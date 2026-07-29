@@ -17,6 +17,8 @@ pub(crate) use crate::lua_host::TrustedLuaHostCallError;
 use crate::lua_host::TrustedLuaHostFuture;
 use crate::managed_translation::managed_translations_unavailable;
 pub(crate) use crate::managed_translation::{
+    ManagedPreparedContent, ManagedTranslationCandidateAcceptance,
+    ManagedTranslationCandidateRequest, ManagedTranslationCandidateUnit,
     TrustedLuaManagedTranslateHostCalls, TrustedLuaManagedTranslationCollection,
     TrustedLuaManagedTranslationCollectionDeclaration, TrustedLuaManagedTranslationContent,
     TrustedLuaManagedTranslationReader, TrustedLuaManagedTranslationReport,
@@ -28,6 +30,7 @@ pub(crate) use crate::managed_translation::{
     TrustedLuaTranslationTerm,
 };
 use crate::rpg_maker::extract::store::LuaSnapshot;
+use crate::rpg_maker::lua::document::RpgMakerTextReplacement;
 use crate::rpg_maker::model::{TextUnitContent, TextUnitRole};
 use crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner;
 use crate::rpg_maker::text::{RpgMakerLocation, TextGroupKind};
@@ -236,6 +239,23 @@ pub(crate) trait TrustedLuaTranslateHostCalls: Send + Sync + 'static {
         semantic_context: String,
     ) -> Result<Arc<dyn TrustedLuaPreparedTranslation>, TrustedLuaHostCallError>;
 
+    fn prepare_content(
+        &self,
+        _kind: TextGroupKind,
+        _shape: TrustedLuaManagedTranslationShape,
+        _original: TrustedLuaManagedTranslationContent,
+        _semantic_context: String,
+    ) -> Result<Arc<ManagedPreparedContent>, TrustedLuaHostCallError> {
+        Err(TrustedLuaHostCallError::new(
+            "translation",
+            "unavailable",
+            "当前 Translate Host 未构造结构化准备能力",
+            None,
+            None,
+        )
+        .with_operation("translation.prepare_content"))
+    }
+
     fn request_llm(
         &self,
         messages: Vec<ChatMessage>,
@@ -288,6 +308,29 @@ pub(crate) trait TrustedLuaStandardHostCalls: Send + Sync + 'static {
     fn open(
         &self,
     ) -> HostFuture<Result<Arc<dyn TrustedLuaStandardSession>, TrustedLuaHostCallError>>;
+}
+
+/// 独立项目 Lua 打开 Managed 人工候选会话的 Host 能力。
+pub(crate) trait TrustedLuaManagedEditHostCalls: Send + Sync + 'static {
+    fn edit(
+        &self,
+    ) -> HostFuture<Result<Arc<dyn TrustedLuaManagedEditSession>, TrustedLuaHostCallError>>;
+}
+
+/// 一轮 Managed 冻结快照及其人工候选提交边界。
+pub(crate) trait TrustedLuaManagedEditSession: Send + Sync + 'static {
+    fn units(&self) -> Result<Vec<ManagedTranslationCandidateUnit>, TrustedLuaHostCallError>;
+
+    fn get(
+        &self,
+        collection: String,
+        key: String,
+    ) -> Result<Option<ManagedTranslationCandidateUnit>, TrustedLuaHostCallError>;
+
+    fn accept(
+        &self,
+        candidates: Vec<ManagedTranslationCandidateRequest>,
+    ) -> HostFuture<Result<Vec<ManagedTranslationCandidateAcceptance>, TrustedLuaHostCallError>>;
 }
 
 /// 一轮只读 Standard 快照及其人工候选提交边界。
@@ -729,6 +772,23 @@ pub(crate) trait TrustedLuaWriteBackHostCalls: Send + Sync + 'static {
         Box::pin(async { Err(managed_translations_unavailable("translations.open")) })
     }
 
+    /// 以冻结来源建立的结构化文本引用完整替换候选中的 RPG Maker string Value。
+    fn replace_text(
+        &self,
+        _replacements: Vec<RpgMakerTextReplacement>,
+    ) -> HostFuture<Result<(), TrustedLuaHostCallError>> {
+        Box::pin(async {
+            Err(TrustedLuaHostCallError::new(
+                "write_back",
+                "unavailable",
+                "当前 WriteBack Host 未构造安全结构化文本写回能力",
+                None,
+                None,
+            )
+            .with_operation("write_back.replace_text"))
+        })
+    }
+
     fn read_output(
         &self,
         path: ScopedDirectoryPath,
@@ -785,6 +845,7 @@ pub(crate) enum TrustedLuaPhaseBindings {
     Project {
         arguments: Vec<String>,
         standard: Arc<dyn TrustedLuaStandardHostCalls>,
+        managed: Arc<dyn TrustedLuaManagedEditHostCalls>,
     },
 }
 
@@ -853,10 +914,11 @@ impl TrustedLuaRuntimeBindings {
         }
     }
 
-    pub(crate) fn project(
+    pub(crate) fn project_with_managed(
         common: TrustedLuaCommonBindings,
         arguments: Vec<String>,
         standard: Arc<dyn TrustedLuaStandardHostCalls>,
+        managed: Arc<dyn TrustedLuaManagedEditHostCalls>,
         finalizer: Box<dyn TrustedLuaBindingFinalizer>,
     ) -> Self {
         Self {
@@ -864,6 +926,7 @@ impl TrustedLuaRuntimeBindings {
             phase: TrustedLuaPhaseBindings::Project {
                 arguments,
                 standard,
+                managed,
             },
             finalizer,
         }

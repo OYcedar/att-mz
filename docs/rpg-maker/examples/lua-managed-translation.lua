@@ -1,6 +1,5 @@
 local collection_name = "quest_titles"
 local data_file_name = "QuestEntries.json"
-local output_path = "data/QuestEntries.json"
 
 local function read_source_entries()
   local document = ctx.rpg_maker.open(
@@ -66,10 +65,10 @@ if ctx.phase == "write_back" then
   local collection = ctx.translations.open(collection_name)
   assert(collection ~= nil, "缺少 quest_titles Managed collection")
 
-  local source_entries = read_source_entries()
-  local candidate_entries = ctx.output.read_json(output_path)
-  assert(ctx.json.kind(candidate_entries) == "array", "候选 QuestEntries.json 根必须是数组")
-  assert(#candidate_entries == #source_entries, "候选任务数量与冻结来源不一致")
+  local document = ctx.rpg_maker.open(
+    ctx.rpg_maker.data_file(data_file_name)
+  )
+  local replacements = {}
 
   for unit in collection:units() do
     assert(ctx.json.kind(unit.metadata) == "object", "Managed metadata 必须是对象")
@@ -78,24 +77,25 @@ if ctx.phase == "write_back" then
     assert(math.type(json_index) == "integer" and json_index >= 0, "json_index 必须是非负整数")
     assert(type(quest_id) == "string" and quest_id:match("%S"), "quest_id 必须是非空字符串")
 
-    local source_entry = source_entries[json_index + 1]
-    local candidate_entry = candidate_entries[json_index + 1]
-    assert(ctx.json.kind(source_entry) == "object", "metadata 指向的来源任务不存在")
-    assert(ctx.json.kind(candidate_entry) == "object", "metadata 指向的候选任务不存在")
-    assert(source_entry.id == quest_id, "metadata 指向了不同来源任务")
-    assert(candidate_entry.id == quest_id, "候选任务身份与冻结来源不一致")
-    assert(source_entry.title == unit.original, "冻结来源标题与 Managed 原文不一致")
-    assert(candidate_entry.title == unit.original, "候选标题已被其他规则修改")
+    local source_id = document:value(ctx.json.array({ json_index, "id" }))
+    local title = document:text(ctx.json.array({ json_index, "title" }))
+    assert(source_id == quest_id, "metadata 指向了不同来源任务")
+    assert(title.original == unit.original, "冻结来源标题与 Managed 原文不一致")
 
     if unit.status == "current" then
       assert(type(unit.translation) == "string", "Current unit 必须有标量译文")
-      candidate_entry.title = unit.translation
+      replacements[#replacements + 1] = {
+        text = title,
+        replacement = unit.translation,
+      }
     else
       assert(unit.status == "missing", "WriteBack open 只应返回 current 或 missing")
     end
   end
 
-  ctx.output.write_json(output_path, candidate_entries)
+  if #replacements > 0 then
+    ctx.write_back.replace_text(replacements)
+  end
   return
 end
 

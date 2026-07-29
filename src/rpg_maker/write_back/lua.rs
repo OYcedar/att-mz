@@ -1,10 +1,12 @@
 //! 把尚未发布的完整写回候选交给共享可信 Lua Host。
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::diagnostic::{
     DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
@@ -13,6 +15,7 @@ use crate::diagnostic::{
 };
 use crate::execution::OperationCompletion;
 use crate::rpg_maker::lua::directory_cache::SuccessfulDirectoryListCache;
+use crate::rpg_maker::lua::document::{RpgMakerTextReplacement, source_path};
 use crate::rpg_maker::lua::hosting::TrustedLuaExecutionHostingError;
 use crate::rpg_maker::lua::runtime::{
     OwnedLuaProgram, TrustedLuaHostCallError, TrustedLuaManagedTranslationCollection,
@@ -23,6 +26,7 @@ use crate::rpg_maker::lua::runtime::{
 use crate::rpg_maker::lua::{
     LuaInvocation, LuaProjectContext, TrustedLuaExecutionHost, TrustedLuaExecutionOutcome,
 };
+use crate::rpg_maker::model::{MutationClaim, MutationClaimSet};
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::project::RpgMakerWriteBackLayoutProfile;
 use crate::storage::file_system::{
@@ -35,6 +39,9 @@ use crate::storage::scoped_path::{
 };
 use crate::windows_path::WindowsOrdinalCaseKeyError;
 
+use super::rewriter::{
+    RpgMakerReferencedTextRewriteError, rewrite_referenced_texts, verify_referenced_texts,
+};
 use super::standard::{
     RpgMakerLayoutTextPair, RpgMakerTextLayoutOutcome, RpgMakerWriteBackLayoutRegion,
 };
@@ -151,6 +158,7 @@ where
             let editor = Arc::clone(&self.editor);
             let layout_profile = *project.layout_profile();
             let rpg_maker_layout = project.layout().rpg_maker_layout();
+            let mutation_claims = candidate.mutation_claims().to_vec();
             Ok((
                 program,
                 LuaProjectContext::for_write_back_candidate(
@@ -167,6 +175,7 @@ where
                 editor,
                 layout_profile,
                 rpg_maker_layout,
+                mutation_claims,
             ))
         };
 
@@ -180,6 +189,7 @@ where
                 editor,
                 layout_profile,
                 rpg_maker_layout,
+                mutation_claims,
             ) = prepared?;
             let scope = bind
                 .await
@@ -188,6 +198,7 @@ where
                     source,
                 })?;
             let scope = Arc::new(scope);
+            let safety = Arc::new(LuaWriteBackCandidateSafety::with_claims(mutation_claims));
             let calls: Arc<dyn TrustedLuaWriteBackHostCalls> =
                 Arc::new(ScopedLuaWriteBackHostCalls {
                     editor,
@@ -195,9 +206,18 @@ where
                     layout_profile,
                     rpg_maker_layout,
                     output_directories: Arc::default(),
+                    safety: Arc::clone(&safety),
                 });
             let invocation = LuaInvocation::write_back(program, project, calls, managed);
             match self.host.execute(invocation).await {
+                Ok(OperationCompletion::Completed(TrustedLuaExecutionOutcome::Empty))
+                    if safety.is_poisoned() =>
+                {
+                    Err(LuaWriteBackServiceError::PoisonedCandidate {
+                        script_path: error_path,
+                        candidate_root,
+                    })
+                }
                 Ok(OperationCompletion::Completed(TrustedLuaExecutionOutcome::Empty)) => {
                     Ok(OperationCompletion::Completed(()))
                 }
@@ -215,6 +235,33 @@ where
                 }),
             }
         }
+    }
+}
+
+#[derive(Default)]
+struct LuaWriteBackCandidateSafety {
+    poisoned: AtomicBool,
+    accepted_claims: tokio::sync::Mutex<Vec<MutationClaim>>,
+}
+
+impl LuaWriteBackCandidateSafety {
+    fn with_claims(accepted_claims: Vec<MutationClaim>) -> Self {
+        Self {
+            poisoned: AtomicBool::new(false),
+            accepted_claims: tokio::sync::Mutex::new(accepted_claims),
+        }
+    }
+
+    fn poison(&self) {
+        self.poisoned.store(true, Ordering::Release);
+    }
+
+    fn mark_verified(&self) {
+        self.poisoned.store(false, Ordering::Release);
+    }
+
+    fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Acquire)
     }
 }
 
@@ -273,6 +320,7 @@ where
     layout_profile: RpgMakerWriteBackLayoutProfile,
     rpg_maker_layout: crate::rpg_maker::RpgMakerLayout,
     output_directories: Arc<SuccessfulDirectoryListCache<ScopedDirectoryEntry>>,
+    safety: Arc<LuaWriteBackCandidateSafety>,
 }
 
 /// 把候选中的每个现存路径段解析为目录实际列出的逐字身份。
@@ -381,10 +429,266 @@ fn invalidate_removed_output_subtree(
     output_directories.invalidate_subtree(path.as_path());
 }
 
+struct PreparedReferencedTextWrite {
+    path: ScopedDirectoryPath,
+    original_bytes: Vec<u8>,
+    rewritten_bytes: Vec<u8>,
+    replacements: Vec<RpgMakerTextReplacement>,
+}
+
+impl<E> ScopedLuaWriteBackHostCalls<E>
+where
+    E: ScopedDirectoryEditor + 'static,
+{
+    /// 在当前候选上完成一批结构化文本替换。
+    ///
+    /// 该方法留作 `TrustedLuaWriteBackHostCalls` 的窄接线点；Lua 绑定只负责从当前
+    /// VM 的 userdata 构造 `RpgMakerTextReplacement`，不得重新提交路径或原文。
+    pub(crate) fn replace_referenced_texts(
+        &self,
+        replacements: Vec<RpgMakerTextReplacement>,
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = Result<(), TrustedLuaHostCallError>> + Send + 'static>,
+    > {
+        let editor = Arc::clone(&self.editor);
+        let scope = Arc::clone(&self.scope);
+        let output_directories = Arc::clone(&self.output_directories);
+        let safety = Arc::clone(&self.safety);
+        let layout = self.rpg_maker_layout;
+        Box::pin(async move {
+            replace_referenced_texts_in_candidate(
+                editor.as_ref(),
+                scope.as_ref(),
+                output_directories.as_ref(),
+                safety.as_ref(),
+                layout,
+                replacements,
+            )
+            .await
+        })
+    }
+}
+
+async fn replace_referenced_texts_in_candidate<E>(
+    editor: &E,
+    scope: &BoundScopedDirectory<E::ScopeState>,
+    output_directories: &SuccessfulDirectoryListCache<ScopedDirectoryEntry>,
+    safety: &LuaWriteBackCandidateSafety,
+    layout: crate::rpg_maker::RpgMakerLayout,
+    replacements: Vec<RpgMakerTextReplacement>,
+) -> Result<(), TrustedLuaHostCallError>
+where
+    E: ScopedDirectoryEditor,
+{
+    if replacements.is_empty() {
+        return Ok(());
+    }
+
+    // 锁覆盖完整调用，使同一个 Host 即使被并发调用，也不会让两个批次分别通过
+    // 旧 Claim 快照后再同时写入。成功前不登记本批 Claim。
+    let mut accepted_claims = safety.accepted_claims.lock().await;
+    if safety.is_poisoned() {
+        return Err(TrustedLuaHostCallError::new(
+            "write_back",
+            "candidate_poisoned",
+            "候选此前的结构化文本替换已经失败，不能继续安全写回",
+            None,
+            None,
+        ));
+    }
+    let new_claims = replacements
+        .iter()
+        .map(|replacement| replacement.reference().mutation_claim().clone())
+        .collect::<Vec<_>>();
+    MutationClaimSet::new(
+        accepted_claims
+            .iter()
+            .cloned()
+            .chain(new_claims.iter().cloned())
+            .collect(),
+    )
+    .map_err(|conflict| {
+        TrustedLuaHostCallError::new(
+            "write_back",
+            "claim_conflict",
+            format!("结构化文本替换的物理修改声明冲突：{}", conflict.resource()),
+            None,
+            None,
+        )
+    })?;
+
+    let mut groups = BTreeMap::<ScopedDirectoryPath, Vec<RpgMakerTextReplacement>>::new();
+    for replacement in replacements {
+        let logical = source_path(replacement.reference().location().source());
+        let logical = ScopedDirectoryPath::new(PathBuf::from(logical.as_str()))
+            .expect("RPG Maker 来源路径已经满足候选路径协议");
+        let path = map_output_path(layout, logical).map_err(|error| {
+            replace_text_host_error("source_changed", "无法解析结构化文本引用的候选路径", error)
+        })?;
+        let path = resolve_exact_output_path(editor, scope, output_directories, path)
+            .await
+            .map_err(|error| {
+                replace_text_host_error(
+                    "source_changed",
+                    "无法确认结构化文本引用对应的候选文件",
+                    error,
+                )
+            })?;
+        groups.entry(path).or_default().push(replacement);
+    }
+
+    // 所有候选文档先读取、定位、核对冻结原文、完成 codec 往返并序列化；这个阶段
+    // 任一失败都不会修改候选。
+    let mut prepared = Vec::with_capacity(groups.len());
+    for (path, replacements) in groups {
+        let original_bytes = editor
+            .read_scoped_file(scope, path.clone())
+            .await
+            .map_err(output_edit_error)
+            .map_err(|error| {
+                replace_text_host_error(
+                    "source_changed",
+                    "读取结构化文本引用对应的候选文件失败",
+                    error,
+                )
+            })?;
+        let rewritten =
+            rewrite_referenced_texts(&original_bytes, &replacements).map_err(|error| {
+                replace_text_rewrite_error(
+                    "source_changed",
+                    "候选文件已无法按冻结的结构化文本引用完成替换",
+                    error,
+                )
+            })?;
+        let (logical_path, rewritten_bytes) = rewritten.into_parts();
+        let logical_path = ScopedDirectoryPath::from_internal_path(logical_path)
+            .expect("结构化改写器只返回受检 data/js 文件路径");
+        let expected_path = map_output_path(layout, logical_path).map_err(|error| {
+            replace_text_host_error("source_changed", "结构化文本改写结果的候选路径无效", error)
+        })?;
+        if expected_path != path {
+            return Err(TrustedLuaHostCallError::new(
+                "write_back",
+                "source_changed",
+                format!(
+                    "结构化文本引用解析到的候选文件与请求来源不一致（请求：{}，解析：{}）",
+                    path.as_path().display(),
+                    expected_path.as_path().display()
+                ),
+                None,
+                None,
+            ));
+        }
+        prepared.push(PreparedReferencedTextWrite {
+            path,
+            original_bytes,
+            rewritten_bytes,
+            replacements,
+        });
+    }
+
+    // 在第一项写入前统一重读，避免预检期间发生的候选变化被静默覆盖。
+    for file in &prepared {
+        let current = editor
+            .read_scoped_file(scope, file.path.clone())
+            .await
+            .map_err(output_edit_error)
+            .map_err(|error| {
+                replace_text_host_error("source_changed", "重新读取待替换的候选文件失败", error)
+            })?;
+        if current != file.original_bytes {
+            return Err(TrustedLuaHostCallError::new(
+                "write_back",
+                "source_changed",
+                format!(
+                    "候选文档在结构化文本替换预检后发生变化：{}",
+                    file.path.as_path().display()
+                ),
+                None,
+                None,
+            ));
+        }
+    }
+
+    // 从第一次物理写入开始，任何错误或取消都可能留下部分结果。先标记候选不可
+    // 发布；只有全部写入和磁盘重读验证成功后才解除。
+    safety.poison();
+    for file in &mut prepared {
+        let rewritten_bytes = std::mem::take(&mut file.rewritten_bytes);
+        let result = editor
+            .write_scoped_file(scope, file.path.clone(), rewritten_bytes)
+            .await;
+        invalidate_output_parent_and_target(output_directories, &file.path);
+        result.map_err(output_edit_error).map_err(|error| {
+            replace_text_host_error("write_failed", "写入结构化文本替换结果失败", error)
+        })?;
+    }
+
+    // 磁盘写入返回成功仍不足以证明 codec 结果；重新读取实际候选，并按相同结构
+    // 路径穿过全部 DecodeJsonString 层逐字确认 replacement。
+    for file in &prepared {
+        let actual = editor
+            .read_scoped_file(scope, file.path.clone())
+            .await
+            .map_err(output_edit_error)
+            .map_err(|error| {
+                replace_text_host_error(
+                    "verification_failed",
+                    "重新读取结构化文本替换结果失败",
+                    error,
+                )
+            })?;
+        verify_referenced_texts(&actual, &file.replacements).map_err(|error| {
+            replace_text_rewrite_error(
+                "verification_failed",
+                "结构化文本替换结果未通过完整往返验证",
+                error,
+            )
+        })?;
+    }
+
+    accepted_claims.extend(new_claims);
+    safety.mark_verified();
+    Ok(())
+}
+
+fn replace_text_host_error(
+    kind: &'static str,
+    context: &'static str,
+    source: TrustedLuaHostCallError,
+) -> TrustedLuaHostCallError {
+    let safe_diagnostic = source.safe_diagnostic().cloned();
+    let message = format!("{context}：{source}");
+    let error =
+        TrustedLuaHostCallError::new("write_back", kind, message, None, Some(Arc::new(source)));
+    match safe_diagnostic {
+        Some(safe_diagnostic) => error.with_safe_diagnostic(safe_diagnostic),
+        None => error,
+    }
+}
+
+fn replace_text_rewrite_error(
+    kind: &'static str,
+    context: &'static str,
+    error: RpgMakerReferencedTextRewriteError,
+) -> TrustedLuaHostCallError {
+    let message = format!("{context}：{error}");
+    TrustedLuaHostCallError::new("write_back", kind, message, None, Some(Arc::new(error)))
+}
+
 impl<E> TrustedLuaWriteBackHostCalls for ScopedLuaWriteBackHostCalls<E>
 where
     E: ScopedDirectoryEditor + 'static,
 {
+    fn replace_text(
+        &self,
+        replacements: Vec<RpgMakerTextReplacement>,
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = Result<(), TrustedLuaHostCallError>> + Send + 'static>,
+    > {
+        self.replace_referenced_texts(replacements)
+    }
+
     fn read_output(
         &self,
         path: ScopedDirectoryPath,
@@ -680,6 +984,10 @@ pub(crate) enum LuaWriteBackServiceError<H, E> {
         candidate_root: PathBuf,
         source: ScopedDirectoryBindError<E>,
     },
+    PoisonedCandidate {
+        script_path: PathBuf,
+        candidate_root: PathBuf,
+    },
     UnexpectedOutcome {
         script_path: PathBuf,
         candidate_root: PathBuf,
@@ -720,6 +1028,15 @@ where
                 "无法把 Lua 写回能力绑定到候选 {}：{source}",
                 candidate_root.display()
             ),
+            Self::PoisonedCandidate {
+                script_path,
+                candidate_root,
+            } => write!(
+                formatter,
+                "Lua 写回程序捕获了结构化写回失败，候选已拒绝发布（脚本：{}，候选：{}）",
+                script_path.display(),
+                candidate_root.display()
+            ),
             Self::UnexpectedOutcome {
                 script_path,
                 candidate_root,
@@ -740,7 +1057,9 @@ where
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::CandidateProjectMismatch { .. } | Self::UnexpectedOutcome { .. } => None,
+            Self::CandidateProjectMismatch { .. }
+            | Self::PoisonedCandidate { .. }
+            | Self::UnexpectedOutcome { .. } => None,
             Self::ExecuteHost { source, .. } => Some(source),
             Self::BindCandidate { source, .. } => Some(source),
         }
@@ -782,6 +1101,18 @@ where
                 candidate_root,
                 source,
             } => scoped_bind_diagnostic(source, candidate_root),
+            Self::PoisonedCandidate {
+                script_path,
+                candidate_root,
+            } => SafeDiagnostic::new(
+                DiagnosticCode::WriteBackCandidate,
+                DiagnosticStage::WriteBack,
+                DiagnosticSubject::path(script_path),
+                DiagnosticReason::failure(DiagnosticFailureKind::StateMismatch),
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::FixInput,
+            )
+            .with_recovery(RecoveryFact::path(candidate_root)),
             Self::UnexpectedOutcome {
                 script_path,
                 candidate_root,
@@ -878,7 +1209,9 @@ mod tests {
     use super::*;
     use crate::rpg_maker::ProjectName;
     use crate::rpg_maker::lua::LuaPhase;
+    use crate::rpg_maker::lua::document::OpenedRpgMakerDocument;
     use crate::rpg_maker::project::MaxFullwidthChars;
+    use crate::rpg_maker::text::{RpgMakerLocationStep, RpgMakerSource, StandardDataFile};
 
     #[test]
     fn output_paths_keep_logical_roots_and_hide_mv_www_mapping() {
@@ -1329,6 +1662,358 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn referenced_text_batch_rewrites_multiple_documents_and_rechecks_actual_files() {
+        let items = r#"[null,{"name":"道具","payload":"{\"description\":\"说明\"}"}]"#.as_bytes();
+        let actors = r#"[null,{"nickname":"勇者"}]"#.as_bytes();
+        let editor = Arc::new(FakeEditor::with_files([
+            (PathBuf::from("data/Items.json"), items.to_vec()),
+            (PathBuf::from("data/Actors.json"), actors.to_vec()),
+        ]));
+        let calls = output_calls(crate::rpg_maker::RpgMakerLayout::MZ, Arc::clone(&editor));
+        let items_document =
+            OpenedRpgMakerDocument::open(RpgMakerSource::data(StandardDataFile::Items), items)
+                .unwrap();
+        let actors_document =
+            OpenedRpgMakerDocument::open(RpgMakerSource::data(StandardDataFile::Actors), actors)
+                .unwrap();
+        let item_steps = vec![
+            RpgMakerLocationStep::index(1),
+            RpgMakerLocationStep::key("payload"),
+            RpgMakerLocationStep::DecodeJsonString,
+            RpgMakerLocationStep::key("description"),
+        ];
+        let actor_steps = vec![
+            RpgMakerLocationStep::index(1),
+            RpgMakerLocationStep::key("nickname"),
+        ];
+
+        calls
+            .replace_referenced_texts(vec![
+                RpgMakerTextReplacement::new(
+                    items_document.text(&item_steps).unwrap(),
+                    "第一行\n字面\\n".to_owned(),
+                ),
+                RpgMakerTextReplacement::new(
+                    actors_document.text(&actor_steps).unwrap(),
+                    "新称号".to_owned(),
+                ),
+            ])
+            .await
+            .expect("全部文档应先验收，再写入并重读");
+
+        let items = editor.file("data/Items.json");
+        let actors = editor.file("data/Actors.json");
+        let items_document =
+            OpenedRpgMakerDocument::open(RpgMakerSource::data(StandardDataFile::Items), &items)
+                .unwrap();
+        let actors_document =
+            OpenedRpgMakerDocument::open(RpgMakerSource::data(StandardDataFile::Actors), &actors)
+                .unwrap();
+        assert_eq!(
+            items_document.text(&item_steps).unwrap().original(),
+            "第一行\n字面\\n"
+        );
+        assert_eq!(
+            actors_document.text(&actor_steps).unwrap().original(),
+            "新称号"
+        );
+        assert!(!calls.safety.is_poisoned());
+    }
+
+    #[tokio::test]
+    async fn empty_referenced_text_batch_is_a_side_effect_free_success() {
+        let editor = Arc::new(FakeEditor::default());
+        let calls = output_calls(crate::rpg_maker::RpgMakerLayout::MZ, Arc::clone(&editor));
+
+        calls
+            .replace_referenced_texts(Vec::new())
+            .await
+            .expect("空批次应自然成功");
+
+        assert!(!calls.safety.is_poisoned());
+        assert!(
+            editor
+                .terminal_operations
+                .lock()
+                .expect("候选操作记录锁不应中毒")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn referenced_text_waiting_call_rechecks_poison_after_serialization() {
+        let items = r#"[null,{"name":"道具"}]"#.as_bytes();
+        let editor = Arc::new(FakeEditor::with_files([(
+            PathBuf::from("data/Items.json"),
+            items.to_vec(),
+        )]));
+        let calls = output_calls(crate::rpg_maker::RpgMakerLayout::MZ, Arc::clone(&editor));
+        let document =
+            OpenedRpgMakerDocument::open(RpgMakerSource::data(StandardDataFile::Items), items)
+                .unwrap();
+        let reference = document
+            .text(&[
+                RpgMakerLocationStep::index(1),
+                RpgMakerLocationStep::key("name"),
+            ])
+            .unwrap();
+
+        let serialization = calls.safety.accepted_claims.lock().await;
+        let waiting =
+            tokio::spawn(
+                calls.replace_referenced_texts(vec![RpgMakerTextReplacement::new(
+                    reference,
+                    "新道具".to_owned(),
+                )]),
+            );
+        tokio::task::yield_now().await;
+        calls.safety.poison();
+        drop(serialization);
+
+        let error = waiting
+            .await
+            .expect("等待锁的高级写回应正常结束")
+            .expect_err("取得串行锁后必须重新观察候选污染状态");
+        assert_eq!(error.kind(), "candidate_poisoned");
+        assert_eq!(
+            *editor.write_calls.lock().expect("候选写入计数锁不应中毒"),
+            0
+        );
+        assert_eq!(editor.file("data/Items.json"), items);
+    }
+
+    #[tokio::test]
+    async fn referenced_text_claim_conflict_writes_nothing_and_keeps_the_candidate_usable() {
+        let items = r#"[null,{"payload":"{\"description\":\"说明\"}"}]"#.as_bytes();
+        let editor = Arc::new(FakeEditor::with_files([(
+            PathBuf::from("data/Items.json"),
+            items.to_vec(),
+        )]));
+        let calls = output_calls(crate::rpg_maker::RpgMakerLayout::MZ, Arc::clone(&editor));
+        let document =
+            OpenedRpgMakerDocument::open(RpgMakerSource::data(StandardDataFile::Items), items)
+                .unwrap();
+        let raw = document
+            .text(&[
+                RpgMakerLocationStep::index(1),
+                RpgMakerLocationStep::key("payload"),
+            ])
+            .unwrap();
+        let descendant = document
+            .text(&[
+                RpgMakerLocationStep::index(1),
+                RpgMakerLocationStep::key("payload"),
+                RpgMakerLocationStep::DecodeJsonString,
+                RpgMakerLocationStep::key("description"),
+            ])
+            .unwrap();
+
+        let error = calls
+            .replace_referenced_texts(vec![
+                RpgMakerTextReplacement::new(raw, r#"{"description":"整体替换"}"#.to_owned()),
+                RpgMakerTextReplacement::new(descendant, "叶子替换".to_owned()),
+            ])
+            .await
+            .expect_err("祖先与后代 Claim 必须在任何读取或写入前拒绝");
+        assert_eq!(error.kind(), "claim_conflict");
+        assert!(!calls.safety.is_poisoned());
+        assert!(
+            editor
+                .terminal_operations
+                .lock()
+                .expect("候选操作记录锁不应中毒")
+                .is_empty()
+        );
+        assert_eq!(editor.file("data/Items.json"), items);
+    }
+
+    #[tokio::test]
+    async fn referenced_text_source_preflight_failure_keeps_the_candidate_usable() {
+        let frozen = r#"[null,{"name":"冻结原文"}]"#.as_bytes();
+        let current = r#"[null,{"name":"候选已变化"}]"#.as_bytes();
+        let editor = Arc::new(FakeEditor::with_files([(
+            PathBuf::from("data/Items.json"),
+            current.to_vec(),
+        )]));
+        let calls = output_calls(crate::rpg_maker::RpgMakerLayout::MZ, Arc::clone(&editor));
+        let document =
+            OpenedRpgMakerDocument::open(RpgMakerSource::data(StandardDataFile::Items), frozen)
+                .unwrap();
+        let reference = document
+            .text(&[
+                RpgMakerLocationStep::index(1),
+                RpgMakerLocationStep::key("name"),
+            ])
+            .unwrap();
+
+        let error = calls
+            .replace_referenced_texts(vec![RpgMakerTextReplacement::new(
+                reference,
+                "Lua 译文".to_owned(),
+            )])
+            .await
+            .expect_err("冻结原文与候选不一致时应在任何物理写入前失败");
+        assert_eq!(error.domain(), "write_back");
+        assert_eq!(error.kind(), "source_changed");
+        assert!(!calls.safety.is_poisoned());
+        assert_eq!(
+            *editor.write_calls.lock().expect("候选写入计数锁不应中毒"),
+            0
+        );
+        assert_eq!(editor.file("data/Items.json"), current);
+
+        calls
+            .write_output(
+                scoped_path("data/Items.json"),
+                r#"[null,{"private":"Lua 自行负责"}]"#.as_bytes().to_vec(),
+            )
+            .await
+            .expect("纯预检失败后仍应允许 Lua 选择低级实现");
+        assert_eq!(
+            editor.file("data/Items.json"),
+            r#"[null,{"private":"Lua 自行负责"}]"#.as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn referenced_text_checks_standard_claims_but_low_level_output_remains_free() {
+        let items = r#"[null,{"payload":"{\"description\":\"说明\"}"}]"#.as_bytes();
+        let editor = Arc::new(FakeEditor::with_files([(
+            PathBuf::from("data/Items.json"),
+            items.to_vec(),
+        )]));
+        let document =
+            OpenedRpgMakerDocument::open(RpgMakerSource::data(StandardDataFile::Items), items)
+                .unwrap();
+        let raw = document
+            .text(&[
+                RpgMakerLocationStep::index(1),
+                RpgMakerLocationStep::key("payload"),
+            ])
+            .unwrap();
+        let descendant = document
+            .text(&[
+                RpgMakerLocationStep::index(1),
+                RpgMakerLocationStep::key("payload"),
+                RpgMakerLocationStep::DecodeJsonString,
+                RpgMakerLocationStep::key("description"),
+            ])
+            .unwrap();
+        let calls = output_calls_with_claims(
+            crate::rpg_maker::RpgMakerLayout::MZ,
+            Arc::clone(&editor),
+            vec![raw.mutation_claim().clone()],
+        );
+
+        let error = calls
+            .replace_referenced_texts(vec![RpgMakerTextReplacement::new(
+                descendant,
+                "叶子替换".to_owned(),
+            )])
+            .await
+            .expect_err("Lua 高级替换必须与 Standard 已占用的祖先 Claim 冲突");
+        assert_eq!(error.kind(), "claim_conflict");
+        assert!(
+            editor
+                .terminal_operations
+                .lock()
+                .expect("候选操作记录锁不应中毒")
+                .is_empty()
+        );
+
+        calls
+            .write_output(
+                scoped_path("data/Items.json"),
+                r#"[null,{"private":"Lua 自行负责"}]"#.as_bytes().to_vec(),
+            )
+            .await
+            .expect("低级 ctx.output 不受高级 Claim 限制");
+        assert_eq!(
+            editor.file("data/Items.json"),
+            r#"[null,{"private":"Lua 自行负责"}]"#.as_bytes()
+        );
+        assert!(!calls.safety.is_poisoned());
+    }
+
+    #[tokio::test]
+    async fn referenced_text_partial_write_failure_poisons_the_candidate() {
+        let items = r#"[null,{"name":"道具"}]"#.as_bytes();
+        let actors = r#"[null,{"name":"角色"}]"#.as_bytes();
+        let editor = Arc::new(FakeEditor {
+            fail_write_number: Some(2),
+            ..FakeEditor::with_files([
+                (PathBuf::from("data/Items.json"), items.to_vec()),
+                (PathBuf::from("data/Actors.json"), actors.to_vec()),
+            ])
+        });
+        let calls = output_calls(crate::rpg_maker::RpgMakerLayout::MZ, Arc::clone(&editor));
+        let items_document =
+            OpenedRpgMakerDocument::open(RpgMakerSource::data(StandardDataFile::Items), items)
+                .unwrap();
+        let actors_document =
+            OpenedRpgMakerDocument::open(RpgMakerSource::data(StandardDataFile::Actors), actors)
+                .unwrap();
+        let steps = [
+            RpgMakerLocationStep::index(1),
+            RpgMakerLocationStep::key("name"),
+        ];
+
+        let error = calls
+            .replace_referenced_texts(vec![
+                RpgMakerTextReplacement::new(
+                    items_document.text(&steps).unwrap(),
+                    "新道具".to_owned(),
+                ),
+                RpgMakerTextReplacement::new(
+                    actors_document.text(&steps).unwrap(),
+                    "新角色".to_owned(),
+                ),
+            ])
+            .await
+            .expect_err("第二个物理文件失败时调用必须失败");
+
+        assert_eq!(error.domain(), "write_back");
+        assert_eq!(error.kind(), "write_failed");
+        assert!(calls.safety.is_poisoned());
+        assert_eq!(
+            *editor.write_calls.lock().expect("候选写入计数锁不应中毒"),
+            2
+        );
+        assert_ne!(editor.file("data/Actors.json"), actors);
+        assert_eq!(editor.file("data/Items.json"), items);
+    }
+
+    #[tokio::test]
+    async fn referenced_text_post_write_mismatch_poisons_the_candidate() {
+        let items = r#"[null,{"name":"道具"}]"#.as_bytes();
+        let editor = Arc::new(FakeEditor {
+            corrupt_successful_writes: true,
+            ..FakeEditor::with_files([(PathBuf::from("data/Items.json"), items.to_vec())])
+        });
+        let calls = output_calls(crate::rpg_maker::RpgMakerLayout::MZ, Arc::clone(&editor));
+        let document =
+            OpenedRpgMakerDocument::open(RpgMakerSource::data(StandardDataFile::Items), items)
+                .unwrap();
+        let reference = document
+            .text(&[
+                RpgMakerLocationStep::index(1),
+                RpgMakerLocationStep::key("name"),
+            ])
+            .unwrap();
+
+        let error = calls
+            .replace_referenced_texts(vec![RpgMakerTextReplacement::new(
+                reference,
+                "新道具".to_owned(),
+            )])
+            .await
+            .expect_err("实际候选无法按相同路径恢复 replacement 时必须失败");
+        assert_eq!(error.domain(), "write_back");
+        assert_eq!(error.kind(), "verification_failed");
+        assert!(calls.safety.is_poisoned());
+    }
+
+    #[tokio::test]
     async fn mv_output_case_resolution_keeps_www_internal() {
         let editor = Arc::new(FakeEditor::with_entries([
             (
@@ -1416,6 +2101,7 @@ mod tests {
             layout_profile: RpgMakerWriteBackLayoutProfile::new(width(3), width(2), width(2)),
             rpg_maker_layout: crate::rpg_maker::RpgMakerLayout::MZ,
             output_directories: Arc::default(),
+            safety: Arc::default(),
         };
 
         let error = calls
@@ -1500,6 +2186,7 @@ mod tests {
             layout_profile: RpgMakerWriteBackLayoutProfile::new(width(3), width(2), width(2)),
             rpg_maker_layout: layout,
             output_directories: Arc::default(),
+            safety: Arc::default(),
         };
 
         for root in ["data", "js"] {
@@ -1666,8 +2353,12 @@ mod tests {
     struct FakeEditor {
         bind_fail: bool,
         fail_mutations: bool,
+        fail_write_number: Option<usize>,
+        corrupt_successful_writes: bool,
         entries:
             Arc<Mutex<BTreeMap<PathBuf, Vec<crate::storage::file_system::ScopedDirectoryEntry>>>>,
+        files: Arc<Mutex<BTreeMap<PathBuf, Vec<u8>>>>,
+        write_calls: Arc<Mutex<usize>>,
         directory_lists: Arc<Mutex<Vec<PathBuf>>>,
         terminal_operations: Arc<Mutex<Vec<String>>>,
     }
@@ -1685,6 +2376,55 @@ mod tests {
                 entries: Arc::new(Mutex::new(entries.into_iter().collect())),
                 ..Self::default()
             }
+        }
+
+        fn with_files(files: impl IntoIterator<Item = (PathBuf, Vec<u8>)>) -> Self {
+            let files = files.into_iter().collect::<BTreeMap<_, _>>();
+            let mut entries =
+                BTreeMap::<PathBuf, Vec<crate::storage::file_system::ScopedDirectoryEntry>>::new();
+            entries.entry(PathBuf::new()).or_default();
+            for path in files.keys() {
+                let components = path.components().collect::<Vec<_>>();
+                let mut parent = PathBuf::new();
+                for (index, component) in components.iter().enumerate() {
+                    let Component::Normal(name) = component else {
+                        panic!("测试候选文件路径必须只含普通相对路径段")
+                    };
+                    let kind = if index + 1 == components.len() {
+                        ScopedDirectoryEntryKind::File
+                    } else {
+                        ScopedDirectoryEntryKind::Directory
+                    };
+                    let children = entries.entry(parent.clone()).or_default();
+                    if !children.iter().any(|entry| entry.name() == *name) {
+                        children.push(crate::storage::file_system::ScopedDirectoryEntry::new(
+                            name.to_os_string(),
+                            kind,
+                        ));
+                    }
+                    parent.push(name);
+                    if kind == ScopedDirectoryEntryKind::Directory {
+                        entries.entry(parent.clone()).or_default();
+                    }
+                }
+            }
+            for children in entries.values_mut() {
+                children.sort_by(|left, right| left.name().cmp(right.name()));
+            }
+            Self {
+                entries: Arc::new(Mutex::new(entries)),
+                files: Arc::new(Mutex::new(files)),
+                ..Self::default()
+            }
+        }
+
+        fn file(&self, path: &str) -> Vec<u8> {
+            self.files
+                .lock()
+                .expect("候选文件测试状态锁不应中毒")
+                .get(Path::new(path))
+                .cloned()
+                .unwrap_or_else(|| panic!("候选中缺少测试文件 {path}"))
         }
 
         fn entries_at(
@@ -1806,7 +2546,14 @@ mod tests {
             Output = Result<Vec<u8>, ScopedDirectoryEditError<Self::Error>>,
         > + Send {
             self.record("read", &path);
-            std::future::ready(Ok(Vec::new()))
+            let bytes = self
+                .files
+                .lock()
+                .expect("候选文件测试状态锁不应中毒")
+                .get(path.as_path())
+                .cloned()
+                .unwrap_or_default();
+            std::future::ready(Ok(bytes))
         }
 
         fn list_scoped_directory(
@@ -1858,11 +2605,31 @@ mod tests {
             &self,
             _scope: &BoundScopedDirectory<Self::ScopeState>,
             path: ScopedDirectoryPath,
-            _bytes: Vec<u8>,
+            mut bytes: Vec<u8>,
         ) -> impl std::future::Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>> + Send
         {
             self.record("write", &path);
-            std::future::ready(self.mutation_result(&path))
+            let write_number = {
+                let mut calls = self.write_calls.lock().expect("候选写入计数锁不应中毒");
+                *calls += 1;
+                *calls
+            };
+            let result = if self.fail_mutations || self.fail_write_number == Some(write_number) {
+                Err(ScopedDirectoryEditError::Failed {
+                    path: path.as_path().to_path_buf(),
+                    source: FakeEditorError,
+                })
+            } else {
+                if self.corrupt_successful_writes {
+                    bytes = br#"{"corrupt":true}"#.to_vec();
+                }
+                self.files
+                    .lock()
+                    .expect("候选文件测试状态锁不应中毒")
+                    .insert(path.as_path().to_path_buf(), bytes);
+                Ok(())
+            };
+            std::future::ready(result)
         }
 
         fn remove_scoped_path(
@@ -1891,6 +2658,14 @@ mod tests {
         layout: crate::rpg_maker::RpgMakerLayout,
         editor: Arc<FakeEditor>,
     ) -> ScopedLuaWriteBackHostCalls<FakeEditor> {
+        output_calls_with_claims(layout, editor, Vec::new())
+    }
+
+    fn output_calls_with_claims(
+        layout: crate::rpg_maker::RpgMakerLayout,
+        editor: Arc<FakeEditor>,
+        mutation_claims: Vec<MutationClaim>,
+    ) -> ScopedLuaWriteBackHostCalls<FakeEditor> {
         ScopedLuaWriteBackHostCalls {
             editor,
             scope: Arc::new(BoundScopedDirectory::new(
@@ -1901,6 +2676,7 @@ mod tests {
             layout_profile: RpgMakerWriteBackLayoutProfile::new(width(3), width(2), width(2)),
             rpg_maker_layout: layout,
             output_directories: Arc::default(),
+            safety: Arc::new(LuaWriteBackCandidateSafety::with_claims(mutation_claims)),
         }
     }
 
@@ -2162,6 +2938,7 @@ mod tests {
             layout_profile: RpgMakerWriteBackLayoutProfile::new(width(3), width(2), width(2)),
             rpg_maker_layout: crate::rpg_maker::RpgMakerLayout::MZ,
             output_directories: Arc::default(),
+            safety: Arc::default(),
         };
         let pairs = vec![
             TrustedLuaWriteBackLayoutPair::new("原文".to_owned(), Some("甲乙丙".to_owned())),

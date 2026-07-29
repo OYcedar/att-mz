@@ -29,7 +29,11 @@ use crate::diagnostic::{
 use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage, project_log_value_source_label};
 use crate::language::LanguageModuleCatalogError;
-use crate::managed_translation::managed_translation_system_prompt_fragment;
+use crate::managed_translation::{
+    ManagedTranslationCandidateAcceptance, ManagedTranslationCandidateRequest,
+    ManagedTranslationCandidateSession, ManagedTranslationCheckpointMode, ManagedTranslationStore,
+    ManagedTranslationStoreCheckpoint, managed_translation_system_prompt_fragment,
+};
 use crate::progress::{
     ProgressAmount, ProgressMode, ProgressObserver, ProgressSnapshot, TerminalProgress,
     TerminalProgressObserver,
@@ -65,15 +69,18 @@ use crate::rpg_maker::lua::lua54::{
 };
 use crate::rpg_maker::lua::runtime::OwnedLuaProgram;
 use crate::rpg_maker::lua::runtime::{
-    TrustedLuaHostCallError, TrustedLuaStandardAcceptance, TrustedLuaStandardCandidate,
-    TrustedLuaStandardHostCalls, TrustedLuaStandardLinePolicy, TrustedLuaStandardRejectionDetail,
+    TrustedLuaHostCallError, TrustedLuaManagedEditHostCalls, TrustedLuaManagedEditSession,
+    TrustedLuaStandardAcceptance, TrustedLuaStandardCandidate, TrustedLuaStandardHostCalls,
+    TrustedLuaStandardLinePolicy, TrustedLuaStandardRejectionDetail,
     TrustedLuaStandardRejectionValue, TrustedLuaStandardSession, TrustedLuaStandardUnit,
-    TrustedLuaStandardUnitStatus, TrustedLuaTranslationTerm,
+    TrustedLuaStandardUnitStatus, TrustedLuaTranslationSemantics, TrustedLuaTranslationTerm,
 };
 use crate::rpg_maker::lua::{
     LuaInvocation, LuaProjectContext, TrustedLuaExecutionHost, TrustedLuaExecutionOutcome,
 };
-use crate::rpg_maker::managed_translation::ManagedTranslationSqliteRepository;
+use crate::rpg_maker::managed_translation::{
+    ManagedTranslationSnapshot, ManagedTranslationSqliteRepository,
+};
 use crate::rpg_maker::model::{TextUnitContent, TextUnitRole};
 use crate::rpg_maker::project::{
     ExistingProjectOpener, ExistingProjectOpeningError, ExistingProjectOpeningService,
@@ -109,7 +116,8 @@ use crate::rpg_maker::translate::executor::{
 };
 use crate::rpg_maker::translate::lua::{LuaTranslationError, LuaTranslationService};
 use crate::rpg_maker::translate::managed::{
-    ManagedTranslationReadService, ManagedTranslationService,
+    ManagedTranslationReadService, ManagedTranslationService, RpgManagedSemanticsAdapter,
+    RpgManagedStoreAdapter,
 };
 use crate::rpg_maker::translate::placeholder::{
     Pcre2PlaceholderConstructionError, Pcre2PlaceholderService,
@@ -2835,7 +2843,7 @@ impl ProductionRpgMakerCommandRunner {
             }
         };
         let arguments = command.arguments().to_vec();
-        let standard = Arc::new(ProductionProjectLuaStandardHostCalls::new(
+        let translations = Arc::new(ProductionProjectLuaTranslationHostCalls::new(
             command.into_standard_profile(),
             opened_project.clone(),
             self.locale,
@@ -2849,7 +2857,7 @@ impl ProductionRpgMakerCommandRunner {
                 lua.runtime.clone(),
                 sqlite.clone(),
             );
-        let invocation = LuaInvocation::project(
+        let invocation = LuaInvocation::project_with_managed(
             lua.program.clone(),
             LuaProjectContext::for_frozen_source(
                 opened_project.name().as_str(),
@@ -2859,7 +2867,8 @@ impl ProductionRpgMakerCommandRunner {
                 opened_project.language_pair().clone(),
             ),
             arguments,
-            standard.clone(),
+            translations.clone(),
+            translations.clone(),
         );
         let progress_observer = ProductionProgressObserver::new(
             progress.observer(),
@@ -2916,7 +2925,7 @@ impl ProductionRpgMakerCommandRunner {
         }
         progress_observer.finish();
         drop(progress_observer);
-        if let Some(profile_id) = standard.opened_profile_id() {
+        if let Some(profile_id) = translations.opened_profile_id() {
             project_log.set_profile(profile_id);
         }
         let shutdown = roots.shutdown().await;
@@ -4408,14 +4417,15 @@ type ProductionManagedTranslation = ManagedTranslationService<
 type ProductionLuaTranslation =
     LuaTranslationService<ProductionLuaHost, ProductionManagedTranslation>;
 
-/// 独立项目 Lua 到 Standard 人工候选核心之间的生产组合根。
+/// 独立项目 Lua 到项目翻译能力之间的生产组合根。
 ///
-/// Profile 只在 `ctx.standard.open()` 时解析；普通项目 Lua 因而不依赖任何 Translate
-/// 配置或已保存运行方案。每次 `open()` 都重新读取项目权威快照，配置源本身则保持为
-/// 本次 CLI 已读取的当前配置。
-struct ProductionProjectLuaStandardHostCalls {
+/// Profile 只在首次打开 Standard 会话或 Managed 修订会话时解析；普通项目 Lua
+/// 因而不依赖任何 Translate 配置或已保存运行方案。两个入口共享同一次解析结果和
+/// 翻译语义，配置源本身则保持为本次 CLI 已读取的当前配置。
+struct ProductionProjectLuaTranslationHostCalls {
     selection: ConfiguredProjectLuaStandardProfile,
     resolved: Arc<tokio::sync::OnceCell<ResolvedProjectLuaStandardConfiguration>>,
+    shared: Arc<tokio::sync::OnceCell<ResolvedProjectLuaTranslationContext>>,
     opened_profile: Arc<tokio::sync::OnceCell<String>>,
     project: OpenedProject,
     ui_locale: UiLocale,
@@ -4424,7 +4434,7 @@ struct ProductionProjectLuaStandardHostCalls {
     cpu: RayonCpuExecutor,
 }
 
-impl ProductionProjectLuaStandardHostCalls {
+impl ProductionProjectLuaTranslationHostCalls {
     fn new(
         selection: ConfiguredProjectLuaStandardProfile,
         project: OpenedProject,
@@ -4436,6 +4446,7 @@ impl ProductionProjectLuaStandardHostCalls {
         Self {
             selection,
             resolved: Arc::new(tokio::sync::OnceCell::new()),
+            shared: Arc::new(tokio::sync::OnceCell::new()),
             opened_profile: Arc::new(tokio::sync::OnceCell::new()),
             project,
             ui_locale,
@@ -4447,6 +4458,7 @@ impl ProductionProjectLuaStandardHostCalls {
 
     async fn resolve_configuration(
         &self,
+        surface: ProjectLuaTranslationSurface,
     ) -> Result<Arc<TranslateConfiguration>, TrustedLuaHostCallError> {
         let resolved = self
             .resolved
@@ -4461,9 +4473,10 @@ impl ProductionProjectLuaStandardHostCalls {
                             .read(self.project.database_path().to_path_buf())
                             .await
                             .map_err(|source| {
-                                project_lua_standard_command_error(
+                                project_lua_translation_command_error(
+                                    surface.domain(),
                                     "profile_state_unavailable",
-                                    "standard.open",
+                                    surface.operation(),
                                     ProductionCommandError::project_run_plan_read(source),
                                 )
                             })?;
@@ -4471,9 +4484,10 @@ impl ProductionProjectLuaStandardHostCalls {
                             .translate()
                             .map(|plan| plan.profile_id().to_owned())
                             .ok_or_else(|| {
-                                project_lua_standard_command_error(
+                                project_lua_translation_command_error(
+                                    surface.domain(),
                                     "profile_required",
-                                    "standard.open",
+                                    surface.operation(),
                                     ProductionCommandError::run_plan_resolution(
                                         RunPlanResolutionError::ProjectLuaProfileRequired,
                                     ),
@@ -4488,9 +4502,10 @@ impl ProductionProjectLuaStandardHostCalls {
                             ConfigurationLoadError::TranslationProfileNotFound { .. }
                         )
                     {
-                        project_lua_standard_command_error(
+                        project_lua_translation_command_error(
+                            surface.domain(),
                             "saved_profile_unavailable",
-                            "standard.open",
+                            surface.operation(),
                             ProductionCommandError::run_plan_resolution(
                                 RunPlanResolutionError::SavedProfileUnavailable {
                                     profile_id: profile_id.clone(),
@@ -4498,9 +4513,10 @@ impl ProductionProjectLuaStandardHostCalls {
                             ),
                         )
                     } else {
-                        project_lua_standard_command_error(
+                        project_lua_translation_command_error(
+                            surface.domain(),
                             "profile_invalid",
-                            "standard.open",
+                            surface.operation(),
                             ProductionCommandError::configuration_load(source),
                         )
                     }
@@ -4518,74 +4534,112 @@ impl ProductionProjectLuaStandardHostCalls {
         self.opened_profile.get().map(String::as_str)
     }
 
+    async fn resolve_translation_context(
+        &self,
+        surface: ProjectLuaTranslationSurface,
+    ) -> Result<&ResolvedProjectLuaTranslationContext, TrustedLuaHostCallError> {
+        self.shared
+            .get_or_try_init(|| async {
+                let configuration = self.resolve_configuration(surface).await?;
+                let (profile, translation_resources) = build_production_translation_profile(
+                    configuration.as_ref(),
+                    self.ui_locale,
+                    &self.file_system,
+                    &self.project,
+                )
+                .await
+                .map_err(|source| {
+                    project_lua_translation_build_error(
+                        surface.domain(),
+                        surface.operation(),
+                        source,
+                    )
+                })?;
+                let managed_system_prompt = translation_resources.managed_system_prompt().clone();
+                let placeholders = Pcre2PlaceholderService::new()
+                    .map_err(ProductionTranslationExecutionBuildError::builtin_placeholder_compile)
+                    .map_err(|source| {
+                        project_lua_translation_build_error(
+                            surface.domain(),
+                            surface.operation(),
+                            source,
+                        )
+                    })?;
+                let corpus = RpgMakerStandardTranslationAssetReadingService::new(
+                    self.sqlite.clone(),
+                    self.cpu.clone(),
+                )
+                .read(&self.project)
+                .await
+                .map_err(|source| {
+                    let diagnostic = source.safe_diagnostic_source(
+                        DiagnosticStage::Lua,
+                        DiagnosticImpact::Unchanged,
+                        DiagnosticAction::CheckProjectState,
+                    );
+                    project_lua_translation_host_error(
+                        surface.domain(),
+                        "snapshot_unavailable",
+                        surface.operation(),
+                        source,
+                        diagnostic,
+                    )
+                })?;
+                let resources = TranslationPlanningResourceReadingService::new(
+                    self.file_system.clone(),
+                    self.cpu.clone(),
+                );
+                let planner = RpgMakerStandardTranslationTaskPlanningService::<
+                    _,
+                    _,
+                    OpenAiChatCompletionClient,
+                >::new(
+                    resources,
+                    translation_resources,
+                    placeholders,
+                    self.cpu.clone(),
+                );
+                let (standard_session, semantics) = planner
+                    .open_candidate_session_with_semantics(&self.project, &profile, corpus)
+                    .await
+                    .map_err(|source| {
+                        let diagnostic = source.safe_diagnostic_source(
+                            DiagnosticStage::Lua,
+                            DiagnosticImpact::Unchanged,
+                            DiagnosticAction::FixInput,
+                        );
+                        project_lua_translation_host_error(
+                            surface.domain(),
+                            "open_failed",
+                            surface.operation(),
+                            source,
+                            diagnostic,
+                        )
+                    })?;
+                let resolved = self
+                    .resolved
+                    .get()
+                    .expect("成功解析项目 Lua 翻译语义前必须已经冻结 Profile");
+                let _ = self.opened_profile.set(resolved.profile_id.clone());
+                Ok(ResolvedProjectLuaTranslationContext {
+                    standard_session: Arc::new(standard_session),
+                    semantics,
+                    managed_system_prompt,
+                })
+            })
+            .await
+    }
+
     async fn open_session(
         &self,
     ) -> Result<Arc<dyn TrustedLuaStandardSession>, TrustedLuaHostCallError> {
-        let configuration = self.resolve_configuration().await?;
-        let (profile, translation_resources) = build_production_translation_profile(
-            configuration.as_ref(),
-            self.ui_locale,
-            &self.file_system,
-            &self.project,
-        )
-        .await
-        .map_err(project_lua_standard_translation_build_error)?;
-        let placeholders = Pcre2PlaceholderService::new()
-            .map_err(ProductionTranslationExecutionBuildError::builtin_placeholder_compile)
-            .map_err(project_lua_standard_translation_build_error)?;
-        let corpus = RpgMakerStandardTranslationAssetReadingService::new(
-            self.sqlite.clone(),
-            self.cpu.clone(),
-        )
-        .read(&self.project)
-        .await
-        .map_err(|source| {
-            let diagnostic = source.safe_diagnostic_source(
-                DiagnosticStage::Lua,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            );
-            project_lua_standard_host_error(
-                "snapshot_unavailable",
-                "standard.open",
-                source,
-                diagnostic,
-            )
-        })?;
-        let resources = TranslationPlanningResourceReadingService::new(
-            self.file_system.clone(),
-            self.cpu.clone(),
-        );
-        let planner = RpgMakerStandardTranslationTaskPlanningService::<
-            _,
-            _,
-            OpenAiChatCompletionClient,
-        >::new(
-            resources,
-            translation_resources,
-            placeholders,
-            self.cpu.clone(),
-        );
-        let session = planner
-            .open_candidate_session(&self.project, &profile, corpus)
-            .await
-            .map_err(|source| {
-                let diagnostic = source.safe_diagnostic_source(
-                    DiagnosticStage::Lua,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::FixInput,
-                );
-                project_lua_standard_host_error("open_failed", "standard.open", source, diagnostic)
-            })?;
-        let resolved = self
-            .resolved
-            .get()
-            .expect("成功打开 Standard 会话前必须已经冻结 Profile");
-        let _ = self.opened_profile.set(resolved.profile_id.clone());
+        let shared = self
+            .resolve_translation_context(ProjectLuaTranslationSurface::Standard)
+            .await?;
         let session: Arc<dyn TrustedLuaStandardSession> =
             Arc::new(ProductionProjectLuaStandardSession {
                 project: self.project.clone(),
-                session: Arc::new(session),
+                session: Arc::clone(&shared.standard_session),
                 acceptance: Arc::new(RpgMakerStandardCandidateAcceptanceService::new(
                     self.sqlite.clone(),
                     self.cpu.clone(),
@@ -4593,9 +4647,48 @@ impl ProductionProjectLuaStandardHostCalls {
             });
         Ok(session)
     }
+
+    async fn open_managed_edit_session(
+        &self,
+    ) -> Result<Arc<dyn TrustedLuaManagedEditSession>, TrustedLuaHostCallError> {
+        let shared = self
+            .resolve_translation_context(ProjectLuaTranslationSurface::Managed)
+            .await?;
+        let semantics: Arc<dyn TrustedLuaTranslationSemantics> = shared.semantics.clone();
+        let semantics =
+            RpgManagedSemanticsAdapter::new(semantics, shared.managed_system_prompt.clone());
+        let store = Arc::new(RpgManagedStoreAdapter::new(
+            ManagedTranslationSqliteRepository::new(self.sqlite.clone()),
+            self.project.clone(),
+        ));
+        let baseline = store
+            .load()
+            .await
+            .map_err(|error| error.with_operation("translations.edit"))?
+            .unwrap_or(
+                ManagedTranslationSnapshot::new(
+                    self.project.source_snapshot_fingerprint(),
+                    Vec::new(),
+                )
+                .map_err(|source| {
+                    project_lua_managed_session_error(
+                        "snapshot_invalid",
+                        "translations.edit",
+                        source,
+                    )
+                })?,
+            );
+        let session = ManagedTranslationCandidateSession::open(baseline, &semantics)
+            .map_err(|error| error.with_operation("translations.edit"))?;
+        Ok(Arc::new(ProductionProjectLuaManagedEditSession {
+            session: Arc::new(session),
+            store,
+            acceptance_gate: Arc::new(tokio::sync::Mutex::new(())),
+        }))
+    }
 }
 
-impl TrustedLuaStandardHostCalls for ProductionProjectLuaStandardHostCalls {
+impl TrustedLuaStandardHostCalls for ProductionProjectLuaTranslationHostCalls {
     fn open(
         &self,
     ) -> Pin<
@@ -4608,6 +4701,7 @@ impl TrustedLuaStandardHostCalls for ProductionProjectLuaStandardHostCalls {
         let calls = Self {
             selection: self.selection.clone(),
             resolved: Arc::clone(&self.resolved),
+            shared: Arc::clone(&self.shared),
             opened_profile: Arc::clone(&self.opened_profile),
             project: self.project.clone(),
             ui_locale: self.ui_locale,
@@ -4619,15 +4713,163 @@ impl TrustedLuaStandardHostCalls for ProductionProjectLuaStandardHostCalls {
     }
 }
 
+impl TrustedLuaManagedEditHostCalls for ProductionProjectLuaTranslationHostCalls {
+    fn edit(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<Arc<dyn TrustedLuaManagedEditSession>, TrustedLuaHostCallError>,
+                > + Send
+                + 'static,
+        >,
+    > {
+        let calls = Self {
+            selection: self.selection.clone(),
+            resolved: Arc::clone(&self.resolved),
+            shared: Arc::clone(&self.shared),
+            opened_profile: Arc::clone(&self.opened_profile),
+            project: self.project.clone(),
+            ui_locale: self.ui_locale,
+            file_system: self.file_system.clone(),
+            sqlite: self.sqlite.clone(),
+            cpu: self.cpu.clone(),
+        };
+        Box::pin(async move { calls.open_managed_edit_session().await })
+    }
+}
+
 struct ResolvedProjectLuaStandardConfiguration {
     profile_id: String,
     configuration: Arc<TranslateConfiguration>,
+}
+
+#[derive(Clone, Copy)]
+enum ProjectLuaTranslationSurface {
+    Standard,
+    Managed,
+}
+
+impl ProjectLuaTranslationSurface {
+    const fn domain(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Managed => "translations",
+        }
+    }
+
+    const fn operation(self) -> &'static str {
+        match self {
+            Self::Standard => "standard.open",
+            Self::Managed => "translations.edit",
+        }
+    }
+}
+
+struct ResolvedProjectLuaTranslationContext {
+    standard_session: Arc<StandardCandidateSession>,
+    semantics: Arc<crate::rpg_maker::translate::semantics::ResolvedTranslationSemantics>,
+    managed_system_prompt: RpgMakerSystemPrompt,
 }
 
 struct ProductionProjectLuaStandardSession {
     project: OpenedProject,
     session: Arc<StandardCandidateSession>,
     acceptance: Arc<ProductionStandardCandidateAcceptance>,
+}
+
+type ProductionManagedEditStore =
+    RpgManagedStoreAdapter<ManagedTranslationSqliteRepository<RusqliteStorage>>;
+
+struct ProductionProjectLuaManagedEditSession {
+    session: Arc<ManagedTranslationCandidateSession<ManagedTranslationSnapshot>>,
+    store: Arc<ProductionManagedEditStore>,
+    acceptance_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl TrustedLuaManagedEditSession for ProductionProjectLuaManagedEditSession {
+    fn units(
+        &self,
+    ) -> Result<
+        Vec<crate::managed_translation::ManagedTranslationCandidateUnit>,
+        TrustedLuaHostCallError,
+    > {
+        self.session.units().map_err(|source| {
+            project_lua_managed_session_error("session_unavailable", "translations.units", source)
+        })
+    }
+
+    fn get(
+        &self,
+        collection: String,
+        key: String,
+    ) -> Result<
+        Option<crate::managed_translation::ManagedTranslationCandidateUnit>,
+        TrustedLuaHostCallError,
+    > {
+        self.session.get(&collection, &key).map_err(|source| {
+            project_lua_managed_session_error("session_unavailable", "translations.get", source)
+        })
+    }
+
+    fn accept(
+        &self,
+        candidates: Vec<ManagedTranslationCandidateRequest>,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Vec<ManagedTranslationCandidateAcceptance>,
+                        TrustedLuaHostCallError,
+                    >,
+                > + Send
+                + 'static,
+        >,
+    > {
+        let session = Arc::clone(&self.session);
+        let store = Arc::clone(&self.store);
+        let acceptance_gate = Arc::clone(&self.acceptance_gate);
+        Box::pin(async move {
+            let _guard = acceptance_gate.lock().await;
+            let prepared = session.prepare_acceptance(candidates).map_err(|source| {
+                project_lua_managed_session_error(
+                    "acceptance_failed",
+                    "translations.accept",
+                    source,
+                )
+            })?;
+            let results = prepared.results().to_vec();
+            if prepared.replacements().is_empty() {
+                return Ok(results);
+            }
+            let checkpoint = store
+                .checkpoint(
+                    prepared.baseline(),
+                    prepared.replacements().to_vec(),
+                    ManagedTranslationCheckpointMode::CompleteGuard,
+                )
+                .await;
+            let committed = match checkpoint {
+                ManagedTranslationStoreCheckpoint::Applied(committed) => committed,
+                ManagedTranslationStoreCheckpoint::PreparationFailed(source)
+                | ManagedTranslationStoreCheckpoint::NotApplied(source)
+                | ManagedTranslationStoreCheckpoint::OutcomeUnknown(source)
+                | ManagedTranslationStoreCheckpoint::Failed(source) => {
+                    return Err(source.with_operation("translations.accept"));
+                }
+            };
+            session
+                .apply_committed(&prepared, committed)
+                .map_err(|source| {
+                    project_lua_managed_session_error(
+                        "session_update_failed",
+                        "translations.accept",
+                        source,
+                    )
+                })?;
+            Ok(results)
+        })
+    }
 }
 
 impl TrustedLuaStandardSession for ProductionProjectLuaStandardSession {
@@ -4848,24 +5090,41 @@ fn project_lua_standard_projection_error(
     ))
 }
 
-fn project_lua_standard_command_error(
+fn project_lua_managed_session_error<E>(
+    kind: &'static str,
+    operation: &'static str,
+    source: E,
+) -> TrustedLuaHostCallError
+where
+    E: Error + Send + Sync + 'static,
+{
+    let message = source.to_string();
+    TrustedLuaHostCallError::new("translations", kind, message, None, Some(Arc::new(source)))
+        .with_operation(operation)
+}
+
+fn project_lua_translation_command_error(
+    domain: &'static str,
     kind: &'static str,
     operation: &'static str,
     source: ProductionCommandError,
 ) -> TrustedLuaHostCallError {
     let mut diagnostic = source.failure_report().primary.public().clone();
     diagnostic.stage = DiagnosticStage::Lua;
-    project_lua_standard_host_error(kind, operation, source, diagnostic)
+    project_lua_translation_host_error(domain, kind, operation, source, diagnostic)
 }
 
-fn project_lua_standard_translation_build_error(
+fn project_lua_translation_build_error(
+    domain: &'static str,
+    operation: &'static str,
     source: ProductionTranslationExecutionBuildError,
 ) -> TrustedLuaHostCallError {
     let mut diagnostic = source.diagnostic().clone();
     diagnostic.stage = DiagnosticStage::Lua;
-    project_lua_standard_host_error(
+    project_lua_translation_host_error(
+        domain,
         "profile_resources_invalid",
-        "standard.open",
+        operation,
         source,
         diagnostic,
     )
@@ -4910,7 +5169,8 @@ fn project_lua_standard_acceptance_error(
     .with_safe_diagnostic(diagnostic)
 }
 
-fn project_lua_standard_host_error<E>(
+fn project_lua_translation_host_error<E>(
+    domain: &'static str,
     kind: &'static str,
     operation: &'static str,
     source: E,
@@ -4920,7 +5180,7 @@ where
     E: Error + Send + Sync + 'static,
 {
     TrustedLuaHostCallError::new(
-        "standard",
+        domain,
         kind,
         source.to_string(),
         None,

@@ -1,10 +1,11 @@
 //! 引擎无关的 Managed 翻译规划、协议、执行与 checkpoint 协调内核。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
+use std::fmt;
 use std::future::Future;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -39,10 +40,16 @@ use crate::translation_protocol::{
 #[cfg(test)]
 use super::managed_translation_system_prompt_fragment;
 use super::{
-    MANAGED_REFLOW_WIRE_MARKER, ManagedTranslationCollection, ManagedTranslationContent,
-    ManagedTranslationPair, ManagedTranslationSemantics, ManagedTranslationShape,
-    ManagedTranslationUnit, TrustedLuaPreparedTranslation, TrustedLuaPreparedTranslationAcceptance,
-    TrustedLuaPreparedTranslationStatus, TrustedLuaTranslationTerm,
+    MANAGED_REFLOW_WIRE_MARKER, ManagedPreparedContent, ManagedPreparedContentAcceptance,
+    ManagedPreparedContentError, ManagedPreparedContentRejection, ManagedTranslationCollection,
+    ManagedTranslationContent, ManagedTranslationMetadata, ManagedTranslationPair,
+    ManagedTranslationSemantics, ManagedTranslationShape, ManagedTranslationTerm,
+    ManagedTranslationUnit,
+};
+#[cfg(test)]
+use super::{
+    ManagedPreparedTranslation, ManagedPreparedTranslationAcceptance,
+    ManagedPreparedTranslationStatus,
 };
 
 const IN_FLIGHT_WINDOW_MULTIPLIER: NonZeroUsize = NonZeroUsize::new(3).unwrap();
@@ -338,6 +345,217 @@ impl ManagedUnitIdentity {
     }
 }
 
+/// 当前 Managed 人工候选会话中的稳定物理单元下标。
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct ManagedTranslationCandidateHandle(usize);
+
+impl ManagedTranslationCandidateHandle {
+    pub(crate) const fn new(value: usize) -> Self {
+        Self(value)
+    }
+
+    pub(crate) const fn get(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedTranslationCandidateUnitStatus {
+    Current,
+    Missing,
+    Stale,
+    NotApplicable,
+    Unavailable,
+}
+
+impl ManagedTranslationCandidateUnitStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Missing => "missing",
+            Self::Stale => "stale",
+            Self::NotApplicable => "not_applicable",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// 人工候选会话向调用方投影的完整冻结单元。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ManagedTranslationCandidateUnit {
+    handle: ManagedTranslationCandidateHandle,
+    collection: String,
+    key: String,
+    kind: String,
+    shape: ManagedTranslationShape,
+    original: ManagedTranslationContent,
+    context: String,
+    metadata: Option<ManagedTranslationMetadata>,
+    translation: Option<ManagedTranslationContent>,
+    model_content: ManagedTranslationContent,
+    terms: Vec<ManagedTranslationTerm>,
+    status: ManagedTranslationCandidateUnitStatus,
+    family_size: usize,
+}
+
+impl ManagedTranslationCandidateUnit {
+    pub(crate) const fn handle(&self) -> ManagedTranslationCandidateHandle {
+        self.handle
+    }
+
+    pub(crate) fn collection(&self) -> &str {
+        &self.collection
+    }
+
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
+
+    pub(crate) fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    pub(crate) const fn shape(&self) -> ManagedTranslationShape {
+        self.shape
+    }
+
+    pub(crate) fn original(&self) -> &ManagedTranslationContent {
+        &self.original
+    }
+
+    pub(crate) fn context(&self) -> &str {
+        &self.context
+    }
+
+    pub(crate) fn metadata(&self) -> Option<&ManagedTranslationMetadata> {
+        self.metadata.as_ref()
+    }
+
+    pub(crate) fn translation(&self) -> Option<&ManagedTranslationContent> {
+        self.translation.as_ref()
+    }
+
+    pub(crate) fn model_content(&self) -> &ManagedTranslationContent {
+        &self.model_content
+    }
+
+    pub(crate) fn terms(&self) -> &[ManagedTranslationTerm] {
+        &self.terms
+    }
+
+    pub(crate) const fn status(&self) -> ManagedTranslationCandidateUnitStatus {
+        self.status
+    }
+
+    pub(crate) const fn family_size(&self) -> usize {
+        self.family_size
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ManagedTranslationCandidateRequest {
+    handle: ManagedTranslationCandidateHandle,
+    candidate: ManagedTranslationContent,
+    replace_current: bool,
+}
+
+impl ManagedTranslationCandidateRequest {
+    pub(crate) fn new(
+        handle: ManagedTranslationCandidateHandle,
+        candidate: ManagedTranslationContent,
+        replace_current: bool,
+    ) -> Self {
+        Self {
+            handle,
+            candidate,
+            replace_current,
+        }
+    }
+}
+
+/// 人工候选普通拒绝携带的结构化补充事实。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedTranslationCandidateRejectionDetails {
+    Item { item: usize },
+    ItemCount { expected: usize, actual: usize },
+    Unavailable { detail: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedTranslationCandidateAcceptance {
+    Accepted {
+        content: ManagedTranslationContent,
+        changed_units: usize,
+    },
+    Rejected {
+        reason: String,
+        details: Option<ManagedTranslationCandidateRejectionDetails>,
+    },
+}
+
+impl ManagedTranslationCandidateAcceptance {
+    fn rejected(
+        reason: impl Into<String>,
+        details: Option<ManagedTranslationCandidateRejectionDetails>,
+    ) -> Self {
+        Self::Rejected {
+            reason: reason.into(),
+            details,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ManagedTranslationCandidateWrite {
+    unit_index: usize,
+    expected: Option<ManagedTranslationPair>,
+    replacement: ManagedTranslationPair,
+}
+
+/// 一批候选完成领域验收后形成的冻结 CAS 计划。
+#[derive(Clone)]
+pub(crate) struct PreparedManagedTranslationCandidateAcceptance<S> {
+    baseline: S,
+    results: Vec<ManagedTranslationCandidateAcceptance>,
+    replacements: Vec<ManagedTranslationReplacement>,
+    writes: Vec<ManagedTranslationCandidateWrite>,
+}
+
+impl<S> PreparedManagedTranslationCandidateAcceptance<S> {
+    pub(crate) fn baseline(&self) -> &S {
+        &self.baseline
+    }
+
+    pub(crate) fn results(&self) -> &[ManagedTranslationCandidateAcceptance] {
+        &self.results
+    }
+
+    pub(crate) fn replacements(&self) -> &[ManagedTranslationReplacement] {
+        &self.replacements
+    }
+}
+
+struct ManagedTranslationCandidateUnitState {
+    view: ManagedTranslationCandidateUnit,
+    prepared: Option<PreparedManagedUnit>,
+    family_index: Option<usize>,
+    unavailable_reason: Option<String>,
+}
+
+struct ManagedTranslationCandidateSessionState<S> {
+    baseline: S,
+    units: Vec<ManagedTranslationCandidateUnitState>,
+}
+
+/// 一次 `open` 冻结的 Managed 语义、family 与项目快照。
+pub(crate) struct ManagedTranslationCandidateSession<S>
+where
+    S: ManagedTranslationSnapshotView,
+{
+    families: Vec<Vec<usize>>,
+    state: Mutex<ManagedTranslationCandidateSessionState<S>>,
+}
+
 /// 一项 unit 在本轮 Translate 结束时的业务结果。
 #[derive(Clone)]
 pub(crate) struct ManagedUnitResult {
@@ -413,12 +631,6 @@ impl<S> ManagedTranslationKernelOutput<S> {
     }
 }
 
-#[derive(Clone)]
-enum PreparedManagedSemantics {
-    Atomic(Arc<dyn TrustedLuaPreparedTranslation>),
-    Items(Vec<Arc<dyn TrustedLuaPreparedTranslation>>),
-}
-
 #[derive(Clone, Copy)]
 struct ManagedUnitStateContext(Sha256Fingerprint);
 
@@ -440,21 +652,14 @@ struct PreparedManagedUnit {
     original: ManagedTranslationContent,
     instruction: String,
     context: String,
-    semantics: PreparedManagedSemantics,
+    semantics: ManagedPreparedContent,
     state_context: ManagedUnitStateContext,
     stored_translation: Option<ManagedTranslationPair>,
 }
 
 impl PreparedManagedUnit {
     fn active(&self) -> bool {
-        match &self.semantics {
-            PreparedManagedSemantics::Atomic(prepared) => {
-                prepared.status() == TrustedLuaPreparedTranslationStatus::Active
-            }
-            PreparedManagedSemantics::Items(items) => items
-                .iter()
-                .any(|prepared| prepared.status() == TrustedLuaPreparedTranslationStatus::Active),
-        }
+        self.semantics.is_active()
     }
 
     fn current_translation(&self) -> Option<&ManagedTranslationPair> {
@@ -464,46 +669,11 @@ impl PreparedManagedUnit {
     }
 
     fn model_content(&self) -> ManagedTranslationContent {
-        match &self.semantics {
-            PreparedManagedSemantics::Atomic(prepared) => match self.shape {
-                ManagedTranslationShape::Single | ManagedTranslationShape::Reflow => {
-                    ManagedTranslationContent::scalar(prepared.model_text())
-                }
-                ManagedTranslationShape::Lines => ManagedTranslationContent::array(
-                    prepared
-                        .model_text()
-                        .split('\n')
-                        .map(str::to_owned)
-                        .collect(),
-                ),
-                ManagedTranslationShape::Items => unreachable!("items 使用逐项语义"),
-            },
-            PreparedManagedSemantics::Items(items) => ManagedTranslationContent::array(
-                items
-                    .iter()
-                    .map(|prepared| prepared.model_text().to_owned())
-                    .collect(),
-            ),
-        }
+        self.semantics.model_content()
     }
 
-    fn terms(&self) -> Vec<TrustedLuaTranslationTerm> {
-        let mut seen = HashSet::new();
-        let mut terms = Vec::new();
-        let prepared: Vec<&dyn TrustedLuaPreparedTranslation> = match &self.semantics {
-            PreparedManagedSemantics::Atomic(prepared) => vec![prepared.as_ref()],
-            PreparedManagedSemantics::Items(items) => {
-                items.iter().map(|prepared| prepared.as_ref()).collect()
-            }
-        };
-        for prepared in prepared {
-            for term in prepared.terms() {
-                if seen.insert((term.term().to_owned(), term.translation().to_owned())) {
-                    terms.push(term.clone());
-                }
-            }
-        }
-        terms
+    fn terms(&self) -> Vec<ManagedTranslationTerm> {
+        self.semantics.terms()
     }
 }
 
@@ -573,33 +743,19 @@ fn prepare_managed_input(
         unit,
     } = input;
     let base_context = managed_semantic_context(&instruction, unit.shape(), unit.context());
-    let prepared = match (unit.shape(), unit.original()) {
-        (
-            ManagedTranslationShape::Single | ManagedTranslationShape::Reflow,
-            ManagedTranslationContent::Scalar(_),
-        )
-        | (ManagedTranslationShape::Lines, ManagedTranslationContent::Array(_)) => {
-            PreparedManagedSemantics::Atomic(semantics.prepare_translation(
-                unit.kind(),
-                unit.shape(),
-                unit.original(),
-                &base_context,
-            )?)
+    let prepared = ManagedPreparedContent::prepare(
+        semantics,
+        unit.kind(),
+        unit.shape(),
+        unit.original(),
+        &base_context,
+    )
+    .map_err(|source| match source {
+        ManagedPreparedContentError::InvalidOriginal(source) => {
+            managed_internal_source_error("invalid_original", source, "managed_preparation")
         }
-        (ManagedTranslationShape::Items, ManagedTranslationContent::Array(original)) => {
-            let mut items = Vec::with_capacity(original.len());
-            for (index, item) in original.iter().enumerate() {
-                items.push(semantics.prepare_translation(
-                    unit.kind(),
-                    ManagedTranslationShape::Items,
-                    &ManagedTranslationContent::scalar(item),
-                    &format!("{base_context}\nitem_index={index}"),
-                )?);
-            }
-            PreparedManagedSemantics::Items(items)
-        }
-        _ => unreachable!("托管模型已经建立 shape/content 不变量"),
-    };
+        ManagedPreparedContentError::Semantics(source) => source,
+    })?;
     let state_context = managed_state_context(
         semantics,
         &unit,
@@ -635,7 +791,7 @@ fn managed_state_context(
     semantics: &dyn ManagedTranslationSemantics,
     unit: &ManagedTranslationUnit,
     instruction: &str,
-    prepared: &PreparedManagedSemantics,
+    prepared: &ManagedPreparedContent,
     system_prompt_fingerprint: Sha256Fingerprint,
 ) -> ManagedUnitStateContext {
     let mut hasher = Sha256FramedHasher::new(b"att.managed_translation.context");
@@ -648,19 +804,7 @@ fn managed_state_context(
         .frame(6, unit.original().canonical_json().as_bytes())
         .frame(7, instruction.as_bytes())
         .frame(8, unit.context().as_bytes());
-    match prepared {
-        PreparedManagedSemantics::Atomic(prepared) => {
-            hasher
-                .frame(9, b"atomic")
-                .frame(10, prepared.semantic_fingerprint().as_bytes());
-        }
-        PreparedManagedSemantics::Items(items) => {
-            hasher.frame(9, b"items");
-            for prepared in items {
-                hasher.frame(10, prepared.semantic_fingerprint().as_bytes());
-            }
-        }
-    }
+    prepared.frame_automatic_state_context(&mut hasher);
     hasher.frame(11, system_prompt_fingerprint.as_bytes());
     ManagedUnitStateContext(hasher.finish())
 }
@@ -691,6 +835,473 @@ fn unit_store_pair(
         .map_err(|source| {
             managed_internal_source_error("invalid_pair", source, "managed_translation_pair")
         })
+}
+
+impl<S> ManagedTranslationCandidateSession<S>
+where
+    S: ManagedTranslationSnapshotView,
+{
+    pub(crate) fn open(
+        baseline: S,
+        semantics: &dyn ManagedTranslationSemantics,
+    ) -> Result<Self, TrustedLuaHostCallError> {
+        let system_prompt_fingerprint =
+            managed_system_prompt_fingerprint(semantics.system_prompt());
+        let mut units = Vec::new();
+        for input in managed_preparation_inputs(&baseline) {
+            let source_unit = input.unit.clone();
+            let collection = input.collection_name.clone();
+            let prepared = prepare_managed_input(input, semantics, system_prompt_fingerprint);
+            let handle = ManagedTranslationCandidateHandle::new(units.len());
+            match prepared {
+                Ok(prepared) => {
+                    let status = if !prepared.active() {
+                        ManagedTranslationCandidateUnitStatus::NotApplicable
+                    } else if prepared.current_translation().is_some() {
+                        ManagedTranslationCandidateUnitStatus::Current
+                    } else if prepared.stored_translation.is_some() {
+                        ManagedTranslationCandidateUnitStatus::Stale
+                    } else {
+                        ManagedTranslationCandidateUnitStatus::Missing
+                    };
+                    units.push(ManagedTranslationCandidateUnitState {
+                        view: ManagedTranslationCandidateUnit {
+                            handle,
+                            collection,
+                            key: source_unit.key().to_owned(),
+                            kind: source_unit.kind().to_owned(),
+                            shape: source_unit.shape(),
+                            original: source_unit.original().clone(),
+                            context: source_unit.context().to_owned(),
+                            metadata: source_unit.metadata().cloned(),
+                            translation: source_unit
+                                .translation()
+                                .map(|pair| pair.content().clone()),
+                            model_content: prepared.model_content(),
+                            terms: prepared.terms(),
+                            status,
+                            family_size: 1,
+                        },
+                        prepared: Some(prepared),
+                        family_index: None,
+                        unavailable_reason: None,
+                    });
+                }
+                Err(source) => {
+                    units.push(ManagedTranslationCandidateUnitState {
+                        view: ManagedTranslationCandidateUnit {
+                            handle,
+                            collection,
+                            key: source_unit.key().to_owned(),
+                            kind: source_unit.kind().to_owned(),
+                            shape: source_unit.shape(),
+                            original: source_unit.original().clone(),
+                            context: source_unit.context().to_owned(),
+                            metadata: source_unit.metadata().cloned(),
+                            translation: source_unit
+                                .translation()
+                                .map(|pair| pair.content().clone()),
+                            model_content: source_unit.original().clone(),
+                            terms: Vec::new(),
+                            status: ManagedTranslationCandidateUnitStatus::Unavailable,
+                            family_size: 1,
+                        },
+                        prepared: None,
+                        family_index: None,
+                        unavailable_reason: Some(source.to_string()),
+                    });
+                }
+            }
+        }
+
+        let mut families = Vec::<Vec<usize>>::new();
+        let mut family_by_context = HashMap::<Sha256Fingerprint, usize>::new();
+        for (unit_index, unit) in units.iter_mut().enumerate() {
+            let Some(prepared) = unit.prepared.as_ref().filter(|prepared| prepared.active()) else {
+                continue;
+            };
+            let family_index = *family_by_context
+                .entry(prepared.state_context.0)
+                .or_insert_with(|| {
+                    let index = families.len();
+                    families.push(Vec::new());
+                    index
+                });
+            unit.family_index = Some(family_index);
+            families[family_index].push(unit_index);
+        }
+
+        for (family_index, members) in families.iter().enumerate() {
+            let family_size = members.len();
+            let mut current = None::<ManagedTranslationContent>;
+            for &unit_index in members {
+                let unit = &units[unit_index];
+                let prepared = unit
+                    .prepared
+                    .as_ref()
+                    .expect("active family member 必须保留 prepared");
+                if let Some(pair) = prepared.current_translation() {
+                    match &current {
+                        None => current = Some(pair.content().clone()),
+                        Some(existing) if existing == pair.content() => {}
+                        Some(_) => {
+                            return Err(managed_project_state_error(
+                                "current_conflict",
+                                format!(
+                                    "同一托管翻译去重族存在冲突的 Current 译文：{}/{}",
+                                    unit.view.collection, unit.view.key
+                                ),
+                                DiagnosticFailureKind::ConflictingValues,
+                                "resolve_conflicting_managed_translations",
+                            ));
+                        }
+                    }
+                }
+            }
+            for &unit_index in members {
+                units[unit_index].family_index = Some(family_index);
+                units[unit_index].view.family_size = family_size;
+            }
+        }
+
+        Ok(Self {
+            families,
+            state: Mutex::new(ManagedTranslationCandidateSessionState { baseline, units }),
+        })
+    }
+
+    pub(crate) fn units(
+        &self,
+    ) -> Result<Vec<ManagedTranslationCandidateUnit>, ManagedTranslationCandidateSessionError> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| ManagedTranslationCandidateSessionError::SessionPoisoned)?
+            .units
+            .iter()
+            .map(|unit| unit.view.clone())
+            .collect())
+    }
+
+    pub(crate) fn get(
+        &self,
+        collection: &str,
+        key: &str,
+    ) -> Result<Option<ManagedTranslationCandidateUnit>, ManagedTranslationCandidateSessionError>
+    {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| ManagedTranslationCandidateSessionError::SessionPoisoned)?
+            .units
+            .iter()
+            .find(|unit| unit.view.collection == collection && unit.view.key == key)
+            .map(|unit| unit.view.clone()))
+    }
+
+    pub(crate) fn prepare_acceptance(
+        &self,
+        requests: Vec<ManagedTranslationCandidateRequest>,
+    ) -> Result<
+        PreparedManagedTranslationCandidateAcceptance<S>,
+        ManagedTranslationCandidateSessionError,
+    > {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ManagedTranslationCandidateSessionError::SessionPoisoned)?;
+        let mut results = vec![None; requests.len()];
+        let mut requests_by_family = BTreeMap::<usize, Vec<usize>>::new();
+
+        for (request_index, request) in requests.iter().enumerate() {
+            let unit = state.units.get(request.handle.get()).ok_or(
+                ManagedTranslationCandidateSessionError::InvalidHandle {
+                    handle: request.handle.get(),
+                    unit_count: state.units.len(),
+                },
+            )?;
+            match unit.view.status {
+                ManagedTranslationCandidateUnitStatus::NotApplicable => {
+                    results[request_index] = Some(ManagedTranslationCandidateAcceptance::rejected(
+                        "not_applicable",
+                        None,
+                    ));
+                }
+                ManagedTranslationCandidateUnitStatus::Unavailable => {
+                    results[request_index] = Some(ManagedTranslationCandidateAcceptance::rejected(
+                        "unavailable",
+                        Some(ManagedTranslationCandidateRejectionDetails::Unavailable {
+                            detail: unit
+                                .unavailable_reason
+                                .clone()
+                                .unwrap_or_else(|| "managed_unit_unavailable".to_owned()),
+                        }),
+                    ));
+                }
+                ManagedTranslationCandidateUnitStatus::Current
+                | ManagedTranslationCandidateUnitStatus::Missing
+                | ManagedTranslationCandidateUnitStatus::Stale => {
+                    let family_index = unit.family_index.ok_or(
+                        ManagedTranslationCandidateSessionError::ActiveUnitMissingFamily {
+                            handle: request.handle.get(),
+                        },
+                    )?;
+                    requests_by_family
+                        .entry(family_index)
+                        .or_default()
+                        .push(request_index);
+                }
+            }
+        }
+
+        let mut replacements = Vec::new();
+        let mut writes = Vec::new();
+        for (family_index, request_indices) in requests_by_family {
+            let first = &requests[request_indices[0]];
+            if request_indices.iter().skip(1).any(|&request_index| {
+                let request = &requests[request_index];
+                request.candidate != first.candidate
+                    || request.replace_current != first.replace_current
+            }) {
+                for request_index in request_indices {
+                    results[request_index] = Some(ManagedTranslationCandidateAcceptance::rejected(
+                        "conflicting_candidate",
+                        None,
+                    ));
+                }
+                continue;
+            }
+
+            let members = self.families.get(family_index).ok_or(
+                ManagedTranslationCandidateSessionError::InvalidFamily {
+                    family: family_index,
+                },
+            )?;
+            let unit = &state.units[first.handle.get()];
+            let prepared = unit.prepared.as_ref().ok_or(
+                ManagedTranslationCandidateSessionError::ActiveUnitMissingPrepared {
+                    handle: first.handle.get(),
+                },
+            )?;
+            let accepted = match prepared
+                .semantics
+                .accept(first.candidate.clone())
+                .map_err(ManagedTranslationCandidateSessionError::Semantics)?
+            {
+                ManagedPreparedContentAcceptance::Accepted { content, .. } => content,
+                ManagedPreparedContentAcceptance::Rejected { rejection } => {
+                    let details = candidate_rejection_details(&rejection);
+                    for request_index in request_indices {
+                        results[request_index] =
+                            Some(ManagedTranslationCandidateAcceptance::rejected(
+                                rejection.reason(),
+                                details.clone(),
+                            ));
+                    }
+                    continue;
+                }
+            };
+
+            let changes_current = members.iter().any(|&member_index| {
+                let member = &state.units[member_index];
+                member.view.status == ManagedTranslationCandidateUnitStatus::Current
+                    && member.view.translation.as_ref() != Some(&accepted)
+            });
+            if changes_current && !first.replace_current {
+                for request_index in request_indices {
+                    results[request_index] = Some(ManagedTranslationCandidateAcceptance::rejected(
+                        "current_replacement_required",
+                        None,
+                    ));
+                }
+                continue;
+            }
+
+            let mut family_writes = Vec::with_capacity(members.len());
+            let mut changed_units = 0usize;
+            for &member_index in members {
+                let member = &state.units[member_index];
+                let prepared = member.prepared.as_ref().ok_or(
+                    ManagedTranslationCandidateSessionError::ActiveUnitMissingPrepared {
+                        handle: member_index,
+                    },
+                )?;
+                let replacement = unit_store_pair(prepared, accepted.clone())
+                    .map_err(ManagedTranslationCandidateSessionError::Pair)?;
+                let expected = prepared.stored_translation.clone();
+                if expected.as_ref() != Some(&replacement) {
+                    changed_units = changed_units.saturating_add(1);
+                    replacements.push(ManagedTranslationReplacement::new(
+                        &prepared.identity.collection,
+                        &prepared.identity.key,
+                        Some(replacement.clone()),
+                    ));
+                }
+                family_writes.push(ManagedTranslationCandidateWrite {
+                    unit_index: member_index,
+                    expected,
+                    replacement,
+                });
+            }
+            writes.extend(family_writes);
+            for request_index in request_indices {
+                results[request_index] = Some(ManagedTranslationCandidateAcceptance::Accepted {
+                    content: accepted.clone(),
+                    changed_units,
+                });
+            }
+        }
+
+        Ok(PreparedManagedTranslationCandidateAcceptance {
+            baseline: state.baseline.clone(),
+            results: results
+                .into_iter()
+                .map(|result| result.expect("每项 Managed 人工候选必须得到普通结果"))
+                .collect(),
+            replacements,
+            writes,
+        })
+    }
+
+    /// 在外部存储确认应用 CAS 后，用重读快照推进同一个会话。
+    pub(crate) fn apply_committed(
+        &self,
+        prepared: &PreparedManagedTranslationCandidateAcceptance<S>,
+        committed_snapshot: S,
+    ) -> Result<(), ManagedTranslationCandidateSessionError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ManagedTranslationCandidateSessionError::SessionPoisoned)?;
+        if state.baseline != prepared.baseline {
+            return Err(ManagedTranslationCandidateSessionError::BaselineChanged);
+        }
+        for write in &prepared.writes {
+            let unit_count = state.units.len();
+            let unit = state.units.get_mut(write.unit_index).ok_or(
+                ManagedTranslationCandidateSessionError::InvalidHandle {
+                    handle: write.unit_index,
+                    unit_count,
+                },
+            )?;
+            let prepared_unit = unit.prepared.as_mut().ok_or(
+                ManagedTranslationCandidateSessionError::ActiveUnitMissingPrepared {
+                    handle: write.unit_index,
+                },
+            )?;
+            if prepared_unit.stored_translation != write.expected {
+                return Err(
+                    ManagedTranslationCandidateSessionError::FrozenExpectedChanged {
+                        collection: unit.view.collection.clone(),
+                        key: unit.view.key.clone(),
+                    },
+                );
+            }
+            let committed =
+                snapshot_translation(&committed_snapshot, &unit.view.collection, &unit.view.key);
+            if committed != Some(Some(&write.replacement)) {
+                return Err(
+                    ManagedTranslationCandidateSessionError::CommittedSnapshotMismatch {
+                        collection: unit.view.collection.clone(),
+                        key: unit.view.key.clone(),
+                    },
+                );
+            }
+            prepared_unit.stored_translation = Some(write.replacement.clone());
+            unit.view.translation = Some(write.replacement.content().clone());
+            unit.view.status = ManagedTranslationCandidateUnitStatus::Current;
+        }
+        state.baseline = committed_snapshot;
+        Ok(())
+    }
+}
+
+fn snapshot_translation<'a, S>(
+    snapshot: &'a S,
+    collection: &str,
+    key: &str,
+) -> Option<Option<&'a ManagedTranslationPair>>
+where
+    S: ManagedTranslationSnapshotView,
+{
+    snapshot
+        .collections()
+        .iter()
+        .find(|candidate| candidate.name() == collection)
+        .and_then(|collection| collection.unit(key))
+        .map(ManagedTranslationUnit::translation)
+}
+
+fn candidate_rejection_details(
+    rejection: &ManagedPreparedContentRejection,
+) -> Option<ManagedTranslationCandidateRejectionDetails> {
+    if let Some((expected, actual)) = rejection.expected_actual() {
+        Some(ManagedTranslationCandidateRejectionDetails::ItemCount { expected, actual })
+    } else {
+        rejection
+            .item_number()
+            .map(|item| ManagedTranslationCandidateRejectionDetails::Item { item })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ManagedTranslationCandidateSessionError {
+    SessionPoisoned,
+    InvalidHandle { handle: usize, unit_count: usize },
+    InvalidFamily { family: usize },
+    ActiveUnitMissingFamily { handle: usize },
+    ActiveUnitMissingPrepared { handle: usize },
+    BaselineChanged,
+    FrozenExpectedChanged { collection: String, key: String },
+    CommittedSnapshotMismatch { collection: String, key: String },
+    Semantics(TrustedLuaHostCallError),
+    Pair(TrustedLuaHostCallError),
+}
+
+impl fmt::Display for ManagedTranslationCandidateSessionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SessionPoisoned => formatter.write_str("Managed 人工候选会话互斥锁已中毒"),
+            Self::InvalidHandle { handle, unit_count } => write!(
+                formatter,
+                "Managed 人工候选 handle 超出冻结会话范围：handle={handle}, unit_count={unit_count}"
+            ),
+            Self::InvalidFamily { family } => {
+                write!(formatter, "Managed 人工候选 family 不存在：{family}")
+            }
+            Self::ActiveUnitMissingFamily { handle } => {
+                write!(formatter, "活动 Managed 单元缺少 family：handle={handle}")
+            }
+            Self::ActiveUnitMissingPrepared { handle } => {
+                write!(
+                    formatter,
+                    "活动 Managed 单元缺少 prepared 语义：handle={handle}"
+                )
+            }
+            Self::BaselineChanged => {
+                formatter.write_str("Managed 人工候选会话基线已在本次 CAS 计划后改变")
+            }
+            Self::FrozenExpectedChanged { collection, key } => write!(
+                formatter,
+                "Managed 人工候选冻结预期已改变：{collection}/{key}"
+            ),
+            Self::CommittedSnapshotMismatch { collection, key } => write!(
+                formatter,
+                "Managed 人工候选提交后快照与 replacement 不一致：{collection}/{key}"
+            ),
+            Self::Semantics(source) => write!(formatter, "Managed 人工候选语义验收失败：{source}"),
+            Self::Pair(source) => write!(formatter, "Managed 人工候选无法建立受管译文：{source}"),
+        }
+    }
+}
+
+impl Error for ManagedTranslationCandidateSessionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Semantics(source) | Self::Pair(source) => Some(source),
+            _ => None,
+        }
+    }
 }
 
 fn finalize_managed_plan(
@@ -886,7 +1497,7 @@ fn managed_message_prefix_character_count(instruction: &str) -> usize {
     rendered.chars().count()
 }
 
-fn managed_term_character_count(term: &TrustedLuaTranslationTerm) -> usize {
+fn managed_term_character_count(term: &ManagedTranslationTerm) -> usize {
     let mut rendered = String::from("- ");
     push_markdown_literal(&mut rendered, term.term());
     rendered.push_str(" → ");
@@ -932,7 +1543,7 @@ fn finalize_managed_task(
 }
 
 fn render_managed_user_message(instruction: &str, families: &[ManagedFamily]) -> String {
-    let mut terms = Vec::<TrustedLuaTranslationTerm>::new();
+    let mut terms = Vec::<ManagedTranslationTerm>::new();
     let mut seen_terms = HashSet::new();
     for family in families {
         for term in family.representative.terms() {
@@ -1258,144 +1869,27 @@ fn accept_managed_candidate(
     values: &[String],
 ) -> Result<ManagedTaskDecision, TrustedLuaHostCallError> {
     let unit = &expected.representative;
-    if let Some((reason, details)) = validate_candidate_shape(unit, values) {
-        return Ok(ManagedTaskDecision::rejected(expected.id, reason, details));
-    }
-    match &unit.semantics {
-        PreparedManagedSemantics::Atomic(prepared) => {
-            let candidate = match unit.shape {
-                ManagedTranslationShape::Single => values[0].clone(),
-                ManagedTranslationShape::Reflow | ManagedTranslationShape::Lines => {
-                    values.join("\n")
-                }
-                ManagedTranslationShape::Items => unreachable!("items 使用逐项验收"),
-            };
-            match prepared.accept(candidate)? {
-                TrustedLuaPreparedTranslationAcceptance::Accepted { translation, .. } => {
-                    let content = match unit.shape {
-                        ManagedTranslationShape::Single | ManagedTranslationShape::Reflow => {
-                            ManagedTranslationContent::scalar(translation)
-                        }
-                        ManagedTranslationShape::Lines => ManagedTranslationContent::array(
-                            translation.split('\n').map(str::to_owned).collect(),
-                        ),
-                        ManagedTranslationShape::Items => unreachable!("items 使用逐项验收"),
-                    };
-                    if let Some((reason, details)) = validate_accepted_content(unit, &content) {
-                        return Ok(ManagedTaskDecision::rejected(expected.id, reason, details));
-                    }
-                    Ok(ManagedTaskDecision::accepted(expected.id, content))
-                }
-                TrustedLuaPreparedTranslationAcceptance::Rejected { reason } => {
-                    Ok(ManagedTaskDecision::rejected(expected.id, reason, None))
-                }
-            }
-        }
-        PreparedManagedSemantics::Items(prepared_items) => {
-            let originals = unit.original.as_array().expect("items 原文必须是数组");
-            let mut accepted = Vec::with_capacity(values.len());
-            for ((prepared, candidate), original) in
-                prepared_items.iter().zip(values).zip(originals)
-            {
-                if prepared.status() == TrustedLuaPreparedTranslationStatus::Active {
-                    match prepared.accept(candidate.clone())? {
-                        TrustedLuaPreparedTranslationAcceptance::Accepted {
-                            translation, ..
-                        } => accepted.push(translation),
-                        TrustedLuaPreparedTranslationAcceptance::Rejected { reason } => {
-                            return Ok(ManagedTaskDecision::rejected(expected.id, reason, None));
-                        }
-                    }
-                } else if candidate == prepared.model_text() {
-                    accepted.push(original.clone());
-                } else {
-                    return Ok(ManagedTaskDecision::rejected(
-                        expected.id,
-                        "inactive_item_changed",
-                        None,
-                    ));
-                }
-            }
-            let content = ManagedTranslationContent::array(accepted);
-            if let Some((reason, details)) = validate_accepted_content(unit, &content) {
-                return Ok(ManagedTaskDecision::rejected(expected.id, reason, details));
-            }
+    match unit.semantics.accept_wire_values(values)? {
+        ManagedPreparedContentAcceptance::Accepted { content, .. } => {
             Ok(ManagedTaskDecision::accepted(expected.id, content))
         }
+        ManagedPreparedContentAcceptance::Rejected { rejection } => {
+            let details = managed_content_rejection_details(&rejection);
+            Ok(ManagedTaskDecision::rejected(
+                expected.id,
+                rejection.reason(),
+                details,
+            ))
+        }
     }
 }
 
-fn validate_accepted_content(
-    unit: &PreparedManagedUnit,
-    content: &ManagedTranslationContent,
-) -> Option<(&'static str, Option<Value>)> {
-    match content {
-        ManagedTranslationContent::Scalar(value) => {
-            validate_candidate_shape(unit, std::slice::from_ref(value))
-        }
-        ManagedTranslationContent::Array(values) => validate_candidate_shape(unit, values),
+fn managed_content_rejection_details(rejection: &ManagedPreparedContentRejection) -> Option<Value> {
+    if let Some((expected, actual)) = rejection.expected_actual() {
+        Some(json!({"expected": expected, "actual": actual}))
+    } else {
+        rejection.item_number().map(|item| json!({"item": item}))
     }
-}
-
-fn validate_candidate_shape(
-    unit: &PreparedManagedUnit,
-    values: &[String],
-) -> Option<(&'static str, Option<Value>)> {
-    let invalid_item = values.iter().position(|value| {
-        value.contains(['\0', '\r'])
-            || (unit.shape != ManagedTranslationShape::Reflow && value.contains('\n'))
-    });
-    if let Some(index) = invalid_item {
-        return Some(("invalid_line_text", Some(json!({"item": index + 1}))));
-    }
-    match unit.shape {
-        ManagedTranslationShape::Single | ManagedTranslationShape::Reflow => {
-            if values.len() != 1 {
-                return Some((
-                    "item_count_mismatch",
-                    Some(json!({"expected": 1, "actual": values.len()})),
-                ));
-            }
-            if values[0].trim().is_empty() {
-                return Some(("blank_translation", None));
-            }
-        }
-        ManagedTranslationShape::Lines => {
-            let original = unit.original.as_array().expect("lines 原文必须是数组");
-            if values.len() != original.len() {
-                return Some((
-                    "item_count_mismatch",
-                    Some(json!({
-                        "expected": original.len(),
-                        "actual": values.len(),
-                    })),
-                ));
-            }
-            if let Some(index) = original
-                .iter()
-                .zip(values)
-                .position(|(source, target)| source.trim().is_empty() != target.trim().is_empty())
-            {
-                return Some(("blank_slot_mismatch", Some(json!({"item": index + 1}))));
-            }
-        }
-        ManagedTranslationShape::Items => {
-            let original = unit.original.as_array().expect("items 原文必须是数组");
-            if values.len() != original.len() {
-                return Some((
-                    "item_count_mismatch",
-                    Some(json!({
-                        "expected": original.len(),
-                        "actual": values.len(),
-                    })),
-                ));
-            }
-            if let Some(index) = values.iter().position(|value| value.trim().is_empty()) {
-                return Some(("blank_item", Some(json!({"item": index + 1}))));
-            }
-        }
-    }
-    None
 }
 
 /// 一个可由任意引擎适配并生产装配的 Managed 执行内核。
@@ -2395,7 +2889,7 @@ mod tests {
             shape: ManagedTranslationShape,
             original: &ManagedTranslationContent,
             semantic_context: &str,
-        ) -> Result<Arc<dyn TrustedLuaPreparedTranslation>, TrustedLuaHostCallError> {
+        ) -> Result<Arc<dyn ManagedPreparedTranslation>, TrustedLuaHostCallError> {
             let model_text = match original {
                 ManagedTranslationContent::Scalar(value) => value.clone(),
                 ManagedTranslationContent::Array(values) => values.join("\n"),
@@ -2414,22 +2908,58 @@ mod tests {
         }
     }
 
+    struct UnavailableSemantics;
+
+    impl ManagedTranslationSemantics for UnavailableSemantics {
+        fn engine_semantic_identity(&self) -> &str {
+            "test_engine"
+        }
+
+        fn system_prompt(&self) -> &str {
+            "system"
+        }
+
+        fn source_language(&self) -> &str {
+            "ja"
+        }
+
+        fn target_language(&self) -> &str {
+            "zh-Hans"
+        }
+
+        fn prepare_translation(
+            &self,
+            _kind: &str,
+            _shape: ManagedTranslationShape,
+            _original: &ManagedTranslationContent,
+            _semantic_context: &str,
+        ) -> Result<Arc<dyn ManagedPreparedTranslation>, TrustedLuaHostCallError> {
+            Err(TrustedLuaHostCallError::new(
+                "translation",
+                "unavailable",
+                "测试语义不可用",
+                None,
+                None,
+            ))
+        }
+    }
+
     struct FakePrepared {
         model_text: String,
         fingerprint: Sha256Fingerprint,
-        terms: Vec<TrustedLuaTranslationTerm>,
+        terms: Vec<ManagedTranslationTerm>,
     }
 
-    impl TrustedLuaPreparedTranslation for FakePrepared {
-        fn status(&self) -> TrustedLuaPreparedTranslationStatus {
-            TrustedLuaPreparedTranslationStatus::Active
+    impl ManagedPreparedTranslation for FakePrepared {
+        fn status(&self) -> ManagedPreparedTranslationStatus {
+            ManagedPreparedTranslationStatus::Active
         }
 
         fn model_text(&self) -> &str {
             &self.model_text
         }
 
-        fn terms(&self) -> &[TrustedLuaTranslationTerm] {
+        fn terms(&self) -> &[ManagedTranslationTerm] {
             &self.terms
         }
 
@@ -2448,9 +2978,9 @@ mod tests {
         fn accept(
             &self,
             candidate: String,
-        ) -> Result<TrustedLuaPreparedTranslationAcceptance, TrustedLuaHostCallError> {
+        ) -> Result<ManagedPreparedTranslationAcceptance, TrustedLuaHostCallError> {
             let state = accepted_state(&candidate);
-            Ok(TrustedLuaPreparedTranslationAcceptance::accepted(
+            Ok(ManagedPreparedTranslationAcceptance::accepted(
                 candidate, state,
             ))
         }
@@ -2543,6 +3073,272 @@ mod tests {
 
     fn response(content: &str) -> LlmResponse {
         LlmResponse::new(content, LlmFinishReason::Stop, None, None, None)
+    }
+
+    fn apply_replacements(
+        mut snapshot: TestSnapshot,
+        replacements: &[ManagedTranslationReplacement],
+    ) -> TestSnapshot {
+        for replacement in replacements.iter().cloned() {
+            let (collection_name, key, replacement) = replacement.into_parts();
+            let collection = snapshot
+                .collections
+                .iter_mut()
+                .find(|collection| collection.name() == collection_name)
+                .expect("replacement collection 应存在");
+            let unit = collection
+                .units
+                .iter_mut()
+                .find(|unit| unit.key() == key)
+                .expect("replacement unit 应存在");
+            unit.translation = replacement;
+        }
+        snapshot
+    }
+
+    #[test]
+    fn candidate_session_freezes_families_and_produces_guarded_replacements() {
+        let baseline = snapshot(vec![
+            collection("first", "同一指令", vec![scalar_unit("one", "")]),
+            collection("second", "同一指令", vec![scalar_unit("two", "")]),
+        ]);
+        let session =
+            ManagedTranslationCandidateSession::open(baseline.clone(), &FakeSemantics::default())
+                .expect("人工候选会话应可打开");
+        let units = session.units().expect("冻结单元应可读取");
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].collection(), "first");
+        assert_eq!(units[0].key(), "one");
+        assert_eq!(units[0].kind(), "test_kind");
+        assert_eq!(units[0].shape(), ManagedTranslationShape::Single);
+        assert_eq!(
+            units[0].original(),
+            &ManagedTranslationContent::scalar("原文")
+        );
+        assert_eq!(units[0].context(), "");
+        assert_eq!(units[0].metadata(), None);
+        assert_eq!(units[0].translation(), None);
+        assert_eq!(
+            units[0].model_content(),
+            &ManagedTranslationContent::scalar("原文")
+        );
+        assert_eq!(
+            units[0].status(),
+            ManagedTranslationCandidateUnitStatus::Missing
+        );
+        assert_eq!(units[0].family_size(), 2);
+        assert_eq!(
+            session
+                .get("second", "two")
+                .expect("get 应可读取")
+                .expect("目标单元应存在")
+                .handle(),
+            units[1].handle()
+        );
+
+        let conflicting = session
+            .prepare_acceptance(vec![
+                ManagedTranslationCandidateRequest::new(
+                    units[0].handle(),
+                    ManagedTranslationContent::scalar("译文甲"),
+                    false,
+                ),
+                ManagedTranslationCandidateRequest::new(
+                    units[1].handle(),
+                    ManagedTranslationContent::scalar("译文乙"),
+                    false,
+                ),
+            ])
+            .expect("family 候选冲突是普通拒绝");
+        assert!(conflicting.results().iter().all(|result| {
+            matches!(
+                result,
+                ManagedTranslationCandidateAcceptance::Rejected { reason, details: None }
+                    if reason == "conflicting_candidate"
+            )
+        }));
+        assert!(conflicting.replacements().is_empty());
+
+        let prepared = session
+            .prepare_acceptance(vec![ManagedTranslationCandidateRequest::new(
+                units[0].handle(),
+                ManagedTranslationContent::scalar("译文"),
+                false,
+            )])
+            .expect("合法候选应形成 CAS 计划");
+        assert_eq!(prepared.baseline(), &baseline);
+        assert_eq!(prepared.replacements().len(), 2);
+        assert!(matches!(
+            &prepared.results()[0],
+            ManagedTranslationCandidateAcceptance::Accepted {
+                content,
+                changed_units: 2,
+            } if content == &ManagedTranslationContent::scalar("译文")
+        ));
+
+        let committed = apply_replacements(baseline, prepared.replacements());
+        session
+            .apply_committed(&prepared, committed)
+            .expect("确认提交后应推进会话");
+        assert!(session.units().expect("应可重读").iter().all(|unit| {
+            unit.status() == ManagedTranslationCandidateUnitStatus::Current
+                && unit.translation() == Some(&ManagedTranslationContent::scalar("译文"))
+        }));
+
+        let replacement_required = session
+            .prepare_acceptance(vec![ManagedTranslationCandidateRequest::new(
+                units[1].handle(),
+                ManagedTranslationContent::scalar("新译文"),
+                false,
+            )])
+            .expect("Current 覆盖缺少授权是普通拒绝");
+        assert!(matches!(
+            &replacement_required.results()[0],
+            ManagedTranslationCandidateAcceptance::Rejected { reason, details: None }
+                if reason == "current_replacement_required"
+        ));
+        assert!(replacement_required.replacements().is_empty());
+
+        let idempotent = session
+            .prepare_acceptance(vec![ManagedTranslationCandidateRequest::new(
+                units[0].handle(),
+                ManagedTranslationContent::scalar("译文"),
+                false,
+            )])
+            .expect("与 Current 相同的候选应幂等成功");
+        assert!(matches!(
+            &idempotent.results()[0],
+            ManagedTranslationCandidateAcceptance::Accepted {
+                content,
+                changed_units: 0,
+            } if content == &ManagedTranslationContent::scalar("译文")
+        ));
+        assert!(idempotent.replacements().is_empty());
+
+        let replacement = session
+            .prepare_acceptance(vec![ManagedTranslationCandidateRequest::new(
+                units[1].handle(),
+                ManagedTranslationContent::scalar("新译文"),
+                true,
+            )])
+            .expect("显式 Current 替换应形成整个 family 的 CAS 计划");
+        assert!(matches!(
+            &replacement.results()[0],
+            ManagedTranslationCandidateAcceptance::Accepted {
+                content,
+                changed_units: 2,
+            } if content == &ManagedTranslationContent::scalar("新译文")
+        ));
+        assert_eq!(replacement.replacements().len(), 2);
+    }
+
+    #[test]
+    fn candidate_session_projects_semantic_failures_as_unavailable_units() {
+        let session = ManagedTranslationCandidateSession::open(
+            snapshot(vec![collection(
+                "unavailable",
+                "",
+                vec![scalar_unit("unit", "")],
+            )]),
+            &UnavailableSemantics,
+        )
+        .expect("单元语义不可用不应阻止打开其余冻结会话");
+        let units = session.units().expect("单元应可读取");
+        assert_eq!(
+            units[0].status(),
+            ManagedTranslationCandidateUnitStatus::Unavailable
+        );
+
+        let prepared = session
+            .prepare_acceptance(vec![ManagedTranslationCandidateRequest::new(
+                units[0].handle(),
+                ManagedTranslationContent::scalar("译文"),
+                false,
+            )])
+            .expect("Unavailable 是普通逐项拒绝");
+        assert!(matches!(
+            &prepared.results()[0],
+            ManagedTranslationCandidateAcceptance::Rejected {
+                reason,
+                details: Some(ManagedTranslationCandidateRejectionDetails::Unavailable { detail }),
+            } if reason == "unavailable" && detail.contains("测试语义不可用")
+        ));
+        assert!(prepared.replacements().is_empty());
+    }
+
+    #[test]
+    fn candidate_session_uses_current_seed_to_fill_missing_and_stale_family_members() {
+        let baseline = snapshot(vec![collection(
+            "mixed",
+            "同一指令",
+            vec![
+                scalar_unit("current", ""),
+                scalar_unit("missing", ""),
+                scalar_unit("stale", ""),
+            ],
+        )]);
+        let seed_session =
+            ManagedTranslationCandidateSession::open(baseline.clone(), &FakeSemantics::default())
+                .expect("种子会话应可打开");
+        let seed_unit = seed_session.units().expect("种子单元应可读取")[0].clone();
+        let seeded = seed_session
+            .prepare_acceptance(vec![ManagedTranslationCandidateRequest::new(
+                seed_unit.handle(),
+                ManagedTranslationContent::scalar("译文"),
+                false,
+            )])
+            .expect("种子候选应形成完整 family replacement");
+
+        let mut mixed = apply_replacements(baseline, &seeded.replacements()[..1]);
+        let stale = mixed.collections[0]
+            .units
+            .iter_mut()
+            .find(|unit| unit.key() == "stale")
+            .expect("stale 测试单元应存在");
+        stale.translation = Some(ManagedTranslationPair::new_trusted(
+            ManagedTranslationContent::scalar("旧译文"),
+            Sha256Fingerprint::from_bytes([0xA5; 32]),
+        ));
+
+        let session =
+            ManagedTranslationCandidateSession::open(mixed.clone(), &FakeSemantics::default())
+                .expect("混合状态会话应可打开");
+        let units = session.units().expect("混合状态单元应可读取");
+        assert_eq!(
+            units
+                .iter()
+                .map(ManagedTranslationCandidateUnit::status)
+                .collect::<Vec<_>>(),
+            [
+                ManagedTranslationCandidateUnitStatus::Current,
+                ManagedTranslationCandidateUnitStatus::Missing,
+                ManagedTranslationCandidateUnitStatus::Stale,
+            ]
+        );
+
+        let prepared = session
+            .prepare_acceptance(vec![ManagedTranslationCandidateRequest::new(
+                units[0].handle(),
+                ManagedTranslationContent::scalar("译文"),
+                false,
+            )])
+            .expect("Current 相同候选应补齐其余 family 成员");
+        assert!(matches!(
+            &prepared.results()[0],
+            ManagedTranslationCandidateAcceptance::Accepted {
+                changed_units: 2,
+                ..
+            }
+        ));
+        assert_eq!(prepared.replacements().len(), 2);
+        let committed = apply_replacements(mixed, prepared.replacements());
+        session
+            .apply_committed(&prepared, committed)
+            .expect("补齐提交后会话应推进");
+        assert!(session.units().expect("应可重读").iter().all(|unit| {
+            unit.status() == ManagedTranslationCandidateUnitStatus::Current
+                && unit.translation() == Some(&ManagedTranslationContent::scalar("译文"))
+        }));
     }
 
     #[test]

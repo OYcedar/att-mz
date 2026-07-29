@@ -124,10 +124,10 @@ Unit 再用 Custom Placeholder 时，只保护 Unit 内的外壳，不改变提�
 
 ### Lua 的责任边界
 
-可信 Lua 有两个不同入口。已有人工候选要补入**现存 Standard 单元**时，使用独立项目
-`lua` 命令的 `ctx.standard`：核心按普通 Standard 的完整身份、Lines、源上下文、
-Placeholder、语言、去重和 Current 语义验收并原子提交，脚本不读取或构造 state，也不
-直接 SQL 修改受管翻译表。
+可信 Lua 有阶段扩展与独立项目程序两个入口。已有人工候选要补入**现存 Standard 单元**
+或 **Managed unit** 时，使用独立项目 `lua` 命令的相应人工候选接口：状态所有者按完整
+身份、shape、上下文、Placeholder、语言、去重和 Current 语义验收并原子提交，脚本不读取
+或构造 state，也不直接 SQL 修改受管翻译表。
 
 只有现实关系超出 Builtin、Rules 或 Placeholder 的表达能力时，才考虑 Extract、
 Translate、WriteBack 的阶段 Lua。若 Lua 只需声明 collection、原子 unit 和写回关系，
@@ -140,10 +140,13 @@ Translate、WriteBack 的阶段 Lua。若 Lua 只需声明 collection、原子 u
 - 需要 Rules 契约之外的身份，但每个 unit 可以独立、原子地翻译和提交；
 - 静态路径能够命中字符串，却无法表达完整分组和可逆写回。
 
-私有 grammar、跨 unit 原子关系、特殊模型协议或自有恢复状态超出 Managed 契约时，再由
-Lua 显式组合 `ctx.translation`、`ctx.llm` 与 `ctx.db`；Host 不自动降级。复杂不自动意味着
-需要低级协议。每个启用 Lua 的阶段都必须拥有独立、现实的理由，并明确协议所有者、事务
-和幂等边界。独立项目脚本也必须按完整身份定位候选、审查去重传播范围并保持可重复执行。
+低级 Lua 能把内容转换成公共四种 shape 时，可复用结构化准备、Placeholder、语言验收和
+私有 Current state；能把写回位置表示为完整 RPG Maker string Value 时，可把引用交给
+Host 完成原值比较、嵌套 JSON 编码和重新读取验证。私有 grammar、跨 unit 原子关系、
+特殊模型协议或自有恢复状态超出这些契约时，再由 Lua 显式组合低级翻译、模型、数据库和
+候选能力；Host 不自动降级。复杂不自动意味着需要低级协议。每个启用 Lua 的阶段都必须
+拥有独立、现实的理由，并明确协议所有者、事务和幂等边界。独立项目脚本也必须按完整身份
+定位候选、审查去重传播范围并保持可重复执行。
 完整能力见[Lua 技术参考](lua.md)；先查看
 [Managed 三阶段示例](lua-cookbook.md#2-managed-三阶段翻译)，再按需参考 Cookbook 中的
 低级协议。
@@ -175,10 +178,12 @@ ATT 事务、取消或发布管理。
 `project.db` 可用于只读核对 metadata、Standard owner 快照、逻辑组、语义单元、recipe、
 Claim 冲突摘要、译文和 state，也可以核对 Managed owner、collection、unit 与成对
 translation/state。完整逻辑 Claim 由 Standard group kind、location 和 recipe 重建；
-Managed 不建立 Claim。持久化摘要不是完整 Claim 清单，不能用其行数代替覆盖判断。
+Managed 翻译快照不保存 Claim；Lua 在 WriteBack 建立完整 text 引用时才由该物理目标派生
+本轮候选 Claim。持久化摘要不是完整 Claim 清单，不能用其行数代替覆盖判断。
 
 外部 SQLite 工具不会自动取得 ATT 项目租约。直接修改受管表属于明确授权下的高级修复，
-不是普通调查步骤，也不是人工补译入口；人工译文必须通过 `ctx.standard` 交给语义所有者。
+不是普通调查步骤，也不是人工补译入口；Standard 或 Managed 人工译文必须通过相应正式
+接口交给语义所有者。
 其他确需直接修复受管表的情况，先确认没有同项目命令并发运行，建立可恢复副本，在事务
 中修改，并在提交前后重新证明当前 schema 与业务不变量。受管 schema 不是稳定扩展 API；
 自有扩展应使用可信 Lua 保证的私有命名空间。

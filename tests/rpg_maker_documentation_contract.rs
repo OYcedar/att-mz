@@ -20,7 +20,7 @@ const TOML_EXAMPLES: [&str; 4] = [
     "terminology.toml",
 ];
 
-const LUA_EXAMPLES: [(&str, &[&str]); 7] = [
+const LUA_EXAMPLES: [(&str, &[&str]); 10] = [
     (
         "lua-standard-data-file.lua",
         &["ctx.rpg_maker.data_file", "ctx.extract.replace_standard"],
@@ -32,9 +32,20 @@ const LUA_EXAMPLES: [(&str, &[&str]); 7] = [
             "ctx.translations.replace",
             "ctx.translations.translate",
             "ctx.translations.open",
-            "ctx.output.read_json",
-            "ctx.output.write_json",
+            "ctx.write_back.replace_text",
             "unit.status == \"missing\"",
+        ],
+    ),
+    (
+        "lua-prepare-content.lua",
+        &[
+            "ctx.translation.prepare_content",
+            "shape = \"single\"",
+            "shape = \"reflow\"",
+            "shape = \"lines\"",
+            "shape = \"items\"",
+            ":is_current(",
+            ":accept(",
         ],
     ),
     (
@@ -54,6 +65,25 @@ const LUA_EXAMPLES: [(&str, &[&str]); 7] = [
             "standard:units(",
             "standard:accept(",
             "replace_current",
+        ],
+    ),
+    (
+        "lua-edit-managed.lua",
+        &[
+            "ctx.translations.edit",
+            "session:get(",
+            "session:accept(",
+            "replace_current",
+            "current.status == \"current\"",
+        ],
+    ),
+    (
+        "lua-managed-replace-text.lua",
+        &[
+            "ctx.translations.open",
+            "unit.metadata",
+            "document:text(",
+            "ctx.write_back.replace_text",
         ],
     ),
     (
@@ -80,7 +110,7 @@ const LUA_EXAMPLES: [(&str, &[&str]); 7] = [
     ),
 ];
 
-const PRODUCTION_EXAMPLE_BINDINGS: [(&str, &str, &str, &str); 12] = [
+const PRODUCTION_EXAMPLE_BINDINGS: [(&str, &str, &str, &str); 13] = [
     (
         "config.example.toml",
         "src/application/config.rs",
@@ -134,6 +164,12 @@ const PRODUCTION_EXAMPLE_BINDINGS: [(&str, &str, &str, &str); 12] = [
         "src/rpg_maker/lua/lua54.rs",
         "include_str!(\"../../../docs/rpg-maker/examples/lua-accept-standard.lua\")",
         "async fn documented_standard_candidate_example_executes_in_the_real_vm()",
+    ),
+    (
+        "lua-edit-managed.lua",
+        "tests/rpg_maker_process_e2e.rs",
+        "include_str!(\"../docs/rpg-maker/examples/lua-edit-managed.lua\")",
+        "fn managed_lua_translation_crosses_extract_translate_and_write_back_processes()",
     ),
     (
         "lua-idempotent-write-back.lua",
@@ -463,6 +499,125 @@ fn translation_skill_records_lua_resolution_dependencies_and_unmanaged_effects()
             template.contains(required),
             "{} 必须为 Lua 解析与依赖证据预留位置 {required:?}",
             display_relative(&template_path)
+        );
+    }
+}
+
+#[test]
+fn translation_skill_selects_managed_capabilities_and_requires_full_round_trip() {
+    let root = workspace_root().join("skills/translate-rpg-maker-with-att");
+    let skill_path = root.join("SKILL.md");
+    let skill = read_utf8(&skill_path);
+    for required in [
+        "检查当前",
+        "能够完整表达该结构、Current 和写回关系的高级接口",
+        "由语义所有者验收和提交",
+        "保留低级 Lua",
+        "解析、验收或保存、渲染、重新解析和领域值比较",
+        "不得留下半修改或伪造 Current",
+    ] {
+        assert!(
+            skill.contains(required),
+            "{} 必须保存 Lua 受管能力选择与往返规则 {required:?}",
+            display_relative(&skill_path)
+        );
+    }
+
+    let workflow_path = root.join("references/workflow.md");
+    let workflow = read_utf8(&workflow_path);
+    for required in [
+        "Lua 表示层与受管能力选择",
+        "源文件或私有 grammar",
+        "解码领域值",
+        "模型 wire",
+        "已保存 Current",
+        "重新编码候选",
+        "解析来源 → 建立解码领域值 → 公共或私有验收",
+        "结构、Placeholder、编码和私有 grammar",
+        "才提交 translation/state",
+        "显式处理已有 Current",
+        "随后重新打开正式接口并读取权威 Current",
+        "特殊 grammar、跨目标原子关系或私有模型协议",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "{} 必须说明 Lua 表示层、正式状态接口与完整往返 {required:?}",
+            display_relative(&workflow_path)
+        );
+    }
+}
+
+#[test]
+fn structured_translation_managed_edit_and_checked_write_back_are_documented() {
+    let lua_path = documentation_root().join("lua.md");
+    let lua = read_utf8(&lua_path);
+    for required in [
+        "ctx.translation.prepare_content",
+        "prepared.part_statuses",
+        "prepared.model_content",
+        "ctx.translations.edit()",
+        "`current`、`missing`、`stale`、`not_applicable` 或 `unavailable`",
+        "current_replacement_required",
+        "完整冻结 source",
+        "ctx.write_back.replace_text",
+        "重复目标或祖先/后代",
+        "重新读取同一路径",
+        "不可发布",
+        "私有标签、任意",
+        "JavaScript 文件、字节区间和多目标私有协议",
+    ] {
+        assert!(
+            lua.contains(required),
+            "{} 必须说明结构化翻译、Managed 修订和安全写回 {required:?}",
+            display_relative(&lua_path)
+        );
+    }
+
+    let translation_path = documentation_root().join("translation.md");
+    let translation = read_utf8(&translation_path);
+    for required in [
+        "Standard 是 RPG Maker 核心翻译路径",
+        "Managed 的模型与执行内核保持引擎无关",
+        "不构成与 Lua 并列的三个流程",
+        "低级 `prepare_content`",
+        "确认未应用与提交结果未知",
+    ] {
+        assert!(
+            translation.contains(required),
+            "{} 必须说明正确的 Standard、Lua 与 Managed 关系 {required:?}",
+            display_relative(&translation_path)
+        );
+    }
+
+    let write_back_path = documentation_root().join("write-back.md");
+    let write_back = read_utf8(&write_back_path);
+    for required in [
+        "ctx.write_back.replace_text(batch)",
+        "多层 `DECODE_JSON`",
+        "重新读取同一路径并逐字比较",
+        "标记为不可发布",
+        "`ctx.output`",
+        "不增加通用 grammar DSL",
+    ] {
+        assert!(
+            write_back.contains(required),
+            "{} 必须说明受保护写回与低级 Lua 的边界 {required:?}",
+            display_relative(&write_back_path)
+        );
+    }
+
+    let cli_path = workspace_root().join("docs/runtime/cli.md");
+    let cli = read_utf8(&cli_path);
+    for required in [
+        "`ctx.translations.edit()`",
+        "首次打开任一人工会话",
+        "共用一次解析出的 Profile",
+        "不增加 CLI 参数",
+    ] {
+        assert!(
+            cli.contains(required),
+            "{} 必须说明独立 Lua 的 Managed 修订与 Profile 选择 {required:?}",
+            display_relative(&cli_path)
         );
     }
 }

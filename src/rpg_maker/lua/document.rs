@@ -8,6 +8,9 @@ use crate::rpg_maker::model::MutationClaim;
 use crate::rpg_maker::plugin_document::{
     PluginsEnvelopeFailure, parse_plugins_envelope, validate_plugins_root_is_array,
 };
+use crate::rpg_maker::structured_path::{
+    StructuredPathAccessError, StructuredPathDecoder, StructuredPathError, visit_structured_path,
+};
 use crate::rpg_maker::text::{
     DataFileName, DataFileNameError, MapId, RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource,
     StandardDataFile,
@@ -109,6 +112,33 @@ impl RpgMakerTextReference {
     }
 }
 
+/// Lua 请求宿主安全写回的一项完整文本替换。
+///
+/// `reference` 只能由当前 Lua VM 中已经打开的冻结 RPG Maker 文档建立；
+/// 调用边界只补充完整 replacement，不再让脚本重新表达来源、路径或冻结原文。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RpgMakerTextReplacement {
+    reference: RpgMakerTextReference,
+    replacement: String,
+}
+
+impl RpgMakerTextReplacement {
+    pub(crate) fn new(reference: RpgMakerTextReference, replacement: String) -> Self {
+        Self {
+            reference,
+            replacement,
+        }
+    }
+
+    pub(crate) fn reference(&self) -> &RpgMakerTextReference {
+        &self.reference
+    }
+
+    pub(crate) fn replacement(&self) -> &str {
+        &self.replacement
+    }
+}
+
 /// 一个 RPG Maker 来源在冻结项目根中的物理文件。
 pub(crate) fn source_path(source: &RpgMakerSource) -> LuaSourcePath {
     let path = match source {
@@ -171,82 +201,53 @@ fn resolve_value(
     root: &LosslessJsonValue,
     steps: &[RpgMakerLocationStep],
 ) -> Result<LosslessJsonValue, RpgMakerDocumentError> {
-    let mut current = ResolvedValue::Borrowed(root);
-    for step in steps {
-        current = match (current, step) {
-            (
-                ResolvedValue::Borrowed(LosslessJsonValue::Object(entries)),
-                RpgMakerLocationStep::ObjectKey(key),
-            ) => ResolvedValue::Borrowed(
-                object_get(entries, key).ok_or(RpgMakerDocumentError::MissingObjectKey)?,
-            ),
-            (ResolvedValue::Owned(mut value), RpgMakerLocationStep::ObjectKey(key)) => {
-                if !matches!(&value, LosslessJsonValue::Object(_)) {
-                    return Err(RpgMakerDocumentError::ExpectedObject);
-                }
-                ResolvedValue::Owned(
-                    value
-                        .take_object_value(key)
-                        .ok_or(RpgMakerDocumentError::MissingObjectKey)?,
-                )
-            }
-            (
-                ResolvedValue::Borrowed(LosslessJsonValue::Array(values)),
-                RpgMakerLocationStep::ArrayIndex(index),
-            ) => ResolvedValue::Borrowed(
-                values
-                    .get(*index)
-                    .ok_or(RpgMakerDocumentError::MissingArrayIndex)?,
-            ),
-            (ResolvedValue::Owned(mut value), RpgMakerLocationStep::ArrayIndex(index)) => {
-                if !matches!(&value, LosslessJsonValue::Array(_)) {
-                    return Err(RpgMakerDocumentError::ExpectedArray);
-                }
-                ResolvedValue::Owned(
-                    value
-                        .take_array_value(*index)
-                        .ok_or(RpgMakerDocumentError::MissingArrayIndex)?,
-                )
-            }
-            (
-                ResolvedValue::Borrowed(LosslessJsonValue::String(source)),
-                RpgMakerLocationStep::DecodeJsonString,
-            ) => ResolvedValue::Owned(
-                decode_json(source).map_err(RpgMakerDocumentError::InvalidNestedJson)?,
-            ),
-            (ResolvedValue::Owned(value), RpgMakerLocationStep::DecodeJsonString) => {
-                let LosslessJsonValue::String(source) = &value else {
-                    return Err(RpgMakerDocumentError::ExpectedEncodedJsonString);
-                };
-                ResolvedValue::Owned(
-                    decode_json(source).map_err(RpgMakerDocumentError::InvalidNestedJson)?,
-                )
-            }
-            (_, RpgMakerLocationStep::DecodeJsonString) => {
-                return Err(RpgMakerDocumentError::ExpectedEncodedJsonString);
-            }
-            (_, RpgMakerLocationStep::ObjectKey(_)) => {
-                return Err(RpgMakerDocumentError::ExpectedObject);
-            }
-            (_, RpgMakerLocationStep::ArrayIndex(_)) => {
-                return Err(RpgMakerDocumentError::ExpectedArray);
-            }
-        };
+    let mut decoder = LosslessStructuredPathDecoder;
+    visit_structured_path(root, steps, &mut decoder, LosslessJsonValue::clone)
+        .map_err(document_path_error)
+}
+
+struct LosslessStructuredPathDecoder;
+
+impl StructuredPathDecoder for LosslessStructuredPathDecoder {
+    type Value = LosslessJsonValue;
+    type Owned = LosslessJsonValue;
+    type DecodeError = LosslessJsonError;
+
+    fn decode(&mut self, source: &str) -> Result<Self::Owned, Self::DecodeError> {
+        decode_json(source)
     }
-    Ok(current.into_owned())
+
+    fn value(owned: &Self::Owned) -> &Self::Value {
+        owned
+    }
+
+    fn value_mut(owned: &mut Self::Owned) -> &mut Self::Value {
+        owned
+    }
 }
 
-enum ResolvedValue<'a> {
-    Borrowed(&'a LosslessJsonValue),
-    Owned(LosslessJsonValue),
-}
-
-impl ResolvedValue<'_> {
-    fn into_owned(self) -> LosslessJsonValue {
-        match self {
-            Self::Borrowed(value) => value.clone(),
-            Self::Owned(value) => value,
+fn document_path_error(error: StructuredPathError<LosslessJsonError>) -> RpgMakerDocumentError {
+    match error {
+        StructuredPathError::Access(StructuredPathAccessError::ExpectedObject) => {
+            RpgMakerDocumentError::ExpectedObject
         }
+        StructuredPathError::Access(StructuredPathAccessError::MissingObjectKey) => {
+            RpgMakerDocumentError::MissingObjectKey
+        }
+        StructuredPathError::Access(StructuredPathAccessError::ExpectedArray) => {
+            RpgMakerDocumentError::ExpectedArray
+        }
+        StructuredPathError::Access(StructuredPathAccessError::MissingArrayIndex) => {
+            RpgMakerDocumentError::MissingArrayIndex
+        }
+        StructuredPathError::Access(StructuredPathAccessError::UnexpectedDecodeBoundary) => {
+            unreachable!("共用遍历器不会把 DecodeJsonString 交给普通路径访问")
+        }
+        StructuredPathError::ExpectedEncodedJsonString => {
+            RpgMakerDocumentError::ExpectedEncodedJsonString
+        }
+        StructuredPathError::Decode(source) => RpgMakerDocumentError::InvalidNestedJson(source),
+        StructuredPathError::Encode(source) => match source {},
     }
 }
 

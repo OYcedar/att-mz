@@ -75,9 +75,9 @@ Translate
 
 WriteBack
   -> ctx.translations.open
-  -> 用 metadata 找回候选目标
+  -> 用 metadata 找回冻结来源的完整 text 引用
   -> 复核 quest id 与原文
-  -> 只把 Current 译文写入 ctx.output
+  -> 只把 Current 译文交给 ctx.write_back.replace_text
 ```
 
 Extract 使用稳定的任务 `id` 形成 key，把数组位置和任务 id 放入不发送给模型的
@@ -111,9 +111,11 @@ ctx.translations.replace({
 报告供诊断，任务是否完成仍由调用方根据完整范围判断。
 
 WriteBack 的 `open` 只从持久快照投影 `current` 或 `missing`，不会自动修改候选，也不会
-保留某轮 Translate 报告中的 `not_applicable` 或 `unavailable`。示例分别读取冻结来源和
-候选 `data/QuestEntries.json`，验证 metadata 指向的对象仍有相同 id 和原文，再写入
-Current 译文；`missing` 保持冻结原文。相同来源和托管状态重复执行会得到相同 JSON。
+保留某轮 Translate 报告中的 `not_applicable` 或 `unavailable`。示例从冻结来源
+`data/QuestEntries.json` 建立完整 text 引用，验证 metadata 指向的对象仍有相同 id 和
+原文，再由 Host 完成 Mutation Claim、候选原值、重新编码和重新读取比较；`missing`
+保持冻结原文。相同来源和托管状态重复执行会得到相同 JSON。若目标是私有 grammar、
+JavaScript 字节区间或多位置协议，仍由脚本通过 `ctx.output` 完整重建和验证。
 
 复制到真实插件时至少重新确认：
 

@@ -1796,6 +1796,29 @@ impl StandardWriteBackMutationPlan {
     pub(crate) fn into_mutations(self) -> Vec<StandardWriteBackMutation> {
         self.mutations
     }
+
+    /// 投影本轮 Standard 已声明的全部物理修改，供尚未发布候选上的后续高级能力
+    /// 继续执行同一套 Claim 冲突检查。
+    pub(crate) fn cloned_mutation_claims(&self) -> Vec<MutationClaim> {
+        self.mutations
+            .iter()
+            .flat_map(|mutation| {
+                let claims = match mutation {
+                    StandardWriteBackMutation::SetText(mutation) => mutation.mutation_claims(),
+                    StandardWriteBackMutation::ReplaceDialogue(mutation) => {
+                        mutation.mutation_claims()
+                    }
+                    StandardWriteBackMutation::ReplaceChoices(mutation) => {
+                        mutation.mutation_claims()
+                    }
+                    StandardWriteBackMutation::ReplaceEventBody(mutation) => {
+                        mutation.mutation_claims()
+                    }
+                };
+                claims.claims().iter().cloned()
+            })
+            .collect()
+    }
 }
 
 /// Mutation 计划构造时发现的内部冲突。

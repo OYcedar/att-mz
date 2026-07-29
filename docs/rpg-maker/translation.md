@@ -1,16 +1,17 @@
 # RPG Maker 翻译现行规格
 
-本文定义 MV/MZ Standard 与 Lua Managed Translate 的资源生命周期、任务规划、译文检查、
-state、提交与恢复，以及独立项目 Lua 如何复用 Standard 的规则来检查人工译文。Standard
-与 Managed 是两套独立流程；它们共用 ATT 的模型协议执行器和任务记录功能，但不共享身份
-或译文。Prompt 配置与资源、模型消息内容、响应信封、JSON wire、临时 ID、输出形状和
-ATT token 协议由[Prompt 资源与模型协议现行规格](prompts.md)统一规定；本文直接使用响应
-解析器返回的结构化结果，不重新定义协议。
+本文定义 MV/MZ Standard 与 Lua 可采用的 Managed 翻译能力之资源生命周期、任务规划、
+译文检查、state、提交与恢复，以及独立项目 Lua 如何复用相应状态所有者的规则检查人工
+译文。Standard 是 RPG Maker 核心翻译路径；Managed 的模型与执行内核保持引擎无关，并由
+Lua 负责声明身份和最终写回关系。二者不共享身份或译文，也不构成与 Lua 并列的三个流程。
+Prompt 配置与资源、模型消息内容、响应信封、JSON wire、临时 ID、输出形状和 ATT token
+协议由[Prompt 资源与模型协议现行规格](prompts.md)统一规定；本文直接使用响应解析器返回
+的结构化结果，不重新定义协议。
 术语字段由[术语现行规格](terminology.md)唯一规定，Placeholder 字段由
 [规则文件](rules.md#6-placeholder-rules)唯一规定，Lua Translate API 见
 [Lua 技术参考](lua.md#7-translatepreparecurrent-与-accept)，Managed API 见
-[托管 translate/open](lua.md#72-ctxtranslationstranslateopen)，Standard 人工提交 API 见
-[独立项目 Lua](lua.md#8-独立项目-luastandard-人工译文验收与提交)。
+[托管 translate/open](lua.md#72-ctxtranslationstranslateopen)，Standard 与 Managed 人工
+提交 API 见[独立项目 Lua](lua.md#8-独立项目-lua人工译文验收与提交)。
 
 ## 1. 命令与阶段顺序
 
@@ -66,6 +67,14 @@ system Prompt 按执行路径分离：Standard 与低级 Lua 保持资源既有�
 planning、request、响应信封、并发、重试、验收、state、checkpoint 与任务记录；低级
 `ctx.translation/ctx.llm/ctx.db` 仍由脚本自行定义消息格式并确认写入结果，不继承这些
 Managed 行为。
+
+Managed 的 prepared content 是引擎无关领域契约，不属于 Lua VM。本轮自动 Managed、
+独立项目 Lua 的 Managed 人工候选，以及低级 `prepare_content` 对相同
+`single/reflow/lines/items` 输入复用同一份 shape、空槽、Placeholder、控制字符和语言
+验收结论。自动与人工 Managed 继续由 Managed 状态所有者负责 collection/unit identity、
+全局去重、Current state 和 checkpoint；低级接口只返回私有 prepared/state，由 Lua 自己
+负责 identity、LLM、事务和持久化。共享验收不把 Standard 的 `TextUnitContent`、行策略、
+recipe 或传播规则改成 Managed shape。
 
 MV 与 MZ 共享翻译流程，但 engine 是语义事实：两者 Builtin 控制符矩阵不同，state 也
 绑定 engine。精确矩阵见[规则文件](rules.md#68-mvmz-builtin-控制符矩阵)。
@@ -263,19 +272,26 @@ state 是当前译文成立所依赖语义的 SHA-256 摘要。它绑定：
 运行为零 LLM。切换 Prompt locale、`thinking_output` 或修改本轮选择的 Prompt 资源都会
 改变已绑定语义；任何已绑定语义变化后，旧译文不再 Current。
 
-低级 Lua 暴露相同语义的 64 字符小写十六进制 state，但私有身份和成对事务由脚本负责，见
+低级 Lua 暴露相同语义的 64 字符小写十六进制 state，但私有身份和成对事务由脚本负责。
+标量 `prepare` 保持既有 state 字节；结构化 `prepare_content` 另外绑定
+`single/reflow/lines/items`、完整标量或数组边界、semantic context 和规范内容，两个
+接口的 state 不能互换。完整接口见
 [Lua Translate API](lua.md#7-translatepreparecurrent-与-accept)。
 
 ## 8. 独立项目 Lua 的人工候选
 
-独立 `mv|mz lua` 命令可在不请求 LLM 的情况下，通过 `ctx.standard.open()` 打开一次
-Standard Candidate Acceptance 会话。会话使用显式 `--profile`，或者在未显式指定时延迟
-复用项目上次成功 Translate 保存的 Profile；两种选择都只作用于本次程序，不替换保存
-方案。术语和 Placeholder 固定来自项目当前 canonical 资源，不接受临时文件覆盖。
+独立 `mv|mz lua` 命令可在不请求 LLM 的情况下，分别打开 Standard 或 Managed 人工候选
+会话。显式 `--profile` 精确选择本次 Profile；未显式指定时，首次打开任一会话才延迟复用
+项目上次成功 Translate 保存的 Profile。一次 VM 中两个接口共用这次解析结果、项目当前
+canonical 术语和 Placeholder，以及相同的语言与 Prompt/Client 语义；它们不接受临时资源
+覆盖，也不替换保存方案。
 
-打开会话时，核心从一致数据库快照读取完整物理单元、Value/Lines 边界、源上下文、当前
-译文/state 和全部潜在去重成员，并用普通 Standard Planner 的全局语义指纹建立只读单元。
-打开和枚举本身没有副作用：不会全局清除失效译文，也不会自动传播已有 Current。
+### 8.1 Standard 人工候选
+
+打开 Standard 会话时，核心从一致数据库快照读取完整物理单元、Value/Lines 边界、源
+上下文、当前译文/state 和全部潜在去重成员，并用普通 Standard Planner 的全局语义指纹
+建立只读单元。打开和枚举本身没有副作用：不会全局清除失效译文，也不会自动传播已有
+Current。
 
 人工候选继续经过普通 Standard 共用的 Placeholder 恢复、line shape、自然语言、源语
 残留、语言修复和精确去重规则。Lua 只提交候选和是否允许替换 Current 的明确意图；它
@@ -283,17 +299,33 @@ Standard Candidate Acceptance 会话。会话使用显式 `--profile`，或者�
 模块、术语、Placeholder、原文或源上下文改变后，下一次 Planner 会按同一规则把旧结果
 判为非 Current。
 
-每次 `standard:accept(batch)` 先验收全部候选。普通候选拒绝逐项返回且不写库；合法去重
-族在一个短 SQLite 事务中以 CAS 提交。事务内重新检查项目 source snapshot、owner/resource
-指纹，以及每个传播位置的完整身份、原文、源上下文和读取时 translation/state pair；
-任一目标陈旧则整批合法族回滚并抛出 `standard/stale_snapshot`。每个传播位置分别计算
-自己的正确 state，translation/state 始终成对。成功返回后该次提交已经生效，脚本后续
-失败或取消不会回滚它。
+每批先验收全部候选。普通候选拒绝逐项返回且不写库；合法去重族在一个短 SQLite 事务中以
+CAS 提交。事务内重新检查项目 source snapshot、owner/resource 指纹，以及每个传播位置的
+完整身份、原文、源上下文和读取时 translation/state pair；任一目标陈旧则整批合法族
+回滚。每个传播位置分别计算自己的正确 state，translation/state 始终成对。
 
-同一 Profile 再运行普通 Translate 时，人工提交且仍 Current 的族不产生 LLM 任务；
-WriteBack 按普通 Standard 规则消费它们。独立命令不生成 Standard TaskBlock 或任务记录，
-也不修改原游戏目录。完整 Lua 表面和冲突规则见
-[Lua 技术参考](lua.md#8-独立项目-luastandard-人工译文验收与提交)。
+### 8.2 Managed 人工候选
+
+Managed 会话读取完整 source、owner/manifest、collection/unit、prepared content、当前
+translation/state 和全部全局去重成员。只读 unit 按 collection、unit 自然顺序投影
+`current`、`missing`、`stale`、`not_applicable` 或 `unavailable`；打开、查找和枚举不会
+修改数据库。
+
+候选复用自动 Managed 的四种 shape、Placeholder、语言和去重族规则。同批同族必须提供
+相同候选与覆盖选项；已有 Current 与规范候选相同为幂等成功，并可补齐同族
+missing/stale unit；改变任一 Current 成员必须显式允许替换。普通拒绝排除在写入外，全部
+合法族在一个短事务中共同提交。
+
+事务 CAS 再次检查打开会话时的完整冻结快照和每个成员旧 translation/state pair，任何
+并发变化都让合法族整体回滚。确认未应用与提交结果未知保持不同技术终态；结果未知时不能
+盲目重试。成功返回后该次提交已经生效，同一会话后续查询投影为新 Current，先前取得的
+userdata 仍是旧只读投影。
+
+两个接口在活动交互 `ctx.db` 事务中都拒绝提交。脚本后续失败或取消不会回滚已经成功返回
+的人工批次。同一 Profile 再运行普通 Translate 时，人工提交且仍 Current 的族不产生 LLM
+任务；Standard 按普通 recipe 写回，Managed 由 Lua 显式选择安全完整 Value 写回或私有
+grammar。独立命令不生成 TaskBlock 或任务记录，也不修改原游戏目录。完整 Lua 表面和
+冲突规则见[Lua 技术参考](lua.md#8-独立项目-lua人工译文验收与提交)。
 
 ## 9. 并发、提交与任务结果
 

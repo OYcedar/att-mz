@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use self::runtime::OwnedLuaProgram;
 use self::runtime::TrustedLuaExtractIntent;
+use self::runtime::TrustedLuaManagedEditHostCalls;
 use self::runtime::TrustedLuaManagedTranslateHostCalls;
 use self::runtime::TrustedLuaManagedTranslationReader;
 use self::runtime::TrustedLuaStandardHostCalls;
@@ -280,6 +281,7 @@ pub(crate) enum LuaInvocation<C> {
         project: LuaProjectContext,
         arguments: Vec<String>,
         standard: Arc<dyn TrustedLuaStandardHostCalls>,
+        managed: Arc<dyn TrustedLuaManagedEditHostCalls>,
     },
 }
 
@@ -318,17 +320,19 @@ impl<C> LuaInvocation<C> {
         }
     }
 
-    pub(crate) fn project(
+    pub(crate) fn project_with_managed(
         program: OwnedLuaProgram,
         project: LuaProjectContext,
         arguments: Vec<String>,
         standard: Arc<dyn TrustedLuaStandardHostCalls>,
+        managed: Arc<dyn TrustedLuaManagedEditHostCalls>,
     ) -> Self {
         Self::Project {
             program,
             project,
             arguments,
             standard,
+            managed,
         }
     }
 }

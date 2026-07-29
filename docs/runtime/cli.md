@@ -131,7 +131,8 @@ canonical `rule = []` 清空该 definition。它不是独立 owner。
 术语和 Placeholder 继续以项目 canonical 资源为权威：省略文件时复用项目状态，术语的
 `term = []` 和 Placeholder 的 `rule = []` 分别清空对应资源。非空 `--lua` 替换并执行
 Translate 阶段程序；省略时自动复用该阶段保存的程序；零字节文件清除该程序且本次不执行
-Lua。清除不会猜测或删除 Lua 私有数据库状态。
+Lua。清除不会猜测或删除 Lua 私有数据库状态。标量和结构化低级准备接口都消费本次解析
+出的同一 Profile 与 canonical 资源，不增加 CLI 参数。
 
 Translate 还会读取 `[prompts]`。字段和类型见[配置现行规格](configuration.md#4-prompt语言与-profile)；
 资源选择、文件检查、消息装配和模型响应协议见
@@ -146,7 +147,9 @@ Translate 同时读取 `[rpg_maker].record_translation_tasks`。字段类型和�
 
 项目从未保存 WriteBack Lua 选择时，省略 `--lua` 使用固定产品行为 Standard-only。
 以后省略时复用上次成功选择。非空 Lua 文件替换并启用 WriteBack 阶段程序；零字节文件
-清除程序，本轮只执行 Standard，并且不处理 Lua 私有数据库状态。
+清除程序，本轮只执行 Standard，并且不处理 Lua 私有数据库状态。启用 Lua 时，完整
+RPG Maker string Value 的受保护写回和低级 `ctx.output` 同时可用；选择接口不增加命令
+参数，也不改变本阶段只发布一次的边界。
 
 ### 3.5 独立项目 Lua
 
@@ -157,18 +160,21 @@ Translate 同时读取 `[rpg_maker].record_translation_tasks`。字段类型和�
 全局 `arg[1..]`，`arg[0]` 是解析后的脚本路径；任一参数不能表示为 UTF-8 时在运行脚本前
 明确失败。
 
-独立程序拥有可信 Lua 5.4 标准库（不含本机动态模块装载入口）和公共项目接口。它可通过
-`ctx.standard.open()` 打开由 Standard 核心拥有的人工候选会话，但不会发送 LLM 请求：
+独立程序拥有可信 Lua 5.4 标准库（不含本机动态模块装载入口）和公共项目接口。它可打开
+Standard 人工候选会话，也可通过 `ctx.translations.edit()` 打开 Managed 人工候选会话；
+二者都由相应状态所有者验收和提交，不发送 LLM 请求：
 
 - 显式 `--profile` 在当前配置中精确选择，ID 不存在时失败；
-- 未显式选择时，`open()` 才读取上次成功 Translate 保存的 Profile；项目没有可复用 ID，
-  或保存 ID 已不在当前配置中时，只让 `open()` 失败，不妨碍不使用 Standard 的普通脚本；
+- 未显式选择时，首次打开任一人工会话才读取上次成功 Translate 保存的 Profile；项目没有
+  可复用 ID，或保存 ID 已不在当前配置中时，只让该调用失败，不妨碍不使用人工接口的
+  普通脚本；
 - 显式或复用的 Profile 只服务本次会话，不替换 Translate 保存方案；
-- 术语和 Placeholder 始终读取项目当前 canonical 资源，不接受本命令临时覆盖。
+- Standard 与 Managed 在同一 VM 中共用一次解析出的 Profile、翻译语义、项目当前
+  canonical 术语和 Placeholder，不接受本命令临时覆盖。
 
-一次成功的 `ctx.standard.accept` 已经完成独立短事务提交。脚本之后失败或取消不会回滚
-更早已经确认的调用；原游戏目录不被该接口修改。可信脚本通过标准库或 `ctx.db` 自行产生
-的其他副作用仍由脚本作者负责。
+一次成功的 Standard 或 Managed accept 已经完成独立短事务提交。脚本之后失败或取消不会
+回滚更早已经确认的调用；原游戏目录不被这些接口修改。可信脚本通过标准库或 `ctx.db`
+自行产生的其他副作用仍由脚本作者负责。
 
 ### 3.6 Lua 快照
 
@@ -240,9 +246,10 @@ Translate 在选定显式或保存的 Profile 后，精确选择当前配置中�
 [Prompt 资源与模型协议现行规格](../rpg-maker/prompts.md)选择和装配本轮 Prompt。只有最终
 方案启用某阶段 Lua 时才构造程序固定策略的 Lua Runtime；配置不包含 Lua Runtime 分区。
 
-独立 `lua` 每次从显式路径构造程序。未显式提供 Profile 时，公共 Lua 能力先运行；
-`ctx.standard.open()` 才解析保存的 Translate Profile 并装配 Standard 语义。该入口不构造
-LLM 请求执行器，不建立虚假的 Standard TaskBlock。
+独立 `lua` 每次从显式路径构造程序。未显式提供 Profile 时，公共 Lua 能力先运行；首次
+打开 Standard 或 Managed 人工会话才解析保存的 Translate Profile，并缓存同一份资源与
+翻译语义供两个接口复用。该入口不构造 LLM 请求执行器，不建立虚假的 Standard 或 Managed
+TaskBlock。
 
 Extract、Translate、WriteBack 与独立 Lua 各自在命令生命周期内构造一个私有 Rayon CPU
 池。文档解析、规则扫描、资产编解码、规划准备、人工 Standard 准备与写回计算共享操作
@@ -261,7 +268,7 @@ Extract、Translate、WriteBack 与独立 Lua 各自在命令生命周期内构�
   Complete、Partial、Unavailable 都计入，零任务提示“无需调用模型”且不显示 `0/0`；
 - WriteBack：资产读取、规划和文档改写使用可取得的真实计数；Lua、候选验证和发布使用
   spinner；
-- Lua：程序执行和每次 Standard 人工提交使用 spinner，不制造 LLM 任务进度；
+- Lua：程序执行和每次 Standard/Managed 人工提交使用 spinner，不制造 LLM 任务进度；
 - 达到 `N/N` 后进入“正在收尾/保存运行方案”，所有必要业务操作完成后才显示成功；
 - Ctrl-C 立即显示“正在安全停止”，并保留最后一个已确认计数。
 

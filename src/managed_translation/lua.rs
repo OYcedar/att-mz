@@ -1,10 +1,20 @@
 //! Lua 托管翻译高级接口与共享 Managed planner 之间的引擎无关契约。
 
+#[cfg(test)]
 use std::sync::Arc;
 
+#[cfg(test)]
 use crate::fingerprint::Sha256Fingerprint;
 use crate::lua_host::{TrustedLuaHostCallError, TrustedLuaHostFuture};
 
+#[cfg(test)]
+use super::ManagedTranslationSemantics;
+pub(crate) use super::{
+    ManagedPreparedTranslation as TrustedLuaPreparedTranslation,
+    ManagedPreparedTranslationAcceptance as TrustedLuaPreparedTranslationAcceptance,
+    ManagedPreparedTranslationStatus as TrustedLuaPreparedTranslationStatus,
+    ManagedTranslationTerm as TrustedLuaTranslationTerm,
+};
 use super::{ManagedTranslationContent, ManagedTranslationShape};
 
 /// Lua 高级接口沿用根领域形状，不建立第二套枚举。
@@ -370,112 +380,6 @@ pub(crate) fn managed_translations_unavailable(operation: &'static str) -> Trust
         None,
     )
     .with_operation(operation)
-}
-
-/// Translate 共享语义对一段文本完成预处理后的稳定状态。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TrustedLuaPreparedTranslationStatus {
-    Active,
-    NonSourceLanguage,
-    FullyProtected,
-}
-
-impl TrustedLuaPreparedTranslationStatus {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::NonSourceLanguage => "non_source_language",
-            Self::FullyProtected => "fully_protected",
-        }
-    }
-}
-
-/// 当前单段文本实际命中的一个有序术语对。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TrustedLuaTranslationTerm {
-    term: String,
-    translation: String,
-}
-
-impl TrustedLuaTranslationTerm {
-    pub(crate) fn new(term: impl Into<String>, translation: impl Into<String>) -> Self {
-        Self {
-            term: term.into(),
-            translation: translation.into(),
-        }
-    }
-
-    pub(crate) fn term(&self) -> &str {
-        &self.term
-    }
-
-    pub(crate) fn translation(&self) -> &str {
-        &self.translation
-    }
-}
-
-/// prepared handle 对候选正文的正常验收结果。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum TrustedLuaPreparedTranslationAcceptance {
-    Accepted {
-        translation: String,
-        state: Sha256Fingerprint,
-    },
-    Rejected {
-        reason: String,
-    },
-}
-
-impl TrustedLuaPreparedTranslationAcceptance {
-    pub(crate) fn accepted(translation: impl Into<String>, state: Sha256Fingerprint) -> Self {
-        Self::Accepted {
-            translation: translation.into(),
-            state,
-        }
-    }
-
-    pub(crate) fn rejected(reason: impl Into<String>) -> Self {
-        Self::Rejected {
-            reason: reason.into(),
-        }
-    }
-}
-
-/// 共享翻译语义建立、不可由 Lua 伪造的预处理句柄。
-pub(crate) trait TrustedLuaPreparedTranslation: Send + Sync + 'static {
-    fn status(&self) -> TrustedLuaPreparedTranslationStatus;
-    fn model_text(&self) -> &str;
-    fn terms(&self) -> &[TrustedLuaTranslationTerm];
-    fn semantic_fingerprint(&self) -> Sha256Fingerprint;
-
-    fn is_current(
-        &self,
-        translation: String,
-        state: Sha256Fingerprint,
-    ) -> Result<bool, TrustedLuaHostCallError>;
-
-    fn accept(
-        &self,
-        candidate: String,
-    ) -> Result<TrustedLuaPreparedTranslationAcceptance, TrustedLuaHostCallError>;
-}
-
-/// 引擎适配器向共享 Managed planner 提供的翻译语义。
-///
-/// `kind` 保持调用引擎的原始稳定名称；根内核不解释任何引擎枚举。
-pub(crate) trait ManagedTranslationSemantics: Send + Sync + 'static {
-    fn engine_semantic_identity(&self) -> &str;
-    fn system_prompt(&self) -> &str;
-    fn source_language(&self) -> &str;
-    fn target_language(&self) -> &str;
-
-    fn prepare_translation(
-        &self,
-        kind: &str,
-        shape: ManagedTranslationShape,
-        original: &ManagedTranslationContent,
-        semantic_context: &str,
-    ) -> Result<Arc<dyn TrustedLuaPreparedTranslation>, TrustedLuaHostCallError>;
 }
 
 #[cfg(test)]
