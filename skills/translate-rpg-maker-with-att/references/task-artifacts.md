@@ -111,9 +111,22 @@ WB-03-game-menu-20260729-174206-6c1e6ee2.png
   任务仍保留当时采用输入的逐字副本、原路径和 SHA-256，供审查决策。修改后使用新文件。
 - **Prompt**：每轮 Translate 都核对实际 Prompt 根、选中的文件和 SHA-256。共享 Prompt
   的修改可能影响其他项目；没有完整影响和授权时不得修改。
+- **Lua 动态加载与直接访问**：阶段 Lua 和独立项目 Lua 都记录主程序解析目录、调用 cwd、
+  实际采用的路径来源（`LUA_PATH_5_4`、后备 `LUA_PATH` 或内置默认）、展开后的初始
+  `package.path`，以及脚本对
+  `package.path`、`package.preload[name]`、`package.loaded[name]`、`package.searchers`
+  的相关修改。脚本通过 `os.getenv` 使用的其他环境变量记录变量名、实际采用值及其影响，
+  并按本次实际发布目录中 `docs/runtime/chat-completions.md` 的唯一规定处理。每个实际
+  文件依赖记录访问方式、最终绝对路径、SHA-256 和继续任务时的可用性；
+  没有文件路径的 `package.loaded` 预置值、preload 或自定义 searcher 记录定义来源和
+  生产者身份。直接文件修改、进程、网络和私有 SQLite 的记录包含目标、动作、授权和
+  执行前后状态，以及验证与恢复办法。依赖很多时，把逐项记录保存为唯一命名的
+  `evidence/` 文件，并在任务清单中记录该文件的路径和 SHA-256，不把全部内容塞进清单
+  正文。
+  外部依赖可以位于项目、发布目录和任务根之外，不要求为了保存证据而复制或移动它；无法
+  保留或重新访问时明确记录未验证风险。
 - **阶段 Lua**：分别记录 Extract、Translate、WriteBack 采用的主程序身份。ATT 保存主
-  程序正文不表示它保存了 `require`、`io`、`os` 等动态依赖；实际依赖文件也要记录绝对
-  路径和 SHA-256，并保持可用。
+  程序正文不表示它保存了 `require`、`loadfile`、`dofile`、`io`、`os` 等动态依赖。
 - **独立项目 Lua**：每次从显式脚本读取，不属于阶段快照。脚本、参数、ATT 返回结果和
   权威状态复读共同作为提交证据。
 

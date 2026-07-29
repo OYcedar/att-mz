@@ -289,6 +289,8 @@ fn windows_unicode_runtime_and_lua_direct_path_contract_are_documented() {
         "Windows 10 1903",
         "UTF-8 active code page manifest",
         "code page 是 65001",
+        "实际值不是 65001",
+        "RT_MANIFEST ID 1",
         "中文、Emoji 和内部空格",
         "不需要启用 `LongPathsEnabled`",
         "ATT_TEST_UNC_ROOT",
@@ -318,7 +320,7 @@ fn windows_unicode_runtime_and_lua_direct_path_contract_are_documented() {
         .expect("Lua 规格必须最后写 package.path");
     assert!(
         preload < main_directory && main_directory < package_path,
-        "Lua 规格必须固定 preload、主程序目录、package.path 的查找顺序"
+        "Lua 规格必须说明 preload、主程序目录、package.path 的初始查找顺序"
     );
 
     for required in [
@@ -326,6 +328,10 @@ fn windows_unicode_runtime_and_lua_direct_path_contract_are_documented() {
         "`LUA_PATH_5_4`",
         "仅在它不存在时读取 `LUA_PATH`",
         "环境值中的 `;;`",
+        "捕获的原始 `package` table",
+        "重绑定全局",
+        "`package.searchers`",
+        "未配对 UTF-16 surrogate",
         "`io.open`",
         "`io.input`",
         "`io.output`",
@@ -350,6 +356,113 @@ fn windows_unicode_runtime_and_lua_direct_path_contract_are_documented() {
             vm_section.contains(required),
             "{} 的 VM 章节必须说明直接 Lua 边界 {required:?}",
             display_relative(&lua_path)
+        );
+    }
+
+    for required in [
+        "未被脚本捕获的 VM 错误",
+        "实际存在的 Windows 或文件系统错误码",
+        "顶层不会把这些事实压缩成",
+    ] {
+        assert!(
+            lua.contains(required),
+            "{} 必须说明未捕获 Lua 错误的安全诊断 {required:?}",
+            display_relative(&lua_path)
+        );
+    }
+
+    let translation_path = documentation_root().join("translation.md");
+    let translation = read_utf8(&translation_path);
+    for required in [
+        "`require`、`loadfile`、`dofile`、`io`、`os`",
+        "不随主程序进入快照",
+        "非受管副作用",
+        "[Lua 技术参考](lua.md#2-vm连接与-ctx)",
+    ] {
+        assert!(
+            translation.contains(required),
+            "{} 必须说明 Translate Lua 的动态依赖边界 {required:?}",
+            display_relative(&translation_path)
+        );
+    }
+}
+
+#[test]
+fn translation_skill_records_lua_resolution_dependencies_and_unmanaged_effects() {
+    let root = workspace_root().join("skills/translate-rpg-maker-with-att");
+    let skill_path = root.join("SKILL.md");
+    let skill = read_utf8(&skill_path);
+    for required in [
+        "本次运行方案或项目状态会使用 Lua",
+        "Lua 外部依赖与副作用",
+        "模块解析环境",
+        "不得假定依赖位于项目内",
+        "重新核对当前模块解析环境",
+        "动态依赖和非受管副作用已经核对",
+    ] {
+        assert!(
+            skill.contains(required),
+            "{} 必须把 Lua 外部依赖纳入执行流程 {required:?}",
+            display_relative(&skill_path)
+        );
+    }
+
+    let workflow_path = root.join("references/workflow.md");
+    let workflow = read_utf8(&workflow_path);
+    for required in [
+        "调用 cwd",
+        "`att.exe` 目录",
+        "`LUA_PATH_5_4`、后备 `LUA_PATH` 或内置默认",
+        "`require`、`loadfile`、`dofile`",
+        "`os.getenv` 读取的其他环境",
+        "本次实际发布目录",
+        "`docs/runtime/chat-completions.md` 的唯一规定",
+        "沿主程序、已经确定的候选依赖和配置逐层调查",
+        "`package.loaded` 预置值",
+        "preload 或自定义 searcher",
+        "本地盘、映射盘、UNC、长路径",
+        "不获得 ATT 的事务、取消、恢复或发布语义",
+        "返回最早执行该 Lua 的阶段",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "{} 必须说明 Lua 依赖调查与恢复要求 {required:?}",
+            display_relative(&workflow_path)
+        );
+    }
+
+    let artifacts_path = root.join("references/task-artifacts.md");
+    let artifacts = read_utf8(&artifacts_path);
+    for required in [
+        "Lua 动态加载与直接访问",
+        "最终绝对路径、SHA-256",
+        "`os.getenv` 使用的其他环境变量",
+        "本次实际发布目录",
+        "`docs/runtime/chat-completions.md` 的唯一规定",
+        "`package.loaded` 预置值",
+        "`evidence/` 文件",
+        "执行前后状态",
+        "项目、发布目录和任务根",
+    ] {
+        assert!(
+            artifacts.contains(required),
+            "{} 必须保存 Lua 依赖与副作用证据 {required:?}",
+            display_relative(&artifacts_path)
+        );
+    }
+
+    let template_path = root.join("assets/task-list-template.md");
+    let template = read_utf8(&template_path);
+    for required in [
+        "Lua 解析环境",
+        "Lua 动态依赖与直接访问",
+        "最终绝对路径或生产者身份",
+        "`os.getenv` 使用的其他变量名",
+    ] {
+        assert!(
+            template.contains(required),
+            "{} 必须为 Lua 解析与依赖证据预留位置 {required:?}",
+            display_relative(&template_path)
         );
     }
 }

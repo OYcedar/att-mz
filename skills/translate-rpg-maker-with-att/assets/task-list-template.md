@@ -31,7 +31,8 @@
   - 项目内可恢复修改：<允许或不允许的范围>
   - 模型、外部服务和费用：<允许或不允许的范围>
   - 写回和目标替换：<允许或不允许的范围>
-  - Lua 受管 API 外副作用：<允许或不允许的范围>
+  - Lua 受管 API 外副作用：<允许的外部读取或执行、文件修改、进程、网络和私有 SQLite
+    的具体范围与禁止项>
 - 待用户决定：<没有则写“无”>
 
 ## 本次有效资源
@@ -41,7 +42,13 @@
 - Extract owner 与来源：<Builtin / Rules / Lua；显式或保存状态；采用文件及 SHA-256>
 - Translate：<Profile；Terminology、Placeholder、Prompt、Lua 的实际来源及 SHA-256>
 - WriteBack：<Standard-only 或 Lua；实际来源及 SHA-256>
-- Lua 动态依赖：<阶段、绝对路径及 SHA-256；没有则写“无”>
+- Lua 解析环境：<阶段或独立入口；主程序解析目录；调用 cwd；实际采用的路径来源
+  （`LUA_PATH_5_4`、后备 `LUA_PATH` 或内置默认）；展开后的初始 `package.path`；脚本对
+  `package.path`、`package.preload[name]`、`package.loaded[name]` 或 `package.searchers`
+  的相关修改；`os.getenv` 使用的其他变量名、按现行敏感信息规定处理的实际采用值及其
+  影响；没有 Lua 则写“无”>
+- Lua 动态依赖与直接访问：<访问方式；最终绝对路径或生产者身份；SHA-256、可用性、动作
+  和执行前后状态；逐项记录较多时填写 evidence 清单路径及 SHA-256；没有则写“无”>
 
 ## 当前状态
 

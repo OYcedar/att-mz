@@ -38,6 +38,10 @@ Standard 请求。
 技术错误阻止后续阶段。Standard 或 Managed 已确认提交的译文不会因随后 Lua 失败组合
 回滚。Lua 私有数据库状态不因清除主程序而被猜测或删除。
 
+保存的 Translate Lua 只包含主程序正文；`require`、`loadfile`、`dofile`、`io`、`os`
+读取或执行的模块、文件与进程仍是运行时外部依赖，不随主程序进入快照。模块解析、路径和
+非受管副作用见 [Lua 技术参考](lua.md#2-vm连接与-ctx)。
+
 Profile 与 Lua 各自保留类型化来源。显式 Profile 配合省略 `--lua` 时，Profile 来源为
 显式输入，Lua 来源仍为项目状态（项目尚无 Translate 方案时为产品行为）。终端摘要和
 项目日志分别呈现这两个来源，不能把混合方案笼统标成全部显式或全部复用。
