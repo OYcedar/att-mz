@@ -89,6 +89,12 @@ pub(crate) enum ProjectLogCode {
     TaskFinished,
     #[serde(rename = "task.diagnostic")]
     TaskDiagnostic,
+    #[serde(rename = "lua.script")]
+    LuaScript,
+    #[serde(rename = "lua.print")]
+    LuaPrint,
+    #[serde(rename = "lua.summary")]
+    LuaSummary,
 }
 
 impl ProjectLogCode {
@@ -115,6 +121,9 @@ impl ProjectLogCode {
             Self::TaskStarted => "task.started",
             Self::TaskFinished => "task.finished",
             Self::TaskDiagnostic => "task.diagnostic",
+            Self::LuaScript => "lua.script",
+            Self::LuaPrint => "lua.print",
+            Self::LuaSummary => "lua.summary",
         }
     }
 }
@@ -178,13 +187,11 @@ pub(crate) enum ProjectLogPhase {
     RulesMatches,
     RulesCommit,
     Lua,
-    LuaExecution,
-    LuaCommit,
     Planning,
     ConfirmedTasks,
     NoWork,
     ReadAssets,
-    PlanStandard,
+    PlanRpgMakerWriteBack,
     RewriteDocuments,
     ValidateCandidate,
 }
@@ -200,18 +207,15 @@ impl ProjectLogPhase {
             Self::Builtin => UiMessage::LogLabelPhaseBuiltin,
             Self::BuiltinDocuments | Self::RulesDocuments => UiMessage::ProgressExtractDocuments,
             Self::BuiltinWorkUnits => UiMessage::ProgressExtractBuiltin,
-            Self::BuiltinCommit | Self::RulesCommit | Self::LuaCommit => {
-                UiMessage::ProgressExtractCommit
-            }
+            Self::BuiltinCommit | Self::RulesCommit => UiMessage::ProgressExtractCommit,
             Self::Rules => UiMessage::LogLabelPhaseRules,
             Self::RulesMatches => UiMessage::ProgressExtractRules,
             Self::Lua => UiMessage::LogLabelPhaseLua,
-            Self::LuaExecution => UiMessage::ProgressExtractLua,
             Self::Planning => UiMessage::LogLabelPhasePlanning,
             Self::ConfirmedTasks => UiMessage::LogLabelPhaseConfirmedTasks,
             Self::NoWork => UiMessage::LogLabelPhaseNoWork,
             Self::ReadAssets => UiMessage::LogLabelPhaseReadAssets,
-            Self::PlanStandard => UiMessage::LogLabelPhasePlanStandard,
+            Self::PlanRpgMakerWriteBack => UiMessage::LogLabelPhasePlanRpgMakerWriteBack,
             Self::RewriteDocuments => UiMessage::LogLabelPhaseRewriteDocuments,
             Self::ValidateCandidate => UiMessage::LogLabelPhaseValidateCandidate,
         }
@@ -256,9 +260,7 @@ pub(crate) enum ProjectLogPayload {
     },
     RunPlan {
         source: ProjectLogValueSource,
-        lua_source: Option<ProjectLogValueSource>,
         selections: Vec<String>,
-        lua_enabled: Option<bool>,
     },
     Phase {
         phase: ProjectLogPhase,
@@ -298,6 +300,19 @@ pub(crate) enum ProjectLogPayload {
         confirmed: u64,
         total: Option<u64>,
     },
+    LuaScript {
+        identity: String,
+        fingerprint: String,
+    },
+    LuaPrint {
+        message: String,
+    },
+    LuaSummary {
+        database_calls: u64,
+        changed_rows: u64,
+        translation_calls: u64,
+        printed_lines: u64,
+    },
 }
 
 impl ProjectLogPayload {
@@ -316,6 +331,9 @@ impl ProjectLogPayload {
             Self::Task { .. } => "task",
             Self::TaskDiagnostic { .. } => "task_diagnostic",
             Self::Cancellation { .. } => "cancellation",
+            Self::LuaScript { .. } => "lua_script",
+            Self::LuaPrint { .. } => "lua_print",
+            Self::LuaSummary { .. } => "lua_summary",
         }
     }
 }
@@ -1142,6 +1160,33 @@ fn render_message(
                 candidate_validation_completed: snapshot.candidate_validations.completed,
             })
         }
+        (
+            ProjectLogCode::LuaScript,
+            ProjectLogPayload::LuaScript {
+                identity,
+                fingerprint,
+            },
+        ) => localizer.format(UiMessage::LogLuaScript {
+            identity,
+            fingerprint,
+        }),
+        (ProjectLogCode::LuaPrint, ProjectLogPayload::LuaPrint { message }) => {
+            localizer.format(UiMessage::LogLuaPrint { message })
+        }
+        (
+            ProjectLogCode::LuaSummary,
+            ProjectLogPayload::LuaSummary {
+                database_calls,
+                changed_rows,
+                translation_calls,
+                printed_lines,
+            },
+        ) => localizer.format(UiMessage::LogLuaSummary {
+            database_calls: *database_calls,
+            changed_rows: *changed_rows,
+            translation_calls: *translation_calls,
+            printed_lines: *printed_lines,
+        }),
         (ProjectLogCode::FailureReported, ProjectLogPayload::Failure { diagnostic, .. }) => {
             render_failure_message(diagnostic, &localizer)
         }
@@ -1310,19 +1355,22 @@ fn sanitize_payload(payload: ProjectLogPayload) -> ProjectLogPayload {
             attempts,
             diagnostic: diagnostic.sanitized(),
         },
-        ProjectLogPayload::RunPlan {
+        ProjectLogPayload::RunPlan { source, selections } => ProjectLogPayload::RunPlan {
             source,
-            lua_source,
-            selections,
-            lua_enabled,
-        } => ProjectLogPayload::RunPlan {
-            source,
-            lua_source,
             selections: selections
                 .into_iter()
                 .map(|selection| sanitize_user_text(&selection))
                 .collect(),
-            lua_enabled,
+        },
+        ProjectLogPayload::LuaScript {
+            identity,
+            fingerprint,
+        } => ProjectLogPayload::LuaScript {
+            identity: sanitize_user_text(&identity),
+            fingerprint: sanitize_user_text(&fingerprint),
+        },
+        ProjectLogPayload::LuaPrint { message } => ProjectLogPayload::LuaPrint {
+            message: sanitize_user_text(&message),
         },
         payload => payload,
     }

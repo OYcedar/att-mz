@@ -9,9 +9,8 @@ use crate::diagnostic::{
     DiagnosticStage, DiagnosticSubject, FailureReport, RecoveryFact, ReportedFailure,
     SafeDiagnostic, SafeDiagnosticSource,
 };
-use crate::rpg_maker::ProjectName;
+use crate::project_name::ProjectName;
 use crate::rpg_maker::RpgMakerLayout;
-use crate::rpg_maker::model::MutationClaim;
 use crate::rpg_maker::project::OpenedProject;
 use crate::storage::file_system::{
     DirectoryDiscardError, DirectoryFileOverlay, DirectoryPrepareError, DirectoryPublishError,
@@ -21,20 +20,16 @@ use crate::storage::file_system::{
     ScopedDirectoryEntryKind, ScopedDirectoryPath,
 };
 
-use super::lua::ScopedPreparedWriteBackCandidate;
 use super::rewriter::RpgMakerRewrittenDocuments;
 use super::{
-    PreparedWriteBackCandidate, PublishedWriteBack, StandardWriteBackPublisher,
+    PreparedWriteBackCandidate, PublishedWriteBack, RpgMakerWriteBackPublisher,
     WriteBackPublishFailure, WriteBackPublishFailureState, WriteBackPublishingDiagnostic,
 };
 
 /// 根已准备、只能发布或丢弃一次的完整写回候选。
 pub(crate) struct PreparedWriteBack<S> {
-    project_name: ProjectName,
-    workspace_root: PathBuf,
     output_root: PathBuf,
     layout: RpgMakerLayout,
-    mutation_claims: Vec<MutationClaim>,
     staged: crate::storage::file_system::StagedDirectory<S>,
 }
 
@@ -42,8 +37,6 @@ impl<S> fmt::Debug for PreparedWriteBack<S> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PreparedWriteBack")
-            .field("project_name", &self.project_name)
-            .field("workspace_root", &self.workspace_root)
             .field("output_root", &self.output_root)
             .field("candidate_root", &self.staged.staging_root())
             .finish_non_exhaustive()
@@ -54,36 +47,17 @@ impl<S> PreparedWriteBackCandidate for PreparedWriteBack<S>
 where
     S: Send + 'static,
 {
-    fn belongs_to(&self, project: &OpenedProject) -> bool {
-        self.project_name == *project.name()
-            && self.workspace_root == project.workspace_root()
-            && self.output_root == project.write_back_root()
-    }
-
     fn candidate_root(&self) -> &Path {
         self.staged.staging_root()
     }
-
-    fn mutation_claims(&self) -> &[MutationClaim] {
-        &self.mutation_claims
-    }
 }
 
-impl<S> ScopedPreparedWriteBackCandidate<S> for PreparedWriteBack<S>
-where
-    S: Send + 'static,
-{
-    fn staged_directory(&self) -> &crate::storage::file_system::StagedDirectory<S> {
-        &self.staged
-    }
-}
-
-/// 用当前引擎布局下冻结的 `data`、`js` 基底发布 Standard 写回候选。
-pub(crate) struct StandardWriteBackPublishingService<A> {
+/// 用当前引擎布局下冻结的 `data`、`js` 基底发布 RPG Maker 写回候选。
+pub(crate) struct RpgMakerWriteBackPublishingService<A> {
     directory_publisher: A,
 }
 
-impl<A> StandardWriteBackPublishingService<A> {
+impl<A> RpgMakerWriteBackPublishingService<A> {
     pub(crate) fn new(directory_publisher: A) -> Self {
         Self {
             directory_publisher,
@@ -91,8 +65,8 @@ impl<A> StandardWriteBackPublishingService<A> {
     }
 }
 
-impl<A> StandardWriteBackPublisher<RpgMakerRewrittenDocuments>
-    for StandardWriteBackPublishingService<A>
+impl<A> RpgMakerWriteBackPublisher<RpgMakerRewrittenDocuments>
+    for RpgMakerWriteBackPublishingService<A>
 where
     A: RecoverableDirectoryPublisher
         + ScopedDirectoryEditor<
@@ -101,7 +75,7 @@ where
         >,
 {
     type Candidate = PreparedWriteBack<<A as RecoverableDirectoryPublisher>::StagingState>;
-    type Error = StandardWriteBackPublishingError<<A as RecoverableDirectoryPublisher>::Error>;
+    type Error = RpgMakerWriteBackPublishingError<<A as RecoverableDirectoryPublisher>::Error>;
 
     async fn prepare(
         &self,
@@ -111,7 +85,7 @@ where
         if documents.project_name() != project.name()
             || documents.workspace_root() != project.workspace_root()
         {
-            return Err(StandardWriteBackPublishingError::CandidateProjectMismatch {
+            return Err(RpgMakerWriteBackPublishingError::CandidateProjectMismatch {
                 expected_name: project.name().clone(),
                 expected_workspace_root: project.workspace_root().to_path_buf(),
                 candidate_name: documents.project_name().clone(),
@@ -124,15 +98,15 @@ where
                 project.layout().source_data().to_path_buf(),
                 project.layout().rpg_maker_layout().data_relative(),
             )
-            .map_err(StandardWriteBackPublishingError::InvalidRequest)?,
+            .map_err(RpgMakerWriteBackPublishingError::InvalidRequest)?,
             DirectorySourceMapping::new(
                 project.layout().source_js().to_path_buf(),
                 project.layout().rpg_maker_layout().js_relative(),
             )
-            .map_err(StandardWriteBackPublishingError::InvalidRequest)?,
+            .map_err(RpgMakerWriteBackPublishingError::InvalidRequest)?,
         ];
-        let (files, mutation_claims) = documents.into_files_and_claims();
-        let overlays = files
+        let overlays = documents
+            .into_files()
             .into_iter()
             .map(|file| {
                 let (relative_path, bytes) = file.into_parts();
@@ -141,7 +115,7 @@ where
                     .rpg_maker_layout()
                     .map_content_relative(&relative_path);
                 DirectoryFileOverlay::new(relative_path, bytes)
-                    .map_err(StandardWriteBackPublishingError::InvalidRequest)
+                    .map_err(RpgMakerWriteBackPublishingError::InvalidRequest)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let request = DirectoryStageRequest::new(
@@ -151,19 +125,16 @@ where
             overlays,
             Vec::new(),
         )
-        .map_err(StandardWriteBackPublishingError::InvalidRequest)?;
+        .map_err(RpgMakerWriteBackPublishingError::InvalidRequest)?;
 
         let staged = self
             .directory_publisher
             .prepare(request)
             .await
-            .map_err(StandardWriteBackPublishingError::Prepare)?;
+            .map_err(RpgMakerWriteBackPublishingError::Prepare)?;
         Ok(PreparedWriteBack {
-            project_name: project.name().clone(),
-            workspace_root: project.workspace_root().to_path_buf(),
             output_root: project.write_back_root().to_path_buf(),
             layout: project.layout().rpg_maker_layout(),
-            mutation_claims,
             staged,
         })
     }
@@ -184,11 +155,11 @@ where
         async move {
             let scope = bind
                 .await
-                .map_err(StandardWriteBackPublishingError::BindCandidate)?;
+                .map_err(RpgMakerWriteBackPublishingError::BindCandidate)?;
             let entries = directory_publisher
                 .list_scoped_root(&scope)
                 .await
-                .map_err(StandardWriteBackPublishingError::InspectCandidateRoot)?;
+                .map_err(RpgMakerWriteBackPublishingError::InspectCandidateRoot)?;
             let structure_valid = if let Some(directory) = layout.content_directory() {
                 validate_single_directory(&entries, directory)
                     && validate_data_and_js(
@@ -199,7 +170,7 @@ where
                                     .expect("固定内容目录必须是安全相对路径"),
                             )
                             .await
-                            .map_err(StandardWriteBackPublishingError::InspectCandidateRoot)?,
+                            .map_err(RpgMakerWriteBackPublishingError::InspectCandidateRoot)?,
                     )
             } else {
                 validate_data_and_js(&entries)
@@ -207,7 +178,7 @@ where
             if structure_valid {
                 Ok(())
             } else {
-                Err(StandardWriteBackPublishingError::InvalidCandidateRoot {
+                Err(RpgMakerWriteBackPublishingError::InvalidCandidateRoot {
                     root: candidate_root,
                 })
             }
@@ -227,7 +198,7 @@ where
             let state = publish_failure_state(&source);
             return Err(WriteBackPublishFailure::new(
                 state,
-                StandardWriteBackPublishingError::Publish(source),
+                RpgMakerWriteBackPublishingError::Publish(source),
             ));
         }
         Ok(PublishedWriteBack::new(output_root))
@@ -237,7 +208,7 @@ where
         self.directory_publisher
             .discard(candidate.staged)
             .await
-            .map_err(StandardWriteBackPublishingError::Discard)
+            .map_err(RpgMakerWriteBackPublishingError::Discard)
     }
 }
 
@@ -298,9 +269,9 @@ fn publish_failure_state<E>(source: &DirectoryPublishError<E>) -> WriteBackPubli
     }
 }
 
-/// Standard Publisher 在候选交接、请求建立或根终结阶段遇到的失败。
+/// RPG Maker Publisher 在候选交接、请求建立或根终结阶段遇到的失败。
 #[derive(Debug)]
-pub(crate) enum StandardWriteBackPublishingError<E> {
+pub(crate) enum RpgMakerWriteBackPublishingError<E> {
     CandidateProjectMismatch {
         expected_name: ProjectName,
         expected_workspace_root: PathBuf,
@@ -318,7 +289,7 @@ pub(crate) enum StandardWriteBackPublishingError<E> {
     Discard(DirectoryDiscardError<E>),
 }
 
-impl<E> fmt::Display for StandardWriteBackPublishingError<E>
+impl<E> fmt::Display for RpgMakerWriteBackPublishingError<E>
 where
     E: fmt::Display,
 {
@@ -356,7 +327,7 @@ where
     }
 }
 
-impl<E> Error for StandardWriteBackPublishingError<E>
+impl<E> Error for RpgMakerWriteBackPublishingError<E>
 where
     E: Error + 'static,
 {
@@ -374,7 +345,7 @@ where
     }
 }
 
-impl<E> StandardWriteBackPublishingError<E>
+impl<E> RpgMakerWriteBackPublishingError<E>
 where
     E: SafeDiagnosticSource,
 {
@@ -423,7 +394,7 @@ where
     }
 }
 
-impl<E> WriteBackPublishingDiagnostic for StandardWriteBackPublishingError<E>
+impl<E> WriteBackPublishingDiagnostic for RpgMakerWriteBackPublishingError<E>
 where
     E: Error + SafeDiagnosticSource + Send + Sync + 'static,
 {
@@ -724,12 +695,6 @@ where
             DiagnosticAction::CheckProjectState,
             "candidate_edit_error=not_directory",
         ),
-        ScopedDirectoryEditError::DirectoryNotEmpty { path } => (
-            DiagnosticSubject::path(path),
-            DiagnosticFailureKind::StateMismatch,
-            DiagnosticAction::CheckProjectState,
-            "candidate_edit_error=directory_not_empty",
-        ),
         ScopedDirectoryEditError::CandidateIdentityChanged { root } => (
             DiagnosticSubject::path(root),
             DiagnosticFailureKind::FileIdentityChanged,
@@ -1018,16 +983,6 @@ mod tests {
             std::future::ready(Ok(BoundScopedDirectory::new(root, scope, ())))
         }
 
-        fn read_scoped_file(
-            &self,
-            _scope: &BoundScopedDirectory<Self::ScopeState>,
-            _path: ScopedDirectoryPath,
-        ) -> impl std::future::Future<
-            Output = Result<Vec<u8>, ScopedDirectoryEditError<Self::Error>>,
-        > + Send {
-            std::future::ready(Ok(Vec::new()))
-        }
-
         fn list_scoped_directory(
             &self,
             _scope: &BoundScopedDirectory<Self::ScopeState>,
@@ -1064,15 +1019,6 @@ mod tests {
             _scope: &BoundScopedDirectory<Self::ScopeState>,
             _path: ScopedDirectoryPath,
             _bytes: Vec<u8>,
-        ) -> impl std::future::Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>> + Send
-        {
-            std::future::ready(Ok(()))
-        }
-
-        fn remove_scoped_path(
-            &self,
-            _scope: &BoundScopedDirectory<Self::ScopeState>,
-            _path: ScopedDirectoryPath,
         ) -> impl std::future::Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>> + Send
         {
             std::future::ready(Ok(()))
@@ -1222,7 +1168,7 @@ mod tests {
 
     #[test]
     fn candidate_edit_and_publish_diagnostics_keep_typed_terminal_state() {
-        let edit_cases: [(ScopedDirectoryEditError<FakeError>, &str); 8] = [
+        let edit_cases: [(ScopedDirectoryEditError<FakeError>, &str); 7] = [
             (
                 ScopedDirectoryEditError::WrongEditorInstance,
                 "candidate_edit_error=wrong_editor_instance",
@@ -1256,12 +1202,6 @@ mod tests {
                     path: PathBuf::from("data/Items.json"),
                 },
                 "candidate_edit_error=not_directory",
-            ),
-            (
-                ScopedDirectoryEditError::DirectoryNotEmpty {
-                    path: PathBuf::from("data"),
-                },
-                "candidate_edit_error=directory_not_empty",
             ),
             (
                 ScopedDirectoryEditError::CandidateIdentityChanged {
@@ -1360,14 +1300,14 @@ mod tests {
         prepare_error: Option<PrepareError>,
         result: PublishResult,
     ) -> (
-        StandardWriteBackPublishingService<FakeRecoverablePublisher>,
+        RpgMakerWriteBackPublishingService<FakeRecoverablePublisher>,
         PrepareCalls,
         PublishCalls,
     ) {
         let prepare_calls = Arc::new(Mutex::new(Vec::new()));
         let publish_calls = Arc::new(Mutex::new(Vec::new()));
         (
-            StandardWriteBackPublishingService::new(FakeRecoverablePublisher {
+            RpgMakerWriteBackPublishingService::new(FakeRecoverablePublisher {
                 prepare_calls: Arc::clone(&prepare_calls),
                 publish_calls: Arc::clone(&publish_calls),
                 prepare_error: Arc::new(Mutex::new(prepare_error)),
@@ -1451,7 +1391,7 @@ mod tests {
         let prepare_calls = Arc::new(Mutex::new(Vec::new()));
         let publish_calls = Arc::new(Mutex::new(Vec::new()));
         let discard_calls = Arc::new(Mutex::new(Vec::new()));
-        let publisher = StandardWriteBackPublishingService::new(FakeRecoverablePublisher {
+        let publisher = RpgMakerWriteBackPublishingService::new(FakeRecoverablePublisher {
             prepare_calls,
             publish_calls: Arc::clone(&publish_calls),
             prepare_error: Arc::new(Mutex::new(None)),
@@ -1476,7 +1416,7 @@ mod tests {
     #[tokio::test]
     async fn discard_failure_preserves_the_exact_staging_root() {
         let project = project("alice", "C:/projects");
-        let publisher = StandardWriteBackPublishingService::new(FakeRecoverablePublisher {
+        let publisher = RpgMakerWriteBackPublishingService::new(FakeRecoverablePublisher {
             prepare_calls: Arc::new(Mutex::new(Vec::new())),
             publish_calls: Arc::new(Mutex::new(Vec::new())),
             prepare_error: Arc::new(Mutex::new(None)),
@@ -1496,7 +1436,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            StandardWriteBackPublishingError::Discard(source)
+            RpgMakerWriteBackPublishingError::Discard(source)
                 if source.staging_root()
                     == Path::new("C:/projects/alice/write_back.att-stage")
                     && *source.source() == FakeError("cleanup")
@@ -1537,7 +1477,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            StandardWriteBackPublishingError::CandidateProjectMismatch { .. }
+            RpgMakerWriteBackPublishingError::CandidateProjectMismatch { .. }
         ));
         assert!(calls.lock().expect("发布调用锁不应中毒").is_empty());
         assert!(publish_calls.lock().expect("发布调用锁不应中毒").is_empty());
@@ -1561,7 +1501,7 @@ mod tests {
             .expect_err("暂存失败必须传播");
         assert!(matches!(
             error,
-            StandardWriteBackPublishingError::Prepare(DirectoryPrepareError::NotPrepared {
+            RpgMakerWriteBackPublishingError::Prepare(DirectoryPrepareError::NotPrepared {
                 target_root: failed_target,
                 source: FakeError("copy"),
                 cleanup_failure: None,
@@ -1575,7 +1515,7 @@ mod tests {
         root_error: DirectoryPublishError<FakeError>,
     ) -> (
         WriteBackPublishFailureState,
-        StandardWriteBackPublishingError<FakeError>,
+        RpgMakerWriteBackPublishingError<FakeError>,
     ) {
         let project = project("alice", "C:/projects");
         let (publisher, _, publish_calls) = harness(None, Err(root_error));
@@ -1611,7 +1551,7 @@ mod tests {
         );
         assert!(matches!(
             error,
-            StandardWriteBackPublishingError::Publish(
+            RpgMakerWriteBackPublishingError::Publish(
                 DirectoryPublishError::TargetMissing {
                     target_root: failed_target,
                     cleanup_failure: None,
@@ -1633,7 +1573,7 @@ mod tests {
         );
         assert!(matches!(
             error,
-            StandardWriteBackPublishingError::Publish(
+            RpgMakerWriteBackPublishingError::Publish(
                 DirectoryPublishError::TargetNotDirectory {
                     target_root: failed_target,
                     cleanup_failure: None,
@@ -1665,7 +1605,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            StandardWriteBackPublishingError::Publish(
+            RpgMakerWriteBackPublishingError::Publish(
                 DirectoryPublishError::NotPublished {
                     target_root: failed_target,
                     source: FakeError("replace"),
@@ -1696,7 +1636,7 @@ mod tests {
         );
         assert!(matches!(
             error,
-            StandardWriteBackPublishingError::Publish(
+            RpgMakerWriteBackPublishingError::Publish(
                 DirectoryPublishError::PublishedWithResiduals {
                     target_root: failed_target,
                     residual_path: residual,
@@ -1721,7 +1661,7 @@ mod tests {
         );
         assert!(matches!(
             error,
-            StandardWriteBackPublishingError::Publish(
+            RpgMakerWriteBackPublishingError::Publish(
                 DirectoryPublishError::OutcomeUnknown {
                     target_root: failed_target,
                     recovery_artifacts: artifacts,

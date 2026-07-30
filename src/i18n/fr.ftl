@@ -1,30 +1,29 @@
-app-about = Traduire des jeux RPG Maker avec un état de projet réutilisable
+app-about = Traduire des jeux et du texte structuré avec un état de projet réutilisable
 cli-config-help = Fichier de configuration TOML strict pour cette exécution
 cli-ui-language-help = Langue de l’aide, des diagnostics, de la progression, des résultats et des journaux : ar, zh-Hans, zh-Hant, en, fr, ru, es, ja, ko ou vi
 cli-progress-help = Mode de progression en direct : auto, plain ou off
 cli-mz-about = Traduire un jeu RPG Maker MZ
 cli-mv-about = Traduire un jeu RPG Maker MV
-cli-init-about = Initialiser ou mettre à jour un projet de jeu nommé
-cli-extract-about = Extraire le texte avec un plan owner explicite ou enregistré
+cli-generic-about = Traduire du texte JSONL structuré
+cli-init-about = Initialiser ou mettre à jour un projet de traduction nommé
+cli-extract-about = Synchroniser le texte source depuis l’entrée actuelle du projet
 cli-translate-about = Traduire le texte extrait avec un Profile explicite ou enregistré
-cli-write-back-about = Réécrire les traductions validées dans le jeu
-cli-project-lua-about = Exécuter une fois un programme Lua approuvé dans le contexte du projet
+cli-write-back-about = Écrire les traductions actuelles dans la sortie du projet
+cli-project-lua-about = Exécuter une fois un Lua atomique de base de données dans le projet
 cli-project-name-help = Nom stable du projet
-cli-init-path-help = Racine du jeu RPG Maker ; un projet existant peut réutiliser le dernier chemin réussi
+cli-init-path-help = Répertoire racine d’entrée ; un projet existant peut réutiliser le dernier chemin réussi
 cli-source-language-help = ID de langue source
 cli-target-language-help = ID de langue cible
 cli-dialogue-width-help = Nombre maximal de caractères pleine chasse par ligne de dialogue
 cli-scrolling-width-help = Nombre maximal de caractères pleine chasse par ligne de texte défilant
 cli-help-width-help = Nombre maximal de caractères pleine chasse par ligne d’aide ou de description
 cli-builtin-help = Utiliser les emplacements de texte RPG Maker intégrés à ATT
-cli-rules-help = Remplacer l’owner Rules par cette définition TOML ; une liste vide le désactive
+cli-rules-help = Remplacer les règles d’extraction RPG Maker par cette définition TOML ; une liste vide les désactive
 cli-dialogue-rules-help = Remplacer la projection des noms de dialogue MV utilisée avec Builtin
-cli-lua-help = Remplacer le programme Lua de la phase ; un fichier de zéro octet l’efface
 cli-profile-help = ID du Profile de traduction ; l’omettre réutilise le dernier Profile réussi
 cli-terms-help = Remplacer la ressource terminologique du projet
 cli-placeholders-help = Remplacer la ressource Placeholder du projet
-cli-project-lua-profile-help = Profile pour la validation manuelle Standard ; s’il est omis, le dernier Profile Translate réussi est résolu à l’ouverture de Standard
-cli-project-lua-script-help = Programme Lua approuvé à exécuter une fois
+cli-project-lua-script-help = Programme Lua atomique de base de données à exécuter une fois
 cli-project-lua-arguments-help = Argument UTF-8 transmis à Lua arg[1..] après --
 cli-usage-heading = Utilisation :
 cli-commands-heading = Commandes :
@@ -66,7 +65,7 @@ log-label-phase-planning = planification
 log-label-phase-confirmed-tasks = confirmation des tâches
 log-label-phase-no-work = aucun travail requis
 log-label-phase-read-assets = lecture des ressources
-log-label-phase-plan-standard = planification de l’écriture standard
+log-label-phase-plan-rpg-maker-write-back = planification de la réécriture RPG Maker
 log-label-phase-rewrite-documents = réécriture des documents
 log-label-phase-validate-candidate = validation du candidat
 log-label-task-complete = complet
@@ -83,12 +82,8 @@ plan-source-product-default = comportement du produit
 notice-init-reuse-path = Aucun chemin source fourni ; réutilisation du dernier chemin réussi : { $path }.
 notice-extract-reuse-owners = Aucune portée d’extraction fournie ; réutilisation du dernier plan réussi : { $owners }.
 notice-translate-reuse-profile = Aucun Profile fourni ; réutilisation du dernier Profile réussi : { $profile }.
-notice-translate-reuse-lua = Aucune option Lua fournie ; réutilisation du dernier choix Translate Lua réussi.
-notice-write-back-reuse-lua = Aucune option Lua fournie ; réutilisation du dernier programme WriteBack Lua réussi.
-notice-write-back-standard-only = Aucun programme WriteBack Lua n’est configuré ; Standard seul sera exécuté.
 notice-owner-disabled = L’owner { $owner } a été désactivé et retiré des futurs plans automatiques.
-notice-lua-cleared = Le programme Lua { $phase } a été effacé ; il ne sera pas exécuté cette fois.
-notice-no-model-request = Toutes les unités de traduction standard sont à jour ; Standard n’a envoyé aucune requête au modèle pendant cette exécution.
+notice-no-model-request = Toutes les unités de traduction sont à jour ; cette exécution n’a envoyé aucune requête au modèle.
 notice-manual-layout = { $count ->
     [one] 1 unité nécessite une vérification manuelle des sauts de ligne.
    *[other] { $count } unités nécessitent une vérification manuelle des sauts de ligne.
@@ -105,7 +100,6 @@ progress-extract-owner = Owner d’extraction : { $owner }
 progress-extract-documents = Analyse des documents
 progress-extract-builtin = Unités Builtin
 progress-extract-rules = Définitions Rules
-progress-extract-lua = Exécution du programme Extract Lua
 progress-extract-commit = Commit des ressources extraites
 progress-translate-planning = Planification des tâches de traduction
 progress-translate-confirmed = Tâches de traduction confirmées
@@ -114,7 +108,6 @@ progress-project-lua = Exécution du programme Lua du projet
 progress-write-back-read-assets = Lecture des ressources validées
 progress-write-back-planning = Planification de la réécriture des documents
 progress-write-back-documents = Documents réécrits
-progress-write-back-lua = Exécution du programme WriteBack Lua
 progress-write-back-validate-candidate = Validation du candidat de sortie
 progress-write-back-publish = Publication de la sortie ; une interruption attendra un résultat confirmé
 progress-finalizing = Finalisation des ressources obligatoires
@@ -126,23 +119,27 @@ result-init-updated = État du projet : mis à jour
 result-init-stale-owners = Nouvelle extraction requise : { $owners }
 result-extract-completed = Extraction terminée : { $project }
 result-translate-completed = Traduction terminée : { $project } (Profile : { $profile })
-result-translate-standard = Traduction standard : { $total } tâches ; { $complete } complètes, { $partial } partielles, { $unavailable } indisponibles ; { $written } emplacements écrits, { $remaining } restants
+result-translate-summary = Traduction : { $total } tâches ; { $complete } complètes, { $partial } partielles, { $unavailable } indisponibles ; { $written } emplacements écrits, { $remaining } restants
 result-translate-convergence = Convergence : { $retained } conservés, { $invalidated } invalidés, { $not_applicable } non applicables, { $reused } réutilisés
 result-write-back-completed = Réécriture terminée : { $project }
 result-project-lua-completed = Exécution Lua du projet terminée : { $project }
 result-output-directory = Répertoire de sortie : { $path }
-result-write-back-standard = Réécriture standard : { $translated } unités traduites, { $original } unités source ; { $auto_wrapped } retours automatiques, { $breaks } sauts de ligne et { $indents } retraits pleine chasse ajoutés ; { $manual } mises en page manuelles
-result-lua-executed = Lua : exécuté
-result-lua-not-executed = Lua : non exécuté
+result-write-back-summary = Réécriture : { $translated } unités traduites, { $original } unités source ; { $auto_wrapped } retours automatiques, { $breaks } sauts de ligne et { $indents } retraits pleine chasse ajoutés ; { $manual } mises en page manuelles
+result-generic-extract-unchanged = Entrée Generic inchangée : { $files } fichiers, { $groups } groupes, { $units } unités
+result-generic-extract-updated = Entrée Generic mise à jour : { $files } fichiers, { $groups } groupes, { $units } unités ; { $preserved } traductions conservées et { $cleared } effacées
+result-generic-translate-summary = Traduction Generic : { $total } tâches ; { $complete } complètes, { $partial } partielles, { $unavailable } indisponibles ; { $cleared } effacées, { $reused } réutilisées, { $accepted } acceptées, { $written } écrites, { $conflicted } conflits, { $problems } problèmes de réponse
+result-generic-write-back-summary = Réécriture Generic : { $translated } unités traduites, { $original } unités source conservées
 result-cancelled = La commande a été annulée après une finalisation sûre.
 result-plan-saved = Le plan d’exécution réussi a été enregistré.
-result-translate-plan-sources = Le plan de cette exécution réussie a été enregistré. Source du Profile : { $profile_source } ; source Lua : { $lua_source }.
 log-run-started = La commande { $command } a démarré.
 log-run-succeeded = La commande { $command } s’est terminée avec succès.
 log-run-failed = La commande { $command } a échoué.
 log-run-outcome-unknown = La commande { $command } s’est terminée avec un résultat final inconnu ; suivez les emplacements de récupération indiqués dans l’erreur.
 log-run-cancelled = La commande { $command } a été annulée.
 log-performance-counters = Compteurs de performances : { $sqlite_control_attempted_total } tentatives de contrôle de transaction SQLite ; validations complètes de l’arborescence candidate démarrées { $candidate_validation_started }, terminées { $candidate_validation_completed }.
+log-lua-script = Script Lua { $identity } (SHA-256 { $fingerprint }).
+log-lua-print = Lua : { $message }
+log-lua-summary = Lua validé : { $database_calls } appels à la base, { $changed_rows } lignes modifiées, { $translation_calls } appels de traduction et { $printed_lines } lignes affichées.
 log-plan-resolved = Le plan de { $command } provient de { $source }.
 log-phase-started = Phase démarrée : { $phase }.
 log-phase-finished = Phase terminée : { $phase }.
@@ -221,7 +218,8 @@ diagnostic-action-value = { $code ->
 }
 diagnostic-failure-value = { $code ->
     [missing_required_value] Une valeur obligatoire est manquante
-    [extract_plan_required] Aucun plan Extract réutilisable n’est enregistré ; fournissez au moins une option parmi --builtin, --rules et --lua
+    [extract_plan_required] Aucun plan Extract réutilisable n’est enregistré ; fournissez --builtin ou --rules
+    [generic_extract_required] L’entrée JSONL ne correspond plus au dernier Extract ; exécutez de nouveau att generic extract
     [conflicting_values] Les valeurs fournies sont incompatibles
     [invalid_syntax] La syntaxe de la valeur est incorrecte
     [invalid_encoding] L’encodage du texte est incorrect
@@ -265,8 +263,6 @@ diagnostic-failure-value = { $code ->
     [lua_execution_failed] Le programme Lua principal a échoué pendant son exécution
     [lua_host_call_failed] Un appel à une capacité de l’hôte Lua a échoué
     [lua_finalization_failed] L’hôte Lua n’a pas pu finaliser toutes les ressources liées
-    [lua_unclosed_transaction] Le programme Lua s’est terminé avec une transaction ouverte ; celle-ci a été annulée
-    [lua_snapshot_store_failed] L’instantané d’extraction Lua validé n’a pas pu être enregistré
     [rules_definition_invalid] Le programme Rules ne respecte pas le contrat de définition Rules
     [rules_document_read_failed] Un document source requis par le programme Rules n’a pas pu être lu
     [rules_no_non_blank_match] L’entrée Rules n’a produit aucune unité sémantique non vide
@@ -281,14 +277,13 @@ diagnostic-failure-value = { $code ->
     [rules_snapshot_invalid] Les groupes Rules extraits ne forment pas un instantané de ressources valide
     [rules_snapshot_store_failed] L’instantané d’extraction Rules validé n’a pas pu être enregistré
     [write_back_extraction_out_of_date] Les ressources extraites ne correspondent plus à la source actuelle du projet
-    [write_back_asset_snapshot_invalid] Les ressources Standard enregistrées ne forment pas un instantané de réécriture valide
+    [write_back_asset_snapshot_invalid] Les ressources RPG Maker enregistrées ne forment pas un instantané de réécriture valide
     [source_document_invalid] Un document source RPG Maker ne respecte pas le format requis
     [write_back_mutation_invalid] Une modification de traduction validée ne peut pas être appliquée à son emplacement source figé
     [write_back_output_path_invalid] Un fichier réécrit se trouve hors de l’arborescence de sortie RPG Maker autorisée
     [write_back_output_path_duplicate] Plusieurs fichiers réécrits ciblent le même chemin de sortie
     [write_back_candidate_project_mismatch] Le candidat de réécriture préparé appartient à un autre projet
     [write_back_candidate_invalid] Le candidat de réécriture ne respecte pas l’arborescence data/js requise
-    [write_back_unexpected_lua_outcome] Le programme Lua de réécriture a renvoyé un résultat pour une autre phase Lua
     [write_back_not_published] Le candidat de réécriture n’a pas remplacé le répertoire de sortie actuel
     [write_back_published_with_residuals] La sortie a été publiée, mais certains artefacts de récupération n’ont pas pu être supprimés
     [write_back_recovery_required] Le répertoire de sortie doit être récupéré avant que son contenu soit fiable

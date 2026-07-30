@@ -1285,7 +1285,7 @@ pub(crate) fn parse_json_document_for_test(
         PathBuf::from("data/Test.json"),
         text.as_bytes().to_vec(),
     )
-    .expect("测试 Standard JSON 必须有效") else {
+    .expect("测试 RPG Maker JSON 必须有效") else {
         unreachable!("JSON 测试请求必须返回 JSON 文档")
     };
     RpgMakerProjectDocuments::from_stack_safe_parts(BTreeMap::from([(id, value)]), Vec::new())
@@ -1316,7 +1316,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
 
-    use crate::rpg_maker::ProjectName;
+    use crate::project_name::ProjectName;
     use crate::storage::file_system::ReadFile;
 
     use super::*;

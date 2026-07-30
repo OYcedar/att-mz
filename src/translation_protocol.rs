@@ -19,22 +19,6 @@ pub(crate) enum TranslationResponseEnvelope {
     ThinkingThenJson,
 }
 
-/// 合法 Assistant JSON 中单个值不满足字符串数组契约的结构化原因。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TranslationAssistantValueError {
-    NotStringArray,
-    NonStringItem { item: NonZeroUsize },
-}
-
-impl TranslationAssistantValueError {
-    pub(crate) fn business_message(self) -> String {
-        match self {
-            Self::NotStringArray => "译文必须是字符串数组".to_owned(),
-            Self::NonStringItem { item } => format!("译文数组第 {item} 项必须是字符串"),
-        }
-    }
-}
-
 /// `serde_json` 在协议边界建立的稳定错误类别。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TranslationTaskResponseJsonErrorCategory {
@@ -143,11 +127,9 @@ pub(crate) struct ParsedTranslationAssistantEntry {
     id: String,
     value: Value,
     canonical_id: Option<usize>,
-    translation: Result<Vec<String>, TranslationAssistantValueError>,
 }
 
 impl ParsedTranslationAssistantEntry {
-    #[cfg(test)]
     pub(crate) fn id(&self) -> &str {
         &self.id
     }
@@ -156,19 +138,12 @@ impl ParsedTranslationAssistantEntry {
         self.canonical_id
     }
 
-    pub(crate) fn translation(&self) -> Result<&[String], TranslationAssistantValueError> {
-        self.translation.as_deref().map_err(|error| *error)
+    pub(crate) fn value(&self) -> &Value {
+        &self.value
     }
 
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        String,
-        Value,
-        Option<usize>,
-        Result<Vec<String>, TranslationAssistantValueError>,
-    ) {
-        (self.id, self.value, self.canonical_id, self.translation)
+    pub(crate) fn into_parts(self) -> (String, Value, Option<usize>) {
+        (self.id, self.value, self.canonical_id)
     }
 }
 
@@ -218,7 +193,7 @@ impl<'de> Visitor<'de> for ModelOutputBatchVisitor {
     type Value = ModelOutputBatch;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("以正整数 ID 为键、字符串数组为值的 JSON 对象")
+        formatter.write_str("以数字 ID 为键的 JSON 对象")
     }
 
     fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
@@ -249,7 +224,6 @@ pub(crate) fn parse_translation_response(
                 .into_iter()
                 .map(|output| ParsedTranslationAssistantEntry {
                     canonical_id: parse_model_output_id(&output.id),
-                    translation: parse_translation_lines(&output.value),
                     id: output.id,
                     value: output.value,
                 })
@@ -288,22 +262,6 @@ fn parse_model_output_id(value: &str) -> Option<usize> {
         return None;
     }
     value.parse().ok()
-}
-
-fn parse_translation_lines(value: &Value) -> Result<Vec<String>, TranslationAssistantValueError> {
-    let Value::Array(values) = value else {
-        return Err(TranslationAssistantValueError::NotStringArray);
-    };
-    values
-        .iter()
-        .enumerate()
-        .map(|(line_index, value)| match value {
-            Value::String(line) => Ok(line.clone()),
-            _ => Err(TranslationAssistantValueError::NonStringItem {
-                item: NonZeroUsize::new(line_index + 1).expect("一基数组项编号不可能为零"),
-            }),
-        })
-        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -523,10 +481,7 @@ mod tests {
         )
         .expect("合法 thinking 信封应解析");
         assert_eq!(parsed.thinking(), Some("逐项检查"));
-        assert_eq!(
-            parsed.entries()[0].translation().expect("值应为字符串数组"),
-            ["译文"]
-        );
+        assert_eq!(parsed.entries()[0].value(), &serde_json::json!(["译文"]));
 
         let error = parse_translation_response(
             "<why>不应出现</why>{\"1\":[\"译文\"]}",
@@ -546,10 +501,7 @@ mod tests {
             TranslationResponseEnvelope::JsonOnly,
         )
         .expect("值形状由逐 ID 验收");
-        assert_eq!(
-            parsed.entries()[1].translation(),
-            Err(TranslationAssistantValueError::NotStringArray)
-        );
+        assert_eq!(parsed.entries()[1].value(), &serde_json::Value::Bool(true));
 
         let error = parse_translation_response(
             "\n<why>ok</why>\n{\"1\":",

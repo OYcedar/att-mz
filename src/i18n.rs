@@ -421,6 +421,7 @@ pub(crate) enum UiMessage<'a> {
     CliProgressHelp,
     CliMzAbout,
     CliMvAbout,
+    CliGenericAbout,
     CliInitAbout,
     CliExtractAbout,
     CliTranslateAbout,
@@ -436,11 +437,9 @@ pub(crate) enum UiMessage<'a> {
     CliBuiltinHelp,
     CliRulesHelp,
     CliDialogueRulesHelp,
-    CliLuaHelp,
     CliProfileHelp,
     CliTermsHelp,
     CliPlaceholdersHelp,
-    CliProjectLuaProfileHelp,
     CliProjectLuaScriptHelp,
     CliProjectLuaArgumentsHelp,
     CliUsageHeading,
@@ -646,7 +645,7 @@ pub(crate) enum UiMessage<'a> {
     LogLabelPhaseConfirmedTasks,
     LogLabelPhaseNoWork,
     LogLabelPhaseReadAssets,
-    LogLabelPhasePlanStandard,
+    LogLabelPhasePlanRpgMakerWriteBack,
     LogLabelPhaseRewriteDocuments,
     LogLabelPhaseValidateCandidate,
     LogLabelTaskComplete,
@@ -662,14 +661,8 @@ pub(crate) enum UiMessage<'a> {
     NoticeTranslateReuseProfile {
         profile: &'a str,
     },
-    NoticeTranslateReuseLua,
-    NoticeWriteBackReuseLua,
-    NoticeWriteBackStandardOnly,
     NoticeOwnerDisabled {
         owner: &'a str,
-    },
-    NoticeLuaCleared {
-        phase: &'a str,
     },
     NoticeNoModelRequest,
     NoticeManualLayout {
@@ -689,7 +682,6 @@ pub(crate) enum UiMessage<'a> {
     ProgressExtractDocuments,
     ProgressExtractBuiltin,
     ProgressExtractRules,
-    ProgressExtractLua,
     ProgressExtractCommit,
     ProgressTranslatePlanning,
     ProgressTranslateConfirmed,
@@ -698,7 +690,6 @@ pub(crate) enum UiMessage<'a> {
     ProgressWriteBackReadAssets,
     ProgressWriteBackPlanning,
     ProgressWriteBackDocuments,
-    ProgressWriteBackLua,
     ProgressWriteBackValidateCandidate,
     ProgressWriteBackPublish,
     ProgressFinalizing,
@@ -715,11 +706,23 @@ pub(crate) enum UiMessage<'a> {
     ResultExtractCompleted {
         project: &'a str,
     },
+    ResultGenericExtractUnchanged {
+        files: u64,
+        groups: u64,
+        units: u64,
+    },
+    ResultGenericExtractUpdated {
+        files: u64,
+        groups: u64,
+        units: u64,
+        preserved: u64,
+        cleared: u64,
+    },
     ResultTranslateCompleted {
         project: &'a str,
         profile: &'a str,
     },
-    ResultTranslateStandard {
+    ResultTranslateSummary {
         total: u64,
         complete: u64,
         partial: u64,
@@ -733,6 +736,18 @@ pub(crate) enum UiMessage<'a> {
         not_applicable: u64,
         reused: u64,
     },
+    ResultGenericTranslateSummary {
+        total: u64,
+        complete: u64,
+        partial: u64,
+        unavailable: u64,
+        cleared: u64,
+        reused: u64,
+        accepted: u64,
+        written: u64,
+        conflicted: u64,
+        problems: u64,
+    },
     ResultWriteBackCompleted {
         project: &'a str,
     },
@@ -742,7 +757,7 @@ pub(crate) enum UiMessage<'a> {
     ResultOutputDirectory {
         path: &'a str,
     },
-    ResultWriteBackStandard {
+    ResultWriteBackSummary {
         translated: u64,
         original: u64,
         auto_wrapped: u64,
@@ -750,14 +765,12 @@ pub(crate) enum UiMessage<'a> {
         indents: u64,
         manual: u64,
     },
-    ResultLuaExecuted,
-    ResultLuaNotExecuted,
+    ResultGenericWriteBackSummary {
+        translated: u64,
+        original: u64,
+    },
     ResultCancelled,
     ResultPlanSaved,
-    ResultTranslatePlanSources {
-        profile_source: &'a str,
-        lua_source: &'a str,
-    },
     LogRunStarted {
         command: &'a str,
     },
@@ -777,6 +790,19 @@ pub(crate) enum UiMessage<'a> {
         sqlite_control_attempted_total: u64,
         candidate_validation_started: u64,
         candidate_validation_completed: u64,
+    },
+    LogLuaScript {
+        identity: &'a str,
+        fingerprint: &'a str,
+    },
+    LogLuaPrint {
+        message: &'a str,
+    },
+    LogLuaSummary {
+        database_calls: u64,
+        changed_rows: u64,
+        translation_calls: u64,
+        printed_lines: u64,
     },
     LogPlanResolved {
         command: &'a str,
@@ -954,6 +980,7 @@ impl UiMessage<'_> {
             Self::CliProgressHelp => "cli-progress-help",
             Self::CliMzAbout => "cli-mz-about",
             Self::CliMvAbout => "cli-mv-about",
+            Self::CliGenericAbout => "cli-generic-about",
             Self::CliInitAbout => "cli-init-about",
             Self::CliExtractAbout => "cli-extract-about",
             Self::CliTranslateAbout => "cli-translate-about",
@@ -969,11 +996,9 @@ impl UiMessage<'_> {
             Self::CliBuiltinHelp => "cli-builtin-help",
             Self::CliRulesHelp => "cli-rules-help",
             Self::CliDialogueRulesHelp => "cli-dialogue-rules-help",
-            Self::CliLuaHelp => "cli-lua-help",
             Self::CliProfileHelp => "cli-profile-help",
             Self::CliTermsHelp => "cli-terms-help",
             Self::CliPlaceholdersHelp => "cli-placeholders-help",
-            Self::CliProjectLuaProfileHelp => "cli-project-lua-profile-help",
             Self::CliProjectLuaScriptHelp => "cli-project-lua-script-help",
             Self::CliProjectLuaArgumentsHelp => "cli-project-lua-arguments-help",
             Self::CliUsageHeading => "cli-usage-heading",
@@ -1066,7 +1091,7 @@ impl UiMessage<'_> {
             Self::LogLabelPhaseConfirmedTasks => "log-label-phase-confirmed-tasks",
             Self::LogLabelPhaseNoWork => "log-label-phase-no-work",
             Self::LogLabelPhaseReadAssets => "log-label-phase-read-assets",
-            Self::LogLabelPhasePlanStandard => "log-label-phase-plan-standard",
+            Self::LogLabelPhasePlanRpgMakerWriteBack => "log-label-phase-plan-rpg-maker-write-back",
             Self::LogLabelPhaseRewriteDocuments => "log-label-phase-rewrite-documents",
             Self::LogLabelPhaseValidateCandidate => "log-label-phase-validate-candidate",
             Self::LogLabelTaskComplete => "log-label-task-complete",
@@ -1076,11 +1101,7 @@ impl UiMessage<'_> {
             Self::NoticeInitReusePath { .. } => "notice-init-reuse-path",
             Self::NoticeExtractReuseOwners { .. } => "notice-extract-reuse-owners",
             Self::NoticeTranslateReuseProfile { .. } => "notice-translate-reuse-profile",
-            Self::NoticeTranslateReuseLua => "notice-translate-reuse-lua",
-            Self::NoticeWriteBackReuseLua => "notice-write-back-reuse-lua",
-            Self::NoticeWriteBackStandardOnly => "notice-write-back-standard-only",
             Self::NoticeOwnerDisabled { .. } => "notice-owner-disabled",
-            Self::NoticeLuaCleared { .. } => "notice-lua-cleared",
             Self::NoticeNoModelRequest => "notice-no-model-request",
             Self::NoticeManualLayout { .. } => "notice-manual-layout",
             Self::NoticeLogDegraded => "notice-log-degraded",
@@ -1095,7 +1116,6 @@ impl UiMessage<'_> {
             Self::ProgressExtractDocuments => "progress-extract-documents",
             Self::ProgressExtractBuiltin => "progress-extract-builtin",
             Self::ProgressExtractRules => "progress-extract-rules",
-            Self::ProgressExtractLua => "progress-extract-lua",
             Self::ProgressExtractCommit => "progress-extract-commit",
             Self::ProgressTranslatePlanning => "progress-translate-planning",
             Self::ProgressTranslateConfirmed => "progress-translate-confirmed",
@@ -1104,7 +1124,6 @@ impl UiMessage<'_> {
             Self::ProgressWriteBackReadAssets => "progress-write-back-read-assets",
             Self::ProgressWriteBackPlanning => "progress-write-back-planning",
             Self::ProgressWriteBackDocuments => "progress-write-back-documents",
-            Self::ProgressWriteBackLua => "progress-write-back-lua",
             Self::ProgressWriteBackValidateCandidate => "progress-write-back-validate-candidate",
             Self::ProgressWriteBackPublish => "progress-write-back-publish",
             Self::ProgressFinalizing => "progress-finalizing",
@@ -1115,24 +1134,28 @@ impl UiMessage<'_> {
             Self::ResultInitUpdated => "result-init-updated",
             Self::ResultInitStaleOwners { .. } => "result-init-stale-owners",
             Self::ResultExtractCompleted { .. } => "result-extract-completed",
+            Self::ResultGenericExtractUnchanged { .. } => "result-generic-extract-unchanged",
+            Self::ResultGenericExtractUpdated { .. } => "result-generic-extract-updated",
             Self::ResultTranslateCompleted { .. } => "result-translate-completed",
-            Self::ResultTranslateStandard { .. } => "result-translate-standard",
+            Self::ResultTranslateSummary { .. } => "result-translate-summary",
             Self::ResultTranslateConvergence { .. } => "result-translate-convergence",
+            Self::ResultGenericTranslateSummary { .. } => "result-generic-translate-summary",
             Self::ResultWriteBackCompleted { .. } => "result-write-back-completed",
             Self::ResultProjectLuaCompleted { .. } => "result-project-lua-completed",
             Self::ResultOutputDirectory { .. } => "result-output-directory",
-            Self::ResultWriteBackStandard { .. } => "result-write-back-standard",
-            Self::ResultLuaExecuted => "result-lua-executed",
-            Self::ResultLuaNotExecuted => "result-lua-not-executed",
+            Self::ResultWriteBackSummary { .. } => "result-write-back-summary",
+            Self::ResultGenericWriteBackSummary { .. } => "result-generic-write-back-summary",
             Self::ResultCancelled => "result-cancelled",
             Self::ResultPlanSaved => "result-plan-saved",
-            Self::ResultTranslatePlanSources { .. } => "result-translate-plan-sources",
             Self::LogRunStarted { .. } => "log-run-started",
             Self::LogRunSucceeded { .. } => "log-run-succeeded",
             Self::LogRunFailed { .. } => "log-run-failed",
             Self::LogRunOutcomeUnknown { .. } => "log-run-outcome-unknown",
             Self::LogRunCancelled { .. } => "log-run-cancelled",
             Self::LogPerformanceCounters { .. } => "log-performance-counters",
+            Self::LogLuaScript { .. } => "log-lua-script",
+            Self::LogLuaPrint { .. } => "log-lua-print",
+            Self::LogLuaSummary { .. } => "log-lua-summary",
             Self::LogPlanResolved { .. } => "log-plan-resolved",
             Self::LogPhaseStarted { .. } => "log-phase-started",
             Self::LogPhaseFinished { .. } => "log-phase-finished",
@@ -1211,13 +1234,6 @@ impl UiMessage<'_> {
             Self::NoticeTranslateReuseProfile { profile } => {
                 set_text(&mut arguments, "profile", profile);
             }
-            Self::ResultTranslatePlanSources {
-                profile_source,
-                lua_source,
-            } => {
-                set_text(&mut arguments, "profile_source", profile_source);
-                set_text(&mut arguments, "lua_source", lua_source);
-            }
             Self::NoticeInitReusePath { path } | Self::ResultOutputDirectory { path } => {
                 set_text(&mut arguments, "path", path)
             }
@@ -1225,7 +1241,6 @@ impl UiMessage<'_> {
                 set_text(&mut arguments, "owners", owners);
             }
             Self::NoticeOwnerDisabled { owner } => set_text(&mut arguments, "owner", owner),
-            Self::NoticeLuaCleared { phase } => set_text(&mut arguments, "phase", phase),
             Self::NoticeManualLayout { count }
             | Self::LogRetrySummary { count }
             | Self::LogPartialResult { count } => set_number(&mut arguments, "count", count),
@@ -1242,7 +1257,29 @@ impl UiMessage<'_> {
                 set_text(&mut arguments, "project", project);
                 set_text(&mut arguments, "profile", profile);
             }
-            Self::ResultTranslateStandard {
+            Self::ResultGenericExtractUnchanged {
+                files,
+                groups,
+                units,
+            } => {
+                set_number(&mut arguments, "files", files);
+                set_number(&mut arguments, "groups", groups);
+                set_number(&mut arguments, "units", units);
+            }
+            Self::ResultGenericExtractUpdated {
+                files,
+                groups,
+                units,
+                preserved,
+                cleared,
+            } => {
+                set_number(&mut arguments, "files", files);
+                set_number(&mut arguments, "groups", groups);
+                set_number(&mut arguments, "units", units);
+                set_number(&mut arguments, "preserved", preserved);
+                set_number(&mut arguments, "cleared", cleared);
+            }
+            Self::ResultTranslateSummary {
                 total,
                 complete,
                 partial,
@@ -1268,7 +1305,30 @@ impl UiMessage<'_> {
                 set_number(&mut arguments, "not_applicable", not_applicable);
                 set_number(&mut arguments, "reused", reused);
             }
-            Self::ResultWriteBackStandard {
+            Self::ResultGenericTranslateSummary {
+                total,
+                complete,
+                partial,
+                unavailable,
+                cleared,
+                reused,
+                accepted,
+                written,
+                conflicted,
+                problems,
+            } => {
+                set_number(&mut arguments, "total", total);
+                set_number(&mut arguments, "complete", complete);
+                set_number(&mut arguments, "partial", partial);
+                set_number(&mut arguments, "unavailable", unavailable);
+                set_number(&mut arguments, "cleared", cleared);
+                set_number(&mut arguments, "reused", reused);
+                set_number(&mut arguments, "accepted", accepted);
+                set_number(&mut arguments, "written", written);
+                set_number(&mut arguments, "conflicted", conflicted);
+                set_number(&mut arguments, "problems", problems);
+            }
+            Self::ResultWriteBackSummary {
                 translated,
                 original,
                 auto_wrapped,
@@ -1282,6 +1342,13 @@ impl UiMessage<'_> {
                 set_number(&mut arguments, "breaks", breaks);
                 set_number(&mut arguments, "indents", indents);
                 set_number(&mut arguments, "manual", manual);
+            }
+            Self::ResultGenericWriteBackSummary {
+                translated,
+                original,
+            } => {
+                set_number(&mut arguments, "translated", translated);
+                set_number(&mut arguments, "original", original);
             }
             Self::LogRunStarted { command }
             | Self::LogRunSucceeded { command }
@@ -1308,6 +1375,25 @@ impl UiMessage<'_> {
                     "candidate_validation_completed",
                     candidate_validation_completed,
                 );
+            }
+            Self::LogLuaScript {
+                identity,
+                fingerprint,
+            } => {
+                set_text(&mut arguments, "identity", identity);
+                set_text(&mut arguments, "fingerprint", fingerprint);
+            }
+            Self::LogLuaPrint { message } => set_text(&mut arguments, "message", message),
+            Self::LogLuaSummary {
+                database_calls,
+                changed_rows,
+                translation_calls,
+                printed_lines,
+            } => {
+                set_number(&mut arguments, "database_calls", database_calls);
+                set_number(&mut arguments, "changed_rows", changed_rows);
+                set_number(&mut arguments, "translation_calls", translation_calls);
+                set_number(&mut arguments, "printed_lines", printed_lines);
             }
             Self::LogPlanResolved { command, source } => {
                 set_text(&mut arguments, "command", command);
@@ -1631,6 +1717,7 @@ impl UiMessage<'_> {
             | Self::CliProgressHelp
             | Self::CliMzAbout
             | Self::CliMvAbout
+            | Self::CliGenericAbout
             | Self::CliInitAbout
             | Self::CliExtractAbout
             | Self::CliTranslateAbout
@@ -1646,11 +1733,9 @@ impl UiMessage<'_> {
             | Self::CliBuiltinHelp
             | Self::CliRulesHelp
             | Self::CliDialogueRulesHelp
-            | Self::CliLuaHelp
             | Self::CliProfileHelp
             | Self::CliTermsHelp
             | Self::CliPlaceholdersHelp
-            | Self::CliProjectLuaProfileHelp
             | Self::CliProjectLuaScriptHelp
             | Self::CliProjectLuaArgumentsHelp
             | Self::CliUsageHeading
@@ -1691,7 +1776,7 @@ impl UiMessage<'_> {
             | Self::LogLabelPhaseConfirmedTasks
             | Self::LogLabelPhaseNoWork
             | Self::LogLabelPhaseReadAssets
-            | Self::LogLabelPhasePlanStandard
+            | Self::LogLabelPhasePlanRpgMakerWriteBack
             | Self::LogLabelPhaseRewriteDocuments
             | Self::LogLabelPhaseValidateCandidate
             | Self::LogLabelTaskComplete
@@ -1699,9 +1784,6 @@ impl UiMessage<'_> {
             | Self::LogLabelTaskUnavailable
             | Self::LogLabelTaskFailed
             | Self::LogNoWorkTranslationUpToDate
-            | Self::NoticeTranslateReuseLua
-            | Self::NoticeWriteBackReuseLua
-            | Self::NoticeWriteBackStandardOnly
             | Self::NoticeNoModelRequest
             | Self::NoticeLogDegraded
             | Self::NoticeTaskRecordsDegraded
@@ -1714,7 +1796,6 @@ impl UiMessage<'_> {
             | Self::ProgressExtractDocuments
             | Self::ProgressExtractBuiltin
             | Self::ProgressExtractRules
-            | Self::ProgressExtractLua
             | Self::ProgressExtractCommit
             | Self::ProgressTranslatePlanning
             | Self::ProgressTranslateConfirmed
@@ -1723,7 +1804,6 @@ impl UiMessage<'_> {
             | Self::ProgressWriteBackReadAssets
             | Self::ProgressWriteBackPlanning
             | Self::ProgressWriteBackDocuments
-            | Self::ProgressWriteBackLua
             | Self::ProgressWriteBackValidateCandidate
             | Self::ProgressWriteBackPublish
             | Self::ProgressFinalizing
@@ -1731,8 +1811,6 @@ impl UiMessage<'_> {
             | Self::ResultInitCreated
             | Self::ResultInitUnchanged
             | Self::ResultInitUpdated
-            | Self::ResultLuaExecuted
-            | Self::ResultLuaNotExecuted
             | Self::ResultCancelled
             | Self::ResultPlanSaved
             | Self::TaskRecordRunIdLabel
@@ -2115,6 +2193,7 @@ mod tests {
             UiMessage::CliProgressHelp,
             UiMessage::CliMzAbout,
             UiMessage::CliMvAbout,
+            UiMessage::CliGenericAbout,
             UiMessage::CliInitAbout,
             UiMessage::CliExtractAbout,
             UiMessage::CliTranslateAbout,
@@ -2130,11 +2209,9 @@ mod tests {
             UiMessage::CliBuiltinHelp,
             UiMessage::CliRulesHelp,
             UiMessage::CliDialogueRulesHelp,
-            UiMessage::CliLuaHelp,
             UiMessage::CliProfileHelp,
             UiMessage::CliTermsHelp,
             UiMessage::CliPlaceholdersHelp,
-            UiMessage::CliProjectLuaProfileHelp,
             UiMessage::CliProjectLuaScriptHelp,
             UiMessage::CliProjectLuaArgumentsHelp,
             UiMessage::CliUsageHeading,
@@ -2296,7 +2373,7 @@ mod tests {
             UiMessage::LogLabelPhaseConfirmedTasks,
             UiMessage::LogLabelPhaseNoWork,
             UiMessage::LogLabelPhaseReadAssets,
-            UiMessage::LogLabelPhasePlanStandard,
+            UiMessage::LogLabelPhasePlanRpgMakerWriteBack,
             UiMessage::LogLabelPhaseRewriteDocuments,
             UiMessage::LogLabelPhaseValidateCandidate,
             UiMessage::LogLabelTaskComplete,
@@ -2306,11 +2383,7 @@ mod tests {
             UiMessage::NoticeInitReusePath { path: "path" },
             UiMessage::NoticeExtractReuseOwners { owners: "owners" },
             UiMessage::NoticeTranslateReuseProfile { profile: "profile" },
-            UiMessage::NoticeTranslateReuseLua,
-            UiMessage::NoticeWriteBackReuseLua,
-            UiMessage::NoticeWriteBackStandardOnly,
             UiMessage::NoticeOwnerDisabled { owner: "owner" },
-            UiMessage::NoticeLuaCleared { phase: "phase" },
             UiMessage::NoticeNoModelRequest,
             UiMessage::NoticeManualLayout { count: 3 },
             UiMessage::NoticeLogDegraded,
@@ -2325,7 +2398,6 @@ mod tests {
             UiMessage::ProgressExtractDocuments,
             UiMessage::ProgressExtractBuiltin,
             UiMessage::ProgressExtractRules,
-            UiMessage::ProgressExtractLua,
             UiMessage::ProgressExtractCommit,
             UiMessage::ProgressTranslatePlanning,
             UiMessage::ProgressTranslateConfirmed,
@@ -2334,7 +2406,6 @@ mod tests {
             UiMessage::ProgressWriteBackReadAssets,
             UiMessage::ProgressWriteBackPlanning,
             UiMessage::ProgressWriteBackDocuments,
-            UiMessage::ProgressWriteBackLua,
             UiMessage::ProgressWriteBackValidateCandidate,
             UiMessage::ProgressWriteBackPublish,
             UiMessage::ProgressFinalizing,
@@ -2345,11 +2416,23 @@ mod tests {
             UiMessage::ResultInitUpdated,
             UiMessage::ResultInitStaleOwners { owners: "Rules" },
             UiMessage::ResultExtractCompleted { project: "demo" },
+            UiMessage::ResultGenericExtractUnchanged {
+                files: 1,
+                groups: 2,
+                units: 3,
+            },
+            UiMessage::ResultGenericExtractUpdated {
+                files: 1,
+                groups: 2,
+                units: 3,
+                preserved: 4,
+                cleared: 5,
+            },
             UiMessage::ResultTranslateCompleted {
                 project: "demo",
                 profile: "main",
             },
-            UiMessage::ResultTranslateStandard {
+            UiMessage::ResultTranslateSummary {
                 total: 1,
                 complete: 1,
                 partial: 0,
@@ -2363,10 +2446,22 @@ mod tests {
                 not_applicable: 0,
                 reused: 1,
             },
+            UiMessage::ResultGenericTranslateSummary {
+                total: 1,
+                complete: 2,
+                partial: 3,
+                unavailable: 4,
+                cleared: 5,
+                reused: 6,
+                accepted: 7,
+                written: 8,
+                conflicted: 9,
+                problems: 10,
+            },
             UiMessage::ResultWriteBackCompleted { project: "demo" },
             UiMessage::ResultProjectLuaCompleted { project: "demo" },
             UiMessage::ResultOutputDirectory { path: "output" },
-            UiMessage::ResultWriteBackStandard {
+            UiMessage::ResultWriteBackSummary {
                 translated: 1,
                 original: 2,
                 auto_wrapped: 3,
@@ -2374,14 +2469,12 @@ mod tests {
                 indents: 5,
                 manual: 6,
             },
-            UiMessage::ResultLuaExecuted,
-            UiMessage::ResultLuaNotExecuted,
+            UiMessage::ResultGenericWriteBackSummary {
+                translated: 1,
+                original: 2,
+            },
             UiMessage::ResultCancelled,
             UiMessage::ResultPlanSaved,
-            UiMessage::ResultTranslatePlanSources {
-                profile_source: "explicit",
-                lua_source: "project state",
-            },
             UiMessage::LogRunStarted { command: "extract" },
             UiMessage::LogRunSucceeded { command: "extract" },
             UiMessage::LogRunFailed { command: "extract" },
@@ -2391,6 +2484,17 @@ mod tests {
                 sqlite_control_attempted_total: 7,
                 candidate_validation_started: 11,
                 candidate_validation_completed: 13,
+            },
+            UiMessage::LogLuaScript {
+                identity: "script.lua",
+                fingerprint: "0123456789abcdef",
+            },
+            UiMessage::LogLuaPrint { message: "message" },
+            UiMessage::LogLuaSummary {
+                database_calls: 1,
+                changed_rows: 2,
+                translation_calls: 3,
+                printed_lines: 4,
             },
             UiMessage::LogPlanResolved {
                 command: "extract",

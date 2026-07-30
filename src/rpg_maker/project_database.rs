@@ -11,11 +11,11 @@ use std::path::{Path, PathBuf};
 use crate::fingerprint::{InvalidSha256FingerprintLength, Sha256Fingerprint};
 use crate::json_diagnostic::JsonErrorCategory;
 use crate::language::{LanguageId, LanguageIdError, LanguagePair};
-use crate::rpg_maker::ProjectName;
+use crate::project_name::ProjectName;
 use crate::rpg_maker::RpgMakerLayout;
+use crate::rpg_maker::asset::RpgMakerAssetOwner;
+use crate::rpg_maker::asset_storage::rpg_maker_asset_owner_order;
 use crate::rpg_maker::dialogue::{MvDialogueDefinition, MvDialogueDefinitionError};
-use crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner;
-use crate::rpg_maker::standard_asset_storage::standard_asset_owner_order;
 use crate::storage::sqlite::{
     CreateDatabaseError, ExecuteTransactionError, QueryExistingDatabaseError, SqliteCommand,
     SqliteDatabaseCreator, SqliteQuery, SqliteQueryExecutor, SqliteRow, SqliteTransactionExecutor,
@@ -24,20 +24,19 @@ use crate::storage::sqlite::{
 
 use run_plan::{
     CREATE_EXTRACT_RULES_DEFINITION_TABLE, CREATE_EXTRACT_RUN_PLAN_TABLE,
-    CREATE_INIT_RUN_PLAN_TABLE, CREATE_LUA_PROGRAM_TABLE, CREATE_TRANSLATE_RUN_PLAN_TABLE,
-    CREATE_WRITE_BACK_RUN_PLAN_TABLE, SELECT_LUA_PROGRAMS, SELECT_RUN_PLAN_SINGLETONS,
+    CREATE_INIT_RUN_PLAN_TABLE, CREATE_TRANSLATE_RUN_PLAN_TABLE, SELECT_RUN_PLAN_SINGLETONS,
     decode_project_run_plans,
 };
 #[allow(
     unused_imports,
-    reason = "运行方案组合根 API 在同次纵向重构完成接线后由 application 消费"
+    reason = "项目数据库集中重导出运行方案 API，调用方按具体命令选择所需成员"
 )]
 pub(crate) use run_plan::{
     ExtractRulesCanonicalJson, ExtractRunPlan, FinalProjectRunPlanPersistenceService, InitRunPlan,
-    InvalidProjectRunPlans, InvalidRunPlanValue, LuaProgramPhase, LuaProgramSnapshot,
-    ProjectRunPlanFinalizer, ProjectRunPlanPersistenceService, ProjectRunPlanReadError,
-    ProjectRunPlanReplaceError, ProjectRunPlanReplacement, ProjectRunPlanRepository,
-    ProjectRunPlans, TranslateRunPlan, WriteBackRunPlan,
+    InvalidProjectRunPlans, InvalidRunPlanValue, ProjectRunPlanFinalizer,
+    ProjectRunPlanPersistenceService, ProjectRunPlanReadError, ProjectRunPlanReplaceError,
+    ProjectRunPlanReplacement, ProjectRunPlanRepository, ProjectRunPlans, TranslateRunPlan,
+    decode_init_source_path,
 };
 
 const PROJECT_DATABASE_FILE_NAME: &str = "project.db";
@@ -54,8 +53,8 @@ const CREATE_METADATA_TABLE: &str = r#"CREATE TABLE metadata (
     help_description_max_fullwidth_chars INTEGER NOT NULL CHECK (help_description_max_fullwidth_chars > 0)
 )"#;
 
-const CREATE_STANDARD_ASSET_OWNER_STATE_TABLE: &str = r#"CREATE TABLE standard_asset_owner_state (
-    owner                       TEXT NOT NULL PRIMARY KEY CHECK (owner IN ('builtin', 'rules', 'lua')),
+const CREATE_RPG_MAKER_ASSET_OWNER_STATE_TABLE: &str = r#"CREATE TABLE rpg_maker_asset_owner_state (
+    owner                       TEXT NOT NULL PRIMARY KEY CHECK (owner IN ('builtin', 'rules')),
     source_snapshot_fingerprint BLOB NOT NULL CHECK (
         typeof(source_snapshot_fingerprint) = 'blob'
         AND length(source_snapshot_fingerprint) = 32
@@ -66,12 +65,12 @@ const CREATE_STANDARD_ASSET_OWNER_STATE_TABLE: &str = r#"CREATE TABLE standard_a
     )
 )"#;
 
-pub(crate) const STANDARD_TEXT_GROUP_TABLE_NAME: &str = "standard_text_group";
-pub(crate) const STANDARD_TEXT_UNIT_TABLE_NAME: &str = "standard_text_unit";
-pub(crate) const STANDARD_MUTATION_CLAIM_TABLE_NAME: &str = "standard_mutation_claim";
+pub(crate) const RPG_MAKER_TEXT_GROUP_TABLE_NAME: &str = "rpg_maker_text_group";
+pub(crate) const RPG_MAKER_TEXT_UNIT_TABLE_NAME: &str = "rpg_maker_text_unit";
+pub(crate) const RPG_MAKER_MUTATION_CLAIM_TABLE_NAME: &str = "rpg_maker_mutation_claim";
 
-const CREATE_STANDARD_TEXT_GROUP_TABLE: &str = r#"CREATE TABLE standard_text_group (
-    owner                  TEXT NOT NULL CHECK (owner IN ('builtin', 'rules', 'lua')),
+const CREATE_RPG_MAKER_TEXT_GROUP_TABLE: &str = r#"CREATE TABLE rpg_maker_text_group (
+    owner                  TEXT NOT NULL CHECK (owner IN ('builtin', 'rules')),
     group_location         TEXT NOT NULL CHECK (length(group_location) > 0),
     group_order            INTEGER NOT NULL CHECK (group_order >= 0),
     group_kind             TEXT NOT NULL CHECK (group_kind IN (
@@ -87,11 +86,11 @@ const CREATE_STANDARD_TEXT_GROUP_TABLE: &str = r#"CREATE TABLE standard_text_gro
     projection_recipe_json TEXT NOT NULL CHECK (length(projection_recipe_json) > 0),
     PRIMARY KEY (owner, group_location),
     UNIQUE (owner, group_order),
-    FOREIGN KEY (owner) REFERENCES standard_asset_owner_state(owner) ON DELETE CASCADE
+    FOREIGN KEY (owner) REFERENCES rpg_maker_asset_owner_state(owner) ON DELETE CASCADE
 )"#;
 
-const CREATE_STANDARD_TEXT_UNIT_TABLE: &str = r#"CREATE TABLE standard_text_unit (
-    owner                    TEXT NOT NULL CHECK (owner IN ('builtin', 'rules', 'lua')),
+const CREATE_RPG_MAKER_TEXT_UNIT_TABLE: &str = r#"CREATE TABLE rpg_maker_text_unit (
+    owner                    TEXT NOT NULL CHECK (owner IN ('builtin', 'rules')),
     group_location           TEXT NOT NULL CHECK (length(group_location) > 0),
     unit_role                TEXT NOT NULL CHECK (length(unit_role) > 0),
     unit_order               INTEGER NOT NULL CHECK (unit_order >= 0),
@@ -108,7 +107,7 @@ const CREATE_STANDARD_TEXT_UNIT_TABLE: &str = r#"CREATE TABLE standard_text_unit
     PRIMARY KEY (owner, group_location, unit_role),
     UNIQUE (owner, group_location, unit_order),
     FOREIGN KEY (owner, group_location)
-        REFERENCES standard_text_group(owner, group_location) ON DELETE CASCADE,
+        REFERENCES rpg_maker_text_group(owner, group_location) ON DELETE CASCADE,
     CHECK (
         (translation_content_json IS NULL AND translation_state IS NULL)
         OR (
@@ -121,116 +120,40 @@ const CREATE_STANDARD_TEXT_UNIT_TABLE: &str = r#"CREATE TABLE standard_text_unit
     )
 )"#;
 
-const CREATE_STANDARD_MUTATION_CLAIM_TABLE: &str = r#"CREATE TABLE standard_mutation_claim (
-    owner          TEXT NOT NULL CHECK (owner IN ('builtin', 'rules', 'lua')),
+const CREATE_RPG_MAKER_MUTATION_CLAIM_TABLE: &str = r#"CREATE TABLE rpg_maker_mutation_claim (
+    owner          TEXT NOT NULL CHECK (owner IN ('builtin', 'rules')),
     group_location TEXT NOT NULL CHECK (length(group_location) > 0),
     resource_key   TEXT NOT NULL CHECK (length(resource_key) > 0),
     access         TEXT NOT NULL CHECK (access IN ('intent', 'exclusive')),
     PRIMARY KEY (owner, group_location, resource_key),
     FOREIGN KEY (owner, group_location)
-        REFERENCES standard_text_group(owner, group_location) ON DELETE CASCADE
+        REFERENCES rpg_maker_text_group(owner, group_location) ON DELETE CASCADE
 )"#;
 
-pub(crate) const CREATE_STANDARD_MUTATION_CLAIM_RESOURCE_INDEX: &str = "CREATE INDEX standard_mutation_claim_resource_idx ON standard_mutation_claim(resource_key, access, owner, group_location)";
-pub(crate) const CREATE_STANDARD_MUTATION_CLAIM_OWNER_RESOURCE_INDEX: &str = "CREATE INDEX standard_mutation_claim_owner_resource_idx ON standard_mutation_claim(owner, resource_key, access, group_location)";
-pub(crate) const DROP_STANDARD_MUTATION_CLAIM_RESOURCE_INDEX: &str =
-    "DROP INDEX standard_mutation_claim_resource_idx";
-pub(crate) const DROP_STANDARD_MUTATION_CLAIM_OWNER_RESOURCE_INDEX: &str =
-    "DROP INDEX standard_mutation_claim_owner_resource_idx";
+pub(crate) const CREATE_RPG_MAKER_MUTATION_CLAIM_RESOURCE_INDEX: &str = "CREATE INDEX rpg_maker_mutation_claim_resource_idx ON rpg_maker_mutation_claim(resource_key, access, owner, group_location)";
+pub(crate) const CREATE_RPG_MAKER_MUTATION_CLAIM_OWNER_RESOURCE_INDEX: &str = "CREATE INDEX rpg_maker_mutation_claim_owner_resource_idx ON rpg_maker_mutation_claim(owner, resource_key, access, group_location)";
+pub(crate) const DROP_RPG_MAKER_MUTATION_CLAIM_RESOURCE_INDEX: &str =
+    "DROP INDEX rpg_maker_mutation_claim_resource_idx";
+pub(crate) const DROP_RPG_MAKER_MUTATION_CLAIM_OWNER_RESOURCE_INDEX: &str =
+    "DROP INDEX rpg_maker_mutation_claim_owner_resource_idx";
 
-pub(crate) const STANDARD_TRANSLATION_RESOURCE_TABLE_NAME: &str = "standard_translation_resource";
+pub(crate) const RPG_MAKER_TRANSLATION_RESOURCE_TABLE_NAME: &str = "rpg_maker_translation_resource";
 pub(crate) const TERMINOLOGY_RESOURCE_KIND: &str = "terminology";
 pub(crate) const PLACEHOLDER_RULES_RESOURCE_KIND: &str = "placeholder_rules";
 
-const CREATE_STANDARD_TRANSLATION_RESOURCE_TABLE: &str = r#"CREATE TABLE standard_translation_resource (
+const CREATE_RPG_MAKER_TRANSLATION_RESOURCE_TABLE: &str = r#"CREATE TABLE rpg_maker_translation_resource (
     resource_kind  TEXT NOT NULL PRIMARY KEY CHECK (
         resource_kind IN ('terminology', 'placeholder_rules')
     ),
     canonical_json TEXT NOT NULL CHECK (length(canonical_json) > 0)
 )"#;
 
-pub(crate) const STANDARD_PROJECT_DEFINITION_TABLE_NAME: &str = "standard_project_definition";
+pub(crate) const RPG_MAKER_PROJECT_DEFINITION_TABLE_NAME: &str = "rpg_maker_project_definition";
 pub(crate) const MV_DIALOGUE_RULES_DEFINITION_KIND: &str = "mv_dialogue_rules";
 
-const CREATE_STANDARD_PROJECT_DEFINITION_TABLE: &str = r#"CREATE TABLE standard_project_definition (
+const CREATE_RPG_MAKER_PROJECT_DEFINITION_TABLE: &str = r#"CREATE TABLE rpg_maker_project_definition (
     definition_kind TEXT NOT NULL PRIMARY KEY CHECK (definition_kind IN ('mv_dialogue_rules')),
     canonical_json  TEXT NOT NULL CHECK (length(canonical_json) > 0)
-)"#;
-
-pub(crate) const CREATE_MANAGED_TRANSLATION_OWNER_STATE_TABLE: &str = r#"CREATE TABLE managed_translation_owner_state (
-    owner                       TEXT NOT NULL PRIMARY KEY CHECK (owner = 'lua'),
-    source_snapshot_fingerprint BLOB NOT NULL CHECK (
-        typeof(source_snapshot_fingerprint) = 'blob'
-        AND length(source_snapshot_fingerprint) = 32
-    ),
-    manifest_fingerprint        BLOB NOT NULL CHECK (
-        typeof(manifest_fingerprint) = 'blob'
-        AND length(manifest_fingerprint) = 32
-    )
-)"#;
-
-pub(crate) const CREATE_MANAGED_TRANSLATION_COLLECTION_TABLE: &str = r#"CREATE TABLE managed_translation_collection (
-    owner            TEXT NOT NULL CHECK (owner = 'lua'),
-    collection_name  TEXT NOT NULL CHECK (
-        typeof(collection_name) = 'text'
-        AND length(trim(collection_name)) > 0
-    ),
-    collection_order INTEGER NOT NULL CHECK (collection_order >= 0),
-    instruction      TEXT NOT NULL CHECK (typeof(instruction) = 'text'),
-    PRIMARY KEY (owner, collection_name),
-    UNIQUE (owner, collection_order),
-    FOREIGN KEY (owner)
-        REFERENCES managed_translation_owner_state(owner) ON DELETE CASCADE
-)"#;
-
-pub(crate) const CREATE_MANAGED_TRANSLATION_UNIT_TABLE: &str = r#"CREATE TABLE managed_translation_unit (
-    owner                    TEXT NOT NULL CHECK (owner = 'lua'),
-    collection_name          TEXT NOT NULL CHECK (
-        typeof(collection_name) = 'text'
-        AND length(trim(collection_name)) > 0
-    ),
-    unit_key                 TEXT NOT NULL CHECK (
-        typeof(unit_key) = 'text'
-        AND length(trim(unit_key)) > 0
-    ),
-    unit_order               INTEGER NOT NULL CHECK (unit_order >= 0),
-    kind                     TEXT NOT NULL CHECK (
-        typeof(kind) = 'text'
-        AND length(trim(kind)) > 0
-    ),
-    shape                    TEXT NOT NULL CHECK (shape IN ('single', 'reflow', 'lines', 'items')),
-    original_content_json    TEXT NOT NULL CHECK (
-        typeof(original_content_json) = 'text'
-        AND json_valid(original_content_json)
-        AND (
-            (shape IN ('single', 'reflow') AND json_type(original_content_json) = 'text')
-            OR (shape IN ('lines', 'items') AND json_type(original_content_json) = 'array')
-        )
-    ),
-    context                  TEXT NOT NULL CHECK (typeof(context) = 'text'),
-    metadata_json            TEXT CHECK (
-        metadata_json IS NULL
-        OR (
-            typeof(metadata_json) = 'text'
-            AND json_valid(metadata_json)
-        )
-    ),
-    translation_content_json TEXT,
-    translation_state        BLOB,
-    PRIMARY KEY (owner, collection_name, unit_key),
-    UNIQUE (owner, collection_name, unit_order),
-    FOREIGN KEY (owner, collection_name)
-        REFERENCES managed_translation_collection(owner, collection_name) ON DELETE CASCADE,
-    CHECK (
-        (translation_content_json IS NULL AND translation_state IS NULL)
-        OR (
-            typeof(translation_content_json) = 'text'
-            AND json_valid(translation_content_json)
-            AND json_type(translation_content_json) = json_type(original_content_json)
-            AND typeof(translation_state) = 'blob'
-            AND length(translation_state) = 32
-        )
-    )
 )"#;
 
 const INSERT_METADATA: &str = r#"INSERT INTO metadata (
@@ -242,11 +165,11 @@ const INSERT_METADATA: &str = r#"INSERT INTO metadata (
     scrolling_text_max_fullwidth_chars,
     help_description_max_fullwidth_chars
 ) VALUES (?, ?, ?, ?, ?, ?, ?)"#;
-const INSERT_STANDARD_TRANSLATION_RESOURCE: &str = r#"INSERT INTO standard_translation_resource (
+const INSERT_RPG_MAKER_TRANSLATION_RESOURCE: &str = r#"INSERT INTO rpg_maker_translation_resource (
     resource_kind,
     canonical_json
 ) VALUES (?, ?)"#;
-const INSERT_STANDARD_PROJECT_DEFINITION: &str = r#"INSERT INTO standard_project_definition (
+const INSERT_RPG_MAKER_PROJECT_DEFINITION: &str = r#"INSERT INTO rpg_maker_project_definition (
     definition_kind,
     canonical_json
 ) VALUES (?, ?)"#;
@@ -269,11 +192,11 @@ const SELECT_PROJECT_RECORD: &str = r#"SELECT
     metadata.help_description_max_fullwidth_chars,
     definition.canonical_json
 FROM metadata
-JOIN standard_project_definition AS definition
+JOIN rpg_maker_project_definition AS definition
   ON definition.definition_kind = 'mv_dialogue_rules'"#;
 
 const SELECT_SCHEMA_VERSION: &str = "SELECT schema_version FROM pragma_schema_version";
-const SELECT_MANAGED_SCHEMA: &str = r#"SELECT type, name, tbl_name, sql
+const SELECT_ATT_SCHEMA: &str = r#"SELECT type, name, tbl_name, sql
 FROM sqlite_schema
 WHERE sql IS NOT NULL
   AND (
@@ -283,32 +206,27 @@ WHERE sql IS NOT NULL
       'extract_run_plan',
       'extract_rules_definition',
       'translate_run_plan',
-      'write_back_run_plan',
-      'lua_program',
-      'standard_asset_owner_state',
-      'standard_text_group',
-      'standard_text_unit',
-      'standard_mutation_claim',
-      'standard_translation_resource',
-      'standard_project_definition',
-      'managed_translation_owner_state',
-      'managed_translation_collection',
-      'managed_translation_unit'
+      'rpg_maker_asset_owner_state',
+      'rpg_maker_text_group',
+      'rpg_maker_text_unit',
+      'rpg_maker_mutation_claim',
+      'rpg_maker_translation_resource',
+      'rpg_maker_project_definition'
     )
     OR name IN (
-      'standard_mutation_claim_resource_idx',
-      'standard_mutation_claim_owner_resource_idx'
+      'rpg_maker_mutation_claim_resource_idx',
+      'rpg_maker_mutation_claim_owner_resource_idx'
     )
   )
 ORDER BY type, name"#;
 const SELECT_OWNER_STATES: &str = r#"SELECT owner, source_snapshot_fingerprint, asset_snapshot_fingerprint
-FROM standard_asset_owner_state
+FROM rpg_maker_asset_owner_state
 ORDER BY owner"#;
 const SELECT_TRANSLATION_RESOURCES: &str = r#"SELECT resource_kind, canonical_json
-FROM standard_translation_resource
+FROM rpg_maker_translation_resource
 ORDER BY resource_kind"#;
 const SELECT_PROJECT_DEFINITIONS: &str = r#"SELECT definition_kind, canonical_json
-FROM standard_project_definition
+FROM rpg_maker_project_definition
 ORDER BY definition_kind"#;
 const SELECT_QUICK_CHECK: &str = "PRAGMA quick_check";
 const SELECT_FOREIGN_KEY_CHECK: &str = "PRAGMA foreign_key_check";
@@ -324,9 +242,8 @@ SET source_language = ?1,
     scrolling_text_max_fullwidth_chars = ?5,
     help_description_max_fullwidth_chars = ?6
 WHERE name = ?7"#;
-const CLEAR_STANDARD_TEXT_TRANSLATIONS: &str = "UPDATE standard_text_unit SET translation_content_json = NULL, translation_state = NULL WHERE translation_content_json IS NOT NULL OR translation_state IS NOT NULL";
-const CLEAR_MANAGED_TRANSLATIONS: &str = "UPDATE managed_translation_unit SET translation_content_json = NULL, translation_state = NULL WHERE translation_content_json IS NOT NULL OR translation_state IS NOT NULL";
-const RESET_TERMINOLOGY_RESOURCE: &str = r#"UPDATE standard_translation_resource
+const CLEAR_RPG_MAKER_TEXT_TRANSLATIONS: &str = "UPDATE rpg_maker_text_unit SET translation_content_json = NULL, translation_state = NULL WHERE translation_content_json IS NOT NULL OR translation_state IS NOT NULL";
+const RESET_TERMINOLOGY_RESOURCE: &str = r#"UPDATE rpg_maker_translation_resource
 SET canonical_json = '[]'
 WHERE resource_kind = 'terminology'"#;
 
@@ -455,16 +372,6 @@ impl ProjectWorkspaceLayout {
     pub(crate) fn write_back_root(&self) -> &Path {
         &self.write_back_root
     }
-
-    #[cfg(test)]
-    pub(crate) fn write_back_data(&self) -> &Path {
-        &self.write_back_data
-    }
-
-    #[cfg(test)]
-    pub(crate) fn write_back_js(&self) -> &Path {
-        &self.write_back_js
-    }
 }
 
 /// 一个游戏显示区域允许的每行最大全角字符数。
@@ -509,7 +416,7 @@ impl fmt::Display for MaxFullwidthCharsError {
 
 impl Error for MaxFullwidthCharsError {}
 
-/// RPG Maker 标准写回所使用的三个显示区域宽度。
+/// RPG Maker 写回所使用的三个显示区域宽度。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RpgMakerWriteBackLayoutProfile {
     dialogue_body: MaxFullwidthChars,
@@ -616,6 +523,7 @@ impl StoredProjectRecord {
         self.layout.workspace_root()
     }
 
+    #[cfg(test)]
     pub(crate) fn source_root(&self) -> &Path {
         self.layout.source_root()
     }
@@ -953,15 +861,6 @@ impl<E> ProjectDatabaseReadError<E> {
             },
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn path(&self) -> &Path {
-        match self {
-            Self::DatabaseNotFound { path }
-            | Self::ReadDatabase { path, .. }
-            | Self::InvalidMetadata { path, .. } => path,
-        }
-    }
 }
 
 impl<E: fmt::Display> fmt::Display for ProjectDatabaseReadError<E> {
@@ -1171,17 +1070,9 @@ impl Error for InvalidProjectMetadata {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ActiveOwnerState {
-    owner: RpgMakerStandardAssetOwner,
+    owner: RpgMakerAssetOwner,
     source_snapshot_fingerprint: SourceSnapshotFingerprint,
     asset_snapshot_fingerprint: AssetSnapshotFingerprint,
-}
-
-/// 一个 active owner 相对于当前项目冻结来源的精确新鲜度。
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct StandardAssetOwnerFreshness {
-    owner: RpgMakerStandardAssetOwner,
-    fresh: bool,
 }
 
 /// 已经按当前完整 schema 验证的项目数据库事实。
@@ -1203,7 +1094,7 @@ impl ProjectDatabaseState {
         language_pair: LanguagePair,
         source_snapshot_fingerprint: SourceSnapshotFingerprint,
         layout_profile: RpgMakerWriteBackLayoutProfile,
-        owners: Vec<(RpgMakerStandardAssetOwner, SourceSnapshotFingerprint)>,
+        owners: Vec<(RpgMakerAssetOwner, SourceSnapshotFingerprint)>,
     ) -> Self {
         Self {
             metadata: ProjectMetadataFacts {
@@ -1250,19 +1141,7 @@ impl ProjectDatabaseState {
         self.metadata.source_snapshot_fingerprint
     }
 
-    #[cfg(test)]
-    pub(crate) fn active_owner_freshness(&self) -> Vec<StandardAssetOwnerFreshness> {
-        self.owners
-            .iter()
-            .map(|state| StandardAssetOwnerFreshness {
-                owner: state.owner,
-                fresh: state.source_snapshot_fingerprint
-                    == self.metadata.source_snapshot_fingerprint,
-            })
-            .collect()
-    }
-
-    pub(crate) fn stale_owners(&self) -> Vec<RpgMakerStandardAssetOwner> {
+    pub(crate) fn stale_owners(&self) -> Vec<RpgMakerAssetOwner> {
         let mut owners = self
             .owners
             .iter()
@@ -1271,20 +1150,15 @@ impl ProjectDatabaseState {
                     .then_some(state.owner)
             })
             .collect::<Vec<_>>();
-        owners.sort_by_key(|owner| standard_asset_owner_order(*owner));
+        owners.sort_by_key(|owner| rpg_maker_asset_owner_order(*owner));
         owners
-    }
-
-    #[cfg(test)]
-    pub(crate) fn mv_dialogue_rules_json(&self) -> &str {
-        &self.mv_dialogue_rules_json
     }
 }
 
 /// 项目数据库无法按当前唯一 schema 重建为受信事实。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum InvalidCurrentProjectDatabase {
-    ManagedSchema(InvalidManagedSchema),
+    Schema(InvalidAttSchema),
     Metadata(InvalidProjectMetadata),
     OwnerState(InvalidOwnerState),
     TranslationResources(InvalidTranslationResources),
@@ -1360,28 +1234,23 @@ impl ProjectDatabaseField {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ManagedSchemaObject {
+pub(crate) enum AttSchemaObject {
     Metadata,
     InitRunPlan,
     ExtractRunPlan,
     ExtractRulesDefinition,
     TranslateRunPlan,
-    WriteBackRunPlan,
-    LuaProgram,
-    StandardAssetOwnerState,
-    StandardTextGroup,
-    StandardTextUnit,
-    StandardMutationClaim,
-    StandardTranslationResource,
-    StandardProjectDefinition,
-    ManagedTranslationOwnerState,
-    ManagedTranslationCollection,
-    ManagedTranslationUnit,
-    StandardMutationClaimOwnerResourceIndex,
-    StandardMutationClaimResourceIndex,
+    RpgMakerAssetOwnerState,
+    RpgMakerTextGroup,
+    RpgMakerTextUnit,
+    RpgMakerMutationClaim,
+    RpgMakerTranslationResource,
+    RpgMakerProjectDefinition,
+    RpgMakerMutationClaimOwnerResourceIndex,
+    RpgMakerMutationClaimResourceIndex,
 }
 
-impl ManagedSchemaObject {
+impl AttSchemaObject {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Metadata => "table:metadata",
@@ -1389,29 +1258,24 @@ impl ManagedSchemaObject {
             Self::ExtractRunPlan => "table:extract_run_plan",
             Self::ExtractRulesDefinition => "table:extract_rules_definition",
             Self::TranslateRunPlan => "table:translate_run_plan",
-            Self::WriteBackRunPlan => "table:write_back_run_plan",
-            Self::LuaProgram => "table:lua_program",
-            Self::StandardAssetOwnerState => "table:standard_asset_owner_state",
-            Self::StandardTextGroup => "table:standard_text_group",
-            Self::StandardTextUnit => "table:standard_text_unit",
-            Self::StandardMutationClaim => "table:standard_mutation_claim",
-            Self::StandardTranslationResource => "table:standard_translation_resource",
-            Self::StandardProjectDefinition => "table:standard_project_definition",
-            Self::ManagedTranslationOwnerState => "table:managed_translation_owner_state",
-            Self::ManagedTranslationCollection => "table:managed_translation_collection",
-            Self::ManagedTranslationUnit => "table:managed_translation_unit",
-            Self::StandardMutationClaimOwnerResourceIndex => {
-                "index:standard_mutation_claim_owner_resource_idx"
+            Self::RpgMakerAssetOwnerState => "table:rpg_maker_asset_owner_state",
+            Self::RpgMakerTextGroup => "table:rpg_maker_text_group",
+            Self::RpgMakerTextUnit => "table:rpg_maker_text_unit",
+            Self::RpgMakerMutationClaim => "table:rpg_maker_mutation_claim",
+            Self::RpgMakerTranslationResource => "table:rpg_maker_translation_resource",
+            Self::RpgMakerProjectDefinition => "table:rpg_maker_project_definition",
+            Self::RpgMakerMutationClaimOwnerResourceIndex => {
+                "index:rpg_maker_mutation_claim_owner_resource_idx"
             }
-            Self::StandardMutationClaimResourceIndex => {
-                "index:standard_mutation_claim_resource_idx"
+            Self::RpgMakerMutationClaimResourceIndex => {
+                "index:rpg_maker_mutation_claim_resource_idx"
             }
         }
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum InvalidManagedSchema {
+pub(crate) enum InvalidAttSchema {
     WrongColumnCount {
         query: &'static str,
         expected: usize,
@@ -1433,8 +1297,8 @@ pub(crate) enum InvalidManagedSchema {
     ObjectMismatch {
         expected_count: usize,
         actual_count: usize,
-        missing: Vec<ManagedSchemaObject>,
-        definition_mismatches: Vec<ManagedSchemaObject>,
+        missing: Vec<AttSchemaObject>,
+        definition_mismatches: Vec<AttSchemaObject>,
         unexpected_count: usize,
     },
 }
@@ -1452,13 +1316,13 @@ pub(crate) enum InvalidOwnerState {
     },
     UnknownOwner,
     InvalidFingerprintLength {
-        owner: RpgMakerStandardAssetOwner,
+        owner: RpgMakerAssetOwner,
         field: ProjectDatabaseField,
         expected: usize,
         actual: usize,
     },
     DuplicateOwner {
-        owner: RpgMakerStandardAssetOwner,
+        owner: RpgMakerAssetOwner,
     },
 }
 
@@ -1664,8 +1528,8 @@ impl InvalidCurrentProjectDatabase {
     /// 只从闭集 reason 的类型化字段建立可公开事实，不读取任意错误文本或持久正文。
     pub(crate) fn safe_fact(&self) -> String {
         match self {
-            Self::ManagedSchema(reason) => {
-                format!("database_component=managed_schema; {}", reason.safe_fact())
+            Self::Schema(reason) => {
+                format!("database_component=att_schema; {}", reason.safe_fact())
             }
             Self::Metadata(reason) => {
                 format!("database_component=metadata; {}", reason.safe_fact())
@@ -1701,7 +1565,7 @@ impl InvalidCurrentProjectDatabase {
     }
 }
 
-impl InvalidManagedSchema {
+impl InvalidAttSchema {
     fn safe_fact(&self) -> String {
         match self {
             Self::WrongColumnCount {
@@ -1738,9 +1602,9 @@ impl InvalidManagedSchema {
                 definition_mismatches,
                 unexpected_count,
             } => format!(
-                "violation=managed_object_mismatch; expected_count={expected_count}; actual_count={actual_count}; missing={}; definition_mismatches={}; unexpected_count={unexpected_count}",
-                managed_schema_object_list(missing),
-                managed_schema_object_list(definition_mismatches)
+                "violation=att_schema_object_mismatch; expected_count={expected_count}; actual_count={actual_count}; missing={}; definition_mismatches={}; unexpected_count={unexpected_count}",
+                att_schema_object_list(missing),
+                att_schema_object_list(definition_mismatches)
             ),
         }
     }
@@ -1952,7 +1816,7 @@ fn language_id_failure_safe_fact(source: &LanguageIdError) -> &'static str {
     }
 }
 
-fn managed_schema_object_list(objects: &[ManagedSchemaObject]) -> String {
+fn att_schema_object_list(objects: &[AttSchemaObject]) -> String {
     if objects.is_empty() {
         "none".to_owned()
     } else {
@@ -1973,7 +1837,7 @@ impl Error for InvalidCurrentProjectDatabase {
         match self {
             Self::Metadata(source) => Some(source),
             Self::RunPlans(source) => Some(source),
-            Self::ManagedSchema(_)
+            Self::Schema(_)
             | Self::OwnerState(_)
             | Self::TranslationResources(_)
             | Self::ProjectDefinitions(_)
@@ -1982,7 +1846,7 @@ impl Error for InvalidCurrentProjectDatabase {
     }
 }
 
-fn expected_managed_schema() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
+fn expected_att_schema() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
     vec![
         ("table", "metadata", "metadata", CREATE_METADATA_TABLE),
         (
@@ -2011,93 +1875,63 @@ fn expected_managed_schema() -> Vec<(&'static str, &'static str, &'static str, &
         ),
         (
             "table",
-            "write_back_run_plan",
-            "write_back_run_plan",
-            CREATE_WRITE_BACK_RUN_PLAN_TABLE,
+            "rpg_maker_asset_owner_state",
+            "rpg_maker_asset_owner_state",
+            CREATE_RPG_MAKER_ASSET_OWNER_STATE_TABLE,
         ),
         (
             "table",
-            "lua_program",
-            "lua_program",
-            CREATE_LUA_PROGRAM_TABLE,
+            RPG_MAKER_TEXT_GROUP_TABLE_NAME,
+            RPG_MAKER_TEXT_GROUP_TABLE_NAME,
+            CREATE_RPG_MAKER_TEXT_GROUP_TABLE,
         ),
         (
             "table",
-            "standard_asset_owner_state",
-            "standard_asset_owner_state",
-            CREATE_STANDARD_ASSET_OWNER_STATE_TABLE,
+            RPG_MAKER_TEXT_UNIT_TABLE_NAME,
+            RPG_MAKER_TEXT_UNIT_TABLE_NAME,
+            CREATE_RPG_MAKER_TEXT_UNIT_TABLE,
         ),
         (
             "table",
-            STANDARD_TEXT_GROUP_TABLE_NAME,
-            STANDARD_TEXT_GROUP_TABLE_NAME,
-            CREATE_STANDARD_TEXT_GROUP_TABLE,
+            RPG_MAKER_MUTATION_CLAIM_TABLE_NAME,
+            RPG_MAKER_MUTATION_CLAIM_TABLE_NAME,
+            CREATE_RPG_MAKER_MUTATION_CLAIM_TABLE,
         ),
         (
             "table",
-            STANDARD_TEXT_UNIT_TABLE_NAME,
-            STANDARD_TEXT_UNIT_TABLE_NAME,
-            CREATE_STANDARD_TEXT_UNIT_TABLE,
+            RPG_MAKER_TRANSLATION_RESOURCE_TABLE_NAME,
+            RPG_MAKER_TRANSLATION_RESOURCE_TABLE_NAME,
+            CREATE_RPG_MAKER_TRANSLATION_RESOURCE_TABLE,
         ),
         (
             "table",
-            STANDARD_MUTATION_CLAIM_TABLE_NAME,
-            STANDARD_MUTATION_CLAIM_TABLE_NAME,
-            CREATE_STANDARD_MUTATION_CLAIM_TABLE,
-        ),
-        (
-            "table",
-            STANDARD_TRANSLATION_RESOURCE_TABLE_NAME,
-            STANDARD_TRANSLATION_RESOURCE_TABLE_NAME,
-            CREATE_STANDARD_TRANSLATION_RESOURCE_TABLE,
-        ),
-        (
-            "table",
-            STANDARD_PROJECT_DEFINITION_TABLE_NAME,
-            STANDARD_PROJECT_DEFINITION_TABLE_NAME,
-            CREATE_STANDARD_PROJECT_DEFINITION_TABLE,
-        ),
-        (
-            "table",
-            "managed_translation_owner_state",
-            "managed_translation_owner_state",
-            CREATE_MANAGED_TRANSLATION_OWNER_STATE_TABLE,
-        ),
-        (
-            "table",
-            "managed_translation_collection",
-            "managed_translation_collection",
-            CREATE_MANAGED_TRANSLATION_COLLECTION_TABLE,
-        ),
-        (
-            "table",
-            "managed_translation_unit",
-            "managed_translation_unit",
-            CREATE_MANAGED_TRANSLATION_UNIT_TABLE,
+            RPG_MAKER_PROJECT_DEFINITION_TABLE_NAME,
+            RPG_MAKER_PROJECT_DEFINITION_TABLE_NAME,
+            CREATE_RPG_MAKER_PROJECT_DEFINITION_TABLE,
         ),
         (
             "index",
-            "standard_mutation_claim_owner_resource_idx",
-            STANDARD_MUTATION_CLAIM_TABLE_NAME,
-            CREATE_STANDARD_MUTATION_CLAIM_OWNER_RESOURCE_INDEX,
+            "rpg_maker_mutation_claim_owner_resource_idx",
+            RPG_MAKER_MUTATION_CLAIM_TABLE_NAME,
+            CREATE_RPG_MAKER_MUTATION_CLAIM_OWNER_RESOURCE_INDEX,
         ),
         (
             "index",
-            "standard_mutation_claim_resource_idx",
-            STANDARD_MUTATION_CLAIM_TABLE_NAME,
-            CREATE_STANDARD_MUTATION_CLAIM_RESOURCE_INDEX,
+            "rpg_maker_mutation_claim_resource_idx",
+            RPG_MAKER_MUTATION_CLAIM_TABLE_NAME,
+            CREATE_RPG_MAKER_MUTATION_CLAIM_RESOURCE_INDEX,
         ),
     ]
 }
 
-fn validate_managed_schema(rows: Vec<SqliteRow>) -> Result<(), InvalidCurrentProjectDatabase> {
+fn validate_att_schema(rows: Vec<SqliteRow>) -> Result<(), InvalidCurrentProjectDatabase> {
     let mut actual = Vec::with_capacity(rows.len());
     for row in rows {
         let values = row.into_values();
         if values.len() != 4 {
-            return Err(InvalidCurrentProjectDatabase::ManagedSchema(
-                InvalidManagedSchema::WrongColumnCount {
-                    query: "managed_schema",
+            return Err(InvalidCurrentProjectDatabase::Schema(
+                InvalidAttSchema::WrongColumnCount {
+                    query: "att_schema",
                     expected: 4,
                     actual: values.len(),
                 },
@@ -2122,14 +1956,14 @@ fn validate_managed_schema(rows: Vec<SqliteRow>) -> Result<(), InvalidCurrentPro
         )?;
         actual.push((kind, name, table, sql));
     }
-    let expected = expected_managed_schema();
+    let expected = expected_att_schema();
     let missing = expected
         .iter()
         .filter_map(|(kind, name, _, _)| {
             (!actual
                 .iter()
                 .any(|(actual_kind, actual_name, _, _)| actual_kind == kind && actual_name == name))
-            .then(|| managed_schema_object(kind, name))
+            .then(|| att_schema_object(kind, name))
             .flatten()
         })
         .collect::<Vec<_>>();
@@ -2141,7 +1975,7 @@ fn validate_managed_schema(rows: Vec<SqliteRow>) -> Result<(), InvalidCurrentPro
                 .find(|(actual_kind, actual_name, _, _)| actual_kind == kind && actual_name == name)
                 .and_then(|(_, _, actual_table, actual_sql)| {
                     (actual_table != table || actual_sql != sql)
-                        .then(|| managed_schema_object(kind, name))
+                        .then(|| att_schema_object(kind, name))
                         .flatten()
                 })
         })
@@ -2161,8 +1995,8 @@ fn validate_managed_schema(rows: Vec<SqliteRow>) -> Result<(), InvalidCurrentPro
     {
         Ok(())
     } else {
-        Err(InvalidCurrentProjectDatabase::ManagedSchema(
-            InvalidManagedSchema::ObjectMismatch {
+        Err(InvalidCurrentProjectDatabase::Schema(
+            InvalidAttSchema::ObjectMismatch {
                 expected_count: expected.len(),
                 actual_count: actual.len(),
                 missing,
@@ -2179,8 +2013,8 @@ fn schema_text(
 ) -> Result<String, InvalidCurrentProjectDatabase> {
     match value {
         SqliteValue::Text(value) => Ok(value),
-        value => Err(InvalidCurrentProjectDatabase::ManagedSchema(
-            InvalidManagedSchema::WrongColumnType {
+        value => Err(InvalidCurrentProjectDatabase::Schema(
+            InvalidAttSchema::WrongColumnType {
                 field,
                 expected: ProjectDatabaseValueKind::Text,
                 actual: ProjectDatabaseValueKind::from(&value),
@@ -2189,41 +2023,30 @@ fn schema_text(
     }
 }
 
-fn managed_schema_object(kind: &str, name: &str) -> Option<ManagedSchemaObject> {
+fn att_schema_object(kind: &str, name: &str) -> Option<AttSchemaObject> {
     match (kind, name) {
-        ("table", "metadata") => Some(ManagedSchemaObject::Metadata),
-        ("table", "init_run_plan") => Some(ManagedSchemaObject::InitRunPlan),
-        ("table", "extract_run_plan") => Some(ManagedSchemaObject::ExtractRunPlan),
-        ("table", "extract_rules_definition") => Some(ManagedSchemaObject::ExtractRulesDefinition),
-        ("table", "translate_run_plan") => Some(ManagedSchemaObject::TranslateRunPlan),
-        ("table", "write_back_run_plan") => Some(ManagedSchemaObject::WriteBackRunPlan),
-        ("table", "lua_program") => Some(ManagedSchemaObject::LuaProgram),
-        ("table", "standard_asset_owner_state") => {
-            Some(ManagedSchemaObject::StandardAssetOwnerState)
+        ("table", "metadata") => Some(AttSchemaObject::Metadata),
+        ("table", "init_run_plan") => Some(AttSchemaObject::InitRunPlan),
+        ("table", "extract_run_plan") => Some(AttSchemaObject::ExtractRunPlan),
+        ("table", "extract_rules_definition") => Some(AttSchemaObject::ExtractRulesDefinition),
+        ("table", "translate_run_plan") => Some(AttSchemaObject::TranslateRunPlan),
+        ("table", "rpg_maker_asset_owner_state") => Some(AttSchemaObject::RpgMakerAssetOwnerState),
+        ("table", RPG_MAKER_TEXT_GROUP_TABLE_NAME) => Some(AttSchemaObject::RpgMakerTextGroup),
+        ("table", RPG_MAKER_TEXT_UNIT_TABLE_NAME) => Some(AttSchemaObject::RpgMakerTextUnit),
+        ("table", RPG_MAKER_MUTATION_CLAIM_TABLE_NAME) => {
+            Some(AttSchemaObject::RpgMakerMutationClaim)
         }
-        ("table", STANDARD_TEXT_GROUP_TABLE_NAME) => Some(ManagedSchemaObject::StandardTextGroup),
-        ("table", STANDARD_TEXT_UNIT_TABLE_NAME) => Some(ManagedSchemaObject::StandardTextUnit),
-        ("table", STANDARD_MUTATION_CLAIM_TABLE_NAME) => {
-            Some(ManagedSchemaObject::StandardMutationClaim)
+        ("table", RPG_MAKER_TRANSLATION_RESOURCE_TABLE_NAME) => {
+            Some(AttSchemaObject::RpgMakerTranslationResource)
         }
-        ("table", STANDARD_TRANSLATION_RESOURCE_TABLE_NAME) => {
-            Some(ManagedSchemaObject::StandardTranslationResource)
+        ("table", RPG_MAKER_PROJECT_DEFINITION_TABLE_NAME) => {
+            Some(AttSchemaObject::RpgMakerProjectDefinition)
         }
-        ("table", STANDARD_PROJECT_DEFINITION_TABLE_NAME) => {
-            Some(ManagedSchemaObject::StandardProjectDefinition)
+        ("index", "rpg_maker_mutation_claim_owner_resource_idx") => {
+            Some(AttSchemaObject::RpgMakerMutationClaimOwnerResourceIndex)
         }
-        ("table", "managed_translation_owner_state") => {
-            Some(ManagedSchemaObject::ManagedTranslationOwnerState)
-        }
-        ("table", "managed_translation_collection") => {
-            Some(ManagedSchemaObject::ManagedTranslationCollection)
-        }
-        ("table", "managed_translation_unit") => Some(ManagedSchemaObject::ManagedTranslationUnit),
-        ("index", "standard_mutation_claim_owner_resource_idx") => {
-            Some(ManagedSchemaObject::StandardMutationClaimOwnerResourceIndex)
-        }
-        ("index", "standard_mutation_claim_resource_idx") => {
-            Some(ManagedSchemaObject::StandardMutationClaimResourceIndex)
+        ("index", "rpg_maker_mutation_claim_resource_idx") => {
+            Some(AttSchemaObject::RpgMakerMutationClaimResourceIndex)
         }
         _ => None,
     }
@@ -2231,14 +2054,14 @@ fn managed_schema_object(kind: &str, name: &str) -> Option<ManagedSchemaObject> 
 
 fn decode_schema_version(rows: Vec<SqliteRow>) -> Result<i64, InvalidCurrentProjectDatabase> {
     let [row] = <[SqliteRow; 1]>::try_from(rows).map_err(|rows| {
-        InvalidCurrentProjectDatabase::ManagedSchema(InvalidManagedSchema::WrongRowCount {
+        InvalidCurrentProjectDatabase::Schema(InvalidAttSchema::WrongRowCount {
             query: "schema_version",
             expected: 1,
             actual: rows.len(),
         })
     })?;
     let [value] = <[SqliteValue; 1]>::try_from(row.into_values()).map_err(|values| {
-        InvalidCurrentProjectDatabase::ManagedSchema(InvalidManagedSchema::WrongColumnCount {
+        InvalidCurrentProjectDatabase::Schema(InvalidAttSchema::WrongColumnCount {
             query: "schema_version",
             expected: 1,
             actual: values.len(),
@@ -2246,11 +2069,11 @@ fn decode_schema_version(rows: Vec<SqliteRow>) -> Result<i64, InvalidCurrentProj
     })?;
     match value {
         SqliteValue::Integer(value) if value >= 0 => Ok(value),
-        SqliteValue::Integer(actual) => Err(InvalidCurrentProjectDatabase::ManagedSchema(
-            InvalidManagedSchema::NegativeSchemaVersion { actual },
+        SqliteValue::Integer(actual) => Err(InvalidCurrentProjectDatabase::Schema(
+            InvalidAttSchema::NegativeSchemaVersion { actual },
         )),
-        value => Err(InvalidCurrentProjectDatabase::ManagedSchema(
-            InvalidManagedSchema::WrongColumnType {
+        value => Err(InvalidCurrentProjectDatabase::Schema(
+            InvalidAttSchema::WrongColumnType {
                 field: ProjectDatabaseField::SchemaVersion,
                 expected: ProjectDatabaseValueKind::Integer,
                 actual: ProjectDatabaseValueKind::from(&value),
@@ -2275,10 +2098,9 @@ fn decode_owner_states(
         }
         let mut values = values.into_iter();
         let owner = match values.next().expect("已确认有三列") {
-            SqliteValue::Text(value) => RpgMakerStandardAssetOwner::from_storage_name(&value)
-                .ok_or(InvalidCurrentProjectDatabase::OwnerState(
-                    InvalidOwnerState::UnknownOwner,
-                ))?,
+            SqliteValue::Text(value) => RpgMakerAssetOwner::from_storage_name(&value).ok_or(
+                InvalidCurrentProjectDatabase::OwnerState(InvalidOwnerState::UnknownOwner),
+            )?,
             value => {
                 return Err(InvalidCurrentProjectDatabase::OwnerState(
                     InvalidOwnerState::WrongColumnType {
@@ -2349,7 +2171,7 @@ fn decode_owner_states(
             asset_snapshot_fingerprint,
         });
     }
-    owners.sort_by_key(|state| standard_asset_owner_order(state.owner));
+    owners.sort_by_key(|state| rpg_maker_asset_owner_order(state.owner));
     Ok(owners)
 }
 
@@ -2689,12 +2511,7 @@ impl ProjectDatabaseReconciliation {
         Self { state }
     }
 
-    #[cfg(test)]
-    pub(crate) fn state(&self) -> &ProjectDatabaseState {
-        &self.state
-    }
-
-    pub(crate) fn stale_owners(&self) -> Vec<RpgMakerStandardAssetOwner> {
+    pub(crate) fn stale_owners(&self) -> Vec<RpgMakerAssetOwner> {
         self.state.stale_owners()
     }
 }
@@ -2925,8 +2742,8 @@ where
         vec![
             SqliteQuery::new(SELECT_SCHEMA_VERSION, Vec::new())
                 .with_id("project_database.inspect.schema_version"),
-            SqliteQuery::new(SELECT_MANAGED_SCHEMA, Vec::new())
-                .with_id("project_database.inspect.managed_schema"),
+            SqliteQuery::new(SELECT_ATT_SCHEMA, Vec::new())
+                .with_id("project_database.inspect.att_schema"),
             SqliteQuery::new(SELECT_METADATA, Vec::new())
                 .with_id("project_database.inspect.metadata"),
             SqliteQuery::new(SELECT_OWNER_STATES, Vec::new())
@@ -2937,8 +2754,6 @@ where
                 .with_id("project_database.inspect.project_definitions"),
             SqliteQuery::new(SELECT_RUN_PLAN_SINGLETONS, Vec::new())
                 .with_id("project_database.inspect.run_plan_singletons"),
-            SqliteQuery::new(SELECT_LUA_PROGRAMS, Vec::new())
-                .with_id("project_database.inspect.lua_programs"),
             SqliteQuery::new(SELECT_QUICK_CHECK, Vec::new())
                 .with_id("project_database.inspect.quick_check"),
             SqliteQuery::new(SELECT_FOREIGN_KEY_CHECK, Vec::new())
@@ -2955,19 +2770,16 @@ where
         translation_resource_rows,
         project_definition_rows,
         run_plan_singletons,
-        lua_programs,
         quick_check,
         foreign_key_check,
-    ] = <[Vec<SqliteRow>; 10]>::try_from(snapshot).map_err(|results| {
+    ] = <[Vec<SqliteRow>; 9]>::try_from(snapshot).map_err(|results| {
         ProjectDatabaseInspectionError::InvalidDatabase {
             path: database_path.clone(),
-            reason: InvalidCurrentProjectDatabase::ManagedSchema(
-                InvalidManagedSchema::WrongRowCount {
-                    query: "inspection_snapshot_result_sets",
-                    expected: 10,
-                    actual: results.len(),
-                },
-            ),
+            reason: InvalidCurrentProjectDatabase::Schema(InvalidAttSchema::WrongRowCount {
+                query: "inspection_snapshot_result_sets",
+                expected: 9,
+                actual: results.len(),
+            }),
         }
     })?;
 
@@ -2977,7 +2789,7 @@ where
             reason,
         }
     })?;
-    validate_managed_schema(schema).map_err(|reason| {
+    validate_att_schema(schema).map_err(|reason| {
         ProjectDatabaseInspectionError::InvalidDatabase {
             path: database_path.clone(),
             reason,
@@ -3010,13 +2822,12 @@ where
                 reason,
             }
         })?;
-    let run_plans =
-        decode_project_run_plans(run_plan_singletons, lua_programs).map_err(|reason| {
-            ProjectDatabaseInspectionError::InvalidDatabase {
-                path: database_path.clone(),
-                reason: InvalidCurrentProjectDatabase::RunPlans(reason),
-            }
-        })?;
+    let run_plans = decode_project_run_plans(run_plan_singletons).map_err(|reason| {
+        ProjectDatabaseInspectionError::InvalidDatabase {
+            path: database_path.clone(),
+            reason: InvalidCurrentProjectDatabase::RunPlans(reason),
+        }
+    })?;
 
     validate_integrity(quick_check, foreign_key_check).map_err(|reason| {
         ProjectDatabaseInspectionError::InvalidDatabase {
@@ -3083,12 +2894,12 @@ WHERE (SELECT COUNT(*) FROM metadata) <> 1
 
 fn owner_state_cas(state: &ProjectDatabaseState) -> SqliteTransactionStep {
     let mut statement =
-        "SELECT 1 WHERE (SELECT COUNT(*) FROM standard_asset_owner_state) <> ?1".to_owned();
+        "SELECT 1 WHERE (SELECT COUNT(*) FROM rpg_maker_asset_owner_state) <> ?1".to_owned();
     let mut parameters = vec![SqliteValue::Integer(
         i64::try_from(state.owners.len()).expect("owner 数量固定小于 i64 上限"),
     )];
     if !state.owners.is_empty() {
-        statement.push_str(" OR EXISTS (SELECT 1 FROM standard_asset_owner_state WHERE NOT (");
+        statement.push_str(" OR EXISTS (SELECT 1 FROM rpg_maker_asset_owner_state WHERE NOT (");
         for (index, owner) in state.owners.iter().enumerate() {
             if index != 0 {
                 statement.push_str(" OR ");
@@ -3115,13 +2926,13 @@ fn owner_state_cas(state: &ProjectDatabaseState) -> SqliteTransactionStep {
 fn translation_resources_cas(state: &ProjectDatabaseState) -> SqliteTransactionStep {
     SqliteTransactionStep::RequireNoRows(SqliteQuery::new(
         r#"SELECT 1
-WHERE (SELECT COUNT(*) FROM standard_translation_resource) <> 2
+WHERE (SELECT COUNT(*) FROM rpg_maker_translation_resource) <> 2
    OR NOT EXISTS (
-     SELECT 1 FROM standard_translation_resource
+     SELECT 1 FROM rpg_maker_translation_resource
      WHERE resource_kind = 'terminology' AND canonical_json = ?1
    )
    OR NOT EXISTS (
-     SELECT 1 FROM standard_translation_resource
+     SELECT 1 FROM rpg_maker_translation_resource
      WHERE resource_kind = 'placeholder_rules' AND canonical_json = ?2
    )"#,
         vec![
@@ -3134,9 +2945,9 @@ WHERE (SELECT COUNT(*) FROM standard_translation_resource) <> 2
 fn project_definitions_cas(state: &ProjectDatabaseState) -> SqliteTransactionStep {
     SqliteTransactionStep::RequireNoRows(SqliteQuery::new(
         r#"SELECT 1
-WHERE (SELECT COUNT(*) FROM standard_project_definition) <> 1
+WHERE (SELECT COUNT(*) FROM rpg_maker_project_definition) <> 1
    OR NOT EXISTS (
-     SELECT 1 FROM standard_project_definition
+     SELECT 1 FROM rpg_maker_project_definition
      WHERE definition_kind = 'mv_dialogue_rules' AND canonical_json = ?1
    )"#,
         vec![SqliteValue::Text(state.mv_dialogue_rules_json.clone())],
@@ -3170,8 +2981,7 @@ where
     ];
     if language_changed {
         for statement in [
-            CLEAR_STANDARD_TEXT_TRANSLATIONS,
-            CLEAR_MANAGED_TRANSLATIONS,
+            CLEAR_RPG_MAKER_TEXT_TRANSLATIONS,
             RESET_TERMINOLOGY_RESOURCE,
         ] {
             steps.push(SqliteTransactionStep::Execute(SqliteCommand::new(
@@ -3309,19 +3119,14 @@ fn project_database_commands(project: &NewProject) -> Vec<SqliteCommand> {
         CREATE_EXTRACT_RUN_PLAN_TABLE,
         CREATE_EXTRACT_RULES_DEFINITION_TABLE,
         CREATE_TRANSLATE_RUN_PLAN_TABLE,
-        CREATE_WRITE_BACK_RUN_PLAN_TABLE,
-        CREATE_LUA_PROGRAM_TABLE,
-        CREATE_STANDARD_ASSET_OWNER_STATE_TABLE,
-        CREATE_STANDARD_TEXT_GROUP_TABLE,
-        CREATE_STANDARD_TEXT_UNIT_TABLE,
-        CREATE_STANDARD_MUTATION_CLAIM_TABLE,
-        CREATE_STANDARD_MUTATION_CLAIM_OWNER_RESOURCE_INDEX,
-        CREATE_STANDARD_MUTATION_CLAIM_RESOURCE_INDEX,
-        CREATE_STANDARD_TRANSLATION_RESOURCE_TABLE,
-        CREATE_STANDARD_PROJECT_DEFINITION_TABLE,
-        CREATE_MANAGED_TRANSLATION_OWNER_STATE_TABLE,
-        CREATE_MANAGED_TRANSLATION_COLLECTION_TABLE,
-        CREATE_MANAGED_TRANSLATION_UNIT_TABLE,
+        CREATE_RPG_MAKER_ASSET_OWNER_STATE_TABLE,
+        CREATE_RPG_MAKER_TEXT_GROUP_TABLE,
+        CREATE_RPG_MAKER_TEXT_UNIT_TABLE,
+        CREATE_RPG_MAKER_MUTATION_CLAIM_TABLE,
+        CREATE_RPG_MAKER_MUTATION_CLAIM_OWNER_RESOURCE_INDEX,
+        CREATE_RPG_MAKER_MUTATION_CLAIM_RESOURCE_INDEX,
+        CREATE_RPG_MAKER_TRANSLATION_RESOURCE_TABLE,
+        CREATE_RPG_MAKER_PROJECT_DEFINITION_TABLE,
     ]
     .into_iter()
     .map(|statement| SqliteCommand::new(statement, Vec::new()))
@@ -3340,7 +3145,7 @@ fn project_database_commands(project: &NewProject) -> Vec<SqliteCommand> {
     ));
     for resource_kind in [TERMINOLOGY_RESOURCE_KIND, PLACEHOLDER_RULES_RESOURCE_KIND] {
         commands.push(SqliteCommand::new(
-            INSERT_STANDARD_TRANSLATION_RESOURCE,
+            INSERT_RPG_MAKER_TRANSLATION_RESOURCE,
             vec![
                 SqliteValue::Text(resource_kind.to_owned()),
                 SqliteValue::Text("[]".to_owned()),
@@ -3348,7 +3153,7 @@ fn project_database_commands(project: &NewProject) -> Vec<SqliteCommand> {
         ));
     }
     commands.push(SqliteCommand::new(
-        INSERT_STANDARD_PROJECT_DEFINITION,
+        INSERT_RPG_MAKER_PROJECT_DEFINITION,
         vec![
             SqliteValue::Text(MV_DIALOGUE_RULES_DEFINITION_KIND.to_owned()),
             SqliteValue::Text(r#"{"rules":[]}"#.to_owned()),
@@ -3379,17 +3184,6 @@ impl<E> ProjectDatabaseCreateError<E> {
             CreateDatabaseError::ResidualArtifact(source) => {
                 Self::ResidualArtifact { path, source }
             }
-        }
-    }
-
-    /// 返回此次创建所针对的数据库路径。
-    #[cfg(test)]
-    pub(crate) fn path(&self) -> &Path {
-        match self {
-            Self::AlreadyExists { path }
-            | Self::NotCreated { path, .. }
-            | Self::OutcomeUnknown { path, .. }
-            | Self::ResidualArtifact { path, .. } => path,
         }
     }
 }
@@ -3436,21 +3230,32 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
-    use std::error::Error;
-    use std::fmt;
-    use std::future::Future;
-    use std::path::PathBuf;
-    use std::pin::Pin;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::task::{Context, Poll};
-
     use super::*;
+
+    fn language_pair(source: &str, target: &str) -> LanguagePair {
+        LanguagePair::new(
+            LanguageId::parse(source).expect("源语言应合法"),
+            LanguageId::parse(target).expect("目标语言应合法"),
+        )
+    }
+
+    fn layout_profile() -> RpgMakerWriteBackLayoutProfile {
+        let width = |value| MaxFullwidthChars::new(value).expect("测试宽度应合法");
+        RpgMakerWriteBackLayoutProfile::new(width(24), width(30), width(18))
+    }
+
+    fn project() -> NewProject {
+        NewProject::new(
+            "测试 游戏".parse().expect("项目名应合法"),
+            language_pair("ja", "zh-Hans"),
+            SourceSnapshotFingerprint::from_bytes([0x5a; 32]),
+            layout_profile(),
+        )
+    }
 
     #[test]
     fn workspace_layout_derives_every_fixed_location_from_one_root() {
-        let name: ProjectName = "测试 游戏".parse().expect("test name should be valid");
+        let name: ProjectName = "测试 游戏".parse().expect("项目名应合法");
         let layout = ProjectWorkspaceLayout::for_project(
             Path::new("C:/att/projects"),
             RpgMakerLayout::MZ,
@@ -3470,299 +3275,65 @@ mod tests {
             Path::new("C:/att/projects/mz/测试 游戏/source")
         );
         assert_eq!(
-            layout.source_data(),
-            Path::new("C:/att/projects/mz/测试 游戏/source/data")
-        );
-        assert_eq!(
-            layout.source_js(),
-            Path::new("C:/att/projects/mz/测试 游戏/source/js")
-        );
-        assert_eq!(
             layout.write_back_root(),
             Path::new("C:/att/projects/mz/测试 游戏/write_back")
-        );
-        assert_eq!(
-            layout.write_back_data(),
-            Path::new("C:/att/projects/mz/测试 游戏/write_back/data")
-        );
-        assert_eq!(
-            layout.write_back_js(),
-            Path::new("C:/att/projects/mz/测试 游戏/write_back/js")
-        );
-
-        let mv = ProjectWorkspaceLayout::for_project(
-            Path::new("C:/att/projects"),
-            RpgMakerLayout::MV,
-            &name,
-        );
-        assert_eq!(
-            mv.source_data(),
-            Path::new("C:/att/projects/mv/测试 游戏/source/www/data")
-        );
-        assert_eq!(
-            mv.write_back_js(),
-            Path::new("C:/att/projects/mv/测试 游戏/write_back/www/js")
-        );
-    }
-
-    #[derive(Debug)]
-    struct FakeDriverError(&'static str);
-
-    impl fmt::Display for FakeDriverError {
-        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str(self.0)
-        }
-    }
-
-    impl Error for FakeDriverError {}
-
-    #[derive(Debug)]
-    struct Invocation {
-        path: PathBuf,
-        commands: Vec<SqliteCommand>,
-    }
-
-    struct RecordingDriver {
-        invocations: Mutex<Vec<Invocation>>,
-        responses: Mutex<VecDeque<Result<(), CreateDatabaseError<FakeDriverError>>>>,
-    }
-
-    impl RecordingDriver {
-        fn succeeding() -> Self {
-            Self::responding_with(Ok(()))
-        }
-
-        fn responding_with(response: Result<(), CreateDatabaseError<FakeDriverError>>) -> Self {
-            Self {
-                invocations: Mutex::new(Vec::new()),
-                responses: Mutex::new(VecDeque::from([response])),
-            }
-        }
-    }
-
-    impl SqliteDatabaseCreator for RecordingDriver {
-        type Error = FakeDriverError;
-
-        fn create_new_database(
-            &self,
-            path: PathBuf,
-            commands: Vec<SqliteCommand>,
-        ) -> impl Future<Output = Result<(), CreateDatabaseError<Self::Error>>> + Send {
-            self.invocations
-                .lock()
-                .expect("invocations mutex should not be poisoned")
-                .push(Invocation { path, commands });
-            let response = self
-                .responses
-                .lock()
-                .expect("responses mutex should not be poisoned")
-                .pop_front()
-                .expect("test must provide one driver response per invocation");
-
-            async move { response }
-        }
-    }
-
-    fn project(name: &str) -> NewProject {
-        NewProject::new(
-            name.parse().expect("test project name should be valid"),
-            language_pair("JA", "zh-cn"),
-            test_source_snapshot_fingerprint(),
-            layout_profile(),
-        )
-    }
-
-    fn language_id(value: &str) -> LanguageId {
-        LanguageId::parse(value).expect("test language ID should be valid")
-    }
-
-    fn language_pair(source: &str, target: &str) -> LanguagePair {
-        LanguagePair::new(language_id(source), language_id(target))
-    }
-
-    fn test_source_snapshot_fingerprint() -> SourceSnapshotFingerprint {
-        SourceSnapshotFingerprint::from_bytes([0x5a; 32])
-    }
-
-    fn width(value: u32) -> MaxFullwidthChars {
-        MaxFullwidthChars::new(value).expect("test width should be positive")
-    }
-
-    fn layout_profile() -> RpgMakerWriteBackLayoutProfile {
-        RpgMakerWriteBackLayoutProfile::new(width(24), width(30), width(18))
-    }
-
-    #[tokio::test]
-    async fn creates_expected_database_and_parameterized_metadata_transaction() {
-        let service = ProjectDatabaseCreationService::new(RecordingDriver::succeeding());
-
-        service
-            .create(
-                PathBuf::from("C:/projects/测试 游戏/project.db"),
-                project("测试 游戏"),
-            )
-            .await
-            .expect("database creation should succeed");
-
-        let invocations = service
-            .sqlite
-            .invocations
-            .lock()
-            .expect("invocations mutex should not be poisoned");
-        assert_eq!(invocations.len(), 1);
-        let invocation = &invocations[0];
-        assert_eq!(
-            invocation.path,
-            PathBuf::from("C:/projects/测试 游戏/project.db")
-        );
-        assert_eq!(invocation.commands.len(), 22);
-        assert_eq!(invocation.commands[0].statement(), CREATE_METADATA_TABLE);
-        assert!(invocation.commands[0].parameters().is_empty());
-        assert_eq!(
-            invocation.commands[1].statement(),
-            CREATE_INIT_RUN_PLAN_TABLE
-        );
-        assert_eq!(
-            invocation.commands[2].statement(),
-            CREATE_EXTRACT_RUN_PLAN_TABLE
-        );
-        assert_eq!(
-            invocation.commands[3].statement(),
-            CREATE_EXTRACT_RULES_DEFINITION_TABLE
-        );
-        assert_eq!(
-            invocation.commands[4].statement(),
-            CREATE_TRANSLATE_RUN_PLAN_TABLE
-        );
-        assert_eq!(
-            invocation.commands[5].statement(),
-            CREATE_WRITE_BACK_RUN_PLAN_TABLE
-        );
-        assert_eq!(invocation.commands[6].statement(), CREATE_LUA_PROGRAM_TABLE);
-        assert_eq!(
-            invocation.commands[7].statement(),
-            CREATE_STANDARD_ASSET_OWNER_STATE_TABLE
-        );
-        assert_eq!(
-            invocation.commands[8].statement(),
-            CREATE_STANDARD_TEXT_GROUP_TABLE
-        );
-        assert_eq!(
-            invocation.commands[9].statement(),
-            CREATE_STANDARD_TEXT_UNIT_TABLE
-        );
-        assert_eq!(
-            invocation.commands[10].statement(),
-            CREATE_STANDARD_MUTATION_CLAIM_TABLE
-        );
-        assert_eq!(
-            invocation.commands[15].statement(),
-            CREATE_MANAGED_TRANSLATION_OWNER_STATE_TABLE
-        );
-        assert_eq!(
-            invocation.commands[16].statement(),
-            CREATE_MANAGED_TRANSLATION_COLLECTION_TABLE
-        );
-        assert_eq!(
-            invocation.commands[17].statement(),
-            CREATE_MANAGED_TRANSLATION_UNIT_TABLE
-        );
-        assert_eq!(invocation.commands[18].statement(), INSERT_METADATA);
-        assert_eq!(
-            invocation.commands[18].parameters(),
-            &[
-                SqliteValue::Text("测试 游戏".to_owned()),
-                SqliteValue::Text("ja".to_owned()),
-                SqliteValue::Text("zh-CN".to_owned()),
-                SqliteValue::Blob(vec![0x5a; 32]),
-                SqliteValue::Integer(24),
-                SqliteValue::Integer(30),
-                SqliteValue::Integer(18),
-            ]
-        );
-        assert_eq!(
-            invocation.commands[19].parameters(),
-            &[
-                SqliteValue::Text(TERMINOLOGY_RESOURCE_KIND.to_owned()),
-                SqliteValue::Text("[]".to_owned()),
-            ]
-        );
-        assert_eq!(
-            invocation.commands[20].parameters(),
-            &[
-                SqliteValue::Text(PLACEHOLDER_RULES_RESOURCE_KIND.to_owned()),
-                SqliteValue::Text("[]".to_owned()),
-            ]
-        );
-        assert_eq!(
-            invocation.commands[21].parameters(),
-            &[
-                SqliteValue::Text(MV_DIALOGUE_RULES_DEFINITION_KIND.to_owned()),
-                SqliteValue::Text(r#"{"rules":[]}"#.to_owned()),
-            ]
-        );
-        assert!(
-            invocation.commands[8]
-                .statement()
-                .contains("PRIMARY KEY (owner, group_location)")
-        );
-        assert!(
-            invocation.commands[9]
-                .statement()
-                .contains("source_context_json")
-        );
-        assert!(
-            invocation.commands[9]
-                .statement()
-                .contains("translation_state")
-        );
-        assert!(
-            invocation.commands[10]
-                .statement()
-                .contains("resource_key   TEXT NOT NULL")
-        );
-        assert!(
-            invocation.commands[7]
-                .statement()
-                .contains("'builtin', 'rules', 'lua'")
         );
     }
 
     #[test]
-    fn complete_schema_enforces_owner_identity_and_translation_state_pairing() {
-        let connection = rusqlite::Connection::open_in_memory().expect("内存数据库应可打开");
+    fn creation_plan_contains_the_complete_current_rpg_maker_schema_and_resources() {
+        let commands = project_database_commands(&project());
+        assert_eq!(commands.len(), 17);
+        let statements = commands
+            .iter()
+            .map(SqliteCommand::statement)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(statements.contains("rpg_maker_text_group"));
+        assert!(statements.contains("rpg_maker_translation_resource"));
+        assert_eq!(
+            expected_att_schema()
+                .iter()
+                .map(|(_, name, _, _)| *name)
+                .collect::<Vec<_>>(),
+            [
+                "metadata",
+                "init_run_plan",
+                "extract_run_plan",
+                "extract_rules_definition",
+                "translate_run_plan",
+                "rpg_maker_asset_owner_state",
+                "rpg_maker_text_group",
+                "rpg_maker_text_unit",
+                "rpg_maker_mutation_claim",
+                "rpg_maker_translation_resource",
+                "rpg_maker_project_definition",
+                "rpg_maker_mutation_claim_owner_resource_idx",
+                "rpg_maker_mutation_claim_resource_idx",
+            ]
+        );
+    }
+
+    #[test]
+    fn current_schema_matches_the_protected_att_objects_and_allows_private_tables() {
+        let connection = rusqlite::Connection::open_in_memory().expect("应可打开内存数据库");
         connection
             .pragma_update(None, "foreign_keys", true)
-            .expect("测试必须启用外键约束");
-        for statement in [
-            CREATE_METADATA_TABLE,
-            CREATE_INIT_RUN_PLAN_TABLE,
-            CREATE_EXTRACT_RUN_PLAN_TABLE,
-            CREATE_EXTRACT_RULES_DEFINITION_TABLE,
-            CREATE_TRANSLATE_RUN_PLAN_TABLE,
-            CREATE_WRITE_BACK_RUN_PLAN_TABLE,
-            CREATE_LUA_PROGRAM_TABLE,
-            CREATE_STANDARD_ASSET_OWNER_STATE_TABLE,
-            CREATE_STANDARD_TEXT_GROUP_TABLE,
-            CREATE_STANDARD_TEXT_UNIT_TABLE,
-            CREATE_STANDARD_MUTATION_CLAIM_TABLE,
-            CREATE_STANDARD_MUTATION_CLAIM_OWNER_RESOURCE_INDEX,
-            CREATE_STANDARD_MUTATION_CLAIM_RESOURCE_INDEX,
-            CREATE_STANDARD_TRANSLATION_RESOURCE_TABLE,
-            CREATE_STANDARD_PROJECT_DEFINITION_TABLE,
-            CREATE_MANAGED_TRANSLATION_OWNER_STATE_TABLE,
-            CREATE_MANAGED_TRANSLATION_COLLECTION_TABLE,
-            CREATE_MANAGED_TRANSLATION_UNIT_TABLE,
-        ] {
+            .expect("应可启用外键");
+        for (_, _, _, sql) in expected_att_schema() {
             connection
-                .execute_batch(statement)
+                .execute_batch(sql)
                 .unwrap_or_else(|error| panic!("当前 schema 应可执行：{error}"));
         }
+        connection
+            .execute_batch("CREATE TABLE script_private_state (value TEXT)")
+            .expect("脚本私有表应可建立");
 
-        let read_managed_schema = |connection: &rusqlite::Connection| {
+        let rows = {
             let mut statement = connection
-                .prepare(SELECT_MANAGED_SCHEMA)
-                .expect("应可准备受管 schema 查询");
+                .prepare(SELECT_ATT_SCHEMA)
+                .expect("应可准备 ATT schema 查询");
             statement
                 .query_map([], |row| {
                     Ok(SqliteRow::new(vec![
@@ -3772,1453 +3343,11 @@ mod tests {
                         SqliteValue::Text(row.get(3)?),
                     ]))
                 })
-                .expect("应可查询受管 schema")
+                .expect("应可读取 ATT schema")
                 .collect::<Result<Vec<_>, _>>()
-                .expect("schema 行应可读取")
-        };
-        validate_managed_schema(read_managed_schema(&connection))
-            .expect("建库 DDL 必须与当前唯一 schema 精确一致");
-        connection
-            .execute_batch("CREATE TABLE lua_custom_state (value TEXT)")
-            .expect("Lua 自建表应可存在");
-        validate_managed_schema(read_managed_schema(&connection))
-            .expect("Lua 自建表不得污染受管 schema 检查");
-        connection
-            .execute_batch(
-                "CREATE TRIGGER injected_unit_trigger AFTER INSERT ON standard_text_unit BEGIN SELECT 1; END",
-            )
-            .expect("测试触发器应可创建");
-        assert!(matches!(
-            validate_managed_schema(read_managed_schema(&connection)),
-            Err(InvalidCurrentProjectDatabase::ManagedSchema(_))
-        ));
-
-        connection
-            .execute(
-                "INSERT INTO extract_run_plan (singleton, builtin_enabled, rules_enabled, lua_enabled) VALUES (1, 0, 0, 0)",
-                [],
-            )
-            .expect_err("空 Extract owner 集合不得持久化");
-        connection
-            .execute(
-                "INSERT INTO extract_rules_definition (singleton, canonical_json) VALUES (1, '[]')",
-                [],
-            )
-            .expect_err("空 Rules 集合表示停用，不得保存为 active 定义");
-        connection
-            .execute(
-                "INSERT INTO extract_rules_definition (singleton, canonical_json) VALUES (1, ?1)",
-                rusqlite::params![br#"[{"file":"Actors.json","path":"[].name"}]"#.to_vec()],
-            )
-            .expect_err("Rules canonical_json 的 BLOB 伪装不得通过 TEXT schema 约束");
-        connection
-            .execute(
-                "INSERT INTO translate_run_plan (singleton, profile_id) VALUES (1, ?1)",
-                rusqlite::params![b"quality".to_vec()],
-            )
-            .expect_err("Profile ID 的 BLOB 伪装不得通过 TEXT schema 约束");
-        connection
-            .execute(
-                "INSERT INTO lua_program (phase, source, source_sha256, resolved_path_utf16) VALUES ('extract', ?1, ?2, ?3)",
-                rusqlite::params![Vec::<u8>::new(), vec![0_u8; 32], vec![0x43_u8, 0_u8]],
-            )
-            .expect_err("零字节 Lua 应由命令语义清除，不能进入快照表");
-
-        let insert_group = "INSERT INTO standard_text_group (owner, group_location, group_order, group_kind, projection_recipe_json) VALUES (?1, ?2, 0, 'database_entry', '[]')";
-        let insert_unit = "INSERT INTO standard_text_unit (owner, group_location, unit_role, unit_order, source_content_json, source_context_json, translation_content_json, translation_state) VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6, ?7)";
-        connection
-            .execute(insert_group, rusqlite::params!["builtin", "group-a",])
-            .expect_err("没有 owner state 的资产必须被外键拒绝");
-
-        for owner in ["builtin", "rules", "lua"] {
-            connection
-                .execute(
-                    "INSERT INTO standard_asset_owner_state (owner, source_snapshot_fingerprint, asset_snapshot_fingerprint) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![owner, vec![0x5a_u8; 32], vec![0x6b_u8; 32]],
-                )
-                .expect("三个当前 owner 编码都应合法");
-        }
-
-        connection
-            .execute(insert_group, rusqlite::params!["builtin", "group-a",])
-            .expect("owner 可以保存文本组");
-        connection
-            .execute(
-                insert_unit,
-                rusqlite::params![
-                    "builtin",
-                    "group-a",
-                    "scalar:name",
-                    0,
-                    r#""original""#,
-                    Option::<String>::None,
-                    Option::<Vec<u8>>::None,
-                ],
-            )
-            .expect("未翻译语义单元应可保存");
-        connection
-            .execute(
-                insert_unit,
-                rusqlite::params![
-                    "builtin",
-                    "group-a",
-                    "scalar:description",
-                    1,
-                    r#""original""#,
-                    r#""译文""#,
-                    Option::<Vec<u8>>::None,
-                ],
-            )
-            .expect_err("译文与语义单元状态必须成对保存");
-        connection
-            .execute(
-                insert_unit,
-                rusqlite::params![
-                    "builtin",
-                    "group-a",
-                    "choices",
-                    2,
-                    r#"["是","否"]"#,
-                    r#""合并译文""#,
-                    vec![0x7c_u8; 32],
-                ],
-            )
-            .expect_err("译文内容形状必须与源内容一致");
-        connection
-            .execute(
-                insert_unit,
-                rusqlite::params![
-                    "builtin",
-                    "group-a",
-                    "choices",
-                    2,
-                    r#"["是","否"]"#,
-                    r#"["Yes","No"]"#,
-                    vec![0x7c_u8; 32],
-                ],
-            )
-            .expect("有序行集合应以 JSON 数组保存");
-        connection
-            .execute(
-                insert_unit,
-                rusqlite::params![
-                    "builtin",
-                    "group-a",
-                    "scalar:name",
-                    3,
-                    r#""original""#,
-                    Option::<String>::None,
-                    Option::<Vec<u8>>::None,
-                ],
-            )
-            .expect_err("同一组不能重复保存同一逻辑角色");
-
-        connection
-            .execute(
-                "INSERT INTO standard_mutation_claim (owner, group_location, resource_key, access) VALUES ('builtin', 'group-a', 'value:shared', 'intent')",
-                [],
-            )
-            .expect("第一个物理资源锁应可保存");
-        connection
-            .execute(insert_group, rusqlite::params!["rules", "group-b"])
-            .expect("第二个 owner 的组应可保存");
-        connection
-            .execute(
-                "INSERT INTO standard_mutation_claim (owner, group_location, resource_key, access) VALUES ('rules', 'group-b', 'value:shared', 'intent')",
-                [],
-            )
-            .expect("两个 owner 的 Intent 锁可以共存，跨 owner 冲突由 Store 事务判定");
-
-        connection
-            .execute(
-                "INSERT INTO managed_translation_owner_state VALUES ('other', ?1, ?2)",
-                rusqlite::params![vec![1_u8; 32], vec![2_u8; 32]],
-            )
-            .expect_err("托管翻译 owner 必须固定为 lua");
-        connection
-            .execute(
-                "INSERT INTO managed_translation_owner_state VALUES ('lua', ?1, ?2)",
-                rusqlite::params![vec![1_u8; 32], vec![2_u8; 32]],
-            )
-            .expect("合法托管 owner 应可保存");
-        connection
-            .execute(
-                "INSERT INTO managed_translation_collection VALUES ('lua', 'quests', 0, ?1)",
-                rusqlite::params![b"instruction".to_vec()],
-            )
-            .expect_err("collection instruction 的 BLOB 伪装必须拒绝");
-        connection
-            .execute(
-                "INSERT INTO managed_translation_collection VALUES ('lua', 'quests', 0, '')",
-                [],
-            )
-            .expect("空 instruction 是合法的明确语义");
-        let insert_managed_unit = r#"INSERT INTO managed_translation_unit (
-            owner, collection_name, unit_key, unit_order, kind, shape,
-            original_content_json, context, metadata_json,
-            translation_content_json, translation_state
-        ) VALUES ('lua', 'quests', ?1, ?2, 'plugin_parameter', ?3, ?4, '', ?5, ?6, ?7)"#;
-        connection
-            .execute(
-                insert_managed_unit,
-                rusqlite::params![
-                    "metadata-array",
-                    0,
-                    "single",
-                    r#""原文""#,
-                    "[]",
-                    Option::<String>::None,
-                    Option::<Vec<u8>>::None,
-                ],
-            )
-            .expect("metadata 可以是任意显式 JSON 值");
-        connection
-            .execute(
-                insert_managed_unit,
-                rusqlite::params![
-                    "q:1",
-                    1,
-                    "single",
-                    r#""原文""#,
-                    Option::<String>::None,
-                    r#""译文""#,
-                    Option::<Vec<u8>>::None,
-                ],
-            )
-            .expect_err("托管译文与 state 必须成对保存");
-        connection
-            .execute(
-                insert_managed_unit,
-                rusqlite::params![
-                    "q:1",
-                    0,
-                    "lines",
-                    r#""错误标量""#,
-                    Option::<String>::None,
-                    Option::<String>::None,
-                    Option::<Vec<u8>>::None,
-                ],
-            )
-            .expect_err("托管原文 JSON 类型必须符合 shape");
-        connection
-            .execute(
-                insert_managed_unit,
-                rusqlite::params![
-                    "q:1",
-                    1,
-                    "single",
-                    r#""原文""#,
-                    r#"{"quest_id":1}"#,
-                    r#""译文""#,
-                    vec![3_u8; 32],
-                ],
-            )
-            .expect("合法托管单位与成对译文应可保存");
-    }
-
-    #[test]
-    fn owner_state_requires_distinct_source_and_asset_fingerprints() {
-        let valid = decode_owner_states(vec![SqliteRow::new(vec![
-            SqliteValue::Text("builtin".to_owned()),
-            SqliteValue::Blob(vec![0x11; 32]),
-            SqliteValue::Blob(vec![0x22; 32]),
-        ])])
-        .expect("两个合法指纹应重建 owner state");
-
-        assert_eq!(valid.len(), 1);
-        assert_eq!(valid[0].source_snapshot_fingerprint.as_bytes(), &[0x11; 32]);
-        assert_eq!(valid[0].asset_snapshot_fingerprint.as_bytes(), &[0x22; 32]);
-        assert!(matches!(
-            decode_owner_states(vec![SqliteRow::new(vec![
-                SqliteValue::Text("builtin".to_owned()),
-                SqliteValue::Blob(vec![0x11; 32]),
-                SqliteValue::Blob(vec![0x22; 31]),
-            ])]),
-            Err(InvalidCurrentProjectDatabase::OwnerState(_))
-        ));
-    }
-
-    #[test]
-    fn project_definition_requires_current_canonical_dialogue_definition() {
-        let row = |json: &str| {
-            vec![SqliteRow::new(vec![
-                SqliteValue::Text(MV_DIALOGUE_RULES_DEFINITION_KIND.to_owned()),
-                SqliteValue::Text(json.to_owned()),
-            ])]
+                .expect("ATT schema 行应可解码")
         };
 
-        assert_eq!(
-            decode_project_definitions(row(r#"{"rules":[]}"#)).expect("空对话定义应是有效当前定义"),
-            r#"{"rules":[]}"#
-        );
-        for invalid in [
-            "[]",
-            r#"{ "rules": [] }"#,
-            r#"{"rules":[{"pattern":""}]}"#,
-            r#"{"rules":[{"pattern":"(?<text>.+)"}]}"#,
-        ] {
-            assert!(matches!(
-                decode_project_definitions(row(invalid)),
-                Err(InvalidCurrentProjectDatabase::ProjectDefinitions(_))
-            ));
-        }
+        validate_att_schema(rows).expect("生产 DDL 应与当前唯一 schema 一致");
     }
-
-    #[tokio::test]
-    async fn maps_all_driver_terminal_states_with_target_context() {
-        let cases = [
-            (
-                CreateDatabaseError::AlreadyExists,
-                ExpectedKind::AlreadyExists,
-                None,
-            ),
-            (
-                CreateDatabaseError::NotCreated(FakeDriverError("not-created")),
-                ExpectedKind::NotCreated,
-                Some("not-created"),
-            ),
-            (
-                CreateDatabaseError::OutcomeUnknown(FakeDriverError("unknown")),
-                ExpectedKind::OutcomeUnknown,
-                Some("unknown"),
-            ),
-            (
-                CreateDatabaseError::ResidualArtifact(FakeDriverError("residual")),
-                ExpectedKind::ResidualArtifact,
-                Some("residual"),
-            ),
-        ];
-
-        for (driver_error, expected_kind, expected_source) in cases {
-            let service = ProjectDatabaseCreationService::new(RecordingDriver::responding_with(
-                Err(driver_error),
-            ));
-
-            let error = service
-                .create(
-                    PathBuf::from("C:/projects/demo/project.db"),
-                    project("demo"),
-                )
-                .await
-                .expect_err("driver failure should be preserved");
-
-            assert_eq!(error.path(), Path::new("C:/projects/demo/project.db"));
-            assert_eq!(ExpectedKind::from(&error), expected_kind);
-            assert_eq!(
-                error.source().map(ToString::to_string).as_deref(),
-                expected_source
-            );
-        }
-    }
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum ExpectedKind {
-        AlreadyExists,
-        NotCreated,
-        OutcomeUnknown,
-        ResidualArtifact,
-    }
-
-    impl<E> From<&ProjectDatabaseCreateError<E>> for ExpectedKind {
-        fn from(error: &ProjectDatabaseCreateError<E>) -> Self {
-            match error {
-                ProjectDatabaseCreateError::AlreadyExists { .. } => Self::AlreadyExists,
-                ProjectDatabaseCreateError::NotCreated { .. } => Self::NotCreated,
-                ProjectDatabaseCreateError::OutcomeUnknown { .. } => Self::OutcomeUnknown,
-                ProjectDatabaseCreateError::ResidualArtifact { .. } => Self::ResidualArtifact,
-            }
-        }
-    }
-
-    struct ConcurrentDriver {
-        entered: AtomicUsize,
-        max_entered: AtomicUsize,
-    }
-
-    impl ConcurrentDriver {
-        fn new() -> Self {
-            Self {
-                entered: AtomicUsize::new(0),
-                max_entered: AtomicUsize::new(0),
-            }
-        }
-    }
-
-    impl SqliteDatabaseCreator for ConcurrentDriver {
-        type Error = FakeDriverError;
-
-        async fn create_new_database(
-            &self,
-            _path: PathBuf,
-            _commands: Vec<SqliteCommand>,
-        ) -> Result<(), CreateDatabaseError<Self::Error>> {
-            let entered = self.entered.fetch_add(1, Ordering::SeqCst) + 1;
-            self.max_entered.fetch_max(entered, Ordering::SeqCst);
-            YieldOnce::new().await;
-            self.entered.fetch_sub(1, Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
-    struct YieldOnce(bool);
-
-    impl YieldOnce {
-        fn new() -> Self {
-            Self(false)
-        }
-    }
-
-    impl Future for YieldOnce {
-        type Output = ();
-
-        fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-            if self.0 {
-                Poll::Ready(())
-            } else {
-                self.0 = true;
-                context.waker().wake_by_ref();
-                Poll::Pending
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn does_not_serialize_creation_of_different_projects() {
-        let service = ProjectDatabaseCreationService::new(ConcurrentDriver::new());
-
-        let (first, second) = tokio::join!(
-            service.create(
-                PathBuf::from("C:/projects/first/project.db"),
-                project("first")
-            ),
-            service.create(
-                PathBuf::from("C:/projects/second/project.db"),
-                project("second")
-            )
-        );
-
-        first.expect("first database should be created");
-        second.expect("second database should be created");
-        assert_eq!(service.sqlite.max_entered.load(Ordering::SeqCst), 2);
-    }
-
-    #[test]
-    fn creation_future_is_send() {
-        let service = ProjectDatabaseCreationService::new(RecordingDriver::succeeding());
-
-        assert_send(service.create(
-            PathBuf::from("C:/projects/demo/project.db"),
-            project("demo"),
-        ));
-    }
-
-    #[derive(Debug)]
-    struct QueryInvocation {
-        path: PathBuf,
-        query: SqliteQuery,
-    }
-
-    struct RecordingQueryExecutor {
-        invocations: Mutex<Vec<QueryInvocation>>,
-        snapshots: Mutex<Vec<(PathBuf, Vec<SqliteQuery>)>>,
-        responses:
-            Mutex<VecDeque<Result<Vec<SqliteRow>, QueryExistingDatabaseError<FakeDriverError>>>>,
-    }
-
-    impl RecordingQueryExecutor {
-        fn responding_with(
-            response: Result<Vec<SqliteRow>, QueryExistingDatabaseError<FakeDriverError>>,
-        ) -> Self {
-            Self::responding_with_many(vec![response])
-        }
-
-        fn responding_with_many(
-            responses: Vec<Result<Vec<SqliteRow>, QueryExistingDatabaseError<FakeDriverError>>>,
-        ) -> Self {
-            Self {
-                invocations: Mutex::new(Vec::new()),
-                snapshots: Mutex::new(Vec::new()),
-                responses: Mutex::new(VecDeque::from(responses)),
-            }
-        }
-    }
-
-    impl SqliteQueryExecutor for RecordingQueryExecutor {
-        type Error = FakeDriverError;
-
-        fn query_existing_database(
-            &self,
-            path: PathBuf,
-            query: SqliteQuery,
-        ) -> impl Future<Output = Result<Vec<SqliteRow>, QueryExistingDatabaseError<Self::Error>>> + Send
-        {
-            self.invocations
-                .lock()
-                .expect("query invocations mutex should not be poisoned")
-                .push(QueryInvocation { path, query });
-            let response = self
-                .responses
-                .lock()
-                .expect("query responses mutex should not be poisoned")
-                .pop_front()
-                .expect("test must provide one response per query");
-
-            async move { response }
-        }
-
-        async fn query_existing_database_snapshot(
-            &self,
-            path: PathBuf,
-            queries: Vec<SqliteQuery>,
-        ) -> Result<Vec<Vec<SqliteRow>>, QueryExistingDatabaseError<Self::Error>> {
-            self.snapshots
-                .lock()
-                .expect("query snapshots mutex should not be poisoned")
-                .push((path.clone(), queries.clone()));
-            let mut results = Vec::with_capacity(queries.len());
-            for query in queries {
-                results.push(self.query_existing_database(path.clone(), query).await?);
-            }
-            Ok(results)
-        }
-    }
-
-    struct RecordingTransactionExecutor {
-        plans: Mutex<Vec<(PathBuf, SqliteTransactionPlan)>>,
-        responses: Mutex<VecDeque<Result<(), ExecuteTransactionError<FakeDriverError>>>>,
-    }
-
-    impl RecordingTransactionExecutor {
-        fn responding_with(response: Result<(), ExecuteTransactionError<FakeDriverError>>) -> Self {
-            Self {
-                plans: Mutex::new(Vec::new()),
-                responses: Mutex::new(VecDeque::from([response])),
-            }
-        }
-    }
-
-    impl SqliteTransactionExecutor for RecordingTransactionExecutor {
-        type Error = FakeDriverError;
-
-        fn execute_transaction(
-            &self,
-            path: PathBuf,
-            plan: SqliteTransactionPlan,
-        ) -> impl Future<Output = Result<(), ExecuteTransactionError<Self::Error>>> + Send {
-            self.plans
-                .lock()
-                .expect("transaction plans mutex should not be poisoned")
-                .push((path, plan));
-            let response = self
-                .responses
-                .lock()
-                .expect("transaction responses mutex should not be poisoned")
-                .pop_front()
-                .expect("test must provide one transaction response per invocation");
-            async move { response }
-        }
-    }
-
-    fn valid_managed_schema_rows() -> Vec<SqliteRow> {
-        expected_managed_schema()
-            .into_iter()
-            .map(|(kind, name, table, sql)| {
-                SqliteRow::new(vec![
-                    SqliteValue::Text(kind.to_owned()),
-                    SqliteValue::Text(name.to_owned()),
-                    SqliteValue::Text(table.to_owned()),
-                    SqliteValue::Text(sql.to_owned()),
-                ])
-            })
-            .collect()
-    }
-
-    fn valid_inspection_responses()
-    -> Vec<Result<Vec<SqliteRow>, QueryExistingDatabaseError<FakeDriverError>>> {
-        vec![
-            Ok(vec![SqliteRow::new(vec![SqliteValue::Integer(13)])]),
-            Ok(valid_managed_schema_rows()),
-            Ok(vec![valid_metadata_row()]),
-            Ok(vec![
-                SqliteRow::new(vec![
-                    SqliteValue::Text("builtin".to_owned()),
-                    SqliteValue::Blob(vec![0x5a; 32]),
-                    SqliteValue::Blob(vec![0xa5; 32]),
-                ]),
-                SqliteRow::new(vec![
-                    SqliteValue::Text("lua".to_owned()),
-                    SqliteValue::Blob(vec![0x6b; 32]),
-                    SqliteValue::Blob(vec![0xb6; 32]),
-                ]),
-            ]),
-            Ok(vec![
-                SqliteRow::new(vec![
-                    SqliteValue::Text("placeholder_rules".to_owned()),
-                    SqliteValue::Text("[]".to_owned()),
-                ]),
-                SqliteRow::new(vec![
-                    SqliteValue::Text("terminology".to_owned()),
-                    SqliteValue::Text("[]".to_owned()),
-                ]),
-            ]),
-            Ok(vec![SqliteRow::new(vec![
-                SqliteValue::Text(MV_DIALOGUE_RULES_DEFINITION_KIND.to_owned()),
-                SqliteValue::Text(r#"{"rules":[]}"#.to_owned()),
-            ])]),
-            Ok(vec![SqliteRow::new(vec![
-                SqliteValue::Null,
-                SqliteValue::Null,
-                SqliteValue::Null,
-                SqliteValue::Null,
-                SqliteValue::Null,
-                SqliteValue::Null,
-                SqliteValue::Null,
-            ])]),
-            Ok(Vec::new()),
-            Ok(vec![SqliteRow::new(vec![SqliteValue::Text(
-                "ok".to_owned(),
-            )])]),
-            Ok(Vec::new()),
-        ]
-    }
-
-    fn metadata_row(
-        name: SqliteValue,
-        source_language: SqliteValue,
-        target_language: SqliteValue,
-        dialogue_width: SqliteValue,
-        scrolling_width: SqliteValue,
-        help_width: SqliteValue,
-    ) -> SqliteRow {
-        SqliteRow::new(vec![
-            name,
-            source_language,
-            target_language,
-            SqliteValue::Blob(vec![0x5a; 32]),
-            dialogue_width,
-            scrolling_width,
-            help_width,
-        ])
-    }
-
-    fn valid_metadata_row() -> SqliteRow {
-        metadata_row(
-            SqliteValue::Text("测试 游戏".to_owned()),
-            SqliteValue::Text("ja".to_owned()),
-            SqliteValue::Text("zh-Hans".to_owned()),
-            SqliteValue::Integer(24),
-            SqliteValue::Integer(30),
-            SqliteValue::Integer(18),
-        )
-    }
-
-    fn metadata_row_with_fingerprint(fingerprint: SqliteValue) -> SqliteRow {
-        let mut values = valid_metadata_row().into_values();
-        values[3] = fingerprint;
-        SqliteRow::new(values)
-    }
-
-    fn record_reading_service(
-        response: Result<Vec<SqliteRow>, QueryExistingDatabaseError<FakeDriverError>>,
-    ) -> ProjectDatabaseRecordReadingService<RecordingQueryExecutor> {
-        let response = response.map(|rows| {
-            rows.into_iter()
-                .map(|row| {
-                    let mut values = row.into_values();
-                    if values.len() == 7 {
-                        values.push(SqliteValue::Text(r#"{"rules":[]}"#.to_owned()));
-                    }
-                    SqliteRow::new(values)
-                })
-                .collect()
-        });
-        ProjectDatabaseRecordReadingService::new(
-            PathBuf::from("C:/att/projects"),
-            RpgMakerLayout::MZ,
-            RecordingQueryExecutor::responding_with(response),
-        )
-    }
-
-    #[tokio::test]
-    async fn strict_inspection_reads_all_project_facts_in_one_snapshot_and_domain_order() {
-        let queries = RecordingQueryExecutor::responding_with_many(valid_inspection_responses());
-        let transactions = RecordingTransactionExecutor::responding_with(Ok(()));
-        let service = ProjectDatabaseStateReconciliationService::new(queries, transactions);
-        let expected_name: ProjectName = "测试 游戏".parse().expect("项目名应合法");
-
-        let state = service
-            .inspect(PathBuf::from("C:/projects/demo/project.db"), expected_name)
-            .await
-            .expect("当前 schema 与项目事实应通过严格检查");
-
-        assert_eq!(state.source_language().as_str(), "ja");
-        assert_eq!(state.target_language().as_str(), "zh-Hans");
-        assert_eq!(
-            state.active_owner_freshness(),
-            vec![
-                StandardAssetOwnerFreshness {
-                    owner: RpgMakerStandardAssetOwner::Builtin,
-                    fresh: true,
-                },
-                StandardAssetOwnerFreshness {
-                    owner: RpgMakerStandardAssetOwner::Lua,
-                    fresh: false,
-                },
-            ]
-        );
-        assert_eq!(state.stale_owners(), vec![RpgMakerStandardAssetOwner::Lua]);
-        let invocations = service
-            .queries
-            .invocations
-            .lock()
-            .expect("query invocations mutex should not be poisoned");
-        assert_eq!(state.mv_dialogue_rules_json(), r#"{"rules":[]}"#);
-        assert_eq!(invocations.len(), 10);
-        let snapshots = service
-            .queries
-            .snapshots
-            .lock()
-            .expect("query snapshots mutex should not be poisoned");
-        assert_eq!(snapshots.len(), 1);
-        assert_eq!(snapshots[0].0, PathBuf::from("C:/projects/demo/project.db"));
-        assert_eq!(snapshots[0].1.len(), 10);
-        assert_eq!(
-            snapshots[0]
-                .1
-                .iter()
-                .map(SqliteQuery::statement)
-                .collect::<Vec<_>>(),
-            vec![
-                SELECT_SCHEMA_VERSION,
-                SELECT_MANAGED_SCHEMA,
-                SELECT_METADATA,
-                SELECT_OWNER_STATES,
-                SELECT_TRANSLATION_RESOURCES,
-                SELECT_PROJECT_DEFINITIONS,
-                SELECT_RUN_PLAN_SINGLETONS,
-                SELECT_LUA_PROGRAMS,
-                SELECT_QUICK_CHECK,
-                SELECT_FOREIGN_KEY_CHECK,
-            ]
-        );
-        assert_eq!(
-            snapshots[0]
-                .1
-                .iter()
-                .map(SqliteQuery::id)
-                .collect::<Vec<_>>(),
-            vec![
-                "project_database.inspect.schema_version",
-                "project_database.inspect.managed_schema",
-                "project_database.inspect.metadata",
-                "project_database.inspect.owner_states",
-                "project_database.inspect.translation_resources",
-                "project_database.inspect.project_definitions",
-                "project_database.inspect.run_plan_singletons",
-                "project_database.inspect.lua_programs",
-                "project_database.inspect.quick_check",
-                "project_database.inspect.foreign_key_check",
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn inspection_read_failure_preserves_database_path_stage_and_query_identity() {
-        let queries = RecordingQueryExecutor::responding_with(Err(
-            QueryExistingDatabaseError::QueryFailed(FakeDriverError("SQL_PARAMETER_SENTINEL")),
-        ));
-        let transactions = RecordingTransactionExecutor::responding_with(Ok(()));
-        let service = ProjectDatabaseStateReconciliationService::new(queries, transactions);
-
-        let error = service
-            .inspect(
-                PathBuf::from("C:/projects/demo/project.db"),
-                "demo".parse().expect("项目名应合法"),
-            )
-            .await
-            .expect_err("一致快照读取失败必须保留完整查询上下文");
-
-        let ProjectDatabaseInspectionError::ReadDatabase {
-            path,
-            stage,
-            query_ids,
-            source,
-        } = error
-        else {
-            panic!("应报告带上下文的数据库读取失败")
-        };
-        assert_eq!(path, PathBuf::from("C:/projects/demo/project.db"));
-        assert_eq!(stage, "读取项目数据库一致快照");
-        assert_eq!(
-            query_ids,
-            vec![
-                "project_database.inspect.schema_version",
-                "project_database.inspect.managed_schema",
-                "project_database.inspect.metadata",
-                "project_database.inspect.owner_states",
-                "project_database.inspect.translation_resources",
-                "project_database.inspect.project_definitions",
-                "project_database.inspect.run_plan_singletons",
-                "project_database.inspect.lua_programs",
-                "project_database.inspect.quick_check",
-                "project_database.inspect.foreign_key_check",
-            ]
-        );
-        assert_eq!(source.0, "SQL_PARAMETER_SENTINEL");
-    }
-
-    #[tokio::test]
-    async fn inspection_maps_quick_check_and_foreign_key_sets_in_snapshot_order() {
-        let mut quick_check_responses = valid_inspection_responses();
-        quick_check_responses[8] = Ok(vec![SqliteRow::new(vec![SqliteValue::Text(
-            "corrupt".to_owned(),
-        )])]);
-        let service = ProjectDatabaseStateReconciliationService::new(
-            RecordingQueryExecutor::responding_with_many(quick_check_responses),
-            RecordingTransactionExecutor::responding_with(Ok(())),
-        );
-        let error = service
-            .inspect(
-                PathBuf::from("C:/projects/demo/project.db"),
-                "测试 游戏".parse().expect("项目名应合法"),
-            )
-            .await
-            .expect_err("quick_check 非 ok 必须按第九组结果报告");
-        assert!(matches!(
-            error,
-            ProjectDatabaseInspectionError::InvalidDatabase {
-                reason: InvalidCurrentProjectDatabase::Integrity(
-                    InvalidProjectDatabaseIntegrity::QuickCheckFailed
-                ),
-                ..
-            }
-        ));
-
-        let mut foreign_key_responses = valid_inspection_responses();
-        foreign_key_responses[9] = Ok(vec![SqliteRow::new(vec![
-            SqliteValue::Text("standard_text_unit".to_owned()),
-            SqliteValue::Integer(1),
-            SqliteValue::Text("standard_text_group".to_owned()),
-            SqliteValue::Integer(0),
-        ])]);
-        let service = ProjectDatabaseStateReconciliationService::new(
-            RecordingQueryExecutor::responding_with_many(foreign_key_responses),
-            RecordingTransactionExecutor::responding_with(Ok(())),
-        );
-        let error = service
-            .inspect(
-                PathBuf::from("C:/projects/demo/project.db"),
-                "测试 游戏".parse().expect("项目名应合法"),
-            )
-            .await
-            .expect_err("foreign_key_check 非空必须按第十组结果报告");
-        assert!(matches!(
-            error,
-            ProjectDatabaseInspectionError::InvalidDatabase {
-                reason: InvalidCurrentProjectDatabase::Integrity(
-                    InvalidProjectDatabaseIntegrity::ForeignKeyViolations { actual: 1 }
-                ),
-                ..
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn reconciliation_rejects_noncanonical_language_metadata_without_writing() {
-        let mut responses = valid_inspection_responses();
-        responses[2] = Ok(vec![metadata_row(
-            SqliteValue::Text("测试 游戏".to_owned()),
-            SqliteValue::Text("en-us".to_owned()),
-            SqliteValue::Text("zh-Hans".to_owned()),
-            SqliteValue::Integer(24),
-            SqliteValue::Integer(30),
-            SqliteValue::Integer(18),
-        )]);
-        let queries = RecordingQueryExecutor::responding_with_many(responses);
-        let transactions = RecordingTransactionExecutor::responding_with(Ok(()));
-        let service = ProjectDatabaseStateReconciliationService::new(queries, transactions);
-        let requested = NewProject::new(
-            "测试 游戏".parse().expect("项目名应合法"),
-            language_pair("en-US", "zh-Hans"),
-            test_source_snapshot_fingerprint(),
-            layout_profile(),
-        );
-
-        let error = service
-            .reconcile(PathBuf::from("C:/projects/demo/project.db"), requested)
-            .await
-            .expect_err("非规范语言 metadata 必须在对账写入前失败");
-
-        let ProjectDatabaseReconciliationError::Inspection(
-            ProjectDatabaseInspectionError::InvalidDatabase {
-                reason:
-                    InvalidCurrentProjectDatabase::Metadata(
-                        InvalidProjectMetadata::NonCanonicalLanguage {
-                            column,
-                            stored,
-                            canonical,
-                        },
-                    ),
-                ..
-            },
-        ) = error
-        else {
-            panic!("应报告项目 metadata 中的非规范语言")
-        };
-        assert_eq!(column, "source_language");
-        assert_eq!(stored, "en-us");
-        assert_eq!(canonical, "en-US");
-        assert_eq!(
-            service
-                .queries
-                .invocations
-                .lock()
-                .expect("查询记录锁不应中毒")
-                .len(),
-            10
-        );
-        assert!(
-            service
-                .transactions
-                .plans
-                .lock()
-                .expect("事务记录锁不应中毒")
-                .is_empty(),
-            "非规范 metadata 不得触发修复或其他写事务"
-        );
-    }
-
-    #[tokio::test]
-    async fn reconciliation_rejects_invalid_language_metadata_without_writing() {
-        let mut responses = valid_inspection_responses();
-        responses[2] = Ok(vec![metadata_row(
-            SqliteValue::Text("测试 游戏".to_owned()),
-            SqliteValue::Text("en_US".to_owned()),
-            SqliteValue::Text("zh-Hans".to_owned()),
-            SqliteValue::Integer(24),
-            SqliteValue::Integer(30),
-            SqliteValue::Integer(18),
-        )]);
-        let queries = RecordingQueryExecutor::responding_with_many(responses);
-        let transactions = RecordingTransactionExecutor::responding_with(Ok(()));
-        let service = ProjectDatabaseStateReconciliationService::new(queries, transactions);
-        let requested = NewProject::new(
-            "测试 游戏".parse().expect("项目名应合法"),
-            language_pair("en-US", "zh-Hans"),
-            test_source_snapshot_fingerprint(),
-            layout_profile(),
-        );
-
-        let error = service
-            .reconcile(PathBuf::from("C:/projects/demo/project.db"), requested)
-            .await
-            .expect_err("非法语言 metadata 必须在对账写入前失败");
-
-        assert!(matches!(
-            error,
-            ProjectDatabaseReconciliationError::Inspection(
-                ProjectDatabaseInspectionError::InvalidDatabase {
-                    reason: InvalidCurrentProjectDatabase::Metadata(
-                        InvalidProjectMetadata::InvalidLanguage {
-                            column: "source_language",
-                            ..
-                        }
-                    ),
-                    ..
-                }
-            )
-        ));
-        assert!(
-            service
-                .transactions
-                .plans
-                .lock()
-                .expect("事务记录锁不应中毒")
-                .is_empty(),
-            "非法 metadata 不得触发修复或其他写事务"
-        );
-    }
-
-    #[tokio::test]
-    async fn reconciliation_clears_language_dependent_state_and_uses_cas_guards() {
-        let queries = RecordingQueryExecutor::responding_with_many(valid_inspection_responses());
-        let transactions = RecordingTransactionExecutor::responding_with(Ok(()));
-        let service = ProjectDatabaseStateReconciliationService::new(queries, transactions);
-        let requested = NewProject::new(
-            "测试 游戏".parse().expect("项目名应合法"),
-            language_pair("en", "zh-Hans"),
-            SourceSnapshotFingerprint::from_bytes([0x7c; 32]),
-            RpgMakerWriteBackLayoutProfile::new(width(26), width(32), width(20)),
-        );
-
-        let result = service
-            .reconcile(PathBuf::from("C:/projects/demo/project.db"), requested)
-            .await
-            .expect("对账事务应提交");
-
-        assert_eq!(
-            result.stale_owners(),
-            vec![
-                RpgMakerStandardAssetOwner::Builtin,
-                RpgMakerStandardAssetOwner::Lua
-            ]
-        );
-        assert_eq!(result.state().source_language().as_str(), "en");
-        assert_eq!(
-            result.state().source_snapshot_fingerprint(),
-            SourceSnapshotFingerprint::from_bytes([0x7c; 32])
-        );
-        let plans = service
-            .transactions
-            .plans
-            .lock()
-            .expect("transaction plans mutex should not be poisoned");
-        assert_eq!(plans.len(), 1);
-        let steps = plans[0].1.steps();
-        let SqliteTransactionStep::RequireNoRows(schema_version_guard) = &steps[0] else {
-            panic!("首个 CAS 必须复核一致快照读取到的 schema version")
-        };
-        assert_eq!(
-            schema_version_guard.parameters(),
-            &[SqliteValue::Integer(13)]
-        );
-        let check_count = steps
-            .iter()
-            .filter(|step| matches!(step, SqliteTransactionStep::RequireNoRows(_)))
-            .count();
-        assert_eq!(check_count, 5);
-        let executed = steps
-            .iter()
-            .filter_map(|step| match step {
-                SqliteTransactionStep::Execute(command) => Some(command.statement()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert!(executed.contains(&CLEAR_STANDARD_TEXT_TRANSLATIONS));
-        assert!(executed.contains(&CLEAR_MANAGED_TRANSLATIONS));
-        assert!(executed.contains(&RESET_TERMINOLOGY_RESOURCE));
-        assert_eq!(executed.last().copied(), Some(UPDATE_METADATA));
-    }
-
-    #[tokio::test]
-    async fn reconciliation_maps_failed_cas_without_executing_a_second_plan() {
-        let queries = RecordingQueryExecutor::responding_with_many(valid_inspection_responses());
-        let transactions = RecordingTransactionExecutor::responding_with(Err(
-            ExecuteTransactionError::RequirementFailed,
-        ));
-        let service = ProjectDatabaseStateReconciliationService::new(queries, transactions);
-        let requested = NewProject::new(
-            "测试 游戏".parse().expect("项目名应合法"),
-            language_pair("ja", "zh-Hans"),
-            SourceSnapshotFingerprint::from_bytes([0x7c; 32]),
-            layout_profile(),
-        );
-
-        let error = service
-            .reconcile(PathBuf::from("C:/projects/demo/project.db"), requested)
-            .await
-            .expect_err("CAS 失败必须作为外部并发改变返回");
-
-        assert!(matches!(
-            error,
-            ProjectDatabaseReconciliationError::ConcurrentModification { .. }
-        ));
-        assert_eq!(
-            service
-                .transactions
-                .plans
-                .lock()
-                .expect("transaction plans mutex should not be poisoned")
-                .len(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn reads_exact_metadata_projection_into_trusted_record() {
-        let service = record_reading_service(Ok(vec![valid_metadata_row()]));
-        let requested: ProjectName = "测试 游戏".parse().expect("test name should be valid");
-
-        let record = service
-            .read(&requested)
-            .await
-            .expect("valid metadata should be read");
-
-        assert_eq!(record.name(), &requested);
-        assert_eq!(
-            record.workspace_root(),
-            Path::new("C:/att/projects/mz/测试 游戏")
-        );
-        assert_eq!(
-            record.database_path(),
-            Path::new("C:/att/projects/mz/测试 游戏/project.db")
-        );
-        assert_eq!(
-            record.layout().source_data(),
-            Path::new("C:/att/projects/mz/测试 游戏/source/data")
-        );
-        assert_eq!(
-            record.layout().source_js(),
-            Path::new("C:/att/projects/mz/测试 游戏/source/js")
-        );
-        assert_eq!(record.source_language().as_str(), "ja");
-        assert_eq!(record.target_language().as_str(), "zh-Hans");
-        assert_eq!(
-            record.source_snapshot_fingerprint(),
-            test_source_snapshot_fingerprint()
-        );
-        assert_eq!(record.layout_profile(), &layout_profile());
-
-        let invocations = service
-            .sqlite
-            .invocations
-            .lock()
-            .expect("query invocations mutex should not be poisoned");
-        assert_eq!(invocations.len(), 1);
-        assert_eq!(
-            invocations[0].path,
-            PathBuf::from("C:/att/projects/mz/测试 游戏/project.db")
-        );
-        assert_eq!(invocations[0].query.statement(), SELECT_PROJECT_RECORD);
-        assert_eq!(invocations[0].query.id(), PROJECT_RECORD_QUERY_ID);
-        assert!(invocations[0].query.parameters().is_empty());
-    }
-
-    #[tokio::test]
-    async fn maps_query_terminal_states_with_database_path() {
-        let not_found = record_reading_service(Err(QueryExistingDatabaseError::NotFound))
-            .read(&"demo".parse().expect("test name should be valid"))
-            .await
-            .expect_err("missing database should fail");
-        assert!(matches!(
-            not_found,
-            ProjectDatabaseReadError::DatabaseNotFound { .. }
-        ));
-        assert_eq!(
-            not_found.path(),
-            Path::new("C:/att/projects/mz/demo/project.db")
-        );
-        assert!(not_found.source().is_none());
-
-        let read_failure = record_reading_service(Err(QueryExistingDatabaseError::QueryFailed(
-            FakeDriverError("query failed"),
-        )))
-        .read(&"demo".parse().expect("test name should be valid"))
-        .await
-        .expect_err("query failure should be preserved");
-        assert_eq!(
-            read_failure.path(),
-            Path::new("C:/att/projects/mz/demo/project.db")
-        );
-        let ProjectDatabaseReadError::ReadDatabase {
-            stage,
-            query_id,
-            source,
-            ..
-        } = &read_failure
-        else {
-            panic!("query failure should preserve read context")
-        };
-        assert_eq!(*stage, PROJECT_RECORD_READ_STAGE);
-        assert_eq!(query_id, PROJECT_RECORD_QUERY_ID);
-        assert_eq!(source.0, "query failed");
-        assert_eq!(
-            read_failure.source().map(ToString::to_string).as_deref(),
-            Some("query failed")
-        );
-    }
-
-    #[tokio::test]
-    async fn dialogue_definition_failure_keeps_typed_position_without_definition_body() {
-        const DEFINITION_BODY_SENTINEL: &str = "DIALOGUE_DEFINITION_BODY_SENTINEL";
-        let mut values = valid_metadata_row().into_values();
-        values.push(SqliteValue::Text(format!(
-            "{{\n\"rules\": \"{DEFINITION_BODY_SENTINEL}\"\n}}"
-        )));
-
-        let error = record_reading_service(Ok(vec![SqliteRow::new(values)]))
-            .read(&"测试 游戏".parse().expect("test name should be valid"))
-            .await
-            .expect_err("无效的对话定义必须被拒绝");
-
-        let ProjectDatabaseReadError::InvalidMetadata { path, reason } = error else {
-            panic!("应报告 metadata 中的定义错误")
-        };
-        assert_eq!(
-            path,
-            PathBuf::from("C:/att/projects/mz/测试 游戏/project.db")
-        );
-        let InvalidProjectMetadata::InvalidDialogueDefinition { stage, failure } = &reason else {
-            panic!("应保留类型化的对话定义失败")
-        };
-        assert_eq!(*stage, ProjectDefinitionStage::Decode);
-        let ProjectDefinitionFailure::InvalidJson {
-            category,
-            line,
-            column,
-        } = failure
-        else {
-            panic!("应保留 JSON 分类与行列")
-        };
-        assert_eq!(*category, SafeJsonErrorCategory::Data);
-        assert_eq!(*line, 2);
-        assert!(*column > 0);
-
-        let fact = reason.safe_fact();
-        assert!(fact.contains("metadata=invalid_dialogue_definition"));
-        assert!(fact.contains("definition=mv_dialogue_rules"));
-        assert!(fact.contains("stage=decode"));
-        assert!(fact.contains("failure=invalid_json"));
-        assert!(fact.contains("json_category=data"));
-        assert!(fact.contains("line=2"));
-        assert!(!fact.contains(DEFINITION_BODY_SENTINEL));
-    }
-
-    #[tokio::test]
-    async fn rejects_metadata_rows_that_do_not_match_the_current_contract() {
-        let service = record_reading_service(Err(QueryExistingDatabaseError::QueryFailed(
-            FakeDriverError("no such column: dialogue_max_fullwidth_chars"),
-        )));
-
-        let error = service
-            .read(&"demo".parse().expect("test name should be valid"))
-            .await
-            .expect_err("不符合当前 metadata 契约的记录必须被拒绝");
-
-        assert!(matches!(
-            error,
-            ProjectDatabaseReadError::ReadDatabase { .. }
-        ));
-        let invocations = service
-            .sqlite
-            .invocations
-            .lock()
-            .expect("query invocations mutex should not be poisoned");
-        assert_eq!(invocations.len(), 1);
-        assert_eq!(invocations[0].query.statement(), SELECT_PROJECT_RECORD);
-    }
-
-    #[tokio::test]
-    async fn rejects_invalid_metadata_shape_and_storage_types() {
-        let cases = [
-            (Vec::new(), ExpectedInvalidMetadata::MissingRow),
-            (
-                vec![valid_metadata_row(), valid_metadata_row()],
-                ExpectedInvalidMetadata::MultipleRows,
-            ),
-            (
-                vec![SqliteRow::new(vec![SqliteValue::Text(
-                    "测试 游戏".to_owned(),
-                )])],
-                ExpectedInvalidMetadata::WrongColumnCount,
-            ),
-            (
-                vec![metadata_row(
-                    SqliteValue::Text("测试 游戏".to_owned()),
-                    SqliteValue::Blob(Vec::new()),
-                    SqliteValue::Text("zh-Hans".to_owned()),
-                    SqliteValue::Integer(24),
-                    SqliteValue::Integer(30),
-                    SqliteValue::Integer(18),
-                )],
-                ExpectedInvalidMetadata::WrongColumnType,
-            ),
-            (
-                vec![metadata_row(
-                    SqliteValue::Text("测试 游戏".to_owned()),
-                    SqliteValue::Text("ja".to_owned()),
-                    SqliteValue::Text("zh-Hans".to_owned()),
-                    SqliteValue::Text("24".to_owned()),
-                    SqliteValue::Integer(30),
-                    SqliteValue::Integer(18),
-                )],
-                ExpectedInvalidMetadata::WrongColumnType,
-            ),
-            (
-                vec![metadata_row_with_fingerprint(SqliteValue::Text(
-                    "not-a-fingerprint".to_owned(),
-                ))],
-                ExpectedInvalidMetadata::WrongColumnType,
-            ),
-            (
-                vec![metadata_row_with_fingerprint(SqliteValue::Blob(vec![
-                    0x5a;
-                    31
-                ]))],
-                ExpectedInvalidMetadata::InvalidSourceSnapshotFingerprintLength,
-            ),
-        ];
-
-        for (rows, expected) in cases {
-            let error = record_reading_service(Ok(rows))
-                .read(&"测试 游戏".parse().expect("test name should be valid"))
-                .await
-                .expect_err("invalid metadata should fail");
-
-            let ProjectDatabaseReadError::InvalidMetadata { reason, .. } = error else {
-                panic!("expected invalid metadata error")
-            };
-            assert_eq!(ExpectedInvalidMetadata::from(&reason), expected);
-        }
-    }
-
-    #[tokio::test]
-    async fn rejects_metadata_that_cannot_reestablish_trusted_project_facts() {
-        let cases = [
-            (
-                metadata_row(
-                    SqliteValue::Text("../unsafe".to_owned()),
-                    SqliteValue::Text("ja".to_owned()),
-                    SqliteValue::Text("zh".to_owned()),
-                    SqliteValue::Integer(24),
-                    SqliteValue::Integer(30),
-                    SqliteValue::Integer(18),
-                ),
-                ExpectedInvalidMetadata::InvalidProjectName,
-            ),
-            (
-                metadata_row(
-                    SqliteValue::Text("another".to_owned()),
-                    SqliteValue::Text("ja".to_owned()),
-                    SqliteValue::Text("zh".to_owned()),
-                    SqliteValue::Integer(24),
-                    SqliteValue::Integer(30),
-                    SqliteValue::Integer(18),
-                ),
-                ExpectedInvalidMetadata::NameMismatch,
-            ),
-            (
-                metadata_row(
-                    SqliteValue::Text("demo".to_owned()),
-                    SqliteValue::Text(" \t".to_owned()),
-                    SqliteValue::Text("zh".to_owned()),
-                    SqliteValue::Integer(24),
-                    SqliteValue::Integer(30),
-                    SqliteValue::Integer(18),
-                ),
-                ExpectedInvalidMetadata::InvalidLanguage,
-            ),
-            (
-                metadata_row(
-                    SqliteValue::Text("demo".to_owned()),
-                    SqliteValue::Text("ja".to_owned()),
-                    SqliteValue::Text("\n".to_owned()),
-                    SqliteValue::Integer(24),
-                    SqliteValue::Integer(30),
-                    SqliteValue::Integer(18),
-                ),
-                ExpectedInvalidMetadata::InvalidLanguage,
-            ),
-            (
-                metadata_row(
-                    SqliteValue::Text("demo".to_owned()),
-                    SqliteValue::Text("en-us".to_owned()),
-                    SqliteValue::Text("zh".to_owned()),
-                    SqliteValue::Integer(24),
-                    SqliteValue::Integer(30),
-                    SqliteValue::Integer(18),
-                ),
-                ExpectedInvalidMetadata::NonCanonicalLanguage,
-            ),
-            (
-                metadata_row(
-                    SqliteValue::Text("demo".to_owned()),
-                    SqliteValue::Text("ja".to_owned()),
-                    SqliteValue::Text("zh".to_owned()),
-                    SqliteValue::Integer(0),
-                    SqliteValue::Integer(30),
-                    SqliteValue::Integer(18),
-                ),
-                ExpectedInvalidMetadata::InvalidLineWidth,
-            ),
-            (
-                metadata_row(
-                    SqliteValue::Text("demo".to_owned()),
-                    SqliteValue::Text("ja".to_owned()),
-                    SqliteValue::Text("zh".to_owned()),
-                    SqliteValue::Integer(24),
-                    SqliteValue::Integer(-1),
-                    SqliteValue::Integer(18),
-                ),
-                ExpectedInvalidMetadata::InvalidLineWidth,
-            ),
-            (
-                metadata_row(
-                    SqliteValue::Text("demo".to_owned()),
-                    SqliteValue::Text("ja".to_owned()),
-                    SqliteValue::Text("zh".to_owned()),
-                    SqliteValue::Integer(24),
-                    SqliteValue::Integer(30),
-                    SqliteValue::Integer(i64::from(u32::MAX) + 1),
-                ),
-                ExpectedInvalidMetadata::InvalidLineWidth,
-            ),
-        ];
-
-        for (row, expected) in cases {
-            let error = record_reading_service(Ok(vec![row]))
-                .read(&"demo".parse().expect("test name should be valid"))
-                .await
-                .expect_err("untrusted metadata should fail");
-            let ProjectDatabaseReadError::InvalidMetadata { reason, .. } = error else {
-                panic!("expected invalid metadata error")
-            };
-            assert_eq!(ExpectedInvalidMetadata::from(&reason), expected);
-        }
-    }
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum ExpectedInvalidMetadata {
-        MissingRow,
-        MultipleRows,
-        WrongColumnCount,
-        WrongColumnType,
-        InvalidProjectName,
-        NameMismatch,
-        InvalidLanguage,
-        NonCanonicalLanguage,
-        InvalidLineWidth,
-        InvalidSourceSnapshotFingerprintLength,
-        InvalidDialogueDefinition,
-    }
-
-    impl From<&InvalidProjectMetadata> for ExpectedInvalidMetadata {
-        fn from(reason: &InvalidProjectMetadata) -> Self {
-            match reason {
-                InvalidProjectMetadata::MissingRow => Self::MissingRow,
-                InvalidProjectMetadata::MultipleRows => Self::MultipleRows,
-                InvalidProjectMetadata::WrongColumnCount { .. } => Self::WrongColumnCount,
-                InvalidProjectMetadata::WrongColumnType { .. } => Self::WrongColumnType,
-                InvalidProjectMetadata::InvalidProjectName { .. } => Self::InvalidProjectName,
-                InvalidProjectMetadata::NameMismatch { .. } => Self::NameMismatch,
-                InvalidProjectMetadata::InvalidLanguage { .. } => Self::InvalidLanguage,
-                InvalidProjectMetadata::NonCanonicalLanguage { .. } => Self::NonCanonicalLanguage,
-                InvalidProjectMetadata::InvalidLineWidth { .. } => Self::InvalidLineWidth,
-                InvalidProjectMetadata::InvalidSourceSnapshotFingerprintLength { .. } => {
-                    Self::InvalidSourceSnapshotFingerprintLength
-                }
-                InvalidProjectMetadata::InvalidDialogueDefinition { .. } => {
-                    Self::InvalidDialogueDefinition
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn maximum_fullwidth_chars_rejects_zero() {
-        let error = MaxFullwidthChars::new(0).expect_err("zero width should be rejected");
-
-        assert_eq!(error.to_string(), "每行最大全角字符数必须大于零");
-        assert_eq!(width(1).get(), 1);
-    }
-
-    #[test]
-    fn record_reading_future_is_send() {
-        let service = record_reading_service(Ok(vec![valid_metadata_row()]));
-        let name: ProjectName = "测试 游戏".parse().expect("test name should be valid");
-
-        assert_send(service.read(&name));
-    }
-
-    fn assert_send(_: impl Send) {}
 }

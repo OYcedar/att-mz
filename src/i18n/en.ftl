@@ -1,30 +1,29 @@
-app-about = Translate RPG Maker games with reusable project state
+app-about = Translate games and structured text with reusable project state
 cli-config-help = Strict TOML configuration file for this run
 cli-ui-language-help = Language for help, diagnostics, progress, results, and project logs: ar, zh-Hans, zh-Hant, en, fr, ru, es, ja, ko, or vi
 cli-progress-help = Live progress mode: auto, plain, or off
 cli-mz-about = Translate an RPG Maker MZ game
 cli-mv-about = Translate an RPG Maker MV game
-cli-init-about = Initialize or update a named game project
-cli-extract-about = Extract source text using an explicit or saved owner plan
+cli-generic-about = Translate structured JSONL text
+cli-init-about = Initialize or update a named translation project
+cli-extract-about = Synchronize source text from the project's current input
 cli-translate-about = Translate extracted text with an explicit or saved profile
-cli-write-back-about = Write accepted translations back to the game
-cli-project-lua-about = Run a trusted Lua program once in a project context
+cli-write-back-about = Write current translations to the project's output
+cli-project-lua-about = Run one atomic database Lua program in a project
 cli-project-name-help = Stable project name
-cli-init-path-help = RPG Maker game root; an existing project can reuse its last successful path
+cli-init-path-help = Input root directory; an existing project can reuse its last successful path
 cli-source-language-help = Source language ID
 cli-target-language-help = Target language ID
 cli-dialogue-width-help = Maximum full-width characters per dialogue line
 cli-scrolling-width-help = Maximum full-width characters per scrolling-text line
 cli-help-width-help = Maximum full-width characters per help or description line
 cli-builtin-help = Use ATT's built-in RPG Maker text locations
-cli-rules-help = Replace the Rules owner with this TOML definition; an empty rule list disables it
+cli-rules-help = Replace the RPG Maker extraction rules with this TOML definition; an empty rule list disables them
 cli-dialogue-rules-help = Replace the MV dialogue-name projection used with Builtin
-cli-lua-help = Replace the phase Lua program; a zero-byte file clears it
 cli-profile-help = Translation profile ID; omit it to reuse the last successful profile
 cli-terms-help = Replace the project's terminology resource
 cli-placeholders-help = Replace the project's placeholder resource
-cli-project-lua-profile-help = Profile for Standard manual acceptance; omit it to resolve the last successful Translate profile when Standard is opened
-cli-project-lua-script-help = Trusted Lua program to run once
+cli-project-lua-script-help = Atomic database Lua program to run once
 cli-project-lua-arguments-help = UTF-8 argument passed to Lua arg[1..] after --
 cli-usage-heading = Usage:
 cli-commands-heading = Commands:
@@ -66,7 +65,7 @@ log-label-phase-planning = planning
 log-label-phase-confirmed-tasks = confirming tasks
 log-label-phase-no-work = no work required
 log-label-phase-read-assets = reading assets
-log-label-phase-plan-standard = planning standard write-back
+log-label-phase-plan-rpg-maker-write-back = planning RPG Maker write-back
 log-label-phase-rewrite-documents = rewriting documents
 log-label-phase-validate-candidate = validating candidate
 log-label-task-complete = complete
@@ -83,12 +82,8 @@ plan-source-product-default = product behavior
 notice-init-reuse-path = No source path was provided; reusing the last successful path: { $path }.
 notice-extract-reuse-owners = No extraction scope was provided; reusing the last successful plan: { $owners }.
 notice-translate-reuse-profile = No profile was provided; reusing the last successful profile: { $profile }.
-notice-translate-reuse-lua = No Lua option was provided; reusing the last successful Translate Lua selection.
-notice-write-back-reuse-lua = No Lua option was provided; reusing the last successful WriteBack Lua program.
-notice-write-back-standard-only = No WriteBack Lua program is configured; running Standard only.
 notice-owner-disabled = Owner { $owner } was disabled and removed from future automatic plans.
-notice-lua-cleared = The { $phase } Lua program was cleared; it will not run this time.
-notice-no-model-request = All standard translation units are current; Standard made no model request this run.
+notice-no-model-request = All translation units are current; no model request was needed in this run.
 notice-manual-layout = { $count ->
     [one] 1 unit needs a manual line-break review.
    *[other] { $count } units need a manual line-break review.
@@ -105,7 +100,6 @@ progress-extract-owner = Extract owner: { $owner }
 progress-extract-documents = Scanning documents
 progress-extract-builtin = Builtin work units
 progress-extract-rules = Rules definitions
-progress-extract-lua = Running the Extract Lua program
 progress-extract-commit = Committing extracted assets
 progress-translate-planning = Planning translation tasks
 progress-translate-confirmed = Confirmed translation tasks
@@ -114,7 +108,6 @@ progress-project-lua = Running the project Lua program
 progress-write-back-read-assets = Reading accepted assets
 progress-write-back-planning = Planning document rewrites
 progress-write-back-documents = Rewritten documents
-progress-write-back-lua = Running the WriteBack Lua program
 progress-write-back-validate-candidate = Validating the output candidate
 progress-write-back-publish = Publishing output; interruption will wait for a confirmed outcome
 progress-finalizing = Finalizing required resources
@@ -126,23 +119,27 @@ result-init-updated = Project state: updated
 result-init-stale-owners = Re-extraction required: { $owners }
 result-extract-completed = Extraction complete: { $project }
 result-translate-completed = Translation complete: { $project } (Profile: { $profile })
-result-translate-standard = Standard translation: { $total } tasks; { $complete } complete, { $partial } partial, { $unavailable } unavailable; wrote { $written } locations, { $remaining } remaining
+result-translate-summary = Translation: { $total } tasks; { $complete } complete, { $partial } partial, { $unavailable } unavailable; wrote { $written } locations, { $remaining } remaining
 result-translate-convergence = State convergence: { $retained } retained, { $invalidated } invalidated, { $not_applicable } not applicable, { $reused } reused
 result-write-back-completed = Write-back complete: { $project }
 result-project-lua-completed = Project Lua execution complete: { $project }
 result-output-directory = Output directory: { $path }
-result-write-back-standard = Standard write-back: { $translated } translated units, { $original } source units; auto-wrapped { $auto_wrapped }, inserted { $breaks } line breaks and { $indents } full-width indents; { $manual } need manual layout
-result-lua-executed = Lua: executed
-result-lua-not-executed = Lua: not executed
+result-write-back-summary = Write-back: { $translated } translated units, { $original } source units; auto-wrapped { $auto_wrapped }, inserted { $breaks } line breaks and { $indents } full-width indents; { $manual } need manual layout
+result-generic-extract-unchanged = Generic input unchanged: { $files } files, { $groups } groups, { $units } units
+result-generic-extract-updated = Generic input updated: { $files } files, { $groups } groups, { $units } units; preserved { $preserved } translations and cleared { $cleared }
+result-generic-translate-summary = Generic translation: { $total } tasks; { $complete } complete, { $partial } partial, { $unavailable } unavailable; cleared { $cleared }, reused { $reused }, accepted { $accepted }, wrote { $written }, conflicts { $conflicted }, response problems { $problems }
+result-generic-write-back-summary = Generic write-back: { $translated } translated units, { $original } source units retained
 result-cancelled = The command was cancelled after safe finalization.
 result-plan-saved = The successful run plan was saved.
-result-translate-plan-sources = This successful run plan was saved. Profile source: { $profile_source }; Lua source: { $lua_source }.
 log-run-started = Command { $command } started.
 log-run-succeeded = Command { $command } completed successfully.
 log-run-failed = Command { $command } failed.
 log-run-outcome-unknown = Command { $command } ended with an unknown final outcome; follow the recovery locations in the error.
 log-run-cancelled = Command { $command } was cancelled.
 log-performance-counters = Performance counters: SQLite transaction-control attempts { $sqlite_control_attempted_total }; full candidate-tree validations started { $candidate_validation_started }, completed { $candidate_validation_completed }.
+log-lua-script = Lua script { $identity } (SHA-256 { $fingerprint }).
+log-lua-print = Lua: { $message }
+log-lua-summary = Lua committed: database calls { $database_calls }, changed rows { $changed_rows }, translation calls { $translation_calls }, printed lines { $printed_lines }.
 log-plan-resolved = Command { $command } resolved its plan from { $source }.
 log-phase-started = Phase started: { $phase }.
 log-phase-finished = Phase finished: { $phase }.
@@ -221,7 +218,8 @@ diagnostic-action-value = { $code ->
 }
 diagnostic-failure-value = { $code ->
     [missing_required_value] A required value is missing
-    [extract_plan_required] No reusable Extract plan is saved; provide at least one of --builtin, --rules, or --lua
+    [extract_plan_required] No reusable Extract plan is saved; provide --builtin or --rules
+    [generic_extract_required] The JSONL input no longer matches the latest Extract; run att generic extract again
     [conflicting_values] The supplied values conflict
     [invalid_syntax] The value has invalid syntax
     [invalid_encoding] The value has invalid text encoding
@@ -265,8 +263,6 @@ diagnostic-failure-value = { $code ->
     [lua_execution_failed] The Lua main program failed while it was running
     [lua_host_call_failed] A Lua host capability call failed
     [lua_finalization_failed] The Lua host could not finalize all bound resources
-    [lua_unclosed_transaction] The Lua program ended with an open transaction; the transaction was rolled back
-    [lua_snapshot_store_failed] The validated Lua extraction snapshot could not be committed
     [rules_definition_invalid] The Rules program does not satisfy the Rules definition contract
     [rules_document_read_failed] A source document required by the Rules program could not be read
     [rules_no_non_blank_match] The Rules entry produced no non-blank semantic unit
@@ -281,14 +277,13 @@ diagnostic-failure-value = { $code ->
     [rules_snapshot_invalid] The extracted Rules groups do not form a valid asset snapshot
     [rules_snapshot_store_failed] The validated Rules extraction snapshot could not be committed
     [write_back_extraction_out_of_date] The extracted assets no longer match the current project source
-    [write_back_asset_snapshot_invalid] The stored Standard assets do not form a valid write-back snapshot
+    [write_back_asset_snapshot_invalid] The stored RPG Maker assets do not form a valid write-back snapshot
     [source_document_invalid] An RPG Maker source document does not satisfy the required document format
     [write_back_mutation_invalid] A validated translation mutation cannot be applied to its frozen source location
     [write_back_output_path_invalid] A rewritten file is outside the permitted RPG Maker output tree
     [write_back_output_path_duplicate] More than one rewritten file targets the same output path
     [write_back_candidate_project_mismatch] The prepared write-back candidate belongs to a different project
     [write_back_candidate_invalid] The write-back candidate does not satisfy the required data/js tree structure
-    [write_back_unexpected_lua_outcome] The Lua write-back program returned an outcome for a different Lua phase
     [write_back_not_published] The write-back candidate did not replace the current output directory
     [write_back_published_with_residuals] The output was published, but one or more recovery artifacts could not be removed
     [write_back_recovery_required] The output directory requires recovery before its contents can be trusted

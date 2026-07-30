@@ -1,4 +1,4 @@
-//! 把 Standard Mutation Plan 应用到冻结 RPG Maker 文档的候选生成服务。
+//! 把 RPG Maker Mutation Plan 应用到冻结 RPG Maker 文档的候选生成服务。
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -10,10 +10,10 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 
 use super::WriteBackProgressPhase;
-use super::standard::{
+use super::planner::{
     ReplaceChoicesMutation, ReplaceDialogueMutation, ReplaceEventBodyMutation,
-    RpgMakerWriteBackDocumentRewriter, SetTextMutation, StandardWriteBackMutation,
-    StandardWriteBackMutationPlan,
+    RpgMakerWriteBackDocumentRewriter, RpgMakerWriteBackMutation, RpgMakerWriteBackMutationPlan,
+    SetTextMutation,
 };
 use crate::diagnostic::{
     DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
@@ -26,16 +26,12 @@ use crate::json::{
     to_vec_pretty as encode_json_pretty_bytes,
 };
 use crate::progress::{NoopProgressObserver, ProgressObserver, ProgressSnapshot};
-use crate::rpg_maker::ProjectName;
+use crate::project_name::ProjectName;
 use crate::rpg_maker::extract::document::{
     RpgMakerDocumentId, RpgMakerDocumentSelection, RpgMakerProjectDocumentReader,
     RpgMakerProjectDocumentReadingDiagnostic, RpgMakerProjectDocuments,
 };
-use crate::rpg_maker::lua::document::RpgMakerTextReplacement;
-use crate::rpg_maker::model::{DialogueLinePart, MutationClaim};
-use crate::rpg_maker::plugin_document::{
-    PluginsEnvelopeFailure, parse_plugins_envelope, validate_plugins_root_is_array,
-};
+use crate::rpg_maker::model::DialogueLinePart;
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::structured_path::{
     StructuredPathAccessError, StructuredPathCodec, StructuredPathDecoder, StructuredPathError,
@@ -85,25 +81,15 @@ pub(crate) struct RpgMakerRewrittenDocuments {
     project_name: ProjectName,
     workspace_root: PathBuf,
     files: Vec<RpgMakerRewrittenFile>,
-    mutation_claims: Vec<MutationClaim>,
 }
 
 impl RpgMakerRewrittenDocuments {
-    #[cfg(test)]
     pub(super) fn new(
         project_name: ProjectName,
         workspace_root: PathBuf,
         files: Vec<RpgMakerRewrittenFile>,
     ) -> Result<Self, RpgMakerWriteBackDocumentRewriteFailure> {
-        Self::new_with_claims(project_name, workspace_root, files, Vec::new())
-    }
-
-    fn new_with_claims(
-        project_name: ProjectName,
-        workspace_root: PathBuf,
-        mut files: Vec<RpgMakerRewrittenFile>,
-        mutation_claims: Vec<MutationClaim>,
-    ) -> Result<Self, RpgMakerWriteBackDocumentRewriteFailure> {
+        let mut files = files;
         files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         let mut seen_paths = HashMap::with_capacity(files.len());
         for file in &files {
@@ -120,7 +106,6 @@ impl RpgMakerRewrittenDocuments {
             project_name,
             workspace_root,
             files,
-            mutation_claims,
         })
     }
 
@@ -129,7 +114,6 @@ impl RpgMakerRewrittenDocuments {
             project_name: project.name().clone(),
             workspace_root: project.workspace_root().to_path_buf(),
             files: Vec::new(),
-            mutation_claims: Vec::new(),
         }
     }
 
@@ -146,13 +130,8 @@ impl RpgMakerRewrittenDocuments {
         &self.files
     }
 
-    #[cfg(test)]
-    pub(crate) fn mutation_claims(&self) -> &[MutationClaim] {
-        &self.mutation_claims
-    }
-
-    pub(crate) fn into_files_and_claims(self) -> (Vec<RpgMakerRewrittenFile>, Vec<MutationClaim>) {
-        (self.files, self.mutation_claims)
+    pub(crate) fn into_files(self) -> Vec<RpgMakerRewrittenFile> {
+        self.files
     }
 }
 
@@ -242,7 +221,7 @@ where
     async fn rewrite(
         &self,
         project: &OpenedProject,
-        plan: StandardWriteBackMutationPlan,
+        plan: RpgMakerWriteBackMutationPlan,
     ) -> Result<Self::RewrittenDocuments, Self::Error> {
         let progress = Arc::clone(&self.progress);
         if plan.mutations().is_empty() {
@@ -271,7 +250,6 @@ where
             project_name,
             workspace_root,
             jobs,
-            mutation_claims,
         } = prepared.map_err(RpgMakerWriteBackDocumentRewritingError::Rewrite)?;
         let total_documents = u64::try_from(jobs.len()).expect("写回文档数量必须可表示为 u64");
         progress.observe(ProgressSnapshot::determinate(
@@ -302,12 +280,7 @@ where
                     .into_iter()
                     .flatten()
                     .collect();
-                RpgMakerRewrittenDocuments::new_with_claims(
-                    project_name,
-                    workspace_root,
-                    files,
-                    mutation_claims,
-                )
+                RpgMakerRewrittenDocuments::new(project_name, workspace_root, files)
             })
             .await
             .map_err(RpgMakerWriteBackDocumentRewritingError::ScheduleRewrite)?
@@ -315,14 +288,14 @@ where
     }
 }
 
-fn selection_for_plan(plan: &StandardWriteBackMutationPlan) -> RpgMakerDocumentSelection {
+fn selection_for_plan(plan: &RpgMakerWriteBackMutationPlan) -> RpgMakerDocumentSelection {
     let mut selection = RpgMakerDocumentSelection::empty();
     for mutation in plan.mutations() {
         match mutation {
-            StandardWriteBackMutation::SetText(mutation) => {
+            RpgMakerWriteBackMutation::SetText(mutation) => {
                 select_source(&mut selection, mutation.exact_location().source());
             }
-            StandardWriteBackMutation::ReplaceDialogue(mutation) => {
+            RpgMakerWriteBackMutation::ReplaceDialogue(mutation) => {
                 select_source(&mut selection, mutation.group_location().source());
                 if let Some(speaker) = mutation.recipe().direct_speaker() {
                     select_source(&mut selection, speaker.physical_location().source());
@@ -331,13 +304,13 @@ fn selection_for_plan(plan: &StandardWriteBackMutationPlan) -> RpgMakerDocumentS
                     select_source(&mut selection, line.physical_location().source());
                 }
             }
-            StandardWriteBackMutation::ReplaceChoices(mutation) => {
+            RpgMakerWriteBackMutation::ReplaceChoices(mutation) => {
                 select_source(&mut selection, mutation.group_location().source());
                 for recipe in mutation.recipes() {
                     select_source(&mut selection, recipe.target().source());
                 }
             }
-            StandardWriteBackMutation::ReplaceEventBody(mutation) => {
+            RpgMakerWriteBackMutation::ReplaceEventBody(mutation) => {
                 select_source(&mut selection, mutation.group_location().source());
                 for segment in mutation.segments() {
                     select_source(&mut selection, segment.exact_location().source());
@@ -441,20 +414,6 @@ impl TextValueMutation for SetTextMutation {
     }
 }
 
-impl TextValueMutation for RpgMakerTextReplacement {
-    fn exact_location(&self) -> &RpgMakerLocation {
-        self.reference().location()
-    }
-
-    fn expected_original(&self) -> &str {
-        self.reference().original()
-    }
-
-    fn replacement(&self) -> &str {
-        self.replacement()
-    }
-}
-
 #[derive(Clone, Copy)]
 struct IndexedValueMutation<'a> {
     ordinal: usize,
@@ -514,7 +473,7 @@ enum PhysicalDocumentKey {
 
 struct DocumentRewriteJob {
     documents: MutableDocuments,
-    mutations: Vec<StandardWriteBackMutation>,
+    mutations: Vec<RpgMakerWriteBackMutation>,
 }
 
 struct ProgressTrackedRewriteJob {
@@ -528,19 +487,16 @@ struct PreparedDocumentRewrite {
     project_name: ProjectName,
     workspace_root: PathBuf,
     jobs: Vec<DocumentRewriteJob>,
-    mutation_claims: Vec<MutationClaim>,
 }
 
 fn prepare_rewrite_jobs(
     project_name: ProjectName,
     workspace_root: PathBuf,
     documents: RpgMakerProjectDocuments,
-    plan: StandardWriteBackMutationPlan,
+    plan: RpgMakerWriteBackMutationPlan,
 ) -> Result<PreparedDocumentRewrite, RpgMakerWriteBackDocumentRewriteFailure> {
     validate_structural_conflicts(plan.mutations())?;
-    let mutation_claims = plan.cloned_mutation_claims();
-
-    let mut partitions = BTreeMap::<PhysicalDocumentKey, Vec<StandardWriteBackMutation>>::new();
+    let mut partitions = BTreeMap::<PhysicalDocumentKey, Vec<RpgMakerWriteBackMutation>>::new();
     for mutation in plan.into_mutations() {
         let key = mutation_document_key(&mutation)?;
         partitions.entry(key).or_default().push(mutation);
@@ -582,16 +538,15 @@ fn prepare_rewrite_jobs(
         project_name,
         workspace_root,
         jobs,
-        mutation_claims,
     })
 }
 
 fn mutation_document_key(
-    mutation: &StandardWriteBackMutation,
+    mutation: &RpgMakerWriteBackMutation,
 ) -> Result<PhysicalDocumentKey, RpgMakerWriteBackDocumentRewriteFailure> {
     let (location, other_locations): (&RpgMakerLocation, Vec<&RpgMakerLocation>) = match mutation {
-        StandardWriteBackMutation::SetText(mutation) => (mutation.exact_location(), Vec::new()),
-        StandardWriteBackMutation::ReplaceDialogue(mutation) => {
+        RpgMakerWriteBackMutation::SetText(mutation) => (mutation.exact_location(), Vec::new()),
+        RpgMakerWriteBackMutation::ReplaceDialogue(mutation) => {
             let mut locations = mutation
                 .recipe()
                 .lines()
@@ -603,7 +558,7 @@ fn mutation_document_key(
             }
             (mutation.group_location(), locations)
         }
-        StandardWriteBackMutation::ReplaceChoices(mutation) => (
+        RpgMakerWriteBackMutation::ReplaceChoices(mutation) => (
             mutation.group_location(),
             mutation
                 .recipes()
@@ -611,7 +566,7 @@ fn mutation_document_key(
                 .map(|recipe| recipe.target())
                 .collect(),
         ),
-        StandardWriteBackMutation::ReplaceEventBody(mutation) => (
+        RpgMakerWriteBackMutation::ReplaceEventBody(mutation) => (
             mutation.group_location(),
             mutation
                 .segments()
@@ -636,220 +591,28 @@ fn physical_document_key(source: &RpgMakerSource) -> PhysicalDocumentKey {
     document_id(source).map_or(PhysicalDocumentKey::Plugins, PhysicalDocumentKey::Json)
 }
 
-/// 把同一候选物理文档中的结构化文本引用完整替换并重新编码。
-///
-/// 所有修改都先在内存副本中完成并通过重读；调用方只有在本函数成功后才应写入
-/// 返回的完整文件。跨文件批次由上层先全部调用成功，再开始任何候选写入。
-pub(crate) fn rewrite_referenced_texts(
-    bytes: &[u8],
-    replacements: &[RpgMakerTextReplacement],
-) -> Result<RpgMakerRewrittenFile, RpgMakerReferencedTextRewriteError> {
-    let key = referenced_text_document_key(replacements)?;
-    let mut documents = parse_referenced_text_document(bytes, &key, replacements)?;
-    let mutations = replacements
-        .iter()
-        .enumerate()
-        .map(|(ordinal, replacement)| (ordinal, replacement as &dyn TextValueMutation))
-        .collect::<Vec<_>>();
-    apply_value_mutations(&mut documents, &mutations)
-        .map_err(RpgMakerReferencedTextRewriteError::Rewrite)?;
-
-    let expected_path = physical_document_relative_path(&key);
-    let mut rewritten = serialize_rewritten_files(documents)
-        .map_err(RpgMakerReferencedTextRewriteError::Rewrite)?;
-    if rewritten.len() != 1 {
-        return Err(RpgMakerReferencedTextRewriteError::UnexpectedFileCount {
-            path: expected_path,
-            actual: rewritten.len(),
-        });
-    }
-    let file = rewritten.pop().expect("长度已经确认恰好为一");
-    if file.relative_path != expected_path {
-        return Err(RpgMakerReferencedTextRewriteError::UnexpectedOutputPath {
-            expected: expected_path,
-            actual: file.relative_path,
-        });
-    }
-    verify_referenced_texts(&file.bytes, replacements)?;
-    Ok(file)
-}
-
-/// 从候选文件重新解析所有 codec 层，并逐字确认最终 replacement。
-pub(crate) fn verify_referenced_texts(
-    bytes: &[u8],
-    replacements: &[RpgMakerTextReplacement],
-) -> Result<(), RpgMakerReferencedTextRewriteError> {
-    let key = referenced_text_document_key(replacements)?;
-    let mut documents = parse_referenced_text_document(bytes, &key, replacements)?;
-    for replacement in replacements {
-        verify_referenced_text(&mut documents, replacement)
-            .map_err(RpgMakerReferencedTextRewriteError::Rewrite)?;
-    }
-    Ok(())
-}
-
-fn referenced_text_document_key(
-    replacements: &[RpgMakerTextReplacement],
-) -> Result<PhysicalDocumentKey, RpgMakerReferencedTextRewriteError> {
-    let Some(first) = replacements.first() else {
-        return Err(RpgMakerReferencedTextRewriteError::EmptyBatch);
-    };
-    let first = physical_document_key(first.reference().location().source());
-    for replacement in &replacements[1..] {
-        let candidate = physical_document_key(replacement.reference().location().source());
-        if candidate != first {
-            return Err(
-                RpgMakerReferencedTextRewriteError::MultiplePhysicalDocuments {
-                    first: physical_document_relative_path(&first),
-                    conflicting: physical_document_relative_path(&candidate),
-                },
-            );
-        }
-    }
-    Ok(first)
-}
-
-fn physical_document_relative_path(key: &PhysicalDocumentKey) -> PathBuf {
-    match key {
-        PhysicalDocumentKey::Json(id) => relative_document_path(id),
-        PhysicalDocumentKey::Plugins => PathBuf::from("js").join("plugins.js"),
-    }
-}
-
-fn parse_referenced_text_document(
-    bytes: &[u8],
-    key: &PhysicalDocumentKey,
-    replacements: &[RpgMakerTextReplacement],
-) -> Result<MutableDocuments, RpgMakerReferencedTextRewriteError> {
-    let path = physical_document_relative_path(key);
-    let text = std::str::from_utf8(bytes).map_err(|source| {
-        RpgMakerReferencedTextRewriteError::InvalidUtf8 {
-            path: path.clone(),
-            source,
-        }
-    })?;
-    match key {
-        PhysicalDocumentKey::Json(id) => {
-            let value = parse_json(text).map_err(|source| {
-                RpgMakerReferencedTextRewriteError::InvalidJson {
-                    path: path.clone(),
-                    source,
-                }
-            })?;
-            Ok(MutableDocuments::from_document(id.clone(), value))
-        }
-        PhysicalDocumentKey::Plugins => {
-            let envelope = parse_plugins_envelope(text).map_err(|failure| {
-                RpgMakerReferencedTextRewriteError::InvalidPluginsEnvelope {
-                    path: path.clone(),
-                    failure,
-                }
-            })?;
-            let values = parse_json(envelope.json()).map_err(|source| {
-                RpgMakerReferencedTextRewriteError::InvalidJson {
-                    path: path.clone(),
-                    source,
-                }
-            })?;
-            validate_plugins_root_is_array(values.is_array()).map_err(|failure| {
-                RpgMakerReferencedTextRewriteError::InvalidPluginsEnvelope {
-                    path: path.clone(),
-                    failure,
-                }
-            })?;
-            let Value::Array(values) = values.into_inner() else {
-                unreachable!("已检查 plugins.js assignment 根是 array")
-            };
-            let values = values
-                .into_iter()
-                .map(StackSafeJsonValue::new)
-                .collect::<Vec<_>>();
-            let mut plugins = Vec::with_capacity(values.len());
-            for (index, value) in values.into_iter().enumerate() {
-                if !value.is_object() {
-                    return Err(RpgMakerReferencedTextRewriteError::InvalidPluginRecord {
-                        path,
-                        index,
-                    });
-                }
-                plugins.push((index, value));
-            }
-
-            // 每个插件参数来源都必须仍指向当前物理 plugins.js；这里不依赖第一个
-            // replacement 的参数身份来解释同文件内的其他 replacement。
-            debug_assert!(replacements.iter().all(|replacement| matches!(
-                replacement.reference().location().source(),
-                RpgMakerSource::PluginParameter { .. }
-            )));
-            Ok(MutableDocuments::from_plugins(
-                plugins,
-                envelope.prefix().to_owned(),
-            ))
-        }
-    }
-}
-
-fn verify_referenced_text(
-    documents: &mut MutableDocuments,
-    replacement: &RpgMakerTextReplacement,
-) -> Result<(), RpgMakerWriteBackDocumentRewriteFailure> {
-    let location = replacement.reference().location();
-    let verify = |value: &mut Value| {
-        let actual = value
-            .as_str()
-            .ok_or_else(|| mutation_failure(location, "重读目标值不是字符串"))?;
-        if actual != replacement.replacement() {
-            return Err(mutation_failure(
-                location,
-                "候选重读值与 replacement 不一致",
-            ));
-        }
-        Ok(())
-    };
-    match location.source() {
-        RpgMakerSource::Data(_) | RpgMakerSource::DataFile(_) | RpgMakerSource::Map(_) => {
-            let (document, _) = documents.document_mut(location.source(), location)?;
-            edit_value_at_steps(document, location.steps(), location, verify)
-        }
-        RpgMakerSource::PluginParameter {
-            plugin_index,
-            plugin_name,
-            parameter_name,
-        } => {
-            let parameter = plugin_parameter_mut(
-                &mut documents.plugins,
-                *plugin_index,
-                plugin_name,
-                parameter_name,
-                location,
-            )?;
-            edit_value_at_steps(parameter, location.steps(), location, verify)
-        }
-    }
-}
-
-fn mutation_location(mutation: &StandardWriteBackMutation) -> &RpgMakerLocation {
+fn mutation_location(mutation: &RpgMakerWriteBackMutation) -> &RpgMakerLocation {
     match mutation {
-        StandardWriteBackMutation::SetText(mutation) => mutation.exact_location(),
-        StandardWriteBackMutation::ReplaceDialogue(mutation) => mutation.group_location(),
-        StandardWriteBackMutation::ReplaceChoices(mutation) => mutation.group_location(),
-        StandardWriteBackMutation::ReplaceEventBody(mutation) => mutation.group_location(),
+        RpgMakerWriteBackMutation::SetText(mutation) => mutation.exact_location(),
+        RpgMakerWriteBackMutation::ReplaceDialogue(mutation) => mutation.group_location(),
+        RpgMakerWriteBackMutation::ReplaceChoices(mutation) => mutation.group_location(),
+        RpgMakerWriteBackMutation::ReplaceEventBody(mutation) => mutation.group_location(),
     }
 }
 
 fn validate_structural_conflicts(
-    mutations: &[StandardWriteBackMutation],
+    mutations: &[RpgMakerWriteBackMutation],
 ) -> Result<(), RpgMakerWriteBackDocumentRewriteFailure> {
     let mut structural = Vec::<(StructuralKey, &RpgMakerLocation)>::new();
     for mutation in mutations {
         match mutation {
-            StandardWriteBackMutation::SetText(_) => {}
-            StandardWriteBackMutation::ReplaceDialogue(mutation) => structural.push((
+            RpgMakerWriteBackMutation::SetText(_) => {}
+            RpgMakerWriteBackMutation::ReplaceDialogue(mutation) => structural.push((
                 dialogue_structural_key(mutation)?,
                 mutation.group_location(),
             )),
-            StandardWriteBackMutation::ReplaceChoices(_) => {}
-            StandardWriteBackMutation::ReplaceEventBody(mutation) => {
+            RpgMakerWriteBackMutation::ReplaceChoices(_) => {}
+            RpgMakerWriteBackMutation::ReplaceEventBody(mutation) => {
                 structural.push((event_structural_key(mutation)?, mutation.group_location()))
             }
         }
@@ -904,7 +667,7 @@ fn rewrite_document_with_progress(
 
 fn apply_mutations(
     documents: &mut MutableDocuments,
-    mutations: &[StandardWriteBackMutation],
+    mutations: &[RpgMakerWriteBackMutation],
 ) -> Result<(), RpgMakerWriteBackDocumentRewriteFailure> {
     let mut value_mutations = Vec::new();
     let mut event_mutations = Vec::new();
@@ -913,14 +676,14 @@ fn apply_mutations(
 
     for (ordinal, mutation) in mutations.iter().enumerate() {
         match mutation {
-            StandardWriteBackMutation::SetText(mutation) => {
+            RpgMakerWriteBackMutation::SetText(mutation) => {
                 value_mutations.push((ordinal, mutation as &dyn TextValueMutation))
             }
-            StandardWriteBackMutation::ReplaceDialogue(mutation) => {
+            RpgMakerWriteBackMutation::ReplaceDialogue(mutation) => {
                 dialogue_mutations.push(mutation)
             }
-            StandardWriteBackMutation::ReplaceChoices(mutation) => choices_mutations.push(mutation),
-            StandardWriteBackMutation::ReplaceEventBody(mutation) => event_mutations.push(mutation),
+            RpgMakerWriteBackMutation::ReplaceChoices(mutation) => choices_mutations.push(mutation),
+            RpgMakerWriteBackMutation::ReplaceEventBody(mutation) => event_mutations.push(mutation),
         }
     }
 
@@ -951,13 +714,12 @@ fn rewrite_documents(
     project_name: ProjectName,
     workspace_root: PathBuf,
     documents: RpgMakerProjectDocuments,
-    plan: StandardWriteBackMutationPlan,
+    plan: RpgMakerWriteBackMutationPlan,
 ) -> Result<RpgMakerRewrittenDocuments, RpgMakerWriteBackDocumentRewriteFailure> {
     let PreparedDocumentRewrite {
         project_name,
         workspace_root,
         jobs,
-        mutation_claims,
     } = prepare_rewrite_jobs(project_name, workspace_root, documents, plan)?;
     let files = jobs
         .into_iter()
@@ -966,12 +728,7 @@ fn rewrite_documents(
         .into_iter()
         .flatten()
         .collect();
-    RpgMakerRewrittenDocuments::new_with_claims(
-        project_name,
-        workspace_root,
-        files,
-        mutation_claims,
-    )
+    RpgMakerRewrittenDocuments::new(project_name, workspace_root, files)
 }
 
 fn compare_structural_operations(
@@ -2516,103 +2273,6 @@ where
     }
 }
 
-/// Lua 高级文本替换无法从一个候选物理文档完成完整往返。
-#[derive(Debug)]
-pub(crate) enum RpgMakerReferencedTextRewriteError {
-    EmptyBatch,
-    MultiplePhysicalDocuments {
-        first: PathBuf,
-        conflicting: PathBuf,
-    },
-    InvalidUtf8 {
-        path: PathBuf,
-        source: std::str::Utf8Error,
-    },
-    InvalidJson {
-        path: PathBuf,
-        source: StackSafeJsonError,
-    },
-    InvalidPluginsEnvelope {
-        path: PathBuf,
-        failure: PluginsEnvelopeFailure,
-    },
-    InvalidPluginRecord {
-        path: PathBuf,
-        index: usize,
-    },
-    Rewrite(RpgMakerWriteBackDocumentRewriteFailure),
-    UnexpectedFileCount {
-        path: PathBuf,
-        actual: usize,
-    },
-    UnexpectedOutputPath {
-        expected: PathBuf,
-        actual: PathBuf,
-    },
-}
-
-impl fmt::Display for RpgMakerReferencedTextRewriteError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyBatch => formatter.write_str("结构化文本替换批次不能为空"),
-            Self::MultiplePhysicalDocuments { first, conflicting } => write!(
-                formatter,
-                "单个文档改写请求包含不同物理文件（{} 与 {}）",
-                first.display(),
-                conflicting.display()
-            ),
-            Self::InvalidUtf8 { path, .. } => {
-                write!(formatter, "候选文档 {} 不是有效 UTF-8", path.display())
-            }
-            Self::InvalidJson { path, source } => {
-                write!(
-                    formatter,
-                    "候选文档 {} 不是有效 JSON：{source}",
-                    path.display()
-                )
-            }
-            Self::InvalidPluginsEnvelope { path, failure } => write!(
-                formatter,
-                "候选文档 {} 不是有效 RPG Maker plugins.js：{failure}",
-                path.display()
-            ),
-            Self::InvalidPluginRecord { path, index } => write!(
-                formatter,
-                "候选文档 {} 的插件记录 {index} 不是对象",
-                path.display()
-            ),
-            Self::Rewrite(source) => write!(formatter, "结构化文本替换失败：{source}"),
-            Self::UnexpectedFileCount { path, actual } => write!(
-                formatter,
-                "结构化文本替换应只产生候选文件 {}，实际产生 {actual} 个文件",
-                path.display()
-            ),
-            Self::UnexpectedOutputPath { expected, actual } => write!(
-                formatter,
-                "结构化文本替换产生了错误候选路径（期望：{}，实际：{}）",
-                expected.display(),
-                actual.display()
-            ),
-        }
-    }
-}
-
-impl Error for RpgMakerReferencedTextRewriteError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::InvalidUtf8 { source, .. } => Some(source),
-            Self::InvalidJson { source, .. } => Some(source),
-            Self::Rewrite(source) => Some(source),
-            Self::EmptyBatch
-            | Self::MultiplePhysicalDocuments { .. }
-            | Self::InvalidPluginsEnvelope { .. }
-            | Self::InvalidPluginRecord { .. }
-            | Self::UnexpectedFileCount { .. }
-            | Self::UnexpectedOutputPath { .. } => None,
-        }
-    }
-}
-
 /// 已读取文档与 Mutation Plan 无法共同建立完整候选。
 #[derive(Debug)]
 pub(crate) enum RpgMakerWriteBackDocumentRewriteFailure {
@@ -2857,15 +2517,14 @@ mod tests {
     use crate::rpg_maker::extract::document::{
         PluginConfiguration, parse_json_document_for_test, parse_plugins_document_for_test,
     };
-    use crate::rpg_maker::lua::document::{OpenedRpgMakerDocument, RpgMakerTextReference};
     use crate::rpg_maker::model::{
         DialogueLinePart, DialogueLineRecipe, DialogueWriteRecipe, DirectSpeakerTarget,
         DirectTextPart, DirectTextRecipe, TextUnitRole,
     };
     use crate::rpg_maker::project::test_layout_profile;
     use crate::rpg_maker::text::{MapId, StandardDataFile};
-    use crate::rpg_maker::write_back::standard::{
-        EventBodyMutationSegment, RpgMakerWriteBackLaidOutLine, StandardWriteBackMutation,
+    use crate::rpg_maker::write_back::planner::{
+        EventBodyMutationSegment, RpgMakerWriteBackLaidOutLine, RpgMakerWriteBackMutation,
     };
 
     #[test]
@@ -3146,7 +2805,7 @@ mod tests {
             .with_progress(progress.clone());
 
         let candidate = service
-            .rewrite(&project, StandardWriteBackMutationPlan::empty())
+            .rewrite(&project, RpgMakerWriteBackMutationPlan::empty())
             .await
             .expect("空计划应该直接成功");
 
@@ -3623,9 +3282,6 @@ mod tests {
                 "outside": true
             }
         ]);
-        let frozen = serde_json::to_vec(&document).expect("冻结文档应可编码");
-        let opened = OpenedRpgMakerDocument::open(source.clone(), &frozen)
-            .expect("Lua Extract 应能打开冻结文档");
         let text_steps = vec![
             RpgMakerLocationStep::index(1),
             RpgMakerLocationStep::key("payload"),
@@ -3634,10 +3290,6 @@ mod tests {
             RpgMakerLocationStep::DecodeJsonString,
             RpgMakerLocationStep::key("note"),
         ];
-        let reference = opened
-            .text(&text_steps)
-            .expect("Lua Extract 应能建立双层 decoded Value 引用");
-        assert_eq!(reference.original(), "<Help:旧帮助>");
         let documents = RpgMakerProjectDocuments::new(
             BTreeMap::from([(RpgMakerDocumentId::Data(StandardDataFile::Items), document)]),
             Vec::new(),
@@ -3647,7 +3299,11 @@ mod tests {
             project_name(),
             workspace_root(),
             documents,
-            plan(vec![set_text_reference(&reference, "<Help:新帮助>>")]),
+            plan(vec![set_text(
+                RpgMakerLocation::value(source, text_steps),
+                "<Help:旧帮助>",
+                "<Help:新帮助>>",
+            )]),
         )
         .expect("双层 decoded Value 应可逐字写回");
 
@@ -3668,9 +3324,6 @@ mod tests {
             "payload": " { \"events\" : [{\"list\":[{\"code\":108,\"indent\":2,\"parameters\":[\"<Quest:第一\"],\"unknown\":\"first\"},{\"code\":408,\"indent\":2,\"parameters\":[\"行>\"],\"unknown\":\"continued\"},{\"code\":0,\"indent\":2,\"parameters\":[]}]}], \"kept\" : \"勇者\" } ",
             "outside": 9
         });
-        let frozen = serde_json::to_vec(&document).expect("冻结文档应可编码");
-        let opened = OpenedRpgMakerDocument::open(source.clone(), &frozen)
-            .expect("Lua Extract 应能打开冻结 Map");
         let command_steps = vec![
             RpgMakerLocationStep::key("payload"),
             RpgMakerLocationStep::DecodeJsonString,
@@ -3678,21 +3331,15 @@ mod tests {
             RpgMakerLocationStep::index(0),
             RpgMakerLocationStep::key("list"),
         ];
-        let text_reference = |command_index| {
+        let text_location = |command_index| {
             let mut steps = command_steps.clone();
             steps.extend([
                 RpgMakerLocationStep::index(command_index),
                 RpgMakerLocationStep::key("parameters"),
                 RpgMakerLocationStep::index(0),
             ]);
-            opened
-                .text(&steps)
-                .expect("Lua Extract 应能建立 decoded Value 引用")
+            RpgMakerLocation::value(source.clone(), steps)
         };
-        let first = text_reference(0);
-        let continued = text_reference(1);
-        assert_eq!(first.original(), "<Quest:第一");
-        assert_eq!(continued.original(), "行>");
         let documents = RpgMakerProjectDocuments::new(
             BTreeMap::from([(RpgMakerDocumentId::Map(MapId::new(8).unwrap()), document)]),
             Vec::new(),
@@ -3703,8 +3350,8 @@ mod tests {
             workspace_root(),
             documents,
             plan(vec![
-                set_text_reference(&first, "<Quest:已译"),
-                set_text_reference(&continued, "完成>>"),
+                set_text(text_location(0), "<Quest:第一", "<Quest:已译"),
+                set_text(text_location(1), "行>", "完成>>"),
             ]),
         )
         .expect("decoded 108/408 的完整值应可写回");
@@ -3835,7 +3482,7 @@ mod tests {
         let plan = plan(vec![
             set_text(segment_location(3), "<Tag:旧", "<Tag:新"),
             set_text(segment_location(4), "值><Tag:二>", "值><Tag:第二>>"),
-            StandardWriteBackMutation::ReplaceDialogue(body),
+            RpgMakerWriteBackMutation::ReplaceDialogue(body),
         ]);
 
         reset_structural_list_rebuild_count();
@@ -4031,7 +3678,7 @@ mod tests {
                 project_name(),
                 workspace_root(),
                 documents,
-                plan(vec![StandardWriteBackMutation::ReplaceDialogue(mutation)]),
+                plan(vec![RpgMakerWriteBackMutation::ReplaceDialogue(mutation)]),
             )
             .expect("完整正文应按模型语义行数原子重建");
             let map: Value =
@@ -4130,7 +3777,7 @@ mod tests {
             project_name(),
             workspace_root(),
             documents,
-            plan(vec![StandardWriteBackMutation::ReplaceDialogue(mutation)]),
+            plan(vec![RpgMakerWriteBackMutation::ReplaceDialogue(mutation)]),
         )
         .expect("MV inline 对话应能原子重建");
         let map: Value = serde_json::from_str(file_text(&candidate, Path::new("data/Map008.json")))
@@ -4229,7 +3876,7 @@ mod tests {
             project_name(),
             workspace_root(),
             documents("台词", false),
-            plan(vec![StandardWriteBackMutation::ReplaceDialogue(mutation())]),
+            plan(vec![RpgMakerWriteBackMutation::ReplaceDialogue(mutation())]),
         )
         .expect("精确首行 Speaker 应可写回");
         let map: Value =
@@ -4245,7 +3892,7 @@ mod tests {
                 project_name(),
                 workspace_root(),
                 documents,
-                plan(vec![StandardWriteBackMutation::ReplaceDialogue(mutation())]),
+                plan(vec![RpgMakerWriteBackMutation::ReplaceDialogue(mutation())]),
             )
             .expect_err("来源或块长度漂移必须失败");
             assert!(matches!(
@@ -4349,8 +3996,8 @@ mod tests {
             workspace_root(),
             documents,
             plan(vec![
-                StandardWriteBackMutation::ReplaceChoices(mutation),
-                StandardWriteBackMutation::ReplaceEventBody(event_mutation),
+                RpgMakerWriteBackMutation::ReplaceChoices(mutation),
+                RpgMakerWriteBackMutation::ReplaceEventBody(event_mutation),
             ]),
         )
         .expect("选项头、分支标签与同 list 事件正文应能原子同步");
@@ -4400,7 +4047,7 @@ mod tests {
             )],
         )
         .expect("滚动文本 Mutation 应该合法");
-        let mutation_plan = plan(vec![StandardWriteBackMutation::ReplaceEventBody(mutation)]);
+        let mutation_plan = plan(vec![RpgMakerWriteBackMutation::ReplaceEventBody(mutation)]);
         let documents_with_code = |body_code| {
             RpgMakerProjectDocuments::new(
                 BTreeMap::from([(
@@ -4506,7 +4153,7 @@ mod tests {
             project_name(),
             workspace_root(),
             documents,
-            plan(vec![StandardWriteBackMutation::ReplaceEventBody(mutation)]),
+            plan(vec![RpgMakerWriteBackMutation::ReplaceEventBody(mutation)]),
         )
         .expect_err("无法证明正文块边界时必须拒绝改写");
 
@@ -4678,181 +4325,6 @@ mod tests {
     }
 
     #[test]
-    fn referenced_text_rewrite_preserves_full_text_through_nested_json_codecs() {
-        let source = RpgMakerSource::data(StandardDataFile::Items);
-        let input =
-            r#"[null,{"plain":"原文","payload":"{\"left\":\"左\",\"deep\":\"{\\\"value\\\":\\\"深\\\"}\"}"}]"#
-                .as_bytes();
-        let document = OpenedRpgMakerDocument::open(source, input).unwrap();
-        let plain_steps = vec![
-            RpgMakerLocationStep::index(1),
-            RpgMakerLocationStep::key("plain"),
-        ];
-        let left_steps = vec![
-            RpgMakerLocationStep::index(1),
-            RpgMakerLocationStep::key("payload"),
-            RpgMakerLocationStep::DecodeJsonString,
-            RpgMakerLocationStep::key("left"),
-        ];
-        let deep_steps = vec![
-            RpgMakerLocationStep::index(1),
-            RpgMakerLocationStep::key("payload"),
-            RpgMakerLocationStep::DecodeJsonString,
-            RpgMakerLocationStep::key("deep"),
-            RpgMakerLocationStep::DecodeJsonString,
-            RpgMakerLocationStep::key("value"),
-        ];
-        let plain = "真实换行\n字面反斜杠 n：\\n；引号：\"；反斜杠：\\";
-        let left = "左侧\t控制符和😀";
-        let deep = "深层\r\n第二行";
-        let replacements = vec![
-            RpgMakerTextReplacement::new(document.text(&plain_steps).unwrap(), plain.to_owned()),
-            RpgMakerTextReplacement::new(document.text(&left_steps).unwrap(), left.to_owned()),
-            RpgMakerTextReplacement::new(document.text(&deep_steps).unwrap(), deep.to_owned()),
-        ];
-
-        let rewritten = rewrite_referenced_texts(input, &replacements)
-            .expect("全部结构化位置应完成改写和内存重读");
-        assert_eq!(rewritten.relative_path(), Path::new("data/Items.json"));
-        verify_referenced_texts(rewritten.bytes(), &replacements)
-            .expect("序列化后的每一层 codec 都应逐字恢复 replacement");
-        let repeated = rewrite_referenced_texts(input, &replacements)
-            .expect("相同冻结来源和 replacement 应可重复改写");
-        assert_eq!(
-            repeated.bytes(),
-            rewritten.bytes(),
-            "重复 WriteBack 必须产生字节稳定的结构化候选"
-        );
-
-        let reopened = OpenedRpgMakerDocument::open(
-            RpgMakerSource::data(StandardDataFile::Items),
-            rewritten.bytes(),
-        )
-        .unwrap();
-        assert_eq!(reopened.text(&plain_steps).unwrap().original(), plain);
-        assert_eq!(reopened.text(&left_steps).unwrap().original(), left);
-        assert_eq!(reopened.text(&deep_steps).unwrap().original(), deep);
-    }
-
-    #[test]
-    fn referenced_text_rewrite_handles_multiple_plugin_parameters_in_one_file() {
-        let input = r#"// generated
-var $plugins = [{"name":"Quest","status":true,"parameters":{"Entries":"[{\"Title\":\"标题\"}]","Help":"{\"Text\":\"说明\"}"}}];"#
-            .as_bytes();
-        let title_source = RpgMakerSource::plugin_parameter(0, "Quest", "Entries");
-        let help_source = RpgMakerSource::plugin_parameter(0, "Quest", "Help");
-        let title_steps = vec![
-            RpgMakerLocationStep::DecodeJsonString,
-            RpgMakerLocationStep::index(0),
-            RpgMakerLocationStep::key("Title"),
-        ];
-        let help_steps = vec![
-            RpgMakerLocationStep::DecodeJsonString,
-            RpgMakerLocationStep::key("Text"),
-        ];
-        let title_document =
-            OpenedRpgMakerDocument::open(title_source, input).expect("Entries 参数应能打开");
-        let help_document =
-            OpenedRpgMakerDocument::open(help_source, input).expect("Help 参数应能打开");
-        let replacements = vec![
-            RpgMakerTextReplacement::new(
-                title_document.text(&title_steps).unwrap(),
-                "任务\\n标题".to_owned(),
-            ),
-            RpgMakerTextReplacement::new(
-                help_document.text(&help_steps).unwrap(),
-                "第一行\n第二行".to_owned(),
-            ),
-        ];
-
-        let rewritten = rewrite_referenced_texts(input, &replacements)
-            .expect("同一 plugins.js 内的多个参数应在一个物理文件中完成改写");
-        assert_eq!(rewritten.relative_path(), Path::new("js/plugins.js"));
-        assert!(
-            std::str::from_utf8(rewritten.bytes())
-                .unwrap()
-                .starts_with("// generated\nvar $plugins = ")
-        );
-        verify_referenced_texts(rewritten.bytes(), &replacements)
-            .expect("插件参数应按各自来源重读");
-    }
-
-    #[test]
-    fn referenced_text_rewrite_rejects_candidate_original_drift() {
-        let frozen = r#"[null,{"name":"冻结原文"}]"#.as_bytes();
-        let current = r#"[null,{"name":"Standard 已修改"}]"#.as_bytes();
-        let document =
-            OpenedRpgMakerDocument::open(RpgMakerSource::data(StandardDataFile::Items), frozen)
-                .unwrap();
-        let replacement = RpgMakerTextReplacement::new(
-            document
-                .text(&[
-                    RpgMakerLocationStep::index(1),
-                    RpgMakerLocationStep::key("name"),
-                ])
-                .unwrap(),
-            "Lua 译文".to_owned(),
-        );
-
-        assert!(matches!(
-            rewrite_referenced_texts(current, &[replacement]),
-            Err(RpgMakerReferencedTextRewriteError::Rewrite(
-                RpgMakerWriteBackDocumentRewriteFailure::InvalidMutation { .. }
-            ))
-        ));
-    }
-
-    #[test]
-    fn rewritten_documents_carry_standard_mutation_claims_to_the_candidate_boundary() {
-        let location = RpgMakerLocation::value(
-            RpgMakerSource::data(StandardDataFile::Items),
-            vec![
-                RpgMakerLocationStep::index(1),
-                RpgMakerLocationStep::key("name"),
-            ],
-        );
-        let expected_claim = MutationClaim::for_location(location.clone());
-        let documents = parse_json_document_for_test(
-            RpgMakerDocumentId::Data(StandardDataFile::Items),
-            r#"[null,{"name":"原文"}]"#,
-        );
-
-        let rewritten = rewrite_documents(
-            project_name(),
-            workspace_root(),
-            documents,
-            plan(vec![set_text(location, "原文", "译文")]),
-        )
-        .expect("Standard 候选应建立");
-
-        assert_eq!(rewritten.mutation_claims(), &[expected_claim]);
-    }
-
-    #[test]
-    fn referenced_text_verification_detects_a_tampered_candidate() {
-        let frozen = r#"[null,{"name":"原文"}]"#.as_bytes();
-        let document =
-            OpenedRpgMakerDocument::open(RpgMakerSource::data(StandardDataFile::Items), frozen)
-                .unwrap();
-        let replacement = RpgMakerTextReplacement::new(
-            document
-                .text(&[
-                    RpgMakerLocationStep::index(1),
-                    RpgMakerLocationStep::key("name"),
-                ])
-                .unwrap(),
-            "期望译文".to_owned(),
-        );
-
-        assert!(matches!(
-            verify_referenced_texts(r#"[null,{"name":"被篡改"}]"#.as_bytes(), &[replacement]),
-            Err(RpgMakerReferencedTextRewriteError::Rewrite(
-                RpgMakerWriteBackDocumentRewriteFailure::InvalidMutation { .. }
-            ))
-        ));
-    }
-
-    #[test]
     fn standard_data_at_4096_levels_parses_rewrites_serializes_and_drops_without_recursion() {
         const DEPTH: usize = 4_096;
         let mut source_text = "[".repeat(DEPTH);
@@ -4871,10 +4343,10 @@ var $plugins = [{"name":"Quest","status":true,"parameters":{"Entries":"[{\"Title
             documents,
             plan(vec![set_text(location, "原文", "译文")]),
         )
-        .expect("4096 层 Standard data 文档应可完成写回");
+        .expect("4096 层 RPG Maker data 文档应可完成写回");
 
         let reparsed = parse_json(file_text(&candidate, Path::new("data/Actors.json")))
-            .expect("深层 Standard data 候选应仍是有效 JSON");
+            .expect("深层 RPG Maker data 候选应仍是有效 JSON");
         let mut current = reparsed.as_ref();
         for _ in 0..DEPTH {
             current = current
@@ -4939,35 +4411,23 @@ var $plugins = [{"name":"Quest","status":true,"parameters":{"Entries":"[{\"Title
 
         let service = RpgMakerWriteBackDocumentRewritingService::new(PanickingReader, PanickingCpu);
         let project = project();
-        assert_send(service.rewrite(&project, StandardWriteBackMutationPlan::empty()));
+        assert_send(service.rewrite(&project, RpgMakerWriteBackMutationPlan::empty()));
     }
 
     fn set_text(
         location: RpgMakerLocation,
         expected: impl Into<String>,
         replacement: impl Into<String>,
-    ) -> StandardWriteBackMutation {
-        StandardWriteBackMutation::SetText(SetTextMutation::for_test(
+    ) -> RpgMakerWriteBackMutation {
+        RpgMakerWriteBackMutation::SetText(SetTextMutation::for_test(
             location,
             expected,
             replacement,
         ))
     }
 
-    fn set_text_reference(
-        reference: &RpgMakerTextReference,
-        replacement: impl Into<String>,
-    ) -> StandardWriteBackMutation {
-        StandardWriteBackMutation::SetText(SetTextMutation::for_test_with_claim(
-            reference.location().clone(),
-            reference.mutation_claim().clone(),
-            reference.original(),
-            replacement,
-        ))
-    }
-
-    fn plan(mutations: Vec<StandardWriteBackMutation>) -> StandardWriteBackMutationPlan {
-        StandardWriteBackMutationPlan::new(mutations).expect("测试 Mutation Plan 应该合法")
+    fn plan(mutations: Vec<RpgMakerWriteBackMutation>) -> RpgMakerWriteBackMutationPlan {
+        RpgMakerWriteBackMutationPlan::new(mutations).expect("测试 Mutation Plan 应该合法")
     }
 
     fn file_text<'a>(candidate: &'a RpgMakerRewrittenDocuments, path: &Path) -> &'a str {

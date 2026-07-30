@@ -1,0 +1,4 @@
+interface:
+  display_name: "ATT 翻译任务"
+  short_description: "规划、执行、诊断和审校 ATT 的 MV、MZ 与 Generic 翻译"
+  default_prompt: "使用 $translate-with-att 规划并执行这个 ATT 翻译任务。"

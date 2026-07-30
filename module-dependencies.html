@@ -3,24 +3,23 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ATT RPG Maker MV/MZ 职责与依赖</title>
-  <meta name="description" content="ATT RPG Maker MV/MZ 四条纵向切片、共享能力与环境根的当前依赖图。">
+  <title>ATT 多引擎职责与依赖</title>
+  <meta name="description" content="ATT MV、MZ、Generic 与原子数据库 Lua 的现行职责和直接依赖。">
   <link rel="icon" href="data:,">
   <style>
     :root {
       color-scheme: light;
-      --paper: #f7f3e9;
+      --paper: #f5f1e8;
       --card: #fffdf8;
-      --ink: #292821;
-      --muted: #68655c;
-      --line: #c9c1b0;
+      --ink: #25251f;
+      --muted: #66635b;
+      --line: #c9c0ae;
       --blue: #315fa8;
-      --teal: #157e71;
-      --amber: #a66d08;
-      --red: #b83d49;
-      --violet: #7151ad;
-      --shadow: 0 14px 40px rgb(67 58 39 / 10%);
-      font-family: "LXGW WenKai", "Microsoft YaHei UI", system-ui, sans-serif;
+      --teal: #13796d;
+      --amber: #9a660b;
+      --violet: #6d4ea4;
+      --red: #ae3e49;
+      font-family: "Microsoft YaHei UI", system-ui, sans-serif;
     }
 
     * { box-sizing: border-box; }
@@ -29,335 +28,231 @@
       margin: 0;
       color: var(--ink);
       background:
-        radial-gradient(circle at 1px 1px, rgb(88 78 55 / 13%) 1px, transparent 1.2px) 0 0 / 24px 24px,
+        radial-gradient(circle at 1px 1px, rgb(88 78 55 / 12%) 1px, transparent 1.2px) 0 0 / 24px 24px,
         var(--paper);
       line-height: 1.65;
     }
 
     main {
-      width: min(1480px, calc(100% - 28px));
+      width: min(1320px, calc(100% - 28px));
       margin: 0 auto;
-      padding: 36px 0 60px;
+      padding: 34px 0 56px;
     }
 
-    header,
-    .overview,
-    .slice,
-    .roots {
-      background: color-mix(in srgb, var(--card) 94%, transparent);
+    header, section {
+      margin-bottom: 22px;
+      padding: clamp(22px, 3vw, 36px);
       border: 1px solid var(--line);
-      border-radius: 24px 8px 22px 10px;
-      box-shadow: var(--shadow);
-    }
-
-    header {
-      padding: clamp(24px, 4vw, 48px);
-      display: grid;
-      grid-template-columns: minmax(0, 1.5fr) minmax(260px, .7fr);
-      gap: 30px;
-      align-items: end;
+      border-radius: 22px 8px 20px 10px;
+      background: rgb(255 253 248 / 95%);
+      box-shadow: 0 14px 38px rgb(67 58 39 / 9%);
     }
 
     h1, h2, h3, p { margin-top: 0; }
-    h1 { font-size: clamp(32px, 5vw, 64px); line-height: 1.05; margin-bottom: 18px; }
-    h2 { font-size: clamp(24px, 3vw, 38px); line-height: 1.2; }
-    h3 { font-size: 20px; margin-bottom: 8px; }
+    h1 { margin-bottom: 14px; font-size: clamp(32px, 5vw, 58px); line-height: 1.08; }
+    h2 { margin-bottom: 18px; font-size: clamp(24px, 3vw, 36px); }
+    h3 { margin-bottom: 8px; font-size: 20px; }
 
     .kicker {
+      margin-bottom: 8px;
       color: var(--blue);
       font-weight: 800;
-      letter-spacing: .12em;
+      letter-spacing: .1em;
       text-transform: uppercase;
-      margin-bottom: 10px;
     }
 
-    .lead { max-width: 850px; font-size: 18px; color: var(--muted); margin-bottom: 0; }
+    .lead { max-width: 920px; margin-bottom: 0; color: var(--muted); font-size: 18px; }
+    .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+    .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 
-    .note {
-      border-left: 4px solid var(--amber);
-      padding: 12px 0 12px 18px;
-      color: var(--muted);
+    article {
+      min-width: 0;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-top: 4px solid var(--accent, var(--blue));
+      border-radius: 14px 5px 12px 7px;
+      background: var(--card);
     }
 
-    .note strong { color: var(--ink); display: block; margin-bottom: 4px; }
+    article p, li { color: var(--muted); }
+    article ul { margin: 10px 0 0; padding-left: 22px; }
+    article li + li { margin-top: 6px; }
+    .rpg { --accent: var(--blue); }
+    .generic { --accent: var(--teal); }
+    .lua { --accent: var(--amber); }
+    .shared { --accent: var(--violet); }
+    .runtime { --accent: var(--red); }
 
-    .overview { margin-top: 24px; padding: clamp(20px, 3vw, 34px); }
+    code, .path {
+      font-family: "Cascadia Mono", Consolas, monospace;
+      color: var(--violet);
+      overflow-wrap: anywhere;
+    }
+
+    .path {
+      display: block;
+      margin-top: 10px;
+      font-size: 12px;
+    }
 
     .flow {
       display: grid;
-      grid-template-columns: 1fr auto 1.25fr;
+      grid-template-columns: minmax(0, .8fr) auto minmax(0, 1.7fr);
       gap: 14px;
       align-items: center;
     }
 
-    .box {
+    .node {
+      padding: 18px;
       border: 2px solid currentColor;
       border-radius: 16px 5px 14px 7px;
-      padding: 18px;
       background: var(--card);
-      min-width: 0;
-      overflow: hidden;
     }
 
-    .box strong { display: block; font-size: 18px; margin-bottom: 6px; overflow-wrap: anywhere; }
-    .box span { color: var(--muted); overflow-wrap: anywhere; }
-    .arrow { font-size: 30px; color: var(--muted); text-align: center; }
-    .product { color: var(--blue); }
-    .shared { color: var(--teal); }
+    .node strong { display: block; margin-bottom: 6px; font-size: 18px; }
+    .node span { color: var(--muted); }
+    .route { color: var(--blue); }
+    .slices { color: var(--teal); }
+    .arrow { color: var(--muted); font-size: 30px; text-align: center; }
 
-    .layout-grid,
-    .slice-grid,
-    .root-grid {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 18px;
+    .rule {
+      margin: 20px 0 0;
+      padding: 14px 16px;
+      border-left: 4px solid var(--amber);
+      background: rgb(154 102 11 / 7%);
     }
 
-    .layout-grid { margin-top: 20px; }
-    .layout-card { padding: 16px 18px; border: 1px dashed var(--line); border-radius: 12px; }
-    .layout-card code { display: block; margin-top: 5px; }
-
-    .slice-grid { margin-top: 24px; }
-
-    .slice { overflow: hidden; }
-    .slice.init { --accent: var(--amber); }
-    .slice.extract { --accent: var(--teal); }
-    .slice.translate { --accent: var(--blue); }
-    .slice.writeback { --accent: var(--red); }
-
-    summary {
-      cursor: pointer;
-      list-style: none;
-      padding: 24px 26px;
-      border-bottom: 1px solid transparent;
-      display: grid;
-      grid-template-columns: auto 1fr auto;
-      gap: 14px;
-      align-items: center;
-    }
-
-    summary::-webkit-details-marker { display: none; }
-    details[open] summary { border-bottom-color: var(--line); }
-
-    .index {
-      width: 42px;
-      height: 42px;
-      display: grid;
-      place-items: center;
-      border-radius: 50%;
-      color: white;
-      background: var(--accent);
-      font-weight: 800;
-    }
-
-    .slice-title strong { display: block; font-size: 23px; }
-    .slice-title span { color: var(--muted); }
-    .toggle { color: var(--accent); font-weight: 800; }
-    details[open] .toggle::before { content: "收起"; }
-    details:not([open]) .toggle::before { content: "展开"; }
-
-    .tree { padding: 24px 26px 28px; }
-    .tree ol { margin: 0; padding-left: 25px; }
-    .tree li { position: relative; padding: 0 0 16px 16px; }
-    .tree li::marker { color: var(--accent); font-weight: 800; }
-    .tree li:last-child { padding-bottom: 0; }
-    .tree p { color: var(--muted); margin: 4px 0 0; }
-
-    .path {
-      display: inline-block;
-      margin-top: 7px;
-      padding: 2px 8px;
-      border-radius: 6px;
-      color: var(--violet);
-      background: rgb(113 81 173 / 8%);
-      font-family: "Cascadia Mono", Consolas, monospace;
-      font-size: 12px;
-      overflow-wrap: anywhere;
-    }
-
-    code {
-      font-family: "Cascadia Mono", Consolas, monospace;
-      font-size: .9em;
-      color: var(--violet);
-      overflow-wrap: anywhere;
-    }
-
-    .invariant {
-      margin: 16px 0 0;
-      padding: 12px 14px;
-      border-left: 4px solid var(--accent);
-      background: color-mix(in srgb, var(--accent) 7%, transparent);
-    }
-
-    .roots { margin-top: 24px; padding: clamp(22px, 3vw, 34px); }
-    .root-grid { margin-top: 18px; }
-    .root-card { border: 1px solid var(--line); border-radius: 14px 5px 12px 7px; padding: 18px; }
-    .root-card p { color: var(--muted); margin-bottom: 8px; }
-    .root-card .path { margin-top: 0; }
-
-    .stopline {
-      margin-top: 24px;
-      border: 2px dashed var(--red);
-      border-radius: 14px;
-      padding: 18px 20px;
-      background: rgb(184 61 73 / 4%);
-    }
-
-    footer { margin-top: 24px; color: var(--muted); text-align: center; }
+    .rule:last-child { margin-bottom: 0; }
+    footer { color: var(--muted); text-align: center; }
 
     @media (max-width: 900px) {
-      header, .flow { grid-template-columns: 1fr; }
+      .grid, .grid.two, .flow { grid-template-columns: 1fr; }
       .arrow { transform: rotate(90deg); }
-      .slice-grid, .layout-grid, .root-grid { grid-template-columns: 1fr; }
-    }
-
-    @media (prefers-reduced-motion: no-preference) {
-      details[open] .tree { animation: reveal .22s ease-out; }
-      @keyframes reveal { from { opacity: 0; transform: translateY(-7px); } }
     }
   </style>
 </head>
 <body>
 <main>
   <header>
-    <div>
-      <p class="kicker">ATT · 当前唯一 RPG Maker 实现</p>
-      <h1>MV / MZ 四条纵向切片</h1>
-      <p class="lead">两个 CLI 命令域复用 <code>src/rpg_maker</code> 中同一套项目、提取、翻译与写回能力。MZ/MV 的差异只停留在游戏目录布局，以及 MV 第一条 401 的姓名投影。</p>
-    </div>
-    <div class="note">
-      <strong>图中只画当前职责</strong>
-      人写外部定义统一为 TOML；共享能力不建立未知引擎 trait 或平行的 MV/MZ 业务实现。
-    </div>
+    <p class="kicker">ATT · 当前实现</p>
+    <h1>一个 CLI，三个独立翻译领域</h1>
+    <p class="lead"><code>att mv</code>、<code>att mz</code> 与 <code>att generic</code> 各自拥有完整命令流程和项目数据库。共享模块只提供语义确实相同的能力，不建立统一引擎框架。</p>
   </header>
 
-  <section class="overview" aria-labelledby="overview-title">
-    <p class="kicker">统一路由与共享语义</p>
-    <h2 id="overview-title">依赖从产品命令直接进入语义所有者</h2>
+  <section aria-labelledby="route-title">
+    <p class="kicker">入口与路由</p>
+    <h2 id="route-title">命令直接进入负责结果的领域</h2>
     <div class="flow">
-      <div class="box product">
-        <strong>ProductCommand::{Mz, Mv}</strong>
-        <span>各自拥有 CLI 契约与 <code>RpgMakerLayout</code></span>
+      <div class="node route">
+        <strong>ProductCommand</strong>
+        <span>解析 MV、MZ、Generic 与各自参数</span>
       </div>
       <div class="arrow" aria-hidden="true">→</div>
-      <div class="box shared">
-        <strong>ProductionRpgMakerCommandRunner</strong>
-        <span>持有项目租约，以 CommandRootGuard 管理必要运行根，解析并最终保存运行方案，把 Init / Extract / Translate / WriteBack 路由到唯一共享能力网络</span>
+      <div class="node slices">
+        <strong>RPG Maker runner / Generic runner</strong>
+        <span>取得对应项目租约，打开对应数据库，执行领域规则，产生日志、任务记录和输出</span>
       </div>
     </div>
-    <div class="layout-grid">
-      <div class="layout-card">
-        <strong>MZ 布局适配</strong>
-        <code>GAME_ROOT/data · GAME_ROOT/js/rmmz_core.js</code>
-        <code>projects.root/mz/name</code>
-      </div>
-      <div class="layout-card">
-        <strong>MV 布局适配</strong>
-        <code>GAME_ROOT/www/data · GAME_ROOT/www/js/rpg_core.js</code>
-        <code>projects.root/mv/name</code>
-      </div>
+    <p class="path">src/application/arguments.rs · src/application/config.rs · src/application/command.rs · src/application/generic_command.rs · src/application/process.rs</p>
+  </section>
+
+  <section aria-labelledby="domains-title">
+    <p class="kicker">领域职责</p>
+    <h2 id="domains-title">每个领域保留自己的纵向流程</h2>
+    <div class="grid">
+      <article class="rpg">
+        <h3>MV / MZ</h3>
+        <p>理解 RPG Maker 游戏目录、数据文件、事件命令、角色、对话、Rules、修改声明、布局和游戏文件写回。</p>
+        <ul>
+          <li>Init 冻结游戏来源并建立项目。</li>
+          <li>Extract 只运行 Builtin 与 Rules。</li>
+          <li>Translate 使用 RPG Maker 分组和字符串数组响应。</li>
+          <li>WriteBack 生成并发布完整游戏候选。</li>
+        </ul>
+        <span class="path">src/rpg_maker/init.rs · extract/ · translate/ · write_back/</span>
+      </article>
+      <article class="generic">
+        <h3>Generic</h3>
+        <p>只理解严格 JSONL。外部操作者负责把任意游戏或文本转换为约定格式，并消费译后 JSONL。</p>
+        <ul>
+          <li>Init 只保存输入根和语言对。</li>
+          <li>Extract 每次重新读取可变输入，并只清理受影响的 Group。</li>
+          <li>Translate 按文件限制 TaskBlock，按 Group 保留语境。</li>
+          <li>WriteBack 只替换 Current Unit 的 text。</li>
+        </ul>
+        <span class="path">src/generic/ · src/application/generic_command.rs</span>
+      </article>
+      <article class="lua">
+        <h3>原子数据库 Lua</h3>
+        <p>每次显式读取一个脚本，在单个 SQLite 事务内灵活修改当前项目数据库；不参与 Extract、Translate 或 WriteBack 阶段编排。</p>
+        <ul>
+          <li><code>ctx.db</code> 执行单条 SQL。</li>
+          <li><code>ctx.translation</code> 精确修改一个 Unit。</li>
+          <li>脚本后检查 schema、项目事实、译文不变量与数据库结构。</li>
+          <li>任一未捕获失败使整个脚本回滚。</li>
+        </ul>
+        <span class="path">src/project_lua/mod.rs · binding.rs · rpg_maker.rs · generic.rs</span>
+      </article>
+    </div>
+    <p class="rule"><strong>隔离规则：</strong>同一个游戏可以同时建立 RPG Maker 项目和 Generic 项目。两者的数据库、术语、Placeholder、状态、日志、任务记录和输出互不读写。</p>
+  </section>
+
+  <section aria-labelledby="shared-title">
+    <p class="kicker">共享能力网络</p>
+    <h2 id="shared-title">复用机制，不接管引擎编排</h2>
+    <div class="grid two">
+      <article class="shared">
+        <h3>项目身份与互斥</h3>
+        <p>公共项目名、工作区路径和项目租约；各命令域传入自己的 engine 目录。</p>
+        <span class="path">src/project_name.rs · src/project_lease.rs</span>
+      </article>
+      <article class="shared">
+        <h3>Profile、Prompt 与语言</h3>
+        <p>公共 Profile 和 LLM Client 配置；Prompt 正文按 RPG Maker / Generic 分开；源语言模块负责译前判断、源语残留与安全修复。</p>
+        <span class="path">src/translation/profile.rs · src/application/translation_prompt.rs · src/language.rs</span>
+      </article>
+      <article class="shared">
+        <h3>术语与 Placeholder</h3>
+        <p>公共 TOML 解析、术语匹配、PCRE2、token、恢复和绑定机制；具体 kind 作用域仍由引擎解释。</p>
+        <span class="path">src/translation/planning_resource.rs · placeholder.rs · placeholder_projection.rs · placeholder_token.rs</span>
+      </article>
+      <article class="shared">
+        <h3>模型协议与任务记录</h3>
+        <p>公共 thinking 信封、严格 JSON object、数字 ID、请求重试证据和 Markdown 任务记录；value 形状由各引擎检查。</p>
+        <span class="path">src/translation_protocol.rs · src/execution/llm_request.rs · src/translation/task_record.rs</span>
+      </article>
+      <article class="runtime">
+        <h3>执行与持久化</h3>
+        <p>Tokio、CPU 工作池、文件 I/O、SQLite、取消和 LLM Client。并发可以改变耗时，不能改变自然顺序或提交结果。</p>
+        <span class="path">src/runtime/ · src/execution/ · src/storage/</span>
+      </article>
+      <article class="runtime">
+        <h3>日志与发布</h3>
+        <p>统一项目日志、安全诊断、十种界面语言和可恢复目录发布；日志不参与业务提交判断。</p>
+        <span class="path">src/runtime/project_log.rs · src/diagnostic.rs · src/i18n.rs · src/runtime/filesystem.rs</span>
+      </article>
     </div>
   </section>
 
-  <section class="slice-grid" aria-label="四条职责树">
-    <details class="slice init" open>
-      <summary>
-        <span class="index">01</span>
-        <span class="slice-title"><strong>Init</strong><span>收敛项目、冻结来源与当前 schema</span></span>
-        <span class="toggle" aria-hidden="true"></span>
-      </summary>
-      <div class="tree">
-        <ol>
-          <li><strong>布局边界验证游戏根</strong><p>MZ 确认 data/js 与 rmmz_core.js；MV 确认 www/data、www/js 与 rpg_core.js，不探测或自动修正。</p><span class="path">src/rpg_maker/init.rs · src/rpg_maker/mod.rs</span></li>
-          <li><strong>项目租约与来源指纹</strong><p>项目、锁和发布锁按 engine 分开；冻结树的完整 SHA-256 是后续三命令的 freshness 权威。</p><span class="path">src/rpg_maker/project_lease.rs · src/rpg_maker/project.rs</span></li>
-          <li><strong>建立当前数据库</strong><p>核心资产结构是 standard_text_group、standard_text_unit、standard_mutation_claim；group/unit 保存 owner 内和组内自然顺序，unit 保存角色、完整源内容、源上下文、译文内容与 state，owner 同时保存 source 与 asset snapshot fingerprint。四个命令的成功运行方案与分阶段 Lua 程序快照也由项目数据库持久化。</p><span class="path">src/rpg_maker/project_database.rs · src/rpg_maker/project_database/run_plan.rs</span></li>
-          <li><strong>一次候选发布</strong><p>MZ 保留 data/js，MV 保留 www/data/js。完全相同返回 Unchanged，否则只发布一个完整候选。</p><span class="path">src/rpg_maker/init.rs · src/runtime/filesystem.rs</span></li>
-        </ol>
-        <p class="invariant"><strong>项目身份：</strong><code>projects.root / engine / name</code>。同名 MZ 与 MV 项目可以共存；已有项目省略来源路径时复用上次成功的 Init 方案。</p>
-      </div>
-    </details>
-
-    <details class="slice extract" open>
-      <summary>
-        <span class="index">02</span>
-        <span class="slice-title"><strong>Extract</strong><span>物化语义单元、物理修改声明与可逆 recipe</span></span>
-        <span class="toggle" aria-hidden="true"></span>
-      </summary>
-      <div class="tree">
-        <ol>
-          <li><strong>Builtin 共享事件骨架</strong><p>Map、CommonEvents、Troops 与数据库条目共用遍历；101+401* 的正文、一个 102 的有序选项和 105+405* 的滚动块各形成一个完整语义单元。</p><span class="path">src/rpg_maker/extract/builtin.rs · src/rpg_maker/dialogue.rs</span></li>
-          <li><strong>引擎姓名投影</strong><p>MZ 从可选 101.parameters[4] 建立 direct Speaker；MV 只在首条 401 上应用项目内已提交的 dialogue TOML，并生成 Literal/SpeakerSlot recipe。</p><span class="path">src/rpg_maker/dialogue.rs</span></li>
-          <li><strong>统一 Rules TOML</strong><p>一个 [[rule]] 数组只支持 file、plugin 或任意 code+parameter，加窄路径、逐层 JSON decode 与可选 text 捕获。</p><span class="path">src/rpg_maker/extract/rules</span></li>
-          <li><strong>三表原子 Store</strong><p>语义身份是 owner + group_location + unit_role；Value 保存为 JSON string，Lines 保存为 JSON array，物理 Mutation Claim 展开为 Intent/Exclusive 资源锁独立存放。MV 对话定义与 Builtin 快照原子切换。</p><span class="path">src/rpg_maker/extract/store/asset_store.rs · src/rpg_maker/model.rs</span></li>
-          <li><strong>可信 Lua</strong><p><code>ctx.rpg_maker</code> 复用 data、map、plugin、document 与 db 能力；跨命令插件协议留给 Lua。</p><span class="path">src/rpg_maker/lua · src/rpg_maker/lua/lua54.rs · src/rpg_maker/extract/lua.rs</span></li>
-        </ol>
-        <p class="invariant"><strong>Owner 顺序：</strong>Builtin → Rules → Lua。省略范围时复用上次成功的完整 owner 方案；显式选择精确替换方案，空 Rules 或 Lua 停用对应 owner。失败 owner 保留旧资产快照。</p>
-      </div>
-    </details>
-
-    <details class="slice translate" open>
-      <summary>
-        <span class="index">03</span>
-        <span class="slice-title"><strong>Translate</strong><span>按语义单元、上下文与 state 翻译</span></span>
-        <span class="toggle" aria-hidden="true"></span>
-      </summary>
-      <div class="tree">
-        <ol>
-          <li><strong>共享 Profile 与 Prompt</strong><p>[prompts] 显式提供 root、locale 与 thinking_output；Prompt 从 prompts.root/rpg_maker/locale/system.md 渲染，开启时再追加同目录 thinking.md。Planner 与 Executor 共享响应信封模式。</p><span class="path">src/application/config.rs · src/rpg_maker/translate/profile.rs</span></li>
-          <li><strong>TOML 资源边界</strong><p>Terminology 与 Placeholder 从严格 TOML 建立受信类型，再以 canonical JSON 持久化。</p><span class="path">src/rpg_maker/translate/planning_resource.rs · src/rpg_maker/translate/placeholder.rs</span></li>
-          <li><strong>共享存储 Codec 与 Planner</strong><p>Translate reader 复用标准资产共享列投影、原始行解码、owner 顺序与分区归并，再自行承担本阶段的查询条件、metadata 与失败语义。Speaker、完整 Body、Choices、ScrollingText 与 Scalar 可以进入同一任务；相关组不拆分。Body 按完整行序列和源 Speaker 去重，Choices 保持组内独立。</p><span class="path">src/rpg_maker/standard_asset_storage.rs · src/rpg_maker/translate/asset_reader.rs · src/rpg_maker/translate/planner.rs</span></li>
-          <li><strong>最小模型协议</strong><p>user message 只用 Markdown 表达命中术语、无编号直接语境和活动 ID，例如 <code>Body [2] (free line breaking):<br>&gt; 第一行<br>&gt; 第二行</code>；JsonOnly 直接返回 ID 到字符串数组的 JSON 对象，ThinkingThenJson 先返回唯一非空 <code>&lt;why&gt;...&lt;/why&gt;</code> 再返回同一 JSON。Reflow 允许重断行，Aligned(N) 必须逐槽对应。</p><span class="path">src/rpg_maker/translate/planner.rs · src/rpg_maker/translate/executor.rs</span></li>
-          <li><strong>按语义单元提交</strong><p>写入前再次核对 metadata、owner 双指纹、资源快照、unit role、完整源内容与上下文，随后原子更新 standard_text_unit 并传播完整译文。</p><span class="path">src/rpg_maker/translate/result_store.rs</span></li>
-        </ol>
-        <p class="invariant"><strong>任务位置与计数：</strong><code>{group_location, unit_role}</code>；confirmed/accepted/unresolved 的计数均表示语义单元，不表示模型行或物理命令。省略 Profile 时只复用上次成功的 Translate 方案，不自行选择其他 Profile。</p>
-      </div>
-    </details>
-
-    <details class="slice writeback" open>
-      <summary>
-        <span class="index">04</span>
-        <span class="slice-title"><strong>WriteBack</strong><span>统一 Mutation、候选验证与单次发布</span></span>
-        <span class="toggle" aria-hidden="true"></span>
-      </summary>
-      <div class="tree">
-        <ol>
-          <li><strong>读取完整物化快照</strong><p>WriteBack reader 复用与 Translate 相同的标准资产存储投影、行解码、owner 顺序与分区归并，再自行承担本阶段的 SQL、recipe、快照与错误语义；读取后重新计算 owner asset fingerprint，验证自然顺序、语义单元、Mutation Claim、来源块与资源锁冲突。</p><span class="path">src/rpg_maker/standard_asset_storage.rs · src/rpg_maker/write_back/asset_reader.rs</span></li>
-          <li><strong>统一对话修改</strong><p>一个 ReplaceDialogueMutation 同时处理 Speaker 与完整 Body；模型正文可以从三行变为一、二或四行，验证后一次替换完整 101+401*。</p><span class="path">src/rpg_maker/write_back/standard.rs · src/rpg_maker/write_back/rewriter.rs</span></li>
-          <li><strong>语义断行与兜底布局</strong><p>模型行保持原样，只拆分过宽行；每条语义行使用对应源模板，新增语义行与自动续行沿用确定模板。Choices 同步更新 102/402，ScrollingText 原子更新完整 105+405*。</p><span class="path">src/rpg_maker/write_back/standard/layout.rs</span></li>
-          <li><strong>Lua 编辑同一候选</strong><p>Lua 使用逻辑 data/js 路径；MV Host 映射到 www 内。脚本没有 publish 能力。</p><span class="path">src/rpg_maker/write_back/lua.rs · src/rpg_maker/lua</span></li>
-          <li><strong>引擎布局验证与发布</strong><p>MZ 验证顶层 data/js；MV 验证顶层 www 及其 data/js。候选验证通过后只 publish 一次；项目日志只观察发布阶段与终态，不参与发布门槛。</p><span class="path">src/rpg_maker/write_back/publisher.rs · src/runtime/filesystem.rs</span></li>
-        </ol>
-        <p class="invariant"><strong>写回权威：</strong>只消费 Extract 物化 recipe；不重读 TOML，不重新运行 PCRE2。</p>
-      </div>
-    </details>
+  <section aria-labelledby="facts-title">
+    <p class="kicker">状态与输出</p>
+    <h2 id="facts-title">权威事实停留在所属项目</h2>
+    <div class="grid two">
+      <article class="rpg">
+        <h3>RPG Maker 项目</h3>
+        <p><code>projects.root/{mv|mz}/name/project.db</code></p>
+        <p>保存冻结来源、Builtin/Rules 资产、译文状态、资源和最近 Profile；WriteBack 发布完整游戏目录。</p>
+      </article>
+      <article class="generic">
+        <h3>Generic 项目</h3>
+        <p><code>projects.root/generic/name/project.db</code></p>
+        <p>保存当前 JSONL 快照、Group、Unit、译文状态、资源和最近 Profile；输出固定在项目 <code>write_back/</code>。</p>
+      </article>
+    </div>
+    <p class="rule"><strong>依赖停止线：</strong>共享模块不判断当前是哪种引擎，不保存 Generic 去重族，也不解释 RPG Maker 的角色、对话、数组形状、Rules、布局或游戏文件。</p>
   </section>
 
-  <section class="roots" aria-labelledby="roots-title">
-    <p class="kicker">共享能力、生产根与边界适配器</p>
-    <h2 id="roots-title">业务能力直接依赖语义所有者与所需机制</h2>
-    <div class="root-grid">
-      <article class="root-card"><h3>文件、指纹与可恢复发布</h3><p>完整文件读取、有界并发执行、稳定对象身份、项目锁、候选编辑与 Windows 目录发布；不对项目规模设置人工上限。</p><span class="path">src/runtime/filesystem.rs</span></article>
-      <article class="root-card"><h3>SQLite</h3><p>通用存储契约承载任意查询组的一致内存快照、短事务、交互会话与长寿命事务会话；rusqlite 根负责连接、线程、背压与 shutdown，不拥有 RPG Maker 语义。</p><span class="path">src/storage/sqlite.rs · src/storage/sqlite_session.rs · src/storage/sqlite_transaction_session.rs · src/runtime/sqlite.rs</span></article>
-      <article class="root-card"><h3>CPU 与 Tokio</h3><p>PCRE2、JSON、规划与写回进入有界 CPU/文件资源；并发不改变自然顺序。</p><span class="path">src/runtime/cpu.rs · src/runtime/mod.rs</span></article>
-      <article class="root-card"><h3>LLM 与 Delay</h3><p>公共非流式 Chat Completion 根负责连接池、限流与 shutdown；生产组合根直接提供 RPG Maker 重试等待。</p><span class="path">src/runtime/llm.rs · src/application/command.rs</span></article>
-      <article class="root-card"><h3>RPG Maker Lua 5.4 适配器</h3><p>直接实现当前可信 Host 协议，负责每脚本专用线程、无深度上限的 Host 值转换、合作取消和唯一 finalizer。</p><span class="path">src/rpg_maker/lua/lua54.rs · src/rpg_maker/lua/json.rs · src/rpg_maker/json.rs</span></article>
-      <article class="root-card"><h3>Lua 单次执行目录缓存</h3><p><code>SuccessfulDirectoryListCache</code> 由 Source Host 与 WriteBack Output Host 共同消费，只在一次 Lua 执行内保存成功目录列举，不缓存错误。Output write 尝试后失效父目录与目标，create 失效根至新目录的全部前缀，remove 失效父目录、目标及全部后代；操作失败也执行失效。</p><span class="path">src/rpg_maker/lua/directory_cache.rs · src/rpg_maker/lua/hosting.rs · src/rpg_maker/write_back/lua.rs</span></article>
-      <article class="root-card"><h3>标准资产存储 Codec</h3><p><code>standard_asset_storage</code> 唯一拥有共享列投影、原始 SQLite 行解码、owner 自然顺序与分区归并。Translate 与 WriteBack reader 共同消费它，但阶段特有 SQL、状态、校验和错误仍归各 reader；项目数据库只复用 owner 顺序。</p><span class="path">src/rpg_maker/standard_asset_storage.rs · src/rpg_maker/translate/asset_reader.rs · src/rpg_maker/write_back/asset_reader.rs · src/rpg_maker/project_database.rs</span></article>
-      <article class="root-card"><h3>Windows invariant 路径身份</h3><p>共享能力按 Win32 invariant UTF-16 uppercase 建立 ignore-case 身份，不做 Unicode case folding、规范化或兼容折叠。Scoped path、文件系统、Extract 文档解析、Lua Host 与 WriteBack 输出文档/重写器依赖同一规则识别大小写等价和重复路径。</p><span class="path">src/windows_path.rs · src/storage/scoped_path.rs · src/runtime/filesystem.rs · src/rpg_maker/extract/document.rs · src/rpg_maker/lua/hosting.rs · src/rpg_maker/write_back/lua.rs · src/rpg_maker/write_back/rewriter.rs</span></article>
-      <article class="root-card"><h3>命令根生命周期</h3><p><code>CommandRootGuard</code> 统一四条纵向切片与项目 Lua 命令的部分启动失败和正常收尾。主命令严格按 CPU → FileSystem → SQLite → 按需 Lua 启动，并按 Lua → SQLite → FileSystem → CPU 逆序关闭；Init 使用 FileSystem → SQLite 子集。</p><span class="path">src/application/command.rs</span></article>
-      <article class="root-card"><h3>运行方案与项目租约</h3><p>租约覆盖方案读取、业务执行和最终替换；<code>AlreadyHeldProjectCommandLeaseProvider</code> 必须借用仍存活的真实租约，类型上不能伪造无锁装配。只有业务成功且必要的非日志根完成收尾，才用最终短事务整体替换本命令方案。Lua 主程序以正文、SHA-256 和无损 Windows 路径分阶段保存。</p><span class="path">src/rpg_maker/project_lease.rs · src/rpg_maker/project_database/run_plan.rs · src/application/command.rs</span></article>
-      <article class="root-card"><h3>JSON 诊断分类</h3><p><code>JsonErrorCategory</code> 为 serde_json 错误提供唯一的 typed category；项目数据库、Extract/Rules、Translate、WriteBack 与 Lua/LLM 只建立稳定的 <code>json_category</code>，CLI 和项目日志消费形成后的安全诊断。各责任域仍拥有自己的错误码、阶段、路径和恢复语义。</p><span class="path">src/json_diagnostic.rs · src/rpg_maker/json.rs · src/rpg_maker/project_database.rs · src/runtime/llm.rs</span></article>
-      <article class="root-card"><h3>安全诊断与终端 i18n</h3><p>具体错误在持有阶段、路径和底层代码时建立 SafeDiagnostic；CLI 与 JSONL 消费同一 FailureReport。类型化 UiMessage 和十个 Fluent catalog 负责最终呈现，用户文本在边界统一净化。</p><span class="path">src/diagnostic.rs · src/i18n.rs · src/i18n/*.ftl · src/user_text.rs · src/application/arguments.rs · src/application/process.rs</span></article>
-      <article class="root-card"><h3>实时进度</h3><p>各纵向切片拥有自己的 phase enum，共享层只传递不可失败的绝对快照。生产观察器把同一快照分别交给终端和项目日志；终端按 auto/plain/off 独立渲染，翻译计数只在任务必要提交成功后推进。</p><span class="path">src/progress.rs · src/application/command.rs · src/rpg_maker/init.rs · src/rpg_maker/extract/service.rs · src/rpg_maker/write_back.rs</span></article>
-      <article class="root-card"><h3>普通项目日志</h3><p>每个 RunId 独占一个不轮转的 JSONL；普通事件对单 writer 有界队列使用 <code>try_send</code>，队列已满或断开时只累计丢弃数。<code>performance.counters</code>、<code>failure.reported</code> 与 <code>run.finished</code>（含清理诊断）使用可靠终态槽；RunId、启动、写入、flush、sync 和关闭故障明确降级，不改变业务结果、发布或退出码。</p><span class="path">src/runtime/project_log.rs · src/diagnostic.rs · src/user_text.rs · src/application/command.rs</span></article>
-      <article class="root-card"><h3>翻译任务记录旁路</h3><p><code>StandardTranslationService</code> 只依赖既有 <code>TranslationTaskRecordSink</code> 提交不可变终态文档；组合根直接用独立 <code>SystemFileSystem</code> 与同一个 <code>ProjectLogger</code> 构造具体 <code>MarkdownTranslationTaskRecordSink</code>。RunId 不可用时本轮记录禁用；任务记录与 JSONL 故障分别计数、分别呈现，均不改变业务结果。</p><span class="path">src/rpg_maker/translate/standard.rs · src/rpg_maker/translate/task_record.rs · src/application/command.rs · src/runtime/filesystem.rs · src/runtime/project_log.rs</span></article>
-    </div>
-    <div class="stopline">
-      <strong>当前停止线：</strong>跨命令 Speaker 状态、ChoiceHelp 等块协议和 JS 字符串语义由 <code>ctx.rpg_maker</code> Lua 处理。共享层不包含 TOML 状态机、JSONPath、规则优先级、版本字段或面向其他引擎的框架。
-    </div>
-  </section>
-
-  <footer>页面口径：当前唯一规格与本轮落地结构；点击四张职责卡可展开或收起。</footer>
+  <footer>本页只描述现行源码中的职责和直接依赖。</footer>
 </main>
 </body>
 </html>

@@ -1578,29 +1578,6 @@ impl ScopedDirectoryEditor for SystemDirectoryPublisher {
         }
     }
 
-    fn read_scoped_file(
-        &self,
-        scope: &BoundScopedDirectory<Self::ScopeState>,
-        path: ScopedDirectoryPath,
-    ) -> impl std::future::Future<Output = Result<Vec<u8>, ScopedDirectoryEditError<Self::Error>>> + Send
-    {
-        let context = scoped_operation_context(self, scope, path);
-        async move {
-            let (inner, root, root_identity, relative, absolute) = context?;
-            let error_path = relative.as_path().to_path_buf();
-            inner
-                .pool
-                .execute("read_scoped_file", &error_path, move || {
-                    read_scoped_file_sync(&root, root_identity, &relative, &absolute)
-                })
-                .await
-                .map_err(|source| ScopedDirectoryEditError::Failed {
-                    path: error_path,
-                    source: Box::new(source),
-                })?
-        }
-    }
-
     fn list_scoped_directory(
         &self,
         scope: &BoundScopedDirectory<Self::ScopeState>,
@@ -1698,35 +1675,6 @@ impl ScopedDirectoryEditor for SystemDirectoryPublisher {
                 .pool
                 .execute("write_scoped_file", &error_path, move || {
                     write_scoped_file_sync(&root, root_identity, &relative, &absolute, bytes)
-                })
-                .await
-                .map_err(|source| ScopedDirectoryEditError::Failed {
-                    path: error_path,
-                    source: Box::new(source),
-                })?
-        }
-    }
-
-    fn remove_scoped_path(
-        &self,
-        scope: &BoundScopedDirectory<Self::ScopeState>,
-        path: ScopedDirectoryPath,
-    ) -> impl std::future::Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>> + Send
-    {
-        let scope_root = scope.scope().is_scope_root(&path);
-        let context = scoped_operation_context(self, scope, path);
-        async move {
-            let (inner, root, root_identity, relative, absolute) = context?;
-            if scope_root {
-                return Err(ScopedDirectoryEditError::ScopeRootMutation {
-                    path: relative.as_path().to_path_buf(),
-                });
-            }
-            let error_path = relative.as_path().to_path_buf();
-            inner
-                .pool
-                .execute("remove_scoped_path", &error_path, move || {
-                    remove_scoped_path_sync(&root, root_identity, &relative, &absolute)
                 })
                 .await
                 .map_err(|source| ScopedDirectoryEditError::Failed {
@@ -2222,61 +2170,6 @@ fn scoped_failed(
     }
 }
 
-fn read_scoped_file_sync(
-    root: &Path,
-    root_identity: FileIdentity,
-    relative: &ScopedDirectoryPath,
-    absolute: &Path,
-) -> Result<Vec<u8>, ScopedDirectoryEditError<Box<SystemFileSystemError>>> {
-    let _root = pin_scoped_root(root, root_identity)?;
-    validate_relative_windows_path(relative.as_path())
-        .map_err(|source| scoped_failed(relative, source))?;
-    let metadata = match fs::symlink_metadata(absolute) {
-        Ok(metadata) => metadata,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            return Err(ScopedDirectoryEditError::NotFound {
-                path: relative.as_path().to_path_buf(),
-            });
-        }
-        Err(source) => {
-            return Err(scoped_failed(
-                relative,
-                io_error("读取候选文件元数据", absolute, source),
-            ));
-        }
-    };
-    if !metadata.is_file() {
-        return Err(ScopedDirectoryEditError::NotFile {
-            path: relative.as_path().to_path_buf(),
-        });
-    }
-    let mut pinned =
-        pin_path_without_reparse(absolute).map_err(|source| scoped_failed(relative, source))?;
-    let metadata = pinned
-        .metadata()
-        .map_err(|source| scoped_failed(relative, source))?;
-    if !metadata.is_file() {
-        return Err(ScopedDirectoryEditError::NotFile {
-            path: relative.as_path().to_path_buf(),
-        });
-    }
-    if number_of_links(pinned.file(), absolute).map_err(|source| scoped_failed(relative, source))?
-        != 1
-    {
-        return Err(scoped_failed(
-            relative,
-            SystemFileSystemError::InvalidPath {
-                path: absolute.to_path_buf(),
-                reason: "候选编辑拒绝硬链接文件",
-            },
-        ));
-    }
-    let bytes = read_all_bytes(pinned.file_mut()).map_err(|source| {
-        scoped_failed(relative, io_error("读取候选编辑文件", absolute, source))
-    })?;
-    Ok(bytes)
-}
-
 fn list_scoped_directory_sync(
     root: &Path,
     root_identity: FileIdentity,
@@ -2619,71 +2512,6 @@ fn restore_scoped_file_after_failure(
                 rollback: Box::new(rollback),
             },
         )),
-    }
-}
-
-fn remove_scoped_path_sync(
-    root: &Path,
-    root_identity: FileIdentity,
-    relative: &ScopedDirectoryPath,
-    absolute: &Path,
-) -> Result<(), ScopedDirectoryEditError<Box<SystemFileSystemError>>> {
-    let _root = pin_scoped_root(root, root_identity)?;
-    validate_relative_windows_path(relative.as_path())
-        .map_err(|source| scoped_failed(relative, source))?;
-    let pinned = match pin_path_without_reparse(absolute) {
-        Ok(pinned) => pinned,
-        Err(WindowsFsError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
-            return Err(ScopedDirectoryEditError::NotFound {
-                path: relative.as_path().to_path_buf(),
-            });
-        }
-        Err(source) => return Err(scoped_failed(relative, source)),
-    };
-    let metadata = pinned
-        .metadata()
-        .map_err(|source| scoped_failed(relative, source))?;
-    let identity = FileIdentity::of(pinned.file(), absolute)
-        .map_err(|source| scoped_failed(relative, source))?;
-    if metadata.is_file()
-        && number_of_links(pinned.file(), absolute)
-            .map_err(|source| scoped_failed(relative, source))?
-            != 1
-    {
-        return Err(scoped_failed(
-            relative,
-            SystemFileSystemError::InvalidPath {
-                path: absolute.to_path_buf(),
-                reason: "候选编辑拒绝硬链接文件",
-            },
-        ));
-    }
-    drop(pinned);
-    if metadata.is_file() {
-        delete_regular_file_if_identity(absolute, identity)
-            .map_err(|source| scoped_failed(relative, source))
-    } else if metadata.is_dir() {
-        delete_empty_directory_if_identity(absolute, identity).map_err(|source| {
-            if matches!(
-                &source,
-                WindowsFsError::Io { source, .. }
-                    if source.kind() == io::ErrorKind::DirectoryNotEmpty
-            ) {
-                ScopedDirectoryEditError::DirectoryNotEmpty {
-                    path: relative.as_path().to_path_buf(),
-                }
-            } else {
-                scoped_failed(relative, source)
-            }
-        })
-    } else {
-        Err(scoped_failed(
-            relative,
-            SystemFileSystemError::InvalidPath {
-                path: absolute.to_path_buf(),
-                reason: "候选编辑拒绝非普通文件系统对象",
-            },
-        ))
     }
 }
 
@@ -3727,6 +3555,7 @@ fn materialize_candidate_manifest(
             } => prepare_candidate_source_tree(
                 source_tree,
                 &stage_root.join(relative_target),
+                relative_target.as_os_str().is_empty(),
                 &mut files,
                 cancellation,
             )?,
@@ -3751,6 +3580,7 @@ struct CandidateFileTask<'a> {
 fn prepare_candidate_source_tree<'a>(
     source_tree: &'a CandidateManifestSourceTree,
     destination: &Path,
+    destination_is_existing_candidate_root: bool,
     files: &mut Vec<CandidateFileTask<'a>>,
     cancellation: &AtomicBool,
 ) -> Result<(), SystemFileSystemError> {
@@ -3758,6 +3588,7 @@ fn prepare_candidate_source_tree<'a>(
         Directory {
             directory: usize,
             destination: PathBuf,
+            create_destination: bool,
         },
         File {
             file: usize,
@@ -3768,6 +3599,7 @@ fn prepare_candidate_source_tree<'a>(
     let mut pending = vec![Work::Directory {
         directory: source_tree.root_directory,
         destination: destination.to_path_buf(),
+        create_destination: !destination_is_existing_candidate_root,
     }];
     while let Some(work) = pending.pop() {
         ensure_operation_active(cancellation, "准备候选来源", destination)?;
@@ -3780,6 +3612,7 @@ fn prepare_candidate_source_tree<'a>(
             Work::Directory {
                 directory,
                 destination,
+                create_destination,
             } => {
                 let manifest = &source_tree.directories[directory];
                 let source_path = pin_directory_without_reparse(&manifest.source)?;
@@ -3795,8 +3628,10 @@ fn prepare_candidate_source_tree<'a>(
                     source_path.resolved_path(),
                     cancellation,
                 )?;
-                fs::create_dir(&destination)
-                    .map_err(|source| io_error("建立候选目录", &destination, source))?;
+                if create_destination {
+                    fs::create_dir(&destination)
+                        .map_err(|source| io_error("建立候选目录", &destination, source))?;
+                }
                 let destination_path = pin_directory_without_reparse(&destination)?;
                 let destination_resolved = destination_path.resolved_path().to_path_buf();
 
@@ -3806,6 +3641,7 @@ fn prepare_candidate_source_tree<'a>(
                         CandidateManifestEntryKind::Directory(directory) => Work::Directory {
                             directory,
                             destination: child_destination,
+                            create_destination: true,
                         },
                         CandidateManifestEntryKind::File(file) => Work::File {
                             file,
@@ -6787,6 +6623,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn root_source_mapping_replaces_the_target_with_the_exact_source_tree() {
+        let temporary = tempfile::tempdir().expect("应该可创建临时目录");
+        let source = temporary.path().join("source");
+        let target = temporary.path().join("output");
+        fs::create_dir_all(source.join("nested")).expect("应该可建立嵌套来源");
+        fs::write(source.join("scene.jsonl"), b"scene\n").expect("应该可建立顶层来源文件");
+        fs::write(source.join("nested/extra.jsonl"), b"extra\n").expect("应该可建立嵌套来源文件");
+        fs::create_dir(&target).expect("应该可建立旧输出目录");
+        fs::write(target.join("stale.jsonl"), b"stale\n").expect("应该可建立旧输出文件");
+
+        let request = DirectoryStageRequest::new(
+            target.clone(),
+            DirectoryPublishIntent::ReplaceExisting,
+            vec![
+                DirectorySourceMapping::new(source, PathBuf::new())
+                    .expect("来源根应该可以直接映射到候选根"),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("根映射候选请求应该合法");
+        let root = TestDirectoryPublisher::new(file_system_config());
+        let staged = root.prepare(request).await.expect("根映射候选应该可准备");
+
+        assert_eq!(
+            fs::read(staged.staging_root().join("scene.jsonl")).expect("候选根应直接包含顶层文件"),
+            b"scene\n"
+        );
+        assert_eq!(
+            fs::read(staged.staging_root().join("nested/extra.jsonl"))
+                .expect("候选根应保留嵌套路径"),
+            b"extra\n"
+        );
+        root.publish(staged)
+            .await
+            .expect("根映射候选应该可整体发布");
+
+        assert_eq!(
+            fs::read(target.join("scene.jsonl")).expect("应该可读取已发布顶层文件"),
+            b"scene\n"
+        );
+        assert_eq!(
+            fs::read(target.join("nested/extra.jsonl")).expect("应该可读取已发布嵌套文件"),
+            b"extra\n"
+        );
+        assert!(!target.join("stale.jsonl").exists(), "旧输出不得残留");
+        root.shutdown().await.expect("文件系统根应该可终结");
+    }
+
+    #[tokio::test]
     async fn scoped_editor_mutates_only_declared_roots_and_the_publisher_revalidates_the_result() {
         let temporary = tempfile::tempdir().expect("应该可创建临时目录");
         let source = temporary.path().join("source");
@@ -6806,17 +6692,6 @@ mod tests {
             .await
             .expect("应该可绑定未发布候选");
 
-        assert_eq!(
-            root.read_scoped_file(&scope, scoped_path("assets/catalog.json"))
-                .await
-                .expect("应该可读取候选文件"),
-            b"items"
-        );
-        assert!(matches!(
-            root.read_scoped_file(&scope, scoped_path("other/file.txt"))
-                .await,
-            Err(ScopedDirectoryEditError::OutsideScope { .. })
-        ));
         assert_eq!(
             root.list_scoped_directory(&scope, scoped_path("assets"))
                 .await
@@ -6839,16 +6714,11 @@ mod tests {
         root.write_scoped_file(&scope, scoped_path("scripts/main.lua"), b"changed".to_vec())
             .await
             .expect("应该可替换候选文件");
-        root.remove_scoped_path(&scope, scoped_path("assets/catalog.json"))
-            .await
-            .expect("应该可删除候选文件");
-
         for operation in [
             root.create_scoped_directory(&scope, scoped_path("assets"))
                 .await,
             root.write_scoped_file(&scope, scoped_path("assets"), Vec::new())
                 .await,
-            root.remove_scoped_path(&scope, scoped_path("assets")).await,
         ] {
             assert!(matches!(
                 operation,
@@ -6857,7 +6727,6 @@ mod tests {
         }
 
         fn assert_send<T: Send>(_: T) {}
-        assert_send(root.read_scoped_file(&scope, scoped_path("scripts/main.lua")));
         assert_send(root.list_scoped_directory(&scope, scoped_path("scripts")));
         drop(scope);
 
@@ -6874,7 +6743,10 @@ mod tests {
             (1, 1),
             "完整 candidate 全树校验必须且只能发生一次"
         );
-        assert!(!target.join("assets/catalog.json").exists());
+        assert_eq!(
+            fs::read(target.join("assets/catalog.json")).expect("未修改文件应该原样发布"),
+            b"items"
+        );
         assert_eq!(
             fs::read(target.join("assets/generated/nested/result.json"))
                 .expect("应该可读取已发布新文件"),
@@ -7002,13 +6874,16 @@ mod tests {
             .expect("通用顶层目录应该可绑定");
 
         assert_eq!(
-            root.read_scoped_file(&scope, scoped_path("assets/title.png"))
+            root.list_scoped_directory(&scope, scoped_path("assets"))
                 .await
-                .expect("应该可读取声明范围内文件"),
-            b"image"
+                .expect("应该可列举声明范围内目录"),
+            vec![ScopedDirectoryEntry::new(
+                OsString::from("title.png"),
+                ScopedDirectoryEntryKind::File,
+            )]
         );
         assert!(matches!(
-            root.read_scoped_file(&scope, scoped_path("other/catalog.json"))
+            root.list_scoped_directory(&scope, scoped_path("other"))
                 .await,
             Err(ScopedDirectoryEditError::OutsideScope { .. })
         ));
@@ -7044,7 +6919,7 @@ mod tests {
             .expect("所有者应该可绑定候选");
         assert!(matches!(
             foreign
-                .read_scoped_file(&scope, scoped_path("assets/catalog.json"))
+                .list_scoped_directory(&scope, scoped_path("assets"))
                 .await,
             Err(ScopedDirectoryEditError::WrongEditorInstance)
         ));
@@ -7078,13 +6953,6 @@ mod tests {
         fs::hard_link(staging_root.join("assets/catalog.json"), &hardlink)
             .expect("本地 NTFS 测试目录应支持硬链接");
         assert!(matches!(
-            root.read_scoped_file(&scope, scoped_path("assets/hardlink.json"))
-                .await,
-            Err(ScopedDirectoryEditError::Failed { source, .. })
-                if matches!(*source, SystemFileSystemError::InvalidPath { reason, .. }
-                    if reason.contains("硬链接"))
-        ));
-        assert!(matches!(
             root.list_scoped_directory(&scope, scoped_path("assets"))
                 .await,
             Err(ScopedDirectoryEditError::Failed { source, .. })
@@ -7102,13 +6970,6 @@ mod tests {
                 if matches!(*source, SystemFileSystemError::InvalidPath { reason, .. }
                     if reason.contains("硬链接"))
         ));
-        assert!(matches!(
-            root.remove_scoped_path(&scope, scoped_path("assets/hardlink.json"))
-                .await,
-            Err(ScopedDirectoryEditError::Failed { source, .. })
-                if matches!(*source, SystemFileSystemError::InvalidPath { reason, .. }
-                    if reason.contains("硬链接"))
-        ));
         assert_eq!(
             fs::read(staging_root.join("assets/catalog.json")).unwrap(),
             b"items",
@@ -7122,7 +6983,7 @@ mod tests {
         match std::os::windows::fs::symlink_file(&external, &link) {
             Ok(()) => {
                 assert!(matches!(
-                    root.read_scoped_file(&scope, scoped_path("assets/linked.txt"))
+                    root.list_scoped_directory(&scope, scoped_path("assets"))
                         .await,
                     Err(ScopedDirectoryEditError::Failed { source, .. })
                         if matches!(*source, SystemFileSystemError::Windows(
@@ -7162,11 +7023,6 @@ mod tests {
         let invalid = || scoped_path("assets/CON");
 
         assert!(matches!(
-            root.read_scoped_file(&scope, invalid()).await,
-            Err(ScopedDirectoryEditError::Failed { source, .. })
-                if matches!(*source, SystemFileSystemError::InvalidPath { .. })
-        ));
-        assert!(matches!(
             root.list_scoped_directory(&scope, invalid()).await,
             Err(ScopedDirectoryEditError::Failed { source, .. })
                 if matches!(*source, SystemFileSystemError::InvalidPath { .. })
@@ -7179,11 +7035,6 @@ mod tests {
         assert!(matches!(
             root.write_scoped_file(&scope, invalid(), b"forbidden".to_vec())
                 .await,
-            Err(ScopedDirectoryEditError::Failed { source, .. })
-                if matches!(*source, SystemFileSystemError::InvalidPath { .. })
-        ));
-        assert!(matches!(
-            root.remove_scoped_path(&scope, invalid()).await,
             Err(ScopedDirectoryEditError::Failed { source, .. })
                 if matches!(*source, SystemFileSystemError::InvalidPath { .. })
         ));

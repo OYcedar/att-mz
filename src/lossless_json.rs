@@ -1,116 +1,10 @@
 //! ATT 内部共用的严格、无深度上限 JSON 解析边界。
 
 use std::collections::HashSet;
-use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 
 use serde_json::{Map, Number, Value};
-
-/// 保留 JSON number 原文的中间值。
-#[derive(Debug)]
-pub(crate) enum LosslessJsonValue {
-    Null,
-    Boolean(bool),
-    String(String),
-    Number(String),
-    Array(Vec<Self>),
-    Object(Vec<(String, Self)>),
-}
-
-impl Clone for LosslessJsonValue {
-    fn clone(&self) -> Self {
-        enum Work<'a> {
-            Value(&'a LosslessJsonValue),
-            Array(usize),
-            Object(Vec<String>),
-        }
-
-        let mut work = vec![Work::Value(self)];
-        let mut values = Vec::new();
-        while let Some(item) = work.pop() {
-            match item {
-                Work::Value(Self::Null) => values.push(Self::Null),
-                Work::Value(Self::Boolean(value)) => values.push(Self::Boolean(*value)),
-                Work::Value(Self::String(value)) => values.push(Self::String(value.clone())),
-                Work::Value(Self::Number(value)) => values.push(Self::Number(value.clone())),
-                Work::Value(Self::Array(items)) => {
-                    work.push(Work::Array(items.len()));
-                    work.extend(items.iter().rev().map(Work::Value));
-                }
-                Work::Value(Self::Object(entries)) => {
-                    work.push(Work::Object(
-                        entries.iter().map(|(key, _)| key.clone()).collect(),
-                    ));
-                    work.extend(entries.iter().rev().map(|(_, value)| Work::Value(value)));
-                }
-                Work::Array(length) => {
-                    let start = values.len() - length;
-                    let children = values.split_off(start);
-                    values.push(Self::Array(children));
-                }
-                Work::Object(keys) => {
-                    let start = values.len() - keys.len();
-                    let children = values.split_off(start);
-                    values.push(Self::Object(keys.into_iter().zip(children).collect()));
-                }
-            }
-        }
-        values.pop().expect("根 JSON 值必须产生一个克隆")
-    }
-}
-
-impl PartialEq for LosslessJsonValue {
-    fn eq(&self, other: &Self) -> bool {
-        let mut work = vec![(self, other)];
-        while let Some((left, right)) = work.pop() {
-            match (left, right) {
-                (Self::Null, Self::Null) => {}
-                (Self::Boolean(left), Self::Boolean(right)) if left == right => {}
-                (Self::String(left), Self::String(right)) if left == right => {}
-                (Self::Number(left), Self::Number(right)) if left == right => {}
-                (Self::Array(left), Self::Array(right)) if left.len() == right.len() => {
-                    work.extend(left.iter().zip(right).rev());
-                }
-                (Self::Object(left), Self::Object(right)) if left.len() == right.len() => {
-                    for ((left_key, left_value), (right_key, right_value)) in
-                        left.iter().zip(right).rev()
-                    {
-                        if left_key != right_key {
-                            return false;
-                        }
-                        work.push((left_value, right_value));
-                    }
-                }
-                _ => return false,
-            }
-        }
-        true
-    }
-}
-
-impl Drop for LosslessJsonValue {
-    fn drop(&mut self) {
-        let mut pending = Vec::new();
-        take_children(self, &mut pending);
-        while let Some(mut value) = pending.pop() {
-            take_children(&mut value, &mut pending);
-        }
-    }
-}
-
-fn take_children(value: &mut LosslessJsonValue, pending: &mut Vec<LosslessJsonValue>) {
-    match value {
-        LosslessJsonValue::Array(values) => pending.append(values),
-        LosslessJsonValue::Object(entries) => {
-            pending.extend(entries.drain(..).map(|(_, value)| value));
-        }
-        LosslessJsonValue::Null
-        | LosslessJsonValue::Boolean(_)
-        | LosslessJsonValue::String(_)
-        | LosslessJsonValue::Number(_) => {}
-    }
-}
 
 /// 严格 JSON 解析失败。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -182,59 +76,6 @@ trait JsonValueBuilder {
 
     fn drop_object(object: Self::Object) {
         Self::drop_value(Self::finish_object(object));
-    }
-}
-
-struct LosslessValueBuilder;
-
-impl JsonValueBuilder for LosslessValueBuilder {
-    type Value = LosslessJsonValue;
-    type Array = Vec<LosslessJsonValue>;
-    type Object = Vec<(String, LosslessJsonValue)>;
-    type Error = Infallible;
-
-    fn null() -> Self::Value {
-        LosslessJsonValue::Null
-    }
-
-    fn boolean(value: bool) -> Self::Value {
-        LosslessJsonValue::Boolean(value)
-    }
-
-    fn string(value: String) -> Self::Value {
-        LosslessJsonValue::String(value)
-    }
-
-    fn number(source: &str) -> Result<Self::Value, Self::Error> {
-        Ok(LosslessJsonValue::Number(source.to_owned()))
-    }
-
-    fn new_array() -> Self::Array {
-        Vec::new()
-    }
-
-    fn push_array(array: &mut Self::Array, value: Self::Value) {
-        array.push(value);
-    }
-
-    fn finish_array(array: Self::Array) -> Self::Value {
-        LosslessJsonValue::Array(array)
-    }
-
-    fn new_object() -> Self::Object {
-        Vec::new()
-    }
-
-    fn push_object(object: &mut Self::Object, key: String, value: Self::Value) {
-        object.push((key, value));
-    }
-
-    fn finish_object(object: Self::Object) -> Self::Value {
-        LosslessJsonValue::Object(object)
-    }
-
-    fn drop_value(value: Self::Value) {
-        drop(value);
     }
 }
 
@@ -331,15 +172,6 @@ impl<B: JsonValueBuilder> Drop for ParseState<B> {
     }
 }
 
-/// 解析一个完整且严格的 JSON 值。
-pub(crate) fn decode(source: &str) -> Result<LosslessJsonValue, LosslessJsonError> {
-    match decode_with_builder::<LosslessValueBuilder>(source) {
-        Ok(value) => Ok(value),
-        Err(ParseValueError::Syntax(source)) => Err(source),
-        Err(ParseValueError::Build(source)) => match source {},
-    }
-}
-
 /// 使用同一解析器直接构造一个完整且严格的 `serde_json::Value`。
 ///
 /// 成功结果可能任意深；调用方必须立即转交栈安全拥有型边界，或使用
@@ -384,18 +216,6 @@ fn take_serde_children(value: &mut Value, pending: &mut Vec<Value>) {
         Value::Object(values) => pending.extend(std::mem::take(values).into_values()),
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
-}
-
-/// 验证文本是否恰好为一个标准 JSON number。
-pub(crate) fn validate_number(source: &str) -> Result<(), LosslessJsonError> {
-    let end = scan_number(source.as_bytes(), 0)?;
-    if end != source.len() {
-        return Err(LosslessJsonError::Syntax {
-            byte_offset: end,
-            reason: "number 之后存在额外内容",
-        });
-    }
-    Ok(())
 }
 
 struct Parser<'a> {
@@ -724,32 +544,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decodes_unicode_escapes_and_preserves_number_text() {
-        let value =
-            decode(r#"{"文本":"\uD83D\uDE00","numbers":[0,-0,1.25,1e999,9223372036854775808]}"#)
-                .unwrap();
-        assert_eq!(
-            value,
-            LosslessJsonValue::Object(vec![
-                (
-                    "文本".to_owned(),
-                    LosslessJsonValue::String("😀".to_owned()),
-                ),
-                (
-                    "numbers".to_owned(),
-                    LosslessJsonValue::Array(vec![
-                        LosslessJsonValue::Number("0".to_owned()),
-                        LosslessJsonValue::Number("-0".to_owned()),
-                        LosslessJsonValue::Number("1.25".to_owned()),
-                        LosslessJsonValue::Number("1e999".to_owned()),
-                        LosslessJsonValue::Number("9223372036854775808".to_owned()),
-                    ]),
-                ),
-            ])
-        );
-    }
-
-    #[test]
     fn direct_value_builder_preserves_number_and_object_semantics() {
         let source = r#"{"z":-0,"a":1e999,"integer":9223372036854775808,"text":"\uD83D\uDE00"}"#;
         let value = decode_value(source).unwrap();
@@ -770,24 +564,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_keys_after_escape_decoding() {
-        assert!(matches!(
-            decode(r#"{"a":1,"\u0061":2}"#),
-            Err(LosslessJsonError::DuplicateObjectKey { .. })
-        ));
-    }
-
-    #[test]
-    fn number_validation_is_the_exact_json_grammar() {
-        for valid in ["0", "-0", "123", "-12.5", "1e9", "1E+9", "1e-9"] {
-            validate_number(valid).unwrap();
-        }
-        for invalid in ["", "-", "01", "+1", ".1", "1.", "1e", "1  ", "NaN", "inf"] {
-            assert!(validate_number(invalid).is_err(), "{invalid:?} 应被拒绝");
-        }
-    }
-
-    #[test]
     fn rejects_non_standard_or_truncated_json() {
         for invalid in [
             "",
@@ -801,7 +577,7 @@ mod tests {
             r#""\uDC00""#,
             r#""unterminated"#,
         ] {
-            assert!(decode(invalid).is_err(), "{invalid:?} 应被拒绝");
+            assert!(decode_value(invalid).is_err(), "{invalid:?} 应被拒绝");
         }
     }
 
@@ -840,25 +616,23 @@ mod tests {
     }
 
     #[test]
-    fn deeply_nested_values_parse_clone_compare_and_drop_without_using_the_rust_stack() {
+    fn deeply_nested_values_parse_and_drop_without_using_the_rust_stack() {
         const DEPTH: usize = 20_000;
         let mut source = "[".repeat(DEPTH);
         source.push_str("null");
         source.push_str(&"]".repeat(DEPTH));
 
-        let value = decode(&source).unwrap();
-        let cloned = value.clone();
-        assert_eq!(value, cloned);
-
+        let value = decode_value(&source).unwrap();
         let mut current = &value;
         for _ in 0..DEPTH {
-            let LosslessJsonValue::Array(values) = current else {
+            let Value::Array(values) = current else {
                 panic!("每一层都应是 JSON array");
             };
             assert_eq!(values.len(), 1);
             current = &values[0];
         }
-        assert!(matches!(current, LosslessJsonValue::Null));
+        assert!(matches!(current, Value::Null));
+        drop_serde_value(value);
     }
 
     #[test]
@@ -868,10 +642,11 @@ mod tests {
         source.push('"');
         source.extend(std::iter::repeat_n('x', PAYLOAD_BYTES));
         source.push('"');
-        let value = decode(&source).unwrap();
-        let LosslessJsonValue::String(value) = &value else {
+        let value = decode_value(&source).unwrap();
+        let Value::String(text) = &value else {
             panic!("顶层值应是字符串")
         };
-        assert_eq!(value.len(), PAYLOAD_BYTES);
+        assert_eq!(text.len(), PAYLOAD_BYTES);
+        drop_serde_value(value);
     }
 }

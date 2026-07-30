@@ -1,4 +1,4 @@
-//! 标准翻译任务的模型调用、有限响应清洗与译后验收。
+//! RPG Maker 翻译任务的模型调用、有限响应清洗与译后验收。
 //!
 //! 本模块只对可恢复网络失败按外部预算重试，并把网络请求、可取消等待与
 //! CPU 调度停在根接口。模型内容按 ID 独立验收，完整、部分或完全不可用均
@@ -37,27 +37,25 @@ use crate::llm::{
     LlmResponse, LlmUsage,
 };
 use crate::rpg_maker::model::{
-    TextUnitContent, TextUnitContentStructureError, TextUnitContentView, TextUnitRole,
-    validate_text_unit_content_structure, validate_text_unit_lines,
+    TextUnitContent, TextUnitContentStructureError, validate_text_unit_lines,
 };
-use crate::rpg_maker::placeholder_token;
-use crate::rpg_maker::text::TextGroupKind;
-use crate::translation_protocol::parse_translation_response;
-
-use super::language_projection::{
+use crate::translation::placeholder_projection::{
     LanguageTextProjectionError, PlaceholderBindingIndex, PlaceholderMultisetError,
     PlaceholderTextScan,
 };
-use super::profile::{
-    ResolvedRpgMakerTranslationResources, RpgMakerTranslationProfile, TranslationResponseEnvelope,
-};
-use super::standard::{
+use crate::translation::placeholder_token;
+use crate::translation_protocol::parse_translation_response;
+
+use super::pipeline::{
     AcceptedTranslationDecision, AppliedPlaceholder, ExpectedLineShape, ExpectedTranslationOutput,
-    NonEmptyTaskItems, PlaceholderRuleOrigin, StandardTranslationProfile,
-    StandardTranslationTaskExecutor, StandardTranslationTaskIndex, TranslationPatch,
+    NonEmptyTaskItems, PlaceholderRuleOrigin, RpgMakerTranslationExecutionProfile,
+    RpgMakerTranslationTaskExecutor, RpgMakerTranslationTaskIndex, TranslationPatch,
     TranslationProtocolDiagnostic, TranslationTaskBlock, TranslationTaskOutcome,
     TranslationTaskOutcomeContext, TranslationTaskUnavailableReason,
     TranslationUnitRejectionReason, UnresolvedTranslationUnit,
+};
+use super::profile::{
+    ResolvedRpgMakerTranslationResources, RpgMakerTranslationProfile, TranslationResponseEnvelope,
 };
 use super::task_record::{
     TranslationAssistantEntry, TranslationAssistantValueError, TranslationTaskAttemptRecord,
@@ -127,7 +125,9 @@ impl FinalLlmResponseMetadata {
 }
 
 /// Executor 从受信 RPG Maker Profile 消费的最小配置面。
-pub(crate) trait TranslationTaskExecutionProfile: StandardTranslationProfile {
+pub(crate) trait TranslationTaskExecutionProfile:
+    RpgMakerTranslationExecutionProfile
+{
     type LlmClient: Send + Sync + 'static;
 
     fn llm_client(&self) -> &Self::LlmClient;
@@ -176,31 +176,27 @@ where
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TranslationCandidateInvariantLocation {
     TaskUnit {
-        task_index: StandardTranslationTaskIndex,
+        task_index: RpgMakerTranslationTaskIndex,
         unit_id: usize,
     },
+    #[cfg(test)]
     PreparedCandidate,
 }
 
 #[derive(Eq, PartialEq)]
 pub(crate) enum TranslationInternalInvariant {
     ResponseAttemptZero {
-        task_index: StandardTranslationTaskIndex,
+        task_index: RpgMakerTranslationTaskIndex,
     },
     ExpectedOutputsEmpty {
-        task_index: StandardTranslationTaskIndex,
+        task_index: RpgMakerTranslationTaskIndex,
     },
     LanguagePairMismatch {
-        task_index: StandardTranslationTaskIndex,
+        task_index: RpgMakerTranslationTaskIndex,
         task_source: LanguageId,
         task_target: LanguageId,
         resolved_source: LanguageId,
         resolved_target: LanguageId,
-    },
-    TextUnitKindRoleMismatch {
-        location: TranslationCandidateInvariantLocation,
-        kind: TextGroupKind,
-        role: TextUnitRole,
     },
     RepairSegmentRangeMissing {
         location: TranslationCandidateInvariantLocation,
@@ -272,16 +268,6 @@ impl TranslationInternalInvariant {
                 resolved_source.as_str(),
                 resolved_target.as_str()
             ),
-            Self::TextUnitKindRoleMismatch {
-                location,
-                kind,
-                role,
-            } => format!(
-                "text_unit_kind_role_mismatch; {}; group_kind={}; role={}",
-                candidate_location_detail(*location),
-                kind.storage_name(),
-                text_unit_role_kind(role)
-            ),
             Self::RepairSegmentRangeMissing {
                 location,
                 line_index,
@@ -323,8 +309,7 @@ impl TranslationInternalInvariant {
             | Self::LanguagePairMismatch { task_index, .. } => {
                 translation_task_subject(*task_index)
             }
-            Self::TextUnitKindRoleMismatch { location, .. }
-            | Self::RepairSegmentRangeMissing { location, .. }
+            Self::RepairSegmentRangeMissing { location, .. }
             | Self::RepairLineBoundaryMissing { location, .. }
             | Self::RepairUnassignedSegments { location, .. }
             | Self::ReservedTokenAfterRestore { location } => candidate_location_subject(*location),
@@ -353,12 +338,12 @@ impl Error for TranslationInternalInvariant {
     }
 }
 
-fn translation_task_subject(task_index: StandardTranslationTaskIndex) -> DiagnosticSubject {
+fn translation_task_subject(task_index: RpgMakerTranslationTaskIndex) -> DiagnosticSubject {
     DiagnosticSubject::operation(format!("translation_task_{}", task_index.get()))
 }
 
 fn translation_unit_subject(
-    task_index: StandardTranslationTaskIndex,
+    task_index: RpgMakerTranslationTaskIndex,
     unit_id: usize,
 ) -> DiagnosticSubject {
     DiagnosticSubject::operation(format!(
@@ -375,6 +360,7 @@ fn candidate_location_subject(
             task_index,
             unit_id,
         } => translation_unit_subject(task_index, unit_id),
+        #[cfg(test)]
         TranslationCandidateInvariantLocation::PreparedCandidate => {
             DiagnosticSubject::operation("prepared_translation_candidate")
         }
@@ -387,19 +373,10 @@ fn candidate_location_detail(location: TranslationCandidateInvariantLocation) ->
             task_index,
             unit_id,
         } => format!("scope=task_unit; task={}; unit={unit_id}", task_index.get()),
+        #[cfg(test)]
         TranslationCandidateInvariantLocation::PreparedCandidate => {
             "scope=prepared_candidate".to_owned()
         }
-    }
-}
-
-const fn text_unit_role_kind(role: &TextUnitRole) -> &'static str {
-    match role {
-        TextUnitRole::Scalar(_) => "scalar",
-        TextUnitRole::DialogueSpeaker => "dialogue_speaker",
-        TextUnitRole::DialogueBody => "dialogue_body",
-        TextUnitRole::Choices => "choices",
-        TextUnitRole::ScrollingText => "scrolling_text",
     }
 }
 
@@ -926,7 +903,7 @@ impl TranslationTaskEvidenceBuilder {
 }
 
 /// 使用根 LLM、根 Delay 和真实 ResponseProcessor 执行一个 TaskBlock。
-pub(crate) struct RpgMakerStandardTranslationTaskExecutionService<L, D, R, P> {
+pub(crate) struct RpgMakerTranslationTaskExecutionService<L, D, R, P> {
     llm: L,
     delay: D,
     response_processor: R,
@@ -935,7 +912,7 @@ pub(crate) struct RpgMakerStandardTranslationTaskExecutionService<L, D, R, P> {
     profile: PhantomData<fn() -> P>,
 }
 
-impl<L, D, R, P> RpgMakerStandardTranslationTaskExecutionService<L, D, R, P> {
+impl<L, D, R, P> RpgMakerTranslationTaskExecutionService<L, D, R, P> {
     pub(crate) fn new(
         llm: L,
         delay: D,
@@ -959,8 +936,8 @@ impl<L, D, R, P> RpgMakerStandardTranslationTaskExecutionService<L, D, R, P> {
     }
 }
 
-impl<L, D, R, P> StandardTranslationTaskExecutor
-    for RpgMakerStandardTranslationTaskExecutionService<L, D, R, P>
+impl<L, D, R, P> RpgMakerTranslationTaskExecutor
+    for RpgMakerTranslationTaskExecutionService<L, D, R, P>
 where
     L: LlmRequestExecutor,
     L::Error: LlmRequestDiagnosticSource,
@@ -969,7 +946,7 @@ where
     P: TranslationTaskExecutionProfile<LlmClient = L::Client>,
 {
     type Profile = P;
-    type Error = RpgMakerStandardTranslationTaskExecutionError<L::Error, R::Error>;
+    type Error = RpgMakerTranslationTaskExecutionError<L::Error, R::Error>;
 
     async fn execute(
         &self,
@@ -984,7 +961,7 @@ where
             let diagnostic =
                 invariant.safe_diagnostic(DiagnosticStage::Translate, DiagnosticImpact::Unchanged);
             return Err(TranslationTaskExecutionFailure::new(
-                RpgMakerStandardTranslationTaskExecutionError::InternalInvariant { invariant },
+                RpgMakerTranslationTaskExecutionError::InternalInvariant { invariant },
                 evidence.finish(None),
                 Some(diagnostic),
                 false,
@@ -1049,10 +1026,9 @@ where
                 source,
                 diagnostic,
                 cancelled,
-                classification: _,
             } => {
                 return Err(TranslationTaskExecutionFailure::new(
-                    RpgMakerStandardTranslationTaskExecutionError::FatalRequest {
+                    RpgMakerTranslationTaskExecutionError::FatalRequest {
                         attempt: attempt.get(),
                         source,
                     },
@@ -1061,9 +1037,9 @@ where
                     cancelled,
                 ));
             }
-            LlmRequestExecutionOutcome::Cancelled { attempt, point: _ } => {
+            LlmRequestExecutionOutcome::Cancelled { attempt } => {
                 return Err(TranslationTaskExecutionFailure::new(
-                    RpgMakerStandardTranslationTaskExecutionError::RetryWaitCancelled {
+                    RpgMakerTranslationTaskExecutionError::RetryWaitCancelled {
                         attempt: attempt.get(),
                     },
                     evidence.finish(None),
@@ -1090,7 +1066,7 @@ where
                         .then(|| self.response_processor.task_record_diagnostic(&source))
                         .flatten();
                     Err(TranslationTaskExecutionFailure::new(
-                        RpgMakerStandardTranslationTaskExecutionError::ProcessResponse {
+                        RpgMakerTranslationTaskExecutionError::ProcessResponse {
                             attempt: attempt.get(),
                             source,
                         },
@@ -1126,7 +1102,7 @@ where
                     .then(|| self.response_processor.task_record_diagnostic(&source))
                     .flatten();
                 Err(TranslationTaskExecutionFailure::new(
-                    RpgMakerStandardTranslationTaskExecutionError::ProcessResponse {
+                    RpgMakerTranslationTaskExecutionError::ProcessResponse {
                         attempt: attempt.get(),
                         source,
                     },
@@ -1140,7 +1116,7 @@ where
 }
 
 #[cfg(test)]
-impl<L, D, R, P> RpgMakerStandardTranslationTaskExecutionService<L, D, R, P>
+impl<L, D, R, P> RpgMakerTranslationTaskExecutionService<L, D, R, P>
 where
     L: LlmRequestExecutor,
     L::Error: LlmRequestDiagnosticSource,
@@ -1153,11 +1129,9 @@ where
         &self,
         profile: &P,
         task: TranslationTaskBlock,
-    ) -> Result<
-        TranslationTaskOutcome,
-        RpgMakerStandardTranslationTaskExecutionError<L::Error, R::Error>,
-    > {
-        match <Self as StandardTranslationTaskExecutor>::execute(self, profile, &task).await {
+    ) -> Result<TranslationTaskOutcome, RpgMakerTranslationTaskExecutionError<L::Error, R::Error>>
+    {
+        match <Self as RpgMakerTranslationTaskExecutor>::execute(self, profile, &task).await {
             Ok(execution) => Ok(execution.into_parts().0),
             Err(failure) => Err(failure.into_parts().0),
         }
@@ -1185,7 +1159,7 @@ fn unavailable_after_request_failure(
 
 /// 单任务模型执行失败。
 #[derive(Debug)]
-pub(crate) enum RpgMakerStandardTranslationTaskExecutionError<L, R> {
+pub(crate) enum RpgMakerTranslationTaskExecutionError<L, R> {
     FatalRequest {
         attempt: usize,
         source: L,
@@ -1202,7 +1176,7 @@ pub(crate) enum RpgMakerStandardTranslationTaskExecutionError<L, R> {
     },
 }
 
-impl<L, R> fmt::Display for RpgMakerStandardTranslationTaskExecutionError<L, R>
+impl<L, R> fmt::Display for RpgMakerTranslationTaskExecutionError<L, R>
 where
     L: fmt::Display,
     R: fmt::Display,
@@ -1225,7 +1199,7 @@ where
     }
 }
 
-impl<L, R> Error for RpgMakerStandardTranslationTaskExecutionError<L, R>
+impl<L, R> Error for RpgMakerTranslationTaskExecutionError<L, R>
 where
     L: Error + 'static,
     R: Error + 'static,
@@ -1240,7 +1214,7 @@ where
 }
 
 struct ResponseProcessingInput {
-    task_index: StandardTranslationTaskIndex,
+    task_index: RpgMakerTranslationTaskIndex,
     language_pair: LanguagePair,
     expected_outputs: Vec<ExpectedTranslationOutput>,
     attempt: NonZeroUsize,
@@ -1266,7 +1240,7 @@ fn process_response(
     let raw_assistant = record_response.then(|| response.content().to_owned());
     let parsed = parse_model_response(
         response.content(),
-        resources.standard_system_prompt().response_envelope(),
+        resources.system_prompt().response_envelope(),
     );
     let response_record = raw_assistant.map(|raw_assistant| match &parsed {
         Ok(parsed) => TranslationTaskResponseRecord::parsed(
@@ -1434,7 +1408,7 @@ fn process_response(
             .cloned()
             .zip(expected.propagation_state_contexts().iter().copied())
             .map(|(identity, state_context)| {
-                super::standard::TranslationPropagationTarget::new(identity, state_context)
+                super::pipeline::TranslationPropagationTarget::new(identity, state_context)
             })
             .collect();
         accepted.push(AcceptedTranslationDecision::new(
@@ -1496,7 +1470,7 @@ fn non_empty_known<T>(items: Vec<T>, established_by: &'static str) -> NonEmptyTa
 }
 
 fn validate_translation_lines(
-    identity: &super::standard::TranslationUnitIdentity,
+    identity: &super::pipeline::TranslationUnitIdentity,
     shape: ExpectedLineShape,
     lines: &[String],
 ) -> Result<(), TranslationUnitRejectionReason> {
@@ -1549,7 +1523,7 @@ fn validate_translation_lines(
 }
 
 fn translation_content(
-    identity: &super::standard::TranslationUnitIdentity,
+    identity: &super::pipeline::TranslationUnitIdentity,
     lines: Vec<String>,
 ) -> TextUnitContent {
     match identity.source_content() {
@@ -1564,110 +1538,9 @@ pub(crate) enum TranslationContentAcceptance {
     Rejected(TranslationUnitRejectionReason),
 }
 
-/// 按 Standard 模型响应使用的同一条完整规则验收一个结构化候选译文。
-///
-/// `Value` 与 `Lines` 的物理边界由调用方提交的 `TextUnitContent` 明确表达；
-/// 本函数不会用 LF 猜测或转换两种形状。
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn accept_translation_content_candidate(
-    identity: &super::standard::TranslationUnitIdentity,
-    protected_text: &str,
-    line_shape: ExpectedLineShape,
-    placeholders: &[AppliedPlaceholder],
-    language_analysis: &crate::language::LanguageAnalysis,
-    language_module: &dyn LanguageModule,
-    candidate: TextUnitContent,
-) -> Result<TranslationContentAcceptance, TranslationCandidateTechnicalError> {
-    accept_translation_content_candidate_at(
-        identity,
-        protected_text,
-        line_shape,
-        placeholders,
-        language_analysis,
-        language_module,
-        candidate,
-        TranslationCandidateInvariantLocation::PreparedCandidate,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn accept_translation_content_candidate_at(
-    identity: &super::standard::TranslationUnitIdentity,
-    protected_text: &str,
-    line_shape: ExpectedLineShape,
-    placeholders: &[AppliedPlaceholder],
-    language_analysis: &crate::language::LanguageAnalysis,
-    language_module: &dyn LanguageModule,
-    candidate: TextUnitContent,
-    invariant_location: TranslationCandidateInvariantLocation,
-) -> Result<TranslationContentAcceptance, TranslationCandidateTechnicalError> {
-    if let Err(error) = validate_text_unit_content_structure(
-        identity.kind(),
-        identity.role(),
-        TextUnitContentView::from(&candidate),
-    ) {
-        let rejection = match error {
-            TextUnitContentStructureError::KindRoleMismatch => {
-                return Err(TranslationCandidateTechnicalError::InternalInvariant {
-                    invariant: TranslationInternalInvariant::TextUnitKindRoleMismatch {
-                        location: invariant_location,
-                        kind: identity.kind(),
-                        role: identity.role().clone(),
-                    },
-                });
-            }
-            TextUnitContentStructureError::ShapeMismatch => {
-                TranslationUnitRejectionReason::InvalidShape {
-                    message: match candidate {
-                        TextUnitContent::Value(_) => "expected=lines; actual=value".to_owned(),
-                        TextUnitContent::Lines(_) => "expected=value; actual=lines".to_owned(),
-                    },
-                }
-            }
-            TextUnitContentStructureError::InvalidText { line_index } => {
-                TranslationUnitRejectionReason::InvalidLineText { line_index }
-            }
-        };
-        return Ok(TranslationContentAcceptance::Rejected(rejection));
-    }
-    let lines = match (identity.source_content(), candidate) {
-        (TextUnitContent::Value(_), TextUnitContent::Value(value)) => {
-            value.split('\n').map(str::to_owned).collect::<Vec<_>>()
-        }
-        (TextUnitContent::Lines(_), TextUnitContent::Lines(lines)) => lines,
-        (TextUnitContent::Value(_), TextUnitContent::Lines(_)) => {
-            return Ok(TranslationContentAcceptance::Rejected(
-                TranslationUnitRejectionReason::InvalidShape {
-                    message: "expected=value; actual=lines".to_owned(),
-                },
-            ));
-        }
-        (TextUnitContent::Lines(_), TextUnitContent::Value(_)) => {
-            return Ok(TranslationContentAcceptance::Rejected(
-                TranslationUnitRejectionReason::InvalidShape {
-                    message: "expected=lines; actual=value".to_owned(),
-                },
-            ));
-        }
-    };
-    let placeholder_bindings = PlaceholderBindingIndex::new(placeholders)
-        .map_err(TranslationCandidateTechnicalError::LanguageProjection)?;
-    accept_translation_lines_candidate_at(
-        identity,
-        protected_text,
-        line_shape,
-        placeholders,
-        &placeholder_bindings,
-        language_analysis,
-        language_module,
-        lines,
-        invariant_location,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn accept_translation_lines_candidate_at(
-    identity: &super::standard::TranslationUnitIdentity,
+    identity: &super::pipeline::TranslationUnitIdentity,
     protected_text: &str,
     line_shape: ExpectedLineShape,
     placeholders: &[AppliedPlaceholder],
@@ -1767,7 +1640,8 @@ fn parse_model_response(
             outputs: entries
                 .into_iter()
                 .map(|entry| {
-                    let (id, value, canonical_id, translation) = entry.into_parts();
+                    let (id, value, canonical_id) = entry.into_parts();
+                    let translation = parse_translation_lines(&value);
                     ParsedModelOutput {
                         id,
                         value,
@@ -1778,6 +1652,25 @@ fn parse_model_response(
                 .collect(),
         }
     })
+}
+
+fn parse_translation_lines(
+    value: &serde_json::Value,
+) -> Result<Vec<String>, TranslationAssistantValueError> {
+    let serde_json::Value::Array(values) = value else {
+        return Err(TranslationAssistantValueError::NotStringArray);
+    };
+    values
+        .iter()
+        .enumerate()
+        .map(|(line_index, value)| match value {
+            serde_json::Value::String(line) => Ok(line.clone()),
+            _ => Err(TranslationAssistantValueError::NonStringItem {
+                item: std::num::NonZeroUsize::new(line_index + 1)
+                    .expect("一基数组项编号不可能为零"),
+            }),
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -2013,6 +1906,7 @@ fn validate_and_restore_translation_lines_at(
     Ok(restored)
 }
 
+#[cfg(test)]
 fn validate_and_restore_translation(
     translation: String,
     placeholders: &[AppliedPlaceholder],
@@ -2028,6 +1922,7 @@ fn validate_and_restore_translation(
     )
 }
 
+#[cfg(test)]
 fn validate_and_restore_translation_at(
     mut translation: String,
     placeholders: &[AppliedPlaceholder],
@@ -2096,6 +1991,7 @@ fn validate_and_restore_translation_at(
     Ok(restored)
 }
 
+#[cfg(test)]
 pub(super) fn accept_prepared_translation_candidate(
     translation: String,
     placeholders: &[AppliedPlaceholder],
@@ -2402,22 +2298,23 @@ mod tests {
         LanguageModule, LanguagePair, LanguageText, QuotePair,
     };
     use crate::llm::{ChatMessage, ChatMessageRole};
+    use crate::rpg_maker::asset::RpgMakerAssetOwner;
     use crate::rpg_maker::model::{ScalarFieldKey, TextUnitContent, TextUnitRole};
-    use crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner;
     use crate::rpg_maker::text::{
         RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, StandardDataFile, TextGroupKind,
+    };
+    use crate::rpg_maker::translate::pipeline::{
+        AppliedPlaceholder, ExpectedLineShape, ExpectedTranslationOutput,
+        ExpectedTranslationValidation, PlaceholderRuleOrigin, PlaceholderSegment,
+        RpgMakerTranslationTaskIndex, TranslationStateContext, TranslationUnitIdentity,
     };
     use crate::rpg_maker::translate::profile::{
         ResolvedRpgMakerTranslationResources, RpgMakerSystemPrompt,
         RpgMakerTranslationPlanningConfiguration, RpgMakerTranslationProfile,
-        RpgMakerTranslationRequestConfiguration, TranslationResponseEnvelope,
-    };
-    use crate::rpg_maker::translate::standard::{
-        AppliedPlaceholder, ExpectedLineShape, ExpectedTranslationOutput,
-        ExpectedTranslationValidation, PlaceholderRuleOrigin, PlaceholderSegment,
-        StandardTranslationTaskIndex, TranslationStateContext, TranslationUnitIdentity,
+        TranslationResponseEnvelope,
     };
     use crate::runtime::cpu::CpuExecutorUnavailable;
+    use crate::translation::profile::TranslationRequestConfiguration;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct FakeError(&'static str);
@@ -2651,11 +2548,7 @@ mod tests {
         );
         let prompt = RpgMakerSystemPrompt::new(pair, "# Contract".to_owned(), response_envelope)
             .expect("测试 Prompt 合法");
-        Arc::new(ResolvedRpgMakerTranslationResources::new(
-            prompt.clone(),
-            prompt,
-            module,
-        ))
+        Arc::new(ResolvedRpgMakerTranslationResources::new(prompt, module))
     }
 
     fn translation_resources() -> Arc<ResolvedRpgMakerTranslationResources> {
@@ -2681,7 +2574,7 @@ mod tests {
             vec![RpgMakerLocationStep::index(1)],
         );
         TranslationUnitIdentity::new(
-            RpgMakerStandardAssetOwner::Builtin,
+            RpgMakerAssetOwner::Builtin,
             TextGroupKind::DatabaseEntry,
             group,
             TextUnitRole::Scalar(ScalarFieldKey::new("description").expect("字段键应合法")),
@@ -2707,7 +2600,7 @@ mod tests {
             vec![RpgMakerLocationStep::index(2)],
         );
         TranslationUnitIdentity::new(
-            RpgMakerStandardAssetOwner::Builtin,
+            RpgMakerAssetOwner::Builtin,
             TextGroupKind::DatabaseEntry,
             group,
             TextUnitRole::Scalar(ScalarFieldKey::new("description").expect("字段键应合法")),
@@ -2722,7 +2615,7 @@ mod tests {
             vec![RpgMakerLocationStep::index(3)],
         );
         TranslationUnitIdentity::new(
-            RpgMakerStandardAssetOwner::Builtin,
+            RpgMakerAssetOwner::Builtin,
             TextGroupKind::DatabaseEntry,
             group,
             TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法")),
@@ -2735,7 +2628,7 @@ mod tests {
         let group =
             RpgMakerLocation::value(RpgMakerSource::map(1), vec![RpgMakerLocationStep::index(0)]);
         TranslationUnitIdentity::new(
-            RpgMakerStandardAssetOwner::Builtin,
+            RpgMakerAssetOwner::Builtin,
             TextGroupKind::EventDialogue,
             group,
             TextUnitRole::DialogueSpeaker,
@@ -2748,7 +2641,7 @@ mod tests {
         let group =
             RpgMakerLocation::value(RpgMakerSource::map(1), vec![RpgMakerLocationStep::index(1)]);
         TranslationUnitIdentity::new(
-            RpgMakerStandardAssetOwner::Builtin,
+            RpgMakerAssetOwner::Builtin,
             TextGroupKind::EventDialogue,
             group,
             TextUnitRole::DialogueBody,
@@ -2765,7 +2658,7 @@ mod tests {
         let group =
             RpgMakerLocation::value(RpgMakerSource::map(1), vec![RpgMakerLocationStep::index(2)]);
         TranslationUnitIdentity::new(
-            RpgMakerStandardAssetOwner::Builtin,
+            RpgMakerAssetOwner::Builtin,
             TextGroupKind::EventChoices,
             group,
             TextUnitRole::Choices,
@@ -2778,7 +2671,7 @@ mod tests {
         let group =
             RpgMakerLocation::value(RpgMakerSource::map(1), vec![RpgMakerLocationStep::index(3)]);
         TranslationUnitIdentity::new(
-            RpgMakerStandardAssetOwner::Builtin,
+            RpgMakerAssetOwner::Builtin,
             TextGroupKind::EventScrollingText,
             group,
             TextUnitRole::ScrollingText,
@@ -2824,7 +2717,7 @@ mod tests {
             .map(|index| state_context(index as u8 + 5))
             .collect();
         TranslationTaskBlock::new(
-            StandardTranslationTaskIndex::new(4),
+            RpgMakerTranslationTaskIndex::new(4),
             LanguagePair::new(
                 LanguageId::parse("ja").expect("测试源语言合法"),
                 LanguageId::parse("zh-Hans").expect("测试目标语言合法"),
@@ -2859,7 +2752,7 @@ mod tests {
 
     fn speaker_task() -> TranslationTaskBlock {
         TranslationTaskBlock::new(
-            StandardTranslationTaskIndex::new(3),
+            RpgMakerTranslationTaskIndex::new(3),
             LanguagePair::new(
                 LanguageId::parse("ja").expect("测试源语言合法"),
                 LanguageId::parse("zh-Hans").expect("测试目标语言合法"),
@@ -2890,7 +2783,7 @@ mod tests {
         output_count: usize,
     ) -> TranslationTaskBlock {
         TranslationTaskBlock::new(
-            StandardTranslationTaskIndex::new(2),
+            RpgMakerTranslationTaskIndex::new(2),
             LanguagePair::new(
                 LanguageId::parse(source_language).expect("测试源语言合法"),
                 LanguageId::parse(target_language).expect("测试目标语言合法"),
@@ -3184,7 +3077,7 @@ mod tests {
             TextUnitContent::Value(_) => unreachable!("对话正文必须是完整行序列"),
         };
         let task = TranslationTaskBlock::new(
-            StandardTranslationTaskIndex::new(6),
+            RpgMakerTranslationTaskIndex::new(6),
             LanguagePair::new(
                 LanguageId::parse("ja").expect("测试源语言合法"),
                 LanguageId::parse("zh-Hans").expect("测试目标语言合法"),
@@ -3405,7 +3298,7 @@ mod tests {
         let group =
             RpgMakerLocation::value(RpgMakerSource::map(1), vec![RpgMakerLocationStep::index(4)]);
         let identity = TranslationUnitIdentity::new(
-            RpgMakerStandardAssetOwner::Builtin,
+            RpgMakerAssetOwner::Builtin,
             TextGroupKind::EventChoices,
             group,
             TextUnitRole::Choices,
@@ -3413,7 +3306,7 @@ mod tests {
             "{}",
         );
         let task = TranslationTaskBlock::new(
-            StandardTranslationTaskIndex::new(5),
+            RpgMakerTranslationTaskIndex::new(5),
             LanguagePair::new(
                 LanguageId::parse("ja").expect("测试源语言合法"),
                 LanguageId::parse("zh-Hans").expect("测试目标语言合法"),
@@ -3462,7 +3355,7 @@ mod tests {
         let group =
             RpgMakerLocation::value(RpgMakerSource::map(1), vec![RpgMakerLocationStep::index(5)]);
         let identity = TranslationUnitIdentity::new(
-            RpgMakerStandardAssetOwner::Builtin,
+            RpgMakerAssetOwner::Builtin,
             TextGroupKind::EventDialogue,
             group,
             TextUnitRole::DialogueBody,
@@ -3496,7 +3389,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            super::super::standard::ExpectedTranslationOutputContractError::
+            super::super::pipeline::ExpectedTranslationOutputContractError::
                 ProtectedPlaceholderCrossesLineBoundary {
                     unit_id: 1,
                     placeholder_index: 0,
@@ -3524,7 +3417,7 @@ mod tests {
             .await
             .expect("原控制符能够唯一对应时应规范化并恢复");
 
-        assert_eq!(result.task_index(), StandardTranslationTaskIndex::new(2));
+        assert_eq!(result.task_index(), RpgMakerTranslationTaskIndex::new(2));
         assert!(matches!(&result, TranslationTaskOutcome::Complete { .. }));
         assert_eq!(result.attempts().get(), 1);
         assert_eq!(result.provider_request_id(), Some("request-1"));
@@ -3539,7 +3432,7 @@ mod tests {
         );
         assert_eq!(
             result.accepted()[0].propagation_targets(),
-            &[super::super::standard::TranslationPropagationTarget::new(
+            &[super::super::pipeline::TranslationPropagationTarget::new(
                 propagation_target(),
                 state_context(102),
             )]
@@ -3654,41 +3547,6 @@ mod tests {
                 TranslationUnitRejectionReason::InvalidLineText { line_index: 0 }
             ));
         }
-    }
-
-    #[test]
-    fn candidate_acceptance_reports_kind_role_mismatch_as_an_internal_invariant() {
-        let identity = TranslationUnitIdentity::new(
-            RpgMakerStandardAssetOwner::Builtin,
-            TextGroupKind::EventChoices,
-            RpgMakerLocation::value(RpgMakerSource::map(1), vec![RpgMakerLocationStep::index(9)]),
-            TextUnitRole::DialogueSpeaker,
-            TextUnitContent::Value("炎の剣".to_owned()),
-            "{}",
-        );
-        let module = japanese_module();
-
-        let error = accept_translation_content_candidate(
-            &identity,
-            "炎の剣",
-            ExpectedLineShape::Aligned(NonZeroUsize::MIN),
-            &[],
-            &japanese_analysis(),
-            module.as_ref(),
-            TextUnitContent::Value("炎之剑".to_owned()),
-        )
-        .expect_err("受信身份的 kind/role 不一致必须是技术不变量，而不是模型候选拒绝");
-
-        assert!(matches!(
-            error,
-            TranslationCandidateTechnicalError::InternalInvariant {
-                invariant: TranslationInternalInvariant::TextUnitKindRoleMismatch {
-                    kind: TextGroupKind::EventChoices,
-                    role: TextUnitRole::DialogueSpeaker,
-                    ..
-                }
-            }
-        ));
     }
 
     #[tokio::test]
@@ -4432,7 +4290,7 @@ mod tests {
         RpgMakerTranslationProfile::new(
             "quality",
             planning,
-            RpgMakerTranslationRequestConfiguration::new(
+            TranslationRequestConfiguration::new(
                 vec![Duration::from_millis(10), Duration::from_millis(20)],
                 Duration::from_secs(2),
             ),
@@ -4444,7 +4302,7 @@ mod tests {
     async fn executor_retries_identical_messages_and_uses_larger_retry_after() {
         let messages = Arc::new(Mutex::new(Vec::new()));
         let waits = Arc::new(Mutex::new(Vec::new()));
-        let service = RpgMakerStandardTranslationTaskExecutionService::<_, _, _, _>::new(
+        let service = RpgMakerTranslationTaskExecutionService::<_, _, _, _>::new(
             FakeLlm {
                 responses: Arc::new(Mutex::new(VecDeque::from([
                     Err(LlmRequestError::Retryable {
@@ -4484,7 +4342,7 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_task_recording_keeps_only_the_logical_attempt_count() {
-        let service = RpgMakerStandardTranslationTaskExecutionService::<_, _, _, _>::new(
+        let service = RpgMakerTranslationTaskExecutionService::<_, _, _, _>::new(
             FakeLlm {
                 responses: Arc::new(Mutex::new(VecDeque::from([Ok(LlmResponse::new(
                     r#"{"1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
@@ -4504,7 +4362,7 @@ mod tests {
         .with_task_recording(false);
         let task = task();
         let execution =
-            <RpgMakerStandardTranslationTaskExecutionService<_, _, _, _> as StandardTranslationTaskExecutor>::execute(
+            <RpgMakerTranslationTaskExecutionService<_, _, _, _> as RpgMakerTranslationTaskExecutor>::execute(
                 &service,
                 &profile(),
                 &task,
@@ -4525,7 +4383,7 @@ mod tests {
         let messages = Arc::new(Mutex::new(Vec::new()));
         let delay_started = Arc::new(tokio::sync::Semaphore::new(0));
         let cancellation = CooperativeCancellation::default();
-        let service = RpgMakerStandardTranslationTaskExecutionService::<_, _, _, _>::new(
+        let service = RpgMakerTranslationTaskExecutionService::<_, _, _, _>::new(
             FakeLlm {
                 responses: Arc::new(Mutex::new(VecDeque::from([
                     Err(LlmRequestError::Retryable {
@@ -4551,7 +4409,7 @@ mod tests {
         let execution = tokio::spawn(async move {
             let profile = profile();
             let task = task();
-            <RpgMakerStandardTranslationTaskExecutionService<_, _, _, _> as StandardTranslationTaskExecutor>::execute(
+            <RpgMakerTranslationTaskExecutionService<_, _, _, _> as RpgMakerTranslationTaskExecutor>::execute(
                 &service,
                 &profile,
                 &task,
@@ -4573,7 +4431,7 @@ mod tests {
         let (source, evidence, diagnostic, cancelled) = failure.into_parts();
         assert!(matches!(
             source,
-            RpgMakerStandardTranslationTaskExecutionError::RetryWaitCancelled { attempt: 1 }
+            RpgMakerTranslationTaskExecutionError::RetryWaitCancelled { attempt: 1 }
         ));
         assert!(cancelled);
         assert!(diagnostic.is_none());
@@ -4591,7 +4449,7 @@ mod tests {
     #[tokio::test]
     async fn llm_admission_cancellation_is_returned_as_a_cancelled_started_task() {
         let cancellation = CooperativeCancellation::default();
-        let service = RpgMakerStandardTranslationTaskExecutionService::<_, _, _, _>::new(
+        let service = RpgMakerTranslationTaskExecutionService::<_, _, _, _>::new(
             CancellingLlm {
                 cancellation: cancellation.clone(),
             },
@@ -4604,14 +4462,14 @@ mod tests {
         let task = task();
         let profile = profile();
 
-        let failure = StandardTranslationTaskExecutor::execute(&service, &profile, &task)
+        let failure = RpgMakerTranslationTaskExecutor::execute(&service, &profile, &task)
             .await
             .expect_err("等待 LLM 本地入场时的合作取消必须返回取消终态");
         let (source, evidence, diagnostic, cancelled) = failure.into_parts();
 
         assert!(matches!(
             source,
-            RpgMakerStandardTranslationTaskExecutionError::FatalRequest {
+            RpgMakerTranslationTaskExecutionError::FatalRequest {
                 attempt: 1,
                 source: FakeError("cancelled-wait"),
             }
@@ -4624,7 +4482,7 @@ mod tests {
     #[tokio::test]
     async fn response_cpu_admission_cancellation_is_returned_as_a_cancelled_started_task() {
         let cancellation = CooperativeCancellation::default();
-        let service = RpgMakerStandardTranslationTaskExecutionService::<_, _, _, _>::new(
+        let service = RpgMakerTranslationTaskExecutionService::<_, _, _, _>::new(
             FakeLlm {
                 responses: Arc::new(Mutex::new(VecDeque::from([Ok(LlmResponse::new(
                     r#"{"1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
@@ -4649,14 +4507,14 @@ mod tests {
         let task = task();
         let profile = profile();
 
-        let failure = StandardTranslationTaskExecutor::execute(&service, &profile, &task)
+        let failure = RpgMakerTranslationTaskExecutor::execute(&service, &profile, &task)
             .await
             .expect_err("等待响应 CPU 入场时的合作取消必须返回取消终态");
         let (source, evidence, diagnostic, cancelled) = failure.into_parts();
 
         assert!(matches!(
             source,
-            RpgMakerStandardTranslationTaskExecutionError::ProcessResponse {
+            RpgMakerTranslationTaskExecutionError::ProcessResponse {
                 attempt: 1,
                 source: TranslationTaskResponseProcessingError::ScheduleCompute(
                     CpuTaskExecutionError::Cancelled
@@ -4679,7 +4537,7 @@ mod tests {
     async fn executor_keeps_parsed_thinking_record_when_later_validation_fails() {
         let raw_assistant =
             "<why>已建立解析证据。</why>\n{\"1\":[\"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧\"]}";
-        let service = RpgMakerStandardTranslationTaskExecutionService::<_, _, _, _>::new(
+        let service = RpgMakerTranslationTaskExecutionService::<_, _, _, _>::new(
             FakeLlm {
                 responses: Arc::new(Mutex::new(VecDeque::from([Ok(LlmResponse::new(
                     raw_assistant,
@@ -4702,14 +4560,14 @@ mod tests {
         let task = task_with_language_pair("en", "zh-Hant", 1);
         let profile = profile();
 
-        let failure = StandardTranslationTaskExecutor::execute(&service, &profile, &task)
+        let failure = RpgMakerTranslationTaskExecutor::execute(&service, &profile, &task)
             .await
             .expect_err("解析后的任务语言对不一致必须返回技术失败");
         let (source, evidence, _diagnostic, cancelled) = failure.into_parts();
 
         assert!(matches!(
             source,
-            RpgMakerStandardTranslationTaskExecutionError::ProcessResponse {
+            RpgMakerTranslationTaskExecutionError::ProcessResponse {
                 attempt: 1,
                 source: TranslationTaskResponseProcessingError::InternalInvariant {
                     invariant: TranslationInternalInvariant::LanguagePairMismatch { .. },
@@ -4737,7 +4595,7 @@ mod tests {
     async fn executor_never_retries_a_per_id_shape_rejection() {
         let waits = Arc::new(Mutex::new(Vec::new()));
         let messages = Arc::new(Mutex::new(Vec::new()));
-        let service = RpgMakerStandardTranslationTaskExecutionService::<
+        let service = RpgMakerTranslationTaskExecutionService::<
             _,
             _,
             _,
@@ -4803,7 +4661,7 @@ mod tests {
                 None,
             )),
         ])));
-        let service = RpgMakerStandardTranslationTaskExecutionService::<
+        let service = RpgMakerTranslationTaskExecutionService::<
             _,
             _,
             _,
@@ -4869,7 +4727,7 @@ mod tests {
                 1,
             ),
         ] {
-            let service = RpgMakerStandardTranslationTaskExecutionService::<
+            let service = RpgMakerTranslationTaskExecutionService::<
                 _,
                 _,
                 _,
@@ -4950,7 +4808,7 @@ mod tests {
 
     #[tokio::test]
     async fn executor_stops_on_fatal_request() {
-        let service = RpgMakerStandardTranslationTaskExecutionService::<
+        let service = RpgMakerTranslationTaskExecutionService::<
             _,
             _,
             _,
@@ -4971,7 +4829,7 @@ mod tests {
 
         assert!(matches!(
             service.execute(&profile(), task()).await,
-            Err(RpgMakerStandardTranslationTaskExecutionError::FatalRequest { .. })
+            Err(RpgMakerTranslationTaskExecutionError::FatalRequest { .. })
         ));
     }
 
@@ -4979,7 +4837,7 @@ mod tests {
     fn execution_future_is_send() {
         fn assert_send<T: Send>(_: T) {}
 
-        let service = RpgMakerStandardTranslationTaskExecutionService::<
+        let service = RpgMakerTranslationTaskExecutionService::<
             _,
             _,
             _,

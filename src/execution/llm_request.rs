@@ -179,27 +179,10 @@ pub(crate) enum LlmRequestExecutionOutcome<E> {
         source: E,
         diagnostic: Option<SafeDiagnostic>,
         cancelled: bool,
-        classification: LlmRequestTerminalFailureClassification,
     },
     Cancelled {
         attempt: NonZeroUsize,
-        point: LlmRequestCancellationPoint,
     },
-}
-
-/// 合作取消相对于请求与重试等待发生的位置。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum LlmRequestCancellationPoint {
-    BeforeAttempt,
-    DuringRetryWait,
-    AfterRetryWait,
-}
-
-/// 根请求返回技术终态时原始的请求错误类别。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum LlmRequestTerminalFailureClassification {
-    Fatal,
-    RetryableCancelled,
 }
 
 /// 共享请求状态机的终态与一次性证据。
@@ -321,18 +304,13 @@ where
 
     loop {
         if cancellation.is_requested() {
-            let point = if completed_retry_wait.is_some() {
+            if completed_retry_wait.is_some() {
                 evidence.push(completed_retry_wait.take());
-                LlmRequestCancellationPoint::AfterRetryWait
             } else {
                 let _ = evidence.begin_attempt(attempt);
                 evidence.record(|| LlmRequestAttemptRecord::cancelled(attempt, Duration::ZERO));
-                LlmRequestCancellationPoint::BeforeAttempt
-            };
-            return finish(
-                LlmRequestExecutionOutcome::Cancelled { attempt, point },
-                evidence,
-            );
+            }
+            return finish(LlmRequestExecutionOutcome::Cancelled { attempt }, evidence);
         }
         if let Some(mut completed_retry_wait) = completed_retry_wait.take() {
             completed_retry_wait.mark_retry_started();
@@ -381,7 +359,6 @@ where
                         source,
                         diagnostic,
                         cancelled,
-                        classification: LlmRequestTerminalFailureClassification::Fatal,
                     },
                     evidence,
                 );
@@ -403,8 +380,6 @@ where
                             source,
                             diagnostic: None,
                             cancelled: true,
-                            classification:
-                                LlmRequestTerminalFailureClassification::RetryableCancelled,
                         },
                         evidence,
                     );
@@ -476,10 +451,7 @@ where
                             )
                         });
                         return finish(
-                            LlmRequestExecutionOutcome::Cancelled {
-                                attempt,
-                                point: LlmRequestCancellationPoint::DuringRetryWait,
-                            },
+                            LlmRequestExecutionOutcome::Cancelled { attempt },
                             evidence,
                         );
                     }
@@ -499,13 +471,7 @@ where
                 }
                 if cancellation.is_requested() {
                     evidence.push(completed_retry_wait.take());
-                    return finish(
-                        LlmRequestExecutionOutcome::Cancelled {
-                            attempt,
-                            point: LlmRequestCancellationPoint::AfterRetryWait,
-                        },
-                        evidence,
-                    );
+                    return finish(LlmRequestExecutionOutcome::Cancelled { attempt }, evidence);
                 }
                 // 这条同步观察只供竞态测试在“等待已完成、下一请求尚未准入”的
                 // 精确边界注入取消；生产调用传入零成本空闭包。
@@ -647,10 +613,7 @@ mod tests {
 
         assert!(matches!(
             outcome,
-            LlmRequestExecutionOutcome::Cancelled {
-                attempt,
-                point: LlmRequestCancellationPoint::AfterRetryWait,
-            }
+            LlmRequestExecutionOutcome::Cancelled { attempt }
                 if attempt == NonZeroUsize::MIN
         ));
         assert_eq!(*calls.lock().expect("请求计数锁不应中毒"), 1);
@@ -714,10 +677,8 @@ mod tests {
 
         assert!(matches!(
             outcome,
-            LlmRequestExecutionOutcome::Cancelled {
-                attempt,
-                point: LlmRequestCancellationPoint::AfterRetryWait,
-            } if attempt == NonZeroUsize::MIN
+            LlmRequestExecutionOutcome::Cancelled { attempt }
+                if attempt == NonZeroUsize::MIN
         ));
         assert_eq!(*calls.lock().expect("请求计数锁不应中毒"), 1);
         assert_eq!(attempt_count, 1);

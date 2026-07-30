@@ -1,10 +1,10 @@
-<#
+﻿<#
 .SYNOPSIS
 把仓库中的使用者资源同步到 dist，或只检查两边是否一致。
 
 .DESCRIPTION
-管理 README.md、config.example.toml -> config.toml、Lua 许可、docs、prompts 和 skills。
-不修改 att.exe、运行库或其他许可文件。
+管理 README.md、config.example.toml -> config.toml、统一许可证目录、docs、prompts 和 skills。
+不修改 att.exe 或运行库。
 
 .PARAMETER Check
 只比较文件集合和 SHA-256，不修改 dist。
@@ -32,14 +32,14 @@ $fileMappings = @(
     [pscustomobject]@{
         Source = Join-Path $repositoryRoot 'config.example.toml'
         Destination = Join-Path $distributionRoot 'config.toml'
-    },
-    [pscustomobject]@{
-        Source = Join-Path $repositoryRoot 'vendor/lua-src/LICENSE'
-        Destination = Join-Path $distributionRoot 'licenses/Lua-LICENSE.md'
     }
 )
 
 $directoryMappings = @(
+    [pscustomobject]@{
+        Source = Join-Path $repositoryRoot 'licenses'
+        Destination = Join-Path $distributionRoot 'licenses'
+    },
     [pscustomobject]@{
         Source = Join-Path $repositoryRoot 'docs'
         Destination = Join-Path $distributionRoot 'docs'
@@ -112,9 +112,10 @@ function Get-DirectoryDigestMap {
 
     Assert-NoReparsePoint -Path $Root -Recurse
     $resolvedRoot = (Resolve-Path -LiteralPath $Root).Path
+    $relativePrefixLength = $resolvedRoot.TrimEnd('\', '/').Length
     $result = @{}
     foreach ($file in Get-ChildItem -LiteralPath $resolvedRoot -Recurse -File -Force) {
-        $relative = [System.IO.Path]::GetRelativePath($resolvedRoot, $file.FullName)
+        $relative = $file.FullName.Substring($relativePrefixLength).TrimStart('\', '/')
         $relative = $relative.Replace('\', '/')
         $result[$relative] = Get-FileDigest -Path $file.FullName
     }

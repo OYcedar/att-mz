@@ -1,25 +1,20 @@
 //! RPG Maker MV 与 MZ 共用的唯一纵向实现。
 //!
-//! 应用入口只选择受信引擎布局；项目、提取、翻译、写回及 Lua 均由本模块拥有。
+//! 应用入口只选择受信引擎布局；项目、提取、翻译及写回均由本模块拥有。
 
+pub(crate) mod asset;
+pub(crate) mod asset_storage;
 pub(crate) mod dialogue;
 #[cfg(test)]
 pub(crate) mod documentation_test;
 pub(crate) mod extract;
 pub(crate) mod init;
 pub(crate) mod location_codec;
-pub(crate) mod lua;
-pub(crate) mod managed_translation;
 pub(crate) mod model;
 pub(crate) mod mutation_claim_summary;
-pub(crate) mod placeholder_token;
 pub(crate) mod plugin_document;
 pub(crate) mod project;
 pub(crate) mod project_database;
-pub(crate) mod project_lease;
-mod project_name;
-pub(crate) mod standard_asset;
-pub(crate) mod standard_asset_storage;
 pub(crate) mod structured_path;
 pub(crate) mod text;
 pub(crate) mod translate;
@@ -28,7 +23,6 @@ pub(crate) mod write_back;
 use std::path::{Path, PathBuf};
 
 pub(crate) use project::MaxFullwidthChars;
-pub(crate) use project_name::ProjectName;
 
 /// 当前支持的 RPG Maker 引擎。
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -121,29 +115,5 @@ impl RpgMakerLayout {
 
     pub(crate) fn write_back_js_relative(self) -> PathBuf {
         PathBuf::from("write_back").join(self.js_relative())
-    }
-}
-
-/// 把一次命令选择的 Lua 脚本和唯一执行能力绑定为不可拆分的依赖。
-pub(crate) struct SelectedLua<L> {
-    program: lua::runtime::OwnedLuaProgram,
-    executor: L,
-}
-
-impl<L> SelectedLua<L> {
-    pub(crate) fn new(program: lua::runtime::OwnedLuaProgram, executor: L) -> Self {
-        Self { program, executor }
-    }
-
-    pub(crate) fn script_path(&self) -> &Path {
-        self.program.main_script_path()
-    }
-
-    pub(crate) const fn program(&self) -> &lua::runtime::OwnedLuaProgram {
-        &self.program
-    }
-
-    pub(crate) fn executor(&self) -> &L {
-        &self.executor
     }
 }

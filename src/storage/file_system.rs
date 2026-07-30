@@ -528,7 +528,11 @@ impl DirectorySourceMapping {
         if source_directory.as_os_str().is_empty() {
             return Err(DirectoryStageRequestError::EmptySourceDirectory);
         }
-        validate_stage_relative_path(&relative_target)?;
+        // 空目标只在来源映射中表示“把这棵来源目录作为候选根”。Overlay 和显式空目录
+        // 仍必须是非空普通相对路径，不能借此表达候选根本身。
+        if !relative_target.as_os_str().is_empty() {
+            validate_stage_relative_path(&relative_target)?;
+        }
         Ok(Self {
             source_directory,
             relative_target,
@@ -1176,7 +1180,6 @@ pub(crate) enum ScopedDirectoryEditError<E> {
     NotFound { path: PathBuf },
     NotFile { path: PathBuf },
     NotDirectory { path: PathBuf },
-    DirectoryNotEmpty { path: PathBuf },
     CandidateIdentityChanged { root: PathBuf },
     Failed { path: PathBuf, source: E },
 }
@@ -1202,9 +1205,6 @@ impl<E: fmt::Display> fmt::Display for ScopedDirectoryEditError<E> {
             Self::NotDirectory { path } => {
                 write!(formatter, "候选路径不是目录：{}", path.display())
             }
-            Self::DirectoryNotEmpty { path } => {
-                write!(formatter, "候选目录不是空目录：{}", path.display())
-            }
             Self::CandidateIdentityChanged { root } => {
                 write!(formatter, "目录候选物理身份已经变化：{}", root.display())
             }
@@ -1225,7 +1225,6 @@ impl<E: Error + 'static> Error for ScopedDirectoryEditError<E> {
             | Self::NotFound { .. }
             | Self::NotFile { .. }
             | Self::NotDirectory { .. }
-            | Self::DirectoryNotEmpty { .. }
             | Self::CandidateIdentityChanged { .. } => None,
         }
     }
@@ -1252,12 +1251,6 @@ pub(crate) trait ScopedDirectoryEditor: Send + Sync {
         >,
     > + Send
     + use<Self>;
-
-    fn read_scoped_file(
-        &self,
-        scope: &BoundScopedDirectory<Self::ScopeState>,
-        path: ScopedDirectoryPath,
-    ) -> impl Future<Output = Result<Vec<u8>, ScopedDirectoryEditError<Self::Error>>> + Send;
 
     fn list_scoped_directory(
         &self,
@@ -1286,13 +1279,6 @@ pub(crate) trait ScopedDirectoryEditor: Send + Sync {
         scope: &BoundScopedDirectory<Self::ScopeState>,
         path: ScopedDirectoryPath,
         bytes: Vec<u8>,
-    ) -> impl Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>> + Send;
-
-    /// 删除一个普通文件或空目录；调用方声明的范围根本身不可删除。
-    fn remove_scoped_path(
-        &self,
-        scope: &BoundScopedDirectory<Self::ScopeState>,
-        path: ScopedDirectoryPath,
     ) -> impl Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>> + Send;
 }
 
@@ -1759,7 +1745,6 @@ mod directory_stage_tests {
     #[test]
     fn every_candidate_relative_path_rejects_empty_absolute_and_escape_forms() {
         for path in [
-            "",
             ".",
             "../assets",
             "assets/../scripts",
@@ -1786,6 +1771,60 @@ mod directory_stage_tests {
                 Err(DirectoryStageRequestError::InvalidRelativePath { .. })
             ));
         }
+        assert!(
+            DirectorySourceMapping::new(PathBuf::from("source"), PathBuf::new()).is_ok(),
+            "来源映射可以精确声明候选根"
+        );
+        assert!(matches!(
+            DirectoryFileOverlay::new(PathBuf::new(), Vec::new()),
+            Err(DirectoryStageRequestError::InvalidRelativePath { .. })
+        ));
+        assert!(matches!(
+            DirectoryStageRequest::new(
+                PathBuf::from("out"),
+                DirectoryPublishIntent::CreateNew,
+                vec![mapping("source", "source")],
+                Vec::new(),
+                vec![PathBuf::new()],
+            ),
+            Err(DirectoryStageRequestError::InvalidRelativePath { .. })
+        ));
+    }
+
+    #[test]
+    fn root_source_mapping_owns_the_whole_candidate_and_must_be_unique() {
+        let request = DirectoryStageRequest::new(
+            PathBuf::from("out"),
+            DirectoryPublishIntent::ReplaceExisting,
+            vec![
+                DirectorySourceMapping::new(PathBuf::from("source"), PathBuf::new())
+                    .expect("根来源映射应合法"),
+            ],
+            vec![overlay("dialogue.jsonl"), overlay("nested/name.jsonl")],
+            Vec::new(),
+        )
+        .expect("根来源映射应覆盖全部文件");
+        assert!(
+            request.source_mappings()[0]
+                .relative_target()
+                .as_os_str()
+                .is_empty()
+        );
+
+        assert!(matches!(
+            DirectoryStageRequest::new(
+                PathBuf::from("out"),
+                DirectoryPublishIntent::ReplaceExisting,
+                vec![
+                    DirectorySourceMapping::new(PathBuf::from("source/root"), PathBuf::new(),)
+                        .expect("根来源映射应合法"),
+                    mapping("source/nested", "nested"),
+                ],
+                Vec::new(),
+                Vec::new(),
+            ),
+            Err(DirectoryStageRequestError::OverlappingSourceTargets { .. })
+        ));
     }
 
     #[test]

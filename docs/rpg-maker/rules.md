@@ -1,14 +1,17 @@
 # RPG Maker 规则文件现行规格与编写指南
 
-本文是 RPG Maker MV/MZ 三类声明式规则文件的唯一现行规范：
+本文负责 RPG Maker MV/MZ 三类声明式规则中的引擎专用事实：
 
 - MV 对话姓名投影（`--dialogue-rules`）；
 - Extract Rules（`extract --rules`）；
-- Placeholder Rules（`translate --placeholders`）。
+- Placeholder Rules 的 RPG Maker kind、Builtin 控制符与数组槽边界
+  （`translate --placeholders`）。
 
-字段、默认值、互斥关系、解析失败和执行失败均以本文为准。提取、翻译阶段文档只说明
-生命周期、事务与状态交接，不重复定义字段。如果代码或测试与本文冲突，应修正实现或
-本文，使系统重新只有一套契约；外部作者不需要阅读源码来猜测真实行为。
+MV 姓名投影与 Extract Rules 的字段、默认值、互斥关系、解析失败和执行失败均以本文为
+准。Placeholder 的公共 TOML、捕获、token、恢复与资源生命周期以
+[公共 Placeholder 规格](../translation/placeholders.md)为准；本文只补充 MV/MZ 作用域、
+控制符和形状规则。提取、翻译阶段文档只说明状态交接，不重复定义字段。外部作者不需要
+阅读源码来猜测真实行为。
 
 本文所有规范代码块前都有机器可读标记：
 
@@ -24,9 +27,9 @@
 | Extract Rules | `mv|mz extract --rules FILE` | 已知来源、确定路径、最终字符串及可逆写回边界 | 猜测可见性、跨文档关系、多目标同步 |
 | Placeholder Rules | `mv|mz translate ... --placeholders FILE` | 已提取文本中不可让模型改写的协议跨度 | 新增提取位置、修复错误分组 |
 
-真实关系需要动态键枚举、条件筛选、跨文档判断、一个译文写到多个目标或脚本私有状态
-时，使用 [Lua 技术参考](lua.md)和 [Lua Cookbook](lua-cookbook.md)。Lua 自由度很高；
-停止线来自协议所有权，而不是脚本能力不足。
+真实关系需要动态键枚举、条件筛选、跨文档判断或一个译文写到多个目标，而 Rules 无法
+完整表达时，由了解该格式的外部操作者转换成
+[Generic JSONL](../generic/jsonl.md)，并使用独立 Generic 项目。
 
 ## 2. 共同根结构、严格解析与生命周期
 
@@ -186,7 +189,7 @@ Body    ：不由这一行建立
 - 同一行中同一规则建立了两个原始字节不同的 Speaker；
 - 两条规则命中同一第一条 `401`；
 - 某条规则在全部当前对话中从未建立任何非空白 Speaker；
-- 投影与 Builtin/Rules/Lua 的物理修改声明冲突。
+- 投影与 Builtin/Rules 的物理修改声明冲突。
 
 规则不应依靠“像姓名”猜测整行。应使用当前游戏消费协议的 marker、锚点和反例验证。
 
@@ -319,7 +322,7 @@ Rules owner 快照保持不变。成功时文件内全部规则的结果一次�
 - 与 `data/` 的实际目录项逐字同大小写。
 
 请求 `items.json` 而实际目录项为 `Items.json` 会明确失败，即使 Windows 能打开前者。
-Builtin、Rules、Lua `data_file` 和 WriteBack 使用同一个精确物理身份。
+Builtin、Rules 和 WriteBack 使用同一个精确物理身份。
 
 Map 的规范文件名是 `Map` + 1～4,294,967,295 (`u32::MAX`) 的十进制 ID + `.json`：数字
 至少三位，且除了三位补零外没有多余前导零。`Map001.json`、`Map999.json`、
@@ -408,7 +411,7 @@ path = 'payload.entry.title'
 省略 `pattern` 时，最终 string 整体形成一个 Scalar。提供 `pattern` 时：
 
 - 模式不能为空，必须恰好有一个名为 `text` 的命名捕获；
-- 完整匹配必须非零宽；`text` 必须参与、非零宽、位于匹配内且对齐 UTF-8；
+- 完整匹配必须非零宽；`text` 必须参与、非零宽、位于匹配内且落在 UTF-8 字符边界；
 - 同一 string 的多次匹配按 `text` 捕获起始字节位置排序且不得重叠；
 - 空白 `text` 不产出单元；匹配之外和捕获之外的字节冻结为 Literal；
 - 一条非空规则在整个当前来源中至少产出一个非空单元，否则 Rules 候选失败。
@@ -459,13 +462,12 @@ JSON 解码、最终 string、捕获、重建或物理 Claim 不成立，整个 
 
 ## 5. 自然顺序与 Mutation Claim
 
-最终标准资产的 owner 总顺序固定为 `Builtin → Rules → Lua`。每个 owner 的 `group_order`
+最终 RPG Maker 资产的 owner 总顺序固定为 `Builtin → Rules`。每个 owner 的 `group_order`
 从 0 连续，每组 `unit_order` 从 0 连续：
 
 - Builtin：来源结构顺序、本文声明的字段顺序、数组数值顺序；
 - Rules：下表定义的 canonical 来源顺序、来源内部结构路径顺序、同一 string 的捕获字节
-  位置；
-- Lua：脚本提交的 `groups` 数组和每组 `fields` 数组声明顺序。
+  位置。
 
 Rules 的跨来源顺序是稳定契约，不读取也不继承 OS 目录枚举顺序：
 
@@ -489,7 +491,7 @@ Rules 的跨来源顺序是稳定契约，不读取也不继承 OS 目录枚举�
 owner 内、跨 owner Store 和 WriteBack 发布前使用同一规则。
 
 完整逻辑 Claim 由 group kind、location 和 recipe 决定并进入 owner 指纹。项目表
-`standard_mutation_claim` 不是这份完整清单，而是跨 owner 冲突摘要：每个
+`rpg_maker_mutation_claim` 不是这份完整清单，而是跨 owner 冲突摘要：每个
 `(owner, resource)` 至多一行；唯一 Exclusive 原样保留，共享 resource 的多个合法 Intent
 只保留自然顺序最早的 group 代表。WriteBack 会从 recipe 重建完整集合并严格验证该摘要，
 因此摘要不会放宽本节任何冲突规则。
@@ -505,9 +507,13 @@ owner 内、跨 owner Store 和 WriteBack 发布前使用同一规则。
 因此“最终字符串文字刚好相等”以及 Value 是否包含 `<`、`>` 都不是冲突判断；关键是两个
 recipe 是否竞争同一物理资源。
 
-## 6. Placeholder Rules
+## 6. RPG Maker Placeholder Rules
 
-### 6.1 完整根结构、字段和 scope
+本节建立在[公共 Placeholder 规格](../translation/placeholders.md)之上。共同的严格 TOML、
+`pattern`、可选 `scopes`、`text` 捕获和 token 恢复不在这里另建一套解释；下面只规定
+MV/MZ 能使用的 scope、Builtin 控制符与数组槽行为。
+
+### 6.1 RPG Maker scope
 
 <!-- att-example: valid -->
 ```toml
@@ -546,10 +552,9 @@ pattern = '<name>(?<text>.*?)</name>'
 
 ### 6.4 针对来源执行失败
 
-定义成功后，规则只对 kind 与 scope 相符的 Unit 执行。这个 kind 可以来自 Builtin、
-Rules，或由 Lua `translation.prepare(kind, ...)` 明确提交；owner、文件路径、Rule 序号和
-脚本身份都不参与 scope 选择。单条自定义规则零命中是正常结果；一旦命中，完整匹配必须
-非零宽并位于 UTF-8 边界，`text` 必须参与、位于完整匹配内并对齐。
+定义成功后，规则只对 kind 与 scope 相符的 Unit 执行。这个 kind 来自 Builtin 或
+Rules；owner、文件路径和 Rule 序号都不参与 scope 选择。单条自定义规则零命中是正常结果；一旦命中，完整匹配必须
+非零宽并位于 UTF-8 边界，`text` 必须参与、位于完整匹配内并落在 UTF-8 字符边界。
 实际保护跨度冲突、跨越 `Lines` 元素的语义槽边界、原文占用保留前缀 `⟦ATT_`，或最终
 token 无法安全投影时，只使当前翻译单元规划失败，不把未命中的其他单元判为失败。
 
@@ -598,7 +603,8 @@ MV 行为依据 RPG Maker MV 的
 
 ### 6.9 匹配、NaturalText 与重叠
 
-完整匹配必须非零宽并对齐 UTF-8；`text` 若存在，必须参与、位于匹配内并对齐。自定义
+完整匹配必须非零宽并落在 UTF-8 字符边界；`text` 若存在，必须参与、位于匹配内并落在
+UTF-8 字符边界。自定义
 规则零命中合法。ATT 先求出每条规则实际保护的跨度，再检查冲突：保护跨度相交才冲突。
 wrapper 的 NaturalText 捕获中可以继续出现 Builtin 控制符，Builtin 会在 NaturalText
 内部保护它，不会因为两个完整正则范围包含彼此就误判。
@@ -621,8 +627,8 @@ NaturalText，`\C[2]` 是 NaturalText 内的 Builtin 保护段。三者可以自
 同理，Extract 省略 `pattern` 得到的完整 Unit `<Help:炎之剑的说明>`，可以在
 `database_entry` scope 使用 `\A<Help:(?<text>.*?)>\z`：前后壳成为 opaque，正文保持
 NaturalText，但 Unit 原文、Group、recipe、持久身份和去重输入都不改变。Placeholder
-只保护明确跨度，不承担 `<Help:...>` grammar 的候选验收；需要这种责任时由 Lua 私有
-协议处理。
+只保护明确跨度，不承担 `<Help:...>` grammar 的候选验收；需要这种责任时应在 ATT 之外
+完成格式转换和写回，并由独立 Generic 项目处理翻译。
 
 例如源 `Lines` 为 `["<msg>第一行", "第二行</msg>"]` 时，若模式启用 DOTALL，元素边界
 位于 `text` 捕获中，因此合法；无 `text` 捕获并把两行整体保护的模式则使该单元规划失败。
@@ -638,7 +644,7 @@ label 或 state。插入、删除、重排一条对该单元不命中的规则�
 
 若去掉全部 opaque 段后没有任何非空白 NaturalText，prepared 状态为
 `fully_protected`，不请求 LLM；只剩空格、制表符或换行也属于这种情况。
-模型响应必须精确保留 token 的数量和对齐位置。候选缺少 token 时，只有对应原片段属于
+模型响应必须精确保留 token 的数量和原有位置关系。候选缺少 token 时，只有对应原片段属于
 唯一槽且在候选中恰好回显一次，才可归一化回该 token；多个同字节槽或多次回显无法唯一
 对应时拒绝为 `placeholder_normalization_ambiguous`。token 已经在场时，额外出现的
 Builtin 原控制符仍按内建控制语义拒绝；Custom 原片段不会反向扫描候选正文，正文中的
@@ -655,8 +661,7 @@ Builtin 原控制符仍按内建控制语义拒绝；Custom 原片段不会反�
 ## 7. Terminology 与协议壳的边界
 
 术语只在 Placeholder 投影后的每段 NaturalText 内逐段匹配，不扫描 opaque 协议壳，也
-不跨两个 `OpaqueBoundary` 拼接。Standard Prompt、Standard state 和 Lua
-`prepared.terms` 复用同一次有序命中结果。
+不跨两个 `OpaqueBoundary` 拼接。模型 Prompt 和翻译状态复用同一次有序命中结果。
 
 假设术语 trigger 是 `勇者`：
 
@@ -671,7 +676,7 @@ opaque 后壳：不扫描
 ```
 
 若 trigger 的前半在一个 NaturalText 段、后半在另一个 NaturalText 段，它也不命中。
-术语文件完整契约见[术语现行规格与指南](terminology.md)。
+术语文件完整契约见[公共术语规格](../translation/terminology.md)。
 
 ## 8. 一次写对的验证清单
 
@@ -682,7 +687,7 @@ opaque 后壳：不扫描
 3. 路径每一层的 JSON 类型和逐层解码都有真实样本；
 4. 完整匹配、命名捕获、Literal 和最终写回边界符合协议；
 5. group/unit 自然顺序与真实显示顺序一致；
-6. Mutation Claim 没有与 Builtin、另一规则或 Lua 竞争；
+6. Mutation Claim 没有与 Builtin 或另一规则竞争；
 7. 未翻译 round-trip 逐字保持，翻译 round-trip 只改变允许的槽；
 8. 重复 Extract/Translate 收敛，未命中资源变化不制造无关重译。
 

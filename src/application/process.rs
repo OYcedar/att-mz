@@ -12,11 +12,16 @@ use super::arguments::AttArguments;
 use super::arguments::ProgressArgument;
 use super::command::{
     CommandPanicBoundary, CommandResultRenderer, CommandRunResult, PendingProjectLog,
-    ProductionCommandError, ProductionRpgMakerCommandRunner, TerminationSignals,
+    ProductionCommandError, ProductionCommandRunReport, ProductionRpgMakerCommandRunner,
+    TerminationSignals,
 };
 use super::config::{
-    ConfigurationLoadError, ConfigurationPathError, load_product_configuration,
-    resolve_configuration_path,
+    ConfigurationLoadError, ConfigurationPathError, ConfiguredProductCommand,
+    load_product_configuration, resolve_configuration_path,
+};
+use super::generic_command::{
+    GenericCommandOutput, GenericCommandRunReport, GenericCommandRunResult, GenericShutdownError,
+    ProductionGenericCommandRunner,
 };
 use crate::diagnostic::{
     DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
@@ -25,6 +30,11 @@ use crate::diagnostic::{
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
 use crate::progress::ProgressMode;
 use crate::runtime::project_log::{ObservabilityWarning, ProjectLogWarning};
+
+enum ProductCommandRunReport {
+    RpgMaker(ProductionCommandRunReport),
+    Generic(GenericCommandRunReport),
+}
 
 /// 运行真实进程入口。
 pub(crate) fn run() -> ExitCode {
@@ -211,20 +221,36 @@ fn run_after_cli_parsing(
         }
     };
 
-    let (layout, command) = configuration.into_parts();
     // Translate 的生产纵向切片包含完整计划、错误与收尾状态，其 async 状态机明显大于
     // Windows 主线程的默认栈。先把顶层 future 固定在堆上，避免 block_on 将整棵
     // 状态机钉在主线程栈中；这不改变 Tokio 内部任务的调度和并发关系。
     let command_run = Box::pin(async move {
         let mut termination_signals = TerminationSignals::new();
-        let report = ProductionRpgMakerCommandRunner::new(layout, locale, progress_mode)
-            .run(command, &mut termination_signals)
-            .await;
+        let report = match configuration {
+            ConfiguredProductCommand::RpgMaker { layout, command } => {
+                ProductCommandRunReport::RpgMaker(
+                    ProductionRpgMakerCommandRunner::new(layout, locale, progress_mode)
+                        .run(command, &mut termination_signals)
+                        .await,
+                )
+            }
+            ConfiguredProductCommand::Generic(command) => ProductCommandRunReport::Generic(
+                ProductionGenericCommandRunner::new(locale, progress_mode)
+                    .run(command, &mut termination_signals)
+                    .await,
+            ),
+        };
         (report, termination_signals)
     });
     let (report, _termination_signals) = runtime.block_on(command_run);
     // 信号订阅与 Runtime 保持到最终结果输出结束；各业务根已经在 report 返回前显式 shutdown。
 
+    let report = match report {
+        ProductCommandRunReport::RpgMaker(report) => report,
+        ProductCommandRunReport::Generic(report) => {
+            return render_generic_command_report(report, localizer, stdout, stderr);
+        }
+    };
     let mut pending_project_log = report.pending_project_log;
     let panic_boundary = pending_project_log
         .as_mut()
@@ -303,6 +329,258 @@ fn render_command_report(
             let _ = CommandResultRenderer::render_failure(None, Some(&shutdown), localizer, stderr);
             ExitCode::FAILURE
         }
+    }
+}
+
+fn render_generic_command_report(
+    report: GenericCommandRunReport,
+    localizer: &UiLocalizer,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> ExitCode {
+    let GenericCommandRunReport {
+        result,
+        shutdown_errors,
+        mut pending_project_log,
+    } = report;
+    let panic_boundary = pending_project_log
+        .as_mut()
+        .map(PendingProjectLog::arm_presentation_panic);
+    catch_logged_presentation(panic_boundary, localizer, stderr, |stderr| {
+        render_generic_command_result(
+            result,
+            &shutdown_errors,
+            pending_project_log,
+            localizer,
+            stdout,
+            stderr,
+        )
+    })
+}
+
+fn render_generic_command_result(
+    result: GenericCommandRunResult,
+    shutdown_errors: &[GenericShutdownError],
+    pending_project_log: Option<PendingProjectLog>,
+    localizer: &UiLocalizer,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> ExitCode {
+    match result {
+        GenericCommandRunResult::Succeeded(output) => {
+            if let Err(source) = render_generic_output(output, localizer, stdout) {
+                let diagnostic = SafeDiagnostic::io(
+                    DiagnosticCode::StateFinalizationFailed,
+                    DiagnosticStage::ProcessOutput,
+                    DiagnosticSubject::operation("write_stdout"),
+                    "write_stdout",
+                    &source,
+                    DiagnosticImpact::StateAppliedFinalizationFailed,
+                    DiagnosticAction::Retry,
+                );
+                let warning = pending_project_log
+                    .and_then(|project_log| project_log.finish_with_diagnostic(diagnostic.clone()));
+                render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
+                let _ = render_safe_diagnostic(&diagnostic, localizer, stderr);
+                render_generic_shutdown_errors(
+                    shutdown_errors,
+                    DiagnosticImpact::StateAppliedFinalizationFailed,
+                    localizer,
+                    stderr,
+                );
+                ExitCode::FAILURE
+            } else {
+                let warning = pending_project_log.and_then(PendingProjectLog::finish);
+                render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
+                if shutdown_errors.is_empty() {
+                    ExitCode::SUCCESS
+                } else {
+                    render_generic_shutdown_errors(
+                        shutdown_errors,
+                        DiagnosticImpact::StateAppliedFinalizationFailed,
+                        localizer,
+                        stderr,
+                    );
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        GenericCommandRunResult::Failed(error) => {
+            let warning = pending_project_log.and_then(PendingProjectLog::finish);
+            render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
+            let _ = render_safe_diagnostic(&error.safe_diagnostic(), localizer, stderr);
+            if let Some(related) = error.related_diagnostic() {
+                let _ = render_safe_diagnostic(&related, localizer, stderr);
+            }
+            render_generic_shutdown_errors(
+                shutdown_errors,
+                DiagnosticImpact::ProgressPreserved,
+                localizer,
+                stderr,
+            );
+            ExitCode::FAILURE
+        }
+        GenericCommandRunResult::Interrupted => {
+            let warning = pending_project_log.and_then(PendingProjectLog::finish);
+            render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
+            let _ = writeln!(stderr, "{}", localizer.format(UiMessage::ResultCancelled));
+            if shutdown_errors.is_empty() {
+                ExitCode::from(130)
+            } else {
+                render_generic_shutdown_errors(
+                    shutdown_errors,
+                    DiagnosticImpact::ProgressPreserved,
+                    localizer,
+                    stderr,
+                );
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+fn render_generic_output(
+    output: GenericCommandOutput,
+    localizer: &UiLocalizer,
+    stdout: &mut dyn Write,
+) -> io::Result<()> {
+    let count = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+    match output {
+        GenericCommandOutput::Init { project } => writeln!(
+            stdout,
+            "{}",
+            localizer.format(UiMessage::ResultInitCompleted {
+                project: project.project_name().as_str(),
+            })
+        ),
+        GenericCommandOutput::Extract { project, outcome } => {
+            writeln!(
+                stdout,
+                "{}",
+                localizer.format(UiMessage::ResultExtractCompleted {
+                    project: project.as_str(),
+                })
+            )?;
+            match outcome {
+                crate::generic::ExtractOutcome::Unchanged {
+                    files,
+                    groups,
+                    units,
+                } => writeln!(
+                    stdout,
+                    "{}",
+                    localizer.format(UiMessage::ResultGenericExtractUnchanged {
+                        files: count(files),
+                        groups: count(groups),
+                        units: count(units),
+                    })
+                ),
+                crate::generic::ExtractOutcome::Updated {
+                    files,
+                    groups,
+                    units,
+                    preserved_translations,
+                    cleared_translations,
+                } => writeln!(
+                    stdout,
+                    "{}",
+                    localizer.format(UiMessage::ResultGenericExtractUpdated {
+                        files: count(files),
+                        groups: count(groups),
+                        units: count(units),
+                        preserved: count(preserved_translations),
+                        cleared: count(cleared_translations),
+                    })
+                ),
+            }
+        }
+        GenericCommandOutput::Translate {
+            project,
+            profile_id,
+            summary,
+        } => {
+            writeln!(
+                stdout,
+                "{}",
+                localizer.format(UiMessage::ResultTranslateCompleted {
+                    project: project.as_str(),
+                    profile: &profile_id,
+                })
+            )?;
+            writeln!(
+                stdout,
+                "{}",
+                localizer.format(UiMessage::ResultGenericTranslateSummary {
+                    total: count(summary.total_tasks),
+                    complete: count(summary.complete_tasks),
+                    partial: count(summary.partial_tasks),
+                    unavailable: count(summary.unavailable_tasks),
+                    cleared: count(summary.cleared_units),
+                    reused: count(summary.reused_units),
+                    accepted: count(summary.accepted_units),
+                    written: count(summary.written_units),
+                    conflicted: count(summary.conflicted_units),
+                    problems: count(summary.response_problems),
+                })
+            )?;
+            if summary.total_tasks == 0 {
+                writeln!(
+                    stdout,
+                    "{}",
+                    localizer.format(UiMessage::NoticeNoModelRequest)
+                )?;
+            }
+            Ok(())
+        }
+        GenericCommandOutput::WriteBack {
+            project,
+            output_root,
+            translated_units,
+            retained_source_units,
+        } => {
+            writeln!(
+                stdout,
+                "{}",
+                localizer.format(UiMessage::ResultWriteBackCompleted {
+                    project: project.as_str(),
+                })
+            )?;
+            writeln!(
+                stdout,
+                "{}",
+                localizer.format(UiMessage::ResultOutputDirectory {
+                    path: &output_root.to_string_lossy(),
+                })
+            )?;
+            writeln!(
+                stdout,
+                "{}",
+                localizer.format(UiMessage::ResultGenericWriteBackSummary {
+                    translated: count(translated_units),
+                    original: count(retained_source_units),
+                })
+            )
+        }
+        GenericCommandOutput::Lua { project, .. } => writeln!(
+            stdout,
+            "{}",
+            localizer.format(UiMessage::ResultProjectLuaCompleted {
+                project: project.as_str(),
+            })
+        ),
+    }
+}
+
+fn render_generic_shutdown_errors(
+    errors: &[GenericShutdownError],
+    impact: DiagnosticImpact,
+    localizer: &UiLocalizer,
+    stderr: &mut dyn Write,
+) {
+    for error in errors {
+        let mut diagnostic = error.safe_diagnostic();
+        diagnostic.impact = impact;
+        let _ = render_safe_diagnostic(&diagnostic, localizer, stderr);
     }
 }
 
