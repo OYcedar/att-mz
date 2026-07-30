@@ -1,12 +1,11 @@
 use std::sync::Arc;
 
 use self::rules::RulesProgram;
-use super::ProjectName;
 use crate::progress::{NoopProgressObserver, ProgressObserver, ProgressSnapshot};
+use crate::project_name::ProjectName;
 
 pub(crate) mod builtin;
 pub(crate) mod document;
-pub(crate) mod lua;
 mod model;
 pub(crate) mod rules;
 pub(crate) mod service;
@@ -20,7 +19,7 @@ pub struct ExtractInput {
 
 /// Extract 当前正在执行的 owner 或 owner 内部阶段。
 ///
-/// `Builtin` / `Rules` / `Lua` 只表达 owner 的 `i/N`；其余变体拥有
+/// `Builtin` / `Rules` 只表达 owner 的 `i/N`；其余变体拥有
 /// 各自的真实分母或 spinner，避免用一个假全局百分比混合不同工作量。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExtractProgressPhase {
@@ -32,9 +31,6 @@ pub(crate) enum ExtractProgressPhase {
     RulesDocuments,
     RulesMatches,
     RulesCommit,
-    Lua,
-    LuaExecution,
-    LuaCommit,
 }
 
 /// 在 Extract 纵向切片内共享的不可失败进度入口。

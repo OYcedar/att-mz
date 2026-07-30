@@ -1,30 +1,29 @@
-app-about = Перевод игр RPG Maker с повторно используемым состоянием проекта
+app-about = Перевод игр и структурированного текста с повторно используемым состоянием проекта
 cli-config-help = Строгий файл конфигурации TOML для этого запуска
 cli-ui-language-help = Язык справки, диагностики, прогресса, результатов и журналов проекта: ar, zh-Hans, zh-Hant, en, fr, ru, es, ja, ko или vi
 cli-progress-help = Режим текущего прогресса: auto, plain или off
 cli-mz-about = Перевести игру RPG Maker MZ
 cli-mv-about = Перевести игру RPG Maker MV
-cli-init-about = Инициализировать или обновить именованный игровой проект
-cli-extract-about = Извлечь текст по явному или сохранённому плану owner
+cli-generic-about = Перевести структурированный текст JSONL
+cli-init-about = Инициализировать или обновить именованный проект перевода
+cli-extract-about = Синхронизировать исходный текст из текущего входа проекта
 cli-translate-about = Перевести извлечённый текст с явным или сохранённым Profile
-cli-write-back-about = Записать принятые переводы обратно в игру
-cli-project-lua-about = Однократно выполнить доверенную программу Lua в контексте проекта
+cli-write-back-about = Записать текущие переводы в выходной каталог проекта
+cli-project-lua-about = Однократно выполнить атомарный Lua для базы данных проекта
 cli-project-name-help = Стабильное имя проекта
-cli-init-path-help = Корень игры RPG Maker; существующий проект может повторно использовать последний успешный путь
+cli-init-path-help = Корневой входной каталог; существующий проект может повторно использовать последний успешный путь
 cli-source-language-help = ID исходного языка
 cli-target-language-help = ID целевого языка
 cli-dialogue-width-help = Максимум полноширинных символов в строке диалога
 cli-scrolling-width-help = Максимум полноширинных символов в строке прокручиваемого текста
 cli-help-width-help = Максимум полноширинных символов в строке справки или описания
 cli-builtin-help = Использовать встроенные в ATT позиции текста RPG Maker
-cli-rules-help = Заменить owner Rules этим TOML; пустой список правил отключает его
+cli-rules-help = Заменить правила извлечения RPG Maker этим TOML; пустой список отключает правила
 cli-dialogue-rules-help = Заменить проекцию имён диалога MV, используемую с Builtin
-cli-lua-help = Заменить программу Lua этапа; файл нулевого размера очищает её
 cli-profile-help = ID Profile перевода; при отсутствии используется последний успешный Profile
 cli-terms-help = Заменить терминологический ресурс проекта
 cli-placeholders-help = Заменить ресурс Placeholder проекта
-cli-project-lua-profile-help = Profile для ручной приёмки Standard; если он не указан, при открытии Standard используется последний успешный Translate Profile
-cli-project-lua-script-help = Доверенная программа Lua для однократного выполнения
+cli-project-lua-script-help = Атомарная программа Lua для базы данных, выполняемая один раз
 cli-project-lua-arguments-help = Аргумент UTF-8 для Lua arg[1..] после --
 cli-usage-heading = Использование:
 cli-commands-heading = Команды:
@@ -66,7 +65,7 @@ log-label-phase-planning = планирование
 log-label-phase-confirmed-tasks = подтверждение задач
 log-label-phase-no-work = работа не требуется
 log-label-phase-read-assets = чтение ресурсов
-log-label-phase-plan-standard = планирование стандартной записи
+log-label-phase-plan-rpg-maker-write-back = планирование записи RPG Maker
 log-label-phase-rewrite-documents = перезапись документов
 log-label-phase-validate-candidate = проверка кандидата
 log-label-task-complete = полностью
@@ -83,12 +82,8 @@ plan-source-product-default = поведение продукта
 notice-init-reuse-path = Исходный путь не указан; используется последний успешный путь: { $path }.
 notice-extract-reuse-owners = Область извлечения не указана; используется последний успешный план: { $owners }.
 notice-translate-reuse-profile = Profile не указан; используется последний успешный Profile: { $profile }.
-notice-translate-reuse-lua = Параметр Lua не указан; используется последний успешный выбор Translate Lua.
-notice-write-back-reuse-lua = Параметр Lua не указан; используется последняя успешная программа WriteBack Lua.
-notice-write-back-standard-only = Программа WriteBack Lua не настроена; выполняется только Standard.
 notice-owner-disabled = Owner { $owner } отключён и удалён из будущих автоматических планов.
-notice-lua-cleared = Программа Lua { $phase } очищена и в этот раз выполняться не будет.
-notice-no-model-request = Все единицы стандартного перевода актуальны; в этом запуске Standard не отправлял запрос к модели.
+notice-no-model-request = Все единицы перевода актуальны; в этом запуске запрос к модели не требовался.
 notice-manual-layout = { $count ->
     [one] 1 единица требует ручной проверки переноса строк.
     [few] { $count } единицы требуют ручной проверки переноса строк.
@@ -107,7 +102,6 @@ progress-extract-owner = Owner извлечения: { $owner }
 progress-extract-documents = Сканирование документов
 progress-extract-builtin = Единицы Builtin
 progress-extract-rules = Определения Rules
-progress-extract-lua = Выполнение программы Extract Lua
 progress-extract-commit = Commit извлечённых ресурсов
 progress-translate-planning = Планирование задач перевода
 progress-translate-confirmed = Подтверждено задач перевода
@@ -116,7 +110,6 @@ progress-project-lua = Выполнение программы Lua проект�
 progress-write-back-read-assets = Чтение принятых ресурсов
 progress-write-back-planning = Планирование перезаписи документов
 progress-write-back-documents = Перезаписано документов
-progress-write-back-lua = Выполнение программы WriteBack Lua
 progress-write-back-validate-candidate = Проверка кандидата вывода
 progress-write-back-publish = Публикация вывода; при прерывании ожидается подтверждённый результат
 progress-finalizing = Завершение обязательных ресурсов
@@ -128,23 +121,27 @@ result-init-updated = Состояние проекта: обновлён
 result-init-stale-owners = Требуется повторное извлечение: { $owners }
 result-extract-completed = Извлечение завершено: { $project }
 result-translate-completed = Перевод завершён: { $project } (Profile: { $profile })
-result-translate-standard = Стандартный перевод: { $total } задач; завершено { $complete }, частично { $partial }, недоступно { $unavailable }; записано { $written } позиций, осталось { $remaining }
+result-translate-summary = Перевод: { $total } задач; завершено { $complete }, частично { $partial }, недоступно { $unavailable }; записано { $written } позиций, осталось { $remaining }
 result-translate-convergence = Сведение состояния: сохранено { $retained }, аннулировано { $invalidated }, неприменимо { $not_applicable }, переиспользовано { $reused }
 result-write-back-completed = Запись завершена: { $project }
 result-project-lua-completed = Выполнение Lua проекта завершено: { $project }
 result-output-directory = Каталог вывода: { $path }
-result-write-back-standard = Стандартная запись: { $translated } переведённых единиц, { $original } исходных; автоперенос { $auto_wrapped }, добавлено переносов { $breaks } и полноширинных отступов { $indents }; ручная раскладка { $manual }
-result-lua-executed = Lua: выполнено
-result-lua-not-executed = Lua: не выполнено
+result-write-back-summary = Запись: { $translated } переведённых единиц, { $original } исходных; автоперенос { $auto_wrapped }, добавлено переносов { $breaks } и полноширинных отступов { $indents }; ручная раскладка { $manual }
+result-generic-extract-unchanged = Входные данные Generic не изменились: файлов — { $files }, групп — { $groups }, единиц — { $units }
+result-generic-extract-updated = Входные данные Generic обновлены: файлов — { $files }, групп — { $groups }, единиц — { $units }; переводов сохранено — { $preserved }, очищено — { $cleared }
+result-generic-translate-summary = Перевод Generic: { $total } задач; завершено { $complete }, частично { $partial }, недоступно { $unavailable }; очищено { $cleared }, повторно использовано { $reused }, принято { $accepted }, записано { $written }, конфликтов { $conflicted }, проблем ответа { $problems }
+result-generic-write-back-summary = Запись Generic: { $translated } переведённых единиц, { $original } исходных сохранено
 result-cancelled = Команда отменена после безопасного завершения.
 result-plan-saved = Успешный план запуска сохранён.
-result-translate-plan-sources = План этого успешного запуска сохранён. Источник Profile: { $profile_source }; источник Lua: { $lua_source }.
 log-run-started = Команда { $command } запущена.
 log-run-succeeded = Команда { $command } успешно завершена.
 log-run-failed = Команда { $command } завершилась ошибкой.
 log-run-outcome-unknown = Команда { $command } завершилась, но итоговое состояние неизвестно; используйте пути восстановления из ошибки.
 log-run-cancelled = Команда { $command } отменена.
 log-performance-counters = Счётчики производительности: попыток управления транзакциями SQLite — { $sqlite_control_attempted_total }; полных проверок дерева-кандидата начато — { $candidate_validation_started }, завершено — { $candidate_validation_completed }.
+log-lua-script = Сценарий Lua { $identity } (SHA-256 { $fingerprint }).
+log-lua-print = Lua: { $message }
+log-lua-summary = Lua зафиксирован: вызовов базы данных — { $database_calls }, изменено строк — { $changed_rows }, вызовов перевода — { $translation_calls }, строк print — { $printed_lines }.
 log-plan-resolved = План команды { $command } получен из { $source }.
 log-phase-started = Этап начат: { $phase }.
 log-phase-finished = Этап завершён: { $phase }.
@@ -227,7 +224,8 @@ diagnostic-action-value = { $code ->
 }
 diagnostic-failure-value = { $code ->
     [missing_required_value] Отсутствует обязательное значение
-    [extract_plan_required] Нет сохранённого плана Extract для повторного использования; укажите хотя бы один из параметров --builtin, --rules или --lua
+    [extract_plan_required] Нет сохранённого плана Extract для повторного использования; укажите --builtin или --rules
+    [generic_extract_required] Входные JSONL больше не соответствуют последнему Extract; снова выполните att generic extract
     [conflicting_values] Указанные значения конфликтуют
     [invalid_syntax] Значение имеет недопустимый синтаксис
     [invalid_encoding] Недопустимая кодировка текста
@@ -271,8 +269,6 @@ diagnostic-failure-value = { $code ->
     [lua_execution_failed] Ошибка во время выполнения основной программы Lua
     [lua_host_call_failed] Ошибка вызова возможности хоста Lua
     [lua_finalization_failed] Хост Lua не смог завершить все связанные ресурсы
-    [lua_unclosed_transaction] Программа Lua завершилась с открытой транзакцией; транзакция отменена
-    [lua_snapshot_store_failed] Не удалось зафиксировать проверенный снимок извлечения Lua
     [rules_definition_invalid] Программа Rules не соответствует контракту определения Rules
     [rules_document_read_failed] Не удалось прочитать исходный документ, требуемый программой Rules
     [rules_no_non_blank_match] Запись Rules не создала непустую семантическую единицу
@@ -287,14 +283,13 @@ diagnostic-failure-value = { $code ->
     [rules_snapshot_invalid] Извлечённые группы Rules не образуют допустимый снимок ресурсов
     [rules_snapshot_store_failed] Не удалось зафиксировать проверенный снимок извлечения Rules
     [write_back_extraction_out_of_date] Извлечённые ресурсы больше не соответствуют текущему источнику проекта
-    [write_back_asset_snapshot_invalid] Сохранённые ресурсы Standard не образуют допустимый снимок обратной записи
+    [write_back_asset_snapshot_invalid] Сохранённые ресурсы RPG Maker не образуют допустимый снимок обратной записи
     [source_document_invalid] Исходный документ RPG Maker не соответствует требуемому формату
     [write_back_mutation_invalid] Проверенное изменение перевода нельзя применить к зафиксированному исходному расположению
     [write_back_output_path_invalid] Перезаписанный файл находится вне разрешённого дерева вывода RPG Maker
     [write_back_output_path_duplicate] Несколько перезаписанных файлов нацелены на один путь вывода
     [write_back_candidate_project_mismatch] Подготовленный кандидат обратной записи принадлежит другому проекту
     [write_back_candidate_invalid] Кандидат обратной записи не соответствует требуемой структуре дерева data/js
-    [write_back_unexpected_lua_outcome] Программа Lua обратной записи вернула результат другой фазы Lua
     [write_back_not_published] Кандидат обратной записи не заменил текущий каталог вывода
     [write_back_published_with_residuals] Вывод опубликован, но некоторые артефакты восстановления не удалены
     [write_back_recovery_required] Перед использованием содержимого каталога вывода требуется восстановление

@@ -1,85 +1,8 @@
-//! 在单一 SQLite 连接上执行动态语句的交互式会话根能力。
+//! 长寿命 SQLite 会话共用的终结契约。
 
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
-use std::path::PathBuf;
-use std::sync::Arc;
-
-use crate::storage::sqlite::{SqliteCommand, SqliteQuery, SqliteRow};
-
-/// 打开一个现存项目数据库的交互式会话失败。
-#[derive(Debug)]
-pub(crate) enum OpenSqliteInteractiveSessionError<E> {
-    NotFound,
-    OpenFailed(E),
-}
-
-impl<E> fmt::Display for OpenSqliteInteractiveSessionError<E>
-where
-    E: fmt::Display,
-{
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotFound => formatter.write_str("目标数据库不存在"),
-            Self::OpenFailed(source) => write!(formatter, "无法打开交互式数据库会话：{source}"),
-        }
-    }
-}
-
-impl<E> Error for OpenSqliteInteractiveSessionError<E>
-where
-    E: Error + 'static,
-{
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::NotFound => None,
-            Self::OpenFailed(source) => Some(source),
-        }
-    }
-}
-
-/// 交互式会话中的单次操作失败。
-#[derive(Debug)]
-pub(crate) enum SqliteInteractiveSessionError<E> {
-    Closed,
-    Indeterminate,
-    TransactionAlreadyActive,
-    NoActiveTransaction,
-    OperationFailed(E),
-    OutcomeUnknown(E),
-}
-
-impl<E> fmt::Display for SqliteInteractiveSessionError<E>
-where
-    E: fmt::Display,
-{
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Closed => formatter.write_str("交互式数据库会话已经进入终结阶段"),
-            Self::Indeterminate => formatter.write_str("数据库会话结果已无法确定，只能终结会话"),
-            Self::TransactionAlreadyActive => formatter.write_str("数据库事务已经开始"),
-            Self::NoActiveTransaction => formatter.write_str("当前没有活动数据库事务"),
-            Self::OperationFailed(source) => write!(formatter, "数据库会话操作失败：{source}"),
-            Self::OutcomeUnknown(source) => write!(formatter, "数据库操作结果未知：{source}"),
-        }
-    }
-}
-
-impl<E> Error for SqliteInteractiveSessionError<E>
-where
-    E: Error + 'static,
-{
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::OperationFailed(source) | Self::OutcomeUnknown(source) => Some(source),
-            Self::Closed
-            | Self::Indeterminate
-            | Self::TransactionAlreadyActive
-            | Self::NoActiveTransaction => None,
-        }
-    }
-}
 
 /// 交互式会话已完整终结。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,44 +95,6 @@ impl<E: Error + 'static> Error for SqliteInteractiveSessionFinalizationError<E> 
     }
 }
 
-/// 在同一现存 SQLite 连接上执行的操作面。
-///
-/// `OutcomeUnknown` 之后实现必须进入不可继续执行的状态；后续调用只能
-/// 返回 `Indeterminate`，终结令牌仍然可以完成回滚观察和连接关闭。
-pub(crate) trait SqliteInteractiveSessionOperations: Send + Sync + 'static {
-    type Error: Error + Send + Sync + 'static;
-
-    fn query(
-        &self,
-        query: SqliteQuery,
-    ) -> impl Future<Output = Result<Vec<SqliteRow>, SqliteInteractiveSessionError<Self::Error>>> + Send;
-
-    fn execute(
-        &self,
-        command: SqliteCommand,
-    ) -> impl Future<Output = Result<u64, SqliteInteractiveSessionError<Self::Error>>> + Send;
-
-    fn begin(
-        &self,
-    ) -> impl Future<Output = Result<(), SqliteInteractiveSessionError<Self::Error>>> + Send;
-
-    fn commit(
-        &self,
-    ) -> impl Future<Output = Result<(), SqliteInteractiveSessionError<Self::Error>>> + Send;
-
-    fn rollback(
-        &self,
-    ) -> impl Future<Output = Result<(), SqliteInteractiveSessionError<Self::Error>>> + Send;
-
-    /// 返回同一连接在此前全部已入队操作之后的权威事务状态。
-    ///
-    /// 该观察必须覆盖通过 `query`/`execute` 直接执行的事务控制语句，而不能只跟踪
-    /// `begin`/`commit`/`rollback` 便利方法。
-    fn transaction_active(
-        &self,
-    ) -> impl Future<Output = Result<bool, SqliteInteractiveSessionError<Self::Error>>> + Send;
-}
-
 /// 一次性终结交互式 SQLite 会话的唯一令牌。
 ///
 /// 具体令牌不得实现 `Clone` 或 `Copy`。`finalize` 按值消费令牌，终止新
@@ -224,46 +109,5 @@ pub(crate) trait SqliteInteractiveSessionFinalizer: Send + 'static {
             SqliteInteractiveSessionFinalization,
             SqliteInteractiveSessionFinalizationError<Self::Error>,
         >,
-    > + Send;
-}
-
-/// 工厂交付的交互式 SQLite 会话。
-///
-/// 操作面可以被 Host 调用共享，终结令牌只能移交给唯一的运行监督者。
-#[must_use = "打开的 SQLite 会话必须把终结令牌移交给运行监督者"]
-pub(crate) struct OpenedSqliteInteractiveSession<O, F> {
-    operations: Arc<O>,
-    finalizer: F,
-}
-
-pub(crate) type OpenSqliteInteractiveSessionResult<O, F, E> =
-    Result<OpenedSqliteInteractiveSession<O, F>, OpenSqliteInteractiveSessionError<E>>;
-
-impl<O, F> OpenedSqliteInteractiveSession<O, F> {
-    pub(crate) fn new(operations: Arc<O>, finalizer: F) -> Self {
-        Self {
-            operations,
-            finalizer,
-        }
-    }
-
-    pub(crate) fn into_parts(self) -> (Arc<O>, F) {
-        (self.operations, self.finalizer)
-    }
-}
-
-/// 打开一个不会创建缺失数据库的交互式会话。
-pub(crate) trait SqliteInteractiveSessionFactory: Send + Sync {
-    type Operations: SqliteInteractiveSessionOperations;
-    type Finalizer: SqliteInteractiveSessionFinalizer<
-        Error = <Self::Operations as SqliteInteractiveSessionOperations>::Error,
-    >;
-    type Error: Error + Send + Sync + 'static;
-
-    fn open_existing(
-        &self,
-        path: PathBuf,
-    ) -> impl Future<
-        Output = OpenSqliteInteractiveSessionResult<Self::Operations, Self::Finalizer, Self::Error>,
     > + Send;
 }

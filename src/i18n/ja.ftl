@@ -1,30 +1,29 @@
-app-about = 再利用可能なプロジェクト状態で RPG Maker ゲームを翻訳します
+app-about = 再利用可能なプロジェクト状態でゲームと構造化テキストを翻訳します
 cli-config-help = 今回の実行で使用する厳密な TOML 設定ファイル
 cli-ui-language-help = ヘルプ、診断、進捗、結果、プロジェクトログの言語: ar、zh-Hans、zh-Hant、en、fr、ru、es、ja、ko、vi
 cli-progress-help = 進捗表示モード: auto、plain、off
 cli-mz-about = RPG Maker MZ ゲームを翻訳します
 cli-mv-about = RPG Maker MV ゲームを翻訳します
-cli-init-about = 名前付きゲームプロジェクトを初期化または更新します
-cli-extract-about = 明示または保存済み owner プランで原文を抽出します
+cli-generic-about = 規定の JSONL テキストを翻訳します
+cli-init-about = 名前付き翻訳プロジェクトを初期化または更新します
+cli-extract-about = プロジェクトの現在の入力から原文を同期します
 cli-translate-about = 明示または保存済み Profile で抽出済み原文を翻訳します
-cli-write-back-about = 承認済み訳文をゲームへ書き戻します
-cli-project-lua-about = プロジェクトコンテキストで信頼済み Lua プログラムを一度実行します
+cli-write-back-about = 現在の訳文をプロジェクトの出力へ書き込みます
+cli-project-lua-about = プロジェクトで原子的なデータベース Lua を一度実行します
 cli-project-name-help = 安定したプロジェクト名
-cli-init-path-help = RPG Maker ゲームのルート。既存プロジェクトでは前回成功時のパスを再利用できます
+cli-init-path-help = 入力ルートディレクトリ。既存プロジェクトでは前回成功時のパスを再利用できます
 cli-source-language-help = 原文の言語 ID
 cli-target-language-help = 翻訳先の言語 ID
 cli-dialogue-width-help = 会話行あたりの最大全角文字数
 cli-scrolling-width-help = スクロールテキスト行あたりの最大全角文字数
 cli-help-width-help = ヘルプまたは説明行あたりの最大全角文字数
 cli-builtin-help = ATT 内蔵の RPG Maker テキスト位置を使用します
-cli-rules-help = Rules owner をこの TOML 定義で置換します。空のルール一覧で無効になります
+cli-rules-help = RPG Maker 抽出ルールをこの TOML 定義で置換します。空のルール一覧で無効になります
 cli-dialogue-rules-help = Builtin と併用する MV 会話名投影を置換します
-cli-lua-help = このフェーズの Lua プログラムを置換します。0 バイトのファイルで消去します
 cli-profile-help = 翻訳 Profile ID。省略すると前回成功した Profile を再利用します
 cli-terms-help = プロジェクトの用語リソースを置換します
 cli-placeholders-help = プロジェクトの Placeholder リソースを置換します
-cli-project-lua-profile-help = Standard 手動承認用 Profile。省略すると Standard を開く際に直近の成功した Translate Profile を再利用します
-cli-project-lua-script-help = 一度だけ実行する信頼済み Lua プログラム
+cli-project-lua-script-help = 一度だけ実行する原子的なデータベース Lua プログラム
 cli-project-lua-arguments-help = -- の後で Lua arg[1..] に渡す UTF-8 引数
 cli-usage-heading = 使用法:
 cli-commands-heading = コマンド:
@@ -66,7 +65,7 @@ log-label-phase-planning = 計画
 log-label-phase-confirmed-tasks = タスク確認
 log-label-phase-no-work = 作業不要
 log-label-phase-read-assets = アセット読み取り
-log-label-phase-plan-standard = 標準書き戻し計画
+log-label-phase-plan-rpg-maker-write-back = RPG Maker 書き戻し計画
 log-label-phase-rewrite-documents = ドキュメント書き換え
 log-label-phase-validate-candidate = 候補検証
 log-label-task-complete = 完了
@@ -83,12 +82,8 @@ plan-source-product-default = 製品動作
 notice-init-reuse-path = 元パスが指定されなかったため、前回成功したパスを再利用します: { $path }。
 notice-extract-reuse-owners = 抽出範囲が指定されなかったため、前回成功したプランを再利用します: { $owners }。
 notice-translate-reuse-profile = Profile が指定されなかったため、前回成功した Profile を再利用します: { $profile }。
-notice-translate-reuse-lua = Lua オプションが指定されなかったため、前回成功した Translate Lua の選択を再利用します。
-notice-write-back-reuse-lua = Lua オプションが指定されなかったため、前回成功した WriteBack Lua プログラムを再利用します。
-notice-write-back-standard-only = WriteBack Lua プログラムは未設定です。Standard のみ実行します。
 notice-owner-disabled = owner { $owner } を無効にし、今後の自動プランから削除しました。
-notice-lua-cleared = { $phase } Lua プログラムを消去しました。今回は実行しません。
-notice-no-model-request = すべての標準翻訳単位が最新のため、今回 Standard はモデルへのリクエストを行いませんでした。
+notice-no-model-request = すべての翻訳単位が最新のため、今回はモデルへのリクエストを行いませんでした。
 notice-manual-layout = { $count } 単位で改行の手動確認が必要です。
 notice-log-degraded = プロジェクトログを利用できないか劣化しています。コマンドは継続し、終了状態には影響しません。
 notice-task-records-degraded = 翻訳タスク記録を利用できないか劣化しています。コマンドは継続し、終了状態には影響しません。
@@ -102,7 +97,6 @@ progress-extract-owner = 抽出 owner: { $owner }
 progress-extract-documents = 文書を走査しています
 progress-extract-builtin = Builtin 作業単位
 progress-extract-rules = Rules 定義
-progress-extract-lua = Extract Lua プログラムを実行しています
 progress-extract-commit = 抽出資産をコミットしています
 progress-translate-planning = 翻訳タスクを計画しています
 progress-translate-confirmed = 確認済みの翻訳タスク
@@ -111,7 +105,6 @@ progress-project-lua = プロジェクト Lua プログラムを実行してい�
 progress-write-back-read-assets = 承認済み資産を読み込んでいます
 progress-write-back-planning = 文書書き換えを計画しています
 progress-write-back-documents = 文書を書き換えました
-progress-write-back-lua = WriteBack Lua プログラムを実行しています
 progress-write-back-validate-candidate = 出力候補を検証しています
 progress-write-back-publish = 出力を公開しています。中断後も確定結果を待ちます
 progress-finalizing = 必須の終了処理を実行しています
@@ -123,23 +116,27 @@ result-init-updated = プロジェクト状態: 更新済み
 result-init-stale-owners = 再抽出が必要です: { $owners }
 result-extract-completed = 抽出完了: { $project }
 result-translate-completed = 翻訳完了: { $project }（Profile: { $profile }）
-result-translate-standard = 標準翻訳: タスク { $total }、完全 { $complete }、部分 { $partial }、利用不可 { $unavailable }。{ $written } 箇所を書き込み、残り { $remaining } 箇所
+result-translate-summary = 翻訳: タスク { $total }、完全 { $complete }、部分 { $partial }、利用不可 { $unavailable }。{ $written } 箇所を書き込み、残り { $remaining } 箇所
 result-translate-convergence = 状態収束: 保持 { $retained }、無効化 { $invalidated }、非該当 { $not_applicable }、再利用 { $reused }
 result-write-back-completed = 書き戻し完了: { $project }
 result-project-lua-completed = プロジェクト Lua 実行完了: { $project }
 result-output-directory = 出力ディレクトリ: { $path }
-result-write-back-standard = 標準書き戻し: 訳文 { $translated } 単位、原文 { $original } 単位。自動折返し { $auto_wrapped }、改行追加 { $breaks }、全角インデント追加 { $indents }。手動配置 { $manual }
-result-lua-executed = Lua: 実行済み
-result-lua-not-executed = Lua: 未実行
+result-write-back-summary = 書き戻し: 訳文 { $translated } 単位、原文 { $original } 単位。自動折返し { $auto_wrapped }、改行追加 { $breaks }、全角インデント追加 { $indents }。手動配置 { $manual }
+result-generic-extract-unchanged = Generic 入力に変更なし: { $files } ファイル、{ $groups } グループ、{ $units } 単位
+result-generic-extract-updated = Generic 入力を更新: { $files } ファイル、{ $groups } グループ、{ $units } 単位。訳文 { $preserved } 件を保持し、{ $cleared } 件を消去
+result-generic-translate-summary = Generic 翻訳: タスク { $total }、完全 { $complete }、部分 { $partial }、利用不可 { $unavailable }。クリア { $cleared }、再利用 { $reused }、受理 { $accepted }、書き込み { $written }、競合 { $conflicted }、応答問題 { $problems }
+result-generic-write-back-summary = Generic 書き戻し: 訳文 { $translated } 単位、原文保持 { $original } 単位
 result-cancelled = 安全な終了処理後にコマンドをキャンセルしました。
 result-plan-saved = 成功した実行プランを保存しました。
-result-translate-plan-sources = 今回成功した実行プランを保存しました。Profile の指定元: { $profile_source }、Lua の指定元: { $lua_source }。
 log-run-started = コマンド { $command } を開始しました。
 log-run-succeeded = コマンド { $command } は正常に完了しました。
 log-run-failed = コマンド { $command } に失敗しました。
 log-run-outcome-unknown = コマンド { $command } は終了しましたが、最終結果は不明です。エラーに示された復旧場所を確認してください。
 log-run-cancelled = コマンド { $command } をキャンセルしました。
 log-performance-counters = パフォーマンスカウンター：SQLite トランザクション制御の試行 { $sqlite_control_attempted_total } 回、候補ツリー全体の検証開始 { $candidate_validation_started } 回、完了 { $candidate_validation_completed } 回。
+log-lua-script = Lua スクリプト { $identity }（SHA-256 { $fingerprint }）。
+log-lua-print = Lua：{ $message }
+log-lua-summary = Lua をコミットしました：データベース呼び出し { $database_calls } 回、変更行 { $changed_rows } 行、翻訳呼び出し { $translation_calls } 回、print { $printed_lines } 行。
 log-plan-resolved = コマンド { $command } のプラン元: { $source }。
 log-phase-started = フェーズ開始: { $phase }。
 log-phase-finished = フェーズ完了: { $phase }。
@@ -212,7 +209,8 @@ diagnostic-action-value = { $code ->
 }
 diagnostic-failure-value = { $code ->
     [missing_required_value] 必須値がありません
-    [extract_plan_required] 再利用可能な Extract プランが保存されていません。--builtin、--rules、--lua のいずれかを指定してください
+    [extract_plan_required] 再利用可能な Extract プランが保存されていません。--builtin または --rules を指定してください
+    [generic_extract_required] JSONL 入力が直近の Extract と一致しません。att generic extract を再実行してください
     [conflicting_values] 指定された値が競合しています
     [invalid_syntax] 値の構文が無効です
     [invalid_encoding] テキストのエンコーディングが無効です
@@ -256,8 +254,6 @@ diagnostic-failure-value = { $code ->
     [lua_execution_failed] Lua メインプログラムの実行中に失敗しました
     [lua_host_call_failed] Lua ホスト機能の呼び出しに失敗しました
     [lua_finalization_failed] Lua ホストがすべてのバインド済みリソースを確定できませんでした
-    [lua_unclosed_transaction] Lua プログラム終了時にトランザクションが開いたままだったため、ロールバックされました
-    [lua_snapshot_store_failed] 検証済み Lua 抽出スナップショットをコミットできませんでした
     [rules_definition_invalid] Rules プログラムが Rules 定義契約を満たしていません
     [rules_document_read_failed] Rules プログラムに必要なソース文書を読み取れませんでした
     [rules_no_non_blank_match] Rules エントリから空白以外の意味単位が生成されませんでした
@@ -272,14 +268,13 @@ diagnostic-failure-value = { $code ->
     [rules_snapshot_invalid] 抽出された Rules グループが有効なアセットスナップショットを形成しません
     [rules_snapshot_store_failed] 検証済み Rules 抽出スナップショットをコミットできませんでした
     [write_back_extraction_out_of_date] 抽出済みアセットが現在のプロジェクトソースと一致しません
-    [write_back_asset_snapshot_invalid] 保存された Standard アセットが有効な書き戻しスナップショットを形成しません
+    [write_back_asset_snapshot_invalid] 保存された RPG Maker アセットが有効な書き戻しスナップショットを形成しません
     [source_document_invalid] RPG Maker のソース文書が必要な文書形式を満たしていません
     [write_back_mutation_invalid] 検証済み翻訳変更を固定されたソース位置に適用できません
     [write_back_output_path_invalid] 書き換えたファイルが許可された RPG Maker 出力ツリー外にあります
     [write_back_output_path_duplicate] 複数の書き換えファイルが同じ出力パスを対象にしています
     [write_back_candidate_project_mismatch] 準備済み書き戻し候補は別のプロジェクトに属しています
     [write_back_candidate_invalid] 書き戻し候補が必要な data/js ツリー構造を満たしていません
-    [write_back_unexpected_lua_outcome] Lua 書き戻しプログラムが別の Lua フェーズの結果を返しました
     [write_back_not_published] 書き戻し候補が現在の出力ディレクトリを置き換えませんでした
     [write_back_published_with_residuals] 出力は公開されましたが、一部の復旧成果物を削除できませんでした
     [write_back_recovery_required] 内容を信頼する前に出力ディレクトリの復旧が必要です

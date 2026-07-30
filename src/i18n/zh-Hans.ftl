@@ -1,30 +1,29 @@
-app-about = 使用可复用项目状态翻译 RPG Maker 游戏
+app-about = 使用可复用项目状态翻译游戏和结构化文本
 cli-config-help = 本次运行使用的严格 TOML 配置文件
 cli-ui-language-help = Help、诊断、进度、结果和项目日志使用的语言：ar、zh-Hans、zh-Hant、en、fr、ru、es、ja、ko 或 vi
 cli-progress-help = 实时进度模式：auto、plain 或 off
 cli-mz-about = 翻译 RPG Maker MZ 游戏
 cli-mv-about = 翻译 RPG Maker MV 游戏
-cli-init-about = 初始化或更新一个命名游戏项目
-cli-extract-about = 使用显式或已保存的 owner 方案提取原文
+cli-generic-about = 翻译约定 JSONL 文本
+cli-init-about = 初始化或更新一个命名翻译项目
+cli-extract-about = 从项目当前输入同步原文
 cli-translate-about = 使用显式或已保存的 Profile 翻译已提取原文
-cli-write-back-about = 将已验收译文写回游戏
-cli-project-lua-about = 在项目上下文中一次性运行可信 Lua 程序
+cli-write-back-about = 将当前译文写入项目输出
+cli-project-lua-about = 在项目中一次性运行原子数据库 Lua
 cli-project-name-help = 稳定项目名称
-cli-init-path-help = RPG Maker 游戏根目录；已有项目可复用上次成功路径
+cli-init-path-help = 输入根目录；已有项目可复用上次成功路径
 cli-source-language-help = 原文语言 ID
 cli-target-language-help = 译文目标语言 ID
 cli-dialogue-width-help = 对话正文每行允许的最大全角字符数
 cli-scrolling-width-help = 滚动文本每行允许的最大全角字符数
 cli-help-width-help = 帮助或说明框每行允许的最大全角字符数
 cli-builtin-help = 使用 ATT 内置的 RPG Maker 文本位置
-cli-rules-help = 用该 TOML 定义替换 Rules owner；空规则列表会停用它
+cli-rules-help = 用该 TOML 定义替换 RPG Maker 提取规则；空规则列表会停用规则
 cli-dialogue-rules-help = 替换与 Builtin 配合使用的 MV 对话姓名投影
-cli-lua-help = 替换当前阶段的 Lua 程序；零字节文件会清除它
 cli-profile-help = 翻译 Profile ID；省略时复用上次成功 Profile
 cli-terms-help = 替换项目术语资源
 cli-placeholders-help = 替换项目 Placeholder 资源
-cli-project-lua-profile-help = Standard 人工验收使用的 Profile；省略时在打开 Standard 能力时复用上次成功的 Translate Profile
-cli-project-lua-script-help = 本次一次性运行的可信 Lua 程序
+cli-project-lua-script-help = 本次一次性运行的原子数据库 Lua 程序
 cli-project-lua-arguments-help = 在 -- 后传给 Lua arg[1..] 的 UTF-8 参数
 cli-usage-heading = 用法：
 cli-commands-heading = 命令：
@@ -66,7 +65,7 @@ log-label-phase-planning = 规划任务
 log-label-phase-confirmed-tasks = 确认任务
 log-label-phase-no-work = 无需处理
 log-label-phase-read-assets = 读取资产
-log-label-phase-plan-standard = 规划标准写回
+log-label-phase-plan-rpg-maker-write-back = 规划 RPG Maker 写回
 log-label-phase-rewrite-documents = 改写文档
 log-label-phase-validate-candidate = 验证候选目录
 log-label-task-complete = 完整
@@ -83,12 +82,8 @@ plan-source-product-default = 产品行为
 notice-init-reuse-path = 未提供来源路径，已沿用上次成功路径：{ $path }。
 notice-extract-reuse-owners = 未提供提取范围，已沿用上次成功方案：{ $owners }。
 notice-translate-reuse-profile = 未提供 Profile，已沿用上次成功 Profile：{ $profile }。
-notice-translate-reuse-lua = 未提供 Lua 选项，已沿用上次成功的 Translate Lua 选择。
-notice-write-back-reuse-lua = 未提供 Lua 选项，已沿用上次成功的 WriteBack Lua 程序。
-notice-write-back-standard-only = 尚未配置 WriteBack Lua 程序，本次仅执行 Standard。
 notice-owner-disabled = 已停用 owner { $owner }，并将其移出后续自动方案。
-notice-lua-cleared = 已清除 { $phase } Lua 程序，本轮不会执行。
-notice-no-model-request = 全部标准翻译单元均为最新状态，Standard 本次未请求模型。
+notice-no-model-request = 全部翻译单元均为最新状态，本次无需请求模型。
 notice-manual-layout = 有 { $count } 个单元需要人工检查换行。
 notice-log-degraded = 项目日志不可用或已降级；命令会继续，退出状态不受影响。
 notice-task-records-degraded = 翻译任务记录不可用或已降级；命令会继续，退出状态不受影响。
@@ -102,7 +97,6 @@ progress-extract-owner = 提取 owner：{ $owner }
 progress-extract-documents = 正在扫描文档
 progress-extract-builtin = Builtin 工作单元
 progress-extract-rules = Rules 规则
-progress-extract-lua = 正在运行 Extract Lua 程序
 progress-extract-commit = 正在提交提取资产
 progress-translate-planning = 正在规划翻译任务
 progress-translate-confirmed = 已确认翻译任务
@@ -111,7 +105,6 @@ progress-project-lua = 正在运行项目 Lua 程序
 progress-write-back-read-assets = 正在读取已验收资产
 progress-write-back-planning = 正在规划文档改写
 progress-write-back-documents = 已改写文档
-progress-write-back-lua = 正在运行 WriteBack Lua 程序
 progress-write-back-validate-candidate = 正在验证输出候选
 progress-write-back-publish = 正在发布输出；中断后会等待明确终态
 progress-finalizing = 正在完成必要收尾
@@ -123,23 +116,27 @@ result-init-updated = 项目状态：已更新
 result-init-stale-owners = 需重新提取：{ $owners }
 result-extract-completed = 提取完成：{ $project }
 result-translate-completed = 翻译执行完成：{ $project }（Profile：{ $profile }）
-result-translate-standard = 标准翻译：任务 { $total }，完整 { $complete }，部分 { $partial }，不可用 { $unavailable }；写入 { $written } 处，剩余 { $remaining } 处
+result-translate-summary = 翻译：任务 { $total }，完整 { $complete }，部分 { $partial }，不可用 { $unavailable }；写入 { $written } 处，剩余 { $remaining } 处
 result-translate-convergence = 状态收敛：保留 { $retained }，失效 { $invalidated }，不适用 { $not_applicable }，复用 { $reused }
 result-write-back-completed = 写回完成：{ $project }
 result-project-lua-completed = 项目 Lua 执行完成：{ $project }
 result-output-directory = 输出目录：{ $path }
-result-write-back-standard = 标准写回：应用译文 { $translated } 个单元，保留原文 { $original } 个单元；自动换行 { $auto_wrapped } 段，新增换行 { $breaks } 处；续行全角缩进 { $indents } 处；需人工换行 { $manual } 段
-result-lua-executed = Lua：已执行
-result-lua-not-executed = Lua：未执行
+result-write-back-summary = 写回：应用译文 { $translated } 个单元，保留原文 { $original } 个单元；自动换行 { $auto_wrapped } 段，新增换行 { $breaks } 处；续行全角缩进 { $indents } 处；需人工换行 { $manual } 段
+result-generic-extract-unchanged = Generic 输入未变化：{ $files } 个文件，{ $groups } 个组，{ $units } 个单元
+result-generic-extract-updated = Generic 输入已更新：{ $files } 个文件，{ $groups } 个组，{ $units } 个单元；保留 { $preserved } 条译文，清除 { $cleared } 条
+result-generic-translate-summary = Generic 翻译：任务 { $total }，完整 { $complete }，部分 { $partial }，不可用 { $unavailable }；清除 { $cleared }，复用 { $reused }，接受 { $accepted }，写入 { $written }，冲突 { $conflicted }，响应问题 { $problems }
+result-generic-write-back-summary = Generic 写回：应用译文 { $translated } 个单元，保留原文 { $original } 个单元
 result-cancelled = 命令已在安全收尾后取消。
 result-plan-saved = 已保存本次成功运行方案。
-result-translate-plan-sources = 已保存本次成功运行方案。Profile 来源：{ $profile_source }；Lua 来源：{ $lua_source }。
 log-run-started = 命令 { $command } 已开始。
 log-run-succeeded = 命令 { $command } 已成功完成。
 log-run-failed = 命令 { $command } 失败。
 log-run-outcome-unknown = 命令 { $command } 结束，但最终结果未知；请按错误中的恢复位置处理。
 log-run-cancelled = 命令 { $command } 已取消。
 log-performance-counters = 性能计数：SQLite 事务控制尝试 { $sqlite_control_attempted_total } 次；完整候选树校验开始 { $candidate_validation_started } 次，完成 { $candidate_validation_completed } 次。
+log-lua-script = Lua 脚本 { $identity }（SHA-256 { $fingerprint }）。
+log-lua-print = Lua：{ $message }
+log-lua-summary = Lua 已提交：数据库调用 { $database_calls } 次，修改行 { $changed_rows } 行，译文调用 { $translation_calls } 次，print { $printed_lines } 行。
 log-plan-resolved = 命令 { $command } 的方案来自{ $source }。
 log-phase-started = 阶段开始：{ $phase }。
 log-phase-finished = 阶段完成：{ $phase }。
@@ -212,7 +209,8 @@ diagnostic-action-value = { $code ->
 }
 diagnostic-failure-value = { $code ->
     [missing_required_value] 缺少必填值
-    [extract_plan_required] 项目没有可复用的 Extract 方案；必须提供 --builtin、--rules 或 --lua 中的至少一项
+    [extract_plan_required] 项目没有可复用的 Extract 方案；请提供 --builtin 或 --rules
+    [generic_extract_required] 当前 JSONL 输入与最近一次 Extract 不一致；请重新运行 att generic extract
     [conflicting_values] 提供的值互相冲突
     [invalid_syntax] 值的语法无效
     [invalid_encoding] 文本编码无效
@@ -256,8 +254,6 @@ diagnostic-failure-value = { $code ->
     [lua_execution_failed] Lua 主程序运行失败
     [lua_host_call_failed] Lua Host 能力调用失败
     [lua_finalization_failed] Lua Host 无法完成所有绑定资源的收尾
-    [lua_unclosed_transaction] Lua 程序结束时事务仍未关闭；该事务已回滚
-    [lua_snapshot_store_failed] 无法提交已验证的 Lua 提取快照
     [rules_definition_invalid] Rules 程序不符合 Rules 定义契约
     [rules_document_read_failed] 无法读取 Rules 程序需要的来源文档
     [rules_no_non_blank_match] Rules 条目没有产生任何非空白语义单元
@@ -272,14 +268,13 @@ diagnostic-failure-value = { $code ->
     [rules_snapshot_invalid] 提取出的 Rules 组无法组成有效资产快照
     [rules_snapshot_store_failed] 无法提交已验证的 Rules 提取快照
     [write_back_extraction_out_of_date] 已提取资产不再匹配当前项目来源
-    [write_back_asset_snapshot_invalid] 已保存的 Standard 资产无法组成有效写回快照
+    [write_back_asset_snapshot_invalid] 已保存的 RPG Maker 资产无法组成有效写回快照
     [source_document_invalid] RPG Maker 来源文档不符合所需文档格式
     [write_back_mutation_invalid] 已验证的译文修改无法应用到冻结来源位置
     [write_back_output_path_invalid] 改写文件位于允许的 RPG Maker 输出树之外
     [write_back_output_path_duplicate] 多个改写文件指向同一输出路径
     [write_back_candidate_project_mismatch] 写回候选属于另一个项目
     [write_back_candidate_invalid] 写回候选不符合所需的 data/js 目录结构
-    [write_back_unexpected_lua_outcome] Lua 写回程序返回了其他 Lua 阶段的结果
     [write_back_not_published] 写回候选没有替换当前输出目录
     [write_back_published_with_residuals] 输出已发布，但部分恢复产物无法删除
     [write_back_recovery_required] 必须先恢复输出目录，才能信任其中内容

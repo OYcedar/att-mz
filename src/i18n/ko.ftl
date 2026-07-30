@@ -1,30 +1,29 @@
-app-about = 재사용 가능한 프로젝트 상태로 RPG Maker 게임을 번역합니다
+app-about = 재사용 가능한 프로젝트 상태로 게임과 구조화된 텍스트를 번역합니다
 cli-config-help = 이번 실행에 사용할 엄격한 TOML 구성 파일
 cli-ui-language-help = 도움말, 진단, 진행률, 결과 및 프로젝트 로그의 언어: ar, zh-Hans, zh-Hant, en, fr, ru, es, ja, ko 또는 vi
 cli-progress-help = 실시간 진행률 모드: auto, plain 또는 off
 cli-mz-about = RPG Maker MZ 게임 번역
 cli-mv-about = RPG Maker MV 게임 번역
-cli-init-about = 이름이 지정된 게임 프로젝트 초기화 또는 업데이트
-cli-extract-about = 명시적 또는 저장된 owner 계획으로 원문 추출
+cli-generic-about = 규정된 JSONL 텍스트 번역
+cli-init-about = 이름이 지정된 번역 프로젝트 초기화 또는 업데이트
+cli-extract-about = 프로젝트의 현재 입력에서 원문 동기화
 cli-translate-about = 명시적 또는 저장된 Profile로 추출된 원문 번역
-cli-write-back-about = 승인된 번역을 게임에 다시 쓰기
-cli-project-lua-about = 프로젝트 컨텍스트에서 신뢰할 수 있는 Lua 프로그램을 한 번 실행
+cli-write-back-about = 현재 번역을 프로젝트 출력에 쓰기
+cli-project-lua-about = 프로젝트에서 원자적 데이터베이스 Lua를 한 번 실행
 cli-project-name-help = 안정적인 프로젝트 이름
-cli-init-path-help = RPG Maker 게임 루트. 기존 프로젝트는 마지막 성공 경로를 재사용할 수 있습니다
+cli-init-path-help = 입력 루트 디렉터리. 기존 프로젝트는 마지막 성공 경로를 재사용할 수 있습니다
 cli-source-language-help = 원문 언어 ID
 cli-target-language-help = 대상 언어 ID
 cli-dialogue-width-help = 대화 줄당 최대 전각 문자 수
 cli-scrolling-width-help = 스크롤 텍스트 줄당 최대 전각 문자 수
 cli-help-width-help = 도움말 또는 설명 줄당 최대 전각 문자 수
 cli-builtin-help = ATT 내장 RPG Maker 텍스트 위치 사용
-cli-rules-help = 이 TOML 정의로 Rules owner 교체. 빈 규칙 목록은 비활성화합니다
+cli-rules-help = 이 TOML 정의로 RPG Maker 추출 규칙 교체. 빈 규칙 목록은 규칙을 비활성화합니다
 cli-dialogue-rules-help = Builtin과 함께 쓰는 MV 대화 이름 투영 교체
-cli-lua-help = 현재 단계 Lua 프로그램 교체. 0바이트 파일은 프로그램을 지웁니다
 cli-profile-help = 번역 Profile ID. 생략하면 마지막 성공 Profile을 재사용합니다
 cli-terms-help = 프로젝트 용어 리소스 교체
 cli-placeholders-help = 프로젝트 Placeholder 리소스 교체
-cli-project-lua-profile-help = Standard 수동 승인용 Profile. 생략하면 Standard를 열 때 마지막으로 성공한 Translate Profile을 재사용합니다
-cli-project-lua-script-help = 한 번 실행할 신뢰할 수 있는 Lua 프로그램
+cli-project-lua-script-help = 한 번 실행할 원자적 데이터베이스 Lua 프로그램
 cli-project-lua-arguments-help = -- 뒤에서 Lua arg[1..]에 전달할 UTF-8 인수
 cli-usage-heading = 사용법:
 cli-commands-heading = 명령:
@@ -66,7 +65,7 @@ log-label-phase-planning = 계획
 log-label-phase-confirmed-tasks = 작업 확인
 log-label-phase-no-work = 작업 불필요
 log-label-phase-read-assets = 자산 읽기
-log-label-phase-plan-standard = 표준 쓰기 계획
+log-label-phase-plan-rpg-maker-write-back = RPG Maker 쓰기 계획
 log-label-phase-rewrite-documents = 문서 다시 쓰기
 log-label-phase-validate-candidate = 후보 검증
 log-label-task-complete = 완료
@@ -83,12 +82,8 @@ plan-source-product-default = 제품 동작
 notice-init-reuse-path = 원본 경로가 없어 마지막 성공 경로를 재사용합니다: { $path }.
 notice-extract-reuse-owners = 추출 범위가 없어 마지막 성공 계획을 재사용합니다: { $owners }.
 notice-translate-reuse-profile = Profile이 없어 마지막 성공 Profile을 재사용합니다: { $profile }.
-notice-translate-reuse-lua = Lua 옵션이 없어 마지막 성공 Translate Lua 선택을 재사용합니다.
-notice-write-back-reuse-lua = Lua 옵션이 없어 마지막 성공 WriteBack Lua 프로그램을 재사용합니다.
-notice-write-back-standard-only = WriteBack Lua 프로그램이 구성되지 않아 Standard만 실행합니다.
 notice-owner-disabled = owner { $owner }을 비활성화하고 이후 자동 계획에서 제거했습니다.
-notice-lua-cleared = { $phase } Lua 프로그램을 지웠으며 이번에는 실행하지 않습니다.
-notice-no-model-request = 모든 표준 번역 단위가 최신 상태여서 이번 실행에서 Standard는 모델 요청을 보내지 않았습니다.
+notice-no-model-request = 모든 번역 단위가 최신 상태여서 이번 실행에서는 모델 요청을 보내지 않았습니다.
 notice-manual-layout = { $count }개 단위의 줄바꿈을 수동으로 확인해야 합니다.
 notice-log-degraded = 프로젝트 로그를 사용할 수 없거나 성능이 저하되었습니다. 명령은 계속되며 종료 상태는 바뀌지 않습니다.
 notice-task-records-degraded = 번역 작업 기록을 사용할 수 없거나 성능이 저하되었습니다. 명령은 계속되며 종료 상태는 바뀌지 않습니다.
@@ -102,7 +97,6 @@ progress-extract-owner = 추출 owner: { $owner }
 progress-extract-documents = 문서 검색 중
 progress-extract-builtin = Builtin 작업 단위
 progress-extract-rules = Rules 정의
-progress-extract-lua = Extract Lua 프로그램 실행 중
 progress-extract-commit = 추출 자산 커밋 중
 progress-translate-planning = 번역 작업 계획 중
 progress-translate-confirmed = 확인된 번역 작업
@@ -111,7 +105,6 @@ progress-project-lua = 프로젝트 Lua 프로그램 실행 중
 progress-write-back-read-assets = 승인된 자산 읽는 중
 progress-write-back-planning = 문서 다시 쓰기 계획 중
 progress-write-back-documents = 문서 다시 쓰기
-progress-write-back-lua = WriteBack Lua 프로그램 실행 중
 progress-write-back-validate-candidate = 출력 후보 검증 중
 progress-write-back-publish = 출력 게시 중. 중단 후에도 확인된 결과를 기다립니다
 progress-finalizing = 필수 마무리 작업 중
@@ -123,23 +116,27 @@ result-init-updated = 프로젝트 상태: 업데이트됨
 result-init-stale-owners = 다시 추출 필요: { $owners }
 result-extract-completed = 추출 완료: { $project }
 result-translate-completed = 번역 완료: { $project }(Profile: { $profile })
-result-translate-standard = 표준 번역: 작업 { $total }, 완료 { $complete }, 부분 { $partial }, 사용 불가 { $unavailable }; { $written }개 위치 기록, { $remaining }개 남음
+result-translate-summary = 번역: 작업 { $total }, 완료 { $complete }, 부분 { $partial }, 사용 불가 { $unavailable }; { $written }개 위치 기록, { $remaining }개 남음
 result-translate-convergence = 상태 수렴: 유지 { $retained }, 무효화 { $invalidated }, 해당 없음 { $not_applicable }, 재사용 { $reused }
 result-write-back-completed = 쓰기 완료: { $project }
 result-project-lua-completed = 프로젝트 Lua 실행 완료: { $project }
 result-output-directory = 출력 디렉터리: { $path }
-result-write-back-standard = 표준 쓰기: 번역 { $translated }단위, 원문 { $original }단위; 자동 줄바꿈 { $auto_wrapped }, 줄바꿈 추가 { $breaks }, 전각 들여쓰기 추가 { $indents }; 수동 배치 { $manual }
-result-lua-executed = Lua: 실행됨
-result-lua-not-executed = Lua: 실행 안 함
+result-write-back-summary = 쓰기: 번역 { $translated }단위, 원문 { $original }단위; 자동 줄바꿈 { $auto_wrapped }, 줄바꿈 추가 { $breaks }, 전각 들여쓰기 추가 { $indents }; 수동 배치 { $manual }
+result-generic-extract-unchanged = Generic 입력 변경 없음: 파일 { $files }개, 그룹 { $groups }개, 단위 { $units }개
+result-generic-extract-updated = Generic 입력 갱신: 파일 { $files }개, 그룹 { $groups }개, 단위 { $units }개; 번역 { $preserved }개 유지, { $cleared }개 삭제
+result-generic-translate-summary = Generic 번역: 작업 { $total }, 완료 { $complete }, 부분 { $partial }, 사용 불가 { $unavailable }; 초기화 { $cleared }, 재사용 { $reused }, 수락 { $accepted }, 기록 { $written }, 충돌 { $conflicted }, 응답 문제 { $problems }
+result-generic-write-back-summary = Generic 쓰기: 번역 { $translated }단위, 원문 유지 { $original }단위
 result-cancelled = 안전한 마무리 후 명령을 취소했습니다.
 result-plan-saved = 성공한 실행 계획을 저장했습니다.
-result-translate-plan-sources = 이번에 성공한 실행 계획을 저장했습니다. Profile 출처: { $profile_source }; Lua 출처: { $lua_source }.
 log-run-started = 명령 { $command }이 시작되었습니다.
 log-run-succeeded = 명령 { $command }이 성공적으로 완료되었습니다.
 log-run-failed = 명령 { $command }이 실패했습니다.
 log-run-outcome-unknown = 명령 { $command }이 종료되었지만 최종 결과를 알 수 없습니다. 오류에 표시된 복구 위치를 따르십시오.
 log-run-cancelled = 명령 { $command }이 취소되었습니다.
 log-performance-counters = 성능 카운터: SQLite 트랜잭션 제어 시도 { $sqlite_control_attempted_total }회, 전체 후보 트리 검증 시작 { $candidate_validation_started }회, 완료 { $candidate_validation_completed }회.
+log-lua-script = Lua 스크립트 { $identity }(SHA-256 { $fingerprint }).
+log-lua-print = Lua: { $message }
+log-lua-summary = Lua 커밋 완료: 데이터베이스 호출 { $database_calls }회, 변경 행 { $changed_rows }개, 번역 호출 { $translation_calls }회, print { $printed_lines }줄.
 log-plan-resolved = 명령 { $command }의 계획 출처: { $source }.
 log-phase-started = 단계 시작: { $phase }.
 log-phase-finished = 단계 완료: { $phase }.
@@ -212,7 +209,8 @@ diagnostic-action-value = { $code ->
 }
 diagnostic-failure-value = { $code ->
     [missing_required_value] 필수 값이 없습니다
-    [extract_plan_required] 재사용할 수 있는 Extract 계획이 저장되어 있지 않습니다. --builtin, --rules 또는 --lua 중 하나 이상을 지정하세요
+    [extract_plan_required] 재사용할 수 있는 Extract 계획이 저장되어 있지 않습니다. --builtin 또는 --rules를 지정하세요
+    [generic_extract_required] JSONL 입력이 최근 Extract와 일치하지 않습니다. att generic extract를 다시 실행하세요
     [conflicting_values] 제공한 값이 서로 충돌합니다
     [invalid_syntax] 값의 구문이 잘못되었습니다
     [invalid_encoding] 텍스트 인코딩이 잘못되었습니다
@@ -256,8 +254,6 @@ diagnostic-failure-value = { $code ->
     [lua_execution_failed] Lua 주 프로그램 실행 중 오류가 발생했습니다
     [lua_host_call_failed] Lua 호스트 기능 호출에 실패했습니다
     [lua_finalization_failed] Lua 호스트가 바인딩된 모든 리소스를 마무리할 수 없습니다
-    [lua_unclosed_transaction] Lua 프로그램 종료 시 트랜잭션이 열려 있어 롤백했습니다
-    [lua_snapshot_store_failed] 검증된 Lua 추출 스냅샷을 커밋할 수 없습니다
     [rules_definition_invalid] Rules 프로그램이 Rules 정의 계약을 충족하지 않습니다
     [rules_document_read_failed] Rules 프로그램에 필요한 원본 문서를 읽을 수 없습니다
     [rules_no_non_blank_match] Rules 항목이 공백이 아닌 의미 단위를 만들지 못했습니다
@@ -272,14 +268,13 @@ diagnostic-failure-value = { $code ->
     [rules_snapshot_invalid] 추출된 Rules 그룹이 유효한 자산 스냅샷을 구성하지 않습니다
     [rules_snapshot_store_failed] 검증된 Rules 추출 스냅샷을 커밋할 수 없습니다
     [write_back_extraction_out_of_date] 추출한 자산이 현재 프로젝트 원본과 더 이상 일치하지 않습니다
-    [write_back_asset_snapshot_invalid] 저장된 Standard 자산이 유효한 쓰기 반영 스냅샷을 구성하지 않습니다
+    [write_back_asset_snapshot_invalid] 저장된 RPG Maker 자산이 유효한 쓰기 반영 스냅샷을 구성하지 않습니다
     [source_document_invalid] RPG Maker 원본 문서가 필수 문서 형식을 충족하지 않습니다
     [write_back_mutation_invalid] 검증된 번역 변경을 고정된 원본 위치에 적용할 수 없습니다
     [write_back_output_path_invalid] 다시 쓴 파일이 허용된 RPG Maker 출력 트리 밖에 있습니다
     [write_back_output_path_duplicate] 둘 이상의 다시 쓴 파일이 같은 출력 경로를 대상으로 합니다
     [write_back_candidate_project_mismatch] 준비된 쓰기 반영 후보가 다른 프로젝트에 속합니다
     [write_back_candidate_invalid] 쓰기 반영 후보가 필수 data/js 트리 구조를 충족하지 않습니다
-    [write_back_unexpected_lua_outcome] Lua 쓰기 반영 프로그램이 다른 Lua 단계의 결과를 반환했습니다
     [write_back_not_published] 쓰기 반영 후보가 현재 출력 디렉터리를 대체하지 않았습니다
     [write_back_published_with_residuals] 출력을 게시했지만 일부 복구 산출물을 제거할 수 없습니다
     [write_back_recovery_required] 내용을 신뢰하기 전에 출력 디렉터리를 복구해야 합니다

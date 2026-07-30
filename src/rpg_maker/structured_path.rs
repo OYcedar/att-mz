@@ -7,8 +7,6 @@ use std::convert::Infallible;
 
 use serde_json::Value;
 
-use crate::lossless_json::LosslessJsonValue;
-
 use super::text::RpgMakerLocationStep;
 
 /// 结构化路径访问普通 JSON 节点时的稳定失败原因。
@@ -40,59 +38,6 @@ pub(crate) trait StructuredPathValue: Sized {
     fn array_value_mut(&mut self, index: usize) -> Option<&mut Self>;
     fn string_value(&self) -> Option<&str>;
     fn replace_with_string(&mut self, value: String);
-}
-
-impl StructuredPathValue for LosslessJsonValue {
-    fn is_object(&self) -> bool {
-        matches!(self, Self::Object(_))
-    }
-
-    fn object_value(&self, key: &str) -> Option<&Self> {
-        let Self::Object(entries) = self else {
-            return None;
-        };
-        entries
-            .iter()
-            .find_map(|(candidate, value)| (candidate == key).then_some(value))
-    }
-
-    fn object_value_mut(&mut self, key: &str) -> Option<&mut Self> {
-        let Self::Object(entries) = self else {
-            return None;
-        };
-        entries
-            .iter_mut()
-            .find_map(|(candidate, value)| (candidate == key).then_some(value))
-    }
-
-    fn is_array(&self) -> bool {
-        matches!(self, Self::Array(_))
-    }
-
-    fn array_value(&self, index: usize) -> Option<&Self> {
-        let Self::Array(values) = self else {
-            return None;
-        };
-        values.get(index)
-    }
-
-    fn array_value_mut(&mut self, index: usize) -> Option<&mut Self> {
-        let Self::Array(values) = self else {
-            return None;
-        };
-        values.get_mut(index)
-    }
-
-    fn string_value(&self) -> Option<&str> {
-        let Self::String(value) = self else {
-            return None;
-        };
-        Some(value)
-    }
-
-    fn replace_with_string(&mut self, value: String) {
-        *self = Self::String(value);
-    }
 }
 
 impl StructuredPathValue for Value {
@@ -149,7 +94,7 @@ pub(crate) trait StructuredPathCodec: StructuredPathDecoder {
 
 /// 把路径在第一个 `DecodeJsonString` 处分成解码前的普通路径和解码后的剩余路径。
 ///
-/// Standard 的同容器批处理与单路径读写必须共用这个边界解释，避免一方把解码
+/// RPG Maker 的同容器批处理与单路径读写必须共用这个边界解释，避免一方把解码
 /// 标记包含在父路径中、另一方把它包含在子路径中。
 pub(crate) fn split_at_decode_boundary(
     steps: &[RpgMakerLocationStep],
@@ -158,39 +103,6 @@ pub(crate) fn split_at_decode_boundary(
         .iter()
         .position(|step| matches!(step, RpgMakerLocationStep::DecodeJsonString))
         .map(|index| (&steps[..index], &steps[index + 1..]))
-}
-
-/// 沿完整结构化路径访问一个值。
-///
-/// 每个 `DecodeJsonString` 都通过调用方提供的同一种 decoder 解释；访问函数在
-/// 拥有型解码值仍存活时执行，因此不要求调用方把任意深 JSON 递归克隆到栈上。
-pub(crate) fn visit_structured_path<C, R>(
-    root: &C::Value,
-    steps: &[RpgMakerLocationStep],
-    decoder: &mut C,
-    visit: impl FnOnce(&C::Value) -> R,
-) -> Result<R, StructuredPathError<C::DecodeError>>
-where
-    C: StructuredPathDecoder,
-{
-    let mut decoded = None::<C::Owned>;
-    let mut remaining = steps;
-    while let Some((plain, after_decode)) = split_at_decode_boundary(remaining) {
-        let parent = decoded.as_ref().map_or(root, C::value);
-        let encoded = value_at_plain_steps(parent, plain)
-            .map_err(StructuredPathError::Access)?
-            .string_value()
-            .ok_or(StructuredPathError::ExpectedEncodedJsonString)?;
-        let next = decoder
-            .decode(encoded)
-            .map_err(StructuredPathError::Decode)?;
-        decoded = Some(next);
-        remaining = after_decode;
-    }
-
-    let parent = decoded.as_ref().map_or(root, C::value);
-    let target = value_at_plain_steps(parent, remaining).map_err(StructuredPathError::Access)?;
-    Ok(visit(target))
 }
 
 /// 沿完整结构化路径修改一个值，并由内向外重建全部嵌套 JSON string。

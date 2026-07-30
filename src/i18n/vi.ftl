@@ -1,30 +1,29 @@
-app-about = Dịch trò chơi RPG Maker với trạng thái dự án có thể tái sử dụng
+app-about = Dịch trò chơi và văn bản có cấu trúc với trạng thái dự án có thể tái sử dụng
 cli-config-help = Tệp cấu hình TOML nghiêm ngặt cho lần chạy này
 cli-ui-language-help = Ngôn ngữ cho trợ giúp, chẩn đoán, tiến độ, kết quả và nhật ký dự án: ar, zh-Hans, zh-Hant, en, fr, ru, es, ja, ko hoặc vi
 cli-progress-help = Chế độ tiến độ trực tiếp: auto, plain hoặc off
 cli-mz-about = Dịch trò chơi RPG Maker MZ
 cli-mv-about = Dịch trò chơi RPG Maker MV
-cli-init-about = Khởi tạo hoặc cập nhật dự án trò chơi có tên
-cli-extract-about = Trích xuất văn bản bằng kế hoạch owner đã chỉ định hoặc đã lưu
+cli-generic-about = Dịch văn bản JSONL có cấu trúc
+cli-init-about = Khởi tạo hoặc cập nhật dự án dịch có tên
+cli-extract-about = Đồng bộ văn bản nguồn từ đầu vào hiện tại của dự án
 cli-translate-about = Dịch văn bản đã trích xuất bằng Profile đã chỉ định hoặc đã lưu
-cli-write-back-about = Ghi bản dịch đã duyệt trở lại trò chơi
-cli-project-lua-about = Chạy một lần chương trình Lua tin cậy trong ngữ cảnh dự án
+cli-write-back-about = Ghi bản dịch hiện tại vào đầu ra của dự án
+cli-project-lua-about = Chạy một lần Lua cơ sở dữ liệu nguyên tử trong dự án
 cli-project-name-help = Tên dự án ổn định
-cli-init-path-help = Thư mục gốc trò chơi RPG Maker; dự án hiện có có thể dùng lại đường dẫn thành công gần nhất
+cli-init-path-help = Thư mục gốc đầu vào; dự án hiện có có thể dùng lại đường dẫn thành công gần nhất
 cli-source-language-help = ID ngôn ngữ nguồn
 cli-target-language-help = ID ngôn ngữ đích
 cli-dialogue-width-help = Số ký tự toàn chiều rộng tối đa trên mỗi dòng hội thoại
 cli-scrolling-width-help = Số ký tự toàn chiều rộng tối đa trên mỗi dòng văn bản cuộn
 cli-help-width-help = Số ký tự toàn chiều rộng tối đa trên mỗi dòng trợ giúp hoặc mô tả
 cli-builtin-help = Dùng các vị trí văn bản RPG Maker tích hợp của ATT
-cli-rules-help = Thay owner Rules bằng định nghĩa TOML này; danh sách quy tắc rỗng sẽ tắt nó
+cli-rules-help = Thay quy tắc trích xuất RPG Maker bằng định nghĩa TOML này; danh sách rỗng sẽ tắt quy tắc
 cli-dialogue-rules-help = Thay phép chiếu tên hội thoại MV dùng cùng Builtin
-cli-lua-help = Thay chương trình Lua của giai đoạn; tệp 0 byte sẽ xóa chương trình
 cli-profile-help = ID Profile dịch; bỏ qua để dùng lại Profile thành công gần nhất
 cli-terms-help = Thay tài nguyên thuật ngữ của dự án
 cli-placeholders-help = Thay tài nguyên Placeholder của dự án
-cli-project-lua-profile-help = Profile dùng để duyệt thủ công Standard; nếu bỏ qua, Profile Translate thành công gần nhất được dùng khi mở Standard
-cli-project-lua-script-help = Chương trình Lua tin cậy sẽ chạy một lần
+cli-project-lua-script-help = Chương trình Lua cơ sở dữ liệu nguyên tử chạy một lần
 cli-project-lua-arguments-help = Đối số UTF-8 truyền cho Lua arg[1..] sau --
 cli-usage-heading = Cách dùng:
 cli-commands-heading = Lệnh:
@@ -66,7 +65,7 @@ log-label-phase-planning = lập kế hoạch
 log-label-phase-confirmed-tasks = xác nhận tác vụ
 log-label-phase-no-work = không cần xử lý
 log-label-phase-read-assets = đọc tài nguyên
-log-label-phase-plan-standard = lập kế hoạch ghi lại chuẩn
+log-label-phase-plan-rpg-maker-write-back = lập kế hoạch ghi lại RPG Maker
 log-label-phase-rewrite-documents = ghi lại tài liệu
 log-label-phase-validate-candidate = xác thực bản ứng viên
 log-label-task-complete = hoàn tất
@@ -83,12 +82,8 @@ plan-source-product-default = hành vi sản phẩm
 notice-init-reuse-path = Không có đường dẫn nguồn; đang dùng lại đường dẫn thành công gần nhất: { $path }.
 notice-extract-reuse-owners = Không có phạm vi trích xuất; đang dùng lại kế hoạch thành công gần nhất: { $owners }.
 notice-translate-reuse-profile = Không có Profile; đang dùng lại Profile thành công gần nhất: { $profile }.
-notice-translate-reuse-lua = Không có tùy chọn Lua; đang dùng lại lựa chọn Translate Lua thành công gần nhất.
-notice-write-back-reuse-lua = Không có tùy chọn Lua; đang dùng lại chương trình WriteBack Lua thành công gần nhất.
-notice-write-back-standard-only = Chưa cấu hình chương trình WriteBack Lua; chỉ chạy Standard.
 notice-owner-disabled = Owner { $owner } đã bị tắt và xóa khỏi các kế hoạch tự động sau này.
-notice-lua-cleared = Chương trình Lua { $phase } đã bị xóa và sẽ không chạy lần này.
-notice-no-model-request = Mọi đơn vị dịch chuẩn đều mới nhất; trong lần chạy này Standard không gửi yêu cầu nào đến mô hình.
+notice-no-model-request = Mọi đơn vị dịch đều mới nhất; lần chạy này không cần gửi yêu cầu nào đến mô hình.
 notice-manual-layout = Có { $count } đơn vị cần kiểm tra ngắt dòng thủ công.
 notice-log-degraded = Nhật ký dự án không khả dụng hoặc suy giảm; lệnh vẫn tiếp tục và trạng thái thoát không đổi.
 notice-task-records-degraded = Bản ghi tác vụ dịch không khả dụng hoặc suy giảm; lệnh vẫn tiếp tục và trạng thái thoát không đổi.
@@ -102,7 +97,6 @@ progress-extract-owner = Owner trích xuất: { $owner }
 progress-extract-documents = Đang quét tài liệu
 progress-extract-builtin = Đơn vị công việc Builtin
 progress-extract-rules = Định nghĩa Rules
-progress-extract-lua = Đang chạy chương trình Extract Lua
 progress-extract-commit = Đang commit tài sản đã trích xuất
 progress-translate-planning = Đang lập kế hoạch tác vụ dịch
 progress-translate-confirmed = Tác vụ dịch đã xác nhận
@@ -111,7 +105,6 @@ progress-project-lua = Đang chạy chương trình Lua của dự án
 progress-write-back-read-assets = Đang đọc tài sản đã duyệt
 progress-write-back-planning = Đang lập kế hoạch viết lại tài liệu
 progress-write-back-documents = Đã viết lại tài liệu
-progress-write-back-lua = Đang chạy chương trình WriteBack Lua
 progress-write-back-validate-candidate = Đang xác thực ứng viên đầu ra
 progress-write-back-publish = Đang xuất bản đầu ra; khi ngắt vẫn chờ kết quả được xác nhận
 progress-finalizing = Đang hoàn tất tài nguyên bắt buộc
@@ -123,23 +116,27 @@ result-init-updated = Trạng thái dự án: đã cập nhật
 result-init-stale-owners = Cần trích xuất lại: { $owners }
 result-extract-completed = Trích xuất hoàn tất: { $project }
 result-translate-completed = Dịch hoàn tất: { $project } (Profile: { $profile })
-result-translate-standard = Dịch chuẩn: { $total } tác vụ; { $complete } hoàn tất, { $partial } một phần, { $unavailable } không khả dụng; đã ghi { $written } vị trí, còn { $remaining }
+result-translate-summary = Dịch: { $total } tác vụ; { $complete } hoàn tất, { $partial } một phần, { $unavailable } không khả dụng; đã ghi { $written } vị trí, còn { $remaining }
 result-translate-convergence = Hội tụ trạng thái: giữ { $retained }, vô hiệu { $invalidated }, không áp dụng { $not_applicable }, tái dùng { $reused }
 result-write-back-completed = Ghi lại hoàn tất: { $project }
 result-project-lua-completed = Thực thi Lua dự án hoàn tất: { $project }
 result-output-directory = Thư mục đầu ra: { $path }
-result-write-back-standard = Ghi lại chuẩn: { $translated } đơn vị dịch, { $original } đơn vị nguồn; tự ngắt { $auto_wrapped }, thêm { $breaks } ngắt dòng và { $indents } thụt đầu dòng toàn chiều rộng; { $manual } cần bố cục thủ công
-result-lua-executed = Lua: đã chạy
-result-lua-not-executed = Lua: không chạy
+result-write-back-summary = Ghi lại: { $translated } đơn vị dịch, { $original } đơn vị nguồn; tự ngắt { $auto_wrapped }, thêm { $breaks } ngắt dòng và { $indents } thụt đầu dòng toàn chiều rộng; { $manual } cần bố cục thủ công
+result-generic-extract-unchanged = Đầu vào Generic không đổi: { $files } tệp, { $groups } nhóm, { $units } đơn vị
+result-generic-extract-updated = Đã cập nhật đầu vào Generic: { $files } tệp, { $groups } nhóm, { $units } đơn vị; giữ { $preserved } bản dịch và xóa { $cleared }
+result-generic-translate-summary = Dịch Generic: { $total } tác vụ; { $complete } hoàn tất, { $partial } một phần, { $unavailable } không khả dụng; xóa { $cleared }, dùng lại { $reused }, chấp nhận { $accepted }, ghi { $written }, xung đột { $conflicted }, lỗi phản hồi { $problems }
+result-generic-write-back-summary = Ghi lại Generic: { $translated } đơn vị dịch, giữ nguyên { $original } đơn vị nguồn
 result-cancelled = Lệnh đã bị hủy sau khi hoàn tất an toàn.
 result-plan-saved = Kế hoạch chạy thành công đã được lưu.
-result-translate-plan-sources = Đã lưu kế hoạch của lần chạy thành công này. Nguồn Profile: { $profile_source }; nguồn Lua: { $lua_source }.
 log-run-started = Lệnh { $command } đã bắt đầu.
 log-run-succeeded = Lệnh { $command } đã hoàn tất thành công.
 log-run-failed = Lệnh { $command } thất bại.
 log-run-outcome-unknown = Lệnh { $command } đã kết thúc nhưng kết quả cuối cùng chưa xác định; hãy làm theo các vị trí khôi phục trong lỗi.
 log-run-cancelled = Lệnh { $command } đã bị hủy.
 log-performance-counters = Bộ đếm hiệu năng: số lần thử điều khiển giao dịch SQLite { $sqlite_control_attempted_total }; xác thực toàn bộ cây ứng viên đã bắt đầu { $candidate_validation_started }, đã hoàn tất { $candidate_validation_completed }.
+log-lua-script = Tập lệnh Lua { $identity } (SHA-256 { $fingerprint }).
+log-lua-print = Lua: { $message }
+log-lua-summary = Đã commit Lua: { $database_calls } lần gọi cơ sở dữ liệu, { $changed_rows } hàng thay đổi, { $translation_calls } lần gọi bản dịch và { $printed_lines } dòng print.
 log-plan-resolved = Lệnh { $command } lấy kế hoạch từ { $source }.
 log-phase-started = Bắt đầu giai đoạn: { $phase }.
 log-phase-finished = Hoàn tất giai đoạn: { $phase }.
@@ -212,7 +209,8 @@ diagnostic-action-value = { $code ->
 }
 diagnostic-failure-value = { $code ->
     [missing_required_value] Thiếu một giá trị bắt buộc
-    [extract_plan_required] Không có kế hoạch Extract có thể tái sử dụng; hãy cung cấp ít nhất một trong --builtin, --rules hoặc --lua
+    [extract_plan_required] Không có kế hoạch Extract có thể tái sử dụng; hãy cung cấp --builtin hoặc --rules
+    [generic_extract_required] Dữ liệu JSONL không còn khớp với lần Extract gần nhất; hãy chạy lại att generic extract
     [conflicting_values] Các giá trị được cung cấp xung đột với nhau
     [invalid_syntax] Cú pháp của giá trị không hợp lệ
     [invalid_encoding] Mã hóa văn bản không hợp lệ
@@ -256,8 +254,6 @@ diagnostic-failure-value = { $code ->
     [lua_execution_failed] Chương trình Lua chính thất bại trong khi chạy
     [lua_host_call_failed] Lời gọi khả năng máy chủ Lua thất bại
     [lua_finalization_failed] Máy chủ Lua không thể hoàn tất mọi tài nguyên đã liên kết
-    [lua_unclosed_transaction] Chương trình Lua kết thúc với giao dịch còn mở; giao dịch đã được hoàn tác
-    [lua_snapshot_store_failed] Không thể commit ảnh chụp trích xuất Lua đã xác minh
     [rules_definition_invalid] Chương trình Rules không đáp ứng hợp đồng định nghĩa Rules
     [rules_document_read_failed] Không thể đọc tài liệu nguồn mà chương trình Rules yêu cầu
     [rules_no_non_blank_match] Mục Rules không tạo ra đơn vị ngữ nghĩa khác trống
@@ -272,14 +268,13 @@ diagnostic-failure-value = { $code ->
     [rules_snapshot_invalid] Các nhóm Rules đã trích xuất không tạo thành ảnh chụp tài sản hợp lệ
     [rules_snapshot_store_failed] Không thể commit ảnh chụp trích xuất Rules đã xác minh
     [write_back_extraction_out_of_date] Tài sản đã trích xuất không còn khớp với nguồn dự án hiện tại
-    [write_back_asset_snapshot_invalid] Tài sản Standard đã lưu không tạo thành ảnh chụp ghi ngược hợp lệ
+    [write_back_asset_snapshot_invalid] Tài sản RPG Maker đã lưu không tạo thành ảnh chụp ghi ngược hợp lệ
     [source_document_invalid] Tài liệu nguồn RPG Maker không đáp ứng định dạng bắt buộc
     [write_back_mutation_invalid] Không thể áp dụng thay đổi bản dịch đã xác minh vào vị trí nguồn đã đóng băng
     [write_back_output_path_invalid] Tệp được viết lại nằm ngoài cây đầu ra RPG Maker được phép
     [write_back_output_path_duplicate] Nhiều tệp được viết lại nhắm đến cùng một đường dẫn đầu ra
     [write_back_candidate_project_mismatch] Ứng viên ghi ngược đã chuẩn bị thuộc về dự án khác
     [write_back_candidate_invalid] Ứng viên ghi ngược không đáp ứng cấu trúc cây data/js bắt buộc
-    [write_back_unexpected_lua_outcome] Chương trình Lua ghi ngược trả về kết quả cho một giai đoạn Lua khác
     [write_back_not_published] Ứng viên ghi ngược không thay thế thư mục đầu ra hiện tại
     [write_back_published_with_residuals] Đầu ra đã được phát hành nhưng không thể xóa một số tạo phẩm khôi phục
     [write_back_recovery_required] Cần khôi phục thư mục đầu ra trước khi có thể tin cậy nội dung

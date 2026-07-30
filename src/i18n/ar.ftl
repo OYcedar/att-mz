@@ -1,30 +1,29 @@
-app-about = ترجمة ألعاب RPG Maker باستخدام حالة مشروع قابلة لإعادة الاستخدام
+app-about = ترجمة الألعاب والنصوص المنظّمة باستخدام حالة مشروع قابلة لإعادة الاستخدام
 cli-config-help = ملف إعداد TOML صارم لهذا التشغيل
 cli-ui-language-help = لغة المساعدة والتشخيص والتقدم والنتائج وسجلات المشروع: ar وzh-Hans وzh-Hant وen وfr وru وes وja وko وvi
 cli-progress-help = نمط التقدم المباشر: auto أو plain أو off
 cli-mz-about = ترجمة لعبة RPG Maker MZ
 cli-mv-about = ترجمة لعبة RPG Maker MV
-cli-init-about = تهيئة مشروع لعبة مسمى أو تحديثه
-cli-extract-about = استخراج النص بخطة owner صريحة أو محفوظة
+cli-generic-about = ترجمة نص JSONL منظّم
+cli-init-about = تهيئة مشروع ترجمة مسمى أو تحديثه
+cli-extract-about = مزامنة النص المصدر من مدخل المشروع الحالي
 cli-translate-about = ترجمة النص المستخرج باستخدام Profile صريح أو محفوظ
-cli-write-back-about = كتابة الترجمات المقبولة إلى اللعبة
-cli-project-lua-about = تشغيل برنامج Lua موثوق مرة واحدة ضمن سياق المشروع
+cli-write-back-about = كتابة الترجمات الحالية إلى مخرجات المشروع
+cli-project-lua-about = تشغيل Lua ذري لقاعدة البيانات مرة واحدة داخل المشروع
 cli-project-name-help = اسم المشروع الثابت
-cli-init-path-help = جذر لعبة RPG Maker؛ يمكن للمشروع الموجود إعادة استخدام آخر مسار ناجح
+cli-init-path-help = دليل جذر الإدخال؛ يمكن للمشروع الموجود إعادة استخدام آخر مسار ناجح
 cli-source-language-help = معرّف لغة المصدر
 cli-target-language-help = معرّف اللغة الهدف
 cli-dialogue-width-help = الحد الأقصى للمحارف كاملة العرض في سطر الحوار
 cli-scrolling-width-help = الحد الأقصى للمحارف كاملة العرض في سطر النص المتمرر
 cli-help-width-help = الحد الأقصى للمحارف كاملة العرض في سطر المساعدة أو الوصف
 cli-builtin-help = استخدام مواضع نص RPG Maker المضمنة في ATT
-cli-rules-help = استبدال owner Rules بتعريف TOML هذا؛ قائمة قواعد فارغة تعطّله
+cli-rules-help = استبدال قواعد استخراج RPG Maker بتعريف TOML هذا؛ القائمة الفارغة تعطّل القواعد
 cli-dialogue-rules-help = استبدال إسقاط أسماء حوار MV المستخدم مع Builtin
-cli-lua-help = استبدال برنامج Lua للمرحلة؛ ملف حجمه صفر يمسحه
 cli-profile-help = معرّف Profile للترجمة؛ يؤدي حذفه إلى إعادة استخدام آخر Profile ناجح
 cli-terms-help = استبدال مورد مصطلحات المشروع
 cli-placeholders-help = استبدال مورد Placeholder للمشروع
-cli-project-lua-profile-help = Profile للقبول اليدوي في Standard؛ عند حذفه يُستخدم آخر Translate Profile ناجح عند فتح Standard
-cli-project-lua-script-help = برنامج Lua الموثوق المطلوب تشغيله مرة واحدة
+cli-project-lua-script-help = برنامج Lua ذري لقاعدة البيانات يُشغّل مرة واحدة
 cli-project-lua-arguments-help = وسيطة UTF-8 تمرر إلى Lua arg[1..] بعد --
 cli-usage-heading = الاستخدام:
 cli-commands-heading = الأوامر:
@@ -66,7 +65,7 @@ log-label-phase-planning = التخطيط
 log-label-phase-confirmed-tasks = تأكيد المهام
 log-label-phase-no-work = لا عمل مطلوب
 log-label-phase-read-assets = قراءة الأصول
-log-label-phase-plan-standard = تخطيط الكتابة القياسية
+log-label-phase-plan-rpg-maker-write-back = تخطيط كتابة RPG Maker
 log-label-phase-rewrite-documents = إعادة كتابة المستندات
 log-label-phase-validate-candidate = التحقق من المرشح
 log-label-task-complete = مكتمل
@@ -83,12 +82,8 @@ plan-source-product-default = سلوك المنتج
 notice-init-reuse-path = لم يُقدّم مسار مصدر؛ سيُعاد استخدام آخر مسار ناجح: { $path }.
 notice-extract-reuse-owners = لم يُقدّم نطاق استخراج؛ ستُعاد استخدام آخر خطة ناجحة: { $owners }.
 notice-translate-reuse-profile = لم يُقدّم Profile؛ سيُعاد استخدام آخر Profile ناجح: { $profile }.
-notice-translate-reuse-lua = لم يُقدّم خيار Lua؛ سيُعاد استخدام آخر اختيار Translate Lua ناجح.
-notice-write-back-reuse-lua = لم يُقدّم خيار Lua؛ سيُعاد استخدام آخر برنامج WriteBack Lua ناجح.
-notice-write-back-standard-only = لا يوجد برنامج WriteBack Lua معدّ؛ سيُنفذ Standard فقط.
 notice-owner-disabled = عُطّل owner { $owner } وأزيل من الخطط التلقائية اللاحقة.
-notice-lua-cleared = مُسح برنامج Lua لمرحلة { $phase } ولن يُنفذ هذه المرة.
-notice-no-model-request = كل وحدات الترجمة القياسية حديثة؛ لم يرسل Standard طلبًا إلى النموذج هذه المرة.
+notice-no-model-request = كل وحدات الترجمة حديثة؛ لم تحتج هذه الجولة إلى إرسال طلب للنموذج.
 notice-manual-layout = { $count ->
     [zero] لا توجد وحدات تحتاج إلى مراجعة يدوية لفواصل الأسطر.
     [one] تحتاج وحدة واحدة إلى مراجعة يدوية لفواصل الأسطر.
@@ -109,7 +104,6 @@ progress-extract-owner = owner الاستخراج: { $owner }
 progress-extract-documents = جارٍ فحص المستندات
 progress-extract-builtin = وحدات عمل Builtin
 progress-extract-rules = تعريفات Rules
-progress-extract-lua = جارٍ تشغيل برنامج Extract Lua
 progress-extract-commit = جارٍ تنفيذ commit للأصول المستخرجة
 progress-translate-planning = جارٍ تخطيط مهام الترجمة
 progress-translate-confirmed = مهام الترجمة المؤكدة
@@ -118,7 +112,6 @@ progress-project-lua = جارٍ تشغيل برنامج Lua للمشروع
 progress-write-back-read-assets = جارٍ قراءة الأصول المقبولة
 progress-write-back-planning = جارٍ تخطيط إعادة كتابة المستندات
 progress-write-back-documents = المستندات المعاد كتابتها
-progress-write-back-lua = جارٍ تشغيل برنامج WriteBack Lua
 progress-write-back-validate-candidate = جارٍ التحقق من مرشح الإخراج
 progress-write-back-publish = جارٍ نشر الإخراج؛ سينتظر الانقطاع نتيجة مؤكدة
 progress-finalizing = جارٍ إنهاء الموارد المطلوبة
@@ -130,23 +123,27 @@ result-init-updated = حالة المشروع: حُدّث
 result-init-stale-owners = يلزم إعادة الاستخراج: { $owners }
 result-extract-completed = اكتمل الاستخراج: { $project }
 result-translate-completed = اكتملت الترجمة: { $project } (Profile: { $profile })
-result-translate-standard = الترجمة القياسية: { $total } مهمة؛ مكتملة { $complete }، جزئية { $partial }، غير متاحة { $unavailable }؛ كُتب { $written } موضعًا وتبقى { $remaining }
+result-translate-summary = الترجمة: { $total } مهمة؛ مكتملة { $complete }، جزئية { $partial }، غير متاحة { $unavailable }؛ كُتب { $written } موضعًا وتبقى { $remaining }
 result-translate-convergence = تقارب الحالة: أُبقي { $retained }، أُبطل { $invalidated }، غير منطبق { $not_applicable }، أُعيد استخدام { $reused }
 result-write-back-completed = اكتملت الكتابة: { $project }
 result-project-lua-completed = اكتمل تنفيذ Lua للمشروع: { $project }
 result-output-directory = مجلد الإخراج: { $path }
-result-write-back-standard = الكتابة القياسية: { $translated } وحدة مترجمة و{ $original } وحدة مصدر؛ التفاف تلقائي { $auto_wrapped }، أضيف { $breaks } فاصل أسطر و{ $indents } إزاحة كاملة العرض؛ يحتاج { $manual } إلى تخطيط يدوي
-result-lua-executed = Lua: نُفذ
-result-lua-not-executed = Lua: لم يُنفذ
+result-write-back-summary = الكتابة: { $translated } وحدة مترجمة و{ $original } وحدة مصدر؛ التفاف تلقائي { $auto_wrapped }، أضيف { $breaks } فاصل أسطر و{ $indents } إزاحة كاملة العرض؛ يحتاج { $manual } إلى تخطيط يدوي
+result-generic-extract-unchanged = لم تتغير مدخلات Generic: ‏{ $files } ملفًا و{ $groups } مجموعة و{ $units } وحدة
+result-generic-extract-updated = حُدثت مدخلات Generic: ‏{ $files } ملفًا و{ $groups } مجموعة و{ $units } وحدة؛ حُفظت { $preserved } ترجمة ومُسحت { $cleared }
+result-generic-translate-summary = ترجمة Generic: ‏{ $total } مهمة؛ مكتملة { $complete }، جزئية { $partial }، غير متاحة { $unavailable }؛ مُسحت { $cleared }، وأُعيد استخدام { $reused }، وقُبل { $accepted }، وكُتب { $written }، والتعارضات { $conflicted }، ومشكلات الاستجابة { $problems }
+result-generic-write-back-summary = كتابة Generic: ‏{ $translated } وحدة مترجمة مع الاحتفاظ بـ { $original } وحدة مصدر
 result-cancelled = أُلغي الأمر بعد إنهاء آمن.
 result-plan-saved = حُفظت خطة التشغيل الناجحة.
-result-translate-plan-sources = حُفظت خطة التشغيل الناجحة الحالية. مصدر Profile: { $profile_source }؛ مصدر Lua: { $lua_source }.
 log-run-started = بدأ الأمر { $command }.
 log-run-succeeded = اكتمل الأمر { $command } بنجاح.
 log-run-failed = فشل الأمر { $command }.
 log-run-outcome-unknown = انتهى الأمر { $command } لكن النتيجة النهائية غير معروفة؛ اتبع مواقع الاسترداد الواردة في الخطأ.
 log-run-cancelled = أُلغي الأمر { $command }.
 log-performance-counters = عدادات الأداء: محاولات التحكم في معاملات SQLite‏ { $sqlite_control_attempted_total }؛ بدء التحقق الكامل من شجرة المرشح { $candidate_validation_started }، واكتماله { $candidate_validation_completed }.
+log-lua-script = برنامج Lua النصي { $identity } ‏(SHA-256 { $fingerprint }).
+log-lua-print = Lua: { $message }
+log-lua-summary = تم تثبيت Lua: استدعاءات قاعدة البيانات { $database_calls }، والصفوف المعدلة { $changed_rows }، واستدعاءات الترجمة { $translation_calls }، وأسطر print‏ { $printed_lines }.
 log-plan-resolved = حُلّت خطة الأمر { $command } من { $source }.
 log-phase-started = بدأت المرحلة: { $phase }.
 log-phase-finished = اكتملت المرحلة: { $phase }.
@@ -233,7 +230,8 @@ diagnostic-action-value = { $code ->
 }
 diagnostic-failure-value = { $code ->
     [missing_required_value] قيمة مطلوبة مفقودة
-    [extract_plan_required] لا توجد خطة Extract محفوظة قابلة لإعادة الاستخدام؛ حدد واحدًا على الأقل من --builtin أو --rules أو --lua
+    [extract_plan_required] لا توجد خطة Extract محفوظة قابلة لإعادة الاستخدام؛ حدد --builtin أو --rules
+    [generic_extract_required] لم يعد إدخال JSONL مطابقًا لآخر Extract؛ شغّل att generic extract مرة أخرى
     [conflicting_values] القيم المقدمة متعارضة
     [invalid_syntax] صياغة القيمة غير صالحة
     [invalid_encoding] ترميز النص غير صالح
@@ -277,8 +275,6 @@ diagnostic-failure-value = { $code ->
     [lua_execution_failed] فشل برنامج Lua الرئيسي أثناء التشغيل
     [lua_host_call_failed] فشل استدعاء إحدى إمكانات مضيف Lua
     [lua_finalization_failed] تعذر على مضيف Lua إنهاء جميع الموارد المرتبطة
-    [lua_unclosed_transaction] انتهى برنامج Lua مع معاملة مفتوحة؛ تم التراجع عن المعاملة
-    [lua_snapshot_store_failed] تعذر تثبيت لقطة استخراج Lua التي تم التحقق منها
     [rules_definition_invalid] برنامج Rules لا يستوفي عقد تعريف Rules
     [rules_document_read_failed] تعذرت قراءة مستند مصدر يتطلبه برنامج Rules
     [rules_no_non_blank_match] لم ينتج إدخال Rules وحدة دلالية غير فارغة
@@ -293,14 +289,13 @@ diagnostic-failure-value = { $code ->
     [rules_snapshot_invalid] مجموعات Rules المستخرجة لا تكوّن لقطة أصول صالحة
     [rules_snapshot_store_failed] تعذر تثبيت لقطة استخراج Rules التي تم التحقق منها
     [write_back_extraction_out_of_date] لم تعد الأصول المستخرجة تطابق مصدر المشروع الحالي
-    [write_back_asset_snapshot_invalid] أصول Standard المخزنة لا تكوّن لقطة إعادة كتابة صالحة
+    [write_back_asset_snapshot_invalid] أصول RPG Maker المخزنة لا تكوّن لقطة إعادة كتابة صالحة
     [source_document_invalid] مستند مصدر RPG Maker لا يستوفي تنسيق المستند المطلوب
     [write_back_mutation_invalid] لا يمكن تطبيق تعديل ترجمة متحقق منه على موضع المصدر المجمّد
     [write_back_output_path_invalid] الملف المعاد كتابته خارج شجرة إخراج RPG Maker المسموح بها
     [write_back_output_path_duplicate] أكثر من ملف معاد كتابته يستهدف مسار الإخراج نفسه
     [write_back_candidate_project_mismatch] مرشح إعادة الكتابة المحضر يخص مشروعًا آخر
     [write_back_candidate_invalid] مرشح إعادة الكتابة لا يستوفي بنية شجرة data/js المطلوبة
-    [write_back_unexpected_lua_outcome] أعاد برنامج Lua لإعادة الكتابة نتيجة لمرحلة Lua أخرى
     [write_back_not_published] لم يستبدل مرشح إعادة الكتابة دليل الإخراج الحالي
     [write_back_published_with_residuals] نُشر الإخراج، لكن تعذرت إزالة عنصر استرداد واحد أو أكثر
     [write_back_recovery_required] يلزم استرداد دليل الإخراج قبل الوثوق بمحتوياته

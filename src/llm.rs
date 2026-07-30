@@ -23,7 +23,6 @@ use crate::fingerprint::Sha256Fingerprint;
 pub(crate) enum ChatMessageRole {
     System,
     User,
-    Assistant,
 }
 
 /// 调用方已经建立的一条确定性消息。

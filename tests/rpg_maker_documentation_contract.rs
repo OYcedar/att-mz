@@ -1,1132 +1,482 @@
-//! RPG Maker 作者文档与可复制示例的机器可验证契约。
+//! ATT 多引擎文档、示例与总 Skill 的机器可验证契约。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use mlua::Lua;
+use serde_json::Value as JsonValue;
 use toml::Value as TomlValue;
 
-const CONTRACT_DOCUMENTS: [&str; 4] = ["rules.md", "terminology.md", "lua.md", "lua-cookbook.md"];
-
-const PROMPT_LOCALES: [&str; 10] = [
+const LOCALES: [&str; 10] = [
     "ar", "zh-Hans", "zh-Hant", "en", "fr", "ru", "es", "ja", "ko", "vi",
 ];
-
-const TOML_EXAMPLES: [&str; 4] = [
-    "mv-dialogue.toml",
-    "extract-rules.toml",
-    "placeholders.toml",
-    "terminology.toml",
-];
-
-const LUA_EXAMPLES: [(&str, &[&str]); 10] = [
-    (
-        "lua-standard-data-file.lua",
-        &["ctx.rpg_maker.data_file", "ctx.extract.replace_standard"],
-    ),
-    (
-        "lua-managed-translation.lua",
-        &[
-            "ctx.rpg_maker.data_file",
-            "ctx.translations.replace",
-            "ctx.translations.translate",
-            "ctx.translations.open",
-            "ctx.write_back.replace_text",
-            "unit.status == \"missing\"",
-        ],
-    ),
-    (
-        "lua-prepare-content.lua",
-        &[
-            "ctx.translation.prepare_content",
-            "shape = \"single\"",
-            "shape = \"reflow\"",
-            "shape = \"lines\"",
-            "shape = \"items\"",
-            ":is_current(",
-            ":accept(",
-        ],
-    ),
-    (
-        "lua-translate-state.lua",
-        &[
-            "ctx.translation.prepare",
-            ":is_current(",
-            ":accept(",
-            "ctx.db.begin(",
-            "ctx.db.commit(",
-        ],
-    ),
-    (
-        "lua-accept-standard.lua",
-        &[
-            "ctx.standard.open",
-            "standard:units(",
-            "standard:accept(",
-            "replace_current",
-        ],
-    ),
-    (
-        "lua-edit-managed.lua",
-        &[
-            "ctx.translations.edit",
-            "session:get(",
-            "session:accept(",
-            "replace_current",
-            "current.status == \"current\"",
-        ],
-    ),
-    (
-        "lua-managed-replace-text.lua",
-        &[
-            "ctx.translations.open",
-            "unit.metadata",
-            "document:text(",
-            "ctx.write_back.replace_text",
-        ],
-    ),
-    (
-        "lua-idempotent-write-back.lua",
-        &["ctx.write_back", "ctx.output"],
-    ),
-    (
-        "lua-private-tag.lua",
-        &[
-            "ctx.rpg_maker.open",
-            "ctx.translation.prepare",
-            "ctx.output",
-            "lua_private_tag_unit",
-        ],
-    ),
-    (
-        "lua-complex-protocol.lua",
-        &[
-            "ctx.phase",
-            "ctx.translation.prepare",
-            "ctx.write_back",
-            "ctx.db",
-        ],
-    ),
-];
-
-const PRODUCTION_EXAMPLE_BINDINGS: [(&str, &str, &str, &str); 13] = [
-    (
-        "config.example.toml",
-        "src/application/config.rs",
-        "include_str!(\"../../config.example.toml\")",
-        "fn repository_example_is_valid_for_every_command()",
-    ),
-    (
-        "mv-dialogue.toml",
-        "src/rpg_maker/dialogue.rs",
-        "include_str!(\"../../docs/rpg-maker/examples/mv-dialogue.toml\")",
-        "fn documented_mv_dialogue_definition_uses_the_production_parser_and_compiler()",
-    ),
-    (
-        "extract-rules.toml",
-        "src/rpg_maker/extract/rules/definition.rs",
-        "include_str!(\"../../../../docs/rpg-maker/examples/extract-rules.toml\")",
-        "fn documented_extract_rules_use_the_production_parser_and_compiler()",
-    ),
-    (
-        "placeholders.toml",
-        "src/rpg_maker/translate/planning_resource.rs",
-        "include_bytes!(\"../../../docs/rpg-maker/examples/placeholders.toml\")",
-        "fn documented_placeholder_rules_use_the_production_parser_and_compiler()",
-    ),
-    (
-        "terminology.toml",
-        "src/rpg_maker/translate/planning_resource.rs",
-        "include_bytes!(\"../../../docs/rpg-maker/examples/terminology.toml\")",
-        "fn documented_terminology_uses_the_production_parser_and_compiler()",
-    ),
-    (
-        "lua-standard-data-file.lua",
-        "src/rpg_maker/lua/lua54.rs",
-        "include_str!(\"../../../docs/rpg-maker/examples/lua-standard-data-file.lua\")",
-        "async fn documented_custom_data_file_example_executes_in_the_real_vm()",
-    ),
-    (
-        "lua-managed-translation.lua",
-        "tests/rpg_maker_process_e2e.rs",
-        "include_str!(\"../docs/rpg-maker/examples/lua-managed-translation.lua\")",
-        "fn managed_lua_translation_crosses_extract_translate_and_write_back_processes()",
-    ),
-    (
-        "lua-translate-state.lua",
-        "src/rpg_maker/lua/lua54.rs",
-        "include_str!(\"../../../docs/rpg-maker/examples/lua-translate-state.lua\")",
-        "async fn documented_translate_state_and_idempotent_write_back_examples_execute()",
-    ),
-    (
-        "lua-accept-standard.lua",
-        "src/rpg_maker/lua/lua54.rs",
-        "include_str!(\"../../../docs/rpg-maker/examples/lua-accept-standard.lua\")",
-        "async fn documented_standard_candidate_example_executes_in_the_real_vm()",
-    ),
-    (
-        "lua-edit-managed.lua",
-        "tests/rpg_maker_process_e2e.rs",
-        "include_str!(\"../docs/rpg-maker/examples/lua-edit-managed.lua\")",
-        "fn managed_lua_translation_crosses_extract_translate_and_write_back_processes()",
-    ),
-    (
-        "lua-idempotent-write-back.lua",
-        "src/rpg_maker/lua/lua54.rs",
-        "include_str!(\"../../../docs/rpg-maker/examples/lua-idempotent-write-back.lua\")",
-        "async fn documented_translate_state_and_idempotent_write_back_examples_execute()",
-    ),
-    (
-        "lua-private-tag.lua",
-        "src/rpg_maker/lua/lua54.rs",
-        "include_str!(\"../../../docs/rpg-maker/examples/lua-private-tag.lua\")",
-        "async fn documented_private_tag_protocol_owns_all_three_phases()",
-    ),
-    (
-        "lua-complex-protocol.lua",
-        "src/rpg_maker/lua/lua54.rs",
-        "include_str!(\"../../../docs/rpg-maker/examples/lua-complex-protocol.lua\")",
-        "async fn documented_complex_protocol_executes_all_three_phases_with_persisted_sqlite_state()",
-    ),
-];
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ExampleKind {
-    Valid,
-    Invalid,
-    Illustrative,
-}
-
-impl ExampleKind {
-    fn parse(line: &str) -> Option<Self> {
-        match line.trim() {
-            "<!-- att-example: valid -->" => Some(Self::Valid),
-            "<!-- att-example: invalid -->" => Some(Self::Invalid),
-            "<!-- att-example: illustrative -->" => Some(Self::Illustrative),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct FencedExample {
-    kind: ExampleKind,
-    language: String,
-    body: String,
-    opening_line: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ConfigurationExampleKind {
-    ProductionMinimalInit,
-    Fragment,
-}
-
-impl ConfigurationExampleKind {
-    fn parse(line: &str) -> Option<Self> {
-        match line.trim() {
-            "<!-- att-config-example: production-minimal-init -->" => {
-                Some(Self::ProductionMinimalInit)
-            }
-            "<!-- att-config-example: fragment -->" => Some(Self::Fragment),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct ConfigurationExample {
-    kind: ConfigurationExampleKind,
-    body: String,
-    opening_line: usize,
-}
+const PROMPT_ENGINES: [&str; 2] = ["rpg_maker", "generic"];
 
 #[test]
-fn current_markdown_local_links_resolve_to_existing_files_and_anchors() {
-    let markdown_files = current_markdown_files();
-    assert!(
-        !markdown_files.is_empty(),
-        "当前文档范围至少应包含一个 Markdown 文件"
-    );
-
-    let mut failures = Vec::new();
-    for markdown_path in markdown_files {
-        let source = read_utf8(&markdown_path);
-        for (line_number, target) in local_markdown_links(&source) {
-            let (file_target, anchor) = target
+fn all_current_markdown_links_resolve() {
+    let root = workspace_root();
+    for document in current_markdown_files() {
+        let source = read_utf8(&document);
+        for (line, target) in local_markdown_links(&source) {
+            let (path_part, fragment) = target
                 .split_once('#')
-                .map_or((target.as_str(), None), |(file, anchor)| {
-                    (file, Some(anchor))
+                .map_or((target.as_str(), None), |(path, anchor)| {
+                    (path, Some(anchor))
                 });
-            if target.contains('%') {
-                failures.push(format!(
-                    "{}:{line_number}: 本地链接必须直接使用 UTF-8 路径，不能依赖百分号解码：{target}",
-                    display_relative(&markdown_path)
-                ));
-                continue;
-            }
-
-            let linked_path = if file_target.is_empty() {
-                markdown_path.clone()
+            let target_path = if path_part.is_empty() {
+                document.clone()
             } else {
-                markdown_path
+                document
                     .parent()
-                    .expect("Markdown 文件始终有父目录")
-                    .join(file_target)
+                    .expect("Markdown 文档必须有父目录")
+                    .join(path_part)
             };
-            if is_absolute_or_escaping(&linked_path, workspace_root()) {
-                failures.push(format!(
-                    "{}:{line_number}: 本地链接不得逃出项目工作区：{target}",
-                    display_relative(&markdown_path)
-                ));
-            } else if !linked_path.exists() {
-                failures.push(format!(
-                    "{}:{line_number}: 本地链接目标不存在：{target}",
-                    display_relative(&markdown_path)
-                ));
-            } else if let Some(anchor) = anchor {
-                if anchor.is_empty() {
-                    failures.push(format!(
-                        "{}:{line_number}: Markdown 锚点不能为空：{target}",
-                        display_relative(&markdown_path)
-                    ));
-                } else if linked_path.extension().and_then(|value| value.to_str()) != Some("md") {
-                    failures.push(format!(
-                        "{}:{line_number}: 只有 Markdown 目标支持锚点校验：{target}",
-                        display_relative(&markdown_path)
-                    ));
-                } else {
-                    let linked_source = read_utf8(&linked_path);
-                    let anchors = markdown_heading_anchors(&linked_source);
-                    if !anchors.contains(anchor) {
-                        failures.push(format!(
-                            "{}:{line_number}: Markdown 锚点不存在：{target}",
-                            display_relative(&markdown_path)
-                        ));
-                    }
-                }
+
+            assert!(
+                !is_absolute_or_escaping(&target_path, root),
+                "{}:{} 的本地链接不得离开仓库：{}",
+                display_relative(&document),
+                line,
+                target
+            );
+            assert!(
+                target_path.exists(),
+                "{}:{} 链接的文件不存在：{}",
+                display_relative(&document),
+                line,
+                display_relative(&target_path)
+            );
+
+            if let Some(fragment) = fragment.filter(|value| !value.is_empty()) {
+                assert!(
+                    target_path.is_file(),
+                    "{}:{} 的锚点必须指向 Markdown 文件：{}",
+                    display_relative(&document),
+                    line,
+                    target
+                );
+                let anchors = markdown_heading_anchors(&read_utf8(&target_path));
+                assert!(
+                    anchors.contains(fragment),
+                    "{}:{} 的锚点不存在：{}；可用锚点为 {:?}",
+                    display_relative(&document),
+                    line,
+                    target,
+                    anchors
+                );
             }
         }
     }
-
-    assert!(
-        failures.is_empty(),
-        "当前文档包含无效本地链接：\n{}",
-        failures.join("\n")
-    );
 }
 
 #[test]
-fn windows_unicode_runtime_and_lua_direct_path_contract_are_documented() {
-    let readme_path = workspace_root().join("README.md");
-    let readme = read_utf8(&readme_path);
-    for required in [
-        "Windows 10 1903",
-        "UTF-8 active code page manifest",
-        "code page 是 65001",
-        "实际值不是 65001",
-        "RT_MANIFEST ID 1",
-        "中文、Emoji 和内部空格",
-        "不需要启用 `LongPathsEnabled`",
-        "ATT_TEST_UNC_ROOT",
-        "ATT_RELEASE_ACCEPTANCE=1",
-        "ATT_TEST_EXECUTABLE",
-        "它不是 ATT 产品配置",
-    ] {
-        assert!(
-            readme.contains(required),
-            "{} 必须说明 Windows Unicode 运行契约 {required:?}",
-            display_relative(&readme_path)
-        );
-    }
+fn documentation_has_one_navigation_and_three_independent_engine_domains() {
+    let readme = read_utf8(&workspace_root().join("README.md"));
+    let navigation = read_utf8(&workspace_root().join("docs/README.md"));
 
-    let lua_path = documentation_root().join("lua.md");
-    let lua = read_utf8(&lua_path);
-    let vm_section = markdown_level_two_section(&lua, "## 2. VM、连接与 `ctx`")
-        .expect("Lua 规格必须保留 VM、连接与 ctx 章节");
-    let preload = vm_section
-        .find("1. `package.preload[name]`")
-        .expect("Lua 规格必须先写 package.preload");
-    let main_directory = vm_section
-        .find("2. 主程序解析路径所在目录")
-        .expect("Lua 规格必须写主程序目录 searcher");
-    let package_path = vm_section
-        .find("3. 当前 VM 的 `package.path`")
-        .expect("Lua 规格必须最后写 package.path");
-    assert!(
-        preload < main_directory && main_directory < package_path,
-        "Lua 规格必须说明 preload、主程序目录、package.path 的初始查找顺序"
-    );
-
-    for required in [
-        "`package.searchpath`",
-        "`LUA_PATH_5_4`",
-        "仅在它不存在时读取 `LUA_PATH`",
-        "环境值中的 `;;`",
-        "捕获的原始 `package` table",
-        "重绑定全局",
-        "`package.searchers`",
-        "未配对 UTF-16 surrogate",
-        "`io.open`",
-        "`io.input`",
-        "`io.output`",
-        "`io.lines`",
-        "`loadfile`",
-        "`dofile`",
-        "`os.remove`",
-        "`os.rename`",
-        "`os.getenv`",
-        "`os.execute`",
-        "`io.popen`",
-        "相对路径按进程 cwd 解析",
-        "`errno` 第三返回值",
-        "原始 Windows error code",
-        "直接外部访问",
-        "本地盘",
-        "映射盘和 UNC",
-        "不受项目根白名单限制",
-        "必须使用受管接口",
-    ] {
-        assert!(
-            vm_section.contains(required),
-            "{} 的 VM 章节必须说明直接 Lua 边界 {required:?}",
-            display_relative(&lua_path)
-        );
+    for required in ["`mv`", "`mz`", "`generic`", "docs/README.md", "互不共享"] {
+        assert!(readme.contains(required), "README.md 缺少 {required:?}");
     }
 
     for required in [
-        "未被脚本捕获的 VM 错误",
-        "实际存在的 Windows 或文件系统错误码",
-        "顶层不会把这些事实压缩成",
+        "guides/translation-project.md",
+        "rpg-maker/README.md",
+        "generic/README.md",
+        "translation/README.md",
+        "lua/README.md",
+        "runtime/README.md",
     ] {
         assert!(
-            lua.contains(required),
-            "{} 必须说明未捕获 Lua 错误的安全诊断 {required:?}",
-            display_relative(&lua_path)
+            navigation.contains(required),
+            "docs/README.md 缺少总导航目标 {required:?}"
+        );
+    }
+}
+
+#[test]
+fn generic_jsonl_contract_and_example_use_the_minimal_shape() {
+    let contract = read_utf8(&workspace_root().join("docs/generic/jsonl.md"));
+    for required in [
+        "Group 只允许以下字段",
+        "`id`",
+        "`kind`",
+        "`units`",
+        "Unit 只允许",
+        "`text`",
+        "唯一会被翻译的字段",
+        "空白物理行",
+        "无效 UTF-8",
+        "空输入目录和空 JSONL 文件合法",
+        "扩展名精确为小写 `.jsonl`",
+        "纯空白字符串按原值是合法身份",
+    ] {
+        assert!(
+            contract.contains(required),
+            "Generic JSONL 规格缺少 {required:?}"
+        );
+    }
+    for forbidden in [
+        "\"translate\"",
+        "\"context\"",
+        "\"role\"",
+        "\"metadata\"",
+        "\"version\"",
+    ] {
+        assert!(
+            !contract.contains(&format!("{forbidden}:")),
+            "Generic JSONL 规格不得把 {forbidden} 定义为字段"
         );
     }
 
-    let translation_path = documentation_root().join("translation.md");
-    let translation = read_utf8(&translation_path);
+    let example_path = workspace_root().join("docs/generic/examples/sample.jsonl");
+    let example = read_utf8(&example_path);
+    assert!(!example.is_empty(), "Generic 示例应至少包含一个 Group");
+    for (line_index, line) in example.lines().enumerate() {
+        assert!(!line.trim().is_empty(), "JSONL 示例不得包含空白物理行");
+        let value: JsonValue = serde_json::from_str(line).unwrap_or_else(|error| {
+            panic!(
+                "{}:{} 必须是一行有效 JSON：{error}",
+                display_relative(&example_path),
+                line_index + 1
+            )
+        });
+        let group = value
+            .as_object()
+            .unwrap_or_else(|| panic!("JSONL 第 {} 行必须是 object", line_index + 1));
+        assert_eq!(
+            group.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            BTreeSet::from(["id", "kind", "units"]),
+            "JSONL Group 只能使用当前契约的三个字段"
+        );
+        let units = group["units"].as_array().expect("JSONL units 必须是数组");
+        assert!(!units.is_empty(), "JSONL Group 至少包含一个 Unit");
+        for unit in units {
+            let unit = unit.as_object().expect("JSONL Unit 必须是 object");
+            assert_eq!(
+                unit.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+                BTreeSet::from(["id", "text"]),
+                "JSONL Unit 只能使用当前契约的两个字段"
+            );
+            assert!(unit["id"].is_string());
+            assert!(unit["text"].is_string());
+        }
+    }
+}
+
+#[test]
+fn generic_dynamic_pipeline_and_independent_projects_are_documented() {
+    let extraction = read_utf8(&workspace_root().join("docs/generic/extraction.md"));
     for required in [
-        "`require`、`loadfile`、`dofile`、`io`、`os`",
-        "不随主程序进入快照",
-        "非受管副作用",
-        "[Lua 技术参考](lua.md#2-vm连接与-ctx)",
+        "不冻结或复制 Generic 输入",
+        "一个数据库事务",
+        "文件改名或移到其他 JSONL",
+        "只改变一个 Unit ID",
+        "只清除实际受影响的 Group",
+        "明确要求重新 Extract",
+    ] {
+        assert!(
+            extraction.contains(required),
+            "Generic 动态 Extract 规格缺少 {required:?}"
+        );
+    }
+
+    let translation = read_utf8(&workspace_root().join("docs/generic/translation.md"));
+    for required in [
+        "不包含文件、kind、Group 或 ID",
+        "已经有多种不同 Current",
+        "不跨越 JSONL 文件",
+        "全部 Unit 按原顺序参与语境",
+        "只有代表项带临时数字 ID",
+        "每个 value 为字符串",
     ] {
         assert!(
             translation.contains(required),
-            "{} 必须说明 Translate Lua 的动态依赖边界 {required:?}",
-            display_relative(&translation_path)
-        );
-    }
-}
-
-#[test]
-fn translation_skill_records_lua_resolution_dependencies_and_unmanaged_effects() {
-    let root = workspace_root().join("skills/translate-rpg-maker-with-att");
-    let skill_path = root.join("SKILL.md");
-    let skill = read_utf8(&skill_path);
-    for required in [
-        "本次运行方案或项目状态会使用 Lua",
-        "Lua 外部依赖与副作用",
-        "模块解析环境",
-        "不得假定依赖位于项目内",
-        "重新核对当前模块解析环境",
-        "动态依赖和非受管副作用已经核对",
-    ] {
-        assert!(
-            skill.contains(required),
-            "{} 必须把 Lua 外部依赖纳入执行流程 {required:?}",
-            display_relative(&skill_path)
+            "Generic Translate 规格缺少 {required:?}"
         );
     }
 
-    let workflow_path = root.join("references/workflow.md");
-    let workflow = read_utf8(&workflow_path);
+    let write_back = read_utf8(&workspace_root().join("docs/generic/write-back.md"));
     for required in [
-        "调用 cwd",
-        "`att.exe` 目录",
-        "`LUA_PATH_5_4`、后备 `LUA_PATH` 或内置默认",
-        "`require`、`loadfile`、`dofile`",
-        "`os.getenv` 读取的其他环境",
-        "本次实际发布目录",
-        "`docs/runtime/chat-completions.md` 的唯一规定",
-        "沿主程序、已经确定的候选依赖和配置逐层调查",
-        "`package.loaded` 预置值",
-        "preload 或自定义 searcher",
-        "本地盘、映射盘、UNC、长路径",
-        "不获得 ATT 的事务、取消、恢复或发布语义",
-        "返回最早执行该 Lua 的阶段",
-    ] {
-        assert!(
-            workflow.contains(required),
-            "{} 必须说明 Lua 依赖调查与恢复要求 {required:?}",
-            display_relative(&workflow_path)
-        );
-    }
-
-    let artifacts_path = root.join("references/task-artifacts.md");
-    let artifacts = read_utf8(&artifacts_path);
-    for required in [
-        "Lua 动态加载与直接访问",
-        "最终绝对路径、SHA-256",
-        "`os.getenv` 使用的其他环境变量",
-        "本次实际发布目录",
-        "`docs/runtime/chat-completions.md` 的唯一规定",
-        "`package.loaded` 预置值",
-        "`evidence/` 文件",
-        "执行前后状态",
-        "项目、发布目录和任务根",
-    ] {
-        assert!(
-            artifacts.contains(required),
-            "{} 必须保存 Lua 依赖与副作用证据 {required:?}",
-            display_relative(&artifacts_path)
-        );
-    }
-
-    let template_path = root.join("assets/task-list-template.md");
-    let template = read_utf8(&template_path);
-    for required in [
-        "Lua 解析环境",
-        "Lua 动态依赖与直接访问",
-        "最终绝对路径或生产者身份",
-        "`os.getenv` 使用的其他变量名",
-    ] {
-        assert!(
-            template.contains(required),
-            "{} 必须为 Lua 解析与依赖证据预留位置 {required:?}",
-            display_relative(&template_path)
-        );
-    }
-}
-
-#[test]
-fn translation_skill_selects_managed_capabilities_and_requires_full_round_trip() {
-    let root = workspace_root().join("skills/translate-rpg-maker-with-att");
-    let skill_path = root.join("SKILL.md");
-    let skill = read_utf8(&skill_path);
-    for required in [
-        "检查当前",
-        "能够完整表达该结构、Current 和写回关系的高级接口",
-        "由语义所有者验收和提交",
-        "保留低级 Lua",
-        "解析、验收或保存、渲染、重新解析和领域值比较",
-        "不得留下半修改或伪造 Current",
-    ] {
-        assert!(
-            skill.contains(required),
-            "{} 必须保存 Lua 受管能力选择与往返规则 {required:?}",
-            display_relative(&skill_path)
-        );
-    }
-
-    let workflow_path = root.join("references/workflow.md");
-    let workflow = read_utf8(&workflow_path);
-    for required in [
-        "Lua 表示层与受管能力选择",
-        "源文件或私有 grammar",
-        "解码领域值",
-        "模型 wire",
-        "已保存 Current",
-        "重新编码候选",
-        "解析来源 → 建立解码领域值 → 公共或私有验收",
-        "结构、Placeholder、编码和私有 grammar",
-        "才提交 translation/state",
-        "显式处理已有 Current",
-        "随后重新打开正式接口并读取权威 Current",
-        "特殊 grammar、跨目标原子关系或私有模型协议",
-    ] {
-        assert!(
-            workflow.contains(required),
-            "{} 必须说明 Lua 表示层、正式状态接口与完整往返 {required:?}",
-            display_relative(&workflow_path)
-        );
-    }
-}
-
-#[test]
-fn structured_translation_managed_edit_and_checked_write_back_are_documented() {
-    let lua_path = documentation_root().join("lua.md");
-    let lua = read_utf8(&lua_path);
-    for required in [
-        "ctx.translation.prepare_content",
-        "prepared.part_statuses",
-        "prepared.model_content",
-        "ctx.translations.edit()",
-        "`current`、`missing`、`stale`、`not_applicable` 或 `unavailable`",
-        "current_replacement_required",
-        "完整冻结 source",
-        "ctx.write_back.replace_text",
-        "重复目标或祖先/后代",
-        "重新读取同一路径",
-        "不可发布",
-        "私有标签、任意",
-        "JavaScript 文件、字节区间和多目标私有协议",
-    ] {
-        assert!(
-            lua.contains(required),
-            "{} 必须说明结构化翻译、Managed 修订和安全写回 {required:?}",
-            display_relative(&lua_path)
-        );
-    }
-
-    let translation_path = documentation_root().join("translation.md");
-    let translation = read_utf8(&translation_path);
-    for required in [
-        "Standard 是 RPG Maker 核心翻译路径",
-        "Managed 的模型与执行内核保持引擎无关",
-        "不构成与 Lua 并列的三个流程",
-        "低级 `prepare_content`",
-        "确认未应用与提交结果未知",
-    ] {
-        assert!(
-            translation.contains(required),
-            "{} 必须说明正确的 Standard、Lua 与 Managed 关系 {required:?}",
-            display_relative(&translation_path)
-        );
-    }
-
-    let write_back_path = documentation_root().join("write-back.md");
-    let write_back = read_utf8(&write_back_path);
-    for required in [
-        "ctx.write_back.replace_text(batch)",
-        "多层 `DECODE_JSON`",
-        "重新读取同一路径并逐字比较",
-        "标记为不可发布",
-        "`ctx.output`",
-        "不增加通用 grammar DSL",
+        "<projects.root>/generic/<name>/write_back/",
+        "永远不修改外部输入目录",
+        "Current Unit 用译文替换 `text`",
+        "其他 Unit 保留当前原文",
+        "确认除 `text` 外的全部事实",
+        "成功输出保持",
     ] {
         assert!(
             write_back.contains(required),
-            "{} 必须说明受保护写回与低级 Lua 的边界 {required:?}",
-            display_relative(&write_back_path)
+            "Generic WriteBack 规格缺少 {required:?}"
         );
     }
 
-    let cli_path = workspace_root().join("docs/runtime/cli.md");
-    let cli = read_utf8(&cli_path);
+    let guide = read_utf8(&workspace_root().join("docs/guides/translation-project.md"));
     for required in [
-        "`ctx.translations.edit()`",
-        "首次打开任一人工会话",
-        "共用一次解析出的 Profile",
-        "不增加 CLI 参数",
+        "建立两个独立项目",
+        "数据库、译文状态、日志、模型任务记录和输出都分别保存",
+        "外部操作者负责把未覆盖内容转换成 Generic JSONL",
+    ] {
+        assert!(guide.contains(required), "混合项目指南缺少 {required:?}");
+    }
+
+    let configuration = read_utf8(&workspace_root().join("docs/runtime/configuration.md"));
+    for required in [
+        "[[translation.profiles]]",
+        "MV、MZ 和 Generic 共用 Profile 定义",
+        "每个项目分别保存最近采用的 ID",
     ] {
         assert!(
-            cli.contains(required),
-            "{} 必须说明独立 Lua 的 Managed 修订与 Profile 选择 {required:?}",
-            display_relative(&cli_path)
+            configuration.contains(required),
+            "公共 Profile 规格缺少 {required:?}"
         );
     }
 }
 
 #[test]
-fn sensitive_information_members_have_one_authority_and_are_only_linked_elsewhere() {
-    let authority_path = workspace_root().join("docs/runtime/chat-completions.md");
-    let canonical_authority_path = canonicalize_for_contract(&authority_path);
-    let authority_anchor = "6-敏感信息闭集唯一权威";
-    let authority_source = read_utf8(&authority_path).replace("\r\n", "\n");
-    let authority_section =
-        markdown_level_two_section(&authority_source, "## 6. 敏感信息闭集唯一权威")
-            .expect("Chat Completions 规格必须保留敏感信息闭集唯一权威章节");
-    let normalized_authority = authority_section
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let sensitive_member = normalized_authority
-        .split_once("闭集只有")
-        .and_then(|(_, remainder)| remainder.split_once('。'))
-        .map(|(member, _)| member.trim())
-        .filter(|member| !member.is_empty())
-        .expect("敏感信息权威章节必须明确闭集成员");
-
-    for relative_path in [
-        "AGENTS.md",
-        "docs/runtime/project-log.md",
-        "docs/rpg-maker/task-records.md",
+fn atomic_lua_is_documented_as_a_restricted_database_transaction() {
+    let contract = read_utf8(&workspace_root().join("docs/lua/README.md"));
+    for required in [
+        "ctx.db.NULL",
+        "ctx.db.blob(bytes)",
+        "ctx.db.query(sql, parameters)",
+        "ctx.db.execute(sql, parameters)",
+        "ctx.translation.set(locator, translation)",
+        "ctx.translation.clear(locator)",
+        "`warn`",
+        "BEGIN IMMEDIATE",
+        "foreign_key_check",
+        "quick_check",
+        "outcome_unknown",
+        "`lua.print`",
+        "不自动把 SQL、参数、查询结果",
     ] {
-        let path = workspace_root().join(relative_path);
-        let source = read_utf8(&path).replace("\r\n", "\n");
-        let authority_links = local_markdown_links(&source)
-            .into_iter()
-            .filter(|(_, target)| {
-                let Some((file_target, anchor)) = target.split_once('#') else {
-                    return false;
-                };
-                if anchor != authority_anchor {
-                    return false;
-                }
-                let linked_path = path
-                    .parent()
-                    .expect("Markdown 文件始终有父目录")
-                    .join(file_target);
-                canonicalize_for_contract(&linked_path) == canonical_authority_path
-            })
-            .count();
-        assert_eq!(
-            authority_links, 1,
-            "{relative_path} 必须恰好一次直链敏感信息闭集唯一权威及其锚点"
-        );
-
-        let normalized_source = source.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            !normalized_source.contains(sensitive_member),
-            "{relative_path} 只能引用敏感信息权威，不得复述闭集成员"
+            contract.contains(required),
+            "原子数据库 Lua 规格缺少 {required:?}"
         );
     }
-}
+    for forbidden in [
+        "`io`",
+        "`os`",
+        "`package`",
+        "`require`",
+        "`loadfile`",
+        "`dofile`",
+        "`debug`",
+        "`warn`",
+    ] {
+        assert!(
+            contract.contains(forbidden),
+            "Lua VM 禁用能力清单缺少 {forbidden}"
+        );
+    }
+    for obsolete in [
+        "ctx.phase",
+        "ctx.llm",
+        "ctx.write_back",
+        "ctx.output",
+        "ctx.translations",
+        "ctx.standard",
+        "Managed",
+    ] {
+        assert!(
+            !contract.contains(obsolete),
+            "原子数据库 Lua 规格不得保留旧阶段能力 {obsolete:?}"
+        );
+    }
 
-#[test]
-fn normative_fences_are_classified_and_valid_inputs_compile() {
-    let documentation_root = documentation_root();
-    let mut totals = BTreeMap::from([
-        ("valid", 0_usize),
-        ("invalid", 0_usize),
-        ("illustrative", 0_usize),
-    ]);
-
-    for file_name in CONTRACT_DOCUMENTS {
-        let path = documentation_root.join(file_name);
+    let examples = workspace_root().join("docs/lua/examples");
+    let expected = [
+        (
+            "generic-override.lua",
+            &["ctx.translation.set", "group_id", "unit_id"][..],
+        ),
+        ("project-note.lua", &["ctx.db.execute", "CREATE TABLE"][..]),
+        ("rollback.lua", &["error("][..]),
+    ];
+    for (file, markers) in expected {
+        let path = examples.join(file);
         let source = read_utf8(&path);
-        let examples = parse_classified_fences(&path, &source);
-        assert!(
-            !examples.is_empty(),
-            "{} 至少应有一个机器分类的规范代码块",
-            display_relative(&path)
-        );
-
-        for example in examples {
-            let total_key = match example.kind {
-                ExampleKind::Valid => "valid",
-                ExampleKind::Invalid => "invalid",
-                ExampleKind::Illustrative => "illustrative",
-            };
-            *totals.get_mut(total_key).expect("计数键已预先建立") += 1;
-
-            if example.kind != ExampleKind::Valid {
-                continue;
-            }
-            match example.language.as_str() {
-                "toml" => validate_toml_example(&path, &example),
-                "lua" => compile_lua(
-                    &example.body,
-                    &format!("{}:{}", display_relative(&path), example.opening_line),
-                ),
-                _ => {}
-            }
-        }
-    }
-
-    for (kind, total) in totals {
-        assert_ne!(total, 0, "规范文档至少应包含一个 {kind} 代码块");
-    }
-}
-
-#[test]
-fn cookbook_lua_files_are_utf8_compilable_and_cover_the_supported_workflows() {
-    let examples_root = documentation_root().join("examples");
-    let readme = examples_root.join("README.md");
-    let readme_source = read_utf8(&readme);
-
-    for (file_name, required_fragments) in LUA_EXAMPLES {
-        assert!(
-            readme_source.contains(file_name),
-            "examples/README.md 必须链接或列出 {file_name}"
-        );
-        let path = examples_root.join(file_name);
-        let source = read_utf8(&path);
-        assert!(
-            !source.trim().is_empty(),
-            "{} 不能是空脚本",
-            display_relative(&path)
-        );
-        compile_lua(&source, &display_relative(&path));
-
-        for &fragment in required_fragments {
+        for marker in markers {
             assert!(
-                source.contains(fragment),
-                "{} 必须演示当前 API 形状 {fragment:?}",
+                source.contains(marker),
+                "{} 缺少示例行为 {marker:?}",
                 display_relative(&path)
             );
         }
+        Lua::new()
+            .load(&source)
+            .set_name(file)
+            .into_function()
+            .unwrap_or_else(|error| panic!("{file} 必须是可编译的 Lua 5.4：{error}"));
     }
 }
 
 #[test]
-fn complete_toml_examples_are_utf8_parseable_and_listed_in_the_manifest() {
-    let examples_root = documentation_root().join("examples");
-    let readme_source = read_utf8(&examples_root.join("README.md"));
-
-    for file_name in TOML_EXAMPLES {
-        assert!(
-            readme_source.contains(file_name),
-            "examples/README.md 必须链接或列出 {file_name}"
-        );
-        let path = examples_root.join(file_name);
+fn shared_translation_examples_and_prompt_locales_keep_the_current_protocol() {
+    for path in collect_files_with_extension(&workspace_root().join("docs"), "toml") {
         let source = read_utf8(&path);
-        toml::from_str::<TomlValue>(&source).unwrap_or_else(|error| {
-            panic!(
-                "{} 必须能由项目当前 TOML 语法解析器读取：{error}",
-                display_relative(&path)
-            )
-        });
+        toml::from_str::<TomlValue>(&source)
+            .unwrap_or_else(|error| panic!("{} 必须是有效 TOML：{error}", display_relative(&path)));
     }
-}
+    toml::from_str::<TomlValue>(&read_utf8(&workspace_root().join("config.example.toml")))
+        .expect("config.example.toml 必须是有效 TOML");
 
-#[test]
-fn repository_examples_remain_wired_into_production_contract_tests() {
-    // 这里只固定“示例仍由真实边界消费”。字段语义继续由各生产解析器和真实 Lua VM
-    // 测试负责，避免在文档测试里复制第二套解析规则。
-    for (example, source_path, include_expression, contract_test) in PRODUCTION_EXAMPLE_BINDINGS {
-        let source_path = workspace_root().join(source_path);
-        let source = read_utf8(&source_path).replace("\r\n", "\n");
-        assert!(
-            source.contains(include_expression),
-            "{example} 必须继续由 {} 直接 include",
-            display_relative(&source_path)
-        );
-        assert!(
-            source.contains(contract_test),
-            "{example} 必须继续由 {} 的生产契约测试消费",
-            display_relative(&source_path)
-        );
-    }
-}
-
-#[test]
-fn runtime_toml_examples_are_explicitly_classified() {
-    let runtime_root = workspace_root().join("docs/runtime");
-    let markdown_files = collect_files_with_extension(&runtime_root, "md");
-    let production_configuration_source =
-        read_utf8(&workspace_root().join("src/application/config.rs")).replace("\r\n", "\n");
-    let mut production_examples = 0_usize;
-    let mut fragments = 0_usize;
-
-    for markdown_path in markdown_files {
-        let source = read_utf8(&markdown_path);
-        for example in parse_configuration_examples(&markdown_path, &source) {
-            toml::from_str::<TomlValue>(&example.body).unwrap_or_else(|error| {
-                panic!(
-                    "{}:{} 的配置示例必须至少是完整 TOML 语法：{error}",
-                    display_relative(&markdown_path),
-                    example.opening_line
-                )
-            });
-
-            match example.kind {
-                ConfigurationExampleKind::ProductionMinimalInit => {
-                    production_examples += 1;
-                    let production_fixture = format!("r#\"\n{}\"#", example.body);
-                    assert!(
-                        production_configuration_source.contains(&production_fixture),
-                        "{}:{} 的 production-minimal-init 必须与生产配置测试的输入完全一致",
-                        display_relative(&markdown_path),
-                        example.opening_line
-                    );
-                    assert!(
-                        production_configuration_source.contains(
-                            "fn non_translate_commands_load_their_minimal_configuration()"
-                        ),
-                        "生产配置测试必须继续用当前 schema 验证最小 Init 配置"
-                    );
-                }
-                ConfigurationExampleKind::Fragment => fragments += 1,
-            }
+    for engine in PROMPT_ENGINES {
+        for locale in LOCALES {
+            let locale_root = workspace_root().join("prompts").join(engine).join(locale);
+            let system_path = locale_root.join("system.md");
+            let thinking_path = locale_root.join("thinking.md");
+            let system = read_utf8(&system_path);
+            let thinking = read_utf8(&thinking_path);
+            assert!(
+                !system.trim().is_empty(),
+                "{} 不得为空",
+                system_path.display()
+            );
+            assert!(
+                !thinking.trim().is_empty(),
+                "{} 不得为空",
+                thinking_path.display()
+            );
+            assert_eq!(
+                prompt_template_variables(&system),
+                BTreeSet::from(["source_language", "target_language"]),
+                "{} 只能使用公共语言变量",
+                display_relative(&system_path)
+            );
+            assert!(
+                prompt_template_variables(&thinking).is_empty(),
+                "{} 不得使用模板变量",
+                display_relative(&thinking_path)
+            );
         }
     }
 
-    assert_ne!(
-        production_examples, 0,
-        "runtime 文档至少应保留一个由生产配置 schema 覆盖的完整示例"
+    let generic = read_utf8(&workspace_root().join("prompts/generic/en/system.md"));
+    let rpg_maker = read_utf8(&workspace_root().join("prompts/rpg_maker/en/system.md"));
+    let protocol = read_utf8(&workspace_root().join("docs/translation/prompts.md"));
+    let placeholders = read_utf8(&workspace_root().join("docs/translation/placeholders.md"));
+    let rpg_rules = read_utf8(&workspace_root().join("docs/rpg-maker/rules.md"));
+    assert!(
+        generic.contains(r#"{"1":"Translation\nSecond line"}"#),
+        "Generic Prompt 必须要求字符串 value"
     );
-    assert_ne!(
-        fragments, 0,
-        "runtime 文档中的组合片段必须通过 fragment 标记明确跳过生产 schema 校验"
+    assert!(
+        rpg_maker.contains("Every value must be an array of strings"),
+        "RPG Maker Prompt 必须要求字符串数组 value"
     );
+    for required in [
+        "按原始顺序保留全部 key",
+        "重复、非法、未知和缺少的 ID",
+        "每个 ID 独立验收",
+        "其他合法 ID 可以保存",
+    ] {
+        assert!(
+            protocol.contains(required),
+            "公共响应协议缺少逐 ID Partial 语义 {required:?}"
+        );
+    }
+    for required in [
+        "捕获本身仍是可",
+        "翻译的 NaturalText",
+        "捕获前后的字节分别成为不透明 wrapper",
+        "实际保护跨度重叠",
+    ] {
+        assert!(
+            placeholders.contains(required),
+            "公共 Placeholder 规格缺少 wrapper 保护语义 {required:?}"
+        );
+    }
+    for required in [
+        "建立在[公共 Placeholder 规格]",
+        "本文只补充 MV/MZ 作用域",
+        "控制符和形状规则",
+    ] {
+        assert!(
+            rpg_rules.contains(required),
+            "RPG Maker Placeholder 文档必须服从公共规格并只拥有引擎差异：{required:?}"
+        );
+    }
 }
 
 #[test]
-fn external_prompt_locales_preserve_the_same_machine_contract() {
-    let prompt_root = workspace_root().join("prompts/rpg_maker");
-    let expected_locales = PROMPT_LOCALES
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<BTreeSet<_>>();
-    let actual_locales = fs::read_dir(&prompt_root)
-        .expect("Prompt 资源根必须存在")
-        .map(|entry| {
-            let entry = entry.expect("Prompt locale 目录应可枚举");
-            assert!(
-                entry.file_type().expect("应可读取资源类型").is_dir(),
-                "Prompt 资源根只能包含 locale 目录：{}",
-                display_relative(&entry.path())
-            );
-            entry
-                .file_name()
-                .into_string()
-                .expect("Prompt locale 目录名必须是 Unicode")
-        })
-        .collect::<BTreeSet<_>>();
-    assert_eq!(actual_locales, expected_locales);
+fn total_skill_routes_execution_to_documents_without_copying_product_protocols() {
+    let skill_root = workspace_root().join("skills/translate-with-att");
+    let skill_path = skill_root.join("SKILL.md");
+    let metadata_path = skill_root.join("agents/openai.yaml");
+    let skill = read_utf8(&skill_path);
+    let metadata = read_utf8(&metadata_path);
 
-    for locale in PROMPT_LOCALES {
-        let locale_root = prompt_root.join(locale);
-        let actual_files = fs::read_dir(&locale_root)
-            .unwrap_or_else(|error| panic!("无法读取 {}：{error}", display_relative(&locale_root)))
-            .map(|entry| {
-                let entry = entry.expect("Prompt 组件应可枚举");
-                assert!(
-                    entry.file_type().expect("应可读取资源类型").is_file(),
-                    "Prompt locale 目录只能包含普通文件：{}",
-                    display_relative(&entry.path())
-                );
-                entry
-                    .file_name()
-                    .into_string()
-                    .expect("Prompt 组件文件名必须是 Unicode")
-            })
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            actual_files,
-            BTreeSet::from(["system.md".to_owned(), "thinking.md".to_owned()]),
-            "{locale} 必须且只能包含两份现行 Prompt 组件"
-        );
-
-        let system = read_utf8(&locale_root.join("system.md"));
-        let thinking = read_utf8(&locale_root.join("thinking.md"));
-        assert!(!system.trim().is_empty(), "{locale}/system.md 不能为空");
-        assert!(!thinking.trim().is_empty(), "{locale}/thinking.md 不能为空");
-        assert_eq!(
-            prompt_template_variables(&system),
-            BTreeSet::from(["source_language", "target_language"]),
-            "{locale}/system.md 只能使用两项现行模板变量"
-        );
-        assert!(
-            !thinking.contains("{{") && !thinking.contains("}}"),
-            "{locale}/thinking.md 不允许模板变量"
-        );
-
-        for shape_literal in [
-            "single line",
-            "free line breaking",
-            "N lines, corresponding line by line",
-            "N items, corresponding item by item",
-        ] {
-            assert!(
-                system.contains(shape_literal),
-                "{locale}/system.md 缺少形状协议字面量 {shape_literal:?}"
-            );
-            assert!(
-                thinking.contains(shape_literal),
-                "{locale}/thinking.md 缺少形状协议字面量 {shape_literal:?}"
-            );
-        }
-        let combined = format!("{system}\n{thinking}");
-        for literal in ["JSON", "[ID]", "<why>", "</why>", "ATT token"] {
-            assert!(
-                combined.contains(literal),
-                "{locale} Prompt 资源缺少协议字面量 {literal:?}"
-            );
-        }
+    assert!(skill.lines().count() < 500, "总 Skill 应保持简短");
+    for required in [
+        "只读",
+        "执行",
+        "协作者",
+        "实际使用的 `att.exe`",
+        "`docs/README.md`",
+        "MV/MZ",
+        "`generic`",
+        "彼此独立",
+        "外部操作者或工具",
+        "同一文本",
+        "Lua 文档精确修订",
+        "Partial",
+        "outcome unknown",
+    ] {
+        assert!(skill.contains(required), "总 Skill 缺少引导 {required:?}");
     }
+    for forbidden in [
+        "att mv init",
+        "att mz init",
+        "att generic init",
+        r#"{"id":"#,
+        "CREATE TABLE",
+        "SELECT ",
+    ] {
+        assert!(
+            !skill.contains(forbidden),
+            "命令、JSONL 或数据库协议只能由文档负责，Skill 不得复制 {forbidden:?}"
+        );
+    }
+
+    for required in [
+        "display_name: \"ATT 翻译任务\"",
+        "short_description:",
+        "default_prompt:",
+        "$translate-with-att",
+    ] {
+        assert!(
+            metadata.contains(required),
+            "agents/openai.yaml 缺少 {required:?}"
+        );
+    }
+    assert!(
+        !skill_root.join("README.md").exists(),
+        "Skill 目录不应包含辅助 README"
+    );
 }
 
 fn prompt_template_variables(source: &str) -> BTreeSet<&str> {
     let mut variables = BTreeSet::new();
-    let mut remaining = source;
-    loop {
-        let next_open = remaining.find("{{");
-        let next_close = remaining.find("}}");
-        let Some(open) = next_open else {
-            assert!(next_close.is_none(), "Prompt 模板含有未配对的结束定界符");
-            break;
+    let mut remainder = source;
+    while let Some(start) = remainder.find("{{") {
+        remainder = &remainder[start + 2..];
+        let Some(end) = remainder.find("}}") else {
+            panic!("Prompt 存在未闭合模板变量");
         };
-        assert!(
-            next_close.is_none_or(|close| open < close),
-            "Prompt 模板含有未配对的结束定界符"
-        );
-        let after_open = &remaining[open + 2..];
-        let close = after_open.find("}}").expect("Prompt 模板变量必须闭合");
-        assert!(
-            !after_open[..close].contains("{{"),
-            "Prompt 模板变量不得嵌套"
-        );
-        variables.insert(&after_open[..close]);
-        remaining = &after_open[close + 2..];
+        variables.insert(&remainder[..end]);
+        remainder = &remainder[end + 2..];
     }
     variables
-}
-
-fn validate_toml_example(path: &Path, example: &FencedExample) {
-    let parsed = toml::from_str::<TomlValue>(&example.body).unwrap_or_else(|error| {
-        panic!(
-            "{}:{} 标为 valid 的 TOML 必须能由项目当前 TOML 解析器读取：{error}",
-            display_relative(path),
-            example.opening_line
-        )
-    });
-    let table = parsed.as_table().unwrap_or_else(|| {
-        panic!(
-            "{}:{} 标为 valid 的 TOML 根必须是 table",
-            display_relative(path),
-            example.opening_line
-        )
-    });
-
-    let required_root = match path.file_name().and_then(|name| name.to_str()) {
-        Some("rules.md") => Some("rule"),
-        Some("terminology.md") => Some("term"),
-        _ => None,
-    };
-    if let Some(required_root) = required_root {
-        assert!(
-            table.get(required_root).is_some_and(TomlValue::is_array),
-            "{}:{} 的 valid TOML 必须包含数组根 {required_root:?}",
-            display_relative(path),
-            example.opening_line
-        );
-        assert_eq!(
-            table.len(),
-            1,
-            "{}:{} 的完整规则文件不得在根部混入其他字段",
-            display_relative(path),
-            example.opening_line
-        );
-    }
-}
-
-fn compile_lua(source: &str, name: &str) {
-    Lua::new()
-        .load(source)
-        .set_name(name)
-        .into_function()
-        .unwrap_or_else(|error| panic!("{name} 必须是可编译的 Lua 5.4 chunk：{error}"));
-}
-
-fn parse_classified_fences(path: &Path, source: &str) -> Vec<FencedExample> {
-    let lines = source.lines().collect::<Vec<_>>();
-    let mut examples = Vec::new();
-    let mut index = 0;
-    while index < lines.len() {
-        let line = lines[index];
-        if ExampleKind::parse(line).is_some() {
-            assert!(
-                lines
-                    .get(index + 1)
-                    .is_some_and(|line| line.starts_with("```")),
-                "{}:{} 的 att-example 标记必须紧邻它所分类的 fenced code block",
-                display_relative(path),
-                index + 1
-            );
-        }
-        if !line.starts_with("```") || line == "```" {
-            index += 1;
-            continue;
-        }
-
-        let opening_line = index + 1;
-        let kind = index
-            .checked_sub(1)
-            .and_then(|previous| ExampleKind::parse(lines[previous]))
-            .unwrap_or_else(|| {
-                panic!(
-                    "{}:{opening_line} 的规范代码块缺少紧邻的 att-example 分类",
-                    display_relative(path)
-                )
-            });
-        let language = line.trim_start_matches('`').trim().to_owned();
-        assert!(
-            !language.is_empty(),
-            "{}:{opening_line} 的代码块必须声明语言",
-            display_relative(path)
-        );
-
-        index += 1;
-        let body_start = index;
-        while index < lines.len() && lines[index] != "```" {
-            index += 1;
-        }
-        assert!(
-            index < lines.len(),
-            "{}:{opening_line} 的代码块没有闭合",
-            display_relative(path)
-        );
-        let mut body = lines[body_start..index].join("\n");
-        body.push('\n');
-        examples.push(FencedExample {
-            kind,
-            language,
-            body,
-            opening_line,
-        });
-        index += 1;
-    }
-    examples
-}
-
-fn parse_configuration_examples(path: &Path, source: &str) -> Vec<ConfigurationExample> {
-    let lines = source.lines().collect::<Vec<_>>();
-    let mut examples = Vec::new();
-    let mut index = 0_usize;
-    while index < lines.len() {
-        let line = lines[index];
-        if ConfigurationExampleKind::parse(line).is_some() {
-            assert!(
-                lines
-                    .get(index + 1)
-                    .is_some_and(|line| line.starts_with("```toml")),
-                "{}:{} 的 att-config-example 标记必须紧邻 TOML fenced code block",
-                display_relative(path),
-                index + 1
-            );
-        }
-        if !line.starts_with("```") || line == "```" {
-            index += 1;
-            continue;
-        }
-
-        let opening_line = index + 1;
-        let language = line.trim_start_matches('`').trim();
-        index += 1;
-        let body_start = index;
-        while index < lines.len() && lines[index] != "```" {
-            index += 1;
-        }
-        assert!(
-            index < lines.len(),
-            "{}:{opening_line} 的代码块没有闭合",
-            display_relative(path)
-        );
-        if language == "toml" {
-            let kind = body_start
-                .checked_sub(2)
-                .and_then(|marker| ConfigurationExampleKind::parse(lines[marker]))
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{}:{opening_line} 的 runtime TOML 缺少紧邻的 att-config-example 分类",
-                        display_relative(path)
-                    )
-                });
-            let mut body = lines[body_start..index].join("\n");
-            body.push('\n');
-            examples.push(ConfigurationExample {
-                kind,
-                body,
-                opening_line,
-            });
-        }
-        index += 1;
-    }
-    examples
 }
 
 fn local_markdown_links(source: &str) -> Vec<(usize, String)> {
     let mut links = Vec::new();
     let mut in_fence = false;
     for (line_index, line) in source.lines().enumerate() {
-        if line.starts_with("```") {
+        if line.trim_start().starts_with("```") {
             in_fence = !in_fence;
             continue;
         }
@@ -1143,7 +493,7 @@ fn local_markdown_links(source: &str) -> Vec<(usize, String)> {
             let raw_target = rest[..link_end].trim();
             let target = raw_target
                 .strip_prefix('<')
-                .and_then(|target| target.strip_suffix('>'))
+                .and_then(|value| value.strip_suffix('>'))
                 .unwrap_or_else(|| {
                     raw_target
                         .split_ascii_whitespace()
@@ -1169,7 +519,7 @@ fn markdown_heading_anchors(source: &str) -> BTreeSet<String> {
     let mut in_fence = false;
 
     for line in source.lines() {
-        if line.starts_with("```") {
+        if line.trim_start().starts_with("```") {
             in_fence = !in_fence;
             continue;
         }
@@ -1201,7 +551,6 @@ fn markdown_heading_anchors(source: &str) -> BTreeSet<String> {
         *occurrence += 1;
         anchors.insert(anchor);
     }
-
     anchors
 }
 
@@ -1219,35 +568,12 @@ fn markdown_heading_slug(heading: &str) -> String {
 
 fn current_markdown_files() -> Vec<PathBuf> {
     let root = workspace_root();
-    let mut files = vec![
-        root.join("AGENTS.md"),
-        root.join("README.md"),
-        root.join("docs/README.md"),
-    ];
-    files.extend(collect_files_with_extension(
-        &root.join("docs/runtime"),
-        "md",
-    ));
-    files.extend(collect_files_with_extension(
-        &root.join("docs/rpg-maker"),
-        "md",
-    ));
+    let mut files = vec![root.join("AGENTS.md"), root.join("README.md")];
+    files.extend(collect_files_with_extension(&root.join("docs"), "md"));
     files.extend(collect_files_with_extension(&root.join("skills"), "md"));
     files.sort();
     files.dedup();
     files
-}
-
-fn markdown_level_two_section<'a>(source: &'a str, heading: &str) -> Option<&'a str> {
-    let start = source.find(heading)?;
-    let remainder = &source[start + heading.len()..];
-    let end = remainder.find("\n## ").unwrap_or(remainder.len());
-    Some(&remainder[..end])
-}
-
-fn canonicalize_for_contract(path: &Path) -> PathBuf {
-    fs::canonicalize(path)
-        .unwrap_or_else(|error| panic!("无法解析 {}：{error}", display_relative(path)))
 }
 
 fn collect_files_with_extension(root: &Path, extension: &str) -> Vec<PathBuf> {
@@ -1301,10 +627,6 @@ fn is_absolute_or_escaping(path: &Path, root: &Path) -> bool {
 fn read_utf8(path: &Path) -> String {
     fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("{} 必须存在且是 UTF-8：{error}", display_relative(path)))
-}
-
-fn documentation_root() -> PathBuf {
-    workspace_root().join("docs/rpg-maker")
 }
 
 fn workspace_root() -> &'static Path {

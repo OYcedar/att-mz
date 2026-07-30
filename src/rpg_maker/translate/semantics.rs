@@ -1,33 +1,35 @@
-//! Standard 与可信 Lua 共同使用的一次翻译语义快照。
+//! RPG Maker 翻译规划和结果验收共同使用的一次语义快照。
 
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::fingerprint::Sha256Fingerprint;
+use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::language::{LanguageAnalysis, LanguageModule, LanguagePair, LanguageTextSegment};
 use crate::rpg_maker::RpgMakerEngine;
+use crate::rpg_maker::location_codec::{
+    RpgMakerLocationCodec, RpgMakerLocationCodecError, RpgMakerProjectionCodec,
+    RpgMakerProjectionCodecError,
+};
 use crate::rpg_maker::model::TextUnitContent;
 use crate::rpg_maker::text::TextGroupKind;
-
-use super::executor::{
-    TranslationContentAcceptance, accept_prepared_translation_candidate,
-    accept_translation_content_candidate,
+use crate::translation::placeholder_projection::{
+    LanguageTextProjectionError, project_protected_text,
 };
-use super::language_projection::{LanguageTextProjectionError, project_protected_text};
+
+#[cfg(test)]
+use super::executor::accept_prepared_translation_candidate;
+#[cfg(test)]
+use super::pipeline::TranslationUnitRejectionReason;
+use super::pipeline::{AppliedPlaceholder, TerminologyDependency, TranslationUnitIdentity};
 use super::placeholder::{
     CompiledPlaceholderRules, Pcre2PlaceholderService, PlaceholderProtectionError,
 };
-use super::planning_resource::CompiledTerminology;
-use super::standard::{
-    AppliedPlaceholder, ExpectedLineShape, TerminologyDependency, TranslationUnitIdentity,
-    TranslationUnitRejectionReason,
-};
+use crate::translation::planning_resource::CompiledTerminology;
 
-/// 一轮 Standard 与 Lua 共享且不可变的当前翻译语义。
+/// 一轮 RPG Maker 翻译共享且不可变的当前语义。
 pub(crate) struct ResolvedTranslationSemantics {
     engine: RpgMakerEngine,
-    system_prompt: String,
     language_pair: LanguagePair,
     terminology: Arc<CompiledTerminology>,
     placeholder_service: Pcre2PlaceholderService,
@@ -60,7 +62,6 @@ impl ResolvedTranslationSemantics {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         engine: RpgMakerEngine,
-        system_prompt: String,
         language_pair: LanguagePair,
         terminology: Arc<CompiledTerminology>,
         placeholder_service: Pcre2PlaceholderService,
@@ -70,7 +71,6 @@ impl ResolvedTranslationSemantics {
     ) -> Self {
         Self {
             engine,
-            system_prompt,
             language_pair,
             terminology,
             placeholder_service,
@@ -106,7 +106,6 @@ impl ResolvedTranslationSemantics {
         ));
         Self::new(
             RpgMakerEngine::Mz,
-            "test system".to_owned(),
             LanguagePair::new(
                 LanguageId::parse("ja").expect("测试源语言应合法"),
                 LanguageId::parse("zh-Hans").expect("测试目标语言应合法"),
@@ -117,10 +116,6 @@ impl ResolvedTranslationSemantics {
             source_language,
             Sha256Fingerprint::from_bytes([0x5a; 32]),
         )
-    }
-
-    pub(crate) fn system_prompt(&self) -> &str {
-        &self.system_prompt
     }
 
     pub(crate) const fn engine(&self) -> RpgMakerEngine {
@@ -143,7 +138,7 @@ impl ResolvedTranslationSemantics {
         self.prepare_text(kind, original, &[])
     }
 
-    /// Standard 的 `Lines` 保持完整原文参与 Placeholder 与语言分析，但 opaque 保护和
+    /// RPG Maker 的 `Lines` 保持完整原文参与 Placeholder 与语言分析，但 opaque 保护和
     /// 术语都不能跨越两个物理数组元素。`Value` 没有这层边界，其中的 LF 仍是普通内容。
     pub(crate) fn prepare_content(
         &self,
@@ -215,7 +210,10 @@ impl ResolvedTranslationSemantics {
         let terms = term_indices
             .iter()
             .copied()
-            .map(|index| self.terminology.entries()[index].dependency())
+            .map(|index| {
+                let entry = &self.terminology.entries()[index];
+                TerminologyDependency::new(entry.term(), entry.translation())
+            })
             .collect();
         Ok(PreparedTranslationText {
             status,
@@ -224,8 +222,96 @@ impl ResolvedTranslationSemantics {
             term_indices,
             placeholders,
             language_analysis,
+            #[cfg(test)]
             source_language: Arc::clone(&self.source_language),
         })
+    }
+}
+
+/// 建立人工译文的稳定语义状态。
+///
+/// 该状态只绑定会决定人工译文是否仍适用于当前 Unit 的事实。Prompt、Profile、
+/// Client、术语和译文正文不参与；因此对已有人工译文作精确修订不会使它失去
+/// Current，调整自动翻译配置也不会清除人工修订。
+pub(crate) fn manual_translation_state_fingerprint(
+    engine: RpgMakerEngine,
+    language_pair: &LanguagePair,
+    identity: &TranslationUnitIdentity,
+    placeholders: &[AppliedPlaceholder],
+) -> Result<Sha256Fingerprint, ManualTranslationStateError> {
+    let group_location = RpgMakerLocationCodec::encode(identity.group_location())
+        .map_err(ManualTranslationStateError::EncodeLocation)?;
+    let unit_role = RpgMakerProjectionCodec::encode_role(identity.role())
+        .map_err(ManualTranslationStateError::EncodeRole)?;
+    let mut hasher = Sha256FramedHasher::new(b"att.rpg_maker.translation-state.manual");
+    hasher
+        .frame(1, engine.storage_name().as_bytes())
+        .frame(2, language_pair.source().as_str().as_bytes())
+        .frame(3, language_pair.target().as_str().as_bytes())
+        .frame(4, identity.owner().storage_name().as_bytes())
+        .frame(5, identity.kind().storage_name().as_bytes())
+        .frame(6, group_location.as_bytes())
+        .frame(7, unit_role.as_bytes())
+        .frame(8, identity.source_context_json().as_bytes());
+    match identity.source_content() {
+        TextUnitContent::Value(value) => {
+            hasher.frame(9, b"value").frame(10, value.as_bytes());
+        }
+        TextUnitContent::Lines(lines) => {
+            let count = u64::try_from(lines.len())
+                .expect("RPG Maker Unit 行数必须能表示为 u64")
+                .to_le_bytes();
+            hasher.frame(9, b"lines").frame(10, &count);
+            for line in lines {
+                hasher.frame(11, line.as_bytes());
+            }
+        }
+    }
+    for placeholder in placeholders {
+        let origin = match placeholder.origin() {
+            super::pipeline::PlaceholderRuleOrigin::BuiltIn => b"builtin".as_slice(),
+            super::pipeline::PlaceholderRuleOrigin::Custom => b"custom".as_slice(),
+        };
+        let segment = match placeholder.segment() {
+            super::pipeline::PlaceholderSegment::Whole => b"whole".as_slice(),
+            super::pipeline::PlaceholderSegment::Begin => b"begin".as_slice(),
+            super::pipeline::PlaceholderSegment::End => b"end".as_slice(),
+        };
+        hasher
+            .frame(20, placeholder.token().as_bytes())
+            .frame(21, placeholder.original().as_bytes())
+            .frame(22, origin)
+            .frame(23, placeholder.label().as_bytes())
+            .frame(24, placeholder.scope().as_bytes())
+            .frame(25, segment);
+    }
+    Ok(hasher.finish())
+}
+
+/// 人工译文状态无法编码受信 Unit 身份。
+#[derive(Debug)]
+pub(crate) enum ManualTranslationStateError {
+    EncodeLocation(RpgMakerLocationCodecError),
+    EncodeRole(RpgMakerProjectionCodecError),
+}
+
+impl fmt::Display for ManualTranslationStateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EncodeLocation(source) => {
+                write!(formatter, "无法编码人工译文状态位置：{source}")
+            }
+            Self::EncodeRole(source) => write!(formatter, "无法编码人工译文状态角色：{source}"),
+        }
+    }
+}
+
+impl Error for ManualTranslationStateError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::EncodeLocation(source) => Some(source),
+            Self::EncodeRole(source) => Some(source),
+        }
     }
 }
 
@@ -326,6 +412,7 @@ pub(crate) enum PreparedTranslationStatus {
 }
 
 impl PreparedTranslationStatus {
+    #[cfg(test)]
     pub(crate) const fn storage_name(self) -> &'static str {
         match self {
             Self::Active => "active",
@@ -344,6 +431,7 @@ pub(crate) struct PreparedTranslationText {
     term_indices: Vec<usize>,
     placeholders: Vec<AppliedPlaceholder>,
     language_analysis: LanguageAnalysis,
+    #[cfg(test)]
     source_language: Arc<dyn LanguageModule>,
 }
 
@@ -372,6 +460,7 @@ impl PreparedTranslationText {
         &self.language_analysis
     }
 
+    #[cfg(test)]
     pub(crate) fn accept(
         &self,
         candidate: impl Into<String>,
@@ -389,52 +478,23 @@ impl PreparedTranslationText {
         )
         .map_err(ResolvedTranslationSemanticError::AcceptCandidate)
     }
-
-    /// 验收保持 `Value` / `Lines` 物理边界的 Standard 候选。
-    ///
-    /// 普通模型响应和人工提交都必须经过 executor 拥有的同一条 line shape、
-    /// Placeholder、语言残留与修复规则。
-    pub(crate) fn accept_content(
-        &self,
-        identity: &TranslationUnitIdentity,
-        line_shape: ExpectedLineShape,
-        candidate: TextUnitContent,
-    ) -> Result<TranslationContentAcceptance, ResolvedTranslationSemanticError> {
-        if self.status != PreparedTranslationStatus::Active {
-            return Ok(TranslationContentAcceptance::Rejected(
-                TranslationUnitRejectionReason::InvalidShape {
-                    message: format!(
-                        "prepared_status={}; expected=active",
-                        self.status.storage_name()
-                    ),
-                },
-            ));
-        }
-        accept_translation_content_candidate(
-            identity,
-            &self.model_text,
-            line_shape,
-            &self.placeholders,
-            &self.language_analysis,
-            self.source_language.as_ref(),
-            candidate,
-        )
-        .map_err(ResolvedTranslationSemanticError::AcceptCandidate)
-    }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PreparedTranslationAcceptance {
     Accepted(String),
     Rejected(PreparedTranslationRejection),
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PreparedTranslationRejection {
     NotActive(PreparedTranslationStatus),
     Candidate(TranslationUnitRejectionReason),
 }
 
+#[cfg(test)]
 impl fmt::Display for PreparedTranslationRejection {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -452,69 +512,8 @@ impl fmt::Display for PreparedTranslationRejection {
 pub(crate) enum ResolvedTranslationSemanticError {
     ProtectPlaceholder(PlaceholderProtectionError),
     ProjectLanguageText(LanguageTextProjectionError),
+    #[cfg(test)]
     AcceptCandidate(super::executor::TranslationCandidateTechnicalError),
-}
-
-impl ResolvedTranslationSemanticError {
-    /// 只公开闭集错误类型中的稳定机制事实；原文、译文和生成的 token 均不进入诊断。
-    pub(crate) fn safe_detail(&self) -> String {
-        match self {
-            Self::ProtectPlaceholder(source) => placeholder_protection_detail(source),
-            Self::ProjectLanguageText(source) => format!(
-                "semantic=language_projection; {}",
-                super::executor::language_projection_detail(source)
-            ),
-            Self::AcceptCandidate(source) => {
-                format!("semantic=candidate_validation; {}", source.safe_detail())
-            }
-        }
-    }
-}
-
-fn placeholder_protection_detail(source: &PlaceholderProtectionError) -> String {
-    match source {
-        PlaceholderProtectionError::Match(source) => {
-            let kind = match source.kind() {
-                pcre2::ErrorKind::Compile => "compile",
-                pcre2::ErrorKind::JIT => "jit",
-                pcre2::ErrorKind::Match => "match",
-                pcre2::ErrorKind::Info => "info",
-                pcre2::ErrorKind::Option => "option",
-                _ => "unknown",
-            };
-            let offset = source
-                .offset()
-                .map_or_else(|| "none".to_owned(), |offset| offset.to_string());
-            format!(
-                "semantic=placeholder_protection; failure=match; engine=pcre2; kind={kind}; code={}; offset={offset}",
-                source.code()
-            )
-        }
-        PlaceholderProtectionError::EmptyMatch { .. } => {
-            "semantic=placeholder_protection; failure=empty_match".to_owned()
-        }
-        PlaceholderProtectionError::MissingTextCapture { rule_number } => format!(
-            "semantic=placeholder_protection; failure=missing_text_capture; rule={rule_number}"
-        ),
-        PlaceholderProtectionError::InvalidMatchRange { rule_number } => format!(
-            "semantic=placeholder_protection; failure=invalid_match_range; rule={rule_number}"
-        ),
-        PlaceholderProtectionError::OverlappingMatches { .. } => {
-            "semantic=placeholder_protection; failure=overlapping_matches".to_owned()
-        }
-        PlaceholderProtectionError::CrossesLineBoundary {
-            rule_number,
-            source_line_index,
-        } => {
-            let rule = rule_number.map_or_else(|| "builtin".to_owned(), |value| value.to_string());
-            format!(
-                "semantic=placeholder_protection; failure=crosses_line_boundary; rule={rule}; source_line_index={source_line_index}"
-            )
-        }
-        PlaceholderProtectionError::ReservedTokenNamespace => {
-            "semantic=placeholder_protection; failure=reserved_token_namespace".to_owned()
-        }
-    }
 }
 
 impl fmt::Display for ResolvedTranslationSemanticError {
@@ -522,6 +521,7 @@ impl fmt::Display for ResolvedTranslationSemanticError {
         match self {
             Self::ProtectPlaceholder(source) => write!(formatter, "无法保护占位符：{source}"),
             Self::ProjectLanguageText(source) => write!(formatter, "无法建立语言视图：{source}"),
+            #[cfg(test)]
             Self::AcceptCandidate(source) => write!(formatter, "无法验收候选译文：{source}"),
         }
     }
@@ -532,6 +532,7 @@ impl Error for ResolvedTranslationSemanticError {
         match self {
             Self::ProtectPlaceholder(source) => Some(source),
             Self::ProjectLanguageText(source) => Some(source),
+            #[cfg(test)]
             Self::AcceptCandidate(source) => Some(source),
         }
     }
@@ -545,8 +546,13 @@ mod tests {
     use crate::language::{
         JapaneseLanguageModule, JapaneseResidualPolicy, LanguageId, LanguagePair,
     };
+    use crate::rpg_maker::asset::RpgMakerAssetOwner;
+    use crate::rpg_maker::model::{ScalarFieldKey, TextUnitRole};
+    use crate::rpg_maker::text::{
+        RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, StandardDataFile,
+    };
     use crate::rpg_maker::translate::placeholder::PlaceholderRuleDefinition;
-    use crate::rpg_maker::translate::planning_resource::{TerminologyEntry, compile_terminology};
+    use crate::translation::planning_resource::{TerminologyEntry, compile_terminology};
 
     fn semantics_with(
         engine: RpgMakerEngine,
@@ -563,7 +569,6 @@ mod tests {
         ));
         ResolvedTranslationSemantics::new(
             engine,
-            "test system".to_owned(),
             LanguagePair::new(
                 LanguageId::parse("ja").expect("源语言应有效"),
                 LanguageId::parse("zh-Hans").expect("目标语言应有效"),
@@ -574,6 +579,83 @@ mod tests {
             source_language,
             Sha256Fingerprint::from_bytes([0x3c; 32]),
         )
+    }
+
+    #[test]
+    fn manual_state_binds_unit_language_context_and_actual_placeholders_only() {
+        let semantics = semantics_with(
+            RpgMakerEngine::Mz,
+            vec![TerminologyEntry::new(
+                "勇者",
+                "英雄",
+                vec!["勇者".to_owned()],
+            )],
+            Vec::new(),
+        );
+        let identity = |context: &str, source: &str| {
+            TranslationUnitIdentity::new(
+                RpgMakerAssetOwner::Builtin,
+                TextGroupKind::DatabaseEntry,
+                RpgMakerLocation::value(
+                    RpgMakerSource::data(StandardDataFile::Actors),
+                    vec![RpgMakerLocationStep::index(1)],
+                ),
+                TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应有效")),
+                TextUnitContent::Value(source.to_owned()),
+                context,
+            )
+        };
+        let base_identity = identity("{}", r"\V[1]勇者");
+        let prepared = semantics
+            .prepare_content(base_identity.kind(), base_identity.source_content())
+            .expect("应准备包含内置控制符的原文");
+        let base = manual_translation_state_fingerprint(
+            semantics.engine(),
+            semantics.language_pair(),
+            &base_identity,
+            prepared.placeholders(),
+        )
+        .expect("应建立人工状态");
+
+        let changed_context = identity(r#"{"speaker":"actor"}"#, r"\V[1]勇者");
+        assert_ne!(
+            base,
+            manual_translation_state_fingerprint(
+                semantics.engine(),
+                semantics.language_pair(),
+                &changed_context,
+                prepared.placeholders(),
+            )
+            .expect("应建立上下文变化后的人工状态")
+        );
+        let changed_source = identity("{}", r"\V[2]勇者");
+        let changed_prepared = semantics
+            .prepare_content(changed_source.kind(), changed_source.source_content())
+            .expect("应准备变化后的控制符");
+        assert_ne!(
+            base,
+            manual_translation_state_fingerprint(
+                semantics.engine(),
+                semantics.language_pair(),
+                &changed_source,
+                changed_prepared.placeholders(),
+            )
+            .expect("应建立 Placeholder 变化后的人工状态")
+        );
+        let changed_language = LanguagePair::new(
+            LanguageId::parse("ja").expect("来源语言应有效"),
+            LanguageId::parse("en").expect("目标语言应有效"),
+        );
+        assert_ne!(
+            base,
+            manual_translation_state_fingerprint(
+                semantics.engine(),
+                &changed_language,
+                &base_identity,
+                prepared.placeholders(),
+            )
+            .expect("应建立语言变化后的人工状态")
+        );
     }
 
     #[test]
@@ -753,7 +835,7 @@ mod tests {
         assert_eq!(
             prepared
                 .accept("<Help:炎之剑的说明>")
-                .expect("人工候选应能用唯一原片段恢复 Custom 外壳"),
+                .expect("候选译文应能用唯一原片段恢复 Custom 外壳"),
             PreparedTranslationAcceptance::Accepted("<Help:炎之剑的说明>".to_owned())
         );
 
@@ -765,7 +847,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_custom_shell_rejects_repeated_missing_bindings_as_ambiguous() {
+    fn custom_shell_candidate_rejects_repeated_missing_bindings_as_ambiguous() {
         let semantics = semantics_with(
             RpgMakerEngine::Mz,
             Vec::new(),
@@ -857,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn new_candidate_keeps_strict_ambiguity_for_repeated_original_placeholders() {
+    fn candidate_keeps_strict_ambiguity_for_repeated_original_placeholders() {
         let prepared = ResolvedTranslationSemantics::for_test()
             .prepare(TextGroupKind::EventDialogue, r"\C[2]翻訳\C[2]")
             .expect("重复控制符原文应可准备");
@@ -873,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn new_candidate_rejects_extra_builtin_control_when_all_tokens_are_present() {
+    fn candidate_rejects_extra_builtin_control_when_all_tokens_are_present() {
         // 重复 original 的 token 全部在场时，多抄的一份原始控制片段同样无法
         // 唯一归位；混排必须与单绑定分支一致拒绝，不得作为字面文本混入译文。
         let prepared = ResolvedTranslationSemantics::for_test()

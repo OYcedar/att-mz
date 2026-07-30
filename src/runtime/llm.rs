@@ -877,7 +877,6 @@ fn serialize_request(
             role: match message.role() {
                 ChatMessageRole::System => "system",
                 ChatMessageRole::User => "user",
-                ChatMessageRole::Assistant => "assistant",
             },
             content: message.content(),
         })

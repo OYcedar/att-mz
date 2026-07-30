@@ -4,10 +4,11 @@ use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::path::Path;
+#[cfg(test)]
 use std::path::PathBuf;
 
-use super::ProjectName;
 use crate::language::{LanguageId, LanguagePair};
+use crate::project_name::ProjectName;
 #[cfg(test)]
 use crate::rpg_maker::RpgMakerLayout;
 use crate::rpg_maker::dialogue::MvDialogueDefinition;
@@ -71,15 +72,9 @@ impl OpenedProject {
         self.record.workspace_root()
     }
 
+    #[cfg(test)]
     pub(crate) fn source_root(&self) -> &Path {
         self.record.source_root()
-    }
-
-    /// 返回引擎内容根；其下始终以 `data/**`、`js/**` 表达 Lua 与文档路径。
-    pub(crate) fn source_content_root(&self) -> PathBuf {
-        self.layout()
-            .rpg_maker_layout()
-            .game_content_root(self.source_root())
     }
 
     pub(crate) fn write_back_root(&self) -> &Path {
@@ -483,7 +478,7 @@ mod tests {
             Path::new("C:/att/projects/游戏 一")
         );
         assert_eq!(
-            opened.source_root(),
+            opened.layout().source_root(),
             Path::new("C:/att/projects/游戏 一/source")
         );
         assert_eq!(

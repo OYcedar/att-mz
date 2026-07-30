@@ -1,30 +1,29 @@
-app-about = 使用可重用專案狀態翻譯 RPG Maker 遊戲
+app-about = 使用可重用專案狀態翻譯遊戲與結構化文字
 cli-config-help = 本次執行使用的嚴格 TOML 設定檔
 cli-ui-language-help = Help、診斷、進度、結果與專案日誌使用的語言：ar、zh-Hans、zh-Hant、en、fr、ru、es、ja、ko 或 vi
 cli-progress-help = 即時進度模式：auto、plain 或 off
 cli-mz-about = 翻譯 RPG Maker MZ 遊戲
 cli-mv-about = 翻譯 RPG Maker MV 遊戲
-cli-init-about = 初始化或更新一個命名遊戲專案
-cli-extract-about = 使用明確或已儲存的 owner 方案擷取原文
+cli-generic-about = 翻譯約定 JSONL 文字
+cli-init-about = 初始化或更新一個命名翻譯專案
+cli-extract-about = 從專案目前輸入同步原文
 cli-translate-about = 使用明確或已儲存的 Profile 翻譯已擷取原文
-cli-write-back-about = 將已驗收譯文寫回遊戲
-cli-project-lua-about = 在專案上下文中一次性執行可信 Lua 程式
+cli-write-back-about = 將目前譯文寫入專案輸出
+cli-project-lua-about = 在專案中一次性執行原子資料庫 Lua
 cli-project-name-help = 穩定專案名稱
-cli-init-path-help = RPG Maker 遊戲根目錄；既有專案可重用上次成功路徑
+cli-init-path-help = 輸入根目錄；既有專案可重用上次成功路徑
 cli-source-language-help = 原文語言 ID
 cli-target-language-help = 譯文目標語言 ID
 cli-dialogue-width-help = 對話正文每行允許的最大全形字元數
 cli-scrolling-width-help = 捲動文字每行允許的最大全形字元數
 cli-help-width-help = 說明框每行允許的最大全形字元數
 cli-builtin-help = 使用 ATT 內建的 RPG Maker 文字位置
-cli-rules-help = 以此 TOML 定義取代 Rules owner；空規則清單會停用它
+cli-rules-help = 以此 TOML 定義取代 RPG Maker 擷取規則；空規則清單會停用規則
 cli-dialogue-rules-help = 取代與 Builtin 搭配使用的 MV 對話姓名投影
-cli-lua-help = 取代目前階段的 Lua 程式；零位元組檔案會清除它
 cli-profile-help = 翻譯 Profile ID；省略時重用上次成功 Profile
 cli-terms-help = 取代專案術語資源
 cli-placeholders-help = 取代專案 Placeholder 資源
-cli-project-lua-profile-help = Standard 人工驗收使用的 Profile；省略時在開啟 Standard 能力時重用上次成功的 Translate Profile
-cli-project-lua-script-help = 本次一次性執行的可信 Lua 程式
+cli-project-lua-script-help = 本次一次性執行的原子資料庫 Lua 程式
 cli-project-lua-arguments-help = 在 -- 後傳給 Lua arg[1..] 的 UTF-8 參數
 cli-usage-heading = 用法：
 cli-commands-heading = 命令：
@@ -66,7 +65,7 @@ log-label-phase-planning = 規劃工作
 log-label-phase-confirmed-tasks = 確認工作
 log-label-phase-no-work = 無需處理
 log-label-phase-read-assets = 讀取資產
-log-label-phase-plan-standard = 規劃標準寫回
+log-label-phase-plan-rpg-maker-write-back = 規劃 RPG Maker 寫回
 log-label-phase-rewrite-documents = 改寫文件
 log-label-phase-validate-candidate = 驗證候選目錄
 log-label-task-complete = 完整
@@ -83,12 +82,8 @@ plan-source-product-default = 產品行為
 notice-init-reuse-path = 未提供來源路徑，已沿用上次成功路徑：{ $path }。
 notice-extract-reuse-owners = 未提供擷取範圍，已沿用上次成功方案：{ $owners }。
 notice-translate-reuse-profile = 未提供 Profile，已沿用上次成功 Profile：{ $profile }。
-notice-translate-reuse-lua = 未提供 Lua 選項，已沿用上次成功的 Translate Lua 選擇。
-notice-write-back-reuse-lua = 未提供 Lua 選項，已沿用上次成功的 WriteBack Lua 程式。
-notice-write-back-standard-only = 尚未設定 WriteBack Lua 程式，本次僅執行 Standard。
 notice-owner-disabled = 已停用 owner { $owner }，並將其移出後續自動方案。
-notice-lua-cleared = 已清除 { $phase } Lua 程式，本輪不會執行。
-notice-no-model-request = 所有標準翻譯單元都是最新狀態，Standard 本次未請求模型。
+notice-no-model-request = 所有翻譯單元都是最新狀態，本次不需請求模型。
 notice-manual-layout = 有 { $count } 個單元需要人工檢查換行。
 notice-log-degraded = 專案日誌無法使用或已降級；命令會繼續，結束狀態不受影響。
 notice-task-records-degraded = 翻譯任務記錄無法使用或已降級；命令會繼續，結束狀態不受影響。
@@ -102,7 +97,6 @@ progress-extract-owner = 擷取 owner：{ $owner }
 progress-extract-documents = 正在掃描文件
 progress-extract-builtin = Builtin 工作單元
 progress-extract-rules = Rules 規則
-progress-extract-lua = 正在執行 Extract Lua 程式
 progress-extract-commit = 正在提交擷取資產
 progress-translate-planning = 正在規劃翻譯工作
 progress-translate-confirmed = 已確認翻譯工作
@@ -111,7 +105,6 @@ progress-project-lua = 正在執行專案 Lua 程式
 progress-write-back-read-assets = 正在讀取已驗收資產
 progress-write-back-planning = 正在規劃文件改寫
 progress-write-back-documents = 已改寫文件
-progress-write-back-lua = 正在執行 WriteBack Lua 程式
 progress-write-back-validate-candidate = 正在驗證輸出候選
 progress-write-back-publish = 正在發佈輸出；中斷後會等待明確終態
 progress-finalizing = 正在完成必要收尾
@@ -123,23 +116,27 @@ result-init-updated = 專案狀態：已更新
 result-init-stale-owners = 需要重新擷取：{ $owners }
 result-extract-completed = 擷取完成：{ $project }
 result-translate-completed = 翻譯執行完成：{ $project }（Profile：{ $profile }）
-result-translate-standard = 標準翻譯：工作 { $total }，完整 { $complete }，部分 { $partial }，無法使用 { $unavailable }；寫入 { $written } 處，剩餘 { $remaining } 處
+result-translate-summary = 翻譯：工作 { $total }，完整 { $complete }，部分 { $partial }，無法使用 { $unavailable }；寫入 { $written } 處，剩餘 { $remaining } 處
 result-translate-convergence = 狀態收斂：保留 { $retained }，失效 { $invalidated }，不適用 { $not_applicable }，重用 { $reused }
 result-write-back-completed = 寫回完成：{ $project }
 result-project-lua-completed = 專案 Lua 執行完成：{ $project }
 result-output-directory = 輸出目錄：{ $path }
-result-write-back-standard = 標準寫回：套用譯文 { $translated } 個單元，保留原文 { $original } 個單元；自動換行 { $auto_wrapped } 段，新增換行 { $breaks } 處；續行全形縮排 { $indents } 處；需人工換行 { $manual } 段
-result-lua-executed = Lua：已執行
-result-lua-not-executed = Lua：未執行
+result-write-back-summary = 寫回：套用譯文 { $translated } 個單元，保留原文 { $original } 個單元；自動換行 { $auto_wrapped } 段，新增換行 { $breaks } 處；續行全形縮排 { $indents } 處；需人工換行 { $manual } 段
+result-generic-extract-unchanged = Generic 輸入未變更：{ $files } 個檔案，{ $groups } 個群組，{ $units } 個單元
+result-generic-extract-updated = Generic 輸入已更新：{ $files } 個檔案，{ $groups } 個群組，{ $units } 個單元；保留 { $preserved } 條譯文，清除 { $cleared } 條
+result-generic-translate-summary = Generic 翻譯：工作 { $total }，完整 { $complete }，部分 { $partial }，無法使用 { $unavailable }；清除 { $cleared }，重用 { $reused }，接受 { $accepted }，寫入 { $written }，衝突 { $conflicted }，回應問題 { $problems }
+result-generic-write-back-summary = Generic 寫回：套用譯文 { $translated } 個單元，保留原文 { $original } 個單元
 result-cancelled = 命令已在安全收尾後取消。
 result-plan-saved = 已儲存本次成功執行方案。
-result-translate-plan-sources = 已儲存本次成功執行方案。Profile 來源：{ $profile_source }；Lua 來源：{ $lua_source }。
 log-run-started = 命令 { $command } 已開始。
 log-run-succeeded = 命令 { $command } 已成功完成。
 log-run-failed = 命令 { $command } 失敗。
 log-run-outcome-unknown = 命令 { $command } 已結束，但最終結果未知；請依錯誤中的復原位置處理。
 log-run-cancelled = 命令 { $command } 已取消。
 log-performance-counters = 效能計數：SQLite 事務控制嘗試 { $sqlite_control_attempted_total } 次；完整候選樹驗證開始 { $candidate_validation_started } 次，完成 { $candidate_validation_completed } 次。
+log-lua-script = Lua 指令碼 { $identity }（SHA-256 { $fingerprint }）。
+log-lua-print = Lua：{ $message }
+log-lua-summary = Lua 已提交：資料庫呼叫 { $database_calls } 次，修改 { $changed_rows } 列，譯文呼叫 { $translation_calls } 次，print { $printed_lines } 列。
 log-plan-resolved = 命令 { $command } 的方案來自{ $source }。
 log-phase-started = 階段開始：{ $phase }。
 log-phase-finished = 階段完成：{ $phase }。
@@ -212,7 +209,8 @@ diagnostic-action-value = { $code ->
 }
 diagnostic-failure-value = { $code ->
     [missing_required_value] 缺少必填值
-    [extract_plan_required] 專案沒有可重用的 Extract 計畫；請提供 --builtin、--rules 或 --lua 中的至少一項
+    [extract_plan_required] 專案沒有可重用的 Extract 計畫；請提供 --builtin 或 --rules
+    [generic_extract_required] 目前 JSONL 輸入與最近一次 Extract 不一致；請重新執行 att generic extract
     [conflicting_values] 提供的值互相衝突
     [invalid_syntax] 值的語法無效
     [invalid_encoding] 文字編碼無效
@@ -256,8 +254,6 @@ diagnostic-failure-value = { $code ->
     [lua_execution_failed] Lua 主程式執行時失敗
     [lua_host_call_failed] Lua 主機功能呼叫失敗
     [lua_finalization_failed] Lua 主機無法完成所有已繫結資源的收尾
-    [lua_unclosed_transaction] Lua 程式結束時交易仍開啟；該交易已回復
-    [lua_snapshot_store_failed] 無法提交已驗證的 Lua 擷取快照
     [rules_definition_invalid] Rules 程式不符合 Rules 定義契約
     [rules_document_read_failed] 無法讀取 Rules 程式需要的來源文件
     [rules_no_non_blank_match] Rules 項目未產生任何非空白語意單元
@@ -272,14 +268,13 @@ diagnostic-failure-value = { $code ->
     [rules_snapshot_invalid] 擷取出的 Rules 群組無法組成有效的資產快照
     [rules_snapshot_store_failed] 無法提交已驗證的 Rules 擷取快照
     [write_back_extraction_out_of_date] 已擷取資產不再符合目前專案來源
-    [write_back_asset_snapshot_invalid] 已儲存的 Standard 資產無法組成有效的寫回快照
+    [write_back_asset_snapshot_invalid] 已儲存的 RPG Maker 資產無法組成有效的寫回快照
     [source_document_invalid] RPG Maker 來源文件不符合必要的文件格式
     [write_back_mutation_invalid] 已驗證的翻譯變更無法套用到凍結的來源位置
     [write_back_output_path_invalid] 重寫檔案位於允許的 RPG Maker 輸出樹之外
     [write_back_output_path_duplicate] 多個重寫檔案指向相同輸出路徑
     [write_back_candidate_project_mismatch] 已準備的寫回候選屬於另一個專案
     [write_back_candidate_invalid] 寫回候選不符合必要的 data/js 樹狀結構
-    [write_back_unexpected_lua_outcome] Lua 寫回程式傳回了其他 Lua 階段的結果
     [write_back_not_published] 寫回候選未取代目前的輸出目錄
     [write_back_published_with_residuals] 輸出已發佈，但部分復原產物無法移除
     [write_back_recovery_required] 必須先復原輸出目錄，才能信任其中內容

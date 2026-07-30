@@ -6,18 +6,18 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::ProjectName;
+use super::asset::RpgMakerAssetOwner;
 use super::project::{MaxFullwidthChars, RpgMakerWriteBackLayoutProfile};
-use super::standard_asset::RpgMakerStandardAssetOwner;
 use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::language::{LanguageId, LanguagePair};
 use crate::progress::{NoopProgressObserver, ProgressObserver, ProgressSnapshot};
+use crate::project_lease::{ProjectCommandLeaseError, ProjectCommandLeaseProvider};
+use crate::project_name::ProjectName;
 use crate::rpg_maker::RpgMakerLayout;
 use crate::rpg_maker::project_database::{
     NewProject, ProjectDatabaseCreator, ProjectDatabaseStateReconciler, ProjectWorkspaceLayout,
     SourceSnapshotFingerprint,
 };
-use crate::rpg_maker::project_lease::{ProjectCommandLeaseError, ProjectCommandLeaseProvider};
 use crate::storage::file_system::{
     BoundScopedDirectory, DirectChildDirectoryEnsurer, DirectoryDiscardError, DirectoryEntry,
     DirectoryEntryKind, DirectoryLister, DirectoryPrepareError, DirectoryPublishError,
@@ -43,12 +43,11 @@ pub struct InitInput {
     pub help_description_max_fullwidth_chars: Option<MaxFullwidthChars>,
 }
 
-/// Init 更新后可能需要重新提取的标准资产 owner。
+/// Init 更新后可能需要重新提取的 RPG Maker 资产 owner。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InitStaleOwner {
     Builtin,
     Rules,
-    Lua,
 }
 
 /// 本次 Init 把项目工作区收敛到的终态。
@@ -143,7 +142,7 @@ pub(crate) enum ProjectWorkspaceConvergence {
     Created,
     Unchanged,
     Updated {
-        stale_owners: Vec<RpgMakerStandardAssetOwner>,
+        stale_owners: Vec<RpgMakerAssetOwner>,
     },
 }
 
@@ -1249,12 +1248,11 @@ where
     }
 }
 
-impl From<RpgMakerStandardAssetOwner> for InitStaleOwner {
-    fn from(owner: RpgMakerStandardAssetOwner) -> Self {
+impl From<RpgMakerAssetOwner> for InitStaleOwner {
+    fn from(owner: RpgMakerAssetOwner) -> Self {
         match owner {
-            RpgMakerStandardAssetOwner::Builtin => Self::Builtin,
-            RpgMakerStandardAssetOwner::Rules => Self::Rules,
-            RpgMakerStandardAssetOwner::Lua => Self::Lua,
+            RpgMakerAssetOwner::Builtin => Self::Builtin,
+            RpgMakerAssetOwner::Rules => Self::Rules,
         }
     }
 }
@@ -1868,16 +1866,6 @@ mod tests {
             }
         }
 
-        async fn read_scoped_file(
-            &self,
-            _scope: &crate::storage::file_system::BoundScopedDirectory<Self::ScopeState>,
-            path: ScopedDirectoryPath,
-        ) -> Result<Vec<u8>, ScopedDirectoryEditError<Self::Error>> {
-            Err(ScopedDirectoryEditError::NotFound {
-                path: path.as_path().to_path_buf(),
-            })
-        }
-
         async fn list_scoped_directory(
             &self,
             _scope: &crate::storage::file_system::BoundScopedDirectory<Self::ScopeState>,
@@ -1922,16 +1910,6 @@ mod tests {
                 });
             }
             Ok(())
-        }
-
-        async fn remove_scoped_path(
-            &self,
-            _scope: &crate::storage::file_system::BoundScopedDirectory<Self::ScopeState>,
-            path: ScopedDirectoryPath,
-        ) -> Result<(), ScopedDirectoryEditError<Self::Error>> {
-            Err(ScopedDirectoryEditError::NotFound {
-                path: path.as_path().to_path_buf(),
-            })
         }
     }
 
@@ -2004,7 +1982,7 @@ mod tests {
 
     fn database_state(
         source_fingerprint: u8,
-        owners: Vec<(RpgMakerStandardAssetOwner, SourceSnapshotFingerprint)>,
+        owners: Vec<(RpgMakerAssetOwner, SourceSnapshotFingerprint)>,
     ) -> ProjectDatabaseState {
         ProjectDatabaseState::for_test(
             "game".parse().expect("项目名应合法"),
@@ -2519,14 +2497,8 @@ mod tests {
 
     #[tokio::test]
     async fn changed_source_updates_workspace_and_reports_stale_owners() {
-        let current = database_state(
-            0x33,
-            vec![(RpgMakerStandardAssetOwner::Builtin, fingerprint(0x33))],
-        );
-        let updated = database_state(
-            0x44,
-            vec![(RpgMakerStandardAssetOwner::Builtin, fingerprint(0x33))],
-        );
+        let current = database_state(0x33, vec![(RpgMakerAssetOwner::Builtin, fingerprint(0x33))]);
+        let updated = database_state(0x44, vec![(RpgMakerAssetOwner::Builtin, fingerprint(0x33))]);
         let (service, observations) = service(
             true,
             WorkspaceStructureObservation::Complete,
@@ -2545,7 +2517,7 @@ mod tests {
         assert_eq!(
             outcome,
             OperationCompletion::Completed(ProjectWorkspaceConvergence::Updated {
-                stale_owners: vec![RpgMakerStandardAssetOwner::Builtin],
+                stale_owners: vec![RpgMakerAssetOwner::Builtin],
             })
         );
         assert!(observations.events().contains(&"snapshot_database"));
@@ -3242,10 +3214,10 @@ mod tests {
             &self,
             _: &ProjectName,
         ) -> Result<
-            crate::rpg_maker::project_lease::ProjectCommandLease<Self::LeaseState>,
+            crate::project_lease::ProjectCommandLease<Self::LeaseState>,
             ProjectCommandLeaseError<Self::Error>,
         > {
-            Ok(crate::rpg_maker::project_lease::ProjectCommandLease::for_test(()))
+            Ok(crate::project_lease::ProjectCommandLease::for_test(()))
         }
     }
 
@@ -3267,10 +3239,7 @@ mod tests {
             requests: Arc::new(Mutex::new(Vec::new())),
             responses: Arc::new(Mutex::new(VecDeque::from([Ok(
                 OperationCompletion::Completed(ProjectWorkspaceConvergence::Updated {
-                    stale_owners: vec![
-                        RpgMakerStandardAssetOwner::Builtin,
-                        RpgMakerStandardAssetOwner::Lua,
-                    ],
+                    stale_owners: vec![RpgMakerAssetOwner::Builtin, RpgMakerAssetOwner::Rules],
                 }),
             )]))),
         };
@@ -3292,7 +3261,7 @@ mod tests {
         assert_eq!(
             output.outcome,
             InitOutcome::Updated {
-                stale_owners: vec![InitStaleOwner::Builtin, InitStaleOwner::Lua],
+                stale_owners: vec![InitStaleOwner::Builtin, InitStaleOwner::Rules],
             }
         );
         let requests = service

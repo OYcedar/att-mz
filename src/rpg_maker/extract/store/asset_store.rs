@@ -1,4 +1,4 @@
-//! Builtin、Rules 与 Lua 标准文本资产的 SQLite 快照替换实现。
+//! Builtin 与 Rules 文本资产的 SQLite 快照替换实现。
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -17,13 +17,11 @@ use crate::diagnostic::{
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::json_diagnostic::JsonErrorCategory;
+use crate::rpg_maker::asset::{RpgMakerAssetOwner, RpgMakerTextSnapshotFingerprintBuilder};
 use crate::rpg_maker::dialogue::{MvDialogueDefinition, MvDialogueDefinitionError};
 use crate::rpg_maker::location_codec::{
     RpgMakerLocationCodec, RpgMakerLocationCodecError, RpgMakerProjectionCodec,
     RpgMakerProjectionCodecError,
-};
-use crate::rpg_maker::managed_translation::{
-    ManagedTranslationSnapshot, ManagedTranslationSnapshotMutation,
 };
 use crate::rpg_maker::model::{MutationResourceAccess, TextUnitRole};
 #[cfg(test)]
@@ -35,13 +33,10 @@ use crate::rpg_maker::mutation_claim_summary::{
 };
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::project_database::{
-    AssetSnapshotFingerprint, CREATE_STANDARD_MUTATION_CLAIM_OWNER_RESOURCE_INDEX,
-    CREATE_STANDARD_MUTATION_CLAIM_RESOURCE_INDEX,
-    DROP_STANDARD_MUTATION_CLAIM_OWNER_RESOURCE_INDEX, DROP_STANDARD_MUTATION_CLAIM_RESOURCE_INDEX,
-    MV_DIALOGUE_RULES_DEFINITION_KIND,
-};
-use crate::rpg_maker::standard_asset::{
-    RpgMakerStandardAssetOwner, StandardTextSnapshotFingerprintBuilder,
+    AssetSnapshotFingerprint, CREATE_RPG_MAKER_MUTATION_CLAIM_OWNER_RESOURCE_INDEX,
+    CREATE_RPG_MAKER_MUTATION_CLAIM_RESOURCE_INDEX,
+    DROP_RPG_MAKER_MUTATION_CLAIM_OWNER_RESOURCE_INDEX,
+    DROP_RPG_MAKER_MUTATION_CLAIM_RESOURCE_INDEX, MV_DIALOGUE_RULES_DEFINITION_KIND,
 };
 use crate::rpg_maker::text::{RpgMakerLocation, TextGroupKind};
 use crate::storage::sqlite::{
@@ -50,31 +45,26 @@ use crate::storage::sqlite::{
     SqliteTransactionStep, SqliteValue,
 };
 
-#[cfg(test)]
-use super::super::model::LuaSnapshot;
 use super::super::model::{BuiltinSnapshot, ExtractedTextGroup, RulesSnapshot};
-use super::{
-    BuiltinProjectDefinitionUpdate, BuiltinSnapshotStore, LuaSnapshotStore,
-    LuaStandardSnapshotMutation, RulesSnapshotStore,
-};
+use super::{BuiltinProjectDefinitionUpdate, BuiltinSnapshotStore, RulesSnapshotStore};
 
-const INSERT_CLAIM_PREFIX: &str = r#"INSERT INTO standard_mutation_claim (
+const INSERT_CLAIM_PREFIX: &str = r#"INSERT INTO rpg_maker_mutation_claim (
     owner, group_location, resource_key, access
 )"#;
 #[cfg(test)]
-const INSERT_CLAIM: &str = r#"INSERT INTO standard_mutation_claim (
+const INSERT_CLAIM: &str = r#"INSERT INTO rpg_maker_mutation_claim (
     owner, group_location, resource_key, access
 ) VALUES (?1, ?2, ?3, ?4)"#;
 
 const FIND_MUTATION_CLAIM_CONFLICT: &str = r#"WITH
 other_sample(owner, group_location, resource_key, access, group_order) AS MATERIALIZED (
     SELECT claim.owner, claim.group_location, claim.resource_key, claim.access, text_group.group_order
-    FROM standard_mutation_claim AS claim
-         INDEXED BY standard_mutation_claim_owner_resource_idx
-    JOIN standard_text_group AS text_group
+    FROM rpg_maker_mutation_claim AS claim
+         INDEXED BY rpg_maker_mutation_claim_owner_resource_idx
+    JOIN rpg_maker_text_group AS text_group
       ON text_group.owner = claim.owner
      AND text_group.group_location = claim.group_location
-    WHERE claim.owner IN (?3, ?4)
+    WHERE claim.owner = ?3
     LIMIT CASE WHEN ?2 < 9223372036854775807 THEN ?2 + 1 ELSE -1 END
 ),
 other_count(value) AS MATERIALIZED (
@@ -105,9 +95,9 @@ conflicts(
         current.group_order
     FROM other_count
     CROSS JOIN other_sample AS current
-    CROSS JOIN standard_mutation_claim AS incoming
-         INDEXED BY standard_mutation_claim_resource_idx
-    JOIN standard_text_group AS incoming_group
+    CROSS JOIN rpg_maker_mutation_claim AS incoming
+         INDEXED BY rpg_maker_mutation_claim_resource_idx
+    JOIN rpg_maker_text_group AS incoming_group
       ON incoming_group.owner = incoming.owner
      AND incoming_group.group_location = incoming.group_location
     WHERE other_count.value <= ?2
@@ -129,19 +119,19 @@ conflicts(
         CASE current.owner WHEN 'builtin' THEN 0 WHEN 'rules' THEN 1 ELSE 2 END,
         current_group.group_order
     FROM other_count
-    CROSS JOIN standard_mutation_claim AS incoming
-         INDEXED BY standard_mutation_claim_owner_resource_idx
-    CROSS JOIN standard_mutation_claim AS current
-         INDEXED BY standard_mutation_claim_resource_idx
-    JOIN standard_text_group AS incoming_group
+    CROSS JOIN rpg_maker_mutation_claim AS incoming
+         INDEXED BY rpg_maker_mutation_claim_owner_resource_idx
+    CROSS JOIN rpg_maker_mutation_claim AS current
+         INDEXED BY rpg_maker_mutation_claim_resource_idx
+    JOIN rpg_maker_text_group AS incoming_group
       ON incoming_group.owner = incoming.owner
      AND incoming_group.group_location = incoming.group_location
-    JOIN standard_text_group AS current_group
+    JOIN rpg_maker_text_group AS current_group
       ON current_group.owner = current.owner
      AND current_group.group_location = current.group_location
     WHERE other_count.value > ?2
       AND incoming.owner = ?1
-      AND current.owner IN (?3, ?4)
+      AND current.owner = ?3
       AND incoming.resource_key = current.resource_key
       AND (current.access = 'exclusive' OR incoming.access = 'exclusive')
 )
@@ -165,26 +155,26 @@ ORDER BY
     current_group_location COLLATE BINARY
 LIMIT 1"#;
 
-const DELETE_OWNER_CLAIMS: &str = "DELETE FROM standard_mutation_claim WHERE owner = ?";
-const DELETE_OWNER_UNITS: &str = "DELETE FROM standard_text_unit WHERE owner = ?";
-const DELETE_OWNER_GROUPS: &str = "DELETE FROM standard_text_group WHERE owner = ?";
+const DELETE_OWNER_CLAIMS: &str = "DELETE FROM rpg_maker_mutation_claim WHERE owner = ?";
+const DELETE_OWNER_UNITS: &str = "DELETE FROM rpg_maker_text_unit WHERE owner = ?";
+const DELETE_OWNER_GROUPS: &str = "DELETE FROM rpg_maker_text_group WHERE owner = ?";
 
-const UPSERT_OWNER_STATE: &str = r#"INSERT INTO standard_asset_owner_state (
+const UPSERT_OWNER_STATE: &str = r#"INSERT INTO rpg_maker_asset_owner_state (
     owner, source_snapshot_fingerprint, asset_snapshot_fingerprint
 ) VALUES (?, ?, ?)
 ON CONFLICT(owner) DO UPDATE SET
     source_snapshot_fingerprint = excluded.source_snapshot_fingerprint,
     asset_snapshot_fingerprint = excluded.asset_snapshot_fingerprint"#;
 
-const INSERT_GROUP_PREFIX: &str = r#"INSERT INTO standard_text_group (
+const INSERT_GROUP_PREFIX: &str = r#"INSERT INTO rpg_maker_text_group (
     owner, group_location, group_order, group_kind, projection_recipe_json
 )"#;
 #[cfg(test)]
-const INSERT_GROUP: &str = r#"INSERT INTO standard_text_group (
+const INSERT_GROUP: &str = r#"INSERT INTO rpg_maker_text_group (
     owner, group_location, group_order, group_kind, projection_recipe_json
 ) VALUES (?1, ?2, ?3, ?4, ?5)"#;
 
-const INSERT_UNIT_PREFIX: &str = r#"INSERT INTO standard_text_unit (
+const INSERT_UNIT_PREFIX: &str = r#"INSERT INTO rpg_maker_text_unit (
     owner,
     group_location,
     unit_role,
@@ -195,7 +185,7 @@ const INSERT_UNIT_PREFIX: &str = r#"INSERT INTO standard_text_unit (
     translation_state
 )"#;
 #[cfg(test)]
-const INSERT_UNIT: &str = r#"INSERT INTO standard_text_unit (
+const INSERT_UNIT: &str = r#"INSERT INTO rpg_maker_text_unit (
     owner,
     group_location,
     unit_role,
@@ -206,20 +196,20 @@ const INSERT_UNIT: &str = r#"INSERT INTO standard_text_unit (
     translation_state
 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#;
 
-const DEACTIVATE_OWNER: &str = "DELETE FROM standard_asset_owner_state WHERE owner = ?";
+const DEACTIVATE_OWNER: &str = "DELETE FROM rpg_maker_asset_owner_state WHERE owner = ?";
 
 const READ_PROJECT_DEFINITION: &str = r#"SELECT canonical_json
-FROM standard_project_definition
+FROM rpg_maker_project_definition
 WHERE definition_kind = ?"#;
 
-const UPDATE_PROJECT_DEFINITION: &str = r#"UPDATE standard_project_definition
+const UPDATE_PROJECT_DEFINITION: &str = r#"UPDATE rpg_maker_project_definition
 SET canonical_json = ?
 WHERE definition_kind = ?"#;
 
 const READ_OWNER_STATE: &str = r#"SELECT
     source_snapshot_fingerprint,
     asset_snapshot_fingerprint
-FROM standard_asset_owner_state
+FROM rpg_maker_asset_owner_state
 WHERE owner = ?"#;
 
 const READ_OWNER_GROUPS: &str = r#"SELECT
@@ -227,7 +217,7 @@ const READ_OWNER_GROUPS: &str = r#"SELECT
     group_order,
     group_kind,
     projection_recipe_json
-FROM standard_text_group
+FROM rpg_maker_text_group
 WHERE owner = ?
 ORDER BY group_order"#;
 
@@ -239,8 +229,8 @@ const READ_OWNER_UNITS: &str = r#"SELECT
     unit.source_context_json,
     unit.translation_content_json,
     unit.translation_state
-FROM standard_text_group AS text_group
-CROSS JOIN standard_text_unit AS unit
+FROM rpg_maker_text_group AS text_group
+CROSS JOIN rpg_maker_text_unit AS unit
   ON unit.owner = text_group.owner
  AND unit.group_location = text_group.group_location
 WHERE text_group.owner = ?
@@ -250,26 +240,26 @@ const READ_OWNER_CLAIMS: &str = r#"SELECT
     resource_key,
     access,
     group_location
-FROM standard_mutation_claim INDEXED BY standard_mutation_claim_owner_resource_idx
+FROM rpg_maker_mutation_claim INDEXED BY rpg_maker_mutation_claim_owner_resource_idx
 WHERE owner = ?
 ORDER BY owner, resource_key, access, group_location"#;
 
-// 只需知道其他 owner 是否存在第 incoming_count + 1 行，无需为小 Rules/Lua owner
+// 只需知道另一 owner 是否存在第 incoming_count + 1 行，无需为小 Rules owner
 // 扫描完整 Builtin 索引。返回一行表示 incoming_count 不小于其他 owner 的总量。
 const DECIDE_CLAIM_INDEX_REBUILD: &str = r#"SELECT 1
 WHERE NOT EXISTS (
     SELECT 1
-    FROM standard_mutation_claim
-         INDEXED BY standard_mutation_claim_owner_resource_idx
-    WHERE owner IN (?1, ?2)
-    LIMIT 1 OFFSET ?3
+    FROM rpg_maker_mutation_claim
+         INDEXED BY rpg_maker_mutation_claim_owner_resource_idx
+    WHERE owner = ?1
+    LIMIT 1 OFFSET ?2
 )"#;
 
 // 这是 Rayon 的内部任务粒度，不是 Group 总量上限。沿用已验证的产品粒度，后续只通过
 // 最大真实项目的消融基准调整，不把内部调度策略暴露为用户配置。
 const GROUPS_PER_ENCODING_WORK_ITEM: usize = 256;
 
-/// 使用纯 CPU 编码与单个 SQLite 事务替换 RPG Maker 标准资产。
+/// 使用纯 CPU 编码与单个 SQLite 事务替换 RPG Maker 资产。
 pub(crate) struct RpgMakerExtractionAssetStore<S, C> {
     sqlite: S,
     cpu: C,
@@ -289,7 +279,7 @@ where
     async fn prepare_replace(
         &self,
         project: &OpenedProject,
-        owner: RpgMakerStandardAssetOwner,
+        owner: RpgMakerAssetOwner,
         groups: Vec<ExtractedTextGroup>,
         project_definition_update: Option<BuiltinProjectDefinitionUpdate>,
     ) -> Result<
@@ -412,7 +402,7 @@ where
     async fn replace(
         &self,
         project: &OpenedProject,
-        owner: RpgMakerStandardAssetOwner,
+        owner: RpgMakerAssetOwner,
         groups: Vec<ExtractedTextGroup>,
         project_definition_update: Option<BuiltinProjectDefinitionUpdate>,
     ) -> Result<(), RpgMakerExtractionAssetStoreError<C::Error, <S as SqliteQueryExecutor>::Error>>
@@ -434,7 +424,7 @@ where
     async fn deactivate(
         &self,
         project: &OpenedProject,
-        owner: RpgMakerStandardAssetOwner,
+        owner: RpgMakerAssetOwner,
     ) -> Result<(), RpgMakerExtractionAssetStoreError<C::Error, <S as SqliteQueryExecutor>::Error>>
     {
         let database_path = project.database_path().to_path_buf();
@@ -460,7 +450,7 @@ where
     async fn read_owner_state(
         &self,
         database_path: PathBuf,
-        owner: RpgMakerStandardAssetOwner,
+        owner: RpgMakerAssetOwner,
     ) -> Result<
         Vec<SqliteRow>,
         RpgMakerExtractionAssetStoreError<C::Error, <S as SqliteQueryExecutor>::Error>,
@@ -478,7 +468,7 @@ where
     async fn read_stored_snapshot_rows(
         &self,
         database_path: PathBuf,
-        owner: RpgMakerStandardAssetOwner,
+        owner: RpgMakerAssetOwner,
     ) -> Result<
         StoredSnapshotRows,
         RpgMakerExtractionAssetStoreError<C::Error, <S as SqliteQueryExecutor>::Error>,
@@ -518,7 +508,7 @@ where
     async fn read_stored_unit_rows(
         &self,
         database_path: PathBuf,
-        owner: RpgMakerStandardAssetOwner,
+        owner: RpgMakerAssetOwner,
     ) -> Result<
         Vec<SqliteRow>,
         RpgMakerExtractionAssetStoreError<C::Error, <S as SqliteQueryExecutor>::Error>,
@@ -563,7 +553,7 @@ where
     async fn decide_claim_index_maintenance(
         &self,
         database_path: PathBuf,
-        owner: RpgMakerStandardAssetOwner,
+        owner: RpgMakerAssetOwner,
         incoming_claim_count: usize,
     ) -> Result<
         ClaimIndexMaintenance,
@@ -576,7 +566,7 @@ where
         // 写事务之间改变数据库，事务内的精确冲突检查仍是唯一权威结果。
         let incoming_claim_count = i64::try_from(incoming_claim_count)
             .expect("内存中的 Claim 数量必须可写入 SQLite INTEGER");
-        let [other_owner_a, other_owner_b] = other_owner_storage_names(owner);
+        let other_owner = other_owner_storage_name(owner);
         let rows = self
             .sqlite
             .query_existing_database(
@@ -584,8 +574,7 @@ where
                 SqliteQuery::new(
                     DECIDE_CLAIM_INDEX_REBUILD,
                     vec![
-                        text(other_owner_a),
-                        text(other_owner_b),
+                        text(other_owner),
                         SqliteValue::Integer(incoming_claim_count),
                     ],
                 )
@@ -620,7 +609,7 @@ where
     ) -> Result<(), Self::Error> {
         self.replace(
             project,
-            RpgMakerStandardAssetOwner::Builtin,
+            RpgMakerAssetOwner::Builtin,
             snapshot.into_groups(),
             Some(project_definition_update),
         )
@@ -642,7 +631,7 @@ where
     ) -> Result<(), Self::Error> {
         self.replace(
             project,
-            RpgMakerStandardAssetOwner::Rules,
+            RpgMakerAssetOwner::Rules,
             snapshot.into_groups(),
             None,
         )
@@ -650,83 +639,11 @@ where
     }
 
     async fn deactivate_rules(&self, project: &OpenedProject) -> Result<(), Self::Error> {
-        self.deactivate(project, RpgMakerStandardAssetOwner::Rules)
-            .await
+        self.deactivate(project, RpgMakerAssetOwner::Rules).await
     }
 }
 
-impl<S, C> LuaSnapshotStore for RpgMakerExtractionAssetStore<S, C>
-where
-    S: SqliteQueryExecutor + SqliteTransactionExecutor<Error = <S as SqliteQueryExecutor>::Error>,
-    C: CpuTaskExecutor,
-{
-    type Error = RpgMakerExtractionAssetStoreError<C::Error, <S as SqliteQueryExecutor>::Error>;
-
-    async fn apply_lua(
-        &self,
-        project: &OpenedProject,
-        standard: Option<LuaStandardSnapshotMutation>,
-        managed: Option<ManagedTranslationSnapshot>,
-    ) -> Result<(), Self::Error> {
-        let mut steps = match standard {
-            None => Vec::new(),
-            Some(LuaStandardSnapshotMutation::Replace(snapshot)) => self
-                .prepare_replace(
-                    project,
-                    RpgMakerStandardAssetOwner::Lua,
-                    snapshot.into_groups(),
-                    None,
-                )
-                .await?
-                .unwrap_or_default(),
-            Some(LuaStandardSnapshotMutation::Deactivate) => {
-                let database_path = project.database_path().to_path_buf();
-                if self
-                    .read_owner_state(database_path, RpgMakerStandardAssetOwner::Lua)
-                    .await?
-                    .is_empty()
-                {
-                    Vec::new()
-                } else {
-                    vec![execute(
-                        DEACTIVATE_OWNER,
-                        vec![text(RpgMakerStandardAssetOwner::Lua.storage_name())],
-                    )]
-                }
-            }
-        };
-        if let Some(snapshot) = managed {
-            steps.extend(ManagedTranslationSnapshotMutation::replace(&snapshot).into_steps());
-        }
-        if steps.is_empty() {
-            return Ok(());
-        }
-
-        let database_path = project.database_path().to_path_buf();
-        self.sqlite
-            .execute_transaction(database_path.clone(), SqliteTransactionPlan::new(steps))
-            .await
-            .map_err(|error| map_persist_error(database_path, error))
-    }
-
-    async fn deactivate_lua(&self, project: &OpenedProject) -> Result<(), Self::Error> {
-        let mut steps = vec![execute(
-            DEACTIVATE_OWNER,
-            vec![text(RpgMakerStandardAssetOwner::Lua.storage_name())],
-        )];
-        steps.extend(
-            ManagedTranslationSnapshotMutation::deactivate(project.source_snapshot_fingerprint())
-                .into_steps(),
-        );
-        let database_path = project.database_path().to_path_buf();
-        self.sqlite
-            .execute_transaction(database_path.clone(), SqliteTransactionPlan::new(steps))
-            .await
-            .map_err(|error| map_persist_error(database_path, error))
-    }
-}
-
-/// 标准提取快照替换的阶段化错误。
+/// RPG Maker 提取快照替换的阶段化错误。
 #[derive(Debug)]
 pub(crate) enum RpgMakerExtractionAssetStoreError<C, S> {
     ScheduleEncoding(CpuTaskExecutionError<C>),
@@ -842,7 +759,7 @@ where
                 conflict,
             } => write!(
                 formatter,
-                "标准资产物理修改声明冲突 {}：资源 {}，新 owner {} 的组 {} ({}) 与现有 owner {} 的组 {} ({}) 冲突",
+                "RPG Maker 资产物理修改声明冲突 {}：资源 {}，新 owner {} 的组 {} ({}) 与现有 owner {} 的组 {} ({}) 冲突",
                 database_path.display(),
                 conflict.resource,
                 conflict.incoming_owner.storage_name(),
@@ -854,7 +771,7 @@ where
             ),
             Self::ConcurrentModification { database_path } => write!(
                 formatter,
-                "Lua 提取提交前项目来源已经改变，事务未应用：{}",
+                "提取提交前项目来源已经改变，事务未应用：{}",
                 database_path.display()
             ),
             Self::InvalidMutationClaimConflictRow {
@@ -871,7 +788,7 @@ where
                 source,
             } => write!(
                 formatter,
-                "标准资产物理修改声明冲突且无法确认事务回滚终态 {}：资源 {}，新 owner {} 的组 {} ({}) 与现有 owner {} 的组 {} ({}) 冲突；{source}",
+                "RPG Maker 资产物理修改声明冲突且无法确认事务回滚终态 {}：资源 {}，新 owner {} 的组 {} ({}) 与现有 owner {} 的组 {} ({}) 冲突；{source}",
                 database_path.display(),
                 conflict.resource,
                 conflict.incoming_owner.storage_name(),
@@ -1059,9 +976,7 @@ where
                 DiagnosticImpact::Unchanged,
                 DiagnosticAction::Retry,
             )
-            .with_recovery(RecoveryFact::component(
-                "operation=commit_lua_extract_snapshot",
-            ))
+            .with_recovery(RecoveryFact::component("operation=commit_extract_snapshot"))
             .with_recovery(RecoveryFact::transaction("rolled_back")),
             Self::InvalidMutationClaimConflictRow {
                 database_path,
@@ -1241,10 +1156,10 @@ enum ClaimIndexMaintenance {
 #[derive(Clone, Debug)]
 pub(crate) struct MutationClaimConflictDetails {
     resource: RpgMakerLocation,
-    incoming_owner: RpgMakerStandardAssetOwner,
+    incoming_owner: RpgMakerAssetOwner,
     incoming_group_location: RpgMakerLocation,
     incoming_access: MutationResourceAccess,
-    current_owner: RpgMakerStandardAssetOwner,
+    current_owner: RpgMakerAssetOwner,
     current_group_location: RpgMakerLocation,
     current_access: MutationResourceAccess,
 }
@@ -1483,11 +1398,11 @@ fn invalid_project_definition_diagnostic(
     }
     let (subject, detail) = match source {
         StoredProjectDefinitionError::Missing => (
-            DiagnosticSubject::field("standard_project_definition"),
+            DiagnosticSubject::field("rpg_maker_project_definition"),
             "definition_kind=mv_dialogue_rules; expected_rows=1; actual_rows=0".to_owned(),
         ),
         StoredProjectDefinitionError::Multiple => (
-            DiagnosticSubject::field("standard_project_definition"),
+            DiagnosticSubject::field("rpg_maker_project_definition"),
             "definition_kind=mv_dialogue_rules; expected_rows=1; actual_rows=multiple".to_owned(),
         ),
         StoredProjectDefinitionError::WrongColumnCount { actual } => (
@@ -1705,7 +1620,7 @@ impl ResolvedProjectDefinition {
 
 struct EncodedSnapshot {
     #[cfg(test)]
-    owner: RpgMakerStandardAssetOwner,
+    owner: RpgMakerAssetOwner,
     groups: Vec<EncodedGroup>,
     units: Vec<EncodedUnit>,
     /// 参与指纹与写回语义的完整逻辑 Claim。
@@ -1726,7 +1641,7 @@ struct StoredSnapshotRows {
 
 impl EncodedSnapshot {
     fn merge(
-        owner: RpgMakerStandardAssetOwner,
+        owner: RpgMakerAssetOwner,
         batches: Vec<EncodedBatch>,
         project_definition_json: Option<&str>,
     ) -> Result<Self, EncodeAssetSnapshotError> {
@@ -2139,13 +2054,13 @@ const fn group_kind_name(kind: TextGroupKind) -> &'static str {
 }
 
 fn asset_snapshot_fingerprint(
-    owner: RpgMakerStandardAssetOwner,
+    owner: RpgMakerAssetOwner,
     project_definition_json: Option<&str>,
     groups: &[EncodedGroup],
     units: &[EncodedUnit],
     claims: &[EncodedClaim],
 ) -> AssetSnapshotFingerprint {
-    let mut builder = StandardTextSnapshotFingerprintBuilder::new(owner, project_definition_json);
+    let mut builder = RpgMakerTextSnapshotFingerprintBuilder::new(owner, project_definition_json);
     for group in groups {
         builder.group(
             &group.group_location,
@@ -2175,7 +2090,7 @@ fn asset_snapshot_fingerprint(
 
 #[cfg(test)]
 fn build_transaction_plan(
-    owner: RpgMakerStandardAssetOwner,
+    owner: RpgMakerAssetOwner,
     source_snapshot_fingerprint: [u8; 32],
     snapshot: EncodedSnapshot,
     previous_unit_rows: Vec<SqliteRow>,
@@ -2193,7 +2108,7 @@ fn build_transaction_plan(
 }
 
 fn build_transaction_steps(
-    owner: RpgMakerStandardAssetOwner,
+    owner: RpgMakerAssetOwner,
     source_snapshot_fingerprint: [u8; 32],
     mut snapshot: EncodedSnapshot,
     previous_unit_rows: Vec<SqliteRow>,
@@ -2211,18 +2126,18 @@ fn build_transaction_steps(
     } = snapshot;
     let incoming_claim_count = i64::try_from(claim_summary.len())
         .expect("内存中的 Claim 摘要数量必须可写入 SQLite INTEGER");
-    let [other_owner_a, other_owner_b] = other_owner_storage_names(owner);
+    let other_owner = other_owner_storage_name(owner);
     let mut steps = Vec::new();
     if claim_index_maintenance == ClaimIndexMaintenance::Rebuild {
         // 最大真实项目表明：当本 owner 至少覆盖其余 owner 的全部 Claim 时，边写边
         // 维护两个二级索引会成为主要耗时。SQLite 的事务性 DDL 让索引重建与快照
         // 替换共享同一回滚边界；任何后续失败都会恢复旧行和原索引定义。
         steps.push(execute(
-            DROP_STANDARD_MUTATION_CLAIM_OWNER_RESOURCE_INDEX,
+            DROP_RPG_MAKER_MUTATION_CLAIM_OWNER_RESOURCE_INDEX,
             Vec::new(),
         ));
         steps.push(execute(
-            DROP_STANDARD_MUTATION_CLAIM_RESOURCE_INDEX,
+            DROP_RPG_MAKER_MUTATION_CLAIM_RESOURCE_INDEX,
             Vec::new(),
         ));
     }
@@ -2288,11 +2203,11 @@ fn build_transaction_steps(
     }
     if claim_index_maintenance == ClaimIndexMaintenance::Rebuild {
         steps.push(execute(
-            CREATE_STANDARD_MUTATION_CLAIM_RESOURCE_INDEX,
+            CREATE_RPG_MAKER_MUTATION_CLAIM_RESOURCE_INDEX,
             Vec::new(),
         ));
         steps.push(execute(
-            CREATE_STANDARD_MUTATION_CLAIM_OWNER_RESOURCE_INDEX,
+            CREATE_RPG_MAKER_MUTATION_CLAIM_OWNER_RESOURCE_INDEX,
             Vec::new(),
         ));
     }
@@ -2306,8 +2221,7 @@ fn build_transaction_steps(
             vec![
                 text(owner.storage_name()),
                 SqliteValue::Integer(incoming_claim_count),
-                text(other_owner_a),
-                text(other_owner_b),
+                text(other_owner),
             ],
         )
         .with_id("extract.mutation_claim_conflict"),
@@ -2378,11 +2292,10 @@ fn decode_claim_index_maintenance(
     }
 }
 
-fn other_owner_storage_names(owner: RpgMakerStandardAssetOwner) -> [&'static str; 2] {
+fn other_owner_storage_name(owner: RpgMakerAssetOwner) -> &'static str {
     match owner {
-        RpgMakerStandardAssetOwner::Builtin => ["rules", "lua"],
-        RpgMakerStandardAssetOwner::Rules => ["builtin", "lua"],
-        RpgMakerStandardAssetOwner::Lua => ["builtin", "rules"],
+        RpgMakerAssetOwner::Builtin => "rules",
+        RpgMakerAssetOwner::Rules => "builtin",
     }
 }
 
@@ -2562,9 +2475,9 @@ fn conflict_row_text(
 fn conflict_row_owner(
     value: SqliteValue,
     column: &'static str,
-) -> Result<RpgMakerStandardAssetOwner, MutationClaimConflictRowError> {
+) -> Result<RpgMakerAssetOwner, MutationClaimConflictRowError> {
     let value = conflict_row_text(value, column)?;
-    RpgMakerStandardAssetOwner::from_storage_name(&value)
+    RpgMakerAssetOwner::from_storage_name(&value)
         .ok_or(MutationClaimConflictRowError::UnknownOwner { column })
 }
 
@@ -2634,13 +2547,9 @@ mod tests {
     use rusqlite::types::Value as RusqliteValue;
     use rusqlite::{Connection, params_from_iter};
 
-    use crate::rpg_maker::ProjectName;
+    use crate::project_name::ProjectName;
     use crate::rpg_maker::extract::model::{
         ExtractedTextUnit, RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource,
-    };
-    use crate::rpg_maker::managed_translation::{
-        ManagedTranslationCollection, ManagedTranslationContent, ManagedTranslationShape,
-        ManagedTranslationUnit,
     };
     use crate::rpg_maker::model::{
         DirectTextPart, DirectTextRecipe, MutationClaim, ScalarFieldKey, TextProjectionRecipe,
@@ -2648,10 +2557,10 @@ mod tests {
     };
     use crate::rpg_maker::project::test_layout_profile;
     use crate::rpg_maker::text::{DataFileName, StandardDataFile};
-    use crate::rpg_maker::translate::asset_reader::RpgMakerStandardTranslationAssetReadingService;
-    use crate::rpg_maker::translate::standard::StandardTranslationAssetReader;
-    use crate::rpg_maker::write_back::asset_reader::RpgMakerStandardWriteBackAssetReadingService;
-    use crate::rpg_maker::write_back::standard::StandardWriteBackAssetReader;
+    use crate::rpg_maker::translate::asset_reader::RpgMakerTranslationAssetReadingService;
+    use crate::rpg_maker::translate::pipeline::RpgMakerTranslationAssetReader;
+    use crate::rpg_maker::write_back::asset_reader::RpgMakerWriteBackAssetReadingService;
+    use crate::rpg_maker::write_back::planner::RpgMakerWriteBackAssetReader;
     use crate::runtime::cpu::{CpuExecutorConfig, RayonCpuExecutor};
     use crate::runtime::sqlite::{RusqliteStorage, RusqliteStorageConfiguration};
 
@@ -2794,7 +2703,7 @@ mod tests {
                 assert!(matches!(
                     query.parameters(),
                     [SqliteValue::Text(owner)]
-                        if matches!(owner.as_str(), "builtin" | "rules" | "lua")
+                        if matches!(owner.as_str(), "builtin" | "rules")
                 ));
                 return Ok(self
                     .owner_state
@@ -2806,17 +2715,16 @@ mod tests {
                 assert!(matches!(
                     query.parameters(),
                     [
-                        SqliteValue::Text(first),
-                        SqliteValue::Text(second),
+                        SqliteValue::Text(other),
                         SqliteValue::Integer(incoming)
-                    ] if first != second && *incoming > 0
+                    ] if matches!(other.as_str(), "builtin" | "rules") && *incoming > 0
                 ));
                 return Ok(vec![SqliteRow::new(vec![SqliteValue::Integer(1)])]);
             }
             assert!(matches!(
                 query.parameters(),
                 [SqliteValue::Text(owner)]
-                    if matches!(owner.as_str(), "builtin" | "rules" | "lua")
+                    if matches!(owner.as_str(), "builtin" | "rules")
             ));
             let snapshot = self.snapshot_rows.lock().expect("当前快照锁不应中毒");
             match query.statement() {
@@ -3003,7 +2911,7 @@ mod tests {
     #[test]
     fn collision_summary_folds_repeated_intents_but_fingerprint_keeps_every_logical_claim() {
         let snapshot = EncodedSnapshot::merge(
-            RpgMakerStandardAssetOwner::Builtin,
+            RpgMakerAssetOwner::Builtin,
             vec![
                 encode_test_batch(vec![
                     scalar_group(9, "name", "后排序位置"),
@@ -3041,7 +2949,7 @@ mod tests {
         );
 
         let summary_only_fingerprint = asset_snapshot_fingerprint(
-            RpgMakerStandardAssetOwner::Builtin,
+            RpgMakerAssetOwner::Builtin,
             None,
             &snapshot.groups,
             &snapshot.units,
@@ -3065,7 +2973,7 @@ mod tests {
         .map(encode_batch)
         .collect::<Result<Vec<_>, _>>()
         .expect("大量重复 Intent 组应可编码");
-        let snapshot = EncodedSnapshot::merge(RpgMakerStandardAssetOwner::Builtin, batches, None)
+        let snapshot = EncodedSnapshot::merge(RpgMakerAssetOwner::Builtin, batches, None)
             .expect("大量重复 Intent 应可建立确定性摘要");
 
         assert!(snapshot.claims.len() > snapshot.claim_summary.len());
@@ -3078,32 +2986,22 @@ mod tests {
 
     #[test]
     fn asset_fingerprint_covers_owner_groups_units_context_recipes_and_claims() {
-        let base = snapshot_fingerprint(
-            RpgMakerStandardAssetOwner::Builtin,
-            projected_group("<a>", "</a>"),
-        );
-        let different_owner = snapshot_fingerprint(
-            RpgMakerStandardAssetOwner::Rules,
-            projected_group("<a>", "</a>"),
-        );
-        let different_recipe = snapshot_fingerprint(
-            RpgMakerStandardAssetOwner::Builtin,
-            projected_group("<b>", "</b>"),
-        );
+        let base =
+            snapshot_fingerprint(RpgMakerAssetOwner::Builtin, projected_group("<a>", "</a>"));
+        let different_owner =
+            snapshot_fingerprint(RpgMakerAssetOwner::Rules, projected_group("<a>", "</a>"));
+        let different_recipe =
+            snapshot_fingerprint(RpgMakerAssetOwner::Builtin, projected_group("<b>", "</b>"));
         let different_text = snapshot_fingerprint(
-            RpgMakerStandardAssetOwner::Builtin,
+            RpgMakerAssetOwner::Builtin,
             scalar_group(1, "name", "另一段原文"),
         );
-        let different_target = snapshot_fingerprint(
-            RpgMakerStandardAssetOwner::Builtin,
-            scalar_group(2, "name", "原文"),
-        );
-        let with_context = snapshot_fingerprint(
-            RpgMakerStandardAssetOwner::Builtin,
-            dialogue_group("角色", "原文"),
-        );
+        let different_target =
+            snapshot_fingerprint(RpgMakerAssetOwner::Builtin, scalar_group(2, "name", "原文"));
+        let with_context =
+            snapshot_fingerprint(RpgMakerAssetOwner::Builtin, dialogue_group("角色", "原文"));
         let with_project_definition = EncodedSnapshot::merge(
-            RpgMakerStandardAssetOwner::Builtin,
+            RpgMakerAssetOwner::Builtin,
             vec![
                 encode_test_batch(vec![projected_group("<a>", "</a>")]).expect("测试快照应可编码"),
             ],
@@ -3123,7 +3021,7 @@ mod tests {
     #[test]
     fn asset_fingerprint_tracks_group_and_unit_order_without_changing_inheritance_identity() {
         let forward_groups = EncodedSnapshot::merge(
-            RpgMakerStandardAssetOwner::Rules,
+            RpgMakerAssetOwner::Rules,
             vec![
                 encode_test_batch(vec![
                     scalar_group(1, "name", "一"),
@@ -3135,7 +3033,7 @@ mod tests {
         )
         .expect("正序组快照应可合并");
         let reverse_groups = EncodedSnapshot::merge(
-            RpgMakerStandardAssetOwner::Rules,
+            RpgMakerAssetOwner::Rules,
             vec![
                 encode_test_batch(vec![
                     scalar_group(2, "name", "二"),
@@ -3147,13 +3045,13 @@ mod tests {
         )
         .expect("逆序组快照应可合并");
         let forward_units = EncodedSnapshot::merge(
-            RpgMakerStandardAssetOwner::Lua,
+            RpgMakerAssetOwner::Builtin,
             vec![encode_test_batch(vec![two_field_group(false)]).expect("正序单元应可编码")],
             None,
         )
         .expect("正序单元快照应可合并");
         let reverse_units = EncodedSnapshot::merge(
-            RpgMakerStandardAssetOwner::Lua,
+            RpgMakerAssetOwner::Builtin,
             vec![encode_test_batch(vec![two_field_group(true)]).expect("逆序单元应可编码")],
             None,
         )
@@ -3203,7 +3101,7 @@ mod tests {
     #[test]
     fn translation_inheritance_uses_logical_identity_text_and_context_only() {
         let mut snapshot = EncodedSnapshot::merge(
-            RpgMakerStandardAssetOwner::Builtin,
+            RpgMakerAssetOwner::Builtin,
             vec![
                 encode_test_batch(vec![projected_group("<new>", "</new>")]).expect("快照应可编码"),
             ],
@@ -3234,14 +3132,14 @@ mod tests {
     #[test]
     fn replacement_writes_every_asset_row_directly_without_staging_copies() {
         let snapshot = EncodedSnapshot::merge(
-            RpgMakerStandardAssetOwner::Builtin,
+            RpgMakerAssetOwner::Builtin,
             vec![encode_test_batch(vec![scalar_group(1, "name", "原文")]).expect("快照应可编码")],
             None,
         )
         .expect("快照应可合并");
 
         let plan = build_transaction_plan(
-            RpgMakerStandardAssetOwner::Builtin,
+            RpgMakerAssetOwner::Builtin,
             [0xa5; 32],
             snapshot,
             Vec::new(),
@@ -3289,7 +3187,7 @@ mod tests {
                     }
                     _ => None,
                 })
-                .expect("三类标准资产行都应使用批量 INSERT");
+                .expect("三类 RPG Maker 资产行都应使用批量 INSERT");
             let (actual_prefix, actual_row_parameter_count, _) =
                 batch.bulk_insert_spec().expect("批次应为 bulk INSERT");
             assert_eq!(actual_prefix, prefix);
@@ -3306,13 +3204,13 @@ mod tests {
     #[test]
     fn dominant_nonempty_owner_rebuilds_claim_indexes_inside_the_replacement_transaction() {
         let snapshot = EncodedSnapshot::merge(
-            RpgMakerStandardAssetOwner::Builtin,
+            RpgMakerAssetOwner::Builtin,
             vec![encode_test_batch(vec![scalar_group(1, "name", "原文")]).expect("快照应可编码")],
             None,
         )
         .expect("快照应可合并");
         let plan = build_transaction_plan(
-            RpgMakerStandardAssetOwner::Builtin,
+            RpgMakerAssetOwner::Builtin,
             [0xa5; 32],
             snapshot,
             Vec::new(),
@@ -3327,12 +3225,12 @@ mod tests {
                 .unwrap_or_else(|| panic!("事务应包含：{statement}"))
         };
 
-        let drop_owner = position(DROP_STANDARD_MUTATION_CLAIM_OWNER_RESOURCE_INDEX);
-        let drop_resource = position(DROP_STANDARD_MUTATION_CLAIM_RESOURCE_INDEX);
+        let drop_owner = position(DROP_RPG_MAKER_MUTATION_CLAIM_OWNER_RESOURCE_INDEX);
+        let drop_resource = position(DROP_RPG_MAKER_MUTATION_CLAIM_RESOURCE_INDEX);
         let delete_claims = position(DELETE_OWNER_CLAIMS);
         let insert_claims = position(INSERT_CLAIM);
-        let create_resource = position(CREATE_STANDARD_MUTATION_CLAIM_RESOURCE_INDEX);
-        let create_owner = position(CREATE_STANDARD_MUTATION_CLAIM_OWNER_RESOURCE_INDEX);
+        let create_resource = position(CREATE_RPG_MAKER_MUTATION_CLAIM_RESOURCE_INDEX);
+        let create_owner = position(CREATE_RPG_MAKER_MUTATION_CLAIM_OWNER_RESOURCE_INDEX);
         let check_conflicts = position(FIND_MUTATION_CLAIM_CONFLICT);
 
         assert!(drop_owner < delete_claims && drop_resource < delete_claims);
@@ -3344,13 +3242,13 @@ mod tests {
     #[test]
     fn small_owner_keeps_claim_indexes_online() {
         let snapshot = EncodedSnapshot::merge(
-            RpgMakerStandardAssetOwner::Rules,
+            RpgMakerAssetOwner::Rules,
             vec![encode_test_batch(vec![scalar_group(1, "name", "原文")]).expect("快照应可编码")],
             None,
         )
         .expect("快照应可合并");
         let plan = build_transaction_plan(
-            RpgMakerStandardAssetOwner::Rules,
+            RpgMakerAssetOwner::Rules,
             [0xa5; 32],
             snapshot,
             Vec::new(),
@@ -3360,10 +3258,10 @@ mod tests {
         let statements = plan_statements(&plan);
 
         for ddl in [
-            DROP_STANDARD_MUTATION_CLAIM_OWNER_RESOURCE_INDEX,
-            DROP_STANDARD_MUTATION_CLAIM_RESOURCE_INDEX,
-            CREATE_STANDARD_MUTATION_CLAIM_RESOURCE_INDEX,
-            CREATE_STANDARD_MUTATION_CLAIM_OWNER_RESOURCE_INDEX,
+            DROP_RPG_MAKER_MUTATION_CLAIM_OWNER_RESOURCE_INDEX,
+            DROP_RPG_MAKER_MUTATION_CLAIM_RESOURCE_INDEX,
+            CREATE_RPG_MAKER_MUTATION_CLAIM_RESOURCE_INDEX,
+            CREATE_RPG_MAKER_MUTATION_CLAIM_OWNER_RESOURCE_INDEX,
         ] {
             assert!(
                 statements.iter().all(|statement| statement != ddl),
@@ -3376,7 +3274,7 @@ mod tests {
     fn transaction_parameters_follow_the_active_btree_order() {
         let make_snapshot = || {
             EncodedSnapshot::merge(
-                RpgMakerStandardAssetOwner::Builtin,
+                RpgMakerAssetOwner::Builtin,
                 vec![
                     encode_test_batch(vec![
                         scalar_group(2, "description", "说明"),
@@ -3390,7 +3288,7 @@ mod tests {
         };
 
         let rebuild = build_transaction_plan(
-            RpgMakerStandardAssetOwner::Builtin,
+            RpgMakerAssetOwner::Builtin,
             [0xa5; 32],
             make_snapshot(),
             Vec::new(),
@@ -3448,7 +3346,7 @@ mod tests {
         );
 
         let online = build_transaction_plan(
-            RpgMakerStandardAssetOwner::Builtin,
+            RpgMakerAssetOwner::Builtin,
             [0xa5; 32],
             make_snapshot(),
             Vec::new(),
@@ -3483,7 +3381,7 @@ mod tests {
 
     #[test]
     fn claim_index_rebuild_decision_uses_the_exact_other_owner_crossover() {
-        let owner = RpgMakerStandardAssetOwner::Builtin;
+        let owner = RpgMakerAssetOwner::Builtin;
         let snapshot = EncodedSnapshot::merge(
             owner,
             vec![encode_test_batch(vec![scalar_group(1, "name", "原文")]).expect("快照应可编码")],
@@ -3500,7 +3398,7 @@ mod tests {
         assert_eq!(
             query_claim_index_maintenance(
                 &connection,
-                RpgMakerStandardAssetOwner::Rules,
+                RpgMakerAssetOwner::Rules,
                 other_claim_count - 1,
             ),
             ClaimIndexMaintenance::Online,
@@ -3509,7 +3407,7 @@ mod tests {
         assert_eq!(
             query_claim_index_maintenance(
                 &connection,
-                RpgMakerStandardAssetOwner::Rules,
+                RpgMakerAssetOwner::Rules,
                 other_claim_count,
             ),
             ClaimIndexMaintenance::Rebuild,
@@ -3518,7 +3416,7 @@ mod tests {
         assert_eq!(
             query_claim_index_maintenance(
                 &connection,
-                RpgMakerStandardAssetOwner::Rules,
+                RpgMakerAssetOwner::Rules,
                 other_claim_count + 1,
             ),
             ClaimIndexMaintenance::Rebuild,
@@ -3564,7 +3462,7 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()
                 .expect("大量生产模型组应可编码");
             EncodedSnapshot::merge(
-                RpgMakerStandardAssetOwner::Builtin,
+                RpgMakerAssetOwner::Builtin,
                 encoded_batches,
                 Some(DIALOGUE_DEFINITION_JSON),
             )
@@ -3589,7 +3487,7 @@ mod tests {
         execute_plan(
             &mut connection,
             build_transaction_plan(
-                RpgMakerStandardAssetOwner::Builtin,
+                RpgMakerAssetOwner::Builtin,
                 [0xa5; 32],
                 snapshot,
                 Vec::new(),
@@ -3601,7 +3499,7 @@ mod tests {
 
         let repeated = encode_snapshot();
         assert_eq!(repeated.fingerprint, expected_fingerprint);
-        let stored = read_snapshot_rows(&connection, RpgMakerStandardAssetOwner::Builtin);
+        let stored = read_snapshot_rows(&connection, RpgMakerAssetOwner::Builtin);
         assert_eq!(stored.groups.len(), 1);
         assert_eq!(stored.units.len(), 1);
         assert_eq!(stored.claims.len(), expected_summary_count);
@@ -3614,7 +3512,7 @@ mod tests {
 
         let observer = Connection::open(&database_path).expect("应打开大项目观察连接");
         let claim_count: i64 = observer
-            .query_row("SELECT COUNT(*) FROM standard_mutation_claim", [], |row| {
+            .query_row("SELECT COUNT(*) FROM rpg_maker_mutation_claim", [], |row| {
                 row.get(0)
             })
             .expect("应读取持久 Claim 总数");
@@ -3657,7 +3555,7 @@ mod tests {
         );
 
         let translation_reader =
-            RpgMakerStandardTranslationAssetReadingService::new(sqlite.clone(), cpu.clone());
+            RpgMakerTranslationAssetReadingService::new(sqlite.clone(), cpu.clone());
         let corpus = translation_reader
             .read(&project)
             .await
@@ -3666,7 +3564,7 @@ mod tests {
         assert_eq!(corpus.groups()[0].assets().len(), 1);
 
         let write_back_reader =
-            RpgMakerStandardWriteBackAssetReadingService::new(sqlite.clone(), cpu.clone());
+            RpgMakerWriteBackAssetReadingService::new(sqlite.clone(), cpu.clone());
         let _snapshot = write_back_reader
             .read(&project)
             .await
@@ -3708,10 +3606,8 @@ mod tests {
             test_layout_profile(),
         );
 
-        let translation_reader = RpgMakerStandardTranslationAssetReadingService::new(
-            sqlite.clone(),
-            observed_cpu.clone(),
-        );
+        let translation_reader =
+            RpgMakerTranslationAssetReadingService::new(sqlite.clone(), observed_cpu.clone());
         let corpus = translation_reader
             .read(&project)
             .await
@@ -3725,7 +3621,7 @@ mod tests {
                 panic!("每个大规模验收 Group 必须恰好包含一个 Unit")
             };
             let identity = asset.identity();
-            assert_eq!(identity.owner(), RpgMakerStandardAssetOwner::Builtin);
+            assert_eq!(identity.owner(), RpgMakerAssetOwner::Builtin);
             assert_eq!(identity.kind(), TextGroupKind::DatabaseEntry);
             assert_eq!(identity.group_location(), group.group_location());
             assert!(matches!(
@@ -3749,7 +3645,7 @@ mod tests {
         drop(translation_reader);
 
         let write_back_reader =
-            RpgMakerStandardWriteBackAssetReadingService::new(sqlite.clone(), observed_cpu.clone());
+            RpgMakerWriteBackAssetReadingService::new(sqlite.clone(), observed_cpu.clone());
         let write_back_snapshot = write_back_reader
             .read(&project)
             .await
@@ -3769,7 +3665,7 @@ mod tests {
 
     #[test]
     fn recipe_shell_change_inherits_translation_in_a_real_transaction() {
-        let owner = RpgMakerStandardAssetOwner::Builtin;
+        let owner = RpgMakerAssetOwner::Builtin;
         let old = EncodedSnapshot::merge(
             owner,
             vec![encode_test_batch(vec![projected_group("<a>", "</a>")]).expect("旧快照应可编码")],
@@ -3803,7 +3699,7 @@ mod tests {
 
         let (translation, state): (String, Vec<u8>) = connection
             .query_row(
-                "SELECT translation_content_json, translation_state FROM standard_text_unit",
+                "SELECT translation_content_json, translation_state FROM rpg_maker_text_unit",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -3812,7 +3708,7 @@ mod tests {
         assert_eq!(state, vec![0x44; 32]);
         let recipe: String = connection
             .query_row(
-                "SELECT projection_recipe_json FROM standard_text_group",
+                "SELECT projection_recipe_json FROM rpg_maker_text_group",
                 [],
                 |row| row.get(0),
             )
@@ -3823,7 +3719,7 @@ mod tests {
 
     #[test]
     fn source_change_does_not_inherit_stale_translation_in_a_real_transaction() {
-        let owner = RpgMakerStandardAssetOwner::Builtin;
+        let owner = RpgMakerAssetOwner::Builtin;
         let old = EncodedSnapshot::merge(
             owner,
             vec![
@@ -3860,7 +3756,7 @@ mod tests {
 
         let (translation, state): (Option<String>, Option<Vec<u8>>) = connection
             .query_row(
-                "SELECT translation_content_json, translation_state FROM standard_text_unit",
+                "SELECT translation_content_json, translation_state FROM rpg_maker_text_unit",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -3872,7 +3768,7 @@ mod tests {
     #[tokio::test]
     async fn cross_owner_claim_conflict_rolls_back_data_and_indexes_in_the_production_runtime() {
         let builtin = EncodedSnapshot::merge(
-            RpgMakerStandardAssetOwner::Builtin,
+            RpgMakerAssetOwner::Builtin,
             vec![
                 encode_test_batch(vec![scalar_group(1, "name", "Builtin 原文")])
                     .expect("Builtin 快照应可编码"),
@@ -3881,7 +3777,7 @@ mod tests {
         )
         .expect("Builtin 快照应可合并");
         let previous_rules = EncodedSnapshot::merge(
-            RpgMakerStandardAssetOwner::Rules,
+            RpgMakerAssetOwner::Rules,
             vec![
                 encode_test_batch(vec![scalar_group(2, "name", "旧 Rules 原文")])
                     .expect("旧 Rules 快照应可编码"),
@@ -3890,7 +3786,7 @@ mod tests {
         )
         .expect("旧 Rules 快照应可合并");
         let conflicting_rules = EncodedSnapshot::merge(
-            RpgMakerStandardAssetOwner::Rules,
+            RpgMakerAssetOwner::Rules,
             vec![
                 encode_test_batch(vec![scalar_group(1, "name", "新 Rules 原文")])
                     .expect("冲突 Rules 快照应可编码"),
@@ -3910,13 +3806,13 @@ mod tests {
             r#""旧 Rules 译文""#,
             &[0x22; 32],
         );
-        let builtin_rows = read_snapshot_rows(&connection, RpgMakerStandardAssetOwner::Builtin);
-        let previous_rows = read_snapshot_rows(&connection, RpgMakerStandardAssetOwner::Rules);
+        let builtin_rows = read_snapshot_rows(&connection, RpgMakerAssetOwner::Builtin);
+        let previous_rows = read_snapshot_rows(&connection, RpgMakerAssetOwner::Rules);
         let previous_unit_rows = previous_rows.units.clone();
         let previous_index_schema = read_claim_index_schema(&connection);
 
         let plan = build_transaction_plan(
-            RpgMakerStandardAssetOwner::Rules,
+            RpgMakerAssetOwner::Rules,
             [0xa5; 32],
             conflicting_rules,
             previous_unit_rows,
@@ -3926,7 +3822,7 @@ mod tests {
         assert!(
             plan_statements(&plan)
                 .iter()
-                .any(|statement| statement == DROP_STANDARD_MUTATION_CLAIM_RESOURCE_INDEX),
+                .any(|statement| statement == DROP_RPG_MAKER_MUTATION_CLAIM_RESOURCE_INDEX),
             "该测试必须覆盖事务内 DDL 回滚，而不是在线维护路径"
         );
         drop(connection);
@@ -3948,12 +3844,12 @@ mod tests {
         ));
         let connection = Connection::open(&database_path).expect("应重新打开回滚后的数据库");
         assert_eq!(
-            read_snapshot_rows(&connection, RpgMakerStandardAssetOwner::Rules),
+            read_snapshot_rows(&connection, RpgMakerAssetOwner::Rules),
             previous_rows,
             "冲突替换不得删除、部分覆盖或污染旧 Rules 快照"
         );
         assert_eq!(
-            read_snapshot_rows(&connection, RpgMakerStandardAssetOwner::Builtin),
+            read_snapshot_rows(&connection, RpgMakerAssetOwner::Builtin),
             builtin_rows,
             "冲突替换不得改变另一个 owner 的权威快照"
         );
@@ -3972,7 +3868,7 @@ mod tests {
 
     #[test]
     fn claim_index_rebuild_rolls_back_schema_and_data_on_sqlite_failure() {
-        let owner = RpgMakerStandardAssetOwner::Builtin;
+        let owner = RpgMakerAssetOwner::Builtin;
         let old = EncodedSnapshot::merge(
             owner,
             vec![encode_test_batch(vec![scalar_group(1, "name", "旧原文")]).expect("旧快照应编码")],
@@ -4055,9 +3951,9 @@ mod tests {
         let plans = harness.sqlite.plans.lock().expect("事务记录锁不应中毒");
         assert_eq!(plans.len(), 1);
         let statements = plan_statements(&plans[0].1).join("\n");
-        assert!(statements.contains("standard_text_group"));
-        assert!(statements.contains("standard_text_unit"));
-        assert!(statements.contains("standard_mutation_claim"));
+        assert!(statements.contains("rpg_maker_text_group"));
+        assert!(statements.contains("rpg_maker_text_unit"));
+        assert!(statements.contains("rpg_maker_mutation_claim"));
     }
 
     #[tokio::test]
@@ -4131,7 +4027,7 @@ mod tests {
         execute_plan(&mut connection, plan).expect("定义与资产事务应可整体提交");
         let persisted: String = connection
             .query_row(
-                "SELECT canonical_json FROM standard_project_definition WHERE definition_kind = 'mv_dialogue_rules'",
+                "SELECT canonical_json FROM rpg_maker_project_definition WHERE definition_kind = 'mv_dialogue_rules'",
                 [],
                 |row| row.get(0),
             )
@@ -4269,7 +4165,7 @@ mod tests {
     #[tokio::test]
     async fn identical_snapshot_skips_the_write_transaction() {
         let harness = Harness::new(None);
-        let owner = RpgMakerStandardAssetOwner::Builtin;
+        let owner = RpgMakerAssetOwner::Builtin;
         let group = scalar_group(1, "name", "原文");
         let encoded = EncodedSnapshot::merge(
             owner,
@@ -4326,7 +4222,7 @@ mod tests {
     #[tokio::test]
     async fn deep_snapshot_rechecks_owner_state_in_the_same_read_view() {
         let harness = Harness::new(None);
-        let owner = RpgMakerStandardAssetOwner::Rules;
+        let owner = RpgMakerAssetOwner::Rules;
         let group = scalar_group(1, "name", "原文");
         let encoded = EncodedSnapshot::merge(
             owner,
@@ -4392,7 +4288,7 @@ mod tests {
     #[tokio::test]
     async fn matching_fingerprints_deep_read_and_repair_a_damaged_snapshot() {
         let harness = Harness::new(None);
-        let owner = RpgMakerStandardAssetOwner::Rules;
+        let owner = RpgMakerAssetOwner::Rules;
         let group = scalar_group(1, "name", "原文");
         let encoded = EncodedSnapshot::merge(
             owner,
@@ -4445,7 +4341,7 @@ mod tests {
         let harness = Harness::new(None);
         let group = scalar_group(1, "name", "原文");
         let encoded = EncodedSnapshot::merge(
-            RpgMakerStandardAssetOwner::Rules,
+            RpgMakerAssetOwner::Rules,
             vec![encode_test_batch(vec![group.clone()]).expect("快照应可编码")],
             None,
         )
@@ -4584,19 +4480,10 @@ mod tests {
         assert!(requirement.statement().contains("other_sample"));
         assert!(requirement.statement().contains("other_count.value <= ?2"));
         assert!(requirement.statement().contains("other_count.value > ?2"));
-        assert!(
-            requirement
-                .statement()
-                .contains("current.owner IN (?3, ?4)")
-        );
+        assert!(requirement.statement().contains("current.owner = ?3"));
         assert_eq!(
             requirement.parameters(),
-            [
-                text("rules"),
-                SqliteValue::Integer(3),
-                text("builtin"),
-                text("lua"),
-            ]
+            [text("rules"), SqliteValue::Integer(3), text("builtin")]
         );
     }
 
@@ -4610,13 +4497,9 @@ mod tests {
             let harness = Harness::new(Some(response));
             let error = harness
                 .service()
-                .apply_lua(
+                .replace_rules(
                     &project(),
-                    Some(LuaStandardSnapshotMutation::Replace(
-                        LuaSnapshot::new(vec![scalar_group(1, "name", "原文")])
-                            .expect("快照应合法"),
-                    )),
-                    None,
+                    RulesSnapshot::new(vec![scalar_group(1, "name", "原文")]).expect("快照应合法"),
                 )
                 .await
                 .expect_err("预设的事务终态必须返回");
@@ -4636,210 +4519,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn lua_standard_and_managed_snapshots_share_exactly_one_transaction_plan() {
-        let harness = Harness::new(None);
-        let project = project();
-        let managed = managed_snapshot(&project);
-
-        harness
-            .service()
-            .apply_lua(
-                &project,
-                Some(LuaStandardSnapshotMutation::Replace(
-                    LuaSnapshot::new(vec![scalar_group(1, "name", "原文")])
-                        .expect("标准快照应合法"),
-                )),
-                Some(managed),
-            )
-            .await
-            .expect("两个 Lua 域应原子提交");
-
-        let plans = harness.sqlite.plans.lock().expect("事务记录锁不应中毒");
-        assert_eq!(plans.len(), 1, "两个域不得串行提交两个事务");
-        let statements = plan_statements(&plans[0].1);
-        assert!(
-            statements
-                .iter()
-                .any(|statement| statement.contains("standard_asset_owner_state"))
-        );
-        assert!(
-            statements
-                .iter()
-                .any(|statement| statement.contains("managed_translation_owner_state"))
-        );
-        let standard_step = statements
-            .iter()
-            .position(|statement| statement.contains("standard_asset_owner_state"))
-            .expect("计划应包含 Standard owner 写入");
-        let managed_step = statements
-            .iter()
-            .position(|statement| statement.contains("managed_translation_owner_state"))
-            .expect("计划应包含 Managed owner 写入");
-        assert!(
-            standard_step < managed_step,
-            "Standard 与 Managed 步骤应保持确定的域顺序"
-        );
-    }
-
-    #[tokio::test]
-    async fn managed_only_replace_preserves_standard_domain() {
-        let harness = Harness::new(None);
-        let project = project();
-
-        harness
-            .service()
-            .apply_lua(&project, None, Some(managed_snapshot(&project)))
-            .await
-            .expect("仅 Managed replace 应成功");
-
-        assert!(
-            harness
-                .sqlite
-                .queries
-                .lock()
-                .expect("查询记录锁不应中毒")
-                .is_empty(),
-            "未声明 Standard 意图时不应读取或改写该域"
-        );
-        let plans = harness.sqlite.plans.lock().expect("事务记录锁不应中毒");
-        assert_eq!(plans.len(), 1);
-        let statements = plan_statements(&plans[0].1);
-        assert!(
-            statements
-                .iter()
-                .all(|statement| !statement.contains("standard_asset_owner_state"))
-        );
-        assert!(
-            statements
-                .iter()
-                .any(|statement| statement.contains("managed_translation_owner_state"))
-        );
-    }
-
-    #[tokio::test]
-    async fn standard_only_replace_preserves_managed_domain() {
-        let harness = Harness::new(None);
-
-        harness
-            .service()
-            .apply_lua(
-                &project(),
-                Some(LuaStandardSnapshotMutation::Replace(
-                    LuaSnapshot::new(vec![scalar_group(1, "name", "原文")])
-                        .expect("标准快照应合法"),
-                )),
-                None,
-            )
-            .await
-            .expect("仅 Standard replace 应成功");
-
-        let plans = harness.sqlite.plans.lock().expect("事务记录锁不应中毒");
-        assert_eq!(plans.len(), 1);
-        let statements = plan_statements(&plans[0].1);
-        assert!(
-            statements
-                .iter()
-                .any(|statement| statement.contains("standard_asset_owner_state"))
-        );
-        assert!(
-            statements
-                .iter()
-                .all(|statement| !statement.contains("managed_translation_")),
-            "未声明 Managed 意图时不得改写该域"
-        );
-    }
-
-    #[tokio::test]
-    async fn absent_lua_intents_leave_both_domains_untouched_without_a_transaction() {
-        let harness = Harness::new(None);
-
-        harness
-            .service()
-            .apply_lua(&project(), None, None)
-            .await
-            .expect("未声明任何 Lua 意图应是无副作用成功");
-
-        assert!(
-            harness
-                .sqlite
-                .queries
-                .lock()
-                .expect("查询记录锁不应中毒")
-                .is_empty()
-        );
-        assert!(
-            harness
-                .sqlite
-                .plans
-                .lock()
-                .expect("事务记录锁不应中毒")
-                .is_empty(),
-            "未声明任何 Lua 意图时不得创建事务"
-        );
-    }
-
-    #[tokio::test]
-    async fn deactivating_an_absent_standard_lua_owner_does_not_create_a_write_transaction() {
-        let harness = Harness::new(None);
-
-        harness
-            .service()
-            .apply_lua(
-                &project(),
-                Some(LuaStandardSnapshotMutation::Deactivate),
-                None,
-            )
-            .await
-            .expect("停用不存在的 Standard Lua owner 应是无副作用成功");
-
-        assert_eq!(
-            *harness.sqlite.queries.lock().expect("查询记录锁不应中毒"),
-            [READ_OWNER_STATE.to_owned()]
-        );
-        assert!(
-            harness
-                .sqlite
-                .plans
-                .lock()
-                .expect("事务记录锁不应中毒")
-                .is_empty(),
-            "不存在的 Standard owner 不应产生空效果 DELETE 事务"
-        );
-    }
-
-    #[tokio::test]
-    async fn lua_deactivation_clears_both_domains_in_one_transaction() {
-        let harness = Harness::new(None);
-
-        harness
-            .service()
-            .deactivate_lua(&project())
-            .await
-            .expect("停用 Lua 应原子清除两个 owner");
-
-        let plans = harness.sqlite.plans.lock().expect("事务记录锁不应中毒");
-        assert_eq!(plans.len(), 1);
-        let statements = plan_statements(&plans[0].1);
-        assert_eq!(
-            statements
-                .iter()
-                .filter(|statement| statement.contains("standard_asset_owner_state"))
-                .count(),
-            1
-        );
-        assert_eq!(
-            statements
-                .iter()
-                .filter(|statement| statement.contains("managed_translation_owner_state"))
-                .count(),
-            1
-        );
-    }
-
     #[test]
     fn physical_write_order_preserves_fingerprint_values_and_natural_read_order() {
-        let owner = RpgMakerStandardAssetOwner::Rules;
+        let owner = RpgMakerAssetOwner::Rules;
         let snapshot = EncodedSnapshot::merge(
             owner,
             vec![
@@ -4873,7 +4555,7 @@ mod tests {
         assert_eq!(read_snapshot_rows(&connection, owner), expected);
         let stored_fingerprint: Vec<u8> = connection
             .query_row(
-                "SELECT asset_snapshot_fingerprint FROM standard_asset_owner_state WHERE owner = ?1",
+                "SELECT asset_snapshot_fingerprint FROM rpg_maker_asset_owner_state WHERE owner = ?1",
                 [owner.storage_name()],
                 |row| row.get(0),
             )
@@ -4883,12 +4565,12 @@ mod tests {
             read_claim_index_schema(&connection),
             vec![
                 (
-                    "standard_mutation_claim_owner_resource_idx".to_owned(),
-                    CREATE_STANDARD_MUTATION_CLAIM_OWNER_RESOURCE_INDEX.to_owned(),
+                    "rpg_maker_mutation_claim_owner_resource_idx".to_owned(),
+                    CREATE_RPG_MAKER_MUTATION_CLAIM_OWNER_RESOURCE_INDEX.to_owned(),
                 ),
                 (
-                    "standard_mutation_claim_resource_idx".to_owned(),
-                    CREATE_STANDARD_MUTATION_CLAIM_RESOURCE_INDEX.to_owned(),
+                    "rpg_maker_mutation_claim_resource_idx".to_owned(),
+                    CREATE_RPG_MAKER_MUTATION_CLAIM_RESOURCE_INDEX.to_owned(),
                 ),
             ],
             "成功提交后两个命名索引必须恢复为项目数据库的精确权威 DDL"
@@ -4898,7 +4580,7 @@ mod tests {
     #[test]
     fn narrow_snapshot_rows_require_exact_table_contents_and_types() {
         let snapshot = EncodedSnapshot::merge(
-            RpgMakerStandardAssetOwner::Rules,
+            RpgMakerAssetOwner::Rules,
             vec![
                 encode_test_batch(vec![
                     scalar_group(2, "description", "说明"),
@@ -4989,7 +4671,7 @@ mod tests {
             let explain = format!("EXPLAIN QUERY PLAN {query}");
             let mut statement = connection.prepare(&explain).expect("查询计划应可准备");
             let details = statement
-                .query_map([RpgMakerStandardAssetOwner::Rules.storage_name()], |row| {
+                .query_map([RpgMakerAssetOwner::Rules.storage_name()], |row| {
                     row.get::<_, String>(3)
                 })
                 .expect("查询计划应可读取")
@@ -5091,8 +4773,8 @@ mod tests {
         assert_eq!(sample.claims[0].access, MutationResourceAccess::Exclusive);
         assert_eq!(sample.claims[0].group_location, sample_location);
 
-        let owner = RpgMakerStandardAssetOwner::Builtin;
-        let mut fingerprint_builder = StandardTextSnapshotFingerprintBuilder::new(
+        let owner = RpgMakerAssetOwner::Builtin;
+        let mut fingerprint_builder = RpgMakerTextSnapshotFingerprintBuilder::new(
             owner,
             Some(LARGE_GROUP_UNIT_DIALOGUE_DEFINITION_JSON),
         );
@@ -5102,14 +4784,14 @@ mod tests {
             .expect("大 Group/Unit 项目应开启单次夹具事务");
         transaction
             .execute(
-                "INSERT INTO standard_asset_owner_state VALUES (?1, ?2, ?3)",
+                "INSERT INTO rpg_maker_asset_owner_state VALUES (?1, ?2, ?3)",
                 (owner.storage_name(), vec![0xa5; 32], vec![0_u8; 32]),
             )
             .expect("大 Group/Unit owner state 应先建立");
 
         {
             let mut statement = transaction
-                .prepare("INSERT INTO standard_text_group VALUES (?1, ?2, ?3, ?4, ?5)")
+                .prepare("INSERT INTO rpg_maker_text_group VALUES (?1, ?2, ?3, ?4, ?5)")
                 .expect("大 Group 写入语句应准备一次");
             for group_order in 0..total {
                 let location = large_data_root_location(group_order + 1);
@@ -5132,7 +4814,7 @@ mod tests {
         {
             let mut statement = transaction
                 .prepare(
-                    "INSERT INTO standard_text_unit VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL)",
+                    "INSERT INTO rpg_maker_text_unit VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL)",
                 )
                 .expect("大 Unit 写入语句应准备一次");
             for ordinal in 1..=total {
@@ -5159,7 +4841,7 @@ mod tests {
 
         {
             let mut statement = transaction
-                .prepare("INSERT INTO standard_mutation_claim VALUES (?1, ?2, ?3, 'exclusive')")
+                .prepare("INSERT INTO rpg_maker_mutation_claim VALUES (?1, ?2, ?3, 'exclusive')")
                 .expect("大 Claim 写入语句应准备一次");
             for ordinal in 1..=total {
                 let location = large_data_root_location(ordinal);
@@ -5178,7 +4860,7 @@ mod tests {
             AssetSnapshotFingerprint::from_bytes(fingerprint_builder.finish().into_bytes());
         transaction
             .execute(
-                "UPDATE standard_asset_owner_state SET asset_snapshot_fingerprint = ?1 WHERE owner = ?2",
+                "UPDATE rpg_maker_asset_owner_state SET asset_snapshot_fingerprint = ?1 WHERE owner = ?2",
                 (fingerprint.as_bytes().to_vec(), owner.storage_name()),
             )
             .expect("大 Group/Unit owner 指纹应最终写入");
@@ -5189,7 +4871,7 @@ mod tests {
     }
 
     fn snapshot_fingerprint(
-        owner: RpgMakerStandardAssetOwner,
+        owner: RpgMakerAssetOwner,
         group: ExtractedTextGroup,
     ) -> AssetSnapshotFingerprint {
         EncodedSnapshot::merge(
@@ -5461,22 +5143,6 @@ mod tests {
         )
     }
 
-    fn managed_snapshot(project: &OpenedProject) -> ManagedTranslationSnapshot {
-        let unit = ManagedTranslationUnit::new(
-            "quest:1",
-            "plugin_parameter",
-            ManagedTranslationShape::Single,
-            ManagedTranslationContent::scalar("星港へ"),
-            "",
-            None,
-        )
-        .expect("托管单元应合法");
-        let collection = ManagedTranslationCollection::new("quests", "翻译标题", vec![unit])
-            .expect("托管 collection 应合法");
-        ManagedTranslationSnapshot::new(project.source_snapshot_fingerprint(), vec![collection])
-            .expect("托管快照应合法")
-    }
-
     fn encode_test_batch(
         groups: Vec<ExtractedTextGroup>,
     ) -> Result<EncodedBatch, EncodeAssetSnapshotError> {
@@ -5551,7 +5217,7 @@ mod tests {
 
     fn read_snapshot_rows(
         connection: &Connection,
-        owner: RpgMakerStandardAssetOwner,
+        owner: RpgMakerAssetOwner,
     ) -> StoredSnapshotRows {
         StoredSnapshotRows {
             owner_state: read_rows(connection, READ_OWNER_STATE, owner, 2),
@@ -5564,7 +5230,7 @@ mod tests {
     fn read_rows(
         connection: &Connection,
         query: &str,
-        owner: RpgMakerStandardAssetOwner,
+        owner: RpgMakerAssetOwner,
         column_count: usize,
     ) -> Vec<SqliteRow> {
         let mut statement = connection.prepare(query).expect("快照查询应可准备");
@@ -5587,10 +5253,10 @@ mod tests {
 
     fn query_claim_index_maintenance(
         connection: &Connection,
-        owner: RpgMakerStandardAssetOwner,
+        owner: RpgMakerAssetOwner,
         incoming_claim_count: usize,
     ) -> ClaimIndexMaintenance {
-        let [other_owner_a, other_owner_b] = other_owner_storage_names(owner);
+        let other_owner = other_owner_storage_name(owner);
         let incoming_claim_count =
             i64::try_from(incoming_claim_count).expect("测试 Claim 数量应可编码");
         let mut statement = connection
@@ -5598,7 +5264,7 @@ mod tests {
             .expect("索引策略查询应可准备");
         let rows = statement
             .query_map(
-                rusqlite::params![other_owner_a, other_owner_b, incoming_claim_count],
+                rusqlite::params![other_owner, incoming_claim_count],
                 |row| row.get::<_, i64>(0),
             )
             .expect("索引策略查询应可执行")
@@ -5618,8 +5284,8 @@ mod tests {
 FROM sqlite_schema
 WHERE type = 'index'
   AND name IN (
-      'standard_mutation_claim_resource_idx',
-      'standard_mutation_claim_owner_resource_idx'
+      'rpg_maker_mutation_claim_resource_idx',
+      'rpg_maker_mutation_claim_owner_resource_idx'
   )
 ORDER BY name"#,
             )
@@ -5670,26 +5336,26 @@ ORDER BY name"#,
                 INSERT INTO metadata VALUES (
                     X'A5A5A5A5A5A5A5A5A5A5A5A5A5A5A5A5A5A5A5A5A5A5A5A5A5A5A5A5A5A5A5A5'
                 );
-                CREATE TABLE standard_asset_owner_state (
+                CREATE TABLE rpg_maker_asset_owner_state (
                     owner TEXT PRIMARY KEY,
                     source_snapshot_fingerprint BLOB NOT NULL,
                     asset_snapshot_fingerprint BLOB NOT NULL
                 );
-                CREATE TABLE standard_project_definition (
+                CREATE TABLE rpg_maker_project_definition (
                     definition_kind TEXT PRIMARY KEY,
                     canonical_json TEXT NOT NULL
                 );
-                INSERT INTO standard_project_definition VALUES (
+                INSERT INTO rpg_maker_project_definition VALUES (
                     'mv_dialogue_rules',
                     '{"rules":[]}'
                 );
-                CREATE TABLE standard_translation_resource (
+                CREATE TABLE rpg_maker_translation_resource (
                     resource_kind TEXT PRIMARY KEY,
                     canonical_json TEXT NOT NULL
                 );
-                INSERT INTO standard_translation_resource VALUES ('terminology', '[]');
-                INSERT INTO standard_translation_resource VALUES ('placeholder_rules', '[]');
-                CREATE TABLE standard_text_group (
+                INSERT INTO rpg_maker_translation_resource VALUES ('terminology', '[]');
+                INSERT INTO rpg_maker_translation_resource VALUES ('placeholder_rules', '[]');
+                CREATE TABLE rpg_maker_text_group (
                     owner TEXT NOT NULL,
                     group_location TEXT NOT NULL,
                     group_order INTEGER NOT NULL CHECK (group_order >= 0),
@@ -5697,9 +5363,9 @@ ORDER BY name"#,
                     projection_recipe_json TEXT NOT NULL,
                     PRIMARY KEY (owner, group_location),
                     UNIQUE (owner, group_order),
-                    FOREIGN KEY (owner) REFERENCES standard_asset_owner_state(owner) ON DELETE CASCADE
+                    FOREIGN KEY (owner) REFERENCES rpg_maker_asset_owner_state(owner) ON DELETE CASCADE
                 );
-                CREATE TABLE standard_text_unit (
+                CREATE TABLE rpg_maker_text_unit (
                     owner TEXT NOT NULL,
                     group_location TEXT NOT NULL,
                     unit_role TEXT NOT NULL,
@@ -5711,25 +5377,25 @@ ORDER BY name"#,
                     PRIMARY KEY (owner, group_location, unit_role),
                     UNIQUE (owner, group_location, unit_order),
                     FOREIGN KEY (owner, group_location)
-                        REFERENCES standard_text_group(owner, group_location) ON DELETE CASCADE
+                        REFERENCES rpg_maker_text_group(owner, group_location) ON DELETE CASCADE
                 );
-                CREATE TABLE standard_mutation_claim (
+                CREATE TABLE rpg_maker_mutation_claim (
                     owner TEXT NOT NULL,
                     group_location TEXT NOT NULL,
                     resource_key TEXT NOT NULL,
                     access TEXT NOT NULL CHECK (access IN ('intent', 'exclusive')),
                     PRIMARY KEY (owner, group_location, resource_key),
                     FOREIGN KEY (owner, group_location)
-                        REFERENCES standard_text_group(owner, group_location) ON DELETE CASCADE
+                        REFERENCES rpg_maker_text_group(owner, group_location) ON DELETE CASCADE
                 );
                 "#,
             )
             .expect("当前测试 schema 应创建成功");
         connection
-            .execute(CREATE_STANDARD_MUTATION_CLAIM_RESOURCE_INDEX, [])
+            .execute(CREATE_RPG_MAKER_MUTATION_CLAIM_RESOURCE_INDEX, [])
             .expect("Claim resource 索引应按生产 DDL 创建");
         connection
-            .execute(CREATE_STANDARD_MUTATION_CLAIM_OWNER_RESOURCE_INDEX, [])
+            .execute(CREATE_RPG_MAKER_MUTATION_CLAIM_OWNER_RESOURCE_INDEX, [])
             .expect("Claim owner/resource 索引应按生产 DDL 创建");
     }
 
@@ -5741,7 +5407,7 @@ ORDER BY name"#,
     ) {
         connection
             .execute(
-                "INSERT INTO standard_asset_owner_state VALUES (?1, ?2, ?3)",
+                "INSERT INTO rpg_maker_asset_owner_state VALUES (?1, ?2, ?3)",
                 (
                     snapshot.owner.storage_name(),
                     vec![0xa5; 32],
@@ -5752,7 +5418,7 @@ ORDER BY name"#,
         for group in &snapshot.groups {
             connection
                 .execute(
-                    "INSERT INTO standard_text_group VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO rpg_maker_text_group VALUES (?1, ?2, ?3, ?4, ?5)",
                     (
                         snapshot.owner.storage_name(),
                         &group.group_location,
@@ -5766,7 +5432,7 @@ ORDER BY name"#,
         for unit in &snapshot.units {
             connection
                 .execute(
-                    "INSERT INTO standard_text_unit VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    "INSERT INTO rpg_maker_text_unit VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     rusqlite::params![
                         snapshot.owner.storage_name(),
                         &unit.group_location,
@@ -5783,7 +5449,7 @@ ORDER BY name"#,
         for claim in &snapshot.claim_summary {
             connection
                 .execute(
-                    "INSERT INTO standard_mutation_claim VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT INTO rpg_maker_mutation_claim VALUES (?1, ?2, ?3, ?4)",
                     (
                         snapshot.owner.storage_name(),
                         &claim.group_location,

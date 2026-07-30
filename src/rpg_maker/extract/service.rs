@@ -3,36 +3,31 @@ use std::fmt;
 use std::path::PathBuf;
 
 use super::builtin::BuiltInExtraction;
-use super::lua::LuaExtraction;
 use super::rules::RulesExtraction;
 use super::{ExtractInput, ExtractOutput, ExtractProgress, ExtractProgressPhase, SelectedRules};
 use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::progress::ProgressObserver;
-use crate::rpg_maker::SelectedLua;
+use crate::project_lease::{ProjectCommandLeaseError, ProjectCommandLeaseProvider};
 use crate::rpg_maker::project::ExistingProjectOpener;
-use crate::rpg_maker::project_lease::{ProjectCommandLeaseError, ProjectCommandLeaseProvider};
 
 /// 按固定业务顺序编排一次 RPG Maker 文本提取。
 ///
-/// 用例只打开一次项目，随后按 Builtin、Rules、Lua 执行被选择的阶段。首个失败会
+/// 用例只打开一次项目，随后按 Builtin、Rules 执行被选择的阶段。首个失败会
 /// 阻止后续阶段，已经成功提交的前序阶段不由本层做组合回滚。
-pub(crate) struct ExtractService<O, B, R, L, P> {
+pub(crate) struct ExtractService<O, B, R, P> {
     project_opener: O,
     built_in_extraction: Option<B>,
     selected_rules: Option<SelectedRules<R>>,
-    selected_lua: Option<SelectedLua<L>>,
-    removed_lua: Option<L>,
     project_lease: P,
     cancellation: CooperativeCancellation,
     progress: ExtractProgress,
 }
 
-impl<O, B, R, L, P> ExtractService<O, B, R, L, P> {
+impl<O, B, R, P> ExtractService<O, B, R, P> {
     pub(crate) fn new(
         project_opener: O,
         built_in_extraction: Option<B>,
         selected_rules: Option<SelectedRules<R>>,
-        selected_lua: Option<SelectedLua<L>>,
         project_lease: P,
         cancellation: CooperativeCancellation,
     ) -> Self {
@@ -40,22 +35,10 @@ impl<O, B, R, L, P> ExtractService<O, B, R, L, P> {
             project_opener,
             built_in_extraction,
             selected_rules,
-            selected_lua,
-            removed_lua: None,
             project_lease,
             cancellation,
             progress: ExtractProgress::default(),
         }
-    }
-
-    /// 显式 Extract 运行方案移除 Lua 时，绑定负责清除旧 Lua owner 的执行器。
-    pub(crate) fn with_removed_lua(mut self, lua: L) -> Self {
-        assert!(
-            self.selected_lua.is_none(),
-            "选择 Lua 程序与移除 Lua owner 互斥"
-        );
-        self.removed_lua = Some(lua);
-        self
     }
 
     /// 为本次 Extract 绑定同步、不可失败的业务进度观察者。
@@ -72,12 +55,11 @@ impl<O, B, R, L, P> ExtractService<O, B, R, L, P> {
     }
 }
 
-impl<O, B, R, L, P> ExtractService<O, B, R, L, P>
+impl<O, B, R, P> ExtractService<O, B, R, P>
 where
     O: ExistingProjectOpener,
     B: BuiltInExtraction,
     R: RulesExtraction,
-    L: LuaExtraction,
     P: ProjectCommandLeaseProvider,
 {
     pub(crate) async fn execute(
@@ -85,7 +67,7 @@ where
         input: ExtractInput,
     ) -> Result<
         OperationCompletion<ExtractOutput>,
-        ExtractServiceError<O::Error, B::Error, R::Error, L::Error, P::Error>,
+        ExtractServiceError<O::Error, B::Error, R::Error, P::Error>,
     > {
         if self.cancellation.is_requested() {
             return Ok(OperationCompletion::Cancelled);
@@ -109,8 +91,7 @@ where
         }
 
         let total_owners = u64::from(self.built_in_extraction.is_some() as u8)
-            + u64::from(self.selected_rules.is_some() as u8)
-            + u64::from((self.selected_lua.is_some() || self.removed_lua.is_some()) as u8);
+            + u64::from(self.selected_rules.is_some() as u8);
         let mut completed_owners = 0_u64;
 
         if let Some(built_in_extraction) = &self.built_in_extraction {
@@ -151,45 +132,6 @@ where
                 })?;
             completed_owners += 1;
             self.observe_owner(ExtractProgressPhase::Rules, completed_owners, total_owners);
-            if self.cancellation.is_requested() {
-                return Ok(OperationCompletion::Cancelled);
-            }
-        }
-
-        if let Some(selected_lua) = &self.selected_lua {
-            if self.cancellation.is_requested() {
-                return Ok(OperationCompletion::Cancelled);
-            }
-            self.observe_owner(ExtractProgressPhase::Lua, completed_owners, total_owners);
-            let error_path = selected_lua.script_path().to_path_buf();
-            let completion = selected_lua
-                .executor()
-                .run(
-                    &project,
-                    selected_lua.program().clone(),
-                    self.progress.clone(),
-                )
-                .await
-                .map_err(|source| ExtractServiceError::Lua {
-                    script_path: error_path,
-                    source,
-                })?;
-            let OperationCompletion::Completed(()) = completion else {
-                return Ok(OperationCompletion::Cancelled);
-            };
-            completed_owners += 1;
-            self.observe_owner(ExtractProgressPhase::Lua, completed_owners, total_owners);
-        } else if let Some(removed_lua) = &self.removed_lua {
-            if self.cancellation.is_requested() {
-                return Ok(OperationCompletion::Cancelled);
-            }
-            self.observe_owner(ExtractProgressPhase::Lua, completed_owners, total_owners);
-            removed_lua
-                .deactivate(&project, self.progress.clone())
-                .await
-                .map_err(ExtractServiceError::LuaDeactivation)?;
-            completed_owners += 1;
-            self.observe_owner(ExtractProgressPhase::Lua, completed_owners, total_owners);
         }
 
         if self.cancellation.is_requested() {
@@ -200,23 +142,20 @@ where
     }
 }
 
-/// 提取用例在四个直接依赖边界上遇到的阶段失败。
+/// 提取用例在直接依赖边界上遇到的阶段失败。
 #[derive(Debug)]
-pub(crate) enum ExtractServiceError<OE, BE, RE, LE, PE> {
+pub(crate) enum ExtractServiceError<OE, BE, RE, PE> {
     ProjectLease(ProjectCommandLeaseError<PE>),
     OpenProject(OE),
     BuiltIn(BE),
     Rules { rules_path: PathBuf, source: RE },
-    Lua { script_path: PathBuf, source: LE },
-    LuaDeactivation(LE),
 }
 
-impl<OE, BE, RE, LE, PE> fmt::Display for ExtractServiceError<OE, BE, RE, LE, PE>
+impl<OE, BE, RE, PE> fmt::Display for ExtractServiceError<OE, BE, RE, PE>
 where
     OE: Error,
     BE: Error,
     RE: Error,
-    LE: Error,
     PE: Error,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -227,27 +166,15 @@ where
             Self::Rules { rules_path, source } => {
                 write!(formatter, "规则提取失败 {}：{source}", rules_path.display())
             }
-            Self::Lua {
-                script_path,
-                source,
-            } => write!(
-                formatter,
-                "Lua 提取失败 {}：{source}",
-                script_path.display()
-            ),
-            Self::LuaDeactivation(source) => {
-                write!(formatter, "停用 Lua 提取 owner 失败：{source}")
-            }
         }
     }
 }
 
-impl<OE, BE, RE, LE, PE> Error for ExtractServiceError<OE, BE, RE, LE, PE>
+impl<OE, BE, RE, PE> Error for ExtractServiceError<OE, BE, RE, PE>
 where
     OE: Error + 'static,
     BE: Error + 'static,
     RE: Error + 'static,
-    LE: Error + 'static,
     PE: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
@@ -256,611 +183,6 @@ where
             Self::OpenProject(source) => Some(source),
             Self::BuiltIn(source) => Some(source),
             Self::Rules { source, .. } => Some(source),
-            Self::Lua { source, .. } => Some(source),
-            Self::LuaDeactivation(source) => Some(source),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::{Arc, Mutex};
-
-    use super::*;
-    use crate::progress::{ProgressObserver, ProgressSnapshot};
-    use crate::rpg_maker::ProjectName;
-    use crate::rpg_maker::project::OpenedProject;
-
-    #[derive(Clone, Default)]
-    struct RecordingProgress(Arc<Mutex<Vec<ProgressSnapshot<ExtractProgressPhase>>>>);
-
-    impl ProgressObserver<ExtractProgressPhase> for RecordingProgress {
-        fn observe(&self, snapshot: ProgressSnapshot<ExtractProgressPhase>) {
-            self.0.lock().expect("进度记录锁不应中毒").push(snapshot);
-        }
-    }
-
-    impl RecordingProgress {
-        fn snapshots(&self) -> Vec<ProgressSnapshot<ExtractProgressPhase>> {
-            self.0.lock().expect("进度记录锁不应中毒").clone()
-        }
-    }
-
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    enum Event {
-        Lease,
-        Open,
-        BuiltIn,
-        Rules(PathBuf),
-        Lua(PathBuf),
-    }
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    struct FakeError(&'static str);
-
-    impl fmt::Display for FakeError {
-        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str(self.0)
-        }
-    }
-
-    impl Error for FakeError {}
-
-    #[derive(Clone)]
-    struct FakeLeaseProvider {
-        events: Arc<Mutex<Vec<Event>>>,
-        fail: bool,
-    }
-
-    impl ProjectCommandLeaseProvider for FakeLeaseProvider {
-        type Error = FakeError;
-        type LeaseState = ();
-
-        async fn acquire(
-            &self,
-            _: &ProjectName,
-        ) -> Result<
-            crate::rpg_maker::project_lease::ProjectCommandLease<Self::LeaseState>,
-            ProjectCommandLeaseError<Self::Error>,
-        > {
-            self.events
-                .lock()
-                .expect("事件锁不应中毒")
-                .push(Event::Lease);
-            if self.fail {
-                Err(ProjectCommandLeaseError::Unavailable {
-                    project: project_name(),
-                    source: FakeError("lease"),
-                })
-            } else {
-                Ok(crate::rpg_maker::project_lease::ProjectCommandLease::for_test(()))
-            }
-        }
-    }
-
-    #[derive(Clone)]
-    struct FakeOpener {
-        events: Arc<Mutex<Vec<Event>>>,
-        fail: bool,
-        cancel: Option<CooperativeCancellation>,
-    }
-
-    impl ExistingProjectOpener for FakeOpener {
-        type Error = FakeError;
-
-        async fn open(&self, _: &ProjectName) -> Result<OpenedProject, Self::Error> {
-            self.events
-                .lock()
-                .expect("事件锁不应中毒")
-                .push(Event::Open);
-            if let Some(cancellation) = &self.cancel {
-                cancellation.request();
-            }
-            if self.fail {
-                return Err(FakeError("open"));
-            }
-            Ok(opened_project())
-        }
-    }
-
-    #[derive(Clone)]
-    struct FakeBuiltIn {
-        events: Arc<Mutex<Vec<Event>>>,
-        fail: bool,
-    }
-
-    impl BuiltInExtraction for FakeBuiltIn {
-        type Error = FakeError;
-
-        async fn refresh(&self, _: &OpenedProject, _: ExtractProgress) -> Result<(), Self::Error> {
-            self.events
-                .lock()
-                .expect("事件锁不应中毒")
-                .push(Event::BuiltIn);
-            if self.fail {
-                Err(FakeError("builtin"))
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    #[derive(Clone)]
-    struct FakeRules {
-        events: Arc<Mutex<Vec<Event>>>,
-        fail: bool,
-    }
-
-    impl RulesExtraction for FakeRules {
-        type Error = FakeError;
-
-        async fn replace(
-            &self,
-            _: &OpenedProject,
-            program: crate::rpg_maker::extract::rules::RulesProgram,
-            _: ExtractProgress,
-        ) -> Result<(), Self::Error> {
-            self.events
-                .lock()
-                .expect("事件锁不应中毒")
-                .push(Event::Rules(program.diagnostic_path().to_path_buf()));
-            if self.fail {
-                Err(FakeError("rules"))
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    #[derive(Clone)]
-    struct FakeLua {
-        events: Arc<Mutex<Vec<Event>>>,
-        fail: bool,
-        cancelled: bool,
-    }
-
-    impl LuaExtraction for FakeLua {
-        type Error = FakeError;
-
-        async fn run(
-            &self,
-            _: &OpenedProject,
-            program: crate::rpg_maker::lua::runtime::OwnedLuaProgram,
-            _: ExtractProgress,
-        ) -> Result<OperationCompletion<()>, Self::Error> {
-            self.events
-                .lock()
-                .expect("事件锁不应中毒")
-                .push(Event::Lua(program.main_script_path().to_path_buf()));
-            if self.fail {
-                Err(FakeError("lua"))
-            } else if self.cancelled {
-                Ok(OperationCompletion::Cancelled)
-            } else {
-                Ok(OperationCompletion::Completed(()))
-            }
-        }
-
-        async fn deactivate(
-            &self,
-            _: &OpenedProject,
-            _: ExtractProgress,
-        ) -> Result<(), Self::Error> {
-            self.events
-                .lock()
-                .expect("事件锁不应中毒")
-                .push(Event::Lua(PathBuf::from("<removed>")));
-            if self.fail {
-                Err(FakeError("lua"))
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    type Service = ExtractService<FakeOpener, FakeBuiltIn, FakeRules, FakeLua, FakeLeaseProvider>;
-
-    fn service(
-        events: Arc<Mutex<Vec<Event>>>,
-        failing_stage: Option<&str>,
-        builtin: bool,
-        rules_path: Option<&str>,
-        lua_script: Option<&str>,
-    ) -> Service {
-        ExtractService::new(
-            FakeOpener {
-                events: Arc::clone(&events),
-                fail: failing_stage == Some("open"),
-                cancel: None,
-            },
-            builtin.then(|| FakeBuiltIn {
-                events: Arc::clone(&events),
-                fail: failing_stage == Some("builtin"),
-            }),
-            rules_path.map(|path| {
-                SelectedRules::new(
-                    rules_program(path),
-                    FakeRules {
-                        events: Arc::clone(&events),
-                        fail: failing_stage == Some("rules"),
-                    },
-                )
-            }),
-            lua_script.map(|path| {
-                SelectedLua::new(
-                    lua_program(path),
-                    FakeLua {
-                        events: Arc::clone(&events),
-                        fail: failing_stage == Some("lua"),
-                        cancelled: failing_stage == Some("cancel-lua"),
-                    },
-                )
-            }),
-            FakeLeaseProvider {
-                events,
-                fail: failing_stage == Some("lease"),
-            },
-            CooperativeCancellation::default(),
-        )
-    }
-
-    fn opened_project() -> OpenedProject {
-        OpenedProject::new(
-            project_name(),
-            PathBuf::from("C:/projects/alice"),
-            PathBuf::from("C:/projects/alice/project.db"),
-            "ja".to_owned(),
-            "zh-CN".to_owned(),
-            crate::rpg_maker::project::test_layout_profile(),
-        )
-    }
-
-    fn project_name() -> ProjectName {
-        "alice".parse().expect("项目名应合法")
-    }
-
-    fn rules_program(path: &str) -> crate::rpg_maker::extract::rules::RulesProgram {
-        crate::rpg_maker::extract::rules::RulesProgram::from_toml(
-            PathBuf::from(path),
-            b"rule = []".to_vec(),
-        )
-        .expect("测试 Rules 程序应合法")
-    }
-
-    fn lua_program(path: &str) -> crate::rpg_maker::lua::runtime::OwnedLuaProgram {
-        crate::rpg_maker::lua::runtime::OwnedLuaProgram::new(
-            PathBuf::from(path),
-            b"return nil".to_vec(),
-        )
-    }
-
-    #[tokio::test]
-    async fn cancellation_after_open_prevents_every_extraction_stage() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let cancellation = CooperativeCancellation::default();
-        let service = ExtractService::new(
-            FakeOpener {
-                events: Arc::clone(&events),
-                fail: false,
-                cancel: Some(cancellation.clone()),
-            },
-            Some(FakeBuiltIn {
-                events: Arc::clone(&events),
-                fail: false,
-            }),
-            Some(SelectedRules::new(
-                rules_program("rules.toml"),
-                FakeRules {
-                    events: Arc::clone(&events),
-                    fail: false,
-                },
-            )),
-            Some(SelectedLua::new(
-                lua_program("translate.lua"),
-                FakeLua {
-                    events: Arc::clone(&events),
-                    fail: false,
-                    cancelled: false,
-                },
-            )),
-            FakeLeaseProvider {
-                events: Arc::clone(&events),
-                fail: false,
-            },
-            cancellation,
-        );
-
-        let completion = service.execute(input()).await.expect("取消是正常结果");
-
-        assert_eq!(completion, OperationCompletion::Cancelled);
-        assert_eq!(
-            *events.lock().expect("事件锁不应中毒"),
-            [Event::Lease, Event::Open]
-        );
-    }
-
-    fn input() -> ExtractInput {
-        ExtractInput {
-            name: project_name(),
-        }
-    }
-
-    fn events(events: &Arc<Mutex<Vec<Event>>>) -> Vec<Event> {
-        events.lock().expect("事件锁不应中毒").clone()
-    }
-
-    #[tokio::test]
-    async fn always_dispatches_selected_stages_in_business_order() {
-        let recorded = Arc::new(Mutex::new(Vec::new()));
-        let service = service(
-            Arc::clone(&recorded),
-            None,
-            true,
-            Some("rules.toml"),
-            Some("extract.lua"),
-        );
-
-        let output = service.execute(input()).await.expect("组合提取应该成功");
-
-        assert_eq!(
-            output,
-            OperationCompletion::Completed(ExtractOutput {
-                name: project_name()
-            })
-        );
-        assert_eq!(
-            events(&recorded),
-            vec![
-                Event::Lease,
-                Event::Open,
-                Event::BuiltIn,
-                Event::Rules(PathBuf::from("rules.toml")),
-                Event::Lua(PathBuf::from("extract.lua")),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn owner_progress_uses_absolute_monotonic_snapshots() {
-        let recorded = Arc::new(Mutex::new(Vec::new()));
-        let progress = RecordingProgress::default();
-        let service = service(
-            recorded,
-            None,
-            true,
-            Some("rules.toml"),
-            Some("extract.lua"),
-        )
-        .with_progress(progress.clone());
-
-        service.execute(input()).await.expect("组合提取应该成功");
-
-        assert_eq!(
-            progress.snapshots(),
-            vec![
-                ProgressSnapshot::determinate(ExtractProgressPhase::Builtin, 0, 3),
-                ProgressSnapshot::determinate(ExtractProgressPhase::Builtin, 1, 3),
-                ProgressSnapshot::determinate(ExtractProgressPhase::Rules, 1, 3),
-                ProgressSnapshot::determinate(ExtractProgressPhase::Rules, 2, 3),
-                ProgressSnapshot::determinate(ExtractProgressPhase::Lua, 2, 3),
-                ProgressSnapshot::determinate(ExtractProgressPhase::Lua, 3, 3),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_or_cancelled_owner_never_reports_completion() {
-        for (failure, expected) in [
-            (
-                "rules",
-                vec![
-                    ProgressSnapshot::determinate(ExtractProgressPhase::Builtin, 0, 3),
-                    ProgressSnapshot::determinate(ExtractProgressPhase::Builtin, 1, 3),
-                    ProgressSnapshot::determinate(ExtractProgressPhase::Rules, 1, 3),
-                ],
-            ),
-            (
-                "cancel-lua",
-                vec![ProgressSnapshot::determinate(
-                    ExtractProgressPhase::Lua,
-                    0,
-                    1,
-                )],
-            ),
-        ] {
-            let progress = RecordingProgress::default();
-            let service = if failure == "rules" {
-                service(
-                    Arc::new(Mutex::new(Vec::new())),
-                    Some(failure),
-                    true,
-                    Some("rules.toml"),
-                    Some("extract.lua"),
-                )
-            } else {
-                service(
-                    Arc::new(Mutex::new(Vec::new())),
-                    Some(failure),
-                    false,
-                    None,
-                    Some("extract.lua"),
-                )
-            }
-            .with_progress(progress.clone());
-
-            let _ = service.execute(input()).await;
-
-            assert_eq!(progress.snapshots(), expected);
-        }
-    }
-
-    #[tokio::test]
-    async fn each_stage_can_be_selected_on_its_own() {
-        let cases = [
-            (true, None, None, Event::BuiltIn),
-            (
-                false,
-                Some("rules.toml"),
-                None,
-                Event::Rules(PathBuf::from("rules.toml")),
-            ),
-            (
-                false,
-                None,
-                Some("extract.lua"),
-                Event::Lua(PathBuf::from("extract.lua")),
-            ),
-        ];
-
-        for (builtin, rules, lua, expected) in cases {
-            let recorded = Arc::new(Mutex::new(Vec::new()));
-            service(Arc::clone(&recorded), None, builtin, rules, lua)
-                .execute(input())
-                .await
-                .expect("单阶段提取应该成功");
-            assert_eq!(events(&recorded), vec![Event::Lease, Event::Open, expected]);
-        }
-    }
-
-    #[tokio::test]
-    async fn removing_lua_from_an_explicit_plan_deactivates_its_owner() {
-        let recorded = Arc::new(Mutex::new(Vec::new()));
-        let service =
-            service(Arc::clone(&recorded), None, true, None, None).with_removed_lua(FakeLua {
-                events: Arc::clone(&recorded),
-                fail: false,
-                cancelled: false,
-            });
-
-        service
-            .execute(input())
-            .await
-            .expect("移除 Lua 应清除旧 owner");
-
-        assert_eq!(
-            events(&recorded),
-            vec![
-                Event::Lease,
-                Event::Open,
-                Event::BuiltIn,
-                Event::Lua(PathBuf::from("<removed>")),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn lua_cancellation_is_the_normal_top_level_completion() {
-        let recorded = Arc::new(Mutex::new(Vec::new()));
-
-        let completion = service(
-            Arc::clone(&recorded),
-            Some("cancel-lua"),
-            false,
-            None,
-            Some("extract.lua"),
-        )
-        .execute(input())
-        .await
-        .expect("Lua 取消应作为正常结果传播");
-
-        assert_eq!(completion, OperationCompletion::Cancelled);
-        assert_eq!(
-            events(&recorded),
-            vec![
-                Event::Lease,
-                Event::Open,
-                Event::Lua(PathBuf::from("extract.lua")),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn the_first_failure_stops_all_later_stages() {
-        let cases = [
-            ("lease", vec![Event::Lease]),
-            ("open", vec![Event::Lease, Event::Open]),
-            ("builtin", vec![Event::Lease, Event::Open, Event::BuiltIn]),
-            (
-                "rules",
-                vec![
-                    Event::Lease,
-                    Event::Open,
-                    Event::BuiltIn,
-                    Event::Rules(PathBuf::from("rules.toml")),
-                ],
-            ),
-            (
-                "lua",
-                vec![
-                    Event::Lease,
-                    Event::Open,
-                    Event::BuiltIn,
-                    Event::Rules(PathBuf::from("rules.toml")),
-                    Event::Lua(PathBuf::from("extract.lua")),
-                ],
-            ),
-        ];
-
-        for (stage, expected) in cases {
-            let recorded = Arc::new(Mutex::new(Vec::new()));
-            service(
-                Arc::clone(&recorded),
-                Some(stage),
-                true,
-                Some("rules.toml"),
-                Some("extract.lua"),
-            )
-            .execute(input())
-            .await
-            .expect_err("指定阶段应该失败");
-            assert_eq!(events(&recorded), expected);
-        }
-    }
-
-    #[tokio::test]
-    async fn rules_and_lua_errors_keep_their_file_paths_and_sources() {
-        let recorded = Arc::new(Mutex::new(Vec::new()));
-        let rules_error = service(
-            Arc::clone(&recorded),
-            Some("rules"),
-            false,
-            Some("custom/rules.toml"),
-            None,
-        )
-        .execute(input())
-        .await
-        .expect_err("Rules 应该失败");
-        assert!(matches!(
-            &rules_error,
-            ExtractServiceError::Rules {
-                rules_path,
-                source: FakeError("rules")
-            } if rules_path == &PathBuf::from("custom/rules.toml")
-        ));
-        let lua_error = service(
-            Arc::new(Mutex::new(Vec::new())),
-            Some("lua"),
-            false,
-            None,
-            Some("scripts/extract.lua"),
-        )
-        .execute(input())
-        .await
-        .expect_err("Lua 应该失败");
-        assert!(matches!(
-            &lua_error,
-            ExtractServiceError::Lua {
-                script_path,
-                source: FakeError("lua")
-            } if script_path == &PathBuf::from("scripts/extract.lua")
-        ));
-    }
-
-    #[test]
-    fn execution_future_is_send() {
-        fn assert_send<T: Send>(_: T) {}
-
-        let service = service(Arc::new(Mutex::new(Vec::new())), None, true, None, None);
-        assert_send(service.execute(input()));
     }
 }

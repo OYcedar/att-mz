@@ -4,11 +4,10 @@
 
 `OpenAiChatCompletionExecutor` 按所选 Client 执行非流式请求，拥有共享 HTTP 连接池、
 Client 活动请求许可、可选 RPM limiter、连接/读取/完整请求超时和实际 HTTP 协议。
-Standard、Managed 与低级 Translate Lua 共享同一 Client 约束。
+MV、MZ 与 Generic Translate 共享同一 Client 约束。
 
-运行根只执行请求并返回结构化传输事实；Standard/Managed TaskBlock、Lua 私有业务、
-逐 ID 验收、数据库提交状态和高级任务记录均由各自语义所有者负责。Standard 与 Managed
-的高级任务记录由 RPG Maker 顺序最终化边界拥有；低级 `ctx.llm` 不生成该记录。
+运行根只执行请求并返回结构化传输事实；TaskBlock、引擎 value 形状、逐 ID 验收、数据库
+提交状态和任务记录由相应翻译域负责。独立 Lua 不使用运行根。
 
 只有 Client 的 `max_concurrent_requests` 和可选 `rate_limit` 控制请求。没有第二层用户队列、
 总容量或本地准入截止时间；等待活动许可或 RPM 时只响应取消/shutdown，不算模型失败或
@@ -42,14 +41,14 @@ HTTP 200 后要求：
 - 该 choice 的 `message.content` 与 `finish_reason` 是字符串。
 
 其他 choice 和未消费供应商扩展字段忽略。`x-request-id`、正文 `id` 与 `usage` 使用宽松
-可选读取；缺失或类型不符时为 `None`，互不补位。模型 `message.content` 仍由 RPG Maker
-层执行完整 ID、数组形状、ATT token、语言和逐 ID 验收。
+可选读取；缺失或类型不符时为 `None`，互不补位。模型 `message.content` 仍由对应引擎
+执行完整 ID、value 形状、ATT token、语言和逐 ID 验收。
 
 ## 4. 失败与重试
 
 Retryable 包含 DNS/连接/发送/读取/完整请求超时或中断，以及 HTTP 408、429、500、502、
 503、504。`Retry-After` 支持秒数和 HTTP-date，并受 Client `max_retry_after_ms` 约束。
-Standard 与 Managed 按 Client `retry_delays_ms` 执行有限重试；本地等待不消耗重试次数。
+Translate 按 Client `retry_delays_ms` 执行有限重试；本地等待不消耗重试次数。
 运行根向调用方提供 HTTP 状态、供应商稳定 code/type、`Retry-After` 和结构化原因，
 使调用方能把多次逻辑 attempt 汇总到同一任务记录；它不提供原始 Header 或任意
 非 200 wire body。
@@ -86,4 +85,4 @@ Provider 正文和普通用户内容不因内容类别成为敏感信息。任�
 二次处理。配置中的 API key 字段本身完全不进入任务记录；任务记录不采集 Header、
 Provider 外层信封或非 200 原始 body。`Authorization` 是字段与认证方案，不是另一类
 敏感信息；诊断需要说明认证事实时只保留字段名和方案。任务记录的其余格式契约见
-[翻译任务记录现行规格](../rpg-maker/task-records.md)。
+[模型任务记录现行规格](../translation/task-records.md)。

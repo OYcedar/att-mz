@@ -9,9 +9,6 @@ use std::sync::{Arc, Mutex};
 
 use super::builtin::BuiltInExtractionService;
 use super::document::{RpgMakerDocumentReadingConfig, RpgMakerProjectDocumentReadingService};
-use super::lua::{
-    LuaExtractionService, LuaInvocation, TrustedLuaExecutionHost, TrustedLuaExecutionOutcome,
-};
 use super::rules::RulesExtractionService;
 use super::service::ExtractService;
 use super::store::asset_store::RpgMakerExtractionAssetStore;
@@ -19,13 +16,13 @@ use super::{ExtractInput, SelectedRules};
 use crate::execution::OperationCompletion;
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::fingerprint::Sha256Fingerprint;
+use crate::project_lease::{
+    ProjectCommandLease, ProjectCommandLeaseError, ProjectCommandLeaseProvider,
+};
+use crate::project_name::ProjectName;
 use crate::rpg_maker::RpgMakerLayout;
 use crate::rpg_maker::project::ExistingProjectOpeningService;
 use crate::rpg_maker::project_database::ProjectDatabaseRecordReadingService;
-use crate::rpg_maker::project_lease::{
-    ProjectCommandLease, ProjectCommandLeaseError, ProjectCommandLeaseProvider,
-};
-use crate::rpg_maker::{ProjectName, SelectedLua};
 use crate::storage::file_system::{
     DirectoryEntry, DirectoryLister, DirectoryTreeFingerprintError,
     DirectoryTreeFingerprintRequest, DirectoryTreeFingerprinter, ExistingDirectoryResolver,
@@ -67,7 +64,6 @@ impl ProjectCommandLeaseProvider for FakeProjectLease {
 enum Event {
     BuiltinTransaction,
     RulesTransaction,
-    Lua,
 }
 
 #[derive(Clone)]
@@ -282,16 +278,16 @@ impl SqliteQueryExecutor for FakeSqliteTransactionExecutor {
         _: PathBuf,
         query: SqliteQuery,
     ) -> Result<Vec<SqliteRow>, QueryExistingDatabaseError<Self::Error>> {
-        if query.statement().contains("standard_project_definition") {
+        if query.statement().contains("rpg_maker_project_definition") {
             return Ok(vec![SqliteRow::new(vec![SqliteValue::Text(
                 r#"{"rules":[]}"#.to_owned(),
             )])]);
         }
         assert!(
-            query.statement().contains("standard_asset_owner_state")
-                || query.statement().contains("standard_text_group")
-                || query.statement().contains("standard_text_unit")
-                || query.statement().contains("standard_mutation_claim"),
+            query.statement().contains("rpg_maker_asset_owner_state")
+                || query.statement().contains("rpg_maker_text_group")
+                || query.statement().contains("rpg_maker_text_unit")
+                || query.statement().contains("rpg_maker_mutation_claim"),
             "Store 只应读取当前 owner 快照或新鲜 owner"
         );
         Ok(Vec::new())
@@ -319,7 +315,7 @@ fn transaction_owner(plan: &SqliteTransactionPlan) -> &str {
             };
             if !command
                 .statement()
-                .starts_with("INSERT INTO standard_asset_owner_state")
+                .starts_with("INSERT INTO rpg_maker_asset_owner_state")
             {
                 return None;
             }
@@ -331,51 +327,13 @@ fn transaction_owner(plan: &SqliteTransactionPlan) -> &str {
         .expect("资产事务必须明确快照所有者")
 }
 
-#[derive(Clone)]
-struct FakeTrustedLuaExecutionHost {
-    events: Arc<Mutex<Vec<Event>>>,
-    invocations: Arc<Mutex<Vec<RecordedLuaInvocation>>>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct RecordedLuaInvocation {
-    script_path: PathBuf,
-    project: crate::rpg_maker::lua::LuaProjectContext,
-}
-
-impl TrustedLuaExecutionHost for FakeTrustedLuaExecutionHost {
-    type TranslationClient = ();
-    type Error = FakeRootError;
-
-    async fn execute(
-        &self,
-        invocation: LuaInvocation<Self::TranslationClient>,
-    ) -> Result<OperationCompletion<TrustedLuaExecutionOutcome>, Self::Error> {
-        self.events.lock().expect("事件锁不应中毒").push(Event::Lua);
-        let LuaInvocation::Extract { program, project } = invocation else {
-            panic!("Extract 完整树不应提交 Translate Lua 调用")
-        };
-        self.invocations
-            .lock()
-            .expect("Lua 调用锁不应中毒")
-            .push(RecordedLuaInvocation {
-                script_path: program.main_script_path().to_path_buf(),
-                project,
-            });
-        Ok(OperationCompletion::Completed(
-            TrustedLuaExecutionOutcome::Empty,
-        ))
-    }
-}
-
 #[tokio::test]
-async fn eight_root_fakes_drive_the_complete_non_root_extract_tree() {
+async fn root_fakes_drive_the_complete_non_root_extract_tree() {
     let query_count = Arc::new(AtomicUsize::new(0));
     let cpu_executions = Arc::new(AtomicUsize::new(0));
     let file_max_active = Arc::new(AtomicUsize::new(0));
     let cpu_max_active = Arc::new(AtomicUsize::new(0));
     let events = Arc::new(Mutex::new(Vec::new()));
-    let lua_invocations = Arc::new(Mutex::new(Vec::new()));
     let fail_owner = Arc::new(Mutex::new(None));
 
     let file_reader = FakeFileReader {
@@ -426,13 +384,6 @@ async fn eight_root_fakes_drive_the_complete_non_root_extract_tree() {
         RpgMakerExtractionAssetStore::new(sqlite_transactions.clone(), cpu.clone()),
         cpu.clone(),
     );
-    let lua = LuaExtractionService::new(
-        FakeTrustedLuaExecutionHost {
-            events: Arc::clone(&events),
-            invocations: Arc::clone(&lua_invocations),
-        },
-        RpgMakerExtractionAssetStore::new(sqlite_transactions, cpu.clone()),
-    );
     let extract = ExtractService::new(
         opener,
         Some(builtin),
@@ -448,13 +399,6 @@ path = '[].customRule'
             )
             .expect("测试 Rules 应合法"),
             rules,
-        )),
-        Some(SelectedLua::new(
-            crate::rpg_maker::lua::runtime::OwnedLuaProgram::new(
-                PathBuf::from("extract.lua"),
-                b"return nil".to_vec(),
-            ),
-            lua,
         )),
         FakeProjectLease,
         crate::execution::CooperativeCancellation::default(),
@@ -479,38 +423,20 @@ path = '[].customRule'
     assert_eq!(cpu_max_active.load(Ordering::SeqCst), 2);
     assert_eq!(
         events.lock().expect("事件锁不应中毒").as_slice(),
-        &[
-            Event::BuiltinTransaction,
-            Event::RulesTransaction,
-            Event::Lua,
-        ]
+        &[Event::BuiltinTransaction, Event::RulesTransaction]
     );
 
-    {
-        let invocations = lua_invocations.lock().expect("Lua 调用锁不应中毒");
-        assert_eq!(invocations.len(), 1);
-        assert_eq!(invocations[0].script_path, PathBuf::from("extract.lua"));
-        assert_eq!(invocations[0].project.name(), output.name.as_str());
-    }
-
     events.lock().expect("事件锁不应中毒").clear();
-    lua_invocations.lock().expect("Lua 调用锁不应中毒").clear();
     *fail_owner.lock().expect("SQLite 失败配置锁不应中毒") = Some("builtin".to_owned());
 
     extract
         .execute(ExtractInput { name })
         .await
-        .expect_err("Builtin 根事务失败必须停止 Rules 与 Lua");
+        .expect_err("Builtin 根事务失败必须停止 Rules");
 
     assert_eq!(
         events.lock().expect("事件锁不应中毒").as_slice(),
         &[Event::BuiltinTransaction]
-    );
-    assert!(
-        lua_invocations
-            .lock()
-            .expect("Lua 调用锁不应中毒")
-            .is_empty()
     );
 }
 

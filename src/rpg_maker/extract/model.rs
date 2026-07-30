@@ -1,4 +1,4 @@
-//! RPG Maker 固定提取、规则提取与 Lua 提取共用的语义文本快照。
+//! RPG Maker 固定提取与规则提取共用的语义文本快照。
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
@@ -24,7 +24,7 @@ pub(crate) struct ExtractedTextUnit {
 }
 
 impl ExtractedTextUnit {
-    /// 为 Builtin、规则或 Lua 的普通单值字段建立标量单元。
+    /// 为 Builtin 或规则的普通单值字段建立标量单元。
     pub(crate) fn new(
         field_name: impl Into<String>,
         projection_location: RpgMakerLocation,
@@ -36,23 +36,6 @@ impl ExtractedTextUnit {
         Self::projected(
             role,
             projection_location,
-            TextUnitContent::Value(original_text.into()),
-        )
-    }
-
-    pub(crate) fn new_with_claim(
-        field_name: impl Into<String>,
-        projection_location: RpgMakerLocation,
-        mutation_claim: MutationClaim,
-        original_text: impl Into<String>,
-    ) -> Result<Self, SnapshotModelError> {
-        let role = ScalarFieldKey::new(field_name)
-            .map(TextUnitRole::Scalar)
-            .map_err(SnapshotModelError::Projection)?;
-        Self::projected_with_claim(
-            role,
-            projection_location,
-            mutation_claim,
             TextUnitContent::Value(original_text.into()),
         )
     }
@@ -118,7 +101,7 @@ pub(crate) struct ExtractedTextGroup {
 }
 
 impl ExtractedTextGroup {
-    /// 为一个单值单元对应一个物理目标的 Builtin、规则或 Lua 组建立直接配方。
+    /// 为一个单值单元对应一个物理目标的 Builtin 或规则组建立直接配方。
     pub(crate) fn new(
         kind: TextGroupKind,
         group_location: RpgMakerLocation,
@@ -291,11 +274,11 @@ fn validate_line_references(
     Ok(())
 }
 
-/// 一个标准资产 owner 拥有的完整当前快照。
+/// 一个 RPG Maker 资产 owner 拥有的完整当前快照。
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StandardAssetSnapshot(Vec<ExtractedTextGroup>);
+pub(crate) struct RpgMakerAssetSnapshot(Vec<ExtractedTextGroup>);
 
-impl StandardAssetSnapshot {
+impl RpgMakerAssetSnapshot {
     pub(crate) fn new(groups: Vec<ExtractedTextGroup>) -> Result<Self, SnapshotModelError> {
         normalize_groups(groups).map(Self)
     }
@@ -311,11 +294,11 @@ impl StandardAssetSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BuiltinSnapshot(StandardAssetSnapshot);
+pub(crate) struct BuiltinSnapshot(RpgMakerAssetSnapshot);
 
 impl BuiltinSnapshot {
     pub(crate) fn new(groups: Vec<ExtractedTextGroup>) -> Result<Self, SnapshotModelError> {
-        StandardAssetSnapshot::new(groups).map(Self)
+        RpgMakerAssetSnapshot::new(groups).map(Self)
     }
 
     #[cfg(test)]
@@ -329,39 +312,16 @@ impl BuiltinSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RulesSnapshot(StandardAssetSnapshot);
+pub(crate) struct RulesSnapshot(RpgMakerAssetSnapshot);
 
 impl RulesSnapshot {
     pub(crate) fn new(groups: Vec<ExtractedTextGroup>) -> Result<Self, SnapshotModelError> {
-        StandardAssetSnapshot::new(groups).map(Self)
+        RpgMakerAssetSnapshot::new(groups).map(Self)
     }
 
     #[cfg(test)]
     pub(crate) fn empty() -> Self {
-        Self(StandardAssetSnapshot(Vec::new()))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn groups(&self) -> &[ExtractedTextGroup] {
-        self.0.groups()
-    }
-
-    pub(crate) fn into_groups(self) -> Vec<ExtractedTextGroup> {
-        self.0.into_groups()
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct LuaSnapshot(StandardAssetSnapshot);
-
-impl LuaSnapshot {
-    pub(crate) fn new(groups: Vec<ExtractedTextGroup>) -> Result<Self, SnapshotModelError> {
-        StandardAssetSnapshot::new(groups).map(Self)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn empty() -> Self {
-        Self(StandardAssetSnapshot(Vec::new()))
+        Self(RpgMakerAssetSnapshot(Vec::new()))
     }
 
     #[cfg(test)]

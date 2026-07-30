@@ -757,7 +757,7 @@ mod tests {
     use super::*;
     use crate::execution::cpu::CpuTaskExecutionError;
     use crate::progress::{ProgressObserver, ProgressSnapshot};
-    use crate::rpg_maker::ProjectName;
+    use crate::project_name::ProjectName;
     use crate::rpg_maker::extract::document::RpgMakerProjectDocumentReadingError;
     use crate::rpg_maker::model::{
         DirectTextPart, DirectTextRecipe, TextProjectionRecipe, TextUnitRole,

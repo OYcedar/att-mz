@@ -39,10 +39,10 @@ minimum_copied_word_count = 2
 minimum_copied_letter_count = 4
 allowed_terms = []
 
-[rpg_maker]
+[translation]
 record_translation_tasks = true
 
-[[rpg_maker.translation_profiles]]
+[[translation.profiles]]
 id = "primary"
 llm_client = "primary"
 target_task_user_message_characters = 5090

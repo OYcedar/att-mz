@@ -25,8 +25,8 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use super::arguments::{
-    ExtractArguments, InitArguments, MvCommand, MzCommand, ProductCommand, ProjectLuaArguments,
-    TranslateArguments, WriteBackArguments,
+    ExtractArguments, GenericCommand, GenericInitArguments, InitArguments, MvCommand, MzCommand,
+    ProductCommand, ProjectLuaArguments, TranslateArguments, WriteBackArguments,
 };
 
 use crate::diagnostic::{
@@ -39,16 +39,16 @@ use crate::language::{
     JapaneseResidualPolicy, LanguageId, LanguageIdError, LanguageModule, LanguageModuleCatalog,
     LanguageModuleCatalogBuildError, LanguagePolicyConfigurationError, QuotePair,
 };
-use crate::rpg_maker::ProjectName;
+use crate::project_name::ProjectName;
+use crate::rpg_maker::RpgMakerLayout;
 use crate::rpg_maker::extract::document::RpgMakerDocumentReadingConfig;
-use crate::rpg_maker::translate::profile::RpgMakerTranslationRequestConfiguration;
-use crate::rpg_maker::{RpgMakerEngine, RpgMakerLayout};
 use crate::runtime::cpu::CpuExecutorConfig;
 use crate::runtime::filesystem::{DirectoryPublisherConfig, SystemFileSystemConfig};
 use crate::runtime::llm::{
     LlmProxyConfiguration, OpenAiChatCompletionClient, OpenAiExecutorConfiguration,
 };
 use crate::runtime::sqlite::RusqliteStorageConfiguration;
+use crate::translation::profile::TranslationRequestConfiguration;
 
 const RESERVED_REQUEST_BODY_FIELDS: [&str; 3] = ["model", "messages", "stream"];
 
@@ -118,17 +118,45 @@ pub(crate) fn load_product_configuration(
         .parent()
         .expect("规范绝对文件路径必须拥有父目录")
         .to_path_buf();
-    let (layout, command, dialogue_rules_path) = normalize_product_command(product);
-    ConfiguredRpgMakerCommand::build(
-        &configuration_path,
-        &configuration_directory,
-        source,
-        toml_index,
-        layout,
-        command,
-        dialogue_rules_path,
-    )
-    .map(|command| ConfiguredProductCommand { layout, command })
+    match product {
+        ProductCommand::Mz { command } => ConfiguredRpgMakerCommand::build(
+            &configuration_path,
+            &configuration_directory,
+            source,
+            toml_index,
+            RpgMakerLayout::MZ,
+            RpgMakerCommandArguments::from(command),
+            None,
+        )
+        .map(|command| ConfiguredProductCommand::RpgMaker {
+            layout: RpgMakerLayout::MZ,
+            command,
+        }),
+        ProductCommand::Mv { command } => {
+            let (command, dialogue_rules_path) = normalize_mv_command(command);
+            ConfiguredRpgMakerCommand::build(
+                &configuration_path,
+                &configuration_directory,
+                source,
+                toml_index,
+                RpgMakerLayout::MV,
+                command,
+                dialogue_rules_path,
+            )
+            .map(|command| ConfiguredProductCommand::RpgMaker {
+                layout: RpgMakerLayout::MV,
+                command,
+            })
+        }
+        ProductCommand::Generic { command } => ConfiguredGenericCommand::build(
+            &configuration_path,
+            &configuration_directory,
+            source,
+            toml_index,
+            command,
+        )
+        .map(ConfiguredProductCommand::Generic),
+    }
     .map_err(|error| error.with_configuration_path(&configuration_path))
 }
 
@@ -137,62 +165,36 @@ fn load_configuration(
     requested_path: &Path,
     command: MzCommand,
 ) -> Result<ConfiguredRpgMakerCommand, ConfigurationLoadError> {
-    load_product_configuration(requested_path, ProductCommand::Mz { command })
-        .map(|configured| configured.command)
+    load_product_configuration(requested_path, ProductCommand::Mz { command }).map(|configured| {
+        match configured {
+            ConfiguredProductCommand::RpgMaker { command, .. } => command,
+            ConfiguredProductCommand::Generic(_) => unreachable!("测试传入 MZ 命令"),
+        }
+    })
 }
 
-pub(crate) struct ConfiguredProductCommand {
-    layout: RpgMakerLayout,
-    command: ConfiguredRpgMakerCommand,
+pub(crate) enum ConfiguredProductCommand {
+    RpgMaker {
+        layout: RpgMakerLayout,
+        command: ConfiguredRpgMakerCommand,
+    },
+    Generic(ConfiguredGenericCommand),
 }
 
-impl ConfiguredProductCommand {
-    pub(crate) fn into_parts(self) -> (RpgMakerLayout, ConfiguredRpgMakerCommand) {
-        (self.layout, self.command)
-    }
-}
-
-fn normalize_product_command(
-    product: ProductCommand,
-) -> (RpgMakerLayout, RpgMakerCommandArguments, Option<PathBuf>) {
-    match product {
-        ProductCommand::Mz { command } => (
-            RpgMakerLayout::MZ,
-            RpgMakerCommandArguments::from(command),
-            None,
+fn normalize_mv_command(command: MvCommand) -> (RpgMakerCommandArguments, Option<PathBuf>) {
+    match command {
+        MvCommand::Init(arguments) => (RpgMakerCommandArguments::Init(arguments), None),
+        MvCommand::Extract(arguments) => (
+            RpgMakerCommandArguments::Extract(ExtractArguments {
+                project: arguments.project,
+                builtin: arguments.builtin,
+                rules: arguments.rules,
+            }),
+            arguments.dialogue_rules,
         ),
-        ProductCommand::Mv { command } => match command {
-            MvCommand::Init(arguments) => (
-                RpgMakerLayout::MV,
-                RpgMakerCommandArguments::Init(arguments),
-                None,
-            ),
-            MvCommand::Extract(arguments) => (
-                RpgMakerLayout::MV,
-                RpgMakerCommandArguments::Extract(ExtractArguments {
-                    project: arguments.project,
-                    builtin: arguments.builtin,
-                    rules: arguments.rules,
-                    lua: arguments.lua,
-                }),
-                arguments.dialogue_rules,
-            ),
-            MvCommand::Translate(arguments) => (
-                RpgMakerLayout::MV,
-                RpgMakerCommandArguments::Translate(arguments),
-                None,
-            ),
-            MvCommand::WriteBack(arguments) => (
-                RpgMakerLayout::MV,
-                RpgMakerCommandArguments::WriteBack(arguments),
-                None,
-            ),
-            MvCommand::Lua(arguments) => (
-                RpgMakerLayout::MV,
-                RpgMakerCommandArguments::Lua(arguments),
-                None,
-            ),
-        },
+        MvCommand::Translate(arguments) => (RpgMakerCommandArguments::Translate(arguments), None),
+        MvCommand::WriteBack(arguments) => (RpgMakerCommandArguments::WriteBack(arguments), None),
+        MvCommand::Lua(arguments) => (RpgMakerCommandArguments::Lua(arguments), None),
     }
 }
 
@@ -254,7 +256,7 @@ impl ConfiguredRpgMakerCommand {
                 )?;
                 let publisher = build_directory_publisher_configuration(
                     common.projects_root(),
-                    layout.engine(),
+                    layout.engine().storage_name(),
                 )
                 .map_err(ConfigurationLoadError::InvalidValue)?;
                 Ok(Self::Init(ConfiguredInitCommand {
@@ -275,15 +277,12 @@ impl ConfiguredRpgMakerCommand {
                     project,
                     builtin,
                     rules,
-                    lua,
                 } = arguments;
-                let lua = lua.map(SelectedLuaConfiguration::new);
                 let rpg_maker = ExtractConfiguration::build(builtin, rules);
                 Ok(Self::Extract(ConfiguredExtractCommand {
                     project_name: project.name,
                     common,
                     cpu,
-                    lua,
                     rpg_maker,
                     dialogue_rules_path,
                 }))
@@ -301,20 +300,18 @@ impl ConfiguredRpgMakerCommand {
                     ConfigurationSelection::Translate,
                 )?;
                 let cpu = build_cpu_configuration();
-                let record_translation_tasks = raw.rpg_maker.record_translation_tasks;
+                let record_translation_tasks = raw.translation.record_translation_tasks;
                 let TranslateArguments {
                     project,
                     profile_id,
                     terms,
                     placeholders,
-                    lua,
                 } = arguments;
-                let lua = lua.map(SelectedLuaConfiguration::new);
                 let rpg_maker = PendingTranslateConfiguration::build(
                     configuration_directory,
                     raw.prompts,
                     raw.languages,
-                    raw.rpg_maker,
+                    raw.translation,
                 )
                 .map_err(ConfigurationLoadError::InvalidValue)?;
                 let configured = ConfiguredTranslateCommand {
@@ -324,7 +321,6 @@ impl ConfiguredRpgMakerCommand {
                     placeholder_rules_path: placeholders,
                     common,
                     cpu,
-                    lua,
                     record_translation_tasks,
                     profile: ConfiguredTranslateProfile::Deferred {
                         source: deferred_source,
@@ -347,45 +343,221 @@ impl ConfiguredRpgMakerCommand {
                 let cpu = build_cpu_configuration();
                 let publisher = build_directory_publisher_configuration(
                     common.projects_root(),
-                    layout.engine(),
+                    layout.engine().storage_name(),
                 )
                 .map_err(ConfigurationLoadError::InvalidValue)?;
-                let WriteBackArguments { project, lua } = arguments;
-                let lua = lua.map(SelectedLuaConfiguration::new);
+                let WriteBackArguments { project } = arguments;
                 let rpg_maker = WriteBackConfiguration::build();
                 Ok(Self::WriteBack(ConfiguredWriteBackCommand {
                     project_name: project.name,
                     common,
                     cpu,
                     publisher,
-                    lua,
                     rpg_maker,
                 }))
             }
             RpgMakerCommandArguments::Lua(arguments) => {
+                let ProjectLuaArguments {
+                    project,
+                    script,
+                    arguments,
+                } = arguments;
+                Ok(Self::Lua(ConfiguredProjectLuaCommand {
+                    project_name: project.name,
+                    common,
+                    script: ConfiguredProjectLuaScript::new(script),
+                    arguments,
+                }))
+            }
+        }
+    }
+}
+
+/// Generic 命令已经完成配置读取后的进程输入。
+pub(crate) enum ConfiguredGenericCommand {
+    Init {
+        arguments: GenericInitArguments,
+        common: CommonCommandConfiguration,
+    },
+    Extract {
+        project_name: ProjectName,
+        common: CommonCommandConfiguration,
+    },
+    Translate(Box<ConfiguredTranslateCommand>),
+    WriteBack(ConfiguredGenericWriteBackCommand),
+    Lua(ConfiguredProjectLuaCommand),
+}
+
+impl ConfiguredGenericCommand {
+    fn build(
+        configuration_path: &Path,
+        configuration_directory: &Path,
+        source: &str,
+        toml_index: Arc<ConfigurationTomlIndex>,
+        command: GenericCommand,
+    ) -> Result<Self, ConfigurationLoadError> {
+        let raw_common: RawCommonConfiguration = parse_selected(
+            source,
+            configuration_path,
+            toml_index.as_ref(),
+            ConfigurationSelection::Common,
+        )?;
+        let common = CommonCommandConfiguration::build(configuration_directory, raw_common)
+            .map_err(ConfigurationLoadError::InvalidValue)?;
+
+        match command {
+            GenericCommand::Init(arguments) => {
+                let _: RawInitSelection = parse_selected(
+                    source,
+                    configuration_path,
+                    toml_index.as_ref(),
+                    ConfigurationSelection::NoAdditionalFields,
+                )?;
+                Ok(Self::Init { arguments, common })
+            }
+            GenericCommand::Extract(project) => {
+                let _: RawExtractSelection = parse_selected(
+                    source,
+                    configuration_path,
+                    toml_index.as_ref(),
+                    ConfigurationSelection::NoAdditionalFields,
+                )?;
+                Ok(Self::Extract {
+                    project_name: project.name,
+                    common,
+                })
+            }
+            GenericCommand::Translate(arguments) => {
                 let deferred_source = Arc::new(DeferredConfigurationSource::new(
                     configuration_path,
                     source,
                     Arc::clone(&toml_index),
                 ));
+                let raw: RawTranslateSelection = parse_selected(
+                    source,
+                    configuration_path,
+                    toml_index.as_ref(),
+                    ConfigurationSelection::Translate,
+                )?;
+                let record_translation_tasks = raw.translation.record_translation_tasks;
+                let TranslateArguments {
+                    project,
+                    profile_id,
+                    terms,
+                    placeholders,
+                } = arguments;
+                let translation = PendingTranslateConfiguration::build(
+                    configuration_directory,
+                    raw.prompts,
+                    raw.languages,
+                    raw.translation,
+                )
+                .map_err(ConfigurationLoadError::InvalidValue)?;
+                let configured = ConfiguredTranslateCommand {
+                    project_name: project.name,
+                    configuration_path: configuration_path.to_path_buf(),
+                    terminology_path: terms,
+                    placeholder_rules_path: placeholders,
+                    common,
+                    cpu: build_cpu_configuration(),
+                    record_translation_tasks,
+                    profile: ConfiguredTranslateProfile::Deferred {
+                        source: deferred_source,
+                        configuration: translation,
+                    },
+                };
+                let configured = match profile_id {
+                    Some(profile_id) => configured.resolve_profile(&profile_id)?,
+                    None => configured,
+                };
+                Ok(Self::Translate(Box::new(configured)))
+            }
+            GenericCommand::WriteBack(project) => {
+                let _: RawWriteBackSelection = parse_selected(
+                    source,
+                    configuration_path,
+                    toml_index.as_ref(),
+                    ConfigurationSelection::NoAdditionalFields,
+                )?;
+                let publisher =
+                    build_directory_publisher_configuration(common.projects_root(), "generic")
+                        .map_err(ConfigurationLoadError::InvalidValue)?;
+                Ok(Self::WriteBack(ConfiguredGenericWriteBackCommand {
+                    project_name: project.name,
+                    configuration_directory: configuration_directory.to_path_buf(),
+                    common,
+                    cpu: build_cpu_configuration(),
+                    publisher,
+                    source: Arc::new(DeferredConfigurationSource::new(
+                        configuration_path,
+                        source,
+                        Arc::clone(&toml_index),
+                    )),
+                }))
+            }
+            GenericCommand::Lua(arguments) => {
                 let ProjectLuaArguments {
                     project,
-                    profile,
                     script,
                     arguments,
                 } = arguments;
-                let standard_profile =
-                    ConfiguredProjectLuaStandardProfile::new(deferred_source, profile.as_deref())?;
                 Ok(Self::Lua(ConfiguredProjectLuaCommand {
                     project_name: project.name,
                     common,
-                    cpu: build_cpu_configuration(),
-                    lua: SelectedLuaConfiguration::new(script),
+                    script: ConfiguredProjectLuaScript::new(script),
                     arguments,
-                    standard_profile,
                 }))
             }
         }
+    }
+}
+
+/// Generic WriteBack 的基础配置；仅在存在自动译文时才解析翻译 Profile。
+pub(crate) struct ConfiguredGenericWriteBackCommand {
+    project_name: ProjectName,
+    configuration_directory: PathBuf,
+    common: CommonCommandConfiguration,
+    cpu: CpuExecutorConfig,
+    publisher: DirectoryPublisherConfig,
+    source: Arc<DeferredConfigurationSource>,
+}
+
+impl ConfiguredGenericWriteBackCommand {
+    pub(crate) const fn common(&self) -> &CommonCommandConfiguration {
+        &self.common
+    }
+
+    pub(crate) const fn project_name(&self) -> &ProjectName {
+        &self.project_name
+    }
+
+    pub(crate) const fn cpu(&self) -> CpuExecutorConfig {
+        self.cpu
+    }
+
+    pub(crate) const fn publisher(&self) -> &DirectoryPublisherConfig {
+        &self.publisher
+    }
+
+    pub(crate) fn resolve_translation(
+        &self,
+        profile_id: &str,
+    ) -> Result<TranslateConfiguration, ConfigurationLoadError> {
+        let raw: RawTranslateSelection = parse_selected(
+            self.source.source(),
+            self.source.path(),
+            self.source.toml_index(),
+            ConfigurationSelection::Translate,
+        )?;
+        PendingTranslateConfiguration::build(
+            &self.configuration_directory,
+            raw.prompts,
+            raw.languages,
+            raw.translation,
+        )
+        .map_err(ConfigurationLoadError::InvalidValue)
+        .map_err(|error| error.with_configuration_path(self.source.path()))?
+        .resolve(self.source.as_ref(), profile_id)
     }
 }
 
@@ -442,7 +614,6 @@ pub(crate) struct ConfiguredExtractCommand {
     project_name: ProjectName,
     common: CommonCommandConfiguration,
     cpu: CpuExecutorConfig,
-    lua: Option<SelectedLuaConfiguration>,
     rpg_maker: ExtractConfiguration,
     dialogue_rules_path: Option<PathBuf>,
 }
@@ -458,10 +629,6 @@ impl ConfiguredExtractCommand {
 
     pub(crate) const fn cpu(&self) -> CpuExecutorConfig {
         self.cpu
-    }
-
-    pub(crate) const fn lua(&self) -> Option<&SelectedLuaConfiguration> {
-        self.lua.as_ref()
     }
 
     pub(crate) const fn rpg_maker(&self) -> &ExtractConfiguration {
@@ -480,7 +647,6 @@ pub(crate) struct ConfiguredTranslateCommand {
     placeholder_rules_path: Option<PathBuf>,
     common: CommonCommandConfiguration,
     cpu: CpuExecutorConfig,
-    lua: Option<SelectedLuaConfiguration>,
     record_translation_tasks: bool,
     profile: ConfiguredTranslateProfile,
 }
@@ -515,11 +681,7 @@ impl ConfiguredTranslateCommand {
     }
 
     pub(crate) fn llm(&self) -> &SelectedLlmExecutorConfiguration {
-        self.rpg_maker().llm()
-    }
-
-    pub(crate) const fn lua(&self) -> Option<&SelectedLuaConfiguration> {
-        self.lua.as_ref()
+        self.translation().llm()
     }
 
     pub(crate) const fn record_translation_tasks(&self) -> bool {
@@ -556,7 +718,6 @@ impl ConfiguredTranslateCommand {
             placeholder_rules_path,
             common,
             cpu,
-            lua,
             record_translation_tasks,
             profile,
         } = self;
@@ -588,7 +749,6 @@ impl ConfiguredTranslateCommand {
             placeholder_rules_path,
             common,
             cpu,
-            lua,
             record_translation_tasks,
             profile,
         })
@@ -600,10 +760,10 @@ impl ConfiguredTranslateCommand {
 
     #[cfg(test)]
     pub(crate) fn client(&self) -> &Arc<OpenAiChatCompletionClient> {
-        self.rpg_maker().client()
+        self.translation().client()
     }
 
-    pub(crate) fn rpg_maker(&self) -> &TranslateConfiguration {
+    pub(crate) fn translation(&self) -> &TranslateConfiguration {
         match &self.profile {
             ConfiguredTranslateProfile::Deferred { .. } => {
                 panic!("Translate Profile 必须在业务装配前完成解析")
@@ -617,10 +777,8 @@ impl ConfiguredTranslateCommand {
 pub(crate) struct ConfiguredProjectLuaCommand {
     project_name: ProjectName,
     common: CommonCommandConfiguration,
-    cpu: CpuExecutorConfig,
-    lua: SelectedLuaConfiguration,
+    script: ConfiguredProjectLuaScript,
     arguments: Vec<String>,
-    standard_profile: ConfiguredProjectLuaStandardProfile,
 }
 
 impl ConfiguredProjectLuaCommand {
@@ -632,107 +790,13 @@ impl ConfiguredProjectLuaCommand {
         &self.project_name
     }
 
-    pub(crate) const fn cpu(&self) -> CpuExecutorConfig {
-        self.cpu
-    }
-
-    pub(crate) const fn lua(&self) -> &SelectedLuaConfiguration {
-        &self.lua
+    pub(crate) const fn script(&self) -> &ConfiguredProjectLuaScript {
+        &self.script
     }
 
     pub(crate) fn arguments(&self) -> &[String] {
         &self.arguments
     }
-
-    pub(crate) fn into_standard_profile(self) -> ConfiguredProjectLuaStandardProfile {
-        self.standard_profile
-    }
-}
-
-/// 项目 Lua 的 Standard Profile 选择；省略 Profile 时保留到 `ctx.standard.open()`。
-#[derive(Clone)]
-pub(crate) enum ConfiguredProjectLuaStandardProfile {
-    Deferred {
-        source: Arc<DeferredConfigurationSource>,
-    },
-    Resolved {
-        configuration_path: PathBuf,
-        configuration: Arc<TranslateConfiguration>,
-    },
-}
-
-impl ConfiguredProjectLuaStandardProfile {
-    fn new(
-        source: Arc<DeferredConfigurationSource>,
-        explicit_profile_id: Option<&str>,
-    ) -> Result<Self, ConfigurationLoadError> {
-        match explicit_profile_id {
-            Some(profile_id) => {
-                let configuration_path = source.path().to_path_buf();
-                resolve_project_lua_standard_profile(&source, profile_id).map(|configuration| {
-                    Self::Resolved {
-                        configuration_path,
-                        configuration: Arc::new(configuration),
-                    }
-                })
-            }
-            None => Ok(Self::Deferred { source }),
-        }
-    }
-
-    pub(crate) fn explicit_profile_id(&self) -> Option<&str> {
-        match self {
-            Self::Deferred { .. } => None,
-            Self::Resolved { configuration, .. } => Some(configuration.profile().id()),
-        }
-    }
-
-    /// 在 Standard 能力真正打开时精确解析显式或项目状态给出的 Profile。
-    pub(crate) fn resolve(
-        &self,
-        profile_id: &str,
-    ) -> Result<Arc<TranslateConfiguration>, ConfigurationLoadError> {
-        match self {
-            Self::Deferred { source } => {
-                resolve_project_lua_standard_profile(source.as_ref(), profile_id).map(Arc::new)
-            }
-            Self::Resolved { configuration, .. } if configuration.profile().id() == profile_id => {
-                Ok(Arc::clone(configuration))
-            }
-            Self::Resolved {
-                configuration_path,
-                configuration,
-            } => Err(ConfigurationLoadError::ProfileSelectionConflict {
-                path: configuration_path.clone(),
-                explicit_profile: configuration.profile().id().to_owned(),
-                requested_profile: profile_id.to_owned(),
-            }),
-        }
-    }
-}
-
-fn resolve_project_lua_standard_profile(
-    source: &DeferredConfigurationSource,
-    profile_id: &str,
-) -> Result<TranslateConfiguration, ConfigurationLoadError> {
-    validate_exact_identifier("Profile ID", profile_id)
-        .map_err(ConfigurationLoadError::InvalidValue)
-        .map_err(|error| error.with_configuration_path(source.path()))?;
-    let raw: RawTranslateSelection = parse_selected(
-        source.source(),
-        source.path(),
-        source.toml_index(),
-        ConfigurationSelection::Translate,
-    )?;
-    PendingTranslateConfiguration::build(
-        source.path().parent().expect("配置文件必须拥有父目录"),
-        raw.prompts,
-        raw.languages,
-        raw.rpg_maker,
-    )
-    .map_err(ConfigurationLoadError::InvalidValue)
-    .map_err(|error| error.with_configuration_path(source.path()))?
-    .resolve(source, profile_id)
 }
 
 pub(crate) struct ConfiguredWriteBackCommand {
@@ -740,7 +804,6 @@ pub(crate) struct ConfiguredWriteBackCommand {
     common: CommonCommandConfiguration,
     cpu: CpuExecutorConfig,
     publisher: DirectoryPublisherConfig,
-    lua: Option<SelectedLuaConfiguration>,
     rpg_maker: WriteBackConfiguration,
 }
 
@@ -761,10 +824,6 @@ impl ConfiguredWriteBackCommand {
         &self.publisher
     }
 
-    pub(crate) const fn lua(&self) -> Option<&SelectedLuaConfiguration> {
-        self.lua.as_ref()
-    }
-
     pub(crate) const fn rpg_maker(&self) -> &WriteBackConfiguration {
         &self.rpg_maker
     }
@@ -780,13 +839,13 @@ fn build_file_system_configuration() -> SystemFileSystemConfig {
 
 fn build_directory_publisher_configuration(
     projects_root: &Path,
-    engine: RpgMakerEngine,
+    engine_storage_name: &str,
 ) -> Result<DirectoryPublisherConfig, ConfigurationValueError> {
     DirectoryPublisherConfig::production(
         projects_root
             .join(".att-locks")
             .join("directory-publish")
-            .join(engine.storage_name()),
+            .join(engine_storage_name),
     )
     .map_err(|_| {
         invalid(
@@ -831,11 +890,11 @@ impl DeferredConfigurationSource {
     }
 }
 
-pub(crate) struct SelectedLuaConfiguration {
+pub(crate) struct ConfiguredProjectLuaScript {
     script_path: PathBuf,
 }
 
-impl SelectedLuaConfiguration {
+impl ConfiguredProjectLuaScript {
     fn new(script_path: PathBuf) -> Self {
         Self { script_path }
     }
@@ -917,7 +976,7 @@ struct PendingTranslateConfiguration {
     language_modules: LanguageModuleCatalog,
 }
 
-/// Prompt 资源语言由显式配置决定，或复用组合根已经解析的 UI locale。
+/// Prompt 资源语言由显式配置决定，或按项目目标语言选择。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PromptLocaleSelection {
     Auto,
@@ -925,20 +984,51 @@ pub(crate) enum PromptLocaleSelection {
 }
 
 impl PromptLocaleSelection {
-    pub(crate) const fn resolve(self, effective_ui_locale: UiLocale) -> UiLocale {
+    pub(crate) fn resolve(
+        self,
+        target_language: &LanguageId,
+    ) -> Result<UiLocale, PromptLocaleResolutionError> {
         match self {
-            Self::Auto => effective_ui_locale,
-            Self::Explicit(locale) => locale,
+            Self::Auto => UiLocale::match_automatic(target_language.as_str()).ok_or_else(|| {
+                PromptLocaleResolutionError {
+                    target_language: target_language.clone(),
+                }
+            }),
+            Self::Explicit(locale) => Ok(locale),
         }
     }
 }
+
+/// `auto` 无法把项目目标语言映射到现有 Prompt locale。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PromptLocaleResolutionError {
+    target_language: LanguageId,
+}
+
+impl PromptLocaleResolutionError {
+    pub(crate) fn target_language(&self) -> &LanguageId {
+        &self.target_language
+    }
+}
+
+impl fmt::Display for PromptLocaleResolutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "目标语言 {} 没有可自动选择的 Prompt locale；请显式设置 prompts.locale",
+            self.target_language
+        )
+    }
+}
+
+impl Error for PromptLocaleResolutionError {}
 
 impl PendingTranslateConfiguration {
     fn build(
         configuration_directory: &Path,
         raw_prompts: RawPromptsConfiguration,
         raw_languages: Vec<RawLanguageConfiguration>,
-        _raw: RawTranslateRpgMakerSelection,
+        _raw: RawTranslationSelection,
     ) -> Result<Self, ConfigurationValueError> {
         let prompt_locale = if raw_prompts.locale == "auto" {
             PromptLocaleSelection::Auto
@@ -986,7 +1076,7 @@ impl PendingTranslateConfiguration {
         .map_err(ConfigurationLoadError::InvalidValue)
         .map_err(|error| error.with_configuration_path(source.path()))?;
         let profile = build_selected_translation_profile(
-            "rpg_maker.translation_profiles",
+            "translation.profiles",
             selected_profile,
             built_client.request,
         )
@@ -1058,7 +1148,7 @@ fn build_document_configuration() -> RpgMakerDocumentReadingConfig {
 pub(crate) struct TranslationProfileConfiguration {
     id: String,
     target_task_user_message_characters: NonZeroUsize,
-    request: RpgMakerTranslationRequestConfiguration,
+    request: TranslationRequestConfiguration,
 }
 
 impl TranslationProfileConfiguration {
@@ -1070,7 +1160,7 @@ impl TranslationProfileConfiguration {
         self.target_task_user_message_characters
     }
 
-    pub(crate) const fn request(&self) -> &RpgMakerTranslationRequestConfiguration {
+    pub(crate) const fn request(&self) -> &TranslationRequestConfiguration {
         &self.request
     }
 }
@@ -1233,7 +1323,7 @@ const fn language_catalog_rule(source: &LanguageModuleCatalogBuildError) -> Conf
 fn build_selected_translation_profile(
     field: &str,
     raw: RawSelectedTranslationProfileConfiguration,
-    request: RpgMakerTranslationRequestConfiguration,
+    request: TranslationRequestConfiguration,
 ) -> Result<TranslationProfileConfiguration, ConfigurationValueError> {
     validate_exact_identifier(format!("{field}.id").as_str(), &raw.id)?;
     validate_exact_identifier(format!("{field}.llm_client").as_str(), &raw.llm_client)?;
@@ -1250,7 +1340,7 @@ fn build_selected_translation_profile(
 struct BuiltLlmClient {
     executor: SelectedLlmExecutorConfiguration,
     client: OpenAiChatCompletionClient,
-    request: RpgMakerTranslationRequestConfiguration,
+    request: TranslationRequestConfiguration,
 }
 
 fn build_llm_client(
@@ -1396,7 +1486,7 @@ fn build_llm_client(
             ))
         })
         .transpose()?;
-    let request = RpgMakerTranslationRequestConfiguration::new(
+    let request = TranslationRequestConfiguration::new(
         raw.retry_delays_ms
             .into_iter()
             .map(Duration::from_millis)
@@ -1901,7 +1991,7 @@ impl fmt::Display for ConfigurationLoadError {
             }
             Self::TranslationProfileNotFound { path, profile_id } => write!(
                 formatter,
-                "配置文件 {}：rpg_maker.translation_profiles 中不存在 ID 为 {profile_id} 的 Profile",
+                "配置文件 {}：translation.profiles 中不存在 ID 为 {profile_id} 的 Profile",
                 path.display()
             ),
             Self::ProfileSelectionConflict {
@@ -2276,7 +2366,7 @@ impl ConfigurationTomlIndex {
                     self.require_contract_field(
                         source,
                         path,
-                        &["rpg_maker", "translation_profiles", field],
+                        &["translation", "profiles", field],
                         Some(occurrence),
                     )?;
                 }
@@ -2316,13 +2406,13 @@ impl ConfigurationTomlIndex {
             self.require_contract_field(source, path, field_path, None)?;
         }
         if self
-            .field(&["rpg_maker", "record_translation_tasks"], None)
+            .field(&["translation", "record_translation_tasks"], None)
             .is_some()
         {
             self.require_contract_field(
                 source,
                 path,
-                &["rpg_maker", "record_translation_tasks"],
+                &["translation", "record_translation_tasks"],
                 None,
             )?;
         }
@@ -2351,12 +2441,12 @@ impl ConfigurationTomlIndex {
             }
         }
 
-        let profile_tables = self.table_occurrences(&["rpg_maker", "translation_profiles"]);
+        let profile_tables = self.table_occurrences(&["translation", "profiles"]);
         if profile_tables.is_empty() {
             return Err(self.missing_field(
                 source,
                 path,
-                &["rpg_maker", "translation_profiles"],
+                &["translation", "profiles"],
                 None,
                 ConfigurationTomlValueKind::TableArray,
             ));
@@ -2365,7 +2455,7 @@ impl ConfigurationTomlIndex {
             self.require_contract_field(
                 source,
                 path,
-                &["rpg_maker", "translation_profiles", "id"],
+                &["translation", "profiles", "id"],
                 Some(occurrence),
             )?;
         }
@@ -2645,7 +2735,12 @@ impl ConfigurationFieldContract {
 
     fn table_kind(path: &[String]) -> Option<IndexedTableKind> {
         match path {
-            [first] if matches!(first.as_str(), "projects" | "prompts" | "llm" | "rpg_maker") => {
+            [first]
+                if matches!(
+                    first.as_str(),
+                    "projects" | "prompts" | "llm" | "translation"
+                ) =>
+            {
                 Some(IndexedTableKind::Table)
             }
             [llm, clients] if llm == "llm" && clients == "clients" => Some(IndexedTableKind::Table),
@@ -2658,9 +2753,7 @@ impl ConfigurationFieldContract {
                 Some(IndexedTableKind::Table)
             }
             [languages] if languages == "languages" => Some(IndexedTableKind::TableArray),
-            [rpg_maker, profiles]
-                if rpg_maker == "rpg_maker" && profiles == "translation_profiles" =>
-            {
+            [translation, profiles] if translation == "translation" && profiles == "profiles" => {
                 Some(IndexedTableKind::TableArray)
             }
             _ => None,
@@ -2755,21 +2848,21 @@ impl ConfigurationFieldContract {
             [languages, pairs] if languages == "languages" && pairs == "quote_repair_pairs" => {
                 ConfigurationTomlValueKind::StringPairArray
             }
-            [rpg_maker, record]
-                if rpg_maker == "rpg_maker" && record == "record_translation_tasks" =>
+            [translation, record]
+                if translation == "translation" && record == "record_translation_tasks" =>
             {
                 ConfigurationTomlValueKind::Boolean
             }
-            [rpg_maker, profiles, field]
-                if rpg_maker == "rpg_maker"
-                    && profiles == "translation_profiles"
+            [translation, profiles, field]
+                if translation == "translation"
+                    && profiles == "profiles"
                     && matches!(field.as_str(), "id" | "llm_client") =>
             {
                 ConfigurationTomlValueKind::String
             }
-            [rpg_maker, profiles, target]
-                if rpg_maker == "rpg_maker"
-                    && profiles == "translation_profiles"
+            [translation, profiles, target]
+                if translation == "translation"
+                    && profiles == "profiles"
                     && target == "target_task_user_message_characters" =>
             {
                 ConfigurationTomlValueKind::Integer
@@ -3279,7 +3372,7 @@ fn parse_selected_translation_profile(
         .unwrap_or_default();
     if selection.duplicate {
         return Err(ConfigurationLoadError::InvalidValue(invalid(
-            "rpg_maker.translation_profiles",
+            "translation.profiles",
             ConfigurationValueRule::DuplicateProfileId,
         )));
     }
@@ -3302,7 +3395,7 @@ fn parse_selected_translation_profile(
         .map_err(|error| invalid_toml(path, source, index, &error))?
         .ok_or_else(|| {
             ConfigurationLoadError::InvalidValue(invalid(
-                "rpg_maker.translation_profiles",
+                "translation.profiles",
                 ConfigurationValueRule::SelectedProfileInvalid,
             ))
         })
@@ -3346,15 +3439,15 @@ impl<'de> Visitor<'de> for TranslationProfileIndexTopVisitor<'_> {
     where
         A: MapAccess<'de>,
     {
-        let mut seen_rpg_maker = false;
+        let mut seen_translation = false;
         let mut selection = None;
         while let Some(key) = map.next_key::<String>()? {
-            if key == "rpg_maker" {
-                if seen_rpg_maker {
-                    return Err(de::Error::duplicate_field("rpg_maker"));
+            if key == "translation" {
+                if seen_translation {
+                    return Err(de::Error::duplicate_field("translation"));
                 }
-                seen_rpg_maker = true;
-                selection = map.next_value_seed(TranslationProfileIndexRpgMakerSeed {
+                seen_translation = true;
+                selection = map.next_value_seed(TranslationProfileIndexTranslationSeed {
                     requested_id: self.requested_id,
                 })?;
             } else {
@@ -3365,32 +3458,32 @@ impl<'de> Visitor<'de> for TranslationProfileIndexTopVisitor<'_> {
     }
 }
 
-struct TranslationProfileIndexRpgMakerSeed<'a> {
+struct TranslationProfileIndexTranslationSeed<'a> {
     requested_id: &'a str,
 }
 
-impl<'de> DeserializeSeed<'de> for TranslationProfileIndexRpgMakerSeed<'_> {
+impl<'de> DeserializeSeed<'de> for TranslationProfileIndexTranslationSeed<'_> {
     type Value = Option<TranslationProfileIndexSelection>;
 
     fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_map(TranslationProfileIndexRpgMakerVisitor {
+        deserializer.deserialize_map(TranslationProfileIndexTranslationVisitor {
             requested_id: self.requested_id,
         })
     }
 }
 
-struct TranslationProfileIndexRpgMakerVisitor<'a> {
+struct TranslationProfileIndexTranslationVisitor<'a> {
     requested_id: &'a str,
 }
 
-impl<'de> Visitor<'de> for TranslationProfileIndexRpgMakerVisitor<'_> {
+impl<'de> Visitor<'de> for TranslationProfileIndexTranslationVisitor<'_> {
     type Value = Option<TranslationProfileIndexSelection>;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("RPG Maker 配置")
+        formatter.write_str("公共翻译配置")
     }
 
     fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
@@ -3400,9 +3493,9 @@ impl<'de> Visitor<'de> for TranslationProfileIndexRpgMakerVisitor<'_> {
         let mut seen_profiles = false;
         let mut selection = None;
         while let Some(key) = map.next_key::<String>()? {
-            if key == "translation_profiles" {
+            if key == "profiles" {
                 if seen_profiles {
-                    return Err(de::Error::duplicate_field("translation_profiles"));
+                    return Err(de::Error::duplicate_field("profiles"));
                 }
                 seen_profiles = true;
                 selection = Some(map.next_value_seed(TranslationProfileIndexSequenceSeed {
@@ -3441,7 +3534,7 @@ impl<'de> Visitor<'de> for TranslationProfileIndexSequenceVisitor<'_> {
     type Value = TranslationProfileIndexSelection;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("RPG Maker translation profile 数组")
+        formatter.write_str("公共翻译 Profile 数组")
     }
 
     fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
@@ -3481,7 +3574,7 @@ impl<'de> Visitor<'de> for TranslationProfileIdVisitor {
     type Value = Option<String>;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("只读取 id 的 RPG Maker translation profile")
+        formatter.write_str("只读取 id 的公共翻译 Profile")
     }
 
     fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
@@ -3608,15 +3701,15 @@ impl<'de> Visitor<'de> for SelectedTranslationProfileTopVisitor {
     where
         A: MapAccess<'de>,
     {
-        let mut seen_rpg_maker = false;
+        let mut seen_translation = false;
         let mut selected = None;
         while let Some(key) = map.next_key::<String>()? {
-            if key == "rpg_maker" {
-                if seen_rpg_maker {
-                    return Err(de::Error::duplicate_field("rpg_maker"));
+            if key == "translation" {
+                if seen_translation {
+                    return Err(de::Error::duplicate_field("translation"));
                 }
-                seen_rpg_maker = true;
-                selected = map.next_value_seed(SelectedTranslationProfileRpgMakerSeed {
+                seen_translation = true;
+                selected = map.next_value_seed(SelectedTranslationProfileTranslationSeed {
                     selected_index: self.selected_index,
                 })?;
             } else {
@@ -3627,32 +3720,32 @@ impl<'de> Visitor<'de> for SelectedTranslationProfileTopVisitor {
     }
 }
 
-struct SelectedTranslationProfileRpgMakerSeed {
+struct SelectedTranslationProfileTranslationSeed {
     selected_index: usize,
 }
 
-impl<'de> DeserializeSeed<'de> for SelectedTranslationProfileRpgMakerSeed {
+impl<'de> DeserializeSeed<'de> for SelectedTranslationProfileTranslationSeed {
     type Value = Option<RawSelectedTranslationProfileConfiguration>;
 
     fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_map(SelectedTranslationProfileRpgMakerVisitor {
+        deserializer.deserialize_map(SelectedTranslationProfileTranslationVisitor {
             selected_index: self.selected_index,
         })
     }
 }
 
-struct SelectedTranslationProfileRpgMakerVisitor {
+struct SelectedTranslationProfileTranslationVisitor {
     selected_index: usize,
 }
 
-impl<'de> Visitor<'de> for SelectedTranslationProfileRpgMakerVisitor {
+impl<'de> Visitor<'de> for SelectedTranslationProfileTranslationVisitor {
     type Value = Option<RawSelectedTranslationProfileConfiguration>;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("RPG Maker 配置")
+        formatter.write_str("公共翻译配置")
     }
 
     fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
@@ -3662,9 +3755,9 @@ impl<'de> Visitor<'de> for SelectedTranslationProfileRpgMakerVisitor {
         let mut seen_profiles = false;
         let mut selected = None;
         while let Some(key) = map.next_key::<String>()? {
-            if key == "translation_profiles" {
+            if key == "profiles" {
                 if seen_profiles {
-                    return Err(de::Error::duplicate_field("translation_profiles"));
+                    return Err(de::Error::duplicate_field("profiles"));
                 }
                 seen_profiles = true;
                 selected = map.next_value_seed(SelectedTranslationProfileSequenceSeed {
@@ -3703,7 +3796,7 @@ impl<'de> Visitor<'de> for SelectedTranslationProfileSequenceVisitor {
     type Value = Option<RawSelectedTranslationProfileConfiguration>;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("RPG Maker translation profile 数组")
+        formatter.write_str("translation profile 数组")
     }
 
     fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
@@ -3930,8 +4023,8 @@ struct RawCommonConfiguration {
     _prompts: Option<IgnoredAny>,
     #[serde(default, rename = "languages")]
     _languages: Option<IgnoredAny>,
-    #[serde(default, rename = "rpg_maker")]
-    _rpg_maker: Option<IgnoredAny>,
+    #[serde(default, rename = "translation")]
+    _translation: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -3945,8 +4038,8 @@ struct RawInitSelection {
     _prompts: Option<IgnoredAny>,
     #[serde(default, rename = "languages")]
     _languages: Option<IgnoredAny>,
-    #[serde(default, rename = "rpg_maker")]
-    _rpg_maker: Option<IgnoredAny>,
+    #[serde(default, rename = "translation")]
+    _translation: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -3960,8 +4053,8 @@ struct RawExtractSelection {
     _prompts: Option<IgnoredAny>,
     #[serde(default, rename = "languages")]
     _languages: Option<IgnoredAny>,
-    #[serde(default, rename = "rpg_maker")]
-    _rpg_maker: Option<IgnoredAny>,
+    #[serde(default, rename = "translation")]
+    _translation: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -3984,7 +4077,7 @@ struct RawLanguageDiscriminator {
 struct RawTranslateSelection {
     prompts: RawPromptsConfiguration,
     languages: Vec<RawLanguageConfiguration>,
-    rpg_maker: RawTranslateRpgMakerSelection,
+    translation: RawTranslationSelection,
     #[serde(default, rename = "projects")]
     _projects: Option<IgnoredAny>,
     #[serde(default, rename = "llm")]
@@ -4002,17 +4095,17 @@ struct RawWriteBackSelection {
     _prompts: Option<IgnoredAny>,
     #[serde(default, rename = "languages")]
     _languages: Option<IgnoredAny>,
-    #[serde(default, rename = "rpg_maker")]
-    _rpg_maker: Option<IgnoredAny>,
+    #[serde(default, rename = "translation")]
+    _translation: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawTranslateRpgMakerSelection {
+struct RawTranslationSelection {
     #[serde(default)]
     record_translation_tasks: bool,
-    #[serde(rename = "translation_profiles")]
-    _translation_profiles: IgnoredAny,
+    #[serde(rename = "profiles")]
+    _profiles: IgnoredAny,
 }
 
 #[derive(Deserialize)]
@@ -4101,6 +4194,7 @@ mod tests {
     use super::*;
     use crate::application::arguments::{AttArguments, ProductCommand};
     use crate::llm::LlmClientSemanticIdentity;
+    use crate::rpg_maker::RpgMakerEngine;
 
     const EXAMPLE_TASK_RECORDING: &str = "record_translation_tasks = true";
     const EXAMPLE_TARGET_CHARACTERS: &str = "target_task_user_message_characters = 5090";
@@ -4115,9 +4209,9 @@ mod tests {
         for command in [
             init_command(),
             extract_command(false),
-            translate_command(false, "primary"),
-            write_back_command(false),
-            project_lua_command(Some("primary")),
+            translate_command("primary"),
+            write_back_command(),
+            project_lua_command(),
         ] {
             load_configuration(&path, command).expect("仓库示例必须满足每个命令的当前契约");
         }
@@ -4141,17 +4235,21 @@ mod tests {
     #[test]
     fn directory_publisher_lock_root_is_namespaced_by_engine() {
         let projects_root = absolute_test_path("projects");
-        let configured =
-            build_directory_publisher_configuration(&projects_root, RpgMakerEngine::Mz)
-                .expect("目录发布配置应合法");
+        let configured = build_directory_publisher_configuration(
+            &projects_root,
+            RpgMakerEngine::Mz.storage_name(),
+        )
+        .expect("目录发布配置应合法");
         assert_eq!(
             configured.lock_directory(),
             projects_root.join(".att-locks/directory-publish/mz")
         );
 
-        let configured =
-            build_directory_publisher_configuration(&projects_root, RpgMakerEngine::Mv)
-                .expect("MV 目录发布配置应合法");
+        let configured = build_directory_publisher_configuration(
+            &projects_root,
+            RpgMakerEngine::Mv.storage_name(),
+        )
+        .expect("MV 目录发布配置应合法");
         assert_eq!(
             configured.lock_directory(),
             projects_root.join(".att-locks/directory-publish/mv")
@@ -4175,11 +4273,7 @@ mod tests {
         let directory = TestDirectory::new();
         let path = directory.write("minimal.toml", minimal_init_configuration());
 
-        for command in [
-            init_command(),
-            extract_command(false),
-            write_back_command(false),
-        ] {
+        for command in [init_command(), extract_command(false), write_back_command()] {
             load_configuration(&path, command)
                 .expect("非 Translate 命令不应要求无现实消费的配置存在");
         }
@@ -4204,45 +4298,7 @@ mod tests {
             .resolve_profile("primary")
             .expect("项目状态中的现行 Profile 应可精确解析");
         assert_eq!(configured.resolved_profile_id(), Some("primary"));
-        assert_eq!(configured.rpg_maker().profile().id(), "primary");
-    }
-
-    #[test]
-    fn omitted_project_lua_profile_remains_deferred_until_standard_is_opened() {
-        let directory = TestDirectory::new();
-        let source = include_str!("../../config.example.toml")
-            .replace("locale = \"auto\"", "locale = \"unsupported-locale\"");
-        let path = directory.write("deferred-project-lua-profile.toml", &source);
-
-        let configured = load_configuration(&path, project_lua_command(None))
-            .expect("普通 Lua 不应提前解析翻译配置");
-        let ConfiguredRpgMakerCommand::Lua(configured) = configured else {
-            panic!("应建立项目 Lua 配置");
-        };
-        let standard_profile = configured.into_standard_profile();
-        assert_eq!(standard_profile.explicit_profile_id(), None);
-        assert!(matches!(
-            standard_profile.resolve("primary"),
-            Err(ConfigurationLoadError::InvalidValueAtPath { .. })
-        ));
-    }
-
-    #[test]
-    fn explicit_project_lua_profile_is_validated_during_configuration_load() {
-        let directory = TestDirectory::new();
-        let path = directory.write(
-            "explicit-project-lua-profile.toml",
-            include_str!("../../config.example.toml"),
-        );
-
-        let error = load_configuration(&path, project_lua_command(Some("missing")))
-            .err()
-            .expect("显式 Profile 必须精确校验");
-        assert!(matches!(
-            error,
-            ConfigurationLoadError::TranslationProfileNotFound { profile_id, .. }
-                if profile_id == "missing"
-        ));
+        assert_eq!(configured.translation().profile().id(), "primary");
     }
 
     #[test]
@@ -4281,7 +4337,7 @@ mod tests {
         );
         let path = directory.write("invalid-explicit-profile.toml", &source);
 
-        let error = match load_configuration(&path, translate_command(false, "primary")) {
+        let error = match load_configuration(&path, translate_command("primary")) {
             Ok(_) => panic!("显式 Profile 的无效字段必须在配置加载阶段被拒绝"),
             Err(error) => error,
         };
@@ -4290,7 +4346,7 @@ mod tests {
         };
         assert_eq!(
             error.field(),
-            "rpg_maker.translation_profiles.target_task_user_message_characters"
+            "translation.profiles.target_task_user_message_characters"
         );
     }
 
@@ -4311,7 +4367,7 @@ retry_delays_ms = []
 max_retry_after_ms = []
 parameters = []
 
-[[rpg_maker.translation_profiles]]
+[[translation.profiles]]
 llm_client = ["{sentinel}"]
 target_task_user_message_characters = {{ marker = "{sentinel}" }}
 id = "unused"
@@ -4327,18 +4383,18 @@ id = "unused"
         let source = configuration_with_unselected_profile_sentinel(SENTINEL);
         let path = directory.write("translate.toml", &source);
         let ConfiguredRpgMakerCommand::Translate(configured) =
-            load_configuration(&path, translate_command(false, "primary"))
+            load_configuration(&path, translate_command("primary"))
                 .expect("无关客户端和 Profile 不应阻止本次翻译")
         else {
             panic!("应建立 Translate 配置");
         };
         configured
-            .rpg_maker()
+            .translation()
             .language_modules()
             .resolve(&LanguageId::parse("ja").expect("测试语言应合法"))
             .expect("应建立日语模块");
         configured
-            .rpg_maker()
+            .translation()
             .language_modules()
             .resolve(&LanguageId::parse("en").expect("测试语言应合法"))
             .expect("应建立英语模块");
@@ -4347,7 +4403,7 @@ id = "unused"
             configured.client().api_key().expose_secret(),
             "replace-with-api-key"
         );
-        let profile_debug = format!("{:?}", configured.rpg_maker().profile());
+        let profile_debug = format!("{:?}", configured.translation().profile());
         assert!(profile_debug.contains("primary"));
         assert!(!profile_debug.contains(SENTINEL));
     }
@@ -4362,7 +4418,7 @@ id = "unused"
             1,
         );
         let path = directory.write("invalid-language-with-unselected-profile.toml", &source);
-        let error = match load_configuration(&path, translate_command(false, "primary")) {
+        let error = match load_configuration(&path, translate_command("primary")) {
             Ok(_) => panic!("无效语言策略必须拒绝"),
             Err(error) => error,
         };
@@ -4385,7 +4441,7 @@ id = "unused"
         );
         let path = directory.write("invalid-language.toml", &source);
         assert!(
-            load_configuration(&path, translate_command(false, "primary")).is_err(),
+            load_configuration(&path, translate_command("primary")).is_err(),
             "Translate 必须在执行前验证全部语言条目"
         );
     }
@@ -4395,7 +4451,7 @@ id = "unused"
         let directory = TestDirectory::new();
         let path = directory.write("config.toml", include_str!("../../config.example.toml"));
         let ConfiguredRpgMakerCommand::Translate(configured) =
-            load_configuration(&path, translate_command(false, "primary"))
+            load_configuration(&path, translate_command("primary"))
                 .expect("示例 Translate 配置应合法")
         else {
             panic!("应建立 Translate 配置");
@@ -4406,11 +4462,11 @@ id = "unused"
             .parent()
             .expect("规范配置路径应有父目录")
             .join("prompts");
-        assert_eq!(configured.rpg_maker().prompt_root(), expected);
+        assert_eq!(configured.translation().prompt_root(), expected);
     }
 
     #[test]
-    fn prompt_locale_auto_and_thinking_output_are_preserved_for_the_composition_root() {
+    fn prompt_locale_auto_uses_the_project_target_language() {
         let directory = TestDirectory::new();
         for (thinking_output, expected) in [("false", false), ("true", true)] {
             let source = replace_thinking_output(
@@ -4422,25 +4478,26 @@ id = "unused"
                 &source,
             );
             let ConfiguredRpgMakerCommand::Translate(configured) =
-                load_configuration(&path, translate_command(false, "primary"))
+                load_configuration(&path, translate_command("primary"))
                     .expect("auto locale 与布尔思考输出开关应建立受信配置")
             else {
                 panic!("应建立 Translate 配置");
             };
 
             assert_eq!(
-                configured.rpg_maker().prompt_locale(),
+                configured.translation().prompt_locale(),
                 PromptLocaleSelection::Auto
             );
             assert_eq!(
                 configured
-                    .rpg_maker()
+                    .translation()
                     .prompt_locale()
-                    .resolve(UiLocale::French),
-                UiLocale::French,
-                "auto 必须复用组合根提供的已解析 UI locale"
+                    .resolve(&LanguageId::parse("zh-Hant").expect("测试目标语言应合法"))
+                    .expect("受支持目标语言应映射到 Prompt locale"),
+                UiLocale::TraditionalChinese,
+                "auto 必须按项目目标语言选择 Prompt locale"
             );
-            assert_eq!(configured.rpg_maker().thinking_output(), expected);
+            assert_eq!(configured.translation().thinking_output(), expected);
         }
     }
 
@@ -4466,26 +4523,37 @@ id = "unused"
                 &source,
             );
             let ConfiguredRpgMakerCommand::Translate(configured) =
-                load_configuration(&path, translate_command(false, "primary"))
+                load_configuration(&path, translate_command("primary"))
                     .expect("受支持的 BCP 47 UI locale 应建立显式 Prompt locale")
             else {
                 panic!("应建立 Translate 配置");
             };
 
             assert_eq!(
-                configured.rpg_maker().prompt_locale(),
+                configured.translation().prompt_locale(),
                 PromptLocaleSelection::Explicit(expected),
                 "显式 locale {locale_input} 应规范化为所选 UI locale"
             );
             assert_eq!(
                 configured
-                    .rpg_maker()
+                    .translation()
                     .prompt_locale()
-                    .resolve(UiLocale::English),
+                    .resolve(&LanguageId::parse("de").expect("测试目标语言应合法"))
+                    .expect("显式 Prompt locale 不依赖目标语言"),
                 expected,
-                "显式 locale 必须覆盖组合根提供的 UI locale"
+                "显式 locale 必须覆盖自动目标语言映射"
             );
         }
+    }
+
+    #[test]
+    fn automatic_prompt_locale_rejects_an_unsupported_target_language() {
+        let error = PromptLocaleSelection::Auto
+            .resolve(&LanguageId::parse("de").expect("测试目标语言应合法"))
+            .expect_err("没有对应资源目录的目标语言不能自动选择 Prompt locale");
+
+        assert_eq!(error.target_language().as_str(), "de");
+        assert!(error.to_string().contains("prompts.locale"));
     }
 
     #[test]
@@ -4502,7 +4570,7 @@ id = "unused"
                 format!("locale = \"{locale}\"").as_str(),
             );
             let path = directory.write(format!("prompt-locale-{name}.toml").as_str(), &source);
-            let error = match load_configuration(&path, translate_command(false, "primary")) {
+            let error = match load_configuration(&path, translate_command("primary")) {
                 Ok(_) => panic!("无效或不支持的 Prompt locale 必须失败"),
                 Err(error) => error,
             };
@@ -4523,11 +4591,7 @@ id = "unused"
         let source = replace_thinking_output(&source, "thinking_output = []");
         let path = directory.write("unselected-prompts.toml", &source);
 
-        for command in [
-            init_command(),
-            extract_command(false),
-            write_back_command(false),
-        ] {
+        for command in [init_command(), extract_command(false), write_back_command()] {
             load_configuration(&path, command)
                 .expect("非 Translate 命令不得物化或校验 prompts 的字段值");
         }
@@ -4558,7 +4622,7 @@ id = "unused"
                 &source,
             );
             let ConfiguredRpgMakerCommand::Translate(configured) =
-                load_configuration(&path, translate_command(false, "primary"))
+                load_configuration(&path, translate_command("primary"))
                     .expect("任务记录开关应建立受信 Translate 配置")
             else {
                 panic!("应建立 Translate 配置");
@@ -4584,21 +4648,17 @@ id = "unused"
         );
         let path = directory.write("record-translation-tasks-type.toml", &source);
 
-        for command in [
-            init_command(),
-            extract_command(false),
-            write_back_command(false),
-        ] {
+        for command in [init_command(), extract_command(false), write_back_command()] {
             load_configuration(&path, command)
                 .expect("非 Translate 命令不得物化或校验任务记录开关");
         }
 
-        let error = match load_configuration(&path, translate_command(false, "primary")) {
+        let error = match load_configuration(&path, translate_command("primary")) {
             Ok(_) => panic!("Translate 必须拒绝非布尔任务记录开关"),
             Err(error) => error,
         };
         let diagnostics = format!("{error:?}\n{error}");
-        assert!(diagnostics.contains("rpg_maker.record_translation_tasks"));
+        assert!(diagnostics.contains("translation.record_translation_tasks"));
         assert!(!diagnostics.contains(SENTINEL));
     }
 
@@ -4611,7 +4671,7 @@ id = "unused"
         );
         let path = directory.write("unknown-profile-field.toml", &source);
         assert!(
-            load_configuration(&path, translate_command(false, "primary")).is_err(),
+            load_configuration(&path, translate_command("primary")).is_err(),
             "所选 Profile 必须严格拒绝未知字段"
         );
     }
@@ -4635,11 +4695,7 @@ id = "unused"
             ),
             (
                 "languages",
-                remove_configuration_range(
-                    &source,
-                    "[[languages]]",
-                    "[[rpg_maker.translation_profiles]]",
-                ),
+                remove_configuration_range(&source, "[[languages]]", "[[translation.profiles]]"),
             ),
             ("profile-id", source.replacen("id = \"primary\"\n", "", 1)),
             (
@@ -4663,7 +4719,7 @@ id = "unused"
         for (name, source) in cases {
             let path = directory.write(format!("missing-{name}.toml").as_str(), &source);
             assert!(
-                load_configuration(&path, translate_command(false, "primary")).is_err(),
+                load_configuration(&path, translate_command("primary")).is_err(),
                 "Translate 消费的必填项 {name} 缺失时必须显式失败"
             );
         }
@@ -4677,7 +4733,7 @@ id = "unused"
             (
                 "selected-profile-missing",
                 source.replacen("llm_client = \"primary\"\n", "", 1),
-                "rpg_maker.translation_profiles.llm_client",
+                "translation.profiles.llm_client",
                 "缺少必填字段",
                 ConfigurationTomlFailureKind::MissingField,
                 None,
@@ -4777,7 +4833,7 @@ id = "unused"
             cases
         {
             let path = directory.write(format!("diagnostic-{name}.toml").as_str(), &source);
-            let error = match load_configuration(&path, translate_command(false, "primary")) {
+            let error = match load_configuration(&path, translate_command("primary")) {
                 Ok(_) => panic!("无效配置必须失败"),
                 Err(error) => error,
             };
@@ -4820,18 +4876,18 @@ id = "unused"
     fn translate_rejects_duplicate_current_profile_and_language_ids() {
         let directory = TestDirectory::new();
         let duplicate_profile = format!(
-            "{}\n[[rpg_maker.translation_profiles]]\nid = \"primary\"\n",
+            "{}\n[[translation.profiles]]\nid = \"primary\"\n",
             include_str!("../../config.example.toml")
         );
         let path = directory.write("duplicate-profile.toml", &duplicate_profile);
-        assert!(load_configuration(&path, translate_command(false, "primary")).is_err());
+        assert!(load_configuration(&path, translate_command("primary")).is_err());
 
         let duplicate_language = format!(
             "{}\n[[languages]]\ntype = \"japanese\"\nid = \"JA\"\nminimum_kana_characters = 1\nallowed_terms = []\nquote_repair_pairs = []\n",
             include_str!("../../config.example.toml")
         );
         let path = directory.write("duplicate-language.toml", &duplicate_language);
-        assert!(load_configuration(&path, translate_command(false, "primary")).is_err());
+        assert!(load_configuration(&path, translate_command("primary")).is_err());
     }
 
     #[test]
@@ -4840,7 +4896,7 @@ id = "unused"
         let invalid_client = include_str!("../../config.example.toml")
             .replace("model = \"replace-with-model-id\"", "model = []");
         let path = directory.write("client.toml", &invalid_client);
-        assert!(load_configuration(&path, translate_command(false, "primary")).is_err());
+        assert!(load_configuration(&path, translate_command("primary")).is_err());
     }
 
     #[test]
@@ -4953,7 +5009,7 @@ id = "unused"
         ] {
             let source = example.replacen(EXAMPLE_CLIENT_PARAMETERS, &replacement, 1);
             let path = directory.write(format!("scalar-shape-{name}.toml").as_str(), &source);
-            let error = match load_configuration(&path, translate_command(false, "primary")) {
+            let error = match load_configuration(&path, translate_command("primary")) {
                 Ok(_) => panic!("所选字符串字段的表形态必须拒绝：{name}"),
                 Err(error) => error,
             };
@@ -4990,7 +5046,7 @@ id = "unused"
         ] {
             let source = example.replacen(original, &replacement, 1);
             let path = directory.write(format!("pair-shape-{name}.toml").as_str(), &source);
-            let error = match load_configuration(&path, translate_command(false, "primary")) {
+            let error = match load_configuration(&path, translate_command("primary")) {
                 Ok(_) => panic!("一项必须恰好包含两个字符串：{name}"),
                 Err(error) => error,
             };
@@ -5067,7 +5123,7 @@ id = "unused"
             1,
         );
         let value_path = directory.write("language-type.toml", &source);
-        let value = match load_configuration(&value_path, translate_command(false, "primary")) {
+        let value = match load_configuration(&value_path, translate_command("primary")) {
             Ok(_) => panic!("未知语言类型必须拒绝"),
             Err(error) => error,
         };
@@ -5128,8 +5184,7 @@ api_key = "{API_KEY}" "invalid"
         assert!(source.contains("PARAMETER_SENTINEL"));
         let path = directory.write("api-key.toml", &source);
         let ConfiguredRpgMakerCommand::Translate(configured) =
-            load_configuration(&path, translate_command(false, "primary"))
-                .expect("所选客户端应合法")
+            load_configuration(&path, translate_command("primary")).expect("所选客户端应合法")
         else {
             panic!("应建立 Translate 配置");
         };
@@ -5147,7 +5202,7 @@ api_key = "{API_KEY}" "invalid"
         );
         let source = replace_thinking_output(&source, "thinking_output = []");
         let path = directory.write("unselected-api-key.toml", &source);
-        let error = match load_configuration(&path, translate_command(false, "primary")) {
+        let error = match load_configuration(&path, translate_command("primary")) {
             Ok(_) => panic!("无效 Prompt 配置必须拒绝"),
             Err(error) => error,
         };
@@ -5191,49 +5246,20 @@ api_key = "{API_KEY}" "invalid"
         }
     }
 
-    fn translate_command(lua: bool, profile: &str) -> MzCommand {
-        if lua {
-            parse_command([
-                "att",
-                "mz",
-                "translate",
-                "--name",
-                "demo",
-                profile,
-                "--lua",
-                "script.lua",
-            ])
-        } else {
-            parse_command(["att", "mz", "translate", "--name", "demo", profile])
-        }
+    fn translate_command(profile: &str) -> MzCommand {
+        parse_command(["att", "mz", "translate", "--name", "demo", profile])
     }
 
     fn translate_command_without_profile() -> MzCommand {
         parse_command(["att", "mz", "translate", "--name", "demo"])
     }
 
-    fn write_back_command(lua: bool) -> MzCommand {
-        if lua {
-            parse_command([
-                "att",
-                "mz",
-                "write-back",
-                "--name",
-                "demo",
-                "--lua",
-                "script.lua",
-            ])
-        } else {
-            parse_command(["att", "mz", "write-back", "--name", "demo"])
-        }
+    fn write_back_command() -> MzCommand {
+        parse_command(["att", "mz", "write-back", "--name", "demo"])
     }
 
-    fn project_lua_command(profile: Option<&str>) -> MzCommand {
-        let mut arguments = vec!["att", "mz", "lua", "--name", "demo", "script.lua"];
-        if let Some(profile) = profile {
-            arguments.splice(5..5, ["--profile", profile]);
-        }
-        parse_command_vec(arguments)
+    fn project_lua_command() -> MzCommand {
+        parse_command(["att", "mz", "lua", "--name", "demo", "script.lua"])
     }
 
     fn parse_command<const N: usize>(arguments: [&str; N]) -> MzCommand {
@@ -5248,6 +5274,7 @@ api_key = "{API_KEY}" "invalid"
         match parsed.product {
             ProductCommand::Mz { command } => command,
             ProductCommand::Mv { .. } => panic!("配置测试只应构造 MZ 命令"),
+            ProductCommand::Generic { .. } => panic!("配置测试只应构造 MZ 命令"),
         }
     }
 

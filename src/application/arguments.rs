@@ -17,7 +17,8 @@ use crate::i18n::{
     resolve_lower_priority_ui_locale, resolve_ui_locale,
 };
 use crate::language::LanguageId;
-use crate::rpg_maker::{MaxFullwidthChars, ProjectName};
+use crate::project_name::ProjectName;
+use crate::rpg_maker::MaxFullwidthChars;
 
 /// 已确认显式配置路径的 ATT 进程参数。
 #[derive(Debug)]
@@ -277,6 +278,12 @@ pub(crate) enum ProductCommand {
         #[command(subcommand)]
         command: MvCommand,
     },
+    /// 约定 JSONL 的通用翻译。
+    #[command(name = "generic")]
+    Generic {
+        #[command(subcommand)]
+        command: GenericCommand,
+    },
 }
 
 /// `att mz` 当前支持的用户意图。
@@ -359,6 +366,41 @@ pub(crate) enum MvCommand {
     Lua(ProjectLuaArguments),
 }
 
+/// `att generic` 当前支持的用户意图。
+#[derive(Debug, Subcommand)]
+pub(crate) enum GenericCommand {
+    /// 建立或更新一个绑定外部 JSONL 目录的项目。
+    #[command(name = "init")]
+    Init(GenericInitArguments),
+    /// 把当前 JSONL 内容同步到项目数据库。
+    #[command(name = "extract")]
+    Extract(ProjectArguments),
+    /// 使用指定翻译 Profile 翻译已同步原文。
+    #[command(name = "translate")]
+    Translate(TranslateArguments),
+    /// 把当前译文写入项目输出目录。
+    #[command(name = "write-back")]
+    WriteBack(ProjectArguments),
+    /// 在项目数据库的一次事务中执行 Lua。
+    #[command(name = "lua")]
+    Lua(ProjectLuaArguments),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct GenericInitArguments {
+    #[command(flatten)]
+    pub(crate) project: ProjectArguments,
+    /// 包含 Generic JSONL 输入的外部目录。
+    #[arg(long, value_name = "DIR", value_parser = parse_non_blank_path)]
+    pub(crate) path: Option<PathBuf>,
+    /// JSONL 原文语言 ID。
+    #[arg(long, value_name = "LANG", value_parser = parse_language_id)]
+    pub(crate) source_language: Option<LanguageId>,
+    /// JSONL 译文目标语言 ID。
+    #[arg(long, value_name = "LANG", value_parser = parse_language_id)]
+    pub(crate) target_language: Option<LanguageId>,
+}
+
 #[derive(Debug, Args)]
 pub(crate) struct InitArguments {
     #[command(flatten)]
@@ -393,9 +435,6 @@ pub(crate) struct ExtractArguments {
     /// 按指定 TOML 规则提取外部明确声明的位置。
     #[arg(long, value_name = "RULES_TOML", value_parser = parse_non_blank_path)]
     pub(crate) rules: Option<PathBuf>,
-    /// 运行指定可信 Lua 程序。
-    #[arg(long, value_name = "SCRIPT_LUA", value_parser = parse_non_blank_path)]
-    pub(crate) lua: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -416,9 +455,6 @@ pub(crate) struct MvExtractArguments {
         requires = "builtin"
     )]
     pub(crate) dialogue_rules: Option<PathBuf>,
-    /// 运行指定可信 Lua 程序。
-    #[arg(long, value_name = "SCRIPT_LUA", value_parser = parse_non_blank_path)]
-    pub(crate) lua: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -434,28 +470,19 @@ pub(crate) struct TranslateArguments {
     /// 用该 TOML 文件替换项目当前占位符规则；省略时复用已保存内容。
     #[arg(long, value_name = "PLACEHOLDERS_TOML", value_parser = parse_non_blank_path)]
     pub(crate) placeholders: Option<PathBuf>,
-    /// 运行指定可信 Lua 程序。
-    #[arg(long, value_name = "SCRIPT_LUA", value_parser = parse_non_blank_path)]
-    pub(crate) lua: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct WriteBackArguments {
     #[command(flatten)]
     pub(crate) project: ProjectArguments,
-    /// 运行指定可信 Lua 程序。
-    #[arg(long, value_name = "SCRIPT_LUA", value_parser = parse_non_blank_path)]
-    pub(crate) lua: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct ProjectLuaArguments {
     #[command(flatten)]
     pub(crate) project: ProjectArguments,
-    /// 本次 Standard 人工译文验收使用的翻译 Profile ID。
-    #[arg(long, value_name = "PROFILE_ID", value_parser = parse_non_blank)]
-    pub(crate) profile: Option<String>,
-    /// 本次执行的可信 Lua 程序。
+    /// 本次执行的原子数据库 Lua 程序。
     #[arg(value_name = "SCRIPT_LUA", value_parser = parse_non_blank_path)]
     pub(crate) script: PathBuf,
     /// `--` 后原样传给 Lua 全局 `arg[1..]` 的 UTF-8 参数。
@@ -465,7 +492,7 @@ pub(crate) struct ProjectLuaArguments {
 
 #[derive(Debug, Args)]
 pub(crate) struct ProjectArguments {
-    /// RPG Maker 游戏的稳定项目名称。
+    /// 当前引擎项目的稳定名称。
     #[arg(long, value_name = "NAME")]
     pub(crate) name: ProjectName,
 }
@@ -533,7 +560,7 @@ fn localize_command_tree(
         .disable_help_subcommand(true)
         .disable_version_flag(true);
 
-    const ARGUMENT_IDENTIFIERS: [&str; 20] = [
+    const ARGUMENT_IDENTIFIERS: [&str; 18] = [
         "config",
         "ui_language",
         "progress",
@@ -547,11 +574,9 @@ fn localize_command_tree(
         "builtin",
         "rules",
         "dialogue_rules",
-        "lua",
         "profile_id",
         "terms",
         "placeholders",
-        "profile",
         "script",
         "arguments",
     ];
@@ -607,7 +632,7 @@ fn localized_usage_syntax(
     let options = localizer.format(UiMessage::CliOptionsMetavar);
     let nested_command = localizer.format(UiMessage::CliCommandMetavar);
     let syntax = match command_name {
-        "att" | "mz" | "mv" => {
+        "att" | "mz" | "mv" | "generic" => {
             format!("{command_path} --config <FILE> [{options}] <{nested_command}>")
         }
         "translate" => {
@@ -652,6 +677,7 @@ fn command_about(name: &str) -> UiMessage<'static> {
         "att" => UiMessage::AppAbout,
         "mz" => UiMessage::CliMzAbout,
         "mv" => UiMessage::CliMvAbout,
+        "generic" => UiMessage::CliGenericAbout,
         "init" => UiMessage::CliInitAbout,
         "extract" => UiMessage::CliExtractAbout,
         "translate" => UiMessage::CliTranslateAbout,
@@ -676,11 +702,9 @@ fn argument_help(identifier: &str) -> Option<UiMessage<'static>> {
         "builtin" => Some(UiMessage::CliBuiltinHelp),
         "rules" => Some(UiMessage::CliRulesHelp),
         "dialogue_rules" => Some(UiMessage::CliDialogueRulesHelp),
-        "lua" => Some(UiMessage::CliLuaHelp),
         "profile_id" => Some(UiMessage::CliProfileHelp),
         "terms" => Some(UiMessage::CliTermsHelp),
         "placeholders" => Some(UiMessage::CliPlaceholdersHelp),
-        "profile" => Some(UiMessage::CliProjectLuaProfileHelp),
         "script" => Some(UiMessage::CliProjectLuaScriptHelp),
         "arguments" => Some(UiMessage::CliProjectLuaArgumentsHelp),
         _ => None,
@@ -876,7 +900,6 @@ mod tests {
         };
         assert!(!arguments.builtin);
         assert!(arguments.rules.is_none());
-        assert!(arguments.lua.is_none());
     }
 
     #[test]
@@ -901,8 +924,6 @@ mod tests {
             "input/terms.toml",
             "--placeholders",
             "input/placeholders.toml",
-            "--lua",
-            "scripts/translate.lua",
         ])
         .expect("翻译参数应合法");
 
@@ -918,14 +939,10 @@ mod tests {
             arguments.placeholders.as_deref(),
             Some(Path::new("input/placeholders.toml"))
         );
-        assert_eq!(
-            arguments.lua.as_deref(),
-            Some(Path::new("scripts/translate.lua"))
-        );
     }
 
     #[test]
-    fn project_lua_preserves_script_profile_and_delimited_arguments() {
+    fn project_lua_preserves_script_and_delimited_arguments() {
         let parsed = AttArguments::try_parse_from([
             "att",
             "--config",
@@ -934,8 +951,6 @@ mod tests {
             "lua",
             "--name",
             "demo",
-            "--profile",
-            "Profile-A",
             "scripts/manual.lua",
             "--",
             "--replace",
@@ -947,9 +962,120 @@ mod tests {
             panic!("应解析为项目 Lua 命令");
         };
         assert_eq!(arguments.project.name.as_str(), "demo");
-        assert_eq!(arguments.profile.as_deref(), Some("Profile-A"));
         assert_eq!(arguments.script.as_path(), Path::new("scripts/manual.lua"));
         assert_eq!(arguments.arguments, ["--replace", "值"]);
+    }
+
+    #[test]
+    fn stage_lua_and_project_lua_profile_are_rejected() {
+        for arguments in [
+            vec![
+                "att",
+                "--config",
+                "config.toml",
+                "mz",
+                "extract",
+                "--name",
+                "demo",
+                "--lua",
+                "stage.lua",
+            ],
+            vec![
+                "att",
+                "--config",
+                "config.toml",
+                "mz",
+                "translate",
+                "--name",
+                "demo",
+                "--lua",
+                "stage.lua",
+            ],
+            vec![
+                "att",
+                "--config",
+                "config.toml",
+                "mz",
+                "write-back",
+                "--name",
+                "demo",
+                "--lua",
+                "stage.lua",
+            ],
+            vec![
+                "att",
+                "--config",
+                "config.toml",
+                "mz",
+                "lua",
+                "--name",
+                "demo",
+                "--profile",
+                "primary",
+                "script.lua",
+            ],
+        ] {
+            let error = AttArguments::try_parse_from(arguments)
+                .expect_err("已删除的 Lua 参数必须作为普通未知参数拒绝");
+            assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+        }
+    }
+
+    #[test]
+    fn generic_commands_preserve_live_input_and_translation_options() {
+        let init = AttArguments::try_parse_from([
+            "att",
+            "--config",
+            "config.toml",
+            "generic",
+            "init",
+            "--name",
+            "demo",
+            "--path",
+            "jsonl",
+            "--source-language",
+            "ja",
+            "--target-language",
+            "zh-Hans",
+        ])
+        .expect("Generic Init 参数应合法");
+        let ProductCommand::Generic {
+            command: GenericCommand::Init(arguments),
+        } = init.product
+        else {
+            panic!("应解析为 Generic Init");
+        };
+        assert_eq!(arguments.path.as_deref(), Some(Path::new("jsonl")));
+        assert_eq!(
+            arguments.source_language.as_ref().map(LanguageId::as_str),
+            Some("ja")
+        );
+        assert_eq!(
+            arguments.target_language.as_ref().map(LanguageId::as_str),
+            Some("zh-Hans")
+        );
+
+        let translate = AttArguments::try_parse_from([
+            "att",
+            "--config",
+            "config.toml",
+            "generic",
+            "translate",
+            "--name",
+            "demo",
+            "primary",
+            "--terms",
+            "terms.toml",
+            "--placeholders",
+            "placeholders.toml",
+        ])
+        .expect("Generic Translate 参数应合法");
+        assert!(matches!(
+            translate.product,
+            ProductCommand::Generic {
+                command: GenericCommand::Translate(_)
+            }
+        ));
     }
 
     #[test]
@@ -1357,6 +1483,7 @@ mod tests {
         match product {
             ProductCommand::Mz { command } => command,
             ProductCommand::Mv { .. } => panic!("应解析为 MZ 命令"),
+            ProductCommand::Generic { .. } => panic!("应解析为 MZ 命令"),
         }
     }
 }

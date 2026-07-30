@@ -333,7 +333,7 @@ impl TextGroupKind {
         Self::PluginParameter,
     ];
 
-    /// 标准资产持久化和受信协议共用的唯一名称。
+    /// RPG Maker 资产持久化和受信协议共用的唯一名称。
     pub(crate) const fn storage_name(self) -> &'static str {
         match self {
             Self::DatabaseEntry => "database_entry",

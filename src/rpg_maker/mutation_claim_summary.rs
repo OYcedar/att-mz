@@ -1,4 +1,4 @@
-//! 标准资产 Claim 的完整逻辑投影与持久化冲突摘要。
+//! RPG Maker 资产 Claim 的完整逻辑投影与持久化冲突摘要。
 //!
 //! 完整逻辑 Claim 参与资产指纹与写回重建；SQLite 只持久化足以完成跨 owner
 //! 冲突检查的摘要。每个 `(owner, resource_key)` 最多保留一行：Exclusive

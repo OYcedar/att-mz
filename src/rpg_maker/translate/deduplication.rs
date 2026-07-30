@@ -1,20 +1,18 @@
-//! 标准翻译语料的全局确定性去重。
+//! RPG Maker 翻译语料的全局确定性去重。
 //!
 //! 本模块只拥有“一个翻译决策对应哪些具体位置”的领域规则。它不执行 I/O、
 //! 不切分任务，也不持久化关系；调用方必须先按 RPG Maker 自然顺序提供候选项。
 
-use std::collections::HashMap;
-use std::error::Error;
-use std::fmt;
+use std::collections::{HashMap, HashSet};
 
-use super::standard::{
+use super::pipeline::{
     AppliedPlaceholder, TranslationInvalidation, TranslationPropagationTarget, TranslationReuse,
     TranslationReuseSeed, TranslationReuseTarget, TranslationStateContext, TranslationUnitIdentity,
     TranslationVirtualReason,
 };
 use crate::fingerprint::Sha256Fingerprint;
+use crate::rpg_maker::asset::RpgMakerAssetOwner;
 use crate::rpg_maker::model::{ScalarFieldKey, TextUnitContent, TextUnitRole};
-use crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner;
 use crate::rpg_maker::text::{
     DataFileName, RpgMakerLocation, RpgMakerSource, StandardDataFile, TextGroupKind,
 };
@@ -111,7 +109,7 @@ enum DeduplicationRole {
         source_context_json: String,
     },
     Choices {
-        owner: RpgMakerStandardAssetOwner,
+        owner: RpgMakerAssetOwner,
         group_location: RpgMakerLocation,
     },
     ScrollingText,
@@ -174,15 +172,10 @@ impl DeduplicationRole {
 }
 
 struct Family {
-    source_content: TextUnitContent,
     member_indices: Vec<usize>,
 }
 
-/// 按与 Standard 去重完全相同的键建立稳定自然顺序的成员族。
-///
-/// 人工候选验收只需要知道传播边界，不应触发普通 Translate 对现有 Current
-/// 译文的唯一种子选择、失效清理或自动复用。两条路径因此共享这里建立的族，
-/// 再分别拥有各自的后续行为。
+/// 按 RPG Maker 去重键建立自然顺序稳定的成员族。
 pub(crate) fn translation_deduplication_families(
     candidates: &[TranslationDeduplicationCandidate],
 ) -> Vec<Vec<usize>> {
@@ -202,16 +195,10 @@ pub(crate) fn translation_deduplication_families(
 /// 按调用方给出的稳定自然顺序建立全局去重族。
 pub(crate) fn deduplicate_translation_candidates(
     candidates: Vec<TranslationDeduplicationCandidate>,
-) -> Result<TranslationDeduplicationResult, TranslationDeduplicationError> {
+) -> TranslationDeduplicationResult {
     let families = translation_deduplication_families(&candidates)
         .into_iter()
-        .map(|member_indices| Family {
-            source_content: candidates[member_indices[0]]
-                .identity
-                .source_content()
-                .clone(),
-            member_indices,
-        })
+        .map(|member_indices| Family { member_indices })
         .collect::<Vec<_>>();
 
     let mut outcomes = vec![None; candidates.len()];
@@ -224,17 +211,17 @@ pub(crate) fn deduplicate_translation_candidates(
             &mut outcomes,
             &mut invalidations,
             &mut reuses,
-        )?;
+        );
     }
 
-    Ok(TranslationDeduplicationResult {
+    TranslationDeduplicationResult {
         outcomes: outcomes
             .into_iter()
             .map(|outcome| outcome.expect("每个候选项必须恰好属于一个去重族"))
             .collect(),
         invalidations,
         reuses,
-    })
+    }
 }
 
 fn plan_family(
@@ -243,52 +230,37 @@ fn plan_family(
     outcomes: &mut [Option<TranslationDeduplicationOutcome>],
     invalidations: &mut Vec<TranslationInvalidation>,
     reuses: &mut Vec<TranslationReuse>,
-) -> Result<(), TranslationDeduplicationError> {
-    let mut seed_index = None;
-    let mut conflicting = false;
+) {
+    let mut current_indices = Vec::<usize>::new();
+    let mut distinct_current_translations = HashSet::<&TextUnitContent>::new();
+    let mut first_current_index = None;
+    let mut unresolved_indices = Vec::<usize>::new();
     for &index in &family.member_indices {
         let candidate = &candidates[index];
         if !candidate.invalidated
             && let Some(translation) = candidate.translation.as_ref()
         {
-            match seed_index {
-                None => seed_index = Some(index),
-                Some(seed) if candidates[seed].translation.as_ref() == Some(translation) => {}
-                Some(_) => conflicting = true,
+            current_indices.push(index);
+            if distinct_current_translations.insert(translation) {
+                first_current_index.get_or_insert(index);
             }
+        } else {
+            unresolved_indices.push(index);
         }
     }
 
-    if conflicting {
-        let conflicts = family
-            .member_indices
-            .iter()
-            .filter_map(|&index| {
-                let candidate = &candidates[index];
-                (!candidate.invalidated).then(|| {
-                    candidate.translation.as_ref().map(|translation| {
-                        ConflictingReusableTranslation::new(
-                            candidate.identity.clone(),
-                            translation.clone(),
-                        )
-                    })
-                })?
-            })
-            .collect();
-        return Err(
-            TranslationDeduplicationError::ConflictingReusableTranslations {
-                source_content: family.source_content.clone(),
-                conflicts,
-            },
-        );
+    for &index in &current_indices {
+        outcomes[index] = Some(TranslationDeduplicationOutcome::Virtual {
+            reason: TranslationVirtualReason::ExistingTranslation,
+        });
     }
 
-    if let Some(seed_index) = seed_index {
+    if distinct_current_translations.len() == 1 {
+        let seed_index = first_current_index.expect("存在 Current 译文时必须记录其自然顺序首项");
         plan_reuse_family(family, candidates, seed_index, outcomes, reuses);
-    } else {
-        plan_active_family(family, candidates, outcomes, invalidations);
+    } else if !unresolved_indices.is_empty() {
+        plan_active_members(&unresolved_indices, candidates, outcomes, invalidations);
     }
-    Ok(())
 }
 
 fn plan_reuse_family(
@@ -341,15 +313,15 @@ fn plan_reuse_family(
     }
 }
 
-fn plan_active_family(
-    family: &Family,
+fn plan_active_members(
+    member_indices: &[usize],
     candidates: &[TranslationDeduplicationCandidate],
     outcomes: &mut [Option<TranslationDeduplicationOutcome>],
     invalidations: &mut Vec<TranslationInvalidation>,
 ) {
-    let leader_index = family.member_indices[0];
+    let leader_index = member_indices[0];
     let leader = &candidates[leader_index];
-    let propagation_targets = family.member_indices[1..]
+    let propagation_targets = member_indices[1..]
         .iter()
         .map(|&index| {
             TranslationPropagationTarget::new(
@@ -362,7 +334,7 @@ fn plan_active_family(
         propagation_targets,
     });
 
-    for &index in &family.member_indices[1..] {
+    for &index in &member_indices[1..] {
         outcomes[index] = Some(TranslationDeduplicationOutcome::Virtual {
             reason: TranslationVirtualReason::Duplicate {
                 leader: Box::new(leader.identity.clone()),
@@ -370,7 +342,7 @@ fn plan_active_family(
         });
     }
 
-    for &index in &family.member_indices {
+    for &index in member_indices {
         let candidate = &candidates[index];
         if candidate.invalidated {
             invalidations.push(TranslationInvalidation::new(
@@ -387,77 +359,17 @@ fn plan_active_family(
     }
 }
 
-/// 同一可安全复用族内的一条冲突译文。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ConflictingReusableTranslation {
-    identity: TranslationUnitIdentity,
-    translation: TextUnitContent,
-}
-
-impl ConflictingReusableTranslation {
-    fn new(identity: TranslationUnitIdentity, translation: TextUnitContent) -> Self {
-        Self {
-            identity,
-            translation,
-        }
-    }
-}
-
-/// 当前一致语料无法建立唯一复用译文。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum TranslationDeduplicationError {
-    ConflictingReusableTranslations {
-        source_content: TextUnitContent,
-        conflicts: Vec<ConflictingReusableTranslation>,
-    },
-}
-
-impl fmt::Display for TranslationDeduplicationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ConflictingReusableTranslations {
-                source_content,
-                conflicts,
-            } => {
-                write!(
-                    formatter,
-                    "原文语义单元 {source_content:?} 存在 {} 个互相冲突的有效译文：",
-                    conflicts.len()
-                )?;
-                for (index, conflict) in conflicts.iter().enumerate() {
-                    if index > 0 {
-                        formatter.write_str("；")?;
-                    }
-                    write!(
-                        formatter,
-                        "{} => {:?}",
-                        format_logical_location(&conflict.identity),
-                        conflict.translation
-                    )?;
-                }
-                Ok(())
-            }
-        }
-    }
-}
-
-fn format_logical_location(identity: &TranslationUnitIdentity) -> String {
-    format!("{} / {:?}", identity.group_location(), identity.role())
-}
-
-impl Error for TranslationDeduplicationError {}
-
 #[cfg(test)]
 mod tests {
+    use crate::rpg_maker::asset::RpgMakerAssetOwner;
     use crate::rpg_maker::model::{ScalarFieldKey, TextUnitContent, TextUnitRole};
-    use crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner;
     use crate::rpg_maker::text::{
         DataFileName, RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, StandardDataFile,
         TextGroupKind,
     };
 
     use super::*;
-    use crate::rpg_maker::translate::standard::{PlaceholderRuleOrigin, PlaceholderSegment};
+    use crate::rpg_maker::translate::pipeline::{PlaceholderRuleOrigin, PlaceholderSegment};
 
     fn fingerprint(marker: u8) -> Sha256Fingerprint {
         Sha256Fingerprint::from_bytes([marker; 32])
@@ -484,7 +396,7 @@ mod tests {
         source_context_json: &str,
     ) -> TranslationUnitIdentity {
         TranslationUnitIdentity::new(
-            RpgMakerStandardAssetOwner::Builtin,
+            RpgMakerAssetOwner::Builtin,
             kind,
             RpgMakerLocation::value(source, vec![RpgMakerLocationStep::index(group_index)]),
             role,
@@ -602,8 +514,7 @@ mod tests {
                 third_context,
                 false,
             ),
-        ])
-        .expect("没有当前译文时应建立唯一模型责任");
+        ]);
         let (outcomes, invalidations, reuses) = result.into_parts();
 
         assert!(invalidations.is_empty());
@@ -657,8 +568,7 @@ mod tests {
                 state_context(2),
                 false,
             ),
-        ])
-        .expect("不同完整原文应各自建立模型责任");
+        ]);
         let (outcomes, invalidations, reuses) = result.into_parts();
 
         assert!(invalidations.is_empty());
@@ -696,8 +606,7 @@ mod tests {
                 target_context,
                 false,
             ),
-        ])
-        .expect("当前译文应直接复用");
+        ]);
         let (outcomes, invalidations, reuses) = result.into_parts();
 
         assert!(invalidations.is_empty());
@@ -765,8 +674,7 @@ mod tests {
                 target_context,
                 false,
             ),
-        ])
-        .expect("相同当前译文不构成冲突");
+        ]);
         let (outcomes, invalidations, reuses) = result.into_parts();
 
         assert!(invalidations.is_empty());
@@ -831,8 +739,7 @@ mod tests {
                 current_context,
                 false,
             ),
-        ])
-        .expect("失效译文不能成为种子，但可由当前种子原子覆盖");
+        ]);
         let (outcomes, invalidations, reuses) = result.into_parts();
 
         assert!(invalidations.is_empty());
@@ -868,12 +775,12 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_current_translations_fail_before_a_plan_exists() {
+    fn different_current_translations_coexist_without_reuse_or_model_work() {
         let first_context = state_context(1);
         let second_context = state_context(2);
         let first_translation = value("Save");
         let second_translation = value("Store");
-        let error = deduplicate_translation_candidates(vec![
+        let result = deduplicate_translation_candidates(vec![
             candidate(
                 scalar_identity(StandardDataFile::Items, 1, "name", "保存"),
                 "保存",
@@ -896,16 +803,137 @@ mod tests {
                 second_context,
                 false,
             ),
-        ])
-        .expect_err("同族当前译文冲突必须显式失败");
+        ]);
+        let (outcomes, invalidations, reuses) = result.into_parts();
 
+        assert!(invalidations.is_empty());
+        assert!(reuses.is_empty());
+        assert!(outcomes.iter().all(|outcome| matches!(
+            outcome,
+            TranslationDeduplicationOutcome::Virtual {
+                reason: TranslationVirtualReason::ExistingTranslation
+            }
+        )));
+    }
+
+    #[test]
+    fn many_different_current_translations_coexist_without_quadratic_comparison() {
+        const CURRENT_COUNT: usize = 4_096;
+
+        let candidates = (0..CURRENT_COUNT)
+            .map(|index| {
+                let context = state_context((index % 251 + 1) as u8);
+                let translation = value(&format!("译文-{index}"));
+                candidate(
+                    scalar_identity(StandardDataFile::Items, index, "name", "私"),
+                    "私",
+                    Vec::new(),
+                    Some(StoredTranslation::new(
+                        translation.clone(),
+                        context.finish(&translation),
+                    )),
+                    context,
+                    false,
+                )
+            })
+            .collect();
+        let result = deduplicate_translation_candidates(candidates);
+        let (outcomes, invalidations, reuses) = result.into_parts();
+
+        assert!(invalidations.is_empty());
+        assert!(reuses.is_empty());
+        assert_eq!(outcomes.len(), CURRENT_COUNT);
+        assert!(outcomes.iter().all(|outcome| matches!(
+            outcome,
+            TranslationDeduplicationOutcome::Virtual {
+                reason: TranslationVirtualReason::ExistingTranslation
+            }
+        )));
+    }
+
+    #[test]
+    fn different_current_translations_leave_missing_members_for_a_new_decision() {
+        let first_context = state_context(1);
+        let second_context = state_context(2);
+        let missing_context = state_context(3);
+        let other_missing_context = state_context(4);
+        let first_translation = value("我");
+        let second_translation = value("小女子");
+        let missing = scalar_identity(StandardDataFile::Items, 3, "name", "私");
+        let other_missing = scalar_identity(StandardDataFile::Items, 4, "name", "私");
+        let result = deduplicate_translation_candidates(vec![
+            candidate(
+                scalar_identity(StandardDataFile::Items, 1, "name", "私"),
+                "私",
+                Vec::new(),
+                Some(StoredTranslation::new(
+                    first_translation.clone(),
+                    first_context.finish(&first_translation),
+                )),
+                first_context,
+                false,
+            ),
+            candidate(
+                scalar_identity(StandardDataFile::Items, 2, "name", "私"),
+                "私",
+                Vec::new(),
+                Some(StoredTranslation::new(
+                    second_translation.clone(),
+                    second_context.finish(&second_translation),
+                )),
+                second_context,
+                false,
+            ),
+            candidate(
+                missing.clone(),
+                "私",
+                Vec::new(),
+                None,
+                missing_context,
+                false,
+            ),
+            candidate(
+                other_missing.clone(),
+                "私",
+                Vec::new(),
+                None,
+                other_missing_context,
+                false,
+            ),
+        ]);
+        let (outcomes, invalidations, reuses) = result.into_parts();
+
+        assert!(invalidations.is_empty());
+        assert!(reuses.is_empty());
         assert!(matches!(
-            error,
-            TranslationDeduplicationError::ConflictingReusableTranslations {
-                conflicts,
-                ..
-            } if conflicts.len() == 2
+            outcomes[0],
+            TranslationDeduplicationOutcome::Virtual {
+                reason: TranslationVirtualReason::ExistingTranslation
+            }
         ));
+        assert!(matches!(
+            outcomes[1],
+            TranslationDeduplicationOutcome::Virtual {
+                reason: TranslationVirtualReason::ExistingTranslation
+            }
+        ));
+        assert_eq!(
+            outcomes[2],
+            TranslationDeduplicationOutcome::Active {
+                propagation_targets: vec![TranslationPropagationTarget::new(
+                    other_missing,
+                    other_missing_context,
+                )],
+            }
+        );
+        assert_eq!(
+            outcomes[3],
+            TranslationDeduplicationOutcome::Virtual {
+                reason: TranslationVirtualReason::Duplicate {
+                    leader: Box::new(missing),
+                },
+            }
+        );
     }
 
     #[test]
@@ -927,8 +955,7 @@ mod tests {
                 state_context(2),
                 false,
             ),
-        ])
-        .expect("不同精确占位符契约必须形成独立去重族");
+        ]);
         let (outcomes, invalidations, reuses) = result.into_parts();
 
         assert!(invalidations.is_empty());
@@ -1010,8 +1037,7 @@ mod tests {
                 state_context(5),
                 false,
             ),
-        ])
-        .expect("正文必须按完整有序行及源姓名上下文去重");
+        ]);
         let (outcomes, invalidations, reuses) = result.into_parts();
 
         assert!(invalidations.is_empty());
@@ -1067,8 +1093,7 @@ mod tests {
                 state_context(2),
                 false,
             ),
-        ])
-        .expect("相同选项文本在不同问题下也必须独立翻译");
+        ]);
         let (outcomes, _, _) = result.into_parts();
 
         assert!(outcomes.iter().all(|outcome| matches!(
@@ -1127,8 +1152,7 @@ mod tests {
                 state_context(3),
                 false,
             ),
-        ])
-        .expect("滚动文本只应按完整有序行序列去重");
+        ]);
         let (outcomes, _, _) = result.into_parts();
 
         assert!(matches!(
@@ -1188,8 +1212,7 @@ mod tests {
                 state_context(4),
                 false,
             ),
-        ])
-        .expect("相同标量只有语义域和字段都相同才可复用");
+        ]);
         let (outcomes, _, _) = result.into_parts();
 
         assert!(matches!(
@@ -1287,8 +1310,7 @@ mod tests {
                 state_context(6),
                 false,
             ),
-        ])
-        .expect("Map ID 与插件加载索引不应切碎标量语义域");
+        ]);
         let (outcomes, _, _) = result.into_parts();
 
         assert!(matches!(
@@ -1396,8 +1418,7 @@ mod tests {
                 state_context(4),
                 false,
             ),
-        ])
-        .expect("不同自定义文件或插件不能因字段和原文相同而误复用");
+        ]);
         let (outcomes, _, _) = result.into_parts();
 
         assert!(outcomes.iter().all(|outcome| matches!(
@@ -1422,8 +1443,7 @@ mod tests {
         let result = deduplicate_translation_candidates(vec![
             candidate(first, "アリス", Vec::new(), None, state_context(1), false),
             candidate(second, "アリス", Vec::new(), None, state_context(2), false),
-        ])
-        .expect("完全相同的说话人应全局去重");
+        ]);
         let (outcomes, _, _) = result.into_parts();
 
         assert!(matches!(
@@ -1461,8 +1481,7 @@ mod tests {
                 pending_context,
                 false,
             ),
-        ])
-        .expect("失效译文应按待翻译语义单元处理");
+        ]);
         let (outcomes, invalidations, reuses) = result.into_parts();
 
         assert!(matches!(
