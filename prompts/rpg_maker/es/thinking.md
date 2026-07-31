@@ -1,13 +1,25 @@
-# Requisitos de salida del razonamiento
+# Piénsalo bien primero
 
-Para todo el TaskBlock, genera exactamente un bloque `<why>...</why>` antes del JSON final.
+Antes de escribir cualquier JSON, analiza toda la entrada: genera un bloque
+`<why>...</why>` y después el JSON.
 
-- La respuesta debe comenzar inmediatamente con la etiqueta exacta `<why>`, en minúsculas y sin atributos. No generes texto introductorio antes de ella ni anides o repitas `<why>`.
-- El contenido de `<why>` debe seguir sin estar vacío después de Unicode `trim()` y debe analizar realmente cada entrada marcada con `[ID]`:
-  1. el hablante, el oyente, el sujeto omitido y la posible persona gramatical;
-  2. las relaciones entre personajes, el tono, la emoción y el nivel de tratamiento honorífico;
-  3. el significado de la terminología y su expresión natural en el idioma de destino;
-  4. los marcadores de posición, los códigos de control, cada ATT token y la estructura de líneas exigida por `single line`, `free line breaking`, `N lines, corresponding line by line` o `N items, corresponding item by item`;
-  5. los valores `[ID]`, el número de líneas, los restos del idioma de origen y el formato final.
-- No te limites a escribir «comprobado» ni pases directamente a una conclusión; proporciona un análisis concreto. No se exigen títulos de sección fijos. ATT solo comprueba que el contenido del razonamiento no esté vacío y no juzga si el análisis es correcto.
-- Termina el único bloque con la etiqueta exacta `</why>`, en minúsculas y sin atributos. Entre `</why>` y el JSON solo puede haber espacios en blanco; después, genera directamente el JSON exigido por el system Prompt. El JSON no debe estar dentro de `<why>` y no se permite un segundo bloque `<why>...</why>`.
+- Empieza la respuesta directamente con `<why>`, en minúsculas y sin atributos, y
+  dentro escribe tu análisis real de cada entrada con `[ID]`:
+  1. quién habla, a quién, qué sujeto se omite y cuál es la persona probable;
+  2. las relaciones entre personajes, el tono, la emoción y el nivel de
+     tratamiento honorífico;
+  3. qué significa la terminología y cómo decirla con naturalidad en el idioma
+     de destino;
+  4. los marcadores de posición, los códigos de control, los marcadores
+     protegidos y la estructura de líneas que piden `single line`,
+     `free line breaking`, `N lines, corresponding line by line` o
+     `N items, corresponding item by item`;
+  5. los valores `[ID]`, el número de líneas, los restos del idioma de origen y
+     el formato final.
+- Ofrece un razonamiento concreto que el lector pueda seguir; los encabezados de
+  sección fijos son opcionales. Una vez eliminados los espacios del principio y
+  del final, debe quedar contenido de verdad.
+- Cierra con `</why>`, en minúsculas y sin atributos. Después de `</why>` solo
+  puede haber espacios en blanco y luego el JSON con la forma exigida; el JSON
+  vive siempre fuera de `<why>`, y el bloque `<why>...</why>` completo aparece
+  exactamente una vez.

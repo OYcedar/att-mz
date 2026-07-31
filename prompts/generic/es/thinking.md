@@ -1,10 +1,15 @@
-# Requisitos de razonamiento
+# Piénsalo bien primero
 
-Antes del JSON final, devuelve exactamente un bloque `<why>...</why>`.
+Antes del JSON final, piensa primero: genera un bloque `<why>...</why>` y
+después el JSON.
 
-- Empieza directamente con `<why>` exacto, en minúsculas y sin atributos, y termina con `</why>`.
-- El contenido tras Unicode trim debe ser no vacío y analizar para cada `[ID]` el contexto, los
-  referentes, la persona, el tono, la terminología, los saltos de línea, los ATT tokens, los restos
-  de lengua fuente y el formato final.
-- No escribas solo «comprobado» ni coloques el JSON final dentro de `<why>`.
-- Después de `</why>` solo puede haber espacios antes del JSON exigido por el system Prompt.
+- Empieza la respuesta directamente con `<why>`, en minúsculas y sin atributos,
+  y ciérralo con `</why>`; el bloque aparece exactamente una vez.
+- Dentro, escribe tu análisis real de cada `[ID]`: contexto, referencias,
+  persona, tono, terminología, saltos de línea, marcadores protegidos, restos
+  del idioma de origen y formato final. Una vez eliminados los espacios del
+  principio y del final, debe quedar contenido de verdad.
+- Ofrece un razonamiento concreto, no un mero «comprobado»; el JSON vive siempre
+  fuera de `<why>`.
+- Después de `</why>` solo puede haber espacios en blanco y luego el JSON con la
+  forma exigida.

@@ -6,8 +6,8 @@
 att --config FILE [--ui-language LANG] [--progress auto|plain|off] ENGINE COMMAND ...
 ```
 
-`ENGINE` 是 `mv`、`mz` 或 `generic`。除 Help 与 Version 外，配置、引擎、命令和项目名都
-必须显式提供，没有默认配置路径。
+`ENGINE` 取 `mv`、`mz` 或 `generic`。Help 与 Version 开箱即用；其余命令都要显式
+给出配置、引擎、命令和项目名，ATT 不设默认配置路径。
 
 当前命令：
 
@@ -38,8 +38,8 @@ Extract、Translate 和 WriteBack 不接受 `--lua`。独立 Lua 不接受 `--pr
 
 ## 2. UI 与进度
 
-`--progress` 默认为 `auto`。UI 语言可由 `--ui-language` 或 `ATT_UI_LANGUAGE` 指定，选择
-优先级为：
+`--progress` 默认为 `auto`。UI 语言可由 `--ui-language` 或 `ATT_UI_LANGUAGE` 指定，
+选择优先级为：
 
 ```text
 --ui-language > ATT_UI_LANGUAGE > Windows 用户首选 UI 语言 > en
@@ -51,16 +51,16 @@ Extract、Translate 和 WriteBack 不接受 `--lua`。独立 Lua 不接受 `--pr
 ar  zh-Hans  zh-Hant  en  fr  ru  es  ja  ko  vi
 ```
 
-区域变体按主语言选择，中文按简繁区域选择。显式非法值是输入错误；自动检测不能匹配时
-回退英语。Prompt locale 为 `auto` 时按项目目标语言选择可用 Prompt 资源；显式 locale
-覆盖自动选择。两者都不改变项目语言。
+区域变体按主语言归并，中文按简繁区域区分。显式非法值按输入错误处理；自动检测
+匹配不上时回退英语。Prompt locale 取 `auto` 时，ATT 按项目目标语言挑选可用的
+Prompt 资源；显式 locale 优先于自动选择。两种方式都不改变项目语言。
 
-路径、ID 和动态文本在终端与日志中移除终端转义、换行伪装和双向控制字符。十个 locale
-必须分别提供完整界面文本，不以英文 Debug 文本代替。
+路径、ID 和动态文本进入终端与日志前，会先移除终端转义、换行伪装和双向控制字符。
+十个 locale 各自提供完整界面文本，英文 Debug 文本不会拿来凑数。
 
 ## 3. 保存状态与省略参数
 
-省略可选参数只在文档明确说明时复用项目状态：
+省略可选参数时，ATT 只在以下明确说明的情形复用项目状态：
 
 - Generic 首次 Init 必须提供路径和语言；再次 Init 分项复用；
 - MV/MZ 首次 Init 还必须提供三个正数全角布局宽度；再次 Init 分项复用；
@@ -70,15 +70,16 @@ ar  zh-Hans  zh-Hant  en  fr  ru  es  ja  ko  vi
 - WriteBack 没有运行方案；
 - Lua 每次读取本次显式脚本。
 
-项目租约覆盖状态读取、业务执行、必要收尾和最终保存，防止并发命令拼接出不存在的选择。
+从状态读取、业务执行、必要收尾到最终保存，项目租约全程在场，两条并发命令拼不出
+一份不存在的选择。
 
 ## 4. 启动和资源
 
-程序按命令需要建立配置、项目、Prompt、Client、CPU、文件系统与 SQLite 能力。没有模型
-请求的命令不构造 HTTP Client；没有 Lua 的命令不构造 Lua VM。
+程序按命令的实际需要建立配置、项目、Prompt、Client、CPU、文件系统与 SQLite 能力：
+不发模型请求的命令不构造 HTTP Client，不运行 Lua 的命令不构造 Lua VM。
 
-文件解析与独立工作默认并行。需要确定顺序的结果按自然顺序合并和提交。窗口已满时上游
-等待，不把项目总量当作容量错误。
+文件解析与相互独立的工作默认并行；要求确定顺序的结果仍按自然顺序合并和提交。
+处理窗口装满时上游原地等待——项目再大也只是多等一会儿，不会变成容量错误。
 
 Ctrl-C 请求合作取消：
 
@@ -90,12 +91,12 @@ Ctrl-C 请求合作取消：
 
 ## 5. 输出与退出码
 
-stdout 只呈现进度和最终业务结果；stderr 呈现警告、降级和错误。项目命令建立 RunId 后，
-同一 RunId 用于终端摘要、项目日志和可选模型任务记录。
+stdout 呈现进度和最终业务结果，警告、降级和错误走 stderr。项目命令建立 RunId 后，
+终端摘要、项目日志和可选模型任务记录共用同一个 RunId。
 
 - `0`：命令得到明确成功结果，包括已明确的 Partial 或 Unavailable；
 - `1`：输入、运行、提交、发布或呈现失败；
 - `130`：受控取消。
 
-结果不明确时必须明确显示 `outcome_unknown`、影响范围、恢复位置和下一步，不得伪造成功
-或回滚。
+结果不明确时，ATT 如实显示 `outcome_unknown`、影响范围、恢复位置和下一步——
+宁可承认未知，也不伪造成功或回滚。

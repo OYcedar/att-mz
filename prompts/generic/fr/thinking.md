@@ -1,10 +1,14 @@
-# Exigences de réflexion
+# Réfléchissez d'abord
 
-Avant le JSON final, produisez exactement un bloc `<why>...</why>`.
+Avant le JSON final, réfléchissez d'abord : produisez un bloc `<why>...</why>`,
+puis le JSON.
 
-- Commencez directement par `<why>` en minuscules, sans attribut, et terminez par `</why>`.
-- Le contenu après Unicode trim doit être non vide et analyser, pour chaque `[ID]`, le contexte, les
-  références, la personne, le ton, la terminologie, les sauts de ligne, les ATT tokens, les restes
-  de langue source et le format final.
-- Ne vous contentez pas d'écrire « vérifié » et ne placez pas le JSON final dans `<why>`.
-- Après `</why>`, seuls des espaces sont permis avant le JSON imposé par le system Prompt.
+- Commencez la réponse directement par `<why>`, en minuscules et sans attribut,
+  et terminez-la par `</why>` ; le bloc apparaît exactement une fois.
+- À l'intérieur, écrivez votre véritable analyse de chaque `[ID]` : le contexte,
+  les références, la personne, le ton, la terminologie, les sauts de ligne, les
+  marqueurs protégés, les restes de langue source et le format final. Une fois
+  les espaces en début et en fin retirés, il doit rester un contenu réel.
+- Donnez un raisonnement concret, pas un simple « vérifié » ; le JSON se trouve
+  toujours en dehors de `<why>`.
+- Après `</why>`, il n'y a que des espaces puis le JSON dans la forme exigée.

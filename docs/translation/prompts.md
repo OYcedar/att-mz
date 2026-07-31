@@ -12,7 +12,7 @@
 `prompt-engine` 为 `rpg_maker` 或 `generic`。MV 与 MZ 共用 `rpg_maker`，Generic 使用
 `generic`。
 
-`[prompts].locale` 为具体 locale 时精确选择；`auto` 使用目标语言能够映射到的 locale。
+`[prompts].locale` 为具体 locale 时精确选择；`auto` 使用目标语言能够映射到的 locale，
 ATT 不回退到其他目录。`system.md` 必须存在、为非空 UTF-8，并且只能使用
 `{{source_language}}` 和 `{{target_language}}` 两个模板变量，两者必须都出现。
 
@@ -26,8 +26,8 @@ ATT 不回退到其他目录。`system.md` 必须存在、为非空 UTF-8，并�
 1. 渲染后的 system message；
 2. 当前 TaskBlock 的一条 user message。
 
-user message 只发送模型完成当前任务所需的语境、实际术语、形状标记和临时数字 ID，不
-发送项目数据库身份。
+user message 只携带模型完成当前任务所需的语境、实际术语、形状标记和临时数字 ID，
+不发送项目数据库身份。
 
 MV/MZ 的 value 是字符串数组，数组形状由 RPG Maker 翻译规格决定。Generic 的 value
 是一个字符串，并允许在 JSON 字符串中使用 `\n` 表示 LF：
@@ -46,7 +46,7 @@ MV/MZ 的 value 是字符串数组，数组形状由 RPG Maker 翻译规格决�
 {"1":"译文"}
 ```
 
-只能有一组精确小写、无属性的 `<why>...</why>`；其后除空白外只能是最终 JSON。
+只允许一组精确小写、无属性的 `<why>...</why>`；其后除空白外只能是最终 JSON。
 
 公共解析严格检查 thinking 信封和 JSON object，并按原始顺序保留全部 key，包括重复 key
 与不能解释为规范十进制数字的 key。引擎据此识别重复、非法、未知和缺少的 ID，再检查

@@ -84,6 +84,7 @@ fn documentation_has_one_navigation_and_three_independent_engine_domains() {
         "rpg-maker/README.md",
         "generic/README.md",
         "translation/README.md",
+        "../skills/extract-game-terminology/SKILL.md",
         "lua/README.md",
         "runtime/README.md",
     ] {
@@ -110,6 +111,10 @@ fn generic_jsonl_contract_and_example_use_the_minimal_shape() {
         "空输入目录和空 JSONL 文件合法",
         "扩展名精确为小写 `.jsonl`",
         "纯空白字符串按原值是合法身份",
+        "完整来源路径",
+        "同一 Group 的有序 Unit",
+        "较小且相关的完整 Group 保持在同一个 JSONL 文件中",
+        "Profile 目标字符数不决定 Group 边界",
     ] {
         assert!(
             contract.contains(required),
@@ -186,6 +191,9 @@ fn generic_dynamic_pipeline_and_independent_projects_are_documented() {
         "不包含文件、kind、Group 或 ID",
         "已经有多种不同 Current",
         "不跨越 JSONL 文件",
+        "按文件内自然顺序把完整 Group 依次加入 TaskBlock",
+        "不重排、回填或跨越",
+        "不能依赖相邻 Group 恰好进入同一个",
         "全部 Unit 按原顺序参与语境",
         "只有代表项带临时数字 ID",
         "每个 value 为字符串",
@@ -216,6 +224,8 @@ fn generic_dynamic_pipeline_and_independent_projects_are_documented() {
         "建立两个独立项目",
         "数据库、译文状态、日志、模型任务记录和输出都分别保存",
         "外部操作者负责把未覆盖内容转换成 Generic JSONL",
+        "来源路径到",
+        "Group、Unit、JSONL 相对文件和写回位置的映射",
     ] {
         assert!(guide.contains(required), "混合项目指南缺少 {required:?}");
     }
@@ -391,7 +401,7 @@ fn shared_translation_examples_and_prompt_locales_keep_the_current_protocol() {
     }
     for required in [
         "建立在[公共 Placeholder 规格]",
-        "本文只补充 MV/MZ 作用域",
+        "本规格只补充 MV/MZ",
         "控制符和形状规则",
     ] {
         assert!(
@@ -420,6 +430,9 @@ fn total_skill_routes_execution_to_documents_without_copying_product_protocols()
         "`generic`",
         "彼此独立",
         "外部操作者或工具",
+        "组织和审查 Generic JSONL",
+        "完整来源路径",
+        "Profile 目标字符数组合 TaskBlock",
         "同一文本",
         "Lua 文档精确修订",
         "Partial",
@@ -455,6 +468,84 @@ fn total_skill_routes_execution_to_documents_without_copying_product_protocols()
     assert!(
         !skill_root.join("README.md").exists(),
         "Skill 目录不应包含辅助 README"
+    );
+}
+
+#[test]
+fn terminology_selection_and_att_input_contract_stay_separate() {
+    let root = workspace_root();
+    let skill_root = root.join("skills/extract-game-terminology");
+    let skill = read_utf8(&skill_root.join("SKILL.md"));
+    let metadata = read_utf8(&skill_root.join("agents/openai.yaml"));
+    let rpg_maker = read_utf8(&skill_root.join("references/rpg-maker-mv-mz.md"));
+    let att_contract = read_utf8(&root.join("docs/translation/terminology.md"));
+
+    assert!(skill.lines().count() < 500, "术语制作 Skill 应保持简短");
+    for required in [
+        "游戏专有名称",
+        "游戏内有明确定义的词",
+        "两个合格译者",
+        "主要信号",
+        "官方名称",
+        "固定拼写",
+        "缺少官方译名不等于没有术语价值",
+        "普通名词",
+        "高频",
+        "下游格式",
+        "references/rpg-maker-mv-mz.md",
+    ] {
+        assert!(skill.contains(required), "术语制作 Skill 缺少 {required:?}");
+    }
+    for forbidden in ["ATT", "[[term]]", "translate --terms"] {
+        assert!(
+            !skill.contains(forbidden),
+            "通用术语制作 Skill 不得复制 ATT 契约 {forbidden:?}"
+        );
+    }
+
+    for required in [
+        "data/System.json",
+        "data/Actors.json",
+        "data/MapNNN.json",
+        "js/plugins.js",
+        "名称字段当作高密度候选源",
+        "次数只用于定位重要位置",
+        "表面普通但由游戏明确定义的词",
+    ] {
+        assert!(
+            rpg_maker.contains(required),
+            "RPG Maker 术语抓取参考缺少 {required:?}"
+        );
+    }
+
+    for required in [
+        "ATT 从已经确定的术语要求开始",
+        "不负责从游戏内容中发现候选",
+        "通用游戏术语表制作 Skill",
+        "严格 TOML",
+        "没有按文件、Group、kind",
+        "上下文限定作用域的字段",
+    ] {
+        assert!(
+            att_contract.contains(required),
+            "ATT 术语规格缺少职责或输入契约 {required:?}"
+        );
+    }
+
+    for required in [
+        "display_name: \"制作游戏术语表\"",
+        "short_description:",
+        "default_prompt:",
+        "$extract-game-terminology",
+    ] {
+        assert!(
+            metadata.contains(required),
+            "术语制作 agents/openai.yaml 缺少 {required:?}"
+        );
+    }
+    assert!(
+        !skill_root.join("README.md").exists(),
+        "术语制作 Skill 目录不应包含辅助 README"
     );
 }
 

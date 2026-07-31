@@ -1,19 +1,19 @@
 # RPG Maker 规则文件现行规格与编写指南
 
-本文负责 RPG Maker MV/MZ 三类声明式规则中的引擎专用事实：
+RPG Maker MV/MZ 的三类声明式规则，其引擎专用事实由本规格统一约定：
 
 - MV 对话姓名投影（`--dialogue-rules`）；
 - Extract Rules（`extract --rules`）；
 - Placeholder Rules 的 RPG Maker kind、Builtin 控制符与数组槽边界
   （`translate --placeholders`）。
 
-MV 姓名投影与 Extract Rules 的字段、默认值、互斥关系、解析失败和执行失败均以本文为
-准。Placeholder 的公共 TOML、捕获、token、恢复与资源生命周期以
-[公共 Placeholder 规格](../translation/placeholders.md)为准；本文只补充 MV/MZ 作用域、
-控制符和形状规则。提取、翻译阶段文档只说明状态交接，不重复定义字段。外部作者不需要
-阅读源码来猜测真实行为。
+MV 姓名投影与 Extract Rules 的字段、默认值、互斥关系、解析失败和执行失败，均以本
+规格为唯一权威。Placeholder 的公共 TOML、捕获、token、恢复与资源生命周期以
+[公共 Placeholder 规格](../translation/placeholders.md)为准；本规格只补充 MV/MZ
+作用域、控制符和形状规则。提取、翻译阶段文档只说明状态交接，字段定义全部回到这里。外部
+作者读完本规格即可写对规则，真实行为不需要从源码反推。
 
-本文所有规范代码块前都有机器可读标记：
+每个规范代码块前面都有一枚机器可读标记，说明它能拿来做什么：
 
 - `<!-- att-example: valid -->`：可直接交给相应生产解析器的完整有效输入；
 - `<!-- att-example: invalid -->`：必须被生产边界拒绝的完整输入；
@@ -41,8 +41,8 @@ MV 姓名投影与 Extract Rules 的字段、默认值、互斥关系、解析�
 rule = []
 ```
 
-零字节文件、只有注释的文件、缺少 `rule`、未知字段、重复字段或错误类型都属于普通
-无效输入，不等于空定义。文件只接受本规格列出的根、字段和值。
+零字节文件、只有注释的文件、缺少 `rule`、未知字段、重复字段或错误类型，都按普通
+无效输入处理，而不是空定义。文件只接受本规格列出的根、字段和值。
 
 <!-- att-example: invalid -->
 ```toml
@@ -57,24 +57,24 @@ rule = []
 | 提供 `rule = []` | 清空姓名定义 | 停用并删除 Rules owner 快照 | 清空自定义规则；Builtin 保护仍在 |
 | 省略参数 | 复用项目当前定义，不重新解析文件 | 所有 owner 参数均省略时按上次成功方案复用；显式选择其他 owner 时不执行且既有资产不变 | 复用项目当前资源 |
 
-`--dialogue-rules` 只允许与 MV `--builtin` 同时使用。三个文件任一候选失败，都不会用
-半成品覆盖它对应的旧状态。阶段级的先后提交语义见[提取规格](extraction.md)和
+`--dialogue-rules` 必须与 MV `--builtin` 结伴出现。三个文件中任一候选失败，旧状态都
+原样保留，半成品永远不会盖上去。阶段级的先后提交语义见[提取规格](extraction.md)和
 [翻译规格](translation.md)。
 
 ### 2.1 PCRE2 与三层转义
 
-三类规则的正则均使用 PCRE2，开启 UTF 与 UCP。它不是 JavaScript `RegExp`：不要使用
-JavaScript 正则字面量 `/.../flags`；标志应写在模式内（如 `(?i)`），Unicode 属性、
-命名捕获、锚点和替换语义以 PCRE2 为准。`.` 默认不匹配 LF；确实需要让单次匹配跨越
-多行时，必须在模式中显式启用 DOTALL，例如 `(?s)`。DOTALL 只决定 PCRE2 是否能看到
-LF，不会取消 Placeholder 的 `Lines` 槽边界：匹配可以跨 `Value` 内部 LF，但实际 opaque
-保护跨度不得吞入两个 `Lines` 元素之间的拼接 LF。
+三类规则的正则都使用 PCRE2，开启 UTF 与 UCP。写法上它和 JavaScript `RegExp` 不同：
+标志写在模式内（如 `(?i)`），不用 `/.../flags` 字面量；Unicode 属性、命名捕获、锚点
+和替换语义以 PCRE2 为准。`.` 默认不匹配 LF；想让单次匹配跨越多行，就在模式中显式
+启用 DOTALL，例如 `(?s)`。DOTALL 只决定 PCRE2 能否看到 LF，Placeholder 的 `Lines`
+槽边界依然有效：匹配可以跨过 `Value` 内部的 LF，但实际 opaque 保护跨度不得吞入两个
+`Lines` 元素之间的拼接 LF。
 
-推荐使用 TOML 单引号字面字符串，让反斜杠原样传给 PCRE2：
+写 pattern 时推荐用 TOML 单引号字面字符串，反斜杠可以原样直达 PCRE2：
 
-本小节下面两个标为 `valid` 的完整 `[[rule]]` 采用 Placeholder Rules 的字段形状，并由
-Placeholder 生产解析与编译边界验收；MV 姓名规则和 Extract Rules 使用相同的 TOML/PCRE2
-转义原则，但还必须分别补齐 `speaker` 捕获或 Extract 来源与 `text` 捕获。
+下面两个标为 `valid` 的完整 `[[rule]]` 采用 Placeholder Rules 的字段形状，由 Placeholder
+生产解析与编译边界验收；MV 姓名规则和 Extract Rules 遵循同一套 TOML/PCRE2 转义原则，
+只是还要分别补齐 `speaker` 捕获，或 Extract 来源与 `text` 捕获。
 
 <!-- att-example: valid -->
 ```toml
@@ -82,7 +82,7 @@ Placeholder 生产解析与编译边界验收；MV 姓名规则和 Extract Rules
 pattern = '\A(?<text>正文)\z'
 ```
 
-写 Extract 路径中的 quoted key 时，最多同时存在三层语法，必须逐层计算：
+写 Extract 路径里的 quoted key 时，最多有三层语法叠在一起，逐层算清才不会出错：
 
 1. TOML 字符串；
 2. 路径中 quoted key 使用的 JSON string；
@@ -120,8 +120,8 @@ pattern = '\\SE\[[^]]+\]'
 pattern = '\A\\N<(?<speaker>[^>]*)>\z'
 ```
 
-未命名捕获可以使用；除 `speaker` 外的任何命名捕获都非法。`pattern = ""` 在编译边界
-作为空模式错误拒绝，而不是被当成一个到处零宽命中的规则。
+未命名捕获随意使用，命名捕获则只有 `speaker` 一个位置。`pattern = ""` 会在编译边界
+作为空模式错误被拒绝——它不会变成一条到处零宽命中的规则。
 
 <!-- att-example: invalid -->
 ```toml
@@ -131,17 +131,17 @@ pattern = ''
 
 ### 3.2 类型、默认值与互斥
 
-`pattern` 只能是 TOML string，没有默认值。每项只能出现这一个字段；缺少它、写成数组、
-同时写入 Extract/Placeholder 字段或出现未知字段，都会使整份文件无效。每个模式必须且
-只能声明一个 `speaker` 命名捕获；未命名捕获允许存在，其他命名捕获不允许存在。
+`pattern` 只接受 TOML string，没有默认值，也是每项唯一允许的字段；缺少它、写成数组、
+混入 Extract/Placeholder 字段或出现未知字段，整份文件都会无效。`speaker` 命名捕获必须
+恰好一个，其他命名捕获一律非法。
 
-姓名定义只适用于 MV Builtin；MZ 的原生 Speaker 不与此规则互斥，而是完全不消费此文件。
+姓名定义只为 MV Builtin 服务；MZ 有自己的原生 Speaker，这份文件对它完全不生效。
 
 ### 3.3 解析失败
 
-下列问题在读取或编译候选时拒绝整份定义，不接触冻结游戏来源：根不是 `rule` 数组、字段
-缺失/重复/未知、类型错误、空模式、无效 PCRE2、`speaker` 数量不为一，或存在其他命名
-捕获。PCRE2 与转义边界以[第 2.1 节](#21-pcre2-与三层转义)为准。
+出现下列任一问题，整份定义在读取或编译候选时就会被拒绝，冻结游戏来源不会被触碰：
+根不是 `rule` 数组、字段缺失/重复/未知、类型错误、空模式、无效 PCRE2、`speaker` 数量
+不为一，或存在其他命名捕获。PCRE2 与转义边界以[第 2.1 节](#21-pcre2-与三层转义)为准。
 
 ### 3.4 针对来源执行失败
 
@@ -154,9 +154,9 @@ pattern = ''
 不规范化。单次空/纯空白捕获是合法命中；但一条非空规则在整份当前冻结来源执行完后，
 仍必须至少建立过一个非空白 Speaker，证明这条规则在本游戏中有现实消费。
 
-一条规则可在同一第一行产生多个不重叠匹配。所有实际建立的 Speaker 必须原始字节完全
-相同。两条不同规则只要都命中同一第一条 `401` 就冲突，不要求两个跨度重叠，也没有
-“先写优先”。规则序号只用于错误定位。
+一条规则可以在同一第一行产生多个不重叠匹配，但所有实际建立的 Speaker 必须原始字节
+完全相同。两条不同规则只要都命中同一第一条 `401` 就冲突——跨度是否重叠、谁先写都
+不影响判定。规则序号只用于错误定位。
 
 ATT 将从行首到最后一个 marker 结束处投影成 Literal/SpeakerSlot。最后 marker 后：
 
@@ -191,7 +191,8 @@ Body    ：不由这一行建立
 - 某条规则在全部当前对话中从未建立任何非空白 Speaker；
 - 投影与 Builtin/Rules 的物理修改声明冲突。
 
-规则不应依靠“像姓名”猜测整行。应使用当前游戏消费协议的 marker、锚点和反例验证。
+写规则要对准当前游戏消费协议的 marker 和锚点，并用反例验证；“看起来像姓名”的整行
+猜测迟早会误伤。
 
 ### 3.6 提供文件、略去参数与显式空数组的生命周期
 
@@ -232,8 +233,8 @@ pattern = '\A\[title\](?<text>.+)\z'
 | `decode_json` | boolean | 可选，默认 `false` | 要求路径终点 string 再解码一次，结果仍须为 string |
 | `pattern` | string | 可选 | 非空 PCRE2；若存在，恰好一个 `text` 命名捕获 |
 
-`file`、`plugin`、`code+parameter` 恰好选择一个来源。`parameter` 不能单独出现，`code`
-也不能省略 `parameter`。没有 `label`、`priority`、`required`、`translate` 或版本字段。
+`file`、`plugin`、`code+parameter` 三种来源恰好选择一个，`code` 与 `parameter` 必须
+成对出现。字段到此为止：`label`、`priority`、`required`、`translate` 和版本字段都不存在。
 
 <!-- att-example: invalid -->
 ```toml
@@ -245,12 +246,12 @@ path = 'name'
 
 ### 4.2 类型、默认值与互斥
 
-每项恰好选择 `file`、`plugin`、`code+parameter` 三种来源之一。`file/plugin` 必须提供
-`path`；command 可省略 `path`，此时参数自身必须是最终 string。`decode_json` 仅接受
-boolean，默认 `false`；`pattern` 省略时使用整个最终 string，提供时必须是非空 string。
-`code`、`parameter` 与固定数组下标都是非负整数，不接受浮点数、数字字符串或负数。
+三项来源的互斥选择见 4.1。`file/plugin` 必须提供 `path`；command 可省略 `path`，
+此时参数自身必须是最终 string。`decode_json` 仅接受 boolean，默认 `false`；`pattern`
+省略时使用整个最终 string，提供时必须是非空 string。`code`、`parameter` 与固定数组
+下标都是非负整数，浮点数、数字字符串和负数都不接受。
 
-来源选择是互斥关系，不是优先级；不能靠字段排列让其中一个来源覆盖另一个来源。
+来源选择是互斥关系而非优先级：字段的排列顺序无法让一个来源盖过另一个。
 
 三类来源的 `path` 都从已经选中的来源值开始，起点固定如下：
 
@@ -284,10 +285,10 @@ boolean，默认 `false`；`pattern` 省略时使用整个最终 string，提供
 
 ### 4.5 原子失败范围
 
-一份 Extract Rules 文件先整体解析、编译并针对同一冻结来源执行，再作为一个 Rules owner
-候选提交。任一规则失败、recipe 无法重建或 Mutation Claim 冲突，整个候选不提交；旧
-Rules owner 快照保持不变。成功时文件内全部规则的结果一次性替换该 owner，不做逐规则
-部分提交。
+一份 Extract Rules 文件先整体解析、编译，并针对同一冻结来源执行，再作为一个 Rules
+owner 候选提交。任一规则失败、recipe 无法重建或 Mutation Claim 冲突，整个候选都不
+提交，旧 Rules owner 快照原样保持；成功时，文件内全部规则的结果一次性替换该 owner，
+没有逐规则的部分提交。
 
 ### 4.6 提供文件、略去参数与显式空数组的生命周期
 
@@ -299,9 +300,9 @@ Rules owner 快照保持不变。成功时文件内全部规则的结果一次�
 - 提供内容为 `rule = []` 的文件：明确停用并删除 Rules owner 快照，同时把 Rules 移出
   后续自动方案。
 
-因此“整组 owner 参数省略”“显式选择其他 owner 时未列出 Rules”和“传空定义”是三个
-不同意图，不能互换。保存方案持有 canonical 语义而不是文件路径，所以原 TOML 移动或
-删除不影响自动复用。
+可见，“整组 owner 参数省略”“显式选择其他 owner 时未列出 Rules”和“传空定义”是三个
+不同意图，请按需选用。保存方案持有 canonical 语义而不是文件路径，原 TOML 移动或删除
+都不影响自动复用。
 
 ### 4.7 可复制正例、反例和物化结果
 
@@ -378,7 +379,8 @@ file = "QuestEntries.json"
 path = ''
 ```
 
-不支持 `$`、递归下降、过滤器、对象键通配、负数下标或方括号外的任意 Unicode key。
+语法到此为止：`$`、递归下降、过滤器、对象键通配、负数下标和方括号外的任意 Unicode
+key 都不在其中。
 
 路径继续而当前值为 JSON string 时，ATT 会把该 string 解码成 JSON 后继续；若下一步仍
 需要继续且又遇到 string，就再次解码。每一层都记录进 recipe，写回按相反顺序编码。
@@ -416,10 +418,11 @@ path = 'payload.entry.title'
 - 空白 `text` 不产出单元；匹配之外和捕获之外的字节冻结为 Literal；
 - 一条非空规则在整个当前来源中至少产出一个非空单元，否则 Rules 候选失败。
 
-同一最终 string 内由同一规则的多次捕获自动形成一个组，字段按捕获字节位置排列；不要
-用多条规则瓜分同一个 string。组的自然顺序使用[第 5 节](#5-自然顺序与-mutation-claim)
-定义的 canonical 来源顺序，再按结构路径和捕获字节位置排列；规则编号不参与排序。数组
-下标按数值顺序（`2` 在 `10` 前），不是按位置字符串排序。
+同一最终 string 内由同一规则的多次捕获自动形成一个组，字段按捕获字节位置排列；同一
+个 string 交给一条规则就好，别让多条规则瓜分。组的自然顺序使用
+[第 5 节](#5-自然顺序与-mutation-claim)定义的 canonical 来源顺序，再按结构路径和捕获
+字节位置排列；规则编号不参与排序。数组下标按数值顺序（`2` 在 `10` 前），而不是按
+位置字符串排序。
 
 <!-- att-example: valid -->
 ```toml
@@ -447,7 +450,8 @@ recipe：Literal("A<t>") + Slot(0) + Literal("</t>B<t>") + Slot(1) + Literal("</
   模式，则 Unit 仍是完整 `<Help:炎之剑的说明>`；Placeholder 只在该 Unit 内保护前后壳，
   不改变 Unit 身份或 recipe。
 
-选择哪一种只由规则作者表达的翻译边界决定，ATT 不根据 `<name:value>` 外观猜测标签。
+选择哪一种，取决于规则作者想表达的翻译边界；ATT 只认写明的规则，不根据 `<name:value>`
+外观猜测标签。
 
 ### 4.11 来源执行与原子失败范围
 
@@ -469,7 +473,7 @@ JSON 解码、最终 string、捕获、重建或物理 Claim 不成立，整个 
 - Rules：下表定义的 canonical 来源顺序、来源内部结构路径顺序、同一 string 的捕获字节
   位置。
 
-Rules 的跨来源顺序是稳定契约，不读取也不继承 OS 目录枚举顺序：
+Rules 的跨来源顺序是稳定契约，与 OS 目录枚举顺序无关：
 
 | 次序 | Rules 来源 | 来源之间的顺序 |
 |---:|---|---|
@@ -504,14 +508,14 @@ owner 内、跨 owner Store 和 WriteBack 发布前使用同一规则。
 | Dialogue/Choices/ScrollingText 事件块与其覆盖字段或 decoded descendant | 冲突 |
 | 两个互不覆盖的事件块或普通值 | 允许 |
 
-因此“最终字符串文字刚好相等”以及 Value 是否包含 `<`、`>` 都不是冲突判断；关键是两个
-recipe 是否竞争同一物理资源。
+所以，“最终字符串文字刚好相等”和 Value 是否包含 `<`、`>` 都不构成冲突判断；真正的
+问题是两个 recipe 是否竞争同一物理资源。
 
 ## 6. RPG Maker Placeholder Rules
 
-本节建立在[公共 Placeholder 规格](../translation/placeholders.md)之上。共同的严格 TOML、
-`pattern`、可选 `scopes`、`text` 捕获和 token 恢复不在这里另建一套解释；下面只规定
-MV/MZ 能使用的 scope、Builtin 控制符与数组槽行为。
+本节建立在[公共 Placeholder 规格](../translation/placeholders.md)之上。严格 TOML、
+`pattern`、可选 `scopes`、`text` 捕获和 token 恢复都沿用那里的解释；下面只规定 MV/MZ
+能使用的 scope、Builtin 控制符与数组槽行为。
 
 ### 6.1 RPG Maker scope
 
@@ -531,11 +535,13 @@ pattern = '<name>(?<text>.*?)</name>'
 | `pattern` | string | 必填 | 非空 PCRE2；无命名捕获，或恰好一个 `text` |
 | `scopes` | string array | 可选；省略表示全部 scope | 显式数组必须非空、无重复、只含下表值 |
 
-合法 scope：`database_entry`、`system`、`map`、`event_dialogue`、`event_choices`、
-`event_scrolling_text`、`event_command`、`plugin_parameter`。没有 `all`、别名或父 scope。
+合法 scope 共八个：`database_entry`、`system`、`map`、`event_dialogue`、`event_choices`、
+`event_scrolling_text`、`event_command`、`plugin_parameter`；`all`、别名和父 scope 都不
+存在。
 
-无 `text` 捕获时完整匹配是不透明保护段；有 `text` 时，完整匹配中捕获前后的 wrapper
-是不透明边界，捕获本身仍是 NaturalText。`text` 不是“要保护的内容”。
+无 `text` 捕获时，完整匹配整段都是不透明保护区；有 `text` 时，捕获前后的 wrapper 是
+不透明边界，捕获本身仍是可以翻译的 NaturalText。注意 `text` 的含义恰恰不是“要保护
+的内容”。
 
 ### 6.2 类型、默认值与互斥
 
@@ -592,10 +598,10 @@ Builtin 匹配严格使用 ASCII 字母和 `[0-9]`；命令名接受 ASCII 大�
 | `\G` | 保护 | 保护 |
 | `\\`、`\{`、`\}`、`\$`、`\.`、`\|`、`\!`、`\>`、`\<`、`\^` | 保护 | 保护 |
 
-`n` 必须由一个或多个 ASCII 数字组成。插件扩展，包括 MV 插件自行实现的 PX/PY/FS，
-用自定义 Placeholder Rule 明确保护。
-表中的 `\<`、`\>` 都包含实际反斜杠；裸 `<`、`>` 不是 Builtin Placeholder，也不会因
-外形类似插件协议而被推断成占位符。
+`n` 必须由一个或多个 ASCII 数字组成。插件扩展——包括 MV 插件自行实现的 PX/PY/FS——
+请用自定义 Placeholder Rule 明确保护。
+表中的 `\<`、`\>` 都带着实际的反斜杠；裸 `<`、`>` 不是 Builtin Placeholder，外形再像
+插件协议也不会被推断成占位符。
 
 MV 行为依据 RPG Maker MV 的
 [官方 `Window_Base` 核心脚本](https://raw.githubusercontent.com/rpgtkoolmv/corescript/master/js/rpg_windows/Window_Base.js)
@@ -604,10 +610,9 @@ MV 行为依据 RPG Maker MV 的
 ### 6.9 匹配、NaturalText 与重叠
 
 完整匹配必须非零宽并落在 UTF-8 字符边界；`text` 若存在，必须参与、位于匹配内并落在
-UTF-8 字符边界。自定义
-规则零命中合法。ATT 先求出每条规则实际保护的跨度，再检查冲突：保护跨度相交才冲突。
-wrapper 的 NaturalText 捕获中可以继续出现 Builtin 控制符，Builtin 会在 NaturalText
-内部保护它，不会因为两个完整正则范围包含彼此就误判。
+UTF-8 字符边界。自定义规则零命中合法。ATT 先求出每条规则实际保护的跨度，再检查冲突：
+保护跨度相交才冲突。wrapper 的 NaturalText 捕获中可以继续出现 Builtin 控制符，Builtin
+会在 NaturalText 内部保护它，两个完整正则范围互相包含也不会误判。
 
 `Value` 是一个完整标量，规则可以按 PCRE2 设置跨其中的 LF 匹配。`Lines` 则保留元素槽
 边界：无 `text` 捕获的完整 opaque 匹配不得跨元素；有 `text` 捕获时，完整 wrapper 匹配
@@ -633,8 +638,8 @@ NaturalText，但 Unit 原文、Group、recipe、持久身份和去重输入都�
 例如源 `Lines` 为 `["<msg>第一行", "第二行</msg>"]` 时，若模式启用 DOTALL，元素边界
 位于 `text` 捕获中，因此合法；无 `text` 捕获并把两行整体保护的模式则使该单元规划失败。
 
-Custom/Custom 或 Custom/Builtin 的实际保护跨度相交时，本单元规划失败；没有规则优先级、
-最长匹配或静默覆盖。
+Custom/Custom 或 Custom/Builtin 的实际保护跨度一旦相交，本单元规划失败——这里没有
+规则优先级、最长匹配或静默覆盖。
 
 ### 6.10 token、FullyProtected 与 Current
 
@@ -675,12 +680,12 @@ NaturalText 捕获中的“勇者”：命中
 opaque 后壳：不扫描
 ```
 
-若 trigger 的前半在一个 NaturalText 段、后半在另一个 NaturalText 段，它也不命中。
+即使 trigger 的前半在一个 NaturalText 段、后半在另一个 NaturalText 段，它同样不命中。
 术语文件完整契约见[公共术语规格](../translation/terminology.md)。
 
 ## 8. 一次写对的验证清单
 
-提交规则前，用当前游戏的正向和反向样本逐项确认：
+提交规则前，拿当前游戏的正向和反向样本逐项过一遍：
 
 1. 来源是实际启用的消费者读取的精确物理身份，文件大小写与目录项一致；
 2. 正例能命中，形似的代码、资源名、禁用插件或不可达内容不命中；

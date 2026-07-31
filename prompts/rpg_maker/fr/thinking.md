@@ -1,13 +1,26 @@
-# Exigences relatives à la sortie de réflexion
+# Réfléchissez d'abord
 
-Pour l'ensemble du TaskBlock, produisez exactement un bloc `<why>...</why>` avant le JSON final.
+Avant d'écrire le moindre JSON, pesez l'ensemble de l'entrée : produisez un
+bloc `<why>...</why>`, puis le JSON.
 
-- La réponse doit commencer immédiatement par la balise exacte `<why>`, en minuscules et sans attribut. Ne produisez aucun texte introductif avant elle et n'imbriquez ni ne répétez `<why>`.
-- Le contenu de `<why>` doit rester non vide après Unicode `trim()` et analyser réellement chaque entrée marquée par `[ID]` :
-  1. le locuteur, le destinataire, le sujet omis et la personne grammaticale possible ;
-  2. les relations entre personnages, le ton, l'émotion et le niveau de politesse ;
-  3. le sens des termes et leur expression naturelle dans la langue cible ;
-  4. les espaces réservés, les codes de contrôle, chaque ATT token et la structure de lignes imposée par `single line`, `free line breaking`, `N lines, corresponding line by line` ou `N items, corresponding item by item` ;
-  5. les valeurs `[ID]`, le nombre de lignes, les résidus de la langue source et le format final.
-- Ne vous contentez pas d'écrire « vérifié » et ne passez pas directement à la conclusion ; fournissez une analyse concrète. Aucun titre de rubrique fixe n'est imposé. ATT vérifie seulement que le contenu de réflexion n'est pas vide et ne juge pas si l'analyse est correcte.
-- Terminez ce bloc unique par la balise exacte `</why>`, en minuscules et sans attribut. Seuls des espaces peuvent séparer `</why>` du JSON ; produisez ensuite directement le JSON exigé par le system Prompt. Le JSON ne doit pas se trouver dans `<why>` et aucun second bloc `<why>...</why>` n'est autorisé.
+- Commencez la réponse directement par `<why>`, en minuscules et sans attribut,
+  et écrivez-y votre véritable analyse de chaque entrée `[ID]` :
+  1. qui parle, à qui, quel sujet est omis et quelle personne est la plus
+     probable ;
+  2. les liens entre les personnages, le ton, l'émotion et le niveau de
+     langue ;
+  3. ce que signifie la terminologie et comment la dire naturellement dans la
+     langue cible ;
+  4. les espaces réservés, les codes de contrôle, les marqueurs protégés et la
+     structure de lignes demandée par `single line`, `free line breaking`,
+     `N lines, corresponding line by line` ou
+     `N items, corresponding item by item` ;
+  5. les valeurs `[ID]`, le nombre de lignes, les restes de langue source et le
+     format final.
+- Donnez un raisonnement concret qu'un lecteur puisse suivre ; les titres de
+  rubriques fixes sont facultatifs. Une fois les espaces en début et en fin
+  retirés, il doit rester un contenu réel.
+- Terminez par `</why>`, en minuscules et sans attribut. Après `</why>`, il n'y
+  a que des espaces puis le JSON dans la forme exigée ; le JSON se trouve
+  toujours en dehors de `<why>`, et le bloc `<why>...</why>` apparaît
+  exactement une fois.

@@ -1,2 +1,2 @@
-{"id":"opening","kind":"dialogue","units":[{"id":"speaker","text":"アリス"},{"id":"body","text":"こんにちは。\n今日はいい天気ですね。"}]}
-{"id":"menu-help","kind":"description","units":[{"id":"text","text":"装備を変更します。"}]}
+{"id":"opening-dialogue","kind":"dialogue","units":[{"id":"speaker","text":"アリス"},{"id":"body","text":"こんにちは。\n一緒に行きませんか？"}]}
+{"id":"opening-choice","kind":"choice","units":[{"id":"prompt","text":"一緒に行きますか？"},{"id":"accept","text":"はい"},{"id":"decline","text":"いいえ"}]}

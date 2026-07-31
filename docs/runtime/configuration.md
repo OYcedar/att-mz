@@ -1,7 +1,7 @@
 # ATT 配置现行规格
 
-除 Help 和 Version 外，每次进程都通过顶层 `--config FILE` 指定 UTF-8 TOML。相对配置
-路径以当前工作目录为基准；配置内路径以配置文件所在目录为基准。
+每次进程都通过顶层 `--config FILE` 拿到一份 UTF-8 TOML（Help 和 Version 除外）。
+相对配置路径以当前工作目录为基准；配置内路径以配置文件所在目录为基准。
 
 当前顶层只允许：
 
@@ -11,8 +11,8 @@
 - `[[languages]]`
 - `[translation]` 与 `[[translation.profiles]]`
 
-未知字段、重复 key、错误类型、空白 ID 和规范化后的重复 ID 都严格拒绝。配置只解析当前
-命令实际使用的子树。
+未知字段、重复 key、错误类型、空白 ID 和规范化后的重复 ID 都会被严格拒绝——启动
+时说清楚，胜过带着歧义往下走。配置只解析当前命令实际使用的子树。
 
 ## 1. 项目路径
 
@@ -27,7 +27,7 @@ root = "projects"
 <projects.root>/<mv|mz|generic>/<project-name>/
 ```
 
-项目租约、数据库、日志、任务记录、候选和输出位置不能另行配置。
+项目租约、数据库、日志、任务记录、候选和输出的位置都由工作区固定，无需另行配置。
 
 ## 2. Prompt 与翻译 Profile
 
@@ -67,8 +67,8 @@ allowed_terms = []
 quote_repair_pairs = [["“", "”"], ["‘", "’"]]
 ```
 
-每种语言类型只接受自己声明的字段。Translate 校验全部定义，再精确选择项目源语言模块。
-完整语义见[语言规格](../translation/language.md)。
+每种语言类型只接受自己声明的字段。Translate 校验全部定义，再精确选择项目源语言
+模块。完整语义见[语言规格](../translation/language.md)。
 
 ## 4. LLM Client
 
@@ -94,12 +94,13 @@ requests_per_minute = 60
 burst = 8
 ```
 
-`rate_limit` 整表可省略。存在时两个值都必须为正。`proxy` 是 `false` 或不含凭据的 URL。
-`parameters` 必须是严格 JSON object，顶层不得包含 `model`、`messages` 或 `stream`。
-ATT 不展开 `api_key` 环境变量。
+`rate_limit` 整表可省略；一旦给出，两个值都必须为正。`proxy` 取 `false` 或一个
+不含凭据的 URL。`parameters` 是严格 JSON object，顶层留给 ATT 的 `model`、
+`messages`、`stream` 三个键不出现在这里。`api_key` 按字面读取，ATT 不展开环境
+变量。
 
-超时、重试、代理、PEM 和 rate limit 都是外部服务约束。内部 worker、TaskBlock 数量、
-SQLite 策略和文件总量不是配置。
+超时、重试、代理、PEM 和 rate limit 描述的是外部服务约束，所以进入配置；内部
+worker、TaskBlock 数量、SQLite 策略和文件总量由执行代码决定，不出现在配置里。
 
 ## 5. 路径与敏感信息
 
@@ -109,5 +110,5 @@ SQLite 策略和文件总量不是配置。
 | `projects.root`、`prompts.root`、`additional_pem_files` | 配置文件所在目录 |
 | CLI 的游戏、JSONL、Rules、术语、Placeholder 与 Lua 路径 | 进程当前工作目录 |
 
-配置诊断展示路径、字段、一基行列和具体原因，但按照
-[Chat Completions 规格](chat-completions.md#6-敏感信息闭集唯一权威)处理敏感值。
+配置出错时，诊断会给出路径、字段、一基行列和具体原因；敏感值按
+[Chat Completions 规格](chat-completions.md#6-敏感信息闭集唯一权威)处理。

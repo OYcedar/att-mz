@@ -5,6 +5,6 @@
 - [`terminology.toml`](terminology.toml)：公共术语格式；
 - [`placeholders.toml`](placeholders.toml)：RPG Maker kind 与控制符保护。
 
-示例只说明当前文件格式。完整字段、生命周期和失败范围分别见
+这些示例演示当前文件格式，可直接复制使用。完整字段、生命周期和失败范围分别见
 [Rules](../rules.md)、[术语](../../translation/terminology.md)与
 [Placeholder](../../translation/placeholders.md)。
