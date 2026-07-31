@@ -14,9 +14,9 @@
 - ATT 程序：<att.exe 绝对路径；--version；SHA-256>
 - ATT 发布目录：<绝对路径>
 - 调用 cwd：<绝对路径>
-- 显式配置：<绝对路径；SHA-256>
-- 实际 `projects.root`：<绝对路径>
-- 实际 `prompts.root`：<运行 Translate 时填写>
+- 固定配置：<ATT 发布目录/config.toml；SHA-256>
+- 固定项目目录：<ATT 发布目录/projects>
+- 固定 Prompt 目录：<ATT 发布目录/prompts；运行 Translate 时填写实际 locale>
 - ATT 项目：
   - <mv | mz | generic>/<项目名>：<工作区；负责的内容；来源身份>
 - 已读取产品文档：<发布目录内相对路径>

@@ -3,9 +3,9 @@
 Lua 是 MV、MZ 和 Generic 项目的独立数据库操作命令：
 
 ```text
-att --config CONFIG mv lua --name NAME SCRIPT.lua [-- ARG...]
-att --config CONFIG mz lua --name NAME SCRIPT.lua [-- ARG...]
-att --config CONFIG generic lua --name NAME SCRIPT.lua [-- ARG...]
+att mv lua --name NAME SCRIPT.lua [-- ARG...]
+att mz lua --name NAME SCRIPT.lua [-- ARG...]
+att generic lua --name NAME SCRIPT.lua [-- ARG...]
 ```
 
 它适合精确修订某个译文、批量更新项目数据库或维护脚本自己的私有表，作用类似 Redis

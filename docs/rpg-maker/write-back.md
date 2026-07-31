@@ -1,14 +1,14 @@
 # RPG Maker WriteBack 现行规格
 
 ```text
-att --config CONFIG mv write-back --name NAME
-att --config CONFIG mz write-back --name NAME
+att mv write-back --name NAME
+att mz write-back --name NAME
 ```
 
 WriteBack 不使用 Lua。它只读取冻结来源、当前提取资产和译文，在项目工作区生成：
 
 ```text
-<projects.root>/<mv|mz>/<name>/write_back/
+<att-dir>/projects/<mv|mz>/<name>/write_back/
 ```
 
 原游戏与冻结来源在整个过程中保持原样。

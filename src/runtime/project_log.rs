@@ -89,6 +89,8 @@ pub(crate) enum ProjectLogCode {
     TaskFinished,
     #[serde(rename = "task.diagnostic")]
     TaskDiagnostic,
+    #[serde(rename = "extract.rules.command_non_string_skipped")]
+    ExtractRulesCommandNonStringSkipped,
     #[serde(rename = "lua.script")]
     LuaScript,
     #[serde(rename = "lua.print")]
@@ -121,6 +123,7 @@ impl ProjectLogCode {
             Self::TaskStarted => "task.started",
             Self::TaskFinished => "task.finished",
             Self::TaskDiagnostic => "task.diagnostic",
+            Self::ExtractRulesCommandNonStringSkipped => "extract.rules.command_non_string_skipped",
             Self::LuaScript => "lua.script",
             Self::LuaPrint => "lua.print",
             Self::LuaSummary => "lua.summary",
@@ -296,6 +299,14 @@ pub(crate) enum ProjectLogPayload {
         attempts: u64,
         diagnostic: SafeDiagnostic,
     },
+    RulesCommandNonStringSkipped {
+        rule_number: u64,
+        source_file: String,
+        command_code: i64,
+        parameter: u64,
+        actual_type: String,
+        skipped_count: u64,
+    },
     Cancellation {
         confirmed: u64,
         total: Option<u64>,
@@ -330,6 +341,7 @@ impl ProjectLogPayload {
             Self::Publication { .. } => "publication",
             Self::Task { .. } => "task",
             Self::TaskDiagnostic { .. } => "task_diagnostic",
+            Self::RulesCommandNonStringSkipped { .. } => "rules_command_non_string_skipped",
             Self::Cancellation { .. } => "cancellation",
             Self::LuaScript { .. } => "lua_script",
             Self::LuaPrint { .. } => "lua_print",
@@ -1244,6 +1256,27 @@ fn render_message(
                 diagnostic: &diagnostic,
             })
         }
+        (
+            ProjectLogCode::ExtractRulesCommandNonStringSkipped,
+            ProjectLogPayload::RulesCommandNonStringSkipped {
+                rule_number,
+                source_file,
+                command_code,
+                parameter,
+                actual_type,
+                skipped_count,
+            },
+        ) => {
+            let command_code = command_code.to_string();
+            localizer.format(UiMessage::WarningRulesCommandNonStringSkipped {
+                rule_number: *rule_number,
+                source_file,
+                command_code: &command_code,
+                parameter: *parameter,
+                actual_type,
+                skipped_count: *skipped_count,
+            })
+        }
         (ProjectLogCode::RetrySummary, ProjectLogPayload::RetrySummary { attempted, .. }) => {
             localizer.format(UiMessage::LogRetrySummary { count: *attempted })
         }
@@ -1371,6 +1404,21 @@ fn sanitize_payload(payload: ProjectLogPayload) -> ProjectLogPayload {
         },
         ProjectLogPayload::LuaPrint { message } => ProjectLogPayload::LuaPrint {
             message: sanitize_user_text(&message),
+        },
+        ProjectLogPayload::RulesCommandNonStringSkipped {
+            rule_number,
+            source_file,
+            command_code,
+            parameter,
+            actual_type,
+            skipped_count,
+        } => ProjectLogPayload::RulesCommandNonStringSkipped {
+            rule_number,
+            source_file: sanitize_user_text(&source_file),
+            command_code,
+            parameter,
+            actual_type: sanitize_user_text(&actual_type),
+            skipped_count,
         },
         payload => payload,
     }
@@ -1681,6 +1729,97 @@ mod tests {
         assert_eq!(records[0]["level"], "debug");
         assert_eq!(records[1]["code"], "performance.counters");
         assert_eq!(records[2]["code"], "run.finished");
+    }
+
+    #[test]
+    fn rules_non_string_warning_has_stable_code_payload_and_ordered_fields() {
+        let directory = tempdir().expect("临时目录应可建立");
+        let run_id = "550e8400-e29b-41d4-a716-446655440010";
+        let runtime = start_project_log(directory.path().to_path_buf(), run_id.to_owned());
+        runtime.logger().emit(ProjectLogEvent::new(
+            ProjectLogLevel::Warn,
+            ProjectLogCode::ExtractRulesCommandNonStringSkipped,
+            context(),
+            ProjectLogPayload::RulesCommandNonStringSkipped {
+                rule_number: 7,
+                source_file: "Map001.json".to_owned(),
+                command_code: 355,
+                parameter: 0,
+                actual_type: "number".to_owned(),
+                skipped_count: 3,
+            },
+        ));
+
+        let health = runtime.finish(ProjectLogRunOutcome::Succeeded, context(), Vec::new());
+        assert!(!health.is_degraded());
+        let path = directory.path().join(format!("{run_id}.jsonl"));
+        let records = records(&path);
+        let warning = &records[0];
+        assert_eq!(warning["code"], "extract.rules.command_non_string_skipped");
+        assert_eq!(warning["level"], "warn");
+        assert_eq!(
+            warning["payload"],
+            serde_json::json!({
+                "kind": "rules_command_non_string_skipped",
+                "rule_number": 7,
+                "source_file": "Map001.json",
+                "command_code": 355,
+                "parameter": 0,
+                "actual_type": "number",
+                "skipped_count": 3,
+            })
+        );
+        let message = warning["message"]
+            .as_str()
+            .expect("日志消息应为文本")
+            .replace(['\u{2068}', '\u{2069}'], "");
+        assert!(message.contains("Rules rule 7"));
+    }
+
+    #[test]
+    fn http_provider_message_is_preserved_in_task_diagnostic_event() {
+        let directory = tempdir().expect("临时目录应可建立");
+        let run_id = "550e8400-e29b-41d4-a716-446655440011";
+        let runtime = start_project_log(directory.path().to_path_buf(), run_id.to_owned());
+        let diagnostic = SafeDiagnostic::new(
+            DiagnosticCode::ModelRequest,
+            DiagnosticStage::ModelRequest,
+            DiagnosticSubject::component("provider"),
+            DiagnosticReason::Http {
+                status: Some(400),
+                retry_after_seconds: None,
+                provider_code: Some("bad_request".to_owned()),
+                provider_type: Some("invalid_request_error".to_owned()),
+                provider_message: Some("request [REDACTED API KEY] rejected".to_owned()),
+            },
+            DiagnosticImpact::ProgressPreserved,
+            DiagnosticAction::CheckModelService,
+        );
+        runtime.logger().emit(ProjectLogEvent::new(
+            ProjectLogLevel::Warn,
+            ProjectLogCode::TaskDiagnostic,
+            context(),
+            ProjectLogPayload::TaskDiagnostic {
+                ordinal: 1,
+                total: 1,
+                attempts: 1,
+                diagnostic,
+            },
+        ));
+
+        let _ = runtime.finish(ProjectLogRunOutcome::Succeeded, context(), Vec::new());
+        let path = directory.path().join(format!("{run_id}.jsonl"));
+        let records = records(&path);
+        assert_eq!(
+            records[0]["payload"]["diagnostic"]["reason"]["provider_message"],
+            "request [REDACTED API KEY] rejected"
+        );
+        assert!(
+            records[0]["message"]
+                .as_str()
+                .expect("日志消息应为文本")
+                .contains("Provider error message request [REDACTED API KEY] rejected")
+        );
     }
 
     #[test]

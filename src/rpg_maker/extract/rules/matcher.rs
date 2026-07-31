@@ -4,9 +4,7 @@
 //! `text` 捕获。它不会在写回阶段保存或重新运行正则；匹配跨度会立即变成
 //! `Literal` / `TextSlot` 配方。
 
-#[cfg(test)]
-use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
@@ -29,6 +27,7 @@ use crate::rpg_maker::text::{
     StandardDataFile, TextGroupKind,
 };
 
+use super::super::{RulesCommandNonStringType, RulesCommandNonStringWarning};
 #[cfg(test)]
 use super::definition::RulesDefinition;
 use super::definition::{
@@ -409,6 +408,14 @@ pub(super) fn match_rules(
     definition: &RulesDefinition,
     input: &RulesMatchInput,
 ) -> Result<Vec<MatchedRuleTarget>, RulesMatchError> {
+    match_rules_with_warnings(definition, input).map(|finished| finished.targets)
+}
+
+#[cfg(test)]
+fn match_rules_with_warnings(
+    definition: &RulesDefinition,
+    input: &RulesMatchInput,
+) -> Result<FinishedRulesMatches, RulesMatchError> {
     let plan = build_source_match_plan(definition.rules().to_vec(), input.clone());
     let (rule_count, work_units) = plan.into_parts();
     finish_source_matches(
@@ -461,6 +468,14 @@ pub(super) struct RulesSourceMatchResult {
 struct RuleMatchContribution {
     rule_index: usize,
     outcome: Result<Vec<MatchedRuleTarget>, RulesMatchError>,
+    skipped_non_strings: Vec<RulesCommandNonStringWarning>,
+}
+
+/// 全部来源匹配完成后，交给快照构建和调用方警告呈现的确定结果。
+#[derive(Debug)]
+pub(super) struct FinishedRulesMatches {
+    pub(super) targets: Vec<MatchedRuleTarget>,
+    pub(super) warnings: Vec<RulesCommandNonStringWarning>,
 }
 
 impl RulesSourceMatchWorkUnit {
@@ -608,13 +623,18 @@ pub(super) fn build_source_match_plan(
 pub(super) fn finish_source_matches(
     rule_count: usize,
     results: Vec<RulesSourceMatchResult>,
-) -> Result<Vec<MatchedRuleTarget>, RulesMatchError> {
+) -> Result<FinishedRulesMatches, RulesMatchError> {
     let mut per_rule = (0..rule_count)
-        .map(|_| (Vec::new(), None))
-        .collect::<Vec<(Vec<MatchedRuleTarget>, Option<RulesMatchError>)>>();
+        .map(|_| (Vec::new(), None, Vec::new()))
+        .collect::<Vec<(
+            Vec<MatchedRuleTarget>,
+            Option<RulesMatchError>,
+            Vec<RulesCommandNonStringWarning>,
+        )>>();
     for result in results {
         for contribution in result.contributions {
-            let (targets, error) = &mut per_rule[contribution.rule_index];
+            let (targets, error, skipped_non_strings) = &mut per_rule[contribution.rule_index];
+            skipped_non_strings.extend(contribution.skipped_non_strings);
             if error.is_some() {
                 continue;
             }
@@ -626,18 +646,60 @@ pub(super) fn finish_source_matches(
     }
 
     let mut matches = Vec::with_capacity(rule_count);
-    for (rule_index, (targets, error)) in per_rule.into_iter().enumerate() {
+    let mut warnings = Vec::new();
+    for (rule_index, (targets, error, skipped_non_strings)) in per_rule.into_iter().enumerate() {
         if let Some(error) = error {
             return Err(error);
         }
+        let skipped_non_strings = aggregate_non_string_warnings(skipped_non_strings);
         if targets.is_empty() {
             return Err(RulesMatchError::NoNonBlankMatch {
                 rule_number: rule_index + 1,
+                skipped_non_strings,
             });
         }
         matches.push(targets);
+        warnings.extend(skipped_non_strings);
     }
-    merge_ordered_rule_matches(matches)
+    let targets = merge_ordered_rule_matches(matches)?;
+    Ok(FinishedRulesMatches {
+        targets,
+        warnings: aggregate_non_string_warnings(warnings),
+    })
+}
+
+fn aggregate_non_string_warnings(
+    warnings: Vec<RulesCommandNonStringWarning>,
+) -> Vec<RulesCommandNonStringWarning> {
+    let mut counts = BTreeMap::<(usize, String, i64, usize, RulesCommandNonStringType), u64>::new();
+    for warning in warnings {
+        let key = (
+            warning.rule_number,
+            warning.source_file,
+            warning.command_code,
+            warning.parameter,
+            warning.actual_type,
+        );
+        let count = counts.entry(key).or_default();
+        *count = count
+            .checked_add(warning.skipped_count)
+            .expect("Rules 跳过计数不会超过同一进程可表示的匹配项总数");
+    }
+    counts
+        .into_iter()
+        .map(
+            |((rule_number, source_file, command_code, parameter, actual_type), skipped_count)| {
+                RulesCommandNonStringWarning {
+                    rule_number,
+                    source_file,
+                    command_code,
+                    parameter,
+                    actual_type,
+                    skipped_count,
+                }
+            },
+        )
+        .collect()
 }
 
 fn merge_ordered_rule_matches(
@@ -705,6 +767,7 @@ fn match_file_rules_on_source(
             );
             RuleMatchContribution {
                 rule_index: rule.rule_number() - 1,
+                skipped_non_strings: Vec::new(),
                 outcome: outcome
                     .map_err(|source| source.with_context(context))
                     .map(|local| {
@@ -750,6 +813,7 @@ fn match_plugin_rules_on_source(
             );
             RuleMatchContribution {
                 rule_index: rule.rule_number() - 1,
+                skipped_non_strings: Vec::new(),
                 outcome: outcome
                     .and_then(|local| materialize_plugin_targets(rule, plugin, source_order, local))
                     .map_err(|source| source.with_context(context)),
@@ -1353,6 +1417,9 @@ fn match_command_rules_on_file(
     let mut outcomes = (0..rule_indexes.len())
         .map(|_| Ok(Vec::<MatchedRuleTarget>::new()))
         .collect::<Vec<Result<Vec<_>, RulesMatchError>>>();
+    let mut skipped_non_strings = (0..rule_indexes.len())
+        .map(|_| BTreeMap::<RulesCommandNonStringType, u64>::new())
+        .collect::<Vec<_>>();
 
     for event_list in event_lists(file, root) {
         for (command_index, command) in event_list.commands.iter().enumerate() {
@@ -1430,10 +1497,18 @@ fn match_command_rules_on_file(
                     })
                     .map_err(|source| source.with_context(context));
                 match result {
-                    Ok(targets) => outcomes[*outcome_index]
+                    Ok(CommandRuleMatchOutcome::Matched(targets)) => outcomes[*outcome_index]
                         .as_mut()
                         .expect("已排除失败结果")
                         .extend(targets),
+                    Ok(CommandRuleMatchOutcome::SkippedNonString(actual_type)) => {
+                        let count = skipped_non_strings[*outcome_index]
+                            .entry(actual_type)
+                            .or_default();
+                        *count = count
+                            .checked_add(1)
+                            .expect("Rules 跳过计数不会超过同一来源的 command 总数");
+                    }
                     Err(error) => outcomes[*outcome_index] = Err(error),
                 }
             }
@@ -1444,11 +1519,36 @@ fn match_command_rules_on_file(
         .iter()
         .map(|rule_index| &rules[*rule_index])
         .zip(outcomes)
-        .map(|(rule, outcome)| RuleMatchContribution {
-            rule_index: rule.rule_number() - 1,
-            outcome,
+        .zip(skipped_non_strings)
+        .map(|((rule, outcome), skipped_non_strings)| {
+            let RuleSource::Command { code, parameter } = rule.source() else {
+                unreachable!("command 工作单元只包含 command 规则")
+            };
+            let skipped_non_strings = skipped_non_strings
+                .into_iter()
+                .map(
+                    |(actual_type, skipped_count)| RulesCommandNonStringWarning {
+                        rule_number: rule.rule_number(),
+                        source_file: file.to_owned(),
+                        command_code: *code,
+                        parameter: *parameter,
+                        actual_type,
+                        skipped_count,
+                    },
+                )
+                .collect();
+            RuleMatchContribution {
+                rule_index: rule.rule_number() - 1,
+                outcome,
+                skipped_non_strings,
+            }
         })
         .collect()
+}
+
+enum CommandRuleMatchOutcome {
+    Matched(Vec<MatchedRuleTarget>),
+    SkippedNonString(RulesCommandNonStringType),
 }
 
 struct CommandRuleMatch<'a> {
@@ -1465,7 +1565,7 @@ struct CommandRuleMatch<'a> {
 fn match_command_rule_at(
     rule: &RuleDefinition,
     command: CommandRuleMatch<'_>,
-) -> Result<Vec<MatchedRuleTarget>, RulesMatchError> {
+) -> Result<CommandRuleMatchOutcome, RulesMatchError> {
     let mut command_steps = command.list_steps.to_vec();
     command_steps.push(RulesValueStep::Index(command.command_index));
     let mut target_steps = command_steps.clone();
@@ -1498,6 +1598,19 @@ fn match_command_rule_at(
             &mut targets,
         )?;
     } else {
+        if !command.selected.is_string() {
+            let actual = match JsonValueKind::of(Some(command.selected)) {
+                JsonValueKind::Null => RulesCommandNonStringType::Null,
+                JsonValueKind::Boolean => RulesCommandNonStringType::Boolean,
+                JsonValueKind::Number => RulesCommandNonStringType::Number,
+                JsonValueKind::Array => RulesCommandNonStringType::Array,
+                JsonValueKind::Object => RulesCommandNonStringType::Object,
+                JsonValueKind::Missing | JsonValueKind::String => {
+                    unreachable!("已确认存在且不是字符串的 command 参数")
+                }
+            };
+            return Ok(CommandRuleMatchOutcome::SkippedNonString(actual));
+        }
         let mut local = Vec::new();
         visit_terminal(
             rule,
@@ -1516,7 +1629,7 @@ fn match_command_rule_at(
             ..terminal.target
         }));
     }
-    Ok(targets)
+    Ok(CommandRuleMatchOutcome::Matched(targets))
 }
 
 struct RulePathTarget {
@@ -2214,6 +2327,7 @@ pub(crate) enum RulesMatchError {
     },
     NoNonBlankMatch {
         rule_number: usize,
+        skipped_non_strings: Vec<RulesCommandNonStringWarning>,
     },
     InvalidTarget {
         rule_number: usize,
@@ -2534,10 +2648,17 @@ impl RulesMatchError {
     fn safe_projection(&self) -> (DiagnosticFailureKind, String) {
         match self {
             Self::Context { source, .. } => source.safe_projection(),
-            Self::NoNonBlankMatch { rule_number } => (
-                DiagnosticFailureKind::RulesNoNonBlankMatch,
-                format!("rule={rule_number}; error=no_non_blank_match"),
-            ),
+            Self::NoNonBlankMatch {
+                rule_number,
+                skipped_non_strings,
+            } => {
+                let mut detail = format!("rule={rule_number}; error=no_non_blank_match");
+                if !skipped_non_strings.is_empty() {
+                    detail.push_str("; skipped_non_strings=");
+                    detail.push_str(&render_non_string_warnings(skipped_non_strings));
+                }
+                (DiagnosticFailureKind::RulesNoNonBlankMatch, detail)
+            }
             Self::InvalidTarget {
                 rule_number,
                 reason,
@@ -2658,6 +2779,26 @@ fn render_value_steps(steps: &[RulesValueStep]) -> String {
     json_string(&result)
 }
 
+fn render_non_string_warnings(warnings: &[RulesCommandNonStringWarning]) -> String {
+    let mut rendered = String::from("[");
+    for (index, warning) in warnings.iter().enumerate() {
+        if index > 0 {
+            rendered.push(',');
+        }
+        rendered.push_str(&format!(
+            "{{\"rule\":{},\"file\":{},\"code\":{},\"parameter\":{},\"actual_type\":{},\"skipped_count\":{}}}",
+            warning.rule_number,
+            json_string(&warning.source_file),
+            warning.command_code,
+            warning.parameter,
+            json_string(warning.actual_type.as_str()),
+            warning.skipped_count,
+        ));
+    }
+    rendered.push(']');
+    rendered
+}
+
 fn render_match_source(source: &RulesMatchSource) -> String {
     match source {
         RulesMatchSource::DataFile { file } => {
@@ -2681,11 +2822,22 @@ impl fmt::Display for RulesMatchError {
             Self::Context { context, source } => {
                 write!(formatter, "{source}; {}", context.safe_detail())
             }
-            Self::NoNonBlankMatch { rule_number } => {
+            Self::NoNonBlankMatch {
+                rule_number,
+                skipped_non_strings,
+            } => {
                 write!(
                     formatter,
                     "Rules 规则 {rule_number} 没有产生任何非空语义单元"
-                )
+                )?;
+                if !skipped_non_strings.is_empty() {
+                    write!(
+                        formatter,
+                        "；跳过的 command 非字符串参数：{}",
+                        render_non_string_warnings(skipped_non_strings)
+                    )?;
+                }
+                Ok(())
             }
             Self::InvalidTarget {
                 rule_number,
@@ -2977,6 +3129,340 @@ parameter = 0
     }
 
     #[test]
+    fn direct_command_rule_skips_and_aggregates_all_non_string_parameter_types() {
+        let definition = RulesDefinition::parse(
+            r#"
+[[rule]]
+code = 401
+parameter = 0
+"#,
+        )
+        .expect("命令规则应合法");
+        let input = input([(
+            "CommonEvents.json",
+            json!([
+                null,
+                {
+                    "list": [
+                        {"code":401,"parameters":[null]},
+                        {"code":401,"parameters":[false]},
+                        {"code":401,"parameters":[1]},
+                        {"code":401,"parameters":[2]},
+                        {"code":401,"parameters":[[]]},
+                        {"code":401,"parameters":[{}]},
+                        {"code":401,"parameters":["有效正文"]}
+                    ]
+                }
+            ]),
+        )]);
+
+        let finished =
+            match_rules_with_warnings(&definition, &input).expect("有效字符串应允许快照成立");
+
+        assert_eq!(finished.targets.len(), 1);
+        assert_eq!(finished.targets[0].units()[0].source_text(), "有效正文");
+        assert_eq!(
+            finished.warnings,
+            [
+                warning(RulesCommandNonStringType::Null, 1),
+                warning(RulesCommandNonStringType::Boolean, 1),
+                warning(RulesCommandNonStringType::Number, 2),
+                warning(RulesCommandNonStringType::Array, 1),
+                warning(RulesCommandNonStringType::Object, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_command_string_that_does_not_match_pattern_does_not_warn() {
+        let definition = RulesDefinition::parse(
+            r#"
+[[rule]]
+code = 356
+parameter = 0
+pattern = '\AGabText\s+(?<text>.+)\z'
+"#,
+        )
+        .expect("命令规则应合法");
+        let input = input([(
+            "CommonEvents.json",
+            json!([
+                null,
+                {"list":[
+                    {"code":356,"parameters":["OtherCommand 不应命中"]},
+                    {"code":356,"parameters":["GabText 有效正文"]}
+                ]}
+            ]),
+        )]);
+
+        let finished =
+            match_rules_with_warnings(&definition, &input).expect("另一条字符串匹配时规则应成功");
+
+        assert_eq!(finished.targets.len(), 1);
+        assert_eq!(finished.targets[0].units()[0].source_text(), "有效正文");
+        assert!(finished.warnings.is_empty());
+    }
+
+    #[test]
+    fn direct_command_rule_with_only_non_strings_still_fails_with_skip_facts() {
+        let definition = RulesDefinition::parse(
+            r#"
+[[rule]]
+code = 401
+parameter = 0
+decode_json = true
+"#,
+        )
+        .expect("命令规则应合法");
+        let input = input([(
+            "CommonEvents.json",
+            json!([
+                null,
+                {"list":[
+                    {"code":401,"parameters":[null]},
+                    {"code":401,"parameters":[17]}
+                ]}
+            ]),
+        )]);
+
+        let error = match_rules_with_warnings(&definition, &input)
+            .expect_err("只有非字符串跳过项时仍应视为零命中");
+
+        match &error {
+            RulesMatchError::NoNonBlankMatch {
+                rule_number,
+                skipped_non_strings,
+            } => {
+                assert_eq!(*rule_number, 1);
+                assert_eq!(
+                    skipped_non_strings,
+                    &[
+                        warning(RulesCommandNonStringType::Null, 1),
+                        warning(RulesCommandNonStringType::Number, 1),
+                    ]
+                );
+            }
+            error => panic!("应返回携带跳过事实的零命中错误：{error:?}"),
+        }
+        let diagnostic = serde_json::to_string(&error.safe_diagnostic(Path::new("rules.toml")))
+            .expect("安全诊断应可序列化");
+        assert!(diagnostic.contains("skipped_non_strings"));
+        assert!(diagnostic.contains("actual_type"));
+        assert!(diagnostic.contains("number"));
+        assert!(diagnostic.contains("skipped_count"));
+    }
+
+    #[test]
+    fn command_rule_with_explicit_path_keeps_non_string_terminal_strict() {
+        let definition = RulesDefinition::parse(
+            r#"
+[[rule]]
+code = 357
+parameter = 0
+path = 'text'
+"#,
+        )
+        .expect("结构化命令规则应合法");
+        let input = input([(
+            "CommonEvents.json",
+            json!([null, {"list":[{"code":357,"parameters":[{"text":7}]}]}]),
+        )]);
+
+        let error = match_rules(&definition, &input).expect_err("显式 path 终值必须保持字符串契约");
+
+        assert!(matches!(
+            error,
+            RulesMatchError::Context {
+                context: RulesMatchContext {
+                    source: RulesDiagnosticSource::Command { .. },
+                    has_declared_path: true,
+                },
+                source,
+            } if matches!(
+                *source,
+                RulesMatchError::InvalidTarget {
+                    reason: RulesInvalidTargetReason::FinalTargetType {
+                        actual: JsonValueKind::Number,
+                        ..
+                    },
+                    ..
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn file_and_plugin_paths_keep_non_string_terminals_strict() {
+        let file_definition = RulesDefinition::parse(
+            r#"
+[[rule]]
+file = "Custom.json"
+path = 'text'
+"#,
+        )
+        .expect("文件规则应合法");
+        assert_contextual_data_file_error(
+            match_rules(
+                &file_definition,
+                &input([("Custom.json", json!({"text":7}))]),
+            ),
+            "Custom.json",
+            |source| {
+                matches!(
+                    source,
+                    RulesMatchError::InvalidTarget {
+                        reason: RulesInvalidTargetReason::FinalTargetType {
+                            actual: JsonValueKind::Number,
+                            ..
+                        },
+                        ..
+                    }
+                )
+            },
+        );
+
+        let plugin_definition = RulesDefinition::parse(
+            r#"
+[[rule]]
+plugin = "StrictPlugin"
+path = 'text'
+"#,
+        )
+        .expect("插件规则应合法");
+        let plugin_input = RulesMatchInput::new(
+            BTreeMap::new(),
+            vec![RulesPlugin::new(
+                0,
+                "StrictPlugin",
+                true,
+                Map::from_iter([("text".to_owned(), json!(7))]),
+            )],
+        );
+        let plugin_error = match_rules(&plugin_definition, &plugin_input)
+            .expect_err("插件 path 的非字符串终值必须保持严格失败");
+        assert!(matches!(
+            plugin_error,
+            RulesMatchError::Context {
+                context: RulesMatchContext {
+                    source: RulesDiagnosticSource::Plugin { .. },
+                    has_declared_path: true,
+                },
+                source,
+            } if matches!(
+                *source,
+                RulesMatchError::InvalidTarget {
+                    reason: RulesInvalidTargetReason::FinalTargetType {
+                        actual: JsonValueKind::Number,
+                        ..
+                    },
+                    ..
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn direct_command_decode_json_string_to_non_string_keeps_final_type_strict() {
+        let definition = RulesDefinition::parse(
+            r#"
+[[rule]]
+code = 401
+parameter = 0
+decode_json = true
+"#,
+        )
+        .expect("解码命令规则应合法");
+        let input = input([(
+            "CommonEvents.json",
+            json!([null, {"list":[{"code":401,"parameters":["17"]}]}]),
+        )]);
+
+        let error = match_rules(&definition, &input)
+            .expect_err("原始字符串解码后的非字符串终值必须保持严格失败");
+
+        assert!(matches!(
+            error,
+            RulesMatchError::Context { source, .. }
+                if matches!(
+                    *source,
+                    RulesMatchError::InvalidTarget {
+                        reason: RulesInvalidTargetReason::FinalTargetType {
+                            actual: JsonValueKind::Number,
+                            ..
+                        },
+                        ..
+                    }
+                )
+        ));
+    }
+
+    #[test]
+    fn direct_command_decode_json_keeps_invalid_string_strict() {
+        let definition = RulesDefinition::parse(
+            r#"
+[[rule]]
+code = 401
+parameter = 0
+decode_json = true
+"#,
+        )
+        .expect("解码命令规则应合法");
+        let input = input([(
+            "CommonEvents.json",
+            json!([null, {"list":[{"code":401,"parameters":["not-json"]}]}]),
+        )]);
+
+        let error = match_rules(&definition, &input)
+            .expect_err("字符串中的无效 JSON 不得按非字符串参数跳过");
+
+        assert!(matches!(
+            error,
+            RulesMatchError::Context { source, .. }
+                if matches!(
+                    *source,
+                    RulesMatchError::InvalidTarget {
+                        reason: RulesInvalidTargetReason::NestedJsonDecode {
+                            phase: "decode_json_target",
+                            ..
+                        },
+                        ..
+                    }
+                )
+        ));
+    }
+
+    #[test]
+    fn command_parameters_shape_and_requested_index_remain_strict() {
+        let definition = RulesDefinition::parse(
+            r#"
+[[rule]]
+code = 401
+parameter = 1
+"#,
+        )
+        .expect("命令规则应合法");
+
+        for (parameters, matches_reason) in [
+            (json!({}), RulesCommandStrictFailure::ParametersType),
+            (
+                json!(["only-zero"]),
+                RulesCommandStrictFailure::ParameterMissing,
+            ),
+        ] {
+            let input = input([(
+                "CommonEvents.json",
+                json!([null, {"list":[{"code":401,"parameters":parameters}]}]),
+            )]);
+            let error = match_rules(&definition, &input)
+                .expect_err("parameters 结构错误不得按非字符串参数跳过");
+            assert!(
+                matches_reason.matches(&error),
+                "错误必须保留原有严格分类：{error:?}"
+            );
+        }
+    }
+
+    #[test]
     fn exact_nonstandard_file_and_all_maps_are_real_sources() {
         let definition = RulesDefinition::parse(
             r#"
@@ -3166,7 +3652,7 @@ path = '[].name'
 
         assert!(matches!(
             match_rules(&definition, &input),
-            Err(RulesMatchError::NoNonBlankMatch { rule_number: 1 })
+            Err(RulesMatchError::NoNonBlankMatch { rule_number: 1, .. })
         ));
     }
 
@@ -3347,9 +3833,10 @@ pattern = '(?<text>\C)'
         );
         let actual = finish_source_matches(rule_count, results).expect("来源驱动匹配应成功");
 
-        assert_eq!(actual.len(), 2);
-        assert_eq!(actual[0].units()[0].source_text(), "第一段");
-        assert_eq!(actual[1].units()[0].source_text(), "第二段");
+        assert_eq!(actual.targets.len(), 2);
+        assert!(actual.warnings.is_empty());
+        assert_eq!(actual.targets[0].units()[0].source_text(), "第一段");
+        assert_eq!(actual.targets[1].units()[0].source_text(), "第二段");
     }
 
     #[test]
@@ -3694,6 +4181,7 @@ path = '{deep_path}.command_text'
             if targets.is_empty() {
                 return Err(RulesMatchError::NoNonBlankMatch {
                     rule_number: rule.rule_number(),
+                    skipped_non_strings: Vec::new(),
                 });
             }
             matches.push(targets);
@@ -3710,6 +4198,50 @@ path = '{deep_path}.command_text'
             .map(RulesSourceMatchWorkUnit::run)
             .map(|result| result.shared_path_node_visits)
             .sum()
+    }
+
+    fn warning(
+        actual_type: RulesCommandNonStringType,
+        skipped_count: u64,
+    ) -> RulesCommandNonStringWarning {
+        RulesCommandNonStringWarning {
+            rule_number: 1,
+            source_file: "CommonEvents.json".to_owned(),
+            command_code: 401,
+            parameter: 0,
+            actual_type,
+            skipped_count,
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum RulesCommandStrictFailure {
+        ParametersType,
+        ParameterMissing,
+    }
+
+    impl RulesCommandStrictFailure {
+        fn matches(self, error: &RulesMatchError) -> bool {
+            let RulesMatchError::Context { source, .. } = error else {
+                return false;
+            };
+            matches!(
+                (self, source.as_ref()),
+                (
+                    Self::ParametersType,
+                    RulesMatchError::InvalidTarget {
+                        reason: RulesInvalidTargetReason::CommandParametersType { .. },
+                        ..
+                    },
+                ) | (
+                    Self::ParameterMissing,
+                    RulesMatchError::InvalidTarget {
+                        reason: RulesInvalidTargetReason::CommandParameterMissing { .. },
+                        ..
+                    },
+                )
+            )
+        }
     }
 
     fn input<const N: usize>(files: [(&str, Value); N]) -> RulesMatchInput {

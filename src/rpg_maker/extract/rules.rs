@@ -35,7 +35,13 @@ use super::document::{
 };
 use super::model::{ExtractedTextGroup, ExtractedTextUnit, RulesSnapshot, SnapshotModelError};
 use super::store::RulesSnapshotStore;
-use super::{ExtractProgress, ExtractProgressPhase};
+use super::{ExtractProgress, ExtractProgressPhase, RulesCommandNonStringWarning};
+
+/// Rules 快照已经成功提交后返回给 Extract 编排层的结果。
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RulesExtractionOutput {
+    pub(crate) warnings: Vec<RulesCommandNonStringWarning>,
+}
 
 /// 使用调用方提供的当前 Rules TOML 完整替换 Rules 提取快照。
 pub(crate) trait RulesExtraction: Send + Sync {
@@ -46,7 +52,7 @@ pub(crate) trait RulesExtraction: Send + Sync {
         project: &OpenedProject,
         program: RulesProgram,
         progress: ExtractProgress,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    ) -> impl Future<Output = Result<RulesExtractionOutput, Self::Error>> + Send;
 }
 
 /// 已读取、验证并规范编码的 Extract Rules 程序。
@@ -192,7 +198,7 @@ where
         project: &OpenedProject,
         program: RulesProgram,
         progress: ExtractProgress,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<RulesExtractionOutput, Self::Error> {
         let rules_path = program.diagnostic_path().to_path_buf();
         let definition = program.definition;
 
@@ -202,7 +208,7 @@ where
                 .deactivate_rules(project)
                 .await
                 .map_err(|source| RulesExtractionError::Persist { rules_path, source })?;
-            return Ok(());
+            return Ok(RulesExtractionOutput::default());
         }
 
         let selection = document_selection(&definition);
@@ -243,7 +249,7 @@ where
                 source,
             })?;
 
-        let matches = self
+        let candidate = self
             .match_rules_parallel(definition, input, progress.clone())
             .await
             .map_err(|error| match error {
@@ -273,10 +279,18 @@ where
 
         progress.indeterminate(ExtractProgressPhase::RulesCommit);
         self.snapshot_store
-            .replace_rules(project, matches)
+            .replace_rules(project, candidate.snapshot)
             .await
-            .map_err(|source| RulesExtractionError::Persist { rules_path, source })
+            .map_err(|source| RulesExtractionError::Persist { rules_path, source })?;
+        Ok(RulesExtractionOutput {
+            warnings: candidate.warnings,
+        })
     }
+}
+
+struct RulesSnapshotCandidate {
+    snapshot: RulesSnapshot,
+    warnings: Vec<RulesCommandNonStringWarning>,
 }
 
 impl<D, S, C> RulesExtractionService<D, S, C>
@@ -288,7 +302,7 @@ where
         definition: RulesDefinition,
         input: RulesMatchInput,
         progress: ExtractProgress,
-    ) -> Result<RulesSnapshot, ParallelRulesBuildError<C::Error>> {
+    ) -> Result<RulesSnapshotCandidate, ParallelRulesBuildError<C::Error>> {
         let plan = build_source_match_plan(definition.into_rules(), input);
         let (rule_count, work_units) = plan.into_parts();
         let total = u64::try_from(work_units.len()).expect("Rules 来源工作单元数必须能用 u64 表达");
@@ -306,9 +320,14 @@ where
 
         self.cpu_executor
             .execute(move || {
-                let targets = finish_source_matches(rule_count, completed)
+                let finished = finish_source_matches(rule_count, completed)
                     .map_err(ParallelRulesBuildError::Match)?;
-                snapshot_from_targets(targets).map_err(ParallelRulesBuildError::Snapshot)
+                let snapshot = snapshot_from_targets(finished.targets)
+                    .map_err(ParallelRulesBuildError::Snapshot)?;
+                Ok(RulesSnapshotCandidate {
+                    snapshot,
+                    warnings: finished.warnings,
+                })
             })
             .await
             .map_err(ParallelRulesBuildError::FinalizeCompute)?
@@ -1405,7 +1424,7 @@ path = '[].name'
         assert!(matches!(
             error,
             RulesExtractionError::InvalidTarget {
-                source: RulesMatchError::NoNonBlankMatch { rule_number: 1 },
+                source: RulesMatchError::NoNonBlankMatch { rule_number: 1, .. },
                 ..
             }
         ));
@@ -1418,6 +1437,104 @@ path = '[].name'
                 ProgressSnapshot::determinate(ExtractProgressPhase::RulesMatches, 1, 1),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn successful_command_rule_returns_aggregated_warnings_after_snapshot_commit() {
+        let state = Arc::new(StoreState::default());
+        let (service, program) = test_service(
+            br#"
+[[rule]]
+code = 401
+parameter = 0
+"#
+            .to_vec(),
+            RpgMakerProjectDocuments::new(
+                BTreeMap::from([(
+                    RpgMakerDocumentId::Data(StandardDataFile::CommonEvents),
+                    json!([
+                        null,
+                        {"list":[
+                            {"code":401,"parameters":[1]},
+                            {"code":401,"parameters":[2]},
+                            {"code":401,"parameters":["有效正文"]}
+                        ]}
+                    ]),
+                )]),
+                Vec::new(),
+            ),
+            Arc::clone(&state),
+        );
+
+        let output = service
+            .replace(&project(), program, ExtractProgress::default())
+            .await
+            .expect("有效字符串应提交快照并返回跳过警告");
+
+        assert_eq!(state.replacements.load(Ordering::SeqCst), 1);
+        assert_eq!(state.deactivations.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            output.warnings,
+            [RulesCommandNonStringWarning {
+                rule_number: 1,
+                source_file: "CommonEvents.json".to_owned(),
+                command_code: 401,
+                parameter: 0,
+                actual_type: super::super::RulesCommandNonStringType::Number,
+                skipped_count: 2,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn command_rule_with_only_non_strings_keeps_previous_snapshot_unchanged() {
+        let state = Arc::new(StoreState::default());
+        let (service, program) = test_service(
+            br#"
+[[rule]]
+code = 401
+parameter = 0
+"#
+            .to_vec(),
+            RpgMakerProjectDocuments::new(
+                BTreeMap::from([(
+                    RpgMakerDocumentId::Data(StandardDataFile::CommonEvents),
+                    json!([
+                        null,
+                        {"list":[
+                            {"code":401,"parameters":[null]},
+                            {"code":401,"parameters":[7]}
+                        ]}
+                    ]),
+                )]),
+                Vec::new(),
+            ),
+            Arc::clone(&state),
+        );
+
+        let error = service
+            .replace(&project(), program, ExtractProgress::default())
+            .await
+            .expect_err("只有非字符串跳过项时不得提交空快照");
+
+        match error {
+            RulesExtractionError::InvalidTarget {
+                source:
+                    RulesMatchError::NoNonBlankMatch {
+                        rule_number,
+                        skipped_non_strings,
+                    },
+                ..
+            } => {
+                assert_eq!(rule_number, 1);
+                assert_eq!(skipped_non_strings.len(), 2);
+                assert_eq!(skipped_non_strings[0].actual_type.as_str(), "null");
+                assert_eq!(skipped_non_strings[1].actual_type.as_str(), "number");
+            }
+            error => panic!("应返回携带跳过事实的零命中错误：{error:?}"),
+        }
+        assert_eq!(state.replacements.load(Ordering::SeqCst), 0);
+        assert_eq!(state.deactivations.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

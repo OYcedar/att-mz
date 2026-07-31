@@ -54,13 +54,15 @@ HTTP 200 后要求：
 Retryable 包含 DNS/连接/发送/读取/完整请求超时或中断，以及 HTTP 408、429、500、
 502、503、504。`Retry-After` 支持秒数和 HTTP-date，并受 Client `max_retry_after_ms`
 约束。Translate 按 Client `retry_delays_ms` 执行有限重试；本地等待不消耗重试次数。
-运行根把 HTTP 状态、供应商稳定 code/type、`Retry-After` 和结构化原因交给调用方，
-让多次逻辑 attempt 能汇总到同一条任务记录；原始 Header 和任意非 200 wire body
-留在运行根内部。
+运行根把 HTTP 状态、供应商稳定 code/type、标准 `error.message`、`Retry-After` 和
+结构化原因交给调用方，让多次逻辑 attempt 能汇总到同一条任务记录。三个供应商字段
+彼此独立：其中一个缺失或类型错误，不会抹掉另外两个合法字符串。只读取顶层
+`error` 对象，不猜测顶层 `message`、`detail`、`error_description` 或纯文本正文。
+原始 Header 和任意非 200 wire body 留在运行根内部。
 
 Fatal 包含请求构造失败、TLS/证书问题、其他 HTTP 状态，以及不满足成功信封的 200
-响应。安全诊断会说明 HTTP 状态、`Retry-After` 和允许公开的供应商 code/type；
-任意错误正文不落盘。
+响应。安全诊断会说明 HTTP 状态、`Retry-After`、供应商 code/type，以及标准信封中
+经过闭集替换和单行清理的 `error.message`。完整错误正文不落盘。
 
 ## 5. 生命周期
 
@@ -75,9 +77,10 @@ Thinking、Assistant、Provider 正文和普通用户内容都按普通内容处
 任何模块、日志、诊断、文档、测试或 Skill 中都保持原样，不增不减，也不另行复述。
 
 运行根的 Debug、CLI 和普通 JSONL 用稳定摘要说话：Client ID、阶段、Endpoint
-对象、HTTP 状态、超时种类和状态影响都在其中；闭集值与完整请求、响应、Header
-不出现。这是运行根职责、稳定 schema、控制字符和输出体积的边界，与敏感性分类
-无关。
+对象、HTTP 状态、超时种类、状态影响和经过处理的标准供应商错误字段都可以出现；
+闭集值与完整请求、原始响应、Header 不出现。`error.message` 先精确替换当前 API key，
+再删除终端控制和双向控制字符并收敛为单行；没有可见内容时省略。这是运行根职责、
+稳定 schema、控制字符和输出体积的边界，与敏感性分类无关。
 
 翻译任务记录使用实际选中的 Endpoint、Model、parameters 和最终消息，并在所有
 可读字段中递归应用同一个闭集替换器。Endpoint query、自定义参数键和值、System、
@@ -90,6 +93,6 @@ User、输入历史 Assistant、Thinking、输出 Assistant、Provider 标识和
 
 替换器只碰命中的闭集值：所在字段、段落和相邻正文保持原样，替换标记本身也不再
 处理。配置中的 API key 字段从不进入任务记录；任务记录也不采集 Header、Provider
-外层信封或非 200 原始 body。`Authorization` 是一个字段和一种认证方案，不是另
-一类敏感信息；诊断需要说明认证事实时，保留字段名和方案就够了。任务记录的其余
-格式契约见[模型任务记录现行规格](../translation/task-records.md)。
+外层信封或非 200 原始 body，只保留上述标准错误字段投影。`Authorization` 是一个字段
+和一种认证方案，不是另一类敏感信息；诊断需要说明认证事实时，保留字段名和方案就
+够了。任务记录的其余格式契约见[模型任务记录现行规格](../translation/task-records.md)。

@@ -1,6 +1,6 @@
 //! 外部术语与占位符 TOML 的异步读取和 CPU 解析边界。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 #[cfg(test)]
 use std::convert::Infallible;
 use std::error::Error;
@@ -249,7 +249,14 @@ impl TerminologyEntry {
 pub(crate) struct CompiledTerminology {
     entries: Vec<TerminologyEntry>,
     matcher: Option<TerminologyMatcher>,
-    pattern_to_entry: Vec<usize>,
+    patterns: Vec<TerminologyPattern>,
+    maximum_pattern_bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+struct TerminologyPattern {
+    entry_index: usize,
+    byte_len: usize,
 }
 
 enum TerminologyMatcher {
@@ -272,7 +279,8 @@ impl CompiledTerminology {
         Self {
             entries: Vec::new(),
             matcher: None,
-            pattern_to_entry: Vec::new(),
+            patterns: Vec::new(),
+            maximum_pattern_bytes: 0,
         }
     }
 
@@ -303,7 +311,8 @@ impl CompiledTerminology {
         }
     }
 
-    /// 扫描任意数量和长度的原文，并在文本窗口、匹配项和结果收集之间轮询取消。
+    /// 分别扫描任意数量和长度的 NaturalText，按最早起点、同起点最长选择互不相交的
+    /// trigger，并在文本窗口、匹配项和结果收集之间轮询取消。
     pub(crate) fn triggered_indices_with_cancellation<'t, E>(
         &self,
         texts: impl IntoIterator<Item = &'t str>,
@@ -318,7 +327,7 @@ impl CompiledTerminology {
         match matcher {
             TerminologyMatcher::Windowed(matcher) => scan_windowed_terminology(
                 matcher,
-                &self.pattern_to_entry,
+                &self.patterns,
                 texts,
                 &mut matched,
                 &mut matched_count,
@@ -327,7 +336,8 @@ impl CompiledTerminology {
             TerminologyMatcher::Streaming(matcher) => match matcher.as_ref() {
                 StreamingTerminologyMatcher::Contiguous(matcher) => scan_streaming_terminology(
                     matcher,
-                    &self.pattern_to_entry,
+                    &self.patterns,
+                    self.maximum_pattern_bytes,
                     texts,
                     &mut matched,
                     &mut matched_count,
@@ -335,7 +345,8 @@ impl CompiledTerminology {
                 )?,
                 StreamingTerminologyMatcher::Noncontiguous(matcher) => scan_streaming_terminology(
                     matcher,
-                    &self.pattern_to_entry,
+                    &self.patterns,
+                    self.maximum_pattern_bytes,
                     texts,
                     &mut matched,
                     &mut matched_count,
@@ -357,10 +368,117 @@ impl CompiledTerminology {
 
 /// 重叠窗口最多重复约 1/15 的输入；更长 trigger 改用真正流式的 NFA。
 const TERMINOLOGY_WINDOWED_MAX_PATTERN_BYTES: usize = PLANNING_RESOURCE_CANCEL_CHECK_BYTES / 16;
+/// 扫描阶段已经逐匹配轮询；选择阶段只需防止一次大量抑制操作长时间占用 CPU。
+const TERMINOLOGY_SELECTION_CANCEL_CHECK_OPERATIONS: usize = PLANNING_RESOURCE_CANCEL_CHECK_BYTES;
+
+#[derive(Clone, Copy)]
+struct TerminologyOccurrence {
+    pattern_index: usize,
+    end: usize,
+}
+
+/// 在单段 NaturalText 内把全部字面命中归并为从左到右且互不相交的命中。
+///
+/// Aho-Corasick 按结束位置报告命中；更长的 trigger 因此可能稍后才报告更早的起点。
+/// 扫描器只在确认某段起点不会再出现新命中后推进 `complete_before`，这里再选择最早
+/// 起点，并在同一起点保留最长 trigger。
+struct TerminologyOccurrenceSelector {
+    pending: BTreeMap<usize, TerminologyOccurrence>,
+    selected_until: usize,
+}
+
+impl TerminologyOccurrenceSelector {
+    fn new() -> Self {
+        Self {
+            pending: BTreeMap::new(),
+            selected_until: 0,
+        }
+    }
+
+    fn record(
+        &mut self,
+        pattern_index: usize,
+        start: usize,
+        end: usize,
+        patterns: &[TerminologyPattern],
+    ) {
+        if start < self.selected_until {
+            return;
+        }
+        debug_assert_eq!(end - start, patterns[pattern_index].byte_len);
+        let candidate = TerminologyOccurrence { pattern_index, end };
+        self.pending
+            .entry(start)
+            .and_modify(|current| {
+                let candidate_length = patterns[candidate.pattern_index].byte_len;
+                let current_length = patterns[current.pattern_index].byte_len;
+                if candidate_length > current_length
+                    || (candidate_length == current_length
+                        && candidate.pattern_index < current.pattern_index)
+                {
+                    *current = candidate;
+                }
+            })
+            .or_insert(candidate);
+    }
+
+    fn finalize_before<E>(
+        &mut self,
+        complete_before: usize,
+        patterns: &[TerminologyPattern],
+        matched: &mut [bool],
+        matched_count: &mut usize,
+        ensure_running: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut operations_since_poll = 0_usize;
+        while self
+            .pending
+            .first_key_value()
+            .is_some_and(|(&start, _)| start < complete_before)
+        {
+            let (start, occurrence) = self
+                .pending
+                .pop_first()
+                .expect("已确认存在待选择的术语命中");
+            operations_since_poll += 1;
+            if operations_since_poll == TERMINOLOGY_SELECTION_CANCEL_CHECK_OPERATIONS {
+                ensure_running()?;
+                operations_since_poll = 0;
+            }
+            debug_assert!(start >= self.selected_until);
+            record_selected_terminology(occurrence.pattern_index, patterns, matched, matched_count);
+            self.selected_until = occurrence.end;
+
+            while self
+                .pending
+                .first_key_value()
+                .is_some_and(|(&pending_start, _)| pending_start < self.selected_until)
+            {
+                self.pending.pop_first();
+                operations_since_poll += 1;
+                if operations_since_poll == TERMINOLOGY_SELECTION_CANCEL_CHECK_OPERATIONS {
+                    ensure_running()?;
+                    operations_since_poll = 0;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish<E>(
+        &mut self,
+        patterns: &[TerminologyPattern],
+        matched: &mut [bool],
+        matched_count: &mut usize,
+        ensure_running: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.finalize_before(usize::MAX, patterns, matched, matched_count, ensure_running)
+    }
+}
 
 fn scan_windowed_terminology<'t, E>(
     matcher: &AhoCorasick,
-    pattern_to_entry: &[usize],
+    patterns: &[TerminologyPattern],
     texts: impl IntoIterator<Item = &'t str>,
     matched: &mut [bool],
     matched_count: &mut usize,
@@ -379,46 +497,69 @@ fn scan_windowed_terminology<'t, E>(
     for text in texts {
         ensure_running()?;
         let bytes = text.as_bytes();
+        let mut selector = TerminologyOccurrenceSelector::new();
         let mut start = 0_usize;
         while start < bytes.len() {
             ensure_running()?;
             let end = start
                 .saturating_add(PLANNING_RESOURCE_CANCEL_CHECK_BYTES)
                 .min(bytes.len());
+            let complete_before = if end == bytes.len() {
+                bytes.len()
+            } else {
+                start.saturating_add(advance)
+            };
             for found in matcher.find_overlapping_iter(&bytes[start..end]) {
                 ensure_running()?;
-                record_terminology_match(
+                let absolute_start = start.saturating_add(found.start());
+                if absolute_start >= complete_before {
+                    continue;
+                }
+                selector.record(
                     found.pattern().as_usize(),
-                    pattern_to_entry,
-                    matched,
-                    matched_count,
+                    absolute_start,
+                    start.saturating_add(found.end()),
+                    patterns,
                 );
             }
+            selector.finalize_before(
+                complete_before,
+                patterns,
+                matched,
+                matched_count,
+                ensure_running,
+            )?;
             if end == bytes.len() {
                 break;
             }
             start = start.saturating_add(advance);
         }
+        selector.finish(patterns, matched, matched_count, ensure_running)?;
     }
     ensure_running()
 }
 
 fn scan_streaming_terminology<'t, E, A: Automaton>(
     matcher: &A,
-    pattern_to_entry: &[usize],
+    patterns: &[TerminologyPattern],
+    maximum_pattern_bytes: usize,
     texts: impl IntoIterator<Item = &'t str>,
     matched: &mut [bool],
     matched_count: &mut usize,
     ensure_running: &mut impl FnMut() -> Result<(), E>,
 ) -> Result<(), E> {
+    debug_assert!(maximum_pattern_bytes > TERMINOLOGY_WINDOWED_MAX_PATTERN_BYTES);
     for text in texts {
         ensure_running()?;
+        let mut selector = TerminologyOccurrenceSelector::new();
         let mut state = matcher
             .start_state(Anchored::No)
             .expect("术语 NFA 必须支持非锚定搜索");
+        let mut processed_end = 0_usize;
         'text: for chunk in text.as_bytes().chunks(PLANNING_RESOURCE_CANCEL_CHECK_BYTES) {
             ensure_running()?;
             for &byte in chunk {
+                processed_end += 1;
                 state = matcher.next_state(Anchored::No, state, byte);
                 if !matcher.is_special(state) {
                     continue;
@@ -433,26 +574,40 @@ fn scan_streaming_terminology<'t, E, A: Automaton>(
                 }
                 for match_index in 0..matcher.match_len(state) {
                     ensure_running()?;
-                    record_terminology_match(
-                        matcher.match_pattern(state, match_index).as_usize(),
-                        pattern_to_entry,
-                        matched,
-                        matched_count,
+                    let pattern_index = matcher.match_pattern(state, match_index).as_usize();
+                    let pattern_length = patterns[pattern_index].byte_len;
+                    selector.record(
+                        pattern_index,
+                        processed_end
+                            .checked_sub(pattern_length)
+                            .expect("术语 NFA 不会在读取完整 pattern 前报告命中"),
+                        processed_end,
+                        patterns,
                     );
                 }
             }
+            if processed_end >= maximum_pattern_bytes {
+                selector.finalize_before(
+                    processed_end - maximum_pattern_bytes + 1,
+                    patterns,
+                    matched,
+                    matched_count,
+                    ensure_running,
+                )?;
+            }
         }
+        selector.finish(patterns, matched, matched_count, ensure_running)?;
     }
     ensure_running()
 }
 
-fn record_terminology_match(
+fn record_selected_terminology(
     pattern_index: usize,
-    pattern_to_entry: &[usize],
+    patterns: &[TerminologyPattern],
     matched: &mut [bool],
     matched_count: &mut usize,
 ) {
-    let entry_index = pattern_to_entry[pattern_index];
+    let entry_index = patterns[pattern_index].entry_index;
     if !matched[entry_index] {
         matched[entry_index] = true;
         *matched_count += 1;
@@ -1086,7 +1241,7 @@ pub(crate) fn compile_terminology_with_cancellation(
     let mut entries = Vec::<TerminologyEntry>::with_capacity(raw.len());
     let mut entry_by_term = HashMap::<Sha256Fingerprint, Vec<usize>>::new();
     let mut trigger_by_text = HashMap::<Sha256Fingerprint, Vec<(usize, usize)>>::new();
-    let mut pattern_to_entry = Vec::new();
+    let mut patterns = Vec::new();
     let mut maximum_trigger_bytes = 0_usize;
 
     for raw_entry in raw {
@@ -1178,13 +1333,16 @@ pub(crate) fn compile_terminology_with_cancellation(
                 .entry(trigger_fingerprint)
                 .or_default()
                 .push((entry_index, trigger_index));
-            pattern_to_entry.push(entry_index);
+            patterns.push(TerminologyPattern {
+                entry_index,
+                byte_len: trigger.len(),
+            });
         }
     }
 
     drop(entry_by_term);
     drop(trigger_by_text);
-    let (entries, matcher) = if pattern_to_entry.is_empty() {
+    let (entries, matcher) = if patterns.is_empty() {
         (entries, None)
     } else {
         ensure_planning_resource_running(cancellation)
@@ -1202,7 +1360,8 @@ pub(crate) fn compile_terminology_with_cancellation(
     Ok(CompiledTerminology {
         entries,
         matcher,
-        pattern_to_entry,
+        patterns,
+        maximum_pattern_bytes: maximum_trigger_bytes,
     })
 }
 
@@ -1669,7 +1828,7 @@ mod tests {
     }
 
     #[test]
-    fn terminology_keeps_overlap_and_file_order() {
+    fn terminology_selects_overlaps_per_natural_text_and_keeps_file_order() {
         let entries = parse_terminology_toml(
             r#"
                 [[term]]
@@ -1687,11 +1846,77 @@ mod tests {
         .expect("TOML 术语应该有效");
         let compiled = compile_terminology(entries).expect("术语应该有效");
 
-        let matched = compiled.triggered_by(["伝説の魔法剣"]);
+        let matched = compiled.triggered_by(["伝説の魔法剣", "予備の剣"]);
         assert_eq!(
             matched.iter().map(|entry| entry.term()).collect::<Vec<_>>(),
             vec!["魔法剣", "剣"]
         );
+    }
+
+    #[test]
+    fn terminology_prefers_longest_at_same_start_for_name_and_laugh() {
+        let compiled = compile_terminology(vec![
+            TerminologyEntry {
+                term: "プフクス".to_owned(),
+                translation: "普芙库丝".to_owned(),
+                triggers: vec!["プフクス".to_owned()],
+            },
+            TerminologyEntry {
+                term: "プフクスッ".to_owned(),
+                translation: "噗呼咯".to_owned(),
+                triggers: vec!["プフクスッ".to_owned()],
+            },
+        ])
+        .expect("姓名与笑声 trigger 应可编译");
+
+        assert_eq!(
+            compiled.triggered_indices(["プフクスッと笑った"]),
+            vec![1],
+            "同一起点的笑声必须抑制姓名前缀"
+        );
+        assert_eq!(
+            compiled.triggered_indices(["プフクスッとプフクスが笑った"]),
+            vec![0, 1],
+            "后方独立出现的姓名仍然必须命中，结果按文件顺序返回"
+        );
+    }
+
+    #[test]
+    fn terminology_prefers_earlier_start_even_when_later_trigger_is_longer() {
+        let compiled = compile_terminology(vec![
+            TerminologyEntry {
+                term: "earlier".to_owned(),
+                translation: "较早".to_owned(),
+                triggers: vec!["ab".to_owned()],
+            },
+            TerminologyEntry {
+                term: "longer".to_owned(),
+                translation: "较长".to_owned(),
+                triggers: vec!["bcde".to_owned()],
+            },
+        ])
+        .expect("重叠 trigger 应可编译");
+
+        assert_eq!(compiled.triggered_indices(["abcde"]), vec![0]);
+    }
+
+    #[test]
+    fn terminology_keeps_adjacent_spans() {
+        let compiled = compile_terminology(vec![
+            TerminologyEntry {
+                term: "left".to_owned(),
+                translation: "左".to_owned(),
+                triggers: vec!["abc".to_owned()],
+            },
+            TerminologyEntry {
+                term: "right".to_owned(),
+                translation: "右".to_owned(),
+                triggers: vec!["de".to_owned()],
+            },
+        ])
+        .expect("相邻 trigger 应可编译");
+
+        assert_eq!(compiled.triggered_indices(["abcde"]), vec![0, 1]);
     }
 
     #[test]
@@ -1834,13 +2059,20 @@ mod tests {
     }
 
     #[test]
-    fn cancellable_terminology_scan_preserves_cross_window_matches() {
+    fn cancellable_terminology_scan_selects_longest_cross_window_match() {
         const WINDOW_BYTES: usize = 64 * 1024;
-        let compiled = compile_terminology(vec![TerminologyEntry {
-            term: "boundary".to_owned(),
-            translation: "边界".to_owned(),
-            triggers: vec!["ABCD".to_owned()],
-        }])
+        let compiled = compile_terminology(vec![
+            TerminologyEntry {
+                term: "short-boundary".to_owned(),
+                translation: "短边界".to_owned(),
+                triggers: vec!["AB".to_owned()],
+            },
+            TerminologyEntry {
+                term: "long-boundary".to_owned(),
+                translation: "长边界".to_owned(),
+                triggers: vec!["ABCD".to_owned()],
+            },
+        ])
         .expect("术语应该有效");
         let mut text = "x".repeat(WINDOW_BYTES - 2);
         text.push_str("ABCD");
@@ -1849,11 +2081,11 @@ mod tests {
             .triggered_indices_with_cancellation([text.as_str()], || Ok::<_, ()>(()))
             .expect("未取消的扫描应该完成");
 
-        assert_eq!(indices, vec![0]);
+        assert_eq!(indices, vec![1]);
     }
 
     #[test]
-    fn cancellable_terminology_scan_reports_all_nested_and_overlapping_patterns() {
+    fn cancellable_terminology_scan_selects_leftmost_longest_through_eof() {
         let compiled = compile_terminology(vec![
             TerminologyEntry {
                 term: "one".to_owned(),
@@ -1877,11 +2109,15 @@ mod tests {
             .triggered_indices_with_cancellation(["aaaa"], || Ok::<_, ()>(()))
             .expect("未取消的重叠扫描应完成");
 
-        assert_eq!(indices, vec![0, 1, 2]);
+        assert_eq!(
+            indices,
+            vec![0, 2],
+            "aaa 占用前三个字节，EOF 前剩余的独立 a 仍应命中"
+        );
     }
 
     #[test]
-    fn cancellable_terminology_streaming_scan_reports_all_nested_patterns() {
+    fn cancellable_terminology_streaming_scan_selects_longest_nested_pattern() {
         let longest = "a".repeat(TERMINOLOGY_WINDOWED_MAX_PATTERN_BYTES + 1);
         let middle = "a".repeat(TERMINOLOGY_WINDOWED_MAX_PATTERN_BYTES);
         let shortest = "a".repeat(TERMINOLOGY_WINDOWED_MAX_PATTERN_BYTES - 1);
@@ -1911,9 +2147,9 @@ mod tests {
 
         let indices = compiled
             .triggered_indices_with_cancellation([text.as_str()], || Ok::<_, ()>(()))
-            .expect("流式扫描必须枚举同一状态上的全部嵌套匹配");
+            .expect("流式扫描必须完成同起点最长选择");
 
-        assert_eq!(indices, vec![0, 1, 2]);
+        assert_eq!(indices, vec![0]);
     }
 
     #[test]

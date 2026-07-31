@@ -206,7 +206,7 @@ fn generic_dynamic_pipeline_and_independent_projects_are_documented() {
 
     let write_back = read_utf8(&workspace_root().join("docs/generic/write-back.md"));
     for required in [
-        "<projects.root>/generic/<name>/write_back/",
+        "<att-dir>/projects/generic/<name>/write_back/",
         "永远不修改外部输入目录",
         "Current Unit 用译文替换 `text`",
         "其他 Unit 保留当前原文",
@@ -241,6 +241,117 @@ fn generic_dynamic_pipeline_and_independent_projects_are_documented() {
             "公共 Profile 规格缺少 {required:?}"
         );
     }
+}
+
+#[test]
+fn fixed_distribution_layout_is_the_only_documented_configuration_location() {
+    let root = workspace_root();
+    let configuration = read_utf8(&root.join("docs/runtime/configuration.md"));
+    for required in [
+        "<att-dir>/config.toml",
+        "<att-dir>/projects/",
+        "<att-dir>/prompts/",
+        "实际运行的 `att.exe` 所在目录",
+        "CLI 不接受自定义配置路径",
+    ] {
+        assert!(
+            configuration.contains(required),
+            "固定发行目录规格缺少 {required:?}"
+        );
+    }
+
+    let example = read_utf8(&root.join("config.example.toml"));
+    let example: TomlValue = toml::from_str(&example).expect("示例配置必须是有效 TOML");
+    let table = example.as_table().expect("示例配置顶层必须是 table");
+    assert!(!table.contains_key("projects"));
+    assert!(
+        !table
+            .get("prompts")
+            .and_then(TomlValue::as_table)
+            .expect("示例配置必须包含 prompts")
+            .contains_key("root")
+    );
+
+    for relative in [
+        "docs/runtime/cli.md",
+        "docs/rpg-maker/init.md",
+        "docs/rpg-maker/extraction.md",
+        "docs/rpg-maker/translation.md",
+        "docs/rpg-maker/write-back.md",
+        "docs/generic/init.md",
+        "docs/generic/extraction.md",
+        "docs/generic/translation.md",
+        "docs/generic/write-back.md",
+        "docs/lua/README.md",
+    ] {
+        assert!(
+            !read_utf8(&root.join(relative)).contains("--config"),
+            "{relative} 不得继续呈现已删除的配置参数"
+        );
+    }
+}
+
+#[test]
+fn builtin_documentation_lists_the_exact_supported_matrix_and_exclusions() {
+    let extraction = read_utf8(&workspace_root().join("docs/rpg-maker/extraction.md"));
+    for required in [
+        "`Actors.json[*]`",
+        "`name`、`nickname`、`profile`",
+        "`Skills.json[*]`",
+        "`message1`、`message2`",
+        "`States.json[*]`",
+        "`message3`、`message4`",
+        "`gameTitle`、`currencyUnit`",
+        "`terms.basic[*]`",
+        "`terms.commands[*]`",
+        "`terms.params[*]`",
+        "`terms.messages` 对象中的每个成员",
+        "每个值都必须是字符串",
+        "`elements[*]`",
+        "`skillTypes[*]`",
+        "`weaponTypes[*]`",
+        "`armorTypes[*]`",
+        "`equipTypes[*]`",
+        "`MapNNN.json`",
+        "`events[*].pages[*].list`",
+        "`CommonEvents.json`",
+        "`Troops.json`",
+        "`101` + 连续 `401`",
+        "`102`、同缩进 `402`、`404`",
+        "`105` + 连续 `405`",
+        "`320`",
+        "`324`",
+        "`325`",
+        "MZ",
+        "MV",
+    ] {
+        assert!(
+            extraction.contains(required),
+            "Builtin 精确覆盖规格缺少 {required:?}"
+        );
+    }
+    for required in [
+        "不读取插件参数",
+        "插件命令",
+        "`note`/`meta`",
+        "`MapInfos.json`",
+        "自定义",
+        "`data/*.json`",
+        "事件脚本 `355/655`",
+        "普通事件注释 `108/408`",
+        "普通 JavaScript",
+        "Extract Rules",
+        "Generic 项目",
+    ] {
+        assert!(
+            extraction.contains(required),
+            "Builtin 排除项或替代路径缺少 {required:?}"
+        );
+    }
+    assert!(
+        !extraction.contains("明确支持的插件参数"),
+        "Builtin 规格不得把 Rules 的插件能力写成内建覆盖"
+    );
 }
 
 #[test]

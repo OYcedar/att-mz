@@ -1,5 +1,4 @@
 app-about = Dịch trò chơi và văn bản có cấu trúc với trạng thái dự án có thể tái sử dụng
-cli-config-help = Tệp cấu hình TOML nghiêm ngặt cho lần chạy này
 cli-ui-language-help = Ngôn ngữ cho trợ giúp, chẩn đoán, tiến độ, kết quả và nhật ký dự án: ar, zh-Hans, zh-Hant, en, fr, ru, es, ja, ko hoặc vi
 cli-progress-help = Chế độ tiến độ trực tiếp: auto, plain hoặc off
 cli-mz-about = Dịch trò chơi RPG Maker MZ
@@ -33,7 +32,6 @@ cli-options-metavar = TÙY_CHỌN
 cli-command-metavar = LỆNH
 cli-print-help = In trợ giúp
 cli-print-version = In phiên bản
-cli-missing-config = Thiếu đường dẫn cấu hình bắt buộc --config <FILE>.
 cli-blank-value = Giá trị không được để trống.
 cli-invalid-positive-integer = Giá trị phải là số nguyên dương.
 cli-invalid-progress = Không hỗ trợ chế độ tiến độ { $value }; hãy dùng auto, plain hoặc off.
@@ -83,6 +81,7 @@ notice-init-reuse-path = Không có đường dẫn nguồn; đang dùng lại �
 notice-extract-reuse-owners = Không có phạm vi trích xuất; đang dùng lại kế hoạch thành công gần nhất: { $owners }.
 notice-translate-reuse-profile = Không có Profile; đang dùng lại Profile thành công gần nhất: { $profile }.
 notice-owner-disabled = Owner { $owner } đã bị tắt và xóa khỏi các kế hoạch tự động sau này.
+warning-rules-command-non-string-skipped = Cảnh báo: quy tắc Rules { $rule_number } đã bỏ qua { $skipped_count } tham số command không phải chuỗi (nguồn { $source_file }, code={ $command_code }, parameter={ $parameter }, kiểu { $actual_type }).
 notice-no-model-request = Mọi đơn vị dịch đều mới nhất; lần chạy này không cần gửi yêu cầu nào đến mô hình.
 notice-manual-layout = Có { $count } đơn vị cần kiểm tra ngắt dòng thủ công.
 notice-log-degraded = Nhật ký dự án không khả dụng hoặc suy giảm; lệnh vẫn tiếp tục và trạng thái thoát không đổi.
@@ -327,7 +326,6 @@ diagnostic-io-kind-value = { $code ->
    *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
-    [runtime_configuration_invalid] Cấu hình thời gian chạy không hợp lệ
     [unsupported_prompt_locale] Phải là auto viết thường hoàn toàn hoặc locale giao diện BCP 47 được hỗ trợ
     [language_policy_term_blank] Thuật ngữ chính sách ngôn ngữ không được để trống
     [language_policy_term_surrounding_whitespace] Thuật ngữ chính sách ngôn ngữ không được có khoảng trắng ở hai đầu
@@ -404,6 +402,7 @@ diagnostic-http-status = Trạng thái HTTP { $status }
 diagnostic-http-retry-after = Retry-After { $seconds } giây
 diagnostic-http-provider-code = Mã lỗi nhà cung cấp { $code }
 diagnostic-http-provider-type = Loại lỗi nhà cung cấp { $kind }
+diagnostic-http-provider-message = Thông báo lỗi nhà cung cấp { $message }
 diagnostic-http-fact-separator = ;{ " " }
 diagnostic-sqlite = Mã lỗi SQLite chính { $primary_code }, mã mở rộng { $extended_code }
 diagnostic-windows-status = Thao tác Windows { $operation } thất bại với NTSTATUS { $status }

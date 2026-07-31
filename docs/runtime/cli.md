@@ -3,11 +3,12 @@
 ## 1. 统一入口
 
 ```text
-att --config FILE [--ui-language LANG] [--progress auto|plain|off] ENGINE COMMAND ...
+att [--ui-language LANG] [--progress auto|plain|off] ENGINE COMMAND ...
 ```
 
-`ENGINE` 取 `mv`、`mz` 或 `generic`。Help 与 Version 开箱即用；其余命令都要显式
-给出配置、引擎、命令和项目名，ATT 不设默认配置路径。
+`ENGINE` 取 `mv`、`mz` 或 `generic`。Help 与 Version 开箱即用；其余命令读取实际运行的
+`att.exe` 同目录下固定的 `config.toml`，并要求显式给出引擎、命令和项目名。CLI 不提供
+配置路径参数。
 
 当前命令：
 

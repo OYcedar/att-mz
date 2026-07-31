@@ -1,11 +1,11 @@
 # ATT 配置现行规格
 
-每次进程都通过顶层 `--config FILE` 拿到一份 UTF-8 TOML（Help 和 Version 除外）。
-相对配置路径以当前工作目录为基准；配置内路径以配置文件所在目录为基准。
+除 Help、Version 和 CLI 语法错误外，每次进程都读取实际运行的 `att.exe` 同目录下唯一的
+UTF-8 `config.toml`。该文件缺失、不可读或无效时，命令明确失败；
+CLI 不接受自定义配置路径，也不搜索当前工作目录、环境变量或其他候选位置。
 
 当前顶层只允许：
 
-- `[projects]`
 - `[prompts]`
 - `[llm]`
 - `[[languages]]`
@@ -14,26 +14,24 @@
 未知字段、重复 key、错误类型、空白 ID 和规范化后的重复 ID 都会被严格拒绝——启动
 时说清楚，胜过带着歧义往下走。配置只解析当前命令实际使用的子树。
 
-## 1. 项目路径
+## 1. 固定发行目录
 
-```toml
-[projects]
-root = "projects"
-```
-
-工作区固定为：
+`att.exe` 所在目录是发行根，配置、项目和 Prompt 的位置固定为：
 
 ```text
-<projects.root>/<mv|mz|generic>/<project-name>/
+<att-dir>/config.toml
+<att-dir>/projects/<mv|mz|generic>/<project-name>/
+<att-dir>/prompts/
 ```
 
-项目租约、数据库、日志、任务记录、候选和输出的位置都由工作区固定，无需另行配置。
+`projects/` 和 `prompts/` 不是配置项。项目租约、数据库、日志、任务记录、候选和输出的
+位置都由项目工作区固定；命令实际需要某个目录时再按对应规格创建或报告错误，启动阶段
+不做额外预检。
 
 ## 2. Prompt 与翻译 Profile
 
 ```toml
 [prompts]
-root = "prompts"
 locale = "auto"
 thinking_output = false
 
@@ -46,7 +44,7 @@ llm_client = "primary"
 target_task_user_message_characters = 24000
 ```
 
-- Prompt 三个字段都必填；
+- Prompt 的 `locale` 与 `thinking_output` 都必填；
 - `record_translation_tasks` 可省略，默认 `false`；
 - Profile 的 `id` 和 `llm_client` 必须非空；
 - `llm_client` 必须引用现有 Client；
@@ -106,8 +104,8 @@ worker、TaskBlock 数量、SQLite 策略和文件总量由执行代码决定，
 
 | 路径 | 相对基准 |
 |---|---|
-| `--config FILE` | 进程当前工作目录 |
-| `projects.root`、`prompts.root`、`additional_pem_files` | 配置文件所在目录 |
+| `config.toml`、`projects/`、`prompts/` | 实际运行的 `att.exe` 所在目录 |
+| `additional_pem_files` | 实际运行的 `att.exe` 所在目录 |
 | CLI 的游戏、JSONL、Rules、术语、Placeholder 与 Lua 路径 | 进程当前工作目录 |
 
 配置出错时，诊断会给出路径、字段、一基行列和具体原因；敏感值按

@@ -11,7 +11,7 @@ use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use reqwest::header::{CONTENT_TYPE, RETRY_AFTER};
 use reqwest::{Client, Proxy, StatusCode, redirect};
 use secrecy::{ExposeSecret, SecretString};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Map, Value};
 use tokio::sync::{Semaphore, watch};
 use url::Url;
@@ -27,6 +27,7 @@ use crate::llm::{
     LlmClientSemanticIdentity, LlmFinishReason, LlmRequestError, LlmRequestExecutor, LlmResponse,
     LlmUsage,
 };
+use crate::user_text::sanitize_user_text;
 
 /// 一个可被不同引擎及 Lua 共享的受信 LLM Client。
 pub(crate) struct OpenAiChatCompletionClient {
@@ -607,18 +608,23 @@ impl OpenAiChatCompletionExecutor {
             let provider_body = response.bytes().await;
             drop(active_permit);
             drop(job);
-            let (provider_code, provider_type) = provider_body
+            let provider_error = provider_body
                 .as_ref()
                 .ok()
-                .and_then(|body| parse_provider_error_identifiers(body))
-                .unwrap_or((None, None));
+                .and_then(|body| parse_provider_error(body))
+                .unwrap_or_default();
             let redactor = ApiKeyRedactor::new(client.api_key.clone());
-            let provider_code = provider_code.map(|value| redactor.redact(&value));
-            let provider_type = provider_type.map(|value| redactor.redact(&value));
+            let provider_code = provider_error.code.map(|value| redactor.redact(&value));
+            let provider_type = provider_error.kind.map(|value| redactor.redact(&value));
+            let provider_message = provider_error.message.and_then(|value| {
+                let value = sanitize_user_text(&redactor.redact(&value));
+                (!value.trim().is_empty()).then_some(value)
+            });
             let error = OpenAiChatCompletionError::HttpStatus {
                 status: status.as_u16(),
                 provider_code,
                 provider_type,
+                provider_message,
             };
             let result = if is_retryable_status(status) {
                 Err(LlmRequestError::Retryable {
@@ -681,6 +687,7 @@ pub(crate) enum OpenAiChatCompletionError {
         status: u16,
         provider_code: Option<String>,
         provider_type: Option<String>,
+        provider_message: Option<String>,
     },
     ParseResponse(serde_json::Error),
     InvalidResponseWire {
@@ -719,8 +726,8 @@ impl Error for OpenAiChatCompletionError {
 }
 
 impl OpenAiChatCompletionError {
-    /// 只公开 HTTP/传输与 JSON 解析器的稳定事实；请求、响应正文和
-    /// serde/reqwest 原始文本始终留在 source。
+    /// 只公开 HTTP/传输、标准供应商错误投影与 JSON 解析器的稳定事实；请求、
+    /// 原始响应正文和 serde/reqwest 原始文本始终留在 source。
     pub(crate) fn safe_diagnostic(
         &self,
         retry_after: Option<Duration>,
@@ -753,6 +760,7 @@ impl OpenAiChatCompletionError {
                 status,
                 provider_code,
                 provider_type,
+                provider_message,
             } => SafeDiagnostic::new(
                 DiagnosticCode::ModelRequest,
                 DiagnosticStage::ModelRequest,
@@ -762,6 +770,7 @@ impl OpenAiChatCompletionError {
                     retry_after_seconds: retry_after.map(|value| value.as_secs()),
                     provider_code: provider_code.clone(),
                     provider_type: provider_type.clone(),
+                    provider_message: provider_message.clone(),
                 },
                 impact,
                 if *status == 401 || *status == 403 {
@@ -857,24 +866,32 @@ fn transport_classification(source: &reqwest::Error) -> &'static str {
     }
 }
 
-#[derive(Deserialize)]
-struct ProviderErrorEnvelope {
-    error: ProviderErrorIdentifiers,
-}
-
-#[derive(Deserialize)]
-struct ProviderErrorIdentifiers {
+#[derive(Default)]
+struct ProviderErrorProjection {
     code: Option<String>,
-    #[serde(rename = "type")]
     kind: Option<String>,
+    message: Option<String>,
 }
 
-fn parse_provider_error_identifiers(body: &[u8]) -> Option<(Option<String>, Option<String>)> {
-    let envelope = serde_json::from_slice::<ProviderErrorEnvelope>(body).ok()?;
-    Some((
-        envelope.error.code.and_then(provider_identifier),
-        envelope.error.kind.and_then(provider_identifier),
-    ))
+fn parse_provider_error(body: &[u8]) -> Option<ProviderErrorProjection> {
+    let root = serde_json::from_slice::<Value>(body).ok()?;
+    let error = root.get("error")?.as_object()?;
+    Some(ProviderErrorProjection {
+        code: error
+            .get("code")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .and_then(provider_identifier),
+        kind: error
+            .get("type")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .and_then(provider_identifier),
+        message: error
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
 }
 
 fn provider_identifier(value: String) -> Option<String> {
@@ -1679,20 +1696,39 @@ mod tests {
     }
 
     #[test]
-    fn provider_error_projection_keeps_only_stable_identifiers() {
-        let (code, kind) = parse_provider_error_identifiers(
+    fn provider_error_projection_reads_each_standard_field_independently() {
+        let projection = parse_provider_error(
             br#"{"error":{"code":"rate_limit_exceeded","type":"requests/rate-limit","message":"MODEL_BODY_SENTINEL"}}"#,
         )
         .expect("供应商错误信封应可解析");
-        assert_eq!(code.as_deref(), Some("rate_limit_exceeded"));
-        assert_eq!(kind.as_deref(), Some("requests/rate-limit"));
+        assert_eq!(projection.code.as_deref(), Some("rate_limit_exceeded"));
+        assert_eq!(projection.kind.as_deref(), Some("requests/rate-limit"));
+        assert_eq!(projection.message.as_deref(), Some("MODEL_BODY_SENTINEL"));
 
-        let (code, kind) = parse_provider_error_identifiers(
-            br#"{"error":{"code":"PROVIDER_CODE_WITH_CONTROL\r\nforged","type":"MODEL_BODY_SENTINEL!","message":"MODEL_BODY_SENTINEL"}}"#,
+        let projection = parse_provider_error(
+            br#"{"error":{"code":429,"type":"MODEL_BODY_SENTINEL!","message":"independent message"}}"#,
         )
-        .expect("无效供应商标识不应使信封解析失败");
-        assert_eq!(code, None);
-        assert_eq!(kind, None);
+        .expect("一个字段类型错误不应抹掉其他标准字段");
+        assert_eq!(projection.code, None);
+        assert_eq!(projection.kind, None);
+        assert_eq!(projection.message.as_deref(), Some("independent message"));
+
+        let projection = parse_provider_error(
+            br#"{"error":{"code":"bad_request","type":"request_error","message":[]}}"#,
+        )
+        .expect("message 类型错误不应抹掉合法标识");
+        assert_eq!(projection.code.as_deref(), Some("bad_request"));
+        assert_eq!(projection.kind.as_deref(), Some("request_error"));
+        assert_eq!(projection.message, None);
+
+        assert!(parse_provider_error(br#"{"message":"top-level"}"#).is_none());
+        assert!(parse_provider_error(br#"{"error":"plain text"}"#).is_none());
+        assert!(parse_provider_error(b"not-json").is_none());
+
+        let long_message = "x".repeat(20_000);
+        let body = serde_json::json!({"error":{"message":long_message.clone()}}).to_string();
+        let projection = parse_provider_error(body.as_bytes()).expect("长标准消息应可解析");
+        assert_eq!(projection.message.as_deref(), Some(long_message.as_str()));
     }
 
     #[test]
@@ -1701,6 +1737,7 @@ mod tests {
             status: 429,
             provider_code: Some("PROVIDER_CODE_WITH_CONTROL\r\nforged".to_owned()),
             provider_type: Some("rate_limit".to_owned()),
+            provider_message: Some("request\r\nforged".to_owned()),
         };
         let diagnostic = source.safe_diagnostic(
             Some(Duration::from_secs(3)),
@@ -1708,11 +1745,59 @@ mod tests {
         );
         let serialized = serde_json::to_string(&diagnostic).expect("诊断应可序列化");
         assert!(!serialized.contains("PROVIDER_CODE_WITH_CONTROL"));
-        assert!(!serialized.contains("forged"));
+        assert!(!serialized.contains("\\r"));
+        assert!(!serialized.contains("\\n"));
         assert!(serialized.contains("\"status\":429"));
         assert!(serialized.contains("\"retry_after_seconds\":3"));
         assert!(serialized.contains("\"provider_type\":\"rate_limit\""));
         assert!(serialized.contains("\"provider_code\":null"));
+        assert!(serialized.contains("\"provider_message\":\"request forged\""));
+    }
+
+    #[tokio::test]
+    async fn fatal_http_provider_message_is_redacted_and_sanitized_before_error_storage() {
+        let body = serde_json::json!({
+            "error": {
+                "code": "bad_request",
+                "type": "invalid_request_error",
+                "message": "before test-secret\r\n\u{0000}\u{202e} after test-secret"
+            }
+        })
+        .to_string();
+        let server = spawn_test_server(
+            vec![status_response(
+                "400 Bad Request",
+                "Content-Type: application/json\r\n",
+                &body,
+            )],
+            false,
+        );
+        let client = client(&server.endpoint, Map::new());
+        let executor = executor(1);
+
+        let source = match executor.request(&client, &[]).await {
+            Err(LlmRequestError::Fatal(source)) => source,
+            other => panic!("400 应是 Fatal，实际为 {other:?}"),
+        };
+        let debug = format!("{source:?}");
+        assert!(!debug.contains("test-secret"));
+        assert!(
+            !debug
+                .chars()
+                .any(|character| matches!(character, '\r' | '\n' | '\0' | '\u{202e}'))
+        );
+        assert_eq!(debug.matches("[REDACTED API KEY]").count(), 2);
+
+        let diagnostic = source.safe_diagnostic(None, DiagnosticImpact::ProgressPreserved);
+        let serialized = serde_json::to_string(&diagnostic).expect("诊断应可序列化");
+        assert!(!serialized.contains("test-secret"));
+        assert!(serialized.contains("before [REDACTED API KEY] after [REDACTED API KEY]"));
+        assert!(serialized.contains("\"provider_code\":\"bad_request\""));
+        assert!(serialized.contains("\"provider_type\":\"invalid_request_error\""));
+
+        assert!(server.requests.recv_timeout(Duration::from_secs(1)).is_ok());
+        server.worker.join().expect("测试服务器应正常退出");
+        executor.shutdown().await;
     }
 
     struct SerializationFailureSentinel;
@@ -2206,8 +2291,8 @@ mod tests {
         let server = spawn_test_server(
             vec![status_response(
                 "429 Too Many Requests",
-                "Retry-After: 3\r\nContent-Type: text/plain\r\n",
-                "error-body-is-not-retained",
+                "Retry-After: 3\r\nContent-Type: application/json\r\n",
+                r#"{"error":{"message":"retry later","code":"rate_limit","type":"service_error"}}"#,
             )],
             false,
         );
@@ -2222,9 +2307,13 @@ mod tests {
                 )
                 .await,
             Err(LlmRequestError::Retryable {
-                source: OpenAiChatCompletionError::HttpStatus { status: 429, .. },
+                source: OpenAiChatCompletionError::HttpStatus {
+                    status: 429,
+                    provider_message: Some(message),
+                    ..
+                },
                 retry_after: Some(duration),
-            }) if duration == Duration::from_secs(3)
+            }) if duration == Duration::from_secs(3) && message == "retry later"
         ));
         assert!(server.requests.recv_timeout(Duration::from_secs(1)).is_ok());
         server.worker.join().expect("测试服务器应正常退出");

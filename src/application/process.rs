@@ -16,8 +16,8 @@ use super::command::{
     TerminationSignals,
 };
 use super::config::{
-    ConfigurationLoadError, ConfigurationPathError, ConfiguredProductCommand,
-    load_product_configuration, resolve_configuration_path,
+    ConfigurationLoadError, ConfiguredProductCommand, DistributionLayout, DistributionLayoutError,
+    load_product_configuration,
 };
 use super::generic_command::{
     GenericCommandOutput, GenericCommandRunReport, GenericCommandRunResult, GenericShutdownError,
@@ -162,27 +162,11 @@ fn run_after_cli_parsing(
         ProgressArgument::Plain => ProgressMode::Plain,
         ProgressArgument::Off => ProgressMode::Off,
     };
-    let current_directory = match std::env::current_dir() {
-        Ok(path) => path,
-        Err(error) => {
-            let diagnostic = SafeDiagnostic::io(
-                DiagnosticCode::ProcessCurrentDirectory,
-                DiagnosticStage::ProcessStartup,
-                DiagnosticSubject::Process,
-                "resolve_current_directory",
-                &error,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckPathAndPermissions,
-            );
-            return render_diagnostic_fatal(localizer, &diagnostic, stderr);
-        }
+    let distribution = match DistributionLayout::from_current_executable() {
+        Ok(distribution) => distribution,
+        Err(error) => return render_distribution_layout_error(localizer, &error, stderr),
     };
-    let configuration_path = match resolve_configuration_path(&arguments.config, &current_directory)
-    {
-        Ok(path) => path,
-        Err(error) => return render_configuration_path_error(localizer, &error, stderr),
-    };
-    let configuration = match load_product_configuration(&configuration_path, arguments.product) {
+    let configuration = match load_product_configuration(&distribution, arguments.product) {
         Ok(configuration) => configuration,
         Err(error) => return render_configuration_load_error(localizer, &error, stderr),
     };
@@ -277,8 +261,22 @@ fn render_command_report(
 ) -> ExitCode {
     match (result, shutdown_error) {
         (CommandRunResult::Succeeded(output), shutdown) => {
-            if let Err(error) = CommandResultRenderer::render_success(output, localizer, stdout) {
+            if let Err(error) = CommandResultRenderer::render_success(&output, localizer, stdout) {
                 let command_error = ProductionCommandError::stdout_write(error);
+                let warning = pending_project_log
+                    .and_then(|project_log| project_log.finish_with_failure(&command_error));
+                render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
+                let _ = CommandResultRenderer::render_failure(
+                    Some(&command_error),
+                    shutdown.as_ref(),
+                    localizer,
+                    stderr,
+                );
+                ExitCode::FAILURE
+            } else if let Err(error) =
+                CommandResultRenderer::render_success_warnings(&output, localizer, stderr)
+            {
+                let command_error = ProductionCommandError::stderr_write(error);
                 let warning = pending_project_log
                     .and_then(|project_log| project_log.finish_with_failure(&command_error));
                 render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
@@ -677,27 +675,28 @@ fn render_fatal(
     render_diagnostic_fatal(localizer, &diagnostic, stderr)
 }
 
-fn render_configuration_path_error(
+fn render_distribution_layout_error(
     localizer: &UiLocalizer,
-    error: &ConfigurationPathError,
+    error: &DistributionLayoutError,
     stderr: &mut dyn Write,
 ) -> ExitCode {
     let diagnostic = match error {
-        ConfigurationPathError::CurrentDirectoryNotAbsolute(path) => SafeDiagnostic::new(
-            DiagnosticCode::ConfigurationPath,
-            DiagnosticStage::Configuration,
+        DistributionLayoutError::CurrentExecutable(source) => SafeDiagnostic::io(
+            DiagnosticCode::ProcessRuntimeStart,
+            DiagnosticStage::ProcessStartup,
+            DiagnosticSubject::component("ATT executable"),
+            "resolve_current_executable",
+            source,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::CheckPathAndPermissions,
+        ),
+        DistributionLayoutError::ExecutableDirectoryMissing { path } => SafeDiagnostic::new(
+            DiagnosticCode::ProcessRuntimeStart,
+            DiagnosticStage::ProcessStartup,
             DiagnosticSubject::path(path),
             DiagnosticReason::failure(DiagnosticFailureKind::InvalidValue),
             DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixConfiguration,
-        ),
-        ConfigurationPathError::EmptyExplicitPath => SafeDiagnostic::new(
-            DiagnosticCode::ConfigurationPath,
-            DiagnosticStage::Configuration,
-            DiagnosticSubject::field("--config"),
-            DiagnosticReason::failure(DiagnosticFailureKind::MissingRequiredValue),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixConfiguration,
+            DiagnosticAction::ReportBug,
         ),
     };
     render_diagnostic_fatal(localizer, &diagnostic, stderr)
@@ -721,6 +720,10 @@ mod tests {
     use super::*;
     use crate::application::command::{RpgMakerCommandOutput, ShutdownFailures};
     use crate::diagnostic::SafeDiagnosticSource;
+    use crate::rpg_maker::extract::{
+        ExtractOutput, RulesCommandNonStringType, RulesCommandNonStringWarning,
+    };
+    use crate::runtime::project_log::ProjectLogValueSource;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum ObservedStream {
@@ -819,6 +822,92 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn successful_extract_keeps_summary_on_stdout_and_warnings_on_stderr() {
+        let output = RpgMakerCommandOutput::Extract {
+            output: ExtractOutput {
+                name: "project".parse().expect("测试项目名应合法"),
+                rules_warnings: vec![RulesCommandNonStringWarning {
+                    rule_number: 2,
+                    source_file: "Map001.json".to_owned(),
+                    command_code: 355,
+                    parameter: 0,
+                    actual_type: RulesCommandNonStringType::Number,
+                    skipped_count: 3,
+                }],
+            },
+            plan_source: ProjectLogValueSource::Explicit,
+            owners: vec!["Rules".to_owned()],
+            disabled_owners: Vec::new(),
+            has_saved_plan: true,
+        };
+        let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit = render_command_report(
+            CommandRunResult::Succeeded(output),
+            None,
+            None,
+            &localizer,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(exit, ExitCode::SUCCESS);
+        let stdout = String::from_utf8(stdout).expect("stdout 应为 UTF-8");
+        let stderr = String::from_utf8(stderr).expect("stderr 应为 UTF-8");
+        let plain_stderr = stderr.replace(['\u{2068}', '\u{2069}'], "");
+        assert!(stdout.contains("提取完成"));
+        assert!(stdout.contains("project"));
+        assert!(!stdout.contains("非字符串"));
+        assert!(plain_stderr.contains("Rules 规则 2"));
+        assert!(plain_stderr.contains("Map001.json"));
+        assert!(plain_stderr.contains("code=355"));
+        assert!(plain_stderr.contains("parameter=0"));
+        assert!(plain_stderr.contains("类型 number"));
+        assert!(plain_stderr.contains("3 个"));
+    }
+
+    #[test]
+    fn extract_warning_write_failure_is_a_process_output_failure() {
+        let output = RpgMakerCommandOutput::Extract {
+            output: ExtractOutput {
+                name: "project".parse().expect("测试项目名应合法"),
+                rules_warnings: vec![RulesCommandNonStringWarning {
+                    rule_number: 2,
+                    source_file: "Map001.json".to_owned(),
+                    command_code: 355,
+                    parameter: 0,
+                    actual_type: RulesCommandNonStringType::Number,
+                    skipped_count: 1,
+                }],
+            },
+            plan_source: ProjectLogValueSource::Explicit,
+            owners: vec!["Rules".to_owned()],
+            disabled_owners: Vec::new(),
+            has_saved_plan: true,
+        };
+        let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
+        let mut stdout = Vec::new();
+        let mut stderr = FailingOutput::default();
+
+        let exit = render_command_report(
+            CommandRunResult::Succeeded(output),
+            None,
+            None,
+            &localizer,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(exit, ExitCode::FAILURE);
+        assert!(stderr.write_attempts > 0);
+        let stdout = String::from_utf8_lossy(&stdout);
+        assert!(stdout.contains("提取完成"));
+        assert!(stdout.contains("project"));
     }
 
     #[test]
@@ -1060,7 +1149,7 @@ mod tests {
     }
 
     #[test]
-    fn help_and_parse_errors_do_not_require_configuration() {
+    fn help_and_parse_errors_do_not_load_the_fixed_configuration() {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let exit = run_from(["att", "--help"], &mut stdout, &mut stderr);
@@ -1086,13 +1175,13 @@ mod tests {
             &mut stdout,
             &mut stderr,
         );
-        assert_eq!(exit, ExitCode::from(2));
+        assert_eq!(exit, ExitCode::FAILURE);
         assert!(stdout.is_empty());
         assert!(
             String::from_utf8(stderr.clone())
                 .expect("诊断应为 UTF-8")
-                .contains("--config"),
-            "缺少配置路径应由 clap 呈现缺参错误"
+                .contains("config.toml"),
+            "合法业务命令应读取测试可执行文件旁的固定配置"
         );
     }
 

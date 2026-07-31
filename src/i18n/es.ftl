@@ -1,5 +1,4 @@
 app-about = Traduce juegos y texto estructurado con un estado de proyecto reutilizable
-cli-config-help = Archivo de configuración TOML estricto para esta ejecución
 cli-ui-language-help = Idioma de la ayuda, diagnósticos, progreso, resultados y registros del proyecto: ar, zh-Hans, zh-Hant, en, fr, ru, es, ja, ko o vi
 cli-progress-help = Modo de progreso en vivo: auto, plain u off
 cli-mz-about = Traduce un juego de RPG Maker MZ
@@ -33,7 +32,6 @@ cli-options-metavar = OPCIONES
 cli-command-metavar = COMANDO
 cli-print-help = Muestra la ayuda
 cli-print-version = Muestra la versión
-cli-missing-config = Falta la ruta de configuración obligatoria --config <FILE>.
 cli-blank-value = El valor no puede estar vacío.
 cli-invalid-positive-integer = El valor debe ser un entero positivo.
 cli-invalid-progress = El modo de progreso { $value } no está admitido; usa auto, plain u off.
@@ -83,6 +81,7 @@ notice-init-reuse-path = No se indicó una ruta de origen; se reutiliza la últi
 notice-extract-reuse-owners = No se indicó el ámbito de extracción; se reutiliza el último plan correcto: { $owners }.
 notice-translate-reuse-profile = No se indicó Profile; se reutiliza el último Profile correcto: { $profile }.
 notice-owner-disabled = El owner { $owner } se desactivó y se quitó de futuros planes automáticos.
+warning-rules-command-non-string-skipped = Advertencia: la regla Rules { $rule_number } omitió { $skipped_count } parámetros command que no eran cadenas (origen { $source_file }, code={ $command_code }, parameter={ $parameter }, tipo={ $actual_type }).
 notice-no-model-request = Todas las unidades de traducción están actualizadas; esta ejecución no necesitó enviar solicitudes al modelo.
 notice-manual-layout = { $count ->
     [one] 1 unidad necesita revisión manual de saltos de línea.
@@ -336,7 +335,6 @@ diagnostic-io-kind-value = { $code ->
    *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
-    [runtime_configuration_invalid] La configuración de ejecución no es válida
     [unsupported_prompt_locale] Debe ser exactamente auto en minúsculas o una configuración regional de interfaz BCP 47 compatible
     [language_policy_term_blank] El término de política lingüística no puede estar vacío
     [language_policy_term_surrounding_whitespace] El término de política lingüística no puede tener espacios al principio o al final
@@ -413,6 +411,7 @@ diagnostic-http-status = Estado HTTP { $status }
 diagnostic-http-retry-after = Retry-After de { $seconds } segundos
 diagnostic-http-provider-code = Código de error del proveedor { $code }
 diagnostic-http-provider-type = Tipo de error del proveedor { $kind }
+diagnostic-http-provider-message = Mensaje de error del proveedor { $message }
 diagnostic-http-fact-separator = ;{ " " }
 diagnostic-sqlite = Código de error principal de SQLite { $primary_code }, código ampliado { $extended_code }
 diagnostic-windows-status = La operación de Windows { $operation } falló con NTSTATUS { $status }

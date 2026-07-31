@@ -93,6 +93,7 @@ where
         let total_owners = u64::from(self.built_in_extraction.is_some() as u8)
             + u64::from(self.selected_rules.is_some() as u8);
         let mut completed_owners = 0_u64;
+        let mut rules_warnings = Vec::new();
 
         if let Some(built_in_extraction) = &self.built_in_extraction {
             self.observe_owner(
@@ -118,7 +119,7 @@ where
         if let Some(selected_rules) = &self.selected_rules {
             self.observe_owner(ExtractProgressPhase::Rules, completed_owners, total_owners);
             let error_path = selected_rules.program().diagnostic_path().to_path_buf();
-            selected_rules
+            let rules_output = selected_rules
                 .executor()
                 .replace(
                     &project,
@@ -130,6 +131,7 @@ where
                     rules_path: error_path,
                     source,
                 })?;
+            rules_warnings = rules_output.warnings;
             completed_owners += 1;
             self.observe_owner(ExtractProgressPhase::Rules, completed_owners, total_owners);
         }
@@ -138,7 +140,10 @@ where
             return Ok(OperationCompletion::Cancelled);
         }
 
-        Ok(OperationCompletion::Completed(ExtractOutput { name }))
+        Ok(OperationCompletion::Completed(ExtractOutput {
+            name,
+            rules_warnings,
+        }))
     }
 }
 

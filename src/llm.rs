@@ -229,9 +229,10 @@ pub(crate) trait LlmClientSemanticIdentity: Send + Sync {
 
 /// LLM 根错误能够公开的唯一结构化投影。
 ///
-/// 实现必须直接读取具体根错误的类型化字段；不得返回请求、响应正文、Header 值，
-/// 也不得通过 `Display` 或 source 链补猜事实。`retry_after` 来自同一次请求的响应头，
-/// 因而由仍同时持有根错误与请求包装事实的位置传入。
+/// 实现必须直接读取具体根错误的类型化字段；不得返回请求、原始响应正文、Header 值，
+/// 也不得通过 `Display` 或 source 链补猜事实。供应商标准错误消息必须先按敏感信息契约
+/// 脱敏并清理为单行文本；`retry_after` 来自同一次请求的响应头，因而由仍同时持有根错误
+/// 与请求包装事实的位置传入。
 pub(crate) trait LlmRequestDiagnosticSource {
     fn request_diagnostic(
         &self,

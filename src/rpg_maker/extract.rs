@@ -92,6 +92,43 @@ impl<R> SelectedRules<R> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExtractOutput {
     pub name: ProjectName,
+    /// Rules command 规则跳过的非字符串直接参数；未选择 Rules 时为空。
+    pub rules_warnings: Vec<RulesCommandNonStringWarning>,
+}
+
+/// command Rule 直接选择的参数不是字符串时，可安全跳过的 JSON 类型。
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum RulesCommandNonStringType {
+    Null,
+    Boolean,
+    Number,
+    Array,
+    Object,
+}
+
+impl RulesCommandNonStringType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::Boolean => "boolean",
+            Self::Number => "number",
+            Self::Array => "array",
+            Self::Object => "object",
+        }
+    }
+}
+
+/// 一类被 Rules command 直接参数规则跳过的非字符串值。
+///
+/// 聚合键不包含原始值或命令位置，避免诊断泄露正文并控制警告数量。
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct RulesCommandNonStringWarning {
+    pub rule_number: usize,
+    pub source_file: String,
+    pub command_code: i64,
+    pub parameter: usize,
+    pub actual_type: RulesCommandNonStringType,
+    pub skipped_count: u64,
 }
 
 #[cfg(test)]

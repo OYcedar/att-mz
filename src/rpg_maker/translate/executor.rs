@@ -3396,6 +3396,7 @@ mod tests {
                     retry_after_seconds: retry_after.map(|value| value.as_secs()),
                     provider_code: Some("temporarily_unavailable".to_owned()),
                     provider_type: Some("service_error".to_owned()),
+                    provider_message: None,
                 },
                 impact,
                 crate::diagnostic::DiagnosticAction::CheckModelService,
@@ -6265,6 +6266,7 @@ mod tests {
                     retry_after_seconds,
                     provider_code: Some(code),
                     provider_type: Some(kind),
+                    provider_message: None,
                 } if *retry_after_seconds
                     == (expected_status == "retry-after").then_some(3)
                     && code == "temporarily_unavailable"

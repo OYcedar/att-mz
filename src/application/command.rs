@@ -163,6 +163,7 @@ use crate::storage::file_system::{
 };
 use crate::storage::sqlite::SnapshotDatabaseError;
 use crate::translation::planning_resource::TranslationPlanningResourceReadingService;
+use crate::user_text::sanitize_user_text;
 
 const RPG_MAKER_PROMPT_DIRECTORY_NAME: &str = "rpg_maker";
 
@@ -1948,6 +1949,23 @@ impl ProductionRpgMakerCommandRunner {
             },
         )
         .await;
+        if let Some(output) = completed_output(&execution) {
+            for warning in &output.rules_warnings {
+                project_log.logger.emit(ProjectLogEvent::new(
+                    ProjectLogLevel::Warn,
+                    ProjectLogCode::ExtractRulesCommandNonStringSkipped,
+                    project_log.context.clone(),
+                    ProjectLogPayload::RulesCommandNonStringSkipped {
+                        rule_number: u64::try_from(warning.rule_number).unwrap_or(u64::MAX),
+                        source_file: warning.source_file.clone(),
+                        command_code: warning.command_code,
+                        parameter: u64::try_from(warning.parameter).unwrap_or(u64::MAX),
+                        actual_type: warning.actual_type.as_str().to_owned(),
+                        skipped_count: warning.skipped_count,
+                    },
+                ));
+            }
+        }
         drop(project_lease_guard);
         progress.finish();
         let log_outcome = project_log_outcome(&execution, &shutdown);
@@ -3440,6 +3458,20 @@ fn business_completed<T>(
         DrivenCommand::Finished(Ok(OperationCompletion::Completed(_)))
             | DrivenCommand::Interrupted(Ok(OperationCompletion::Completed(_)))
     )
+}
+
+fn completed_output<T>(
+    execution: &DrivenCommand<Result<OperationCompletion<T>, ProductionCommandError>>,
+) -> Option<&T> {
+    match execution {
+        DrivenCommand::Finished(Ok(OperationCompletion::Completed(output)))
+        | DrivenCommand::Interrupted(Ok(OperationCompletion::Completed(output))) => Some(output),
+        DrivenCommand::Finished(Ok(OperationCompletion::Cancelled))
+        | DrivenCommand::Interrupted(Ok(OperationCompletion::Cancelled))
+        | DrivenCommand::Finished(Err(_))
+        | DrivenCommand::Interrupted(Err(_))
+        | DrivenCommand::SignalFailed { .. } => None,
+    }
 }
 
 struct RunPlanFinalizationInput {
@@ -6667,6 +6699,21 @@ impl ProductionCommandError {
         )))
     }
 
+    pub(crate) fn stderr_write(source: io::Error) -> Self {
+        let diagnostic = SafeDiagnostic::io(
+            DiagnosticCode::StateFinalizationFailed,
+            DiagnosticStage::ProcessOutput,
+            DiagnosticSubject::operation("write_stderr"),
+            "write_stderr",
+            &source,
+            DiagnosticImpact::StateAppliedFinalizationFailed,
+            DiagnosticAction::Retry,
+        );
+        Self::StateAppliedButFinalizationFailed(Box::new(Self::report_diagnostic(
+            source, diagnostic,
+        )))
+    }
+
     fn into_failure_report(self) -> FailureReport {
         match self {
             Self::ConfigurationOrInput(report)
@@ -7574,7 +7621,7 @@ pub(crate) struct CommandResultRenderer;
 
 impl CommandResultRenderer {
     pub(crate) fn render_success(
-        output: RpgMakerCommandOutput,
+        output: &RpgMakerCommandOutput,
         localizer: &UiLocalizer,
         stdout: &mut dyn Write,
     ) -> io::Result<()> {
@@ -7591,7 +7638,7 @@ impl CommandResultRenderer {
                         project: output.name.as_str(),
                     })
                 )?;
-                match output.outcome {
+                match &output.outcome {
                     InitOutcome::Created => {
                         writeln!(stdout, "{}", localizer.format(UiMessage::ResultInitCreated))?
                     }
@@ -7604,7 +7651,7 @@ impl CommandResultRenderer {
                         writeln!(stdout, "{}", localizer.format(UiMessage::ResultInitUpdated))?;
                         if !stale_owners.is_empty() {
                             let owners = stale_owners
-                                .into_iter()
+                                .iter()
                                 .map(|owner| match owner {
                                     InitStaleOwner::Builtin => "Builtin",
                                     InitStaleOwner::Rules => "Rules",
@@ -7629,7 +7676,7 @@ impl CommandResultRenderer {
                         })
                     )?;
                 }
-                render_saved_plan_source(localizer, plan_source, stdout)
+                render_saved_plan_source(localizer, *plan_source, stdout)
             }
             RpgMakerCommandOutput::Extract {
                 output,
@@ -7645,7 +7692,7 @@ impl CommandResultRenderer {
                         project: output.name.as_str(),
                     })
                 )?;
-                if plan_source == ProjectLogValueSource::ProjectState {
+                if *plan_source == ProjectLogValueSource::ProjectState {
                     writeln!(
                         stdout,
                         "{}",
@@ -7661,8 +7708,8 @@ impl CommandResultRenderer {
                         localizer.format(UiMessage::NoticeOwnerDisabled { owner })
                     )?;
                 }
-                if has_saved_plan {
-                    render_saved_plan_source(localizer, plan_source, stdout)
+                if *has_saved_plan {
+                    render_saved_plan_source(localizer, *plan_source, stdout)
                 } else {
                     writeln!(
                         stdout,
@@ -7716,7 +7763,7 @@ impl CommandResultRenderer {
                         localizer.format(UiMessage::NoticeNoModelRequest)
                     )?;
                 }
-                if profile_source == ProjectLogValueSource::ProjectState {
+                if *profile_source == ProjectLogValueSource::ProjectState {
                     writeln!(
                         stdout,
                         "{}",
@@ -7725,7 +7772,7 @@ impl CommandResultRenderer {
                         })
                     )?;
                 }
-                render_saved_plan_source(localizer, profile_source, stdout)
+                render_saved_plan_source(localizer, *profile_source, stdout)
             }
             RpgMakerCommandOutput::WriteBack { output } => {
                 writeln!(
@@ -7779,6 +7826,33 @@ impl CommandResultRenderer {
                 })
             ),
         }
+    }
+
+    pub(crate) fn render_success_warnings(
+        output: &RpgMakerCommandOutput,
+        localizer: &UiLocalizer,
+        stderr: &mut dyn Write,
+    ) -> io::Result<()> {
+        let RpgMakerCommandOutput::Extract { output, .. } = output else {
+            return Ok(());
+        };
+        for warning in &output.rules_warnings {
+            let source_file = sanitize_user_text(&warning.source_file);
+            let command_code = warning.command_code.to_string();
+            writeln!(
+                stderr,
+                "{}",
+                localizer.format(UiMessage::WarningRulesCommandNonStringSkipped {
+                    rule_number: u64::try_from(warning.rule_number).unwrap_or(u64::MAX),
+                    source_file: &source_file,
+                    command_code: &command_code,
+                    parameter: u64::try_from(warning.parameter).unwrap_or(u64::MAX),
+                    actual_type: warning.actual_type.as_str(),
+                    skipped_count: warning.skipped_count,
+                })
+            )?;
+        }
+        Ok(())
     }
 
     pub(crate) fn render_failure(

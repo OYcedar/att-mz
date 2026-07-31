@@ -579,7 +579,7 @@ pub(crate) struct ProjectDatabaseRecordReadingService<S> {
 }
 
 impl<S> ProjectDatabaseRecordReadingService<S> {
-    /// 创建服务；项目工作区根目录由外部配置边界明确注入。
+    /// 创建服务；项目工作区根目录由发行布局边界明确注入。
     pub(crate) fn new(projects_root: PathBuf, rpg_maker_layout: RpgMakerLayout, sqlite: S) -> Self {
         Self {
             projects_root,

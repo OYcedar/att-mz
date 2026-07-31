@@ -2035,6 +2035,48 @@ mod tests {
     }
 
     #[test]
+    fn http_provider_message_is_visible_in_attempt_record_and_redacted_again() {
+        const API_KEY: &str = "task-record-secret";
+        let diagnostic = SafeDiagnostic::new(
+            DiagnosticCode::ModelRequest,
+            DiagnosticStage::ModelRequest,
+            DiagnosticSubject::component("provider"),
+            DiagnosticReason::Http {
+                status: Some(400),
+                retry_after_seconds: None,
+                provider_code: Some("bad_request".to_owned()),
+                provider_type: Some("invalid_request_error".to_owned()),
+                provider_message: Some(format!("before {API_KEY} after")),
+            },
+            DiagnosticImpact::ProgressPreserved,
+            DiagnosticAction::CheckModelService,
+        );
+        let document = document(
+            Vec::new(),
+            vec![TranslationTaskAttemptRecord::failed(
+                NonZeroUsize::MIN,
+                Duration::from_millis(10),
+                diagnostic,
+            )],
+            None,
+            TranslationTaskRecordFinalState::ExecutionFailedNoChanges { diagnostic: None },
+        );
+
+        let markdown = render_task_record(
+            "run-provider-message",
+            &client("https://example.test", "model", Map::new(), API_KEY),
+            UiLocale::SimplifiedChinese,
+            &document,
+        )
+        .expect("任务记录应可渲染");
+
+        assert!(!markdown.contains(API_KEY));
+        assert!(markdown.contains("供应商错误码 bad_request"));
+        assert!(markdown.contains("供应商错误类型 invalid_request_error"));
+        assert!(markdown.contains("供应商错误消息 before [REDACTED API KEY] after"));
+    }
+
+    #[test]
     fn total_duration_is_frozen_when_the_final_state_is_constructed() {
         let started = Instant::now() - Duration::from_secs(2);
         let evidence = TranslationTaskExecutionEvidence::from_execution(

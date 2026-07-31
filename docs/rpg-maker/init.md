@@ -3,13 +3,13 @@
 首次建立项目：
 
 ```text
-att --config CONFIG mv init --name NAME --path GAME_ROOT \
+att mv init --name NAME --path GAME_ROOT \
   --source-language LANGUAGE --target-language LANGUAGE \
   --dialogue-max-fullwidth-chars DIALOGUE_COUNT \
   --scrolling-text-max-fullwidth-chars SCROLLING_COUNT \
   --help-description-max-fullwidth-chars HELP_COUNT
 
-att --config CONFIG mz init --name NAME --path GAME_ROOT \
+att mz init --name NAME --path GAME_ROOT \
   --source-language LANGUAGE --target-language LANGUAGE \
   --dialogue-max-fullwidth-chars DIALOGUE_COUNT \
   --scrolling-text-max-fullwidth-chars SCROLLING_COUNT \
@@ -19,7 +19,7 @@ att --config CONFIG mz init --name NAME --path GAME_ROOT \
 项目工作区固定为：
 
 ```text
-<projects.root>/<mv|mz>/<name>/
+<att-dir>/projects/<mv|mz>/<name>/
 ```
 
 首次 Init 需要一次给齐游戏根、语言对，以及对话、滚动文本、帮助与说明的三个正数全角
