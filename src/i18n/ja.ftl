@@ -1,5 +1,4 @@
 app-about = 再利用可能なプロジェクト状態でゲームと構造化テキストを翻訳します
-cli-config-help = 今回の実行で使用する厳密な TOML 設定ファイル
 cli-ui-language-help = ヘルプ、診断、進捗、結果、プロジェクトログの言語: ar、zh-Hans、zh-Hant、en、fr、ru、es、ja、ko、vi
 cli-progress-help = 進捗表示モード: auto、plain、off
 cli-mz-about = RPG Maker MZ ゲームを翻訳します
@@ -33,7 +32,6 @@ cli-options-metavar = オプション
 cli-command-metavar = コマンド
 cli-print-help = ヘルプを表示します
 cli-print-version = バージョンを表示します
-cli-missing-config = 必須の設定パス --config <FILE> がありません。
 cli-blank-value = 値を空にすることはできません。
 cli-invalid-positive-integer = 値は正の整数でなければなりません。
 cli-invalid-progress = 進捗モード { $value } は未対応です。auto、plain、off のいずれかを使用してください。
@@ -83,6 +81,7 @@ notice-init-reuse-path = 元パスが指定されなかったため、前回成�
 notice-extract-reuse-owners = 抽出範囲が指定されなかったため、前回成功したプランを再利用します: { $owners }。
 notice-translate-reuse-profile = Profile が指定されなかったため、前回成功した Profile を再利用します: { $profile }。
 notice-owner-disabled = owner { $owner } を無効にし、今後の自動プランから削除しました。
+warning-rules-command-non-string-skipped = 警告：Rules ルール { $rule_number } は文字列ではない command パラメーターを { $skipped_count } 件スキップしました（ソース { $source_file }、code={ $command_code }、parameter={ $parameter }、型 { $actual_type }）。
 notice-no-model-request = すべての翻訳単位が最新のため、今回はモデルへのリクエストを行いませんでした。
 notice-manual-layout = { $count } 単位で改行の手動確認が必要です。
 notice-log-degraded = プロジェクトログを利用できないか劣化しています。コマンドは継続し、終了状態には影響しません。
@@ -327,7 +326,6 @@ diagnostic-io-kind-value = { $code ->
    *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
-    [runtime_configuration_invalid] ランタイム設定が無効です
     [unsupported_prompt_locale] 小文字の auto またはサポートされている BCP 47 UI ロケールでなければなりません
     [language_policy_term_blank] 言語ポリシー用語を空白にできません
     [language_policy_term_surrounding_whitespace] 言語ポリシー用語の前後に空白を含められません
@@ -404,6 +402,7 @@ diagnostic-http-status = HTTP ステータス { $status }
 diagnostic-http-retry-after = Retry-After { $seconds } 秒
 diagnostic-http-provider-code = プロバイダーエラーコード { $code }
 diagnostic-http-provider-type = プロバイダーエラー種別 { $kind }
+diagnostic-http-provider-message = プロバイダーエラーメッセージ { $message }
 diagnostic-http-fact-separator = ；
 diagnostic-sqlite = SQLite 主エラーコード { $primary_code }、拡張エラーコード { $extended_code }
 diagnostic-windows-status = Windows 操作 { $operation } が失敗しました。NTSTATUS { $status }

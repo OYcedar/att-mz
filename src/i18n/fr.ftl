@@ -1,5 +1,4 @@
 app-about = Traduire des jeux et du texte structuré avec un état de projet réutilisable
-cli-config-help = Fichier de configuration TOML strict pour cette exécution
 cli-ui-language-help = Langue de l’aide, des diagnostics, de la progression, des résultats et des journaux : ar, zh-Hans, zh-Hant, en, fr, ru, es, ja, ko ou vi
 cli-progress-help = Mode de progression en direct : auto, plain ou off
 cli-mz-about = Traduire un jeu RPG Maker MZ
@@ -33,7 +32,6 @@ cli-options-metavar = OPTIONS
 cli-command-metavar = COMMANDE
 cli-print-help = Afficher l’aide
 cli-print-version = Afficher la version
-cli-missing-config = Le chemin de configuration requis --config <FILE> est absent.
 cli-blank-value = La valeur ne peut pas être vide.
 cli-invalid-positive-integer = La valeur doit être un entier positif.
 cli-invalid-progress = Le mode de progression { $value } n’est pas pris en charge ; utilisez auto, plain ou off.
@@ -83,6 +81,7 @@ notice-init-reuse-path = Aucun chemin source fourni ; réutilisation du dernier 
 notice-extract-reuse-owners = Aucune portée d’extraction fournie ; réutilisation du dernier plan réussi : { $owners }.
 notice-translate-reuse-profile = Aucun Profile fourni ; réutilisation du dernier Profile réussi : { $profile }.
 notice-owner-disabled = L’owner { $owner } a été désactivé et retiré des futurs plans automatiques.
+warning-rules-command-non-string-skipped = Avertissement : la règle Rules { $rule_number } a ignoré { $skipped_count } paramètres command qui ne sont pas des chaînes (source { $source_file }, code={ $command_code }, parameter={ $parameter }, type={ $actual_type }).
 notice-no-model-request = Toutes les unités de traduction sont à jour ; cette exécution n’a envoyé aucune requête au modèle.
 notice-manual-layout = { $count ->
     [one] 1 unité nécessite une vérification manuelle des sauts de ligne.
@@ -336,7 +335,6 @@ diagnostic-io-kind-value = { $code ->
    *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
-    [runtime_configuration_invalid] La configuration d’exécution est incorrecte
     [unsupported_prompt_locale] La valeur doit être exactement auto en minuscules ou une langue d’interface BCP 47 prise en charge
     [language_policy_term_blank] Le terme de politique linguistique ne doit pas être vide
     [language_policy_term_surrounding_whitespace] Le terme de politique linguistique ne doit pas contenir d’espaces en début ou fin
@@ -413,6 +411,7 @@ diagnostic-http-status = État HTTP { $status }
 diagnostic-http-retry-after = Retry-After de { $seconds } secondes
 diagnostic-http-provider-code = Code d’erreur du fournisseur { $code }
 diagnostic-http-provider-type = Type d’erreur du fournisseur { $kind }
+diagnostic-http-provider-message = Message d’erreur du fournisseur { $message }
 diagnostic-http-fact-separator = ;{ " " }
 diagnostic-sqlite = Code d’erreur SQLite principal { $primary_code }, code étendu { $extended_code }
 diagnostic-windows-status = L’opération Windows { $operation } a échoué avec NTSTATUS { $status }

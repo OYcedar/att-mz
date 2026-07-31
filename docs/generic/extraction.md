@@ -1,7 +1,7 @@
 # Generic Extract 现行规格
 
 ```text
-att --config CONFIG generic extract --name NAME
+att generic extract --name NAME
 ```
 
 Extract 读取项目当前绑定的外部 JSONL 根，严格按照

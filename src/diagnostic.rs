@@ -20,12 +20,8 @@ pub(crate) type BoxedError = Box<dyn Error + Send + Sync + 'static>;
 /// 稳定、闭集的诊断代码。代码描述具体失败，不承担责任域分类职责。
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) enum DiagnosticCode {
-    #[serde(rename = "process.current_directory")]
-    ProcessCurrentDirectory,
     #[serde(rename = "process.runtime_start")]
     ProcessRuntimeStart,
-    #[serde(rename = "configuration.path")]
-    ConfigurationPath,
     #[serde(rename = "configuration.open")]
     ConfigurationOpen,
     #[serde(rename = "configuration.read")]
@@ -119,9 +115,7 @@ pub(crate) enum DiagnosticCode {
 impl DiagnosticCode {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
-            Self::ProcessCurrentDirectory => "process.current_directory",
             Self::ProcessRuntimeStart => "process.runtime_start",
-            Self::ConfigurationPath => "configuration.path",
             Self::ConfigurationOpen => "configuration.open",
             Self::ConfigurationRead => "configuration.read",
             Self::ConfigurationNotFile => "configuration.not_file",
@@ -669,7 +663,6 @@ where
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ConfigurationValueRule {
-    RuntimeConfigurationInvalid,
     UnsupportedPromptLocale,
     LanguagePolicyTermBlank,
     LanguagePolicyTermSurroundingWhitespace,
@@ -714,7 +707,6 @@ pub(crate) enum ConfigurationValueRule {
 impl ConfigurationValueRule {
     const fn as_str(&self) -> &'static str {
         match self {
-            Self::RuntimeConfigurationInvalid => "runtime_configuration_invalid",
             Self::UnsupportedPromptLocale => "unsupported_prompt_locale",
             Self::LanguagePolicyTermBlank => "language_policy_term_blank",
             Self::LanguagePolicyTermSurroundingWhitespace => {
@@ -861,7 +853,8 @@ impl ConfigurationTomlFailureKind {
     }
 }
 
-/// 可公开原因。自由文本只允许来自操作系统按稳定错误码重新生成的系统消息。
+/// 可公开原因。自由文本只允许来自操作系统按稳定错误码重新生成的系统消息，或已经在
+/// HTTP 根边界完成敏感信息替换的供应商标准错误消息。
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub(crate) enum DiagnosticReason {
@@ -896,6 +889,7 @@ pub(crate) enum DiagnosticReason {
         retry_after_seconds: Option<u64>,
         provider_code: Option<String>,
         provider_type: Option<String>,
+        provider_message: Option<String>,
     },
     Sqlite {
         primary_code: i32,
@@ -985,11 +979,13 @@ impl DiagnosticReason {
                 retry_after_seconds,
                 provider_code,
                 provider_type,
+                provider_message,
             } => Self::Http {
                 status,
                 retry_after_seconds,
                 provider_code: provider_code.and_then(safe_provider_identifier),
                 provider_type: provider_type.and_then(safe_provider_identifier),
+                provider_message: provider_message.and_then(safe_provider_message),
             },
             Self::WindowsStatus { operation, status } => Self::WindowsStatus {
                 operation: sanitize_user_text(&operation),
@@ -1058,11 +1054,15 @@ impl DiagnosticReason {
                 retry_after_seconds,
                 provider_code,
                 provider_type,
+                provider_message,
             } => Self::Http {
                 status,
                 retry_after_seconds,
                 provider_code: provider_code.map(|value| map_text(value, map)),
                 provider_type: provider_type.map(|value| map_text(value, map)),
+                provider_message: provider_message
+                    .map(|value| map_text(value, map))
+                    .and_then(safe_provider_message),
             },
             Self::Sqlite {
                 primary_code,
@@ -1186,6 +1186,7 @@ impl DiagnosticReason {
                 retry_after_seconds,
                 provider_code,
                 provider_type,
+                provider_message,
             } => {
                 let mut facts = Vec::new();
                 if let Some(status) = status {
@@ -1203,6 +1204,11 @@ impl DiagnosticReason {
                 }
                 if let Some(kind) = provider_type {
                     facts.push(localizer.format(UiMessage::DiagnosticHttpProviderType { kind }));
+                }
+                if let Some(message) = provider_message {
+                    facts.push(
+                        localizer.format(UiMessage::DiagnosticHttpProviderMessage { message }),
+                    );
                 }
                 if facts.is_empty() {
                     localizer.format(UiMessage::DiagnosticHttpNoDetails)
@@ -1468,6 +1474,11 @@ fn safe_provider_identifier(value: String) -> Option<String> {
     .then_some(value)
 }
 
+fn safe_provider_message(value: String) -> Option<String> {
+    let value = sanitize_user_text(&value);
+    (!value.trim().is_empty()).then_some(value)
+}
+
 /// 内部因果与公开投影的绑定。`source` 不参与序列化或渲染。
 pub(crate) struct ReportedFailure {
     public: SafeDiagnostic,
@@ -1710,6 +1721,7 @@ mod tests {
                 retry_after_seconds: Some(7),
                 provider_code: Some("rate_limit\r\nINJECTED_CODE".to_owned()),
                 provider_type: Some("rate-limit".to_owned()),
+                provider_message: Some("message\r\nINJECTED_MESSAGE".to_owned()),
             },
             DiagnosticImpact::ProgressPreserved,
             DiagnosticAction::CheckModelService,
@@ -1725,6 +1737,7 @@ mod tests {
         assert!(serialized.contains("provider INJECTED_SUBJECT"));
         assert!(serialized.contains("task INJECTED_RECOVERY"));
         assert!(serialized.contains("rate-limit"));
+        assert!(serialized.contains("message INJECTED_MESSAGE"));
         assert!(serialized.contains("\"provider_code\":null"));
     }
 
@@ -1740,6 +1753,7 @@ mod tests {
                 retry_after_seconds: Some(7),
                 provider_code: Some(format!("before-{API_KEY}-after")),
                 provider_type: Some(format!("type-{API_KEY}")),
+                provider_message: Some(format!("message-{API_KEY}")),
             },
             DiagnosticImpact::ProgressPreserved,
             DiagnosticAction::CheckModelService,
@@ -1751,7 +1765,7 @@ mod tests {
 
         let serialized = serde_json::to_string(&diagnostic).expect("诊断应可序列化");
         assert!(!serialized.contains(API_KEY));
-        assert_eq!(serialized.matches("[REDACTED API KEY]").count(), 4);
+        assert_eq!(serialized.matches("[REDACTED API KEY]").count(), 5);
         assert!(serialized.contains("\"code\":\"model.request\""));
         assert!(serialized.contains("\"stage\":\"model_request\""));
         assert!(serialized.contains("\"status\":429"));
@@ -1838,6 +1852,7 @@ mod tests {
             retry_after_seconds: Some(17),
             provider_code: Some("rate_limit".to_owned()),
             provider_type: Some("quota".to_owned()),
+            provider_message: Some("request rejected".to_owned()),
         }
         .render_localized(&localizer);
         let sqlite = DiagnosticReason::Sqlite {
@@ -1857,7 +1872,7 @@ mod tests {
 
         assert_eq!(
             http_plain,
-            "HTTP 状态码 429；Retry-After 17 秒；供应商错误码 rate_limit；供应商错误类型 quota"
+            "HTTP 状态码 429；Retry-After 17 秒；供应商错误码 rate_limit；供应商错误类型 quota；供应商错误消息 request rejected"
         );
         assert_eq!(sqlite_plain, "SQLite 主错误码 5，扩展错误码 517");
         assert_eq!(resource_plain, "请求字符数：实际值 25000，上限 24000");
@@ -1897,9 +1912,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn every_structured_diagnostic_value_is_localized_without_fallback_or_debug_syntax() {
         let codes = [
-            DiagnosticCode::ProcessCurrentDirectory,
             DiagnosticCode::ProcessRuntimeStart,
-            DiagnosticCode::ConfigurationPath,
             DiagnosticCode::ConfigurationOpen,
             DiagnosticCode::ConfigurationRead,
             DiagnosticCode::ConfigurationNotFile,
@@ -2215,12 +2228,14 @@ mod tests {
                     retry_after_seconds: Some(17),
                     provider_code: Some("rate_limit".to_owned()),
                     provider_type: Some("quota".to_owned()),
+                    provider_message: Some("request rejected".to_owned()),
                 },
                 DiagnosticReason::Http {
                     status: None,
                     retry_after_seconds: None,
                     provider_code: None,
                     provider_type: None,
+                    provider_message: None,
                 },
                 DiagnosticReason::Sqlite {
                     primary_code: 5,
@@ -2262,7 +2277,6 @@ mod tests {
 
     fn all_configuration_value_rules() -> Vec<ConfigurationValueRule> {
         vec![
-            ConfigurationValueRule::RuntimeConfigurationInvalid,
             ConfigurationValueRule::UnsupportedPromptLocale,
             ConfigurationValueRule::LanguagePolicyTermBlank,
             ConfigurationValueRule::LanguagePolicyTermSurroundingWhitespace,

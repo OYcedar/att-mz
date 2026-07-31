@@ -1,7 +1,7 @@
 # Generic Translate 现行规格
 
 ```text
-att --config CONFIG generic translate --name NAME [PROFILE_ID] \
+att generic translate --name NAME [PROFILE_ID] \
   [--terms TERMINOLOGY_TOML] [--placeholders PLACEHOLDER_TOML]
 ```
 

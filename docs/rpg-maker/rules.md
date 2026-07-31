@@ -228,7 +228,7 @@ pattern = '\A\[title\](?<text>.+)\z'
 | `file` | string | 三类来源选一 | 安全精确 `.json` 基名，或唯一通配 `Map*.json` |
 | `plugin` | string | 三类来源选一 | `js/plugins.js` 中精确名称且 `status = true` 的插件 |
 | `code` | non-negative integer | 与 `parameter` 成对，三类来源选一 | 扫描 Map、CommonEvents、Troops 的事件命令 |
-| `parameter` | non-negative integer | 与 `code` 成对 | 指定参数下标；缺少该参数使整个规则候选失败 |
+| `parameter` | non-negative integer | 与 `code` 成对 | 指定参数下标；`parameters` 非数组或缺少该下标使整个候选失败 |
 | `path` | string | `file/plugin` 必填；command 可省略 | 非空确定路径，语法见下文 |
 | `decode_json` | boolean | 可选，默认 `false` | 要求路径终点 string 再解码一次，结果仍须为 string |
 | `pattern` | string | 可选 | 非空 PCRE2；若存在，恰好一个 `text` 命名捕获 |
@@ -247,9 +247,11 @@ path = 'name'
 ### 4.2 类型、默认值与互斥
 
 三项来源的互斥选择见 4.1。`file/plugin` 必须提供 `path`；command 可省略 `path`，
-此时参数自身必须是最终 string。`decode_json` 仅接受 boolean，默认 `false`；`pattern`
-省略时使用整个最终 string，提供时必须是非空 string。`code`、`parameter` 与固定数组
-下标都是非负整数，浮点数、数字字符串和负数都不接受。
+此时直接读取原始参数：string 进入后续 `decode_json` 和 `pattern`，而 null、boolean、
+number、array、object 按类型聚合为警告并跳过。这个跳过只属于“command 且省略
+`path`”的直接参数，不放宽任何路径、解码或来源结构错误。`decode_json` 仅接受 boolean，
+默认 `false`；`pattern` 省略时使用整个最终 string，提供时必须是非空 string。
+`code`、`parameter` 与固定数组下标都是非负整数，浮点数、数字字符串和负数都不接受。
 
 来源选择是互斥关系而非优先级：字段的排列顺序无法让一个来源盖过另一个。
 
@@ -276,10 +278,13 @@ path = 'name'
 解析成功后，ATT 才对冻结来源执行。扫描 command 来源时，事件列表中的非 object 项或
 `code` 非整数项不构成事件命令，按项跳过；这种来源结构异常本身不使候选失败。已经建立
 整数 `code` 且命中规则后，`parameters` 非数组或缺少规则声明的 `parameter` 才表示该规则
-依赖的事件协议不成立。精确文件/插件/事件来源不存在，实际大小写不符，插件未启用，上述
-已命中 command 协议失败，路径要求的 JSON 类型不符，逐层解码失败，终点不是 string，
-捕获非法，或规则最终未产出任何非空单元，都会使候选失败。路径缺 key 或固定数组越界
-只让当前展开分支不产出；它不是候选失败，除非最终导致该规则零产出。
+依赖的事件协议不成立。command 省略 `path` 时，存在的直接参数若不是 string，则按
+`rule_number + source_file + command_code + parameter + actual_type` 聚合跳过数量；string
+没有命中 `pattern` 只是普通未命中，不产生警告。精确文件/插件/事件来源不存在，实际
+大小写不符，插件未启用，上述已命中 command 协议失败，显式 `path` 的结构或终值类型
+不符，逐层或 `decode_json` 解码失败，解码后终值不是 string，捕获非法，或规则最终未
+产出任何非空单元，都会使候选失败。路径缺 key 或固定数组越界只让当前展开分支不产出；
+它不是候选失败，除非最终导致该规则零产出。
 
 完整来源行为见[第 4.11 节](#411-来源执行与原子失败范围)。
 
@@ -288,7 +293,9 @@ path = 'name'
 一份 Extract Rules 文件先整体解析、编译，并针对同一冻结来源执行，再作为一个 Rules
 owner 候选提交。任一规则失败、recipe 无法重建或 Mutation Claim 冲突，整个候选都不
 提交，旧 Rules owner 快照原样保持；成功时，文件内全部规则的结果一次性替换该 owner，
-没有逐规则的部分提交。
+没有逐规则的部分提交。聚合警告只在匹配、冲突检查和这次提交全部成功后随 Extract 成功
+结果返回；它不写入数据库，也不改变后续项目状态。项目日志写入失败仍不改变 Extract
+结果。
 
 ### 4.6 提供文件、略去参数与显式空数组的生命周期
 
@@ -406,7 +413,8 @@ path = 'payload.entry.title'
 自动解码失败、终点不是 string 则使整个规则候选失败。对 command 来源，非 object 命令
 项和非整数 `code` 按来源扫描规则跳过；但整数 `code` 已命中后，`parameters` 非数组或
 指定的 `parameter` 不存在不是“当前分支跳过”，而是整个候选失败，因为规则声明的事件
-协议已经不成立。
+协议已经不成立。唯一额外的宽松情况是 command 省略 `path` 后直接拿到非字符串参数；
+显式 `path`、字符串 JSON 解码及解码后的终值仍遵守本节严格规则。
 
 ### 4.10 整串、局部捕获、顺序与分组
 
@@ -417,6 +425,10 @@ path = 'payload.entry.title'
 - 同一 string 的多次匹配按 `text` 捕获起始字节位置排序且不得重叠；
 - 空白 `text` 不产出单元；匹配之外和捕获之外的字节冻结为 Literal；
 - 一条非空规则在整个当前来源中至少产出一个非空单元，否则 Rules 候选失败。
+
+被跳过的非字符串不算有效命中。若一条规则只有这类跳过项而没有非空 string 单元，仍按
+`rules_no_non_blank_match` 失败；诊断附带各实际类型及数量，便于区分“规则没有目标”和
+“来源存在但直接参数类型混合”。候选失败时不提交快照，也不把成功警告交给 CLI。
 
 同一最终 string 内由同一规则的多次捕获自动形成一个组，字段按捕获字节位置排列；同一
 个 string 交给一条规则就好，别让多条规则瓜分。组的自然顺序使用
@@ -462,7 +474,8 @@ Troops 中的事件列表；`code` 本身没有 ATT 预设语义。
 整份 TOML 先严格解析和编译，再针对冻结来源执行。任一规则的来源身份、参数、路径类型、
 JSON 解码、最终 string、捕获、重建或物理 Claim 不成立，整个 Rules owner 候选失败，
 旧 Rules 快照保持不变。路径缺 key/越界只是该展开分支无产出，但最终仍需满足每条规则
-至少产出一个单元。
+至少产出一个单元。成功时 CLI 的提取摘要仍写 stdout；每类非字符串跳过警告各写一行
+stderr，退出码仍为 0。警告按上述聚合键稳定排序，不包含原始参数值或逐命令位置。
 
 ## 5. 自然顺序与 Mutation Claim
 

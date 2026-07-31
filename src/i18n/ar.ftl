@@ -1,5 +1,4 @@
 app-about = ترجمة الألعاب والنصوص المنظّمة باستخدام حالة مشروع قابلة لإعادة الاستخدام
-cli-config-help = ملف إعداد TOML صارم لهذا التشغيل
 cli-ui-language-help = لغة المساعدة والتشخيص والتقدم والنتائج وسجلات المشروع: ar وzh-Hans وzh-Hant وen وfr وru وes وja وko وvi
 cli-progress-help = نمط التقدم المباشر: auto أو plain أو off
 cli-mz-about = ترجمة لعبة RPG Maker MZ
@@ -33,7 +32,6 @@ cli-options-metavar = خيارات
 cli-command-metavar = أمر
 cli-print-help = عرض المساعدة
 cli-print-version = عرض الإصدار
-cli-missing-config = مسار الإعداد المطلوب --config <FILE> مفقود.
 cli-blank-value = لا يجوز أن تكون القيمة فارغة.
 cli-invalid-positive-integer = يجب أن تكون القيمة عددًا صحيحًا موجبًا.
 cli-invalid-progress = نمط التقدم { $value } غير مدعوم؛ استخدم auto أو plain أو off.
@@ -83,6 +81,7 @@ notice-init-reuse-path = لم يُقدّم مسار مصدر؛ سيُعاد اس
 notice-extract-reuse-owners = لم يُقدّم نطاق استخراج؛ ستُعاد استخدام آخر خطة ناجحة: { $owners }.
 notice-translate-reuse-profile = لم يُقدّم Profile؛ سيُعاد استخدام آخر Profile ناجح: { $profile }.
 notice-owner-disabled = عُطّل owner { $owner } وأزيل من الخطط التلقائية اللاحقة.
+warning-rules-command-non-string-skipped = تحذير: تخطّت قاعدة Rules رقم { $rule_number } عدد { $skipped_count } من معاملات command غير النصية (المصدر { $source_file }، code={ $command_code }، parameter={ $parameter }، النوع { $actual_type }).
 notice-no-model-request = كل وحدات الترجمة حديثة؛ لم تحتج هذه الجولة إلى إرسال طلب للنموذج.
 notice-manual-layout = { $count ->
     [zero] لا توجد وحدات تحتاج إلى مراجعة يدوية لفواصل الأسطر.
@@ -348,7 +347,6 @@ diagnostic-io-kind-value = { $code ->
    *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
-    [runtime_configuration_invalid] إعدادات وقت التشغيل غير صالحة
     [unsupported_prompt_locale] يجب أن تكون auto بأحرف صغيرة تمامًا أو لغة واجهة BCP 47 مدعومة
     [language_policy_term_blank] يجب ألا يكون مصطلح سياسة اللغة فارغًا
     [language_policy_term_surrounding_whitespace] يجب ألا يحتوي مصطلح سياسة اللغة على مسافات طرفية
@@ -425,6 +423,7 @@ diagnostic-http-status = حالة HTTP ‏{ $status }
 diagnostic-http-retry-after = Retry-After بعد { $seconds } ثانية
 diagnostic-http-provider-code = رمز خطأ المزوّد { $code }
 diagnostic-http-provider-type = نوع خطأ المزوّد { $kind }
+diagnostic-http-provider-message = رسالة خطأ المزوّد { $message }
 diagnostic-http-fact-separator = ؛
 diagnostic-sqlite = رمز خطأ SQLite الأساسي { $primary_code }، ورمز الخطأ الموسّع { $extended_code }
 diagnostic-windows-status = فشلت عملية Windows ‏{ $operation } بالحالة NTSTATUS ‏{ $status }

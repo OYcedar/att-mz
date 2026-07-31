@@ -51,36 +51,72 @@ use crate::runtime::sqlite::RusqliteStorageConfiguration;
 use crate::translation::profile::TranslationRequestConfiguration;
 
 const RESERVED_REQUEST_BODY_FIELDS: [&str; 3] = ["model", "messages", "stream"];
+const CONFIGURATION_FILE_NAME: &str = "config.toml";
+const PROJECTS_DIRECTORY_NAME: &str = "projects";
+const PROMPTS_DIRECTORY_NAME: &str = "prompts";
 
-/// 根据命令行显式路径选择配置文件位置。
-///
-/// 相对路径以当前工作目录解析。
-pub(crate) fn resolve_configuration_path(
-    explicit: &Path,
-    current_directory: &Path,
-) -> Result<PathBuf, ConfigurationPathError> {
-    if !current_directory.is_absolute() {
-        return Err(ConfigurationPathError::CurrentDirectoryNotAbsolute(
-            current_directory.to_path_buf(),
-        ));
+/// 由实际运行的可执行文件唯一确定的发行目录布局。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DistributionLayout {
+    configuration_path: PathBuf,
+    projects_root: PathBuf,
+    prompts_root: PathBuf,
+}
+
+impl DistributionLayout {
+    pub(crate) fn from_current_executable() -> Result<Self, DistributionLayoutError> {
+        let executable_path =
+            std::env::current_exe().map_err(DistributionLayoutError::CurrentExecutable)?;
+        Self::from_executable_path(executable_path)
     }
 
-    if explicit.as_os_str().is_empty() {
-        return Err(ConfigurationPathError::EmptyExplicitPath);
+    fn from_executable_path(executable_path: PathBuf) -> Result<Self, DistributionLayoutError> {
+        let root = executable_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or_else(|| DistributionLayoutError::ExecutableDirectoryMissing {
+                path: executable_path.clone(),
+            })?
+            .to_path_buf();
+        Ok(Self {
+            configuration_path: root.join(CONFIGURATION_FILE_NAME),
+            projects_root: root.join(PROJECTS_DIRECTORY_NAME),
+            prompts_root: root.join(PROMPTS_DIRECTORY_NAME),
+        })
     }
-    Ok(resolve_path(current_directory, explicit))
+
+    #[cfg(test)]
+    fn for_test_configuration(configuration_path: &Path) -> Self {
+        let root = configuration_path
+            .parent()
+            .expect("测试配置必须拥有父目录")
+            .to_path_buf();
+        Self {
+            configuration_path: configuration_path.to_path_buf(),
+            projects_root: root.join(PROJECTS_DIRECTORY_NAME),
+            prompts_root: root.join(PROMPTS_DIRECTORY_NAME),
+        }
+    }
+
+    pub(crate) fn configuration_path(&self) -> &Path {
+        &self.configuration_path
+    }
+
+    pub(crate) fn projects_root(&self) -> &Path {
+        &self.projects_root
+    }
+
+    pub(crate) fn prompts_root(&self) -> &Path {
+        &self.prompts_root
+    }
 }
 
 /// 读取配置，并且只建立本次命令实际消费的受信配置。
 pub(crate) fn load_product_configuration(
-    requested_path: &Path,
+    distribution: &DistributionLayout,
     product: ProductCommand,
 ) -> Result<ConfiguredProductCommand, ConfigurationLoadError> {
-    let configuration_path =
-        std::fs::canonicalize(requested_path).map_err(|source| ConfigurationLoadError::Open {
-            path: requested_path.to_path_buf(),
-            source,
-        })?;
+    let configuration_path = distribution.configuration_path().to_path_buf();
     let mut file =
         File::open(&configuration_path).map_err(|source| ConfigurationLoadError::Open {
             path: configuration_path.clone(),
@@ -114,14 +150,10 @@ pub(crate) fn load_product_configuration(
     })?;
     let toml_index = Arc::new(ConfigurationTomlIndex::build(source, &configuration_path)?);
     toml_index.validate_complete_field_set(source, &configuration_path)?;
-    let configuration_directory = configuration_path
-        .parent()
-        .expect("规范绝对文件路径必须拥有父目录")
-        .to_path_buf();
     match product {
         ProductCommand::Mz { command } => ConfiguredRpgMakerCommand::build(
             &configuration_path,
-            &configuration_directory,
+            distribution,
             source,
             toml_index,
             RpgMakerLayout::MZ,
@@ -136,7 +168,7 @@ pub(crate) fn load_product_configuration(
             let (command, dialogue_rules_path) = normalize_mv_command(command);
             ConfiguredRpgMakerCommand::build(
                 &configuration_path,
-                &configuration_directory,
+                distribution,
                 source,
                 toml_index,
                 RpgMakerLayout::MV,
@@ -150,7 +182,7 @@ pub(crate) fn load_product_configuration(
         }
         ProductCommand::Generic { command } => ConfiguredGenericCommand::build(
             &configuration_path,
-            &configuration_directory,
+            distribution,
             source,
             toml_index,
             command,
@@ -165,7 +197,8 @@ fn load_configuration(
     requested_path: &Path,
     command: MzCommand,
 ) -> Result<ConfiguredRpgMakerCommand, ConfigurationLoadError> {
-    load_product_configuration(requested_path, ProductCommand::Mz { command }).map(|configured| {
+    let distribution = DistributionLayout::for_test_configuration(requested_path);
+    load_product_configuration(&distribution, ProductCommand::Mz { command }).map(|configured| {
         match configured {
             ConfiguredProductCommand::RpgMaker { command, .. } => command,
             ConfiguredProductCommand::Generic(_) => unreachable!("测试传入 MZ 命令"),
@@ -230,21 +263,14 @@ pub(crate) enum ConfiguredRpgMakerCommand {
 impl ConfiguredRpgMakerCommand {
     fn build(
         configuration_path: &Path,
-        configuration_directory: &Path,
+        distribution: &DistributionLayout,
         source: &str,
         toml_index: Arc<ConfigurationTomlIndex>,
         layout: RpgMakerLayout,
         command: RpgMakerCommandArguments,
         dialogue_rules_path: Option<PathBuf>,
     ) -> Result<Self, ConfigurationLoadError> {
-        let raw_common: RawCommonConfiguration = parse_selected(
-            source,
-            configuration_path,
-            toml_index.as_ref(),
-            ConfigurationSelection::Common,
-        )?;
-        let common = CommonCommandConfiguration::build(configuration_directory, raw_common)
-            .map_err(ConfigurationLoadError::InvalidValue)?;
+        let common = CommonCommandConfiguration::build(distribution.projects_root());
 
         match command {
             RpgMakerCommandArguments::Init(arguments) => {
@@ -257,8 +283,7 @@ impl ConfiguredRpgMakerCommand {
                 let publisher = build_directory_publisher_configuration(
                     common.projects_root(),
                     layout.engine().storage_name(),
-                )
-                .map_err(ConfigurationLoadError::InvalidValue)?;
+                );
                 Ok(Self::Init(ConfiguredInitCommand {
                     arguments,
                     common,
@@ -308,7 +333,7 @@ impl ConfiguredRpgMakerCommand {
                     placeholders,
                 } = arguments;
                 let rpg_maker = PendingTranslateConfiguration::build(
-                    configuration_directory,
+                    distribution.prompts_root(),
                     raw.prompts,
                     raw.languages,
                     raw.translation,
@@ -344,8 +369,7 @@ impl ConfiguredRpgMakerCommand {
                 let publisher = build_directory_publisher_configuration(
                     common.projects_root(),
                     layout.engine().storage_name(),
-                )
-                .map_err(ConfigurationLoadError::InvalidValue)?;
+                );
                 let WriteBackArguments { project } = arguments;
                 let rpg_maker = WriteBackConfiguration::build();
                 Ok(Self::WriteBack(ConfiguredWriteBackCommand {
@@ -391,19 +415,12 @@ pub(crate) enum ConfiguredGenericCommand {
 impl ConfiguredGenericCommand {
     fn build(
         configuration_path: &Path,
-        configuration_directory: &Path,
+        distribution: &DistributionLayout,
         source: &str,
         toml_index: Arc<ConfigurationTomlIndex>,
         command: GenericCommand,
     ) -> Result<Self, ConfigurationLoadError> {
-        let raw_common: RawCommonConfiguration = parse_selected(
-            source,
-            configuration_path,
-            toml_index.as_ref(),
-            ConfigurationSelection::Common,
-        )?;
-        let common = CommonCommandConfiguration::build(configuration_directory, raw_common)
-            .map_err(ConfigurationLoadError::InvalidValue)?;
+        let common = CommonCommandConfiguration::build(distribution.projects_root());
 
         match command {
             GenericCommand::Init(arguments) => {
@@ -447,7 +464,7 @@ impl ConfiguredGenericCommand {
                     placeholders,
                 } = arguments;
                 let translation = PendingTranslateConfiguration::build(
-                    configuration_directory,
+                    distribution.prompts_root(),
                     raw.prompts,
                     raw.languages,
                     raw.translation,
@@ -480,11 +497,10 @@ impl ConfiguredGenericCommand {
                     ConfigurationSelection::NoAdditionalFields,
                 )?;
                 let publisher =
-                    build_directory_publisher_configuration(common.projects_root(), "generic")
-                        .map_err(ConfigurationLoadError::InvalidValue)?;
+                    build_directory_publisher_configuration(common.projects_root(), "generic");
                 Ok(Self::WriteBack(ConfiguredGenericWriteBackCommand {
                     project_name: project.name,
-                    configuration_directory: configuration_directory.to_path_buf(),
+                    prompt_root: distribution.prompts_root().to_path_buf(),
                     common,
                     cpu: build_cpu_configuration(),
                     publisher,
@@ -515,7 +531,7 @@ impl ConfiguredGenericCommand {
 /// Generic WriteBack 的基础配置；仅在存在自动译文时才解析翻译 Profile。
 pub(crate) struct ConfiguredGenericWriteBackCommand {
     project_name: ProjectName,
-    configuration_directory: PathBuf,
+    prompt_root: PathBuf,
     common: CommonCommandConfiguration,
     cpu: CpuExecutorConfig,
     publisher: DirectoryPublisherConfig,
@@ -550,7 +566,7 @@ impl ConfiguredGenericWriteBackCommand {
             ConfigurationSelection::Translate,
         )?;
         PendingTranslateConfiguration::build(
-            &self.configuration_directory,
+            &self.prompt_root,
             raw.prompts,
             raw.languages,
             raw.translation,
@@ -568,17 +584,12 @@ pub(crate) struct CommonCommandConfiguration {
 }
 
 impl CommonCommandConfiguration {
-    fn build(
-        configuration_directory: &Path,
-        raw: RawCommonConfiguration,
-    ) -> Result<Self, ConfigurationValueError> {
-        let projects_root =
-            checked_path("projects.root", configuration_directory, raw.projects.root)?;
-        Ok(Self {
-            projects_root,
+    fn build(projects_root: &Path) -> Self {
+        Self {
+            projects_root: projects_root.to_path_buf(),
             filesystem: build_file_system_configuration(),
             sqlite: build_sqlite_configuration(),
-        })
+        }
     }
 
     pub(crate) fn projects_root(&self) -> &Path {
@@ -840,19 +851,14 @@ fn build_file_system_configuration() -> SystemFileSystemConfig {
 fn build_directory_publisher_configuration(
     projects_root: &Path,
     engine_storage_name: &str,
-) -> Result<DirectoryPublisherConfig, ConfigurationValueError> {
+) -> DirectoryPublisherConfig {
     DirectoryPublisherConfig::production(
         projects_root
             .join(".att-locks")
             .join("directory-publish")
             .join(engine_storage_name),
     )
-    .map_err(|_| {
-        invalid(
-            "projects.root",
-            ConfigurationValueRule::RuntimeConfigurationInvalid,
-        )
-    })
+    .expect("固定项目目录派生的发布锁路径不得为空")
 }
 
 fn build_sqlite_configuration() -> RusqliteStorageConfiguration {
@@ -1025,7 +1031,7 @@ impl Error for PromptLocaleResolutionError {}
 
 impl PendingTranslateConfiguration {
     fn build(
-        configuration_directory: &Path,
+        prompt_root: &Path,
         raw_prompts: RawPromptsConfiguration,
         raw_languages: Vec<RawLanguageConfiguration>,
         _raw: RawTranslationSelection,
@@ -1043,7 +1049,7 @@ impl PendingTranslateConfiguration {
             )
         };
         Ok(Self {
-            prompt_root: checked_path("prompts.root", configuration_directory, raw_prompts.root)?,
+            prompt_root: prompt_root.to_path_buf(),
             prompt_locale,
             thinking_output: raw_prompts.thinking_output,
             language_modules: build_language_modules(raw_languages)?,
@@ -1747,23 +1753,32 @@ pub(super) fn invalid(field: &str, rule: ConfigurationValueRule) -> Configuratio
 }
 
 #[derive(Debug)]
-pub(crate) enum ConfigurationPathError {
-    CurrentDirectoryNotAbsolute(PathBuf),
-    EmptyExplicitPath,
+pub(crate) enum DistributionLayoutError {
+    CurrentExecutable(io::Error),
+    ExecutableDirectoryMissing { path: PathBuf },
 }
 
-impl fmt::Display for ConfigurationPathError {
+impl fmt::Display for DistributionLayoutError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CurrentDirectoryNotAbsolute(path) => {
-                write!(formatter, "当前工作目录不是绝对路径：{}", path.display())
+            Self::CurrentExecutable(source) => {
+                write!(formatter, "无法确定当前可执行文件：{source}")
             }
-            Self::EmptyExplicitPath => formatter.write_str("--config 路径不能为空"),
+            Self::ExecutableDirectoryMissing { path } => {
+                write!(formatter, "当前可执行文件没有发行目录：{}", path.display())
+            }
         }
     }
 }
 
-impl Error for ConfigurationPathError {}
+impl Error for DistributionLayoutError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::CurrentExecutable(source) => Some(source),
+            Self::ExecutableDirectoryMissing { .. } => None,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) enum ConfigurationLoadError {
@@ -2071,7 +2086,6 @@ impl Error for ConfigurationValueError {}
 /// 按现实消费范围选择需要建立的配置值不变量。
 #[derive(Clone, Copy)]
 enum ConfigurationSelection {
-    Common,
     NoAdditionalFields,
     Translate,
     SelectedProfile(usize),
@@ -2354,11 +2368,6 @@ impl ConfigurationTomlIndex {
         selection: ConfigurationSelection,
     ) -> Result<(), ConfigurationLoadError> {
         match selection {
-            ConfigurationSelection::Common => {
-                for field_path in ConfigurationFieldContract::COMMON_REQUIRED_FIELDS {
-                    self.require_contract_field(source, path, field_path, None)?;
-                }
-            }
             ConfigurationSelection::NoAdditionalFields => {}
             ConfigurationSelection::Translate => self.validate_translate(source, path)?,
             ConfigurationSelection::SelectedProfile(occurrence) => {
@@ -2658,12 +2667,8 @@ impl ConfigurationTomlIndex {
 struct ConfigurationFieldContract;
 
 impl ConfigurationFieldContract {
-    const COMMON_REQUIRED_FIELDS: &'static [&'static [&'static str]] = &[&["projects", "root"]];
-    const TRANSLATE_REQUIRED_FIELDS: &'static [&'static [&'static str]] = &[
-        &["prompts", "root"],
-        &["prompts", "locale"],
-        &["prompts", "thinking_output"],
-    ];
+    const TRANSLATE_REQUIRED_FIELDS: &'static [&'static [&'static str]] =
+        &[&["prompts", "locale"], &["prompts", "thinking_output"]];
     const LANGUAGE_BASE_REQUIRED_FIELDS: &'static [&'static str] = &["type", "id"];
     const LANGUAGE_OPTIONAL_FIELDS: &'static [&'static str] = &[
         "minimum_kana_characters",
@@ -2735,12 +2740,7 @@ impl ConfigurationFieldContract {
 
     fn table_kind(path: &[String]) -> Option<IndexedTableKind> {
         match path {
-            [first]
-                if matches!(
-                    first.as_str(),
-                    "projects" | "prompts" | "llm" | "translation"
-                ) =>
-            {
+            [first] if matches!(first.as_str(), "prompts" | "llm" | "translation") => {
                 Some(IndexedTableKind::Table)
             }
             [llm, clients] if llm == "llm" && clients == "clients" => Some(IndexedTableKind::Table),
@@ -2766,12 +2766,7 @@ impl ConfigurationFieldContract {
 
     fn field_kind(path: &[String]) -> Option<ConfigurationTomlValueKind> {
         let kind = match path {
-            [projects, root] if projects == "projects" && root == "root" => {
-                ConfigurationTomlValueKind::String
-            }
-            [prompts, field]
-                if prompts == "prompts" && matches!(field.as_str(), "root" | "locale") =>
-            {
+            [prompts, field] if prompts == "prompts" && field == "locale" => {
                 ConfigurationTomlValueKind::String
             }
             [prompts, thinking] if prompts == "prompts" && thinking == "thinking_output" => {
@@ -4015,23 +4010,7 @@ impl<'de> Visitor<'de> for SelectedLlmClientMapVisitor<'_> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawCommonConfiguration {
-    projects: RawProjectsConfiguration,
-    #[serde(default, rename = "llm")]
-    _llm: Option<IgnoredAny>,
-    #[serde(default, rename = "prompts")]
-    _prompts: Option<IgnoredAny>,
-    #[serde(default, rename = "languages")]
-    _languages: Option<IgnoredAny>,
-    #[serde(default, rename = "translation")]
-    _translation: Option<IgnoredAny>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawInitSelection {
-    #[serde(default, rename = "projects")]
-    _projects: Option<IgnoredAny>,
     #[serde(default, rename = "llm")]
     _llm: Option<IgnoredAny>,
     #[serde(default, rename = "prompts")]
@@ -4045,8 +4024,6 @@ struct RawInitSelection {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawExtractSelection {
-    #[serde(default, rename = "projects")]
-    _projects: Option<IgnoredAny>,
     #[serde(default, rename = "llm")]
     _llm: Option<IgnoredAny>,
     #[serde(default, rename = "prompts")]
@@ -4078,8 +4055,6 @@ struct RawTranslateSelection {
     prompts: RawPromptsConfiguration,
     languages: Vec<RawLanguageConfiguration>,
     translation: RawTranslationSelection,
-    #[serde(default, rename = "projects")]
-    _projects: Option<IgnoredAny>,
     #[serde(default, rename = "llm")]
     _llm: Option<IgnoredAny>,
 }
@@ -4087,8 +4062,6 @@ struct RawTranslateSelection {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawWriteBackSelection {
-    #[serde(default, rename = "projects")]
-    _projects: Option<IgnoredAny>,
     #[serde(default, rename = "llm")]
     _llm: Option<IgnoredAny>,
     #[serde(default, rename = "prompts")]
@@ -4111,15 +4084,8 @@ struct RawTranslationSelection {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPromptsConfiguration {
-    root: PathBuf,
     locale: String,
     thinking_output: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawProjectsConfiguration {
-    root: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -4218,17 +4184,67 @@ mod tests {
     }
 
     #[test]
-    fn explicit_configuration_path_uses_current_directory_as_its_base() {
-        let current = absolute_test_path("cwd");
+    fn distribution_layout_uses_only_the_executable_directory() {
+        let root = absolute_test_path("release");
+        let executable = root.join("att.exe");
+        let distribution = DistributionLayout::from_executable_path(executable)
+            .expect("拥有父目录的可执行文件路径应建立发行布局");
+        assert_eq!(distribution.configuration_path(), root.join("config.toml"));
+        assert_eq!(distribution.projects_root(), root.join("projects"));
+        assert_eq!(distribution.prompts_root(), root.join("prompts"));
+
+        assert!(matches!(
+            DistributionLayout::from_executable_path(PathBuf::from("att.exe")),
+            Err(DistributionLayoutError::ExecutableDirectoryMissing { .. })
+        ));
+
+        let current = DistributionLayout::from_current_executable()
+            .expect("测试进程必须能确定自己的可执行文件");
+        let current_root = std::env::current_exe()
+            .expect("测试进程路径应可读取")
+            .parent()
+            .expect("测试进程路径应有父目录")
+            .to_path_buf();
         assert_eq!(
-            resolve_configuration_path(Path::new("settings/att.toml"), &current)
-                .expect("显式配置路径应合法"),
-            current.join("settings/att.toml")
+            current.configuration_path(),
+            current_root.join("config.toml")
         );
+    }
+
+    #[test]
+    fn missing_fixed_configuration_reports_the_executable_sibling_path() {
+        let directory = TestDirectory::new();
+        let distribution =
+            DistributionLayout::from_executable_path(directory.path().join("att.exe"))
+                .expect("测试发行布局应合法");
+        let error = match load_product_configuration(
+            &distribution,
+            ProductCommand::Mz {
+                command: init_command(),
+            },
+        ) {
+            Ok(_) => panic!("缺少固定配置时必须失败"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ConfigurationLoadError::Open { ref path, .. }
+                if path == &directory.path().join("config.toml")
+        ));
+    }
+
+    #[test]
+    fn project_root_is_the_fixed_sibling_of_the_executable() {
+        let directory = TestDirectory::new();
+        let path = directory.write("config.toml", minimal_init_configuration());
+        let ConfiguredRpgMakerCommand::Init(configured) =
+            load_configuration(&path, init_command()).expect("最小 Init 配置应合法")
+        else {
+            panic!("应建立 Init 配置");
+        };
         assert_eq!(
-            resolve_configuration_path(&absolute_test_path("explicit.toml"), &current)
-                .expect("绝对配置路径应保持不变"),
-            absolute_test_path("explicit.toml")
+            configured.common().projects_root(),
+            directory.path().join("projects")
         );
     }
 
@@ -4238,8 +4254,7 @@ mod tests {
         let configured = build_directory_publisher_configuration(
             &projects_root,
             RpgMakerEngine::Mz.storage_name(),
-        )
-        .expect("目录发布配置应合法");
+        );
         assert_eq!(
             configured.lock_directory(),
             projects_root.join(".att-locks/directory-publish/mz")
@@ -4248,8 +4263,7 @@ mod tests {
         let configured = build_directory_publisher_configuration(
             &projects_root,
             RpgMakerEngine::Mv.storage_name(),
-        )
-        .expect("MV 目录发布配置应合法");
+        );
         assert_eq!(
             configured.lock_directory(),
             projects_root.join(".att-locks/directory-publish/mv")
@@ -4447,7 +4461,7 @@ id = "unused"
     }
 
     #[test]
-    fn prompt_root_is_resolved_from_the_configuration_directory() {
+    fn prompt_root_is_the_fixed_sibling_of_the_executable() {
         let directory = TestDirectory::new();
         let path = directory.write("config.toml", include_str!("../../config.example.toml"));
         let ConfiguredRpgMakerCommand::Translate(configured) =
@@ -4457,12 +4471,30 @@ id = "unused"
             panic!("应建立 Translate 配置");
         };
         let expected = path
-            .canonicalize()
-            .expect("测试配置应可规范化")
             .parent()
-            .expect("规范配置路径应有父目录")
+            .expect("测试配置路径应有父目录")
             .join("prompts");
         assert_eq!(configured.translation().prompt_root(), expected);
+    }
+
+    #[test]
+    fn additional_pem_paths_are_relative_to_the_executable_directory() {
+        let directory = TestDirectory::new();
+        let source = include_str!("../../config.example.toml").replace(
+            "additional_pem_files = []",
+            "additional_pem_files = [\"certificates/local.pem\"]",
+        );
+        let path = directory.write("config.toml", &source);
+        let ConfiguredRpgMakerCommand::Translate(configured) =
+            load_configuration(&path, translate_command("primary"))
+                .expect("相对 PEM 路径应建立 Translate 配置")
+        else {
+            panic!("应建立 Translate 配置");
+        };
+        assert_eq!(
+            configured.llm().additional_pem_files(),
+            &[directory.path().join("certificates/local.pem")]
+        );
     }
 
     #[test]
@@ -4585,9 +4617,8 @@ id = "unused"
     #[test]
     fn commands_other_than_translate_do_not_consume_prompt_values() {
         let directory = TestDirectory::new();
-        let source = include_str!("../../config.example.toml")
-            .replace("root = \"prompts\"", "root = []")
-            .replace("locale = \"auto\"", "locale = []");
+        let source =
+            include_str!("../../config.example.toml").replace("locale = \"auto\"", "locale = []");
         let source = replace_thinking_output(&source, "thinking_output = []");
         let path = directory.write("unselected-prompts.toml", &source);
 
@@ -4682,10 +4713,6 @@ id = "unused"
         let source = include_str!("../../config.example.toml").replace("\r\n", "\n");
         let cases = [
             (
-                "prompts-root",
-                source.replacen("root = \"prompts\"\n", "", 1),
-            ),
-            (
                 "prompts-locale",
                 source.replacen("locale = \"auto\"\n", "", 1),
             ),
@@ -4739,12 +4766,24 @@ id = "unused"
                 None,
             ),
             (
-                "missing",
-                source.replacen("root = \"prompts\"\n", "", 1),
+                "removed-projects",
+                format!("{source}\n[projects]\nroot = \"REMOVED_PROJECT_ROOT_SENTINEL\"\n"),
+                "projects",
+                "当前配置契约不接受该字段",
+                ConfigurationTomlFailureKind::UnknownField,
+                Some("REMOVED_PROJECT_ROOT_SENTINEL"),
+            ),
+            (
+                "removed-prompt-root",
+                source.replacen(
+                    "[prompts]\n",
+                    "[prompts]\nroot = \"PROMPT_ROOT_SENTINEL\"\n",
+                    1,
+                ),
                 "prompts.root",
-                "缺少必填字段",
-                ConfigurationTomlFailureKind::MissingField,
-                None,
+                "当前配置契约不接受该字段",
+                ConfigurationTomlFailureKind::UnknownField,
+                Some("PROMPT_ROOT_SENTINEL"),
             ),
             (
                 "unknown",
@@ -4757,20 +4796,6 @@ id = "unused"
                 "当前配置契约不接受该字段",
                 ConfigurationTomlFailureKind::UnknownField,
                 Some("UNKNOWN_VALUE_SENTINEL"),
-            ),
-            (
-                "prompt-root-type",
-                source.replacen(
-                    "root = \"prompts\"",
-                    "root = [\"PROMPT_ROOT_TYPE_SENTINEL\"]",
-                    1,
-                ),
-                "prompts.root",
-                "字段类型不符合当前配置契约",
-                ConfigurationTomlFailureKind::TypeMismatch {
-                    expected: ConfigurationTomlValueKind::String,
-                },
-                Some("PROMPT_ROOT_TYPE_SENTINEL"),
             ),
             (
                 "prompt-locale-type",
@@ -4838,7 +4863,6 @@ id = "unused"
                 Err(error) => error,
             };
             let diagnostic = error.to_string();
-            let canonical_path = path.canonicalize().expect("测试配置应可规范化");
             let ConfigurationLoadError::InvalidToml {
                 path: error_path,
                 location,
@@ -4850,10 +4874,10 @@ id = "unused"
             };
 
             assert!(
-                diagnostic.starts_with(canonical_path.display().to_string().as_str()),
+                diagnostic.starts_with(path.display().to_string().as_str()),
                 "诊断必须以配置路径开始：{diagnostic}"
             );
-            assert_eq!(error_path, &canonical_path);
+            assert_eq!(error_path, &path);
             assert!(location.is_some(), "已定位的配置失败必须携带一基行列");
             assert_eq!(resource, expected_resource);
             assert_eq!(*failure, expected_failure);
@@ -4906,8 +4930,8 @@ id = "unused"
         let cases = [
             ("top", format!("{example}\n[unknown]\nvalue = 1\n")),
             (
-                "projects",
-                example.replace("root = \"projects\"", "root = \"projects\"\nunexpected = 1"),
+                "removed-projects",
+                format!("{example}\n[projects]\nroot = \"REMOVED_PROJECT_ROOT_SENTINEL\"\n"),
             ),
             (
                 "prompts",
@@ -5101,7 +5125,7 @@ id = "unused"
         let directory = TestDirectory::new();
         let syntax_path = directory.write(
             "syntax.toml",
-            "[projects]\nroot = \"UNTERMINATED_VALUE_SENTINEL\n",
+            "[prompts]\nlocale = \"UNTERMINATED_VALUE_SENTINEL\n",
         );
         let syntax = match load_configuration(&syntax_path, init_command()) {
             Ok(_) => panic!("无效 TOML 语法必须拒绝"),
@@ -5267,9 +5291,6 @@ api_key = "{API_KEY}" "invalid"
     }
 
     fn parse_command_vec(arguments: Vec<&str>) -> MzCommand {
-        let arguments = ["att", "--config", "config.toml"]
-            .into_iter()
-            .chain(arguments.into_iter().skip(1));
         let parsed = AttArguments::try_parse_from(arguments).expect("测试命令应合法");
         match parsed.product {
             ProductCommand::Mz { command } => command,
@@ -5283,10 +5304,7 @@ api_key = "{API_KEY}" "invalid"
     }
 
     fn minimal_init_configuration() -> &'static str {
-        r#"
-[projects]
-root = "projects"
-"#
+        ""
     }
 
     fn remove_configuration_range(source: &str, start: &str, end: &str) -> String {

@@ -1,13 +1,13 @@
 # Generic WriteBack 现行规格
 
 ```text
-att --config CONFIG generic write-back --name NAME
+att generic write-back --name NAME
 ```
 
 输出固定为：
 
 ```text
-<projects.root>/generic/<name>/write_back/
+<att-dir>/projects/generic/<name>/write_back/
 ```
 
 命令永远不修改外部输入目录。

@@ -1,5 +1,4 @@
 app-about = Translate games and structured text with reusable project state
-cli-config-help = Strict TOML configuration file for this run
 cli-ui-language-help = Language for help, diagnostics, progress, results, and project logs: ar, zh-Hans, zh-Hant, en, fr, ru, es, ja, ko, or vi
 cli-progress-help = Live progress mode: auto, plain, or off
 cli-mz-about = Translate an RPG Maker MZ game
@@ -33,7 +32,6 @@ cli-options-metavar = OPTIONS
 cli-command-metavar = COMMAND
 cli-print-help = Print help
 cli-print-version = Print version
-cli-missing-config = Missing required configuration path --config <FILE>.
 cli-blank-value = The value must not be blank.
 cli-invalid-positive-integer = The value must be a positive integer.
 cli-invalid-progress = Unsupported progress mode { $value }; use auto, plain, or off.
@@ -83,6 +81,7 @@ notice-init-reuse-path = No source path was provided; reusing the last successfu
 notice-extract-reuse-owners = No extraction scope was provided; reusing the last successful plan: { $owners }.
 notice-translate-reuse-profile = No profile was provided; reusing the last successful profile: { $profile }.
 notice-owner-disabled = Owner { $owner } was disabled and removed from future automatic plans.
+warning-rules-command-non-string-skipped = Warning: Rules rule { $rule_number } skipped { $skipped_count } non-string command parameters (source { $source_file }, code={ $command_code }, parameter={ $parameter }, type={ $actual_type }).
 notice-no-model-request = All translation units are current; no model request was needed in this run.
 notice-manual-layout = { $count ->
     [one] 1 unit needs a manual line-break review.
@@ -336,7 +335,6 @@ diagnostic-io-kind-value = { $code ->
    *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
-    [runtime_configuration_invalid] Runtime configuration is invalid
     [unsupported_prompt_locale] Must be exact lowercase auto or a supported BCP 47 UI locale
     [language_policy_term_blank] Language policy term must not be blank
     [language_policy_term_surrounding_whitespace] Language policy term must not contain surrounding whitespace
@@ -413,6 +411,7 @@ diagnostic-http-status = HTTP status { $status }
 diagnostic-http-retry-after = Retry-After { $seconds } seconds
 diagnostic-http-provider-code = Provider error code { $code }
 diagnostic-http-provider-type = Provider error type { $kind }
+diagnostic-http-provider-message = Provider error message { $message }
 diagnostic-http-fact-separator = ;{ " " }
 diagnostic-sqlite = SQLite primary error code { $primary_code }, extended error code { $extended_code }
 diagnostic-windows-status = Windows operation { $operation } failed with NTSTATUS { $status }

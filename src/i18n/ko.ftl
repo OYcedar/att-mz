@@ -1,5 +1,4 @@
 app-about = 재사용 가능한 프로젝트 상태로 게임과 구조화된 텍스트를 번역합니다
-cli-config-help = 이번 실행에 사용할 엄격한 TOML 구성 파일
 cli-ui-language-help = 도움말, 진단, 진행률, 결과 및 프로젝트 로그의 언어: ar, zh-Hans, zh-Hant, en, fr, ru, es, ja, ko 또는 vi
 cli-progress-help = 실시간 진행률 모드: auto, plain 또는 off
 cli-mz-about = RPG Maker MZ 게임 번역
@@ -33,7 +32,6 @@ cli-options-metavar = 옵션
 cli-command-metavar = 명령
 cli-print-help = 도움말 출력
 cli-print-version = 버전 출력
-cli-missing-config = 필수 구성 경로 --config <FILE>이 없습니다.
 cli-blank-value = 값은 비워 둘 수 없습니다.
 cli-invalid-positive-integer = 값은 양의 정수여야 합니다.
 cli-invalid-progress = 지원하지 않는 진행률 모드 { $value }입니다. auto, plain 또는 off를 사용하세요.
@@ -83,6 +81,7 @@ notice-init-reuse-path = 원본 경로가 없어 마지막 성공 경로를 재�
 notice-extract-reuse-owners = 추출 범위가 없어 마지막 성공 계획을 재사용합니다: { $owners }.
 notice-translate-reuse-profile = Profile이 없어 마지막 성공 Profile을 재사용합니다: { $profile }.
 notice-owner-disabled = owner { $owner }을 비활성화하고 이후 자동 계획에서 제거했습니다.
+warning-rules-command-non-string-skipped = 경고: Rules 규칙 { $rule_number }에서 문자열이 아닌 command 매개변수 { $skipped_count }개를 건너뛰었습니다(소스 { $source_file }, code={ $command_code }, parameter={ $parameter }, 유형 { $actual_type }).
 notice-no-model-request = 모든 번역 단위가 최신 상태여서 이번 실행에서는 모델 요청을 보내지 않았습니다.
 notice-manual-layout = { $count }개 단위의 줄바꿈을 수동으로 확인해야 합니다.
 notice-log-degraded = 프로젝트 로그를 사용할 수 없거나 성능이 저하되었습니다. 명령은 계속되며 종료 상태는 바뀌지 않습니다.
@@ -327,7 +326,6 @@ diagnostic-io-kind-value = { $code ->
    *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
-    [runtime_configuration_invalid] 런타임 구성이 잘못되었습니다
     [unsupported_prompt_locale] 소문자 auto 또는 지원되는 BCP 47 UI 로캘이어야 합니다
     [language_policy_term_blank] 언어 정책 용어는 비워 둘 수 없습니다
     [language_policy_term_surrounding_whitespace] 언어 정책 용어 앞뒤에 공백을 둘 수 없습니다
@@ -404,6 +402,7 @@ diagnostic-http-status = HTTP 상태 { $status }
 diagnostic-http-retry-after = Retry-After { $seconds }초
 diagnostic-http-provider-code = 공급자 오류 코드 { $code }
 diagnostic-http-provider-type = 공급자 오류 형식 { $kind }
+diagnostic-http-provider-message = 공급자 오류 메시지 { $message }
 diagnostic-http-fact-separator = ;{ " " }
 diagnostic-sqlite = SQLite 기본 오류 코드 { $primary_code }, 확장 오류 코드 { $extended_code }
 diagnostic-windows-status = Windows 작업 { $operation }이 실패했습니다. NTSTATUS { $status }

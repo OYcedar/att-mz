@@ -36,6 +36,10 @@ Lua 是独立的数据库操作命令，不参与 Extract、Translate 或 WriteB
 code page 与 long-path-aware manifest。文件系统路径支持 Windows 能表示的 Unicode，
 包括中文、Emoji、内部空格、长路径和 UNC 路径；访问 UNC 取决于运行账户的权限。
 
+发行包按固定同目录布局工作：`att.exe` 读取旁边的 `config.toml`，并使用同目录下的
+`projects/` 与 `prompts/`。CLI 不接受自定义配置路径；游戏、JSONL、Rules、术语、
+Placeholder 和 Lua 等显式输入路径仍以调用 cwd 为基准。
+
 ## 文档入口
 
 想了解怎样选择引擎、各命令和文件格式遵守什么约定，从

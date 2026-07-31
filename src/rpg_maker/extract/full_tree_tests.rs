@@ -118,6 +118,15 @@ path = '[].customRule'
             Some("Items.json") => r#"[null,{"name":"","description":"","customRule":"规则文本"}]"#
                 .as_bytes()
                 .to_vec(),
+            Some("CommonEvents.json") => r#"[
+                null,
+                {"list":[
+                    {"code":999,"parameters":[17]},
+                    {"code":999,"parameters":["命令规则文本"]}
+                ]}
+            ]"#
+            .as_bytes()
+            .to_vec(),
             Some("System.json") => br#"{
                 "gameTitle":"",
                 "currencyUnit":"",
@@ -130,8 +139,8 @@ path = '[].customRule'
             }"#
             .to_vec(),
             Some(
-                "Actors.json" | "Armors.json" | "Classes.json" | "CommonEvents.json"
-                | "Enemies.json" | "Skills.json" | "States.json" | "Troops.json" | "Weapons.json",
+                "Actors.json" | "Armors.json" | "Classes.json" | "Enemies.json" | "Skills.json"
+                | "States.json" | "Troops.json" | "Weapons.json",
             ) => b"[null]".to_vec(),
             _ => {
                 return Err(ReadFileError::NotFound { path });
@@ -394,6 +403,10 @@ async fn root_fakes_drive_the_complete_non_root_extract_tree() {
 [[rule]]
 file = "Items.json"
 path = '[].customRule'
+
+[[rule]]
+code = 999
+parameter = 0
 "#
                 .to_vec(),
             )
@@ -414,6 +427,13 @@ path = '[].customRule'
         panic!("完整非根树应正常完成")
     };
     assert_eq!(output.name, name);
+    assert_eq!(output.rules_warnings.len(), 1);
+    assert_eq!(output.rules_warnings[0].rule_number, 2);
+    assert_eq!(output.rules_warnings[0].source_file, "CommonEvents.json");
+    assert_eq!(output.rules_warnings[0].command_code, 999);
+    assert_eq!(output.rules_warnings[0].parameter, 0);
+    assert_eq!(output.rules_warnings[0].actual_type.as_str(), "number");
+    assert_eq!(output.rules_warnings[0].skipped_count, 1);
     assert_eq!(query_count.load(Ordering::Relaxed), 1, "项目只应开启一次");
     assert!(
         cpu_executions.load(Ordering::Relaxed) > 0,

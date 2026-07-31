@@ -1,5 +1,4 @@
 app-about = Перевод игр и структурированного текста с повторно используемым состоянием проекта
-cli-config-help = Строгий файл конфигурации TOML для этого запуска
 cli-ui-language-help = Язык справки, диагностики, прогресса, результатов и журналов проекта: ar, zh-Hans, zh-Hant, en, fr, ru, es, ja, ko или vi
 cli-progress-help = Режим текущего прогресса: auto, plain или off
 cli-mz-about = Перевести игру RPG Maker MZ
@@ -33,7 +32,6 @@ cli-options-metavar = ПАРАМЕТРЫ
 cli-command-metavar = КОМАНДА
 cli-print-help = Показать справку
 cli-print-version = Показать версию
-cli-missing-config = Отсутствует обязательный путь конфигурации --config <FILE>.
 cli-blank-value = Значение не может быть пустым.
 cli-invalid-positive-integer = Значение должно быть положительным целым числом.
 cli-invalid-progress = Режим прогресса { $value } не поддерживается; используйте auto, plain или off.
@@ -83,6 +81,7 @@ notice-init-reuse-path = Исходный путь не указан; испол
 notice-extract-reuse-owners = Область извлечения не указана; используется последний успешный план: { $owners }.
 notice-translate-reuse-profile = Profile не указан; используется последний успешный Profile: { $profile }.
 notice-owner-disabled = Owner { $owner } отключён и удалён из будущих автоматических планов.
+warning-rules-command-non-string-skipped = Предупреждение: правило Rules { $rule_number } пропустило нестроковые параметры command: { $skipped_count } (источник { $source_file }, code={ $command_code }, parameter={ $parameter }, тип { $actual_type }).
 notice-no-model-request = Все единицы перевода актуальны; в этом запуске запрос к модели не требовался.
 notice-manual-layout = { $count ->
     [one] 1 единица требует ручной проверки переноса строк.
@@ -342,7 +341,6 @@ diagnostic-io-kind-value = { $code ->
    *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
-    [runtime_configuration_invalid] Конфигурация среды выполнения недействительна
     [unsupported_prompt_locale] Значение должно быть ровно auto в нижнем регистре или поддерживаемой локалью интерфейса BCP 47
     [language_policy_term_blank] Термин языковой политики не должен быть пустым
     [language_policy_term_surrounding_whitespace] Термин языковой политики не должен содержать пробелы по краям
@@ -419,6 +417,7 @@ diagnostic-http-status = Состояние HTTP { $status }
 diagnostic-http-retry-after = Retry-After: { $seconds } секунд
 diagnostic-http-provider-code = Код ошибки поставщика { $code }
 diagnostic-http-provider-type = Тип ошибки поставщика { $kind }
+diagnostic-http-provider-message = Сообщение об ошибке поставщика { $message }
 diagnostic-http-fact-separator = ;{ " " }
 diagnostic-sqlite = Основной код ошибки SQLite { $primary_code }, расширенный код { $extended_code }
 diagnostic-windows-status = Операция Windows { $operation } завершилась ошибкой NTSTATUS { $status }

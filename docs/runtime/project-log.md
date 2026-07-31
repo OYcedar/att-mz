@@ -20,6 +20,12 @@ payload；code 来自封闭集合，业务代码无法提交任意自由文本�
 - `lua.print`：脚本一次显式 `print(...)` 的安全单行正文；
 - `lua.summary`：数据库调用次数、changed rows、译文操作次数和打印行数。
 
+Rules command 直接参数出现可跳过的非字符串时，Extract 成功后写 Warn 事件
+`extract.rules.command_non_string_skipped`。payload kind 是
+`rules_command_non_string_skipped`，只保存 `rule_number`、`source_file`、
+`command_code`、`parameter`、`actual_type` 和 `skipped_count`；不保存原始参数值或
+逐命令位置。相同键已经聚合，事件按键稳定排序。
+
 SQL、参数、查询结果、Lua 变量和游戏正文不会自动变成日志事件；只有脚本显式
 `print` 的内容——有意输出——会作为 `lua.print` 保存。脚本只打印需要保留的
 内容就好。
@@ -53,6 +59,7 @@ CLI 与 JSONL 使用同一份结构化安全诊断，保留：
 
 - 错误 code、阶段、路径或对象；
 - 具体原因与 OS、SQLite 或 HTTP 稳定代码；
+- 非 2xx 标准信封中经过闭集替换和单行清理的供应商 `error.message`；
 - 状态是否改变、是否已经生效、终态是否未知；
 - 操作建议与恢复位置；
 - 主错误、相关错误与清理错误。
@@ -60,7 +67,8 @@ CLI 与 JSONL 使用同一份结构化安全诊断，保留：
 日志直接沿用
 [Chat Completions 规格的敏感信息闭集](chat-completions.md#6-敏感信息闭集唯一权威)，
 全项目只有这一份清单。普通日志只写结构化诊断，模型正文、Lua 执行中的任意值、
-SQL、参数、查询结果、游戏文本和 panic payload 都不会被自动复制；`lua.print`
+SQL、参数、查询结果、游戏文本、非 2xx 原始 body 和 panic payload 都不会被自动复制；
+标准供应商错误消息只作为 `DiagnosticReason::Http.provider_message` 保存；`lua.print`
 只记录脚本显式提交并经过安全处理的正文。
 
 恢复语义由数据库和目录发布 journal 各自掌管；日志只管记录，不参与补写、回滚

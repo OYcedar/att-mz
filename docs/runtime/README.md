@@ -1,15 +1,16 @@
 # ATT 运行时导航
 
-## 命令需要哪些配置
+## 命令需要哪些发行资源和配置
 
-| 命令 | 读取的配置 |
+| 命令 | 固定资源与读取的配置 |
 |---|---|
 | Help、Version | 无 |
-| Init、Extract、MV/MZ WriteBack、Lua | `projects.root` |
-| Translate | `projects.root`、`prompts`、`translation`、全部 `languages`、所选 Profile 和 Client |
-| Generic WriteBack | `projects.root`；存在自动译文时还读取 `prompts`、`translation`、全部 `languages`、译文所用 Profile 和 Client |
+| Init、Extract、MV/MZ WriteBack、Lua | `<att-dir>/config.toml` 与固定的 `<att-dir>/projects/`；没有额外配置字段 |
+| Translate | 固定的 `projects/`、`prompts/`，以及 `[prompts]`、`[translation]`、全部 `[[languages]]`、所选 Profile 和 Client |
+| Generic WriteBack | 固定的 `projects/`；存在自动译文时还读取固定 `prompts/` 和上述翻译配置 |
 
-ATT 只解析当前命令真正用到的配置；没被选中的 Client，其凭据始终留在配置文件里。
+所有业务命令都读取 `att.exe` 同目录下唯一的 `config.toml`。ATT 只解析当前命令真正用到
+的配置值；没被选中的 Client，其凭据始终留在配置文件里。
 
 ## 项目保存什么选择
 

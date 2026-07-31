@@ -416,7 +416,6 @@ fn windows_user_preferred_ui_languages() -> Vec<String> {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum UiMessage<'a> {
     AppAbout,
-    CliConfigHelp,
     CliUiLanguageHelp,
     CliProgressHelp,
     CliMzAbout,
@@ -450,7 +449,6 @@ pub(crate) enum UiMessage<'a> {
     CliCommandMetavar,
     CliPrintHelp,
     CliPrintVersion,
-    CliMissingConfig,
     CliBlankValue,
     CliInvalidPositiveInteger,
     CliInvalidProgress {
@@ -609,6 +607,9 @@ pub(crate) enum UiMessage<'a> {
     DiagnosticHttpProviderType {
         kind: &'a str,
     },
+    DiagnosticHttpProviderMessage {
+        message: &'a str,
+    },
     DiagnosticHttpFactSeparator,
     DiagnosticSqlite {
         primary_code: &'a str,
@@ -663,6 +664,14 @@ pub(crate) enum UiMessage<'a> {
     },
     NoticeOwnerDisabled {
         owner: &'a str,
+    },
+    WarningRulesCommandNonStringSkipped {
+        rule_number: u64,
+        source_file: &'a str,
+        command_code: &'a str,
+        parameter: u64,
+        actual_type: &'a str,
+        skipped_count: u64,
     },
     NoticeNoModelRequest,
     NoticeManualLayout {
@@ -977,7 +986,6 @@ impl UiMessage<'_> {
     fn key(self) -> &'static str {
         match self {
             Self::AppAbout => "app-about",
-            Self::CliConfigHelp => "cli-config-help",
             Self::CliUiLanguageHelp => "cli-ui-language-help",
             Self::CliProgressHelp => "cli-progress-help",
             Self::CliMzAbout => "cli-mz-about",
@@ -1011,7 +1019,6 @@ impl UiMessage<'_> {
             Self::CliCommandMetavar => "cli-command-metavar",
             Self::CliPrintHelp => "cli-print-help",
             Self::CliPrintVersion => "cli-print-version",
-            Self::CliMissingConfig => "cli-missing-config",
             Self::CliBlankValue => "cli-blank-value",
             Self::CliInvalidPositiveInteger => "cli-invalid-positive-integer",
             Self::CliInvalidProgress { .. } => "cli-invalid-progress",
@@ -1070,6 +1077,7 @@ impl UiMessage<'_> {
             Self::DiagnosticHttpRetryAfter { .. } => "diagnostic-http-retry-after",
             Self::DiagnosticHttpProviderCode { .. } => "diagnostic-http-provider-code",
             Self::DiagnosticHttpProviderType { .. } => "diagnostic-http-provider-type",
+            Self::DiagnosticHttpProviderMessage { .. } => "diagnostic-http-provider-message",
             Self::DiagnosticHttpFactSeparator => "diagnostic-http-fact-separator",
             Self::DiagnosticSqlite { .. } => "diagnostic-sqlite",
             Self::DiagnosticWindowsStatus { .. } => "diagnostic-windows-status",
@@ -1104,6 +1112,9 @@ impl UiMessage<'_> {
             Self::NoticeExtractReuseOwners { .. } => "notice-extract-reuse-owners",
             Self::NoticeTranslateReuseProfile { .. } => "notice-translate-reuse-profile",
             Self::NoticeOwnerDisabled { .. } => "notice-owner-disabled",
+            Self::WarningRulesCommandNonStringSkipped { .. } => {
+                "warning-rules-command-non-string-skipped"
+            }
             Self::NoticeNoModelRequest => "notice-no-model-request",
             Self::NoticeManualLayout { .. } => "notice-manual-layout",
             Self::NoticeLogDegraded => "notice-log-degraded",
@@ -1245,6 +1256,21 @@ impl UiMessage<'_> {
                 set_text(&mut arguments, "owners", owners);
             }
             Self::NoticeOwnerDisabled { owner } => set_text(&mut arguments, "owner", owner),
+            Self::WarningRulesCommandNonStringSkipped {
+                rule_number,
+                source_file,
+                command_code,
+                parameter,
+                actual_type,
+                skipped_count,
+            } => {
+                set_number(&mut arguments, "rule_number", rule_number);
+                set_text(&mut arguments, "source_file", source_file);
+                set_text(&mut arguments, "command_code", command_code);
+                set_number(&mut arguments, "parameter", parameter);
+                set_text(&mut arguments, "actual_type", actual_type);
+                set_number(&mut arguments, "skipped_count", skipped_count);
+            }
             Self::NoticeManualLayout { count }
             | Self::LogRetrySummary { count }
             | Self::LogPartialResult { count } => set_number(&mut arguments, "count", count),
@@ -1691,6 +1717,9 @@ impl UiMessage<'_> {
             Self::DiagnosticHttpProviderType { kind } => {
                 set_text(&mut arguments, "kind", kind);
             }
+            Self::DiagnosticHttpProviderMessage { message } => {
+                set_text(&mut arguments, "message", message);
+            }
             Self::DiagnosticSqlite {
                 primary_code,
                 extended_code,
@@ -1716,7 +1745,6 @@ impl UiMessage<'_> {
                 set_number(&mut arguments, "maximum", maximum);
             }
             Self::AppAbout
-            | Self::CliConfigHelp
             | Self::CliUiLanguageHelp
             | Self::CliProgressHelp
             | Self::CliMzAbout
@@ -1750,7 +1778,6 @@ impl UiMessage<'_> {
             | Self::CliCommandMetavar
             | Self::CliPrintHelp
             | Self::CliPrintVersion
-            | Self::CliMissingConfig
             | Self::CliBlankValue
             | Self::CliInvalidPositiveInteger
             | Self::CliUiLanguageEnvironmentNotUnicode
@@ -2194,7 +2221,6 @@ mod tests {
     fn all_test_messages() -> Vec<UiMessage<'static>> {
         vec![
             UiMessage::AppAbout,
-            UiMessage::CliConfigHelp,
             UiMessage::CliUiLanguageHelp,
             UiMessage::CliProgressHelp,
             UiMessage::CliMzAbout,
@@ -2228,7 +2254,6 @@ mod tests {
             UiMessage::CliCommandMetavar,
             UiMessage::CliPrintHelp,
             UiMessage::CliPrintVersion,
-            UiMessage::CliMissingConfig,
             UiMessage::CliBlankValue,
             UiMessage::CliInvalidPositiveInteger,
             UiMessage::CliInvalidProgress { value: "fast" },
@@ -2343,6 +2368,9 @@ mod tests {
             UiMessage::DiagnosticHttpRetryAfter { seconds: 7 },
             UiMessage::DiagnosticHttpProviderCode { code: "rate_limit" },
             UiMessage::DiagnosticHttpProviderType { kind: "quota" },
+            UiMessage::DiagnosticHttpProviderMessage {
+                message: "request rejected",
+            },
             UiMessage::DiagnosticHttpFactSeparator,
             UiMessage::DiagnosticSqlite {
                 primary_code: "5",
@@ -2390,6 +2418,14 @@ mod tests {
             UiMessage::NoticeExtractReuseOwners { owners: "owners" },
             UiMessage::NoticeTranslateReuseProfile { profile: "profile" },
             UiMessage::NoticeOwnerDisabled { owner: "owner" },
+            UiMessage::WarningRulesCommandNonStringSkipped {
+                rule_number: 3,
+                source_file: "Map001.json",
+                command_code: "355",
+                parameter: 0,
+                actual_type: "number",
+                skipped_count: 2,
+            },
             UiMessage::NoticeNoModelRequest,
             UiMessage::NoticeManualLayout { count: 3 },
             UiMessage::NoticeLogDegraded,

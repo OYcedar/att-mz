@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -49,18 +49,39 @@ fn help_exposes_mv_mz_and_generic_as_independent_command_domains() {
 }
 
 #[test]
-fn configuration_is_required_and_stage_commands_reject_lua_options() {
+fn fixed_configuration_is_required_and_stage_commands_reject_lua_options() {
     let temporary = tempfile::tempdir().expect("应可建立 CLI 参数测试目录");
     let root = temporary.path();
 
-    let missing_configuration = Command::new(env!("CARGO_BIN_EXE_att"))
+    let missing_configuration = Command::new(stage_att_executable(root))
         .current_dir(root)
         .args(["mz", "extract", "--name", PROJECT, "--builtin"])
         .output()
         .expect("att.exe 应可执行");
-    assert_eq!(missing_configuration.status.code(), Some(2));
+    assert_eq!(missing_configuration.status.code(), Some(1));
     assert!(missing_configuration.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&missing_configuration.stderr).contains("--config"));
+    let missing_stderr = String::from_utf8_lossy(&missing_configuration.stderr);
+    let fixed_configuration = distribution_root(root).join("config.toml");
+    assert!(
+        missing_stderr.contains(fixed_configuration.to_string_lossy().as_ref()),
+        "缺失配置诊断必须报告可执行文件旁的固定绝对路径：{missing_stderr}"
+    );
+
+    let removed_argument = Command::new(stage_att_executable(root))
+        .current_dir(root)
+        .args([
+            "--config",
+            "elsewhere.toml",
+            "mz",
+            "extract",
+            "--name",
+            PROJECT,
+            "--builtin",
+        ])
+        .output()
+        .expect("att.exe 应可执行");
+    assert_eq!(removed_argument.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&removed_argument.stderr).contains("--config"));
 
     for engine in ["mv", "mz", "generic"] {
         for stage in ["extract", "translate", "write-back"] {
@@ -68,7 +89,7 @@ fn configuration_is_required_and_stage_commands_reject_lua_options() {
             if stage == "translate" {
                 arguments.insert(4, "local");
             }
-            let output = Command::new(env!("CARGO_BIN_EXE_att"))
+            let output = Command::new(stage_att_executable(root))
                 .current_dir(root)
                 .args(arguments)
                 .output()
@@ -83,7 +104,7 @@ fn configuration_is_required_and_stage_commands_reject_lua_options() {
             );
         }
 
-        let output = Command::new(env!("CARGO_BIN_EXE_att"))
+        let output = Command::new(stage_att_executable(root))
             .current_dir(root)
             .args([
                 engine,
@@ -127,10 +148,17 @@ fn same_named_mv_mz_and_generic_projects_remain_isolated_across_real_processes()
     );
     write_configuration(root, &endpoint);
 
-    assert_success("MZ Init", &run_att(root, init_arguments("mz", &mz_game)));
-    assert_success("MV Init", &run_att(root, init_arguments("mv", &mv_game)));
+    // 可执行文件位于 release/，而这些相对输入必须继续以调用 cwd 为基准。
+    assert_success(
+        "MZ Init",
+        &run_att(root, init_arguments("mz", Path::new("mz-game"))),
+    );
+    assert_success(
+        "MV Init",
+        &run_att(root, init_arguments("mv", Path::new("mv-game"))),
+    );
     let mut generic_init = arguments(&["generic", "init", "--name", PROJECT, "--path"]);
-    generic_init.push(generic_input.as_os_str().to_owned());
+    generic_init.push(OsString::from("jsonl"));
     generic_init.extend(arguments(&[
         "--source-language",
         "ja",
@@ -139,9 +167,11 @@ fn same_named_mv_mz_and_generic_projects_remain_isolated_across_real_processes()
     ]));
     assert_success("Generic Init", &run_att(root, generic_init));
 
-    let mz_workspace = root.join("projects/mz").join(PROJECT);
-    let mv_workspace = root.join("projects/mv").join(PROJECT);
-    let generic_workspace = root.join("projects/generic").join(PROJECT);
+    let mz_workspace = distribution_root(root).join("projects/mz").join(PROJECT);
+    let mv_workspace = distribution_root(root).join("projects/mv").join(PROJECT);
+    let generic_workspace = distribution_root(root)
+        .join("projects/generic")
+        .join(PROJECT);
     assert!(mz_workspace.join("project.db").is_file());
     assert!(mv_workspace.join("project.db").is_file());
     assert!(generic_workspace.join("project.db").is_file());
@@ -263,7 +293,7 @@ fn mv_dialogue_crosses_extract_translate_and_write_back_processes() {
         ),
     );
 
-    let workspace = root.join("projects/mv").join(PROJECT);
+    let workspace = distribution_root(root).join("projects/mv").join(PROJECT);
     let database = workspace.join("project.db");
     let extracted = read_owner_units(&database, "builtin");
     assert_eq!(
@@ -413,7 +443,7 @@ fn rules_owner_replaces_writes_back_and_disables_without_touching_builtin() {
         ),
     );
 
-    let workspace = root.join("projects/mz").join(PROJECT);
+    let workspace = distribution_root(root).join("projects/mz").join(PROJECT);
     let database = workspace.join("project.db");
     assert_eq!(
         read_owner_units(&database, "builtin"),
@@ -593,7 +623,9 @@ fn generic_reextract_preserves_moves_and_rejects_unextracted_changes() {
         ),
     );
 
-    let workspace = root.join("projects/generic").join(PROJECT);
+    let workspace = distribution_root(root)
+        .join("projects/generic")
+        .join(PROJECT);
     let first_output = workspace.join("write_back/story.jsonl");
     assert_eq!(
         read_generic_texts(&first_output),
@@ -701,13 +733,12 @@ fn malformed_configuration_does_not_echo_api_key() {
 
     let temporary = tempfile::tempdir().expect("应可建立配置诊断测试目录");
     let root = temporary.path();
+    let distribution = distribution_root(root);
+    fs::create_dir_all(&distribution).expect("测试发行目录应可建立");
     fs::write(
-        root.join("config.toml"),
+        distribution.join("config.toml"),
         format!(
-            r#"[projects]
-root = "projects"
-
-[llm.clients.invalid]
+            r#"[llm.clients.invalid]
 url = "https://example.invalid/v1/chat/completions"
 api_key = "{SECRET}" "invalid"
 "#
@@ -751,7 +782,10 @@ fn generic_lua_syntax_failure_is_logged_and_reported_before_project_open() {
         "语法诊断必须保留 Lua 编译器给出的具体原因：{stderr}"
     );
 
-    let logs = root.join("projects/generic").join(PROJECT).join("logs");
+    let logs = distribution_root(root)
+        .join("projects/generic")
+        .join(PROJECT)
+        .join("logs");
     let log_paths = fs::read_dir(&logs)
         .expect("语法预检开始前应建立项目日志")
         .map(|entry| entry.expect("日志目录项应可读取").path())
@@ -808,7 +842,10 @@ fn atomic_lua_documented_examples_commit_once_or_roll_back_once() {
     note_arguments.extend(arguments(&["menu", "checked"]));
     assert_success("Lua 私有表提交", &run_att(root, note_arguments));
 
-    let database = root.join("projects/mz").join(PROJECT).join("project.db");
+    let database = distribution_root(root)
+        .join("projects/mz")
+        .join(PROJECT)
+        .join("project.db");
     let connection = Connection::open(&database).expect("项目数据库应可重新打开");
     let note: String = connection
         .query_row("SELECT note FROM lua_notes WHERE key = 'menu'", [], |row| {
@@ -866,7 +903,7 @@ assert(warn == nil)
 }
 
 fn run_information_command(root: &Path, arguments: &[&str]) -> String {
-    let output = Command::new(env!("CARGO_BIN_EXE_att"))
+    let output = Command::new(stage_att_executable(root))
         .current_dir(root)
         .args(arguments)
         .output()
@@ -901,12 +938,33 @@ fn arguments(values: &[&str]) -> Vec<OsString> {
     values.iter().map(OsString::from).collect()
 }
 
+fn distribution_root(root: &Path) -> PathBuf {
+    root.join("release")
+}
+
+fn stage_att_executable(root: &Path) -> PathBuf {
+    let source = Path::new(env!("CARGO_BIN_EXE_att"));
+    let release = distribution_root(root);
+    fs::create_dir_all(&release).expect("测试发行目录应可建立");
+    let executable = release.join("att.exe");
+    if !executable.exists() {
+        fs::copy(source, &executable).expect("测试 att.exe 应可复制到独立发行目录");
+        let source_directory = source.parent().expect("测试 att.exe 应拥有父目录");
+        for entry in fs::read_dir(source_directory).expect("测试构建目录应可读取") {
+            let path = entry.expect("测试构建目录项应可读取").path();
+            if path.extension().is_some_and(|extension| extension == "dll") {
+                let name = path.file_name().expect("DLL 应拥有文件名");
+                fs::copy(&path, release.join(name)).expect("运行时 DLL 应可复制到发行目录");
+            }
+        }
+    }
+    executable
+}
+
 fn run_att(root: &Path, arguments: Vec<OsString>) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_att"));
+    let mut command = Command::new(stage_att_executable(root));
     command
         .current_dir(root)
-        .arg("--config")
-        .arg(root.join("config.toml"))
         .args(["--ui-language", "zh-Hans", "--progress", "off"])
         .args(arguments);
     command.output().expect("att.exe 应可执行")
@@ -923,11 +981,7 @@ fn assert_success(stage: &str, output: &Output) {
 
 fn write_configuration(root: &Path, endpoint: &str) {
     let configuration = format!(
-        r#"[projects]
-root = "projects"
-
-[prompts]
-root = "prompts"
+        r#"[prompts]
 locale = "zh-Hans"
 thinking_output = false
 
@@ -963,11 +1017,13 @@ llm_client = "primary"
 target_task_user_message_characters = 10000
 "#
     );
-    fs::write(root.join("config.toml"), configuration).expect("测试配置应可写入");
+    let distribution = distribution_root(root);
+    fs::create_dir_all(&distribution).expect("测试发行目录应可建立");
+    fs::write(distribution.join("config.toml"), configuration).expect("测试配置应可写入");
 }
 
 fn write_rpg_maker_prompt(root: &Path) {
-    let prompt_root = root.join("prompts/rpg_maker/zh-Hans");
+    let prompt_root = distribution_root(root).join("prompts/rpg_maker/zh-Hans");
     fs::create_dir_all(&prompt_root).expect("Prompt 目录应可建立");
     fs::write(
         prompt_root.join("system.md"),
@@ -993,7 +1049,7 @@ fn write_extract_rules(root: &Path, field: Option<&str>) {
 }
 
 fn write_generic_prompt(root: &Path) {
-    let prompt_root = root.join("prompts/generic/zh-Hans");
+    let prompt_root = distribution_root(root).join("prompts/generic/zh-Hans");
     fs::create_dir_all(&prompt_root).expect("Generic Prompt 目录应可建立");
     fs::write(
         prompt_root.join("system.md"),

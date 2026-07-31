@@ -8,8 +8,7 @@ use std::path::PathBuf;
 
 use clap::error::{ContextKind, ErrorKind};
 use clap::{
-    Arg, ArgAction, ArgMatches, Args, Command, CommandFactory, FromArgMatches, Parser, Subcommand,
-    ValueEnum,
+    Arg, ArgAction, Args, Command, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum,
 };
 
 use crate::i18n::{
@@ -20,10 +19,9 @@ use crate::language::LanguageId;
 use crate::project_name::ProjectName;
 use crate::rpg_maker::MaxFullwidthChars;
 
-/// 已确认显式配置路径的 ATT 进程参数。
+/// 已完成解析的 ATT 进程参数。
 #[derive(Debug)]
 pub(crate) struct AttArguments {
-    pub(crate) config: PathBuf,
     pub(crate) progress: ProgressArgument,
     pub(crate) product: ProductCommand,
 }
@@ -79,7 +77,6 @@ impl AttArguments {
         };
         let localizer = UiLocalizer::new(resolved.locale());
         let command = localized_command(&localizer);
-        let usage_command = command.clone();
         let mut fallback_usage_command = command.clone();
         let fallback_usage = localized_usage(
             &fallback_usage_command.render_usage().to_string(),
@@ -92,28 +89,11 @@ impl AttArguments {
             LocalizedCliError::from_clap(error, &localizer, Some(fallback_usage))
         })?;
         let RawAttArguments {
-            config,
             ui_language: _,
             progress,
             product,
         } = raw;
-        let Some(config) = config else {
-            let usage = localized_usage_for_matches(usage_command, &matches, &localizer);
-            return Err(LocalizedCliError::input(
-                ErrorKind::MissingRequiredArgument,
-                localizer.format(UiMessage::CliMissingConfig),
-                Some(usage),
-                &localizer,
-            ));
-        };
-        Ok((
-            Self {
-                config,
-                progress,
-                product,
-            },
-            resolved,
-        ))
+        Ok((Self { progress, product }, resolved))
     }
 
     #[cfg(test)]
@@ -124,22 +104,11 @@ impl AttArguments {
     {
         let raw = RawAttArguments::try_parse_from(arguments)?;
         let RawAttArguments {
-            config,
             ui_language: _,
             progress,
             product,
         } = raw;
-        let Some(config) = config else {
-            return Err(RawAttArguments::command().error(
-                ErrorKind::MissingRequiredArgument,
-                "缺少必需的配置路径 `--config <FILE>`",
-            ));
-        };
-        Ok(Self {
-            config,
-            progress,
-            product,
-        })
+        Ok(Self { progress, product })
     }
 
     #[cfg(test)]
@@ -229,16 +198,10 @@ impl fmt::Display for LocalizedCliError {
 
 impl std::error::Error for LocalizedCliError {}
 
-/// Clap 解析阶段允许全局参数在子命令前后出现，再由上方边界建立必填不变量。
+/// Clap 解析阶段允许全局参数在子命令前后出现。
 #[derive(Debug, Parser)]
 #[command(name = "att", bin_name = "att", about = "游戏翻译工具", version)]
 struct RawAttArguments {
-    /// 本次进程使用的严格 TOML 配置文件。
-    ///
-    /// 相对路径以进程当前工作目录为基准。
-    #[arg(long, global = true, value_name = "FILE", value_parser = parse_non_blank_path)]
-    config: Option<PathBuf>,
-
     /// 终端、帮助与项目日志消息使用的界面语言。
     #[arg(long, global = true, value_name = "LANG", value_parser = parse_non_blank)]
     ui_language: Option<String>,
@@ -560,8 +523,7 @@ fn localize_command_tree(
         .disable_help_subcommand(true)
         .disable_version_flag(true);
 
-    const ARGUMENT_IDENTIFIERS: [&str; 18] = [
-        "config",
+    const ARGUMENT_IDENTIFIERS: [&str; 17] = [
         "ui_language",
         "progress",
         "name",
@@ -633,18 +595,14 @@ fn localized_usage_syntax(
     let nested_command = localizer.format(UiMessage::CliCommandMetavar);
     let syntax = match command_name {
         "att" | "mz" | "mv" | "generic" => {
-            format!("{command_path} --config <FILE> [{options}] <{nested_command}>")
+            format!("{command_path} [{options}] <{nested_command}>")
         }
-        "translate" => {
-            format!("{command_path} --config <FILE> --name <NAME> [PROFILE_ID] [{options}]")
-        }
-        "lua" => format!(
-            "{command_path} --config <FILE> --name <NAME> [{options}] <SCRIPT_LUA> [-- <ARG>...]"
-        ),
+        "translate" => format!("{command_path} --name <NAME> [PROFILE_ID] [{options}]"),
+        "lua" => format!("{command_path} --name <NAME> [{options}] <SCRIPT_LUA> [-- <ARG>...]"),
         "init" | "extract" | "write-back" => {
-            format!("{command_path} --config <FILE> --name <NAME> [{options}]")
+            format!("{command_path} --name <NAME> [{options}]")
         }
-        _ => format!("{command_path} --config <FILE> [{options}]"),
+        _ => format!("{command_path} [{options}]"),
     };
     format!("\u{2068}{syntax}\u{2069}")
 }
@@ -689,7 +647,6 @@ fn command_about(name: &str) -> UiMessage<'static> {
 
 fn argument_help(identifier: &str) -> Option<UiMessage<'static>> {
     match identifier {
-        "config" => Some(UiMessage::CliConfigHelp),
         "ui_language" => Some(UiMessage::CliUiLanguageHelp),
         "progress" => Some(UiMessage::CliProgressHelp),
         "name" => Some(UiMessage::CliProjectNameHelp),
@@ -742,9 +699,7 @@ fn localize_clap_error(error: &clap::Error, localizer: &UiLocalizer) -> String {
             localizer.format(UiMessage::CliUnexpectedArgument { value: unexpected })
         }
         ErrorKind::MissingRequiredArgument => {
-            if argument.contains("--config") || argument.contains("config") {
-                localizer.format(UiMessage::CliMissingConfig)
-            } else if argument.is_empty() {
+            if argument.is_empty() {
                 localizer.format(UiMessage::CliParseFailure)
             } else {
                 localizer.format(UiMessage::CliMissingRequiredArgument { value: &argument })
@@ -801,23 +756,6 @@ fn localized_usage(usage: &str, localizer: &UiLocalizer) -> String {
     )
 }
 
-fn localized_usage_for_matches(
-    mut command: Command,
-    matches: &ArgMatches,
-    localizer: &UiLocalizer,
-) -> String {
-    command.build();
-    let mut active_command = &mut command;
-    let mut active_matches = matches;
-    while let Some((name, subcommand_matches)) = active_matches.subcommand() {
-        active_command = active_command
-            .find_subcommand_mut(name)
-            .expect("Clap matches 中的子命令必须存在于同一命令 schema");
-        active_matches = subcommand_matches;
-    }
-    localized_usage(&active_command.render_usage().to_string(), localizer)
-}
-
 fn parse_non_blank(value: &str) -> Result<String, String> {
     if value.trim().is_empty() {
         Err("值不能为空".to_owned())
@@ -856,9 +794,9 @@ mod tests {
     }
 
     #[test]
-    fn global_config_is_accepted_before_or_after_mz() {
+    fn custom_configuration_path_is_rejected_as_an_unknown_argument() {
         for arguments in [
-            [
+            vec![
                 "att",
                 "--config",
                 "settings/config.toml",
@@ -867,7 +805,7 @@ mod tests {
                 "--name",
                 "demo",
             ],
-            [
+            vec![
                 "att",
                 "mz",
                 "--config",
@@ -877,24 +815,16 @@ mod tests {
                 "demo",
             ],
         ] {
-            let parsed = AttArguments::try_parse_from(arguments).expect("参数应合法");
-            assert_eq!(parsed.config.as_path(), Path::new("settings/config.toml"));
-            assert!(matches!(expect_mz(parsed.product), MzCommand::WriteBack(_)));
+            let error = AttArguments::try_parse_from(arguments)
+                .expect_err("固定发行目录模式不得接受自定义配置路径");
+            assert_eq!(error.kind(), ErrorKind::UnknownArgument);
         }
     }
 
     #[test]
     fn extract_without_explicit_owner_is_preserved_for_project_state_resolution() {
-        let parsed = AttArguments::try_parse_from([
-            "att",
-            "--config",
-            "config.toml",
-            "mz",
-            "extract",
-            "--name",
-            "demo",
-        ])
-        .expect("省略 owner 应交给项目状态解析");
+        let parsed = AttArguments::try_parse_from(["att", "mz", "extract", "--name", "demo"])
+            .expect("省略 owner 应交给项目状态解析");
         let MzCommand::Extract(arguments) = expect_mz(parsed.product) else {
             panic!("应解析为提取命令");
         };
@@ -903,18 +833,16 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_commands_require_explicit_configuration() {
-        let error = AttArguments::try_parse_from(["att", "mz", "write-back", "--name", "demo"])
-            .expect_err("普通命令不得推断默认配置路径");
-        assert_eq!(error.exit_code(), 2);
+    fn ordinary_commands_parse_without_a_configuration_argument() {
+        let parsed = AttArguments::try_parse_from(["att", "mz", "write-back", "--name", "demo"])
+            .expect("配置位置由发行目录确定，不属于命令意图");
+        assert!(matches!(expect_mz(parsed.product), MzCommand::WriteBack(_)));
     }
 
     #[test]
     fn translate_preserves_exact_profile_id_and_paths() {
         let parsed = AttArguments::try_parse_from([
             "att",
-            "--config",
-            "config.toml",
             "mz",
             "translate",
             "--name",
@@ -945,8 +873,6 @@ mod tests {
     fn project_lua_preserves_script_and_delimited_arguments() {
         let parsed = AttArguments::try_parse_from([
             "att",
-            "--config",
-            "config.toml",
             "mz",
             "lua",
             "--name",
@@ -971,8 +897,6 @@ mod tests {
         for arguments in [
             vec![
                 "att",
-                "--config",
-                "config.toml",
                 "mz",
                 "extract",
                 "--name",
@@ -982,8 +906,6 @@ mod tests {
             ],
             vec![
                 "att",
-                "--config",
-                "config.toml",
                 "mz",
                 "translate",
                 "--name",
@@ -993,8 +915,6 @@ mod tests {
             ],
             vec![
                 "att",
-                "--config",
-                "config.toml",
                 "mz",
                 "write-back",
                 "--name",
@@ -1004,8 +924,6 @@ mod tests {
             ],
             vec![
                 "att",
-                "--config",
-                "config.toml",
                 "mz",
                 "lua",
                 "--name",
@@ -1025,8 +943,6 @@ mod tests {
     fn generic_commands_preserve_live_input_and_translation_options() {
         let init = AttArguments::try_parse_from([
             "att",
-            "--config",
-            "config.toml",
             "generic",
             "init",
             "--name",
@@ -1057,8 +973,6 @@ mod tests {
 
         let translate = AttArguments::try_parse_from([
             "att",
-            "--config",
-            "config.toml",
             "generic",
             "translate",
             "--name",
@@ -1080,22 +994,12 @@ mod tests {
 
     #[test]
     fn project_lua_requires_a_script_and_delimits_script_arguments() {
-        let missing_script = AttArguments::try_parse_from([
-            "att",
-            "--config",
-            "config.toml",
-            "mv",
-            "lua",
-            "--name",
-            "demo",
-        ])
-        .expect_err("项目 Lua 必须提供脚本");
+        let missing_script = AttArguments::try_parse_from(["att", "mv", "lua", "--name", "demo"])
+            .expect_err("项目 Lua 必须提供脚本");
         assert_eq!(missing_script.kind(), ErrorKind::MissingRequiredArgument);
 
         let unexpected_argument = AttArguments::try_parse_from([
             "att",
-            "--config",
-            "config.toml",
             "mv",
             "lua",
             "--name",
@@ -1113,8 +1017,6 @@ mod tests {
         let invalid_argument = OsString::from_wide(&[0xD800]);
         let arguments = [
             OsString::from("att"),
-            OsString::from("--config"),
-            OsString::from("config.toml"),
             OsString::from("mz"),
             OsString::from("lua"),
             OsString::from("--name"),
@@ -1131,18 +1033,9 @@ mod tests {
 
     #[test]
     fn init_accepts_only_project_and_game_path() {
-        let parsed = AttArguments::try_parse_from([
-            "att",
-            "--config",
-            "config.toml",
-            "mz",
-            "init",
-            "--name",
-            "demo",
-            "--path",
-            "game",
-        ])
-        .expect("后续 Init 应允许复用已经保存的语言和布局");
+        let parsed =
+            AttArguments::try_parse_from(["att", "mz", "init", "--name", "demo", "--path", "game"])
+                .expect("后续 Init 应允许复用已经保存的语言和布局");
         let MzCommand::Init(arguments) = expect_mz(parsed.product) else {
             panic!("应解析为 Init 命令");
         };
@@ -1156,31 +1049,15 @@ mod tests {
 
     #[test]
     fn init_and_translate_allow_project_state_reuse() {
-        let init = AttArguments::try_parse_from([
-            "att",
-            "--config",
-            "config.toml",
-            "mz",
-            "init",
-            "--name",
-            "demo",
-        ])
-        .expect("后续 Init 可省略来源路径");
+        let init = AttArguments::try_parse_from(["att", "mz", "init", "--name", "demo"])
+            .expect("后续 Init 可省略来源路径");
         let MzCommand::Init(arguments) = expect_mz(init.product) else {
             panic!("应解析为 Init 命令");
         };
         assert!(arguments.path.is_none());
 
-        let translate = AttArguments::try_parse_from([
-            "att",
-            "--config",
-            "config.toml",
-            "mz",
-            "translate",
-            "--name",
-            "demo",
-        ])
-        .expect("后续 Translate 可省略 Profile");
+        let translate = AttArguments::try_parse_from(["att", "mz", "translate", "--name", "demo"])
+            .expect("后续 Translate 可省略 Profile");
         let MzCommand::Translate(arguments) = expect_mz(translate.product) else {
             panic!("应解析为 Translate 命令");
         };
@@ -1191,8 +1068,6 @@ mod tests {
     fn parses_global_ui_language_and_progress_mode() {
         let (parsed, resolved) = AttArguments::try_parse_localized_from([
             "att",
-            "--config",
-            "config.toml",
             "--ui-language",
             "zh-Hant",
             "--progress",
@@ -1226,7 +1101,6 @@ mod tests {
                 localizer.format(UiMessage::CliUsageHeading),
                 localizer.format(UiMessage::CliCommandsHeading),
                 localizer.format(UiMessage::CliOptionsHeading),
-                localizer.format(UiMessage::CliConfigHelp),
                 localizer.format(UiMessage::CliPrintHelp),
             ] {
                 assert!(
@@ -1284,8 +1158,6 @@ mod tests {
             "att",
             "--ui-language",
             "fr",
-            "--config",
-            "config.toml",
             "--progress",
             "fast",
             "mz",
@@ -1344,22 +1216,25 @@ mod tests {
     }
 
     #[test]
-    fn localized_parser_reports_missing_config_in_the_selected_language() {
+    fn localized_parser_rejects_removed_config_argument_in_the_selected_language() {
         let error = AttArguments::try_parse_localized_from([
             "att",
             "--ui-language",
             "ja",
+            "--config",
+            "config.toml",
             "mz",
             "write-back",
             "--name",
             "demo",
         ])
-        .expect_err("配置路径仍是显式必填");
+        .expect_err("已移除的配置参数必须作为未知参数拒绝");
         let localizer = UiLocalizer::new(UiLocale::Japanese);
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
         assert!(
-            error
-                .output()
-                .contains(&localizer.format(UiMessage::CliMissingConfig))
+            error.output().contains(
+                &localizer.format(UiMessage::CliUnexpectedArgument { value: "--config" })
+            )
         );
     }
 
@@ -1382,8 +1257,6 @@ mod tests {
     fn init_parses_each_explicit_override_independently() {
         let parsed = AttArguments::try_parse_from([
             "att",
-            "--config",
-            "config.toml",
             "mz",
             "init",
             "--name",
@@ -1418,8 +1291,6 @@ mod tests {
     fn init_rejects_language_ids_with_surrounding_whitespace() {
         let error = AttArguments::try_parse_from([
             "att",
-            "--config",
-            "config.toml",
             "mz",
             "init",
             "--name",
@@ -1437,15 +1308,7 @@ mod tests {
     #[test]
     fn mv_exposes_all_project_command_domains() {
         for command in ["init", "extract", "translate", "write-back", "lua"] {
-            let mut arguments = vec![
-                "att",
-                "--config",
-                "config.toml",
-                "mv",
-                command,
-                "--name",
-                "demo",
-            ];
+            let mut arguments = vec!["att", "mv", command, "--name", "demo"];
             match command {
                 "init" => arguments.extend(["--path", "game"]),
                 "extract" => arguments.push("--builtin"),
@@ -1463,8 +1326,6 @@ mod tests {
     fn mv_dialogue_rules_require_builtin_extraction() {
         let error = AttArguments::try_parse_from([
             "att",
-            "--config",
-            "config.toml",
             "mv",
             "extract",
             "--name",

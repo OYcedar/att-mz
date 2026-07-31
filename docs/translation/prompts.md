@@ -5,8 +5,8 @@
 每个引擎分别读取：
 
 ```text
-<prompts.root>/<prompt-engine>/<locale>/system.md
-<prompts.root>/<prompt-engine>/<locale>/thinking.md
+<att-dir>/prompts/<prompt-engine>/<locale>/system.md
+<att-dir>/prompts/<prompt-engine>/<locale>/thinking.md
 ```
 
 `prompt-engine` 为 `rpg_maker` 或 `generic`。MV 与 MZ 共用 `rpg_maker`，Generic 使用

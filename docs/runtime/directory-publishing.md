@@ -22,13 +22,13 @@ MV/MZ 来源冻结、Generic 输入一致读取和所有发布候选都建立在
 项目租约位于：
 
 ```text
-<projects.root>/.att-locks/projects/<engine>/
+<att-dir>/projects/.att-locks/projects/<engine>/
 ```
 
 目录发布锁位于：
 
 ```text
-<projects.root>/.att-locks/directory-publish/<engine>/
+<att-dir>/projects/.att-locks/directory-publish/<engine>/
 ```
 
 锁竞争时持续等待并随时响应取消；ATT 不设任意截止时间，也不设本地队列容量。

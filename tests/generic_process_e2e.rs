@@ -3,7 +3,7 @@
 //! Generic CLI 的独立生产进程边界测试。
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const PROJECT: &str = "generic-observable";
@@ -14,13 +14,11 @@ fn generic_progress_modes_and_jsonl_diagnostic_are_observable() {
     let root = temporary.path();
     let input = root.join("input");
     fs::create_dir(&input).expect("应可建立 Generic 输入目录");
+    let distribution = distribution_root(root);
+    fs::create_dir_all(&distribution).expect("测试发行目录应可建立");
     fs::write(
-        root.join("config.toml"),
-        r#"[projects]
-root = "projects"
-
-[prompts]
-root = "prompts"
+        distribution.join("config.toml"),
+        r#"[prompts]
 locale = "en"
 thinking_output = false
 
@@ -57,7 +55,7 @@ target_task_user_message_characters = 10000
 "#,
     )
     .expect("应可写入测试配置");
-    let prompt_root = root.join("prompts/generic/en");
+    let prompt_root = distribution.join("prompts/generic/en");
     fs::create_dir_all(&prompt_root).expect("应可建立 Generic Prompt 目录");
     fs::write(
         prompt_root.join("system.md"),
@@ -220,14 +218,35 @@ target_task_user_message_characters = 10000
 }
 
 fn run_att(root: &Path, progress: &str, arguments: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_att"))
+    Command::new(stage_att_executable(root))
         .current_dir(root)
-        .arg("--config")
-        .arg(root.join("config.toml"))
         .args(["--ui-language", "en", "--progress", progress])
         .args(arguments)
         .output()
         .expect("att.exe 应可执行")
+}
+
+fn distribution_root(root: &Path) -> PathBuf {
+    root.join("release")
+}
+
+fn stage_att_executable(root: &Path) -> PathBuf {
+    let source = Path::new(env!("CARGO_BIN_EXE_att"));
+    let release = distribution_root(root);
+    fs::create_dir_all(&release).expect("测试发行目录应可建立");
+    let executable = release.join("att.exe");
+    if !executable.exists() {
+        fs::copy(source, &executable).expect("测试 att.exe 应可复制到独立发行目录");
+        let source_directory = source.parent().expect("测试 att.exe 应拥有父目录");
+        for entry in fs::read_dir(source_directory).expect("测试构建目录应可读取") {
+            let path = entry.expect("测试构建目录项应可读取").path();
+            if path.extension().is_some_and(|extension| extension == "dll") {
+                let name = path.file_name().expect("DLL 应拥有文件名");
+                fs::copy(&path, release.join(name)).expect("运行时 DLL 应可复制到发行目录");
+            }
+        }
+    }
+    executable
 }
 
 fn assert_success(stage: &str, output: &Output) {

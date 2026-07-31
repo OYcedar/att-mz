@@ -4860,6 +4860,7 @@ mod tests {
                             retry_after_seconds: Some(2),
                             provider_code: Some("busy".to_owned()),
                             provider_type: Some("service_error".to_owned()),
+                            provider_message: None,
                         },
                         crate::diagnostic::DiagnosticImpact::ProgressPreserved,
                         crate::diagnostic::DiagnosticAction::CheckModelService,

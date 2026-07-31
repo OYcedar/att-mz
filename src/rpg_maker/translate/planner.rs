@@ -4694,6 +4694,14 @@ pattern = '\A<Help:(?<text>.*?)>\z'
                             [[term]]
                             term = "勇者"
                             translation = "英雄"
+
+                            [[term]]
+                            term = "プフクス"
+                            translation = "普芙库丝"
+
+                            [[term]]
+                            term = "プフクスッ"
+                            translation = "噗呼咯"
                         "#
                         .as_bytes()
                         .to_vec(),
@@ -4725,7 +4733,7 @@ pattern = '\A<Help:(?<text>.*?)>\z'
                 RpgMakerTranslationCorpus::new(vec![group(
                     RpgMakerSource::data(StandardDataFile::Items),
                     1,
-                    r"<code:秘密>前\C[2]後勇者翻訳",
+                    r"<code:秘密>前\C[2]後勇者とプフクスッ翻訳",
                     None,
                     Vec::new(),
                 )]),
@@ -4737,6 +4745,11 @@ pattern = '\A<Help:(?<text>.*?)>\z'
 
         let user = tasks[0].messages()[1].content();
         assert!(user.contains("- 勇者 → 英雄"));
+        assert!(user.contains("- プフクスッ → 噗呼咯"));
+        assert!(
+            !user.contains("- プフクス → 普芙库丝"),
+            "同一起点被最长 trigger 抑制的姓名术语不得进入 Prompt"
+        );
         assert!(!user.contains("- 秘密 →"), "协议壳不得触发术语");
         assert!(!user.contains("- 前後 →"), "术语不得跨不透明边界拼接");
     }

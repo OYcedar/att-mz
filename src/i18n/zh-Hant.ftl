@@ -1,5 +1,4 @@
 app-about = 使用可重用專案狀態翻譯遊戲與結構化文字
-cli-config-help = 本次執行使用的嚴格 TOML 設定檔
 cli-ui-language-help = Help、診斷、進度、結果與專案日誌使用的語言：ar、zh-Hans、zh-Hant、en、fr、ru、es、ja、ko 或 vi
 cli-progress-help = 即時進度模式：auto、plain 或 off
 cli-mz-about = 翻譯 RPG Maker MZ 遊戲
@@ -33,7 +32,6 @@ cli-options-metavar = 選項
 cli-command-metavar = 命令
 cli-print-help = 顯示說明
 cli-print-version = 顯示版本
-cli-missing-config = 缺少必要的設定路徑 --config <FILE>。
 cli-blank-value = 值不可空白。
 cli-invalid-positive-integer = 值必須是正整數。
 cli-invalid-progress = 不支援進度模式 { $value }；請使用 auto、plain 或 off。
@@ -83,6 +81,7 @@ notice-init-reuse-path = 未提供來源路徑，已沿用上次成功路徑：{
 notice-extract-reuse-owners = 未提供擷取範圍，已沿用上次成功方案：{ $owners }。
 notice-translate-reuse-profile = 未提供 Profile，已沿用上次成功 Profile：{ $profile }。
 notice-owner-disabled = 已停用 owner { $owner }，並將其移出後續自動方案。
+warning-rules-command-non-string-skipped = 警告：Rules 規則 { $rule_number } 跳過了 { $skipped_count } 個非字串 command 參數（來源 { $source_file }，code={ $command_code }，parameter={ $parameter }，類型 { $actual_type }）。
 notice-no-model-request = 所有翻譯單元都是最新狀態，本次不需請求模型。
 notice-manual-layout = 有 { $count } 個單元需要人工檢查換行。
 notice-log-degraded = 專案日誌無法使用或已降級；命令會繼續，結束狀態不受影響。
@@ -327,7 +326,6 @@ diagnostic-io-kind-value = { $code ->
    *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
-    [runtime_configuration_invalid] 執行階段設定無效
     [unsupported_prompt_locale] 必須是全小寫 auto 或支援的 BCP 47 介面語言
     [language_policy_term_blank] 語言原則詞彙不能為空白
     [language_policy_term_surrounding_whitespace] 語言原則詞彙不能包含前後空白
@@ -404,6 +402,7 @@ diagnostic-http-status = HTTP 狀態碼 { $status }
 diagnostic-http-retry-after = Retry-After { $seconds } 秒
 diagnostic-http-provider-code = 供應商錯誤碼 { $code }
 diagnostic-http-provider-type = 供應商錯誤類型 { $kind }
+diagnostic-http-provider-message = 供應商錯誤訊息 { $message }
 diagnostic-http-fact-separator = ；
 diagnostic-sqlite = SQLite 主要錯誤碼 { $primary_code }，延伸錯誤碼 { $extended_code }
 diagnostic-windows-status = Windows 作業 { $operation } 失敗，NTSTATUS { $status }

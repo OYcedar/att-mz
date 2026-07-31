@@ -1,10 +1,10 @@
 # RPG Maker Translate 现行规格
 
 ```text
-att --config CONFIG mv translate --name NAME [PROFILE_ID] \
+att mv translate --name NAME [PROFILE_ID] \
   [--terms TERMINOLOGY_TOML] [--placeholders PLACEHOLDER_TOML]
 
-att --config CONFIG mz translate --name NAME [PROFILE_ID] \
+att mz translate --name NAME [PROFILE_ID] \
   [--terms TERMINOLOGY_TOML] [--placeholders PLACEHOLDER_TOML]
 ```
 

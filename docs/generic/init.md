@@ -3,7 +3,7 @@
 首次建立项目：
 
 ```text
-att --config CONFIG generic init --name NAME --path JSONL_ROOT \
+att generic init --name NAME --path JSONL_ROOT \
   --source-language LANGUAGE --target-language LANGUAGE
 ```
 
@@ -13,7 +13,7 @@ JSONL 的扫描、解析和复制由 Extract 负责。
 项目工作区固定为：
 
 ```text
-<projects.root>/generic/<name>/
+<att-dir>/projects/generic/<name>/
 ```
 
 再次 Init 同一项目时，只提供需要改变的字段，省略值沿用项目当前值。源语言与目标语言

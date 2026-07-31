@@ -949,6 +949,7 @@ mod tests {
         RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, StandardDataFile,
     };
     use crate::rpg_maker::translate::placeholder::PlaceholderRuleDefinition;
+    use crate::rpg_maker::translate::planner::translation_state_context;
     use crate::translation::planning_resource::{TerminologyEntry, compile_terminology};
 
     fn semantics_with(
@@ -1137,6 +1138,78 @@ mod tests {
             ["勇者"]
         );
         assert_eq!(visible.term_indices(), [0]);
+    }
+
+    #[test]
+    fn suppressed_overlapping_term_is_absent_from_translation_state_fingerprint() {
+        let semantics = semantics_with(
+            RpgMakerEngine::Mz,
+            vec![
+                TerminologyEntry::new("プフクス", "普芙库丝", vec!["プフクス".to_owned()]),
+                TerminologyEntry::new("プフクスッ", "噗呼咯", vec!["プフクスッ".to_owned()]),
+            ],
+            Vec::new(),
+        );
+        let identity = TranslationUnitIdentity::new(
+            RpgMakerAssetOwner::Builtin,
+            TextGroupKind::DatabaseEntry,
+            RpgMakerLocation::value(
+                RpgMakerSource::data(StandardDataFile::Actors),
+                vec![RpgMakerLocationStep::index(1)],
+            ),
+            TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应有效")),
+            TextUnitContent::Value("プフクスッは笑った".to_owned()),
+            "{}",
+        );
+        let prepared = semantics
+            .prepare_content(identity.kind(), identity.source_content())
+            .expect("重叠术语原文应可准备");
+        assert_eq!(prepared.term_indices(), [1]);
+        assert_eq!(
+            prepared
+                .terms()
+                .iter()
+                .map(TerminologyDependency::term)
+                .collect::<Vec<_>>(),
+            ["プフクスッ"]
+        );
+
+        let translation = TextUnitContent::Value("噗呼咯笑了".to_owned());
+        let actual = translation_state_context(
+            semantics.global_fingerprint(),
+            &identity,
+            prepared.model_text(),
+            prepared.placeholders(),
+            prepared.terms(),
+        )
+        .expect("实际状态上下文应可建立")
+        .finish(&translation);
+        let longest_only = [TerminologyDependency::new("プフクスッ", "噗呼咯")];
+        let expected = translation_state_context(
+            semantics.global_fingerprint(),
+            &identity,
+            prepared.model_text(),
+            prepared.placeholders(),
+            &longest_only,
+        )
+        .expect("最长术语状态上下文应可建立")
+        .finish(&translation);
+        let both = [
+            TerminologyDependency::new("プフクス", "普芙库丝"),
+            TerminologyDependency::new("プフクスッ", "噗呼咯"),
+        ];
+        let obsolete_overlap = translation_state_context(
+            semantics.global_fingerprint(),
+            &identity,
+            prepared.model_text(),
+            prepared.placeholders(),
+            &both,
+        )
+        .expect("旧重叠状态上下文应可建立")
+        .finish(&translation);
+
+        assert_eq!(actual, expected);
+        assert_ne!(actual, obsolete_overlap);
     }
 
     #[test]
