@@ -5,6 +5,7 @@
 
 use std::error::Error;
 use std::fmt;
+use std::num::NonZeroUsize;
 
 use sha2::{Digest, Sha256};
 
@@ -102,6 +103,27 @@ impl Sha256FramedHasher {
         self
     }
 
+    /// 保持单个 frame 语义，同时允许调用方在固定大小的数据块之间执行可失败检查。
+    ///
+    /// 检查失败时当前 hasher 已不完整，调用方必须丢弃它。方法直接接收完整 slice，
+    /// 因而声明长度与实际写入长度始终一致，不向调用方开放可伪造的 framing 状态。
+    pub(crate) fn try_frame_chunks<E>(
+        &mut self,
+        tag: u8,
+        bytes: &[u8],
+        chunk_size: NonZeroUsize,
+        mut before_chunk: impl FnMut() -> Result<(), E>,
+    ) -> Result<&mut Self, E> {
+        let length = u64::try_from(bytes.len()).expect("本目标平台的 usize 必须能表示为 u64");
+        self.hasher.update([tag]);
+        self.hasher.update(length.to_be_bytes());
+        for chunk in bytes.chunks(chunk_size.get()) {
+            before_chunk()?;
+            self.hasher.update(chunk);
+        }
+        Ok(self)
+    }
+
     pub(crate) fn finish(self) -> Sha256Fingerprint {
         Sha256Fingerprint::from_bytes(self.hasher.finalize().into())
     }
@@ -135,6 +157,41 @@ mod tests {
             reference,
             fingerprint(b"translation", &[(1, b"c"), (2, b"ab")])
         );
+    }
+
+    #[test]
+    fn chunked_frames_are_identical_to_single_update_frames() {
+        let lengths = [
+            0, 1, 7, 63, 64, 65, 4_095, 4_096, 4_097, 65_535, 65_536, 65_537, 131_111,
+        ];
+        let chunk_sizes = [1, 3, 64, 4_096, 65_536];
+
+        for length in lengths {
+            let mut state = 0x9e37_79b9_u32 ^ u32::try_from(length).unwrap();
+            let bytes = (0..length)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (state >> 24) as u8
+                })
+                .collect::<Vec<_>>();
+            let mut expected = Sha256FramedHasher::new(b"chunk-equivalence");
+            expected.frame(7, &bytes);
+            let expected = expected.finish();
+
+            for chunk_size in chunk_sizes {
+                let mut actual = Sha256FramedHasher::new(b"chunk-equivalence");
+                actual
+                    .try_frame_chunks(7, &bytes, NonZeroUsize::new(chunk_size).unwrap(), || {
+                        Ok::<_, std::convert::Infallible>(())
+                    })
+                    .unwrap();
+                assert_eq!(
+                    actual.finish(),
+                    expected,
+                    "length={length}, chunk_size={chunk_size}"
+                );
+            }
+        }
     }
 
     #[test]

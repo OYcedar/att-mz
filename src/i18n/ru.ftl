@@ -103,6 +103,8 @@ progress-extract-documents = Сканирование документов
 progress-extract-builtin = Единицы Builtin
 progress-extract-rules = Определения Rules
 progress-extract-commit = Commit извлечённых ресурсов
+progress-generic-init = Инициализация проекта Generic
+progress-generic-extract = Сканирование входных данных Generic JSONL
 progress-translate-planning = Планирование задач перевода
 progress-translate-confirmed = Подтверждено задач перевода
 progress-translate-no-work = Запрос к модели не нужен
@@ -285,6 +287,7 @@ diagnostic-failure-value = { $code ->
     [write_back_extraction_out_of_date] Извлечённые ресурсы больше не соответствуют текущему источнику проекта
     [write_back_asset_snapshot_invalid] Сохранённые ресурсы RPG Maker не образуют допустимый снимок обратной записи
     [source_document_invalid] Исходный документ RPG Maker не соответствует требуемому формату
+    [generic_source_document_invalid] Исходный документ Generic JSONL не соответствует требуемому формату
     [write_back_mutation_invalid] Проверенное изменение перевода нельзя применить к зафиксированному исходному расположению
     [write_back_output_path_invalid] Перезаписанный файл находится вне разрешённого дерева вывода RPG Maker
     [write_back_output_path_duplicate] Несколько перезаписанных файлов нацелены на один путь вывода

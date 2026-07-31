@@ -7,6 +7,7 @@ use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
@@ -100,9 +101,9 @@ impl LlmUsage {
 }
 
 /// 一次模型请求的未清洗统一响应。
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct LlmResponse {
-    content: String,
+    content: Arc<String>,
     finish_reason: LlmFinishReason,
     provider_request_id: Option<String>,
     provider_response_id: Option<String>,
@@ -118,7 +119,7 @@ impl LlmResponse {
         usage: Option<LlmUsage>,
     ) -> Self {
         Self {
-            content: content.into(),
+            content: Arc::new(content.into()),
             finish_reason,
             provider_request_id,
             provider_response_id,
@@ -127,7 +128,11 @@ impl LlmResponse {
     }
 
     pub(crate) fn content(&self) -> &str {
-        &self.content
+        self.content.as_str()
+    }
+
+    pub(crate) fn shared_content(&self) -> Arc<String> {
+        Arc::clone(&self.content)
     }
 
     pub(crate) fn finish_reason(&self) -> &LlmFinishReason {
@@ -144,6 +149,13 @@ impl LlmResponse {
 
     pub(crate) const fn usage(&self) -> Option<LlmUsage> {
         self.usage
+    }
+
+    pub(crate) fn into_content_and_finish_reason(self) -> (String, LlmFinishReason) {
+        (
+            Arc::try_unwrap(self.content).unwrap_or_else(|content| (*content).clone()),
+            self.finish_reason,
+        )
     }
 }
 
@@ -272,14 +284,14 @@ impl ApiKeyRedactor {
     /// string fragment 可以保留对象条目、数组顺序和值类型，同时覆盖键和值中的匹配。
     pub(crate) fn redact_json<T>(&self, value: &T) -> Result<String, serde_json::Error>
     where
-        T: Serialize,
+        T: Serialize + ?Sized,
     {
         serde_json::to_string(value).map(|serialized| self.redact_serialized_json(&serialized))
     }
 
     pub(crate) fn redact_json_pretty<T>(&self, value: &T) -> Result<String, serde_json::Error>
     where
-        T: Serialize,
+        T: Serialize + ?Sized,
     {
         serde_json::to_string_pretty(value)
             .map(|serialized| self.redact_serialized_json(&serialized))
@@ -291,6 +303,31 @@ impl ApiKeyRedactor {
     /// 因此这里只替换 key 对应的原始字节，闭合与未闭合 string 的其余内容都逐字保留。
     pub(crate) fn redact_text_with_json_strings(&self, value: &str) -> String {
         self.redact_json_string_tokens(value, false)
+    }
+
+    /// 替换 RPG Maker User message 中 API key 的原文和 Markdown 转义表示。
+    ///
+    /// RPG Maker Prompt 会在每个 ASCII 标点前插入反斜杠。任务记录接收的是已经渲染
+    /// 的消息，因此必须同时识别原文和该确定性表示，且不能把普通反斜杠当作通用转义
+    /// 再解释。
+    pub(crate) fn redact_text_with_markdown_ascii_punctuation_escaped(
+        &self,
+        value: &str,
+    ) -> String {
+        let api_key = self.api_key.expose_secret();
+        if api_key.is_empty() {
+            return value.to_owned();
+        }
+        let mut escaped_api_key = String::with_capacity(api_key.len().saturating_mul(2));
+        for character in api_key.chars() {
+            if character.is_ascii_punctuation() {
+                escaped_api_key.push('\\');
+            }
+            escaped_api_key.push(character);
+        }
+        let mut replacements = Self::literal_source_ranges(value, api_key);
+        replacements.extend(Self::literal_source_ranges(value, &escaped_api_key));
+        Self::replace_source_ranges(value, Self::merge_source_ranges(replacements))
     }
 
     /// 替换整个 endpoint 中出现的 API key 实际值，逐字保留其余内容。
@@ -359,44 +396,30 @@ impl ApiKeyRedactor {
             return value.to_owned();
         }
         let bytes = value.as_bytes();
-        let mut output = String::with_capacity(value.len());
-        let mut copied_until = 0usize;
+        let mut replacements = if serialized_json {
+            Vec::new()
+        } else {
+            Self::literal_source_ranges(value, api_key)
+        };
         let mut index = 0usize;
         while index < bytes.len() {
-            let remaining = &value[index..];
-            if remaining.starts_with(Self::REPLACEMENT) {
-                index += Self::REPLACEMENT.len();
-                continue;
-            }
             if bytes[index] == b'"' {
                 let decoded = decode_json_string(value, index + 1);
                 assert!(
                     !serialized_json || decoded.closed,
                     "serde_json 必须只生成闭合的 JSON string token"
                 );
-                for source in decoded.api_key_source_ranges(api_key) {
-                    output.push_str(&value[copied_until..source.start]);
-                    output.push_str(Self::REPLACEMENT);
-                    copied_until = source.end;
-                }
+                replacements.extend(decoded.api_key_source_ranges(api_key));
                 index = decoded.next_index;
                 continue;
             }
-            if !serialized_json && remaining.starts_with(api_key) {
-                output.push_str(&value[copied_until..index]);
-                output.push_str(Self::REPLACEMENT);
-                index += api_key.len();
-                copied_until = index;
-                continue;
-            }
-            index += remaining
+            index += value[index..]
                 .chars()
                 .next()
                 .expect("非空 UTF-8 后缀必须包含字符")
                 .len_utf8();
         }
-        output.push_str(&value[copied_until..]);
-        output
+        Self::replace_source_ranges(value, Self::merge_source_ranges(replacements))
     }
 
     fn replace_literal(value: &str, needle: &str) -> String {
@@ -407,27 +430,29 @@ impl ApiKeyRedactor {
     }
 
     fn literal_source_ranges(value: &str, needle: &str) -> Vec<DecodedSourceRange> {
-        let mut replacements = Vec::new();
-        let mut index = 0usize;
-        while index < value.len() {
-            let remaining = &value[index..];
-            if remaining.starts_with(Self::REPLACEMENT) {
-                index += Self::REPLACEMENT.len();
-            } else if remaining.starts_with(needle) {
-                replacements.push(DecodedSourceRange {
-                    start: index,
-                    end: index + needle.len(),
-                });
-                index += needle.len();
-            } else {
-                index += remaining
-                    .chars()
-                    .next()
-                    .expect("非空 UTF-8 后缀必须包含字符")
-                    .len_utf8();
-            }
-        }
-        replacements
+        let mut replacement_ranges = value
+            .match_indices(Self::REPLACEMENT)
+            .map(|(start, replacement)| start..start + replacement.len())
+            .peekable();
+        value
+            .match_indices(needle)
+            .filter_map(|(start, matched)| {
+                let end = start + matched.len();
+                while replacement_ranges
+                    .peek()
+                    .is_some_and(|replacement| replacement.end <= start)
+                {
+                    replacement_ranges.next();
+                }
+                if replacement_ranges
+                    .peek()
+                    .is_some_and(|replacement| start >= replacement.start && end <= replacement.end)
+                {
+                    return None;
+                }
+                Some(DecodedSourceRange { start, end })
+            })
+            .collect()
     }
 
     fn merge_source_ranges(mut replacements: Vec<DecodedSourceRange>) -> Vec<DecodedSourceRange> {
@@ -464,36 +489,92 @@ struct DecodedSourceRange {
     end: usize,
 }
 
-struct DecodedJsonString {
+struct DecodedJsonString<'a> {
+    source: &'a str,
+    content_start: usize,
+    content_end: usize,
     decoded: String,
-    source_by_decoded_byte: Vec<DecodedSourceRange>,
     next_index: usize,
     closed: bool,
 }
 
-impl DecodedJsonString {
+impl DecodedJsonString<'_> {
     fn api_key_source_ranges(&self, api_key: &str) -> Vec<DecodedSourceRange> {
-        let replacement_ranges = self
+        let mut replacement_ranges = self
             .decoded
             .match_indices(ApiKeyRedactor::REPLACEMENT)
             .map(|(start, replacement)| start..start + replacement.len())
-            .collect::<Vec<_>>();
-        self.decoded
-            .match_indices(api_key)
-            .filter_map(|(start, matched)| {
-                let end = start + matched.len();
-                if replacement_ranges
-                    .iter()
-                    .any(|replacement| start >= replacement.start && end <= replacement.end)
-                {
-                    return None;
-                }
-                Some(DecodedSourceRange {
-                    start: self.source_by_decoded_byte[start].start,
-                    end: self.source_by_decoded_byte[end - 1].end,
+            .peekable();
+        let decoded_ranges =
+            self.decoded
+                .match_indices(api_key)
+                .filter_map(|(start, matched)| {
+                    let end = start + matched.len();
+                    while replacement_ranges
+                        .peek()
+                        .is_some_and(|replacement| replacement.end <= start)
+                    {
+                        replacement_ranges.next();
+                    }
+                    if replacement_ranges.peek().is_some_and(|replacement| {
+                        start >= replacement.start && end <= replacement.end
+                    }) {
+                        return None;
+                    }
+                    Some(DecodedSourceRange { start, end })
                 })
-            })
-            .collect()
+                .collect::<Vec<_>>();
+        self.map_decoded_ranges_to_source(&decoded_ranges)
+    }
+
+    fn map_decoded_ranges_to_source(
+        &self,
+        decoded_ranges: &[DecodedSourceRange],
+    ) -> Vec<DecodedSourceRange> {
+        let mut source_ranges = Vec::with_capacity(decoded_ranges.len());
+        let mut range_index = 0usize;
+        let mut decoded_index = 0usize;
+        let mut source_index = self.content_start;
+        let mut current_source_start = None;
+
+        while source_index < self.content_end && range_index < decoded_ranges.len() {
+            let target = decoded_ranges[range_index];
+            if decoded_index == target.start {
+                current_source_start = Some(source_index);
+            }
+
+            let (decoded_char, source_end) = decode_json_character(self.source, source_index);
+            let decoded_end = decoded_index + decoded_char.len_utf8();
+            if decoded_index < target.start {
+                assert!(
+                    decoded_end <= target.start,
+                    "decoded JSON match 必须从字符边界开始"
+                );
+            } else if decoded_end == target.end {
+                source_ranges.push(DecodedSourceRange {
+                    start: current_source_start
+                        .take()
+                        .expect("decoded JSON match 必须记录源起点"),
+                    end: source_end,
+                });
+                range_index += 1;
+            } else {
+                assert!(
+                    decoded_end < target.end,
+                    "decoded JSON match 必须在字符边界结束"
+                );
+            }
+
+            decoded_index = decoded_end;
+            source_index = source_end;
+        }
+
+        assert_eq!(
+            range_index,
+            decoded_ranges.len(),
+            "每个 decoded JSON match 都必须映射回原始输入"
+        );
+        source_ranges
     }
 }
 
@@ -506,24 +587,75 @@ impl DecodedQueryComponent {
     fn api_key_source_ranges(&self, api_key: &str) -> Vec<DecodedSourceRange> {
         let api_key = api_key.as_bytes();
         let replacement = ApiKeyRedactor::REPLACEMENT.as_bytes();
+        let replacement_ranges = overlapping_byte_match_starts(&self.decoded, replacement)
+            .into_iter()
+            .map(|start| start..start + replacement.len())
+            .collect::<Vec<_>>();
         let mut replacements = Vec::new();
-        let mut index = 0usize;
-        while index < self.decoded.len() {
-            let remaining = &self.decoded[index..];
-            if remaining.starts_with(replacement) {
-                index += replacement.len();
-            } else if remaining.starts_with(api_key) {
-                replacements.push(DecodedSourceRange {
-                    start: self.source_by_decoded_byte[index].start,
-                    end: self.source_by_decoded_byte[index + api_key.len() - 1].end,
-                });
-                index += api_key.len();
-            } else {
-                index += 1;
+        let mut replacement_index = 0usize;
+        let mut accepted_until = 0usize;
+        for index in overlapping_byte_match_starts(&self.decoded, api_key) {
+            if index < accepted_until {
+                continue;
             }
+            while replacement_ranges
+                .get(replacement_index)
+                .is_some_and(|replacement| replacement.end <= index)
+            {
+                replacement_index += 1;
+            }
+            let match_end = index.saturating_add(api_key.len());
+            let wholly_inside_replacement =
+                replacement_ranges
+                    .get(replacement_index)
+                    .is_some_and(|replacement| {
+                        index >= replacement.start && match_end <= replacement.end
+                    });
+            if wholly_inside_replacement {
+                continue;
+            }
+            replacements.push(DecodedSourceRange {
+                start: self.source_by_decoded_byte[index].start,
+                end: self.source_by_decoded_byte[match_end - 1].end,
+            });
+            accepted_until = match_end;
         }
         replacements
     }
+}
+
+fn overlapping_byte_match_starts(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return Vec::new();
+    }
+
+    let mut prefix_lengths = vec![0usize; needle.len()];
+    let mut matched = 0usize;
+    for index in 1..needle.len() {
+        while matched > 0 && needle[index] != needle[matched] {
+            matched = prefix_lengths[matched - 1];
+        }
+        if needle[index] == needle[matched] {
+            matched += 1;
+        }
+        prefix_lengths[index] = matched;
+    }
+
+    let mut starts = Vec::new();
+    matched = 0;
+    for (index, byte) in haystack.iter().copied().enumerate() {
+        while matched > 0 && byte != needle[matched] {
+            matched = prefix_lengths[matched - 1];
+        }
+        if byte == needle[matched] {
+            matched += 1;
+        }
+        if matched == needle.len() {
+            starts.push(index + 1 - needle.len());
+            matched = prefix_lengths[matched - 1];
+        }
+    }
+    starts
 }
 
 /// 在 path 或 fragment 区间内按原始分隔符切段并对段内容做解码感知匹配。
@@ -613,71 +745,48 @@ fn decode_url_component(
     }
 }
 
-fn decode_json_string(value: &str, content_start: usize) -> DecodedJsonString {
+fn decode_json_string(value: &str, content_start: usize) -> DecodedJsonString<'_> {
     let bytes = value.as_bytes();
     let mut decoded = String::new();
-    let mut source_by_decoded_byte = Vec::new();
     let mut index = content_start;
     while index < bytes.len() {
         if bytes[index] == b'"' {
             return DecodedJsonString {
+                source: value,
+                content_start,
+                content_end: index,
                 decoded,
-                source_by_decoded_byte,
                 next_index: index + 1,
                 closed: true,
             };
         }
-        if bytes[index] == b'\\'
-            && let Some((decoded_char, source_end)) = decode_json_escape(bytes, index)
-        {
-            push_decoded_char(
-                &mut decoded,
-                &mut source_by_decoded_byte,
-                decoded_char,
-                DecodedSourceRange {
-                    start: index,
-                    end: source_end,
-                },
-            );
-            index = source_end;
-            continue;
-        }
-
-        let decoded_char = value[index..]
-            .chars()
-            .next()
-            .expect("非空 UTF-8 后缀必须包含字符");
-        let source_end = index + decoded_char.len_utf8();
-        push_decoded_char(
-            &mut decoded,
-            &mut source_by_decoded_byte,
-            decoded_char,
-            DecodedSourceRange {
-                start: index,
-                end: source_end,
-            },
-        );
+        let (decoded_char, source_end) = decode_json_character(value, index);
+        decoded.push(decoded_char);
         index = source_end;
     }
     DecodedJsonString {
+        source: value,
+        content_start,
+        content_end: value.len(),
         decoded,
-        source_by_decoded_byte,
         next_index: value.len(),
         closed: false,
     }
 }
 
-fn push_decoded_char(
-    decoded: &mut String,
-    source_by_decoded_byte: &mut Vec<DecodedSourceRange>,
-    decoded_char: char,
-    source: DecodedSourceRange,
-) {
-    decoded.push(decoded_char);
-    source_by_decoded_byte.resize(
-        source_by_decoded_byte.len() + decoded_char.len_utf8(),
-        source,
-    );
+fn decode_json_character(value: &str, index: usize) -> (char, usize) {
+    let bytes = value.as_bytes();
+    if bytes[index] == b'\\'
+        && let Some(decoded) = decode_json_escape(bytes, index)
+    {
+        return decoded;
+    }
+
+    let decoded_char = value[index..]
+        .chars()
+        .next()
+        .expect("非空 UTF-8 后缀必须包含字符");
+    (decoded_char, index + decoded_char.len_utf8())
 }
 
 fn decode_json_escape(bytes: &[u8], slash: usize) -> Option<(char, usize)> {
@@ -758,24 +867,39 @@ impl fmt::Debug for ApiKeyRedactor {
 /// 专用替换器中，字段本身永远不会进入任务文档。
 #[derive(Clone)]
 pub(crate) struct LlmClientRecordMetadata {
-    endpoint: String,
-    model: String,
-    parameters: Map<String, Value>,
-    api_key_redactor: ApiKeyRedactor,
+    endpoint: Arc<str>,
+    model: Arc<str>,
+    parameters: Arc<Map<String, Value>>,
+    api_key_redactor: Arc<ApiKeyRedactor>,
 }
 
 impl LlmClientRecordMetadata {
+    #[cfg(test)]
     pub(crate) fn new(
         endpoint: String,
         model: String,
         parameters: Map<String, Value>,
         api_key_redactor: ApiKeyRedactor,
     ) -> Self {
+        Self::from_shared(
+            endpoint,
+            Arc::from(model),
+            Arc::new(parameters),
+            Arc::new(api_key_redactor),
+        )
+    }
+
+    pub(crate) fn from_shared(
+        endpoint: String,
+        model: Arc<str>,
+        parameters: Arc<Map<String, Value>>,
+        api_key_redactor: Arc<ApiKeyRedactor>,
+    ) -> Self {
         let endpoint = api_key_redactor.redact_url(&endpoint);
         let model = api_key_redactor.redact(&model);
         Self {
-            endpoint,
-            model,
+            endpoint: Arc::from(endpoint),
+            model: Arc::from(model),
             parameters,
             api_key_redactor,
         }
@@ -790,11 +914,11 @@ impl LlmClientRecordMetadata {
     }
 
     pub(crate) fn parameters(&self) -> &Map<String, Value> {
-        &self.parameters
+        self.parameters.as_ref()
     }
 
-    pub(crate) const fn api_key_redactor(&self) -> &ApiKeyRedactor {
-        &self.api_key_redactor
+    pub(crate) fn api_key_redactor(&self) -> &ApiKeyRedactor {
+        self.api_key_redactor.as_ref()
     }
 }
 
@@ -802,7 +926,7 @@ impl fmt::Debug for LlmClientRecordMetadata {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let parameters = self
             .api_key_redactor
-            .redact_json(&self.parameters)
+            .redact_json(self.parameters.as_ref())
             .expect("受信 LLM Client 参数必须能够序列化");
         formatter
             .debug_struct("LlmClientRecordMetadata")
@@ -1123,6 +1247,75 @@ mod tests {
     }
 
     #[test]
+    fn wide_json_string_maps_an_escaped_key_to_its_exact_source_interval() {
+        const API_KEY: &str = "a\"\\😀z";
+        const PADDING_LEN: usize = 1 << 20;
+        let redactor = ApiKeyRedactor::new(SecretString::from(API_KEY));
+        let padding = "x".repeat(PADDING_LEN);
+        let serialized = format!(r#"{{"value":"{padding}\u0061\"\\\uD83D\uDE00\u007A{padding}"}}"#);
+        let expected = format!(
+            r#"{{"value":"{padding}{}{padding}"}}"#,
+            ApiKeyRedactor::REPLACEMENT
+        );
+
+        let redacted = redactor.redact_serialized_json(&serialized);
+
+        assert_eq!(redacted, expected);
+        let reparsed: Value =
+            serde_json::from_str(&redacted).expect("宽字符串替换后必须仍是合法 JSON");
+        assert_eq!(
+            reparsed["value"]
+                .as_str()
+                .expect("value 必须保持为字符串")
+                .len(),
+            PADDING_LEN * 2 + ApiKeyRedactor::REPLACEMENT.len()
+        );
+    }
+
+    #[test]
+    fn arbitrary_text_redaction_also_matches_a_raw_key_starting_with_a_quote() {
+        const API_KEY: &str = "\"secret";
+        let redactor = ApiKeyRedactor::new(SecretString::from(API_KEY));
+        let raw = "prefix \"secret trailing {";
+
+        assert_eq!(
+            redactor.redact_text_with_json_strings(raw),
+            format!("prefix {} trailing {{", ApiKeyRedactor::REPLACEMENT)
+        );
+    }
+
+    #[test]
+    fn markdown_ascii_punctuation_redaction_covers_raw_and_rendered_keys() {
+        const API_KEY: &str = "quote\"slash\\[value]?";
+        let redactor = ApiKeyRedactor::new(SecretString::from(API_KEY));
+        let escaped = API_KEY
+            .chars()
+            .fold(String::new(), |mut output, character| {
+                if character.is_ascii_punctuation() {
+                    output.push('\\');
+                }
+                output.push(character);
+                output
+            });
+        let raw = format!(
+            "raw={API_KEY}; rendered={escaped}; marker={}",
+            ApiKeyRedactor::REPLACEMENT
+        );
+        let expected = format!(
+            "raw={0}; rendered={0}; marker={0}",
+            ApiKeyRedactor::REPLACEMENT
+        );
+
+        let redacted = redactor.redact_text_with_markdown_ascii_punctuation_escaped(&raw);
+        assert_eq!(redacted, expected);
+        assert_eq!(
+            redactor.redact_text_with_markdown_ascii_punctuation_escaped(&redacted),
+            expected,
+            "重复替换不得改写替换标记"
+        );
+    }
+
+    #[test]
     fn short_api_key_does_not_reprocess_existing_or_inserted_replacement() {
         let redactor = ApiKeyRedactor::new(SecretString::from("API"));
         let raw = r#"{"value":"API [REDACTED API KEY] API"#;
@@ -1136,5 +1329,92 @@ mod tests {
             expected,
             "重复替换不得改写替换标记本身"
         );
+    }
+
+    #[test]
+    fn many_json_markers_and_keys_are_redacted_in_one_ordered_scan() {
+        const ITEMS: usize = 4_096;
+        let redactor = ApiKeyRedactor::new(SecretString::from("API"));
+        let values = vec![format!("API {} API", ApiKeyRedactor::REPLACEMENT); ITEMS];
+
+        let redacted = redactor
+            .redact_json(&values)
+            .expect("大量测试字符串应可序列化");
+        assert_eq!(
+            redacted.matches(ApiKeyRedactor::REPLACEMENT).count(),
+            ITEMS * 3
+        );
+        assert_eq!(
+            redactor.redact_text_with_json_strings(&redacted),
+            redacted,
+            "大量既有替换标记必须保持幂等"
+        );
+    }
+
+    #[test]
+    fn api_key_extending_the_replacement_marker_is_still_fully_redacted() {
+        let api_key = format!("{}-secret", ApiKeyRedactor::REPLACEMENT);
+        let redactor = ApiKeyRedactor::new(SecretString::from(api_key.clone()));
+
+        assert_eq!(
+            redactor.redact(&format!("before-{api_key}-after")),
+            format!("before-{}-after", ApiKeyRedactor::REPLACEMENT),
+        );
+        assert_eq!(
+            redactor.redact_text_with_json_strings(&format!("plain={api_key}; json=\"{api_key}\"")),
+            format!("plain={0}; json=\"{0}\"", ApiKeyRedactor::REPLACEMENT),
+        );
+        let redacted_json = redactor
+            .redact_json(&json!([api_key.as_str()]))
+            .expect("测试 JSON 应可序列化");
+        let reparsed: Value =
+            serde_json::from_str(&redacted_json).expect("替换后必须仍是合法 JSON");
+        assert_eq!(reparsed[0], ApiKeyRedactor::REPLACEMENT);
+
+        let mut endpoint = Url::parse("https://example.test/v1").expect("测试 endpoint 应合法");
+        endpoint.query_pairs_mut().append_pair("token", &api_key);
+        assert_eq!(
+            redactor.redact_url(endpoint.as_str()),
+            format!(
+                "https://example.test/v1?token={}",
+                ApiKeyRedactor::REPLACEMENT
+            ),
+        );
+    }
+
+    #[test]
+    fn api_key_starting_inside_the_replacement_marker_and_extending_past_it_is_redacted() {
+        const API_KEY: &str = "KEY]-secret";
+        let redactor = ApiKeyRedactor::new(SecretString::from(API_KEY));
+        let raw = format!("{}-secret", ApiKeyRedactor::REPLACEMENT);
+        let expected = format!("[REDACTED API {}", ApiKeyRedactor::REPLACEMENT);
+
+        assert_eq!(redactor.redact(&raw), expected);
+        assert_eq!(redactor.redact_text_with_json_strings(&raw), expected);
+        assert_eq!(
+            redactor.redact_url("https://example.test/?token=%5BREDACTED+API+KEY%5D-secret"),
+            format!(
+                "https://example.test/?token=%5BREDACTED+API+{}",
+                ApiKeyRedactor::REPLACEMENT
+            ),
+            "percent 解码后的匹配即使从既有 marker 内开始，也不能漏掉越界后缀"
+        );
+    }
+
+    #[test]
+    fn url_redaction_handles_a_degenerate_long_key_and_component_linearly() {
+        const KEY_PREFIX_LEN: usize = 32 * 1024;
+        const COMPONENT_LEN: usize = 256 * 1024;
+        let api_key = format!("{}b", "a".repeat(KEY_PREFIX_LEN));
+        let redactor = ApiKeyRedactor::new(SecretString::from(api_key));
+        let component = "a".repeat(COMPONENT_LEN);
+        let endpoint = format!("https://example.test/?token={component}%62");
+        let expected = format!(
+            "https://example.test/?token={}{}",
+            "a".repeat(COMPONENT_LEN - KEY_PREFIX_LEN),
+            ApiKeyRedactor::REPLACEMENT
+        );
+
+        assert_eq!(redactor.redact_url(&endpoint), expected);
     }
 }

@@ -4,24 +4,25 @@
 //! 统一的 RunId 目录、文件命名、并发写入、敏感值处理和非致命写入诊断。
 
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
-use serde_json::Value;
 use time::OffsetDateTime;
 
 use crate::diagnostic::{
     DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
     DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
 };
+use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::execution::llm_request::{
     LlmRequestAttemptOutcome, LlmRequestAttemptRecord, LlmRequestRetryWaitRecord,
 };
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
 use crate::json_diagnostic::JsonErrorCategory;
 use crate::llm::{ApiKeyRedactor, LlmClientRecordMetadata};
+use crate::runtime::cpu::{CpuExecutorUnavailable, RayonCpuExecutor};
 use crate::runtime::filesystem::SystemFileSystem;
 use crate::runtime::project_log::ProjectLogger;
 
@@ -80,13 +81,14 @@ struct PendingTranslationTaskRecords {
     documents: Vec<Box<dyn TranslationTaskRecordArtifact>>,
 }
 
-/// 生产 Markdown sink；文件故障只并入项目日志健康状态。
+/// 生产 Markdown sink；渲染与文件故障只并入项目日志健康状态。
 #[derive(Clone)]
 pub(crate) struct MarkdownTranslationTaskRecordSink {
     directory: PathBuf,
     run_id: String,
     client: LlmClientRecordMetadata,
     locale: UiLocale,
+    cpu: RayonCpuExecutor,
     file_system: SystemFileSystem,
     warnings: ProjectLogger,
     pending: Arc<Mutex<PendingTranslationTaskRecords>>,
@@ -98,6 +100,7 @@ impl MarkdownTranslationTaskRecordSink {
         run_id: String,
         client: LlmClientRecordMetadata,
         locale: UiLocale,
+        cpu: RayonCpuExecutor,
         file_system: SystemFileSystem,
         warnings: ProjectLogger,
     ) -> Self {
@@ -106,6 +109,7 @@ impl MarkdownTranslationTaskRecordSink {
             run_id,
             client,
             locale,
+            cpu,
             file_system,
             warnings,
             pending: Arc::new(Mutex::new(PendingTranslationTaskRecords::default())),
@@ -117,7 +121,10 @@ impl MarkdownTranslationTaskRecordSink {
             .pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        pending.total_tasks = pending.total_tasks.max(document.total_tasks());
+        pending.total_tasks = pending
+            .total_tasks
+            .max(document.total_tasks())
+            .max(document.task_index().saturating_add(1));
         pending.documents.push(Box::new(document));
     }
 
@@ -129,20 +136,18 @@ impl MarkdownTranslationTaskRecordSink {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             std::mem::take(&mut *pending)
         };
-        let total_tasks =
-            pending
-                .documents
-                .iter()
-                .fold(pending.total_tasks, |total_tasks, document| {
-                    total_tasks
-                        .max(document.total_tasks())
-                        .max(document.task_index().saturating_add(1))
-                });
+        let total_tasks = pending.total_tasks;
         let mut writes = FuturesUnordered::new();
-        for document in pending.documents {
+        let mut documents = pending.documents.into_iter();
+        // 窗口限制的是同时存在的 render+write Future，不限制本轮文档总量。
+        for document in documents.by_ref().take(self.cpu.parallelism().get()) {
             writes.push(self.write(document, total_tasks));
         }
-        while writes.next().await.is_some() {}
+        while writes.next().await.is_some() {
+            if let Some(document) = documents.next() {
+                writes.push(self.write(document, total_tasks));
+            }
+        }
         if let Err(error) = self.file_system.shutdown().await {
             let redactor = self.client.api_key_redactor();
             let diagnostics = error
@@ -164,10 +169,16 @@ impl MarkdownTranslationTaskRecordSink {
             "task-{:06}.md",
             document.task_index().saturating_add(1)
         ));
-        let markdown = document.render(&self.run_id, &self.client, self.locale, total_tasks);
+        let run_id = self.run_id.clone();
+        let client = self.client.clone();
+        let locale = self.locale;
+        let markdown = self
+            .cpu
+            .execute(move || document.render(&run_id, &client, locale, total_tasks))
+            .await;
         let markdown = match markdown {
-            Ok(markdown) => markdown,
-            Err(error) => {
+            Ok(Ok(markdown)) => markdown,
+            Ok(Err(error)) => {
                 let path = self
                     .client
                     .api_key_redactor()
@@ -191,6 +202,15 @@ impl MarkdownTranslationTaskRecordSink {
                     )
                     .with_recovery(RecoveryFact::path(&path)),
                 );
+                return;
+            }
+            Err(error) => {
+                self.warnings
+                    .record_task_record_failure(task_record_render_cpu_failure(
+                        &error,
+                        &path,
+                        &self.client,
+                    ));
                 return;
             }
         };
@@ -218,6 +238,23 @@ impl MarkdownTranslationTaskRecordSink {
             self.warnings.record_task_record_failures(diagnostics);
         }
     }
+}
+
+fn task_record_render_cpu_failure(
+    source: &CpuTaskExecutionError<CpuExecutorUnavailable>,
+    path: &Path,
+    client: &LlmClientRecordMetadata,
+) -> SafeDiagnostic {
+    let redactor = client.api_key_redactor();
+    let path = redactor.redact(&path.to_string_lossy());
+    source
+        .safe_diagnostic_source(
+            DiagnosticStage::Logging,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::Retry,
+        )
+        .map_dynamic_text(|value| redactor.redact(value))
+        .with_recovery(RecoveryFact::path(path))
 }
 
 /// 按任务记录本地化规则渲染一次共享 LLM attempt。
@@ -498,5 +535,367 @@ pub(crate) fn render_client_parameters(
 ) -> Result<String, serde_json::Error> {
     client
         .api_key_redactor()
-        .redact_json_pretty(&Value::Object(client.parameters().clone()))
+        .redact_json_pretty(client.parameters())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::thread::ThreadId;
+
+    use secrecy::SecretString;
+    use serde_json::Map;
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::runtime::cpu::CpuExecutorConfig;
+    use crate::runtime::filesystem::SystemFileSystemConfig;
+    use crate::runtime::project_log::start_project_log;
+
+    fn client() -> LlmClientRecordMetadata {
+        LlmClientRecordMetadata::new(
+            "https://example.test".to_owned(),
+            "model".to_owned(),
+            Map::new(),
+            ApiKeyRedactor::new(SecretString::from("unused-key")),
+        )
+    }
+
+    fn cpu(worker_threads: usize) -> RayonCpuExecutor {
+        RayonCpuExecutor::start(CpuExecutorConfig::fixed(
+            NonZeroUsize::new(worker_threads).expect("测试 CPU worker 数必须非零"),
+        ))
+        .expect("测试 CPU 根应可启动")
+    }
+
+    struct ThreadRecordingArtifact {
+        rendered_on: Arc<Mutex<Option<ThreadId>>>,
+    }
+
+    impl TranslationTaskRecordArtifact for ThreadRecordingArtifact {
+        fn task_index(&self) -> usize {
+            0
+        }
+
+        fn total_tasks(&self) -> usize {
+            1
+        }
+
+        fn render(
+            &self,
+            _run_id: &str,
+            _client: &LlmClientRecordMetadata,
+            _locale: UiLocale,
+            _total_tasks: usize,
+        ) -> Result<String, serde_json::Error> {
+            *self
+                .rendered_on
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(std::thread::current().id());
+            Ok("# rendered\n".to_owned())
+        }
+    }
+
+    struct PanickingArtifact;
+
+    impl TranslationTaskRecordArtifact for PanickingArtifact {
+        fn task_index(&self) -> usize {
+            0
+        }
+
+        fn total_tasks(&self) -> usize {
+            1
+        }
+
+        fn render(
+            &self,
+            _run_id: &str,
+            _client: &LlmClientRecordMetadata,
+            _locale: UiLocale,
+            _total_tasks: usize,
+        ) -> Result<String, serde_json::Error> {
+            panic!("测试任务记录渲染 panic")
+        }
+    }
+
+    #[derive(Default)]
+    struct InFlightTracker {
+        active: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    impl InFlightTracker {
+        fn enter(&self) {
+            let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+            self.peak.fetch_max(active, Ordering::AcqRel);
+        }
+
+        fn leave(&self) {
+            let previous = self.active.fetch_sub(1, Ordering::AcqRel);
+            assert!(previous > 0, "测试 in-flight 计数不得下溢");
+        }
+    }
+
+    #[derive(Default)]
+    struct RenderGate {
+        open: Mutex<bool>,
+        changed: Condvar,
+    }
+
+    impl RenderGate {
+        fn wait(&self) {
+            let mut open = self
+                .open
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*open {
+                open = self
+                    .changed
+                    .wait(open)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+
+        fn release(&self) {
+            *self
+                .open
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            self.changed.notify_all();
+        }
+    }
+
+    struct WindowArtifact {
+        index: usize,
+        total_tasks: usize,
+        task_index_calls: AtomicUsize,
+        admitted: AtomicBool,
+        tracker: Arc<InFlightTracker>,
+        gate: Arc<RenderGate>,
+    }
+
+    impl TranslationTaskRecordArtifact for WindowArtifact {
+        fn task_index(&self) -> usize {
+            let previous_calls = self.task_index_calls.fetch_add(1, Ordering::AcqRel);
+            if previous_calls > 0 && !self.admitted.swap(true, Ordering::AcqRel) {
+                self.tracker.enter();
+            }
+            self.index
+        }
+
+        fn total_tasks(&self) -> usize {
+            self.total_tasks
+        }
+
+        fn render(
+            &self,
+            _run_id: &str,
+            _client: &LlmClientRecordMetadata,
+            _locale: UiLocale,
+            _total_tasks: usize,
+        ) -> Result<String, serde_json::Error> {
+            self.gate.wait();
+            Ok(format!("# task {}\n", self.index + 1))
+        }
+    }
+
+    impl Drop for WindowArtifact {
+        fn drop(&mut self) {
+            if self.admitted.load(Ordering::Acquire) {
+                self.tracker.leave();
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn render_runs_on_the_cpu_pool_instead_of_the_async_calling_thread() {
+        let temporary = tempdir().expect("应建立临时目录");
+        let record_directory = temporary.path().join("task-records");
+        std::fs::create_dir_all(&record_directory).expect("应建立任务记录目录");
+        let file_system = SystemFileSystem::new(SystemFileSystemConfig::production())
+            .expect("文件系统执行根应可建立");
+        let cpu = cpu(1);
+        let log_runtime =
+            start_project_log(temporary.path().join("logs"), "render-thread".to_owned());
+        let logger = log_runtime.logger();
+        let rendered_on = Arc::new(Mutex::new(None));
+        let calling_thread = std::thread::current().id();
+        let sink = MarkdownTranslationTaskRecordSink::new(
+            record_directory.clone(),
+            "render-thread".to_owned(),
+            client(),
+            UiLocale::SimplifiedChinese,
+            cpu.clone(),
+            file_system,
+            logger,
+        );
+        sink.submit(ThreadRecordingArtifact {
+            rendered_on: Arc::clone(&rendered_on),
+        });
+
+        sink.finish().await;
+
+        let rendered_thread = rendered_on
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("任务记录 render 应实际执行");
+        assert_ne!(
+            rendered_thread, calling_thread,
+            "任务记录 render 不能占用 async 调用线程"
+        );
+        assert_eq!(
+            std::fs::read_to_string(record_directory.join("task-000001.md"))
+                .expect("应写入渲染结果"),
+            "# rendered\n"
+        );
+        cpu.shutdown().expect("测试 CPU 根应可关闭");
+        drop(log_runtime);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cpu_render_failure_is_logged_without_creating_a_record_file() {
+        let temporary = tempdir().expect("应建立临时目录");
+        let record_directory = temporary.path().join("task-records");
+        std::fs::create_dir_all(&record_directory).expect("应建立任务记录目录");
+        let file_system = SystemFileSystem::new(SystemFileSystemConfig::production())
+            .expect("文件系统执行根应可建立");
+        let cpu = cpu(1);
+        let log_runtime =
+            start_project_log(temporary.path().join("logs"), "render-panic".to_owned());
+        let logger = log_runtime.logger();
+        let sink = MarkdownTranslationTaskRecordSink::new(
+            record_directory.clone(),
+            "render-panic".to_owned(),
+            client(),
+            UiLocale::SimplifiedChinese,
+            cpu.clone(),
+            file_system,
+            logger.clone(),
+        );
+        sink.submit(PanickingArtifact);
+
+        sink.finish().await;
+
+        assert!(!record_directory.join("task-000001.md").exists());
+        assert_eq!(logger.health().task_record_failures, 1);
+        let diagnostic = logger
+            .take_warning()
+            .and_then(|warning| warning.task_records)
+            .and_then(|warning| warning.diagnostic)
+            .expect("CPU render 失败应留下任务记录诊断");
+        assert_eq!(diagnostic.code, DiagnosticCode::InternalOperation);
+        assert_eq!(diagnostic.stage, DiagnosticStage::Logging);
+        assert_eq!(
+            diagnostic.reason,
+            DiagnosticReason::failure(DiagnosticFailureKind::WorkerPanicked)
+        );
+        assert_eq!(diagnostic.impact, DiagnosticImpact::Unchanged);
+        assert_eq!(diagnostic.action, DiagnosticAction::ReportBug);
+        cpu.shutdown().expect("测试 CPU 根应可关闭");
+        drop(log_runtime);
+    }
+
+    #[test]
+    fn cpu_render_failures_keep_their_specific_logging_diagnostics() {
+        let path = PathBuf::from("task-000001.md");
+        let client = client();
+        let cases = [
+            (
+                CpuTaskExecutionError::Cancelled,
+                DiagnosticFailureKind::LockCancelled,
+                DiagnosticAction::Retry,
+            ),
+            (
+                CpuTaskExecutionError::Unavailable(CpuExecutorUnavailable::ShuttingDown),
+                DiagnosticFailureKind::ExecutorClosed,
+                DiagnosticAction::Retry,
+            ),
+            (
+                CpuTaskExecutionError::TaskPanicked,
+                DiagnosticFailureKind::WorkerPanicked,
+                DiagnosticAction::ReportBug,
+            ),
+        ];
+        for (source, failure, action) in cases {
+            let diagnostic = task_record_render_cpu_failure(&source, &path, &client);
+            assert_eq!(diagnostic.code, DiagnosticCode::InternalOperation);
+            assert_eq!(diagnostic.stage, DiagnosticStage::Logging);
+            assert_eq!(diagnostic.reason, DiagnosticReason::failure(failure));
+            assert_eq!(diagnostic.impact, DiagnosticImpact::Unchanged);
+            assert_eq!(diagnostic.action, action);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn many_documents_keep_only_cpu_parallelism_writes_in_flight() {
+        const WORKERS: usize = 2;
+        const DOCUMENTS: usize = 5;
+
+        let temporary = tempdir().expect("应建立临时目录");
+        let record_directory = temporary.path().join("task-records");
+        std::fs::create_dir_all(&record_directory).expect("应建立任务记录目录");
+        let file_system = SystemFileSystem::new(SystemFileSystemConfig::production())
+            .expect("文件系统执行根应可建立");
+        let cpu = cpu(WORKERS);
+        assert_eq!(cpu.parallelism().get(), WORKERS);
+        let log_runtime =
+            start_project_log(temporary.path().join("logs"), "bounded-window".to_owned());
+        let logger = log_runtime.logger();
+        let sink = MarkdownTranslationTaskRecordSink::new(
+            record_directory.clone(),
+            "bounded-window".to_owned(),
+            client(),
+            UiLocale::SimplifiedChinese,
+            cpu.clone(),
+            file_system,
+            logger.clone(),
+        );
+        let tracker = Arc::new(InFlightTracker::default());
+        let gate = Arc::new(RenderGate::default());
+        for index in 0..DOCUMENTS {
+            sink.submit(WindowArtifact {
+                index,
+                total_tasks: DOCUMENTS,
+                task_index_calls: AtomicUsize::new(0),
+                admitted: AtomicBool::new(false),
+                tracker: Arc::clone(&tracker),
+                gate: Arc::clone(&gate),
+            });
+        }
+
+        let observe_window = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while tracker.active.load(Ordering::Acquire) < WORKERS {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("首个任务记录窗口应及时开始");
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                tracker.peak.load(Ordering::Acquire),
+                WORKERS,
+                "等待 CPU 的任务记录 Future 不得按文档总量建立"
+            );
+            gate.release();
+        };
+        tokio::join!(sink.finish(), observe_window);
+
+        assert_eq!(tracker.active.load(Ordering::Acquire), 0);
+        assert_eq!(
+            std::fs::read_dir(&record_directory)
+                .expect("应读取任务记录目录")
+                .count(),
+            DOCUMENTS
+        );
+        assert_eq!(logger.health().task_record_failures, 0);
+        cpu.shutdown().expect("测试 CPU 根应可关闭");
+        drop(log_runtime);
+    }
 }

@@ -1,5 +1,9 @@
 //! RPG Maker 对公共 Placeholder 算法的 scope 与内置控制符适配。
 
+#[cfg(test)]
+use std::convert::Infallible;
+use std::sync::Arc;
+
 use crate::rpg_maker::RpgMakerEngine;
 use crate::rpg_maker::text::TextGroupKind;
 use crate::translation::placeholder::{CompiledBuiltinPlaceholderRule, PlaceholderService};
@@ -15,30 +19,47 @@ const MZ_BUILTIN_CONTROL_PATTERN: &str =
 const BUILTIN_SEMANTIC_LABEL: &str = "RPG_MAKER_CONTROL";
 
 /// RPG Maker 的封闭 scope 与 MV/MZ 内置控制符入口。
+#[derive(Clone)]
 pub(crate) struct Pcre2PlaceholderService {
     common: PlaceholderService,
-    mv_builtin: CompiledBuiltinPlaceholderRule,
-    mz_builtin: CompiledBuiltinPlaceholderRule,
-}
-
-impl Clone for Pcre2PlaceholderService {
-    fn clone(&self) -> Self {
-        Self::new().expect("进程已成功编译过固定 RPG Maker 内置 Placeholder")
-    }
+    mv_builtin: Arc<CompiledBuiltinPlaceholderRule>,
+    mz_builtin: Arc<CompiledBuiltinPlaceholderRule>,
 }
 
 impl Pcre2PlaceholderService {
+    #[cfg(test)]
     pub(crate) fn new() -> Result<Self, Pcre2PlaceholderConstructionError> {
-        let common = PlaceholderService;
-        Ok(Self {
-            mv_builtin: common
-                .compile_builtin(MV_BUILTIN_CONTROL_PATTERN, BUILTIN_SEMANTIC_LABEL)?,
-            mz_builtin: common
-                .compile_builtin(MZ_BUILTIN_CONTROL_PATTERN, BUILTIN_SEMANTIC_LABEL)?,
-            common,
-        })
+        match Self::new_with_cancellation(|| Ok::<_, Infallible>(())) {
+            Ok(result) => result,
+            Err(unreachable) => match unreachable {},
+        }
     }
 
+    pub(crate) fn new_with_cancellation<E>(
+        mut ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Result<Self, Pcre2PlaceholderConstructionError>, E> {
+        ensure_running()?;
+        let common = PlaceholderService;
+        let mv_builtin =
+            match common.compile_builtin(MV_BUILTIN_CONTROL_PATTERN, BUILTIN_SEMANTIC_LABEL) {
+                Ok(rule) => rule,
+                Err(source) => return Ok(Err(source)),
+            };
+        ensure_running()?;
+        let mz_builtin =
+            match common.compile_builtin(MZ_BUILTIN_CONTROL_PATTERN, BUILTIN_SEMANTIC_LABEL) {
+                Ok(rule) => rule,
+                Err(source) => return Ok(Err(source)),
+            };
+        ensure_running()?;
+        Ok(Ok(Self {
+            mv_builtin: Arc::new(mv_builtin),
+            mz_builtin: Arc::new(mz_builtin),
+            common,
+        }))
+    }
+
+    #[cfg(test)]
     pub(crate) fn compile_custom(
         &self,
         definitions: Vec<PlaceholderRuleDefinition>,
@@ -46,6 +67,18 @@ impl Pcre2PlaceholderService {
         self.common.compile_custom(definitions, |scope| {
             TextGroupKind::from_storage_name(scope).is_some()
         })
+    }
+
+    pub(crate) fn compile_custom_with_cancellation<E>(
+        &self,
+        definitions: Vec<PlaceholderRuleDefinition>,
+        ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Result<CompiledPlaceholderRules, PlaceholderRuleCompilationError>, E> {
+        self.common.compile_custom_with_cancellation(
+            definitions,
+            |scope| TextGroupKind::from_storage_name(scope).is_some(),
+            ensure_running,
+        )
     }
 
     #[cfg(test)]
@@ -59,6 +92,7 @@ impl Pcre2PlaceholderService {
         self.protect_with_line_boundaries(engine, kind, original, &[], custom)
     }
 
+    #[cfg(test)]
     pub(crate) fn protect_with_line_boundaries(
         &self,
         engine: RpgMakerEngine,
@@ -67,16 +101,39 @@ impl Pcre2PlaceholderService {
         line_separator_offsets: &[usize],
         custom: &CompiledPlaceholderRules,
     ) -> Result<ProtectedText, PlaceholderProtectionError> {
+        match self.protect_with_line_boundaries_with_cancellation(
+            engine,
+            kind,
+            original,
+            line_separator_offsets,
+            custom,
+            || Ok::<_, Infallible>(()),
+        ) {
+            Ok(result) => result,
+            Err(unreachable) => match unreachable {},
+        }
+    }
+
+    pub(crate) fn protect_with_line_boundaries_with_cancellation<E>(
+        &self,
+        engine: RpgMakerEngine,
+        kind: TextGroupKind,
+        original: &str,
+        line_separator_offsets: &[usize],
+        custom: &CompiledPlaceholderRules,
+        ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Result<ProtectedText, PlaceholderProtectionError>, E> {
         let builtin = match engine {
-            RpgMakerEngine::Mv => &self.mv_builtin,
-            RpgMakerEngine::Mz => &self.mz_builtin,
+            RpgMakerEngine::Mv => self.mv_builtin.as_ref(),
+            RpgMakerEngine::Mz => self.mz_builtin.as_ref(),
         };
-        self.common.protect(
+        self.common.protect_with_cancellation(
             kind.storage_name(),
             original,
             line_separator_offsets,
             custom,
             Some(builtin),
+            ensure_running,
         )
     }
 }
@@ -85,6 +142,27 @@ impl Pcre2PlaceholderService {
 mod tests {
     use super::*;
     use crate::translation::placeholder::{PlaceholderRuleOrigin, PlaceholderSegment};
+
+    #[test]
+    fn clone_shares_compiled_builtin_rules() {
+        let service = Pcre2PlaceholderService::new().expect("固定规则应可编译");
+        let cloned = service.clone();
+
+        assert!(Arc::ptr_eq(&service.mv_builtin, &cloned.mv_builtin));
+        assert!(Arc::ptr_eq(&service.mz_builtin, &cloned.mz_builtin));
+    }
+
+    #[test]
+    fn construction_observes_cancellation_between_builtin_rules() {
+        let mut polls = 0_usize;
+        let result = Pcre2PlaceholderService::new_with_cancellation(|| {
+            polls += 1;
+            if polls >= 2 { Err("cancelled") } else { Ok(()) }
+        });
+
+        assert!(matches!(result, Err("cancelled")));
+        assert_eq!(polls, 2);
+    }
 
     #[test]
     fn rpg_adapter_adds_engine_builtin_and_rejects_generic_scope() {

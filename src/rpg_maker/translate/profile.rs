@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -28,19 +30,48 @@ impl fmt::Debug for RpgMakerSystemPrompt {
 }
 
 impl RpgMakerSystemPrompt {
+    #[cfg(test)]
     pub(crate) fn new(
         language_pair: LanguagePair,
         markdown: String,
         response_envelope: TranslationResponseEnvelope,
     ) -> Result<Self, RpgMakerSystemPromptError> {
-        if markdown.trim().is_empty() {
-            return Err(RpgMakerSystemPromptError::Blank);
+        match Self::new_with_cancellation(language_pair, markdown, response_envelope, || {
+            Ok::<_, Infallible>(())
+        }) {
+            Ok(result) => result,
+            Err(unreachable) => match unreachable {},
         }
-        Ok(Self {
+    }
+
+    pub(crate) fn new_with_cancellation<E>(
+        language_pair: LanguagePair,
+        markdown: String,
+        response_envelope: TranslationResponseEnvelope,
+        mut ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Result<Self, RpgMakerSystemPromptError>, E> {
+        const CANCELLATION_CHECK_CHARACTERS: usize = 16 * 1024;
+
+        ensure_running()?;
+        let mut has_content = false;
+        for (index, character) in markdown.chars().enumerate() {
+            if index.is_multiple_of(CANCELLATION_CHECK_CHARACTERS) {
+                ensure_running()?;
+            }
+            if !character.is_whitespace() {
+                has_content = true;
+                break;
+            }
+        }
+        ensure_running()?;
+        if !has_content {
+            return Ok(Err(RpgMakerSystemPromptError::Blank));
+        }
+        Ok(Ok(Self {
             language_pair,
             markdown,
             response_envelope,
-        })
+        }))
     }
 
     pub(crate) fn language_pair(&self) -> &LanguagePair {

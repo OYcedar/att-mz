@@ -32,10 +32,12 @@ use crate::llm::{
 pub(crate) struct OpenAiChatCompletionClient {
     url: Url,
     api_key: SecretString,
-    model: String,
+    model: Arc<str>,
+    semantic_fingerprint: Sha256Fingerprint,
     max_concurrent_requests: NonZeroUsize,
     request_timeout: Duration,
-    parameters: Map<String, Value>,
+    parameters: Arc<Map<String, Value>>,
+    record_metadata: LlmClientRecordMetadata,
     rate_limiter: Option<Arc<DefaultDirectRateLimiter>>,
 }
 
@@ -54,20 +56,33 @@ impl OpenAiChatCompletionClient {
                 Quota::per_minute(rpm).allow_burst(burst),
             ))
         });
+        let model: String = model.into();
+        let model: Arc<str> = Arc::from(model);
+        let parameters = Arc::new(parameters);
+        let semantic_fingerprint =
+            chat_completions_semantic_fingerprint(&url, model.as_ref(), parameters.as_ref());
+        let record_metadata = LlmClientRecordMetadata::from_shared(
+            url.to_string(),
+            Arc::clone(&model),
+            Arc::clone(&parameters),
+            Arc::new(ApiKeyRedactor::new(api_key.clone())),
+        );
         Self {
             url,
             api_key,
-            model: model.into(),
+            model,
+            semantic_fingerprint,
             max_concurrent_requests,
             request_timeout,
             parameters,
+            record_metadata,
             rate_limiter,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn model(&self) -> &str {
-        &self.model
+        self.model.as_ref()
     }
 
     #[cfg(test)]
@@ -76,34 +91,41 @@ impl OpenAiChatCompletionClient {
     }
 
     pub(crate) fn record_metadata(&self) -> LlmClientRecordMetadata {
-        LlmClientRecordMetadata::new(
-            self.url.to_string(),
-            self.model.clone(),
-            self.parameters.clone(),
-            ApiKeyRedactor::new(self.api_key.clone()),
-        )
+        self.record_metadata.clone()
     }
 }
 
 impl LlmClientSemanticIdentity for OpenAiChatCompletionClient {
     fn semantic_fingerprint(&self) -> Sha256Fingerprint {
-        let canonical_parameters =
-            canonical_json_semantic_bytes(&Value::Object(self.parameters.clone()));
-        let mut hasher = Sha256FramedHasher::new(b"att.llm.chat-completions.semantics");
-        hasher
-            .frame(1, self.url.as_str().as_bytes())
-            .frame(2, self.model.as_bytes())
-            .frame(3, &canonical_parameters);
-        hasher.finish()
+        self.semantic_fingerprint
     }
 }
 
-/// 为翻译语义指纹建立与配置书写形式无关的 JSON 值编码。
+fn chat_completions_semantic_fingerprint(
+    url: &Url,
+    model: &str,
+    parameters: &Map<String, Value>,
+) -> Sha256Fingerprint {
+    let canonical_parameters = canonical_json_object_semantic_bytes(parameters);
+    let mut hasher = Sha256FramedHasher::new(b"att.llm.chat-completions.semantics");
+    hasher
+        .frame(1, url.as_str().as_bytes())
+        .frame(2, model.as_bytes())
+        .frame(3, &canonical_parameters);
+    hasher.finish()
+}
+
+/// 为翻译语义指纹建立与配置书写形式无关的 JSON object 编码。
 ///
 /// 对象键递归排序，数组顺序保持不变；数字按任意精度十进制值规范化，因此
-/// `0.2`、`2e-1` 与 `0.20` 具有同一个语义身份。请求发送仍使用用户提供的值，
-/// 这份编码只服务于失效判断。
-fn canonical_json_semantic_bytes(value: &Value) -> Vec<u8> {
+/// `0.2`、`2e-1` 与 `0.20` 具有同一个语义身份。显式工作栈避免自定义参数的
+/// 合法嵌套深度进入 Rust 调用栈。
+fn canonical_json_object_semantic_bytes(object: &Map<String, Value>) -> Vec<u8> {
+    enum Work<'a> {
+        Value(&'a Value),
+        ObjectEntry(&'a str, &'a Value),
+    }
+
     fn push_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
         output.extend_from_slice(
             &u64::try_from(bytes.len())
@@ -113,53 +135,65 @@ fn canonical_json_semantic_bytes(value: &Value) -> Vec<u8> {
         output.extend_from_slice(bytes);
     }
 
-    fn encode(value: &Value, output: &mut Vec<u8>) {
-        match value {
-            Value::Null => output.push(0),
-            Value::Bool(false) => output.push(1),
-            Value::Bool(true) => output.push(2),
-            Value::Number(number) => {
+    fn push_object<'a>(
+        object: &'a Map<String, Value>,
+        output: &mut Vec<u8>,
+        work: &mut Vec<Work<'a>>,
+    ) {
+        output.push(6);
+        output.extend_from_slice(
+            &u64::try_from(object.len())
+                .expect("x86_64 usize 必须可表示为 u64")
+                .to_be_bytes(),
+        );
+        let mut entries = object.iter().collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|(key, _)| *key);
+        work.extend(
+            entries
+                .into_iter()
+                .rev()
+                .map(|(key, value)| Work::ObjectEntry(key, value)),
+        );
+    }
+
+    let mut output = Vec::new();
+    let mut work = Vec::new();
+    push_object(object, &mut output, &mut work);
+    while let Some(item) = work.pop() {
+        match item {
+            Work::ObjectEntry(key, value) => {
+                push_bytes(&mut output, key.as_bytes());
+                work.push(Work::Value(value));
+            }
+            Work::Value(Value::Null) => output.push(0),
+            Work::Value(Value::Bool(false)) => output.push(1),
+            Work::Value(Value::Bool(true)) => output.push(2),
+            Work::Value(Value::Number(number)) => {
                 output.push(3);
                 let number = CanonicalJsonNumber::parse(&number.to_string());
                 output.push(u8::from(number.negative));
-                push_bytes(output, number.coefficient.as_bytes());
+                push_bytes(&mut output, number.coefficient.as_bytes());
                 output.push(u8::from(number.exponent.negative));
-                push_bytes(output, &number.exponent.magnitude);
+                push_bytes(&mut output, &number.exponent.magnitude);
             }
-            Value::String(value) => {
+            Work::Value(Value::String(value)) => {
                 output.push(4);
-                push_bytes(output, value.as_bytes());
+                push_bytes(&mut output, value.as_bytes());
             }
-            Value::Array(values) => {
+            Work::Value(Value::Array(values)) => {
                 output.push(5);
                 output.extend_from_slice(
                     &u64::try_from(values.len())
                         .expect("x86_64 usize 必须可表示为 u64")
                         .to_be_bytes(),
                 );
-                for value in values {
-                    encode(value, output);
-                }
+                work.extend(values.iter().rev().map(Work::Value));
             }
-            Value::Object(object) => {
-                output.push(6);
-                output.extend_from_slice(
-                    &u64::try_from(object.len())
-                        .expect("x86_64 usize 必须可表示为 u64")
-                        .to_be_bytes(),
-                );
-                let mut keys = object.keys().collect::<Vec<_>>();
-                keys.sort_unstable();
-                for key in keys {
-                    push_bytes(output, key.as_bytes());
-                    encode(&object[key], output);
-                }
+            Work::Value(Value::Object(object)) => {
+                push_object(object, &mut output, &mut work);
             }
         }
     }
-
-    let mut output = Vec::new();
-    encode(value, &mut output);
     output
 }
 
@@ -338,9 +372,9 @@ impl fmt::Debug for OpenAiChatCompletionClient {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let redactor = ApiKeyRedactor::new(self.api_key.clone());
         let endpoint = redactor.redact_url(self.url.as_str());
-        let model = redactor.redact(&self.model);
+        let model = redactor.redact(self.model.as_ref());
         let parameters = redactor
-            .redact_json(&self.parameters)
+            .redact_json(self.parameters.as_ref())
             .expect("已验证的 LLM 自定义参数必须能够序列化");
         formatter
             .debug_struct("OpenAiChatCompletionClient")
@@ -882,10 +916,10 @@ fn serialize_request(
         })
         .collect::<Vec<_>>();
     let wire = ChatCompletionRequestWire {
-        model: &client.model,
+        model: client.model.as_ref(),
         messages,
         stream: false,
-        parameters: &client.parameters,
+        parameters: client.parameters.as_ref(),
     };
     serde_json::to_vec(&wire).map_err(OpenAiChatCompletionError::SerializeRequest)
 }

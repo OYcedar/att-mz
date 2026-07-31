@@ -4,6 +4,8 @@
 //! 并按计划顺序逐项提交。任务可以并发完成，但后续任务绝不能越过前序任务
 //! 写入数据库，因此失败时始终只保留一个确定的成功前缀。
 
+#[cfg(test)]
+use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
@@ -111,7 +113,10 @@ where
 ///
 /// Store 在写入时可以用原文事实防止把旧计划提交到已变化的资产上。
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct TranslationUnitIdentity {
+pub(crate) struct TranslationUnitIdentity(Arc<TranslationUnitIdentityInner>);
+
+#[derive(Debug, Eq, Hash, PartialEq)]
+struct TranslationUnitIdentityInner {
     owner: RpgMakerAssetOwner,
     kind: TextGroupKind,
     logical_location: LogicalTextLocation,
@@ -128,26 +133,26 @@ impl TranslationUnitIdentity {
         source_content: TextUnitContent,
         source_context_json: impl Into<String>,
     ) -> Self {
-        Self {
+        Self(Arc::new(TranslationUnitIdentityInner {
             owner,
             kind,
             logical_location: LogicalTextLocation::new(group_location, role),
             source_content,
             source_context_json: source_context_json.into(),
-        }
+        }))
     }
 
-    pub(crate) const fn owner(&self) -> RpgMakerAssetOwner {
-        self.owner
+    pub(crate) fn owner(&self) -> RpgMakerAssetOwner {
+        self.0.owner
     }
 
     /// 返回语义单元所属的领域组种类。
-    pub(crate) const fn kind(&self) -> TextGroupKind {
-        self.kind
+    pub(crate) fn kind(&self) -> TextGroupKind {
+        self.0.kind
     }
 
     pub(crate) fn role(&self) -> &TextUnitRole {
-        self.logical_location.role()
+        self.0.logical_location.role()
     }
 
     pub(crate) fn role_label(&self) -> String {
@@ -162,15 +167,15 @@ impl TranslationUnitIdentity {
 
     /// 返回译文所属复合语义组的结构化位置。
     pub(crate) fn group_location(&self) -> &RpgMakerLocation {
-        self.logical_location.group_location()
+        self.0.logical_location.group_location()
     }
 
     pub(crate) fn source_content(&self) -> &TextUnitContent {
-        &self.source_content
+        &self.0.source_content
     }
 
     pub(crate) fn source_context_json(&self) -> &str {
-        &self.source_context_json
+        &self.0.source_context_json
     }
 }
 
@@ -880,6 +885,7 @@ impl ExpectedTranslationValidation {
 pub(crate) enum PlaceholderMultisetErrorKind {
     Mismatch,
     Unexpected,
+    OrderMismatch,
 }
 
 impl PlaceholderMultisetErrorKind {
@@ -887,6 +893,7 @@ impl PlaceholderMultisetErrorKind {
         match self {
             Self::Mismatch => "mismatch",
             Self::Unexpected => "unexpected",
+            Self::OrderMismatch => "order_mismatch",
         }
     }
 }
@@ -896,6 +903,7 @@ impl From<&PlaceholderMultisetError> for PlaceholderMultisetErrorKind {
         match source {
             PlaceholderMultisetError::Mismatch { .. } => Self::Mismatch,
             PlaceholderMultisetError::Unexpected { .. } => Self::Unexpected,
+            PlaceholderMultisetError::OrderMismatch { .. } => Self::OrderMismatch,
         }
     }
 }
@@ -1097,6 +1105,7 @@ pub(crate) struct ExpectedTranslationOutput {
 }
 
 impl ExpectedTranslationOutput {
+    #[cfg(test)]
     pub(crate) fn try_new(
         id: usize,
         identity: TranslationUnitIdentity,
@@ -1105,9 +1114,33 @@ impl ExpectedTranslationOutput {
         state_context: TranslationStateContext,
         propagation_state_contexts: Vec<TranslationStateContext>,
     ) -> Result<Self, ExpectedTranslationOutputContractError> {
+        match Self::try_new_with_cancellation(
+            id,
+            identity,
+            propagation_targets,
+            validation,
+            state_context,
+            propagation_state_contexts,
+            || Ok::<_, Infallible>(()),
+        ) {
+            Ok(result) => result,
+            Err(unreachable) => match unreachable {},
+        }
+    }
+
+    pub(crate) fn try_new_with_cancellation<E>(
+        id: usize,
+        identity: TranslationUnitIdentity,
+        propagation_targets: Vec<TranslationUnitIdentity>,
+        validation: ExpectedTranslationValidation,
+        state_context: TranslationStateContext,
+        propagation_state_contexts: Vec<TranslationStateContext>,
+        mut ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Result<Self, ExpectedTranslationOutputContractError>, E> {
+        ensure_running()?;
         assert!(id > 0, "模型输出 ID 必须是正整数");
         if propagation_targets.len() != propagation_state_contexts.len() {
-            return Err(
+            return Ok(Err(
                 ExpectedTranslationOutputContractError::PropagationContextCountMismatch {
                     unit_id: id,
                     target: Box::new(ExpectedTranslationOutputContractTarget::from_identity(
@@ -1116,23 +1149,32 @@ impl ExpectedTranslationOutput {
                     target_count: propagation_targets.len(),
                     context_count: propagation_state_contexts.len(),
                 },
-            );
+            ));
         }
-        let placeholder_bindings = Arc::new(
-            PlaceholderBindingIndex::from_shared(Arc::clone(&validation.applied_placeholders))
-                .map_err(|source| {
+        let placeholder_bindings = match PlaceholderBindingIndex::from_shared_with_cancellation(
+            Arc::clone(&validation.applied_placeholders),
+            &mut ensure_running,
+        )? {
+            Ok(bindings) => Arc::new(bindings),
+            Err(source) => {
+                return Ok(Err(
                     ExpectedTranslationOutputContractError::placeholder_index_invalid(
                         id, &identity, source,
-                    )
-                })?,
-        );
-        validate_expected_translation_output(
+                    ),
+                ));
+            }
+        };
+        if let Err(source) = validate_expected_translation_output_with_cancellation(
             id,
             &identity,
             &validation,
             placeholder_bindings.as_ref(),
-        )?;
-        Ok(Self {
+            &mut ensure_running,
+        )? {
+            return Ok(Err(source));
+        }
+        ensure_running()?;
+        Ok(Ok(Self {
             id,
             identity,
             propagation_targets,
@@ -1140,7 +1182,7 @@ impl ExpectedTranslationOutput {
             placeholder_bindings,
             state_context,
             propagation_state_contexts,
-        })
+        }))
     }
 
     #[cfg(test)]
@@ -1205,58 +1247,66 @@ impl ExpectedTranslationOutput {
     }
 }
 
-fn validate_expected_translation_output(
+fn validate_expected_translation_output_with_cancellation<E>(
     unit_id: usize,
     identity: &TranslationUnitIdentity,
     validation: &ExpectedTranslationValidation,
     placeholder_bindings: &PlaceholderBindingIndex,
-) -> Result<(), ExpectedTranslationOutputContractError> {
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<Result<(), ExpectedTranslationOutputContractError>, E> {
+    ensure_running()?;
     let target = || {
         Box::new(ExpectedTranslationOutputContractTarget::from_identity(
             identity,
         ))
     };
-    let protected_scan = placeholder_bindings.scan(&validation.protected_text);
-    if matches!(identity.source_content(), TextUnitContent::Lines(_))
-        && let Some((placeholder_index, _)) = validation
-            .applied_placeholders
-            .iter()
-            .enumerate()
-            .find(|(_, placeholder)| placeholder.original().contains('\n'))
-    {
-        return Err(
-            ExpectedTranslationOutputContractError::ProtectedPlaceholderCrossesLineBoundary {
-                unit_id,
-                target: target(),
-                placeholder_index,
-            },
-        );
+    let protected_scan = placeholder_bindings
+        .scan_with_cancellation(&validation.protected_text, &mut ensure_running)?;
+    if matches!(identity.source_content(), TextUnitContent::Lines(_)) {
+        for (placeholder_index, placeholder) in validation.applied_placeholders.iter().enumerate() {
+            ensure_running()?;
+            if text_contains_byte_with_cancellation(
+                placeholder.original(),
+                b'\n',
+                &mut ensure_running,
+            )? {
+                return Ok(Err(
+                    ExpectedTranslationOutputContractError::ProtectedPlaceholderCrossesLineBoundary {
+                        unit_id,
+                        target: target(),
+                        placeholder_index,
+                    },
+                ));
+            }
+        }
     }
-    if let Err(reason) = placeholder_bindings.validate_multiset(
+    if let Err(reason) = placeholder_bindings.validate_multiset_with_cancellation(
         std::slice::from_ref(&protected_scan),
         placeholder_bindings.all_binding_indices(),
-    ) {
-        return Err(
+        &mut ensure_running,
+    )? {
+        return Ok(Err(
             ExpectedTranslationOutputContractError::ProtectedPlaceholderMultisetMismatch {
                 unit_id,
                 target: target(),
                 kind: (&reason).into(),
             },
-        );
+        ));
     }
-    if let ExpectedLineShape::Aligned(line_count) = validation.line_shape
-        && validation.protected_text.split('\n').count() != line_count.get()
-    {
-        return Err(
-            ExpectedTranslationOutputContractError::ProtectedLineCountMismatch {
-                unit_id,
-                target: target(),
-                expected: line_count.get(),
-                actual: validation.protected_text.split('\n').count(),
-            },
-        );
+    if let ExpectedLineShape::Aligned(line_count) = validation.line_shape {
+        let actual = line_count_with_cancellation(&validation.protected_text, &mut ensure_running)?;
+        if actual != line_count.get() {
+            return Ok(Err(
+                ExpectedTranslationOutputContractError::ProtectedLineCountMismatch {
+                    unit_id,
+                    target: target(),
+                    expected: line_count.get(),
+                    actual,
+                },
+            ));
+        }
     }
-    match (identity.source_content(), validation.line_shape) {
+    let result = match (identity.source_content(), validation.line_shape) {
         (TextUnitContent::Value(_), ExpectedLineShape::Aligned(line_count))
             if line_count.get() == 1 =>
         {
@@ -1283,7 +1333,39 @@ fn validate_expected_translation_output(
             )
         }
         (TextUnitContent::Lines(_), _) => Ok(()),
+    };
+    ensure_running()?;
+    Ok(result)
+}
+
+fn text_contains_byte_with_cancellation<E>(
+    text: &str,
+    needle: u8,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    const CHECK_BYTES: usize = 64 * 1024;
+    for chunk in text.as_bytes().chunks(CHECK_BYTES) {
+        ensure_running()?;
+        if chunk.contains(&needle) {
+            return Ok(true);
+        }
     }
+    ensure_running()?;
+    Ok(false)
+}
+
+fn line_count_with_cancellation<E>(
+    text: &str,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<usize, E> {
+    const CHECK_BYTES: usize = 64 * 1024;
+    let mut lines = 1_usize;
+    for chunk in text.as_bytes().chunks(CHECK_BYTES) {
+        ensure_running()?;
+        lines = lines.saturating_add(chunk.iter().filter(|byte| **byte == b'\n').count());
+    }
+    ensure_running()?;
+    Ok(lines)
 }
 
 /// 一个已经完成语义切块并生成最终最小消息的任务块。
@@ -1292,7 +1374,7 @@ pub(crate) struct TranslationTaskBlock {
     index: RpgMakerTranslationTaskIndex,
     language_pair: LanguagePair,
     messages: Vec<ChatMessage>,
-    expected_outputs: Vec<ExpectedTranslationOutput>,
+    expected_outputs: Arc<[ExpectedTranslationOutput]>,
 }
 
 impl TranslationTaskBlock {
@@ -1313,7 +1395,7 @@ impl TranslationTaskBlock {
             index,
             language_pair,
             messages,
-            expected_outputs,
+            expected_outputs: expected_outputs.into(),
         }
     }
 
@@ -1331,6 +1413,10 @@ impl TranslationTaskBlock {
 
     pub(crate) fn expected_outputs(&self) -> &[ExpectedTranslationOutput] {
         &self.expected_outputs
+    }
+
+    pub(crate) fn shared_expected_outputs(&self) -> Arc<[ExpectedTranslationOutput]> {
+        Arc::clone(&self.expected_outputs)
     }
 }
 
@@ -1488,22 +1574,19 @@ pub(crate) enum TranslationUnitRejectionReason {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct UnresolvedTranslationUnit {
     id: usize,
-    identity: TranslationUnitIdentity,
-    propagation_targets: Vec<TranslationUnitIdentity>,
+    location_count: usize,
     reason: TranslationUnitRejectionReason,
 }
 
 impl UnresolvedTranslationUnit {
     pub(crate) fn new(
         id: usize,
-        identity: TranslationUnitIdentity,
-        propagation_targets: Vec<TranslationUnitIdentity>,
+        propagation_target_count: usize,
         reason: TranslationUnitRejectionReason,
     ) -> Self {
         Self {
             id,
-            identity,
-            propagation_targets,
+            location_count: 1 + propagation_target_count,
             reason,
         }
     }
@@ -1517,7 +1600,7 @@ impl UnresolvedTranslationUnit {
     }
 
     pub(crate) const fn location_count(&self) -> usize {
-        1 + self.propagation_targets.len()
+        self.location_count
     }
 }
 
@@ -1554,9 +1637,16 @@ pub(crate) struct NonEmptyTaskItems<T> {
 }
 
 impl<T> NonEmptyTaskItems<T> {
+    #[cfg(test)]
     pub(crate) fn new(first: T, mut rest: Vec<T>) -> Self {
-        rest.insert(0, first);
-        Self { items: rest }
+        let mut items = Vec::with_capacity(1 + rest.len());
+        items.push(first);
+        items.append(&mut rest);
+        Self { items }
+    }
+
+    pub(crate) fn from_vec(items: Vec<T>) -> Option<Self> {
+        (!items.is_empty()).then_some(Self { items })
     }
 
     pub(crate) fn as_slice(&self) -> &[T] {
@@ -2624,11 +2714,19 @@ where
             if self.cancellation.is_requested() {
                 return Ok(OperationCompletion::Cancelled);
             }
-            let plan = self
+            let plan = match self
                 .task_planner
                 .plan(project, profile, corpus, input)
                 .await
-                .map_err(RpgMakerTranslationServiceError::PlanTasks)?;
+            {
+                Ok(plan) => plan,
+                Err(_) if self.cancellation.is_requested() => {
+                    return Ok(OperationCompletion::Cancelled);
+                }
+                Err(source) => {
+                    return Err(RpgMakerTranslationServiceError::PlanTasks(source));
+                }
+            };
             if self.cancellation.is_requested() {
                 return Ok(OperationCompletion::Cancelled);
             }
@@ -2925,6 +3023,31 @@ mod tests {
     }
 
     #[test]
+    fn expected_output_contract_scan_can_cancel_during_long_protected_text() {
+        let mut polls = 0_usize;
+        let result = ExpectedTranslationOutput::try_new_with_cancellation(
+            1,
+            translation_identity(),
+            Vec::new(),
+            ExpectedTranslationValidation::new(
+                ExpectedLineShape::Aligned(NonZeroUsize::MIN),
+                "宝剑".repeat(100_000),
+                Vec::new(),
+                test_language_analysis(),
+            ),
+            test_state_context(1),
+            Vec::new(),
+            || {
+                polls += 1;
+                if polls >= 5 { Err("cancelled") } else { Ok(()) }
+            },
+        );
+
+        assert_eq!(result, Err("cancelled"));
+        assert!(polls >= 5);
+    }
+
+    #[test]
     #[should_panic(expected = "RPG Maker 计划中的 TaskBlock 序号必须按自然计划顺序从零连续编号")]
     fn plan_establishes_the_contiguous_task_ordinal_invariant_before_execution() {
         RpgMakerTranslationPlan::new(
@@ -3084,6 +3207,7 @@ mod tests {
         preparation: TranslationPlanPreparation,
         task_count: usize,
         failure: bool,
+        cancel_on_plan: Option<CooperativeCancellation>,
     }
 
     impl RpgMakerTranslationTaskPlanner for FakePlanner {
@@ -3102,6 +3226,9 @@ mod tests {
                 .lock()
                 .expect("计划输入记录锁不应中毒")
                 .push(input);
+            if let Some(cancellation) = &self.cancel_on_plan {
+                cancellation.request();
+            }
             if self.failure {
                 return Err(FakeError("plan"));
             }
@@ -3468,6 +3595,7 @@ mod tests {
                     preparation,
                     task_count,
                     failure: plan_failure,
+                    cancel_on_plan: None,
                 },
                 FakeExecutor {
                     events: Arc::clone(&events),
@@ -3544,6 +3672,21 @@ mod tests {
                 (2, RecordedTaskState::CompleteCommitted),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn cancellation_requested_during_failed_planning_is_not_reported_as_a_planner_failure() {
+        let mut harness = harness(0, Vec::new(), false, true, false, None, None);
+        harness.service.task_planner.cancel_on_plan = Some(harness.cancellation.clone());
+
+        let completion = harness
+            .service
+            .run(&project(), &profile(1), input())
+            .await
+            .expect("取消后的规划错误应转换成正常取消结果");
+
+        assert!(matches!(completion, OperationCompletion::Cancelled));
+        assert_eq!(events(&harness.events), vec![Event::Read, Event::Plan]);
     }
 
     #[tokio::test]
@@ -4632,12 +4775,7 @@ mod tests {
             )
         };
         let unresolved = |output: &ExpectedTranslationOutput, reason| {
-            UnresolvedTranslationUnit::new(
-                output.id(),
-                output.identity().clone(),
-                output.propagation_targets().to_vec(),
-                reason,
-            )
+            UnresolvedTranslationUnit::new(output.id(), output.propagation_targets().len(), reason)
         };
 
         match kind {

@@ -98,6 +98,8 @@ progress-extract-documents = 문서 검색 중
 progress-extract-builtin = Builtin 작업 단위
 progress-extract-rules = Rules 정의
 progress-extract-commit = 추출 자산 커밋 중
+progress-generic-init = Generic 프로젝트 초기화 중
+progress-generic-extract = Generic JSONL 입력 검색 중
 progress-translate-planning = 번역 작업 계획 중
 progress-translate-confirmed = 확인된 번역 작업
 progress-translate-no-work = 모델 요청이 필요하지 않음
@@ -270,6 +272,7 @@ diagnostic-failure-value = { $code ->
     [write_back_extraction_out_of_date] 추출한 자산이 현재 프로젝트 원본과 더 이상 일치하지 않습니다
     [write_back_asset_snapshot_invalid] 저장된 RPG Maker 자산이 유효한 쓰기 반영 스냅샷을 구성하지 않습니다
     [source_document_invalid] RPG Maker 원본 문서가 필수 문서 형식을 충족하지 않습니다
+    [generic_source_document_invalid] Generic JSONL 원본 문서가 필수 형식을 충족하지 않습니다
     [write_back_mutation_invalid] 검증된 번역 변경을 고정된 원본 위치에 적용할 수 없습니다
     [write_back_output_path_invalid] 다시 쓴 파일이 허용된 RPG Maker 출력 트리 밖에 있습니다
     [write_back_output_path_duplicate] 둘 이상의 다시 쓴 파일이 같은 출력 경로를 대상으로 합니다

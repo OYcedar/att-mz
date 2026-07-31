@@ -17,6 +17,13 @@ use serde_json::{Value, json};
 const PROJECT: &str = "shared";
 const SOURCE_TEXT: &str = "薬草です";
 const TRANSLATION: &str = "治疗药草";
+const MV_SPEAKER: &str = "アリス";
+const MV_BODY: &str = "こんにちは、世界！";
+const MV_SPEAKER_TRANSLATION: &str = "爱丽丝";
+const MV_BODY_TRANSLATION: &str = "你好，世界！";
+const RULES_SHORT_SOURCE: &str = "ポーション";
+const RULES_SHORT_TRANSLATION: &str = "治疗药水";
+const RULES_LONG_SOURCE: &str = "高級ポーション";
 
 #[test]
 fn help_exposes_mv_mz_and_generic_as_independent_command_domains() {
@@ -220,6 +227,307 @@ fn same_named_mv_mz_and_generic_projects_remain_isolated_across_real_processes()
     assert_eq!(
         original_mz[1]["description"], SOURCE_TEXT,
         "WriteBack 不得修改外部游戏目录"
+    );
+}
+
+#[test]
+fn mv_dialogue_crosses_extract_translate_and_write_back_processes() {
+    let temporary = tempfile::tempdir().expect("应可建立 MV 对话端到端测试目录");
+    let root = temporary.path();
+    let game = root.join("mv-game");
+    write_minimal_mv_game(&game);
+    write_mv_dialogue_rules(root);
+    write_rpg_maker_prompt(root);
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("本地模型服务端口应可绑定");
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().expect("本地模型地址应可读取")
+    );
+    write_configuration(root, &endpoint);
+
+    assert_success("MV 对话 Init", &run_att(root, init_arguments("mv", &game)));
+    assert_success(
+        "MV 对话 Extract",
+        &run_att(
+            root,
+            arguments(&[
+                "mv",
+                "extract",
+                "--name",
+                PROJECT,
+                "--builtin",
+                "--dialogue-rules",
+                "dialogue.toml",
+            ]),
+        ),
+    );
+
+    let workspace = root.join("projects/mv").join(PROJECT);
+    let database = workspace.join("project.db");
+    let extracted = read_owner_units(&database, "builtin");
+    assert_eq!(
+        extracted,
+        vec![(json!(MV_SPEAKER), None), (json!([MV_BODY]), None),],
+        "MV 姓名和正文必须按 Speaker、Body 顺序物化"
+    );
+    let connection = Connection::open(&database).expect("MV 项目数据库应可打开");
+    let (groups, claims): (i64, i64) = connection
+        .query_row(
+            "SELECT
+                (SELECT count(*) FROM rpg_maker_text_group WHERE owner = 'builtin'),
+                (SELECT count(*) FROM rpg_maker_mutation_claim WHERE owner = 'builtin')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("MV 对话组和修改目标应可读取");
+    assert_eq!(groups, 1, "MV 对话必须物化为一个原子语义组");
+    assert!(claims > 0, "MV 对话写回目标必须由 Mutation Claim 保护");
+    let definition: String = connection
+        .query_row(
+            "SELECT canonical_json
+             FROM rpg_maker_project_definition
+             WHERE definition_kind = 'mv_dialogue_rules'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("MV 对话投影定义应随 Builtin 快照保存");
+    let definition: Value =
+        serde_json::from_str(&definition).expect("MV 对话投影定义必须是规范 JSON");
+    assert_eq!(definition["rules"].as_array().map(Vec::len), Some(1));
+    drop(connection);
+
+    let server = thread::spawn(move || {
+        serve_one_response(
+            listener,
+            json!({
+                "1": [MV_SPEAKER_TRANSLATION],
+                "2": [MV_BODY_TRANSLATION]
+            }),
+        )
+    });
+    assert_success(
+        "MV 对话 Translate",
+        &run_att(
+            root,
+            arguments(&["mv", "translate", "--name", PROJECT, "local"]),
+        ),
+    );
+    let request = server
+        .join()
+        .expect("MV 对话模型服务线程不得 panic")
+        .expect("MV 对话模型服务必须完成请求");
+    let user = request["messages"][1]["content"]
+        .as_str()
+        .expect("MV 对话 user message 必须是字符串");
+    assert!(
+        user.contains(MV_SPEAKER) && user.contains(MV_BODY),
+        "同一模型任务必须包含 Speaker 与 Body：{user}"
+    );
+    assert!(
+        user.find(MV_SPEAKER) < user.find(MV_BODY),
+        "MV 对话必须按 Speaker、Body 的自然顺序请求：{user}"
+    );
+    assert_eq!(
+        read_owner_units(&database, "builtin"),
+        vec![
+            (json!(MV_SPEAKER), Some(json!(MV_SPEAKER_TRANSLATION)),),
+            (json!([MV_BODY]), Some(json!([MV_BODY_TRANSLATION])),),
+        ],
+        "模型响应必须按语义 Unit 提交到项目数据库"
+    );
+
+    assert_success(
+        "MV 对话 WriteBack",
+        &run_att(root, arguments(&["mv", "write-back", "--name", PROJECT])),
+    );
+    let output_root = workspace.join("write_back");
+    let output_map: Value = serde_json::from_slice(
+        &fs::read(output_root.join("www/data/Map001.json")).expect("MV 写回 Map 应存在"),
+    )
+    .expect("MV 写回 Map 必须是 JSON");
+    let commands = output_map["events"][1]["pages"][0]["list"]
+        .as_array()
+        .expect("MV 写回事件命令必须是数组");
+    assert_eq!(commands[0]["code"], 101);
+    assert_eq!(commands[0]["parameters"], json!(["", 0, 0, 2]));
+    assert_eq!(commands[1]["code"], 401);
+    assert_eq!(
+        commands[1]["parameters"][0],
+        format!(r"\n<{MV_SPEAKER_TRANSLATION}>{MV_BODY_TRANSLATION}")
+    );
+    assert_eq!(commands[2]["code"], 0);
+    assert_eq!(
+        fs::read_to_string(output_root.join("www/js/rpg_core.js")).expect("MV core 应保留"),
+        "/* MV core */"
+    );
+    assert!(
+        !output_root.join("data").exists() && !output_root.join("js").exists(),
+        "MV 写回不得把 www 内容提升到输出根"
+    );
+
+    let original_map: Value = serde_json::from_slice(
+        &fs::read(game.join("www/data/Map001.json")).expect("外部 MV Map 应保留"),
+    )
+    .expect("外部 MV Map 必须保持有效 JSON");
+    assert_eq!(
+        original_map["events"][1]["pages"][0]["list"][1]["parameters"][0],
+        format!(r"\n<{MV_SPEAKER}>{MV_BODY}"),
+        "WriteBack 不得修改外部 MV 游戏"
+    );
+}
+
+#[test]
+fn rules_owner_replaces_writes_back_and_disables_without_touching_builtin() {
+    let temporary = tempfile::tempdir().expect("应可建立 Rules 端到端测试目录");
+    let root = temporary.path();
+    let game = root.join("mz-game");
+    write_minimal_mz_game(&game);
+    write_extract_rules(root, Some("customShortName"));
+    write_rpg_maker_prompt(root);
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("本地模型服务端口应可绑定");
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().expect("本地模型地址应可读取")
+    );
+    write_configuration(root, &endpoint);
+
+    assert_success(
+        "Rules 项目 Init",
+        &run_att(root, init_arguments("mz", &game)),
+    );
+    assert_success(
+        "Builtin 与 Rules 初次 Extract",
+        &run_att(
+            root,
+            arguments(&[
+                "mz",
+                "extract",
+                "--name",
+                PROJECT,
+                "--builtin",
+                "--rules",
+                "rules.toml",
+            ]),
+        ),
+    );
+
+    let workspace = root.join("projects/mz").join(PROJECT);
+    let database = workspace.join("project.db");
+    assert_eq!(
+        read_owner_units(&database, "builtin"),
+        vec![(json!(SOURCE_TEXT), None)]
+    );
+    assert_eq!(
+        read_owner_units(&database, "rules"),
+        vec![(json!(RULES_SHORT_SOURCE), None)]
+    );
+
+    let server = thread::spawn(move || {
+        serve_one_response(
+            listener,
+            json!({
+                "1": [TRANSLATION],
+                "2": [RULES_SHORT_TRANSLATION]
+            }),
+        )
+    });
+    assert_success(
+        "Builtin 与 Rules Translate",
+        &run_att(
+            root,
+            arguments(&["mz", "translate", "--name", PROJECT, "local"]),
+        ),
+    );
+    let request = server
+        .join()
+        .expect("Rules 模型服务线程不得 panic")
+        .expect("Rules 模型服务必须完成请求");
+    let user = request["messages"][1]["content"]
+        .as_str()
+        .expect("Rules user message 必须是字符串");
+    assert!(
+        user.contains(SOURCE_TEXT) && user.contains(RULES_SHORT_SOURCE),
+        "同一翻译运行必须读取 Builtin 与 Rules owner：{user}"
+    );
+    assert_success(
+        "Rules 初次 WriteBack",
+        &run_att(root, arguments(&["mz", "write-back", "--name", PROJECT])),
+    );
+    let output_items = read_items(&workspace.join("write_back/data/Items.json"));
+    assert_eq!(output_items[1]["description"], TRANSLATION);
+    assert_eq!(output_items[1]["customShortName"], RULES_SHORT_TRANSLATION);
+
+    write_extract_rules(root, Some("customLongName"));
+    assert_success(
+        "Rules 定义替换",
+        &run_att(
+            root,
+            arguments(&["mz", "extract", "--name", PROJECT, "--rules", "rules.toml"]),
+        ),
+    );
+    assert_eq!(
+        read_owner_units(&database, "builtin"),
+        vec![(json!(SOURCE_TEXT), Some(json!(TRANSLATION)))],
+        "仅替换 Rules 不得扰动 Builtin 资产或译文"
+    );
+    assert_eq!(
+        read_owner_units(&database, "rules"),
+        vec![(json!(RULES_LONG_SOURCE), None)],
+        "新 Rules 定义必须原子替换旧 owner"
+    );
+    assert_success(
+        "Rules 替换后 WriteBack",
+        &run_att(root, arguments(&["mz", "write-back", "--name", PROJECT])),
+    );
+    let output_items = read_items(&workspace.join("write_back/data/Items.json"));
+    assert_eq!(output_items[1]["description"], TRANSLATION);
+    assert_eq!(output_items[1]["customShortName"], RULES_SHORT_SOURCE);
+    assert_eq!(output_items[1]["customLongName"], RULES_LONG_SOURCE);
+
+    write_extract_rules(root, None);
+    let disabled = run_att(
+        root,
+        arguments(&["mz", "extract", "--name", PROJECT, "--rules", "rules.toml"]),
+    );
+    assert_success("Rules 显式停用", &disabled);
+    let disabled_stdout = String::from_utf8_lossy(&disabled.stdout);
+    assert!(
+        disabled_stdout.contains("已停用 owner") && disabled_stdout.contains("Rules"),
+        "显式空 Rules 必须向操作者说明该 owner 已停用：{disabled_stdout}"
+    );
+    assert!(read_owner_units(&database, "rules").is_empty());
+    assert_eq!(
+        read_owner_units(&database, "builtin"),
+        vec![(json!(SOURCE_TEXT), Some(json!(TRANSLATION)))],
+        "停用 Rules 不得删除 Builtin"
+    );
+    let connection = Connection::open(&database).expect("项目数据库应可打开");
+    let saved_extract_plans: i64 = connection
+        .query_row("SELECT count(*) FROM extract_run_plan", [], |row| {
+            row.get(0)
+        })
+        .expect("Extract 运行方案应可读取");
+    assert_eq!(
+        saved_extract_plans, 0,
+        "仅显式停用 Rules 后不得保留空自动 Extract 方案"
+    );
+    drop(connection);
+
+    assert_success(
+        "Rules 停用后 WriteBack",
+        &run_att(root, arguments(&["mz", "write-back", "--name", PROJECT])),
+    );
+    let output_items = read_items(&workspace.join("write_back/data/Items.json"));
+    assert_eq!(output_items[1]["description"], TRANSLATION);
+    assert_eq!(output_items[1]["customShortName"], RULES_SHORT_SOURCE);
+    assert_eq!(output_items[1]["customLongName"], RULES_LONG_SOURCE);
+
+    let omitted = run_att(root, arguments(&["mz", "extract", "--name", PROJECT]));
+    assert!(
+        !omitted.status.success(),
+        "停用唯一自动 owner 后省略全部 Extract 选项必须失败"
     );
 }
 
@@ -668,6 +976,22 @@ fn write_rpg_maker_prompt(root: &Path) {
     .expect("system Prompt 应可写入");
 }
 
+fn write_mv_dialogue_rules(root: &Path) {
+    fs::write(
+        root.join("dialogue.toml"),
+        "[[rule]]\npattern = '(?i)\\\\n<(?<speaker>[^>]*?)(?::)?>'\n",
+    )
+    .expect("MV 对话姓名投影规则应可写入");
+}
+
+fn write_extract_rules(root: &Path, field: Option<&str>) {
+    let definition = field.map_or_else(
+        || "rule = []\n".to_owned(),
+        |field| format!("[[rule]]\nfile = \"Items.json\"\npath = '[].{field}'\n"),
+    );
+    fs::write(root.join("rules.toml"), definition).expect("Extract Rules 应可写入");
+}
+
 fn write_generic_prompt(root: &Path) {
     let prompt_root = root.join("prompts/generic/zh-Hans");
     fs::create_dir_all(&prompt_root).expect("Generic Prompt 目录应可建立");
@@ -764,7 +1088,9 @@ fn write_minimal_mz_game(game_root: &Path) {
             {
                 "id": 1,
                 "name": "",
-                "description": SOURCE_TEXT
+                "description": SOURCE_TEXT,
+                "customShortName": RULES_SHORT_SOURCE,
+                "customLongName": RULES_LONG_SOURCE
             }
         ]))
         .expect("Items 夹具应可序列化"),
@@ -833,6 +1159,43 @@ fn write_minimal_mv_game(game_root: &Path) {
         .expect("MV Map 夹具应可序列化"),
     )
     .expect("MV Map 夹具应可写入");
+}
+
+fn read_owner_units(database: &Path, owner: &str) -> Vec<(Value, Option<Value>)> {
+    let connection = Connection::open(database).expect("项目数据库应可打开");
+    let mut statement = connection
+        .prepare(
+            "SELECT unit.source_content_json, unit.translation_content_json
+             FROM rpg_maker_text_unit AS unit
+             JOIN rpg_maker_text_group AS group_row
+               ON group_row.owner = unit.owner
+              AND group_row.group_location = unit.group_location
+             WHERE unit.owner = ?1
+             ORDER BY group_row.group_order, unit.unit_order",
+        )
+        .expect("RPG Maker Unit 查询应可准备");
+    statement
+        .query_map([owner], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .expect("RPG Maker Unit 查询应可执行")
+        .map(|row| {
+            let (source, translation) = row.expect("RPG Maker Unit 应可读取");
+            (
+                serde_json::from_str(&source).expect("Unit source 必须是规范 JSON"),
+                translation.map(|translation| {
+                    serde_json::from_str(&translation).expect("Unit translation 必须是规范 JSON")
+                }),
+            )
+        })
+        .collect()
+}
+
+fn read_items(path: &Path) -> Value {
+    serde_json::from_slice(
+        &fs::read(path).unwrap_or_else(|error| panic!("{} 应可读取：{error}", path.display())),
+    )
+    .expect("Items.json 必须是有效 JSON")
 }
 
 fn serve_one_translation(listener: TcpListener) -> Result<Value, String> {

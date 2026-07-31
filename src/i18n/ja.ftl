@@ -98,6 +98,8 @@ progress-extract-documents = 文書を走査しています
 progress-extract-builtin = Builtin 作業単位
 progress-extract-rules = Rules 定義
 progress-extract-commit = 抽出資産をコミットしています
+progress-generic-init = Generic プロジェクトを初期化しています
+progress-generic-extract = Generic JSONL 入力を走査しています
 progress-translate-planning = 翻訳タスクを計画しています
 progress-translate-confirmed = 確認済みの翻訳タスク
 progress-translate-no-work = モデル呼び出しは不要です
@@ -270,6 +272,7 @@ diagnostic-failure-value = { $code ->
     [write_back_extraction_out_of_date] 抽出済みアセットが現在のプロジェクトソースと一致しません
     [write_back_asset_snapshot_invalid] 保存された RPG Maker アセットが有効な書き戻しスナップショットを形成しません
     [source_document_invalid] RPG Maker のソース文書が必要な文書形式を満たしていません
+    [generic_source_document_invalid] Generic JSONL のソース文書が必要な形式を満たしていません
     [write_back_mutation_invalid] 検証済み翻訳変更を固定されたソース位置に適用できません
     [write_back_output_path_invalid] 書き換えたファイルが許可された RPG Maker 出力ツリー外にあります
     [write_back_output_path_duplicate] 複数の書き換えファイルが同じ出力パスを対象にしています

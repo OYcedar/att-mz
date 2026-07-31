@@ -6,7 +6,7 @@
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::value::RawValue;
 use time::OffsetDateTime;
 
 use crate::diagnostic::SafeDiagnostic;
@@ -25,11 +25,11 @@ use crate::translation_protocol::{
 
 use super::ResponseProblem;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) enum GenericTaskResponseRecord {
     Parsed {
         thinking: Option<String>,
-        entries: Vec<(String, Value)>,
+        entries: Vec<(String, GenericTaskRecordedValue)>,
     },
     Invalid {
         raw_assistant: String,
@@ -40,19 +40,35 @@ pub(crate) enum GenericTaskResponseRecord {
     },
 }
 
+#[derive(Debug)]
+pub(crate) enum GenericTaskRecordedValue {
+    Text(String),
+    RawJson(Box<RawValue>),
+}
+
 impl GenericTaskResponseRecord {
-    pub(crate) fn parsed(parsed: ParsedTranslationResponse) -> Self {
+    pub(crate) fn parsed_with_cancellation<E>(
+        parsed: ParsedTranslationResponse,
+        mut ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Self, E> {
+        ensure_running()?;
         let (thinking, entries) = parsed.into_parts();
-        Self::Parsed {
-            thinking,
-            entries: entries
-                .into_iter()
-                .map(|entry| {
-                    let (id, value, _) = entry.into_parts();
-                    (id, value)
-                })
-                .collect(),
+        let mut recorded_entries = Vec::with_capacity(entries.len());
+        for entry in entries {
+            ensure_running()?;
+            let decoded = entry.decode_value_with_cancellation::<String, _>(&mut ensure_running)?;
+            let (id, value, _) = entry.into_parts();
+            let value = match decoded {
+                Ok(value) => GenericTaskRecordedValue::Text(value),
+                Err(_) => GenericTaskRecordedValue::RawJson(value),
+            };
+            recorded_entries.push((id, value));
         }
+        ensure_running()?;
+        Ok(Self::Parsed {
+            thinking,
+            entries: recorded_entries,
+        })
     }
 
     pub(crate) const fn invalid(
@@ -78,10 +94,14 @@ pub(crate) struct GenericTaskRecordIssue {
 }
 
 impl GenericTaskRecordIssue {
-    pub(crate) fn from_response_problem(problem: &ResponseProblem) -> Self {
-        match problem {
+    pub(crate) fn from_response_problem_with_cancellation<E>(
+        problem: &ResponseProblem,
+        mut ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Self, E> {
+        ensure_running()?;
+        let issue = match problem {
             ResponseProblem::InvalidId(id) => Self {
-                id: id.clone(),
+                id: clone_task_record_text(id, &mut ensure_running)?,
                 code: "invalid_id",
                 detail: None,
             },
@@ -108,18 +128,27 @@ impl GenericTaskRecordIssue {
             ResponseProblem::InvalidTranslation { output_id, detail } => Self {
                 id: output_id.to_string(),
                 code: "invalid_translation",
-                detail: Some(detail.clone()),
+                detail: Some(clone_task_record_text(detail, &mut ensure_running)?),
             },
             ResponseProblem::InvalidDestination {
                 output_id,
                 key,
                 detail,
             } => Self {
-                id: format!("{output_id}:{}/{}", key.group_id(), key.unit_id()),
+                id: {
+                    let mut id = output_id.to_string();
+                    id.push(':');
+                    append_task_record_text(&mut id, key.group_id(), &mut ensure_running)?;
+                    id.push('/');
+                    append_task_record_text(&mut id, key.unit_id(), &mut ensure_running)?;
+                    id
+                },
                 code: "invalid_destination_translation",
-                detail: Some(detail.clone()),
+                detail: Some(clone_task_record_text(detail, &mut ensure_running)?),
             },
-        }
+        };
+        ensure_running()?;
+        Ok(issue)
     }
 
     pub(crate) fn commit_conflicts(count: usize) -> Self {
@@ -129,6 +158,37 @@ impl GenericTaskRecordIssue {
             detail: Some(format!("{count} 个 Unit 在提交前已发生变化")),
         }
     }
+}
+
+fn clone_task_record_text<E>(
+    text: &str,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<String, E> {
+    let mut output = String::with_capacity(text.len());
+    append_task_record_text(&mut output, text, ensure_running)?;
+    Ok(output)
+}
+
+fn append_task_record_text<E>(
+    output: &mut String,
+    text: &str,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<(), E> {
+    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
+
+    let mut start = 0_usize;
+    while start < text.len() {
+        ensure_running()?;
+        let mut end = start
+            .saturating_add(CANCELLATION_CHECK_BYTES)
+            .min(text.len());
+        while end < text.len() && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        output.push_str(&text[start..end]);
+        start = end;
+    }
+    ensure_running()
 }
 
 #[derive(Clone, Debug)]
@@ -354,7 +414,10 @@ fn render_generic_task_record(
             ChatMessageRole::User => "User",
         };
         let _ = write!(output, "\n## {title}\n\n");
-        let content = redactor.redact(message.content());
+        let content = match message.role() {
+            ChatMessageRole::System => redactor.redact(message.content()),
+            ChatMessageRole::User => redactor.redact_text_with_json_strings(message.content()),
+        };
         output.push_str(&content);
         if !content.ends_with('\n') {
             output.push('\n');
@@ -478,15 +541,15 @@ fn render_response(
                 let id = redactor.redact(id);
                 let _ = writeln!(output, "### ID {}\n", markdown_heading_id(&id));
                 match value {
-                    Value::String(value) => {
+                    GenericTaskRecordedValue::Text(value) => {
                         let value = redactor.redact(value);
                         output.push_str(&value);
                         if !value.ends_with('\n') {
                             output.push('\n');
                         }
                     }
-                    value => {
-                        let value = redactor.redact_json_pretty(value)?;
+                    GenericTaskRecordedValue::RawJson(value) => {
+                        let value = redactor.redact_json(value.as_ref())?;
                         output.push_str(&markdown_fence(&value, "json"));
                     }
                 }
@@ -515,12 +578,126 @@ fn render_response(
                     }
                 )
             );
-            output.push_str(&markdown_fence(&redactor.redact(raw_assistant), "text"));
+            output.push_str(&markdown_fence(
+                &redactor.redact_text_with_json_strings(raw_assistant),
+                "text",
+            ));
         }
         GenericTaskResponseRecord::Unprocessed { raw_assistant } => {
             output.push_str("\n## Assistant\n\n");
-            output.push_str(&markdown_fence(&redactor.redact(raw_assistant), "text"));
+            output.push_str(&markdown_fence(
+                &redactor.redact_text_with_json_strings(raw_assistant),
+                "text",
+            ));
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::convert::Infallible;
+
+    use secrecy::SecretString;
+    use serde_json::Map;
+
+    use super::*;
+    use crate::llm::ApiKeyRedactor;
+    use crate::translation_protocol::{TranslationResponseEnvelope, parse_translation_response};
+
+    #[test]
+    fn deeply_nested_raw_value_renders_as_valid_redacted_json_without_value_tree() {
+        const API_KEY: &str = "quote\"slash\\value";
+        const DEPTH: usize = 10_000;
+
+        let encoded_api_key = serde_json::to_string(API_KEY).expect("API key 应可编码为 JSON");
+        let deep_value = format!(
+            "{}{}{}",
+            "[".repeat(DEPTH),
+            encoded_api_key,
+            "]".repeat(DEPTH)
+        );
+        let parsed = parse_translation_response(
+            &format!(r#"{{"1":{deep_value}}}"#),
+            TranslationResponseEnvelope::JsonOnly,
+        )
+        .expect("深层 raw value 应可解析");
+        let record =
+            GenericTaskResponseRecord::parsed_with_cancellation(parsed, || Ok::<_, Infallible>(()))
+                .expect("未取消的记录投影应成功");
+        let client = LlmClientRecordMetadata::new(
+            "https://example.test".to_owned(),
+            "model".to_owned(),
+            Map::new(),
+            ApiKeyRedactor::new(SecretString::from(API_KEY)),
+        );
+        let mut output = String::new();
+
+        render_response(
+            &mut output,
+            &UiLocalizer::new(UiLocale::SimplifiedChinese),
+            &client,
+            &record,
+        )
+        .expect("RawValue 的 JSON 序列化不应递归展开");
+
+        let opening = "```json\n";
+        let json_start = output.find(opening).expect("非字符串值应进入 JSON fence") + opening.len();
+        let json_end = json_start
+            + output[json_start..]
+                .find("\n```\n")
+                .expect("JSON fence 应闭合");
+        let recorded_json = &output[json_start..json_end];
+        serde_json::from_str::<Box<RawValue>>(recorded_json)
+            .expect("脱敏后的记录仍必须是有效 JSON");
+        let escaped_api_key = &encoded_api_key[1..encoded_api_key.len() - 1];
+        assert!(!recorded_json.contains(API_KEY));
+        assert!(!recorded_json.contains(escaped_api_key));
+        assert!(recorded_json.contains("[REDACTED API KEY]"));
+
+        drop(record);
+    }
+
+    #[test]
+    fn rendered_generic_user_and_unprocessed_assistant_redact_json_escaped_key() {
+        const API_KEY: &str = "quote\"slash\\value";
+        let encoded_api_key = serde_json::to_string(API_KEY).expect("API key 应可编码为 JSON");
+        let encoded_fragment = &encoded_api_key[1..encoded_api_key.len() - 1];
+        let document = GenericTaskRecordDocument::new(
+            1,
+            0,
+            vec![ChatMessage::new(
+                ChatMessageRole::User,
+                format!("units:\n[1] \"before-{encoded_fragment}-after\""),
+            )],
+            1,
+            OffsetDateTime::UNIX_EPOCH,
+            Duration::ZERO,
+            0,
+            Vec::new(),
+            Some(GenericTaskResponseRecord::unprocessed(format!(
+                "prefix {{\"1\":\"before-{encoded_fragment}-after\"}} trailing {{"
+            ))),
+            GenericTaskRecordState::cancelled(),
+        );
+        let client = LlmClientRecordMetadata::new(
+            "https://example.test".to_owned(),
+            "model".to_owned(),
+            Map::new(),
+            ApiKeyRedactor::new(SecretString::from(API_KEY)),
+        );
+
+        let markdown = render_generic_task_record(
+            "run-redaction",
+            &client,
+            UiLocale::SimplifiedChinese,
+            &document,
+            1,
+        )
+        .expect("Generic 任务记录应可渲染");
+
+        assert!(!markdown.contains(API_KEY));
+        assert!(!markdown.contains(encoded_fragment));
+        assert_eq!(markdown.matches("[REDACTED API KEY]").count(), 2);
+    }
 }

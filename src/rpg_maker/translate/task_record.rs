@@ -4,12 +4,15 @@
 //! 逐 ID 验收和数据库提交仍分别由原有语义所有者负责；本模块只接收它们建立的
 //! 确定事实并呈现，不参与恢复、重放、验收、提交或退出码判断。
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 use serde_json::Value;
+use serde_json::value::RawValue;
 use time::OffsetDateTime;
 
 use crate::diagnostic::SafeDiagnostic;
@@ -57,17 +60,42 @@ impl TranslationAssistantValueError {
 }
 
 /// Assistant JSON 中保持原始顺序的一个条目。
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct TranslationAssistantEntry {
     id: String,
-    value: Value,
+    value: TranslationAssistantRecordedValue,
     canonical_id: Option<usize>,
     value_error: Option<TranslationAssistantValueError>,
+}
+
+/// 任务记录实际需要的响应值表示。
+#[derive(Debug)]
+pub(crate) enum TranslationAssistantRecordedValue {
+    Lines(Vec<String>),
+    RawJson(Box<RawValue>),
 }
 
 impl TranslationAssistantEntry {
     #[cfg(test)]
     pub(crate) fn new(id: String, value: Value) -> Self {
+        let value = match value {
+            Value::Array(values)
+                if values.iter().all(|value| matches!(value, Value::String(_))) =>
+            {
+                TranslationAssistantRecordedValue::Lines(
+                    values
+                        .into_iter()
+                        .map(|value| match value {
+                            Value::String(value) => value,
+                            _ => unreachable!("测试构造器已经确认数组项都是字符串"),
+                        })
+                        .collect(),
+                )
+            }
+            value => TranslationAssistantRecordedValue::RawJson(
+                serde_json::value::to_raw_value(&value).expect("测试 JSON Value 必须可序列化"),
+            ),
+        };
         Self {
             id,
             value,
@@ -78,7 +106,7 @@ impl TranslationAssistantEntry {
 
     pub(crate) fn projected(
         id: String,
-        value: Value,
+        value: TranslationAssistantRecordedValue,
         canonical_id: Option<usize>,
         value_error: Option<TranslationAssistantValueError>,
     ) -> Self {
@@ -89,12 +117,43 @@ impl TranslationAssistantEntry {
             value_error,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn canonical_id(&self) -> Option<usize> {
+        self.canonical_id
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn value_error(&self) -> Option<TranslationAssistantValueError> {
+        self.value_error
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lines(&self) -> Option<&[String]> {
+        match &self.value {
+            TranslationAssistantRecordedValue::Lines(lines) => Some(lines),
+            TranslationAssistantRecordedValue::RawJson(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raw_json(&self) -> Option<&RawValue> {
+        match &self.value {
+            TranslationAssistantRecordedValue::Lines(_) => None,
+            TranslationAssistantRecordedValue::RawJson(value) => Some(value),
+        }
+    }
 }
 
 /// 唯一响应解析器建立的任务记录投影。
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct TranslationTaskResponseRecord {
-    raw_assistant: String,
+    raw_assistant: Arc<String>,
     thinking: Option<String>,
     ordered_entries: Option<Vec<TranslationAssistantEntry>>,
     parse_error: Option<TranslationTaskResponseParseError>,
@@ -102,12 +161,12 @@ pub(crate) struct TranslationTaskResponseRecord {
 
 impl TranslationTaskResponseRecord {
     pub(crate) fn parsed(
-        raw_assistant: String,
+        raw_assistant: impl Into<Arc<String>>,
         thinking: Option<String>,
         ordered_entries: Vec<TranslationAssistantEntry>,
     ) -> Self {
         Self {
-            raw_assistant,
+            raw_assistant: raw_assistant.into(),
             thinking,
             ordered_entries: Some(ordered_entries),
             parse_error: None,
@@ -115,29 +174,49 @@ impl TranslationTaskResponseRecord {
     }
 
     pub(crate) fn invalid(
-        raw_assistant: String,
+        raw_assistant: impl Into<Arc<String>>,
         parse_error: TranslationTaskResponseParseError,
     ) -> Self {
         Self {
-            raw_assistant,
+            raw_assistant: raw_assistant.into(),
             thinking: None,
             ordered_entries: None,
             parse_error: Some(parse_error),
         }
     }
 
-    pub(crate) fn unprocessed(raw_assistant: String) -> Self {
+    pub(crate) fn unprocessed(raw_assistant: impl Into<Arc<String>>) -> Self {
         Self {
-            raw_assistant,
+            raw_assistant: raw_assistant.into(),
             thinking: None,
             ordered_entries: None,
             parse_error: None,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn raw_assistant(&self) -> &str {
+        self.raw_assistant.as_str()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn thinking(&self) -> Option<&str> {
+        self.thinking.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ordered_entries(&self) -> Option<&[TranslationAssistantEntry]> {
+        self.ordered_entries.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn parse_error(&self) -> Option<TranslationTaskResponseParseError> {
+        self.parse_error
+    }
 }
 
 /// 一个已启动任务从开始到 Executor 返回的不可变执行证据。
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct TranslationTaskExecutionEvidence {
     started_at: Option<OffsetDateTime>,
     task_started: Option<Instant>,
@@ -670,7 +749,7 @@ fn render_translation_task_record(
     );
     let parameters = client
         .api_key_redactor()
-        .redact_json_pretty(&Value::Object(client.parameters().clone()))?;
+        .redact_json_pretty(client.parameters())?;
     output.push_str(&markdown_fence(&parameters, "json"));
 
     for message in document.task.messages() {
@@ -679,7 +758,11 @@ fn render_translation_task_record(
             ChatMessageRole::User => "User",
         };
         let _ = write!(output, "\n## {title}\n\n");
-        let content = api_key_redactor.redact(message.content());
+        let content = match message.role() {
+            ChatMessageRole::System => api_key_redactor.redact(message.content()),
+            ChatMessageRole::User => api_key_redactor
+                .redact_text_with_markdown_ascii_punctuation_escaped(message.content()),
+        };
         output.push_str(&content);
         if !content.ends_with('\n') {
             output.push('\n');
@@ -730,21 +813,17 @@ fn render_translation_task_record(
                 let id = api_key_redactor.redact(&entry.id);
                 let _ = writeln!(output, "### ID {}\n", markdown_heading_id(&id));
                 match &entry.value {
-                    Value::Array(values)
-                        if values.iter().all(|value| matches!(value, Value::String(_))) =>
-                    {
-                        for (line_index, value) in values.iter().enumerate() {
+                    TranslationAssistantRecordedValue::Lines(lines) => {
+                        for (line_index, line) in lines.iter().enumerate() {
                             if line_index != 0 {
                                 output.push_str("\n\n");
                             }
-                            output.push_str(
-                                &api_key_redactor.redact(value.as_str().expect("已验证为字符串")),
-                            );
+                            output.push_str(&api_key_redactor.redact(line));
                         }
                         output.push('\n');
                     }
-                    value => {
-                        let value = client.api_key_redactor().redact_json_pretty(value)?;
+                    TranslationAssistantRecordedValue::RawJson(value) => {
+                        let value = client.api_key_redactor().redact_json(&value.as_ref())?;
                         output.push_str(&markdown_fence(&value, "json"));
                     }
                 }
@@ -846,6 +925,7 @@ fn render_final_result(
                 "- {}",
                 task_record_text(localizer, UiMessage::TaskRecordRejectedHeading)
             );
+            let response_value_errors = response_value_errors_by_id(document);
             for unresolved in outcome.unresolved() {
                 let reason = if matches!(
                     (unresolved.reason(), response_parse_error_message.as_deref()),
@@ -865,7 +945,10 @@ fn render_final_result(
                         localizer,
                         api_key_redactor,
                         unresolved.reason(),
-                        response_value_error_for_id(document, unresolved.id()),
+                        response_value_errors
+                            .get(&unresolved.id())
+                            .copied()
+                            .flatten(),
                     )
                 };
                 let id =
@@ -936,24 +1019,32 @@ fn render_final_result(
     Ok(())
 }
 
-fn response_value_error_for_id(
+fn response_value_errors_by_id(
     document: &TranslationTaskRecordDocument,
-    id: usize,
-) -> Option<TranslationAssistantValueError> {
-    let entries = document
+) -> HashMap<usize, Option<TranslationAssistantValueError>> {
+    let Some(entries) = document
         .evidence
         .response
-        .as_ref()?
-        .ordered_entries
-        .as_ref()?;
-    let mut matches = entries
-        .iter()
-        .filter(|entry| entry.canonical_id == Some(id));
-    let entry = matches.next()?;
-    if matches.next().is_some() {
-        return None;
+        .as_ref()
+        .and_then(|response| response.ordered_entries.as_ref())
+    else {
+        return HashMap::new();
+    };
+    let mut errors = HashMap::with_capacity(entries.len());
+    for entry in entries {
+        let Some(id) = entry.canonical_id else {
+            continue;
+        };
+        match errors.entry(id) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(entry.value_error);
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                slot.insert(None);
+            }
+        }
     }
-    entry.value_error
+    errors
 }
 
 fn rejection_reason(
@@ -1239,8 +1330,10 @@ mod tests {
     use crate::rpg_maker::text::{
         RpgMakerLocation, RpgMakerSource, StandardDataFile, TextGroupKind,
     };
+    use crate::runtime::cpu::{CpuExecutorConfig, RayonCpuExecutor};
     use crate::runtime::filesystem::SystemFileSystemConfig;
     use crate::runtime::project_log::start_project_log;
+    use crate::translation_protocol::parse_translation_response;
 
     use super::super::executor::FinalLlmResponseMetadata;
     use super::super::pipeline::{
@@ -1249,6 +1342,7 @@ mod tests {
         TranslationStateContext, TranslationTaskOutcomeContext, TranslationUnitIdentity,
         UnresolvedTranslationUnit,
     };
+    use super::super::profile::TranslationResponseEnvelope;
 
     fn language_pair() -> LanguagePair {
         LanguagePair::new(
@@ -1337,12 +1431,7 @@ mod tests {
                 Vec::new(),
             ),
             unresolved: NonEmptyTaskItems::new(
-                UnresolvedTranslationUnit::new(
-                    2,
-                    test_identity(2),
-                    Vec::new(),
-                    TranslationUnitRejectionReason::Missing,
-                ),
+                UnresolvedTranslationUnit::new(2, 0, TranslationUnitRejectionReason::Missing),
                 Vec::new(),
             ),
         })
@@ -1358,12 +1447,7 @@ mod tests {
             final_response: None,
             reason: TranslationTaskUnavailableReason::AllOutputsRejected,
             unresolved: NonEmptyTaskItems::new(
-                UnresolvedTranslationUnit::new(
-                    1,
-                    test_identity(1),
-                    Vec::new(),
-                    TranslationUnitRejectionReason::Missing,
-                ),
+                UnresolvedTranslationUnit::new(1, 0, TranslationUnitRejectionReason::Missing),
                 Vec::new(),
             ),
         })
@@ -1541,16 +1625,10 @@ mod tests {
             final_response: FinalLlmResponseMetadata::new(None, None, "stop", None),
             accepted: NonEmptyTaskItems::new(accepted, Vec::new()),
             unresolved: NonEmptyTaskItems::new(
-                UnresolvedTranslationUnit::new(
-                    2,
-                    test_identity(2),
-                    Vec::new(),
-                    TranslationUnitRejectionReason::Duplicate,
-                ),
+                UnresolvedTranslationUnit::new(2, 0, TranslationUnitRejectionReason::Duplicate),
                 vec![UnresolvedTranslationUnit::new(
                     3,
-                    test_identity(3),
-                    Vec::new(),
+                    0,
                     TranslationUnitRejectionReason::Missing,
                 )],
             ),
@@ -1599,7 +1677,7 @@ mod tests {
             ["### ID 1", "### ID 1", "### ID 99", "### ID bad"],
             "Assistant 必须完整保持重复、未知和非法 ID 的原始条目顺序"
         );
-        assert!(markdown.contains("{\n  \"raw\": true\n}"));
+        assert!(markdown.contains("```json\n{\"raw\":true}\n```"));
         assert!(markdown.contains("- 状态：部分完成，已确认提交"));
         assert!(markdown.contains("  - `2`：重复模型输出"));
         assert!(markdown.contains("  - `3`：缺少模型输出"));
@@ -1679,8 +1757,7 @@ mod tests {
             .map(|id| {
                 UnresolvedTranslationUnit::new(
                     id,
-                    test_identity(id),
-                    Vec::new(),
+                    0,
                     TranslationUnitRejectionReason::InvalidShape {
                         message: parse_error.to_owned(),
                     },
@@ -2083,6 +2160,82 @@ mod tests {
     }
 
     #[test]
+    fn deeply_nested_raw_json_record_stays_valid_redacted_and_stack_safe() {
+        const DEPTH: usize = 10_000;
+        const KEY: &str = "quote\"slash\\value";
+
+        let encoded_key = serde_json::to_string(KEY).expect("API key 应可序列化");
+        let encoded_fragment = &encoded_key[1..encoded_key.len() - 1];
+        let raw_json = format!(
+            "{}{{\"secret\":\"before-{encoded_fragment}-after\"}}{}",
+            "[".repeat(DEPTH),
+            "]".repeat(DEPTH)
+        );
+        let raw_assistant = format!(r#"{{"1":{raw_json}}}"#);
+        let parsed =
+            parse_translation_response(&raw_assistant, TranslationResponseEnvelope::JsonOnly)
+                .expect("深层测试值必须是合法 JSON");
+        let (_, mut entries) = parsed.into_parts();
+        let (_, raw_value, _) = entries
+            .pop()
+            .expect("深层测试响应必须包含一个条目")
+            .into_parts();
+        let response = TranslationTaskResponseRecord::parsed(
+            raw_assistant,
+            None,
+            vec![TranslationAssistantEntry::projected(
+                "1".to_owned(),
+                TranslationAssistantRecordedValue::RawJson(raw_value),
+                Some(1),
+                Some(TranslationAssistantValueError::NonStringItem {
+                    item: NonZeroUsize::MIN,
+                }),
+            )],
+        );
+        let evidence = TranslationTaskExecutionEvidence::new(
+            OffsetDateTime::UNIX_EPOCH,
+            Duration::ZERO,
+            Vec::new(),
+            Some(response),
+        );
+        let document = TranslationTaskRecordDocument::new(
+            1,
+            TranslationTaskBlock::new(
+                RpgMakerTranslationTaskIndex::new(0),
+                language_pair(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            evidence,
+            TranslationTaskRecordFinalState::ExecutionFailedNoChanges { diagnostic: None },
+        );
+
+        let markdown = render_task_record(
+            "run-deep-raw",
+            &client("https://example.test", "model", Map::new(), KEY),
+            UiLocale::SimplifiedChinese,
+            &document,
+        )
+        .expect("深层 RawJson 任务记录应可渲染");
+        let assistant = markdown
+            .split_once("### ID 1\n\n")
+            .expect("记录必须包含测试 ID")
+            .1;
+        let fenced = assistant
+            .strip_prefix("```json\n")
+            .expect("非法值必须使用 JSON 围栏");
+        let rendered_json = fenced.split_once("\n```").expect("JSON 围栏必须闭合").0;
+        let reparsed =
+            serde_json::from_str::<Box<RawValue>>(rendered_json).expect("脱敏后仍必须是合法 JSON");
+
+        assert!(!rendered_json.contains(KEY));
+        assert!(!rendered_json.contains(encoded_fragment));
+        assert!(rendered_json.contains("[REDACTED API KEY]"));
+        drop(reparsed);
+        drop(document);
+    }
+
+    #[test]
     fn final_rejections_and_protocol_diagnostics_redact_keys_and_escape_markdown() {
         const KEY: &str = "api`key";
         const NEIGHBOR: &str = "ordinary``marker";
@@ -2118,8 +2271,7 @@ mod tests {
             unresolved: NonEmptyTaskItems::new(
                 UnresolvedTranslationUnit::new(
                     2,
-                    test_identity(2),
-                    Vec::new(),
+                    0,
                     TranslationUnitRejectionReason::SourceResidual {
                         fragment: format!("{NEIGHBOR}:{KEY}\nsource"),
                     },
@@ -2127,16 +2279,14 @@ mod tests {
                 vec![
                     UnresolvedTranslationUnit::new(
                         3,
-                        test_identity(3),
-                        Vec::new(),
+                        0,
                         TranslationUnitRejectionReason::PlaceholderMismatch {
                             token: format!("{NEIGHBOR}:{KEY}"),
                         },
                     ),
                     UnresolvedTranslationUnit::new(
                         4,
-                        test_identity(4),
-                        Vec::new(),
+                        0,
                         TranslationUnitRejectionReason::InvalidShape {
                             message: format!("{NEIGHBOR}:{KEY}\nshape"),
                         },
@@ -2209,6 +2359,89 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rendered_rpg_user_and_raw_quote_prefixed_assistant_key_are_both_redacted() {
+        const KEY: &str = "\"secret[]\\value";
+        let escaped_key = KEY.chars().fold(String::new(), |mut output, character| {
+            if character.is_ascii_punctuation() {
+                output.push('\\');
+            }
+            output.push(character);
+            output
+        });
+        let document = document(
+            vec![ChatMessage::new(
+                ChatMessageRole::User,
+                format!("unit={escaped_key}"),
+            )],
+            Vec::new(),
+            Some(TranslationTaskResponseRecord::unprocessed(format!(
+                "prefix {KEY} trailing {{"
+            ))),
+            TranslationTaskRecordFinalState::CancelledNoChanges { outcome: None },
+        );
+
+        let markdown = render_task_record(
+            "run-rendered-redaction",
+            &client("https://example.test", "model", Map::new(), KEY),
+            UiLocale::SimplifiedChinese,
+            &document,
+        )
+        .expect("RPG Maker 任务记录应可渲染");
+
+        assert!(!markdown.contains(KEY));
+        assert!(!markdown.contains(&escaped_key));
+        assert_eq!(markdown.matches("[REDACTED API KEY]").count(), 2);
+    }
+
+    #[test]
+    fn response_value_error_index_keeps_only_unique_canonical_ids() {
+        let unique = TranslationAssistantEntry::projected(
+            "1".to_owned(),
+            TranslationAssistantRecordedValue::RawJson(
+                RawValue::from_string("{}".to_owned()).expect("测试 JSON 应合法"),
+            ),
+            Some(1),
+            Some(TranslationAssistantValueError::NotStringArray),
+        );
+        let duplicate_first = TranslationAssistantEntry::projected(
+            "2".to_owned(),
+            TranslationAssistantRecordedValue::RawJson(
+                RawValue::from_string("{}".to_owned()).expect("测试 JSON 应合法"),
+            ),
+            Some(2),
+            Some(TranslationAssistantValueError::NotStringArray),
+        );
+        let duplicate_second = TranslationAssistantEntry::projected(
+            "02".to_owned(),
+            TranslationAssistantRecordedValue::RawJson(
+                RawValue::from_string("[]".to_owned()).expect("测试 JSON 应合法"),
+            ),
+            Some(2),
+            Some(TranslationAssistantValueError::NonStringItem {
+                item: NonZeroUsize::MIN,
+            }),
+        );
+        let document = document(
+            Vec::new(),
+            Vec::new(),
+            Some(TranslationTaskResponseRecord::parsed(
+                "raw".to_owned(),
+                None,
+                vec![unique, duplicate_first, duplicate_second],
+            )),
+            TranslationTaskRecordFinalState::CancelledNoChanges { outcome: None },
+        );
+
+        let errors = response_value_errors_by_id(&document);
+        assert_eq!(
+            errors.get(&1).copied().flatten(),
+            Some(TranslationAssistantValueError::NotStringArray)
+        );
+        assert_eq!(errors.get(&2).copied().flatten(), None);
+        assert_eq!(errors.get(&3), None);
+    }
+
     #[tokio::test]
     async fn existing_target_is_reported_without_overwrite_or_business_failure() {
         let directory = tempdir().expect("临时目录应可建立");
@@ -2219,6 +2452,8 @@ mod tests {
 
         let file_system = SystemFileSystem::new(SystemFileSystemConfig::production())
             .expect("文件系统执行根应可建立");
+        let cpu = RayonCpuExecutor::start(CpuExecutorConfig::fixed(NonZeroUsize::MIN))
+            .expect("CPU 执行根应可建立");
         let log_runtime =
             start_project_log(directory.path().join("logs"), "run-conflict".to_owned());
         let logger = log_runtime.logger();
@@ -2227,6 +2462,7 @@ mod tests {
             "run-conflict".to_owned(),
             client("https://example.test", "model", Map::new(), "unused-key"),
             UiLocale::SimplifiedChinese,
+            cpu.clone(),
             file_system,
             logger.clone(),
         );
@@ -2251,6 +2487,7 @@ mod tests {
             1,
             "任务记录故障必须进入独立、可见但非致命的任务记录健康状态"
         );
+        cpu.shutdown().expect("CPU 执行根应可关闭");
         drop(log_runtime);
     }
 }

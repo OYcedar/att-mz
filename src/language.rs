@@ -4,6 +4,7 @@
 //! 占位符协议、LLM 或运行时根能力。
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -13,6 +14,8 @@ use std::sync::Arc;
 use language_tags::{LanguageTag, ParseError as LanguageTagParseError, ValidationError};
 
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
+
+const LANGUAGE_TEXT_CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
 
 /// 已按 RFC 5646 验证并规范化的语言标签。
 ///
@@ -224,16 +227,52 @@ pub(crate) struct LanguageText {
     segments: Vec<LanguageTextSegment>,
 }
 
+fn append_language_text_with_cancellation<E>(
+    output: &mut String,
+    text: &str,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<(), E> {
+    let mut start = 0_usize;
+    while start < text.len() {
+        ensure_running()?;
+        let mut end = start
+            .saturating_add(LANGUAGE_TEXT_CANCELLATION_CHECK_BYTES)
+            .min(text.len());
+        while end < text.len() && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        output.push_str(&text[start..end]);
+        start = end;
+    }
+    ensure_running()
+}
+
 impl LanguageText {
+    #[cfg(test)]
     pub(crate) fn new(segments: Vec<LanguageTextSegment>) -> Self {
+        match Self::new_with_cancellation(segments, || Ok::<_, Infallible>(())) {
+            Ok(text) => text,
+            Err(unreachable) => match unreachable {},
+        }
+    }
+
+    pub(crate) fn new_with_cancellation<E>(
+        segments: Vec<LanguageTextSegment>,
+        mut ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Self, E> {
         let mut normalized = Vec::with_capacity(segments.len());
         for segment in segments {
+            ensure_running()?;
             match segment {
                 LanguageTextSegment::NaturalText(text) if text.is_empty() => {}
                 LanguageTextSegment::NaturalText(text) => {
                     if let Some(LanguageTextSegment::NaturalText(previous)) = normalized.last_mut()
                     {
-                        previous.push_str(&text);
+                        append_language_text_with_cancellation(
+                            previous,
+                            &text,
+                            &mut ensure_running,
+                        )?;
                     } else {
                         normalized.push(LanguageTextSegment::NaturalText(text));
                     }
@@ -243,9 +282,10 @@ impl LanguageText {
                 }
             }
         }
-        Self {
+        ensure_running()?;
+        Ok(Self {
             segments: normalized,
-        }
+        })
     }
 
     #[cfg(test)]
@@ -265,13 +305,35 @@ impl LanguageText {
     }
 
     /// 验证并应用语言模块给出的字符级修复。
+    #[cfg(test)]
     pub(crate) fn apply_repair(
         &self,
         plan: &LanguageRepairPlan,
     ) -> Result<Self, LanguageRepairApplicationError> {
-        let mut segments = self.segments.clone();
+        match self.apply_repair_with_cancellation(plan, || Ok::<_, Infallible>(())) {
+            Ok(result) => result,
+            Err(unreachable) => match unreachable {},
+        }
+    }
+
+    pub(crate) fn apply_repair_with_cancellation<E>(
+        &self,
+        plan: &LanguageRepairPlan,
+        mut ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Result<Self, LanguageRepairApplicationError>, E> {
+        let mut segments = Vec::with_capacity(self.segments.len());
+        for segment in &self.segments {
+            ensure_running()?;
+            segments.push(match segment {
+                LanguageTextSegment::NaturalText(text) => LanguageTextSegment::NaturalText(
+                    clone_language_text_with_cancellation(text, &mut ensure_running)?,
+                ),
+                LanguageTextSegment::OpaqueBoundary => LanguageTextSegment::OpaqueBoundary,
+            });
+        }
         let mut by_segment = BTreeMap::<usize, Vec<&LanguageCharacterReplacement>>::new();
         for replacement in plan.replacements() {
+            ensure_running()?;
             by_segment
                 .entry(replacement.segment_index())
                 .or_default()
@@ -279,48 +341,85 @@ impl LanguageText {
         }
 
         for (segment_index, mut replacements) in by_segment {
+            ensure_running()?;
             let Some(LanguageTextSegment::NaturalText(text)) = segments.get_mut(segment_index)
             else {
-                return Err(LanguageRepairApplicationError::InvalidNaturalSegment {
+                return Ok(Err(LanguageRepairApplicationError::InvalidNaturalSegment {
                     segment_index,
-                });
+                }));
             };
-            replacements.sort_by_key(|replacement| replacement.byte_offset());
+            stable_sort_language_replacements_with_cancellation(
+                &mut replacements,
+                &mut ensure_running,
+            )?;
             for pair in replacements.windows(2) {
+                ensure_running()?;
                 if pair[0].byte_offset() == pair[1].byte_offset() {
-                    return Err(LanguageRepairApplicationError::DuplicatePosition {
+                    return Ok(Err(LanguageRepairApplicationError::DuplicatePosition {
                         segment_index,
                         byte_offset: pair[0].byte_offset(),
-                    });
+                    }));
                 }
             }
-            for replacement in replacements.into_iter().rev() {
+            let mut rebuilt_capacity = text.len();
+            for replacement in replacements.iter().rev() {
+                ensure_running()?;
                 let byte_offset = replacement.byte_offset();
                 if !text.is_char_boundary(byte_offset) {
-                    return Err(LanguageRepairApplicationError::InvalidCharacterBoundary {
-                        segment_index,
-                        byte_offset,
-                    });
+                    return Ok(Err(
+                        LanguageRepairApplicationError::InvalidCharacterBoundary {
+                            segment_index,
+                            byte_offset,
+                        },
+                    ));
                 }
                 let Some(actual) = text[byte_offset..].chars().next() else {
-                    return Err(LanguageRepairApplicationError::MissingCharacter {
+                    return Ok(Err(LanguageRepairApplicationError::MissingCharacter {
                         segment_index,
                         byte_offset,
-                    });
+                    }));
                 };
                 if actual != replacement.expected() {
-                    return Err(LanguageRepairApplicationError::UnexpectedCharacter {
+                    return Ok(Err(LanguageRepairApplicationError::UnexpectedCharacter {
                         segment_index,
                         byte_offset,
                         expected: replacement.expected(),
                         actual,
-                    });
+                    }));
                 }
-                let end = byte_offset + actual.len_utf8();
-                text.replace_range(byte_offset..end, &replacement.replacement().to_string());
+                rebuilt_capacity = rebuilt_capacity
+                    .checked_sub(actual.len_utf8())
+                    .and_then(|length| length.checked_add(replacement.replacement().len_utf8()))
+                    .expect("语言修复结果长度必须能由 usize 表示");
             }
+
+            let original = std::mem::take(text);
+            let mut rebuilt = String::with_capacity(rebuilt_capacity);
+            let mut cursor = 0_usize;
+            for replacement in replacements {
+                ensure_running()?;
+                let byte_offset = replacement.byte_offset();
+                append_language_text_with_cancellation(
+                    &mut rebuilt,
+                    &original[cursor..byte_offset],
+                    &mut ensure_running,
+                )?;
+                let actual = original[byte_offset..]
+                    .chars()
+                    .next()
+                    .expect("修复位置已经验证");
+                rebuilt.push(replacement.replacement());
+                cursor = byte_offset + actual.len_utf8();
+            }
+            append_language_text_with_cancellation(
+                &mut rebuilt,
+                &original[cursor..],
+                &mut ensure_running,
+            )?;
+            *text = rebuilt;
         }
-        Ok(Self::new(segments))
+        let repaired = Self::new_with_cancellation(segments, ensure_running)?;
+        Ok(Ok(repaired))
     }
 }
 
@@ -358,6 +457,49 @@ impl LanguageCharacterReplacement {
     pub(crate) const fn replacement(&self) -> char {
         self.replacement
     }
+}
+
+fn stable_sort_language_replacements_with_cancellation<E>(
+    replacements: &mut Vec<&LanguageCharacterReplacement>,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<(), E> {
+    let mut scratch = Vec::with_capacity(replacements.len());
+    for replacement in replacements.iter().copied() {
+        ensure_running()?;
+        scratch.push(replacement);
+    }
+    let mut width = 1_usize;
+    while width < replacements.len() {
+        let run_width = width.saturating_mul(2);
+        let mut run_start = 0_usize;
+        while run_start < replacements.len() {
+            let middle = run_start.saturating_add(width).min(replacements.len());
+            let run_end = run_start.saturating_add(run_width).min(replacements.len());
+            let mut left = run_start;
+            let mut right = middle;
+            let mut output = run_start;
+            while output < run_end {
+                ensure_running()?;
+                let take_left = right == run_end
+                    || (left < middle
+                        && replacements[left].byte_offset() <= replacements[right].byte_offset());
+                scratch[output] = if take_left {
+                    let replacement = replacements[left];
+                    left += 1;
+                    replacement
+                } else {
+                    let replacement = replacements[right];
+                    right += 1;
+                    replacement
+                };
+                output += 1;
+            }
+            run_start = run_end;
+        }
+        std::mem::swap(replacements, &mut scratch);
+        width = run_width;
+    }
+    ensure_running()
 }
 
 /// 可选阅读风格修复；空计划表示无需修改或无法唯一证明修改安全。
@@ -516,6 +658,16 @@ pub(crate) trait LanguageModule: Send + Sync {
     /// 返回仅由当前语言策略决定的稳定语义指纹。
     fn semantic_fingerprint(&self) -> Sha256Fingerprint;
 
+    fn semantic_fingerprint_with_cancellation(
+        &self,
+        ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
+    ) -> Result<Sha256Fingerprint, LanguageOperationCancelled> {
+        ensure_running()?;
+        let fingerprint = self.semantic_fingerprint();
+        ensure_running()?;
+        Ok(fingerprint)
+    }
+
     fn analyze_source(&self, text: &LanguageText) -> LanguageAnalysis;
 
     fn find_source_residual(
@@ -529,7 +681,46 @@ pub(crate) trait LanguageModule: Send + Sync {
         analysis: &LanguageAnalysis,
         translation: &LanguageText,
     ) -> Result<LanguageRepairPlan, LanguageModuleError>;
+
+    fn analyze_source_with_cancellation(
+        &self,
+        text: &LanguageText,
+        ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
+    ) -> Result<LanguageAnalysis, LanguageOperationCancelled> {
+        ensure_running()?;
+        let analysis = self.analyze_source(text);
+        ensure_running()?;
+        Ok(analysis)
+    }
+
+    fn find_source_residual_with_cancellation(
+        &self,
+        analysis: &LanguageAnalysis,
+        translation: &LanguageText,
+        ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
+    ) -> Result<Result<Option<LanguageResidual>, LanguageModuleError>, LanguageOperationCancelled>
+    {
+        ensure_running()?;
+        let residual = self.find_source_residual(analysis, translation);
+        ensure_running()?;
+        Ok(residual)
+    }
+
+    fn plan_translation_repair_with_cancellation(
+        &self,
+        analysis: &LanguageAnalysis,
+        translation: &LanguageText,
+        ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
+    ) -> Result<Result<LanguageRepairPlan, LanguageModuleError>, LanguageOperationCancelled> {
+        ensure_running()?;
+        let repair = self.plan_translation_repair(analysis, translation);
+        ensure_running()?;
+        Ok(repair)
+    }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LanguageOperationCancelled;
 
 /// TaskBlock 的分析事实与当前精确源语言绑定不一致。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -751,11 +942,20 @@ impl JapaneseQuoteRepairPolicy {
         Ok(Self { candidate_pairs })
     }
 
-    fn all_pairs(&self) -> Vec<QuotePair> {
-        JAPANESE_QUOTE_PAIRS
+    fn all_pairs_with_cancellation<E>(
+        &self,
+        ensure_running: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<Vec<QuotePair>, E> {
+        let mut pairs = Vec::with_capacity(JAPANESE_QUOTE_PAIRS.len() + self.candidate_pairs.len());
+        for pair in JAPANESE_QUOTE_PAIRS
             .into_iter()
             .chain(self.candidate_pairs.iter().copied())
-            .collect()
+        {
+            ensure_running()?;
+            pairs.push(pair);
+        }
+        ensure_running()?;
+        Ok(pairs)
     }
 }
 
@@ -824,22 +1024,14 @@ impl JapaneseLanguageModule {
             quote_repair_policy,
         }
     }
-}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct JapaneseLanguageAnalysis {
-    needs_translation: bool,
-    quote_structure: Option<Vec<JapaneseQuoteNode>>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct JapaneseQuoteNode {
-    pair: QuotePair,
-    parent: Option<usize>,
-}
-
-impl LanguageModule for JapaneseLanguageModule {
-    fn semantic_fingerprint(&self) -> Sha256Fingerprint {
+    fn semantic_fingerprint_with_check<E>(
+        &self,
+        mut ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Sha256Fingerprint, E> {
+        ensure_running()?;
+        let chunk_size =
+            NonZeroUsize::new(LANGUAGE_TEXT_CANCELLATION_CHECK_BYTES).expect("检查块大小必须非零");
         let mut hasher = Sha256FramedHasher::new(b"att.language.japanese");
         hasher.frame(
             1,
@@ -848,7 +1040,8 @@ impl LanguageModule for JapaneseLanguageModule {
                 .to_be_bytes(),
         );
         for term in &self.residual_policy.allowed_terms {
-            hasher.frame(2, term.as_bytes());
+            ensure_running()?;
+            hasher.try_frame_chunks(2, term.as_bytes(), chunk_size, &mut ensure_running)?;
         }
         match &self.quote_repair_policy {
             None => {
@@ -857,6 +1050,7 @@ impl LanguageModule for JapaneseLanguageModule {
             Some(policy) => {
                 hasher.frame(3, &[1]);
                 for pair in &policy.candidate_pairs {
+                    ensure_running()?;
                     let mut encoded = [0_u8; 8];
                     encoded[..4].copy_from_slice(&u32::from(pair.opening()).to_be_bytes());
                     encoded[4..].copy_from_slice(&u32::from(pair.closing()).to_be_bytes());
@@ -864,78 +1058,121 @@ impl LanguageModule for JapaneseLanguageModule {
                 }
             }
         }
-        hasher.finish()
+        ensure_running()?;
+        Ok(hasher.finish())
     }
 
-    fn analyze_source(&self, text: &LanguageText) -> LanguageAnalysis {
-        let needs_translation = natural_texts(text)
-            .flat_map(str::chars)
-            .any(is_japanese_source_character);
-        let quote_structure = parse_quote_structure(text, &JAPANESE_QUOTE_PAIRS).map(|nodes| {
-            nodes
-                .into_iter()
-                .map(|node| JapaneseQuoteNode {
-                    pair: node.pair,
-                    parent: node.parent,
-                })
-                .collect()
-        });
-        LanguageAnalysis::Japanese(JapaneseLanguageAnalysis {
+    fn analyze_source_with_check<E>(
+        &self,
+        text: &LanguageText,
+        mut ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<LanguageAnalysis, E> {
+        ensure_running()?;
+        let mut needs_translation = false;
+        'segments: for segment in text.segments() {
+            ensure_running()?;
+            let LanguageTextSegment::NaturalText(text) = segment else {
+                continue;
+            };
+            let mut next_check = 0_usize;
+            for (byte_offset, character) in text.char_indices() {
+                ensure_language_text_progress(byte_offset, &mut next_check, &mut ensure_running)?;
+                if is_japanese_source_character(character) {
+                    needs_translation = true;
+                    break 'segments;
+                }
+            }
+        }
+        let quote_structure = match parse_quote_structure_with_cancellation(
+            text,
+            &JAPANESE_QUOTE_PAIRS,
+            &mut ensure_running,
+        )? {
+            Some(nodes) => {
+                let mut structure = Vec::with_capacity(nodes.len());
+                for node in nodes {
+                    ensure_running()?;
+                    structure.push(JapaneseQuoteNode {
+                        pair: node.pair,
+                        parent: node.parent,
+                    });
+                }
+                Some(structure)
+            }
+            None => None,
+        };
+        ensure_running()?;
+        Ok(LanguageAnalysis::Japanese(JapaneseLanguageAnalysis {
             needs_translation,
             quote_structure,
-        })
+        }))
     }
 
-    fn find_source_residual(
+    fn find_source_residual_with_check<E>(
         &self,
         analysis: &LanguageAnalysis,
         translation: &LanguageText,
-    ) -> Result<Option<LanguageResidual>, LanguageModuleError> {
+        mut ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Result<Option<LanguageResidual>, LanguageModuleError>, E> {
+        ensure_running()?;
         let LanguageAnalysis::Japanese(_) = analysis else {
-            return Err(LanguageModuleError::analysis_mismatch(
+            return Ok(Err(LanguageModuleError::analysis_mismatch(
                 LanguageModuleKind::Japanese,
                 analysis,
-            ));
+            )));
         };
         for text in natural_texts(translation) {
-            if let Some(fragment) = first_japanese_residual(
+            ensure_running()?;
+            if let Some(fragment) = first_japanese_residual_with_cancellation(
                 text,
                 self.residual_policy.minimum_kana_characters,
                 &self.residual_policy.allowed_terms,
-            ) {
-                return Ok(Some(LanguageResidual::new(fragment)));
+                &mut ensure_running,
+            )? {
+                return Ok(Ok(Some(LanguageResidual::new(fragment))));
             }
         }
-        Ok(None)
+        ensure_running()?;
+        Ok(Ok(None))
     }
 
-    fn plan_translation_repair(
+    fn plan_translation_repair_with_check<E>(
         &self,
         analysis: &LanguageAnalysis,
         translation: &LanguageText,
-    ) -> Result<LanguageRepairPlan, LanguageModuleError> {
+        mut ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Result<LanguageRepairPlan, LanguageModuleError>, E> {
+        ensure_running()?;
         let LanguageAnalysis::Japanese(analysis) = analysis else {
-            return Err(LanguageModuleError::analysis_mismatch(
+            return Ok(Err(LanguageModuleError::analysis_mismatch(
                 LanguageModuleKind::Japanese,
                 analysis,
-            ));
+            )));
         };
         let (Some(policy), Some(source_nodes)) =
             (&self.quote_repair_policy, &analysis.quote_structure)
         else {
-            return Ok(LanguageRepairPlan::unchanged());
+            ensure_running()?;
+            return Ok(Ok(LanguageRepairPlan::unchanged()));
         };
         if source_nodes.is_empty() {
-            return Ok(LanguageRepairPlan::unchanged());
+            ensure_running()?;
+            return Ok(Ok(LanguageRepairPlan::unchanged()));
         }
-        let Some(target_nodes) =
-            match_quote_structure(translation, &policy.all_pairs(), source_nodes)
+        let pairs = policy.all_pairs_with_cancellation(&mut ensure_running)?;
+        let Some(target_nodes) = match_quote_structure_with_cancellation(
+            translation,
+            &pairs,
+            source_nodes,
+            &mut ensure_running,
+        )?
         else {
-            return Ok(LanguageRepairPlan::unchanged());
+            return Ok(Ok(LanguageRepairPlan::unchanged()));
         };
 
         let mut replacements = Vec::new();
         for (source, target) in source_nodes.iter().zip(target_nodes) {
+            ensure_running()?;
             if target.pair.opening() != source.pair.opening() {
                 replacements.push(LanguageCharacterReplacement::new(
                     target.opening.segment_index,
@@ -953,7 +1190,98 @@ impl LanguageModule for JapaneseLanguageModule {
                 ));
             }
         }
-        Ok(LanguageRepairPlan::replacing(replacements))
+        ensure_running()?;
+        Ok(Ok(LanguageRepairPlan::replacing(replacements)))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct JapaneseLanguageAnalysis {
+    needs_translation: bool,
+    quote_structure: Option<Vec<JapaneseQuoteNode>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct JapaneseQuoteNode {
+    pair: QuotePair,
+    parent: Option<usize>,
+}
+
+impl LanguageModule for JapaneseLanguageModule {
+    fn semantic_fingerprint(&self) -> Sha256Fingerprint {
+        match self.semantic_fingerprint_with_check(|| Ok::<_, Infallible>(())) {
+            Ok(fingerprint) => fingerprint,
+            Err(unreachable) => match unreachable {},
+        }
+    }
+
+    fn semantic_fingerprint_with_cancellation(
+        &self,
+        ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
+    ) -> Result<Sha256Fingerprint, LanguageOperationCancelled> {
+        self.semantic_fingerprint_with_check(ensure_running)
+    }
+
+    fn analyze_source(&self, text: &LanguageText) -> LanguageAnalysis {
+        match self.analyze_source_with_check(text, || Ok::<_, Infallible>(())) {
+            Ok(analysis) => analysis,
+            Err(unreachable) => match unreachable {},
+        }
+    }
+
+    fn find_source_residual(
+        &self,
+        analysis: &LanguageAnalysis,
+        translation: &LanguageText,
+    ) -> Result<Option<LanguageResidual>, LanguageModuleError> {
+        match self.find_source_residual_with_check(
+            analysis,
+            translation,
+            || Ok::<_, Infallible>(()),
+        ) {
+            Ok(result) => result,
+            Err(unreachable) => match unreachable {},
+        }
+    }
+
+    fn plan_translation_repair(
+        &self,
+        analysis: &LanguageAnalysis,
+        translation: &LanguageText,
+    ) -> Result<LanguageRepairPlan, LanguageModuleError> {
+        match self
+            .plan_translation_repair_with_check(analysis, translation, || Ok::<_, Infallible>(()))
+        {
+            Ok(result) => result,
+            Err(unreachable) => match unreachable {},
+        }
+    }
+
+    fn analyze_source_with_cancellation(
+        &self,
+        text: &LanguageText,
+        ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
+    ) -> Result<LanguageAnalysis, LanguageOperationCancelled> {
+        self.analyze_source_with_check(text, ensure_running)
+    }
+
+    fn find_source_residual_with_cancellation(
+        &self,
+        analysis: &LanguageAnalysis,
+        translation: &LanguageText,
+        ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
+    ) -> Result<Result<Option<LanguageResidual>, LanguageModuleError>, LanguageOperationCancelled>
+    {
+        self.find_source_residual_with_check(analysis, translation, ensure_running)
+    }
+
+    fn plan_translation_repair_with_cancellation(
+        &self,
+        analysis: &LanguageAnalysis,
+        translation: &LanguageText,
+        ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
+    ) -> Result<Result<LanguageRepairPlan, LanguageModuleError>, LanguageOperationCancelled> {
+        self.plan_translation_repair_with_check(analysis, translation, ensure_running)
     }
 }
 
@@ -1018,6 +1346,140 @@ impl EnglishLanguageModule {
             residual_policy,
         }
     }
+
+    fn semantic_fingerprint_with_check<E>(
+        &self,
+        mut ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Sha256Fingerprint, E> {
+        ensure_running()?;
+        let chunk_size =
+            NonZeroUsize::new(LANGUAGE_TEXT_CANCELLATION_CHECK_BYTES).expect("检查块大小必须非零");
+        let mut hasher = Sha256FramedHasher::new(b"att.language.english");
+        for (tag, value) in [
+            (1, self.detection_policy.minimum_word_count.get()),
+            (2, self.detection_policy.minimum_letter_count.get()),
+            (4, self.residual_policy.minimum_copied_word_count.get()),
+            (5, self.residual_policy.minimum_copied_letter_count.get()),
+        ] {
+            ensure_running()?;
+            hasher.frame(
+                tag,
+                &u64::try_from(value)
+                    .expect("x86_64 usize 必须可表示为 u64")
+                    .to_be_bytes(),
+            );
+        }
+        for term in &self.detection_policy.ignored_terms {
+            ensure_running()?;
+            hasher.try_frame_chunks(3, term.as_bytes(), chunk_size, &mut ensure_running)?;
+        }
+        for term in &self.residual_policy.allowed_terms {
+            ensure_running()?;
+            hasher.try_frame_chunks(6, term.as_bytes(), chunk_size, &mut ensure_running)?;
+        }
+        ensure_running()?;
+        Ok(hasher.finish())
+    }
+
+    fn analyze_source_with_check<E>(
+        &self,
+        text: &LanguageText,
+        mut ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<LanguageAnalysis, E> {
+        ensure_running()?;
+        let detection_runs = english_runs_with_cancellation(
+            text,
+            &self.detection_policy.ignored_terms,
+            &mut ensure_running,
+        )?;
+        let mut needs_translation = false;
+        for run in &detection_runs {
+            ensure_running()?;
+            if reaches_word_threshold_with_cancellation(
+                run,
+                self.detection_policy.minimum_word_count,
+                self.detection_policy.minimum_letter_count,
+                &mut ensure_running,
+            )? {
+                needs_translation = true;
+                break;
+            }
+        }
+        let source_runs = english_runs_with_cancellation(
+            text,
+            &self.residual_policy.allowed_terms,
+            &mut ensure_running,
+        )?;
+        let mut residual_source_runs = Vec::with_capacity(source_runs.len());
+        for run in source_runs {
+            ensure_running()?;
+            let mut normalized_run = Vec::with_capacity(run.len());
+            for word in run {
+                ensure_running()?;
+                normalized_run.push(word.normalized);
+            }
+            residual_source_runs.push(normalized_run);
+        }
+        ensure_running()?;
+        Ok(LanguageAnalysis::English(EnglishLanguageAnalysis {
+            needs_translation,
+            residual_source_runs,
+        }))
+    }
+
+    fn find_source_residual_with_check<E>(
+        &self,
+        analysis: &LanguageAnalysis,
+        translation: &LanguageText,
+        mut ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Result<Option<LanguageResidual>, LanguageModuleError>, E> {
+        ensure_running()?;
+        let LanguageAnalysis::English(analysis) = analysis else {
+            return Ok(Err(LanguageModuleError::analysis_mismatch(
+                LanguageModuleKind::English,
+                analysis,
+            )));
+        };
+        for segment in natural_texts(translation) {
+            ensure_running()?;
+            let runs = english_runs_in_segment_with_cancellation(
+                segment,
+                &self.residual_policy.allowed_terms,
+                &mut ensure_running,
+            )?;
+            for run in runs {
+                ensure_running()?;
+                if let Some(fragment) = first_copied_english_fragment_with_cancellation(
+                    segment,
+                    &run,
+                    &analysis.residual_source_runs,
+                    self.residual_policy.minimum_copied_word_count,
+                    self.residual_policy.minimum_copied_letter_count,
+                    &mut ensure_running,
+                )? {
+                    return Ok(Ok(Some(LanguageResidual::new(fragment))));
+                }
+            }
+        }
+        ensure_running()?;
+        Ok(Ok(None))
+    }
+
+    fn plan_translation_repair_with_check<E>(
+        &self,
+        analysis: &LanguageAnalysis,
+        mut ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Result<LanguageRepairPlan, LanguageModuleError>, E> {
+        ensure_running()?;
+        let LanguageAnalysis::English(_) = analysis else {
+            return Ok(Err(LanguageModuleError::analysis_mismatch(
+                LanguageModuleKind::English,
+                analysis,
+            )));
+        };
+        ensure_running()?;
+        Ok(Ok(LanguageRepairPlan::unchanged()))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1028,46 +1490,24 @@ pub(crate) struct EnglishLanguageAnalysis {
 
 impl LanguageModule for EnglishLanguageModule {
     fn semantic_fingerprint(&self) -> Sha256Fingerprint {
-        let mut hasher = Sha256FramedHasher::new(b"att.language.english");
-        for (tag, value) in [
-            (1, self.detection_policy.minimum_word_count.get()),
-            (2, self.detection_policy.minimum_letter_count.get()),
-            (4, self.residual_policy.minimum_copied_word_count.get()),
-            (5, self.residual_policy.minimum_copied_letter_count.get()),
-        ] {
-            hasher.frame(
-                tag,
-                &u64::try_from(value)
-                    .expect("x86_64 usize 必须可表示为 u64")
-                    .to_be_bytes(),
-            );
+        match self.semantic_fingerprint_with_check(|| Ok::<_, Infallible>(())) {
+            Ok(fingerprint) => fingerprint,
+            Err(unreachable) => match unreachable {},
         }
-        for term in &self.detection_policy.ignored_terms {
-            hasher.frame(3, term.as_bytes());
-        }
-        for term in &self.residual_policy.allowed_terms {
-            hasher.frame(6, term.as_bytes());
-        }
-        hasher.finish()
+    }
+
+    fn semantic_fingerprint_with_cancellation(
+        &self,
+        ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
+    ) -> Result<Sha256Fingerprint, LanguageOperationCancelled> {
+        self.semantic_fingerprint_with_check(ensure_running)
     }
 
     fn analyze_source(&self, text: &LanguageText) -> LanguageAnalysis {
-        let detection_runs = english_runs(text, &self.detection_policy.ignored_terms);
-        let needs_translation = detection_runs.iter().any(|run| {
-            reaches_word_threshold(
-                run,
-                self.detection_policy.minimum_word_count,
-                self.detection_policy.minimum_letter_count,
-            )
-        });
-        let residual_source_runs = english_runs(text, &self.residual_policy.allowed_terms)
-            .into_iter()
-            .map(|run| run.into_iter().map(|word| word.normalized).collect())
-            .collect();
-        LanguageAnalysis::English(EnglishLanguageAnalysis {
-            needs_translation,
-            residual_source_runs,
-        })
+        match self.analyze_source_with_check(text, || Ok::<_, Infallible>(())) {
+            Ok(analysis) => analysis,
+            Err(unreachable) => match unreachable {},
+        }
     }
 
     fn find_source_residual(
@@ -1075,26 +1515,14 @@ impl LanguageModule for EnglishLanguageModule {
         analysis: &LanguageAnalysis,
         translation: &LanguageText,
     ) -> Result<Option<LanguageResidual>, LanguageModuleError> {
-        let LanguageAnalysis::English(analysis) = analysis else {
-            return Err(LanguageModuleError::analysis_mismatch(
-                LanguageModuleKind::English,
-                analysis,
-            ));
-        };
-        for segment in natural_texts(translation) {
-            for run in english_runs_in_segment(segment, &self.residual_policy.allowed_terms) {
-                if let Some(fragment) = first_copied_english_fragment(
-                    segment,
-                    &run,
-                    &analysis.residual_source_runs,
-                    self.residual_policy.minimum_copied_word_count,
-                    self.residual_policy.minimum_copied_letter_count,
-                ) {
-                    return Ok(Some(LanguageResidual::new(fragment)));
-                }
-            }
+        match self.find_source_residual_with_check(
+            analysis,
+            translation,
+            || Ok::<_, Infallible>(()),
+        ) {
+            Ok(result) => result,
+            Err(unreachable) => match unreachable {},
         }
-        Ok(None)
     }
 
     fn plan_translation_repair(
@@ -1102,13 +1530,37 @@ impl LanguageModule for EnglishLanguageModule {
         analysis: &LanguageAnalysis,
         _translation: &LanguageText,
     ) -> Result<LanguageRepairPlan, LanguageModuleError> {
-        let LanguageAnalysis::English(_) = analysis else {
-            return Err(LanguageModuleError::analysis_mismatch(
-                LanguageModuleKind::English,
-                analysis,
-            ));
-        };
-        Ok(LanguageRepairPlan::unchanged())
+        match self.plan_translation_repair_with_check(analysis, || Ok::<_, Infallible>(())) {
+            Ok(result) => result,
+            Err(unreachable) => match unreachable {},
+        }
+    }
+
+    fn analyze_source_with_cancellation(
+        &self,
+        text: &LanguageText,
+        ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
+    ) -> Result<LanguageAnalysis, LanguageOperationCancelled> {
+        self.analyze_source_with_check(text, ensure_running)
+    }
+
+    fn find_source_residual_with_cancellation(
+        &self,
+        analysis: &LanguageAnalysis,
+        translation: &LanguageText,
+        ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
+    ) -> Result<Result<Option<LanguageResidual>, LanguageModuleError>, LanguageOperationCancelled>
+    {
+        self.find_source_residual_with_check(analysis, translation, ensure_running)
+    }
+
+    fn plan_translation_repair_with_cancellation(
+        &self,
+        analysis: &LanguageAnalysis,
+        _translation: &LanguageText,
+        ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
+    ) -> Result<Result<LanguageRepairPlan, LanguageModuleError>, LanguageOperationCancelled> {
+        self.plan_translation_repair_with_check(analysis, ensure_running)
     }
 }
 
@@ -1164,10 +1616,203 @@ fn collect_terms(
     Ok(result)
 }
 
-fn merge_byte_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
-    ranges.sort_unstable();
+fn clone_language_text_with_cancellation<E>(
+    text: &str,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<String, E> {
+    let mut cloned = String::with_capacity(text.len());
+    append_language_text_with_cancellation(&mut cloned, text, ensure_running)?;
+    Ok(cloned)
+}
+
+fn ascii_lowercase_with_cancellation<E>(
+    text: &str,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<String, E> {
+    let mut normalized = String::with_capacity(text.len());
+    let mut start = 0_usize;
+    while start < text.len() {
+        ensure_running()?;
+        let mut end = start
+            .saturating_add(LANGUAGE_TEXT_CANCELLATION_CHECK_BYTES)
+            .min(text.len());
+        while end < text.len() && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        normalized.push_str(&text[start..end].to_ascii_lowercase());
+        start = end;
+    }
+    ensure_running()?;
+    Ok(normalized)
+}
+
+fn find_language_substring_with_cancellation<E>(
+    text: &str,
+    start: usize,
+    needle: &str,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<Option<usize>, E> {
+    if needle.len() <= LANGUAGE_TEXT_CANCELLATION_CHECK_BYTES {
+        return find_short_language_substring_with_cancellation(
+            text,
+            start,
+            needle,
+            ensure_running,
+        );
+    }
+
+    let mut anchor_end = LANGUAGE_TEXT_CANCELLATION_CHECK_BYTES;
+    while !needle.is_char_boundary(anchor_end) {
+        anchor_end -= 1;
+    }
+    let anchor = &needle[..anchor_end];
+    let first_character_bytes = needle
+        .chars()
+        .next()
+        .expect("非空 needle 必须包含字符")
+        .len_utf8();
+    let mut cursor = start;
+    while let Some(candidate) =
+        find_short_language_substring_with_cancellation(text, cursor, anchor, ensure_running)?
+    {
+        let Some(candidate_end) = candidate.checked_add(needle.len()) else {
+            return Ok(None);
+        };
+        if candidate_end <= text.len()
+            && text.is_char_boundary(candidate_end)
+            && language_text_equal_with_cancellation(
+                &text[candidate..candidate_end],
+                needle,
+                ensure_running,
+            )?
+        {
+            return Ok(Some(candidate));
+        }
+        cursor = candidate.saturating_add(first_character_bytes);
+    }
+    Ok(None)
+}
+
+fn find_short_language_substring_with_cancellation<E>(
+    text: &str,
+    start: usize,
+    needle: &str,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<Option<usize>, E> {
+    debug_assert!(text.is_char_boundary(start));
+    debug_assert!(!needle.is_empty());
+    if text.len().saturating_sub(start) < needle.len() {
+        ensure_running()?;
+        return Ok(None);
+    }
+    let overlap_bytes = needle.len().saturating_sub(1);
+    let mut chunk_start = start;
+    while chunk_start <= text.len() - needle.len() {
+        ensure_running()?;
+        let mut primary_end = chunk_start
+            .saturating_add(LANGUAGE_TEXT_CANCELLATION_CHECK_BYTES)
+            .min(text.len());
+        while primary_end < text.len() && !text.is_char_boundary(primary_end) {
+            primary_end -= 1;
+        }
+        let mut search_end = primary_end.saturating_add(overlap_bytes).min(text.len());
+        while search_end < text.len() && !text.is_char_boundary(search_end) {
+            search_end += 1;
+        }
+        if let Some(relative) = text[chunk_start..search_end].find(needle) {
+            return Ok(Some(chunk_start + relative));
+        }
+        if primary_end == text.len() {
+            break;
+        }
+        chunk_start = primary_end;
+    }
+    ensure_running()?;
+    Ok(None)
+}
+
+fn language_text_equal_with_cancellation<E>(
+    left: &str,
+    right: &str,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    if left.len() != right.len() {
+        ensure_running()?;
+        return Ok(false);
+    }
+    for (left, right) in left
+        .as_bytes()
+        .chunks(LANGUAGE_TEXT_CANCELLATION_CHECK_BYTES)
+        .zip(
+            right
+                .as_bytes()
+                .chunks(LANGUAGE_TEXT_CANCELLATION_CHECK_BYTES),
+        )
+    {
+        ensure_running()?;
+        if left != right {
+            return Ok(false);
+        }
+    }
+    ensure_running()?;
+    Ok(true)
+}
+
+fn ensure_language_text_progress<E>(
+    byte_offset: usize,
+    next_check: &mut usize,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<(), E> {
+    if byte_offset >= *next_check {
+        ensure_running()?;
+        *next_check = byte_offset.saturating_add(LANGUAGE_TEXT_CANCELLATION_CHECK_BYTES);
+    }
+    Ok(())
+}
+
+fn merge_byte_ranges_with_cancellation<E>(
+    mut ranges: Vec<(usize, usize)>,
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<Vec<(usize, usize)>, E> {
+    let mut scratch = Vec::with_capacity(ranges.len());
+    for _ in 0..ranges.len() {
+        ensure_running()?;
+        scratch.push((0_usize, 0_usize));
+    }
+    let mut width = 1_usize;
+    while width < ranges.len() {
+        let run_width = width.saturating_mul(2);
+        let mut run_start = 0_usize;
+        while run_start < ranges.len() {
+            let middle = run_start.saturating_add(width).min(ranges.len());
+            let run_end = run_start.saturating_add(run_width).min(ranges.len());
+            let mut left = run_start;
+            let mut right = middle;
+            let mut output = run_start;
+            while output < run_end {
+                ensure_running()?;
+                let take_left =
+                    right == run_end || (left < middle && ranges[left] <= ranges[right]);
+                scratch[output] = if take_left {
+                    let range = ranges[left];
+                    left += 1;
+                    range
+                } else {
+                    let range = ranges[right];
+                    right += 1;
+                    range
+                };
+                output += 1;
+            }
+            run_start = run_end;
+        }
+        std::mem::swap(&mut ranges, &mut scratch);
+        width = run_width;
+    }
+
     let mut merged = Vec::<(usize, usize)>::with_capacity(ranges.len());
     for (start, end) in ranges {
+        ensure_running()?;
         if let Some((_, previous_end)) = merged.last_mut()
             && start <= *previous_end
         {
@@ -1176,7 +1821,8 @@ fn merge_byte_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
             merged.push((start, end));
         }
     }
-    merged
+    ensure_running()?;
+    Ok(merged)
 }
 
 fn natural_texts(text: &LanguageText) -> impl Iterator<Item = &str> {
@@ -1222,49 +1868,71 @@ fn is_japanese_kana_continuation(character: char) -> bool {
     )
 }
 
-fn first_japanese_residual(
+fn first_japanese_residual_with_cancellation<E>(
     text: &str,
     minimum: NonZeroUsize,
     allowed_terms: &BTreeSet<String>,
-) -> Option<String> {
-    let allowed_ranges = merge_byte_ranges(
-        allowed_terms
-            .iter()
-            .flat_map(|term| {
-                text.match_indices(term)
-                    .map(move |(start, _)| (start, start + term.len()))
-            })
-            .collect(),
-    );
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<Option<String>, E> {
+    let mut ranges = Vec::new();
+    for term in allowed_terms {
+        ensure_running()?;
+        let mut cursor = 0_usize;
+        while let Some(start) =
+            find_language_substring_with_cancellation(text, cursor, term, &mut ensure_running)?
+        {
+            let end = start + term.len();
+            ranges.push((start, end));
+            cursor = end;
+        }
+    }
+    let allowed_ranges = merge_byte_ranges_with_cancellation(ranges, &mut ensure_running)?;
     let mut range_index = 0_usize;
-    let mut fragment = String::new();
+    let mut fragment_start = None;
+    let mut fragment_end = 0_usize;
     let mut count = 0_usize;
+    let mut next_check = 0_usize;
     for (byte_index, character) in text.char_indices() {
+        ensure_language_text_progress(byte_index, &mut next_check, &mut ensure_running)?;
         while allowed_ranges
             .get(range_index)
             .is_some_and(|(_, end)| *end <= byte_index)
         {
+            ensure_running()?;
             range_index += 1;
         }
         let allowed = allowed_ranges
             .get(range_index)
             .is_some_and(|(start, end)| *start <= byte_index && byte_index < *end);
         if !allowed && is_japanese_kana_letter(character) {
-            fragment.push(character);
+            fragment_start.get_or_insert(byte_index);
+            fragment_end = byte_index + character.len_utf8();
             count += 1;
             continue;
         }
-        if !allowed && !fragment.is_empty() && is_japanese_kana_continuation(character) {
-            fragment.push(character);
+        if !allowed && fragment_start.is_some() && is_japanese_kana_continuation(character) {
+            fragment_end = byte_index + character.len_utf8();
             continue;
         }
         if count >= minimum.get() {
-            return Some(fragment);
+            return Ok(Some(clone_language_text_with_cancellation(
+                &text[fragment_start.expect("非零计数必须有起点")..fragment_end],
+                &mut ensure_running,
+            )?));
         }
-        fragment.clear();
+        fragment_start = None;
+        fragment_end = 0;
         count = 0;
     }
-    (count >= minimum.get()).then_some(fragment)
+    ensure_running()?;
+    if count >= minimum.get() {
+        Ok(Some(clone_language_text_with_cancellation(
+            &text[fragment_start.expect("非零计数必须有起点")..fragment_end],
+            &mut ensure_running,
+        )?))
+    } else {
+        Ok(None)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1287,16 +1955,25 @@ struct PendingQuoteNode {
     closing: Option<LanguageCharacterPosition>,
 }
 
-fn parse_quote_structure(text: &LanguageText, pairs: &[QuotePair]) -> Option<Vec<ParsedQuoteNode>> {
-    let roles = quote_roles(pairs)?;
+fn parse_quote_structure_with_cancellation<E>(
+    text: &LanguageText,
+    pairs: &[QuotePair],
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<Option<Vec<ParsedQuoteNode>>, E> {
+    let Some(roles) = quote_roles_with_cancellation(pairs, &mut ensure_running)? else {
+        return Ok(None);
+    };
 
     let mut nodes = Vec::<PendingQuoteNode>::new();
     let mut stack = Vec::<usize>::new();
     for (segment_index, segment) in text.segments().iter().enumerate() {
+        ensure_running()?;
         let LanguageTextSegment::NaturalText(text) = segment else {
             continue;
         };
+        let mut next_check = 0_usize;
         for (byte_offset, character) in text.char_indices() {
+            ensure_language_text_progress(byte_offset, &mut next_check, &mut ensure_running)?;
             let Some(&(pair_index, role)) = roles.get(&character) else {
                 continue;
             };
@@ -1313,9 +1990,11 @@ fn parse_quote_structure(text: &LanguageText, pairs: &[QuotePair]) -> Option<Vec
                     .is_some_and(|node_index| nodes[*node_index].pair == pair),
             };
             if should_close {
-                let node_index = stack.pop()?;
+                let Some(node_index) = stack.pop() else {
+                    return Ok(None);
+                };
                 if nodes[node_index].pair != pair {
-                    return None;
+                    return Ok(None);
                 }
                 nodes[node_index].closing = Some(position);
             } else {
@@ -1331,19 +2010,23 @@ fn parse_quote_structure(text: &LanguageText, pairs: &[QuotePair]) -> Option<Vec
         }
     }
     if !stack.is_empty() {
-        return None;
+        return Ok(None);
     }
-    nodes
-        .into_iter()
-        .map(|node| {
-            Some(ParsedQuoteNode {
-                pair: node.pair,
-                parent: node.parent,
-                opening: node.opening,
-                closing: node.closing?,
-            })
-        })
-        .collect()
+    let mut parsed = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        ensure_running()?;
+        let Some(closing) = node.closing else {
+            return Ok(None);
+        };
+        parsed.push(ParsedQuoteNode {
+            pair: node.pair,
+            parent: node.parent,
+            opening: node.opening,
+            closing,
+        });
+    }
+    ensure_running()?;
+    Ok(Some(parsed))
 }
 
 /// 按源文已经确认的拓扑解释译文引号。
@@ -1351,19 +2034,27 @@ fn parse_quote_structure(text: &LanguageText, pairs: &[QuotePair]) -> Option<Vec
 /// 对称引号没有先验开闭方向，因此不能先用贪心 toggle 固定一种结构。这里先由
 /// 源文拓扑生成唯一的开闭事件，再验证译文每个分隔符是否能够无冲突地承担对应
 /// 事件；只有完整且唯一对应时才产生修复位置。
-fn match_quote_structure(
+fn match_quote_structure_with_cancellation<E>(
     text: &LanguageText,
     pairs: &[QuotePair],
     source_nodes: &[JapaneseQuoteNode],
-) -> Option<Vec<ParsedQuoteNode>> {
-    let roles = quote_roles(pairs)?;
-    let events = quote_events(source_nodes)?;
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<Option<Vec<ParsedQuoteNode>>, E> {
+    let Some(roles) = quote_roles_with_cancellation(pairs, &mut ensure_running)? else {
+        return Ok(None);
+    };
+    let Some(events) = quote_events_with_cancellation(source_nodes, &mut ensure_running)? else {
+        return Ok(None);
+    };
     let mut occurrences = Vec::new();
     for (segment_index, segment) in text.segments().iter().enumerate() {
+        ensure_running()?;
         let LanguageTextSegment::NaturalText(text) = segment else {
             continue;
         };
+        let mut next_check = 0_usize;
         for (byte_offset, character) in text.char_indices() {
+            ensure_language_text_progress(byte_offset, &mut next_check, &mut ensure_running)?;
             let Some(&(pair_index, role)) = roles.get(&character) else {
                 continue;
             };
@@ -1378,12 +2069,14 @@ fn match_quote_structure(
         }
     }
     if occurrences.len() != events.len() {
-        return None;
+        return Ok(None);
     }
 
-    let mut matched = source_nodes
-        .iter()
-        .map(|node| PendingQuoteNode {
+    let mut matched = Vec::with_capacity(source_nodes.len());
+    let mut target_pairs = Vec::with_capacity(source_nodes.len());
+    for node in source_nodes {
+        ensure_running()?;
+        matched.push(PendingQuoteNode {
             pair: node.pair,
             parent: node.parent,
             opening: LanguageCharacterPosition {
@@ -1391,17 +2084,18 @@ fn match_quote_structure(
                 byte_offset: usize::MAX,
             },
             closing: None,
-        })
-        .collect::<Vec<_>>();
-    let mut target_pairs = vec![None; source_nodes.len()];
+        });
+        target_pairs.push(None);
+    }
     for (event, (pair, role, position)) in events.into_iter().zip(occurrences) {
+        ensure_running()?;
         match event {
             QuoteEvent::Open(node_index) => {
                 if !matches!(
                     role,
                     QuoteCharacterRole::Opening | QuoteCharacterRole::Symmetric
                 ) {
-                    return None;
+                    return Ok(None);
                 }
                 target_pairs[node_index] = Some(pair);
                 matched[node_index].pair = pair;
@@ -1413,24 +2107,28 @@ fn match_quote_structure(
                     QuoteCharacterRole::Closing | QuoteCharacterRole::Symmetric
                 ) || target_pairs[node_index] != Some(pair)
                 {
-                    return None;
+                    return Ok(None);
                 }
                 matched[node_index].closing = Some(position);
             }
         }
     }
 
-    matched
-        .into_iter()
-        .map(|node| {
-            Some(ParsedQuoteNode {
-                pair: node.pair,
-                parent: node.parent,
-                opening: node.opening,
-                closing: node.closing?,
-            })
-        })
-        .collect()
+    let mut parsed = Vec::with_capacity(matched.len());
+    for node in matched {
+        ensure_running()?;
+        let Some(closing) = node.closing else {
+            return Ok(None);
+        };
+        parsed.push(ParsedQuoteNode {
+            pair: node.pair,
+            parent: node.parent,
+            opening: node.opening,
+            closing,
+        });
+    }
+    ensure_running()?;
+    Ok(Some(parsed))
 }
 
 #[derive(Clone, Copy)]
@@ -1439,28 +2137,42 @@ enum QuoteEvent {
     Close(usize),
 }
 
-fn quote_events(nodes: &[JapaneseQuoteNode]) -> Option<Vec<QuoteEvent>> {
+fn quote_events_with_cancellation<E>(
+    nodes: &[JapaneseQuoteNode],
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<Option<Vec<QuoteEvent>>, E> {
     let mut events = Vec::with_capacity(nodes.len().saturating_mul(2));
     let mut stack = Vec::<usize>::new();
     for (node_index, node) in nodes.iter().enumerate() {
+        ensure_running()?;
         while stack.last().copied() != node.parent {
-            events.push(QuoteEvent::Close(stack.pop()?));
+            ensure_running()?;
+            let Some(parent) = stack.pop() else {
+                return Ok(None);
+            };
+            events.push(QuoteEvent::Close(parent));
         }
         if node.parent.is_some_and(|parent| parent >= node_index) {
-            return None;
+            return Ok(None);
         }
         events.push(QuoteEvent::Open(node_index));
         stack.push(node_index);
     }
     while let Some(node_index) = stack.pop() {
+        ensure_running()?;
         events.push(QuoteEvent::Close(node_index));
     }
-    Some(events)
+    ensure_running()?;
+    Ok(Some(events))
 }
 
-fn quote_roles(pairs: &[QuotePair]) -> Option<BTreeMap<char, (usize, QuoteCharacterRole)>> {
-    let mut roles = BTreeMap::<char, (usize, QuoteCharacterRole)>::new();
+fn quote_roles_with_cancellation<E>(
+    pairs: &[QuotePair],
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<Option<QuoteRoles>, E> {
+    let mut roles = QuoteRoles::new();
     for (pair_index, pair) in pairs.iter().copied().enumerate() {
+        ensure_running()?;
         let opening_role = if pair.opening() == pair.closing() {
             QuoteCharacterRole::Symmetric
         } else {
@@ -1470,17 +2182,18 @@ fn quote_roles(pairs: &[QuotePair]) -> Option<BTreeMap<char, (usize, QuoteCharac
             .insert(pair.opening(), (pair_index, opening_role))
             .is_some()
         {
-            return None;
+            return Ok(None);
         }
         if pair.opening() != pair.closing()
             && roles
                 .insert(pair.closing(), (pair_index, QuoteCharacterRole::Closing))
                 .is_some()
         {
-            return None;
+            return Ok(None);
         }
     }
-    Some(roles)
+    ensure_running()?;
+    Ok(Some(roles))
 }
 
 #[derive(Clone, Copy)]
@@ -1490,6 +2203,8 @@ enum QuoteCharacterRole {
     Symmetric,
 }
 
+type QuoteRoles = BTreeMap<char, (usize, QuoteCharacterRole)>;
+
 #[derive(Clone)]
 struct EnglishWord {
     normalized: String,
@@ -1497,30 +2212,72 @@ struct EnglishWord {
     end: usize,
 }
 
-fn english_runs(text: &LanguageText, excluded_terms: &BTreeSet<String>) -> Vec<Vec<EnglishWord>> {
-    natural_texts(text)
-        .flat_map(|segment| english_runs_in_segment(segment, excluded_terms))
-        .collect()
+fn english_runs_with_cancellation<E>(
+    text: &LanguageText,
+    excluded_terms: &BTreeSet<String>,
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<Vec<Vec<EnglishWord>>, E> {
+    let mut runs = Vec::new();
+    for segment in natural_texts(text) {
+        ensure_running()?;
+        for run in
+            english_runs_in_segment_with_cancellation(segment, excluded_terms, &mut ensure_running)?
+        {
+            ensure_running()?;
+            runs.push(run);
+        }
+    }
+    ensure_running()?;
+    Ok(runs)
 }
 
-fn english_runs_in_segment(text: &str, excluded_terms: &BTreeSet<String>) -> Vec<Vec<EnglishWord>> {
-    let excluded_ranges = ascii_insensitive_term_ranges(text, excluded_terms);
-    let words = ascii_words(text);
+fn english_runs_in_segment_with_cancellation<E>(
+    text: &str,
+    excluded_terms: &BTreeSet<String>,
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<Vec<Vec<EnglishWord>>, E> {
+    let excluded_ranges =
+        ascii_insensitive_term_ranges_with_cancellation(text, excluded_terms, &mut ensure_running)?;
+    let words = ascii_words_with_cancellation(text, &mut ensure_running)?;
     let mut runs = Vec::new();
     let mut current = Vec::new();
     let mut previous_end = None;
     for word in words {
-        let excluded = excluded_ranges
-            .iter()
-            .any(|(start, end)| word.start < *end && *start < word.end);
-        let disconnected = previous_end.is_some_and(|previous_end| {
-            !text[previous_end..word.start]
-                .chars()
-                .all(is_english_run_connector)
-                || excluded_ranges
-                    .iter()
-                    .any(|(start, end)| previous_end < *end && *start < word.start)
-        });
+        ensure_running()?;
+        let mut excluded = false;
+        for (start, end) in &excluded_ranges {
+            ensure_running()?;
+            if word.start < *end && *start < word.end {
+                excluded = true;
+                break;
+            }
+        }
+        let disconnected = if let Some(previous_end) = previous_end {
+            let mut connectors_only = true;
+            let mut next_check = 0_usize;
+            for (relative_offset, character) in text[previous_end..word.start].char_indices() {
+                ensure_language_text_progress(
+                    relative_offset,
+                    &mut next_check,
+                    &mut ensure_running,
+                )?;
+                if !is_english_run_connector(character) {
+                    connectors_only = false;
+                    break;
+                }
+            }
+            let mut excluded_between = false;
+            for (start, end) in &excluded_ranges {
+                ensure_running()?;
+                if previous_end < *end && *start < word.start {
+                    excluded_between = true;
+                    break;
+                }
+            }
+            !connectors_only || excluded_between
+        } else {
+            false
+        };
         if (excluded || disconnected) && !current.is_empty() {
             runs.push(std::mem::take(&mut current));
         }
@@ -1534,21 +2291,30 @@ fn english_runs_in_segment(text: &str, excluded_terms: &BTreeSet<String>) -> Vec
     if !current.is_empty() {
         runs.push(current);
     }
-    runs
+    ensure_running()?;
+    Ok(runs)
 }
 
 fn is_english_run_connector(character: char) -> bool {
     character.is_whitespace() || character.is_ascii_punctuation()
 }
 
-fn ascii_insensitive_term_ranges(
+fn ascii_insensitive_term_ranges_with_cancellation<E>(
     text: &str,
     excluded_terms: &BTreeSet<String>,
-) -> Vec<(usize, usize)> {
-    let normalized = text.to_ascii_lowercase();
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<Vec<(usize, usize)>, E> {
+    let normalized = ascii_lowercase_with_cancellation(text, &mut ensure_running)?;
     let mut ranges = Vec::new();
     for term in excluded_terms {
-        for (start, _) in normalized.match_indices(term) {
+        ensure_running()?;
+        let mut cursor = 0_usize;
+        while let Some(start) = find_language_substring_with_cancellation(
+            &normalized,
+            cursor,
+            term,
+            &mut ensure_running,
+        )? {
             let end = start + term.len();
             let starts_at_boundary = !term
                 .chars()
@@ -1569,20 +2335,29 @@ fn ascii_insensitive_term_ranges(
             if starts_at_boundary && ends_at_boundary {
                 ranges.push((start, end));
             }
+            cursor = end;
         }
     }
-    merge_byte_ranges(ranges)
+    merge_byte_ranges_with_cancellation(ranges, ensure_running)
 }
 
-fn ascii_words(text: &str) -> Vec<EnglishWord> {
+fn ascii_words_with_cancellation<E>(
+    text: &str,
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<Vec<EnglishWord>, E> {
     let mut words = Vec::new();
     let mut start = None;
+    let mut next_check = 0_usize;
     for (byte_index, character) in text.char_indices() {
+        ensure_language_text_progress(byte_index, &mut next_check, &mut ensure_running)?;
         if character.is_ascii_alphabetic() {
             start.get_or_insert(byte_index);
         } else if let Some(word_start) = start.take() {
             words.push(EnglishWord {
-                normalized: text[word_start..byte_index].to_ascii_lowercase(),
+                normalized: ascii_lowercase_with_cancellation(
+                    &text[word_start..byte_index],
+                    &mut ensure_running,
+                )?,
                 start: word_start,
                 end: byte_index,
             });
@@ -1590,56 +2365,93 @@ fn ascii_words(text: &str) -> Vec<EnglishWord> {
     }
     if let Some(word_start) = start {
         words.push(EnglishWord {
-            normalized: text[word_start..].to_ascii_lowercase(),
+            normalized: ascii_lowercase_with_cancellation(
+                &text[word_start..],
+                &mut ensure_running,
+            )?,
             start: word_start,
             end: text.len(),
         });
     }
-    words
+    ensure_running()?;
+    Ok(words)
 }
 
-fn reaches_word_threshold(
+fn reaches_word_threshold_with_cancellation<E>(
     words: &[EnglishWord],
     minimum_words: NonZeroUsize,
     minimum_letters: NonZeroUsize,
-) -> bool {
-    words.len() >= minimum_words.get()
-        && words
-            .iter()
-            .map(|word| word.normalized.len())
-            .sum::<usize>()
-            >= minimum_letters.get()
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    if words.len() < minimum_words.get() {
+        ensure_running()?;
+        return Ok(false);
+    }
+    let mut letters = 0_usize;
+    for word in words {
+        ensure_running()?;
+        letters = letters.wrapping_add(word.normalized.len());
+    }
+    ensure_running()?;
+    Ok(letters >= minimum_letters.get())
 }
 
-fn first_copied_english_fragment(
+fn first_copied_english_fragment_with_cancellation<E>(
     text: &str,
     target_run: &[EnglishWord],
     source_runs: &[Vec<String>],
     minimum_words: NonZeroUsize,
     minimum_letters: NonZeroUsize,
-) -> Option<String> {
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<Option<String>, E> {
     for start in 0..target_run.len() {
+        ensure_running()?;
         for end in (start + 1..=target_run.len()).rev() {
+            ensure_running()?;
             let candidate = &target_run[start..end];
-            if !reaches_word_threshold(candidate, minimum_words, minimum_letters) {
+            if !reaches_word_threshold_with_cancellation(
+                candidate,
+                minimum_words,
+                minimum_letters,
+                &mut ensure_running,
+            )? {
                 continue;
             }
-            let copied = source_runs.iter().any(|source| {
-                source.windows(candidate.len()).any(|window| {
-                    window
-                        .iter()
-                        .zip(candidate)
-                        .all(|(left, right)| left == &right.normalized)
-                })
-            });
+            let mut copied = false;
+            for source in source_runs {
+                ensure_running()?;
+                for window in source.windows(candidate.len()) {
+                    ensure_running()?;
+                    let mut equal = true;
+                    for (left, right) in window.iter().zip(candidate) {
+                        if !language_text_equal_with_cancellation(
+                            left,
+                            &right.normalized,
+                            &mut ensure_running,
+                        )? {
+                            equal = false;
+                            break;
+                        }
+                    }
+                    if equal {
+                        copied = true;
+                        break;
+                    }
+                }
+                if copied {
+                    break;
+                }
+            }
             if copied {
-                return Some(
-                    text[candidate[0].start..candidate[candidate.len() - 1].end].to_owned(),
-                );
+                return Ok(Some(clone_language_text_with_cancellation(
+                    &text[candidate[0].start..candidate[candidate.len() - 1].end],
+                    &mut ensure_running,
+                )?));
             }
         }
     }
-    None
+    ensure_running()?;
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -1676,6 +2488,109 @@ mod tests {
             EnglishResidualPolicy::new(non_zero(2), non_zero(8), ["Alice".to_owned()])
                 .expect("英文残留策略有效"),
         )
+    }
+
+    #[test]
+    fn language_text_normalization_can_cancel_between_long_text_copies() {
+        let long = "文".repeat(LANGUAGE_TEXT_CANCELLATION_CHECK_BYTES * 2);
+        let mut polls = 0_usize;
+        let result = LanguageText::new_with_cancellation(
+            vec![
+                LanguageTextSegment::NaturalText("前".to_owned()),
+                LanguageTextSegment::NaturalText(long),
+            ],
+            || {
+                polls += 1;
+                if polls == 4 { Err("cancelled") } else { Ok(()) }
+            },
+        );
+
+        assert!(matches!(result, Err("cancelled")));
+        assert_eq!(polls, 4);
+    }
+
+    #[test]
+    fn japanese_analysis_can_cancel_inside_a_long_source_segment() {
+        let module = japanese_module();
+        let source = LanguageText::natural("x".repeat(LANGUAGE_TEXT_CANCELLATION_CHECK_BYTES * 4));
+        let mut polls = 0_usize;
+        let result = module.analyze_source_with_cancellation(&source, &mut || {
+            polls += 1;
+            if polls == 4 {
+                Err(LanguageOperationCancelled)
+            } else {
+                Ok(())
+            }
+        });
+
+        assert_eq!(result, Err(LanguageOperationCancelled));
+        assert_eq!(polls, 4);
+    }
+
+    #[test]
+    fn residual_scan_can_cancel_inside_a_long_translation_segment() {
+        let module = japanese_module();
+        let analysis = module.analyze_source(&LanguageText::natural("勇者"));
+        let translation =
+            LanguageText::natural("x".repeat(LANGUAGE_TEXT_CANCELLATION_CHECK_BYTES * 4));
+        let mut polls = 0_usize;
+        let result =
+            module.find_source_residual_with_cancellation(&analysis, &translation, &mut || {
+                polls += 1;
+                if polls == 6 {
+                    Err(LanguageOperationCancelled)
+                } else {
+                    Ok(())
+                }
+            });
+
+        assert_eq!(result, Err(LanguageOperationCancelled));
+        assert_eq!(polls, 6);
+    }
+
+    #[test]
+    fn repair_application_can_cancel_while_cloning_long_text() {
+        let text = LanguageText::natural("x".repeat(LANGUAGE_TEXT_CANCELLATION_CHECK_BYTES * 4));
+        let mut polls = 0_usize;
+        let result = text.apply_repair_with_cancellation(&LanguageRepairPlan::unchanged(), || {
+            polls += 1;
+            if polls == 3 { Err("cancelled") } else { Ok(()) }
+        });
+
+        assert!(matches!(result, Err("cancelled")));
+        assert_eq!(polls, 3);
+    }
+
+    #[test]
+    fn semantic_fingerprint_can_cancel_inside_a_long_policy_term() {
+        let long_term = "カ".repeat(LANGUAGE_TEXT_CANCELLATION_CHECK_BYTES * 2);
+        let module = JapaneseLanguageModule::new(
+            JapaneseResidualPolicy::new(non_zero(2), [long_term]).expect("测试策略应有效"),
+            None,
+        );
+        let expected = module.semantic_fingerprint();
+        let module: &dyn LanguageModule = &module;
+        let mut successful_polls = 0_usize;
+        let actual = module
+            .semantic_fingerprint_with_cancellation(&mut || {
+                successful_polls += 1;
+                Ok(())
+            })
+            .expect("检查不会取消");
+        assert_eq!(actual, expected);
+        assert!(successful_polls > 2);
+
+        let mut polls = 0_usize;
+        let cancelled = module.semantic_fingerprint_with_cancellation(&mut || {
+            polls += 1;
+            if polls == 4 {
+                Err(LanguageOperationCancelled)
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(cancelled, Err(LanguageOperationCancelled));
+        assert_eq!(polls, 4);
     }
 
     #[test]

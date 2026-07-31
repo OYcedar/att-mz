@@ -52,7 +52,7 @@ pub(super) const CREATE_TRANSLATE_RUN_PLAN_TABLE: &str = r#"CREATE TABLE transla
     )
 )"#;
 
-pub(super) const SELECT_RUN_PLAN_SINGLETONS: &str = r#"SELECT
+pub(crate) const SELECT_RUN_PLAN_SINGLETONS: &str = r#"SELECT
     (SELECT source_path_utf16 FROM init_run_plan WHERE singleton = 1),
     (SELECT builtin_enabled FROM extract_run_plan WHERE singleton = 1),
     (SELECT rules_enabled FROM extract_run_plan WHERE singleton = 1),
@@ -416,7 +416,7 @@ impl fmt::Display for InvalidProjectRunPlans {
 
 impl Error for InvalidProjectRunPlans {}
 
-pub(super) fn decode_project_run_plans(
+pub(crate) fn decode_project_run_plans(
     rows: Vec<SqliteRow>,
 ) -> Result<ProjectRunPlans, InvalidProjectRunPlans> {
     let [row] = <[SqliteRow; 1]>::try_from(rows).map_err(|rows| {
@@ -599,13 +599,6 @@ fn decode_windows_path(
     let path = PathBuf::from(OsString::from_wide(&units));
     validate_resolved_path(&path, purpose)?;
     Ok(path)
-}
-
-/// 按 Init 运行方案的既有路径契约解码 SQLite 中保存的来源目录。
-///
-/// 原子 Lua 的最终校验复用这一入口，避免另行解释 Windows UTF-16 路径。
-pub(crate) fn decode_init_source_path(bytes: Vec<u8>) -> Result<PathBuf, InvalidRunPlanValue> {
-    decode_windows_path(bytes, RunPlanPathPurpose::InitSource)
 }
 
 fn usize_to_u64(value: usize) -> u64 {

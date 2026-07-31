@@ -1,6 +1,8 @@
 //! 各翻译引擎从规划、响应验收到写回检查共同使用的保留信封协议。
 
+#[cfg(test)]
 use std::error::Error;
+#[cfg(test)]
 use std::fmt;
 
 pub(crate) const PREFIX: &str = "⟦ATT_";
@@ -21,6 +23,7 @@ pub(crate) fn contains_reserved_prefix(text: &str) -> bool {
 /// 信封内部的 payload 不在这里解释；响应验收器会把完整信封与 Planner
 /// 建立的精确 token 集合比较。只要出现未闭合保留前缀，就不能继续把文本
 /// 当作普通自然语言处理。
+#[cfg(test)]
 pub(crate) fn scan_envelopes(text: &str) -> Result<Vec<&str>, PlaceholderTokenScanError> {
     let mut envelopes = Vec::new();
     let mut cursor = 0usize;
@@ -41,19 +44,13 @@ pub(crate) fn scan_envelopes(text: &str) -> Result<Vec<&str>, PlaceholderTokenSc
     Ok(envelopes)
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PlaceholderTokenScanError {
     UnclosedReservedPrefix { fragment: String },
 }
 
-impl PlaceholderTokenScanError {
-    pub(crate) fn into_fragment(self) -> String {
-        match self {
-            Self::UnclosedReservedPrefix { fragment } => fragment,
-        }
-    }
-}
-
+#[cfg(test)]
 impl fmt::Display for PlaceholderTokenScanError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -64,6 +61,7 @@ impl fmt::Display for PlaceholderTokenScanError {
     }
 }
 
+#[cfg(test)]
 impl Error for PlaceholderTokenScanError {}
 
 #[cfg(test)]

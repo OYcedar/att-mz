@@ -1,6 +1,6 @@
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{
@@ -8,15 +8,23 @@ use rusqlite::{
     hooks::{AuthAction, AuthContext, Authorization, TransactionOperation},
 };
 
+use crate::fingerprint::Sha256FramedHasher;
+
 use super::{
-    ProjectLuaCallError, ProjectLuaCancellation, ProjectLuaEngineAdapter, ProjectLuaFailure,
-    ProjectLuaPrintSink, ProjectLuaProgram, ProjectLuaProject, ProjectLuaRunError,
-    ProjectLuaRunRequest, ProjectLuaSchemaObjectKind, ProjectLuaValue, rollback, run_project_lua,
+    ProjectLuaCallError, ProjectLuaCancellation, ProjectLuaDatabasePrerequisiteError,
+    ProjectLuaEngineAdapter, ProjectLuaFailure, ProjectLuaPrintSink, ProjectLuaProgram,
+    ProjectLuaProject, ProjectLuaRunError, ProjectLuaRunRequest, ProjectLuaSchemaObjectKind,
+    ProjectLuaValue, compile_project_lua_program, compile_project_lua_program_with_cancellation,
+    fingerprint_project_lua_program_with_cancellation, rollback, run_project_lua,
+    take_project_lua_object_field,
 };
 
 #[derive(Debug, Default)]
 struct TestAdapter {
+    prerequisite_failure: Option<ProjectLuaDatabasePrerequisiteError>,
     fail_validation: bool,
+    cancel_after_translation: Option<ProjectLuaCancellation>,
+    observed_translation_calls: Option<Arc<AtomicUsize>>,
 }
 
 impl ProjectLuaEngineAdapter for TestAdapter {
@@ -36,19 +44,21 @@ impl ProjectLuaEngineAdapter for TestAdapter {
         locator: ProjectLuaValue,
         translation: ProjectLuaValue,
     ) -> Result<u64, ProjectLuaCallError> {
-        let ProjectLuaValue::Object(locator) = locator else {
+        let Some(mut locator) = locator.into_object() else {
             return Err(ProjectLuaCallError::new(
                 "invalid_locator",
                 "locator 必须是 object",
             ));
         };
-        let Some(ProjectLuaValue::Text(id)) = locator.get("id") else {
+        let Some(id) =
+            take_project_lua_object_field(&mut locator, "id").and_then(ProjectLuaValue::into_text)
+        else {
             return Err(ProjectLuaCallError::new(
                 "invalid_locator",
                 "locator.id 必须是字符串",
             ));
         };
-        let ProjectLuaValue::Text(translation) = translation else {
+        let Some(translation) = translation.into_text() else {
             return Err(ProjectLuaCallError::new(
                 "invalid_translation",
                 "translation 必须是字符串",
@@ -63,6 +73,12 @@ impl ProjectLuaEngineAdapter for TestAdapter {
         if changed != 1 {
             return Err(ProjectLuaCallError::new("unknown_unit", "目标 Unit 不存在"));
         }
+        if let Some(calls) = &self.observed_translation_calls {
+            calls.fetch_add(1, Ordering::SeqCst);
+        }
+        if let Some(cancellation) = &self.cancel_after_translation {
+            cancellation.cancel();
+        }
         Ok(u64::try_from(changed).expect("受支持平台的 usize 必须能表示为 u64"))
     }
 
@@ -71,13 +87,15 @@ impl ProjectLuaEngineAdapter for TestAdapter {
         connection: &Connection,
         locator: ProjectLuaValue,
     ) -> Result<u64, ProjectLuaCallError> {
-        let ProjectLuaValue::Object(locator) = locator else {
+        let Some(mut locator) = locator.into_object() else {
             return Err(ProjectLuaCallError::new(
                 "invalid_locator",
                 "locator 必须是 object",
             ));
         };
-        let Some(ProjectLuaValue::Text(id)) = locator.get("id") else {
+        let Some(id) =
+            take_project_lua_object_field(&mut locator, "id").and_then(ProjectLuaValue::into_text)
+        else {
             return Err(ProjectLuaCallError::new(
                 "invalid_locator",
                 "locator.id 必须是字符串",
@@ -90,6 +108,17 @@ impl ProjectLuaEngineAdapter for TestAdapter {
             )
             .map_err(|error| ProjectLuaCallError::new("sqlite", error.to_string()))?;
         Ok(u64::try_from(changed).expect("受支持平台的 usize 必须能表示为 u64"))
+    }
+
+    fn validate_database_before_script(
+        &self,
+        _connection: &Connection,
+        _project: &ProjectLuaProject,
+    ) -> Result<(), ProjectLuaDatabasePrerequisiteError> {
+        match &self.prerequisite_failure {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
     }
 
     fn validate_database(
@@ -136,6 +165,23 @@ impl ProjectLuaPrintSink for SignalPrintSink {
     }
 }
 
+#[derive(Debug)]
+struct CancellingPrintSink {
+    cancellation: ProjectLuaCancellation,
+    lines: Mutex<Vec<Vec<u8>>>,
+}
+
+impl ProjectLuaPrintSink for CancellingPrintSink {
+    fn print(&self, bytes: &[u8]) -> Result<(), ProjectLuaCallError> {
+        self.lines
+            .lock()
+            .expect("测试输出锁不应中毒")
+            .push(bytes.to_vec());
+        self.cancellation.cancel();
+        Ok(())
+    }
+}
+
 fn database() -> Connection {
     let connection = Connection::open_in_memory().expect("应建立内存数据库");
     connection
@@ -157,6 +203,40 @@ fn request(source: &str, adapter: Arc<dyn ProjectLuaEngineAdapter>) -> ProjectLu
         ProjectLuaProgram::new("test.lua", source.as_bytes(), vec!["one".to_owned()]),
         adapter,
     )
+}
+
+fn large_lua_comment(length: usize) -> Vec<u8> {
+    let mut source = Vec::with_capacity(length.max(2));
+    source.extend_from_slice(b"--");
+    source.resize(length.max(2), b'x');
+    source
+}
+
+fn run_script_cancelled_by_first_print(source: &str) -> (ProjectLuaRunError, Vec<Vec<u8>>) {
+    let cancellation = ProjectLuaCancellation::default();
+    let sink = Arc::new(CancellingPrintSink {
+        cancellation: cancellation.clone(),
+        lines: Mutex::new(Vec::new()),
+    });
+    let worker_sink = Arc::clone(&sink);
+    let source = source.to_owned();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let result = run_project_lua(
+            database(),
+            request(&source, Arc::new(TestAdapter::default()))
+                .with_cancellation(cancellation)
+                .with_print_sink(worker_sink),
+        );
+        sender.send(result).expect("测试结果接收端不应提前关闭");
+    });
+    let result = receiver
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .expect("取消后的有限脚本必须在超时前结束");
+    worker.join().expect("Lua worker 不应 panic");
+    let error = result.expect_err("print 触发的取消必须使脚本失败");
+    let lines = sink.lines.lock().expect("测试输出锁不应中毒").clone();
+    (error, lines)
 }
 
 #[test]
@@ -225,6 +305,7 @@ fn failed_validation_rolls_back_every_change() {
             "ctx.db.execute(\"UPDATE units SET translation = 'changed'\")",
             Arc::new(TestAdapter {
                 fail_validation: true,
+                ..TestAdapter::default()
             }),
         ),
     )
@@ -246,6 +327,71 @@ fn failed_validation_rolls_back_every_change() {
         )
         .expect("应读取回滚后的值");
     assert_eq!(translation, None);
+}
+
+#[test]
+fn invalid_project_state_prerequisite_keeps_its_typed_failure() {
+    let error = run_project_lua(
+        database(),
+        request(
+            "ctx.db.execute(\"UPDATE units SET translation = 'must-not-run'\")",
+            Arc::new(TestAdapter {
+                prerequisite_failure: Some(
+                    ProjectLuaDatabasePrerequisiteError::invalid_project_state(
+                        "database_component=att_schema; violation=test",
+                    ),
+                ),
+                ..TestAdapter::default()
+            }),
+        ),
+    )
+    .expect_err("无效项目状态必须在脚本执行前失败");
+
+    assert_eq!(
+        error,
+        ProjectLuaRunError::RolledBack(ProjectLuaFailure::DatabasePrerequisite(
+            ProjectLuaDatabasePrerequisiteError::InvalidProjectState(
+                "database_component=att_schema; violation=test".to_owned()
+            )
+        ))
+    );
+}
+
+#[test]
+fn sqlite_prerequisite_preserves_primary_and_extended_codes() {
+    let source_connection = Connection::open_in_memory().expect("应建立错误来源数据库");
+    source_connection
+        .execute_batch(
+            "CREATE TABLE private_secret (value TEXT UNIQUE);
+             INSERT INTO private_secret VALUES ('sensitive-value');",
+        )
+        .expect("应建立唯一约束");
+    let source = source_connection
+        .execute("INSERT INTO private_secret VALUES ('sensitive-value')", [])
+        .expect_err("重复值应产生扩展 SQLite code");
+    let prerequisite =
+        ProjectLuaDatabasePrerequisiteError::sqlite("read_current_att_schema", &source);
+
+    let error = run_project_lua(
+        database(),
+        request(
+            "error('must-not-run')",
+            Arc::new(TestAdapter {
+                prerequisite_failure: Some(prerequisite),
+                ..TestAdapter::default()
+            }),
+        ),
+    )
+    .expect_err("SQLite 前置检查失败必须保留为数据库错误");
+
+    let ProjectLuaRunError::RolledBack(ProjectLuaFailure::DatabasePrerequisite(
+        ProjectLuaDatabasePrerequisiteError::Sqlite(source),
+    )) = error
+    else {
+        panic!("应保留 typed SQLite 前置检查失败");
+    };
+    assert_eq!(source.operation(), "read_current_att_schema");
+    assert_eq!(source.sqlite_codes(), Some((19, 2067)));
 }
 
 #[test]
@@ -734,6 +880,426 @@ fn running_lua_loop_observes_cross_thread_cancellation() {
 }
 
 #[test]
+fn pcall_and_xpcall_cannot_swallow_cancellation() {
+    for (name, script) in [
+        (
+            "pcall",
+            r#"
+local ok = pcall(function()
+  print("pcall-started")
+  local total = 0
+  for value = 1, 200000 do total = total + value end
+end)
+print(ok and "pcall-completed" or "pcall-caught")
+"#,
+        ),
+        (
+            "xpcall",
+            r#"
+local ok = xpcall(
+  function()
+    print("xpcall-started")
+    local total = 0
+    for value = 1, 200000 do total = total + value end
+  end,
+  function(_) return "caught" end
+)
+print(ok and "xpcall-completed" or "xpcall-caught")
+"#,
+        ),
+    ] {
+        let (error, lines) = run_script_cancelled_by_first_print(script);
+        assert_eq!(
+            error,
+            ProjectLuaRunError::RolledBack(ProjectLuaFailure::Cancelled),
+            "{name} 不得改变取消结果"
+        );
+        assert_eq!(
+            lines,
+            [format!("{name}-started").into_bytes()],
+            "{name} 不得捕获取消后继续运行"
+        );
+    }
+}
+
+#[test]
+fn cancellation_crosses_nested_resume_and_wrap_coroutines() {
+    for (name, script) in [
+        (
+            "resume",
+            r#"
+local worker = coroutine.create(function()
+  print("resume-started")
+  local total = 0
+  for value = 1, 200000 do total = total + value end
+  print("resume-child-completed")
+end)
+coroutine.resume(worker)
+"#,
+        ),
+        (
+            "wrap",
+            r#"
+local worker = coroutine.wrap(function()
+  print("wrap-started")
+  local total = 0
+  for value = 1, 200000 do total = total + value end
+  print("wrap-child-completed")
+end)
+worker()
+"#,
+        ),
+    ] {
+        let (error, lines) = run_script_cancelled_by_first_print(script);
+        assert_eq!(
+            error,
+            ProjectLuaRunError::RolledBack(ProjectLuaFailure::Cancelled),
+            "coroutine.{name} 不得改变取消结果"
+        );
+        assert_eq!(
+            lines,
+            [format!("{name}-started").into_bytes()],
+            "coroutine.{name} 的子 coroutine 不得忽略全局取消 hook"
+        );
+    }
+}
+
+#[test]
+fn cancellation_escapes_non_yieldable_c_boundary() {
+    let cancellation = ProjectLuaCancellation::default();
+    let observed_translation_calls = Arc::new(AtomicUsize::new(0));
+    let error = run_project_lua(
+        database(),
+        request(
+            r#"
+pcall(function()
+  ctx.translation.set({id = "unit-1"}, "cancel")
+  table.sort({3, 2, 1}, function(left, right)
+    local total = 0
+    for value = 1, 200000 do total = total + value end
+    ctx.translation.set({id = "unit-1"}, "escaped")
+    return left < right
+  end)
+end)
+"#,
+            Arc::new(TestAdapter {
+                cancel_after_translation: Some(cancellation.clone()),
+                observed_translation_calls: Some(Arc::clone(&observed_translation_calls)),
+                ..TestAdapter::default()
+            }),
+        )
+        .with_cancellation(cancellation),
+    )
+    .expect_err("不可 yield 的比较器必须观察取消");
+
+    assert_eq!(
+        error,
+        ProjectLuaRunError::RolledBack(ProjectLuaFailure::Cancelled)
+    );
+    assert_eq!(
+        observed_translation_calls.load(Ordering::SeqCst),
+        1,
+        "取消必须在 table.sort 比较器结束前退出不可 yield 的 C 边界"
+    );
+}
+
+#[test]
+fn cancellation_stops_short_lived_coroutine_creation_inside_pcall() {
+    let cancellation = ProjectLuaCancellation::default();
+    let observed_translation_calls = Arc::new(AtomicUsize::new(0));
+    let error = run_project_lua(
+        database(),
+        request(
+            r#"
+ctx.translation.set({id = "unit-1"}, "cancel")
+for attempt = 1, 50000 do
+  pcall(function()
+    local worker = coroutine.create(function() return attempt end)
+    coroutine.resume(worker)
+  end)
+end
+ctx.translation.set({id = "unit-1"}, "escaped")
+"#,
+            Arc::new(TestAdapter {
+                cancel_after_translation: Some(cancellation.clone()),
+                observed_translation_calls: Some(Arc::clone(&observed_translation_calls)),
+                ..TestAdapter::default()
+            }),
+        )
+        .with_cancellation(cancellation),
+    )
+    .expect_err("短命 coroutine 不得绕过取消检查");
+
+    assert_eq!(
+        error,
+        ProjectLuaRunError::RolledBack(ProjectLuaFailure::Cancelled)
+    );
+    assert_eq!(
+        observed_translation_calls.load(Ordering::SeqCst),
+        1,
+        "取消后不得继续创建短命 coroutine 并到达后续 Host 调用"
+    );
+}
+
+#[test]
+fn resumed_child_cannot_print_after_cancellation_yield() {
+    let cancellation = ProjectLuaCancellation::default();
+    let observed_translation_calls = Arc::new(AtomicUsize::new(0));
+    let print_sink = Arc::new(TestPrintSink::default());
+    let error = run_project_lua(
+        database(),
+        request(
+            r#"
+local worker = coroutine.create(function()
+  ctx.translation.set({id = "unit-1"}, "cancel")
+  local total = 0
+  for value = 1, 200000 do total = total + value end
+end)
+coroutine.resume(worker)
+print("after-resume")
+ctx.translation.set({id = "unit-1"}, "escaped")
+"#,
+            Arc::new(TestAdapter {
+                cancel_after_translation: Some(cancellation.clone()),
+                observed_translation_calls: Some(Arc::clone(&observed_translation_calls)),
+                ..TestAdapter::default()
+            }),
+        )
+        .with_cancellation(cancellation)
+        .with_print_sink(print_sink.clone()),
+    )
+    .expect_err("子 coroutine yield 后父 coroutine 必须立即停止");
+
+    assert_eq!(
+        error,
+        ProjectLuaRunError::RolledBack(ProjectLuaFailure::Cancelled)
+    );
+    assert_eq!(observed_translation_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        print_sink
+            .lines
+            .lock()
+            .expect("测试输出锁不应中毒")
+            .is_empty(),
+        "coroutine.resume 返回父 coroutine 后不得执行 print 副作用"
+    );
+}
+
+#[test]
+fn ordinary_protected_errors_remain_catchable() {
+    let report = run_project_lua(
+        database(),
+        request(
+            r#"
+local pcall_ok, pcall_error = pcall(function() error("pcall-error") end)
+assert(not pcall_ok and string.find(pcall_error, "pcall-error", 1, true))
+local xpcall_ok, xpcall_error = xpcall(
+  function() error("xpcall-error") end,
+  function(error) return "handled:" .. error end
+)
+assert(not xpcall_ok and string.find(xpcall_error, "handled:", 1, true))
+ctx.db.execute("UPDATE units SET translation = 'caught'")
+"#,
+            Arc::new(TestAdapter::default()),
+        ),
+    )
+    .expect("普通 pcall/xpcall 错误被捕获后脚本应继续");
+
+    assert_eq!(report.changed_rows(), 1);
+}
+
+#[test]
+fn top_level_coroutine_yield_remains_a_script_error() {
+    let error = run_project_lua(
+        database(),
+        request("coroutine.yield('pause')", Arc::new(TestAdapter::default())),
+    )
+    .expect_err("主程序主动 yield 必须失败");
+
+    assert!(matches!(
+        error,
+        ProjectLuaRunError::RolledBack(ProjectLuaFailure::Script(message))
+            if message.contains("不得主动 yield")
+    ));
+}
+
+#[test]
+fn running_coroutine_loop_observes_cross_thread_cancellation() {
+    let temporary = tempfile::tempdir().expect("应建立临时目录");
+    let path = temporary.path().join("coroutine-cancellation.db");
+    let setup = Connection::open(&path).expect("应建立数据库");
+    setup
+        .execute_batch(
+            "CREATE TABLE units (id TEXT PRIMARY KEY, translation TEXT);
+             INSERT INTO units VALUES ('unit-1', NULL);",
+        )
+        .expect("应建立测试 schema");
+    drop(setup);
+
+    let cancellation = ProjectLuaCancellation::default();
+    let worker_cancellation = cancellation.clone();
+    let worker_path = path.clone();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let sink = Arc::new(SignalPrintSink {
+        sender: Mutex::new(Some(sender)),
+    });
+    let worker = std::thread::spawn(move || {
+        run_project_lua(
+            Connection::open(worker_path).expect("worker 应打开数据库"),
+            request(
+                r#"
+ctx.db.execute("UPDATE main.units SET translation = 'must-roll-back'")
+print("ready")
+local run = coroutine.wrap(function()
+  local worker = coroutine.create(function()
+    while true do end
+  end)
+  coroutine.resume(worker)
+  while true do end
+end)
+run()
+"#,
+                Arc::new(TestAdapter::default()),
+            )
+            .with_cancellation(worker_cancellation)
+            .with_print_sink(sink),
+        )
+    });
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("Lua coroutine 应在超时前开始运行");
+    cancellation.cancel();
+    let error = worker
+        .join()
+        .expect("Lua coroutine worker 不应 panic")
+        .expect_err("coroutine 内的无限循环应被取消");
+    assert_eq!(
+        error,
+        ProjectLuaRunError::RolledBack(ProjectLuaFailure::Cancelled)
+    );
+    let translation: Option<String> = Connection::open(path)
+        .expect("应重开数据库")
+        .query_row(
+            "SELECT translation FROM units WHERE id = 'unit-1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("应读取取消后的译文");
+    assert_eq!(translation, None);
+}
+
+#[test]
+fn program_construction_reuses_source_and_argument_allocations() {
+    let source = large_lua_comment(256 * 1024);
+    let arguments = vec!["first".repeat(32 * 1024), "second".repeat(32 * 1024)];
+    let source_pointer = source.as_ptr();
+    let arguments_pointer = arguments.as_ptr();
+    let program = ProjectLuaProgram::new("shared.lua", source, arguments);
+
+    assert_eq!(program.source().as_ptr(), source_pointer);
+    assert_eq!(program.arguments().as_ptr(), arguments_pointer);
+}
+
+#[test]
+fn chunked_program_fingerprint_matches_existing_contract() {
+    let source = large_lua_comment(2 * 64 * 1024 + 17);
+    let mut expected = Sha256FramedHasher::new(b"att.project-lua.program-identity");
+    expected.frame(1, &source);
+    let program = ProjectLuaProgram::new("fingerprint.lua", source, Vec::new());
+
+    let actual = fingerprint_project_lua_program_with_cancellation(
+        &program,
+        &ProjectLuaCancellation::default(),
+    )
+    .expect("分块指纹应成功");
+
+    assert_eq!(actual, expected.finish());
+}
+
+#[test]
+fn utf8_character_split_across_compile_chunks_is_valid() {
+    let mut source = large_lua_comment(64 * 1024 - 1);
+    source.extend_from_slice("界".as_bytes());
+    let program = ProjectLuaProgram::new("utf8-boundary.lua", source, Vec::new());
+
+    compile_project_lua_program(&program).expect("跨分块的 UTF-8 字符应正常编译");
+}
+
+#[test]
+fn preflight_compilation_observes_cross_thread_cancellation() {
+    let program = ProjectLuaProgram::new(
+        "large-preflight.lua",
+        large_lua_comment(16 * 1024 * 1024),
+        Vec::new(),
+    );
+    let cancellation = ProjectLuaCancellation::default();
+    let worker_cancellation = cancellation.clone();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let worker_barrier = Arc::clone(&barrier);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        worker_barrier.wait();
+        sender
+            .send(compile_project_lua_program_with_cancellation(
+                &program,
+                &worker_cancellation,
+            ))
+            .expect("测试结果接收端不应提前关闭");
+    });
+
+    barrier.wait();
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    cancellation.cancel();
+    let result = receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("大脚本预检取消必须在超时前结束");
+    worker.join().expect("预检 worker 不应 panic");
+    assert_eq!(result, Err(ProjectLuaFailure::Cancelled));
+}
+
+#[test]
+fn execution_second_compile_observes_cross_thread_cancellation() {
+    let program = ProjectLuaProgram::new(
+        "large-execution.lua",
+        large_lua_comment(16 * 1024 * 1024),
+        Vec::new(),
+    );
+    compile_project_lua_program(&program).expect("预检编译应先成功");
+
+    let cancellation = ProjectLuaCancellation::default();
+    let worker_cancellation = cancellation.clone();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let worker_barrier = Arc::clone(&barrier);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        worker_barrier.wait();
+        let result = run_project_lua(
+            database(),
+            ProjectLuaRunRequest::new(
+                ProjectLuaProject::new("test-project", "generic"),
+                program,
+                Arc::new(TestAdapter::default()),
+            )
+            .with_cancellation(worker_cancellation),
+        );
+        sender.send(result).expect("测试结果接收端不应提前关闭");
+    });
+
+    barrier.wait();
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    cancellation.cancel();
+    let error = receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("执行期二次编译取消必须在超时前结束")
+        .expect_err("执行期二次编译应被取消");
+    worker.join().expect("执行 worker 不应 panic");
+    assert_eq!(
+        error,
+        ProjectLuaRunError::NotStarted(ProjectLuaFailure::Cancelled)
+    );
+}
+
+#[test]
 fn invalid_utf8_script_is_rejected_before_transaction() {
     let request = ProjectLuaRunRequest::new(
         ProjectLuaProject::new("test-project", "generic"),
@@ -804,16 +1370,17 @@ fn project_value_distinguishes_object_array_blob_and_scalars() {
     )
     .expect("通用值应交给适配器");
 
-    let mut expected_locator = BTreeMap::new();
-    expected_locator.insert("id".to_owned(), ProjectLuaValue::Text("unit-1".to_owned()));
-    expected_locator.insert("ordinal".to_owned(), ProjectLuaValue::Integer(3));
-    expected_locator.insert(
-        "nested".to_owned(),
-        ProjectLuaValue::Array(vec![
-            ProjectLuaValue::Text("a".to_owned()),
-            ProjectLuaValue::Boolean(true),
-        ]),
-    );
+    let expected_locator = vec![
+        ("id".to_owned(), ProjectLuaValue::Text("unit-1".to_owned())),
+        (
+            "nested".to_owned(),
+            ProjectLuaValue::Array(vec![
+                ProjectLuaValue::Text("a".to_owned()),
+                ProjectLuaValue::Boolean(true),
+            ]),
+        ),
+        ("ordinal".to_owned(), ProjectLuaValue::Integer(3)),
+    ];
     assert_eq!(
         adapter.seen.lock().expect("测试锁不应中毒").as_ref(),
         Some(&(

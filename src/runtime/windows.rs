@@ -443,7 +443,7 @@ fn open_shared_final_path(path: &Path) -> Result<File, WindowsFsError> {
 pub(crate) fn pin_regular_file_for_snapshot_read(
     path: &Path,
 ) -> Result<PinnedPath, WindowsFsError> {
-    let pinned = pin_path_with_final_opener(path, open_snapshot_read_file)?;
+    let pinned = pin_path_with_final_opener(path, open_regular_file_for_snapshot_read)?;
     if !pinned.metadata()?.is_file() {
         return Err(io_error(
             "确认快照读取文件",
@@ -454,7 +454,12 @@ pub(crate) fn pin_regular_file_for_snapshot_read(
     Ok(pinned)
 }
 
-fn open_snapshot_read_file(path: &Path) -> Result<File, WindowsFsError> {
+/// 在调用方已经固定父目录链时，直接打开一个稳定读取的普通文件句柄。
+///
+/// 返回句柄不共享写入和删除权限，因此其存活期间内容与最终对象身份不会被替换。
+/// 调用方必须在本函数返回前持续固定父目录链，避免按字符串解析路径时穿越刚被
+/// 替换的祖先目录。
+pub(crate) fn open_regular_file_for_snapshot_read(path: &Path) -> Result<File, WindowsFsError> {
     let file = OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ)
@@ -462,6 +467,16 @@ fn open_snapshot_read_file(path: &Path) -> Result<File, WindowsFsError> {
         .open(path)
         .map_err(|source| io_error("打开稳定快照文件", path, source))?;
     reject_reparse(&file, path)?;
+    let metadata = file
+        .metadata()
+        .map_err(|source| io_error("读取稳定快照文件元数据", path, source))?;
+    if !metadata.is_file() {
+        return Err(io_error(
+            "确认稳定快照普通文件",
+            path,
+            io::Error::new(io::ErrorKind::InvalidInput, "目标不是普通文件"),
+        ));
+    }
     Ok(file)
 }
 

@@ -1,7 +1,10 @@
 //! RPG Maker 翻译规划和结果验收共同使用的一次语义快照。
 
+#[cfg(test)]
+use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
@@ -14,7 +17,8 @@ use crate::rpg_maker::location_codec::{
 use crate::rpg_maker::model::TextUnitContent;
 use crate::rpg_maker::text::TextGroupKind;
 use crate::translation::placeholder_projection::{
-    LanguageTextProjectionError, project_protected_text,
+    LanguageTextProjectionError, project_protected_text_from_shared_with_cancellation,
+    project_protected_text_with_cancellation,
 };
 
 #[cfg(test)]
@@ -130,50 +134,79 @@ impl ResolvedTranslationSemantics {
         self.global_fingerprint
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare(
         &self,
         kind: TextGroupKind,
         original: &str,
     ) -> Result<PreparedTranslationText, ResolvedTranslationSemanticError> {
-        self.prepare_text(kind, original, &[])
+        let facts = match prepare_translation_resource_text_with_cancellation(
+            self.engine,
+            kind,
+            original,
+            &[],
+            self.terminology.as_ref(),
+            &self.placeholder_service,
+            &self.custom_placeholders,
+            &mut || Ok::<_, Infallible>(()),
+        ) {
+            Ok(result) => result?,
+            Err(unreachable) => match unreachable {},
+        };
+        self.finish_prepared_text(facts)
     }
 
     /// RPG Maker 的 `Lines` 保持完整原文参与 Placeholder 与语言分析，但 opaque 保护和
     /// 术语都不能跨越两个物理数组元素。`Value` 没有这层边界，其中的 LF 仍是普通内容。
+    #[cfg(test)]
     pub(crate) fn prepare_content(
         &self,
         kind: TextGroupKind,
         content: &TextUnitContent,
     ) -> Result<PreparedTranslationText, ResolvedTranslationSemanticError> {
-        match content {
-            TextUnitContent::Value(original) => self.prepare(kind, original),
-            TextUnitContent::Lines(lines) => {
-                let original = lines.join("\n");
-                let line_separators = line_separator_offsets(lines);
-                self.prepare_text(kind, &original, &line_separators)
-            }
+        match self.prepare_content_with_cancellation(kind, content, || Ok::<_, Infallible>(())) {
+            Ok(result) => result,
+            Err(unreachable) => match unreachable {},
         }
     }
 
-    fn prepare_text(
+    /// 保持生产译前语义，并在大文本复制、术语扫描和状态建立之间轮询取消。
+    pub(crate) fn prepare_content_with_cancellation<E>(
         &self,
         kind: TextGroupKind,
-        original: &str,
-        line_separators: &[usize],
+        content: &TextUnitContent,
+        mut ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Result<PreparedTranslationText, ResolvedTranslationSemanticError>, E> {
+        ensure_running()?;
+        let facts = match prepare_translation_resource_facts_with_cancellation(
+            self.engine,
+            kind,
+            content,
+            self.terminology.as_ref(),
+            &self.placeholder_service,
+            &self.custom_placeholders,
+            &mut ensure_running,
+        )? {
+            Ok(facts) => facts,
+            Err(source) => return Ok(Err(source)),
+        };
+        ensure_running()?;
+        let prepared = self.finish_prepared_text(facts);
+        ensure_running()?;
+        Ok(prepared)
+    }
+
+    fn finish_prepared_text(
+        &self,
+        facts: TranslationResourceFacts,
     ) -> Result<PreparedTranslationText, ResolvedTranslationSemanticError> {
-        let (model_text, placeholders) = self
-            .placeholder_service
-            .protect_with_line_boundaries(
-                self.engine,
-                kind,
-                original,
-                line_separators,
-                &self.custom_placeholders,
-            )
-            .map_err(ResolvedTranslationSemanticError::ProtectPlaceholder)?
-            .into_parts();
-        let language_text = project_protected_text(&model_text, &placeholders)
-            .map_err(ResolvedTranslationSemanticError::ProjectLanguageText)?;
+        let TranslationResourceFacts {
+            model_text,
+            terms,
+            term_indices,
+            placeholders,
+            language_text,
+        } = facts;
         let language_analysis = self.source_language.analyze_source(&language_text);
         let status = if !language_text.has_non_whitespace_natural_text() {
             PreparedTranslationStatus::FullyProtected
@@ -182,39 +215,6 @@ impl ResolvedTranslationSemantics {
         } else {
             PreparedTranslationStatus::NonSourceLanguage
         };
-        let term_indices = if line_separators.is_empty() {
-            self.terminology
-                .triggered_indices(natural_segments(&language_text))
-        } else {
-            let domains =
-                terminology_line_domains(original, &model_text, &placeholders, line_separators);
-            let mut natural_texts = Vec::new();
-            for domain in domains {
-                let domain_placeholders = placeholders
-                    .iter()
-                    .filter(|placeholder| domain.contains(placeholder.token()))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let projected = project_protected_text(domain, &domain_placeholders)
-                    .map_err(ResolvedTranslationSemanticError::ProjectLanguageText)?;
-                natural_texts.extend(projected.segments().iter().filter_map(
-                    |segment| match segment {
-                        LanguageTextSegment::NaturalText(text) => Some(text.clone()),
-                        LanguageTextSegment::OpaqueBoundary => None,
-                    },
-                ));
-            }
-            self.terminology
-                .triggered_indices(natural_texts.iter().map(String::as_str))
-        };
-        let terms = term_indices
-            .iter()
-            .copied()
-            .map(|index| {
-                let entry = &self.terminology.entries()[index];
-                TerminologyDependency::new(entry.term(), entry.translation())
-            })
-            .collect();
         Ok(PreparedTranslationText {
             status,
             model_text,
@@ -228,34 +228,257 @@ impl ResolvedTranslationSemantics {
     }
 }
 
+/// 已由当前编译后 Placeholder 与 Terminology 共同建立的 Unit 资源事实。
+///
+/// 字段保持私有，调用方不能用原始 JSON 假装已经完成规则编译和实际命中计算。
+pub(crate) struct TranslationResourceFacts {
+    model_text: String,
+    terms: Vec<TerminologyDependency>,
+    term_indices: Vec<usize>,
+    placeholders: Vec<AppliedPlaceholder>,
+    language_text: crate::language::LanguageText,
+}
+
+impl TranslationResourceFacts {
+    pub(crate) fn terminology_dependencies(&self) -> &[TerminologyDependency] {
+        &self.terms
+    }
+
+    pub(crate) fn placeholders(&self) -> &[AppliedPlaceholder] {
+        &self.placeholders
+    }
+}
+
+/// 用已经编译的当前资源计算一个 Unit 实际命中的 Placeholder 与 Terminology。
+///
+/// 外层错误只表示取消；内层错误表示当前文本无法按已编译资源建立语义。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_translation_resource_facts_with_cancellation<E>(
+    engine: RpgMakerEngine,
+    kind: TextGroupKind,
+    content: &TextUnitContent,
+    terminology: &CompiledTerminology,
+    placeholder_service: &Pcre2PlaceholderService,
+    custom_placeholders: &CompiledPlaceholderRules,
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<Result<TranslationResourceFacts, ResolvedTranslationSemanticError>, E> {
+    ensure_running()?;
+    match content {
+        TextUnitContent::Value(original) => prepare_translation_resource_text_with_cancellation(
+            engine,
+            kind,
+            original,
+            &[],
+            terminology,
+            placeholder_service,
+            custom_placeholders,
+            &mut ensure_running,
+        ),
+        TextUnitContent::Lines(lines) => {
+            let (original, line_separators) =
+                join_lines_with_cancellation(lines, &mut ensure_running)?;
+            prepare_translation_resource_text_with_cancellation(
+                engine,
+                kind,
+                &original,
+                &line_separators,
+                terminology,
+                placeholder_service,
+                custom_placeholders,
+                &mut ensure_running,
+            )
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_translation_resource_text_with_cancellation<E>(
+    engine: RpgMakerEngine,
+    kind: TextGroupKind,
+    original: &str,
+    line_separators: &[usize],
+    terminology: &CompiledTerminology,
+    placeholder_service: &Pcre2PlaceholderService,
+    custom_placeholders: &CompiledPlaceholderRules,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<Result<TranslationResourceFacts, ResolvedTranslationSemanticError>, E> {
+    ensure_running()?;
+    let (model_text, placeholders) = match placeholder_service
+        .protect_with_line_boundaries_with_cancellation(
+            engine,
+            kind,
+            original,
+            line_separators,
+            custom_placeholders,
+            &mut *ensure_running,
+        )? {
+        Ok(protected) => protected.into_parts(),
+        Err(source) => {
+            return Ok(Err(ResolvedTranslationSemanticError::ProtectPlaceholder(
+                source,
+            )));
+        }
+    };
+    ensure_running()?;
+    let language_text = match project_protected_text_with_cancellation(
+        &model_text,
+        &placeholders,
+        &mut *ensure_running,
+    )? {
+        Ok(language_text) => language_text,
+        Err(source) => {
+            return Ok(Err(ResolvedTranslationSemanticError::ProjectLanguageText(
+                source,
+            )));
+        }
+    };
+    ensure_running()?;
+
+    let term_indices = if line_separators.is_empty() {
+        terminology.triggered_indices_with_cancellation(
+            natural_segments(&language_text),
+            &mut *ensure_running,
+        )?
+    } else {
+        let domains = terminology_line_domains_with_cancellation(
+            original,
+            &model_text,
+            &placeholders,
+            line_separators,
+            ensure_running,
+        )?;
+        let mut matched = vec![false; terminology.entries().len()];
+        for domain in domains {
+            ensure_running()?;
+            let mut domain_placeholders = Vec::new();
+            for placeholder in &placeholders {
+                ensure_running()?;
+                if text_contains_with_cancellation(domain, placeholder.token(), ensure_running)? {
+                    domain_placeholders.push(clone_placeholder_with_cancellation(
+                        placeholder,
+                        ensure_running,
+                    )?);
+                }
+            }
+            let projected = match project_protected_text_from_shared_with_cancellation(
+                domain,
+                Arc::new(domain_placeholders),
+                &mut *ensure_running,
+            )? {
+                Ok(projected) => projected,
+                Err(source) => {
+                    return Ok(Err(ResolvedTranslationSemanticError::ProjectLanguageText(
+                        source,
+                    )));
+                }
+            };
+            for index in terminology.triggered_indices_with_cancellation(
+                natural_segments(&projected),
+                &mut *ensure_running,
+            )? {
+                ensure_running()?;
+                matched[index] = true;
+            }
+        }
+        let mut indices = Vec::new();
+        for (index, matched) in matched.into_iter().enumerate() {
+            ensure_running()?;
+            if matched {
+                indices.push(index);
+            }
+        }
+        indices
+    };
+
+    let mut terms = Vec::with_capacity(term_indices.len());
+    for &index in &term_indices {
+        ensure_running()?;
+        let entry = &terminology.entries()[index];
+        terms.push(TerminologyDependency::new(
+            clone_text_with_cancellation(entry.term(), ensure_running)?,
+            clone_text_with_cancellation(entry.translation(), ensure_running)?,
+        ));
+    }
+    ensure_running()?;
+    Ok(Ok(TranslationResourceFacts {
+        model_text,
+        terms,
+        term_indices,
+        placeholders,
+        language_text,
+    }))
+}
+
 /// 建立人工译文的稳定语义状态。
 ///
 /// 该状态只绑定会决定人工译文是否仍适用于当前 Unit 的事实。Prompt、Profile、
 /// Client、术语和译文正文不参与；因此对已有人工译文作精确修订不会使它失去
 /// Current，调整自动翻译配置也不会清除人工修订。
+#[cfg(test)]
 pub(crate) fn manual_translation_state_fingerprint(
     engine: RpgMakerEngine,
     language_pair: &LanguagePair,
     identity: &TranslationUnitIdentity,
     placeholders: &[AppliedPlaceholder],
 ) -> Result<Sha256Fingerprint, ManualTranslationStateError> {
-    let group_location = RpgMakerLocationCodec::encode(identity.group_location())
-        .map_err(ManualTranslationStateError::EncodeLocation)?;
-    let unit_role = RpgMakerProjectionCodec::encode_role(identity.role())
-        .map_err(ManualTranslationStateError::EncodeRole)?;
+    match manual_translation_state_fingerprint_with_cancellation(
+        engine,
+        language_pair,
+        identity,
+        placeholders,
+        || Ok::<_, Infallible>(()),
+    ) {
+        Ok(result) => result,
+        Err(unreachable) => match unreachable {},
+    }
+}
+
+/// 保持人工译文状态的既有字节语义，并在任意长度字段之间轮询取消。
+///
+/// 外层错误只表示取消；内层错误表示受信 Unit 身份不能编码。
+pub(crate) fn manual_translation_state_fingerprint_with_cancellation<E>(
+    engine: RpgMakerEngine,
+    language_pair: &LanguagePair,
+    identity: &TranslationUnitIdentity,
+    placeholders: &[AppliedPlaceholder],
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<Result<Sha256Fingerprint, ManualTranslationStateError>, E> {
+    ensure_running()?;
+    let group_location = match RpgMakerLocationCodec::encode(identity.group_location()) {
+        Ok(group_location) => group_location,
+        Err(source) => {
+            return Ok(Err(ManualTranslationStateError::EncodeLocation(source)));
+        }
+    };
+    let unit_role = match RpgMakerProjectionCodec::encode_role(identity.role()) {
+        Ok(unit_role) => unit_role,
+        Err(source) => return Ok(Err(ManualTranslationStateError::EncodeRole(source))),
+    };
+    let chunk_size = semantic_hash_chunk_size();
     let mut hasher = Sha256FramedHasher::new(b"att.rpg_maker.translation-state.manual");
     hasher
         .frame(1, engine.storage_name().as_bytes())
         .frame(2, language_pair.source().as_str().as_bytes())
         .frame(3, language_pair.target().as_str().as_bytes())
         .frame(4, identity.owner().storage_name().as_bytes())
-        .frame(5, identity.kind().storage_name().as_bytes())
-        .frame(6, group_location.as_bytes())
-        .frame(7, unit_role.as_bytes())
-        .frame(8, identity.source_context_json().as_bytes());
+        .frame(5, identity.kind().storage_name().as_bytes());
+    hasher.try_frame_chunks(
+        6,
+        group_location.as_bytes(),
+        chunk_size,
+        &mut ensure_running,
+    )?;
+    hasher.try_frame_chunks(7, unit_role.as_bytes(), chunk_size, &mut ensure_running)?;
+    hasher.try_frame_chunks(
+        8,
+        identity.source_context_json().as_bytes(),
+        chunk_size,
+        &mut ensure_running,
+    )?;
     match identity.source_content() {
         TextUnitContent::Value(value) => {
-            hasher.frame(9, b"value").frame(10, value.as_bytes());
+            hasher.frame(9, b"value");
+            hasher.try_frame_chunks(10, value.as_bytes(), chunk_size, &mut ensure_running)?;
         }
         TextUnitContent::Lines(lines) => {
             let count = u64::try_from(lines.len())
@@ -263,11 +486,13 @@ pub(crate) fn manual_translation_state_fingerprint(
                 .to_le_bytes();
             hasher.frame(9, b"lines").frame(10, &count);
             for line in lines {
-                hasher.frame(11, line.as_bytes());
+                ensure_running()?;
+                hasher.try_frame_chunks(11, line.as_bytes(), chunk_size, &mut ensure_running)?;
             }
         }
     }
     for placeholder in placeholders {
+        ensure_running()?;
         let origin = match placeholder.origin() {
             super::pipeline::PlaceholderRuleOrigin::BuiltIn => b"builtin".as_slice(),
             super::pipeline::PlaceholderRuleOrigin::Custom => b"custom".as_slice(),
@@ -277,15 +502,39 @@ pub(crate) fn manual_translation_state_fingerprint(
             super::pipeline::PlaceholderSegment::Begin => b"begin".as_slice(),
             super::pipeline::PlaceholderSegment::End => b"end".as_slice(),
         };
-        hasher
-            .frame(20, placeholder.token().as_bytes())
-            .frame(21, placeholder.original().as_bytes())
-            .frame(22, origin)
-            .frame(23, placeholder.label().as_bytes())
-            .frame(24, placeholder.scope().as_bytes())
-            .frame(25, segment);
+        hasher.try_frame_chunks(
+            20,
+            placeholder.token().as_bytes(),
+            chunk_size,
+            &mut ensure_running,
+        )?;
+        hasher.try_frame_chunks(
+            21,
+            placeholder.original().as_bytes(),
+            chunk_size,
+            &mut ensure_running,
+        )?;
+        hasher.frame(22, origin);
+        hasher.try_frame_chunks(
+            23,
+            placeholder.label().as_bytes(),
+            chunk_size,
+            &mut ensure_running,
+        )?;
+        hasher.try_frame_chunks(
+            24,
+            placeholder.scope().as_bytes(),
+            chunk_size,
+            &mut ensure_running,
+        )?;
+        hasher.frame(25, segment);
     }
-    Ok(hasher.finish())
+    ensure_running()?;
+    Ok(Ok(hasher.finish()))
+}
+
+fn semantic_hash_chunk_size() -> NonZeroUsize {
+    NonZeroUsize::new(64 * 1024).expect("语义状态哈希取消检查块大小必须非零")
 }
 
 /// 人工译文状态无法编码受信 Unit 身份。
@@ -325,48 +574,76 @@ fn natural_segments(language_text: &crate::language::LanguageText) -> impl Itera
         })
 }
 
-fn line_separator_offsets(lines: &[String]) -> Vec<usize> {
+fn join_lines_with_cancellation<E>(
+    lines: &[String],
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<(String, Vec<usize>), E> {
+    ensure_running()?;
+    let mut capacity = 0_usize;
+    for line in lines {
+        ensure_running()?;
+        capacity = capacity.saturating_add(line.len()).saturating_add(1);
+    }
+    capacity = capacity.saturating_sub(usize::from(!lines.is_empty()));
+    let mut original = String::with_capacity(capacity);
     let mut offsets = Vec::with_capacity(lines.len().saturating_sub(1));
     let mut cursor = 0;
-    for line in lines.iter().take(lines.len().saturating_sub(1)) {
+    for (index, line) in lines.iter().enumerate() {
+        append_text_with_cancellation(&mut original, line, ensure_running)?;
         cursor += line.len();
-        offsets.push(cursor);
-        cursor += 1;
+        if index + 1 < lines.len() {
+            offsets.push(cursor);
+            original.push('\n');
+            cursor += 1;
+        }
     }
-    offsets
+    ensure_running()?;
+    Ok((original, offsets))
 }
 
 /// 把 Lines 分隔 LF 映射到 Placeholder 投影后的模型文本，并据此切开术语扫描域。
 ///
 /// 译前保护边界已经保证不透明跨度不会吞掉这些分隔符。
-fn terminology_line_domains<'a>(
+fn terminology_line_domains_with_cancellation<'a, E>(
     original: &str,
     model_text: &'a str,
     placeholders: &[AppliedPlaceholder],
     line_separators: &[usize],
-) -> Vec<&'a str> {
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<Vec<&'a str>, E> {
+    ensure_running()?;
     let mut mapped = Vec::with_capacity(line_separators.len());
     let mut separator_index = 0;
     let mut source_cursor = 0;
     let mut model_cursor = 0;
 
     for placeholder in placeholders {
-        let token_offset = model_text[model_cursor..]
-            .find(placeholder.token())
-            .expect("Placeholder 投影已经保证每个 token 在模型文本中恰好出现一次");
+        ensure_running()?;
+        let token_offset = find_text_with_cancellation(
+            &model_text[model_cursor..],
+            placeholder.token(),
+            ensure_running,
+        )?
+        .expect("Placeholder 投影已经保证每个 token 在模型文本中恰好出现一次");
         let token_start = model_cursor + token_offset;
         let source_span_start = source_cursor + token_offset;
         let source_span_end = source_span_start + placeholder.original().len();
 
-        debug_assert_eq!(
-            &original[source_cursor..source_span_start],
-            &model_text[model_cursor..token_start],
-            "Placeholder 之前的自然文本必须逐字保持"
+        debug_assert!(
+            text_eq_with_cancellation(
+                &original[source_cursor..source_span_start],
+                &model_text[model_cursor..token_start],
+                ensure_running,
+            )?,
+            "Placeholder 之前的自然文本必须逐字保持",
         );
-        debug_assert_eq!(
-            &original[source_span_start..source_span_end],
-            placeholder.original(),
-            "Placeholder 绑定必须对应原文中的当前源跨度"
+        debug_assert!(
+            text_eq_with_cancellation(
+                &original[source_span_start..source_span_end],
+                placeholder.original(),
+                ensure_running,
+            )?,
+            "Placeholder 绑定必须对应原文中的当前源跨度",
         );
 
         while line_separators
@@ -389,18 +666,138 @@ fn terminology_line_domains<'a>(
     }
 
     for &separator in &line_separators[separator_index..] {
+        ensure_running()?;
         mapped.push(model_cursor + separator - source_cursor);
     }
 
     let mut domains = Vec::with_capacity(mapped.len() + 1);
     let mut start = 0;
     for separator in mapped {
+        ensure_running()?;
         debug_assert_eq!(model_text.as_bytes().get(separator), Some(&b'\n'));
         domains.push(&model_text[start..separator]);
         start = separator + 1;
     }
     domains.push(&model_text[start..]);
-    domains
+    ensure_running()?;
+    Ok(domains)
+}
+
+fn clone_text_with_cancellation<E>(
+    source: &str,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<String, E> {
+    let mut output = String::with_capacity(source.len());
+    append_text_with_cancellation(&mut output, source, ensure_running)?;
+    Ok(output)
+}
+
+fn clone_placeholder_with_cancellation<E>(
+    placeholder: &AppliedPlaceholder,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<AppliedPlaceholder, E> {
+    Ok(AppliedPlaceholder::new(
+        clone_text_with_cancellation(placeholder.token(), ensure_running)?,
+        clone_text_with_cancellation(placeholder.original(), ensure_running)?,
+        placeholder.origin(),
+        clone_text_with_cancellation(placeholder.label(), ensure_running)?,
+        clone_text_with_cancellation(placeholder.scope(), ensure_running)?,
+        placeholder.segment(),
+    ))
+}
+
+fn append_text_with_cancellation<E>(
+    output: &mut String,
+    source: &str,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<(), E> {
+    const CHUNK_BYTES: usize = 64 * 1024;
+
+    ensure_running()?;
+    let mut start = 0_usize;
+    while start < source.len() {
+        ensure_running()?;
+        let mut end = start.saturating_add(CHUNK_BYTES).min(source.len());
+        while end < source.len() && !source.is_char_boundary(end) {
+            end += 1;
+        }
+        output.push_str(&source[start..end]);
+        start = end;
+    }
+    ensure_running()
+}
+
+fn text_eq_with_cancellation<E>(
+    left: &str,
+    right: &str,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    const CHUNK_BYTES: usize = 64 * 1024;
+
+    ensure_running()?;
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    for (left, right) in left
+        .as_bytes()
+        .chunks(CHUNK_BYTES)
+        .zip(right.as_bytes().chunks(CHUNK_BYTES))
+    {
+        ensure_running()?;
+        if left != right {
+            return Ok(false);
+        }
+    }
+    ensure_running()?;
+    Ok(true)
+}
+
+fn text_contains_with_cancellation<E>(
+    haystack: &str,
+    needle: &str,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    Ok(find_text_with_cancellation(haystack, needle, ensure_running)?.is_some())
+}
+
+fn find_text_with_cancellation<E>(
+    haystack: &str,
+    needle: &str,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<Option<usize>, E> {
+    const CHUNK_BYTES: usize = 64 * 1024;
+
+    ensure_running()?;
+    if needle.is_empty() {
+        return Ok(Some(0));
+    }
+    if needle.len() > haystack.len() {
+        return Ok(None);
+    }
+    let overlap = needle.len().saturating_sub(1);
+    let mut start = 0_usize;
+    while start < haystack.len() {
+        ensure_running()?;
+        let owned_end = start.saturating_add(CHUNK_BYTES).min(haystack.len());
+        let search_end = owned_end.saturating_add(overlap).min(haystack.len());
+        let mut search_start = start;
+        while search_start > 0 && !haystack.is_char_boundary(search_start) {
+            search_start -= 1;
+        }
+        let mut char_search_end = search_end;
+        while char_search_end < haystack.len() && !haystack.is_char_boundary(char_search_end) {
+            char_search_end += 1;
+        }
+        if let Some(offset) = haystack[search_start..char_search_end].find(needle) {
+            let found = search_start + offset;
+            if found < owned_end {
+                return Ok(Some(found));
+            }
+        }
+        start = owned_end;
+    }
+    ensure_running()?;
+    Ok(None)
 }
 
 /// 当前单段文本相对于源语言与保护规则的处理状态。
@@ -656,6 +1053,60 @@ mod tests {
             )
             .expect("应建立语言变化后的人工状态")
         );
+    }
+
+    #[test]
+    fn cancellable_manual_state_preserves_bytes_and_observes_large_fields() {
+        let identity = TranslationUnitIdentity::new(
+            RpgMakerAssetOwner::Builtin,
+            TextGroupKind::DatabaseEntry,
+            RpgMakerLocation::value(
+                RpgMakerSource::data(StandardDataFile::Actors),
+                vec![RpgMakerLocationStep::index(1)],
+            ),
+            TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法")),
+            TextUnitContent::Value("原".repeat(80_000)),
+            format!(r#"{{"note":"{}"}}"#, "文".repeat(80_000)),
+        );
+        let language_pair = LanguagePair::new(
+            LanguageId::parse("ja").expect("来源语言应合法"),
+            LanguageId::parse("zh-Hans").expect("目标语言应合法"),
+        );
+        let expected = manual_translation_state_fingerprint(
+            RpgMakerEngine::Mz,
+            &language_pair,
+            &identity,
+            &[],
+        )
+        .expect("普通状态应可建立");
+        let mut polls = 0_usize;
+        let actual = manual_translation_state_fingerprint_with_cancellation(
+            RpgMakerEngine::Mz,
+            &language_pair,
+            &identity,
+            &[],
+            || {
+                polls += 1;
+                Ok::<_, ()>(())
+            },
+        )
+        .expect("不取消")
+        .expect("状态应可建立");
+        assert_eq!(actual, expected);
+        assert!(polls >= 8);
+
+        let mut polls = 0_usize;
+        let cancelled = manual_translation_state_fingerprint_with_cancellation(
+            RpgMakerEngine::Mz,
+            &language_pair,
+            &identity,
+            &[],
+            || {
+                polls += 1;
+                if polls >= 4 { Err("cancelled") } else { Ok(()) }
+            },
+        );
+        assert!(matches!(cancelled, Err("cancelled")));
     }
 
     #[test]
