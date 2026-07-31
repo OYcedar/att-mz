@@ -24,8 +24,7 @@ use crate::storage::sqlite::{
 
 use run_plan::{
     CREATE_EXTRACT_RULES_DEFINITION_TABLE, CREATE_EXTRACT_RUN_PLAN_TABLE,
-    CREATE_INIT_RUN_PLAN_TABLE, CREATE_TRANSLATE_RUN_PLAN_TABLE, SELECT_RUN_PLAN_SINGLETONS,
-    decode_project_run_plans,
+    CREATE_INIT_RUN_PLAN_TABLE, CREATE_TRANSLATE_RUN_PLAN_TABLE,
 };
 #[allow(
     unused_imports,
@@ -35,8 +34,8 @@ pub(crate) use run_plan::{
     ExtractRulesCanonicalJson, ExtractRunPlan, FinalProjectRunPlanPersistenceService, InitRunPlan,
     InvalidProjectRunPlans, InvalidRunPlanValue, ProjectRunPlanFinalizer,
     ProjectRunPlanPersistenceService, ProjectRunPlanReadError, ProjectRunPlanReplaceError,
-    ProjectRunPlanReplacement, ProjectRunPlanRepository, ProjectRunPlans, TranslateRunPlan,
-    decode_init_source_path,
+    ProjectRunPlanReplacement, ProjectRunPlanRepository, ProjectRunPlans,
+    SELECT_RUN_PLAN_SINGLETONS, TranslateRunPlan, decode_project_run_plans,
 };
 
 const PROJECT_DATABASE_FILE_NAME: &str = "project.db";
@@ -815,7 +814,13 @@ fn max_fullwidth_chars_column(
             actual: value.kind_name(),
         });
     };
+    max_fullwidth_chars_integer(value, column)
+}
 
+fn max_fullwidth_chars_integer(
+    value: i64,
+    column: &'static str,
+) -> Result<MaxFullwidthChars, InvalidProjectMetadata> {
     let value = u32::try_from(value).map_err(|_| InvalidProjectMetadata::InvalidLineWidth {
         column,
         actual: value,
@@ -823,6 +828,30 @@ fn max_fullwidth_chars_column(
     MaxFullwidthChars::new(value).map_err(|_| InvalidProjectMetadata::InvalidLineWidth {
         column,
         actual: i64::from(value),
+    })
+}
+
+/// 用项目数据库读取器的同一规则校验直接 SQLite 连接返回的显示宽度。
+///
+/// Lua 适配器在事务提交前持有 `rusqlite` 行，必须保留 SQLite 实际存储类型，
+/// 不能通过 `get::<i64>` 把 REAL 或 TEXT 隐式转换成看似合法的整数。
+pub(crate) fn max_fullwidth_chars_from_rusqlite_value(
+    value: rusqlite::types::ValueRef<'_>,
+    column: &'static str,
+) -> Result<MaxFullwidthChars, InvalidProjectMetadata> {
+    let value = match value {
+        rusqlite::types::ValueRef::Integer(value) => {
+            return max_fullwidth_chars_integer(value, column);
+        }
+        rusqlite::types::ValueRef::Null => "NULL",
+        rusqlite::types::ValueRef::Real(_) => "REAL",
+        rusqlite::types::ValueRef::Text(_) => "TEXT",
+        rusqlite::types::ValueRef::Blob(_) => "BLOB",
+    };
+    Err(InvalidProjectMetadata::WrongColumnType {
+        column,
+        expected: "INTEGER",
+        actual: value,
     })
 }
 
@@ -1165,6 +1194,34 @@ pub(crate) enum InvalidCurrentProjectDatabase {
     ProjectDefinitions(InvalidProjectDefinitions),
     RunPlans(InvalidProjectRunPlans),
     Integrity(InvalidProjectDatabaseIntegrity),
+}
+
+/// 直接连接无法证明 RPG Maker 数据库采用当前唯一 ATT schema。
+#[derive(Debug)]
+pub(crate) enum CurrentAttSchemaValidationError {
+    Cancelled,
+    Read(rusqlite::Error),
+    Invalid(InvalidCurrentProjectDatabase),
+}
+
+impl fmt::Display for CurrentAttSchemaValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cancelled => formatter.write_str("当前 ATT schema 校验已取消"),
+            Self::Read(source) => write!(formatter, "读取当前 ATT schema 失败：{source}"),
+            Self::Invalid(reason) => reason.fmt(formatter),
+        }
+    }
+}
+
+impl Error for CurrentAttSchemaValidationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Cancelled => None,
+            Self::Read(source) => Some(source),
+            Self::Invalid(reason) => Some(reason),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1691,7 +1748,7 @@ impl InvalidTranslationResources {
 }
 
 impl InvalidProjectDefinitions {
-    fn safe_fact(&self) -> String {
+    pub(crate) fn safe_fact(&self) -> String {
         match self {
             Self::WrongRowCount { expected, actual } => {
                 format!("violation=wrong_row_count; expected={expected}; actual={actual}")
@@ -1925,69 +1982,117 @@ fn expected_att_schema() -> Vec<(&'static str, &'static str, &'static str, &'sta
 }
 
 fn validate_att_schema(rows: Vec<SqliteRow>) -> Result<(), InvalidCurrentProjectDatabase> {
+    match validate_att_schema_with_check(rows, &mut || false) {
+        Ok(()) => Ok(()),
+        Err(AttSchemaCheckError::Invalid(source)) => Err(source),
+        Err(AttSchemaCheckError::Cancelled) => {
+            unreachable!("永不取消的 schema 校验闭包不得返回取消")
+        }
+    }
+}
+
+enum AttSchemaCheckError {
+    Cancelled,
+    Invalid(InvalidCurrentProjectDatabase),
+}
+
+fn validate_att_schema_with_check(
+    rows: Vec<SqliteRow>,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<(), AttSchemaCheckError> {
+    ensure_att_schema_running(is_cancelled)?;
     let mut actual = Vec::with_capacity(rows.len());
     for row in rows {
+        ensure_att_schema_running(is_cancelled)?;
         let values = row.into_values();
         if values.len() != 4 {
-            return Err(InvalidCurrentProjectDatabase::Schema(
-                InvalidAttSchema::WrongColumnCount {
+            return Err(AttSchemaCheckError::Invalid(
+                InvalidCurrentProjectDatabase::Schema(InvalidAttSchema::WrongColumnCount {
                     query: "att_schema",
                     expected: 4,
                     actual: values.len(),
-                },
+                }),
             ));
         }
         let mut values = values.into_iter();
         let kind = schema_text(
             values.next().expect("已确认有四列"),
             ProjectDatabaseField::SchemaType,
-        )?;
+        )
+        .map_err(AttSchemaCheckError::Invalid)?;
         let name = schema_text(
             values.next().expect("已确认有四列"),
             ProjectDatabaseField::SchemaName,
-        )?;
+        )
+        .map_err(AttSchemaCheckError::Invalid)?;
         let table = schema_text(
             values.next().expect("已确认有四列"),
             ProjectDatabaseField::SchemaTableName,
-        )?;
+        )
+        .map_err(AttSchemaCheckError::Invalid)?;
         let sql = schema_text(
             values.next().expect("已确认有四列"),
             ProjectDatabaseField::SchemaSql,
-        )?;
+        )
+        .map_err(AttSchemaCheckError::Invalid)?;
         actual.push((kind, name, table, sql));
     }
+    ensure_att_schema_running(is_cancelled)?;
     let expected = expected_att_schema();
-    let missing = expected
-        .iter()
-        .filter_map(|(kind, name, _, _)| {
-            (!actual
-                .iter()
-                .any(|(actual_kind, actual_name, _, _)| actual_kind == kind && actual_name == name))
-            .then(|| att_schema_object(kind, name))
-            .flatten()
-        })
-        .collect::<Vec<_>>();
-    let definition_mismatches = expected
-        .iter()
-        .filter_map(|(kind, name, table, sql)| {
-            actual
-                .iter()
-                .find(|(actual_kind, actual_name, _, _)| actual_kind == kind && actual_name == name)
-                .and_then(|(_, _, actual_table, actual_sql)| {
-                    (actual_table != table || actual_sql != sql)
-                        .then(|| att_schema_object(kind, name))
-                        .flatten()
-                })
-        })
-        .collect::<Vec<_>>();
-    let unexpected_count = actual
-        .iter()
-        .filter(|(actual_kind, actual_name, _, _)| {
-            !expected
-                .iter()
-                .any(|(kind, name, _, _)| actual_kind == kind && actual_name == name)
-        })
-        .count();
+    let mut missing = Vec::new();
+    for (kind, name, _, _) in &expected {
+        ensure_att_schema_running(is_cancelled)?;
+        let mut found = false;
+        for (actual_kind, actual_name, _, _) in &actual {
+            ensure_att_schema_running(is_cancelled)?;
+            if schema_text_eq(actual_kind, kind, is_cancelled)?
+                && schema_text_eq(actual_name, name, is_cancelled)?
+            {
+                found = true;
+                break;
+            }
+        }
+        if !found && let Some(object) = att_schema_object(kind, name) {
+            missing.push(object);
+        }
+    }
+    let mut definition_mismatches = Vec::new();
+    for (kind, name, table, sql) in &expected {
+        ensure_att_schema_running(is_cancelled)?;
+        for (actual_kind, actual_name, actual_table, actual_sql) in &actual {
+            ensure_att_schema_running(is_cancelled)?;
+            if !schema_text_eq(actual_kind, kind, is_cancelled)?
+                || !schema_text_eq(actual_name, name, is_cancelled)?
+            {
+                continue;
+            }
+            if (!schema_text_eq(actual_table, table, is_cancelled)?
+                || !schema_text_eq(actual_sql, sql, is_cancelled)?)
+                && let Some(object) = att_schema_object(kind, name)
+            {
+                definition_mismatches.push(object);
+            }
+            break;
+        }
+    }
+    let mut unexpected_count = 0;
+    for (actual_kind, actual_name, _, _) in &actual {
+        ensure_att_schema_running(is_cancelled)?;
+        let mut found = false;
+        for (kind, name, _, _) in &expected {
+            ensure_att_schema_running(is_cancelled)?;
+            if schema_text_eq(actual_kind, kind, is_cancelled)?
+                && schema_text_eq(actual_name, name, is_cancelled)?
+            {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            unexpected_count += 1;
+        }
+    }
+    ensure_att_schema_running(is_cancelled)?;
     if actual.len() == expected.len()
         && missing.is_empty()
         && definition_mismatches.is_empty()
@@ -1995,15 +2100,204 @@ fn validate_att_schema(rows: Vec<SqliteRow>) -> Result<(), InvalidCurrentProject
     {
         Ok(())
     } else {
-        Err(InvalidCurrentProjectDatabase::Schema(
-            InvalidAttSchema::ObjectMismatch {
+        Err(AttSchemaCheckError::Invalid(
+            InvalidCurrentProjectDatabase::Schema(InvalidAttSchema::ObjectMismatch {
                 expected_count: expected.len(),
                 actual_count: actual.len(),
                 missing,
                 definition_mismatches,
                 unexpected_count,
-            },
+            }),
         ))
+    }
+}
+
+fn ensure_att_schema_running(
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<(), AttSchemaCheckError> {
+    if is_cancelled() {
+        Err(AttSchemaCheckError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn schema_text_eq(
+    left: &str,
+    right: &str,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<bool, AttSchemaCheckError> {
+    ensure_att_schema_running(is_cancelled)?;
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    for (left, right) in left
+        .as_bytes()
+        .chunks(64 * 1024)
+        .zip(right.as_bytes().chunks(64 * 1024))
+    {
+        ensure_att_schema_running(is_cancelled)?;
+        if left != right {
+            return Ok(false);
+        }
+    }
+    ensure_att_schema_running(is_cancelled)?;
+    Ok(true)
+}
+
+/// 在调用方已经打开的连接上校验当前唯一 RPG Maker ATT schema。
+///
+/// 查询只选择 ATT 管理的对象，因此脚本私有表、索引和触发器不属于本契约。
+#[cfg(test)]
+pub(crate) fn validate_current_att_schema(
+    connection: &rusqlite::Connection,
+) -> Result<(), CurrentAttSchemaValidationError> {
+    validate_current_att_schema_with_cancellation(connection, || false)
+}
+
+pub(crate) fn validate_current_att_schema_with_cancellation(
+    connection: &rusqlite::Connection,
+    mut is_cancelled: impl FnMut() -> bool,
+) -> Result<(), CurrentAttSchemaValidationError> {
+    if is_cancelled() {
+        return Err(CurrentAttSchemaValidationError::Cancelled);
+    }
+    let mut statement = connection
+        .prepare(SELECT_ATT_SCHEMA)
+        .map_err(|source| current_att_schema_read_error(source, &mut is_cancelled))?;
+    if is_cancelled() {
+        return Err(CurrentAttSchemaValidationError::Cancelled);
+    }
+    let mut query = statement
+        .query([])
+        .map_err(|source| current_att_schema_read_error(source, &mut is_cancelled))?;
+    let mut rows = Vec::new();
+    loop {
+        if is_cancelled() {
+            return Err(CurrentAttSchemaValidationError::Cancelled);
+        }
+        let Some(row) = query
+            .next()
+            .map_err(|source| current_att_schema_read_error(source, &mut is_cancelled))?
+        else {
+            break;
+        };
+        rows.push(SqliteRow::new(vec![
+            SqliteValue::Text(clone_current_att_schema_text(
+                row,
+                0,
+                "type",
+                &mut is_cancelled,
+            )?),
+            SqliteValue::Text(clone_current_att_schema_text(
+                row,
+                1,
+                "name",
+                &mut is_cancelled,
+            )?),
+            SqliteValue::Text(clone_current_att_schema_text(
+                row,
+                2,
+                "tbl_name",
+                &mut is_cancelled,
+            )?),
+            SqliteValue::Text(clone_current_att_schema_text(
+                row,
+                3,
+                "sql",
+                &mut is_cancelled,
+            )?),
+        ]));
+    }
+    drop(query);
+    drop(statement);
+    match validate_att_schema_with_check(rows, &mut is_cancelled) {
+        Ok(()) => Ok(()),
+        Err(AttSchemaCheckError::Cancelled) => Err(CurrentAttSchemaValidationError::Cancelled),
+        Err(AttSchemaCheckError::Invalid(source)) => {
+            Err(CurrentAttSchemaValidationError::Invalid(source))
+        }
+    }
+}
+
+fn clone_current_att_schema_text(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+    column: &'static str,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<String, CurrentAttSchemaValidationError> {
+    if is_cancelled() {
+        return Err(CurrentAttSchemaValidationError::Cancelled);
+    }
+    let bytes = match row
+        .get_ref(index)
+        .map_err(|source| current_att_schema_read_error(source, is_cancelled))?
+    {
+        rusqlite::types::ValueRef::Text(bytes) => bytes,
+        value => {
+            let source =
+                rusqlite::Error::InvalidColumnType(index, column.to_owned(), value.data_type());
+            return Err(current_att_schema_read_error(source, is_cancelled));
+        }
+    };
+    let mut text = String::with_capacity(bytes.len());
+    let mut pending = Vec::with_capacity(64 * 1024 + 3);
+    for chunk in bytes.chunks(64 * 1024) {
+        if is_cancelled() {
+            return Err(CurrentAttSchemaValidationError::Cancelled);
+        }
+        pending.extend_from_slice(chunk);
+        match std::str::from_utf8(&pending) {
+            Ok(valid) => {
+                text.push_str(valid);
+                pending.clear();
+            }
+            Err(source) if source.error_len().is_none() => {
+                let valid_up_to = source.valid_up_to();
+                let valid = std::str::from_utf8(&pending[..valid_up_to])
+                    .expect("Utf8Error::valid_up_to 指向有效 UTF-8 前缀");
+                text.push_str(valid);
+                pending.copy_within(valid_up_to.., 0);
+                pending.truncate(pending.len() - valid_up_to);
+            }
+            Err(source) => {
+                let source = rusqlite::Error::FromSqlConversionFailure(
+                    index,
+                    rusqlite::types::Type::Text,
+                    Box::new(source),
+                );
+                return Err(current_att_schema_read_error(source, is_cancelled));
+            }
+        }
+    }
+    if !pending.is_empty() {
+        let source = std::str::from_utf8(&pending).expect_err("pending 只保留不完整 UTF-8 后缀");
+        let source = rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(source),
+        );
+        return Err(current_att_schema_read_error(source, is_cancelled));
+    }
+    if is_cancelled() {
+        Err(CurrentAttSchemaValidationError::Cancelled)
+    } else {
+        Ok(text)
+    }
+}
+
+fn current_att_schema_read_error(
+    source: rusqlite::Error,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> CurrentAttSchemaValidationError {
+    if matches!(
+        source.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::OperationInterrupted)
+    ) || is_cancelled()
+    {
+        CurrentAttSchemaValidationError::Cancelled
+    } else {
+        CurrentAttSchemaValidationError::Read(source)
     }
 }
 
@@ -2274,19 +2568,30 @@ fn decode_project_definitions(
         values.next().expect("已确认有两列"),
         ProjectDatabaseField::DefinitionKind,
     )?;
-    let definition_kind = if raw_definition_kind == MV_DIALOGUE_RULES_DEFINITION_KIND {
-        ProjectDefinitionKind::MvDialogueRules
-    } else {
+    if raw_definition_kind != MV_DIALOGUE_RULES_DEFINITION_KIND {
         return Err(InvalidCurrentProjectDatabase::ProjectDefinitions(
             InvalidProjectDefinitions::UnknownDefinitionKind,
         ));
-    };
+    }
     let canonical_json = project_definition_text(
         values.next().expect("已确认有两列"),
         ProjectDatabaseField::CanonicalJson,
     )?;
+    validate_mv_dialogue_definition_canonical_json(&canonical_json)
+        .map_err(InvalidCurrentProjectDatabase::ProjectDefinitions)?;
+    Ok(canonical_json)
+}
+
+/// 按当前唯一项目定义契约解析、编译并确认 MV 对话规则的规范 JSON。
+///
+/// 项目状态读取与 Lua 最终事务校验共用这个语义边界，避免脚本提交一个 schema
+/// 合法、但 PCRE2 或命名捕获无效而无法再次打开的项目。
+pub(crate) fn validate_mv_dialogue_definition_canonical_json(
+    canonical_json: &str,
+) -> Result<(), InvalidProjectDefinitions> {
+    let definition_kind = ProjectDefinitionKind::MvDialogueRules;
     let definition =
-        MvDialogueDefinition::from_canonical_json(&canonical_json).map_err(|source| {
+        MvDialogueDefinition::from_canonical_json(canonical_json).map_err(|source| {
             invalid_project_definition(definition_kind, ProjectDefinitionStage::Decode, source)
         })?;
     definition.compile().map_err(|source| {
@@ -2296,13 +2601,11 @@ fn decode_project_definitions(
         invalid_project_definition(definition_kind, ProjectDefinitionStage::Encode, source)
     })?;
     if encoded != canonical_json {
-        return Err(InvalidCurrentProjectDatabase::ProjectDefinitions(
-            InvalidProjectDefinitions::NonCanonicalJson {
-                definition: definition_kind,
-            },
-        ));
+        return Err(InvalidProjectDefinitions::NonCanonicalJson {
+            definition: definition_kind,
+        });
     }
-    Ok(canonical_json)
+    Ok(())
 }
 
 fn resource_text(
@@ -2341,14 +2644,12 @@ fn invalid_project_definition(
     definition: ProjectDefinitionKind,
     stage: ProjectDefinitionStage,
     source: MvDialogueDefinitionError,
-) -> InvalidCurrentProjectDatabase {
-    InvalidCurrentProjectDatabase::ProjectDefinitions(
-        InvalidProjectDefinitions::InvalidDefinition {
-            definition,
-            stage,
-            failure: project_definition_failure(source),
-        },
-    )
+) -> InvalidProjectDefinitions {
+    InvalidProjectDefinitions::InvalidDefinition {
+        definition,
+        stage,
+        failure: project_definition_failure(source),
+    }
 }
 
 fn project_definition_failure(source: MvDialogueDefinitionError) -> ProjectDefinitionFailure {
@@ -3330,24 +3631,6 @@ mod tests {
             .execute_batch("CREATE TABLE script_private_state (value TEXT)")
             .expect("脚本私有表应可建立");
 
-        let rows = {
-            let mut statement = connection
-                .prepare(SELECT_ATT_SCHEMA)
-                .expect("应可准备 ATT schema 查询");
-            statement
-                .query_map([], |row| {
-                    Ok(SqliteRow::new(vec![
-                        SqliteValue::Text(row.get(0)?),
-                        SqliteValue::Text(row.get(1)?),
-                        SqliteValue::Text(row.get(2)?),
-                        SqliteValue::Text(row.get(3)?),
-                    ]))
-                })
-                .expect("应可读取 ATT schema")
-                .collect::<Result<Vec<_>, _>>()
-                .expect("ATT schema 行应可解码")
-        };
-
-        validate_att_schema(rows).expect("生产 DDL 应与当前唯一 schema 一致");
+        validate_current_att_schema(&connection).expect("生产 DDL 应与当前唯一 schema 一致");
     }
 }

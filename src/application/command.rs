@@ -16,8 +16,13 @@ use rusqlite::{Connection, OpenFlags};
 
 use super::translation_prompt::{
     PromptResourceLoadError, PromptTemplateError, SYSTEM_PROMPT_FILE_NAME,
-    THINKING_PROMPT_FILE_NAME, ensure_no_prompt_template_variables, read_prompt_resource,
-    render_system_prompt_template,
+    THINKING_PROMPT_FILE_NAME, ensure_no_prompt_template_variables_with_cancellation,
+    parse_prompt_resource_with_cancellation, read_unparsed_prompt_resource,
+    render_system_prompt_template_with_cancellation,
+};
+#[cfg(test)]
+use super::translation_prompt::{
+    ensure_no_prompt_template_variables, render_system_prompt_template,
 };
 use crate::application::config::{
     ConfigurationLoadError, ConfiguredExtractCommand, ConfiguredInitCommand,
@@ -30,8 +35,8 @@ use crate::diagnostic::{
     ReportedFailure, SafeDiagnostic, SafeDiagnosticSource, render_failure_report,
     render_safe_diagnostic,
 };
+use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::execution::{CooperativeCancellation, OperationCompletion};
-use crate::fingerprint::Sha256FramedHasher;
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage, project_log_value_source_label};
 use crate::language::LanguageModuleCatalogError;
 use crate::progress::{
@@ -43,9 +48,11 @@ use crate::project_lease::{
     ProjectCommandLeaseProvider, ProjectCommandLeaseService,
 };
 use crate::project_lua::{
-    ProjectLuaCallError, ProjectLuaCancellation, ProjectLuaFailure, ProjectLuaPrintSink,
-    ProjectLuaProgram, ProjectLuaProject, ProjectLuaRunError, ProjectLuaRunReport,
-    ProjectLuaRunRequest, compile_project_lua_program, rpg_maker_project_lua_adapter,
+    ProjectLuaCallError, ProjectLuaCancellation, ProjectLuaDatabasePrerequisiteError,
+    ProjectLuaFailure, ProjectLuaPrintSink, ProjectLuaProgram, ProjectLuaProject,
+    ProjectLuaRunError, ProjectLuaRunReport, ProjectLuaRunRequest, ProjectLuaSqliteError,
+    compile_project_lua_program_with_cancellation,
+    fingerprint_project_lua_program_with_cancellation, rpg_maker_project_lua_adapter,
     run_project_lua,
 };
 use crate::rpg_maker::RpgMakerLayout;
@@ -126,7 +133,8 @@ use crate::rpg_maker::write_back::{
     WriteBackPublishingDiagnostic, WriteBackService, WriteBackServiceError,
 };
 use crate::runtime::cpu::{
-    CpuExecutorConfig, CpuExecutorShutdownError, CpuExecutorStartError, RayonCpuExecutor,
+    CpuExecutorConfig, CpuExecutorShutdownError, CpuExecutorStartError, CpuExecutorUnavailable,
+    RayonCpuExecutor,
 };
 use crate::runtime::filesystem::{
     SystemFileSystem, SystemFileSystemBuildError, SystemFileSystemConfig, SystemFileSystemError,
@@ -1004,14 +1012,6 @@ impl ProductionRpgMakerCommandRunner {
 
         let script_identity = script.resolved_path().to_string_lossy().into_owned();
         let script_source = script.into_bytes();
-        let mut script_hasher = Sha256FramedHasher::new(b"att.project-lua.program-identity");
-        script_hasher.frame(1, &script_source);
-        let script_fingerprint = script_hasher.finish();
-        let program = ProjectLuaProgram::new(
-            script_identity.clone(),
-            script_source,
-            command.arguments().to_vec(),
-        );
         let project_log = start_command_log(CommandLogStart {
             common: command.common(),
             locale: self.locale,
@@ -1023,56 +1023,72 @@ impl ProductionRpgMakerCommandRunner {
             performance,
             panic_boundary: Some(&self.panic_boundary),
         });
-        project_log.logger.emit(ProjectLogEvent::new(
-            ProjectLogLevel::Info,
-            ProjectLogCode::LuaScript,
-            project_log.context.clone(),
-            ProjectLogPayload::LuaScript {
-                identity: script_identity,
-                fingerprint: script_fingerprint.hex(),
-            },
-        ));
 
-        let compile_program = program.clone();
-        let compile = drive_command(
+        let program_arguments = command.arguments().to_vec();
+        let preflight_cancellation = lua_cancellation.clone();
+        let preflight_logger = project_log.logger.clone();
+        let preflight_context = project_log.context.clone();
+        let preparation = drive_command(
             async move {
-                tokio::task::spawn_blocking(move || compile_project_lua_program(&compile_program))
-                    .await
-                    .map_err(ProductionCommandError::project_lua_worker)?
-                    .map_err(ProductionCommandError::project_lua_preflight)
+                let result = tokio::task::spawn_blocking(move || {
+                    let program =
+                        ProjectLuaProgram::new(script_identity, script_source, program_arguments);
+                    let fingerprint = fingerprint_project_lua_program_with_cancellation(
+                        &program,
+                        &preflight_cancellation,
+                    )?;
+                    preflight_logger.emit(ProjectLogEvent::new(
+                        ProjectLogLevel::Info,
+                        ProjectLogCode::LuaScript,
+                        preflight_context,
+                        ProjectLogPayload::LuaScript {
+                            identity: program.identity().to_owned(),
+                            fingerprint: fingerprint.hex(),
+                        },
+                    ));
+                    compile_project_lua_program_with_cancellation(
+                        &program,
+                        &preflight_cancellation,
+                    )?;
+                    Ok::<_, ProjectLuaFailure>(program)
+                })
+                .await
+                .map_err(ProductionCommandError::project_lua_worker)?;
+                match result {
+                    Ok(prepared) => Ok(OperationCompletion::Completed(prepared)),
+                    Err(ProjectLuaFailure::Cancelled) => Ok(OperationCompletion::Cancelled),
+                    Err(source) => Err(ProductionCommandError::project_lua_preflight(source)),
+                }
             },
             termination_signals,
             || {
                 cancellation.request();
+                lua_cancellation.cancel();
                 file_system.cancel_waits();
                 sqlite.cancel_waits();
             },
             || progress.safe_stopping(progress_safe_stopping(self.locale)),
         )
         .await;
-        let preflight_terminal = match compile {
-            DrivenCommand::Finished(Ok(())) => None,
-            DrivenCommand::Finished(Err(error)) => Some(DrivenCommand::Finished(Err(error))),
-            DrivenCommand::Interrupted(result) => Some(DrivenCommand::Interrupted(
-                result.map(|()| OperationCompletion::Cancelled),
-            )),
-            DrivenCommand::SignalFailed { source, result } => Some(DrivenCommand::SignalFailed {
-                source,
-                result: result.map(|()| OperationCompletion::Cancelled),
-            }),
+        let program = match preparation {
+            DrivenCommand::Finished(Ok(OperationCompletion::Completed(prepared))) => prepared,
+            terminal => {
+                let execution = terminal.map(|result| {
+                    result
+                        .map(|_completion| OperationCompletion::<RpgMakerCommandOutput>::Cancelled)
+                });
+                let shutdown = roots.shutdown().await;
+                progress.finish();
+                let outcome = project_log_outcome(&execution, &shutdown);
+                let diagnostics = project_log_failure_diagnostics(&execution, &shutdown);
+                let pending = PendingProjectLog::new(project_log, outcome, diagnostics);
+                return ProductionCommandRunReport::from_completion_with_project_log(
+                    execution,
+                    shutdown,
+                    Some(pending),
+                );
+            }
         };
-        if let Some(execution) = preflight_terminal {
-            let shutdown = roots.shutdown().await;
-            progress.finish();
-            let outcome = project_log_outcome(&execution, &shutdown);
-            let diagnostics = project_log_failure_diagnostics(&execution, &shutdown);
-            let pending = PendingProjectLog::new(project_log, outcome, diagnostics);
-            return ProductionCommandRunReport::from_completion_with_project_log(
-                execution,
-                shutdown,
-                Some(pending),
-            );
-        }
 
         let lease_provider = ProjectCommandLeaseService::new(
             projects_root.clone(),
@@ -1168,7 +1184,7 @@ impl ProductionRpgMakerCommandRunner {
         let request = ProjectLuaRunRequest::new(
             ProjectLuaProject::new(project_name.as_str(), self.layout.engine().storage_name()),
             program,
-            rpg_maker_project_lua_adapter(self.layout.engine()),
+            rpg_maker_project_lua_adapter(self.layout.engine(), lua_cancellation.clone()),
         )
         .with_cancellation(lua_cancellation.clone())
         .with_print_sink(Arc::new(ProjectLogLuaPrintSink::from_active(&project_log)));
@@ -2212,6 +2228,7 @@ impl ProductionRpgMakerCommandRunner {
                             run_id.to_owned(),
                             command.translation().client().record_metadata(),
                             self.locale,
+                            cpu.clone(),
                             observation_file_system,
                             project_log.logger.clone(),
                         ),
@@ -3804,6 +3821,19 @@ impl fmt::Display for ProjectLuaPreflightError {
 
 impl Error for ProjectLuaPreflightError {}
 
+fn project_lua_sqlite_reason(
+    source: &ProjectLuaSqliteError,
+    fallback: DiagnosticFailureKind,
+) -> DiagnosticReason {
+    match source.sqlite_codes() {
+        Some((primary_code, extended_code)) => DiagnosticReason::Sqlite {
+            primary_code,
+            extended_code,
+        },
+        None => DiagnosticReason::failure(fallback),
+    }
+}
+
 fn project_lua_run_was_cancelled(error: &ProjectLuaRunError) -> bool {
     matches!(
         error,
@@ -4079,19 +4109,77 @@ impl PromptResourceComponent {
     }
 }
 
-fn assemble_rpg_maker_system_prompt_markdown(
+#[derive(Debug)]
+enum RpgMakerPromptPreparationError {
+    Cancelled,
+    SystemResource(PromptResourceLoadError),
+    ThinkingResource(PromptResourceLoadError),
+    SystemTemplate(PromptTemplateError),
+    ThinkingTemplate(PromptTemplateError),
+    SystemPrompt(RpgMakerSystemPromptError),
+}
+
+fn ensure_rpg_maker_prompt_preparation_running(
+    cancellation: &CooperativeCancellation,
+) -> Result<(), RpgMakerPromptPreparationError> {
+    if cancellation.is_requested() {
+        Err(RpgMakerPromptPreparationError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn append_rpg_maker_prompt_text(
+    output: &mut String,
+    text: &str,
+    cancellation: &CooperativeCancellation,
+) -> Result<(), RpgMakerPromptPreparationError> {
+    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
+
+    let mut start = 0_usize;
+    while start < text.len() {
+        ensure_rpg_maker_prompt_preparation_running(cancellation)?;
+        let mut end = start
+            .saturating_add(CANCELLATION_CHECK_BYTES)
+            .min(text.len());
+        while end < text.len() && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        output.push_str(&text[start..end]);
+        start = end;
+    }
+    ensure_rpg_maker_prompt_preparation_running(cancellation)
+}
+
+fn assemble_rpg_maker_system_prompt_markdown_with_cancellation(
     rendered_system: String,
-    thinking: Option<&str>,
-) -> (String, TranslationResponseEnvelope) {
+    thinking: Option<String>,
+    cancellation: &CooperativeCancellation,
+) -> Result<(String, TranslationResponseEnvelope), RpgMakerPromptPreparationError> {
+    ensure_rpg_maker_prompt_preparation_running(cancellation)?;
     let mut prompt = rendered_system;
     let response_envelope = if let Some(thinking) = thinking {
         prompt.push_str("\n\n");
-        prompt.push_str(thinking);
+        append_rpg_maker_prompt_text(&mut prompt, &thinking, cancellation)?;
         TranslationResponseEnvelope::ThinkingThenJson
     } else {
         TranslationResponseEnvelope::JsonOnly
     };
-    (prompt, response_envelope)
+    ensure_rpg_maker_prompt_preparation_running(cancellation)?;
+    Ok((prompt, response_envelope))
+}
+
+#[cfg(test)]
+fn assemble_rpg_maker_system_prompt_markdown(
+    rendered_system: String,
+    thinking: Option<&str>,
+) -> (String, TranslationResponseEnvelope) {
+    assemble_rpg_maker_system_prompt_markdown_with_cancellation(
+        rendered_system,
+        thinking.map(str::to_owned),
+        &CooperativeCancellation::default(),
+    )
+    .expect("未请求取消时应完成 Prompt 拼接")
 }
 
 #[cfg(test)]
@@ -4204,7 +4292,9 @@ struct ProductionSelectedTranslationExecutionBuilder<'a> {
 async fn build_production_translation_profile(
     configuration: &TranslateConfiguration,
     file_system: &SystemFileSystem,
+    cpu: &RayonCpuExecutor,
     project: &OpenedProject,
+    cancellation: &CooperativeCancellation,
 ) -> Result<
     (
         ProductionTranslationProfile,
@@ -4212,6 +4302,7 @@ async fn build_production_translation_profile(
     ),
     ProductionTranslationExecutionBuildError,
 > {
+    ensure_translation_execution_build_running(cancellation)?;
     let profile_configuration = configuration.profile();
     let language_pair = project.language_pair().clone();
     let prompt_locale = configuration
@@ -4223,61 +4314,136 @@ async fn build_production_translation_profile(
         .join(RPG_MAKER_PROMPT_DIRECTORY_NAME)
         .join(prompt_locale.as_str());
     let system_path = prompt_directory.join(SYSTEM_PROMPT_FILE_NAME);
-    let system_template = read_prompt_resource(file_system, &system_path)
-        .await
-        .map_err(|source| {
+    ensure_translation_execution_build_running(cancellation)?;
+    let system_template = read_unparsed_prompt_resource(file_system, &system_path).await;
+    ensure_translation_execution_build_running(cancellation)?;
+    let system_template = system_template.map_err(|source| {
+        ProductionTranslationExecutionBuildError::prompt_resource(
+            prompt_locale,
+            PromptResourceComponent::System,
+            &system_path,
+            source,
+        )
+    })?;
+    let thinking_path = configuration
+        .thinking_output()
+        .then(|| prompt_directory.join(THINKING_PROMPT_FILE_NAME));
+    let thinking = if let Some(path) = thinking_path.as_deref() {
+        ensure_translation_execution_build_running(cancellation)?;
+        let thinking = read_unparsed_prompt_resource(file_system, path).await;
+        ensure_translation_execution_build_running(cancellation)?;
+        Some(thinking.map_err(|source| {
             ProductionTranslationExecutionBuildError::prompt_resource(
                 prompt_locale,
-                PromptResourceComponent::System,
-                &system_path,
-                source,
-            )
-        })?;
-    let rendered_system =
-        render_system_prompt_template(&system_template, &language_pair).map_err(|source| {
-            ProductionTranslationExecutionBuildError::prompt_template(
-                prompt_locale,
-                PromptResourceComponent::System,
-                &system_path,
-                source,
-            )
-        })?;
-    let thinking = if configuration.thinking_output() {
-        let thinking_path = prompt_directory.join(THINKING_PROMPT_FILE_NAME);
-        let thinking = read_prompt_resource(file_system, &thinking_path)
-            .await
-            .map_err(|source| {
-                ProductionTranslationExecutionBuildError::prompt_resource(
-                    prompt_locale,
-                    PromptResourceComponent::Thinking,
-                    &thinking_path,
-                    source,
-                )
-            })?;
-        ensure_no_prompt_template_variables(&thinking).map_err(|source| {
-            ProductionTranslationExecutionBuildError::prompt_template(
-                prompt_locale,
                 PromptResourceComponent::Thinking,
-                &thinking_path,
+                path,
                 source,
             )
-        })?;
-        Some(thinking)
+        })?)
     } else {
         None
     };
-    let (prompt_markdown, response_envelope) =
-        assemble_rpg_maker_system_prompt_markdown(rendered_system, thinking.as_deref());
-    let system_prompt =
-        RpgMakerSystemPrompt::new(language_pair.clone(), prompt_markdown, response_envelope)
-            .map_err(|source| {
+
+    let prompt_language_pair = language_pair.clone();
+    let prompt_cancellation = cancellation.clone();
+    ensure_translation_execution_build_running(cancellation)?;
+    let system_prompt = cpu
+        .execute(move || {
+            ensure_rpg_maker_prompt_preparation_running(&prompt_cancellation)?;
+            let system_template = parse_prompt_resource_with_cancellation(system_template, || {
+                ensure_rpg_maker_prompt_preparation_running(&prompt_cancellation)
+            })?
+            .map_err(RpgMakerPromptPreparationError::SystemResource)?;
+            let rendered_system = render_system_prompt_template_with_cancellation(
+                &system_template,
+                &prompt_language_pair,
+                || ensure_rpg_maker_prompt_preparation_running(&prompt_cancellation),
+            )?
+            .map_err(RpgMakerPromptPreparationError::SystemTemplate)?;
+            let thinking = match thinking {
+                Some(thinking) => {
+                    let thinking = parse_prompt_resource_with_cancellation(thinking, || {
+                        ensure_rpg_maker_prompt_preparation_running(&prompt_cancellation)
+                    })?
+                    .map_err(RpgMakerPromptPreparationError::ThinkingResource)?;
+                    ensure_no_prompt_template_variables_with_cancellation(&thinking, || {
+                        ensure_rpg_maker_prompt_preparation_running(&prompt_cancellation)
+                    })?
+                    .map_err(RpgMakerPromptPreparationError::ThinkingTemplate)?;
+                    Some(thinking)
+                }
+                None => None,
+            };
+            let (prompt_markdown, response_envelope) =
+                assemble_rpg_maker_system_prompt_markdown_with_cancellation(
+                    rendered_system,
+                    thinking,
+                    &prompt_cancellation,
+                )?;
+            RpgMakerSystemPrompt::new_with_cancellation(
+                prompt_language_pair,
+                prompt_markdown,
+                response_envelope,
+                || ensure_rpg_maker_prompt_preparation_running(&prompt_cancellation),
+            )?
+            .map_err(RpgMakerPromptPreparationError::SystemPrompt)
+        })
+        .await;
+    ensure_translation_execution_build_running(cancellation)?;
+    let system_prompt = system_prompt
+        .map_err(ProductionTranslationExecutionBuildError::prompt_cpu)?
+        .map_err(|source| match source {
+            RpgMakerPromptPreparationError::Cancelled => {
+                ProductionTranslationExecutionBuildError::cancelled()
+            }
+            RpgMakerPromptPreparationError::SystemResource(source) => {
+                ProductionTranslationExecutionBuildError::prompt_resource(
+                    prompt_locale,
+                    PromptResourceComponent::System,
+                    &system_path,
+                    source,
+                )
+            }
+            RpgMakerPromptPreparationError::ThinkingResource(source) => {
+                let path = thinking_path
+                    .as_deref()
+                    .expect("thinking Prompt 错误只会在启用 thinking 输出时产生");
+                ProductionTranslationExecutionBuildError::prompt_resource(
+                    prompt_locale,
+                    PromptResourceComponent::Thinking,
+                    path,
+                    source,
+                )
+            }
+            RpgMakerPromptPreparationError::SystemTemplate(source) => {
+                ProductionTranslationExecutionBuildError::prompt_template(
+                    prompt_locale,
+                    PromptResourceComponent::System,
+                    &system_path,
+                    source,
+                )
+            }
+            RpgMakerPromptPreparationError::ThinkingTemplate(source) => {
+                let path = thinking_path
+                    .as_deref()
+                    .expect("thinking Prompt 错误只会在启用 thinking 输出时产生");
+                ProductionTranslationExecutionBuildError::prompt_template(
+                    prompt_locale,
+                    PromptResourceComponent::Thinking,
+                    path,
+                    source,
+                )
+            }
+            RpgMakerPromptPreparationError::SystemPrompt(source) => {
                 ProductionTranslationExecutionBuildError::system_prompt(
                     prompt_locale,
                     PromptResourceComponent::System,
                     &system_path,
                     source,
                 )
-            })?;
+            }
+        })?;
+    ensure_translation_execution_build_running(cancellation)?;
     let source_language = configuration
         .language_modules()
         .resolve(language_pair.source())
@@ -4297,6 +4463,7 @@ async fn build_production_translation_profile(
         profile_configuration.request().clone(),
         Arc::clone(configuration.client()),
     ));
+    ensure_translation_execution_build_running(cancellation)?;
     Ok((profile, translation_resources))
 }
 
@@ -4309,26 +4476,51 @@ impl SelectedTranslationExecutionBuilder for ProductionSelectedTranslationExecut
         &self,
         project: &crate::rpg_maker::project::OpenedProject,
     ) -> Result<SelectedTranslationExecution<Self::Client, Self::Translation>, Self::Error> {
-        let (profile, translation_resources) =
-            build_production_translation_profile(self.configuration, &self.file_system, project)
-                .await?;
-        let placeholders = Pcre2PlaceholderService::new()
+        let (profile, translation_resources) = build_production_translation_profile(
+            self.configuration,
+            &self.file_system,
+            &self.cpu,
+            project,
+            &self.cancellation,
+        )
+        .await?;
+        ensure_translation_execution_build_running(&self.cancellation)?;
+        let placeholder_cancellation = self.cancellation.clone();
+        let placeholders = self
+            .cpu
+            .execute(move || {
+                Pcre2PlaceholderService::new_with_cancellation(|| {
+                    if placeholder_cancellation.is_requested() {
+                        Err(TranslationExecutionBuildCancelled)
+                    } else {
+                        Ok(())
+                    }
+                })
+            })
+            .await;
+        ensure_translation_execution_build_running(&self.cancellation)?;
+        let placeholders = placeholders
+            .map_err(ProductionTranslationExecutionBuildError::placeholder_cpu)?
+            .map_err(|_cancelled| ProductionTranslationExecutionBuildError::cancelled())?
             .map_err(ProductionTranslationExecutionBuildError::builtin_placeholder_compile)?;
         let asset_reader =
             RpgMakerTranslationAssetReadingService::new(self.sqlite.clone(), self.cpu.clone());
         let resources = TranslationPlanningResourceReadingService::new(
             self.file_system.clone(),
             self.cpu.clone(),
-        );
+        )
+        .with_cancellation(self.cancellation.clone());
         let planner =
             RpgMakerTranslationTaskPlanningService::<_, _, OpenAiChatCompletionClient>::new(
                 resources,
                 Arc::clone(&translation_resources),
                 placeholders,
                 self.cpu.clone(),
-            );
+            )
+            .with_cancellation(self.cancellation.clone());
         let processor =
-            TranslationTaskResponseProcessingService::new(self.cpu.clone(), translation_resources);
+            TranslationTaskResponseProcessingService::new(self.cpu.clone(), translation_resources)
+                .with_cancellation(self.cancellation.clone());
         let executor =
             RpgMakerTranslationTaskExecutionService::<_, _, _, ProductionTranslationProfile>::new(
                 self.llm.clone(),
@@ -4348,13 +4540,35 @@ impl SelectedTranslationExecutionBuilder for ProductionSelectedTranslationExecut
             self.cancellation.clone(),
         )
         .with_task_record_sink(self.task_records.clone());
+        ensure_translation_execution_build_running(&self.cancellation)?;
         Ok(SelectedTranslationExecution::new(profile, translation))
+    }
+}
+
+#[derive(Debug)]
+struct TranslationExecutionBuildCancelled;
+
+impl fmt::Display for TranslationExecutionBuildCancelled {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("翻译执行上下文构建已取消")
+    }
+}
+
+impl Error for TranslationExecutionBuildCancelled {}
+
+fn ensure_translation_execution_build_running(
+    cancellation: &CooperativeCancellation,
+) -> Result<(), ProductionTranslationExecutionBuildError> {
+    if cancellation.is_requested() {
+        Err(ProductionTranslationExecutionBuildError::cancelled())
+    } else {
+        Ok(())
     }
 }
 
 struct ProductionTranslationExecutionBuildError {
     class: TranslationExecutionBuildFailureClass,
-    diagnostic: SafeDiagnostic,
+    diagnostic: Box<SafeDiagnostic>,
     source: BoxedError,
 }
 
@@ -4365,6 +4579,40 @@ enum TranslationExecutionBuildFailureClass {
 }
 
 impl ProductionTranslationExecutionBuildError {
+    fn cancelled() -> Self {
+        let diagnostic = SafeDiagnostic::new(
+            DiagnosticCode::InternalOperation,
+            DiagnosticStage::CommandPreparation,
+            DiagnosticSubject::operation("build_translation_execution"),
+            DiagnosticReason::failure(DiagnosticFailureKind::LockCancelled),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::Retry,
+        );
+        Self::new(TranslationExecutionBuildCancelled, diagnostic)
+    }
+
+    fn prompt_cpu(source: CpuTaskExecutionError<CpuExecutorUnavailable>) -> Self {
+        Self::cpu_task("prepare_rpg_maker_prompt", source)
+    }
+
+    fn placeholder_cpu(source: CpuTaskExecutionError<CpuExecutorUnavailable>) -> Self {
+        Self::cpu_task("compile_rpg_maker_builtin_placeholders", source)
+    }
+
+    fn cpu_task(
+        operation: &'static str,
+        source: CpuTaskExecutionError<CpuExecutorUnavailable>,
+    ) -> Self {
+        let diagnostic = source
+            .safe_diagnostic_source(
+                DiagnosticStage::CommandPreparation,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::ReportBug,
+            )
+            .with_recovery(RecoveryFact::component(operation));
+        Self::new(source, diagnostic)
+    }
+
     fn prompt_locale(source: PromptLocaleResolutionError) -> Self {
         let diagnostic = SafeDiagnostic::new(
             DiagnosticCode::PromptUnavailable,
@@ -4486,7 +4734,7 @@ impl ProductionTranslationExecutionBuildError {
         };
         Self {
             class,
-            diagnostic,
+            diagnostic: Box::new(diagnostic),
             source: Box::new(source),
         }
     }
@@ -6779,56 +7027,140 @@ impl ProductionCommandError {
 
     fn project_lua_preflight(source: ProjectLuaFailure) -> Self {
         let source = ProjectLuaPreflightError(source);
-        let (failure, action) = match &source.0 {
+        let detail = source.to_string();
+        let (code, reason, action, class, subject) = match &source.0 {
             ProjectLuaFailure::Compile(_) => (
-                DiagnosticFailureKind::LuaCompilationFailed,
+                DiagnosticCode::LuaExecution,
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::LuaCompilationFailed,
+                    &detail,
+                ),
                 DiagnosticAction::FixInput,
+                2_u8,
+                DiagnosticSubject::component("Lua program"),
             ),
-            ProjectLuaFailure::Cancelled => (
-                DiagnosticFailureKind::LockCancelled,
+            ProjectLuaFailure::Cancelled
+            | ProjectLuaFailure::DatabasePrerequisite(
+                ProjectLuaDatabasePrerequisiteError::Cancelled,
+            ) => (
+                DiagnosticCode::LuaExecution,
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::LockCancelled,
+                    &detail,
+                ),
                 DiagnosticAction::Retry,
+                2,
+                DiagnosticSubject::component("Lua program"),
             ),
             ProjectLuaFailure::Context(_) => (
-                DiagnosticFailureKind::LuaContextCreationFailed,
+                DiagnosticCode::LuaExecution,
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::LuaContextCreationFailed,
+                    &detail,
+                ),
                 DiagnosticAction::ReportBug,
+                1,
+                DiagnosticSubject::component("Lua program"),
             ),
             ProjectLuaFailure::Script(_) => (
-                DiagnosticFailureKind::LuaExecutionFailed,
+                DiagnosticCode::LuaExecution,
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::LuaExecutionFailed,
+                    &detail,
+                ),
                 DiagnosticAction::FixInput,
+                2,
+                DiagnosticSubject::component("Lua program"),
+            ),
+            ProjectLuaFailure::DatabasePrerequisite(
+                ProjectLuaDatabasePrerequisiteError::InvalidProjectState(state),
+            ) => (
+                DiagnosticCode::ProjectState,
+                DiagnosticReason::failure_with_detail(DiagnosticFailureKind::StateMismatch, state),
+                DiagnosticAction::CheckProjectState,
+                0,
+                DiagnosticSubject::operation("validate_project_lua_database"),
+            ),
+            ProjectLuaFailure::DatabasePrerequisite(
+                ProjectLuaDatabasePrerequisiteError::Sqlite(error),
+            )
+            | ProjectLuaFailure::Database(error) => (
+                DiagnosticCode::SqliteOperation,
+                project_lua_sqlite_reason(error, DiagnosticFailureKind::LuaFinalizationFailed),
+                DiagnosticAction::CheckProjectState,
+                0,
+                DiagnosticSubject::operation(error.operation()),
+            ),
+            ProjectLuaFailure::Host {
+                kind: "worker_spawn",
+                operation,
+                ..
+            } => (
+                DiagnosticCode::InternalOperation,
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::WorkerSpawnFailed,
+                    &detail,
+                ),
+                DiagnosticAction::ReportBug,
+                1,
+                DiagnosticSubject::operation(operation),
             ),
             ProjectLuaFailure::Host { .. } => (
-                DiagnosticFailureKind::LuaHostCallFailed,
+                DiagnosticCode::LuaExecution,
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::LuaHostCallFailed,
+                    &detail,
+                ),
                 DiagnosticAction::FixInput,
+                2,
+                DiagnosticSubject::component("Lua program"),
             ),
-            ProjectLuaFailure::Database(_) | ProjectLuaFailure::Validation(_) => (
-                DiagnosticFailureKind::LuaFinalizationFailed,
+            ProjectLuaFailure::Validation(_) => (
+                DiagnosticCode::LuaExecution,
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::LuaFinalizationFailed,
+                    &detail,
+                ),
                 DiagnosticAction::CheckProjectState,
+                0,
+                DiagnosticSubject::component("Lua program"),
             ),
             ProjectLuaFailure::Panicked => (
-                DiagnosticFailureKind::WorkerPanicked,
+                DiagnosticCode::LuaExecution,
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::WorkerPanicked,
+                    &detail,
+                ),
                 DiagnosticAction::ReportBug,
+                1,
+                DiagnosticSubject::component("Lua program"),
             ),
         };
         let diagnostic = SafeDiagnostic::new(
-            DiagnosticCode::LuaExecution,
+            code,
             DiagnosticStage::CommandPreparation,
-            DiagnosticSubject::component("Lua program"),
-            DiagnosticReason::failure_with_detail(failure, source.to_string()),
+            subject,
+            reason,
             DiagnosticImpact::Unchanged,
             action,
         );
         let report = Self::report_diagnostic(source, diagnostic);
-        if action == DiagnosticAction::ReportBug {
-            Self::Internal(Box::new(report))
-        } else {
-            Self::ConfigurationOrInput(Box::new(report))
+        match class {
+            0 => Self::ProjectState(Box::new(report)),
+            1 => Self::Internal(Box::new(report)),
+            _ => Self::ConfigurationOrInput(Box::new(report)),
         }
     }
 
     fn project_lua_execution(source: ProjectLuaExecutionError) -> Self {
-        let (failure, impact, action, class, subject) = match &source {
+        let detail = source.to_string();
+        let (code, reason, impact, action, class, subject) = match &source {
             ProjectLuaExecutionError::Open { path, .. } => (
-                DiagnosticFailureKind::LuaDatabaseOpenFailed,
+                DiagnosticCode::LuaExecution,
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::LuaDatabaseOpenFailed,
+                    &detail,
+                ),
                 DiagnosticImpact::Unchanged,
                 DiagnosticAction::CheckProjectState,
                 0_u8,
@@ -6838,7 +7170,11 @@ impl ProductionCommandError {
                 ProjectLuaRunError::RollbackOutcomeUnknown { .. }
                 | ProjectLuaRunError::CommitOutcomeUnknown(_),
             ) => (
-                DiagnosticFailureKind::LuaFinalizationFailed,
+                DiagnosticCode::LuaExecution,
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::LuaFinalizationFailed,
+                    &detail,
+                ),
                 DiagnosticImpact::OutcomeUnknown,
                 DiagnosticAction::PreserveRecoveryArtifacts,
                 1,
@@ -6847,60 +7183,119 @@ impl ProductionCommandError {
             ProjectLuaExecutionError::Run(
                 ProjectLuaRunError::NotStarted(failure) | ProjectLuaRunError::RolledBack(failure),
             ) => {
-                let (kind, action, class) = match failure {
+                let (code, reason, action, class, subject) = match failure {
                     ProjectLuaFailure::Compile(_) => (
-                        DiagnosticFailureKind::LuaCompilationFailed,
+                        DiagnosticCode::LuaExecution,
+                        DiagnosticReason::failure_with_detail(
+                            DiagnosticFailureKind::LuaCompilationFailed,
+                            &detail,
+                        ),
                         DiagnosticAction::FixInput,
                         2,
+                        DiagnosticSubject::operation("project_lua_transaction"),
                     ),
                     ProjectLuaFailure::Script(_) => (
-                        DiagnosticFailureKind::LuaExecutionFailed,
+                        DiagnosticCode::LuaExecution,
+                        DiagnosticReason::failure_with_detail(
+                            DiagnosticFailureKind::LuaExecutionFailed,
+                            &detail,
+                        ),
                         DiagnosticAction::FixInput,
                         2,
+                        DiagnosticSubject::operation("project_lua_transaction"),
                     ),
-                    ProjectLuaFailure::Host { .. } => (
-                        DiagnosticFailureKind::LuaHostCallFailed,
-                        DiagnosticAction::FixInput,
-                        2,
-                    ),
-                    ProjectLuaFailure::Validation(_) => (
-                        DiagnosticFailureKind::LuaFinalizationFailed,
-                        DiagnosticAction::FixInput,
-                        2,
-                    ),
-                    ProjectLuaFailure::Database(_) => (
-                        DiagnosticFailureKind::LuaExecutionFailed,
+                    ProjectLuaFailure::DatabasePrerequisite(
+                        ProjectLuaDatabasePrerequisiteError::InvalidProjectState(state),
+                    ) => (
+                        DiagnosticCode::ProjectState,
+                        DiagnosticReason::failure_with_detail(
+                            DiagnosticFailureKind::StateMismatch,
+                            state,
+                        ),
                         DiagnosticAction::CheckProjectState,
                         0,
+                        DiagnosticSubject::operation("validate_project_lua_database"),
                     ),
-                    ProjectLuaFailure::Context(_) | ProjectLuaFailure::Panicked => (
-                        DiagnosticFailureKind::WorkerPanicked,
+                    ProjectLuaFailure::DatabasePrerequisite(
+                        ProjectLuaDatabasePrerequisiteError::Sqlite(error),
+                    )
+                    | ProjectLuaFailure::Database(error) => (
+                        DiagnosticCode::SqliteOperation,
+                        project_lua_sqlite_reason(error, DiagnosticFailureKind::LuaExecutionFailed),
+                        DiagnosticAction::CheckProjectState,
+                        0,
+                        DiagnosticSubject::operation(error.operation()),
+                    ),
+                    ProjectLuaFailure::Host {
+                        kind: "worker_spawn",
+                        operation,
+                        ..
+                    } => (
+                        DiagnosticCode::InternalOperation,
+                        DiagnosticReason::failure_with_detail(
+                            DiagnosticFailureKind::WorkerSpawnFailed,
+                            &detail,
+                        ),
                         DiagnosticAction::ReportBug,
                         3,
+                        DiagnosticSubject::operation(operation),
                     ),
-                    ProjectLuaFailure::Cancelled => (
-                        DiagnosticFailureKind::LockCancelled,
+                    ProjectLuaFailure::Host { .. } => (
+                        DiagnosticCode::LuaExecution,
+                        DiagnosticReason::failure_with_detail(
+                            DiagnosticFailureKind::LuaHostCallFailed,
+                            &detail,
+                        ),
+                        DiagnosticAction::FixInput,
+                        2,
+                        DiagnosticSubject::operation("project_lua_transaction"),
+                    ),
+                    ProjectLuaFailure::Validation(_) => (
+                        DiagnosticCode::LuaExecution,
+                        DiagnosticReason::failure_with_detail(
+                            DiagnosticFailureKind::LuaFinalizationFailed,
+                            &detail,
+                        ),
+                        DiagnosticAction::FixInput,
+                        2,
+                        DiagnosticSubject::operation("project_lua_transaction"),
+                    ),
+                    ProjectLuaFailure::Context(_) | ProjectLuaFailure::Panicked => (
+                        DiagnosticCode::LuaExecution,
+                        DiagnosticReason::failure_with_detail(
+                            DiagnosticFailureKind::WorkerPanicked,
+                            &detail,
+                        ),
+                        DiagnosticAction::ReportBug,
+                        3,
+                        DiagnosticSubject::operation("project_lua_transaction"),
+                    ),
+                    ProjectLuaFailure::Cancelled
+                    | ProjectLuaFailure::DatabasePrerequisite(
+                        ProjectLuaDatabasePrerequisiteError::Cancelled,
+                    ) => (
+                        DiagnosticCode::LuaExecution,
+                        DiagnosticReason::failure_with_detail(
+                            DiagnosticFailureKind::LockCancelled,
+                            &detail,
+                        ),
                         DiagnosticAction::Retry,
                         0,
+                        DiagnosticSubject::operation("project_lua_transaction"),
                     ),
                 };
                 (
-                    kind,
+                    code,
+                    reason,
                     DiagnosticImpact::Unchanged,
                     action,
                     class,
-                    DiagnosticSubject::operation("project_lua_transaction"),
+                    subject,
                 )
             }
         };
-        let diagnostic = SafeDiagnostic::new(
-            DiagnosticCode::LuaExecution,
-            DiagnosticStage::Lua,
-            subject,
-            DiagnosticReason::failure_with_detail(failure, source.to_string()),
-            impact,
-            action,
-        );
+        let diagnostic =
+            SafeDiagnostic::new(code, DiagnosticStage::Lua, subject, reason, impact, action);
         let report = Self::report_diagnostic(source, diagnostic);
         match class {
             0 => Self::ProjectState(Box::new(report)),
@@ -6982,6 +7377,89 @@ impl ProductionCommandError {
     fn was_cancelled_wait(&self) -> bool {
         let report = self.failure_report();
         report.related.is_empty() && report.primary.public().reason.is_wait_cancelled()
+    }
+}
+
+#[cfg(test)]
+mod project_lua_diagnostic_tests {
+    use super::*;
+
+    fn primary(error: &ProductionCommandError) -> &SafeDiagnostic {
+        error.failure_report().primary.public()
+    }
+
+    #[test]
+    fn database_prerequisite_state_is_project_state_in_preflight_and_execution() {
+        let failure = ProjectLuaFailure::DatabasePrerequisite(
+            ProjectLuaDatabasePrerequisiteError::InvalidProjectState(
+                "database_component=att_schema; violation=test".to_owned(),
+            ),
+        );
+        let errors = [
+            ProductionCommandError::project_lua_preflight(failure.clone()),
+            ProductionCommandError::project_lua_execution(ProjectLuaExecutionError::Run(
+                ProjectLuaRunError::RolledBack(failure),
+            )),
+        ];
+
+        for error in &errors {
+            assert!(matches!(error, ProductionCommandError::ProjectState(_)));
+            let diagnostic = primary(error);
+            assert_eq!(diagnostic.code, DiagnosticCode::ProjectState);
+            assert_eq!(
+                diagnostic.reason,
+                DiagnosticReason::FailureWithDetail {
+                    failure: DiagnosticFailureKind::StateMismatch,
+                    detail: "database_component=att_schema; violation=test".to_owned(),
+                }
+            );
+            assert_eq!(diagnostic.action, DiagnosticAction::CheckProjectState);
+        }
+    }
+
+    #[test]
+    fn sqlite_prerequisite_uses_structured_codes_without_driver_message() {
+        let connection = Connection::open_in_memory().expect("应建立错误来源数据库");
+        connection
+            .execute_batch(
+                "CREATE TABLE sensitive_driver_message (value TEXT UNIQUE);
+                 INSERT INTO sensitive_driver_message VALUES ('secret-value');",
+            )
+            .expect("应建立唯一约束");
+        let source = connection
+            .execute(
+                "INSERT INTO sensitive_driver_message VALUES ('secret-value')",
+                [],
+            )
+            .expect_err("重复值应产生扩展 SQLite code");
+        assert!(source.to_string().contains("sensitive_driver_message"));
+        let sqlite = ProjectLuaSqliteError::new("read_current_att_schema", &source);
+        let failure = ProjectLuaFailure::DatabasePrerequisite(
+            ProjectLuaDatabasePrerequisiteError::Sqlite(sqlite),
+        );
+        let errors = [
+            ProductionCommandError::project_lua_preflight(failure.clone()),
+            ProductionCommandError::project_lua_execution(ProjectLuaExecutionError::Run(
+                ProjectLuaRunError::RolledBack(failure),
+            )),
+        ];
+
+        for error in &errors {
+            assert!(matches!(error, ProductionCommandError::ProjectState(_)));
+            let diagnostic = primary(error);
+            assert_eq!(diagnostic.code, DiagnosticCode::SqliteOperation);
+            assert_eq!(
+                diagnostic.reason,
+                DiagnosticReason::Sqlite {
+                    primary_code: 19,
+                    extended_code: 2067,
+                }
+            );
+            assert_eq!(diagnostic.action, DiagnosticAction::CheckProjectState);
+            let serialized = serde_json::to_string(diagnostic).expect("公开诊断应可序列化");
+            assert!(!serialized.contains("sensitive_driver_message"));
+            assert!(!serialized.contains("secret-value"));
+        }
     }
 }
 

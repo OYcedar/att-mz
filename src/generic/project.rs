@@ -1,33 +1,133 @@
 //! Generic 项目的专用 SQLite 状态与重复 Extract。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, BufReader, Read, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
+use rusqlite::types::ValueRef;
+use rusqlite::{Connection, DropBehavior, OpenFlags, Row, Transaction, params};
 use uuid::Uuid;
 
+use crate::diagnostic::{
+    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
+    DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
+};
+use crate::execution::CooperativeCancellation;
 use crate::fingerprint::{SHA256_FINGERPRINT_BYTES, Sha256Fingerprint, Sha256FramedHasher};
 use crate::language::{LanguageId, LanguageIdError, LanguagePair};
 use crate::project_name::ProjectName;
 use crate::runtime::sqlite::{
-    apply_att_sqlite_new_database_page_policy, apply_att_sqlite_read_write_policy,
+    AttSqliteCancellableConnection, AttSqliteCancellationHandle,
+    apply_att_sqlite_cancellable_read_write_policy, apply_att_sqlite_new_database_page_policy,
+    suspend_att_sqlite_cancellation,
+};
+use crate::translation::placeholder::PlaceholderRuleCompilationError;
+use crate::translation::planning_resource::{
+    CompiledTerminology, TerminologyDefinitionError, TerminologyEntry,
+    compile_terminology_with_cancellation,
 };
 
-use super::jsonl::{GenericInputSnapshot, GenericJsonlError, scan_input_tree};
+use super::identity::CancellableTextMap;
+#[cfg(test)]
+use super::jsonl::scan_input_tree;
+use super::jsonl::{GenericInputSnapshot, GenericJsonlError, scan_input_tree_with_cancellation};
 use super::placeholder::{
-    GenericPlaceholderService, placeholder_binding_fingerprint,
-    validate_manual_translation_placeholders,
+    GenericCompiledPlaceholderRules, GenericPlaceholderError, GenericPlaceholderService,
+    validate_translation_placeholders_and_binding_with_cancellation,
 };
-use super::translate::{GenericUnitKey, manual_translation_state_fingerprint};
+use super::translate::{
+    GenericUnitKey, GenericUnitMap, manual_translation_state_fingerprint_with_cancellation,
+};
 
 const DATABASE_FILE_NAME: &str = "project.db";
+const FINGERPRINT_CANCELLATION_CHECK_BYTES: NonZeroUsize =
+    NonZeroUsize::new(64 * 1024).expect("Generic 指纹取消检查块大小必须非零");
+const RESOURCE_CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
+const SQLITE_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
 const TERMINOLOGY_RESOURCE: &str = "terminology";
 const PLACEHOLDER_RULES_RESOURCE: &str = "placeholder_rules";
+const CREATE_INITIAL_SCHEMA_SQL: &str = "CREATE TABLE generic_project (
+                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                 project_name TEXT NOT NULL CHECK (length(project_name) > 0),
+                 source_root BLOB NOT NULL CHECK (length(source_root) > 0 AND length(source_root) % 2 = 0),
+                 source_language TEXT NOT NULL CHECK (length(source_language) > 0),
+                 target_language TEXT NOT NULL CHECK (length(target_language) > 0),
+                 extracted_raw_fingerprint BLOB CHECK (
+                     extracted_raw_fingerprint IS NULL OR length(extracted_raw_fingerprint) = 32
+                 ),
+                 extracted_asset_fingerprint BLOB CHECK (
+                     extracted_asset_fingerprint IS NULL OR length(extracted_asset_fingerprint) = 32
+                 ),
+                 last_profile_id TEXT CHECK (last_profile_id IS NULL OR length(last_profile_id) > 0),
+                 CHECK (
+                     (extracted_raw_fingerprint IS NULL) =
+                     (extracted_asset_fingerprint IS NULL)
+                 )
+             ) STRICT;
+             CREATE TABLE generic_file (
+                 relative_path BLOB PRIMARY KEY
+                     CHECK (length(relative_path) > 0 AND length(relative_path) % 2 = 0),
+                 ordinal INTEGER NOT NULL UNIQUE CHECK (ordinal >= 0)
+             ) STRICT;
+             CREATE TABLE generic_group (
+                 group_id TEXT PRIMARY KEY CHECK (length(CAST(group_id AS BLOB)) > 0),
+                 relative_path BLOB NOT NULL REFERENCES generic_file(relative_path) ON DELETE CASCADE,
+                 ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+                 kind TEXT NOT NULL CHECK (length(CAST(kind AS BLOB)) > 0),
+                 context_fingerprint BLOB NOT NULL CHECK (length(context_fingerprint) = 32),
+                 UNIQUE (relative_path, ordinal)
+             ) STRICT;
+             CREATE TABLE generic_unit (
+                 group_id TEXT NOT NULL REFERENCES generic_group(group_id) ON DELETE CASCADE,
+                 unit_id TEXT NOT NULL CHECK (length(CAST(unit_id AS BLOB)) > 0),
+                 ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+                 source_text TEXT NOT NULL CHECK (
+                     instr(source_text, char(13)) = 0 AND instr(source_text, char(0)) = 0
+                 ),
+                 translation TEXT,
+                 translation_origin TEXT CHECK (
+                     translation_origin IS NULL OR translation_origin IN ('automatic', 'manual')
+                 ),
+                 translation_state BLOB CHECK (
+                     translation_state IS NULL OR length(translation_state) = 32
+                 ),
+                 PRIMARY KEY (group_id, unit_id),
+                 UNIQUE (group_id, ordinal),
+                 CHECK (
+                     (translation IS NULL AND translation_origin IS NULL AND translation_state IS NULL)
+                     OR
+                     (translation IS NOT NULL AND length(trim(translation)) > 0
+                      AND instr(translation, char(13)) = 0
+                      AND instr(translation, char(0)) = 0
+                      AND translation_origin IS NOT NULL
+                      AND translation_state IS NOT NULL)
+                 )
+             ) STRICT;
+             CREATE TABLE translation_resource (
+                 resource_kind TEXT PRIMARY KEY CHECK (
+                     resource_kind IN ('terminology', 'placeholder_rules')
+                 ),
+                 canonical_json TEXT NOT NULL CHECK (length(canonical_json) > 0)
+              ) STRICT;
+              INSERT INTO translation_resource (resource_kind, canonical_json)
+              VALUES ('terminology', '[]'), ('placeholder_rules', '[]');";
+const SELECT_GENERIC_ATT_SCHEMA: &str = "SELECT type, name, tbl_name, sql
+    FROM main.sqlite_schema
+    WHERE sql IS NOT NULL
+      AND tbl_name IN (
+          'generic_project',
+          'generic_file',
+          'generic_group',
+          'generic_unit',
+          'translation_resource'
+      )
+    ORDER BY type, name";
 const CREATE_PENDING_TRANSLATION_COMMIT_SQL: &str = "
     CREATE TEMP TABLE pending_translation_commit (
         group_id TEXT NOT NULL,
@@ -120,6 +220,101 @@ impl TranslationResources {
 
     pub(crate) fn placeholder_rules_json(&self) -> &str {
         &self.placeholder_rules_json
+    }
+
+    pub(crate) fn into_parts(self) -> (String, String) {
+        (self.terminology_json, self.placeholder_rules_json)
+    }
+}
+
+/// 已按当前 Generic 契约解析、规范化并完成语义编译的 Placeholder 资源。
+///
+/// 字段保持私有，使项目完整校验只能凭这份编译结果跳过重复 PCRE2 编译，不能用一段裸
+/// JSON 冒充已经验证的资源。
+#[derive(Clone)]
+pub(crate) struct GenericCompiledPlaceholderResource {
+    canonical_json: Arc<String>,
+    service: GenericPlaceholderService,
+    compiled: GenericCompiledPlaceholderRules,
+}
+
+impl GenericCompiledPlaceholderResource {
+    pub(crate) fn canonical_json(&self) -> &str {
+        self.canonical_json.as_str()
+    }
+
+    pub(crate) const fn service(&self) -> GenericPlaceholderService {
+        self.service
+    }
+
+    pub(crate) fn compiled(&self) -> &GenericCompiledPlaceholderRules {
+        &self.compiled
+    }
+}
+
+impl fmt::Debug for GenericCompiledPlaceholderResource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GenericCompiledPlaceholderResource")
+            .field("canonical_json_bytes", &self.canonical_json.len())
+            .field("compiled", &self.compiled)
+            .finish()
+    }
+}
+
+/// 已按当前 Generic 契约解析、规范化并完成语义编译的术语资源。
+#[derive(Clone)]
+pub(crate) struct GenericCompiledTerminologyResource {
+    canonical_json: Arc<String>,
+    compiled: Arc<CompiledTerminology>,
+}
+
+impl GenericCompiledTerminologyResource {
+    pub(crate) fn canonical_json(&self) -> &str {
+        self.canonical_json.as_str()
+    }
+
+    pub(crate) fn compiled(&self) -> &CompiledTerminology {
+        self.compiled.as_ref()
+    }
+}
+
+impl fmt::Debug for GenericCompiledTerminologyResource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GenericCompiledTerminologyResource")
+            .field("canonical_json_bytes", &self.canonical_json.len())
+            .field("compiled", &self.compiled)
+            .finish()
+    }
+}
+
+/// 当前 Generic 项目中两份已经完成规范解析与语义编译的翻译资源。
+///
+/// `load_current_translation_state` 在完整数据库校验期间建立这份值，并把同一份编译结果
+/// 交给 Translate 与 WriteBack。调用方只能取得已编译对象和对应规范 JSON，不能把裸
+/// JSON 标记成已验证。
+#[derive(Clone, Debug)]
+pub(crate) struct GenericCompiledTranslationResources {
+    terminology: GenericCompiledTerminologyResource,
+    placeholder: GenericCompiledPlaceholderResource,
+}
+
+impl GenericCompiledTranslationResources {
+    pub(crate) fn terminology_json(&self) -> &str {
+        self.terminology.canonical_json()
+    }
+
+    pub(crate) fn placeholder_rules_json(&self) -> &str {
+        self.placeholder.canonical_json()
+    }
+
+    pub(crate) fn terminology(&self) -> Arc<CompiledTerminology> {
+        Arc::clone(&self.terminology.compiled)
+    }
+
+    pub(crate) fn placeholder_rules(&self) -> GenericCompiledPlaceholderRules {
+        self.placeholder.compiled.clone()
     }
 }
 
@@ -262,14 +457,6 @@ impl GenericStoredSnapshot {
     pub(crate) fn files(&self) -> &[GenericStoredFile] {
         &self.files
     }
-
-    pub(crate) fn unit_count(&self) -> usize {
-        self.files
-            .iter()
-            .flat_map(|file| &file.groups)
-            .map(|group| group.units.len())
-            .sum()
-    }
 }
 
 /// 数据库中一个 JSONL 文件的位置及内容。
@@ -364,36 +551,75 @@ pub(crate) struct CommitTranslationsOutcome {
 }
 
 /// Generic 项目数据库的直接领域入口。
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct GenericProjectStore {
     workspace_root: PathBuf,
     database_path: PathBuf,
+    cancellation: CooperativeCancellation,
+}
+
+impl fmt::Debug for GenericProjectStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GenericProjectStore")
+            .field("workspace_root", &self.workspace_root)
+            .field("database_path", &self.database_path)
+            .field("cancelled", &self.cancellation.is_requested())
+            .finish()
+    }
 }
 
 impl GenericProjectStore {
+    #[cfg(test)]
     pub(crate) fn for_workspace(workspace_root: PathBuf) -> Self {
+        Self::for_workspace_with_cancellation(workspace_root, CooperativeCancellation::default())
+    }
+
+    pub(crate) fn for_workspace_with_cancellation(
+        workspace_root: PathBuf,
+        cancellation: CooperativeCancellation,
+    ) -> Self {
         let database_path = workspace_root.join(DATABASE_FILE_NAME);
         Self {
             workspace_root,
             database_path,
+            cancellation,
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn initialize(
         request: GenericInitRequest,
+    ) -> Result<(Self, GenericProject), GenericProjectError> {
+        Self::initialize_with_cancellation(request, CooperativeCancellation::default())
+    }
+
+    pub(crate) fn initialize_with_cancellation(
+        request: GenericInitRequest,
+        cancellation: CooperativeCancellation,
     ) -> Result<(Self, GenericProject), GenericProjectError> {
         if request.workspace_root.exists() && !request.workspace_root.is_dir() {
             return Err(GenericProjectError::WorkspaceNotDirectory {
                 path: request.workspace_root,
             });
         }
-        let store = Self::for_workspace(request.workspace_root.clone());
-        let exists = store.database_path.is_file();
+        let store =
+            Self::for_workspace_with_cancellation(request.workspace_root.clone(), cancellation);
+        let project = store.finish_cancellable(store.initialize_inner(request))?;
+        Ok((store, project))
+    }
+
+    fn initialize_inner(
+        &self,
+        request: GenericInitRequest,
+    ) -> Result<GenericProject, GenericProjectError> {
+        self.ensure_not_cancelled()?;
+        let exists = self.database_path.is_file();
 
         if exists {
-            let mut connection = store.open_connection(false)?;
-            validate_schema(&connection)?;
-            let current = store.read_project_with_connection(&connection)?;
+            let mut connection = self.open_connection(false)?;
+            validate_schema_with_cancellation(&connection, &self.cancellation)?;
+            let current = self.read_project_with_connection(&connection)?;
             if current.project_name != request.project_name {
                 return Err(GenericProjectError::ProjectIdentityMismatch {
                     expected: current.project_name.to_string(),
@@ -419,39 +645,53 @@ impl GenericProjectStore {
             let language_changed = source_language != *current.language_pair.source()
                 || target_language != *current.language_pair.target();
 
-            let transaction =
-                connection
-                    .transaction()
-                    .map_err(|source| GenericProjectError::Sqlite {
-                        operation: "开始 Generic Init 事务",
-                        source,
-                    })?;
-            transaction
-                .execute(
-                    "UPDATE generic_project
-                     SET source_root = ?1, source_language = ?2, target_language = ?3
-                     WHERE singleton = 1",
-                    params![
-                        encode_path(&source_root),
-                        source_language.as_str(),
-                        target_language.as_str()
-                    ],
-                )
-                .map_err(|source| GenericProjectError::Sqlite {
-                    operation: "更新 Generic 项目事实",
-                    source,
-                })?;
-            if source_changed {
-                clear_extracted_assets(&transaction)?;
-            } else if language_changed {
-                clear_all_translations(&transaction)?;
-            }
-            transaction
-                .commit()
-                .map_err(|source| GenericProjectError::Sqlite {
-                    operation: "提交 Generic Init",
-                    source,
-                })?;
+            run_cancellable_transaction(
+                &mut connection,
+                &self.cancellation,
+                "开始 Generic Init 事务",
+                "提交 Generic Init",
+                "回滚 Generic Init",
+                |transaction| {
+                    transaction
+                        .execute(
+                            "UPDATE generic_project
+                             SET source_root = ?1, source_language = ?2, target_language = ?3
+                             WHERE singleton = 1",
+                            params![
+                                encode_path(&source_root),
+                                source_language.as_str(),
+                                target_language.as_str()
+                            ],
+                        )
+                        .map_err(|source| GenericProjectError::Sqlite {
+                            operation: "更新 Generic 项目事实",
+                            source,
+                        })?;
+                    if source_changed || language_changed {
+                        clear_extracted_assets(transaction)?;
+                    }
+                    Ok(())
+                },
+            )?;
+            let (extracted_raw_fingerprint, extracted_asset_fingerprint) =
+                if source_changed || language_changed {
+                    (None, None)
+                } else {
+                    (
+                        current.extracted_raw_fingerprint,
+                        current.extracted_asset_fingerprint,
+                    )
+                };
+            Ok(GenericProject {
+                project_name: current.project_name,
+                workspace_root: self.workspace_root.clone(),
+                database_path: self.database_path.clone(),
+                source_root,
+                language_pair: LanguagePair::new(source_language, target_language),
+                extracted_raw_fingerprint,
+                extracted_asset_fingerprint,
+                last_profile_id: current.last_profile_id,
+            })
         } else {
             let source_root = request
                 .source_root
@@ -473,16 +713,23 @@ impl GenericProjectStore {
                     source,
                 }
             })?;
-            store.create_initial_database(
+            self.create_initial_database(
                 &request.project_name,
                 &source_root,
                 &source_language,
                 &target_language,
             )?;
+            Ok(GenericProject {
+                project_name: request.project_name,
+                workspace_root: self.workspace_root.clone(),
+                database_path: self.database_path.clone(),
+                source_root,
+                language_pair: LanguagePair::new(source_language, target_language),
+                extracted_raw_fingerprint: None,
+                extracted_asset_fingerprint: None,
+                last_profile_id: None,
+            })
         }
-
-        let project = store.open()?;
-        Ok((store, project))
     }
 
     fn create_initial_database(
@@ -492,6 +739,13 @@ impl GenericProjectStore {
         source_language: &LanguageId,
         target_language: &LanguageId,
     ) -> Result<(), GenericProjectError> {
+        self.ensure_not_cancelled()?;
+        ensure_initial_database_path_has_no_sidecars(
+            &self.database_path,
+            "检查 Generic 初始数据库发布目标 sidecar",
+            "首次 Init 的发布目标旁存在不属于当前项目的 SQLite sidecar",
+            &self.cancellation,
+        )?;
         let candidate_path = self
             .workspace_root
             .join(format!(".{DATABASE_FILE_NAME}.init-{}.tmp", Uuid::new_v4()));
@@ -506,23 +760,23 @@ impl GenericProjectStore {
             })?;
 
         let build_result = (|| {
-            let mut connection = open_sqlite_connection(&candidate_path, true)?;
+            let mut connection =
+                open_sqlite_connection(&candidate_path, true, self.cancellation.clone())?;
             create_initial_schema(
                 &mut connection,
                 project_name,
                 source_root,
                 source_language,
                 target_language,
+                &self.cancellation,
             )?;
-            validate_schema(&connection)?;
-            drop(connection);
-            fs::rename(&candidate_path, &self.database_path).map_err(|source| {
-                GenericProjectError::Io {
-                    operation: "发布 Generic 初始数据库",
-                    path: self.database_path.clone(),
-                    source,
-                }
-            })
+            validate_schema_with_cancellation(&connection, &self.cancellation)?;
+            publish_initial_database_candidate(
+                connection,
+                &candidate_path,
+                &self.database_path,
+                &self.cancellation,
+            )
         })();
 
         match build_result {
@@ -539,18 +793,30 @@ impl GenericProjectStore {
     }
 
     pub(crate) fn open(&self) -> Result<GenericProject, GenericProjectError> {
+        self.finish_cancellable(self.open_inner())
+    }
+
+    fn open_inner(&self) -> Result<GenericProject, GenericProjectError> {
+        self.ensure_not_cancelled()?;
         let connection = self.open_connection(false)?;
-        validate_schema(&connection)?;
-        self.read_project_with_connection(&connection)
+        validate_schema_with_cancellation(&connection, &self.cancellation)?;
+        let project = self.read_project_with_connection(&connection)?;
+        self.ensure_not_cancelled()?;
+        Ok(project)
     }
 
     pub(crate) fn extract(&self) -> Result<ExtractOutcome, GenericProjectError> {
+        self.finish_cancellable(self.extract_inner())
+    }
+
+    fn extract_inner(&self) -> Result<ExtractOutcome, GenericProjectError> {
         let project = self.open()?;
-        let scanned = scan_input_tree(project.source_root())?;
+        let scanned = scan_input_tree_with_cancellation(project.source_root(), &self.cancellation)?;
         if project.extracted_raw_fingerprint() == Some(scanned.raw_fingerprint())
             && project.extracted_asset_fingerprint() == Some(scanned.asset_fingerprint())
         {
-            let observed_again = scan_input_tree(project.source_root())?;
+            let observed_again =
+                scan_input_tree_with_cancellation(project.source_root(), &self.cancellation)?;
             if observed_again.raw_fingerprint() != scanned.raw_fingerprint() {
                 return Err(GenericProjectError::InputChangedDuringExtract);
             }
@@ -562,27 +828,25 @@ impl GenericProjectStore {
         }
 
         let mut connection = self.open_connection(false)?;
-        let transaction =
-            connection
-                .transaction()
-                .map_err(|source| GenericProjectError::Sqlite {
-                    operation: "开始 Generic Extract 事务",
-                    source,
-                })?;
-        let previous = load_snapshot_rows(&transaction, &project)?;
-        let reconciled = reconcile_snapshot(&previous, &scanned);
-        replace_snapshot(&transaction, &scanned, &reconciled.files)?;
+        let reconciled = run_cancellable_transaction(
+            &mut connection,
+            &self.cancellation,
+            "开始 Generic Extract 事务",
+            "提交 Generic Extract",
+            "回滚 Generic Extract",
+            |transaction| {
+                let previous = load_snapshot_rows(transaction, &project, &self.cancellation)?;
+                let reconciled = reconcile_snapshot(&previous, &scanned, &self.cancellation)?;
+                replace_snapshot(transaction, &scanned, &reconciled.files, &self.cancellation)?;
 
-        let observed_again = scan_input_tree(project.source_root())?;
-        if observed_again.raw_fingerprint() != scanned.raw_fingerprint() {
-            return Err(GenericProjectError::InputChangedDuringExtract);
-        }
-        transaction
-            .commit()
-            .map_err(|source| GenericProjectError::Sqlite {
-                operation: "提交 Generic Extract",
-                source,
-            })?;
+                let observed_again =
+                    scan_input_tree_with_cancellation(project.source_root(), &self.cancellation)?;
+                if observed_again.raw_fingerprint() != scanned.raw_fingerprint() {
+                    return Err(GenericProjectError::InputChangedDuringExtract);
+                }
+                Ok(reconciled)
+            },
+        )?;
 
         Ok(ExtractOutcome::Updated {
             files: scanned.files().len(),
@@ -595,13 +859,18 @@ impl GenericProjectStore {
 
     #[cfg(test)]
     pub(crate) fn load_snapshot(&self) -> Result<GenericStoredSnapshot, GenericProjectError> {
+        self.finish_cancellable(self.load_snapshot_inner())
+    }
+
+    #[cfg(test)]
+    fn load_snapshot_inner(&self) -> Result<GenericStoredSnapshot, GenericProjectError> {
         let connection = self.open_connection(false)?;
-        validate_schema(&connection)?;
+        validate_schema_with_cancellation(&connection, &self.cancellation)?;
         let project = self.read_project_with_connection(&connection)?;
         if project.extracted_raw_fingerprint().is_none() {
             return Err(GenericProjectError::ExtractRequired);
         }
-        load_snapshot_rows(&connection, &project)
+        load_snapshot_rows(&connection, &project, &self.cancellation)
     }
 
     /// 重新扫描外部输入，并只在内容仍与最近一次 Extract 相同时返回快照。
@@ -610,7 +879,7 @@ impl GenericProjectStore {
         &self,
     ) -> Result<(GenericStoredSnapshot, GenericInputSnapshot), GenericProjectError> {
         let stored = self.load_snapshot()?;
-        let live = scan_current_input(&stored)?;
+        let live = scan_current_input(&stored, &self.cancellation)?;
         Ok((stored, live))
     }
 
@@ -624,20 +893,32 @@ impl GenericProjectStore {
         (
             GenericStoredSnapshot,
             GenericInputSnapshot,
-            TranslationResources,
+            GenericCompiledTranslationResources,
+        ),
+        GenericProjectError,
+    > {
+        self.finish_cancellable(self.load_current_translation_state_inner())
+    }
+
+    fn load_current_translation_state_inner(
+        &self,
+    ) -> Result<
+        (
+            GenericStoredSnapshot,
+            GenericInputSnapshot,
+            GenericCompiledTranslationResources,
         ),
         GenericProjectError,
     > {
         let connection = self.open_connection(false)?;
-        validate_schema(&connection)?;
+        let resources = validate_schema_with_cancellation(&connection, &self.cancellation)?;
         let project = self.read_project_with_connection(&connection)?;
         if project.extracted_raw_fingerprint().is_none() {
             return Err(GenericProjectError::ExtractRequired);
         }
-        let stored = load_snapshot_rows(&connection, &project)?;
-        let resources = load_translation_resources_rows(&connection)?;
+        let stored = load_snapshot_rows(&connection, &project, &self.cancellation)?;
         drop(connection);
-        let live = scan_current_input(&stored)?;
+        let live = scan_current_input(&stored, &self.cancellation)?;
         Ok((stored, live, resources))
     }
 
@@ -647,7 +928,11 @@ impl GenericProjectStore {
         expected_raw_fingerprint: Sha256Fingerprint,
         writes: &[TranslationWrite],
     ) -> Result<CommitTranslationsOutcome, GenericProjectError> {
-        self.commit_translations_inner(expected_raw_fingerprint, writes, None)
+        self.finish_cancellable(self.commit_translations_inner(
+            expected_raw_fingerprint,
+            writes,
+            None,
+        ))
     }
 
     /// 提交自动翻译进展，并在至少一项写入成功时于同一事务记录所用 Profile。
@@ -657,10 +942,15 @@ impl GenericProjectStore {
         writes: &[TranslationWrite],
         profile_id: &str,
     ) -> Result<CommitTranslationsOutcome, GenericProjectError> {
+        self.ensure_not_cancelled()?;
         if profile_id.is_empty() || profile_id.chars().all(char::is_whitespace) {
             return Err(GenericProjectError::BlankProfileId);
         }
-        self.commit_translations_inner(expected_raw_fingerprint, writes, Some(profile_id))
+        self.finish_cancellable(self.commit_translations_inner(
+            expected_raw_fingerprint,
+            writes,
+            Some(profile_id),
+        ))
     }
 
     fn commit_translations_inner(
@@ -669,185 +959,233 @@ impl GenericProjectStore {
         writes: &[TranslationWrite],
         profile_id: Option<&str>,
     ) -> Result<CommitTranslationsOutcome, GenericProjectError> {
-        let mut write_indexes = HashMap::with_capacity(writes.len());
+        let mut write_indexes = GenericUnitMap::with_capacity(writes.len());
         for (index, write) in writes.iter().enumerate() {
+            self.ensure_not_cancelled()?;
             validate_translation(&write.translation)?;
+            let key = GenericUnitKey::new(
+                clone_text_with_cancellation(&write.group_id, &self.cancellation)?,
+                clone_text_with_cancellation(&write.unit_id, &self.cancellation)?,
+            );
             if write_indexes
-                .insert((write.group_id.as_str(), write.unit_id.as_str()), index)
+                .insert_with_cancellation(key, index, || self.ensure_not_cancelled())?
                 .is_some()
             {
                 return Err(GenericProjectError::DuplicateTranslationWrite {
-                    group_id: write.group_id.clone(),
-                    unit_id: write.unit_id.clone(),
+                    group_id: clone_text_with_cancellation(&write.group_id, &self.cancellation)?,
+                    unit_id: clone_text_with_cancellation(&write.unit_id, &self.cancellation)?,
                 });
             }
         }
 
         let mut connection = self.open_connection(false)?;
-        let transaction =
-            connection
-                .transaction()
-                .map_err(|source| GenericProjectError::Sqlite {
-                    operation: "开始 Generic 译文提交事务",
-                    source,
-                })?;
-        let actual = read_optional_fingerprint(
-            transaction
-                .query_row(
-                    "SELECT extracted_raw_fingerprint
+        run_cancellable_transaction(
+            &mut connection,
+            &self.cancellation,
+            "开始 Generic 译文提交事务",
+            "完成 Generic 译文提交",
+            "回滚 Generic 译文提交",
+            |transaction| {
+                let actual = read_optional_fingerprint(
+                    transaction
+                        .query_row(
+                            "SELECT extracted_raw_fingerprint
                      FROM generic_project WHERE singleton = 1",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(|source| GenericProjectError::Sqlite {
-                    operation: "读取 Generic Extract 指纹",
-                    source,
-                })?,
-            "extracted_raw_fingerprint",
-        )?;
-        if actual != Some(expected_raw_fingerprint) {
-            return Err(GenericProjectError::TranslationSnapshotChanged);
-        }
-
-        let mut applied = vec![false; writes.len()];
-        {
-            transaction
-                .execute(CREATE_PENDING_TRANSLATION_COMMIT_SQL, [])
-                .map_err(|source| GenericProjectError::Sqlite {
-                    operation: "建立 Generic 译文提交暂存表",
-                    source,
-                })?;
-            let mut insert = transaction
-                .prepare_cached(INSERT_PENDING_TRANSLATION_COMMIT_SQL)
-                .map_err(|source| GenericProjectError::Sqlite {
-                    operation: "准备暂存 Generic 译文",
-                    source,
-                })?;
-            for write in writes {
-                let (expected_translation, expected_origin, expected_state) = write
-                    .expected_translation
-                    .as_ref()
-                    .map_or((None, None, None), |translation| {
-                        (
-                            Some(translation.translation.as_str()),
-                            Some(translation.origin.storage_name()),
-                            Some(translation.state_fingerprint.as_bytes().as_slice()),
+                            [],
+                            |row| row.get(0),
                         )
-                    });
-                insert
-                    .execute(params![
-                        write.group_id,
-                        write.unit_id,
-                        write.expected_source_text,
-                        write.expected_group_context.as_bytes().as_slice(),
-                        write.translation,
-                        write.origin.storage_name(),
-                        write.state_fingerprint.as_bytes().as_slice(),
-                        expected_translation,
-                        expected_origin,
-                        expected_state,
-                    ])
-                    .map_err(|source| GenericProjectError::Sqlite {
-                        operation: "暂存 Generic Unit 译文",
-                        source,
-                    })?;
-            }
-            drop(insert);
-
-            let mut update = transaction
-                .prepare(APPLY_PENDING_TRANSLATION_COMMIT_SQL)
-                .map_err(|source| GenericProjectError::Sqlite {
-                    operation: "准备批量提交 Generic 译文",
-                    source,
-                })?;
-            let updated = update
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .map_err(|source| GenericProjectError::Sqlite {
-                    operation: "批量提交 Generic 译文",
-                    source,
-                })?;
-            for updated in updated {
-                let (group_id, unit_id) =
-                    updated.map_err(|source| GenericProjectError::Sqlite {
-                        operation: "读取 Generic 译文提交结果",
-                        source,
-                    })?;
-                let Some(&index) = write_indexes.get(&(group_id.as_str(), unit_id.as_str())) else {
-                    return Err(GenericProjectError::InvalidDatabase {
-                        detail: format!(
-                            "Generic 译文批量提交返回了未请求的 Unit：{group_id:?}/{unit_id:?}"
-                        ),
-                    });
-                };
-                if std::mem::replace(&mut applied[index], true) {
-                    return Err(GenericProjectError::InvalidDatabase {
-                        detail: format!(
-                            "Generic 译文批量提交重复返回 Unit：{group_id:?}/{unit_id:?}"
-                        ),
-                    });
+                        .map_err(|source| GenericProjectError::Sqlite {
+                            operation: "读取 Generic Extract 指纹",
+                            source,
+                        })?,
+                    "extracted_raw_fingerprint",
+                )?;
+                if actual != Some(expected_raw_fingerprint) {
+                    return Err(GenericProjectError::TranslationSnapshotChanged);
                 }
-            }
-        }
-        let committed = applied.iter().filter(|applied| **applied).count();
-        let conflicts = writes
-            .iter()
-            .zip(applied)
-            .filter(|(_, applied)| !*applied)
-            .map(|(write, _)| (write.group_id.clone(), write.unit_id.clone()))
-            .collect::<Vec<_>>();
-        if committed > 0
-            && let Some(profile_id) = profile_id
-        {
-            transaction
-                .execute(
-                    "UPDATE generic_project
-                     SET last_profile_id = ?1
-                     WHERE singleton = 1",
-                    [profile_id],
-                )
-                .map_err(|source| GenericProjectError::Sqlite {
-                    operation: "保存 Generic 最近 Profile",
-                    source,
-                })?;
-        }
-        transaction
-            .commit()
-            .map_err(|source| GenericProjectError::Sqlite {
-                operation: "完成 Generic 译文提交",
-                source,
-            })?;
-        Ok(CommitTranslationsOutcome {
-            committed,
-            conflicts,
-        })
+
+                let mut applied = vec![false; writes.len()];
+                {
+                    transaction
+                        .execute(CREATE_PENDING_TRANSLATION_COMMIT_SQL, [])
+                        .map_err(|source| GenericProjectError::Sqlite {
+                            operation: "建立 Generic 译文提交暂存表",
+                            source,
+                        })?;
+                    let mut insert = transaction
+                        .prepare_cached(INSERT_PENDING_TRANSLATION_COMMIT_SQL)
+                        .map_err(|source| GenericProjectError::Sqlite {
+                            operation: "准备暂存 Generic 译文",
+                            source,
+                        })?;
+                    for write in writes {
+                        self.ensure_not_cancelled()?;
+                        let (expected_translation, expected_origin, expected_state) = write
+                            .expected_translation
+                            .as_ref()
+                            .map_or((None, None, None), |translation| {
+                                (
+                                    Some(translation.translation.as_str()),
+                                    Some(translation.origin.storage_name()),
+                                    Some(translation.state_fingerprint.as_bytes().as_slice()),
+                                )
+                            });
+                        insert
+                            .execute(params![
+                                write.group_id,
+                                write.unit_id,
+                                write.expected_source_text,
+                                write.expected_group_context.as_bytes().as_slice(),
+                                write.translation,
+                                write.origin.storage_name(),
+                                write.state_fingerprint.as_bytes().as_slice(),
+                                expected_translation,
+                                expected_origin,
+                                expected_state,
+                            ])
+                            .map_err(|source| GenericProjectError::Sqlite {
+                                operation: "暂存 Generic Unit 译文",
+                                source,
+                            })?;
+                    }
+                    drop(insert);
+
+                    let mut update = transaction
+                        .prepare(APPLY_PENDING_TRANSLATION_COMMIT_SQL)
+                        .map_err(|source| GenericProjectError::Sqlite {
+                            operation: "准备批量提交 Generic 译文",
+                            source,
+                        })?;
+                    let mut updated =
+                        update
+                            .query([])
+                            .map_err(|source| GenericProjectError::Sqlite {
+                                operation: "批量提交 Generic 译文",
+                                source,
+                            })?;
+                    while let Some(row) =
+                        updated
+                            .next()
+                            .map_err(|source| GenericProjectError::Sqlite {
+                                operation: "读取 Generic 译文提交结果",
+                                source,
+                            })?
+                    {
+                        self.ensure_not_cancelled()?;
+                        let group_id = clone_sqlite_text_column_with_cancellation(
+                            row,
+                            0,
+                            "读取 Generic 译文提交结果",
+                            &self.cancellation,
+                        )?;
+                        let unit_id = clone_sqlite_text_column_with_cancellation(
+                            row,
+                            1,
+                            "读取 Generic 译文提交结果",
+                            &self.cancellation,
+                        )?;
+                        let Some(&index) = write_indexes.get_parts_with_cancellation(
+                            &group_id,
+                            &unit_id,
+                            || self.ensure_not_cancelled(),
+                        )?
+                        else {
+                            return Err(GenericProjectError::InvalidDatabase {
+                                detail: format!(
+                                    "Generic 译文批量提交返回了未请求的 Unit：{group_id:?}/{unit_id:?}"
+                                ),
+                            });
+                        };
+                        if std::mem::replace(&mut applied[index], true) {
+                            return Err(GenericProjectError::InvalidDatabase {
+                                detail: format!(
+                                    "Generic 译文批量提交重复返回 Unit：{group_id:?}/{unit_id:?}"
+                                ),
+                            });
+                        }
+                    }
+                }
+                let mut committed = 0;
+                let mut conflicts = Vec::new();
+                for (write, applied) in writes.iter().zip(applied) {
+                    self.ensure_not_cancelled()?;
+                    if applied {
+                        committed += 1;
+                    } else {
+                        conflicts.push((
+                            clone_text_with_cancellation(&write.group_id, &self.cancellation)?,
+                            clone_text_with_cancellation(&write.unit_id, &self.cancellation)?,
+                        ));
+                    }
+                }
+                if committed > 0
+                    && let Some(profile_id) = profile_id
+                {
+                    transaction
+                        .execute(
+                            "UPDATE generic_project
+                             SET last_profile_id = ?1
+                             WHERE singleton = 1",
+                            [profile_id],
+                        )
+                        .map_err(|source| GenericProjectError::Sqlite {
+                            operation: "保存 Generic 最近 Profile",
+                            source,
+                        })?;
+                }
+                Ok(CommitTranslationsOutcome {
+                    committed,
+                    conflicts,
+                })
+            },
+        )
     }
 
     pub(crate) fn remember_profile(&self, profile_id: &str) -> Result<(), GenericProjectError> {
+        self.ensure_not_cancelled()?;
         if profile_id.is_empty() || profile_id.chars().all(char::is_whitespace) {
             return Err(GenericProjectError::BlankProfileId);
         }
-        let connection = self.open_connection(false)?;
-        connection
-            .execute(
-                "UPDATE generic_project SET last_profile_id = ?1 WHERE singleton = 1",
-                [profile_id],
-            )
-            .map_err(|source| GenericProjectError::Sqlite {
-                operation: "保存 Generic 最近 Profile",
-                source,
-            })?;
-        Ok(())
+        self.finish_cancellable(self.remember_profile_inner(profile_id))
+    }
+
+    fn remember_profile_inner(&self, profile_id: &str) -> Result<(), GenericProjectError> {
+        let mut connection = self.open_connection(false)?;
+        run_cancellable_transaction(
+            &mut connection,
+            &self.cancellation,
+            "开始保存 Generic 最近 Profile",
+            "提交 Generic 最近 Profile",
+            "回滚 Generic 最近 Profile",
+            |transaction| {
+                transaction
+                    .execute(
+                        "UPDATE generic_project SET last_profile_id = ?1 WHERE singleton = 1",
+                        [profile_id],
+                    )
+                    .map_err(|source| GenericProjectError::Sqlite {
+                        operation: "保存 Generic 最近 Profile",
+                        source,
+                    })?;
+                Ok(())
+            },
+        )
     }
 
     #[cfg(test)]
     pub(crate) fn load_translation_resources(
         &self,
     ) -> Result<TranslationResources, GenericProjectError> {
+        self.finish_cancellable(self.load_translation_resources_inner())
+    }
+
+    #[cfg(test)]
+    fn load_translation_resources_inner(
+        &self,
+    ) -> Result<TranslationResources, GenericProjectError> {
         let connection = self.open_connection(false)?;
-        validate_schema(&connection)?;
-        load_translation_resources_rows(&connection)
+        validate_schema_with_cancellation(&connection, &self.cancellation)?;
+        load_translation_resources_rows_with_cancellation(&connection, &self.cancellation)
     }
 
     /// 原子保存本轮资源，并以 CAS 清除规划时已经确认失效的旧译文。
@@ -858,176 +1196,213 @@ impl GenericProjectStore {
         placeholder_rules_json: &str,
         invalidations: &[TranslationClear],
     ) -> Result<CommitTranslationsOutcome, GenericProjectError> {
-        validate_canonical_resource(TERMINOLOGY_RESOURCE, terminology_json)?;
-        validate_canonical_resource(PLACEHOLDER_RULES_RESOURCE, placeholder_rules_json)?;
-        validate_placeholder_resource(placeholder_rules_json)?;
-        let mut seen = HashSet::with_capacity(invalidations.len());
+        self.ensure_not_cancelled()?;
+        self.finish_cancellable(self.apply_translation_resources_inner(
+            expected_raw_fingerprint,
+            terminology_json,
+            placeholder_rules_json,
+            invalidations,
+        ))
+    }
+
+    fn apply_translation_resources_inner(
+        &self,
+        expected_raw_fingerprint: Sha256Fingerprint,
+        terminology_json: &str,
+        placeholder_rules_json: &str,
+        invalidations: &[TranslationClear],
+    ) -> Result<CommitTranslationsOutcome, GenericProjectError> {
+        validate_translation_resources_with_cancellation(
+            terminology_json,
+            placeholder_rules_json,
+            &self.cancellation,
+        )?;
+        let mut seen = GenericUnitMap::with_capacity(invalidations.len());
         for invalidation in invalidations {
-            if !seen.insert((&invalidation.group_id, &invalidation.unit_id)) {
+            self.ensure_not_cancelled()?;
+            let key = GenericUnitKey::new(
+                clone_text_with_cancellation(&invalidation.group_id, &self.cancellation)?,
+                clone_text_with_cancellation(&invalidation.unit_id, &self.cancellation)?,
+            );
+            if seen
+                .insert_with_cancellation(key, (), || self.ensure_not_cancelled())?
+                .is_some()
+            {
                 return Err(GenericProjectError::DuplicateTranslationClear {
-                    group_id: invalidation.group_id.clone(),
-                    unit_id: invalidation.unit_id.clone(),
+                    group_id: clone_text_with_cancellation(
+                        &invalidation.group_id,
+                        &self.cancellation,
+                    )?,
+                    unit_id: clone_text_with_cancellation(
+                        &invalidation.unit_id,
+                        &self.cancellation,
+                    )?,
                 });
             }
         }
         let mut connection = self.open_connection(false)?;
-        let transaction =
-            connection
-                .transaction()
-                .map_err(|source| GenericProjectError::Sqlite {
-                    operation: "开始保存 Generic 翻译资源",
-                    source,
-                })?;
-        let actual = read_optional_fingerprint(
-            transaction
-                .query_row(
-                    "SELECT extracted_raw_fingerprint
-                     FROM generic_project WHERE singleton = 1",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(|source| GenericProjectError::Sqlite {
-                    operation: "读取 Generic Extract 指纹",
-                    source,
-                })?,
-            "extracted_raw_fingerprint",
-        )?;
-        if actual != Some(expected_raw_fingerprint) {
-            return Err(GenericProjectError::TranslationSnapshotChanged);
-        }
-        for (kind, canonical_json) in [
-            (TERMINOLOGY_RESOURCE, terminology_json),
-            (PLACEHOLDER_RULES_RESOURCE, placeholder_rules_json),
-        ] {
-            transaction
-                .execute(
-                    "UPDATE translation_resource
-                     SET canonical_json = ?1 WHERE resource_kind = ?2",
-                    params![canonical_json, kind],
-                )
-                .map_err(|source| GenericProjectError::Sqlite {
-                    operation: "更新 Generic 翻译资源",
-                    source,
-                })?;
-        }
-        let mut conflicts = Vec::new();
-        let mut committed = 0;
-        {
-            let mut statement = transaction
-                .prepare_cached(
-                    "UPDATE generic_unit
-                     SET translation = NULL,
-                         translation_origin = NULL,
-                         translation_state = NULL
-                     WHERE group_id = ?1 AND unit_id = ?2
-                       AND source_text = ?3
-                       AND EXISTS (
-                           SELECT 1 FROM generic_group
-                           WHERE group_id = ?1 AND context_fingerprint = ?4
-                       )
-                       AND translation = ?5
-                       AND translation_origin = ?6
-                       AND translation_state = ?7",
-                )
-                .map_err(|source| GenericProjectError::Sqlite {
-                    operation: "准备清除失效 Generic 译文",
-                    source,
-                })?;
-            for invalidation in invalidations {
-                let changed = statement
-                    .execute(params![
-                        invalidation.group_id,
-                        invalidation.unit_id,
-                        invalidation.expected_source_text,
-                        invalidation.expected_group_context.as_bytes().as_slice(),
-                        invalidation.expected_translation.translation,
-                        invalidation.expected_translation.origin.storage_name(),
-                        invalidation
-                            .expected_translation
-                            .state_fingerprint
-                            .as_bytes()
-                            .as_slice(),
-                    ])
-                    .map_err(|source| GenericProjectError::Sqlite {
-                        operation: "清除失效 Generic 译文",
-                        source,
-                    })?;
-                if changed == 1 {
-                    committed += 1;
-                } else {
-                    conflicts.push((invalidation.group_id.clone(), invalidation.unit_id.clone()));
+        run_cancellable_transaction(
+            &mut connection,
+            &self.cancellation,
+            "开始保存 Generic 翻译资源",
+            "提交 Generic 翻译资源",
+            "回滚 Generic 翻译资源",
+            |transaction| {
+                let actual = read_optional_fingerprint(
+                    transaction
+                        .query_row(
+                            "SELECT extracted_raw_fingerprint
+                             FROM generic_project WHERE singleton = 1",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .map_err(|source| GenericProjectError::Sqlite {
+                            operation: "读取 Generic Extract 指纹",
+                            source,
+                        })?,
+                    "extracted_raw_fingerprint",
+                )?;
+                if actual != Some(expected_raw_fingerprint) {
+                    return Err(GenericProjectError::TranslationSnapshotChanged);
                 }
-            }
-        }
-        transaction
-            .commit()
-            .map_err(|source| GenericProjectError::Sqlite {
-                operation: "提交 Generic 翻译资源",
-                source,
-            })?;
-        Ok(CommitTranslationsOutcome {
-            committed,
-            conflicts,
-        })
+                for (kind, canonical_json) in [
+                    (TERMINOLOGY_RESOURCE, terminology_json),
+                    (PLACEHOLDER_RULES_RESOURCE, placeholder_rules_json),
+                ] {
+                    transaction
+                        .execute(
+                            "UPDATE translation_resource
+                             SET canonical_json = ?1 WHERE resource_kind = ?2",
+                            params![canonical_json, kind],
+                        )
+                        .map_err(|source| GenericProjectError::Sqlite {
+                            operation: "更新 Generic 翻译资源",
+                            source,
+                        })?;
+                }
+                let mut conflicts = Vec::new();
+                let mut committed = 0;
+                {
+                    let mut statement = transaction
+                        .prepare_cached(
+                            "UPDATE generic_unit
+                             SET translation = NULL,
+                                 translation_origin = NULL,
+                                 translation_state = NULL
+                             WHERE group_id = ?1 AND unit_id = ?2
+                               AND source_text = ?3
+                               AND EXISTS (
+                                   SELECT 1 FROM generic_group
+                                   WHERE group_id = ?1 AND context_fingerprint = ?4
+                               )
+                               AND translation = ?5
+                               AND translation_origin = ?6
+                               AND translation_state = ?7",
+                        )
+                        .map_err(|source| GenericProjectError::Sqlite {
+                            operation: "准备清除失效 Generic 译文",
+                            source,
+                        })?;
+                    for invalidation in invalidations {
+                        self.ensure_not_cancelled()?;
+                        let changed = statement
+                            .execute(params![
+                                invalidation.group_id,
+                                invalidation.unit_id,
+                                invalidation.expected_source_text,
+                                invalidation.expected_group_context.as_bytes().as_slice(),
+                                invalidation.expected_translation.translation,
+                                invalidation.expected_translation.origin.storage_name(),
+                                invalidation
+                                    .expected_translation
+                                    .state_fingerprint
+                                    .as_bytes()
+                                    .as_slice(),
+                            ])
+                            .map_err(|source| GenericProjectError::Sqlite {
+                                operation: "清除失效 Generic 译文",
+                                source,
+                            })?;
+                        if changed == 1 {
+                            committed += 1;
+                        } else {
+                            conflicts.push((
+                                clone_text_with_cancellation(
+                                    &invalidation.group_id,
+                                    &self.cancellation,
+                                )?,
+                                clone_text_with_cancellation(
+                                    &invalidation.unit_id,
+                                    &self.cancellation,
+                                )?,
+                            ));
+                        }
+                    }
+                }
+                Ok(CommitTranslationsOutcome {
+                    committed,
+                    conflicts,
+                })
+            },
+        )
     }
 
-    fn open_connection(&self, create: bool) -> Result<Connection, GenericProjectError> {
+    fn open_connection(
+        &self,
+        create: bool,
+    ) -> Result<AttSqliteCancellableConnection, GenericProjectError> {
+        self.ensure_not_cancelled()?;
         if !create && !self.database_path.is_file() {
             return Err(GenericProjectError::ProjectNotFound {
                 path: self.database_path.clone(),
             });
         }
-        open_sqlite_connection(&self.database_path, create)
+        open_sqlite_connection(&self.database_path, create, self.cancellation.clone())
+    }
+
+    fn ensure_not_cancelled(&self) -> Result<(), GenericProjectError> {
+        if self.cancellation.is_requested() {
+            Err(GenericProjectError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn finish_cancellable<T>(
+        &self,
+        result: Result<T, GenericProjectError>,
+    ) -> Result<T, GenericProjectError> {
+        match result {
+            Err(source)
+                if self.cancellation.is_requested()
+                    && source.is_sqlite_cancellation_without_cleanup_failure() =>
+            {
+                Err(GenericProjectError::Cancelled)
+            }
+            result => result,
+        }
     }
 
     fn read_project_with_connection(
         &self,
         connection: &Connection,
     ) -> Result<GenericProject, GenericProjectError> {
-        type ProjectRow = (
-            String,
-            Vec<u8>,
-            String,
-            String,
-            Option<Vec<u8>>,
-            Option<Vec<u8>>,
-            Option<String>,
-        );
-        let row: ProjectRow = connection
-            .query_row(
-                "SELECT project_name, source_root, source_language, target_language,
-                        extracted_raw_fingerprint, extracted_asset_fingerprint, last_profile_id
-                 FROM main.generic_project WHERE singleton = 1",
-                [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|source| GenericProjectError::Sqlite {
-                operation: "读取 Generic 项目记录",
-                source,
-            })?
-            .ok_or_else(|| GenericProjectError::InvalidDatabase {
-                detail: "缺少 generic_project 单例记录".to_owned(),
-            })?;
-        let project_name = row.0.parse::<ProjectName>().map_err(|detail| {
+        let row = load_generic_project_row_with_cancellation(connection, &self.cancellation)?;
+        self.ensure_not_cancelled()?;
+        let project_name = row.project_name.parse::<ProjectName>().map_err(|detail| {
             GenericProjectError::InvalidDatabase {
                 detail: format!("项目名称无效：{detail}"),
             }
         })?;
-        let source_root = decode_path(&row.1)?;
-        let source = LanguageId::parse(&row.2)?;
-        let target = LanguageId::parse(&row.3)?;
+        self.ensure_not_cancelled()?;
+        let source_root = decode_path_with_cancellation(&row.source_root, &self.cancellation)?;
+        self.ensure_not_cancelled()?;
+        let source = LanguageId::parse(&row.source_language)?;
+        self.ensure_not_cancelled()?;
+        let target = LanguageId::parse(&row.target_language)?;
+        self.ensure_not_cancelled()?;
         validate_distinct_languages(&source, &target)?;
+        self.ensure_not_cancelled()?;
         Ok(GenericProject {
             project_name,
             workspace_root: self.workspace_root.clone(),
@@ -1035,14 +1410,14 @@ impl GenericProjectStore {
             source_root,
             language_pair: LanguagePair::new(source, target),
             extracted_raw_fingerprint: read_optional_fingerprint(
-                row.4,
+                row.extracted_raw_fingerprint,
                 "extracted_raw_fingerprint",
             )?,
             extracted_asset_fingerprint: read_optional_fingerprint(
-                row.5,
+                row.extracted_asset_fingerprint,
                 "extracted_asset_fingerprint",
             )?,
-            last_profile_id: row.6,
+            last_profile_id: row.last_profile_id,
         })
     }
 }
@@ -1050,7 +1425,8 @@ impl GenericProjectStore {
 fn open_sqlite_connection(
     database_path: &Path,
     create: bool,
-) -> Result<Connection, GenericProjectError> {
+    cancellation: CooperativeCancellation,
+) -> Result<AttSqliteCancellableConnection, GenericProjectError> {
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | if create {
             OpenFlags::SQLITE_OPEN_CREATE
@@ -1071,18 +1447,204 @@ fn open_sqlite_connection(
             }
         })?;
     }
-    apply_att_sqlite_read_write_policy(&connection).map_err(|source| {
-        GenericProjectError::Sqlite {
-            operation: "应用 Generic SQLite 读写策略",
-            source,
+    let wait_cancellation = cancellation.clone();
+    apply_att_sqlite_cancellable_read_write_policy(connection, move || {
+        wait_cancellation.is_requested()
+    })
+    .map_err(|source| {
+        if cancellation.is_requested() && sqlite_error_is_busy(&source) {
+            GenericProjectError::Cancelled
+        } else {
+            GenericProjectError::Sqlite {
+                operation: "应用 Generic SQLite 读写策略",
+                source,
+            }
         }
-    })?;
-    Ok(connection)
+    })
+}
+
+#[derive(Debug)]
+pub(crate) enum GenericTransactionFinalizationFailure {
+    Sqlite {
+        operation: &'static str,
+        source: rusqlite::Error,
+    },
+    InvalidState {
+        detail: &'static str,
+    },
+}
+
+impl fmt::Display for GenericTransactionFinalizationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sqlite { operation, source } => {
+                write!(formatter, "{operation}失败：{source}")
+            }
+            Self::InvalidState { detail } => formatter.write_str(detail),
+        }
+    }
+}
+
+impl Error for GenericTransactionFinalizationFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Sqlite { source, .. } => Some(source),
+            Self::InvalidState { .. } => None,
+        }
+    }
+}
+
+fn run_cancellable_transaction<T>(
+    connection: &mut AttSqliteCancellableConnection,
+    cancellation: &CooperativeCancellation,
+    begin_operation: &'static str,
+    commit_operation: &'static str,
+    rollback_operation: &'static str,
+    body: impl FnOnce(&Transaction<'_>) -> Result<T, GenericProjectError>,
+) -> Result<T, GenericProjectError> {
+    let cancellation_handle = connection.cancellation_handle();
+    let mut transaction =
+        connection
+            .transaction()
+            .map_err(|source| GenericProjectError::Sqlite {
+                operation: begin_operation,
+                source,
+            })?;
+    let body_result = body(&transaction);
+
+    // 从这里开始只允许本函数显式确定终态，不能再让 Transaction::drop 吞掉回滚错误。
+    transaction.set_drop_behavior(DropBehavior::Ignore);
+    let result = match body_result {
+        Err(primary) => Err(rollback_generic_transaction(
+            &transaction,
+            &cancellation_handle,
+            primary,
+            rollback_operation,
+        )),
+        Ok(_) if cancellation.is_requested() => Err(rollback_generic_transaction(
+            &transaction,
+            &cancellation_handle,
+            GenericProjectError::Cancelled,
+            rollback_operation,
+        )),
+        Ok(value) => commit_generic_transaction(
+            &transaction,
+            &cancellation_handle,
+            commit_operation,
+            rollback_operation,
+        )
+        .map(|()| value),
+    };
+    drop(transaction);
+    result
+}
+
+fn rollback_generic_transaction(
+    transaction: &Transaction<'_>,
+    cancellation: &AttSqliteCancellationHandle,
+    primary: GenericProjectError,
+    rollback_operation: &'static str,
+) -> GenericProjectError {
+    if transaction.is_autocommit() {
+        return primary;
+    }
+
+    let suspension = suspend_att_sqlite_cancellation(cancellation);
+    let rollback = transaction.execute_batch("ROLLBACK");
+    let is_autocommit = transaction.is_autocommit();
+    drop(suspension);
+
+    match rollback {
+        Ok(()) if is_autocommit => primary,
+        Ok(()) => GenericProjectError::TransactionOutcomeUnknown {
+            operation: rollback_operation,
+            primary: Some(Box::new(primary)),
+            finalization: GenericTransactionFinalizationFailure::InvalidState {
+                detail: "ROLLBACK 返回成功后 Generic SQLite 连接仍处于事务中",
+            },
+        },
+        Err(source) => GenericProjectError::TransactionOutcomeUnknown {
+            operation: rollback_operation,
+            primary: Some(Box::new(primary)),
+            finalization: GenericTransactionFinalizationFailure::Sqlite {
+                operation: rollback_operation,
+                source,
+            },
+        },
+    }
+}
+
+fn commit_generic_transaction(
+    transaction: &Transaction<'_>,
+    cancellation: &AttSqliteCancellationHandle,
+    commit_operation: &'static str,
+    rollback_operation: &'static str,
+) -> Result<(), GenericProjectError> {
+    let suspension = suspend_att_sqlite_cancellation(cancellation);
+
+    let commit = transaction.execute_batch("COMMIT");
+    let is_autocommit = transaction.is_autocommit();
+    let result = match commit {
+        Ok(()) if is_autocommit => Ok(()),
+        Ok(()) => Err(GenericProjectError::TransactionOutcomeUnknown {
+            operation: commit_operation,
+            primary: None,
+            finalization: GenericTransactionFinalizationFailure::InvalidState {
+                detail: "COMMIT 返回成功后 Generic SQLite 连接仍处于事务中",
+            },
+        }),
+        Err(source) if is_autocommit => Err(GenericProjectError::TransactionOutcomeUnknown {
+            operation: commit_operation,
+            primary: Some(Box::new(GenericProjectError::Sqlite {
+                operation: commit_operation,
+                source,
+            })),
+            finalization: GenericTransactionFinalizationFailure::InvalidState {
+                detail: "COMMIT 返回错误后连接已经进入 autocommit，无法确认提交结果",
+            },
+        }),
+        Err(source) => {
+            let rollback = transaction.execute_batch("ROLLBACK");
+            let rollback_autocommit = transaction.is_autocommit();
+            match rollback {
+                Ok(()) if rollback_autocommit => {
+                    Err(GenericProjectError::TransactionNotCommitted {
+                        operation: commit_operation,
+                        source,
+                    })
+                }
+                Ok(()) => Err(GenericProjectError::TransactionOutcomeUnknown {
+                    operation: commit_operation,
+                    primary: Some(Box::new(GenericProjectError::Sqlite {
+                        operation: commit_operation,
+                        source,
+                    })),
+                    finalization: GenericTransactionFinalizationFailure::InvalidState {
+                        detail: "COMMIT 失败后的 ROLLBACK 返回成功，但连接仍处于事务中",
+                    },
+                }),
+                Err(rollback) => Err(GenericProjectError::TransactionOutcomeUnknown {
+                    operation: commit_operation,
+                    primary: Some(Box::new(GenericProjectError::Sqlite {
+                        operation: commit_operation,
+                        source,
+                    })),
+                    finalization: GenericTransactionFinalizationFailure::Sqlite {
+                        operation: rollback_operation,
+                        source: rollback,
+                    },
+                }),
+            }
+        }
+    };
+    drop(suspension);
+    result
 }
 
 /// Generic 项目行为失败。
 #[derive(Debug)]
 pub(crate) enum GenericProjectError {
+    Cancelled,
     MissingInitialField(&'static str),
     WorkspaceNotDirectory {
         path: PathBuf,
@@ -1106,9 +1668,22 @@ pub(crate) enum GenericProjectError {
         path: PathBuf,
         source: io::Error,
     },
+    WorkerStart {
+        operation: &'static str,
+        source: io::Error,
+    },
     Sqlite {
         operation: &'static str,
         source: rusqlite::Error,
+    },
+    TransactionNotCommitted {
+        operation: &'static str,
+        source: rusqlite::Error,
+    },
+    TransactionOutcomeUnknown {
+        operation: &'static str,
+        primary: Option<Box<GenericProjectError>>,
+        finalization: GenericTransactionFinalizationFailure,
     },
     InitialCandidateCleanup {
         original: Box<GenericProjectError>,
@@ -1149,6 +1724,7 @@ pub(crate) enum GenericProjectError {
 impl fmt::Display for GenericProjectError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled => formatter.write_str("Generic 项目操作已取消"),
             Self::MissingInitialField(field) => {
                 write!(formatter, "首次 Generic Init 必须提供 --{field}")
             }
@@ -1183,7 +1759,25 @@ impl fmt::Display for GenericProjectError {
                 path,
                 source,
             } => write!(formatter, "{operation}失败：{}（{source}）", path.display()),
+            Self::WorkerStart { operation, source } => {
+                write!(formatter, "{operation}无法启动 worker：{source}")
+            }
             Self::Sqlite { operation, source } => write!(formatter, "{operation}失败：{source}"),
+            Self::TransactionNotCommitted { operation, source } => write!(
+                formatter,
+                "{operation}失败，事务已确认回滚且未提交：{source}"
+            ),
+            Self::TransactionOutcomeUnknown {
+                operation,
+                primary,
+                finalization,
+            } => {
+                write!(formatter, "{operation}后事务结果未知")?;
+                if let Some(primary) = primary {
+                    write!(formatter, "；主失败：{primary}")?;
+                }
+                write!(formatter, "；终态确认失败：{finalization}")
+            }
             Self::InitialCandidateCleanup {
                 original,
                 path,
@@ -1235,12 +1829,24 @@ impl fmt::Display for GenericProjectError {
 impl Error for GenericProjectError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Io { source, .. } => Some(source),
-            Self::Sqlite { source, .. } => Some(source),
+            Self::Io { source, .. } | Self::WorkerStart { source, .. } => Some(source),
+            Self::Sqlite { source, .. } | Self::TransactionNotCommitted { source, .. } => {
+                Some(source)
+            }
+            Self::TransactionOutcomeUnknown {
+                primary: Some(primary),
+                ..
+            } => Some(primary.as_ref()),
+            Self::TransactionOutcomeUnknown {
+                primary: None,
+                finalization,
+                ..
+            } => finalization.source(),
             Self::InitialCandidateCleanup { original, .. } => Some(original.as_ref()),
             Self::InvalidLanguage(source) => Some(source),
             Self::Jsonl(source) => Some(source),
-            Self::MissingInitialField(_)
+            Self::Cancelled
+            | Self::MissingInitialField(_)
             | Self::WorkspaceNotDirectory { .. }
             | Self::SourceNotDirectory { .. }
             | Self::SourceWriteBackOverlap { .. }
@@ -1261,6 +1867,459 @@ impl Error for GenericProjectError {
     }
 }
 
+impl SafeDiagnosticSource for GenericProjectError {
+    fn safe_diagnostic_source(
+        &self,
+        stage: DiagnosticStage,
+        impact: DiagnosticImpact,
+        fallback_action: DiagnosticAction,
+    ) -> SafeDiagnostic {
+        match self {
+            Self::Cancelled => project_failure(
+                stage,
+                "generic_project_operation",
+                DiagnosticFailureKind::LockCancelled,
+                impact,
+                DiagnosticAction::Retry,
+            ),
+            Self::MissingInitialField(field) => SafeDiagnostic::new(
+                DiagnosticCode::CommandInput,
+                stage,
+                DiagnosticSubject::field(field),
+                DiagnosticReason::failure(DiagnosticFailureKind::MissingRequiredValue),
+                impact,
+                DiagnosticAction::FixInput,
+            ),
+            Self::WorkspaceNotDirectory { path } | Self::SourceNotDirectory { path } => {
+                SafeDiagnostic::new(
+                    DiagnosticCode::CommandInput,
+                    stage,
+                    DiagnosticSubject::path(path),
+                    DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
+                    impact,
+                    DiagnosticAction::FixInput,
+                )
+            }
+            Self::SourceWriteBackOverlap {
+                source_root,
+                write_back_root,
+            } => SafeDiagnostic::new(
+                DiagnosticCode::CommandInput,
+                stage,
+                DiagnosticSubject::path(source_root),
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::ConflictingValues,
+                    "generic_source_and_write_back_overlap",
+                ),
+                impact,
+                DiagnosticAction::FixInput,
+            )
+            .with_recovery(RecoveryFact::path(write_back_root)),
+            Self::ProjectNotFound { path } => SafeDiagnostic::new(
+                DiagnosticCode::ProjectUnavailable,
+                stage,
+                DiagnosticSubject::path(path),
+                DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
+                impact,
+                DiagnosticAction::CheckPathAndPermissions,
+            ),
+            Self::ProjectIdentityMismatch { expected, observed } => SafeDiagnostic::new(
+                DiagnosticCode::ProjectState,
+                stage,
+                DiagnosticSubject::Project {
+                    name: observed.clone(),
+                },
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::StateMismatch,
+                    format!("expected_project={expected}; observed_project={observed}"),
+                ),
+                impact,
+                DiagnosticAction::CheckProjectState,
+            ),
+            Self::Io {
+                operation,
+                path,
+                source,
+            } => SafeDiagnostic::io(
+                DiagnosticCode::FileSystemOperation,
+                stage,
+                DiagnosticSubject::path(path),
+                *operation,
+                source,
+                impact,
+                DiagnosticAction::CheckPathAndPermissions,
+            ),
+            Self::WorkerStart { operation, source } => SafeDiagnostic::io(
+                DiagnosticCode::InternalOperation,
+                stage,
+                DiagnosticSubject::operation(operation),
+                "spawn_worker",
+                source,
+                impact,
+                DiagnosticAction::ReportBug,
+            ),
+            Self::Sqlite { operation, source } => {
+                sqlite_project_diagnostic(operation, source, stage, impact, fallback_action)
+            }
+            Self::TransactionNotCommitted { operation, source } => sqlite_project_diagnostic(
+                operation,
+                source,
+                stage,
+                DiagnosticImpact::Unchanged,
+                fallback_action,
+            )
+            .with_recovery(RecoveryFact::transaction("rolled_back")),
+            Self::TransactionOutcomeUnknown {
+                operation,
+                primary,
+                finalization,
+            } => transaction_outcome_unknown_diagnostic(
+                operation,
+                primary.as_deref(),
+                finalization,
+                stage,
+            ),
+            Self::InitialCandidateCleanup {
+                original,
+                path,
+                cleanup,
+            } => SafeDiagnostic::io(
+                DiagnosticCode::FileSystemOperation,
+                stage,
+                DiagnosticSubject::path(path),
+                "cleanup_generic_initial_database_candidate",
+                cleanup,
+                DiagnosticImpact::RecoveryRequired,
+                DiagnosticAction::PreserveRecoveryArtifacts,
+            )
+            .with_recovery(RecoveryFact::component(format!(
+                "primary_failure={}",
+                original
+                    .safe_diagnostic_source(stage, impact, fallback_action)
+                    .code
+            ))),
+            Self::InvalidDatabase { detail } => project_failure_with_detail(
+                stage,
+                "generic_project_database",
+                DiagnosticFailureKind::InvalidValue,
+                detail,
+                impact,
+                DiagnosticAction::CheckProjectState,
+            ),
+            Self::InvalidLanguage(source) => project_failure_with_detail(
+                stage,
+                "generic_language",
+                DiagnosticFailureKind::InvalidValue,
+                language_error_detail(source),
+                impact,
+                DiagnosticAction::FixInput,
+            ),
+            Self::SameSourceAndTargetLanguage { language } => project_failure_with_detail(
+                stage,
+                "generic_language_pair",
+                DiagnosticFailureKind::ConflictingValues,
+                format!("source_language_equals_target_language={language}"),
+                impact,
+                DiagnosticAction::FixInput,
+            ),
+            Self::Jsonl(source) => source.safe_diagnostic_source(stage, impact, fallback_action),
+            Self::InputChangedDuringExtract => project_failure(
+                stage,
+                "generic_input",
+                DiagnosticFailureKind::StateMismatch,
+                impact,
+                DiagnosticAction::Retry,
+            ),
+            Self::ExtractRequired => project_failure(
+                stage,
+                "generic_extract",
+                DiagnosticFailureKind::GenericExtractRequired,
+                impact,
+                DiagnosticAction::CheckProjectState,
+            ),
+            Self::TranslationSnapshotChanged => project_failure(
+                stage,
+                "generic_translation_snapshot",
+                DiagnosticFailureKind::StateMismatch,
+                impact,
+                DiagnosticAction::Retry,
+            ),
+            Self::InvalidTranslation(detail) => project_failure_with_detail(
+                stage,
+                "generic_translation",
+                DiagnosticFailureKind::InvalidValue,
+                detail,
+                impact,
+                DiagnosticAction::FixInput,
+            ),
+            Self::DuplicateTranslationWrite { group_id, unit_id } => project_failure_with_detail(
+                stage,
+                "generic_translation_write",
+                DiagnosticFailureKind::ConflictingValues,
+                format!("group_id={group_id}; unit_id={unit_id}"),
+                impact,
+                DiagnosticAction::FixInput,
+            ),
+            Self::DuplicateTranslationClear { group_id, unit_id } => project_failure_with_detail(
+                stage,
+                "generic_translation_clear",
+                DiagnosticFailureKind::ConflictingValues,
+                format!("group_id={group_id}; unit_id={unit_id}"),
+                impact,
+                DiagnosticAction::FixInput,
+            ),
+            Self::BlankProfileId => project_failure(
+                stage,
+                "generic_profile_id",
+                DiagnosticFailureKind::InvalidValue,
+                impact,
+                DiagnosticAction::FixInput,
+            ),
+            Self::InvalidResource { kind, detail } => project_failure_with_detail(
+                stage,
+                format!("generic_resource_{kind}"),
+                DiagnosticFailureKind::InvalidValue,
+                detail,
+                impact,
+                DiagnosticAction::FixInput,
+            ),
+            Self::UnitNotFound { group_id, unit_id } => project_failure_with_detail(
+                stage,
+                "generic_unit",
+                DiagnosticFailureKind::NotFound,
+                format!("group_id={group_id}; unit_id={unit_id}"),
+                impact,
+                DiagnosticAction::CheckProjectState,
+            ),
+        }
+    }
+}
+
+fn project_failure(
+    stage: DiagnosticStage,
+    operation: impl AsRef<str>,
+    failure: DiagnosticFailureKind,
+    impact: DiagnosticImpact,
+    action: DiagnosticAction,
+) -> SafeDiagnostic {
+    SafeDiagnostic::new(
+        DiagnosticCode::ProjectState,
+        stage,
+        DiagnosticSubject::operation(operation),
+        DiagnosticReason::failure(failure),
+        impact,
+        action,
+    )
+}
+
+fn project_failure_with_detail(
+    stage: DiagnosticStage,
+    operation: impl AsRef<str>,
+    failure: DiagnosticFailureKind,
+    detail: impl AsRef<str>,
+    impact: DiagnosticImpact,
+    action: DiagnosticAction,
+) -> SafeDiagnostic {
+    SafeDiagnostic::new(
+        DiagnosticCode::ProjectState,
+        stage,
+        DiagnosticSubject::operation(operation),
+        DiagnosticReason::failure_with_detail(failure, detail),
+        impact,
+        action,
+    )
+}
+
+fn sqlite_project_diagnostic(
+    operation: &'static str,
+    source: &rusqlite::Error,
+    stage: DiagnosticStage,
+    impact: DiagnosticImpact,
+    fallback_action: DiagnosticAction,
+) -> SafeDiagnostic {
+    let (reason, action) = source.sqlite_error().map_or_else(
+        || {
+            (
+                DiagnosticReason::failure(DiagnosticFailureKind::InvalidValue),
+                fallback_action,
+            )
+        },
+        |error| {
+            let extended_code = error.extended_code;
+            let primary_code = extended_code & 0xff;
+            let action = if sqlite_error_is_busy(source) {
+                DiagnosticAction::RetryAfterResolvingContention
+            } else {
+                fallback_action
+            };
+            (
+                DiagnosticReason::Sqlite {
+                    primary_code,
+                    extended_code,
+                },
+                action,
+            )
+        },
+    );
+    SafeDiagnostic::new(
+        DiagnosticCode::SqliteOperation,
+        stage,
+        DiagnosticSubject::operation(operation),
+        reason,
+        impact,
+        action,
+    )
+}
+
+fn transaction_outcome_unknown_diagnostic(
+    operation: &'static str,
+    primary: Option<&GenericProjectError>,
+    finalization: &GenericTransactionFinalizationFailure,
+    stage: DiagnosticStage,
+) -> SafeDiagnostic {
+    let finalization_diagnostic = match finalization {
+        GenericTransactionFinalizationFailure::Sqlite { operation, source } => {
+            sqlite_project_diagnostic(
+                operation,
+                source,
+                stage,
+                DiagnosticImpact::OutcomeUnknown,
+                DiagnosticAction::PreserveRecoveryArtifacts,
+            )
+        }
+        GenericTransactionFinalizationFailure::InvalidState { detail } => {
+            project_failure_with_detail(
+                stage,
+                operation,
+                DiagnosticFailureKind::TransactionOutcomeUnknown,
+                detail,
+                DiagnosticImpact::OutcomeUnknown,
+                DiagnosticAction::PreserveRecoveryArtifacts,
+            )
+        }
+    };
+    let mut diagnostic = SafeDiagnostic::new(
+        DiagnosticCode::OperationOutcomeUnknown,
+        stage,
+        DiagnosticSubject::operation(operation),
+        finalization_diagnostic.reason,
+        DiagnosticImpact::OutcomeUnknown,
+        DiagnosticAction::PreserveRecoveryArtifacts,
+    )
+    .with_recovery(RecoveryFact::transaction("outcome_unknown"));
+
+    if let GenericTransactionFinalizationFailure::Sqlite {
+        operation: finalization_operation,
+        ..
+    } = finalization
+    {
+        diagnostic = diagnostic.with_recovery(RecoveryFact::component(format!(
+            "finalization_operation={finalization_operation}"
+        )));
+    }
+    if let Some(primary) = primary {
+        let primary = primary.safe_diagnostic_source(
+            stage,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::Retry,
+        );
+        diagnostic = diagnostic.with_recovery(RecoveryFact::component(format!(
+            "primary_code={}",
+            primary.code.as_str()
+        )));
+        if let DiagnosticReason::Sqlite {
+            primary_code,
+            extended_code,
+        } = primary.reason
+        {
+            diagnostic = diagnostic.with_recovery(RecoveryFact::component(format!(
+                "primary_sqlite={primary_code}/{extended_code}"
+            )));
+        }
+    }
+    diagnostic
+}
+
+fn language_error_detail(source: &LanguageIdError) -> &'static str {
+    match source {
+        LanguageIdError::Blank => "language_id_blank",
+        LanguageIdError::SurroundingWhitespace { .. } => "language_id_surrounding_whitespace",
+        LanguageIdError::Underscore { .. } => "language_id_uses_underscore",
+        LanguageIdError::InvalidSyntax { .. } => "language_id_invalid_syntax",
+        LanguageIdError::InvalidRegistryTag { .. } => "language_id_invalid_registry_tag",
+        LanguageIdError::CanonicalizationFailed { .. } => "language_id_canonicalization_failed",
+        LanguageIdError::UndefinedPrimaryLanguage { .. } => {
+            "language_id_undefined_primary_language"
+        }
+    }
+}
+
+impl GenericProjectError {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
+            || matches!(self, Self::Jsonl(source) if source.is_cancelled())
+    }
+
+    fn is_sqlite_cancellation_without_cleanup_failure(&self) -> bool {
+        match self {
+            Self::Sqlite { source, .. } => {
+                sqlite_error_is_busy(source) || sqlite_error_is_interrupted(source)
+            }
+            Self::Jsonl(source) => source.is_cancelled(),
+            Self::Cancelled => true,
+            Self::InitialCandidateCleanup { .. }
+            | Self::MissingInitialField(_)
+            | Self::WorkspaceNotDirectory { .. }
+            | Self::SourceNotDirectory { .. }
+            | Self::SourceWriteBackOverlap { .. }
+            | Self::ProjectNotFound { .. }
+            | Self::ProjectIdentityMismatch { .. }
+            | Self::Io { .. }
+            | Self::WorkerStart { .. }
+            | Self::TransactionNotCommitted { .. }
+            | Self::TransactionOutcomeUnknown { .. }
+            | Self::InvalidDatabase { .. }
+            | Self::InvalidLanguage(_)
+            | Self::SameSourceAndTargetLanguage { .. }
+            | Self::InputChangedDuringExtract
+            | Self::ExtractRequired
+            | Self::TranslationSnapshotChanged
+            | Self::InvalidTranslation(_)
+            | Self::DuplicateTranslationWrite { .. }
+            | Self::DuplicateTranslationClear { .. }
+            | Self::BlankProfileId
+            | Self::InvalidResource { .. }
+            | Self::UnitNotFound { .. } => false,
+        }
+    }
+}
+
+fn sqlite_error_is_busy(source: &rusqlite::Error) -> bool {
+    matches!(
+        source.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
+fn sqlite_error_is_interrupted(source: &rusqlite::Error) -> bool {
+    matches!(
+        source.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::OperationInterrupted)
+    )
+}
+
+fn cancellable_sqlite_error(
+    operation: &'static str,
+    source: rusqlite::Error,
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> GenericProjectError {
+    if cancellation.is_requested() || sqlite_error_is_interrupted(&source) {
+        GenericProjectError::Cancelled
+    } else {
+        GenericProjectError::Sqlite { operation, source }
+    }
+}
+
 impl From<GenericJsonlError> for GenericProjectError {
     fn from(source: GenericJsonlError) -> Self {
         Self::Jsonl(source)
@@ -1273,6 +2332,81 @@ impl From<LanguageIdError> for GenericProjectError {
     }
 }
 
+struct GenericProjectRow {
+    project_name: String,
+    source_root: Vec<u8>,
+    source_language: String,
+    target_language: String,
+    extracted_raw_fingerprint: Option<Vec<u8>>,
+    extracted_asset_fingerprint: Option<Vec<u8>>,
+    last_profile_id: Option<String>,
+}
+
+fn load_generic_project_row_with_cancellation(
+    connection: &Connection,
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> Result<GenericProjectRow, GenericProjectError> {
+    const OPERATION: &str = "读取 Generic 项目记录";
+
+    cancellation.ensure_running()?;
+    let mut statement = connection
+        .prepare(
+            "SELECT project_name, source_root, source_language, target_language,
+                    extracted_raw_fingerprint, extracted_asset_fingerprint, last_profile_id
+             FROM main.generic_project WHERE singleton = 1",
+        )
+        .map_err(|source| cancellable_sqlite_error(OPERATION, source, cancellation))?;
+    let mut rows = statement
+        .query([])
+        .map_err(|source| cancellable_sqlite_error(OPERATION, source, cancellation))?;
+    let Some(row) = rows
+        .next()
+        .map_err(|source| cancellable_sqlite_error(OPERATION, source, cancellation))?
+    else {
+        return Err(GenericProjectError::InvalidDatabase {
+            detail: "缺少 generic_project 单例记录".to_owned(),
+        });
+    };
+    let project = GenericProjectRow {
+        project_name: clone_sqlite_text_column_with_cancellation(row, 0, OPERATION, cancellation)?,
+        source_root: clone_sqlite_blob_column_with_cancellation(row, 1, OPERATION, cancellation)?,
+        source_language: clone_sqlite_text_column_with_cancellation(
+            row,
+            2,
+            OPERATION,
+            cancellation,
+        )?,
+        target_language: clone_sqlite_text_column_with_cancellation(
+            row,
+            3,
+            OPERATION,
+            cancellation,
+        )?,
+        extracted_raw_fingerprint: clone_optional_sqlite_blob_column_with_cancellation(
+            row,
+            4,
+            OPERATION,
+            cancellation,
+        )?,
+        extracted_asset_fingerprint: clone_optional_sqlite_blob_column_with_cancellation(
+            row,
+            5,
+            OPERATION,
+            cancellation,
+        )?,
+        last_profile_id: clone_optional_sqlite_text_column_with_cancellation(
+            row,
+            6,
+            OPERATION,
+            cancellation,
+        )?,
+    };
+    drop(rows);
+    drop(statement);
+    cancellation.ensure_running()?;
+    Ok(project)
+}
+
 struct ReconciledSnapshot {
     files: Vec<GenericStoredFile>,
     preserved_translations: usize,
@@ -1280,243 +2414,619 @@ struct ReconciledSnapshot {
 }
 
 /// 在 Lua 已打开的同一项目事务内，从当前项目资源重建人工译文状态。
+#[cfg(test)]
 pub(crate) fn manual_translation_state_for_connection(
     connection: &Connection,
     group_id: &str,
     unit_id: &str,
 ) -> Result<Sha256Fingerprint, GenericProjectError> {
-    let (source_language, target_language): (String, String) = connection
-        .query_row(
-            "SELECT source_language, target_language
-             FROM main.generic_project WHERE singleton = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|source| GenericProjectError::Sqlite {
-            operation: "读取 Generic Lua 语言事实",
-            source,
-        })?;
-    let language_pair = LanguagePair::new(
-        LanguageId::parse(&source_language)?,
-        LanguageId::parse(&target_language)?,
-    );
-    let row: Option<(String, Vec<u8>, String)> = connection
-        .query_row(
-            "SELECT generic_group.kind, generic_group.context_fingerprint,
-                    generic_unit.source_text
-             FROM main.generic_unit AS generic_unit
-             JOIN main.generic_group AS generic_group USING (group_id)
-             WHERE generic_unit.group_id = ?1 AND generic_unit.unit_id = ?2",
-            params![group_id, unit_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()
-        .map_err(|source| GenericProjectError::Sqlite {
-            operation: "读取 Generic Lua Unit",
-            source,
-        })?;
-    let Some((kind, context, source_text)) = row else {
-        return Err(GenericProjectError::UnitNotFound {
-            group_id: group_id.to_owned(),
-            unit_id: unit_id.to_owned(),
-        });
-    };
-    let placeholder_json: String = connection
-        .query_row(
-            "SELECT canonical_json FROM main.translation_resource
-             WHERE resource_kind = 'placeholder_rules'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|source| GenericProjectError::Sqlite {
-            operation: "读取 Generic Lua Placeholder 资源",
-            source,
-        })?;
-    let binding = placeholder_binding_fingerprint(&placeholder_json, &kind, &source_text).map_err(
-        |source| GenericProjectError::InvalidResource {
-            kind: PLACEHOLDER_RULES_RESOURCE,
-            detail: source.to_string(),
-        },
-    )?;
-    Ok(manual_translation_state_fingerprint(
-        &language_pair,
-        &GenericUnitKey::new(group_id.to_owned(), unit_id.to_owned()),
-        &source_text,
-        read_fingerprint(context, "context_fingerprint")?,
-        binding,
-    ))
+    manual_translation_state_for_connection_with_cancellation(
+        connection,
+        group_id,
+        unit_id,
+        &CooperativeCancellation::default(),
+    )
 }
 
-/// 在同一事务内校验人工译文的 Placeholder，并建立它的 Current 状态。
-pub(crate) fn validated_manual_translation_state_for_connection(
+#[cfg(test)]
+pub(crate) fn manual_translation_state_for_connection_with_cancellation(
+    connection: &Connection,
+    group_id: &str,
+    unit_id: &str,
+    cancellation: &CooperativeCancellation,
+) -> Result<Sha256Fingerprint, GenericProjectError> {
+    let facts = load_manual_translation_state_facts(connection, group_id, unit_id, cancellation)?;
+    let placeholder = compiled_placeholder_resource_for_connection_with_cancellation(
+        connection,
+        None,
+        cancellation,
+    )?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
+    let binding = placeholder
+        .service()
+        .protect(&facts.kind, &facts.source_text, placeholder.compiled())
+        .map_err(placeholder_resource_error)?
+        .binding_fingerprint();
+    ensure_generic_operation_not_cancelled(cancellation)?;
+    manual_translation_state_from_facts(&facts, group_id, unit_id, binding, cancellation)
+}
+
+pub(crate) fn validated_manual_translation_state_with_compiled_rules_for_connection_with_cancellation(
     connection: &Connection,
     group_id: &str,
     unit_id: &str,
     translation: &str,
+    service: &GenericPlaceholderService,
+    compiled: &GenericCompiledPlaceholderRules,
+    cancellation: &CooperativeCancellation,
 ) -> Result<Sha256Fingerprint, GenericProjectError> {
-    let (kind, source_text, placeholder_json): (String, String, String) = connection
-        .query_row(
-            "SELECT generic_group.kind, generic_unit.source_text,
-                    translation_resource.canonical_json
+    let facts = load_manual_translation_state_facts(connection, group_id, unit_id, cancellation)?;
+    let binding = validate_translation_placeholders_and_binding_with_cancellation(
+        service,
+        compiled,
+        &facts.kind,
+        &facts.source_text,
+        translation,
+        || ensure_generic_operation_not_cancelled(cancellation),
+    )?
+    .map_err(manual_translation_placeholder_error)?;
+    manual_translation_state_from_facts(&facts, group_id, unit_id, binding, cancellation)
+}
+
+struct ManualTranslationStateFacts {
+    language_pair: LanguagePair,
+    kind: String,
+    context: Sha256Fingerprint,
+    source_text: String,
+}
+
+fn load_manual_translation_state_facts(
+    connection: &Connection,
+    group_id: &str,
+    unit_id: &str,
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> Result<ManualTranslationStateFacts, GenericProjectError> {
+    const OPERATION: &str = "读取 Generic Lua 人工译文状态事实";
+
+    cancellation.ensure_running()?;
+    let mut statement = connection
+        .prepare(
+            "SELECT generic_project.source_language, generic_project.target_language,
+                    generic_group.kind, generic_group.context_fingerprint,
+                    generic_unit.source_text
              FROM main.generic_unit AS generic_unit
              JOIN main.generic_group AS generic_group USING (group_id)
-             JOIN main.translation_resource AS translation_resource
-               ON translation_resource.resource_kind = 'placeholder_rules'
+             JOIN main.generic_project AS generic_project
+               ON generic_project.singleton = 1
              WHERE generic_unit.group_id = ?1 AND generic_unit.unit_id = ?2",
-            params![group_id, unit_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .optional()
-        .map_err(|source| GenericProjectError::Sqlite {
-            operation: "读取 Generic Lua Placeholder 事实",
-            source,
-        })?
-        .ok_or_else(|| GenericProjectError::UnitNotFound {
-            group_id: group_id.to_owned(),
-            unit_id: unit_id.to_owned(),
-        })?;
-    validate_manual_translation_placeholders(&placeholder_json, &kind, &source_text, translation)
-        .map_err(|source| GenericProjectError::InvalidTranslation(source.to_string()))?;
-    manual_translation_state_for_connection(connection, group_id, unit_id)
+        .map_err(|source| cancellable_sqlite_error(OPERATION, source, cancellation))?;
+    let mut rows = statement
+        .query(params![group_id, unit_id])
+        .map_err(|source| cancellable_sqlite_error(OPERATION, source, cancellation))?;
+    let Some(row) = rows
+        .next()
+        .map_err(|source| cancellable_sqlite_error(OPERATION, source, cancellation))?
+    else {
+        return Err(GenericProjectError::UnitNotFound {
+            group_id: clone_text_with_cancellation(group_id, cancellation)?,
+            unit_id: clone_text_with_cancellation(unit_id, cancellation)?,
+        });
+    };
+    let source_language =
+        clone_sqlite_text_column_with_cancellation(row, 0, OPERATION, cancellation)?;
+    let target_language =
+        clone_sqlite_text_column_with_cancellation(row, 1, OPERATION, cancellation)?;
+    let kind = clone_sqlite_text_column_with_cancellation(row, 2, OPERATION, cancellation)?;
+    let context = clone_sqlite_blob_column_with_cancellation(row, 3, OPERATION, cancellation)?;
+    let source_text = clone_sqlite_text_column_with_cancellation(row, 4, OPERATION, cancellation)?;
+    drop(rows);
+    drop(statement);
+    cancellation.ensure_running()?;
+    let language_pair = LanguagePair::new(
+        LanguageId::parse(&source_language)?,
+        LanguageId::parse(&target_language)?,
+    );
+    cancellation.ensure_running()?;
+    Ok(ManualTranslationStateFacts {
+        language_pair,
+        kind,
+        context: read_fingerprint(context, "context_fingerprint")?,
+        source_text,
+    })
+}
+
+fn clone_sqlite_text_column_with_cancellation(
+    row: &Row<'_>,
+    index: usize,
+    operation: &'static str,
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> Result<String, GenericProjectError> {
+    let value = row
+        .get_ref(index)
+        .map_err(|source| GenericProjectError::Sqlite { operation, source })?;
+    let bytes = match value {
+        ValueRef::Text(bytes) => bytes,
+        value => {
+            return Err(GenericProjectError::Sqlite {
+                operation,
+                source: invalid_sqlite_column_type(row, index, value),
+            });
+        }
+    };
+    clone_sqlite_text_value_with_cancellation(bytes, index, operation, cancellation)
+}
+
+fn clone_optional_sqlite_text_column_with_cancellation(
+    row: &Row<'_>,
+    index: usize,
+    operation: &'static str,
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> Result<Option<String>, GenericProjectError> {
+    let value = row
+        .get_ref(index)
+        .map_err(|source| GenericProjectError::Sqlite { operation, source })?;
+    match value {
+        ValueRef::Null => Ok(None),
+        ValueRef::Text(bytes) => {
+            clone_sqlite_text_value_with_cancellation(bytes, index, operation, cancellation)
+                .map(Some)
+        }
+        value => Err(GenericProjectError::Sqlite {
+            operation,
+            source: invalid_sqlite_column_type(row, index, value),
+        }),
+    }
+}
+
+fn clone_sqlite_text_value_with_cancellation(
+    bytes: &[u8],
+    index: usize,
+    operation: &'static str,
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> Result<String, GenericProjectError> {
+    let bytes = clone_sqlite_bytes_with_cancellation(bytes, cancellation)?;
+    validate_sqlite_utf8_with_cancellation(&bytes, index, operation, cancellation)?;
+    // SAFETY: `validate_sqlite_utf8_with_cancellation` 已经分块覆盖整份字节串；跨块
+    // 不完整码点会从码点起始位置在下一块重新校验。
+    Ok(unsafe { String::from_utf8_unchecked(bytes) })
+}
+
+fn clone_sqlite_blob_column_with_cancellation(
+    row: &Row<'_>,
+    index: usize,
+    operation: &'static str,
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> Result<Vec<u8>, GenericProjectError> {
+    let value = row
+        .get_ref(index)
+        .map_err(|source| GenericProjectError::Sqlite { operation, source })?;
+    match value {
+        ValueRef::Blob(bytes) => clone_sqlite_bytes_with_cancellation(bytes, cancellation),
+        value => Err(GenericProjectError::Sqlite {
+            operation,
+            source: invalid_sqlite_column_type(row, index, value),
+        }),
+    }
+}
+
+fn clone_optional_sqlite_blob_column_with_cancellation(
+    row: &Row<'_>,
+    index: usize,
+    operation: &'static str,
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> Result<Option<Vec<u8>>, GenericProjectError> {
+    let value = row
+        .get_ref(index)
+        .map_err(|source| GenericProjectError::Sqlite { operation, source })?;
+    match value {
+        ValueRef::Null => Ok(None),
+        ValueRef::Blob(bytes) => {
+            clone_sqlite_bytes_with_cancellation(bytes, cancellation).map(Some)
+        }
+        value => Err(GenericProjectError::Sqlite {
+            operation,
+            source: invalid_sqlite_column_type(row, index, value),
+        }),
+    }
+}
+
+fn invalid_sqlite_column_type(row: &Row<'_>, index: usize, value: ValueRef<'_>) -> rusqlite::Error {
+    let column_name = row
+        .as_ref()
+        .column_name(index)
+        .expect("已由 get_ref 确认 SQLite 列序号有效")
+        .to_owned();
+    rusqlite::Error::InvalidColumnType(index, column_name, value.data_type())
+}
+
+fn clone_sqlite_bytes_with_cancellation(
+    bytes: &[u8],
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> Result<Vec<u8>, GenericProjectError> {
+    cancellation.ensure_running()?;
+    let mut cloned = Vec::with_capacity(bytes.len());
+    for chunk in bytes.chunks(RESOURCE_CANCELLATION_CHECK_BYTES) {
+        cancellation.ensure_running()?;
+        cloned.extend_from_slice(chunk);
+    }
+    cancellation.ensure_running()?;
+    Ok(cloned)
+}
+
+fn append_text_with_cancellation(
+    output: &mut String,
+    text: &str,
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> Result<(), GenericProjectError> {
+    cancellation.ensure_running()?;
+    let mut start = 0_usize;
+    while start < text.len() {
+        cancellation.ensure_running()?;
+        let mut end = start
+            .saturating_add(RESOURCE_CANCELLATION_CHECK_BYTES)
+            .min(text.len());
+        while end < text.len() && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        output.push_str(&text[start..end]);
+        start = end;
+    }
+    cancellation.ensure_running()
+}
+
+fn validate_sqlite_utf8_with_cancellation(
+    bytes: &[u8],
+    index: usize,
+    operation: &'static str,
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> Result<(), GenericProjectError> {
+    match validate_utf8_bytes_with_cancellation(bytes, cancellation)? {
+        Ok(()) => Ok(()),
+        Err(source) => Err(invalid_sqlite_utf8_error(
+            index,
+            operation,
+            source.valid_up_to,
+            source.error_len,
+        )),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InvalidUtf8Facts {
+    valid_up_to: usize,
+    error_len: Option<usize>,
+}
+
+fn validate_utf8_bytes_with_cancellation(
+    bytes: &[u8],
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> Result<Result<(), InvalidUtf8Facts>, GenericProjectError> {
+    let mut start = 0_usize;
+    while start < bytes.len() {
+        cancellation.ensure_running()?;
+        let end = start
+            .saturating_add(RESOURCE_CANCELLATION_CHECK_BYTES)
+            .min(bytes.len());
+        match std::str::from_utf8(&bytes[start..end]) {
+            Ok(_) => start = end,
+            Err(source) => {
+                let valid_end = start.saturating_add(source.valid_up_to());
+                match source.error_len() {
+                    Some(error_len) => {
+                        cancellation.ensure_running()?;
+                        return Ok(Err(InvalidUtf8Facts {
+                            valid_up_to: valid_end,
+                            error_len: Some(error_len),
+                        }));
+                    }
+                    None if end == bytes.len() => {
+                        cancellation.ensure_running()?;
+                        return Ok(Err(InvalidUtf8Facts {
+                            valid_up_to: valid_end,
+                            error_len: None,
+                        }));
+                    }
+                    None => {
+                        debug_assert!(valid_end > start, "不完整 UTF-8 序列只能位于非空分块的末尾");
+                        start = valid_end;
+                    }
+                }
+            }
+        }
+    }
+    cancellation.ensure_running()?;
+    Ok(Ok(()))
+}
+
+fn invalid_sqlite_utf8_error(
+    index: usize,
+    operation: &'static str,
+    valid_up_to: usize,
+    error_len: Option<usize>,
+) -> GenericProjectError {
+    GenericProjectError::InvalidDatabase {
+        detail: format!(
+            "{operation}时 SQLite TEXT 第 {index} 列不是有效 UTF-8：valid_up_to={valid_up_to}; error_len={}",
+            error_len.map_or_else(|| "none".to_owned(), |length| length.to_string())
+        ),
+    }
+}
+
+fn manual_translation_state_from_facts(
+    facts: &ManualTranslationStateFacts,
+    group_id: &str,
+    unit_id: &str,
+    binding: Sha256Fingerprint,
+    cancellation: &CooperativeCancellation,
+) -> Result<Sha256Fingerprint, GenericProjectError> {
+    let key = GenericUnitKey::new(
+        clone_text_with_cancellation(group_id, cancellation)?,
+        clone_text_with_cancellation(unit_id, cancellation)?,
+    );
+    manual_translation_state_fingerprint_with_cancellation(
+        &facts.language_pair,
+        &key,
+        &facts.source_text,
+        facts.context,
+        binding,
+        cancellation,
+    )
+    .map_err(|source| {
+        if source.is_cancelled() {
+            GenericProjectError::Cancelled
+        } else {
+            GenericProjectError::InvalidDatabase {
+                detail: format!("建立 Generic 人工译文状态失败：{source}"),
+            }
+        }
+    })
 }
 
 fn reconcile_snapshot(
     previous: &GenericStoredSnapshot,
     scanned: &GenericInputSnapshot,
-) -> ReconciledSnapshot {
-    let previous_groups = previous
-        .files
-        .iter()
-        .flat_map(|file| &file.groups)
-        .map(|group| (group.id.as_str(), group))
-        .collect::<HashMap<_, _>>();
-    let previous_translation_count = previous
-        .files
-        .iter()
-        .flat_map(|file| &file.groups)
-        .flat_map(|group| &group.units)
-        .filter(|unit| unit.translation.is_some())
-        .count();
+    cancellation: &CooperativeCancellation,
+) -> Result<ReconciledSnapshot, GenericProjectError> {
+    let mut previous_groups = HashMap::<Sha256Fingerprint, Vec<&GenericStoredGroup>>::new();
+    let mut previous_translation_count = 0;
+    for file in &previous.files {
+        ensure_generic_operation_not_cancelled(cancellation)?;
+        for group in &file.groups {
+            ensure_generic_operation_not_cancelled(cancellation)?;
+            let fingerprint =
+                lookup_text_fingerprint_with_cancellation(group.id.as_str(), cancellation)?;
+            previous_groups.entry(fingerprint).or_default().push(group);
+            for unit in &group.units {
+                ensure_generic_operation_not_cancelled(cancellation)?;
+                previous_translation_count += usize::from(unit.translation.is_some());
+            }
+        }
+    }
 
     let mut preserved_translations = 0;
-    let files = scanned
-        .files()
-        .iter()
-        .enumerate()
-        .map(|(file_ordinal, file)| {
-            let groups = file
-                .groups()
-                .iter()
-                .enumerate()
-                .map(|(group_ordinal, group)| {
-                    let context_fingerprint = group_context_fingerprint(
-                        group.kind(),
-                        group.units().iter().map(|unit| unit.text()),
-                    );
-                    let previous_group = previous_groups.get(group.id()).copied();
-                    let preserve_units = previous_group
-                        .is_some_and(|old| group_allows_unit_preservation(old, group));
-                    let previous_units = previous_group
-                        .filter(|_| preserve_units)
-                        .map(|old| old.units.as_slice());
-                    let units = group
-                        .units()
-                        .iter()
-                        .enumerate()
-                        .map(|(unit_ordinal, unit)| {
-                            let translation = previous_units
-                                .and_then(|units| units.get(unit_ordinal))
-                                .filter(|old| old.id == unit.id() && old.source_text == unit.text())
-                                .and_then(|old| old.translation.clone());
-                            if translation.is_some() {
-                                preserved_translations += 1;
-                            }
-                            GenericStoredUnit {
-                                id: unit.id().to_owned(),
-                                ordinal: unit_ordinal,
-                                source_text: unit.text().to_owned(),
-                                translation,
-                            }
-                        })
-                        .collect();
-                    GenericStoredGroup {
-                        id: group.id().to_owned(),
-                        ordinal: group_ordinal,
-                        kind: group.kind().to_owned(),
-                        context_fingerprint,
-                        units,
+    let mut files = Vec::with_capacity(scanned.files().len());
+    for (file_ordinal, file) in scanned.files().iter().enumerate() {
+        ensure_generic_operation_not_cancelled(cancellation)?;
+        let mut groups = Vec::with_capacity(file.groups().len());
+        for (group_ordinal, group) in file.groups().iter().enumerate() {
+            ensure_generic_operation_not_cancelled(cancellation)?;
+            let context_fingerprint = group_context_fingerprint(
+                group.kind(),
+                group.units().iter().map(|unit| unit.text()),
+                Some(cancellation),
+            )?;
+            let previous_group =
+                find_previous_group_with_cancellation(&previous_groups, group.id(), cancellation)?;
+            let preserve_units = match previous_group {
+                Some(old) => group_allows_unit_preservation(old, group, cancellation)?,
+                None => false,
+            };
+            let previous_units = previous_group
+                .filter(|_| preserve_units)
+                .map(|old| old.units.as_slice());
+            let mut units = Vec::with_capacity(group.units().len());
+            for (unit_ordinal, unit) in group.units().iter().enumerate() {
+                ensure_generic_operation_not_cancelled(cancellation)?;
+                let translation = match previous_units.and_then(|units| units.get(unit_ordinal)) {
+                    Some(old)
+                        if bytes_equal_with_cancellation(
+                            old.id.as_bytes(),
+                            unit.id().as_bytes(),
+                            cancellation,
+                        )? && bytes_equal_with_cancellation(
+                            old.source_text.as_bytes(),
+                            unit.text().as_bytes(),
+                            cancellation,
+                        )? =>
+                    {
+                        old.translation
+                            .as_ref()
+                            .map(|translation| {
+                                clone_stored_translation_with_cancellation(
+                                    translation,
+                                    cancellation,
+                                )
+                            })
+                            .transpose()?
                     }
-                })
-                .collect();
-            GenericStoredFile {
-                relative_path: file.relative_path().to_path_buf(),
-                ordinal: file_ordinal,
-                groups,
+                    _ => None,
+                };
+                if translation.is_some() {
+                    preserved_translations += 1;
+                }
+                units.push(GenericStoredUnit {
+                    id: clone_text_with_cancellation(unit.id(), cancellation)?,
+                    ordinal: unit_ordinal,
+                    source_text: clone_text_with_cancellation(unit.text(), cancellation)?,
+                    translation,
+                });
             }
-        })
-        .collect();
+            groups.push(GenericStoredGroup {
+                id: clone_text_with_cancellation(group.id(), cancellation)?,
+                ordinal: group_ordinal,
+                kind: clone_text_with_cancellation(group.kind(), cancellation)?,
+                context_fingerprint,
+                units,
+            });
+        }
+        files.push(GenericStoredFile {
+            relative_path: file.relative_path().to_path_buf(),
+            ordinal: file_ordinal,
+            groups,
+        });
+    }
 
-    ReconciledSnapshot {
+    Ok(ReconciledSnapshot {
         files,
         preserved_translations,
         cleared_translations: previous_translation_count.saturating_sub(preserved_translations),
-    }
+    })
+}
+
+fn clone_stored_translation_with_cancellation(
+    translation: &GenericStoredTranslation,
+    cancellation: &CooperativeCancellation,
+) -> Result<GenericStoredTranslation, GenericProjectError> {
+    Ok(GenericStoredTranslation {
+        translation: clone_text_with_cancellation(&translation.translation, cancellation)?,
+        origin: translation.origin,
+        state_fingerprint: translation.state_fingerprint,
+    })
 }
 
 fn group_allows_unit_preservation(
     previous: &GenericStoredGroup,
     current: &super::jsonl::GenericGroup,
-) -> bool {
-    if previous.kind != current.kind() || previous.units.len() != current.units().len() {
-        return false;
-    }
-    if previous
-        .units
-        .iter()
-        .zip(current.units())
-        .any(|(left, right)| left.source_text != right.text())
+    cancellation: &CooperativeCancellation,
+) -> Result<bool, GenericProjectError> {
+    if !bytes_equal_with_cancellation(
+        previous.kind.as_bytes(),
+        current.kind().as_bytes(),
+        cancellation,
+    )? || previous.units.len() != current.units().len()
     {
-        return false;
+        return Ok(false);
+    }
+    for (left, right) in previous.units.iter().zip(current.units()) {
+        ensure_generic_operation_not_cancelled(cancellation)?;
+        if !bytes_equal_with_cancellation(
+            left.source_text.as_bytes(),
+            right.text().as_bytes(),
+            cancellation,
+        )? {
+            return Ok(false);
+        }
     }
     // 新 ID 表示原位置 Unit 改名；旧 ID 出现在新位置则说明稳定 Unit 确实发生了调序。
-    let previous_ordinals = previous
-        .units
-        .iter()
-        .enumerate()
-        .map(|(ordinal, unit)| (unit.id.as_str(), ordinal))
-        .collect::<HashMap<_, _>>();
-    if current.units().iter().enumerate().any(|(ordinal, unit)| {
+    let mut previous_ordinals =
+        HashMap::<Sha256Fingerprint, Vec<(usize, &str)>>::with_capacity(previous.units.len());
+    for (ordinal, unit) in previous.units.iter().enumerate() {
+        ensure_generic_operation_not_cancelled(cancellation)?;
+        let fingerprint =
+            lookup_text_fingerprint_with_cancellation(unit.id.as_str(), cancellation)?;
         previous_ordinals
-            .get(unit.id())
-            .is_some_and(|previous_ordinal| *previous_ordinal != ordinal)
-    }) {
-        return false;
+            .entry(fingerprint)
+            .or_default()
+            .push((ordinal, unit.id.as_str()));
     }
-    true
+    for (ordinal, unit) in current.units().iter().enumerate() {
+        ensure_generic_operation_not_cancelled(cancellation)?;
+        let fingerprint = lookup_text_fingerprint_with_cancellation(unit.id(), cancellation)?;
+        if let Some(candidates) = previous_ordinals.get(&fingerprint) {
+            for (previous_ordinal, previous_id) in candidates {
+                if bytes_equal_with_cancellation(
+                    previous_id.as_bytes(),
+                    unit.id().as_bytes(),
+                    cancellation,
+                )? && *previous_ordinal != ordinal
+                {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn find_previous_group_with_cancellation<'a>(
+    previous_groups: &HashMap<Sha256Fingerprint, Vec<&'a GenericStoredGroup>>,
+    group_id: &str,
+    cancellation: &CooperativeCancellation,
+) -> Result<Option<&'a GenericStoredGroup>, GenericProjectError> {
+    let fingerprint = lookup_text_fingerprint_with_cancellation(group_id, cancellation)?;
+    let Some(candidates) = previous_groups.get(&fingerprint) else {
+        return Ok(None);
+    };
+    for candidate in candidates {
+        if bytes_equal_with_cancellation(
+            candidate.id.as_bytes(),
+            group_id.as_bytes(),
+            cancellation,
+        )? {
+            return Ok(Some(*candidate));
+        }
+    }
+    Ok(None)
+}
+
+fn lookup_text_fingerprint_with_cancellation(
+    value: &str,
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> Result<Sha256Fingerprint, GenericProjectError> {
+    let mut hasher = Sha256FramedHasher::new(b"att.generic.lookup-text");
+    hasher.try_frame_chunks(
+        1,
+        value.as_bytes(),
+        FINGERPRINT_CANCELLATION_CHECK_BYTES,
+        || cancellation.ensure_running(),
+    )?;
+    Ok(hasher.finish())
 }
 
 fn group_context_fingerprint<'a>(
     kind: &str,
     texts: impl IntoIterator<Item = &'a str>,
-) -> Sha256Fingerprint {
+    cancellation: Option<&CooperativeCancellation>,
+) -> Result<Sha256Fingerprint, GenericProjectError> {
     let mut hasher = Sha256FramedHasher::new(b"att.generic.group-context");
-    hasher.frame(1, kind.as_bytes());
+    frame_group_context_bytes(&mut hasher, 1, kind.as_bytes(), cancellation)?;
     for text in texts {
-        hasher.frame(2, text.as_bytes());
+        frame_group_context_bytes(&mut hasher, 2, text.as_bytes(), cancellation)?;
     }
-    hasher.finish()
+    Ok(hasher.finish())
+}
+
+fn frame_group_context_bytes(
+    hasher: &mut Sha256FramedHasher,
+    tag: u8,
+    bytes: &[u8],
+    cancellation: Option<&CooperativeCancellation>,
+) -> Result<(), GenericProjectError> {
+    match cancellation {
+        Some(cancellation) => {
+            hasher.try_frame_chunks(tag, bytes, FINGERPRINT_CANCELLATION_CHECK_BYTES, || {
+                ensure_generic_operation_not_cancelled(cancellation)
+            })?;
+        }
+        None => {
+            hasher.frame(tag, bytes);
+        }
+    }
+    Ok(())
 }
 
 fn scan_current_input(
     stored: &GenericStoredSnapshot,
+    cancellation: &CooperativeCancellation,
 ) -> Result<GenericInputSnapshot, GenericProjectError> {
-    let live = scan_input_tree(stored.project.source_root())?;
+    let live = scan_input_tree_with_cancellation(stored.project.source_root(), cancellation)?;
     if Some(live.raw_fingerprint()) != stored.project.extracted_raw_fingerprint
         || Some(live.asset_fingerprint()) != stored.project.extracted_asset_fingerprint
     {
         return Err(GenericProjectError::ExtractRequired);
     }
-    validate_stored_assets_match_live(stored, &live)?;
+    validate_stored_assets_match_live(stored, &live, Some(cancellation))?;
     Ok(live)
 }
 
@@ -1524,16 +3034,30 @@ fn scan_current_input(
 ///
 /// 调用方在同一项目排他租约内持有首次完整验证得到的项目事实，因此这里不再打开
 /// 64 MB 级项目数据库或重复执行 SQLite 完整性检查。
+#[cfg(test)]
 pub(crate) fn ensure_input_fingerprints_current(
     project: &GenericProject,
 ) -> Result<(), GenericProjectError> {
+    ensure_input_fingerprints_current_with_cancellation(
+        project,
+        &CooperativeCancellation::default(),
+    )
+}
+
+pub(crate) fn ensure_input_fingerprints_current_with_cancellation(
+    project: &GenericProject,
+    cancellation: &CooperativeCancellation,
+) -> Result<(), GenericProjectError> {
+    if cancellation.is_requested() {
+        return Err(GenericProjectError::Cancelled);
+    }
     let expected_raw_fingerprint = project
         .extracted_raw_fingerprint
         .ok_or(GenericProjectError::ExtractRequired)?;
     let expected_asset_fingerprint = project
         .extracted_asset_fingerprint
         .ok_or(GenericProjectError::ExtractRequired)?;
-    let live = scan_input_tree(project.source_root())?;
+    let live = scan_input_tree_with_cancellation(project.source_root(), cancellation)?;
     if live.raw_fingerprint() != expected_raw_fingerprint
         || live.asset_fingerprint() != expected_asset_fingerprint
     {
@@ -1545,7 +3069,10 @@ pub(crate) fn ensure_input_fingerprints_current(
 fn validate_stored_assets_match_live(
     stored: &GenericStoredSnapshot,
     live: &GenericInputSnapshot,
+    cancellation: Option<&CooperativeCancellation>,
 ) -> Result<(), GenericProjectError> {
+    let no_cancellation = CooperativeCancellation::default();
+    let comparison_cancellation = cancellation.unwrap_or(&no_cancellation);
     if stored.files.len() != live.files().len() {
         return Err(GenericProjectError::InvalidDatabase {
             detail: "Generic 文件记录与当前 Extract 快照不一致".to_owned(),
@@ -1554,6 +3081,9 @@ fn validate_stored_assets_match_live(
     for (file_ordinal, (stored_file, live_file)) in
         stored.files.iter().zip(live.files()).enumerate()
     {
+        if let Some(cancellation) = cancellation {
+            ensure_generic_operation_not_cancelled(cancellation)?;
+        }
         if stored_file.ordinal != file_ordinal
             || stored_file.relative_path != live_file.relative_path()
             || stored_file.groups.len() != live_file.groups().len()
@@ -1571,13 +3101,27 @@ fn validate_stored_assets_match_live(
             .zip(live_file.groups())
             .enumerate()
         {
+            if let Some(cancellation) = cancellation {
+                ensure_generic_operation_not_cancelled(cancellation)?;
+            }
             let expected_context = group_context_fingerprint(
                 live_group.kind(),
                 live_group.units().iter().map(|unit| unit.text()),
-            );
+                cancellation,
+            )?;
+            let group_id_matches = bytes_equal_with_cancellation(
+                stored_group.id.as_bytes(),
+                live_group.id().as_bytes(),
+                comparison_cancellation,
+            )?;
+            let group_kind_matches = bytes_equal_with_cancellation(
+                stored_group.kind.as_bytes(),
+                live_group.kind().as_bytes(),
+                comparison_cancellation,
+            )?;
             if stored_group.ordinal != group_ordinal
-                || stored_group.id != live_group.id()
-                || stored_group.kind != live_group.kind()
+                || !group_id_matches
+                || !group_kind_matches
                 || stored_group.context_fingerprint != expected_context
                 || stored_group.units.len() != live_group.units().len()
             {
@@ -1594,10 +3138,20 @@ fn validate_stored_assets_match_live(
                 .zip(live_group.units())
                 .enumerate()
             {
-                if stored_unit.ordinal != unit_ordinal
-                    || stored_unit.id != live_unit.id()
-                    || stored_unit.source_text != live_unit.text()
-                {
+                if let Some(cancellation) = cancellation {
+                    ensure_generic_operation_not_cancelled(cancellation)?;
+                }
+                let unit_id_matches = bytes_equal_with_cancellation(
+                    stored_unit.id.as_bytes(),
+                    live_unit.id().as_bytes(),
+                    comparison_cancellation,
+                )?;
+                let source_text_matches = bytes_equal_with_cancellation(
+                    stored_unit.source_text.as_bytes(),
+                    live_unit.text().as_bytes(),
+                    comparison_cancellation,
+                )?;
+                if stored_unit.ordinal != unit_ordinal || !unit_id_matches || !source_text_matches {
                     return Err(GenericProjectError::InvalidDatabase {
                         detail: format!(
                             "Generic Unit 记录与当前 Extract 快照不一致：{:?}/{:?}",
@@ -1616,6 +3170,7 @@ fn replace_snapshot(
     transaction: &Transaction<'_>,
     scanned: &GenericInputSnapshot,
     files: &[GenericStoredFile],
+    cancellation: &CooperativeCancellation,
 ) -> Result<(), GenericProjectError> {
     transaction
         .execute("DELETE FROM generic_file", [])
@@ -1654,6 +3209,7 @@ fn replace_snapshot(
             })?;
 
         for file in files {
+            ensure_generic_operation_not_cancelled(cancellation)?;
             let relative_path = encode_path(&file.relative_path);
             file_statement
                 .execute(params![&relative_path, to_i64(file.ordinal)?])
@@ -1662,6 +3218,7 @@ fn replace_snapshot(
                     source,
                 })?;
             for group in &file.groups {
+                ensure_generic_operation_not_cancelled(cancellation)?;
                 group_statement
                     .execute(params![
                         group.id,
@@ -1675,6 +3232,7 @@ fn replace_snapshot(
                         source,
                     })?;
                 for unit in &group.units {
+                    ensure_generic_operation_not_cancelled(cancellation)?;
                     let (translation, origin, state) =
                         unit.translation
                             .as_ref()
@@ -1703,6 +3261,7 @@ fn replace_snapshot(
             }
         }
     }
+    ensure_generic_operation_not_cancelled(cancellation)?;
     transaction
         .execute(
             "UPDATE generic_project
@@ -1720,30 +3279,145 @@ fn replace_snapshot(
     Ok(())
 }
 
-fn load_translation_resources_rows(
+fn ensure_generic_operation_not_cancelled(
+    cancellation: &CooperativeCancellation,
+) -> Result<(), GenericProjectError> {
+    if cancellation.is_requested() {
+        Err(GenericProjectError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn load_translation_resources_rows_with_cancellation(
     connection: &Connection,
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
 ) -> Result<TranslationResources, GenericProjectError> {
-    let read = |kind: &'static str| {
-        connection
-            .query_row(
-                "SELECT canonical_json FROM translation_resource WHERE resource_kind = ?1",
-                [kind],
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(|source| GenericProjectError::Sqlite {
-                operation: "读取 Generic 翻译资源",
-                source,
-            })
-    };
     Ok(TranslationResources {
-        terminology_json: read(TERMINOLOGY_RESOURCE)?,
-        placeholder_rules_json: read(PLACEHOLDER_RULES_RESOURCE)?,
+        terminology_json: load_translation_resource_row_with_cancellation(
+            connection,
+            TERMINOLOGY_RESOURCE,
+            cancellation,
+        )?,
+        placeholder_rules_json: load_translation_resource_row_with_cancellation(
+            connection,
+            PLACEHOLDER_RULES_RESOURCE,
+            cancellation,
+        )?,
     })
+}
+
+pub(crate) fn compiled_placeholder_resource_for_connection_with_cancellation(
+    connection: &Connection,
+    cached: Option<&GenericCompiledPlaceholderResource>,
+    cancellation: &CooperativeCancellation,
+) -> Result<GenericCompiledPlaceholderResource, GenericProjectError> {
+    let canonical_json = load_translation_resource_row_with_cancellation(
+        connection,
+        PLACEHOLDER_RULES_RESOURCE,
+        cancellation,
+    )?;
+    if let Some(cached) = cached
+        && bytes_equal_with_cancellation(
+            cached.canonical_json().as_bytes(),
+            canonical_json.as_bytes(),
+            cancellation,
+        )?
+    {
+        return Ok(cached.clone());
+    }
+    compile_placeholder_resource_with_cancellation(canonical_json, cancellation)
+}
+
+pub(crate) fn compiled_terminology_resource_for_connection_with_cancellation(
+    connection: &Connection,
+    cached: Option<&GenericCompiledTerminologyResource>,
+    cancellation: &CooperativeCancellation,
+) -> Result<GenericCompiledTerminologyResource, GenericProjectError> {
+    let canonical_json = load_translation_resource_row_with_cancellation(
+        connection,
+        TERMINOLOGY_RESOURCE,
+        cancellation,
+    )?;
+    if let Some(cached) = cached
+        && bytes_equal_with_cancellation(
+            cached.canonical_json().as_bytes(),
+            canonical_json.as_bytes(),
+            cancellation,
+        )?
+    {
+        return Ok(cached.clone());
+    }
+    compile_terminology_resource_with_cancellation(canonical_json, cancellation)
+}
+
+fn load_translation_resource_row_with_cancellation(
+    connection: &Connection,
+    kind: &'static str,
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> Result<String, GenericProjectError> {
+    const OPERATION: &str = "读取 Generic 翻译资源";
+
+    cancellation.ensure_running()?;
+    let mut statement = connection
+        .prepare(
+            "SELECT canonical_json FROM main.translation_resource
+             WHERE resource_kind = ?1",
+        )
+        .map_err(|source| cancellable_sqlite_error(OPERATION, source, cancellation))?;
+    let mut rows = statement
+        .query([kind])
+        .map_err(|source| cancellable_sqlite_error(OPERATION, source, cancellation))?;
+    let row = rows
+        .next()
+        .map_err(|source| cancellable_sqlite_error(OPERATION, source, cancellation))?
+        .ok_or(GenericProjectError::Sqlite {
+            operation: OPERATION,
+            source: rusqlite::Error::QueryReturnedNoRows,
+        })?;
+    let canonical_json =
+        clone_sqlite_text_column_with_cancellation(row, 0, OPERATION, cancellation)?;
+    drop(rows);
+    drop(statement);
+    cancellation.ensure_running()?;
+    Ok(canonical_json)
+}
+
+fn query_optional_first_text_with_cancellation(
+    connection: &Connection,
+    query: &'static str,
+    operation: &'static str,
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> Result<Option<String>, GenericProjectError> {
+    cancellation.ensure_running()?;
+    let mut statement = connection
+        .prepare(query)
+        .map_err(|source| cancellable_sqlite_error(operation, source, cancellation))?;
+    let mut rows = statement
+        .query([])
+        .map_err(|source| cancellable_sqlite_error(operation, source, cancellation))?;
+    let value = match rows
+        .next()
+        .map_err(|source| cancellable_sqlite_error(operation, source, cancellation))?
+    {
+        Some(row) => Some(clone_sqlite_text_column_with_cancellation(
+            row,
+            0,
+            operation,
+            cancellation,
+        )?),
+        None => None,
+    };
+    drop(rows);
+    drop(statement);
+    cancellation.ensure_running()?;
+    Ok(value)
 }
 
 fn load_snapshot_rows(
     connection: &Connection,
     project: &GenericProject,
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
 ) -> Result<GenericStoredSnapshot, GenericProjectError> {
     let mut files = Vec::new();
     let mut file_indexes = HashMap::new();
@@ -1752,24 +3426,31 @@ fn load_snapshot_rows(
             "SELECT relative_path, ordinal
              FROM main.generic_file ORDER BY ordinal",
         )
-        .map_err(|source| GenericProjectError::Sqlite {
-            operation: "准备读取 Generic 文件",
-            source,
+        .map_err(|source| {
+            cancellable_sqlite_error("准备读取 Generic 文件", source, cancellation)
         })?;
-    let file_rows = file_statement
-        .query_map([], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
-        })
-        .map_err(|source| GenericProjectError::Sqlite {
-            operation: "读取 Generic 文件",
-            source,
-        })?;
-    for file_row in file_rows {
-        let (path_bytes, ordinal) = file_row.map_err(|source| GenericProjectError::Sqlite {
-            operation: "解码 Generic 文件记录",
-            source,
-        })?;
-        let relative_path = decode_path(&path_bytes)?;
+    let mut file_rows = file_statement
+        .query([])
+        .map_err(|source| cancellable_sqlite_error("读取 Generic 文件", source, cancellation))?;
+    while let Some(row) = file_rows
+        .next()
+        .map_err(|source| cancellable_sqlite_error("解码 Generic 文件记录", source, cancellation))?
+    {
+        cancellation.ensure_running()?;
+        let path_bytes = clone_sqlite_blob_column_with_cancellation(
+            row,
+            0,
+            "解码 Generic 文件记录",
+            cancellation,
+        )?;
+        let ordinal = row
+            .get::<_, i64>(1)
+            .map_err(|source| GenericProjectError::Sqlite {
+                operation: "解码 Generic 文件记录",
+                source,
+            })?;
+        let relative_path = decode_path_with_cancellation(&path_bytes, cancellation)?;
+        cancellation.ensure_running()?;
         let file_index = files.len();
         file_indexes.insert(path_bytes, file_index);
         files.push(GenericStoredFile {
@@ -1778,9 +3459,10 @@ fn load_snapshot_rows(
             groups: Vec::new(),
         });
     }
+    drop(file_rows);
     drop(file_statement);
 
-    let mut group_indexes = HashMap::new();
+    let mut group_indexes = CancellableTextMap::with_capacity(files.len());
     let mut group_statement = connection
         .prepare(
             "SELECT g.relative_path, g.group_id, g.ordinal,
@@ -1790,37 +3472,45 @@ fn load_snapshot_rows(
                ON f.relative_path = g.relative_path
              ORDER BY f.ordinal, g.ordinal",
         )
-        .map_err(|source| GenericProjectError::Sqlite {
-            operation: "准备读取 Generic Group",
-            source,
+        .map_err(|source| {
+            cancellable_sqlite_error("准备读取 Generic Group", source, cancellation)
         })?;
-    let group_rows = group_statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, Vec<u8>>(4)?,
-            ))
-        })
-        .map_err(|source| GenericProjectError::Sqlite {
-            operation: "读取 Generic Group",
-            source,
-        })?;
-    for group_row in group_rows {
-        let (path_bytes, group_id, group_ordinal, kind, context) =
-            group_row.map_err(|source| GenericProjectError::Sqlite {
+    let mut group_rows = group_statement
+        .query([])
+        .map_err(|source| cancellable_sqlite_error("读取 Generic Group", source, cancellation))?;
+    while let Some(row) = group_rows
+        .next()
+        .map_err(|source| cancellable_sqlite_error("解码 Generic Group", source, cancellation))?
+    {
+        cancellation.ensure_running()?;
+        let path_bytes =
+            clone_sqlite_blob_column_with_cancellation(row, 0, "解码 Generic Group", cancellation)?;
+        let group_id =
+            clone_sqlite_text_column_with_cancellation(row, 1, "解码 Generic Group", cancellation)?;
+        let group_ordinal = row
+            .get::<_, i64>(2)
+            .map_err(|source| GenericProjectError::Sqlite {
                 operation: "解码 Generic Group",
                 source,
             })?;
+        let kind =
+            clone_sqlite_text_column_with_cancellation(row, 3, "解码 Generic Group", cancellation)?;
+        let context =
+            clone_sqlite_blob_column_with_cancellation(row, 4, "解码 Generic Group", cancellation)?;
+        cancellation.ensure_running()?;
         let Some(&file_index) = file_indexes.get(&path_bytes) else {
             return Err(GenericProjectError::InvalidDatabase {
                 detail: format!("Generic Group {group_id:?} 引用了不存在的文件"),
             });
         };
         let group_index = files[file_index].groups.len();
-        group_indexes.insert(group_id.clone(), (file_index, group_index));
+        let group_index_key = clone_text_with_cancellation(&group_id, cancellation)?;
+        let previous = group_indexes.insert_with_cancellation(
+            group_index_key,
+            (file_index, group_index),
+            || cancellation.ensure_running(),
+        )?;
+        debug_assert!(previous.is_none());
         files[file_index].groups.push(GenericStoredGroup {
             id: group_id,
             ordinal: from_i64(group_ordinal, "group.ordinal")?,
@@ -1829,36 +3519,52 @@ fn load_snapshot_rows(
             units: Vec::new(),
         });
     }
+    drop(group_rows);
     drop(group_statement);
 
     let mut unit_statement = connection
         .prepare(LOAD_UNITS_NATURAL_SQL)
-        .map_err(|source| GenericProjectError::Sqlite {
-            operation: "准备读取 Generic Unit",
-            source,
+        .map_err(|source| {
+            cancellable_sqlite_error("准备读取 Generic Unit", source, cancellation)
         })?;
-    let unit_rows = unit_statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, Option<Vec<u8>>>(6)?,
-            ))
-        })
-        .map_err(|source| GenericProjectError::Sqlite {
-            operation: "读取 Generic Unit",
-            source,
-        })?;
-    for unit_row in unit_rows {
-        let (group_id, unit_id, unit_ordinal, source_text, translation, origin, state) =
-            unit_row.map_err(|source| GenericProjectError::Sqlite {
+    let mut unit_rows = unit_statement
+        .query([])
+        .map_err(|source| cancellable_sqlite_error("读取 Generic Unit", source, cancellation))?;
+    while let Some(row) = unit_rows
+        .next()
+        .map_err(|source| cancellable_sqlite_error("解码 Generic Unit", source, cancellation))?
+    {
+        cancellation.ensure_running()?;
+        let group_id =
+            clone_sqlite_text_column_with_cancellation(row, 0, "解码 Generic Unit", cancellation)?;
+        let unit_id =
+            clone_sqlite_text_column_with_cancellation(row, 1, "解码 Generic Unit", cancellation)?;
+        let unit_ordinal = row
+            .get::<_, i64>(2)
+            .map_err(|source| GenericProjectError::Sqlite {
                 operation: "解码 Generic Unit",
                 source,
             })?;
+        let source_text =
+            clone_sqlite_text_column_with_cancellation(row, 3, "解码 Generic Unit", cancellation)?;
+        let translation = clone_optional_sqlite_text_column_with_cancellation(
+            row,
+            4,
+            "解码 Generic Unit",
+            cancellation,
+        )?;
+        let origin = clone_optional_sqlite_text_column_with_cancellation(
+            row,
+            5,
+            "解码 Generic Unit",
+            cancellation,
+        )?;
+        let state = clone_optional_sqlite_blob_column_with_cancellation(
+            row,
+            6,
+            "解码 Generic Unit",
+            cancellation,
+        )?;
         let translation = match (translation, origin, state) {
             (None, None, None) => None,
             (Some(translation), Some(origin), Some(state)) => Some(GenericStoredTranslation {
@@ -1872,7 +3578,10 @@ fn load_snapshot_rows(
                 });
             }
         };
-        let Some(&(file_index, group_index)) = group_indexes.get(&group_id) else {
+        cancellation.ensure_running()?;
+        let Some(&(file_index, group_index)) =
+            group_indexes.get_with_cancellation(&group_id, || cancellation.ensure_running())?
+        else {
             return Err(GenericProjectError::InvalidDatabase {
                 detail: format!("Generic Unit {group_id:?}/{unit_id:?} 引用了不存在的 Group"),
             });
@@ -1886,6 +3595,8 @@ fn load_snapshot_rows(
                 translation,
             });
     }
+    drop(unit_rows);
+    cancellation.ensure_running()?;
     Ok(GenericStoredSnapshot {
         project: project.clone(),
         files,
@@ -1893,139 +3604,317 @@ fn load_snapshot_rows(
 }
 
 fn create_initial_schema(
-    connection: &mut Connection,
+    connection: &mut AttSqliteCancellableConnection,
     project_name: &ProjectName,
     source_root: &Path,
     source_language: &LanguageId,
     target_language: &LanguageId,
+    cancellation: &CooperativeCancellation,
 ) -> Result<(), GenericProjectError> {
-    let transaction = connection
-        .transaction()
-        .map_err(|source| GenericProjectError::Sqlite {
-            operation: "开始建立 Generic schema",
-            source,
-        })?;
-    transaction
-        .execute_batch(
-            "CREATE TABLE generic_project (
-                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                 project_name TEXT NOT NULL CHECK (length(project_name) > 0),
-                 source_root BLOB NOT NULL CHECK (length(source_root) > 0 AND length(source_root) % 2 = 0),
-                 source_language TEXT NOT NULL CHECK (length(source_language) > 0),
-                 target_language TEXT NOT NULL CHECK (length(target_language) > 0),
-                 extracted_raw_fingerprint BLOB CHECK (
-                     extracted_raw_fingerprint IS NULL OR length(extracted_raw_fingerprint) = 32
-                 ),
-                 extracted_asset_fingerprint BLOB CHECK (
-                     extracted_asset_fingerprint IS NULL OR length(extracted_asset_fingerprint) = 32
-                 ),
-                 last_profile_id TEXT CHECK (last_profile_id IS NULL OR length(last_profile_id) > 0),
-                 CHECK (
-                     (extracted_raw_fingerprint IS NULL) =
-                     (extracted_asset_fingerprint IS NULL)
-                 )
-             ) STRICT;
-             CREATE TABLE generic_file (
-                 relative_path BLOB PRIMARY KEY
-                     CHECK (length(relative_path) > 0 AND length(relative_path) % 2 = 0),
-                 ordinal INTEGER NOT NULL UNIQUE CHECK (ordinal >= 0)
-             ) STRICT;
-             CREATE TABLE generic_group (
-                 group_id TEXT PRIMARY KEY CHECK (length(CAST(group_id AS BLOB)) > 0),
-                 relative_path BLOB NOT NULL REFERENCES generic_file(relative_path) ON DELETE CASCADE,
-                 ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-                 kind TEXT NOT NULL CHECK (length(CAST(kind AS BLOB)) > 0),
-                 context_fingerprint BLOB NOT NULL CHECK (length(context_fingerprint) = 32),
-                 UNIQUE (relative_path, ordinal)
-             ) STRICT;
-             CREATE TABLE generic_unit (
-                 group_id TEXT NOT NULL REFERENCES generic_group(group_id) ON DELETE CASCADE,
-                 unit_id TEXT NOT NULL CHECK (length(CAST(unit_id AS BLOB)) > 0),
-                 ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-                 source_text TEXT NOT NULL CHECK (
-                     instr(source_text, char(13)) = 0 AND instr(source_text, char(0)) = 0
-                 ),
-                 translation TEXT,
-                 translation_origin TEXT CHECK (
-                     translation_origin IS NULL OR translation_origin IN ('automatic', 'manual')
-                 ),
-                 translation_state BLOB CHECK (
-                     translation_state IS NULL OR length(translation_state) = 32
-                 ),
-                 PRIMARY KEY (group_id, unit_id),
-                 UNIQUE (group_id, ordinal),
-                 CHECK (
-                     (translation IS NULL AND translation_origin IS NULL AND translation_state IS NULL)
-                     OR
-                     (translation IS NOT NULL AND length(trim(translation)) > 0
-                      AND instr(translation, char(13)) = 0
-                      AND instr(translation, char(0)) = 0
-                      AND translation_origin IS NOT NULL
-                      AND translation_state IS NOT NULL)
-                 )
-             ) STRICT;
-             CREATE TABLE translation_resource (
-                 resource_kind TEXT PRIMARY KEY CHECK (
-                     resource_kind IN ('terminology', 'placeholder_rules')
-                 ),
-                 canonical_json TEXT NOT NULL CHECK (length(canonical_json) > 0)
-             ) STRICT;
-             INSERT INTO translation_resource (resource_kind, canonical_json)
-             VALUES ('terminology', '[]'), ('placeholder_rules', '[]');",
-        )
-        .map_err(|source| GenericProjectError::Sqlite {
-            operation: "建立 Generic schema",
-            source,
-        })?;
-    transaction
-        .execute(
-            "INSERT INTO main.generic_project (
+    run_cancellable_transaction(
+        connection,
+        cancellation,
+        "开始建立 Generic schema",
+        "提交 Generic schema",
+        "回滚 Generic schema",
+        |transaction| {
+            transaction
+                .execute_batch(CREATE_INITIAL_SCHEMA_SQL)
+                .map_err(|source| GenericProjectError::Sqlite {
+                    operation: "建立 Generic schema",
+                    source,
+                })?;
+            transaction
+                .execute(
+                    "INSERT INTO main.generic_project (
                  singleton, project_name, source_root, source_language, target_language
              ) VALUES (1, ?1, ?2, ?3, ?4)",
-            params![
-                project_name.as_str(),
-                encode_path(source_root),
-                source_language.as_str(),
-                target_language.as_str()
-            ],
-        )
-        .map_err(|source| GenericProjectError::Sqlite {
-            operation: "写入 Generic 项目事实",
-            source,
-        })?;
-    transaction
-        .commit()
-        .map_err(|source| GenericProjectError::Sqlite {
-            operation: "提交 Generic schema",
-            source,
-        })
+                    params![
+                        project_name.as_str(),
+                        encode_path(source_root),
+                        source_language.as_str(),
+                        target_language.as_str()
+                    ],
+                )
+                .map_err(|source| GenericProjectError::Sqlite {
+                    operation: "写入 Generic 项目事实",
+                    source,
+                })?;
+            Ok(())
+        },
+    )
 }
 
-fn validate_schema(connection: &Connection) -> Result<(), GenericProjectError> {
-    for table in [
-        "generic_project",
-        "generic_file",
-        "generic_group",
-        "generic_unit",
-        "translation_resource",
-    ] {
-        let exists: i64 = connection
-            .query_row(
-                "SELECT count(*) FROM main.sqlite_schema
-                 WHERE type = 'table' AND name = ?1",
-                [table],
-                |row| row.get(0),
-            )
-            .map_err(|source| GenericProjectError::Sqlite {
-                operation: "检查 Generic schema",
-                source,
-            })?;
-        if exists != 1 {
-            return Err(GenericProjectError::InvalidDatabase {
-                detail: format!("缺少表 {table}"),
-            });
+#[derive(Debug, Eq, PartialEq)]
+struct GenericSchemaObject {
+    kind: String,
+    name: String,
+    table_name: String,
+    sql: String,
+}
+
+fn read_generic_att_schema_with_cancellation(
+    connection: &Connection,
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> Result<Vec<GenericSchemaObject>, GenericProjectError> {
+    const OPERATION: &str = "读取当前 Generic schema";
+
+    cancellation.ensure_running()?;
+    let mut statement = connection
+        .prepare(SELECT_GENERIC_ATT_SCHEMA)
+        .map_err(|source| cancellable_sqlite_error(OPERATION, source, cancellation))?;
+    let mut rows = statement
+        .query([])
+        .map_err(|source| cancellable_sqlite_error(OPERATION, source, cancellation))?;
+    let mut objects = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(|source| cancellable_sqlite_error(OPERATION, source, cancellation))?
+    {
+        cancellation.ensure_running()?;
+        objects.push(GenericSchemaObject {
+            kind: clone_sqlite_text_column_with_cancellation(row, 0, OPERATION, cancellation)?,
+            name: clone_sqlite_text_column_with_cancellation(row, 1, OPERATION, cancellation)?,
+            table_name: clone_sqlite_text_column_with_cancellation(
+                row,
+                2,
+                OPERATION,
+                cancellation,
+            )?,
+            sql: clone_sqlite_text_column_with_cancellation(row, 3, OPERATION, cancellation)?,
+        });
+    }
+    drop(rows);
+    drop(statement);
+    cancellation.ensure_running()?;
+    Ok(objects)
+}
+
+fn expected_generic_att_schema() -> &'static [GenericSchemaObject] {
+    static EXPECTED: OnceLock<Vec<GenericSchemaObject>> = OnceLock::new();
+    EXPECTED.get_or_init(|| {
+        let connection =
+            Connection::open_in_memory().expect("当前 Generic schema 必须能在内存数据库中建立");
+        connection
+            .execute_batch(CREATE_INITIAL_SCHEMA_SQL)
+            .expect("当前 Generic schema DDL 必须有效");
+        read_generic_att_schema_with_cancellation(&connection, &CooperativeCancellation::default())
+            .expect("必须能读取刚建立的当前 Generic schema")
+    })
+}
+
+/// 检查调用方连接中的 ATT 受管对象是否与当前唯一 Generic schema 完全一致。
+///
+/// 查询只覆盖 ATT 管理的表及附属于这些表的显式 schema 对象；脚本自己的独立表、
+/// 索引、视图和触发器不属于本契约。
+#[cfg(test)]
+pub(crate) fn validate_current_generic_schema(
+    connection: &Connection,
+) -> Result<(), GenericProjectError> {
+    validate_current_generic_schema_with_cancellation(
+        connection,
+        &CooperativeCancellation::default(),
+    )
+}
+
+pub(crate) fn validate_current_generic_schema_with_cancellation(
+    connection: &Connection,
+    cancellation: &CooperativeCancellation,
+) -> Result<(), GenericProjectError> {
+    let actual = read_generic_att_schema_with_cancellation(connection, cancellation)?;
+    let expected = expected_generic_att_schema();
+    validate_generic_schema_objects_with_cancellation(&actual, expected, cancellation)
+}
+
+fn validate_generic_schema_objects_with_cancellation(
+    actual: &[GenericSchemaObject],
+    expected: &[GenericSchemaObject],
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> Result<(), GenericProjectError> {
+    let mut missing = Vec::new();
+    for expected_object in expected {
+        cancellation.ensure_running()?;
+        let mut found = false;
+        for actual_object in actual {
+            cancellation.ensure_running()?;
+            if schema_object_identity_equal_with_cancellation(
+                actual_object,
+                expected_object,
+                cancellation,
+            )? {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            missing.push(schema_object_label_with_cancellation(
+                expected_object,
+                cancellation,
+            )?);
         }
     }
+
+    let mut definition_mismatches = Vec::new();
+    for expected_object in expected {
+        cancellation.ensure_running()?;
+        let mut matching = None;
+        for actual_object in actual {
+            cancellation.ensure_running()?;
+            if schema_object_identity_equal_with_cancellation(
+                actual_object,
+                expected_object,
+                cancellation,
+            )? {
+                matching = Some(actual_object);
+                break;
+            }
+        }
+        if let Some(actual_object) = matching
+            && !schema_object_equal_with_cancellation(actual_object, expected_object, cancellation)?
+        {
+            definition_mismatches.push(schema_object_label_with_cancellation(
+                expected_object,
+                cancellation,
+            )?);
+        }
+    }
+
+    let mut unexpected = Vec::new();
+    for actual_object in actual {
+        cancellation.ensure_running()?;
+        let mut found = false;
+        for expected_object in expected {
+            cancellation.ensure_running()?;
+            if schema_object_identity_equal_with_cancellation(
+                actual_object,
+                expected_object,
+                cancellation,
+            )? {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            unexpected.push(schema_object_label_with_cancellation(
+                actual_object,
+                cancellation,
+            )?);
+        }
+    }
+
+    if actual.len() == expected.len()
+        && missing.is_empty()
+        && definition_mismatches.is_empty()
+        && unexpected.is_empty()
+    {
+        return Ok(());
+    }
+    let missing = schema_object_list_with_cancellation(&missing, cancellation)?;
+    let definition_mismatches =
+        schema_object_list_with_cancellation(&definition_mismatches, cancellation)?;
+    let unexpected = schema_object_list_with_cancellation(&unexpected, cancellation)?;
+    let mut detail = String::new();
+    append_text_with_cancellation(
+        &mut detail,
+        "Generic 受管 schema 与当前唯一定义不一致：expected_count=",
+        cancellation,
+    )?;
+    append_text_with_cancellation(&mut detail, &expected.len().to_string(), cancellation)?;
+    append_text_with_cancellation(&mut detail, "; actual_count=", cancellation)?;
+    append_text_with_cancellation(&mut detail, &actual.len().to_string(), cancellation)?;
+    append_text_with_cancellation(&mut detail, "; missing=", cancellation)?;
+    append_text_with_cancellation(&mut detail, &missing, cancellation)?;
+    append_text_with_cancellation(&mut detail, "; definition_mismatches=", cancellation)?;
+    append_text_with_cancellation(&mut detail, &definition_mismatches, cancellation)?;
+    append_text_with_cancellation(&mut detail, "; unexpected=", cancellation)?;
+    append_text_with_cancellation(&mut detail, &unexpected, cancellation)?;
+    cancellation.ensure_running()?;
+    Err(GenericProjectError::InvalidDatabase { detail })
+}
+
+fn schema_object_identity_equal_with_cancellation(
+    left: &GenericSchemaObject,
+    right: &GenericSchemaObject,
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> Result<bool, GenericProjectError> {
+    Ok(
+        bytes_equal_with_cancellation(left.kind.as_bytes(), right.kind.as_bytes(), cancellation)?
+            && bytes_equal_with_cancellation(
+                left.name.as_bytes(),
+                right.name.as_bytes(),
+                cancellation,
+            )?,
+    )
+}
+
+fn schema_object_equal_with_cancellation(
+    left: &GenericSchemaObject,
+    right: &GenericSchemaObject,
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> Result<bool, GenericProjectError> {
+    Ok(
+        schema_object_identity_equal_with_cancellation(left, right, cancellation)?
+            && bytes_equal_with_cancellation(
+                left.table_name.as_bytes(),
+                right.table_name.as_bytes(),
+                cancellation,
+            )?
+            && bytes_equal_with_cancellation(
+                left.sql.as_bytes(),
+                right.sql.as_bytes(),
+                cancellation,
+            )?,
+    )
+}
+
+fn schema_object_label_with_cancellation(
+    object: &GenericSchemaObject,
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> Result<String, GenericProjectError> {
+    let mut label = String::new();
+    append_text_with_cancellation(&mut label, &object.kind, cancellation)?;
+    append_text_with_cancellation(&mut label, "/", cancellation)?;
+    append_text_with_cancellation(&mut label, &object.name, cancellation)?;
+    Ok(label)
+}
+
+fn schema_object_list_with_cancellation(
+    objects: &[String],
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> Result<String, GenericProjectError> {
+    if objects.is_empty() {
+        return Ok("none".to_owned());
+    }
+    let mut list = String::new();
+    for (index, object) in objects.iter().enumerate() {
+        cancellation.ensure_running()?;
+        if index != 0 {
+            append_text_with_cancellation(&mut list, ",", cancellation)?;
+        }
+        append_text_with_cancellation(&mut list, object, cancellation)?;
+    }
+    cancellation.ensure_running()?;
+    Ok(list)
+}
+
+fn validate_schema_with_cancellation(
+    connection: &Connection,
+    cancellation: &CooperativeCancellation,
+) -> Result<GenericCompiledTranslationResources, GenericProjectError> {
+    validate_schema_with_compiled_resources(connection, None, cancellation)
+}
+
+fn validate_schema_with_compiled_resources(
+    connection: &Connection,
+    compiled_resources: Option<(
+        &GenericCompiledTerminologyResource,
+        &GenericCompiledPlaceholderResource,
+    )>,
+    cancellation: &CooperativeCancellation,
+) -> Result<GenericCompiledTranslationResources, GenericProjectError> {
+    ensure_generic_operation_not_cancelled(cancellation)?;
+    validate_current_generic_schema_with_cancellation(connection, cancellation)?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     let resource_count: i64 = connection
         .query_row(
             "SELECT count(*) FROM main.translation_resource
@@ -2034,68 +3923,110 @@ fn validate_schema(connection: &Connection) -> Result<(), GenericProjectError> {
             [],
             |row| row.get(0),
         )
-        .map_err(|source| GenericProjectError::Sqlite {
-            operation: "检查 Generic 翻译资源",
-            source,
+        .map_err(|source| {
+            cancellable_sqlite_error("检查 Generic 翻译资源", source, cancellation)
         })?;
     if resource_count != 2 {
         return Err(GenericProjectError::InvalidDatabase {
             detail: "translation_resource 必须恰好包含术语与 Placeholder 两项".to_owned(),
         });
     }
-    for kind in [TERMINOLOGY_RESOURCE, PLACEHOLDER_RULES_RESOURCE] {
-        let canonical_json: String = connection
-            .query_row(
-                "SELECT canonical_json FROM main.translation_resource
-                 WHERE resource_kind = ?1",
-                [kind],
-                |row| row.get(0),
-            )
-            .map_err(|source| GenericProjectError::Sqlite {
-                operation: "读取 Generic 翻译资源以检查",
-                source,
-            })?;
-        validate_canonical_resource(kind, &canonical_json)?;
-        if kind == PLACEHOLDER_RULES_RESOURCE {
-            validate_placeholder_resource(&canonical_json)?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
+    let resources = load_translation_resources_rows_with_cancellation(connection, cancellation)?;
+    let compiled_resources = match compiled_resources {
+        Some((terminology, placeholder)) => {
+            if !bytes_equal_with_cancellation(
+                resources.terminology_json().as_bytes(),
+                terminology.canonical_json().as_bytes(),
+                cancellation,
+            )? || !bytes_equal_with_cancellation(
+                resources.placeholder_rules_json().as_bytes(),
+                placeholder.canonical_json().as_bytes(),
+                cancellation,
+            )? {
+                return Err(GenericProjectError::InvalidDatabase {
+                    detail: "Generic 已编译翻译资源与当前事务内容不一致".to_owned(),
+                });
+            }
+            GenericCompiledTranslationResources {
+                terminology: terminology.clone(),
+                placeholder: placeholder.clone(),
+            }
         }
-    }
-    let foreign_key_issue: Option<String> = connection
-        .query_row("PRAGMA main.foreign_key_check", [], |row| row.get(0))
-        .optional()
-        .map_err(|source| GenericProjectError::Sqlite {
-            operation: "检查 Generic 外键",
-            source,
-        })?;
+        None => {
+            let (terminology_json, placeholder_rules_json) = resources.into_parts();
+            compile_translation_resources_with_cancellation(
+                terminology_json,
+                placeholder_rules_json,
+                cancellation,
+            )?
+        }
+    };
+    ensure_generic_operation_not_cancelled(cancellation)?;
+    let foreign_key_issue = query_optional_first_text_with_cancellation(
+        connection,
+        "PRAGMA main.foreign_key_check",
+        "检查 Generic 外键",
+        cancellation,
+    )?;
     if let Some(table) = foreign_key_issue {
         return Err(GenericProjectError::InvalidDatabase {
             detail: format!("表 {table} 存在外键错误"),
         });
     }
-    let quick_check: String = connection
-        .query_row("PRAGMA main.quick_check", [], |row| row.get(0))
-        .map_err(|source| GenericProjectError::Sqlite {
-            operation: "检查 Generic SQLite 完整性",
-            source,
-        })?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
+    let quick_check = query_optional_first_text_with_cancellation(
+        connection,
+        "PRAGMA main.quick_check",
+        "检查 Generic SQLite 完整性",
+        cancellation,
+    )?
+    .ok_or(GenericProjectError::Sqlite {
+        operation: "检查 Generic SQLite 完整性",
+        source: rusqlite::Error::QueryReturnedNoRows,
+    })?;
     if quick_check != "ok" {
         return Err(GenericProjectError::InvalidDatabase {
             detail: format!("SQLite quick_check：{quick_check}"),
         });
     }
-    Ok(())
+    ensure_generic_operation_not_cancelled(cancellation)?;
+    Ok(compiled_resources)
 }
 
-/// 在调用方持有的同一连接上检查 Generic 项目事实、Extract 快照与数据库不变量。
-///
-/// 原子 Lua 在提交前调用此入口，确保检查能够看见尚未提交的脚本修改。
-pub(crate) fn validate_project_connection(
+pub(crate) fn validate_project_connection_with_compiled_resources_and_cancellation(
     connection: &Connection,
     expected: &GenericProject,
+    terminology: &GenericCompiledTerminologyResource,
+    placeholder: &GenericCompiledPlaceholderResource,
+    cancellation: &CooperativeCancellation,
 ) -> Result<(), GenericProjectError> {
-    validate_schema(connection)?;
-    let store = GenericProjectStore::for_workspace(expected.workspace_root.clone());
+    validate_project_connection_with_compiled_resources(
+        connection,
+        expected,
+        Some((terminology, placeholder)),
+        cancellation,
+    )
+}
+
+fn validate_project_connection_with_compiled_resources(
+    connection: &Connection,
+    expected: &GenericProject,
+    compiled_resources: Option<(
+        &GenericCompiledTerminologyResource,
+        &GenericCompiledPlaceholderResource,
+    )>,
+    cancellation: &CooperativeCancellation,
+) -> Result<(), GenericProjectError> {
+    ensure_generic_operation_not_cancelled(cancellation)?;
+    validate_schema_with_compiled_resources(connection, compiled_resources, cancellation)?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
+    let store = GenericProjectStore::for_workspace_with_cancellation(
+        expected.workspace_root.clone(),
+        cancellation.clone(),
+    );
     let actual = store.read_project_with_connection(connection)?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     if actual.project_name != expected.project_name {
         return Err(GenericProjectError::InvalidDatabase {
             detail: "Lua 修改了 Generic 项目名称".to_owned(),
@@ -2130,26 +4061,28 @@ pub(crate) fn validate_project_connection(
                 [],
                 |row| row.get(0),
             )
-            .map_err(|source| GenericProjectError::Sqlite {
-                operation: "检查未 Extract 的 Generic 资产",
-                source,
+            .map_err(|source| {
+                cancellable_sqlite_error("检查未 Extract 的 Generic 资产", source, cancellation)
             })?;
         if asset_count != 0 {
             return Err(GenericProjectError::InvalidDatabase {
                 detail: "未 Extract 的 Generic 项目不能包含资产记录".to_owned(),
             });
         }
+        ensure_generic_operation_not_cancelled(cancellation)?;
         return Ok(());
     };
 
-    let live = scan_input_tree(expected.source_root())?;
+    let live = scan_input_tree_with_cancellation(expected.source_root(), cancellation)?;
     if live.raw_fingerprint() != expected_raw_fingerprint
         || Some(live.asset_fingerprint()) != expected.extracted_asset_fingerprint
     {
         return Err(GenericProjectError::InputChangedDuringExtract);
     }
-    let stored = load_snapshot_rows(connection, &actual)?;
-    validate_stored_assets_match_live(&stored, &live)
+    ensure_generic_operation_not_cancelled(cancellation)?;
+    let stored = load_snapshot_rows(connection, &actual, cancellation)?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
+    validate_stored_assets_match_live(&stored, &live, Some(cancellation))
 }
 
 fn clear_extracted_assets(transaction: &Transaction<'_>) -> Result<(), GenericProjectError> {
@@ -2166,20 +4099,6 @@ fn clear_extracted_assets(transaction: &Transaction<'_>) -> Result<(), GenericPr
         })
         .map_err(|source| GenericProjectError::Sqlite {
             operation: "清理 Generic Extract 状态",
-            source,
-        })?;
-    Ok(())
-}
-
-fn clear_all_translations(transaction: &Transaction<'_>) -> Result<(), GenericProjectError> {
-    transaction
-        .execute(
-            "UPDATE generic_unit
-             SET translation = NULL, translation_origin = NULL, translation_state = NULL",
-            [],
-        )
-        .map_err(|source| GenericProjectError::Sqlite {
-            operation: "清理 Generic 语言相关译文",
             source,
         })?;
     Ok(())
@@ -2267,12 +4186,132 @@ fn resolve_planned_path(path: &Path) -> Result<PathBuf, GenericProjectError> {
     }
 }
 
+fn publish_initial_database_candidate(
+    connection: AttSqliteCancellableConnection,
+    candidate_path: &Path,
+    database_path: &Path,
+    cancellation: &CooperativeCancellation,
+) -> Result<(), GenericProjectError> {
+    const CHECKPOINT_OPERATION: &str = "收束 Generic 初始数据库 WAL";
+    const JOURNAL_MODE_OPERATION: &str = "切换 Generic 初始数据库日志模式";
+    const CLOSE_OPERATION: &str = "关闭 Generic 初始数据库候选";
+
+    ensure_generic_operation_not_cancelled(cancellation)?;
+    let (busy, log_frames, checkpointed_frames) = connection
+        .query_row("PRAGMA main.wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|source| cancellable_sqlite_error(CHECKPOINT_OPERATION, source, cancellation))?;
+    if busy != 0 || log_frames != checkpointed_frames {
+        if cancellation.is_requested() {
+            return Err(GenericProjectError::Cancelled);
+        }
+        let code = if busy != 0 {
+            rusqlite::ffi::SQLITE_BUSY
+        } else {
+            rusqlite::ffi::SQLITE_ERROR
+        };
+        return Err(GenericProjectError::Sqlite {
+            operation: CHECKPOINT_OPERATION,
+            source: rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                Some(format!(
+                    "WAL checkpoint 未完成：busy={busy}, log_frames={log_frames}, \
+                     checkpointed_frames={checkpointed_frames}"
+                )),
+            ),
+        });
+    }
+
+    ensure_generic_operation_not_cancelled(cancellation)?;
+    let journal_mode = connection
+        .query_row("PRAGMA main.journal_mode = DELETE", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|source| cancellable_sqlite_error(JOURNAL_MODE_OPERATION, source, cancellation))?;
+    if !journal_mode.eq_ignore_ascii_case("delete") {
+        return Err(GenericProjectError::Sqlite {
+            operation: JOURNAL_MODE_OPERATION,
+            source: rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                Some(format!(
+                    "期望 journal_mode=delete，SQLite 实际返回 {journal_mode:?}"
+                )),
+            ),
+        });
+    }
+
+    ensure_generic_operation_not_cancelled(cancellation)?;
+    connection
+        .close()
+        .map_err(|source| GenericProjectError::Sqlite {
+            operation: CLOSE_OPERATION,
+            source,
+        })?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
+    ensure_initial_database_path_has_no_sidecars(
+        candidate_path,
+        "检查 Generic 初始数据库候选 sidecar",
+        "候选数据库切换到 DELETE 后仍存在 SQLite sidecar",
+        cancellation,
+    )?;
+    ensure_initial_database_path_has_no_sidecars(
+        database_path,
+        "检查 Generic 初始数据库发布目标 sidecar",
+        "首次 Init 的发布目标旁存在不属于当前项目的 SQLite sidecar",
+        cancellation,
+    )?;
+    fs::rename(candidate_path, database_path).map_err(|source| GenericProjectError::Io {
+        operation: "发布 Generic 初始数据库",
+        path: database_path.to_path_buf(),
+        source,
+    })
+}
+
+fn ensure_initial_database_path_has_no_sidecars(
+    database_path: &Path,
+    operation: &'static str,
+    present_message: &'static str,
+    cancellation: &CooperativeCancellation,
+) -> Result<(), GenericProjectError> {
+    for suffix in SQLITE_SIDECAR_SUFFIXES {
+        ensure_generic_operation_not_cancelled(cancellation)?;
+        let sidecar = sqlite_sidecar_path(database_path, suffix);
+        match fs::symlink_metadata(&sidecar) {
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(GenericProjectError::Io {
+                    operation,
+                    path: sidecar,
+                    source,
+                });
+            }
+            Ok(_) => {
+                return Err(GenericProjectError::Io {
+                    operation,
+                    path: sidecar,
+                    source: io::Error::new(io::ErrorKind::AlreadyExists, present_message),
+                });
+            }
+        }
+    }
+    ensure_generic_operation_not_cancelled(cancellation)
+}
+
+fn sqlite_sidecar_path(database_path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = database_path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    PathBuf::from(sidecar)
+}
+
 fn cleanup_initial_database_candidate(candidate_path: &Path) -> Result<(), (PathBuf, io::Error)> {
     let mut paths = vec![candidate_path.to_path_buf()];
-    for suffix in ["-journal", "-wal", "-shm"] {
-        let mut sidecar = candidate_path.as_os_str().to_os_string();
-        sidecar.push(suffix);
-        paths.push(PathBuf::from(sidecar));
+    for suffix in SQLITE_SIDECAR_SUFFIXES {
+        paths.push(sqlite_sidecar_path(candidate_path, suffix));
     }
 
     let mut first_failure = None;
@@ -2309,51 +4348,298 @@ fn validate_translation(translation: &str) -> Result<(), GenericProjectError> {
     Ok(())
 }
 
-fn validate_canonical_resource(
-    kind: &'static str,
-    canonical_json: &str,
-) -> Result<(), GenericProjectError> {
-    let value: serde_json::Value = serde_json::from_str(canonical_json).map_err(|source| {
-        GenericProjectError::InvalidResource {
-            kind,
-            detail: source.to_string(),
-        }
-    })?;
-    if !value.is_array() {
-        return Err(GenericProjectError::InvalidResource {
-            kind,
-            detail: "规范快照必须是 JSON array".to_owned(),
-        });
+trait GenericOperationCancellation {
+    fn ensure_running(&self) -> Result<(), GenericProjectError>;
+    fn is_requested(&self) -> bool;
+}
+
+impl GenericOperationCancellation for CooperativeCancellation {
+    fn ensure_running(&self) -> Result<(), GenericProjectError> {
+        ensure_generic_operation_not_cancelled(self)
     }
-    let encoded =
-        serde_json::to_string(&value).map_err(|source| GenericProjectError::InvalidResource {
-            kind,
-            detail: source.to_string(),
-        })?;
-    if encoded != canonical_json {
+
+    fn is_requested(&self) -> bool {
+        CooperativeCancellation::is_requested(self)
+    }
+}
+
+struct CancellableResourceJsonReader<'a, C: ?Sized> {
+    remaining: &'a [u8],
+    cancellation: &'a C,
+    bytes_until_check: usize,
+    cancelled: bool,
+}
+
+impl<'a, C: GenericOperationCancellation + ?Sized> CancellableResourceJsonReader<'a, C> {
+    fn new(remaining: &'a [u8], cancellation: &'a C) -> Self {
+        Self {
+            remaining,
+            cancellation,
+            bytes_until_check: 0,
+            cancelled: false,
+        }
+    }
+}
+
+impl<C: GenericOperationCancellation + ?Sized> Read for CancellableResourceJsonReader<'_, C> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if self.cancelled {
+            // serde_json 在一次底层读取失败后仍可能请求更多输入。取消事实必须锁存，
+            // 后续读取只重复不可重试的 I/O 错误，不能再次调用取消检查。
+            return Err(io::Error::other("Generic 翻译资源 JSON 解析已取消"));
+        }
+        if output.is_empty() || self.remaining.is_empty() {
+            return Ok(0);
+        }
+        if self.bytes_until_check == 0 {
+            if self.cancellation.ensure_running().is_err() {
+                self.cancelled = true;
+                return Err(io::Error::other("Generic 翻译资源 JSON 解析已取消"));
+            }
+            self.bytes_until_check = RESOURCE_CANCELLATION_CHECK_BYTES;
+        }
+        let copied = output
+            .len()
+            .min(self.remaining.len())
+            .min(self.bytes_until_check);
+        output[..copied].copy_from_slice(&self.remaining[..copied]);
+        self.remaining = &self.remaining[copied..];
+        self.bytes_until_check -= copied;
+        Ok(copied)
+    }
+}
+
+struct CancellableResourceJsonWriter<'a, C: ?Sized> {
+    output: &'a mut Vec<u8>,
+    cancellation: &'a C,
+    bytes_until_check: usize,
+    cancelled: bool,
+}
+
+impl<'a, C: GenericOperationCancellation + ?Sized> CancellableResourceJsonWriter<'a, C> {
+    fn new(output: &'a mut Vec<u8>, cancellation: &'a C) -> Self {
+        Self {
+            output,
+            cancellation,
+            bytes_until_check: 0,
+            cancelled: false,
+        }
+    }
+}
+
+impl<C: GenericOperationCancellation + ?Sized> Write for CancellableResourceJsonWriter<'_, C> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.cancelled {
+            // 与 reader 保持同一锁存语义，避免序列化器在首次错误后重复轮询取消。
+            return Err(io::Error::other("Generic 翻译资源 JSON 编码已取消"));
+        }
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        if self.bytes_until_check == 0 {
+            if self.cancellation.ensure_running().is_err() {
+                self.cancelled = true;
+                return Err(io::Error::other("Generic 翻译资源 JSON 编码已取消"));
+            }
+            self.bytes_until_check = RESOURCE_CANCELLATION_CHECK_BYTES;
+        }
+        let written = bytes.len().min(self.bytes_until_check);
+        self.output.extend_from_slice(&bytes[..written]);
+        self.bytes_until_check -= written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn validate_translation_resources_with_cancellation(
+    terminology_json: &str,
+    placeholder_rules_json: &str,
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> Result<GenericCompiledTranslationResources, GenericProjectError> {
+    let terminology_json = clone_text_with_cancellation(terminology_json, cancellation)?;
+    let placeholder_rules_json =
+        clone_text_with_cancellation(placeholder_rules_json, cancellation)?;
+    compile_translation_resources_with_cancellation(
+        terminology_json,
+        placeholder_rules_json,
+        cancellation,
+    )
+}
+
+fn compile_translation_resources_with_cancellation(
+    terminology_json: String,
+    placeholder_rules_json: String,
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> Result<GenericCompiledTranslationResources, GenericProjectError> {
+    let terminology =
+        compile_terminology_resource_with_cancellation(terminology_json, cancellation)?;
+    let placeholder =
+        compile_placeholder_resource_with_cancellation(placeholder_rules_json, cancellation)?;
+    cancellation.ensure_running()?;
+    Ok(GenericCompiledTranslationResources {
+        terminology,
+        placeholder,
+    })
+}
+
+fn clone_text_with_cancellation(
+    value: &str,
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> Result<String, GenericProjectError> {
+    let mut cloned = String::with_capacity(value.len());
+    append_text_with_cancellation(&mut cloned, value, cancellation)?;
+    cancellation.ensure_running()?;
+    Ok(cloned)
+}
+
+fn compile_terminology_resource_with_cancellation(
+    canonical_json: String,
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> Result<GenericCompiledTerminologyResource, GenericProjectError> {
+    cancellation.ensure_running()?;
+    let slice_reader = CancellableResourceJsonReader::new(canonical_json.as_bytes(), cancellation);
+    let mut reader = BufReader::with_capacity(RESOURCE_CANCELLATION_CHECK_BYTES, slice_reader);
+    let entries_result = serde_json::from_reader::<_, Vec<TerminologyEntry>>(&mut reader);
+    let cancelled = reader.get_ref().cancelled;
+    drop(reader);
+    if cancelled {
+        return Err(GenericProjectError::Cancelled);
+    }
+    cancellation.ensure_running()?;
+    let entries = entries_result.map_err(|source| GenericProjectError::InvalidResource {
+        kind: TERMINOLOGY_RESOURCE,
+        detail: source.to_string(),
+    })?;
+
+    let mut encoded = Vec::with_capacity(canonical_json.len());
+    let (encode_result, cancelled) = {
+        let mut writer = CancellableResourceJsonWriter::new(&mut encoded, cancellation);
+        let result = serde_json::to_writer(&mut writer, &entries);
+        (result, writer.cancelled)
+    };
+    if cancelled {
+        return Err(GenericProjectError::Cancelled);
+    }
+    cancellation.ensure_running()?;
+    encode_result.map_err(|source| GenericProjectError::InvalidResource {
+        kind: TERMINOLOGY_RESOURCE,
+        detail: source.to_string(),
+    })?;
+    if !bytes_equal_with_cancellation(&encoded, canonical_json.as_bytes(), cancellation)? {
         return Err(GenericProjectError::InvalidResource {
-            kind,
+            kind: TERMINOLOGY_RESOURCE,
             detail: "资源快照不是规范紧凑 JSON".to_owned(),
         });
     }
-    Ok(())
+
+    let compiled =
+        compile_terminology_with_cancellation(entries, &|| cancellation.ensure_running().is_err())
+            .map_err(terminology_resource_error)?;
+    cancellation.ensure_running()?;
+    Ok(GenericCompiledTerminologyResource {
+        canonical_json: Arc::new(canonical_json),
+        compiled: Arc::new(compiled),
+    })
 }
 
-fn validate_placeholder_resource(canonical_json: &str) -> Result<(), GenericProjectError> {
+fn terminology_resource_error(source: TerminologyDefinitionError) -> GenericProjectError {
+    match source {
+        TerminologyDefinitionError::Cancelled => GenericProjectError::Cancelled,
+        TerminologyDefinitionError::StartWorker { operation, source } => {
+            GenericProjectError::WorkerStart { operation, source }
+        }
+        source => GenericProjectError::InvalidResource {
+            kind: TERMINOLOGY_RESOURCE,
+            detail: source.to_string(),
+        },
+    }
+}
+
+fn compile_placeholder_resource_with_cancellation(
+    canonical_json: String,
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> Result<GenericCompiledPlaceholderResource, GenericProjectError> {
     let service = GenericPlaceholderService::default();
     let definitions = service
-        .parse_canonical_json(canonical_json)
-        .map_err(|source| GenericProjectError::InvalidResource {
+        .parse_canonical_json_with_cancellation(&canonical_json, || cancellation.ensure_running())?
+        .map_err(placeholder_resource_error)?;
+    let mut encoded = Vec::with_capacity(canonical_json.len());
+    let (encode_result, cancelled) = {
+        let mut writer = CancellableResourceJsonWriter::new(&mut encoded, cancellation);
+        let result = serde_json::to_writer(&mut writer, &definitions);
+        (result, writer.cancelled)
+    };
+    if cancelled {
+        return Err(GenericProjectError::Cancelled);
+    }
+    cancellation.ensure_running()?;
+    encode_result.map_err(|source| GenericProjectError::InvalidResource {
+        kind: PLACEHOLDER_RULES_RESOURCE,
+        detail: source.to_string(),
+    })?;
+    if !bytes_equal_with_cancellation(&encoded, canonical_json.as_bytes(), cancellation)? {
+        return Err(GenericProjectError::InvalidResource {
+            kind: PLACEHOLDER_RULES_RESOURCE,
+            detail: "资源快照不是规范紧凑 JSON".to_owned(),
+        });
+    }
+    let compiled = service
+        .compile_with_cancellation(definitions, || cancellation.ensure_running())?
+        .map_err(placeholder_resource_error)?;
+    cancellation.ensure_running()?;
+    Ok(GenericCompiledPlaceholderResource {
+        canonical_json: Arc::new(canonical_json),
+        service,
+        compiled,
+    })
+}
+
+fn placeholder_resource_error(source: GenericPlaceholderError) -> GenericProjectError {
+    match source {
+        GenericPlaceholderError::Compilation(PlaceholderRuleCompilationError::StartWorker {
+            operation,
+            source,
+        }) => GenericProjectError::WorkerStart { operation, source },
+        source => GenericProjectError::InvalidResource {
             kind: PLACEHOLDER_RULES_RESOURCE,
             detail: source.to_string(),
-        })?;
-    service
-        .compile(definitions)
-        .map_err(|source| GenericProjectError::InvalidResource {
-            kind: PLACEHOLDER_RULES_RESOURCE,
-            detail: source.to_string(),
-        })?;
-    Ok(())
+        },
+    }
+}
+
+fn manual_translation_placeholder_error(source: GenericPlaceholderError) -> GenericProjectError {
+    match source {
+        GenericPlaceholderError::Compilation(PlaceholderRuleCompilationError::StartWorker {
+            operation,
+            source,
+        }) => GenericProjectError::WorkerStart { operation, source },
+        source => GenericProjectError::InvalidTranslation(source.to_string()),
+    }
+}
+
+fn bytes_equal_with_cancellation(
+    left: &[u8],
+    right: &[u8],
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> Result<bool, GenericProjectError> {
+    cancellation.ensure_running()?;
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    for (left, right) in left
+        .chunks(RESOURCE_CANCELLATION_CHECK_BYTES)
+        .zip(right.chunks(RESOURCE_CANCELLATION_CHECK_BYTES))
+    {
+        cancellation.ensure_running()?;
+        if left != right {
+            return Ok(false);
+        }
+    }
+    cancellation.ensure_running()?;
+    Ok(true)
 }
 
 fn to_i64(value: usize) -> Result<i64, GenericProjectError> {
@@ -2400,18 +4686,26 @@ fn encode_path(path: &Path) -> Vec<u8> {
 }
 
 #[cfg(windows)]
-fn decode_path(bytes: &[u8]) -> Result<PathBuf, GenericProjectError> {
+fn decode_path_with_cancellation(
+    bytes: &[u8],
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> Result<PathBuf, GenericProjectError> {
     use std::os::windows::ffi::OsStringExt;
 
+    cancellation.ensure_running()?;
     if bytes.is_empty() || !bytes.len().is_multiple_of(2) {
         return Err(GenericProjectError::InvalidDatabase {
             detail: "路径 BLOB 必须是非空 UTF-16LE code units".to_owned(),
         });
     }
-    let units = bytes
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-        .collect::<Vec<_>>();
+    let mut units = Vec::with_capacity(bytes.len() / 2);
+    for chunk in bytes.chunks(RESOURCE_CANCELLATION_CHECK_BYTES) {
+        cancellation.ensure_running()?;
+        for pair in chunk.chunks_exact(2) {
+            units.push(u16::from_le_bytes([pair[0], pair[1]]));
+        }
+    }
+    cancellation.ensure_running()?;
     Ok(PathBuf::from(OsString::from_wide(&units)))
 }
 
@@ -2421,23 +4715,430 @@ fn encode_path(path: &Path) -> Vec<u8> {
 }
 
 #[cfg(not(windows))]
-fn decode_path(bytes: &[u8]) -> Result<PathBuf, GenericProjectError> {
-    let value = std::str::from_utf8(bytes).map_err(|_| GenericProjectError::InvalidDatabase {
-        detail: "路径不是有效 UTF-8".to_owned(),
-    })?;
-    Ok(PathBuf::from(value))
+fn decode_path_with_cancellation(
+    bytes: &[u8],
+    cancellation: &(impl GenericOperationCancellation + ?Sized),
+) -> Result<PathBuf, GenericProjectError> {
+    if validate_utf8_bytes_with_cancellation(bytes, cancellation)?.is_err() {
+        return Err(GenericProjectError::InvalidDatabase {
+            detail: "路径不是有效 UTF-8".to_owned(),
+        });
+    }
+    // SAFETY: 上面的分块校验已经确认整份字节串是 UTF-8。
+    let value = unsafe { std::str::from_utf8_unchecked(bytes) };
+    let mut cloned = String::with_capacity(value.len());
+    append_text_with_cancellation(&mut cloned, value, cancellation)?;
+    Ok(PathBuf::from(cloned))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::fs;
 
     use tempfile::tempdir;
 
     use super::*;
 
+    struct CancelResourceAt {
+        cancel_at: usize,
+        polls: Cell<usize>,
+    }
+
+    impl CancelResourceAt {
+        fn new(cancel_at: usize) -> Self {
+            Self {
+                cancel_at,
+                polls: Cell::new(0),
+            }
+        }
+    }
+
+    impl GenericOperationCancellation for CancelResourceAt {
+        fn ensure_running(&self) -> Result<(), GenericProjectError> {
+            let polls = self.polls.get() + 1;
+            self.polls.set(polls);
+            if polls >= self.cancel_at {
+                Err(GenericProjectError::Cancelled)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn is_requested(&self) -> bool {
+            self.polls.get() >= self.cancel_at
+        }
+    }
+
+    #[test]
+    fn cancellable_sqlite_errors_keep_cancellation_semantics() {
+        let running = CooperativeCancellation::default();
+        let interrupted = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
+            None,
+        );
+        assert!(matches!(
+            cancellable_sqlite_error("测试查询", interrupted, &running),
+            GenericProjectError::Cancelled
+        ));
+
+        let requested = CooperativeCancellation::default();
+        requested.request();
+        assert!(matches!(
+            cancellable_sqlite_error("测试查询", rusqlite::Error::QueryReturnedNoRows, &requested,),
+            GenericProjectError::Cancelled
+        ));
+
+        assert!(matches!(
+            cancellable_sqlite_error("测试查询", rusqlite::Error::QueryReturnedNoRows, &running,),
+            GenericProjectError::Sqlite {
+                operation: "测试查询",
+                source: rusqlite::Error::QueryReturnedNoRows,
+            }
+        ));
+    }
+
     fn language(value: &str) -> LanguageId {
         LanguageId::parse(value).expect("测试语言应合法")
+    }
+
+    #[test]
+    fn typed_resource_validation_can_cancel_json_parsing_and_encoding() {
+        let long_terminology = format!(
+            r#"[{{"term":"{}","translation":"译文","triggers":["触发"]}}]"#,
+            "x".repeat(RESOURCE_CANCELLATION_CHECK_BYTES * 3)
+        );
+        let terminology_parse_cancellation = CancelResourceAt::new(3);
+        assert!(matches!(
+            compile_terminology_resource_with_cancellation(
+                long_terminology,
+                &terminology_parse_cancellation,
+            ),
+            Err(GenericProjectError::Cancelled)
+        ));
+        assert_eq!(terminology_parse_cancellation.polls.get(), 3);
+
+        let terminology_encode_cancellation = CancelResourceAt::new(4);
+        assert!(matches!(
+            compile_terminology_resource_with_cancellation(
+                "[]".to_owned(),
+                &terminology_encode_cancellation,
+            ),
+            Err(GenericProjectError::Cancelled)
+        ));
+        assert_eq!(terminology_encode_cancellation.polls.get(), 4);
+
+        let long_placeholder = format!(
+            r#"[{{"pattern":"{}"}}]"#,
+            "x".repeat(RESOURCE_CANCELLATION_CHECK_BYTES * 3)
+        );
+        let placeholder_parse_cancellation = CancelResourceAt::new(3);
+        assert!(matches!(
+            compile_placeholder_resource_with_cancellation(
+                long_placeholder,
+                &placeholder_parse_cancellation,
+            ),
+            Err(GenericProjectError::Cancelled)
+        ));
+        assert_eq!(placeholder_parse_cancellation.polls.get(), 3);
+
+        let placeholder_encode_cancellation = CancelResourceAt::new(4);
+        assert!(matches!(
+            compile_placeholder_resource_with_cancellation(
+                "[]".to_owned(),
+                &placeholder_encode_cancellation,
+            ),
+            Err(GenericProjectError::Cancelled)
+        ));
+        assert_eq!(placeholder_encode_cancellation.polls.get(), 4);
+    }
+
+    #[test]
+    fn snapshot_text_lookup_and_exact_comparison_poll_between_long_chunks() {
+        let long = "x".repeat(RESOURCE_CANCELLATION_CHECK_BYTES * 3);
+        let fingerprint_cancellation = CancelResourceAt::new(2);
+        assert!(matches!(
+            lookup_text_fingerprint_with_cancellation(&long, &fingerprint_cancellation),
+            Err(GenericProjectError::Cancelled)
+        ));
+
+        let comparison_cancellation = CancelResourceAt::new(3);
+        assert!(matches!(
+            bytes_equal_with_cancellation(
+                long.as_bytes(),
+                long.as_bytes(),
+                &comparison_cancellation
+            ),
+            Err(GenericProjectError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn resource_worker_start_failures_remain_internal_operation_errors() {
+        assert!(matches!(
+            terminology_resource_error(TerminologyDefinitionError::Cancelled),
+            GenericProjectError::Cancelled
+        ));
+
+        let errors = [
+            terminology_resource_error(TerminologyDefinitionError::StartWorker {
+                operation: "启动术语测试 worker",
+                source: io::Error::from_raw_os_error(8),
+            }),
+            placeholder_resource_error(GenericPlaceholderError::Compilation(
+                PlaceholderRuleCompilationError::StartWorker {
+                    operation: "启动 Placeholder 资源测试 worker",
+                    source: io::Error::from_raw_os_error(8),
+                },
+            )),
+            manual_translation_placeholder_error(GenericPlaceholderError::Compilation(
+                PlaceholderRuleCompilationError::StartWorker {
+                    operation: "启动人工译文测试 worker",
+                    source: io::Error::from_raw_os_error(8),
+                },
+            )),
+        ];
+
+        for error in errors {
+            let (operation, source) = match &error {
+                GenericProjectError::WorkerStart { operation, source } => (operation, source),
+                other => panic!("worker 启动失败不得归类为用户输入无效：{other:?}"),
+            };
+            assert_eq!(source.raw_os_error(), Some(8));
+            assert!(std::error::Error::source(&error).is_some());
+            assert!(error.to_string().contains(*operation));
+
+            let diagnostic = error.safe_diagnostic_source(
+                DiagnosticStage::Translate,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::Retry,
+            );
+            assert_eq!(diagnostic.code, DiagnosticCode::InternalOperation);
+            assert!(matches!(
+                diagnostic.reason,
+                DiagnosticReason::Io {
+                    ref operation,
+                    raw_os_code: Some(8),
+                    ..
+                } if operation == "spawn_worker"
+            ));
+            assert_eq!(diagnostic.action, DiagnosticAction::ReportBug);
+        }
+    }
+
+    #[test]
+    fn project_row_clone_is_chunked() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(CREATE_INITIAL_SCHEMA_SQL).unwrap();
+        let project_name = "x".repeat(RESOURCE_CANCELLATION_CHECK_BYTES * 3);
+        connection
+            .execute(
+                "INSERT INTO generic_project (
+                     singleton, project_name, source_root, source_language, target_language
+                 ) VALUES (1, ?1, x'0100', 'ja', 'zh-Hans')",
+                [&project_name],
+            )
+            .unwrap();
+        let cancellation = CancelResourceAt::new(3);
+
+        assert!(matches!(
+            load_generic_project_row_with_cancellation(&connection, &cancellation),
+            Err(GenericProjectError::Cancelled)
+        ));
+        assert_eq!(cancellation.polls.get(), 3);
+    }
+
+    #[test]
+    fn snapshot_row_clone_is_chunked() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(CREATE_INITIAL_SCHEMA_SQL).unwrap();
+        let relative_path = vec![b'x'; RESOURCE_CANCELLATION_CHECK_BYTES * 3];
+        connection
+            .execute(
+                "INSERT INTO generic_file (relative_path, ordinal) VALUES (?1, 0)",
+                [&relative_path],
+            )
+            .unwrap();
+        let project = GenericProject {
+            project_name: "game".parse().unwrap(),
+            workspace_root: PathBuf::from("workspace"),
+            database_path: PathBuf::from("workspace/project.db"),
+            source_root: PathBuf::from("source"),
+            language_pair: LanguagePair::new(language("ja"), language("zh-Hans")),
+            extracted_raw_fingerprint: None,
+            extracted_asset_fingerprint: None,
+            last_profile_id: None,
+        };
+        let cancellation = CancelResourceAt::new(4);
+
+        assert!(matches!(
+            load_snapshot_rows(&connection, &project, &cancellation),
+            Err(GenericProjectError::Cancelled)
+        ));
+        assert_eq!(cancellation.polls.get(), 4);
+    }
+
+    #[test]
+    fn schema_comparison_polls_while_comparing_a_large_definition() {
+        let long_prefix = "x".repeat(RESOURCE_CANCELLATION_CHECK_BYTES * 3);
+        let actual = [GenericSchemaObject {
+            kind: "table".to_owned(),
+            name: "generic_project".to_owned(),
+            table_name: "generic_project".to_owned(),
+            sql: format!("{long_prefix}a"),
+        }];
+        let expected = [GenericSchemaObject {
+            kind: "table".to_owned(),
+            name: "generic_project".to_owned(),
+            table_name: "generic_project".to_owned(),
+            sql: format!("{long_prefix}b"),
+        }];
+        let cancellation = CancelResourceAt::new(28);
+
+        assert!(matches!(
+            validate_generic_schema_objects_with_cancellation(&actual, &expected, &cancellation,),
+            Err(GenericProjectError::Cancelled)
+        ));
+        assert_eq!(cancellation.polls.get(), 28);
+    }
+
+    #[test]
+    fn current_schema_validation_uses_the_command_cancellation() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(CREATE_INITIAL_SCHEMA_SQL).unwrap();
+        let cancellation = CooperativeCancellation::default();
+        cancellation.request();
+
+        assert!(matches!(
+            validate_current_generic_schema_with_cancellation(&connection, &cancellation),
+            Err(GenericProjectError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn translation_resource_row_clone_is_chunked() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(CREATE_INITIAL_SCHEMA_SQL).unwrap();
+        let canonical_json = format!(
+            r#"["{}"]"#,
+            "x".repeat(RESOURCE_CANCELLATION_CHECK_BYTES * 3)
+        );
+        connection
+            .execute(
+                "UPDATE translation_resource SET canonical_json = ?1
+                 WHERE resource_kind = 'terminology'",
+                [&canonical_json],
+            )
+            .unwrap();
+        let cancellation = CancelResourceAt::new(3);
+
+        assert!(matches!(
+            load_translation_resource_row_with_cancellation(
+                &connection,
+                TERMINOLOGY_RESOURCE,
+                &cancellation,
+            ),
+            Err(GenericProjectError::Cancelled)
+        ));
+        assert_eq!(cancellation.polls.get(), 3);
+    }
+
+    #[test]
+    fn sqlite_row_text_clone_is_chunked_and_preserves_conversion_errors() {
+        let connection = Connection::open_in_memory().unwrap();
+        let large_text = "你".repeat(RESOURCE_CANCELLATION_CHECK_BYTES);
+        let mut statement = connection.prepare("SELECT ?1 AS value").unwrap();
+        let mut rows = statement.query([&large_text]).unwrap();
+        let row = rows.next().unwrap().unwrap();
+        let cancellation = CancelResourceAt::new(3);
+
+        assert!(matches!(
+            clone_sqlite_text_column_with_cancellation(row, 0, "读取测试 TEXT", &cancellation,),
+            Err(GenericProjectError::Cancelled)
+        ));
+        assert_eq!(cancellation.polls.get(), 3);
+        drop(rows);
+        drop(statement);
+
+        let mut statement = connection.prepare("SELECT 7 AS value").unwrap();
+        let mut rows = statement.query([]).unwrap();
+        let row = rows.next().unwrap().unwrap();
+        let never_cancel = CancelResourceAt::new(usize::MAX);
+        assert!(matches!(
+            clone_sqlite_text_column_with_cancellation(
+                row,
+                0,
+                "读取测试 TEXT",
+                &never_cancel,
+            ),
+            Err(GenericProjectError::Sqlite {
+                source: rusqlite::Error::InvalidColumnType(
+                    0,
+                    ref column,
+                    rusqlite::types::Type::Integer,
+                ),
+                ..
+            }) if column == "value"
+        ));
+        drop(rows);
+        drop(statement);
+
+        let mut statement = connection
+            .prepare("SELECT CAST(x'80' AS TEXT) AS value")
+            .unwrap();
+        let mut rows = statement.query([]).unwrap();
+        let row = rows.next().unwrap().unwrap();
+        assert!(matches!(
+            clone_sqlite_text_column_with_cancellation(row, 0, "读取测试 TEXT", &never_cancel,),
+            Err(GenericProjectError::InvalidDatabase { ref detail })
+                if detail.contains("SQLite TEXT 第 0 列不是有效 UTF-8")
+                    && detail.contains("valid_up_to=0")
+                    && detail.contains("error_len=1")
+        ));
+    }
+
+    #[test]
+    fn manual_state_fact_loading_cancels_while_cloning_a_large_sqlite_field() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(CREATE_INITIAL_SCHEMA_SQL).unwrap();
+        let large_source_language = "x".repeat(RESOURCE_CANCELLATION_CHECK_BYTES * 3);
+        connection
+            .execute(
+                "INSERT INTO generic_project (
+                     singleton, project_name, source_root, source_language, target_language
+                 ) VALUES (1, 'game', x'0100', ?1, 'zh-Hans')",
+                [&large_source_language],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO generic_file (relative_path, ordinal)
+                 VALUES (x'0200', 0)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO generic_group (
+                     group_id, relative_path, ordinal, kind, context_fingerprint
+                 ) VALUES ('g', x'0200', 0, 'k', zeroblob(32))",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO generic_unit (group_id, unit_id, ordinal, source_text)
+                 VALUES ('g', 'u', 0, 'source')",
+                [],
+            )
+            .unwrap();
+        let cancellation = CancelResourceAt::new(3);
+
+        assert!(matches!(
+            load_manual_translation_state_facts(&connection, "g", "u", &cancellation),
+            Err(GenericProjectError::Cancelled)
+        ));
+        assert_eq!(cancellation.polls.get(), 3);
     }
 
     fn init(workspace: &Path, source: &Path) -> GenericProjectStore {
@@ -2454,6 +5155,64 @@ mod tests {
 
     fn write_source(source: &Path, content: &str) {
         fs::write(source.join("text.jsonl"), content).expect("测试输入应写入");
+    }
+
+    #[test]
+    fn project_diagnostics_preserve_io_sqlite_and_state_facts() {
+        let io_error = GenericProjectError::Io {
+            operation: "读取 Generic 测试输入",
+            path: PathBuf::from("nested/input.jsonl"),
+            source: io::Error::from_raw_os_error(5),
+        };
+        let io_diagnostic = io_error.safe_diagnostic_source(
+            DiagnosticStage::Extract,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::Retry,
+        );
+        assert!(matches!(
+            io_diagnostic.subject,
+            DiagnosticSubject::Path { ref path } if path.ends_with("nested/input.jsonl")
+        ));
+        assert!(matches!(
+            io_diagnostic.reason,
+            DiagnosticReason::Io {
+                raw_os_code: Some(5),
+                ..
+            }
+        ));
+
+        let connection = Connection::open_in_memory().unwrap();
+        let source = connection
+            .execute("INSERT INTO missing_table VALUES (1)", [])
+            .expect_err("不存在的表必须产生 SQLite driver 错误");
+        let sqlite_diagnostic = GenericProjectError::Sqlite {
+            operation: "写入 Generic 测试数据库",
+            source,
+        }
+        .safe_diagnostic_source(
+            DiagnosticStage::Translate,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::Retry,
+        );
+        assert!(matches!(
+            sqlite_diagnostic.reason,
+            DiagnosticReason::Sqlite {
+                primary_code: 1,
+                extended_code: 1,
+            }
+        ));
+
+        let state_diagnostic = GenericProjectError::ExtractRequired.safe_diagnostic_source(
+            DiagnosticStage::Translate,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::Retry,
+        );
+        assert!(matches!(
+            state_diagnostic.reason,
+            DiagnosticReason::Failure {
+                failure: DiagnosticFailureKind::GenericExtractRequired,
+            }
+        ));
     }
 
     #[test]
@@ -2487,8 +5246,12 @@ mod tests {
         let workspace = temp.path().join("project");
         let store = init(&workspace, &source);
         let project = store.open().expect("Generic 项目应可打开");
-        let connection =
-            open_sqlite_connection(project.database_path(), false).expect("项目数据库应可重开");
+        let connection = open_sqlite_connection(
+            project.database_path(),
+            false,
+            CooperativeCancellation::default(),
+        )
+        .expect("项目数据库应可重开");
 
         let page_size: i64 = connection
             .query_row("PRAGMA page_size", [], |row| row.get(0))
@@ -2511,6 +5274,115 @@ mod tests {
         assert_eq!(synchronous, 2, "SQLite FULL synchronous 应返回枚举值 2");
         assert_eq!(cache_size, -(3 * 1024 * 1024));
         assert_eq!(temp_store, 2, "SQLite MEMORY TEMP 模式应返回枚举值 2");
+    }
+
+    #[test]
+    fn initial_database_matches_the_current_exact_generic_schema() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let workspace = temp.path().join("project");
+        let _store = init(&workspace, &source);
+        let connection =
+            Connection::open(workspace.join(DATABASE_FILE_NAME)).expect("应打开 Generic 数据库");
+
+        validate_current_generic_schema(&connection)
+            .expect("新建数据库必须与当前唯一 Generic schema 完全一致");
+    }
+
+    #[test]
+    fn current_generic_schema_rejects_definition_drift_and_attached_objects() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(CREATE_INITIAL_SCHEMA_SQL).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE translation_resource RENAME TO translation_resource_old;
+                 CREATE TABLE translation_resource (
+                     resource_kind TEXT PRIMARY KEY,
+                     canonical_json TEXT NOT NULL
+                 ) STRICT;
+                 INSERT INTO translation_resource
+                 SELECT * FROM translation_resource_old;
+                 DROP TABLE translation_resource_old;",
+            )
+            .unwrap();
+
+        let definition_error =
+            validate_current_generic_schema(&connection).expect_err("约束变化必须拒绝");
+        assert!(matches!(
+            definition_error,
+            GenericProjectError::InvalidDatabase { ref detail }
+                if detail.contains("definition_mismatches=table/translation_resource")
+        ));
+
+        connection
+            .execute(
+                "CREATE INDEX unexpected_generic_unit_index
+                 ON generic_unit(source_text)",
+                [],
+            )
+            .unwrap();
+        let attached_object_error =
+            validate_current_generic_schema(&connection).expect_err("附加受管索引必须拒绝");
+        assert!(matches!(
+            attached_object_error,
+            GenericProjectError::InvalidDatabase { ref detail }
+                if detail.contains("unexpected=index/unexpected_generic_unit_index")
+        ));
+    }
+
+    #[test]
+    fn normal_project_open_rejects_generic_schema_drift() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let workspace = temp.path().join("project");
+        let store = init(&workspace, &source);
+        Connection::open(workspace.join(DATABASE_FILE_NAME))
+            .unwrap()
+            .execute_batch(
+                "ALTER TABLE translation_resource RENAME TO translation_resource_old;
+                 CREATE TABLE translation_resource (
+                     resource_kind TEXT PRIMARY KEY,
+                     canonical_json TEXT NOT NULL
+                 ) STRICT;
+                 INSERT INTO translation_resource
+                 SELECT * FROM translation_resource_old;
+                 DROP TABLE translation_resource_old;",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.open(),
+            Err(GenericProjectError::InvalidDatabase { ref detail })
+                if detail.contains("definition_mismatches=table/translation_resource")
+        ));
+    }
+
+    #[test]
+    fn normal_project_open_rejects_typed_invalid_terminology_resource() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let workspace = temp.path().join("project");
+        let store = init(&workspace, &source);
+        Connection::open(workspace.join(DATABASE_FILE_NAME))
+            .unwrap()
+            .execute(
+                "UPDATE translation_resource
+                 SET canonical_json = '[1]'
+                 WHERE resource_kind = 'terminology'",
+                [],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.open(),
+            Err(GenericProjectError::InvalidResource {
+                kind: TERMINOLOGY_RESOURCE,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2579,13 +5451,235 @@ mod tests {
     }
 
     #[test]
+    fn first_init_publishes_a_self_contained_database_file() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let workspace = temp.path().join("project");
+        let (_, initialized) = GenericProjectStore::initialize(GenericInitRequest {
+            project_name: "game".parse().unwrap(),
+            workspace_root: workspace.clone(),
+            source_root: Some(source.canonicalize().unwrap()),
+            source_language: Some(language("ja")),
+            target_language: Some(language("zh-Hans")),
+        })
+        .expect("首次 Init 应发布数据库");
+        let published = workspace.join(DATABASE_FILE_NAME);
+        for suffix in SQLITE_SIDECAR_SUFFIXES {
+            assert!(
+                !sqlite_sidecar_path(&published, suffix).exists(),
+                "首次 Init 成功后不得依赖 SQLite sidecar"
+            );
+        }
+
+        let isolated_workspace = temp.path().join("isolated-project");
+        fs::create_dir(&isolated_workspace).unwrap();
+        let isolated_database = isolated_workspace.join(DATABASE_FILE_NAME);
+        fs::copy(&published, &isolated_database).expect("应只复制已发布的主数据库文件");
+        let isolated_connection =
+            Connection::open(&isolated_database).expect("独立主数据库文件应可直接重开");
+        validate_current_generic_schema(&isolated_connection)
+            .expect("独立主数据库文件应包含完整的当前 schema");
+        let singleton_count: i64 = isolated_connection
+            .query_row(
+                "SELECT count(*) FROM generic_project WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应可读取独立主数据库中的项目单例");
+        assert_eq!(singleton_count, 1);
+        let journal_mode: String = isolated_connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("应可读取独立主数据库的日志模式");
+        assert_eq!(journal_mode, "delete");
+        isolated_connection
+            .close()
+            .expect("独立主数据库验证连接应可显式关闭");
+
+        let reopened = GenericProjectStore::for_workspace(isolated_workspace)
+            .open()
+            .expect("只复制主数据库文件后仍应能通过生产读取路径打开");
+        assert_eq!(reopened.project_name(), initialized.project_name());
+        assert_eq!(reopened.source_root(), initialized.source_root());
+        assert_eq!(reopened.language_pair(), initialized.language_pair());
+    }
+
+    #[test]
+    fn first_init_rejects_and_preserves_every_stale_target_sidecar() {
+        for suffix in SQLITE_SIDECAR_SUFFIXES {
+            let temp = tempdir().unwrap();
+            let source = temp.path().join("source");
+            fs::create_dir(&source).unwrap();
+            let workspace = temp.path().join("project");
+            fs::create_dir(&workspace).unwrap();
+            let published = workspace.join(DATABASE_FILE_NAME);
+            let stale_sidecar = sqlite_sidecar_path(&published, suffix);
+            fs::write(&stale_sidecar, b"stale-sidecar").expect("应建立遗留 sidecar");
+
+            let error = GenericProjectStore::initialize(GenericInitRequest {
+                project_name: "game".parse().unwrap(),
+                workspace_root: workspace.clone(),
+                source_root: Some(source.canonicalize().unwrap()),
+                source_language: Some(language("ja")),
+                target_language: Some(language("zh-Hans")),
+            })
+            .expect_err("发布目标旁存在遗留 sidecar 时不得建立新项目");
+
+            assert!(matches!(
+                error,
+                GenericProjectError::Io {
+                    operation: "检查 Generic 初始数据库发布目标 sidecar",
+                    ref path,
+                    ref source,
+                } if path == &stale_sidecar && source.kind() == io::ErrorKind::AlreadyExists
+            ));
+            assert!(!published.exists(), "拒绝遗留 sidecar 时不得发布主数据库");
+            assert_eq!(
+                fs::read(&stale_sidecar).expect("遗留 sidecar 必须保留"),
+                b"stale-sidecar"
+            );
+            assert!(
+                fs::read_dir(&workspace).unwrap().all(|entry| {
+                    !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".project.db.init-")
+                }),
+                "拒绝遗留 sidecar 后不得留下候选数据库"
+            );
+        }
+    }
+
+    #[test]
+    fn target_sidecar_appearing_during_init_still_blocks_publish() {
+        for suffix in SQLITE_SIDECAR_SUFFIXES {
+            let temp = tempdir().unwrap();
+            let source = temp.path().join("source");
+            fs::create_dir(&source).unwrap();
+            let candidate = temp.path().join("candidate.db");
+            let published = temp.path().join(DATABASE_FILE_NAME);
+            let stale_sidecar = sqlite_sidecar_path(&published, suffix);
+            let cancellation = CooperativeCancellation::default();
+            let mut connection = open_sqlite_connection(&candidate, true, cancellation.clone())
+                .expect("应打开候选库");
+            create_initial_schema(
+                &mut connection,
+                &"game".parse().unwrap(),
+                &source.canonicalize().unwrap(),
+                &language("ja"),
+                &language("zh-Hans"),
+                &cancellation,
+            )
+            .expect("应建立候选 schema");
+            fs::write(&stale_sidecar, b"appeared-during-init")
+                .expect("应模拟候选建立后出现的目标 sidecar");
+
+            let error = publish_initial_database_candidate(
+                connection,
+                &candidate,
+                &published,
+                &cancellation,
+            )
+            .expect_err("最终 rename 前发现目标 sidecar 时不得发布");
+
+            assert!(matches!(
+                error,
+                GenericProjectError::Io {
+                    operation: "检查 Generic 初始数据库发布目标 sidecar",
+                    ref path,
+                    ref source,
+                } if path == &stale_sidecar && source.kind() == io::ErrorKind::AlreadyExists
+            ));
+            assert!(!published.exists(), "目标 sidecar 竞争时不得发布主数据库");
+            assert_eq!(
+                fs::read(&stale_sidecar).expect("竞争产生的 sidecar 必须保留"),
+                b"appeared-during-init"
+            );
+            cleanup_initial_database_candidate(&candidate).expect("应清理未发布候选");
+        }
+    }
+
+    #[test]
+    fn occupied_wal_checkpoint_does_not_publish_initial_database() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let candidate = temp.path().join("candidate.db");
+        let published = temp.path().join(DATABASE_FILE_NAME);
+        let cancellation = CooperativeCancellation::default();
+        let mut writer =
+            open_sqlite_connection(&candidate, true, cancellation.clone()).expect("应打开候选库");
+        create_initial_schema(
+            &mut writer,
+            &"game".parse().unwrap(),
+            &source.canonicalize().unwrap(),
+            &language("ja"),
+            &language("zh-Hans"),
+            &cancellation,
+        )
+        .expect("应建立候选 schema");
+
+        let blocker = Connection::open(&candidate).expect("应打开 checkpoint 阻塞连接");
+        blocker.execute_batch("BEGIN").expect("应开始读取事务");
+        let initial_profile: Option<String> = blocker
+            .query_row(
+                "SELECT last_profile_id FROM generic_project WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("读取事务应固定 WAL 快照");
+        assert_eq!(initial_profile, None);
+        writer
+            .execute(
+                "UPDATE generic_project SET last_profile_id = 'primary' WHERE singleton = 1",
+                [],
+            )
+            .expect("应在读取快照之后追加 WAL frame");
+        drop(writer);
+        assert!(
+            sqlite_sidecar_path(&candidate, "-wal").exists(),
+            "读取快照必须让候选 WAL 保持存在"
+        );
+
+        let publisher = apply_att_sqlite_cancellable_read_write_policy(
+            Connection::open(&candidate).expect("应重开候选库"),
+            || true,
+        )
+        .expect("应安装立即停止 busy wait 的测试策略");
+        publisher
+            .progress_handler(0, None::<fn() -> bool>)
+            .expect("测试只应由 busy handler 停止 checkpoint");
+        let error =
+            publish_initial_database_candidate(publisher, &candidate, &published, &cancellation)
+                .expect_err("checkpoint 被读取快照占用时不得发布主数据库");
+        assert!(matches!(
+            error,
+            GenericProjectError::Sqlite {
+                operation: "收束 Generic 初始数据库 WAL",
+                ref source,
+            } if sqlite_error_is_busy(source)
+        ));
+        assert!(!published.exists(), "checkpoint 未完成不得出现已发布数据库");
+
+        blocker.execute_batch("ROLLBACK").expect("应释放读取快照");
+        drop(blocker);
+        cleanup_initial_database_candidate(&candidate).expect("应清理测试候选及 sidecar");
+    }
+
+    #[test]
     fn initial_schema_and_project_singleton_roll_back_together() {
         use rusqlite::hooks::{AuthAction, Authorization};
 
         let temp = tempdir().unwrap();
         let source = temp.path().join("source");
         fs::create_dir(&source).unwrap();
-        let mut connection = Connection::open_in_memory().unwrap();
+        let cancellation = CooperativeCancellation::default();
+        let mut connection = apply_att_sqlite_cancellable_read_write_policy(
+            Connection::open_in_memory().unwrap(),
+            || false,
+        )
+        .unwrap();
         connection
             .authorizer(Some(
                 |context: rusqlite::hooks::AuthContext<'_>| match context.action {
@@ -2603,6 +5697,7 @@ mod tests {
             &source,
             &language("ja"),
             &language("zh-Hans"),
+            &cancellation,
         );
         assert!(result.is_err(), "单例写入失败时 Init 事务应失败");
 
@@ -3167,6 +6262,521 @@ mod tests {
     }
 
     #[test]
+    fn changing_either_language_invalidates_extract_and_translations() {
+        for (source_language, target_language) in [(Some("en"), None), (None, Some("zh-Hant"))] {
+            let temp = tempdir().unwrap();
+            let source = temp.path().join("source");
+            fs::create_dir(&source).unwrap();
+            write_source(
+                &source,
+                "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"原文\"}]}\n",
+            );
+            let workspace = temp.path().join("project");
+            let store = init(&workspace, &source);
+            store.extract().expect("首次 Extract 应成功");
+            let snapshot = store.load_snapshot().expect("应该可读取 Extract 快照");
+            let group = &snapshot.files()[0].groups()[0];
+            let unit = &group.units()[0];
+            store
+                .commit_translations(
+                    snapshot.project().extracted_raw_fingerprint().unwrap(),
+                    &[TranslationWrite {
+                        group_id: group.id().to_owned(),
+                        unit_id: unit.id().to_owned(),
+                        expected_source_text: unit.source_text().to_owned(),
+                        expected_group_context: group.context_fingerprint(),
+                        translation: "译文".to_owned(),
+                        origin: TranslationOrigin::Automatic,
+                        state_fingerprint: Sha256Fingerprint::from_bytes([31; 32]),
+                        expected_translation: None,
+                    }],
+                )
+                .expect("测试译文应该可提交");
+
+            GenericProjectStore::initialize(GenericInitRequest {
+                project_name: "game".parse().unwrap(),
+                workspace_root: workspace,
+                source_root: None,
+                source_language: source_language.map(language),
+                target_language: target_language.map(language),
+            })
+            .expect("改变语言应成功");
+
+            let project = store.open().unwrap();
+            assert_eq!(project.extracted_raw_fingerprint(), None);
+            assert_eq!(project.extracted_asset_fingerprint(), None);
+            assert!(matches!(
+                store.load_snapshot(),
+                Err(GenericProjectError::ExtractRequired)
+            ));
+            let connection = store.open_connection(false).unwrap();
+            let asset_rows: i64 = connection
+                .query_row(
+                    "SELECT
+                         (SELECT count(*) FROM generic_file)
+                       + (SELECT count(*) FROM generic_group)
+                       + (SELECT count(*) FROM generic_unit)",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(asset_rows, 0, "语言变化必须同时删除 Extract 资产和译文");
+        }
+    }
+
+    #[test]
+    fn sqlite_busy_wait_stops_promptly_when_the_command_is_cancelled() {
+        use std::sync::{Arc, Barrier, mpsc};
+        use std::time::Duration;
+
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let workspace = temp.path().join("project");
+        init(&workspace, &source);
+
+        let blocker = Connection::open(workspace.join(DATABASE_FILE_NAME)).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let cancellation = CooperativeCancellation::default();
+        let cancellable_store = GenericProjectStore::for_workspace_with_cancellation(
+            workspace.clone(),
+            cancellation.clone(),
+        );
+        let barrier = Arc::new(Barrier::new(2));
+        let worker_barrier = Arc::clone(&barrier);
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            worker_barrier.wait();
+            sender
+                .send(cancellable_store.remember_profile("blocked"))
+                .unwrap();
+        });
+        barrier.wait();
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("SQLite 等待线程不得在返回结果前断开")
+            }
+            Ok(result) => panic!("外部写锁存在时操作必须继续等待，而不是提前返回：{result:?}"),
+        }
+
+        cancellation.request();
+        let result = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("取消后不应继续等待 rusqlite 默认的约五秒超时");
+        assert!(matches!(result, Err(GenericProjectError::Cancelled)));
+        assert!(result.unwrap_err().is_cancelled());
+
+        blocker.execute_batch("ROLLBACK").unwrap();
+        worker.join().unwrap();
+        let verification = Connection::open(workspace.join(DATABASE_FILE_NAME)).unwrap();
+        let remembered: Option<String> = verification
+            .query_row(
+                "SELECT last_profile_id FROM generic_project WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remembered, None,
+            "Busy 取消只能在显式回滚确认成功后返回 Cancelled"
+        );
+    }
+
+    #[test]
+    fn cancellation_rolls_back_a_partially_written_extract_batch() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        write_source(
+            &source,
+            concat!(
+                "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[",
+                "{\"id\":\"u1\",\"text\":\"第一项\"},",
+                "{\"id\":\"u2\",\"text\":\"第二项\"}",
+                "]}\n"
+            ),
+        );
+        let workspace = temp.path().join("project");
+        init(&workspace, &source);
+
+        let cancellation = CooperativeCancellation::default();
+        let store = GenericProjectStore::for_workspace_with_cancellation(
+            workspace.clone(),
+            cancellation.clone(),
+        );
+        let project = store.open().expect("应打开 Generic 项目");
+        let scanned = scan_input_tree(&source).expect("应扫描测试输入");
+        let previous = GenericStoredSnapshot {
+            project,
+            files: Vec::new(),
+        };
+        let reconciled =
+            reconcile_snapshot(&previous, &scanned, &cancellation).expect("应建立待写快照");
+
+        let mut connection = store.open_connection(false).expect("应打开项目数据库");
+        let hook_cancellation = cancellation.clone();
+        connection
+            .update_hook(Some(
+                move |_action: rusqlite::hooks::Action,
+                      _database: &str,
+                      table: &str,
+                      _row_id: i64| {
+                    if table == "generic_unit" {
+                        hook_cancellation.request();
+                    }
+                },
+            ))
+            .expect("应安装测试更新 hook");
+        let result = store.finish_cancellable(run_cancellable_transaction(
+            &mut connection,
+            &cancellation,
+            "开始测试 Extract 事务",
+            "提交测试 Extract 事务",
+            "回滚测试 Extract 事务",
+            |transaction| replace_snapshot(transaction, &scanned, &reconciled.files, &cancellation),
+        ));
+        assert!(matches!(result, Err(GenericProjectError::Cancelled)));
+        assert!(connection.is_autocommit(), "取消返回前必须确认事务已回滚");
+        drop(connection);
+
+        let verification =
+            Connection::open(workspace.join(DATABASE_FILE_NAME)).expect("应重开项目数据库");
+        let asset_rows: i64 = verification
+            .query_row(
+                "SELECT
+                     (SELECT count(*) FROM generic_file)
+                   + (SELECT count(*) FROM generic_group)
+                   + (SELECT count(*) FROM generic_unit)",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应检查回滚后的资产");
+        let fingerprints: (Option<Vec<u8>>, Option<Vec<u8>>) = verification
+            .query_row(
+                "SELECT extracted_raw_fingerprint, extracted_asset_fingerprint
+                 FROM generic_project WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("应检查回滚后的 Extract 指纹");
+        assert_eq!(asset_rows, 0);
+        assert_eq!(fingerprints, (None, None));
+    }
+
+    #[test]
+    fn rollback_failure_is_outcome_unknown_and_preserves_both_failures() {
+        use rusqlite::hooks::{AuthAction, Authorization, TransactionOperation};
+
+        let cancellation = CooperativeCancellation::default();
+        let wait_cancellation = cancellation.clone();
+        let mut connection = apply_att_sqlite_cancellable_read_write_policy(
+            Connection::open_in_memory().unwrap(),
+            move || wait_cancellation.is_requested(),
+        )
+        .unwrap();
+        connection
+            .execute_batch("CREATE TABLE changed(value INTEGER NOT NULL)")
+            .unwrap();
+        connection
+            .authorizer(Some(
+                |context: rusqlite::hooks::AuthContext<'_>| match context.action {
+                    AuthAction::Transaction {
+                        operation: TransactionOperation::Rollback,
+                    } => Authorization::Deny,
+                    _ => Authorization::Allow,
+                },
+            ))
+            .unwrap();
+
+        let result: Result<(), GenericProjectError> = run_cancellable_transaction(
+            &mut connection,
+            &cancellation,
+            "开始回滚失败测试事务",
+            "提交回滚失败测试事务",
+            "回滚失败测试事务",
+            |transaction| {
+                transaction
+                    .execute("INSERT INTO changed VALUES (1)", [])
+                    .map_err(|source| GenericProjectError::Sqlite {
+                        operation: "写入回滚失败测试数据",
+                        source,
+                    })?;
+                cancellation.request();
+                Err(GenericProjectError::Cancelled)
+            },
+        );
+        let classifier = GenericProjectStore::for_workspace_with_cancellation(
+            PathBuf::new(),
+            cancellation.clone(),
+        );
+        let result = classifier.finish_cancellable(result);
+        let error = result.expect_err("ROLLBACK 被拒绝时不得报告干净取消");
+        match &error {
+            GenericProjectError::TransactionOutcomeUnknown {
+                primary: Some(primary),
+                finalization: GenericTransactionFinalizationFailure::Sqlite { operation, .. },
+                ..
+            } => {
+                assert!(matches!(primary.as_ref(), GenericProjectError::Cancelled));
+                assert_eq!(*operation, "回滚失败测试事务");
+            }
+            other => panic!("应保留主取消与回滚失败，实际为 {other:?}"),
+        }
+        assert!(!error.is_cancelled());
+        let diagnostic = error.safe_diagnostic_source(
+            DiagnosticStage::Extract,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::Retry,
+        );
+        assert_eq!(diagnostic.code, DiagnosticCode::OperationOutcomeUnknown);
+        assert_eq!(diagnostic.impact, DiagnosticImpact::OutcomeUnknown);
+        assert!(diagnostic.recovery.iter().any(|fact| {
+            matches!(
+                fact,
+                RecoveryFact::Component { name } if name == "primary_code=project.state"
+            )
+        }));
+    }
+
+    #[test]
+    fn cancellation_requested_during_commit_does_not_interrupt_a_successful_commit() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use rusqlite::hooks::{AuthAction, Authorization, TransactionOperation};
+
+        let cancellation = CooperativeCancellation::default();
+        let wait_cancellation = cancellation.clone();
+        let mut connection = apply_att_sqlite_cancellable_read_write_policy(
+            Connection::open_in_memory().unwrap(),
+            move || wait_cancellation.is_requested(),
+        )
+        .unwrap();
+        connection
+            .execute_batch("CREATE TABLE changed(value INTEGER NOT NULL)")
+            .unwrap();
+        let commit_seen = Arc::new(AtomicBool::new(false));
+        let hook_commit_seen = Arc::clone(&commit_seen);
+        let hook_cancellation = cancellation.clone();
+        connection
+            .authorizer(Some(
+                move |context: rusqlite::hooks::AuthContext<'_>| match context.action {
+                    AuthAction::Transaction {
+                        operation: TransactionOperation::Unknown,
+                    } => {
+                        hook_commit_seen.store(true, Ordering::Release);
+                        hook_cancellation.request();
+                        Authorization::Allow
+                    }
+                    _ => Authorization::Allow,
+                },
+            ))
+            .unwrap();
+
+        let result = run_cancellable_transaction(
+            &mut connection,
+            &cancellation,
+            "开始提交取消测试事务",
+            "提交取消测试事务",
+            "回滚提交取消测试事务",
+            |transaction| {
+                transaction
+                    .execute("INSERT INTO changed VALUES (1)", [])
+                    .map_err(|source| GenericProjectError::Sqlite {
+                        operation: "写入提交取消测试数据",
+                        source,
+                    })?;
+                Ok(())
+            },
+        );
+        assert!(result.is_ok(), "COMMIT 开始后到达的取消不得改写成功终态");
+        assert!(commit_seen.load(Ordering::Acquire));
+        assert!(cancellation.is_requested());
+        assert!(connection.is_autocommit());
+        let finalization_cancellation = connection.cancellation_handle();
+        let finalization = suspend_att_sqlite_cancellation(&finalization_cancellation);
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM changed", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        drop(finalization);
+    }
+
+    #[test]
+    fn failed_commit_with_confirmed_rollback_is_not_mapped_to_cancelled() {
+        use rusqlite::hooks::{AuthAction, Authorization, TransactionOperation};
+
+        let cancellation = CooperativeCancellation::default();
+        let wait_cancellation = cancellation.clone();
+        let mut connection = apply_att_sqlite_cancellable_read_write_policy(
+            Connection::open_in_memory().unwrap(),
+            move || wait_cancellation.is_requested(),
+        )
+        .unwrap();
+        connection
+            .execute_batch("CREATE TABLE changed(value INTEGER NOT NULL)")
+            .unwrap();
+        let hook_cancellation = cancellation.clone();
+        connection
+            .authorizer(Some(
+                move |context: rusqlite::hooks::AuthContext<'_>| match context.action {
+                    AuthAction::Transaction {
+                        operation: TransactionOperation::Unknown,
+                    } => {
+                        hook_cancellation.request();
+                        Authorization::Deny
+                    }
+                    _ => Authorization::Allow,
+                },
+            ))
+            .unwrap();
+
+        let result = run_cancellable_transaction(
+            &mut connection,
+            &cancellation,
+            "开始提交失败测试事务",
+            "提交失败测试事务",
+            "回滚提交失败测试事务",
+            |transaction| {
+                transaction
+                    .execute("INSERT INTO changed VALUES (1)", [])
+                    .map_err(|source| GenericProjectError::Sqlite {
+                        operation: "写入提交失败测试数据",
+                        source,
+                    })?;
+                Ok(())
+            },
+        );
+        let classifier = GenericProjectStore::for_workspace_with_cancellation(
+            PathBuf::new(),
+            cancellation.clone(),
+        );
+        let result = classifier.finish_cancellable(result);
+        let error = result.expect_err("COMMIT 被拒绝后必须报告确认未提交");
+        assert!(matches!(
+            &error,
+            GenericProjectError::TransactionNotCommitted { .. }
+        ));
+        assert!(!error.is_cancelled());
+        assert!(connection.is_autocommit());
+        let finalization_cancellation = connection.cancellation_handle();
+        let finalization = suspend_att_sqlite_cancellation(&finalization_cancellation);
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM changed", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        drop(finalization);
+        let diagnostic = error.safe_diagnostic_source(
+            DiagnosticStage::Translate,
+            DiagnosticImpact::OutcomeUnknown,
+            DiagnosticAction::Retry,
+        );
+        assert_eq!(diagnostic.impact, DiagnosticImpact::Unchanged);
+        assert!(diagnostic.recovery.iter().any(|fact| {
+            matches!(
+                fact,
+                RecoveryFact::Transaction { state } if state == "rolled_back"
+            )
+        }));
+    }
+
+    #[test]
+    fn commit_and_rollback_failures_report_outcome_unknown_with_both_causes() {
+        use rusqlite::hooks::{AuthAction, Authorization, TransactionOperation};
+
+        let cancellation = CooperativeCancellation::default();
+        let wait_cancellation = cancellation.clone();
+        let mut connection = apply_att_sqlite_cancellable_read_write_policy(
+            Connection::open_in_memory().unwrap(),
+            move || wait_cancellation.is_requested(),
+        )
+        .unwrap();
+        connection
+            .execute_batch("CREATE TABLE changed(value INTEGER NOT NULL)")
+            .unwrap();
+        let hook_cancellation = cancellation.clone();
+        connection
+            .authorizer(Some(
+                move |context: rusqlite::hooks::AuthContext<'_>| match context.action {
+                    AuthAction::Transaction {
+                        operation: TransactionOperation::Unknown,
+                    } => {
+                        hook_cancellation.request();
+                        Authorization::Deny
+                    }
+                    AuthAction::Transaction {
+                        operation: TransactionOperation::Rollback,
+                    } => Authorization::Deny,
+                    _ => Authorization::Allow,
+                },
+            ))
+            .unwrap();
+
+        let result = run_cancellable_transaction(
+            &mut connection,
+            &cancellation,
+            "开始提交终态未知测试事务",
+            "提交终态未知测试事务",
+            "回滚提交终态未知测试事务",
+            |transaction| {
+                transaction
+                    .execute("INSERT INTO changed VALUES (1)", [])
+                    .map_err(|source| GenericProjectError::Sqlite {
+                        operation: "写入提交终态未知测试数据",
+                        source,
+                    })?;
+                Ok(())
+            },
+        );
+        let classifier = GenericProjectStore::for_workspace_with_cancellation(
+            PathBuf::new(),
+            cancellation.clone(),
+        );
+        let result = classifier.finish_cancellable(result);
+        let error = result.expect_err("COMMIT 与 ROLLBACK 都失败时结果必须未知");
+        match &error {
+            GenericProjectError::TransactionOutcomeUnknown {
+                primary: Some(primary),
+                finalization: GenericTransactionFinalizationFailure::Sqlite { operation, .. },
+                ..
+            } => {
+                assert!(matches!(
+                    primary.as_ref(),
+                    GenericProjectError::Sqlite {
+                        operation: "提交终态未知测试事务",
+                        ..
+                    }
+                ));
+                assert_eq!(*operation, "回滚提交终态未知测试事务");
+            }
+            other => panic!("应保留 COMMIT 与 ROLLBACK 两个失败，实际为 {other:?}"),
+        }
+        assert!(!error.is_cancelled());
+        let diagnostic = error.safe_diagnostic_source(
+            DiagnosticStage::Translate,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::Retry,
+        );
+        assert_eq!(diagnostic.code, DiagnosticCode::OperationOutcomeUnknown);
+        assert_eq!(diagnostic.impact, DiagnosticImpact::OutcomeUnknown);
+        assert!(diagnostic.recovery.iter().any(|fact| {
+            matches!(
+                fact,
+                RecoveryFact::Component { name }
+                    if name.starts_with("primary_sqlite=")
+            )
+        }));
+    }
+
+    #[test]
     fn extract_treats_reordered_equal_text_units_as_a_group_change() {
         let temp = tempdir().unwrap();
         let source = temp.path().join("source");
@@ -3214,6 +6824,63 @@ mod tests {
                 .all(|unit| unit.translation().is_none()),
             "即使原文相同，Unit 顺序改变也必须清除整个 Group 的译文"
         );
+    }
+
+    #[test]
+    fn applying_resources_rejects_invalid_terminology_without_changing_snapshot() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        write_source(
+            &source,
+            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"原文\"}]}\n",
+        );
+        let workspace = temp.path().join("project");
+        let store = init(&workspace, &source);
+        store.extract().expect("首次 Extract 应成功");
+        let expected_raw_fingerprint = store
+            .open()
+            .expect("应打开已提取项目")
+            .extracted_raw_fingerprint()
+            .expect("已提取项目应保存原始指纹");
+
+        for (case, terminology_json, expected_detail) in [
+            ("条目类型错误", "[1]", None),
+            (
+                "术语重复",
+                r#"[{"term":"同名","translation":"译文一","triggers":["触发一"]},{"term":"同名","translation":"译文二","triggers":["触发二"]}]"#,
+                Some("术语重复"),
+            ),
+            (
+                "术语含首尾空白",
+                r#"[{"term":" 原文","translation":"译文","triggers":["原文"]}]"#,
+                Some("含首尾空白"),
+            ),
+        ] {
+            let error = store
+                .apply_translation_resources(expected_raw_fingerprint, terminology_json, "[]", &[])
+                .expect_err(case);
+            match error {
+                GenericProjectError::InvalidResource {
+                    kind: TERMINOLOGY_RESOURCE,
+                    detail,
+                } => {
+                    if let Some(expected_detail) = expected_detail {
+                        assert!(
+                            detail.contains(expected_detail),
+                            "{case} 应保留具体定义错误，实际为 {detail:?}"
+                        );
+                    }
+                }
+                other => panic!("{case} 应作为 terminology 资源无效返回，实际为 {other:?}"),
+            }
+
+            let resources = store
+                .load_translation_resources()
+                .expect("拒绝无效术语后项目资源仍应可读取");
+            assert_eq!(resources.terminology_json(), "[]");
+            assert_eq!(resources.placeholder_rules_json(), "[]");
+        }
     }
 
     #[test]

@@ -34,7 +34,7 @@ impl CpuExecutorConfig {
     }
 
     #[cfg(test)]
-    fn fixed(worker_threads: NonZeroUsize) -> Self {
+    pub(crate) fn fixed(worker_threads: NonZeroUsize) -> Self {
         Self {
             fixed_worker_threads: Some(worker_threads),
         }
@@ -317,6 +317,7 @@ struct TestWorkerExitGate {
 
 struct CpuExecutorInner {
     lifecycle: Mutex<Lifecycle>,
+    parallelism: NonZeroUsize,
     admission: Arc<Semaphore>,
     waits_cancelled: AtomicBool,
     active_tasks: Arc<ActiveTasks>,
@@ -373,6 +374,7 @@ impl RayonCpuExecutor {
                     state: LifecycleState::Running,
                     pool: Some(pool),
                 }),
+                parallelism: NonZeroUsize::new(worker_threads).expect("CPU worker 数已经确认非零"),
                 // 许可与 Rayon worker 一一对应：饱和调用在提交前自然背压，
                 // 不再另造可配置等待队列。
                 admission: Arc::new(Semaphore::new(worker_threads)),
@@ -381,6 +383,13 @@ impl RayonCpuExecutor {
                 worker_exits,
             }),
         })
+    }
+
+    /// 返回这个执行根实际建立的 worker 数。
+    ///
+    /// 调用方可以据此限制同时存在的 CPU 工作 Future；它不限制一次命令的总工作量。
+    pub(crate) fn parallelism(&self) -> NonZeroUsize {
+        self.inner.parallelism
     }
 
     /// 停止准入，排空全部已接管任务，再释放私有 Rayon 池。
@@ -562,6 +571,7 @@ mod tests {
             || Ok(NonZeroUsize::new(2).unwrap()),
         )
         .unwrap();
+        assert_eq!(executor.parallelism(), NonZeroUsize::new(2).unwrap());
         assert_eq!(
             executor.execute(rayon::current_num_threads).await.unwrap(),
             2

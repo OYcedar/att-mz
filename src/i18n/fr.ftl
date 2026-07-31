@@ -101,6 +101,8 @@ progress-extract-documents = Analyse des documents
 progress-extract-builtin = Unités Builtin
 progress-extract-rules = Définitions Rules
 progress-extract-commit = Commit des ressources extraites
+progress-generic-init = Initialisation du projet Generic
+progress-generic-extract = Analyse de l’entrée JSONL Generic
 progress-translate-planning = Planification des tâches de traduction
 progress-translate-confirmed = Tâches de traduction confirmées
 progress-translate-no-work = Aucun appel au modèle nécessaire
@@ -279,6 +281,7 @@ diagnostic-failure-value = { $code ->
     [write_back_extraction_out_of_date] Les ressources extraites ne correspondent plus à la source actuelle du projet
     [write_back_asset_snapshot_invalid] Les ressources RPG Maker enregistrées ne forment pas un instantané de réécriture valide
     [source_document_invalid] Un document source RPG Maker ne respecte pas le format requis
+    [generic_source_document_invalid] Un document source JSONL Generic ne respecte pas le format requis
     [write_back_mutation_invalid] Une modification de traduction validée ne peut pas être appliquée à son emplacement source figé
     [write_back_output_path_invalid] Un fichier réécrit se trouve hors de l’arborescence de sortie RPG Maker autorisée
     [write_back_output_path_duplicate] Plusieurs fichiers réécrits ciblent le même chemin de sortie

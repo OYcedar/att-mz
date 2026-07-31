@@ -683,6 +683,8 @@ pub(crate) enum UiMessage<'a> {
     ProgressExtractBuiltin,
     ProgressExtractRules,
     ProgressExtractCommit,
+    ProgressGenericInit,
+    ProgressGenericExtract,
     ProgressTranslatePlanning,
     ProgressTranslateConfirmed,
     ProgressTranslateNoWork,
@@ -1117,6 +1119,8 @@ impl UiMessage<'_> {
             Self::ProgressExtractBuiltin => "progress-extract-builtin",
             Self::ProgressExtractRules => "progress-extract-rules",
             Self::ProgressExtractCommit => "progress-extract-commit",
+            Self::ProgressGenericInit => "progress-generic-init",
+            Self::ProgressGenericExtract => "progress-generic-extract",
             Self::ProgressTranslatePlanning => "progress-translate-planning",
             Self::ProgressTranslateConfirmed => "progress-translate-confirmed",
             Self::ProgressTranslateNoWork => "progress-translate-no-work",
@@ -1797,6 +1801,8 @@ impl UiMessage<'_> {
             | Self::ProgressExtractBuiltin
             | Self::ProgressExtractRules
             | Self::ProgressExtractCommit
+            | Self::ProgressGenericInit
+            | Self::ProgressGenericExtract
             | Self::ProgressTranslatePlanning
             | Self::ProgressTranslateConfirmed
             | Self::ProgressTranslateNoWork
@@ -2399,6 +2405,8 @@ mod tests {
             UiMessage::ProgressExtractBuiltin,
             UiMessage::ProgressExtractRules,
             UiMessage::ProgressExtractCommit,
+            UiMessage::ProgressGenericInit,
+            UiMessage::ProgressGenericExtract,
             UiMessage::ProgressTranslatePlanning,
             UiMessage::ProgressTranslateConfirmed,
             UiMessage::ProgressTranslateNoWork,

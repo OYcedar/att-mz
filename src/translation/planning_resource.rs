@@ -1,16 +1,27 @@
 //! 外部术语与占位符 TOML 的异步读取和 CPU 解析边界。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
+use std::io::{self, BufReader, Read, Write};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+use aho_corasick::{
+    AhoCorasick, AhoCorasickBuilder, Anchored, MatchKind,
+    automaton::Automaton,
+    nfa::{contiguous, noncontiguous},
+};
 use serde::{Deserialize, Serialize};
 
+use crate::execution::CooperativeCancellation;
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
+use crate::execution::isolated::{IsolatedOperationError, run_isolated_operation};
+use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::storage::file_system::{FileReader, ReadFile, ReadFileError};
 
 use super::placeholder::PlaceholderRuleDefinition;
@@ -237,8 +248,22 @@ impl TerminologyEntry {
 /// 以 Aho-Corasick 一次扫描全部 trigger 的权威术语集合。
 pub(crate) struct CompiledTerminology {
     entries: Vec<TerminologyEntry>,
-    matcher: Option<AhoCorasick>,
+    matcher: Option<TerminologyMatcher>,
     pattern_to_entry: Vec<usize>,
+}
+
+enum TerminologyMatcher {
+    /// 常见短 trigger 使用优化后的高层 matcher，并以少量重叠的有界窗口搜索。
+    Windowed(AhoCorasick),
+    /// 超长 trigger 用具体 NFA 保留跨块状态，避免把整个 pattern 反复拼入搜索窗口。
+    Streaming(Box<StreamingTerminologyMatcher>),
+}
+
+enum StreamingTerminologyMatcher {
+    /// 紧凑表示可以直接索引同一状态上的全部重叠匹配。
+    Contiguous(contiguous::NFA),
+    /// 紧凑表示无法容纳时，保留不依赖其大小限制的基础 NFA。
+    Noncontiguous(noncontiguous::NFA),
 }
 
 impl CompiledTerminology {
@@ -261,40 +286,176 @@ impl CompiledTerminology {
         &'a self,
         texts: impl IntoIterator<Item = &'a str>,
     ) -> Vec<&'a TerminologyEntry> {
-        let Some(matcher) = &self.matcher else {
-            return Vec::new();
-        };
-        let mut matched = vec![false; self.entries.len()];
-        for text in texts {
-            for found in matcher.find_overlapping_iter(text) {
-                matched[self.pattern_to_entry[found.pattern().as_usize()]] = true;
-            }
-        }
-        self.entries
-            .iter()
-            .zip(matched)
-            .filter_map(|(entry, matched)| matched.then_some(entry))
+        self.triggered_indices(texts)
+            .into_iter()
+            .map(|index| &self.entries[index])
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn triggered_indices<'t>(
         &self,
         texts: impl IntoIterator<Item = &'t str>,
     ) -> Vec<usize> {
+        match self.triggered_indices_with_cancellation(texts, || Ok::<_, Infallible>(())) {
+            Ok(indices) => indices,
+            Err(unreachable) => match unreachable {},
+        }
+    }
+
+    /// 扫描任意数量和长度的原文，并在文本窗口、匹配项和结果收集之间轮询取消。
+    pub(crate) fn triggered_indices_with_cancellation<'t, E>(
+        &self,
+        texts: impl IntoIterator<Item = &'t str>,
+        mut ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Vec<usize>, E> {
+        ensure_running()?;
         let Some(matcher) = &self.matcher else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let mut matched = vec![false; self.entries.len()];
-        for text in texts {
-            for found in matcher.find_overlapping_iter(text) {
-                matched[self.pattern_to_entry[found.pattern().as_usize()]] = true;
+        let mut matched_count = 0_usize;
+        match matcher {
+            TerminologyMatcher::Windowed(matcher) => scan_windowed_terminology(
+                matcher,
+                &self.pattern_to_entry,
+                texts,
+                &mut matched,
+                &mut matched_count,
+                &mut ensure_running,
+            )?,
+            TerminologyMatcher::Streaming(matcher) => match matcher.as_ref() {
+                StreamingTerminologyMatcher::Contiguous(matcher) => scan_streaming_terminology(
+                    matcher,
+                    &self.pattern_to_entry,
+                    texts,
+                    &mut matched,
+                    &mut matched_count,
+                    &mut ensure_running,
+                )?,
+                StreamingTerminologyMatcher::Noncontiguous(matcher) => scan_streaming_terminology(
+                    matcher,
+                    &self.pattern_to_entry,
+                    texts,
+                    &mut matched,
+                    &mut matched_count,
+                    &mut ensure_running,
+                )?,
+            },
+        }
+        let mut indices = Vec::with_capacity(matched_count);
+        for (index, matched) in matched.into_iter().enumerate() {
+            ensure_running()?;
+            if matched {
+                indices.push(index);
             }
         }
-        matched
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, matched)| matched.then_some(index))
-            .collect()
+        ensure_running()?;
+        Ok(indices)
+    }
+}
+
+/// 重叠窗口最多重复约 1/15 的输入；更长 trigger 改用真正流式的 NFA。
+const TERMINOLOGY_WINDOWED_MAX_PATTERN_BYTES: usize = PLANNING_RESOURCE_CANCEL_CHECK_BYTES / 16;
+
+fn scan_windowed_terminology<'t, E>(
+    matcher: &AhoCorasick,
+    pattern_to_entry: &[usize],
+    texts: impl IntoIterator<Item = &'t str>,
+    matched: &mut [bool],
+    matched_count: &mut usize,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<(), E> {
+    let maximum_pattern_bytes = matcher.max_pattern_len();
+    debug_assert!(
+        maximum_pattern_bytes <= TERMINOLOGY_WINDOWED_MAX_PATTERN_BYTES,
+        "只有短 trigger 才能进入重叠窗口扫描"
+    );
+    let overlap = maximum_pattern_bytes.saturating_sub(1);
+    let advance = PLANNING_RESOURCE_CANCEL_CHECK_BYTES
+        .checked_sub(overlap)
+        .expect("短 trigger 的重叠必须小于取消检查窗口");
+
+    for text in texts {
+        ensure_running()?;
+        let bytes = text.as_bytes();
+        let mut start = 0_usize;
+        while start < bytes.len() {
+            ensure_running()?;
+            let end = start
+                .saturating_add(PLANNING_RESOURCE_CANCEL_CHECK_BYTES)
+                .min(bytes.len());
+            for found in matcher.find_overlapping_iter(&bytes[start..end]) {
+                ensure_running()?;
+                record_terminology_match(
+                    found.pattern().as_usize(),
+                    pattern_to_entry,
+                    matched,
+                    matched_count,
+                );
+            }
+            if end == bytes.len() {
+                break;
+            }
+            start = start.saturating_add(advance);
+        }
+    }
+    ensure_running()
+}
+
+fn scan_streaming_terminology<'t, E, A: Automaton>(
+    matcher: &A,
+    pattern_to_entry: &[usize],
+    texts: impl IntoIterator<Item = &'t str>,
+    matched: &mut [bool],
+    matched_count: &mut usize,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<(), E> {
+    for text in texts {
+        ensure_running()?;
+        let mut state = matcher
+            .start_state(Anchored::No)
+            .expect("术语 NFA 必须支持非锚定搜索");
+        'text: for chunk in text.as_bytes().chunks(PLANNING_RESOURCE_CANCEL_CHECK_BYTES) {
+            ensure_running()?;
+            for &byte in chunk {
+                state = matcher.next_state(Anchored::No, state, byte);
+                if !matcher.is_special(state) {
+                    continue;
+                }
+                let dead = matcher.is_dead(state);
+                debug_assert!(!dead, "Standard 非锚定术语 NFA 不应进入 dead state");
+                if dead {
+                    break 'text;
+                }
+                if !matcher.is_match(state) {
+                    continue;
+                }
+                for match_index in 0..matcher.match_len(state) {
+                    ensure_running()?;
+                    record_terminology_match(
+                        matcher.match_pattern(state, match_index).as_usize(),
+                        pattern_to_entry,
+                        matched,
+                        matched_count,
+                    );
+                }
+            }
+        }
+    }
+    ensure_running()
+}
+
+fn record_terminology_match(
+    pattern_index: usize,
+    pattern_to_entry: &[usize],
+    matched: &mut [bool],
+    matched_count: &mut usize,
+) {
+    let entry_index = pattern_to_entry[pattern_index];
+    if !matched[entry_index] {
+        matched[entry_index] = true;
+        *matched_count += 1;
     }
 }
 
@@ -324,11 +485,21 @@ pub(crate) trait TranslationPlanningResourceReader: Send + Sync {
 pub(crate) struct TranslationPlanningResourceReadingService<F, C> {
     file_reader: F,
     cpu: C,
+    cancellation: CooperativeCancellation,
 }
 
 impl<F, C> TranslationPlanningResourceReadingService<F, C> {
     pub(crate) fn new(file_reader: F, cpu: C) -> Self {
-        Self { file_reader, cpu }
+        Self {
+            file_reader,
+            cpu,
+            cancellation: CooperativeCancellation::default(),
+        }
+    }
+
+    pub(crate) fn with_cancellation(mut self, cancellation: CooperativeCancellation) -> Self {
+        self.cancellation = cancellation;
+        self
     }
 }
 
@@ -346,6 +517,9 @@ where
         current_terminology_json: String,
         current_placeholder_rules_json: String,
     ) -> Result<TranslationPlanningResources, Self::Error> {
+        if self.cancellation.is_requested() {
+            return Err(TranslationPlanningResourceReadingError::Cancelled);
+        }
         let terminology_request_path = terminology_path.clone();
         let placeholder_request_path = placeholder_rules_path.clone();
         let (terminology_file, placeholder_file) = futures_util::join!(
@@ -364,21 +538,29 @@ where
                 source,
             }
         })?;
+        if self.cancellation.is_requested() {
+            return Err(TranslationPlanningResourceReadingError::Cancelled);
+        }
 
         let terminology_parse = parse_terminology_resource::<F::Error, C>(
             &self.cpu,
             terminology_file,
             current_terminology_json,
+            self.cancellation.clone(),
         );
         let placeholder_parse = parse_placeholder_resource::<F::Error, C>(
             &self.cpu,
             placeholder_file,
             current_placeholder_rules_json,
+            self.cancellation.clone(),
         );
         let (terminology, placeholder_rules) =
             futures_util::join!(terminology_parse, placeholder_parse);
         let (terminology, terminology_json) = terminology?;
         let (placeholder_rules, placeholder_rules_json) = placeholder_rules?;
+        if self.cancellation.is_requested() {
+            return Err(TranslationPlanningResourceReadingError::Cancelled);
+        }
 
         Ok(TranslationPlanningResources::new(
             terminology,
@@ -403,6 +585,7 @@ async fn parse_terminology_resource<F, C: CpuTaskExecutor>(
     cpu: &C,
     file: Option<ReadFile>,
     current_json: String,
+    cancellation: CooperativeCancellation,
 ) -> Result<(CompiledTerminology, String), TranslationPlanningResourceReadingError<F, C::Error>> {
     let (path, input) = file.map_or_else(
         || (None, PlanningResourceInput::Snapshot(current_json)),
@@ -416,13 +599,19 @@ async fn parse_terminology_resource<F, C: CpuTaskExecutor>(
     let error_path = path.clone();
     let parsed = cpu
         .execute(move || {
+            let is_cancelled = || cancellation.is_requested();
+            ensure_planning_resource_running(&is_cancelled)
+                .map_err(|()| TerminologyDefinitionError::Cancelled)?;
             let entries = match input {
-                PlanningResourceInput::External(bytes) => parse_terminology_toml(&bytes)?,
-                PlanningResourceInput::Snapshot(json) => parse_terminology_snapshot(&json)?,
+                PlanningResourceInput::External(bytes) => {
+                    parse_terminology_toml_with_cancellation(bytes, &is_cancelled)?
+                }
+                PlanningResourceInput::Snapshot(json) => {
+                    parse_terminology_snapshot_with_cancellation(&json, &is_cancelled)?
+                }
             };
-            let canonical = serde_json::to_string(&entries)
-                .map_err(TerminologyDefinitionError::EncodeSnapshot)?;
-            let terminology = compile_terminology(entries)?;
+            let canonical = encode_terminology_snapshot_with_cancellation(&entries, &is_cancelled)?;
+            let terminology = compile_terminology_with_cancellation(entries, &is_cancelled)?;
             Ok::<_, TerminologyDefinitionError>((terminology, canonical))
         })
         .await
@@ -432,15 +621,22 @@ async fn parse_terminology_resource<F, C: CpuTaskExecutor>(
                 source,
             },
         )?;
-    parsed.map_err(
-        |source| TranslationPlanningResourceReadingError::InvalidTerminology { path, source },
-    )
+    match parsed {
+        Err(TerminologyDefinitionError::Cancelled) => {
+            Err(TranslationPlanningResourceReadingError::Cancelled)
+        }
+        Err(source) => {
+            Err(TranslationPlanningResourceReadingError::InvalidTerminology { path, source })
+        }
+        Ok(result) => Ok(result),
+    }
 }
 
 async fn parse_placeholder_resource<F, C: CpuTaskExecutor>(
     cpu: &C,
     file: Option<ReadFile>,
     current_json: String,
+    cancellation: CooperativeCancellation,
 ) -> Result<
     (Vec<PlaceholderRuleDefinition>, String),
     TranslationPlanningResourceReadingError<F, C::Error>,
@@ -457,13 +653,19 @@ async fn parse_placeholder_resource<F, C: CpuTaskExecutor>(
     let error_path = path.clone();
     let parsed = cpu
         .execute(move || {
+            let is_cancelled = || cancellation.is_requested();
+            ensure_planning_resource_running(&is_cancelled)
+                .map_err(|()| PlaceholderDefinitionError::Cancelled)?;
             let definitions = match input {
-                PlanningResourceInput::External(bytes) => parse_placeholder_toml(&bytes)?,
-                PlanningResourceInput::Snapshot(json) => serde_json::from_str(&json)
-                    .map_err(PlaceholderDefinitionError::InvalidSnapshot)?,
+                PlanningResourceInput::External(bytes) => {
+                    parse_placeholder_toml_with_cancellation(bytes, &is_cancelled)?
+                }
+                PlanningResourceInput::Snapshot(json) => {
+                    parse_placeholder_snapshot_with_cancellation(&json, &is_cancelled)?
+                }
             };
-            let canonical = serde_json::to_string(&definitions)
-                .map_err(PlaceholderDefinitionError::EncodeSnapshot)?;
+            let canonical =
+                encode_placeholder_snapshot_with_cancellation(&definitions, &is_cancelled)?;
             Ok::<_, PlaceholderDefinitionError>((definitions, canonical))
         })
         .await
@@ -473,14 +675,201 @@ async fn parse_placeholder_resource<F, C: CpuTaskExecutor>(
                 source,
             }
         })?;
-    parsed.map_err(
-        |source| TranslationPlanningResourceReadingError::InvalidPlaceholderRules { path, source },
-    )
+    match parsed {
+        Err(PlaceholderDefinitionError::Cancelled) => {
+            Err(TranslationPlanningResourceReadingError::Cancelled)
+        }
+        Err(source) => {
+            Err(TranslationPlanningResourceReadingError::InvalidPlaceholderRules { path, source })
+        }
+        Ok(result) => Ok(result),
+    }
 }
 
 enum PlanningResourceInput {
     External(Vec<u8>),
     Snapshot(String),
+}
+
+const PLANNING_RESOURCE_CANCEL_CHECK_BYTES: usize = 64 * 1024;
+
+pub(crate) trait PlanningResourceCancellation {
+    fn is_cancelled(&self) -> bool;
+}
+
+impl<F> PlanningResourceCancellation for F
+where
+    F: Fn() -> bool,
+{
+    fn is_cancelled(&self) -> bool {
+        self()
+    }
+}
+
+#[cfg(test)]
+fn never_cancelled() -> bool {
+    false
+}
+
+fn ensure_planning_resource_running(
+    cancellation: &(impl PlanningResourceCancellation + ?Sized),
+) -> Result<(), ()> {
+    if cancellation.is_cancelled() {
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+enum CancellableUtf8Error {
+    Cancelled,
+    StartWorker {
+        operation: &'static str,
+        source: io::Error,
+    },
+    Invalid(std::str::Utf8Error),
+}
+
+fn terminology_isolated_operation_error(
+    source: IsolatedOperationError<()>,
+) -> TerminologyDefinitionError {
+    match source {
+        IsolatedOperationError::Cancelled(_) => TerminologyDefinitionError::Cancelled,
+        IsolatedOperationError::Start { operation, source } => {
+            TerminologyDefinitionError::StartWorker { operation, source }
+        }
+    }
+}
+
+fn placeholder_isolated_operation_error(
+    source: IsolatedOperationError<()>,
+) -> PlaceholderDefinitionError {
+    match source {
+        IsolatedOperationError::Cancelled(_) => PlaceholderDefinitionError::Cancelled,
+        IsolatedOperationError::Start { operation, source } => {
+            PlaceholderDefinitionError::StartWorker { operation, source }
+        }
+    }
+}
+
+/// 分块确认完整 UTF-8 后复用原 `Vec` 的分配建立 `String`。
+fn into_utf8_string_with_cancellation(
+    bytes: Vec<u8>,
+    cancellation: &(impl PlanningResourceCancellation + ?Sized),
+) -> Result<String, CancellableUtf8Error> {
+    let mut start = 0_usize;
+    while start < bytes.len() {
+        ensure_planning_resource_running(cancellation)
+            .map_err(|()| CancellableUtf8Error::Cancelled)?;
+        let end = start
+            .saturating_add(PLANNING_RESOURCE_CANCEL_CHECK_BYTES)
+            .min(bytes.len());
+        match std::str::from_utf8(&bytes[start..end]) {
+            Ok(_) => start = end,
+            Err(source) => {
+                let valid_end = start.saturating_add(source.valid_up_to());
+                match source.error_len() {
+                    Some(_) => {
+                        ensure_planning_resource_running(cancellation)
+                            .map_err(|()| CancellableUtf8Error::Cancelled)?;
+                        return invalid_utf8_error_with_cancellation(bytes, cancellation);
+                    }
+                    None if end == bytes.len() => {
+                        ensure_planning_resource_running(cancellation)
+                            .map_err(|()| CancellableUtf8Error::Cancelled)?;
+                        return invalid_utf8_error_with_cancellation(bytes, cancellation);
+                    }
+                    None => {
+                        debug_assert!(valid_end > start, "不完整 UTF-8 序列只能位于非空块的末尾");
+                        start = valid_end;
+                    }
+                }
+            }
+        }
+    }
+    ensure_planning_resource_running(cancellation).map_err(|()| CancellableUtf8Error::Cancelled)?;
+    // SAFETY: 上面的循环覆盖整份字节串。跨块的不完整码点会从该码点起始位置在下一块
+    // 重新校验；只有最后一块也完整时循环才会成功结束。
+    Ok(unsafe { String::from_utf8_unchecked(bytes) })
+}
+
+fn invalid_utf8_error_with_cancellation(
+    bytes: Vec<u8>,
+    cancellation: &(impl PlanningResourceCancellation + ?Sized),
+) -> Result<String, CancellableUtf8Error> {
+    match run_isolated_operation(
+        "att-resource-utf8",
+        move || std::str::from_utf8(&bytes).expect_err("分块 UTF-8 校验已经确认输入无效"),
+        || ensure_planning_resource_running(cancellation),
+    ) {
+        Ok(source) => Err(CancellableUtf8Error::Invalid(source)),
+        Err(IsolatedOperationError::Cancelled(_)) => Err(CancellableUtf8Error::Cancelled),
+        Err(IsolatedOperationError::Start { operation, source }) => {
+            Err(CancellableUtf8Error::StartWorker { operation, source })
+        }
+    }
+}
+
+struct CancellableSliceReader<'a, C: ?Sized> {
+    source: &'a [u8],
+    offset: usize,
+    cancellation: &'a C,
+}
+
+impl<'a, C: PlanningResourceCancellation + ?Sized> CancellableSliceReader<'a, C> {
+    fn new(source: &'a [u8], cancellation: &'a C) -> Self {
+        Self {
+            source,
+            offset: 0,
+            cancellation,
+        }
+    }
+}
+
+impl<C: PlanningResourceCancellation + ?Sized> Read for CancellableSliceReader<'_, C> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.cancellation.is_cancelled() {
+            // `Read` 调用方会自动重试 `Interrupted`；取消必须返回不可重试错误，
+            // 否则 serde_json 会在同一个读取点永久循环。
+            return Err(io::Error::other("翻译资源解析已取消"));
+        }
+        if self.offset == self.source.len() || buffer.is_empty() {
+            return Ok(0);
+        }
+        let amount = buffer
+            .len()
+            .min(PLANNING_RESOURCE_CANCEL_CHECK_BYTES)
+            .min(self.source.len() - self.offset);
+        buffer[..amount].copy_from_slice(&self.source[self.offset..self.offset + amount]);
+        self.offset += amount;
+        Ok(amount)
+    }
+}
+
+struct CancellableVecWriter<'a, C: ?Sized> {
+    output: &'a mut Vec<u8>,
+    cancellation: &'a C,
+}
+
+impl<C: PlanningResourceCancellation + ?Sized> Write for CancellableVecWriter<'_, C> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.cancellation.is_cancelled() {
+            // `write_all` 会自动重试 `Interrupted`，因此取消使用不可重试错误。
+            return Err(io::Error::other("翻译资源编码已取消"));
+        }
+        let amount = bytes.len().min(PLANNING_RESOURCE_CANCEL_CHECK_BYTES);
+        self.output.extend_from_slice(&bytes[..amount]);
+        Ok(amount)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.cancellation.is_cancelled() {
+            Err(io::Error::other("翻译资源编码已取消"))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -503,92 +892,311 @@ struct PlaceholderToml {
     rule: Vec<PlaceholderRuleDefinition>,
 }
 
+#[cfg(test)]
 fn parse_terminology_toml(
     bytes: &[u8],
 ) -> Result<Vec<TerminologyEntry>, TerminologyDefinitionError> {
-    let source = std::str::from_utf8(bytes).map_err(TerminologyDefinitionError::InvalidUtf8)?;
-    let definition: TerminologyToml =
-        toml::from_str(source).map_err(TerminologyDefinitionError::InvalidToml)?;
-    Ok(definition
-        .term
-        .into_iter()
-        .map(|entry| {
-            let triggers = entry.triggers.unwrap_or_else(|| vec![entry.term.clone()]);
-            TerminologyEntry {
-                term: entry.term,
-                translation: entry.translation,
-                triggers,
-            }
-        })
-        .collect())
+    parse_terminology_toml_with_cancellation(bytes.to_vec(), &never_cancelled)
 }
 
-fn parse_terminology_snapshot(
-    json: &str,
+fn parse_terminology_toml_with_cancellation(
+    bytes: Vec<u8>,
+    cancellation: &(impl PlanningResourceCancellation + ?Sized),
 ) -> Result<Vec<TerminologyEntry>, TerminologyDefinitionError> {
-    serde_json::from_str(json).map_err(TerminologyDefinitionError::InvalidSnapshot)
+    let source =
+        into_utf8_string_with_cancellation(bytes, cancellation).map_err(|source| match source {
+            CancellableUtf8Error::Cancelled => TerminologyDefinitionError::Cancelled,
+            CancellableUtf8Error::StartWorker { operation, source } => {
+                TerminologyDefinitionError::StartWorker { operation, source }
+            }
+            CancellableUtf8Error::Invalid(source) => {
+                TerminologyDefinitionError::InvalidUtf8(source)
+            }
+        })?;
+    let definition = run_isolated_operation(
+        "att-term-toml",
+        move || toml::from_str::<TerminologyToml>(&source),
+        || ensure_planning_resource_running(cancellation),
+    )
+    .map_err(terminology_isolated_operation_error)?
+    .map_err(TerminologyDefinitionError::InvalidToml)?;
+    ensure_planning_resource_running(cancellation)
+        .map_err(|()| TerminologyDefinitionError::Cancelled)?;
+    let mut entries = Vec::<TerminologyEntry>::with_capacity(definition.term.len());
+    for entry in definition.term {
+        ensure_planning_resource_running(cancellation)
+            .map_err(|()| TerminologyDefinitionError::Cancelled)?;
+        let triggers = match entry.triggers {
+            Some(triggers) => triggers,
+            None => vec![
+                clone_planning_resource_string(&entry.term, cancellation)
+                    .map_err(|()| TerminologyDefinitionError::Cancelled)?,
+            ],
+        };
+        entries.push(TerminologyEntry {
+            term: entry.term,
+            translation: entry.translation,
+            triggers,
+        });
+    }
+    Ok(entries)
 }
 
+fn parse_terminology_snapshot_with_cancellation(
+    json: &str,
+    cancellation: &(impl PlanningResourceCancellation + ?Sized),
+) -> Result<Vec<TerminologyEntry>, TerminologyDefinitionError> {
+    let source = CancellableSliceReader::new(json.as_bytes(), cancellation);
+    let mut reader = BufReader::with_capacity(PLANNING_RESOURCE_CANCEL_CHECK_BYTES, source);
+    let result = serde_json::from_reader(&mut reader);
+    if cancellation.is_cancelled() {
+        Err(TerminologyDefinitionError::Cancelled)
+    } else {
+        result.map_err(TerminologyDefinitionError::InvalidSnapshot)
+    }
+}
+
+#[cfg(test)]
 fn parse_placeholder_toml(
     bytes: &[u8],
 ) -> Result<Vec<PlaceholderRuleDefinition>, PlaceholderDefinitionError> {
-    let source = std::str::from_utf8(bytes).map_err(PlaceholderDefinitionError::InvalidUtf8)?;
-    let definition: PlaceholderToml =
-        toml::from_str(source).map_err(PlaceholderDefinitionError::InvalidToml)?;
+    parse_placeholder_toml_with_cancellation(bytes.to_vec(), &never_cancelled)
+}
+
+fn parse_placeholder_toml_with_cancellation(
+    bytes: Vec<u8>,
+    cancellation: &(impl PlanningResourceCancellation + ?Sized),
+) -> Result<Vec<PlaceholderRuleDefinition>, PlaceholderDefinitionError> {
+    let source =
+        into_utf8_string_with_cancellation(bytes, cancellation).map_err(|source| match source {
+            CancellableUtf8Error::Cancelled => PlaceholderDefinitionError::Cancelled,
+            CancellableUtf8Error::StartWorker { operation, source } => {
+                PlaceholderDefinitionError::StartWorker { operation, source }
+            }
+            CancellableUtf8Error::Invalid(source) => {
+                PlaceholderDefinitionError::InvalidUtf8(source)
+            }
+        })?;
+    let definition = run_isolated_operation(
+        "att-placeholder-toml",
+        move || toml::from_str::<PlaceholderToml>(&source),
+        || ensure_planning_resource_running(cancellation),
+    )
+    .map_err(placeholder_isolated_operation_error)?
+    .map_err(PlaceholderDefinitionError::InvalidToml)?;
+    ensure_planning_resource_running(cancellation)
+        .map_err(|()| PlaceholderDefinitionError::Cancelled)?;
     Ok(definition.rule)
 }
 
+fn parse_placeholder_snapshot_with_cancellation(
+    json: &str,
+    cancellation: &(impl PlanningResourceCancellation + ?Sized),
+) -> Result<Vec<PlaceholderRuleDefinition>, PlaceholderDefinitionError> {
+    let source = CancellableSliceReader::new(json.as_bytes(), cancellation);
+    let mut reader = BufReader::with_capacity(PLANNING_RESOURCE_CANCEL_CHECK_BYTES, source);
+    let result = serde_json::from_reader(&mut reader);
+    if cancellation.is_cancelled() {
+        Err(PlaceholderDefinitionError::Cancelled)
+    } else {
+        result.map_err(PlaceholderDefinitionError::InvalidSnapshot)
+    }
+}
+
+fn encode_terminology_snapshot_with_cancellation(
+    entries: &[TerminologyEntry],
+    cancellation: &(impl PlanningResourceCancellation + ?Sized),
+) -> Result<String, TerminologyDefinitionError> {
+    let mut output = Vec::new();
+    let result = {
+        let mut writer = CancellableVecWriter {
+            output: &mut output,
+            cancellation,
+        };
+        serde_json::to_writer(&mut writer, entries)
+    };
+    if cancellation.is_cancelled() {
+        return Err(TerminologyDefinitionError::Cancelled);
+    }
+    result.map_err(TerminologyDefinitionError::EncodeSnapshot)?;
+    String::from_utf8(output).map_err(|source| {
+        TerminologyDefinitionError::EncodeSnapshot(serde_json::Error::io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            source,
+        )))
+    })
+}
+
+fn encode_placeholder_snapshot_with_cancellation(
+    definitions: &[PlaceholderRuleDefinition],
+    cancellation: &(impl PlanningResourceCancellation + ?Sized),
+) -> Result<String, PlaceholderDefinitionError> {
+    let mut output = Vec::new();
+    let result = {
+        let mut writer = CancellableVecWriter {
+            output: &mut output,
+            cancellation,
+        };
+        serde_json::to_writer(&mut writer, definitions)
+    };
+    if cancellation.is_cancelled() {
+        return Err(PlaceholderDefinitionError::Cancelled);
+    }
+    result.map_err(PlaceholderDefinitionError::EncodeSnapshot)?;
+    String::from_utf8(output).map_err(|source| {
+        PlaceholderDefinitionError::EncodeSnapshot(serde_json::Error::io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            source,
+        )))
+    })
+}
+
+fn clone_planning_resource_string(
+    source: &str,
+    cancellation: &(impl PlanningResourceCancellation + ?Sized),
+) -> Result<String, ()> {
+    let mut output = String::with_capacity(source.len());
+    let mut start = 0;
+    while start < source.len() {
+        ensure_planning_resource_running(cancellation)?;
+        let mut end = (start + PLANNING_RESOURCE_CANCEL_CHECK_BYTES).min(source.len());
+        while end < source.len() && !source.is_char_boundary(end) {
+            end += 1;
+        }
+        output.push_str(&source[start..end]);
+        start = end;
+    }
+    ensure_planning_resource_running(cancellation)?;
+    Ok(output)
+}
+
+#[cfg(test)]
 pub(crate) fn compile_terminology(
     raw: Vec<TerminologyEntry>,
 ) -> Result<CompiledTerminology, TerminologyDefinitionError> {
-    let mut entries = Vec::with_capacity(raw.len());
-    let mut entry_by_term = BTreeMap::new();
-    let mut all_triggers = BTreeSet::new();
-    let mut patterns = Vec::new();
-    let mut pattern_to_entry = Vec::new();
+    compile_terminology_with_cancellation(raw, &never_cancelled)
+}
 
-    for (index, raw_entry) in raw.into_iter().enumerate() {
-        let entry_number = index + 1;
-        validate_term_string("term", &raw_entry.term, entry_number, false)?;
-        validate_term_string("translation", &raw_entry.translation, entry_number, false)?;
+pub(crate) fn compile_terminology_with_cancellation(
+    raw: Vec<TerminologyEntry>,
+    cancellation: &(impl PlanningResourceCancellation + ?Sized),
+) -> Result<CompiledTerminology, TerminologyDefinitionError> {
+    ensure_planning_resource_running(cancellation)
+        .map_err(|()| TerminologyDefinitionError::Cancelled)?;
+    let mut entries = Vec::<TerminologyEntry>::with_capacity(raw.len());
+    let mut entry_by_term = HashMap::<Sha256Fingerprint, Vec<usize>>::new();
+    let mut trigger_by_text = HashMap::<Sha256Fingerprint, Vec<(usize, usize)>>::new();
+    let mut pattern_to_entry = Vec::new();
+    let mut maximum_trigger_bytes = 0_usize;
+
+    for raw_entry in raw {
+        ensure_planning_resource_running(cancellation)
+            .map_err(|()| TerminologyDefinitionError::Cancelled)?;
+        let entry_index = entries.len();
+        let entry_number = entry_index + 1;
+        validate_term_string_with_cancellation(
+            "term",
+            &raw_entry.term,
+            entry_number,
+            false,
+            cancellation,
+        )?;
+        validate_term_string_with_cancellation(
+            "translation",
+            &raw_entry.translation,
+            entry_number,
+            false,
+            cancellation,
+        )?;
         if raw_entry.triggers.is_empty() {
             return Err(TerminologyDefinitionError::EmptyTriggers { entry_number });
         }
-        if entry_by_term
-            .insert(raw_entry.term.clone(), index)
-            .is_some()
-        {
-            return Err(TerminologyDefinitionError::DuplicateTerm {
-                term: raw_entry.term,
-            });
+
+        let term_fingerprint = terminology_text_fingerprint(
+            b"att.terminology.term-identity",
+            &raw_entry.term,
+            cancellation,
+        )?;
+        if let Some(candidates) = entry_by_term.get(&term_fingerprint) {
+            for &candidate_index in candidates {
+                if terminology_text_eq_with_cancellation(
+                    &entries[candidate_index].term,
+                    &raw_entry.term,
+                    cancellation,
+                )? {
+                    return Err(TerminologyDefinitionError::DuplicateTerm {
+                        term: raw_entry.term,
+                    });
+                }
+            }
         }
-        let mut local_triggers = BTreeSet::new();
-        for trigger in &raw_entry.triggers {
-            validate_term_string("trigger", trigger, entry_number, true)?;
-            if !local_triggers.insert(trigger.clone()) || !all_triggers.insert(trigger.clone()) {
+
+        entries.push(raw_entry);
+        entry_by_term
+            .entry(term_fingerprint)
+            .or_default()
+            .push(entry_index);
+
+        for trigger_index in 0..entries[entry_index].triggers.len() {
+            ensure_planning_resource_running(cancellation)
+                .map_err(|()| TerminologyDefinitionError::Cancelled)?;
+            let trigger = &entries[entry_index].triggers[trigger_index];
+            validate_term_string_with_cancellation(
+                "trigger",
+                trigger,
+                entry_number,
+                true,
+                cancellation,
+            )?;
+            maximum_trigger_bytes = maximum_trigger_bytes.max(trigger.len());
+
+            let trigger_fingerprint = terminology_text_fingerprint(
+                b"att.terminology.trigger-identity",
+                trigger,
+                cancellation,
+            )?;
+            let mut duplicate = false;
+            if let Some(candidates) = trigger_by_text.get(&trigger_fingerprint) {
+                for &(candidate_entry, candidate_trigger) in candidates {
+                    if terminology_text_eq_with_cancellation(
+                        &entries[candidate_entry].triggers[candidate_trigger],
+                        trigger,
+                        cancellation,
+                    )? {
+                        duplicate = true;
+                        break;
+                    }
+                }
+            }
+            if duplicate {
                 return Err(TerminologyDefinitionError::DuplicateTrigger {
-                    trigger: trigger.clone(),
+                    trigger: clone_planning_resource_string(trigger, cancellation)
+                        .map_err(|()| TerminologyDefinitionError::Cancelled)?,
                 });
             }
-            patterns.push(trigger.clone());
-            pattern_to_entry.push(index);
+            trigger_by_text
+                .entry(trigger_fingerprint)
+                .or_default()
+                .push((entry_index, trigger_index));
+            pattern_to_entry.push(entry_index);
         }
-        entries.push(TerminologyEntry {
-            term: raw_entry.term,
-            translation: raw_entry.translation,
-            triggers: raw_entry.triggers,
-        });
     }
 
-    let matcher = if patterns.is_empty() {
-        None
+    drop(entry_by_term);
+    drop(trigger_by_text);
+    let (entries, matcher) = if pattern_to_entry.is_empty() {
+        (entries, None)
     } else {
-        Some(
-            AhoCorasickBuilder::new()
-                .match_kind(MatchKind::Standard)
-                .build(patterns)
-                .map_err(TerminologyDefinitionError::CompileMatcher)?,
+        ensure_planning_resource_running(cancellation)
+            .map_err(|()| TerminologyDefinitionError::Cancelled)?;
+        let (entries, matcher) = run_isolated_operation(
+            "att-term-matcher",
+            move || build_terminology_matcher(entries, maximum_trigger_bytes),
+            || ensure_planning_resource_running(cancellation),
         )
+        .map_err(terminology_isolated_operation_error)?
+        .map_err(TerminologyDefinitionError::CompileMatcher)?;
+        (entries, Some(matcher))
     };
 
     Ok(CompiledTerminology {
@@ -598,28 +1206,131 @@ pub(crate) fn compile_terminology(
     })
 }
 
-fn validate_term_string(
+fn build_terminology_matcher(
+    entries: Vec<TerminologyEntry>,
+    maximum_trigger_bytes: usize,
+) -> Result<(Vec<TerminologyEntry>, TerminologyMatcher), aho_corasick::BuildError> {
+    let matcher = if maximum_trigger_bytes <= TERMINOLOGY_WINDOWED_MAX_PATTERN_BYTES {
+        TerminologyMatcher::Windowed(
+            AhoCorasickBuilder::new()
+                .match_kind(MatchKind::Standard)
+                .build(
+                    entries
+                        .iter()
+                        .flat_map(|entry| entry.triggers.iter().map(String::as_bytes)),
+                )?,
+        )
+    } else {
+        let mut builder = noncontiguous::NFA::builder();
+        builder.match_kind(MatchKind::Standard).prefilter(false);
+        let noncontiguous = builder.build(
+            entries
+                .iter()
+                .flat_map(|entry| entry.triggers.iter().map(String::as_bytes)),
+        )?;
+        let streaming = match contiguous::NFA::builder().build_from_noncontiguous(&noncontiguous) {
+            Ok(contiguous) => StreamingTerminologyMatcher::Contiguous(contiguous),
+            Err(_) => StreamingTerminologyMatcher::Noncontiguous(noncontiguous),
+        };
+        TerminologyMatcher::Streaming(Box::new(streaming))
+    };
+    Ok((entries, matcher))
+}
+
+fn terminology_text_fingerprint(
+    domain: &[u8],
+    text: &str,
+    cancellation: &(impl PlanningResourceCancellation + ?Sized),
+) -> Result<Sha256Fingerprint, TerminologyDefinitionError> {
+    let chunk_size = NonZeroUsize::new(PLANNING_RESOURCE_CANCEL_CHECK_BYTES)
+        .expect("术语指纹取消检查块大小必须非零");
+    ensure_planning_resource_running(cancellation)
+        .map_err(|()| TerminologyDefinitionError::Cancelled)?;
+    let mut hasher = Sha256FramedHasher::new(domain);
+    hasher
+        .try_frame_chunks(1, text.as_bytes(), chunk_size, || {
+            ensure_planning_resource_running(cancellation)
+        })
+        .map_err(|()| TerminologyDefinitionError::Cancelled)?;
+    ensure_planning_resource_running(cancellation)
+        .map_err(|()| TerminologyDefinitionError::Cancelled)?;
+    Ok(hasher.finish())
+}
+
+fn terminology_text_eq_with_cancellation(
+    left: &str,
+    right: &str,
+    cancellation: &(impl PlanningResourceCancellation + ?Sized),
+) -> Result<bool, TerminologyDefinitionError> {
+    ensure_planning_resource_running(cancellation)
+        .map_err(|()| TerminologyDefinitionError::Cancelled)?;
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    for (left, right) in left
+        .as_bytes()
+        .chunks(PLANNING_RESOURCE_CANCEL_CHECK_BYTES)
+        .zip(
+            right
+                .as_bytes()
+                .chunks(PLANNING_RESOURCE_CANCEL_CHECK_BYTES),
+        )
+    {
+        ensure_planning_resource_running(cancellation)
+            .map_err(|()| TerminologyDefinitionError::Cancelled)?;
+        if left != right {
+            return Ok(false);
+        }
+    }
+    ensure_planning_resource_running(cancellation)
+        .map_err(|()| TerminologyDefinitionError::Cancelled)?;
+    Ok(true)
+}
+
+fn validate_term_string_with_cancellation(
     field: &'static str,
     value: &str,
     entry_number: usize,
     allow_line_feed: bool,
+    cancellation: &(impl PlanningResourceCancellation + ?Sized),
 ) -> Result<(), TerminologyDefinitionError> {
-    if value.trim().is_empty() {
+    let mut has_non_whitespace = false;
+    let mut first_is_whitespace = None;
+    let mut last_is_whitespace = false;
+    let mut first_disallowed_control = None;
+    let mut next_check = 0;
+    for (offset, character) in value.char_indices() {
+        if offset >= next_check {
+            ensure_planning_resource_running(cancellation)
+                .map_err(|()| TerminologyDefinitionError::Cancelled)?;
+            next_check = offset.saturating_add(PLANNING_RESOURCE_CANCEL_CHECK_BYTES);
+        }
+        let whitespace = character.is_whitespace();
+        first_is_whitespace.get_or_insert(whitespace);
+        last_is_whitespace = whitespace;
+        has_non_whitespace |= !whitespace;
+        if first_disallowed_control.is_none()
+            && character.is_control()
+            && (!allow_line_feed || character != '\n')
+        {
+            first_disallowed_control = Some(character);
+        }
+    }
+    ensure_planning_resource_running(cancellation)
+        .map_err(|()| TerminologyDefinitionError::Cancelled)?;
+    if !has_non_whitespace {
         return Err(TerminologyDefinitionError::BlankField {
             entry_number,
             field,
         });
     }
-    if value.trim() != value {
+    if first_is_whitespace.unwrap_or(false) || last_is_whitespace {
         return Err(TerminologyDefinitionError::SurroundingWhitespace {
             entry_number,
             field,
         });
     }
-    if let Some(character) = value
-        .chars()
-        .find(|character| character.is_control() && (!allow_line_feed || *character != '\n'))
-    {
+    if let Some(character) = first_disallowed_control {
         return Err(TerminologyDefinitionError::ControlCharacter {
             entry_number,
             field,
@@ -632,6 +1343,7 @@ fn validate_term_string(
 /// 外部规划资料在读取或 CPU 解析阶段的错误。
 #[derive(Debug)]
 pub(crate) enum TranslationPlanningResourceReadingError<F, C> {
+    Cancelled,
     ReadTerminology {
         path: PathBuf,
         source: ReadFileError<F>,
@@ -665,6 +1377,7 @@ where
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled => formatter.write_str("翻译资源读取已取消"),
             Self::ReadTerminology { path, source } => {
                 write!(formatter, "无法读取术语文件 {}：{source}", path.display())
             }
@@ -711,6 +1424,7 @@ where
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Cancelled => None,
             Self::ReadTerminology { source, .. } => Some(source),
             Self::ReadPlaceholderRules { source, .. } => Some(source),
             Self::ParseTerminologyCompute { source, .. } => Some(source),
@@ -723,6 +1437,11 @@ where
 
 #[derive(Debug)]
 pub(crate) enum TerminologyDefinitionError {
+    Cancelled,
+    StartWorker {
+        operation: &'static str,
+        source: io::Error,
+    },
     InvalidUtf8(std::str::Utf8Error),
     InvalidToml(toml::de::Error),
     InvalidSnapshot(serde_json::Error),
@@ -755,6 +1474,10 @@ pub(crate) enum TerminologyDefinitionError {
 impl fmt::Display for TerminologyDefinitionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled => formatter.write_str("术语处理已取消"),
+            Self::StartWorker { operation, source } => {
+                write!(formatter, "无法启动术语处理 worker {operation}：{source}")
+            }
             Self::InvalidUtf8(source) => write!(formatter, "TOML 不是 UTF-8：{source}"),
             Self::InvalidToml(source) => write!(formatter, "TOML 解析失败：{source}"),
             Self::InvalidSnapshot(source) => {
@@ -793,6 +1516,8 @@ impl fmt::Display for TerminologyDefinitionError {
 impl Error for TerminologyDefinitionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Cancelled => None,
+            Self::StartWorker { source, .. } => Some(source),
             Self::InvalidUtf8(source) => Some(source),
             Self::InvalidToml(source) => Some(source),
             Self::InvalidSnapshot(source) => Some(source),
@@ -805,6 +1530,11 @@ impl Error for TerminologyDefinitionError {
 
 #[derive(Debug)]
 pub(crate) enum PlaceholderDefinitionError {
+    Cancelled,
+    StartWorker {
+        operation: &'static str,
+        source: io::Error,
+    },
     InvalidUtf8(std::str::Utf8Error),
     InvalidToml(toml::de::Error),
     InvalidSnapshot(serde_json::Error),
@@ -814,6 +1544,13 @@ pub(crate) enum PlaceholderDefinitionError {
 impl fmt::Display for PlaceholderDefinitionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled => formatter.write_str("占位符规则处理已取消"),
+            Self::StartWorker { operation, source } => {
+                write!(
+                    formatter,
+                    "无法启动占位符规则处理 worker {operation}：{source}"
+                )
+            }
             Self::InvalidUtf8(source) => write!(formatter, "TOML 不是 UTF-8：{source}"),
             Self::InvalidToml(source) => write!(formatter, "TOML 解析失败：{source}"),
             Self::InvalidSnapshot(source) => {
@@ -829,6 +1566,8 @@ impl fmt::Display for PlaceholderDefinitionError {
 impl Error for PlaceholderDefinitionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Cancelled => None,
+            Self::StartWorker { source, .. } => Some(source),
             Self::InvalidUtf8(source) => Some(source),
             Self::InvalidToml(source) => Some(source),
             Self::InvalidSnapshot(source) => Some(source),
@@ -843,6 +1582,7 @@ mod tests {
     use std::io::Write as _;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
 
     use super::*;
     use crate::runtime::cpu::{CpuExecutorConfig, RayonCpuExecutor};
@@ -871,6 +1611,26 @@ mod tests {
             F: FnOnce() -> T + Send + 'static,
         {
             Ok(task())
+        }
+    }
+
+    struct CancelAtPoll {
+        polls: AtomicUsize,
+        cancel_at: usize,
+    }
+
+    impl CancelAtPoll {
+        fn new(cancel_at: usize) -> Self {
+            Self {
+                polls: AtomicUsize::new(0),
+                cancel_at,
+            }
+        }
+    }
+
+    impl CancelAtPoll {
+        fn is_cancelled(&self) -> bool {
+            self.polls.fetch_add(1, Ordering::SeqCst) >= self.cancel_at
         }
     }
 
@@ -932,6 +1692,300 @@ mod tests {
             matched.iter().map(|entry| entry.term()).collect::<Vec<_>>(),
             vec!["魔法剣", "剣"]
         );
+    }
+
+    #[test]
+    fn terminology_compilation_stops_between_entries() {
+        let definitions = (0..1_000)
+            .map(|index| TerminologyEntry {
+                term: format!("term-{index}"),
+                translation: format!("translation-{index}"),
+                triggers: vec![format!("trigger-{index}")],
+            })
+            .collect();
+        let cancellation = CancelAtPoll::new(40);
+
+        assert!(matches!(
+            compile_terminology_with_cancellation(definitions, &|| cancellation.is_cancelled()),
+            Err(TerminologyDefinitionError::Cancelled)
+        ));
+        assert!(
+            cancellation.polls.load(Ordering::SeqCst) < 200,
+            "取消后不得继续扫描全部术语"
+        );
+    }
+
+    #[test]
+    fn terminology_identity_fingerprint_stops_between_long_text_chunks() {
+        let text = "x".repeat(PLANNING_RESOURCE_CANCEL_CHECK_BYTES * 4);
+        let cancellation = CancelAtPoll::new(2);
+
+        assert!(matches!(
+            terminology_text_fingerprint(b"att.terminology.test-identity", &text, &|| cancellation
+                .is_cancelled(),),
+            Err(TerminologyDefinitionError::Cancelled)
+        ));
+        assert_eq!(cancellation.polls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn terminology_collision_comparison_stops_between_long_common_prefix_chunks() {
+        let prefix = "x".repeat(PLANNING_RESOURCE_CANCEL_CHECK_BYTES * 4);
+        let left = format!("{prefix}a");
+        let right = format!("{prefix}b");
+        let cancellation = CancelAtPoll::new(2);
+
+        assert!(matches!(
+            terminology_text_eq_with_cancellation(&left, &right, &|| cancellation.is_cancelled(),),
+            Err(TerminologyDefinitionError::Cancelled)
+        ));
+        assert_eq!(cancellation.polls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn long_common_prefix_terms_and_triggers_keep_file_order_semantics() {
+        let prefix = "x".repeat(PLANNING_RESOURCE_CANCEL_CHECK_BYTES * 2 + 17);
+        let first_trigger = format!("{prefix}-first-trigger");
+        let second_trigger = format!("{prefix}-second-trigger");
+        let compiled = compile_terminology(vec![
+            TerminologyEntry {
+                term: format!("{prefix}-first-term"),
+                translation: "甲".to_owned(),
+                triggers: vec![first_trigger.clone()],
+            },
+            TerminologyEntry {
+                term: format!("{prefix}-second-term"),
+                translation: "乙".to_owned(),
+                triggers: vec![second_trigger.clone()],
+            },
+        ])
+        .expect("超长共同前缀不应改变术语身份或 Aho pattern 顺序");
+        let text = format!("{second_trigger}\n{first_trigger}");
+
+        assert_eq!(
+            compiled
+                .triggered_by([text.as_str()])
+                .into_iter()
+                .map(TerminologyEntry::translation)
+                .collect::<Vec<_>>(),
+            ["甲", "乙"]
+        );
+    }
+
+    #[test]
+    fn cancellable_utf8_validation_preserves_cross_chunk_codepoint_and_allocation() {
+        let mut bytes = vec![b'x'; PLANNING_RESOURCE_CANCEL_CHECK_BYTES - 1];
+        bytes.extend_from_slice("译".as_bytes());
+        let original_pointer = bytes.as_ptr();
+
+        let source = into_utf8_string_with_cancellation(bytes, &never_cancelled)
+            .expect("跨分块的 UTF-8 码点应有效");
+
+        assert_eq!(source.as_ptr(), original_pointer);
+        assert!(source.ends_with('译'));
+    }
+
+    #[test]
+    fn cancellable_utf8_validation_reports_global_invalid_offset() {
+        let invalid_offset = PLANNING_RESOURCE_CANCEL_CHECK_BYTES + 17;
+        let mut bytes = vec![b'x'; PLANNING_RESOURCE_CANCEL_CHECK_BYTES * 2];
+        bytes[invalid_offset] = 0xff;
+
+        match into_utf8_string_with_cancellation(bytes, &never_cancelled) {
+            Err(CancellableUtf8Error::Invalid(source)) => {
+                assert_eq!(source.valid_up_to(), invalid_offset);
+            }
+            Err(CancellableUtf8Error::Cancelled) => panic!("未请求取消"),
+            Err(CancellableUtf8Error::StartWorker { operation, source }) => {
+                panic!("不应无法启动 UTF-8 诊断 worker {operation}：{source}");
+            }
+            Ok(_) => panic!("无效 UTF-8 不应通过校验"),
+        }
+    }
+
+    #[test]
+    fn terminology_snapshot_parser_stops_while_reading_json() {
+        let json = format!(
+            r#"[{{"term":"{}","translation":"译文","triggers":["触发"]}}]"#,
+            "x".repeat(PLANNING_RESOURCE_CANCEL_CHECK_BYTES * 4)
+        );
+        let cancellation = CancelAtPoll::new(2);
+
+        assert!(matches!(
+            parse_terminology_snapshot_with_cancellation(&json, &|| cancellation.is_cancelled()),
+            Err(TerminologyDefinitionError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn terminology_snapshot_encoder_stops_while_writing_json() {
+        let entries = vec![TerminologyEntry {
+            term: "x".repeat(PLANNING_RESOURCE_CANCEL_CHECK_BYTES * 4),
+            translation: "译文".to_owned(),
+            triggers: vec!["触发".to_owned()],
+        }];
+        let cancellation = CancelAtPoll::new(3);
+
+        assert!(matches!(
+            encode_terminology_snapshot_with_cancellation(&entries, &|| cancellation
+                .is_cancelled()),
+            Err(TerminologyDefinitionError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn cancellable_terminology_scan_preserves_cross_window_matches() {
+        const WINDOW_BYTES: usize = 64 * 1024;
+        let compiled = compile_terminology(vec![TerminologyEntry {
+            term: "boundary".to_owned(),
+            translation: "边界".to_owned(),
+            triggers: vec!["ABCD".to_owned()],
+        }])
+        .expect("术语应该有效");
+        let mut text = "x".repeat(WINDOW_BYTES - 2);
+        text.push_str("ABCD");
+
+        let indices = compiled
+            .triggered_indices_with_cancellation([text.as_str()], || Ok::<_, ()>(()))
+            .expect("未取消的扫描应该完成");
+
+        assert_eq!(indices, vec![0]);
+    }
+
+    #[test]
+    fn cancellable_terminology_scan_reports_all_nested_and_overlapping_patterns() {
+        let compiled = compile_terminology(vec![
+            TerminologyEntry {
+                term: "one".to_owned(),
+                translation: "一".to_owned(),
+                triggers: vec!["a".to_owned()],
+            },
+            TerminologyEntry {
+                term: "two".to_owned(),
+                translation: "二".to_owned(),
+                triggers: vec!["aa".to_owned()],
+            },
+            TerminologyEntry {
+                term: "three".to_owned(),
+                translation: "三".to_owned(),
+                triggers: vec!["aaa".to_owned()],
+            },
+        ])
+        .expect("嵌套 trigger 应可编译");
+
+        let indices = compiled
+            .triggered_indices_with_cancellation(["aaaa"], || Ok::<_, ()>(()))
+            .expect("未取消的重叠扫描应完成");
+
+        assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn cancellable_terminology_streaming_scan_reports_all_nested_patterns() {
+        let longest = "a".repeat(TERMINOLOGY_WINDOWED_MAX_PATTERN_BYTES + 1);
+        let middle = "a".repeat(TERMINOLOGY_WINDOWED_MAX_PATTERN_BYTES);
+        let shortest = "a".repeat(TERMINOLOGY_WINDOWED_MAX_PATTERN_BYTES - 1);
+        let compiled = compile_terminology(vec![
+            TerminologyEntry {
+                term: "longest".to_owned(),
+                translation: "最长".to_owned(),
+                triggers: vec![longest.clone()],
+            },
+            TerminologyEntry {
+                term: "middle".to_owned(),
+                translation: "中间".to_owned(),
+                triggers: vec![middle],
+            },
+            TerminologyEntry {
+                term: "shortest".to_owned(),
+                translation: "最短".to_owned(),
+                triggers: vec![shortest],
+            },
+        ])
+        .expect("嵌套的长 trigger 应可编译");
+        assert!(matches!(
+            compiled.matcher.as_ref(),
+            Some(TerminologyMatcher::Streaming(_))
+        ));
+        let text = format!("{longest}a");
+
+        let indices = compiled
+            .triggered_indices_with_cancellation([text.as_str()], || Ok::<_, ()>(()))
+            .expect("流式扫描必须枚举同一状态上的全部嵌套匹配");
+
+        assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn cancellable_terminology_scan_streams_multiblock_trigger_and_cancels_by_chunk() {
+        const WINDOW_BYTES: usize = 64 * 1024;
+        const LONG_PATTERN_BYTES: usize = WINDOW_BYTES * 2 + 17;
+        let trigger = "n".repeat(LONG_PATTERN_BYTES);
+        let compiled = compile_terminology(vec![TerminologyEntry {
+            term: "long-boundary".to_owned(),
+            translation: "长边界".to_owned(),
+            triggers: vec![trigger.clone()],
+        }])
+        .expect("长术语应该有效");
+        assert!(matches!(
+            compiled.matcher.as_ref(),
+            Some(TerminologyMatcher::Streaming(_))
+        ));
+        let mut text = "x".repeat(WINDOW_BYTES - 11);
+        text.push_str(&trigger);
+        let mut polls = 0_usize;
+
+        let indices = compiled
+            .triggered_indices_with_cancellation([text.as_str()], || {
+                polls += 1;
+                Ok::<_, ()>(())
+            })
+            .expect("未取消的长术语扫描应该完成");
+
+        assert_eq!(indices, vec![0]);
+        let input_chunks = text.len().div_ceil(WINDOW_BYTES);
+        assert!(
+            polls >= input_chunks,
+            "每处理至多一个 64 KiB 输入块必须轮询一次，实际 chunks={input_chunks}, polls={polls}"
+        );
+        assert!(
+            polls <= input_chunks + 6,
+            "单个长 trigger 应线性流式扫描，不能按 pattern 长度反复窗口扫描，实际 chunks={input_chunks}, polls={polls}"
+        );
+
+        let missing = "x".repeat(WINDOW_BYTES * 8);
+        let mut cancellation_polls = 0_usize;
+        let cancelled = compiled.triggered_indices_with_cancellation([missing.as_str()], || {
+            cancellation_polls += 1;
+            if cancellation_polls >= 5 {
+                Err("cancelled")
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(cancelled, Err("cancelled"));
+        assert_eq!(cancellation_polls, 5);
+    }
+
+    #[test]
+    fn cancellable_terminology_scan_stops_between_text_windows() {
+        const WINDOW_BYTES: usize = 64 * 1024;
+        let compiled = compile_terminology(vec![TerminologyEntry {
+            term: "missing".to_owned(),
+            translation: "缺失".to_owned(),
+            triggers: vec!["needle".to_owned()],
+        }])
+        .expect("术语应该有效");
+        let text = "x".repeat(WINDOW_BYTES * 4);
+        let mut polls = 0_usize;
+
+        let result = compiled.triggered_indices_with_cancellation([text.as_str()], || {
+            polls += 1;
+            if polls >= 4 { Err(()) } else { Ok(()) }
+        });
+
+        assert_eq!(result, Err(()));
+        assert_eq!(polls, 4);
     }
 
     #[test]
@@ -1104,13 +2158,20 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
+        let compile_started = Instant::now();
         let compiled = compile_terminology(definitions).expect("一万条字面 trigger 应可一次编译");
+        let compile_elapsed = compile_started.elapsed();
+        let scan_started = Instant::now();
         let matched = compiled.triggered_by(["前文 trigger-09999 中段 trigger-00007 后文"]);
+        let scan_elapsed = scan_started.elapsed();
 
         assert_eq!(compiled.entries().len(), 10_000);
         assert_eq!(
             matched.iter().map(|entry| entry.term()).collect::<Vec<_>>(),
             ["term-00007", "term-09999"]
+        );
+        eprintln!(
+            "typical terminology: compile={compile_elapsed:?}, scan={scan_elapsed:?}, patterns=10000"
         );
     }
 

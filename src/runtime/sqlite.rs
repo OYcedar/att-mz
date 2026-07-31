@@ -2,15 +2,17 @@
 
 use std::cell::RefCell;
 use std::error::Error;
+use std::ffi::{c_int, c_void};
 use std::fmt;
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::future::Future;
 use std::io;
 use std::num::NonZeroUsize;
+use std::ops::{Deref, DerefMut};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -57,6 +59,7 @@ const SESSION_INDETERMINATE: u8 = 1;
 const SESSION_FINALIZING: u8 = 2;
 const SESSION_CLOSED: u8 = 3;
 const SQLITE_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const SQLITE_CANCELLATION_CHECK_OPERATIONS: i32 = 1_000;
 const SQLITE_BACKUP_PAGES_PER_STEP: i32 = 256;
 // 这些值是 SSPV 最大真实样本的 SQLite 单因素消融结果，不是项目容量限制：
 // 64 KiB 页显著减少长路径 Claim 索引的 B-tree 页与写放大；3 GiB 连接缓存和
@@ -82,8 +85,198 @@ impl SqliteWaitCancellation {
 }
 
 thread_local! {
-    static SQLITE_BUSY_CANCELLATION: RefCell<Option<SqliteWaitCancellation>> = const { RefCell::new(None) };
+    static SQLITE_BUSY_CANCELLATION: RefCell<Option<SqliteWaitCancellation>> =
+        const { RefCell::new(None) };
 }
+
+type AttSqliteCancellationProbe = Arc<dyn Fn() -> bool + Send + Sync + 'static>;
+
+struct AttSqliteCancellationContext {
+    probe: AttSqliteCancellationProbe,
+    suspension_depth: AtomicUsize,
+}
+
+impl AttSqliteCancellationContext {
+    fn new(probe: AttSqliteCancellationProbe) -> Self {
+        Self {
+            probe,
+            suspension_depth: AtomicUsize::new(0),
+        }
+    }
+
+    /// 同一个方法同时服务 busy 与 progress 回调，使终态 guard 对两条取消路径生效。
+    fn is_cancelled(&self) -> bool {
+        if self.suspension_depth.load(Ordering::Acquire) != 0 {
+            return false;
+        }
+        match catch_unwind(AssertUnwindSafe(|| (self.probe)())) {
+            Ok(cancelled) => cancelled,
+            Err(payload) => {
+                // 取消探针 panic 时必须停止 SQLite 工作；panic payload 可能拥有会再次
+                // panic 的 Drop，因此将它遗忘，确保 Rust unwind 绝不越过 SQLite C ABI。
+                std::mem::forget(payload);
+                true
+            }
+        }
+    }
+
+    fn suspend(&self) {
+        self.suspension_depth
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
+                depth.checked_add(1)
+            })
+            .expect("SQLite 取消暂停深度不得耗尽");
+    }
+
+    fn resume(&self) {
+        self.suspension_depth
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
+                depth.checked_sub(1)
+            })
+            .expect("SQLite 取消暂停深度不得下溢");
+    }
+}
+
+unsafe extern "C" fn att_sqlite_busy_handler(
+    context: *mut c_void,
+    _previous_attempts: c_int,
+) -> c_int {
+    let keep_waiting = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: 安装回调时传入的是 `Arc::as_ptr` 得到的稳定非空地址；连接持有该 Arc，
+        // 并在释放最后一个 Arc 之前先卸载 busy handler。SQLite 只会在 handler 已安装
+        // 的同步连接调用中使用这个地址。
+        let context = unsafe { &*context.cast::<AttSqliteCancellationContext>() };
+        if context.is_cancelled() {
+            return false;
+        }
+        thread::sleep(SQLITE_WAIT_POLL_INTERVAL);
+        !context.is_cancelled()
+    }));
+    match keep_waiting {
+        Ok(keep_waiting) => c_int::from(keep_waiting),
+        Err(payload) => {
+            // C 回调不得 unwind。遗忘可能带有 panic Drop 的 payload，并停止继续等待。
+            std::mem::forget(payload);
+            0
+        }
+    }
+}
+
+fn install_att_sqlite_busy_handler(
+    connection: &Connection,
+    context: &Arc<AttSqliteCancellationContext>,
+) -> Result<(), rusqlite::Error> {
+    let context = Arc::as_ptr(context).cast_mut().cast::<c_void>();
+    // SAFETY: `connection.handle()` 在本次调用期间有效；callback 使用的 context 位于 Arc
+    // 的稳定分配中。成功后，`AttSqliteCancellableConnection` 会让 Arc 活到先卸载
+    // callback、再关闭连接之后。callback 自身捕获全部 panic，不允许 unwind 穿过 C。
+    let result = unsafe {
+        rusqlite::ffi::sqlite3_busy_handler(
+            connection.handle(),
+            Some(att_sqlite_busy_handler),
+            context,
+        )
+    };
+    if result == rusqlite::ffi::SQLITE_OK {
+        Ok(())
+    } else {
+        Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(result),
+            None,
+        ))
+    }
+}
+
+/// 一条直接 SQLite 连接自己的取消控制句柄。
+pub(crate) struct AttSqliteCancellationHandle {
+    context: Arc<AttSqliteCancellationContext>,
+}
+
+/// 已应用 ATT 可取消读写策略、并拥有独立 busy/progress 取消上下文的直接 SQLite 连接。
+pub(crate) struct AttSqliteCancellableConnection {
+    connection: Option<Connection>,
+    cancellation: Arc<AttSqliteCancellationContext>,
+}
+
+impl AttSqliteCancellableConnection {
+    pub(crate) fn cancellation_handle(&self) -> AttSqliteCancellationHandle {
+        AttSqliteCancellationHandle {
+            context: Arc::clone(&self.cancellation),
+        }
+    }
+
+    /// 卸载引用连接级取消上下文的回调，并显式关闭 SQLite 连接。
+    ///
+    /// 需要确认数据库已经成为可独立发布文件的调用方不能依赖 `Drop`，因为
+    /// `rusqlite::Connection::drop` 无法把关闭失败返回给调用方。
+    pub(crate) fn close(mut self) -> Result<(), rusqlite::Error> {
+        let connection = self
+            .connection
+            .take()
+            .expect("ATT 可取消 SQLite 连接在显式关闭前必须存在");
+        let mut callback_error = connection.progress_handler(0, None::<fn() -> bool>).err();
+        if let Err(source) = connection.busy_handler(None)
+            && callback_error.is_none()
+        {
+            callback_error = Some(source);
+        }
+        let close_error = match connection.close() {
+            Ok(()) => None,
+            Err((connection, source)) => {
+                // `self.cancellation` 在返回前仍然存活，因此即使 SQLite 意外保留了回调，
+                // 销毁被退回的连接时也不会引用已经释放的取消上下文。
+                drop(connection);
+                Some(source)
+            }
+        };
+        match close_error.or(callback_error) {
+            Some(source) => Err(source),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Deref for AttSqliteCancellableConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        self.connection
+            .as_ref()
+            .expect("ATT 可取消 SQLite 连接在 Drop 前必须存在")
+    }
+}
+
+impl DerefMut for AttSqliteCancellableConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.connection
+            .as_mut()
+            .expect("ATT 可取消 SQLite 连接在 Drop 前必须存在")
+    }
+}
+
+impl Drop for AttSqliteCancellableConnection {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            let _ = connection.progress_handler(0, None::<fn() -> bool>);
+            let _ = connection.busy_handler(None);
+            drop(connection);
+        }
+    }
+}
+
+/// 暂停连接的 busy/progress 取消检查，供 COMMIT 与显式 ROLLBACK 确认事务终态。
+///
+/// 多个 guard 可以嵌套并按任意顺序销毁；最后一个 guard 销毁后才恢复取消检查。
+pub(crate) struct AttSqliteCancellationSuspension {
+    context: Arc<AttSqliteCancellationContext>,
+}
+
+impl Drop for AttSqliteCancellationSuspension {
+    fn drop(&mut self) {
+        self.context.resume();
+    }
+}
+
 /// SQLite 根的内部执行资源。
 #[derive(Clone, Debug)]
 pub(crate) struct RusqliteStorageConfiguration {
@@ -798,11 +991,94 @@ fn apply_new_database_page_policy(connection: &Connection) -> Result<(), SqliteR
 pub(crate) fn apply_att_sqlite_read_write_policy(
     connection: &Connection,
 ) -> Result<(), rusqlite::Error> {
+    apply_att_sqlite_read_write_policy_with_cancellation(connection, sqlite_busy_wait_cancelled)
+}
+
+fn apply_att_sqlite_read_write_policy_with_cancellation(
+    connection: &Connection,
+    is_cancelled: impl Fn() -> bool,
+) -> Result<(), rusqlite::Error> {
     apply_att_sqlite_connection_memory_policy(connection)?;
     connection.pragma_update(None, "foreign_keys", true)?;
-    connection.pragma_update(None, "journal_mode", "WAL")?;
+    apply_att_sqlite_wal_policy_with_cancellation(connection, &is_cancelled)?;
     connection.pragma_update(None, "synchronous", "FULL")?;
     Ok(())
+}
+
+fn apply_att_sqlite_wal_policy_with_cancellation(
+    connection: &Connection,
+    is_cancelled: &impl Fn() -> bool,
+) -> Result<(), rusqlite::Error> {
+    loop {
+        let result = connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+            .and_then(|journal_mode| {
+                if journal_mode.eq_ignore_ascii_case("wal") {
+                    Ok(())
+                } else {
+                    connection.pragma_update(None, "journal_mode", "WAL")
+                }
+            });
+        match result {
+            Err(source)
+                if source.sqlite_error_code() == Some(ErrorCode::DatabaseBusy)
+                    && !is_cancelled() =>
+            {
+                // `PRAGMA journal_mode` 在 WAL 数据库已有写事务时可能不调用连接的
+                // busy handler，而是直接返回 SQLITE_BUSY。这里补上与 busy handler
+                // 相同的无固定期限、可取消等待，避免连接初始化提前失败。
+                thread::sleep(SQLITE_WAIT_POLL_INTERVAL);
+            }
+            result => return result,
+        }
+    }
+}
+
+/// 为直接使用 `rusqlite` 的领域连接安装无固定超时、可由调用方取消的繁忙等待。
+///
+/// busy 与 progress handler 共享连接持有的稳定取消上下文；同一线程上的其他连接不会
+/// 覆盖它，连接移动到其他线程后也仍读取自己的取消事实。
+pub(crate) fn apply_att_sqlite_cancellable_read_write_policy(
+    connection: Connection,
+    is_cancelled: impl Fn() -> bool + Send + Sync + 'static,
+) -> Result<AttSqliteCancellableConnection, rusqlite::Error> {
+    let probe: AttSqliteCancellationProbe = Arc::new(is_cancelled);
+    let cancellation = Arc::new(AttSqliteCancellationContext::new(probe));
+    if let Err(source) = install_att_sqlite_busy_handler(&connection, &cancellation) {
+        let _ = connection.busy_handler(None);
+        drop(connection);
+        return Err(source);
+    }
+    let progress_cancellation = Arc::clone(&cancellation);
+    if let Err(source) = connection.progress_handler(
+        SQLITE_CANCELLATION_CHECK_OPERATIONS,
+        Some(move || progress_cancellation.is_cancelled()),
+    ) {
+        let _ = connection.busy_handler(None);
+        drop(connection);
+        return Err(source);
+    }
+    if let Err(source) = apply_att_sqlite_read_write_policy_with_cancellation(&connection, || {
+        cancellation.is_cancelled()
+    }) {
+        let _ = connection.progress_handler(0, None::<fn() -> bool>);
+        let _ = connection.busy_handler(None);
+        drop(connection);
+        return Err(source);
+    }
+    Ok(AttSqliteCancellableConnection {
+        connection: Some(connection),
+        cancellation,
+    })
+}
+
+/// 暂停一条直接连接的 busy/progress 取消检查，直到最后一个嵌套 guard 销毁。
+pub(crate) fn suspend_att_sqlite_cancellation(
+    cancellation: &AttSqliteCancellationHandle,
+) -> AttSqliteCancellationSuspension {
+    let context = Arc::clone(&cancellation.context);
+    context.suspend();
+    AttSqliteCancellationSuspension { context }
 }
 
 /// 在新数据库创建首个表和进入 WAL 模式前设置统一物理页大小。
@@ -3653,6 +3929,357 @@ mod tests {
         })
         .await
         .unwrap_or_else(|_| panic!("等待{description}超时"));
+    }
+
+    fn release_write_lock_after(database: &Path, delay: Duration) -> JoinHandle<()> {
+        let blocker = Connection::open(database).expect("应建立测试写锁连接");
+        blocker
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("测试写锁应可取得");
+        thread::spawn(move || {
+            thread::sleep(delay);
+            blocker.execute_batch("ROLLBACK").expect("测试写锁应可释放");
+        })
+    }
+
+    fn run_bounded_long_query(connection: &Connection) -> rusqlite::Result<i64> {
+        connection.query_row(
+            "WITH RECURSIVE sequence(value) AS (
+                 VALUES(0)
+                 UNION ALL
+                 SELECT value + 1 FROM sequence WHERE value < 100000
+             )
+             SELECT sum(value) FROM sequence",
+            [],
+            |row| row.get(0),
+        )
+    }
+
+    #[test]
+    fn same_thread_cancellable_connections_use_their_own_busy_contexts() {
+        let directory = TestDirectory::new();
+        let database = directory.database("direct-independent-busy.db");
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch("CREATE TABLE value(id INTEGER PRIMARY KEY)")
+            .unwrap();
+
+        let first_cancellation = Arc::new(AtomicBool::new(false));
+        let first_wait_cancellation = Arc::clone(&first_cancellation);
+        let first = apply_att_sqlite_cancellable_read_write_policy(
+            Connection::open(&database).unwrap(),
+            move || first_wait_cancellation.load(Ordering::Acquire),
+        )
+        .unwrap();
+        let second_cancellation = Arc::new(AtomicBool::new(true));
+        let second_wait_cancellation = Arc::clone(&second_cancellation);
+        let second = apply_att_sqlite_cancellable_read_write_policy(
+            Connection::open(&database).unwrap(),
+            move || second_wait_cancellation.load(Ordering::Acquire),
+        )
+        .unwrap();
+        // 这项测试只验证 raw busy callback 的 context；progress 的共享 context 由下面的
+        // 嵌套长查询测试覆盖。
+        first.progress_handler(0, None::<fn() -> bool>).unwrap();
+        second.progress_handler(0, None::<fn() -> bool>).unwrap();
+
+        let release = release_write_lock_after(&database, Duration::from_millis(75));
+        first
+            .execute("INSERT INTO value DEFAULT VALUES", [])
+            .expect("第二条连接已取消不得误取消第一条连接的 busy 等待");
+        release.join().unwrap();
+
+        first_cancellation.store(true, Ordering::Release);
+        second_cancellation.store(false, Ordering::Release);
+        let release = release_write_lock_after(&database, Duration::from_millis(200));
+        let error = first
+            .execute("INSERT INTO value DEFAULT VALUES", [])
+            .expect_err("第一条连接自己的取消必须停止 busy 等待");
+        assert!(matches!(
+            error.sqlite_error_code(),
+            Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+        ));
+        release.join().unwrap();
+
+        let release = release_write_lock_after(&database, Duration::from_millis(75));
+        second
+            .execute("INSERT INTO value DEFAULT VALUES", [])
+            .expect("第一条连接已取消不得误取消第二条连接的 busy 等待");
+        release.join().unwrap();
+
+        first_cancellation.store(false, Ordering::Release);
+        second_cancellation.store(true, Ordering::Release);
+        let release = release_write_lock_after(&database, Duration::from_millis(200));
+        let error = second
+            .execute("INSERT INTO value DEFAULT VALUES", [])
+            .expect_err("第二条连接自己的取消必须停止 busy 等待");
+        assert!(matches!(
+            error.sqlite_error_code(),
+            Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+        ));
+        release.join().unwrap();
+    }
+
+    #[test]
+    fn cancellable_connection_drop_releases_its_captured_resources() {
+        let captured = Arc::new(());
+        let weak = Arc::downgrade(&captured);
+        let callback_capture = Arc::clone(&captured);
+        let connection = apply_att_sqlite_cancellable_read_write_policy(
+            Connection::open_in_memory().unwrap(),
+            move || {
+                let _ = Arc::strong_count(&callback_capture);
+                false
+            },
+        )
+        .unwrap();
+        drop(captured);
+        assert!(
+            weak.upgrade().is_some(),
+            "连接存活时 progress/busy probe 应持有命令资源"
+        );
+
+        drop(connection);
+        assert!(
+            weak.upgrade().is_none(),
+            "连接销毁后不得由 busy/progress context 继续持有上一命令资源"
+        );
+    }
+
+    #[test]
+    fn direct_connection_does_not_replace_the_ordinary_tls_busy_cancellation() {
+        let ordinary_cancellation = SqliteWaitCancellation::default();
+        install_sqlite_busy_cancellation(ordinary_cancellation.clone());
+        ordinary_cancellation.request();
+        let connection = apply_att_sqlite_cancellable_read_write_policy(
+            Connection::open_in_memory().unwrap(),
+            || false,
+        )
+        .unwrap();
+        assert!(
+            sqlite_busy_wait_cancelled(),
+            "直接连接不得覆盖普通 runtime worker 的 TLS 取消事实"
+        );
+        drop(connection);
+        assert!(
+            sqlite_busy_wait_cancelled(),
+            "直接连接销毁也不得改写普通 TLS 取消事实"
+        );
+        install_sqlite_busy_cancellation(SqliteWaitCancellation::default());
+    }
+
+    #[test]
+    fn cancellable_policy_setup_failure_releases_its_context() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("BEGIN").unwrap();
+        let captured = Arc::new(());
+        let weak = Arc::downgrade(&captured);
+        let callback_capture = Arc::clone(&captured);
+
+        let result = apply_att_sqlite_cancellable_read_write_policy(connection, move || {
+            let _ = Arc::strong_count(&callback_capture);
+            true
+        });
+        drop(captured);
+        assert!(result.is_err(), "事务内修改 journal 策略必须失败");
+        assert!(
+            weak.upgrade().is_none(),
+            "策略设置失败必须卸载 progress/busy callback 并释放命令资源"
+        );
+    }
+
+    #[test]
+    fn nested_cancellation_suspensions_restore_only_after_lifo_outer_drop() {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let wait_cancellation = Arc::clone(&cancellation);
+        let connection = apply_att_sqlite_cancellable_read_write_policy(
+            Connection::open_in_memory().unwrap(),
+            move || wait_cancellation.load(Ordering::Acquire),
+        )
+        .unwrap();
+        let handle = connection.cancellation_handle();
+        cancellation.store(true, Ordering::Release);
+
+        let outer = suspend_att_sqlite_cancellation(&handle);
+        let inner = suspend_att_sqlite_cancellation(&handle);
+        drop(inner);
+        assert_eq!(
+            run_bounded_long_query(&connection).expect("外层 guard 存活时 progress 取消仍应暂停"),
+            5_000_050_000
+        );
+        drop(outer);
+        let error = run_bounded_long_query(&connection)
+            .expect_err("最外层 guard 销毁后必须恢复 progress 取消");
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(ErrorCode::OperationInterrupted)
+        );
+    }
+
+    #[test]
+    fn nested_cancellation_suspensions_restore_only_after_out_of_order_last_drop() {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let wait_cancellation = Arc::clone(&cancellation);
+        let connection = apply_att_sqlite_cancellable_read_write_policy(
+            Connection::open_in_memory().unwrap(),
+            move || wait_cancellation.load(Ordering::Acquire),
+        )
+        .unwrap();
+        let handle = connection.cancellation_handle();
+        cancellation.store(true, Ordering::Release);
+
+        let outer = suspend_att_sqlite_cancellation(&handle);
+        let inner = suspend_att_sqlite_cancellation(&handle);
+        drop(outer);
+        assert_eq!(
+            run_bounded_long_query(&connection)
+                .expect("后创建的 guard 存活时乱序销毁不得恢复 progress 取消"),
+            5_000_050_000
+        );
+        drop(inner);
+        let error = run_bounded_long_query(&connection)
+            .expect_err("最后一个 guard 销毁后必须恢复 progress 取消");
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(ErrorCode::OperationInterrupted)
+        );
+    }
+
+    #[test]
+    fn cancellable_policy_waits_for_an_opening_lock_and_succeeds_after_release() {
+        let directory = TestDirectory::new();
+        let database = directory.database("direct-open-wait.db");
+        let blocker = Connection::open(&database).unwrap();
+        blocker
+            .execute_batch(
+                "CREATE TABLE value(id INTEGER PRIMARY KEY);
+                 BEGIN EXCLUSIVE",
+            )
+            .unwrap();
+        let (started_sender, started_receiver) = mpsc::sync_channel(0);
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let connection = Connection::open(database).unwrap();
+            let result = apply_att_sqlite_cancellable_read_write_policy(connection, move || {
+                let _ = started_sender.try_send(());
+                false
+            })
+            .map(drop);
+            result_sender.send(result).unwrap();
+        });
+        started_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("打开策略必须进入 busy handler");
+        assert!(
+            result_receiver
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "打开策略遇到外部锁时必须等待，不能沿用 SQLite 默认 Busy"
+        );
+
+        blocker.execute_batch("ROLLBACK").unwrap();
+        result_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("锁释放后打开策略应及时继续")
+            .expect("锁释放后打开策略应成功");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn cancellable_policy_stops_waiting_for_an_opening_lock_after_cancellation() {
+        let directory = TestDirectory::new();
+        let database = directory.database("direct-open-cancel.db");
+        let blocker = Connection::open(&database).unwrap();
+        blocker
+            .execute_batch(
+                "CREATE TABLE value(id INTEGER PRIMARY KEY);
+                 BEGIN EXCLUSIVE",
+            )
+            .unwrap();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = Arc::clone(&cancellation);
+        let (started_sender, started_receiver) = mpsc::sync_channel(0);
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let connection = Connection::open(database).unwrap();
+            let result = apply_att_sqlite_cancellable_read_write_policy(connection, move || {
+                let _ = started_sender.try_send(());
+                worker_cancellation.load(Ordering::Acquire)
+            })
+            .map(drop);
+            result_sender.send(result).unwrap();
+        });
+        started_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("打开策略必须进入 busy handler");
+        assert!(
+            result_receiver
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "发出取消前打开策略应继续等待外部锁"
+        );
+
+        cancellation.store(true, Ordering::Release);
+        let error = result_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("取消后打开策略应及时停止等待")
+            .expect_err("外部锁仍存在时取消必须让打开策略失败");
+        assert!(matches!(
+            error.sqlite_error_code(),
+            Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+        ));
+        blocker.execute_batch("ROLLBACK").unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn cancellable_direct_connection_interrupts_an_active_query() {
+        let directory = TestDirectory::new();
+        let database = directory.database("direct-query-cancel.db");
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = Arc::clone(&cancellation);
+        let query_started = Arc::new(AtomicBool::new(false));
+        let worker_query_started = Arc::clone(&query_started);
+        let (active_sender, active_receiver) = mpsc::sync_channel(1);
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+
+        let worker = thread::spawn(move || {
+            let connection = Connection::open(database).expect("应建立直接 SQLite 连接");
+            let connection =
+                apply_att_sqlite_cancellable_read_write_policy(connection, move || {
+                    if worker_query_started.load(Ordering::Acquire) {
+                        let _ = active_sender.try_send(());
+                    }
+                    worker_cancellation.load(Ordering::Acquire)
+                })
+                .expect("应安装可取消直接连接策略");
+            query_started.store(true, Ordering::Release);
+            let result = connection.query_row(
+                "WITH RECURSIVE sequence(value) AS (
+                     VALUES(0)
+                     UNION ALL
+                     SELECT value + 1 FROM sequence WHERE value < 1000000000
+                 )
+                 SELECT sum(value) FROM sequence",
+                [],
+                |row| row.get::<_, i64>(0),
+            );
+            result_sender.send(result).expect("应返回长查询结果");
+        });
+
+        active_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("长查询必须进入 progress handler");
+        cancellation.store(true, Ordering::Release);
+        let error = result_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("取消后长查询必须及时返回")
+            .expect_err("取消必须中断正在执行的长查询");
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(ErrorCode::OperationInterrupted)
+        );
+        worker.join().expect("长查询 worker 不应 panic");
     }
 
     fn configuration_with_workers(worker_threads: usize) -> RusqliteStorageConfiguration {

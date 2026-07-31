@@ -98,6 +98,8 @@ progress-extract-documents = 正在扫描文档
 progress-extract-builtin = Builtin 工作单元
 progress-extract-rules = Rules 规则
 progress-extract-commit = 正在提交提取资产
+progress-generic-init = 正在初始化 Generic 项目
+progress-generic-extract = 正在扫描 Generic JSONL 输入
 progress-translate-planning = 正在规划翻译任务
 progress-translate-confirmed = 已确认翻译任务
 progress-translate-no-work = 无需调用模型
@@ -270,6 +272,7 @@ diagnostic-failure-value = { $code ->
     [write_back_extraction_out_of_date] 已提取资产不再匹配当前项目来源
     [write_back_asset_snapshot_invalid] 已保存的 RPG Maker 资产无法组成有效写回快照
     [source_document_invalid] RPG Maker 来源文档不符合所需文档格式
+    [generic_source_document_invalid] Generic JSONL 来源文档不符合所需格式
     [write_back_mutation_invalid] 已验证的译文修改无法应用到冻结来源位置
     [write_back_output_path_invalid] 改写文件位于允许的 RPG Maker 输出树之外
     [write_back_output_path_duplicate] 多个改写文件指向同一输出路径

@@ -105,6 +105,8 @@ progress-extract-documents = جارٍ فحص المستندات
 progress-extract-builtin = وحدات عمل Builtin
 progress-extract-rules = تعريفات Rules
 progress-extract-commit = جارٍ تنفيذ commit للأصول المستخرجة
+progress-generic-init = جارٍ تهيئة مشروع Generic
+progress-generic-extract = جارٍ فحص إدخال Generic JSONL
 progress-translate-planning = جارٍ تخطيط مهام الترجمة
 progress-translate-confirmed = مهام الترجمة المؤكدة
 progress-translate-no-work = لا حاجة إلى طلب النموذج
@@ -291,6 +293,7 @@ diagnostic-failure-value = { $code ->
     [write_back_extraction_out_of_date] لم تعد الأصول المستخرجة تطابق مصدر المشروع الحالي
     [write_back_asset_snapshot_invalid] أصول RPG Maker المخزنة لا تكوّن لقطة إعادة كتابة صالحة
     [source_document_invalid] مستند مصدر RPG Maker لا يستوفي تنسيق المستند المطلوب
+    [generic_source_document_invalid] مستند مصدر Generic JSONL لا يستوفي التنسيق المطلوب
     [write_back_mutation_invalid] لا يمكن تطبيق تعديل ترجمة متحقق منه على موضع المصدر المجمّد
     [write_back_output_path_invalid] الملف المعاد كتابته خارج شجرة إخراج RPG Maker المسموح بها
     [write_back_output_path_duplicate] أكثر من ملف معاد كتابته يستهدف مسار الإخراج نفسه

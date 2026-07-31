@@ -10,6 +10,7 @@ use std::fs;
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,44 +29,60 @@ use super::config::{
     ConfiguredTranslateCommand,
 };
 use super::translation_prompt::{
-    SYSTEM_PROMPT_FILE_NAME, THINKING_PROMPT_FILE_NAME, ensure_no_prompt_template_variables,
-    read_prompt_resource, render_system_prompt_template,
+    PromptResourceLoadError, PromptTemplateError, SYSTEM_PROMPT_FILE_NAME,
+    THINKING_PROMPT_FILE_NAME, ensure_no_prompt_template_variables_with_cancellation,
+    parse_prompt_resource_with_cancellation, read_unparsed_prompt_resource,
+    render_system_prompt_template_with_cancellation,
 };
 use crate::diagnostic::{
     DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
     DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
 };
 use crate::execution::CooperativeCancellation;
-use crate::execution::cpu::CpuTaskExecutor;
+use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::execution::llm_request::{
     AsyncDelay, LlmRequestExecutionOutcome, LlmRequestRetryPolicy, execute_llm_request_with_retry,
 };
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
+#[cfg(test)]
+use crate::generic::build_write_back_candidate;
 use crate::generic::{
-    AutomaticStateResources, CommitTranslationsOutcome, ExtractOutcome,
+    AutomaticStateResources, CancellableTextMap, CommitTranslationsOutcome, ExtractOutcome,
     GenericCompiledPlaceholderRules, GenericInitRequest, GenericPlaceholderService,
-    GenericPlanningError, GenericProject, GenericProjectStore, GenericProtectedText,
-    GenericStoredSnapshot, GenericTaskRecordDocument, GenericTaskRecordIssue,
-    GenericTaskRecordState, GenericTaskResponseRecord, GenericUnitKey, GenericWriteBackCandidate,
-    GenericWriteBackError, PlannedGroup, PlannedTask, PlanningUnit, TranslationAcceptance,
-    TranslationPlan, accept_parsed_response, build_write_back_candidate,
-    current_translation_for_stored, ensure_input_fingerprints_current, plan_translation,
-    split_tasks_by_rendered_size, validate_materialized_write_back_file,
+    GenericPlanningError, GenericProject, GenericProjectError, GenericProjectStore,
+    GenericProtectedText, GenericStoredSnapshot, GenericTaskRecordDocument, GenericTaskRecordIssue,
+    GenericTaskRecordState, GenericTaskResponseRecord, GenericUnitKey, GenericUnitMap,
+    GenericWriteBackCandidate, GenericWriteBackError, PlannedGroup, PlannedTask, PlanningUnit,
+    TranslationAcceptance, TranslationPlan, TranslationWrite,
+    accept_parsed_response_with_cancellation, build_write_back_candidate_with_cancellation,
+    current_translation_for_stored_with_cancellation,
+    ensure_input_fingerprints_current_with_cancellation,
+    plan_translation_with_validator_and_cancellation,
+    split_tasks_by_rendered_size_with_cancellation, terminology_hit_fingerprint_with_cancellation,
+    validate_materialized_write_back_file_with_cancellation,
 };
-use crate::i18n::UiLocale;
-use crate::language::{LanguageAnalysis, LanguageModule, LanguageText, LanguageTextSegment};
+use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
+use crate::language::{
+    LanguageAnalysis, LanguageModule, LanguageOperationCancelled, LanguageText, LanguageTextSegment,
+};
 use crate::llm::{
     ChatMessage, ChatMessageRole, LlmClientConcurrency, LlmClientSemanticIdentity, LlmFinishReason,
 };
-use crate::progress::ProgressMode;
-use crate::project_lease::{ProjectCommandLeaseProvider, ProjectCommandLeaseService};
+#[cfg(not(test))]
+use crate::progress::ProgressObserver;
+use crate::progress::{ProgressMode, ProgressSnapshot, TerminalProgress, TerminalProgressObserver};
+use crate::project_lease::{
+    ProjectCommandLeaseError, ProjectCommandLeaseProvider, ProjectCommandLeaseService,
+};
 use crate::project_lua::{
-    ProjectLuaCancellation, ProjectLuaFailure, ProjectLuaProgram, ProjectLuaProject,
-    ProjectLuaRunError, ProjectLuaRunRequest, compile_project_lua_program,
-    generic_project_lua_adapter, run_project_lua,
+    ProjectLuaCancellation, ProjectLuaDatabasePrerequisiteError, ProjectLuaFailure,
+    ProjectLuaProgram, ProjectLuaProject, ProjectLuaRunError, ProjectLuaRunRequest,
+    ProjectLuaSqliteError, compile_project_lua_program_with_cancellation,
+    fingerprint_project_lua_program_with_cancellation, generic_project_lua_adapter,
+    run_project_lua,
 };
 use crate::project_name::ProjectName;
-use crate::runtime::cpu::RayonCpuExecutor;
+use crate::runtime::cpu::{CpuExecutorUnavailable, RayonCpuExecutor};
 use crate::runtime::filesystem::{
     SystemDirectoryPublisher, SystemFileSystem, SystemFileSystemBuildError, SystemFileSystemError,
 };
@@ -75,26 +92,144 @@ use crate::runtime::project_log::{
     ProjectLog, ProjectLogCode, ProjectLogEvent, ProjectLogLevel, ProjectLogPayload,
     ProjectLogRunOutcome,
 };
+use crate::runtime::windows::WindowsFsError;
 use crate::storage::file_system::{
-    DirectoryPublishError, DirectoryPublishIntent, DirectorySourceMapping, DirectoryStageRequest,
-    FileReader, RecoverableDirectoryPublisher, StagingCleanupFailure,
+    DirectoryPrepareError, DirectoryPublishError, DirectoryPublishIntent, DirectorySourceMapping,
+    DirectoryStageRequest, FileReader, ReadFileError, RecoverableDirectoryPublisher,
+    StagingCleanupFailure,
 };
+use crate::translation::placeholder::PlaceholderRuleCompilationError;
 use crate::translation::placeholder_projection::LanguageTextProjectionError;
 use crate::translation::placeholder_token;
 use crate::translation::planning_resource::{
-    CompiledTerminology, TranslationPlanningResourceReader,
+    CompiledTerminology, PlaceholderDefinitionError, TerminologyDefinitionError,
+    TranslationPlanningResourceReader, TranslationPlanningResourceReadingError,
     TranslationPlanningResourceReadingService,
 };
 use crate::translation::task_record::{
     ConfiguredTranslationTaskRecordSink, MarkdownTranslationTaskRecordSink,
 };
+#[cfg(test)]
+use crate::translation_protocol::parse_translation_response;
 use crate::translation_protocol::{
-    ParsedTranslationResponse, TranslationResponseEnvelope, parse_translation_response,
+    ParsedTranslationResponse, TranslationResponseEnvelope,
+    parse_translation_response_with_cancellation,
 };
 
 const GENERIC_ENGINE_NAME: &str = "generic";
 const GENERIC_PROMPT_DIRECTORY_NAME: &str = "generic";
 const WRITE_BACK_SCRATCH_PREFIX: &str = ".generic-write-back-";
+const WRITE_BACK_PUBLICATION_CANCELLABLE: u8 = 0;
+const WRITE_BACK_PUBLICATION_CANCELLED: u8 = 1;
+const WRITE_BACK_PUBLICATION_STARTED: u8 = 2;
+
+/// 在合作取消与目录发布之间建立唯一、不可逆的先后决定。
+///
+/// 取消先取得状态时，候选仍可安全丢弃；发布先取得状态时，目录发布根已经接管候选，
+/// 后续信号只等待它形成明确终态，不能再把目录交换留在中间状态。
+#[derive(Clone, Default)]
+struct GenericWriteBackPublicationGate {
+    state: Arc<AtomicU8>,
+}
+
+impl GenericWriteBackPublicationGate {
+    fn request_cancellation(&self) -> bool {
+        self.state
+            .compare_exchange(
+                WRITE_BACK_PUBLICATION_CANCELLABLE,
+                WRITE_BACK_PUBLICATION_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn begin_publication(&self) -> bool {
+        self.state
+            .compare_exchange(
+                WRITE_BACK_PUBLICATION_CANCELLABLE,
+                WRITE_BACK_PUBLICATION_STARTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+fn begin_generic_write_back_publication(
+    gate: &GenericWriteBackPublicationGate,
+    publication_started: impl FnOnce(),
+) -> bool {
+    if !gate.begin_publication() {
+        return false;
+    }
+    publication_started();
+    true
+}
+
+/// Generic 纵向切片能够确认的实时阶段。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GenericProgressPhase {
+    Initializing,
+    Extracting,
+    PlanningTranslation,
+    ConfirmedTasks,
+    NoModelWork,
+    RunningLua,
+    PreparingWriteBack,
+    PublishingWriteBack,
+}
+
+struct GenericTerminalProgress {
+    terminal: TerminalProgress<GenericProgressPhase>,
+    safe_stopping: String,
+    finalizing: String,
+}
+
+impl GenericTerminalProgress {
+    fn observer(&self) -> TerminalProgressObserver<GenericProgressPhase> {
+        self.terminal.observer()
+    }
+
+    fn safe_stopping(&self) {
+        self.terminal.safe_stopping(self.safe_stopping.clone());
+    }
+
+    fn finalizing(&self) {
+        self.terminal.finalizing(self.finalizing.clone());
+    }
+
+    fn finish(self) {
+        self.terminal.finish();
+    }
+}
+
+fn generic_terminal_progress(mode: ProgressMode, locale: UiLocale) -> GenericTerminalProgress {
+    let localizer = UiLocalizer::new(locale);
+    let initializing = localizer.format(UiMessage::ProgressGenericInit);
+    let extracting = localizer.format(UiMessage::ProgressGenericExtract);
+    let planning = localizer.format(UiMessage::ProgressTranslatePlanning);
+    let confirmed = localizer.format(UiMessage::ProgressTranslateConfirmed);
+    let no_work = localizer.format(UiMessage::ProgressTranslateNoWork);
+    let lua = localizer.format(UiMessage::ProgressProjectLua);
+    let preparing_write_back = localizer.format(UiMessage::ProgressWriteBackPlanning);
+    let publishing_write_back = localizer.format(UiMessage::ProgressWriteBackPublish);
+    let terminal = TerminalProgress::stderr(mode, move |phase| match phase {
+        GenericProgressPhase::Initializing => initializing.clone(),
+        GenericProgressPhase::Extracting => extracting.clone(),
+        GenericProgressPhase::PlanningTranslation => planning.clone(),
+        GenericProgressPhase::ConfirmedTasks => confirmed.clone(),
+        GenericProgressPhase::NoModelWork => no_work.clone(),
+        GenericProgressPhase::RunningLua => lua.clone(),
+        GenericProgressPhase::PreparingWriteBack => preparing_write_back.clone(),
+        GenericProgressPhase::PublishingWriteBack => publishing_write_back.clone(),
+    });
+    GenericTerminalProgress {
+        terminal,
+        safe_stopping: localizer.format(UiMessage::ProgressSafeStopping),
+        finalizing: localizer.format(UiMessage::ProgressFinalizing),
+    }
+}
 
 /// Generic 命令成功完成后的类型化结果。
 #[derive(Clone, Debug)]
@@ -205,6 +340,7 @@ pub(crate) enum GenericCommandError {
     Signal {
         source: io::Error,
         operation: Option<Box<GenericCommandError>>,
+        state_applied: bool,
     },
     PublishDiscard {
         operation: Box<GenericCommandError>,
@@ -253,19 +389,30 @@ impl GenericCommandError {
                 DiagnosticAction::Retry,
             ),
             Self::Operation { diagnostic, .. } => diagnostic.clone(),
-            Self::Signal { source, operation } => SafeDiagnostic::io(
-                DiagnosticCode::SignalRegistration,
-                DiagnosticStage::Shutdown,
-                DiagnosticSubject::component("Windows control signal"),
-                "receive_signal",
+            Self::Signal {
                 source,
-                operation
-                    .as_ref()
-                    .map_or(DiagnosticImpact::Unchanged, |error| {
-                        error.safe_diagnostic().impact
-                    }),
-                DiagnosticAction::Retry,
-            ),
+                operation,
+                state_applied,
+            } => {
+                let impact = if *state_applied {
+                    DiagnosticImpact::StateAppliedFinalizationFailed
+                } else {
+                    operation
+                        .as_ref()
+                        .map_or(DiagnosticImpact::Unchanged, |error| {
+                            error.safe_diagnostic().impact
+                        })
+                };
+                SafeDiagnostic::io(
+                    DiagnosticCode::SignalRegistration,
+                    DiagnosticStage::Shutdown,
+                    DiagnosticSubject::component("Windows control signal"),
+                    "receive_signal",
+                    source,
+                    impact,
+                    DiagnosticAction::Retry,
+                )
+            }
             Self::PublishDiscard { recovery_paths, .. } => {
                 let mut diagnostic = SafeDiagnostic::new(
                     DiagnosticCode::WriteBackDiscard,
@@ -305,7 +452,9 @@ impl fmt::Display for GenericCommandError {
         match self {
             Self::Cancelled => formatter.write_str("Generic 命令已取消"),
             Self::Operation { stage, source, .. } => write!(formatter, "{stage} 失败：{source}"),
-            Self::Signal { source, operation } => {
+            Self::Signal {
+                source, operation, ..
+            } => {
                 write!(formatter, "接收 Windows 终止信号失败：{source}")?;
                 if let Some(operation) = operation {
                     write!(formatter, "；同时发生业务失败：{operation}")?;
@@ -365,13 +514,6 @@ fn generic_operation_diagnostic(stage: &'static str) -> SafeDiagnostic {
             DiagnosticCode::ProjectState,
             DiagnosticStage::Init,
             DiagnosticFailureKind::RequirementFailed,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixInput,
-        ),
-        "同步 Generic JSONL" => (
-            DiagnosticCode::ExtractDocumentRead,
-            DiagnosticStage::Extract,
-            DiagnosticFailureKind::SourceDocumentInvalid,
             DiagnosticImpact::Unchanged,
             DiagnosticAction::FixInput,
         ),
@@ -469,6 +611,13 @@ fn generic_operation_diagnostic(stage: &'static str) -> SafeDiagnostic {
             DiagnosticFailureKind::RequirementFailed,
             DiagnosticImpact::Unchanged,
             DiagnosticAction::FixInput,
+        ),
+        "调度 Generic 模型消息" | "建立 Generic 模型消息" => (
+            DiagnosticCode::InternalOperation,
+            DiagnosticStage::Translate,
+            DiagnosticFailureKind::WorkerPanicked,
+            DiagnosticImpact::ProgressPreserved,
+            DiagnosticAction::ReportBug,
         ),
         "提交 Generic 去重复用译文" | "提交 Generic 模型译文" => (
             DiagnosticCode::SqliteOperation,
@@ -572,6 +721,37 @@ fn generic_operation_diagnostic(stage: &'static str) -> SafeDiagnostic {
     )
 }
 
+fn generic_read_file_diagnostic(
+    source: &ReadFileError<SystemFileSystemError>,
+    stage: DiagnosticStage,
+    action: DiagnosticAction,
+) -> SafeDiagnostic {
+    match source {
+        ReadFileError::NotFound { path } => SafeDiagnostic::new(
+            DiagnosticCode::FileSystemOperation,
+            stage,
+            DiagnosticSubject::path(path),
+            DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
+            DiagnosticImpact::Unchanged,
+            action,
+        ),
+        ReadFileError::NotFile { path } => SafeDiagnostic::new(
+            DiagnosticCode::FileSystemOperation,
+            stage,
+            DiagnosticSubject::path(path),
+            DiagnosticReason::failure_with_detail(
+                DiagnosticFailureKind::InvalidValue,
+                "expected=file; actual=not_file",
+            ),
+            DiagnosticImpact::Unchanged,
+            action,
+        ),
+        ReadFileError::Io { path, source } => source
+            .safe_diagnostic_source(stage, DiagnosticImpact::Unchanged, action)
+            .with_recovery(RecoveryFact::path(path)),
+    }
+}
+
 #[derive(Debug)]
 struct MessageError(String);
 
@@ -586,14 +766,14 @@ impl Error for MessageError {}
 /// Generic 的生产命令执行器。
 pub(crate) struct ProductionGenericCommandRunner {
     locale: UiLocale,
-    _progress_mode: ProgressMode,
+    progress_mode: ProgressMode,
 }
 
 impl ProductionGenericCommandRunner {
     pub(crate) const fn new(locale: UiLocale, progress_mode: ProgressMode) -> Self {
         Self {
             locale,
-            _progress_mode: progress_mode,
+            progress_mode,
         }
     }
 
@@ -619,6 +799,8 @@ impl ProductionGenericCommandRunner {
                 };
                 let project_log = generic_project_log_slot();
                 let cancellation = CooperativeCancellation::default();
+                let progress = generic_terminal_progress(self.progress_mode, self.locale);
+                let operation_progress = progress.observer();
                 let project_name = arguments.project.name.clone();
                 let workspace_root = generic_workspace(common.projects_root(), &project_name);
                 let lease_provider = ProjectCommandLeaseService::new(
@@ -631,13 +813,15 @@ impl ProductionGenericCommandRunner {
                 let operation_project_log = Arc::clone(&project_log);
                 let locale = self.locale;
                 let operation = async move {
+                    ensure_generic_operation_running(&operation_cancellation)?;
+                    operation_progress.observe(ProgressSnapshot::indeterminate(
+                        GenericProgressPhase::Initializing,
+                    ));
                     let _lease = lease_provider
                         .acquire(&project_name)
                         .await
-                        .map_err(|source| GenericCommandError::operation("取得项目租约", source))?;
-                    if operation_cancellation.is_requested() {
-                        return Err(GenericCommandError::Cancelled);
-                    }
+                        .map_err(generic_project_lease_failure)?;
+                    ensure_generic_operation_running(&operation_cancellation)?;
                     let request = GenericInitRequest {
                         project_name,
                         workspace_root,
@@ -645,9 +829,19 @@ impl ProductionGenericCommandRunner {
                         source_language: arguments.source_language,
                         target_language: arguments.target_language,
                     };
-                    let (_, project) = run_blocking("初始化 Generic 项目", move || {
-                        GenericProjectStore::initialize(request)
-                    })
+                    let init_cancellation = operation_cancellation.clone();
+                    let (_, project) = run_project_blocking(
+                        "初始化 Generic 项目",
+                        DiagnosticStage::Init,
+                        DiagnosticImpact::Unchanged,
+                        DiagnosticAction::FixInput,
+                        move || {
+                            GenericProjectStore::initialize_with_cancellation(
+                                request,
+                                init_cancellation,
+                            )
+                        },
+                    )
                     .await?;
                     install_generic_project_log(
                         &operation_project_log,
@@ -675,6 +869,7 @@ impl ProductionGenericCommandRunner {
                     file_system,
                     Vec::new(),
                     project_log,
+                    progress,
                 )
                 .await
             }
@@ -697,10 +892,12 @@ impl ProductionGenericCommandRunner {
                 };
                 let project_log = generic_project_log_slot();
                 let cancellation = CooperativeCancellation::default();
-                let store = GenericProjectStore::for_workspace(generic_workspace(
-                    common.projects_root(),
-                    &project_name,
-                ));
+                let progress = generic_terminal_progress(self.progress_mode, self.locale);
+                let operation_progress = progress.observer();
+                let store = GenericProjectStore::for_workspace_with_cancellation(
+                    generic_workspace(common.projects_root(), &project_name),
+                    cancellation.clone(),
+                );
                 let lease_provider = ProjectCommandLeaseService::new(
                     common.projects_root().to_path_buf(),
                     GENERIC_ENGINE_NAME,
@@ -712,15 +909,24 @@ impl ProductionGenericCommandRunner {
                 let operation_project_log = Arc::clone(&project_log);
                 let locale = self.locale;
                 let operation = async move {
+                    ensure_generic_operation_running(&operation_cancellation)?;
+                    operation_progress.observe(ProgressSnapshot::indeterminate(
+                        GenericProgressPhase::Extracting,
+                    ));
                     let _lease = lease_provider
                         .acquire(&project_name)
                         .await
-                        .map_err(|source| GenericCommandError::operation("取得项目租约", source))?;
-                    if operation_cancellation.is_requested() {
-                        return Err(GenericCommandError::Cancelled);
-                    }
+                        .map_err(generic_project_lease_failure)?;
+                    ensure_generic_operation_running(&operation_cancellation)?;
                     let open_store = store.clone();
-                    run_blocking("打开 Generic 项目", move || open_store.open()).await?;
+                    run_project_blocking(
+                        "打开 Generic 项目",
+                        DiagnosticStage::ProjectOpening,
+                        DiagnosticImpact::Unchanged,
+                        DiagnosticAction::CheckProjectState,
+                        move || open_store.open(),
+                    )
+                    .await?;
                     install_generic_project_log(
                         &operation_project_log,
                         start_command_log(CommandLogStart {
@@ -735,8 +941,14 @@ impl ProductionGenericCommandRunner {
                             panic_boundary: None,
                         }),
                     );
-                    let outcome =
-                        run_blocking("同步 Generic JSONL", move || store.extract()).await?;
+                    let outcome = run_project_blocking(
+                        "同步 Generic JSONL",
+                        DiagnosticStage::Extract,
+                        DiagnosticImpact::ProgressPreserved,
+                        DiagnosticAction::FixInput,
+                        move || store.extract(),
+                    )
+                    .await?;
                     Ok(GenericCommandOutput::Extract {
                         project: output_name,
                         outcome,
@@ -752,6 +964,7 @@ impl ProductionGenericCommandRunner {
                     file_system,
                     Vec::new(),
                     project_log,
+                    progress,
                 )
                 .await
             }
@@ -787,13 +1000,15 @@ impl ProductionGenericCommandRunner {
         let project_log = generic_project_log_slot();
         let cancellation = CooperativeCancellation::default();
         let lua_cancellation = ProjectLuaCancellation::default();
+        let progress = generic_terminal_progress(self.progress_mode, self.locale);
+        let operation_progress = progress.observer();
         let project_name = command.project_name().clone();
         let script_path = command.script().script_path().to_path_buf();
         let arguments = command.arguments().to_vec();
-        let store = GenericProjectStore::for_workspace(generic_workspace(
-            command.common().projects_root(),
-            &project_name,
-        ));
+        let store = GenericProjectStore::for_workspace_with_cancellation(
+            generic_workspace(command.common().projects_root(), &project_name),
+            cancellation.clone(),
+        );
         let lease_provider = ProjectCommandLeaseService::new(
             command.common().projects_root().to_path_buf(),
             GENERIC_ENGINE_NAME,
@@ -808,16 +1023,20 @@ impl ProductionGenericCommandRunner {
         let operation_project_log = Arc::clone(&project_log);
         let locale = self.locale;
         let operation = async move {
+            ensure_generic_operation_running(&operation_cancellation)?;
             let script = operation_file_system
                 .read_file(script_path.clone())
                 .await
-                .map_err(|source| GenericCommandError::operation("读取 Lua 脚本", source))?;
+                .map_err(|source| {
+                    generic_read_file_failure(
+                        "读取 Lua 脚本",
+                        source,
+                        DiagnosticStage::CommandPreparation,
+                        DiagnosticAction::FixInput,
+                    )
+                })?;
             let identity = script.resolved_path().to_string_lossy().into_owned();
             let source = script.into_bytes();
-            let mut fingerprint = Sha256FramedHasher::new(b"att.project-lua.program-identity");
-            fingerprint.frame(1, source.as_slice());
-            let fingerprint = fingerprint.finish();
-            let program = ProjectLuaProgram::new(identity.clone(), source, arguments);
             let project_log = start_command_log(CommandLogStart {
                 common,
                 locale,
@@ -829,42 +1048,67 @@ impl ProductionGenericCommandRunner {
                 performance,
                 panic_boundary: None,
             });
-            project_log.logger().emit(ProjectLogEvent::new(
-                ProjectLogLevel::Info,
-                ProjectLogCode::LuaScript,
-                project_log.context().clone(),
-                ProjectLogPayload::LuaScript {
-                    identity: identity.clone(),
-                    fingerprint: fingerprint.hex(),
-                },
-            ));
             let print_sink = Arc::new(ProjectLogLuaPrintSink::from_active(&project_log));
+            let preflight_logger = project_log.logger().clone();
+            let preflight_context = project_log.context().clone();
             install_generic_project_log(&operation_project_log, project_log);
-            compile_project_lua_program(&program).map_err(|source| {
-                let source = GenericLuaPreflightError(source);
-                let detail = source.to_string();
-                let diagnostic = project_lua_failure_diagnostic(
-                    &source.0,
-                    DiagnosticStage::CommandPreparation,
-                    &detail,
-                );
-                GenericCommandError::diagnosed("编译 Lua 脚本", source, diagnostic)
-            })?;
-            if operation_cancellation.is_requested() {
-                return Err(GenericCommandError::Cancelled);
-            }
+            let preflight_cancellation = operation_lua_cancellation.clone();
+            let preparation = tokio::task::spawn_blocking(move || {
+                let program = ProjectLuaProgram::new(identity, source, arguments);
+                let fingerprint = fingerprint_project_lua_program_with_cancellation(
+                    &program,
+                    &preflight_cancellation,
+                )?;
+                preflight_logger.emit(ProjectLogEvent::new(
+                    ProjectLogLevel::Info,
+                    ProjectLogCode::LuaScript,
+                    preflight_context,
+                    ProjectLogPayload::LuaScript {
+                        identity: program.identity().to_owned(),
+                        fingerprint: fingerprint.hex(),
+                    },
+                ));
+                compile_project_lua_program_with_cancellation(&program, &preflight_cancellation)?;
+                Ok::<_, ProjectLuaFailure>(program)
+            })
+            .await
+            .map_err(|source| GenericCommandError::operation("准备 Generic Lua", source))?;
+            let program = match preparation {
+                Ok(prepared) => prepared,
+                Err(ProjectLuaFailure::Cancelled) => return Err(GenericCommandError::Cancelled),
+                Err(source) => {
+                    let source = GenericLuaPreflightError(source);
+                    let detail = source.to_string();
+                    let diagnostic = project_lua_failure_diagnostic(
+                        &source.0,
+                        DiagnosticStage::CommandPreparation,
+                        &detail,
+                    );
+                    return Err(GenericCommandError::diagnosed(
+                        "编译 Lua 脚本",
+                        source,
+                        diagnostic,
+                    ));
+                }
+            };
+            ensure_generic_operation_running(&operation_cancellation)?;
 
             let _lease = lease_provider
                 .acquire(&project_name)
                 .await
-                .map_err(|source| GenericCommandError::operation("取得项目租约", source))?;
-            if operation_cancellation.is_requested() {
-                return Err(GenericCommandError::Cancelled);
-            }
-            let project = run_blocking("打开 Generic 项目", move || store.open()).await?;
+                .map_err(generic_project_lease_failure)?;
+            ensure_generic_operation_running(&operation_cancellation)?;
+            let project = run_project_blocking(
+                "打开 Generic 项目",
+                DiagnosticStage::ProjectOpening,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckProjectState,
+                move || store.open(),
+            )
+            .await?;
             let database_path = project.database_path().to_path_buf();
             let lua_project_name = output_name.as_str().to_owned();
-            let lua_adapter = generic_project_lua_adapter(project);
+            let lua_adapter = generic_project_lua_adapter(project, operation_cancellation.clone());
             let request = ProjectLuaRunRequest::new(
                 ProjectLuaProject::new(lua_project_name, GENERIC_ENGINE_NAME),
                 program,
@@ -872,6 +1116,9 @@ impl ProductionGenericCommandRunner {
             )
             .with_cancellation(operation_lua_cancellation)
             .with_print_sink(print_sink);
+            operation_progress.observe(ProgressSnapshot::indeterminate(
+                GenericProgressPhase::RunningLua,
+            ));
             let report = tokio::task::spawn_blocking(move || {
                 let open_path = database_path.clone();
                 let connection = Connection::open_with_flags(
@@ -930,6 +1177,7 @@ impl ProductionGenericCommandRunner {
             file_system,
             Vec::new(),
             project_log,
+            progress,
         )
         .await
     }
@@ -968,12 +1216,14 @@ impl ProductionGenericCommandRunner {
             }
         };
         let cancellation = CooperativeCancellation::default();
+        let progress = generic_terminal_progress(self.progress_mode, self.locale);
+        let operation_progress = progress.observer();
         let llm_holder = Arc::new(Mutex::new(None::<OpenAiChatCompletionExecutor>));
         let project_name = command.project_name().clone();
-        let store = GenericProjectStore::for_workspace(generic_workspace(
-            command.common().projects_root(),
-            &project_name,
-        ));
+        let store = GenericProjectStore::for_workspace_with_cancellation(
+            generic_workspace(command.common().projects_root(), &project_name),
+            cancellation.clone(),
+        );
         let lease_provider = ProjectCommandLeaseService::new(
             command.common().projects_root().to_path_buf(),
             GENERIC_ENGINE_NAME,
@@ -987,20 +1237,25 @@ impl ProductionGenericCommandRunner {
         let locale = self.locale;
         let operation_project_log = Arc::clone(&project_log);
         let operation = async move {
+            ensure_generic_operation_running(&operation_cancellation)?;
+            operation_progress.observe(ProgressSnapshot::indeterminate(
+                GenericProgressPhase::PlanningTranslation,
+            ));
             let _lease = lease_provider
                 .acquire(&project_name)
                 .await
-                .map_err(|source| GenericCommandError::operation("取得项目租约", source))?;
-            if operation_cancellation.is_requested() {
-                return Err(GenericCommandError::Cancelled);
-            }
+                .map_err(generic_project_lease_failure)?;
+            ensure_generic_operation_running(&operation_cancellation)?;
 
             let initial_store = store.clone();
-            let (snapshot, _live, current_resources) =
-                run_blocking("复查 Generic 输入", move || {
-                    initial_store.load_current_translation_state()
-                })
-                .await?;
+            let (snapshot, _live, current_resources) = run_project_blocking(
+                "复查 Generic 输入",
+                DiagnosticStage::Translate,
+                DiagnosticImpact::ProgressPreserved,
+                DiagnosticAction::CheckProjectState,
+                move || initial_store.load_current_translation_state(),
+            )
+            .await?;
             let project = snapshot.project().clone();
             install_generic_project_log(
                 &operation_project_log,
@@ -1044,30 +1299,87 @@ impl ProductionGenericCommandRunner {
 
             let prompt = load_generic_prompt(
                 &operation_file_system,
+                &operation_cpu,
                 configuration,
                 project.language_pair(),
+                &operation_cancellation,
             )
             .await?;
-            let resource_reader = TranslationPlanningResourceReadingService::new(
-                operation_file_system.clone(),
-                operation_cpu.clone(),
-            );
-            let resources = resource_reader
-                .read(
-                    command.terminology_path().map(Path::to_path_buf),
-                    command.placeholder_rules_path().map(Path::to_path_buf),
-                    current_resources.terminology_json().to_owned(),
-                    current_resources.placeholder_rules_json().to_owned(),
-                )
-                .await
-                .map_err(|source| GenericCommandError::operation("读取翻译资源", source))?;
-            let (terminology, placeholder_definitions, terminology_json, placeholder_json) =
-                resources.into_parts();
-            let placeholder_rules = GenericPlaceholderService::default()
-                .compile(placeholder_definitions)
-                .map_err(|source| {
-                    GenericCommandError::operation("编译 Generic Placeholder", source)
-                })?;
+            let resource_clone_cancellation = operation_cancellation.clone();
+            let (current_resources, current_terminology_json, current_placeholder_json) =
+                operation_cpu
+                    .execute(move || {
+                        let terminology_json = clone_generic_cpu_text(
+                            current_resources.terminology_json(),
+                            &resource_clone_cancellation,
+                        )?;
+                        let placeholder_json = clone_generic_cpu_text(
+                            current_resources.placeholder_rules_json(),
+                            &resource_clone_cancellation,
+                        )?;
+                        Ok::<_, GenericPreparationError>((
+                            current_resources,
+                            terminology_json,
+                            placeholder_json,
+                        ))
+                    })
+                    .await
+                    .map_err(|source| {
+                        generic_cpu_execution_failure("调度 Generic 翻译资源复制", source)
+                    })?
+                    .map_err(|source| {
+                        generic_preparation_failure("复制 Generic 翻译资源", source)
+                    })?;
+            let terminology_path = command.terminology_path().map(Path::to_path_buf);
+            let placeholder_rules_path = command.placeholder_rules_path().map(Path::to_path_buf);
+            let (terminology, placeholder_rules, terminology_json, placeholder_json) =
+                if terminology_path.is_none() && placeholder_rules_path.is_none() {
+                    (
+                        current_resources.terminology(),
+                        current_resources.placeholder_rules(),
+                        current_terminology_json,
+                        current_placeholder_json,
+                    )
+                } else {
+                    let resource_reader = TranslationPlanningResourceReadingService::new(
+                        operation_file_system.clone(),
+                        operation_cpu.clone(),
+                    )
+                    .with_cancellation(operation_cancellation.clone());
+                    let resources = resource_reader
+                        .read(
+                            terminology_path,
+                            placeholder_rules_path,
+                            current_terminology_json,
+                            current_placeholder_json,
+                        )
+                        .await
+                        .map_err(generic_translation_resource_failure)?;
+                    let (terminology, placeholder_definitions, terminology_json, placeholder_json) =
+                        resources.into_parts();
+                    let placeholder_compile_cancellation = operation_cancellation.clone();
+                    let placeholder_rules = operation_cpu
+                        .execute(move || {
+                            GenericPlaceholderService::default()
+                                .compile_with_cancellation(placeholder_definitions, || {
+                                    ensure_generic_cpu_running(&placeholder_compile_cancellation)
+                                })?
+                                .map_err(GenericPreparationError::Placeholder)
+                        })
+                        .await
+                        .map_err(|source| {
+                            generic_cpu_execution_failure("调度 Generic Placeholder 编译", source)
+                        })?
+                        .map_err(|source| {
+                            generic_preparation_failure("编译 Generic Placeholder", source)
+                        })?;
+                    (
+                        terminology,
+                        placeholder_rules,
+                        terminology_json,
+                        placeholder_json,
+                    )
+                };
 
             let expected_raw_fingerprint = snapshot
                 .project()
@@ -1078,13 +1390,22 @@ impl ProductionGenericCommandRunner {
             let planning_rules = placeholder_rules.clone();
             let planning_language = Arc::clone(&source_language);
             let planning_prompt = prompt.fingerprint;
-            let planning_client = configuration.client().semantic_fingerprint();
-            let planning_language_fingerprint = source_language.semantic_fingerprint();
+            let planning_client = Arc::clone(configuration.client());
+            let planning_cancellation = operation_cancellation.clone();
             let target_characters = configuration
                 .profile()
                 .target_task_user_message_characters();
             let prepared = operation_cpu
                 .execute(move || {
+                    ensure_generic_cpu_running(&planning_cancellation)?;
+                    let planning_client_fingerprint = planning_client.semantic_fingerprint();
+                    ensure_generic_cpu_running(&planning_cancellation)?;
+                    let planning_language_fingerprint = planning_language
+                        .semantic_fingerprint_with_cancellation(&mut || {
+                            ensure_generic_language_running(&planning_cancellation)
+                        })
+                        .map_err(|LanguageOperationCancelled| GenericPreparationError::Cancelled)?;
+                    ensure_generic_cpu_running(&planning_cancellation)?;
                     prepare_generic_translation(
                         &planning_snapshot,
                         planning_terms,
@@ -1092,42 +1413,86 @@ impl ProductionGenericCommandRunner {
                         planning_language,
                         AutomaticStateResources {
                             prompt: planning_prompt,
-                            client_semantics: planning_client,
+                            client_semantics: planning_client_fingerprint,
                             language_module: planning_language_fingerprint,
                             terminology_hits: empty_terminology_fingerprint(),
                         },
                         target_characters,
+                        &planning_cancellation,
                     )
                 })
                 .await
-                .map_err(|source| GenericCommandError::operation("调度 Generic 翻译计划", source))?
-                .map_err(|source| {
-                    GenericCommandError::operation("建立 Generic 翻译计划", source)
-                })?;
+                .map_err(|source| generic_cpu_execution_failure("调度 Generic 翻译计划", source))?
+                .map_err(|source| generic_preparation_failure("建立 Generic 翻译计划", source))?;
 
             let PreparedGenericTranslation { plan, facts } = prepared;
             let (invalidations, reused, tasks) = plan.into_parts();
+            let transformation_cancellation = operation_cancellation.clone();
+            let (
+                terminology_json,
+                placeholder_json,
+                invalidations,
+                reuse_writes,
+                apply_translation_resources,
+            ) = operation_cpu
+                .execute(move || {
+                    let has_invalidations = !invalidations.is_empty();
+                    let mut clears = Vec::with_capacity(invalidations.len());
+                    for invalidation in invalidations {
+                        ensure_generic_cpu_running(&transformation_cancellation)?;
+                        clears.push(invalidation.into_clear());
+                    }
+                    let mut writes = Vec::with_capacity(reused.len());
+                    for reuse in reused {
+                        ensure_generic_cpu_running(&transformation_cancellation)?;
+                        writes.push(reuse.into_write());
+                    }
+                    let resources_changed = !generic_cpu_text_equal(
+                        current_resources.terminology_json(),
+                        &terminology_json,
+                        &transformation_cancellation,
+                    )? || !generic_cpu_text_equal(
+                        current_resources.placeholder_rules_json(),
+                        &placeholder_json,
+                        &transformation_cancellation,
+                    )?;
+                    ensure_generic_cpu_running(&transformation_cancellation)?;
+                    Ok::<_, GenericPreparationError>((
+                        terminology_json,
+                        placeholder_json,
+                        clears,
+                        writes,
+                        resources_changed || has_invalidations,
+                    ))
+                })
+                .await
+                .map_err(|source| {
+                    generic_cpu_execution_failure("调度 Generic 翻译计划转换", source)
+                })?
+                .map_err(|source| generic_preparation_failure("转换 Generic 翻译计划", source))?;
             let mut summary = GenericTranslationSummary {
                 total_tasks: tasks.len(),
                 ..GenericTranslationSummary::default()
             };
-            if operation_cancellation.is_requested() {
-                return Err(GenericCommandError::Cancelled);
+            if tasks.is_empty() {
+                operation_progress.observe(ProgressSnapshot::indeterminate(
+                    GenericProgressPhase::NoModelWork,
+                ));
+            } else {
+                operation_progress.observe(ProgressSnapshot::determinate(
+                    GenericProgressPhase::ConfirmedTasks,
+                    0,
+                    u64::try_from(tasks.len()).unwrap_or(u64::MAX),
+                ));
             }
-            let invalidations = invalidations
-                .into_iter()
-                .map(|invalidation| invalidation.into_clear())
-                .collect::<Vec<_>>();
-            if should_apply_translation_resources(
-                current_resources.terminology_json(),
-                current_resources.placeholder_rules_json(),
-                &terminology_json,
-                &placeholder_json,
-                invalidations.len(),
-            ) {
+            ensure_generic_operation_running(&operation_cancellation)?;
+            if apply_translation_resources {
                 let save_store = store.clone();
-                let resource_outcome = run_blocking(
+                let resource_outcome = run_project_blocking(
                     "保存 Generic 翻译资源并清除失效译文",
+                    DiagnosticStage::Translate,
+                    DiagnosticImpact::ProgressPreserved,
+                    DiagnosticAction::Retry,
                     move || {
                         save_store.apply_translation_resources(
                             expected_raw_fingerprint,
@@ -1141,32 +1506,30 @@ impl ProductionGenericCommandRunner {
                 summary.cleared_units = resource_outcome.committed;
                 summary.conflicted_units += resource_outcome.conflicts.len();
             }
-            if operation_cancellation.is_requested() {
-                return Err(GenericCommandError::Cancelled);
-            }
+            ensure_generic_operation_running(&operation_cancellation)?;
 
-            let reuse_writes = reused
-                .into_iter()
-                .map(|reuse| reuse.into_write())
-                .collect::<Vec<_>>();
             summary.reused_units = reuse_writes.len();
             if !reuse_writes.is_empty() {
                 let commit_store = store.clone();
                 let reuse_profile = profile_id.clone();
-                let outcome = run_blocking("提交 Generic 去重复用译文", move || {
-                    commit_store.commit_translations_for_profile(
-                        expected_raw_fingerprint,
-                        &reuse_writes,
-                        &reuse_profile,
-                    )
-                })
+                let outcome = run_project_blocking(
+                    "提交 Generic 去重复用译文",
+                    DiagnosticStage::Translate,
+                    DiagnosticImpact::ProgressPreserved,
+                    DiagnosticAction::Retry,
+                    move || {
+                        commit_store.commit_translations_for_profile(
+                            expected_raw_fingerprint,
+                            &reuse_writes,
+                            &reuse_profile,
+                        )
+                    },
+                )
                 .await?;
                 add_commit_outcome(&mut summary, &outcome);
             }
 
-            if operation_cancellation.is_requested() {
-                return Err(GenericCommandError::Cancelled);
-            }
+            ensure_generic_operation_running(&operation_cancellation)?;
 
             if !tasks.is_empty() {
                 let pem_roots =
@@ -1178,12 +1541,29 @@ impl ProductionGenericCommandRunner {
                 *operation_llm_holder
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(llm.clone());
+                let metadata_client = Arc::clone(configuration.client());
+                let metadata_cancellation = operation_cancellation.clone();
+                let client_metadata = operation_cpu
+                    .execute(move || {
+                        ensure_generic_cpu_running(&metadata_cancellation)?;
+                        let metadata = metadata_client.record_metadata();
+                        ensure_generic_cpu_running(&metadata_cancellation)?;
+                        Ok::<_, GenericPreparationError>(metadata)
+                    })
+                    .await
+                    .map_err(|source| {
+                        generic_cpu_execution_failure("调度 Generic LLM 记录信息", source)
+                    })?
+                    .map_err(|source| {
+                        generic_preparation_failure("建立 Generic LLM 记录信息", source)
+                    })?;
                 let task_records = configure_generic_task_records(
                     command.record_translation_tasks(),
                     &operation_project_log,
                     &file_system_configuration,
-                    configuration.client().record_metadata(),
+                    client_metadata,
                     locale,
+                    operation_cpu.clone(),
                     project.workspace_root(),
                 );
                 let task_result = execute_generic_tasks(GenericTaskExecution {
@@ -1205,8 +1585,10 @@ impl ProductionGenericCommandRunner {
                         .network_retry_delays()
                         .to_vec(),
                     max_retry_after: configuration.profile().request().max_network_retry_after(),
+                    cpu: operation_cpu.clone(),
                     cancellation: operation_cancellation.clone(),
                     task_records: task_records.clone(),
+                    progress: operation_progress.clone(),
                 })
                 .await;
                 llm.shutdown().await;
@@ -1218,15 +1600,17 @@ impl ProductionGenericCommandRunner {
                 merge_task_summary(&mut summary, task_summary);
             }
 
-            if operation_cancellation.is_requested() {
-                return Err(GenericCommandError::Cancelled);
-            }
+            ensure_generic_operation_running(&operation_cancellation)?;
             if should_remember_profile_separately(&summary) {
                 let remember_store = store.clone();
                 let remembered_profile = profile_id.clone();
-                run_blocking("保存 Generic 最近 Profile", move || {
-                    remember_store.remember_profile(&remembered_profile)
-                })
+                run_project_blocking(
+                    "保存 Generic 最近 Profile",
+                    DiagnosticStage::Translate,
+                    DiagnosticImpact::ProgressPreserved,
+                    DiagnosticAction::Retry,
+                    move || remember_store.remember_profile(&remembered_profile),
+                )
                 .await?;
             }
             Ok(GenericCommandOutput::Translate {
@@ -1237,6 +1621,7 @@ impl ProductionGenericCommandRunner {
         };
 
         let driven = drive(operation, termination_signals, || {
+            progress.safe_stopping();
             cancellation.request();
             cpu.cancel_waits();
             file_system.cancel_waits();
@@ -1249,6 +1634,7 @@ impl ProductionGenericCommandRunner {
             }
         })
         .await;
+        progress.finalizing();
         let mut shutdown_errors = Vec::new();
         if let Err(source) = cpu.shutdown() {
             shutdown_errors.push(GenericShutdownError::new("CPU executor", source));
@@ -1256,6 +1642,7 @@ impl ProductionGenericCommandRunner {
         if let Err(source) = file_system.shutdown().await {
             shutdown_errors.push(GenericShutdownError::new("filesystem", source));
         }
+        progress.finish();
         GenericCommandRunReport::from_driven(
             driven,
             shutdown_errors,
@@ -1297,11 +1684,14 @@ impl ProductionGenericCommandRunner {
             }
         };
         let cancellation = CooperativeCancellation::default();
+        let publication_gate = GenericWriteBackPublicationGate::default();
+        let progress = generic_terminal_progress(self.progress_mode, self.locale);
+        let operation_progress = progress.observer();
         let project_name = command.project_name().clone();
-        let store = GenericProjectStore::for_workspace(generic_workspace(
-            command.common().projects_root(),
-            &project_name,
-        ));
+        let store = GenericProjectStore::for_workspace_with_cancellation(
+            generic_workspace(command.common().projects_root(), &project_name),
+            cancellation.clone(),
+        );
         let lease_provider = ProjectCommandLeaseService::new(
             command.common().projects_root().to_path_buf(),
             GENERIC_ENGINE_NAME,
@@ -1311,24 +1701,30 @@ impl ProductionGenericCommandRunner {
         let operation_file_system = file_system.clone();
         let operation_cpu = cpu.clone();
         let operation_cancellation = cancellation.clone();
+        let operation_publication_gate = publication_gate.clone();
         let output_name = project_name.clone();
         let locale = self.locale;
         let operation_project_log = Arc::clone(&project_log);
         let operation = async move {
+            ensure_generic_operation_running(&operation_cancellation)?;
+            operation_progress.observe(ProgressSnapshot::indeterminate(
+                GenericProgressPhase::PreparingWriteBack,
+            ));
             let _lease = lease_provider
                 .acquire(&project_name)
                 .await
-                .map_err(|source| GenericCommandError::operation("取得项目租约", source))?;
-            if operation_cancellation.is_requested() {
-                return Err(GenericCommandError::Cancelled);
-            }
+                .map_err(generic_project_lease_failure)?;
+            ensure_generic_operation_running(&operation_cancellation)?;
 
             let initial_store = store.clone();
-            let (snapshot, live, current_resources) =
-                run_blocking("复查 Generic 写回输入", move || {
-                    initial_store.load_current_translation_state()
-                })
-                .await?;
+            let (snapshot, live, current_resources) = run_project_blocking(
+                "复查 Generic 写回输入",
+                DiagnosticStage::WriteBack,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckProjectState,
+                move || initial_store.load_current_translation_state(),
+            )
+            .await?;
             let project = snapshot.project().clone();
             install_generic_project_log(
                 &operation_project_log,
@@ -1344,38 +1740,38 @@ impl ProductionGenericCommandRunner {
                     panic_boundary: None,
                 }),
             );
-            let resource_reader = TranslationPlanningResourceReadingService::new(
-                operation_file_system.clone(),
-                operation_cpu.clone(),
-            );
-            let resources = resource_reader
-                .read(
-                    None,
-                    None,
-                    current_resources.terminology_json().to_owned(),
-                    current_resources.placeholder_rules_json().to_owned(),
-                )
-                .await
-                .map_err(|source| GenericCommandError::operation("读取翻译资源", source))?;
-            let (terminology, placeholder_definitions, _, _) = resources.into_parts();
-            let placeholder_rules = GenericPlaceholderService::default()
-                .compile(placeholder_definitions)
-                .map_err(|source| {
-                    GenericCommandError::operation("编译 Generic Placeholder", source)
-                })?;
+            let terminology = current_resources.terminology();
+            let placeholder_rules = current_resources.placeholder_rules();
 
-            let has_automatic_translation = snapshot
-                .files()
-                .iter()
-                .flat_map(|file| file.groups())
-                .flat_map(|group| group.units())
-                .filter_map(|unit| unit.translation())
-                .any(|translation| {
-                    matches!(
-                        translation.origin(),
-                        crate::generic::TranslationOrigin::Automatic
-                    )
-                });
+            let automatic_scan_cancellation = operation_cancellation.clone();
+            let (snapshot, has_automatic_translation) = operation_cpu
+                .execute(move || {
+                    let mut has_automatic = false;
+                    'files: for file in snapshot.files() {
+                        ensure_generic_cpu_running(&automatic_scan_cancellation)?;
+                        for group in file.groups() {
+                            ensure_generic_cpu_running(&automatic_scan_cancellation)?;
+                            for unit in group.units() {
+                                ensure_generic_cpu_running(&automatic_scan_cancellation)?;
+                                if unit.translation().is_some_and(|translation| {
+                                    matches!(
+                                        translation.origin(),
+                                        crate::generic::TranslationOrigin::Automatic
+                                    )
+                                }) {
+                                    has_automatic = true;
+                                    break 'files;
+                                }
+                            }
+                        }
+                    }
+                    Ok::<_, GenericPreparationError>((snapshot, has_automatic))
+                })
+                .await
+                .map_err(|source| {
+                    generic_cpu_execution_failure("调度 Generic 自动译文复查", source)
+                })?
+                .map_err(|source| generic_preparation_failure("复查 Generic 自动译文", source))?;
             let automatic_resources = if has_automatic_translation {
                 match project.last_profile_id().map(str::to_owned) {
                     Some(profile_id) => {
@@ -1398,16 +1794,49 @@ impl ProductionGenericCommandRunner {
                             })?;
                         let prompt = load_generic_prompt(
                             &operation_file_system,
+                            &operation_cpu,
                             &configuration,
                             project.language_pair(),
+                            &operation_cancellation,
                         )
                         .await?;
-                        Some(AutomaticStateResources {
-                            prompt: prompt.fingerprint,
-                            client_semantics: configuration.client().semantic_fingerprint(),
-                            language_module: source_language.semantic_fingerprint(),
-                            terminology_hits: empty_terminology_fingerprint(),
-                        })
+                        let fingerprint_client = Arc::clone(configuration.client());
+                        let fingerprint_cancellation = operation_cancellation.clone();
+                        Some(
+                            operation_cpu
+                                .execute(move || {
+                                    ensure_generic_cpu_running(&fingerprint_cancellation)?;
+                                    let client_semantics =
+                                        fingerprint_client.semantic_fingerprint();
+                                    ensure_generic_cpu_running(&fingerprint_cancellation)?;
+                                    let language_module = source_language
+                                        .semantic_fingerprint_with_cancellation(&mut || {
+                                            ensure_generic_language_running(
+                                                &fingerprint_cancellation,
+                                            )
+                                        })
+                                        .map_err(|LanguageOperationCancelled| {
+                                            GenericPreparationError::Cancelled
+                                        })?;
+                                    ensure_generic_cpu_running(&fingerprint_cancellation)?;
+                                    Ok::<_, GenericPreparationError>(AutomaticStateResources {
+                                        prompt: prompt.fingerprint,
+                                        client_semantics,
+                                        language_module,
+                                        terminology_hits: empty_terminology_fingerprint(),
+                                    })
+                                })
+                                .await
+                                .map_err(|source| {
+                                    generic_cpu_execution_failure(
+                                        "调度 Generic 自动资源指纹",
+                                        source,
+                                    )
+                                })?
+                                .map_err(|source| {
+                                    generic_preparation_failure("建立 Generic 自动资源指纹", source)
+                                })?,
+                        )
                     }
                     None => None,
                 }
@@ -1417,6 +1846,7 @@ impl ProductionGenericCommandRunner {
             let current_snapshot = snapshot;
             let current_terms = Arc::clone(&terminology);
             let current_rules = placeholder_rules.clone();
+            let current_cancellation = operation_cancellation.clone();
             let (current_snapshot, current_translations) = operation_cpu
                 .execute(move || {
                     let current_translations = collect_generic_current_translations(
@@ -1424,43 +1854,60 @@ impl ProductionGenericCommandRunner {
                         current_terms.as_ref(),
                         &current_rules,
                         automatic_resources,
+                        &current_cancellation,
                     )?;
                     Ok::<_, GenericPreparationError>((current_snapshot, current_translations))
                 })
                 .await
                 .map_err(|source| {
-                    GenericCommandError::operation("调度 Generic Current 复查", source)
+                    generic_cpu_execution_failure("调度 Generic Current 复查", source)
                 })?
-                .map_err(|source| GenericCommandError::operation("复查 Generic Current", source))?;
-            if operation_cancellation.is_requested() {
-                return Err(GenericCommandError::Cancelled);
-            }
+                .map_err(|source| generic_preparation_failure("复查 Generic Current", source))?;
+            ensure_generic_operation_running(&operation_cancellation)?;
+            let candidate_cancellation = operation_cancellation.clone();
             let (write_back_project, candidate) = operation_cpu
                 .execute(move || {
                     let project = current_snapshot.project().clone();
-                    build_write_back_candidate(&current_snapshot, &live, &current_translations)
-                        .map(|candidate| (project, candidate))
+                    build_write_back_candidate_with_cancellation(
+                        &current_snapshot,
+                        &live,
+                        &current_translations,
+                        &candidate_cancellation,
+                    )
+                    .map(|candidate| (project, candidate))
                 })
                 .await
-                .map_err(|source| GenericCommandError::operation("建立 Generic 写回候选", source))?
-                .map_err(|source| {
-                    GenericCommandError::operation("建立 Generic 写回候选", source)
-                })?;
+                .map_err(|source| generic_cpu_execution_failure("建立 Generic 写回候选", source))?
+                .map_err(generic_write_back_candidate_failure)?;
             publish_generic_write_back(
                 directory_publisher,
                 output_name,
                 write_back_project,
                 candidate,
+                operation_cancellation,
+                operation_publication_gate,
+                move || {
+                    operation_progress.observe(ProgressSnapshot::indeterminate(
+                        GenericProgressPhase::PublishingWriteBack,
+                    ));
+                },
             )
             .await
         };
 
-        let driven = drive(operation, termination_signals, || {
+        let cancellation_publication_gate = publication_gate;
+        let driven = drive_write_back(operation, termination_signals, || {
+            if !cancellation_publication_gate.request_cancellation() {
+                return false;
+            }
+            progress.safe_stopping();
             cancellation.request();
             cpu.cancel_waits();
             file_system.cancel_waits();
+            true
         })
         .await;
+        progress.finalizing();
         let mut shutdown_errors = Vec::new();
         if let Err(source) = cpu.shutdown() {
             shutdown_errors.push(GenericShutdownError::new("CPU executor", source));
@@ -1468,6 +1915,7 @@ impl ProductionGenericCommandRunner {
         if let Err(source) = file_system.shutdown().await {
             shutdown_errors.push(GenericShutdownError::new("filesystem", source));
         }
+        progress.finish();
         GenericCommandRunReport::from_driven(
             driven,
             shutdown_errors,
@@ -1537,48 +1985,113 @@ fn project_lua_failure_diagnostic(
     stage: DiagnosticStage,
     detail: &str,
 ) -> SafeDiagnostic {
-    let (failure, action) = match source {
+    let (code, reason, action, subject) = match source {
         ProjectLuaFailure::Compile(_) => (
-            DiagnosticFailureKind::LuaCompilationFailed,
+            DiagnosticCode::LuaExecution,
+            DiagnosticReason::failure_with_detail(
+                DiagnosticFailureKind::LuaCompilationFailed,
+                detail,
+            ),
             DiagnosticAction::FixInput,
+            DiagnosticSubject::operation("project_lua_transaction"),
         ),
-        ProjectLuaFailure::Cancelled => (
-            DiagnosticFailureKind::LockCancelled,
-            DiagnosticAction::Retry,
-        ),
+        ProjectLuaFailure::Cancelled
+        | ProjectLuaFailure::DatabasePrerequisite(ProjectLuaDatabasePrerequisiteError::Cancelled) => {
+            (
+                DiagnosticCode::LuaExecution,
+                DiagnosticReason::failure_with_detail(DiagnosticFailureKind::LockCancelled, detail),
+                DiagnosticAction::Retry,
+                DiagnosticSubject::operation("project_lua_transaction"),
+            )
+        }
         ProjectLuaFailure::Context(_) => (
-            DiagnosticFailureKind::LuaContextCreationFailed,
+            DiagnosticCode::LuaExecution,
+            DiagnosticReason::failure_with_detail(
+                DiagnosticFailureKind::LuaContextCreationFailed,
+                detail,
+            ),
             DiagnosticAction::ReportBug,
+            DiagnosticSubject::operation("project_lua_transaction"),
         ),
         ProjectLuaFailure::Script(_) => (
-            DiagnosticFailureKind::LuaExecutionFailed,
+            DiagnosticCode::LuaExecution,
+            DiagnosticReason::failure_with_detail(
+                DiagnosticFailureKind::LuaExecutionFailed,
+                detail,
+            ),
             DiagnosticAction::FixInput,
+            DiagnosticSubject::operation("project_lua_transaction"),
+        ),
+        ProjectLuaFailure::DatabasePrerequisite(
+            ProjectLuaDatabasePrerequisiteError::InvalidProjectState(state),
+        ) => (
+            DiagnosticCode::ProjectState,
+            DiagnosticReason::failure_with_detail(DiagnosticFailureKind::StateMismatch, state),
+            DiagnosticAction::CheckProjectState,
+            DiagnosticSubject::operation("validate_project_lua_database"),
+        ),
+        ProjectLuaFailure::DatabasePrerequisite(ProjectLuaDatabasePrerequisiteError::Sqlite(
+            error,
+        ))
+        | ProjectLuaFailure::Database(error) => (
+            DiagnosticCode::SqliteOperation,
+            project_lua_sqlite_reason(error, DiagnosticFailureKind::LuaExecutionFailed),
+            DiagnosticAction::CheckProjectState,
+            DiagnosticSubject::operation(error.operation()),
+        ),
+        ProjectLuaFailure::Host {
+            kind: "worker_spawn",
+            operation,
+            ..
+        } => (
+            DiagnosticCode::InternalOperation,
+            DiagnosticReason::failure_with_detail(DiagnosticFailureKind::WorkerSpawnFailed, detail),
+            DiagnosticAction::ReportBug,
+            DiagnosticSubject::operation(operation),
         ),
         ProjectLuaFailure::Host { .. } => (
-            DiagnosticFailureKind::LuaHostCallFailed,
+            DiagnosticCode::LuaExecution,
+            DiagnosticReason::failure_with_detail(DiagnosticFailureKind::LuaHostCallFailed, detail),
             DiagnosticAction::FixInput,
-        ),
-        ProjectLuaFailure::Database(_) => (
-            DiagnosticFailureKind::LuaExecutionFailed,
-            DiagnosticAction::CheckProjectState,
+            DiagnosticSubject::operation("project_lua_transaction"),
         ),
         ProjectLuaFailure::Validation(_) => (
-            DiagnosticFailureKind::LuaFinalizationFailed,
+            DiagnosticCode::LuaExecution,
+            DiagnosticReason::failure_with_detail(
+                DiagnosticFailureKind::LuaFinalizationFailed,
+                detail,
+            ),
             DiagnosticAction::FixInput,
+            DiagnosticSubject::operation("project_lua_transaction"),
         ),
         ProjectLuaFailure::Panicked => (
-            DiagnosticFailureKind::WorkerPanicked,
+            DiagnosticCode::LuaExecution,
+            DiagnosticReason::failure_with_detail(DiagnosticFailureKind::WorkerPanicked, detail),
             DiagnosticAction::ReportBug,
+            DiagnosticSubject::operation("project_lua_transaction"),
         ),
     };
     SafeDiagnostic::new(
-        DiagnosticCode::LuaExecution,
+        code,
         stage,
-        DiagnosticSubject::operation("project_lua_transaction"),
-        DiagnosticReason::failure_with_detail(failure, detail),
+        subject,
+        reason,
         DiagnosticImpact::Unchanged,
         action,
     )
+}
+
+fn project_lua_sqlite_reason(
+    source: &ProjectLuaSqliteError,
+    fallback: DiagnosticFailureKind,
+) -> DiagnosticReason {
+    match source.sqlite_codes() {
+        Some((primary_code, extended_code)) => DiagnosticReason::Sqlite {
+            primary_code,
+            extended_code,
+        },
+        None => DiagnosticReason::failure(fallback),
+    }
 }
 
 fn generic_lua_execution_diagnostic(source: &GenericLuaExecutionError) -> SafeDiagnostic {
@@ -1626,10 +2139,21 @@ struct LoadedGenericPrompt {
     fingerprint: Sha256Fingerprint,
 }
 
+#[derive(Debug)]
+enum GenericPromptPreparationError {
+    Cancelled,
+    SystemResource(PromptResourceLoadError),
+    ThinkingResource(PromptResourceLoadError),
+    SystemTemplate(PromptTemplateError),
+    ThinkingTemplate(PromptTemplateError),
+}
+
 async fn load_generic_prompt(
     file_system: &SystemFileSystem,
+    cpu: &RayonCpuExecutor,
     configuration: &super::config::TranslateConfiguration,
     language_pair: &crate::language::LanguagePair,
+    cancellation: &CooperativeCancellation,
 ) -> Result<LoadedGenericPrompt, GenericCommandError> {
     let prompt_locale = configuration
         .prompt_locale()
@@ -1640,42 +2164,124 @@ async fn load_generic_prompt(
         .join(GENERIC_PROMPT_DIRECTORY_NAME)
         .join(prompt_locale.as_str());
     let template =
-        read_prompt_resource(file_system, &prompt_directory.join(SYSTEM_PROMPT_FILE_NAME))
+        read_unparsed_prompt_resource(file_system, &prompt_directory.join(SYSTEM_PROMPT_FILE_NAME))
             .await
             .map_err(|source| {
-                GenericCommandError::operation("读取 Generic system Prompt", source)
+                generic_prompt_resource_failure("读取 Generic system Prompt", source)
             })?;
-    let mut system_prompt = render_system_prompt_template(&template, language_pair)
-        .map_err(|source| GenericCommandError::operation("渲染 Generic system Prompt", source))?;
-    let response_envelope = if configuration.thinking_output() {
-        let thinking = read_prompt_resource(
-            file_system,
-            &prompt_directory.join(THINKING_PROMPT_FILE_NAME),
+    let thinking = if configuration.thinking_output() {
+        Some(
+            read_unparsed_prompt_resource(
+                file_system,
+                &prompt_directory.join(THINKING_PROMPT_FILE_NAME),
+            )
+            .await
+            .map_err(|source| {
+                generic_prompt_resource_failure("读取 Generic thinking Prompt", source)
+            })?,
         )
-        .await
-        .map_err(|source| GenericCommandError::operation("读取 Generic thinking Prompt", source))?;
-        ensure_no_prompt_template_variables(&thinking).map_err(|source| {
-            GenericCommandError::operation("校验 Generic thinking Prompt", source)
-        })?;
-        system_prompt.push_str("\n\n");
-        system_prompt.push_str(&thinking);
-        TranslationResponseEnvelope::ThinkingThenJson
     } else {
-        TranslationResponseEnvelope::JsonOnly
+        None
     };
-    let mut hasher = Sha256FramedHasher::new(b"att.generic.system-prompt");
-    hasher.frame(1, system_prompt.as_bytes()).frame(
-        2,
-        match response_envelope {
-            TranslationResponseEnvelope::JsonOnly => b"json-only",
-            TranslationResponseEnvelope::ThinkingThenJson => b"thinking-then-json",
-        },
-    );
-    Ok(LoadedGenericPrompt {
-        system_prompt,
-        response_envelope,
-        fingerprint: hasher.finish(),
+    let language_pair = language_pair.clone();
+    let prompt_cancellation = cancellation.clone();
+    cpu.execute(move || {
+        ensure_generic_prompt_preparation_running(&prompt_cancellation)?;
+        let template = parse_prompt_resource_with_cancellation(template, || {
+            ensure_generic_prompt_preparation_running(&prompt_cancellation)
+        })?
+        .map_err(GenericPromptPreparationError::SystemResource)?;
+        let mut system_prompt =
+            render_system_prompt_template_with_cancellation(&template, &language_pair, || {
+                ensure_generic_prompt_preparation_running(&prompt_cancellation)
+            })?
+            .map_err(GenericPromptPreparationError::SystemTemplate)?;
+        let response_envelope = match thinking {
+            Some(thinking) => {
+                let thinking = parse_prompt_resource_with_cancellation(thinking, || {
+                    ensure_generic_prompt_preparation_running(&prompt_cancellation)
+                })?
+                .map_err(GenericPromptPreparationError::ThinkingResource)?;
+                ensure_no_prompt_template_variables_with_cancellation(&thinking, || {
+                    ensure_generic_prompt_preparation_running(&prompt_cancellation)
+                })?
+                .map_err(GenericPromptPreparationError::ThinkingTemplate)?;
+                system_prompt.push_str("\n\n");
+                append_generic_prompt_text(&mut system_prompt, &thinking, &prompt_cancellation)?;
+                TranslationResponseEnvelope::ThinkingThenJson
+            }
+            None => TranslationResponseEnvelope::JsonOnly,
+        };
+        let chunk_size =
+            std::num::NonZeroUsize::new(64 * 1024).expect("Prompt 指纹取消检查块大小必须非零");
+        let mut hasher = Sha256FramedHasher::new(b"att.generic.system-prompt");
+        hasher
+            .try_frame_chunks(1, system_prompt.as_bytes(), chunk_size, || {
+                ensure_generic_prompt_preparation_running(&prompt_cancellation)
+            })?
+            .frame(
+                2,
+                match response_envelope {
+                    TranslationResponseEnvelope::JsonOnly => b"json-only",
+                    TranslationResponseEnvelope::ThinkingThenJson => b"thinking-then-json",
+                },
+            );
+        ensure_generic_prompt_preparation_running(&prompt_cancellation)?;
+        Ok::<_, GenericPromptPreparationError>(LoadedGenericPrompt {
+            system_prompt,
+            response_envelope,
+            fingerprint: hasher.finish(),
+        })
     })
+    .await
+    .map_err(|source| generic_cpu_execution_failure("调度 Generic Prompt 准备", source))?
+    .map_err(|source| match source {
+        GenericPromptPreparationError::Cancelled => GenericCommandError::Cancelled,
+        GenericPromptPreparationError::SystemResource(source) => {
+            generic_prompt_resource_failure("读取 Generic system Prompt", source)
+        }
+        GenericPromptPreparationError::ThinkingResource(source) => {
+            generic_prompt_resource_failure("读取 Generic thinking Prompt", source)
+        }
+        GenericPromptPreparationError::SystemTemplate(source) => {
+            GenericCommandError::operation("渲染 Generic system Prompt", source)
+        }
+        GenericPromptPreparationError::ThinkingTemplate(source) => {
+            GenericCommandError::operation("校验 Generic thinking Prompt", source)
+        }
+    })
+}
+
+fn ensure_generic_prompt_preparation_running(
+    cancellation: &CooperativeCancellation,
+) -> Result<(), GenericPromptPreparationError> {
+    if cancellation.is_requested() {
+        Err(GenericPromptPreparationError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn append_generic_prompt_text(
+    output: &mut String,
+    text: &str,
+    cancellation: &CooperativeCancellation,
+) -> Result<(), GenericPromptPreparationError> {
+    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
+
+    let mut start = 0_usize;
+    while start < text.len() {
+        ensure_generic_prompt_preparation_running(cancellation)?;
+        let mut end = start
+            .saturating_add(CANCELLATION_CHECK_BYTES)
+            .min(text.len());
+        while end < text.len() && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        output.push_str(&text[start..end]);
+        start = end;
+    }
+    ensure_generic_prompt_preparation_running(cancellation)
 }
 
 #[derive(Clone)]
@@ -1688,7 +2294,7 @@ struct GenericValidationFact {
 
 struct PreparedGenericTranslation {
     plan: TranslationPlan,
-    facts: HashMap<GenericUnitKey, GenericValidationFact>,
+    facts: GenericUnitMap<GenericValidationFact>,
 }
 
 struct PreparedGenericGroup {
@@ -1698,6 +2304,7 @@ struct PreparedGenericGroup {
 
 #[derive(Debug)]
 enum GenericPreparationError {
+    Cancelled,
     Placeholder(crate::generic::GenericPlaceholderError),
     LanguageProjection(LanguageTextProjectionError),
     Planning(GenericPlanningError),
@@ -1706,6 +2313,7 @@ enum GenericPreparationError {
 impl fmt::Display for GenericPreparationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled => formatter.write_str("Generic CPU 工作已取消"),
             Self::Placeholder(source) => source.fmt(formatter),
             Self::LanguageProjection(source) => source.fmt(formatter),
             Self::Planning(source) => source.fmt(formatter),
@@ -1716,10 +2324,196 @@ impl fmt::Display for GenericPreparationError {
 impl Error for GenericPreparationError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Cancelled => None,
             Self::Placeholder(source) => Some(source),
             Self::LanguageProjection(source) => Some(source),
             Self::Planning(source) => Some(source),
         }
+    }
+}
+
+impl GenericPreparationError {
+    const fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
+            || matches!(self, Self::Planning(source) if source.is_cancelled())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GenericOperationCancelled;
+
+impl From<GenericOperationCancelled> for GenericCommandError {
+    fn from(_: GenericOperationCancelled) -> Self {
+        Self::Cancelled
+    }
+}
+
+fn ensure_generic_operation_running(
+    cancellation: &CooperativeCancellation,
+) -> Result<(), GenericOperationCancelled> {
+    if cancellation.is_requested() {
+        Err(GenericOperationCancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn generic_cpu_execution_failure(
+    stage: &'static str,
+    source: CpuTaskExecutionError<CpuExecutorUnavailable>,
+) -> GenericCommandError {
+    match source {
+        CpuTaskExecutionError::Cancelled => GenericCommandError::Cancelled,
+        source @ (CpuTaskExecutionError::Unavailable(_) | CpuTaskExecutionError::TaskPanicked) => {
+            GenericCommandError::operation(stage, source)
+        }
+    }
+}
+
+fn generic_project_lease_failure(
+    source: ProjectCommandLeaseError<Box<SystemFileSystemError>>,
+) -> GenericCommandError {
+    match &source {
+        ProjectCommandLeaseError::Unavailable {
+            source: operation, ..
+        } if system_file_system_error_is_cancelled(operation.as_ref()) => {
+            GenericCommandError::Cancelled
+        }
+        ProjectCommandLeaseError::Unavailable { .. } => {
+            GenericCommandError::operation("取得项目租约", source)
+        }
+    }
+}
+
+fn system_file_system_error_is_cancelled(source: &SystemFileSystemError) -> bool {
+    matches!(
+        source,
+        SystemFileSystemError::Cancelled { .. }
+            | SystemFileSystemError::Windows(WindowsFsError::LockCancelled { .. })
+    )
+}
+
+fn read_file_error_is_cancelled(source: &ReadFileError<SystemFileSystemError>) -> bool {
+    matches!(
+        source,
+        ReadFileError::Io { source, .. } if system_file_system_error_is_cancelled(source)
+    )
+}
+
+fn generic_read_file_failure(
+    operation: &'static str,
+    source: ReadFileError<SystemFileSystemError>,
+    stage: DiagnosticStage,
+    action: DiagnosticAction,
+) -> GenericCommandError {
+    if read_file_error_is_cancelled(&source) {
+        GenericCommandError::Cancelled
+    } else {
+        let diagnostic = generic_read_file_diagnostic(&source, stage, action);
+        GenericCommandError::diagnosed(operation, source, diagnostic)
+    }
+}
+
+fn generic_prompt_resource_failure(
+    operation: &'static str,
+    source: PromptResourceLoadError,
+) -> GenericCommandError {
+    if matches!(
+        &source,
+        PromptResourceLoadError::Read(source) if read_file_error_is_cancelled(source)
+    ) {
+        GenericCommandError::Cancelled
+    } else {
+        let diagnostic = source.safe_diagnostic();
+        GenericCommandError::diagnosed(operation, source, diagnostic)
+    }
+}
+
+fn generic_translation_resource_failure(
+    source: TranslationPlanningResourceReadingError<SystemFileSystemError, CpuExecutorUnavailable>,
+) -> GenericCommandError {
+    let cancelled = match &source {
+        TranslationPlanningResourceReadingError::Cancelled => true,
+        TranslationPlanningResourceReadingError::ReadTerminology { source, .. }
+        | TranslationPlanningResourceReadingError::ReadPlaceholderRules { source, .. } => {
+            read_file_error_is_cancelled(source)
+        }
+        TranslationPlanningResourceReadingError::ParseTerminologyCompute { source, .. }
+        | TranslationPlanningResourceReadingError::ParsePlaceholderRulesCompute {
+            source, ..
+        } => matches!(source, CpuTaskExecutionError::Cancelled),
+        TranslationPlanningResourceReadingError::InvalidTerminology { .. }
+        | TranslationPlanningResourceReadingError::InvalidPlaceholderRules { .. } => false,
+    };
+    if cancelled {
+        GenericCommandError::Cancelled
+    } else if let Some((operation, worker_source)) = translation_resource_worker_start(&source) {
+        let diagnostic = SafeDiagnostic::io(
+            DiagnosticCode::InternalOperation,
+            DiagnosticStage::Translate,
+            DiagnosticSubject::operation(operation),
+            "spawn_worker",
+            worker_source,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::ReportBug,
+        );
+        GenericCommandError::diagnosed("读取翻译资源", source, diagnostic)
+    } else {
+        GenericCommandError::operation("读取翻译资源", source)
+    }
+}
+
+fn translation_resource_worker_start<F, C>(
+    source: &TranslationPlanningResourceReadingError<F, C>,
+) -> Option<(&'static str, &io::Error)> {
+    match source {
+        TranslationPlanningResourceReadingError::InvalidTerminology {
+            source: TerminologyDefinitionError::StartWorker { operation, source },
+            ..
+        }
+        | TranslationPlanningResourceReadingError::InvalidPlaceholderRules {
+            source: PlaceholderDefinitionError::StartWorker { operation, source },
+            ..
+        } => Some((*operation, source)),
+        _ => None,
+    }
+}
+
+fn generic_preparation_failure(
+    stage: &'static str,
+    source: GenericPreparationError,
+) -> GenericCommandError {
+    if source.is_cancelled() {
+        GenericCommandError::Cancelled
+    } else if let GenericPreparationError::Placeholder(
+        crate::generic::GenericPlaceholderError::Compilation(
+            PlaceholderRuleCompilationError::StartWorker {
+                operation,
+                source: worker_source,
+            },
+        ),
+    ) = &source
+    {
+        let diagnostic = SafeDiagnostic::io(
+            DiagnosticCode::InternalOperation,
+            DiagnosticStage::Translate,
+            DiagnosticSubject::operation("custom_placeholder_compile"),
+            *operation,
+            worker_source,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::ReportBug,
+        );
+        GenericCommandError::diagnosed(stage, source, diagnostic)
+    } else {
+        GenericCommandError::operation(stage, source)
+    }
+}
+
+fn generic_write_back_candidate_failure(source: GenericWriteBackError) -> GenericCommandError {
+    if source.is_cancelled() {
+        GenericCommandError::Cancelled
+    } else {
+        GenericCommandError::operation("建立 Generic 写回候选", source)
     }
 }
 
@@ -1730,55 +2524,84 @@ fn prepare_generic_translation(
     source_language: Arc<dyn LanguageModule>,
     base_resources: AutomaticStateResources,
     target_task_characters: std::num::NonZeroUsize,
+    cancellation: &CooperativeCancellation,
 ) -> Result<PreparedGenericTranslation, GenericPreparationError> {
-    let groups = snapshot
-        .files()
-        .iter()
-        .flat_map(|file| file.groups())
-        .collect::<Vec<_>>();
+    ensure_generic_cpu_running(cancellation)?;
+    let mut groups = Vec::new();
+    for file in snapshot.files() {
+        ensure_generic_cpu_running(cancellation)?;
+        for group in file.groups() {
+            ensure_generic_cpu_running(cancellation)?;
+            groups.push(group);
+        }
+    }
     let prepared_groups = groups
         .par_iter()
         .map(|group| {
+            ensure_generic_cpu_running(cancellation)?;
             let service = GenericPlaceholderService::default();
             let mut prepared_units = Vec::with_capacity(group.units().len());
             for unit in group.units() {
+                ensure_generic_cpu_running(cancellation)?;
                 let protected = service
-                    .protect(group.kind(), unit.source_text(), placeholder_rules)
+                    .protect_with_cancellation(
+                        group.kind(),
+                        unit.source_text(),
+                        placeholder_rules,
+                        || ensure_generic_cpu_running(cancellation),
+                    )?
                     .map_err(GenericPreparationError::Placeholder)?;
                 let language_text = protected
-                    .language_text()
+                    .language_text_with_cancellation(|| ensure_generic_cpu_running(cancellation))?
                     .map_err(GenericPreparationError::LanguageProjection)?;
-                let analysis = source_language.analyze_source(&language_text);
+                let analysis = source_language
+                    .analyze_source_with_cancellation(&language_text, &mut || {
+                        ensure_generic_language_running(cancellation)
+                    })
+                    .map_err(|LanguageOperationCancelled| GenericPreparationError::Cancelled)?;
+                ensure_generic_cpu_running(cancellation)?;
                 prepared_units.push((unit, protected, language_text, analysis));
             }
-            let term_indices = terminology.triggered_indices(
+            ensure_generic_cpu_running(cancellation)?;
+            let term_indices = terminology.triggered_indices_with_cancellation(
                 prepared_units
                     .iter()
                     .flat_map(|(_, _, language_text, _)| natural_segments(language_text)),
-            );
-            let terminology_hits = terminology_hit_fingerprint(terminology.as_ref(), &term_indices);
+                || ensure_generic_cpu_running(cancellation),
+            )?;
+            let terminology_hits = terminology_hit_fingerprint_with_cancellation(
+                terminology.as_ref(),
+                &term_indices,
+                || ensure_generic_cpu_running(cancellation),
+            )?;
             let mut planning_units = Vec::with_capacity(prepared_units.len());
             let mut facts = Vec::with_capacity(prepared_units.len());
             for (unit, protected, language_text, analysis) in prepared_units {
+                ensure_generic_cpu_running(cancellation)?;
                 let resources = AutomaticStateResources {
                     terminology_hits,
                     ..base_resources
                 };
-                let planning = PlanningUnit::from_stored(
+                let planning = PlanningUnit::from_stored_with_cancellation(
                     snapshot.project(),
                     group,
                     unit,
                     &protected,
-                    term_indices.clone(),
-                    language_text.has_non_whitespace_natural_text() && analysis.needs_translation(),
+                    clone_generic_cpu_indices(&term_indices, cancellation)?,
+                    generic_language_text_has_non_whitespace_natural_text(
+                        &language_text,
+                        cancellation,
+                    )? && analysis.needs_translation(),
                     resources,
-                );
+                    cancellation,
+                )
+                .map_err(GenericPreparationError::Planning)?;
                 if planning.needs_candidate() {
                     facts.push((
-                        planning.key().clone(),
+                        clone_generic_unit_key(planning.key(), cancellation)?,
                         GenericValidationFact {
-                            kind: group.kind().to_owned(),
-                            source_text: unit.source_text().to_owned(),
+                            kind: clone_generic_cpu_text(group.kind(), cancellation)?,
+                            source_text: clone_generic_cpu_text(unit.source_text(), cancellation)?,
                             protected,
                             analysis,
                         },
@@ -1786,6 +2609,7 @@ fn prepare_generic_translation(
                 }
                 planning_units.push(planning);
             }
+            ensure_generic_cpu_running(cancellation)?;
             Ok::<_, GenericPreparationError>(PreparedGenericGroup {
                 planning_units,
                 facts,
@@ -1793,40 +2617,69 @@ fn prepare_generic_translation(
         })
         .collect::<Vec<_>>();
 
-    let mut planning_units = Vec::with_capacity(snapshot.unit_count());
-    let mut facts = HashMap::with_capacity(snapshot.unit_count());
+    let mut planning_units = Vec::new();
+    let mut facts = GenericUnitMap::new();
     // 并行完成顺序不参与领域语义；按自然 Group 顺序处理结果，保证规划和错误稳定。
     for prepared_group in prepared_groups {
+        ensure_generic_cpu_running(cancellation)?;
         let prepared_group = prepared_group?;
-        planning_units.extend(prepared_group.planning_units);
+        for planning_unit in prepared_group.planning_units {
+            ensure_generic_cpu_running(cancellation)?;
+            planning_units.push(planning_unit);
+        }
         for (key, fact) in prepared_group.facts {
-            facts.insert(key, fact);
+            ensure_generic_cpu_running(cancellation)?;
+            let previous = facts
+                .insert_with_cancellation(key, fact, || ensure_generic_cpu_running(cancellation))?;
+            debug_assert!(previous.is_none());
         }
     }
-    if planning_units.iter().all(|unit| !unit.needs_planning()) {
+    ensure_generic_cpu_running(cancellation)?;
+    let mut needs_planning = false;
+    for unit in &planning_units {
+        ensure_generic_cpu_running(cancellation)?;
+        if unit.needs_planning() {
+            needs_planning = true;
+            break;
+        }
+    }
+    if !needs_planning {
         return Ok(PreparedGenericTranslation {
             plan: TranslationPlan::empty(),
             facts,
         });
     }
-    let plan = plan_translation(snapshot, &planning_units, |key, candidate| {
-        validate_generic_candidate(
-            key,
-            candidate,
-            &facts,
-            placeholder_rules,
-            source_language.as_ref(),
-        )
-    })
+    let plan = plan_translation_with_validator_and_cancellation(
+        snapshot,
+        &planning_units,
+        |key, candidate| {
+            validate_generic_candidate_with_cancellation(
+                key,
+                candidate,
+                &facts,
+                placeholder_rules,
+                source_language.as_ref(),
+                cancellation,
+            )
+        },
+        || cancellation.is_requested(),
+    )
     .map_err(GenericPreparationError::Planning)?;
-    let plan = split_tasks_by_rendered_size(
+    let plan = split_tasks_by_rendered_size_with_cancellation(
         plan,
         target_task_characters,
         "Groups:\n".chars().count(),
         |group, first_output_id| {
-            measure_generic_group_message(group, terminology.as_ref(), first_output_id)
+            measure_generic_group_message(
+                group,
+                terminology.as_ref(),
+                first_output_id,
+                cancellation,
+            )
         },
-    );
+        || cancellation.is_requested(),
+    )
+    .map_err(GenericPreparationError::Planning)?;
     Ok(PreparedGenericTranslation { plan, facts })
 }
 
@@ -1835,63 +2688,219 @@ fn collect_generic_current_translations(
     terminology: &CompiledTerminology,
     placeholder_rules: &GenericCompiledPlaceholderRules,
     automatic_resources: Option<AutomaticStateResources>,
-) -> Result<HashMap<(String, String), String>, GenericPreparationError> {
-    let groups = snapshot
-        .files()
-        .iter()
-        .flat_map(|file| file.groups())
-        .collect::<Vec<_>>();
+    cancellation: &CooperativeCancellation,
+) -> Result<GenericUnitMap<String>, GenericPreparationError> {
+    ensure_generic_cpu_running(cancellation)?;
+    let mut groups = Vec::new();
+    for file in snapshot.files() {
+        ensure_generic_cpu_running(cancellation)?;
+        for group in file.groups() {
+            ensure_generic_cpu_running(cancellation)?;
+            groups.push(group);
+        }
+    }
     let prepared_groups = groups
         .par_iter()
         .map(|group| {
+            ensure_generic_cpu_running(cancellation)?;
             let service = GenericPlaceholderService::default();
             let mut protected_units = Vec::with_capacity(group.units().len());
             for unit in group.units() {
+                ensure_generic_cpu_running(cancellation)?;
                 let protected = service
-                    .protect(group.kind(), unit.source_text(), placeholder_rules)
+                    .protect_with_cancellation(
+                        group.kind(),
+                        unit.source_text(),
+                        placeholder_rules,
+                        || ensure_generic_cpu_running(cancellation),
+                    )?
                     .map_err(GenericPreparationError::Placeholder)?;
                 let language_text = protected
-                    .language_text()
+                    .language_text_with_cancellation(|| ensure_generic_cpu_running(cancellation))?
                     .map_err(GenericPreparationError::LanguageProjection)?;
+                ensure_generic_cpu_running(cancellation)?;
                 protected_units.push((unit, protected, language_text));
             }
-            let term_indices = automatic_resources.map(|_| {
-                terminology.triggered_indices(
-                    protected_units
-                        .iter()
-                        .flat_map(|(_, _, language_text)| natural_segments(language_text)),
-                )
-            });
-            let group_resources = automatic_resources.map(|resources| AutomaticStateResources {
-                terminology_hits: terminology_hit_fingerprint(
-                    terminology,
-                    term_indices.as_deref().unwrap_or_default(),
+            ensure_generic_cpu_running(cancellation)?;
+            let term_indices = match automatic_resources {
+                Some(_) => Some(
+                    terminology.triggered_indices_with_cancellation(
+                        protected_units
+                            .iter()
+                            .flat_map(|(_, _, language_text)| natural_segments(language_text)),
+                        || ensure_generic_cpu_running(cancellation),
+                    )?,
                 ),
-                ..resources
-            });
+                None => None,
+            };
+            let group_resources = match automatic_resources {
+                Some(resources) => Some(AutomaticStateResources {
+                    terminology_hits: terminology_hit_fingerprint_with_cancellation(
+                        terminology,
+                        term_indices.as_deref().unwrap_or_default(),
+                        || ensure_generic_cpu_running(cancellation),
+                    )?,
+                    ..resources
+                }),
+                None => None,
+            };
             let mut current = Vec::new();
             for (unit, protected, _) in protected_units {
-                if let Some(translation) = current_translation_for_stored(
+                ensure_generic_cpu_running(cancellation)?;
+                if let Some(translation) = current_translation_for_stored_with_cancellation(
                     snapshot.project(),
                     group,
                     unit,
                     protected.binding_fingerprint(),
                     group_resources,
-                ) {
-                    current.push(((group.id().to_owned(), unit.id().to_owned()), translation));
+                    cancellation,
+                )
+                .map_err(GenericPreparationError::Planning)?
+                {
+                    current.push((
+                        GenericUnitKey::new(
+                            clone_generic_cpu_text(group.id(), cancellation)?,
+                            clone_generic_cpu_text(unit.id(), cancellation)?,
+                        ),
+                        translation,
+                    ));
                 }
             }
+            ensure_generic_cpu_running(cancellation)?;
             Ok::<_, GenericPreparationError>(current)
         })
         .collect::<Vec<_>>();
 
-    let mut current = HashMap::with_capacity(snapshot.unit_count());
+    let mut current = GenericUnitMap::new();
     for prepared_group in prepared_groups {
+        ensure_generic_cpu_running(cancellation)?;
         for (key, translation) in prepared_group? {
-            current.insert(key, translation);
+            ensure_generic_cpu_running(cancellation)?;
+            let previous = current.insert_with_cancellation(key, translation, || {
+                ensure_generic_cpu_running(cancellation)
+            })?;
+            debug_assert!(previous.is_none());
         }
     }
+    ensure_generic_cpu_running(cancellation)?;
     Ok(current)
+}
+
+fn ensure_generic_cpu_running(
+    cancellation: &CooperativeCancellation,
+) -> Result<(), GenericPreparationError> {
+    if cancellation.is_requested() {
+        Err(GenericPreparationError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_generic_language_running(
+    cancellation: &CooperativeCancellation,
+) -> Result<(), LanguageOperationCancelled> {
+    if cancellation.is_requested() {
+        Err(LanguageOperationCancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn clone_generic_cpu_text(
+    text: &str,
+    cancellation: &CooperativeCancellation,
+) -> Result<String, GenericPreparationError> {
+    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
+
+    let mut output = String::with_capacity(text.len());
+    let mut start = 0_usize;
+    while start < text.len() {
+        ensure_generic_cpu_running(cancellation)?;
+        let mut end = start
+            .saturating_add(CANCELLATION_CHECK_BYTES)
+            .min(text.len());
+        while end < text.len() && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        output.push_str(&text[start..end]);
+        start = end;
+    }
+    ensure_generic_cpu_running(cancellation)?;
+    Ok(output)
+}
+
+fn clone_generic_cpu_indices(
+    indices: &[usize],
+    cancellation: &CooperativeCancellation,
+) -> Result<Vec<usize>, GenericPreparationError> {
+    const CANCELLATION_CHECK_ITEMS: usize = 1024;
+
+    let mut output = Vec::with_capacity(indices.len());
+    for chunk in indices.chunks(CANCELLATION_CHECK_ITEMS) {
+        ensure_generic_cpu_running(cancellation)?;
+        output.extend_from_slice(chunk);
+    }
+    ensure_generic_cpu_running(cancellation)?;
+    Ok(output)
+}
+
+fn clone_generic_unit_key(
+    key: &GenericUnitKey,
+    cancellation: &CooperativeCancellation,
+) -> Result<GenericUnitKey, GenericPreparationError> {
+    Ok(GenericUnitKey::new(
+        clone_generic_cpu_text(key.group_id(), cancellation)?,
+        clone_generic_cpu_text(key.unit_id(), cancellation)?,
+    ))
+}
+
+fn generic_cpu_text_equal(
+    left: &str,
+    right: &str,
+    cancellation: &CooperativeCancellation,
+) -> Result<bool, GenericPreparationError> {
+    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
+
+    ensure_generic_cpu_running(cancellation)?;
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    for (left, right) in left
+        .as_bytes()
+        .chunks(CANCELLATION_CHECK_BYTES)
+        .zip(right.as_bytes().chunks(CANCELLATION_CHECK_BYTES))
+    {
+        ensure_generic_cpu_running(cancellation)?;
+        if left != right {
+            return Ok(false);
+        }
+    }
+    ensure_generic_cpu_running(cancellation)?;
+    Ok(true)
+}
+
+fn generic_language_text_has_non_whitespace_natural_text(
+    text: &LanguageText,
+    cancellation: &CooperativeCancellation,
+) -> Result<bool, GenericPreparationError> {
+    const CANCELLATION_CHECK_CHARACTERS: usize = 16 * 1024;
+
+    for segment in text.segments() {
+        ensure_generic_cpu_running(cancellation)?;
+        let LanguageTextSegment::NaturalText(text) = segment else {
+            continue;
+        };
+        for (index, character) in text.chars().enumerate() {
+            if index.is_multiple_of(CANCELLATION_CHECK_CHARACTERS) {
+                ensure_generic_cpu_running(cancellation)?;
+            }
+            if !character.is_whitespace() {
+                return Ok(true);
+            }
+        }
+    }
+    ensure_generic_cpu_running(cancellation)?;
+    Ok(false)
 }
 
 fn natural_segments(language_text: &LanguageText) -> impl Iterator<Item = &str> {
@@ -1908,18 +2917,15 @@ fn empty_terminology_fingerprint() -> Sha256Fingerprint {
     Sha256FramedHasher::new(b"att.generic.terminology-hits").finish()
 }
 
+#[cfg(test)]
 fn terminology_hit_fingerprint(
     terminology: &CompiledTerminology,
     indices: &[usize],
 ) -> Sha256Fingerprint {
-    let mut hasher = Sha256FramedHasher::new(b"att.generic.terminology-hits");
-    for index in indices {
-        let entry = &terminology.entries()[*index];
-        hasher
-            .frame(1, entry.term().as_bytes())
-            .frame(2, entry.translation().as_bytes());
-    }
-    hasher.finish()
+    terminology_hit_fingerprint_with_cancellation(terminology, indices, || {
+        Ok::<_, std::convert::Infallible>(())
+    })
+    .unwrap_or_else(|never| match never {})
 }
 
 struct GenericTaskExecution {
@@ -1927,7 +2933,7 @@ struct GenericTaskExecution {
     expected_raw_fingerprint: Sha256Fingerprint,
     profile_id: String,
     tasks: Vec<PlannedTask>,
-    facts: Arc<HashMap<GenericUnitKey, GenericValidationFact>>,
+    facts: Arc<GenericUnitMap<GenericValidationFact>>,
     placeholder_rules: GenericCompiledPlaceholderRules,
     terminology: Arc<CompiledTerminology>,
     language_module: Arc<dyn LanguageModule>,
@@ -1937,8 +2943,10 @@ struct GenericTaskExecution {
     llm: OpenAiChatCompletionExecutor,
     retry_delays: Vec<Duration>,
     max_retry_after: Duration,
+    cpu: RayonCpuExecutor,
     cancellation: CooperativeCancellation,
     task_records: ConfiguredTranslationTaskRecordSink,
+    progress: TerminalProgressObserver<GenericProgressPhase>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1983,7 +2991,11 @@ impl GenericTaskRecordDraft {
 
 enum GenericPreparedTaskOutcome {
     Accepted {
-        acceptance: TranslationAcceptance,
+        writes: Vec<TranslationWrite>,
+        issues: Vec<GenericTaskRecordIssue>,
+        accepted_units: usize,
+        response_problems: usize,
+        response_complete: bool,
         accepted_outputs: usize,
     },
     Unavailable {
@@ -2000,16 +3012,17 @@ struct GenericPreparedTask {
 #[derive(Clone)]
 struct GenericTaskRequestContext {
     total_tasks: usize,
-    facts: Arc<HashMap<GenericUnitKey, GenericValidationFact>>,
+    facts: Arc<GenericUnitMap<GenericValidationFact>>,
     placeholder_rules: GenericCompiledPlaceholderRules,
     terminology: Arc<CompiledTerminology>,
     language_module: Arc<dyn LanguageModule>,
-    system_prompt: String,
+    system_prompt: Arc<String>,
     response_envelope: TranslationResponseEnvelope,
     client: Arc<crate::runtime::llm::OpenAiChatCompletionClient>,
     llm: OpenAiChatCompletionExecutor,
-    retry_delays: Vec<Duration>,
+    retry_delays: Arc<Vec<Duration>>,
     max_retry_after: Duration,
+    cpu: RayonCpuExecutor,
     cancellation: CooperativeCancellation,
     record_evidence: bool,
 }
@@ -2019,21 +3032,53 @@ async fn execute_owned_generic_task(
     task_index: usize,
     task: PlannedTask,
 ) -> Result<GenericPreparedTask, GenericCommandError> {
+    let render_terminology = Arc::clone(&context.terminology);
+    let render_system_prompt = Arc::clone(&context.system_prompt);
+    let render_cancellation = context.cancellation.clone();
+    let (task, expected_outputs, system_prompt, user_message) = context
+        .cpu
+        .execute(move || {
+            let user_message = render_generic_user_message_with_cancellation(
+                &task,
+                render_terminology.as_ref(),
+                &render_cancellation,
+            )
+            .map_err(GenericPreparationError::Planning)?;
+            let mut expected_outputs = 0_usize;
+            for _ in task.expected_output_ids() {
+                ensure_generic_cpu_running(&render_cancellation)?;
+                expected_outputs += 1;
+            }
+            let system_prompt =
+                clone_generic_cpu_text(render_system_prompt.as_str(), &render_cancellation)?;
+            Ok::<_, GenericPreparationError>((task, expected_outputs, system_prompt, user_message))
+        })
+        .await
+        .map_err(|source| generic_cpu_execution_failure("调度 Generic 模型消息", source))?
+        .map_err(|source| {
+            if source.is_cancelled() {
+                GenericCommandError::Cancelled
+            } else {
+                generic_preparation_failure("建立 Generic 模型消息", source)
+            }
+        })?;
     execute_generic_task(
         context.total_tasks,
         task_index,
         task,
-        context.facts.as_ref(),
-        &context.placeholder_rules,
-        context.terminology.as_ref(),
-        context.language_module.as_ref(),
-        &context.system_prompt,
+        expected_outputs,
+        user_message,
+        Arc::clone(&context.facts),
+        context.placeholder_rules.clone(),
+        Arc::clone(&context.language_module),
+        system_prompt,
         context.response_envelope,
         context.client.as_ref(),
         &context.llm,
-        &context.retry_delays,
+        context.retry_delays.as_slice(),
         context.max_retry_after,
-        &context.cancellation,
+        context.cpu.clone(),
+        context.cancellation.clone(),
         context.record_evidence,
     )
     .await
@@ -2057,8 +3102,10 @@ async fn execute_generic_tasks(
         llm,
         retry_delays,
         max_retry_after,
+        cpu,
         cancellation,
         task_records,
+        progress,
     } = input;
     let total_tasks = tasks.len();
     let record_evidence = task_records.enabled();
@@ -2069,12 +3116,13 @@ async fn execute_generic_tasks(
         placeholder_rules,
         terminology,
         language_module,
-        system_prompt,
+        system_prompt: Arc::new(system_prompt),
         response_envelope,
         client,
         llm,
-        retry_delays,
+        retry_delays: Arc::new(retry_delays),
         max_retry_after,
+        cpu,
         cancellation: cancellation.clone(),
         record_evidence,
     };
@@ -2121,21 +3169,13 @@ async fn execute_generic_tasks(
         }
         match outcome {
             GenericPreparedTaskOutcome::Accepted {
-                acceptance,
+                writes,
+                mut issues,
+                accepted_units,
+                response_problems,
+                response_complete,
                 accepted_outputs,
             } => {
-                let (accepted, problems) = acceptance.into_parts();
-                let accepted_units = accepted.len();
-                let response_problems = problems.len();
-                let response_complete = problems.is_empty();
-                let mut issues = problems
-                    .iter()
-                    .map(GenericTaskRecordIssue::from_response_problem)
-                    .collect::<Vec<_>>();
-                let writes = accepted
-                    .into_iter()
-                    .map(|accepted| accepted.into_write())
-                    .collect::<Vec<_>>();
                 let commit = if writes.is_empty() {
                     Ok(CommitTranslationsOutcome {
                         committed: 0,
@@ -2144,13 +3184,19 @@ async fn execute_generic_tasks(
                 } else {
                     let store = store.clone();
                     let profile_id = profile_id.clone();
-                    run_blocking("提交 Generic 模型译文", move || {
-                        store.commit_translations_for_profile(
-                            expected_raw_fingerprint,
-                            &writes,
-                            &profile_id,
-                        )
-                    })
+                    run_project_blocking(
+                        "提交 Generic 模型译文",
+                        DiagnosticStage::Translate,
+                        DiagnosticImpact::ProgressPreserved,
+                        DiagnosticAction::Retry,
+                        move || {
+                            store.commit_translations_for_profile(
+                                expected_raw_fingerprint,
+                                &writes,
+                                &profile_id,
+                            )
+                        },
+                    )
                     .await
                 };
                 let commit =
@@ -2204,6 +3250,15 @@ async fn execute_generic_tasks(
                 terminal_error = Some(GenericCommandError::Cancelled);
             }
         }
+        if terminal_error.is_none() {
+            let confirmed =
+                summary.complete_tasks + summary.partial_tasks + summary.unavailable_tasks;
+            progress.observe(ProgressSnapshot::determinate(
+                GenericProgressPhase::ConfirmedTasks,
+                u64::try_from(confirmed).unwrap_or(u64::MAX),
+                u64::try_from(total_tasks).unwrap_or(u64::MAX),
+            ));
+        }
         if terminal_error.is_none()
             && let Some((task_index, task)) = remaining.next()
         {
@@ -2225,106 +3280,179 @@ async fn execute_generic_task(
     total_tasks: usize,
     task_index: usize,
     task: PlannedTask,
-    facts: &HashMap<GenericUnitKey, GenericValidationFact>,
-    placeholder_rules: &GenericCompiledPlaceholderRules,
-    terminology: &CompiledTerminology,
-    language_module: &dyn LanguageModule,
-    system_prompt: &str,
+    expected_outputs: usize,
+    user_message: String,
+    facts: Arc<GenericUnitMap<GenericValidationFact>>,
+    placeholder_rules: GenericCompiledPlaceholderRules,
+    language_module: Arc<dyn LanguageModule>,
+    system_prompt: String,
     response_envelope: TranslationResponseEnvelope,
     client: &crate::runtime::llm::OpenAiChatCompletionClient,
     llm: &OpenAiChatCompletionExecutor,
     retry_delays: &[Duration],
     max_retry_after: Duration,
-    cancellation: &CooperativeCancellation,
+    cpu: RayonCpuExecutor,
+    cancellation: CooperativeCancellation,
     record_evidence: bool,
 ) -> Result<GenericPreparedTask, GenericCommandError> {
-    let user_message = render_generic_user_message(&task, terminology);
     let messages = [
         ChatMessage::new(ChatMessageRole::System, system_prompt),
         ChatMessage::new(ChatMessageRole::User, user_message),
     ];
     let record_started = record_evidence.then(|| (OffsetDateTime::now_utc(), Instant::now()));
-    let record_messages = record_evidence.then(|| messages.to_vec());
-    let expected_outputs = task.expected_output_ids().count();
     let execution = execute_llm_request_with_retry(
         llm,
         client,
         &messages,
         LlmRequestRetryPolicy::new(retry_delays, max_retry_after),
         &TokioDelay,
-        cancellation,
+        &cancellation,
         record_evidence,
     )
     .await;
+    let record_messages =
+        record_evidence.then(|| messages.into_iter().collect::<Vec<ChatMessage>>());
     let (outcome, evidence) = execution.into_parts();
     let (attempt_count, attempts) = evidence.into_parts();
-    let mut response_record = None;
-    let outcome = match outcome {
-        LlmRequestExecutionOutcome::Response { response, .. }
-            if matches!(response.finish_reason(), LlmFinishReason::Stop) =>
-        {
-            match parse_translation_response(response.content(), response_envelope) {
-                Ok(parsed) => {
-                    let acceptance = accept_generic_response(
-                        task,
-                        &parsed,
-                        facts,
-                        placeholder_rules,
-                        language_module,
-                    );
-                    let accepted_outputs = acceptance.accepted_output_count();
-                    if record_evidence {
-                        response_record = Some(GenericTaskResponseRecord::parsed(parsed));
-                    }
-                    GenericPreparedTaskOutcome::Accepted {
-                        acceptance,
-                        accepted_outputs,
+    let response_cancellation = cancellation.clone();
+    let (outcome, response_record) = cpu
+        .execute(move || {
+            ensure_generic_response_processing_running(&response_cancellation)?;
+            let mut response_record = None;
+            let outcome = match outcome {
+                LlmRequestExecutionOutcome::Response { response, .. } => {
+                    let (content, finish_reason) = response.into_content_and_finish_reason();
+                    ensure_generic_response_processing_running(&response_cancellation)?;
+                    if matches!(finish_reason, LlmFinishReason::Stop) {
+                        match parse_translation_response_with_cancellation(
+                            &content,
+                            response_envelope,
+                            || {
+                                ensure_generic_response_processing_running(
+                                    &response_cancellation,
+                                )
+                            },
+                        )? {
+                            Ok(parsed) => {
+                                ensure_generic_response_processing_running(
+                                    &response_cancellation,
+                                )?;
+                                let acceptance =
+                                    accept_generic_response_with_cancellation(
+                                        task,
+                                        &parsed,
+                                        facts.as_ref(),
+                                        &placeholder_rules,
+                                        language_module.as_ref(),
+                                        &response_cancellation,
+                                    )?;
+                                let accepted_outputs = acceptance.accepted_output_count();
+                                let (accepted, problems) = acceptance.into_parts();
+                                let accepted_units = accepted.len();
+                                let response_problems = problems.len();
+                                let response_complete = problems.is_empty();
+                                let mut issues = Vec::with_capacity(problems.len());
+                                for problem in &problems {
+                                    ensure_generic_response_processing_running(
+                                        &response_cancellation,
+                                    )?;
+                                    issues.push(
+                                        GenericTaskRecordIssue::from_response_problem_with_cancellation(
+                                            problem,
+                                            || {
+                                                ensure_generic_response_processing_running(
+                                                    &response_cancellation,
+                                                )
+                                            },
+                                        )?,
+                                    );
+                                }
+                                let mut writes = Vec::with_capacity(accepted.len());
+                                for accepted in accepted {
+                                    ensure_generic_response_processing_running(
+                                        &response_cancellation,
+                                    )?;
+                                    writes.push(accepted.into_write());
+                                }
+                                if record_evidence {
+                                    response_record = Some(
+                                        GenericTaskResponseRecord::parsed_with_cancellation(
+                                            parsed,
+                                            || {
+                                                ensure_generic_response_processing_running(
+                                                    &response_cancellation,
+                                                )
+                                            },
+                                        )?,
+                                    );
+                                }
+                                GenericPreparedTaskOutcome::Accepted {
+                                    writes,
+                                    issues,
+                                    accepted_units,
+                                    response_problems,
+                                    response_complete,
+                                    accepted_outputs,
+                                }
+                            }
+                            Err(error) => {
+                                ensure_generic_response_processing_running(
+                                    &response_cancellation,
+                                )?;
+                                if record_evidence {
+                                    response_record =
+                                        Some(GenericTaskResponseRecord::invalid(content, error));
+                                }
+                                GenericPreparedTaskOutcome::Unavailable {
+                                    reason: "model_response_unusable",
+                                }
+                            }
+                        }
+                    } else {
+                        if record_evidence {
+                            response_record =
+                                Some(GenericTaskResponseRecord::unprocessed(content));
+                        }
+                        GenericPreparedTaskOutcome::Unavailable {
+                            reason: "non_stop_finish",
+                        }
                     }
                 }
-                Err(error) => {
-                    if record_evidence {
-                        response_record = Some(GenericTaskResponseRecord::invalid(
-                            response.content().to_owned(),
-                            error,
-                        ));
-                    }
+                LlmRequestExecutionOutcome::RetryAfterExceedsMaximum { .. } => {
                     GenericPreparedTaskOutcome::Unavailable {
-                        reason: "model_response_unusable",
+                        reason: "retry_after_exceeds_maximum",
                     }
                 }
-            }
-        }
-        LlmRequestExecutionOutcome::Response { response, .. } => {
-            if record_evidence {
-                response_record = Some(GenericTaskResponseRecord::unprocessed(
-                    response.content().to_owned(),
-                ));
-            }
-            GenericPreparedTaskOutcome::Unavailable {
-                reason: "non_stop_finish",
-            }
-        }
-        LlmRequestExecutionOutcome::RetryAfterExceedsMaximum { .. } => {
-            GenericPreparedTaskOutcome::Unavailable {
-                reason: "retry_after_exceeds_maximum",
-            }
-        }
-        LlmRequestExecutionOutcome::RetryBudgetExhausted { .. } => {
-            GenericPreparedTaskOutcome::Unavailable {
-                reason: "recoverable_request_exhausted",
-            }
-        }
-        LlmRequestExecutionOutcome::Fatal { cancelled, .. } => {
-            if cancelled {
-                GenericPreparedTaskOutcome::Cancelled
-            } else {
-                GenericPreparedTaskOutcome::Unavailable {
-                    reason: "request_failed",
+                LlmRequestExecutionOutcome::RetryBudgetExhausted { .. } => {
+                    GenericPreparedTaskOutcome::Unavailable {
+                        reason: "recoverable_request_exhausted",
+                    }
                 }
+                LlmRequestExecutionOutcome::Fatal { cancelled, .. } => {
+                    if cancelled {
+                        GenericPreparedTaskOutcome::Cancelled
+                    } else {
+                        GenericPreparedTaskOutcome::Unavailable {
+                            reason: "request_failed",
+                        }
+                    }
+                }
+                LlmRequestExecutionOutcome::Cancelled { .. } => {
+                    GenericPreparedTaskOutcome::Cancelled
+                }
+            };
+            ensure_generic_response_processing_running(&response_cancellation)?;
+            Ok::<_, GenericPlanningError>((outcome, response_record))
+        })
+        .await
+        .map_err(|source| generic_cpu_execution_failure("调度 Generic 响应验收", source))?
+        .map_err(|source| {
+            if source.is_cancelled() {
+                GenericCommandError::Cancelled
+            } else {
+                GenericCommandError::operation("验收 Generic 模型响应", source)
             }
-        }
-        LlmRequestExecutionOutcome::Cancelled { .. } => GenericPreparedTaskOutcome::Cancelled,
-    };
+        })?;
     let record = record_started.map(|(started_at, started)| GenericTaskRecordDraft {
         total_tasks,
         task_index,
@@ -2339,52 +3467,94 @@ async fn execute_generic_task(
     Ok(GenericPreparedTask { outcome, record })
 }
 
+#[cfg(test)]
 fn render_generic_user_message(task: &PlannedTask, terminology: &CompiledTerminology) -> String {
-    let mut output = String::new();
-    output.push_str("Groups:\n");
+    render_generic_user_message_with_cancellation(
+        task,
+        terminology,
+        &CooperativeCancellation::default(),
+    )
+    .expect("不取消的受信模型消息必须可以渲染")
+}
+
+fn render_generic_user_message_with_cancellation(
+    task: &PlannedTask,
+    terminology: &CompiledTerminology,
+    cancellation: &CooperativeCancellation,
+) -> Result<String, GenericPlanningError> {
+    ensure_message_render_running(cancellation)?;
+    let mut output = b"Groups:\n".to_vec();
     for group in task.groups() {
-        append_generic_group_message(&mut output, group, terminology, None);
-        output.push('\n');
+        ensure_message_render_running(cancellation)?;
+        append_generic_group_message_with_cancellation(
+            &mut output,
+            group,
+            terminology,
+            None,
+            cancellation,
+        )?;
+        output.push(b'\n');
     }
-    output
+    ensure_message_render_running(cancellation)?;
+    Ok(String::from_utf8(output)
+        .expect("ASCII 结构与 serde_json 字符串编码必须组成 UTF-8 模型消息"))
 }
 
 fn measure_generic_group_message(
     group: &PlannedGroup,
     terminology: &CompiledTerminology,
     first_output_id: u64,
-) -> usize {
-    let mut output = String::new();
+    cancellation: &CooperativeCancellation,
+) -> Result<usize, GenericPlanningError> {
+    ensure_message_render_running(cancellation)?;
+    let mut output = Vec::new();
     let mut next_output_id = first_output_id;
-    append_generic_group_message(&mut output, group, terminology, Some(&mut next_output_id));
-    output.push('\n');
-    output.chars().count()
+    append_generic_group_message_with_cancellation(
+        &mut output,
+        group,
+        terminology,
+        Some(&mut next_output_id),
+        cancellation,
+    )?;
+    output.push(b'\n');
+    let output =
+        std::str::from_utf8(&output).expect("ASCII 结构与 serde_json 字符串编码必须组成 UTF-8");
+    let mut characters = 0_usize;
+    for _ in output.chars() {
+        if characters.is_multiple_of(16 * 1024) {
+            ensure_message_render_running(cancellation)?;
+        }
+        characters += 1;
+    }
+    ensure_message_render_running(cancellation)?;
+    Ok(characters)
 }
 
-fn append_generic_group_message(
-    output: &mut String,
+fn append_generic_group_message_with_cancellation(
+    output: &mut Vec<u8>,
     group: &PlannedGroup,
     terminology: &CompiledTerminology,
     mut next_output_id: Option<&mut u64>,
-) {
-    output.push_str("kind=");
-    output.push_str(&serde_json::to_string(group.kind()).expect("受信 UTF-8 kind 必须可编码"));
-    output.push('\n');
+    cancellation: &CooperativeCancellation,
+) -> Result<(), GenericPlanningError> {
+    ensure_message_render_running(cancellation)?;
+    output.extend_from_slice(b"kind=");
+    append_json_string_with_cancellation(output, group.kind(), cancellation)?;
+    output.push(b'\n');
     if !group.terminology_indices().is_empty() {
-        output.push_str("terminology:\n");
+        output.extend_from_slice(b"terminology:\n");
         for index in group.terminology_indices() {
+            ensure_message_render_running(cancellation)?;
             let entry = &terminology.entries()[*index];
-            output
-                .push_str(&serde_json::to_string(entry.term()).expect("受信 UTF-8 术语必须可编码"));
-            output.push_str(" => ");
-            output.push_str(
-                &serde_json::to_string(entry.translation()).expect("受信 UTF-8 译词必须可编码"),
-            );
-            output.push('\n');
+            append_json_string_with_cancellation(output, entry.term(), cancellation)?;
+            output.extend_from_slice(b" => ");
+            append_json_string_with_cancellation(output, entry.translation(), cancellation)?;
+            output.push(b'\n');
         }
     }
-    output.push_str("units:\n");
+    output.extend_from_slice(b"units:\n");
     for unit in group.units() {
+        ensure_message_render_running(cancellation)?;
         let rendered_output_id = match (unit.output_id(), next_output_id.as_deref_mut()) {
             (Some(_), Some(next)) => {
                 let current = *next;
@@ -2396,66 +3566,216 @@ fn append_generic_group_message(
         };
         match rendered_output_id {
             Some(output_id) => {
-                output.push('[');
-                output.push_str(&output_id.to_string());
-                output.push_str("] ");
+                output.push(b'[');
+                output.extend_from_slice(output_id.to_string().as_bytes());
+                output.extend_from_slice(b"] ");
             }
-            None => output.push_str("[-] "),
+            None => output.extend_from_slice(b"[-] "),
         }
-        output.push_str(&serde_json::to_string(unit.text()).expect("受信 UTF-8 text 必须可编码"));
-        output.push('\n');
+        append_json_string_with_cancellation(output, unit.text(), cancellation)?;
+        output.push(b'\n');
+    }
+    ensure_message_render_running(cancellation)
+}
+
+fn append_json_string_with_cancellation(
+    output: &mut Vec<u8>,
+    value: &str,
+    cancellation: &CooperativeCancellation,
+) -> Result<(), GenericPlanningError> {
+    let (result, cancelled) = {
+        let mut writer = CancellableMessageWriter::new(output, cancellation);
+        let result = serde_json::to_writer(&mut writer, value);
+        (result, writer.cancelled)
+    };
+    if cancelled {
+        return Err(GenericPlanningError::Cancelled);
+    }
+    result.expect("向内存写入受信 UTF-8 JSON 字符串不能失败");
+    ensure_message_render_running(cancellation)
+}
+
+struct CancellableMessageWriter<'a> {
+    output: &'a mut Vec<u8>,
+    cancellation: &'a CooperativeCancellation,
+    bytes_until_check: usize,
+    cancelled: bool,
+}
+
+impl<'a> CancellableMessageWriter<'a> {
+    fn new(output: &'a mut Vec<u8>, cancellation: &'a CooperativeCancellation) -> Self {
+        Self {
+            output,
+            cancellation,
+            bytes_until_check: 0,
+            cancelled: false,
+        }
     }
 }
 
-fn accept_generic_response(
-    task: PlannedTask,
-    parsed: &ParsedTranslationResponse,
-    facts: &HashMap<GenericUnitKey, GenericValidationFact>,
-    placeholder_rules: &GenericCompiledPlaceholderRules,
-    language_module: &dyn LanguageModule,
-) -> TranslationAcceptance {
-    accept_generic_response_with(task, parsed, facts, |fact, candidate| {
-        validate_generic_candidate_fact(fact, candidate, placeholder_rules, language_module)
-    })
+impl io::Write for CancellableMessageWriter<'_> {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
+
+        if input.is_empty() {
+            return Ok(0);
+        }
+        if self.bytes_until_check == 0 {
+            if self.cancellation.is_requested() {
+                self.cancelled = true;
+                return Err(io::Error::other("Generic 模型消息渲染已取消"));
+            }
+            self.bytes_until_check = CANCELLATION_CHECK_BYTES;
+        }
+        let written = input.len().min(self.bytes_until_check);
+        self.output.extend_from_slice(&input[..written]);
+        self.bytes_until_check -= written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
+fn ensure_message_render_running(
+    cancellation: &CooperativeCancellation,
+) -> Result<(), GenericPlanningError> {
+    if cancellation.is_requested() {
+        Err(GenericPlanningError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 fn accept_generic_response_with(
     task: PlannedTask,
     parsed: &ParsedTranslationResponse,
-    facts: &HashMap<GenericUnitKey, GenericValidationFact>,
+    facts: &GenericUnitMap<GenericValidationFact>,
     mut validator: impl FnMut(&GenericValidationFact, &str) -> Result<String, String>,
 ) -> TranslationAcceptance {
-    let mut cache = HashMap::<u64, HashMap<String, Result<String, String>>>::new();
-    accept_parsed_response(task, parsed, |output_id, key, candidate| {
-        let Some(fact) = facts.get(key) else {
-            return Err("响应代表项不属于当前 Generic 计划".to_owned());
-        };
-        let output_cache = cache.entry(output_id).or_default();
-        if let Some(cached) = output_cache.get(&fact.kind) {
-            return cached.clone();
-        }
-
-        // 一个 output_id 只对应一个全局去重族；同族的原文、保护后文本和实际
-        // Placeholder 绑定相同。kind 仍会改变 scope，因此必须分别验收。
-        let validated = validator(fact, candidate);
-        output_cache.insert(fact.kind.clone(), validated.clone());
-        validated
-    })
+    accept_generic_response_with_validator_and_cancellation(
+        task,
+        parsed,
+        facts,
+        |fact, candidate| Ok(validator(fact, candidate)),
+        &CooperativeCancellation::default(),
+    )
+    .expect("不取消的受信 Generic 响应必须完成验收")
 }
 
+fn accept_generic_response_with_cancellation(
+    task: PlannedTask,
+    parsed: &ParsedTranslationResponse,
+    facts: &GenericUnitMap<GenericValidationFact>,
+    placeholder_rules: &GenericCompiledPlaceholderRules,
+    language_module: &dyn LanguageModule,
+    cancellation: &CooperativeCancellation,
+) -> Result<TranslationAcceptance, GenericPlanningError> {
+    accept_generic_response_with_validator_and_cancellation(
+        task,
+        parsed,
+        facts,
+        |fact, candidate| {
+            validate_generic_candidate_fact_with_cancellation(
+                fact,
+                candidate,
+                placeholder_rules,
+                language_module,
+                cancellation,
+            )
+        },
+        cancellation,
+    )
+}
+
+fn accept_generic_response_with_validator_and_cancellation(
+    task: PlannedTask,
+    parsed: &ParsedTranslationResponse,
+    facts: &GenericUnitMap<GenericValidationFact>,
+    mut validator: impl FnMut(
+        &GenericValidationFact,
+        &str,
+    ) -> Result<Result<String, String>, GenericPlanningError>,
+    cancellation: &CooperativeCancellation,
+) -> Result<TranslationAcceptance, GenericPlanningError> {
+    let mut cache = HashMap::<u64, CancellableTextMap<&str, Result<String, String>>>::new();
+    accept_parsed_response_with_cancellation(
+        task,
+        parsed,
+        |output_id, key, candidate| {
+            ensure_generic_response_processing_running(cancellation)?;
+            let Some(fact) = facts.get_with_cancellation(key, || {
+                ensure_generic_response_processing_running(cancellation)
+            })?
+            else {
+                return Ok(Err("响应代表项不属于当前 Generic 计划".to_owned()));
+            };
+            let output_cache = cache
+                .entry(output_id)
+                .or_insert_with(|| CancellableTextMap::with_capacity(1));
+            if let Some(cached) = output_cache.get_with_cancellation(fact.kind.as_str(), || {
+                ensure_generic_response_processing_running(cancellation)
+            })? {
+                return clone_generic_validation_result(cached, cancellation);
+            }
+
+            // 一个 output_id 只对应一个全局去重族；同族的原文、保护后文本和实际
+            // Placeholder 绑定相同。kind 仍会改变 scope，因此必须分别验收。
+            let validated = validator(fact, candidate)?;
+            let returned = clone_generic_validation_result(&validated, cancellation)?;
+            let previous =
+                output_cache.insert_with_cancellation(fact.kind.as_str(), validated, || {
+                    ensure_generic_response_processing_running(cancellation)
+                })?;
+            debug_assert!(previous.is_none());
+            Ok(returned)
+        },
+        || cancellation.is_requested(),
+    )
+}
+
+#[cfg(test)]
 fn validate_generic_candidate(
     key: &GenericUnitKey,
     candidate: &str,
-    facts: &HashMap<GenericUnitKey, GenericValidationFact>,
+    facts: &GenericUnitMap<GenericValidationFact>,
     placeholder_rules: &GenericCompiledPlaceholderRules,
     language_module: &dyn LanguageModule,
 ) -> Result<String, String> {
     let fact = facts
-        .get(key)
+        .get_with_cancellation(key, || Ok::<_, std::convert::Infallible>(()))
+        .unwrap_or_else(|never| match never {})
         .ok_or_else(|| "响应代表项不属于当前 Generic 计划".to_owned())?;
     validate_generic_candidate_fact(fact, candidate, placeholder_rules, language_module)
 }
 
+fn validate_generic_candidate_with_cancellation(
+    key: &GenericUnitKey,
+    candidate: &str,
+    facts: &GenericUnitMap<GenericValidationFact>,
+    placeholder_rules: &GenericCompiledPlaceholderRules,
+    language_module: &dyn LanguageModule,
+    cancellation: &CooperativeCancellation,
+) -> Result<Result<String, String>, GenericPlanningError> {
+    ensure_generic_response_processing_running(cancellation)?;
+    let Some(fact) = facts.get_with_cancellation(key, || {
+        ensure_generic_response_processing_running(cancellation)
+    })?
+    else {
+        return Ok(Err("响应代表项不属于当前 Generic 计划".to_owned()));
+    };
+    validate_generic_candidate_fact_with_cancellation(
+        fact,
+        candidate,
+        placeholder_rules,
+        language_module,
+        cancellation,
+    )
+}
+
+#[cfg(test)]
 fn validate_generic_candidate_fact(
     fact: &GenericValidationFact,
     candidate: &str,
@@ -2500,6 +3820,89 @@ fn validate_generic_candidate_fact(
     Ok(final_translation)
 }
 
+fn validate_generic_candidate_fact_with_cancellation(
+    fact: &GenericValidationFact,
+    candidate: &str,
+    placeholder_rules: &GenericCompiledPlaceholderRules,
+    language_module: &dyn LanguageModule,
+    cancellation: &CooperativeCancellation,
+) -> Result<Result<String, String>, GenericPlanningError> {
+    ensure_generic_response_processing_running(cancellation)?;
+    let service = GenericPlaceholderService::default();
+    let restored = match service.restore_with_cancellation(&fact.protected, candidate, || {
+        ensure_generic_response_processing_running(cancellation)
+    })? {
+        Ok(restored) => restored,
+        Err(source) => return Ok(Err(source.to_string())),
+    };
+    let candidate_protected =
+        match service.protect_with_cancellation(&fact.kind, &restored, placeholder_rules, || {
+            ensure_generic_response_processing_running(cancellation)
+        })? {
+            Ok(protected) => protected,
+            Err(source) => return Ok(Err(source.to_string())),
+        };
+    let language_text = match candidate_protected.language_text_with_cancellation(|| {
+        ensure_generic_response_processing_running(cancellation)
+    })? {
+        Ok(text) => text,
+        Err(source) => return Ok(Err(source.to_string())),
+    };
+    let residual = match language_module.find_source_residual_with_cancellation(
+        &fact.analysis,
+        &language_text,
+        &mut || ensure_generic_language_running(cancellation),
+    ) {
+        Ok(Ok(residual)) => residual,
+        Ok(Err(source)) => return Ok(Err(source.to_string())),
+        Err(LanguageOperationCancelled) => return Err(GenericPlanningError::Cancelled),
+    };
+    if residual.is_some() {
+        return Ok(Err("译文仍含不允许保留的源语言文本".to_owned()));
+    }
+    let repair = match language_module.plan_translation_repair_with_cancellation(
+        &fact.analysis,
+        &language_text,
+        &mut || ensure_generic_language_running(cancellation),
+    ) {
+        Ok(Ok(repair)) => repair,
+        Ok(Err(source)) => return Ok(Err(source.to_string())),
+        Err(LanguageOperationCancelled) => return Err(GenericPlanningError::Cancelled),
+    };
+    let repaired = match language_text.apply_repair_with_cancellation(&repair, || {
+        ensure_generic_response_processing_running(cancellation)
+    })? {
+        Ok(repaired) => repaired,
+        Err(source) => return Ok(Err(source.to_string())),
+    };
+    ensure_generic_response_processing_running(cancellation)?;
+    let final_translation = match rebuild_original_placeholders_with_cancellation(
+        &candidate_protected,
+        &repaired,
+        cancellation,
+    )? {
+        Ok(translation) => translation,
+        Err(detail) => return Ok(Err(detail)),
+    };
+    match crate::generic::validate_translation_placeholders_with_cancellation(
+        &service,
+        placeholder_rules,
+        &fact.kind,
+        &fact.source_text,
+        &final_translation,
+        || ensure_generic_response_processing_running(cancellation),
+    )? {
+        Ok(()) => {}
+        Err(source) => return Ok(Err(source.to_string())),
+    }
+    if contains_reserved_prefix_with_cancellation(&final_translation, cancellation)? {
+        return Ok(Err("译文恢复后仍含 ATT 保留 token".to_owned()));
+    }
+    ensure_generic_response_processing_running(cancellation)?;
+    Ok(Ok(final_translation))
+}
+
+#[cfg(test)]
 fn rebuild_original_placeholders(
     protected: &GenericProtectedText,
     repaired: &LanguageText,
@@ -2523,6 +3926,103 @@ fn rebuild_original_placeholders(
     Ok(output)
 }
 
+fn rebuild_original_placeholders_with_cancellation(
+    protected: &GenericProtectedText,
+    repaired: &LanguageText,
+    cancellation: &CooperativeCancellation,
+) -> Result<Result<String, String>, GenericPlanningError> {
+    ensure_generic_response_processing_running(cancellation)?;
+    let mut output = String::new();
+    let mut placeholders = protected.placeholders().iter();
+    for segment in repaired.segments() {
+        ensure_generic_response_processing_running(cancellation)?;
+        match segment {
+            LanguageTextSegment::NaturalText(text) => {
+                append_generic_response_text(&mut output, text, cancellation)?;
+            }
+            LanguageTextSegment::OpaqueBoundary => {
+                let Some(placeholder) = placeholders.next() else {
+                    return Ok(Err("语言修复增加了 Placeholder 边界".to_owned()));
+                };
+                append_generic_response_text(&mut output, placeholder.original(), cancellation)?;
+            }
+        }
+    }
+    ensure_generic_response_processing_running(cancellation)?;
+    if placeholders.next().is_some() {
+        return Ok(Err("语言修复删除了 Placeholder 边界".to_owned()));
+    }
+    Ok(Ok(output))
+}
+
+fn ensure_generic_response_processing_running(
+    cancellation: &CooperativeCancellation,
+) -> Result<(), GenericPlanningError> {
+    if cancellation.is_requested() {
+        Err(GenericPlanningError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn append_generic_response_text(
+    output: &mut String,
+    text: &str,
+    cancellation: &CooperativeCancellation,
+) -> Result<(), GenericPlanningError> {
+    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
+
+    let mut start = 0_usize;
+    while start < text.len() {
+        ensure_generic_response_processing_running(cancellation)?;
+        let mut end = start
+            .saturating_add(CANCELLATION_CHECK_BYTES)
+            .min(text.len());
+        while end < text.len() && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        output.push_str(&text[start..end]);
+        start = end;
+    }
+    ensure_generic_response_processing_running(cancellation)
+}
+
+fn clone_generic_validation_result(
+    result: &Result<String, String>,
+    cancellation: &CooperativeCancellation,
+) -> Result<Result<String, String>, GenericPlanningError> {
+    let mut cloned = String::new();
+    match result {
+        Ok(value) => {
+            append_generic_response_text(&mut cloned, value, cancellation)?;
+            Ok(Ok(cloned))
+        }
+        Err(detail) => {
+            append_generic_response_text(&mut cloned, detail, cancellation)?;
+            Ok(Err(cloned))
+        }
+    }
+}
+
+fn contains_reserved_prefix_with_cancellation(
+    text: &str,
+    cancellation: &CooperativeCancellation,
+) -> Result<bool, GenericPlanningError> {
+    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
+    let prefix = placeholder_token::PREFIX.as_bytes();
+
+    for (index, window) in text.as_bytes().windows(prefix.len()).enumerate() {
+        if index.is_multiple_of(CANCELLATION_CHECK_BYTES) {
+            ensure_generic_response_processing_running(cancellation)?;
+        }
+        if window == prefix {
+            return Ok(true);
+        }
+    }
+    ensure_generic_response_processing_running(cancellation)?;
+    Ok(false)
+}
+
 fn add_commit_outcome(
     summary: &mut GenericTranslationSummary,
     outcome: &CommitTranslationsOutcome,
@@ -2531,6 +4031,7 @@ fn add_commit_outcome(
     summary.conflicted_units += outcome.conflicts.len();
 }
 
+#[cfg(test)]
 fn should_apply_translation_resources(
     current_terminology_json: &str,
     current_placeholder_rules_json: &str,
@@ -2566,7 +4067,14 @@ async fn load_additional_pem_roots(
         let file = file_system
             .read_file(path.to_path_buf())
             .await
-            .map_err(|source| GenericCommandError::operation("读取附加 PEM", source))?;
+            .map_err(|source| {
+                generic_read_file_failure(
+                    "读取附加 PEM",
+                    source,
+                    DiagnosticStage::CommandPreparation,
+                    DiagnosticAction::FixConfiguration,
+                )
+            })?;
         roots.push(file.into_bytes());
     }
     Ok(roots)
@@ -2617,6 +4125,7 @@ fn configure_generic_task_records(
     file_system_configuration: &crate::runtime::filesystem::SystemFileSystemConfig,
     client: crate::llm::LlmClientRecordMetadata,
     locale: UiLocale,
+    cpu: RayonCpuExecutor,
     project_workspace: &Path,
 ) -> ConfiguredTranslationTaskRecordSink {
     if !requested {
@@ -2645,6 +4154,7 @@ fn configure_generic_task_records(
                 run_id,
                 client,
                 locale,
+                cpu,
                 file_system,
                 logger,
             ),
@@ -2662,23 +4172,91 @@ fn generic_workspace(projects_root: &Path, project: &ProjectName) -> PathBuf {
         .join(project.as_str())
 }
 
-async fn run_blocking<T, E>(
+async fn run_project_blocking<T>(
     stage: &'static str,
-    operation: impl FnOnce() -> Result<T, E> + Send + 'static,
+    diagnostic_stage: DiagnosticStage,
+    impact: DiagnosticImpact,
+    fallback_action: DiagnosticAction,
+    operation: impl FnOnce() -> Result<T, GenericProjectError> + Send + 'static,
 ) -> Result<T, GenericCommandError>
 where
     T: Send + 'static,
-    E: Error + Send + Sync + 'static,
 {
-    tokio::task::spawn_blocking(operation)
+    let result = tokio::task::spawn_blocking(operation)
         .await
-        .map_err(|source| GenericCommandError::operation(stage, source))?
-        .map_err(|source| GenericCommandError::operation(stage, source))
+        .map_err(|source| GenericCommandError::operation(stage, source))?;
+    match result {
+        Ok(output) => Ok(output),
+        Err(source) if source.is_cancelled() => Err(GenericCommandError::Cancelled),
+        Err(source) => {
+            let diagnostic =
+                source.safe_diagnostic_source(diagnostic_stage, impact, fallback_action);
+            Err(GenericCommandError::diagnosed(stage, source, diagnostic))
+        }
+    }
+}
+
+async fn run_scratch_blocking<T>(
+    stage: &'static str,
+    operation: impl FnOnce() -> Result<T, GenericScratchError> + Send + 'static,
+) -> Result<T, GenericCommandError>
+where
+    T: Send + 'static,
+{
+    let result = tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|source| GenericCommandError::operation(stage, source))?;
+    match result {
+        Ok(output) => Ok(output),
+        Err(source) => Err(generic_scratch_command_error(stage, source)),
+    }
+}
+
+fn generic_scratch_command_error(
+    stage: &'static str,
+    source: GenericScratchError,
+) -> GenericCommandError {
+    if matches!(&source, GenericScratchError::Cancelled) {
+        return GenericCommandError::Cancelled;
+    }
+    if matches!(
+        &source,
+        GenericScratchError::CleanupAfterFailure { operation, .. }
+            if matches!(operation.as_ref(), GenericScratchError::Cancelled)
+    ) {
+        let GenericScratchError::CleanupAfterFailure { cleanup, .. } = source else {
+            unreachable!("上方模式已经确认取消后的清理失败");
+        };
+        let recovery_paths = scratch_cleanup_recovery_path(&cleanup)
+            .into_iter()
+            .collect();
+        return GenericCommandError::PublishDiscard {
+            operation: Box::new(GenericCommandError::Cancelled),
+            discard: cleanup.to_string(),
+            recovery_paths,
+        };
+    }
+    GenericCommandError::operation(stage, source)
+}
+
+fn scratch_cleanup_recovery_path(source: &GenericScratchError) -> Option<PathBuf> {
+    match source {
+        GenericScratchError::Io { path, .. } => Some(path.clone()),
+        GenericScratchError::UnsafeCleanupTarget { scratch_root, .. } => Some(scratch_root.clone()),
+        GenericScratchError::CleanupAfterFailure { cleanup, .. } => {
+            scratch_cleanup_recovery_path(cleanup)
+        }
+        GenericScratchError::Cancelled
+        | GenericScratchError::InvalidRelativePath(_)
+        | GenericScratchError::InvalidMaterializedFile { .. }
+        | GenericScratchError::TargetNotDirectory(_) => None,
+    }
 }
 
 enum Driven<T> {
     Finished(T),
     Interrupted(T),
+    CancellationWon(T),
     SignalFailed { source: io::Error, result: T },
 }
 
@@ -2707,6 +4285,44 @@ async fn drive<T>(
     }
 }
 
+/// WriteBack 的取消只有在目录发布根接管候选前才能生效。
+///
+/// `cancel` 返回 `false` 表示发布边界已经先发生；此时继续等待业务 future，并按它的真实
+/// 终态处理，而不是把已经开始的目录交换伪报为取消。
+async fn drive_write_back<T>(
+    future: impl Future<Output = T>,
+    termination_signals: &mut TerminationSignals,
+    cancel: impl FnOnce() -> bool,
+) -> Driven<T> {
+    tokio::pin!(future);
+    tokio::select! {
+        biased;
+        signal = termination_signals.recv() => match signal {
+            Ok(()) => {
+                let cancellation_started = cancel();
+                let result = future.await;
+                write_back_signal_result(cancellation_started, result)
+            }
+            Err(source) => {
+                let _ = cancel();
+                Driven::SignalFailed {
+                    source,
+                    result: future.await,
+                }
+            }
+        },
+        result = &mut future => Driven::Finished(result),
+    }
+}
+
+fn write_back_signal_result<T>(cancellation_started: bool, result: T) -> Driven<T> {
+    if cancellation_started {
+        Driven::CancellationWon(result)
+    } else {
+        Driven::Finished(result)
+    }
+}
+
 async fn drive_and_shutdown(
     operation: impl Future<Output = Result<GenericCommandOutput, GenericCommandError>>,
     termination_signals: &mut TerminationSignals,
@@ -2714,11 +4330,18 @@ async fn drive_and_shutdown(
     file_system: SystemFileSystem,
     mut shutdown_errors: Vec<GenericShutdownError>,
     project_log: GenericProjectLogSlot,
+    progress: GenericTerminalProgress,
 ) -> GenericCommandRunReport {
-    let driven = drive(operation, termination_signals, cancel).await;
+    let driven = drive(operation, termination_signals, || {
+        progress.safe_stopping();
+        cancel();
+    })
+    .await;
+    progress.finalizing();
     if let Err(source) = file_system.shutdown().await {
         shutdown_errors.push(GenericShutdownError::new("filesystem", source));
     }
+    progress.finish();
     GenericCommandRunReport::from_driven(
         driven,
         shutdown_errors,
@@ -2741,6 +4364,7 @@ impl GenericCommandRunReport {
         project_log: Option<ActiveProjectLog>,
     ) -> Self {
         let result = match driven {
+            // 信号到达后业务仍返回完整成功，说明事务或其他终态已经生效。
             Driven::Finished(Ok(output)) | Driven::Interrupted(Ok(output)) => {
                 GenericCommandRunResult::Succeeded(output)
             }
@@ -2758,12 +4382,28 @@ impl GenericCommandRunReport {
                     GenericCommandRunResult::Failed(error)
                 }
             }
-            Driven::SignalFailed { source, result } => {
-                GenericCommandRunResult::Failed(GenericCommandError::Signal {
-                    source,
-                    operation: result.err().map(Box::new),
-                })
+            // WriteBack 的发布门确认取消先于发布取得终态；即使内部 future
+            // 随后错误地返回成功，也不能把未发布候选报告为成功。
+            Driven::CancellationWon(Ok(_)) => GenericCommandRunResult::Interrupted,
+            Driven::CancellationWon(Err(error)) => {
+                if error.is_cancelled() {
+                    GenericCommandRunResult::Interrupted
+                } else {
+                    GenericCommandRunResult::Failed(error)
+                }
             }
+            Driven::SignalFailed { source, result } => match result {
+                Ok(_) => GenericCommandRunResult::Failed(GenericCommandError::Signal {
+                    source,
+                    operation: None,
+                    state_applied: true,
+                }),
+                Err(error) => GenericCommandRunResult::Failed(GenericCommandError::Signal {
+                    source,
+                    operation: Some(Box::new(error)),
+                    state_applied: false,
+                }),
+            },
         };
         let pending_project_log = project_log.map(|project_log| {
             let mut diagnostics = match &result {
@@ -2813,51 +4453,86 @@ async fn publish_generic_write_back(
     project_name: ProjectName,
     project: GenericProject,
     candidate: GenericWriteBackCandidate,
+    cancellation: CooperativeCancellation,
+    publication_gate: GenericWriteBackPublicationGate,
+    publication_started: impl FnOnce() + Send,
 ) -> Result<GenericCommandOutput, GenericCommandError> {
+    if cancellation.is_requested() {
+        return Err(GenericCommandError::Cancelled);
+    }
     let workspace_root = project.workspace_root().to_path_buf();
     let translated_units = candidate.translated_units();
     let retained_source_units = candidate.retained_source_units();
     let scratch_candidate = candidate;
     let scratch_workspace = workspace_root.clone();
-    let scratch_root = run_blocking("建立 Generic 写回暂存来源", move || {
-        materialize_write_back_source(&scratch_workspace, &scratch_candidate)
+    let materialize_cancellation = cancellation.clone();
+    let scratch_root = run_scratch_blocking("建立 Generic 写回暂存来源", move || {
+        materialize_write_back_source(
+            &scratch_workspace,
+            &scratch_candidate,
+            &materialize_cancellation,
+        )
     })
     .await?;
+    if cancellation.is_requested() {
+        return match cleanup_write_back_source(&workspace_root, &scratch_root) {
+            Ok(()) => Err(GenericCommandError::Cancelled),
+            Err(cleanup) => Err(GenericCommandError::PublishDiscard {
+                operation: Box::new(GenericCommandError::Cancelled),
+                discard: cleanup.to_string(),
+                recovery_paths: vec![scratch_root],
+            }),
+        };
+    }
 
     let target_root = project.write_back_root();
-    let publish_intent = publish_intent_for(&target_root)
-        .map_err(|source| GenericCommandError::operation("检查 Generic 写回目录", source))?;
-    let mapping = DirectorySourceMapping::new(scratch_root.clone(), PathBuf::new())
-        .map_err(|source| GenericCommandError::operation("建立 Generic 目录候选请求", source))?;
-    let request = DirectoryStageRequest::new(
-        target_root.clone(),
-        publish_intent,
-        vec![mapping],
-        Vec::new(),
-        Vec::new(),
-    )
-    .map_err(|source| GenericCommandError::operation("建立 Generic 目录候选请求", source))?;
+    let request = (|| {
+        let publish_intent = publish_intent_for(&target_root).map_err(|source| {
+            Box::new(GenericCommandError::operation(
+                "检查 Generic 写回目录",
+                source,
+            ))
+        })?;
+        let mapping = DirectorySourceMapping::new(scratch_root.clone(), PathBuf::new()).map_err(
+            |source| {
+                Box::new(GenericCommandError::operation(
+                    "建立 Generic 目录候选请求",
+                    source,
+                ))
+            },
+        )?;
+        DirectoryStageRequest::new(
+            target_root.clone(),
+            publish_intent,
+            vec![mapping],
+            Vec::new(),
+            Vec::new(),
+        )
+        .map_err(|source| {
+            Box::new(GenericCommandError::operation(
+                "建立 Generic 目录候选请求",
+                source,
+            ))
+        })
+    })()
+    .map_err(|operation| {
+        generic_scratch_handoff_failure(*operation, &workspace_root, &scratch_root)
+    })?;
 
     let staged = match publisher.prepare(request).await {
         Ok(staged) => staged,
         Err(source) => {
-            let cleanup = cleanup_write_back_source(&workspace_root, &scratch_root);
-            return match cleanup {
-                Ok(()) => Err(GenericCommandError::operation(
-                    "准备 Generic 写回候选",
-                    source,
-                )),
-                Err(cleanup) => Err(GenericCommandError::PublishDiscard {
-                    operation: Box::new(GenericCommandError::operation(
-                        "准备 Generic 写回候选",
-                        source,
-                    )),
-                    discard: cleanup.to_string(),
-                    recovery_paths: vec![scratch_root.clone()],
-                }),
-            };
+            return Err(generic_prepare_failure(
+                &cancellation,
+                source,
+                &workspace_root,
+                &scratch_root,
+            ));
         }
     };
+    if cancellation.is_requested() {
+        return discard_after_failure(&publisher, staged, GenericCommandError::Cancelled).await;
+    }
 
     if let Err(source) = cleanup_write_back_source(&workspace_root, &scratch_root) {
         let diagnostic = generic_operation_diagnostic("清理 Generic 写回暂存来源")
@@ -2866,15 +4541,31 @@ async fn publish_generic_write_back(
             GenericCommandError::diagnosed("清理 Generic 写回暂存来源", source, diagnostic);
         return discard_after_failure(&publisher, staged, operation).await;
     }
+    if cancellation.is_requested() {
+        return discard_after_failure(&publisher, staged, GenericCommandError::Cancelled).await;
+    }
 
-    if let Err(operation) = run_blocking("发布前复查 Generic 输入", move || {
-        ensure_input_fingerprints_current(&project)
-    })
+    let recheck_cancellation = cancellation.clone();
+    if let Err(operation) = run_project_blocking(
+        "发布前复查 Generic 输入",
+        DiagnosticStage::WriteBack,
+        DiagnosticImpact::Unchanged,
+        DiagnosticAction::FixInput,
+        move || {
+            ensure_input_fingerprints_current_with_cancellation(&project, &recheck_cancellation)
+        },
+    )
     .await
     {
         return discard_after_failure(&publisher, staged, operation).await;
     }
 
+    if cancellation.is_requested() {
+        let _ = publication_gate.request_cancellation();
+    }
+    if !begin_generic_write_back_publication(&publication_gate, publication_started) {
+        return discard_after_failure(&publisher, staged, GenericCommandError::Cancelled).await;
+    }
     publisher.publish(staged).await.map_err(|source| {
         let diagnostic = generic_publish_diagnostic(&source);
         GenericCommandError::diagnosed("发布 Generic 写回目录", source, diagnostic)
@@ -2885,6 +4576,62 @@ async fn publish_generic_write_back(
         translated_units,
         retained_source_units,
     })
+}
+
+fn generic_prepare_error(
+    cancellation: &CooperativeCancellation,
+    source: DirectoryPrepareError<Box<SystemFileSystemError>>,
+) -> GenericCommandError {
+    if cancellation.is_requested() && directory_prepare_cancelled_without_cleanup(&source) {
+        GenericCommandError::Cancelled
+    } else {
+        GenericCommandError::operation("准备 Generic 写回候选", source)
+    }
+}
+
+fn generic_prepare_failure(
+    cancellation: &CooperativeCancellation,
+    source: DirectoryPrepareError<Box<SystemFileSystemError>>,
+    workspace_root: &Path,
+    scratch_root: &Path,
+) -> GenericCommandError {
+    let operation = generic_prepare_error(cancellation, source);
+    generic_scratch_handoff_failure(operation, workspace_root, scratch_root)
+}
+
+fn generic_scratch_handoff_failure(
+    operation: GenericCommandError,
+    workspace_root: &Path,
+    scratch_root: &Path,
+) -> GenericCommandError {
+    match cleanup_write_back_source(workspace_root, scratch_root) {
+        Ok(()) => operation,
+        Err(cleanup) => GenericCommandError::PublishDiscard {
+            operation: Box::new(operation),
+            discard: cleanup.to_string(),
+            recovery_paths: vec![scratch_root.to_path_buf()],
+        },
+    }
+}
+
+fn directory_prepare_cancelled_without_cleanup(
+    source: &DirectoryPrepareError<Box<SystemFileSystemError>>,
+) -> bool {
+    match source {
+        DirectoryPrepareError::NotPrepared {
+            source,
+            cleanup_failure: None,
+            ..
+        } => matches!(
+            source.as_ref(),
+            SystemFileSystemError::Cancelled { .. }
+                | SystemFileSystemError::Windows(WindowsFsError::LockCancelled { .. })
+        ),
+        DirectoryPrepareError::NotPrepared {
+            cleanup_failure: Some(_),
+            ..
+        } => false,
+    }
 }
 
 fn generic_publish_diagnostic(
@@ -3017,17 +4764,22 @@ fn with_recovery_paths(mut diagnostic: SafeDiagnostic, paths: &[PathBuf]) -> Saf
 fn materialize_write_back_source(
     workspace_root: &Path,
     candidate: &GenericWriteBackCandidate,
+    cancellation: &CooperativeCancellation,
 ) -> Result<PathBuf, GenericScratchError> {
-    materialize_write_back_source_with(workspace_root, candidate, |path, bytes| {
-        fs::write(path, bytes)
+    materialize_write_back_source_with(workspace_root, candidate, cancellation, |path, bytes| {
+        write_file_with_cancellation(path, bytes, cancellation)
     })
 }
 
 fn materialize_write_back_source_with(
     workspace_root: &Path,
     candidate: &GenericWriteBackCandidate,
+    cancellation: &CooperativeCancellation,
     mut write_file: impl FnMut(&Path, &[u8]) -> io::Result<()>,
 ) -> Result<PathBuf, GenericScratchError> {
+    if cancellation.is_requested() {
+        return Err(GenericScratchError::Cancelled);
+    }
     let scratch_root = workspace_root.join(format!(
         "{WRITE_BACK_SCRATCH_PREFIX}{}",
         uuid::Uuid::new_v4()
@@ -3039,6 +4791,7 @@ fn materialize_write_back_source_with(
     })?;
 
     for file in candidate.files() {
+        ensure_materialization_not_cancelled(workspace_root, &scratch_root, cancellation)?;
         let relative = file.relative_path();
         if relative.as_os_str().is_empty()
             || relative.is_absolute()
@@ -3077,12 +4830,18 @@ fn materialize_write_back_source_with(
                 }),
             };
         }
+        ensure_materialization_not_cancelled(workspace_root, &scratch_root, cancellation)?;
         if let Err(source) = write_file(&target, file.bytes()) {
-            let operation = GenericScratchError::Io {
-                operation: "写入暂存 JSONL",
-                path: target,
-                source,
-            };
+            let operation =
+                if cancellation.is_requested() && source.kind() == io::ErrorKind::Interrupted {
+                    GenericScratchError::Cancelled
+                } else {
+                    GenericScratchError::Io {
+                        operation: "写入暂存 JSONL",
+                        path: target,
+                        source,
+                    }
+                };
             return match cleanup_write_back_source(workspace_root, &scratch_root) {
                 Ok(()) => Err(operation),
                 Err(cleanup) => Err(GenericScratchError::CleanupAfterFailure {
@@ -3091,14 +4850,20 @@ fn materialize_write_back_source_with(
                 }),
             };
         }
-        let materialized_bytes = match fs::read(&target) {
+        ensure_materialization_not_cancelled(workspace_root, &scratch_root, cancellation)?;
+        let materialized_bytes = match read_file_with_cancellation(&target, cancellation) {
             Ok(bytes) => bytes,
             Err(source) => {
-                let operation = GenericScratchError::Io {
-                    operation: "读回暂存 JSONL",
-                    path: target,
-                    source,
-                };
+                let operation =
+                    if cancellation.is_requested() && source.kind() == io::ErrorKind::Interrupted {
+                        GenericScratchError::Cancelled
+                    } else {
+                        GenericScratchError::Io {
+                            operation: "读回暂存 JSONL",
+                            path: target,
+                            source,
+                        }
+                    };
                 return match cleanup_write_back_source(workspace_root, &scratch_root) {
                     Ok(()) => Err(operation),
                     Err(cleanup) => Err(GenericScratchError::CleanupAfterFailure {
@@ -3108,10 +4873,19 @@ fn materialize_write_back_source_with(
                 };
             }
         };
-        if let Err(source) = validate_materialized_write_back_file(file, materialized_bytes) {
-            let operation = GenericScratchError::InvalidMaterializedFile {
-                path: target,
-                source: Box::new(source),
+        ensure_materialization_not_cancelled(workspace_root, &scratch_root, cancellation)?;
+        if let Err(source) = validate_materialized_write_back_file_with_cancellation(
+            file,
+            materialized_bytes,
+            cancellation,
+        ) {
+            let operation = if source.is_cancelled() {
+                GenericScratchError::Cancelled
+            } else {
+                GenericScratchError::InvalidMaterializedFile {
+                    path: target,
+                    source: Box::new(source),
+                }
             };
             return match cleanup_write_back_source(workspace_root, &scratch_root) {
                 Ok(()) => Err(operation),
@@ -3122,7 +4896,88 @@ fn materialize_write_back_source_with(
             };
         }
     }
+    ensure_materialization_not_cancelled(workspace_root, &scratch_root, cancellation)?;
     Ok(scratch_root)
+}
+
+fn write_file_with_cancellation(
+    path: &Path,
+    bytes: &[u8],
+    cancellation: &CooperativeCancellation,
+) -> io::Result<()> {
+    const CHUNK_BYTES: usize = 64 * 1024;
+
+    let mut file = fs::File::create(path)?;
+    for chunk in bytes.chunks(CHUNK_BYTES) {
+        if cancellation.is_requested() {
+            return Err(io::Error::from(io::ErrorKind::Interrupted));
+        }
+        io::Write::write_all(&mut file, chunk)?;
+    }
+    if cancellation.is_requested() {
+        Err(io::Error::from(io::ErrorKind::Interrupted))
+    } else {
+        Ok(())
+    }
+}
+
+fn read_file_with_cancellation(
+    path: &Path,
+    cancellation: &CooperativeCancellation,
+) -> io::Result<Vec<u8>> {
+    const CHUNK_BYTES: usize = 64 * 1024;
+
+    let mut file = fs::File::open(path)?;
+    let capacity = file
+        .metadata()
+        .ok()
+        .and_then(|metadata| usize::try_from(metadata.len()).ok())
+        .unwrap_or_default();
+    let mut output = Vec::with_capacity(capacity);
+    let mut buffer = [0_u8; CHUNK_BYTES];
+    loop {
+        if cancellation.is_requested() {
+            return Err(io::Error::from(io::ErrorKind::Interrupted));
+        }
+        let read = loop {
+            match io::Read::read(&mut file, &mut buffer) {
+                Err(source)
+                    if source.kind() == io::ErrorKind::Interrupted
+                        && !cancellation.is_requested() =>
+                {
+                    continue;
+                }
+                result => break result?,
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        output.extend_from_slice(&buffer[..read]);
+    }
+    if cancellation.is_requested() {
+        Err(io::Error::from(io::ErrorKind::Interrupted))
+    } else {
+        Ok(output)
+    }
+}
+
+fn ensure_materialization_not_cancelled(
+    workspace_root: &Path,
+    scratch_root: &Path,
+    cancellation: &CooperativeCancellation,
+) -> Result<(), GenericScratchError> {
+    if !cancellation.is_requested() {
+        return Ok(());
+    }
+    let operation = GenericScratchError::Cancelled;
+    match cleanup_write_back_source(workspace_root, scratch_root) {
+        Ok(()) => Err(operation),
+        Err(cleanup) => Err(GenericScratchError::CleanupAfterFailure {
+            operation: Box::new(operation),
+            cleanup: Box::new(cleanup),
+        }),
+    }
 }
 
 fn cleanup_write_back_source(
@@ -3193,6 +5048,7 @@ where
 
 #[derive(Debug)]
 enum GenericScratchError {
+    Cancelled,
     InvalidRelativePath(PathBuf),
     InvalidMaterializedFile {
         path: PathBuf,
@@ -3217,6 +5073,7 @@ enum GenericScratchError {
 impl fmt::Display for GenericScratchError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled => formatter.write_str("Generic 写回暂存已取消"),
             Self::InvalidRelativePath(path) => {
                 write!(
                     formatter,
@@ -3261,7 +5118,8 @@ impl Error for GenericScratchError {
             Self::Io { source, .. } => Some(source),
             Self::InvalidMaterializedFile { source, .. } => Some(source.as_ref()),
             Self::CleanupAfterFailure { operation, .. } => Some(operation.as_ref()),
-            Self::InvalidRelativePath(_)
+            Self::Cancelled
+            | Self::InvalidRelativePath(_)
             | Self::TargetNotDirectory(_)
             | Self::UnsafeCleanupTarget { .. } => None,
         }
@@ -3271,6 +5129,8 @@ impl Error for GenericScratchError {
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::{Barrier, Condvar, mpsc};
 
     use crate::generic::{
         GenericPlaceholderRuleDefinition, automatic_translation_state_fingerprint,
@@ -3285,6 +5145,653 @@ mod tests {
 
     fn fingerprint(byte: u8) -> Sha256Fingerprint {
         Sha256Fingerprint::from_bytes([byte; 32])
+    }
+
+    struct BlockingLanguageModule {
+        inner: JapaneseLanguageModule,
+        started: Mutex<Option<mpsc::SyncSender<()>>>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+        analysis_count: Arc<AtomicUsize>,
+    }
+
+    impl LanguageModule for BlockingLanguageModule {
+        fn semantic_fingerprint(&self) -> Sha256Fingerprint {
+            self.inner.semantic_fingerprint()
+        }
+
+        fn analyze_source(&self, text: &LanguageText) -> LanguageAnalysis {
+            self.analysis_count.fetch_add(1, Ordering::AcqRel);
+            if let Some(started) = self.started.lock().expect("开始信号锁不应中毒").take()
+            {
+                started.send(()).expect("测试线程必须等待语言分析开始");
+            }
+            let (released, release_signal) = self.release.as_ref();
+            let released = released.lock().expect("释放信号锁不应中毒");
+            drop(
+                release_signal
+                    .wait_while(released, |released| !*released)
+                    .expect("释放信号锁不应中毒"),
+            );
+            self.inner.analyze_source(text)
+        }
+
+        fn find_source_residual(
+            &self,
+            analysis: &LanguageAnalysis,
+            translation: &LanguageText,
+        ) -> Result<Option<crate::language::LanguageResidual>, crate::language::LanguageModuleError>
+        {
+            self.inner.find_source_residual(analysis, translation)
+        }
+
+        fn plan_translation_repair(
+            &self,
+            analysis: &LanguageAnalysis,
+            translation: &LanguageText,
+        ) -> Result<crate::language::LanguageRepairPlan, crate::language::LanguageModuleError>
+        {
+            self.inner.plan_translation_repair(analysis, translation)
+        }
+    }
+
+    #[test]
+    fn received_signal_after_lua_commit_preserves_successful_terminal_state() {
+        let mut connection = Connection::open_in_memory().expect("应该建立测试数据库");
+        connection
+            .execute_batch("CREATE TABLE committed(value INTEGER NOT NULL);")
+            .expect("应该建立测试表");
+        let transaction = connection.transaction().expect("应该开始事务");
+        transaction
+            .execute("INSERT INTO committed(value) VALUES (1)", [])
+            .expect("脚本事务应该写入");
+        transaction.commit().expect("脚本事务应该提交");
+
+        let report = GenericCommandRunReport::from_driven(
+            Driven::Interrupted(Ok(GenericCommandOutput::Lua {
+                project: "signal-race".parse().expect("项目名应该有效"),
+            })),
+            Vec::new(),
+            None,
+        );
+
+        assert!(matches!(
+            report.result,
+            GenericCommandRunResult::Succeeded(GenericCommandOutput::Lua { .. })
+        ));
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM committed", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("应该读取已提交事务"),
+            1,
+            "信号晚到不能把已经提交的 Lua 事务伪报为取消"
+        );
+    }
+
+    #[test]
+    fn signal_receiver_failure_after_applied_state_reports_applied_impact() {
+        let report = GenericCommandRunReport::from_driven(
+            Driven::SignalFailed {
+                source: io::Error::other("signal receiver failed"),
+                result: Ok(GenericCommandOutput::Lua {
+                    project: "signal-failure".parse().expect("项目名应该有效"),
+                }),
+            },
+            Vec::new(),
+            None,
+        );
+
+        let GenericCommandRunResult::Failed(error) = report.result else {
+            panic!("信号接收失败仍应报告运行失败");
+        };
+        assert_eq!(
+            error.safe_diagnostic().impact,
+            DiagnosticImpact::StateAppliedFinalizationFailed
+        );
+    }
+
+    #[test]
+    fn requested_cancellation_stops_operation_before_first_side_effect() {
+        let cancellation = CooperativeCancellation::default();
+        cancellation.request();
+        let side_effect_observed = AtomicBool::new(false);
+
+        let result = (|| {
+            ensure_generic_operation_running(&cancellation).map_err(Box::new)?;
+            side_effect_observed.store(true, Ordering::Release);
+            Ok::<_, Box<GenericOperationCancelled>>(())
+        })();
+
+        let error =
+            GenericCommandError::from(*result.expect_err("操作首次执行时必须观察已有取消请求"));
+        assert!(!side_effect_observed.load(Ordering::Acquire));
+        let report =
+            GenericCommandRunReport::from_driven(Driven::Finished(Err(error)), Vec::new(), None);
+        assert!(matches!(
+            report.result,
+            GenericCommandRunResult::Interrupted
+        ));
+    }
+
+    #[test]
+    fn running_cpu_preparation_cancellation_becomes_interrupted() {
+        let temporary = tempfile::tempdir().expect("应该可建立临时目录");
+        let source_root = temporary.path().join("source");
+        fs::create_dir(&source_root).expect("应该可建立输入目录");
+        let group_count = rayon::current_num_threads().saturating_mul(4).max(8);
+        let mut input = String::new();
+        for index in 0..group_count {
+            input.push_str(&format!(
+                "{{\"id\":\"group-{index}\",\"kind\":\"dialogue\",\"units\":[\
+                 {{\"id\":\"unit-{index}\",\"text\":\"こんにちは\"}}]}}\n"
+            ));
+        }
+        fs::write(source_root.join("scene.jsonl"), input).expect("应该可写入 Generic 输入");
+        let (store, _) = GenericProjectStore::initialize(GenericInitRequest {
+            project_name: "cpu-cancel".parse().expect("项目名应该合法"),
+            workspace_root: temporary.path().join("project"),
+            source_root: Some(source_root),
+            source_language: Some(LanguageId::parse("ja").expect("源语言应该合法")),
+            target_language: Some(LanguageId::parse("zh-Hans").expect("目标语言应该合法")),
+        })
+        .expect("Generic 项目应该可初始化");
+        store.extract().expect("Generic 输入应该可提取");
+        let snapshot = store.load_snapshot().expect("应该可读取 Generic 快照");
+        let rules = GenericPlaceholderService::default()
+            .compile(Vec::new())
+            .expect("空 Placeholder 规则应该合法");
+        let terminology = Arc::new(CompiledTerminology::empty());
+        let (started_sender, started_receiver) = mpsc::sync_channel(0);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let analysis_count = Arc::new(AtomicUsize::new(0));
+        let language_module: Arc<dyn LanguageModule> = Arc::new(BlockingLanguageModule {
+            inner: JapaneseLanguageModule::new(
+                JapaneseResidualPolicy::new(NonZeroUsize::MIN, Vec::new())
+                    .expect("日文残留策略应该合法"),
+                None,
+            ),
+            started: Mutex::new(Some(started_sender)),
+            release: Arc::clone(&release),
+            analysis_count: Arc::clone(&analysis_count),
+        });
+        let cancellation = CooperativeCancellation::default();
+        let operation_cancellation = cancellation.clone();
+        let operation = std::thread::spawn(move || {
+            prepare_generic_translation(
+                &snapshot,
+                terminology,
+                &rules,
+                language_module,
+                AutomaticStateResources {
+                    prompt: fingerprint(1),
+                    client_semantics: fingerprint(2),
+                    language_module: fingerprint(3),
+                    terminology_hits: empty_terminology_fingerprint(),
+                },
+                NonZeroUsize::new(10_000).expect("常量应该非零"),
+                &operation_cancellation,
+            )
+        });
+
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("CPU 工作必须先进入语言分析");
+        cancellation.request();
+        let (released, release_signal) = release.as_ref();
+        *released.lock().expect("释放信号锁不应中毒") = true;
+        release_signal.notify_all();
+        let source = operation
+            .join()
+            .expect("CPU 测试线程不应 panic")
+            .err()
+            .expect("运行中的 CPU 工作必须观察取消");
+        assert!(source.is_cancelled());
+
+        let error = generic_preparation_failure("建立 Generic 翻译计划", source);
+        let report =
+            GenericCommandRunReport::from_driven(Driven::Finished(Err(error)), Vec::new(), None);
+        assert!(matches!(
+            report.result,
+            GenericCommandRunResult::Interrupted
+        ));
+        assert!(
+            analysis_count.load(Ordering::Acquire) < group_count,
+            "取消后不得继续遍历剩余 Group"
+        );
+    }
+
+    #[test]
+    fn cancelled_cpu_schedule_becomes_interrupted() {
+        let source: CpuTaskExecutionError<CpuExecutorUnavailable> =
+            CpuTaskExecutionError::Cancelled;
+        let error = generic_cpu_execution_failure("调度 Generic 翻译计划", source);
+        let report =
+            GenericCommandRunReport::from_driven(Driven::Finished(Err(error)), Vec::new(), None);
+
+        assert!(matches!(
+            report.result,
+            GenericCommandRunResult::Interrupted
+        ));
+    }
+
+    #[test]
+    fn cancelled_lease_file_and_resource_boundaries_become_interrupted() {
+        fn assert_interrupted(error: GenericCommandError) {
+            let report = GenericCommandRunReport::from_driven(
+                Driven::Finished(Err(error)),
+                Vec::new(),
+                None,
+            );
+            assert!(matches!(
+                report.result,
+                GenericCommandRunResult::Interrupted
+            ));
+        }
+
+        let cancelled_fs = || SystemFileSystemError::Cancelled {
+            operation: "test_wait",
+            path: PathBuf::from("cancelled"),
+        };
+        assert_interrupted(generic_project_lease_failure(
+            ProjectCommandLeaseError::Unavailable {
+                project: "lease-cancel".parse().expect("项目名应该合法"),
+                source: Box::new(cancelled_fs()),
+            },
+        ));
+        assert_interrupted(generic_read_file_failure(
+            "读取 Lua 脚本",
+            ReadFileError::Io {
+                path: PathBuf::from("script.lua"),
+                source: cancelled_fs(),
+            },
+            DiagnosticStage::CommandPreparation,
+            DiagnosticAction::FixInput,
+        ));
+        assert_interrupted(generic_prompt_resource_failure(
+            "读取 Generic system Prompt",
+            PromptResourceLoadError::Read(ReadFileError::Io {
+                path: PathBuf::from("system.md"),
+                source: SystemFileSystemError::Windows(WindowsFsError::LockCancelled {
+                    path: PathBuf::from("system.md"),
+                }),
+            }),
+        ));
+        assert_interrupted(generic_translation_resource_failure(
+            TranslationPlanningResourceReadingError::ReadTerminology {
+                path: PathBuf::from("terms.json"),
+                source: ReadFileError::Io {
+                    path: PathBuf::from("terms.json"),
+                    source: cancelled_fs(),
+                },
+            },
+        ));
+        assert_interrupted(generic_translation_resource_failure(
+            TranslationPlanningResourceReadingError::ParsePlaceholderRulesCompute {
+                path: None,
+                source: CpuTaskExecutionError::Cancelled,
+            },
+        ));
+    }
+
+    #[test]
+    fn translation_resource_worker_start_is_an_internal_failure() {
+        type ResourceError =
+            TranslationPlanningResourceReadingError<SystemFileSystemError, CpuExecutorUnavailable>;
+
+        let failures = [
+            ResourceError::InvalidTerminology {
+                path: Some(PathBuf::from("terms.toml")),
+                source: TerminologyDefinitionError::StartWorker {
+                    operation: "att-term-matcher",
+                    source: io::Error::from_raw_os_error(8),
+                },
+            },
+            ResourceError::InvalidPlaceholderRules {
+                path: Some(PathBuf::from("placeholders.toml")),
+                source: PlaceholderDefinitionError::StartWorker {
+                    operation: "att-placeholder-toml",
+                    source: io::Error::from_raw_os_error(8),
+                },
+            },
+        ];
+
+        for source in failures {
+            let GenericCommandError::Operation { diagnostic, .. } =
+                generic_translation_resource_failure(source)
+            else {
+                panic!("worker 启动失败必须保留为普通失败");
+            };
+            assert_eq!(diagnostic.code, DiagnosticCode::InternalOperation);
+            assert!(matches!(
+                diagnostic.reason,
+                DiagnosticReason::Io {
+                    raw_os_code: Some(8),
+                    ..
+                }
+            ));
+            assert_eq!(diagnostic.action, DiagnosticAction::ReportBug);
+        }
+    }
+
+    #[test]
+    fn lease_cleanup_failure_is_not_hidden_as_cancellation() {
+        let error = generic_project_lease_failure(ProjectCommandLeaseError::Unavailable {
+            project: "lease-cleanup".parse().expect("项目名应该合法"),
+            source: Box::new(SystemFileSystemError::DirectChildRollbackFailed {
+                path: PathBuf::from("lease"),
+                operation: Box::new(SystemFileSystemError::Cancelled {
+                    operation: "lease",
+                    path: PathBuf::from("lease"),
+                }),
+                rollback: Box::new(SystemFileSystemError::Io {
+                    operation: "rollback",
+                    path: PathBuf::from("lease"),
+                    source: io::Error::from_raw_os_error(5),
+                }),
+            }),
+        });
+
+        assert!(matches!(error, GenericCommandError::Operation { .. }));
+    }
+
+    #[tokio::test]
+    async fn real_project_lease_wait_cancellation_becomes_interrupted() {
+        let temporary = tempfile::tempdir().expect("应该可建立临时目录");
+        let projects_root = temporary.path().join("projects");
+        let owner_file_system =
+            SystemFileSystem::new(crate::runtime::filesystem::SystemFileSystemConfig::production())
+                .expect("应该可建立租约所有者文件能力");
+        let contender_file_system =
+            SystemFileSystem::new(crate::runtime::filesystem::SystemFileSystemConfig::production())
+                .expect("应该可建立租约竞争者文件能力");
+        let owner = ProjectCommandLeaseService::new(
+            projects_root.clone(),
+            GENERIC_ENGINE_NAME,
+            owner_file_system.clone(),
+        );
+        let contender = ProjectCommandLeaseService::new(
+            projects_root,
+            GENERIC_ENGINE_NAME,
+            contender_file_system.clone(),
+        );
+        let project: ProjectName = "lease-race".parse().expect("项目名应该合法");
+        let held = owner
+            .acquire(&project)
+            .await
+            .expect("所有者应该取得项目租约");
+        let waiting_project = project.clone();
+        let waiting = tokio::spawn(async move { contender.acquire(&waiting_project).await });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!waiting.is_finished(), "竞争者应该等待真实项目租约");
+
+        contender_file_system.cancel_waits();
+        let source = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("取消应该及时唤醒租约等待")
+            .expect("租约竞争任务不应 panic")
+            .err()
+            .expect("取消后不得取得项目租约");
+        let error = generic_project_lease_failure(source);
+        let report =
+            GenericCommandRunReport::from_driven(Driven::Interrupted(Err(error)), Vec::new(), None);
+        assert!(matches!(
+            report.result,
+            GenericCommandRunResult::Interrupted
+        ));
+
+        drop(held);
+        contender_file_system
+            .shutdown()
+            .await
+            .expect("竞争者文件能力应该可终结");
+        owner_file_system
+            .shutdown()
+            .await
+            .expect("所有者文件能力应该可终结");
+    }
+
+    #[test]
+    fn write_back_publication_gate_allows_exactly_one_terminal_decision() {
+        let cancelled_first = GenericWriteBackPublicationGate::default();
+        assert!(cancelled_first.request_cancellation());
+        assert!(!cancelled_first.begin_publication());
+
+        let published_first = GenericWriteBackPublicationGate::default();
+        assert!(published_first.begin_publication());
+        assert!(!published_first.request_cancellation());
+
+        for _ in 0..32 {
+            let gate = GenericWriteBackPublicationGate::default();
+            let barrier = Arc::new(Barrier::new(3));
+            let cancellation_gate = gate.clone();
+            let cancellation_barrier = Arc::clone(&barrier);
+            let cancellation = std::thread::spawn(move || {
+                cancellation_barrier.wait();
+                cancellation_gate.request_cancellation()
+            });
+            let publication_gate = gate;
+            let publication_barrier = Arc::clone(&barrier);
+            let publication = std::thread::spawn(move || {
+                publication_barrier.wait();
+                publication_gate.begin_publication()
+            });
+            barrier.wait();
+
+            let cancellation_won = cancellation.join().expect("取消竞争线程不应 panic");
+            let publication_won = publication.join().expect("发布竞争线程不应 panic");
+            assert_ne!(
+                cancellation_won, publication_won,
+                "取消与发布必须恰好一个取得终态决定"
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_publication_gate_does_not_report_or_enter_publishing() {
+        let gate = GenericWriteBackPublicationGate::default();
+        assert!(gate.request_cancellation());
+        let observed = Arc::new(AtomicBool::new(false));
+        let callback_observed = Arc::clone(&observed);
+
+        let began_publication = begin_generic_write_back_publication(&gate, move || {
+            callback_observed.store(true, Ordering::Release);
+        });
+
+        assert!(!began_publication);
+        assert!(!observed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn write_back_signal_after_publication_keeps_the_real_terminal_result() {
+        let output = GenericCommandOutput::Lua {
+            project: "published-before-signal".parse().expect("项目名应该有效"),
+        };
+        let report = GenericCommandRunReport::from_driven(
+            write_back_signal_result(false, Ok(output)),
+            Vec::new(),
+            None,
+        );
+        assert!(matches!(
+            report.result,
+            GenericCommandRunResult::Succeeded(GenericCommandOutput::Lua { .. })
+        ));
+
+        let cancelled = GenericCommandRunReport::from_driven(
+            write_back_signal_result(
+                true,
+                Ok(GenericCommandOutput::Lua {
+                    project: "cancelled-before-publish".parse().expect("项目名应该有效"),
+                }),
+            ),
+            Vec::new(),
+            None,
+        );
+        assert!(matches!(
+            cancelled.result,
+            GenericCommandRunResult::Interrupted
+        ));
+    }
+
+    #[test]
+    fn cancelled_directory_prepare_maps_to_interrupted_without_cleanup_failure() {
+        let cancellation = CooperativeCancellation::default();
+        cancellation.request();
+        let error = generic_prepare_error(
+            &cancellation,
+            DirectoryPrepareError::NotPrepared {
+                target_root: PathBuf::from("write_back"),
+                source: Box::new(SystemFileSystemError::Cancelled {
+                    operation: "prepare_directory_candidate",
+                    path: PathBuf::from("write_back"),
+                }),
+                cleanup_failure: None,
+            },
+        );
+        assert!(error.is_cancelled());
+
+        let report =
+            GenericCommandRunReport::from_driven(Driven::Interrupted(Err(error)), Vec::new(), None);
+        assert!(matches!(
+            report.result,
+            GenericCommandRunResult::Interrupted
+        ));
+    }
+
+    #[tokio::test]
+    async fn real_publish_lock_cancellation_maps_to_interrupted_and_removes_scratch() {
+        let temporary = tempfile::tempdir().expect("应该可建立临时目录");
+        let source_root = temporary.path().join("source");
+        fs::create_dir(&source_root).expect("应该可建立候选来源");
+        fs::write(source_root.join("source.jsonl"), b"source").expect("应该可建立候选文件");
+        let target_root = temporary.path().join("write_back");
+        let lock_directory = temporary.path().join("publish-locks");
+        let publisher_config =
+            crate::runtime::filesystem::DirectoryPublisherConfig::production(lock_directory)
+                .expect("发布锁配置应该合法");
+        let owner_file_system =
+            SystemFileSystem::new(crate::runtime::filesystem::SystemFileSystemConfig::production())
+                .expect("应该可建立锁所有者文件能力");
+        let contender_file_system =
+            SystemFileSystem::new(crate::runtime::filesystem::SystemFileSystemConfig::production())
+                .expect("应该可建立锁竞争者文件能力");
+        let owner = owner_file_system.directory_publisher(publisher_config.clone());
+        let contender = contender_file_system.directory_publisher(publisher_config);
+        let stage_request = || {
+            let mapping = DirectorySourceMapping::new(source_root.clone(), PathBuf::new())
+                .expect("候选来源映射应该合法");
+            DirectoryStageRequest::new(
+                target_root.clone(),
+                DirectoryPublishIntent::CreateNew,
+                vec![mapping],
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("候选请求应该合法")
+        };
+        let staged = owner
+            .prepare(stage_request())
+            .await
+            .expect("所有者应该持有目标发布锁");
+
+        let waiting = tokio::spawn({
+            let contender = contender.clone();
+            let request = stage_request();
+            async move { contender.prepare(request).await }
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!waiting.is_finished(), "竞争者应该持续等待真实目标锁");
+
+        let workspace_root = temporary.path().join("project");
+        fs::create_dir(&workspace_root).expect("应该可建立项目工作区");
+        let scratch_root = workspace_root.join(".generic-write-back-cancelled");
+        fs::create_dir(&scratch_root).expect("应该可建立待清理 scratch");
+        fs::write(scratch_root.join("residual"), b"candidate").expect("应该可建立 scratch 内容");
+        let cancellation = CooperativeCancellation::default();
+        cancellation.request();
+        contender_file_system.cancel_waits();
+        let prepare_result = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("取消应该及时唤醒发布锁等待")
+            .expect("竞争任务不应 panic");
+        let prepare_error = match prepare_result {
+            Ok(_) => panic!("取消后不得伪造候选已准备"),
+            Err(error) => error,
+        };
+        assert!(directory_prepare_cancelled_without_cleanup(&prepare_error));
+
+        let error =
+            generic_prepare_failure(&cancellation, prepare_error, &workspace_root, &scratch_root);
+        assert!(error.is_cancelled());
+        assert!(!scratch_root.exists(), "受控取消后必须删除 scratch");
+        let report =
+            GenericCommandRunReport::from_driven(Driven::Interrupted(Err(error)), Vec::new(), None);
+        assert!(matches!(
+            report.result,
+            GenericCommandRunResult::Interrupted
+        ));
+
+        owner.discard(staged).await.expect("应该可丢弃所有者候选");
+        contender_file_system
+            .shutdown()
+            .await
+            .expect("竞争者文件能力应该可终结");
+        owner_file_system
+            .shutdown()
+            .await
+            .expect("所有者文件能力应该可终结");
+    }
+
+    #[test]
+    fn cancelled_directory_prepare_with_cleanup_failure_remains_a_failure() {
+        let cancellation = CooperativeCancellation::default();
+        cancellation.request();
+        let error = generic_prepare_error(
+            &cancellation,
+            DirectoryPrepareError::NotPrepared {
+                target_root: PathBuf::from("write_back"),
+                source: Box::new(SystemFileSystemError::Cancelled {
+                    operation: "prepare_directory_candidate",
+                    path: PathBuf::from("write_back"),
+                }),
+                cleanup_failure: Some(StagingCleanupFailure::new(
+                    PathBuf::from("candidate"),
+                    Box::new(SystemFileSystemError::Cancelled {
+                        operation: "cleanup_directory_candidate",
+                        path: PathBuf::from("candidate"),
+                    }),
+                )),
+            },
+        );
+        assert!(!error.is_cancelled());
+        assert!(matches!(error, GenericCommandError::Operation { .. }));
+    }
+
+    #[test]
+    fn cancelled_scratch_cleanup_failure_keeps_primary_and_recovery_path() {
+        let scratch_root = PathBuf::from("project/.generic-write-back-test");
+        let error = generic_scratch_command_error(
+            "建立 Generic 写回暂存来源",
+            GenericScratchError::CleanupAfterFailure {
+                operation: Box::new(GenericScratchError::Cancelled),
+                cleanup: Box::new(GenericScratchError::Io {
+                    operation: "删除暂存来源",
+                    path: scratch_root.clone(),
+                    source: io::Error::from_raw_os_error(5),
+                }),
+            },
+        );
+
+        match error {
+            GenericCommandError::PublishDiscard {
+                operation,
+                recovery_paths,
+                ..
+            } => {
+                assert!(operation.is_cancelled());
+                assert_eq!(recovery_paths, vec![scratch_root]);
+            }
+            other => panic!("取消后的清理失败必须保留双错误，实际为 {other}"),
+        }
     }
 
     #[test]
@@ -3358,6 +5865,59 @@ mod tests {
             diagnostic.recovery,
             vec![RecoveryFact::transaction("rolled_back")]
         );
+    }
+
+    #[test]
+    fn project_lua_worker_start_is_internal_during_preflight_and_execution() {
+        let source = ProjectLuaFailure::Host {
+            domain: "isolated_worker",
+            kind: "worker_spawn",
+            operation: "compile_project_lua",
+            message: "worker-start-detail-sentinel".to_owned(),
+        };
+        let detail = source.to_string();
+
+        for stage in [DiagnosticStage::CommandPreparation, DiagnosticStage::Lua] {
+            let diagnostic = project_lua_failure_diagnostic(&source, stage, &detail);
+
+            assert_eq!(diagnostic.code, DiagnosticCode::InternalOperation);
+            assert_eq!(diagnostic.stage, stage);
+            assert_eq!(
+                diagnostic.subject,
+                DiagnosticSubject::operation("compile_project_lua")
+            );
+            assert_eq!(
+                diagnostic.reason,
+                DiagnosticReason::FailureWithDetail {
+                    failure: DiagnosticFailureKind::WorkerSpawnFailed,
+                    detail: detail.clone(),
+                }
+            );
+            assert_eq!(diagnostic.action, DiagnosticAction::ReportBug);
+        }
+    }
+
+    #[test]
+    fn other_project_lua_host_failures_remain_user_input_failures() {
+        let source = ProjectLuaFailure::Host {
+            domain: "translation",
+            kind: "invalid_translation",
+            operation: "translation.set",
+            message: "host-detail-sentinel".to_owned(),
+        };
+        let detail = source.to_string();
+
+        let diagnostic = project_lua_failure_diagnostic(&source, DiagnosticStage::Lua, &detail);
+
+        assert_eq!(diagnostic.code, DiagnosticCode::LuaExecution);
+        assert_eq!(
+            diagnostic.reason,
+            DiagnosticReason::FailureWithDetail {
+                failure: DiagnosticFailureKind::LuaHostCallFailed,
+                detail,
+            }
+        );
+        assert_eq!(diagnostic.action, DiagnosticAction::FixInput);
     }
 
     #[test]
@@ -3449,6 +6009,7 @@ mod tests {
             language_module,
             resources,
             NonZeroUsize::new(10_000).expect("常量应该非零"),
+            &CooperativeCancellation::default(),
         )
         .expect("翻译任务应该可规划");
         let message = render_generic_user_message(&prepared.plan.tasks()[0], terminology.as_ref());
@@ -3547,6 +6108,7 @@ mod tests {
                 terminology_hits: empty_terminology_fingerprint(),
             },
             target,
+            &CooperativeCancellation::default(),
         )
         .expect("翻译任务应该可规划");
 
@@ -3655,15 +6217,30 @@ mod tests {
             .expect("应该可保存测试译文");
         let (stored, live) = store.ensure_input_current().expect("输入应该仍为 Current");
         let terminology = CompiledTerminology::empty();
-        let current = collect_generic_current_translations(&stored, &terminology, &rules, None)
-            .expect("人工 Current 应可独立计算");
+        let current = collect_generic_current_translations(
+            &stored,
+            &terminology,
+            &rules,
+            None,
+            &CooperativeCancellation::default(),
+        )
+        .expect("人工 Current 应可独立计算");
+        let manual_key = GenericUnitKey::new("group".to_owned(), "manual".to_owned());
         assert_eq!(
             current
-                .get(&("group".to_owned(), "manual".to_owned()))
+                .get_with_cancellation(&manual_key, || { Ok::<_, std::convert::Infallible>(()) })
+                .unwrap_or_else(|never| match never {})
                 .map(String::as_str),
             Some("人工译文")
         );
-        assert!(!current.contains_key(&("group".to_owned(), "automatic".to_owned())));
+        let automatic_key = GenericUnitKey::new("group".to_owned(), "automatic".to_owned());
+        assert!(
+            !current
+                .contains_with_cancellation(&automatic_key, || {
+                    Ok::<_, std::convert::Infallible>(())
+                })
+                .unwrap_or_else(|never| match never {})
+        );
         let candidate =
             build_write_back_candidate(&stored, &live, &current).expect("Partial 应允许写回");
         assert_eq!(candidate.translated_units(), 1);
@@ -3695,11 +6272,14 @@ mod tests {
         .expect("Generic 项目应该可初始化");
         store.extract().expect("Generic 输入应该可提取");
         let (stored, live) = store.ensure_input_current().expect("输入应该仍为 Current");
-        let candidate = build_write_back_candidate(&stored, &live, &HashMap::new())
+        let candidate = build_write_back_candidate(&stored, &live, &GenericUnitMap::new())
             .expect("应该可建立写回候选");
 
-        let result =
-            materialize_write_back_source_with(&workspace_root, &candidate, |path, bytes| {
+        let result = materialize_write_back_source_with(
+            &workspace_root,
+            &candidate,
+            &CooperativeCancellation::default(),
+            |path, bytes| {
                 fs::write(path, bytes)?;
                 fs::write(
                     path,
@@ -3709,7 +6289,8 @@ mod tests {
                         "\n"
                     ),
                 )
-            });
+            },
+        );
 
         assert!(matches!(
             result,
@@ -3732,6 +6313,30 @@ mod tests {
                     .to_string_lossy()
                     .starts_with(WRITE_BACK_SCRATCH_PREFIX)),
             "校验失败后不应残留 Generic 写回暂存目录"
+        );
+
+        let cancellation = CooperativeCancellation::default();
+        let write_cancellation = cancellation.clone();
+        let result = materialize_write_back_source_with(
+            &workspace_root,
+            &candidate,
+            &cancellation,
+            move |path, bytes| {
+                fs::write(path, bytes)?;
+                write_cancellation.request();
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(GenericScratchError::Cancelled)));
+        assert!(
+            fs::read_dir(&workspace_root)
+                .expect("应该可列举项目工作区")
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(WRITE_BACK_SCRATCH_PREFIX)),
+            "取消后不应残留 Generic 写回暂存目录"
         );
     }
 
@@ -3763,7 +6368,7 @@ mod tests {
         store.extract().expect("Generic 输入应该可提取");
         let (stored, live) = store.ensure_input_current().expect("首次复查应该通过");
         let project = stored.project().clone();
-        let candidate = build_write_back_candidate(&stored, &live, &HashMap::new())
+        let candidate = build_write_back_candidate(&stored, &live, &GenericUnitMap::new())
             .expect("应该可用首次复查快照建立候选");
         let output_root = project.write_back_root();
         fs::create_dir_all(&output_root).expect("应该可建立上一次输出");
@@ -3788,7 +6393,16 @@ mod tests {
             .expect("发布锁配置应该合法"),
         );
 
-        let result = publish_generic_write_back(publisher, project_name, project, candidate).await;
+        let result = publish_generic_write_back(
+            publisher,
+            project_name,
+            project,
+            candidate,
+            CooperativeCancellation::default(),
+            GenericWriteBackPublicationGate::default(),
+            || {},
+        )
+        .await;
 
         assert!(result.is_err(), "发布前输入变化必须拒绝发布");
         assert_eq!(
@@ -3811,6 +6425,79 @@ mod tests {
                     .to_string_lossy()
                     .starts_with(WRITE_BACK_SCRATCH_PREFIX)),
             "发布前复查失败后不应残留 Generic 写回暂存目录"
+        );
+        file_system
+            .shutdown()
+            .await
+            .expect("文件运行能力应该可终结");
+    }
+
+    #[tokio::test]
+    async fn publish_setup_failure_removes_materialized_scratch() {
+        let temporary = tempfile::tempdir().expect("应该可建立临时目录");
+        let source_root = temporary.path().join("source");
+        fs::create_dir_all(&source_root).expect("应该可建立输入目录");
+        fs::write(
+            source_root.join("scene.jsonl"),
+            concat!(
+                r#"{"id":"group","kind":"dialogue","units":["#,
+                r#"{"id":"unit","text":"原文"}]}"#,
+                "\n"
+            ),
+        )
+        .expect("应该可写入 Generic 输入");
+        let workspace_root = temporary.path().join("project");
+        let project_name: ProjectName = "publish-setup".parse().expect("项目名应该合法");
+        let (store, _) = GenericProjectStore::initialize(GenericInitRequest {
+            project_name: project_name.clone(),
+            workspace_root: workspace_root.clone(),
+            source_root: Some(source_root),
+            source_language: Some(LanguageId::parse("ja").expect("源语言应该合法")),
+            target_language: Some(LanguageId::parse("zh-Hans").expect("目标语言应该合法")),
+        })
+        .expect("Generic 项目应该可初始化");
+        store.extract().expect("Generic 输入应该可提取");
+        let (stored, live) = store.ensure_input_current().expect("输入复查应该通过");
+        let project = stored.project().clone();
+        let candidate = build_write_back_candidate(&stored, &live, &GenericUnitMap::new())
+            .expect("应该可建立写回候选");
+        let output_root = project.write_back_root();
+        fs::write(&output_root, b"occupied").expect("应该可建立非目录发布目标");
+        let file_system =
+            SystemFileSystem::new(crate::runtime::filesystem::SystemFileSystemConfig::production())
+                .expect("应该可建立文件运行能力");
+        let publisher = file_system.directory_publisher(
+            crate::runtime::filesystem::DirectoryPublisherConfig::production(
+                temporary.path().join("publish-locks"),
+            )
+            .expect("发布锁配置应该合法"),
+        );
+
+        let result = publish_generic_write_back(
+            publisher,
+            project_name,
+            project,
+            candidate,
+            CooperativeCancellation::default(),
+            GenericWriteBackPublicationGate::default(),
+            || {},
+        )
+        .await;
+
+        assert!(result.is_err(), "非目录目标必须阻止发布");
+        assert_eq!(
+            fs::read(&output_root).expect("原目标文件应该保持"),
+            b"occupied"
+        );
+        assert!(
+            fs::read_dir(&workspace_root)
+                .expect("应该可列举项目工作区")
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(WRITE_BACK_SCRATCH_PREFIX)),
+            "发布请求建立失败后不应残留 Generic 写回暂存目录"
         );
         file_system
             .shutdown()
@@ -3871,6 +6558,7 @@ mod tests {
             Arc::clone(&language_module),
             resources,
             NonZeroUsize::new(10_000).expect("常量应该非零"),
+            &CooperativeCancellation::default(),
         )
         .expect("同文应该合并为一个模型输出");
         assert_eq!(prepared.plan.tasks().len(), 1);
@@ -3949,6 +6637,7 @@ mod tests {
             language_module,
             resources,
             NonZeroUsize::new(10_000).expect("常量应该非零"),
+            &CooperativeCancellation::default(),
         )
         .expect("复用失败的目标应该改为请求模型");
 
@@ -3989,15 +6678,20 @@ mod tests {
             None,
         );
         let key = GenericUnitKey::new("group".to_owned(), "unit".to_owned());
-        let facts = HashMap::from([(
-            key.clone(),
-            GenericValidationFact {
-                kind: "dialogue".to_owned(),
-                source_text: "こんにちは {name}".to_owned(),
-                analysis: language_module.analyze_source(&language_text),
-                protected,
-            },
-        )]);
+        let mut facts = GenericUnitMap::new();
+        let previous = facts
+            .insert_with_cancellation(
+                key.clone(),
+                GenericValidationFact {
+                    kind: "dialogue".to_owned(),
+                    source_text: "こんにちは {name}".to_owned(),
+                    analysis: language_module.analyze_source(&language_text),
+                    protected,
+                },
+                || Ok::<_, std::convert::Infallible>(()),
+            )
+            .unwrap_or_else(|never| match never {});
+        assert!(previous.is_none());
 
         assert_eq!(
             validate_generic_candidate(

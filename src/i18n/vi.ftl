@@ -98,6 +98,8 @@ progress-extract-documents = Đang quét tài liệu
 progress-extract-builtin = Đơn vị công việc Builtin
 progress-extract-rules = Định nghĩa Rules
 progress-extract-commit = Đang commit tài sản đã trích xuất
+progress-generic-init = Đang khởi tạo dự án Generic
+progress-generic-extract = Đang quét đầu vào Generic JSONL
 progress-translate-planning = Đang lập kế hoạch tác vụ dịch
 progress-translate-confirmed = Tác vụ dịch đã xác nhận
 progress-translate-no-work = Không cần gọi mô hình
@@ -270,6 +272,7 @@ diagnostic-failure-value = { $code ->
     [write_back_extraction_out_of_date] Tài sản đã trích xuất không còn khớp với nguồn dự án hiện tại
     [write_back_asset_snapshot_invalid] Tài sản RPG Maker đã lưu không tạo thành ảnh chụp ghi ngược hợp lệ
     [source_document_invalid] Tài liệu nguồn RPG Maker không đáp ứng định dạng bắt buộc
+    [generic_source_document_invalid] Tài liệu nguồn Generic JSONL không đáp ứng định dạng bắt buộc
     [write_back_mutation_invalid] Không thể áp dụng thay đổi bản dịch đã xác minh vào vị trí nguồn đã đóng băng
     [write_back_output_path_invalid] Tệp được viết lại nằm ngoài cây đầu ra RPG Maker được phép
     [write_back_output_path_duplicate] Nhiều tệp được viết lại nhắm đến cùng một đường dẫn đầu ra

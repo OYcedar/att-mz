@@ -101,6 +101,8 @@ progress-extract-documents = Scanning documents
 progress-extract-builtin = Builtin work units
 progress-extract-rules = Rules definitions
 progress-extract-commit = Committing extracted assets
+progress-generic-init = Initializing the Generic project
+progress-generic-extract = Scanning Generic JSONL input
 progress-translate-planning = Planning translation tasks
 progress-translate-confirmed = Confirmed translation tasks
 progress-translate-no-work = No model request is needed
@@ -279,6 +281,7 @@ diagnostic-failure-value = { $code ->
     [write_back_extraction_out_of_date] The extracted assets no longer match the current project source
     [write_back_asset_snapshot_invalid] The stored RPG Maker assets do not form a valid write-back snapshot
     [source_document_invalid] An RPG Maker source document does not satisfy the required document format
+    [generic_source_document_invalid] A Generic JSONL source document does not satisfy the required format
     [write_back_mutation_invalid] A validated translation mutation cannot be applied to its frozen source location
     [write_back_output_path_invalid] A rewritten file is outside the permitted RPG Maker output tree
     [write_back_output_path_duplicate] More than one rewritten file targets the same output path

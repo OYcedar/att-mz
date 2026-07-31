@@ -119,11 +119,14 @@ where
             return Ok(OperationCompletion::Cancelled);
         }
 
-        let execution = self
-            .execution_builder
-            .build(&project)
-            .await
-            .map_err(TranslateServiceError::BuildExecution)?;
+        let execution = classify_execution_build(
+            self.execution_builder.build(&project).await,
+            &self.cancellation,
+        )
+        .map_err(TranslateServiceError::BuildExecution)?;
+        let OperationCompletion::Completed(execution) = execution else {
+            return Ok(OperationCompletion::Cancelled);
+        };
         if self.cancellation.is_requested() {
             return Ok(OperationCompletion::Cancelled);
         }
@@ -162,6 +165,17 @@ where
                 reused: report.reused(),
             },
         }))
+    }
+}
+
+fn classify_execution_build<T, E>(
+    result: Result<T, E>,
+    cancellation: &CooperativeCancellation,
+) -> Result<OperationCompletion<T>, E> {
+    match result {
+        Ok(execution) => Ok(OperationCompletion::Completed(execution)),
+        Err(_) if cancellation.is_requested() => Ok(OperationCompletion::Cancelled),
+        Err(source) => Err(source),
     }
 }
 
@@ -209,5 +223,123 @@ where
             Self::BuildExecution(source) => Some(source),
             Self::Translation { source } => Some(source),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::project_lease::{ProjectCommandLease, ProjectCommandLeaseProvider};
+    use crate::rpg_maker::project::test_layout_profile;
+    use crate::rpg_maker::translate::pipeline::RpgMakerTranslationRunReport;
+
+    use super::*;
+
+    #[derive(Clone, Copy, Debug)]
+    struct FakeError;
+
+    impl fmt::Display for FakeError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("fake failure")
+        }
+    }
+
+    impl Error for FakeError {}
+
+    struct FakeProjectOpener {
+        project: OpenedProject,
+    }
+
+    impl ExistingProjectOpener for FakeProjectOpener {
+        type Error = FakeError;
+
+        async fn open(&self, _name: &ProjectName) -> Result<OpenedProject, Self::Error> {
+            Ok(self.project.clone())
+        }
+    }
+
+    struct FakeLeaseProvider;
+
+    impl ProjectCommandLeaseProvider for FakeLeaseProvider {
+        type Error = FakeError;
+        type LeaseState = ();
+
+        async fn acquire(
+            &self,
+            _project: &ProjectName,
+        ) -> Result<ProjectCommandLease<Self::LeaseState>, ProjectCommandLeaseError<Self::Error>>
+        {
+            Ok(ProjectCommandLease::for_test(()))
+        }
+    }
+
+    struct UnusedTranslation;
+
+    impl RpgMakerTranslation for UnusedTranslation {
+        type Profile = Arc<RpgMakerTranslationProfile<()>>;
+        type Error = FakeError;
+
+        async fn run(
+            &self,
+            _project: &OpenedProject,
+            _profile: &Self::Profile,
+            _input: RpgMakerTranslationInput,
+        ) -> Result<OperationCompletion<RpgMakerTranslationRunReport>, Self::Error> {
+            panic!("构建失败后不得开始翻译")
+        }
+    }
+
+    struct CancellingBuilder {
+        cancellation: CooperativeCancellation,
+    }
+
+    impl SelectedTranslationExecutionBuilder for CancellingBuilder {
+        type Client = ();
+        type Translation = UnusedTranslation;
+        type Error = FakeError;
+
+        async fn build(
+            &self,
+            _project: &OpenedProject,
+        ) -> SelectedTranslationExecutionBuildResult<Self::Client, Self::Translation, Self::Error>
+        {
+            self.cancellation.request();
+            Err(FakeError)
+        }
+    }
+
+    #[tokio::test]
+    async fn builder_error_after_shared_cancellation_is_a_normal_cancelled_result() {
+        let cancellation = CooperativeCancellation::default();
+        let name = "cancelled-build"
+            .parse::<ProjectName>()
+            .expect("测试项目名应合法");
+        let project = OpenedProject::new(
+            name.clone(),
+            PathBuf::from("C:/att-test/workspace"),
+            PathBuf::from("C:/att-test/workspace/project.db"),
+            "ja".to_owned(),
+            "zh-Hans".to_owned(),
+            test_layout_profile(),
+        );
+        let service = TranslateService::new(
+            FakeProjectOpener { project },
+            CancellingBuilder {
+                cancellation: cancellation.clone(),
+            },
+            FakeLeaseProvider,
+            cancellation,
+        );
+
+        let result = service
+            .execute(TranslateInput {
+                name,
+                terminology_path: None,
+                placeholder_rules_path: None,
+            })
+            .await;
+
+        assert!(matches!(result, Ok(OperationCompletion::Cancelled)));
     }
 }

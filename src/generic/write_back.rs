@@ -1,16 +1,23 @@
 //! Generic JSONL 写回候选的构造与往返验证。
 
-use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 
+use crate::execution::CooperativeCancellation;
+
+#[cfg(test)]
+use super::jsonl::parse_file;
 use super::jsonl::{
-    GenericFile, GenericInputSnapshot, GenericJsonlError, parse_file, serialize_groups,
+    GenericFile, GenericInputSnapshot, GenericJsonlError, parse_file_with_cancellation,
+    serialize_groups_with_cancellation,
 };
 use super::project::GenericStoredSnapshot;
+#[cfg(test)]
+use super::translate::GenericUnitKey;
+use super::translate::GenericUnitMap;
 
 /// 候选中的一个 JSONL 文件。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -97,6 +104,12 @@ impl Error for GenericWriteBackError {
     }
 }
 
+impl GenericWriteBackError {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Jsonl(source) if source.is_cancelled())
+    }
+}
+
 impl From<GenericJsonlError> for GenericWriteBackError {
     fn from(source: GenericJsonlError) -> Self {
         Self::Jsonl(source)
@@ -104,11 +117,28 @@ impl From<GenericJsonlError> for GenericWriteBackError {
 }
 
 /// 以当前外部 JSONL 为结构来源，只把数据库中的当前译文写入 `text`。
+#[cfg(test)]
 pub(crate) fn build_write_back_candidate(
     stored: &GenericStoredSnapshot,
     live: &GenericInputSnapshot,
-    current_translations: &HashMap<(String, String), String>,
+    current_translations: &GenericUnitMap<String>,
 ) -> Result<GenericWriteBackCandidate, GenericWriteBackError> {
+    build_write_back_candidate_with_cancellation(
+        stored,
+        live,
+        current_translations,
+        &CooperativeCancellation::default(),
+    )
+}
+
+/// 构造写回候选，并在文件、Group、Unit、长文本及 JSON 往返边界响应取消。
+pub(crate) fn build_write_back_candidate_with_cancellation(
+    stored: &GenericStoredSnapshot,
+    live: &GenericInputSnapshot,
+    current_translations: &GenericUnitMap<String>,
+    cancellation: &CooperativeCancellation,
+) -> Result<GenericWriteBackCandidate, GenericWriteBackError> {
+    ensure_write_back_running(cancellation)?;
     if stored.project().extracted_raw_fingerprint() != Some(live.raw_fingerprint()) {
         return Err(GenericWriteBackError::SourceChanged);
     }
@@ -118,13 +148,12 @@ pub(crate) fn build_write_back_candidate(
         });
     }
 
-    let translations = index_current_translations(current_translations);
     let built_files = stored
         .files()
         .par_iter()
         .zip(live.files().par_iter())
         .map(|(stored_file, live_file)| {
-            build_write_back_file(stored_file, live_file, &translations)
+            build_write_back_file(stored_file, live_file, current_translations, cancellation)
         })
         .collect::<Vec<_>>();
 
@@ -134,11 +163,13 @@ pub(crate) fn build_write_back_candidate(
     // Rayon 的 indexed collect 保留文件顺序；这里再按自然顺序取出结果，
     // 因而多个文件同时失败时仍返回自然顺序最早的错误。
     for result in built_files {
+        ensure_write_back_running(cancellation)?;
         let built = result?;
         translated_units += built.translated_units;
         retained_source_units += built.retained_source_units;
         files.push(built.file);
     }
+    ensure_write_back_running(cancellation)?;
 
     Ok(GenericWriteBackCandidate {
         files,
@@ -153,26 +184,13 @@ struct BuiltWriteBackFile {
     retained_source_units: usize,
 }
 
-type CurrentTranslationIndex<'a> = HashMap<&'a str, HashMap<&'a str, &'a str>>;
-
-fn index_current_translations(
-    translations: &HashMap<(String, String), String>,
-) -> CurrentTranslationIndex<'_> {
-    let mut index: CurrentTranslationIndex<'_> = HashMap::new();
-    for ((group_id, unit_id), translation) in translations {
-        index
-            .entry(group_id.as_str())
-            .or_default()
-            .insert(unit_id.as_str(), translation.as_str());
-    }
-    index
-}
-
 fn build_write_back_file(
     stored_file: &super::project::GenericStoredFile,
     live_file: &GenericFile,
-    translations: &CurrentTranslationIndex<'_>,
+    translations: &GenericUnitMap<String>,
+    cancellation: &CooperativeCancellation,
 ) -> Result<BuiltWriteBackFile, GenericWriteBackError> {
+    ensure_write_back_running(cancellation)?;
     if stored_file.relative_path() != live_file.relative_path() {
         return Err(GenericWriteBackError::SnapshotMismatch {
             detail: format!(
@@ -190,30 +208,38 @@ fn build_write_back_file(
 
     let mut translated_units = 0;
     let mut retained_source_units = 0;
-    let mut output_groups = live_file.groups().to_vec();
-    for ((stored_group, live_group), output_group) in stored_file
-        .groups()
-        .iter()
-        .zip(live_file.groups())
-        .zip(&mut output_groups)
-    {
-        validate_group_shape(stored_group, live_group, live_file.relative_path())?;
-        let group_translations = translations.get(output_group.id());
-        for unit in output_group.units_mut() {
-            if let Some(translation) = group_translations
-                .and_then(|group_translations| group_translations.get(unit.id()))
-                .copied()
-            {
-                unit.set_text(translation.to_owned())?;
+    let mut output_groups = Vec::with_capacity(live_file.groups().len());
+    for (stored_group, live_group) in stored_file.groups().iter().zip(live_file.groups()) {
+        ensure_write_back_running(cancellation)?;
+        validate_group_shape(
+            stored_group,
+            live_group,
+            live_file.relative_path(),
+            cancellation,
+        )?;
+        let mut output_units = Vec::with_capacity(live_group.units().len());
+        for unit in live_group.units() {
+            ensure_write_back_text_running(unit.text(), cancellation)?;
+            let translation =
+                translations.get_parts_with_cancellation(live_group.id(), unit.id(), || {
+                    ensure_write_back_running(cancellation)
+                })?;
+            let text = if let Some(translation) = translation {
+                ensure_write_back_text_running(translation, cancellation)?;
                 translated_units += 1;
+                translation.as_str()
             } else {
                 retained_source_units += 1;
-            }
+                unit.text()
+            };
+            output_units.push(unit.clone_with_text_with_cancellation(text, cancellation)?);
         }
+        output_groups
+            .push(live_group.clone_with_units_with_cancellation(output_units, cancellation)?);
     }
 
-    let bytes = serialize_groups(&output_groups)?;
-    let validated = validate_round_trip(live_file, bytes, translations)?;
+    let bytes = serialize_groups_with_cancellation(&output_groups, cancellation)?;
+    let validated = validate_round_trip(live_file, bytes, translations, cancellation)?;
     Ok(BuiltWriteBackFile {
         file: GenericWriteBackFile { validated },
         translated_units,
@@ -225,9 +251,11 @@ fn validate_group_shape(
     stored: &super::project::GenericStoredGroup,
     live: &super::jsonl::GenericGroup,
     path: &Path,
+    cancellation: &CooperativeCancellation,
 ) -> Result<(), GenericWriteBackError> {
-    if stored.id() != live.id()
-        || stored.kind() != live.kind()
+    ensure_write_back_running(cancellation)?;
+    if !text_equal_with_cancellation(stored.id(), live.id(), cancellation)?
+        || !text_equal_with_cancellation(stored.kind(), live.kind(), cancellation)?
         || stored.units().len() != live.units().len()
     {
         return Err(GenericWriteBackError::SnapshotMismatch {
@@ -235,7 +263,14 @@ fn validate_group_shape(
         });
     }
     for (stored_unit, live_unit) in stored.units().iter().zip(live.units()) {
-        if stored_unit.id() != live_unit.id() || stored_unit.source_text() != live_unit.text() {
+        ensure_write_back_text_running(live_unit.text(), cancellation)?;
+        if !text_equal_with_cancellation(stored_unit.id(), live_unit.id(), cancellation)?
+            || !text_equal_with_cancellation(
+                stored_unit.source_text(),
+                live_unit.text(),
+                cancellation,
+            )?
+        {
             return Err(GenericWriteBackError::SnapshotMismatch {
                 detail: format!(
                     "{} 中的 Unit {}/{} 结构或原文不同",
@@ -252,9 +287,14 @@ fn validate_group_shape(
 fn validate_round_trip(
     source: &GenericFile,
     candidate_bytes: Vec<u8>,
-    translations: &CurrentTranslationIndex<'_>,
+    translations: &GenericUnitMap<String>,
+    cancellation: &CooperativeCancellation,
 ) -> Result<GenericFile, GenericWriteBackError> {
-    let candidate = parse_file(source.relative_path().to_path_buf(), candidate_bytes)?;
+    let candidate = parse_file_with_cancellation(
+        source.relative_path().to_path_buf(),
+        candidate_bytes,
+        cancellation,
+    )?;
     if source.groups().len() != candidate.groups().len() {
         return Err(GenericWriteBackError::SnapshotMismatch {
             detail: format!(
@@ -264,8 +304,13 @@ fn validate_round_trip(
         });
     }
     for (original_group, candidate_group) in source.groups().iter().zip(candidate.groups()) {
-        if original_group.id() != candidate_group.id()
-            || original_group.kind() != candidate_group.kind()
+        ensure_write_back_running(cancellation)?;
+        if !text_equal_with_cancellation(original_group.id(), candidate_group.id(), cancellation)?
+            || !text_equal_with_cancellation(
+                original_group.kind(),
+                candidate_group.kind(),
+                cancellation,
+            )?
             || original_group.units().len() != candidate_group.units().len()
         {
             return Err(GenericWriteBackError::SnapshotMismatch {
@@ -276,17 +321,18 @@ fn validate_round_trip(
             });
         }
         for (original, candidate) in original_group.units().iter().zip(candidate_group.units()) {
-            if original.id() != candidate.id() {
+            ensure_write_back_text_running(candidate.text(), cancellation)?;
+            if !text_equal_with_cancellation(original.id(), candidate.id(), cancellation)? {
                 return Err(GenericWriteBackError::SnapshotMismatch {
                     detail: format!("{} 的候选改变了 Unit ID", source.relative_path().display()),
                 });
             }
             let expected = translations
-                .get(original_group.id())
-                .and_then(|group_translations| group_translations.get(original.id()))
-                .copied()
-                .unwrap_or(original.text());
-            if candidate.text() != expected {
+                .get_parts_with_cancellation(original_group.id(), original.id(), || {
+                    ensure_write_back_running(cancellation)
+                })?
+                .map_or(original.text(), String::as_str);
+            if !text_equal_with_cancellation(candidate.text(), expected, cancellation)? {
                 return Err(GenericWriteBackError::SnapshotMismatch {
                     detail: format!(
                         "{} 的候选 Unit {}/{} text 不符合预期",
@@ -298,17 +344,40 @@ fn validate_round_trip(
             }
         }
     }
+    ensure_write_back_running(cancellation)?;
     Ok(candidate)
 }
 
 /// 用生产解析器复查实际落盘内容，并与已经通过候选验证的文件逐字节、逐结构比较。
+#[cfg(test)]
 pub(crate) fn validate_materialized_write_back_file(
     expected: &GenericWriteBackFile,
     materialized_bytes: Vec<u8>,
 ) -> Result<(), GenericWriteBackError> {
-    let materialized = parse_file(expected.relative_path().to_path_buf(), materialized_bytes)?;
-    let bytes_changed = materialized.raw_bytes() != expected.bytes();
-    let structure_changed = materialized.groups() != expected.validated.groups();
+    validate_materialized_write_back_file_with_cancellation(
+        expected,
+        materialized_bytes,
+        &CooperativeCancellation::default(),
+    )
+}
+
+pub(crate) fn validate_materialized_write_back_file_with_cancellation(
+    expected: &GenericWriteBackFile,
+    materialized_bytes: Vec<u8>,
+    cancellation: &CooperativeCancellation,
+) -> Result<(), GenericWriteBackError> {
+    let materialized = parse_file_with_cancellation(
+        expected.relative_path().to_path_buf(),
+        materialized_bytes,
+        cancellation,
+    )?;
+    let bytes_changed =
+        !bytes_equal_with_cancellation(materialized.raw_bytes(), expected.bytes(), cancellation)?;
+    let structure_changed = !groups_equal_with_cancellation(
+        materialized.groups(),
+        expected.validated.groups(),
+        cancellation,
+    )?;
     if bytes_changed || structure_changed {
         return Err(GenericWriteBackError::MaterializedMismatch {
             path: expected.relative_path().to_path_buf(),
@@ -317,6 +386,90 @@ pub(crate) fn validate_materialized_write_back_file(
         });
     }
     Ok(())
+}
+
+fn ensure_write_back_running(
+    cancellation: &CooperativeCancellation,
+) -> Result<(), GenericWriteBackError> {
+    if cancellation.is_requested() {
+        Err(GenericJsonlError::Cancelled.into())
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_write_back_text_running(
+    text: &str,
+    cancellation: &CooperativeCancellation,
+) -> Result<(), GenericWriteBackError> {
+    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
+
+    for _ in text.as_bytes().chunks(CANCELLATION_CHECK_BYTES) {
+        ensure_write_back_running(cancellation)?;
+    }
+    ensure_write_back_running(cancellation)
+}
+
+fn bytes_equal_with_cancellation(
+    left: &[u8],
+    right: &[u8],
+    cancellation: &CooperativeCancellation,
+) -> Result<bool, GenericWriteBackError> {
+    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
+
+    ensure_write_back_running(cancellation)?;
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    for (left, right) in left
+        .chunks(CANCELLATION_CHECK_BYTES)
+        .zip(right.chunks(CANCELLATION_CHECK_BYTES))
+    {
+        ensure_write_back_running(cancellation)?;
+        if left != right {
+            return Ok(false);
+        }
+    }
+    ensure_write_back_running(cancellation)?;
+    Ok(true)
+}
+
+fn text_equal_with_cancellation(
+    left: &str,
+    right: &str,
+    cancellation: &CooperativeCancellation,
+) -> Result<bool, GenericWriteBackError> {
+    bytes_equal_with_cancellation(left.as_bytes(), right.as_bytes(), cancellation)
+}
+
+fn groups_equal_with_cancellation(
+    left: &[super::jsonl::GenericGroup],
+    right: &[super::jsonl::GenericGroup],
+    cancellation: &CooperativeCancellation,
+) -> Result<bool, GenericWriteBackError> {
+    ensure_write_back_running(cancellation)?;
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    for (left_group, right_group) in left.iter().zip(right) {
+        ensure_write_back_running(cancellation)?;
+        if !text_equal_with_cancellation(left_group.id(), right_group.id(), cancellation)?
+            || !text_equal_with_cancellation(left_group.kind(), right_group.kind(), cancellation)?
+            || left_group.units().len() != right_group.units().len()
+        {
+            return Ok(false);
+        }
+        for (left_unit, right_unit) in left_group.units().iter().zip(right_group.units()) {
+            ensure_write_back_running(cancellation)?;
+            if !text_equal_with_cancellation(left_unit.id(), right_unit.id(), cancellation)?
+                || !text_equal_with_cancellation(left_unit.text(), right_unit.text(), cancellation)?
+            {
+                return Ok(false);
+            }
+        }
+    }
+    ensure_write_back_running(cancellation)?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -378,8 +531,15 @@ mod tests {
             .unwrap();
 
         let (stored, live) = store.ensure_input_current().unwrap();
-        let current_translations =
-            HashMap::from([(("g".to_owned(), "a".to_owned()), "译文\n第二行".to_owned())]);
+        let mut current_translations = GenericUnitMap::new();
+        let previous = current_translations
+            .insert_with_cancellation(
+                GenericUnitKey::new("g".to_owned(), "a".to_owned()),
+                "译文\n第二行".to_owned(),
+                || Ok::<_, std::convert::Infallible>(()),
+            )
+            .unwrap_or_else(|never| match never {});
+        assert!(previous.is_none());
         let candidate = build_write_back_candidate(&stored, &live, &current_translations).unwrap();
         assert_eq!(candidate.translated_units(), 1);
         assert_eq!(candidate.retained_source_units(), 1);

@@ -98,6 +98,8 @@ progress-extract-documents = 正在掃描文件
 progress-extract-builtin = Builtin 工作單元
 progress-extract-rules = Rules 規則
 progress-extract-commit = 正在提交擷取資產
+progress-generic-init = 正在初始化 Generic 專案
+progress-generic-extract = 正在掃描 Generic JSONL 輸入
 progress-translate-planning = 正在規劃翻譯工作
 progress-translate-confirmed = 已確認翻譯工作
 progress-translate-no-work = 不需要呼叫模型
@@ -270,6 +272,7 @@ diagnostic-failure-value = { $code ->
     [write_back_extraction_out_of_date] 已擷取資產不再符合目前專案來源
     [write_back_asset_snapshot_invalid] 已儲存的 RPG Maker 資產無法組成有效的寫回快照
     [source_document_invalid] RPG Maker 來源文件不符合必要的文件格式
+    [generic_source_document_invalid] Generic JSONL 來源文件不符合必要格式
     [write_back_mutation_invalid] 已驗證的翻譯變更無法套用到凍結的來源位置
     [write_back_output_path_invalid] 重寫檔案位於允許的 RPG Maker 輸出樹之外
     [write_back_output_path_duplicate] 多個重寫檔案指向相同輸出路徑
