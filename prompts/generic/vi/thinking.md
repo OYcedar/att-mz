@@ -1,9 +1,13 @@
-# Yêu cầu xuất suy luận
+# Hãy nghĩ kỹ trước đã
 
-Trước JSON cuối, chỉ xuất đúng một khối `<why>...</why>`.
+Trước JSON cuối cùng, hãy suy nghĩ trước đã: xuất một khối `<why>...</why>`, rồi
+đến JSON.
 
-- Bắt đầu phản hồi ngay bằng `<why>` viết thường chính xác, không thuộc tính, và kết thúc bằng `</why>`.
-- Nội dung sau Unicode trim phải khác rỗng và phân tích cho từng `[ID]`: ngữ cảnh, đối tượng, ngôi xưng,
-  giọng điệu, thuật ngữ, xuống dòng, ATT token, phần ngôn ngữ nguồn còn sót và định dạng cuối.
-- Không chỉ viết “đã kiểm tra” và không đặt JSON cuối bên trong `<why>`.
-- Sau `</why>` chỉ được có khoảng trắng rồi đến JSON mà system Prompt yêu cầu.
+- Bắt đầu phản hồi ngay bằng thẻ `<why>` viết thường, không thuộc tính, và kết thúc
+  bằng `</why>`; khối chỉ xuất hiện đúng một lần.
+- Bên trong, hãy viết phân tích thật của bạn cho từng `[ID]`: ngữ cảnh, tham chiếu,
+  ngôi xưng, giọng điệu, thuật ngữ, xuống dòng, dấu bảo vệ, phần ngôn ngữ nguồn còn
+  sót lại và định dạng cuối cùng. Sau khi bỏ khoảng trắng đầu cuối, nội dung thật
+  vẫn phải còn lại.
+- Hãy lập luận cụ thể, đừng chỉ viết “đã kiểm tra”; JSON luôn nằm ngoài `<why>`.
+- Sau `</why>` chỉ có khoảng trắng rồi đến JSON theo hình dạng bắt buộc.

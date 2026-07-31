@@ -11,23 +11,23 @@ att --config CONFIG generic lua --name NAME SCRIPT.lua [-- ARG...]
 它适合精确修订某个译文、批量更新项目数据库或维护脚本自己的私有表，作用类似 Redis
 中的 Lua：程序提供受控数据库连接，整个脚本只有一次提交或一次回滚。
 
-Lua 不参与 Init、Extract、Translate 或 WriteBack，不保存脚本，不请求模型，也不读取或
-修改游戏、JSONL 输入、候选或输出文件。
+Lua 只面向项目数据库，与 Init、Extract、Translate、WriteBack 互不干涉。ATT 不保存
+脚本，脚本也不请求模型；游戏、JSONL 输入、候选和输出文件都在它的读写范围之外。
 
 ## 1. 程序与环境
 
 ATT 每次从显式路径读取并编译一个 UTF-8 Lua 5.4 主程序。全局 `arg[0]` 是脚本路径，
-`arg[1]` 起是 `--` 后按原顺序提供的 UTF-8 字符串；没有参数时只存在 `arg[0]`。
+`arg[1]` 起是 `--` 后按原顺序提供的 UTF-8 字符串；没有参数时只有 `arg[0]`。
 
 VM 只提供 base、coroutine、table、string、math 和 utf8：
 
 - 不提供 `io`、`os`、`package`、`require`、`loadfile`、`dofile`、`debug` 或 `warn`；
 - 不提供文件、网络、进程、环境变量、LLM、来源或输出 API；
-- 每次 `print(...)` 都产生一条经过安全处理的 `lua.print` 项目日志，不直接写 C stdout；
-- 不按脚本大小、查询行数、返回字节、运行时间或内存设置产品上限。
+- 每次 `print(...)` 都会产生一条经过安全处理的 `lua.print` 项目日志，不直接写 C stdout；
+- 脚本大小、查询行数、返回字节、运行时间和内存都不设产品上限。
 
-每次运行都会创建新 VM。全局变量、闭包和 userdata 不跨运行；只有提交到项目数据库的内容
-会保留。
+每次运行都会创建全新的 VM；运行结束后，只有提交到项目数据库的内容会保留，全局变量、
+闭包和 userdata 都随之消失。
 
 ## 2. `ctx`
 
@@ -57,8 +57,8 @@ ctx.translation.clear(locator)
 | BLOB | `ctx.db.blob` 值 |
 
 `ctx.db.blob(bytes)` 从 Lua string 建立不可伪造的 BLOB 值。query 返回的 BLOB 使用同一
-类型，以 `value:bytes()` 取得逐字 Lua string。Lua `nil` 不是 SQL NULL，也不能出现在稠密
-参数或结果中。
+类型，以 `value:bytes()` 取得逐字 Lua string。Lua `nil` 不是 SQL NULL，稠密参数与结果
+中也不会出现；SQL NULL 一律用 `ctx.db.NULL` 表示。
 
 ### 2.2 query 与 execute
 
@@ -84,8 +84,9 @@ local changed = ctx.db.execute(
 - ATT 不自动把 SQL、参数、查询结果或游戏正文写入普通项目日志；脚本显式传给 `print(...)`
   的内容按 `lua.print` 规则处理。
 
-允许普通查询、DML，以及为脚本私有数据建立或修改事务性表和索引。建议私有对象使用
-`lua_` 前缀。脚本也可以直接修改 ATT 表，但它是可信的高级操作，必须理解当前数据库规格。
+普通查询、DML，以及为脚本私有数据建立或修改事务性表和索引都在允许范围内。建议私有
+对象使用 `lua_` 前缀。脚本也可以直接修改 ATT 表，但这是可信的高级操作，动手前请先
+理解当前数据库规格。
 
 以下操作始终拒绝：
 
@@ -98,7 +99,7 @@ local changed = ctx.db.execute(
 
 ## 3. 精确译文操作
 
-`ctx.translation` 是修改常见译文的安全接口。它只处理 locator 指定的一个 Unit，不执行
+`ctx.translation` 是修改常见译文的安全接口，精确处理 locator 指定的单个 Unit，不触发
 全局去重或传播。
 
 Generic：
@@ -127,14 +128,14 @@ ctx.translation.set(
 - MV/MZ 根据 Unit 形状接受字符串或稠密字符串数组，并执行形状、空槽、控制符和
   Placeholder 检查；
 - locator 必须精确命中当前 Unit，MV/MZ 的 `group_location` 与 `unit_role` 是数据库中的
-  不透明稳定字符串，不应自行拼接；
+  不透明稳定字符串，请直接使用数据库原值，不要自行拼接；
 - `set` 写入人工翻译状态；
 - `clear(locator)` 同时清除该 Unit 的译文与状态；
 - 源文、Group 语境、语言或实际 Placeholder 改变时，人工状态失效；
-- 术语、Prompt、Profile 或 Client 改变不使人工状态失效。
+- 术语、Prompt、Profile 或 Client 改变不影响人工状态。
 
-直接 SQL 修改一个已有 Current 的目标译文时，原语义状态保持，下一次 Translate 仍把它
-视为 Current。修改未译 Unit、需要形状检查或需要建立人工状态时，使用
+用直接 SQL 修改一个已有 Current 的目标译文时，原语义状态保持，下一次 Translate 仍把
+它视为 Current。修改未译 Unit、需要形状检查或需要建立人工状态时，使用
 `ctx.translation.set`。
 
 ## 4. 单一事务
@@ -154,13 +155,13 @@ ctx.translation.set(
 - 语法错误发生在事务开始前；
 - 未捕获的 Lua、Host 或 SQL 错误，取消、panic 或最终验证失败都会回滚；
 - 脚本不能提前提交，也不能把一次调用拆成多个事务；
-- `pcall` 捕获普通错误后可以继续，但不能绕过最终数据库验证；
+- `pcall` 捕获普通错误后可以继续，但最终数据库验证始终执行；
 - VM instruction hook、SQLite progress 与 busy 机制共同响应取消；
-- COMMIT 开始后 ATT 等待 SQLite 的实际结果。无法确认时报告 `outcome_unknown`，不能声称
-  已回滚。
+- COMMIT 开始后 ATT 等待 SQLite 的实际结果。无法确认时报告 `outcome_unknown`，而不是
+  声称已回滚。
 
 项目租约从脚本编译完成后开始，覆盖打开项目数据库、事务、验证、提交或回滚以及最终
-结果。普通日志失败不改变数据库结果。
+结果。普通日志失败不影响数据库结果。
 
 ## 5. 日志与恢复
 
@@ -168,9 +169,9 @@ ctx.translation.set(
 最终事务状态。每次显式 `print(...)` 另写一条 `lua.print` 事件；事件正文会移除控制字符
 伪装并采用项目日志统一的安全处理。
 
-ATT 不会因为脚本读取、计算或写入了某项内容，就自动记录 SQL、参数、查询结果、Lua
-变量或游戏正文。如果脚本显式 `print(...)` 这些内容，它们才会作为 `lua.print` 的正文
-进入项目日志。因此脚本只应打印操作者确实需要保留的诊断。
+日志只自动记录上述运行元信息。SQL、参数、查询结果、Lua 变量和游戏正文是否进入日志，
+完全由脚本决定：只有脚本显式 `print(...)` 的内容才会作为 `lua.print` 的正文写入项目
+日志。因此脚本只应打印操作者确实需要保留的诊断。
 
 成功后重新读取需要确认的项目状态。失败且明确回滚时，可以修正脚本后重试；
 `outcome_unknown` 时停止写入和重跑，保留现场并按诊断重新观察数据库。

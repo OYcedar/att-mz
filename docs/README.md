@@ -1,14 +1,15 @@
 # ATT 文档
 
-这里描述 ATT 当前实现必须遵守的产品行为。命令、格式、状态和恢复方式以相应现行规格为
-准；指南只负责帮助操作者选择正确流程。
+这里描述 ATT 当前实现遵守的产品行为。命令、格式、状态和恢复方式以相应现行规格为
+准；指南帮助操作者选择正确的流程。
 
 ## 从哪里开始
 
-- [翻译项目工作指南](guides/translation-project.md)：调查游戏、选择 MV/MZ 或 Generic、
-  组合多个独立项目，并完成提取、翻译、写回和验收。
-- [任务材料规范](guides/task-artifacts.md)：长期任务的清单、证据、备份和协作材料。
-- [任务清单模板](guides/task-list-template.md)：需要持续执行或多人协作时复制使用。
+- [翻译项目工作指南](guides/translation-project.md)：带你调查游戏、选择 MV/MZ 或
+  Generic、组合多个独立项目，走完提取、翻译、写回和验收。
+- [任务材料规范](guides/task-artifacts.md)：长期任务需要的清单、证据、备份和协作材料。
+- [任务清单模板](guides/task-list-template.md)：任务需要持续执行或多人协作时，从这里
+  复制使用。
 
 ## 三种项目
 
@@ -29,7 +30,9 @@
 
 - [公共翻译能力导航](translation/README.md)
 - [语言](translation/language.md)
-- [术语](translation/terminology.md)
+- [术语文件](translation/terminology.md)：ATT 接受、校验和使用的格式与行为
+- [制作游戏术语表](../skills/extract-game-terminology/SKILL.md)：从游戏或文本中发现、
+  筛选、定译和验收术语，不绑定 ATT 格式
 - [Placeholder](translation/placeholders.md)
 - [Prompt 与模型协议](translation/prompts.md)
 - [模型任务记录](translation/task-records.md)

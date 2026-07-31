@@ -1,7 +1,7 @@
 # ATT SQLite 现行规格
 
-每个 MV、MZ 或 Generic 项目只使用自己工作区内的 `project.db`。不同引擎、不同项目名之间
-不共享表、译文或资源。
+每个 MV、MZ 或 Generic 项目都使用自己工作区内的 `project.db`；引擎不同、项目名
+不同，表、译文和资源就各归各，互不共享。
 
 ## 1. 项目数据库
 
@@ -13,41 +13,45 @@
 - 当前术语、Placeholder 与最近 Profile；
 - MV/MZ 当前 Builtin/Rules 选择与必要的发布交接。
 
-Generic 不保存外部 JSONL 副本、去重族、代表项、译文历史或 kind 注册表。
+Generic 的项目库只存自己的工作；外部 JSONL 副本、去重族、代表项、译文历史和
+kind 注册表都留在外部。
 
-项目使用严格的当前 schema，不在运行时识别、迁移或兼容旧 schema。数据库不符合当前
-schema 时按普通无效项目处理。
+项目只认严格的当前 schema；不符合当前 schema 的数据库按普通无效项目处理，运行时
+不做识别、迁移或兼容。
 
 ## 2. 读取与写事务
 
-只读规划使用一致快照。写操作使用短事务、批量 statement 和准备语句；不得为每个 Unit
-建立独立持久事务。
+只读规划基于一致快照；写操作使用短事务、批量 statement 和准备语句，一批工作一起
+提交，而不是每个 Unit 各建一个持久事务。
 
-Extract 的同一 owner 或整个 Generic 同步原子提交。Translate 准备阶段原子处理失效和
-资源替换，各模型任务按自然顺序独立提交，以保留有效前序进度。WriteBack 只读数据库，
-输出发布由目录发布协议负责。
+Extract 的同一 owner 或整个 Generic 同步原子提交。Translate 准备阶段原子处理失效
+和资源替换，各模型任务按自然顺序独立提交，有效前序进度因此得以保留。WriteBack
+只读数据库，输出发布交给目录发布协议。
 
-写事务开始、COMMIT、ROLLBACK 和无法确认结果都形成结构化诊断。`busy` 等待响应取消，
-不使用固定的本地队列容量拒绝项目。
+写事务从开始、COMMIT、ROLLBACK 到无法确认结果，每一步都形成结构化诊断。`busy`
+等待期间随时响应取消；项目再忙也只是等待，不会被固定的本地队列容量拒之门外。
 
 ## 3. 译文状态
 
-目标译文正文与语义状态分开保存。模型任务提交使用 CAS 同时比较当前源事实、旧目标正文
-和旧状态，不能覆盖并发修订。
+目标译文正文与语义状态分开保存。模型任务提交使用 CAS 同时比较当前源事实、旧目标
+正文和旧状态，并发修订不会被悄悄覆盖。
 
-自动状态绑定语言、Prompt、Client、Group 语境、实际术语和 Placeholder。人工 Lua 状态
-只绑定来源、Group 语境、语言、结构和实际 Placeholder。各引擎规格决定失效范围。
+自动状态绑定语言、Prompt、Client、Group 语境、实际术语和 Placeholder。人工 Lua
+状态只绑定来源、Group 语境、语言、结构和实际 Placeholder。各引擎规格决定失效
+范围。
 
 ## 4. Lua 会话
 
-独立 Lua 使用同一个项目数据库和一个外层 `BEGIN IMMEDIATE`。脚本没有事务控制权；运行
-结束后 ATT 验证 schema、metadata、领域不变量、`foreign_key_check` 与 `quick_check`，
-再提交或回滚。完整 API 与 SQL 限制见[原子数据库 Lua](../lua/README.md)。
+独立 Lua 使用同一个项目数据库，外面包着一个 `BEGIN IMMEDIATE`；事务边界由 ATT
+掌握，脚本只管写逻辑。运行结束后 ATT 先验证 schema、metadata、领域不变量、
+`foreign_key_check` 与 `quick_check`，再提交或回滚。完整 API 与 SQL 限制见
+[原子数据库 Lua](../lua/README.md)。
 
-Lua 可以建立自己的私有表，但 ATT 不读取、迁移或解释它们。直接修改 ATT 表属于可信高级
-操作，必须服从最终不变量检查。
+Lua 可以建立自己的私有表，ATT 不读取、迁移或解释它们。直接修改 ATT 表属于可信
+高级操作：可以做，但结果必须通过最终不变量检查。
 
 ## 5. 诊断与日志
 
-SQLite 错误保留操作、数据库路径、primary/extended code、事务最终状态和恢复位置。SQL、
-参数、结果与游戏正文不进入普通项目日志。项目日志不是数据库恢复或重放来源。
+SQLite 出错时，诊断保留操作、数据库路径、primary/extended code、事务最终状态和
+恢复位置。SQL、参数、结果与游戏正文不进普通项目日志；数据库的恢复和重放另有
+依据，项目日志不参与。

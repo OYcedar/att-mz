@@ -1,0 +1,4 @@
+interface:
+  display_name: "制作游戏术语表"
+  short_description: "从游戏与文本中发现、筛选并验证真正需要统一译法的术语"
+  default_prompt: "使用 $extract-game-terminology 从这些游戏文件或文本中制作一份有来源证据的精简术语表。"
