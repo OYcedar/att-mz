@@ -974,15 +974,10 @@ impl FileWorkPool {
         let Some(workers) = workers else {
             return Ok(());
         };
-        let (sender, receiver) = async_channel::bounded(1);
-        thread::Builder::new()
-            .name("filesystem-join".to_owned())
-            .spawn(move || {
-                let clean = workers.into_iter().all(|worker| worker.join().is_ok());
-                let _ = sender.send_blocking(clean);
-            })
-            .map_err(|source| io_error("建立文件工作池终结线程", Path::new("<runtime>"), source))?;
-        if receiver.recv().await.unwrap_or(false) {
+        let clean = tokio::task::spawn_blocking(move || join_file_workers(workers))
+            .await
+            .map_err(|_| SystemFileSystemError::WorkerPanicked)?;
+        if clean {
             Ok(())
         } else {
             Err(SystemFileSystemError::WorkerPanicked)
@@ -1001,6 +996,16 @@ impl FileWorkPool {
     const fn width(&self) -> usize {
         self.width
     }
+}
+
+fn join_file_workers(workers: Vec<thread::JoinHandle<()>>) -> bool {
+    let mut clean = true;
+    for worker in workers {
+        if worker.join().is_err() {
+            clean = false;
+        }
+    }
+    clean
 }
 
 impl Drop for FileWorkPool {
@@ -5262,6 +5267,25 @@ fn remove_matching_directory(
 mod tests {
     use super::*;
     use std::ops::Deref;
+
+    #[test]
+    fn joining_workers_waits_for_all_workers_after_one_panics() {
+        let completed = Arc::new(AtomicBool::new(false));
+        let panicked = thread::spawn(|| panic!("测试 worker panic"));
+        let remaining_completed = Arc::clone(&completed);
+        let remaining = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            remaining_completed.store(true, Ordering::Release);
+        });
+
+        let clean = join_file_workers(vec![panicked, remaining]);
+
+        assert!(!clean);
+        assert!(
+            completed.load(Ordering::Acquire),
+            "首个 worker panic 后仍必须等待其余 worker 退出"
+        );
+    }
 
     struct HugeMetadataReader {
         reported_length: u64,

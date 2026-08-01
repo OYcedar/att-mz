@@ -21,6 +21,7 @@ use crate::project_lease::{
 };
 use crate::project_name::ProjectName;
 use crate::rpg_maker::RpgMakerLayout;
+use crate::rpg_maker::asset::RpgMakerAssetOwner;
 use crate::rpg_maker::project::ExistingProjectOpeningService;
 use crate::rpg_maker::project_database::ProjectDatabaseRecordReadingService;
 use crate::storage::file_system::{
@@ -241,6 +242,8 @@ impl SqliteQueryExecutor for FakeSqliteQueryExecutor {
 struct FakeSqliteTransactionExecutor {
     events: Arc<Mutex<Vec<Event>>>,
     fail_owner: Arc<Mutex<Option<String>>>,
+    cancel_after_owner: Arc<Mutex<Option<String>>>,
+    cancellation: crate::execution::CooperativeCancellation,
 }
 
 impl SqliteTransactionExecutor for FakeSqliteTransactionExecutor {
@@ -265,6 +268,15 @@ impl SqliteTransactionExecutor for FakeSqliteTransactionExecutor {
             owner => panic!("未预期的快照所有者：{owner}"),
         };
         self.events.lock().expect("事件锁不应中毒").push(event);
+        if self
+            .cancel_after_owner
+            .lock()
+            .expect("SQLite 取消配置锁不应中毒")
+            .as_deref()
+            == Some(owner)
+        {
+            self.cancellation.request();
+        }
         if self
             .fail_owner
             .lock()
@@ -344,6 +356,8 @@ async fn root_fakes_drive_the_complete_non_root_extract_tree() {
     let cpu_max_active = Arc::new(AtomicUsize::new(0));
     let events = Arc::new(Mutex::new(Vec::new()));
     let fail_owner = Arc::new(Mutex::new(None));
+    let cancel_after_owner = Arc::new(Mutex::new(None));
+    let cancellation = crate::execution::CooperativeCancellation::default();
 
     let file_reader = FakeFileReader {
         active: Arc::new(AtomicUsize::new(0)),
@@ -358,6 +372,8 @@ async fn root_fakes_drive_the_complete_non_root_extract_tree() {
     let sqlite_transactions = FakeSqliteTransactionExecutor {
         events: Arc::clone(&events),
         fail_owner: Arc::clone(&fail_owner),
+        cancel_after_owner: Arc::clone(&cancel_after_owner),
+        cancellation: cancellation.clone(),
     };
 
     let document_config = RpgMakerDocumentReadingConfig::new(non_zero(2));
@@ -414,7 +430,7 @@ parameter = 0
             rules,
         )),
         FakeProjectLease,
-        crate::execution::CooperativeCancellation::default(),
+        cancellation,
     );
 
     let name: ProjectName = "demo".parse().expect("测试项目名应该合法");
@@ -450,13 +466,51 @@ parameter = 0
     *fail_owner.lock().expect("SQLite 失败配置锁不应中毒") = Some("builtin".to_owned());
 
     extract
-        .execute(ExtractInput { name })
+        .execute(ExtractInput { name: name.clone() })
         .await
         .expect_err("Builtin 根事务失败必须停止 Rules");
 
     assert_eq!(
         events.lock().expect("事件锁不应中毒").as_slice(),
         &[Event::BuiltinTransaction]
+    );
+
+    events.lock().expect("事件锁不应中毒").clear();
+    *fail_owner.lock().expect("SQLite 失败配置锁不应中毒") = Some("rules".to_owned());
+
+    let error = extract
+        .execute(ExtractInput { name: name.clone() })
+        .await
+        .expect_err("Rules 根事务失败必须保留已经提交的 Builtin 事实");
+    let super::service::ExtractServiceError::Rules {
+        completed_owners, ..
+    } = error
+    else {
+        panic!("Rules 事务失败应保持 Rules 阶段错误")
+    };
+    assert_eq!(completed_owners, vec![RpgMakerAssetOwner::Builtin]);
+    assert_eq!(
+        events.lock().expect("事件锁不应中毒").as_slice(),
+        &[Event::BuiltinTransaction, Event::RulesTransaction]
+    );
+
+    events.lock().expect("事件锁不应中毒").clear();
+    *fail_owner.lock().expect("SQLite 失败配置锁不应中毒") = None;
+    *cancel_after_owner
+        .lock()
+        .expect("SQLite 取消配置锁不应中毒") = Some("rules".to_owned());
+
+    let completion = extract
+        .execute(ExtractInput { name })
+        .await
+        .expect("Rules 提交后到达的取消不得抹掉已完成结果");
+    let OperationCompletion::Completed(output) = completion else {
+        panic!("Rules 提交后到达的取消应保留完成结果与警告")
+    };
+    assert_eq!(output.rules_warnings.len(), 1);
+    assert_eq!(
+        events.lock().expect("事件锁不应中毒").as_slice(),
+        &[Event::BuiltinTransaction, Event::RulesTransaction]
     );
 }
 

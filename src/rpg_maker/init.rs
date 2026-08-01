@@ -301,6 +301,19 @@ where
             });
         }
 
+        // 这两个名称一旦存在就必须是目录。它们承载运行历史和人工补译材料，
+        // 即使项目其余状态完全一致，也不能把同名普通文件当成“无需保留”。
+        let preserved_directories = if target_exists {
+            observe_preserved_observability_directories(
+                &self.file_system,
+                final_layout.workspace_root(),
+            )
+            .await
+            .map_err(ProjectWorkspaceConvergenceError::ObservePreservedDirectory)?
+        } else {
+            Vec::new()
+        };
+
         if let Some(state) = current_state.as_ref() {
             let structure_matches =
                 observe_required_workspace_structure(&self.file_system, &final_layout)
@@ -359,28 +372,7 @@ where
             DirectoryPublishIntent::CreateNew
         };
         // 现存工作区的 logs/ 与 task-records/ 是既有运行历史与人工补译审计材料，
-        // 重建发布必须原样带入候选；不存在或不是目录的条目不进入保留集合。
-        let mut preserved_directories = Vec::new();
-        if target_exists {
-            for name in PRESERVED_OBSERVABILITY_DIRECTORIES {
-                match self
-                    .file_system
-                    .resolve_existing_directory(final_layout.workspace_root().join(name))
-                    .await
-                {
-                    Ok(_) => preserved_directories.push(name),
-                    Err(
-                        ResolveDirectoryError::NotFound { .. }
-                        | ResolveDirectoryError::NotDirectory { .. },
-                    ) => {}
-                    Err(error) => {
-                        return Err(ProjectWorkspaceConvergenceError::ObservePreservedDirectory(
-                            error,
-                        ));
-                    }
-                }
-            }
-        }
+        // 重建发布必须原样带入候选。
         let mut empty_directories = vec![
             self.rpg_maker_layout.write_back_data_relative(),
             self.rpg_maker_layout.write_back_js_relative(),
@@ -765,6 +757,27 @@ where
 /// 工作区重建时按当前契约保留的非权威可观测性目录。
 const PRESERVED_OBSERVABILITY_DIRECTORIES: [&str; 2] = ["logs", "task-records"];
 
+async fn observe_preserved_observability_directories<F>(
+    file_system: &F,
+    workspace_root: &Path,
+) -> Result<Vec<&'static str>, ResolveDirectoryError<F::Error>>
+where
+    F: ExistingDirectoryResolver,
+{
+    let mut preserved = Vec::new();
+    for name in PRESERVED_OBSERVABILITY_DIRECTORIES {
+        match file_system
+            .resolve_existing_directory(workspace_root.join(name))
+            .await
+        {
+            Ok(_) => preserved.push(name),
+            Err(ResolveDirectoryError::NotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(preserved)
+}
+
 /// 把旧工作区的可观测性目录逐文件搬入已准备的候选。
 ///
 /// 来源树在项目租约下不会并发变化;显式栈遍历不建立深度上限。
@@ -993,6 +1006,7 @@ pub(crate) enum ProjectWorkspaceConvergenceFailureImpact {
     ConfigurationOrInput,
     ProjectState,
     StateAppliedButFinalizationFailed,
+    RecoveryRequired,
     OutcomeUnknown,
     Internal,
 }
@@ -1015,22 +1029,52 @@ impl<D, S, I, R, E, P, A> ProjectWorkspaceConvergenceError<D, S, I, R, E, P, A> 
             | Self::InspectExistingDatabase(_)
             | Self::ObserveWorkspaceStructure(_)
             | Self::ObserveExistingSource(_)
-            | Self::ObservePreservedDirectory(_)
-            | Self::Prepare(_)
-            | Self::PreserveObservability { .. }
-            | Self::CandidateFailure { .. }
-            | Self::CancellationCleanup(_) => Impact::ProjectState,
+            | Self::ObservePreservedDirectory(_) => Impact::ProjectState,
+            Self::Prepare(DirectoryPrepareError::NotPrepared {
+                cleanup_failure, ..
+            }) => {
+                if cleanup_failure.is_some() {
+                    Impact::RecoveryRequired
+                } else {
+                    Impact::ProjectState
+                }
+            }
+            Self::PreserveObservability { discard, .. }
+            | Self::CandidateFailure { discard, .. } => {
+                if discard.is_some() {
+                    Impact::RecoveryRequired
+                } else {
+                    Impact::ProjectState
+                }
+            }
+            Self::CancellationCleanup(_) => Impact::RecoveryRequired,
             Self::Publish(error) => match error {
-                DirectoryPublishError::TargetAlreadyExists { .. }
-                | DirectoryPublishError::TargetMissing { .. }
-                | DirectoryPublishError::TargetNotDirectory { .. }
-                | DirectoryPublishError::NotAttempted { .. }
-                | DirectoryPublishError::NotPublished { .. } => Impact::ProjectState,
+                DirectoryPublishError::TargetAlreadyExists {
+                    cleanup_failure, ..
+                }
+                | DirectoryPublishError::TargetMissing {
+                    cleanup_failure, ..
+                }
+                | DirectoryPublishError::TargetNotDirectory {
+                    cleanup_failure, ..
+                }
+                | DirectoryPublishError::NotAttempted {
+                    cleanup_failure, ..
+                }
+                | DirectoryPublishError::NotPublished {
+                    cleanup_failure, ..
+                } => {
+                    if cleanup_failure.is_some() {
+                        Impact::RecoveryRequired
+                    } else {
+                        Impact::ProjectState
+                    }
+                }
                 DirectoryPublishError::PublishedWithResiduals { .. } => {
                     Impact::StateAppliedButFinalizationFailed
                 }
-                DirectoryPublishError::RecoveryRequired { .. }
-                | DirectoryPublishError::OutcomeUnknown { .. } => Impact::OutcomeUnknown,
+                DirectoryPublishError::RecoveryRequired { .. } => Impact::RecoveryRequired,
+                DirectoryPublishError::OutcomeUnknown { .. } => Impact::OutcomeUnknown,
             },
         }
     }
@@ -1391,6 +1435,8 @@ mod tests {
     enum WorkspaceStructureObservation {
         Complete,
         ObservabilityDirectories,
+        LogsNotDirectory,
+        TaskRecordsNotDirectory,
         SqliteSidecars,
         SqliteSidecarNotFile,
         DatabaseNotFile,
@@ -1467,6 +1513,19 @@ mod tests {
             if path == Path::new("C:/projects/mz/game/logs")
                 || path == Path::new("C:/projects/mz/game/task-records")
             {
+                if (path.ends_with("logs")
+                    && matches!(
+                        self.workspace_structure,
+                        WorkspaceStructureObservation::LogsNotDirectory
+                    ))
+                    || (path.ends_with("task-records")
+                        && matches!(
+                            self.workspace_structure,
+                            WorkspaceStructureObservation::TaskRecordsNotDirectory
+                        ))
+                {
+                    return Err(ResolveDirectoryError::NotDirectory { path });
+                }
                 // 只有声明了可观测性目录的工作区场景才存在这两个目录。
                 if matches!(
                     self.workspace_structure,
@@ -1555,6 +1614,24 @@ mod tests {
                             DirectoryEntryKind::Directory,
                         ),
                     ]);
+                }
+                if matches!(
+                    self.workspace_structure,
+                    WorkspaceStructureObservation::LogsNotDirectory
+                ) {
+                    children.push(DirectoryEntry::new(
+                        path.join("logs"),
+                        DirectoryEntryKind::RegularFile,
+                    ));
+                }
+                if matches!(
+                    self.workspace_structure,
+                    WorkspaceStructureObservation::TaskRecordsNotDirectory
+                ) {
+                    children.push(DirectoryEntry::new(
+                        path.join("task-records"),
+                        DirectoryEntryKind::RegularFile,
+                    ));
                 }
                 if matches!(
                     self.workspace_structure,
@@ -2441,6 +2518,45 @@ mod tests {
                 .expect("snapshots mutex should not be poisoned")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn observability_names_that_are_not_directories_are_rejected_before_noop_or_rebuild() {
+        for (structure, entry_name) in [
+            (WorkspaceStructureObservation::LogsNotDirectory, "logs"),
+            (
+                WorkspaceStructureObservation::TaskRecordsNotDirectory,
+                "task-records",
+            ),
+        ] {
+            // 0x33 原本会走 Unchanged，0x44 原本会整树重建；两条路径都必须先拒绝。
+            for candidate_fingerprint in [0x33, 0x44] {
+                let current = database_state(0x33, Vec::new());
+                let (service, observations) = service(
+                    true,
+                    structure,
+                    ExistingSourceObservation::Fingerprint([0x33; 32]),
+                    candidate_fingerprint,
+                    Ok(current.clone()),
+                    Ok(ProjectDatabaseReconciliation::for_test(current)),
+                    Ok(()),
+                );
+
+                let error = service
+                    .converge(request())
+                    .await
+                    .expect_err("同名普通文件不能被静默删除或当成缺失目录");
+
+                assert!(matches!(
+                    error,
+                    ProjectWorkspaceConvergenceError::ObservePreservedDirectory(
+                        ResolveDirectoryError::NotDirectory { ref path }
+                    ) if path == &Path::new("C:/projects/mz/game").join(entry_name)
+                ));
+                assert!(!observations.events().contains(&"prepare"));
+                assert!(!observations.events().contains(&"publish"));
+            }
+        }
     }
 
     #[tokio::test]

@@ -73,6 +73,34 @@ pub struct WriteBackOutput {
     /// 本轮已经发布、供后续封包消费的固定最新输出根目录。
     pub output_root: PathBuf,
     pub summary: RpgMakerWriteBackSummary,
+    manual_layout_diagnostics: Vec<planner::ManualLayoutDiagnostic>,
+}
+
+impl WriteBackOutput {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        name: ProjectName,
+        output_root: PathBuf,
+        summary: RpgMakerWriteBackSummary,
+        manual_layout_diagnostics: Vec<planner::ManualLayoutDiagnostic>,
+    ) -> Self {
+        assert_eq!(
+            summary.manual_layout_units,
+            manual_layout_diagnostics.len(),
+            "人工布局汇总必须与结构化诊断逐项对应"
+        );
+        Self {
+            name,
+            output_root,
+            summary,
+            manual_layout_diagnostics,
+        }
+    }
+
+    /// 返回每项需要人工换行的精确逻辑位置、显示区域和宽度限制。
+    pub(crate) fn manual_layout_diagnostics(&self) -> &[planner::ManualLayoutDiagnostic] {
+        &self.manual_layout_diagnostics
+    }
 }
 
 /// 完整候选已经成功发布后的固定输出身份。
@@ -321,7 +349,7 @@ where
         let OperationCompletion::Completed(preparation) = preparation else {
             return Ok(OperationCompletion::Cancelled);
         };
-        let (documents, summary, _) = preparation.into_parts();
+        let (documents, summary, manual_layout_diagnostics) = preparation.into_parts();
 
         if self.cancellation.is_requested() {
             return Ok(OperationCompletion::Cancelled);
@@ -420,6 +448,7 @@ where
             name: project.name().clone(),
             output_root,
             summary,
+            manual_layout_diagnostics,
         }))
     }
 }
@@ -525,7 +554,9 @@ mod tests {
 
     use super::*;
     use crate::project_lease::{ProjectCommandLease, ProjectCommandLeaseProvider};
-    use crate::rpg_maker::project::test_layout_profile;
+    use crate::rpg_maker::model::{LogicalTextLocation, ScalarFieldKey, TextUnitRole};
+    use crate::rpg_maker::project::{MaxFullwidthChars, test_layout_profile};
+    use crate::rpg_maker::text::{RpgMakerLocation, RpgMakerSource, StandardDataFile};
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct FakeError;
@@ -581,6 +612,7 @@ mod tests {
     struct FakeWriteBack {
         events: Events,
         summary: RpgMakerWriteBackSummary,
+        manual_layout_diagnostics: Vec<planner::ManualLayoutDiagnostic>,
     }
 
     impl RpgMakerWriteBack for FakeWriteBack {
@@ -597,7 +629,11 @@ mod tests {
         > {
             record(&self.events, "prepare");
             Ok(OperationCompletion::Completed(
-                planner::RpgMakerWriteBackPreparation::new((), self.summary, Vec::new()),
+                planner::RpgMakerWriteBackPreparation::new(
+                    (),
+                    self.summary,
+                    self.manual_layout_diagnostics.clone(),
+                ),
             ))
         }
     }
@@ -700,6 +736,7 @@ mod tests {
             FakeWriteBack {
                 events: Arc::clone(&events),
                 summary,
+                manual_layout_diagnostics: Vec::new(),
             },
             FakePublisher {
                 events: Arc::clone(&events),
@@ -741,6 +778,50 @@ mod tests {
                 "publish",
                 "publication_finished",
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_write_back_preserves_each_manual_layout_diagnostic() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut service = service(Arc::clone(&events), CooperativeCancellation::default());
+        service.rpg_maker_write_back.summary.manual_layout_units = 1;
+        service.rpg_maker_write_back.manual_layout_diagnostics.push(
+            planner::ManualLayoutDiagnostic::for_test(
+                vec![LogicalTextLocation::new(
+                    RpgMakerLocation::value(
+                        RpgMakerSource::data(StandardDataFile::Actors),
+                        Vec::new(),
+                    ),
+                    TextUnitRole::Scalar(
+                        ScalarFieldKey::new("description").expect("测试字段名应合法"),
+                    ),
+                )],
+                planner::RpgMakerWriteBackLayoutRegion::HelpDescription,
+                MaxFullwidthChars::new(18).expect("测试宽度应合法"),
+            ),
+        );
+
+        let completion = service
+            .execute(WriteBackInput {
+                name: "demo".parse().expect("项目名应合法"),
+            })
+            .await
+            .expect("带人工布局项的写回应成功");
+        let OperationCompletion::Completed(output) = completion else {
+            panic!("未取消的写回应完成")
+        };
+
+        let [diagnostic] = output.manual_layout_diagnostics() else {
+            panic!("每个人工布局项都必须交还给调用方")
+        };
+        assert_eq!(diagnostic.region_name(), "help_description");
+        assert_eq!(diagnostic.max_fullwidth_chars(), 18);
+        assert_eq!(diagnostic.locations().len(), 1);
+        assert_eq!(diagnostic.locations()[0].role_name(), "scalar:description");
+        assert_eq!(
+            diagnostic.locations()[0].group_location().to_string(),
+            "data/Actors.json"
         );
     }
 

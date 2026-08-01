@@ -1,8 +1,8 @@
 //! 终端实时进度的共享契约与渲染根适配器。
 //!
-//! 业务切片拥有阶段枚举，并只发布绝对快照；本模块不解释业务阶段，也不把终端
-//! 写入故障反馈给业务流程。动态终端渲染在后台线程执行；中间观察只尝试替换一个
-//! 有界的最新快照，最终确认快照通过异步渲染通道交接，因此业务不会等待终端 I/O。
+//! 业务切片拥有阶段枚举，并只发布绝对快照；本模块不解释业务阶段。动态终端渲染在
+//! 后台线程执行；中间观察只尝试替换一个有界的最新快照，最终确认快照通过异步渲染
+//! 通道交接。线程、通道和终端 I/O 故障会记入统一健康快照，并由显式收尾结果返回给进程边界。
 
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
@@ -157,6 +157,211 @@ enum RenderStyle {
     Silent,
 }
 
+/// 终端进度呈现失败的类型。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TerminalProgressFailureKind {
+    RendererThreadStart,
+    ControlChannelClosed,
+    WriterWrite,
+    WriterFlush,
+    RendererThreadPanicked,
+}
+
+impl TerminalProgressFailureKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::RendererThreadStart => "renderer_thread_start",
+            Self::ControlChannelClosed => "control_channel_closed",
+            Self::WriterWrite => "writer_write",
+            Self::WriterFlush => "writer_flush",
+            Self::RendererThreadPanicked => "renderer_thread_panicked",
+        }
+    }
+}
+
+/// 失败发生时进度渲染器正在执行的操作。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TerminalProgressOperation {
+    StartRenderer,
+    PublishCompletion,
+    RenderPlainLine,
+    RenderDynamicLine,
+    RenderStatus,
+    ClearDynamicLine,
+    RenderFinalMessage,
+    Finalizing,
+    SafeStopping,
+    Finish,
+    JoinRenderer,
+}
+
+impl TerminalProgressOperation {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::StartRenderer => "start_renderer",
+            Self::PublishCompletion => "publish_completion",
+            Self::RenderPlainLine => "render_plain_line",
+            Self::RenderDynamicLine => "render_dynamic_line",
+            Self::RenderStatus => "render_status",
+            Self::ClearDynamicLine => "clear_dynamic_line",
+            Self::RenderFinalMessage => "render_final_message",
+            Self::Finalizing => "finalizing",
+            Self::SafeStopping => "safe_stopping",
+            Self::Finish => "finish",
+            Self::JoinRenderer => "join_renderer",
+        }
+    }
+}
+
+/// 一项已经确认的终端进度呈现失败。
+#[derive(Clone, Debug)]
+pub(crate) struct TerminalProgressFailure {
+    kind: TerminalProgressFailureKind,
+    operation: TerminalProgressOperation,
+    source: Option<Arc<io::Error>>,
+    detail: String,
+}
+
+impl TerminalProgressFailure {
+    fn io(
+        kind: TerminalProgressFailureKind,
+        operation: TerminalProgressOperation,
+        source: io::Error,
+    ) -> Self {
+        let detail = source.to_string();
+        Self {
+            kind,
+            operation,
+            source: Some(Arc::new(source)),
+            detail,
+        }
+    }
+
+    fn channel_closed(operation: TerminalProgressOperation) -> Self {
+        Self {
+            kind: TerminalProgressFailureKind::ControlChannelClosed,
+            operation,
+            source: None,
+            detail: String::from("终端进度渲染线程的 control channel 已关闭"),
+        }
+    }
+
+    fn worker_panicked(detail: String) -> Self {
+        Self {
+            kind: TerminalProgressFailureKind::RendererThreadPanicked,
+            operation: TerminalProgressOperation::JoinRenderer,
+            source: None,
+            detail,
+        }
+    }
+
+    pub(crate) const fn kind(&self) -> TerminalProgressFailureKind {
+        self.kind
+    }
+
+    pub(crate) const fn operation(&self) -> TerminalProgressOperation {
+        self.operation
+    }
+
+    pub(crate) fn io_error_kind(&self) -> Option<io::ErrorKind> {
+        self.source.as_ref().map(|source| source.kind())
+    }
+
+    pub(crate) fn raw_os_error(&self) -> Option<i32> {
+        self.source
+            .as_ref()
+            .and_then(|source| source.raw_os_error())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn detail(&self) -> &str {
+        &self.detail
+    }
+
+    fn same_fact(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.operation == other.operation
+            && self.io_error_kind() == other.io_error_kind()
+            && self.raw_os_error() == other.raw_os_error()
+            && self.detail == other.detail
+    }
+}
+
+impl fmt::Display for TerminalProgressFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "terminal progress {} failed during {}: {}",
+            self.kind.as_str(),
+            self.operation.as_str(),
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for TerminalProgressFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
+
+/// 一次进度命令期间已确认的全部呈现失败。
+#[derive(Clone, Debug)]
+pub(crate) struct TerminalProgressFailures {
+    failures: Vec<TerminalProgressFailure>,
+}
+
+impl TerminalProgressFailures {
+    pub(crate) fn failures(&self) -> &[TerminalProgressFailure] {
+        &self.failures
+    }
+}
+
+impl fmt::Display for TerminalProgressFailures {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, failure) in self.failures.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str("; ")?;
+            }
+            failure.fmt(formatter)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for TerminalProgressFailures {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.failures
+            .first()
+            .map(|failure| failure as &(dyn std::error::Error + 'static))
+    }
+}
+
+#[derive(Default)]
+struct ProgressHealth {
+    failures: Mutex<Vec<TerminalProgressFailure>>,
+}
+
+impl ProgressHealth {
+    fn record(&self, failure: TerminalProgressFailure) {
+        let mut failures = lock_after_poison(&self.failures);
+        if !failures.iter().any(|current| current.same_fact(&failure)) {
+            failures.push(failure);
+        }
+    }
+
+    fn result(&self) -> Result<(), TerminalProgressFailures> {
+        let failures = lock_after_poison(&self.failures).clone();
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(TerminalProgressFailures { failures })
+        }
+    }
+}
+
 struct PendingSnapshot<P> {
     sequence: u64,
     snapshot: ProgressSnapshot<P>,
@@ -191,9 +396,12 @@ impl<P> LatestSnapshot<P> {
     }
 
     fn take(&self) -> Option<ProgressSnapshot<P>> {
-        lock_after_poison(&self.pending)
-            .take()
-            .map(|pending| pending.snapshot)
+        let mut pending = match self.pending.try_lock() {
+            Ok(pending) => pending,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return None,
+        };
+        pending.take().map(|pending| pending.snapshot)
     }
 }
 
@@ -207,6 +415,7 @@ struct SnapshotDispatch<P> {
     latest: Arc<LatestSnapshot<P>>,
     control_sender: Arc<mpsc::Sender<RendererControl<P>>>,
     worker_thread: Thread,
+    health: Arc<ProgressHealth>,
 }
 
 /// 可廉价克隆并交给并发业务工作的终端进度观察者。
@@ -247,9 +456,17 @@ where
         if snapshot.amount.is_complete() {
             // 完成快照和后续 Status/Finish 共用同一个 Sender，确保调用方先发布的
             // N/N 不会被收尾消息越过；异步 channel 的 send 不等待渲染线程。
-            let _ = dispatch
+            if dispatch
                 .control_sender
-                .send(RendererControl::Completion(snapshot));
+                .send(RendererControl::Completion(snapshot))
+                .is_err()
+            {
+                dispatch
+                    .health
+                    .record(TerminalProgressFailure::channel_closed(
+                        TerminalProgressOperation::PublishCompletion,
+                    ));
+            }
         } else {
             dispatch.latest.try_replace(snapshot);
         }
@@ -259,18 +476,54 @@ where
 
 enum RendererControl<P> {
     Completion(ProgressSnapshot<P>),
-    Status(String),
+    Status {
+        message: String,
+        operation: TerminalProgressOperation,
+        acknowledgement: mpsc::Sender<()>,
+    },
     Finish(Option<String>),
 }
 
 struct RendererControlHandle<P> {
     sender: Arc<mpsc::Sender<RendererControl<P>>>,
     worker_thread: Thread,
+    health: Arc<ProgressHealth>,
 }
 
 impl<P> RendererControlHandle<P> {
-    fn send(&self, control: RendererControl<P>) {
-        let _ = self.sender.send(control);
+    fn send_status(
+        &self,
+        message: String,
+        operation: TerminalProgressOperation,
+    ) -> Result<(), TerminalProgressFailures> {
+        let (acknowledgement, acknowledged) = mpsc::channel();
+        if self
+            .sender
+            .send(RendererControl::Status {
+                message,
+                operation,
+                acknowledgement,
+            })
+            .is_err()
+        {
+            self.health
+                .record(TerminalProgressFailure::channel_closed(operation));
+            return self.health.result();
+        }
+        self.worker_thread.unpark();
+        if acknowledged.recv().is_err() {
+            self.health
+                .record(TerminalProgressFailure::channel_closed(operation));
+        }
+        self.health.result()
+    }
+
+    fn send_finish(&self, message: Option<String>) {
+        if self.sender.send(RendererControl::Finish(message)).is_err() {
+            self.health.record(TerminalProgressFailure::channel_closed(
+                TerminalProgressOperation::Finish,
+            ));
+        }
         self.worker_thread.unpark();
     }
 }
@@ -285,15 +538,26 @@ pub(crate) struct TerminalProgress<P> {
     observer: TerminalProgressObserver<P>,
     control: Option<RendererControlHandle<P>>,
     worker: Option<JoinHandle<()>>,
+    health: Arc<ProgressHealth>,
+    finished: bool,
 }
 
 impl<P> TerminalProgress<P> {
     fn silent() -> Self {
+        let health = Arc::new(ProgressHealth::default());
         Self {
             observer: TerminalProgressObserver::silent(),
             control: None,
             worker: None,
+            health,
+            finished: false,
         }
+    }
+
+    fn silent_with_failure(failure: TerminalProgressFailure) -> Self {
+        let progress = Self::silent();
+        progress.health.record(failure);
+        progress
     }
 
     pub(crate) fn observer(&self) -> TerminalProgressObserver<P> {
@@ -308,41 +572,72 @@ impl<P> TerminalProgress<P> {
         self.observer.observe(snapshot);
     }
 
-    /// 切换到本地化的收尾状态；不会把终端写入故障返回给调用方。
-    pub(crate) fn finalizing(&self, message: impl Into<String>) {
-        self.send_control(RendererControl::Status(message.into()));
+    /// 切换到本地化的收尾状态，并等待后台线程确认呈现结果。
+    pub(crate) fn finalizing(
+        &self,
+        message: impl Into<String>,
+    ) -> Result<(), TerminalProgressFailures> {
+        self.send_status(message.into(), TerminalProgressOperation::Finalizing)
     }
 
-    /// 切换到本地化的安全停止状态，并保留此前确认的业务进度事实。
-    pub(crate) fn safe_stopping(&self, message: impl Into<String>) {
-        self.send_control(RendererControl::Status(message.into()));
+    /// 切换到本地化的安全停止状态，保留此前确认的业务进度事实，并等待呈现确认。
+    pub(crate) fn safe_stopping(
+        &self,
+        message: impl Into<String>,
+    ) -> Result<(), TerminalProgressFailures> {
+        self.send_status(message.into(), TerminalProgressOperation::SafeStopping)
     }
 
-    /// 清除实时状态并等待渲染线程结束。
-    pub(crate) fn finish(mut self) {
-        self.shutdown(None);
+    /// 清除实时状态、等待渲染线程结束，并返回命令期间已经确认的全部呈现失败。
+    pub(crate) fn finish(mut self) -> Result<(), TerminalProgressFailures> {
+        self.shutdown(None)
     }
 
     /// 用一行本地化文本结束实时状态并等待渲染线程结束。
     #[cfg(test)]
-    pub(crate) fn finish_with_message(mut self, message: impl Into<String>) {
-        self.shutdown(Some(message.into()));
+    pub(crate) fn finish_with_message(
+        mut self,
+        message: impl Into<String>,
+    ) -> Result<(), TerminalProgressFailures> {
+        self.shutdown(Some(message.into()))
     }
 
-    fn send_control(&self, control: RendererControl<P>) {
+    /// 返回当前已经确认的呈现失败，不停止渲染线程。
+    #[cfg(test)]
+    pub(crate) fn check_health(&self) -> Result<(), TerminalProgressFailures> {
+        self.health.result()
+    }
+
+    fn send_status(
+        &self,
+        message: String,
+        operation: TerminalProgressOperation,
+    ) -> Result<(), TerminalProgressFailures> {
         if let Some(handle) = &self.control {
-            handle.send(control);
+            handle.send_status(message, operation)
+        } else {
+            self.health.result()
         }
     }
 
-    fn shutdown(&mut self, message: Option<String>) {
-        if let Some(handle) = self.control.take() {
-            handle.send(RendererControl::Finish(message));
+    fn shutdown(&mut self, message: Option<String>) -> Result<(), TerminalProgressFailures> {
+        if self.finished {
+            return self.health.result();
         }
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+        if let Some(handle) = self.control.take() {
+            handle.send_finish(message);
+        }
+        if let Some(worker) = self.worker.take()
+            && let Err(panic) = worker.join()
+        {
+            self.health
+                .record(TerminalProgressFailure::worker_panicked(panic_detail(
+                    panic,
+                )));
         }
         self.observer = TerminalProgressObserver::silent();
+        self.finished = true;
+        self.health.result()
     }
 }
 
@@ -363,7 +658,8 @@ where
     /// 使用调用方提供的输出能力创建渲染器。
     ///
     /// `stderr_is_terminal` 必须来自承载标准错误流的真实终端判断；该参数也使终端
-    /// 策略能够在不依赖真实控制台的测试中完整验证。
+    /// 策略能够在不依赖真实控制台的测试中完整验证。渲染线程无法创建时，返回携带
+    /// 启动失败健康状态的静默控制器；调用方仍可执行业务，但必须处理后续健康检查或收尾结果。
     pub(crate) fn with_writer<W, R>(
         mode: ProgressMode,
         stderr_is_terminal: bool,
@@ -374,6 +670,27 @@ where
         W: Write + Send + 'static,
         R: Fn(&P) -> String + Send + 'static,
     {
+        Self::with_writer_and_spawner(
+            mode,
+            stderr_is_terminal,
+            writer,
+            render_phase,
+            spawn_renderer_thread,
+        )
+    }
+
+    fn with_writer_and_spawner<W, R, S>(
+        mode: ProgressMode,
+        stderr_is_terminal: bool,
+        writer: W,
+        render_phase: R,
+        spawn: S,
+    ) -> Self
+    where
+        W: Write + Send + 'static,
+        R: Fn(&P) -> String + Send + 'static,
+        S: FnOnce(Box<dyn FnOnce() + Send + 'static>) -> io::Result<JoinHandle<()>>,
+    {
         let style = mode.render_style(stderr_is_terminal);
         if style == RenderStyle::Silent {
             return Self::silent();
@@ -383,14 +700,27 @@ where
         let worker_latest = Arc::clone(&latest);
         let (control_sender, control_receiver) = mpsc::channel();
         let control_sender = Arc::new(control_sender);
-        let worker = thread::Builder::new()
-            .name(String::from("att-terminal-progress"))
-            .spawn(move || {
-                run_renderer(style, writer, render_phase, worker_latest, control_receiver);
-            });
-
-        let Ok(worker) = worker else {
-            return Self::silent();
+        let health = Arc::new(ProgressHealth::default());
+        let worker_health = Arc::clone(&health);
+        let worker = spawn(Box::new(move || {
+            run_renderer(
+                style,
+                writer,
+                render_phase,
+                worker_latest,
+                control_receiver,
+                worker_health,
+            );
+        }));
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(source) => {
+                return Self::silent_with_failure(TerminalProgressFailure::io(
+                    TerminalProgressFailureKind::RendererThreadStart,
+                    TerminalProgressOperation::StartRenderer,
+                    source,
+                ));
+            }
         };
         let worker_thread = worker.thread().clone();
         Self {
@@ -399,21 +729,48 @@ where
                     latest,
                     control_sender: Arc::clone(&control_sender),
                     worker_thread: worker_thread.clone(),
+                    health: Arc::clone(&health),
                 })),
             },
             control: Some(RendererControlHandle {
                 sender: control_sender,
                 worker_thread,
+                health: Arc::clone(&health),
             }),
             worker: Some(worker),
+            health,
+            finished: false,
         }
     }
 }
 
 impl<P> Drop for TerminalProgress<P> {
     fn drop(&mut self) {
-        self.shutdown(None);
+        if self.finished {
+            return;
+        }
+        if let Err(failures) = self.shutdown(None)
+            && !thread::panicking()
+        {
+            panic!("终端进度控制器在 Drop 收尾时发现未处理的呈现失败: {failures}");
+        }
     }
+}
+
+fn spawn_renderer_thread(task: Box<dyn FnOnce() + Send + 'static>) -> io::Result<JoinHandle<()>> {
+    thread::Builder::new()
+        .name(String::from("att-terminal-progress"))
+        .spawn(task)
+}
+
+fn panic_detail(panic: Box<dyn std::any::Any + Send + 'static>) -> String {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        return (*message).to_owned();
+    }
+    if let Some(message) = panic.downcast_ref::<String>() {
+        return message.clone();
+    }
+    String::from("渲染线程以非文本 panic payload 结束")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -556,6 +913,7 @@ fn run_renderer<P, W, R>(
     render_phase: R,
     latest: Arc<LatestSnapshot<P>>,
     control_receiver: mpsc::Receiver<RendererControl<P>>,
+    health: Arc<ProgressHealth>,
 ) where
     P: Eq,
     W: Write,
@@ -573,6 +931,7 @@ fn run_renderer<P, W, R>(
                     &render_phase,
                     &mut state,
                     &mut writer_available,
+                    &health,
                 );
             }
         }
@@ -588,16 +947,22 @@ fn run_renderer<P, W, R>(
                             &render_phase,
                             &mut state,
                             &mut writer_available,
+                            &health,
                         );
                     }
                 }
-                RendererControl::Status(message) => {
+                RendererControl::Status {
+                    message,
+                    operation,
+                    acknowledgement,
+                } => {
                     if style == RenderStyle::Dynamic && state.active_is_completed_snapshot() {
                         write_dynamic_active(
                             &mut writer,
                             &render_phase,
                             &mut state,
                             &mut writer_available,
+                            &health,
                         );
                     }
                     state.set_status(message);
@@ -607,14 +972,19 @@ fn run_renderer<P, W, R>(
                             &render_phase,
                             &mut state,
                             &mut writer_available,
+                            &health,
                         ),
                         RenderStyle::Plain => write_plain_active(
                             &mut writer,
                             &render_phase,
                             &mut state,
                             &mut writer_available,
+                            &health,
                         ),
                         RenderStyle::Silent => {}
+                    }
+                    if acknowledgement.send(()).is_err() {
+                        health.record(TerminalProgressFailure::channel_closed(operation));
                     }
                 }
                 RendererControl::Finish(message) => {
@@ -631,6 +1001,7 @@ fn run_renderer<P, W, R>(
                 &mut state,
                 message.as_deref(),
                 &mut writer_available,
+                &health,
             );
             return;
         }
@@ -641,6 +1012,7 @@ fn run_renderer<P, W, R>(
                 &render_phase,
                 &mut state,
                 &mut writer_available,
+                &health,
             );
         }
 
@@ -691,6 +1063,7 @@ fn write_plain_active<P, W, R>(
     render_phase: &R,
     state: &mut RendererState<P>,
     writer_available: &mut bool,
+    health: &ProgressHealth,
 ) where
     W: Write,
     R: Fn(&P) -> String,
@@ -705,9 +1078,15 @@ fn write_plain_active<P, W, R>(
         return;
     }
     state.last_plain_line = Some(line.clone());
-    if writeln!(writer, "{line}")
-        .and_then(|()| writer.flush())
-        .is_err()
+    let operation = if state.active == ActiveDisplay::Status {
+        TerminalProgressOperation::RenderStatus
+    } else {
+        TerminalProgressOperation::RenderPlainLine
+    };
+    if write_and_flush(writer, operation, health, |writer| {
+        writeln!(writer, "{line}")
+    })
+    .is_err()
     {
         *writer_available = false;
     }
@@ -718,6 +1097,7 @@ fn write_dynamic_active<P, W, R>(
     render_phase: &R,
     state: &mut RendererState<P>,
     writer_available: &mut bool,
+    health: &ProgressHealth,
 ) where
     W: Write,
     R: Fn(&P) -> String,
@@ -732,9 +1112,15 @@ fn write_dynamic_active<P, W, R>(
     state.spinner_frame = state.spinner_frame.wrapping_add(1);
     let line_width = UnicodeWidthStr::width(line.as_str());
     let trailing_spaces = state.dynamic_line_width.saturating_sub(line_width);
-    if write!(writer, "\r{line}{:trailing_spaces$}", "")
-        .and_then(|()| writer.flush())
-        .is_err()
+    let operation = if state.active == ActiveDisplay::Status {
+        TerminalProgressOperation::RenderStatus
+    } else {
+        TerminalProgressOperation::RenderDynamicLine
+    };
+    if write_and_flush(writer, operation, health, |writer| {
+        write!(writer, "\r{line}{:trailing_spaces$}", "")
+    })
+    .is_err()
     {
         *writer_available = false;
         return;
@@ -818,19 +1204,20 @@ fn clear_dynamic_line<P, W>(
     writer: &mut W,
     state: &mut RendererState<P>,
     writer_available: &mut bool,
+    health: &ProgressHealth,
 ) where
     W: Write,
 {
     if !*writer_available || state.dynamic_line_width == 0 {
         return;
     }
-    if write!(
+    let width = state.dynamic_line_width;
+    if write_and_flush(
         writer,
-        "\r{:width$}\r",
-        "",
-        width = state.dynamic_line_width
+        TerminalProgressOperation::ClearDynamicLine,
+        health,
+        |writer| write!(writer, "\r{:width$}\r", "", width = width),
     )
-    .and_then(|()| writer.flush())
     .is_err()
     {
         *writer_available = false;
@@ -844,6 +1231,7 @@ fn finish_rendering<P, W>(
     state: &mut RendererState<P>,
     message: Option<&str>,
     writer_available: &mut bool,
+    health: &ProgressHealth,
 ) where
     W: Write,
 {
@@ -853,12 +1241,16 @@ fn finish_rendering<P, W>(
     let message = message.map(sanitize_terminal_line);
     match style {
         RenderStyle::Dynamic => {
-            clear_dynamic_line(writer, state, writer_available);
+            clear_dynamic_line(writer, state, writer_available, health);
             if let Some(message) = message
                 && *writer_available
-                && writeln!(writer, "{message}")
-                    .and_then(|()| writer.flush())
-                    .is_err()
+                && write_and_flush(
+                    writer,
+                    TerminalProgressOperation::RenderFinalMessage,
+                    health,
+                    |writer| writeln!(writer, "{message}"),
+                )
+                .is_err()
             {
                 *writer_available = false;
             }
@@ -866,15 +1258,48 @@ fn finish_rendering<P, W>(
         RenderStyle::Plain => {
             if let Some(message) = message
                 && state.last_plain_line.as_deref() != Some(message.as_str())
-                && writeln!(writer, "{message}")
-                    .and_then(|()| writer.flush())
-                    .is_err()
+                && write_and_flush(
+                    writer,
+                    TerminalProgressOperation::RenderFinalMessage,
+                    health,
+                    |writer| writeln!(writer, "{message}"),
+                )
+                .is_err()
             {
                 *writer_available = false;
             }
         }
         RenderStyle::Silent => {}
     }
+}
+
+fn write_and_flush<W, F>(
+    writer: &mut W,
+    operation: TerminalProgressOperation,
+    health: &ProgressHealth,
+    write: F,
+) -> Result<(), ()>
+where
+    W: Write,
+    F: FnOnce(&mut W) -> io::Result<()>,
+{
+    if let Err(source) = write(writer) {
+        health.record(TerminalProgressFailure::io(
+            TerminalProgressFailureKind::WriterWrite,
+            operation,
+            source,
+        ));
+        return Err(());
+    }
+    if let Err(source) = writer.flush() {
+        health.record(TerminalProgressFailure::io(
+            TerminalProgressFailureKind::WriterFlush,
+            operation,
+            source,
+        ));
+        return Err(());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -911,6 +1336,56 @@ mod tests {
         }
     }
 
+    struct WriteFailingWriter;
+
+    impl Write for WriteFailingWriter {
+        fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from_raw_os_error(5))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FlushFailingWriter;
+
+    impl Write for FlushFailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "injected flush failure",
+            ))
+        }
+    }
+
+    struct PanickingWriter;
+
+    impl Write for PanickingWriter {
+        fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+            panic!("injected renderer panic")
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn has_failure(
+        failures: &TerminalProgressFailures,
+        kind: TerminalProgressFailureKind,
+        operation: TerminalProgressOperation,
+    ) -> bool {
+        failures
+            .failures()
+            .iter()
+            .any(|failure| failure.kind() == kind && failure.operation() == operation)
+    }
+
     fn phase_label(phase: &Phase) -> String {
         match phase {
             Phase::Planning => String::from("规划"),
@@ -944,11 +1419,188 @@ mod tests {
             let output = writer.clone();
             let progress = TerminalProgress::with_writer(mode, terminal, writer, phase_label);
             progress.observe(ProgressSnapshot::indeterminate(Phase::Planning));
-            progress.finalizing("正在收尾");
-            progress.safe_stopping("正在安全停止");
-            progress.finish_with_message("完成");
+            progress.finalizing("正在收尾").expect("静默模式应成功");
+            progress
+                .safe_stopping("正在安全停止")
+                .expect("静默模式应成功");
+            progress
+                .finish_with_message("完成")
+                .expect("静默模式应成功");
             assert!(output.text().is_empty());
         }
+    }
+
+    #[test]
+    fn renderer_thread_start_failure_is_returned_with_io_context() {
+        let progress = TerminalProgress::<Phase>::with_writer_and_spawner(
+            ProgressMode::Plain,
+            false,
+            SharedWriter::default(),
+            phase_label,
+            |_task| Err(io::Error::from_raw_os_error(8)),
+        );
+        let failures = progress
+            .check_health()
+            .expect_err("线程创建失败必须立即进入健康快照");
+        let failure = failures.failures().first().expect("必须返回失败");
+        assert_eq!(
+            failure.kind(),
+            TerminalProgressFailureKind::RendererThreadStart
+        );
+        assert_eq!(
+            failure.operation(),
+            TerminalProgressOperation::StartRenderer
+        );
+        assert_eq!(failure.raw_os_error(), Some(8));
+        progress.finish().expect_err("收尾必须保留线程创建失败");
+    }
+
+    #[test]
+    fn finalizing_returns_writer_write_failure_without_waiting_for_finish() {
+        let progress = TerminalProgress::with_writer(
+            ProgressMode::Plain,
+            false,
+            WriteFailingWriter,
+            phase_label,
+        );
+
+        let failures = progress
+            .finalizing("正在收尾")
+            .expect_err("写入失败必须由 finalizing 立即返回");
+        assert!(has_failure(
+            &failures,
+            TerminalProgressFailureKind::WriterWrite,
+            TerminalProgressOperation::RenderStatus,
+        ));
+        let write_failure = failures
+            .failures()
+            .iter()
+            .find(|failure| failure.kind() == TerminalProgressFailureKind::WriterWrite)
+            .expect("必须保留写入失败");
+        assert_eq!(write_failure.raw_os_error(), Some(5));
+
+        progress.finish().expect_err("收尾仍必须保留既有失败");
+    }
+
+    #[test]
+    fn safe_stopping_returns_writer_flush_failure() {
+        let progress = TerminalProgress::with_writer(
+            ProgressMode::Plain,
+            false,
+            FlushFailingWriter,
+            phase_label,
+        );
+
+        let failures = progress
+            .safe_stopping("正在安全停止")
+            .expect_err("flush 失败必须由 safe_stopping 立即返回");
+        assert!(has_failure(
+            &failures,
+            TerminalProgressFailureKind::WriterFlush,
+            TerminalProgressOperation::RenderStatus,
+        ));
+        let flush_failure = failures
+            .failures()
+            .iter()
+            .find(|failure| failure.kind() == TerminalProgressFailureKind::WriterFlush)
+            .expect("必须保留 flush 失败");
+        assert_eq!(
+            flush_failure.io_error_kind(),
+            Some(io::ErrorKind::BrokenPipe)
+        );
+
+        progress.finish().expect_err("收尾仍必须保留既有失败");
+    }
+
+    #[test]
+    fn finish_returns_final_message_write_failure() {
+        let progress = TerminalProgress::with_writer(
+            ProgressMode::Plain,
+            false,
+            WriteFailingWriter,
+            phase_label,
+        );
+
+        let failures = progress
+            .finish_with_message("完成")
+            .expect_err("最终消息写入失败必须由 finish 返回");
+        assert!(has_failure(
+            &failures,
+            TerminalProgressFailureKind::WriterWrite,
+            TerminalProgressOperation::RenderFinalMessage,
+        ));
+    }
+
+    #[test]
+    fn closed_control_channel_is_returned_by_status_and_finish() {
+        let progress = TerminalProgress::<Phase>::with_writer_and_spawner(
+            ProgressMode::Plain,
+            false,
+            SharedWriter::default(),
+            phase_label,
+            |_renderer| Ok(thread::spawn(|| {})),
+        );
+
+        let failures = progress
+            .finalizing("正在收尾")
+            .expect_err("已关闭 channel 必须返回失败");
+        assert!(has_failure(
+            &failures,
+            TerminalProgressFailureKind::ControlChannelClosed,
+            TerminalProgressOperation::Finalizing,
+        ));
+
+        let failures = progress.finish().expect_err("finish 必须返回 channel 失败");
+        assert!(has_failure(
+            &failures,
+            TerminalProgressFailureKind::ControlChannelClosed,
+            TerminalProgressOperation::Finish,
+        ));
+    }
+
+    #[test]
+    fn completion_observer_records_closed_control_channel_in_health_snapshot() {
+        let progress = TerminalProgress::<Phase>::with_writer_and_spawner(
+            ProgressMode::Plain,
+            false,
+            SharedWriter::default(),
+            phase_label,
+            |_renderer| Ok(thread::spawn(|| {})),
+        );
+        progress.observe(ProgressSnapshot::determinate(Phase::Translating, 1, 1));
+
+        let failures = progress
+            .check_health()
+            .expect_err("观察入口不能返回 Result 时必须记入健康快照");
+        assert!(has_failure(
+            &failures,
+            TerminalProgressFailureKind::ControlChannelClosed,
+            TerminalProgressOperation::PublishCompletion,
+        ));
+        progress.finish().expect_err("收尾必须保留观察失败");
+    }
+
+    #[test]
+    fn worker_panic_is_returned_by_finish_with_payload() {
+        let progress =
+            TerminalProgress::with_writer(ProgressMode::Plain, false, PanickingWriter, phase_label);
+        progress.observe(ProgressSnapshot::determinate(Phase::Translating, 1, 1));
+
+        let failures = progress
+            .finish()
+            .expect_err("渲染线程 panic 必须由 finish 返回");
+        assert!(has_failure(
+            &failures,
+            TerminalProgressFailureKind::RendererThreadPanicked,
+            TerminalProgressOperation::JoinRenderer,
+        ));
+        assert!(
+            failures
+                .failures()
+                .iter()
+                .any(|failure| failure.detail().contains("injected renderer panic")),
+            "panic payload 必须保留: {failures}"
+        );
     }
 
     #[test]
@@ -1007,9 +1659,13 @@ mod tests {
         thread::sleep(Duration::from_millis(10));
         progress.observe(ProgressSnapshot::determinate(Phase::Translating, 10, 100));
         thread::sleep(Duration::from_millis(10));
-        progress.safe_stopping("安全\u{001b}[2J\r\n停止");
+        progress
+            .safe_stopping("安全\u{001b}[2J\r\n停止")
+            .expect("状态应成功呈现");
         thread::sleep(Duration::from_millis(10));
-        progress.finish_with_message("结束\n完成");
+        progress
+            .finish_with_message("结束\n完成")
+            .expect("收尾应成功");
 
         let text = output.text();
         assert!(
@@ -1049,9 +1705,9 @@ mod tests {
         thread::sleep(Duration::from_millis(15));
         progress.observe(ProgressSnapshot::determinate(Phase::Translating, 5, 10));
         thread::sleep(DYNAMIC_REFRESH_INTERVAL + Duration::from_millis(20));
-        progress.finalizing("正在收尾");
+        progress.finalizing("正在收尾").expect("状态应呈现");
         thread::sleep(Duration::from_millis(15));
-        progress.finish();
+        progress.finish().expect("收尾应成功");
 
         let text = output.text();
         assert!(text.contains('\r'), "动态终端必须使用单行刷新：{text:?}");
@@ -1077,8 +1733,8 @@ mod tests {
         let progress =
             TerminalProgress::with_writer(ProgressMode::Plain, false, writer, phase_label);
         progress.observe(ProgressSnapshot::determinate(Phase::Translating, 10, 10));
-        progress.finalizing("正在保存运行方案");
-        progress.finish();
+        progress.finalizing("正在保存运行方案").expect("状态应呈现");
+        progress.finish().expect("收尾应成功");
 
         let text = output.text();
         let completed = text.find("10/10").expect("必须呈现最终确认计数");
@@ -1105,16 +1761,18 @@ mod tests {
 
         let publisher = thread::spawn(move || {
             observer.observe(ProgressSnapshot::determinate(Phase::Translating, 10, 10));
-            let _ = published_sender.send(());
+            published_sender
+                .send(())
+                .expect("测试协调 channel 不应关闭");
         });
         published_receiver
             .recv_timeout(Duration::from_secs(1))
             .expect("发布最终快照不得等待最新值槽的互斥锁");
         publisher.join().expect("发布线程不应 panic");
 
-        progress.finalizing("正在保存运行方案");
+        progress.finalizing("正在保存运行方案").expect("状态应呈现");
         drop(pending_guard);
-        progress.finish();
+        progress.finish().expect("收尾应成功");
 
         let text = output.text();
         let completed = text.find("10/10").expect("锁竞争不能丢失最终确认计数");

@@ -82,6 +82,7 @@ notice-extract-reuse-owners = لم يُقدّم نطاق استخراج؛ ستُ
 notice-translate-reuse-profile = لم يُقدّم Profile؛ سيُعاد استخدام آخر Profile ناجح: { $profile }.
 notice-owner-disabled = عُطّل owner { $owner } وأزيل من الخطط التلقائية اللاحقة.
 warning-rules-command-non-string-skipped = تحذير: تخطّت قاعدة Rules رقم { $rule_number } عدد { $skipped_count } من معاملات command غير النصية (المصدر { $source_file }، code={ $command_code }، parameter={ $parameter }، النوع { $actual_type }).
+warning-manual-layout-required = تحذير: يلزم فحص فواصل الأسطر يدويًا في { $locations } (region={ $region }، max_fullwidth_chars={ $max_fullwidth_chars }).
 notice-no-model-request = كل وحدات الترجمة حديثة؛ لم تحتج هذه الجولة إلى إرسال طلب للنموذج.
 notice-manual-layout = { $count ->
     [zero] لا توجد وحدات تحتاج إلى مراجعة يدوية لفواصل الأسطر.

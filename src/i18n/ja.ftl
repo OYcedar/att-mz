@@ -82,6 +82,7 @@ notice-extract-reuse-owners = 抽出範囲が指定されなかったため、�
 notice-translate-reuse-profile = Profile が指定されなかったため、前回成功した Profile を再利用します: { $profile }。
 notice-owner-disabled = owner { $owner } を無効にし、今後の自動プランから削除しました。
 warning-rules-command-non-string-skipped = 警告：Rules ルール { $rule_number } は文字列ではない command パラメーターを { $skipped_count } 件スキップしました（ソース { $source_file }、code={ $command_code }、parameter={ $parameter }、型 { $actual_type }）。
+warning-manual-layout-required = 警告：{ $locations } の改行を手動で確認してください（region={ $region }、max_fullwidth_chars={ $max_fullwidth_chars }）。
 notice-no-model-request = すべての翻訳単位が最新のため、今回はモデルへのリクエストを行いませんでした。
 notice-manual-layout = { $count } 単位で改行の手動確認が必要です。
 notice-log-degraded = プロジェクトログを利用できないか劣化しています。コマンドは継続し、終了状態には影響しません。

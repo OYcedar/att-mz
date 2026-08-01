@@ -33,10 +33,10 @@ CLI 不接受自定义配置路径，也不搜索当前工作目录、环境变�
 ```toml
 [prompts]
 locale = "auto"
-thinking_output = false
+thinking_output = true
 
 [translation]
-record_translation_tasks = false
+record_translation_tasks = true
 
 [[translation.profiles]]
 id = "primary"
@@ -45,7 +45,7 @@ target_task_user_message_characters = 24000
 ```
 
 - Prompt 的 `locale` 与 `thinking_output` 都必填；
-- `record_translation_tasks` 可省略，默认 `false`；
+- `record_translation_tasks` 可省略，默认 `true`；只有操作者明确不需要可读的模型任务记录时才设为 `false`；
 - Profile 的 `id` 和 `llm_client` 必须非空；
 - `llm_client` 必须引用现有 Client；
 - `target_task_user_message_characters` 是正整数，是 TaskBlock 的目标而非硬上限；

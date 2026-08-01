@@ -8,6 +8,7 @@ use super::{ExtractInput, ExtractOutput, ExtractProgress, ExtractProgressPhase, 
 use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::progress::ProgressObserver;
 use crate::project_lease::{ProjectCommandLeaseError, ProjectCommandLeaseProvider};
+use crate::rpg_maker::asset::RpgMakerAssetOwner;
 use crate::rpg_maker::project::ExistingProjectOpener;
 
 /// 按固定业务顺序编排一次 RPG Maker 文本提取。
@@ -93,6 +94,7 @@ where
         let total_owners = u64::from(self.built_in_extraction.is_some() as u8)
             + u64::from(self.selected_rules.is_some() as u8);
         let mut completed_owners = 0_u64;
+        let mut committed_owners = Vec::new();
         let mut rules_warnings = Vec::new();
 
         if let Some(built_in_extraction) = &self.built_in_extraction {
@@ -106,12 +108,13 @@ where
                 .await
                 .map_err(ExtractServiceError::BuiltIn)?;
             completed_owners += 1;
+            committed_owners.push(RpgMakerAssetOwner::Builtin);
             self.observe_owner(
                 ExtractProgressPhase::Builtin,
                 completed_owners,
                 total_owners,
             );
-            if self.cancellation.is_requested() {
+            if self.selected_rules.is_some() && self.cancellation.is_requested() {
                 return Ok(OperationCompletion::Cancelled);
             }
         }
@@ -129,15 +132,12 @@ where
                 .await
                 .map_err(|source| ExtractServiceError::Rules {
                     rules_path: error_path,
+                    completed_owners: committed_owners.clone(),
                     source,
                 })?;
             rules_warnings = rules_output.warnings;
             completed_owners += 1;
             self.observe_owner(ExtractProgressPhase::Rules, completed_owners, total_owners);
-        }
-
-        if self.cancellation.is_requested() {
-            return Ok(OperationCompletion::Cancelled);
         }
 
         Ok(OperationCompletion::Completed(ExtractOutput {
@@ -153,7 +153,12 @@ pub(crate) enum ExtractServiceError<OE, BE, RE, PE> {
     ProjectLease(ProjectCommandLeaseError<PE>),
     OpenProject(OE),
     BuiltIn(BE),
-    Rules { rules_path: PathBuf, source: RE },
+    Rules {
+        rules_path: PathBuf,
+        /// Rules 失败前已经各自成功提交、不会被组合回滚的 owner。
+        completed_owners: Vec<RpgMakerAssetOwner>,
+        source: RE,
+    },
 }
 
 impl<OE, BE, RE, PE> fmt::Display for ExtractServiceError<OE, BE, RE, PE>
@@ -168,8 +173,22 @@ where
             Self::ProjectLease(error) => error.fmt(formatter),
             Self::OpenProject(source) => write!(formatter, "打开项目失败：{source}"),
             Self::BuiltIn(source) => write!(formatter, "内置提取失败：{source}"),
-            Self::Rules { rules_path, source } => {
-                write!(formatter, "规则提取失败 {}：{source}", rules_path.display())
+            Self::Rules {
+                rules_path,
+                completed_owners,
+                source,
+            } => {
+                write!(formatter, "规则提取失败 {}：{source}", rules_path.display())?;
+                if !completed_owners.is_empty() {
+                    formatter.write_str("；失败前已经提交：")?;
+                    for (index, owner) in completed_owners.iter().enumerate() {
+                        if index != 0 {
+                            formatter.write_str("、")?;
+                        }
+                        formatter.write_str(owner.storage_name())?;
+                    }
+                }
+                Ok(())
             }
         }
     }

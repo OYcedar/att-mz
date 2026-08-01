@@ -200,6 +200,17 @@ impl LogicalTextLocation {
     pub(crate) fn role(&self) -> &TextUnitRole {
         &self.role
     }
+
+    /// 返回可直接写入结构化诊断的稳定角色名称。
+    pub(crate) fn role_name(&self) -> String {
+        match &self.role {
+            TextUnitRole::Scalar(field) => format!("scalar:{}", field.as_str()),
+            TextUnitRole::DialogueSpeaker => "dialogue_speaker".to_owned(),
+            TextUnitRole::DialogueBody => "dialogue_body".to_owned(),
+            TextUnitRole::Choices => "choices".to_owned(),
+            TextUnitRole::ScrollingText => "scrolling_text".to_owned(),
+        }
+    }
 }
 
 /// 一项物理修改对共享资源所需的访问方式。

@@ -31,27 +31,61 @@ SQL、参数、查询结果、Lua 变量和游戏正文不会自动变成日志�
 内容就好。
 
 正常结束前，writer 先排空普通事件，再依次写性能计数、主错误与相关错误、唯一
-`run.finished`，并完成 flush/sync。panic 在仍持有运行上下文的边界转换成安全
-诊断，`run.finished.outcome` 为 `outcome_unknown`。
+`run.finished`，并完成 flush/sync。`run.finished.outcome` 只使用以下终态：
 
-日志建立、写入或关闭失败时，stderr 显示一次降级诊断，业务结果、数据库和退出码
-都不受牵连。缓冲压力下普通事件可以丢弃并计数；性能、失败和终态记录始终优先，
-不会被普通事件挤掉。
+- `succeeded`：业务得到明确成功结果；
+- `failed`：业务明确失败，且不需要操作者保留恢复现场；
+- `cancelled`：合作取消完成；
+- `recovery_required`：业务状态已经明确，但操作者必须按诊断保留或处理恢复现场；
+- `outcome_unknown`：提交、发布或进程异常使最终状态确实无法确认。
+
+`recovery_required` 不能归入 `outcome_unknown`；已知需要恢复和无法判断是否生效是两种
+不同事实。panic 在仍持有运行上下文的边界转换成安全诊断，只有无法证明业务终态时才把
+`run.finished.outcome` 写成 `outcome_unknown`。
+
+Translate 的任务事实不依赖 Markdown 任务记录开关。每个实际任务使用
+`task.finished` 保存 `complete`、`partial`、`unavailable` 或 `failed`；存在具体原因时，
+另写 `task.diagnostic`。本轮存在 Partial 或 Unavailable 时，`result.partial` 保存完整汇总。
+关闭 Markdown 任务记录不会删除这些 JSONL 事件。
+
+WriteBack 需要人工调整布局时，每个布局单元写 Warn 事件
+`write_back.manual_layout_required`。payload kind 是 `manual_layout_required`，包含受影响
+逻辑单元的精确 `group_location` 与 `role`、显示区域 `region` 和采用的
+`max_fullwidth_chars`；只有汇总数量不足以替代这些位置。
+
+日志目录或文件建立失败时，JSONL 无法承载自己的失败；一旦到达可以安全写终端的位置，
+stderr 立即显示包含阶段、路径或对象、操作、稳定 OS code、具体原因和处理办法的降级
+诊断，不能只在内存里累计到一个可能无法送达的横幅。序列化、写入、队列关闭、writer
+panic、flush 或 sync 失败时，同样由仍可用的 stderr 报告具体诊断。缓冲压力下普通事件
+可以丢弃并计数；性能、失败和终态记录始终优先，不会被普通事件挤掉。最终降级诊断必须
+同时给出实际丢失数量和日志路径，不能只显示“日志已降级”。
+
+项目日志故障本身不改变业务结果、数据库状态或业务退出语义。向使用者呈现这份警告又
+发生 stdout/stderr 写入、flush、后台线程或 channel 故障时，这是独立的进程呈现失败，
+退出码为 `1`。
 
 ## 2. 模型任务记录
 
-`[translation].record_translation_tasks = true` 时，Translate 还可以建立：
+`[translation].record_translation_tasks` 省略时默认是 `true`；只有显式设为 `false` 才
+关闭 Markdown 任务记录。开启时，Translate 为每个实际发出的 TaskBlock 建立：
 
 ```text
 <project>/task-records/<run-id>/task-000001.md
 ```
 
-它保存单个 MV/MZ 或 Generic TaskBlock 的可读消息、响应和逐 ID 验收。格式和故障
-处理见[模型任务记录规格](../translation/task-records.md)。独立 Lua 没有模型
-任务，因而不生成该记录。
+它保存单个 MV/MZ 或 Generic TaskBlock 的可读消息、响应和逐 ID 验收。没有实际模型
+任务时不建立空的 `<project>/task-records/<run-id>/`。格式和故障处理见
+[模型任务记录规格](../translation/task-records.md)。独立 Lua 没有模型任务，因而不生成
+该记录。
 
-JSONL 日志和任务记录都是事后记录，不是权威业务状态：它们缺失，说明不了模型
-请求或数据库提交有没有发生。
+任务记录的渲染、建立目录、写入、flush、sync、临时文件清理或 worker 收尾失败时，若
+当前项目 JSONL 仍可写，使用 Warn 事件 `observability.task_record_failed` 保存同一份结构化
+安全诊断；主错误和相关清理错误分别保留。该记录处理完成后，stderr 立即显示任务记录
+降级警告及其具体原因。该故障不改写模型请求、译文提交或业务结果；如果 stderr 无法呈现
+警告，则按进程呈现失败返回 `1`。
+
+JSONL 日志和任务记录都是事后记录，不是权威业务状态：它们缺失，说明不了模型请求或
+数据库提交有没有发生。Markdown 也不是 Partial、Unavailable 或任务失败原因的唯一来源。
 
 ## 3. 失败与敏感信息
 

@@ -82,6 +82,7 @@ notice-extract-reuse-owners = Область извлечения не указ�
 notice-translate-reuse-profile = Profile не указан; используется последний успешный Profile: { $profile }.
 notice-owner-disabled = Owner { $owner } отключён и удалён из будущих автоматических планов.
 warning-rules-command-non-string-skipped = Предупреждение: правило Rules { $rule_number } пропустило нестроковые параметры command: { $skipped_count } (источник { $source_file }, code={ $command_code }, parameter={ $parameter }, тип { $actual_type }).
+warning-manual-layout-required = Предупреждение: проверьте переносы строк вручную для { $locations } (region={ $region }, max_fullwidth_chars={ $max_fullwidth_chars }).
 notice-no-model-request = Все единицы перевода актуальны; в этом запуске запрос к модели не требовался.
 notice-manual-layout = { $count ->
     [one] 1 единица требует ручной проверки переноса строк.

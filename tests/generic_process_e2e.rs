@@ -20,7 +20,7 @@ fn generic_progress_modes_and_jsonl_diagnostic_are_observable() {
         distribution.join("config.toml"),
         r#"[prompts]
 locale = "en"
-thinking_output = false
+thinking_output = true
 
 [llm.clients.local]
 url = "http://127.0.0.1:9/v1/chat/completions"
@@ -46,7 +46,6 @@ allowed_terms = []
 quote_repair_pairs = [["“", "”"], ["‘", "’"]]
 
 [translation]
-record_translation_tasks = false
 
 [[translation.profiles]]
 id = "local"
@@ -62,6 +61,11 @@ target_task_user_message_characters = 10000
         "Translate {{source_language}} into {{target_language}}. Return string values.",
     )
     .expect("应可写入 Generic system Prompt");
+    fs::write(
+        prompt_root.join("thinking.md"),
+        "Explain the checks inside the required why envelope.",
+    )
+    .expect("应可写入 Generic Thinking Prompt");
     fs::write(
         input.join("story.jsonl"),
         concat!(
@@ -165,6 +169,60 @@ target_task_user_message_characters = 10000
     assert_success("无请求 Generic Translate", &translate);
     assert_stderr_contains(&translate, "Planning translation tasks");
     assert_stderr_contains(&translate, "No model request is needed");
+    assert!(
+        !distribution
+            .join("projects/generic")
+            .join(no_work_project)
+            .join("task-records")
+            .exists(),
+        "默认开启任务记录但没有模型任务时不得建立空目录"
+    );
+
+    let workspace = distribution.join("projects/generic").join(PROJECT);
+    fs::write(workspace.join("task-records"), b"not-a-directory")
+        .expect("普通文件应可稳定触发 Generic 任务记录写入失败");
+    let degraded_translate = run_att(
+        root,
+        "off",
+        &["generic", "translate", "--name", PROJECT, "local"],
+    );
+    assert_success("任务记录降级 Generic Translate", &degraded_translate);
+    let degraded_stderr =
+        String::from_utf8(degraded_translate.stderr).expect("stderr 必须是 UTF-8");
+    assert_eq!(
+        degraded_stderr
+            .matches("Translation task records are unavailable or degraded")
+            .count(),
+        1,
+        "Generic 任务记录故障必须恰好警告一次：{degraded_stderr}"
+    );
+    let mut observed_same_run_log = false;
+    for entry in fs::read_dir(workspace.join("logs")).expect("Generic 项目日志目录应存在")
+    {
+        let path = entry.expect("Generic 项目日志项应可读取").path();
+        let expected_run_id = path
+            .file_stem()
+            .expect("项目日志应以 RunId 命名")
+            .to_string_lossy()
+            .into_owned();
+        for line in fs::read_to_string(&path)
+            .expect("Generic 项目日志应可读取")
+            .lines()
+        {
+            let record: serde_json::Value =
+                serde_json::from_str(line).expect("Generic 项目日志行应为 JSON");
+            if record["code"] == "observability.task_record_failed" {
+                assert_eq!(record["run_id"], expected_run_id);
+                assert_eq!(record["command"], "translate");
+                assert_eq!(record["level"], "warn");
+                observed_same_run_log = true;
+            }
+        }
+    }
+    assert!(
+        observed_same_run_log,
+        "Generic 任务记录故障必须写入同一 RunId 的 Translate JSONL"
+    );
 
     for mode in ["auto", "off"] {
         let output = run_att(root, mode, &["generic", "extract", "--name", PROJECT]);

@@ -608,11 +608,10 @@ impl OpenAiChatCompletionExecutor {
             let provider_body = response.bytes().await;
             drop(active_permit);
             drop(job);
-            let provider_error = provider_body
-                .as_ref()
-                .ok()
-                .and_then(|body| parse_provider_error(body))
-                .unwrap_or_default();
+            let (provider_error, response_body_error) = match provider_body {
+                Ok(body) => (parse_provider_error(&body).unwrap_or_default(), None),
+                Err(source) => (ProviderErrorProjection::default(), Some(source)),
+            };
             let redactor = ApiKeyRedactor::new(client.api_key.clone());
             let provider_code = provider_error.code.map(|value| redactor.redact(&value));
             let provider_type = provider_error.kind.map(|value| redactor.redact(&value));
@@ -625,6 +624,7 @@ impl OpenAiChatCompletionExecutor {
                 provider_code,
                 provider_type,
                 provider_message,
+                response_body_error,
             };
             let result = if is_retryable_status(status) {
                 Err(LlmRequestError::Retryable {
@@ -688,6 +688,7 @@ pub(crate) enum OpenAiChatCompletionError {
         provider_code: Option<String>,
         provider_type: Option<String>,
         provider_message: Option<String>,
+        response_body_error: Option<reqwest::Error>,
     },
     ParseResponse(serde_json::Error),
     InvalidResponseWire {
@@ -719,6 +720,10 @@ impl Error for OpenAiChatCompletionError {
         match self {
             Self::SerializeRequest(source) => Some(source),
             Self::Transport(source) => Some(source),
+            Self::HttpStatus {
+                response_body_error: Some(source),
+                ..
+            } => Some(source),
             Self::ParseResponse(source) => Some(source),
             _ => None,
         }
@@ -761,24 +766,35 @@ impl OpenAiChatCompletionError {
                 provider_code,
                 provider_type,
                 provider_message,
-            } => SafeDiagnostic::new(
-                DiagnosticCode::ModelRequest,
-                DiagnosticStage::ModelRequest,
-                DiagnosticSubject::component("LLM provider"),
-                DiagnosticReason::Http {
-                    status: Some(*status),
-                    retry_after_seconds: retry_after.map(|value| value.as_secs()),
-                    provider_code: provider_code.clone(),
-                    provider_type: provider_type.clone(),
-                    provider_message: provider_message.clone(),
-                },
-                impact,
-                if *status == 401 || *status == 403 {
-                    DiagnosticAction::FixConfiguration
-                } else {
-                    DiagnosticAction::CheckModelService
-                },
-            ),
+                response_body_error,
+            } => {
+                let diagnostic = SafeDiagnostic::new(
+                    DiagnosticCode::ModelRequest,
+                    DiagnosticStage::ModelRequest,
+                    DiagnosticSubject::component("LLM provider"),
+                    DiagnosticReason::Http {
+                        status: Some(*status),
+                        retry_after_seconds: retry_after.map(|value| value.as_secs()),
+                        provider_code: provider_code.clone(),
+                        provider_type: provider_type.clone(),
+                        provider_message: provider_message.clone(),
+                    },
+                    impact,
+                    if *status == 401 || *status == 403 {
+                        DiagnosticAction::FixConfiguration
+                    } else {
+                        DiagnosticAction::CheckModelService
+                    },
+                );
+                response_body_error
+                    .as_ref()
+                    .map_or(diagnostic.clone(), |source| {
+                        diagnostic.with_recovery(RecoveryFact::component(format!(
+                            "response_body_read={}",
+                            transport_classification(source)
+                        )))
+                    })
+            }
             Self::ParseResponse(source) => json_model_failure(
                 DiagnosticFailureKind::ResponseParsingFailed,
                 impact,
@@ -1738,6 +1754,7 @@ mod tests {
             provider_code: Some("PROVIDER_CODE_WITH_CONTROL\r\nforged".to_owned()),
             provider_type: Some("rate_limit".to_owned()),
             provider_message: Some("request\r\nforged".to_owned()),
+            response_body_error: None,
         };
         let diagnostic = source.safe_diagnostic(
             Some(Duration::from_secs(3)),
@@ -2321,6 +2338,46 @@ mod tests {
             server.requests.try_recv(),
             Err(mpsc::TryRecvError::Disconnected)
         ));
+        executor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn non_success_status_preserves_truncated_body_read_failure() {
+        let response = b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 128\r\nConnection: close\r\n\r\n{"
+            .to_vec();
+        let server = spawn_test_server(vec![response], false);
+        let client = client_with_rate(&server.endpoint, Map::new(), 60, 1);
+        let executor = executor(1);
+
+        let result = executor
+            .request(
+                &client,
+                &[ChatMessage::new(ChatMessageRole::User, "content")],
+            )
+            .await;
+
+        let Err(LlmRequestError::Fatal(error)) = result else {
+            panic!("截断的非成功响应必须保留为致命 HTTP 状态错误");
+        };
+        assert!(matches!(
+            &error,
+            OpenAiChatCompletionError::HttpStatus {
+                status: 400,
+                response_body_error: Some(_),
+                ..
+            }
+        ));
+        assert!(
+            Error::source(&error).is_some(),
+            "HTTP 状态错误的 source 必须保留响应正文读取错误"
+        );
+        let diagnostic = error.safe_diagnostic(None, DiagnosticImpact::Unchanged);
+        assert!(diagnostic.recovery.iter().any(|fact| matches!(
+            fact,
+            RecoveryFact::Component { name } if name.starts_with("response_body_read=")
+        )));
+        assert!(server.requests.recv_timeout(Duration::from_secs(1)).is_ok());
+        server.worker.join().expect("测试服务器应正常退出");
         executor.shutdown().await;
     }
 
