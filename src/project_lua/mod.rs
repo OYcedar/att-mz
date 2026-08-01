@@ -20,8 +20,9 @@ use std::time::Duration;
 
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::{Connection, ErrorCode, InterruptHandle};
+use sha2::{Digest, Sha256};
 
-use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
+use crate::fingerprint::Sha256Fingerprint;
 
 use self::binding::{BindingMetrics, PreparedProjectLua, prepare_lua, validate_program};
 
@@ -348,6 +349,7 @@ pub(crate) struct ProjectLuaRunRequest {
     adapter: Arc<dyn ProjectLuaEngineAdapter>,
     cancellation: ProjectLuaCancellation,
     print_sink: Arc<dyn ProjectLuaPrintSink>,
+    metrics: Arc<BindingMetrics>,
 }
 
 /// 在取得项目租约和打开数据库前完成脚本 UTF-8 与 Lua 语法检查。
@@ -375,18 +377,20 @@ pub(crate) fn fingerprint_project_lua_program_with_cancellation(
     if cancellation.is_cancelled() {
         return Err(ProjectLuaFailure::Cancelled);
     }
-    let mut hasher = Sha256FramedHasher::new(b"att.project-lua.program-identity");
-    hasher.try_frame_chunks(1, program.source(), PROJECT_LUA_SOURCE_CHUNK_BYTES, || {
+    let mut hasher = Sha256::new();
+    for chunk in program
+        .source()
+        .chunks(PROJECT_LUA_SOURCE_CHUNK_BYTES.get())
+    {
         if cancellation.is_cancelled() {
-            Err(ProjectLuaFailure::Cancelled)
-        } else {
-            Ok(())
+            return Err(ProjectLuaFailure::Cancelled);
         }
-    })?;
+        hasher.update(chunk);
+    }
     if cancellation.is_cancelled() {
         return Err(ProjectLuaFailure::Cancelled);
     }
-    Ok(hasher.finish())
+    Ok(Sha256Fingerprint::from_bytes(hasher.finalize().into()))
 }
 
 impl ProjectLuaRunRequest {
@@ -401,6 +405,13 @@ impl ProjectLuaRunRequest {
             adapter,
             cancellation: ProjectLuaCancellation::default(),
             print_sink: Arc::new(IgnoreProjectLuaPrint),
+            metrics: Arc::new(BindingMetrics::default()),
+        }
+    }
+
+    pub(crate) fn metrics(&self) -> ProjectLuaRunMetrics {
+        ProjectLuaRunMetrics {
+            metrics: Arc::clone(&self.metrics),
         }
     }
 
@@ -490,6 +501,18 @@ pub(crate) struct ProjectLuaRunReport {
     changed_rows: u64,
     translation_calls: u64,
     printed_lines: u64,
+}
+
+/// 允许命令层在执行失败或取消后读取已经发生的 Lua Host 计数。
+#[derive(Clone, Debug)]
+pub(crate) struct ProjectLuaRunMetrics {
+    metrics: Arc<BindingMetrics>,
+}
+
+impl ProjectLuaRunMetrics {
+    pub(crate) fn report(&self) -> ProjectLuaRunReport {
+        self.metrics.report()
+    }
 }
 
 impl ProjectLuaRunReport {

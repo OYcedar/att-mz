@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 const PROJECT: &str = "shared";
 const SOURCE_TEXT: &str = "薬草です";
@@ -912,6 +913,20 @@ fn generic_lua_syntax_failure_is_logged_and_reported_before_project_open() {
         records.iter().any(|record| record["code"] == "lua.script"),
         "语法失败日志必须保存脚本身份和哈希"
     );
+    let summaries = records
+        .iter()
+        .filter(|record| record["code"] == "lua.summary")
+        .collect::<Vec<_>>();
+    assert_eq!(summaries.len(), 1, "语法失败必须且只能写入一条 Lua 摘要");
+    let summary = summaries[0];
+    for field in [
+        "database_calls",
+        "changed_rows",
+        "translation_calls",
+        "printed_lines",
+    ] {
+        assert_eq!(summary["payload"][field], 0, "{field} 必须明确记录为零");
+    }
     let failure = records
         .iter()
         .find(|record| record["code"] == "failure.reported")
@@ -931,6 +946,430 @@ fn generic_lua_syntax_failure_is_logged_and_reported_before_project_open() {
             record["code"] == "run.finished" && record["payload"]["outcome"] == "failed"
         }),
         "语法失败日志必须写入明确终态"
+    );
+
+    let logs_before_project_open = fs::read_dir(&logs)
+        .expect("项目打开失败前日志目录应可读取")
+        .map(|entry| entry.expect("项目打开失败前日志项应可读取").path())
+        .collect::<Vec<_>>();
+    let valid_script = root.join("valid-generic.lua");
+    fs::write(&valid_script, "return\n").expect("合法 Generic Lua 脚本应可写入");
+    let mut valid_arguments = arguments(&["generic", "lua", "--name", PROJECT]);
+    valid_arguments.push(valid_script.into_os_string());
+    let project_open_failure = run_att(root, valid_arguments);
+    assert_eq!(project_open_failure.status.code(), Some(1));
+    let project_open_logs = fs::read_dir(&logs)
+        .expect("项目打开失败后日志目录应可读取")
+        .map(|entry| entry.expect("项目打开失败后日志项应可读取").path())
+        .filter(|path| !logs_before_project_open.contains(path))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        project_open_logs.len(),
+        1,
+        "项目打开前失败也只应新增一份项目日志"
+    );
+    let project_open_records = fs::read_to_string(&project_open_logs[0])
+        .expect("项目打开失败日志应可读取")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("项目打开失败日志行必须是 JSON"))
+        .collect::<Vec<_>>();
+    let project_open_summaries = project_open_records
+        .iter()
+        .filter(|record| record["code"] == "lua.summary")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        project_open_summaries.len(),
+        1,
+        "预检成功但项目打开失败时必须且只能写入一条零调用摘要"
+    );
+    for field in [
+        "database_calls",
+        "changed_rows",
+        "translation_calls",
+        "printed_lines",
+    ] {
+        assert_eq!(
+            project_open_summaries[0]["payload"][field], 0,
+            "项目打开失败时 {field} 必须为零"
+        );
+    }
+}
+
+#[test]
+fn mv_lua_clear_trusts_unchanged_current_with_additional_custom_placeholder_bytes() {
+    let temporary = tempfile::tempdir().expect("应可建立 MV Lua 全量清理端到端测试目录");
+    let root = temporary.path();
+    let game = root.join("mv-game");
+    write_minimal_mv_game(&game);
+    fs::write(
+        game.join("www/data/Items.json"),
+        serde_json::to_vec(&json!([
+            null,
+            {
+                "id": 1,
+                "name": "",
+                "description": "回復一行目\n回復二行目"
+            },
+            {
+                "id": 2,
+                "name": "",
+                "description": "魔法一行目\n魔法二行目"
+            }
+        ]))
+        .expect("含 Placeholder 的 MV Items 夹具应可序列化"),
+    )
+    .expect("含 Placeholder 的 MV Items 夹具应可写入");
+    write_configuration(root, "http://127.0.0.1:9/v1/chat/completions");
+
+    assert_success(
+        "MV Lua 全量清理 Init",
+        &run_att(root, init_arguments("mv", &game)),
+    );
+    assert_success(
+        "MV Lua 全量清理 Extract",
+        &run_att(
+            root,
+            arguments(&["mv", "extract", "--name", PROJECT, "--builtin"]),
+        ),
+    );
+
+    let workspace = distribution_root(root).join("projects/mv").join(PROJECT);
+    let database = workspace.join("project.db");
+    let connection = Connection::open(&database).expect("MV 项目数据库应可打开");
+    let mut statement = connection
+        .prepare(
+            "SELECT owner, group_location, unit_role, source_content_json
+             FROM rpg_maker_text_unit
+             ORDER BY owner, group_location, unit_role",
+        )
+        .expect("MV Unit locator 查询应可准备");
+    let placeholder_units = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .expect("MV Unit locator 查询应可执行")
+        .map(|row| row.expect("MV Unit locator 应可读取"))
+        .filter(|(_, _, _, source)| {
+            serde_json::from_str::<Value>(source)
+                .expect("MV Unit source 必须是规范 JSON")
+                .as_str()
+                .is_some_and(|source| source.matches('\n').count() == 1)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        placeholder_units.len(),
+        2,
+        "测试夹具必须且只能提取两个含单个 LF 的标量 Unit"
+    );
+    let (corrupted_owner, corrupted_group_location, corrupted_unit_role, _) = &placeholder_units[1];
+    drop(statement);
+    let newline_placeholder = r#"[{"scopes":["database_entry"],"pattern":"\\n"}]"#;
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE rpg_maker_translation_resource
+                 SET canonical_json = ?1
+                 WHERE resource_kind = 'placeholder_rules'",
+                [newline_placeholder],
+            )
+            .expect("应可安装 LF Placeholder 资源"),
+        1
+    );
+    drop(connection);
+
+    let set_script = root.join("set-custom-placeholder-current.lua");
+    let set_calls = placeholder_units
+        .iter()
+        .enumerate()
+        .map(|(index, (owner, group_location, unit_role, _))| {
+            let ordinal = index + 1;
+            format!(
+                "ctx.translation.set(\n  {{ owner = [==[{owner}]==], group_location = [==[{group_location}]==], unit_role = [==[{unit_role}]==] }},\n  [==[治疗{ordinal}一行\n治疗{ordinal}二行]==]\n)"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&set_script, set_calls).expect("建立含 LF Placeholder Current 的 Lua 脚本应可写入");
+    let mut set_arguments = arguments(&["mv", "lua", "--name", PROJECT]);
+    set_arguments.push(set_script.into_os_string());
+    assert_success(
+        "实际 att.exe 建立含 LF Placeholder Current",
+        &run_att(root, set_arguments),
+    );
+
+    let connection = Connection::open(&database).expect("建立 Current 后数据库应可重新打开");
+    let (valid_translation, state_before): (String, Vec<u8>) = connection
+        .query_row(
+            "SELECT translation_content_json, translation_state
+             FROM rpg_maker_text_unit
+             WHERE owner = ?1 AND group_location = ?2 AND unit_role = ?3",
+            (
+                corrupted_owner,
+                corrupted_group_location,
+                corrupted_unit_role,
+            ),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("含 LF Placeholder Current 应可读取");
+    assert_eq!(
+        serde_json::from_str::<Value>(&valid_translation).expect("Current 译文必须是规范 JSON"),
+        json!("治疗2一行\n治疗2二行")
+    );
+    assert_eq!(state_before.len(), 32, "Current 必须保存完整翻译状态");
+
+    // Translate 允许在保留 Custom Placeholder token 后，让自然正文额外出现相同字节。
+    // 这里保留刚建立的合法 Current state，只把一处 LF 译文改成两处 LF，复现跨契约现场。
+    let translation_with_additional_lf =
+        serde_json::to_string("治疗2一行\n治疗2二行\n正文新增换行").expect("现场译文应可编码");
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE rpg_maker_text_unit
+                 SET translation_content_json = ?1
+                 WHERE owner = ?2 AND group_location = ?3 AND unit_role = ?4",
+                (
+                    &translation_with_additional_lf,
+                    corrupted_owner,
+                    corrupted_group_location,
+                    corrupted_unit_role,
+                ),
+            )
+            .expect("应可安装含额外 Custom 原片段的 Current 译文"),
+        1
+    );
+    let (current_translation, state_after): (String, Vec<u8>) = connection
+        .query_row(
+            "SELECT translation_content_json, translation_state
+             FROM rpg_maker_text_unit
+             WHERE owner = ?1 AND group_location = ?2 AND unit_role = ?3",
+            (
+                corrupted_owner,
+                corrupted_group_location,
+                corrupted_unit_role,
+            ),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("含额外 Custom 原片段的 Current 应可读取");
+    assert_eq!(current_translation, translation_with_additional_lf);
+    assert_eq!(
+        state_after, state_before,
+        "现场夹具只能修订译文正文，必须保留原 Current 状态"
+    );
+    let current_before_selective_clear: i64 = connection
+        .query_row(
+            "SELECT count(*)
+             FROM rpg_maker_text_unit
+             WHERE translation_content_json IS NOT NULL OR translation_state IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("全量清理前 Current 数量应可读取");
+    assert_eq!(
+        current_before_selective_clear, 2,
+        "测试前必须同时存在一项含额外 Custom 原片段的 Current 和一项合法 Current"
+    );
+    drop(connection);
+
+    let (first_owner, first_group_location, first_unit_role, _) = &placeholder_units[0];
+    let selective_clear_script = root.join("clear-one-mv-translation.lua");
+    fs::write(
+        &selective_clear_script,
+        format!(
+            "ctx.translation.clear({{ owner = [==[{first_owner}]==], group_location = [==[{first_group_location}]==], unit_role = [==[{first_unit_role}]==] }})\n"
+        ),
+    )
+    .expect("MV 单项清理 Lua 脚本应可写入");
+    let mut selective_clear_arguments = arguments(&["mv", "lua", "--name", PROJECT]);
+    selective_clear_arguments.push(selective_clear_script.into_os_string());
+    assert_success(
+        "实际 att.exe 清除一项并保留未改现场 Current",
+        &run_att(root, selective_clear_arguments),
+    );
+
+    let connection = Connection::open(&database).expect("单项清理后数据库应可重新打开");
+    let first_current: (Option<String>, Option<Vec<u8>>) = connection
+        .query_row(
+            "SELECT translation_content_json, translation_state
+             FROM rpg_maker_text_unit
+             WHERE owner = ?1 AND group_location = ?2 AND unit_role = ?3",
+            (first_owner, first_group_location, first_unit_role),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("单项清理目标应可读取");
+    assert_eq!(first_current, (None, None), "指定 Current 必须清除");
+    let unchanged_current: (String, Vec<u8>) = connection
+        .query_row(
+            "SELECT translation_content_json, translation_state
+             FROM rpg_maker_text_unit
+             WHERE owner = ?1 AND group_location = ?2 AND unit_role = ?3",
+            (
+                corrupted_owner,
+                corrupted_group_location,
+                corrupted_unit_role,
+            ),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("未改现场 Current 应继续存在");
+    assert_eq!(unchanged_current.0, translation_with_additional_lf);
+    assert_eq!(unchanged_current.1, state_before);
+    let expected: i64 = connection
+        .query_row(
+            "SELECT count(*)
+             FROM rpg_maker_text_unit
+             WHERE translation_content_json IS NOT NULL OR translation_state IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("全量清理前剩余 Current 数量应可读取");
+    assert_eq!(expected, 1, "单项清理后必须保留一项未改现场 Current");
+    drop(connection);
+
+    let clear_script = root.join("clear-all-mv-translations.lua");
+    fs::write(
+        &clear_script,
+        r#"local expected = assert(tonumber(arg[1]), "missing expected count")
+local rows = ctx.db.query([=[
+SELECT owner, group_location, unit_role
+FROM rpg_maker_text_unit
+WHERE translation_content_json IS NOT NULL OR translation_state IS NOT NULL
+ORDER BY owner, group_location, unit_role
+]=])
+assert(#rows == expected, "Current count changed before clear")
+print("selected Current", #rows)
+for _, row in ipairs(rows) do
+  ctx.translation.clear({
+    owner = row[1],
+    group_location = row[2],
+    unit_role = row[3]
+  })
+end
+local remaining = ctx.db.query([=[
+SELECT count(*)
+FROM rpg_maker_text_unit
+WHERE translation_content_json IS NOT NULL OR translation_state IS NOT NULL
+]=])[1][1]
+assert(remaining == 0, "Current remained after clear")
+print("remaining Current", remaining)
+"#,
+    )
+    .expect("MV 全量清理 Lua 脚本应可写入");
+    let clear_script_sha256 =
+        Sha256::digest(fs::read(&clear_script).expect("MV 全量清理 Lua 脚本应可重新读取"))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+
+    let logs = workspace.join("logs");
+    let logs_before = fs::read_dir(&logs)
+        .expect("MV 项目日志目录应可读取")
+        .map(|entry| entry.expect("MV 项目日志目录项应可读取").path())
+        .collect::<Vec<_>>();
+    let mut clear_arguments = arguments(&["mv", "lua", "--name", PROJECT]);
+    clear_arguments.push(clear_script.into_os_string());
+    clear_arguments.push("--".into());
+    clear_arguments.push(expected.to_string().into());
+    assert_success(
+        "实际 att.exe 执行 ctx.translation.clear 全量清理",
+        &run_att(root, clear_arguments),
+    );
+
+    let connection = Connection::open(&database).expect("全量清理后数据库应可重新打开");
+    let remaining: i64 = connection
+        .query_row(
+            "SELECT count(*)
+             FROM rpg_maker_text_unit
+             WHERE translation_content_json IS NOT NULL OR translation_state IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("全量清理后 Current 数量应可读取");
+    assert_eq!(remaining, 0, "译文正文与翻译状态必须全部清空");
+    let quick_check: String = connection
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .expect("SQLite quick_check 应可执行");
+    assert_eq!(quick_check, "ok", "清理后的数据库必须保持完整");
+    let mut foreign_keys = connection
+        .prepare("PRAGMA foreign_key_check")
+        .expect("SQLite foreign_key_check 应可准备");
+    assert!(
+        foreign_keys
+            .query([])
+            .expect("SQLite foreign_key_check 应可执行")
+            .next()
+            .expect("SQLite foreign_key_check 结果应可读取")
+            .is_none(),
+        "清理后的数据库不得存在外键错误"
+    );
+    drop(foreign_keys);
+    drop(connection);
+
+    let new_logs = fs::read_dir(&logs)
+        .expect("全量清理后 MV 项目日志目录应可读取")
+        .map(|entry| entry.expect("MV 项目日志目录项应可读取").path())
+        .filter(|path| !logs_before.contains(path))
+        .collect::<Vec<_>>();
+    assert_eq!(new_logs.len(), 1, "一次 Lua 命令只应新增一份项目日志");
+    let records = fs::read_to_string(&new_logs[0])
+        .expect("全量清理项目日志应可读取")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("项目日志行必须是 JSON"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["code"] == "lua.script")
+            .count(),
+        1,
+        "成功运行必须记录一次 Lua 脚本身份"
+    );
+    let script_record = records
+        .iter()
+        .find(|record| record["code"] == "lua.script")
+        .expect("成功运行必须保留 Lua 脚本记录");
+    assert_eq!(
+        script_record["payload"]["fingerprint"], clear_script_sha256,
+        "日志中的 SHA-256 必须等于脚本文件原始字节的普通 SHA-256"
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["code"] == "lua.print")
+            .count(),
+        2,
+        "脚本的两次 print 必须各写入一条日志"
+    );
+    let summaries = records
+        .iter()
+        .filter(|record| record["code"] == "lua.summary")
+        .collect::<Vec<_>>();
+    assert_eq!(summaries.len(), 1, "成功运行必须且只能记录一条 Lua 摘要");
+    let summary = summaries[0];
+    assert_eq!(summary["payload"]["database_calls"], 2);
+    assert_eq!(summary["payload"]["changed_rows"], expected);
+    assert_eq!(summary["payload"]["translation_calls"], expected);
+    assert_eq!(summary["payload"]["printed_lines"], 2);
+    let succeeded = records
+        .iter()
+        .position(|record| {
+            record["code"] == "run.finished" && record["payload"]["outcome"] == "succeeded"
+        })
+        .expect("成功运行必须记录 succeeded 终态");
+    assert_eq!(
+        succeeded,
+        records.len() - 1,
+        "succeeded 必须是本次日志的最后一条记录"
+    );
+    assert!(
+        records[..succeeded].iter().all(|record| {
+            record["code"] != "failure.reported"
+                && !(record["code"] == "run.finished" && record["payload"]["outcome"] == "failed")
+        }),
+        "成功终态之前不得伪报失败"
     );
 }
 
@@ -963,11 +1402,74 @@ fn atomic_lua_documented_examples_commit_once_or_roll_back_once() {
     assert_eq!(note, "checked");
     drop(connection);
 
+    let logs = database
+        .parent()
+        .expect("项目数据库应有父目录")
+        .join("logs");
+    let logs_before_rollback = fs::read_dir(&logs)
+        .expect("回滚前项目日志目录应可读取")
+        .map(|entry| entry.expect("回滚前项目日志目录项应可读取").path())
+        .collect::<Vec<_>>();
     let rollback_script = workspace_root().join("docs/lua/examples/rollback.lua");
     let mut rollback_arguments = arguments(&["mz", "lua", "--name", PROJECT]);
     rollback_arguments.push(rollback_script.into_os_string());
     let rollback = run_att(root, rollback_arguments);
     assert!(!rollback.status.success(), "未捕获 Lua 错误必须让命令失败");
+    let rollback_logs = fs::read_dir(&logs)
+        .expect("回滚后项目日志目录应可读取")
+        .map(|entry| entry.expect("回滚后项目日志目录项应可读取").path())
+        .filter(|path| !logs_before_rollback.contains(path))
+        .collect::<Vec<_>>();
+    assert_eq!(rollback_logs.len(), 1, "失败 Lua 命令只应新增一份项目日志");
+    let rollback_records = fs::read_to_string(&rollback_logs[0])
+        .expect("失败 Lua 项目日志应可读取")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("失败项目日志行必须是 JSON"))
+        .collect::<Vec<_>>();
+    assert!(
+        rollback_records
+            .iter()
+            .any(|record| record["code"] == "phase.started"),
+        "失败 Lua 必须记录阶段开始"
+    );
+    assert!(
+        rollback_records
+            .iter()
+            .all(|record| record["code"] != "phase.finished"),
+        "失败 Lua 不得伪报阶段完成"
+    );
+    let rollback_summaries = rollback_records
+        .iter()
+        .filter(|record| record["code"] == "lua.summary")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rollback_summaries.len(),
+        1,
+        "失败 Lua 必须且只能记录一条 Host 调用摘要"
+    );
+    let rollback_summary = rollback_summaries[0];
+    assert_eq!(rollback_summary["payload"]["database_calls"], 2);
+    assert_eq!(rollback_summary["payload"]["changed_rows"], 1);
+    assert_eq!(rollback_summary["payload"]["translation_calls"], 0);
+    assert_eq!(rollback_summary["payload"]["printed_lines"], 0);
+    assert!(
+        rollback_summary["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Lua 统计") && !message.contains("已提交")),
+        "失败摘要必须使用不宣称事务成功的中性文案"
+    );
+    assert!(
+        rollback_records
+            .iter()
+            .any(|record| record["code"] == "failure.reported"),
+        "失败 Lua 必须及时记录结构化失败"
+    );
+    assert!(
+        rollback_records.iter().any(|record| {
+            record["code"] == "run.finished" && record["payload"]["outcome"] == "failed"
+        }),
+        "失败 Lua 必须记录 failed 终态"
+    );
 
     let connection = Connection::open(&database).expect("回滚后数据库应可重新打开");
     let rollback_table_count: i64 = connection
