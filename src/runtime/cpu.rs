@@ -843,14 +843,24 @@ mod tests {
         let executor = RayonCpuExecutor::start(fixed_config(2).unwrap()).unwrap();
         let active = Arc::new(AtomicUsize::new(0));
         let maximum = Arc::new(AtomicUsize::new(0));
+        let parallel_start = Arc::new((std::sync::Mutex::new(0_usize), Condvar::new()));
         let output = executor
             .execute_ordered_map((0usize..16).collect(), {
                 let active = Arc::clone(&active);
                 let maximum = Arc::clone(&maximum);
+                let parallel_start = Arc::clone(&parallel_start);
                 move |value| {
                     let now = active.fetch_add(1, Ordering::AcqRel) + 1;
                     maximum.fetch_max(now, Ordering::AcqRel);
-                    std::thread::sleep(Duration::from_millis(if value % 2 == 0 { 3 } else { 1 }));
+                    let (started, ready) = &*parallel_start;
+                    let mut started = started.lock().expect("并行启动计数锁不应中毒");
+                    *started += 1;
+                    ready.notify_all();
+                    let (started, timeout) = ready
+                        .wait_timeout_while(started, Duration::from_secs(5), |started| *started < 2)
+                        .expect("并行启动计数锁不应中毒");
+                    assert!(!timeout.timed_out(), "两个 CPU worker 应并行开始任务");
+                    drop(started);
                     active.fetch_sub(1, Ordering::AcqRel);
                     value * 2
                 }

@@ -336,7 +336,6 @@ diagnostic-io-kind-value = { $code ->
    *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
-    [unsupported_prompt_locale] La valeur doit être exactement auto en minuscules ou une langue d’interface BCP 47 prise en charge
     [language_policy_term_blank] Le terme de politique linguistique ne doit pas être vide
     [language_policy_term_surrounding_whitespace] Le terme de politique linguistique ne doit pas contenir d’espaces en début ou fin
     [language_policy_term_duplicate] Le terme de politique linguistique ne doit pas être dupliqué
@@ -445,17 +444,8 @@ task-record-final-result-heading = Résultat final
 task-record-no-request = Aucune requête de modèle prête à être envoyée.
 task-record-empty-assistant = Le modèle a renvoyé un objet vide.
 task-record-parse-error = Erreur d’analyse : { $kind ->
-    [json] JSON de réponse du modèle invalide (catégorie `{ $category }`), ligne { $line }, colonne { $column }
-    [thinking_not_allowed] la sortie de raisonnement n’est pas acceptée dans ce mode de réponse, ligne { $line }, colonne { $column }
-    [thinking_envelope_missing] l’enveloppe de raisonnement requise est absente, ligne { $line }, colonne { $column }
-    [thinking_envelope_unclosed] l’enveloppe de raisonnement n’est pas fermée, ligne { $line }, colonne { $column }
     [thinking_empty] le contenu du raisonnement est vide, ligne { $line }, colonne { $column }
-    [thinking_nested] une enveloppe de raisonnement imbriquée commence ligne { $line }, colonne { $column }
-    [thinking_repeated] une enveloppe de raisonnement répétée commence ligne { $line }, colonne { $column }
-    [markdown_fence_no_body] la clôture Markdown n’a pas de contenu, ligne { $line }, colonne { $column }
-    [markdown_fence_unsupported] seule une clôture Markdown unique sans balise de langue ou avec la balise json est acceptée, ligne { $line }, colonne { $column }
-    [markdown_fence_unclosed] la clôture Markdown n’est pas fermée, ligne { $line }, colonne { $column }
-   *[markdown_fence_invalid_closing] la clôture Markdown doit se fermer sur la dernière ligne isolée, ligne { $line }, colonne { $column }
+   *[json] JSON de réponse du modèle invalide (catégorie `{ $category }`), ligne { $line }, colonne { $column }
 }
 task-record-attempt-succeeded = Tentative { $number } : réussie ; finish reason { $finish_reason }
 task-record-attempt-token-usage = ; tokens `{ $prompt } / { $completion } / { $total }`

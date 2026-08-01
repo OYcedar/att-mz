@@ -32,7 +32,6 @@ use super::arguments::{
 use crate::diagnostic::{
     ConfigurationTomlFailureKind, ConfigurationTomlValueKind, ConfigurationValueRule,
 };
-use crate::i18n::UiLocale;
 use crate::language::{
     EnglishLanguageModule, EnglishResidualPolicy, EnglishTranslationDetectionPolicy,
     JapaneseLanguageModule, JapaneseQuoteRepairPolicy, JapaneseQuoteRepairPolicyError,
@@ -967,8 +966,8 @@ impl ExtractConfiguration {
 
 pub(crate) struct TranslateConfiguration {
     prompt_root: PathBuf,
-    prompt_locale: PromptLocaleSelection,
     thinking_output: bool,
+    source_echo: bool,
     language_modules: LanguageModuleCatalog,
     profile: TranslationProfileConfiguration,
     client: Arc<OpenAiChatCompletionClient>,
@@ -977,57 +976,10 @@ pub(crate) struct TranslateConfiguration {
 
 struct PendingTranslateConfiguration {
     prompt_root: PathBuf,
-    prompt_locale: PromptLocaleSelection,
     thinking_output: bool,
+    source_echo: bool,
     language_modules: LanguageModuleCatalog,
 }
-
-/// Prompt 资源语言由显式配置决定，或按项目目标语言选择。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PromptLocaleSelection {
-    Auto,
-    Explicit(UiLocale),
-}
-
-impl PromptLocaleSelection {
-    pub(crate) fn resolve(
-        self,
-        target_language: &LanguageId,
-    ) -> Result<UiLocale, PromptLocaleResolutionError> {
-        match self {
-            Self::Auto => UiLocale::match_automatic(target_language.as_str()).ok_or_else(|| {
-                PromptLocaleResolutionError {
-                    target_language: target_language.clone(),
-                }
-            }),
-            Self::Explicit(locale) => Ok(locale),
-        }
-    }
-}
-
-/// `auto` 无法把项目目标语言映射到现有 Prompt locale。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PromptLocaleResolutionError {
-    target_language: LanguageId,
-}
-
-impl PromptLocaleResolutionError {
-    pub(crate) fn target_language(&self) -> &LanguageId {
-        &self.target_language
-    }
-}
-
-impl fmt::Display for PromptLocaleResolutionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "目标语言 {} 没有可自动选择的 Prompt locale；请显式设置 prompts.locale",
-            self.target_language
-        )
-    }
-}
-
-impl Error for PromptLocaleResolutionError {}
 
 impl PendingTranslateConfiguration {
     fn build(
@@ -1036,22 +988,10 @@ impl PendingTranslateConfiguration {
         raw_languages: Vec<RawLanguageConfiguration>,
         _raw: RawTranslationSelection,
     ) -> Result<Self, ConfigurationValueError> {
-        let prompt_locale = if raw_prompts.locale == "auto" {
-            PromptLocaleSelection::Auto
-        } else {
-            PromptLocaleSelection::Explicit(
-                UiLocale::match_automatic(&raw_prompts.locale).ok_or_else(|| {
-                    invalid(
-                        "prompts.locale",
-                        ConfigurationValueRule::UnsupportedPromptLocale,
-                    )
-                })?,
-            )
-        };
         Ok(Self {
             prompt_root: prompt_root.to_path_buf(),
-            prompt_locale,
             thinking_output: raw_prompts.thinking_output,
+            source_echo: raw_prompts.source_echo,
             language_modules: build_language_modules(raw_languages)?,
         })
     }
@@ -1090,8 +1030,8 @@ impl PendingTranslateConfiguration {
         .map_err(|error| error.with_configuration_path(source.path()))?;
         Ok(TranslateConfiguration {
             prompt_root: self.prompt_root,
-            prompt_locale: self.prompt_locale,
             thinking_output: self.thinking_output,
+            source_echo: self.source_echo,
             language_modules: self.language_modules,
             profile,
             client: Arc::new(built_client.client),
@@ -1109,12 +1049,12 @@ impl TranslateConfiguration {
         &self.prompt_root
     }
 
-    pub(crate) const fn prompt_locale(&self) -> PromptLocaleSelection {
-        self.prompt_locale
-    }
-
     pub(crate) const fn thinking_output(&self) -> bool {
         self.thinking_output
+    }
+
+    pub(crate) const fn source_echo(&self) -> bool {
+        self.source_echo
     }
 
     pub(crate) const fn language_modules(&self) -> &LanguageModuleCatalog {
@@ -2669,7 +2609,7 @@ struct ConfigurationFieldContract;
 
 impl ConfigurationFieldContract {
     const TRANSLATE_REQUIRED_FIELDS: &'static [&'static [&'static str]] =
-        &[&["prompts", "locale"], &["prompts", "thinking_output"]];
+        &[&["prompts", "thinking_output"], &["prompts", "source_echo"]];
     const LANGUAGE_BASE_REQUIRED_FIELDS: &'static [&'static str] = &["type", "id"];
     const LANGUAGE_OPTIONAL_FIELDS: &'static [&'static str] = &[
         "minimum_kana_characters",
@@ -2767,10 +2707,10 @@ impl ConfigurationFieldContract {
 
     fn field_kind(path: &[String]) -> Option<ConfigurationTomlValueKind> {
         let kind = match path {
-            [prompts, field] if prompts == "prompts" && field == "locale" => {
-                ConfigurationTomlValueKind::String
-            }
-            [prompts, thinking] if prompts == "prompts" && thinking == "thinking_output" => {
+            [prompts, field]
+                if prompts == "prompts"
+                    && matches!(field.as_str(), "thinking_output" | "source_echo") =>
+            {
                 ConfigurationTomlValueKind::Boolean
             }
             [llm, clients, _, field]
@@ -4089,8 +4029,8 @@ const fn default_record_translation_tasks() -> bool {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPromptsConfiguration {
-    locale: String,
     thinking_output: bool,
+    source_echo: bool,
 }
 
 #[derive(Deserialize)]
@@ -4503,128 +4443,41 @@ id = "unused"
     }
 
     #[test]
-    fn prompt_locale_auto_uses_the_project_target_language() {
+    fn prompt_output_switches_are_independent_required_booleans() {
         let directory = TestDirectory::new();
-        for (thinking_output, expected) in [("false", false), ("true", true)] {
+        for (thinking_output, source_echo) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
             let source = replace_thinking_output(
                 include_str!("../../config.example.toml"),
                 format!("thinking_output = {thinking_output}").as_str(),
             );
+            let source =
+                replace_source_echo(&source, format!("source_echo = {source_echo}").as_str());
             let path = directory.write(
-                format!("prompt-auto-thinking-{thinking_output}.toml").as_str(),
+                format!("prompt-{thinking_output}-{source_echo}.toml").as_str(),
                 &source,
             );
             let ConfiguredRpgMakerCommand::Translate(configured) =
                 load_configuration(&path, translate_command("primary"))
-                    .expect("auto locale 与布尔思考输出开关应建立受信配置")
+                    .expect("两个 Prompt 输出开关的任意组合都应建立受信配置")
             else {
                 panic!("应建立 Translate 配置");
             };
 
-            assert_eq!(
-                configured.translation().prompt_locale(),
-                PromptLocaleSelection::Auto
-            );
-            assert_eq!(
-                configured
-                    .translation()
-                    .prompt_locale()
-                    .resolve(&LanguageId::parse("zh-Hant").expect("测试目标语言应合法"))
-                    .expect("受支持目标语言应映射到 Prompt locale"),
-                UiLocale::TraditionalChinese,
-                "auto 必须按项目目标语言选择 Prompt locale"
-            );
-            assert_eq!(configured.translation().thinking_output(), expected);
-        }
-    }
-
-    #[test]
-    fn explicit_prompt_locale_uses_the_existing_ui_locale_matching_contract() {
-        let directory = TestDirectory::new();
-        let mut cases = UiLocale::ALL
-            .into_iter()
-            .map(|locale| (locale.as_str(), locale))
-            .collect::<Vec<_>>();
-        cases.extend([
-            ("ja-JP", UiLocale::Japanese),
-            ("zh-TW", UiLocale::TraditionalChinese),
-        ]);
-
-        for (locale_input, expected) in cases {
-            let source = include_str!("../../config.example.toml").replace(
-                "locale = \"auto\"",
-                format!("locale = \"{locale_input}\"").as_str(),
-            );
-            let path = directory.write(
-                format!("prompt-locale-{}.toml", locale_input.replace('-', "_")).as_str(),
-                &source,
-            );
-            let ConfiguredRpgMakerCommand::Translate(configured) =
-                load_configuration(&path, translate_command("primary"))
-                    .expect("受支持的 BCP 47 UI locale 应建立显式 Prompt locale")
-            else {
-                panic!("应建立 Translate 配置");
-            };
-
-            assert_eq!(
-                configured.translation().prompt_locale(),
-                PromptLocaleSelection::Explicit(expected),
-                "显式 locale {locale_input} 应规范化为所选 UI locale"
-            );
-            assert_eq!(
-                configured
-                    .translation()
-                    .prompt_locale()
-                    .resolve(&LanguageId::parse("de").expect("测试目标语言应合法"))
-                    .expect("显式 Prompt locale 不依赖目标语言"),
-                expected,
-                "显式 locale 必须覆盖自动目标语言映射"
-            );
-        }
-    }
-
-    #[test]
-    fn automatic_prompt_locale_rejects_an_unsupported_target_language() {
-        let error = PromptLocaleSelection::Auto
-            .resolve(&LanguageId::parse("de").expect("测试目标语言应合法"))
-            .expect_err("没有对应资源目录的目标语言不能自动选择 Prompt locale");
-
-        assert_eq!(error.target_language().as_str(), "de");
-        assert!(error.to_string().contains("prompts.locale"));
-    }
-
-    #[test]
-    fn prompt_locale_rejects_invalid_or_unsupported_choices_without_echoing_them() {
-        const SENTINEL: &str = "UNSUPPORTED_PROMPT_LOCALE_SENTINEL";
-        let directory = TestDirectory::new();
-        for (name, locale) in [
-            ("uppercase-auto", "AUTO"),
-            ("surrounding-whitespace", " ja "),
-            ("unsupported", SENTINEL),
-        ] {
-            let source = include_str!("../../config.example.toml").replace(
-                "locale = \"auto\"",
-                format!("locale = \"{locale}\"").as_str(),
-            );
-            let path = directory.write(format!("prompt-locale-{name}.toml").as_str(), &source);
-            let error = match load_configuration(&path, translate_command("primary")) {
-                Ok(_) => panic!("无效或不支持的 Prompt locale 必须失败"),
-                Err(error) => error,
-            };
-            let diagnostics = format!("{error:?}\n{error}");
-
-            assert!(diagnostics.contains("prompts.locale"));
-            assert!(diagnostics.contains("BCP 47 UI locale"));
-            assert!(!diagnostics.contains(SENTINEL));
+            assert_eq!(configured.translation().thinking_output(), thinking_output);
+            assert_eq!(configured.translation().source_echo(), source_echo);
         }
     }
 
     #[test]
     fn commands_other_than_translate_do_not_consume_prompt_values() {
         let directory = TestDirectory::new();
-        let source =
-            include_str!("../../config.example.toml").replace("locale = \"auto\"", "locale = []");
-        let source = replace_thinking_output(&source, "thinking_output = []");
+        let source = replace_thinking_output(
+            include_str!("../../config.example.toml"),
+            "thinking_output = []",
+        );
+        let source = replace_source_echo(&source, "source_echo = []");
         let path = directory.write("unselected-prompts.toml", &source);
 
         for command in [init_command(), extract_command(false), write_back_command()] {
@@ -4714,13 +4567,10 @@ id = "unused"
         let source = include_str!("../../config.example.toml").replace("\r\n", "\n");
         let cases = [
             (
-                "prompts-locale",
-                source.replacen("locale = \"auto\"\n", "", 1),
-            ),
-            (
                 "prompts-thinking-output",
                 replace_thinking_output(&source, ""),
             ),
+            ("prompts-source-echo", replace_source_echo(&source, "")),
             (
                 "languages",
                 remove_configuration_range(&source, "[[languages]]", "[[translation.profiles]]"),
@@ -4799,20 +4649,6 @@ id = "unused"
                 Some("UNKNOWN_VALUE_SENTINEL"),
             ),
             (
-                "prompt-locale-type",
-                source.replacen(
-                    "locale = \"auto\"",
-                    "locale = [\"PROMPT_LOCALE_TYPE_SENTINEL\"]",
-                    1,
-                ),
-                "prompts.locale",
-                "字段类型不符合当前配置契约",
-                ConfigurationTomlFailureKind::TypeMismatch {
-                    expected: ConfigurationTomlValueKind::String,
-                },
-                Some("PROMPT_LOCALE_TYPE_SENTINEL"),
-            ),
-            (
                 "prompt-thinking-output-type",
                 replace_thinking_output(
                     &source,
@@ -4824,6 +4660,19 @@ id = "unused"
                     expected: ConfigurationTomlValueKind::Boolean,
                 },
                 Some("PROMPT_THINKING_TYPE_SENTINEL"),
+            ),
+            (
+                "prompt-source-echo-type",
+                replace_source_echo(
+                    &source,
+                    "source_echo = [\"PROMPT_SOURCE_ECHO_TYPE_SENTINEL\"]",
+                ),
+                "prompts.source_echo",
+                "字段类型不符合当前配置契约",
+                ConfigurationTomlFailureKind::TypeMismatch {
+                    expected: ConfigurationTomlValueKind::Boolean,
+                },
+                Some("PROMPT_SOURCE_ECHO_TYPE_SENTINEL"),
             ),
             (
                 "type",
@@ -5126,7 +4975,7 @@ id = "unused"
         let directory = TestDirectory::new();
         let syntax_path = directory.write(
             "syntax.toml",
-            "[prompts]\nlocale = \"UNTERMINATED_VALUE_SENTINEL\n",
+            "[prompts]\nthinking_output = \"UNTERMINATED_VALUE_SENTINEL\n",
         );
         let syntax = match load_configuration(&syntax_path, init_command()) {
             Ok(_) => panic!("无效 TOML 语法必须拒绝"),
@@ -5324,6 +5173,15 @@ api_key = "{API_KEY}" "invalid"
             }
         }
         panic!("测试配置应包含 thinking_output 布尔字段");
+    }
+
+    fn replace_source_echo(source: &str, replacement: &str) -> String {
+        for current in ["source_echo = false", "source_echo = true"] {
+            if source.contains(current) {
+                return source.replacen(current, replacement, 1);
+            }
+        }
+        panic!("测试配置应包含 source_echo 布尔字段");
     }
 
     struct TestDirectory {

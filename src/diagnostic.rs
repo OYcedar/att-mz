@@ -663,7 +663,6 @@ where
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ConfigurationValueRule {
-    UnsupportedPromptLocale,
     LanguagePolicyTermBlank,
     LanguagePolicyTermSurroundingWhitespace,
     LanguagePolicyTermDuplicate,
@@ -707,7 +706,6 @@ pub(crate) enum ConfigurationValueRule {
 impl ConfigurationValueRule {
     const fn as_str(&self) -> &'static str {
         match self {
-            Self::UnsupportedPromptLocale => "unsupported_prompt_locale",
             Self::LanguagePolicyTermBlank => "language_policy_term_blank",
             Self::LanguagePolicyTermSurroundingWhitespace => {
                 "language_policy_term_surrounding_whitespace"
@@ -2277,7 +2275,6 @@ mod tests {
 
     fn all_configuration_value_rules() -> Vec<ConfigurationValueRule> {
         vec![
-            ConfigurationValueRule::UnsupportedPromptLocale,
             ConfigurationValueRule::LanguagePolicyTermBlank,
             ConfigurationValueRule::LanguagePolicyTermSurroundingWhitespace,
             ConfigurationValueRule::LanguagePolicyTermDuplicate,

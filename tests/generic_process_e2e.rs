@@ -19,8 +19,8 @@ fn generic_progress_modes_and_jsonl_diagnostic_are_observable() {
     fs::write(
         distribution.join("config.toml"),
         r#"[prompts]
-locale = "en"
 thinking_output = true
+source_echo = false
 
 [llm.clients.local]
 url = "http://127.0.0.1:9/v1/chat/completions"
@@ -54,18 +54,29 @@ target_task_user_message_characters = 10000
 "#,
     )
     .expect("应可写入测试配置");
-    let prompt_root = distribution.join("prompts/generic/en");
-    fs::create_dir_all(&prompt_root).expect("应可建立 Generic Prompt 目录");
+    let prompt_root = distribution.join("prompts/translation");
+    fs::create_dir_all(prompt_root.join("rules")).expect("应可建立 Prompt 规则目录");
+    fs::create_dir_all(prompt_root.join("examples")).expect("应可建立 Prompt 示例目录");
     fs::write(
         prompt_root.join("system.md"),
-        "Translate {{source_language}} into {{target_language}}. Return string values.",
+        "把 {{source_language}} 翻译成 {{target_language}}。",
     )
-    .expect("应可写入 Generic system Prompt");
+    .expect("应可写入共享 system Prompt");
     fs::write(
         prompt_root.join("thinking.md"),
-        "Explain the checks inside the required why envelope.",
+        "在 think 中写出影响译文的判断。",
     )
-    .expect("应可写入 Generic Thinking Prompt");
+    .expect("应可写入共享 Thinking Prompt");
+    fs::write(
+        prompt_root.join("rules/thinking.md"),
+        "只输出带 think 和 translations 的 JSON object。",
+    )
+    .expect("应可写入思考模式规则");
+    fs::write(
+        prompt_root.join("examples/thinking.md"),
+        "# 示例\n\n输入：{}\n\n输出：{\"think\":\"判断\",\"translations\":{}}",
+    )
+    .expect("应可写入思考模式示例");
     fs::write(
         input.join("story.jsonl"),
         concat!(

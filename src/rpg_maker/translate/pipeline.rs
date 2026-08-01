@@ -1494,10 +1494,11 @@ impl RpgMakerExecutableTask {
         expected_outputs: Vec<ExpectedTranslationOutput>,
     ) -> Self {
         assert!(
-            expected_outputs.iter().enumerate().all(|(index, output)| {
-                index.checked_add(1).and_then(TaskId::new) == Some(output.id())
-            }),
-            "任务内模型输出 ID 必须从 1 连续编号"
+            expected_outputs
+                .iter()
+                .enumerate()
+                .all(|(index, output)| TaskId::new(index) == output.id()),
+            "任务内模型输出 ID 必须从 0 连续编号"
         );
         Self {
             index,
@@ -2057,7 +2058,7 @@ pub(crate) trait RpgMakerTranslationAssetReader: Send + Sync {
 /// Planner 必须先在最大仍有关联的 RPG Maker 结构范围内组织复合 Group，再按外部 Profile
 /// 提供的 user message 字符装箱目标切割；不得为了接近目标拼接无关范围。单个完整 Group
 /// 超过目标时独立成块，不能拆组或拒绝规范内容，后续任务继续使用原目标。每个 TaskBlock
-/// 内待翻译单元的 ID 从 1 连续递增，虚原文只保留原文且没有 ID。省略外部资源时复用项目
+/// 内待翻译单元的 ID 从 0 连续递增，虚原文只保留原文且没有 ID。省略外部资源时复用项目
 /// 当前快照；显式资源在全部解析成功后成为新快照。Planner 按每个语义单元实际触发的术语
 /// 和占位符语义对账，并把资源更新、失效清理与可复用传播一并写入 Preparation。
 pub(crate) trait RpgMakerTranslationTaskPlanner: Send + Sync {
@@ -3060,7 +3061,7 @@ mod tests {
     }
 
     fn task_id(value: usize) -> TaskId {
-        TaskId::new(value).expect("测试 Task ID 必须非零")
+        TaskId::new(value)
     }
 
     #[test]
@@ -3093,7 +3094,7 @@ mod tests {
                 ChatMessage::new(ChatMessageRole::User, "# Content\n\n..."),
             ],
             vec![ExpectedTranslationOutput::new(
-                task_id(1),
+                task_id(0),
                 description_identity,
                 Vec::new(),
                 ExpectedTranslationValidation::new(
@@ -3119,7 +3120,7 @@ mod tests {
             &group_location
         );
         assert_eq!(block.messages().len(), 2);
-        assert_eq!(block.expected_outputs()[0].id(), task_id(1));
+        assert_eq!(block.expected_outputs()[0].id(), task_id(0));
         assert_eq!(
             block.expected_outputs()[0].line_shape(),
             ExpectedLineShape::Aligned(NonZeroUsize::MIN)
@@ -3138,7 +3139,7 @@ mod tests {
     fn expected_output_contract_scan_can_cancel_during_long_protected_text() {
         let mut polls = 0_usize;
         let result = ExpectedTranslationOutput::try_new_with_cancellation(
-            task_id(1),
+            task_id(0),
             translation_identity(),
             Vec::new(),
             ExpectedTranslationValidation::new(
@@ -3348,8 +3349,8 @@ mod tests {
             let tasks: Vec<RpgMakerExecutableTask> = (0..self.task_count)
                 .map(|index| {
                     let expected_outputs = vec![
-                        expected_output(index, 1, true),
-                        expected_output(index, 2, false),
+                        expected_output(index, 0, true),
+                        expected_output(index, 1, false),
                     ];
                     RpgMakerExecutableTask::new(
                         RpgMakerTranslationTaskIndex::new(index),

@@ -169,20 +169,17 @@ pub(crate) enum UnitTaskResponsibility {
     Context,
 }
 
-/// 实际请求中从 `1` 开始连续分配的块内临时 ID。
+/// 实际请求中从 `0` 开始连续分配的块内临时 ID。
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct TaskId(NonZeroUsize);
+pub(crate) struct TaskId(usize);
 
 impl TaskId {
-    pub(crate) const fn new(value: usize) -> Option<Self> {
-        match NonZeroUsize::new(value) {
-            Some(value) => Some(Self(value)),
-            None => None,
-        }
+    pub(crate) const fn new(value: usize) -> Self {
+        Self(value)
     }
 
     pub(crate) const fn get(self) -> usize {
-        self.0.get()
+        self.0
     }
 }
 
@@ -380,10 +377,11 @@ pub(crate) fn assign_task_ids(
             let task_id = match responsibility {
                 UnitTaskResponsibility::Context => None,
                 UnitTaskResponsibility::ModelRepresentative => {
+                    let task_id = TaskId::new(assigned_count);
                     assigned_count = assigned_count
                         .checked_add(1)
                         .ok_or(TaskPlanningError::TaskIdOverflow)?;
-                    Some(TaskId::new(assigned_count).ok_or(TaskPlanningError::TaskIdOverflow)?)
+                    Some(task_id)
                 }
             };
             unit_task_ids.push(task_id);
@@ -519,8 +517,8 @@ mod tests {
         assert_eq!(sent.len(), 2);
         assert_eq!(sent[0].layout().group_range(), 0..1);
         assert_eq!(sent[1].layout().group_range(), 2..3);
-        assert_eq!(sent[0].unit_task_ids(), [TaskId::new(1)]);
-        assert_eq!(sent[1].unit_task_ids(), [TaskId::new(1)]);
+        assert_eq!(sent[0].unit_task_ids(), [Some(TaskId::new(0))]);
+        assert_eq!(sent[1].unit_task_ids(), [Some(TaskId::new(0))]);
     }
 
     #[test]
@@ -709,9 +707,9 @@ mod tests {
     }
 
     #[test]
-    fn task_ids_are_nonzero_and_restart_in_every_block() {
-        assert_eq!(TaskId::new(0), None);
-        assert_eq!(TaskId::new(7).expect("非零 ID").to_string(), "7");
+    fn task_ids_are_zero_based_and_restart_in_every_block() {
+        assert_eq!(TaskId::new(0).to_string(), "0");
+        assert_eq!(TaskId::new(7).to_string(), "7");
 
         let layout = TaskPlanningLayout::new(vec![scope(vec![group(2, 2, 2), group(2, 2, 2)])])
             .expect("layout 应合法");
@@ -729,8 +727,11 @@ mod tests {
         .expect("编号应完成");
         assert_eq!(
             assigned.blocks()[0].unit_task_ids(),
-            [TaskId::new(1), TaskId::new(2)]
+            [Some(TaskId::new(0)), Some(TaskId::new(1))]
         );
-        assert_eq!(assigned.blocks()[1].unit_task_ids(), [None, TaskId::new(1)]);
+        assert_eq!(
+            assigned.blocks()[1].unit_task_ids(),
+            [None, Some(TaskId::new(0))]
+        );
     }
 }

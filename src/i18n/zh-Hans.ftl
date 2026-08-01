@@ -327,7 +327,6 @@ diagnostic-io-kind-value = { $code ->
    *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
-    [unsupported_prompt_locale] 必须是全小写的 auto 或受支持的 BCP 47 界面语言
     [language_policy_term_blank] 语言策略术语不能为空
     [language_policy_term_surrounding_whitespace] 语言策略术语不能带首尾空白
     [language_policy_term_duplicate] 语言策略术语不能重复
@@ -436,17 +435,8 @@ task-record-final-result-heading = 最终结果
 task-record-no-request = 没有形成可发送的模型请求。
 task-record-empty-assistant = 模型返回了空对象。
 task-record-parse-error = 解析错误：{ $kind ->
-    [json] 模型响应 JSON 无效（类别 `{ $category }`），第 { $line } 行、第 { $column } 列
-    [thinking_not_allowed] 当前响应模式不接受思考输出，第 { $line } 行、第 { $column } 列
-    [thinking_envelope_missing] 模型响应缺少规定的思考信封，第 { $line } 行、第 { $column } 列
-    [thinking_envelope_unclosed] 模型响应的思考信封没有闭合，第 { $line } 行、第 { $column } 列
     [thinking_empty] 模型响应的思考内容为空，第 { $line } 行、第 { $column } 列
-    [thinking_nested] 模型响应包含嵌套的思考信封，第 { $line } 行、第 { $column } 列
-    [thinking_repeated] 模型响应包含重复的思考信封，第 { $line } 行、第 { $column } 列
-    [markdown_fence_no_body] Markdown 围栏没有正文，第 { $line } 行、第 { $column } 列
-    [markdown_fence_unsupported] 只接受无语言标记或 json 标记的单层 Markdown 围栏，第 { $line } 行、第 { $column } 列
-    [markdown_fence_unclosed] Markdown 围栏没有闭合，第 { $line } 行、第 { $column } 列
-   *[markdown_fence_invalid_closing] Markdown 围栏必须以最终独立行闭合，第 { $line } 行、第 { $column } 列
+   *[json] 模型响应 JSON 无效（类别 `{ $category }`），第 { $line } 行、第 { $column } 列
 }
 task-record-attempt-succeeded = 尝试 { $number }：成功；finish reason { $finish_reason }
 task-record-attempt-token-usage = ；token `{ $prompt } / { $completion } / { $total }`

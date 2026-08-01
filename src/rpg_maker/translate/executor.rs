@@ -48,7 +48,9 @@ use crate::translation::placeholder_projection::{
 use crate::translation::placeholder_token;
 use crate::translation::task_planning::TaskId;
 use crate::translation_protocol::{
-    DecodedJsonStringArray, parse_translation_response_with_cancellation,
+    DecodedJsonStringArray, DecodedSourceEchoFieldsError, DecodedSourceEchoValue,
+    DecodedTranslationAssistantValue, TranslationResponseMode,
+    parse_translation_response_with_cancellation,
 };
 
 use super::pipeline::{
@@ -59,20 +61,13 @@ use super::pipeline::{
     TranslationTaskOutcome, TranslationTaskOutcomeContext, TranslationTaskUnavailableReason,
     TranslationUnitRejectionReason, UnresolvedTranslationUnit,
 };
-use super::profile::{
-    ResolvedRpgMakerTranslationResources, RpgMakerTranslationProfile, TranslationResponseEnvelope,
-};
+use super::profile::{ResolvedRpgMakerTranslationResources, RpgMakerTranslationProfile};
 use super::task_record::{
     TranslationAssistantEntry, TranslationAssistantRecordedValue, TranslationAssistantValueError,
     TranslationTaskAttemptRecord, TranslationTaskExecution, TranslationTaskExecutionEvidence,
     TranslationTaskExecutionFailure, TranslationTaskResponseParseError,
     TranslationTaskResponseRecord,
 };
-#[cfg(test)]
-use super::task_record::{
-    TranslationTaskResponseJsonErrorCategory, TranslationTaskResponseParseErrorKind,
-};
-
 const RESPONSE_PROCESSING_CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
 
 /// 一次最终成功 HTTP 响应中可安全进入任务结果与持久日志的元数据。
@@ -1362,7 +1357,7 @@ fn process_response(
 
     let parsed = match parse_model_response_with_cancellation(
         response.content(),
-        resources.system_prompt().response_envelope(),
+        resources.system_prompt().response_mode(),
         &mut ensure_running,
     ) {
         Ok(parsed) => parsed,
@@ -2029,19 +2024,19 @@ fn collect_model_outputs_with_cancellation<E>(
 fn parse_model_output_id(value: &str) -> Option<TaskId> {
     if value.is_empty()
         || !value.bytes().all(|byte| byte.is_ascii_digit())
-        || value.starts_with('0')
+        || (value.len() > 1 && value.starts_with('0'))
     {
         return None;
     }
-    value.parse().ok().and_then(TaskId::new)
+    value.parse().ok().map(TaskId::new)
 }
 
 #[cfg(test)]
 fn parse_model_response(
     value: &str,
-    response_envelope: TranslationResponseEnvelope,
+    response_mode: TranslationResponseMode,
 ) -> Result<ParsedModelOutputBatch, TranslationTaskResponseParseError> {
-    match parse_model_response_with_cancellation(value, response_envelope, || {
+    match parse_model_response_with_cancellation(value, response_mode, || {
         Ok::<_, std::convert::Infallible>(())
     }) {
         Ok(result) => result,
@@ -2051,12 +2046,12 @@ fn parse_model_response(
 
 fn parse_model_response_with_cancellation<E>(
     value: &str,
-    response_envelope: TranslationResponseEnvelope,
+    response_mode: TranslationResponseMode,
     mut ensure_running: impl FnMut() -> Result<(), E>,
 ) -> Result<Result<ParsedModelOutputBatch, TranslationTaskResponseParseError>, E> {
     let parsed = match parse_translation_response_with_cancellation(
         value,
-        response_envelope,
+        response_mode,
         &mut ensure_running,
     )? {
         Ok(parsed) => parsed,
@@ -2066,13 +2061,8 @@ fn parse_model_response_with_cancellation<E>(
     let mut outputs = Vec::with_capacity(entries.len());
     for entry in entries {
         ensure_running()?;
-        let translation = match entry.decode_string_array_with_cancellation(&mut ensure_running)? {
-            DecodedJsonStringArray::NotArray => Err(TranslationAssistantValueError::NotStringArray),
-            DecodedJsonStringArray::NonStringItem { item } => {
-                Err(TranslationAssistantValueError::NonStringItem { item })
-            }
-            DecodedJsonStringArray::Strings(lines) => Ok(lines),
-        };
+        let decoded = entry.decode_translation_value_with_cancellation(&mut ensure_running)?;
+        let translation = translation_lines_from_decoded_value(decoded);
         let (id, value, canonical_id) = entry.into_parts();
         outputs.push(ParsedModelOutput {
             id,
@@ -2085,6 +2075,64 @@ fn parse_model_response_with_cancellation<E>(
     Ok(Ok(ParsedModelOutputBatch { thinking, outputs }))
 }
 
+fn translation_lines_from_decoded_value(
+    value: DecodedTranslationAssistantValue,
+) -> Result<Vec<String>, TranslationAssistantValueError> {
+    match value {
+        DecodedTranslationAssistantValue::Translation(translation) => {
+            translation_lines_from_array(translation, false)
+        }
+        DecodedTranslationAssistantValue::SourceEcho(DecodedSourceEchoValue::NotObject) => {
+            Err(TranslationAssistantValueError::SourceEchoNotObject)
+        }
+        DecodedTranslationAssistantValue::SourceEcho(DecodedSourceEchoValue::InvalidFields(
+            error,
+        )) => Err(match error {
+            DecodedSourceEchoFieldsError::MissingSource => {
+                TranslationAssistantValueError::SourceEchoMissingSource
+            }
+            DecodedSourceEchoFieldsError::MissingTranslation => {
+                TranslationAssistantValueError::SourceEchoMissingTranslation
+            }
+            DecodedSourceEchoFieldsError::DuplicateSource => {
+                TranslationAssistantValueError::SourceEchoDuplicateSource
+            }
+            DecodedSourceEchoFieldsError::DuplicateTranslation => {
+                TranslationAssistantValueError::SourceEchoDuplicateTranslation
+            }
+            DecodedSourceEchoFieldsError::UnexpectedField { .. } => {
+                TranslationAssistantValueError::SourceEchoUnexpectedField
+            }
+        }),
+        DecodedTranslationAssistantValue::SourceEcho(DecodedSourceEchoValue::Fields {
+            source,
+            translation,
+        }) => {
+            translation_lines_from_array(source, true)?;
+            translation_lines_from_array(translation, false)
+        }
+    }
+}
+
+fn translation_lines_from_array(
+    value: DecodedJsonStringArray,
+    source: bool,
+) -> Result<Vec<String>, TranslationAssistantValueError> {
+    match value {
+        DecodedJsonStringArray::NotArray if source => {
+            Err(TranslationAssistantValueError::SourceNotStringArray)
+        }
+        DecodedJsonStringArray::NonStringItem { item } if source => {
+            Err(TranslationAssistantValueError::SourceNonStringItem { item })
+        }
+        DecodedJsonStringArray::NotArray => Err(TranslationAssistantValueError::NotStringArray),
+        DecodedJsonStringArray::NonStringItem { item } => {
+            Err(TranslationAssistantValueError::NonStringItem { item })
+        }
+        DecodedJsonStringArray::Strings(lines) => Ok(lines),
+    }
+}
+
 #[derive(Debug)]
 struct ParsedModelOutputBatch {
     thinking: Option<String>,
@@ -2094,9 +2142,9 @@ struct ParsedModelOutputBatch {
 #[cfg(test)]
 fn parse_model_output_batch(
     value: &str,
-    response_envelope: TranslationResponseEnvelope,
+    response_mode: TranslationResponseMode,
 ) -> Result<Vec<ParsedModelOutput>, TranslationTaskResponseParseError> {
-    parse_model_response(value, response_envelope).map(|parsed| parsed.outputs)
+    parse_model_response(value, response_mode).map(|parsed| parsed.outputs)
 }
 
 fn unresolved_unit(
@@ -3371,7 +3419,7 @@ mod tests {
     use crate::rpg_maker::translate::profile::{
         ResolvedRpgMakerTranslationResources, RpgMakerSystemPrompt,
         RpgMakerTranslationPlanningConfiguration, RpgMakerTranslationProfile,
-        TranslationResponseEnvelope,
+        TranslationResponseMode,
     };
     use crate::runtime::cpu::CpuExecutorUnavailable;
     use crate::translation::profile::TranslationRequestConfiguration;
@@ -3388,7 +3436,7 @@ mod tests {
     impl Error for FakeError {}
 
     fn task_id(value: usize) -> TaskId {
-        TaskId::new(value).expect("测试 Task ID 必须非零")
+        TaskId::new(value)
     }
 
     impl LlmRequestDiagnosticSource for FakeError {
@@ -3620,25 +3668,25 @@ mod tests {
         target_language: &str,
         module: Arc<dyn LanguageModule>,
     ) -> Arc<ResolvedRpgMakerTranslationResources> {
-        translation_resources_with_envelope(
+        translation_resources_with_mode(
             source_language,
             target_language,
             module,
-            TranslationResponseEnvelope::JsonOnly,
+            TranslationResponseMode::new(false, false),
         )
     }
 
-    fn translation_resources_with_envelope(
+    fn translation_resources_with_mode(
         source_language: &str,
         target_language: &str,
         module: Arc<dyn LanguageModule>,
-        response_envelope: TranslationResponseEnvelope,
+        response_mode: TranslationResponseMode,
     ) -> Arc<ResolvedRpgMakerTranslationResources> {
         let pair = LanguagePair::new(
             LanguageId::parse(source_language).expect("测试源语言合法"),
             LanguageId::parse(target_language).expect("测试目标语言合法"),
         );
-        let prompt = RpgMakerSystemPrompt::new(pair, "# Contract".to_owned(), response_envelope)
+        let prompt = RpgMakerSystemPrompt::new(pair, "# Contract".to_owned(), response_mode)
             .expect("测试 Prompt 合法");
         Arc::new(ResolvedRpgMakerTranslationResources::new(prompt, module))
     }
@@ -3648,11 +3696,20 @@ mod tests {
     }
 
     fn thinking_translation_resources() -> Arc<ResolvedRpgMakerTranslationResources> {
-        translation_resources_with_envelope(
+        translation_resources_with_mode(
             "ja",
             "zh-Hans",
             japanese_module(),
-            TranslationResponseEnvelope::ThinkingThenJson,
+            TranslationResponseMode::new(true, false),
+        )
+    }
+
+    fn source_echo_translation_resources() -> Arc<ResolvedRpgMakerTranslationResources> {
+        translation_resources_with_mode(
+            "ja",
+            "zh-Hans",
+            japanese_module(),
+            TranslationResponseMode::new(false, true),
         )
     }
 
@@ -3819,7 +3876,7 @@ mod tests {
                 ChatMessage::new(ChatMessageRole::User, "# Task"),
             ],
             vec![ExpectedTranslationOutput::new(
-                task_id(1),
+                task_id(0),
                 identity,
                 propagation_targets,
                 ExpectedTranslationValidation::new(
@@ -3854,7 +3911,7 @@ mod tests {
                 ChatMessage::new(ChatMessageRole::User, "# Task"),
             ],
             vec![ExpectedTranslationOutput::new(
-                task_id(1),
+                task_id(0),
                 speaker_identity(),
                 Vec::new(),
                 ExpectedTranslationValidation::new(
@@ -3884,7 +3941,7 @@ mod tests {
                 ChatMessage::new(ChatMessageRole::System, "# Contract"),
                 ChatMessage::new(ChatMessageRole::User, "# Task"),
             ],
-            (1..=output_count)
+            (0..output_count)
                 .map(|id| {
                     ExpectedTranslationOutput::new(
                         task_id(id),
@@ -3920,7 +3977,7 @@ mod tests {
             .process(
                 &task,
                 LlmResponse::new(
-                    r#"{"1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
+                    r#"{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                     LlmFinishReason::Stop,
                     None,
                     None,
@@ -3939,186 +3996,114 @@ mod tests {
     }
 
     #[test]
-    fn json_only_response_envelope_accepts_only_the_explicit_contract() {
-        for value in [
-            "{}",
-            " \r\n {} \n ",
-            "\u{feff}{}",
-            r#"{"1":["业务文本可以包含 <why> 与 </why> 标签"]}"#,
-            r#"{"0":["括号 [ ]、逗号 ,} 与反引号 ```"]}"#,
-        ] {
-            assert!(
-                parse_model_output_batch(value, TranslationResponseEnvelope::JsonOnly).is_ok(),
-                "合法响应信封应通过：{value:?}"
-            );
-        }
-
-        for value in [
-            "说明：{}",
-            "<why>不应输出思考</why>{}",
-            "</why>{}",
-            "{} 后记",
-            "{}\n{}",
-            "{\"0\":[\"译文\",]}",
-            "{\"0\":[\"译文\"] ,}",
-            "{// comment\n}",
-            "```yaml\n{}\n```",
-            "```json\n{}",
-            "```json\n{}```",
-            "```json\n\n```",
-            "```json\n{}\n```\n后记",
-            "{\"0\":[\"截断",
-            "\u{feff}\u{feff}{}",
-            "[]",
-        ] {
-            assert!(
-                parse_model_output_batch(value, TranslationResponseEnvelope::JsonOnly).is_err(),
-                "协议外响应必须拒绝：{value:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn thinking_response_envelope_accepts_one_non_blank_exact_tag_pair() {
-        for value in [
-            "<why>逐项分析。</why>{}",
-            "<why>第一行\n第二行</why>\n{}",
-            " \r\n\u{feff}<why>\n　逐项分析\t\n</why>\r\n{}\n",
-            r#"<why>逐项分析。</why>{"1":["业务文本可以包含 <why> 与 </why> 标签"]}"#,
-        ] {
-            assert!(
-                parse_model_output_batch(value, TranslationResponseEnvelope::ThinkingThenJson)
-                    .is_ok(),
-                "合法思考信封应通过：{value:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn thinking_response_envelope_rejects_every_protocol_variant() {
-        for value in [
-            "{}",
-            "<why></why>{}",
-            "<why> \n　\t</why>{}",
-            "<why>未闭合{}",
-            "<why>外层<why>内层</why></why>{}",
-            "<why>第一组</why><why>第二组</why>{}",
-            "<why>第一组</why></why>{}",
-            "<WHY>大小写错误</WHY>{}",
-            "<Why>大小写错误</why>{}",
-            "<why reason=\"analysis\">带属性</why>{}",
-            "说明文字<why>分析</why>{}",
-            "<why>分析</WHY>{}",
-            "<why>分析</why>说明文字{}",
-            "<why>分析</why>{}后记",
-            "```\n<why>分析</why>{}\n```",
-        ] {
-            assert!(
-                parse_model_output_batch(value, TranslationResponseEnvelope::ThinkingThenJson)
-                    .is_err(),
-                "协议外思考信封必须拒绝：{value:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn response_parse_errors_use_complete_raw_assistant_coordinates() {
+    fn four_response_modes_decode_the_same_translation_lines() {
         let cases = [
             (
-                " \r\n\u{feff}<why>\n分析\n</why>\r\n{\r\n  \"1\": [\"ok\"],\r\n  \"2\": ]\r\n}\r\n",
-                TranslationResponseEnvelope::ThinkingThenJson,
-                TranslationTaskResponseParseErrorKind::Json(
-                    TranslationTaskResponseJsonErrorCategory::Syntax,
-                ),
-                7,
-                8,
+                TranslationResponseMode::new(false, false),
+                r#"{"0":["甲","乙"]}"#,
             ),
             (
-                " \n<why>分析\n",
-                TranslationResponseEnvelope::ThinkingThenJson,
-                TranslationTaskResponseParseErrorKind::ThinkingEnvelopeUnclosed,
-                3,
-                1,
+                TranslationResponseMode::new(true, false),
+                r#"{"think":"结合上下文判断语气。","translations":{"0":["甲","乙"]}}"#,
             ),
             (
-                "\n<why>外层\n  <why>内层</why></why>{}",
-                TranslationResponseEnvelope::ThinkingThenJson,
-                TranslationTaskResponseParseErrorKind::ThinkingNested,
-                3,
-                3,
+                TranslationResponseMode::new(false, true),
+                r#"{"0":{"source":["任意回显"],"translation":["甲","乙"]}}"#,
             ),
             (
-                "<why>第一组</why>\n  </why>{}",
-                TranslationResponseEnvelope::ThinkingThenJson,
-                TranslationTaskResponseParseErrorKind::ThinkingRepeated,
-                2,
-                3,
-            ),
-            (
-                " \n```yaml\n{}\n```",
-                TranslationResponseEnvelope::JsonOnly,
-                TranslationTaskResponseParseErrorKind::Json(
-                    TranslationTaskResponseJsonErrorCategory::Syntax,
-                ),
-                2,
-                1,
-            ),
-            (
-                "\n```json\n{}\n",
-                TranslationResponseEnvelope::JsonOnly,
-                TranslationTaskResponseParseErrorKind::Json(
-                    TranslationTaskResponseJsonErrorCategory::Syntax,
-                ),
-                2,
-                1,
-            ),
-            (
-                "```json\n{}\n``` trailing",
-                TranslationResponseEnvelope::JsonOnly,
-                TranslationTaskResponseParseErrorKind::Json(
-                    TranslationTaskResponseJsonErrorCategory::Syntax,
-                ),
-                1,
-                1,
-            ),
-            (
-                "\n  </why>{}",
-                TranslationResponseEnvelope::JsonOnly,
-                TranslationTaskResponseParseErrorKind::ThinkingNotAllowed,
-                2,
-                3,
+                TranslationResponseMode::new(true, true),
+                r#"{"think":"结合上下文判断语气。","translations":{"0":{"source":["任意回显"],"translation":["甲","乙"]}}}"#,
             ),
         ];
 
-        for (raw, envelope, kind, line, column) in cases {
-            let error = parse_model_response(raw, envelope).expect_err("测试响应必须解析失败");
-            assert_eq!(
-                error,
-                TranslationTaskResponseParseError::new(
-                    kind,
-                    NonZeroUsize::new(line).expect("测试行号非零"),
-                    NonZeroUsize::new(column).expect("测试列号非零"),
-                ),
-                "原始 Assistant 坐标错误：{raw:?}"
-            );
-            let message = error.business_message();
-            assert!(message.contains(&format!("第 {line} 行、第 {column} 列")));
+        for (mode, value) in cases {
+            let outputs = parse_model_output_batch(value, mode).expect("当前模式响应应合法");
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(outputs[0].id, "0");
+            assert!(matches!(
+                &outputs[0].translation,
+                Ok(lines) if lines == &["甲".to_owned(), "乙".to_owned()]
+            ));
         }
     }
 
     #[test]
-    fn model_output_id_accepts_only_canonical_object_keys() {
+    fn thinking_mode_requires_exact_non_blank_json_wrapper() {
+        let mode = TranslationResponseMode::new(true, false);
+        for value in [
+            "{}",
+            r#"{"think":"","translations":{}}"#,
+            r#"{"think":" \n　\t","translations":{}}"#,
+            r#"{"think":[],"translations":{}}"#,
+            r#"{"think":"判断","translations":{},"extra":true}"#,
+            r#"{"think":"判断","think":"重复","translations":{}}"#,
+            r#"{"think":"判断"}"#,
+            "```json\n{\"think\":\"判断\",\"translations\":{}}\n```",
+        ] {
+            assert!(
+                parse_model_output_batch(value, mode).is_err(),
+                "协议外 thinking 响应必须拒绝：{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_echo_shape_errors_only_reject_the_affected_id() {
         let outputs = parse_model_output_batch(
-            r#"{"1":["甲"],"2":["乙"]}"#,
-            TranslationResponseEnvelope::JsonOnly,
+            r#"{"0":{"source":["不同原文"],"translation":["可接受"]},"1":{"source":"错误","translation":["拒绝"]},"2":{"translation":["拒绝"]},"3":["拒绝"]}"#,
+            TranslationResponseMode::new(false, true),
         )
-        .expect("无前导零的 ASCII 十进制键应合法");
+        .expect("逐 ID 形状错误不使整份 JSON 失效");
+
+        assert!(matches!(
+            &outputs[0].translation,
+            Ok(lines) if lines == &["可接受".to_owned()]
+        ));
+        assert!(matches!(
+            outputs[1].translation,
+            Err(TranslationAssistantValueError::SourceNotStringArray)
+        ));
+        assert!(matches!(
+            outputs[2].translation,
+            Err(TranslationAssistantValueError::SourceEchoMissingSource)
+        ));
+        assert!(matches!(
+            outputs[3].translation,
+            Err(TranslationAssistantValueError::SourceEchoNotObject)
+        ));
+    }
+
+    #[test]
+    fn response_parser_rejects_non_json_and_trailing_content() {
+        let mode = TranslationResponseMode::new(false, false);
+        for value in [
+            "说明：{}",
+            "{} 后记",
+            "{}\n{}",
+            "{\"0\":[\"译文\",]}",
+            "{// comment\n}",
+            "```json\n{}\n```",
+            "{\"0\":[\"截断",
+            "[]",
+        ] {
+            assert!(parse_model_output_batch(value, mode).is_err());
+        }
+    }
+
+    #[test]
+    fn model_output_id_accepts_zero_and_canonical_decimal_keys() {
+        let outputs = parse_model_output_batch(
+            r#"{"0":["甲"],"1":["乙"]}"#,
+            TranslationResponseMode::new(false, false),
+        )
+        .expect("零和无前导零的 ASCII 十进制键应合法");
 
         assert_eq!(outputs.len(), 2);
-        assert_eq!(outputs[0].id, "1");
-        assert_eq!(outputs[1].id, "2");
+        assert_eq!(outputs[0].id, "0");
+        assert_eq!(outputs[1].id, "1");
+        assert_eq!(parse_model_output_id("0"), Some(task_id(0)));
         assert_eq!(parse_model_output_id("1"), Some(task_id(1)));
-        for invalid in ["", "0", "01", "-1", "1.5", "true"] {
+        for invalid in ["", "00", "01", "-1", "1.5", "true"] {
             assert_eq!(parse_model_output_id(invalid), None);
         }
         assert_eq!(
@@ -4130,13 +4115,12 @@ mod tests {
     #[test]
     fn deeply_nested_per_id_values_keep_exact_rpg_shape_errors_and_drop_safely() {
         const DEPTH: usize = 10_000;
+        let mode = TranslationResponseMode::new(false, false);
 
         let deep_object = format!("{}null{}", r#"{"next":"#.repeat(DEPTH), "}".repeat(DEPTH));
-        let root_outputs = parse_model_output_batch(
-            &format!(r#"{{"1":{deep_object},"2":["保留"]}}"#),
-            TranslationResponseEnvelope::JsonOnly,
-        )
-        .expect("深层对象仍是合法的逐 ID JSON 值");
+        let root_outputs =
+            parse_model_output_batch(&format!(r#"{{"0":{deep_object},"1":["保留"]}}"#), mode)
+                .expect("深层对象仍是合法的逐 ID JSON 值");
         assert_eq!(root_outputs.len(), 2);
         assert!(matches!(
             &root_outputs[0].translation,
@@ -4144,14 +4128,14 @@ mod tests {
         ));
         assert!(matches!(
             &root_outputs[1].translation,
-            Ok(lines) if lines.len() == 1 && lines[0] == "保留"
+            Ok(lines) if lines == &["保留".to_owned()]
         ));
         drop(root_outputs);
 
         let deep_array = format!("{}0{}", "[".repeat(DEPTH), "]".repeat(DEPTH));
         let item_outputs = parse_model_output_batch(
-            &format!(r#"{{"1":["第一项","第二项",{deep_array}],"2":["保留"]}}"#),
-            TranslationResponseEnvelope::JsonOnly,
+            &format!(r#"{{"0":["第一项","第二项",{deep_array}],"1":["保留"]}}"#),
+            mode,
         )
         .expect("含深层非法数组项的响应仍应按 ID 解析");
         assert!(matches!(
@@ -4161,7 +4145,7 @@ mod tests {
         ));
         assert!(matches!(
             &item_outputs[1].translation,
-            Ok(lines) if lines.len() == 1 && lines[0] == "保留"
+            Ok(lines) if lines == &["保留".to_owned()]
         ));
         drop(item_outputs);
     }
@@ -4170,39 +4154,29 @@ mod tests {
     fn long_escaped_rpg_string_array_decode_observes_cancellation_after_outer_parse() {
         let long_line =
             r"\u4e2d".repeat(RESPONSE_PROCESSING_CANCELLATION_CHECK_BYTES.saturating_mul(4));
-        let raw_assistant = format!(r#"{{"1":["{long_line}"]}}"#);
+        let raw_assistant = format!(r#"{{"0":["{long_line}"]}}"#);
+        let mode = TranslationResponseMode::new(false, false);
 
         let outer_polls = Cell::new(0_usize);
-        let parsed = parse_translation_response_with_cancellation(
-            &raw_assistant,
-            TranslationResponseEnvelope::JsonOnly,
-            || {
-                outer_polls.set(outer_polls.get() + 1);
-                Ok::<_, ResponseProcessingCancelled>(())
-            },
-        )
+        let parsed = parse_translation_response_with_cancellation(&raw_assistant, mode, || {
+            outer_polls.set(outer_polls.get() + 1);
+            Ok::<_, ResponseProcessingCancelled>(())
+        })
         .expect("计数运行不应取消")
         .expect("合法外层响应必须解析");
         drop(parsed);
 
-        // RPG 在公共外层解析后先轮询条目和解码入口，再分块扫描 RawValue 中的转义
-        // string。放过这些入口并在首个长字符串窗口取消，可证明取消发生在逐 ID 值
-        // 解码内部，而不是只依赖外层 JSON reader。
         let cancel_at = outer_polls.get() + 4;
         let polls = Cell::new(0_usize);
-        let result = parse_model_response_with_cancellation(
-            &raw_assistant,
-            TranslationResponseEnvelope::JsonOnly,
-            || {
-                let current = polls.get() + 1;
-                polls.set(current);
-                if current == cancel_at {
-                    Err(ResponseProcessingCancelled)
-                } else {
-                    Ok(())
-                }
-            },
-        );
+        let result = parse_model_response_with_cancellation(&raw_assistant, mode, || {
+            let current = polls.get() + 1;
+            polls.set(current);
+            if current == cancel_at {
+                Err(ResponseProcessingCancelled)
+            } else {
+                Ok(())
+            }
+        });
 
         assert!(matches!(result, Err(ResponseProcessingCancelled)));
         assert_eq!(polls.get(), cancel_at);
@@ -4221,7 +4195,7 @@ mod tests {
                 ExpectedLineShape::Reflow,
                 line_content_analysis(&["今日はいい天気ですね。", "一緒に町へ", "行きませんか？"]),
             );
-            let content = serde_json::to_string(&serde_json::json!({"1": &expected_lines}))
+            let content = serde_json::to_string(&serde_json::json!({"0": &expected_lines}))
                 .expect("测试响应应可序列化");
             let outcome = processor
                 .process(
@@ -4261,7 +4235,7 @@ mod tests {
             ],
             vec![
                 ExpectedTranslationOutput::new(
-                    task_id(1),
+                    task_id(0),
                     body,
                     Vec::new(),
                     ExpectedTranslationValidation::new(
@@ -4278,7 +4252,7 @@ mod tests {
                     Vec::new(),
                 ),
                 ExpectedTranslationOutput::new(
-                    task_id(2),
+                    task_id(1),
                     speaker_identity(),
                     Vec::new(),
                     ExpectedTranslationValidation::new(
@@ -4294,8 +4268,8 @@ mod tests {
         );
 
         for response in [
-            r#"{"1":[],"2":["爱丽丝"]}"#,
-            r#"{"1":["","   "],"2":["爱丽丝"]}"#,
+            r#"{"0":[],"1":["爱丽丝"]}"#,
+            r#"{"0":["","   "],"1":["爱丽丝"]}"#,
         ] {
             let outcome = processor
                 .process(
@@ -4308,9 +4282,9 @@ mod tests {
 
             assert!(matches!(outcome, TranslationTaskOutcome::Partial { .. }));
             assert_eq!(outcome.accepted().len(), 1);
-            assert_eq!(outcome.accepted()[0].id(), task_id(2));
+            assert_eq!(outcome.accepted()[0].id(), task_id(1));
             assert_eq!(outcome.unresolved().len(), 1);
-            assert_eq!(outcome.unresolved()[0].id(), task_id(1));
+            assert_eq!(outcome.unresolved()[0].id(), task_id(0));
             assert!(matches!(
                 outcome.unresolved()[0].reason(),
                 TranslationUnitRejectionReason::BlankTranslation
@@ -4333,7 +4307,7 @@ mod tests {
             .process(
                 &task,
                 LlmResponse::new(
-                    r#"{"1":["炎之剑。","装备后可提升攻击力。"]}"#,
+                    r#"{"0":["炎之剑。","装备后可提升攻击力。"]}"#,
                     LlmFinishReason::Stop,
                     None,
                     None,
@@ -4363,7 +4337,7 @@ mod tests {
             .process(
                 &task,
                 LlmResponse::new(
-                    r#"{"1":["是／否"]}"#,
+                    r#"{"0":["是／否"]}"#,
                     LlmFinishReason::Stop,
                     None,
                     None,
@@ -4391,7 +4365,7 @@ mod tests {
             .process(
                 &speaker_task(),
                 LlmResponse::new(
-                    r#"{"1":["爱丽","丝"]}"#,
+                    r#"{"0":["爱丽","丝"]}"#,
                     LlmFinishReason::Stop,
                     None,
                     None,
@@ -4425,7 +4399,7 @@ mod tests {
             .process(
                 &task,
                 LlmResponse::new(
-                    r#"{"1":["制作人员","","爱丽丝"]}"#,
+                    r#"{"0":["制作人员","","爱丽丝"]}"#,
                     LlmFinishReason::Stop,
                     None,
                     None,
@@ -4445,9 +4419,9 @@ mod tests {
         );
 
         for lines in [
-            r#"{"1":["制作人员","填充了空槽","爱丽丝"]}"#,
-            r#"{"1":["制作人员","   ","爱丽丝"]}"#,
-            r#"{"1":["","","爱丽丝"]}"#,
+            r#"{"0":["制作人员","填充了空槽","爱丽丝"]}"#,
+            r#"{"0":["制作人员","   ","爱丽丝"]}"#,
+            r#"{"0":["","","爱丽丝"]}"#,
         ] {
             let rejected = processor
                 .process(
@@ -4489,7 +4463,7 @@ mod tests {
                 ChatMessage::new(ChatMessageRole::User, "# Task"),
             ],
             vec![ExpectedTranslationOutput::new(
-                task_id(1),
+                task_id(0),
                 identity,
                 Vec::new(),
                 ExpectedTranslationValidation::new(
@@ -4506,7 +4480,7 @@ mod tests {
             .process(
                 &task,
                 LlmResponse::new(
-                    r#"{"1":["和他交谈","取消⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
+                    r#"{"0":["和他交谈","取消⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                     LlmFinishReason::Stop,
                     None,
                     None,
@@ -4539,7 +4513,7 @@ mod tests {
             "{}",
         );
         let error = ExpectedTranslationOutput::try_new(
-            task_id(1),
+            task_id(0),
             identity,
             Vec::new(),
             ExpectedTranslationValidation::new(
@@ -4567,7 +4541,7 @@ mod tests {
                     unit_id,
                     placeholder_index: 0,
                     ..
-                } if unit_id == task_id(1)
+                } if unit_id == task_id(0)
         ));
     }
 
@@ -4579,7 +4553,7 @@ mod tests {
             .process(
                 &task_with_language_pair("ja", "zh-Hans", 1),
                 LlmResponse::new(
-                    r#"{"1":["炎之剑\\N[1]！"]}"#,
+                    r#"{"0":["炎之剑\\N[1]！"]}"#,
                     LlmFinishReason::Stop,
                     Some("request-1".to_owned()),
                     Some("response-1".to_owned()),
@@ -4607,7 +4581,7 @@ mod tests {
             result.accepted()[0].propagation_targets(),
             &[super::super::pipeline::TranslationPropagationTarget::new(
                 propagation_target(),
-                state_context(102),
+                state_context(101),
             )]
         );
     }
@@ -4620,7 +4594,7 @@ mod tests {
             .process(
                 &task_with_language_pair("ja", "zh-Hans", 1),
                 LlmResponse::new(
-                    r#"{"1":["炎之剑\\N[1]！"]}"#,
+                    r#"{"0":["炎之剑\\N[1]！"]}"#,
                     LlmFinishReason::Stop,
                     None,
                     None,
@@ -4650,7 +4624,7 @@ mod tests {
             .process(
                 &task(),
                 LlmResponse::new(
-                    r#"{"1":["炎\uFEFF之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
+                    r#"{"0":["炎\uFEFF之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                     LlmFinishReason::Stop,
                     None,
                     Some("response-bom".to_owned()),
@@ -4669,7 +4643,7 @@ mod tests {
             .process(
                 &task(),
                 LlmResponse::new(
-                    r#"{"1":["  ⟦ATT_ACTOR_NAME_WHOLE_0000⟧  "]}"#,
+                    r#"{"0":["  ⟦ATT_ACTOR_NAME_WHOLE_0000⟧  "]}"#,
                     LlmFinishReason::Stop,
                     None,
                     Some("response-natural".to_owned()),
@@ -4691,7 +4665,7 @@ mod tests {
             TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources());
 
         for translation in ["炎之\r剑", "炎之\n剑", "炎之\0剑"] {
-            let content = serde_json::to_string(&serde_json::json!({"1": [translation]}))
+            let content = serde_json::to_string(&serde_json::json!({"0": [translation]}))
                 .expect("测试响应应可序列化");
             let result = processor
                 .process(
@@ -4735,7 +4709,7 @@ mod tests {
                     line_content_analysis(&["炎の剣。", "装備すると攻撃力が上がる。"]),
                 ),
                 LlmResponse::new(
-                    r#"{"1":["<Help:炎之剑>装备后攻击力上升。"]}"#,
+                    r#"{"0":["<Help:炎之剑>装备后攻击力上升。"]}"#,
                     LlmFinishReason::Stop,
                     None,
                     Some("response-plain-value".to_owned()),
@@ -5061,8 +5035,8 @@ mod tests {
                 &task_with_output_count(2),
                 LlmResponse::new(
                     r#"{
-                        "1":["甲⟦ATT_ACTOR_NAME_WHOLE_0000⟧"],
-                        "2":["乙⟦ATT_ACTOR_NAME_WHOLE_0000⟧⟦ATT_UNKNOWN_WHOLE_9999⟧"]
+                        "0":["甲⟦ATT_ACTOR_NAME_WHOLE_0000⟧"],
+                        "1":["乙⟦ATT_ACTOR_NAME_WHOLE_0000⟧⟦ATT_UNKNOWN_WHOLE_9999⟧"]
                     }"#,
                     LlmFinishReason::Stop,
                     None,
@@ -5076,9 +5050,9 @@ mod tests {
 
         assert!(matches!(&result, TranslationTaskOutcome::Partial { .. }));
         assert_eq!(result.accepted().len(), 1);
-        assert_eq!(result.accepted()[0].id(), task_id(1));
+        assert_eq!(result.accepted()[0].id(), task_id(0));
         assert_eq!(result.unresolved().len(), 1);
-        assert_eq!(result.unresolved()[0].id(), task_id(2));
+        assert_eq!(result.unresolved()[0].id(), task_id(1));
         assert!(matches!(
             result.unresolved()[0].reason(),
             TranslationUnitRejectionReason::UnexpectedPlaceholderToken { token }
@@ -5155,12 +5129,12 @@ mod tests {
                 &task_with_output_count(6),
                 LlmResponse::new(
                     r#"{
-                        "1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"],
-                        "2":123,
-                        "2":["乙⟦ATT_ACTOR_NAME_WHOLE_0000⟧"],
-                        "4":[""],
-                        "5":["缺少控制符"],
-                        "6":["译文です⟦ATT_ACTOR_NAME_WHOLE_0000⟧"],
+                        "0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"],
+                        "1":123,
+                        "1":["乙⟦ATT_ACTOR_NAME_WHOLE_0000⟧"],
+                        "3":[""],
+                        "4":["缺少控制符"],
+                        "5":["译文です⟦ATT_ACTOR_NAME_WHOLE_0000⟧"],
                         "99":["未知"]
                     }"#,
                     LlmFinishReason::Length,
@@ -5177,17 +5151,17 @@ mod tests {
         assert_eq!(result.attempts().get(), 2);
         assert_eq!(result.accepted().len(), 1);
         assert_eq!(result.unresolved().len(), 5);
-        assert_eq!(result.unresolved()[0].id(), task_id(2));
+        assert_eq!(result.unresolved()[0].id(), task_id(1));
         assert!(matches!(
             result.unresolved()[0].reason(),
             TranslationUnitRejectionReason::Duplicate
         ));
-        assert_eq!(result.unresolved()[1].id(), task_id(3));
+        assert_eq!(result.unresolved()[1].id(), task_id(2));
         assert!(matches!(
             result.unresolved()[1].reason(),
             TranslationUnitRejectionReason::Missing
         ));
-        assert_eq!(result.unresolved()[2].id(), task_id(4));
+        assert_eq!(result.unresolved()[2].id(), task_id(3));
         assert!(matches!(
             result.unresolved()[2].reason(),
             TranslationUnitRejectionReason::BlankLineMismatch {
@@ -5195,12 +5169,12 @@ mod tests {
                 expected_blank: false
             }
         ));
-        assert_eq!(result.unresolved()[3].id(), task_id(5));
+        assert_eq!(result.unresolved()[3].id(), task_id(4));
         assert!(matches!(
             result.unresolved()[3].reason(),
             TranslationUnitRejectionReason::PlaceholderMismatch { .. }
         ));
-        assert_eq!(result.unresolved()[4].id(), task_id(6));
+        assert_eq!(result.unresolved()[4].id(), task_id(5));
         assert!(matches!(
             result.unresolved()[4].reason(),
             TranslationUnitRejectionReason::SourceResidual { .. }
@@ -5225,9 +5199,9 @@ mod tests {
                 &task_with_output_count(2),
                 LlmResponse::new(
                     r#"{
-                        "1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"],
+                        "0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"],
                         "bad":["非法 ID"],
-                        "2":[123],
+                        "1":[123],
                         "99":["未知 ID"]
                     }"#,
                     LlmFinishReason::Stop,
@@ -5242,9 +5216,9 @@ mod tests {
 
         assert!(matches!(&result, TranslationTaskOutcome::Partial { .. }));
         assert_eq!(result.accepted().len(), 1);
-        assert_eq!(result.accepted()[0].id(), task_id(1));
+        assert_eq!(result.accepted()[0].id(), task_id(0));
         assert_eq!(result.unresolved().len(), 1);
-        assert_eq!(result.unresolved()[0].id(), task_id(2));
+        assert_eq!(result.unresolved()[0].id(), task_id(1));
         assert!(matches!(
             result.unresolved()[0].reason(),
             TranslationUnitRejectionReason::InvalidShape { message }
@@ -5266,7 +5240,7 @@ mod tests {
 
         let deep_value = format!("{}0{}", "[".repeat(DEPTH), "]".repeat(DEPTH));
         let raw_assistant =
-            format!(r#"{{"1":{deep_value},"2":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}}"#);
+            format!(r#"{{"0":{deep_value},"1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}}"#);
         let processor =
             TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources());
         let outcome = processor
@@ -5286,9 +5260,9 @@ mod tests {
 
         assert!(matches!(&outcome, TranslationTaskOutcome::Partial { .. }));
         assert_eq!(outcome.accepted().len(), 1);
-        assert_eq!(outcome.accepted()[0].id(), task_id(2));
+        assert_eq!(outcome.accepted()[0].id(), task_id(1));
         assert_eq!(outcome.unresolved().len(), 1);
-        assert_eq!(outcome.unresolved()[0].id(), task_id(1));
+        assert_eq!(outcome.unresolved()[0].id(), task_id(0));
         assert!(matches!(
             outcome.unresolved()[0].reason(),
             TranslationUnitRejectionReason::InvalidShape { message }
@@ -5335,7 +5309,7 @@ mod tests {
             .process(
                 &task(),
                 LlmResponse::new(
-                    r#"{"1":[""]}"#,
+                    r#"{"0":[""]}"#,
                     LlmFinishReason::Stop,
                     None,
                     Some("response-rejected".to_owned()),
@@ -5362,7 +5336,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thinking_envelope_preserves_existing_outcome_classification() {
+    async fn thinking_mode_preserves_existing_outcome_classification() {
         let processor = TranslationTaskResponseProcessingService::new(
             InlineCpu,
             thinking_translation_resources(),
@@ -5372,7 +5346,7 @@ mod tests {
             .process(
                 &task(),
                 LlmResponse::new(
-                    "<why>确认语境、敬语、token 与单行结构。</why>\n{\"1\":[\"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧\"]}",
+                    r#"{"think":"确认语境、敬语、token 与单行结构。","translations":{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}}"#,
                     LlmFinishReason::Stop,
                     None,
                     Some("response-thinking-complete".to_owned()),
@@ -5381,14 +5355,14 @@ mod tests {
                 1,
             )
             .await
-            .expect("合法思考信封后仍应使用既有逐 ID 验收");
+            .expect("合法 thinking 响应仍应使用既有逐 ID 验收");
         assert!(matches!(complete, TranslationTaskOutcome::Complete { .. }));
 
         let partial = processor
             .process(
                 &task_with_output_count(2),
                 LlmResponse::new(
-                    "<why>两个 ID 均已逐项分析，但第二项未能产出。</why>\n{\"1\":[\"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧\"]}",
+                    r#"{"think":"两个 ID 均已逐项分析，但第二项未能产出。","translations":{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}}"#,
                     LlmFinishReason::Stop,
                     None,
                     Some("response-thinking-partial".to_owned()),
@@ -5409,7 +5383,7 @@ mod tests {
             .process(
                 &task(),
                 LlmResponse::new(
-                    "<why>已分析该 ID，但最终数组留下了不合法的空槽。</why>\n{\"1\":[\"\"]}",
+                    r#"{"think":"已分析该 ID，但最终数组留下了不合法的空槽。","translations":{"0":[""]}}"#,
                     LlmFinishReason::Stop,
                     None,
                     Some("response-thinking-rejected".to_owned()),
@@ -5431,7 +5405,7 @@ mod tests {
             .process(
                 &task(),
                 LlmResponse::new(
-                    r#"{"1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
+                    r#"{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                     LlmFinishReason::Stop,
                     None,
                     Some("response-thinking-missing".to_owned()),
@@ -5451,6 +5425,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_echo_content_does_not_participate_in_rpg_acceptance() {
+        let processor = TranslationTaskResponseProcessingService::new(
+            InlineCpu,
+            source_echo_translation_resources(),
+        );
+        let outcome = processor
+            .process(
+                &task(),
+                LlmResponse::new(
+                    r#"{"0":{"source":["与请求完全不同"],"translation":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}}"#,
+                    LlmFinishReason::Stop,
+                    None,
+                    None,
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect("source 内容不同不应影响按 ID 验收");
+
+        assert!(matches!(outcome, TranslationTaskOutcome::Complete { .. }));
+    }
+
+    #[tokio::test]
     async fn thinking_content_is_discarded_before_results_and_diagnostics() {
         const THINKING_SENTINEL: &str = "ATT_THINKING_BODY_SENTINEL_7C4E";
 
@@ -5463,7 +5461,7 @@ mod tests {
                 &task(),
                 LlmResponse::new(
                     format!(
-                        "<why>{THINKING_SENTINEL}</why>{{\"1\":[\"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧\"]}}"
+                        "{{\"think\":\"{THINKING_SENTINEL}\",\"translations\":{{\"0\":[\"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧\"]}}}}"
                     ),
                     LlmFinishReason::Stop,
                     None,
@@ -5480,7 +5478,7 @@ mod tests {
             .process(
                 &task(),
                 LlmResponse::new(
-                    format!("<why>{THINKING_SENTINEL}</why>not-json"),
+                    format!("{{\"think\":\"{THINKING_SENTINEL}\",\"translations\":not-json}}"),
                     LlmFinishReason::Stop,
                     None,
                     None,
@@ -5489,7 +5487,7 @@ mod tests {
                 1,
             )
             .await
-            .expect("信封后的非法 JSON 应成为模型响应不可用");
+            .expect("非法 translations JSON 应成为模型响应不可用");
         assert!(matches!(
             &unusable,
             TranslationTaskOutcome::Unavailable {
@@ -5513,14 +5511,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn json_only_mode_rejects_thinking_as_model_response_unusable() {
+    async fn plain_mode_treats_thinking_fields_as_invalid_ids() {
         let processor =
             TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources());
         let outcome = processor
             .process(
                 &task(),
                 LlmResponse::new(
-                    "<why>不应出现。</why>{\"1\":[\"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧\"]}",
+                    r#"{"think":"不应出现。","translations":{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}}"#,
                     LlmFinishReason::Stop,
                     None,
                     None,
@@ -5529,12 +5527,12 @@ mod tests {
                 1,
             )
             .await
-            .expect("JSON-only 模式中的思考内容应成为正常不可用结果");
+            .expect("plain 模式中的额外思考字段应成为正常不可用结果");
 
         assert!(matches!(
             outcome,
             TranslationTaskOutcome::Unavailable {
-                reason: TranslationTaskUnavailableReason::ModelResponseUnusable,
+                reason: TranslationTaskUnavailableReason::AllOutputsRejected,
                 ..
             }
         ));
@@ -5575,7 +5573,7 @@ mod tests {
             .process(
                 &task_with_language_pair("en", "zh-Hant", 1),
                 LlmResponse::new(
-                    r#"{"1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
+                    r#"{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                     LlmFinishReason::Stop,
                     None,
                     Some("response-language".to_owned()),
@@ -5596,7 +5594,7 @@ mod tests {
                 .process(
                     &task_with_language_pair("ja", "zh-Hans", 1),
                     LlmResponse::new(
-                        r#"{"1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
+                        r#"{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                         LlmFinishReason::Stop,
                         None,
                         Some("response-mismatch".to_owned()),
@@ -5731,7 +5729,7 @@ mod tests {
                         retry_after: Some(Duration::from_millis(50)),
                     }),
                     Ok(LlmResponse::new(
-                        r#"{"1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
+                        r#"{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                         LlmFinishReason::Stop,
                         None,
                         Some("response-retry".to_owned()),
@@ -5766,7 +5764,7 @@ mod tests {
         let service = RpgMakerTranslationTaskExecutionService::<_, _, _, _>::new(
             FakeLlm {
                 responses: Arc::new(Mutex::new(VecDeque::from([Ok(LlmResponse::new(
-                    r#"{"1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
+                    r#"{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                     LlmFinishReason::Stop,
                     None,
                     Some("response-without-record".to_owned()),
@@ -5812,7 +5810,7 @@ mod tests {
                         retry_after: Some(Duration::from_secs(1)),
                     }),
                     Ok(LlmResponse::new(
-                        r#"{"1":["不应请求"]}"#,
+                        r#"{"0":["不应请求"]}"#,
                         LlmFinishReason::Stop,
                         None,
                         Some("response-unused".to_owned()),
@@ -5838,9 +5836,9 @@ mod tests {
             .await
         });
 
-        delay_started
-            .acquire()
+        tokio::time::timeout(Duration::from_secs(1), delay_started.acquire())
             .await
+            .expect("重试等待必须在一秒内开始")
             .expect("重试等待应开始")
             .forget();
         cancellation.request();
@@ -5906,7 +5904,7 @@ mod tests {
         let service = RpgMakerTranslationTaskExecutionService::<_, _, _, _>::new(
             FakeLlm {
                 responses: Arc::new(Mutex::new(VecDeque::from([Ok(LlmResponse::new(
-                    r#"{"1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
+                    r#"{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                     LlmFinishReason::Stop,
                     None,
                     Some("response-cancelled".to_owned()),
@@ -5948,7 +5946,7 @@ mod tests {
             .expect("CPU 闭包入场前取消时应保留原始 Assistant");
         assert_eq!(
             response.raw_assistant(),
-            r#"{"1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#
+            r#"{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#
         );
         assert!(response.thinking().is_none());
         assert!(response.ordered_entries().is_none());
@@ -5963,7 +5961,7 @@ mod tests {
         let long_translation =
             "x".repeat(RESPONSE_PROCESSING_CANCELLATION_CHECK_BYTES.saturating_mul(8));
         let raw_assistant = serde_json::to_string(&serde_json::json!({
-            "1": [long_translation],
+            "0": [long_translation],
         }))
         .expect("测试响应应可序列化");
         let service = RpgMakerTranslationTaskExecutionService::<_, _, _, _>::new(
@@ -6018,8 +6016,7 @@ mod tests {
 
     #[tokio::test]
     async fn executor_keeps_parsed_thinking_record_when_later_validation_fails() {
-        let raw_assistant =
-            "<why>已建立解析证据。</why>\n{\"1\":[\"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧\"]}";
+        let raw_assistant = r#"{"think":"已建立解析证据。","translations":{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}}"#;
         let service = RpgMakerTranslationTaskExecutionService::<_, _, _, _>::new(
             FakeLlm {
                 responses: Arc::new(Mutex::new(VecDeque::from([Ok(LlmResponse::new(
@@ -6068,8 +6065,8 @@ mod tests {
             .ordered_entries()
             .expect("合法响应必须保留有序条目");
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].id(), "1");
-        assert_eq!(entries[0].canonical_id(), Some(task_id(1)));
+        assert_eq!(entries[0].id(), "0");
+        assert_eq!(entries[0].canonical_id(), Some(task_id(0)));
         assert_eq!(entries[0].value_error(), None);
         assert_eq!(
             entries[0].lines(),
@@ -6092,14 +6089,14 @@ mod tests {
             FakeLlm {
                 responses: Arc::new(Mutex::new(VecDeque::from([
                     Ok(LlmResponse::new(
-                        r#"{"1":123}"#,
+                        r#"{"0":123}"#,
                         LlmFinishReason::Stop,
                         None,
                         Some("response-invalid-shape".to_owned()),
                         None,
                     )),
                     Ok(LlmResponse::new(
-                        r#"{"1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
+                        r#"{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                         LlmFinishReason::Stop,
                         None,
                         Some("response-unused".to_owned()),
@@ -6130,19 +6127,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn executor_never_retries_an_invalid_thinking_envelope() {
+    async fn executor_never_retries_an_invalid_thinking_response() {
         let waits = Arc::new(Mutex::new(Vec::new()));
         let messages = Arc::new(Mutex::new(Vec::new()));
         let responses = Arc::new(Mutex::new(VecDeque::from([
             Ok(LlmResponse::new(
-                r#"{"1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
+                r#"{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                 LlmFinishReason::Stop,
                 None,
                 Some("response-missing-thinking".to_owned()),
                 None,
             )),
             Ok(LlmResponse::new(
-                "<why>该响应不应被消费。</why>{\"1\":[\"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧\"]}",
+                r#"{"think":"该响应不应被消费。","translations":{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}}"#,
                 LlmFinishReason::Stop,
                 None,
                 Some("response-unused".to_owned()),
@@ -6172,7 +6169,7 @@ mod tests {
         let outcome = service
             .execute(&profile(), task())
             .await
-            .expect("模型信封错误应成为正常不可用结果");
+            .expect("thinking 响应错误应成为正常不可用结果");
         assert!(matches!(
             outcome,
             TranslationTaskOutcome::Unavailable {
@@ -6334,7 +6331,7 @@ mod tests {
         >::new(
             FakeLlm {
                 responses: Arc::new(Mutex::new(VecDeque::from([Ok(LlmResponse::new(
-                    r#"{"1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
+                    r#"{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                     LlmFinishReason::Stop,
                     None,
                     Some("response-send".to_owned()),

@@ -1,4 +1,4 @@
-//! ATT 托管翻译任务共同使用的响应信封、JSON ID 与可读记录投影。
+//! ATT 托管翻译任务共同使用的响应模式、JSON ID 与可读记录投影。
 //!
 //! 本模块不理解游戏引擎、持久化身份、Placeholder 或语言验收。调用方只消费一次解析
 //! 建立的有序条目，并在自己的语义边界逐 ID 验收。
@@ -9,18 +9,35 @@ use std::fmt;
 use std::io::{self, BufReader, Read};
 use std::num::NonZeroUsize;
 
-use serde::de::{DeserializeOwned, MapAccess, Visitor, value::StringDeserializer};
+use serde::de::{DeserializeOwned, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::value::RawValue;
 
 use crate::json_diagnostic::JsonErrorCategory;
 use crate::translation::task_planning::TaskId;
 
-/// 托管翻译响应必须遵循的受信外层协议。
+/// 托管翻译响应必须遵循的两个独立输出事实。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TranslationResponseEnvelope {
-    JsonOnly,
-    ThinkingThenJson,
+pub(crate) struct TranslationResponseMode {
+    thinking: bool,
+    source_echo: bool,
+}
+
+impl TranslationResponseMode {
+    pub(crate) const fn new(thinking: bool, source_echo: bool) -> Self {
+        Self {
+            thinking,
+            source_echo,
+        }
+    }
+
+    pub(crate) const fn thinking(self) -> bool {
+        self.thinking
+    }
+
+    pub(crate) const fn source_echo(self) -> bool {
+        self.source_echo
+    }
 }
 
 /// `serde_json` 在协议边界建立的稳定错误类别。
@@ -47,24 +64,14 @@ impl TranslationTaskResponseJsonErrorCategory {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TranslationTaskResponseParseErrorKind {
     Json(TranslationTaskResponseJsonErrorCategory),
-    ThinkingNotAllowed,
-    ThinkingEnvelopeMissing,
-    ThinkingEnvelopeUnclosed,
     ThinkingEmpty,
-    ThinkingNested,
-    ThinkingRepeated,
 }
 
 impl TranslationTaskResponseParseErrorKind {
     pub(crate) const fn code(self) -> &'static str {
         match self {
             Self::Json(_) => "json",
-            Self::ThinkingNotAllowed => "thinking_not_allowed",
-            Self::ThinkingEnvelopeMissing => "thinking_envelope_missing",
-            Self::ThinkingEnvelopeUnclosed => "thinking_envelope_unclosed",
             Self::ThinkingEmpty => "thinking_empty",
-            Self::ThinkingNested => "thinking_nested",
-            Self::ThinkingRepeated => "thinking_repeated",
         }
     }
 }
@@ -108,18 +115,7 @@ impl TranslationTaskResponseParseError {
                     self.column
                 );
             }
-            TranslationTaskResponseParseErrorKind::ThinkingNotAllowed => {
-                "当前响应模式不接受思考输出"
-            }
-            TranslationTaskResponseParseErrorKind::ThinkingEnvelopeMissing => {
-                "模型响应缺少规定的思考信封"
-            }
-            TranslationTaskResponseParseErrorKind::ThinkingEnvelopeUnclosed => {
-                "模型响应的思考信封没有闭合"
-            }
             TranslationTaskResponseParseErrorKind::ThinkingEmpty => "模型响应的思考内容为空",
-            TranslationTaskResponseParseErrorKind::ThinkingNested => "模型响应包含嵌套的思考信封",
-            TranslationTaskResponseParseErrorKind::ThinkingRepeated => "模型响应包含重复的思考信封",
         };
         format!("{message}，第 {} 行、第 {} 列", self.line, self.column)
     }
@@ -131,6 +127,7 @@ pub(crate) struct ParsedTranslationAssistantEntry {
     id: String,
     value: Box<RawValue>,
     canonical_id: Option<TaskId>,
+    source_echo: bool,
 }
 
 impl ParsedTranslationAssistantEntry {
@@ -147,38 +144,85 @@ impl ParsedTranslationAssistantEntry {
         self.value.as_ref()
     }
 
-    /// 只把当前引擎需要的值形状解码为拥有型数据，并在输入读取期间轮询取消。
+    /// 按当前响应模式解码一个 ID 的译文值，并保留逐字段形状错误。
     ///
-    /// 公共解析已经证明 raw value 是有效 JSON，因此内层错误只表示它不能解码为 `T`。
-    pub(crate) fn decode_value_with_cancellation<T, E>(
+    /// 原文回显只供人工或 agent 排查，不参与译文关联。这里验证它存在且为字符串数组，
+    /// 但不比较它和请求原文的内容。
+    pub(crate) fn decode_translation_value_with_cancellation<E>(
         &self,
         mut ensure_running: impl FnMut() -> Result<(), E>,
-    ) -> Result<Result<T, serde_json::Error>, E>
-    where
-        T: DeserializeOwned,
-    {
-        if let Some(value) =
-            decode_owned_json_string_with_cancellation(self.value.get(), &mut ensure_running)?
-        {
-            // `StringDeserializer` 把已经拥有的缓冲区移交给目标 visitor。这里不能再经
-            // `serde_json::from_reader`，否则 serde_json 会先把字符串解码进内部
-            // scratch，再通过 `visit_str` 触发一次无法轮询取消的整串复制。
-            return Ok(T::deserialize(
-                StringDeserializer::<serde_json::Error>::new(value),
+    ) -> Result<DecodedTranslationAssistantValue, E> {
+        if !self.source_echo {
+            return Ok(DecodedTranslationAssistantValue::Translation(
+                decode_json_string_array_with_cancellation(self.value.get(), &mut ensure_running)?,
             ));
         }
-        deserialize_json_with_cancellation(self.value.get(), &mut ensure_running)
-    }
 
-    /// 把当前值解码为 JSON 字符串数组，并在扫描与字符串复制期间轮询取消。
-    ///
-    /// 公共解析已经证明 raw value 是有效 JSON。第一遍只确认形状和精确项数，第二遍才
-    /// 建立拥有型字符串，因此结果 `Vec` 不会在累积任意多项时反复扩容并搬移已有文本。
-    pub(crate) fn decode_string_array_with_cancellation<E>(
-        &self,
-        mut ensure_running: impl FnMut() -> Result<(), E>,
-    ) -> Result<DecodedJsonStringArray, E> {
-        decode_json_string_array_with_cancellation(self.value.get(), &mut ensure_running)
+        let fields = match deserialize_json_with_cancellation::<SourceEchoObject, _>(
+            self.value.get(),
+            &mut ensure_running,
+        )? {
+            Ok(fields) => fields,
+            Err(_) => {
+                return Ok(DecodedTranslationAssistantValue::SourceEcho(
+                    DecodedSourceEchoValue::NotObject,
+                ));
+            }
+        };
+        let mut source = None;
+        let mut translation = None;
+        for field in fields.0 {
+            ensure_running()?;
+            match field.name.as_str() {
+                "source" => {
+                    if source.replace(field.value).is_some() {
+                        return Ok(DecodedTranslationAssistantValue::SourceEcho(
+                            DecodedSourceEchoValue::InvalidFields(
+                                DecodedSourceEchoFieldsError::DuplicateSource,
+                            ),
+                        ));
+                    }
+                }
+                "translation" => {
+                    if translation.replace(field.value).is_some() {
+                        return Ok(DecodedTranslationAssistantValue::SourceEcho(
+                            DecodedSourceEchoValue::InvalidFields(
+                                DecodedSourceEchoFieldsError::DuplicateTranslation,
+                            ),
+                        ));
+                    }
+                }
+                _ => {
+                    return Ok(DecodedTranslationAssistantValue::SourceEcho(
+                        DecodedSourceEchoValue::InvalidFields(
+                            DecodedSourceEchoFieldsError::UnexpectedField { field: field.name },
+                        ),
+                    ));
+                }
+            }
+        }
+
+        let Some(source) = source else {
+            return Ok(DecodedTranslationAssistantValue::SourceEcho(
+                DecodedSourceEchoValue::InvalidFields(DecodedSourceEchoFieldsError::MissingSource),
+            ));
+        };
+        let Some(translation) = translation else {
+            return Ok(DecodedTranslationAssistantValue::SourceEcho(
+                DecodedSourceEchoValue::InvalidFields(
+                    DecodedSourceEchoFieldsError::MissingTranslation,
+                ),
+            ));
+        };
+        let source = decode_json_string_array_with_cancellation(source.get(), &mut ensure_running)?;
+        let translation =
+            decode_json_string_array_with_cancellation(translation.get(), &mut ensure_running)?;
+        Ok(DecodedTranslationAssistantValue::SourceEcho(
+            DecodedSourceEchoValue::Fields {
+                source,
+                translation,
+            },
+        ))
     }
 
     pub(crate) fn into_parts(self) -> (String, Box<RawValue>, Option<TaskId>) {
@@ -192,6 +236,34 @@ pub(crate) enum DecodedJsonStringArray {
     NotArray,
     NonStringItem { item: NonZeroUsize },
     Strings(Vec<String>),
+}
+
+/// 一个逐 ID 值按当前 plain/source-echo 模式建立的公共投影。
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum DecodedTranslationAssistantValue {
+    Translation(DecodedJsonStringArray),
+    SourceEcho(DecodedSourceEchoValue),
+}
+
+/// 原文回显对象的结构和两个数组字段。
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum DecodedSourceEchoValue {
+    NotObject,
+    InvalidFields(DecodedSourceEchoFieldsError),
+    Fields {
+        source: DecodedJsonStringArray,
+        translation: DecodedJsonStringArray,
+    },
+}
+
+/// 原文回显对象没有严格包含一次 `source` 和一次 `translation` 时的原因。
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum DecodedSourceEchoFieldsError {
+    MissingSource,
+    MissingTranslation,
+    DuplicateSource,
+    DuplicateTranslation,
+    UnexpectedField { field: String },
 }
 
 /// 唯一响应解析器建立的完整投影。
@@ -255,13 +327,60 @@ impl<'de> Visitor<'de> for ModelOutputBatchVisitor {
     }
 }
 
+/// thinking 模式唯一允许的根对象。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThinkingModelOutputBatch {
+    think: Box<RawValue>,
+    translations: ModelOutputBatch,
+}
+
+#[derive(Debug)]
+struct SourceEchoField {
+    name: String,
+    value: Box<RawValue>,
+}
+
+#[derive(Debug)]
+struct SourceEchoObject(Vec<SourceEchoField>);
+
+impl<'de> Deserialize<'de> for SourceEchoObject {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(SourceEchoObjectVisitor)
+    }
+}
+
+struct SourceEchoObjectVisitor;
+
+impl<'de> Visitor<'de> for SourceEchoObjectVisitor {
+    type Value = SourceEchoObject;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("只包含 source 和 translation 的 JSON 对象")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut fields = Vec::with_capacity(map.size_hint().unwrap_or_default());
+        while let Some((name, value)) = map.next_entry::<String, Box<RawValue>>()? {
+            fields.push(SourceEchoField { name, value });
+        }
+        Ok(SourceEchoObject(fields))
+    }
+}
+
 /// 解析 ATT 托管翻译任务的唯一 Assistant wire。
 #[cfg(test)]
 pub(crate) fn parse_translation_response(
     value: &str,
-    response_envelope: TranslationResponseEnvelope,
+    response_mode: TranslationResponseMode,
 ) -> Result<ParsedTranslationResponse, TranslationTaskResponseParseError> {
-    match parse_translation_response_with_cancellation(value, response_envelope, || {
+    match parse_translation_response_with_cancellation(value, response_mode, || {
         Ok::<_, Infallible>(())
     }) {
         Ok(result) => result,
@@ -275,62 +394,59 @@ pub(crate) fn parse_translation_response(
 /// 不可观察取消的单次调用。返回外层错误表示调用方取消，内层错误保持现有 wire 契约。
 pub(crate) fn parse_translation_response_with_cancellation<E>(
     value: &str,
-    response_envelope: TranslationResponseEnvelope,
+    response_mode: TranslationResponseMode,
     mut ensure_running: impl FnMut() -> Result<(), E>,
 ) -> Result<Result<ParsedTranslationResponse, TranslationTaskResponseParseError>, E> {
     ensure_running()?;
     let value = trim_model_response_with_cancellation(value, &mut ensure_running)?;
-    let envelope = match parse_translation_response_envelope_with_cancellation(
-        value,
-        response_envelope,
-        &mut ensure_running,
-    )? {
-        Ok(envelope) => envelope,
-        Err(error) => return Ok(Err(error)),
-    };
-    let value = envelope
-        .assistant_json
-        .trim_with_cancellation(&mut ensure_running)?;
-    let batch =
-        match deserialize_model_output_batch_with_cancellation(value.value, &mut ensure_running)? {
-            Ok(batch) => batch,
+    let (thinking, batch) = if response_mode.thinking() {
+        let wrapper = match deserialize_json_with_cancellation::<ThinkingModelOutputBatch, _>(
+            value.value,
+            &mut ensure_running,
+        )? {
+            Ok(wrapper) => wrapper,
             Err(source) => {
-                let category = match JsonErrorCategory::from(&source) {
-                    JsonErrorCategory::Io => TranslationTaskResponseJsonErrorCategory::Io,
-                    JsonErrorCategory::Syntax | JsonErrorCategory::DuplicateObjectKey => {
-                        TranslationTaskResponseJsonErrorCategory::Syntax
-                    }
-                    JsonErrorCategory::Data => TranslationTaskResponseJsonErrorCategory::Shape,
-                    JsonErrorCategory::Eof => {
-                        TranslationTaskResponseJsonErrorCategory::UnexpectedEof
-                    }
-                };
-                let (line, column) = if matches!(
-                    category,
-                    TranslationTaskResponseJsonErrorCategory::UnexpectedEof
-                ) {
-                    value.location_at_with_cancellation(value.value.len(), &mut ensure_running)?
-                } else {
-                    value.location_for_local_with_cancellation(
-                        source.line(),
-                        source.column(),
-                        &mut ensure_running,
-                    )?
-                };
-                return Ok(Err(TranslationTaskResponseParseError::new(
-                    TranslationTaskResponseParseErrorKind::Json(category),
-                    line,
-                    column,
-                )));
+                return Ok(Err(translation_response_json_error_with_cancellation(
+                    value,
+                    source,
+                    &mut ensure_running,
+                )?));
             }
         };
-
-    let thinking = match envelope.thinking {
-        Some(thinking) => Some(clone_response_text_with_cancellation(
-            thinking,
+        let Some(thinking) =
+            decode_owned_json_string_with_cancellation(wrapper.think.get(), &mut ensure_running)?
+        else {
+            return Ok(Err(value.error_at_with_cancellation(
+                TranslationTaskResponseParseErrorKind::Json(
+                    TranslationTaskResponseJsonErrorCategory::Shape,
+                ),
+                0,
+                &mut ensure_running,
+            )?));
+        };
+        if response_text_is_whitespace_with_cancellation(&thinking, &mut ensure_running)? {
+            return Ok(Err(value.error_at_with_cancellation(
+                TranslationTaskResponseParseErrorKind::ThinkingEmpty,
+                0,
+                &mut ensure_running,
+            )?));
+        }
+        (Some(thinking), wrapper.translations)
+    } else {
+        let batch = match deserialize_model_output_batch_with_cancellation(
+            value.value,
             &mut ensure_running,
-        )?),
-        None => None,
+        )? {
+            Ok(batch) => batch,
+            Err(source) => {
+                return Ok(Err(translation_response_json_error_with_cancellation(
+                    value,
+                    source,
+                    &mut ensure_running,
+                )?));
+            }
+        };
+        (None, batch)
     };
     let mut entries = Vec::with_capacity(batch.0.len());
     for output in batch.0 {
@@ -341,10 +457,43 @@ pub(crate) fn parse_translation_response_with_cancellation<E>(
             canonical_id,
             id: output.id,
             value: output.value,
+            source_echo: response_mode.source_echo(),
         });
     }
     ensure_running()?;
     Ok(Ok(ParsedTranslationResponse { thinking, entries }))
+}
+
+fn translation_response_json_error_with_cancellation<E>(
+    value: LocatedModelResponse<'_>,
+    source: serde_json::Error,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<TranslationTaskResponseParseError, E> {
+    let category = match JsonErrorCategory::from(&source) {
+        JsonErrorCategory::Io => TranslationTaskResponseJsonErrorCategory::Io,
+        JsonErrorCategory::Syntax | JsonErrorCategory::DuplicateObjectKey => {
+            TranslationTaskResponseJsonErrorCategory::Syntax
+        }
+        JsonErrorCategory::Data => TranslationTaskResponseJsonErrorCategory::Shape,
+        JsonErrorCategory::Eof => TranslationTaskResponseJsonErrorCategory::UnexpectedEof,
+    };
+    let (line, column) = if matches!(
+        category,
+        TranslationTaskResponseJsonErrorCategory::UnexpectedEof
+    ) {
+        value.location_at_with_cancellation(value.value.len(), ensure_running)?
+    } else {
+        value.location_for_local_with_cancellation(
+            source.line(),
+            source.column(),
+            ensure_running,
+        )?
+    };
+    Ok(TranslationTaskResponseParseError::new(
+        TranslationTaskResponseParseErrorKind::Json(category),
+        line,
+        column,
+    ))
 }
 
 fn parse_model_output_id_with_cancellation<E>(
@@ -354,7 +503,7 @@ fn parse_model_output_id_with_cancellation<E>(
     const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
 
     ensure_running()?;
-    if value.is_empty() || value.starts_with('0') {
+    if value.is_empty() || (value.len() > 1 && value.starts_with('0')) {
         return Ok(None);
     }
     let mut parsed = 0_usize;
@@ -374,7 +523,7 @@ fn parse_model_output_id_with_cancellation<E>(
         parsed = next;
     }
     ensure_running()?;
-    Ok(TaskId::new(parsed))
+    Ok(Some(TaskId::new(parsed)))
 }
 
 fn deserialize_model_output_batch_with_cancellation<E>(
@@ -782,14 +931,6 @@ impl<'a> LocatedModelResponse<'a> {
         Ok(value.prefix(value.value.len() - trailing))
     }
 
-    fn trim_start_with_cancellation<E>(
-        self,
-        ensure_running: &mut impl FnMut() -> Result<(), E>,
-    ) -> Result<Self, E> {
-        let leading = leading_whitespace_bytes_with_cancellation(self.value, ensure_running)?;
-        Ok(self.advance(leading))
-    }
-
     fn location_at_with_cancellation<E>(
         self,
         local_byte_offset: usize,
@@ -834,16 +975,6 @@ impl<'a> LocatedModelResponse<'a> {
     ) -> Result<TranslationTaskResponseParseError, E> {
         let (line, column) =
             self.location_at_with_cancellation(local_byte_offset, ensure_running)?;
-        Ok(TranslationTaskResponseParseError::new(kind, line, column))
-    }
-
-    fn error_at_raw_eof_with_cancellation<E>(
-        self,
-        kind: TranslationTaskResponseParseErrorKind,
-        ensure_running: &mut impl FnMut() -> Result<(), E>,
-    ) -> Result<TranslationTaskResponseParseError, E> {
-        let (line, column) =
-            response_location_with_cancellation(self.raw, self.raw.len(), ensure_running)?;
         Ok(TranslationTaskResponseParseError::new(kind, line, column))
     }
 }
@@ -952,269 +1083,292 @@ fn response_text_is_whitespace_with_cancellation<E>(
     Ok(true)
 }
 
-fn find_response_bytes_with_cancellation<E>(
-    value: &str,
-    needle: &[u8],
-    ensure_running: &mut impl FnMut() -> Result<(), E>,
-) -> Result<Option<usize>, E> {
-    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
-
-    debug_assert!(!needle.is_empty());
-    if value.len() < needle.len() {
-        ensure_running()?;
-        return Ok(None);
-    }
-    for index in 0..=value.len() - needle.len() {
-        if index.is_multiple_of(CANCELLATION_CHECK_BYTES) {
-            ensure_running()?;
-        }
-        if value.as_bytes()[index..].starts_with(needle) {
-            return Ok(Some(index));
-        }
-    }
-    ensure_running()?;
-    Ok(None)
-}
-
-fn clone_response_text_with_cancellation<E>(
-    value: &str,
-    ensure_running: &mut impl FnMut() -> Result<(), E>,
-) -> Result<String, E> {
-    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
-
-    let mut output = String::with_capacity(value.len());
-    let mut start = 0_usize;
-    while start < value.len() {
-        ensure_running()?;
-        let mut end = start
-            .saturating_add(CANCELLATION_CHECK_BYTES)
-            .min(value.len());
-        while end < value.len() && !value.is_char_boundary(end) {
-            end -= 1;
-        }
-        output.push_str(&value[start..end]);
-        start = end;
-    }
-    ensure_running()?;
-    Ok(output)
-}
-
-fn parse_translation_response_envelope_with_cancellation<'a, E>(
-    value: LocatedModelResponse<'a>,
-    response_envelope: TranslationResponseEnvelope,
-    ensure_running: &mut impl FnMut() -> Result<(), E>,
-) -> Result<Result<TranslationResponseEnvelopeParts<'a>, TranslationTaskResponseParseError>, E> {
-    ensure_running()?;
-    match response_envelope {
-        TranslationResponseEnvelope::JsonOnly => {
-            if starts_with_thinking_tag(value.value) {
-                return Ok(Err(value.error_at_with_cancellation(
-                    TranslationTaskResponseParseErrorKind::ThinkingNotAllowed,
-                    0,
-                    ensure_running,
-                )?));
-            }
-            Ok(Ok(TranslationResponseEnvelopeParts {
-                thinking: None,
-                assistant_json: value,
-            }))
-        }
-        TranslationResponseEnvelope::ThinkingThenJson => {
-            parse_thinking_then_json_with_cancellation(value, ensure_running)
-        }
-    }
-}
-
-struct TranslationResponseEnvelopeParts<'a> {
-    thinking: Option<&'a str>,
-    assistant_json: LocatedModelResponse<'a>,
-}
-
-fn parse_thinking_then_json_with_cancellation<'a, E>(
-    value: LocatedModelResponse<'a>,
-    ensure_running: &mut impl FnMut() -> Result<(), E>,
-) -> Result<Result<TranslationResponseEnvelopeParts<'a>, TranslationTaskResponseParseError>, E> {
-    ensure_running()?;
-    let Some(after_opening) = value.value.strip_prefix("<why>") else {
-        return Ok(Err(value.error_at_with_cancellation(
-            TranslationTaskResponseParseErrorKind::ThinkingEnvelopeMissing,
-            0,
-            ensure_running,
-        )?));
-    };
-    let after_opening = value.advance(value.value.len() - after_opening.len());
-    let Some(closing_start) =
-        find_response_bytes_with_cancellation(after_opening.value, b"</why>", ensure_running)?
-    else {
-        return Ok(Err(value.error_at_raw_eof_with_cancellation(
-            TranslationTaskResponseParseErrorKind::ThinkingEnvelopeUnclosed,
-            ensure_running,
-        )?));
-    };
-    let thinking = after_opening.prefix(closing_start);
-    if response_text_is_whitespace_with_cancellation(thinking.value, ensure_running)? {
-        return Ok(Err(after_opening.error_at_with_cancellation(
-            TranslationTaskResponseParseErrorKind::ThinkingEmpty,
-            closing_start,
-            ensure_running,
-        )?));
-    }
-    if let Some(offending) = first_thinking_tag_with_cancellation(thinking.value, ensure_running)? {
-        return Ok(Err(thinking.error_at_with_cancellation(
-            TranslationTaskResponseParseErrorKind::ThinkingNested,
-            offending,
-            ensure_running,
-        )?));
-    }
-
-    let json = after_opening
-        .advance(closing_start + "</why>".len())
-        .trim_start_with_cancellation(ensure_running)?;
-    if starts_with_thinking_tag(json.value) {
-        return Ok(Err(json.error_at_with_cancellation(
-            TranslationTaskResponseParseErrorKind::ThinkingRepeated,
-            0,
-            ensure_running,
-        )?));
-    }
-    ensure_running()?;
-    Ok(Ok(TranslationResponseEnvelopeParts {
-        thinking: Some(thinking.value),
-        assistant_json: json,
-    }))
-}
-
-fn starts_with_thinking_tag(value: &str) -> bool {
-    value.starts_with("<why>") || value.starts_with("</why>")
-}
-
-fn first_thinking_tag_with_cancellation<E>(
-    value: &str,
-    ensure_running: &mut impl FnMut() -> Result<(), E>,
-) -> Result<Option<usize>, E> {
-    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
-
-    for index in 0..value.len() {
-        if index.is_multiple_of(CANCELLATION_CHECK_BYTES) {
-            ensure_running()?;
-        }
-        let suffix = &value.as_bytes()[index..];
-        if suffix.starts_with(b"<why>") || suffix.starts_with(b"</why>") {
-            return Ok(Some(index));
-        }
-    }
-    ensure_running()?;
-    Ok(None)
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
 
     use super::*;
 
+    const fn mode(thinking: bool, source_echo: bool) -> TranslationResponseMode {
+        TranslationResponseMode::new(thinking, source_echo)
+    }
+
     #[test]
-    fn preserves_order_duplicates_and_invalid_ids() {
+    fn preserves_order_duplicates_and_zero_based_canonical_ids() {
         let parsed = parse_translation_response(
-            r#"{"1":["甲"],"bad":["乙"],"1":["丙"],"02":["丁"]}"#,
-            TranslationResponseEnvelope::JsonOnly,
+            r#"{"0":["甲"],"bad":["乙"],"0":["丙"],"00":["丁"],"01":["戊"]}"#,
+            mode(false, false),
         )
         .expect("合法对象应解析");
 
+        let entries = parsed
+            .entries()
+            .iter()
+            .map(|entry| (entry.id(), entry.canonical_id()))
+            .collect::<Vec<_>>();
         assert_eq!(
-            parsed
-                .entries()
-                .iter()
-                .map(|entry| (entry.id(), entry.canonical_id()))
-                .collect::<Vec<_>>(),
+            entries,
             [
-                ("1", TaskId::new(1)),
+                ("0", Some(TaskId::new(0))),
                 ("bad", None),
-                ("1", TaskId::new(1)),
-                ("02", None),
+                ("0", Some(TaskId::new(0))),
+                ("00", None),
+                ("01", None),
             ]
+        );
+        assert!(entries[0].1.is_some(), "规范 ID 0 必须可表示");
+    }
+
+    #[test]
+    fn rejects_negative_nondigit_leading_zero_and_overflow_ids() {
+        let overflow = format!("{}0", usize::MAX);
+        for invalid in ["", "-1", "+1", " 1", "1 ", "00", "01", &overflow] {
+            assert_eq!(
+                parse_model_output_id_with_cancellation(invalid, &mut || {
+                    Ok::<_, Infallible>(())
+                })
+                .expect("未取消"),
+                None,
+                "ID 必须是规范的无符号十进制数：{invalid:?}"
+            );
+        }
+        assert_eq!(
+            parse_model_output_id_with_cancellation("0", &mut || Ok::<_, Infallible>(()))
+                .expect("未取消"),
+            Some(TaskId::new(0))
+        );
+        assert_eq!(
+            parse_model_output_id_with_cancellation(&usize::MAX.to_string(), &mut || {
+                Ok::<_, Infallible>(())
+            })
+            .expect("未取消"),
+            Some(TaskId::new(usize::MAX))
         );
     }
 
     #[test]
-    fn deeply_nested_wrong_value_keeps_valid_sibling_and_drops_without_recursion() {
+    fn parses_all_four_response_modes() {
+        let plain = parse_translation_response(r#"{"0":["译文"]}"#, mode(false, false))
+            .expect("plain 响应应解析");
+        assert_eq!(plain.thinking(), None);
+        assert_eq!(
+            plain.entries()[0]
+                .decode_translation_value_with_cancellation::<Infallible>(|| Ok(()))
+                .expect("未取消"),
+            DecodedTranslationAssistantValue::Translation(DecodedJsonStringArray::Strings(vec![
+                "译文".to_owned()
+            ]))
+        );
+
+        let thinking = parse_translation_response(
+            r#"{"think":"结合上下文判断语气","translations":{"0":["译文"]}}"#,
+            mode(true, false),
+        )
+        .expect("thinking 响应应解析");
+        assert_eq!(thinking.thinking(), Some("结合上下文判断语气"));
+
+        let echo = parse_translation_response(
+            r#"{"0":{"source":["原文"],"translation":["译文"]}}"#,
+            mode(false, true),
+        )
+        .expect("source echo 响应应解析");
+        assert_eq!(echo.thinking(), None);
+        assert_eq!(
+            echo.entries()[0]
+                .decode_translation_value_with_cancellation::<Infallible>(|| Ok(()))
+                .expect("未取消"),
+            DecodedTranslationAssistantValue::SourceEcho(DecodedSourceEchoValue::Fields {
+                source: DecodedJsonStringArray::Strings(vec!["原文".to_owned()]),
+                translation: DecodedJsonStringArray::Strings(vec!["译文".to_owned()]),
+            })
+        );
+
+        let thinking_echo = parse_translation_response(
+            r#"{"think":"判断","translations":{"0":{"source":["回显可以不同"],"translation":["译文"]}}}"#,
+            mode(true, true),
+        )
+        .expect("thinking + source echo 响应应解析");
+        assert_eq!(thinking_echo.thinking(), Some("判断"));
+        assert_eq!(
+            thinking_echo.entries()[0]
+                .decode_translation_value_with_cancellation::<Infallible>(|| Ok(()))
+                .expect("未取消"),
+            DecodedTranslationAssistantValue::SourceEcho(DecodedSourceEchoValue::Fields {
+                source: DecodedJsonStringArray::Strings(vec!["回显可以不同".to_owned()]),
+                translation: DecodedJsonStringArray::Strings(vec!["译文".to_owned()]),
+            })
+        );
+    }
+
+    #[test]
+    fn keeps_each_id_raw_value_without_recursing_into_wrong_shapes() {
         const DEPTH: usize = 10_000;
 
         let deep_value = format!("{}0{}", "[".repeat(DEPTH), "]".repeat(DEPTH));
-        let response = format!(r#"{{"1":{deep_value},"2":"合法译文"}}"#);
-        let parsed = parse_translation_response(&response, TranslationResponseEnvelope::JsonOnly)
-            .expect("外层 object 与每个 raw value 均为有效 JSON");
+        let response = format!(r#"{{"0":{deep_value},"1":["合法译文"]}}"#);
+        let parsed = parse_translation_response(&response, mode(false, false))
+            .expect("外层对象与每个 raw value 均为有效 JSON");
 
-        assert_eq!(
-            parsed
-                .entries()
-                .iter()
-                .map(|entry| entry.id())
-                .collect::<Vec<_>>(),
-            ["1", "2"]
-        );
         assert_eq!(parsed.entries()[0].raw_value().get(), deep_value);
-        assert!(
-            parsed.entries()[0]
-                .decode_value_with_cancellation::<String, Infallible>(|| Ok(()))
-                .expect("未取消")
-                .is_err(),
-            "任意深的非字符串只应成为当前 ID 的形状错误"
-        );
-        assert_eq!(
-            parsed.entries()[1]
-                .decode_value_with_cancellation::<String, Infallible>(|| Ok(()))
-                .expect("未取消")
-                .expect("同级字符串应可解码"),
-            "合法译文"
-        );
-
+        assert_eq!(parsed.entries()[1].raw_value().get(), r#"["合法译文"]"#);
         drop(parsed);
     }
 
     #[test]
-    fn thinking_envelope_is_exact_and_not_business_state() {
-        let parsed = parse_translation_response(
-            "<why>逐项检查</why>\n{\"1\":[\"译文\"]}",
-            TranslationResponseEnvelope::ThinkingThenJson,
-        )
-        .expect("合法 thinking 信封应解析");
-        assert_eq!(parsed.thinking(), Some("逐项检查"));
-        assert_eq!(parsed.entries()[0].raw_value().get(), r#"["译文"]"#);
+    fn thinking_wrapper_is_exact_and_thinking_must_be_nonempty_string() {
+        for invalid in [
+            r#"{"translations":{"0":["译文"]}}"#,
+            r#"{"think":"判断"}"#,
+            r#"{"think":3,"translations":{"0":["译文"]}}"#,
+            r#"{"think":"判断","translations":{"0":["译文"]},"extra":true}"#,
+            r#"{"think":"第一次","think":"第二次","translations":{"0":["译文"]}}"#,
+            r#"{"think":"判断","translations":{},"translations":{"0":["译文"]}}"#,
+            r#"{"think":"判断","translations":[]}"#,
+            r#"不是 JSON"#,
+        ] {
+            assert!(
+                parse_translation_response(invalid, mode(true, false)).is_err(),
+                "thinking 根对象的字段和类型必须严格：{invalid}"
+            );
+        }
 
-        let error = parse_translation_response(
-            "<why>不应出现</why>{\"1\":[\"译文\"]}",
-            TranslationResponseEnvelope::JsonOnly,
+        for blank in ["", " ", "\n\t"] {
+            let response = format!(
+                r#"{{"think":{},"translations":{{"0":["译文"]}}}}"#,
+                serde_json::to_string(blank).expect("测试字符串可编码")
+            );
+            let error = parse_translation_response(&response, mode(true, false))
+                .expect_err("空白 thinking 必须使整份响应无效");
+            assert_eq!(
+                error.kind(),
+                TranslationTaskResponseParseErrorKind::ThinkingEmpty
+            );
+        }
+    }
+
+    #[test]
+    fn source_echo_shape_errors_stay_on_the_individual_id() {
+        let parsed = parse_translation_response(
+            r#"{"0":true,"1":{"translation":["译文"]},"2":{"source":["原文"]},"3":{"source":["甲"],"source":["乙"],"translation":["译文"]},"4":{"source":["原文"],"translation":["甲"],"translation":["乙"]},"5":{"source":["原文"],"translation":["译文"],"extra":0},"6":{"source":true,"translation":["译文"]},"7":{"source":["原文"],"translation":[3]}}"#,
+            mode(false, true),
         )
-        .expect_err("JSON-only 不接受 thinking");
+        .expect("逐 ID 的 echo 形状错误不能使整个根响应失败");
+
+        let decoded = parsed
+            .entries()
+            .iter()
+            .map(|entry| {
+                entry
+                    .decode_translation_value_with_cancellation::<Infallible>(|| Ok(()))
+                    .expect("未取消")
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
-            error.kind(),
-            TranslationTaskResponseParseErrorKind::ThinkingNotAllowed
+            decoded[0],
+            DecodedTranslationAssistantValue::SourceEcho(DecodedSourceEchoValue::NotObject)
+        );
+        assert_eq!(
+            decoded[1],
+            DecodedTranslationAssistantValue::SourceEcho(DecodedSourceEchoValue::InvalidFields(
+                DecodedSourceEchoFieldsError::MissingSource
+            ))
+        );
+        assert_eq!(
+            decoded[2],
+            DecodedTranslationAssistantValue::SourceEcho(DecodedSourceEchoValue::InvalidFields(
+                DecodedSourceEchoFieldsError::MissingTranslation
+            ))
+        );
+        assert_eq!(
+            decoded[3],
+            DecodedTranslationAssistantValue::SourceEcho(DecodedSourceEchoValue::InvalidFields(
+                DecodedSourceEchoFieldsError::DuplicateSource
+            ))
+        );
+        assert_eq!(
+            decoded[4],
+            DecodedTranslationAssistantValue::SourceEcho(DecodedSourceEchoValue::InvalidFields(
+                DecodedSourceEchoFieldsError::DuplicateTranslation
+            ))
+        );
+        assert_eq!(
+            decoded[5],
+            DecodedTranslationAssistantValue::SourceEcho(DecodedSourceEchoValue::InvalidFields(
+                DecodedSourceEchoFieldsError::UnexpectedField {
+                    field: "extra".to_owned()
+                }
+            ))
+        );
+        assert_eq!(
+            decoded[6],
+            DecodedTranslationAssistantValue::SourceEcho(DecodedSourceEchoValue::Fields {
+                source: DecodedJsonStringArray::NotArray,
+                translation: DecodedJsonStringArray::Strings(vec!["译文".to_owned()]),
+            })
+        );
+        assert_eq!(
+            decoded[7],
+            DecodedTranslationAssistantValue::SourceEcho(DecodedSourceEchoValue::Fields {
+                source: DecodedJsonStringArray::Strings(vec!["原文".to_owned()]),
+                translation: DecodedJsonStringArray::NonStringItem {
+                    item: NonZeroUsize::new(1).expect("测试项编号非零"),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn string_array_decoder_preserves_json_escape_semantics_and_shape_errors() {
+        let response = parse_translation_response(
+            r#"{"0":["原文","换行\n","\ud83d\ude00"],"1":["合法",3],"2":true}"#,
+            mode(false, false),
+        )
+        .expect("合法外层响应应解析");
+
+        assert_eq!(
+            response.entries()[0]
+                .decode_translation_value_with_cancellation::<Infallible>(|| Ok(()))
+                .expect("未取消"),
+            DecodedTranslationAssistantValue::Translation(DecodedJsonStringArray::Strings(vec![
+                "原文".to_owned(),
+                "换行\n".to_owned(),
+                "😀".to_owned(),
+            ]))
+        );
+        assert_eq!(
+            response.entries()[1]
+                .decode_translation_value_with_cancellation::<Infallible>(|| Ok(()))
+                .expect("未取消"),
+            DecodedTranslationAssistantValue::Translation(DecodedJsonStringArray::NonStringItem {
+                item: NonZeroUsize::new(2).expect("测试项编号非零"),
+            })
+        );
+        assert_eq!(
+            response.entries()[2]
+                .decode_translation_value_with_cancellation::<Infallible>(|| Ok(()))
+                .expect("未取消"),
+            DecodedTranslationAssistantValue::Translation(DecodedJsonStringArray::NotArray)
         );
     }
 
     #[test]
     fn reports_shape_and_full_response_location() {
-        let parsed = parse_translation_response(
-            "\n{\"1\":[\"ok\"],\"2\":true}\n",
-            TranslationResponseEnvelope::JsonOnly,
-        )
-        .expect("值形状由逐 ID 验收");
+        let parsed =
+            parse_translation_response("\n{\"0\":[\"ok\"],\"1\":true}\n", mode(false, false))
+                .expect("值形状由逐 ID 验收");
         assert_eq!(parsed.entries()[1].raw_value().get(), "true");
 
         let error = parse_translation_response(
-            "\n<why>ok</why>\n{\"1\":",
-            TranslationResponseEnvelope::ThinkingThenJson,
+            "\n{\"think\":\"判断\",\"translations\":{\"0\":",
+            mode(true, false),
         )
         .expect_err("截断 JSON 必须失败");
-        assert_eq!(error.line().get(), 3);
-        assert!(error.column().get() >= 6);
+        assert_eq!(error.line().get(), 2);
+        assert!(error.column().get() >= 35);
 
-        let fenced = parse_translation_response(
-            "```json\n{\"1\":[\"ok\"]}\n```",
-            TranslationResponseEnvelope::JsonOnly,
-        )
-        .expect_err("当前协议只接受裸 JSON，不接受 Markdown 围栏");
+        let fenced =
+            parse_translation_response("```json\n{\"0\":[\"ok\"]}\n```", mode(false, false))
+                .expect_err("当前协议只接受裸 JSON，不接受 Markdown 围栏");
         assert!(matches!(
             fenced.kind(),
             TranslationTaskResponseParseErrorKind::Json(
@@ -1224,132 +1378,22 @@ mod tests {
     }
 
     #[test]
-    fn cancellable_parser_stops_while_reading_long_json() {
-        let response = format!(r#"{{"1":"{}"}}"#, "译".repeat(256 * 1024));
+    fn cancellable_parser_stops_while_reading_long_json_and_thinking() {
+        let response = format!(
+            r#"{{"think":"{}","translations":{{"0":["译文"]}}}}"#,
+            "分析".repeat(512 * 1024)
+        );
         let polls = Cell::new(0_usize);
 
-        let parsed = parse_translation_response_with_cancellation(
-            &response,
-            TranslationResponseEnvelope::JsonOnly,
-            || {
+        let parsed =
+            parse_translation_response_with_cancellation(&response, mode(true, false), || {
                 let next = polls.get() + 1;
                 polls.set(next);
                 if next >= 20 { Err("cancelled") } else { Ok(()) }
-            },
-        );
+            });
 
         assert!(matches!(parsed, Err("cancelled")));
         assert_eq!(polls.get(), 20);
-    }
-
-    #[test]
-    fn cancellable_parser_stops_while_capturing_long_raw_value() {
-        let response = format!(r#"{{"1":[{}0]}}"#, "0,".repeat(1024 * 1024));
-        let polls = Cell::new(0_usize);
-
-        let parsed = parse_translation_response_with_cancellation(
-            &response,
-            TranslationResponseEnvelope::JsonOnly,
-            || {
-                let next = polls.get() + 1;
-                polls.set(next);
-                if next >= 20 { Err("cancelled") } else { Ok(()) }
-            },
-        );
-
-        assert!(matches!(parsed, Err("cancelled")));
-        assert_eq!(polls.get(), 20);
-    }
-
-    #[test]
-    fn long_escaped_owned_string_decode_observes_cancellation() {
-        let escaped = r"\u4e2d".repeat(64 * 1024);
-        let response = format!(r#"{{"1":"{escaped}"}}"#);
-        let parsed = parse_translation_response(&response, TranslationResponseEnvelope::JsonOnly)
-            .expect("外层 JSON 与 raw value 应先完成解析");
-        let polls = Cell::new(0_usize);
-
-        let decoded = parsed.entries()[0].decode_value_with_cancellation::<String, _>(|| {
-            let next = polls.get() + 1;
-            polls.set(next);
-            if next >= 3 { Err("cancelled") } else { Ok(()) }
-        });
-
-        assert!(matches!(decoded, Err("cancelled")));
-        assert_eq!(polls.get(), 3);
-    }
-
-    #[test]
-    fn string_array_decoder_preserves_json_escape_semantics_and_shape_errors() {
-        let response = parse_translation_response(
-            r#"{"1":["原文","换行\n","\ud83d\ude00"],"2":["合法",3],"3":true}"#,
-            TranslationResponseEnvelope::JsonOnly,
-        )
-        .expect("合法外层响应应解析");
-
-        assert_eq!(
-            response.entries()[0]
-                .decode_string_array_with_cancellation::<Infallible>(|| Ok(()))
-                .expect("未取消"),
-            DecodedJsonStringArray::Strings(vec![
-                "原文".to_owned(),
-                "换行\n".to_owned(),
-                "😀".to_owned(),
-            ])
-        );
-        assert_eq!(
-            response.entries()[1]
-                .decode_string_array_with_cancellation::<Infallible>(|| Ok(()))
-                .expect("未取消"),
-            DecodedJsonStringArray::NonStringItem {
-                item: NonZeroUsize::new(2).expect("测试项编号非零"),
-            }
-        );
-        assert_eq!(
-            response.entries()[2]
-                .decode_string_array_with_cancellation::<Infallible>(|| Ok(()))
-                .expect("未取消"),
-            DecodedJsonStringArray::NotArray
-        );
-    }
-
-    #[test]
-    fn long_escaped_string_array_decode_observes_cancellation() {
-        let escaped = r"\u4e2d".repeat(64 * 1024);
-        let response = parse_translation_response(
-            &format!(r#"{{"1":["{escaped}"]}}"#),
-            TranslationResponseEnvelope::JsonOnly,
-        )
-        .expect("外层 JSON 与 raw value 应先完成解析");
-        let polls = Cell::new(0_usize);
-
-        let decoded = response.entries()[0].decode_string_array_with_cancellation(|| {
-            let next = polls.get() + 1;
-            polls.set(next);
-            if next >= 4 { Err("cancelled") } else { Ok(()) }
-        });
-
-        assert_eq!(decoded, Err("cancelled"));
-        assert_eq!(polls.get(), 4);
-    }
-
-    #[test]
-    fn cancellable_parser_stops_while_searching_long_thinking_envelope() {
-        let response = format!("<why>{}</why>{{\"1\":\"译文\"}}", "分析".repeat(256 * 1024));
-        let polls = Cell::new(0_usize);
-
-        let parsed = parse_translation_response_with_cancellation(
-            &response,
-            TranslationResponseEnvelope::ThinkingThenJson,
-            || {
-                let next = polls.get() + 1;
-                polls.set(next);
-                if next >= 14 { Err("cancelled") } else { Ok(()) }
-            },
-        );
-
-        assert!(matches!(parsed, Err("cancelled")));
-        assert_eq!(polls.get(), 14);
     }
 
     #[test]
@@ -1365,17 +1409,5 @@ mod tests {
 
         assert_eq!(location, Err("cancelled"));
         assert_eq!(polls.get(), 3);
-    }
-
-    #[test]
-    fn long_thinking_projection_observes_cancellation() {
-        let thinking = "思".repeat(128 * 1024);
-        let thinking_polls = Cell::new(0_usize);
-        let cloned = clone_response_text_with_cancellation(&thinking, &mut || {
-            let next = thinking_polls.get() + 1;
-            thinking_polls.set(next);
-            if next >= 3 { Err("cancelled") } else { Ok(()) }
-        });
-        assert_eq!(cloned, Err("cancelled"));
     }
 }

@@ -336,7 +336,6 @@ diagnostic-io-kind-value = { $code ->
    *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
-    [unsupported_prompt_locale] Must be exact lowercase auto or a supported BCP 47 UI locale
     [language_policy_term_blank] Language policy term must not be blank
     [language_policy_term_surrounding_whitespace] Language policy term must not contain surrounding whitespace
     [language_policy_term_duplicate] Language policy term must not be duplicated
@@ -445,17 +444,8 @@ task-record-final-result-heading = Final result
 task-record-no-request = No model request was ready to send.
 task-record-empty-assistant = The model returned an empty object.
 task-record-parse-error = Parse error: { $kind ->
-    [json] invalid model response JSON (category `{ $category }`) at line { $line }, column { $column }
-    [thinking_not_allowed] thinking output is not accepted in the current response mode at line { $line }, column { $column }
-    [thinking_envelope_missing] the required thinking envelope is missing at line { $line }, column { $column }
-    [thinking_envelope_unclosed] the thinking envelope is not closed at line { $line }, column { $column }
     [thinking_empty] the thinking content is empty at line { $line }, column { $column }
-    [thinking_nested] a nested thinking envelope starts at line { $line }, column { $column }
-    [thinking_repeated] a repeated thinking envelope starts at line { $line }, column { $column }
-    [markdown_fence_no_body] the Markdown fence has no body at line { $line }, column { $column }
-    [markdown_fence_unsupported] only a single Markdown fence with no language tag or a json tag is accepted at line { $line }, column { $column }
-    [markdown_fence_unclosed] the Markdown fence is not closed at line { $line }, column { $column }
-   *[markdown_fence_invalid_closing] the Markdown fence must close on the final standalone line at line { $line }, column { $column }
+   *[json] invalid model response JSON (category `{ $category }`) at line { $line }, column { $column }
 }
 task-record-attempt-succeeded = Attempt { $number }: succeeded; finish reason { $finish_reason }
 task-record-attempt-token-usage = ; tokens `{ $prompt } / { $completion } / { $total }`

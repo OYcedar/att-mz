@@ -13,11 +13,112 @@ use crate::diagnostic::{
 use crate::language::LanguagePair;
 use crate::runtime::filesystem::{SystemFileSystem, SystemFileSystemError};
 use crate::storage::file_system::{FileReader, ReadFileError};
+use crate::translation_protocol::TranslationResponseMode;
 
+pub(crate) const TRANSLATION_PROMPT_DIRECTORY_NAME: &str = "translation";
 pub(crate) const SYSTEM_PROMPT_FILE_NAME: &str = "system.md";
 pub(crate) const THINKING_PROMPT_FILE_NAME: &str = "thinking.md";
+pub(crate) const RULES_PROMPT_DIRECTORY_NAME: &str = "rules";
+pub(crate) const EXAMPLES_PROMPT_DIRECTORY_NAME: &str = "examples";
 const SOURCE_LANGUAGE_TEMPLATE_VARIABLE: &str = "{{source_language}}";
 const TARGET_LANGUAGE_TEMPLATE_VARIABLE: &str = "{{target_language}}";
+
+/// 两个响应开关共同选择唯一一份规则和示例；最终 Prompt 不介绍未启用的模式。
+pub(crate) const fn prompt_variant_file_name(mode: TranslationResponseMode) -> &'static str {
+    match (mode.thinking(), mode.source_echo()) {
+        (false, false) => "plain.md",
+        (true, false) => "thinking.md",
+        (false, true) => "source-echo.md",
+        (true, true) => "thinking-source-echo.md",
+    }
+}
+
+/// 一次翻译只会读取当前响应模式需要的四类资源。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TranslationPromptResourcePaths {
+    system: PathBuf,
+    thinking: Option<PathBuf>,
+    rules: PathBuf,
+    example: PathBuf,
+}
+
+impl TranslationPromptResourcePaths {
+    pub(crate) fn system(&self) -> &Path {
+        &self.system
+    }
+
+    pub(crate) fn thinking(&self) -> Option<&Path> {
+        self.thinking.as_deref()
+    }
+
+    pub(crate) fn rules(&self) -> &Path {
+        &self.rules
+    }
+
+    pub(crate) fn example(&self) -> &Path {
+        &self.example
+    }
+}
+
+pub(crate) fn translation_prompt_resource_paths(
+    prompt_root: &Path,
+    mode: TranslationResponseMode,
+) -> TranslationPromptResourcePaths {
+    let directory = prompt_root.join(TRANSLATION_PROMPT_DIRECTORY_NAME);
+    let variant = prompt_variant_file_name(mode);
+    TranslationPromptResourcePaths {
+        system: directory.join(SYSTEM_PROMPT_FILE_NAME),
+        thinking: mode
+            .thinking()
+            .then(|| directory.join(THINKING_PROMPT_FILE_NAME)),
+        rules: directory.join(RULES_PROMPT_DIRECTORY_NAME).join(variant),
+        example: directory.join(EXAMPLES_PROMPT_DIRECTORY_NAME).join(variant),
+    }
+}
+
+/// 按唯一顺序拼接已经解析和校验的翻译 Prompt 组件。
+pub(crate) fn assemble_translation_system_prompt_with_cancellation<E>(
+    rendered_system: String,
+    thinking: Option<String>,
+    rules: String,
+    example: String,
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<String, E> {
+    ensure_running()?;
+    let mut prompt = rendered_system;
+    if let Some(thinking) = thinking {
+        prompt.push_str("\n\n");
+        append_prompt_component(&mut prompt, &thinking, &mut ensure_running)?;
+    }
+    prompt.push_str("\n\n");
+    append_prompt_component(&mut prompt, &rules, &mut ensure_running)?;
+    prompt.push_str("\n\n");
+    append_prompt_component(&mut prompt, &example, &mut ensure_running)?;
+    ensure_running()?;
+    Ok(prompt)
+}
+
+fn append_prompt_component<E>(
+    output: &mut String,
+    component: &str,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<(), E> {
+    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
+
+    let mut start = 0_usize;
+    while start < component.len() {
+        ensure_running()?;
+        let mut end = start
+            .saturating_add(CANCELLATION_CHECK_BYTES)
+            .min(component.len());
+        while end < component.len() && !component.is_char_boundary(end) {
+            end -= 1;
+        }
+        output.push_str(&component[start..end]);
+        start = end;
+    }
+    ensure_running()
+}
 
 pub(crate) struct UnparsedPromptResource {
     requested_path: PathBuf,
@@ -407,7 +508,7 @@ pub(crate) fn render_system_prompt_template_with_cancellation<E>(
     Ok(Ok(rendered))
 }
 
-/// Thinking Prompt 是固定正文，不接受任何模板变量。
+/// system 以外的 Prompt 组件都是固定正文，不接受任何模板变量。
 #[cfg(test)]
 pub(crate) fn ensure_no_prompt_template_variables(text: &str) -> Result<(), PromptTemplateError> {
     match ensure_no_prompt_template_variables_with_cancellation(text, || Ok::<_, Infallible>(())) {
@@ -425,7 +526,9 @@ pub(crate) fn ensure_no_prompt_template_variables_with_cancellation<E>(
         if index.is_multiple_of(64 * 1024) {
             ensure_running()?;
         }
-        if matches!(&bytes[index..index + 2], b"{{" | b"}}") {
+        // 只有 `{{` 会开始本项目的模板变量。连续的 `}}` 也会自然出现在紧凑 JSON
+        // 示例的嵌套对象结尾，不能把普通固定正文误判成模板。
+        if &bytes[index..index + 2] == b"{{" {
             return Ok(Err(PromptTemplateError::VariablesNotAllowed));
         }
     }
@@ -487,6 +590,20 @@ mod tests {
     use super::*;
     use crate::language::{LanguageId, LanguagePair};
 
+    const SYSTEM_RESOURCE: &str = include_str!("../../prompts/translation/system.md");
+    const THINKING_RESOURCE: &str = include_str!("../../prompts/translation/thinking.md");
+    const PLAIN_RULES: &str = include_str!("../../prompts/translation/rules/plain.md");
+    const THINKING_RULES: &str = include_str!("../../prompts/translation/rules/thinking.md");
+    const SOURCE_ECHO_RULES: &str = include_str!("../../prompts/translation/rules/source-echo.md");
+    const THINKING_SOURCE_ECHO_RULES: &str =
+        include_str!("../../prompts/translation/rules/thinking-source-echo.md");
+    const PLAIN_EXAMPLE: &str = include_str!("../../prompts/translation/examples/plain.md");
+    const THINKING_EXAMPLE: &str = include_str!("../../prompts/translation/examples/thinking.md");
+    const SOURCE_ECHO_EXAMPLE: &str =
+        include_str!("../../prompts/translation/examples/source-echo.md");
+    const THINKING_SOURCE_ECHO_EXAMPLE: &str =
+        include_str!("../../prompts/translation/examples/thinking-source-echo.md");
+
     fn language_pair() -> LanguagePair {
         LanguagePair::new(
             LanguageId::parse("ja").expect("语言应合法"),
@@ -505,6 +622,140 @@ mod tests {
     }
 
     #[test]
+    fn shared_prompt_resources_keep_the_four_mode_contract() {
+        assert_eq!(
+            SYSTEM_RESOURCE
+                .lines()
+                .filter(|line| line.starts_with('#'))
+                .collect::<Vec<_>>(),
+            ["# 任务", "# 翻译要求"]
+        );
+        assert!(!SYSTEM_RESOURCE.contains("think"));
+        render_system_prompt_template(SYSTEM_RESOURCE, &language_pair())
+            .expect("共享 system Prompt 应只使用语言变量");
+
+        for fixed_resource in [
+            THINKING_RESOURCE,
+            PLAIN_RULES,
+            THINKING_RULES,
+            SOURCE_ECHO_RULES,
+            THINKING_SOURCE_ECHO_RULES,
+            PLAIN_EXAMPLE,
+            THINKING_EXAMPLE,
+            SOURCE_ECHO_EXAMPLE,
+            THINKING_SOURCE_ECHO_EXAMPLE,
+        ] {
+            ensure_no_prompt_template_variables(fixed_resource)
+                .expect("system 以外的 Prompt 资源不得含模板变量");
+        }
+
+        for (mode, expected) in [
+            (TranslationResponseMode::new(false, false), "plain.md"),
+            (TranslationResponseMode::new(true, false), "thinking.md"),
+            (TranslationResponseMode::new(false, true), "source-echo.md"),
+            (
+                TranslationResponseMode::new(true, true),
+                "thinking-source-echo.md",
+            ),
+        ] {
+            assert_eq!(prompt_variant_file_name(mode), expected);
+        }
+    }
+
+    #[test]
+    fn resource_plan_selects_only_the_current_mode() {
+        let root = PathBuf::from("prompt-root");
+        let translation = root.join("translation");
+        for (mode, variant, has_thinking) in [
+            (
+                TranslationResponseMode::new(false, false),
+                "plain.md",
+                false,
+            ),
+            (
+                TranslationResponseMode::new(true, false),
+                "thinking.md",
+                true,
+            ),
+            (
+                TranslationResponseMode::new(false, true),
+                "source-echo.md",
+                false,
+            ),
+            (
+                TranslationResponseMode::new(true, true),
+                "thinking-source-echo.md",
+                true,
+            ),
+        ] {
+            let paths = translation_prompt_resource_paths(&root, mode);
+            assert_eq!(paths.system(), translation.join("system.md"));
+            assert_eq!(
+                paths.thinking(),
+                has_thinking
+                    .then(|| translation.join("thinking.md"))
+                    .as_deref(),
+                "thinking 关闭时资源计划不能包含 thinking.md"
+            );
+            assert_eq!(paths.rules(), translation.join("rules").join(variant));
+            assert_eq!(paths.example(), translation.join("examples").join(variant));
+        }
+    }
+
+    #[test]
+    fn all_four_modes_use_the_single_prompt_assembly_order() {
+        for (mode, variant) in [
+            (TranslationResponseMode::new(false, false), "plain"),
+            (TranslationResponseMode::new(true, false), "thinking"),
+            (TranslationResponseMode::new(false, true), "source-echo"),
+            (
+                TranslationResponseMode::new(true, true),
+                "thinking-source-echo",
+            ),
+        ] {
+            let thinking = mode.thinking().then(|| "thinking-component".to_owned());
+            let rules = format!("rules:{variant}");
+            let example = format!("example:{variant}");
+            let assembled = assemble_translation_system_prompt_with_cancellation(
+                "system-component".to_owned(),
+                thinking.clone(),
+                rules.clone(),
+                example.clone(),
+                || Ok::<_, ()>(()),
+            )
+            .expect("未取消的 Prompt 应完成拼接");
+            let expected = match thinking {
+                Some(thinking) => {
+                    format!("system-component\n\n{thinking}\n\n{rules}\n\n{example}")
+                }
+                None => format!("system-component\n\n{rules}\n\n{example}"),
+            };
+            assert_eq!(assembled, expected);
+        }
+    }
+
+    #[test]
+    fn every_selected_example_contains_one_valid_input_and_output_json() {
+        for example in [
+            PLAIN_EXAMPLE,
+            THINKING_EXAMPLE,
+            SOURCE_ECHO_EXAMPLE,
+            THINKING_SOURCE_ECHO_EXAMPLE,
+        ] {
+            let blocks = example
+                .split("```json")
+                .skip(1)
+                .map(|tail| tail.split("```").next().expect("JSON 围栏必须闭合").trim())
+                .collect::<Vec<_>>();
+            assert_eq!(blocks.len(), 2, "每份示例必须只有一组输入和输出");
+            for json in blocks {
+                serde_json::from_str::<serde_json::Value>(json)
+                    .expect("示例中的输入和输出都必须是合法 JSON");
+            }
+        }
+    }
+
+    #[test]
     fn system_and_thinking_template_boundaries_are_strict() {
         for template in [
             "{{target_language}}",
@@ -518,6 +769,7 @@ mod tests {
             );
         }
         assert!(ensure_no_prompt_template_variables("固定要求").is_ok());
+        assert!(ensure_no_prompt_template_variables(r#"{"translations":{}}"#).is_ok());
         assert!(ensure_no_prompt_template_variables("{{source_language}}").is_err());
     }
 

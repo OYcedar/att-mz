@@ -8,11 +8,6 @@ use mlua::Lua;
 use serde_json::Value as JsonValue;
 use toml::Value as TomlValue;
 
-const LOCALES: [&str; 10] = [
-    "ar", "zh-Hans", "zh-Hant", "en", "fr", "ru", "es", "ja", "ko", "vi",
-];
-const PROMPT_ENGINES: [&str; 2] = ["rpg_maker", "generic"];
-
 #[test]
 fn all_current_markdown_links_resolve() {
     let root = workspace_root();
@@ -196,7 +191,8 @@ fn generic_dynamic_pipeline_and_independent_projects_are_documented() {
         "不能依赖相邻 Group 恰好进入同一个",
         "全部 Unit 按原顺序参与语境",
         "只有代表项带临时数字 ID",
-        "每个 value 为字符串",
+        "每个 ID 的 value 是译文",
+        "验收后用 LF 连接",
     ] {
         assert!(
             translation.contains(required),
@@ -435,7 +431,7 @@ fn atomic_lua_is_documented_as_a_restricted_database_transaction() {
 }
 
 #[test]
-fn shared_translation_examples_and_prompt_locales_keep_the_current_protocol() {
+fn shared_chinese_translation_prompt_keeps_the_current_protocol() {
     for path in collect_files_with_extension(&workspace_root().join("docs"), "toml") {
         let source = read_utf8(&path);
         toml::from_str::<TomlValue>(&source)
@@ -444,51 +440,95 @@ fn shared_translation_examples_and_prompt_locales_keep_the_current_protocol() {
     toml::from_str::<TomlValue>(&read_utf8(&workspace_root().join("config.example.toml")))
         .expect("config.example.toml 必须是有效 TOML");
 
-    for engine in PROMPT_ENGINES {
-        for locale in LOCALES {
-            let locale_root = workspace_root().join("prompts").join(engine).join(locale);
-            let system_path = locale_root.join("system.md");
-            let thinking_path = locale_root.join("thinking.md");
-            let system = read_utf8(&system_path);
-            let thinking = read_utf8(&thinking_path);
-            assert!(
-                !system.trim().is_empty(),
-                "{} 不得为空",
-                system_path.display()
-            );
-            assert!(
-                !thinking.trim().is_empty(),
-                "{} 不得为空",
-                thinking_path.display()
-            );
-            assert_eq!(
-                prompt_template_variables(&system),
-                BTreeSet::from(["source_language", "target_language"]),
-                "{} 只能使用公共语言变量",
-                display_relative(&system_path)
-            );
-            assert!(
-                prompt_template_variables(&thinking).is_empty(),
-                "{} 不得使用模板变量",
-                display_relative(&thinking_path)
-            );
+    let prompt_root = workspace_root().join("prompts/translation");
+    let prompt_directories = fs::read_dir(workspace_root().join("prompts"))
+        .expect("Prompt 根目录必须可读取")
+        .map(|entry| {
+            entry
+                .expect("Prompt 根目录项必须可读取")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        prompt_directories,
+        BTreeSet::from(["translation".to_owned()]),
+        "MV、MZ 与 Generic 必须只共用一套固定中文 Prompt"
+    );
+
+    let system_path = prompt_root.join("system.md");
+    let system = read_utf8(&system_path);
+    assert_eq!(
+        prompt_template_variables(&system),
+        BTreeSet::from(["source_language", "target_language"]),
+        "system.md 只能使用源语言与目标语言变量"
+    );
+    assert!(system.contains("# 任务") && system.contains("# 翻译要求"));
+    assert!(!system.contains("think"), "主 Prompt 不得介绍思考模式");
+
+    let fixed_resources = [
+        "thinking.md",
+        "rules/plain.md",
+        "rules/thinking.md",
+        "rules/source-echo.md",
+        "rules/thinking-source-echo.md",
+        "examples/plain.md",
+        "examples/thinking.md",
+        "examples/source-echo.md",
+        "examples/thinking-source-echo.md",
+    ];
+    for relative in fixed_resources {
+        let path = prompt_root.join(relative);
+        let source = read_utf8(&path);
+        assert!(!source.trim().is_empty(), "{} 不得为空", path.display());
+        assert!(
+            prompt_template_variables(&source).is_empty(),
+            "{} 不得使用模板变量",
+            display_relative(&path)
+        );
+    }
+
+    for example in [
+        "plain.md",
+        "thinking.md",
+        "source-echo.md",
+        "thinking-source-echo.md",
+    ] {
+        let source = read_utf8(&prompt_root.join("examples").join(example));
+        let json_blocks = source
+            .split("```json")
+            .skip(1)
+            .map(|tail| tail.split("```").next().expect("JSON 围栏必须闭合").trim())
+            .collect::<Vec<_>>();
+        assert_eq!(json_blocks.len(), 2, "{example} 必须只有一组输入和输出");
+        for block in json_blocks {
+            serde_json::from_str::<JsonValue>(block)
+                .unwrap_or_else(|error| panic!("{example} 的示例必须是合法 JSON：{error}"));
         }
     }
 
-    let generic = read_utf8(&workspace_root().join("prompts/generic/en/system.md"));
-    let rpg_maker = read_utf8(&workspace_root().join("prompts/rpg_maker/en/system.md"));
+    let example_configuration =
+        toml::from_str::<TomlValue>(&read_utf8(&workspace_root().join("config.example.toml")))
+            .expect("config.example.toml 必须是有效 TOML");
+    let prompts = example_configuration["prompts"]
+        .as_table()
+        .expect("示例配置必须包含 prompts table");
+    assert_eq!(
+        prompts.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+        BTreeSet::from(["source_echo", "thinking_output"]),
+        "Prompt 配置只允许两个互不影响的布尔开关"
+    );
+    assert!(prompts.values().all(TomlValue::is_bool));
+
     let protocol = read_utf8(&workspace_root().join("docs/translation/prompts.md"));
     let placeholders = read_utf8(&workspace_root().join("docs/translation/placeholders.md"));
     let rpg_rules = read_utf8(&workspace_root().join("docs/rpg-maker/rules.md"));
-    assert!(
-        generic.contains(r#"{"1":"Translation\nSecond line"}"#),
-        "Generic Prompt 必须要求字符串 value"
-    );
-    assert!(
-        rpg_maker.contains("Every value must be an array of strings"),
-        "RPG Maker Prompt 必须要求字符串数组 value"
-    );
     for required in [
+        r#"{"0":["译文"]}"#,
+        r#"{"think":"具体翻译判断","translations":{"0":["译文"]}}"#,
+        r#"{"0":{"source":["原文"],"translation":["译文"]}}"#,
+        "thinking-source-echo.md",
         "按原始顺序保留全部 key",
         "重复、非法、未知和缺少的 ID",
         "每个 ID 独立验收",

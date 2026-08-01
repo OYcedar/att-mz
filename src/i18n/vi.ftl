@@ -327,7 +327,6 @@ diagnostic-io-kind-value = { $code ->
    *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
-    [unsupported_prompt_locale] Phải là auto viết thường hoàn toàn hoặc locale giao diện BCP 47 được hỗ trợ
     [language_policy_term_blank] Thuật ngữ chính sách ngôn ngữ không được để trống
     [language_policy_term_surrounding_whitespace] Thuật ngữ chính sách ngôn ngữ không được có khoảng trắng ở hai đầu
     [language_policy_term_duplicate] Thuật ngữ chính sách ngôn ngữ không được trùng lặp
@@ -436,17 +435,8 @@ task-record-final-result-heading = Kết quả cuối
 task-record-no-request = Không tạo được yêu cầu mô hình sẵn sàng để gửi.
 task-record-empty-assistant = Mô hình trả về một đối tượng rỗng.
 task-record-parse-error = Lỗi phân tích: { $kind ->
-    [json] JSON phản hồi của mô hình không hợp lệ (loại `{ $category }`), dòng { $line }, cột { $column }
-    [thinking_not_allowed] chế độ phản hồi hiện tại không chấp nhận phần suy luận, dòng { $line }, cột { $column }
-    [thinking_envelope_missing] thiếu phong bì suy luận bắt buộc, dòng { $line }, cột { $column }
-    [thinking_envelope_unclosed] phong bì suy luận chưa được đóng, dòng { $line }, cột { $column }
     [thinking_empty] nội dung suy luận trống, dòng { $line }, cột { $column }
-    [thinking_nested] có phong bì suy luận lồng nhau, dòng { $line }, cột { $column }
-    [thinking_repeated] có phong bì suy luận lặp lại, dòng { $line }, cột { $column }
-    [markdown_fence_no_body] hàng rào Markdown không có nội dung, dòng { $line }, cột { $column }
-    [markdown_fence_unsupported] chỉ chấp nhận một hàng rào Markdown không có nhãn ngôn ngữ hoặc có nhãn json, dòng { $line }, cột { $column }
-    [markdown_fence_unclosed] hàng rào Markdown chưa được đóng, dòng { $line }, cột { $column }
-   *[markdown_fence_invalid_closing] hàng rào Markdown phải đóng ở dòng độc lập cuối cùng, dòng { $line }, cột { $column }
+   *[json] JSON phản hồi của mô hình không hợp lệ (loại `{ $category }`), dòng { $line }, cột { $column }
 }
 task-record-attempt-succeeded = Lần thử { $number }: thành công; finish reason { $finish_reason }
 task-record-attempt-token-usage = ; token `{ $prompt } / { $completion } / { $total }`

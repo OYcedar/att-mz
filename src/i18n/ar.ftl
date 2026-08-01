@@ -348,7 +348,6 @@ diagnostic-io-kind-value = { $code ->
    *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
-    [unsupported_prompt_locale] يجب أن تكون auto بأحرف صغيرة تمامًا أو لغة واجهة BCP 47 مدعومة
     [language_policy_term_blank] يجب ألا يكون مصطلح سياسة اللغة فارغًا
     [language_policy_term_surrounding_whitespace] يجب ألا يحتوي مصطلح سياسة اللغة على مسافات طرفية
     [language_policy_term_duplicate] يجب ألا يتكرر مصطلح سياسة اللغة
@@ -457,17 +456,8 @@ task-record-final-result-heading = النتيجة النهائية
 task-record-no-request = لم يتكوّن طلب نموذج جاهز للإرسال.
 task-record-empty-assistant = أعاد النموذج كائنًا فارغًا.
 task-record-parse-error = خطأ في التحليل: { $kind ->
-    [json] JSON استجابة النموذج غير صالح (الفئة `{ $category }`)، السطر { $line }، العمود { $column }
-    [thinking_not_allowed] وضع الاستجابة الحالي لا يقبل مخرجات التفكير، السطر { $line }، العمود { $column }
-    [thinking_envelope_missing] غلاف التفكير المطلوب مفقود، السطر { $line }، العمود { $column }
-    [thinking_envelope_unclosed] غلاف التفكير غير مغلق، السطر { $line }، العمود { $column }
     [thinking_empty] محتوى التفكير فارغ، السطر { $line }، العمود { $column }
-    [thinking_nested] يوجد غلاف تفكير متداخل، السطر { $line }، العمود { $column }
-    [thinking_repeated] يوجد غلاف تفكير متكرر، السطر { $line }، العمود { $column }
-    [markdown_fence_no_body] سياج Markdown بلا محتوى، السطر { $line }، العمود { $column }
-    [markdown_fence_unsupported] لا يُقبل إلا سياج Markdown واحد بلا وسم لغة أو بوسم json، السطر { $line }، العمود { $column }
-    [markdown_fence_unclosed] سياج Markdown غير مغلق، السطر { $line }، العمود { $column }
-   *[markdown_fence_invalid_closing] يجب إغلاق سياج Markdown في السطر المستقل الأخير، السطر { $line }، العمود { $column }
+   *[json] JSON استجابة النموذج غير صالح (الفئة `{ $category }`)، السطر { $line }، العمود { $column }
 }
 task-record-attempt-succeeded = المحاولة { $number }: نجحت؛ finish reason { $finish_reason }
 task-record-attempt-token-usage = ؛ الرموز `{ $prompt } / { $completion } / { $total }`

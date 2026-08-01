@@ -505,6 +505,20 @@ pub(crate) fn markdown_fence(content: &str, language: &str) -> String {
     output
 }
 
+/// 把 Chat Completions 的 `message.content` 投影成可安全嵌入任务记录的证据。
+///
+/// 这里只执行现行敏感信息规则要求的文本与 JSON 字符串替换，并动态选择 Markdown
+/// 围栏长度；调用方不能把结果解释为供应商响应或未经修改的字节副本。
+pub(crate) fn render_raw_assistant(
+    raw_assistant: &str,
+    api_key_redactor: &ApiKeyRedactor,
+) -> String {
+    markdown_fence(
+        &api_key_redactor.redact_text_with_json_strings(raw_assistant),
+        "json",
+    )
+}
+
 pub(crate) fn recorded_at_utc(now: OffsetDateTime) -> String {
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",

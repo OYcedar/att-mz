@@ -38,31 +38,34 @@ Placeholder 与内置控制符，为每个 Unit 判定去向：Current、需要�
 ## 3. TaskBlock 与模型形状
 
 RPG Maker 的明确 Semantic Scope、Group 物理顺序和 Profile 目标字符数共同决定
-TaskBlock。装箱只使用完整原文、Group 类型、Unit 角色、固定消息格式和固定 `[-]` 槽位；
+TaskBlock。装箱只使用完整原文、Group 类型、Unit 角色和固定 JSON 消息结构；
 Current、译文、术语、Placeholder token、去重和临时 ID 不参与。Group 保持完整、绝不
 拆开，TaskBlock 不跨 Scope；单个 Group 超过目标字符数时独占一块。完整公共规则见
 [TaskBlock 规划规格](../translation/task-planning.md)。
 
 只发送至少含一个模型代表的完整 TaskBlock。发送时保留块内全部 Group 和全部 Unit，只有
-模型代表获得临时数字 ID；其他 Unit 使用 `[-]`，已有有效目标文本时显示经过自身
-Placeholder 绑定保护的目标文本，否则显示保护后的原文。块内所有 Group 的术语命中按
-术语文件顺序合并并提供一次。模型 value 始终是字符串数组：
+模型代表获得临时数字 ID；其他 Unit 省略 `id` 和 `type`，已有有效目标文本时显示经过
+自身 Placeholder 绑定保护的目标文本，否则显示保护后的原文。块内所有 Group 的术语
+命中按术语文件顺序合并并提供一次。
 
-- `single line`：恰好一个无 LF 字符串；
-- `N lines, corresponding line by line`：恰好 N 项并保持空槽；
-- `N items, corresponding item by item`：恰好 N 项并保持空槽；
-- `free line breaking`：至少一项，可以自然改变数组项数量。
+模型收到公共 JSON user message。Group 提供 `kind`，Unit 按实际含义提供 `speaker`、
+`body` 或 `choices` 等 `role`，`text` 始终是字符串数组。带 ID Unit 的 `type` 按现有
+RPG Maker 形状映射：
 
-数组中每个字符串不得含 CR、LF 或 NUL。公共 Prompt 与信封见
+- `single line`、`N lines, corresponding line by line` 和
+  `N items, corresponding item by item` 使用 `strict`，译文恰好保持原数组项数和空槽；
+- `free line breaking` 使用 `free`，译文至少一项，可以自然改变数组项数量。
+
+响应的 translation 始终是字符串数组，每项不得含 CR、LF 或 NUL。四种响应模式见
 [Prompt 规格](../translation/prompts.md)。
 
-Partial 后重试重新判断 ID，但不重新装箱。原块中的已完成 Unit 继续以 `[-]` 目标译文
-提供语境，失败 Unit 获得从 `1` 开始的新临时 ID。一个完整块没有任何 ID 时只是不发送，
+Partial 后重试重新判断 ID，但不重新装箱。原块中的已完成 Unit 继续省略 ID，以安全目标
+译文提供语境；失败 Unit 获得从 `0` 开始的新临时 ID。一个完整块没有任何 ID 时只是不发送，
 不会与相邻块合并。
 
 ## 4. 验收、并发和结果
 
-每个 ID 独立检查 JSON 形状、数组结构、Placeholder、源语残留，并执行语言模块能够
+每个 ID 独立检查 JSON 形状、strict/free 数组结构、Placeholder、源语残留，并执行语言模块能够
 证明安全的修复。译文语言以项目语言对和 Prompt 的明确要求为准，ATT 不做短文本语言
 识别式的猜测。合法 ID 可以提交，其他 ID 形成 Partial；整个响应无法解析时，该任务
 不提交。

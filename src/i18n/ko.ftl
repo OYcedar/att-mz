@@ -327,7 +327,6 @@ diagnostic-io-kind-value = { $code ->
    *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
-    [unsupported_prompt_locale] 소문자 auto 또는 지원되는 BCP 47 UI 로캘이어야 합니다
     [language_policy_term_blank] 언어 정책 용어는 비워 둘 수 없습니다
     [language_policy_term_surrounding_whitespace] 언어 정책 용어 앞뒤에 공백을 둘 수 없습니다
     [language_policy_term_duplicate] 언어 정책 용어는 중복될 수 없습니다
@@ -436,17 +435,8 @@ task-record-final-result-heading = 최종 결과
 task-record-no-request = 전송 가능한 모델 요청이 만들어지지 않았습니다.
 task-record-empty-assistant = 모델이 빈 객체를 반환했습니다.
 task-record-parse-error = 구문 분석 오류: { $kind ->
-    [json] 모델 응답 JSON이 올바르지 않습니다(범주 `{ $category }`, { $line }행 { $column }열)
-    [thinking_not_allowed] 현재 응답 모드에서는 사고 출력을 허용하지 않습니다({ $line }행 { $column }열)
-    [thinking_envelope_missing] 필수 사고 봉투가 없습니다({ $line }행 { $column }열)
-    [thinking_envelope_unclosed] 사고 봉투가 닫히지 않았습니다({ $line }행 { $column }열)
     [thinking_empty] 사고 내용이 비어 있습니다({ $line }행 { $column }열)
-    [thinking_nested] 중첩된 사고 봉투가 있습니다({ $line }행 { $column }열)
-    [thinking_repeated] 사고 봉투가 반복되었습니다({ $line }행 { $column }열)
-    [markdown_fence_no_body] Markdown 펜스에 본문이 없습니다({ $line }행 { $column }열)
-    [markdown_fence_unsupported] 언어 표시가 없거나 json 표시인 단일 Markdown 펜스만 허용됩니다({ $line }행 { $column }열)
-    [markdown_fence_unclosed] Markdown 펜스가 닫히지 않았습니다({ $line }행 { $column }열)
-   *[markdown_fence_invalid_closing] Markdown 펜스는 마지막 독립 행에서 닫혀야 합니다({ $line }행 { $column }열)
+   *[json] 모델 응답 JSON이 올바르지 않습니다(범주 `{ $category }`, { $line }행 { $column }열)
 }
 task-record-attempt-succeeded = 시도 { $number }: 성공; finish reason { $finish_reason }
 task-record-attempt-token-usage = ; token `{ $prompt } / { $completion } / { $total }`
