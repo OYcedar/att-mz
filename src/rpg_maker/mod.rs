@@ -15,6 +15,7 @@ pub(crate) mod mutation_claim_summary;
 pub(crate) mod plugin_document;
 pub(crate) mod project;
 pub(crate) mod project_database;
+pub(crate) mod semantic_order;
 pub(crate) mod structured_path;
 pub(crate) mod text;
 pub(crate) mod translate;

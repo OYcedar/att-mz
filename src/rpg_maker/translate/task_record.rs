@@ -28,6 +28,7 @@ use crate::llm::{ApiKeyRedactor, ChatMessageRole, LlmClientRecordMetadata};
 use crate::llm::{LlmFinishReason, LlmResponse, LlmUsage};
 #[cfg(test)]
 use crate::runtime::filesystem::SystemFileSystem;
+use crate::translation::task_planning::TaskId;
 pub(crate) use crate::translation::task_record::{
     ConfiguredTranslationTaskRecordSink, MarkdownTranslationTaskRecordSink,
 };
@@ -39,7 +40,7 @@ pub(crate) use crate::translation_protocol::{
 };
 
 use super::pipeline::{
-    RpgMakerTranslationTaskIndex, TranslationProtocolDiagnostic, TranslationTaskBlock,
+    RpgMakerExecutableTask, RpgMakerTranslationTaskIndex, TranslationProtocolDiagnostic,
     TranslationTaskOutcome, TranslationTaskUnavailableReason, TranslationUnitRejectionReason,
 };
 
@@ -64,7 +65,7 @@ impl TranslationAssistantValueError {
 pub(crate) struct TranslationAssistantEntry {
     id: String,
     value: TranslationAssistantRecordedValue,
-    canonical_id: Option<usize>,
+    canonical_id: Option<TaskId>,
     value_error: Option<TranslationAssistantValueError>,
 }
 
@@ -107,7 +108,7 @@ impl TranslationAssistantEntry {
     pub(crate) fn projected(
         id: String,
         value: TranslationAssistantRecordedValue,
-        canonical_id: Option<usize>,
+        canonical_id: Option<TaskId>,
         value_error: Option<TranslationAssistantValueError>,
     ) -> Self {
         Self {
@@ -124,7 +125,7 @@ impl TranslationAssistantEntry {
     }
 
     #[cfg(test)]
-    pub(crate) const fn canonical_id(&self) -> Option<usize> {
+    pub(crate) const fn canonical_id(&self) -> Option<TaskId> {
         self.canonical_id
     }
 
@@ -549,7 +550,7 @@ impl TranslationTaskRecordFinalState {
 /// 最终化线交给记录 sink 的完整不可变文档。
 pub(crate) struct TranslationTaskRecordDocument {
     total_tasks: usize,
-    task: TranslationTaskBlock,
+    task: RpgMakerExecutableTask,
     evidence: TranslationTaskExecutionEvidence,
     total_duration: Duration,
     state: TranslationTaskRecordFinalState,
@@ -558,7 +559,7 @@ pub(crate) struct TranslationTaskRecordDocument {
 impl TranslationTaskRecordDocument {
     pub(crate) fn new(
         total_tasks: usize,
-        task: TranslationTaskBlock,
+        task: RpgMakerExecutableTask,
         evidence: TranslationTaskExecutionEvidence,
         state: TranslationTaskRecordFinalState,
     ) -> Self {
@@ -951,8 +952,9 @@ fn render_final_result(
                             .flatten(),
                     )
                 };
-                let id =
-                    markdown_inline_code(&api_key_redactor.redact(&unresolved.id().to_string()));
+                let id = markdown_inline_code(
+                    &api_key_redactor.redact(&unresolved.id().get().to_string()),
+                );
                 let _ = writeln!(
                     output,
                     "  - {}",
@@ -1021,7 +1023,7 @@ fn render_final_result(
 
 fn response_value_errors_by_id(
     document: &TranslationTaskRecordDocument,
-) -> HashMap<usize, Option<TranslationAssistantValueError>> {
+) -> HashMap<TaskId, Option<TranslationAssistantValueError>> {
     let Some(entries) = document
         .evidence
         .response
@@ -1180,7 +1182,7 @@ fn protocol_diagnostic(
         TranslationProtocolDiagnostic::UnknownId { item_index, id } => (
             "unknown_id",
             item_index.saturating_add(1),
-            markdown_inline_code(&api_key_redactor.redact(&id.to_string())),
+            markdown_inline_code(&api_key_redactor.redact(&id.get().to_string())),
         ),
     };
     task_record_text(
@@ -1351,6 +1353,10 @@ mod tests {
         )
     }
 
+    fn task_id(value: usize) -> TaskId {
+        TaskId::new(value).expect("测试 Task ID 必须非零")
+    }
+
     fn test_identity(index: usize) -> TranslationUnitIdentity {
         TranslationUnitIdentity::new(
             RpgMakerAssetOwner::Builtin,
@@ -1373,7 +1379,7 @@ mod tests {
         )
         .analyze_source(&LanguageText::natural("姫"));
         ExpectedTranslationOutput::new(
-            id,
+            task_id(id),
             test_identity(id),
             Vec::new(),
             ExpectedTranslationValidation::new(
@@ -1397,7 +1403,7 @@ mod tests {
             final_response: FinalLlmResponseMetadata::new(None, None, "stop", None),
             accepted: NonEmptyTaskItems::new(
                 AcceptedTranslationDecision::new(
-                    1,
+                    task_id(1),
                     TranslationPatch::new(
                         test_identity(1),
                         Vec::new(),
@@ -1420,7 +1426,7 @@ mod tests {
             final_response: FinalLlmResponseMetadata::new(None, None, "stop", None),
             accepted: NonEmptyTaskItems::new(
                 AcceptedTranslationDecision::new(
-                    1,
+                    task_id(1),
                     TranslationPatch::new(
                         test_identity(1),
                         Vec::new(),
@@ -1431,7 +1437,11 @@ mod tests {
                 Vec::new(),
             ),
             unresolved: NonEmptyTaskItems::new(
-                UnresolvedTranslationUnit::new(2, 0, TranslationUnitRejectionReason::Missing),
+                UnresolvedTranslationUnit::new(
+                    task_id(2),
+                    0,
+                    TranslationUnitRejectionReason::Missing,
+                ),
                 Vec::new(),
             ),
         })
@@ -1447,7 +1457,11 @@ mod tests {
             final_response: None,
             reason: TranslationTaskUnavailableReason::AllOutputsRejected,
             unresolved: NonEmptyTaskItems::new(
-                UnresolvedTranslationUnit::new(1, 0, TranslationUnitRejectionReason::Missing),
+                UnresolvedTranslationUnit::new(
+                    task_id(1),
+                    0,
+                    TranslationUnitRejectionReason::Missing,
+                ),
                 Vec::new(),
             ),
         })
@@ -1475,7 +1489,7 @@ mod tests {
     ) -> TranslationTaskRecordDocument {
         TranslationTaskRecordDocument::new(
             3,
-            TranslationTaskBlock::new(
+            RpgMakerExecutableTask::new(
                 RpgMakerTranslationTaskIndex::new(0),
                 language_pair(),
                 messages,
@@ -1602,7 +1616,7 @@ mod tests {
         let accepted_identity = test_identity(1);
         let accepted_translation = TextUnitContent::Value("公主".to_owned());
         let accepted = AcceptedTranslationDecision::new(
-            1,
+            task_id(1),
             TranslationPatch::new(
                 accepted_identity,
                 Vec::new(),
@@ -1617,7 +1631,7 @@ mod tests {
                 vec![
                     TranslationProtocolDiagnostic::UnknownId {
                         item_index: 2,
-                        id: 99,
+                        id: task_id(99),
                     },
                     TranslationProtocolDiagnostic::InvalidId { item_index: 3 },
                 ],
@@ -1625,15 +1639,19 @@ mod tests {
             final_response: FinalLlmResponseMetadata::new(None, None, "stop", None),
             accepted: NonEmptyTaskItems::new(accepted, Vec::new()),
             unresolved: NonEmptyTaskItems::new(
-                UnresolvedTranslationUnit::new(2, 0, TranslationUnitRejectionReason::Duplicate),
+                UnresolvedTranslationUnit::new(
+                    task_id(2),
+                    0,
+                    TranslationUnitRejectionReason::Duplicate,
+                ),
                 vec![UnresolvedTranslationUnit::new(
-                    3,
+                    task_id(3),
                     0,
                     TranslationUnitRejectionReason::Missing,
                 )],
             ),
         });
-        let task = TranslationTaskBlock::new(
+        let task = RpgMakerExecutableTask::new(
             RpgMakerTranslationTaskIndex::new(0),
             language_pair(),
             Vec::new(),
@@ -1756,7 +1774,7 @@ mod tests {
         let unresolved = (1..=2)
             .map(|id| {
                 UnresolvedTranslationUnit::new(
-                    id,
+                    task_id(id),
                     0,
                     TranslationUnitRejectionReason::InvalidShape {
                         message: parse_error.to_owned(),
@@ -1781,7 +1799,7 @@ mod tests {
         });
         let document = TranslationTaskRecordDocument::new(
             1,
-            TranslationTaskBlock::new(
+            RpgMakerExecutableTask::new(
                 RpgMakerTranslationTaskIndex::new(0),
                 language_pair(),
                 Vec::new(),
@@ -1954,7 +1972,7 @@ mod tests {
 
     #[test]
     fn unknown_commit_result_never_claims_zero_written_locations() {
-        let task = TranslationTaskBlock::new(
+        let task = RpgMakerExecutableTask::new(
             RpgMakerTranslationTaskIndex::new(0),
             language_pair(),
             Vec::new(),
@@ -2088,7 +2106,7 @@ mod tests {
         );
         let document = TranslationTaskRecordDocument::new(
             1,
-            TranslationTaskBlock::new(
+            RpgMakerExecutableTask::new(
                 RpgMakerTranslationTaskIndex::new(0),
                 language_pair(),
                 Vec::new(),
@@ -2228,7 +2246,7 @@ mod tests {
             vec![TranslationAssistantEntry::projected(
                 "1".to_owned(),
                 TranslationAssistantRecordedValue::RawJson(raw_value),
-                Some(1),
+                Some(task_id(1)),
                 Some(TranslationAssistantValueError::NonStringItem {
                     item: NonZeroUsize::MIN,
                 }),
@@ -2242,7 +2260,7 @@ mod tests {
         );
         let document = TranslationTaskRecordDocument::new(
             1,
-            TranslationTaskBlock::new(
+            RpgMakerExecutableTask::new(
                 RpgMakerTranslationTaskIndex::new(0),
                 language_pair(),
                 Vec::new(),
@@ -2282,7 +2300,7 @@ mod tests {
         const KEY: &str = "api`key";
         const NEIGHBOR: &str = "ordinary``marker";
         let accepted = AcceptedTranslationDecision::new(
-            1,
+            task_id(1),
             TranslationPatch::new(
                 test_identity(1),
                 Vec::new(),
@@ -2312,7 +2330,7 @@ mod tests {
             accepted: NonEmptyTaskItems::new(accepted, Vec::new()),
             unresolved: NonEmptyTaskItems::new(
                 UnresolvedTranslationUnit::new(
-                    2,
+                    task_id(2),
                     0,
                     TranslationUnitRejectionReason::SourceResidual {
                         fragment: format!("{NEIGHBOR}:{KEY}\nsource"),
@@ -2320,14 +2338,14 @@ mod tests {
                 ),
                 vec![
                     UnresolvedTranslationUnit::new(
-                        3,
+                        task_id(3),
                         0,
                         TranslationUnitRejectionReason::PlaceholderMismatch {
                             token: format!("{NEIGHBOR}:{KEY}"),
                         },
                     ),
                     UnresolvedTranslationUnit::new(
-                        4,
+                        task_id(4),
                         0,
                         TranslationUnitRejectionReason::InvalidShape {
                             message: format!("{NEIGHBOR}:{KEY}\nshape"),
@@ -2338,7 +2356,7 @@ mod tests {
         });
         let document = TranslationTaskRecordDocument::new(
             1,
-            TranslationTaskBlock::new(
+            RpgMakerExecutableTask::new(
                 RpgMakerTranslationTaskIndex::new(0),
                 language_pair(),
                 Vec::new(),
@@ -2443,7 +2461,7 @@ mod tests {
             TranslationAssistantRecordedValue::RawJson(
                 RawValue::from_string("{}".to_owned()).expect("测试 JSON 应合法"),
             ),
-            Some(1),
+            Some(task_id(1)),
             Some(TranslationAssistantValueError::NotStringArray),
         );
         let duplicate_first = TranslationAssistantEntry::projected(
@@ -2451,7 +2469,7 @@ mod tests {
             TranslationAssistantRecordedValue::RawJson(
                 RawValue::from_string("{}".to_owned()).expect("测试 JSON 应合法"),
             ),
-            Some(2),
+            Some(task_id(2)),
             Some(TranslationAssistantValueError::NotStringArray),
         );
         let duplicate_second = TranslationAssistantEntry::projected(
@@ -2459,7 +2477,7 @@ mod tests {
             TranslationAssistantRecordedValue::RawJson(
                 RawValue::from_string("[]".to_owned()).expect("测试 JSON 应合法"),
             ),
-            Some(2),
+            Some(task_id(2)),
             Some(TranslationAssistantValueError::NonStringItem {
                 item: NonZeroUsize::MIN,
             }),
@@ -2477,11 +2495,11 @@ mod tests {
 
         let errors = response_value_errors_by_id(&document);
         assert_eq!(
-            errors.get(&1).copied().flatten(),
+            errors.get(&task_id(1)).copied().flatten(),
             Some(TranslationAssistantValueError::NotStringArray)
         );
-        assert_eq!(errors.get(&2).copied().flatten(), None);
-        assert_eq!(errors.get(&3), None);
+        assert_eq!(errors.get(&task_id(2)).copied().flatten(), None);
+        assert_eq!(errors.get(&task_id(3)), None);
     }
 
     #[tokio::test]

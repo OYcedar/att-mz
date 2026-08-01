@@ -74,9 +74,12 @@ ATT 在 Placeholder 处理后的每段 NaturalText 中执行字面 trigger 匹�
 完成上述选择后，实际触发的术语条目始终按术语文件顺序提供给模型，而不是按它们在源文
 中的出现顺序。被重叠规则丢弃的条目不进入模型 Prompt，也不进入该译文的术语状态指纹。
 
-Generic 以完整 Group 的全部源文计算实际命中。一个术语即使只出现在兄弟 Unit 中，也会
-进入该 Group 每个自动译文的语义状态；Group 发送给模型时，只附带该 Group 实际命中的
-术语。TaskBlock 的拆分方式不会改变术语状态。
+MV、MZ 和 Generic 都以完整 Group 的全部 Unit 计算实际命中，包括没有临时 ID 的 Unit。
+一个术语即使只出现在兄弟 Unit 或无 ID Group 中，也不会因为本轮无需翻译该文本而消失。
+发送 TaskBlock 时，ATT 合并其中全部 Group 的命中，并按术语文件顺序提供一次。
+
+每个自动译文的状态仍只绑定自己所属完整 Group 的实际术语，不绑定 TaskBlock 邻居。
+TaskBlock 边界、兄弟 Group 的译文和本轮临时 ID 都不会改变术语状态。
 
 术语只提供翻译要求：不替换源文，也不产生新的 Unit。`term = []` 是合法的显式空
 术语集。

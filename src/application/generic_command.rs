@@ -54,12 +54,12 @@ use crate::generic::{
     GenericProtectedText, GenericStoredSnapshot, GenericTaskRecordDocument, GenericTaskRecordIssue,
     GenericTaskRecordState, GenericTaskResponseRecord, GenericUnitKey, GenericUnitMap,
     GenericWriteBackCandidate, GenericWriteBackError, PlannedGroup, PlannedTask, PlanningUnit,
-    ResponseProblem, TranslationAcceptance, TranslationPlan, TranslationWrite,
+    ResponseProblem, TranslationAcceptance, TranslationPlan, TranslationWrite, ValidatedReuse,
     accept_parsed_response_with_cancellation, build_write_back_candidate_with_cancellation,
     current_translation_for_stored_with_cancellation,
     ensure_input_fingerprints_current_with_cancellation,
     plan_translation_with_validator_and_cancellation,
-    split_tasks_by_rendered_size_with_cancellation, terminology_hit_fingerprint_with_cancellation,
+    terminology_hit_fingerprint_with_cancellation,
     validate_materialized_write_back_file_with_cancellation,
 };
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
@@ -110,6 +110,7 @@ use crate::translation::planning_resource::{
     TranslationPlanningResourceReader, TranslationPlanningResourceReadingError,
     TranslationPlanningResourceReadingService,
 };
+use crate::translation::task_planning::TaskId;
 use crate::translation::task_record::{
     ConfiguredTranslationTaskRecordSink, MarkdownTranslationTaskRecordSink,
 };
@@ -2734,7 +2735,7 @@ fn prepare_generic_translation(
                     terminology_hits,
                     ..base_resources
                 };
-                let planning = PlanningUnit::from_stored_with_cancellation(
+                let mut planning = PlanningUnit::from_stored_with_cancellation(
                     snapshot.project(),
                     group,
                     unit,
@@ -2748,6 +2749,30 @@ fn prepare_generic_translation(
                     cancellation,
                 )
                 .map_err(GenericPreparationError::Planning)?;
+                if let Some(current_translation) = planning.current_translation() {
+                    match service.protect_with_cancellation(
+                        group.kind(),
+                        current_translation,
+                        placeholder_rules,
+                        || ensure_generic_cpu_running(cancellation),
+                    )? {
+                        Ok(current_protected)
+                            if current_protected.binding_fingerprint()
+                                == protected.binding_fingerprint() =>
+                        {
+                            planning.install_current_target_context(clone_generic_cpu_text(
+                                current_protected.text(),
+                                cancellation,
+                            )?);
+                        }
+                        Ok(_) | Err(_) => {
+                            planning.install_current_source_fallback(clone_generic_cpu_text(
+                                protected.text(),
+                                cancellation,
+                            )?);
+                        }
+                    }
+                }
                 if planning.needs_candidate() {
                     facts.push((
                         clone_generic_unit_key(planning.key(), cancellation)?,
@@ -2787,25 +2812,12 @@ fn prepare_generic_translation(
         }
     }
     ensure_generic_cpu_running(cancellation)?;
-    let mut needs_planning = false;
-    for unit in &planning_units {
-        ensure_generic_cpu_running(cancellation)?;
-        if unit.needs_planning() {
-            needs_planning = true;
-            break;
-        }
-    }
-    if !needs_planning {
-        return Ok(PreparedGenericTranslation {
-            plan: TranslationPlan::empty(),
-            facts,
-        });
-    }
     let plan = plan_translation_with_validator_and_cancellation(
         snapshot,
         &planning_units,
+        target_task_characters,
         |key, candidate| {
-            validate_generic_candidate_with_cancellation(
+            validate_generic_reuse_with_cancellation(
                 key,
                 candidate,
                 &facts,
@@ -2814,22 +2826,7 @@ fn prepare_generic_translation(
                 cancellation,
             )
         },
-        || cancellation.is_requested(),
-    )
-    .map_err(GenericPreparationError::Planning)?;
-    let plan = split_tasks_by_rendered_size_with_cancellation(
-        plan,
-        target_task_characters,
-        "Groups:\n".chars().count(),
-        |group, first_output_id| {
-            measure_generic_group_message(
-                group,
-                terminology.as_ref(),
-                first_output_id,
-                cancellation,
-            )
-        },
-        || cancellation.is_requested(),
+        cancellation,
     )
     .map_err(GenericPreparationError::Planning)?;
     Ok(PreparedGenericTranslation { plan, facts })
@@ -3969,15 +3966,20 @@ fn render_generic_user_message_with_cancellation(
 ) -> Result<String, GenericPlanningError> {
     ensure_message_render_running(cancellation)?;
     let mut output = b"Groups:\n".to_vec();
+    if !task.terminology_indices().is_empty() {
+        output.extend_from_slice(b"terminology:\n");
+        for index in task.terminology_indices() {
+            ensure_message_render_running(cancellation)?;
+            let entry = &terminology.entries()[*index];
+            append_json_string_with_cancellation(&mut output, entry.term(), cancellation)?;
+            output.extend_from_slice(b" => ");
+            append_json_string_with_cancellation(&mut output, entry.translation(), cancellation)?;
+            output.push(b'\n');
+        }
+    }
     for group in task.groups() {
         ensure_message_render_running(cancellation)?;
-        append_generic_group_message_with_cancellation(
-            &mut output,
-            group,
-            terminology,
-            None,
-            cancellation,
-        )?;
+        append_generic_group_message_with_cancellation(&mut output, group, cancellation)?;
         output.push(b'\n');
     }
     ensure_message_render_running(cancellation)?;
@@ -3985,71 +3987,19 @@ fn render_generic_user_message_with_cancellation(
         .expect("ASCII 结构与 serde_json 字符串编码必须组成 UTF-8 模型消息"))
 }
 
-fn measure_generic_group_message(
-    group: &PlannedGroup,
-    terminology: &CompiledTerminology,
-    first_output_id: u64,
-    cancellation: &CooperativeCancellation,
-) -> Result<usize, GenericPlanningError> {
-    ensure_message_render_running(cancellation)?;
-    let mut output = Vec::new();
-    let mut next_output_id = first_output_id;
-    append_generic_group_message_with_cancellation(
-        &mut output,
-        group,
-        terminology,
-        Some(&mut next_output_id),
-        cancellation,
-    )?;
-    output.push(b'\n');
-    let output =
-        std::str::from_utf8(&output).expect("ASCII 结构与 serde_json 字符串编码必须组成 UTF-8");
-    let mut characters = 0_usize;
-    for _ in output.chars() {
-        if characters.is_multiple_of(16 * 1024) {
-            ensure_message_render_running(cancellation)?;
-        }
-        characters += 1;
-    }
-    ensure_message_render_running(cancellation)?;
-    Ok(characters)
-}
-
 fn append_generic_group_message_with_cancellation(
     output: &mut Vec<u8>,
     group: &PlannedGroup,
-    terminology: &CompiledTerminology,
-    mut next_output_id: Option<&mut u64>,
     cancellation: &CooperativeCancellation,
 ) -> Result<(), GenericPlanningError> {
     ensure_message_render_running(cancellation)?;
     output.extend_from_slice(b"kind=");
     append_json_string_with_cancellation(output, group.kind(), cancellation)?;
     output.push(b'\n');
-    if !group.terminology_indices().is_empty() {
-        output.extend_from_slice(b"terminology:\n");
-        for index in group.terminology_indices() {
-            ensure_message_render_running(cancellation)?;
-            let entry = &terminology.entries()[*index];
-            append_json_string_with_cancellation(output, entry.term(), cancellation)?;
-            output.extend_from_slice(b" => ");
-            append_json_string_with_cancellation(output, entry.translation(), cancellation)?;
-            output.push(b'\n');
-        }
-    }
     output.extend_from_slice(b"units:\n");
     for unit in group.units() {
         ensure_message_render_running(cancellation)?;
-        let rendered_output_id = match (unit.output_id(), next_output_id.as_deref_mut()) {
-            (Some(_), Some(next)) => {
-                let current = *next;
-                *next = next.saturating_add(1);
-                Some(current)
-            }
-            (output_id, None) => output_id,
-            (None, Some(_)) => None,
-        };
-        match rendered_output_id {
+        match unit.output_id() {
             Some(output_id) => {
                 output.push(b'[');
                 output.extend_from_slice(output_id.to_string().as_bytes());
@@ -4185,7 +4135,7 @@ fn accept_generic_response_with_validator_and_cancellation(
     ) -> Result<Result<String, String>, GenericPlanningError>,
     cancellation: &CooperativeCancellation,
 ) -> Result<TranslationAcceptance, GenericPlanningError> {
-    let mut cache = HashMap::<u64, CancellableTextMap<&str, Result<String, String>>>::new();
+    let mut cache = HashMap::<TaskId, CancellableTextMap<&str, Result<String, String>>>::new();
     accept_parsed_response_with_cancellation(
         task,
         parsed,
@@ -4236,14 +4186,14 @@ fn validate_generic_candidate(
     validate_generic_candidate_fact(fact, candidate, placeholder_rules, language_module)
 }
 
-fn validate_generic_candidate_with_cancellation(
+fn validate_generic_reuse_with_cancellation(
     key: &GenericUnitKey,
     candidate: &str,
     facts: &GenericUnitMap<GenericValidationFact>,
     placeholder_rules: &GenericCompiledPlaceholderRules,
     language_module: &dyn LanguageModule,
     cancellation: &CooperativeCancellation,
-) -> Result<Result<String, String>, GenericPlanningError> {
+) -> Result<Result<ValidatedReuse, String>, GenericPlanningError> {
     ensure_generic_response_processing_running(cancellation)?;
     let Some(fact) = facts.get_with_cancellation(key, || {
         ensure_generic_response_processing_running(cancellation)
@@ -4251,13 +4201,40 @@ fn validate_generic_candidate_with_cancellation(
     else {
         return Ok(Err("响应代表项不属于当前 Generic 计划".to_owned()));
     };
-    validate_generic_candidate_fact_with_cancellation(
+    let final_translation = match validate_generic_candidate_fact_with_cancellation(
         fact,
         candidate,
         placeholder_rules,
         language_module,
         cancellation,
-    )
+    )? {
+        Ok(translation) => translation,
+        Err(detail) => return Ok(Err(detail)),
+    };
+    let service = GenericPlaceholderService::default();
+    let context = match service.protect_with_cancellation(
+        &fact.kind,
+        &final_translation,
+        placeholder_rules,
+        || ensure_generic_response_processing_running(cancellation),
+    )? {
+        Ok(context) => context,
+        Err(source) => return Ok(Err(source.to_string())),
+    };
+    let context_binding = context.binding_fingerprint_with_cancellation(|| {
+        ensure_generic_response_processing_running(cancellation)
+    })?;
+    let expected_binding = fact.protected.binding_fingerprint_with_cancellation(|| {
+        ensure_generic_response_processing_running(cancellation)
+    })?;
+    if context_binding != expected_binding {
+        return Ok(Err(
+            "复用译文的 Placeholder 绑定与目标 Generic Unit 不一致".to_owned()
+        ));
+    }
+    let mut context_text = String::with_capacity(context.text().len());
+    append_generic_response_text(&mut context_text, context.text(), cancellation)?;
+    Ok(Ok(ValidatedReuse::new(final_translation, context_text)))
 }
 
 #[cfg(test)]
@@ -5673,7 +5650,8 @@ mod tests {
         manual_translation_state_fingerprint,
     };
     use crate::language::{
-        JapaneseLanguageModule, JapaneseResidualPolicy, LanguageId, LanguageModule,
+        JapaneseLanguageModule, JapaneseQuoteRepairPolicy, JapaneseResidualPolicy, LanguageId,
+        LanguageModule, QuotePair,
     };
     use crate::translation::planning_resource::{TerminologyEntry, compile_terminology};
 
@@ -5681,6 +5659,10 @@ mod tests {
 
     fn fingerprint(byte: u8) -> Sha256Fingerprint {
         Sha256Fingerprint::from_bytes([byte; 32])
+    }
+
+    fn task_id(value: usize) -> TaskId {
+        TaskId::new(value).expect("测试 Task ID 必须非零")
     }
 
     #[tokio::test]
@@ -5711,7 +5693,8 @@ mod tests {
 
     #[test]
     fn generic_partial_response_diagnostic_keeps_task_and_output_id() {
-        let diagnostic = generic_response_problem_diagnostic(2, &ResponseProblem::MissingId(7));
+        let diagnostic =
+            generic_response_problem_diagnostic(2, &ResponseProblem::MissingId(task_id(7)));
 
         assert_eq!(diagnostic.code, DiagnosticCode::ModelRequest);
         assert_eq!(diagnostic.stage, DiagnosticStage::ModelRequest);
@@ -6531,16 +6514,24 @@ mod tests {
     }
 
     #[test]
-    fn model_message_contains_complete_group_context_without_stable_project_identity() {
+    fn model_message_keeps_terms_and_uses_safe_current_or_source_context() {
         let temporary = tempfile::tempdir().expect("应该可建立临时目录");
         let source_root = temporary.path().join("source");
         fs::create_dir_all(source_root.join("nested")).expect("应该可建立输入目录");
         fs::write(
             source_root.join("nested/scene.jsonl"),
             concat!(
-                r#"{"id":"secret-group","kind":"dialogue","units":["#,
-                r#"{"id":"secret-output","text":"こんにちは"},"#,
-                r#"{"id":"secret-context","text":"魔王"}]}"#,
+                r#"{"id":"secret-context-group","kind":"dialogue","units":["#,
+                r#"{"id":"secret-context","text":"魔王 {hero}"}]}"#,
+                "\n",
+                r#"{"id":"secret-invalid-current-group","kind":"dialogue","units":["#,
+                r#"{"id":"secret-invalid-current","text":"あ {rival}"}]}"#,
+                "\n",
+                r#"{"id":"secret-reuse-group","kind":"dialogue","units":["#,
+                r#"{"id":"secret-reuse","text":"あ {rival}"}]}"#,
+                "\n",
+                r#"{"id":"secret-output-group","kind":"dialogue","units":["#,
+                r#"{"id":"secret-output","text":"こんにちは"}]}"#,
                 "\n"
             ),
         )
@@ -6564,29 +6555,56 @@ mod tests {
             .expect("术语应该可编译"),
         );
         let placeholder_rules = GenericPlaceholderService::default()
-            .compile(Vec::new())
-            .expect("空 Placeholder 规则应该合法");
+            .compile(vec![GenericPlaceholderRuleDefinition::new(
+                Some(vec!["dialogue".to_owned()]),
+                r"\{[^}]+\}",
+            )])
+            .expect("Placeholder 规则应该合法");
         let resources = AutomaticStateResources {
             prompt: fingerprint(2),
             client_semantics: fingerprint(3),
             language_module: fingerprint(4),
             terminology_hits: empty_terminology_fingerprint(),
         };
-        let group = snapshot.files()[0].groups()[0].clone();
-        let unit = group.units()[0].clone();
-        let protected = GenericPlaceholderService::default()
-            .protect(group.kind(), unit.source_text(), &placeholder_rules)
+        let current_group = snapshot.files()[0].groups()[0].clone();
+        let current_unit = current_group.units()[0].clone();
+        let current_protected = GenericPlaceholderService::default()
+            .protect(
+                current_group.kind(),
+                current_unit.source_text(),
+                &placeholder_rules,
+            )
             .expect("原文应该可保护");
-        let state = automatic_translation_state_fingerprint(
+        let current_state = automatic_translation_state_fingerprint(
             snapshot.project().language_pair(),
-            &GenericUnitKey::new(group.id().to_owned(), unit.id().to_owned()),
-            unit.source_text(),
-            group.context_fingerprint(),
-            protected.binding_fingerprint(),
+            &GenericUnitKey::new(current_group.id().to_owned(), current_unit.id().to_owned()),
+            current_unit.source_text(),
+            current_group.context_fingerprint(),
+            current_protected.binding_fingerprint(),
             AutomaticStateResources {
                 terminology_hits: terminology_hit_fingerprint(terminology.as_ref(), &[0]),
                 ..resources
             },
+        );
+        let invalid_current_group = snapshot.files()[0].groups()[1].clone();
+        let invalid_current_unit = invalid_current_group.units()[0].clone();
+        let invalid_current_protected = GenericPlaceholderService::default()
+            .protect(
+                invalid_current_group.kind(),
+                invalid_current_unit.source_text(),
+                &placeholder_rules,
+            )
+            .expect("原文应该可保护");
+        let invalid_current_state = automatic_translation_state_fingerprint(
+            snapshot.project().language_pair(),
+            &GenericUnitKey::new(
+                invalid_current_group.id().to_owned(),
+                invalid_current_unit.id().to_owned(),
+            ),
+            invalid_current_unit.source_text(),
+            invalid_current_group.context_fingerprint(),
+            invalid_current_protected.binding_fingerprint(),
+            resources,
         );
         store
             .commit_translations(
@@ -6594,22 +6612,37 @@ mod tests {
                     .project()
                     .extracted_raw_fingerprint()
                     .expect("Extract 应保存原始指纹"),
-                &[crate::generic::TranslationWrite {
-                    group_id: group.id().to_owned(),
-                    unit_id: unit.id().to_owned(),
-                    expected_source_text: unit.source_text().to_owned(),
-                    expected_group_context: group.context_fingerprint(),
-                    translation: "已有上下文".to_owned(),
-                    origin: crate::generic::TranslationOrigin::Automatic,
-                    state_fingerprint: state,
-                    expected_translation: None,
-                }],
+                &[
+                    crate::generic::TranslationWrite {
+                        group_id: current_group.id().to_owned(),
+                        unit_id: current_unit.id().to_owned(),
+                        expected_source_text: current_unit.source_text().to_owned(),
+                        expected_group_context: current_group.context_fingerprint(),
+                        translation: "已有上下文 {hero}".to_owned(),
+                        origin: crate::generic::TranslationOrigin::Automatic,
+                        state_fingerprint: current_state,
+                        expected_translation: None,
+                    },
+                    crate::generic::TranslationWrite {
+                        group_id: invalid_current_group.id().to_owned(),
+                        unit_id: invalid_current_unit.id().to_owned(),
+                        expected_source_text: invalid_current_unit.source_text().to_owned(),
+                        expected_group_context: invalid_current_group.context_fingerprint(),
+                        translation: "损坏的已有译文".to_owned(),
+                        origin: crate::generic::TranslationOrigin::Automatic,
+                        state_fingerprint: invalid_current_state,
+                        expected_translation: None,
+                    },
+                ],
             )
             .expect("应该可保存测试译文");
         let snapshot = store.load_snapshot().expect("应该可重读 Generic 快照");
         let language_module: Arc<dyn LanguageModule> = Arc::new(JapaneseLanguageModule::new(
-            JapaneseResidualPolicy::new(NonZeroUsize::MIN, Vec::new())
-                .expect("日文残留策略应该合法"),
+            JapaneseResidualPolicy::new(
+                NonZeroUsize::new(2).expect("测试阈值应该非零"),
+                Vec::new(),
+            )
+            .expect("日文残留策略应该合法"),
             None,
         ));
         let prepared = prepare_generic_translation(
@@ -6625,11 +6658,32 @@ mod tests {
         let message = render_generic_user_message(&prepared.plan.tasks()[0], terminology.as_ref());
 
         assert!(message.contains("\"魔王\" => \"魔王（Demon King）\""));
+        assert_eq!(
+            message
+                .matches("\"魔王\" => \"魔王（Demon King）\"")
+                .count(),
+            1,
+            "TaskBlock 命中的术语必须按文件顺序合并后只提供一次"
+        );
         assert!(message.contains("kind=\"dialogue\""));
-        assert!(message.contains("[-] \"已有上下文\""));
-        assert!(message.contains("[1] \"魔王\""));
+        assert!(message.contains("[-] \"已有上下文 "));
+        assert!(message.contains("[-] \"あ "));
+        assert!(message.contains("[1] \"あ "));
+        assert!(message.contains("[2] \"こんにちは\""));
+        assert!(
+            prepared.plan.reused().is_empty(),
+            "只供阅读的源文回退不能成为重复 Unit 的复用译文"
+        );
+        assert!(!message.contains("损坏的已有译文"));
+        assert!(!message.contains("{hero}"));
+        assert!(!message.contains("{rival}"));
         for hidden_identity in [
-            "secret-group",
+            "secret-context-group",
+            "secret-invalid-current-group",
+            "secret-invalid-current",
+            "secret-reuse-group",
+            "secret-reuse",
+            "secret-output-group",
             "secret-output",
             "secret-context",
             "nested/scene.jsonl",
@@ -6642,7 +6696,121 @@ mod tests {
     }
 
     #[test]
-    fn rendered_task_size_includes_terms_escaping_ids_and_keeps_oversized_group_whole() {
+    fn repaired_reuse_is_reprotected_before_it_becomes_model_context() {
+        let temporary = tempfile::tempdir().expect("应该可建立临时目录");
+        let source_root = temporary.path().join("source");
+        fs::create_dir_all(&source_root).expect("应该可建立输入目录");
+        fs::write(
+            source_root.join("scene.jsonl"),
+            concat!(
+                r#"{"id":"current","kind":"dialogue","units":[{"id":"unit","text":"「こんにちは {name}」"}]}"#,
+                "\n",
+                r#"{"id":"reuse","kind":"dialogue","units":[{"id":"unit","text":"「こんにちは {name}」"}]}"#,
+                "\n",
+                r#"{"id":"model","kind":"dialogue","units":[{"id":"unit","text":"さようなら"}]}"#,
+                "\n"
+            ),
+        )
+        .expect("应该可写入 Generic 输入");
+        let (store, _) = GenericProjectStore::initialize(GenericInitRequest {
+            project_name: "reuse-context-test".parse().expect("项目名应该合法"),
+            workspace_root: temporary.path().join("project"),
+            source_root: Some(source_root),
+            source_language: Some(LanguageId::parse("ja").expect("源语言应该合法")),
+            target_language: Some(LanguageId::parse("zh-Hans").expect("目标语言应该合法")),
+        })
+        .expect("Generic 项目应该可初始化");
+        store.extract().expect("Generic 输入应该可提取");
+        let snapshot = store.load_snapshot().expect("应该可读取 Generic 快照");
+        let placeholder_rules = GenericPlaceholderService::default()
+            .compile(vec![GenericPlaceholderRuleDefinition::new(
+                Some(vec!["dialogue".to_owned()]),
+                r"\{[^}]+\}",
+            )])
+            .expect("Placeholder 规则应该合法");
+        let current_group = &snapshot.files()[0].groups()[0];
+        let current_unit = &current_group.units()[0];
+        let current_protected = GenericPlaceholderService::default()
+            .protect(
+                current_group.kind(),
+                current_unit.source_text(),
+                &placeholder_rules,
+            )
+            .expect("Current 原文应该可保护");
+        let current_state = manual_translation_state_fingerprint(
+            snapshot.project().language_pair(),
+            &GenericUnitKey::new(current_group.id().to_owned(), current_unit.id().to_owned()),
+            current_unit.source_text(),
+            current_group.context_fingerprint(),
+            current_protected.binding_fingerprint(),
+        );
+        store
+            .commit_translations(
+                snapshot
+                    .project()
+                    .extracted_raw_fingerprint()
+                    .expect("Extract 应保存原始指纹"),
+                &[crate::generic::TranslationWrite {
+                    group_id: current_group.id().to_owned(),
+                    unit_id: current_unit.id().to_owned(),
+                    expected_source_text: current_unit.source_text().to_owned(),
+                    expected_group_context: current_group.context_fingerprint(),
+                    translation: "“你好 {name}”".to_owned(),
+                    origin: crate::generic::TranslationOrigin::Manual,
+                    state_fingerprint: current_state,
+                    expected_translation: None,
+                }],
+            )
+            .expect("应该可保存 Current 译文");
+        let snapshot = store.load_snapshot().expect("应该可重读 Generic 快照");
+        let language_module: Arc<dyn LanguageModule> = Arc::new(JapaneseLanguageModule::new(
+            JapaneseResidualPolicy::new(NonZeroUsize::MIN, Vec::new())
+                .expect("日文残留策略应该合法"),
+            Some(
+                JapaneseQuoteRepairPolicy::new(vec![QuotePair::new('“', '”')])
+                    .expect("日文引号修复策略应该合法"),
+            ),
+        ));
+        let terminology = Arc::new(CompiledTerminology::empty());
+        let prepared = prepare_generic_translation(
+            &snapshot,
+            Arc::clone(&terminology),
+            &placeholder_rules,
+            language_module,
+            AutomaticStateResources {
+                prompt: fingerprint(21),
+                client_semantics: fingerprint(22),
+                language_module: fingerprint(23),
+                terminology_hits: empty_terminology_fingerprint(),
+            },
+            NonZeroUsize::new(10_000).expect("常量应该非零"),
+            &CooperativeCancellation::default(),
+        )
+        .expect("翻译任务应该可规划");
+
+        assert_eq!(prepared.plan.reused().len(), 1);
+        assert_eq!(prepared.plan.reused()[0].key().group_id(), "reuse");
+        assert_eq!(
+            prepared.plan.reused()[0].translation(),
+            "「你好 {name}」",
+            "提交值必须使用语言模块修复后的译文"
+        );
+        let task = &prepared.plan.tasks()[0];
+        assert_eq!(task.groups().len(), 3);
+        let current_context = task.groups()[0].units()[0].text();
+        let reuse_context = task.groups()[1].units()[0].text();
+        assert!(current_context.starts_with("“你好 ") && current_context.ends_with('”'));
+        assert!(reuse_context.starts_with("「你好 ") && reuse_context.ends_with('」'));
+        assert!(placeholder_token::contains_reserved_prefix(reuse_context));
+        assert_eq!(task.groups()[1].units()[0].output_id(), None);
+        assert_eq!(task.groups()[2].units()[0].output_id(), Some(task_id(1)));
+        let message = render_generic_user_message(task, terminology.as_ref());
+        assert!(message.contains("[-] \"「你好 "));
+        assert!(!message.contains("{name}"));
+    }
+
+    #[test]
+    fn stable_source_packing_keeps_oversized_groups_and_renderer_keeps_full_content() {
         let temporary = tempfile::tempdir().expect("应该可建立临时目录");
         let source_root = temporary.path().join("source");
         fs::create_dir_all(&source_root).expect("应该可建立输入目录");
@@ -6735,16 +6903,7 @@ mod tests {
             .plan
             .tasks()
             .iter()
-            .map(|task| {
-                let message = render_generic_user_message(task, terminology.as_ref());
-                let characters = message.chars().count();
-                assert_eq!(task.estimated_characters(), characters);
-                assert!(
-                    characters <= target.get() || task.groups().len() == 1,
-                    "超过目标字符数的 Task 只能包含一个不可拆 Group"
-                );
-                message
-            })
+            .map(|task| render_generic_user_message(task, terminology.as_ref()))
             .collect::<Vec<_>>()
             .join("\n");
         assert!(rendered.contains("\\\""));
@@ -7173,7 +7332,12 @@ mod tests {
         .expect("同文应该合并为一个模型输出");
         assert_eq!(prepared.plan.tasks().len(), 1);
         let task = &prepared.plan.tasks()[0];
-        assert_eq!(task.expected_output_ids().collect::<Vec<_>>(), [1]);
+        assert_eq!(
+            task.expected_output_ids()
+                .map(TaskId::get)
+                .collect::<Vec<_>>(),
+            [1]
+        );
         let parsed = parse_translation_response(
             r#"{"1":"你好 {invented}"}"#,
             TranslationResponseEnvelope::JsonOnly,
@@ -7201,10 +7365,12 @@ mod tests {
             matches!(
                 problem,
                 crate::generic::ResponseProblem::InvalidDestination {
-                    output_id: 1,
+                    output_id,
                     key,
                     ..
-                } if key.group_id() == "target" && key.unit_id() == "unit"
+                } if *output_id == task_id(1)
+                    && key.group_id() == "target"
+                    && key.unit_id() == "unit"
             )
         }));
 
@@ -7258,10 +7424,12 @@ mod tests {
             "同 kind 目标仍应复用 Current"
         );
         assert_eq!(prepared.plan.tasks().len(), 1);
-        assert_eq!(prepared.plan.tasks()[0].groups()[0].kind(), "name");
+        assert_eq!(prepared.plan.tasks()[0].groups().len(), 3);
+        assert_eq!(prepared.plan.tasks()[0].groups()[2].kind(), "name");
         assert_eq!(
             prepared.plan.tasks()[0]
                 .expected_output_ids()
+                .map(TaskId::get)
                 .collect::<Vec<_>>(),
             [1],
             "复用失败的目标不能从同一次 Translate 消失"

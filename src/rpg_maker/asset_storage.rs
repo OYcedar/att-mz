@@ -9,6 +9,9 @@ use crate::rpg_maker::location_codec::{
     RpgMakerProjectionCodecError,
 };
 use crate::rpg_maker::model::{TextUnitContent, TextUnitRole};
+use crate::rpg_maker::semantic_order::{
+    RpgMakerSemanticOrderKey, RpgMakerSemanticOrderKeyDecodeError,
+};
 use crate::rpg_maker::text::{RpgMakerLocation, TextGroupKind};
 use crate::storage::sqlite::{SqliteRow, SqliteValue};
 
@@ -18,14 +21,14 @@ pub(crate) const RPG_MAKER_ASSET_OWNER_STATE_PROJECTION: &str =
 
 /// RPG Maker 文本组在各读取阶段共同消费的列顺序。
 pub(crate) const RPG_MAKER_TEXT_GROUP_CORE_PROJECTION: &str =
-    "group_location,\n    group_kind,\n    group_order";
+    "group_location,\n    group_kind,\n    semantic_order_key";
 
 /// RPG Maker 文本单元位置列；Translate 会在其后插入阶段特有的组事实。
 pub(crate) const RPG_MAKER_TEXT_UNIT_LOCATION_PROJECTION: &str = "unit.group_location";
 
 /// RPG Maker 文本单元在位置之后由各读取阶段共同消费的列顺序。
 pub(crate) const RPG_MAKER_TEXT_UNIT_CONTENT_PROJECTION: &str = "unit.unit_role,\n    \
-     unit.unit_order,\n    \
+     unit.semantic_order_key,\n    \
      unit.source_content_json,\n    \
      unit.source_context_json,\n    \
      unit.translation_content_json";
@@ -107,9 +110,9 @@ pub(crate) enum RpgMakerAssetStorageRowError {
         expected: &'static str,
         actual: &'static str,
     },
-    InvalidOrderValue {
+    InvalidSemanticOrderKey {
         column: &'static str,
-        actual: i64,
+        source: RpgMakerSemanticOrderKeyDecodeError,
     },
     UnknownOwner(String),
     UnknownGroupKind(String),
@@ -200,26 +203,6 @@ impl RpgMakerAssetStorageRowDecoder {
         }
     }
 
-    pub(crate) fn non_negative_order(
-        &mut self,
-        column: &'static str,
-    ) -> Result<usize, RpgMakerAssetStorageRowError> {
-        let value = match self.next() {
-            SqliteValue::Integer(value) => value,
-            actual => {
-                return Err(RpgMakerAssetStorageRowError::WrongColumnType {
-                    column,
-                    expected: "INTEGER",
-                    actual: actual.kind_name(),
-                });
-            }
-        };
-        usize::try_from(value).map_err(|_| RpgMakerAssetStorageRowError::InvalidOrderValue {
-            column,
-            actual: value,
-        })
-    }
-
     fn next(&mut self) -> SqliteValue {
         self.values
             .next()
@@ -254,7 +237,7 @@ pub(crate) struct RpgMakerTextGroupStorageRow {
     pub(crate) group_location: RpgMakerLocation,
     pub(crate) group_kind_raw: String,
     pub(crate) kind: TextGroupKind,
-    pub(crate) group_order: usize,
+    pub(crate) semantic_order_key: RpgMakerSemanticOrderKey,
 }
 
 impl RpgMakerTextGroupStorageRow {
@@ -268,13 +251,22 @@ impl RpgMakerTextGroupStorageRow {
         let kind = TextGroupKind::from_storage_name(group_kind_raw.as_str()).ok_or_else(|| {
             RpgMakerAssetStorageRowError::UnknownGroupKind(group_kind_raw.clone())
         })?;
-        let group_order = row.non_negative_order("group_order")?;
+        let semantic_order_key = row
+            .required_blob("semantic_order_key")
+            .and_then(|encoded| {
+                RpgMakerSemanticOrderKey::decode(&encoded).map_err(|source| {
+                    RpgMakerAssetStorageRowError::InvalidSemanticOrderKey {
+                        column: "semantic_order_key",
+                        source,
+                    }
+                })
+            })?;
         Ok(Self {
             group_location_raw,
             group_location,
             group_kind_raw,
             kind,
-            group_order,
+            semantic_order_key,
         })
     }
 }
@@ -302,7 +294,7 @@ pub(crate) struct RpgMakerTextUnitIdentityStorageRow {
     pub(crate) location: RpgMakerTextUnitLocationStorageRow,
     pub(crate) role_raw: String,
     pub(crate) role: TextUnitRole,
-    pub(crate) unit_order: usize,
+    pub(crate) semantic_order_key: RpgMakerSemanticOrderKey,
 }
 
 impl RpgMakerTextUnitIdentityStorageRow {
@@ -313,12 +305,21 @@ impl RpgMakerTextUnitIdentityStorageRow {
         let role_raw = row.required_text("unit_role")?;
         let role = RpgMakerProjectionCodec::decode_role(role_raw.as_str())
             .map_err(RpgMakerAssetStorageRowError::InvalidRole)?;
-        let unit_order = row.non_negative_order("unit_order")?;
+        let semantic_order_key = row
+            .required_blob("semantic_order_key")
+            .and_then(|encoded| {
+                RpgMakerSemanticOrderKey::decode(&encoded).map_err(|source| {
+                    RpgMakerAssetStorageRowError::InvalidSemanticOrderKey {
+                        column: "semantic_order_key",
+                        source,
+                    }
+                })
+            })?;
         Ok(Self {
             location,
             role_raw,
             role,
-            unit_order,
+            semantic_order_key,
         })
     }
 }
@@ -328,7 +329,7 @@ pub(crate) struct RpgMakerTextUnitStorageRow {
     pub(crate) group_location: RpgMakerLocation,
     pub(crate) role_raw: String,
     pub(crate) role: TextUnitRole,
-    pub(crate) unit_order: usize,
+    pub(crate) semantic_order_key: RpgMakerSemanticOrderKey,
     pub(crate) source_content_json: String,
     pub(crate) source_content: TextUnitContent,
     pub(crate) source_context_json: String,
@@ -361,14 +362,14 @@ impl RpgMakerTextUnitStorageRow {
                 },
             role_raw,
             role,
-            unit_order,
+            semantic_order_key,
         } = identity;
         Ok(Self {
             group_location_raw,
             group_location,
             role_raw,
             role,
-            unit_order,
+            semantic_order_key,
             source_content_json,
             source_content,
             source_context_json,
@@ -436,6 +437,8 @@ mod tests {
             ScalarFieldKey::new("name").expect("测试字段键应合法"),
         ))
         .expect("测试角色应编码");
+        let semantic_order_key = RpgMakerSemanticOrderKey::new(vec![1, 7], 2);
+        let semantic_order_key_blob = semantic_order_key.encode().expect("测试顺序键应编码");
         let source_content_json = r#""原文""#.to_owned();
         let source_context_json = "{}".to_owned();
         let location_pointer = location_raw.as_ptr();
@@ -445,7 +448,7 @@ mod tests {
             SqliteRow::new(vec![
                 SqliteValue::Text(location_raw),
                 SqliteValue::Text(role_raw),
-                SqliteValue::Integer(0),
+                SqliteValue::Blob(semantic_order_key_blob),
                 SqliteValue::Text(source_content_json),
                 SqliteValue::Text(source_context_json),
                 SqliteValue::Text(r#""译文""#.to_owned()),
@@ -459,6 +462,7 @@ mod tests {
         assert_eq!(decoded.group_location_raw.as_ptr(), location_pointer);
         assert_eq!(decoded.role_raw.as_ptr(), role_pointer);
         assert_eq!(decoded.source_content_json.as_ptr(), source_pointer);
+        assert_eq!(decoded.semantic_order_key, semantic_order_key);
         assert_eq!(decoded.source_content.as_value(), Some("原文"));
         assert_eq!(
             decoded

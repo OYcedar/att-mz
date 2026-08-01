@@ -3,6 +3,7 @@
 //! SQL 三表及各用例的行解码规则由相应的读写边界负责。
 
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
+use crate::rpg_maker::semantic_order::RpgMakerSemanticOrderKey;
 
 /// `att.rpg_maker.rpg_maker_text_snapshot` 域指纹的唯一 framing 定义。
 ///
@@ -26,38 +27,42 @@ impl RpgMakerTextSnapshotFingerprintBuilder {
         Self { hasher }
     }
 
-    /// 按持久化自然顺序写入一个文本组;`group_order` 为组在 owner 分区内的序号。
+    /// 按持久化自然顺序写入一个文本组。
     pub(crate) fn group(
         &mut self,
         group_location: &str,
-        group_order: usize,
+        semantic_order_key: &RpgMakerSemanticOrderKey,
         group_kind: &str,
         projection_recipes_json: &str,
     ) {
-        let group_order = u64::try_from(group_order).expect("group_order 必须可编码为 u64");
+        let semantic_order_key = semantic_order_key
+            .encode()
+            .expect("已经建立的语义顺序键必须可编码");
         self.hasher
             .frame(2, b"group")
             .frame(3, group_location.as_bytes())
-            .frame(16, &group_order.to_le_bytes())
+            .frame(16, &semantic_order_key)
             .frame(4, group_kind.as_bytes())
             .frame(5, projection_recipes_json.as_bytes());
     }
 
-    /// 按持久化自然顺序写入一个文本单元;`unit_order` 为单元在组内的序号。
+    /// 按持久化自然顺序写入一个文本单元。
     pub(crate) fn unit(
         &mut self,
         group_location: &str,
         unit_role: &str,
-        unit_order: usize,
+        semantic_order_key: &RpgMakerSemanticOrderKey,
         source_content_json: &str,
         source_context_json: &str,
     ) {
-        let unit_order = u64::try_from(unit_order).expect("unit_order 必须可编码为 u64");
+        let semantic_order_key = semantic_order_key
+            .encode()
+            .expect("已经建立的语义顺序键必须可编码");
         self.hasher
             .frame(6, b"unit")
             .frame(7, group_location.as_bytes())
             .frame(8, unit_role.as_bytes())
-            .frame(17, &unit_order.to_le_bytes())
+            .frame(17, &semantic_order_key)
             .frame(9, source_content_json.as_bytes())
             .frame(10, source_context_json.as_bytes());
     }

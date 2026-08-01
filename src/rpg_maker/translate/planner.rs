@@ -1,6 +1,6 @@
 //! RPG Maker 翻译任务规划：自然排序、语义范围、虚原文、术语和占位符。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 use std::convert::Infallible;
 use std::error::Error;
@@ -25,25 +25,31 @@ use crate::rpg_maker::RpgMakerEngine;
 use crate::rpg_maker::location_codec::{RpgMakerLocationCodec, RpgMakerProjectionCodec};
 use crate::rpg_maker::model::{TextUnitContent, TextUnitRole};
 use crate::rpg_maker::project::OpenedProject;
-use crate::rpg_maker::text::{DataFileName, MapId};
-use crate::rpg_maker::text::{
-    RpgMakerLocationStep, RpgMakerSource, StandardDataFile, TextGroupKind,
-};
+use crate::rpg_maker::semantic_order::{RpgMakerSemanticOrderKey, RpgMakerSemanticScopeKey};
+use crate::rpg_maker::text::{RpgMakerSource, StandardDataFile, TextGroupKind};
 use crate::storage::file_system::ReadFileError;
 use crate::translation::placeholder_projection::LanguageTextProjectionError;
+use crate::translation::task_planning::{
+    AssignedTaskBlock, StableGroupCharacters, TaskId, TaskPlanningError, TaskPlanningGroupLayout,
+    TaskPlanningLayout, TaskPlanningScopeLayout, UnitTaskResponsibility, assign_task_ids,
+    pack_complete_task_blocks,
+};
 
 use super::deduplication::{
     TranslationDeduplicationCandidate, TranslationDeduplicationOutcome,
     deduplicate_translation_candidates,
 };
+#[cfg(test)]
+use super::pipeline::RpgMakerTranslationGroup;
 use super::pipeline::{
     ExpectedLineShape, ExpectedTranslationOutput, ExpectedTranslationOutputContractError,
-    ExpectedTranslationValidation, RpgMakerTranslationCorpus, RpgMakerTranslationGroup,
-    RpgMakerTranslationInput, RpgMakerTranslationPlan, RpgMakerTranslationTaskIndex,
-    RpgMakerTranslationTaskPlanner, TerminologyDependency, TranslationInvalidation,
-    TranslationPlanPreparation, TranslationPlanPreparationCounts, TranslationPlanningFailure,
-    TranslationPlanningFailureReason, TranslationPropagationTarget, TranslationStateContext,
-    TranslationTaskBlock, TranslationUnitIdentity, TranslationVirtualReason,
+    ExpectedTranslationValidation, GroupContextFingerprint, RpgMakerExecutableTask,
+    RpgMakerTranslationCorpus, RpgMakerTranslationInput, RpgMakerTranslationPlan,
+    RpgMakerTranslationScope, RpgMakerTranslationTaskIndex, RpgMakerTranslationTaskPlanner,
+    TerminologyDependency, TranslationInvalidation, TranslationPlanPreparation,
+    TranslationPlanPreparationCounts, TranslationPlanningFailure, TranslationPlanningFailureReason,
+    TranslationPropagationTarget, TranslationStateContext, TranslationUnitIdentity,
+    TranslationVirtualReason,
 };
 use super::placeholder::{
     Pcre2PlaceholderService, PlaceholderProtectionError, PlaceholderRuleCompilationError,
@@ -52,8 +58,10 @@ use super::profile::{ResolvedRpgMakerTranslationResources, RpgMakerTranslationPr
 #[cfg(test)]
 use super::semantics::manual_translation_state_fingerprint;
 use super::semantics::{
-    ManualTranslationStateError, PreparedTranslationStatus, ResolvedTranslationSemanticError,
-    ResolvedTranslationSemantics, manual_translation_state_fingerprint_with_cancellation,
+    GroupContextFingerprintError, ManualTranslationStateError, PreparedTranslationStatus,
+    ResolvedTranslationSemanticError, ResolvedTranslationSemantics,
+    group_context_fingerprint_with_cancellation as shared_group_context_fingerprint_with_cancellation,
+    manual_translation_state_fingerprint_with_cancellation,
 };
 use crate::translation::planning_resource::{
     CompiledTerminology, PlaceholderDefinitionError, TerminologyDefinitionError,
@@ -94,7 +102,7 @@ impl<R, C, L> RpgMakerTranslationTaskPlanningService<R, C, L> {
 }
 
 struct ResolvedCorpusSemantics {
-    groups: Vec<RpgMakerTranslationGroup>,
+    scopes: Vec<RpgMakerTranslationScope>,
     snapshot_baseline: super::pipeline::TranslationSnapshotBaseline,
     terminology: Arc<CompiledTerminology>,
     terminology_json: String,
@@ -132,7 +140,7 @@ where
             );
         }
         let source_language = self.translation_resources.source_language();
-        let (groups, snapshot_baseline) = corpus.into_parts();
+        let (scopes, snapshot_baseline) = corpus.into_parts();
         let context_resources = Arc::clone(&self.translation_resources);
         let context_cancellation = self.cancellation.clone();
         let engine = project.layout().rpg_maker_layout().engine();
@@ -174,7 +182,7 @@ where
                     || ensure_planner_cpu_running(&context_cancellation),
                 )?;
                 Ok::<_, ()>((
-                    groups,
+                    scopes,
                     snapshot_baseline,
                     current_terminology_json,
                     current_placeholder_rules_json,
@@ -187,7 +195,7 @@ where
             .await
             .map_err(RpgMakerTranslationTaskPlanningError::PrepareResourcesCompute)?;
         let (
-            groups,
+            scopes,
             snapshot_baseline,
             current_terminology_json,
             current_placeholder_rules_json,
@@ -254,7 +262,7 @@ where
             global_semantics,
         ));
         Ok(ResolvedCorpusSemantics {
-            groups,
+            scopes,
             snapshot_baseline,
             terminology,
             terminology_json,
@@ -284,7 +292,7 @@ where
     ) -> Result<RpgMakerTranslationPlan, Self::Error> {
         let planning = profile.planning();
         let ResolvedCorpusSemantics {
-            groups,
+            scopes,
             snapshot_baseline,
             terminology,
             terminology_json,
@@ -300,7 +308,7 @@ where
             .cpu
             .execute({
                 let cancellation = self.cancellation.clone();
-                move || prepare_corpus_with_cancellation(groups, &cancellation)
+                move || prepare_corpus_with_cancellation(scopes, &cancellation)
             })
             .await
             .map_err(RpgMakerTranslationTaskPlanningError::PrepareCorpusCompute)?;
@@ -316,7 +324,38 @@ where
             }
         };
 
-        let target_user_message_characters = planning.target_user_message_characters().get();
+        let target_user_message_characters = planning.target_user_message_characters();
+        let stable_planning = self
+            .cpu
+            .execute({
+                let cancellation = self.cancellation.clone();
+                move || {
+                    let layout = task_planning_layout_with_cancellation(&prepared, &cancellation)?;
+                    let complete_plan = pack_complete_task_blocks(
+                        &layout,
+                        target_user_message_characters,
+                        &cancellation,
+                    )
+                    .map_err(ScopeTaskPlanningFailure::TaskPlanning)?;
+                    Ok::<_, ScopeTaskPlanningFailure>((prepared, complete_plan))
+                }
+            })
+            .await
+            .map_err(RpgMakerTranslationTaskPlanningError::PlanScopesCompute)?;
+        let (prepared, complete_plan) = match stable_planning {
+            Ok(planning) => planning,
+            Err(ScopeTaskPlanningFailure::Cancelled) => {
+                return Err(RpgMakerTranslationTaskPlanningError::PlanScopesCompute(
+                    CpuTaskExecutionError::Cancelled,
+                ));
+            }
+            Err(ScopeTaskPlanningFailure::TaskPlanning(source)) => {
+                return Err(RpgMakerTranslationTaskPlanningError::TaskPlanning(source));
+            }
+            Err(ScopeTaskPlanningFailure::InvalidContract(_)) => {
+                unreachable!("稳定装箱尚未建立模型输出契约")
+            }
+        };
         let scope_semantics = Arc::clone(&semantics);
         let scope_cancellation = self.cancellation.clone();
         let preprocessed_scopes = self
@@ -332,109 +371,141 @@ where
             .map_err(RpgMakerTranslationTaskPlanningError::PreprocessScopesCompute)?;
 
         let deduplication_cancellation = self.cancellation.clone();
-        let (scopes, invalidations, reuses, planning_failures, preparation_counts) = self
+        let (scopes, invalidations, reuses, planning_failures, preparation_counts, complete_plan) =
+            self.cpu
+                .execute(move || {
+                    match run_isolated_operation(
+                        "att-rpg-maker-deduplication",
+                        move || {
+                            let mut scopes = Vec::with_capacity(preprocessed_scopes.len());
+                            let mut planning_failures = Vec::new();
+                            let mut preprocessing_invalidations = Vec::new();
+                            let mut preprocessing_invalidated = 0;
+                            for (scope, result) in preprocessed_scopes {
+                                let result = result.map_err(|source| match source {
+                                    ScopePreprocessingFailure::Cancelled => {
+                                        GlobalPreparationFailure::Cancelled
+                                    }
+                                    ScopePreprocessingFailure::Invalid(source) => {
+                                        GlobalPreparationFailure::InvalidScopePreprocessing {
+                                            scope,
+                                            source,
+                                        }
+                                    }
+                                })?;
+                                planning_failures.extend(result.planning_failures);
+                                preprocessing_invalidations.extend(result.invalidations);
+                                preprocessing_invalidated += result.invalidated;
+                                scopes.push(result.scope);
+                            }
+                            let (candidates, positions, mut invalidations) =
+                                collect_deduplication_inputs(&scopes, &complete_plan);
+                            invalidations.extend(preprocessing_invalidations);
+                            let deduplicated = deduplicate_translation_candidates(candidates);
+                            let (outcomes, deduplication_invalidations, reuses) =
+                                deduplicated.into_parts();
+                            invalidations.extend(deduplication_invalidations);
+                            apply_deduplication_outcomes(&mut scopes, positions, outcomes);
+
+                            let retained = scopes
+                                .iter()
+                                .flat_map(|scope| &scope.groups)
+                                .flat_map(|group| &group.units)
+                                .filter_map(Option::as_ref)
+                                .filter(|unit| unit.current)
+                                .count();
+                            let not_applicable = scopes
+                                .iter()
+                                .flat_map(|scope| &scope.groups)
+                                .flat_map(|group| &group.units)
+                                .filter_map(Option::as_ref)
+                                .filter(|unit| unit.not_applicable)
+                                .count();
+                            let invalidated = scopes
+                                .iter()
+                                .flat_map(|scope| &scope.groups)
+                                .flat_map(|group| &group.units)
+                                .filter_map(Option::as_ref)
+                                .filter(|unit| unit.invalidated && !unit.not_applicable)
+                                .count()
+                                + preprocessing_invalidated;
+
+                            Ok::<_, GlobalPreparationFailure>((
+                                scopes,
+                                invalidations,
+                                reuses,
+                                planning_failures,
+                                TranslationPlanPreparationCounts::new(
+                                    retained,
+                                    invalidated,
+                                    not_applicable,
+                                ),
+                                complete_plan,
+                            ))
+                        },
+                        || ensure_planner_cpu_running(&deduplication_cancellation),
+                    ) {
+                        Ok(result) => result,
+                        Err(IsolatedOperationError::Cancelled(())) => {
+                            Err(GlobalPreparationFailure::Cancelled)
+                        }
+                        Err(IsolatedOperationError::Start { operation, source }) => {
+                            Err(GlobalPreparationFailure::StartWorker { operation, source })
+                        }
+                    }
+                })
+                .await
+                .map_err(RpgMakerTranslationTaskPlanningError::DeduplicateCompute)?
+                .map_err(|failure| match failure {
+                    GlobalPreparationFailure::InvalidScopePreprocessing { scope, source } => {
+                        RpgMakerTranslationTaskPlanningError::InvalidScopePreprocessing {
+                            scope,
+                            source,
+                        }
+                    }
+                    GlobalPreparationFailure::Cancelled => {
+                        RpgMakerTranslationTaskPlanningError::DeduplicateCompute(
+                            CpuTaskExecutionError::Cancelled,
+                        )
+                    }
+                    GlobalPreparationFailure::StartWorker { operation, source } => {
+                        RpgMakerTranslationTaskPlanningError::StartDeduplicationWorker {
+                            operation,
+                            source,
+                        }
+                    }
+                })?;
+
+        let assignment_cancellation = self.cancellation.clone();
+        let assigned = self
             .cpu
             .execute(move || {
-                match run_isolated_operation(
-                    "att-rpg-maker-deduplication",
-                    move || {
-                        let mut scopes = Vec::with_capacity(preprocessed_scopes.len());
-                        let mut planning_failures = Vec::new();
-                        let mut preprocessing_invalidations = Vec::new();
-                        let mut preprocessing_invalidated = 0;
-                        for (scope, result) in preprocessed_scopes {
-                            let result = result.map_err(|source| match source {
-                                ScopePreprocessingFailure::Cancelled => {
-                                    GlobalPreparationFailure::Cancelled
-                                }
-                                ScopePreprocessingFailure::Invalid(source) => {
-                                    GlobalPreparationFailure::InvalidScopePreprocessing {
-                                        scope,
-                                        source,
-                                    }
-                                }
-                            })?;
-                            planning_failures.extend(result.planning_failures);
-                            preprocessing_invalidations.extend(result.invalidations);
-                            preprocessing_invalidated += result.invalidated;
-                            scopes.push(result.scope);
-                        }
-                        let (candidates, positions, mut invalidations) =
-                            collect_deduplication_inputs(&scopes);
-                        invalidations.extend(preprocessing_invalidations);
-                        let deduplicated = deduplicate_translation_candidates(candidates);
-                        let (outcomes, deduplication_invalidations, reuses) =
-                            deduplicated.into_parts();
-                        invalidations.extend(deduplication_invalidations);
-                        apply_deduplication_outcomes(&mut scopes, positions, outcomes);
-
-                        let retained = scopes
-                            .iter()
-                            .flat_map(|scope| &scope.groups)
-                            .flat_map(|group| &group.units)
-                            .filter(|unit| unit.current)
-                            .count();
-                        let not_applicable = scopes
-                            .iter()
-                            .flat_map(|scope| &scope.groups)
-                            .flat_map(|group| &group.units)
-                            .filter(|unit| unit.not_applicable)
-                            .count();
-                        let invalidated = scopes
-                            .iter()
-                            .flat_map(|scope| &scope.groups)
-                            .flat_map(|group| &group.units)
-                            .filter(|unit| unit.invalidated && !unit.not_applicable)
-                            .count()
-                            + preprocessing_invalidated;
-
-                        Ok::<_, GlobalPreparationFailure>((
-                            scopes,
-                            invalidations,
-                            reuses,
-                            planning_failures,
-                            TranslationPlanPreparationCounts::new(
-                                retained,
-                                invalidated,
-                                not_applicable,
-                            ),
-                        ))
-                    },
-                    || ensure_planner_cpu_running(&deduplication_cancellation),
-                ) {
-                    Ok(result) => result,
-                    Err(IsolatedOperationError::Cancelled(())) => {
-                        Err(GlobalPreparationFailure::Cancelled)
-                    }
-                    Err(IsolatedOperationError::Start { operation, source }) => {
-                        Err(GlobalPreparationFailure::StartWorker { operation, source })
-                    }
-                }
+                assign_complete_task_plan(scopes, complete_plan, &assignment_cancellation)
             })
             .await
-            .map_err(RpgMakerTranslationTaskPlanningError::DeduplicateCompute)?
-            .map_err(|failure| match failure {
-                GlobalPreparationFailure::InvalidScopePreprocessing { scope, source } => {
-                    RpgMakerTranslationTaskPlanningError::InvalidScopePreprocessing {
-                        scope,
-                        source,
-                    }
-                }
-                GlobalPreparationFailure::Cancelled => {
-                    RpgMakerTranslationTaskPlanningError::DeduplicateCompute(
-                        CpuTaskExecutionError::Cancelled,
-                    )
-                }
-                GlobalPreparationFailure::StartWorker { operation, source } => {
-                    RpgMakerTranslationTaskPlanningError::StartDeduplicationWorker {
-                        operation,
-                        source,
-                    }
-                }
-            })?;
+            .map_err(RpgMakerTranslationTaskPlanningError::PlanScopesCompute)?;
+        let (scopes, assigned) = match assigned {
+            Ok(assigned) => assigned,
+            Err(ScopeTaskPlanningFailure::Cancelled) => {
+                return Err(RpgMakerTranslationTaskPlanningError::PlanScopesCompute(
+                    CpuTaskExecutionError::Cancelled,
+                ));
+            }
+            Err(ScopeTaskPlanningFailure::TaskPlanning(source)) if source.is_cancelled() => {
+                return Err(RpgMakerTranslationTaskPlanningError::PlanScopesCompute(
+                    CpuTaskExecutionError::Cancelled,
+                ));
+            }
+            Err(ScopeTaskPlanningFailure::TaskPlanning(source)) => {
+                return Err(RpgMakerTranslationTaskPlanningError::TaskPlanning(source));
+            }
+            Err(ScopeTaskPlanningFailure::InvalidContract(_)) => {
+                unreachable!("分配 Task ID 尚未建立模型输出契约")
+            }
+        };
 
-        // 术语提示词行只渲染一次。后续每个 Scope/Task 只按实际命中的稀疏下标取用，
-        // 不能再为了少数命中反复扫描整份术语表。
+        // 术语提示词行只渲染一次。每个实际发送块会合并完整 Group 范围中的全部命中，
+        // 再按术语文件自然顺序访问稀疏下标。
         let terminology_index_cancellation = self.cancellation.clone();
         let terminology_for_index = Arc::clone(&terminology);
         let terminology_prompt = self
@@ -454,24 +525,31 @@ where
                     CpuTaskExecutionError::Cancelled,
                 ));
             }
+            Err(ScopeTaskPlanningFailure::TaskPlanning(source)) => {
+                return Err(RpgMakerTranslationTaskPlanningError::TaskPlanning(source));
+            }
             Err(ScopeTaskPlanningFailure::InvalidContract(source)) => {
                 return Err(RpgMakerTranslationTaskPlanningError::InvalidOutputContract(
                     source,
                 ));
             }
         };
-        let scope_terminology_prompt = Arc::clone(&terminology_prompt);
-        let scope_system_markdown = Arc::new(system_markdown);
-        let scope_planning_cancellation = self.cancellation.clone();
-        let planned_scopes = self
+        let materialization_scopes = Arc::new(scopes);
+        let materialization_blocks = assigned.blocks_with_task_ids().cloned().collect::<Vec<_>>();
+        let materialization_terminology = Arc::clone(&terminology_prompt);
+        let materialization_system_markdown = Arc::new(system_markdown);
+        let materialization_semantics = Arc::clone(&semantics);
+        let materialization_cancellation = self.cancellation.clone();
+        let materialized_blocks = self
             .cpu
-            .execute_ordered_map(scopes, move |scope| {
-                build_scope_tasks(
-                    scope,
-                    Arc::clone(&scope_terminology_prompt),
-                    scope_system_markdown.as_str(),
-                    target_user_message_characters,
-                    &scope_planning_cancellation,
+            .execute_ordered_map(materialization_blocks, move |block| {
+                materialize_task_block(
+                    materialization_scopes.as_slice(),
+                    block,
+                    &materialization_terminology,
+                    &materialization_semantics,
+                    materialization_system_markdown.as_str(),
+                    &materialization_cancellation,
                 )
             })
             .await
@@ -484,12 +562,10 @@ where
                 ensure_planner_cpu_running(&finalization_cancellation)
                     .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
                 let mut tasks = Vec::new();
-                for planned_scope in planned_scopes {
+                for materialized in materialized_blocks {
                     ensure_planner_cpu_running(&finalization_cancellation)
                         .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-                    for task in planned_scope? {
-                        ensure_planner_cpu_running(&finalization_cancellation)
-                            .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
+                    if let Some(task) = materialized? {
                         let index = RpgMakerTranslationTaskIndex::new(tasks.len());
                         tasks.push(task.with_index(index, task_language_pair.clone()));
                     }
@@ -506,6 +582,9 @@ where
                 return Err(RpgMakerTranslationTaskPlanningError::FinalizePlanCompute(
                     CpuTaskExecutionError::Cancelled,
                 ));
+            }
+            Err(ScopeTaskPlanningFailure::TaskPlanning(source)) => {
+                return Err(RpgMakerTranslationTaskPlanningError::TaskPlanning(source));
             }
             Err(ScopeTaskPlanningFailure::InvalidContract(source)) => {
                 return Err(RpgMakerTranslationTaskPlanningError::InvalidOutputContract(
@@ -535,17 +614,19 @@ pub(super) struct PreparedCorpus {
 }
 
 pub(super) struct PreparedScope {
-    key: SemanticScopeKey,
+    key: RpgMakerSemanticScopeKey,
     groups: Vec<PreparedGroup>,
 }
 
 pub(super) struct PreparedGroup {
     kind: TextGroupKind,
+    semantic_order_key: RpgMakerSemanticOrderKey,
     assets: Vec<PreparedAsset>,
 }
 
 pub(super) struct PreparedAsset {
     identity: TranslationUnitIdentity,
+    semantic_order_key: RpgMakerSemanticOrderKey,
     translation: Option<TextUnitContent>,
     translation_state: Option<Sha256Fingerprint>,
 }
@@ -554,7 +635,9 @@ pub(super) struct PreparedAsset {
 pub(super) fn prepare_corpus(
     groups: Vec<RpgMakerTranslationGroup>,
 ) -> Result<PreparedCorpus, CorpusPlanningError> {
-    match prepare_corpus_with_cancellation(groups, &CooperativeCancellation::default()) {
+    let corpus = RpgMakerTranslationCorpus::new(groups);
+    let (scopes, _) = corpus.into_parts();
+    match prepare_corpus_with_cancellation(scopes, &CooperativeCancellation::default()) {
         Ok(prepared) => Ok(prepared),
         Err(PrepareCorpusFailure::Invalid(source)) => Err(source),
         Err(PrepareCorpusFailure::Cancelled) => {
@@ -564,113 +647,149 @@ pub(super) fn prepare_corpus(
 }
 
 fn prepare_corpus_with_cancellation(
-    groups: Vec<RpgMakerTranslationGroup>,
+    source_scopes: Vec<RpgMakerTranslationScope>,
     cancellation: &CooperativeCancellation,
 ) -> Result<PreparedCorpus, PrepareCorpusFailure> {
     ensure_planner_cpu_running(cancellation).map_err(|()| PrepareCorpusFailure::Cancelled)?;
-    let mut scopes = Vec::<PreparedScope>::new();
-    for group in groups {
+    let mut scopes = Vec::<PreparedScope>::with_capacity(source_scopes.len());
+    for scope in source_scopes {
         ensure_planner_cpu_running(cancellation).map_err(|()| PrepareCorpusFailure::Cancelled)?;
-        let scope = SemanticScopeKey::from_group(&group).map_err(PrepareCorpusFailure::Invalid)?;
-        ensure_planner_cpu_running(cancellation).map_err(|()| PrepareCorpusFailure::Cancelled)?;
-        let kind = group.kind();
-        let mut assets = Vec::new();
-        for asset in group.into_assets() {
+        let key = scope.key().clone();
+        let source_groups = scope.into_groups();
+        if source_groups.is_empty() {
+            return Err(PrepareCorpusFailure::Invalid(
+                CorpusPlanningError::EmptySemanticScope { scope: key },
+            ));
+        }
+        let mut groups = Vec::with_capacity(source_groups.len());
+        for group in source_groups {
             ensure_planner_cpu_running(cancellation)
                 .map_err(|()| PrepareCorpusFailure::Cancelled)?;
-            let (identity, translation, translation_state) = asset.into_parts();
-            assets.push(PreparedAsset {
-                identity,
-                translation,
-                translation_state,
+            let kind = group.kind();
+            let semantic_order_key = group.semantic_order_key().clone();
+            let source_assets = group.into_assets();
+            if source_assets.is_empty() {
+                return Err(PrepareCorpusFailure::Invalid(
+                    CorpusPlanningError::EmptyGroup {
+                        scope: key.clone(),
+                        kind,
+                    },
+                ));
+            }
+            let mut assets = Vec::with_capacity(source_assets.len());
+            for asset in source_assets {
+                ensure_planner_cpu_running(cancellation)
+                    .map_err(|()| PrepareCorpusFailure::Cancelled)?;
+                let (identity, semantic_order_key, translation, translation_state) =
+                    asset.into_parts();
+                assets.push(PreparedAsset {
+                    identity,
+                    semantic_order_key,
+                    translation,
+                    translation_state,
+                });
+            }
+            groups.push(PreparedGroup {
+                kind,
+                semantic_order_key,
+                assets,
             });
         }
-        let prepared_group = PreparedGroup { kind, assets };
-        if let Some(current_scope) = scopes.last_mut()
-            && current_scope.key == scope
-        {
-            current_scope.groups.push(prepared_group);
-        } else {
-            scopes.push(PreparedScope {
-                key: scope,
-                groups: vec![prepared_group],
-            });
-        }
+        scopes.push(PreparedScope { key, groups });
     }
     ensure_planner_cpu_running(cancellation).map_err(|()| PrepareCorpusFailure::Cancelled)?;
     Ok(PreparedCorpus { scopes })
 }
 
+fn task_planning_layout_with_cancellation(
+    corpus: &PreparedCorpus,
+    cancellation: &CooperativeCancellation,
+) -> Result<TaskPlanningLayout, ScopeTaskPlanningFailure> {
+    ensure_planner_cpu_running(cancellation).map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
+    let mut scopes = Vec::with_capacity(corpus.scopes.len());
+    for scope in &corpus.scopes {
+        ensure_planner_cpu_running(cancellation)
+            .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
+        let mut groups = Vec::with_capacity(scope.groups.len());
+        for group in &scope.groups {
+            ensure_planner_cpu_running(cancellation)
+                .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
+            let mut markdown = format!("## {}\n", human_group_kind(group.kind));
+            for asset in &group.assets {
+                ensure_planner_cpu_running(cancellation)
+                    .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
+                markdown.push('\n');
+                let source_text = task_content_text_with_cancellation(
+                    asset.identity.source_content(),
+                    cancellation,
+                )?;
+                render_task_unit_with_cancellation(
+                    &mut markdown,
+                    &asset.identity,
+                    asset.identity.role_label().as_str(),
+                    None,
+                    &source_text,
+                    cancellation,
+                )?;
+            }
+            let first_in_block =
+                planner_character_count_with_cancellation(&markdown, cancellation)?;
+            let following_in_block =
+                first_in_block
+                    .checked_add(1)
+                    .ok_or(ScopeTaskPlanningFailure::TaskPlanning(
+                        TaskPlanningError::CharacterCountOverflow,
+                    ))?;
+            groups.push(
+                TaskPlanningGroupLayout::new(
+                    group.assets.len(),
+                    StableGroupCharacters::new(first_in_block, following_in_block),
+                )
+                .map_err(ScopeTaskPlanningFailure::TaskPlanning)?,
+            );
+        }
+        scopes.push(
+            TaskPlanningScopeLayout::new(groups).map_err(ScopeTaskPlanningFailure::TaskPlanning)?,
+        );
+    }
+    TaskPlanningLayout::new(scopes).map_err(ScopeTaskPlanningFailure::TaskPlanning)
+}
+
+fn task_content_text_with_cancellation(
+    content: &TextUnitContent,
+    cancellation: &CooperativeCancellation,
+) -> Result<String, ScopeTaskPlanningFailure> {
+    match content {
+        TextUnitContent::Value(value) => clone_planner_text_with_cancellation(value, cancellation)
+            .map_err(|()| ScopeTaskPlanningFailure::Cancelled),
+        TextUnitContent::Lines(lines) => {
+            let mut capacity = lines.len().saturating_sub(1);
+            for line in lines {
+                ensure_planner_cpu_running(cancellation)
+                    .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
+                capacity = capacity.checked_add(line.len()).ok_or(
+                    ScopeTaskPlanningFailure::TaskPlanning(
+                        TaskPlanningError::CharacterCountOverflow,
+                    ),
+                )?;
+            }
+            let mut text = String::with_capacity(capacity);
+            for (index, line) in lines.iter().enumerate() {
+                ensure_planner_cpu_running(cancellation)
+                    .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
+                if index != 0 {
+                    text.push('\n');
+                }
+                append_planner_text_with_cancellation(&mut text, line, cancellation)?;
+            }
+            Ok(text)
+        }
+    }
+}
+
 enum PrepareCorpusFailure {
     Cancelled,
     Invalid(CorpusPlanningError),
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum SemanticScopeKey {
-    StandardDatabase(StandardDataFile),
-    DataFile(DataFileName),
-    System,
-    Map(MapId),
-    CommonEvent(usize),
-    Troop(usize),
-    Plugin {
-        plugin_index: usize,
-        plugin_name: String,
-    },
-}
-
-impl SemanticScopeKey {
-    fn from_group(group: &RpgMakerTranslationGroup) -> Result<Self, CorpusPlanningError> {
-        match group.group_location().source() {
-            RpgMakerSource::Data(StandardDataFile::System) => Ok(Self::System),
-            RpgMakerSource::Data(StandardDataFile::CommonEvents) => {
-                first_array_index(group).map(Self::CommonEvent)
-            }
-            RpgMakerSource::Data(StandardDataFile::Troops) => {
-                first_array_index(group).map(Self::Troop)
-            }
-            RpgMakerSource::Data(file) => Ok(Self::StandardDatabase(*file)),
-            RpgMakerSource::DataFile(file) => Ok(Self::DataFile(file.clone())),
-            RpgMakerSource::Map(map_id) => Ok(Self::Map(*map_id)),
-            RpgMakerSource::PluginParameter {
-                plugin_index,
-                plugin_name,
-                ..
-            } => Ok(Self::Plugin {
-                plugin_index: *plugin_index,
-                plugin_name: plugin_name.clone(),
-            }),
-        }
-    }
-}
-
-impl fmt::Display for SemanticScopeKey {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::StandardDatabase(file) => write!(formatter, "data/{}", file.file_name()),
-            Self::DataFile(file) => write!(formatter, "data/{file}"),
-            Self::System => formatter.write_str("data/System.json"),
-            Self::Map(map_id) => write!(formatter, "Map{:03}", map_id.get()),
-            Self::CommonEvent(event_id) => write!(formatter, "CommonEvent[{event_id}]"),
-            Self::Troop(troop_id) => write!(formatter, "Troop[{troop_id}]"),
-            Self::Plugin { plugin_name, .. } => write!(formatter, "Plugin[{plugin_name}]"),
-        }
-    }
-}
-
-fn first_array_index(group: &RpgMakerTranslationGroup) -> Result<usize, CorpusPlanningError> {
-    group
-        .group_location()
-        .steps()
-        .iter()
-        .find_map(|step| match step {
-            RpgMakerLocationStep::ArrayIndex(index) => Some(*index),
-            _ => None,
-        })
-        .ok_or_else(|| CorpusPlanningError::MissingSemanticIndex {
-            location: group.group_location().to_string(),
-        })
 }
 
 struct PreprocessedScope {
@@ -686,7 +805,11 @@ struct PreprocessedScopeResult {
 
 struct PreprocessedGroup {
     kind: TextGroupKind,
-    units: Vec<PreprocessedUnit>,
+    /// 完整 Group 内所有 Unit 实际命中的术语文件索引。
+    triggered_terms: Vec<usize>,
+    /// `None` 保留无法完成源文保护或语言投影的原始 Unit 槽位。
+    /// 完整装箱仍按 Extract 的 Unit 数量进行；最终包含该槽位的块不会发送。
+    units: Vec<Option<PreprocessedUnit>>,
 }
 
 struct PreprocessedUnit {
@@ -694,7 +817,6 @@ struct PreprocessedUnit {
     protected_text: String,
     placeholders: Vec<super::pipeline::AppliedPlaceholder>,
     language_analysis: LanguageAnalysis,
-    triggered_terms: Vec<usize>,
     translation: Option<TextUnitContent>,
     translation_state: Option<Sha256Fingerprint>,
     invalidated: bool,
@@ -728,7 +850,8 @@ fn preprocess_scope(
     for group in scope.groups {
         ensure_planner_cpu_running(cancellation)
             .map_err(|()| ScopePreprocessingFailure::Cancelled)?;
-        let mut units = Vec::with_capacity(group.assets.len());
+        let group_context = group_context_fingerprint_with_cancellation(&group, cancellation)?;
+        let mut prepared_assets = Vec::with_capacity(group.assets.len());
         for asset in group.assets {
             ensure_planner_cpu_running(cancellation)
                 .map_err(|()| ScopePreprocessingFailure::Cancelled)?;
@@ -751,17 +874,46 @@ fn preprocess_scope(
                         invalidated += 1;
                     }
                     planning_failures.push(TranslationPlanningFailure::new(asset.identity, reason));
+                    prepared_assets.push(None);
                     continue;
                 }
                 Err(()) => return Err(ScopePreprocessingFailure::Cancelled),
             };
+            prepared_assets.push(Some((asset, prepared)));
+        }
+
+        // 术语属于完整 Group：任一 Unit 命中的术语都必须进入该 Group 的全部自动状态，
+        // 并且按术语文件中的自然顺序只保留一次。
+        let mut group_terminology = BTreeMap::<usize, TerminologyDependency>::new();
+        for (_, prepared) in prepared_assets.iter().flatten() {
+            ensure_planner_cpu_running(cancellation)
+                .map_err(|()| ScopePreprocessingFailure::Cancelled)?;
+            debug_assert_eq!(prepared.term_indices().len(), prepared.terms().len());
+            for (&term_index, dependency) in prepared.term_indices().iter().zip(prepared.terms()) {
+                ensure_planner_cpu_running(cancellation)
+                    .map_err(|()| ScopePreprocessingFailure::Cancelled)?;
+                if let Some(existing) = group_terminology.get(&term_index) {
+                    debug_assert_eq!(existing, dependency);
+                } else {
+                    group_terminology.insert(term_index, dependency.clone());
+                }
+            }
+        }
+        let triggered_terms = group_terminology.keys().copied().collect::<Vec<_>>();
+        let terminology_dependencies = group_terminology.into_values().collect::<Vec<_>>();
+
+        let mut units = Vec::with_capacity(prepared_assets.len());
+        for prepared_asset in prepared_assets {
+            let Some((asset, prepared)) = prepared_asset else {
+                units.push(None);
+                continue;
+            };
             let protected_text = prepared.model_text().to_owned();
             let placeholders = prepared.placeholders().to_vec();
             let language_analysis = prepared.language_analysis().clone();
-            let triggered_terms = prepared.term_indices().to_vec();
-            let terminology_dependencies = prepared.terms().to_vec();
             let state_context = translation_state_context_with_cancellation(
                 semantics.global_fingerprint(),
+                group_context,
                 &asset.identity,
                 &protected_text,
                 &placeholders,
@@ -773,6 +925,7 @@ fn preprocess_scope(
             let manual_state = manual_translation_state_fingerprint_with_cancellation(
                 semantics.engine(),
                 semantics.language_pair(),
+                group_context,
                 &asset.identity,
                 &placeholders,
                 || ensure_planner_cpu_running(cancellation),
@@ -781,10 +934,10 @@ fn preprocess_scope(
             .map_err(|source| {
                 ScopePreprocessingFailure::Invalid(match source {
                     ManualTranslationStateError::EncodeLocation(source) => {
-                        ScopePreprocessingError::EncodeStateLocation(source)
+                        ScopePreprocessingError::StateLocation(source)
                     }
                     ManualTranslationStateError::EncodeRole(source) => {
-                        ScopePreprocessingError::EncodeStateRole(source)
+                        ScopePreprocessingError::StateRole(source)
                     }
                 })
             })?;
@@ -808,12 +961,11 @@ fn preprocess_scope(
                     reason: TranslationVirtualReason::FullyProtected,
                 },
             };
-            units.push(PreprocessedUnit {
+            units.push(Some(PreprocessedUnit {
                 identity: asset.identity,
                 protected_text,
                 placeholders,
                 language_analysis,
-                triggered_terms,
                 translation: asset.translation,
                 translation_state: asset.translation_state,
                 invalidated,
@@ -821,10 +973,11 @@ fn preprocess_scope(
                 current,
                 not_applicable,
                 responsibility,
-            });
+            }));
         }
         groups.push(PreprocessedGroup {
             kind: group.kind,
+            triggered_terms,
             units,
         });
     }
@@ -836,6 +989,34 @@ fn preprocess_scope(
     })
 }
 
+fn group_context_fingerprint_with_cancellation(
+    group: &PreparedGroup,
+    cancellation: &CooperativeCancellation,
+) -> Result<GroupContextFingerprint, ScopePreprocessingFailure> {
+    shared_group_context_fingerprint_with_cancellation(
+        group.kind,
+        &group.semantic_order_key,
+        group
+            .assets
+            .iter()
+            .map(|asset| (&asset.semantic_order_key, &asset.identity)),
+        || ensure_planner_cpu_running(cancellation),
+    )
+    .map_err(|()| ScopePreprocessingFailure::Cancelled)?
+    .map_err(|source| {
+        ScopePreprocessingFailure::Invalid(match source {
+            GroupContextFingerprintError::SemanticOrder(source) => {
+                ScopePreprocessingError::SemanticOrder(source)
+            }
+            GroupContextFingerprintError::Location(source) => {
+                ScopePreprocessingError::StateLocation(source)
+            }
+            GroupContextFingerprintError::Role(source) => {
+                ScopePreprocessingError::StateRole(source)
+            }
+        })
+    })
+}
 fn planning_failure_reason(
     source: ResolvedTranslationSemanticError,
 ) -> TranslationPlanningFailureReason {
@@ -925,35 +1106,6 @@ fn placeholder_projection_failure_detail(source: &LanguageTextProjectionError) -
     }
 }
 
-#[cfg(test)]
-fn semantic_text(content: &TextUnitContent) -> String {
-    match content {
-        TextUnitContent::Value(value) => value.clone(),
-        TextUnitContent::Lines(lines) => lines.join("\n"),
-    }
-}
-
-#[cfg(test)]
-fn context_text(unit: &PreparedUnit) -> String {
-    match &unit.responsibility {
-        PreparedUnitResponsibility::Virtual {
-            reason: TranslationVirtualReason::ExistingTranslation,
-        } => unit
-            .translation
-            .as_ref()
-            .map(semantic_text)
-            .unwrap_or_else(|| semantic_text(unit.identity.source_content())),
-        PreparedUnitResponsibility::Virtual {
-            reason: TranslationVirtualReason::Reused { translation, .. },
-        } => semantic_text(translation),
-        PreparedUnitResponsibility::Virtual { .. }
-        | PreparedUnitResponsibility::AwaitingDeduplication
-        | PreparedUnitResponsibility::Active { .. } => {
-            semantic_text(unit.identity.source_content())
-        }
-    }
-}
-
 fn ensure_planner_cpu_running(cancellation: &CooperativeCancellation) -> Result<(), ()> {
     if cancellation.is_requested() {
         Err(())
@@ -1017,12 +1169,16 @@ fn planner_character_count_with_cancellation(
     for chunk in text.as_bytes().chunks(CANCELLATION_CHECK_BYTES) {
         ensure_planner_cpu_running(cancellation)
             .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-        count = count.saturating_add(
-            chunk
-                .iter()
-                .filter(|byte| (**byte & 0b1100_0000) != 0b1000_0000)
-                .count(),
-        );
+        count = count
+            .checked_add(
+                chunk
+                    .iter()
+                    .filter(|byte| (**byte & 0b1100_0000) != 0b1000_0000)
+                    .count(),
+            )
+            .ok_or(ScopeTaskPlanningFailure::TaskPlanning(
+                TaskPlanningError::CharacterCountOverflow,
+            ))?;
     }
     ensure_planner_cpu_running(cancellation).map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
     Ok(count)
@@ -1088,8 +1244,29 @@ pub(crate) fn translation_state_context(
     placeholders: &[super::pipeline::AppliedPlaceholder],
     terminology: &[TerminologyDependency],
 ) -> Result<TranslationStateContext, ScopePreprocessingError> {
+    let group = PreparedGroup {
+        kind: identity.kind(),
+        semantic_order_key: RpgMakerSemanticOrderKey::new(Vec::new(), 0),
+        assets: vec![PreparedAsset {
+            identity: identity.clone(),
+            semantic_order_key: RpgMakerSemanticOrderKey::new(Vec::new(), 0),
+            translation: None,
+            translation_state: None,
+        }],
+    };
+    let group_context = match group_context_fingerprint_with_cancellation(
+        &group,
+        &CooperativeCancellation::default(),
+    ) {
+        Ok(fingerprint) => fingerprint,
+        Err(ScopePreprocessingFailure::Invalid(source)) => return Err(source),
+        Err(ScopePreprocessingFailure::Cancelled) => {
+            unreachable!("未请求取消的测试 Group 指纹不能取消")
+        }
+    };
     match translation_state_context_with_cancellation(
         global_semantics,
+        group_context,
         identity,
         protected_text,
         placeholders,
@@ -1106,6 +1283,7 @@ pub(crate) fn translation_state_context(
 /// 外层错误只表示取消；内层错误表示受信 Unit 身份不能编码。
 pub(crate) fn translation_state_context_with_cancellation<E>(
     global_semantics: Sha256Fingerprint,
+    group_context: GroupContextFingerprint,
     identity: &TranslationUnitIdentity,
     protected_text: &str,
     placeholders: &[super::pipeline::AppliedPlaceholder],
@@ -1116,50 +1294,51 @@ pub(crate) fn translation_state_context_with_cancellation<E>(
     let group_location = match RpgMakerLocationCodec::encode(identity.group_location()) {
         Ok(group_location) => group_location,
         Err(source) => {
-            return Ok(Err(ScopePreprocessingError::EncodeStateLocation(source)));
+            return Ok(Err(ScopePreprocessingError::StateLocation(source)));
         }
     };
     let role = match RpgMakerProjectionCodec::encode_role(identity.role()) {
         Ok(role) => role,
-        Err(source) => return Ok(Err(ScopePreprocessingError::EncodeStateRole(source))),
+        Err(source) => return Ok(Err(ScopePreprocessingError::StateRole(source))),
     };
     let chunk_size = NonZeroUsize::new(64 * 1024).expect("自动译文状态哈希取消检查块大小必须非零");
     let mut hasher = Sha256FramedHasher::new(b"att.rpg_maker.translation-unit-context");
     hasher
         .frame(1, global_semantics.as_bytes())
-        .frame(2, identity.owner().storage_name().as_bytes())
-        .frame(3, group_kind_name(identity.kind()));
+        .frame(2, group_context.as_fingerprint().as_bytes())
+        .frame(3, identity.owner().storage_name().as_bytes())
+        .frame(4, group_kind_name(identity.kind()));
     hasher.try_frame_chunks(
-        4,
+        5,
         group_location.as_bytes(),
         chunk_size,
         &mut ensure_running,
     )?;
-    hasher.try_frame_chunks(5, role.as_bytes(), chunk_size, &mut ensure_running)?;
+    hasher.try_frame_chunks(6, role.as_bytes(), chunk_size, &mut ensure_running)?;
     hasher.try_frame_chunks(
-        6,
+        7,
         identity.source_context_json().as_bytes(),
         chunk_size,
         &mut ensure_running,
     )?;
     match identity.source_content() {
         TextUnitContent::Value(value) => {
-            hasher.frame(7, b"value");
-            hasher.try_frame_chunks(8, value.as_bytes(), chunk_size, &mut ensure_running)?;
+            hasher.frame(8, b"value");
+            hasher.try_frame_chunks(9, value.as_bytes(), chunk_size, &mut ensure_running)?;
         }
         TextUnitContent::Lines(lines) => {
             let count = u64::try_from(lines.len())
                 .expect("源行数必须能表示为 u64")
                 .to_le_bytes();
-            hasher.frame(7, b"lines").frame(8, &count);
+            hasher.frame(8, b"lines").frame(9, &count);
             for line in lines {
                 ensure_running()?;
-                hasher.try_frame_chunks(9, line.as_bytes(), chunk_size, &mut ensure_running)?;
+                hasher.try_frame_chunks(10, line.as_bytes(), chunk_size, &mut ensure_running)?;
             }
         }
     }
     hasher.try_frame_chunks(
-        10,
+        11,
         protected_text.as_bytes(),
         chunk_size,
         &mut ensure_running,
@@ -1225,30 +1404,58 @@ type UnitPosition = (usize, usize, usize);
 
 fn collect_deduplication_inputs(
     scopes: &[PreprocessedScope],
+    complete_plan: &crate::translation::task_planning::CompleteTaskPlan,
 ) -> (
     Vec<TranslationDeduplicationCandidate>,
     Vec<UnitPosition>,
     Vec<TranslationInvalidation>,
 ) {
+    let mut model_representative_eligibility = vec![true; complete_plan.total_units()];
+    for block in complete_plan.blocks() {
+        let scope = scopes
+            .get(block.scope_index())
+            .expect("共享 Planner 的 Scope 索引必须来自当前完整语料");
+        let groups = scope
+            .groups
+            .get(block.group_range())
+            .expect("共享 Planner 的 Group 范围必须来自当前完整语料");
+        if groups
+            .iter()
+            .flat_map(|group| &group.units)
+            .any(Option::is_none)
+        {
+            model_representative_eligibility[block.unit_range()].fill(false);
+        }
+    }
     let mut candidates = Vec::new();
     let mut positions = Vec::new();
     let mut invalidations = Vec::new();
+    let mut global_unit_index = 0_usize;
     for (scope_index, scope) in scopes.iter().enumerate() {
         for (group_index, group) in scope.groups.iter().enumerate() {
             for (unit_index, unit) in group.units.iter().enumerate() {
+                let Some(unit) = unit.as_ref() else {
+                    global_unit_index += 1;
+                    continue;
+                };
                 if matches!(
                     unit.responsibility,
                     PreparedUnitResponsibility::AwaitingDeduplication
                 ) {
-                    candidates.push(TranslationDeduplicationCandidate::new(
-                        unit.identity.clone(),
-                        unit.protected_text.clone(),
-                        unit.placeholders.clone(),
-                        unit.translation.clone(),
-                        unit.translation_state,
-                        unit.state_context,
-                        unit.invalidated,
-                    ));
+                    candidates.push(
+                        TranslationDeduplicationCandidate::new(
+                            unit.identity.clone(),
+                            unit.protected_text.clone(),
+                            unit.placeholders.clone(),
+                            unit.translation.clone(),
+                            unit.translation_state,
+                            unit.state_context,
+                            unit.invalidated,
+                        )
+                        .with_model_representative_eligibility(
+                            model_representative_eligibility[global_unit_index],
+                        ),
+                    );
                     positions.push((scope_index, group_index, unit_index));
                 } else if unit.invalidated {
                     invalidations.push(TranslationInvalidation::new(
@@ -1260,9 +1467,15 @@ fn collect_deduplication_inputs(
                             .expect("已有译文必须同时具有 translation_state"),
                     ));
                 }
+                global_unit_index += 1;
             }
         }
     }
+    assert_eq!(
+        global_unit_index,
+        complete_plan.total_units(),
+        "共享 Planner 的完整 Unit 数必须与预处理语料一致"
+    );
     (candidates, positions, invalidations)
 }
 
@@ -1277,7 +1490,9 @@ fn apply_deduplication_outcomes(
         "全局去重必须为每个候选单元返回一个责任"
     );
     for ((scope_index, group_index, unit_index), outcome) in positions.into_iter().zip(outcomes) {
-        let unit = &mut scopes[scope_index].groups[group_index].units[unit_index];
+        let unit = scopes[scope_index].groups[group_index].units[unit_index]
+            .as_mut()
+            .expect("去重位置只能指向成功完成译前准备的 Unit");
         unit.responsibility = match outcome {
             TranslationDeduplicationOutcome::Active {
                 propagation_targets,
@@ -1291,108 +1506,216 @@ fn apply_deduplication_outcomes(
     }
 }
 
-#[derive(Clone)]
-struct PreparedTaskGroup {
-    kind: TextGroupKind,
-    units: Vec<PreparedUnit>,
-    triggered_terms: Vec<usize>,
-}
-
-#[derive(Clone)]
-struct PreparedUnit {
-    field_name: String,
-    identity: TranslationUnitIdentity,
-    protected_text: String,
-    translation: Option<TextUnitContent>,
-    placeholders: Vec<super::pipeline::AppliedPlaceholder>,
-    language_analysis: LanguageAnalysis,
-    triggered_terms: Vec<usize>,
-    state_context: TranslationStateContext,
-    responsibility: PreparedUnitResponsibility,
-}
-
-fn build_scope_tasks(
-    scope: PreprocessedScope,
-    terminology: Arc<TerminologyPromptIndex>,
-    system_markdown: &str,
-    target_user_message_characters: usize,
+fn assign_complete_task_plan(
+    scopes: Vec<PreprocessedScope>,
+    complete_plan: crate::translation::task_planning::CompleteTaskPlan,
     cancellation: &CooperativeCancellation,
-) -> Result<Vec<UnindexedTask>, ScopeTaskPlanningFailure> {
+) -> Result<
+    (
+        Vec<PreprocessedScope>,
+        crate::translation::task_planning::AssignedTaskPlan,
+    ),
+    ScopeTaskPlanningFailure,
+> {
     ensure_planner_cpu_running(cancellation).map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-    let mut prepared_groups = Vec::with_capacity(scope.groups.len());
-    for group in scope.groups {
-        ensure_planner_cpu_running(cancellation)
-            .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-        let mut units = Vec::with_capacity(group.units.len());
-        for unit in group.units {
-            ensure_planner_cpu_running(cancellation)
-                .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-            units.push(PreparedUnit {
-                field_name: unit.identity.role_label(),
-                identity: unit.identity,
-                protected_text: unit.protected_text,
-                translation: unit.translation,
-                placeholders: unit.placeholders,
-                language_analysis: unit.language_analysis,
-                triggered_terms: unit.triggered_terms,
-                state_context: unit.state_context,
-                responsibility: unit.responsibility,
-            });
-        }
-        let mut triggered_terms = BTreeSet::new();
-        for unit in units.iter().filter(|unit| {
-            matches!(
-                unit.responsibility,
-                PreparedUnitResponsibility::Active { .. }
-            )
-        }) {
-            ensure_planner_cpu_running(cancellation)
-                .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-            for term in &unit.triggered_terms {
+    let mut responsibilities = Vec::with_capacity(complete_plan.total_units());
+    for scope in &scopes {
+        for group in &scope.groups {
+            for unit in &group.units {
                 ensure_planner_cpu_running(cancellation)
                     .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-                triggered_terms.insert(*term);
+                responsibilities.push(match unit.as_ref().map(|unit| &unit.responsibility) {
+                    Some(PreparedUnitResponsibility::Active { .. }) => {
+                        UnitTaskResponsibility::ModelRepresentative
+                    }
+                    Some(PreparedUnitResponsibility::AwaitingDeduplication) => {
+                        unreachable!("分配 Task ID 前必须完成全局去重")
+                    }
+                    Some(PreparedUnitResponsibility::Virtual { .. }) | None => {
+                        UnitTaskResponsibility::Context
+                    }
+                });
             }
         }
-        prepared_groups.push(PreparedTaskGroup {
-            kind: group.kind,
-            units,
-            triggered_terms: triggered_terms.into_iter().collect(),
-        });
+    }
+    let assigned = assign_task_ids(complete_plan, &responsibilities, cancellation)
+        .map_err(ScopeTaskPlanningFailure::TaskPlanning)?;
+    Ok((scopes, assigned))
+}
+
+fn materialize_task_block(
+    scopes: &[PreprocessedScope],
+    block: AssignedTaskBlock,
+    terminology: &TerminologyPromptIndex,
+    semantics: &ResolvedTranslationSemantics,
+    system_markdown: &str,
+    cancellation: &CooperativeCancellation,
+) -> Result<Option<UnindexedTask>, ScopeTaskPlanningFailure> {
+    ensure_planner_cpu_running(cancellation).map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
+    let layout = block.layout();
+    let scope = scopes
+        .get(layout.scope_index())
+        .expect("共享 Planner 返回的 Scope 索引必须来自当前完整语料");
+    let group_range = layout.group_range();
+    let groups = scope
+        .groups
+        .get(group_range)
+        .expect("共享 Planner 返回的 Group 范围必须来自当前完整语料");
+
+    // 原文准备失败的 Unit 仍占据完整块中的原位置。它没有安全模型表示，因此整个块不发送。
+    if groups
+        .iter()
+        .flat_map(|group| &group.units)
+        .any(Option::is_none)
+    {
+        return Ok(None);
     }
 
-    pack_scope(
-        prepared_groups,
-        &terminology,
-        system_markdown,
-        target_user_message_characters,
+    let mut task_ids = block.unit_task_ids().iter().copied();
+    let mut selected_terms = BTreeSet::new();
+    let mut rendered_groups = Vec::with_capacity(groups.len());
+    for group in groups {
+        ensure_planner_cpu_running(cancellation)
+            .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
+        let mut markdown = format!("## {}\n", human_group_kind(group.kind));
+        let mut expected = Vec::new();
+        for term in &group.triggered_terms {
+            selected_terms.insert(*term);
+        }
+        for unit in &group.units {
+            ensure_planner_cpu_running(cancellation)
+                .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
+            let unit = unit.as_ref().expect("原文准备失败的完整块已在渲染前排除");
+            let task_id = task_ids
+                .next()
+                .expect("AssignedTaskBlock 的 Unit ID 槽必须覆盖完整块");
+            let display_text = if task_id.is_some() {
+                unit.protected_text.clone()
+            } else {
+                context_model_text_with_cancellation(unit, semantics, cancellation)?
+            };
+            markdown.push('\n');
+            render_task_unit_with_cancellation(
+                &mut markdown,
+                &unit.identity,
+                unit.identity.role_label().as_str(),
+                task_id,
+                &display_text,
+                cancellation,
+            )?;
+
+            let Some(task_id) = task_id else {
+                continue;
+            };
+            let PreparedUnitResponsibility::Active {
+                propagation_targets,
+            } = &unit.responsibility
+            else {
+                unreachable!("只有模型代表可以获得 Task ID")
+            };
+            expected.push(ExpectedBase {
+                id: task_id,
+                line_shape: expected_line_shape_with_cancellation(&unit.identity, cancellation)?,
+                identity: unit.identity.clone(),
+                propagation_targets: propagation_targets.clone(),
+                protected_text: unit.protected_text.clone(),
+                placeholders: unit.placeholders.clone(),
+                language_analysis: unit.language_analysis.clone(),
+                state_context: unit.state_context,
+            });
+        }
+        rendered_groups.push(RenderedGroup { markdown, expected });
+    }
+    assert!(
+        task_ids.next().is_none(),
+        "AssignedTaskBlock 不得包含超出完整块的 Unit ID 槽"
+    );
+
+    let user_markdown = render_user_markdown_with_cancellation(
+        &rendered_groups,
+        None,
+        terminology,
+        &selected_terms,
         cancellation,
-    )
-}
-
-/// 已经完成语义筛选、但尚未分配任务内 ID 的组。
-///
-/// Markdown 中只保存 ID 插入位置，切块阶段据此精确计算最终 user message 字符数；
-/// 最终任务确定后才渲染一次，从而避免任务边界上的整组克隆和重复字符串构造。
-struct PackedGroup {
-    markdown_template: String,
-    task_id_offsets: Vec<usize>,
-    markdown_characters_without_ids: usize,
-    expected: Vec<ExpectedBase>,
-    triggered_terms: Vec<usize>,
-}
-
-impl PackedGroup {
-    fn active_count(&self) -> usize {
-        self.task_id_offsets.len()
+    )?;
+    let mut expected_outputs = Vec::new();
+    for group in rendered_groups {
+        for expected in group.expected {
+            ensure_planner_cpu_running(cancellation)
+                .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
+            let mut propagation_targets = Vec::with_capacity(expected.propagation_targets.len());
+            let mut propagation_state_contexts =
+                Vec::with_capacity(expected.propagation_targets.len());
+            for target in expected.propagation_targets {
+                ensure_planner_cpu_running(cancellation)
+                    .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
+                propagation_targets.push(target.identity().clone());
+                propagation_state_contexts.push(target.state_context());
+            }
+            expected_outputs.push(
+                ExpectedTranslationOutput::try_new_with_cancellation(
+                    expected.id,
+                    expected.identity,
+                    propagation_targets,
+                    ExpectedTranslationValidation::new(
+                        expected.line_shape,
+                        expected.protected_text,
+                        expected.placeholders,
+                        expected.language_analysis,
+                    ),
+                    expected.state_context,
+                    propagation_state_contexts,
+                    || ensure_planner_cpu_running(cancellation),
+                )
+                .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?
+                .map_err(ScopeTaskPlanningFailure::InvalidContract)?,
+            );
+        }
     }
+    let system_markdown = clone_planner_text_with_cancellation(system_markdown, cancellation)
+        .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
+    Ok(Some(UnindexedTask {
+        messages: vec![
+            ChatMessage::new(ChatMessageRole::System, system_markdown),
+            ChatMessage::new(ChatMessageRole::User, user_markdown),
+        ],
+        expected_outputs,
+    }))
+}
 
-    fn markdown_characters(&self, first_active_id: usize) -> usize {
-        let id_characters = (0..self.active_count()).fold(0usize, |characters, offset| {
-            characters.saturating_add(decimal_characters(first_active_id.saturating_add(offset)))
-        });
-        self.markdown_characters_without_ids
-            .saturating_add(id_characters)
+fn context_model_text_with_cancellation(
+    unit: &PreprocessedUnit,
+    semantics: &ResolvedTranslationSemantics,
+    cancellation: &CooperativeCancellation,
+) -> Result<String, ScopeTaskPlanningFailure> {
+    let target = if unit.current {
+        unit.translation.as_ref()
+    } else {
+        match &unit.responsibility {
+            PreparedUnitResponsibility::Virtual {
+                reason: TranslationVirtualReason::ExistingTranslation,
+            } => unit.translation.as_ref(),
+            PreparedUnitResponsibility::Virtual {
+                reason: TranslationVirtualReason::Reused { translation, .. },
+            } => Some(translation),
+            PreparedUnitResponsibility::Virtual { .. }
+            | PreparedUnitResponsibility::AwaitingDeduplication
+            | PreparedUnitResponsibility::Active { .. } => None,
+        }
+    };
+    let Some(target) = target else {
+        return Ok(unit.protected_text.clone());
+    };
+    let projected = semantics
+        .prepare_content_with_cancellation(unit.identity.kind(), target, || {
+            ensure_planner_cpu_running(cancellation)
+        })
+        .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
+    match projected {
+        Ok(projected) if projected.placeholders() == unit.placeholders => {
+            Ok(projected.model_text().to_owned())
+        }
+        Ok(_) | Err(_) => Ok(unit.protected_text.clone()),
     }
 }
 
@@ -1402,7 +1725,7 @@ struct RenderedGroup {
 }
 
 struct ExpectedBase {
-    id: usize,
+    id: TaskId,
     line_shape: ExpectedLineShape,
     identity: TranslationUnitIdentity,
     propagation_targets: Vec<TranslationPropagationTarget>,
@@ -1412,278 +1735,73 @@ struct ExpectedBase {
     state_context: TranslationStateContext,
 }
 
-fn prepare_group(
-    seed: PreparedTaskGroup,
-    cancellation: &CooperativeCancellation,
-) -> Result<PackedGroup, ScopeTaskPlanningFailure> {
-    ensure_planner_cpu_running(cancellation).map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-    let mut expected = Vec::new();
-    let mut active_count = 0_usize;
-    for unit in &seed.units {
-        ensure_planner_cpu_running(cancellation)
-            .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-        active_count += usize::from(is_active_unit(unit));
+fn append_task_id_slot(markdown: &mut String, task_id: Option<TaskId>) {
+    markdown.push('[');
+    match task_id {
+        Some(task_id) => markdown.push_str(&task_id.to_string()),
+        None => markdown.push('-'),
     }
-    if active_count == 0 {
-        return Ok(PackedGroup {
-            markdown_template: String::new(),
-            task_id_offsets: Vec::new(),
-            markdown_characters_without_ids: 0,
-            expected,
-            triggered_terms: seed.triggered_terms,
-        });
-    }
-
-    let mut markdown = format!("## {}\n", human_group_kind(seed.kind));
-    let mut task_id_offsets = Vec::with_capacity(active_count);
-    let mut active_dialogue_body = false;
-    let mut active_database_value = false;
-    for unit in &seed.units {
-        ensure_planner_cpu_running(cancellation)
-            .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-        active_dialogue_body |=
-            is_active_unit(unit) && matches!(unit.identity.role(), TextUnitRole::DialogueBody);
-        active_database_value |= is_active_unit(unit)
-            && matches!(
-                unit.identity.role(),
-                TextUnitRole::Scalar(key) if key.as_str() != "name"
-            );
-    }
-
-    for unit in &seed.units {
-        ensure_planner_cpu_running(cancellation)
-            .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-        if is_useful_context(unit, seed.kind, active_dialogue_body, active_database_value) {
-            markdown.push('\n');
-            markdown.push_str(human_context_label(unit.identity.role()));
-            markdown.push(':');
-            append_context_text_with_cancellation(&mut markdown, unit, cancellation)?;
-            markdown.push('\n');
-        }
-    }
-
-    for unit in seed.units {
-        ensure_planner_cpu_running(cancellation)
-            .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-        if is_active_unit(&unit) {
-            markdown.push('\n');
-            render_active_unit_template(&mut markdown, &mut task_id_offsets, &unit, cancellation)?;
-            let line_shape = expected_line_shape_with_cancellation(&unit.identity, cancellation)?;
-            let PreparedUnitResponsibility::Active {
-                propagation_targets,
-            } = unit.responsibility
-            else {
-                unreachable!("已确认的活跃单元必须携带传播目标")
-            };
-            expected.push(ExpectedBase {
-                id: 0,
-                line_shape,
-                identity: unit.identity,
-                propagation_targets,
-                protected_text: unit.protected_text,
-                placeholders: unit.placeholders,
-                language_analysis: unit.language_analysis,
-                state_context: unit.state_context,
-            });
-        } else if matches!(
-            unit.responsibility,
-            PreparedUnitResponsibility::AwaitingDeduplication
-        ) {
-            unreachable!("任务切块前必须完成全局去重")
-        }
-    }
-
-    let markdown_characters_without_ids =
-        planner_character_count_with_cancellation(&markdown, cancellation)?;
-    Ok(PackedGroup {
-        markdown_template: markdown,
-        task_id_offsets,
-        markdown_characters_without_ids,
-        expected,
-        triggered_terms: seed.triggered_terms,
-    })
+    markdown.push(']');
 }
 
-fn render_group_with_cancellation(
-    group: PackedGroup,
-    first_active_id: usize,
-    cancellation: &CooperativeCancellation,
-) -> Result<RenderedGroup, ScopeTaskPlanningFailure> {
-    ensure_planner_cpu_running(cancellation).map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-    let final_characters = group.markdown_characters(first_active_id);
-    let mut markdown =
-        String::with_capacity(group.markdown_template.len().saturating_add(
-            final_characters.saturating_sub(group.markdown_characters_without_ids),
-        ));
-    let mut template_offset = 0usize;
-    for (task_offset, id_offset) in group.task_id_offsets.into_iter().enumerate() {
-        ensure_planner_cpu_running(cancellation)
-            .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-        append_planner_text_with_cancellation(
-            &mut markdown,
-            &group.markdown_template[template_offset..id_offset],
-            cancellation,
-        )?;
-        markdown.push_str(&first_active_id.saturating_add(task_offset).to_string());
-        template_offset = id_offset;
-    }
-    append_planner_text_with_cancellation(
-        &mut markdown,
-        &group.markdown_template[template_offset..],
-        cancellation,
-    )?;
-
-    let mut expected = Vec::with_capacity(group.expected.len());
-    for (offset, mut output) in group.expected.into_iter().enumerate() {
-        ensure_planner_cpu_running(cancellation)
-            .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-        output.id = first_active_id.saturating_add(offset);
-        expected.push(output);
-    }
-    Ok(RenderedGroup { markdown, expected })
-}
-
-fn decimal_characters(mut value: usize) -> usize {
-    let mut characters = 1usize;
-    while value >= 10 {
-        value /= 10;
-        characters += 1;
-    }
-    characters
-}
-
-fn is_active_unit(unit: &PreparedUnit) -> bool {
-    matches!(
-        unit.responsibility,
-        PreparedUnitResponsibility::Active { .. }
-    )
-}
-
-fn is_useful_context(
-    unit: &PreparedUnit,
-    kind: TextGroupKind,
-    active_dialogue_body: bool,
-    active_database_value: bool,
-) -> bool {
-    if !matches!(
-        unit.responsibility,
-        PreparedUnitResponsibility::Virtual { .. }
-    ) {
-        return false;
-    }
-    (kind == TextGroupKind::EventDialogue
-        && active_dialogue_body
-        && matches!(unit.identity.role(), TextUnitRole::DialogueSpeaker))
-        || (kind == TextGroupKind::DatabaseEntry
-            && active_database_value
-            && matches!(
-                unit.identity.role(),
-                TextUnitRole::Scalar(key) if key.as_str() == "name"
-            ))
-}
-
-fn append_context_text_with_cancellation(
-    output: &mut String,
-    unit: &PreparedUnit,
-    cancellation: &CooperativeCancellation,
-) -> Result<(), ScopeTaskPlanningFailure> {
-    let content = match &unit.responsibility {
-        PreparedUnitResponsibility::Virtual {
-            reason: TranslationVirtualReason::ExistingTranslation,
-        } => unit
-            .translation
-            .as_ref()
-            .unwrap_or_else(|| unit.identity.source_content()),
-        PreparedUnitResponsibility::Virtual {
-            reason: TranslationVirtualReason::Reused { translation, .. },
-        } => translation,
-        PreparedUnitResponsibility::Virtual { .. }
-        | PreparedUnitResponsibility::AwaitingDeduplication
-        | PreparedUnitResponsibility::Active { .. } => unit.identity.source_content(),
-    };
-    match content {
-        TextUnitContent::Value(value) => {
-            append_planner_text_with_cancellation(output, value, cancellation)
-        }
-        TextUnitContent::Lines(lines) => {
-            for (index, line) in lines.iter().enumerate() {
-                ensure_planner_cpu_running(cancellation)
-                    .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-                if index > 0 {
-                    output.push('\n');
-                }
-                append_planner_text_with_cancellation(output, line, cancellation)?;
-            }
-            Ok(())
-        }
-    }
-}
-
-fn human_context_label(role: &TextUnitRole) -> &'static str {
-    match role {
-        TextUnitRole::DialogueSpeaker => "Speaker",
-        TextUnitRole::Scalar(_) => "Name",
-        TextUnitRole::DialogueBody | TextUnitRole::Choices | TextUnitRole::ScrollingText => {
-            unreachable!("只有说话人和数据库名称可以作为无编号语境")
-        }
-    }
-}
-
-fn render_active_unit_template(
+/// 用同一种角色格式渲染模型代表和无编号语境。
+///
+/// 稳定装箱传入完整原文和 `None`；最终消息只改变 ID 槽和显示文本，不改变角色格式。
+fn render_task_unit_with_cancellation(
     markdown: &mut String,
-    task_id_offsets: &mut Vec<usize>,
-    unit: &PreparedUnit,
+    identity: &TranslationUnitIdentity,
+    field_name: &str,
+    task_id: Option<TaskId>,
+    text: &str,
     cancellation: &CooperativeCancellation,
 ) -> Result<(), ScopeTaskPlanningFailure> {
     ensure_planner_cpu_running(cancellation).map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-    match unit.identity.role() {
+    match identity.role() {
         TextUnitRole::DialogueSpeaker => {
-            markdown.push_str("Speaker [");
-            task_id_offsets.push(markdown.len());
-            markdown.push_str("] (single line):");
-            append_planner_text_with_cancellation(markdown, &unit.protected_text, cancellation)?;
+            markdown.push_str("Speaker ");
+            append_task_id_slot(markdown, task_id);
+            markdown.push_str(" (single line):");
+            append_planner_text_with_cancellation(markdown, text, cancellation)?;
             markdown.push('\n');
         }
         TextUnitRole::DialogueBody => {
-            markdown.push_str("Body [");
-            task_id_offsets.push(markdown.len());
-            markdown.push_str("] (free line breaking):\n\n");
-            push_blockquote_with_cancellation(markdown, &unit.protected_text, cancellation)?;
+            markdown.push_str("Body ");
+            append_task_id_slot(markdown, task_id);
+            markdown.push_str(" (free line breaking):\n\n");
+            push_blockquote_with_cancellation(markdown, text, cancellation)?;
         }
         TextUnitRole::Choices => {
-            let count = source_line_count(&unit.identity);
-            markdown.push_str("Choices [");
-            task_id_offsets.push(markdown.len());
-            markdown.push_str("] (");
-            markdown.push_str(&count.to_string());
+            markdown.push_str("Choices ");
+            append_task_id_slot(markdown, task_id);
+            markdown.push_str(" (");
+            markdown.push_str(&source_line_count(identity).to_string());
             markdown.push_str(" items, corresponding item by item):\n\n");
-            push_blockquote_with_cancellation(markdown, &unit.protected_text, cancellation)?;
+            push_blockquote_with_cancellation(markdown, text, cancellation)?;
         }
         TextUnitRole::ScrollingText => {
-            let count = source_line_count(&unit.identity);
-            markdown.push_str("Scrolling Text [");
-            task_id_offsets.push(markdown.len());
-            markdown.push_str("] (");
-            markdown.push_str(&count.to_string());
+            markdown.push_str("Scrolling Text ");
+            append_task_id_slot(markdown, task_id);
+            markdown.push_str(" (");
+            markdown.push_str(&source_line_count(identity).to_string());
             markdown.push_str(" lines, corresponding line by line):\n\n");
-            push_blockquote_with_cancellation(markdown, &unit.protected_text, cancellation)?;
+            push_blockquote_with_cancellation(markdown, text, cancellation)?;
         }
         TextUnitRole::Scalar(_)
-            if expected_line_shape_with_cancellation(&unit.identity, cancellation)?
+            if expected_line_shape_with_cancellation(identity, cancellation)?
                 == ExpectedLineShape::Reflow =>
         {
-            markdown.push_str(human_scalar_label(&unit.field_name));
-            markdown.push_str(" [");
-            task_id_offsets.push(markdown.len());
-            markdown.push_str("] (free line breaking):\n\n");
-            push_blockquote_with_cancellation(markdown, &unit.protected_text, cancellation)?;
+            markdown.push_str(human_scalar_label(field_name));
+            markdown.push(' ');
+            append_task_id_slot(markdown, task_id);
+            markdown.push_str(" (free line breaking):\n\n");
+            push_blockquote_with_cancellation(markdown, text, cancellation)?;
         }
         TextUnitRole::Scalar(_) => {
-            markdown.push_str(human_scalar_label(&unit.field_name));
-            markdown.push_str(" [");
-            task_id_offsets.push(markdown.len());
-            markdown.push_str("] (single line):");
-            append_planner_text_with_cancellation(markdown, &unit.protected_text, cancellation)?;
+            markdown.push_str(human_scalar_label(field_name));
+            markdown.push(' ');
+            append_task_id_slot(markdown, task_id);
+            markdown.push_str(" (single line):");
+            append_planner_text_with_cancellation(markdown, text, cancellation)?;
             markdown.push('\n');
         }
     }
@@ -1707,6 +1825,9 @@ pub(crate) fn expected_line_shape(identity: &TranslationUnitIdentity) -> Expecte
         Ok(shape) => shape,
         Err(ScopeTaskPlanningFailure::Cancelled) => {
             unreachable!("未请求取消的行形状判断不能取消")
+        }
+        Err(ScopeTaskPlanningFailure::TaskPlanning(_)) => {
+            unreachable!("行形状判断不执行 TaskBlock 规划")
         }
         Err(ScopeTaskPlanningFailure::InvalidContract(_)) => {
             unreachable!("行形状判断不验证输出契约")
@@ -1803,7 +1924,6 @@ struct TerminologyPromptIndex {
 
 struct TerminologyPromptLine {
     markdown: String,
-    characters: usize,
 }
 
 impl TerminologyPromptIndex {
@@ -1813,6 +1933,9 @@ impl TerminologyPromptIndex {
             Ok(index) => index,
             Err(ScopeTaskPlanningFailure::Cancelled) => {
                 unreachable!("未请求取消的术语索引构建不能取消")
+            }
+            Err(ScopeTaskPlanningFailure::TaskPlanning(_)) => {
+                unreachable!("术语索引构建不执行 TaskBlock 规划")
             }
             Err(ScopeTaskPlanningFailure::InvalidContract(_)) => {
                 unreachable!("术语索引构建不验证输出契约")
@@ -1838,19 +1961,11 @@ impl TerminologyPromptIndex {
                 cancellation,
             )?;
             markdown.push('\n');
-            let characters = planner_character_count_with_cancellation(&markdown, cancellation)?;
-            lines.push(TerminologyPromptLine {
-                markdown,
-                characters,
-            });
+            lines.push(TerminologyPromptLine { markdown });
         }
         ensure_planner_cpu_running(cancellation)
             .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
         Ok(Self { lines })
-    }
-
-    fn line_characters(&self, index: usize) -> usize {
-        self.lines[index].characters
     }
 
     /// 追加自然有序的稀疏命中，并返回实际访问的术语行数供复杂度测试观察。
@@ -1864,6 +1979,9 @@ impl TerminologyPromptIndex {
             Ok(visited) => visited,
             Err(ScopeTaskPlanningFailure::Cancelled) => {
                 unreachable!("未请求取消的术语渲染不能取消")
+            }
+            Err(ScopeTaskPlanningFailure::TaskPlanning(_)) => {
+                unreachable!("术语渲染不执行 TaskBlock 规划")
             }
             Err(ScopeTaskPlanningFailure::InvalidContract(_)) => {
                 unreachable!("术语渲染不验证输出契约")
@@ -1890,173 +2008,6 @@ impl TerminologyPromptIndex {
     }
 }
 
-fn pack_scope(
-    groups: Vec<PreparedTaskGroup>,
-    terminology: &TerminologyPromptIndex,
-    system_markdown: &str,
-    target_user_message_characters: usize,
-    cancellation: &CooperativeCancellation,
-) -> Result<Vec<UnindexedTask>, ScopeTaskPlanningFailure> {
-    ensure_planner_cpu_running(cancellation).map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-    let mut tasks = Vec::new();
-    let mut current_groups = Vec::<PackedGroup>::new();
-    let mut current_active = 0usize;
-    let mut current_terms = BTreeSet::new();
-    let mut current_user_message_characters = 0usize;
-
-    for seed in groups {
-        ensure_planner_cpu_running(cancellation)
-            .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-        let packed = prepare_group(seed, cancellation)?;
-        if packed.active_count() == 0 {
-            continue;
-        }
-        let (additional_term_count, additional_term_characters) =
-            additional_terminology_size_with_cancellation(
-                &packed.triggered_terms,
-                &current_terms,
-                terminology,
-                cancellation,
-            )?;
-        let candidate_user_message_characters = candidate_user_message_character_count(
-            current_user_message_characters,
-            !current_groups.is_empty(),
-            current_terms.len(),
-            additional_term_count,
-            additional_term_characters,
-            packed.markdown_characters(current_active + 1),
-        );
-        if candidate_user_message_characters <= target_user_message_characters {
-            current_active += packed.active_count();
-            current_terms.extend(packed.triggered_terms.iter().copied());
-            current_user_message_characters = candidate_user_message_characters;
-            current_groups.push(packed);
-            continue;
-        }
-
-        if current_active > 0 {
-            tasks.push(finalize_task(
-                std::mem::take(&mut current_groups),
-                terminology,
-                &current_terms,
-                system_markdown,
-                cancellation,
-            )?);
-        } else {
-            current_groups.clear();
-        }
-        current_terms.clear();
-
-        let (term_count, term_characters) = additional_terminology_size_with_cancellation(
-            &packed.triggered_terms,
-            &current_terms,
-            terminology,
-            cancellation,
-        )?;
-        let group_user_message_characters = candidate_user_message_character_count(
-            0,
-            false,
-            0,
-            term_count,
-            term_characters,
-            packed.markdown_characters(1),
-        );
-        current_active = packed.active_count();
-        current_terms.extend(packed.triggered_terms.iter().copied());
-        current_user_message_characters = group_user_message_characters;
-        current_groups.push(packed);
-        if current_user_message_characters > target_user_message_characters {
-            // 完整语义组可以自然超过装箱目标。立即完成可确保它独占任务，并让下一组
-            // 继续使用原目标；不能把本次实际长度反向提升为后续任务的新目标。
-            tasks.push(finalize_task(
-                std::mem::take(&mut current_groups),
-                terminology,
-                &current_terms,
-                system_markdown,
-                cancellation,
-            )?);
-            current_active = 0;
-            current_terms.clear();
-            current_user_message_characters = 0;
-        }
-    }
-
-    if current_active > 0 {
-        tasks.push(finalize_task(
-            current_groups,
-            terminology,
-            &current_terms,
-            system_markdown,
-            cancellation,
-        )?);
-    }
-    ensure_planner_cpu_running(cancellation).map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-    Ok(tasks)
-}
-
-fn additional_terminology_size_with_cancellation(
-    triggered_terms: &[usize],
-    current_terms: &BTreeSet<usize>,
-    terminology: &TerminologyPromptIndex,
-    cancellation: &CooperativeCancellation,
-) -> Result<(usize, usize), ScopeTaskPlanningFailure> {
-    let mut count = 0usize;
-    let mut characters = 0usize;
-    for &index in triggered_terms {
-        ensure_planner_cpu_running(cancellation)
-            .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-        if !current_terms.contains(&index) {
-            count += 1;
-            characters = characters.saturating_add(terminology.line_characters(index));
-        }
-    }
-    Ok((count, characters))
-}
-
-fn candidate_user_message_character_count(
-    current_characters: usize,
-    has_groups: bool,
-    current_term_count: usize,
-    additional_term_count: usize,
-    additional_term_characters: usize,
-    group_characters: usize,
-) -> usize {
-    let mut characters = current_characters;
-    if additional_term_count > 0 {
-        if current_term_count == 0 {
-            characters = characters.saturating_add("Terminology:\n\n".chars().count());
-            if has_groups {
-                // 术语区位于既有组之前，首次加入时会多出一个区段分隔换行。
-                characters = characters.saturating_add(1);
-            }
-        }
-        characters = characters.saturating_add(additional_term_characters);
-    }
-    if characters > 0 {
-        characters = characters.saturating_add(1);
-    }
-    characters.saturating_add(group_characters)
-}
-
-#[cfg(test)]
-fn terminology_line_character_count(
-    entry: &crate::translation::planning_resource::TerminologyEntry,
-) -> usize {
-    "- ".chars().count()
-        + markdown_literal_character_count(entry.term())
-        + " → ".chars().count()
-        + markdown_literal_character_count(entry.translation())
-        + 1
-}
-
-#[cfg(test)]
-fn markdown_literal_character_count(value: &str) -> usize {
-    value
-        .chars()
-        .map(|character| usize::from(character.is_ascii_punctuation()) + 1)
-        .sum()
-}
-
 #[cfg(test)]
 fn render_user_markdown(
     groups: &[RenderedGroup],
@@ -2074,6 +2025,9 @@ fn render_user_markdown(
         Ok(markdown) => markdown,
         Err(ScopeTaskPlanningFailure::Cancelled) => {
             unreachable!("未请求取消的用户消息渲染不能取消")
+        }
+        Err(ScopeTaskPlanningFailure::TaskPlanning(_)) => {
+            unreachable!("用户消息渲染不执行 TaskBlock 规划")
         }
         Err(ScopeTaskPlanningFailure::InvalidContract(_)) => {
             unreachable!("用户消息渲染不验证输出契约")
@@ -2128,6 +2082,9 @@ fn push_markdown_literal(markdown: &mut String, value: &str) {
         Err(ScopeTaskPlanningFailure::Cancelled) => {
             unreachable!("未请求取消的 Markdown 转义不能取消")
         }
+        Err(ScopeTaskPlanningFailure::TaskPlanning(_)) => {
+            unreachable!("Markdown 转义不执行 TaskBlock 规划")
+        }
         Err(ScopeTaskPlanningFailure::InvalidContract(_)) => {
             unreachable!("Markdown 转义不验证输出契约")
         }
@@ -2155,81 +2112,6 @@ fn push_markdown_literal_with_cancellation(
     ensure_planner_cpu_running(cancellation).map_err(|()| ScopeTaskPlanningFailure::Cancelled)
 }
 
-fn finalize_task(
-    groups: Vec<PackedGroup>,
-    terminology: &TerminologyPromptIndex,
-    selected_terms: &BTreeSet<usize>,
-    system_markdown: &str,
-    cancellation: &CooperativeCancellation,
-) -> Result<UnindexedTask, ScopeTaskPlanningFailure> {
-    ensure_planner_cpu_running(cancellation).map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-    let mut next_active_id = 1usize;
-    let mut rendered_groups = Vec::with_capacity(groups.len());
-    for group in groups {
-        ensure_planner_cpu_running(cancellation)
-            .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-        let active_count = group.active_count();
-        rendered_groups.push(render_group_with_cancellation(
-            group,
-            next_active_id,
-            cancellation,
-        )?);
-        next_active_id = next_active_id.saturating_add(active_count);
-    }
-    let user_markdown = render_user_markdown_with_cancellation(
-        &rendered_groups,
-        None,
-        terminology,
-        selected_terms,
-        cancellation,
-    )?;
-    let mut expected_outputs = Vec::new();
-    for group in rendered_groups {
-        ensure_planner_cpu_running(cancellation)
-            .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-        for expected in group.expected {
-            ensure_planner_cpu_running(cancellation)
-                .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-            let mut propagation_targets = Vec::with_capacity(expected.propagation_targets.len());
-            let mut propagation_state_contexts =
-                Vec::with_capacity(expected.propagation_targets.len());
-            for target in expected.propagation_targets {
-                ensure_planner_cpu_running(cancellation)
-                    .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-                propagation_targets.push(target.identity().clone());
-                propagation_state_contexts.push(target.state_context());
-            }
-            let output = ExpectedTranslationOutput::try_new_with_cancellation(
-                expected.id,
-                expected.identity,
-                propagation_targets,
-                ExpectedTranslationValidation::new(
-                    expected.line_shape,
-                    expected.protected_text,
-                    expected.placeholders,
-                    expected.language_analysis,
-                ),
-                expected.state_context,
-                propagation_state_contexts,
-                || ensure_planner_cpu_running(cancellation),
-            )
-            .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?
-            .map_err(ScopeTaskPlanningFailure::InvalidContract)?;
-            expected_outputs.push(output);
-        }
-    }
-    let system_markdown = clone_planner_text_with_cancellation(system_markdown, cancellation)
-        .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-    ensure_planner_cpu_running(cancellation).map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-    Ok(UnindexedTask {
-        messages: vec![
-            ChatMessage::new(ChatMessageRole::System, system_markdown),
-            ChatMessage::new(ChatMessageRole::User, user_markdown),
-        ],
-        expected_outputs,
-    })
-}
-
 struct UnindexedTask {
     messages: Vec<ChatMessage>,
     expected_outputs: Vec<ExpectedTranslationOutput>,
@@ -2240,8 +2122,8 @@ impl UnindexedTask {
         self,
         index: RpgMakerTranslationTaskIndex,
         language_pair: LanguagePair,
-    ) -> TranslationTaskBlock {
-        TranslationTaskBlock::new(index, language_pair, self.messages, self.expected_outputs)
+    ) -> RpgMakerExecutableTask {
+        RpgMakerExecutableTask::new(index, language_pair, self.messages, self.expected_outputs)
     }
 }
 
@@ -2269,13 +2151,14 @@ enum GlobalPreparationFailure {
         source: io::Error,
     },
     InvalidScopePreprocessing {
-        scope: SemanticScopeKey,
+        scope: RpgMakerSemanticScopeKey,
         source: ScopePreprocessingError,
     },
 }
 
 enum ScopeTaskPlanningFailure {
     Cancelled,
+    TaskPlanning(TaskPlanningError),
     InvalidContract(ExpectedTranslationOutputContractError),
 }
 
@@ -2307,7 +2190,7 @@ pub(crate) enum RpgMakerTranslationTaskPlanningError<R, C> {
     InvalidCorpus(CorpusPlanningError),
     PreprocessScopesCompute(CpuTaskExecutionError<C>),
     InvalidScopePreprocessing {
-        scope: SemanticScopeKey,
+        scope: RpgMakerSemanticScopeKey,
         source: ScopePreprocessingError,
     },
     DeduplicateCompute(CpuTaskExecutionError<C>),
@@ -2317,6 +2200,7 @@ pub(crate) enum RpgMakerTranslationTaskPlanningError<R, C> {
     },
     PlanScopesCompute(CpuTaskExecutionError<C>),
     FinalizePlanCompute(CpuTaskExecutionError<C>),
+    TaskPlanning(TaskPlanningError),
     InvalidOutputContract(ExpectedTranslationOutputContractError),
 }
 
@@ -2367,6 +2251,7 @@ impl<R: fmt::Display, C: fmt::Display> fmt::Display for RpgMakerTranslationTaskP
             Self::FinalizePlanCompute(source) => {
                 write!(formatter, "无法调度翻译任务最终编号：{source}")
             }
+            Self::TaskPlanning(source) => write!(formatter, "无法建立稳定 TaskBlock：{source}"),
             Self::InvalidOutputContract(source) => {
                 write!(formatter, "Planner 建立的模型输出契约无效：{source}")
             }
@@ -2389,6 +2274,7 @@ impl<R: Error + 'static, C: Error + 'static> Error for RpgMakerTranslationTaskPl
             Self::StartDeduplicationWorker { source, .. } => Some(source),
             Self::PlanScopesCompute(source) => Some(source),
             Self::FinalizePlanCompute(source) => Some(source),
+            Self::TaskPlanning(source) => Some(source),
             Self::InvalidOutputContract(source) => Some(source),
             Self::ResolvedLanguagePairMismatch { .. } => None,
         }
@@ -2444,19 +2330,17 @@ where
             Self::PrepareCorpusCompute(source) => {
                 planning_cpu_diagnostic(source, stage, impact, "prepare_translation_corpus", None)
             }
-            Self::InvalidCorpus(CorpusPlanningError::MissingSemanticIndex { location }) => {
-                SafeDiagnostic::new(
-                    DiagnosticCode::ProjectState,
-                    stage,
-                    DiagnosticSubject::operation("rpg_maker_translation_corpus"),
-                    DiagnosticReason::failure_with_detail(
-                        DiagnosticFailureKind::StateMismatch,
-                        format!("missing_semantic_index; location={location}"),
-                    ),
-                    impact,
-                    DiagnosticAction::CheckProjectState,
-                )
-            }
+            Self::InvalidCorpus(source) => SafeDiagnostic::new(
+                DiagnosticCode::ProjectState,
+                stage,
+                DiagnosticSubject::operation("rpg_maker_translation_corpus"),
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::StateMismatch,
+                    source.to_string(),
+                ),
+                impact,
+                DiagnosticAction::CheckProjectState,
+            ),
             Self::PreprocessScopesCompute(source) => planning_cpu_diagnostic(
                 source,
                 stage,
@@ -2505,6 +2389,29 @@ where
                 impact,
                 "finalize_translation_task_order",
                 None,
+            ),
+            Self::TaskPlanning(source) => SafeDiagnostic::new(
+                if source.is_cancelled() {
+                    DiagnosticCode::CommandInput
+                } else {
+                    DiagnosticCode::InternalOperation
+                },
+                stage,
+                DiagnosticSubject::operation("task_block_planning"),
+                DiagnosticReason::failure_with_detail(
+                    if source.is_cancelled() {
+                        DiagnosticFailureKind::LockCancelled
+                    } else {
+                        DiagnosticFailureKind::InternalInvariant
+                    },
+                    source.to_string(),
+                ),
+                impact,
+                if source.is_cancelled() {
+                    DiagnosticAction::Retry
+                } else {
+                    DiagnosticAction::ReportBug
+                },
             ),
             Self::InvalidOutputContract(source) => SafeDiagnostic::new(
                 DiagnosticCode::InternalOperation,
@@ -2578,7 +2485,7 @@ fn planning_cpu_diagnostic<C>(
     stage: DiagnosticStage,
     impact: DiagnosticImpact,
     operation: &'static str,
-    scope: Option<&SemanticScopeKey>,
+    scope: Option<&RpgMakerSemanticScopeKey>,
 ) -> SafeDiagnostic
 where
     CpuTaskExecutionError<C>: SafeDiagnosticSource,
@@ -2990,16 +2897,19 @@ fn placeholder_compilation_diagnostic(
 
 pub(crate) fn scope_preprocessing_detail(source: &ScopePreprocessingError) -> String {
     match source {
-        ScopePreprocessingError::EncodeStateLocation(source) => {
+        ScopePreprocessingError::StateLocation(source) => {
             format!(
                 "encode_translation_state_location: {}",
                 location_codec_detail(source)
             )
         }
-        ScopePreprocessingError::EncodeStateRole(source) => format!(
+        ScopePreprocessingError::StateRole(source) => format!(
             "encode_translation_state_role: {}",
             projection_codec_detail(source)
         ),
+        ScopePreprocessingError::SemanticOrder(source) => {
+            format!("encode_translation_semantic_order: {source}")
+        }
     }
 }
 
@@ -3047,15 +2957,15 @@ fn pcre2_error_kind(source: &pcre2::Error) -> &'static str {
     }
 }
 
-fn safe_scope_label(scope: &SemanticScopeKey) -> String {
+fn safe_scope_label(scope: &RpgMakerSemanticScopeKey) -> String {
     match scope {
-        SemanticScopeKey::StandardDatabase(file) => format!("data/{}", file.file_name()),
-        SemanticScopeKey::DataFile(file) => format!("data/{file}"),
-        SemanticScopeKey::System => "data/System.json".to_owned(),
-        SemanticScopeKey::Map(map_id) => format!("Map{:03}", map_id.get()),
-        SemanticScopeKey::CommonEvent(event_id) => format!("CommonEvent[{event_id}]"),
-        SemanticScopeKey::Troop(troop_id) => format!("Troop[{troop_id}]"),
-        SemanticScopeKey::Plugin { plugin_index, .. } => {
+        RpgMakerSemanticScopeKey::StandardDatabase(file) => format!("data/{}", file.file_name()),
+        RpgMakerSemanticScopeKey::DataFile(file) => format!("data/{file}"),
+        RpgMakerSemanticScopeKey::System => "data/System.json".to_owned(),
+        RpgMakerSemanticScopeKey::Map(map_id) => format!("Map{:03}", map_id.get()),
+        RpgMakerSemanticScopeKey::CommonEvent(event_id) => format!("CommonEvent[{event_id}]"),
+        RpgMakerSemanticScopeKey::Troop(troop_id) => format!("Troop[{troop_id}]"),
+        RpgMakerSemanticScopeKey::Plugin { plugin_index, .. } => {
             format!("Plugin[index={plugin_index}]")
         }
     }
@@ -3067,15 +2977,24 @@ fn usize_as_u64(value: usize) -> u64 {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CorpusPlanningError {
-    MissingSemanticIndex { location: String },
+    EmptySemanticScope {
+        scope: RpgMakerSemanticScopeKey,
+    },
+    EmptyGroup {
+        scope: RpgMakerSemanticScopeKey,
+        kind: TextGroupKind,
+    },
 }
 
 impl fmt::Display for CorpusPlanningError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingSemanticIndex { location } => {
-                write!(formatter, "CommonEvent/Troop 位置缺少对象索引：{location}")
-            }
+            Self::EmptySemanticScope { scope } => write!(formatter, "语义范围 {scope} 不得为空"),
+            Self::EmptyGroup { scope, kind } => write!(
+                formatter,
+                "语义范围 {scope} 中的 {} Group 不得为空",
+                kind.storage_name()
+            ),
         }
     }
 }
@@ -3084,17 +3003,21 @@ impl Error for CorpusPlanningError {}
 
 #[derive(Debug)]
 pub(crate) enum ScopePreprocessingError {
-    EncodeStateLocation(crate::rpg_maker::location_codec::RpgMakerLocationCodecError),
-    EncodeStateRole(crate::rpg_maker::location_codec::RpgMakerProjectionCodecError),
+    StateLocation(crate::rpg_maker::location_codec::RpgMakerLocationCodecError),
+    StateRole(crate::rpg_maker::location_codec::RpgMakerProjectionCodecError),
+    SemanticOrder(crate::rpg_maker::semantic_order::RpgMakerSemanticOrderKeyEncodeError),
 }
 
 impl fmt::Display for ScopePreprocessingError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EncodeStateLocation(source) => {
+            Self::StateLocation(source) => {
                 write!(formatter, "无法编码译文状态位置：{source}")
             }
-            Self::EncodeStateRole(source) => write!(formatter, "无法编码译文状态角色：{source}"),
+            Self::StateRole(source) => write!(formatter, "无法编码译文状态角色：{source}"),
+            Self::SemanticOrder(source) => {
+                write!(formatter, "无法编码 Group 语义顺序：{source}")
+            }
         }
     }
 }
@@ -3102,8 +3025,9 @@ impl fmt::Display for ScopePreprocessingError {
 impl Error for ScopePreprocessingError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::EncodeStateLocation(source) => Some(source),
-            Self::EncodeStateRole(source) => Some(source),
+            Self::StateLocation(source) => Some(source),
+            Self::StateRole(source) => Some(source),
+            Self::SemanticOrder(source) => Some(source),
         }
     }
 }
@@ -3136,6 +3060,10 @@ mod tests {
         TranslationPlanningResourceReadingService, TranslationPlanningResources,
     };
     use crate::translation::profile::TranslationRequestConfiguration;
+
+    fn task_id(value: usize) -> TaskId {
+        TaskId::new(value).expect("测试 Task ID 必须非零")
+    }
 
     #[derive(Clone, Copy)]
     struct ImmediateCpu;
@@ -3238,12 +3166,22 @@ mod tests {
             "语".repeat(80_000),
         )];
         let global = Sha256Fingerprint::from_bytes([0x6b; 32]);
-        let expected =
-            translation_state_context(global, &identity, &protected_text, &[], &terminology)
-                .expect("普通状态应可建立");
+        let group_context = GroupContextFingerprint::new(Sha256Fingerprint::from_bytes([0x4c; 32]));
+        let expected = translation_state_context_with_cancellation(
+            global,
+            group_context,
+            &identity,
+            &protected_text,
+            &[],
+            &terminology,
+            || Ok::<_, Infallible>(()),
+        )
+        .expect("测试不取消")
+        .expect("普通状态应可建立");
         let mut polls = 0_usize;
         let actual = translation_state_context_with_cancellation(
             global,
+            group_context,
             &identity,
             &protected_text,
             &[],
@@ -3261,6 +3199,7 @@ mod tests {
         let mut polls = 0_usize;
         let cancelled = translation_state_context_with_cancellation(
             global,
+            group_context,
             &identity,
             &protected_text,
             &[],
@@ -3271,6 +3210,125 @@ mod tests {
             },
         );
         assert!(matches!(cancelled, Err("cancelled")));
+    }
+
+    #[test]
+    fn group_context_fingerprint_tracks_complete_group_but_not_translation_state() {
+        let build = |owner: RpgMakerAssetOwner,
+                     group_order: u64,
+                     second_order: u64,
+                     second_source: &str,
+                     second_context: &str,
+                     with_translation: bool| {
+            let identity = |index, source: &str, context: &str| {
+                TranslationUnitIdentity::new(
+                    owner,
+                    TextGroupKind::DatabaseEntry,
+                    RpgMakerLocation::value(
+                        RpgMakerSource::data(StandardDataFile::Items),
+                        vec![RpgMakerLocationStep::index(index)],
+                    ),
+                    TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法")),
+                    TextUnitContent::Value(source.to_owned()),
+                    context,
+                )
+            };
+            PreparedGroup {
+                kind: TextGroupKind::DatabaseEntry,
+                semantic_order_key: RpgMakerSemanticOrderKey::new(vec![group_order], 0),
+                assets: vec![
+                    PreparedAsset {
+                        identity: identity(1, "第一项", "{}"),
+                        semantic_order_key: RpgMakerSemanticOrderKey::new(vec![1], 1),
+                        translation: with_translation
+                            .then(|| TextUnitContent::Value("译文一".to_owned())),
+                        translation_state: with_translation
+                            .then(|| Sha256Fingerprint::from_bytes([1; 32])),
+                    },
+                    PreparedAsset {
+                        identity: identity(2, second_source, second_context),
+                        semantic_order_key: RpgMakerSemanticOrderKey::new(vec![second_order], 1),
+                        translation: with_translation
+                            .then(|| TextUnitContent::Value("译文二".to_owned())),
+                        translation_state: with_translation
+                            .then(|| Sha256Fingerprint::from_bytes([2; 32])),
+                    },
+                ],
+            }
+        };
+        let fingerprint = |group: &PreparedGroup| {
+            group_context_fingerprint_with_cancellation(group, &CooperativeCancellation::default())
+                .expect("完整 Group 语境应可建立")
+        };
+
+        let base = fingerprint(&build(
+            RpgMakerAssetOwner::Builtin,
+            10,
+            2,
+            "第二项",
+            r#"{"speaker":"甲"}"#,
+            false,
+        ));
+        assert_eq!(
+            base,
+            fingerprint(&build(
+                RpgMakerAssetOwner::Builtin,
+                10,
+                2,
+                "第二项",
+                r#"{"speaker":"甲"}"#,
+                true,
+            )),
+            "目标译文和旧状态不能进入 Group 语境指纹"
+        );
+        for changed in [
+            build(
+                RpgMakerAssetOwner::Rules,
+                10,
+                2,
+                "第二项",
+                r#"{"speaker":"甲"}"#,
+                false,
+            ),
+            build(
+                RpgMakerAssetOwner::Builtin,
+                11,
+                2,
+                "第二项",
+                r#"{"speaker":"甲"}"#,
+                false,
+            ),
+            build(
+                RpgMakerAssetOwner::Builtin,
+                10,
+                3,
+                "第二项",
+                r#"{"speaker":"甲"}"#,
+                false,
+            ),
+            build(
+                RpgMakerAssetOwner::Builtin,
+                10,
+                2,
+                "改过的第二项",
+                r#"{"speaker":"甲"}"#,
+                false,
+            ),
+            build(
+                RpgMakerAssetOwner::Builtin,
+                10,
+                2,
+                "第二项",
+                r#"{"speaker":"乙"}"#,
+                false,
+            ),
+        ] {
+            assert_ne!(
+                base,
+                fingerprint(&changed),
+                "owner、Group/Unit 顺序、兄弟原文和 source context 都必须属于完整 Group 语境"
+            );
+        }
     }
 
     #[test]
@@ -3377,7 +3435,7 @@ mod tests {
         let error: ProductionPlanningError =
             RpgMakerTranslationTaskPlanningError::InvalidOutputContract(
                 ExpectedTranslationOutputContractError::placeholder_index_invalid(
-                    4,
+                    task_id(4),
                     &identity,
                     LanguageTextProjectionError::MissingToken {
                         token: sentinel.to_owned(),
@@ -3463,16 +3521,6 @@ mod tests {
         ] {
             assert_eq!(human_scalar_label(field_name), expected);
         }
-        assert_eq!(
-            human_context_label(&TextUnitRole::DialogueSpeaker),
-            "Speaker"
-        );
-        assert_eq!(
-            human_context_label(&TextUnitRole::Scalar(
-                ScalarFieldKey::new("name").expect("测试字段键应合法")
-            )),
-            "Name"
-        );
     }
 
     impl LlmClientSemanticIdentity for () {
@@ -3576,7 +3624,7 @@ mod tests {
         ))
     }
 
-    fn user_message(task: &TranslationTaskBlock) -> &str {
+    fn user_message(task: &RpgMakerExecutableTask) -> &str {
         task.messages()
             .iter()
             .find(|message| message.role() == ChatMessageRole::User)
@@ -3634,6 +3682,61 @@ mod tests {
         )
     }
 
+    fn manual_current_group(
+        source: RpgMakerSource,
+        object_index: usize,
+        original: &str,
+        translation: &str,
+        placeholder_definitions: Vec<super::super::placeholder::PlaceholderRuleDefinition>,
+    ) -> RpgMakerTranslationGroup {
+        let natural_index = u64::try_from(object_index).expect("测试对象索引必须可转成 u64");
+        let group_location =
+            RpgMakerLocation::value(source, vec![RpgMakerLocationStep::index(object_index)]);
+        let identity = TranslationUnitIdentity::new(
+            RpgMakerAssetOwner::Builtin,
+            TextGroupKind::DatabaseEntry,
+            group_location.clone(),
+            TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法")),
+            TextUnitContent::Value(original.to_owned()),
+            "{}",
+        );
+        let group_order = RpgMakerSemanticOrderKey::new(vec![natural_index], 0);
+        let unit_order = RpgMakerSemanticOrderKey::new(vec![natural_index], 1);
+        let semantics =
+            ResolvedTranslationSemantics::for_test_with_placeholders(placeholder_definitions);
+        let prepared = semantics
+            .prepare_content(identity.kind(), identity.source_content())
+            .expect("人工 Current 测试原文应可准备");
+        let group_context = shared_group_context_fingerprint_with_cancellation(
+            TextGroupKind::DatabaseEntry,
+            &group_order,
+            std::iter::once((&unit_order, &identity)),
+            || Ok::<_, Infallible>(()),
+        )
+        .expect("人工 Current 测试 Group 指纹不能取消")
+        .expect("人工 Current 测试 Group 指纹应可建立");
+        let translation_state = manual_translation_state_fingerprint(
+            semantics.engine(),
+            semantics.language_pair(),
+            group_context,
+            &identity,
+            prepared.placeholders(),
+        )
+        .expect("人工 Current 测试状态应可建立");
+
+        RpgMakerTranslationGroup::with_semantic_order_key(
+            TextGroupKind::DatabaseEntry,
+            group_location,
+            group_order,
+            vec![RpgMakerTranslationAsset::with_semantic_order_key(
+                identity,
+                unit_order,
+                Some(TextUnitContent::Value(translation.to_owned())),
+                Some(translation_state),
+            )],
+        )
+    }
+
     fn translation_state_for(
         identity: &TranslationUnitIdentity,
         original: &str,
@@ -3663,6 +3766,46 @@ mod tests {
             .finish(&TextUnitContent::Value(translation.to_owned()))
     }
 
+    fn translation_state_context_for_group(
+        global_semantics: Sha256Fingerprint,
+        group: &RpgMakerTranslationGroup,
+        identity: &TranslationUnitIdentity,
+        protected_text: &str,
+        placeholders: &[AppliedPlaceholder],
+        terminology: &[TerminologyDependency],
+    ) -> TranslationStateContext {
+        let prepared_group = PreparedGroup {
+            kind: group.kind(),
+            semantic_order_key: group.semantic_order_key().clone(),
+            assets: group
+                .assets()
+                .iter()
+                .map(|asset| PreparedAsset {
+                    identity: asset.identity().clone(),
+                    semantic_order_key: asset.semantic_order_key().clone(),
+                    translation: None,
+                    translation_state: None,
+                })
+                .collect(),
+        };
+        let group_context = group_context_fingerprint_with_cancellation(
+            &prepared_group,
+            &CooperativeCancellation::default(),
+        )
+        .expect("测试完整 Group 语境指纹应可建立");
+        translation_state_context_with_cancellation(
+            global_semantics,
+            group_context,
+            identity,
+            protected_text,
+            placeholders,
+            terminology,
+            || Ok::<_, Infallible>(()),
+        )
+        .expect("不取消的测试状态计算不能取消")
+        .expect("测试完整 Group 状态应可建立")
+    }
+
     #[test]
     fn matching_manual_state_stays_current_for_active_and_non_source_units() {
         for original in ["こんにちは", "已经是中文"] {
@@ -3682,19 +3825,32 @@ mod tests {
             let prepared = semantics
                 .prepare_content(identity.kind(), identity.source_content())
                 .expect("测试原文应可准备");
+            let group_order = RpgMakerSemanticOrderKey::new(vec![1], 0);
+            let unit_order = RpgMakerSemanticOrderKey::new(vec![1], 0);
+            let group_context = shared_group_context_fingerprint_with_cancellation(
+                TextGroupKind::DatabaseEntry,
+                &group_order,
+                std::iter::once((&unit_order, &identity)),
+                || Ok::<_, Infallible>(()),
+            )
+            .expect("测试 Group 指纹不能取消")
+            .expect("测试 Group 指纹应可建立");
             let state = manual_translation_state_fingerprint(
                 semantics.engine(),
                 semantics.language_pair(),
+                group_context,
                 &identity,
                 prepared.placeholders(),
             )
             .expect("人工状态应可建立");
             let scope = PreparedScope {
-                key: SemanticScopeKey::StandardDatabase(StandardDataFile::Actors),
+                key: RpgMakerSemanticScopeKey::StandardDatabase(StandardDataFile::Actors),
                 groups: vec![PreparedGroup {
                     kind: TextGroupKind::DatabaseEntry,
+                    semantic_order_key: group_order,
                     assets: vec![PreparedAsset {
                         identity,
+                        semantic_order_key: unit_order,
                         translation: Some(TextUnitContent::Value("人工译文".to_owned())),
                         translation_state: Some(state),
                     }],
@@ -3703,12 +3859,252 @@ mod tests {
 
             let result = preprocess_scope(scope, semantics, &CooperativeCancellation::default())
                 .expect("人工 Current 应可预处理");
-            let unit = &result.scope.groups[0].units[0];
+            let unit = result.scope.groups[0].units[0]
+                .as_ref()
+                .expect("人工 Current Unit 应完成译前准备");
             assert!(unit.current);
             assert!(!unit.invalidated);
             assert_eq!(result.invalidated, 0);
             assert!(result.invalidations.is_empty());
         }
+    }
+
+    #[test]
+    fn manual_current_tracks_sibling_source_but_ignores_sibling_translation() {
+        let semantics = Arc::new(ResolvedTranslationSemantics::for_test());
+        let group_location = RpgMakerLocation::value(
+            RpgMakerSource::map(1),
+            vec![
+                RpgMakerLocationStep::key("events"),
+                RpgMakerLocationStep::index(1),
+                RpgMakerLocationStep::key("pages"),
+                RpgMakerLocationStep::index(0),
+                RpgMakerLocationStep::key("list"),
+                RpgMakerLocationStep::index(0),
+            ],
+        );
+        let speaker = TranslationUnitIdentity::new(
+            RpgMakerAssetOwner::Builtin,
+            TextGroupKind::EventDialogue,
+            group_location.clone(),
+            TextUnitRole::DialogueSpeaker,
+            TextUnitContent::Value("先生".to_owned()),
+            r#"{"event":1}"#,
+        );
+        let body = |source: &str| {
+            TranslationUnitIdentity::new(
+                RpgMakerAssetOwner::Rules,
+                TextGroupKind::EventDialogue,
+                group_location.clone(),
+                TextUnitRole::DialogueBody,
+                TextUnitContent::Value(source.to_owned()),
+                r#"{"event":1}"#,
+            )
+        };
+        let group_order = RpgMakerSemanticOrderKey::new(vec![1, 1, 0], 0);
+        let speaker_order = RpgMakerSemanticOrderKey::new(vec![1, 1, 0], 1);
+        let body_order = RpgMakerSemanticOrderKey::new(vec![1, 1, 0], 2);
+        let original_body = body("こんにちは");
+        let group_context = shared_group_context_fingerprint_with_cancellation(
+            TextGroupKind::EventDialogue,
+            &group_order,
+            [(&speaker_order, &speaker), (&body_order, &original_body)].into_iter(),
+            || Ok::<_, Infallible>(()),
+        )
+        .expect("测试 Group 指纹不能取消")
+        .expect("测试 Group 指纹应可建立");
+        let prepared_speaker = semantics
+            .prepare_content(speaker.kind(), speaker.source_content())
+            .expect("测试说话者应可准备");
+        let speaker_state = manual_translation_state_fingerprint(
+            semantics.engine(),
+            semantics.language_pair(),
+            group_context,
+            &speaker,
+            prepared_speaker.placeholders(),
+        )
+        .expect("人工状态应可建立");
+        let scope = |body_source: &str, body_translation: Option<&str>| PreparedScope {
+            key: RpgMakerSemanticScopeKey::Map(
+                crate::rpg_maker::text::MapId::new(1).expect("测试 Map ID 应有效"),
+            ),
+            groups: vec![PreparedGroup {
+                kind: TextGroupKind::EventDialogue,
+                semantic_order_key: group_order.clone(),
+                assets: vec![
+                    PreparedAsset {
+                        identity: speaker.clone(),
+                        semantic_order_key: speaker_order.clone(),
+                        translation: Some(TextUnitContent::Value("老师".to_owned())),
+                        translation_state: Some(speaker_state),
+                    },
+                    PreparedAsset {
+                        identity: body(body_source),
+                        semantic_order_key: body_order.clone(),
+                        translation: body_translation
+                            .map(|value| TextUnitContent::Value(value.to_owned())),
+                        translation_state: body_translation
+                            .map(|_| Sha256Fingerprint::from_bytes([0x91; 32])),
+                    },
+                ],
+            }],
+        };
+
+        let translation_only = preprocess_scope(
+            scope("こんにちは", Some("你好")),
+            Arc::clone(&semantics),
+            &CooperativeCancellation::default(),
+        )
+        .expect("兄弟译文变化应可预处理");
+        assert!(
+            translation_only.scope.groups[0].units[0]
+                .as_ref()
+                .expect("说话者应完成准备")
+                .current,
+            "兄弟目标译文不能使人工译文失去 Current"
+        );
+
+        let source_changed = preprocess_scope(
+            scope("こんばんは", None),
+            semantics,
+            &CooperativeCancellation::default(),
+        )
+        .expect("兄弟原文变化应可预处理");
+        assert!(
+            !source_changed.scope.groups[0].units[0]
+                .as_ref()
+                .expect("说话者应完成准备")
+                .current,
+            "跨 owner 兄弟 Unit 的原文变化必须使人工译文失去 Current"
+        );
+    }
+
+    #[test]
+    fn automatic_current_tracks_sibling_source_and_order_but_ignores_sibling_translation() {
+        let semantics = Arc::new(ResolvedTranslationSemantics::for_test());
+        let group_location = RpgMakerLocation::value(
+            RpgMakerSource::map(1),
+            vec![
+                RpgMakerLocationStep::key("events"),
+                RpgMakerLocationStep::index(1),
+                RpgMakerLocationStep::key("pages"),
+                RpgMakerLocationStep::index(0),
+                RpgMakerLocationStep::key("list"),
+                RpgMakerLocationStep::index(0),
+            ],
+        );
+        let speaker = TranslationUnitIdentity::new(
+            RpgMakerAssetOwner::Builtin,
+            TextGroupKind::EventDialogue,
+            group_location.clone(),
+            TextUnitRole::DialogueSpeaker,
+            TextUnitContent::Value("先生".to_owned()),
+            r#"{"event":1}"#,
+        );
+        let body = |source: &str| {
+            TranslationUnitIdentity::new(
+                RpgMakerAssetOwner::Rules,
+                TextGroupKind::EventDialogue,
+                group_location.clone(),
+                TextUnitRole::DialogueBody,
+                TextUnitContent::Value(source.to_owned()),
+                r#"{"event":1}"#,
+            )
+        };
+        let group_order = RpgMakerSemanticOrderKey::new(vec![1, 1, 0], 0);
+        let speaker_order = RpgMakerSemanticOrderKey::new(vec![1, 1, 0], 1);
+        let original_body_order = RpgMakerSemanticOrderKey::new(vec![1, 1, 0], 2);
+        let original_body = body("こんにちは");
+        let group_context = shared_group_context_fingerprint_with_cancellation(
+            TextGroupKind::EventDialogue,
+            &group_order,
+            [
+                (&speaker_order, &speaker),
+                (&original_body_order, &original_body),
+            ]
+            .into_iter(),
+            || Ok::<_, Infallible>(()),
+        )
+        .expect("测试 Group 指纹不能取消")
+        .expect("测试 Group 指纹应可建立");
+        let prepared_speaker = semantics
+            .prepare_content(speaker.kind(), speaker.source_content())
+            .expect("测试说话者应可准备");
+        let speaker_translation = TextUnitContent::Value("老师".to_owned());
+        let speaker_state = translation_state_context_with_cancellation(
+            semantics.global_fingerprint(),
+            group_context,
+            &speaker,
+            prepared_speaker.model_text(),
+            prepared_speaker.placeholders(),
+            prepared_speaker.terms(),
+            || Ok::<_, Infallible>(()),
+        )
+        .expect("测试自动状态不能取消")
+        .expect("测试自动状态应可建立")
+        .finish(&speaker_translation);
+        let scope = |body_source: &str,
+                     body_order: RpgMakerSemanticOrderKey,
+                     body_translation: Option<&str>| PreparedScope {
+            key: RpgMakerSemanticScopeKey::Map(
+                crate::rpg_maker::text::MapId::new(1).expect("测试 Map ID 应有效"),
+            ),
+            groups: vec![PreparedGroup {
+                kind: TextGroupKind::EventDialogue,
+                semantic_order_key: group_order.clone(),
+                assets: vec![
+                    PreparedAsset {
+                        identity: speaker.clone(),
+                        semantic_order_key: speaker_order.clone(),
+                        translation: Some(speaker_translation.clone()),
+                        translation_state: Some(speaker_state),
+                    },
+                    PreparedAsset {
+                        identity: body(body_source),
+                        semantic_order_key: body_order,
+                        translation: body_translation
+                            .map(|value| TextUnitContent::Value(value.to_owned())),
+                        translation_state: body_translation
+                            .map(|_| Sha256Fingerprint::from_bytes([0x91; 32])),
+                    },
+                ],
+            }],
+        };
+        let speaker_is_current = |scope| {
+            preprocess_scope(
+                scope,
+                Arc::clone(&semantics),
+                &CooperativeCancellation::default(),
+            )
+            .expect("测试 Scope 应可预处理")
+            .scope
+            .groups[0]
+                .units[0]
+                .as_ref()
+                .expect("说话者应完成准备")
+                .current
+        };
+
+        assert!(
+            speaker_is_current(scope(
+                "こんにちは",
+                original_body_order.clone(),
+                Some("你好")
+            )),
+            "兄弟目标译文不能使自动译文失去 Current"
+        );
+        assert!(
+            !speaker_is_current(scope("こんばんは", original_body_order, None)),
+            "兄弟原文变化必须使自动译文失去 Current"
+        );
+        assert!(
+            !speaker_is_current(scope(
+                "こんにちは",
+                RpgMakerSemanticOrderKey::new(vec![1, 1, 0], 3),
+                None
+            )),
+            "兄弟顺序变化必须使自动译文失去 Current"
+        );
     }
 
     fn map_group(
@@ -3881,15 +4277,15 @@ mod tests {
         assert_eq!(prepared.scopes.len(), 3);
         assert!(matches!(
             &prepared.scopes[0].key,
-            SemanticScopeKey::StandardDatabase(StandardDataFile::Items)
+            RpgMakerSemanticScopeKey::StandardDatabase(StandardDataFile::Items)
         ));
         assert!(matches!(
             &prepared.scopes[1].key,
-            SemanticScopeKey::StandardDatabase(StandardDataFile::Actors)
+            RpgMakerSemanticScopeKey::StandardDatabase(StandardDataFile::Actors)
         ));
         assert!(matches!(
             &prepared.scopes[2].key,
-            SemanticScopeKey::StandardDatabase(StandardDataFile::Items)
+            RpgMakerSemanticScopeKey::StandardDatabase(StandardDataFile::Items)
         ));
     }
 
@@ -3953,7 +4349,7 @@ mod tests {
         );
         assert_eq!(preparation.invalidated(), 1);
         assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].expected_outputs()[0].id(), 1);
+        assert_eq!(tasks[0].expected_outputs()[0].id(), task_id(1));
         assert_eq!(
             tasks[0].expected_outputs()[0].applied_placeholders().len(),
             1
@@ -4283,7 +4679,7 @@ pattern = '\A<Help:(?<text>.*?)>\z'
                 .iter()
                 .map(ExpectedTranslationOutput::id)
                 .collect::<Vec<_>>(),
-            vec![1, 2, 3, 4, 5]
+            vec![task_id(1), task_id(2), task_id(3), task_id(4), task_id(5)]
         );
         assert_eq!(
             tasks[0]
@@ -4361,6 +4757,22 @@ pattern = '\A<Help:(?<text>.*?)>\z'
             TextUnitContent::Value("アリス".to_owned()),
             "{}",
         );
+        let body = TranslationUnitIdentity::new(
+            RpgMakerAssetOwner::Builtin,
+            TextGroupKind::EventDialogue,
+            group_location.clone(),
+            TextUnitRole::DialogueBody,
+            TextUnitContent::Lines(vec!["出かけましょう。".to_owned()]),
+            r#"{"source_speaker":"アリス"}"#,
+        );
+        let fingerprint_group = RpgMakerTranslationGroup::new(
+            TextGroupKind::EventDialogue,
+            group_location.clone(),
+            vec![
+                RpgMakerTranslationAsset::new(speaker.clone(), None, None),
+                RpgMakerTranslationAsset::new(body.clone(), None, None),
+            ],
+        );
         let (protected_speaker, bindings) = placeholders
             .protect(
                 RpgMakerEngine::Mz,
@@ -4379,18 +4791,15 @@ pattern = '\A<Help:(?<text>.*?)>\z'
             ().semantic_fingerprint(),
         );
         let speaker_translation = TextUnitContent::Value("爱丽丝".to_owned());
-        let speaker_state =
-            translation_state_context(global, &speaker, &protected_speaker, &bindings, &[])
-                .expect("说话人状态应可建立")
-                .finish(&speaker_translation);
-        let body = TranslationUnitIdentity::new(
-            RpgMakerAssetOwner::Builtin,
-            TextGroupKind::EventDialogue,
-            group_location.clone(),
-            TextUnitRole::DialogueBody,
-            TextUnitContent::Lines(vec!["出かけましょう。".to_owned()]),
-            r#"{"source_speaker":"アリス"}"#,
-        );
+        let speaker_state = translation_state_context_for_group(
+            global,
+            &fingerprint_group,
+            &speaker,
+            &protected_speaker,
+            &bindings,
+            &[],
+        )
+        .finish(&speaker_translation);
         let corpus = RpgMakerTranslationCorpus::new(vec![RpgMakerTranslationGroup::new(
             TextGroupKind::EventDialogue,
             group_location,
@@ -4423,75 +4832,370 @@ pattern = '\A<Help:(?<text>.*?)>\z'
 
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].expected_outputs().len(), 1);
-        assert_eq!(tasks[0].expected_outputs()[0].id(), 1);
+        assert_eq!(tasks[0].expected_outputs()[0].id(), task_id(1));
         let user = tasks[0].messages()[1].content();
-        assert!(user.contains("Speaker:爱丽丝"));
-        assert!(!user.contains("Speaker ["));
+        assert!(user.contains("Speaker [-] (single line):爱丽丝"));
         assert!(!user.contains("アリス"));
         assert!(user.contains("Body [1] (free line breaking):"));
     }
 
-    #[test]
-    fn reused_translation_is_preferred_over_source_for_virtual_context() {
+    #[tokio::test]
+    async fn context_only_group_keeps_terminology_and_placeholder_safe_target_text() {
+        let terminology_path = PathBuf::from("C:/input/terms.toml");
+        let placeholder_path = PathBuf::from("C:/input/placeholders.toml");
+        let reader = TranslationPlanningResourceReadingService::new(
+            MemoryFileReader {
+                files: Arc::new(BTreeMap::from([
+                    (
+                        terminology_path.clone(),
+                        r#"
+[[term]]
+term = "魔王"
+translation = "魔王（Demon King）"
+"#
+                        .as_bytes()
+                        .to_vec(),
+                    ),
+                    (
+                        placeholder_path.clone(),
+                        r#"
+[[rule]]
+scopes = ["database_entry"]
+pattern = '\{[^}]+\}'
+"#
+                        .as_bytes()
+                        .to_vec(),
+                    ),
+                ])),
+            },
+            ImmediateCpu,
+        );
+        let planner = RpgMakerTranslationTaskPlanningService::<_, _, ()>::new(
+            reader,
+            translation_resources(),
+            Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
+            ImmediateCpu,
+        );
+        let source = RpgMakerSource::data(StandardDataFile::Items);
+        let group_location =
+            RpgMakerLocation::value(source.clone(), vec![RpgMakerLocationStep::index(1)]);
+        let original = "魔王です {hero}";
+        let target = "已有上下文 {hero}";
         let identity = TranslationUnitIdentity::new(
             RpgMakerAssetOwner::Builtin,
-            TextGroupKind::EventDialogue,
-            RpgMakerLocation::value(RpgMakerSource::map(1), Vec::new()),
-            TextUnitRole::DialogueSpeaker,
-            TextUnitContent::Value("アリス".to_owned()),
+            TextGroupKind::DatabaseEntry,
+            group_location.clone(),
+            TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法")),
+            TextUnitContent::Value(original.to_owned()),
             "{}",
         );
-        let language_analysis = translation_resources()
-            .source_language()
-            .analyze_source(&crate::language::LanguageText::natural("アリス"));
-        let unit = PreparedUnit {
-            field_name: "speaker".to_owned(),
-            identity: identity.clone(),
-            protected_text: "アリス".to_owned(),
-            translation: None,
-            placeholders: Vec::new(),
-            language_analysis,
-            triggered_terms: Vec::new(),
-            state_context: TranslationStateContext::new(Sha256Fingerprint::from_bytes([7; 32])),
-            responsibility: PreparedUnitResponsibility::Virtual {
-                reason: TranslationVirtualReason::Reused {
-                    seed: Box::new(identity),
-                    translation: TextUnitContent::Value("爱丽丝".to_owned()),
-                },
-            },
-        };
+        let terminology = vec![TerminologyDependency::new("魔王", "魔王（Demon King）")];
+        let state = translation_state_for(
+            &identity,
+            original,
+            target,
+            &terminology,
+            vec![super::super::placeholder::PlaceholderRuleDefinition::new(
+                None,
+                r"\{[^}]+\}",
+            )],
+        );
+        let context_group = RpgMakerTranslationGroup::new(
+            TextGroupKind::DatabaseEntry,
+            group_location,
+            vec![RpgMakerTranslationAsset::new(
+                identity,
+                Some(TextUnitContent::Value(target.to_owned())),
+                Some(state),
+            )],
+        );
+        let active_group = group(source, 2, "こんにちは", None, Vec::new());
 
-        assert_eq!(context_text(&unit), "爱丽丝");
+        let (_, _, tasks) = planner
+            .plan(
+                &project(),
+                &profile(10_000),
+                RpgMakerTranslationCorpus::new(vec![context_group, active_group]),
+                RpgMakerTranslationInput::new(Some(terminology_path), Some(placeholder_path)),
+            )
+            .await
+            .expect("无 ID Group 仍应完成术语和 Placeholder 安全语境准备")
+            .into_parts();
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].expected_outputs().len(), 1);
+        let user = user_message(&tasks[0]);
+        assert_eq!(
+            user.matches("- 魔王 → 魔王（Demon King）").count(),
+            1,
+            "完整块术语应按文件顺序只提供一次"
+        );
+        assert!(user.contains("Name [-] (single line):已有上下文 ⟦ATT_"));
+        assert!(user.contains("Name [1] (single line):こんにちは"));
+        assert!(!user.contains("{hero}"));
     }
 
-    #[test]
-    fn virtual_context_without_translation_uses_source_instead_of_placeholder_protocol_text() {
-        let identity = TranslationUnitIdentity::new(
+    #[tokio::test]
+    async fn automatic_current_state_uses_terms_from_every_unit_in_its_complete_group() {
+        let terminology_path = PathBuf::from("C:/input/terms.toml");
+        let reader = TranslationPlanningResourceReadingService::new(
+            MemoryFileReader {
+                files: Arc::new(BTreeMap::from([(
+                    terminology_path.clone(),
+                    r#"
+[[term]]
+term = "魔王"
+translation = "Demon King"
+
+[[term]]
+term = "勇者"
+translation = "Hero"
+"#
+                    .as_bytes()
+                    .to_vec(),
+                )])),
+            },
+            ImmediateCpu,
+        );
+        let resources = translation_resources();
+        let placeholders = Pcre2PlaceholderService::new().expect("内置占位符应该可编译");
+        let custom = placeholders
+            .compile_custom(Vec::new())
+            .expect("空 Placeholder 规则应可编译");
+        let group_location = RpgMakerLocation::value(
+            RpgMakerSource::data(StandardDataFile::Actors),
+            vec![RpgMakerLocationStep::index(1)],
+        );
+        let group_order = RpgMakerSemanticOrderKey::new(vec![1], 0);
+        let first_order = RpgMakerSemanticOrderKey::new(vec![1], 1);
+        let second_order = RpgMakerSemanticOrderKey::new(vec![1], 2);
+        let first_identity = TranslationUnitIdentity::new(
             RpgMakerAssetOwner::Builtin,
-            TextGroupKind::EventDialogue,
-            RpgMakerLocation::value(RpgMakerSource::map(1), Vec::new()),
-            TextUnitRole::DialogueSpeaker,
-            TextUnitContent::Value("\\N[1]".to_owned()),
+            TextGroupKind::DatabaseEntry,
+            group_location.clone(),
+            TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法")),
+            TextUnitContent::Value("勇者です".to_owned()),
             "{}",
         );
-        let language_analysis = translation_resources()
-            .source_language()
-            .analyze_source(&crate::language::LanguageText::natural("角色"));
-        let unit = PreparedUnit {
-            field_name: "speaker".to_owned(),
-            identity,
-            protected_text: "⟦ATT_ACTOR_NAME_WHOLE_0000⟧".to_owned(),
-            translation: None,
-            placeholders: Vec::new(),
-            language_analysis,
-            triggered_terms: Vec::new(),
-            state_context: TranslationStateContext::new(Sha256Fingerprint::from_bytes([8; 32])),
-            responsibility: PreparedUnitResponsibility::Virtual {
-                reason: TranslationVirtualReason::FullyProtected,
-            },
-        };
+        let second_identity = TranslationUnitIdentity::new(
+            RpgMakerAssetOwner::Builtin,
+            TextGroupKind::DatabaseEntry,
+            group_location.clone(),
+            TextUnitRole::Scalar(ScalarFieldKey::new("description").expect("字段键应合法")),
+            TextUnitContent::Value("魔王です".to_owned()),
+            "{}",
+        );
+        let group_without_states = RpgMakerTranslationGroup::with_semantic_order_key(
+            TextGroupKind::DatabaseEntry,
+            group_location.clone(),
+            group_order.clone(),
+            vec![
+                RpgMakerTranslationAsset::with_semantic_order_key(
+                    first_identity.clone(),
+                    first_order.clone(),
+                    None,
+                    None,
+                ),
+                RpgMakerTranslationAsset::with_semantic_order_key(
+                    second_identity.clone(),
+                    second_order.clone(),
+                    None,
+                    None,
+                ),
+            ],
+        );
+        let group_terms = vec![
+            TerminologyDependency::new("魔王", "Demon King"),
+            TerminologyDependency::new("勇者", "Hero"),
+        ];
+        let global = global_translation_semantics(
+            RpgMakerEngine::Mz,
+            "ja",
+            "zh-Hans",
+            resources.source_language().semantic_fingerprint(),
+            resources.system_prompt().markdown(),
+            ().semantic_fingerprint(),
+        );
+        let first_translation = TextUnitContent::Value("勇者译文".to_owned());
+        let second_translation = TextUnitContent::Value("魔王译文".to_owned());
+        let first_prepared = placeholders
+            .protect(
+                RpgMakerEngine::Mz,
+                TextGroupKind::DatabaseEntry,
+                "勇者です",
+                &custom,
+            )
+            .expect("第一项原文应可保护");
+        let (first_protected, first_bindings) = first_prepared.into_parts();
+        let second_prepared = placeholders
+            .protect(
+                RpgMakerEngine::Mz,
+                TextGroupKind::DatabaseEntry,
+                "魔王です",
+                &custom,
+            )
+            .expect("第二项原文应可保护");
+        let (second_protected, second_bindings) = second_prepared.into_parts();
+        let first_state = translation_state_context_for_group(
+            global,
+            &group_without_states,
+            &first_identity,
+            &first_protected,
+            &first_bindings,
+            &group_terms,
+        )
+        .finish(&first_translation);
+        let second_state = translation_state_context_for_group(
+            global,
+            &group_without_states,
+            &second_identity,
+            &second_protected,
+            &second_bindings,
+            &group_terms,
+        )
+        .finish(&second_translation);
+        let group = RpgMakerTranslationGroup::with_semantic_order_key(
+            TextGroupKind::DatabaseEntry,
+            group_location,
+            group_order,
+            vec![
+                RpgMakerTranslationAsset::with_semantic_order_key(
+                    first_identity,
+                    first_order,
+                    Some(first_translation),
+                    Some(first_state),
+                ),
+                RpgMakerTranslationAsset::with_semantic_order_key(
+                    second_identity,
+                    second_order,
+                    Some(second_translation),
+                    Some(second_state),
+                ),
+            ],
+        );
+        let planner = RpgMakerTranslationTaskPlanningService::<_, _, ()>::new(
+            reader,
+            resources,
+            placeholders,
+            ImmediateCpu,
+        );
 
-        assert_eq!(context_text(&unit), "\\N[1]");
+        let (_, preparation, tasks) = planner
+            .plan(
+                &project(),
+                &profile(10_000),
+                RpgMakerTranslationCorpus::new(vec![group]),
+                RpgMakerTranslationInput::new(Some(terminology_path), None),
+            )
+            .await
+            .expect("完整 Group 的两项自动译文都应保持 Current")
+            .into_parts();
+
+        assert_eq!(preparation.invalidated(), 0);
+        assert!(preparation.invalidations().is_empty());
+        assert!(tasks.is_empty(), "全部 Current 的完整块不得进入翻译流水线");
+    }
+
+    #[tokio::test]
+    async fn manual_current_non_source_and_fully_protected_units_use_safe_target_context() {
+        let placeholder_path = PathBuf::from("C:/input/placeholders.toml");
+        let placeholder_toml = r#"
+[[rule]]
+scopes = ["database_entry"]
+pattern = '\{[^}]+\}'
+
+[[rule]]
+scopes = ["database_entry"]
+pattern = '保護対象'
+"#;
+        let definitions = vec![
+            super::super::placeholder::PlaceholderRuleDefinition::new(
+                Some(vec!["database_entry".to_owned()]),
+                r"\{[^}]+\}",
+            ),
+            super::super::placeholder::PlaceholderRuleDefinition::new(
+                Some(vec!["database_entry".to_owned()]),
+                "保護対象",
+            ),
+        ];
+        let semantics =
+            ResolvedTranslationSemantics::for_test_with_placeholders(definitions.clone());
+        assert_eq!(
+            semantics
+                .prepare_content(
+                    TextGroupKind::DatabaseEntry,
+                    &TextUnitContent::Value("12345 {hero}".to_owned()),
+                )
+                .expect("非源语原文应可准备")
+                .status(),
+            PreparedTranslationStatus::NonSourceLanguage,
+        );
+        assert_eq!(
+            semantics
+                .prepare_content(
+                    TextGroupKind::DatabaseEntry,
+                    &TextUnitContent::Value("保護対象".to_owned()),
+                )
+                .expect("完全保护原文应可准备")
+                .status(),
+            PreparedTranslationStatus::FullyProtected,
+        );
+
+        let reader = TranslationPlanningResourceReadingService::new(
+            MemoryFileReader {
+                files: Arc::new(BTreeMap::from([(
+                    placeholder_path.clone(),
+                    placeholder_toml.as_bytes().to_vec(),
+                )])),
+            },
+            ImmediateCpu,
+        );
+        let planner = RpgMakerTranslationTaskPlanningService::<_, _, ()>::new(
+            reader,
+            translation_resources(),
+            Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
+            ImmediateCpu,
+        );
+        let source = RpgMakerSource::data(StandardDataFile::Items);
+        let non_source = manual_current_group(
+            source.clone(),
+            1,
+            "12345 {hero}",
+            "人工数字语境 {hero}",
+            definitions.clone(),
+        );
+        let fully_protected = manual_current_group(
+            source.clone(),
+            2,
+            "保護対象",
+            "完整保护语境 保護対象",
+            definitions,
+        );
+        let active = group(source, 3, "翻訳対象", None, Vec::new());
+
+        let (_, preparation, tasks) = planner
+            .plan(
+                &project(),
+                &profile(10_000),
+                RpgMakerTranslationCorpus::new(vec![non_source, fully_protected, active]),
+                RpgMakerTranslationInput::new(None, Some(placeholder_path)),
+            )
+            .await
+            .expect("人工 Current 的无编号语境应使用安全目标文本")
+            .into_parts();
+
+        assert_eq!(preparation.not_applicable(), 2);
+        assert_eq!(preparation.invalidated(), 0);
+        assert!(preparation.invalidations().is_empty());
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].expected_outputs().len(), 1);
+        let user = user_message(&tasks[0]);
+        assert!(user.contains("Name [-] (single line):人工数字语境 ⟦ATT_"));
+        assert!(user.contains("Name [-] (single line):完整保护语境 ⟦ATT_"));
+        assert!(user.contains("Name [1] (single line):翻訳対象"));
+        assert!(!user.contains("12345 {hero}"));
+        assert!(!user.contains("{hero}"));
+        assert!(!user.contains("保護対象"));
     }
 
     #[tokio::test]
@@ -4668,7 +5372,7 @@ pattern = '\A<Help:(?<text>.*?)>\z'
 
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].expected_outputs().len(), 1);
-        assert_eq!(tasks[0].expected_outputs()[0].id(), 1);
+        assert_eq!(tasks[0].expected_outputs()[0].id(), task_id(1));
         assert!(!tasks[0].messages()[1].content().contains("保護対象"));
         assert!(!tasks[0].messages()[1].content().contains("仅上下文"));
     }
@@ -4810,7 +5514,7 @@ pattern = '\A<Help:(?<text>.*?)>\z'
     }
 
     #[tokio::test]
-    async fn global_deduplication_sends_only_the_first_unit_and_propagates_atomically() {
+    async fn global_deduplication_assigns_one_id_but_keeps_every_duplicate_as_context() {
         let planner = RpgMakerTranslationTaskPlanningService::<_, _, ()>::new(
             EmptyResources,
             translation_resources(),
@@ -4862,8 +5566,13 @@ pattern = '\A<Help:(?<text>.*?)>\z'
             .expect("Reader 自然顺序中的首个重复单元应成为代表");
         assert_eq!(deduplicated.propagation_targets(), &[last_duplicate]);
         let user = tasks[0].messages()[1].content();
-        assert_eq!(user.matches("保存しますか？").count(), 1);
-        assert!(!user.contains("仅上下文"));
+        assert_eq!(
+            user.matches("保存しますか？").count(),
+            2,
+            "去重只合并模型责任，不能从完整 TaskBlock 删除重复原文语境"
+        );
+        assert!(user.contains("Name [2] (single line):保存しますか？"));
+        assert!(user.contains("Name [-] (single line):保存しますか？"));
         assert_eq!(tasks[0].expected_outputs().len(), 2);
     }
 
@@ -5015,7 +5724,7 @@ pattern = '\A<Help:(?<text>.*?)>\z'
     }
 
     #[tokio::test]
-    async fn placeholder_projection_failure_isolated_to_one_unit_and_invalidates_its_old_translation()
+    async fn placeholder_projection_failure_suppresses_its_complete_task_block_and_invalidates_old_translation()
      {
         let placeholder_path = PathBuf::from("C:/input/placeholders.toml");
         let reader = TranslationPlanningResourceReadingService::new(
@@ -5063,7 +5772,7 @@ pattern = '\A<Help:(?<text>.*?)>\z'
                 RpgMakerTranslationInput::new(None, Some(placeholder_path)),
             )
             .await
-            .expect("一个单元的 Placeholder 冲突不应阻断其他单元")
+            .expect("Placeholder 冲突应形成规划失败并禁止发送残缺 TaskBlock")
             .into_parts();
 
         assert_eq!(preparation.planning_failures().len(), 1);
@@ -5073,14 +5782,14 @@ pattern = '\A<Help:(?<text>.*?)>\z'
         ));
         assert_eq!(preparation.invalidations().len(), 1);
         assert_eq!(preparation.invalidated(), 1);
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].expected_outputs().len(), 1);
-        assert!(tasks[0].messages()[1].content().contains("正常な翻訳"));
-        assert!(!tasks[0].messages()[1].content().contains("翻訳<BAD>"));
+        assert!(
+            tasks.is_empty(),
+            "失败 Unit 与正常兄弟 Group 同属一个完整块时，不能删除失败 Unit 后只发送正常原文"
+        );
     }
 
     #[tokio::test]
-    async fn line_crossing_placeholder_failure_isolated_to_its_lines_unit() {
+    async fn line_crossing_placeholder_failure_skips_its_block_but_keeps_another_scope_block() {
         let placeholder_path = PathBuf::from("C:/input/placeholders.toml");
         let reader = TranslationPlanningResourceReadingService::new(
             MemoryFileReader {
@@ -5130,7 +5839,7 @@ pattern = '\A<Help:(?<text>.*?)>\z'
                 RpgMakerTranslationInput::new(None, Some(placeholder_path)),
             )
             .await
-            .expect("一个 Lines 单元的 Placeholder 边界失败不应阻断其他单元")
+            .expect("一个完整块失败不应阻断另一 Semantic Scope 的完整块")
             .into_parts();
 
         assert_eq!(preparation.planning_failures().len(), 1);
@@ -5145,6 +5854,65 @@ pattern = '\A<Help:(?<text>.*?)>\z'
         assert_eq!(tasks[0].expected_outputs().len(), 1);
         assert!(tasks[0].messages()[1].content().contains("正常な翻訳"));
         assert!(!tasks[0].messages()[1].content().contains("翻訳<opaque>"));
+    }
+
+    #[tokio::test]
+    async fn failed_block_dedup_member_cannot_take_healthy_block_model_responsibility() {
+        let placeholder_path = PathBuf::from("C:/input/placeholders.toml");
+        let reader = TranslationPlanningResourceReadingService::new(
+            MemoryFileReader {
+                files: Arc::new(BTreeMap::from([(
+                    placeholder_path.clone(),
+                    br#"
+                        [[rule]]
+                        pattern = '<BAD>'
+
+                        [[rule]]
+                        pattern = 'BAD'
+                    "#
+                    .to_vec(),
+                )])),
+            },
+            ImmediateCpu,
+        );
+        let planner = RpgMakerTranslationTaskPlanningService::<_, _, ()>::new(
+            reader,
+            translation_resources(),
+            Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
+            ImmediateCpu,
+        );
+        let duplicate = "重複テキスト";
+        let bad = group(RpgMakerSource::map(1), 1, "翻訳<BAD>", None, Vec::new());
+        let blocked_duplicate = group(RpgMakerSource::map(1), 2, duplicate, None, Vec::new());
+        let healthy_duplicate = group(RpgMakerSource::map(2), 1, duplicate, None, Vec::new());
+
+        let (_, preparation, tasks) = planner
+            .plan(
+                &project(),
+                &profile(10_000),
+                RpgMakerTranslationCorpus::new(vec![bad, blocked_duplicate, healthy_duplicate]),
+                RpgMakerTranslationInput::new(None, Some(placeholder_path)),
+            )
+            .await
+            .expect("坏块不得阻止健康重复项取得模型责任")
+            .into_parts();
+
+        assert_eq!(preparation.planning_failures().len(), 1);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].expected_outputs().len(), 1);
+        let output = &tasks[0].expected_outputs()[0];
+        assert_eq!(output.id(), task_id(1));
+        assert_eq!(
+            output.identity().group_location().source(),
+            &RpgMakerSource::map(2)
+        );
+        assert_eq!(output.propagation_targets().len(), 1);
+        assert_eq!(
+            output.propagation_targets()[0].group_location().source(),
+            &RpgMakerSource::map(1)
+        );
+        assert!(user_message(&tasks[0]).contains("Name [1] (single line):重複テキスト"));
+        assert!(!user_message(&tasks[0]).contains("翻訳<BAD>"));
     }
 
     #[tokio::test]
@@ -5234,8 +6002,8 @@ pattern = '\A<Help:(?<text>.*?)>\z'
             .into_parts();
 
         assert_eq!(split.len(), 2);
-        assert_eq!(split[0].expected_outputs()[0].id(), 1);
-        assert_eq!(split[1].expected_outputs()[0].id(), 1);
+        assert_eq!(split[0].expected_outputs()[0].id(), task_id(1));
+        assert_eq!(split[1].expected_outputs()[0].id(), task_id(1));
     }
 
     #[tokio::test]
@@ -5363,7 +6131,7 @@ pattern = '\A<Help:(?<text>.*?)>\z'
             .map(|task| {
                 let outputs = task.expected_outputs();
                 assert_eq!(outputs.len(), 1);
-                assert_eq!(outputs[0].id(), 1);
+                assert_eq!(outputs[0].id(), task_id(1));
                 outputs[0].protected_text()
             })
             .collect::<Vec<_>>();
@@ -5376,60 +6144,6 @@ pattern = '\A<Help:(?<text>.*?)>\z'
                 fourth_original.as_str(),
             ]
         );
-    }
-
-    #[test]
-    fn incremental_user_message_size_matches_the_exact_rendered_markdown() {
-        let first_term = crate::translation::planning_resource::TerminologyEntry::new(
-            "术语.一",
-            "翻译(一)",
-            Vec::new(),
-        );
-        let second_term = crate::translation::planning_resource::TerminologyEntry::new(
-            "术语二",
-            "翻译二",
-            Vec::new(),
-        );
-        let first_line = terminology_line_character_count(&first_term);
-        let second_line = terminology_line_character_count(&second_term);
-        let first_group = "## Database Text\n\nName [1] (single line):一\n";
-        let second_group = "## Database Text\n\nName [2] (single line):二\n";
-
-        let first_size = candidate_user_message_character_count(
-            0,
-            false,
-            0,
-            1,
-            first_line,
-            first_group.chars().count(),
-        );
-        let expected_first = format!("Terminology:\n\n- 术语\\.一 → 翻译\\(一\\)\n\n{first_group}");
-        assert_eq!(first_size, expected_first.chars().count());
-
-        let second_size = candidate_user_message_character_count(
-            first_size,
-            true,
-            1,
-            1,
-            second_line,
-            second_group.chars().count(),
-        );
-        let expected_second = format!(
-            "Terminology:\n\n- 术语\\.一 → 翻译\\(一\\)\n- 术语二 → 翻译二\n\n{first_group}\n{second_group}"
-        );
-        assert_eq!(second_size, expected_second.chars().count());
-
-        let inserted_size = candidate_user_message_character_count(
-            first_group.chars().count(),
-            true,
-            0,
-            1,
-            first_line,
-            second_group.chars().count(),
-        );
-        let expected_inserted =
-            format!("Terminology:\n\n- 术语\\.一 → 翻译\\(一\\)\n\n{first_group}\n{second_group}");
-        assert_eq!(inserted_size, expected_inserted.chars().count());
     }
 
     #[test]

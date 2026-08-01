@@ -7,6 +7,7 @@ MV、MZ 和 Generic 各自拥有自己的项目状态与业务流程，同时复
   与定译由[通用游戏术语表制作 Skill](../../skills/extract-game-terminology/SKILL.md)
   负责；
 - [Placeholder](placeholders.md)：不可改写片段的保护与恢复；
+- [TaskBlock 规划](task-planning.md)：Unit、Group、Semantic Scope、稳定装箱与临时 ID；
 - [Prompt 与模型协议](prompts.md)：locale、消息、响应信封和数字 ID；
 - [模型任务记录](task-records.md)：可读请求与结果记录。
 

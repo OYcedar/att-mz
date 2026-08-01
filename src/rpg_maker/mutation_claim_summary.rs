@@ -9,13 +9,14 @@ use std::fmt;
 use rayon::prelude::*;
 
 use super::model::MutationResourceAccess;
+use super::semantic_order::RpgMakerSemanticOrderKey;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EncodedMutationClaim {
     pub(crate) resource_key: String,
     pub(crate) access: MutationResourceAccess,
     pub(crate) group_location: String,
-    pub(crate) group_order: usize,
+    pub(crate) semantic_order_key: RpgMakerSemanticOrderKey,
 }
 
 impl EncodedMutationClaim {
@@ -23,13 +24,13 @@ impl EncodedMutationClaim {
         resource_key: String,
         access: MutationResourceAccess,
         group_location: String,
-        group_order: usize,
+        semantic_order_key: RpgMakerSemanticOrderKey,
     ) -> Self {
         Self {
             resource_key,
             access,
             group_location,
-            group_order,
+            semantic_order_key,
         }
     }
 }
@@ -96,8 +97,8 @@ pub(crate) fn collision_summary(
             MutationResourceAccess::Intent => claims
                 .iter()
                 .min_by(|left, right| {
-                    left.group_order
-                        .cmp(&right.group_order)
+                    left.semantic_order_key
+                        .cmp(&right.semantic_order_key)
                         .then_with(|| left.group_location.cmp(&right.group_location))
                 })
                 .expect("非空资源分组必须存在代表"),
@@ -144,8 +145,8 @@ pub(crate) fn collision_summary_owned(
                 });
             }
             if candidate
-                .group_order
-                .cmp(&representative.group_order)
+                .semantic_order_key
+                .cmp(&representative.semantic_order_key)
                 .then_with(|| candidate.group_location.cmp(&representative.group_location))
                 .is_lt()
             {
@@ -171,7 +172,10 @@ mod tests {
             resource_key.to_owned(),
             access,
             group_location.to_owned(),
-            group_order,
+            RpgMakerSemanticOrderKey::new(
+                vec![u64::try_from(group_order).expect("测试顺序应可编码为 u64")],
+                0,
+            ),
         )
     }
 
@@ -190,7 +194,7 @@ mod tests {
         assert_eq!(summary[0].resource_key, "other");
         assert_eq!(summary[1].resource_key, "resource");
         assert_eq!(summary[1].group_location, "group-z");
-        assert_eq!(summary[1].group_order, 2);
+        assert_eq!(summary[1].semantic_order_key.physical_path(), &[2]);
     }
 
     #[test]

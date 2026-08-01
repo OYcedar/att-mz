@@ -38,6 +38,7 @@ use crate::rpg_maker::project_database::{
     DROP_RPG_MAKER_MUTATION_CLAIM_OWNER_RESOURCE_INDEX,
     DROP_RPG_MAKER_MUTATION_CLAIM_RESOURCE_INDEX, MV_DIALOGUE_RULES_DEFINITION_KIND,
 };
+use crate::rpg_maker::semantic_order::RpgMakerSemanticOrderKey;
 use crate::rpg_maker::text::{RpgMakerLocation, TextGroupKind};
 use crate::storage::sqlite::{
     ExecuteTransactionError, QueryExistingDatabaseError, SqliteBatch, SqliteCommand, SqliteQuery,
@@ -57,8 +58,8 @@ const INSERT_CLAIM: &str = r#"INSERT INTO rpg_maker_mutation_claim (
 ) VALUES (?1, ?2, ?3, ?4)"#;
 
 const FIND_MUTATION_CLAIM_CONFLICT: &str = r#"WITH
-other_sample(owner, group_location, resource_key, access, group_order) AS MATERIALIZED (
-    SELECT claim.owner, claim.group_location, claim.resource_key, claim.access, text_group.group_order
+other_sample(owner, group_location, resource_key, access, semantic_order_key) AS MATERIALIZED (
+    SELECT claim.owner, claim.group_location, claim.resource_key, claim.access, text_group.semantic_order_key
     FROM rpg_maker_mutation_claim AS claim
          INDEXED BY rpg_maker_mutation_claim_owner_resource_idx
     JOIN rpg_maker_text_group AS text_group
@@ -78,9 +79,9 @@ conflicts(
     current_owner,
     current_group_location,
     current_access,
-    incoming_group_order,
+    incoming_semantic_order_key,
     current_owner_order,
-    current_group_order
+    current_semantic_order_key
 ) AS (
     SELECT
         incoming.resource_key,
@@ -90,9 +91,9 @@ conflicts(
         current.owner,
         current.group_location,
         current.access,
-        incoming_group.group_order,
+        incoming_group.semantic_order_key,
         CASE current.owner WHEN 'builtin' THEN 0 WHEN 'rules' THEN 1 ELSE 2 END,
-        current.group_order
+        current.semantic_order_key
     FROM other_count
     CROSS JOIN other_sample AS current
     CROSS JOIN rpg_maker_mutation_claim AS incoming
@@ -115,9 +116,9 @@ conflicts(
         current.owner,
         current.group_location,
         current.access,
-        incoming_group.group_order,
+        incoming_group.semantic_order_key,
         CASE current.owner WHEN 'builtin' THEN 0 WHEN 'rules' THEN 1 ELSE 2 END,
-        current_group.group_order
+        current_group.semantic_order_key
     FROM other_count
     CROSS JOIN rpg_maker_mutation_claim AS incoming
          INDEXED BY rpg_maker_mutation_claim_owner_resource_idx
@@ -145,9 +146,9 @@ SELECT
     current_access
 FROM conflicts
 ORDER BY
-    incoming_group_order,
+    incoming_semantic_order_key,
     current_owner_order,
-    current_group_order,
+    current_semantic_order_key,
     resource_key COLLATE BINARY,
     incoming_access COLLATE BINARY,
     incoming_group_location COLLATE BINARY,
@@ -167,18 +168,18 @@ ON CONFLICT(owner) DO UPDATE SET
     asset_snapshot_fingerprint = excluded.asset_snapshot_fingerprint"#;
 
 const INSERT_GROUP_PREFIX: &str = r#"INSERT INTO rpg_maker_text_group (
-    owner, group_location, group_order, group_kind, projection_recipe_json
+    owner, group_location, semantic_order_key, group_kind, projection_recipe_json
 )"#;
 #[cfg(test)]
 const INSERT_GROUP: &str = r#"INSERT INTO rpg_maker_text_group (
-    owner, group_location, group_order, group_kind, projection_recipe_json
+    owner, group_location, semantic_order_key, group_kind, projection_recipe_json
 ) VALUES (?1, ?2, ?3, ?4, ?5)"#;
 
 const INSERT_UNIT_PREFIX: &str = r#"INSERT INTO rpg_maker_text_unit (
     owner,
     group_location,
     unit_role,
-    unit_order,
+    semantic_order_key,
     source_content_json,
     source_context_json,
     translation_content_json,
@@ -189,7 +190,7 @@ const INSERT_UNIT: &str = r#"INSERT INTO rpg_maker_text_unit (
     owner,
     group_location,
     unit_role,
-    unit_order,
+    semantic_order_key,
     source_content_json,
     source_context_json,
     translation_content_json,
@@ -214,27 +215,28 @@ WHERE owner = ?"#;
 
 const READ_OWNER_GROUPS: &str = r#"SELECT
     group_location,
-    group_order,
+    semantic_order_key,
     group_kind,
     projection_recipe_json
 FROM rpg_maker_text_group
 WHERE owner = ?
-ORDER BY group_order"#;
+ORDER BY semantic_order_key"#;
 
 const READ_OWNER_UNITS: &str = r#"SELECT
     unit.group_location,
     unit.unit_role,
-    unit.unit_order,
+    unit.semantic_order_key,
     unit.source_content_json,
     unit.source_context_json,
     unit.translation_content_json,
     unit.translation_state
 FROM rpg_maker_text_group AS text_group
 CROSS JOIN rpg_maker_text_unit AS unit
+           INDEXED BY rpg_maker_text_unit_owner_group_order_idx
   ON unit.owner = text_group.owner
  AND unit.group_location = text_group.group_location
 WHERE text_group.owner = ?
-ORDER BY text_group.group_order, unit.unit_order"#;
+ORDER BY text_group.semantic_order_key, unit.semantic_order_key"#;
 
 const READ_OWNER_CLAIMS: &str = r#"SELECT
     resource_key,
@@ -1670,6 +1672,27 @@ impl EncodedSnapshot {
             });
         }
 
+        // 并行 Extract 批次的输入顺序不是领域顺序。指纹、无变化判断和后续读取
+        // 必须只由 semantic_order_key 决定，不能绑定 Vec 或工作完成顺序。
+        groups.par_sort_unstable_by(|left, right| {
+            left.semantic_order_key.cmp(&right.semantic_order_key)
+        });
+        let group_ranks = groups
+            .iter()
+            .enumerate()
+            .map(|(rank, group)| (group.group_location.as_str(), rank))
+            .collect::<HashMap<_, _>>();
+        units.par_iter_mut().for_each(|unit| {
+            unit.group_semantic_rank = *group_ranks
+                .get(unit.group_location.as_str())
+                .expect("Extract Unit 必须属于同一快照中的完整 Group");
+        });
+        units.par_sort_unstable_by(|left, right| {
+            left.group_semantic_rank
+                .cmp(&right.group_semantic_rank)
+                .then_with(|| left.semantic_order_key.cmp(&right.semantic_order_key))
+        });
+
         let fingerprint =
             asset_snapshot_fingerprint(owner, project_definition_json, &groups, &units, &claims);
         #[cfg(test)]
@@ -1740,7 +1763,7 @@ impl EncodedSnapshot {
             let [
                 SqliteValue::Text(group_location),
                 SqliteValue::Text(unit_role),
-                SqliteValue::Integer(_),
+                SqliteValue::Blob(_),
                 SqliteValue::Text(source_content_json),
                 SqliteValue::Text(source_context_json),
                 SqliteValue::Text(translation_content_json),
@@ -1782,13 +1805,13 @@ impl EncodedSnapshot {
 
     fn prepare_physical_write_order(&mut self, claim_index_maintenance: ClaimIndexMaintenance) {
         // 指纹、无变化判断和译文继承均已完成，以下排序只优化 SQLite B-tree 写入。
-        // 自然顺序仍由持久化的 group_order/unit_order 表达，读取契约继续按这些字段排序。
+        // 自然顺序仍由持久化的 semantic_order_key 表达，读取契约继续按该字段排序。
         self.groups
             .par_sort_unstable_by(|left, right| left.group_location.cmp(&right.group_location));
         self.units.par_sort_unstable_by(|left, right| {
             left.group_location
                 .cmp(&right.group_location)
-                .then_with(|| left.unit_order.cmp(&right.unit_order))
+                .then_with(|| left.semantic_order_key.cmp(&right.semantic_order_key))
                 .then_with(|| left.unit_role.cmp(&right.unit_role))
         });
         if claim_index_maintenance == ClaimIndexMaintenance::Rebuild {
@@ -1826,18 +1849,18 @@ fn stored_group_row_matches(row: Option<&SqliteRow>, expected: &EncodedGroup) ->
     let Some(row) = row else {
         return false;
     };
-    let Ok(expected_order) = i64::try_from(expected.group_order) else {
+    let Ok(expected_order_key) = expected.semantic_order_key.encode() else {
         return false;
     };
     matches!(
         row.values(),
         [
             SqliteValue::Text(group_location),
-            SqliteValue::Integer(group_order),
+            SqliteValue::Blob(semantic_order_key),
             SqliteValue::Text(group_kind),
             SqliteValue::Text(projection_recipe_json),
         ] if group_location == &expected.group_location
-            && *group_order == expected_order
+            && semantic_order_key == &expected_order_key
             && group_kind == expected.group_kind
             && projection_recipe_json == &expected.projection_recipe_json
     )
@@ -1847,7 +1870,7 @@ fn stored_unit_row_matches(row: Option<&SqliteRow>, expected: &EncodedUnit) -> b
     let Some(row) = row else {
         return false;
     };
-    let Ok(expected_order) = i64::try_from(expected.unit_order) else {
+    let Ok(expected_order_key) = expected.semantic_order_key.encode() else {
         return false;
     };
     matches!(
@@ -1855,14 +1878,14 @@ fn stored_unit_row_matches(row: Option<&SqliteRow>, expected: &EncodedUnit) -> b
         [
             SqliteValue::Text(group_location),
             SqliteValue::Text(unit_role),
-            SqliteValue::Integer(unit_order),
+            SqliteValue::Blob(semantic_order_key),
             SqliteValue::Text(source_content_json),
             SqliteValue::Text(source_context_json),
             translation_content_json,
             translation_state,
         ] if group_location == &expected.group_location
             && unit_role == &expected.unit_role
-            && *unit_order == expected_order
+            && semantic_order_key == &expected_order_key
             && source_content_json == &expected.source_content_json
             && source_context_json == &expected.source_context_json
             && stored_translation_pair_is_valid(translation_content_json, translation_state)
@@ -1896,15 +1919,18 @@ fn stored_claim_row_matches(row: Option<&SqliteRow>, expected: &EncodedClaim) ->
 
 struct EncodedGroup {
     group_location: String,
-    group_order: usize,
+    semantic_order_key: RpgMakerSemanticOrderKey,
     group_kind: &'static str,
     projection_recipe_json: String,
 }
 
 struct EncodedUnit {
     group_location: String,
+    /// 完整快照建立后得到的 Group 自然顺序位置，只用于规范化并行 Extract
+    /// 结果；它不进入持久化身份或数据库。
+    group_semantic_rank: usize,
     unit_role: String,
-    unit_order: usize,
+    semantic_order_key: RpgMakerSemanticOrderKey,
     source_content_json: String,
     source_context_json: String,
     translation: Option<EncodedTranslation>,
@@ -1995,7 +2021,8 @@ fn encode_batch(
     groups: Vec<(usize, ExtractedTextGroup)>,
 ) -> Result<EncodedBatch, EncodeAssetSnapshotError> {
     let mut encoded = EncodedBatch::default();
-    for (group_order, group) in groups {
+    for (_group_order, group) in groups {
+        let group_semantic_order_key = group.semantic_order_key().clone();
         let group_location = RpgMakerLocationCodec::encode(group.group_location())
             .map_err(EncodeAssetSnapshotError::Location)?;
         let source_speaker = group
@@ -2010,7 +2037,7 @@ fn encode_batch(
             })
             .transpose()?;
 
-        for (unit_order, unit) in group.units().iter().enumerate() {
+        for unit in group.units() {
             let source_context_json = if matches!(unit.role(), TextUnitRole::DialogueBody) {
                 dialogue_context.as_deref().unwrap_or("{}")
             } else {
@@ -2018,9 +2045,10 @@ fn encode_batch(
             };
             encoded.units.push(EncodedUnit {
                 group_location: group_location.clone(),
+                group_semantic_rank: 0,
                 unit_role: RpgMakerProjectionCodec::encode_role(unit.role())
                     .map_err(EncodeAssetSnapshotError::Projection)?,
-                unit_order,
+                semantic_order_key: unit.semantic_order_key().clone(),
                 source_content_json: serde_json::to_string(unit.source_content())
                     .map_err(EncodeAssetSnapshotError::SourceContent)?,
                 source_context_json: source_context_json.to_owned(),
@@ -2034,13 +2062,13 @@ fn encode_batch(
                     .map_err(EncodeAssetSnapshotError::Projection)?,
                 lock.access(),
                 group_location.clone(),
-                group_order,
+                group_semantic_order_key.clone(),
             ));
         }
 
         encoded.groups.push(EncodedGroup {
             group_location,
-            group_order,
+            semantic_order_key: group_semantic_order_key,
             group_kind: group_kind_name(group.kind()),
             projection_recipe_json: RpgMakerProjectionCodec::encode_recipes(group.recipes())
                 .map_err(EncodeAssetSnapshotError::Projection)?,
@@ -2064,7 +2092,7 @@ fn asset_snapshot_fingerprint(
     for group in groups {
         builder.group(
             &group.group_location,
-            group.group_order,
+            &group.semantic_order_key,
             group.group_kind,
             &group.projection_recipe_json,
         );
@@ -2073,7 +2101,7 @@ fn asset_snapshot_fingerprint(
         builder.unit(
             &unit.group_location,
             &unit.unit_role,
-            unit.unit_order,
+            &unit.semantic_order_key,
             &unit.source_content_json,
             &unit.source_context_json,
         );
@@ -2166,9 +2194,11 @@ fn build_transaction_steps(
         for group in groups {
             parameter_values.extend([
                 text(group.group_location),
-                SqliteValue::Integer(
-                    i64::try_from(group.group_order)
-                        .expect("内存中的 group_order 必须可写入 SQLite INTEGER"),
+                SqliteValue::Blob(
+                    group
+                        .semantic_order_key
+                        .encode()
+                        .expect("内存中的语义顺序键必须可编码"),
                 ),
                 text(group.group_kind),
                 text(group.projection_recipe_json),
@@ -2239,9 +2269,10 @@ fn build_transaction_steps(
             parameter_values.extend([
                 text(unit.group_location),
                 text(unit.unit_role),
-                SqliteValue::Integer(
-                    i64::try_from(unit.unit_order)
-                        .expect("内存中的 unit_order 必须可写入 SQLite INTEGER"),
+                SqliteValue::Blob(
+                    unit.semantic_order_key
+                        .encode()
+                        .expect("内存中的语义顺序键必须可编码"),
                 ),
                 text(unit.source_content_json),
                 text(unit.source_context_json),
@@ -2940,8 +2971,12 @@ mod tests {
         assert_eq!(logical.len(), 2, "完整逻辑 Claim 不得因持久化摘要而丢失");
         assert_eq!(summary.len(), 1, "同资源的多个 Intent 只持久化一个代表");
         assert_eq!(
-            summary[0].group_order, 0,
-            "代表必须取自然顺序最早的组，而不是 compact 编码字典序最小的组"
+            summary[0].semantic_order_key,
+            RpgMakerSemanticOrderKey::from_group_location(&RpgMakerLocation::value(
+                RpgMakerSource::data(StandardDataFile::Items),
+                vec![RpgMakerLocationStep::index(1)],
+            )),
+            "代表必须取源结构中自然顺序最早的组"
         );
         assert_eq!(
             summary[0].group_location, snapshot.groups[0].group_location,
@@ -3019,7 +3054,7 @@ mod tests {
     }
 
     #[test]
-    fn asset_fingerprint_tracks_group_and_unit_order_without_changing_inheritance_identity() {
+    fn asset_fingerprint_is_independent_of_group_input_order_and_tracks_semantic_keys() {
         let forward_groups = EncodedSnapshot::merge(
             RpgMakerAssetOwner::Rules,
             vec![
@@ -3050,28 +3085,46 @@ mod tests {
             None,
         )
         .expect("正序单元快照应可合并");
-        let reverse_units = EncodedSnapshot::merge(
-            RpgMakerAssetOwner::Builtin,
-            vec![encode_test_batch(vec![two_field_group(true)]).expect("逆序单元应可编码")],
+        let mut changed_group = scalar_group(1, "name", "一");
+        changed_group.set_semantic_order_key(RpgMakerSemanticOrderKey::new(vec![99], 0));
+        let changed_groups = EncodedSnapshot::merge(
+            RpgMakerAssetOwner::Rules,
+            vec![
+                encode_test_batch(vec![changed_group, scalar_group(2, "name", "二")])
+                    .expect("变更 Group 顺序键的快照应可编码"),
+            ],
             None,
         )
-        .expect("逆序单元快照应可合并");
+        .expect("变更 Group 顺序键的快照应可合并");
+        let mut changed_unit_group = two_field_group(false);
+        changed_unit_group.units_mut()[0]
+            .set_semantic_order_key(RpgMakerSemanticOrderKey::new(vec![99], 1));
+        let changed_units = EncodedSnapshot::merge(
+            RpgMakerAssetOwner::Builtin,
+            vec![
+                encode_test_batch(vec![changed_unit_group])
+                    .expect("变更 Unit 顺序键的快照应可编码"),
+            ],
+            None,
+        )
+        .expect("变更 Unit 顺序键的快照应可合并");
 
-        assert_ne!(forward_groups.fingerprint, reverse_groups.fingerprint);
-        assert_ne!(forward_units.fingerprint, reverse_units.fingerprint);
-        let mut forward_identities = forward_units
-            .units
-            .iter()
-            .map(|unit| unit.identity_hash())
-            .collect::<Vec<_>>();
-        let mut reverse_identities = reverse_units
-            .units
-            .iter()
-            .map(|unit| unit.identity_hash())
-            .collect::<Vec<_>>();
-        forward_identities.sort_unstable();
-        reverse_identities.sort_unstable();
-        assert_eq!(forward_identities, reverse_identities);
+        assert_eq!(forward_groups.fingerprint, reverse_groups.fingerprint);
+        assert_ne!(forward_groups.fingerprint, changed_groups.fingerprint);
+        assert_ne!(forward_units.fingerprint, changed_units.fingerprint);
+        assert_eq!(
+            forward_groups
+                .groups
+                .iter()
+                .map(|group| &group.semantic_order_key)
+                .collect::<Vec<_>>(),
+            reverse_groups
+                .groups
+                .iter()
+                .map(|group| &group.semantic_order_key)
+                .collect::<Vec<_>>(),
+            "相同语义键必须恢复相同 Group 自然顺序"
+        );
     }
 
     #[test]
@@ -3109,10 +3162,20 @@ mod tests {
         )
         .expect("快照应可合并");
         let unit = &snapshot.units[0];
+        let previous_semantic_order_key = RpgMakerSemanticOrderKey::new(vec![999], 999)
+            .encode()
+            .expect("旧 Unit 的语义顺序键应可编码");
+        assert_ne!(
+            previous_semantic_order_key,
+            unit.semantic_order_key
+                .encode()
+                .expect("新 Unit 的语义顺序键应可编码"),
+            "测试必须使用不同顺序，证明顺序不属于继承身份"
+        );
         let previous = SqliteRow::new(vec![
             text(unit.group_location.clone()),
             text(unit.unit_role.clone()),
-            SqliteValue::Integer(999),
+            SqliteValue::Blob(previous_semantic_order_key),
             text(unit.source_content_json.clone()),
             text(unit.source_context_json.clone()),
             text(r#""译文""#),
@@ -3322,8 +3385,12 @@ mod tests {
                 (
                     SqliteValue::Text(group_location),
                     SqliteValue::Text(unit_role),
-                    SqliteValue::Integer(unit_order),
-                ) => (group_location.clone(), *unit_order, unit_role.clone()),
+                    SqliteValue::Blob(semantic_order_key),
+                ) => (
+                    group_location.clone(),
+                    semantic_order_key.clone(),
+                    unit_role.clone(),
+                ),
                 _ => panic!("Unit 物理键应保持规范类型"),
             })
             .collect::<Vec<_>>();
@@ -3560,8 +3627,8 @@ mod tests {
             .read(&project)
             .await
             .expect("生产 Translate asset reader 应消费 229,974+ Claim 项目状态");
-        assert_eq!(corpus.groups().len(), 1);
-        assert_eq!(corpus.groups()[0].assets().len(), 1);
+        assert_eq!(corpus.scopes().len(), 1);
+        assert_eq!(corpus.scopes()[0].groups()[0].assets().len(), 1);
 
         let write_back_reader =
             RpgMakerWriteBackAssetReadingService::new(sqlite.clone(), cpu.clone());
@@ -3612,9 +3679,12 @@ mod tests {
             .read(&project)
             .await
             .expect("生产 Translate reader 应消费 229,974+ Group/Unit");
-        assert_eq!(corpus.groups().len(), TOTAL);
+        assert_eq!(corpus.scopes().len(), TOTAL);
         let mut observed_units = 0usize;
-        for (group_order, group) in corpus.groups().iter().enumerate() {
+        for (group_order, scope) in corpus.scopes().iter().enumerate() {
+            let [group] = scope.groups() else {
+                panic!("每个 data 文件语义范围必须恰好包含一个 Group")
+            };
             assert_eq!(group.kind(), TextGroupKind::DatabaseEntry);
             assert_large_data_root_location(group.group_location(), group_order + 1);
             let [asset] = group.assets() else {
@@ -4522,15 +4592,17 @@ mod tests {
     #[test]
     fn physical_write_order_preserves_fingerprint_values_and_natural_read_order() {
         let owner = RpgMakerAssetOwner::Rules;
+        let mut natural_first = scalar_group(2, "description", "说明");
+        let mut natural_second = scalar_group(1, "name", "名称");
+        natural_first.set_semantic_order_key(RpgMakerSemanticOrderKey::new(vec![0], 0));
+        natural_first.units_mut()[0]
+            .set_semantic_order_key(RpgMakerSemanticOrderKey::new(vec![0], 1));
+        natural_second.set_semantic_order_key(RpgMakerSemanticOrderKey::new(vec![1], 0));
+        natural_second.units_mut()[0]
+            .set_semantic_order_key(RpgMakerSemanticOrderKey::new(vec![1], 1));
         let snapshot = EncodedSnapshot::merge(
             owner,
-            vec![
-                encode_test_batch(vec![
-                    scalar_group(2, "description", "说明"),
-                    scalar_group(1, "name", "名称"),
-                ])
-                .expect("测试快照应可编码"),
-            ],
+            vec![encode_test_batch(vec![natural_first, natural_second]).expect("测试快照应可编码")],
             None,
         )
         .expect("测试快照应可合并");
@@ -4575,6 +4647,75 @@ mod tests {
             ],
             "成功提交后两个命名索引必须恢复为项目数据库的精确权威 DDL"
         );
+    }
+
+    #[tokio::test]
+    async fn scrambled_extract_input_round_trips_through_the_write_back_reader() {
+        let owner = RpgMakerAssetOwner::Rules;
+        let extracted_groups = vec![scalar_group(9, "name", "后组"), two_field_group(true)];
+        let snapshot = EncodedSnapshot::merge(
+            owner,
+            vec![encode_test_batch(extracted_groups.clone()).expect("乱序测试快照应可编码")],
+            None,
+        )
+        .expect("乱序测试快照应按语义键规范化");
+        let workspace = tempfile::tempdir().expect("应建立写回往返测试目录");
+        let database_path = workspace.path().join("project.db");
+        let mut connection = Connection::open(&database_path).expect("应创建测试数据库");
+        create_current_schema(&connection);
+        execute_plan(
+            &mut connection,
+            build_transaction_plan(
+                owner,
+                [0xa5; 32],
+                snapshot,
+                Vec::new(),
+                None,
+                ClaimIndexMaintenance::Rebuild,
+            ),
+        )
+        .expect("乱序输入应完整写入当前 schema");
+        drop(connection);
+
+        let sqlite = RusqliteStorage::start(RusqliteStorageConfiguration::production())
+            .expect("生产 SQLite 根应启动");
+        let cpu =
+            RayonCpuExecutor::start(CpuExecutorConfig::production()).expect("生产 CPU 根应启动");
+        let project = OpenedProject::new(
+            "semantic-order-round-trip"
+                .parse::<ProjectName>()
+                .expect("测试项目名应合法"),
+            workspace.path().to_path_buf(),
+            database_path,
+            "ja".to_owned(),
+            "zh-Hans".to_owned(),
+            test_layout_profile(),
+        );
+        let observer = Connection::open(project.database_path()).expect("应打开观察连接");
+        let data_version_before: i64 = observer
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .expect("应读取重复 Extract 前的数据版本");
+        RpgMakerExtractionAssetStore::new(sqlite.clone(), cpu.clone())
+            .replace_rules(
+                &project,
+                RulesSnapshot::new(extracted_groups).expect("重复 Rules 快照应合法"),
+            )
+            .await
+            .expect("同源重复 Extract 应识别规范语义顺序下的相同快照");
+        let data_version_after: i64 = observer
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .expect("应读取重复 Extract 后的数据版本");
+        assert_eq!(
+            data_version_after, data_version_before,
+            "同源重复 Extract 不得因输入 Vec 顺序不同而重写数据库"
+        );
+        RpgMakerWriteBackAssetReadingService::new(sqlite.clone(), cpu.clone())
+            .read(&project)
+            .await
+            .expect("WriteBack 必须按同一语义顺序重建并验证 Extract 指纹");
+        drop(observer);
+        sqlite.shutdown().await.expect("SQLite 根应关闭");
+        cpu.shutdown().expect("CPU 根应关闭");
     }
 
     #[test]
@@ -4688,6 +4829,15 @@ mod tests {
                 }),
                 "深快照查询必须按现有权威索引读取：{details:?}"
             );
+            if query == READ_OWNER_UNITS {
+                assert!(
+                    details.iter().any(|detail| {
+                        detail.contains("rpg_maker_text_unit_owner_group_order_idx")
+                            && detail.contains("group_location=?")
+                    }),
+                    "深快照 Unit 必须按 owner 与 group_location 定位：{details:?}"
+                );
+            }
         }
     }
 
@@ -4752,7 +4902,7 @@ mod tests {
         assert_eq!(sample.claims.len(), 1);
         let sample_location = large_data_root_location(1);
         assert_eq!(sample.groups[0].group_location, sample_location);
-        assert_eq!(sample.groups[0].group_order, 0);
+        assert_eq!(sample.groups[0].semantic_order_key.fragment(), 0);
         assert_eq!(sample.groups[0].group_kind, "database_entry");
         assert_eq!(
             sample.groups[0].projection_recipe_json,
@@ -4760,7 +4910,7 @@ mod tests {
         );
         assert_eq!(sample.units[0].group_location, sample_location);
         assert_eq!(sample.units[0].unit_role, LARGE_GROUP_UNIT_ROLE_JSON);
-        assert_eq!(sample.units[0].unit_order, 0);
+        assert_eq!(sample.units[0].semantic_order_key.fragment(), 1);
         assert_eq!(
             sample.units[0].source_content_json,
             LARGE_GROUP_UNIT_SOURCE_CONTENT_JSON
@@ -4796,14 +4946,21 @@ mod tests {
             for group_order in 0..total {
                 let location = large_data_root_location(group_order + 1);
                 let recipe = large_data_root_recipe(&location);
-                let persisted_order =
-                    i64::try_from(group_order).expect("大 Group 自然顺序应可编码为 i64");
-                fingerprint_builder.group(&location, group_order, "database_entry", &recipe);
+                let semantic_order_key = RpgMakerSemanticOrderKey::new(
+                    vec![u64::try_from(group_order).expect("测试顺序应可编码为 u64")],
+                    0,
+                );
+                fingerprint_builder.group(
+                    &location,
+                    &semantic_order_key,
+                    "database_entry",
+                    &recipe,
+                );
                 statement
                     .execute(rusqlite::params![
                         owner.storage_name(),
                         location,
-                        persisted_order,
+                        semantic_order_key.encode().expect("Group 顺序键应可编码"),
                         "database_entry",
                         recipe,
                     ])
@@ -4819,10 +4976,14 @@ mod tests {
                 .expect("大 Unit 写入语句应准备一次");
             for ordinal in 1..=total {
                 let location = large_data_root_location(ordinal);
+                let semantic_order_key = RpgMakerSemanticOrderKey::new(
+                    vec![u64::try_from(ordinal - 1).expect("测试顺序应可编码为 u64")],
+                    1,
+                );
                 fingerprint_builder.unit(
                     &location,
                     LARGE_GROUP_UNIT_ROLE_JSON,
-                    0,
+                    &semantic_order_key,
                     LARGE_GROUP_UNIT_SOURCE_CONTENT_JSON,
                     LARGE_GROUP_UNIT_SOURCE_CONTEXT_JSON,
                 );
@@ -4831,7 +4992,7 @@ mod tests {
                         owner.storage_name(),
                         location,
                         LARGE_GROUP_UNIT_ROLE_JSON,
-                        0_i64,
+                        semantic_order_key.encode().expect("Unit 顺序键应可编码"),
                         LARGE_GROUP_UNIT_SOURCE_CONTENT_JSON,
                         LARGE_GROUP_UNIT_SOURCE_CONTEXT_JSON,
                     ])
@@ -5166,8 +5327,11 @@ mod tests {
             .map(|group| {
                 SqliteRow::new(vec![
                     text(group.group_location.clone()),
-                    SqliteValue::Integer(
-                        i64::try_from(group.group_order).expect("测试顺序应可编码"),
+                    SqliteValue::Blob(
+                        group
+                            .semantic_order_key
+                            .encode()
+                            .expect("测试 Group 顺序键应可编码"),
                     ),
                     text(group.group_kind),
                     text(group.projection_recipe_json.clone()),
@@ -5188,7 +5352,11 @@ mod tests {
                 SqliteRow::new(vec![
                     text(unit.group_location.clone()),
                     text(unit.unit_role.clone()),
-                    SqliteValue::Integer(i64::try_from(unit.unit_order).expect("测试顺序应可编码")),
+                    SqliteValue::Blob(
+                        unit.semantic_order_key
+                            .encode()
+                            .expect("测试 Unit 顺序键应可编码"),
+                    ),
                     text(unit.source_content_json.clone()),
                     text(unit.source_context_json.clone()),
                     translation_content_json,
@@ -5358,27 +5526,29 @@ ORDER BY name"#,
                 CREATE TABLE rpg_maker_text_group (
                     owner TEXT NOT NULL,
                     group_location TEXT NOT NULL,
-                    group_order INTEGER NOT NULL CHECK (group_order >= 0),
+                    semantic_order_key BLOB NOT NULL,
                     group_kind TEXT NOT NULL,
                     projection_recipe_json TEXT NOT NULL,
                     PRIMARY KEY (owner, group_location),
-                    UNIQUE (owner, group_order),
+                    UNIQUE (owner, semantic_order_key),
                     FOREIGN KEY (owner) REFERENCES rpg_maker_asset_owner_state(owner) ON DELETE CASCADE
                 );
                 CREATE TABLE rpg_maker_text_unit (
                     owner TEXT NOT NULL,
                     group_location TEXT NOT NULL,
                     unit_role TEXT NOT NULL,
-                    unit_order INTEGER NOT NULL CHECK (unit_order >= 0),
+                    semantic_order_key BLOB NOT NULL,
                     source_content_json TEXT NOT NULL,
                     source_context_json TEXT NOT NULL,
                     translation_content_json TEXT,
                     translation_state BLOB,
                     PRIMARY KEY (owner, group_location, unit_role),
-                    UNIQUE (owner, group_location, unit_order),
+                    UNIQUE (owner, semantic_order_key),
                     FOREIGN KEY (owner, group_location)
                         REFERENCES rpg_maker_text_group(owner, group_location) ON DELETE CASCADE
                 );
+                CREATE INDEX rpg_maker_text_unit_owner_group_order_idx
+                    ON rpg_maker_text_unit(owner, group_location, semantic_order_key);
                 CREATE TABLE rpg_maker_mutation_claim (
                     owner TEXT NOT NULL,
                     group_location TEXT NOT NULL,
@@ -5422,7 +5592,10 @@ ORDER BY name"#,
                     (
                         snapshot.owner.storage_name(),
                         &group.group_location,
-                        i64::try_from(group.group_order).expect("测试顺序应可编码"),
+                        group
+                            .semantic_order_key
+                            .encode()
+                            .expect("测试 Group 顺序键应可编码"),
                         group.group_kind,
                         &group.projection_recipe_json,
                     ),
@@ -5437,7 +5610,9 @@ ORDER BY name"#,
                         snapshot.owner.storage_name(),
                         &unit.group_location,
                         &unit.unit_role,
-                        i64::try_from(unit.unit_order).expect("测试顺序应可编码"),
+                        unit.semantic_order_key
+                            .encode()
+                            .expect("测试 Unit 顺序键应可编码"),
                         &unit.source_content_json,
                         &unit.source_context_json,
                         translation,

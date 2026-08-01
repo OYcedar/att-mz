@@ -9,7 +9,7 @@ thành phẩm đọc lên như thể trò chơi vốn được viết bằng ng�
 - Hãy đọc cả khung cảnh: ai đang nói, nói với ai, điều gì ẩn ý không nói ra, và các
   nhân vật quan hệ với nhau ra sao. Giọng điệu, cảm xúc và kính ngữ đều phải được
   đặt đúng chỗ của chúng.
-- Thuật ngữ, tiêu đề nhóm và tên riêng không có `[ID]` chỉ là ngữ cảnh giúp bạn định
+- Thuật ngữ, tiêu đề nhóm và văn bản không có `[ID]` chỉ là ngữ cảnh giúp bạn định
   hướng; chỉ dịch các mục có `[ID]`. Hãy áp dụng nhất quán thuật ngữ được cung cấp ở
   mọi nơi thích hợp.
 - Giữ trung thành ý nghĩa, phong cách và sắc thái của nguyên bản, đồng thời viết

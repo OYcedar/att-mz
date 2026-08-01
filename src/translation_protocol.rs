@@ -14,6 +14,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::value::RawValue;
 
 use crate::json_diagnostic::JsonErrorCategory;
+use crate::translation::task_planning::TaskId;
 
 /// 托管翻译响应必须遵循的受信外层协议。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -129,7 +130,7 @@ impl TranslationTaskResponseParseError {
 pub(crate) struct ParsedTranslationAssistantEntry {
     id: String,
     value: Box<RawValue>,
-    canonical_id: Option<usize>,
+    canonical_id: Option<TaskId>,
 }
 
 impl ParsedTranslationAssistantEntry {
@@ -137,7 +138,7 @@ impl ParsedTranslationAssistantEntry {
         &self.id
     }
 
-    pub(crate) const fn canonical_id(&self) -> Option<usize> {
+    pub(crate) const fn canonical_id(&self) -> Option<TaskId> {
         self.canonical_id
     }
 
@@ -180,7 +181,7 @@ impl ParsedTranslationAssistantEntry {
         decode_json_string_array_with_cancellation(self.value.get(), &mut ensure_running)
     }
 
-    pub(crate) fn into_parts(self) -> (String, Box<RawValue>, Option<usize>) {
+    pub(crate) fn into_parts(self) -> (String, Box<RawValue>, Option<TaskId>) {
         (self.id, self.value, self.canonical_id)
     }
 }
@@ -349,7 +350,7 @@ pub(crate) fn parse_translation_response_with_cancellation<E>(
 fn parse_model_output_id_with_cancellation<E>(
     value: &str,
     ensure_running: &mut impl FnMut() -> Result<(), E>,
-) -> Result<Option<usize>, E> {
+) -> Result<Option<TaskId>, E> {
     const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
 
     ensure_running()?;
@@ -373,7 +374,7 @@ fn parse_model_output_id_with_cancellation<E>(
         parsed = next;
     }
     ensure_running()?;
-    Ok(Some(parsed))
+    Ok(TaskId::new(parsed))
 }
 
 fn deserialize_model_output_batch_with_cancellation<E>(
@@ -1126,7 +1127,12 @@ mod tests {
                 .iter()
                 .map(|entry| (entry.id(), entry.canonical_id()))
                 .collect::<Vec<_>>(),
-            [("1", Some(1)), ("bad", None), ("1", Some(1)), ("02", None)]
+            [
+                ("1", TaskId::new(1)),
+                ("bad", None),
+                ("1", TaskId::new(1)),
+                ("02", None),
+            ]
         );
     }
 

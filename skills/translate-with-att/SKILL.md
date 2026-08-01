@@ -68,6 +68,12 @@ Generic JSONL 如何产生和如何回写由外部操作者负责。修改 JSONL
 拆分；没有这种边界时保持完整，并在发出模型请求前确认所选 Client 能够处理实际任务。
 用户已经提供 JSONL 时，先报告分组问题及影响；没有修改授权和同步写回过程，不重组输入。
 
+把 Unit、Group、Semantic Scope 和 TaskBlock 分开判断：Unit 是最小验收单位，Group 是
+不可拆的语义整体，Semantic Scope 是允许相邻 Group 共同装箱的最大范围，TaskBlock 是
+一次模型请求的完整上下文。数据源与 Profile 不变时，完整 TaskBlock 的范围和顺序必须
+幂等；Current、复用、非源语、Placeholder 结果、术语命中、临时 ID 和历史任务都不能
+改变装箱边界。
+
 保留全局去重。少量相同原文需要不同译文时，先完成自动翻译，再按
 Lua 文档精确修订目标 Unit，不为少量例外重写提取或去重规则。
 
@@ -114,6 +120,13 @@ ATT 发布目录中的术语规格只定义 ATT 接受的文件、匹配方式�
 - 用数据库和发布终态判断结果；日志和任务记录只用于诊断。
 - 分别解释 Complete、Partial、Unavailable、取消与 outcome unknown；退出码零
   只代表进程正常结束，翻译是否完成要看权威状态。
+- 检查 Partial 或重试时，不要只数带 ID 的原文。任务记录只保存实际请求，但该请求必须
+  包含原 TaskBlock 的全部 Group 和 Unit；已完成或只提供语境的 Unit 使用 `[-]`，需要
+  模型输出的 Unit 才从 `[1]` 起连续编号。数据源与 Profile 未变时，前后两次记录中的块
+  边界和自然顺序应相同；只允许 ID、受 Placeholder 保护的显示文本和实际发送块集合变化。
+- 当前发行版的 MV/MZ 项目数据库只接受当前 schema。旧项目不能由程序识别或迁移；确认
+  数据库不符合当前发行规格时，在新的项目工作区重新 `Init + Extract`，不要修改旧库或
+  从旧库自动带入译文。Generic JSONL 和 Generic 项目按各自现行规格处理。
 - Translate 出现 HTTP 失败或 Unavailable 时，读取对应任务记录和项目日志中的结构化
   状态、供应商 code/type/message。修改 Endpoint、Model 或 parameters 前，把用户要求
   写成精确目标值并逐字段核对；一次请求成功不能代替语义符合要求，也不另发没有授权的

@@ -27,16 +27,27 @@ Extract 的执行者是 Builtin 与 Rules 两类能力，Lua 不在其中。
 
 ## 2. 资产与身份
 
-每个 Group 保存 kind、来源语境、自然顺序和一个或多个 Unit。Unit 内容形状由 RPG Maker
-字段决定：
+Extract 先按引擎结构建立明确的 `Semantic Scope → Group → Unit`。每个 Group 保存 kind、
+来源语境、规范语义顺序和一个或多个 Unit；Translate 直接读取这个层次，不再从相邻路径
+或 owner 类型推断 Scope。Unit 内容形状由 RPG Maker 字段决定：
 
 - 单字符串；
 - 固定逐行数组；
 - 固定逐项数组；
 - 可自由断行数组。
 
-Unit 身份是 `owner + group_location + unit_role`，排序字段不参与身份。Builtin 与
-Rules 都保存可从冻结来源重新验证的写回 recipe。
+Unit 身份是 `owner + group_location + unit_role`，排序字段不参与身份。Builtin 与 Rules
+都保存可从冻结来源重新验证的写回 recipe。
+
+Group 和 Unit 的顺序使用同一种规范语义顺序键。键由物理路径的零个或多个 `u64` 段和
+一个 `fragment` 组成；物理路径来自 JSON 对象插入顺序、数组位置、事件位置或插件位置，
+`fragment` 区分同一物理节点内的角色或捕获槽。数据库 BLOB 对每个路径段写入 `0x01`
+和大端 `u64`，最后写入 `0x00` 和 fragment 的大端 `u64`。该 BLOB 的字典序必须与语义
+顺序完全相同，非法编码会被拒绝。
+
+Builtin 与 Rules 命中相同 kind 和 group location 时属于同一个 Group，读取时按完整顺序
+合并，同时保留每个 Unit 的 owner。Group 顺序键不一致、kind 冲突、重复角色或不同对象
+占用同一顺序键都会明确失败；owner 类型不作为排序补充。
 
 ## 3. Builtin 精确覆盖矩阵
 

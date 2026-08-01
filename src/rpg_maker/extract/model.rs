@@ -10,6 +10,9 @@ use crate::rpg_maker::model::{
     TextUnitContentStructureError, TextUnitContentView, TextUnitRole, mutation_claims_for_group,
     validate_text_unit_content_structure,
 };
+use crate::rpg_maker::semantic_order::{
+    RpgMakerSemanticOrderKey, RpgMakerSemanticOrderProjectionError,
+};
 pub(crate) use crate::rpg_maker::text::{
     RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, TextGroupKind,
 };
@@ -19,6 +22,7 @@ pub(crate) use crate::rpg_maker::text::{
 pub(crate) struct ExtractedTextUnit {
     role: TextUnitRole,
     projection_location: RpgMakerLocation,
+    semantic_order_key: RpgMakerSemanticOrderKey,
     mutation_claim: MutationClaim,
     source_content: TextUnitContent,
 }
@@ -66,9 +70,12 @@ impl ExtractedTextUnit {
                 exact_location: Box::new(projection_location),
             });
         }
+        let semantic_order_key =
+            RpgMakerSemanticOrderKey::from_unit_location(&projection_location, &role);
         Ok(Self {
             role,
             projection_location,
+            semantic_order_key,
             mutation_claim,
             source_content,
         })
@@ -88,6 +95,18 @@ impl ExtractedTextUnit {
     pub(crate) fn source_content(&self) -> &TextUnitContent {
         &self.source_content
     }
+
+    pub(crate) fn projection_location(&self) -> &RpgMakerLocation {
+        &self.projection_location
+    }
+
+    pub(crate) fn semantic_order_key(&self) -> &RpgMakerSemanticOrderKey {
+        &self.semantic_order_key
+    }
+
+    pub(crate) fn set_semantic_order_key(&mut self, semantic_order_key: RpgMakerSemanticOrderKey) {
+        self.semantic_order_key = semantic_order_key;
+    }
 }
 
 /// 一个会作为最小翻译上下文共同送给翻译器的复合文本组。
@@ -95,6 +114,7 @@ impl ExtractedTextUnit {
 pub(crate) struct ExtractedTextGroup {
     kind: TextGroupKind,
     group_location: RpgMakerLocation,
+    semantic_order_key: RpgMakerSemanticOrderKey,
     units: Vec<ExtractedTextUnit>,
     mutation_claims: MutationClaimSet,
     recipes: Vec<TextProjectionRecipe>,
@@ -209,9 +229,11 @@ impl ExtractedTextGroup {
                 }
             })?;
 
+        let semantic_order_key = RpgMakerSemanticOrderKey::from_group_location(&group_location);
         Ok(Self {
             kind,
             group_location,
+            semantic_order_key,
             units,
             mutation_claims,
             recipes,
@@ -224,6 +246,18 @@ impl ExtractedTextGroup {
 
     pub(crate) fn group_location(&self) -> &RpgMakerLocation {
         &self.group_location
+    }
+
+    pub(crate) fn semantic_order_key(&self) -> &RpgMakerSemanticOrderKey {
+        &self.semantic_order_key
+    }
+
+    pub(crate) fn set_semantic_order_key(&mut self, semantic_order_key: RpgMakerSemanticOrderKey) {
+        self.semantic_order_key = semantic_order_key;
+    }
+
+    pub(crate) fn units_mut(&mut self) -> &mut [ExtractedTextUnit] {
+        &mut self.units
     }
 
     pub(crate) fn units(&self) -> &[ExtractedTextUnit] {
@@ -344,6 +378,7 @@ enum NormalizedGroupSlot {
     Complete(Option<ExtractedTextGroup>),
     Merged {
         group_location: RpgMakerLocation,
+        semantic_order_key: RpgMakerSemanticOrderKey,
         kind: TextGroupKind,
         units: Vec<ExtractedTextUnit>,
         recipes: Vec<TextProjectionRecipe>,
@@ -372,9 +407,21 @@ fn normalize_groups_with_rebuild_observer(
                             second: group.kind,
                         });
                     }
+                    let existing_semantic_order_key = &existing
+                        .as_ref()
+                        .expect("尚未归并的完整文本组必须存在")
+                        .semantic_order_key;
+                    if existing_semantic_order_key != &group.semantic_order_key {
+                        return Err(SnapshotModelError::ConflictingSemanticOrderKey {
+                            group_location: Box::new(group.group_location),
+                            first: existing_semantic_order_key.clone(),
+                            second: group.semantic_order_key,
+                        });
+                    }
                     let ExtractedTextGroup {
                         kind,
                         group_location,
+                        semantic_order_key,
                         mut units,
                         mutation_claims: _,
                         mut recipes,
@@ -383,6 +430,7 @@ fn normalize_groups_with_rebuild_observer(
                     recipes.extend(group.recipes);
                     *slot = NormalizedGroupSlot::Merged {
                         group_location,
+                        semantic_order_key,
                         kind,
                         units,
                         recipes,
@@ -390,6 +438,7 @@ fn normalize_groups_with_rebuild_observer(
                 }
                 NormalizedGroupSlot::Merged {
                     group_location,
+                    semantic_order_key,
                     kind,
                     units,
                     recipes,
@@ -399,6 +448,13 @@ fn normalize_groups_with_rebuild_observer(
                             group_location: Box::new(group.group_location),
                             first: *kind,
                             second: group.kind,
+                        });
+                    }
+                    if *semantic_order_key != group.semantic_order_key {
+                        return Err(SnapshotModelError::ConflictingSemanticOrderKey {
+                            group_location: Box::new(group.group_location),
+                            first: semantic_order_key.clone(),
+                            second: group.semantic_order_key,
                         });
                     }
                     debug_assert_eq!(*group_location, group.group_location);
@@ -420,12 +476,16 @@ fn normalize_groups_with_rebuild_observer(
             NormalizedGroupSlot::Complete(group) => group.expect("未重复文本组必须保持完整"),
             NormalizedGroupSlot::Merged {
                 group_location,
+                semantic_order_key,
                 kind,
                 units,
                 recipes,
             } => {
                 observe_rebuild();
-                ExtractedTextGroup::projected(kind, group_location, units, recipes)?
+                let mut group =
+                    ExtractedTextGroup::projected(kind, group_location, units, recipes)?;
+                group.set_semantic_order_key(semantic_order_key);
+                group
             }
         };
         total_claim_locks = total_claim_locks
@@ -477,6 +537,15 @@ pub(crate) enum SnapshotModelError {
         group_location: Box<RpgMakerLocation>,
         first: TextGroupKind,
         second: TextGroupKind,
+    },
+    ConflictingSemanticOrderKey {
+        group_location: Box<RpgMakerLocation>,
+        first: RpgMakerSemanticOrderKey,
+        second: RpgMakerSemanticOrderKey,
+    },
+    SemanticOrderProjection {
+        exact_location: Box<RpgMakerLocation>,
+        source: RpgMakerSemanticOrderProjectionError,
     },
     MutationClaimConflict {
         resource: Box<RpgMakerLocation>,
@@ -545,6 +614,21 @@ impl fmt::Display for SnapshotModelError {
                 formatter,
                 "同一文本组位置 {group_location} 声明了不同类型：{first:?} 与 {second:?}"
             ),
+            Self::ConflictingSemanticOrderKey {
+                group_location,
+                first,
+                second,
+            } => write!(
+                formatter,
+                "同一文本组位置 {group_location} 声明了不同语义顺序键：{first:?} 与 {second:?}"
+            ),
+            Self::SemanticOrderProjection {
+                exact_location,
+                source,
+            } => write!(
+                formatter,
+                "无法从原始 JSON 物理位置建立语义顺序键：{exact_location}：{source}"
+            ),
             Self::MutationClaimConflict { resource } => {
                 write!(formatter, "快照包含冲突的物理修改声明：{resource:?}")
             }
@@ -574,6 +658,7 @@ impl Error for SnapshotModelError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Projection(source) => Some(source),
+            Self::SemanticOrderProjection { source, .. } => Some(source),
             _ => None,
         }
     }

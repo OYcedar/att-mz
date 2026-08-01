@@ -1,6 +1,6 @@
 //! RPG Maker 项目的原子 Lua 适配器。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::{self, BufReader, Read, Write};
 use std::num::NonZeroUsize;
@@ -29,17 +29,19 @@ use crate::rpg_maker::project_database::{
     max_fullwidth_chars_from_rusqlite_value, validate_current_att_schema_with_cancellation,
     validate_mv_dialogue_definition_canonical_json,
 };
+use crate::rpg_maker::semantic_order::RpgMakerSemanticOrderKey;
 use crate::rpg_maker::text::TextGroupKind;
 use crate::rpg_maker::translate::pipeline::{
-    AppliedPlaceholder, PlaceholderRuleOrigin, PlaceholderSegment, TerminologyDependency,
-    TranslationUnitIdentity,
+    AppliedPlaceholder, GroupContextFingerprint, PlaceholderRuleOrigin, PlaceholderSegment,
+    TerminologyDependency, TranslationUnitIdentity,
 };
 use crate::rpg_maker::translate::placeholder::{
     CompiledPlaceholderRules, Pcre2PlaceholderService, PlaceholderRuleCompilationError,
     PlaceholderRuleDefinition,
 };
 use crate::rpg_maker::translate::semantics::{
-    ManualTranslationStateError, ResolvedTranslationSemanticError, TranslationResourceFacts,
+    GroupContextFingerprintError, ManualTranslationStateError, ResolvedTranslationSemanticError,
+    TranslationResourceFacts, group_context_fingerprint_with_cancellation,
     manual_translation_state_fingerprint_with_cancellation,
     prepare_translation_resource_facts_with_cancellation,
 };
@@ -221,6 +223,15 @@ impl ProjectLuaEngineAdapter for RpgMakerProjectLuaAdapter {
         cancellation.ensure_running()?;
         let locator = parse_locator(locator)?;
         let unit = load_unit(connection, &locator, cancellation)?;
+        let group_contexts = load_group_context_fingerprints(
+            connection,
+            Some(&locator.group_location),
+            cancellation,
+        )?;
+        let group_context = group_contexts
+            .get(&locator.group_location)
+            .copied()
+            .ok_or_else(|| invalid_database("人工译文 Unit 缺少完整 Group 语境"))?;
         let LoadedUnit {
             owner,
             group_location,
@@ -257,6 +268,7 @@ impl ProjectLuaEngineAdapter for RpgMakerProjectLuaAdapter {
         let state = manual_translation_state_fingerprint_with_cancellation(
             self.engine,
             &language_pair,
+            group_context,
             &identity,
             &placeholders,
             || cancellation.ensure_running(),
@@ -402,6 +414,7 @@ impl ProjectLuaEngineAdapter for RpgMakerProjectLuaAdapter {
 #[derive(Debug)]
 struct RpgMakerCurrentBaseline {
     group_kind: String,
+    group_context: GroupContextFingerprint,
     source_content_json: String,
     source_context_json: String,
     translation_content_json: String,
@@ -673,6 +686,251 @@ struct LoadedUnit {
     source_context_json: String,
     language_pair: LanguagePair,
     placeholder_rules_json: String,
+}
+
+struct LoadedGroupContextUnit {
+    semantic_order_key: RpgMakerSemanticOrderKey,
+    identity: TranslationUnitIdentity,
+}
+
+struct LoadedGroupContext {
+    location_raw: String,
+    location: crate::rpg_maker::text::RpgMakerLocation,
+    kind: TextGroupKind,
+    semantic_order_key: RpgMakerSemanticOrderKey,
+    units: Vec<LoadedGroupContextUnit>,
+}
+
+fn load_group_context_fingerprints(
+    connection: &Connection,
+    only_location: Option<&str>,
+    cancellation: RpgMakerLuaCancellation<'_>,
+) -> Result<HashMap<String, GroupContextFingerprint>, ProjectLuaCallError> {
+    cancellation.ensure_running()?;
+    let group_sql = if only_location.is_some() {
+        "SELECT owner, group_location, semantic_order_key, group_kind
+         FROM main.rpg_maker_text_group
+         WHERE group_location = ?1
+         ORDER BY semantic_order_key,
+                  CASE owner WHEN 'builtin' THEN 0 WHEN 'rules' THEN 1 END"
+    } else {
+        "SELECT owner, group_location, semantic_order_key, group_kind
+         FROM main.rpg_maker_text_group
+         ORDER BY semantic_order_key,
+                  CASE owner WHEN 'builtin' THEN 0 WHEN 'rules' THEN 1 END"
+    };
+    let mut group_statement = connection
+        .prepare(group_sql)
+        .map_err(|source| invalid_database(format!("读取完整 Group 语境失败：{source}")))?;
+    let mut group_rows = match only_location {
+        Some(location) => group_statement.query(params![location]),
+        None => group_statement.query([]),
+    }
+    .map_err(|source| invalid_database(format!("读取完整 Group 语境失败：{source}")))?;
+    let mut group_indexes = RpgMakerGroupIndexes::default();
+    let mut logical_locations = HashMap::<String, usize>::new();
+    let mut semantic_orders = HashMap::<RpgMakerSemanticOrderKey, String>::new();
+    let mut groups = Vec::<LoadedGroupContext>::new();
+    while let Some(row) = group_rows
+        .next()
+        .map_err(|source| invalid_database(format!("读取完整 Group 语境失败：{source}")))?
+    {
+        cancellation.ensure_running()?;
+        let owner_raw =
+            sqlite_text_with_cancellation(row, 0, "owner", cancellation).map_err(|source| {
+                invalid_database_sqlite_read_error(source, "读取完整 Group 语境失败")
+            })?;
+        let location_raw = sqlite_text_with_cancellation(row, 1, "group_location", cancellation)
+            .map_err(|source| {
+                invalid_database_sqlite_read_error(source, "读取完整 Group 语境失败")
+            })?;
+        let semantic_order_key =
+            sqlite_blob_with_cancellation(row, 2, "semantic_order_key", cancellation).map_err(
+                |source| invalid_database_sqlite_read_error(source, "读取完整 Group 语境失败"),
+            )?;
+        let kind_raw = sqlite_text_with_cancellation(row, 3, "group_kind", cancellation).map_err(
+            |source| invalid_database_sqlite_read_error(source, "读取完整 Group 语境失败"),
+        )?;
+        let owner = RpgMakerAssetOwner::from_storage_name(&owner_raw)
+            .ok_or_else(|| invalid_database("完整 Group 语境包含无效 owner"))?;
+        let semantic_order_key = RpgMakerSemanticOrderKey::decode(&semantic_order_key)
+            .map_err(|source| invalid_database(format!("完整 Group 语境顺序键无效：{source}")))?;
+        let kind = TextGroupKind::from_storage_name(&kind_raw)
+            .ok_or_else(|| invalid_database("完整 Group 语境包含无效 kind"))?;
+        let location = RpgMakerLocationCodec::decode(&location_raw)
+            .map_err(|source| invalid_database(format!("完整 Group 语境位置无效：{source}")))?;
+        let index = if let Some(index) = logical_locations.get(&location_raw).copied() {
+            let existing = &groups[index];
+            if existing.kind != kind
+                || existing.semantic_order_key != semantic_order_key
+                || existing.location != location
+            {
+                return Err(invalid_database(format!(
+                    "跨 owner 的 Group 定义不一致：{location_raw}"
+                )));
+            }
+            index
+        } else {
+            if let Some(first) =
+                semantic_orders.insert(semantic_order_key.clone(), location_raw.clone())
+            {
+                return Err(invalid_database(format!(
+                    "不同 Group 使用了相同 semantic_order_key：{first} / {location_raw}"
+                )));
+            }
+            let index = groups.len();
+            logical_locations.insert(location_raw.clone(), index);
+            groups.push(LoadedGroupContext {
+                location_raw: location_raw.clone(),
+                location,
+                kind,
+                semantic_order_key,
+                units: Vec::new(),
+            });
+            index
+        };
+        if !group_indexes.insert(owner, location_raw, index, cancellation)? {
+            return Err(invalid_database("完整 Group 语境包含重复 Group 身份"));
+        }
+    }
+    drop(group_rows);
+    drop(group_statement);
+
+    cancellation.ensure_running()?;
+    let unit_sql = if only_location.is_some() {
+        "SELECT unit.owner, unit.group_location, unit.unit_role,
+                unit.semantic_order_key, unit.source_content_json,
+                unit.source_context_json
+         FROM main.rpg_maker_text_unit AS unit
+         WHERE unit.group_location = ?1
+         ORDER BY unit.semantic_order_key,
+                  CASE unit.owner WHEN 'builtin' THEN 0 WHEN 'rules' THEN 1 END"
+    } else {
+        "SELECT unit.owner, unit.group_location, unit.unit_role,
+                unit.semantic_order_key, unit.source_content_json,
+                unit.source_context_json
+         FROM main.rpg_maker_text_unit AS unit
+         ORDER BY unit.semantic_order_key,
+                  CASE unit.owner WHEN 'builtin' THEN 0 WHEN 'rules' THEN 1 END"
+    };
+    let mut unit_statement = connection
+        .prepare(unit_sql)
+        .map_err(|source| invalid_database(format!("读取完整 Group Unit 失败：{source}")))?;
+    let mut unit_rows = match only_location {
+        Some(location) => unit_statement.query(params![location]),
+        None => unit_statement.query([]),
+    }
+    .map_err(|source| invalid_database(format!("读取完整 Group Unit 失败：{source}")))?;
+    while let Some(row) = unit_rows
+        .next()
+        .map_err(|source| invalid_database(format!("读取完整 Group Unit 失败：{source}")))?
+    {
+        cancellation.ensure_running()?;
+        let owner_raw =
+            sqlite_text_with_cancellation(row, 0, "owner", cancellation).map_err(|source| {
+                invalid_database_sqlite_read_error(source, "读取完整 Group Unit 失败")
+            })?;
+        let location_raw = sqlite_text_with_cancellation(row, 1, "group_location", cancellation)
+            .map_err(|source| {
+                invalid_database_sqlite_read_error(source, "读取完整 Group Unit 失败")
+            })?;
+        let role_raw =
+            sqlite_text_with_cancellation(row, 2, "unit_role", cancellation).map_err(|source| {
+                invalid_database_sqlite_read_error(source, "读取完整 Group Unit 失败")
+            })?;
+        let semantic_order_key =
+            sqlite_blob_with_cancellation(row, 3, "semantic_order_key", cancellation).map_err(
+                |source| invalid_database_sqlite_read_error(source, "读取完整 Group Unit 失败"),
+            )?;
+        let source_json =
+            sqlite_text_with_cancellation(row, 4, "source_content_json", cancellation).map_err(
+                |source| invalid_database_sqlite_read_error(source, "读取完整 Group Unit 失败"),
+            )?;
+        let context_json =
+            sqlite_text_with_cancellation(row, 5, "source_context_json", cancellation).map_err(
+                |source| invalid_database_sqlite_read_error(source, "读取完整 Group Unit 失败"),
+            )?;
+        let owner = RpgMakerAssetOwner::from_storage_name(&owner_raw)
+            .ok_or_else(|| invalid_database("完整 Group Unit 包含无效 owner"))?;
+        let index = group_indexes
+            .get(owner, &location_raw, cancellation)?
+            .ok_or_else(|| invalid_database("完整 Group Unit 缺少所属 Group"))?;
+        let semantic_order_key = RpgMakerSemanticOrderKey::decode(&semantic_order_key)
+            .map_err(|source| invalid_database(format!("完整 Group Unit 顺序键无效：{source}")))?;
+        let role = RpgMakerProjectionCodec::decode_role(&role_raw)
+            .map_err(|source| invalid_database(format!("完整 Group Unit 角色无效：{source}")))?;
+        let source_content: TextUnitContent =
+            parse_json_with_cancellation(&source_json, "完整 Group Unit 原文", cancellation)?;
+        let context: serde_json::Value =
+            parse_json_with_cancellation(&context_json, "完整 Group Unit 上下文", cancellation)?;
+        if !context.is_object() {
+            return Err(invalid_database("完整 Group Unit 上下文必须是 JSON object"));
+        }
+        let group = &mut groups[index];
+        if group
+            .units
+            .iter()
+            .any(|unit| unit.semantic_order_key == semantic_order_key)
+        {
+            return Err(invalid_database(format!(
+                "同一完整 Group 的不同 Unit 使用了相同 semantic_order_key：{location_raw}"
+            )));
+        }
+        if group.units.iter().any(|unit| unit.identity.role() == &role) {
+            return Err(invalid_database(format!(
+                "同一完整 Group 包含重复 Unit 角色：{location_raw} / {role_raw}"
+            )));
+        }
+        group.units.push(LoadedGroupContextUnit {
+            semantic_order_key,
+            identity: TranslationUnitIdentity::new(
+                owner,
+                group.kind,
+                group.location.clone(),
+                role,
+                source_content,
+                context_json,
+            ),
+        });
+    }
+    drop(unit_rows);
+    drop(unit_statement);
+
+    let mut fingerprints = HashMap::with_capacity(groups.len());
+    for mut group in groups {
+        cancellation.ensure_running()?;
+        if group.units.is_empty() {
+            return Err(invalid_database(format!(
+                "完整 Group 不得为空：{}",
+                group.location_raw
+            )));
+        }
+        group
+            .units
+            .sort_by(|left, right| left.semantic_order_key.cmp(&right.semantic_order_key));
+        let fingerprint = group_context_fingerprint_with_cancellation(
+            group.kind,
+            &group.semantic_order_key,
+            group
+                .units
+                .iter()
+                .map(|unit| (&unit.semantic_order_key, &unit.identity)),
+            || cancellation.ensure_running(),
+        )?
+        .map_err(group_context_fingerprint_error)?;
+        if fingerprints
+            .insert(group.location_raw, fingerprint)
+            .is_some()
+        {
+            return Err(invalid_database("完整 Group 语境位置重复"));
+        }
+    }
+    cancellation.ensure_running()?;
+    Ok(fingerprints)
+}
+
+fn group_context_fingerprint_error(source: GroupContextFingerprintError) -> ProjectLuaCallError {
+    invalid_database(format!("无法建立完整 Group 语境指纹：{source}"))
 }
 
 fn load_unit(
@@ -1048,6 +1306,106 @@ fn prepare_current_resource_facts(
         Ok(facts) => Ok(facts),
         Err(source) => Err(resource_semantic_error(source)),
     }
+}
+
+/// 按完整 Group 汇总所有 Unit 实际命中的术语依赖。
+///
+/// 返回值以 Group 位置为键；依赖按术语文件顺序排列并去重。不同 Group 即使随后
+/// 被装进同一个 TaskBlock，也不会在这里互相影响译文状态。
+fn load_group_terminology_dependencies(
+    connection: &Connection,
+    engine: RpgMakerEngine,
+    terminology: &CompiledTerminology,
+    placeholder_service: &Pcre2PlaceholderService,
+    placeholder_rules: &CompiledPlaceholderRules,
+    cancellation: RpgMakerLuaCancellation<'_>,
+) -> Result<HashMap<String, Vec<TerminologyDependency>>, ProjectLuaCallError> {
+    cancellation.ensure_running()?;
+    let mut statement = connection
+        .prepare(
+            "SELECT unit.group_location, text_group.group_kind,
+                    unit.source_content_json
+             FROM main.rpg_maker_text_unit AS unit
+             JOIN main.rpg_maker_text_group AS text_group
+               ON text_group.owner = unit.owner
+              AND text_group.group_location = unit.group_location
+             ORDER BY text_group.semantic_order_key,
+                      unit.semantic_order_key,
+                      CASE unit.owner WHEN 'builtin' THEN 0 WHEN 'rules' THEN 1 END",
+        )
+        .map_err(|source| invalid_database(format!("读取完整 Group 术语事实失败：{source}")))?;
+    let mut rows = statement
+        .query([])
+        .map_err(|source| invalid_database(format!("读取完整 Group 术语事实失败：{source}")))?;
+    let mut groups =
+        HashMap::<String, (TextGroupKind, BTreeMap<usize, TerminologyDependency>)>::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(|source| invalid_database(format!("读取完整 Group 术语事实失败：{source}")))?
+    {
+        cancellation.ensure_running()?;
+        let location_raw = sqlite_text_with_cancellation(row, 0, "group_location", cancellation)
+            .map_err(|source| {
+                invalid_database_sqlite_read_error(source, "读取完整 Group 术语事实失败")
+            })?;
+        let kind_raw = sqlite_text_with_cancellation(row, 1, "group_kind", cancellation).map_err(
+            |source| invalid_database_sqlite_read_error(source, "读取完整 Group 术语事实失败"),
+        )?;
+        let source_json =
+            sqlite_text_with_cancellation(row, 2, "source_content_json", cancellation).map_err(
+                |source| invalid_database_sqlite_read_error(source, "读取完整 Group 术语事实失败"),
+            )?;
+        let kind = TextGroupKind::from_storage_name(&kind_raw)
+            .ok_or_else(|| invalid_database("完整 Group 术语事实包含无效 kind"))?;
+        let source: TextUnitContent =
+            parse_json_with_cancellation(&source_json, "完整 Group 术语事实原文", cancellation)?;
+        let facts = prepare_current_resource_facts(
+            engine,
+            kind,
+            &source,
+            terminology,
+            placeholder_service,
+            placeholder_rules,
+            cancellation,
+        )?;
+        if facts.term_indices().len() != facts.terminology_dependencies().len() {
+            return Err(invalid_database("完整 Group 术语索引与依赖数量不一致"));
+        }
+        let (group_kind, dependencies) = groups
+            .entry(location_raw.clone())
+            .or_insert_with(|| (kind, BTreeMap::new()));
+        if *group_kind != kind {
+            return Err(invalid_database(format!(
+                "跨 owner 的 Group kind 不一致：{location_raw}"
+            )));
+        }
+        for (&term_index, dependency) in facts
+            .term_indices()
+            .iter()
+            .zip(facts.terminology_dependencies())
+        {
+            cancellation.ensure_running()?;
+            if let Some(existing) = dependencies.get(&term_index) {
+                if existing != dependency {
+                    return Err(invalid_database(format!(
+                        "相同术语索引产生了不一致依赖：{location_raw} / {term_index}"
+                    )));
+                }
+            } else {
+                dependencies.insert(term_index, dependency.clone());
+            }
+        }
+    }
+    drop(rows);
+    drop(statement);
+
+    let mut completed = HashMap::with_capacity(groups.len());
+    for (location, (_, dependencies)) in groups {
+        cancellation.ensure_running()?;
+        completed.insert(location, dependencies.into_values().collect());
+    }
+    cancellation.ensure_running()?;
+    Ok(completed)
 }
 
 fn resource_semantic_error(source: ResolvedTranslationSemanticError) -> ProjectLuaCallError {
@@ -2072,6 +2430,15 @@ fn capture_rpg_maker_translation_baseline(
     let placeholder_rules =
         compile_placeholder_rules(&placeholder_service, &placeholder_json, cancellation)?;
     let terminology = compile_terminology_resource(&terminology_json, cancellation)?;
+    let group_contexts = load_group_context_fingerprints(connection, None, cancellation)?;
+    let group_terminology_dependencies = load_group_terminology_dependencies(
+        connection,
+        engine,
+        terminology.as_ref(),
+        &placeholder_service,
+        &placeholder_rules,
+        cancellation,
+    )?;
 
     cancellation.ensure_running()?;
     let mut current_statement = connection
@@ -2181,9 +2548,14 @@ fn capture_rpg_maker_translation_baseline(
             source,
             source_context_json.clone(),
         );
+        let group_context = group_contexts
+            .get(&group_location)
+            .copied()
+            .ok_or_else(|| invalid_database("脚本前 Current 缺少完整 Group 语境"))?;
         let manual_state = manual_translation_state_fingerprint_with_cancellation(
             engine,
             &language_pair,
+            group_context,
             &identity,
             resource_facts.placeholders(),
             || cancellation.ensure_running(),
@@ -2192,13 +2564,17 @@ fn capture_rpg_maker_translation_baseline(
         let origin = if manual_state == translation_state {
             RpgMakerTranslationOrigin::Manual
         } else {
+            let terminology_dependencies = group_terminology_dependencies
+                .get(&group_location)
+                .ok_or_else(|| invalid_database("脚本前 Current 缺少完整 Group 术语事实"))?;
             RpgMakerTranslationOrigin::Automatic(TerminologyDependencyProof::from_dependencies(
-                resource_facts.terminology_dependencies(),
+                terminology_dependencies,
                 cancellation,
             )?)
         };
         let baseline = RpgMakerCurrentBaseline {
             group_kind,
+            group_context,
             source_content_json,
             source_context_json,
             translation_content_json,
@@ -2490,7 +2866,7 @@ struct StoredUnit {
     role_raw: String,
     source_json: String,
     context_json: String,
-    unit_order: usize,
+    semantic_order_key: RpgMakerSemanticOrderKey,
     write_back: RpgMakerWriteBackUnit,
 }
 
@@ -2498,7 +2874,7 @@ struct StoredGroup {
     owner: RpgMakerAssetOwner,
     location_raw: String,
     location: crate::rpg_maker::text::RpgMakerLocation,
-    group_order: usize,
+    semantic_order_key: RpgMakerSemanticOrderKey,
     kind_raw: String,
     kind: TextGroupKind,
     recipes_raw: String,
@@ -2514,6 +2890,15 @@ fn validate_assets(
     cancellation: RpgMakerLuaCancellation<'_>,
 ) -> Result<(), ProjectLuaCallError> {
     cancellation.ensure_running()?;
+    let current_group_contexts = load_group_context_fingerprints(connection, None, cancellation)?;
+    let current_group_terminology_dependencies = load_group_terminology_dependencies(
+        connection,
+        engine,
+        resources.terminology.as_ref(),
+        &resources.placeholder_service,
+        &resources.placeholder_rules,
+        cancellation,
+    )?;
     let builtin_only_rules = resources
         .placeholder_service
         .compile_custom_with_cancellation(Vec::new(), || cancellation.ensure_running())?
@@ -2566,17 +2951,18 @@ fn validate_assets(
     cancellation.ensure_running()?;
     let mut group_statement = connection
         .prepare(
-            "SELECT owner, group_location, group_order, group_kind,
+            "SELECT owner, group_location, semantic_order_key, group_kind,
                     projection_recipe_json
              FROM main.rpg_maker_text_group
              ORDER BY CASE owner WHEN 'builtin' THEN 0 WHEN 'rules' THEN 1 END,
-                      group_order",
+                      semantic_order_key",
         )
         .map_err(|source| invalid_database(format!("读取 RPG Maker Group 失败：{source}")))?;
     let mut group_rows = group_statement
         .query([])
         .map_err(|source| invalid_database(format!("读取 RPG Maker Group 失败：{source}")))?;
-    let mut next_group_orders = HashMap::<RpgMakerAssetOwner, usize>::new();
+    let mut group_order_keys =
+        HashMap::<RpgMakerAssetOwner, HashMap<RpgMakerSemanticOrderKey, String>>::new();
     let mut groups = Vec::new();
     let mut group_indexes = RpgMakerGroupIndexes::default();
     while let Some(group_row) = group_rows
@@ -2592,9 +2978,11 @@ fn validate_assets(
             sqlite_text_with_cancellation(group_row, 1, "group_location", cancellation).map_err(
                 |source| invalid_database_sqlite_read_error(source, "读取 RPG Maker Group 失败"),
             )?;
-        let group_order = group_row
-            .get::<_, i64>(2)
-            .map_err(|source| invalid_database(format!("读取 RPG Maker Group 失败：{source}")))?;
+        let semantic_order_key =
+            sqlite_blob_with_cancellation(group_row, 2, "semantic_order_key", cancellation)
+                .map_err(|source| {
+                    invalid_database_sqlite_read_error(source, "读取 RPG Maker Group 失败")
+                })?;
         let kind_raw = sqlite_text_with_cancellation(group_row, 3, "group_kind", cancellation)
             .map_err(|source| {
                 invalid_database_sqlite_read_error(source, "读取 RPG Maker Group 失败")
@@ -2609,16 +2997,17 @@ fn validate_assets(
         if !owner_fingerprints.contains_key(&owner) {
             return Err(invalid_database("Group 引用了未激活的 owner"));
         }
-        let group_order = usize::try_from(group_order)
-            .map_err(|_| invalid_database("Group order 不是非负序号"))?;
-        let expected = next_group_orders.entry(owner).or_default();
-        if group_order != *expected {
+        let semantic_order_key = RpgMakerSemanticOrderKey::decode(&semantic_order_key)
+            .map_err(|source| invalid_database(format!("Group 顺序键无效：{source}")))?;
+        if let Some(first) = group_order_keys
+            .entry(owner)
+            .or_default()
+            .insert(semantic_order_key.clone(), location_raw.clone())
+        {
             return Err(invalid_database(format!(
-                "{} Group order 必须从 0 连续",
-                owner.storage_name()
+                "不同 Group 使用了相同 semantic_order_key：{first} / {location_raw}"
             )));
         }
-        *expected += 1;
         cancellation.ensure_running()?;
         let location = RpgMakerLocationCodec::decode(&location_raw)
             .map_err(|source| invalid_database(format!("Group 位置无效：{source}")))?;
@@ -2637,7 +3026,7 @@ fn validate_assets(
             owner,
             location_raw,
             location,
-            group_order,
+            semantic_order_key,
             kind_raw,
             kind,
             recipes_raw,
@@ -2651,7 +3040,7 @@ fn validate_assets(
     cancellation.ensure_running()?;
     let mut unit_statement = connection
         .prepare(
-            "SELECT unit.owner, unit.group_location, unit.unit_role, unit.unit_order,
+            "SELECT unit.owner, unit.group_location, unit.unit_role, unit.semantic_order_key,
                     unit.source_content_json, unit.source_context_json,
                     unit.translation_content_json, unit.translation_state
              FROM main.rpg_maker_text_unit AS unit
@@ -2659,7 +3048,7 @@ fn validate_assets(
                ON text_group.owner = unit.owner
               AND text_group.group_location = unit.group_location
              ORDER BY CASE unit.owner WHEN 'builtin' THEN 0 WHEN 'rules' THEN 1 END,
-                      text_group.group_order, unit.unit_order",
+                      text_group.semantic_order_key, unit.semantic_order_key",
         )
         .map_err(|source| invalid_database(format!("读取 RPG Maker Unit 失败：{source}")))?;
     let mut unit_rows = unit_statement
@@ -2681,9 +3070,11 @@ fn validate_assets(
             .map_err(|source| {
                 invalid_database_sqlite_read_error(source, "读取 RPG Maker Unit 失败")
             })?;
-        let unit_order = unit_row
-            .get::<_, i64>(3)
-            .map_err(|source| invalid_database(format!("读取 RPG Maker Unit 失败：{source}")))?;
+        let semantic_order_key =
+            sqlite_blob_with_cancellation(unit_row, 3, "semantic_order_key", cancellation)
+                .map_err(|source| {
+                    invalid_database_sqlite_read_error(source, "读取 RPG Maker Unit 失败")
+                })?;
         let source_json =
             sqlite_text_with_cancellation(unit_row, 4, "source_content_json", cancellation)
                 .map_err(|source| {
@@ -2712,10 +3103,16 @@ fn validate_assets(
             .get(owner, &location_raw, cancellation)?
             .ok_or_else(|| invalid_database("Unit 缺少所属 Group"))?;
         let group = &mut groups[index];
-        let unit_order =
-            usize::try_from(unit_order).map_err(|_| invalid_database("Unit order 不是非负序号"))?;
-        if unit_order != group.units.len() {
-            return Err(invalid_database("Unit order 必须从 0 连续"));
+        let semantic_order_key = RpgMakerSemanticOrderKey::decode(&semantic_order_key)
+            .map_err(|source| invalid_database(format!("Unit 顺序键无效：{source}")))?;
+        if group
+            .units
+            .iter()
+            .any(|unit| unit.semantic_order_key == semantic_order_key)
+        {
+            return Err(invalid_database(
+                "同一 Group 的不同 Unit 使用了相同 semantic_order_key",
+            ));
         }
         cancellation.ensure_running()?;
         let role = RpgMakerProjectionCodec::decode_role(&role_raw)
@@ -2768,6 +3165,17 @@ fn validate_assets(
         }
         if let (Some(translation), Some(state)) = (translation.as_ref(), translation_state.as_ref())
         {
+            let group_context = current_group_contexts
+                .get(&location_raw)
+                .copied()
+                .ok_or_else(|| {
+                    with_unit_locator(
+                        invalid_database("Unit 缺少完整 Group 语境"),
+                        &owner_raw,
+                        &location_raw,
+                        &role_raw,
+                    )
+                })?;
             validate_translation_structure(group.kind, &role, &source, translation, cancellation)
                 .map_err(|source| with_unit_locator(source, &owner_raw, &location_raw, &role_raw))?;
             let resource_facts = prepare_current_resource_facts(
@@ -2793,6 +3201,7 @@ fn validate_assets(
             let existing_current = baseline.filter(|baseline| baseline.translation_state == *state);
             if let Some(baseline) = existing_current {
                 let unchanged_semantics = baseline.group_kind == group.kind_raw
+                    && baseline.group_context == group_context
                     && text_eq_with_cancellation(
                         &baseline.source_content_json,
                         &source_json,
@@ -2855,8 +3264,18 @@ fn validate_assets(
                 if let RpgMakerTranslationOrigin::Automatic(baseline_dependencies) =
                     &baseline.origin
                 {
+                    let terminology_dependencies = current_group_terminology_dependencies
+                        .get(&location_raw)
+                        .ok_or_else(|| {
+                            with_unit_locator(
+                                invalid_database("已有自动译文缺少完整 Group 术语事实"),
+                                &owner_raw,
+                                &location_raw,
+                                &role_raw,
+                            )
+                        })?;
                     let current_dependencies = TerminologyDependencyProof::from_dependencies(
-                        resource_facts.terminology_dependencies(),
+                        terminology_dependencies,
                         cancellation,
                     )?;
                     if !baseline_dependencies
@@ -2864,7 +3283,7 @@ fn validate_assets(
                     {
                         return Err(with_unit_locator(
                             invalid_database(
-                                "已有自动译文只允许在实际命中的 Terminology 不变时保留原 translation_state",
+                                "已有自动译文只允许在完整 Group 实际命中的 Terminology 不变时保留原 translation_state",
                             ),
                             &owner_raw,
                             &location_raw,
@@ -2897,6 +3316,7 @@ fn validate_assets(
                 let manual_state = manual_translation_state_fingerprint_with_cancellation(
                     engine,
                     &resources.language_pair,
+                    group_context,
                     &identity,
                     resource_facts.placeholders(),
                     || cancellation.ensure_running(),
@@ -2922,7 +3342,7 @@ fn validate_assets(
             role_raw,
             source_json,
             context_json,
-            unit_order,
+            semantic_order_key,
             write_back,
         });
     }
@@ -2948,7 +3368,7 @@ fn validate_assets(
             .expect("Group owner 已验证")
             .group(
                 &group.location_raw,
-                group.group_order,
+                &group.semantic_order_key,
                 &group.kind_raw,
                 &group.recipes_raw,
             );
@@ -2964,7 +3384,7 @@ fn validate_assets(
                 .unit(
                     &group.location_raw,
                     &unit.role_raw,
-                    unit.unit_order,
+                    &unit.semantic_order_key,
                     &unit.source_json,
                     &unit.context_json,
                 );
@@ -3008,7 +3428,7 @@ fn validate_assets(
                     resource_key,
                     lock.access(),
                     group.location_raw.clone(),
-                    group.group_order,
+                    group.semantic_order_key.clone(),
                 ));
         }
     }
@@ -3054,10 +3474,10 @@ fn validate_assets(
             })?;
         let owner = RpgMakerAssetOwner::from_storage_name(&owner_raw)
             .ok_or_else(|| invalid_database("Claim owner 无效"))?;
-        let group_order = group_indexes
+        let semantic_order_key = group_indexes
             .get(owner, &location_raw, cancellation)?
             .and_then(|index| groups.get(index))
-            .map(|group| group.group_order)
+            .map(|group| group.semantic_order_key.clone())
             .ok_or_else(|| invalid_database("Claim 缺少所属 Group"))?;
         cancellation.ensure_running()?;
         let resource = RpgMakerProjectionCodec::decode_mutation_resource(&resource_raw)
@@ -3078,7 +3498,7 @@ fn validate_assets(
                 resource_raw,
                 access,
                 location_raw,
-                group_order,
+                semantic_order_key,
             ));
     }
     drop(claim_rows);
@@ -3223,6 +3643,9 @@ mod tests {
         let group_location = RpgMakerLocationCodec::encode(&location).expect("应编码位置");
         let role = TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应有效"));
         let unit_role = RpgMakerProjectionCodec::encode_role(&role).expect("应编码角色");
+        let group_semantic_order_key = RpgMakerSemanticOrderKey::from_group_location(&location);
+        let unit_semantic_order_key =
+            RpgMakerSemanticOrderKey::from_unit_location(&location, &role);
         let source = r"\V[1]こんにちは {hero}";
         let source_content = TextUnitContent::Value(source.to_owned());
         let source_json = serde_json::to_string(&source_content).expect("应编码原文");
@@ -3253,7 +3676,7 @@ mod tests {
                         .expect("应编码 Claim"),
                     lock.access(),
                     group_location.clone(),
-                    0,
+                    group_semantic_order_key.clone(),
                 )
             })
             .collect::<Vec<_>>();
@@ -3265,11 +3688,17 @@ mod tests {
         );
         fingerprint.group(
             &group_location,
-            0,
+            &group_semantic_order_key,
             TextGroupKind::DatabaseEntry.storage_name(),
             &recipes_json,
         );
-        fingerprint.unit(&group_location, &unit_role, 0, &source_json, context_json);
+        fingerprint.unit(
+            &group_location,
+            &unit_role,
+            &unit_semantic_order_key,
+            &source_json,
+            context_json,
+        );
         for claim in &claims {
             fingerprint.claim(
                 &claim.resource_key,
@@ -3308,19 +3737,33 @@ mod tests {
         transaction
             .execute(
                 "INSERT INTO rpg_maker_text_group
-                 (owner, group_location, group_order, group_kind, projection_recipe_json)
-                 VALUES ('builtin', ?1, 0, 'database_entry', ?2)",
-                params![group_location, recipes_json],
+                 (owner, group_location, semantic_order_key, group_kind, projection_recipe_json)
+                 VALUES ('builtin', ?1, ?2, 'database_entry', ?3)",
+                params![
+                    group_location,
+                    group_semantic_order_key
+                        .encode()
+                        .expect("应编码 Group 顺序键"),
+                    recipes_json
+                ],
             )
             .expect("应插入 Group");
         transaction
             .execute(
                 "INSERT INTO rpg_maker_text_unit
-                 (owner, group_location, unit_role, unit_order,
+                 (owner, group_location, unit_role, semantic_order_key,
                   source_content_json, source_context_json,
                   translation_content_json, translation_state)
-                 VALUES ('builtin', ?1, ?2, 0, ?3, ?4, NULL, NULL)",
-                params![group_location, unit_role, source_json, context_json],
+                 VALUES ('builtin', ?1, ?2, ?3, ?4, ?5, NULL, NULL)",
+                params![
+                    group_location,
+                    unit_role,
+                    unit_semantic_order_key
+                        .encode()
+                        .expect("应编码 Unit 顺序键"),
+                    source_json,
+                    context_json
+                ],
             )
             .expect("应插入 Unit");
         for claim in summary {
@@ -3339,6 +3782,153 @@ mod tests {
         }
         transaction.commit().expect("应提交测试资产");
         (group_location, unit_role)
+    }
+
+    fn install_rules_sibling(project: &TestProject) -> String {
+        let connection = Connection::open(&project.database_path).expect("应打开项目数据库");
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .expect("应启用外键");
+        let group_order_blob: Vec<u8> = connection
+            .query_row(
+                "SELECT semantic_order_key
+                 FROM rpg_maker_text_group
+                 WHERE owner = 'builtin' AND group_location = ?1",
+                [&project.group_location],
+                |row| row.get(0),
+            )
+            .expect("应读取 Builtin Group 顺序键");
+        let group_order = RpgMakerSemanticOrderKey::decode(&group_order_blob)
+            .expect("Builtin Group 顺序键应有效");
+        let logical_group_location =
+            RpgMakerLocationCodec::decode(&project.group_location).expect("测试 Group 位置应有效");
+        let sibling_location = RpgMakerLocation::value(
+            RpgMakerSource::data(StandardDataFile::Actors),
+            vec![
+                RpgMakerLocationStep::index(1),
+                RpgMakerLocationStep::key("description"),
+            ],
+        );
+        let sibling_role =
+            TextUnitRole::Scalar(ScalarFieldKey::new("description").expect("测试字段键应有效"));
+        let sibling_role_raw =
+            RpgMakerProjectionCodec::encode_role(&sibling_role).expect("应编码兄弟角色");
+        let sibling_order =
+            RpgMakerSemanticOrderKey::from_unit_location(&sibling_location, &sibling_role);
+        let sibling_source = TextUnitContent::Value("兄弟こんにちは".to_owned());
+        let sibling_source_json = serde_json::to_string(&sibling_source).expect("应编码兄弟原文");
+        let recipes = vec![TextProjectionRecipe::Direct(
+            DirectTextRecipe::new(
+                sibling_location,
+                "兄弟こんにちは",
+                vec![DirectTextPart::TextSlot {
+                    role: sibling_role.clone(),
+                }],
+            )
+            .expect("应建立兄弟直接配方"),
+        )];
+        let recipes_json = RpgMakerProjectionCodec::encode_recipes(&recipes).expect("应编码配方");
+        let write_back_group = RpgMakerWriteBackGroup::from_recipes(
+            TextGroupKind::DatabaseEntry,
+            logical_group_location,
+            vec![
+                RpgMakerWriteBackUnit::new(sibling_role, sibling_source, None)
+                    .expect("应建立兄弟写回 Unit"),
+            ],
+            recipes,
+        )
+        .expect("应建立兄弟写回 Group");
+        let mut claims = write_back_group
+            .mutation_claims()
+            .locks()
+            .iter()
+            .map(|lock| {
+                EncodedMutationClaim::new(
+                    RpgMakerProjectionCodec::encode_mutation_resource(lock.resource())
+                        .expect("应编码兄弟 Claim"),
+                    lock.access(),
+                    project.group_location.clone(),
+                    group_order.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        sort_logical_claims(&mut claims);
+        let summary = collision_summary(&claims).expect("应建立兄弟 Claim 摘要");
+        let mut fingerprint =
+            RpgMakerTextSnapshotFingerprintBuilder::new(RpgMakerAssetOwner::Rules, None);
+        fingerprint.group(
+            &project.group_location,
+            &group_order,
+            TextGroupKind::DatabaseEntry.storage_name(),
+            &recipes_json,
+        );
+        fingerprint.unit(
+            &project.group_location,
+            &sibling_role_raw,
+            &sibling_order,
+            &sibling_source_json,
+            "{}",
+        );
+        for claim in &claims {
+            fingerprint.claim(
+                &claim.resource_key,
+                claim.access.storage_name(),
+                &claim.group_location,
+            );
+        }
+        let asset_fingerprint = fingerprint.finish();
+
+        let transaction = connection.unchecked_transaction().expect("应开始测试事务");
+        transaction
+            .execute(
+                "INSERT INTO rpg_maker_asset_owner_state
+                 (owner, source_snapshot_fingerprint, asset_snapshot_fingerprint)
+                 VALUES ('rules', ?1, ?2)",
+                params![
+                    [0x5a_u8; 32].as_slice(),
+                    asset_fingerprint.as_bytes().as_slice()
+                ],
+            )
+            .expect("应插入 Rules owner");
+        transaction
+            .execute(
+                "INSERT INTO rpg_maker_text_group
+                 (owner, group_location, semantic_order_key, group_kind, projection_recipe_json)
+                 VALUES ('rules', ?1, ?2, 'database_entry', ?3)",
+                params![project.group_location, group_order_blob, recipes_json],
+            )
+            .expect("应插入 Rules Group");
+        transaction
+            .execute(
+                "INSERT INTO rpg_maker_text_unit
+                 (owner, group_location, unit_role, semantic_order_key,
+                  source_content_json, source_context_json,
+                  translation_content_json, translation_state)
+                 VALUES ('rules', ?1, ?2, ?3, ?4, '{}', NULL, NULL)",
+                params![
+                    project.group_location,
+                    sibling_role_raw,
+                    sibling_order.encode().expect("应编码兄弟顺序键"),
+                    sibling_source_json
+                ],
+            )
+            .expect("应插入 Rules Unit");
+        for claim in summary {
+            transaction
+                .execute(
+                    "INSERT INTO rpg_maker_mutation_claim
+                     (owner, group_location, resource_key, access)
+                     VALUES ('rules', ?1, ?2, ?3)",
+                    params![
+                        claim.group_location,
+                        claim.resource_key,
+                        claim.access.storage_name()
+                    ],
+                )
+                .expect("应插入 Rules Claim");
+        }
+        transaction.commit().expect("应提交兄弟资产");
+        sibling_role_raw
     }
 
     fn locator(project: &TestProject) -> String {
@@ -3501,6 +4091,252 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("应检查测试标记表")
+    }
+
+    #[test]
+    fn group_context_loader_merges_owners_and_ignores_target_translations() {
+        let project = create_project();
+        let connection = Connection::open(&project.database_path).expect("应打开项目数据库");
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .expect("应启用测试连接外键");
+        let cancellation_token = ProjectLuaCancellation::default();
+        let adapter =
+            RpgMakerProjectLuaAdapter::new(RpgMakerEngine::Mz, cancellation_token.clone());
+        let cancellation = adapter.cancellation(RpgMakerLuaCancellationPhase::Validation);
+        let fingerprint = || {
+            load_group_context_fingerprints(
+                &connection,
+                Some(&project.group_location),
+                cancellation,
+            )
+            .expect("应读取完整 Group 语境")
+            .get(&project.group_location)
+            .copied()
+            .expect("测试 Group 应存在")
+        };
+        let base = fingerprint();
+        let (group_order, recipes): (Vec<u8>, String) = connection
+            .query_row(
+                "SELECT semantic_order_key, projection_recipe_json
+                 FROM rpg_maker_text_group
+                 WHERE owner = 'builtin' AND group_location = ?1",
+                [&project.group_location],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("应读取现有 Group 定义");
+        let sibling_role = RpgMakerProjectionCodec::encode_role(&TextUnitRole::Scalar(
+            ScalarFieldKey::new("description").expect("测试字段键应有效"),
+        ))
+        .expect("应编码兄弟角色");
+        let sibling_order = RpgMakerSemanticOrderKey::new(vec![u64::MAX - 1], 7)
+            .encode()
+            .expect("应编码兄弟顺序键");
+        let sibling_source = serde_json::to_string(&TextUnitContent::Value("兄弟原文".to_owned()))
+            .expect("应编码兄弟原文");
+        connection
+            .execute(
+                "INSERT INTO rpg_maker_asset_owner_state
+                 (owner, source_snapshot_fingerprint, asset_snapshot_fingerprint)
+                 VALUES ('rules', ?1, ?2)",
+                params![[0x5a_u8; 32].as_slice(), [0x63_u8; 32].as_slice()],
+            )
+            .expect("应插入 Rules owner");
+        connection
+            .execute(
+                "INSERT INTO rpg_maker_text_group
+                 (owner, group_location, semantic_order_key, group_kind, projection_recipe_json)
+                 VALUES ('rules', ?1, ?2, 'database_entry', ?3)",
+                params![project.group_location, group_order, recipes],
+            )
+            .expect("应插入跨 owner 同一 Group");
+        connection
+            .execute(
+                "INSERT INTO rpg_maker_text_unit
+                 (owner, group_location, unit_role, semantic_order_key,
+                  source_content_json, source_context_json,
+                  translation_content_json, translation_state)
+                 VALUES ('rules', ?1, ?2, ?3, ?4, '{}', NULL, NULL)",
+                params![
+                    project.group_location,
+                    sibling_role,
+                    sibling_order,
+                    sibling_source
+                ],
+            )
+            .expect("应插入跨 owner 兄弟 Unit");
+
+        let with_rules_sibling = fingerprint();
+        assert_ne!(
+            with_rules_sibling, base,
+            "跨 Builtin/Rules 合并的兄弟 Unit 必须进入完整 Group 语境"
+        );
+        let sibling_translation =
+            serde_json::to_string(&TextUnitContent::Value("兄弟译文".to_owned()))
+                .expect("应编码兄弟译文");
+        connection
+            .execute(
+                "UPDATE rpg_maker_text_unit
+                 SET translation_content_json = ?1, translation_state = ?2
+                 WHERE owner = 'rules' AND group_location = ?3 AND unit_role = ?4",
+                params![
+                    sibling_translation,
+                    [0x81_u8; 32].as_slice(),
+                    project.group_location,
+                    sibling_role
+                ],
+            )
+            .expect("应更新兄弟目标译文");
+        assert_eq!(
+            fingerprint(),
+            with_rules_sibling,
+            "兄弟目标译文和旧状态不能进入完整 Group 语境"
+        );
+        let changed_source =
+            serde_json::to_string(&TextUnitContent::Value("变化后的兄弟原文".to_owned()))
+                .expect("应编码变化后的兄弟原文");
+        connection
+            .execute(
+                "UPDATE rpg_maker_text_unit
+                 SET source_content_json = ?1
+                 WHERE owner = 'rules' AND group_location = ?2 AND unit_role = ?3",
+                params![changed_source, project.group_location, sibling_role],
+            )
+            .expect("应更新兄弟原文");
+        assert_ne!(
+            fingerprint(),
+            with_rules_sibling,
+            "跨 owner 兄弟原文变化必须改变完整 Group 语境"
+        );
+        assert!(!cancellation_token.is_cancelled());
+    }
+
+    #[test]
+    fn group_terminology_loader_merges_sibling_units_in_file_order() {
+        let project = create_project();
+        install_rules_sibling(&project);
+        let connection = Connection::open(&project.database_path).expect("应打开项目数据库");
+        let token = ProjectLuaCancellation::default();
+        let adapter = RpgMakerProjectLuaAdapter::new(RpgMakerEngine::Mz, token.clone());
+        let cancellation = adapter.cancellation(RpgMakerLuaCancellationPhase::Validation);
+        let terminology_json = terminology_json(vec![
+            TerminologyEntry::new("兄弟", "Sibling", vec!["兄弟".to_owned()]),
+            TerminologyEntry::new("こんにちは", "你好", vec!["こんにちは".to_owned()]),
+        ]);
+        let terminology =
+            compile_terminology_resource(&terminology_json, cancellation).expect("术语应可编译");
+        let placeholder_service =
+            Pcre2PlaceholderService::new().expect("内置 Placeholder 应可编译");
+        let placeholder_rules = compile_placeholder_rules(
+            &placeholder_service,
+            &stored_resource(&project, "placeholder_rules"),
+            cancellation,
+        )
+        .expect("Placeholder 应可编译");
+
+        let dependencies = load_group_terminology_dependencies(
+            &connection,
+            RpgMakerEngine::Mz,
+            &terminology,
+            &placeholder_service,
+            &placeholder_rules,
+            cancellation,
+        )
+        .expect("应按完整 Group 汇总术语");
+
+        assert_eq!(
+            dependencies.get(&project.group_location),
+            Some(&vec![
+                TerminologyDependency::new("兄弟", "Sibling"),
+                TerminologyDependency::new("こんにちは", "你好"),
+            ]),
+            "跨 Builtin/Rules 的兄弟 Unit 命中项必须合并，并保持术语文件顺序"
+        );
+        assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn final_validation_preserves_target_only_changes_and_rolls_back_sibling_source_changes() {
+        let project = create_project();
+        let sibling_role = install_rules_sibling(&project);
+        run(
+            &project,
+            &format!(
+                "ctx.translation.set({}, [=[你好 \\V[1] {{hero}}]=])",
+                locator(&project)
+            ),
+        )
+        .expect("应先建立 Builtin Current");
+        let sibling_locator = format!(
+            "{{owner = \"rules\", group_location = [=[{}]=], unit_role = [=[{}]=]}}",
+            project.group_location, sibling_role
+        );
+        run(
+            &project,
+            &format!("ctx.translation.set({sibling_locator}, [=[兄弟译文]=])"),
+        )
+        .expect("应建立跨 owner 兄弟 Current");
+
+        let changed_target =
+            serde_json::to_string(&TextUnitContent::Value("兄弟目标修订".to_owned()))
+                .expect("应编码兄弟目标修订");
+        run(
+            &project,
+            &format!(
+                r#"ctx.db.execute(
+                     [=[UPDATE rpg_maker_text_unit SET translation_content_json = ?1
+                        WHERE owner = 'rules' AND group_location = ?2 AND unit_role = ?3]=],
+                     {{[=[{changed_target}]=], [=[{}]=], [=[{}]=]}}
+                   )"#,
+                project.group_location, sibling_role
+            ),
+        )
+        .expect("兄弟目标译文变化不应改变完整 Group 语境");
+
+        let original_source: String = Connection::open(&project.database_path)
+            .expect("应重开项目数据库")
+            .query_row(
+                "SELECT source_content_json FROM rpg_maker_text_unit
+                 WHERE owner = 'rules' AND group_location = ?1 AND unit_role = ?2",
+                params![project.group_location, sibling_role],
+                |row| row.get(0),
+            )
+            .expect("应读取兄弟原文");
+        let changed_source =
+            serde_json::to_string(&TextUnitContent::Value("兄弟こんばんは".to_owned()))
+                .expect("应编码变化后的兄弟原文");
+        let error = run(
+            &project,
+            &format!(
+                r#"ctx.db.execute(
+                     [=[UPDATE rpg_maker_text_unit SET source_content_json = ?1
+                        WHERE owner = 'rules' AND group_location = ?2 AND unit_role = ?3]=],
+                     {{[=[{changed_source}]=], [=[{}]=], [=[{}]=]}}
+                   )"#,
+                project.group_location, sibling_role
+            ),
+        )
+        .expect_err("兄弟原文变化后不得保留原 Current 状态");
+        let ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
+            operation: "translation.validate",
+            message,
+            ..
+        }) = error
+        else {
+            panic!("完整 Group 语境失效应由翻译最终校验拒绝");
+        };
+        assert!(message.contains("已有 Current 只允许在语义事实不变时保留"));
+        assert!(message.contains(&project.group_location));
+        let stored_source: String = Connection::open(&project.database_path)
+            .expect("应重开项目数据库")
+            .query_row(
+                "SELECT source_content_json FROM rpg_maker_text_unit
+                 WHERE owner = 'rules' AND group_location = ?1 AND unit_role = ?2",
+                params![project.group_location, sibling_role],
+                |row| row.get(0),
+            )
+            .expect("应读取回滚后的兄弟原文");
+        assert_eq!(stored_source, original_source, "失败事务必须回滚兄弟原文");
     }
 
     #[test]

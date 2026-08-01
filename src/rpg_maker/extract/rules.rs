@@ -21,7 +21,12 @@ use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::json::StackSafeJsonValue;
 use crate::rpg_maker::model::{ProjectionModelError, TextUnitContent};
 use crate::rpg_maker::project::OpenedProject;
-use crate::rpg_maker::text::{DataFileName, StandardDataFile};
+use crate::rpg_maker::semantic_order::{
+    RpgMakerSemanticOrderKey, RpgMakerSemanticOrderProjectionError,
+};
+use crate::rpg_maker::text::{
+    DataFileName, RpgMakerLocation, RpgMakerLocationStep, StandardDataFile,
+};
 
 use self::definition::{FileRuleSource, RuleSource, RulesDefinition, RulesDefinitionError};
 use self::matcher::{
@@ -461,31 +466,78 @@ fn snapshot_from_targets(
         let physical_location = target
             .physical_location()
             .expect("匹配器只会产生已通过 Rules 定义校验的来源");
+        let group_location = target
+            .group_location()
+            .expect("匹配器只会产生已通过 Rules 定义校验的来源");
+        let plugin_parameter_order = target.plugin_parameter_order();
+        let physical_order = target.physical_order();
+        let group_physical_order_len = location_physical_step_count(&group_location);
+        let group_physical_order =
+            physical_order
+                .get(..group_physical_order_len)
+                .ok_or_else(|| SnapshotModelError::SemanticOrderProjection {
+                    exact_location: Box::new(group_location.clone()),
+                    source: RpgMakerSemanticOrderProjectionError::MissingPhysicalOrdinal,
+                })?;
+        let group_semantic_order_key = RpgMakerSemanticOrderKey::from_physical_ordinals(
+            &group_location,
+            group_physical_order,
+            0,
+            plugin_parameter_order,
+        )
+        .map_err(|source| SnapshotModelError::SemanticOrderProjection {
+            exact_location: Box::new(group_location.clone()),
+            source,
+        })?;
         let units = target
             .units()
             .iter()
             .enumerate()
             .map(|(unit_index, unit)| {
-                ExtractedTextUnit::projected(
-                    target.role_for(unit_index),
+                let role = target.role_for(unit_index);
+                let fragment = u64::try_from(unit_index)
+                    .ok()
+                    .and_then(|index| index.checked_add(1))
+                    .ok_or_else(|| SnapshotModelError::SemanticOrderProjection {
+                        exact_location: Box::new(physical_location.clone()),
+                        source: RpgMakerSemanticOrderProjectionError::OrdinalOverflow,
+                    })?;
+                let semantic_order_key = RpgMakerSemanticOrderKey::from_physical_ordinals(
+                    &physical_location,
+                    physical_order,
+                    fragment,
+                    plugin_parameter_order,
+                )
+                .map_err(|source| SnapshotModelError::SemanticOrderProjection {
+                    exact_location: Box::new(physical_location.clone()),
+                    source,
+                })?;
+                let mut extracted = ExtractedTextUnit::projected(
+                    role,
                     physical_location.clone(),
                     TextUnitContent::Value(unit.source_text().to_owned()),
-                )
+                )?;
+                extracted.set_semantic_order_key(semantic_order_key);
+                Ok(extracted)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let recipe = target
             .projection_recipe()
             .expect("匹配器已经校验物化配方可以逐字重建最终字符串");
-        groups.push(ExtractedTextGroup::projected(
-            target.kind(),
-            target
-                .group_location()
-                .expect("匹配器只会产生已通过 Rules 定义校验的来源"),
-            units,
-            vec![recipe],
-        )?);
+        let mut group =
+            ExtractedTextGroup::projected(target.kind(), group_location, units, vec![recipe])?;
+        group.set_semantic_order_key(group_semantic_order_key);
+        groups.push(group);
     }
     RulesSnapshot::new(groups)
+}
+
+fn location_physical_step_count(location: &RpgMakerLocation) -> usize {
+    location
+        .steps()
+        .iter()
+        .filter(|step| !matches!(step, RpgMakerLocationStep::DecodeJsonString))
+        .count()
 }
 
 enum ParallelRulesBuildError<CE> {
@@ -661,6 +713,8 @@ fn snapshot_model_fact(source: &SnapshotModelError) -> String {
         SnapshotModelError::EmptyProjection { .. } => "empty_projection",
         SnapshotModelError::DuplicateLogicalLocation { .. } => "duplicate_logical_location",
         SnapshotModelError::ConflictingGroupKind { .. } => "conflicting_group_kind",
+        SnapshotModelError::ConflictingSemanticOrderKey { .. } => "conflicting_semantic_order_key",
+        SnapshotModelError::SemanticOrderProjection { .. } => "semantic_order_projection",
         SnapshotModelError::MutationClaimConflict { .. } => "mutation_claim_conflict",
         SnapshotModelError::RecipeRoleMismatch { .. } => "recipe_role_mismatch",
         SnapshotModelError::RecipeLineMismatch { .. } => "recipe_line_mismatch",

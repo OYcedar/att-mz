@@ -1,6 +1,6 @@
 //! 从 RPG Maker 文本表建立一致翻译语料。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
@@ -35,6 +35,10 @@ use crate::rpg_maker::project_database::{
     AssetSnapshotFingerprint, PLACEHOLDER_RULES_RESOURCE_KIND, SourceSnapshotFingerprint,
     TERMINOLOGY_RESOURCE_KIND,
 };
+use crate::rpg_maker::semantic_order::{
+    RpgMakerSemanticOrderKey, RpgMakerSemanticOrderKeyDecodeError, RpgMakerSemanticScopeError,
+    RpgMakerSemanticScopeKey,
+};
 use crate::rpg_maker::text::{RpgMakerLocation, TextGroupKind};
 use crate::storage::sqlite::{
     QueryExistingDatabaseError, SqliteQuery, SqliteQueryExecutor, SqliteRow, SqliteValue,
@@ -42,7 +46,8 @@ use crate::storage::sqlite::{
 
 use super::pipeline::{
     RpgMakerTranslationAsset, RpgMakerTranslationAssetReader, RpgMakerTranslationCorpus,
-    RpgMakerTranslationGroup, TranslationOwnerSnapshot, TranslationUnitIdentity,
+    RpgMakerTranslationGroup, RpgMakerTranslationScope, TranslationOwnerSnapshot,
+    TranslationUnitIdentity,
 };
 
 const READ_TRANSLATION_METADATA: &str = "SELECT source_snapshot_fingerprint FROM metadata";
@@ -65,7 +70,7 @@ fn read_translation_owner_groups() -> String {
         "SELECT\n    {RPG_MAKER_TEXT_GROUP_CORE_PROJECTION}\n\
          FROM rpg_maker_text_group\n\
          WHERE owner = ?\n\
-         ORDER BY group_order"
+         ORDER BY semantic_order_key"
     )
 }
 
@@ -73,16 +78,17 @@ fn read_translation_owner_units() -> String {
     format!(
         "SELECT\n    {RPG_MAKER_TEXT_UNIT_LOCATION_PROJECTION},\n    \
          text_group.group_kind,\n    \
-         text_group.group_order,\n    \
+         text_group.semantic_order_key,\n    \
          {RPG_MAKER_TEXT_UNIT_CONTENT_PROJECTION},\n    \
          unit.translation_state\n\
          FROM rpg_maker_text_group AS text_group\n\
          CROSS JOIN rpg_maker_text_unit AS unit\n  \
+                    INDEXED BY rpg_maker_text_unit_owner_group_order_idx\n  \
            ON unit.owner = text_group.owner\n \
           AND text_group.group_location = unit.group_location\n\
          WHERE text_group.owner = ?\n\
-         ORDER BY text_group.group_order,\n         \
-          unit.unit_order"
+         ORDER BY text_group.semantic_order_key,\n         \
+          unit.semantic_order_key"
     )
 }
 
@@ -459,9 +465,9 @@ pub(crate) enum InvalidRpgMakerTranslationAssetSnapshot {
         expected: &'static str,
         actual: &'static str,
     },
-    InvalidOrderValue {
+    InvalidSemanticOrderKey {
         column: &'static str,
-        actual: i64,
+        source: RpgMakerSemanticOrderKeyDecodeError,
     },
     UnknownOwner(String),
     InactiveOwner(String),
@@ -486,6 +492,7 @@ pub(crate) enum InvalidRpgMakerTranslationAssetSnapshot {
     BlankTranslationResource(String),
     UnknownGroupKind(String),
     InvalidLocation(RpgMakerLocationCodecError),
+    InvalidSemanticScope(RpgMakerSemanticScopeError),
     InvalidRole(RpgMakerProjectionCodecError),
     RoleDoesNotBelongToGroup {
         role: TextUnitRole,
@@ -532,20 +539,14 @@ pub(crate) enum InvalidRpgMakerTranslationAssetSnapshot {
         owner: RpgMakerAssetOwner,
         group_location: Box<RpgMakerLocation>,
     },
-    InvalidGroupOrder {
-        owner: RpgMakerAssetOwner,
-        expected: usize,
-        actual: usize,
-    },
     InconsistentGroupDefinition {
         owner: RpgMakerAssetOwner,
         group_location: Box<RpgMakerLocation>,
     },
-    InvalidUnitOrder {
-        owner: RpgMakerAssetOwner,
-        group_location: Box<RpgMakerLocation>,
-        expected: usize,
-        actual: usize,
+    DuplicateSemanticOrderKey {
+        level: &'static str,
+        first: String,
+        second: String,
     },
     DuplicateLogicalUnit {
         owner: RpgMakerAssetOwner,
@@ -569,11 +570,8 @@ impl fmt::Display for InvalidRpgMakerTranslationAssetSnapshot {
                 expected,
                 actual,
             } => write!(formatter, "列 {column} 应为 {expected}，实际为 {actual}"),
-            Self::InvalidOrderValue { column, actual } => {
-                write!(
-                    formatter,
-                    "列 {column} 必须是可表示的非负顺序，实际为 {actual}"
-                )
+            Self::InvalidSemanticOrderKey { column, source } => {
+                write!(formatter, "列 {column} 不是规范语义顺序键：{source}")
             }
             Self::UnknownOwner(owner) => write!(formatter, "未知资产所有者：{owner}"),
             Self::InactiveOwner(owner) => write!(formatter, "文本单元引用未激活 owner：{owner}"),
@@ -599,6 +597,7 @@ impl fmt::Display for InvalidRpgMakerTranslationAssetSnapshot {
             Self::BlankTranslationResource(kind) => write!(formatter, "翻译资源 {kind} 为空"),
             Self::UnknownGroupKind(kind) => write!(formatter, "未知文本组类型：{kind}"),
             Self::InvalidLocation(source) => write!(formatter, "组位置无效：{source}"),
+            Self::InvalidSemanticScope(source) => write!(formatter, "语义范围无效：{source}"),
             Self::InvalidRole(source) => write!(formatter, "单元角色无效：{source}"),
             Self::RoleDoesNotBelongToGroup { role, kind } => {
                 write!(formatter, "单元角色 {role:?} 不属于文本组 {kind:?}")
@@ -668,32 +667,21 @@ impl fmt::Display for InvalidRpgMakerTranslationAssetSnapshot {
                 "资产组不包含文本单元：{} / {group_location}",
                 owner.storage_name()
             ),
-            Self::InvalidGroupOrder {
-                owner,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "owner {} 的 group_order 必须从 0 连续：期待 {expected}，实际 {actual}",
-                owner.storage_name()
-            ),
             Self::InconsistentGroupDefinition {
                 owner,
                 group_location,
             } => write!(
                 formatter,
-                "同一资产组的类型或 group_order 不一致：{} / {group_location}",
+                "同一资产组的类型或 semantic_order_key 不一致：{} / {group_location}",
                 owner.storage_name()
             ),
-            Self::InvalidUnitOrder {
-                owner,
-                group_location,
-                expected,
-                actual,
+            Self::DuplicateSemanticOrderKey {
+                level,
+                first,
+                second,
             } => write!(
                 formatter,
-                "组 {} / {group_location} 的 unit_order 必须从 0 连续：期待 {expected}，实际 {actual}",
-                owner.storage_name()
+                "不同 {level} 使用了相同 semantic_order_key：{first} / {second}"
             ),
             Self::DuplicateLogicalUnit {
                 owner,
@@ -712,6 +700,8 @@ impl Error for InvalidRpgMakerTranslationAssetSnapshot {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::InvalidLocation(source) => Some(source),
+            Self::InvalidSemanticOrderKey { source, .. } => Some(source),
+            Self::InvalidSemanticScope(source) => Some(source),
             Self::InvalidRole(source) => Some(source),
             Self::InvalidSourceContent(source)
             | Self::InvalidTranslationContent(source)
@@ -737,8 +727,8 @@ impl InvalidRpgMakerTranslationAssetSnapshot {
             } => {
                 format!("wrong_column_type: column={column}; expected={expected}; actual={actual}")
             }
-            Self::InvalidOrderValue { column, actual } => {
-                format!("invalid_order_value: column={column}; actual={actual}")
+            Self::InvalidSemanticOrderKey { column, source } => {
+                format!("invalid_semantic_order_key: column={column}; reason={source}")
             }
             Self::UnknownOwner(_) => "unknown_rpg_maker_asset_owner".to_owned(),
             Self::InactiveOwner(_) => "unit_references_inactive_rpg_maker_asset_owner".to_owned(),
@@ -764,6 +754,9 @@ impl InvalidRpgMakerTranslationAssetSnapshot {
             Self::UnknownGroupKind(_) => "unknown_text_group_kind".to_owned(),
             Self::InvalidLocation(source) => {
                 format!("invalid_group_location: {}", location_codec_detail(source))
+            }
+            Self::InvalidSemanticScope(source) => {
+                format!("invalid_semantic_scope: {source}")
             }
             Self::InvalidRole(source) => {
                 format!("invalid_unit_role: {}", projection_codec_detail(source))
@@ -833,14 +826,6 @@ impl InvalidRpgMakerTranslationAssetSnapshot {
                 "rpg_maker_text_group_is_empty: owner={}; group_location={group_location}",
                 owner.storage_name()
             ),
-            Self::InvalidGroupOrder {
-                owner,
-                expected,
-                actual,
-            } => format!(
-                "invalid_group_order: owner={}; expected={expected}; actual={actual}",
-                owner.storage_name()
-            ),
             Self::InconsistentGroupDefinition {
                 owner,
                 group_location,
@@ -848,15 +833,9 @@ impl InvalidRpgMakerTranslationAssetSnapshot {
                 "inconsistent_group_definition: owner={}; group_location={group_location}",
                 owner.storage_name()
             ),
-            Self::InvalidUnitOrder {
-                owner,
-                group_location,
-                expected,
-                actual,
-            } => format!(
-                "invalid_unit_order: owner={}; group_location={group_location}; expected={expected}; actual={actual}",
-                owner.storage_name()
-            ),
+            Self::DuplicateSemanticOrderKey { level, .. } => {
+                format!("duplicate_semantic_order_key: level={level}")
+            }
             Self::DuplicateLogicalUnit {
                 owner,
                 group_location,
@@ -1170,7 +1149,7 @@ struct DecodedGroup {
     owner: RpgMakerAssetOwner,
     kind: TextGroupKind,
     group_location: RpgMakerLocation,
-    group_order: usize,
+    semantic_order_key: RpgMakerSemanticOrderKey,
 }
 
 fn decode_groups(
@@ -1189,14 +1168,14 @@ fn decode_groups(
             let RpgMakerTextGroupStorageRow {
                 group_location,
                 kind,
-                group_order,
+                semantic_order_key,
                 ..
             } = RpgMakerTextGroupStorageRow::decode(&mut row).map_err(map_storage_row_error)?;
             Ok(DecodedGroup {
                 owner,
                 kind,
                 group_location,
-                group_order,
+                semantic_order_key,
             })
         })
         .collect()
@@ -1207,9 +1186,9 @@ struct DecodedUnit {
     owner: RpgMakerAssetOwner,
     kind: TextGroupKind,
     group_location: RpgMakerLocation,
-    group_order: usize,
+    group_semantic_order_key: RpgMakerSemanticOrderKey,
     role: TextUnitRole,
-    unit_order: usize,
+    semantic_order_key: RpgMakerSemanticOrderKey,
     source_content: TextUnitContent,
     source_context_json: String,
     translation: Option<TextUnitContent>,
@@ -1234,8 +1213,16 @@ fn decode_unit(
     let kind = TextGroupKind::from_storage_name(group_kind_raw.as_str()).ok_or(
         InvalidRpgMakerTranslationAssetSnapshot::UnknownGroupKind(group_kind_raw),
     )?;
-    let group_order = row
-        .non_negative_order("group_order")
+    let group_semantic_order_key = row
+        .required_blob("semantic_order_key")
+        .and_then(|encoded| {
+            RpgMakerSemanticOrderKey::decode(&encoded).map_err(|source| {
+                RpgMakerAssetStorageRowError::InvalidSemanticOrderKey {
+                    column: "semantic_order_key",
+                    source,
+                }
+            })
+        })
         .map_err(map_storage_row_error)?;
     let identity = RpgMakerTextUnitIdentityStorageRow::decode_after_location(&mut row, location)
         .map_err(map_storage_row_error)?;
@@ -1275,7 +1262,7 @@ fn decode_unit(
     let RpgMakerTextUnitStorageRow {
         group_location,
         role,
-        unit_order,
+        semantic_order_key,
         source_content,
         source_context_json,
         ..
@@ -1284,9 +1271,9 @@ fn decode_unit(
         owner,
         kind,
         group_location,
-        group_order,
+        group_semantic_order_key,
         role,
-        unit_order,
+        semantic_order_key,
         source_content,
         source_context_json,
         translation,
@@ -1398,8 +1385,8 @@ fn map_storage_row_error(
             expected,
             actual,
         },
-        RpgMakerAssetStorageRowError::InvalidOrderValue { column, actual } => {
-            InvalidRpgMakerTranslationAssetSnapshot::InvalidOrderValue { column, actual }
+        RpgMakerAssetStorageRowError::InvalidSemanticOrderKey { column, source } => {
+            InvalidRpgMakerTranslationAssetSnapshot::InvalidSemanticOrderKey { column, source }
         }
         RpgMakerAssetStorageRowError::UnknownOwner(owner) => {
             InvalidRpgMakerTranslationAssetSnapshot::UnknownOwner(owner)
@@ -1425,63 +1412,75 @@ fn map_storage_row_error(
 fn assemble_corpus(
     group_rows: Vec<DecodedGroup>,
     units: Vec<DecodedUnit>,
-) -> Result<Vec<RpgMakerTranslationGroup>, InvalidRpgMakerTranslationAssetSnapshot> {
+) -> Result<Vec<RpgMakerTranslationScope>, InvalidRpgMakerTranslationAssetSnapshot> {
     struct GroupBuilder {
-        owner: RpgMakerAssetOwner,
+        first_owner: RpgMakerAssetOwner,
         kind: TextGroupKind,
         group_location: RpgMakerLocation,
-        group_order: usize,
+        semantic_order_key: RpgMakerSemanticOrderKey,
         assets: Vec<RpgMakerTranslationAsset>,
+        roles: HashSet<TextUnitRole>,
     }
 
-    let mut next_group_orders = [0_usize; TRANSLATION_OWNER_ORDER.len()];
-    let mut group_locations: [HashSet<RpgMakerLocation>; TRANSLATION_OWNER_ORDER.len()] =
-        std::array::from_fn(|_| HashSet::new());
+    let mut owner_group_locations =
+        HashSet::<(RpgMakerAssetOwner, RpgMakerLocation)>::with_capacity(group_rows.len());
+    let mut group_locations = HashMap::<RpgMakerLocation, usize>::with_capacity(group_rows.len());
+    let mut group_order_keys =
+        HashMap::<RpgMakerSemanticOrderKey, usize>::with_capacity(group_rows.len());
     let mut groups = Vec::<GroupBuilder>::with_capacity(group_rows.len());
     for group in group_rows {
-        let owner_index = owner_order(group.owner);
-        let expected = next_group_orders[owner_index];
-        if group.group_order != expected {
-            return Err(InvalidRpgMakerTranslationAssetSnapshot::InvalidGroupOrder {
-                owner: group.owner,
-                expected,
-                actual: group.group_order,
-            });
-        }
-        next_group_orders[owner_index] += 1;
-        if !group_locations[owner_index].insert(group.group_location.clone()) {
+        if !owner_group_locations.insert((group.owner, group.group_location.clone())) {
             return Err(InvalidRpgMakerTranslationAssetSnapshot::DuplicateGroup {
                 owner: group.owner,
                 group_location: Box::new(group.group_location),
             });
         }
+        if let Some(index) = group_locations.get(&group.group_location).copied() {
+            let existing = &groups[index];
+            if existing.kind != group.kind
+                || existing.semantic_order_key != group.semantic_order_key
+            {
+                return Err(
+                    InvalidRpgMakerTranslationAssetSnapshot::InconsistentGroupDefinition {
+                        owner: group.owner,
+                        group_location: Box::new(group.group_location),
+                    },
+                );
+            }
+            continue;
+        }
+        if let Some(existing_index) = group_order_keys.get(&group.semantic_order_key).copied() {
+            return Err(
+                InvalidRpgMakerTranslationAssetSnapshot::DuplicateSemanticOrderKey {
+                    level: "Group",
+                    first: groups[existing_index].group_location.to_string(),
+                    second: group.group_location.to_string(),
+                },
+            );
+        }
+        let index = groups.len();
+        group_locations.insert(group.group_location.clone(), index);
+        group_order_keys.insert(group.semantic_order_key.clone(), index);
         groups.push(GroupBuilder {
-            owner: group.owner,
+            first_owner: group.owner,
             kind: group.kind,
             group_location: group.group_location,
-            group_order: group.group_order,
+            semantic_order_key: group.semantic_order_key,
             assets: Vec::new(),
+            roles: HashSet::new(),
         });
     }
 
-    let group_starts = [
-        0,
-        next_group_orders[0],
-        next_group_orders[0] + next_group_orders[1],
-    ];
-    let mut seen_logical_units = HashSet::with_capacity(units.len());
+    let mut unit_order_keys =
+        HashMap::<RpgMakerSemanticOrderKey, (RpgMakerLocation, TextUnitRole)>::new();
     for unit in units {
-        let owner_index = owner_order(unit.owner);
-        if !group_locations[owner_index].contains(&unit.group_location) {
+        if !owner_group_locations.contains(&(unit.owner, unit.group_location.clone())) {
             return Err(InvalidRpgMakerTranslationAssetSnapshot::MissingGroup {
                 owner: unit.owner,
                 group_location: Box::new(unit.group_location),
             });
         }
-        let group_index = group_starts[owner_index].checked_add(unit.group_order);
-        let Some((group_index, group)) =
-            group_index.and_then(|index| groups.get_mut(index).map(|group| (index, group)))
-        else {
+        let Some(group_index) = group_locations.get(&unit.group_location).copied() else {
             return Err(
                 InvalidRpgMakerTranslationAssetSnapshot::InconsistentGroupDefinition {
                     owner: unit.owner,
@@ -1489,10 +1488,10 @@ fn assemble_corpus(
                 },
             );
         };
-        if group.owner != unit.owner
-            || group.kind != unit.kind
+        let group = &mut groups[group_index];
+        if group.kind != unit.kind
             || group.group_location != unit.group_location
-            || group.group_order != unit.group_order
+            || group.semantic_order_key != unit.group_semantic_order_key
         {
             return Err(
                 InvalidRpgMakerTranslationAssetSnapshot::InconsistentGroupDefinition {
@@ -1501,21 +1500,24 @@ fn assemble_corpus(
                 },
             );
         }
-        let expected_unit_order = group.assets.len();
-        if unit.unit_order != expected_unit_order {
-            return Err(InvalidRpgMakerTranslationAssetSnapshot::InvalidUnitOrder {
-                owner: unit.owner,
-                group_location: Box::new(unit.group_location),
-                expected: expected_unit_order,
-                actual: unit.unit_order,
-            });
-        }
-        if !seen_logical_units.insert((group_index, unit.role.clone())) {
+        if !group.roles.insert(unit.role.clone()) {
             return Err(
                 InvalidRpgMakerTranslationAssetSnapshot::DuplicateLogicalUnit {
                     owner: unit.owner,
                     group_location: Box::new(unit.group_location),
                     role: unit.role,
+                },
+            );
+        }
+        if let Some((first_location, first_role)) = unit_order_keys.insert(
+            unit.semantic_order_key.clone(),
+            (unit.group_location.clone(), unit.role.clone()),
+        ) {
+            return Err(
+                InvalidRpgMakerTranslationAssetSnapshot::DuplicateSemanticOrderKey {
+                    level: "Unit",
+                    first: format!("{first_location} / {first_role:?}"),
+                    second: format!("{} / {:?}", group.group_location, unit.role),
                 },
             );
         }
@@ -1527,22 +1529,48 @@ fn assemble_corpus(
             unit.source_content,
             unit.source_context_json,
         );
-        group.assets.push(RpgMakerTranslationAsset::new(
-            identity,
-            unit.translation,
-            unit.translation_state,
-        ));
+        group
+            .assets
+            .push(RpgMakerTranslationAsset::with_semantic_order_key(
+                identity,
+                unit.semantic_order_key,
+                unit.translation,
+                unit.translation_state,
+            ));
     }
 
     if let Some(group) = groups.iter().find(|group| group.assets.is_empty()) {
         return Err(InvalidRpgMakerTranslationAssetSnapshot::EmptyGroup {
-            owner: group.owner,
+            owner: group.first_owner,
             group_location: Box::new(group.group_location.clone()),
         });
     }
-    Ok(groups
+    groups.sort_by(|left, right| left.semantic_order_key.cmp(&right.semantic_order_key));
+    let mut scope_indexes = HashMap::<RpgMakerSemanticScopeKey, usize>::new();
+    let mut scopes = Vec::<(RpgMakerSemanticScopeKey, Vec<RpgMakerTranslationGroup>)>::new();
+    for mut group in groups {
+        group
+            .assets
+            .sort_by(|left, right| left.semantic_order_key().cmp(right.semantic_order_key()));
+        let scope = RpgMakerSemanticScopeKey::from_group_location(&group.group_location)
+            .map_err(InvalidRpgMakerTranslationAssetSnapshot::InvalidSemanticScope)?;
+        let group = RpgMakerTranslationGroup::with_semantic_order_key(
+            group.kind,
+            group.group_location,
+            group.semantic_order_key,
+            group.assets,
+        );
+        if let Some(index) = scope_indexes.get(&scope).copied() {
+            scopes[index].1.push(group);
+        } else {
+            let index = scopes.len();
+            scope_indexes.insert(scope.clone(), index);
+            scopes.push((scope, vec![group]));
+        }
+    }
+    Ok(scopes
         .into_iter()
-        .map(|group| RpgMakerTranslationGroup::new(group.kind, group.group_location, group.assets))
+        .map(|(key, groups)| RpgMakerTranslationScope::new(key, groups))
         .collect())
 }
 
@@ -1779,8 +1807,8 @@ mod tests {
 
         let corpus = service.read(&project()).await.expect("统一表应可读取");
 
-        assert_eq!(corpus.groups().len(), 1);
-        let assets = corpus.groups()[0].assets();
+        assert_eq!(corpus.scopes().len(), 1);
+        let assets = corpus.scopes()[0].groups()[0].assets();
         assert_eq!(assets[0].identity().role(), &TextUnitRole::DialogueBody);
         assert_eq!(
             assets[0].identity().source_context_json(),
@@ -1811,7 +1839,7 @@ mod tests {
     }
 
     #[test]
-    fn corpus_keeps_builtin_rules_owner_order_and_independent_same_location_groups() {
+    fn corpus_merges_same_location_groups_across_owners() {
         let group_location = RpgMakerLocation::value(
             RpgMakerSource::data(crate::rpg_maker::text::StandardDataFile::Items),
             vec![RpgMakerLocationStep::index(1)],
@@ -1823,7 +1851,7 @@ mod tests {
                 owner,
                 kind: TextGroupKind::DatabaseEntry,
                 group_location: group_location.clone(),
-                group_order: 0,
+                semantic_order_key: RpgMakerSemanticOrderKey::new(vec![1], 0),
             })
             .collect::<Vec<_>>();
         let units = owners
@@ -1837,9 +1865,15 @@ mod tests {
                     owner,
                     kind: TextGroupKind::DatabaseEntry,
                     group_location: group_location.clone(),
-                    group_order: 0,
+                    group_semantic_order_key: RpgMakerSemanticOrderKey::new(vec![1], 0),
                     role,
-                    unit_order: 0,
+                    semantic_order_key: RpgMakerSemanticOrderKey::new(
+                        vec![1],
+                        match owner {
+                            RpgMakerAssetOwner::Builtin => 1,
+                            RpgMakerAssetOwner::Rules => 2,
+                        },
+                    ),
                     source_content: TextUnitContent::Value(owner.storage_name().to_owned()),
                     source_context_json: "{}".to_owned(),
                     translation: None,
@@ -1848,17 +1882,370 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let groups = assemble_corpus(group_rows, units).expect("两个 owner 的语料应能组装");
+        let scopes = assemble_corpus(group_rows, units).expect("两个 owner 的语料应能组装");
 
-        assert_eq!(groups.len(), 2, "同一逻辑位置不得跨 owner 合并");
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(scopes[0].groups().len(), 1, "同一逻辑位置必须跨 owner 合并");
         assert_eq!(
-            groups
+            scopes[0].groups()[0]
+                .assets()
                 .iter()
-                .map(|group| group.assets()[0].identity().owner())
+                .map(|asset| asset.identity().owner())
                 .collect::<Vec<_>>(),
             owners,
-            "RPG Maker 总顺序必须固定为 Builtin、Rules"
+            "Unit 必须按统一 semantic_order_key 排序"
         );
+    }
+
+    #[test]
+    fn corpus_preserves_scope_first_appearance_in_physical_semantic_order() {
+        let common_event = RpgMakerLocation::value(
+            RpgMakerSource::data(crate::rpg_maker::text::StandardDataFile::CommonEvents),
+            vec![RpgMakerLocationStep::index(1)],
+        );
+        let map = RpgMakerLocation::value(RpgMakerSource::map(1), Vec::new());
+        let common_order = RpgMakerSemanticOrderKey::new(vec![1], 0);
+        let map_order = RpgMakerSemanticOrderKey::new(vec![2], 0);
+        let role = TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("测试字段键必须有效"));
+
+        let scopes = assemble_corpus(
+            vec![
+                decoded_group(
+                    RpgMakerAssetOwner::Builtin,
+                    TextGroupKind::DatabaseEntry,
+                    &map,
+                    map_order.clone(),
+                ),
+                decoded_group(
+                    RpgMakerAssetOwner::Builtin,
+                    TextGroupKind::DatabaseEntry,
+                    &common_event,
+                    common_order.clone(),
+                ),
+            ],
+            vec![
+                decoded_unit(
+                    RpgMakerAssetOwner::Builtin,
+                    &map,
+                    map_order,
+                    role.clone(),
+                    RpgMakerSemanticOrderKey::new(vec![2], 1),
+                ),
+                decoded_unit(
+                    RpgMakerAssetOwner::Builtin,
+                    &common_event,
+                    common_order,
+                    role,
+                    RpgMakerSemanticOrderKey::new(vec![1], 1),
+                ),
+            ],
+        )
+        .expect("跨 Scope 语料应可组装");
+
+        assert_eq!(scopes.len(), 2);
+        assert!(matches!(
+            scopes[0].key(),
+            RpgMakerSemanticScopeKey::CommonEvent(1)
+        ));
+        assert!(matches!(
+            scopes[1].key(),
+            RpgMakerSemanticScopeKey::Map(map_id)
+                if *map_id == crate::rpg_maker::text::MapId::new(1).expect("测试 Map ID 应有效")
+        ));
+    }
+
+    fn decoded_group(
+        owner: RpgMakerAssetOwner,
+        kind: TextGroupKind,
+        group_location: &RpgMakerLocation,
+        semantic_order_key: RpgMakerSemanticOrderKey,
+    ) -> DecodedGroup {
+        DecodedGroup {
+            owner,
+            kind,
+            group_location: group_location.clone(),
+            semantic_order_key,
+        }
+    }
+
+    fn decoded_unit(
+        owner: RpgMakerAssetOwner,
+        group_location: &RpgMakerLocation,
+        group_semantic_order_key: RpgMakerSemanticOrderKey,
+        role: TextUnitRole,
+        semantic_order_key: RpgMakerSemanticOrderKey,
+    ) -> DecodedUnit {
+        DecodedUnit {
+            owner,
+            kind: TextGroupKind::DatabaseEntry,
+            group_location: group_location.clone(),
+            group_semantic_order_key,
+            role,
+            semantic_order_key,
+            source_content: TextUnitContent::Value(owner.storage_name().to_owned()),
+            source_context_json: "{}".to_owned(),
+            translation: None,
+            translation_state: None,
+        }
+    }
+
+    #[test]
+    fn corpus_rejects_inconsistent_cross_owner_group_definitions() {
+        let group_location = RpgMakerLocation::value(
+            RpgMakerSource::data(crate::rpg_maker::text::StandardDataFile::Items),
+            vec![RpgMakerLocationStep::index(1)],
+        );
+        let canonical_order = RpgMakerSemanticOrderKey::new(vec![1], 0);
+        let conflicts = [
+            (
+                TextGroupKind::Map,
+                canonical_order.clone(),
+                "跨 owner 的 kind 冲突必须失败",
+            ),
+            (
+                TextGroupKind::DatabaseEntry,
+                RpgMakerSemanticOrderKey::new(vec![2], 0),
+                "跨 owner 的 Group 顺序键冲突必须失败",
+            ),
+        ];
+
+        for (rules_kind, rules_order, message) in conflicts {
+            let error = assemble_corpus(
+                vec![
+                    decoded_group(
+                        RpgMakerAssetOwner::Builtin,
+                        TextGroupKind::DatabaseEntry,
+                        &group_location,
+                        canonical_order.clone(),
+                    ),
+                    decoded_group(
+                        RpgMakerAssetOwner::Rules,
+                        rules_kind,
+                        &group_location,
+                        rules_order,
+                    ),
+                ],
+                Vec::new(),
+            )
+            .expect_err(message);
+
+            assert!(matches!(
+                error,
+                InvalidRpgMakerTranslationAssetSnapshot::InconsistentGroupDefinition {
+                    owner: RpgMakerAssetOwner::Rules,
+                    group_location: ref actual,
+                } if actual.as_ref() == &group_location
+            ));
+        }
+    }
+
+    #[test]
+    fn corpus_rejects_distinct_groups_with_the_same_semantic_order_key() {
+        let first_location = RpgMakerLocation::value(
+            RpgMakerSource::data(crate::rpg_maker::text::StandardDataFile::Items),
+            vec![RpgMakerLocationStep::index(1)],
+        );
+        let second_location = RpgMakerLocation::value(
+            RpgMakerSource::data(crate::rpg_maker::text::StandardDataFile::Items),
+            vec![RpgMakerLocationStep::index(2)],
+        );
+        let duplicate_order = RpgMakerSemanticOrderKey::new(vec![1], 0);
+
+        let error = assemble_corpus(
+            vec![
+                decoded_group(
+                    RpgMakerAssetOwner::Builtin,
+                    TextGroupKind::DatabaseEntry,
+                    &first_location,
+                    duplicate_order.clone(),
+                ),
+                decoded_group(
+                    RpgMakerAssetOwner::Builtin,
+                    TextGroupKind::DatabaseEntry,
+                    &second_location,
+                    duplicate_order,
+                ),
+            ],
+            Vec::new(),
+        )
+        .expect_err("不同 Group 共用 semantic_order_key 必须失败");
+
+        assert!(matches!(
+            error,
+            InvalidRpgMakerTranslationAssetSnapshot::DuplicateSemanticOrderKey {
+                level: "Group",
+                ref first,
+                ref second,
+            } if first == &first_location.to_string() && second == &second_location.to_string()
+        ));
+    }
+
+    #[test]
+    fn corpus_rejects_a_duplicate_logical_role_across_owners() {
+        let group_location = RpgMakerLocation::value(
+            RpgMakerSource::data(crate::rpg_maker::text::StandardDataFile::Items),
+            vec![RpgMakerLocationStep::index(1)],
+        );
+        let group_order = RpgMakerSemanticOrderKey::new(vec![1], 0);
+        let role = TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("测试字段键必须有效"));
+
+        let error = assemble_corpus(
+            vec![
+                decoded_group(
+                    RpgMakerAssetOwner::Builtin,
+                    TextGroupKind::DatabaseEntry,
+                    &group_location,
+                    group_order.clone(),
+                ),
+                decoded_group(
+                    RpgMakerAssetOwner::Rules,
+                    TextGroupKind::DatabaseEntry,
+                    &group_location,
+                    group_order.clone(),
+                ),
+            ],
+            vec![
+                decoded_unit(
+                    RpgMakerAssetOwner::Builtin,
+                    &group_location,
+                    group_order.clone(),
+                    role.clone(),
+                    RpgMakerSemanticOrderKey::new(vec![1], 1),
+                ),
+                decoded_unit(
+                    RpgMakerAssetOwner::Rules,
+                    &group_location,
+                    group_order,
+                    role.clone(),
+                    RpgMakerSemanticOrderKey::new(vec![1], 2),
+                ),
+            ],
+        )
+        .expect_err("跨 owner 的同一逻辑角色必须失败");
+
+        assert!(matches!(
+            error,
+            InvalidRpgMakerTranslationAssetSnapshot::DuplicateLogicalUnit {
+                owner: RpgMakerAssetOwner::Rules,
+                group_location: ref actual_location,
+                role: ref actual_role,
+            } if actual_location.as_ref() == &group_location && actual_role == &role
+        ));
+    }
+
+    #[test]
+    fn corpus_rejects_distinct_units_with_the_same_semantic_order_key() {
+        let group_location = RpgMakerLocation::value(
+            RpgMakerSource::data(crate::rpg_maker::text::StandardDataFile::Items),
+            vec![RpgMakerLocationStep::index(1)],
+        );
+        let group_order = RpgMakerSemanticOrderKey::new(vec![1], 0);
+        let first_role =
+            TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("测试字段键必须有效"));
+        let second_role =
+            TextUnitRole::Scalar(ScalarFieldKey::new("description").expect("测试字段键必须有效"));
+        let duplicate_order = RpgMakerSemanticOrderKey::new(vec![1], 1);
+
+        let error = assemble_corpus(
+            vec![decoded_group(
+                RpgMakerAssetOwner::Builtin,
+                TextGroupKind::DatabaseEntry,
+                &group_location,
+                group_order.clone(),
+            )],
+            vec![
+                decoded_unit(
+                    RpgMakerAssetOwner::Builtin,
+                    &group_location,
+                    group_order.clone(),
+                    first_role.clone(),
+                    duplicate_order.clone(),
+                ),
+                decoded_unit(
+                    RpgMakerAssetOwner::Builtin,
+                    &group_location,
+                    group_order,
+                    second_role.clone(),
+                    duplicate_order,
+                ),
+            ],
+        )
+        .expect_err("同一 Group 的不同 Unit 共用 semantic_order_key 必须失败");
+
+        let expected_first = format!("{group_location} / {first_role:?}");
+        let expected_second = format!("{group_location} / {second_role:?}");
+        assert!(matches!(
+            error,
+            InvalidRpgMakerTranslationAssetSnapshot::DuplicateSemanticOrderKey {
+                level: "Unit",
+                ref first,
+                ref second,
+            } if first == &expected_first && second == &expected_second
+        ));
+    }
+
+    #[test]
+    fn corpus_rejects_a_unit_order_key_reused_by_another_owner_and_group() {
+        let first_location = RpgMakerLocation::value(
+            RpgMakerSource::data(crate::rpg_maker::text::StandardDataFile::Items),
+            vec![RpgMakerLocationStep::index(1)],
+        );
+        let second_location = RpgMakerLocation::value(
+            RpgMakerSource::data(crate::rpg_maker::text::StandardDataFile::Items),
+            vec![RpgMakerLocationStep::index(2)],
+        );
+        let first_group_order = RpgMakerSemanticOrderKey::new(vec![1], 0);
+        let second_group_order = RpgMakerSemanticOrderKey::new(vec![2], 0);
+        let duplicate_unit_order = RpgMakerSemanticOrderKey::new(vec![9], 1);
+        let first_role =
+            TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("测试字段键必须有效"));
+        let second_role =
+            TextUnitRole::Scalar(ScalarFieldKey::new("description").expect("测试字段键必须有效"));
+
+        let error = assemble_corpus(
+            vec![
+                decoded_group(
+                    RpgMakerAssetOwner::Builtin,
+                    TextGroupKind::DatabaseEntry,
+                    &first_location,
+                    first_group_order.clone(),
+                ),
+                decoded_group(
+                    RpgMakerAssetOwner::Rules,
+                    TextGroupKind::DatabaseEntry,
+                    &second_location,
+                    second_group_order.clone(),
+                ),
+            ],
+            vec![
+                decoded_unit(
+                    RpgMakerAssetOwner::Builtin,
+                    &first_location,
+                    first_group_order,
+                    first_role.clone(),
+                    duplicate_unit_order.clone(),
+                ),
+                decoded_unit(
+                    RpgMakerAssetOwner::Rules,
+                    &second_location,
+                    second_group_order,
+                    second_role.clone(),
+                    duplicate_unit_order,
+                ),
+            ],
+        )
+        .expect_err("不同 owner 和 Group 的 Unit 共用 semantic_order_key 必须失败");
+
+        let expected_first = format!("{first_location} / {first_role:?}");
+        let expected_second = format!("{second_location} / {second_role:?}");
+        assert!(matches!(
+            error,
+            InvalidRpgMakerTranslationAssetSnapshot::DuplicateSemanticOrderKey {
+                level: "Unit",
+                ref first,
+                ref second,
+            } if first == &expected_first && second == &expected_second
+        ));
     }
 
     #[test]
@@ -1882,23 +2269,25 @@ mod tests {
                 CREATE TABLE rpg_maker_text_group (
                     owner TEXT NOT NULL,
                     group_location TEXT NOT NULL,
-                    group_order INTEGER NOT NULL,
+                    semantic_order_key BLOB NOT NULL,
                     group_kind TEXT NOT NULL,
                     PRIMARY KEY (owner, group_location),
-                    UNIQUE (owner, group_order)
+                    UNIQUE (owner, semantic_order_key)
                 );
                 CREATE TABLE rpg_maker_text_unit (
                     owner TEXT NOT NULL,
                     group_location TEXT NOT NULL,
                     unit_role TEXT NOT NULL,
-                    unit_order INTEGER NOT NULL,
+                    semantic_order_key BLOB NOT NULL,
                     source_content_json TEXT NOT NULL,
                     source_context_json TEXT NOT NULL,
                     translation_content_json TEXT,
                     translation_state BLOB,
                     PRIMARY KEY (owner, group_location, unit_role),
-                    UNIQUE (owner, group_location, unit_order)
+                    UNIQUE (owner, semantic_order_key)
                 );
+                CREATE INDEX rpg_maker_text_unit_owner_group_order_idx
+                    ON rpg_maker_text_unit(owner, group_location, semantic_order_key);
 
                 INSERT INTO metadata VALUES (zeroblob(32));
                 INSERT INTO rpg_maker_asset_owner_state VALUES
@@ -1908,12 +2297,12 @@ mod tests {
                     ('terminology', '[]'),
                     ('placeholder_rules', '[]');
                 INSERT INTO rpg_maker_text_group VALUES
-                    ('builtin', 'group-b', 1, 'map'),
-                    ('builtin', 'group-a', 0, 'map'),
-                    ('rules', 'group-r', 0, 'map');
+                    ('builtin', 'group-b', X'010000000000000001000000000000000000', 'map'),
+                    ('builtin', 'group-a', X'010000000000000000000000000000000000', 'map'),
+                    ('rules', 'group-r', X'010000000000000000000000000000000000', 'map');
                 INSERT INTO rpg_maker_text_unit VALUES
-                    ('builtin', 'group-b', 'role-z', 0, '"z"', '{}', NULL, NULL),
-                    ('builtin', 'group-a', 'role-y', 0, '"y"', '{}', NULL, NULL);
+                    ('builtin', 'group-b', 'role-z', X'010000000000000001000000000000000000', '"z"', '{}', NULL, NULL),
+                    ('builtin', 'group-a', 'role-y', X'010000000000000000000000000000000000', '"y"', '{}', NULL, NULL);
                 "#,
             )
             .expect("测试快照表与行应可建立");
@@ -1978,6 +2367,15 @@ mod tests {
                 details.iter().all(|detail| !detail.contains("TEMP B-TREE")),
                 "翻译快照查询不得建立全局临时排序：{details:?}"
             );
+            if query.statement().contains("rpg_maker_text_unit AS unit") {
+                assert!(
+                    details.iter().any(|detail| {
+                        detail.contains("rpg_maker_text_unit_owner_group_order_idx")
+                            && detail.contains("group_location=?")
+                    }),
+                    "Unit 必须按 owner 与 group_location 定位，不能为每个 Group 扫描整个 owner：{details:?}"
+                );
+            }
         }
     }
 
@@ -2035,10 +2433,10 @@ mod tests {
     fn group_columns_keep_first_error_before_corrupt_role_and_source_json() {
         let role = RpgMakerProjectionCodec::encode_role(&TextUnitRole::DialogueBody)
             .expect("角色应可编码");
-        let corrupt_tail = |kind: &str, group_order: i64| {
+        let corrupt_tail = |kind: &str, group_order_key: SqliteValue| {
             let mut values =
                 unit_payload_row(&dialogue_group(), kind, &role, r#"["正文"]"#, "{}").into_values();
-            values[2] = SqliteValue::Integer(group_order);
+            values[2] = group_order_key;
             values[3] = text("{");
             values[5] = text("{");
             SqliteRow::new(values)
@@ -2047,7 +2445,14 @@ mod tests {
         let unknown_kind = decode_unit(
             OwnerSqliteRow {
                 owner: RpgMakerAssetOwner::Builtin,
-                row: corrupt_tail("unknown_kind", 0),
+                row: corrupt_tail(
+                    "unknown_kind",
+                    SqliteValue::Blob(
+                        RpgMakerSemanticOrderKey::new(vec![0], 0)
+                            .encode()
+                            .expect("应编码顺序键"),
+                    ),
+                ),
             },
             active_builtin(),
         )
@@ -2061,16 +2466,16 @@ mod tests {
         let invalid_group_order = decode_unit(
             OwnerSqliteRow {
                 owner: RpgMakerAssetOwner::Builtin,
-                row: corrupt_tail("event_dialogue", -1),
+                row: corrupt_tail("event_dialogue", SqliteValue::Blob(vec![0])),
             },
             active_builtin(),
         )
-        .expect_err("非法 group_order 必须先于损坏的 role 和 source JSON 报告");
+        .expect_err("非法 semantic_order_key 必须先于损坏的 role 和 source JSON 报告");
         assert!(matches!(
             invalid_group_order,
-            InvalidRpgMakerTranslationAssetSnapshot::InvalidOrderValue {
-                column: "group_order",
-                actual: -1
+            InvalidRpgMakerTranslationAssetSnapshot::InvalidSemanticOrderKey {
+                column: "semantic_order_key",
+                ..
             }
         ));
     }
@@ -2202,7 +2607,11 @@ mod tests {
             vec![SqliteRow::new(vec![
                 text(RpgMakerLocationCodec::encode(group).expect("位置应可编码")),
                 text("event_dialogue"),
-                SqliteValue::Integer(0),
+                SqliteValue::Blob(
+                    RpgMakerSemanticOrderKey::from_group_location(group)
+                        .encode()
+                        .expect("应编码 Group 顺序键"),
+                ),
             ])],
             Vec::new(),
             units,
@@ -2221,9 +2630,20 @@ mod tests {
         SqliteRow::new(vec![
             text(RpgMakerLocationCodec::encode(group).expect("位置应可编码")),
             text(kind),
-            SqliteValue::Integer(0),
+            SqliteValue::Blob(
+                RpgMakerSemanticOrderKey::from_group_location(group)
+                    .encode()
+                    .expect("应编码 Group 顺序键"),
+            ),
             text(role),
-            SqliteValue::Integer(unit_order),
+            SqliteValue::Blob(
+                RpgMakerSemanticOrderKey::new(
+                    vec![u64::try_from(unit_order).expect("测试顺序必须非负")],
+                    0,
+                )
+                .encode()
+                .expect("应编码 Unit 顺序键"),
+            ),
             text(source_content_json),
             text(context),
             SqliteValue::Null,
@@ -2241,9 +2661,17 @@ mod tests {
         SqliteRow::new(vec![
             text(RpgMakerLocationCodec::encode(group).expect("位置应可编码")),
             text(kind),
-            SqliteValue::Integer(0),
+            SqliteValue::Blob(
+                RpgMakerSemanticOrderKey::from_group_location(group)
+                    .encode()
+                    .expect("应编码 Group 顺序键"),
+            ),
             text(role),
-            SqliteValue::Integer(0),
+            SqliteValue::Blob(
+                RpgMakerSemanticOrderKey::new(vec![0], 0)
+                    .encode()
+                    .expect("应编码 Unit 顺序键"),
+            ),
             text(source_content_json),
             text(context),
             SqliteValue::Null,

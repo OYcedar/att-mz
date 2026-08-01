@@ -23,6 +23,9 @@ use crate::rpg_maker::model::{
     DirectTextRecipe, MutationClaim, TextProjectionRecipe, TextUnitContent, TextUnitRole,
 };
 use crate::rpg_maker::project::OpenedProject;
+use crate::rpg_maker::semantic_order::{
+    RpgMakerSemanticOrderKey, RpgMakerSemanticOrderProjectionError,
+};
 use crate::rpg_maker::text::MapId;
 
 use super::document::{
@@ -619,6 +622,19 @@ fn snapshot_model_safe_diagnostic(source: &SnapshotModelError) -> SafeDiagnostic
                 builtin_group_kind_name(*second)
             ),
         ),
+        SnapshotModelError::ConflictingSemanticOrderKey { group_location, .. } => (
+            DiagnosticSubject::field(group_location.to_string()),
+            DiagnosticFailureKind::InternalInvariant,
+            "structure=text_group; semantic_order_key=conflicting".to_owned(),
+        ),
+        SnapshotModelError::SemanticOrderProjection {
+            exact_location,
+            source,
+        } => (
+            DiagnosticSubject::field(exact_location.to_string()),
+            DiagnosticFailureKind::InternalInvariant,
+            format!("structure=semantic_order_key; reason={source}"),
+        ),
         SnapshotModelError::MutationClaimConflict { .. } => (
             DiagnosticSubject::operation("build_builtin_snapshot_claim_index"),
             DiagnosticFailureKind::ConflictingValues,
@@ -735,6 +751,7 @@ fn build_builtin_snapshot_with_dialogue_projection(
     extract_common_events(documents, &mut dialogue_projection, &mut groups)?;
     extract_troops(documents, &mut dialogue_projection, &mut groups)?;
     dialogue_projection.finish()?;
+    assign_builtin_semantic_order(documents, &mut groups)?;
 
     BuiltinSnapshot::new(groups).map_err(Into::into)
 }
@@ -830,12 +847,14 @@ impl BuiltinWorkUnit {
             } => {
                 let documents = single_document(RpgMakerDocumentId::Data(file), document);
                 extract_database_entries(&documents, file, field_names, &mut groups)?;
+                assign_builtin_semantic_order(&documents, &mut groups)?;
                 None
             }
             Self::System(document) => {
                 let documents =
                     single_document(RpgMakerDocumentId::Data(StandardDataFile::System), document);
                 extract_system(&documents, &mut groups)?;
+                assign_builtin_semantic_order(&documents, &mut groups)?;
                 None
             }
             Self::Map {
@@ -845,6 +864,7 @@ impl BuiltinWorkUnit {
             } => {
                 let documents = single_document(RpgMakerDocumentId::Map(map_id), document);
                 extract_maps(&documents, &mut dialogue_projection, &mut groups)?;
+                assign_builtin_semantic_order(&documents, &mut groups)?;
                 Some(dialogue_projection)
             }
             Self::CommonEvents {
@@ -856,6 +876,7 @@ impl BuiltinWorkUnit {
                     document,
                 );
                 extract_common_events(&documents, &mut dialogue_projection, &mut groups)?;
+                assign_builtin_semantic_order(&documents, &mut groups)?;
                 Some(dialogue_projection)
             }
             Self::Troops {
@@ -865,6 +886,7 @@ impl BuiltinWorkUnit {
                 let documents =
                     single_document(RpgMakerDocumentId::Data(StandardDataFile::Troops), document);
                 extract_troops(&documents, &mut dialogue_projection, &mut groups)?;
+                assign_builtin_semantic_order(&documents, &mut groups)?;
                 Some(dialogue_projection)
             }
         };
@@ -873,6 +895,65 @@ impl BuiltinWorkUnit {
             dialogue_projection,
         })
     }
+}
+
+fn assign_builtin_semantic_order(
+    documents: &RpgMakerProjectDocuments,
+    groups: &mut [ExtractedTextGroup],
+) -> Result<(), SnapshotModelError> {
+    for group in groups {
+        let group_location = group.group_location().clone();
+        let root = builtin_semantic_order_root(documents, &group_location)?;
+        let group_key = RpgMakerSemanticOrderKey::from_json_location(&group_location, root, 0)
+            .map_err(|source| SnapshotModelError::SemanticOrderProjection {
+                exact_location: Box::new(group_location.clone()),
+                source,
+            })?;
+        group.set_semantic_order_key(group_key);
+
+        for (unit_index, unit) in group.units_mut().iter_mut().enumerate() {
+            let exact_location = unit.projection_location().clone();
+            let root = builtin_semantic_order_root(documents, &exact_location)?;
+            let fragment = u64::try_from(unit_index)
+                .ok()
+                .and_then(|index| index.checked_add(1))
+                .ok_or_else(|| SnapshotModelError::SemanticOrderProjection {
+                    exact_location: Box::new(exact_location.clone()),
+                    source: RpgMakerSemanticOrderProjectionError::OrdinalOverflow,
+                })?;
+            let unit_key =
+                RpgMakerSemanticOrderKey::from_json_location(&exact_location, root, fragment)
+                    .map_err(|source| SnapshotModelError::SemanticOrderProjection {
+                        exact_location: Box::new(exact_location.clone()),
+                        source,
+                    })?;
+            unit.set_semantic_order_key(unit_key);
+        }
+    }
+    Ok(())
+}
+
+fn builtin_semantic_order_root<'a>(
+    documents: &'a RpgMakerProjectDocuments,
+    location: &RpgMakerLocation,
+) -> Result<&'a Value, SnapshotModelError> {
+    let document_id = match location.source() {
+        RpgMakerSource::Data(file) => RpgMakerDocumentId::Data(*file),
+        RpgMakerSource::DataFile(file) => RpgMakerDocumentId::DataFile(file.clone()),
+        RpgMakerSource::Map(map_id) => RpgMakerDocumentId::Map(*map_id),
+        RpgMakerSource::PluginParameter { .. } => {
+            return Err(SnapshotModelError::SemanticOrderProjection {
+                exact_location: Box::new(location.clone()),
+                source: RpgMakerSemanticOrderProjectionError::UnsupportedBuiltinPluginSource,
+            });
+        }
+    };
+    documents
+        .document(document_id)
+        .ok_or_else(|| SnapshotModelError::SemanticOrderProjection {
+            exact_location: Box::new(location.clone()),
+            source: RpgMakerSemanticOrderProjectionError::MissingSourceDocument,
+        })
 }
 
 fn single_document(
