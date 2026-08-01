@@ -110,6 +110,9 @@ ATT 发布目录中的术语规格只定义 ATT 接受的文件、匹配方式�
 - 修改项目、发出模型请求或发布输出前，先确认相应授权。
 - 模型、凭据、费用、语言、范围、外部服务和唯一原件，都按用户指定的来。
 - 按项目文档执行 Init、Extract、Translate 和 WriteBack，参数以文档为准。
+- Init 诊断为 `filesystem.operation`、发布、无覆盖重命名、`OS 5` 和“状态未改变”时，按
+  `docs/runtime/directory-publishing.md#5-init-发布阶段的-os-5` 检查项目目录不存在且没有
+  恢复终态；满足后只用原命令重试一次。否则不重试；不得手工删除、移动或编辑 ATT 项目。
 - Extract 成功但报告 Rules 非字符串跳过警告时，按 Rules 文档检查规则号、来源文件、
   command code、parameter、实际类型和数量。已确认的混合类型直接参数可以继续；类型
   出乎规则设计时先修正规则或来源范围。警告既不等于 Extract 失败，也不能在覆盖审查中
