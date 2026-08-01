@@ -48,4 +48,4 @@
 - [SQLite](runtime/sqlite.md)
 - [项目日志](runtime/project-log.md)
 - [目录发布](runtime/directory-publishing.md)
-- [性能验证](performance-validation.md)
+- [发行物](runtime/distribution.md)
