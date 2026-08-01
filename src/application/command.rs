@@ -51,8 +51,8 @@ use crate::project_lease::{
 use crate::project_lua::{
     ProjectLuaCallError, ProjectLuaCancellation, ProjectLuaDatabasePrerequisiteError,
     ProjectLuaFailure, ProjectLuaPrintSink, ProjectLuaProgram, ProjectLuaProject,
-    ProjectLuaRunError, ProjectLuaRunReport, ProjectLuaRunRequest, ProjectLuaSqliteError,
-    compile_project_lua_program_with_cancellation,
+    ProjectLuaRunError, ProjectLuaRunMetrics, ProjectLuaRunReport, ProjectLuaRunRequest,
+    ProjectLuaSqliteError, compile_project_lua_program_with_cancellation,
     fingerprint_project_lua_program_with_cancellation, rpg_maker_project_lua_adapter,
     run_project_lua,
 };
@@ -1135,6 +1135,7 @@ impl ProductionRpgMakerCommandRunner {
             performance,
             panic_boundary: Some(&self.panic_boundary),
         });
+        let mut lua_summary = ProjectLuaSummaryGuard::new(&project_log);
 
         let program_arguments = command.arguments().to_vec();
         let preflight_cancellation = lua_cancellation.clone();
@@ -1322,6 +1323,8 @@ impl ProductionRpgMakerCommandRunner {
         )
         .with_cancellation(lua_cancellation.clone())
         .with_print_sink(Arc::new(ProjectLogLuaPrintSink::from_active(&project_log)));
+        let lua_metrics = request.metrics();
+        lua_summary.track(lua_metrics.clone());
         let execution = drive_command(
             async move {
                 let result = tokio::task::spawn_blocking(move || {
@@ -1367,20 +1370,11 @@ impl ProductionRpgMakerCommandRunner {
         )
         .await;
         drop(project_lease_guard);
-        progress_observer.finish();
-        if let Some(report) = completed_project_lua_report(&execution) {
-            project_log.logger.emit(ProjectLogEvent::new(
-                ProjectLogLevel::Info,
-                ProjectLogCode::LuaSummary,
-                project_log.context.clone(),
-                ProjectLogPayload::LuaSummary {
-                    database_calls: report.database_calls(),
-                    changed_rows: report.changed_rows(),
-                    translation_calls: report.translation_calls(),
-                    printed_lines: report.printed_lines(),
-                },
-            ));
+        if completed_project_lua_report(&execution).is_some() {
+            progress_observer.finish();
         }
+        let report = lua_metrics.report();
+        lua_summary.emit(report);
         let execution = execution.map(|result| {
             result.map(|completion| map_completion(completion, |(output, _report)| output))
         });
@@ -3108,6 +3102,50 @@ pub(crate) struct ActiveProjectLog {
     performance: Arc<RunPerformanceCounters>,
 }
 
+pub(crate) struct ProjectLuaSummaryGuard {
+    logger: ProjectLogger,
+    context: ProjectLogContext,
+    metrics: Option<ProjectLuaRunMetrics>,
+    emitted: bool,
+}
+
+impl ProjectLuaSummaryGuard {
+    pub(crate) fn new(project_log: &ActiveProjectLog) -> Self {
+        Self {
+            logger: project_log.logger.clone(),
+            context: project_log.context.clone(),
+            metrics: None,
+            emitted: false,
+        }
+    }
+
+    pub(crate) fn track(&mut self, metrics: ProjectLuaRunMetrics) {
+        self.metrics = Some(metrics);
+    }
+
+    pub(crate) fn emit(&mut self, report: ProjectLuaRunReport) {
+        if self.emitted {
+            return;
+        }
+        emit_project_lua_summary(&self.logger, &self.context, report);
+        self.emitted = true;
+    }
+}
+
+impl Drop for ProjectLuaSummaryGuard {
+    fn drop(&mut self) {
+        if self.emitted {
+            return;
+        }
+        let report = self
+            .metrics
+            .as_ref()
+            .map_or_else(ProjectLuaRunReport::default, ProjectLuaRunMetrics::report);
+        emit_project_lua_summary(&self.logger, &self.context, report);
+        self.emitted = true;
+    }
+}
+
 pub(crate) struct PendingProjectLog {
     active: ActiveProjectLog,
     outcome: ProjectLogRunOutcome,
@@ -4174,6 +4212,24 @@ fn completed_project_lua_report(
         | DrivenCommand::Interrupted(Err(_))
         | DrivenCommand::SignalFailed { .. } => None,
     }
+}
+
+fn emit_project_lua_summary(
+    logger: &ProjectLogger,
+    context: &ProjectLogContext,
+    report: ProjectLuaRunReport,
+) {
+    logger.emit_reliable(ProjectLogEvent::new(
+        ProjectLogLevel::Info,
+        ProjectLogCode::LuaSummary,
+        context.clone(),
+        ProjectLogPayload::LuaSummary {
+            database_calls: report.database_calls(),
+            changed_rows: report.changed_rows(),
+            translation_calls: report.translation_calls(),
+            printed_lines: report.printed_lines(),
+        },
+    ));
 }
 
 impl RpgMakerTranslationLog for ProductionBusinessLog {
@@ -7848,6 +7904,19 @@ impl ProductionCommandError {
                         DiagnosticAction::ReportBug,
                         3,
                         DiagnosticSubject::operation(operation),
+                    ),
+                    ProjectLuaFailure::Host {
+                        operation: "translation.capture",
+                        ..
+                    } => (
+                        DiagnosticCode::ProjectState,
+                        DiagnosticReason::failure_with_detail(
+                            DiagnosticFailureKind::StateMismatch,
+                            &detail,
+                        ),
+                        DiagnosticAction::CheckProjectState,
+                        0,
+                        DiagnosticSubject::operation("translation.capture"),
                     ),
                     ProjectLuaFailure::Host { .. } => (
                         DiagnosticCode::LuaExecution,

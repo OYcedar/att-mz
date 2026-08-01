@@ -23,7 +23,7 @@ use time::OffsetDateTime;
 
 use super::command::{
     ActiveProjectLog, CommandLogStart, PendingProjectLog, ProjectLogLuaPrintSink,
-    TerminationSignals, start_command_log,
+    ProjectLuaSummaryGuard, TerminationSignals, start_command_log,
 };
 use super::config::{
     ConfiguredGenericCommand, ConfiguredGenericWriteBackCommand, ConfiguredProjectLuaCommand,
@@ -1132,6 +1132,16 @@ impl ProductionGenericCommandRunner {
                 panic_boundary: None,
             }),
         );
+        let mut lua_summary = {
+            let project_log = project_log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ProjectLuaSummaryGuard::new(
+                project_log
+                    .as_ref()
+                    .expect("Generic Lua 必须在建立摘要守卫前建立项目日志"),
+            )
+        };
         let file_system_configuration = command.common().filesystem().clone();
         let file_system =
             match start_file_system(file_system_configuration, Arc::clone(&performance)) {
@@ -1167,7 +1177,6 @@ impl ProductionGenericCommandRunner {
         let operation_cancellation = cancellation.clone();
         let cancellation_file_system = file_system.clone();
         let output_name = project_name.clone();
-        let operation_project_log = Arc::clone(&project_log);
         let (print_sink, preflight_log) = {
             let project_log = project_log
                 .lock()
@@ -1215,8 +1224,9 @@ impl ProductionGenericCommandRunner {
                 compile_project_lua_program_with_cancellation(&program, &preflight_cancellation)?;
                 Ok::<_, ProjectLuaFailure>(program)
             })
-            .await
-            .map_err(|source| GenericCommandError::operation("准备 Generic Lua", source))?;
+            .await;
+            let preparation = preparation
+                .map_err(|source| GenericCommandError::operation("准备 Generic Lua", source))?;
             let program = match preparation {
                 Ok(prepared) => prepared,
                 Err(ProjectLuaFailure::Cancelled) => return Err(GenericCommandError::Cancelled),
@@ -1263,10 +1273,12 @@ impl ProductionGenericCommandRunner {
                 Some(print_sink) => request.with_print_sink(print_sink),
                 None => request,
             };
+            let lua_metrics = request.metrics();
+            lua_summary.track(lua_metrics.clone());
             operation_progress.observe(ProgressSnapshot::indeterminate(
                 GenericProgressPhase::RunningLua,
             ));
-            let report = tokio::task::spawn_blocking(move || {
+            let execution = tokio::task::spawn_blocking(move || {
                 let open_path = database_path.clone();
                 let connection = Connection::open_with_flags(
                     &database_path,
@@ -1278,10 +1290,13 @@ impl ProductionGenericCommandRunner {
                 })?;
                 run_project_lua(connection, request).map_err(GenericLuaExecutionError::Run)
             })
-            .await
-            .map_err(|source| GenericCommandError::operation("执行 Generic Lua", source))?;
-            let report = match report {
-                Ok(report) => report,
+            .await;
+            let report = lua_metrics.report();
+            lua_summary.emit(report);
+            let execution = execution
+                .map_err(|source| GenericCommandError::operation("执行 Generic Lua", source))?;
+            match execution {
+                Ok(_) => {}
                 Err(source) if source.is_cancelled() => return Err(GenericCommandError::Cancelled),
                 Err(source) => {
                     let diagnostic = generic_lua_execution_diagnostic(&source);
@@ -1291,23 +1306,6 @@ impl ProductionGenericCommandRunner {
                         diagnostic,
                     ));
                 }
-            };
-            if let Some(project_log) = operation_project_log
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-            {
-                project_log.logger().emit(ProjectLogEvent::new(
-                    ProjectLogLevel::Info,
-                    ProjectLogCode::LuaSummary,
-                    project_log.context().clone(),
-                    ProjectLogPayload::LuaSummary {
-                        database_calls: report.database_calls(),
-                        changed_rows: report.changed_rows(),
-                        translation_calls: report.translation_calls(),
-                        printed_lines: report.printed_lines(),
-                    },
-                ));
             }
             Ok(GenericCommandOutput::Lua {
                 project: output_name,
@@ -2193,6 +2191,15 @@ fn project_lua_failure_diagnostic(
             DiagnosticReason::failure_with_detail(DiagnosticFailureKind::WorkerSpawnFailed, detail),
             DiagnosticAction::ReportBug,
             DiagnosticSubject::operation(operation),
+        ),
+        ProjectLuaFailure::Host {
+            operation: "translation.capture",
+            ..
+        } => (
+            DiagnosticCode::ProjectState,
+            DiagnosticReason::failure_with_detail(DiagnosticFailureKind::StateMismatch, detail),
+            DiagnosticAction::CheckProjectState,
+            DiagnosticSubject::operation("translation.capture"),
         ),
         ProjectLuaFailure::Host { .. } => (
             DiagnosticCode::LuaExecution,

@@ -18,7 +18,9 @@ payload；code 来自封闭集合，业务代码无法提交任意自由文本�
 
 - `lua.script`：脚本身份与 SHA-256；
 - `lua.print`：脚本一次显式 `print(...)` 的安全单行正文；
-- `lua.summary`：数据库调用次数、changed rows、译文操作次数和打印行数。
+- `lua.summary`：数据库调用次数、changed rows、译文操作次数和打印行数；每份已经建立
+  的 Lua 项目日志恰好写一条，失败或回滚时也记录已经发生的操作，但不表示事务已提交，
+  事务终态只由 `run.finished` 表达。
 
 Rules command 直接参数出现可跳过的非字符串时，Extract 成功后写 Warn 事件
 `extract.rules.command_non_string_skipped`。payload kind 是

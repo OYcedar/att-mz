@@ -7,8 +7,9 @@ use rusqlite::{
     Connection,
     hooks::{AuthAction, AuthContext, Authorization, TransactionOperation},
 };
+use sha2::{Digest, Sha256};
 
-use crate::fingerprint::Sha256FramedHasher;
+use crate::fingerprint::Sha256Fingerprint;
 
 use super::{
     ProjectLuaCallError, ProjectLuaCancellation, ProjectLuaDatabasePrerequisiteError,
@@ -832,6 +833,52 @@ ctx.translation.set({id = "unit-1"}, "final")
 }
 
 #[test]
+fn failed_translation_host_call_is_included_in_failure_metrics() {
+    let request = request(
+        r#"ctx.translation.set({id = "missing"}, "译文")"#,
+        Arc::new(TestAdapter::default()),
+    );
+    let metrics = request.metrics();
+
+    let error = run_project_lua(database(), request)
+        .expect_err("不存在的 Unit 必须让 translation.set 失败并回滚");
+    assert!(matches!(
+        error,
+        ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
+            operation: "translation.set",
+            ..
+        })
+    ));
+    let report = metrics.report();
+    assert_eq!(report.translation_calls(), 1);
+    assert_eq!(report.changed_rows(), 0);
+}
+
+#[test]
+fn cancellation_after_translation_change_keeps_call_and_changed_row_metrics() {
+    let cancellation = ProjectLuaCancellation::default();
+    let request = request(
+        r#"ctx.translation.set({id = "unit-1"}, "译文")"#,
+        Arc::new(TestAdapter {
+            cancel_after_translation: Some(cancellation.clone()),
+            ..TestAdapter::default()
+        }),
+    )
+    .with_cancellation(cancellation);
+    let metrics = request.metrics();
+
+    let error =
+        run_project_lua(database(), request).expect_err("数据库已经改动后观察到取消，事务必须回滚");
+    assert_eq!(
+        error,
+        ProjectLuaRunError::RolledBack(ProjectLuaFailure::Cancelled)
+    );
+    let report = metrics.report();
+    assert_eq!(report.translation_calls(), 1);
+    assert_eq!(report.changed_rows(), 1);
+}
+
+#[test]
 fn cancellation_before_start_does_not_begin_a_transaction() {
     let cancellation = ProjectLuaCancellation::default();
     cancellation.cancel();
@@ -1201,10 +1248,9 @@ fn program_construction_reuses_source_and_argument_allocations() {
 }
 
 #[test]
-fn chunked_program_fingerprint_matches_existing_contract() {
+fn chunked_program_fingerprint_is_the_source_file_sha256() {
     let source = large_lua_comment(2 * 64 * 1024 + 17);
-    let mut expected = Sha256FramedHasher::new(b"att.project-lua.program-identity");
-    expected.frame(1, &source);
+    let expected = Sha256Fingerprint::from_bytes(Sha256::digest(&source).into());
     let program = ProjectLuaProgram::new("fingerprint.lua", source, Vec::new());
 
     let actual = fingerprint_project_lua_program_with_cancellation(
@@ -1213,7 +1259,7 @@ fn chunked_program_fingerprint_matches_existing_contract() {
     )
     .expect("分块指纹应成功");
 
-    assert_eq!(actual, expected.finish());
+    assert_eq!(actual, expected);
 }
 
 #[test]

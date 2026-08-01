@@ -222,7 +222,6 @@ impl ProjectLuaEngineAdapter for GenericProjectLuaAdapter {
                 "Generic locator 没有命中唯一 Unit",
             ));
         }
-        ensure_generic_lua_running(&self.cancellation)?;
         Ok(u64::try_from(changed).expect("受支持平台的 usize 必须能表示为 u64"))
     }
 
@@ -251,7 +250,6 @@ impl ProjectLuaEngineAdapter for GenericProjectLuaAdapter {
                 "Generic locator 没有命中唯一 Unit",
             ));
         }
-        ensure_generic_lua_running(&self.cancellation)?;
         Ok(u64::try_from(changed).expect("受支持平台的 usize 必须能表示为 u64"))
     }
 

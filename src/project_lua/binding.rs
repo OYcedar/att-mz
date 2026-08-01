@@ -6,6 +6,7 @@ use std::num::NonZeroU32;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use mlua::thread::ThreadStatus;
 use mlua::{
@@ -25,53 +26,65 @@ pub(super) struct PreparedProjectLua {
     pub(super) lua: Lua,
     pub(super) function: Function,
     pub(super) connection: Rc<RefCell<Connection>>,
-    pub(super) metrics: Rc<BindingMetrics>,
+    pub(super) metrics: Arc<BindingMetrics>,
     pub(super) transaction_guard: Rc<BindingTransactionGuard>,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct BindingMetrics {
-    database_calls: Cell<u64>,
-    changed_rows: Cell<u64>,
-    translation_calls: Cell<u64>,
-    printed_lines: Cell<u64>,
+    database_calls: AtomicU64,
+    changed_rows: AtomicU64,
+    translation_calls: AtomicU64,
+    printed_lines: AtomicU64,
 }
 
 impl BindingMetrics {
     pub(super) fn database_calls(&self) -> u64 {
-        self.database_calls.get()
+        self.database_calls.load(Ordering::Relaxed)
     }
 
     pub(super) fn changed_rows(&self) -> u64 {
-        self.changed_rows.get()
+        self.changed_rows.load(Ordering::Relaxed)
     }
 
     pub(super) fn translation_calls(&self) -> u64 {
-        self.translation_calls.get()
+        self.translation_calls.load(Ordering::Relaxed)
     }
 
     pub(super) fn printed_lines(&self) -> u64 {
-        self.printed_lines.get()
+        self.printed_lines.load(Ordering::Relaxed)
     }
 
     fn record_database_call(&self) {
         self.database_calls
-            .set(self.database_calls.get().saturating_add(1));
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_add(1))
+            })
+            .expect("计数更新闭包始终返回新值");
     }
 
     fn record_changed_rows(&self, rows: u64) {
         self.changed_rows
-            .set(self.changed_rows.get().saturating_add(rows));
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_add(rows))
+            })
+            .expect("计数更新闭包始终返回新值");
     }
 
     fn record_translation_call(&self) {
         self.translation_calls
-            .set(self.translation_calls.get().saturating_add(1));
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_add(1))
+            })
+            .expect("计数更新闭包始终返回新值");
     }
 
     fn record_printed_line(&self) {
         self.printed_lines
-            .set(self.printed_lines.get().saturating_add(1));
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_add(1))
+            })
+            .expect("计数更新闭包始终返回新值");
     }
 }
 
@@ -160,13 +173,13 @@ pub(super) fn prepare_lua(
     let function = compile_program(&lua, &request.program, &request.cancellation)?;
 
     let connection = Rc::new(RefCell::new(connection));
-    let metrics = Rc::new(BindingMetrics::default());
+    let metrics = Arc::clone(&request.metrics);
     let transaction_guard = Rc::new(BindingTransactionGuard::default());
     let context = build_context(
         &lua,
         request,
         Rc::clone(&connection),
-        Rc::clone(&metrics),
+        Arc::clone(&metrics),
         Rc::clone(&transaction_guard),
     )
     .map_err(|error| ProjectLuaFailure::Context(error.to_string()))?;
@@ -178,7 +191,7 @@ pub(super) fn prepare_lua(
     install_print(
         &lua,
         Arc::clone(&request.print_sink),
-        Rc::clone(&metrics),
+        Arc::clone(&metrics),
         cancellation,
     )
     .map_err(|error| ProjectLuaFailure::Context(error.to_string()))?;
@@ -434,7 +447,7 @@ fn build_context(
     lua: &Lua,
     request: &ProjectLuaRunRequest,
     connection: Rc<RefCell<Connection>>,
-    metrics: Rc<BindingMetrics>,
+    metrics: Arc<BindingMetrics>,
     transaction_guard: Rc<BindingTransactionGuard>,
 ) -> mlua::Result<Table> {
     let context = lua.create_table()?;
@@ -451,7 +464,7 @@ fn build_context(
         build_database_table(
             lua,
             Rc::clone(&connection),
-            Rc::clone(&metrics),
+            Arc::clone(&metrics),
             Rc::clone(&transaction_guard),
             request.cancellation.clone(),
         )?,
@@ -473,12 +486,12 @@ fn build_context(
 fn install_print(
     lua: &Lua,
     sink: Arc<dyn ProjectLuaPrintSink>,
-    metrics: Rc<BindingMetrics>,
+    metrics: Arc<BindingMetrics>,
     cancellation: ProjectLuaCancellation,
 ) -> mlua::Result<()> {
     let native = lua.create_function(move |lua, bytes: mlua::LuaString| {
-        ensure_lua_not_cancelled(&cancellation)?;
         metrics.record_printed_line();
+        ensure_lua_not_cancelled(&cancellation)?;
         let result = sink
             .print(bytes.as_bytes().as_ref())
             .map_err(|error| host_error("log", error, "print"));
@@ -512,7 +525,7 @@ end
 fn build_database_table(
     lua: &Lua,
     connection: Rc<RefCell<Connection>>,
-    metrics: Rc<BindingMetrics>,
+    metrics: Arc<BindingMetrics>,
     transaction_guard: Rc<BindingTransactionGuard>,
     cancellation: ProjectLuaCancellation,
 ) -> mlua::Result<Table> {
@@ -520,14 +533,14 @@ fn build_database_table(
     let null = lua.create_userdata(LuaSqliteNull)?;
 
     let query_connection = Rc::clone(&connection);
-    let query_metrics = Rc::clone(&metrics);
+    let query_metrics = Arc::clone(&metrics);
     let query_transaction_guard = Rc::clone(&transaction_guard);
     let query_cancellation = cancellation.clone();
     native.set(
         "query",
         lua.create_function(move |lua, (statement, parameters): (Value, Value)| {
-            ensure_lua_not_cancelled(&query_cancellation)?;
             query_metrics.record_database_call();
+            ensure_lua_not_cancelled(&query_cancellation)?;
             let connection = query_connection.borrow();
             let result = query_transaction_guard.call(&connection, "db.query", |connection| {
                 parse_sql_call(statement, parameters, &query_cancellation)
@@ -552,14 +565,14 @@ fn build_database_table(
         })?,
     )?;
 
-    let execute_metrics = Rc::clone(&metrics);
+    let execute_metrics = Arc::clone(&metrics);
     let execute_transaction_guard = transaction_guard;
     let execute_cancellation = cancellation.clone();
     native.set(
         "execute",
         lua.create_function(move |lua, (statement, parameters): (Value, Value)| {
-            ensure_lua_not_cancelled(&execute_cancellation)?;
             execute_metrics.record_database_call();
+            ensure_lua_not_cancelled(&execute_cancellation)?;
             let connection = connection.borrow();
             let result = execute_transaction_guard.call(&connection, "db.execute", |connection| {
                 parse_sql_call(statement, parameters, &execute_cancellation)
@@ -569,11 +582,6 @@ fn build_database_table(
                             .map_err(|error| host_error("binding", error, "db.execute"))?;
                         execute_database(connection, &statement, &parameters)
                             .map_err(|error| sqlite_host_error("db.execute", &error))
-                            .and_then(|changed| {
-                                ensure_project_lua_call_running(&execute_cancellation)
-                                    .map_err(|error| host_error("binding", error, "db.execute"))?;
-                                Ok(changed)
-                            })
                     })
             });
             let output = match result {
@@ -649,7 +657,7 @@ fn build_translation_table(
     lua: &Lua,
     connection: Rc<RefCell<Connection>>,
     adapter: Arc<dyn ProjectLuaEngineAdapter>,
-    metrics: Rc<BindingMetrics>,
+    metrics: Arc<BindingMetrics>,
     transaction_guard: Rc<BindingTransactionGuard>,
     cancellation: ProjectLuaCancellation,
 ) -> mlua::Result<Table> {
@@ -657,12 +665,13 @@ fn build_translation_table(
 
     let set_adapter = Arc::clone(&adapter);
     let set_connection = Rc::clone(&connection);
-    let set_metrics = Rc::clone(&metrics);
+    let set_metrics = Arc::clone(&metrics);
     let set_transaction_guard = Rc::clone(&transaction_guard);
     let set_cancellation = cancellation.clone();
     native.set(
         "set",
         lua.create_function(move |lua, (locator, translation): (Value, Value)| {
+            set_metrics.record_translation_call();
             ensure_lua_not_cancelled(&set_cancellation)?;
             let connection = set_connection.borrow();
             let result = set_transaction_guard.call(&connection, "translation.set", |connection| {
@@ -680,7 +689,6 @@ fn build_translation_table(
             });
             let output = match result {
                 Ok(changed) => {
-                    set_metrics.record_translation_call();
                     set_metrics.record_changed_rows(changed);
                     host_result_to_lua(lua, Ok(()), |_lua, ()| Ok(Value::Nil))
                 }
@@ -697,6 +705,7 @@ fn build_translation_table(
     native.set(
         "clear",
         lua.create_function(move |lua, locator: Value| {
+            clear_metrics.record_translation_call();
             ensure_lua_not_cancelled(&clear_cancellation)?;
             let connection = connection.borrow();
             let result =
@@ -713,7 +722,6 @@ fn build_translation_table(
                 });
             let output = match result {
                 Ok(changed) => {
-                    clear_metrics.record_translation_call();
                     clear_metrics.record_changed_rows(changed);
                     host_result_to_lua(lua, Ok(()), |_lua, ()| Ok(Value::Nil))
                 }
@@ -1709,6 +1717,83 @@ mod tests {
     use super::*;
 
     const DEEP_PROJECT_VALUE_TABLE_DEPTH: usize = 5_000;
+
+    #[test]
+    fn cancelled_host_entry_is_still_counted() {
+        let lua = Lua::new();
+        let cancellation = ProjectLuaCancellation::default();
+        let metrics = Arc::new(BindingMetrics::default());
+        let database = build_database_table(
+            &lua,
+            Rc::new(RefCell::new(
+                Connection::open_in_memory().expect("应建立测试数据库"),
+            )),
+            Arc::clone(&metrics),
+            Rc::new(BindingTransactionGuard::default()),
+            cancellation.clone(),
+        )
+        .expect("应建立数据库 Host table");
+        cancellation.cancel();
+
+        let query: Function = database.get("query").expect("应取得 query Host");
+        query
+            .call::<Value>(("SELECT 1", Value::Nil))
+            .expect_err("进入 Host 后观察到取消必须返回失败");
+        assert_eq!(metrics.database_calls(), 1);
+        assert_eq!(metrics.changed_rows(), 0);
+    }
+
+    #[test]
+    fn changed_rows_are_counted_before_post_execute_cancellation() {
+        let lua = Lua::new();
+        let cancellation = ProjectLuaCancellation::default();
+        let cancel_from_authorizer = cancellation.clone();
+        let connection = Connection::open_in_memory().expect("应建立测试数据库");
+        connection
+            .execute_batch(
+                "CREATE TABLE units (id TEXT PRIMARY KEY, translation TEXT);
+                 INSERT INTO units VALUES ('unit-1', NULL);
+                 BEGIN IMMEDIATE;",
+            )
+            .expect("应建立测试事务");
+        connection
+            .authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+                if matches!(context.action, rusqlite::hooks::AuthAction::Update { .. }) {
+                    cancel_from_authorizer.cancel();
+                }
+                rusqlite::hooks::Authorization::Allow
+            }))
+            .expect("应安装取消测试 authorizer");
+        let connection = Rc::new(RefCell::new(connection));
+        let metrics = Arc::new(BindingMetrics::default());
+        let database = build_database_table(
+            &lua,
+            Rc::clone(&connection),
+            Arc::clone(&metrics),
+            Rc::new(BindingTransactionGuard::default()),
+            cancellation,
+        )
+        .expect("应建立数据库 Host table");
+
+        let execute: Function = database.get("execute").expect("应取得 execute Host");
+        execute
+            .call::<Value>((
+                "UPDATE units SET translation = 'changed' WHERE id = 'unit-1'",
+                Value::Nil,
+            ))
+            .expect_err("SQLite 已返回 changed rows 后的取消必须终止脚本");
+        assert_eq!(metrics.database_calls(), 1);
+        assert_eq!(metrics.changed_rows(), 1);
+        let translation: String = connection
+            .borrow()
+            .query_row(
+                "SELECT translation FROM units WHERE id = 'unit-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("事务内应能看到已经发生的更新");
+        assert_eq!(translation, "changed");
+    }
 
     fn deeply_nested_lua_array(lua: &Lua) -> Value {
         let mut value = Value::Integer(7);

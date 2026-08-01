@@ -296,7 +296,6 @@ impl ProjectLuaEngineAdapter for RpgMakerProjectLuaAdapter {
                 "RPG Maker locator 没有命中唯一 Unit",
             ));
         }
-        cancellation.ensure_running()?;
         Ok(u64::try_from(changed).expect("受支持平台的 usize 必须能表示为 u64"))
     }
 
@@ -329,7 +328,6 @@ impl ProjectLuaEngineAdapter for RpgMakerProjectLuaAdapter {
                 "RPG Maker locator 没有命中唯一 Unit",
             ));
         }
-        cancellation.ensure_running()?;
         Ok(u64::try_from(changed).expect("受支持平台的 usize 必须能表示为 u64"))
     }
 
@@ -406,6 +404,7 @@ struct RpgMakerCurrentBaseline {
     group_kind: String,
     source_content_json: String,
     source_context_json: String,
+    translation_content_json: String,
     translation_state: Sha256Fingerprint,
     placeholders: PlaceholderMultiset,
     origin: RpgMakerTranslationOrigin,
@@ -945,6 +944,40 @@ fn validate_translation_placeholders(
     Ok(())
 }
 
+fn validate_unchanged_current_placeholders(
+    service: &Pcre2PlaceholderService,
+    builtin_only_rules: &CompiledPlaceholderRules,
+    engine: RpgMakerEngine,
+    kind: TextGroupKind,
+    source_placeholders: &[AppliedPlaceholder],
+    translation: &TextUnitContent,
+    cancellation: RpgMakerLuaCancellation<'_>,
+) -> Result<(), ProjectLuaCallError> {
+    cancellation.ensure_running()?;
+    // Translate 恢复 token 后不会重新扫描 Custom 原字节，因为相同字节也可能来自
+    // NaturalText。原始 Current 没有保存这项来源信息，因此这里只能重新识别始终具有
+    // 控制语义的 Builtin；正文和语义事实均未改变时，Custom 沿用 Translate 已建立的
+    // 验收结果。
+    let translation_placeholders = protect_content(
+        service,
+        engine,
+        kind,
+        translation,
+        builtin_only_rules,
+        cancellation,
+    )?;
+    let source_multiset = placeholder_multiset(source_placeholders, cancellation)?;
+    let translation_multiset = placeholder_multiset(&translation_placeholders, cancellation)?;
+    if !source_multiset.builtin_eq_with_cancellation(&translation_multiset, cancellation)? {
+        return Err(ProjectLuaCallError::new(
+            "placeholder_mismatch",
+            "已有 Current 没有完整保留原文要求的 Builtin 控制符",
+        ));
+    }
+    cancellation.ensure_running()?;
+    Ok(())
+}
+
 fn compile_placeholder_rules(
     service: &Pcre2PlaceholderService,
     canonical_json: &str,
@@ -1191,6 +1224,72 @@ impl PlaceholderMultiset {
         cancellation.ensure_running()?;
         Ok(true)
     }
+
+    /// Builtin 原字节始终具有控制语义，未改 Current 中的数量必须与原文完全一致。
+    /// Custom 原字节也可能来自 NaturalText，脱离 Translate 的 token 来源信息后不能反扫。
+    fn builtin_eq_with_cancellation(
+        &self,
+        translation: &Self,
+        cancellation: RpgMakerLuaCancellation<'_>,
+    ) -> Result<bool, ProjectLuaCallError> {
+        cancellation.ensure_running()?;
+        for (fingerprint, source_bucket) in &self.buckets {
+            cancellation.ensure_running()?;
+            let translation_bucket = translation.buckets.get(fingerprint);
+            for source in source_bucket {
+                cancellation.ensure_running()?;
+                if source.fact.origin != PlaceholderRuleOrigin::BuiltIn {
+                    continue;
+                }
+                let mut translation_count = None;
+                if let Some(translation_bucket) = translation_bucket {
+                    for candidate in translation_bucket {
+                        cancellation.ensure_running()?;
+                        if placeholder_fact_eq_with_cancellation(
+                            &source.fact,
+                            &candidate.fact,
+                            cancellation,
+                        )? {
+                            translation_count = Some(candidate.count);
+                            break;
+                        }
+                    }
+                }
+                if translation_count != Some(source.count) {
+                    return Ok(false);
+                }
+            }
+        }
+        for (fingerprint, translation_bucket) in &translation.buckets {
+            cancellation.ensure_running()?;
+            let source_bucket = self.buckets.get(fingerprint);
+            for candidate in translation_bucket {
+                cancellation.ensure_running()?;
+                if candidate.fact.origin != PlaceholderRuleOrigin::BuiltIn {
+                    continue;
+                }
+                let mut source_count = None;
+                if let Some(source_bucket) = source_bucket {
+                    for source in source_bucket {
+                        cancellation.ensure_running()?;
+                        if placeholder_fact_eq_with_cancellation(
+                            &source.fact,
+                            &candidate.fact,
+                            cancellation,
+                        )? {
+                            source_count = Some(source.count);
+                            break;
+                        }
+                    }
+                }
+                if source_count != Some(candidate.count) {
+                    return Ok(false);
+                }
+            }
+        }
+        cancellation.ensure_running()?;
+        Ok(true)
+    }
 }
 
 fn placeholder_fact(
@@ -1339,6 +1438,21 @@ fn manual_state_error(source: ManualTranslationStateError) -> ProjectLuaCallErro
 
 fn invalid_database(message: impl Into<String>) -> ProjectLuaCallError {
     ProjectLuaCallError::new("rpg_maker_project", message)
+}
+
+fn with_unit_locator(
+    source: ProjectLuaCallError,
+    owner: &str,
+    group_location: &str,
+    unit_role: &str,
+) -> ProjectLuaCallError {
+    ProjectLuaCallError::new(
+        source.kind(),
+        format!(
+            "Unit locator owner={owner}, group_location={group_location}, unit_role={unit_role}：{}",
+            source.message()
+        ),
+    )
 }
 
 fn rpg_maker_lua_cancelled() -> ProjectLuaCallError {
@@ -2045,17 +2159,11 @@ fn capture_rpg_maker_translation_baseline(
         cancellation.ensure_running()?;
         let source: TextUnitContent =
             parse_json_with_cancellation(&source_content_json, "脚本前 Unit 原文", cancellation)?;
-        let translation: TextUnitContent = parse_json_with_cancellation(
-            &translation_content_json,
-            "脚本前 Unit 译文",
-            cancellation,
-        )?;
         let context: serde_json::Value =
             parse_json_with_cancellation(&source_context_json, "脚本前 Unit 上下文", cancellation)?;
         if !context.is_object() {
             return Err(invalid_database("脚本前 Unit 上下文必须是 JSON object"));
         }
-        validate_translation_structure(kind, &role, &source, &translation, cancellation)?;
         let resource_facts = prepare_current_resource_facts(
             engine,
             kind,
@@ -2063,15 +2171,6 @@ fn capture_rpg_maker_translation_baseline(
             terminology.as_ref(),
             &placeholder_service,
             &placeholder_rules,
-            cancellation,
-        )?;
-        validate_translation_placeholders(
-            &placeholder_service,
-            &placeholder_rules,
-            engine,
-            kind,
-            resource_facts.placeholders(),
-            &translation,
             cancellation,
         )?;
         let identity = TranslationUnitIdentity::new(
@@ -2102,6 +2201,7 @@ fn capture_rpg_maker_translation_baseline(
             group_kind,
             source_content_json,
             source_context_json,
+            translation_content_json,
             translation_state,
             placeholders: placeholder_multiset(resource_facts.placeholders(), cancellation)?,
             origin,
@@ -2414,6 +2514,11 @@ fn validate_assets(
     cancellation: RpgMakerLuaCancellation<'_>,
 ) -> Result<(), ProjectLuaCallError> {
     cancellation.ensure_running()?;
+    let builtin_only_rules = resources
+        .placeholder_service
+        .compile_custom_with_cancellation(Vec::new(), || cancellation.ensure_running())?
+        .map_err(placeholder_compilation_error)?;
+    cancellation.ensure_running()?;
     let mut owner_statement = connection
         .prepare(
             "SELECT owner, source_snapshot_fingerprint, asset_snapshot_fingerprint
@@ -2616,35 +2721,55 @@ fn validate_assets(
         let role = RpgMakerProjectionCodec::decode_role(&role_raw)
             .map_err(|source| invalid_database(format!("Unit role 无效：{source}")))?;
         let source: TextUnitContent =
-            parse_json_with_cancellation(&source_json, "Unit 原文", cancellation)?;
+            parse_json_with_cancellation(&source_json, "Unit 原文", cancellation).map_err(
+                |source| with_unit_locator(source, &owner_raw, &location_raw, &role_raw),
+            )?;
         let translation: Option<TextUnitContent> = match translation_json.as_deref() {
-            Some(json) => Some(parse_json_with_cancellation(
-                json,
-                "Unit 译文",
-                cancellation,
-            )?),
+            Some(json) => Some(
+                parse_json_with_cancellation(json, "Unit 译文", cancellation).map_err(
+                    |source| with_unit_locator(source, &owner_raw, &location_raw, &role_raw),
+                )?,
+            ),
             None => None,
         };
         let translation_state = match translation_state {
             Some(state) => Some(
                 Sha256Fingerprint::from_slice(&state)
-                    .map_err(|source| invalid_database(format!("Unit 译文状态无效：{source}")))?,
+                    .map_err(|source| invalid_database(format!("Unit 译文状态无效：{source}")))
+                    .map_err(|source| {
+                        with_unit_locator(source, &owner_raw, &location_raw, &role_raw)
+                    })?,
             ),
             None => None,
         };
         match (translation.as_ref(), translation_state.as_ref()) {
             (None, None) => {}
             (Some(_), Some(_)) => {}
-            _ => return Err(invalid_database("Unit 译文与状态必须同时存在或同时为空")),
+            _ => {
+                return Err(with_unit_locator(
+                    invalid_database("Unit 译文与状态必须同时存在或同时为空"),
+                    &owner_raw,
+                    &location_raw,
+                    &role_raw,
+                ));
+            }
         }
         let context: serde_json::Value =
-            parse_json_with_cancellation(&context_json, "Unit 上下文", cancellation)?;
+            parse_json_with_cancellation(&context_json, "Unit 上下文", cancellation).map_err(
+                |source| with_unit_locator(source, &owner_raw, &location_raw, &role_raw),
+            )?;
         if !context.is_object() {
-            return Err(invalid_database("Unit 上下文必须是 JSON object"));
+            return Err(with_unit_locator(
+                invalid_database("Unit 上下文必须是 JSON object"),
+                &owner_raw,
+                &location_raw,
+                &role_raw,
+            ));
         }
         if let (Some(translation), Some(state)) = (translation.as_ref(), translation_state.as_ref())
         {
-            validate_translation_structure(group.kind, &role, &source, translation, cancellation)?;
+            validate_translation_structure(group.kind, &role, &source, translation, cancellation)
+                .map_err(|source| with_unit_locator(source, &owner_raw, &location_raw, &role_raw))?;
             let resource_facts = prepare_current_resource_facts(
                 engine,
                 group.kind,
@@ -2654,22 +2779,19 @@ fn validate_assets(
                 &resources.placeholder_rules,
                 cancellation,
             )?;
-            validate_translation_placeholders(
-                &resources.placeholder_service,
-                &resources.placeholder_rules,
-                engine,
-                group.kind,
-                resource_facts.placeholders(),
-                translation,
-                cancellation,
-            )?;
             let placeholder_facts =
                 placeholder_multiset(resource_facts.placeholders(), cancellation)?;
-            let unchanged_current = translation_baseline
-                .currents
-                .get(&owner_raw, &location_raw, &role_raw, cancellation)?
-                .filter(|baseline| baseline.translation_state == *state);
-            if let Some(baseline) = unchanged_current {
+            let translation_json = translation_json
+                .as_deref()
+                .expect("已解析的译文必须保留原始 JSON");
+            let baseline = translation_baseline.currents.get(
+                &owner_raw,
+                &location_raw,
+                &role_raw,
+                cancellation,
+            )?;
+            let existing_current = baseline.filter(|baseline| baseline.translation_state == *state);
+            if let Some(baseline) = existing_current {
                 let unchanged_semantics = baseline.group_kind == group.kind_raw
                     && text_eq_with_cancellation(
                         &baseline.source_content_json,
@@ -2689,9 +2811,46 @@ fn validate_assets(
                         .placeholders
                         .eq_with_cancellation(&placeholder_facts, cancellation)?;
                 if !unchanged_semantics {
-                    return Err(invalid_database(
-                        "已有 Current 只允许在语义事实不变时保留原 translation_state",
+                    return Err(with_unit_locator(
+                        invalid_database(
+                            "已有 Current 只允许在语义事实不变时保留原 translation_state",
+                        ),
+                        &owner_raw,
+                        &location_raw,
+                        &role_raw,
                     ));
+                }
+                let translation_unchanged = text_eq_with_cancellation(
+                    &baseline.translation_content_json,
+                    translation_json,
+                    cancellation,
+                )?;
+                if translation_unchanged {
+                    validate_unchanged_current_placeholders(
+                        &resources.placeholder_service,
+                        &builtin_only_rules,
+                        engine,
+                        group.kind,
+                        resource_facts.placeholders(),
+                        translation,
+                        cancellation,
+                    )
+                    .map_err(|source| {
+                        with_unit_locator(source, &owner_raw, &location_raw, &role_raw)
+                    })?;
+                } else {
+                    validate_translation_placeholders(
+                        &resources.placeholder_service,
+                        &resources.placeholder_rules,
+                        engine,
+                        group.kind,
+                        resource_facts.placeholders(),
+                        translation,
+                        cancellation,
+                    )
+                    .map_err(|source| {
+                        with_unit_locator(source, &owner_raw, &location_raw, &role_raw)
+                    })?;
                 }
                 if let RpgMakerTranslationOrigin::Automatic(baseline_dependencies) =
                     &baseline.origin
@@ -2703,13 +2862,30 @@ fn validate_assets(
                     if !baseline_dependencies
                         .eq_with_cancellation(&current_dependencies, cancellation)?
                     {
-                        return Err(invalid_database(
-                            "已有自动译文只允许在实际命中的 Terminology 不变时保留原 translation_state",
+                        return Err(with_unit_locator(
+                            invalid_database(
+                                "已有自动译文只允许在实际命中的 Terminology 不变时保留原 translation_state",
+                            ),
+                            &owner_raw,
+                            &location_raw,
+                            &role_raw,
                         ));
                     }
                 }
             } else {
                 cancellation.ensure_running()?;
+                validate_translation_placeholders(
+                    &resources.placeholder_service,
+                    &resources.placeholder_rules,
+                    engine,
+                    group.kind,
+                    resource_facts.placeholders(),
+                    translation,
+                    cancellation,
+                )
+                .map_err(|source| {
+                    with_unit_locator(source, &owner_raw, &location_raw, &role_raw)
+                })?;
                 let identity = TranslationUnitIdentity::new(
                     owner,
                     group.kind,
@@ -2728,8 +2904,13 @@ fn validate_assets(
                 .map_err(manual_state_error)?;
                 cancellation.ensure_running()?;
                 if manual_state != *state {
-                    return Err(invalid_database(
-                        "新增或改写的 translation_state 必须等于当前 Unit 的人工译文状态",
+                    return Err(with_unit_locator(
+                        invalid_database(
+                            "新增或改写的 translation_state 必须等于当前 Unit 的人工译文状态",
+                        ),
+                        &owner_raw,
+                        &location_raw,
+                        &role_raw,
                     ));
                 }
             }
@@ -3447,13 +3628,17 @@ mod tests {
             ),
         )
         .expect_err("直接 SQL 不能伪造新的 Current 状态");
-        assert!(matches!(
-            state_error,
-            ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
-                operation: "translation.validate",
-                ..
-            })
-        ));
+        let ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
+            operation: "translation.validate",
+            message,
+            ..
+        }) = state_error
+        else {
+            panic!("伪造 Current 状态必须返回带 locator 的最终校验错误");
+        };
+        assert!(message.contains("owner=builtin"));
+        assert!(message.contains(&project.group_location));
+        assert!(message.contains(&project.unit_role));
 
         run(
             &project,
@@ -3470,6 +3655,162 @@ mod tests {
             )
             .expect("应读取清理结果");
         assert_eq!(cleared, None);
+    }
+
+    #[test]
+    fn typed_clear_accepts_preexisting_current_with_extra_custom_literal() {
+        let project = create_project();
+        run(
+            &project,
+            &format!(
+                "ctx.translation.set({}, [=[你好 \\V[1] {{hero}}]=])",
+                locator(&project)
+            ),
+        )
+        .expect("测试前应建立合法人工译文");
+
+        // Translate 已验收的 Current 可能在保留 Custom Placeholder 的同时，
+        // 把相同字节作为 NaturalText 再写一次；Lua 不得反向扫描并阻止 clear。
+        let accepted_translation = serde_json::to_string(&TextUnitContent::Value(
+            r"你好 \V[1] {hero}，正文再次提到 {hero}".to_owned(),
+        ))
+        .expect("应编码包含额外 Custom 原片段的译文");
+        Connection::open(&project.database_path)
+            .expect("应重开数据库")
+            .execute(
+                "UPDATE rpg_maker_text_unit
+                 SET translation_content_json = ?1
+                 WHERE owner = 'builtin' AND group_location = ?2 AND unit_role = ?3",
+                params![
+                    accepted_translation,
+                    project.group_location,
+                    project.unit_role
+                ],
+            )
+            .expect("应建立 Translate 可以接受的现有 Current");
+
+        run(&project, "return").expect("未改 Current 的额外 Custom 原片段必须保持合法");
+
+        run(
+            &project,
+            &format!("ctx.translation.clear({})", locator(&project)),
+        )
+        .expect("typed clear 应能清除含额外 Custom 原片段的现有译文");
+        let cleared: (Option<String>, Option<Vec<u8>>) = Connection::open(&project.database_path)
+            .expect("应重开数据库")
+            .query_row(
+                "SELECT translation_content_json, translation_state
+                     FROM rpg_maker_text_unit
+                     WHERE owner = 'builtin' AND group_location = ?1 AND unit_role = ?2",
+                params![project.group_location, project.unit_role],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("应读取清除后的译文状态");
+        assert_eq!(cleared, (None, None));
+    }
+
+    #[test]
+    fn typed_clear_accepts_preexisting_current_with_overlapping_custom_natural_text() {
+        let project = create_project();
+        let overlapping_rules = serde_json::to_string(&vec![
+            PlaceholderRuleDefinition::new(None, r"\{hero\}"),
+            PlaceholderRuleDefinition::new(None, r"\{hero\}Z"),
+        ])
+        .expect("应编码会在恢复后字节上重叠的 Custom Placeholder");
+        Connection::open(&project.database_path)
+            .expect("应重开数据库")
+            .execute(
+                "UPDATE rpg_maker_translation_resource
+                 SET canonical_json = ?1
+                 WHERE resource_kind = 'placeholder_rules'",
+                [&overlapping_rules],
+            )
+            .expect("应安装重叠测试规则");
+        run(
+            &project,
+            &format!(
+                "ctx.translation.set({}, [=[你好 \\V[1] {{hero}}]=])",
+                locator(&project)
+            ),
+        )
+        .expect("测试前应建立合法人工译文");
+
+        // 源文本只命中 {hero}；Translate 可以在该 token 后生成 NaturalText `Z`。
+        // 恢复后的 `{hero}Z` 会同时命中两条 Custom 规则，不能据此否定旧 Current。
+        let accepted_translation =
+            serde_json::to_string(&TextUnitContent::Value(r"你好 \V[1] {hero}Z".to_owned()))
+                .expect("应编码恢复后会产生 Custom 重叠的译文");
+        Connection::open(&project.database_path)
+            .expect("应重开数据库")
+            .execute(
+                "UPDATE rpg_maker_text_unit
+                 SET translation_content_json = ?1
+                 WHERE owner = 'builtin' AND group_location = ?2 AND unit_role = ?3",
+                params![
+                    accepted_translation,
+                    project.group_location,
+                    project.unit_role
+                ],
+            )
+            .expect("应建立 Translate 可以接受的现有 Current");
+
+        run(&project, "return").expect("未改 Current 不得反扫 Custom 并误报重叠");
+        run(
+            &project,
+            &format!("ctx.translation.clear({})", locator(&project)),
+        )
+        .expect("typed clear 应能清除恢复后 Custom 匹配重叠的现有译文");
+    }
+
+    #[test]
+    fn unchanged_current_rejects_missing_or_extra_builtin_placeholders_but_clear_repairs_it() {
+        for invalid_translation in [r"你好 {hero}", r"你好 \V[1] \V[1] {hero}"] {
+            let project = create_project();
+            run(
+                &project,
+                &format!(
+                    "ctx.translation.set({}, [=[你好 \\V[1] {{hero}}]=])",
+                    locator(&project)
+                ),
+            )
+            .expect("测试前应建立合法人工译文");
+            let invalid_translation =
+                serde_json::to_string(&TextUnitContent::Value(invalid_translation.to_owned()))
+                    .expect("应编码缺失或额外 Builtin 的译文");
+            Connection::open(&project.database_path)
+                .expect("应重开数据库")
+                .execute(
+                    "UPDATE rpg_maker_text_unit
+                     SET translation_content_json = ?1
+                     WHERE owner = 'builtin' AND group_location = ?2 AND unit_role = ?3",
+                    params![
+                        invalid_translation,
+                        project.group_location,
+                        project.unit_role
+                    ],
+                )
+                .expect("应建立需要最终校验拒绝的 Current");
+
+            let error = run(&project, "return")
+                .expect_err("未改 Current 仍必须保留所需 Placeholder 并拒绝额外 Builtin");
+            let ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
+                kind: "placeholder_mismatch",
+                operation: "translation.validate",
+                message,
+                ..
+            }) = error
+            else {
+                panic!("非法未改 Current 必须返回带 locator 的 Placeholder 错误");
+            };
+            assert!(message.contains(&project.group_location));
+            assert!(message.contains(&project.unit_role));
+
+            run(
+                &project,
+                &format!("ctx.translation.clear({})", locator(&project)),
+            )
+            .expect("clear 必须能够修复最终校验会拒绝的 Current");
+        }
     }
 
     #[test]
