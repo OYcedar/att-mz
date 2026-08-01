@@ -61,3 +61,20 @@ MV/MZ 候选完成 recipe 修改后执行 RPG Maker 全量验证。Generic 候�
 恢复只处理当前目标命名空间的 candidate、stage、backup 和 journal，无关文件不
 扫描也不删除。恢复依据来自 journal 而非项目日志；主失败和候选清理失败都会
 保留。
+
+## 5. Init 发布阶段的 OS 5
+
+只在 Init 诊断同时包含以下事实时，把这次失败当作一次可重试的目录发布失败：
+
+- code 为 `filesystem.operation`，阶段为“发布”；
+- 原因为“无覆盖重命名：权限不足（OS 5）”或同一系统错误的本地化文本；
+- 影响为“状态未改变”；
+- `<att-dir>/projects/<engine>/<name>` 不存在，且诊断没有 `recovery_required` 或
+  `outcome_unknown`。
+
+满足全部条件后，不修改 `projects/` 中的任何文件或目录，直接用原来的 `att.exe`、
+`--name`、`--path`、语言和三个宽度参数重跑一次 Init。不要借此更换配置、游戏路径或
+项目名。
+
+第二次成功时，以新项目的 `project.db` 和发布终态为准；第二次仍报错、目标已存在，或出现
+恢复终态时，停止 Init，不手工删除、移动或编辑项目目录，保留现场并报告完整诊断。
