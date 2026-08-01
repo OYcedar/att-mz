@@ -15,14 +15,13 @@ use crate::diagnostic::{
     DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
     DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
 };
-use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::execution::llm_request::{
     LlmRequestAttemptOutcome, LlmRequestAttemptRecord, LlmRequestRetryWaitRecord,
 };
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
 use crate::json_diagnostic::JsonErrorCategory;
 use crate::llm::{ApiKeyRedactor, LlmClientRecordMetadata};
-use crate::runtime::cpu::{CpuExecutorUnavailable, RayonCpuExecutor};
+use crate::runtime::cpu::RayonCpuExecutor;
 use crate::runtime::filesystem::SystemFileSystem;
 use crate::runtime::project_log::ProjectLogger;
 
@@ -88,7 +87,7 @@ pub(crate) struct MarkdownTranslationTaskRecordSink {
     run_id: String,
     client: LlmClientRecordMetadata,
     locale: UiLocale,
-    cpu: RayonCpuExecutor,
+    render_parallelism: usize,
     file_system: SystemFileSystem,
     warnings: ProjectLogger,
     pending: Arc<Mutex<PendingTranslationTaskRecords>>,
@@ -109,7 +108,9 @@ impl MarkdownTranslationTaskRecordSink {
             run_id,
             client,
             locale,
-            cpu,
+            // 任务记录在业务终态固定后才渲染。这里只继承已经选定的并行度，不能
+            // 继续复用会被 Ctrl-C 取消或随业务根关闭的 CPU 执行器。
+            render_parallelism: cpu.parallelism().get(),
             file_system,
             warnings,
             pending: Arc::new(Mutex::new(PendingTranslationTaskRecords::default())),
@@ -140,7 +141,7 @@ impl MarkdownTranslationTaskRecordSink {
         let mut writes = FuturesUnordered::new();
         let mut documents = pending.documents.into_iter();
         // 窗口限制的是同时存在的 render+write Future，不限制本轮文档总量。
-        for document in documents.by_ref().take(self.cpu.parallelism().get()) {
+        for document in documents.by_ref().take(self.render_parallelism) {
             writes.push(self.write(document, total_tasks));
         }
         while writes.next().await.is_some() {
@@ -172,10 +173,10 @@ impl MarkdownTranslationTaskRecordSink {
         let run_id = self.run_id.clone();
         let client = self.client.clone();
         let locale = self.locale;
-        let markdown = self
-            .cpu
-            .execute(move || document.render(&run_id, &client, locale, total_tasks))
-            .await;
+        let markdown = tokio::task::spawn_blocking(move || {
+            document.render(&run_id, &client, locale, total_tasks)
+        })
+        .await;
         let markdown = match markdown {
             Ok(Ok(markdown)) => markdown,
             Ok(Err(error)) => {
@@ -206,7 +207,7 @@ impl MarkdownTranslationTaskRecordSink {
             }
             Err(error) => {
                 self.warnings
-                    .record_task_record_failure(task_record_render_cpu_failure(
+                    .record_task_record_failure(task_record_render_join_failure(
                         &error,
                         &path,
                         &self.client,
@@ -240,21 +241,33 @@ impl MarkdownTranslationTaskRecordSink {
     }
 }
 
-fn task_record_render_cpu_failure(
-    source: &CpuTaskExecutionError<CpuExecutorUnavailable>,
+fn task_record_render_join_failure(
+    source: &tokio::task::JoinError,
     path: &Path,
     client: &LlmClientRecordMetadata,
 ) -> SafeDiagnostic {
     let redactor = client.api_key_redactor();
     let path = redactor.redact(&path.to_string_lossy());
-    source
-        .safe_diagnostic_source(
-            DiagnosticStage::Logging,
-            DiagnosticImpact::Unchanged,
+    let (failure, action) = if source.is_panic() {
+        (
+            DiagnosticFailureKind::WorkerPanicked,
+            DiagnosticAction::ReportBug,
+        )
+    } else {
+        (
+            DiagnosticFailureKind::ExecutorClosed,
             DiagnosticAction::Retry,
         )
-        .map_dynamic_text(|value| redactor.redact(value))
-        .with_recovery(RecoveryFact::path(path))
+    };
+    SafeDiagnostic::new(
+        DiagnosticCode::InternalOperation,
+        DiagnosticStage::Logging,
+        DiagnosticSubject::path(&path),
+        DiagnosticReason::failure(failure),
+        DiagnosticImpact::Unchanged,
+        action,
+    )
+    .with_recovery(RecoveryFact::path(path))
 }
 
 /// 按任务记录本地化规则渲染一次共享 LLM attempt。
@@ -711,7 +724,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn render_runs_on_the_cpu_pool_instead_of_the_async_calling_thread() {
+    async fn render_runs_on_a_blocking_worker_instead_of_the_async_calling_thread() {
         let temporary = tempdir().expect("应建立临时目录");
         let record_directory = temporary.path().join("task-records");
         std::fs::create_dir_all(&record_directory).expect("应建立任务记录目录");
@@ -757,7 +770,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn cpu_render_failure_is_logged_without_creating_a_record_file() {
+    async fn blocking_render_failure_is_logged_without_creating_a_record_file() {
         let temporary = tempdir().expect("应建立临时目录");
         let record_directory = temporary.path().join("task-records");
         std::fs::create_dir_all(&record_directory).expect("应建立任务记录目录");
@@ -786,7 +799,7 @@ mod tests {
             .take_warning()
             .and_then(|warning| warning.task_records)
             .and_then(|warning| warning.diagnostic)
-            .expect("CPU render 失败应留下任务记录诊断");
+            .expect("阻塞渲染失败应留下任务记录诊断");
         assert_eq!(diagnostic.code, DiagnosticCode::InternalOperation);
         assert_eq!(diagnostic.stage, DiagnosticStage::Logging);
         assert_eq!(
@@ -799,35 +812,42 @@ mod tests {
         drop(log_runtime);
     }
 
-    #[test]
-    fn cpu_render_failures_keep_their_specific_logging_diagnostics() {
-        let path = PathBuf::from("task-000001.md");
-        let client = client();
-        let cases = [
-            (
-                CpuTaskExecutionError::Cancelled,
-                DiagnosticFailureKind::LockCancelled,
-                DiagnosticAction::Retry,
-            ),
-            (
-                CpuTaskExecutionError::Unavailable(CpuExecutorUnavailable::ShuttingDown),
-                DiagnosticFailureKind::ExecutorClosed,
-                DiagnosticAction::Retry,
-            ),
-            (
-                CpuTaskExecutionError::TaskPanicked,
-                DiagnosticFailureKind::WorkerPanicked,
-                DiagnosticAction::ReportBug,
-            ),
-        ];
-        for (source, failure, action) in cases {
-            let diagnostic = task_record_render_cpu_failure(&source, &path, &client);
-            assert_eq!(diagnostic.code, DiagnosticCode::InternalOperation);
-            assert_eq!(diagnostic.stage, DiagnosticStage::Logging);
-            assert_eq!(diagnostic.reason, DiagnosticReason::failure(failure));
-            assert_eq!(diagnostic.impact, DiagnosticImpact::Unchanged);
-            assert_eq!(diagnostic.action, action);
-        }
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_business_cpu_does_not_cancel_terminal_task_record_rendering() {
+        let temporary = tempdir().expect("应建立临时目录");
+        let record_directory = temporary.path().join("task-records");
+        std::fs::create_dir_all(&record_directory).expect("应建立任务记录目录");
+        let file_system = SystemFileSystem::new(SystemFileSystemConfig::production())
+            .expect("文件系统执行根应可建立");
+        let cpu = cpu(1);
+        let log_runtime =
+            start_project_log(temporary.path().join("logs"), "cancelled-cpu".to_owned());
+        let logger = log_runtime.logger();
+        let rendered_on = Arc::new(Mutex::new(None));
+        let sink = MarkdownTranslationTaskRecordSink::new(
+            record_directory.clone(),
+            "cancelled-cpu".to_owned(),
+            client(),
+            UiLocale::SimplifiedChinese,
+            cpu.clone(),
+            file_system,
+            logger.clone(),
+        );
+        sink.submit(ThreadRecordingArtifact {
+            rendered_on: Arc::clone(&rendered_on),
+        });
+        cpu.cancel_waits();
+
+        sink.finish().await;
+
+        assert_eq!(logger.health().task_record_failures, 0);
+        assert_eq!(
+            std::fs::read_to_string(record_directory.join("task-000001.md"))
+                .expect("业务 CPU 取消后仍应写入终态任务记录"),
+            "# rendered\n"
+        );
+        cpu.shutdown().expect("测试 CPU 根应可关闭");
+        drop(log_runtime);
     }
 
     #[tokio::test(flavor = "current_thread")]

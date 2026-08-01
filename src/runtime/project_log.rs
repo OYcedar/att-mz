@@ -11,7 +11,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -55,6 +55,8 @@ pub(crate) enum ProjectLogCode {
     PerformanceCounters,
     #[serde(rename = "failure.reported")]
     FailureReported,
+    #[serde(rename = "observability.task_record_failed")]
+    TaskRecordFailed,
     #[serde(rename = "run.cancel_requested")]
     CancellationRequested,
     #[serde(rename = "run.safe_stop_finished")]
@@ -91,6 +93,8 @@ pub(crate) enum ProjectLogCode {
     TaskDiagnostic,
     #[serde(rename = "extract.rules.command_non_string_skipped")]
     ExtractRulesCommandNonStringSkipped,
+    #[serde(rename = "write_back.manual_layout_required")]
+    WriteBackManualLayoutRequired,
     #[serde(rename = "lua.script")]
     LuaScript,
     #[serde(rename = "lua.print")]
@@ -106,6 +110,7 @@ impl ProjectLogCode {
             Self::RunFinished => "run.finished",
             Self::PerformanceCounters => "performance.counters",
             Self::FailureReported => "failure.reported",
+            Self::TaskRecordFailed => "observability.task_record_failed",
             Self::CancellationRequested => "run.cancel_requested",
             Self::SafeStopFinished => "run.safe_stop_finished",
             Self::RunPlanResolved => "run_plan.resolved",
@@ -124,6 +129,7 @@ impl ProjectLogCode {
             Self::TaskFinished => "task.finished",
             Self::TaskDiagnostic => "task.diagnostic",
             Self::ExtractRulesCommandNonStringSkipped => "extract.rules.command_non_string_skipped",
+            Self::WriteBackManualLayoutRequired => "write_back.manual_layout_required",
             Self::LuaScript => "lua.script",
             Self::LuaPrint => "lua.print",
             Self::LuaSummary => "lua.summary",
@@ -152,6 +158,7 @@ pub(crate) enum ProjectLogRunOutcome {
     Succeeded,
     Failed,
     Cancelled,
+    RecoveryRequired,
     OutcomeUnknown,
 }
 
@@ -246,6 +253,13 @@ pub(crate) enum FailureRelation {
     Related,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProjectLogManualLayoutLocation {
+    pub(crate) group_location: String,
+    pub(crate) role: String,
+}
+
 /// 项目日志允许持久化的结构化业务事实。
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
@@ -307,6 +321,11 @@ pub(crate) enum ProjectLogPayload {
         actual_type: String,
         skipped_count: u64,
     },
+    ManualLayoutRequired {
+        locations: Vec<ProjectLogManualLayoutLocation>,
+        region: String,
+        max_fullwidth_chars: u64,
+    },
     Cancellation {
         confirmed: u64,
         total: Option<u64>,
@@ -342,6 +361,7 @@ impl ProjectLogPayload {
             Self::Task { .. } => "task",
             Self::TaskDiagnostic { .. } => "task_diagnostic",
             Self::RulesCommandNonStringSkipped { .. } => "rules_command_non_string_skipped",
+            Self::ManualLayoutRequired { .. } => "manual_layout_required",
             Self::Cancellation { .. } => "cancellation",
             Self::LuaScript { .. } => "lua_script",
             Self::LuaPrint { .. } => "lua_print",
@@ -448,6 +468,8 @@ pub(crate) struct ProjectLogger {
 struct LoggerInner {
     sender: Option<Sender<QueuedProjectLogEvent>>,
     health: Arc<ProjectLogHealth>,
+    context: Mutex<Option<ProjectLogContext>>,
+    reliable_events: Option<Arc<Mutex<Vec<QueuedProjectLogEvent>>>>,
 }
 
 impl ProjectLogger {
@@ -456,8 +478,36 @@ impl ProjectLogger {
             inner: Arc::new(LoggerInner {
                 sender: None,
                 health,
+                context: Mutex::new(None),
+                reliable_events: None,
             }),
         }
+    }
+
+    /// 安装当前命令的稳定日志上下文，供旁路记录故障形成普通 JSONL 事件。
+    pub(crate) fn set_context(&self, context: ProjectLogContext) {
+        *self
+            .inner
+            .context
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(context);
+    }
+
+    /// 安装非致命可观测性故障的即时终端呈现器，并补呈安装前已经发生的启动故障。
+    pub(crate) fn install_warning_presenter(
+        &self,
+        presenter: impl Fn(&ProjectLogWarning) -> Result<(), Box<SafeDiagnostic>>
+        + Send
+        + Sync
+        + 'static,
+    ) {
+        *self
+            .inner
+            .health
+            .warning_presenter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(presenter));
+        self.inner.health.present_pending_warning();
     }
 
     pub(crate) fn health(&self) -> ProjectLogHealthSnapshot {
@@ -478,7 +528,48 @@ impl ProjectLogger {
         &self,
         diagnostics: impl IntoIterator<Item = SafeDiagnostic>,
     ) {
-        self.inner.health.record_task_record_failures(diagnostics);
+        let diagnostics = diagnostics.into_iter().collect::<Vec<_>>();
+        self.inner
+            .health
+            .record_task_record_failures(diagnostics.iter().cloned());
+        let context = self
+            .inner
+            .context
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(context) = context else {
+            return;
+        };
+        for (index, diagnostic) in diagnostics.into_iter().enumerate() {
+            self.emit_reliable(ProjectLogEvent::new(
+                ProjectLogLevel::Warn,
+                ProjectLogCode::TaskRecordFailed,
+                context.clone(),
+                ProjectLogPayload::Failure {
+                    relation: if index == 0 {
+                        FailureRelation::Primary
+                    } else {
+                        FailureRelation::Related
+                    },
+                    diagnostic,
+                },
+            ));
+        }
+    }
+
+    pub(crate) fn emit_reliable(&self, event: ProjectLogEvent) {
+        let Some(events) = &self.inner.reliable_events else {
+            return;
+        };
+        events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(QueuedProjectLogEvent {
+                emitted_at: OffsetDateTime::now_utc(),
+                event,
+            });
+        self.inner.health.add_accepted(1);
     }
 }
 
@@ -536,6 +627,7 @@ impl ProjectLogHealthSnapshot {
         self.task_record_failures > 0
     }
 
+    #[cfg(test)]
     pub(crate) const fn is_degraded(self) -> bool {
         self.is_project_log_degraded() || self.is_task_record_degraded()
     }
@@ -551,7 +643,11 @@ pub(crate) struct ObservabilityWarning {
 pub(crate) struct ProjectLogWarning {
     pub(crate) project_log: Option<ObservabilityWarning>,
     pub(crate) task_records: Option<ObservabilityWarning>,
+    pub(crate) presentation_failures: Vec<SafeDiagnostic>,
 }
+
+type ProjectLogWarningPresenter =
+    dyn Fn(&ProjectLogWarning) -> Result<(), Box<SafeDiagnostic>> + Send + Sync + 'static;
 
 #[derive(Default)]
 struct ProjectLogHealth {
@@ -566,16 +662,26 @@ struct ProjectLogHealth {
     sync_failures: AtomicU64,
     worker_panics: AtomicU64,
     task_record_failures: AtomicU64,
-    warning_claimed: AtomicBool,
+    warning_revision: AtomicU64,
+    claimed_warning_revision: AtomicU64,
     first_failure: Mutex<Option<SafeDiagnostic>>,
     task_record_diagnostics: Mutex<Vec<SafeDiagnostic>>,
+    log_path: Mutex<Option<PathBuf>>,
+    warning_presenter: Mutex<Option<Arc<ProjectLogWarningPresenter>>>,
+    presentation_failures: Mutex<Vec<SafeDiagnostic>>,
 }
 
 impl ProjectLogHealth {
-    fn increment(counter: &AtomicU64, amount: u64) {
-        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            Some(current.saturating_add(amount))
-        });
+    fn increment(counter: &AtomicU64, amount: u64) -> u64 {
+        counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(amount))
+            })
+            .unwrap_or_else(|current| current)
+    }
+
+    fn mark_warning_changed(&self) {
+        Self::increment(&self.warning_revision, 1);
     }
 
     fn add_accepted(&self, amount: u64) {
@@ -587,22 +693,50 @@ impl ProjectLogHealth {
     }
 
     fn add_dropped(&self, amount: u64) {
-        Self::increment(&self.dropped_records, amount);
+        let previous = Self::increment(&self.dropped_records, amount);
+        self.mark_warning_changed();
+        if previous == 0 {
+            self.present_pending_warning();
+        }
+    }
+
+    fn set_log_path(&self, path: PathBuf) {
+        *self
+            .log_path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path);
     }
 
     fn record_queue_closed(&self) {
-        Self::increment(&self.queue_closed, 1);
+        let previous = Self::increment(&self.queue_closed, 1);
+        if previous == 0 {
+            let mut first = self
+                .first_failure
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if first.is_none() {
+                *first = Some(self.queue_closed_diagnostic());
+            }
+        }
+        self.mark_warning_changed();
+        if previous == 0 {
+            self.present_pending_warning();
+        }
     }
 
     fn record_failure(&self, counter: &AtomicU64, diagnostic: SafeDiagnostic) {
         Self::increment(counter, 1);
-        let mut first = self
-            .first_failure
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if first.is_none() {
-            *first = Some(diagnostic);
+        {
+            let mut first = self
+                .first_failure
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if first.is_none() {
+                *first = Some(diagnostic);
+            }
         }
+        self.mark_warning_changed();
+        self.present_pending_warning();
     }
 
     fn record_task_record_failures(&self, diagnostics: impl IntoIterator<Item = SafeDiagnostic>) {
@@ -615,6 +749,8 @@ impl ProjectLogHealth {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .extend(diagnostics);
+        self.mark_warning_changed();
+        self.present_pending_warning();
     }
 
     fn snapshot(&self) -> ProjectLogHealthSnapshot {
@@ -633,27 +769,72 @@ impl ProjectLogHealth {
         }
     }
 
+    fn claim_warning_revision(&self) -> bool {
+        loop {
+            let revision = self.warning_revision.load(Ordering::Acquire);
+            let claimed = self.claimed_warning_revision.load(Ordering::Acquire);
+            if revision == claimed {
+                return false;
+            }
+            if self
+                .claimed_warning_revision
+                .compare_exchange(claimed, revision, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
     fn take_warning(&self) -> Option<ProjectLogWarning> {
-        let health = self.snapshot();
-        if !health.is_degraded()
-            || self
-                .warning_claimed
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-        {
+        let warning_changed = self.claim_warning_revision();
+        let presentation_failures = std::mem::take(
+            &mut *self
+                .presentation_failures
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        if !warning_changed && presentation_failures.is_empty() {
             return None;
         }
-        let project_log = health
-            .is_project_log_degraded()
-            .then(|| ObservabilityWarning {
-                diagnostic: self
-                    .first_failure
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone(),
-                related_diagnostics: Vec::new(),
-            });
-        let task_records = health.is_task_record_degraded().then(|| {
+        Some(self.warning_snapshot(warning_changed, presentation_failures))
+    }
+
+    fn take_immediate_warning(&self) -> Option<ProjectLogWarning> {
+        self.claim_warning_revision()
+            .then(|| self.warning_snapshot(true, Vec::new()))
+    }
+
+    fn warning_snapshot(
+        &self,
+        include_health: bool,
+        presentation_failures: Vec<SafeDiagnostic>,
+    ) -> ProjectLogWarning {
+        let health = self.snapshot();
+        let project_log = (include_health && health.is_project_log_degraded()).then(|| {
+            let first_failure = self
+                .first_failure
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let dropped = (health.dropped_records > 0)
+                .then(|| self.dropped_records_diagnostic(health.dropped_records));
+            match (first_failure, dropped) {
+                (Some(diagnostic), Some(related)) => ObservabilityWarning {
+                    diagnostic: Some(diagnostic),
+                    related_diagnostics: vec![related],
+                },
+                (Some(diagnostic), None) | (None, Some(diagnostic)) => ObservabilityWarning {
+                    diagnostic: Some(diagnostic),
+                    related_diagnostics: Vec::new(),
+                },
+                (None, None) => ObservabilityWarning {
+                    diagnostic: None,
+                    related_diagnostics: Vec::new(),
+                },
+            }
+        });
+        let task_records = (include_health && health.is_task_record_degraded()).then(|| {
             let mut diagnostics = self
                 .task_record_diagnostics
                 .lock()
@@ -665,19 +846,93 @@ impl ProjectLogHealth {
                 related_diagnostics: diagnostics.collect(),
             }
         });
-        Some(ProjectLogWarning {
+        ProjectLogWarning {
             project_log,
             task_records,
-        })
+            presentation_failures,
+        }
+    }
+
+    fn present_pending_warning(&self) {
+        let presenter = self
+            .warning_presenter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(presenter) = presenter else {
+            return;
+        };
+        let Some(warning) = self.take_immediate_warning() else {
+            return;
+        };
+        if let Err(diagnostic) = presenter(&warning) {
+            self.presentation_failures
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(*diagnostic);
+            // 即时呈现已经领取了原警告；重新推进 revision，保证进程最终呈现还会
+            // 重试原警告并报告这次呈现失败。
+            self.mark_warning_changed();
+        }
+    }
+
+    fn queue_closed_diagnostic(&self) -> SafeDiagnostic {
+        let path = self
+            .log_path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut diagnostic = SafeDiagnostic::new(
+            DiagnosticCode::LogWorker,
+            DiagnosticStage::Logging,
+            path.as_deref().map_or_else(
+                || DiagnosticSubject::component("project log queue"),
+                DiagnosticSubject::path,
+            ),
+            DiagnosticReason::failure(DiagnosticFailureKind::ExecutorClosed),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::ReportBug,
+        );
+        if let Some(path) = path {
+            diagnostic = diagnostic.with_recovery(RecoveryFact::path(path));
+        }
+        diagnostic
+    }
+
+    fn dropped_records_diagnostic(&self, dropped_records: u64) -> SafeDiagnostic {
+        let path = self
+            .log_path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut diagnostic = SafeDiagnostic::new(
+            DiagnosticCode::LogWorker,
+            DiagnosticStage::Logging,
+            path.as_deref().map_or_else(
+                || DiagnosticSubject::component("project log queue"),
+                DiagnosticSubject::path,
+            ),
+            DiagnosticReason::Resource {
+                resource: String::from("dropped_project_log_records"),
+                actual: dropped_records,
+                maximum: None,
+            },
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::ReportBug,
+        );
+        if let Some(path) = path {
+            diagnostic = diagnostic.with_recovery(RecoveryFact::path(path));
+        }
+        diagnostic
     }
 }
 
-#[derive(Clone)]
 struct TerminalRecords {
     outcome: ProjectLogRunOutcome,
     context: ProjectLogContext,
     failures: Vec<SafeDiagnostic>,
     performance: RunPerformanceSnapshot,
+    reliable_events: Vec<QueuedProjectLogEvent>,
 }
 
 #[derive(Clone)]
@@ -693,6 +948,7 @@ pub(crate) struct ProjectLogRuntime {
     unfinished_terminal: Option<UnfinishedTerminalRecords>,
     worker: Option<JoinHandle<()>>,
     path: Option<PathBuf>,
+    reliable_events: Option<Arc<Mutex<Vec<QueuedProjectLogEvent>>>>,
 }
 
 impl ProjectLogRuntime {
@@ -756,6 +1012,7 @@ impl ProjectLogRuntime {
         performance: RunPerformanceSnapshot,
     ) -> ProjectLogHealthSnapshot {
         self.unfinished_terminal = None;
+        let reliable_events = self.take_reliable_events();
         *self
             .terminal
             .lock()
@@ -764,6 +1021,7 @@ impl ProjectLogRuntime {
             context,
             failures,
             performance,
+            reliable_events,
         });
         self.shutdown_inner();
         self.logger.health()
@@ -786,6 +1044,18 @@ impl ProjectLogRuntime {
                 .health
                 .record_failure(&self.logger.inner.health.worker_panics, diagnostic);
         }
+    }
+
+    fn take_reliable_events(&self) -> Vec<QueuedProjectLogEvent> {
+        self.reliable_events
+            .as_ref()
+            .map_or_else(Vec::new, |events| {
+                std::mem::take(
+                    &mut *events
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                )
+            })
     }
 }
 
@@ -816,11 +1086,13 @@ impl ProjectLogRuntime {
                 performance: Arc::new(RunPerformanceCounters::default()),
             }
         });
+        let reliable_events = self.take_reliable_events();
         *terminal = Some(TerminalRecords {
             outcome: ProjectLogRunOutcome::OutcomeUnknown,
             context: fallback.context,
             failures: fallback.failures,
             performance: fallback.performance.snapshot(),
+            reliable_events,
         });
     }
 }
@@ -855,11 +1127,15 @@ pub(crate) fn start_project_log(logs_root: PathBuf, run_id: String) -> ProjectLo
             return no_op_runtime(health, terminal);
         }
     };
+    health.set_log_path(path.clone());
     let (sender, receiver) = async_channel::bounded(QUEUE_CAPACITY);
+    let reliable_events = Arc::new(Mutex::new(Vec::new()));
     let logger = ProjectLogger {
         inner: Arc::new(LoggerInner {
             sender: Some(sender),
             health: Arc::clone(&health),
+            context: Mutex::new(None),
+            reliable_events: Some(Arc::clone(&reliable_events)),
         }),
     };
     let worker_health = Arc::clone(&health);
@@ -911,6 +1187,7 @@ pub(crate) fn start_project_log(logs_root: PathBuf, run_id: String) -> ProjectLo
         unfinished_terminal: None,
         worker: Some(worker),
         path: Some(path),
+        reliable_events: Some(reliable_events),
     }
 }
 
@@ -933,6 +1210,7 @@ fn no_op_runtime(
         unfinished_terminal: None,
         worker: None,
         path: None,
+        reliable_events: None,
     }
 }
 
@@ -963,6 +1241,17 @@ fn run_worker(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .take()
     {
+        for queued in terminal.reliable_events {
+            write_event(
+                &mut writer,
+                &path,
+                &run_id,
+                queued.emitted_at,
+                queued.event,
+                &mut sequence,
+                health,
+            );
+        }
         write_event(
             &mut writer,
             &path,
@@ -1007,9 +1296,9 @@ fn run_worker(
             ProjectLogRunOutcome::Succeeded | ProjectLogRunOutcome::Cancelled => {
                 ProjectLogLevel::Info
             }
-            ProjectLogRunOutcome::Failed | ProjectLogRunOutcome::OutcomeUnknown => {
-                ProjectLogLevel::Error
-            }
+            ProjectLogRunOutcome::Failed
+            | ProjectLogRunOutcome::RecoveryRequired
+            | ProjectLogRunOutcome::OutcomeUnknown => ProjectLogLevel::Error,
         };
         write_event(
             &mut writer,
@@ -1199,9 +1488,10 @@ fn render_message(
             translation_calls: *translation_calls,
             printed_lines: *printed_lines,
         }),
-        (ProjectLogCode::FailureReported, ProjectLogPayload::Failure { diagnostic, .. }) => {
-            render_failure_message(diagnostic, &localizer)
-        }
+        (
+            ProjectLogCode::FailureReported | ProjectLogCode::TaskRecordFailed,
+            ProjectLogPayload::Failure { diagnostic, .. },
+        ) => render_failure_message(diagnostic, &localizer),
         (
             ProjectLogCode::PhaseStarted | ProjectLogCode::PhaseFinished,
             ProjectLogPayload::Phase { phase, .. },
@@ -1275,6 +1565,25 @@ fn render_message(
                 parameter: *parameter,
                 actual_type,
                 skipped_count: *skipped_count,
+            })
+        }
+        (
+            ProjectLogCode::WriteBackManualLayoutRequired,
+            ProjectLogPayload::ManualLayoutRequired {
+                locations,
+                region,
+                max_fullwidth_chars,
+            },
+        ) => {
+            let locations = locations
+                .iter()
+                .map(|location| format!("{} ({})", location.group_location, location.role))
+                .collect::<Vec<_>>()
+                .join(", ");
+            localizer.format(UiMessage::WarningManualLayoutRequired {
+                locations: &locations,
+                region,
+                max_fullwidth_chars: *max_fullwidth_chars,
             })
         }
         (ProjectLogCode::RetrySummary, ProjectLogPayload::RetrySummary { attempted, .. }) => {
@@ -1807,7 +2116,11 @@ mod tests {
             },
         ));
 
-        let _ = runtime.finish(ProjectLogRunOutcome::Succeeded, context(), Vec::new());
+        assert!(
+            !runtime
+                .finish(ProjectLogRunOutcome::Succeeded, context(), Vec::new())
+                .is_degraded()
+        );
         let path = directory.path().join(format!("{run_id}.jsonl"));
         let records = records(&path);
         assert_eq!(
@@ -1841,7 +2154,11 @@ mod tests {
             DiagnosticAction::CheckPathAndPermissions,
         )
         .with_recovery(crate::diagnostic::RecoveryFact::path("C:\\game\\recovery"));
-        let _ = runtime.finish(ProjectLogRunOutcome::Failed, context(), vec![failure]);
+        assert!(
+            !runtime
+                .finish(ProjectLogRunOutcome::Failed, context(), vec![failure])
+                .is_degraded()
+        );
         let path = directory.path().join(format!("{run_id}.jsonl"));
         let raw = std::fs::read_to_string(&path).expect("日志应可读取");
         assert!(!raw.contains("UNTYPED_SOURCE_SENTINEL"));
@@ -1886,10 +2203,14 @@ mod tests {
             DiagnosticImpact::StateAppliedFinalizationFailed,
             DiagnosticAction::Retry,
         );
-        let _ = runtime.finish(
-            ProjectLogRunOutcome::Failed,
-            context(),
-            vec![primary.clone(), related.clone()],
+        assert!(
+            !runtime
+                .finish(
+                    ProjectLogRunOutcome::Failed,
+                    context(),
+                    vec![primary.clone(), related.clone()],
+                )
+                .is_degraded()
         );
 
         let path = directory.path().join(format!("{run_id}.jsonl"));
@@ -1915,10 +2236,13 @@ mod tests {
     fn full_ordinary_queue_drops_without_blocking_and_counts_degradation() {
         let health = Arc::new(ProjectLogHealth::default());
         let (sender, _receiver) = async_channel::bounded(1);
+        let reliable_events = Arc::new(Mutex::new(Vec::new()));
         let logger = ProjectLogger {
             inner: Arc::new(LoggerInner {
                 sender: Some(sender),
                 health: Arc::clone(&health),
+                context: Mutex::new(None),
+                reliable_events: Some(Arc::clone(&reliable_events)),
             }),
         };
 
@@ -1931,17 +2255,105 @@ mod tests {
         assert!(snapshot.is_project_log_degraded());
         assert!(!snapshot.is_task_record_degraded());
         let warning = logger.take_warning().expect("普通事件丢弃必须可见");
-        assert_eq!(
-            warning,
-            ProjectLogWarning {
-                project_log: Some(ObservabilityWarning {
-                    diagnostic: None,
-                    related_diagnostics: Vec::new(),
-                }),
-                task_records: None,
-            }
-        );
+        let project_log = warning.project_log.expect("普通事件丢弃必须有项目日志诊断");
+        let diagnostic = project_log.diagnostic.expect("丢弃数量必须进入结构化诊断");
+        assert_eq!(diagnostic.code, DiagnosticCode::LogWorker);
+        assert!(matches!(
+            diagnostic.reason,
+            DiagnosticReason::Resource {
+                resource,
+                actual: 1,
+                maximum: None,
+            } if resource == "dropped_project_log_records"
+        ));
+        assert!(project_log.related_diagnostics.is_empty());
+        assert!(warning.task_records.is_none());
         assert!(logger.take_warning().is_none(), "降级横幅只能领取一次");
+
+        logger.set_context(context());
+        logger.record_task_record_failure(SafeDiagnostic::new(
+            DiagnosticCode::FileSystemOperation,
+            DiagnosticStage::Logging,
+            DiagnosticSubject::path("C:/project/task-records/run/task-000001.md"),
+            DiagnosticReason::failure(DiagnosticFailureKind::TargetAlreadyExists),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::CheckPathAndPermissions,
+        ));
+        let reliable = reliable_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(reliable.len(), 1, "普通队列已满不能丢任务记录故障");
+        assert_eq!(reliable[0].event.code, ProjectLogCode::TaskRecordFailed);
+    }
+
+    #[test]
+    fn task_record_failure_is_also_persisted_in_the_current_project_log() {
+        let directory = tempdir().expect("临时目录应可建立");
+        let run_id = "550e8400-e29b-41d4-a716-446655440099";
+        let runtime = start_project_log(directory.path().to_path_buf(), run_id.to_owned());
+        let logger = runtime.logger();
+        logger.set_context(context());
+        let diagnostic = SafeDiagnostic::new(
+            DiagnosticCode::FileSystemOperation,
+            DiagnosticStage::Logging,
+            DiagnosticSubject::path("C:/project/task-records/run/task-000001.md"),
+            DiagnosticReason::failure(DiagnosticFailureKind::TargetAlreadyExists),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::CheckPathAndPermissions,
+        );
+
+        logger.record_task_record_failure(diagnostic.clone());
+        runtime.finish(ProjectLogRunOutcome::Succeeded, context(), Vec::new());
+
+        let records = records(&directory.path().join(format!("{run_id}.jsonl")));
+        let record = records
+            .iter()
+            .find(|record| record["code"] == "observability.task_record_failed")
+            .expect("项目日志仍可写时，任务记录故障必须持久化");
+        assert_eq!(record["level"], "warn");
+        assert_eq!(record["payload"]["kind"], "failure");
+        assert_eq!(record["payload"]["relation"], "primary");
+        assert_eq!(
+            record["payload"]["diagnostic"],
+            serde_json::to_value(diagnostic).expect("诊断应可序列化")
+        );
+    }
+
+    #[test]
+    fn manual_layout_event_preserves_all_actionable_fields() {
+        let directory = tempdir().expect("临时目录应可建立");
+        let run_id = "550e8400-e29b-41d4-a716-446655440098";
+        let runtime = start_project_log(directory.path().to_path_buf(), run_id.to_owned());
+        runtime.logger().emit(ProjectLogEvent::new(
+            ProjectLogLevel::Warn,
+            ProjectLogCode::WriteBackManualLayoutRequired,
+            context(),
+            ProjectLogPayload::ManualLayoutRequired {
+                locations: vec![ProjectLogManualLayoutLocation {
+                    group_location: "data/Map007.json[events][3]".to_owned(),
+                    role: "dialogue_body".to_owned(),
+                }],
+                region: "dialogue_body".to_owned(),
+                max_fullwidth_chars: 28,
+            },
+        ));
+
+        runtime.finish(ProjectLogRunOutcome::Succeeded, context(), Vec::new());
+
+        let records = records(&directory.path().join(format!("{run_id}.jsonl")));
+        let record = records
+            .iter()
+            .find(|record| record["code"] == "write_back.manual_layout_required")
+            .expect("人工布局事实必须进入项目日志");
+        assert_eq!(record["level"], "warn");
+        assert_eq!(record["payload"]["kind"], "manual_layout_required");
+        assert_eq!(
+            record["payload"]["locations"][0]["group_location"],
+            "data/Map007.json[events][3]"
+        );
+        assert_eq!(record["payload"]["locations"][0]["role"], "dialogue_body");
+        assert_eq!(record["payload"]["region"], "dialogue_body");
+        assert_eq!(record["payload"]["max_fullwidth_chars"], 28);
     }
 
     #[test]
@@ -1970,9 +2382,95 @@ mod tests {
                     related_diagnostics: Vec::new(),
                 }),
                 task_records: None,
+                presentation_failures: Vec::new(),
             })
         );
         assert!(logger.take_warning().is_none());
+    }
+
+    #[test]
+    fn warning_presenter_immediately_reports_failures_that_precede_installation() {
+        let startup = SafeDiagnostic::new(
+            DiagnosticCode::LogStart,
+            DiagnosticStage::Logging,
+            DiagnosticSubject::path("C:/project/logs/run.jsonl"),
+            DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::CheckPathAndPermissions,
+        );
+        let runtime = disabled_project_log(startup.clone());
+        let logger = runtime.logger();
+        let presented = Arc::new(Mutex::new(Vec::<ProjectLogWarning>::new()));
+        let captured = Arc::clone(&presented);
+
+        logger.install_warning_presenter(move |warning| {
+            captured
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(warning.clone());
+            Ok(())
+        });
+
+        let warnings = presented
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            warnings[0]
+                .project_log
+                .as_ref()
+                .and_then(|warning| warning.diagnostic.as_ref()),
+            Some(&startup)
+        );
+        assert!(
+            logger.take_warning().is_none(),
+            "成功即时呈现后不得重复横幅"
+        );
+        drop(runtime);
+    }
+
+    #[test]
+    fn warning_presentation_failure_is_retried_and_preserved_for_exit_status() {
+        let startup = SafeDiagnostic::new(
+            DiagnosticCode::LogStart,
+            DiagnosticStage::Logging,
+            DiagnosticSubject::path("C:/project/logs/run.jsonl"),
+            DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::CheckPathAndPermissions,
+        );
+        let presentation = SafeDiagnostic::new(
+            DiagnosticCode::StateFinalizationFailed,
+            DiagnosticStage::ProcessOutput,
+            DiagnosticSubject::operation("write_observability_warning"),
+            DiagnosticReason::failure(DiagnosticFailureKind::FinalizationFailed),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::Retry,
+        );
+        let runtime = disabled_project_log(startup);
+        let logger = runtime.logger();
+        let expected = presentation.clone();
+
+        logger.install_warning_presenter(move |_| Err(Box::new(expected.clone())));
+        logger.install_warning_presenter(|_| Ok(()));
+        logger.record_task_record_failure(SafeDiagnostic::new(
+            DiagnosticCode::FileSystemOperation,
+            DiagnosticStage::Logging,
+            DiagnosticSubject::path("C:/project/task-records/run/task-000001.md"),
+            DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::CheckPathAndPermissions,
+        ));
+
+        let retry = logger
+            .take_warning()
+            .expect("即时呈现失败后，最终进程边界必须重试");
+        assert_eq!(retry.presentation_failures, vec![presentation]);
+        assert!(
+            retry.project_log.is_none() && retry.task_records.is_none(),
+            "后来已经成功呈现的业务警告不必重复，但呈现失败事实不能被消费"
+        );
+        drop(runtime);
     }
 
     #[test]

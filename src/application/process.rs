@@ -62,7 +62,8 @@ fn run_guarded() -> ExitCode {
         // 进程运行时不满足最低要求时，完整 CLI 尚未解析，固定使用英语呈现；
         // run_from 不执行此检查，避免未嵌入 manifest 的 Rust 测试宿主受进程 ACP 影响。
         let localizer = UiLocalizer::new(UiLocale::English);
-        return render_diagnostic_fatal(&localizer, &diagnostic, &mut stderr);
+        let exit = render_diagnostic_fatal(&localizer, &diagnostic, &mut stderr);
+        return finalize_process_output(exit, &mut stdout, &mut stderr);
     }
     run_from(std::env::args_os(), &mut stdout, &mut stderr)
 }
@@ -117,13 +118,25 @@ where
     A: IntoIterator<Item = S>,
     S: Into<OsString> + Clone,
 {
+    let exit = run_from_unflushed(args, stdout, stderr);
+    finalize_process_output(exit, stdout, stderr)
+}
+
+fn run_from_unflushed<A, S>(args: A, stdout: &mut dyn Write, stderr: &mut dyn Write) -> ExitCode
+where
+    A: IntoIterator<Item = S>,
+    S: Into<OsString> + Clone,
+{
     let (arguments, resolved_locale) = match AttArguments::try_parse_localized_from(args) {
         Ok(parsed) => parsed,
         Err(error) => {
-            if error.use_stderr() {
-                let _ = write!(stderr, "{}", error.output());
+            let rendered = if error.use_stderr() {
+                write!(stderr, "{}", error.output())
             } else {
-                let _ = write!(stdout, "{}", error.output());
+                write!(stdout, "{}", error.output())
+            };
+            if rendered.is_err() {
+                return ExitCode::FAILURE;
             }
             return ExitCode::from(error.exit_code());
         }
@@ -133,6 +146,21 @@ where
     catch_after_cli_parsing(&localizer, stderr, |stderr| {
         run_after_cli_parsing(arguments, locale, &localizer, stdout, stderr)
     })
+}
+
+fn finalize_process_output(
+    exit: ExitCode,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> ExitCode {
+    // 两个流都必须尝试刷新，不能让第一个失败阻止另一个流完成收尾。
+    let stdout_flush = stdout.flush();
+    let stderr_flush = stderr.flush();
+    if stdout_flush.is_err() || stderr_flush.is_err() {
+        ExitCode::FAILURE
+    } else {
+        exit
+    }
 }
 
 fn catch_after_cli_parsing(
@@ -265,13 +293,19 @@ fn render_command_report(
                 let command_error = ProductionCommandError::stdout_write(error);
                 let warning = pending_project_log
                     .and_then(|project_log| project_log.finish_with_failure(&command_error));
-                render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
-                let _ = CommandResultRenderer::render_failure(
+                let warning_failed =
+                    render_project_log_warning_if_present(localizer, warning.as_ref(), stderr)
+                        .is_err();
+                let failure_failed = CommandResultRenderer::render_failure(
                     Some(&command_error),
                     shutdown.as_ref(),
                     localizer,
                     stderr,
-                );
+                )
+                .is_err();
+                if warning_failed || failure_failed {
+                    return ExitCode::FAILURE;
+                }
                 ExitCode::FAILURE
             } else if let Err(error) =
                 CommandResultRenderer::render_success_warnings(&output, localizer, stderr)
@@ -279,23 +313,41 @@ fn render_command_report(
                 let command_error = ProductionCommandError::stderr_write(error);
                 let warning = pending_project_log
                     .and_then(|project_log| project_log.finish_with_failure(&command_error));
-                render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
-                let _ = CommandResultRenderer::render_failure(
+                let warning_failed =
+                    render_project_log_warning_if_present(localizer, warning.as_ref(), stderr)
+                        .is_err();
+                let failure_failed = CommandResultRenderer::render_failure(
                     Some(&command_error),
                     shutdown.as_ref(),
                     localizer,
                     stderr,
-                );
+                )
+                .is_err();
+                if warning_failed || failure_failed {
+                    return ExitCode::FAILURE;
+                }
                 ExitCode::FAILURE
             } else {
                 let warning = pending_project_log.and_then(PendingProjectLog::finish);
-                render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
+                let warning_presentation_failed = warning
+                    .as_ref()
+                    .is_some_and(|warning| !warning.presentation_failures.is_empty());
+                if render_project_log_warning_if_present(localizer, warning.as_ref(), stderr)
+                    .is_err()
+                    || warning_presentation_failed
+                {
+                    return ExitCode::FAILURE;
+                }
                 if let Some(shutdown) = shutdown {
                     // 业务结果已生效：成功输出完整写入后再报告收尾失败，
                     // 清理错误不得覆盖业务成功事实。
-                    let _ = CommandResultRenderer::render_applied_finalization_failure(
+                    if CommandResultRenderer::render_applied_finalization_failure(
                         &shutdown, localizer, stderr,
-                    );
+                    )
+                    .is_err()
+                    {
+                        return ExitCode::FAILURE;
+                    }
                     ExitCode::FAILURE
                 } else {
                     ExitCode::SUCCESS
@@ -304,27 +356,51 @@ fn render_command_report(
         }
         (CommandRunResult::Failed(command_error), shutdown) => {
             let warning = pending_project_log.and_then(PendingProjectLog::finish);
-            render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
-            let _ = CommandResultRenderer::render_failure(
+            let warning_failed =
+                render_project_log_warning_if_present(localizer, warning.as_ref(), stderr).is_err();
+            let failure_failed = CommandResultRenderer::render_failure(
                 Some(&command_error),
                 shutdown.as_ref(),
                 localizer,
                 stderr,
-            );
+            )
+            .is_err();
+            if warning_failed || failure_failed {
+                return ExitCode::FAILURE;
+            }
             ExitCode::FAILURE
         }
         (CommandRunResult::Interrupted, None) => {
             let warning = pending_project_log.and_then(PendingProjectLog::finish);
-            render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
-            let _ = writeln!(stderr, "{}", localizer.format(UiMessage::ResultCancelled));
-            ExitCode::from(130)
+            let warning_presentation_failed = warning
+                .as_ref()
+                .is_some_and(|warning| !warning.presentation_failures.is_empty());
+            let warning_result =
+                render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
+            let cancellation_result =
+                writeln!(stderr, "{}", localizer.format(UiMessage::ResultCancelled));
+            if warning_result.is_err()
+                || cancellation_result.is_err()
+                || warning_presentation_failed
+            {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::from(130)
+            }
         }
         (CommandRunResult::Interrupted, Some(shutdown)) => {
             let warning = pending_project_log.and_then(PendingProjectLog::finish);
-            render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
             // 取消事实与清理失败并列呈现，清理错误不吞掉“已取消”这一终态。
-            let _ = writeln!(stderr, "{}", localizer.format(UiMessage::ResultCancelled));
-            let _ = CommandResultRenderer::render_failure(None, Some(&shutdown), localizer, stderr);
+            let warning_failed =
+                render_project_log_warning_if_present(localizer, warning.as_ref(), stderr).is_err();
+            let cancellation_failed =
+                writeln!(stderr, "{}", localizer.format(UiMessage::ResultCancelled)).is_err();
+            let shutdown_failed =
+                CommandResultRenderer::render_failure(None, Some(&shutdown), localizer, stderr)
+                    .is_err();
+            if warning_failed || cancellation_failed || shutdown_failed {
+                return ExitCode::FAILURE;
+            }
             ExitCode::FAILURE
         }
     }
@@ -378,59 +454,98 @@ fn render_generic_command_result(
                 );
                 let warning = pending_project_log
                     .and_then(|project_log| project_log.finish_with_diagnostic(diagnostic.clone()));
-                render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
-                let _ = render_safe_diagnostic(&diagnostic, localizer, stderr);
-                render_generic_shutdown_errors(
+                let warning_failed =
+                    render_project_log_warning_if_present(localizer, warning.as_ref(), stderr)
+                        .is_err();
+                let diagnostic_failed =
+                    render_safe_diagnostic(&diagnostic, localizer, stderr).is_err();
+                let shutdown_failed = render_generic_shutdown_errors(
                     shutdown_errors,
                     DiagnosticImpact::StateAppliedFinalizationFailed,
                     localizer,
                     stderr,
-                );
+                )
+                .is_err();
+                if warning_failed || diagnostic_failed || shutdown_failed {
+                    return ExitCode::FAILURE;
+                }
                 ExitCode::FAILURE
             } else {
                 let warning = pending_project_log.and_then(PendingProjectLog::finish);
-                render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
+                let warning_presentation_failed = warning
+                    .as_ref()
+                    .is_some_and(|warning| !warning.presentation_failures.is_empty());
+                if render_project_log_warning_if_present(localizer, warning.as_ref(), stderr)
+                    .is_err()
+                    || warning_presentation_failed
+                {
+                    return ExitCode::FAILURE;
+                }
                 if shutdown_errors.is_empty() {
                     ExitCode::SUCCESS
                 } else {
-                    render_generic_shutdown_errors(
+                    if render_generic_shutdown_errors(
                         shutdown_errors,
                         DiagnosticImpact::StateAppliedFinalizationFailed,
                         localizer,
                         stderr,
-                    );
+                    )
+                    .is_err()
+                    {
+                        return ExitCode::FAILURE;
+                    }
                     ExitCode::FAILURE
                 }
             }
         }
         GenericCommandRunResult::Failed(error) => {
             let warning = pending_project_log.and_then(PendingProjectLog::finish);
-            render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
-            let _ = render_safe_diagnostic(&error.safe_diagnostic(), localizer, stderr);
-            if let Some(related) = error.related_diagnostic() {
-                let _ = render_safe_diagnostic(&related, localizer, stderr);
-            }
-            render_generic_shutdown_errors(
+            let warning_failed =
+                render_project_log_warning_if_present(localizer, warning.as_ref(), stderr).is_err();
+            let diagnostic_failed =
+                render_safe_diagnostic(&error.safe_diagnostic(), localizer, stderr).is_err();
+            let related_failed = error.related_diagnostic().is_some_and(|related| {
+                render_safe_diagnostic(&related, localizer, stderr).is_err()
+            });
+            let shutdown_failed = render_generic_shutdown_errors(
                 shutdown_errors,
                 DiagnosticImpact::ProgressPreserved,
                 localizer,
                 stderr,
-            );
+            )
+            .is_err();
+            if warning_failed || diagnostic_failed || related_failed || shutdown_failed {
+                return ExitCode::FAILURE;
+            }
             ExitCode::FAILURE
         }
         GenericCommandRunResult::Interrupted => {
             let warning = pending_project_log.and_then(PendingProjectLog::finish);
-            render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
-            let _ = writeln!(stderr, "{}", localizer.format(UiMessage::ResultCancelled));
-            if shutdown_errors.is_empty() {
+            let warning_presentation_failed = warning
+                .as_ref()
+                .is_some_and(|warning| !warning.presentation_failures.is_empty());
+            let warning_result =
+                render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
+            let cancellation_result =
+                writeln!(stderr, "{}", localizer.format(UiMessage::ResultCancelled));
+            if warning_result.is_err()
+                || cancellation_result.is_err()
+                || warning_presentation_failed
+            {
+                ExitCode::FAILURE
+            } else if shutdown_errors.is_empty() {
                 ExitCode::from(130)
             } else {
-                render_generic_shutdown_errors(
+                if render_generic_shutdown_errors(
                     shutdown_errors,
                     DiagnosticImpact::ProgressPreserved,
                     localizer,
                     stderr,
-                );
+                )
+                .is_err()
+                {
+                    return ExitCode::FAILURE;
+                }
                 ExitCode::FAILURE
             }
         }
@@ -574,12 +689,13 @@ fn render_generic_shutdown_errors(
     impact: DiagnosticImpact,
     localizer: &UiLocalizer,
     stderr: &mut dyn Write,
-) {
+) -> io::Result<()> {
     for error in errors {
         let mut diagnostic = error.safe_diagnostic();
         diagnostic.impact = impact;
-        let _ = render_safe_diagnostic(&diagnostic, localizer, stderr);
+        render_safe_diagnostic(&diagnostic, localizer, stderr)?;
     }
+    Ok(())
 }
 
 fn catch_logged_presentation(
@@ -598,7 +714,10 @@ fn catch_logged_presentation(
             // 与命令边界相同，payload 只负责触发控制流，绝不读取或格式化。
             drop(payload);
             let error = panic_boundary.panic_error();
-            let _ = CommandResultRenderer::render_failure(Some(&error), None, localizer, stderr);
+            if CommandResultRenderer::render_failure(Some(&error), None, localizer, stderr).is_err()
+            {
+                return ExitCode::FAILURE;
+            }
             ExitCode::FAILURE
         }
     }
@@ -609,7 +728,9 @@ fn render_diagnostic_fatal(
     diagnostic: &SafeDiagnostic,
     stderr: &mut dyn Write,
 ) -> ExitCode {
-    let _ = render_safe_diagnostic(diagnostic, localizer, stderr);
+    if render_safe_diagnostic(diagnostic, localizer, stderr).is_err() {
+        return ExitCode::FAILURE;
+    }
     ExitCode::FAILURE
 }
 
@@ -628,6 +749,9 @@ fn render_project_log_warning(
             task_records,
             stderr,
         )?;
+    }
+    for diagnostic in &warning.presentation_failures {
+        render_safe_diagnostic(diagnostic, localizer, stderr)?;
     }
     Ok(())
 }
@@ -652,10 +776,11 @@ fn render_project_log_warning_if_present(
     localizer: &UiLocalizer,
     warning: Option<&ProjectLogWarning>,
     stderr: &mut dyn Write,
-) {
+) -> io::Result<()> {
     if let Some(warning) = warning {
-        let _ = render_project_log_warning(localizer, warning, stderr);
+        render_project_log_warning(localizer, warning, stderr)?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -821,6 +946,27 @@ mod tests {
 
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FlushFailingOutput {
+        bytes: Vec<u8>,
+        flush_attempts: usize,
+    }
+
+    impl Write for FlushFailingOutput {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flush_attempts += 1;
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "测试输出流最终刷新失败",
+            ))
         }
     }
 
@@ -1074,7 +1220,9 @@ mod tests {
             &mut stderr,
             move |_stderr| {
                 let _runtime = runtime;
-                let _ = stdout.write_all(b"result");
+                stdout
+                    .write_all(b"result")
+                    .expect("测试输出必须在写入时触发 panic");
                 ExitCode::SUCCESS
             },
         );
@@ -1183,6 +1331,82 @@ mod tests {
                 .contains("config.toml"),
             "合法业务命令应读取测试可执行文件旁的固定配置"
         );
+    }
+
+    #[test]
+    fn help_and_version_output_failures_return_failure() {
+        let mut stdout = FailingOutput::default();
+        let mut stderr = Vec::new();
+
+        let help_exit = run_from(["att", "--help"], &mut stdout, &mut stderr);
+        assert_eq!(help_exit, ExitCode::FAILURE);
+        assert!(stdout.write_attempts > 0);
+
+        let mut stdout = FailingOutput::default();
+        let version_exit = run_from(["att", "--version"], &mut stdout, &mut stderr);
+        assert_eq!(version_exit, ExitCode::FAILURE);
+        assert!(stdout.write_attempts > 0);
+    }
+
+    #[test]
+    fn final_stdout_or_stderr_flush_failure_returns_failure_and_both_streams_are_attempted() {
+        let mut stdout = FlushFailingOutput::default();
+        let mut stderr = FlushFailingOutput::default();
+
+        let exit = run_from(["att", "--help"], &mut stdout, &mut stderr);
+
+        assert_eq!(exit, ExitCode::FAILURE);
+        assert!(!stdout.bytes.is_empty());
+        assert_eq!(stdout.flush_attempts, 1);
+        assert_eq!(stderr.flush_attempts, 1);
+    }
+
+    #[test]
+    fn project_log_warning_write_failure_is_returned() {
+        let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
+        let warning = ProjectLogWarning {
+            project_log: Some(ObservabilityWarning {
+                diagnostic: None,
+                related_diagnostics: Vec::new(),
+            }),
+            task_records: None,
+            presentation_failures: Vec::new(),
+        };
+        let mut stderr = FailingOutput::default();
+
+        let result = render_project_log_warning_if_present(&localizer, Some(&warning), &mut stderr);
+
+        assert!(result.is_err());
+        assert!(stderr.write_attempts > 0);
+    }
+
+    #[test]
+    fn cancellation_notice_write_failure_changes_exit_code_to_failure() {
+        let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
+        let mut stdout = Vec::new();
+        let mut rpg_stderr = FailingOutput::default();
+        let rpg_exit = render_command_report(
+            CommandRunResult::Interrupted,
+            None,
+            None,
+            &localizer,
+            &mut stdout,
+            &mut rpg_stderr,
+        );
+        assert_eq!(rpg_exit, ExitCode::FAILURE);
+        assert!(rpg_stderr.write_attempts > 0);
+
+        let mut generic_stderr = FailingOutput::default();
+        let generic_exit = render_generic_command_result(
+            GenericCommandRunResult::Interrupted,
+            &[],
+            None,
+            &localizer,
+            &mut stdout,
+            &mut generic_stderr,
+        );
+        assert_eq!(generic_exit, ExitCode::FAILURE);
+        assert!(generic_stderr.write_attempts > 0);
     }
 
     #[test]
@@ -1343,6 +1567,7 @@ mod tests {
                     DiagnosticAction::CheckPathAndPermissions,
                 )],
             }),
+            presentation_failures: Vec::new(),
         };
         let mut stderr = Vec::new();
 

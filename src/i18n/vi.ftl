@@ -82,6 +82,7 @@ notice-extract-reuse-owners = Không có phạm vi trích xuất; đang dùng l�
 notice-translate-reuse-profile = Không có Profile; đang dùng lại Profile thành công gần nhất: { $profile }.
 notice-owner-disabled = Owner { $owner } đã bị tắt và xóa khỏi các kế hoạch tự động sau này.
 warning-rules-command-non-string-skipped = Cảnh báo: quy tắc Rules { $rule_number } đã bỏ qua { $skipped_count } tham số command không phải chuỗi (nguồn { $source_file }, code={ $command_code }, parameter={ $parameter }, kiểu { $actual_type }).
+warning-manual-layout-required = Cảnh báo: cần kiểm tra ngắt dòng thủ công tại { $locations } (region={ $region }, max_fullwidth_chars={ $max_fullwidth_chars }).
 notice-no-model-request = Mọi đơn vị dịch đều mới nhất; lần chạy này không cần gửi yêu cầu nào đến mô hình.
 notice-manual-layout = Có { $count } đơn vị cần kiểm tra ngắt dòng thủ công.
 notice-log-degraded = Nhật ký dự án không khả dụng hoặc suy giảm; lệnh vẫn tiếp tục và trạng thái thoát không đổi.

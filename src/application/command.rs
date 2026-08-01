@@ -41,6 +41,7 @@ use crate::i18n::{UiLocale, UiLocalizer, UiMessage, project_log_value_source_lab
 use crate::language::LanguageModuleCatalogError;
 use crate::progress::{
     ProgressAmount, ProgressMode, ProgressObserver, ProgressSnapshot, TerminalProgress,
+    TerminalProgressFailure, TerminalProgressFailureKind, TerminalProgressFailures,
     TerminalProgressObserver,
 };
 use crate::project_lease::{
@@ -146,9 +147,9 @@ use crate::runtime::llm::{
 use crate::runtime::performance::RunPerformanceCounters;
 use crate::runtime::project_log::{
     ProjectLog, ProjectLogAmount, ProjectLogCode, ProjectLogContext, ProjectLogEvent,
-    ProjectLogLevel, ProjectLogNoWorkReason, ProjectLogPayload, ProjectLogPhase,
-    ProjectLogRunOutcome, ProjectLogRuntime, ProjectLogValueSource, ProjectLogWarning,
-    ProjectLogger, disabled_project_log, start_project_log,
+    ProjectLogLevel, ProjectLogManualLayoutLocation, ProjectLogNoWorkReason, ProjectLogPayload,
+    ProjectLogPhase, ProjectLogRunOutcome, ProjectLogRuntime, ProjectLogValueSource,
+    ProjectLogWarning, ProjectLogger, disabled_project_log, start_project_log,
 };
 use crate::runtime::run_id::generate_run_id;
 use crate::runtime::sqlite::{
@@ -366,6 +367,99 @@ fn progress_finalizing(locale: UiLocale) -> String {
 
 fn progress_saving_plan(locale: UiLocale) -> String {
     UiLocalizer::new(locale).format(UiMessage::ProgressSaveRunPlan)
+}
+
+fn defer_terminal_progress_status(result: Result<(), TerminalProgressFailures>) {
+    if let Err(failures) = result {
+        // `TerminalProgress` 同时把这些事实保存在共享健康状态中；这里不能改变业务
+        // future 的返回类型，最终 `finish` 会把同一批失败完整交给 shutdown 结果。
+        debug_assert!(!failures.failures().is_empty());
+    }
+}
+
+fn finish_terminal_progress<P>(
+    progress: TerminalProgress<P>,
+    mut shutdown: ShutdownFailures,
+) -> ShutdownFailures {
+    if let Err(failures) = progress.finish() {
+        shutdown.push("terminal progress", failures);
+    }
+    shutdown
+}
+
+impl SafeDiagnosticSource for TerminalProgressFailure {
+    fn safe_diagnostic_source(
+        &self,
+        stage: DiagnosticStage,
+        impact: DiagnosticImpact,
+        fallback_action: DiagnosticAction,
+    ) -> SafeDiagnostic {
+        let detail = format!(
+            "kind={}; operation={}; io_kind={:?}; os_code={:?}",
+            self.kind().as_str(),
+            self.operation().as_str(),
+            self.io_error_kind(),
+            self.raw_os_error(),
+        );
+        SafeDiagnostic::new(
+            DiagnosticCode::StateFinalizationFailed,
+            stage,
+            DiagnosticSubject::component("terminal progress"),
+            DiagnosticReason::failure_with_detail(
+                DiagnosticFailureKind::FinalizationFailed,
+                detail,
+            ),
+            impact,
+            if self.kind() == TerminalProgressFailureKind::RendererThreadPanicked {
+                DiagnosticAction::ReportBug
+            } else {
+                fallback_action
+            },
+        )
+    }
+}
+
+impl SafeDiagnosticSource for TerminalProgressFailures {
+    fn safe_diagnostic_source(
+        &self,
+        stage: DiagnosticStage,
+        impact: DiagnosticImpact,
+        fallback_action: DiagnosticAction,
+    ) -> SafeDiagnostic {
+        self.failures().first().map_or_else(
+            || {
+                SafeDiagnostic::new(
+                    DiagnosticCode::StateFinalizationFailed,
+                    stage,
+                    DiagnosticSubject::component("terminal progress"),
+                    DiagnosticReason::failure(DiagnosticFailureKind::FinalizationFailed),
+                    impact,
+                    fallback_action,
+                )
+            },
+            |failure| failure.safe_diagnostic_source(stage, impact, fallback_action),
+        )
+    }
+
+    fn into_failure_report(
+        self,
+        stage: DiagnosticStage,
+        impact: DiagnosticImpact,
+        fallback_action: DiagnosticAction,
+    ) -> FailureReport {
+        let mut failures = self.failures().to_vec().into_iter();
+        let Some(primary) = failures.next() else {
+            let public = self.safe_diagnostic_source(stage, impact, fallback_action);
+            return FailureReport::new(ReportedFailure::new(public, self));
+        };
+        let public = primary.safe_diagnostic_source(stage, impact, fallback_action);
+        let mut report = FailureReport::new(ReportedFailure::new(public, primary));
+        for related in failures {
+            let public = related.safe_diagnostic_source(stage, impact, fallback_action);
+            report = report.with_related(ReportedFailure::new(public, related));
+        }
+        report
+    }
 }
 
 #[derive(Clone, Default)]
@@ -976,7 +1070,11 @@ impl ProductionRpgMakerCommandRunner {
                 file_system.cancel_waits();
                 sqlite.cancel_waits();
             },
-            || progress.safe_stopping(progress_safe_stopping(self.locale)),
+            || {
+                defer_terminal_progress_status(
+                    progress.safe_stopping(progress_safe_stopping(self.locale)),
+                );
+            },
         )
         .await;
         let script = match script_read {
@@ -988,10 +1086,24 @@ impl ProductionRpgMakerCommandRunner {
                     shutdown,
                 );
             }
-            DrivenCommand::Interrupted(_) => {
-                let shutdown = roots.shutdown().await;
-                progress.finish();
-                return ProductionCommandRunReport::interrupted_before_logging(shutdown);
+            DrivenCommand::Interrupted(result) => {
+                let error = match result {
+                    Ok(script) => {
+                        drop(script);
+                        None
+                    }
+                    Err(source) => {
+                        let error = ProductionCommandError::lua_script_read(source);
+                        (!error.was_cancelled_wait()).then_some(error)
+                    }
+                };
+                let shutdown = finish_terminal_progress(progress, roots.shutdown().await);
+                return match error {
+                    Some(error) => ProductionCommandRunReport::failed_before_logging_with_shutdown(
+                        error, shutdown,
+                    ),
+                    None => ProductionCommandRunReport::interrupted_before_logging(shutdown),
+                };
             }
             DrivenCommand::SignalFailed { source, result } => {
                 let outcome = result.map_or_else(
@@ -1002,8 +1114,7 @@ impl ProductionRpgMakerCommandRunner {
                     },
                     |_| SignalOutcomeSource::Cancelled,
                 );
-                let shutdown = roots.shutdown().await;
-                progress.finish();
+                let shutdown = finish_terminal_progress(progress, roots.shutdown().await);
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                     ProductionCommandError::signal(source, outcome),
                     shutdown,
@@ -1068,7 +1179,11 @@ impl ProductionRpgMakerCommandRunner {
                 file_system.cancel_waits();
                 sqlite.cancel_waits();
             },
-            || progress.safe_stopping(progress_safe_stopping(self.locale)),
+            || {
+                defer_terminal_progress_status(
+                    progress.safe_stopping(progress_safe_stopping(self.locale)),
+                );
+            },
         )
         .await;
         let program = match preparation {
@@ -1078,8 +1193,7 @@ impl ProductionRpgMakerCommandRunner {
                     result
                         .map(|_completion| OperationCompletion::<RpgMakerCommandOutput>::Cancelled)
                 });
-                let shutdown = roots.shutdown().await;
-                progress.finish();
+                let shutdown = finish_terminal_progress(progress, roots.shutdown().await);
                 let outcome = project_log_outcome(&execution, &shutdown);
                 let diagnostics = project_log_failure_diagnostics(&execution, &shutdown);
                 let pending = PendingProjectLog::new(project_log, outcome, diagnostics);
@@ -1103,7 +1217,11 @@ impl ProductionRpgMakerCommandRunner {
             &sqlite,
             &cancellation,
             termination_signals,
-            || progress.safe_stopping(progress_safe_stopping(self.locale)),
+            || {
+                defer_terminal_progress_status(
+                    progress.safe_stopping(progress_safe_stopping(self.locale)),
+                );
+            },
         )
         .await;
         let project_lease_guard = match project_lease {
@@ -1127,9 +1245,25 @@ impl ProductionRpgMakerCommandRunner {
                 );
             }
             DrivenCommand::Interrupted(result) => {
-                drop(result);
-                let shutdown = roots.shutdown().await;
-                progress.finish();
+                let error = interrupted_non_cancellation_error(result);
+                let shutdown = finish_terminal_progress(progress, roots.shutdown().await);
+                if let Some(error) = error {
+                    let pending = PendingProjectLog::new(
+                        project_log,
+                        ProjectLogRunOutcome::Failed,
+                        error
+                            .failure_report()
+                            .public_diagnostics()
+                            .cloned()
+                            .chain(shutdown.public_diagnostics().cloned())
+                            .collect(),
+                    );
+                    return ProductionCommandRunReport::construction_failed_with_shutdown_and_project_log(
+                        error,
+                        shutdown,
+                        Some(pending),
+                    );
+                }
                 let pending = PendingProjectLog::new(
                     project_log,
                     ProjectLogRunOutcome::Cancelled,
@@ -1150,8 +1284,7 @@ impl ProductionRpgMakerCommandRunner {
                     Err(error) => SignalOutcomeSource::CommandFailed(error),
                 };
                 let error = ProductionCommandError::signal(source, outcome);
-                let shutdown = roots.shutdown().await;
-                progress.finish();
+                let shutdown = finish_terminal_progress(progress, roots.shutdown().await);
                 let pending = PendingProjectLog::new(
                     project_log,
                     ProjectLogRunOutcome::Failed,
@@ -1226,12 +1359,15 @@ impl ProductionRpgMakerCommandRunner {
                 file_system.cancel_waits();
                 sqlite.cancel_waits();
             },
-            || progress.safe_stopping(progress_safe_stopping(self.locale)),
+            || {
+                defer_terminal_progress_status(
+                    progress.safe_stopping(progress_safe_stopping(self.locale)),
+                );
+            },
         )
         .await;
         drop(project_lease_guard);
         progress_observer.finish();
-        progress.finish();
         if let Some(report) = completed_project_lua_report(&execution) {
             project_log.logger.emit(ProjectLogEvent::new(
                 ProjectLogLevel::Info,
@@ -1248,7 +1384,7 @@ impl ProductionRpgMakerCommandRunner {
         let execution = execution.map(|result| {
             result.map(|completion| map_completion(completion, |(output, _report)| output))
         });
-        let shutdown = roots.shutdown().await;
+        let shutdown = finish_terminal_progress(progress, roots.shutdown().await);
         let outcome = project_log_outcome(&execution, &shutdown);
         let diagnostics = project_log_failure_diagnostics(&execution, &shutdown);
         let pending = PendingProjectLog::new(project_log, outcome, diagnostics);
@@ -1300,7 +1436,11 @@ impl ProductionRpgMakerCommandRunner {
             &sqlite,
             &cancellation,
             termination_signals,
-            || progress.safe_stopping(progress_safe_stopping(self.locale)),
+            || {
+                defer_terminal_progress_status(
+                    progress.safe_stopping(progress_safe_stopping(self.locale)),
+                );
+            },
         )
         .await;
         let project_lease_guard = match project_lease {
@@ -1312,10 +1452,14 @@ impl ProductionRpgMakerCommandRunner {
                 );
             }
             DrivenCommand::Interrupted(result) => {
-                drop(result);
-                let shutdown = roots.shutdown().await;
-                progress.finish();
-                return ProductionCommandRunReport::interrupted_before_logging(shutdown);
+                let error = interrupted_non_cancellation_error(result);
+                let shutdown = finish_terminal_progress(progress, roots.shutdown().await);
+                return match error {
+                    Some(error) => ProductionCommandRunReport::failed_before_logging_with_shutdown(
+                        error, shutdown,
+                    ),
+                    None => ProductionCommandRunReport::interrupted_before_logging(shutdown),
+                };
             }
             DrivenCommand::SignalFailed { source, result } => {
                 let outcome = match result {
@@ -1325,8 +1469,7 @@ impl ProductionRpgMakerCommandRunner {
                     }
                     Err(error) => SignalOutcomeSource::CommandFailed(error),
                 };
-                let shutdown = roots.shutdown().await;
-                progress.finish();
+                let shutdown = finish_terminal_progress(progress, roots.shutdown().await);
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                     ProductionCommandError::signal(source, outcome),
                     shutdown,
@@ -1426,7 +1569,7 @@ impl ProductionRpgMakerCommandRunner {
                 sqlite.cancel_waits();
             },
             || {
-                progress.safe_stopping(safe_stopping);
+                defer_terminal_progress_status(progress.safe_stopping(safe_stopping));
             },
         )
         .await
@@ -1446,7 +1589,7 @@ impl ProductionRpgMakerCommandRunner {
         );
         if !workspace_is_legal {
             drop(project_lease_guard);
-            progress.finish();
+            let shutdown = finish_terminal_progress(progress, shutdown);
             return ProductionCommandRunReport::from_completion_with_project_log(
                 execution.map(|result| {
                     result.map(|completion| {
@@ -1485,12 +1628,14 @@ impl ProductionRpgMakerCommandRunner {
             .map(ProjectRunPlanReplacement::Init)
             .map_err(ProductionCommandError::invalid_run_plan);
         if !matches!(execution, DrivenCommand::Interrupted(_)) {
-            progress.finalizing(progress_finalizing(self.locale));
+            defer_terminal_progress_status(progress.finalizing(progress_finalizing(self.locale)));
         }
         execution = match replacement {
             Ok(replacement) => {
                 if business_completed(&execution) && shutdown.is_empty() {
-                    progress.finalizing(progress_saving_plan(self.locale));
+                    defer_terminal_progress_status(
+                        progress.finalizing(progress_saving_plan(self.locale)),
+                    );
                 }
                 finalize_run_plan(
                     execution,
@@ -1503,7 +1648,9 @@ impl ProductionRpgMakerCommandRunner {
                     &project_log,
                     termination_signals,
                     || {
-                        progress.safe_stopping(progress_safe_stopping(self.locale));
+                        defer_terminal_progress_status(
+                            progress.safe_stopping(progress_safe_stopping(self.locale)),
+                        );
                         let (confirmed, total) = progress_observer.confirmed_amount();
                         project_log.emit_cancellation(
                             ProjectLogCode::CancellationRequested,
@@ -1517,7 +1664,7 @@ impl ProductionRpgMakerCommandRunner {
             Err(error) => replace_success_with_plan_error(execution, Err(error)),
         };
         drop(project_lease_guard);
-        progress.finish();
+        let shutdown = finish_terminal_progress(progress, shutdown);
         let log_outcome = project_log_outcome(&execution, &shutdown);
         let failure_diagnostics = project_log_failure_diagnostics(&execution, &shutdown);
         let pending_project_log =
@@ -1579,7 +1726,9 @@ impl ProductionRpgMakerCommandRunner {
             &cancellation,
             termination_signals,
             || {
-                progress.safe_stopping(progress_safe_stopping(self.locale));
+                defer_terminal_progress_status(
+                    progress.safe_stopping(progress_safe_stopping(self.locale)),
+                );
             },
         )
         .await;
@@ -1592,10 +1741,14 @@ impl ProductionRpgMakerCommandRunner {
                 );
             }
             DrivenCommand::Interrupted(result) => {
-                drop(result);
-                let shutdown = roots.shutdown().await;
-                progress.finish();
-                return ProductionCommandRunReport::interrupted_before_logging(shutdown);
+                let error = interrupted_non_cancellation_error(result);
+                let shutdown = finish_terminal_progress(progress, roots.shutdown().await);
+                return match error {
+                    Some(error) => ProductionCommandRunReport::failed_before_logging_with_shutdown(
+                        error, shutdown,
+                    ),
+                    None => ProductionCommandRunReport::interrupted_before_logging(shutdown),
+                };
             }
             DrivenCommand::SignalFailed { source, result } => {
                 let outcome = match result {
@@ -1605,8 +1758,7 @@ impl ProductionRpgMakerCommandRunner {
                     }
                     Err(error) => SignalOutcomeSource::CommandFailed(error),
                 };
-                let shutdown = roots.shutdown().await;
-                progress.finish();
+                let shutdown = finish_terminal_progress(progress, roots.shutdown().await);
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                     ProductionCommandError::signal(source, outcome),
                     shutdown,
@@ -1663,7 +1815,11 @@ impl ProductionRpgMakerCommandRunner {
             &sqlite,
             &cancellation,
             termination_signals,
-            || progress.safe_stopping(progress_safe_stopping(self.locale)),
+            || {
+                defer_terminal_progress_status(
+                    progress.safe_stopping(progress_safe_stopping(self.locale)),
+                );
+            },
         )
         .await;
         let opened_project = match project_opening {
@@ -1671,17 +1827,22 @@ impl ProductionRpgMakerCommandRunner {
             DrivenCommand::Finished(Err(error)) => {
                 let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
-                progress.finish();
+                let shutdown = finish_terminal_progress(progress, shutdown);
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                     error, shutdown,
                 );
             }
             DrivenCommand::Interrupted(result) => {
-                drop(result);
+                let error = interrupted_non_cancellation_error(result);
                 let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
-                progress.finish();
-                return ProductionCommandRunReport::interrupted_before_logging(shutdown);
+                let shutdown = finish_terminal_progress(progress, shutdown);
+                return match error {
+                    Some(error) => ProductionCommandRunReport::failed_before_logging_with_shutdown(
+                        error, shutdown,
+                    ),
+                    None => ProductionCommandRunReport::interrupted_before_logging(shutdown),
+                };
             }
             DrivenCommand::SignalFailed { source, result } => {
                 let outcome = match result {
@@ -1693,7 +1854,7 @@ impl ProductionRpgMakerCommandRunner {
                 };
                 let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
-                progress.finish();
+                let shutdown = finish_terminal_progress(progress, shutdown);
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                     ProductionCommandError::signal(source, outcome),
                     shutdown,
@@ -1905,7 +2066,7 @@ impl ProductionRpgMakerCommandRunner {
                 sqlite.cancel_waits();
             },
             || {
-                progress.safe_stopping(safe_stopping);
+                defer_terminal_progress_status(progress.safe_stopping(safe_stopping));
                 let (confirmed, total) = progress_observer.confirmed_amount();
                 project_log.emit_cancellation(
                     ProjectLogCode::CancellationRequested,
@@ -1923,10 +2084,10 @@ impl ProductionRpgMakerCommandRunner {
         progress_observer.finish();
         let shutdown = roots.shutdown().await;
         if !matches!(execution, DrivenCommand::Interrupted(_)) {
-            progress.finalizing(progress_finalizing(self.locale));
+            defer_terminal_progress_status(progress.finalizing(progress_finalizing(self.locale)));
         }
         if business_completed(&execution) && shutdown.is_empty() {
-            progress.finalizing(progress_saving_plan(self.locale));
+            defer_terminal_progress_status(progress.finalizing(progress_saving_plan(self.locale)));
         }
         execution = finalize_run_plan(
             execution,
@@ -1939,7 +2100,9 @@ impl ProductionRpgMakerCommandRunner {
             &project_log,
             termination_signals,
             || {
-                progress.safe_stopping(progress_safe_stopping(self.locale));
+                defer_terminal_progress_status(
+                    progress.safe_stopping(progress_safe_stopping(self.locale)),
+                );
                 let (confirmed, total) = progress_observer.confirmed_amount();
                 project_log.emit_cancellation(
                     ProjectLogCode::CancellationRequested,
@@ -1951,7 +2114,7 @@ impl ProductionRpgMakerCommandRunner {
         .await;
         if let Some(output) = completed_output(&execution) {
             for warning in &output.rules_warnings {
-                project_log.logger.emit(ProjectLogEvent::new(
+                project_log.logger.emit_reliable(ProjectLogEvent::new(
                     ProjectLogLevel::Warn,
                     ProjectLogCode::ExtractRulesCommandNonStringSkipped,
                     project_log.context.clone(),
@@ -1967,7 +2130,7 @@ impl ProductionRpgMakerCommandRunner {
             }
         }
         drop(project_lease_guard);
-        progress.finish();
+        let shutdown = finish_terminal_progress(progress, shutdown);
         let log_outcome = project_log_outcome(&execution, &shutdown);
         let failure_diagnostics = project_log_failure_diagnostics(&execution, &shutdown);
         let pending_project_log =
@@ -2031,7 +2194,11 @@ impl ProductionRpgMakerCommandRunner {
             &sqlite,
             &cancellation,
             termination_signals,
-            || progress.safe_stopping(progress_safe_stopping(self.locale)),
+            || {
+                defer_terminal_progress_status(
+                    progress.safe_stopping(progress_safe_stopping(self.locale)),
+                );
+            },
         )
         .await;
         let project_lease_guard = match project_lease {
@@ -2043,10 +2210,14 @@ impl ProductionRpgMakerCommandRunner {
                 );
             }
             DrivenCommand::Interrupted(result) => {
-                drop(result);
-                let shutdown = roots.shutdown().await;
-                progress.finish();
-                return ProductionCommandRunReport::interrupted_before_logging(shutdown);
+                let error = interrupted_non_cancellation_error(result);
+                let shutdown = finish_terminal_progress(progress, roots.shutdown().await);
+                return match error {
+                    Some(error) => ProductionCommandRunReport::failed_before_logging_with_shutdown(
+                        error, shutdown,
+                    ),
+                    None => ProductionCommandRunReport::interrupted_before_logging(shutdown),
+                };
             }
             DrivenCommand::SignalFailed { source, result } => {
                 let outcome = match result {
@@ -2056,8 +2227,7 @@ impl ProductionRpgMakerCommandRunner {
                     }
                     Err(error) => SignalOutcomeSource::CommandFailed(error),
                 };
-                let shutdown = roots.shutdown().await;
-                progress.finish();
+                let shutdown = finish_terminal_progress(progress, roots.shutdown().await);
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                     ProductionCommandError::signal(source, outcome),
                     shutdown,
@@ -2106,7 +2276,11 @@ impl ProductionRpgMakerCommandRunner {
             &sqlite,
             &cancellation,
             termination_signals,
-            || progress.safe_stopping(progress_safe_stopping(self.locale)),
+            || {
+                defer_terminal_progress_status(
+                    progress.safe_stopping(progress_safe_stopping(self.locale)),
+                );
+            },
         )
         .await;
         let opened_project = match project_opening {
@@ -2114,17 +2288,22 @@ impl ProductionRpgMakerCommandRunner {
             DrivenCommand::Finished(Err(error)) => {
                 let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
-                progress.finish();
+                let shutdown = finish_terminal_progress(progress, shutdown);
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                     error, shutdown,
                 );
             }
             DrivenCommand::Interrupted(result) => {
-                drop(result);
+                let error = interrupted_non_cancellation_error(result);
                 let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
-                progress.finish();
-                return ProductionCommandRunReport::interrupted_before_logging(shutdown);
+                let shutdown = finish_terminal_progress(progress, shutdown);
+                return match error {
+                    Some(error) => ProductionCommandRunReport::failed_before_logging_with_shutdown(
+                        error, shutdown,
+                    ),
+                    None => ProductionCommandRunReport::interrupted_before_logging(shutdown),
+                };
             }
             DrivenCommand::SignalFailed { source, result } => {
                 let outcome = match result {
@@ -2136,7 +2315,7 @@ impl ProductionRpgMakerCommandRunner {
                 };
                 let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
-                progress.finish();
+                let shutdown = finish_terminal_progress(progress, shutdown);
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                     ProductionCommandError::signal(source, outcome),
                     shutdown,
@@ -2300,7 +2479,7 @@ impl ProductionRpgMakerCommandRunner {
                 llm.cancel_waits();
             },
             || {
-                progress.safe_stopping(safe_stopping);
+                defer_terminal_progress_status(progress.safe_stopping(safe_stopping));
                 let (confirmed, total) = progress_observer.confirmed_amount();
                 project_log.emit_cancellation(
                     ProjectLogCode::CancellationRequested,
@@ -2336,12 +2515,15 @@ impl ProductionRpgMakerCommandRunner {
         }
         progress_observer.finish();
         llm.shutdown().await;
+        // 任务记录渲染仍使用本次命令的 CPU 根。必须在关闭根之前完成旁路记录；
+        // 记录故障只写入日志健康状态，不改变翻译、取消或运行方案的终态。
+        task_records.finish().await;
         let shutdown = roots.shutdown().await;
         if !matches!(execution, DrivenCommand::Interrupted(_)) {
-            progress.finalizing(progress_finalizing(self.locale));
+            defer_terminal_progress_status(progress.finalizing(progress_finalizing(self.locale)));
         }
         if business_completed(&execution) && shutdown.is_empty() {
-            progress.finalizing(progress_saving_plan(self.locale));
+            defer_terminal_progress_status(progress.finalizing(progress_saving_plan(self.locale)));
         }
         execution = finalize_run_plan(
             execution,
@@ -2354,7 +2536,9 @@ impl ProductionRpgMakerCommandRunner {
             &project_log,
             termination_signals,
             || {
-                progress.safe_stopping(progress_safe_stopping(self.locale));
+                defer_terminal_progress_status(
+                    progress.safe_stopping(progress_safe_stopping(self.locale)),
+                );
                 let (confirmed, total) = progress_observer.confirmed_amount();
                 project_log.emit_cancellation(
                     ProjectLogCode::CancellationRequested,
@@ -2365,10 +2549,7 @@ impl ProductionRpgMakerCommandRunner {
         )
         .await;
         drop(project_lease_guard);
-        // 任务记录拥有独立的终态观察文件根；运行方案终态固定后才渲染、写入并关闭该根。
-        // 因此旁路慢写、故障或此时到达的信号都不能改变业务、取消或运行方案语义。
-        task_records.finish().await;
-        progress.finish();
+        let shutdown = finish_terminal_progress(progress, shutdown);
         let log_outcome = project_log_outcome(&execution, &shutdown);
         let failure_diagnostics = project_log_failure_diagnostics(&execution, &shutdown);
         let pending_project_log =
@@ -2424,7 +2605,11 @@ impl ProductionRpgMakerCommandRunner {
             &sqlite,
             &cancellation,
             termination_signals,
-            || progress.safe_stopping(progress_safe_stopping(self.locale)),
+            || {
+                defer_terminal_progress_status(
+                    progress.safe_stopping(progress_safe_stopping(self.locale)),
+                );
+            },
         )
         .await;
         let project_lease_guard = match project_lease {
@@ -2436,10 +2621,14 @@ impl ProductionRpgMakerCommandRunner {
                 );
             }
             DrivenCommand::Interrupted(result) => {
-                drop(result);
-                let shutdown = roots.shutdown().await;
-                progress.finish();
-                return ProductionCommandRunReport::interrupted_before_logging(shutdown);
+                let error = interrupted_non_cancellation_error(result);
+                let shutdown = finish_terminal_progress(progress, roots.shutdown().await);
+                return match error {
+                    Some(error) => ProductionCommandRunReport::failed_before_logging_with_shutdown(
+                        error, shutdown,
+                    ),
+                    None => ProductionCommandRunReport::interrupted_before_logging(shutdown),
+                };
             }
             DrivenCommand::SignalFailed { source, result } => {
                 let outcome = match result {
@@ -2449,8 +2638,7 @@ impl ProductionRpgMakerCommandRunner {
                     }
                     Err(error) => SignalOutcomeSource::CommandFailed(error),
                 };
-                let shutdown = roots.shutdown().await;
-                progress.finish();
+                let shutdown = finish_terminal_progress(progress, roots.shutdown().await);
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                     ProductionCommandError::signal(source, outcome),
                     shutdown,
@@ -2467,7 +2655,11 @@ impl ProductionRpgMakerCommandRunner {
             &sqlite,
             &cancellation,
             termination_signals,
-            || progress.safe_stopping(progress_safe_stopping(self.locale)),
+            || {
+                defer_terminal_progress_status(
+                    progress.safe_stopping(progress_safe_stopping(self.locale)),
+                );
+            },
         )
         .await;
         let opened_project = match project_opening {
@@ -2475,17 +2667,22 @@ impl ProductionRpgMakerCommandRunner {
             DrivenCommand::Finished(Err(error)) => {
                 let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
-                progress.finish();
+                let shutdown = finish_terminal_progress(progress, shutdown);
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                     error, shutdown,
                 );
             }
             DrivenCommand::Interrupted(result) => {
-                drop(result);
+                let error = interrupted_non_cancellation_error(result);
                 let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
-                progress.finish();
-                return ProductionCommandRunReport::interrupted_before_logging(shutdown);
+                let shutdown = finish_terminal_progress(progress, shutdown);
+                return match error {
+                    Some(error) => ProductionCommandRunReport::failed_before_logging_with_shutdown(
+                        error, shutdown,
+                    ),
+                    None => ProductionCommandRunReport::interrupted_before_logging(shutdown),
+                };
             }
             DrivenCommand::SignalFailed { source, result } => {
                 let outcome = match result {
@@ -2497,7 +2694,7 @@ impl ProductionRpgMakerCommandRunner {
                 };
                 let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
-                progress.finish();
+                let shutdown = finish_terminal_progress(progress, shutdown);
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                     ProductionCommandError::signal(source, outcome),
                     shutdown,
@@ -2563,7 +2760,7 @@ impl ProductionRpgMakerCommandRunner {
                 sqlite.cancel_waits();
             },
             || {
-                progress.safe_stopping(safe_stopping);
+                defer_terminal_progress_status(progress.safe_stopping(safe_stopping));
                 let (confirmed, total) = progress_observer.confirmed_amount();
                 project_log.emit_cancellation(
                     ProjectLogCode::CancellationRequested,
@@ -2578,10 +2775,11 @@ impl ProductionRpgMakerCommandRunner {
             let (confirmed, total) = progress_observer.confirmed_amount();
             project_log.emit_cancellation(ProjectLogCode::SafeStopFinished, confirmed, total);
         }
+        emit_write_back_manual_layout_diagnostics(&execution, &project_log);
         progress_observer.finish();
         let shutdown = roots.shutdown().await;
         drop(project_lease_guard);
-        progress.finish();
+        let shutdown = finish_terminal_progress(progress, shutdown);
         let log_outcome = project_log_outcome(&execution, &shutdown);
         let failure_diagnostics = project_log_failure_diagnostics(&execution, &shutdown);
         let pending_project_log =
@@ -2597,6 +2795,41 @@ impl ProductionRpgMakerCommandRunner {
             shutdown,
             Some(pending_project_log),
         )
+    }
+}
+
+fn emit_write_back_manual_layout_diagnostics(
+    execution: &DrivenCommand<Result<OperationCompletion<WriteBackOutput>, ProductionCommandError>>,
+    project_log: &ActiveProjectLog,
+) {
+    let output = match execution {
+        DrivenCommand::Finished(Ok(OperationCompletion::Completed(output)))
+        | DrivenCommand::Interrupted(Ok(OperationCompletion::Completed(output)))
+        | DrivenCommand::SignalFailed {
+            result: Ok(OperationCompletion::Completed(output)),
+            ..
+        } => output,
+        _ => return,
+    };
+    for diagnostic in output.manual_layout_diagnostics() {
+        let locations = diagnostic
+            .locations()
+            .iter()
+            .map(|location| ProjectLogManualLayoutLocation {
+                group_location: location.group_location().to_string(),
+                role: location.role_name(),
+            })
+            .collect();
+        project_log.logger.emit_reliable(ProjectLogEvent::new(
+            ProjectLogLevel::Warn,
+            ProjectLogCode::WriteBackManualLayoutRequired,
+            project_log.context.clone(),
+            ProjectLogPayload::ManualLayoutRequired {
+                locations,
+                region: diagnostic.region_name().to_owned(),
+                max_fullwidth_chars: u64::from(diagnostic.max_fullwidth_chars()),
+            },
+        ));
     }
 }
 
@@ -3311,6 +3544,8 @@ fn start_command_log_with_run_id(
     if let Some(profile) = profile {
         context = context.with_profile(profile);
     }
+    logger.set_context(context.clone());
+    install_immediate_project_log_warning_presenter(&logger, locale);
     let panic_diagnostic =
         command_panic_diagnostic(command, stage, &project_workspace, runtime.path());
     runtime.arm_unfinished_terminal(
@@ -3334,6 +3569,49 @@ fn start_command_log_with_run_id(
         context,
         performance,
     }
+}
+
+fn install_immediate_project_log_warning_presenter(logger: &ProjectLogger, locale: UiLocale) {
+    logger.install_warning_presenter(move |warning| {
+        let localizer = UiLocalizer::new(locale);
+        let mut stderr = io::stderr();
+        let result = (|| -> io::Result<()> {
+            if let Some(project_log) = &warning.project_log {
+                writeln!(stderr, "{}", localizer.format(UiMessage::NoticeLogDegraded))?;
+                if let Some(diagnostic) = &project_log.diagnostic {
+                    render_safe_diagnostic(diagnostic, &localizer, &mut stderr)?;
+                }
+                for diagnostic in &project_log.related_diagnostics {
+                    render_safe_diagnostic(diagnostic, &localizer, &mut stderr)?;
+                }
+            }
+            if let Some(task_records) = &warning.task_records {
+                writeln!(
+                    stderr,
+                    "{}",
+                    localizer.format(UiMessage::NoticeTaskRecordsDegraded)
+                )?;
+                if let Some(diagnostic) = &task_records.diagnostic {
+                    render_safe_diagnostic(diagnostic, &localizer, &mut stderr)?;
+                }
+                for diagnostic in &task_records.related_diagnostics {
+                    render_safe_diagnostic(diagnostic, &localizer, &mut stderr)?;
+                }
+            }
+            stderr.flush()
+        })();
+        result.map_err(|source| {
+            Box::new(SafeDiagnostic::io(
+                DiagnosticCode::StateFinalizationFailed,
+                DiagnosticStage::ProcessOutput,
+                DiagnosticSubject::operation("write_observability_warning"),
+                "write_stderr",
+                &source,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::Retry,
+            ))
+        })
+    });
 }
 
 fn start_project_log_with_run_id(
@@ -3429,10 +3707,11 @@ async fn observed_construction_failure(
     error: ProductionCommandError,
     shutdown: ShutdownFailures,
 ) -> ProductionCommandRunReport {
-    let outcome = if matches!(error, ProductionCommandError::OutcomeUnknown(_)) {
-        ProjectLogRunOutcome::OutcomeUnknown
-    } else {
-        ProjectLogRunOutcome::Failed
+    let outcome = match &error {
+        ProductionCommandError::OutcomeUnknown(_)
+        | ProductionCommandError::RunPlanOutcomeUnknown(_) => ProjectLogRunOutcome::OutcomeUnknown,
+        ProductionCommandError::RecoveryRequired(_) => ProjectLogRunOutcome::RecoveryRequired,
+        _ => ProjectLogRunOutcome::Failed,
     };
     let mut diagnostics = error
         .failure_report()
@@ -3901,7 +4180,7 @@ impl RpgMakerTranslationLog for ProductionBusinessLog {
     fn emit(&self, event: RpgMakerTranslationLogEvent) {
         match event {
             RpgMakerTranslationLogEvent::PlanningUnresolved { units } => {
-                self.logger.emit(ProjectLogEvent::new(
+                self.logger.emit_reliable(ProjectLogEvent::new(
                     ProjectLogLevel::Warn,
                     ProjectLogCode::PartialResult,
                     self.context.clone(),
@@ -3968,23 +4247,23 @@ impl RpgMakerTranslationLog for ProductionBusinessLog {
                 let attempt_count =
                     attempts.map(|value| u64::try_from(value.get()).unwrap_or(u64::MAX));
                 if retries > 0 {
-                    let _ = self.translation_retry_attempts.fetch_update(
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                        |current| Some(current.saturating_add(retries)),
-                    );
+                    self.translation_retry_attempts
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                            Some(current.saturating_add(retries))
+                        })
+                        .expect("重试计数更新闭包始终返回新值");
                     if retry_exhausted {
-                        let _ = self.translation_retry_exhausted.fetch_update(
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                            |current| Some(current.saturating_add(1)),
-                        );
+                        self.translation_retry_exhausted
+                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                                Some(current.saturating_add(1))
+                            })
+                            .expect("重试耗尽计数更新闭包始终返回新值");
                     } else {
-                        let _ = self.translation_retry_recovered.fetch_update(
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                            |current| Some(current.saturating_add(1)),
-                        );
+                        self.translation_retry_recovered
+                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                                Some(current.saturating_add(1))
+                            })
+                            .expect("重试恢复计数更新闭包始终返回新值");
                     }
                 }
                 let outcome = match outcome {
@@ -4004,7 +4283,7 @@ impl RpgMakerTranslationLog for ProductionBusinessLog {
                         crate::runtime::project_log::ProjectLogTaskOutcome::Failed
                     }
                 };
-                self.logger.emit(ProjectLogEvent::new(
+                let finished = ProjectLogEvent::new(
                     ProjectLogLevel::Debug,
                     ProjectLogCode::TaskFinished,
                     self.context.clone(),
@@ -4014,10 +4293,15 @@ impl RpgMakerTranslationLog for ProductionBusinessLog {
                         outcome: Some(outcome),
                         attempts: attempt_count,
                     },
-                ));
+                );
+                if outcome == crate::runtime::project_log::ProjectLogTaskOutcome::Complete {
+                    self.logger.emit(finished);
+                } else {
+                    self.logger.emit_reliable(finished);
+                }
                 if let Some(diagnostic) = diagnostic {
                     debug_assert!(attempt_count.is_some());
-                    self.logger.emit(ProjectLogEvent::new(
+                    self.logger.emit_reliable(ProjectLogEvent::new(
                         ProjectLogLevel::Warn,
                         ProjectLogCode::TaskDiagnostic,
                         self.context.clone(),
@@ -4050,7 +4334,7 @@ impl RpgMakerTranslationLog for ProductionBusinessLog {
 impl WriteBackLog for ProductionBusinessLog {
     fn emit(&self, event: WriteBackLogEvent) {
         match event {
-            WriteBackLogEvent::PublicationStarted { output_root } => {
+            WriteBackLogEvent::PublicationStarted { output_root: _ } => {
                 self.logger.emit(ProjectLogEvent::new(
                     ProjectLogLevel::Info,
                     ProjectLogCode::PublicationStarted,
@@ -4061,7 +4345,6 @@ impl WriteBackLog for ProductionBusinessLog {
                         published_items: None,
                     },
                 ));
-                let _ = output_root;
             }
             WriteBackLogEvent::PublicationFinished {
                 output_root: _,
@@ -5031,6 +5314,19 @@ async fn drive_with_signal<T>(
     }
 }
 
+fn interrupted_non_cancellation_error<T>(
+    result: Result<T, ProductionCommandError>,
+) -> Option<ProductionCommandError> {
+    match result {
+        Ok(value) => {
+            drop(value);
+            None
+        }
+        Err(error) if error.was_cancelled_wait() => None,
+        Err(error) => Some(error),
+    }
+}
+
 pub(crate) struct ProductionCommandRunReport {
     pub(crate) result: CommandRunResult,
     pub(crate) shutdown_error: Option<ShutdownFailures>,
@@ -5179,6 +5475,9 @@ fn map_init_error(
                 InitFailureClass::StateAppliedFinalizationFailed => {
                     ProductionCommandError::StateAppliedButFinalizationFailed(Box::new(report))
                 }
+                InitFailureClass::RecoveryRequired => {
+                    ProductionCommandError::RecoveryRequired(Box::new(report))
+                }
                 InitFailureClass::OutcomeUnknown => {
                     ProductionCommandError::OutcomeUnknown(Box::new(report))
                 }
@@ -5192,14 +5491,34 @@ fn init_workspace_failure_report(
     source: ProductionWorkspaceConvergenceError,
 ) -> (InitFailureClass, FailureReport) {
     match source {
+        ProjectWorkspaceConvergenceError::PreserveObservability { failure, discard } => {
+            let diagnostic = init_preserve_observability_diagnostic(&failure);
+            let mut report = ProductionCommandError::report_diagnostic(failure, diagnostic);
+            let class = if let Some(discard) = discard {
+                report = report.with_related_report(init_discard_failure_report(discard));
+                InitFailureClass::RecoveryRequired
+            } else {
+                InitFailureClass::ProjectState
+            };
+            (class, report)
+        }
         ProjectWorkspaceConvergenceError::CandidateFailure { failure, discard } => {
             let diagnostic = init_candidate_diagnostic(&failure);
             let mut report = ProductionCommandError::report_diagnostic(failure, diagnostic);
-            if let Some(discard) = discard {
-                report = report.with_related_report(init_candidate_discard_failure_report(discard));
-            }
-            (InitFailureClass::ProjectState, report)
+            let class = if let Some(discard) = discard {
+                report = report.with_related_report(init_discard_failure_report(discard));
+                InitFailureClass::RecoveryRequired
+            } else {
+                InitFailureClass::ProjectState
+            };
+            (class, report)
         }
+        ProjectWorkspaceConvergenceError::Prepare(source) => init_prepare_failure_report(source),
+        ProjectWorkspaceConvergenceError::Publish(source) => init_publish_failure_report(source),
+        ProjectWorkspaceConvergenceError::CancellationCleanup(source) => (
+            InitFailureClass::RecoveryRequired,
+            init_discard_failure_report(source),
+        ),
         source => {
             let (class, diagnostic) = init_workspace_diagnostic(&source);
             (
@@ -5210,7 +5529,223 @@ fn init_workspace_failure_report(
     }
 }
 
-fn init_candidate_discard_failure_report(
+fn init_prepare_failure_report(
+    source: DirectoryPrepareError<Box<SystemFileSystemError>>,
+) -> (InitFailureClass, FailureReport) {
+    let DirectoryPrepareError::NotPrepared {
+        target_root,
+        source,
+        cleanup_failure,
+    } = source;
+    let recovery_required = cleanup_failure.is_some();
+    let diagnostic = source
+        .safe_diagnostic(
+            DiagnosticStage::Init,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::CheckProjectState,
+        )
+        .with_recovery(RecoveryFact::path(&target_root));
+    let primary = DirectoryPrepareError::NotPrepared {
+        target_root,
+        source,
+        cleanup_failure: None,
+    };
+    let mut report = ProductionCommandError::report_diagnostic(primary, diagnostic);
+    if let Some(cleanup) = cleanup_failure {
+        report = report.with_related_report(init_staging_cleanup_failure_report(
+            cleanup,
+            DiagnosticStage::Init,
+        ));
+    }
+    (
+        if recovery_required {
+            InitFailureClass::RecoveryRequired
+        } else {
+            InitFailureClass::ProjectState
+        },
+        report,
+    )
+}
+
+fn init_publish_failure_report(
+    source: DirectoryPublishError<Box<SystemFileSystemError>>,
+) -> (InitFailureClass, FailureReport) {
+    macro_rules! report_with_optional_cleanup {
+        ($variant:ident, $target_root:expr, $cleanup_failure:expr, $diagnostic:expr) => {{
+            let target_root = $target_root;
+            let cleanup_failure = $cleanup_failure;
+            let recovery_required = cleanup_failure.is_some();
+            let diagnostic = $diagnostic;
+            let primary: DirectoryPublishError<Box<SystemFileSystemError>> =
+                DirectoryPublishError::$variant {
+                    target_root,
+                    cleanup_failure: None,
+                };
+            let mut report = ProductionCommandError::report_diagnostic(primary, diagnostic);
+            if let Some(cleanup) = cleanup_failure {
+                report = report.with_related_report(init_staging_cleanup_failure_report(
+                    cleanup,
+                    DiagnosticStage::Publication,
+                ));
+            }
+            (
+                if recovery_required {
+                    InitFailureClass::RecoveryRequired
+                } else {
+                    InitFailureClass::ProjectState
+                },
+                report,
+            )
+        }};
+        ($variant:ident, $target_root:expr, $source:expr, $cleanup_failure:expr, $diagnostic:expr) => {{
+            let target_root = $target_root;
+            let source = $source;
+            let cleanup_failure = $cleanup_failure;
+            let recovery_required = cleanup_failure.is_some();
+            let diagnostic = $diagnostic;
+            let primary: DirectoryPublishError<Box<SystemFileSystemError>> =
+                DirectoryPublishError::$variant {
+                    target_root,
+                    source,
+                    cleanup_failure: None,
+                };
+            let mut report = ProductionCommandError::report_diagnostic(primary, diagnostic);
+            if let Some(cleanup) = cleanup_failure {
+                report = report.with_related_report(init_staging_cleanup_failure_report(
+                    cleanup,
+                    DiagnosticStage::Publication,
+                ));
+            }
+            (
+                if recovery_required {
+                    InitFailureClass::RecoveryRequired
+                } else {
+                    InitFailureClass::ProjectState
+                },
+                report,
+            )
+        }};
+    }
+
+    match source {
+        DirectoryPublishError::TargetAlreadyExists {
+            target_root,
+            cleanup_failure,
+        } => {
+            let diagnostic = SafeDiagnostic::new(
+                DiagnosticCode::ProjectState,
+                DiagnosticStage::Publication,
+                DiagnosticSubject::path(&target_root),
+                DiagnosticReason::failure(DiagnosticFailureKind::TargetAlreadyExists),
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckProjectState,
+            );
+            report_with_optional_cleanup!(
+                TargetAlreadyExists,
+                target_root,
+                cleanup_failure,
+                diagnostic
+            )
+        }
+        DirectoryPublishError::TargetMissing {
+            target_root,
+            cleanup_failure,
+        } => {
+            let diagnostic = SafeDiagnostic::new(
+                DiagnosticCode::ProjectState,
+                DiagnosticStage::Publication,
+                DiagnosticSubject::path(&target_root),
+                DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckProjectState,
+            );
+            report_with_optional_cleanup!(TargetMissing, target_root, cleanup_failure, diagnostic)
+        }
+        DirectoryPublishError::TargetNotDirectory {
+            target_root,
+            cleanup_failure,
+        } => {
+            let diagnostic = SafeDiagnostic::new(
+                DiagnosticCode::ProjectState,
+                DiagnosticStage::Publication,
+                DiagnosticSubject::path(&target_root),
+                DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckProjectState,
+            );
+            report_with_optional_cleanup!(
+                TargetNotDirectory,
+                target_root,
+                cleanup_failure,
+                diagnostic
+            )
+        }
+        DirectoryPublishError::NotAttempted {
+            target_root,
+            source,
+            cleanup_failure,
+        } => {
+            let diagnostic = source
+                .safe_diagnostic(
+                    DiagnosticStage::Publication,
+                    DiagnosticImpact::Unchanged,
+                    DiagnosticAction::CheckProjectState,
+                )
+                .with_recovery(RecoveryFact::path(&target_root));
+            report_with_optional_cleanup!(
+                NotAttempted,
+                target_root,
+                source,
+                cleanup_failure,
+                diagnostic
+            )
+        }
+        DirectoryPublishError::NotPublished {
+            target_root,
+            source,
+            cleanup_failure,
+        } => {
+            let diagnostic = source
+                .safe_diagnostic(
+                    DiagnosticStage::Publication,
+                    DiagnosticImpact::Unchanged,
+                    DiagnosticAction::CheckProjectState,
+                )
+                .with_recovery(RecoveryFact::path(&target_root));
+            report_with_optional_cleanup!(
+                NotPublished,
+                target_root,
+                source,
+                cleanup_failure,
+                diagnostic
+            )
+        }
+        source => {
+            let (class, diagnostic) = init_publish_diagnostic(&source);
+            (
+                class,
+                ProductionCommandError::report_diagnostic(source, diagnostic),
+            )
+        }
+    }
+}
+
+fn init_staging_cleanup_failure_report(
+    cleanup: StagingCleanupFailure<Box<SystemFileSystemError>>,
+    stage: DiagnosticStage,
+) -> FailureReport {
+    let (residual_path, source) = cleanup.into_parts();
+    (*source)
+        .into_failure_report(
+            stage,
+            DiagnosticImpact::RecoveryRequired,
+            DiagnosticAction::PreserveRecoveryArtifacts,
+        )
+        .with_primary_recovery(RecoveryFact::path(residual_path))
+        .with_primary_recovery(RecoveryFact::component("candidate_cleanup=failed"))
+}
+
+fn init_discard_failure_report(
     source: DirectoryDiscardError<Box<SystemFileSystemError>>,
 ) -> FailureReport {
     let (staging_root, source) = source.into_parts();
@@ -5231,6 +5766,7 @@ enum InitFailureClass {
     ConfigurationOrInput,
     ProjectState,
     StateAppliedFinalizationFailed,
+    RecoveryRequired,
     OutcomeUnknown,
     Internal,
 }
@@ -5955,7 +6491,7 @@ fn init_publish_diagnostic(
             recovery_artifacts,
             source,
         } => (
-            Class::OutcomeUnknown,
+            Class::RecoveryRequired,
             with_recovery_paths(
                 source
                     .safe_diagnostic(
@@ -6092,8 +6628,21 @@ where
         }
         ExtractServiceError::Rules {
             rules_path: _,
+            completed_owners,
             source,
-        } => map_project_failure_report(source.into_extract_failure_report()),
+        } => {
+            let mut report = source.into_extract_failure_report();
+            if !completed_owners.is_empty() {
+                report = report.with_primary_impact(DiagnosticImpact::ProgressPreserved);
+                for owner in completed_owners {
+                    report = report.with_primary_recovery(RecoveryFact::component(format!(
+                        "completed_owner={}",
+                        owner.storage_name()
+                    )));
+                }
+            }
+            map_project_failure_report(report)
+        }
     }
 }
 
@@ -6277,23 +6826,18 @@ fn map_project_diagnostic(
 fn map_project_failure_report(report: FailureReport) -> ProductionCommandError {
     let impact = report.primary.public().impact;
     let action = report.primary.public().action;
-    let related_outcome_unknown = report
-        .related
-        .iter()
-        .any(|failure| failure.public().impact == DiagnosticImpact::OutcomeUnknown);
-    let related_recovery_required = report.related.iter().any(|failure| {
-        matches!(
-            failure.public().impact,
-            DiagnosticImpact::StateAppliedFinalizationFailed | DiagnosticImpact::RecoveryRequired
-        )
-    });
-    if impact == DiagnosticImpact::OutcomeUnknown || related_outcome_unknown {
+    let has_impact = |expected| {
+        impact == expected
+            || report
+                .related
+                .iter()
+                .any(|failure| failure.public().impact == expected)
+    };
+    if has_impact(DiagnosticImpact::OutcomeUnknown) {
         ProductionCommandError::OutcomeUnknown(Box::new(report))
-    } else if matches!(
-        impact,
-        DiagnosticImpact::StateAppliedFinalizationFailed | DiagnosticImpact::RecoveryRequired
-    ) || related_recovery_required
-    {
+    } else if has_impact(DiagnosticImpact::RecoveryRequired) {
+        ProductionCommandError::RecoveryRequired(Box::new(report))
+    } else if has_impact(DiagnosticImpact::StateAppliedFinalizationFailed) {
         ProductionCommandError::StateAppliedButFinalizationFailed(Box::new(report))
     } else if action == DiagnosticAction::ReportBug {
         ProductionCommandError::Internal(Box::new(report))
@@ -6416,11 +6960,10 @@ where
             ProductionCommandError::ProjectState(Box::new(report))
         }
         WriteBackServiceError::ValidateCandidateAndDiscard {
-            candidate_root,
+            candidate_root: _,
             source,
             discard,
         } => {
-            let _ = candidate_root;
             let report = source.into_write_back_failure_report(
                 DiagnosticStage::WriteBack,
                 DiagnosticImpact::Unchanged,
@@ -6444,14 +6987,13 @@ where
                 ),
                 WriteBackPublishFailureState::RecoveryRequired { .. } => (
                     DiagnosticImpact::RecoveryRequired,
-                    WriteBackReportVariant::OutcomeUnknown,
+                    WriteBackReportVariant::RecoveryRequired,
                 ),
                 WriteBackPublishFailureState::OutcomeUnknown { .. } => (
                     DiagnosticImpact::OutcomeUnknown,
                     WriteBackReportVariant::OutcomeUnknown,
                 ),
             };
-            let _ = state;
             let report =
                 source.into_write_back_failure_report(DiagnosticStage::Publication, impact);
             match variant {
@@ -6460,6 +7002,9 @@ where
                 }
                 WriteBackReportVariant::StateAppliedFinalizationFailed => {
                     ProductionCommandError::StateAppliedButFinalizationFailed(Box::new(report))
+                }
+                WriteBackReportVariant::RecoveryRequired => {
+                    ProductionCommandError::RecoveryRequired(Box::new(report))
                 }
                 WriteBackReportVariant::OutcomeUnknown => {
                     ProductionCommandError::OutcomeUnknown(Box::new(report))
@@ -6478,6 +7023,7 @@ fn append_related_report(mut primary: FailureReport, related: FailureReport) -> 
 enum WriteBackReportVariant {
     ProjectState,
     StateAppliedFinalizationFailed,
+    RecoveryRequired,
     OutcomeUnknown,
 }
 
@@ -6624,6 +7170,10 @@ fn project_log_outcome<T>(
         {
             ProjectLogRunOutcome::Cancelled
         }
+        DrivenCommand::Finished(Err(ProductionCommandError::RecoveryRequired(_)))
+        | DrivenCommand::Interrupted(Err(ProductionCommandError::RecoveryRequired(_))) => {
+            ProjectLogRunOutcome::RecoveryRequired
+        }
         DrivenCommand::Finished(Err(
             ProductionCommandError::OutcomeUnknown(_)
             | ProductionCommandError::RunPlanOutcomeUnknown(_),
@@ -6635,6 +7185,10 @@ fn project_log_outcome<T>(
         DrivenCommand::Finished(Err(_)) | DrivenCommand::Interrupted(Err(_)) => {
             ProjectLogRunOutcome::Failed
         }
+        DrivenCommand::SignalFailed {
+            result: Err(ProductionCommandError::RecoveryRequired(_)),
+            ..
+        } => ProjectLogRunOutcome::RecoveryRequired,
         DrivenCommand::SignalFailed {
             result:
                 Err(
@@ -6656,6 +7210,7 @@ pub(crate) enum ProductionCommandError {
     ResultAppliedButRunPlanNotSaved(Box<FailureReport>),
     RunPlanOutcomeUnknown(Box<FailureReport>),
     StateAppliedButFinalizationFailed(Box<FailureReport>),
+    RecoveryRequired(Box<FailureReport>),
     OutcomeUnknown(Box<FailureReport>),
     Internal(Box<FailureReport>),
     Signal(Box<FailureReport>),
@@ -6723,6 +7278,7 @@ impl ProductionCommandError {
             | Self::ResultAppliedButRunPlanNotSaved(report)
             | Self::RunPlanOutcomeUnknown(report)
             | Self::StateAppliedButFinalizationFailed(report)
+            | Self::RecoveryRequired(report)
             | Self::OutcomeUnknown(report)
             | Self::Internal(report)
             | Self::Signal(report) => *report,
@@ -6737,9 +7293,15 @@ impl ProductionCommandError {
         let related_outcome_unknown = related
             .public_diagnostics()
             .any(|diagnostic| diagnostic.impact == DiagnosticImpact::OutcomeUnknown);
+        let primary_recovery_required = matches!(&self, Self::RecoveryRequired(_));
+        let related_recovery_required = related
+            .public_diagnostics()
+            .any(|diagnostic| diagnostic.impact == DiagnosticImpact::RecoveryRequired);
         let report = self.into_failure_report().with_related_report(related);
         if primary_outcome_unknown || related_outcome_unknown {
             Self::OutcomeUnknown(Box::new(report))
+        } else if primary_recovery_required || related_recovery_required {
+            Self::RecoveryRequired(Box::new(report))
         } else {
             Self::StateAppliedButFinalizationFailed(Box::new(report))
         }
@@ -7415,6 +7977,7 @@ impl ProductionCommandError {
             | Self::ResultAppliedButRunPlanNotSaved(report)
             | Self::RunPlanOutcomeUnknown(report)
             | Self::StateAppliedButFinalizationFailed(report)
+            | Self::RecoveryRequired(report)
             | Self::OutcomeUnknown(report)
             | Self::Internal(report)
             | Self::Signal(report) => report.as_ref(),
@@ -7833,24 +8396,51 @@ impl CommandResultRenderer {
         localizer: &UiLocalizer,
         stderr: &mut dyn Write,
     ) -> io::Result<()> {
-        let RpgMakerCommandOutput::Extract { output, .. } = output else {
-            return Ok(());
-        };
-        for warning in &output.rules_warnings {
-            let source_file = sanitize_user_text(&warning.source_file);
-            let command_code = warning.command_code.to_string();
-            writeln!(
-                stderr,
-                "{}",
-                localizer.format(UiMessage::WarningRulesCommandNonStringSkipped {
-                    rule_number: u64::try_from(warning.rule_number).unwrap_or(u64::MAX),
-                    source_file: &source_file,
-                    command_code: &command_code,
-                    parameter: u64::try_from(warning.parameter).unwrap_or(u64::MAX),
-                    actual_type: warning.actual_type.as_str(),
-                    skipped_count: warning.skipped_count,
-                })
-            )?;
+        match output {
+            RpgMakerCommandOutput::Extract { output, .. } => {
+                for warning in &output.rules_warnings {
+                    let source_file = sanitize_user_text(&warning.source_file);
+                    let command_code = warning.command_code.to_string();
+                    writeln!(
+                        stderr,
+                        "{}",
+                        localizer.format(UiMessage::WarningRulesCommandNonStringSkipped {
+                            rule_number: u64::try_from(warning.rule_number).unwrap_or(u64::MAX),
+                            source_file: &source_file,
+                            command_code: &command_code,
+                            parameter: u64::try_from(warning.parameter).unwrap_or(u64::MAX),
+                            actual_type: warning.actual_type.as_str(),
+                            skipped_count: warning.skipped_count,
+                        })
+                    )?;
+                }
+            }
+            RpgMakerCommandOutput::WriteBack { output } => {
+                for diagnostic in output.manual_layout_diagnostics() {
+                    let locations = diagnostic
+                        .locations()
+                        .iter()
+                        .map(|location| {
+                            format!(
+                                "{} ({})",
+                                sanitize_user_text(&location.group_location().to_string()),
+                                location.role_name()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    writeln!(
+                        stderr,
+                        "{}",
+                        localizer.format(UiMessage::WarningManualLayoutRequired {
+                            locations: &locations,
+                            region: diagnostic.region_name(),
+                            max_fullwidth_chars: u64::from(diagnostic.max_fullwidth_chars()),
+                        })
+                    )?;
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -7936,4 +8526,232 @@ fn plan_source_message(source: ProjectLogValueSource) -> UiMessage<'static> {
         ProjectLogValueSource::ProductDefault => "product_default",
     })
     .expect("每个运行方案来源代码都必须具有本地化日志标签")
+}
+
+#[cfg(test)]
+mod command_result_renderer_tests {
+    use std::fmt;
+
+    use super::*;
+    use crate::project_name::ProjectName;
+    use crate::rpg_maker::MaxFullwidthChars;
+    use crate::rpg_maker::model::{LogicalTextLocation, TextUnitRole};
+    use crate::rpg_maker::text::{RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource};
+    use crate::rpg_maker::write_back::RpgMakerWriteBackSummary;
+    use crate::rpg_maker::write_back::planner::{
+        ManualLayoutDiagnostic, RpgMakerWriteBackLayoutRegion,
+    };
+
+    #[derive(Debug)]
+    struct TestFailure;
+
+    impl fmt::Display for TestFailure {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("测试失败")
+        }
+    }
+
+    impl Error for TestFailure {}
+
+    fn test_report(impact: DiagnosticImpact) -> FailureReport {
+        ProductionCommandError::report_diagnostic(
+            TestFailure,
+            SafeDiagnostic::new(
+                DiagnosticCode::ProjectState,
+                DiagnosticStage::Publication,
+                DiagnosticSubject::operation("test_failure"),
+                DiagnosticReason::failure(DiagnosticFailureKind::FinalizationFailed),
+                impact,
+                DiagnosticAction::PreserveRecoveryArtifacts,
+            ),
+        )
+    }
+
+    #[test]
+    fn recovery_required_is_not_collapsed_into_state_applied_finalization_failure() {
+        let report = test_report(DiagnosticImpact::Unchanged)
+            .with_related_report(test_report(DiagnosticImpact::RecoveryRequired));
+        let error = map_project_failure_report(report);
+        assert!(matches!(error, ProductionCommandError::RecoveryRequired(_)));
+
+        let execution: DrivenCommand<Result<OperationCompletion<()>, ProductionCommandError>> =
+            DrivenCommand::Finished(Err(error));
+        assert_eq!(
+            project_log_outcome(&execution, &ShutdownFailures::default()),
+            ProjectLogRunOutcome::RecoveryRequired
+        );
+    }
+
+    #[test]
+    fn outcome_unknown_has_priority_over_recovery_required() {
+        let report = test_report(DiagnosticImpact::RecoveryRequired)
+            .with_related_report(test_report(DiagnosticImpact::OutcomeUnknown));
+        assert!(matches!(
+            map_project_failure_report(report),
+            ProductionCommandError::OutcomeUnknown(_)
+        ));
+    }
+
+    fn assert_init_recovery_required(error: ProductionWorkspaceConvergenceError) {
+        let mapped = map_init_error(InitServiceError::Workspace(error));
+        let ProductionCommandError::RecoveryRequired(report) = mapped else {
+            panic!("Init 清理失败必须映射为 RecoveryRequired");
+        };
+        let diagnostics = report.public_diagnostics().collect::<Vec<_>>();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.impact == DiagnosticImpact::RecoveryRequired)
+        );
+    }
+
+    #[test]
+    fn init_cancellation_cleanup_failure_requires_recovery() {
+        assert_init_recovery_required(ProjectWorkspaceConvergenceError::CancellationCleanup(
+            DirectoryDiscardError::new(
+                PathBuf::from("C:/project/.init-candidate"),
+                Box::new(SystemFileSystemError::Closed),
+            ),
+        ));
+    }
+
+    #[test]
+    fn init_prepare_cleanup_failure_preserves_related_recovery_diagnostic() {
+        assert_init_recovery_required(ProjectWorkspaceConvergenceError::Prepare(
+            DirectoryPrepareError::NotPrepared {
+                target_root: PathBuf::from("C:/project/workspace"),
+                source: Box::new(SystemFileSystemError::Closed),
+                cleanup_failure: Some(StagingCleanupFailure::new(
+                    PathBuf::from("C:/project/.prepare-residual"),
+                    Box::new(SystemFileSystemError::Closed),
+                )),
+            },
+        ));
+    }
+
+    #[test]
+    fn init_publish_cleanup_failure_preserves_publication_recovery_diagnostic() {
+        let mapped = map_init_error(InitServiceError::Workspace(
+            ProjectWorkspaceConvergenceError::Publish(DirectoryPublishError::NotPublished {
+                target_root: PathBuf::from("C:/project/workspace"),
+                source: Box::new(SystemFileSystemError::Closed),
+                cleanup_failure: Some(StagingCleanupFailure::new(
+                    PathBuf::from("C:/project/.publish-residual"),
+                    Box::new(SystemFileSystemError::Closed),
+                )),
+            }),
+        ));
+        let ProductionCommandError::RecoveryRequired(report) = mapped else {
+            panic!("Init 发布清理失败必须映射为 RecoveryRequired");
+        };
+        assert!(report.public_diagnostics().any(|diagnostic| {
+            diagnostic.stage == DiagnosticStage::Publication
+                && diagnostic.impact == DiagnosticImpact::RecoveryRequired
+        }));
+    }
+
+    #[test]
+    fn write_back_manual_layout_warning_contains_precise_location_role_region_and_width() {
+        let location = LogicalTextLocation::new(
+            RpgMakerLocation::value(
+                RpgMakerSource::map(7),
+                vec![
+                    RpgMakerLocationStep::key("events"),
+                    RpgMakerLocationStep::index(3),
+                ],
+            ),
+            TextUnitRole::DialogueBody,
+        );
+        let output = RpgMakerCommandOutput::WriteBack {
+            output: WriteBackOutput::for_test(
+                "manual-layout"
+                    .parse::<ProjectName>()
+                    .expect("项目名应有效"),
+                PathBuf::from("C:/project/write_back"),
+                RpgMakerWriteBackSummary {
+                    manual_layout_units: 1,
+                    ..RpgMakerWriteBackSummary::default()
+                },
+                vec![ManualLayoutDiagnostic::for_test(
+                    vec![location],
+                    RpgMakerWriteBackLayoutRegion::DialogueBody,
+                    MaxFullwidthChars::new(28).expect("宽度应有效"),
+                )],
+            ),
+        };
+        let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        CommandResultRenderer::render_success(&output, &localizer, &mut stdout)
+            .expect("成功摘要应可写入");
+        CommandResultRenderer::render_success_warnings(&output, &localizer, &mut stderr)
+            .expect("人工布局警告应可写入");
+
+        let stdout = String::from_utf8(stdout).expect("stdout 应为 UTF-8");
+        let stderr = String::from_utf8(stderr).expect("stderr 应为 UTF-8");
+        assert!(!stdout.contains("Map007"), "精确位置只应进入警告");
+        assert!(stderr.contains("data/Map007.json"), "{stderr}");
+        assert!(stderr.contains("dialogue_body"), "{stderr}");
+        assert!(stderr.contains("28"), "{stderr}");
+    }
+
+    #[test]
+    fn write_back_output_is_connected_to_the_same_run_project_log() {
+        let temporary = tempfile::tempdir().expect("临时日志目录应可建立");
+        let run_id = "550e8400-e29b-41d4-a716-446655440097";
+        let runtime = start_project_log(temporary.path().to_path_buf(), run_id.to_owned());
+        let log_path = runtime.path().expect("项目日志应有路径").to_path_buf();
+        let logger = runtime.logger();
+        let context = ProjectLogContext::new("zh-Hans")
+            .with_engine("mz")
+            .with_project("manual-layout")
+            .with_command("write-back");
+        logger.set_context(context.clone());
+        let active = ActiveProjectLog {
+            run_id: Some(run_id.to_owned()),
+            runtime,
+            logger,
+            context,
+            performance: Arc::new(RunPerformanceCounters::default()),
+        };
+        let output = WriteBackOutput::for_test(
+            "manual-layout"
+                .parse::<ProjectName>()
+                .expect("项目名应有效"),
+            PathBuf::from("C:/project/write_back"),
+            RpgMakerWriteBackSummary {
+                manual_layout_units: 1,
+                ..RpgMakerWriteBackSummary::default()
+            },
+            vec![ManualLayoutDiagnostic::for_test(
+                vec![LogicalTextLocation::new(
+                    RpgMakerLocation::value(
+                        RpgMakerSource::map(7),
+                        vec![RpgMakerLocationStep::key("events")],
+                    ),
+                    TextUnitRole::DialogueBody,
+                )],
+                RpgMakerWriteBackLayoutRegion::DialogueBody,
+                MaxFullwidthChars::new(28).expect("宽度应有效"),
+            )],
+        );
+        let execution = DrivenCommand::Finished(Ok(OperationCompletion::Completed(output)));
+
+        emit_write_back_manual_layout_diagnostics(&execution, &active);
+        assert!(finish_project_log(active, ProjectLogRunOutcome::Succeeded, Vec::new()).is_none());
+
+        let records = std::fs::read_to_string(log_path).expect("项目日志应可读取");
+        let diagnostic = records
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("日志行应有效"))
+            .find(|record| record["code"] == "write_back.manual_layout_required")
+            .expect("WriteBackOutput 的人工布局诊断必须接入项目日志");
+        assert_eq!(diagnostic["run_id"], run_id);
+        assert_eq!(
+            diagnostic["payload"]["locations"][0]["role"],
+            "dialogue_body"
+        );
+        assert_eq!(diagnostic["payload"]["max_fullwidth_chars"], 28);
+    }
 }

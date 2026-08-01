@@ -24,6 +24,8 @@ const MV_BODY_TRANSLATION: &str = "你好，世界！";
 const RULES_SHORT_SOURCE: &str = "ポーション";
 const RULES_SHORT_TRANSLATION: &str = "治疗药水";
 const RULES_LONG_SOURCE: &str = "高級ポーション";
+const THINKING_PROMPT: &str = "Explain the checks inside the required why envelope.";
+const THINKING_SENTINEL: &str = "PRIVATE_THINKING_SENTINEL";
 
 #[test]
 fn help_exposes_mv_mz_and_generic_as_independent_command_domains() {
@@ -204,13 +206,11 @@ fn same_named_mv_mz_and_generic_projects_remain_isolated_across_real_processes()
     );
 
     let server = thread::spawn(move || serve_one_translation(listener));
-    assert_success(
-        "MZ Translate",
-        &run_att(
-            root,
-            arguments(&["mz", "translate", "--name", PROJECT, "local"]),
-        ),
+    let translate = run_att(
+        root,
+        arguments(&["mz", "translate", "--name", PROJECT, "local"]),
     );
+    assert_success("MZ Translate", &translate);
     let request = server
         .join()
         .expect("本地模型服务线程不得 panic")
@@ -225,6 +225,32 @@ fn same_named_mv_mz_and_generic_projects_remain_isolated_across_real_processes()
             .as_str()
             .is_some_and(|content| content.contains(SOURCE_TEXT)),
         "模型 user message 必须包含待译原文"
+    );
+    assert!(
+        messages[0]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains(THINKING_PROMPT)),
+        "正式成功路径必须加载 Thinking Prompt"
+    );
+    let task_record = read_single_task_record_sharing_log_run_id(&mz_workspace);
+    assert!(task_record.contains("# 翻译任务 000001 · 完成"));
+    assert!(task_record.contains("## Thinking"));
+    assert!(task_record.contains(THINKING_SENTINEL));
+    assert!(task_record.contains("## Assistant"));
+    assert!(task_record.contains("## 最终结果"));
+    assert!(
+        !String::from_utf8_lossy(&translate.stdout).contains(THINKING_SENTINEL)
+            && !String::from_utf8_lossy(&translate.stderr).contains(THINKING_SENTINEL),
+        "Thinking 正文不得进入终端输出"
+    );
+    assert_workspace_does_not_contain(&mz_workspace.join("logs"), THINKING_SENTINEL);
+    assert!(
+        find_subslice(
+            &fs::read(mz_workspace.join("project.db")).expect("项目数据库应可读取"),
+            THINKING_SENTINEL.as_bytes(),
+        )
+        .is_none(),
+        "Thinking 正文不得进入权威数据库"
     );
 
     assert_success(
@@ -258,6 +284,85 @@ fn same_named_mv_mz_and_generic_projects_remain_isolated_across_real_processes()
         original_mz[1]["description"], SOURCE_TEXT,
         "WriteBack 不得修改外部游戏目录"
     );
+}
+
+#[test]
+fn task_record_write_failure_warns_once_without_changing_translate_success() {
+    let temporary = tempfile::tempdir().expect("应可建立任务记录降级测试目录");
+    let root = temporary.path();
+    let game = root.join("mz-game");
+    write_minimal_mz_game(&game);
+    write_rpg_maker_prompt(root);
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("本地模型服务端口应可绑定");
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().expect("本地模型地址应可读取")
+    );
+    write_configuration(root, &endpoint);
+    assert_success(
+        "任务记录降级 Init",
+        &run_att(root, init_arguments("mz", &game)),
+    );
+    assert_success(
+        "任务记录降级 Extract",
+        &run_att(
+            root,
+            arguments(&["mz", "extract", "--name", PROJECT, "--builtin"]),
+        ),
+    );
+
+    let workspace = distribution_root(root).join("projects/mz").join(PROJECT);
+    fs::write(workspace.join("task-records"), b"not-a-directory")
+        .expect("普通文件应可稳定触发任务记录写入失败");
+    let server = thread::spawn(move || serve_one_translation(listener));
+    let translate = run_att(
+        root,
+        arguments(&["mz", "translate", "--name", PROJECT, "local"]),
+    );
+    assert_success("任务记录降级 Translate", &translate);
+    server
+        .join()
+        .expect("本地模型服务线程不得 panic")
+        .expect("本地模型服务必须完成一次请求");
+    assert_eq!(
+        read_owner_units(&workspace.join("project.db"), "builtin"),
+        vec![(json!(SOURCE_TEXT), Some(json!(TRANSLATION)))],
+        "任务记录写入失败不得回滚已确认译文"
+    );
+    let stderr = String::from_utf8(translate.stderr).expect("stderr 必须是 UTF-8");
+    assert_eq!(
+        stderr.matches("翻译任务记录不可用或已降级").count(),
+        1,
+        "任务记录故障必须恰好警告一次：{stderr}"
+    );
+    assert!(
+        stderr.contains("task-records"),
+        "任务记录警告必须包含失败路径：{stderr}"
+    );
+    let task_record_failures = fs::read_dir(workspace.join("logs"))
+        .expect("项目日志目录应存在")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("项目日志目录应可读取")
+        .into_iter()
+        .flat_map(|entry| {
+            fs::read_to_string(entry.path())
+                .expect("项目日志应可读取")
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).expect("日志行应为 JSON"))
+                .collect::<Vec<_>>()
+        })
+        .filter(|record| record["code"] == "observability.task_record_failed")
+        .collect::<Vec<_>>();
+    assert!(
+        !task_record_failures.is_empty(),
+        "任务记录故障必须写入 Translate 的同 RunId JSONL"
+    );
+    assert!(task_record_failures.iter().all(|record| {
+        record["command"] == "translate"
+            && record["level"] == "warn"
+            && record["payload"]["diagnostic"]["stage"] == "logging"
+    }));
 }
 
 #[test]
@@ -615,6 +720,12 @@ fn generic_reextract_preserves_moves_and_rejects_unextracted_changes() {
             .is_some_and(|content| content.contains("こんにちは")),
         "Generic user message 必须包含待译 Group"
     );
+    let workspace = distribution_root(root)
+        .join("projects/generic")
+        .join(PROJECT);
+    let task_record = read_single_task_record_sharing_log_run_id(&workspace);
+    assert!(task_record.contains("# 翻译任务 000001 · 完成"));
+    assert!(task_record.contains(THINKING_SENTINEL));
     assert_success(
         "Generic WriteBack",
         &run_att(
@@ -623,9 +734,6 @@ fn generic_reextract_preserves_moves_and_rejects_unextracted_changes() {
         ),
     );
 
-    let workspace = distribution_root(root)
-        .join("projects/generic")
-        .join(PROJECT);
     let first_output = workspace.join("write_back/story.jsonl");
     assert_eq!(
         read_generic_texts(&first_output),
@@ -983,7 +1091,7 @@ fn write_configuration(root: &Path, endpoint: &str) {
     let configuration = format!(
         r#"[prompts]
 locale = "zh-Hans"
-thinking_output = false
+thinking_output = true
 
 [llm.clients.primary]
 url = "{endpoint}"
@@ -1009,7 +1117,6 @@ allowed_terms = []
 quote_repair_pairs = [["“", "”"], ["‘", "’"]]
 
 [translation]
-record_translation_tasks = false
 
 [[translation.profiles]]
 id = "local"
@@ -1030,6 +1137,7 @@ fn write_rpg_maker_prompt(root: &Path) {
         "Translate {{source_language}} into {{target_language}}. Return the required JSON object.",
     )
     .expect("system Prompt 应可写入");
+    fs::write(prompt_root.join("thinking.md"), THINKING_PROMPT).expect("Thinking Prompt 应可写入");
 }
 
 fn write_mv_dialogue_rules(root: &Path) {
@@ -1056,6 +1164,56 @@ fn write_generic_prompt(root: &Path) {
         "Translate {{source_language}} into {{target_language}}. Return string values.",
     )
     .expect("Generic system Prompt 应可写入");
+    fs::write(prompt_root.join("thinking.md"), THINKING_PROMPT)
+        .expect("Generic Thinking Prompt 应可写入");
+}
+
+fn read_single_task_record_sharing_log_run_id(workspace: &Path) -> String {
+    let task_records_root = workspace.join("task-records");
+    let run_directories = fs::read_dir(&task_records_root)
+        .expect("任务记录根应存在")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("任务记录运行目录应可读取");
+    assert_eq!(run_directories.len(), 1, "测试项目应只有一个任务记录运行");
+    let run_directory = &run_directories[0];
+    let run_id = run_directory.file_name();
+    let log_path = workspace
+        .join("logs")
+        .join(Path::new(&run_id).with_extension("jsonl"));
+    assert!(
+        log_path.is_file(),
+        "任务记录目录名必须与 Translate 项目日志 RunId 相同：{}",
+        log_path.display()
+    );
+    let log = fs::read_to_string(&log_path).expect("Translate 项目日志应可读取");
+    assert!(
+        log.lines().any(|line| {
+            serde_json::from_str::<Value>(line).is_ok_and(|record| record["command"] == "translate")
+        }),
+        "同 RunId 项目日志必须属于 Translate"
+    );
+    let task_files = fs::read_dir(run_directory.path())
+        .expect("任务记录运行目录应可读取")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("任务记录文件应可读取");
+    assert_eq!(task_files.len(), 1, "一个 TaskBlock 只能生成一份任务记录");
+    assert_eq!(task_files[0].file_name(), OsString::from("task-000001.md"));
+    fs::read_to_string(task_files[0].path()).expect("任务记录 Markdown 应可读取")
+}
+
+fn assert_workspace_does_not_contain(root: &Path, sentinel: &str) {
+    for entry in fs::read_dir(root)
+        .expect("工作区诊断目录应可读取")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("工作区诊断文件应可读取")
+    {
+        let content = fs::read(entry.path()).expect("工作区诊断文件应可读取");
+        assert!(
+            find_subslice(&content, sentinel.as_bytes()).is_none(),
+            "{} 不得包含 Thinking 正文",
+            entry.path().display()
+        );
+    }
 }
 
 fn write_generic_group(path: &Path, text: &str, alternate_order: bool) {
@@ -1267,7 +1425,8 @@ fn serve_one_generic_translation(
 
 fn serve_one_response(listener: TcpListener, model_output: Value) -> Result<Value, String> {
     let (mut stream, request) = accept_request(listener)?;
-    let content = serde_json::to_string(&model_output).map_err(|error| error.to_string())?;
+    let assistant_json = serde_json::to_string(&model_output).map_err(|error| error.to_string())?;
+    let content = format!("<why>{THINKING_SENTINEL}</why>\n{assistant_json}");
     write_chat_response(&mut stream, &content)?;
     Ok(request)
 }

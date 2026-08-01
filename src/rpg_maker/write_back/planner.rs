@@ -895,6 +895,16 @@ pub(crate) enum RpgMakerWriteBackLayoutRegion {
     HelpDescription,
 }
 
+impl RpgMakerWriteBackLayoutRegion {
+    pub(crate) const fn diagnostic_name(self) -> &'static str {
+        match self {
+            Self::DialogueBody => "dialogue_body",
+            Self::ScrollingText => "scrolling_text",
+            Self::HelpDescription => "help_description",
+        }
+    }
+}
+
 /// 共享布局内核中的一个原文/当前文本对。
 ///
 /// `replacement == None` 表示该项仍使用冻结原文：它参与跨项括号与缩进状态观察，
@@ -1850,7 +1860,7 @@ impl ManualLayoutDiagnostic {
         region: RpgMakerWriteBackLayoutRegion,
         max_fullwidth_chars: MaxFullwidthChars,
     ) -> Self {
-        debug_assert!(
+        assert!(
             !locations.is_empty(),
             "人工布局诊断必须关联至少一个逻辑单元"
         );
@@ -1862,8 +1872,24 @@ impl ManualLayoutDiagnostic {
     }
 
     #[cfg(test)]
+    pub(crate) fn for_test(
+        locations: Vec<LogicalTextLocation>,
+        region: RpgMakerWriteBackLayoutRegion,
+        max_fullwidth_chars: MaxFullwidthChars,
+    ) -> Self {
+        Self::new(locations, region, max_fullwidth_chars)
+    }
+
     pub(crate) fn locations(&self) -> &[LogicalTextLocation] {
         &self.locations
+    }
+
+    pub(crate) const fn region_name(&self) -> &'static str {
+        self.region.diagnostic_name()
+    }
+
+    pub(crate) fn max_fullwidth_chars(&self) -> u32 {
+        self.max_fullwidth_chars.get()
     }
 }
 

@@ -141,9 +141,6 @@ where
         let OperationCompletion::Completed(report) = report else {
             return Ok(OperationCompletion::Cancelled);
         };
-        if self.cancellation.is_requested() {
-            return Ok(OperationCompletion::Cancelled);
-        }
 
         Ok(OperationCompletion::Completed(TranslateOutput {
             name,
@@ -228,11 +225,15 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     use crate::project_lease::{ProjectCommandLease, ProjectCommandLeaseProvider};
     use crate::rpg_maker::project::test_layout_profile;
     use crate::rpg_maker::translate::pipeline::RpgMakerTranslationRunReport;
+    use crate::rpg_maker::translate::profile::RpgMakerTranslationPlanningConfiguration;
+    use crate::translation::profile::TranslationRequestConfiguration;
 
     use super::*;
 
@@ -294,6 +295,58 @@ mod tests {
         cancellation: CooperativeCancellation,
     }
 
+    struct CompletedAfterCancellationTranslation {
+        cancellation: CooperativeCancellation,
+    }
+
+    impl RpgMakerTranslation for CompletedAfterCancellationTranslation {
+        type Profile = Arc<RpgMakerTranslationProfile<()>>;
+        type Error = FakeError;
+
+        async fn run(
+            &self,
+            _project: &OpenedProject,
+            _profile: &Self::Profile,
+            _input: RpgMakerTranslationInput,
+        ) -> Result<OperationCompletion<RpgMakerTranslationRunReport>, Self::Error> {
+            self.cancellation.request();
+            Ok(OperationCompletion::Completed(
+                RpgMakerTranslationRunReport::with_reconciliation(1, 1, 0, 0, 0),
+            ))
+        }
+    }
+
+    struct CompletedAfterCancellationBuilder {
+        cancellation: CooperativeCancellation,
+    }
+
+    impl SelectedTranslationExecutionBuilder for CompletedAfterCancellationBuilder {
+        type Client = ();
+        type Translation = CompletedAfterCancellationTranslation;
+        type Error = FakeError;
+
+        async fn build(
+            &self,
+            _project: &OpenedProject,
+        ) -> SelectedTranslationExecutionBuildResult<Self::Client, Self::Translation, Self::Error>
+        {
+            let profile = Arc::new(RpgMakerTranslationProfile::new(
+                "test-profile",
+                RpgMakerTranslationPlanningConfiguration::new(
+                    NonZeroUsize::new(1).expect("测试规划字符数必须非零"),
+                ),
+                TranslationRequestConfiguration::new(Vec::new(), Duration::ZERO),
+                Arc::new(()),
+            ));
+            Ok(SelectedTranslationExecution::new(
+                profile,
+                CompletedAfterCancellationTranslation {
+                    cancellation: self.cancellation.clone(),
+                },
+            ))
+        }
+    }
+
     impl SelectedTranslationExecutionBuilder for CancellingBuilder {
         type Client = ();
         type Translation = UnusedTranslation;
@@ -341,5 +394,44 @@ mod tests {
             .await;
 
         assert!(matches!(result, Ok(OperationCompletion::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_translation_completion_keeps_the_completed_report() {
+        let cancellation = CooperativeCancellation::default();
+        let name = "completed-before-cancel"
+            .parse::<ProjectName>()
+            .expect("测试项目名应合法");
+        let project = OpenedProject::new(
+            name.clone(),
+            PathBuf::from("C:/att-test/workspace"),
+            PathBuf::from("C:/att-test/workspace/project.db"),
+            "ja".to_owned(),
+            "zh-Hans".to_owned(),
+            test_layout_profile(),
+        );
+        let service = TranslateService::new(
+            FakeProjectOpener { project },
+            CompletedAfterCancellationBuilder {
+                cancellation: cancellation.clone(),
+            },
+            FakeLeaseProvider,
+            cancellation,
+        );
+
+        let completion = service
+            .execute(TranslateInput {
+                name,
+                terminology_path: None,
+                placeholder_rules_path: None,
+            })
+            .await
+            .expect("翻译已完成后到达的取消不得改写结果");
+        let OperationCompletion::Completed(output) = completion else {
+            panic!("翻译已完成后应返回完成结果")
+        };
+        assert_eq!(output.profile_id, "test-profile");
+        assert_eq!(output.summary.total_tasks, 1);
+        assert_eq!(output.summary.retained, 1);
     }
 }

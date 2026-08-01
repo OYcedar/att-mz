@@ -673,6 +673,11 @@ pub(crate) enum UiMessage<'a> {
         actual_type: &'a str,
         skipped_count: u64,
     },
+    WarningManualLayoutRequired {
+        locations: &'a str,
+        region: &'a str,
+        max_fullwidth_chars: u64,
+    },
     NoticeNoModelRequest,
     NoticeManualLayout {
         count: u64,
@@ -1115,6 +1120,7 @@ impl UiMessage<'_> {
             Self::WarningRulesCommandNonStringSkipped { .. } => {
                 "warning-rules-command-non-string-skipped"
             }
+            Self::WarningManualLayoutRequired { .. } => "warning-manual-layout-required",
             Self::NoticeNoModelRequest => "notice-no-model-request",
             Self::NoticeManualLayout { .. } => "notice-manual-layout",
             Self::NoticeLogDegraded => "notice-log-degraded",
@@ -1270,6 +1276,15 @@ impl UiMessage<'_> {
                 set_number(&mut arguments, "parameter", parameter);
                 set_text(&mut arguments, "actual_type", actual_type);
                 set_number(&mut arguments, "skipped_count", skipped_count);
+            }
+            Self::WarningManualLayoutRequired {
+                locations,
+                region,
+                max_fullwidth_chars,
+            } => {
+                set_text(&mut arguments, "locations", locations);
+                set_text(&mut arguments, "region", region);
+                set_number(&mut arguments, "max_fullwidth_chars", max_fullwidth_chars);
             }
             Self::NoticeManualLayout { count }
             | Self::LogRetrySummary { count }
@@ -2425,6 +2440,11 @@ mod tests {
                 parameter: 0,
                 actual_type: "number",
                 skipped_count: 2,
+            },
+            UiMessage::WarningManualLayoutRequired {
+                locations: "Map001.json.events[1] (dialogue_body)",
+                region: "dialogue_body",
+                max_fullwidth_chars: 24,
             },
             UiMessage::NoticeNoModelRequest,
             UiMessage::NoticeManualLayout { count: 3 },

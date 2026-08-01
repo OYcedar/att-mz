@@ -9,13 +9,14 @@ use std::fmt;
 use std::fs;
 use std::future::Future;
 use std::io;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use futures_util::StreamExt;
 use futures_util::stream::FuturesOrdered;
+use futures_util::{FutureExt, StreamExt};
 use rayon::prelude::*;
 use rusqlite::Connection;
 use time::OffsetDateTime;
@@ -53,7 +54,7 @@ use crate::generic::{
     GenericProtectedText, GenericStoredSnapshot, GenericTaskRecordDocument, GenericTaskRecordIssue,
     GenericTaskRecordState, GenericTaskResponseRecord, GenericUnitKey, GenericUnitMap,
     GenericWriteBackCandidate, GenericWriteBackError, PlannedGroup, PlannedTask, PlanningUnit,
-    TranslationAcceptance, TranslationPlan, TranslationWrite,
+    ResponseProblem, TranslationAcceptance, TranslationPlan, TranslationWrite,
     accept_parsed_response_with_cancellation, build_write_back_candidate_with_cancellation,
     current_translation_for_stored_with_cancellation,
     ensure_input_fingerprints_current_with_cancellation,
@@ -70,7 +71,10 @@ use crate::llm::{
 };
 #[cfg(not(test))]
 use crate::progress::ProgressObserver;
-use crate::progress::{ProgressMode, ProgressSnapshot, TerminalProgress, TerminalProgressObserver};
+use crate::progress::{
+    ProgressMode, ProgressSnapshot, TerminalProgress, TerminalProgressFailures,
+    TerminalProgressObserver,
+};
 use crate::project_lease::{
     ProjectCommandLeaseError, ProjectCommandLeaseProvider, ProjectCommandLeaseService,
 };
@@ -89,8 +93,8 @@ use crate::runtime::filesystem::{
 use crate::runtime::llm::OpenAiChatCompletionExecutor;
 use crate::runtime::performance::RunPerformanceCounters;
 use crate::runtime::project_log::{
-    ProjectLog, ProjectLogCode, ProjectLogEvent, ProjectLogLevel, ProjectLogPayload,
-    ProjectLogRunOutcome,
+    ProjectLog, ProjectLogCode, ProjectLogContext, ProjectLogEvent, ProjectLogLevel,
+    ProjectLogPayload, ProjectLogRunOutcome, ProjectLogTaskOutcome, ProjectLogger,
 };
 use crate::runtime::windows::WindowsFsError;
 use crate::storage::file_system::{
@@ -112,8 +116,8 @@ use crate::translation::task_record::{
 #[cfg(test)]
 use crate::translation_protocol::parse_translation_response;
 use crate::translation_protocol::{
-    ParsedTranslationResponse, TranslationResponseEnvelope,
-    parse_translation_response_with_cancellation,
+    ParsedTranslationResponse, TranslationResponseEnvelope, TranslationTaskResponseParseError,
+    TranslationTaskResponseParseErrorKind, parse_translation_response_with_cancellation,
 };
 
 const GENERIC_ENGINE_NAME: &str = "generic";
@@ -192,15 +196,39 @@ impl GenericTerminalProgress {
     }
 
     fn safe_stopping(&self) {
-        self.terminal.safe_stopping(self.safe_stopping.clone());
+        defer_generic_terminal_progress_status(
+            self.terminal.safe_stopping(self.safe_stopping.clone()),
+        );
     }
 
     fn finalizing(&self) {
-        self.terminal.finalizing(self.finalizing.clone());
+        defer_generic_terminal_progress_status(self.terminal.finalizing(self.finalizing.clone()));
     }
 
-    fn finish(self) {
-        self.terminal.finish();
+    fn finish(self) -> Result<(), TerminalProgressFailures> {
+        self.terminal.finish()
+    }
+}
+
+fn defer_generic_terminal_progress_status(result: Result<(), TerminalProgressFailures>) {
+    if let Err(failures) = result {
+        // 健康状态仍由 `TerminalProgress` 持有，最终 `finish` 会再次返回全部失败。
+        debug_assert!(!failures.failures().is_empty());
+    }
+}
+
+fn record_generic_terminal_progress_failures(
+    result: Result<(), TerminalProgressFailures>,
+    shutdown_errors: &mut Vec<GenericShutdownError>,
+) {
+    if let Err(failures) = result {
+        shutdown_errors.extend(
+            failures
+                .failures()
+                .iter()
+                .cloned()
+                .map(|failure| GenericShutdownError::new("terminal progress", failure)),
+        );
     }
 }
 
@@ -763,6 +791,98 @@ impl fmt::Display for MessageError {
 
 impl Error for MessageError {}
 
+#[derive(Clone, Debug)]
+struct GenericCommandPanicContext {
+    command: &'static str,
+    stage: DiagnosticStage,
+    project_workspace: PathBuf,
+}
+
+#[derive(Debug)]
+struct GenericApplicationScopePanicked;
+
+impl fmt::Display for GenericApplicationScopePanicked {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("application scope panicked")
+    }
+}
+
+impl Error for GenericApplicationScopePanicked {}
+
+fn generic_command_panic_context(command: &ConfiguredGenericCommand) -> GenericCommandPanicContext {
+    let (command_name, stage, projects_root, project_name) = match command {
+        ConfiguredGenericCommand::Init { arguments, common } => (
+            "init",
+            DiagnosticStage::Init,
+            common.projects_root(),
+            arguments.project.name.as_str(),
+        ),
+        ConfiguredGenericCommand::Extract {
+            project_name,
+            common,
+        } => (
+            "extract",
+            DiagnosticStage::Extract,
+            common.projects_root(),
+            project_name.as_str(),
+        ),
+        ConfiguredGenericCommand::Translate(command) => (
+            "translate",
+            DiagnosticStage::Translate,
+            command.common().projects_root(),
+            command.project_name().as_str(),
+        ),
+        ConfiguredGenericCommand::WriteBack(command) => (
+            "write-back",
+            DiagnosticStage::WriteBack,
+            command.common().projects_root(),
+            command.project_name().as_str(),
+        ),
+        ConfiguredGenericCommand::Lua(command) => (
+            "lua",
+            DiagnosticStage::Lua,
+            command.common().projects_root(),
+            command.project_name().as_str(),
+        ),
+    };
+    GenericCommandPanicContext {
+        command: command_name,
+        stage,
+        project_workspace: projects_root.join(GENERIC_ENGINE_NAME).join(project_name),
+    }
+}
+
+fn generic_command_panic_error(context: GenericCommandPanicContext) -> GenericCommandError {
+    let diagnostic = SafeDiagnostic::new(
+        DiagnosticCode::InternalOperation,
+        context.stage,
+        DiagnosticSubject::command(context.command),
+        DiagnosticReason::failure(DiagnosticFailureKind::InternalInvariant),
+        DiagnosticImpact::OutcomeUnknown,
+        DiagnosticAction::ReportBug,
+    )
+    .with_recovery(RecoveryFact::path(context.project_workspace));
+    GenericCommandError::diagnosed(
+        "执行 Generic 命令",
+        GenericApplicationScopePanicked,
+        diagnostic,
+    )
+}
+
+async fn catch_generic_command_panic(
+    context: GenericCommandPanicContext,
+    future: impl Future<Output = GenericCommandRunReport>,
+) -> GenericCommandRunReport {
+    match AssertUnwindSafe(future).catch_unwind().await {
+        Ok(report) => report,
+        Err(payload) => {
+            // panic payload 可能包含模型正文、Lua、SQL 或用户文本；只丢弃，绝不读取。
+            drop(payload);
+            GenericCommandRunReport::failed(generic_command_panic_error(context))
+        }
+    }
+}
+
 /// Generic 的生产命令执行器。
 pub(crate) struct ProductionGenericCommandRunner {
     locale: UiLocale,
@@ -778,6 +898,19 @@ impl ProductionGenericCommandRunner {
     }
 
     pub(crate) async fn run(
+        self,
+        command: ConfiguredGenericCommand,
+        termination_signals: &mut TerminationSignals,
+    ) -> GenericCommandRunReport {
+        let panic_context = generic_command_panic_context(&command);
+        catch_generic_command_panic(
+            panic_context,
+            self.run_without_panic_boundary(command, termination_signals),
+        )
+        .await
+    }
+
+    async fn run_without_panic_boundary(
         self,
         command: ConfiguredGenericCommand,
         termination_signals: &mut TerminationSignals,
@@ -878,19 +1011,32 @@ impl ProductionGenericCommandRunner {
                 common,
             } => {
                 let performance = Arc::new(RunPerformanceCounters::default());
+                let project_log = generic_project_log_slot();
+                start_existing_generic_project_log(
+                    &project_log,
+                    &common,
+                    self.locale,
+                    &project_name,
+                    "extract",
+                    DiagnosticStage::Extract,
+                    Arc::clone(&performance),
+                );
                 let file_system = match start_file_system(
                     common.filesystem().clone(),
                     Arc::clone(&performance),
                 ) {
                     Ok(file_system) => file_system,
                     Err(source) => {
-                        return GenericCommandRunReport::failed(GenericCommandError::operation(
-                            "启动文件运行能力",
-                            source,
-                        ));
+                        return GenericCommandRunReport::from_driven(
+                            Driven::Finished(Err(GenericCommandError::operation(
+                                "启动文件运行能力",
+                                source,
+                            ))),
+                            Vec::new(),
+                            take_generic_project_log(&project_log),
+                        );
                     }
                 };
-                let project_log = generic_project_log_slot();
                 let cancellation = CooperativeCancellation::default();
                 let progress = generic_terminal_progress(self.progress_mode, self.locale);
                 let operation_progress = progress.observer();
@@ -906,8 +1052,6 @@ impl ProductionGenericCommandRunner {
                 let output_name = project_name.clone();
                 let operation_cancellation = cancellation.clone();
                 let cancellation_file_system = file_system.clone();
-                let operation_project_log = Arc::clone(&project_log);
-                let locale = self.locale;
                 let operation = async move {
                     ensure_generic_operation_running(&operation_cancellation)?;
                     operation_progress.observe(ProgressSnapshot::indeterminate(
@@ -927,20 +1071,6 @@ impl ProductionGenericCommandRunner {
                         move || open_store.open(),
                     )
                     .await?;
-                    install_generic_project_log(
-                        &operation_project_log,
-                        start_command_log(CommandLogStart {
-                            common: &common,
-                            locale,
-                            engine: GENERIC_ENGINE_NAME,
-                            project: project_name.as_str(),
-                            command: "extract",
-                            stage: DiagnosticStage::Extract,
-                            profile: None,
-                            performance,
-                            panic_boundary: None,
-                        }),
-                    );
                     let outcome = run_project_blocking(
                         "同步 Generic JSONL",
                         DiagnosticStage::Extract,
@@ -986,23 +1116,41 @@ impl ProductionGenericCommandRunner {
         termination_signals: &mut TerminationSignals,
     ) -> GenericCommandRunReport {
         let performance = Arc::new(RunPerformanceCounters::default());
+        let project_name = command.project_name().clone();
+        let project_log = generic_project_log_slot();
+        install_generic_project_log(
+            &project_log,
+            start_command_log(CommandLogStart {
+                common: command.common(),
+                locale: self.locale,
+                engine: GENERIC_ENGINE_NAME,
+                project: project_name.as_str(),
+                command: "lua",
+                stage: DiagnosticStage::Lua,
+                profile: None,
+                performance: Arc::clone(&performance),
+                panic_boundary: None,
+            }),
+        );
         let file_system_configuration = command.common().filesystem().clone();
         let file_system =
             match start_file_system(file_system_configuration, Arc::clone(&performance)) {
                 Ok(file_system) => file_system,
                 Err(source) => {
-                    return GenericCommandRunReport::failed(GenericCommandError::operation(
-                        "启动文件运行能力",
-                        source,
-                    ));
+                    return GenericCommandRunReport::from_driven(
+                        Driven::Finished(Err(GenericCommandError::operation(
+                            "启动文件运行能力",
+                            source,
+                        ))),
+                        Vec::new(),
+                        take_generic_project_log(&project_log),
+                    );
                 }
             };
-        let project_log = generic_project_log_slot();
         let cancellation = CooperativeCancellation::default();
         let lua_cancellation = ProjectLuaCancellation::default();
         let progress = generic_terminal_progress(self.progress_mode, self.locale);
         let operation_progress = progress.observer();
-        let project_name = command.project_name().clone();
         let script_path = command.script().script_path().to_path_buf();
         let arguments = command.arguments().to_vec();
         let store = GenericProjectStore::for_workspace_with_cancellation(
@@ -1019,9 +1167,18 @@ impl ProductionGenericCommandRunner {
         let operation_cancellation = cancellation.clone();
         let cancellation_file_system = file_system.clone();
         let output_name = project_name.clone();
-        let common = command.common();
         let operation_project_log = Arc::clone(&project_log);
-        let locale = self.locale;
+        let (print_sink, preflight_log) = {
+            let project_log = project_log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            project_log.as_ref().map_or((None, None), |project_log| {
+                (
+                    Some(Arc::new(ProjectLogLuaPrintSink::from_active(project_log))),
+                    Some((project_log.logger().clone(), project_log.context().clone())),
+                )
+            })
+        };
         let operation = async move {
             ensure_generic_operation_running(&operation_cancellation)?;
             let script = operation_file_system
@@ -1037,21 +1194,6 @@ impl ProductionGenericCommandRunner {
                 })?;
             let identity = script.resolved_path().to_string_lossy().into_owned();
             let source = script.into_bytes();
-            let project_log = start_command_log(CommandLogStart {
-                common,
-                locale,
-                engine: GENERIC_ENGINE_NAME,
-                project: project_name.as_str(),
-                command: "lua",
-                stage: DiagnosticStage::Lua,
-                profile: None,
-                performance,
-                panic_boundary: None,
-            });
-            let print_sink = Arc::new(ProjectLogLuaPrintSink::from_active(&project_log));
-            let preflight_logger = project_log.logger().clone();
-            let preflight_context = project_log.context().clone();
-            install_generic_project_log(&operation_project_log, project_log);
             let preflight_cancellation = operation_lua_cancellation.clone();
             let preparation = tokio::task::spawn_blocking(move || {
                 let program = ProjectLuaProgram::new(identity, source, arguments);
@@ -1059,15 +1201,17 @@ impl ProductionGenericCommandRunner {
                     &program,
                     &preflight_cancellation,
                 )?;
-                preflight_logger.emit(ProjectLogEvent::new(
-                    ProjectLogLevel::Info,
-                    ProjectLogCode::LuaScript,
-                    preflight_context,
-                    ProjectLogPayload::LuaScript {
-                        identity: program.identity().to_owned(),
-                        fingerprint: fingerprint.hex(),
-                    },
-                ));
+                if let Some((preflight_logger, preflight_context)) = preflight_log {
+                    preflight_logger.emit(ProjectLogEvent::new(
+                        ProjectLogLevel::Info,
+                        ProjectLogCode::LuaScript,
+                        preflight_context,
+                        ProjectLogPayload::LuaScript {
+                            identity: program.identity().to_owned(),
+                            fingerprint: fingerprint.hex(),
+                        },
+                    ));
+                }
                 compile_project_lua_program_with_cancellation(&program, &preflight_cancellation)?;
                 Ok::<_, ProjectLuaFailure>(program)
             })
@@ -1114,8 +1258,11 @@ impl ProductionGenericCommandRunner {
                 program,
                 lua_adapter,
             )
-            .with_cancellation(operation_lua_cancellation)
-            .with_print_sink(print_sink);
+            .with_cancellation(operation_lua_cancellation);
+            let request = match print_sink {
+                Some(print_sink) => request.with_print_sink(print_sink),
+                None => request,
+            };
             operation_progress.observe(ProgressSnapshot::indeterminate(
                 GenericProgressPhase::RunningLua,
             ));
@@ -1188,38 +1335,51 @@ impl ProductionGenericCommandRunner {
         termination_signals: &mut TerminationSignals,
     ) -> GenericCommandRunReport {
         let performance = Arc::new(RunPerformanceCounters::default());
+        let project_name = command.project_name().clone();
+        let project_log = generic_project_log_slot();
+        start_existing_generic_project_log(
+            &project_log,
+            command.common(),
+            self.locale,
+            &project_name,
+            "translate",
+            DiagnosticStage::Translate,
+            Arc::clone(&performance),
+        );
         let file_system_configuration = command.common().filesystem().clone();
         let file_system =
             match start_file_system(file_system_configuration.clone(), Arc::clone(&performance)) {
                 Ok(file_system) => file_system,
                 Err(source) => {
-                    return GenericCommandRunReport::failed(GenericCommandError::operation(
-                        "启动文件运行能力",
-                        source,
-                    ));
+                    return GenericCommandRunReport::from_driven(
+                        Driven::Finished(Err(GenericCommandError::operation(
+                            "启动文件运行能力",
+                            source,
+                        ))),
+                        Vec::new(),
+                        take_generic_project_log(&project_log),
+                    );
                 }
             };
-        let project_log = generic_project_log_slot();
         let cpu = match RayonCpuExecutor::start(command.cpu()) {
             Ok(cpu) => cpu,
             Err(source) => {
-                let mut report = GenericCommandRunReport::failed(GenericCommandError::operation(
-                    "启动 CPU 运行能力",
-                    source,
-                ));
+                let error = GenericCommandError::operation("启动 CPU 运行能力", source);
+                let mut shutdown_errors = Vec::new();
                 if let Err(source) = file_system.shutdown().await {
-                    report
-                        .shutdown_errors
-                        .push(GenericShutdownError::new("filesystem", source));
+                    shutdown_errors.push(GenericShutdownError::new("filesystem", source));
                 }
-                return report;
+                return GenericCommandRunReport::from_driven(
+                    Driven::Finished(Err(error)),
+                    shutdown_errors,
+                    take_generic_project_log(&project_log),
+                );
             }
         };
         let cancellation = CooperativeCancellation::default();
         let progress = generic_terminal_progress(self.progress_mode, self.locale);
         let operation_progress = progress.observer();
         let llm_holder = Arc::new(Mutex::new(None::<OpenAiChatCompletionExecutor>));
-        let project_name = command.project_name().clone();
         let store = GenericProjectStore::for_workspace_with_cancellation(
             generic_workspace(command.common().projects_root(), &project_name),
             cancellation.clone(),
@@ -1257,20 +1417,6 @@ impl ProductionGenericCommandRunner {
             )
             .await?;
             let project = snapshot.project().clone();
-            install_generic_project_log(
-                &operation_project_log,
-                start_command_log(CommandLogStart {
-                    common: command.common(),
-                    locale,
-                    engine: GENERIC_ENGINE_NAME,
-                    project: project_name.as_str(),
-                    command: "translate",
-                    stage: DiagnosticStage::Translate,
-                    profile: None,
-                    performance,
-                    panic_boundary: None,
-                }),
-            );
             let profile_id = command
                 .resolved_profile_id()
                 .map(str::to_owned)
@@ -1588,6 +1734,7 @@ impl ProductionGenericCommandRunner {
                     cpu: operation_cpu.clone(),
                     cancellation: operation_cancellation.clone(),
                     task_records: task_records.clone(),
+                    project_log: generic_task_project_log(&operation_project_log),
                     progress: operation_progress.clone(),
                 })
                 .await;
@@ -1642,7 +1789,7 @@ impl ProductionGenericCommandRunner {
         if let Err(source) = file_system.shutdown().await {
             shutdown_errors.push(GenericShutdownError::new("filesystem", source));
         }
-        progress.finish();
+        record_generic_terminal_progress_failures(progress.finish(), &mut shutdown_errors);
         GenericCommandRunReport::from_driven(
             driven,
             shutdown_errors,
@@ -1656,38 +1803,51 @@ impl ProductionGenericCommandRunner {
         termination_signals: &mut TerminationSignals,
     ) -> GenericCommandRunReport {
         let performance = Arc::new(RunPerformanceCounters::default());
+        let project_name = command.project_name().clone();
+        let project_log = generic_project_log_slot();
+        start_existing_generic_project_log(
+            &project_log,
+            command.common(),
+            self.locale,
+            &project_name,
+            "write-back",
+            DiagnosticStage::WriteBack,
+            Arc::clone(&performance),
+        );
         let file_system_configuration = command.common().filesystem().clone();
         let file_system =
             match start_file_system(file_system_configuration, Arc::clone(&performance)) {
                 Ok(file_system) => file_system,
                 Err(source) => {
-                    return GenericCommandRunReport::failed(GenericCommandError::operation(
-                        "启动文件运行能力",
-                        source,
-                    ));
+                    return GenericCommandRunReport::from_driven(
+                        Driven::Finished(Err(GenericCommandError::operation(
+                            "启动文件运行能力",
+                            source,
+                        ))),
+                        Vec::new(),
+                        take_generic_project_log(&project_log),
+                    );
                 }
             };
-        let project_log = generic_project_log_slot();
         let cpu = match RayonCpuExecutor::start(command.cpu()) {
             Ok(cpu) => cpu,
             Err(source) => {
-                let mut report = GenericCommandRunReport::failed(GenericCommandError::operation(
-                    "启动 CPU 运行能力",
-                    source,
-                ));
+                let error = GenericCommandError::operation("启动 CPU 运行能力", source);
+                let mut shutdown_errors = Vec::new();
                 if let Err(source) = file_system.shutdown().await {
-                    report
-                        .shutdown_errors
-                        .push(GenericShutdownError::new("filesystem", source));
+                    shutdown_errors.push(GenericShutdownError::new("filesystem", source));
                 }
-                return report;
+                return GenericCommandRunReport::from_driven(
+                    Driven::Finished(Err(error)),
+                    shutdown_errors,
+                    take_generic_project_log(&project_log),
+                );
             }
         };
         let cancellation = CooperativeCancellation::default();
         let publication_gate = GenericWriteBackPublicationGate::default();
         let progress = generic_terminal_progress(self.progress_mode, self.locale);
         let operation_progress = progress.observer();
-        let project_name = command.project_name().clone();
         let store = GenericProjectStore::for_workspace_with_cancellation(
             generic_workspace(command.common().projects_root(), &project_name),
             cancellation.clone(),
@@ -1703,7 +1863,6 @@ impl ProductionGenericCommandRunner {
         let operation_cancellation = cancellation.clone();
         let operation_publication_gate = publication_gate.clone();
         let output_name = project_name.clone();
-        let locale = self.locale;
         let operation_project_log = Arc::clone(&project_log);
         let operation = async move {
             ensure_generic_operation_running(&operation_cancellation)?;
@@ -1726,20 +1885,6 @@ impl ProductionGenericCommandRunner {
             )
             .await?;
             let project = snapshot.project().clone();
-            install_generic_project_log(
-                &operation_project_log,
-                start_command_log(CommandLogStart {
-                    common: command.common(),
-                    locale,
-                    engine: GENERIC_ENGINE_NAME,
-                    project: project_name.as_str(),
-                    command: "write-back",
-                    stage: DiagnosticStage::WriteBack,
-                    profile: None,
-                    performance,
-                    panic_boundary: None,
-                }),
-            );
             let terminology = current_resources.terminology();
             let placeholder_rules = current_resources.placeholder_rules();
 
@@ -1915,7 +2060,7 @@ impl ProductionGenericCommandRunner {
         if let Err(source) = file_system.shutdown().await {
             shutdown_errors.push(GenericShutdownError::new("filesystem", source));
         }
-        progress.finish();
+        record_generic_terminal_progress_failures(progress.finish(), &mut shutdown_errors);
         GenericCommandRunReport::from_driven(
             driven,
             shutdown_errors,
@@ -2913,6 +3058,79 @@ fn natural_segments(language_text: &LanguageText) -> impl Iterator<Item = &str> 
         })
 }
 
+fn generic_task_response_diagnostic(
+    task_index: usize,
+    failure: DiagnosticFailureKind,
+    detail: impl AsRef<str>,
+) -> SafeDiagnostic {
+    SafeDiagnostic::new(
+        DiagnosticCode::ModelRequest,
+        DiagnosticStage::ModelRequest,
+        DiagnosticSubject::operation(format!(
+            "generic_translation_task_{}",
+            generic_task_ordinal(task_index)
+        )),
+        DiagnosticReason::failure_with_detail(failure, detail),
+        DiagnosticImpact::ProgressPreserved,
+        DiagnosticAction::Retry,
+    )
+}
+
+fn generic_response_problem_diagnostic(
+    task_index: usize,
+    problem: &ResponseProblem,
+) -> SafeDiagnostic {
+    let detail = match problem {
+        ResponseProblem::InvalidId(id) => format!("problem=invalid_id; actual_id={id}"),
+        ResponseProblem::UnexpectedId(id) => format!("problem=unexpected_id; output_id={id}"),
+        ResponseProblem::DuplicateId(id) => format!("problem=duplicate_id; output_id={id}"),
+        ResponseProblem::MissingId(id) => format!("problem=missing_id; output_id={id}"),
+        ResponseProblem::NonStringValue(id) => {
+            format!("problem=non_string_value; output_id={id}")
+        }
+        ResponseProblem::InvalidTranslation { output_id, .. } => {
+            format!("problem=invalid_translation; output_id={output_id}")
+        }
+        ResponseProblem::InvalidDestination { output_id, .. } => {
+            format!("problem=invalid_destination_translation; output_id={output_id}")
+        }
+    };
+    generic_task_response_diagnostic(
+        task_index,
+        DiagnosticFailureKind::InvalidResponseContract,
+        detail,
+    )
+}
+
+fn generic_response_parse_diagnostic(
+    task_index: usize,
+    error: TranslationTaskResponseParseError,
+) -> SafeDiagnostic {
+    let parse_kind = match error.kind() {
+        TranslationTaskResponseParseErrorKind::Json(category) => {
+            format!("json_{}", category.code())
+        }
+        kind => kind.code().to_owned(),
+    };
+    generic_task_response_diagnostic(
+        task_index,
+        DiagnosticFailureKind::ResponseParsingFailed,
+        format!(
+            "parse_kind={parse_kind}; line={}; column={}",
+            error.line(),
+            error.column()
+        ),
+    )
+}
+
+fn generic_unavailable_task_diagnostic(task_index: usize, reason: &'static str) -> SafeDiagnostic {
+    generic_task_response_diagnostic(
+        task_index,
+        DiagnosticFailureKind::ExternalServiceUnavailable,
+        format!("reason={reason}"),
+    )
+}
+
 fn empty_terminology_fingerprint() -> Sha256Fingerprint {
     Sha256FramedHasher::new(b"att.generic.terminology-hits").finish()
 }
@@ -2946,7 +3164,95 @@ struct GenericTaskExecution {
     cpu: RayonCpuExecutor,
     cancellation: CooperativeCancellation,
     task_records: ConfiguredTranslationTaskRecordSink,
+    project_log: GenericTaskProjectLog,
     progress: TerminalProgressObserver<GenericProgressPhase>,
+}
+
+#[derive(Clone)]
+struct GenericTaskProjectLog {
+    logger: ProjectLogger,
+    context: ProjectLogContext,
+}
+
+impl GenericTaskProjectLog {
+    fn started(&self, task_index: usize, total_tasks: usize) {
+        self.logger.emit(ProjectLogEvent::new(
+            ProjectLogLevel::Debug,
+            ProjectLogCode::TaskStarted,
+            self.context.clone(),
+            ProjectLogPayload::Task {
+                ordinal: generic_task_ordinal(task_index),
+                total: u64::try_from(total_tasks).unwrap_or(u64::MAX),
+                outcome: None,
+                attempts: None,
+            },
+        ));
+    }
+
+    fn finished(
+        &self,
+        task_index: usize,
+        total_tasks: usize,
+        attempts: usize,
+        outcome: ProjectLogTaskOutcome,
+        diagnostics: impl IntoIterator<Item = SafeDiagnostic>,
+    ) {
+        let ordinal = generic_task_ordinal(task_index);
+        let total = u64::try_from(total_tasks).unwrap_or(u64::MAX);
+        let attempts = u64::try_from(attempts).unwrap_or(u64::MAX);
+        let finished = ProjectLogEvent::new(
+            ProjectLogLevel::Debug,
+            ProjectLogCode::TaskFinished,
+            self.context.clone(),
+            ProjectLogPayload::Task {
+                ordinal,
+                total,
+                outcome: Some(outcome),
+                attempts: Some(attempts),
+            },
+        );
+        if outcome == ProjectLogTaskOutcome::Complete {
+            self.logger.emit(finished);
+        } else {
+            self.logger.emit_reliable(finished);
+        }
+        for diagnostic in diagnostics {
+            self.logger.emit_reliable(ProjectLogEvent::new(
+                ProjectLogLevel::Warn,
+                ProjectLogCode::TaskDiagnostic,
+                self.context.clone(),
+                ProjectLogPayload::TaskDiagnostic {
+                    ordinal,
+                    total,
+                    attempts,
+                    diagnostic,
+                },
+            ));
+        }
+    }
+
+    fn partial_result(&self, summary: GenericTaskSummary) {
+        if summary.partial_tasks == 0 && summary.unavailable_tasks == 0 {
+            return;
+        }
+        self.logger.emit_reliable(ProjectLogEvent::new(
+            ProjectLogLevel::Warn,
+            ProjectLogCode::PartialResult,
+            self.context.clone(),
+            ProjectLogPayload::ResultSummary {
+                complete: u64::try_from(summary.complete_tasks).unwrap_or(u64::MAX),
+                partial: u64::try_from(summary.partial_tasks).unwrap_or(u64::MAX),
+                unavailable: u64::try_from(summary.unavailable_tasks).unwrap_or(u64::MAX),
+                manual_review: u64::try_from(summary.response_problems).unwrap_or(u64::MAX),
+            },
+        ));
+    }
+}
+
+fn generic_task_ordinal(task_index: usize) -> u64 {
+    u64::try_from(task_index)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2972,6 +3278,33 @@ struct GenericTaskRecordDraft {
     response: Option<GenericTaskResponseRecord>,
 }
 
+struct GenericTaskRecordInFlight {
+    total_tasks: usize,
+    task_index: usize,
+    messages: Vec<ChatMessage>,
+    expected_outputs: usize,
+    started_at: OffsetDateTime,
+    started: Instant,
+    attempt_count: usize,
+    attempts: Vec<crate::execution::llm_request::LlmRequestAttemptRecord>,
+}
+
+impl GenericTaskRecordInFlight {
+    fn finish(self, response: Option<GenericTaskResponseRecord>) -> GenericTaskRecordDraft {
+        GenericTaskRecordDraft {
+            total_tasks: self.total_tasks,
+            task_index: self.task_index,
+            messages: self.messages,
+            expected_outputs: self.expected_outputs,
+            started_at: self.started_at,
+            duration: self.started.elapsed(),
+            attempt_count: self.attempt_count,
+            attempts: self.attempts,
+            response,
+        }
+    }
+}
+
 impl GenericTaskRecordDraft {
     fn finish(self, state: GenericTaskRecordState) -> GenericTaskRecordDocument {
         GenericTaskRecordDocument::new(
@@ -2993,6 +3326,7 @@ enum GenericPreparedTaskOutcome {
     Accepted {
         writes: Vec<TranslationWrite>,
         issues: Vec<GenericTaskRecordIssue>,
+        diagnostics: Vec<SafeDiagnostic>,
         accepted_units: usize,
         response_problems: usize,
         response_complete: bool,
@@ -3000,13 +3334,30 @@ enum GenericPreparedTaskOutcome {
     },
     Unavailable {
         reason: &'static str,
+        diagnostic: SafeDiagnostic,
     },
+    Failed(GenericCommandError),
     Cancelled,
 }
 
 struct GenericPreparedTask {
+    task_index: usize,
     outcome: GenericPreparedTaskOutcome,
     record: Option<GenericTaskRecordDraft>,
+    attempt_count: usize,
+}
+
+fn cancelled_generic_prepared_task(
+    task_index: usize,
+    record: Option<GenericTaskRecordInFlight>,
+    attempt_count: usize,
+) -> GenericPreparedTask {
+    GenericPreparedTask {
+        task_index,
+        outcome: GenericPreparedTaskOutcome::Cancelled,
+        record: record.map(|record| record.finish(None)),
+        attempt_count,
+    }
 }
 
 #[derive(Clone)]
@@ -3105,6 +3456,7 @@ async fn execute_generic_tasks(
         cpu,
         cancellation,
         task_records,
+        project_log,
         progress,
     } = input;
     let total_tasks = tasks.len();
@@ -3132,6 +3484,7 @@ async fn execute_generic_tasks(
         let Some((task_index, task)) = remaining.next() else {
             break;
         };
+        project_log.started(task_index, total_tasks);
         tasks.push_back(execute_owned_generic_task(
             request_context.clone(),
             task_index,
@@ -3142,7 +3495,12 @@ async fn execute_generic_tasks(
     let mut summary = GenericTaskSummary::default();
     let mut terminal_error = None;
     while let Some(prepared) = tasks.next().await {
-        let GenericPreparedTask { outcome, record } = match prepared {
+        let GenericPreparedTask {
+            task_index,
+            outcome,
+            record,
+            attempt_count,
+        } = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 if terminal_error.is_none() {
@@ -3156,11 +3514,14 @@ async fn execute_generic_tasks(
             if let Some(record) = record {
                 let state = match outcome {
                     GenericPreparedTaskOutcome::Cancelled => GenericTaskRecordState::cancelled(),
-                    GenericPreparedTaskOutcome::Unavailable { reason } => {
+                    GenericPreparedTaskOutcome::Unavailable { reason, .. } => {
                         GenericTaskRecordState::unavailable(reason)
                     }
                     GenericPreparedTaskOutcome::Accepted { .. } => {
                         GenericTaskRecordState::not_committed_due_to_prior_failure()
+                    }
+                    GenericPreparedTaskOutcome::Failed(ref error) => {
+                        GenericTaskRecordState::failed(error.safe_diagnostic())
                     }
                 };
                 task_records.submit(record.finish(state));
@@ -3171,6 +3532,7 @@ async fn execute_generic_tasks(
             GenericPreparedTaskOutcome::Accepted {
                 writes,
                 mut issues,
+                diagnostics,
                 accepted_units,
                 response_problems,
                 response_complete,
@@ -3203,6 +3565,13 @@ async fn execute_generic_tasks(
                     match commit {
                         Ok(commit) => commit,
                         Err(error) => {
+                            project_log.finished(
+                                task_index,
+                                total_tasks,
+                                attempt_count,
+                                ProjectLogTaskOutcome::Failed,
+                                [error.safe_diagnostic()],
+                            );
                             if let Some(record) = record {
                                 task_records.submit(record.finish(GenericTaskRecordState::failed(
                                     error.safe_diagnostic(),
@@ -3218,6 +3587,35 @@ async fn execute_generic_tasks(
                         commit.conflicts.len(),
                     ));
                 }
+                let mut diagnostics = diagnostics;
+                if !commit.conflicts.is_empty() {
+                    diagnostics.push(SafeDiagnostic::new(
+                        DiagnosticCode::ProjectState,
+                        DiagnosticStage::Translate,
+                        DiagnosticSubject::operation(format!(
+                            "generic_translation_task_{}",
+                            generic_task_ordinal(task_index)
+                        )),
+                        DiagnosticReason::failure_with_detail(
+                            DiagnosticFailureKind::StateMismatch,
+                            format!("cas_conflicts={}", commit.conflicts.len()),
+                        ),
+                        DiagnosticImpact::ProgressPreserved,
+                        DiagnosticAction::Retry,
+                    ));
+                }
+                let complete = response_complete && commit.conflicts.is_empty();
+                project_log.finished(
+                    task_index,
+                    total_tasks,
+                    attempt_count,
+                    if complete {
+                        ProjectLogTaskOutcome::Complete
+                    } else {
+                        ProjectLogTaskOutcome::Partial
+                    },
+                    diagnostics,
+                );
                 if let Some(record) = record {
                     task_records.submit(record.finish(GenericTaskRecordState::committed(
                         response_complete,
@@ -3230,17 +3628,39 @@ async fn execute_generic_tasks(
                 summary.response_problems += response_problems;
                 summary.written_units += commit.committed;
                 summary.conflicted_units += commit.conflicts.len();
-                if response_complete && commit.conflicts.is_empty() {
+                if complete {
                     summary.complete_tasks += 1;
                 } else {
                     summary.partial_tasks += 1;
                 }
             }
-            GenericPreparedTaskOutcome::Unavailable { reason } => {
+            GenericPreparedTaskOutcome::Unavailable { reason, diagnostic } => {
+                project_log.finished(
+                    task_index,
+                    total_tasks,
+                    attempt_count,
+                    ProjectLogTaskOutcome::Unavailable,
+                    [diagnostic],
+                );
                 if let Some(record) = record {
                     task_records.submit(record.finish(GenericTaskRecordState::unavailable(reason)));
                 }
                 summary.unavailable_tasks += 1;
+            }
+            GenericPreparedTaskOutcome::Failed(error) => {
+                let diagnostic = error.safe_diagnostic();
+                project_log.finished(
+                    task_index,
+                    total_tasks,
+                    attempt_count,
+                    ProjectLogTaskOutcome::Failed,
+                    [diagnostic.clone()],
+                );
+                if let Some(record) = record {
+                    task_records.submit(record.finish(GenericTaskRecordState::failed(diagnostic)));
+                }
+                cancellation.request();
+                terminal_error = Some(error);
             }
             GenericPreparedTaskOutcome::Cancelled => {
                 if let Some(record) = record {
@@ -3262,6 +3682,7 @@ async fn execute_generic_tasks(
         if terminal_error.is_none()
             && let Some((task_index, task)) = remaining.next()
         {
+            project_log.started(task_index, total_tasks);
             tasks.push_back(execute_owned_generic_task(
                 request_context.clone(),
                 task_index,
@@ -3271,7 +3692,10 @@ async fn execute_generic_tasks(
     }
     match terminal_error {
         Some(error) => Err(error),
-        None => Ok(summary),
+        None => {
+            project_log.partial_result(summary);
+            Ok(summary)
+        }
     }
 }
 
@@ -3314,8 +3738,18 @@ async fn execute_generic_task(
         record_evidence.then(|| messages.into_iter().collect::<Vec<ChatMessage>>());
     let (outcome, evidence) = execution.into_parts();
     let (attempt_count, attempts) = evidence.into_parts();
+    let record = record_started.map(|(started_at, started)| GenericTaskRecordInFlight {
+        total_tasks,
+        task_index,
+        messages: record_messages.expect("启用记录时必须保留模型消息"),
+        expected_outputs,
+        started_at,
+        started,
+        attempt_count,
+        attempts,
+    });
     let response_cancellation = cancellation.clone();
-    let (outcome, response_record) = cpu
+    let processing = cpu
         .execute(move || {
             ensure_generic_response_processing_running(&response_cancellation)?;
             let mut response_record = None;
@@ -3352,10 +3786,15 @@ async fn execute_generic_task(
                                 let response_problems = problems.len();
                                 let response_complete = problems.is_empty();
                                 let mut issues = Vec::with_capacity(problems.len());
+                                let mut diagnostics = Vec::with_capacity(problems.len());
                                 for problem in &problems {
                                     ensure_generic_response_processing_running(
                                         &response_cancellation,
                                     )?;
+                                    diagnostics.push(generic_response_problem_diagnostic(
+                                        task_index,
+                                        problem,
+                                    ));
                                     issues.push(
                                         GenericTaskRecordIssue::from_response_problem_with_cancellation(
                                             problem,
@@ -3389,6 +3828,7 @@ async fn execute_generic_task(
                                 GenericPreparedTaskOutcome::Accepted {
                                     writes,
                                     issues,
+                                    diagnostics,
                                     accepted_units,
                                     response_problems,
                                     response_complete,
@@ -3399,41 +3839,59 @@ async fn execute_generic_task(
                                 ensure_generic_response_processing_running(
                                     &response_cancellation,
                                 )?;
+                                let diagnostic =
+                                    generic_response_parse_diagnostic(task_index, error);
                                 if record_evidence {
                                     response_record =
                                         Some(GenericTaskResponseRecord::invalid(content, error));
                                 }
                                 GenericPreparedTaskOutcome::Unavailable {
                                     reason: "model_response_unusable",
+                                    diagnostic,
                                 }
                             }
                         }
                     } else {
+                        let finish_reason = finish_reason.to_string();
                         if record_evidence {
                             response_record =
                                 Some(GenericTaskResponseRecord::unprocessed(content));
                         }
                         GenericPreparedTaskOutcome::Unavailable {
                             reason: "non_stop_finish",
+                            diagnostic: generic_task_response_diagnostic(
+                                task_index,
+                                DiagnosticFailureKind::InvalidResponseContract,
+                                format!("finish_reason={finish_reason}"),
+                            ),
                         }
                     }
                 }
-                LlmRequestExecutionOutcome::RetryAfterExceedsMaximum { .. } => {
+                LlmRequestExecutionOutcome::RetryAfterExceedsMaximum { diagnostic, .. } => {
                     GenericPreparedTaskOutcome::Unavailable {
                         reason: "retry_after_exceeds_maximum",
+                        diagnostic,
                     }
                 }
-                LlmRequestExecutionOutcome::RetryBudgetExhausted { .. } => {
+                LlmRequestExecutionOutcome::RetryBudgetExhausted { diagnostic, .. } => {
                     GenericPreparedTaskOutcome::Unavailable {
                         reason: "recoverable_request_exhausted",
+                        diagnostic,
                     }
                 }
-                LlmRequestExecutionOutcome::Fatal { cancelled, .. } => {
+                LlmRequestExecutionOutcome::Fatal {
+                    cancelled,
+                    diagnostic,
+                    ..
+                } => {
                     if cancelled {
                         GenericPreparedTaskOutcome::Cancelled
                     } else {
                         GenericPreparedTaskOutcome::Unavailable {
                             reason: "request_failed",
+                            diagnostic: diagnostic.unwrap_or_else(|| {
+                                generic_unavailable_task_diagnostic(task_index, "request_failed")
+                            }),
                         }
                     }
                 }
@@ -3441,30 +3899,50 @@ async fn execute_generic_task(
                     GenericPreparedTaskOutcome::Cancelled
                 }
             };
-            ensure_generic_response_processing_running(&response_cancellation)?;
             Ok::<_, GenericPlanningError>((outcome, response_record))
         })
-        .await
-        .map_err(|source| generic_cpu_execution_failure("调度 Generic 响应验收", source))?
-        .map_err(|source| {
-            if source.is_cancelled() {
-                GenericCommandError::Cancelled
-            } else {
-                GenericCommandError::operation("验收 Generic 模型响应", source)
-            }
-        })?;
-    let record = record_started.map(|(started_at, started)| GenericTaskRecordDraft {
-        total_tasks,
+        .await;
+    let (outcome, response_record) = match processing {
+        Err(CpuTaskExecutionError::Cancelled) => {
+            return Ok(cancelled_generic_prepared_task(
+                task_index,
+                record,
+                attempt_count,
+            ));
+        }
+        Err(source) => {
+            let error = generic_cpu_execution_failure("调度 Generic 响应验收", source);
+            return Ok(GenericPreparedTask {
+                task_index,
+                outcome: GenericPreparedTaskOutcome::Failed(error),
+                record: record.map(|record| record.finish(None)),
+                attempt_count,
+            });
+        }
+        Ok(Err(source)) if source.is_cancelled() => {
+            return Ok(cancelled_generic_prepared_task(
+                task_index,
+                record,
+                attempt_count,
+            ));
+        }
+        Ok(Err(source)) => {
+            let error = GenericCommandError::operation("验收 Generic 模型响应", source);
+            return Ok(GenericPreparedTask {
+                task_index,
+                outcome: GenericPreparedTaskOutcome::Failed(error),
+                record: record.map(|record| record.finish(None)),
+                attempt_count,
+            });
+        }
+        Ok(Ok(processed)) => processed,
+    };
+    Ok(GenericPreparedTask {
         task_index,
-        messages: record_messages.expect("启用记录时必须保留模型消息"),
-        expected_outputs,
-        started_at,
-        duration: started.elapsed(),
+        outcome,
+        record: record.map(|record| record.finish(response_record)),
         attempt_count,
-        attempts,
-        response: response_record,
-    });
-    Ok(GenericPreparedTask { outcome, record })
+    })
 }
 
 #[cfg(test)]
@@ -4102,6 +4580,35 @@ fn generic_project_log_slot() -> GenericProjectLogSlot {
     Arc::new(Mutex::new(None))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn start_existing_generic_project_log(
+    slot: &GenericProjectLogSlot,
+    common: &crate::application::config::CommonCommandConfiguration,
+    locale: UiLocale,
+    project: &ProjectName,
+    command: &'static str,
+    stage: DiagnosticStage,
+    performance: Arc<RunPerformanceCounters>,
+) {
+    if !generic_workspace(common.projects_root(), project).is_dir() {
+        return;
+    }
+    install_generic_project_log(
+        slot,
+        start_command_log(CommandLogStart {
+            common,
+            locale,
+            engine: GENERIC_ENGINE_NAME,
+            project: project.as_str(),
+            command,
+            stage,
+            profile: None,
+            performance,
+            panic_boundary: None,
+        }),
+    );
+}
+
 fn install_generic_project_log(slot: &GenericProjectLogSlot, project_log: ActiveProjectLog) {
     let mut current = slot
         .lock()
@@ -4117,6 +4624,19 @@ fn take_generic_project_log(slot: &GenericProjectLogSlot) -> Option<ActiveProjec
     slot.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take()
+}
+
+fn generic_task_project_log(slot: &GenericProjectLogSlot) -> GenericTaskProjectLog {
+    let project_log = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let project_log = project_log
+        .as_ref()
+        .expect("Generic Translate 必须在建立模型任务前建立项目日志");
+    GenericTaskProjectLog {
+        logger: project_log.logger().clone(),
+        context: project_log.context().clone(),
+    }
 }
 
 fn configure_generic_task_records(
@@ -4304,7 +4824,8 @@ async fn drive_write_back<T>(
                 write_back_signal_result(cancellation_started, result)
             }
             Err(source) => {
-                let _ = cancel();
+                // 信号接收器本身失败时仍发起合作取消；最终分类由 SignalFailed 固定拥有。
+                cancel();
                 Driven::SignalFailed {
                     source,
                     result: future.await,
@@ -4341,7 +4862,7 @@ async fn drive_and_shutdown(
     if let Err(source) = file_system.shutdown().await {
         shutdown_errors.push(GenericShutdownError::new("filesystem", source));
     }
-    progress.finish();
+    record_generic_terminal_progress_failures(progress.finish(), &mut shutdown_errors);
     GenericCommandRunReport::from_driven(
         driven,
         shutdown_errors,
@@ -4427,6 +4948,14 @@ impl GenericCommandRunReport {
                 match &result {
                     GenericCommandRunResult::Succeeded(_) => ProjectLogRunOutcome::Succeeded,
                     GenericCommandRunResult::Interrupted => ProjectLogRunOutcome::Cancelled,
+                    GenericCommandRunResult::Failed(error)
+                        if matches!(
+                            error.safe_diagnostic().impact,
+                            DiagnosticImpact::RecoveryRequired
+                        ) =>
+                    {
+                        ProjectLogRunOutcome::RecoveryRequired
+                    }
                     GenericCommandRunResult::Failed(error)
                         if matches!(
                             error.safe_diagnostic().impact,
@@ -4560,8 +5089,8 @@ async fn publish_generic_write_back(
         return discard_after_failure(&publisher, staged, operation).await;
     }
 
-    if cancellation.is_requested() {
-        let _ = publication_gate.request_cancellation();
+    if cancellation.is_requested() && publication_gate.request_cancellation() {
+        return discard_after_failure(&publisher, staged, GenericCommandError::Cancelled).await;
     }
     if !begin_generic_write_back_publication(&publication_gate, publication_started) {
         return discard_after_failure(&publisher, staged, GenericCommandError::Cancelled).await;
@@ -5145,6 +5674,80 @@ mod tests {
 
     fn fingerprint(byte: u8) -> Sha256Fingerprint {
         Sha256Fingerprint::from_bytes([byte; 32])
+    }
+
+    #[tokio::test]
+    async fn generic_panic_boundary_keeps_command_stage_and_workspace() {
+        let workspace = PathBuf::from("projects/generic/panic-project");
+        let report = catch_generic_command_panic(
+            GenericCommandPanicContext {
+                command: "translate",
+                stage: DiagnosticStage::Translate,
+                project_workspace: workspace.clone(),
+            },
+            async { panic!("不得读取的测试 panic payload") },
+        )
+        .await;
+
+        let GenericCommandRunResult::Failed(GenericCommandError::Operation { diagnostic, .. }) =
+            report.result
+        else {
+            panic!("Generic 命令 panic 必须成为命令级结构化失败");
+        };
+        assert_eq!(diagnostic.stage, DiagnosticStage::Translate);
+        assert_eq!(diagnostic.code, DiagnosticCode::InternalOperation);
+        assert_eq!(diagnostic.subject, DiagnosticSubject::command("translate"));
+        assert_eq!(diagnostic.impact, DiagnosticImpact::OutcomeUnknown);
+        assert_eq!(diagnostic.action, DiagnosticAction::ReportBug);
+        assert_eq!(diagnostic.recovery, vec![RecoveryFact::path(workspace)]);
+    }
+
+    #[test]
+    fn generic_partial_response_diagnostic_keeps_task_and_output_id() {
+        let diagnostic = generic_response_problem_diagnostic(2, &ResponseProblem::MissingId(7));
+
+        assert_eq!(diagnostic.code, DiagnosticCode::ModelRequest);
+        assert_eq!(diagnostic.stage, DiagnosticStage::ModelRequest);
+        assert_eq!(
+            diagnostic.subject,
+            DiagnosticSubject::operation("generic_translation_task_3")
+        );
+        assert_eq!(
+            diagnostic.reason,
+            DiagnosticReason::failure_with_detail(
+                DiagnosticFailureKind::InvalidResponseContract,
+                "problem=missing_id; output_id=7"
+            )
+        );
+    }
+
+    #[test]
+    fn cancellation_after_request_keeps_task_record_draft() {
+        let prepared = cancelled_generic_prepared_task(
+            1,
+            Some(GenericTaskRecordInFlight {
+                total_tasks: 3,
+                task_index: 1,
+                messages: vec![ChatMessage::new(ChatMessageRole::User, "request")],
+                expected_outputs: 2,
+                started_at: OffsetDateTime::now_utc(),
+                started: Instant::now(),
+                attempt_count: 1,
+                attempts: Vec::new(),
+            }),
+            1,
+        );
+
+        assert_eq!(prepared.task_index, 1);
+        assert!(matches!(
+            prepared.outcome,
+            GenericPreparedTaskOutcome::Cancelled
+        ));
+        let record = prepared.record.expect("请求开始后的取消必须保留可提交记录");
+        assert_eq!(record.total_tasks, 3);
+        assert_eq!(record.task_index, 1);
+        assert_eq!(record.attempt_count, 1);
+        assert!(record.response.is_none());
     }
 
     struct BlockingLanguageModule {

@@ -82,6 +82,7 @@ notice-extract-reuse-owners = No extraction scope was provided; reusing the last
 notice-translate-reuse-profile = No profile was provided; reusing the last successful profile: { $profile }.
 notice-owner-disabled = Owner { $owner } was disabled and removed from future automatic plans.
 warning-rules-command-non-string-skipped = Warning: Rules rule { $rule_number } skipped { $skipped_count } non-string command parameters (source { $source_file }, code={ $command_code }, parameter={ $parameter }, type={ $actual_type }).
+warning-manual-layout-required = Warning: manual line-break review is required at { $locations } (region={ $region }, max_fullwidth_chars={ $max_fullwidth_chars }).
 notice-no-model-request = All translation units are current; no model request was needed in this run.
 notice-manual-layout = { $count ->
     [one] 1 unit needs a manual line-break review.

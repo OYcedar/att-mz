@@ -82,6 +82,7 @@ notice-extract-reuse-owners = 추출 범위가 없어 마지막 성공 계획을
 notice-translate-reuse-profile = Profile이 없어 마지막 성공 Profile을 재사용합니다: { $profile }.
 notice-owner-disabled = owner { $owner }을 비활성화하고 이후 자동 계획에서 제거했습니다.
 warning-rules-command-non-string-skipped = 경고: Rules 규칙 { $rule_number }에서 문자열이 아닌 command 매개변수 { $skipped_count }개를 건너뛰었습니다(소스 { $source_file }, code={ $command_code }, parameter={ $parameter }, 유형 { $actual_type }).
+warning-manual-layout-required = 경고: { $locations }의 줄바꿈을 수동으로 확인해야 합니다(region={ $region }, max_fullwidth_chars={ $max_fullwidth_chars }).
 notice-no-model-request = 모든 번역 단위가 최신 상태여서 이번 실행에서는 모델 요청을 보내지 않았습니다.
 notice-manual-layout = { $count }개 단위의 줄바꿈을 수동으로 확인해야 합니다.
 notice-log-degraded = 프로젝트 로그를 사용할 수 없거나 성능이 저하되었습니다. 명령은 계속되며 종료 상태는 바뀌지 않습니다.

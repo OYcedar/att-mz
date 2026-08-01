@@ -4075,10 +4075,14 @@ struct RawWriteBackSelection {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawTranslationSelection {
-    #[serde(default)]
+    #[serde(default = "default_record_translation_tasks")]
     record_translation_tasks: bool,
     #[serde(rename = "profiles")]
     _profiles: IgnoredAny,
+}
+
+const fn default_record_translation_tasks() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -4633,11 +4637,7 @@ id = "unused"
         let directory = TestDirectory::new();
         let example = include_str!("../../config.example.toml");
         let cases = [
-            (
-                "omitted",
-                example.replace(EXAMPLE_TASK_RECORDING, ""),
-                false,
-            ),
+            ("omitted", example.replace(EXAMPLE_TASK_RECORDING, ""), true),
             (
                 "false",
                 example.replace(EXAMPLE_TASK_RECORDING, "record_translation_tasks = false"),

@@ -82,6 +82,7 @@ notice-extract-reuse-owners = 未提供擷取範圍，已沿用上次成功方�
 notice-translate-reuse-profile = 未提供 Profile，已沿用上次成功 Profile：{ $profile }。
 notice-owner-disabled = 已停用 owner { $owner }，並將其移出後續自動方案。
 warning-rules-command-non-string-skipped = 警告：Rules 規則 { $rule_number } 跳過了 { $skipped_count } 個非字串 command 參數（來源 { $source_file }，code={ $command_code }，parameter={ $parameter }，類型 { $actual_type }）。
+warning-manual-layout-required = 警告：以下文字需要人工檢查換行：{ $locations }（區域={ $region }，全形字元上限={ $max_fullwidth_chars }）。
 notice-no-model-request = 所有翻譯單元都是最新狀態，本次不需請求模型。
 notice-manual-layout = 有 { $count } 個單元需要人工檢查換行。
 notice-log-degraded = 專案日誌無法使用或已降級；命令會繼續，結束狀態不受影響。

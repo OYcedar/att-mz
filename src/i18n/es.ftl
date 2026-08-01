@@ -82,6 +82,7 @@ notice-extract-reuse-owners = No se indicó el ámbito de extracción; se reutil
 notice-translate-reuse-profile = No se indicó Profile; se reutiliza el último Profile correcto: { $profile }.
 notice-owner-disabled = El owner { $owner } se desactivó y se quitó de futuros planes automáticos.
 warning-rules-command-non-string-skipped = Advertencia: la regla Rules { $rule_number } omitió { $skipped_count } parámetros command que no eran cadenas (origen { $source_file }, code={ $command_code }, parameter={ $parameter }, tipo={ $actual_type }).
+warning-manual-layout-required = Advertencia: revise manualmente los saltos de línea en { $locations } (region={ $region }, max_fullwidth_chars={ $max_fullwidth_chars }).
 notice-no-model-request = Todas las unidades de traducción están actualizadas; esta ejecución no necesitó enviar solicitudes al modelo.
 notice-manual-layout = { $count ->
     [one] 1 unidad necesita revisión manual de saltos de línea.
