@@ -46,16 +46,17 @@ use crate::translation::placeholder_projection::{
     PlaceholderTextScan,
 };
 use crate::translation::placeholder_token;
+use crate::translation::task_planning::TaskId;
 use crate::translation_protocol::{
     DecodedJsonStringArray, parse_translation_response_with_cancellation,
 };
 
 use super::pipeline::{
     AcceptedTranslationDecision, AppliedPlaceholder, ExpectedLineShape, ExpectedTranslationOutput,
-    NonEmptyTaskItems, PlaceholderRuleOrigin, RpgMakerTranslationExecutionProfile,
-    RpgMakerTranslationTaskExecutor, RpgMakerTranslationTaskIndex, TranslationPatch,
-    TranslationProtocolDiagnostic, TranslationTaskBlock, TranslationTaskOutcome,
-    TranslationTaskOutcomeContext, TranslationTaskUnavailableReason,
+    NonEmptyTaskItems, PlaceholderRuleOrigin, RpgMakerExecutableTask,
+    RpgMakerTranslationExecutionProfile, RpgMakerTranslationTaskExecutor,
+    RpgMakerTranslationTaskIndex, TranslationPatch, TranslationProtocolDiagnostic,
+    TranslationTaskOutcome, TranslationTaskOutcomeContext, TranslationTaskUnavailableReason,
     TranslationUnitRejectionReason, UnresolvedTranslationUnit,
 };
 use super::profile::{
@@ -210,7 +211,7 @@ where
 pub(crate) enum TranslationCandidateInvariantLocation {
     TaskUnit {
         task_index: RpgMakerTranslationTaskIndex,
-        unit_id: usize,
+        unit_id: TaskId,
     },
     #[cfg(test)]
     PreparedCandidate,
@@ -377,11 +378,12 @@ fn translation_task_subject(task_index: RpgMakerTranslationTaskIndex) -> Diagnos
 
 fn translation_unit_subject(
     task_index: RpgMakerTranslationTaskIndex,
-    unit_id: usize,
+    unit_id: TaskId,
 ) -> DiagnosticSubject {
     DiagnosticSubject::operation(format!(
-        "translation_task_{}_unit_{unit_id}",
-        task_index.get()
+        "translation_task_{}_unit_{}",
+        task_index.get(),
+        unit_id.get()
     ))
 }
 
@@ -405,7 +407,11 @@ fn candidate_location_detail(location: TranslationCandidateInvariantLocation) ->
         TranslationCandidateInvariantLocation::TaskUnit {
             task_index,
             unit_id,
-        } => format!("scope=task_unit; task={}; unit={unit_id}", task_index.get()),
+        } => format!(
+            "scope=task_unit; task={}; unit={}",
+            task_index.get(),
+            unit_id.get()
+        ),
         #[cfg(test)]
         TranslationCandidateInvariantLocation::PreparedCandidate => {
             "scope=prepared_candidate".to_owned()
@@ -422,14 +428,14 @@ pub(crate) trait TranslationTaskResponseProcessor: Send + Sync {
 
     fn process(
         &self,
-        task: &TranslationTaskBlock,
+        task: &RpgMakerExecutableTask,
         response: LlmResponse,
         attempt: usize,
     ) -> impl Future<Output = Result<TranslationTaskOutcome, Self::Error>> + Send;
 
     fn process_recorded(
         &self,
-        task: &TranslationTaskBlock,
+        task: &RpgMakerExecutableTask,
         response: LlmResponse,
         attempt: usize,
     ) -> impl Future<
@@ -516,7 +522,7 @@ where
 {
     async fn process_with_recording(
         &self,
-        task: &TranslationTaskBlock,
+        task: &RpgMakerExecutableTask,
         response: LlmResponse,
         attempt: usize,
     ) -> Result<ProcessedTranslationTaskResponse, TranslationTaskResponseProcessingError<C::Error>>
@@ -558,7 +564,7 @@ where
 
     async fn process(
         &self,
-        task: &TranslationTaskBlock,
+        task: &RpgMakerExecutableTask,
         response: LlmResponse,
         attempt: usize,
     ) -> Result<TranslationTaskOutcome, Self::Error> {
@@ -569,7 +575,7 @@ where
 
     async fn process_recorded(
         &self,
-        task: &TranslationTaskBlock,
+        task: &RpgMakerExecutableTask,
         response: LlmResponse,
         attempt: usize,
     ) -> Result<ProcessedTranslationTaskResponse, RecordedTranslationTaskResponseFailure<Self::Error>>
@@ -1049,7 +1055,7 @@ where
     async fn execute(
         &self,
         profile: &Self::Profile,
-        task: &TranslationTaskBlock,
+        task: &RpgMakerExecutableTask,
     ) -> Result<TranslationTaskExecution, TranslationTaskExecutionFailure<Self::Error>> {
         let mut evidence = TranslationTaskEvidenceBuilder::new(self.record_task_response);
         if task.expected_outputs().is_empty() {
@@ -1226,7 +1232,7 @@ where
     async fn execute(
         &self,
         profile: &P,
-        task: TranslationTaskBlock,
+        task: RpgMakerExecutableTask,
     ) -> Result<TranslationTaskOutcome, RpgMakerTranslationTaskExecutionError<L::Error, R::Error>>
     {
         match <Self as RpgMakerTranslationTaskExecutor>::execute(self, profile, &task).await {
@@ -1237,7 +1243,7 @@ where
 }
 
 fn unavailable_after_request_failure(
-    task: &TranslationTaskBlock,
+    task: &RpgMakerExecutableTask,
     attempts: NonZeroUsize,
     reason: TranslationTaskUnavailableReason,
 ) -> TranslationTaskOutcome {
@@ -1885,17 +1891,17 @@ fn accept_translation_lines_candidate_at_with_cancellation(
 struct ParsedModelOutput {
     id: String,
     value: Box<RawValue>,
-    canonical_id: Option<usize>,
+    canonical_id: Option<TaskId>,
     translation: Result<Vec<String>, TranslationAssistantValueError>,
 }
 
 #[derive(Debug)]
 struct ModelOutputForAcceptance {
-    canonical_id: Option<usize>,
+    canonical_id: Option<TaskId>,
     translation: Result<Vec<String>, TranslationAssistantValueError>,
 }
 
-type ModelOutputsById = BTreeMap<usize, Vec<Result<Vec<String>, String>>>;
+type ModelOutputsById = BTreeMap<TaskId, Vec<Result<Vec<String>, String>>>;
 
 fn append_response_processing_text_with_cancellation<E>(
     output: &mut String,
@@ -1994,7 +2000,7 @@ fn contains_reserved_placeholder_prefix_with_cancellation<E>(
 
 fn collect_model_outputs_with_cancellation<E>(
     outputs: Vec<ModelOutputForAcceptance>,
-    expected_by_id: &BTreeMap<usize, &ExpectedTranslationOutput>,
+    expected_by_id: &BTreeMap<TaskId, &ExpectedTranslationOutput>,
     diagnostics: &mut Vec<TranslationProtocolDiagnostic>,
     mut ensure_running: impl FnMut() -> Result<(), E>,
 ) -> Result<ModelOutputsById, E> {
@@ -2020,14 +2026,14 @@ fn collect_model_outputs_with_cancellation<E>(
 }
 
 #[cfg(test)]
-fn parse_model_output_id(value: &str) -> Option<usize> {
+fn parse_model_output_id(value: &str) -> Option<TaskId> {
     if value.is_empty()
         || !value.bytes().all(|byte| byte.is_ascii_digit())
         || value.starts_with('0')
     {
         return None;
     }
-    value.parse().ok()
+    value.parse().ok().and_then(TaskId::new)
 }
 
 #[cfg(test)]
@@ -3381,6 +3387,10 @@ mod tests {
 
     impl Error for FakeError {}
 
+    fn task_id(value: usize) -> TaskId {
+        TaskId::new(value).expect("测试 Task ID 必须非零")
+    }
+
     impl LlmRequestDiagnosticSource for FakeError {
         fn request_diagnostic(
             &self,
@@ -3781,7 +3791,7 @@ mod tests {
         identity: TranslationUnitIdentity,
         line_shape: ExpectedLineShape,
         analysis: crate::language::LanguageAnalysis,
-    ) -> TranslationTaskBlock {
+    ) -> RpgMakerExecutableTask {
         line_task_with_propagation(identity, Vec::new(), line_shape, analysis)
     }
 
@@ -3790,7 +3800,7 @@ mod tests {
         propagation_targets: Vec<TranslationUnitIdentity>,
         line_shape: ExpectedLineShape,
         analysis: crate::language::LanguageAnalysis,
-    ) -> TranslationTaskBlock {
+    ) -> RpgMakerExecutableTask {
         let protected_text = match identity.source_content() {
             TextUnitContent::Value(value) => value.clone(),
             TextUnitContent::Lines(lines) => lines.join("\n"),
@@ -3798,7 +3808,7 @@ mod tests {
         let propagation_state_contexts = (0..propagation_targets.len())
             .map(|index| state_context(index as u8 + 5))
             .collect();
-        TranslationTaskBlock::new(
+        RpgMakerExecutableTask::new(
             RpgMakerTranslationTaskIndex::new(4),
             LanguagePair::new(
                 LanguageId::parse("ja").expect("测试源语言合法"),
@@ -3809,7 +3819,7 @@ mod tests {
                 ChatMessage::new(ChatMessageRole::User, "# Task"),
             ],
             vec![ExpectedTranslationOutput::new(
-                1,
+                task_id(1),
                 identity,
                 propagation_targets,
                 ExpectedTranslationValidation::new(
@@ -3824,16 +3834,16 @@ mod tests {
         )
     }
 
-    fn task() -> TranslationTaskBlock {
+    fn task() -> RpgMakerExecutableTask {
         task_with_output_count(1)
     }
 
-    fn task_with_output_count(output_count: usize) -> TranslationTaskBlock {
+    fn task_with_output_count(output_count: usize) -> RpgMakerExecutableTask {
         task_with_language_pair("ja", "zh-Hans", output_count)
     }
 
-    fn speaker_task() -> TranslationTaskBlock {
-        TranslationTaskBlock::new(
+    fn speaker_task() -> RpgMakerExecutableTask {
+        RpgMakerExecutableTask::new(
             RpgMakerTranslationTaskIndex::new(3),
             LanguagePair::new(
                 LanguageId::parse("ja").expect("测试源语言合法"),
@@ -3844,7 +3854,7 @@ mod tests {
                 ChatMessage::new(ChatMessageRole::User, "# Task"),
             ],
             vec![ExpectedTranslationOutput::new(
-                1,
+                task_id(1),
                 speaker_identity(),
                 Vec::new(),
                 ExpectedTranslationValidation::new(
@@ -3863,8 +3873,8 @@ mod tests {
         source_language: &str,
         target_language: &str,
         output_count: usize,
-    ) -> TranslationTaskBlock {
-        TranslationTaskBlock::new(
+    ) -> RpgMakerExecutableTask {
+        RpgMakerExecutableTask::new(
             RpgMakerTranslationTaskIndex::new(2),
             LanguagePair::new(
                 LanguageId::parse(source_language).expect("测试源语言合法"),
@@ -3877,7 +3887,7 @@ mod tests {
             (1..=output_count)
                 .map(|id| {
                     ExpectedTranslationOutput::new(
-                        id,
+                        task_id(id),
                         identity(),
                         vec![propagation_target()],
                         ExpectedTranslationValidation::new(
@@ -4107,7 +4117,7 @@ mod tests {
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].id, "1");
         assert_eq!(outputs[1].id, "2");
-        assert_eq!(parse_model_output_id("1"), Some(1));
+        assert_eq!(parse_model_output_id("1"), Some(task_id(1)));
         for invalid in ["", "0", "01", "-1", "1.5", "true"] {
             assert_eq!(parse_model_output_id(invalid), None);
         }
@@ -4239,7 +4249,7 @@ mod tests {
             TextUnitContent::Lines(lines) => lines.join("\n"),
             TextUnitContent::Value(_) => unreachable!("对话正文必须是完整行序列"),
         };
-        let task = TranslationTaskBlock::new(
+        let task = RpgMakerExecutableTask::new(
             RpgMakerTranslationTaskIndex::new(6),
             LanguagePair::new(
                 LanguageId::parse("ja").expect("测试源语言合法"),
@@ -4251,7 +4261,7 @@ mod tests {
             ],
             vec![
                 ExpectedTranslationOutput::new(
-                    1,
+                    task_id(1),
                     body,
                     Vec::new(),
                     ExpectedTranslationValidation::new(
@@ -4268,7 +4278,7 @@ mod tests {
                     Vec::new(),
                 ),
                 ExpectedTranslationOutput::new(
-                    2,
+                    task_id(2),
                     speaker_identity(),
                     Vec::new(),
                     ExpectedTranslationValidation::new(
@@ -4298,9 +4308,9 @@ mod tests {
 
             assert!(matches!(outcome, TranslationTaskOutcome::Partial { .. }));
             assert_eq!(outcome.accepted().len(), 1);
-            assert_eq!(outcome.accepted()[0].id(), 2);
+            assert_eq!(outcome.accepted()[0].id(), task_id(2));
             assert_eq!(outcome.unresolved().len(), 1);
-            assert_eq!(outcome.unresolved()[0].id(), 1);
+            assert_eq!(outcome.unresolved()[0].id(), task_id(1));
             assert!(matches!(
                 outcome.unresolved()[0].reason(),
                 TranslationUnitRejectionReason::BlankTranslation
@@ -4468,7 +4478,7 @@ mod tests {
             TextUnitContent::Lines(vec!["\\N[1]に話す".to_owned(), "やめる".to_owned()]),
             "{}",
         );
-        let task = TranslationTaskBlock::new(
+        let task = RpgMakerExecutableTask::new(
             RpgMakerTranslationTaskIndex::new(5),
             LanguagePair::new(
                 LanguageId::parse("ja").expect("测试源语言合法"),
@@ -4479,7 +4489,7 @@ mod tests {
                 ChatMessage::new(ChatMessageRole::User, "# Task"),
             ],
             vec![ExpectedTranslationOutput::new(
-                1,
+                task_id(1),
                 identity,
                 Vec::new(),
                 ExpectedTranslationValidation::new(
@@ -4529,7 +4539,7 @@ mod tests {
             "{}",
         );
         let error = ExpectedTranslationOutput::try_new(
-            1,
+            task_id(1),
             identity,
             Vec::new(),
             ExpectedTranslationValidation::new(
@@ -4554,10 +4564,10 @@ mod tests {
             error,
             super::super::pipeline::ExpectedTranslationOutputContractError::
                 ProtectedPlaceholderCrossesLineBoundary {
-                    unit_id: 1,
+                    unit_id,
                     placeholder_index: 0,
                     ..
-                }
+                } if unit_id == task_id(1)
         ));
     }
 
@@ -5066,9 +5076,9 @@ mod tests {
 
         assert!(matches!(&result, TranslationTaskOutcome::Partial { .. }));
         assert_eq!(result.accepted().len(), 1);
-        assert_eq!(result.accepted()[0].id(), 1);
+        assert_eq!(result.accepted()[0].id(), task_id(1));
         assert_eq!(result.unresolved().len(), 1);
-        assert_eq!(result.unresolved()[0].id(), 2);
+        assert_eq!(result.unresolved()[0].id(), task_id(2));
         assert!(matches!(
             result.unresolved()[0].reason(),
             TranslationUnitRejectionReason::UnexpectedPlaceholderToken { token }
@@ -5167,17 +5177,17 @@ mod tests {
         assert_eq!(result.attempts().get(), 2);
         assert_eq!(result.accepted().len(), 1);
         assert_eq!(result.unresolved().len(), 5);
-        assert_eq!(result.unresolved()[0].id(), 2);
+        assert_eq!(result.unresolved()[0].id(), task_id(2));
         assert!(matches!(
             result.unresolved()[0].reason(),
             TranslationUnitRejectionReason::Duplicate
         ));
-        assert_eq!(result.unresolved()[1].id(), 3);
+        assert_eq!(result.unresolved()[1].id(), task_id(3));
         assert!(matches!(
             result.unresolved()[1].reason(),
             TranslationUnitRejectionReason::Missing
         ));
-        assert_eq!(result.unresolved()[2].id(), 4);
+        assert_eq!(result.unresolved()[2].id(), task_id(4));
         assert!(matches!(
             result.unresolved()[2].reason(),
             TranslationUnitRejectionReason::BlankLineMismatch {
@@ -5185,12 +5195,12 @@ mod tests {
                 expected_blank: false
             }
         ));
-        assert_eq!(result.unresolved()[3].id(), 5);
+        assert_eq!(result.unresolved()[3].id(), task_id(5));
         assert!(matches!(
             result.unresolved()[3].reason(),
             TranslationUnitRejectionReason::PlaceholderMismatch { .. }
         ));
-        assert_eq!(result.unresolved()[4].id(), 6);
+        assert_eq!(result.unresolved()[4].id(), task_id(6));
         assert!(matches!(
             result.unresolved()[4].reason(),
             TranslationUnitRejectionReason::SourceResidual { .. }
@@ -5201,7 +5211,7 @@ mod tests {
         )));
         assert!(result.diagnostics().iter().any(|diagnostic| matches!(
             diagnostic,
-            TranslationProtocolDiagnostic::UnknownId { id: 99, .. }
+            TranslationProtocolDiagnostic::UnknownId { id, .. } if *id == task_id(99)
         )));
         assert_eq!(result.diagnostics().len(), 2);
     }
@@ -5232,9 +5242,9 @@ mod tests {
 
         assert!(matches!(&result, TranslationTaskOutcome::Partial { .. }));
         assert_eq!(result.accepted().len(), 1);
-        assert_eq!(result.accepted()[0].id(), 1);
+        assert_eq!(result.accepted()[0].id(), task_id(1));
         assert_eq!(result.unresolved().len(), 1);
-        assert_eq!(result.unresolved()[0].id(), 2);
+        assert_eq!(result.unresolved()[0].id(), task_id(2));
         assert!(matches!(
             result.unresolved()[0].reason(),
             TranslationUnitRejectionReason::InvalidShape { message }
@@ -5246,7 +5256,7 @@ mod tests {
         )));
         assert!(result.diagnostics().iter().any(|diagnostic| matches!(
             diagnostic,
-            TranslationProtocolDiagnostic::UnknownId { id: 99, .. }
+            TranslationProtocolDiagnostic::UnknownId { id, .. } if *id == task_id(99)
         )));
     }
 
@@ -5276,9 +5286,9 @@ mod tests {
 
         assert!(matches!(&outcome, TranslationTaskOutcome::Partial { .. }));
         assert_eq!(outcome.accepted().len(), 1);
-        assert_eq!(outcome.accepted()[0].id(), 2);
+        assert_eq!(outcome.accepted()[0].id(), task_id(2));
         assert_eq!(outcome.unresolved().len(), 1);
-        assert_eq!(outcome.unresolved()[0].id(), 1);
+        assert_eq!(outcome.unresolved()[0].id(), task_id(1));
         assert!(matches!(
             outcome.unresolved()[0].reason(),
             TranslationUnitRejectionReason::InvalidShape { message }
@@ -6059,7 +6069,7 @@ mod tests {
             .expect("合法响应必须保留有序条目");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id(), "1");
-        assert_eq!(entries[0].canonical_id(), Some(1));
+        assert_eq!(entries[0].canonical_id(), Some(task_id(1)));
         assert_eq!(entries[0].value_error(), None);
         assert_eq!(
             entries[0].lines(),

@@ -262,6 +262,7 @@ pub(super) struct MatchedRuleTarget {
     parts: Vec<MatchedRulePart>,
     source_order: usize,
     physical_order: Vec<usize>,
+    plugin_parameter_order: Option<usize>,
 }
 
 impl MatchedRuleTarget {
@@ -271,6 +272,14 @@ impl MatchedRuleTarget {
 
     pub(super) fn units(&self) -> &[MatchedRuleUnit] {
         &self.units
+    }
+
+    pub(super) fn physical_order(&self) -> &[usize] {
+        &self.physical_order
+    }
+
+    pub(super) const fn plugin_parameter_order(&self) -> Option<usize> {
+        self.plugin_parameter_order
     }
 
     pub(super) fn physical_location(&self) -> Result<RpgMakerLocation, RulesMatchError> {
@@ -860,6 +869,7 @@ fn materialize_plugin_targets(
         terminal.target.steps = steps;
         terminal.target.source_order = source_order + *parameter_index;
         terminal.target.physical_order = physical_order.to_vec();
+        terminal.target.plugin_parameter_order = Some(*parameter_index);
         targets.push(terminal.target);
     }
     Ok(targets)
@@ -2091,6 +2101,7 @@ fn materialize_target(
         parts,
         source_order: 0,
         physical_order: Vec::new(),
+        plugin_parameter_order: None,
     }))
 }
 

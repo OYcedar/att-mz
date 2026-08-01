@@ -1,4 +1,4 @@
-//! Generic 的全局去重、文件内任务拆分与字符串响应验收。
+//! Generic 的稳定 TaskBlock 投影、全局去重与字符串响应验收。
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
@@ -8,10 +8,16 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 
+use rayon::prelude::*;
+
 use crate::execution::CooperativeCancellation;
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::language::LanguagePair;
 use crate::translation::planning_resource::CompiledTerminology;
+use crate::translation::task_planning::{
+    StableGroupCharacters, TaskId, TaskPlanningError, TaskPlanningGroupLayout, TaskPlanningLayout,
+    TaskPlanningScopeLayout, UnitTaskResponsibility, assign_task_ids, pack_complete_task_blocks,
+};
 use crate::translation_protocol::ParsedTranslationResponse;
 #[cfg(test)]
 use crate::translation_protocol::{
@@ -205,9 +211,35 @@ pub(crate) struct PlanningUnit {
     terminology_indices: Vec<usize>,
     needs_translation: bool,
     current_translation: Option<String>,
+    current_context: Option<CurrentContext>,
     expected_state_fingerprint: Sha256Fingerprint,
     expected_previous: Option<GenericStoredTranslation>,
     invalidated_previous: Option<GenericStoredTranslation>,
+}
+
+/// Current Unit 在完整 TaskBlock 中提供的安全语境。
+///
+/// 无法把目标译文按本 Unit 的 Placeholder 绑定安全保护时，源文仍可供模型理解相邻文本，
+/// 但它不是目标译文，不能成为全局复用的种子。
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CurrentContext {
+    SafeTarget(String),
+    ProtectedSourceFallback(String),
+}
+
+impl CurrentContext {
+    fn text(&self) -> &str {
+        match self {
+            Self::SafeTarget(text) | Self::ProtectedSourceFallback(text) => text,
+        }
+    }
+
+    fn reuse_candidate(&self) -> Option<&str> {
+        match self {
+            Self::SafeTarget(text) => Some(text),
+            Self::ProtectedSourceFallback(_) => None,
+        }
+    }
 }
 
 /// 自动翻译状态中由公共翻译能力提供的实际资源身份。
@@ -229,6 +261,9 @@ impl PlanningUnit {
         current_translation: Option<String>,
         expected_state_fingerprint: Sha256Fingerprint,
     ) -> Self {
+        let current_context = current_translation
+            .as_ref()
+            .map(|text| CurrentContext::SafeTarget(text.clone()));
         Self {
             key,
             protected_text,
@@ -236,6 +271,7 @@ impl PlanningUnit {
             terminology_indices: Vec::new(),
             needs_translation,
             current_translation,
+            current_context,
             expected_state_fingerprint,
             expected_previous: None,
             invalidated_previous: None,
@@ -316,6 +352,7 @@ impl PlanningUnit {
             terminology_indices,
             needs_translation,
             current_translation,
+            current_context: None,
             expected_state_fingerprint: automatic_state,
             expected_previous,
             invalidated_previous,
@@ -330,13 +367,29 @@ impl PlanningUnit {
         self.needs_translation && self.current_translation.is_none()
     }
 
-    pub(crate) fn needs_planning(&self) -> bool {
-        self.invalidated_previous.is_some() || self.needs_candidate()
-    }
-
-    #[cfg(test)]
     pub(crate) fn current_translation(&self) -> Option<&str> {
         self.current_translation.as_deref()
+    }
+
+    /// 为已经确认 Current 的目标文本安装使用本 Unit Placeholder 绑定的安全表示。
+    ///
+    /// 状态判断仍使用持久化译文；进入 Task 规划前，调用方必须完成这一步，避免把原始
+    /// Placeholder 内容直接发给模型。
+    pub(crate) fn install_current_target_context(&mut self, context_text: String) {
+        assert!(
+            self.current_translation.is_some(),
+            "只有 Current Unit 才能安装目标语境文本"
+        );
+        self.current_context = Some(CurrentContext::SafeTarget(context_text));
+    }
+
+    /// 目标译文无法安全投影时，安装只供模型理解相邻语义的保护后源文。
+    pub(crate) fn install_current_source_fallback(&mut self, context_text: String) {
+        assert!(
+            self.current_translation.is_some(),
+            "只有 Current Unit 才能安装源文回退语境"
+        );
+        self.current_context = Some(CurrentContext::ProtectedSourceFallback(context_text));
     }
 }
 
@@ -424,6 +477,38 @@ pub(crate) struct PlannedReuse {
     expected_previous: Option<GenericStoredTranslation>,
 }
 
+/// 一个目标 Unit 已经完整验收的复用结果。
+///
+/// `translation` 是提交到项目的最终译文；`context_text` 是使用该目标 Unit 的
+/// Placeholder 绑定重新保护后的安全表示。二者必须由同一次验收产生，避免语言修复后
+/// 模型看到的语境仍停留在修复前。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ValidatedReuse {
+    translation: String,
+    context_text: String,
+}
+
+impl ValidatedReuse {
+    pub(crate) fn new(translation: String, context_text: String) -> Self {
+        Self {
+            translation,
+            context_text,
+        }
+    }
+
+    #[cfg(test)]
+    fn same_text(text: String) -> Self {
+        Self {
+            context_text: text.clone(),
+            translation: text,
+        }
+    }
+
+    fn into_parts(self) -> (String, String) {
+        (self.translation, self.context_text)
+    }
+}
+
 impl PlannedReuse {
     #[cfg(test)]
     pub(crate) fn key(&self) -> &GenericUnitKey {
@@ -452,12 +537,12 @@ impl PlannedReuse {
 /// Task 中一个只负责提供上下文或要求输出的 Unit。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PlannedContextUnit {
-    output_id: Option<u64>,
+    output_id: Option<TaskId>,
     text: String,
 }
 
 impl PlannedContextUnit {
-    pub(crate) const fn output_id(&self) -> Option<u64> {
+    pub(crate) const fn output_id(&self) -> Option<TaskId> {
         self.output_id
     }
 
@@ -470,7 +555,6 @@ impl PlannedContextUnit {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PlannedGroup {
     kind: String,
-    terminology_indices: Vec<usize>,
     units: Vec<PlannedContextUnit>,
 }
 
@@ -481,17 +565,6 @@ impl PlannedGroup {
 
     pub(crate) fn units(&self) -> &[PlannedContextUnit] {
         &self.units
-    }
-
-    pub(crate) fn terminology_indices(&self) -> &[usize] {
-        &self.terminology_indices
-    }
-
-    pub(crate) fn output_count(&self) -> usize {
-        self.units
-            .iter()
-            .filter(|unit| unit.output_id.is_some())
-            .count()
     }
 }
 
@@ -509,8 +582,8 @@ struct PlannedDestination {
 pub(crate) struct PlannedTask {
     relative_path: PathBuf,
     groups: Vec<PlannedGroup>,
-    estimated_characters: usize,
-    outputs: BTreeMap<u64, Vec<PlannedDestination>>,
+    terminology_indices: Vec<usize>,
+    outputs: BTreeMap<TaskId, Vec<PlannedDestination>>,
 }
 
 impl PlannedTask {
@@ -523,12 +596,11 @@ impl PlannedTask {
         &self.groups
     }
 
-    #[cfg(test)]
-    pub(crate) const fn estimated_characters(&self) -> usize {
-        self.estimated_characters
+    pub(crate) fn terminology_indices(&self) -> &[usize] {
+        &self.terminology_indices
     }
 
-    pub(crate) fn expected_output_ids(&self) -> impl Iterator<Item = u64> + '_ {
+    pub(crate) fn expected_output_ids(&self) -> impl Iterator<Item = TaskId> + '_ {
         self.outputs.keys().copied()
     }
 }
@@ -542,14 +614,6 @@ pub(crate) struct TranslationPlan {
 }
 
 impl TranslationPlan {
-    pub(crate) const fn empty() -> Self {
-        Self {
-            invalidations: Vec::new(),
-            reused: Vec::new(),
-            tasks: Vec::new(),
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn invalidations(&self) -> &[PlannedInvalidation] {
         &self.invalidations
@@ -576,10 +640,12 @@ impl TranslationPlan {
     }
 }
 
-/// 规划输入与 Extract 快照不一致。
+/// Generic 稳定装箱、状态规划或 Extract 快照投影无法建立完整结果。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum GenericPlanningError {
     Cancelled,
+    TaskPlanning(TaskPlanningError),
+    MissingCurrentContext(GenericUnitKey),
     Missing(GenericUnitKey),
     Unknown(GenericUnitKey),
     Duplicate(GenericUnitKey),
@@ -589,6 +655,12 @@ impl fmt::Display for GenericPlanningError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Cancelled => formatter.write_str("Generic 翻译规划已取消"),
+            Self::TaskPlanning(source) => source.fmt(formatter),
+            Self::MissingCurrentContext(key) => write!(
+                formatter,
+                "Current Generic Unit 缺少安全目标语境：{}/{}",
+                key.group_id, key.unit_id
+            ),
             Self::Missing(key) => write!(
                 formatter,
                 "缺少 Generic Unit 的规划事实：{}/{}",
@@ -608,11 +680,29 @@ impl fmt::Display for GenericPlanningError {
     }
 }
 
-impl Error for GenericPlanningError {}
+impl Error for GenericPlanningError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::TaskPlanning(source) => Some(source),
+            Self::Cancelled
+            | Self::MissingCurrentContext(_)
+            | Self::Missing(_)
+            | Self::Unknown(_)
+            | Self::Duplicate(_) => None,
+        }
+    }
+}
 
 impl GenericPlanningError {
     pub(crate) const fn is_cancelled(&self) -> bool {
         matches!(self, Self::Cancelled)
+            || matches!(self, Self::TaskPlanning(source) if source.is_cancelled())
+    }
+}
+
+impl From<TaskPlanningError> for GenericPlanningError {
+    fn from(source: TaskPlanningError) -> Self {
+        Self::TaskPlanning(source)
     }
 }
 
@@ -658,43 +748,107 @@ fn deduplication_keys_equal_with_cancellation(
     )
 }
 
-#[derive(Clone)]
-struct UnitFacts<'a> {
-    input: &'a PlanningUnit,
+struct SnapshotUnitFacts<'a> {
+    key: GenericUnitKey,
     source_text: &'a str,
     group_context: Sha256Fingerprint,
 }
 
-fn planning_unit_fact<'map, 'input>(
-    facts: &'map GenericUnitMap<UnitFacts<'input>>,
-    key: &GenericUnitKey,
+struct UnitFacts<'input, 'snapshot> {
+    key: GenericUnitKey,
+    input: &'input PlanningUnit,
+    source_text: &'snapshot str,
+    group_context: Sha256Fingerprint,
+}
+
+fn resolve_planning_inputs<'input>(
+    natural_units: &[SnapshotUnitFacts<'_>],
+    planning_units: &'input [PlanningUnit],
     is_cancelled: &impl Fn() -> bool,
-) -> Result<&'map UnitFacts<'input>, GenericPlanningError> {
-    let Some(fact) =
-        facts.get_with_cancellation(key, || ensure_planning_not_cancelled(is_cancelled))?
-    else {
-        return Err(GenericPlanningError::Missing(
-            clone_planning_key_with_cancellation(key, is_cancelled)?,
-        ));
-    };
-    Ok(fact)
+) -> Result<Vec<&'input PlanningUnit>, GenericPlanningError> {
+    let mut naturally_ordered = natural_units.len() == planning_units.len();
+    if naturally_ordered {
+        for (natural, supplied) in natural_units.iter().zip(planning_units) {
+            ensure_planning_not_cancelled(is_cancelled)?;
+            if !generic_unit_keys_equal_with_cancellation(&natural.key, &supplied.key, || {
+                ensure_planning_not_cancelled(is_cancelled)
+            })? {
+                naturally_ordered = false;
+                break;
+            }
+        }
+    }
+    if naturally_ordered {
+        ensure_planning_not_cancelled(is_cancelled)?;
+        return Ok(planning_units.iter().collect());
+    }
+
+    // 非生产顺序仍按完整身份严格验收，以保留 Duplicate、Missing 和 Unknown 的
+    // 明确诊断。生产路径由 Extract 自然顺序直接建立，不承担这些重复哈希成本。
+    let mut supplied = GenericUnitMap::with_capacity(planning_units.len());
+    for unit in planning_units {
+        ensure_planning_not_cancelled(is_cancelled)?;
+        let key = clone_planning_key_with_cancellation(&unit.key, is_cancelled)?;
+        if supplied
+            .insert_with_cancellation(key, unit, || ensure_planning_not_cancelled(is_cancelled))?
+            .is_some()
+        {
+            return Err(GenericPlanningError::Duplicate(
+                clone_planning_key_with_cancellation(&unit.key, is_cancelled)?,
+            ));
+        }
+    }
+
+    let mut known = GenericUnitMap::with_capacity(natural_units.len());
+    let mut resolved = Vec::with_capacity(natural_units.len());
+    for natural in natural_units {
+        ensure_planning_not_cancelled(is_cancelled)?;
+        let Some(input) = supplied
+            .get_with_cancellation(&natural.key, || ensure_planning_not_cancelled(is_cancelled))?
+        else {
+            return Err(GenericPlanningError::Missing(
+                clone_planning_key_with_cancellation(&natural.key, is_cancelled)?,
+            ));
+        };
+        resolved.push(*input);
+        let previous = known.insert_with_cancellation(
+            clone_planning_key_with_cancellation(&natural.key, is_cancelled)?,
+            (),
+            || ensure_planning_not_cancelled(is_cancelled),
+        )?;
+        debug_assert!(previous.is_none());
+    }
+    for unit in planning_units {
+        ensure_planning_not_cancelled(is_cancelled)?;
+        if !known
+            .contains_with_cancellation(&unit.key, || ensure_planning_not_cancelled(is_cancelled))?
+        {
+            return Err(GenericPlanningError::Unknown(
+                clone_planning_key_with_cancellation(&unit.key, is_cancelled)?,
+            ));
+        }
+    }
+    Ok(resolved)
 }
 
 struct Family {
-    members: Vec<GenericUnitKey>,
+    members: Vec<usize>,
 }
 
-/// 按自然顺序计算全项目去重，并为每个文件形成一个待精确拆分的 Task 草案。
-///
-/// 此处不能按原文长度提前拆分，否则后续按最终 user message 大小重新拆分时，旧边界
-/// 会留下无法与后续 Group 合并的小 Task。文件边界仍在这里建立，最终拆分只在文件内进行。
+/// 按完整 JSONL 层次稳定装箱，再按自然顺序计算全项目去重和块内临时 ID。
 #[cfg(test)]
 pub(crate) fn plan_translation(
     snapshot: &GenericStoredSnapshot,
     planning_units: &[PlanningUnit],
     reuse_validator: impl Fn(&GenericUnitKey, &str) -> Result<String, String>,
 ) -> Result<TranslationPlan, GenericPlanningError> {
-    plan_translation_with_cancellation(snapshot, planning_units, reuse_validator, || false)
+    plan_translation_with_cancellation(
+        snapshot,
+        planning_units,
+        NonZeroUsize::MAX,
+        reuse_validator,
+        &CooperativeCancellation::default(),
+    )
 }
 
 /// 与 [`plan_translation`] 相同，但在全项目规划的自然边界响应调用方取消。
@@ -702,14 +856,16 @@ pub(crate) fn plan_translation(
 pub(crate) fn plan_translation_with_cancellation(
     snapshot: &GenericStoredSnapshot,
     planning_units: &[PlanningUnit],
+    target_task_characters: NonZeroUsize,
     reuse_validator: impl Fn(&GenericUnitKey, &str) -> Result<String, String>,
-    is_cancelled: impl Fn() -> bool,
+    cancellation: &CooperativeCancellation,
 ) -> Result<TranslationPlan, GenericPlanningError> {
     plan_translation_with_validator_and_cancellation(
         snapshot,
         planning_units,
-        |key, candidate| Ok(reuse_validator(key, candidate)),
-        is_cancelled,
+        target_task_characters,
+        |key, candidate| Ok(reuse_validator(key, candidate).map(ValidatedReuse::same_text)),
+        cancellation,
     )
 }
 
@@ -717,29 +873,19 @@ pub(crate) fn plan_translation_with_cancellation(
 pub(crate) fn plan_translation_with_validator_and_cancellation(
     snapshot: &GenericStoredSnapshot,
     planning_units: &[PlanningUnit],
+    target_task_characters: NonZeroUsize,
     reuse_validator: impl Fn(
         &GenericUnitKey,
         &str,
-    ) -> Result<Result<String, String>, GenericPlanningError>,
-    is_cancelled: impl Fn() -> bool,
+    ) -> Result<Result<ValidatedReuse, String>, GenericPlanningError>,
+    cancellation: &CooperativeCancellation,
 ) -> Result<TranslationPlan, GenericPlanningError> {
+    let is_cancelled = || cancellation.is_requested();
     ensure_planning_not_cancelled(&is_cancelled)?;
-    let mut supplied = GenericUnitMap::with_capacity(planning_units.len());
-    for unit in planning_units {
-        ensure_planning_not_cancelled(&is_cancelled)?;
-        let key = clone_planning_key_with_cancellation(&unit.key, &is_cancelled)?;
-        if supplied
-            .insert_with_cancellation(key, unit, || ensure_planning_not_cancelled(&is_cancelled))?
-            .is_some()
-        {
-            return Err(GenericPlanningError::Duplicate(
-                clone_planning_key_with_cancellation(&unit.key, &is_cancelled)?,
-            ));
-        }
-    }
-
-    let mut facts = GenericUnitMap::with_capacity(planning_units.len());
-    let mut natural_keys = Vec::new();
+    let (task_layout, scope_file_indices) = generic_task_planning_layout(snapshot, &is_cancelled)?;
+    let complete_task_plan =
+        pack_complete_task_blocks(&task_layout, target_task_characters, cancellation)?;
+    let mut natural_units = Vec::with_capacity(task_layout.total_units());
     for file in snapshot.files() {
         ensure_planning_not_cancelled(&is_cancelled)?;
         for group in file.groups() {
@@ -750,45 +896,32 @@ pub(crate) fn plan_translation_with_validator_and_cancellation(
                     clone_planning_text_with_cancellation(group.id(), &is_cancelled)?,
                     clone_planning_text_with_cancellation(unit.id(), &is_cancelled)?,
                 );
-                let Some(input) = supplied
-                    .get_with_cancellation(&key, || ensure_planning_not_cancelled(&is_cancelled))?
-                    .copied()
-                else {
-                    return Err(GenericPlanningError::Missing(key));
-                };
-                let fact_key = clone_planning_key_with_cancellation(&key, &is_cancelled)?;
-                let previous = facts.insert_with_cancellation(
-                    fact_key,
-                    UnitFacts {
-                        input,
-                        source_text: unit.source_text(),
-                        group_context: group.context_fingerprint(),
-                    },
-                    || ensure_planning_not_cancelled(&is_cancelled),
-                )?;
-                debug_assert!(previous.is_none());
-                natural_keys.push(key);
+                natural_units.push(SnapshotUnitFacts {
+                    key,
+                    source_text: unit.source_text(),
+                    group_context: group.context_fingerprint(),
+                });
             }
         }
     }
-    for unit in planning_units {
-        ensure_planning_not_cancelled(&is_cancelled)?;
-        if !facts.contains_with_cancellation(&unit.key, || {
-            ensure_planning_not_cancelled(&is_cancelled)
-        })? {
-            return Err(GenericPlanningError::Unknown(
-                clone_planning_key_with_cancellation(&unit.key, &is_cancelled)?,
-            ));
-        }
-    }
+    let resolved_inputs = resolve_planning_inputs(&natural_units, planning_units, &is_cancelled)?;
+    let facts = natural_units
+        .into_iter()
+        .zip(resolved_inputs)
+        .map(|(natural, input)| UnitFacts {
+            key: natural.key,
+            input,
+            source_text: natural.source_text,
+            group_context: natural.group_context,
+        })
+        .collect::<Vec<_>>();
 
     let mut invalidations = Vec::new();
-    for key in &natural_keys {
+    for fact in &facts {
         ensure_planning_not_cancelled(&is_cancelled)?;
-        let fact = planning_unit_fact(&facts, key, &is_cancelled)?;
         if let Some(expected_translation) = fact.input.invalidated_previous.as_ref() {
             invalidations.push(PlannedInvalidation {
-                key: clone_planning_key_with_cancellation(key, &is_cancelled)?,
+                key: clone_planning_key_with_cancellation(&fact.key, &is_cancelled)?,
                 expected_source_text: clone_planning_text_with_cancellation(
                     fact.source_text,
                     &is_cancelled,
@@ -804,9 +937,8 @@ pub(crate) fn plan_translation_with_validator_and_cancellation(
 
     let mut family_indices = FingerprintBucketMap::<DeduplicationKey, usize>::new();
     let mut families: Vec<Family> = Vec::new();
-    for key in &natural_keys {
+    for (unit_index, fact) in facts.iter().enumerate() {
         ensure_planning_not_cancelled(&is_cancelled)?;
-        let fact = planning_unit_fact(&facts, key, &is_cancelled)?;
         let deduplication_key = DeduplicationKey {
             source_text: clone_planning_text_with_cancellation(fact.source_text, &is_cancelled)?,
             protected_text: clone_planning_text_with_cancellation(
@@ -841,29 +973,36 @@ pub(crate) fn plan_translation_with_validator_and_cancellation(
                     family_index
                 }
             };
-        families[family_index]
-            .members
-            .push(clone_planning_key_with_cancellation(key, &is_cancelled)?);
+        families[family_index].members.push(unit_index);
     }
 
     let mut reused = Vec::new();
     let mut representative_destinations = GenericUnitMap::new();
     let mut known_targets = GenericUnitMap::new();
+    let mut responsibilities = vec![UnitTaskResponsibility::Context; facts.len()];
     for family in &families {
         ensure_planning_not_cancelled(&is_cancelled)?;
         let mut first_current = None::<&str>;
+        let mut first_reuse_candidate = None::<&str>;
         let mut multiple_currents = false;
-        for key in &family.members {
+        for unit_index in &family.members {
             ensure_planning_not_cancelled(&is_cancelled)?;
-            let Some(current) = planning_unit_fact(&facts, key, &is_cancelled)?
-                .input
-                .current_translation
-                .as_deref()
-            else {
+            let fact = &facts[*unit_index];
+            let Some(current) = fact.input.current_translation.as_deref() else {
                 continue;
             };
+            let Some(context) = fact.input.current_context.as_ref() else {
+                return Err(GenericPlanningError::MissingCurrentContext(
+                    clone_planning_key_with_cancellation(&fact.key, &is_cancelled)?,
+                ));
+            };
+            if first_reuse_candidate.is_none() {
+                first_reuse_candidate = context.reuse_candidate();
+            }
             match first_current {
-                None => first_current = Some(current),
+                None => {
+                    first_current = Some(current);
+                }
                 Some(first) => {
                     if !planning_text_equal_with_cancellation(first, current, &is_cancelled)? {
                         multiple_currents = true;
@@ -872,15 +1011,18 @@ pub(crate) fn plan_translation_with_validator_and_cancellation(
                 }
             }
         }
-        for key in &family.members {
+        for unit_index in &family.members {
             ensure_planning_not_cancelled(&is_cancelled)?;
-            if let Some(current) = &planning_unit_fact(&facts, key, &is_cancelled)?
-                .input
-                .current_translation
-            {
+            let fact = &facts[*unit_index];
+            if fact.input.current_translation.is_some() {
+                let Some(context) = fact.input.current_context.as_ref() else {
+                    return Err(GenericPlanningError::MissingCurrentContext(
+                        clone_planning_key_with_cancellation(&fact.key, &is_cancelled)?,
+                    ));
+                };
                 let previous = known_targets.insert_with_cancellation(
-                    clone_planning_key_with_cancellation(key, &is_cancelled)?,
-                    clone_planning_text_with_cancellation(current, &is_cancelled)?,
+                    clone_planning_key_with_cancellation(&fact.key, &is_cancelled)?,
+                    clone_planning_text_with_cancellation(context.text(), &is_cancelled)?,
                     || ensure_planning_not_cancelled(&is_cancelled),
                 )?;
                 debug_assert!(previous.is_none());
@@ -888,11 +1030,11 @@ pub(crate) fn plan_translation_with_validator_and_cancellation(
         }
 
         let mut unresolved = Vec::new();
-        for key in &family.members {
+        for unit_index in &family.members {
             ensure_planning_not_cancelled(&is_cancelled)?;
-            let fact = planning_unit_fact(&facts, key, &is_cancelled)?;
+            let fact = &facts[*unit_index];
             if fact.input.needs_translation && fact.input.current_translation.is_none() {
-                unresolved.push(clone_planning_key_with_cancellation(key, &is_cancelled)?);
+                unresolved.push(*unit_index);
             }
         }
         if unresolved.is_empty() {
@@ -900,15 +1042,18 @@ pub(crate) fn plan_translation_with_validator_and_cancellation(
         }
 
         if !multiple_currents {
-            let Some(translation) = first_current else {
-                let representative =
-                    clone_planning_key_with_cancellation(&unresolved[0], &is_cancelled)?;
+            let Some(translation) = first_reuse_candidate else {
+                let representative_index = unresolved[0];
+                let representative = clone_planning_key_with_cancellation(
+                    &facts[representative_index].key,
+                    &is_cancelled,
+                )?;
                 let mut destinations = Vec::with_capacity(unresolved.len());
-                for key in &unresolved {
+                for unit_index in &unresolved {
                     ensure_planning_not_cancelled(&is_cancelled)?;
-                    let fact = planning_unit_fact(&facts, key, &is_cancelled)?;
+                    let fact = &facts[*unit_index];
                     destinations.push(PlannedDestination {
-                        key: clone_planning_key_with_cancellation(key, &is_cancelled)?,
+                        key: clone_planning_key_with_cancellation(&fact.key, &is_cancelled)?,
                         expected_source_text: clone_planning_text_with_cancellation(
                             fact.source_text,
                             &is_cancelled,
@@ -934,15 +1079,18 @@ pub(crate) fn plan_translation_with_validator_and_cancellation(
                     || ensure_planning_not_cancelled(&is_cancelled),
                 )?;
                 debug_assert!(previous.is_none());
+                responsibilities[representative_index] =
+                    UnitTaskResponsibility::ModelRepresentative;
                 continue;
             };
             let translation = clone_planning_text_with_cancellation(translation, &is_cancelled)?;
             let mut model_destinations = Vec::new();
-            for key in unresolved {
+            let mut model_representative_index = None;
+            for unit_index in unresolved {
                 ensure_planning_not_cancelled(&is_cancelled)?;
-                let fact = planning_unit_fact(&facts, &key, &is_cancelled)?;
+                let fact = &facts[unit_index];
                 let destination = PlannedDestination {
-                    key: clone_planning_key_with_cancellation(&key, &is_cancelled)?,
+                    key: clone_planning_key_with_cancellation(&fact.key, &is_cancelled)?,
                     expected_source_text: clone_planning_text_with_cancellation(
                         fact.source_text,
                         &is_cancelled,
@@ -961,12 +1109,13 @@ pub(crate) fn plan_translation_with_validator_and_cancellation(
                         })
                         .transpose()?,
                 };
-                let validated = reuse_validator(&key, &translation)?;
+                let validated = reuse_validator(&fact.key, &translation)?;
                 ensure_planning_not_cancelled(&is_cancelled)?;
                 match validated {
-                    Ok(validated_translation) => {
+                    Ok(validated) => {
+                        let (validated_translation, context_text) = validated.into_parts();
                         reused.push(PlannedReuse {
-                            key: clone_planning_key_with_cancellation(&key, &is_cancelled)?,
+                            key: clone_planning_key_with_cancellation(&fact.key, &is_cancelled)?,
                             translation: clone_planning_text_with_cancellation(
                                 &validated_translation,
                                 &is_cancelled,
@@ -977,35 +1126,44 @@ pub(crate) fn plan_translation_with_validator_and_cancellation(
                             expected_previous: destination.expected_previous,
                         });
                         let previous = known_targets.insert_with_cancellation(
-                            key,
-                            validated_translation,
+                            clone_planning_key_with_cancellation(&fact.key, &is_cancelled)?,
+                            clone_planning_text_with_cancellation(&context_text, &is_cancelled)?,
                             || ensure_planning_not_cancelled(&is_cancelled),
                         )?;
                         debug_assert!(previous.is_none());
                     }
-                    Err(_) => model_destinations.push(destination),
+                    Err(_) => {
+                        model_representative_index.get_or_insert(unit_index);
+                        model_destinations.push(destination);
+                    }
                 }
             }
-            if let Some(first_destination) = model_destinations.first() {
-                let representative =
-                    clone_planning_key_with_cancellation(&first_destination.key, &is_cancelled)?;
+            if let Some(representative_index) = model_representative_index {
+                let representative = clone_planning_key_with_cancellation(
+                    &facts[representative_index].key,
+                    &is_cancelled,
+                )?;
                 let previous = representative_destinations.insert_with_cancellation(
                     representative,
                     model_destinations,
                     || ensure_planning_not_cancelled(&is_cancelled),
                 )?;
                 debug_assert!(previous.is_none());
+                responsibilities[representative_index] =
+                    UnitTaskResponsibility::ModelRepresentative;
             }
             continue;
         }
 
-        let representative = clone_planning_key_with_cancellation(&unresolved[0], &is_cancelled)?;
+        let representative_index = unresolved[0];
+        let representative =
+            clone_planning_key_with_cancellation(&facts[representative_index].key, &is_cancelled)?;
         let mut destinations = Vec::with_capacity(unresolved.len());
-        for key in &unresolved {
+        for unit_index in &unresolved {
             ensure_planning_not_cancelled(&is_cancelled)?;
-            let fact = planning_unit_fact(&facts, key, &is_cancelled)?;
+            let fact = &facts[*unit_index];
             destinations.push(PlannedDestination {
-                key: clone_planning_key_with_cancellation(key, &is_cancelled)?,
+                key: clone_planning_key_with_cancellation(&fact.key, &is_cancelled)?,
                 expected_source_text: clone_planning_text_with_cancellation(
                     fact.source_text,
                     &is_cancelled,
@@ -1028,45 +1186,36 @@ pub(crate) fn plan_translation_with_validator_and_cancellation(
             || ensure_planning_not_cancelled(&is_cancelled),
         )?;
         debug_assert!(previous.is_none());
+        responsibilities[representative_index] = UnitTaskResponsibility::ModelRepresentative;
     }
 
-    let mut tasks = Vec::new();
-    for file in snapshot.files() {
-        ensure_planning_not_cancelled(&is_cancelled)?;
-        let mut drafts = Vec::new();
-        for group in file.groups() {
-            ensure_planning_not_cancelled(&is_cancelled)?;
-            let mut group_representatives = GenericUnitMap::new();
-            for unit in group.units() {
-                ensure_planning_not_cancelled(&is_cancelled)?;
-                let key = GenericUnitKey::new(
-                    clone_planning_text_with_cancellation(group.id(), &is_cancelled)?,
-                    clone_planning_text_with_cancellation(unit.id(), &is_cancelled)?,
-                );
-                if representative_destinations.contains_with_cancellation(&key, || {
-                    ensure_planning_not_cancelled(&is_cancelled)
-                })? {
-                    let previous =
-                        group_representatives.insert_with_cancellation(key, (), || {
-                            ensure_planning_not_cancelled(&is_cancelled)
-                        })?;
-                    debug_assert!(previous.is_none());
-                }
-            }
-            if group_representatives.is_empty() {
-                continue;
-            }
+    debug_assert_eq!(responsibilities.len(), task_layout.total_units());
+    let assigned_task_plan = assign_task_ids(complete_task_plan, &responsibilities, cancellation)?;
 
+    let mut tasks = Vec::new();
+    for block in assigned_task_plan.blocks_with_task_ids() {
+        ensure_planning_not_cancelled(&is_cancelled)?;
+        let layout = block.layout();
+        let unit_range = layout.unit_range();
+        debug_assert_eq!(unit_range.len(), block.unit_task_ids().len());
+        let file = &snapshot.files()[scope_file_indices[layout.scope_index()]];
+        let mut groups = Vec::with_capacity(layout.group_range().len());
+        let mut terminology_indices = Vec::new();
+        let mut outputs = BTreeMap::new();
+        let mut block_unit_index = 0_usize;
+        for group in &file.groups()[layout.group_range()] {
+            ensure_planning_not_cancelled(&is_cancelled)?;
             let mut units = Vec::with_capacity(group.units().len());
-            for unit in group.units() {
+            for _unit in group.units() {
                 ensure_planning_not_cancelled(&is_cancelled)?;
-                let key = GenericUnitKey::new(
-                    clone_planning_text_with_cancellation(group.id(), &is_cancelled)?,
-                    clone_planning_text_with_cancellation(unit.id(), &is_cancelled)?,
-                );
-                let fact = planning_unit_fact(&facts, &key, &is_cancelled)?;
+                let fact = &facts[unit_range.start + block_unit_index];
+                let key = &fact.key;
+                terminology_indices.extend(clone_planning_indices_with_cancellation(
+                    &fact.input.terminology_indices,
+                    &is_cancelled,
+                )?);
                 let text = match known_targets
-                    .get_with_cancellation(&key, || ensure_planning_not_cancelled(&is_cancelled))?
+                    .get_with_cancellation(key, || ensure_planning_not_cancelled(&is_cancelled))?
                 {
                     Some(text) => clone_planning_text_with_cancellation(text, &is_cancelled)?,
                     None => clone_planning_text_with_cancellation(
@@ -1074,59 +1223,42 @@ pub(crate) fn plan_translation_with_validator_and_cancellation(
                         &is_cancelled,
                     )?,
                 };
-                let representative = group_representatives
-                    .contains_with_cancellation(&key, || {
-                        ensure_planning_not_cancelled(&is_cancelled)
-                    })?;
-                units.push(DraftUnit {
-                    representative: representative.then_some(key),
-                    text,
-                });
-            }
-            let mut estimated_characters =
-                count_chars_with_cancellation(group.kind(), &is_cancelled)?;
-            for unit in &units {
-                estimated_characters = estimated_characters
-                    .saturating_add(count_chars_with_cancellation(&unit.text, &is_cancelled)?);
-            }
-            let terminology_indices = match group.units().first() {
-                Some(unit) => {
-                    let key = GenericUnitKey::new(
-                        clone_planning_text_with_cancellation(group.id(), &is_cancelled)?,
-                        clone_planning_text_with_cancellation(unit.id(), &is_cancelled)?,
-                    );
-                    clone_planning_indices_with_cancellation(
-                        &planning_unit_fact(&facts, &key, &is_cancelled)?
-                            .input
-                            .terminology_indices,
-                        &is_cancelled,
-                    )?
+                let output_id = block.unit_task_ids()[block_unit_index];
+                block_unit_index += 1;
+                if let Some(output_id) = output_id {
+                    let destinations = representative_destinations
+                        .remove_with_cancellation(key, || {
+                            ensure_planning_not_cancelled(&is_cancelled)
+                        })?
+                        .expect("模型代表必须保留对应的传播目标");
+                    let previous = outputs.insert(output_id, destinations);
+                    debug_assert!(previous.is_none());
+                    units.push(PlannedContextUnit {
+                        output_id: Some(output_id),
+                        text,
+                    });
+                } else {
+                    units.push(PlannedContextUnit {
+                        output_id: None,
+                        text,
+                    });
                 }
-                None => Vec::new(),
-            };
-            drafts.push(GroupDraft {
+            }
+            groups.push(PlannedGroup {
                 kind: clone_planning_text_with_cancellation(group.kind(), &is_cancelled)?,
-                terminology_indices,
                 units,
-                estimated_characters,
             });
         }
+        debug_assert_eq!(block_unit_index, block.unit_task_ids().len());
+        terminology_indices.sort_unstable();
+        terminology_indices.dedup();
 
-        if !drafts.is_empty() {
-            let mut estimated_characters = 0_usize;
-            for draft in &drafts {
-                ensure_planning_not_cancelled(&is_cancelled)?;
-                estimated_characters =
-                    estimated_characters.saturating_add(draft.estimated_characters);
-            }
-            tasks.push(finalize_task_with_cancellation(
-                file.relative_path().to_path_buf(),
-                drafts,
-                estimated_characters,
-                &mut representative_destinations,
-                &is_cancelled,
-            )?);
-        }
+        tasks.push(PlannedTask {
+            relative_path: file.relative_path().to_path_buf(),
+            groups,
+            terminology_indices,
+            outputs,
+        });
     }
     ensure_planning_not_cancelled(&is_cancelled)?;
     debug_assert!(representative_destinations.is_empty());
@@ -1138,197 +1270,94 @@ pub(crate) fn plan_translation_with_validator_and_cancellation(
     })
 }
 
-/// 按最终模型 user message 的实际字符数重新拆分已有 TaskBlock。
-///
-/// 初步规划已经保证每个文件只有一个 Task 草案且 Group 不拆分；这里按最终大小在
-/// 文件内连续贪心拆分，并为每个新 Task 重新编号临时输出 ID。单个 Group 超过目标时
-/// 仍独占任务。
-#[cfg(test)]
-pub(crate) fn split_tasks_by_rendered_size(
-    plan: TranslationPlan,
-    target_task_characters: NonZeroUsize,
-    fixed_characters: usize,
-    measure_group: impl Fn(&PlannedGroup, u64) -> usize,
-) -> TranslationPlan {
-    split_tasks_by_rendered_size_with_cancellation(
-        plan,
-        target_task_characters,
-        fixed_characters,
-        |group, first_output_id| Ok(measure_group(group, first_output_id)),
-        || false,
-    )
-    .expect("不取消的 Task 拆分不能失败")
-}
-
-/// 与 [`split_tasks_by_rendered_size`] 相同，但允许在测量和重建 Task 时响应取消。
-pub(crate) fn split_tasks_by_rendered_size_with_cancellation(
-    plan: TranslationPlan,
-    target_task_characters: NonZeroUsize,
-    fixed_characters: usize,
-    measure_group: impl Fn(&PlannedGroup, u64) -> Result<usize, GenericPlanningError>,
-    is_cancelled: impl Fn() -> bool,
-) -> Result<TranslationPlan, GenericPlanningError> {
-    ensure_planning_not_cancelled(&is_cancelled)?;
-    let TranslationPlan {
-        invalidations,
-        reused,
-        tasks,
-    } = plan;
-    let mut split_tasks = Vec::new();
-    for task in tasks {
-        ensure_planning_not_cancelled(&is_cancelled)?;
-        let PlannedTask {
-            relative_path,
-            groups,
-            mut outputs,
-            ..
-        } = task;
-        let mut current = Vec::new();
-        let mut current_characters = fixed_characters;
-        let mut next_output_id = 1_u64;
-        for group in groups {
-            ensure_planning_not_cancelled(&is_cancelled)?;
-            let mut group_characters = measure_group(&group, next_output_id)?;
-            if !current.is_empty()
-                && current_characters.saturating_add(group_characters)
-                    > target_task_characters.get()
-            {
-                split_tasks.push(rebuild_task_with_cancellation(
-                    relative_path.clone(),
-                    std::mem::take(&mut current),
-                    &mut outputs,
-                    current_characters,
-                    &is_cancelled,
-                )?);
-                current_characters = fixed_characters;
-                next_output_id = 1;
-                group_characters = measure_group(&group, next_output_id)?;
+fn generic_task_planning_layout(
+    snapshot: &GenericStoredSnapshot,
+    is_cancelled: &(impl Fn() -> bool + Sync),
+) -> Result<(TaskPlanningLayout, Vec<usize>), GenericPlanningError> {
+    let projected = snapshot
+        .files()
+        .par_iter()
+        .enumerate()
+        .map(|(file_index, file)| {
+            ensure_planning_not_cancelled(is_cancelled)?;
+            if file.groups().is_empty() {
+                return Ok(None);
             }
-            next_output_id = next_output_id
-                .saturating_add(u64::try_from(group.output_count()).unwrap_or(u64::MAX));
-            current_characters = current_characters.saturating_add(group_characters);
-            current.push(group);
-        }
-        if !current.is_empty() {
-            split_tasks.push(rebuild_task_with_cancellation(
-                relative_path,
-                current,
-                &mut outputs,
-                current_characters,
-                &is_cancelled,
-            )?);
-        }
-        debug_assert!(outputs.is_empty());
-    }
-    ensure_planning_not_cancelled(&is_cancelled)?;
-    Ok(TranslationPlan {
-        invalidations,
-        reused,
-        tasks: split_tasks,
-    })
-}
+            let mut groups = Vec::with_capacity(file.groups().len());
+            for group in file.groups() {
+                ensure_planning_not_cancelled(is_cancelled)?;
+                groups.push(TaskPlanningGroupLayout::new(
+                    group.units().len(),
+                    stable_generic_group_characters(group, is_cancelled)?,
+                )?);
+            }
+            Ok(Some((file_index, TaskPlanningScopeLayout::new(groups)?)))
+        })
+        .collect::<Vec<Result<_, GenericPlanningError>>>();
 
-fn rebuild_task_with_cancellation(
-    relative_path: PathBuf,
-    groups: Vec<PlannedGroup>,
-    previous_outputs: &mut BTreeMap<u64, Vec<PlannedDestination>>,
-    estimated_characters: usize,
-    is_cancelled: &impl Fn() -> bool,
-) -> Result<PlannedTask, GenericPlanningError> {
-    let mut outputs = BTreeMap::new();
-    let mut next_output_id = 1_u64;
-    let mut rebuilt_groups = Vec::with_capacity(groups.len());
-    for group in groups {
+    let mut scopes = Vec::new();
+    let mut scope_file_indices = Vec::new();
+    for file in projected {
         ensure_planning_not_cancelled(is_cancelled)?;
-        let mut units = Vec::with_capacity(group.units.len());
-        for unit in group.units {
-            ensure_planning_not_cancelled(is_cancelled)?;
-            let output_id = unit.output_id.map(|previous_id| {
-                let output_id = next_output_id;
-                next_output_id += 1;
-                let destinations = previous_outputs
-                    .remove(&previous_id)
-                    .expect("Task 输出必须保留对应的传播目标");
-                outputs.insert(output_id, destinations);
-                output_id
-            });
-            units.push(PlannedContextUnit {
-                output_id,
-                text: unit.text,
-            });
+        if let Some((file_index, scope)) = file? {
+            scope_file_indices.push(file_index);
+            scopes.push(scope);
         }
-        rebuilt_groups.push(PlannedGroup {
-            kind: group.kind,
-            terminology_indices: group.terminology_indices,
-            units,
-        });
     }
-    Ok(PlannedTask {
-        relative_path,
-        groups: rebuilt_groups,
-        estimated_characters,
-        outputs,
-    })
+    Ok((TaskPlanningLayout::new(scopes)?, scope_file_indices))
 }
 
-struct DraftUnit {
-    representative: Option<GenericUnitKey>,
-    text: String,
-}
-
-struct GroupDraft {
-    kind: String,
-    terminology_indices: Vec<usize>,
-    units: Vec<DraftUnit>,
-    estimated_characters: usize,
-}
-
-fn finalize_task_with_cancellation(
-    relative_path: PathBuf,
-    drafts: Vec<GroupDraft>,
-    estimated_characters: usize,
-    representative_destinations: &mut GenericUnitMap<Vec<PlannedDestination>>,
-    is_cancelled: &impl Fn() -> bool,
-) -> Result<PlannedTask, GenericPlanningError> {
-    let mut outputs = BTreeMap::new();
-    let mut next_output_id = 1_u64;
-    let mut groups = Vec::with_capacity(drafts.len());
-    for draft in drafts {
+fn stable_generic_group_characters(
+    group: &GenericStoredGroup,
+    is_cancelled: &(impl Fn() -> bool + Sync),
+) -> Result<StableGroupCharacters, GenericPlanningError> {
+    let mut following = "kind=".len();
+    following = checked_stable_character_add(
+        following,
+        stable_json_string_characters(group.kind(), is_cancelled)?,
+    )?;
+    following = checked_stable_character_add(following, "\nunits:\n".len())?;
+    for unit in group.units() {
         ensure_planning_not_cancelled(is_cancelled)?;
-        let mut units = Vec::with_capacity(draft.units.len());
-        for unit in draft.units {
-            ensure_planning_not_cancelled(is_cancelled)?;
-            let output_id = match unit.representative {
-                Some(representative) => {
-                    let id = next_output_id;
-                    next_output_id += 1;
-                    let destinations = representative_destinations
-                        .remove_with_cancellation(&representative, || {
-                            ensure_planning_not_cancelled(is_cancelled)
-                        })?
-                        .expect("模型代表必须保留对应的传播目标");
-                    outputs.insert(id, destinations);
-                    Some(id)
-                }
-                None => None,
+        following = checked_stable_character_add(following, "[-] ".len())?;
+        following = checked_stable_character_add(
+            following,
+            stable_json_string_characters(unit.source_text(), is_cancelled)?,
+        )?;
+        following = checked_stable_character_add(following, 1)?;
+    }
+    following = checked_stable_character_add(following, 1)?;
+    let first = checked_stable_character_add("Groups:\n".len(), following)?;
+    Ok(StableGroupCharacters::new(first, following))
+}
+
+fn stable_json_string_characters(
+    text: &str,
+    is_cancelled: &(impl Fn() -> bool + Sync),
+) -> Result<usize, GenericPlanningError> {
+    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
+
+    let mut characters = 2_usize;
+    for chunk in text.as_bytes().chunks(CANCELLATION_CHECK_BYTES) {
+        ensure_planning_not_cancelled(is_cancelled)?;
+        let mut chunk_characters = 0_usize;
+        for byte in chunk {
+            chunk_characters += match byte {
+                b'"' | b'\\' | 0x08 | 0x0c | b'\n' | b'\r' | b'\t' => 2,
+                0x00..=0x1f => 6,
+                0x80..=0xbf => 0,
+                _ => 1,
             };
-            units.push(PlannedContextUnit {
-                output_id,
-                text: unit.text,
-            });
         }
-        groups.push(PlannedGroup {
-            kind: draft.kind,
-            terminology_indices: draft.terminology_indices,
-            units,
-        });
+        characters = checked_stable_character_add(characters, chunk_characters)?;
     }
-    Ok(PlannedTask {
-        relative_path,
-        groups,
-        estimated_characters,
-        outputs,
-    })
+    ensure_planning_not_cancelled(is_cancelled)?;
+    Ok(characters)
+}
+
+fn checked_stable_character_add(left: usize, right: usize) -> Result<usize, GenericPlanningError> {
+    left.checked_add(right)
+        .ok_or(TaskPlanningError::CharacterCountOverflow.into())
 }
 
 fn ensure_planning_not_cancelled(
@@ -1428,23 +1457,6 @@ fn clone_planning_stored_translation_with_cancellation(
     })
 }
 
-fn count_chars_with_cancellation(
-    text: &str,
-    is_cancelled: &impl Fn() -> bool,
-) -> Result<usize, GenericPlanningError> {
-    const CANCELLATION_CHECK_CHARACTERS: usize = 16 * 1024;
-
-    let mut count = 0_usize;
-    for _ in text.chars() {
-        if count.is_multiple_of(CANCELLATION_CHECK_CHARACTERS) {
-            ensure_planning_not_cancelled(is_cancelled)?;
-        }
-        count += 1;
-    }
-    ensure_planning_not_cancelled(is_cancelled)?;
-    Ok(count)
-}
-
 /// 一个通过全部验收、需要写入具体 Unit 的模型结果。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AcceptedTranslation {
@@ -1475,16 +1487,16 @@ impl AcceptedTranslation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ResponseProblem {
     InvalidId(String),
-    UnexpectedId(u64),
-    DuplicateId(u64),
-    MissingId(u64),
-    NonStringValue(u64),
+    UnexpectedId(TaskId),
+    DuplicateId(TaskId),
+    MissingId(TaskId),
+    NonStringValue(TaskId),
     InvalidTranslation {
-        output_id: u64,
+        output_id: TaskId,
         detail: String,
     },
     InvalidDestination {
-        output_id: u64,
+        output_id: TaskId,
         key: GenericUnitKey,
         detail: String,
     },
@@ -1549,7 +1561,7 @@ pub(crate) fn accept_response(
     task: &PlannedTask,
     assistant_response: &str,
     response_envelope: TranslationResponseEnvelope,
-    validator: impl FnMut(u64, &GenericUnitKey, &str) -> Result<String, String>,
+    validator: impl FnMut(TaskId, &GenericUnitKey, &str) -> Result<String, String>,
 ) -> Result<TranslationAcceptance, GenericResponseError> {
     let parsed = parse_translation_response(assistant_response, response_envelope)
         .map_err(|source| GenericResponseError { source })?;
@@ -1563,7 +1575,7 @@ pub(crate) fn accept_response(
 pub(crate) fn accept_parsed_response(
     task: PlannedTask,
     parsed: &ParsedTranslationResponse,
-    mut validator: impl FnMut(u64, &GenericUnitKey, &str) -> Result<String, String>,
+    mut validator: impl FnMut(TaskId, &GenericUnitKey, &str) -> Result<String, String>,
 ) -> TranslationAcceptance {
     accept_parsed_response_with_cancellation(
         task,
@@ -1578,7 +1590,7 @@ pub(crate) fn accept_parsed_response_with_cancellation(
     task: PlannedTask,
     parsed: &ParsedTranslationResponse,
     mut validator: impl FnMut(
-        u64,
+        TaskId,
         &GenericUnitKey,
         &str,
     ) -> Result<Result<String, String>, GenericPlanningError>,
@@ -1589,7 +1601,7 @@ pub(crate) fn accept_parsed_response_with_cancellation(
     let mut canonical_counts = HashMap::new();
     for entry in entries {
         ensure_planning_not_cancelled(&is_cancelled)?;
-        if let Some(output_id) = entry.canonical_id().and_then(|id| u64::try_from(id).ok()) {
+        if let Some(output_id) = entry.canonical_id() {
             *canonical_counts.entry(output_id).or_insert(0usize) += 1;
         }
     }
@@ -1602,7 +1614,7 @@ pub(crate) fn accept_parsed_response_with_cancellation(
     let mut outputs = task.outputs;
     for entry in entries {
         ensure_planning_not_cancelled(&is_cancelled)?;
-        let Some(output_id) = entry.canonical_id().and_then(|id| u64::try_from(id).ok()) else {
+        let Some(output_id) = entry.canonical_id() else {
             problems.push(ResponseProblem::InvalidId(
                 clone_planning_text_with_cancellation(entry.id(), &is_cancelled)?,
             ));
@@ -1964,6 +1976,28 @@ mod tests {
         Sha256Fingerprint::from_bytes([value; 32])
     }
 
+    fn task_id(value: usize) -> TaskId {
+        TaskId::new(value).expect("测试 Task ID 必须非零")
+    }
+
+    #[test]
+    fn stable_json_character_count_matches_the_actual_generic_string_format() {
+        for text in [
+            "plain",
+            "引号\"与反斜线\\",
+            "换行\n制表\t退格\u{08}",
+            "控制\u{01}字符",
+        ] {
+            assert_eq!(
+                stable_json_string_characters(text, &|| false).expect("计数应成功"),
+                serde_json::to_string(text)
+                    .expect("字符串应可编码")
+                    .chars()
+                    .count()
+            );
+        }
+    }
+
     #[test]
     fn planning_helpers_poll_long_text_and_index_copies() {
         fn cancels_on_third_poll(polls: &Cell<usize>) -> bool {
@@ -2127,27 +2161,16 @@ mod tests {
     }
 
     #[test]
-    fn exact_task_split_fills_across_the_removed_rough_boundary() {
+    fn stable_task_packing_uses_complete_file_groups_and_restarts_ids() {
         let snapshot = task_split_snapshot(&[10]);
-        let plan = plan_translation(&snapshot, &planning(&snapshot), |_, candidate| {
-            Ok(candidate.to_owned())
-        })
+        let plan = plan_translation_with_cancellation(
+            &snapshot,
+            &planning(&snapshot),
+            NonZeroUsize::new(58).expect("常量应非零"),
+            |_, candidate| Ok(candidate.to_owned()),
+            &CooperativeCancellation::default(),
+        )
         .expect("规划应成功");
-
-        assert_eq!(plan.tasks().len(), 1, "每个文件应只形成一个待拆分草案");
-        assert_eq!(plan.tasks()[0].groups().len(), 10);
-        assert_eq!(
-            plan.tasks()[0].estimated_characters(),
-            40,
-            "每个 Group 的旧粗略估算为四个字符，旧逻辑会在第五个 Group 后截断"
-        );
-
-        let plan = split_tasks_by_rendered_size(
-            plan,
-            NonZeroUsize::new(20).expect("常量应非零"),
-            0,
-            |_, _| 9,
-        );
         assert_eq!(
             plan.tasks()
                 .iter()
@@ -2162,11 +2185,13 @@ mod tests {
                 .map(|group| group.units()[0].text())
                 .collect::<Vec<_>>(),
             ["<e>", "<f>"],
-            "第五个和第六个 Group 必须越过旧粗拆边界进入同一最终 Task"
+            "第五个和第六个 Group 必须按完整原文稳定装入同一 TaskBlock"
         );
         for task in plan.tasks() {
             assert_eq!(
-                task.expected_output_ids().collect::<Vec<_>>(),
+                task.expected_output_ids()
+                    .map(TaskId::get)
+                    .collect::<Vec<_>>(),
                 [1, 2],
                 "每个最终 Task 都应从 1 重新编号"
             );
@@ -2174,20 +2199,16 @@ mod tests {
     }
 
     #[test]
-    fn exact_task_split_never_combines_different_files() {
+    fn stable_task_packing_never_combines_different_files() {
         let snapshot = task_split_snapshot(&[3, 3]);
-        let plan = plan_translation(&snapshot, &planning(&snapshot), |_, candidate| {
-            Ok(candidate.to_owned())
-        })
+        let plan = plan_translation_with_cancellation(
+            &snapshot,
+            &planning(&snapshot),
+            NonZeroUsize::new(58).expect("常量应非零"),
+            |_, candidate| Ok(candidate.to_owned()),
+            &CooperativeCancellation::default(),
+        )
         .expect("规划应成功");
-        assert_eq!(plan.tasks().len(), 2, "每个有输出的文件应形成独立草案");
-
-        let plan = split_tasks_by_rendered_size(
-            plan,
-            NonZeroUsize::new(20).expect("常量应非零"),
-            0,
-            |_, _| 9,
-        );
         assert_eq!(
             plan.tasks()
                 .iter()
@@ -2203,24 +2224,17 @@ mod tests {
     }
 
     #[test]
-    fn exact_task_split_keeps_an_oversized_group_alone() {
-        let snapshot = task_split_snapshot(&[3]);
-        let plan = plan_translation(&snapshot, &planning(&snapshot), |_, candidate| {
-            Ok(candidate.to_owned())
-        })
+    fn stable_task_packing_keeps_an_oversized_group_alone() {
+        let mut snapshot = task_split_snapshot(&[3]);
+        snapshot.files[0].groups[1].units[0].source_text = "b".repeat(30);
+        let plan = plan_translation_with_cancellation(
+            &snapshot,
+            &planning(&snapshot),
+            NonZeroUsize::new(58).expect("常量应非零"),
+            |_, candidate| Ok(candidate.to_owned()),
+            &CooperativeCancellation::default(),
+        )
         .expect("规划应成功");
-        let plan = split_tasks_by_rendered_size(
-            plan,
-            NonZeroUsize::new(20).expect("常量应非零"),
-            0,
-            |group, _| {
-                if group.units()[0].text() == "<b>" {
-                    25
-                } else {
-                    9
-                }
-            },
-        );
 
         assert_eq!(
             plan.tasks()
@@ -2229,8 +2243,145 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1, 1, 1]
         );
-        assert_eq!(plan.tasks()[1].estimated_characters(), 25);
-        assert_eq!(plan.tasks()[1].groups()[0].units()[0].text(), "<b>");
+        assert_eq!(
+            plan.tasks()[1].groups()[0].units()[0].text(),
+            format!("<{}>", "b".repeat(30))
+        );
+    }
+
+    #[test]
+    fn translation_state_only_changes_ids_and_zero_id_block_filtering() {
+        let snapshot = task_split_snapshot(&[6]);
+        let planning_for = |model_groups: &[usize]| {
+            snapshot.files()[0]
+                .groups()
+                .iter()
+                .enumerate()
+                .map(|(group_index, group)| {
+                    let unit = &group.units()[0];
+                    let model_representative = model_groups.contains(&group_index);
+                    PlanningUnit::new(
+                        GenericUnitKey::new(group.id().to_owned(), unit.id().to_owned()),
+                        format!("<{}>", unit.source_text()),
+                        fingerprint(u8::try_from(group_index + 1).expect("测试索引应可表示")),
+                        model_representative,
+                        (!model_representative).then(|| format!("target-{group_index}")),
+                        fingerprint(7),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let target = NonZeroUsize::new(58).expect("常量应非零");
+
+        let plan = plan_translation_with_cancellation(
+            &snapshot,
+            &planning_for(&[0, 4]),
+            target,
+            |_, candidate| Ok(candidate.to_owned()),
+            &CooperativeCancellation::default(),
+        )
+        .expect("规划应成功");
+        assert_eq!(
+            plan.tasks()
+                .iter()
+                .map(|task| {
+                    task.groups()
+                        .iter()
+                        .map(|group| group.units()[0].text().to_owned())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>(),
+            [
+                vec!["<a>".to_owned(), "target-1".to_owned()],
+                vec!["<e>".to_owned(), "target-5".to_owned()],
+            ],
+            "中间零 ID 块只能被过滤，前后块不能合并或失去完整兄弟 Group"
+        );
+        for task in plan.tasks() {
+            assert_eq!(
+                task.expected_output_ids()
+                    .map(TaskId::get)
+                    .collect::<Vec<_>>(),
+                [1]
+            );
+        }
+
+        let all_current = plan_translation_with_cancellation(
+            &snapshot,
+            &planning_for(&[]),
+            target,
+            |_, candidate| Ok(candidate.to_owned()),
+            &CooperativeCancellation::default(),
+        )
+        .expect("全部 Current 仍应完成稳定装箱和责任分配");
+        assert!(all_current.tasks().is_empty());
+    }
+
+    #[test]
+    fn current_text_without_safe_placeholder_projection_stops_task_materialization() {
+        let snapshot = stored_snapshot();
+        let mut planning_units = planning(&snapshot);
+        let current = planning_units
+            .iter_mut()
+            .find(|unit| unit.current_translation.is_some())
+            .expect("测试快照应含 Current Unit");
+        current.current_context = None;
+
+        let error = plan_translation(&snapshot, &planning_units, |_, candidate| {
+            Ok(candidate.to_owned())
+        })
+        .expect_err("缺少安全目标语境时不得渲染含原始 Placeholder 的 TaskBlock");
+        assert!(matches!(
+            error,
+            GenericPlanningError::MissingCurrentContext(_)
+        ));
+    }
+
+    #[test]
+    fn missing_later_current_context_is_reported_after_different_currents_are_found() {
+        let mut snapshot = stored_snapshot();
+        snapshot.files[0].groups[0].units[0].translation = Some(GenericStoredTranslation {
+            translation: "译文甲".to_owned(),
+            origin: TranslationOrigin::Manual,
+            state_fingerprint: fingerprint(9),
+        });
+        snapshot.files[1].groups[0].units[0].translation = Some(GenericStoredTranslation {
+            translation: "译文乙".to_owned(),
+            origin: TranslationOrigin::Manual,
+            state_fingerprint: fingerprint(10),
+        });
+        snapshot.files[1].groups.push(GenericStoredGroup {
+            id: "g4".to_owned(),
+            ordinal: 1,
+            kind: "dialogue".to_owned(),
+            context_fingerprint: fingerprint(14),
+            units: vec![GenericStoredUnit {
+                id: "u1".to_owned(),
+                ordinal: 0,
+                source_text: "同文".to_owned(),
+                translation: Some(GenericStoredTranslation {
+                    translation: "译文丙".to_owned(),
+                    origin: TranslationOrigin::Manual,
+                    state_fingerprint: fingerprint(11),
+                }),
+            }],
+        });
+        let mut planning_units = planning(&snapshot);
+        planning_units
+            .iter_mut()
+            .find(|unit| unit.key().group_id() == "g4")
+            .expect("测试快照应含第三个 Current")
+            .current_context = None;
+
+        let error = plan_translation(&snapshot, &planning_units, |_, candidate| {
+            Ok(candidate.to_owned())
+        })
+        .expect_err("不同 Current 不能让后续安全语境缺失变成 panic");
+
+        assert!(matches!(
+            error,
+            GenericPlanningError::MissingCurrentContext(key) if key.group_id() == "g4"
+        ));
     }
 
     #[test]
@@ -2245,6 +2396,32 @@ mod tests {
         assert_eq!(plan.tasks()[0].relative_path(), Path::new("a.jsonl"));
         assert_eq!(plan.tasks()[0].expected_output_ids().count(), 2);
         assert!(plan.reused().is_empty());
+    }
+
+    #[test]
+    fn planning_uses_natural_positions_but_still_validates_non_natural_input() {
+        let snapshot = stored_snapshot();
+        let natural = planning(&snapshot);
+        let expected =
+            plan_translation(&snapshot, &natural, |_, candidate| Ok(candidate.to_owned()))
+                .expect("自然顺序规划应成功");
+
+        let mut reordered = natural.clone();
+        reordered.reverse();
+        let actual = plan_translation(&snapshot, &reordered, |_, candidate| {
+            Ok(candidate.to_owned())
+        })
+        .expect("非自然顺序仍应按身份恢复");
+        assert_eq!(actual, expected);
+
+        let mut duplicated = natural;
+        duplicated[1] = duplicated[0].clone();
+        assert!(matches!(
+            plan_translation(&snapshot, &duplicated, |_, candidate| {
+                Ok(candidate.to_owned())
+            }),
+            Err(GenericPlanningError::Duplicate(_))
+        ));
     }
 
     #[test]
@@ -2278,8 +2455,9 @@ mod tests {
         let result = plan_translation_with_validator_and_cancellation(
             &snapshot,
             &planning_units,
+            NonZeroUsize::MAX,
             |_, _| Err(GenericPlanningError::Cancelled),
-            || false,
+            &CooperativeCancellation::default(),
         );
 
         assert!(matches!(result, Err(GenericPlanningError::Cancelled)));
@@ -2306,18 +2484,38 @@ mod tests {
             }],
         });
 
-        let plan = plan_translation(&snapshot, &planning(&snapshot), |key, candidate| {
-            if key.group_id() == "g3" {
-                Err("目标 kind 不接受该译文".to_owned())
-            } else {
-                Ok(format!("{candidate}-已验收"))
-            }
-        })
+        let plan = plan_translation_with_validator_and_cancellation(
+            &snapshot,
+            &planning(&snapshot),
+            NonZeroUsize::MAX,
+            |key, candidate| {
+                if key.group_id() == "g3" {
+                    Ok(Err("目标 kind 不接受该译文".to_owned()))
+                } else {
+                    Ok(Ok(ValidatedReuse::new(
+                        format!("{candidate}-已验收"),
+                        format!("<{candidate}-已验收>"),
+                    )))
+                }
+            },
+            &CooperativeCancellation::default(),
+        )
         .expect("复用验收失败不应中止规划");
 
         assert_eq!(plan.reused().len(), 1);
         assert_eq!(plan.reused()[0].key().group_id(), "g4");
         assert_eq!(plan.reused()[0].translation(), "相同-已验收");
+        let context_task = plan
+            .tasks()
+            .iter()
+            .find(|task| task.relative_path() == Path::new("b.jsonl"))
+            .expect("复用语境应与同文件的模型目标一起发送");
+        assert_eq!(context_task.groups()[1].units()[0].output_id(), None);
+        assert_eq!(
+            context_task.groups()[1].units()[0].text(),
+            "<相同-已验收>",
+            "模型必须看到验收后的安全语境，不能继续使用验收前的 Current 投影"
+        );
         let model_destinations = plan
             .tasks()
             .iter()
@@ -2488,12 +2686,12 @@ mod tests {
         assert!(
             acceptance
                 .problems()
-                .contains(&ResponseProblem::NonStringValue(2))
+                .contains(&ResponseProblem::NonStringValue(task_id(2)))
         );
         assert!(
             acceptance
                 .problems()
-                .contains(&ResponseProblem::UnexpectedId(99))
+                .contains(&ResponseProblem::UnexpectedId(task_id(99)))
         );
     }
 
@@ -2522,7 +2720,10 @@ mod tests {
             2,
             "合法同级 ID 仍应传播到两个 Generic Unit"
         );
-        assert_eq!(acceptance.problems(), [ResponseProblem::NonStringValue(2)]);
+        assert_eq!(
+            acceptance.problems(),
+            [ResponseProblem::NonStringValue(task_id(2))]
+        );
     }
 
     #[test]
@@ -2589,7 +2790,7 @@ mod tests {
             acceptance
                 .problems()
                 .contains(&ResponseProblem::InvalidDestination {
-                    output_id: 1,
+                    output_id: task_id(1),
                     key: GenericUnitKey::new("g3".to_owned(), "u1".to_owned()),
                     detail: "目标 kind 不接受该译文".to_owned(),
                 })
@@ -2613,7 +2814,7 @@ mod tests {
             r#"{"1":"同文译文","2":"独立译文"}"#,
             TranslationResponseEnvelope::JsonOnly,
             |output_id, _, candidate| {
-                if output_id == 1 {
+                if output_id == task_id(1) {
                     Err("该去重族的目标均拒绝译文".to_owned())
                 } else {
                     Ok(candidate.to_owned())
@@ -2629,12 +2830,12 @@ mod tests {
             acceptance.problems(),
             [
                 ResponseProblem::InvalidDestination {
-                    output_id: 1,
+                    output_id: task_id(1),
                     key: GenericUnitKey::new("g1".to_owned(), "u1".to_owned()),
                     detail: "该去重族的目标均拒绝译文".to_owned(),
                 },
                 ResponseProblem::InvalidDestination {
-                    output_id: 1,
+                    output_id: task_id(1),
                     key: GenericUnitKey::new("g3".to_owned(), "u1".to_owned()),
                     detail: "该去重族的目标均拒绝译文".to_owned(),
                 },
@@ -2661,8 +2862,8 @@ mod tests {
         assert_eq!(
             acceptance.problems(),
             [
-                ResponseProblem::DuplicateId(1),
-                ResponseProblem::MissingId(2)
+                ResponseProblem::DuplicateId(task_id(1)),
+                ResponseProblem::MissingId(task_id(2))
             ]
         );
     }

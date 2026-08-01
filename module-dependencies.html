@@ -166,7 +166,8 @@
         <ul>
           <li>Init 冻结游戏来源并建立项目。</li>
           <li>Extract 只运行 Builtin 与 Rules。</li>
-          <li>Translate 使用 RPG Maker 分组和字符串数组响应。</li>
+          <li>Extract 明确产出 Scope、Group、Unit 和语义顺序键。</li>
+          <li>Translate 投影 Current、复用、去重与字符串数组响应。</li>
           <li>WriteBack 生成并发布完整游戏候选。</li>
         </ul>
         <span class="path">src/rpg_maker/init.rs · extract/ · translate/ · write_back/</span>
@@ -177,7 +178,7 @@
         <ul>
           <li>Init 只保存输入根和语言对。</li>
           <li>Extract 每次重新读取可变输入，并只清理受影响的 Group。</li>
-          <li>Translate 按文件限制 TaskBlock，按 Group 保留语境。</li>
+          <li>JSONL 文件直接成为 Semantic Scope，Translate 投影 Current、复用与去重。</li>
           <li>WriteBack 只替换 Current Unit 的 text。</li>
         </ul>
         <span class="path">src/generic/ · src/application/generic_command.rs</span>
@@ -217,8 +218,13 @@
         <span class="path">src/translation/planning_resource.rs · placeholder.rs · placeholder_projection.rs · placeholder_token.rs</span>
       </article>
       <article class="shared">
+        <h3>稳定 TaskBlock 规划</h3>
+        <p>按引擎提供的 Scope、Group、Unit 数量和稳定源文字符数完成唯一装箱，再按 Unit responsibility 分配块内临时 ID；零 ID 块只过滤，不合并或重新装箱。</p>
+        <span class="path">src/translation/task_planning.rs</span>
+      </article>
+      <article class="shared">
         <h3>模型协议与任务记录</h3>
-        <p>公共 thinking 信封、严格 JSON object、数字 ID、请求重试证据和 Markdown 任务记录；value 形状由各引擎检查。</p>
+        <p>公共 TaskId、thinking 信封、严格 JSON object、请求重试证据和 Markdown 任务记录；完整消息与 value 形状由各引擎渲染和检查。</p>
         <span class="path">src/translation_protocol.rs · src/execution/llm_request.rs · src/translation/task_record.rs</span>
       </article>
       <article class="runtime">
@@ -249,7 +255,7 @@
         <p>保存当前 JSONL 快照、Group、Unit、译文状态、资源和最近 Profile；输出固定在项目 <code>write_back/</code>。</p>
       </article>
     </div>
-    <p class="rule"><strong>依赖停止线：</strong>共享模块不判断当前是哪种引擎，不保存 Generic 去重族，也不解释 RPG Maker 的角色、对话、数组形状、Rules、布局或游戏文件。</p>
+    <p class="rule"><strong>依赖停止线：</strong>共享 Planner 只处理已整理的数量、稳定字符数、连续范围和 responsibility，不读取正文或状态。共享模块不判断当前是哪种引擎，不保存 Generic 去重族，也不解释 RPG Maker 的角色、对话、数组形状、Rules、布局或游戏文件。</p>
   </section>
 
   <footer>本页只描述现行源码中的职责和直接依赖。</footer>

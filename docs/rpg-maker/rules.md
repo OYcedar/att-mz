@@ -314,7 +314,7 @@ owner 候选提交。任一规则失败、recipe 无法重建或 Mutation Claim 
 ### 4.7 可复制正例、反例和物化结果
 
 本节 4.1 的 TOML 分别给出最小完整正例和来源互斥反例；4.10 给出多捕获物化后的
-`unit_order` 与 recipe。可由生产解析器执行并做 WriteBack round-trip 的三来源样例见
+Unit 自然顺序与 recipe。可由生产解析器执行并做 WriteBack round-trip 的三来源样例见
 [`examples/extract-rules.toml`](examples/extract-rules.toml)。为自己的规则同时准备：一个
 实际命中样本、一个形似但不应命中的样本，以及未翻译和已翻译各一次写回结果。
 
@@ -432,7 +432,7 @@ path = 'payload.entry.title'
 
 同一最终 string 内由同一规则的多次捕获自动形成一个组，字段按捕获字节位置排列；同一
 个 string 交给一条规则就好，别让多条规则瓜分。组的自然顺序使用
-[第 5 节](#5-自然顺序与-mutation-claim)定义的 canonical 来源顺序，再按结构路径和捕获
+[第 5 节](#5-语义范围自然顺序与-mutation-claim)定义的 canonical 来源顺序，再按结构路径和捕获
 字节位置排列；规则编号不参与排序。数组下标按数值顺序（`2` 在 `10` 前），而不是按
 位置字符串排序。
 
@@ -446,10 +446,10 @@ pattern = '<t>(?<text>.*?)</t>'
 
 <!-- att-example: illustrative -->
 ```text
-源值：A<t>第一段</t>B<t>第二段</t>C
+ 源值：A<t>第一段</t>B<t>第二段</t>C
 物化组：
-  unit_order 0 -> "第一段"
-  unit_order 1 -> "第二段"
+  第一个 Unit -> "第一段"
+  第二个 Unit -> "第二段"
 recipe：Literal("A<t>") + Slot(0) + Literal("</t>B<t>") + Slot(1) + Literal("</t>C")
 ```
 
@@ -477,14 +477,17 @@ JSON 解码、最终 string、捕获、重建或物理 Claim 不成立，整个 
 至少产出一个单元。成功时 CLI 的提取摘要仍写 stdout；每类非字符串跳过警告各写一行
 stderr，退出码仍为 0。警告按上述聚合键稳定排序，不包含原始参数值或逐命令位置。
 
-## 5. 自然顺序与 Mutation Claim
+## 5. 语义范围、自然顺序与 Mutation Claim
 
-最终 RPG Maker 资产的 owner 总顺序固定为 `Builtin → Rules`。每个 owner 的 `group_order`
-从 0 连续，每组 `unit_order` 从 0 连续：
+Builtin 和 Rules 都把来源的物理位置转换成同一种语义顺序键。翻译读取器先按语义范围和
+顺序键整理资产，再合并 `kind + group_location` 相同的 Group；owner 只保留 Unit 的来源
+责任，不再作为 `Builtin → Rules` 排序补充。两个 owner 对同一 Group 给出不同 Group
+顺序键、同一 Group 出现重复角色，或者不同对象得到相同顺序键时，读取明确失败。
 
-- Builtin：来源结构顺序、本文声明的字段顺序、数组数值顺序；
-- Rules：下表定义的 canonical 来源顺序、来源内部结构路径顺序、同一 string 的捕获字节
-  位置。
+语义范围由来源本身决定：普通数据库文件、System、每张 Map、每个 CommonEvent、每个
+Troop 和每个启用插件各自形成范围。TaskBlock 不跨语义范围。范围内的自然顺序来自 JSON
+对象成员的插入顺序、数组下标、事件与插件的物理位置；同一物理节点内再用 fragment
+区分角色或捕获槽。该顺序不读取 owner、译文状态、Task ID 或任务历史。
 
 Rules 的跨来源顺序是稳定契约，与 OS 目录枚举顺序无关：
 
@@ -499,8 +502,13 @@ Rules 的跨来源顺序是稳定契约，与 OS 目录枚举顺序无关：
 同一规则；同一最终 string 的多个捕获按捕获起始字节。规则在 TOML 中的编号只用于诊断和
 逐条执行，不改变最终顺序。
 
-顺序进入资产快照指纹，但不进入逻辑身份，也不单独阻止原文/上下文相同的译文继承。
-并发可以改变完成时间，不能改变这些顺序。
+顺序键以规范 BLOB 保存：每个物理路径段为 `0x01 + u64 大端`，结尾为
+`0x00 + fragment u64 大端`。数据库 BLOB 字典序必须与内存类型顺序完全一致；截断、未知
+标记、终止段后的尾部字节和非规范值都作为当前 schema 的普通无效数据处理。
+
+顺序进入资产快照和完整 Group 语境指纹，但不进入 owner、location、role 组成的主身份，
+也不绑定 TaskBlock 邻居、译文、临时 ID 或任务历史。并发可以改变完成时间，不能改变语义
+范围、Group/Unit 顺序、稳定装箱或提交顺序。
 
 提取方不直接书写 `MutationClaim`。ATT 从完整 Value 和事件块 recipe 派生资源锁：
 `Intent` 表示将穿过资源，`Exclusive` 表示拥有该精确可变 Value。
@@ -575,13 +583,16 @@ pattern = '<name>(?<text>.*?)</name>'
 Rules；owner、文件路径和 Rule 序号都不参与 scope 选择。单条自定义规则零命中是正常结果；一旦命中，完整匹配必须
 非零宽并位于 UTF-8 边界，`text` 必须参与、位于完整匹配内并落在 UTF-8 字符边界。
 实际保护跨度冲突、跨越 `Lines` 元素的语义槽边界、原文占用保留前缀 `⟦ATT_`，或最终
-token 无法安全投影时，只使当前翻译单元规划失败，不把未命中的其他单元判为失败。
+token 无法安全投影时，错误仍定位到当前 Unit。Planner 不会删掉该 Unit 后发送残缺语境；
+包含它的完整 TaskBlock 本次不发送。其他完整 TaskBlock 是否继续，沿用 Translate 的阶段
+结果规则。
 
 ### 6.5 原子失败范围
 
 文件解析/编译失败时不替换项目自定义 Placeholder 资源。翻译执行期的匹配或保护冲突以
-标准单元为最小失败范围；失败单元不发给 LLM，其他独立单元仍可规划。阶段如何记录部分
-结果由[翻译规格](translation.md)规定，规则文件本身没有“忽略冲突”或优先级开关。
+Unit 为最小诊断和状态单位，以完整 TaskBlock 为最小发送单位：失败 Unit 所在块不发送，
+不受影响的完整块仍可规划。阶段如何记录部分结果由[翻译规格](translation.md)规定，规则
+文件本身没有“忽略冲突”或优先级开关。
 
 ### 6.6 提供文件、略去参数与显式空数组的生命周期
 

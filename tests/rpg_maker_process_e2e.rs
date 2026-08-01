@@ -8,6 +8,7 @@ use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -27,6 +28,13 @@ const RULES_SHORT_TRANSLATION: &str = "治疗药水";
 const RULES_LONG_SOURCE: &str = "高級ポーション";
 const THINKING_PROMPT: &str = "Explain the checks inside the required why envelope.";
 const THINKING_SENTINEL: &str = "PRIVATE_THINKING_SENTINEL";
+const PARTIAL_RETRY_SOURCES: [&str; 4] = [
+    "春の便りです",
+    "夏の便りです",
+    "秋の便りです",
+    "冬の便りです",
+];
+const PARTIAL_RETRY_TRANSLATIONS: [&str; 4] = ["春日来信", "夏日来信", "秋日来信", "冬日来信"];
 
 #[test]
 fn help_exposes_mv_mz_and_generic_as_independent_command_domains() {
@@ -285,6 +293,396 @@ fn same_named_mv_mz_and_generic_projects_remain_isolated_across_real_processes()
         original_mz[1]["description"], SOURCE_TEXT,
         "WriteBack 不得修改外部游戏目录"
     );
+}
+
+#[test]
+fn mz_partial_retry_reuses_the_complete_task_block_across_real_processes() {
+    let temporary = tempfile::tempdir().expect("应可建立 MZ Partial 重试端到端测试目录");
+    let root = temporary.path();
+    let game = root.join("mz-game");
+    write_partial_retry_mz_game(&game);
+    write_rpg_maker_prompt(root);
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("本地模型服务端口应可绑定");
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().expect("本地模型地址应可读取")
+    );
+    write_configuration(root, &endpoint);
+
+    assert_success(
+        "MZ Partial 重试 Init",
+        &run_att(root, init_arguments("mz", &game)),
+    );
+    assert_success(
+        "MZ Partial 重试 Extract",
+        &run_att(
+            root,
+            arguments(&["mz", "extract", "--name", PROJECT, "--builtin"]),
+        ),
+    );
+
+    let workspace = distribution_root(root).join("projects/mz").join(PROJECT);
+    let database = workspace.join("project.db");
+    let server = thread::spawn(move || {
+        serve_two_responses(
+            listener,
+            json!({
+                "1": [PARTIAL_RETRY_TRANSLATIONS[0]],
+                "3": [PARTIAL_RETRY_TRANSLATIONS[2]],
+                "4": [PARTIAL_RETRY_TRANSLATIONS[3]]
+            }),
+            json!({ "1": [PARTIAL_RETRY_TRANSLATIONS[1]] }),
+        )
+    });
+
+    assert_success(
+        "MZ 首次 Partial Translate",
+        &run_att(
+            root,
+            arguments(&["mz", "translate", "--name", PROJECT, "local"]),
+        ),
+    );
+    assert_eq!(
+        read_owner_units(&database, "builtin"),
+        vec![
+            (
+                json!(PARTIAL_RETRY_SOURCES[0]),
+                Some(json!(PARTIAL_RETRY_TRANSLATIONS[0])),
+            ),
+            (json!(PARTIAL_RETRY_SOURCES[1]), None),
+            (
+                json!(PARTIAL_RETRY_SOURCES[2]),
+                Some(json!(PARTIAL_RETRY_TRANSLATIONS[2])),
+            ),
+            (
+                json!(PARTIAL_RETRY_SOURCES[3]),
+                Some(json!(PARTIAL_RETRY_TRANSLATIONS[3])),
+            ),
+        ],
+        "首次响应必须只提交 A、C、D"
+    );
+    let first_task_records = read_task_records_sharing_log_run_ids(&workspace);
+    assert_eq!(
+        first_task_records.len(),
+        1,
+        "首次 Partial 必须建立一份任务记录"
+    );
+    let first_run_id = first_task_records[0].0.clone();
+
+    assert_success(
+        "MZ 第二次 Partial 重试 Translate",
+        &run_att(
+            root,
+            arguments(&["mz", "translate", "--name", PROJECT, "local"]),
+        ),
+    );
+    let [first_request, second_request] = server
+        .join()
+        .expect("MZ Partial 重试模型服务线程不得 panic")
+        .expect("MZ Partial 重试模型服务必须完成两次请求");
+
+    let first_user = first_request["messages"][1]["content"]
+        .as_str()
+        .expect("MZ 首次请求 user message 必须是字符串");
+    assert_eq!(
+        first_user,
+        expected_rpg_maker_description_user_message(&[
+            (PARTIAL_RETRY_SOURCES[0], Some(1)),
+            (PARTIAL_RETRY_SOURCES[1], Some(2)),
+            (PARTIAL_RETRY_SOURCES[2], Some(3)),
+            (PARTIAL_RETRY_SOURCES[3], Some(4)),
+        ]),
+        "首次请求必须按 A、B、C、D 的自然顺序发送完整 TaskBlock"
+    );
+    let second_user = second_request["messages"][1]["content"]
+        .as_str()
+        .expect("MZ 第二次请求 user message 必须是字符串");
+    assert_eq!(
+        second_user,
+        expected_rpg_maker_description_user_message(&[
+            (PARTIAL_RETRY_TRANSLATIONS[0], None),
+            (PARTIAL_RETRY_SOURCES[1], Some(1)),
+            (PARTIAL_RETRY_TRANSLATIONS[2], None),
+            (PARTIAL_RETRY_TRANSLATIONS[3], None),
+        ]),
+        "第二次请求必须保留原 TaskBlock，并只给 B 分配 [1]"
+    );
+
+    let task_records = read_task_records_sharing_log_run_ids(&workspace);
+    assert_eq!(task_records.len(), 2, "两次 Translate 必须各有一份任务记录");
+    let second_task_records = task_records
+        .iter()
+        .filter(|(run_id, _)| run_id != &first_run_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        second_task_records.len(),
+        1,
+        "第二次 Translate 必须建立新的 RunId 任务记录"
+    );
+    let second_task_record = &second_task_records[0].1;
+    assert!(
+        second_task_record.contains(second_user),
+        "第二次 MZ 任务记录必须保存与实际请求相同的完整 TaskBlock"
+    );
+    assert!(second_task_record.contains("# 翻译任务 000001 · 完成"));
+    assert_eq!(
+        read_owner_units(&database, "builtin"),
+        PARTIAL_RETRY_SOURCES
+            .iter()
+            .zip(PARTIAL_RETRY_TRANSLATIONS)
+            .map(|(source, translation)| (json!(*source), Some(json!(translation))))
+            .collect::<Vec<_>>(),
+        "第二次响应必须补交 B，并保留首次已提交的 A、C、D"
+    );
+}
+
+#[test]
+fn generic_partial_retry_reuses_the_complete_task_block_across_real_processes() {
+    let temporary = tempfile::tempdir().expect("应可建立 Generic Partial 重试端到端测试目录");
+    let root = temporary.path();
+    let input = root.join("jsonl");
+    fs::create_dir(&input).expect("Generic Partial 重试输入目录应可建立");
+    write_partial_retry_generic_group(&input.join("story.jsonl"));
+    write_generic_prompt(root);
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("本地模型服务端口应可绑定");
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().expect("本地模型地址应可读取")
+    );
+    write_configuration(root, &endpoint);
+
+    let mut init = arguments(&["generic", "init", "--name", PROJECT, "--path"]);
+    init.push(input.as_os_str().to_owned());
+    init.extend(arguments(&[
+        "--source-language",
+        "ja",
+        "--target-language",
+        "zh-Hans",
+    ]));
+    assert_success("Generic Partial 重试 Init", &run_att(root, init));
+    assert_success(
+        "Generic Partial 重试 Extract",
+        &run_att(root, arguments(&["generic", "extract", "--name", PROJECT])),
+    );
+
+    let workspace = distribution_root(root)
+        .join("projects/generic")
+        .join(PROJECT);
+    let database = workspace.join("project.db");
+    let server = thread::spawn(move || {
+        serve_two_responses(
+            listener,
+            json!({
+                "1": PARTIAL_RETRY_TRANSLATIONS[0],
+                "3": PARTIAL_RETRY_TRANSLATIONS[2],
+                "4": PARTIAL_RETRY_TRANSLATIONS[3]
+            }),
+            json!({ "1": PARTIAL_RETRY_TRANSLATIONS[1] }),
+        )
+    });
+
+    assert_success(
+        "Generic 首次 Partial Translate",
+        &run_att(
+            root,
+            arguments(&["generic", "translate", "--name", PROJECT, "local"]),
+        ),
+    );
+    assert_eq!(
+        read_generic_units(&database),
+        PARTIAL_RETRY_SOURCES
+            .iter()
+            .zip([
+                Some(PARTIAL_RETRY_TRANSLATIONS[0]),
+                None,
+                Some(PARTIAL_RETRY_TRANSLATIONS[2]),
+                Some(PARTIAL_RETRY_TRANSLATIONS[3]),
+            ])
+            .map(|(source, translation)| { ((*source).to_owned(), translation.map(str::to_owned)) })
+            .collect::<Vec<_>>(),
+        "首次 Generic 响应必须只提交 A、C、D"
+    );
+    let first_task_records = read_task_records_sharing_log_run_ids(&workspace);
+    assert_eq!(
+        first_task_records.len(),
+        1,
+        "首次 Generic Partial 必须建立一份任务记录"
+    );
+    let first_run_id = first_task_records[0].0.clone();
+
+    assert_success(
+        "Generic 第二次 Partial 重试 Translate",
+        &run_att(
+            root,
+            arguments(&["generic", "translate", "--name", PROJECT, "local"]),
+        ),
+    );
+    let [first_request, second_request] = server
+        .join()
+        .expect("Generic Partial 重试模型服务线程不得 panic")
+        .expect("Generic Partial 重试模型服务必须完成两次请求");
+
+    let first_user = first_request["messages"][1]["content"]
+        .as_str()
+        .expect("Generic 首次请求 user message 必须是字符串");
+    assert_eq!(
+        first_user,
+        expected_generic_user_message(&[
+            (PARTIAL_RETRY_SOURCES[0], Some(1)),
+            (PARTIAL_RETRY_SOURCES[1], Some(2)),
+            (PARTIAL_RETRY_SOURCES[2], Some(3)),
+            (PARTIAL_RETRY_SOURCES[3], Some(4)),
+        ]),
+        "首次 Generic 请求必须按 A、B、C、D 的自然顺序发送完整 TaskBlock"
+    );
+    let second_user = second_request["messages"][1]["content"]
+        .as_str()
+        .expect("Generic 第二次请求 user message 必须是字符串");
+    assert_eq!(
+        second_user,
+        expected_generic_user_message(&[
+            (PARTIAL_RETRY_TRANSLATIONS[0], None),
+            (PARTIAL_RETRY_SOURCES[1], Some(1)),
+            (PARTIAL_RETRY_TRANSLATIONS[2], None),
+            (PARTIAL_RETRY_TRANSLATIONS[3], None),
+        ]),
+        "第二次 Generic 请求必须保留原 TaskBlock，并只给 B 分配 [1]"
+    );
+
+    let task_records = read_task_records_sharing_log_run_ids(&workspace);
+    assert_eq!(task_records.len(), 2, "两次 Translate 必须各有一份任务记录");
+    let second_task_records = task_records
+        .iter()
+        .filter(|(run_id, _)| run_id != &first_run_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        second_task_records.len(),
+        1,
+        "第二次 Generic Translate 必须建立新的 RunId 任务记录"
+    );
+    let second_task_record = &second_task_records[0].1;
+    assert!(
+        second_task_record.contains(second_user),
+        "第二次 Generic 任务记录必须保存与实际请求相同的完整 TaskBlock"
+    );
+    assert!(second_task_record.contains("# 翻译任务 000001 · 完成"));
+    assert_eq!(
+        read_generic_units(&database),
+        PARTIAL_RETRY_SOURCES
+            .iter()
+            .zip(PARTIAL_RETRY_TRANSLATIONS)
+            .map(|(source, translation)| ((*source).to_owned(), Some(translation.to_owned())))
+            .collect::<Vec<_>>(),
+        "第二次 Generic 响应必须补交 B，并保留首次已提交的 A、C、D"
+    );
+}
+
+#[test]
+fn generic_source_placeholder_failure_sends_no_incomplete_task_block() {
+    let temporary = tempfile::tempdir().expect("应可建立 Generic Placeholder 失败测试目录");
+    let root = temporary.path();
+    let input = root.join("jsonl");
+    fs::create_dir(&input).expect("Generic Placeholder 失败输入目录应可建立");
+    fs::write(
+        input.join("story.jsonl"),
+        concat!(
+            r#"{"id":"scene","kind":"dialogue","units":["#,
+            r#"{"id":"good-a","text":"春の便りです"},"#,
+            r#"{"id":"broken","text":"夏の便りです {hero}"},"#,
+            r#"{"id":"good-c","text":"秋の便りです"}]}"#,
+            "\n"
+        ),
+    )
+    .expect("Generic Placeholder 失败 JSONL 应可写入");
+    let placeholders = root.join("overlapping-placeholders.toml");
+    fs::write(
+        &placeholders,
+        concat!(
+            "[[rule]]\n",
+            "scopes = [\"dialogue\"]\n",
+            "pattern = '\\{[^}]+\\}'\n",
+            "\n",
+            "[[rule]]\n",
+            "scopes = [\"dialogue\"]\n",
+            "pattern = '\\{hero\\}'\n",
+        ),
+    )
+    .expect("重叠 Placeholder 规则应可写入");
+    write_generic_prompt(root);
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("本地模型服务端口应可绑定");
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().expect("本地模型地址应可读取")
+    );
+    write_configuration(root, &endpoint);
+    let (stop_sender, stop_receiver) = mpsc::channel();
+    let provider = thread::spawn(move || serve_provider_spy(listener, stop_receiver));
+
+    let mut init = arguments(&["generic", "init", "--name", PROJECT, "--path"]);
+    init.push(input.as_os_str().to_owned());
+    init.extend(arguments(&[
+        "--source-language",
+        "ja",
+        "--target-language",
+        "zh-Hans",
+    ]));
+    assert_success("Generic Placeholder 失败 Init", &run_att(root, init));
+    assert_success(
+        "Generic Placeholder 失败 Extract",
+        &run_att(root, arguments(&["generic", "extract", "--name", PROJECT])),
+    );
+
+    let mut translate = arguments(&[
+        "generic",
+        "translate",
+        "--name",
+        PROJECT,
+        "local",
+        "--placeholders",
+    ]);
+    translate.push(placeholders.as_os_str().to_owned());
+    let output = run_att(root, translate);
+    stop_sender
+        .send(())
+        .expect("Generic Placeholder 失败后应可停止 Provider spy");
+    let requests = provider
+        .join()
+        .expect("Generic Placeholder Provider spy 不得 panic")
+        .expect("Generic Placeholder Provider spy 必须正常结束");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        requests.is_empty(),
+        "同一 TaskBlock 中任一源文无法完成 Placeholder 投影时，不得删除坏 Unit 后发送残缺块：{requests:?}"
+    );
+    let workspace = distribution_root(root)
+        .join("projects/generic")
+        .join(PROJECT);
+    assert!(
+        !workspace.join("task-records").exists(),
+        "模型请求开始前的源文 Placeholder 失败不得建立任务记录"
+    );
+    assert!(
+        read_generic_units(&workspace.join("project.db"))
+            .iter()
+            .all(|(_, translation)| translation.is_none()),
+        "规划失败不得提交同块其他 Unit 的译文"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("Generic 失败诊断必须是 UTF-8");
+    for expected in [
+        "建立 Generic 翻译计划",
+        "必要前置条件未满足",
+        "状态未改变",
+        "修正指出的输入后重试",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "命令必须保留现有的规划失败语义 {expected:?}：{stderr}"
+        );
+    }
 }
 
 #[test]
@@ -1670,37 +2068,86 @@ fn write_generic_prompt(root: &Path) {
         .expect("Generic Thinking Prompt 应可写入");
 }
 
+fn expected_rpg_maker_description_user_message(units: &[(&str, Option<usize>)]) -> String {
+    let mut message = String::new();
+    for (index, (text, task_id)) in units.iter().copied().enumerate() {
+        if index > 0 {
+            message.push('\n');
+        }
+        message.push_str("## Database Text\n\nDescription [");
+        match task_id {
+            Some(task_id) => message.push_str(&task_id.to_string()),
+            None => message.push('-'),
+        }
+        message.push_str("] (free line breaking):\n\n> ");
+        message.push_str(text);
+        message.push('\n');
+    }
+    message
+}
+
+fn expected_generic_user_message(units: &[(&str, Option<usize>)]) -> String {
+    let mut message = "Groups:\nkind=\"dialogue\"\nunits:\n".to_owned();
+    for (text, task_id) in units.iter().copied() {
+        message.push('[');
+        match task_id {
+            Some(task_id) => message.push_str(&task_id.to_string()),
+            None => message.push('-'),
+        }
+        message.push_str("] ");
+        message.push_str(
+            &serde_json::to_string(text).expect("Generic user message 文本应可编码为 JSON"),
+        );
+        message.push('\n');
+    }
+    message.push('\n');
+    message
+}
+
 fn read_single_task_record_sharing_log_run_id(workspace: &Path) -> String {
+    let mut task_records = read_task_records_sharing_log_run_ids(workspace);
+    assert_eq!(task_records.len(), 1, "测试项目应只有一个任务记录运行");
+    task_records.pop().expect("唯一任务记录应存在").1
+}
+
+fn read_task_records_sharing_log_run_ids(workspace: &Path) -> Vec<(OsString, String)> {
     let task_records_root = workspace.join("task-records");
-    let run_directories = fs::read_dir(&task_records_root)
+    let mut run_directories = fs::read_dir(&task_records_root)
         .expect("任务记录根应存在")
         .collect::<Result<Vec<_>, _>>()
         .expect("任务记录运行目录应可读取");
-    assert_eq!(run_directories.len(), 1, "测试项目应只有一个任务记录运行");
-    let run_directory = &run_directories[0];
-    let run_id = run_directory.file_name();
-    let log_path = workspace
-        .join("logs")
-        .join(Path::new(&run_id).with_extension("jsonl"));
-    assert!(
-        log_path.is_file(),
-        "任务记录目录名必须与 Translate 项目日志 RunId 相同：{}",
-        log_path.display()
-    );
-    let log = fs::read_to_string(&log_path).expect("Translate 项目日志应可读取");
-    assert!(
-        log.lines().any(|line| {
-            serde_json::from_str::<Value>(line).is_ok_and(|record| record["command"] == "translate")
-        }),
-        "同 RunId 项目日志必须属于 Translate"
-    );
-    let task_files = fs::read_dir(run_directory.path())
-        .expect("任务记录运行目录应可读取")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("任务记录文件应可读取");
-    assert_eq!(task_files.len(), 1, "一个 TaskBlock 只能生成一份任务记录");
-    assert_eq!(task_files[0].file_name(), OsString::from("task-000001.md"));
-    fs::read_to_string(task_files[0].path()).expect("任务记录 Markdown 应可读取")
+    run_directories.sort_by_key(|entry| entry.file_name());
+    run_directories
+        .into_iter()
+        .map(|run_directory| {
+            let run_id = run_directory.file_name();
+            let log_path = workspace
+                .join("logs")
+                .join(Path::new(&run_id).with_extension("jsonl"));
+            assert!(
+                log_path.is_file(),
+                "任务记录目录名必须与 Translate 项目日志 RunId 相同：{}",
+                log_path.display()
+            );
+            let log = fs::read_to_string(&log_path).expect("Translate 项目日志应可读取");
+            assert!(
+                log.lines().any(|line| {
+                    serde_json::from_str::<Value>(line)
+                        .is_ok_and(|record| record["command"] == "translate")
+                }),
+                "同 RunId 项目日志必须属于 Translate"
+            );
+            let task_files = fs::read_dir(run_directory.path())
+                .expect("任务记录运行目录应可读取")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("任务记录文件应可读取");
+            assert_eq!(task_files.len(), 1, "一个 TaskBlock 只能生成一份任务记录");
+            assert_eq!(task_files[0].file_name(), OsString::from("task-000001.md"));
+            let markdown =
+                fs::read_to_string(task_files[0].path()).expect("任务记录 Markdown 应可读取");
+            (run_id, markdown)
+        })
+        .collect()
 }
 
 fn assert_workspace_does_not_contain(root: &Path, sentinel: &str) {
@@ -1733,6 +2180,25 @@ fn write_generic_group(path: &Path, text: &str, alternate_order: bool) {
         .to_string()
     };
     fs::write(path, format!("{line}\n")).expect("Generic JSONL 夹具应可写入");
+}
+
+fn write_partial_retry_generic_group(path: &Path) {
+    let units = PARTIAL_RETRY_SOURCES
+        .iter()
+        .enumerate()
+        .map(|(index, text)| {
+            json!({
+                "id": format!("line-{}", index + 1),
+                "text": text,
+            })
+        })
+        .collect::<Vec<_>>();
+    let line = json!({
+        "id": "scene-1",
+        "kind": "dialogue",
+        "units": units,
+    });
+    fs::write(path, format!("{line}\n")).expect("Generic Partial 重试夹具应可写入");
 }
 
 fn write_generic_duplicate_group(path: &Path, text: &str, alternate_order: bool) {
@@ -1837,6 +2303,28 @@ fn write_minimal_mz_game(game_root: &Path) {
     fs::write(js.join("rmmz_core.js"), "/* MZ core */").expect("MZ core 标记应可写入");
 }
 
+fn write_partial_retry_mz_game(game_root: &Path) {
+    write_minimal_mz_game(game_root);
+    let mut items = vec![Value::Null];
+    items.extend(
+        PARTIAL_RETRY_SOURCES
+            .iter()
+            .enumerate()
+            .map(|(index, description)| {
+                json!({
+                    "id": index + 1,
+                    "name": "",
+                    "description": description,
+                })
+            }),
+    );
+    fs::write(
+        game_root.join("data/Items.json"),
+        serde_json::to_vec(&items).expect("MZ Partial 重试 Items 应可序列化"),
+    )
+    .expect("MZ Partial 重试 Items 应可写入");
+}
+
 fn write_minimal_mv_game(game_root: &Path) {
     let content_root = game_root.join("www");
     write_minimal_mz_game(&content_root);
@@ -1887,7 +2375,7 @@ fn read_owner_units(database: &Path, owner: &str) -> Vec<(Value, Option<Value>)>
                ON group_row.owner = unit.owner
               AND group_row.group_location = unit.group_location
              WHERE unit.owner = ?1
-             ORDER BY group_row.group_order, unit.unit_order",
+             ORDER BY group_row.semantic_order_key, unit.semantic_order_key",
         )
         .expect("RPG Maker Unit 查询应可准备");
     statement
@@ -1907,6 +2395,25 @@ fn read_owner_units(database: &Path, owner: &str) -> Vec<(Value, Option<Value>)>
         .collect()
 }
 
+fn read_generic_units(database: &Path) -> Vec<(String, Option<String>)> {
+    let connection = Connection::open(database).expect("Generic 项目数据库应可打开");
+    let mut statement = connection
+        .prepare(
+            "SELECT unit.source_text, unit.translation
+             FROM generic_unit AS unit
+             JOIN generic_group AS group_row ON group_row.group_id = unit.group_id
+             JOIN generic_file AS file_row
+               ON file_row.relative_path = group_row.relative_path
+             ORDER BY file_row.ordinal, group_row.ordinal, unit.ordinal",
+        )
+        .expect("Generic Unit 查询应可准备");
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("Generic Unit 查询应可执行")
+        .map(|row| row.expect("Generic Unit 应可读取"))
+        .collect()
+}
+
 fn read_items(path: &Path) -> Value {
     serde_json::from_slice(
         &fs::read(path).unwrap_or_else(|error| panic!("{} 应可读取：{error}", path.display())),
@@ -1923,6 +2430,59 @@ fn serve_one_generic_translation(
     translation: &str,
 ) -> Result<Value, String> {
     serve_one_response(listener, json!({ "1": translation }))
+}
+
+fn serve_two_responses(
+    listener: TcpListener,
+    first_output: Value,
+    second_output: Value,
+) -> Result<[Value; 2], String> {
+    let first_listener = listener.try_clone().map_err(|error| error.to_string())?;
+    let first_request = serve_one_response(first_listener, first_output)?;
+    let second_request = serve_one_response(listener, second_output)?;
+    Ok([first_request, second_request])
+}
+
+fn serve_provider_spy(
+    listener: TcpListener,
+    stop: mpsc::Receiver<()>,
+) -> Result<Vec<Value>, String> {
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| error.to_string())?;
+    let mut requests = Vec::new();
+    loop {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                // Windows 会让新 socket 继承 listener 的非阻塞状态。
+                stream
+                    .set_nonblocking(false)
+                    .map_err(|error| error.to_string())?;
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .map_err(|error| error.to_string())?;
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(10)))
+                    .map_err(|error| error.to_string())?;
+                requests.push(read_http_json(&mut stream)?);
+                write_chat_response(
+                    &mut stream,
+                    &format!(
+                        "<why>{THINKING_SENTINEL}</why>\n{}",
+                        json!({ "1": "春日来信", "2": "秋日来信" })
+                    ),
+                )?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                match stop.recv_timeout(Duration::from_millis(10)) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(requests)
 }
 
 fn serve_one_response(listener: TcpListener, model_output: Value) -> Result<Value, String> {

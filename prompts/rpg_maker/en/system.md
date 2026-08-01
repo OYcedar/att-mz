@@ -8,7 +8,7 @@ reads as if the game had been written in that language from the start.
 
 - Read the whole scene: who is speaking, to whom, what is left unsaid, and how the
   characters relate. Let tone, emotion, and honorifics land where they belong.
-- Terminology, group headings, and names without `[ID]` are context to guide you;
+- Terminology, group headings, and text without `[ID]` are context to guide you;
   produce translations only for `[ID]` entries. Apply the supplied terminology
   consistently wherever it is relevant.
 - Stay faithful to the source meaning, style, and register while writing natural,

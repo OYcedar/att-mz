@@ -15,6 +15,9 @@ use crate::rpg_maker::location_codec::{
     RpgMakerProjectionCodecError,
 };
 use crate::rpg_maker::model::TextUnitContent;
+use crate::rpg_maker::semantic_order::{
+    RpgMakerSemanticOrderKey, RpgMakerSemanticOrderKeyEncodeError,
+};
 use crate::rpg_maker::text::TextGroupKind;
 use crate::translation::placeholder_projection::{
     LanguageTextProjectionError, project_protected_text_from_shared_with_cancellation,
@@ -25,7 +28,9 @@ use crate::translation::placeholder_projection::{
 use super::executor::accept_prepared_translation_candidate;
 #[cfg(test)]
 use super::pipeline::TranslationUnitRejectionReason;
-use super::pipeline::{AppliedPlaceholder, TerminologyDependency, TranslationUnitIdentity};
+use super::pipeline::{
+    AppliedPlaceholder, GroupContextFingerprint, TerminologyDependency, TranslationUnitIdentity,
+};
 use super::placeholder::{
     CompiledPlaceholderRules, Pcre2PlaceholderService, PlaceholderProtectionError,
 };
@@ -244,6 +249,11 @@ impl TranslationResourceFacts {
         &self.terms
     }
 
+    /// 返回实际命中的术语文件索引，供完整 Group 按文件顺序合并依赖。
+    pub(crate) fn term_indices(&self) -> &[usize] {
+        &self.term_indices
+    }
+
     pub(crate) fn placeholders(&self) -> &[AppliedPlaceholder] {
         &self.placeholders
     }
@@ -409,6 +419,118 @@ fn prepare_translation_resource_text_with_cancellation<E>(
     }))
 }
 
+/// 建立一个完整 Group 的稳定来源语境指纹。
+///
+/// 调用方必须按完整自然顺序提供 Group 的全部 Unit。译文、Current、模型责任、
+/// TaskBlock 邻居和临时 ID 都不进入该指纹。
+pub(crate) fn group_context_fingerprint_with_cancellation<'a, E>(
+    kind: TextGroupKind,
+    semantic_order_key: &RpgMakerSemanticOrderKey,
+    units: impl ExactSizeIterator<Item = (&'a RpgMakerSemanticOrderKey, &'a TranslationUnitIdentity)>,
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<Result<GroupContextFingerprint, GroupContextFingerprintError>, E> {
+    ensure_running()?;
+    let group_order = match semantic_order_key.encode() {
+        Ok(group_order) => group_order,
+        Err(source) => {
+            return Ok(Err(GroupContextFingerprintError::SemanticOrder(source)));
+        }
+    };
+    let unit_count = u64::try_from(units.len())
+        .expect("当前平台的 Group Unit 数量必须可表示为 u64")
+        .to_be_bytes();
+    let chunk_size = semantic_hash_chunk_size();
+    let mut hasher = Sha256FramedHasher::new(b"att.rpg_maker.translation-group-context");
+    hasher
+        .frame(1, kind.storage_name().as_bytes())
+        .frame(2, &group_order)
+        .frame(3, &unit_count);
+    for (unit_order_key, identity) in units {
+        ensure_running()?;
+        let unit_order = match unit_order_key.encode() {
+            Ok(unit_order) => unit_order,
+            Err(source) => {
+                return Ok(Err(GroupContextFingerprintError::SemanticOrder(source)));
+            }
+        };
+        let location = match RpgMakerLocationCodec::encode(identity.group_location()) {
+            Ok(location) => location,
+            Err(source) => {
+                return Ok(Err(GroupContextFingerprintError::Location(source)));
+            }
+        };
+        let role = match RpgMakerProjectionCodec::encode_role(identity.role()) {
+            Ok(role) => role,
+            Err(source) => return Ok(Err(GroupContextFingerprintError::Role(source))),
+        };
+        hasher
+            .frame(10, identity.owner().storage_name().as_bytes())
+            .frame(11, identity.kind().storage_name().as_bytes())
+            .frame(12, &unit_order);
+        hasher.try_frame_chunks(13, location.as_bytes(), chunk_size, &mut ensure_running)?;
+        hasher.try_frame_chunks(14, role.as_bytes(), chunk_size, &mut ensure_running)?;
+        hasher.try_frame_chunks(
+            15,
+            identity.source_context_json().as_bytes(),
+            chunk_size,
+            &mut ensure_running,
+        )?;
+        match identity.source_content() {
+            TextUnitContent::Value(value) => {
+                hasher.frame(16, b"value");
+                hasher.try_frame_chunks(17, value.as_bytes(), chunk_size, &mut ensure_running)?;
+            }
+            TextUnitContent::Lines(lines) => {
+                hasher.frame(16, b"lines").frame(
+                    17,
+                    &u64::try_from(lines.len())
+                        .expect("当前平台的源行数必须可表示为 u64")
+                        .to_be_bytes(),
+                );
+                for line in lines {
+                    ensure_running()?;
+                    hasher.try_frame_chunks(
+                        18,
+                        line.as_bytes(),
+                        chunk_size,
+                        &mut ensure_running,
+                    )?;
+                }
+            }
+        }
+    }
+    ensure_running()?;
+    Ok(Ok(GroupContextFingerprint::new(hasher.finish())))
+}
+
+/// 完整 Group 语境指纹无法编码受信的顺序或 Unit 身份。
+#[derive(Debug)]
+pub(crate) enum GroupContextFingerprintError {
+    SemanticOrder(RpgMakerSemanticOrderKeyEncodeError),
+    Location(RpgMakerLocationCodecError),
+    Role(RpgMakerProjectionCodecError),
+}
+
+impl fmt::Display for GroupContextFingerprintError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SemanticOrder(source) => write!(formatter, "无法编码语义顺序：{source}"),
+            Self::Location(source) => write!(formatter, "无法编码 Group 位置：{source}"),
+            Self::Role(source) => write!(formatter, "无法编码 Unit 角色：{source}"),
+        }
+    }
+}
+
+impl Error for GroupContextFingerprintError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::SemanticOrder(source) => Some(source),
+            Self::Location(source) => Some(source),
+            Self::Role(source) => Some(source),
+        }
+    }
+}
+
 /// 建立人工译文的稳定语义状态。
 ///
 /// 该状态只绑定会决定人工译文是否仍适用于当前 Unit 的事实。Prompt、Profile、
@@ -418,12 +540,14 @@ fn prepare_translation_resource_text_with_cancellation<E>(
 pub(crate) fn manual_translation_state_fingerprint(
     engine: RpgMakerEngine,
     language_pair: &LanguagePair,
+    group_context: GroupContextFingerprint,
     identity: &TranslationUnitIdentity,
     placeholders: &[AppliedPlaceholder],
 ) -> Result<Sha256Fingerprint, ManualTranslationStateError> {
     match manual_translation_state_fingerprint_with_cancellation(
         engine,
         language_pair,
+        group_context,
         identity,
         placeholders,
         || Ok::<_, Infallible>(()),
@@ -439,6 +563,7 @@ pub(crate) fn manual_translation_state_fingerprint(
 pub(crate) fn manual_translation_state_fingerprint_with_cancellation<E>(
     engine: RpgMakerEngine,
     language_pair: &LanguagePair,
+    group_context: GroupContextFingerprint,
     identity: &TranslationUnitIdentity,
     placeholders: &[AppliedPlaceholder],
     mut ensure_running: impl FnMut() -> Result<(), E>,
@@ -461,33 +586,34 @@ pub(crate) fn manual_translation_state_fingerprint_with_cancellation<E>(
         .frame(2, language_pair.source().as_str().as_bytes())
         .frame(3, language_pair.target().as_str().as_bytes())
         .frame(4, identity.owner().storage_name().as_bytes())
-        .frame(5, identity.kind().storage_name().as_bytes());
+        .frame(5, identity.kind().storage_name().as_bytes())
+        .frame(6, group_context.as_fingerprint().as_bytes());
     hasher.try_frame_chunks(
-        6,
+        7,
         group_location.as_bytes(),
         chunk_size,
         &mut ensure_running,
     )?;
-    hasher.try_frame_chunks(7, unit_role.as_bytes(), chunk_size, &mut ensure_running)?;
+    hasher.try_frame_chunks(8, unit_role.as_bytes(), chunk_size, &mut ensure_running)?;
     hasher.try_frame_chunks(
-        8,
+        9,
         identity.source_context_json().as_bytes(),
         chunk_size,
         &mut ensure_running,
     )?;
     match identity.source_content() {
         TextUnitContent::Value(value) => {
-            hasher.frame(9, b"value");
-            hasher.try_frame_chunks(10, value.as_bytes(), chunk_size, &mut ensure_running)?;
+            hasher.frame(10, b"value");
+            hasher.try_frame_chunks(11, value.as_bytes(), chunk_size, &mut ensure_running)?;
         }
         TextUnitContent::Lines(lines) => {
             let count = u64::try_from(lines.len())
                 .expect("RPG Maker Unit 行数必须能表示为 u64")
                 .to_le_bytes();
-            hasher.frame(9, b"lines").frame(10, &count);
+            hasher.frame(10, b"lines").frame(11, &count);
             for line in lines {
                 ensure_running()?;
-                hasher.try_frame_chunks(11, line.as_bytes(), chunk_size, &mut ensure_running)?;
+                hasher.try_frame_chunks(12, line.as_bytes(), chunk_size, &mut ensure_running)?;
             }
         }
     }
@@ -979,6 +1105,10 @@ mod tests {
         )
     }
 
+    fn test_group_context(byte: u8) -> GroupContextFingerprint {
+        GroupContextFingerprint::new(Sha256Fingerprint::from_bytes([byte; 32]))
+    }
+
     #[test]
     fn manual_state_binds_unit_language_context_and_actual_placeholders_only() {
         let semantics = semantics_with(
@@ -1010,6 +1140,7 @@ mod tests {
         let base = manual_translation_state_fingerprint(
             semantics.engine(),
             semantics.language_pair(),
+            test_group_context(0x71),
             &base_identity,
             prepared.placeholders(),
         )
@@ -1021,6 +1152,7 @@ mod tests {
             manual_translation_state_fingerprint(
                 semantics.engine(),
                 semantics.language_pair(),
+                test_group_context(0x71),
                 &changed_context,
                 prepared.placeholders(),
             )
@@ -1035,6 +1167,7 @@ mod tests {
             manual_translation_state_fingerprint(
                 semantics.engine(),
                 semantics.language_pair(),
+                test_group_context(0x71),
                 &changed_source,
                 changed_prepared.placeholders(),
             )
@@ -1049,10 +1182,22 @@ mod tests {
             manual_translation_state_fingerprint(
                 semantics.engine(),
                 &changed_language,
+                test_group_context(0x71),
                 &base_identity,
                 prepared.placeholders(),
             )
             .expect("应建立语言变化后的人工状态")
+        );
+        assert_ne!(
+            base,
+            manual_translation_state_fingerprint(
+                semantics.engine(),
+                semantics.language_pair(),
+                test_group_context(0x72),
+                &base_identity,
+                prepared.placeholders(),
+            )
+            .expect("应建立 Group 语境变化后的人工状态")
         );
     }
 
@@ -1076,6 +1221,7 @@ mod tests {
         let expected = manual_translation_state_fingerprint(
             RpgMakerEngine::Mz,
             &language_pair,
+            test_group_context(0x71),
             &identity,
             &[],
         )
@@ -1084,6 +1230,7 @@ mod tests {
         let actual = manual_translation_state_fingerprint_with_cancellation(
             RpgMakerEngine::Mz,
             &language_pair,
+            test_group_context(0x71),
             &identity,
             &[],
             || {
@@ -1100,6 +1247,7 @@ mod tests {
         let cancelled = manual_translation_state_fingerprint_with_cancellation(
             RpgMakerEngine::Mz,
             &language_pair,
+            test_group_context(0x71),
             &identity,
             &[],
             || {

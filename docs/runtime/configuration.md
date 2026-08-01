@@ -48,7 +48,8 @@ target_task_user_message_characters = 24000
 - `record_translation_tasks` 可省略，默认 `true`；只有操作者明确不需要可读的模型任务记录时才设为 `false`；
 - Profile 的 `id` 和 `llm_client` 必须非空；
 - `llm_client` 必须引用现有 Client；
-- `target_task_user_message_characters` 是正整数，是 TaskBlock 的目标而非硬上限；
+- `target_task_user_message_characters` 是正整数，是完整原文稳定投影的 TaskBlock 装箱目标，
+  不是最终 user message 的硬上限；译文、术语、Placeholder token 和临时 ID 不参与装箱；
 - MV、MZ 和 Generic 共用 Profile 定义，但每个项目分别保存最近采用的 ID。
 
 Prompt 文件和模型协议见[Prompt 规格](../translation/prompts.md)，任务记录见

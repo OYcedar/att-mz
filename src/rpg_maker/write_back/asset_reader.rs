@@ -37,6 +37,9 @@ use crate::rpg_maker::mutation_claim_summary::{
 };
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::project_database::{AssetSnapshotFingerprint, SourceSnapshotFingerprint};
+use crate::rpg_maker::semantic_order::{
+    RpgMakerSemanticOrderKey, RpgMakerSemanticOrderKeyDecodeError,
+};
 use crate::rpg_maker::text::{RpgMakerLocation, TextGroupKind};
 use crate::storage::sqlite::{
     QueryExistingDatabaseError, SqliteQuery, SqliteQueryExecutor, SqliteRow, SqliteValue,
@@ -65,7 +68,7 @@ fn read_rpg_maker_write_back_owner_groups() -> String {
          projection_recipe_json\n\
          FROM rpg_maker_text_group\n\
          WHERE owner = ?\n\
-         ORDER BY group_order"
+         ORDER BY semantic_order_key"
     )
 }
 
@@ -75,11 +78,12 @@ fn read_rpg_maker_write_back_owner_units() -> String {
          {RPG_MAKER_TEXT_UNIT_CONTENT_PROJECTION}\n\
          FROM rpg_maker_text_group AS text_group\n\
          CROSS JOIN rpg_maker_text_unit AS unit\n  \
+                    INDEXED BY rpg_maker_text_unit_owner_group_order_idx\n  \
            ON unit.owner = text_group.owner\n \
           AND text_group.group_location = unit.group_location\n\
          WHERE text_group.owner = ?\n\
-         ORDER BY text_group.group_order,\n         \
-          unit.unit_order"
+         ORDER BY text_group.semantic_order_key,\n         \
+          unit.semantic_order_key"
     )
 }
 
@@ -394,9 +398,9 @@ pub(crate) enum InvalidRpgMakerWriteBackAssetSnapshot {
         expected: &'static str,
         actual: &'static str,
     },
-    InvalidOrderValue {
+    InvalidSemanticOrderKey {
         column: &'static str,
-        actual: i64,
+        source: RpgMakerSemanticOrderKeyDecodeError,
     },
     UnknownOwner(String),
     DuplicateOwner(String),
@@ -415,16 +419,11 @@ pub(crate) enum InvalidRpgMakerWriteBackAssetSnapshot {
         owner: String,
         group_location: String,
     },
-    InvalidGroupOrder {
+    DuplicateSemanticOrderKey {
         owner: String,
-        expected: usize,
-        actual: i64,
-    },
-    InvalidUnitOrder {
-        owner: String,
-        group_location: String,
-        expected: usize,
-        actual: i64,
+        level: &'static str,
+        first: String,
+        second: String,
     },
     UnknownMutationAccess(String),
     NonCanonicalMutationResource {
@@ -471,9 +470,9 @@ impl InvalidRpgMakerWriteBackAssetSnapshot {
                 DiagnosticSubject::field(column),
                 format!("expected_type={expected}; actual_type={actual}"),
             ),
-            Self::InvalidOrderValue { column, actual } => (
+            Self::InvalidSemanticOrderKey { column, source } => (
                 DiagnosticSubject::field(column),
-                format!("expected=non_negative_order; actual={actual}"),
+                format!("invalid_semantic_order_key; reason={source}"),
             ),
             Self::UnknownOwner(owner) => (
                 DiagnosticSubject::field("owner"),
@@ -513,24 +512,9 @@ impl InvalidRpgMakerWriteBackAssetSnapshot {
                 DiagnosticSubject::field("group_location"),
                 format!("owner={owner}; missing_group={group_location}"),
             ),
-            Self::InvalidGroupOrder {
-                owner,
-                expected,
-                actual,
-            } => (
-                DiagnosticSubject::field("group_order"),
-                format!("owner={owner}; expected={expected}; actual={actual}"),
-            ),
-            Self::InvalidUnitOrder {
-                owner,
-                group_location,
-                expected,
-                actual,
-            } => (
-                DiagnosticSubject::field("unit_order"),
-                format!(
-                    "owner={owner}; group={group_location}; expected={expected}; actual={actual}"
-                ),
+            Self::DuplicateSemanticOrderKey { owner, level, .. } => (
+                DiagnosticSubject::field("semantic_order_key"),
+                format!("owner={owner}; duplicate_semantic_order_key; level={level}"),
             ),
             Self::UnknownMutationAccess(access) => (
                 DiagnosticSubject::field("access"),
@@ -885,11 +869,8 @@ impl fmt::Display for InvalidRpgMakerWriteBackAssetSnapshot {
                 expected,
                 actual,
             } => write!(formatter, "列 {column} 应为 {expected}，实际为 {actual}"),
-            Self::InvalidOrderValue { column, actual } => {
-                write!(
-                    formatter,
-                    "列 {column} 必须是可表示的非负顺序，实际为 {actual}"
-                )
+            Self::InvalidSemanticOrderKey { column, source } => {
+                write!(formatter, "列 {column} 不是规范语义顺序键：{source}")
             }
             Self::UnknownOwner(owner) => write!(formatter, "未知资产所有者：{owner}"),
             Self::DuplicateOwner(owner) => write!(formatter, "资产所有者状态重复：{owner}"),
@@ -916,22 +897,14 @@ impl fmt::Display for InvalidRpgMakerWriteBackAssetSnapshot {
                 formatter,
                 "单元或目标没有对应资产组：{owner} / {group_location}"
             ),
-            Self::InvalidGroupOrder {
+            Self::DuplicateSemanticOrderKey {
                 owner,
-                expected,
-                actual,
+                level,
+                first,
+                second,
             } => write!(
                 formatter,
-                "owner {owner} 的 group_order 必须从 0 连续：期待 {expected}，实际 {actual}"
-            ),
-            Self::InvalidUnitOrder {
-                owner,
-                group_location,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "组 {owner} / {group_location} 的 unit_order 必须从 0 连续：期待 {expected}，实际 {actual}"
+                "owner {owner} 的不同 {level} 使用了相同 semantic_order_key：{first} / {second}"
             ),
             Self::UnknownMutationAccess(access) => {
                 write!(formatter, "未知物理修改访问方式：{access}")
@@ -997,6 +970,7 @@ impl ClaimSummaryMismatchKind {
 impl Error for InvalidRpgMakerWriteBackAssetSnapshot {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::InvalidSemanticOrderKey { source, .. } => Some(source),
             Self::InvalidLocation(source) => Some(source),
             Self::InvalidProjection(source) => Some(source),
             Self::InvalidUnitContent { source, .. } => Some(source),
@@ -1094,7 +1068,7 @@ enum DecodedRecord {
         owner: RpgMakerAssetOwner,
         group_location_raw: String,
         group_location: RpgMakerLocation,
-        group_order: usize,
+        semantic_order_key: RpgMakerSemanticOrderKey,
         kind: TextGroupKind,
         group_kind_raw: String,
         recipes: Vec<TextProjectionRecipe>,
@@ -1105,7 +1079,7 @@ enum DecodedRecord {
         group_location_raw: String,
         role: TextUnitRole,
         role_raw: String,
-        unit_order: usize,
+        semantic_order_key: RpgMakerSemanticOrderKey,
         source_content: TextUnitContent,
         source_content_json: String,
         source_context_json: String,
@@ -1138,7 +1112,7 @@ fn decode_group(
         group_location,
         group_kind_raw,
         kind,
-        group_order,
+        semantic_order_key,
     } = RpgMakerTextGroupStorageRow::decode(&mut row).map_err(map_storage_row_error)?;
     let recipes_raw = row
         .required_text("projection_recipe_json")
@@ -1147,7 +1121,7 @@ fn decode_group(
         owner,
         group_location,
         group_location_raw,
-        group_order,
+        semantic_order_key,
         kind,
         group_kind_raw,
         recipes: RpgMakerProjectionCodec::decode_recipes(&recipes_raw)
@@ -1168,7 +1142,7 @@ fn decode_unit(
         group_location_raw,
         role,
         role_raw,
-        unit_order,
+        semantic_order_key,
         source_content,
         source_content_json,
         source_context_json,
@@ -1179,7 +1153,7 @@ fn decode_unit(
         group_location_raw,
         role,
         role_raw,
-        unit_order,
+        semantic_order_key,
         source_content,
         source_content_json,
         source_context_json,
@@ -1212,11 +1186,12 @@ fn decode_claim(
 struct GroupBuilder {
     owner: RpgMakerAssetOwner,
     group_location_raw: String,
-    group_order: usize,
+    semantic_order_key: RpgMakerSemanticOrderKey,
     kind: TextGroupKind,
     location: RpgMakerLocation,
     recipes: Vec<TextProjectionRecipe>,
     units: Vec<RpgMakerWriteBackUnit>,
+    unit_order_keys: HashMap<RpgMakerSemanticOrderKey, TextUnitRole>,
 }
 
 /// 校验侧对 `rpg_maker_asset` 唯一 framing 定义的薄包装。
@@ -1238,21 +1213,27 @@ impl SnapshotFingerprintAccumulator {
         }
     }
 
-    fn group(&mut self, group_location: &str, group_order: usize, group_kind: &str, recipes: &str) {
+    fn group(
+        &mut self,
+        group_location: &str,
+        semantic_order_key: &RpgMakerSemanticOrderKey,
+        group_kind: &str,
+        recipes: &str,
+    ) {
         self.builder
-            .group(group_location, group_order, group_kind, recipes);
+            .group(group_location, semantic_order_key, group_kind, recipes);
     }
 
     fn unit(
         &mut self,
         group_location: &str,
         role: &str,
-        unit_order: usize,
+        semantic_order_key: &RpgMakerSemanticOrderKey,
         source: &str,
         context: &str,
     ) {
         self.builder
-            .unit(group_location, role, unit_order, source, context);
+            .unit(group_location, role, semantic_order_key, source, context);
     }
 
     fn claim(&mut self, resource_key: &str, access: &str, group_location: &str) {
@@ -1271,7 +1252,8 @@ fn assemble_snapshot(
 ) -> Result<RpgMakerWriteBackSnapshot, InvalidRpgMakerWriteBackAssetSnapshot> {
     let mut groups = Vec::<GroupBuilder>::new();
     let mut group_indexes = HashMap::<RpgMakerAssetOwner, HashMap<String, usize>>::new();
-    let mut next_group_orders = HashMap::<RpgMakerAssetOwner, usize>::new();
+    let mut group_order_keys =
+        HashMap::<RpgMakerAssetOwner, HashMap<RpgMakerSemanticOrderKey, String>>::new();
     let mut stored_claim_summaries =
         HashMap::<RpgMakerAssetOwner, Vec<EncodedMutationClaim>>::new();
     let mut fingerprint_accumulators = owner_states
@@ -1301,7 +1283,7 @@ fn assemble_snapshot(
                 owner,
                 group_location_raw,
                 group_location,
-                group_order,
+                semantic_order_key,
                 kind,
                 group_kind_raw,
                 recipes,
@@ -1312,7 +1294,7 @@ fn assemble_snapshot(
                     .expect("active owner 已在循环入口确认")
                     .group(
                         &group_location_raw,
-                        group_order,
+                        &semantic_order_key,
                         &group_kind_raw,
                         &recipes_raw,
                     );
@@ -1323,27 +1305,31 @@ fn assemble_snapshot(
                         group_location: group_location_raw,
                     });
                 }
-                let expected = *next_group_orders.entry(owner).or_default();
-                if group_order != expected {
-                    return Err(InvalidRpgMakerWriteBackAssetSnapshot::InvalidGroupOrder {
-                        owner: owner.storage_name().to_owned(),
-                        expected,
-                        actual: i64::try_from(group_order).unwrap_or(i64::MAX),
-                    });
+                if let Some(first) = group_order_keys
+                    .entry(owner)
+                    .or_default()
+                    .insert(semantic_order_key.clone(), group_location_raw.clone())
+                {
+                    return Err(
+                        InvalidRpgMakerWriteBackAssetSnapshot::DuplicateSemanticOrderKey {
+                            owner: owner.storage_name().to_owned(),
+                            level: "Group",
+                            first,
+                            second: group_location_raw,
+                        },
+                    );
                 }
-                *next_group_orders
-                    .get_mut(&owner)
-                    .expect("owner group_order 计数已建立") += 1;
                 let index = groups.len();
                 owner_group_indexes.insert(group_location_raw.clone(), index);
                 groups.push(GroupBuilder {
                     owner,
                     group_location_raw,
-                    group_order,
+                    semantic_order_key,
                     kind,
                     location: group_location,
                     recipes,
                     units: Vec::new(),
+                    unit_order_keys: HashMap::new(),
                 });
             }
             DecodedRecord::Unit {
@@ -1351,7 +1337,7 @@ fn assemble_snapshot(
                 group_location_raw,
                 role,
                 role_raw,
-                unit_order,
+                semantic_order_key,
                 source_content,
                 source_content_json,
                 source_context_json,
@@ -1363,7 +1349,7 @@ fn assemble_snapshot(
                     .unit(
                         &group_location_raw,
                         &role_raw,
-                        unit_order,
+                        &semantic_order_key,
                         &source_content_json,
                         &source_context_json,
                     );
@@ -1376,14 +1362,18 @@ fn assemble_snapshot(
                         group_location: group_location_raw.clone(),
                     })?;
                 let group = &mut groups[index];
-                let expected = group.units.len();
-                if unit_order != expected {
-                    return Err(InvalidRpgMakerWriteBackAssetSnapshot::InvalidUnitOrder {
-                        owner: owner.storage_name().to_owned(),
-                        group_location: group_location_raw,
-                        expected,
-                        actual: i64::try_from(unit_order).unwrap_or(i64::MAX),
-                    });
+                if let Some(first_role) = group
+                    .unit_order_keys
+                    .insert(semantic_order_key, role.clone())
+                {
+                    return Err(
+                        InvalidRpgMakerWriteBackAssetSnapshot::DuplicateSemanticOrderKey {
+                            owner: owner.storage_name().to_owned(),
+                            level: "Unit",
+                            first: format!("{} / {first_role:?}", group.group_location_raw),
+                            second: format!("{} / {role:?}", group.group_location_raw),
+                        },
+                    );
                 }
                 group.units.push(
                     RpgMakerWriteBackUnit::new(role, source_content, translation_content)
@@ -1412,7 +1402,7 @@ fn assemble_snapshot(
                         resource_key_raw,
                         access,
                         group_location_raw,
-                        group.group_order,
+                        group.semantic_order_key.clone(),
                     ));
             }
         }
@@ -1422,7 +1412,7 @@ fn assemble_snapshot(
     let mut validated_groups = Vec::with_capacity(groups.len());
     for group in groups {
         let group_location_raw = group.group_location_raw;
-        let group_order = group.group_order;
+        let semantic_order_key = group.semantic_order_key;
         let owner = group.owner;
         let group = RpgMakerWriteBackGroup::from_recipes(
             group.kind,
@@ -1438,14 +1428,20 @@ fn assemble_snapshot(
                     .map_err(InvalidRpgMakerWriteBackAssetSnapshot::InvalidProjection)?,
                 lock.access(),
                 group_location_raw.clone(),
-                group_order,
+                semantic_order_key.clone(),
             ));
         }
-        validated_groups.push(group);
+        validated_groups.push((semantic_order_key, group));
     }
 
-    let snapshot = RpgMakerWriteBackSnapshot::new(validated_groups)
-        .map_err(InvalidRpgMakerWriteBackAssetSnapshot::InvalidModel)?;
+    validated_groups.sort_by(|left, right| left.0.cmp(&right.0));
+    let snapshot = RpgMakerWriteBackSnapshot::new(
+        validated_groups
+            .into_iter()
+            .map(|(_, group)| group)
+            .collect(),
+    )
+    .map_err(InvalidRpgMakerWriteBackAssetSnapshot::InvalidModel)?;
 
     for owner in RPG_MAKER_WRITE_BACK_OWNER_ORDER {
         let Some(state) = owner_states.get(&owner) else {
@@ -1511,7 +1507,7 @@ fn validate_claim_summary(
                 }
                 (Some(expected), Some(actual))
                     if expected.group_location != actual.group_location
-                        || expected.group_order != actual.group_order =>
+                        || expected.semantic_order_key != actual.semantic_order_key =>
                 {
                     ClaimSummaryMismatchKind::Representative
                 }
@@ -1569,8 +1565,8 @@ fn borrowed_collision_summary(
             MutationResourceAccess::Intent => claims
                 .iter()
                 .min_by(|left, right| {
-                    left.group_order
-                        .cmp(&right.group_order)
+                    left.semantic_order_key
+                        .cmp(&right.semantic_order_key)
                         .then_with(|| left.group_location.cmp(&right.group_location))
                 })
                 .expect("非空资源分组必须存在代表"),
@@ -1657,8 +1653,8 @@ fn decode_actual_summary_resource(
 #[cfg(test)]
 #[derive(Default)]
 struct FingerprintRows {
-    groups: Vec<(String, usize, String, String)>,
-    units: Vec<(String, String, usize, String, String)>,
+    groups: Vec<(String, RpgMakerSemanticOrderKey, String, String)>,
+    units: Vec<(String, String, RpgMakerSemanticOrderKey, String, String)>,
     claims: Vec<(String, String, String)>,
 }
 
@@ -1668,15 +1664,21 @@ fn snapshot_fingerprint(
     mut rows: FingerprintRows,
     dialogue_definition_json: &str,
 ) -> AssetSnapshotFingerprint {
-    rows.groups.sort_by_key(|row| row.1);
-    rows.units.sort_by_key(|row| row.2);
+    rows.groups.sort_by(|left, right| left.1.cmp(&right.1));
+    rows.units.sort_by(|left, right| left.2.cmp(&right.2));
     rows.claims.sort();
     let mut accumulator = SnapshotFingerprintAccumulator::new(owner, dialogue_definition_json);
-    for (group_location, group_order, group_kind, recipes) in rows.groups {
-        accumulator.group(&group_location, group_order, &group_kind, &recipes);
+    for (group_location, semantic_order_key, group_kind, recipes) in rows.groups {
+        accumulator.group(&group_location, &semantic_order_key, &group_kind, &recipes);
     }
-    for (group_location, role, unit_order, source, context) in rows.units {
-        accumulator.unit(&group_location, &role, unit_order, &source, &context);
+    for (group_location, role, semantic_order_key, source, context) in rows.units {
+        accumulator.unit(
+            &group_location,
+            &role,
+            &semantic_order_key,
+            &source,
+            &context,
+        );
     }
     for (resource_key, access, group_location) in rows.claims {
         accumulator.claim(&resource_key, &access, &group_location);
@@ -1715,8 +1717,8 @@ fn map_storage_row_error(
             expected,
             actual,
         },
-        RpgMakerAssetStorageRowError::InvalidOrderValue { column, actual } => {
-            InvalidRpgMakerWriteBackAssetSnapshot::InvalidOrderValue { column, actual }
+        RpgMakerAssetStorageRowError::InvalidSemanticOrderKey { column, source } => {
+            InvalidRpgMakerWriteBackAssetSnapshot::InvalidSemanticOrderKey { column, source }
         }
         RpgMakerAssetStorageRowError::UnknownOwner(owner) => {
             InvalidRpgMakerWriteBackAssetSnapshot::UnknownOwner(owner)
@@ -2143,7 +2145,7 @@ mod tests {
         let mut logical_claims = Vec::new();
         let mut fingerprint_rows = FingerprintRows::default();
 
-        for (group_order, index) in indices.iter().copied().enumerate() {
+        for index in indices.iter().copied() {
             let group_location =
                 RpgMakerLocation::value(source.clone(), vec![RpgMakerLocationStep::index(index)]);
             let target = RpgMakerLocation::value(
@@ -2155,7 +2157,7 @@ mod tests {
             );
             let recipes = vec![TextProjectionRecipe::Direct(
                 DirectTextRecipe::new(
-                    target,
+                    target.clone(),
                     SOURCE_TEXT,
                     vec![DirectTextPart::TextSlot { role: role.clone() }],
                 )
@@ -2165,30 +2167,49 @@ mod tests {
                 RpgMakerLocationCodec::encode(&group_location).expect("组位置应可编码");
             let recipes_raw =
                 RpgMakerProjectionCodec::encode_recipes(&recipes).expect("配方应可编码");
-            groups.push(builtin_partition(vec![
-                SqliteValue::Text(group_location_raw.clone()),
-                SqliteValue::Text("database_entry".to_owned()),
-                SqliteValue::Integer(i64::try_from(group_order).expect("顺序应可编码")),
-                SqliteValue::Text(recipes_raw.clone()),
-            ]));
-            units.push(builtin_partition(vec![
-                SqliteValue::Text(group_location_raw.clone()),
-                SqliteValue::Text(role_raw.clone()),
-                SqliteValue::Integer(0),
-                SqliteValue::Text(source_content_json.clone()),
-                SqliteValue::Text("{}".to_owned()),
-                SqliteValue::Null,
-            ]));
+            let group_semantic_order_key =
+                RpgMakerSemanticOrderKey::from_group_location(&group_location);
+            let unit_semantic_order_key =
+                RpgMakerSemanticOrderKey::from_unit_location(&target, &role);
+            groups.push((
+                group_semantic_order_key.clone(),
+                builtin_partition(vec![
+                    SqliteValue::Text(group_location_raw.clone()),
+                    SqliteValue::Text("database_entry".to_owned()),
+                    SqliteValue::Blob(
+                        group_semantic_order_key
+                            .encode()
+                            .expect("Group 顺序键应可编码"),
+                    ),
+                    SqliteValue::Text(recipes_raw.clone()),
+                ]),
+            ));
+            units.push((
+                group_semantic_order_key.clone(),
+                unit_semantic_order_key.clone(),
+                builtin_partition(vec![
+                    SqliteValue::Text(group_location_raw.clone()),
+                    SqliteValue::Text(role_raw.clone()),
+                    SqliteValue::Blob(
+                        unit_semantic_order_key
+                            .encode()
+                            .expect("Unit 顺序键应可编码"),
+                    ),
+                    SqliteValue::Text(source_content_json.clone()),
+                    SqliteValue::Text("{}".to_owned()),
+                    SqliteValue::Null,
+                ]),
+            ));
             fingerprint_rows.groups.push((
                 group_location_raw.clone(),
-                group_order,
+                group_semantic_order_key.clone(),
                 "database_entry".to_owned(),
                 recipes_raw,
             ));
             fingerprint_rows.units.push((
                 group_location_raw.clone(),
                 role_raw.clone(),
-                0,
+                unit_semantic_order_key,
                 source_content_json.clone(),
                 "{}".to_owned(),
             ));
@@ -2201,7 +2222,7 @@ mod tests {
                         .expect("资源应可编码"),
                     lock.access(),
                     group_location_raw.clone(),
-                    group_order,
+                    group_semantic_order_key.clone(),
                 ));
             }
         }
@@ -2229,10 +2250,12 @@ mod tests {
             })
             .collect();
         let fingerprint = snapshot_fingerprint(OWNER, fingerprint_rows, DIALOGUE_DEFINITION);
+        groups.sort_by(|left, right| left.0.cmp(&right.0));
+        units.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
         SnapshotRows {
             owners: vec![owner_row([1; 32], *fingerprint.as_bytes())],
-            groups,
-            units,
+            groups: groups.into_iter().map(|(_, row)| row).collect(),
+            units: units.into_iter().map(|(_, _, row)| row).collect(),
             claims,
         }
     }
@@ -2263,24 +2286,26 @@ mod tests {
                 CREATE TABLE rpg_maker_text_group (
                     owner TEXT NOT NULL,
                     group_location TEXT NOT NULL,
-                    group_order INTEGER NOT NULL,
+                    semantic_order_key BLOB NOT NULL,
                     group_kind TEXT NOT NULL,
                     projection_recipe_json TEXT NOT NULL,
                     PRIMARY KEY (owner, group_location),
-                    UNIQUE (owner, group_order)
+                    UNIQUE (owner, semantic_order_key)
                 );
                 CREATE TABLE rpg_maker_text_unit (
                     owner TEXT NOT NULL,
                     group_location TEXT NOT NULL,
                     unit_role TEXT NOT NULL,
-                    unit_order INTEGER NOT NULL,
+                    semantic_order_key BLOB NOT NULL,
                     source_content_json TEXT NOT NULL,
                     source_context_json TEXT NOT NULL,
                     translation_content_json TEXT,
                     translation_state TEXT NOT NULL,
                     PRIMARY KEY (owner, group_location, unit_role),
-                    UNIQUE (owner, group_location, unit_order)
+                    UNIQUE (owner, semantic_order_key)
                 );
+                CREATE INDEX rpg_maker_text_unit_owner_group_order_idx
+                    ON rpg_maker_text_unit(owner, group_location, semantic_order_key);
                 CREATE TABLE rpg_maker_mutation_claim (
                     owner TEXT NOT NULL,
                     group_location TEXT NOT NULL,
@@ -2293,10 +2318,10 @@ mod tests {
 
                 INSERT INTO rpg_maker_asset_owner_state VALUES ('rules', zeroblob(32), zeroblob(32));
                 INSERT INTO rpg_maker_asset_owner_state VALUES ('builtin', zeroblob(32), zeroblob(32));
-                INSERT INTO rpg_maker_text_group VALUES ('builtin', 'group-b', 1, 'map', '[]');
-                INSERT INTO rpg_maker_text_group VALUES ('builtin', 'group-a', 0, 'map', '[]');
-                INSERT INTO rpg_maker_text_unit VALUES ('builtin', 'group-b', 'role-z', 0, '"z"', '{}', NULL, 'untranslated');
-                INSERT INTO rpg_maker_text_unit VALUES ('builtin', 'group-a', 'role-y', 0, '"y"', '{}', NULL, 'untranslated');
+                INSERT INTO rpg_maker_text_group VALUES ('builtin', 'group-b', X'010000000000000001000000000000000000', 'map', '[]');
+                INSERT INTO rpg_maker_text_group VALUES ('builtin', 'group-a', X'010000000000000000000000000000000000', 'map', '[]');
+                INSERT INTO rpg_maker_text_unit VALUES ('builtin', 'group-b', 'role-z', X'010000000000000001000000000000000000', '"z"', '{}', NULL, 'untranslated');
+                INSERT INTO rpg_maker_text_unit VALUES ('builtin', 'group-a', 'role-y', X'010000000000000000000000000000000000', '"y"', '{}', NULL, 'untranslated');
                 INSERT INTO rpg_maker_mutation_claim VALUES ('builtin', 'group-a', 'resource-z', 'exclusive');
                 INSERT INTO rpg_maker_mutation_claim VALUES ('builtin', 'group-b', 'resource-a', 'intent');
                 "#,
@@ -2385,6 +2410,15 @@ mod tests {
                 details.iter().all(|detail| !detail.contains("TEMP B-TREE")),
                 "owner 窄查询不得建立全表临时排序：{details:?}"
             );
+            if query.statement().contains("rpg_maker_text_unit AS unit") {
+                assert!(
+                    details.iter().any(|detail| {
+                        detail.contains("rpg_maker_text_unit_owner_group_order_idx")
+                            && detail.contains("group_location=?")
+                    }),
+                    "写回 Unit 必须按 owner 与 group_location 定位：{details:?}"
+                );
+            }
         }
     }
 
@@ -2448,7 +2482,11 @@ mod tests {
         let row = builtin_partition(vec![
             SqliteValue::Text(group_location),
             SqliteValue::Text(role),
-            SqliteValue::Integer(0),
+            SqliteValue::Blob(
+                RpgMakerSemanticOrderKey::new(vec![0], 0)
+                    .encode()
+                    .expect("测试顺序键应可编码"),
+            ),
             SqliteValue::Text(source_content_json),
             SqliteValue::Text(context),
             SqliteValue::Text(translation_content_json),
@@ -2526,7 +2564,11 @@ mod tests {
         let row = builtin_partition(vec![
             SqliteValue::Text(RpgMakerLocationCodec::encode(&location).expect("位置应可编码")),
             SqliteValue::Text("event_dialogue".to_owned()),
-            SqliteValue::Integer(0),
+            SqliteValue::Blob(
+                RpgMakerSemanticOrderKey::from_group_location(&location)
+                    .encode()
+                    .expect("测试顺序键应可编码"),
+            ),
             SqliteValue::Text("{not-json".to_owned()),
         ]);
         assert!(matches!(
@@ -2644,19 +2686,19 @@ mod tests {
                 "resource".to_owned(),
                 MutationResourceAccess::Intent,
                 "group-a".to_owned(),
-                8,
+                RpgMakerSemanticOrderKey::new(vec![8], 0),
             ),
             EncodedMutationClaim::new(
                 "resource".to_owned(),
                 MutationResourceAccess::Intent,
                 "group-z".to_owned(),
-                2,
+                RpgMakerSemanticOrderKey::new(vec![2], 0),
             ),
         ];
         sort_logical_claims(&mut claims);
         let earliest = claims
             .iter()
-            .find(|claim| claim.group_order == 2)
+            .find(|claim| claim.semantic_order_key.physical_path() == [2])
             .expect("测试 Claim 应包含最早自然组");
 
         let representative = borrowed_collision_summary(&claims)

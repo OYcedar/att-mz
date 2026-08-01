@@ -19,6 +19,10 @@ ATT 并发扫描、读取和解析文件，建立：
 提交前 ATT 重新确认输入在读取期间没有改变。任一文件失败、身份重复或输入发生变化时，
 整个 Extract 失败，数据库保持原状。
 
+Extract 同时建立供 Translate 使用的稳定文本层次：一个 JSONL 文件是一个 Semantic Scope，
+文件中的每行是一个 Group，`units` 数组中的每项是一个 Unit。文件、Group 和 Unit 的自然
+顺序来自当前 JSONL 规格；Current、译文和后续模型任务不参与这次整理。
+
 ## 2. 修改后的状态
 
 | 外部变化 | 结果 |

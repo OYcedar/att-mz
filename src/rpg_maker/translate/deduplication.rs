@@ -27,6 +27,7 @@ pub(crate) struct TranslationDeduplicationCandidate {
     translation_state: Option<Sha256Fingerprint>,
     state_context: TranslationStateContext,
     invalidated: bool,
+    model_representative_eligible: bool,
 }
 
 impl TranslationDeduplicationCandidate {
@@ -47,7 +48,16 @@ impl TranslationDeduplicationCandidate {
             translation_state,
             state_context,
             invalidated,
+            model_representative_eligible: true,
         }
+    }
+
+    /// 标记该 Unit 所在的完整 TaskBlock 能否安全发送给模型。
+    ///
+    /// 不可发送块中的成员仍参加复用和传播，但不能拿走健康块中的模型代表责任。
+    pub(crate) const fn with_model_representative_eligibility(mut self, eligible: bool) -> Self {
+        self.model_representative_eligible = eligible;
+        self
     }
 }
 
@@ -319,11 +329,17 @@ fn plan_active_members(
     outcomes: &mut [Option<TranslationDeduplicationOutcome>],
     invalidations: &mut Vec<TranslationInvalidation>,
 ) {
-    let leader_index = member_indices[0];
-    let leader = &candidates[leader_index];
-    let propagation_targets = member_indices[1..]
+    let leader_index = member_indices
         .iter()
-        .map(|&index| {
+        .copied()
+        .find(|&index| candidates[index].model_representative_eligible)
+        .unwrap_or(member_indices[0]);
+    let leader = &candidates[leader_index];
+    let propagation_targets = member_indices
+        .iter()
+        .copied()
+        .filter(|&index| index != leader_index)
+        .map(|index| {
             TranslationPropagationTarget::new(
                 candidates[index].identity.clone(),
                 candidates[index].state_context,
@@ -334,7 +350,10 @@ fn plan_active_members(
         propagation_targets,
     });
 
-    for &index in &member_indices[1..] {
+    for &index in member_indices {
+        if index == leader_index {
+            continue;
+        }
         outcomes[index] = Some(TranslationDeduplicationOutcome::Virtual {
             reason: TranslationVirtualReason::Duplicate {
                 leader: Box::new(leader.identity.clone()),
@@ -544,6 +563,65 @@ mod tests {
                 }
             }
         );
+    }
+
+    #[test]
+    fn unsendable_member_cannot_take_model_responsibility_from_a_healthy_member() {
+        let original = "重複テキスト";
+        let first = scalar_identity(StandardDataFile::Items, 1, "name", original);
+        let second = scalar_identity(StandardDataFile::Items, 2, "name", original);
+        let third = scalar_identity(StandardDataFile::Items, 3, "name", original);
+        let first_context = state_context(1);
+        let second_context = state_context(2);
+        let third_context = state_context(3);
+        let result = deduplicate_translation_candidates(vec![
+            candidate(
+                first.clone(),
+                original,
+                Vec::new(),
+                None,
+                first_context,
+                false,
+            )
+            .with_model_representative_eligibility(false),
+            candidate(
+                second.clone(),
+                original,
+                Vec::new(),
+                None,
+                second_context,
+                false,
+            ),
+            candidate(
+                third.clone(),
+                original,
+                Vec::new(),
+                None,
+                third_context,
+                false,
+            ),
+        ]);
+        let (outcomes, invalidations, reuses) = result.into_parts();
+
+        assert!(invalidations.is_empty());
+        assert!(reuses.is_empty());
+        assert_eq!(
+            outcomes[1],
+            TranslationDeduplicationOutcome::Active {
+                propagation_targets: vec![
+                    TranslationPropagationTarget::new(first, first_context),
+                    TranslationPropagationTarget::new(third, third_context),
+                ],
+            }
+        );
+        for outcome in [&outcomes[0], &outcomes[2]] {
+            assert!(matches!(
+                outcome,
+                TranslationDeduplicationOutcome::Virtual {
+                    reason: TranslationVirtualReason::Duplicate { leader }
+                } if leader.as_ref() == &second
+            ));
+        }
     }
 
     #[test]

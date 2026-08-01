@@ -144,7 +144,10 @@ impl fmt::Debug for ResolvedRpgMakerTranslationResources {
     }
 }
 
-/// Profile 为 RPG Maker Planner 提供的普通任务 user message 字符装箱目标。
+/// Profile 为 RPG Maker Planner 提供的稳定源文投影装箱目标。
+///
+/// 该值不是最终 user message 的硬上限；译文、术语、Placeholder token 和临时 ID
+/// 不参与装箱字符数。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RpgMakerTranslationPlanningConfiguration {
     target_user_message_characters: NonZeroUsize,

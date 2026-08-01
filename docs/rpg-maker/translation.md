@@ -13,9 +13,10 @@ Translate 不使用 Lua。Profile 来自公共 `[translation].profiles`；省略
 
 ## 1. 准备与 Current
 
-ATT 从项目数据库读取 Extract 资产和冻结来源指纹，应用语言模块、实际术语命中、
-RPG Maker Placeholder 与内置控制符，为每个 Unit 判定去向：Current、需要模型、可以
-复用，或不能处理。
+ATT 从项目数据库读取 Extract 已经明确整理的 Semantic Scope、Group、Unit 和冻结来源
+指纹，先按完整原文建立稳定 TaskBlock，再应用语言模块、实际术语命中、RPG Maker
+Placeholder 与内置控制符，为每个 Unit 判定去向：Current、需要模型、可以复用，或不能
+处理。
 
 自动译文状态绑定当前原文、完整 Group 语境、语言、实际术语、实际 Placeholder、Prompt
 和 Client 语义。目标译文正文与语义状态分开保存，因此独立 Lua 修改已有译文后仍可
@@ -36,11 +37,16 @@ RPG Maker Placeholder 与内置控制符，为每个 Unit 判定去向：Current
 
 ## 3. TaskBlock 与模型形状
 
-RPG Maker 的语义范围、Group 顺序和 Profile 目标字符数共同决定 TaskBlock。Group 保持
-完整、绝不拆开；单个 Group 超过目标字符数时就独占一个任务。
+RPG Maker 的明确 Semantic Scope、Group 物理顺序和 Profile 目标字符数共同决定
+TaskBlock。装箱只使用完整原文、Group 类型、Unit 角色、固定消息格式和固定 `[-]` 槽位；
+Current、译文、术语、Placeholder token、去重和临时 ID 不参与。Group 保持完整、绝不
+拆开，TaskBlock 不跨 Scope；单个 Group 超过目标字符数时独占一块。完整公共规则见
+[TaskBlock 规划规格](../translation/task-planning.md)。
 
-发送 Group 时保留全部相关 Unit 和说话人语境，只有模型代表获得临时数字 ID。模型
-value 始终是字符串数组：
+只发送至少含一个模型代表的完整 TaskBlock。发送时保留块内全部 Group 和全部 Unit，只有
+模型代表获得临时数字 ID；其他 Unit 使用 `[-]`，已有有效目标文本时显示经过自身
+Placeholder 绑定保护的目标文本，否则显示保护后的原文。块内所有 Group 的术语命中按
+术语文件顺序合并并提供一次。模型 value 始终是字符串数组：
 
 - `single line`：恰好一个无 LF 字符串；
 - `N lines, corresponding line by line`：恰好 N 项并保持空槽；
@@ -49,6 +55,10 @@ value 始终是字符串数组：
 
 数组中每个字符串不得含 CR、LF 或 NUL。公共 Prompt 与信封见
 [Prompt 规格](../translation/prompts.md)。
+
+Partial 后重试重新判断 ID，但不重新装箱。原块中的已完成 Unit 继续以 `[-]` 目标译文
+提供语境，失败 Unit 获得从 `1` 开始的新临时 ID。一个完整块没有任何 ID 时只是不发送，
+不会与相邻块合并。
 
 ## 4. 验收、并发和结果
 

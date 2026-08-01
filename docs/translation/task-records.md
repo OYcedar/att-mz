@@ -19,6 +19,11 @@ Markdown：
 - 每个 ID 的验收结果；
 - 已提交数量和 Partial、Unavailable 或失败原因。
 
+任务记录只为实际发出的含 ID TaskBlock 建立，不记录本轮完全没有 ID 的块。记录中的 user
+message 是实际请求，必须保留该稳定 TaskBlock 的全部 Group 和 Unit；无编号的 Current、
+复用、重复、非源语、完全保护和空文本仍作为语境出现。Partial 后再次运行时，已接受项以
+`[-]` 目标译文出现，待处理项重新从 `[1]` 编号，不能只记录孤立的失败原文。
+
 记录中绝不写入 API key、Authorization 值或其他由
 [Chat Completions 规格](../runtime/chat-completions.md#6-敏感信息闭集唯一权威)定义的
 敏感值。任务记录不保存非 2xx 原始 body；供应商标准错误消息沿用同一闭集替换并清理为

@@ -71,7 +71,11 @@ pub(crate) const RPG_MAKER_MUTATION_CLAIM_TABLE_NAME: &str = "rpg_maker_mutation
 const CREATE_RPG_MAKER_TEXT_GROUP_TABLE: &str = r#"CREATE TABLE rpg_maker_text_group (
     owner                  TEXT NOT NULL CHECK (owner IN ('builtin', 'rules')),
     group_location         TEXT NOT NULL CHECK (length(group_location) > 0),
-    group_order            INTEGER NOT NULL CHECK (group_order >= 0),
+    semantic_order_key     BLOB NOT NULL CHECK (
+        typeof(semantic_order_key) = 'blob'
+        AND length(semantic_order_key) >= 9
+        AND length(semantic_order_key) % 9 = 0
+    ),
     group_kind             TEXT NOT NULL CHECK (group_kind IN (
         'database_entry',
         'system',
@@ -84,7 +88,7 @@ const CREATE_RPG_MAKER_TEXT_GROUP_TABLE: &str = r#"CREATE TABLE rpg_maker_text_g
     )),
     projection_recipe_json TEXT NOT NULL CHECK (length(projection_recipe_json) > 0),
     PRIMARY KEY (owner, group_location),
-    UNIQUE (owner, group_order),
+    UNIQUE (owner, semantic_order_key),
     FOREIGN KEY (owner) REFERENCES rpg_maker_asset_owner_state(owner) ON DELETE CASCADE
 )"#;
 
@@ -92,7 +96,11 @@ const CREATE_RPG_MAKER_TEXT_UNIT_TABLE: &str = r#"CREATE TABLE rpg_maker_text_un
     owner                    TEXT NOT NULL CHECK (owner IN ('builtin', 'rules')),
     group_location           TEXT NOT NULL CHECK (length(group_location) > 0),
     unit_role                TEXT NOT NULL CHECK (length(unit_role) > 0),
-    unit_order               INTEGER NOT NULL CHECK (unit_order >= 0),
+    semantic_order_key       BLOB NOT NULL CHECK (
+        typeof(semantic_order_key) = 'blob'
+        AND length(semantic_order_key) >= 9
+        AND length(semantic_order_key) % 9 = 0
+    ),
     source_content_json      TEXT NOT NULL CHECK (
         json_valid(source_content_json)
         AND json_type(source_content_json) IN ('text', 'array')
@@ -104,7 +112,7 @@ const CREATE_RPG_MAKER_TEXT_UNIT_TABLE: &str = r#"CREATE TABLE rpg_maker_text_un
     translation_content_json TEXT,
     translation_state        BLOB,
     PRIMARY KEY (owner, group_location, unit_role),
-    UNIQUE (owner, group_location, unit_order),
+    UNIQUE (owner, semantic_order_key),
     FOREIGN KEY (owner, group_location)
         REFERENCES rpg_maker_text_group(owner, group_location) ON DELETE CASCADE,
     CHECK (
@@ -118,6 +126,8 @@ const CREATE_RPG_MAKER_TEXT_UNIT_TABLE: &str = r#"CREATE TABLE rpg_maker_text_un
         )
     )
 )"#;
+
+pub(crate) const CREATE_RPG_MAKER_TEXT_UNIT_OWNER_GROUP_ORDER_INDEX: &str = "CREATE INDEX rpg_maker_text_unit_owner_group_order_idx ON rpg_maker_text_unit(owner, group_location, semantic_order_key)";
 
 const CREATE_RPG_MAKER_MUTATION_CLAIM_TABLE: &str = r#"CREATE TABLE rpg_maker_mutation_claim (
     owner          TEXT NOT NULL CHECK (owner IN ('builtin', 'rules')),
@@ -1300,6 +1310,7 @@ pub(crate) enum AttSchemaObject {
     RpgMakerAssetOwnerState,
     RpgMakerTextGroup,
     RpgMakerTextUnit,
+    RpgMakerTextUnitOwnerGroupOrderIndex,
     RpgMakerMutationClaim,
     RpgMakerTranslationResource,
     RpgMakerProjectDefinition,
@@ -1318,6 +1329,9 @@ impl AttSchemaObject {
             Self::RpgMakerAssetOwnerState => "table:rpg_maker_asset_owner_state",
             Self::RpgMakerTextGroup => "table:rpg_maker_text_group",
             Self::RpgMakerTextUnit => "table:rpg_maker_text_unit",
+            Self::RpgMakerTextUnitOwnerGroupOrderIndex => {
+                "index:rpg_maker_text_unit_owner_group_order_idx"
+            }
             Self::RpgMakerMutationClaim => "table:rpg_maker_mutation_claim",
             Self::RpgMakerTranslationResource => "table:rpg_maker_translation_resource",
             Self::RpgMakerProjectDefinition => "table:rpg_maker_project_definition",
@@ -1949,6 +1963,12 @@ fn expected_att_schema() -> Vec<(&'static str, &'static str, &'static str, &'sta
             CREATE_RPG_MAKER_TEXT_UNIT_TABLE,
         ),
         (
+            "index",
+            "rpg_maker_text_unit_owner_group_order_idx",
+            RPG_MAKER_TEXT_UNIT_TABLE_NAME,
+            CREATE_RPG_MAKER_TEXT_UNIT_OWNER_GROUP_ORDER_INDEX,
+        ),
+        (
             "table",
             RPG_MAKER_MUTATION_CLAIM_TABLE_NAME,
             RPG_MAKER_MUTATION_CLAIM_TABLE_NAME,
@@ -2327,6 +2347,9 @@ fn att_schema_object(kind: &str, name: &str) -> Option<AttSchemaObject> {
         ("table", "rpg_maker_asset_owner_state") => Some(AttSchemaObject::RpgMakerAssetOwnerState),
         ("table", RPG_MAKER_TEXT_GROUP_TABLE_NAME) => Some(AttSchemaObject::RpgMakerTextGroup),
         ("table", RPG_MAKER_TEXT_UNIT_TABLE_NAME) => Some(AttSchemaObject::RpgMakerTextUnit),
+        ("index", "rpg_maker_text_unit_owner_group_order_idx") => {
+            Some(AttSchemaObject::RpgMakerTextUnitOwnerGroupOrderIndex)
+        }
         ("table", RPG_MAKER_MUTATION_CLAIM_TABLE_NAME) => {
             Some(AttSchemaObject::RpgMakerMutationClaim)
         }
@@ -3423,6 +3446,7 @@ fn project_database_commands(project: &NewProject) -> Vec<SqliteCommand> {
         CREATE_RPG_MAKER_ASSET_OWNER_STATE_TABLE,
         CREATE_RPG_MAKER_TEXT_GROUP_TABLE,
         CREATE_RPG_MAKER_TEXT_UNIT_TABLE,
+        CREATE_RPG_MAKER_TEXT_UNIT_OWNER_GROUP_ORDER_INDEX,
         CREATE_RPG_MAKER_MUTATION_CLAIM_TABLE,
         CREATE_RPG_MAKER_MUTATION_CLAIM_OWNER_RESOURCE_INDEX,
         CREATE_RPG_MAKER_MUTATION_CLAIM_RESOURCE_INDEX,
@@ -3584,7 +3608,7 @@ mod tests {
     #[test]
     fn creation_plan_contains_the_complete_current_rpg_maker_schema_and_resources() {
         let commands = project_database_commands(&project());
-        assert_eq!(commands.len(), 17);
+        assert_eq!(commands.len(), 18);
         let statements = commands
             .iter()
             .map(SqliteCommand::statement)
@@ -3607,6 +3631,7 @@ mod tests {
                 "rpg_maker_asset_owner_state",
                 "rpg_maker_text_group",
                 "rpg_maker_text_unit",
+                "rpg_maker_text_unit_owner_group_order_idx",
                 "rpg_maker_mutation_claim",
                 "rpg_maker_translation_resource",
                 "rpg_maker_project_definition",

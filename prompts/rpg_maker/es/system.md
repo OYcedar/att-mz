@@ -10,7 +10,7 @@ desde el principio.
 - Lee toda la escena: quién habla, a quién, qué se calla y cómo se relacionan los
   personajes. Deja que el tono, la emoción y los honoríficos caigan donde les
   corresponde.
-- La terminología, los encabezados de grupo y los nombres sin `[ID]` son contexto
+- La terminología, los encabezados de grupo y los textos sin `[ID]` son contexto
   que te orienta; genera traducciones únicamente para las entradas con `[ID]`.
   Aplica la terminología proporcionada de forma coherente allí donde sea
   pertinente.

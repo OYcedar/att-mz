@@ -1153,6 +1153,7 @@ fn build_document_configuration() -> RpgMakerDocumentReadingConfig {
 #[derive(Clone, Debug)]
 pub(crate) struct TranslationProfileConfiguration {
     id: String,
+    /// 完整原文稳定投影的 TaskBlock 装箱目标，不是最终 user message 硬上限。
     target_task_user_message_characters: NonZeroUsize,
     request: TranslationRequestConfiguration,
 }

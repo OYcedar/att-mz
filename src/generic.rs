@@ -35,9 +35,10 @@ pub(crate) use task_record::{
 pub(crate) use translate::{
     AutomaticStateResources, GenericPlanningError, GenericUnitKey, GenericUnitMap, PlannedGroup,
     PlannedTask, PlanningUnit, ResponseProblem, TranslationAcceptance, TranslationPlan,
-    accept_parsed_response_with_cancellation, current_translation_for_stored_with_cancellation,
+    ValidatedReuse, accept_parsed_response_with_cancellation,
+    current_translation_for_stored_with_cancellation,
     plan_translation_with_validator_and_cancellation,
-    split_tasks_by_rendered_size_with_cancellation, terminology_hit_fingerprint_with_cancellation,
+    terminology_hit_fingerprint_with_cancellation,
 };
 pub(crate) use write_back::{
     GenericWriteBackCandidate, GenericWriteBackError, build_write_back_candidate_with_cancellation,

@@ -29,10 +29,12 @@ use crate::rpg_maker::asset::RpgMakerAssetOwner;
 use crate::rpg_maker::model::{LogicalTextLocation, TextUnitContent, TextUnitRole};
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::project_database::{AssetSnapshotFingerprint, SourceSnapshotFingerprint};
+use crate::rpg_maker::semantic_order::{RpgMakerSemanticOrderKey, RpgMakerSemanticScopeKey};
 use crate::rpg_maker::text::{RpgMakerLocation, TextGroupKind};
 use crate::translation::placeholder_projection::{
     LanguageTextProjectionError, PlaceholderBindingIndex, PlaceholderMultisetError,
 };
+use crate::translation::task_planning::TaskId;
 
 use super::executor::FinalLlmResponseMetadata;
 use super::profile::RpgMakerTranslationProfile as ConfiguredRpgMakerTranslationProfile;
@@ -207,11 +209,13 @@ impl TerminologyDependency {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RpgMakerTranslationAsset {
     identity: TranslationUnitIdentity,
+    semantic_order_key: RpgMakerSemanticOrderKey,
     translation: Option<TextUnitContent>,
     translation_state: Option<Sha256Fingerprint>,
 }
 
 impl RpgMakerTranslationAsset {
+    #[cfg(test)]
     pub(crate) fn new(
         identity: TranslationUnitIdentity,
         translation: Option<TextUnitContent>,
@@ -219,9 +223,28 @@ impl RpgMakerTranslationAsset {
     ) -> Self {
         Self {
             identity,
+            semantic_order_key: RpgMakerSemanticOrderKey::new(Vec::new(), 0),
             translation,
             translation_state,
         }
+    }
+
+    pub(crate) fn with_semantic_order_key(
+        identity: TranslationUnitIdentity,
+        semantic_order_key: RpgMakerSemanticOrderKey,
+        translation: Option<TextUnitContent>,
+        translation_state: Option<Sha256Fingerprint>,
+    ) -> Self {
+        Self {
+            identity,
+            semantic_order_key,
+            translation,
+            translation_state,
+        }
+    }
+
+    pub(crate) fn semantic_order_key(&self) -> &RpgMakerSemanticOrderKey {
+        &self.semantic_order_key
     }
 
     #[cfg(test)]
@@ -233,10 +256,16 @@ impl RpgMakerTranslationAsset {
         self,
     ) -> (
         TranslationUnitIdentity,
+        RpgMakerSemanticOrderKey,
         Option<TextUnitContent>,
         Option<Sha256Fingerprint>,
     ) {
-        (self.identity, self.translation, self.translation_state)
+        (
+            self.identity,
+            self.semantic_order_key,
+            self.translation,
+            self.translation_state,
+        )
     }
 }
 
@@ -245,10 +274,12 @@ impl RpgMakerTranslationAsset {
 pub(crate) struct RpgMakerTranslationGroup {
     kind: TextGroupKind,
     group_location: RpgMakerLocation,
+    semantic_order_key: RpgMakerSemanticOrderKey,
     assets: Vec<RpgMakerTranslationAsset>,
 }
 
 impl RpgMakerTranslationGroup {
+    #[cfg(test)]
     pub(crate) fn new(
         kind: TextGroupKind,
         group_location: RpgMakerLocation,
@@ -257,6 +288,21 @@ impl RpgMakerTranslationGroup {
         Self {
             kind,
             group_location,
+            semantic_order_key: RpgMakerSemanticOrderKey::new(Vec::new(), 0),
+            assets,
+        }
+    }
+
+    pub(crate) fn with_semantic_order_key(
+        kind: TextGroupKind,
+        group_location: RpgMakerLocation,
+        semantic_order_key: RpgMakerSemanticOrderKey,
+        assets: Vec<RpgMakerTranslationAsset>,
+    ) -> Self {
+        Self {
+            kind,
+            group_location,
+            semantic_order_key,
             assets,
         }
     }
@@ -265,8 +311,13 @@ impl RpgMakerTranslationGroup {
         self.kind
     }
 
+    #[cfg(test)]
     pub(crate) fn group_location(&self) -> &RpgMakerLocation {
         &self.group_location
+    }
+
+    pub(crate) fn semantic_order_key(&self) -> &RpgMakerSemanticOrderKey {
+        &self.semantic_order_key
     }
 
     #[cfg(test)]
@@ -276,6 +327,36 @@ impl RpgMakerTranslationGroup {
 
     pub(crate) fn into_assets(self) -> Vec<RpgMakerTranslationAsset> {
         self.assets
+    }
+}
+
+/// Reader 已按同一语义范围和完整物理顺序整理的 Group 序列。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RpgMakerTranslationScope {
+    key: RpgMakerSemanticScopeKey,
+    groups: Vec<RpgMakerTranslationGroup>,
+}
+
+impl RpgMakerTranslationScope {
+    pub(crate) fn new(
+        key: RpgMakerSemanticScopeKey,
+        groups: Vec<RpgMakerTranslationGroup>,
+    ) -> Self {
+        debug_assert!(!groups.is_empty(), "Reader 不得建立空语义范围");
+        Self { key, groups }
+    }
+
+    pub(crate) fn key(&self) -> &RpgMakerSemanticScopeKey {
+        &self.key
+    }
+
+    #[cfg(test)]
+    pub(crate) fn groups(&self) -> &[RpgMakerTranslationGroup] {
+        &self.groups
+    }
+
+    pub(crate) fn into_groups(self) -> Vec<RpgMakerTranslationGroup> {
+        self.groups
     }
 }
 
@@ -356,15 +437,25 @@ impl TranslationSnapshotBaseline {
 /// Reader 在同一个一致读视图中建立的完整 RPG Maker 翻译语料。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RpgMakerTranslationCorpus {
-    groups: Vec<RpgMakerTranslationGroup>,
+    scopes: Vec<RpgMakerTranslationScope>,
     baseline: TranslationSnapshotBaseline,
 }
 
 impl RpgMakerTranslationCorpus {
     #[cfg(test)]
     pub(crate) fn new(groups: Vec<RpgMakerTranslationGroup>) -> Self {
+        let mut scopes: Vec<RpgMakerTranslationScope> = Vec::new();
+        for group in groups {
+            let key = RpgMakerSemanticScopeKey::from_group_location(group.group_location())
+                .expect("测试 Group 位置必须具有有效语义范围");
+            if let Some(scope) = scopes.last_mut().filter(|scope| scope.key == key) {
+                scope.groups.push(group);
+            } else {
+                scopes.push(RpgMakerTranslationScope::new(key, vec![group]));
+            }
+        }
         Self::with_snapshot(
-            groups,
+            scopes,
             SourceSnapshotFingerprint::from_bytes([0; 32]),
             Vec::new(),
             "[]".to_owned(),
@@ -373,14 +464,14 @@ impl RpgMakerTranslationCorpus {
     }
 
     pub(crate) fn with_snapshot(
-        groups: Vec<RpgMakerTranslationGroup>,
+        scopes: Vec<RpgMakerTranslationScope>,
         source_snapshot_fingerprint: SourceSnapshotFingerprint,
         owner_snapshots: Vec<TranslationOwnerSnapshot>,
         terminology_json: String,
         placeholder_rules_json: String,
     ) -> Self {
         Self {
-            groups,
+            scopes,
             baseline: TranslationSnapshotBaseline::new(
                 source_snapshot_fingerprint,
                 owner_snapshots,
@@ -391,12 +482,12 @@ impl RpgMakerTranslationCorpus {
     }
 
     #[cfg(test)]
-    pub(crate) fn groups(&self) -> &[RpgMakerTranslationGroup] {
-        &self.groups
+    pub(crate) fn scopes(&self) -> &[RpgMakerTranslationScope] {
+        &self.scopes
     }
 
-    pub(crate) fn into_parts(self) -> (Vec<RpgMakerTranslationGroup>, TranslationSnapshotBaseline) {
-        (self.groups, self.baseline)
+    pub(crate) fn into_parts(self) -> (Vec<RpgMakerTranslationScope>, TranslationSnapshotBaseline) {
+        (self.scopes, self.baseline)
     }
 }
 
@@ -785,6 +876,20 @@ pub(crate) use crate::translation::placeholder::{
     AppliedPlaceholder, PlaceholderRuleOrigin, PlaceholderSegment,
 };
 
+/// 一个完整 Group 的身份、完整原文、来源语境与 Unit 自然顺序指纹。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GroupContextFingerprint(Sha256Fingerprint);
+
+impl GroupContextFingerprint {
+    pub(crate) const fn new(fingerprint: Sha256Fingerprint) -> Self {
+        Self(fingerprint)
+    }
+
+    pub(crate) const fn as_fingerprint(self) -> Sha256Fingerprint {
+        self.0
+    }
+}
+
 /// 一个语义单元除最终译文以外的全部当前翻译语义。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TranslationStateContext(Sha256Fingerprint);
@@ -936,9 +1041,10 @@ impl ExpectedTranslationOutputContractTarget {
         )
     }
 
-    fn diagnostic_subject(&self, unit_id: usize) -> crate::diagnostic::DiagnosticSubject {
+    fn diagnostic_subject(&self, unit_id: TaskId) -> crate::diagnostic::DiagnosticSubject {
         crate::diagnostic::DiagnosticSubject::operation(format!(
-            "translation_output_contract; unit={unit_id}; {}",
+            "translation_output_contract; unit={}; {}",
+            unit_id.get(),
             self.safe_detail()
         ))
     }
@@ -947,39 +1053,39 @@ impl ExpectedTranslationOutputContractTarget {
 #[derive(Eq, PartialEq)]
 pub(crate) enum ExpectedTranslationOutputContractError {
     PropagationContextCountMismatch {
-        unit_id: usize,
+        unit_id: TaskId,
         target: Box<ExpectedTranslationOutputContractTarget>,
         target_count: usize,
         context_count: usize,
     },
     PlaceholderIndexInvalid {
-        unit_id: usize,
+        unit_id: TaskId,
         target: Box<ExpectedTranslationOutputContractTarget>,
         source: LanguageTextProjectionError,
     },
     ProtectedPlaceholderMultisetMismatch {
-        unit_id: usize,
+        unit_id: TaskId,
         target: Box<ExpectedTranslationOutputContractTarget>,
         kind: PlaceholderMultisetErrorKind,
     },
     ProtectedPlaceholderCrossesLineBoundary {
-        unit_id: usize,
+        unit_id: TaskId,
         target: Box<ExpectedTranslationOutputContractTarget>,
         placeholder_index: usize,
     },
     ProtectedLineCountMismatch {
-        unit_id: usize,
+        unit_id: TaskId,
         target: Box<ExpectedTranslationOutputContractTarget>,
         expected: usize,
         actual: usize,
     },
     ScalarAlignedCountInvalid {
-        unit_id: usize,
+        unit_id: TaskId,
         target: Box<ExpectedTranslationOutputContractTarget>,
         actual: usize,
     },
     LinesAlignedCountMismatch {
-        unit_id: usize,
+        unit_id: TaskId,
         target: Box<ExpectedTranslationOutputContractTarget>,
         expected: usize,
         actual: usize,
@@ -988,7 +1094,7 @@ pub(crate) enum ExpectedTranslationOutputContractError {
 
 impl ExpectedTranslationOutputContractError {
     pub(crate) fn placeholder_index_invalid(
-        unit_id: usize,
+        unit_id: TaskId,
         identity: &TranslationUnitIdentity,
         source: LanguageTextProjectionError,
     ) -> Self {
@@ -1001,7 +1107,7 @@ impl ExpectedTranslationOutputContractError {
         }
     }
 
-    fn target_and_unit(&self) -> (&ExpectedTranslationOutputContractTarget, usize) {
+    fn target_and_unit(&self) -> (&ExpectedTranslationOutputContractTarget, TaskId) {
         match self {
             Self::PropagationContextCountMismatch {
                 unit_id, target, ..
@@ -1065,7 +1171,11 @@ impl ExpectedTranslationOutputContractError {
             } => format!("lines_aligned_count_mismatch; expected={expected}; actual={actual}"),
         };
         let (target, unit_id) = self.target_and_unit();
-        format!("{failure}; unit={unit_id}; {}", target.safe_detail())
+        format!(
+            "{failure}; unit={}; {}",
+            unit_id.get(),
+            target.safe_detail()
+        )
     }
 }
 
@@ -1095,7 +1205,7 @@ impl Error for ExpectedTranslationOutputContractError {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ExpectedTranslationOutput {
-    id: usize,
+    id: TaskId,
     identity: TranslationUnitIdentity,
     propagation_targets: Vec<TranslationUnitIdentity>,
     validation: ExpectedTranslationValidation,
@@ -1107,7 +1217,7 @@ pub(crate) struct ExpectedTranslationOutput {
 impl ExpectedTranslationOutput {
     #[cfg(test)]
     pub(crate) fn try_new(
-        id: usize,
+        id: TaskId,
         identity: TranslationUnitIdentity,
         propagation_targets: Vec<TranslationUnitIdentity>,
         validation: ExpectedTranslationValidation,
@@ -1129,7 +1239,7 @@ impl ExpectedTranslationOutput {
     }
 
     pub(crate) fn try_new_with_cancellation<E>(
-        id: usize,
+        id: TaskId,
         identity: TranslationUnitIdentity,
         propagation_targets: Vec<TranslationUnitIdentity>,
         validation: ExpectedTranslationValidation,
@@ -1138,7 +1248,6 @@ impl ExpectedTranslationOutput {
         mut ensure_running: impl FnMut() -> Result<(), E>,
     ) -> Result<Result<Self, ExpectedTranslationOutputContractError>, E> {
         ensure_running()?;
-        assert!(id > 0, "模型输出 ID 必须是正整数");
         if propagation_targets.len() != propagation_state_contexts.len() {
             return Ok(Err(
                 ExpectedTranslationOutputContractError::PropagationContextCountMismatch {
@@ -1187,7 +1296,7 @@ impl ExpectedTranslationOutput {
 
     #[cfg(test)]
     pub(crate) fn new(
-        id: usize,
+        id: TaskId,
         identity: TranslationUnitIdentity,
         propagation_targets: Vec<TranslationUnitIdentity>,
         validation: ExpectedTranslationValidation,
@@ -1205,7 +1314,7 @@ impl ExpectedTranslationOutput {
         .expect("测试 ExpectedTranslationOutput 必须满足静态 Planner 契约")
     }
 
-    pub(crate) const fn id(&self) -> usize {
+    pub(crate) const fn id(&self) -> TaskId {
         self.id
     }
 
@@ -1248,7 +1357,7 @@ impl ExpectedTranslationOutput {
 }
 
 fn validate_expected_translation_output_with_cancellation<E>(
-    unit_id: usize,
+    unit_id: TaskId,
     identity: &TranslationUnitIdentity,
     validation: &ExpectedTranslationValidation,
     placeholder_bindings: &PlaceholderBindingIndex,
@@ -1370,14 +1479,14 @@ fn line_count_with_cancellation<E>(
 
 /// 一个已经完成语义切块并生成最终最小消息的任务块。
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TranslationTaskBlock {
+pub(crate) struct RpgMakerExecutableTask {
     index: RpgMakerTranslationTaskIndex,
     language_pair: LanguagePair,
     messages: Vec<ChatMessage>,
     expected_outputs: Arc<[ExpectedTranslationOutput]>,
 }
 
-impl TranslationTaskBlock {
+impl RpgMakerExecutableTask {
     pub(crate) fn new(
         index: RpgMakerTranslationTaskIndex,
         language_pair: LanguagePair,
@@ -1385,10 +1494,9 @@ impl TranslationTaskBlock {
         expected_outputs: Vec<ExpectedTranslationOutput>,
     ) -> Self {
         assert!(
-            expected_outputs
-                .iter()
-                .enumerate()
-                .all(|(index, output)| output.id() == index + 1),
+            expected_outputs.iter().enumerate().all(|(index, output)| {
+                index.checked_add(1).and_then(TaskId::new) == Some(output.id())
+            }),
             "任务内模型输出 ID 必须从 1 连续编号"
         );
         Self {
@@ -1425,14 +1533,14 @@ impl TranslationTaskBlock {
 pub(crate) struct RpgMakerTranslationPlan {
     semantics: Arc<super::semantics::ResolvedTranslationSemantics>,
     preparation: TranslationPlanPreparation,
-    tasks: Vec<TranslationTaskBlock>,
+    tasks: Vec<RpgMakerExecutableTask>,
 }
 
 impl RpgMakerTranslationPlan {
     pub(crate) fn new(
         semantics: Arc<super::semantics::ResolvedTranslationSemantics>,
         preparation: TranslationPlanPreparation,
-        tasks: Vec<TranslationTaskBlock>,
+        tasks: Vec<RpgMakerExecutableTask>,
     ) -> Self {
         assert!(
             tasks
@@ -1453,7 +1561,7 @@ impl RpgMakerTranslationPlan {
     ) -> (
         Arc<super::semantics::ResolvedTranslationSemantics>,
         TranslationPlanPreparation,
-        Vec<TranslationTaskBlock>,
+        Vec<RpgMakerExecutableTask>,
     ) {
         (self.semantics, self.preparation, self.tasks)
     }
@@ -1506,17 +1614,17 @@ impl TranslationPatch {
 /// 已验收译文及其传播位置。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AcceptedTranslationDecision {
-    id: usize,
+    id: TaskId,
     patch: TranslationPatch,
 }
 
 impl AcceptedTranslationDecision {
-    pub(crate) fn new(id: usize, patch: TranslationPatch) -> Self {
+    pub(crate) fn new(id: TaskId, patch: TranslationPatch) -> Self {
         Self { id, patch }
     }
 
     #[cfg(test)]
-    pub(crate) const fn id(&self) -> usize {
+    pub(crate) const fn id(&self) -> TaskId {
         self.id
     }
 
@@ -1573,14 +1681,14 @@ pub(crate) enum TranslationUnitRejectionReason {
 /// 一个仍需在后续 CLI 运行中重新翻译的预期单元。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct UnresolvedTranslationUnit {
-    id: usize,
+    id: TaskId,
     location_count: usize,
     reason: TranslationUnitRejectionReason,
 }
 
 impl UnresolvedTranslationUnit {
     pub(crate) fn new(
-        id: usize,
+        id: TaskId,
         propagation_target_count: usize,
         reason: TranslationUnitRejectionReason,
     ) -> Self {
@@ -1591,7 +1699,7 @@ impl UnresolvedTranslationUnit {
         }
     }
 
-    pub(crate) const fn id(&self) -> usize {
+    pub(crate) const fn id(&self) -> TaskId {
         self.id
     }
 
@@ -1610,7 +1718,7 @@ pub(crate) enum TranslationProtocolDiagnostic {
     NonStopFinish { reason: String },
     InvalidResponse { message: String },
     InvalidId { item_index: usize },
-    UnknownId { item_index: usize, id: usize },
+    UnknownId { item_index: usize, id: TaskId },
 }
 
 /// 一个任务没有任何可用译文的正常原因。
@@ -1979,7 +2087,7 @@ pub(crate) trait RpgMakerTranslationTaskExecutor: Send + Sync {
     fn execute(
         &self,
         profile: &Self::Profile,
-        task: &TranslationTaskBlock,
+        task: &RpgMakerExecutableTask,
     ) -> impl Future<
         Output = Result<TranslationTaskExecution, TranslationTaskExecutionFailure<Self::Error>>,
     > + Send;
@@ -2256,7 +2364,7 @@ where
     total_tasks: usize,
 }
 
-impl<R, P, E, S, J, K> OrderedExecutionHandler<TranslationTaskBlock>
+impl<R, P, E, S, J, K> OrderedExecutionHandler<RpgMakerExecutableTask>
     for RpgMakerOrderedExecutionHandler<'_, R, P, E, S, J, K>
 where
     R: RpgMakerTranslationAssetReader,
@@ -2275,7 +2383,7 @@ where
     async fn execute(
         &self,
         _ordinal: usize,
-        task: &TranslationTaskBlock,
+        task: &RpgMakerExecutableTask,
     ) -> Result<Self::Executed, Self::StageError> {
         let task_index = task.index();
         self.service
@@ -2302,7 +2410,7 @@ where
     async fn prepare(
         &self,
         _ordinal: usize,
-        task: &TranslationTaskBlock,
+        task: &RpgMakerExecutableTask,
         execution: Self::Executed,
     ) -> Result<Self::Prepared, Self::StageError> {
         let task_index = task.index();
@@ -2344,7 +2452,7 @@ where
     async fn finalize(
         &self,
         _ordinal: usize,
-        task: TranslationTaskBlock,
+        task: RpgMakerExecutableTask,
         result: OrderedTaskResult<Self::Prepared, Self::StageError>,
         disposition: OrderedFinalizationDisposition,
         report: &mut Self::State,
@@ -2548,7 +2656,7 @@ where
 {
     fn record_not_applied(
         &self,
-        task: TranslationTaskBlock,
+        task: RpgMakerExecutableTask,
         outcome: Arc<TranslationTaskOutcome>,
         evidence: TranslationTaskExecutionEvidence,
         kind: TranslationTaskRecordFinalStateKind,
@@ -2582,7 +2690,7 @@ where
 
     fn record_commit_failure(
         &self,
-        task: TranslationTaskBlock,
+        task: RpgMakerExecutableTask,
         outcome: Arc<TranslationTaskOutcome>,
         evidence: TranslationTaskExecutionEvidence,
         phase: TranslationTaskCommitPhase,
@@ -2622,7 +2730,7 @@ where
 
     fn record_success(
         &self,
-        task: TranslationTaskBlock,
+        task: RpgMakerExecutableTask,
         outcome: Arc<TranslationTaskOutcome>,
         evidence: TranslationTaskExecutionEvidence,
         report: &mut RpgMakerTranslationRunReport,
@@ -2951,6 +3059,10 @@ mod tests {
         )
     }
 
+    fn task_id(value: usize) -> TaskId {
+        TaskId::new(value).expect("测试 Task ID 必须非零")
+    }
+
     #[test]
     fn task_block_keeps_only_the_execution_contract() {
         let group_location = RpgMakerLocation::value(
@@ -2973,7 +3085,7 @@ mod tests {
             "rpg_maker.event.control_character.actor_name",
             PlaceholderSegment::Whole,
         );
-        let block = TranslationTaskBlock::new(
+        let block = RpgMakerExecutableTask::new(
             RpgMakerTranslationTaskIndex::new(4),
             test_language_pair(),
             vec![
@@ -2981,7 +3093,7 @@ mod tests {
                 ChatMessage::new(ChatMessageRole::User, "# Content\n\n..."),
             ],
             vec![ExpectedTranslationOutput::new(
-                1,
+                task_id(1),
                 description_identity,
                 Vec::new(),
                 ExpectedTranslationValidation::new(
@@ -3007,7 +3119,7 @@ mod tests {
             &group_location
         );
         assert_eq!(block.messages().len(), 2);
-        assert_eq!(block.expected_outputs()[0].id(), 1);
+        assert_eq!(block.expected_outputs()[0].id(), task_id(1));
         assert_eq!(
             block.expected_outputs()[0].line_shape(),
             ExpectedLineShape::Aligned(NonZeroUsize::MIN)
@@ -3026,7 +3138,7 @@ mod tests {
     fn expected_output_contract_scan_can_cancel_during_long_protected_text() {
         let mut polls = 0_usize;
         let result = ExpectedTranslationOutput::try_new_with_cancellation(
-            1,
+            task_id(1),
             translation_identity(),
             Vec::new(),
             ExpectedTranslationValidation::new(
@@ -3053,7 +3165,7 @@ mod tests {
         RpgMakerTranslationPlan::new(
             Arc::new(super::super::semantics::ResolvedTranslationSemantics::for_test()),
             empty_preparation(),
-            vec![TranslationTaskBlock::new(
+            vec![RpgMakerExecutableTask::new(
                 RpgMakerTranslationTaskIndex::new(1),
                 test_language_pair(),
                 Vec::new(),
@@ -3233,13 +3345,13 @@ mod tests {
                 return Err(FakeError("plan"));
             }
 
-            let tasks: Vec<TranslationTaskBlock> = (0..self.task_count)
+            let tasks: Vec<RpgMakerExecutableTask> = (0..self.task_count)
                 .map(|index| {
                     let expected_outputs = vec![
                         expected_output(index, 1, true),
                         expected_output(index, 2, false),
                     ];
-                    TranslationTaskBlock::new(
+                    RpgMakerExecutableTask::new(
                         RpgMakerTranslationTaskIndex::new(index),
                         test_language_pair(),
                         vec![ChatMessage::new(
@@ -3278,7 +3390,7 @@ mod tests {
         async fn execute(
             &self,
             _profile: &Self::Profile,
-            task: &TranslationTaskBlock,
+            task: &RpgMakerExecutableTask,
         ) -> Result<TranslationTaskExecution, TranslationTaskExecutionFailure<Self::Error>>
         {
             let task_index = task.index();
@@ -4721,7 +4833,7 @@ mod tests {
             .into_iter()
             .collect();
         ExpectedTranslationOutput::new(
-            id,
+            task_id(id),
             identity,
             propagation_targets,
             ExpectedTranslationValidation::new(
@@ -4799,7 +4911,7 @@ mod tests {
                     NonZeroUsize::MIN,
                     vec![TranslationProtocolDiagnostic::UnknownId {
                         item_index: 3,
-                        id: 99,
+                        id: task_id(99),
                     }],
                 ),
                 final_response: FinalLlmResponseMetadata::new(

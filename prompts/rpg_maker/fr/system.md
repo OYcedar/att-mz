@@ -10,7 +10,7 @@ cette langue dès le départ.
 - Lisez la scène entière : qui parle, à qui, ce qui reste sous-entendu, et les
   liens entre les personnages. Laissez le ton, l'émotion et le niveau de langue
   trouver leur juste place.
-- La terminologie, les titres de groupe et les noms sans `[ID]` ne sont là que
+- La terminologie, les titres de groupe et les textes sans `[ID]` ne sont là que
   pour vous guider ; ne produisez des traductions que pour les entrées `[ID]`.
   Appliquez la terminologie fournie partout où elle s'impose.
 - Restez fidèle au sens, au style et au registre du texte source, tout en

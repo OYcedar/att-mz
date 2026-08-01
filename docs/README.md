@@ -34,6 +34,7 @@
 - [制作游戏术语表](../skills/extract-game-terminology/SKILL.md)：从游戏或文本中发现、
   筛选、定译和验收术语，不绑定 ATT 格式
 - [Placeholder](translation/placeholders.md)
+- [TaskBlock 规划](translation/task-planning.md)：完整语境、稳定装箱和临时 ID
 - [Prompt 与模型协议](translation/prompts.md)
 - [模型任务记录](translation/task-records.md)
 
