@@ -18,10 +18,13 @@ use crate::translation::task_planning::{
     StableGroupCharacters, TaskId, TaskPlanningError, TaskPlanningGroupLayout, TaskPlanningLayout,
     TaskPlanningScopeLayout, UnitTaskResponsibility, assign_task_ids, pack_complete_task_blocks,
 };
-use crate::translation_protocol::ParsedTranslationResponse;
+use crate::translation_protocol::{
+    DecodedJsonStringArray, DecodedSourceEchoFieldsError, DecodedSourceEchoValue,
+    DecodedTranslationAssistantValue, ParsedTranslationResponse,
+};
 #[cfg(test)]
 use crate::translation_protocol::{
-    TranslationResponseEnvelope, TranslationTaskResponseParseError, parse_translation_response,
+    TranslationResponseMode, TranslationTaskResponseParseError, parse_translation_response,
 };
 
 use super::identity::{
@@ -1311,23 +1314,36 @@ fn stable_generic_group_characters(
     group: &GenericStoredGroup,
     is_cancelled: &(impl Fn() -> bool + Sync),
 ) -> Result<StableGroupCharacters, GenericPlanningError> {
-    let mut following = "kind=".len();
-    following = checked_stable_character_add(
-        following,
+    let mut group_characters = "{\"kind\":".len();
+    group_characters = checked_stable_character_add(
+        group_characters,
         stable_json_string_characters(group.kind(), is_cancelled)?,
     )?;
-    following = checked_stable_character_add(following, "\nunits:\n".len())?;
-    for unit in group.units() {
+    group_characters = checked_stable_character_add(group_characters, ",\"units\":[".len())?;
+    for (unit_index, unit) in group.units().iter().enumerate() {
         ensure_planning_not_cancelled(is_cancelled)?;
-        following = checked_stable_character_add(following, "[-] ".len())?;
-        following = checked_stable_character_add(
-            following,
-            stable_json_string_characters(unit.source_text(), is_cancelled)?,
-        )?;
-        following = checked_stable_character_add(following, 1)?;
+        if unit_index != 0 {
+            group_characters = checked_stable_character_add(group_characters, 1)?;
+        }
+        group_characters = checked_stable_character_add(group_characters, "{\"text\":[".len())?;
+        for (line_index, line) in unit.source_text().split('\n').enumerate() {
+            ensure_planning_not_cancelled(is_cancelled)?;
+            if line_index != 0 {
+                group_characters = checked_stable_character_add(group_characters, 1)?;
+            }
+            group_characters = checked_stable_character_add(
+                group_characters,
+                stable_json_string_characters(line, is_cancelled)?,
+            )?;
+        }
+        group_characters = checked_stable_character_add(group_characters, "]}".len())?;
     }
-    following = checked_stable_character_add(following, 1)?;
-    let first = checked_stable_character_add("Groups:\n".len(), following)?;
+    group_characters = checked_stable_character_add(group_characters, "]}".len())?;
+    let first = checked_stable_character_add(
+        checked_stable_character_add("{\"groups\":[".len(), group_characters)?,
+        "]}".len(),
+    )?;
+    let following = checked_stable_character_add(1, group_characters)?;
     Ok(StableGroupCharacters::new(first, following))
 }
 
@@ -1490,7 +1506,10 @@ pub(crate) enum ResponseProblem {
     UnexpectedId(TaskId),
     DuplicateId(TaskId),
     MissingId(TaskId),
-    NonStringValue(TaskId),
+    InvalidValue {
+        output_id: TaskId,
+        detail: String,
+    },
     InvalidTranslation {
         output_id: TaskId,
         detail: String,
@@ -1552,7 +1571,7 @@ impl fmt::Display for GenericResponseError {
 #[cfg(test)]
 impl Error for GenericResponseError {}
 
-/// 验收 Generic 的 `{"1":"译文"}` 响应。
+/// 验收 Generic 的逐 ID 字符串数组响应。
 ///
 /// `validator` 负责 Placeholder 恢复、语言残留检查和可选安全修复。它返回最终应
 /// 保存的译文，或者只影响当前 ID 的具体原因。
@@ -1560,10 +1579,10 @@ impl Error for GenericResponseError {}
 pub(crate) fn accept_response(
     task: &PlannedTask,
     assistant_response: &str,
-    response_envelope: TranslationResponseEnvelope,
+    response_mode: TranslationResponseMode,
     validator: impl FnMut(TaskId, &GenericUnitKey, &str) -> Result<String, String>,
 ) -> Result<TranslationAcceptance, GenericResponseError> {
-    let parsed = parse_translation_response(assistant_response, response_envelope)
+    let parsed = parse_translation_response(assistant_response, response_mode)
         .map_err(|source| GenericResponseError { source })?;
     Ok(accept_parsed_response(task.clone(), &parsed, validator))
 }
@@ -1636,12 +1655,13 @@ pub(crate) fn accept_parsed_response_with_cancellation(
             }
             continue;
         }
-        let candidate = match entry.decode_value_with_cancellation::<String, _>(|| {
+        let decoded = entry.decode_translation_value_with_cancellation(|| {
             ensure_planning_not_cancelled(&is_cancelled)
-        })? {
+        })?;
+        let candidate = match generic_translation_candidate(decoded, &is_cancelled)? {
             Ok(candidate) => candidate,
-            Err(_) => {
-                problems.push(ResponseProblem::NonStringValue(output_id));
+            Err(detail) => {
+                problems.push(ResponseProblem::InvalidValue { output_id, detail });
                 continue;
             }
         };
@@ -1708,6 +1728,101 @@ pub(crate) fn accept_parsed_response_with_cancellation(
         problems,
         accepted_output_count,
     })
+}
+
+fn generic_translation_candidate(
+    decoded: DecodedTranslationAssistantValue,
+    is_cancelled: &impl Fn() -> bool,
+) -> Result<Result<String, String>, GenericPlanningError> {
+    let translation = match decoded {
+        DecodedTranslationAssistantValue::Translation(translation) => translation,
+        DecodedTranslationAssistantValue::SourceEcho(DecodedSourceEchoValue::Fields {
+            source,
+            translation,
+        }) => {
+            if let Err(detail) = validate_response_string_array_shape(source, "source") {
+                return Ok(Err(detail));
+            }
+            translation
+        }
+        DecodedTranslationAssistantValue::SourceEcho(DecodedSourceEchoValue::NotObject) => {
+            return Ok(Err(
+                "原文回显模式下，每个 ID 的值必须是只含 source 和 translation 的对象".to_owned(),
+            ));
+        }
+        DecodedTranslationAssistantValue::SourceEcho(DecodedSourceEchoValue::InvalidFields(
+            error,
+        )) => return Ok(Err(source_echo_fields_error_detail(error))),
+    };
+
+    let lines = match translation {
+        DecodedJsonStringArray::Strings(lines) => lines,
+        invalid => {
+            return Ok(Err(response_string_array_shape_detail(
+                invalid,
+                "translation",
+            )));
+        }
+    };
+    join_translation_lines_with_cancellation(lines, is_cancelled).map(Ok)
+}
+
+fn validate_response_string_array_shape(
+    value: DecodedJsonStringArray,
+    field: &str,
+) -> Result<(), String> {
+    match value {
+        DecodedJsonStringArray::Strings(_) => Ok(()),
+        invalid => Err(response_string_array_shape_detail(invalid, field)),
+    }
+}
+
+fn response_string_array_shape_detail(value: DecodedJsonStringArray, field: &str) -> String {
+    match value {
+        DecodedJsonStringArray::NotArray => format!("{field} 必须是字符串数组"),
+        DecodedJsonStringArray::NonStringItem { item } => {
+            format!("{field} 的第 {} 项必须是字符串", item.get())
+        }
+        DecodedJsonStringArray::Strings(_) => unreachable!("字符串数组不应进入形状错误分支"),
+    }
+}
+
+fn source_echo_fields_error_detail(error: DecodedSourceEchoFieldsError) -> String {
+    match error {
+        DecodedSourceEchoFieldsError::MissingSource => "原文回显对象缺少 source".to_owned(),
+        DecodedSourceEchoFieldsError::MissingTranslation => {
+            "原文回显对象缺少 translation".to_owned()
+        }
+        DecodedSourceEchoFieldsError::DuplicateSource => "原文回显对象包含重复的 source".to_owned(),
+        DecodedSourceEchoFieldsError::DuplicateTranslation => {
+            "原文回显对象包含重复的 translation".to_owned()
+        }
+        DecodedSourceEchoFieldsError::UnexpectedField { field } => {
+            format!("原文回显对象包含未知字段 {field}")
+        }
+    }
+}
+
+fn join_translation_lines_with_cancellation(
+    lines: Vec<String>,
+    is_cancelled: &impl Fn() -> bool,
+) -> Result<String, GenericPlanningError> {
+    let capacity = lines.iter().try_fold(0_usize, |capacity, line| {
+        capacity
+            .checked_add(line.len())
+            .and_then(|capacity| capacity.checked_add(1))
+            .ok_or(TaskPlanningError::CharacterCountOverflow)
+    })?;
+    let mut translation = String::with_capacity(capacity.saturating_sub(1));
+    for (index, line) in lines.iter().enumerate() {
+        ensure_planning_not_cancelled(is_cancelled)?;
+        if index != 0 {
+            translation.push('\n');
+        }
+        translation.push_str(&clone_planning_text_with_cancellation(line, is_cancelled)?);
+    }
+    ensure_planning_not_cancelled(is_cancelled)?;
+    Ok(translation)
 }
 
 fn validate_candidate_text_with_cancellation(
@@ -1977,7 +2092,7 @@ mod tests {
     }
 
     fn task_id(value: usize) -> TaskId {
-        TaskId::new(value).expect("测试 Task ID 必须非零")
+        TaskId::new(value)
     }
 
     #[test]
@@ -2160,13 +2275,18 @@ mod tests {
         }
     }
 
+    fn two_short_groups_stable_json_target() -> NonZeroUsize {
+        let stable_projection = r#"{"groups":[{"kind":"k","units":[{"text":["a"]}]},{"kind":"k","units":[{"text":["b"]}]}]}"#;
+        NonZeroUsize::new(stable_projection.chars().count()).expect("稳定 JSON 投影非空")
+    }
+
     #[test]
     fn stable_task_packing_uses_complete_file_groups_and_restarts_ids() {
         let snapshot = task_split_snapshot(&[10]);
         let plan = plan_translation_with_cancellation(
             &snapshot,
             &planning(&snapshot),
-            NonZeroUsize::new(58).expect("常量应非零"),
+            two_short_groups_stable_json_target(),
             |_, candidate| Ok(candidate.to_owned()),
             &CooperativeCancellation::default(),
         )
@@ -2192,8 +2312,8 @@ mod tests {
                 task.expected_output_ids()
                     .map(TaskId::get)
                     .collect::<Vec<_>>(),
-                [1, 2],
-                "每个最终 Task 都应从 1 重新编号"
+                [0, 1],
+                "每个最终 Task 都应从 0 重新编号"
             );
         }
     }
@@ -2204,7 +2324,7 @@ mod tests {
         let plan = plan_translation_with_cancellation(
             &snapshot,
             &planning(&snapshot),
-            NonZeroUsize::new(58).expect("常量应非零"),
+            two_short_groups_stable_json_target(),
             |_, candidate| Ok(candidate.to_owned()),
             &CooperativeCancellation::default(),
         )
@@ -2271,7 +2391,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        let target = NonZeroUsize::new(58).expect("常量应非零");
+        let target = two_short_groups_stable_json_target();
 
         let plan = plan_translation_with_cancellation(
             &snapshot,
@@ -2302,7 +2422,7 @@ mod tests {
                 task.expected_output_ids()
                     .map(TaskId::get)
                     .collect::<Vec<_>>(),
-                [1]
+                [0]
             );
         }
 
@@ -2676,23 +2796,55 @@ mod tests {
         let task = &plan.tasks()[0];
         let acceptance = accept_response(
             task,
-            r#"{"1":"译文\n第二行","2":3,"99":"额外"}"#,
-            TranslationResponseEnvelope::JsonOnly,
+            r#"{"0":["译文","第二行"],"1":3,"99":["额外"]}"#,
+            TranslationResponseMode::new(false, false),
             |_, _, candidate| Ok(candidate.to_owned()),
         )
         .expect("object 可解析");
 
         assert_eq!(acceptance.accepted().len(), 2, "同文族传播到两个 Unit");
-        assert!(
-            acceptance
-                .problems()
-                .contains(&ResponseProblem::NonStringValue(task_id(2)))
-        );
+        assert!(acceptance.problems().iter().any(|problem| matches!(
+            problem,
+            ResponseProblem::InvalidValue { output_id, .. } if *output_id == task_id(1)
+        )));
         assert!(
             acceptance
                 .problems()
                 .contains(&ResponseProblem::UnexpectedId(task_id(99)))
         );
+    }
+
+    #[test]
+    fn source_echo_content_is_ignored_but_its_shape_is_checked_per_generic_id() {
+        let snapshot = stored_snapshot();
+        let plan = plan_translation(&snapshot, &planning(&snapshot), |_, candidate| {
+            Ok(candidate.to_owned())
+        })
+        .expect("规划应成功");
+        let task = &plan.tasks()[0];
+        let accepted = accept_response(
+            task,
+            r#"{"0":{"source":["与请求不同"],"translation":["同文译文"]},"1":{"source":["也不比较"],"translation":["独立译文"]}}"#,
+            TranslationResponseMode::new(false, true),
+            |_, _, candidate| Ok(candidate.to_owned()),
+        )
+        .expect("原文回显内容不同仍应按 ID 验收");
+        assert_eq!(accepted.accepted().len(), 3);
+        assert!(accepted.problems().is_empty());
+
+        let partial = accept_response(
+            task,
+            r#"{"0":{"source":true,"translation":["同文译文"]},"1":{"source":["任意"],"translation":["独立译文"]}}"#,
+            TranslationResponseMode::new(false, true),
+            |_, _, candidate| Ok(candidate.to_owned()),
+        )
+        .expect("逐 ID 的 source 形状错误不能使整份响应失效");
+        assert_eq!(partial.accepted().len(), 1);
+        assert!(matches!(
+            partial.problems(),
+            [ResponseProblem::InvalidValue { output_id, detail }]
+                if *output_id == task_id(0) && detail.contains("source 必须是字符串数组")
+        ));
     }
 
     #[test]
@@ -2705,12 +2857,12 @@ mod tests {
         })
         .expect("规划应成功");
         let deep_value = format!("{}0{}", "[".repeat(DEPTH), "]".repeat(DEPTH));
-        let response = format!(r#"{{"1":"同级合法译文","2":{deep_value}}}"#);
+        let response = format!(r#"{{"0":["同级合法译文"],"1":{deep_value}}}"#);
 
         let acceptance = accept_response(
             &plan.tasks()[0],
             &response,
-            TranslationResponseEnvelope::JsonOnly,
+            TranslationResponseMode::new(false, false),
             |_, _, candidate| Ok(candidate.to_owned()),
         )
         .expect("任意深的值不应破坏有效外层 object");
@@ -2720,10 +2872,10 @@ mod tests {
             2,
             "合法同级 ID 仍应传播到两个 Generic Unit"
         );
-        assert_eq!(
+        assert!(matches!(
             acceptance.problems(),
-            [ResponseProblem::NonStringValue(task_id(2))]
-        );
+            [ResponseProblem::InvalidValue { output_id, .. }] if *output_id == task_id(1)
+        ));
     }
 
     #[test]
@@ -2733,9 +2885,10 @@ mod tests {
             Ok(candidate.to_owned())
         })
         .expect("规划应成功");
-        let response = format!(r#"{{"1":"{}"}}"#, "文".repeat(128 * 1024));
-        let parsed = parse_translation_response(&response, TranslationResponseEnvelope::JsonOnly)
-            .expect("响应应可解析");
+        let response = format!(r#"{{"0":["{}"]}}"#, "文".repeat(128 * 1024));
+        let parsed =
+            parse_translation_response(&response, TranslationResponseMode::new(false, false))
+                .expect("响应应可解析");
         let polls = Cell::new(0_usize);
 
         let result = accept_parsed_response_with_cancellation(
@@ -2765,8 +2918,8 @@ mod tests {
         let task = &plan.tasks()[0];
         let acceptance = accept_response(
             task,
-            r#"{"1":"同文译文","2":"独立译文"}"#,
-            TranslationResponseEnvelope::JsonOnly,
+            r#"{"0":["同文译文"],"1":["独立译文"]}"#,
+            TranslationResponseMode::new(false, false),
             |_, key, candidate| {
                 if key.group_id() == "g3" {
                     Err("目标 kind 不接受该译文".to_owned())
@@ -2790,7 +2943,7 @@ mod tests {
             acceptance
                 .problems()
                 .contains(&ResponseProblem::InvalidDestination {
-                    output_id: task_id(1),
+                    output_id: task_id(0),
                     key: GenericUnitKey::new("g3".to_owned(), "u1".to_owned()),
                     detail: "目标 kind 不接受该译文".to_owned(),
                 })
@@ -2811,10 +2964,10 @@ mod tests {
         .unwrap();
         let acceptance = accept_response(
             &plan.tasks()[0],
-            r#"{"1":"同文译文","2":"独立译文"}"#,
-            TranslationResponseEnvelope::JsonOnly,
+            r#"{"0":["同文译文"],"1":["独立译文"]}"#,
+            TranslationResponseMode::new(false, false),
             |output_id, _, candidate| {
-                if output_id == task_id(1) {
+                if output_id == task_id(0) {
                     Err("该去重族的目标均拒绝译文".to_owned())
                 } else {
                     Ok(candidate.to_owned())
@@ -2830,12 +2983,12 @@ mod tests {
             acceptance.problems(),
             [
                 ResponseProblem::InvalidDestination {
-                    output_id: task_id(1),
+                    output_id: task_id(0),
                     key: GenericUnitKey::new("g1".to_owned(), "u1".to_owned()),
                     detail: "该去重族的目标均拒绝译文".to_owned(),
                 },
                 ResponseProblem::InvalidDestination {
-                    output_id: task_id(1),
+                    output_id: task_id(0),
                     key: GenericUnitKey::new("g3".to_owned(), "u1".to_owned()),
                     detail: "该去重族的目标均拒绝译文".to_owned(),
                 },
@@ -2853,8 +3006,8 @@ mod tests {
         .unwrap();
         let acceptance = accept_response(
             &plan.tasks()[0],
-            r#"{"1":"甲","1":"乙"}"#,
-            TranslationResponseEnvelope::JsonOnly,
+            r#"{"0":["甲"],"0":["乙"]}"#,
+            TranslationResponseMode::new(false, false),
             |_, _, candidate| Ok(candidate.to_owned()),
         )
         .expect("公共协议应保留重复项，交给逐 ID 验收");
@@ -2862,8 +3015,8 @@ mod tests {
         assert_eq!(
             acceptance.problems(),
             [
-                ResponseProblem::DuplicateId(task_id(1)),
-                ResponseProblem::MissingId(task_id(2))
+                ResponseProblem::DuplicateId(task_id(0)),
+                ResponseProblem::MissingId(task_id(1))
             ]
         );
     }

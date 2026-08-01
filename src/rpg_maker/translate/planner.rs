@@ -34,6 +34,12 @@ use crate::translation::task_planning::{
     TaskPlanningLayout, TaskPlanningScopeLayout, UnitTaskResponsibility, assign_task_ids,
     pack_complete_task_blocks,
 };
+use crate::translation::user_message::{
+    TranslationReturnType, TranslationUserGroup, TranslationUserMessage,
+    TranslationUserTerminology, TranslationUserUnit, measure_translation_user_group,
+    render_translation_user_message,
+};
+use crate::translation_protocol::TranslationResponseMode;
 
 use super::deduplication::{
     TranslationDeduplicationCandidate, TranslationDeduplicationOutcome,
@@ -174,10 +180,10 @@ where
                 )?;
                 let global_semantics = global_translation_semantics_with_cancellation(
                     engine,
-                    source_language_id.as_str(),
-                    target_language_id.as_str(),
+                    context_resources.language_pair(),
                     language_semantics,
                     &system_markdown,
+                    context_resources.system_prompt().response_mode(),
                     client_semantics,
                     || ensure_planner_cpu_running(&context_cancellation),
                 )?;
@@ -714,32 +720,31 @@ fn task_planning_layout_with_cancellation(
         for group in &scope.groups {
             ensure_planner_cpu_running(cancellation)
                 .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-            let mut markdown = format!("## {}\n", human_group_kind(group.kind));
+            let mut stable_units = Vec::with_capacity(group.assets.len());
             for asset in &group.assets {
                 ensure_planner_cpu_running(cancellation)
                     .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-                markdown.push('\n');
                 let source_text = task_content_text_with_cancellation(
                     asset.identity.source_content(),
                     cancellation,
                 )?;
-                render_task_unit_with_cancellation(
-                    &mut markdown,
-                    &asset.identity,
-                    asset.identity.role_label().as_str(),
-                    None,
-                    &source_text,
-                    cancellation,
-                )?;
+                stable_units.push((asset.identity.role_label(), source_text));
             }
-            let first_in_block =
-                planner_character_count_with_cancellation(&markdown, cancellation)?;
-            let following_in_block =
-                first_in_block
-                    .checked_add(1)
-                    .ok_or(ScopeTaskPlanningFailure::TaskPlanning(
-                        TaskPlanningError::CharacterCountOverflow,
-                    ))?;
+            let wire_units = stable_units
+                .iter()
+                .map(|(role, text)| {
+                    TranslationUserUnit::context(Some(role.as_str()), text.as_str())
+                })
+                .collect();
+            let wire_group = TranslationUserGroup::new(group.kind.storage_name(), wire_units);
+            let Some((first_in_block, following_in_block)) =
+                measure_translation_user_group(&wire_group, cancellation)
+                    .map_err(|_| ScopeTaskPlanningFailure::Cancelled)?
+            else {
+                return Err(ScopeTaskPlanningFailure::TaskPlanning(
+                    TaskPlanningError::CharacterCountOverflow,
+                ));
+            };
             groups.push(
                 TaskPlanningGroupLayout::new(
                     group.assets.len(),
@@ -1160,30 +1165,6 @@ fn append_planner_text_with_cancellation(
     ensure_planner_cpu_running(cancellation).map_err(|()| ScopeTaskPlanningFailure::Cancelled)
 }
 
-fn planner_character_count_with_cancellation(
-    text: &str,
-    cancellation: &CooperativeCancellation,
-) -> Result<usize, ScopeTaskPlanningFailure> {
-    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
-    let mut count = 0_usize;
-    for chunk in text.as_bytes().chunks(CANCELLATION_CHECK_BYTES) {
-        ensure_planner_cpu_running(cancellation)
-            .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-        count = count
-            .checked_add(
-                chunk
-                    .iter()
-                    .filter(|byte| (**byte & 0b1100_0000) != 0b1000_0000)
-                    .count(),
-            )
-            .ok_or(ScopeTaskPlanningFailure::TaskPlanning(
-                TaskPlanningError::CharacterCountOverflow,
-            ))?;
-    }
-    ensure_planner_cpu_running(cancellation).map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-    Ok(count)
-}
-
 #[cfg(test)]
 pub(crate) fn global_translation_semantics(
     engine: RpgMakerEngine,
@@ -1191,14 +1172,19 @@ pub(crate) fn global_translation_semantics(
     target_language: &str,
     language_semantics: Sha256Fingerprint,
     system_markdown: &str,
+    response_mode: TranslationResponseMode,
     client_semantics: Sha256Fingerprint,
 ) -> Sha256Fingerprint {
+    let language_pair = LanguagePair::new(
+        crate::language::LanguageId::parse(source_language).expect("测试源语言标识必须有效"),
+        crate::language::LanguageId::parse(target_language).expect("测试目标语言标识必须有效"),
+    );
     match global_translation_semantics_with_cancellation(
         engine,
-        source_language,
-        target_language,
+        &language_pair,
         language_semantics,
         system_markdown,
+        response_mode,
         client_semantics,
         || Ok::<_, Infallible>(()),
     ) {
@@ -1209,10 +1195,10 @@ pub(crate) fn global_translation_semantics(
 
 pub(crate) fn global_translation_semantics_with_cancellation<E>(
     engine: RpgMakerEngine,
-    source_language: &str,
-    target_language: &str,
+    language_pair: &LanguagePair,
     language_semantics: Sha256Fingerprint,
     system_markdown: &str,
+    response_mode: TranslationResponseMode,
     client_semantics: Sha256Fingerprint,
     mut ensure_running: impl FnMut() -> Result<(), E>,
 ) -> Result<Sha256Fingerprint, E> {
@@ -1220,8 +1206,8 @@ pub(crate) fn global_translation_semantics_with_cancellation<E>(
     ensure_running()?;
     let mut hasher = Sha256FramedHasher::new(b"att.rpg_maker.translation-global");
     hasher
-        .frame(1, source_language.as_bytes())
-        .frame(2, target_language.as_bytes())
+        .frame(1, language_pair.source().as_str().as_bytes())
+        .frame(2, language_pair.target().as_str().as_bytes())
         .frame(3, language_semantics.as_bytes());
     hasher
         .try_frame_chunks(
@@ -1230,8 +1216,24 @@ pub(crate) fn global_translation_semantics_with_cancellation<E>(
             chunk_size,
             &mut ensure_running,
         )?
-        .frame(5, client_semantics.as_bytes())
-        .frame(6, engine.storage_name().as_bytes());
+        .frame(
+            5,
+            if response_mode.thinking() {
+                b"thinking=true"
+            } else {
+                b"thinking=false"
+            },
+        )
+        .frame(
+            6,
+            if response_mode.source_echo() {
+                b"source-echo=true"
+            } else {
+                b"source-echo=false"
+            },
+        )
+        .frame(7, client_semantics.as_bytes())
+        .frame(8, engine.storage_name().as_bytes());
     ensure_running()?;
     Ok(hasher.finish())
 }
@@ -1577,7 +1579,7 @@ fn materialize_task_block(
     for group in groups {
         ensure_planner_cpu_running(cancellation)
             .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-        let mut markdown = format!("## {}\n", human_group_kind(group.kind));
+        let mut rendered_units = Vec::with_capacity(group.units.len());
         let mut expected = Vec::new();
         for term in &group.triggered_terms {
             selected_terms.insert(*term);
@@ -1594,15 +1596,13 @@ fn materialize_task_block(
             } else {
                 context_model_text_with_cancellation(unit, semantics, cancellation)?
             };
-            markdown.push('\n');
-            render_task_unit_with_cancellation(
-                &mut markdown,
-                &unit.identity,
-                unit.identity.role_label().as_str(),
-                task_id,
-                &display_text,
-                cancellation,
-            )?;
+            let line_shape = expected_line_shape_with_cancellation(&unit.identity, cancellation)?;
+            rendered_units.push(RenderedUnit {
+                id: task_id,
+                role: unit.identity.role_label(),
+                return_type: task_id.map(|_| translation_return_type(line_shape)),
+                text: display_text,
+            });
 
             let Some(task_id) = task_id else {
                 continue;
@@ -1615,7 +1615,7 @@ fn materialize_task_block(
             };
             expected.push(ExpectedBase {
                 id: task_id,
-                line_shape: expected_line_shape_with_cancellation(&unit.identity, cancellation)?,
+                line_shape,
                 identity: unit.identity.clone(),
                 propagation_targets: propagation_targets.clone(),
                 protected_text: unit.protected_text.clone(),
@@ -1624,16 +1624,19 @@ fn materialize_task_block(
                 state_context: unit.state_context,
             });
         }
-        rendered_groups.push(RenderedGroup { markdown, expected });
+        rendered_groups.push(RenderedGroup {
+            kind: group.kind,
+            units: rendered_units,
+            expected,
+        });
     }
     assert!(
         task_ids.next().is_none(),
         "AssignedTaskBlock 不得包含超出完整块的 Unit ID 槽"
     );
 
-    let user_markdown = render_user_markdown_with_cancellation(
+    let user_json = render_user_json_with_cancellation(
         &rendered_groups,
-        None,
         terminology,
         &selected_terms,
         cancellation,
@@ -1677,7 +1680,7 @@ fn materialize_task_block(
     Ok(Some(UnindexedTask {
         messages: vec![
             ChatMessage::new(ChatMessageRole::System, system_markdown),
-            ChatMessage::new(ChatMessageRole::User, user_markdown),
+            ChatMessage::new(ChatMessageRole::User, user_json),
         ],
         expected_outputs,
     }))
@@ -1720,8 +1723,23 @@ fn context_model_text_with_cancellation(
 }
 
 struct RenderedGroup {
-    markdown: String,
+    kind: TextGroupKind,
+    units: Vec<RenderedUnit>,
     expected: Vec<ExpectedBase>,
+}
+
+struct RenderedUnit {
+    id: Option<TaskId>,
+    role: String,
+    return_type: Option<TranslationReturnType>,
+    text: String,
+}
+
+const fn translation_return_type(line_shape: ExpectedLineShape) -> TranslationReturnType {
+    match line_shape {
+        ExpectedLineShape::Aligned(_) => TranslationReturnType::Strict,
+        ExpectedLineShape::Reflow => TranslationReturnType::Free,
+    }
 }
 
 struct ExpectedBase {
@@ -1733,90 +1751,6 @@ struct ExpectedBase {
     placeholders: Vec<super::pipeline::AppliedPlaceholder>,
     language_analysis: LanguageAnalysis,
     state_context: TranslationStateContext,
-}
-
-fn append_task_id_slot(markdown: &mut String, task_id: Option<TaskId>) {
-    markdown.push('[');
-    match task_id {
-        Some(task_id) => markdown.push_str(&task_id.to_string()),
-        None => markdown.push('-'),
-    }
-    markdown.push(']');
-}
-
-/// 用同一种角色格式渲染模型代表和无编号语境。
-///
-/// 稳定装箱传入完整原文和 `None`；最终消息只改变 ID 槽和显示文本，不改变角色格式。
-fn render_task_unit_with_cancellation(
-    markdown: &mut String,
-    identity: &TranslationUnitIdentity,
-    field_name: &str,
-    task_id: Option<TaskId>,
-    text: &str,
-    cancellation: &CooperativeCancellation,
-) -> Result<(), ScopeTaskPlanningFailure> {
-    ensure_planner_cpu_running(cancellation).map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-    match identity.role() {
-        TextUnitRole::DialogueSpeaker => {
-            markdown.push_str("Speaker ");
-            append_task_id_slot(markdown, task_id);
-            markdown.push_str(" (single line):");
-            append_planner_text_with_cancellation(markdown, text, cancellation)?;
-            markdown.push('\n');
-        }
-        TextUnitRole::DialogueBody => {
-            markdown.push_str("Body ");
-            append_task_id_slot(markdown, task_id);
-            markdown.push_str(" (free line breaking):\n\n");
-            push_blockquote_with_cancellation(markdown, text, cancellation)?;
-        }
-        TextUnitRole::Choices => {
-            markdown.push_str("Choices ");
-            append_task_id_slot(markdown, task_id);
-            markdown.push_str(" (");
-            markdown.push_str(&source_line_count(identity).to_string());
-            markdown.push_str(" items, corresponding item by item):\n\n");
-            push_blockquote_with_cancellation(markdown, text, cancellation)?;
-        }
-        TextUnitRole::ScrollingText => {
-            markdown.push_str("Scrolling Text ");
-            append_task_id_slot(markdown, task_id);
-            markdown.push_str(" (");
-            markdown.push_str(&source_line_count(identity).to_string());
-            markdown.push_str(" lines, corresponding line by line):\n\n");
-            push_blockquote_with_cancellation(markdown, text, cancellation)?;
-        }
-        TextUnitRole::Scalar(_)
-            if expected_line_shape_with_cancellation(identity, cancellation)?
-                == ExpectedLineShape::Reflow =>
-        {
-            markdown.push_str(human_scalar_label(field_name));
-            markdown.push(' ');
-            append_task_id_slot(markdown, task_id);
-            markdown.push_str(" (free line breaking):\n\n");
-            push_blockquote_with_cancellation(markdown, text, cancellation)?;
-        }
-        TextUnitRole::Scalar(_) => {
-            markdown.push_str(human_scalar_label(field_name));
-            markdown.push(' ');
-            append_task_id_slot(markdown, task_id);
-            markdown.push_str(" (single line):");
-            append_planner_text_with_cancellation(markdown, text, cancellation)?;
-            markdown.push('\n');
-        }
-    }
-    ensure_planner_cpu_running(cancellation).map_err(|()| ScopeTaskPlanningFailure::Cancelled)
-}
-
-fn human_scalar_label(field_name: &str) -> &str {
-    match field_name {
-        "name" => "Name",
-        "displayName" => "Map Name",
-        "nickname" => "Nickname",
-        "profile" => "Profile",
-        "description" => "Description",
-        _ => field_name,
-    }
 }
 
 #[cfg(test)]
@@ -1899,31 +1833,17 @@ fn scalar_allows_reflow_with_cancellation(
     ))
 }
 
-fn push_blockquote_with_cancellation(
-    markdown: &mut String,
-    text: &str,
-    cancellation: &CooperativeCancellation,
-) -> Result<(), ScopeTaskPlanningFailure> {
-    for line in text.split('\n') {
-        ensure_planner_cpu_running(cancellation)
-            .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-        markdown.push_str("> ");
-        append_planner_text_with_cancellation(markdown, line, cancellation)?;
-        markdown.push('\n');
-    }
-    ensure_planner_cpu_running(cancellation).map_err(|()| ScopeTaskPlanningFailure::Cancelled)
-}
-
 /// 一次规划运行共享的术语提示词索引。
 ///
-/// `lines` 严格沿用术语文件自然顺序。每一行只做一次 Markdown 转义，Scope 和 Task
-/// 随后只根据已经由 Aho-Corasick 得到的命中下标访问实际需要的行。
+/// `lines` 严格沿用术语文件自然顺序；Task 只根据已经由 Aho-Corasick 得到的命中下标
+/// 借用当前需要的条目，不再次扫描正文。
 struct TerminologyPromptIndex {
     lines: Vec<TerminologyPromptLine>,
 }
 
 struct TerminologyPromptLine {
-    markdown: String,
+    source: String,
+    translation: String,
 }
 
 impl TerminologyPromptIndex {
@@ -1951,73 +1871,30 @@ impl TerminologyPromptIndex {
         for entry in terminology.entries() {
             ensure_planner_cpu_running(cancellation)
                 .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-            let mut markdown = String::new();
-            markdown.push_str("- ");
-            push_markdown_literal_with_cancellation(&mut markdown, entry.term(), cancellation)?;
-            markdown.push_str(" → ");
-            push_markdown_literal_with_cancellation(
-                &mut markdown,
-                entry.translation(),
-                cancellation,
-            )?;
-            markdown.push('\n');
-            lines.push(TerminologyPromptLine { markdown });
+            lines.push(TerminologyPromptLine {
+                source: clone_planner_text_with_cancellation(entry.term(), cancellation)
+                    .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?,
+                translation: clone_planner_text_with_cancellation(
+                    entry.translation(),
+                    cancellation,
+                )
+                .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?,
+            });
         }
         ensure_planner_cpu_running(cancellation)
             .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
         Ok(Self { lines })
     }
-
-    /// 追加自然有序的稀疏命中，并返回实际访问的术语行数供复杂度测试观察。
-    #[cfg(test)]
-    fn append_selected(&self, markdown: &mut String, selected: &BTreeSet<usize>) -> usize {
-        match self.append_selected_with_cancellation(
-            markdown,
-            selected,
-            &CooperativeCancellation::default(),
-        ) {
-            Ok(visited) => visited,
-            Err(ScopeTaskPlanningFailure::Cancelled) => {
-                unreachable!("未请求取消的术语渲染不能取消")
-            }
-            Err(ScopeTaskPlanningFailure::TaskPlanning(_)) => {
-                unreachable!("术语渲染不执行 TaskBlock 规划")
-            }
-            Err(ScopeTaskPlanningFailure::InvalidContract(_)) => {
-                unreachable!("术语渲染不验证输出契约")
-            }
-        }
-    }
-
-    fn append_selected_with_cancellation(
-        &self,
-        markdown: &mut String,
-        selected: &BTreeSet<usize>,
-        cancellation: &CooperativeCancellation,
-    ) -> Result<usize, ScopeTaskPlanningFailure> {
-        for &index in selected {
-            ensure_planner_cpu_running(cancellation)
-                .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-            append_planner_text_with_cancellation(
-                markdown,
-                &self.lines[index].markdown,
-                cancellation,
-            )?;
-        }
-        Ok(selected.len())
-    }
 }
 
 #[cfg(test)]
-fn render_user_markdown(
+fn render_user_json(
     groups: &[RenderedGroup],
-    additional_group: Option<&RenderedGroup>,
     terminology: &TerminologyPromptIndex,
     selected_terms: &BTreeSet<usize>,
 ) -> String {
-    match render_user_markdown_with_cancellation(
+    match render_user_json_with_cancellation(
         groups,
-        additional_group,
         terminology,
         selected_terms,
         &CooperativeCancellation::default(),
@@ -2035,81 +1912,51 @@ fn render_user_markdown(
     }
 }
 
-fn render_user_markdown_with_cancellation(
+fn render_user_json_with_cancellation(
     groups: &[RenderedGroup],
-    additional_group: Option<&RenderedGroup>,
     terminology: &TerminologyPromptIndex,
     selected_terms: &BTreeSet<usize>,
     cancellation: &CooperativeCancellation,
 ) -> Result<String, ScopeTaskPlanningFailure> {
     ensure_planner_cpu_running(cancellation).map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-    let mut markdown = String::new();
-    if !selected_terms.is_empty() {
-        markdown.push_str("Terminology:\n\n");
-        terminology.append_selected_with_cancellation(
-            &mut markdown,
-            selected_terms,
-            cancellation,
-        )?;
+    let mut selected_terminology = Vec::with_capacity(selected_terms.len());
+    for &index in selected_terms {
+        ensure_planner_cpu_running(cancellation)
+            .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
+        let entry = &terminology.lines[index];
+        selected_terminology.push(TranslationUserTerminology::new(
+            &entry.source,
+            &entry.translation,
+        ));
     }
+    let mut wire_groups = Vec::with_capacity(groups.len());
     for group in groups {
         ensure_planner_cpu_running(cancellation)
             .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-        if !markdown.is_empty() {
-            markdown.push('\n');
-        }
-        append_planner_text_with_cancellation(&mut markdown, &group.markdown, cancellation)?;
-    }
-    if let Some(group) = additional_group {
-        ensure_planner_cpu_running(cancellation)
-            .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-        if !markdown.is_empty() {
-            markdown.push('\n');
-        }
-        append_planner_text_with_cancellation(&mut markdown, &group.markdown, cancellation)?;
-    }
-    Ok(markdown)
-}
-
-#[cfg(test)]
-fn push_markdown_literal(markdown: &mut String, value: &str) {
-    match push_markdown_literal_with_cancellation(
-        markdown,
-        value,
-        &CooperativeCancellation::default(),
-    ) {
-        Ok(()) => {}
-        Err(ScopeTaskPlanningFailure::Cancelled) => {
-            unreachable!("未请求取消的 Markdown 转义不能取消")
-        }
-        Err(ScopeTaskPlanningFailure::TaskPlanning(_)) => {
-            unreachable!("Markdown 转义不执行 TaskBlock 规划")
-        }
-        Err(ScopeTaskPlanningFailure::InvalidContract(_)) => {
-            unreachable!("Markdown 转义不验证输出契约")
-        }
-    }
-}
-
-fn push_markdown_literal_with_cancellation(
-    markdown: &mut String,
-    value: &str,
-    cancellation: &CooperativeCancellation,
-) -> Result<(), ScopeTaskPlanningFailure> {
-    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
-    let mut next_check = 0_usize;
-    for (offset, character) in value.char_indices() {
-        if offset >= next_check {
+        let mut units = Vec::with_capacity(group.units.len());
+        for unit in &group.units {
             ensure_planner_cpu_running(cancellation)
                 .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
-            next_check = offset.saturating_add(CANCELLATION_CHECK_BYTES);
+            units.push(match (unit.id, unit.return_type) {
+                (Some(id), Some(return_type)) => TranslationUserUnit::translated(
+                    id,
+                    Some(unit.role.as_str()),
+                    return_type,
+                    unit.text.as_str(),
+                ),
+                (None, None) => {
+                    TranslationUserUnit::context(Some(unit.role.as_str()), unit.text.as_str())
+                }
+                _ => unreachable!("RPG Maker user message 的 ID 与返回类型必须同时出现"),
+            });
         }
-        if character.is_ascii_punctuation() {
-            markdown.push('\\');
-        }
-        markdown.push(character);
+        wire_groups.push(TranslationUserGroup::new(group.kind.storage_name(), units));
     }
-    ensure_planner_cpu_running(cancellation).map_err(|()| ScopeTaskPlanningFailure::Cancelled)
+    render_translation_user_message(
+        &TranslationUserMessage::new(selected_terminology, wire_groups),
+        cancellation,
+    )
+    .map_err(|_| ScopeTaskPlanningFailure::Cancelled)
 }
 
 struct UnindexedTask {
@@ -2124,19 +1971,6 @@ impl UnindexedTask {
         language_pair: LanguagePair,
     ) -> RpgMakerExecutableTask {
         RpgMakerExecutableTask::new(index, language_pair, self.messages, self.expected_outputs)
-    }
-}
-
-const fn human_group_kind(kind: TextGroupKind) -> &'static str {
-    match kind {
-        TextGroupKind::DatabaseEntry => "Database Text",
-        TextGroupKind::System => "System Text",
-        TextGroupKind::Map => "Map Text",
-        TextGroupKind::EventDialogue => "Dialogue",
-        TextGroupKind::EventChoices => "Choices",
-        TextGroupKind::EventScrollingText => "Scrolling Text",
-        TextGroupKind::EventCommand => "Event Command",
-        TextGroupKind::PluginParameter => "Plugin Parameters",
     }
 }
 
@@ -3054,15 +2888,15 @@ mod tests {
     use crate::rpg_maker::translate::profile::{
         ResolvedRpgMakerTranslationResources, RpgMakerSystemPrompt,
         RpgMakerTranslationPlanningConfiguration, RpgMakerTranslationProfile,
-        TranslationResponseEnvelope,
     };
     use crate::translation::planning_resource::{
         TranslationPlanningResourceReadingService, TranslationPlanningResources,
     };
     use crate::translation::profile::TranslationRequestConfiguration;
+    use crate::translation_protocol::TranslationResponseMode;
 
     fn task_id(value: usize) -> TaskId {
-        TaskId::new(value).expect("测试 Task ID 必须非零")
+        TaskId::new(value)
     }
 
     #[derive(Clone, Copy)]
@@ -3101,21 +2935,45 @@ mod tests {
         let system_markdown = "系统提示。".repeat(32 * 1024);
         let language_semantics = Sha256Fingerprint::from_bytes([1; 32]);
         let client_semantics = Sha256Fingerprint::from_bytes([2; 32]);
+        let language_pair = LanguagePair::new(
+            LanguageId::parse("ja").expect("测试源语言应合法"),
+            LanguageId::parse("zh-Hans").expect("测试目标语言应合法"),
+        );
         let expected = global_translation_semantics(
             RpgMakerEngine::Mz,
             "ja",
             "zh-Hans",
             language_semantics,
             &system_markdown,
+            TranslationResponseMode::new(false, false),
             client_semantics,
         );
+        for response_mode in [
+            TranslationResponseMode::new(true, false),
+            TranslationResponseMode::new(false, true),
+            TranslationResponseMode::new(true, true),
+        ] {
+            assert_ne!(
+                global_translation_semantics(
+                    RpgMakerEngine::Mz,
+                    "ja",
+                    "zh-Hans",
+                    language_semantics,
+                    &system_markdown,
+                    response_mode,
+                    client_semantics,
+                ),
+                expected,
+                "响应开关必须独立进入自动译文语义指纹"
+            );
+        }
         let mut polls = 0_usize;
         let actual = global_translation_semantics_with_cancellation(
             RpgMakerEngine::Mz,
-            "ja",
-            "zh-Hans",
+            &language_pair,
             language_semantics,
             &system_markdown,
+            TranslationResponseMode::new(false, false),
             client_semantics,
             || {
                 polls += 1;
@@ -3130,10 +2988,10 @@ mod tests {
         let mut cancellation_polls = 0_usize;
         let cancelled = global_translation_semantics_with_cancellation(
             RpgMakerEngine::Mz,
-            "ja",
-            "zh-Hans",
+            &language_pair,
             language_semantics,
             &system_markdown,
+            TranslationResponseMode::new(false, false),
             client_semantics,
             || {
                 cancellation_polls += 1;
@@ -3487,42 +3345,6 @@ mod tests {
         assert!(!format!("{error:?}").contains(sentinel));
     }
 
-    #[test]
-    fn prompt_protocol_uses_canonical_english_labels() {
-        assert_eq!(
-            [
-                TextGroupKind::DatabaseEntry,
-                TextGroupKind::System,
-                TextGroupKind::Map,
-                TextGroupKind::EventDialogue,
-                TextGroupKind::EventChoices,
-                TextGroupKind::EventScrollingText,
-                TextGroupKind::EventCommand,
-                TextGroupKind::PluginParameter,
-            ]
-            .map(human_group_kind),
-            [
-                "Database Text",
-                "System Text",
-                "Map Text",
-                "Dialogue",
-                "Choices",
-                "Scrolling Text",
-                "Event Command",
-                "Plugin Parameters",
-            ]
-        );
-        for (field_name, expected) in [
-            ("name", "Name"),
-            ("displayName", "Map Name"),
-            ("nickname", "Nickname"),
-            ("profile", "Profile"),
-            ("description", "Description"),
-        ] {
-            assert_eq!(human_scalar_label(field_name), expected);
-        }
-    }
-
     impl LlmClientSemanticIdentity for () {
         fn semantic_fingerprint(&self) -> Sha256Fingerprint {
             Sha256Fingerprint::from_bytes([0x33; 32])
@@ -3602,9 +3424,12 @@ mod tests {
             LanguageId::parse(source_language).expect("测试源语言应合法"),
             LanguageId::parse(target_language).expect("测试目标语言应合法"),
         );
-        let prompt =
-            RpgMakerSystemPrompt::new(pair, system_markdown, TranslationResponseEnvelope::JsonOnly)
-                .expect("测试 Prompt 应合法");
+        let prompt = RpgMakerSystemPrompt::new(
+            pair,
+            system_markdown,
+            TranslationResponseMode::new(false, false),
+        )
+        .expect("测试 Prompt 应合法");
         Arc::new(ResolvedRpgMakerTranslationResources::new(prompt, module))
     }
 
@@ -3630,6 +3455,10 @@ mod tests {
             .find(|message| message.role() == ChatMessageRole::User)
             .expect("任务必须包含 user message")
             .content()
+    }
+
+    fn user_message_json(task: &RpgMakerExecutableTask) -> serde_json::Value {
+        serde_json::from_str(user_message(task)).expect("RPG Maker user message 必须是 JSON")
     }
 
     fn project() -> OpenedProject {
@@ -3759,6 +3588,7 @@ mod tests {
             "zh-Hans",
             source_language.semantic_fingerprint(),
             "# System\n完整且由外部提供。",
+            TranslationResponseMode::new(false, false),
             ().semantic_fingerprint(),
         );
         translation_state_context(global, identity, &protected_text, &bindings, terms)
@@ -4289,13 +4119,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn terminology_values_are_rendered_as_markdown_literals() {
-        let mut markdown = String::new();
-        push_markdown_literal(&mut markdown, r"A*[B] <C> \");
-        assert_eq!(markdown, r"A\*\[B\] \<C\> \\");
-    }
-
     #[tokio::test]
     async fn changed_terminology_invalidates_exact_translation_and_builds_dense_task() {
         let terminology_path = PathBuf::from("C:/input/terms.toml");
@@ -4349,7 +4172,7 @@ mod tests {
         );
         assert_eq!(preparation.invalidated(), 1);
         assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].expected_outputs()[0].id(), task_id(1));
+        assert_eq!(tasks[0].expected_outputs()[0].id(), task_id(0));
         assert_eq!(
             tasks[0].expected_outputs()[0].applied_placeholders().len(),
             1
@@ -4358,10 +4181,13 @@ mod tests {
             tasks[0].messages()[0].content(),
             "# System\n完整且由外部提供。"
         );
+        let user_json = user_message_json(&tasks[0]);
+        assert_eq!(user_json["terminology"][0]["source"], "魔法剣");
+        assert_eq!(user_json["terminology"][0]["translation"], "魔法之剑");
+        assert_eq!(user_json["groups"][0]["units"][0]["id"], "0");
+        assert_eq!(user_json["groups"][0]["units"][0]["role"], "name");
+        assert_eq!(user_json["groups"][0]["units"][0]["type"], "strict");
         let user = tasks[0].messages()[1].content();
-        assert!(user.starts_with("Terminology:\n\n"));
-        assert!(user.contains("- 魔法剣 → 魔法之剑"));
-        assert!(user.contains("Name [1] (single line):"));
         assert!(!user.contains("source_language"));
         assert!(!user.contains("target_language"));
         assert!(!user.contains("data/Items.json"));
@@ -4396,7 +4222,12 @@ mod tests {
             .into_parts();
 
         assert_eq!(tasks.len(), 1);
-        assert!(tasks[0].messages()[1].content().contains(original));
+        let user = user_message_json(&tasks[0]);
+        assert_eq!(
+            user["groups"][0]["units"][0]["text"],
+            serde_json::json!([original]),
+            "未知反斜杠序列必须作为自然文本进入结构化 user message"
+        );
         assert!(
             tasks[0].expected_outputs()[0]
                 .applied_placeholders()
@@ -4515,24 +4346,25 @@ mod tests {
                 .collect::<Vec<_>>(),
             [ExpectedLineShape::Reflow, ExpectedLineShape::Reflow]
         );
-        let prompt = tasks[0].messages()[1].content();
-        for expected in [
-            concat!(
-                "<json>.text[0] [1] (free line breaking):\n",
-                "\n",
-                "> ゲームパッドが接続されていません\n",
-                "> ボタンを押して再度試してください\n",
-            ),
-            concat!(
-                "<json>.text[0] [2] (free line breaking):\n",
-                "\n",
-                "> コンフィグを終了するためには\n",
-                "> ボタンから手を放してください。\n",
-            ),
-        ] {
-            assert!(prompt.contains(expected), "多行标量应使用自由断行契约");
-        }
-        assert!(!prompt.contains("(single line)"));
+        let prompt = user_message_json(&tasks[0]);
+        let units = prompt["groups"]
+            .as_array()
+            .expect("groups 必须是数组")
+            .iter()
+            .flat_map(|group| group["units"].as_array().expect("units 必须是数组"))
+            .collect::<Vec<_>>();
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0]["id"], "0");
+        assert_eq!(units[0]["type"], "free");
+        assert_eq!(
+            units[0]["text"],
+            serde_json::json!([
+                "ゲームパッドが接続されていません",
+                "ボタンを押して再度試してください"
+            ])
+        );
+        assert_eq!(units[1]["id"], "1");
+        assert_eq!(units[1]["type"], "free");
     }
 
     #[tokio::test]
@@ -4679,7 +4511,7 @@ pattern = '\A<Help:(?<text>.*?)>\z'
                 .iter()
                 .map(ExpectedTranslationOutput::id)
                 .collect::<Vec<_>>(),
-            vec![task_id(1), task_id(2), task_id(3), task_id(4), task_id(5)]
+            vec![task_id(0), task_id(1), task_id(2), task_id(3), task_id(4)]
         );
         assert_eq!(
             tasks[0]
@@ -4697,37 +4529,59 @@ pattern = '\A<Help:(?<text>.*?)>\z'
         );
         let user = tasks[0].messages()[1].content();
         assert_eq!(
-            user,
-            concat!(
-                "## Scrolling Text\n",
-                "\n",
-                "Scrolling Text [1] (3 lines, corresponding line by line):\n",
-                "\n",
-                "> 制作\n",
-                "> \n",
-                "> 終わり\n",
-                "\n",
-                "## Choices\n",
-                "\n",
-                "Choices [2] (2 items, corresponding item by item):\n",
-                "\n",
-                "> はい\n",
-                "> いいえ\n",
-                "\n",
-                "## Dialogue\n",
-                "\n",
-                "Speaker [3] (single line):アリス\n",
-                "\n",
-                "Body [4] (free line breaking):\n",
-                "\n",
-                "> 今日はいい天気ですね。\n",
-                "> 一緒に町へ\n",
-                "> 行きませんか？\n",
-                "\n",
-                "## Map Text\n",
-                "\n",
-                "Map Name [5] (single line):始まりの町\n",
-            )
+            serde_json::from_str::<serde_json::Value>(user).expect("user message 必须是 JSON"),
+            serde_json::json!({
+                "groups": [
+                    {
+                        "kind": "event_scrolling_text",
+                        "units": [{
+                            "id": "0",
+                            "role": "scrolling_text",
+                            "type": "strict",
+                            "text": ["制作", "", "終わり"]
+                        }]
+                    },
+                    {
+                        "kind": "event_choices",
+                        "units": [{
+                            "id": "1",
+                            "role": "choices",
+                            "type": "strict",
+                            "text": ["はい", "いいえ"]
+                        }]
+                    },
+                    {
+                        "kind": "event_dialogue",
+                        "units": [
+                            {
+                                "id": "2",
+                                "role": "speaker",
+                                "type": "strict",
+                                "text": ["アリス"]
+                            },
+                            {
+                                "id": "3",
+                                "role": "body",
+                                "type": "free",
+                                "text": [
+                                    "今日はいい天気ですね。",
+                                    "一緒に町へ",
+                                    "行きませんか？"
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        "kind": "map",
+                        "units": [{
+                            "id": "4",
+                            "role": "displayName",
+                            "type": "strict",
+                            "text": ["始まりの町"]
+                        }]
+                    }
+                ]
+            })
         );
     }
 
@@ -4788,6 +4642,7 @@ pattern = '\A<Help:(?<text>.*?)>\z'
             "zh-Hans",
             resources.source_language().semantic_fingerprint(),
             "# System\n完整且由外部提供。",
+            resources.system_prompt().response_mode(),
             ().semantic_fingerprint(),
         );
         let speaker_translation = TextUnitContent::Value("爱丽丝".to_owned());
@@ -4832,11 +4687,17 @@ pattern = '\A<Help:(?<text>.*?)>\z'
 
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].expected_outputs().len(), 1);
-        assert_eq!(tasks[0].expected_outputs()[0].id(), task_id(1));
-        let user = tasks[0].messages()[1].content();
-        assert!(user.contains("Speaker [-] (single line):爱丽丝"));
-        assert!(!user.contains("アリス"));
-        assert!(user.contains("Body [1] (free line breaking):"));
+        assert_eq!(tasks[0].expected_outputs()[0].id(), task_id(0));
+        let user = user_message_json(&tasks[0]);
+        assert_eq!(user["groups"][0]["units"][0]["role"], "speaker");
+        assert_eq!(
+            user["groups"][0]["units"][0]["text"],
+            serde_json::json!(["爱丽丝"])
+        );
+        assert!(user["groups"][0]["units"][0].get("id").is_none());
+        assert_eq!(user["groups"][0]["units"][1]["id"], "0");
+        assert_eq!(user["groups"][0]["units"][1]["role"], "body");
+        assert_eq!(user["groups"][0]["units"][1]["type"], "free");
     }
 
     #[tokio::test]
@@ -4924,15 +4785,29 @@ pattern = '\{[^}]+\}'
 
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].expected_outputs().len(), 1);
-        let user = user_message(&tasks[0]);
+        let user = user_message_json(&tasks[0]);
         assert_eq!(
-            user.matches("- 魔王 → 魔王（Demon King）").count(),
-            1,
+            user["terminology"],
+            serde_json::json!([{
+                "source": "魔王",
+                "translation": "魔王（Demon King）"
+            }]),
             "完整块术语应按文件顺序只提供一次"
         );
-        assert!(user.contains("Name [-] (single line):已有上下文 ⟦ATT_"));
-        assert!(user.contains("Name [1] (single line):こんにちは"));
-        assert!(!user.contains("{hero}"));
+        let context = &user["groups"][0]["units"][0];
+        assert!(context.get("id").is_none());
+        assert!(
+            context["text"][0]
+                .as_str()
+                .expect("语境文本必须是字符串")
+                .starts_with("已有上下文 ⟦ATT_")
+        );
+        assert_eq!(user["groups"][1]["units"][0]["id"], "0");
+        assert_eq!(
+            user["groups"][1]["units"][0]["text"],
+            serde_json::json!(["こんにちは"])
+        );
+        assert!(!user.to_string().contains("{hero}"));
     }
 
     #[tokio::test]
@@ -5014,6 +4889,7 @@ translation = "Hero"
             "zh-Hans",
             resources.source_language().semantic_fingerprint(),
             resources.system_prompt().markdown(),
+            resources.system_prompt().response_mode(),
             ().semantic_fingerprint(),
         );
         let first_translation = TextUnitContent::Value("勇者译文".to_owned());
@@ -5189,13 +5065,34 @@ pattern = '保護対象'
         assert!(preparation.invalidations().is_empty());
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].expected_outputs().len(), 1);
-        let user = user_message(&tasks[0]);
-        assert!(user.contains("Name [-] (single line):人工数字语境 ⟦ATT_"));
-        assert!(user.contains("Name [-] (single line):完整保护语境 ⟦ATT_"));
-        assert!(user.contains("Name [1] (single line):翻訳対象"));
-        assert!(!user.contains("12345 {hero}"));
-        assert!(!user.contains("{hero}"));
-        assert!(!user.contains("保護対象"));
+        let user = user_message_json(&tasks[0]);
+        let units = user["groups"]
+            .as_array()
+            .expect("groups 必须是数组")
+            .iter()
+            .flat_map(|group| group["units"].as_array().expect("units 必须是数组"))
+            .collect::<Vec<_>>();
+        assert_eq!(units.len(), 3);
+        assert!(units[0].get("id").is_none());
+        assert!(
+            units[0]["text"][0]
+                .as_str()
+                .expect("语境文本必须是字符串")
+                .starts_with("人工数字语境 ⟦ATT_")
+        );
+        assert!(units[1].get("id").is_none());
+        assert!(
+            units[1]["text"][0]
+                .as_str()
+                .expect("语境文本必须是字符串")
+                .starts_with("完整保护语境 ⟦ATT_")
+        );
+        assert_eq!(units[2]["id"], "0");
+        assert_eq!(units[2]["text"], serde_json::json!(["翻訳対象"]));
+        let user_text = user.to_string();
+        assert!(!user_text.contains("12345 {hero}"));
+        assert!(!user_text.contains("{hero}"));
+        assert!(!user_text.contains("保護対象"));
     }
 
     #[tokio::test]
@@ -5372,7 +5269,7 @@ pattern = '保護対象'
 
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].expected_outputs().len(), 1);
-        assert_eq!(tasks[0].expected_outputs()[0].id(), task_id(1));
+        assert_eq!(tasks[0].expected_outputs()[0].id(), task_id(0));
         assert!(!tasks[0].messages()[1].content().contains("保護対象"));
         assert!(!tasks[0].messages()[1].content().contains("仅上下文"));
     }
@@ -5447,15 +5344,21 @@ pattern = '保護対象'
             .expect("自然段术语应可建立任务")
             .into_parts();
 
-        let user = tasks[0].messages()[1].content();
-        assert!(user.contains("- 勇者 → 英雄"));
-        assert!(user.contains("- プフクスッ → 噗呼咯"));
-        assert!(
-            !user.contains("- プフクス → 普芙库丝"),
-            "同一起点被最长 trigger 抑制的姓名术语不得进入 Prompt"
+        let user = user_message_json(&tasks[0]);
+        assert_eq!(
+            user["terminology"],
+            serde_json::json!([
+                {
+                    "source": "勇者",
+                    "translation": "英雄"
+                },
+                {
+                    "source": "プフクスッ",
+                    "translation": "噗呼咯"
+                }
+            ]),
+            "术语数组必须只包含自然文本段实际命中的条目，并保持术语文件顺序"
         );
-        assert!(!user.contains("- 秘密 →"), "协议壳不得触发术语");
-        assert!(!user.contains("- 前後 →"), "术语不得跨不透明边界拼接");
     }
 
     #[tokio::test]
@@ -5565,14 +5468,21 @@ pattern = '保護対象'
             .find(|output| output.identity() == &natural_leader)
             .expect("Reader 自然顺序中的首个重复单元应成为代表");
         assert_eq!(deduplicated.propagation_targets(), &[last_duplicate]);
-        let user = tasks[0].messages()[1].content();
+        let user = user_message_json(&tasks[0]);
+        let duplicate_units = user["groups"]
+            .as_array()
+            .expect("groups 必须是数组")
+            .iter()
+            .flat_map(|group| group["units"].as_array().expect("units 必须是数组"))
+            .filter(|unit| unit["text"] == serde_json::json!(["保存しますか？"]))
+            .collect::<Vec<_>>();
         assert_eq!(
-            user.matches("保存しますか？").count(),
+            duplicate_units.len(),
             2,
             "去重只合并模型责任，不能从完整 TaskBlock 删除重复原文语境"
         );
-        assert!(user.contains("Name [2] (single line):保存しますか？"));
-        assert!(user.contains("Name [-] (single line):保存しますか？"));
+        assert!(duplicate_units.iter().any(|unit| unit["id"] == "1"));
+        assert!(duplicate_units.iter().any(|unit| unit.get("id").is_none()));
         assert_eq!(tasks[0].expected_outputs().len(), 2);
     }
 
@@ -5901,7 +5811,7 @@ pattern = '保護対象'
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].expected_outputs().len(), 1);
         let output = &tasks[0].expected_outputs()[0];
-        assert_eq!(output.id(), task_id(1));
+        assert_eq!(output.id(), task_id(0));
         assert_eq!(
             output.identity().group_location().source(),
             &RpgMakerSource::map(2)
@@ -5911,7 +5821,12 @@ pattern = '保護対象'
             output.propagation_targets()[0].group_location().source(),
             &RpgMakerSource::map(1)
         );
-        assert!(user_message(&tasks[0]).contains("Name [1] (single line):重複テキスト"));
+        let user = user_message_json(&tasks[0]);
+        assert_eq!(user["groups"][0]["units"][0]["id"], "0");
+        assert_eq!(
+            user["groups"][0]["units"][0]["text"],
+            serde_json::json!(["重複テキスト"])
+        );
         assert!(!user_message(&tasks[0]).contains("翻訳<BAD>"));
     }
 
@@ -6002,8 +5917,8 @@ pattern = '保護対象'
             .into_parts();
 
         assert_eq!(split.len(), 2);
-        assert_eq!(split[0].expected_outputs()[0].id(), task_id(1));
-        assert_eq!(split[1].expected_outputs()[0].id(), task_id(1));
+        assert_eq!(split[0].expected_outputs()[0].id(), task_id(0));
+        assert_eq!(split[1].expected_outputs()[0].id(), task_id(0));
     }
 
     #[tokio::test]
@@ -6131,7 +6046,7 @@ pattern = '保護対象'
             .map(|task| {
                 let outputs = task.expected_outputs();
                 assert_eq!(outputs.len(), 1);
-                assert_eq!(outputs[0].id(), task_id(1));
+                assert_eq!(outputs[0].id(), task_id(0));
                 outputs[0].protected_text()
             })
             .collect::<Vec<_>>();
@@ -6162,21 +6077,17 @@ pattern = '保護対象'
         let prompt = TerminologyPromptIndex::new(&terminology);
         let selected = [4_095, 1, 2_048].into_iter().collect::<BTreeSet<_>>();
 
-        let mut sparse_lines = String::new();
-        let visited = prompt.append_selected(&mut sparse_lines, &selected);
-        assert_eq!(visited, 3, "渲染工作量必须只随实际命中数增长");
-        assert_eq!(
-            sparse_lines,
-            concat!(
-                "- 术语\\-0001\\-末 → 译文\\-0001\\-末\n",
-                "- 术语\\-2048\\-末 → 译文\\-2048\\-末\n",
-                "- 术语\\-4095\\-末 → 译文\\-4095\\-末\n",
-            ),
-            "稀疏索引不得改变术语文件自然顺序或 Markdown 转义"
-        );
-
-        let rendered = render_user_markdown(&[], None, &prompt, &selected);
-        assert_eq!(rendered, format!("Terminology:\n\n{sparse_lines}"));
+        let rendered = render_user_json(&[], &prompt, &selected);
+        let value: serde_json::Value =
+            serde_json::from_str(&rendered).expect("术语 user message 必须是 JSON");
+        let terms = value["terminology"]
+            .as_array()
+            .expect("命中的术语必须形成数组");
+        assert_eq!(terms.len(), 3, "只应渲染实际命中的术语");
+        assert_eq!(terms[0]["source"], "术语-0001-末");
+        assert_eq!(terms[1]["source"], "术语-2048-末");
+        assert_eq!(terms[2]["source"], "术语-4095-末");
+        assert_eq!(terms[2]["translation"], "译文-4095-末");
     }
 
     #[tokio::test]

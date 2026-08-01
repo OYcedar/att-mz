@@ -32,7 +32,9 @@ use crate::translation::task_planning::TaskId;
 pub(crate) use crate::translation::task_record::{
     ConfiguredTranslationTaskRecordSink, MarkdownTranslationTaskRecordSink,
 };
-use crate::translation::task_record::{TranslationTaskRecordArtifact, render_task_record_attempt};
+use crate::translation::task_record::{
+    TranslationTaskRecordArtifact, markdown_fence, render_raw_assistant, render_task_record_attempt,
+};
 #[cfg(test)]
 pub(crate) use crate::translation_protocol::TranslationTaskResponseJsonErrorCategory;
 pub(crate) use crate::translation_protocol::{
@@ -49,6 +51,14 @@ use super::pipeline::{
 pub(crate) enum TranslationAssistantValueError {
     NotStringArray,
     NonStringItem { item: NonZeroUsize },
+    SourceEchoNotObject,
+    SourceEchoMissingSource,
+    SourceEchoMissingTranslation,
+    SourceEchoDuplicateSource,
+    SourceEchoDuplicateTranslation,
+    SourceEchoUnexpectedField,
+    SourceNotStringArray,
+    SourceNonStringItem { item: NonZeroUsize },
 }
 
 impl TranslationAssistantValueError {
@@ -56,6 +66,20 @@ impl TranslationAssistantValueError {
         match self {
             Self::NotStringArray => "译文必须是字符串数组".to_owned(),
             Self::NonStringItem { item } => format!("译文数组第 {item} 项必须是字符串"),
+            Self::SourceEchoNotObject => "原文回显模式下，每个 ID 的值必须是对象".to_owned(),
+            Self::SourceEchoMissingSource => "原文回显对象缺少 source 字段".to_owned(),
+            Self::SourceEchoMissingTranslation => "原文回显对象缺少 translation 字段".to_owned(),
+            Self::SourceEchoDuplicateSource => "原文回显对象包含重复的 source 字段".to_owned(),
+            Self::SourceEchoDuplicateTranslation => {
+                "原文回显对象包含重复的 translation 字段".to_owned()
+            }
+            Self::SourceEchoUnexpectedField => {
+                "原文回显对象包含 source 和 translation 之外的字段".to_owned()
+            }
+            Self::SourceNotStringArray => "原文回显的 source 必须是字符串数组".to_owned(),
+            Self::SourceNonStringItem { item } => {
+                format!("原文回显的 source 数组第 {item} 项必须是字符串")
+            }
         }
     }
 }
@@ -855,6 +879,13 @@ fn render_translation_task_record(
                 "text",
             ));
         }
+        if response.thinking.is_some() && response.ordered_entries.is_some() {
+            output.push_str("\n## Raw Assistant\n\n");
+            output.push_str(&render_raw_assistant(
+                &response.raw_assistant,
+                api_key_redactor,
+            ));
+        }
     }
 
     let _ = write!(
@@ -1065,6 +1096,14 @@ fn rejection_reason(
             Some(TranslationAssistantValueError::NonStringItem { item }) => {
                 ("invalid_shape_item", item.get(), 0, 0, String::new(), "")
             }
+            Some(error) => (
+                "invalid_shape",
+                0,
+                0,
+                0,
+                markdown_inline_code(&error.business_message()),
+                "",
+            ),
             None => (
                 "invalid_shape",
                 0,
@@ -1248,28 +1287,6 @@ fn markdown_inline_code(value: &str) -> String {
     }
 }
 
-fn markdown_fence(content: &str, language: &str) -> String {
-    let mut longest = 0usize;
-    let mut current = 0usize;
-    for byte in content.bytes() {
-        if byte == b'`' {
-            current += 1;
-            longest = longest.max(current);
-        } else {
-            current = 0;
-        }
-    }
-    let fence = "`".repeat(longest.saturating_add(1).max(3));
-    let mut output = format!("{fence}{language}\n");
-    output.push_str(content);
-    if !content.ends_with('\n') {
-        output.push('\n');
-    }
-    output.push_str(&fence);
-    output.push('\n');
-    output
-}
-
 fn recorded_at_utc(now: OffsetDateTime) -> String {
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
@@ -1344,7 +1361,7 @@ mod tests {
         TranslationStateContext, TranslationTaskOutcomeContext, TranslationUnitIdentity,
         UnresolvedTranslationUnit,
     };
-    use super::super::profile::TranslationResponseEnvelope;
+    use super::super::profile::TranslationResponseMode;
 
     fn language_pair() -> LanguagePair {
         LanguagePair::new(
@@ -1354,7 +1371,7 @@ mod tests {
     }
 
     fn task_id(value: usize) -> TaskId {
-        TaskId::new(value).expect("测试 Task ID 必须非零")
+        TaskId::new(value)
     }
 
     fn test_identity(index: usize) -> TranslationUnitIdentity {
@@ -1403,9 +1420,9 @@ mod tests {
             final_response: FinalLlmResponseMetadata::new(None, None, "stop", None),
             accepted: NonEmptyTaskItems::new(
                 AcceptedTranslationDecision::new(
-                    task_id(1),
+                    task_id(0),
                     TranslationPatch::new(
-                        test_identity(1),
+                        test_identity(0),
                         Vec::new(),
                         TextUnitContent::Value("公主".to_owned()),
                         Sha256Fingerprint::from_bytes([0x22; 32]),
@@ -1426,9 +1443,9 @@ mod tests {
             final_response: FinalLlmResponseMetadata::new(None, None, "stop", None),
             accepted: NonEmptyTaskItems::new(
                 AcceptedTranslationDecision::new(
-                    task_id(1),
+                    task_id(0),
                     TranslationPatch::new(
-                        test_identity(1),
+                        test_identity(0),
                         Vec::new(),
                         TextUnitContent::Value("公主".to_owned()),
                         Sha256Fingerprint::from_bytes([0x33; 32]),
@@ -1438,7 +1455,7 @@ mod tests {
             ),
             unresolved: NonEmptyTaskItems::new(
                 UnresolvedTranslationUnit::new(
-                    task_id(2),
+                    task_id(1),
                     0,
                     TranslationUnitRejectionReason::Missing,
                 ),
@@ -1458,7 +1475,7 @@ mod tests {
             reason: TranslationTaskUnavailableReason::AllOutputsRejected,
             unresolved: NonEmptyTaskItems::new(
                 UnresolvedTranslationUnit::new(
-                    task_id(1),
+                    task_id(0),
                     0,
                     TranslationUnitRejectionReason::Missing,
                 ),
@@ -1531,7 +1548,7 @@ mod tests {
                 "raw".to_owned(),
                 Some("先核对占位符，再翻译。".to_owned()),
                 vec![TranslationAssistantEntry::new(
-                    "1".to_owned(),
+                    "0".to_owned(),
                     json!(["公主", "第二行"]),
                 )],
             )),
@@ -1597,12 +1614,18 @@ mod tests {
 
 ## Assistant
 
-### ID 1
+### ID 0
 
 公主
 
 第二行
 
+
+## Raw Assistant
+
+```json
+raw
+```
 
 ## 最终结果
 
@@ -1613,10 +1636,10 @@ mod tests {
 
     #[test]
     fn duplicate_unknown_invalid_and_missing_ids_remain_readable_without_json_shell() {
-        let accepted_identity = test_identity(1);
+        let accepted_identity = test_identity(0);
         let accepted_translation = TextUnitContent::Value("公主".to_owned());
         let accepted = AcceptedTranslationDecision::new(
-            task_id(1),
+            task_id(0),
             TranslationPatch::new(
                 accepted_identity,
                 Vec::new(),
@@ -1640,12 +1663,12 @@ mod tests {
             accepted: NonEmptyTaskItems::new(accepted, Vec::new()),
             unresolved: NonEmptyTaskItems::new(
                 UnresolvedTranslationUnit::new(
-                    task_id(2),
+                    task_id(1),
                     0,
                     TranslationUnitRejectionReason::Duplicate,
                 ),
                 vec![UnresolvedTranslationUnit::new(
-                    task_id(3),
+                    task_id(2),
                     0,
                     TranslationUnitRejectionReason::Missing,
                 )],
@@ -1655,7 +1678,7 @@ mod tests {
             RpgMakerTranslationTaskIndex::new(0),
             language_pair(),
             Vec::new(),
-            (1..=3).map(test_expected_output).collect(),
+            (0..3).map(test_expected_output).collect(),
         );
         let document = TranslationTaskRecordDocument::new(
             1,
@@ -1665,12 +1688,12 @@ mod tests {
                 Duration::ZERO,
                 Vec::new(),
                 Some(TranslationTaskResponseRecord::parsed(
-                    r#"{"1":["第一版"],"1":["第二版"],"99":["未知"],"bad":{"raw":true}}"#
+                    r#"{"0":["第一版"],"0":["第二版"],"99":["未知"],"bad":{"raw":true}}"#
                         .to_owned(),
                     None,
                     vec![
-                        TranslationAssistantEntry::new("1".to_owned(), json!(["第一版"])),
-                        TranslationAssistantEntry::new("1".to_owned(), json!(["第二版"])),
+                        TranslationAssistantEntry::new("0".to_owned(), json!(["第一版"])),
+                        TranslationAssistantEntry::new("0".to_owned(), json!(["第二版"])),
                         TranslationAssistantEntry::new("99".to_owned(), json!(["未知"])),
                         TranslationAssistantEntry::new("bad".to_owned(), json!({"raw": true})),
                     ],
@@ -1692,13 +1715,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             headings,
-            ["### ID 1", "### ID 1", "### ID 99", "### ID bad"],
+            ["### ID 0", "### ID 0", "### ID 99", "### ID bad"],
             "Assistant 必须完整保持重复、未知和非法 ID 的原始条目顺序"
         );
         assert!(markdown.contains("```json\n{\"raw\":true}\n```"));
         assert!(markdown.contains("- 状态：部分完成，已确认提交"));
-        assert!(markdown.contains("  - `2`：重复模型输出"));
-        assert!(markdown.contains("  - `3`：缺少模型输出"));
+        assert!(markdown.contains("  - `1`：重复模型输出"));
+        assert!(markdown.contains("  - `2`：缺少模型输出"));
         assert!(markdown.contains("协议诊断：模型第 3 个条目返回了未知 ID `99`"));
         assert!(markdown.contains("协议诊断：模型第 4 个条目的 ID 非法"));
         assert!(!markdown.contains("## Assistant\n\n```json"));
@@ -1706,7 +1729,7 @@ mod tests {
 
     #[test]
     fn invalid_assistant_uses_dynamic_fence_and_keeps_one_precise_error() {
-        let raw = "```json\n{\"1\":[\"译文\"]}\n```\n尾部";
+        let raw = "```json\n{\"0\":[\"译文\"]}\n```\n尾部";
         let document = document(
             Vec::new(),
             Vec::new(),
@@ -1732,7 +1755,7 @@ mod tests {
 
         assert_eq!(markdown.matches("> 解析错误：").count(), 1);
         assert!(markdown.contains("第 4 行、第 1 列"));
-        assert!(markdown.contains("````text\n```json\n{\"1\":[\"译文\"]}\n```\n尾部\n````"));
+        assert!(markdown.contains("````text\n```json\n{\"0\":[\"译文\"]}\n```\n尾部\n````"));
 
         let english = render_task_record(
             "run-invalid",
@@ -1771,7 +1794,7 @@ mod tests {
     #[test]
     fn invalid_response_parse_error_is_rendered_once_for_the_real_unavailable_outcome() {
         let parse_error = "模型响应 JSON 无效：类别 syntax，第 4 行、第 1 列";
-        let unresolved = (1..=2)
+        let unresolved = (0..2)
             .map(|id| {
                 UnresolvedTranslationUnit::new(
                     task_id(id),
@@ -1803,7 +1826,7 @@ mod tests {
                 RpgMakerTranslationTaskIndex::new(0),
                 language_pair(),
                 Vec::new(),
-                (1..=2).map(test_expected_output).collect(),
+                (0..2).map(test_expected_output).collect(),
             ),
             TranslationTaskExecutionEvidence::new(
                 OffsetDateTime::UNIX_EPOCH,
@@ -1840,8 +1863,8 @@ mod tests {
         assert!(markdown.contains("- 状态：不可用，项目未改变"));
         assert!(markdown.contains("- 不可用原因：模型响应无法解析"));
         assert!(markdown.contains("- 未接受："));
+        assert!(markdown.contains("  - `0`：模型响应无法解析"));
         assert!(markdown.contains("  - `1`：模型响应无法解析"));
-        assert!(markdown.contains("  - `2`：模型响应无法解析"));
         assert!(!markdown.contains("- 协议诊断："));
     }
 
@@ -1976,7 +1999,7 @@ mod tests {
             RpgMakerTranslationTaskIndex::new(0),
             language_pair(),
             Vec::new(),
-            vec![test_expected_output(1)],
+            vec![test_expected_output(0)],
         );
         let document = TranslationTaskRecordDocument::new(
             1,
@@ -2144,6 +2167,11 @@ mod tests {
             Some(format!("{NEIGHBOR}:{KEY}")),
             None,
         );
+        let raw_assistant = json!({
+            "think": format!("``` {NEIGHBOR}:{KEY}"),
+            "translations": {}
+        })
+        .to_string();
         let document = document(
             vec![
                 ChatMessage::new(ChatMessageRole::System, format!("System {NEIGHBOR}:{KEY}")),
@@ -2162,7 +2190,7 @@ mod tests {
                 ),
             ],
             Some(TranslationTaskResponseRecord::parsed(
-                format!("Raw {NEIGHBOR}:{KEY}"),
+                raw_assistant,
                 Some(format!("Thinking {NEIGHBOR}:{KEY}")),
                 vec![TranslationAssistantEntry::new(
                     format!("{NEIGHBOR}:{KEY}"),
@@ -2217,6 +2245,10 @@ mod tests {
             markdown.matches(NEIGHBOR).count() >= 12,
             "普通相邻文本不得随 API key 一起删除"
         );
+        assert!(
+            markdown.contains("## Raw Assistant\n\n````json\n"),
+            "thinking 成功响应应以安全动态围栏保留脱敏后的原始 JSON"
+        );
     }
 
     #[test]
@@ -2231,9 +2263,9 @@ mod tests {
             "[".repeat(DEPTH),
             "]".repeat(DEPTH)
         );
-        let raw_assistant = format!(r#"{{"1":{raw_json}}}"#);
+        let raw_assistant = format!(r#"{{"0":{raw_json}}}"#);
         let parsed =
-            parse_translation_response(&raw_assistant, TranslationResponseEnvelope::JsonOnly)
+            parse_translation_response(&raw_assistant, TranslationResponseMode::new(false, false))
                 .expect("深层测试值必须是合法 JSON");
         let (_, mut entries) = parsed.into_parts();
         let (_, raw_value, _) = entries
@@ -2244,9 +2276,9 @@ mod tests {
             raw_assistant,
             None,
             vec![TranslationAssistantEntry::projected(
-                "1".to_owned(),
+                "0".to_owned(),
                 TranslationAssistantRecordedValue::RawJson(raw_value),
-                Some(task_id(1)),
+                Some(task_id(0)),
                 Some(TranslationAssistantValueError::NonStringItem {
                     item: NonZeroUsize::MIN,
                 }),
@@ -2278,7 +2310,7 @@ mod tests {
         )
         .expect("深层 RawJson 任务记录应可渲染");
         let assistant = markdown
-            .split_once("### ID 1\n\n")
+            .split_once("### ID 0\n\n")
             .expect("记录必须包含测试 ID")
             .1;
         let fenced = assistant
@@ -2300,9 +2332,9 @@ mod tests {
         const KEY: &str = "api`key";
         const NEIGHBOR: &str = "ordinary``marker";
         let accepted = AcceptedTranslationDecision::new(
-            task_id(1),
+            task_id(0),
             TranslationPatch::new(
-                test_identity(1),
+                test_identity(0),
                 Vec::new(),
                 TextUnitContent::Value("公主".to_owned()),
                 Sha256Fingerprint::from_bytes([0x22; 32]),
@@ -2330,7 +2362,7 @@ mod tests {
             accepted: NonEmptyTaskItems::new(accepted, Vec::new()),
             unresolved: NonEmptyTaskItems::new(
                 UnresolvedTranslationUnit::new(
-                    task_id(2),
+                    task_id(1),
                     0,
                     TranslationUnitRejectionReason::SourceResidual {
                         fragment: format!("{NEIGHBOR}:{KEY}\nsource"),
@@ -2338,14 +2370,14 @@ mod tests {
                 ),
                 vec![
                     UnresolvedTranslationUnit::new(
-                        task_id(3),
+                        task_id(2),
                         0,
                         TranslationUnitRejectionReason::PlaceholderMismatch {
                             token: format!("{NEIGHBOR}:{KEY}"),
                         },
                     ),
                     UnresolvedTranslationUnit::new(
-                        task_id(4),
+                        task_id(3),
                         0,
                         TranslationUnitRejectionReason::InvalidShape {
                             message: format!("{NEIGHBOR}:{KEY}\nshape"),
@@ -2360,7 +2392,7 @@ mod tests {
                 RpgMakerTranslationTaskIndex::new(0),
                 language_pair(),
                 Vec::new(),
-                (1..=4).map(test_expected_output).collect(),
+                (0..4).map(test_expected_output).collect(),
             ),
             TranslationTaskExecutionEvidence::new(
                 OffsetDateTime::UNIX_EPOCH,
@@ -2457,6 +2489,14 @@ mod tests {
     #[test]
     fn response_value_error_index_keeps_only_unique_canonical_ids() {
         let unique = TranslationAssistantEntry::projected(
+            "0".to_owned(),
+            TranslationAssistantRecordedValue::RawJson(
+                RawValue::from_string("{}".to_owned()).expect("测试 JSON 应合法"),
+            ),
+            Some(task_id(0)),
+            Some(TranslationAssistantValueError::NotStringArray),
+        );
+        let duplicate_first = TranslationAssistantEntry::projected(
             "1".to_owned(),
             TranslationAssistantRecordedValue::RawJson(
                 RawValue::from_string("{}".to_owned()).expect("测试 JSON 应合法"),
@@ -2464,20 +2504,12 @@ mod tests {
             Some(task_id(1)),
             Some(TranslationAssistantValueError::NotStringArray),
         );
-        let duplicate_first = TranslationAssistantEntry::projected(
-            "2".to_owned(),
-            TranslationAssistantRecordedValue::RawJson(
-                RawValue::from_string("{}".to_owned()).expect("测试 JSON 应合法"),
-            ),
-            Some(task_id(2)),
-            Some(TranslationAssistantValueError::NotStringArray),
-        );
         let duplicate_second = TranslationAssistantEntry::projected(
-            "02".to_owned(),
+            "1".to_owned(),
             TranslationAssistantRecordedValue::RawJson(
                 RawValue::from_string("[]".to_owned()).expect("测试 JSON 应合法"),
             ),
-            Some(task_id(2)),
+            Some(task_id(1)),
             Some(TranslationAssistantValueError::NonStringItem {
                 item: NonZeroUsize::MIN,
             }),
@@ -2495,11 +2527,11 @@ mod tests {
 
         let errors = response_value_errors_by_id(&document);
         assert_eq!(
-            errors.get(&task_id(1)).copied().flatten(),
+            errors.get(&task_id(0)).copied().flatten(),
             Some(TranslationAssistantValueError::NotStringArray)
         );
-        assert_eq!(errors.get(&task_id(2)).copied().flatten(), None);
-        assert_eq!(errors.get(&task_id(3)), None);
+        assert_eq!(errors.get(&task_id(1)).copied().flatten(), None);
+        assert_eq!(errors.get(&task_id(2)), None);
     }
 
     #[tokio::test]

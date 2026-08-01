@@ -26,7 +26,7 @@ const MV_BODY_TRANSLATION: &str = "你好，世界！";
 const RULES_SHORT_SOURCE: &str = "ポーション";
 const RULES_SHORT_TRANSLATION: &str = "治疗药水";
 const RULES_LONG_SOURCE: &str = "高級ポーション";
-const THINKING_PROMPT: &str = "Explain the checks inside the required why envelope.";
+const THINKING_PROMPT: &str = "在 think 中写出影响译文的判断。";
 const THINKING_SENTINEL: &str = "PRIVATE_THINKING_SENTINEL";
 const PARTIAL_RETRY_SOURCES: [&str; 4] = [
     "春の便りです",
@@ -229,11 +229,14 @@ fn same_named_mv_mz_and_generic_projects_remain_isolated_across_real_processes()
         .as_array()
         .expect("请求必须包含 messages 数组");
     assert_eq!(messages.len(), 2, "一次翻译请求只应包含 system 与 user");
-    assert!(
+    let user_message = parse_user_message(
         messages[1]["content"]
             .as_str()
-            .is_some_and(|content| content.contains(SOURCE_TEXT)),
-        "模型 user message 必须包含待译原文"
+            .expect("模型 user message 必须是字符串"),
+    );
+    assert!(
+        user_message_texts(&user_message).contains(&SOURCE_TEXT),
+        "模型 user message 必须在 JSON text 数组中包含待译原文"
     );
     assert!(
         messages[0]["content"]
@@ -246,6 +249,8 @@ fn same_named_mv_mz_and_generic_projects_remain_isolated_across_real_processes()
     assert!(task_record.contains("## Thinking"));
     assert!(task_record.contains(THINKING_SENTINEL));
     assert!(task_record.contains("## Assistant"));
+    assert!(task_record.contains("## Raw Assistant"));
+    assert!(task_record.contains("\"translations\""));
     assert!(task_record.contains("## 最终结果"));
     assert!(
         !String::from_utf8_lossy(&translate.stdout).contains(THINKING_SENTINEL)
@@ -328,11 +333,11 @@ fn mz_partial_retry_reuses_the_complete_task_block_across_real_processes() {
         serve_two_responses(
             listener,
             json!({
-                "1": [PARTIAL_RETRY_TRANSLATIONS[0]],
-                "3": [PARTIAL_RETRY_TRANSLATIONS[2]],
-                "4": [PARTIAL_RETRY_TRANSLATIONS[3]]
+                "0": [PARTIAL_RETRY_TRANSLATIONS[0]],
+                "2": [PARTIAL_RETRY_TRANSLATIONS[2]],
+                "3": [PARTIAL_RETRY_TRANSLATIONS[3]]
             }),
-            json!({ "1": [PARTIAL_RETRY_TRANSLATIONS[1]] }),
+            json!({ "0": [PARTIAL_RETRY_TRANSLATIONS[1]] }),
         )
     });
 
@@ -368,6 +373,14 @@ fn mz_partial_retry_reuses_the_complete_task_block_across_real_processes() {
         1,
         "首次 Partial 必须建立一份任务记录"
     );
+    assert!(
+        first_task_records[0]
+            .1
+            .contains("# 翻译任务 000001 · 部分完成")
+    );
+    assert!(first_task_records[0].1.contains("## Thinking"));
+    assert!(first_task_records[0].1.contains("## Raw Assistant"));
+    assert!(first_task_records[0].1.contains("\"translations\""));
     let first_run_id = first_task_records[0].0.clone();
 
     assert_success(
@@ -386,12 +399,12 @@ fn mz_partial_retry_reuses_the_complete_task_block_across_real_processes() {
         .as_str()
         .expect("MZ 首次请求 user message 必须是字符串");
     assert_eq!(
-        first_user,
+        parse_user_message(first_user),
         expected_rpg_maker_description_user_message(&[
-            (PARTIAL_RETRY_SOURCES[0], Some(1)),
-            (PARTIAL_RETRY_SOURCES[1], Some(2)),
-            (PARTIAL_RETRY_SOURCES[2], Some(3)),
-            (PARTIAL_RETRY_SOURCES[3], Some(4)),
+            (PARTIAL_RETRY_SOURCES[0], Some(0)),
+            (PARTIAL_RETRY_SOURCES[1], Some(1)),
+            (PARTIAL_RETRY_SOURCES[2], Some(2)),
+            (PARTIAL_RETRY_SOURCES[3], Some(3)),
         ]),
         "首次请求必须按 A、B、C、D 的自然顺序发送完整 TaskBlock"
     );
@@ -399,14 +412,14 @@ fn mz_partial_retry_reuses_the_complete_task_block_across_real_processes() {
         .as_str()
         .expect("MZ 第二次请求 user message 必须是字符串");
     assert_eq!(
-        second_user,
+        parse_user_message(second_user),
         expected_rpg_maker_description_user_message(&[
             (PARTIAL_RETRY_TRANSLATIONS[0], None),
-            (PARTIAL_RETRY_SOURCES[1], Some(1)),
+            (PARTIAL_RETRY_SOURCES[1], Some(0)),
             (PARTIAL_RETRY_TRANSLATIONS[2], None),
             (PARTIAL_RETRY_TRANSLATIONS[3], None),
         ]),
-        "第二次请求必须保留原 TaskBlock，并只给 B 分配 [1]"
+        "第二次请求必须保留原 TaskBlock，并只给 B 分配 ID 0"
     );
 
     let task_records = read_task_records_sharing_log_run_ids(&workspace);
@@ -475,11 +488,11 @@ fn generic_partial_retry_reuses_the_complete_task_block_across_real_processes() 
         serve_two_responses(
             listener,
             json!({
-                "1": PARTIAL_RETRY_TRANSLATIONS[0],
-                "3": PARTIAL_RETRY_TRANSLATIONS[2],
-                "4": PARTIAL_RETRY_TRANSLATIONS[3]
+                "0": [PARTIAL_RETRY_TRANSLATIONS[0]],
+                "2": [PARTIAL_RETRY_TRANSLATIONS[2]],
+                "3": [PARTIAL_RETRY_TRANSLATIONS[3]]
             }),
-            json!({ "1": PARTIAL_RETRY_TRANSLATIONS[1] }),
+            json!({ "0": [PARTIAL_RETRY_TRANSLATIONS[1]] }),
         )
     });
 
@@ -510,6 +523,14 @@ fn generic_partial_retry_reuses_the_complete_task_block_across_real_processes() 
         1,
         "首次 Generic Partial 必须建立一份任务记录"
     );
+    assert!(
+        first_task_records[0]
+            .1
+            .contains("# 翻译任务 000001 · 部分完成")
+    );
+    assert!(first_task_records[0].1.contains("## Thinking"));
+    assert!(first_task_records[0].1.contains("## Raw Assistant"));
+    assert!(first_task_records[0].1.contains("\"translations\""));
     let first_run_id = first_task_records[0].0.clone();
 
     assert_success(
@@ -528,12 +549,12 @@ fn generic_partial_retry_reuses_the_complete_task_block_across_real_processes() 
         .as_str()
         .expect("Generic 首次请求 user message 必须是字符串");
     assert_eq!(
-        first_user,
+        parse_user_message(first_user),
         expected_generic_user_message(&[
-            (PARTIAL_RETRY_SOURCES[0], Some(1)),
-            (PARTIAL_RETRY_SOURCES[1], Some(2)),
-            (PARTIAL_RETRY_SOURCES[2], Some(3)),
-            (PARTIAL_RETRY_SOURCES[3], Some(4)),
+            (PARTIAL_RETRY_SOURCES[0], Some(0)),
+            (PARTIAL_RETRY_SOURCES[1], Some(1)),
+            (PARTIAL_RETRY_SOURCES[2], Some(2)),
+            (PARTIAL_RETRY_SOURCES[3], Some(3)),
         ]),
         "首次 Generic 请求必须按 A、B、C、D 的自然顺序发送完整 TaskBlock"
     );
@@ -541,14 +562,14 @@ fn generic_partial_retry_reuses_the_complete_task_block_across_real_processes() 
         .as_str()
         .expect("Generic 第二次请求 user message 必须是字符串");
     assert_eq!(
-        second_user,
+        parse_user_message(second_user),
         expected_generic_user_message(&[
             (PARTIAL_RETRY_TRANSLATIONS[0], None),
-            (PARTIAL_RETRY_SOURCES[1], Some(1)),
+            (PARTIAL_RETRY_SOURCES[1], Some(0)),
             (PARTIAL_RETRY_TRANSLATIONS[2], None),
             (PARTIAL_RETRY_TRANSLATIONS[3], None),
         ]),
-        "第二次 Generic 请求必须保留原 TaskBlock，并只给 B 分配 [1]"
+        "第二次 Generic 请求必须保留原 TaskBlock，并只给 B 分配 ID 0"
     );
 
     let task_records = read_task_records_sharing_log_run_ids(&workspace);
@@ -835,8 +856,8 @@ fn mv_dialogue_crosses_extract_translate_and_write_back_processes() {
         serve_one_response(
             listener,
             json!({
-                "1": [MV_SPEAKER_TRANSLATION],
-                "2": [MV_BODY_TRANSLATION]
+                "0": [MV_SPEAKER_TRANSLATION],
+                "1": [MV_BODY_TRANSLATION]
             }),
         )
     });
@@ -851,16 +872,15 @@ fn mv_dialogue_crosses_extract_translate_and_write_back_processes() {
         .join()
         .expect("MV 对话模型服务线程不得 panic")
         .expect("MV 对话模型服务必须完成请求");
-    let user = request["messages"][1]["content"]
-        .as_str()
-        .expect("MV 对话 user message 必须是字符串");
-    assert!(
-        user.contains(MV_SPEAKER) && user.contains(MV_BODY),
-        "同一模型任务必须包含 Speaker 与 Body：{user}"
+    let user = parse_user_message(
+        request["messages"][1]["content"]
+            .as_str()
+            .expect("MV 对话 user message 必须是字符串"),
     );
-    assert!(
-        user.find(MV_SPEAKER) < user.find(MV_BODY),
-        "MV 对话必须按 Speaker、Body 的自然顺序请求：{user}"
+    assert_eq!(
+        user_message_texts(&user),
+        [MV_SPEAKER, MV_BODY],
+        "MV 对话必须在同一 JSON 消息中按 Speaker、Body 的自然顺序请求"
     );
     assert_eq!(
         read_owner_units(&database, "builtin"),
@@ -962,8 +982,8 @@ fn rules_owner_replaces_writes_back_and_disables_without_touching_builtin() {
         serve_one_response(
             listener,
             json!({
-                "1": [TRANSLATION],
-                "2": [RULES_SHORT_TRANSLATION]
+                "0": [TRANSLATION],
+                "1": [RULES_SHORT_TRANSLATION]
             }),
         )
     });
@@ -978,12 +998,15 @@ fn rules_owner_replaces_writes_back_and_disables_without_touching_builtin() {
         .join()
         .expect("Rules 模型服务线程不得 panic")
         .expect("Rules 模型服务必须完成请求");
-    let user = request["messages"][1]["content"]
-        .as_str()
-        .expect("Rules user message 必须是字符串");
+    let user = parse_user_message(
+        request["messages"][1]["content"]
+            .as_str()
+            .expect("Rules user message 必须是字符串"),
+    );
+    let user_texts = user_message_texts(&user);
     assert!(
-        user.contains(SOURCE_TEXT) && user.contains(RULES_SHORT_SOURCE),
-        "同一翻译运行必须读取 Builtin 与 Rules owner：{user}"
+        user_texts.contains(&SOURCE_TEXT) && user_texts.contains(&RULES_SHORT_SOURCE),
+        "同一翻译运行必须把 Builtin 与 Rules owner 写入 JSON user message"
     );
     assert_success(
         "Rules 初次 WriteBack",
@@ -1113,11 +1136,14 @@ fn generic_reextract_preserves_moves_and_rejects_unextracted_changes() {
         .join()
         .expect("Generic 本地模型线程不得 panic")
         .expect("Generic 本地模型服务必须完成请求");
-    assert!(
+    let user = parse_user_message(
         request["messages"][1]["content"]
             .as_str()
-            .is_some_and(|content| content.contains("こんにちは")),
-        "Generic user message 必须包含待译 Group"
+            .expect("Generic user message 必须是字符串"),
+    );
+    assert!(
+        user_message_texts(&user).contains(&"こんにちは"),
+        "Generic user message 必须在 JSON text 数组中包含待译 Group"
     );
     let workspace = distribution_root(root)
         .join("projects/generic")
@@ -1125,6 +1151,7 @@ fn generic_reextract_preserves_moves_and_rejects_unextracted_changes() {
     let task_record = read_single_task_record_sharing_log_run_id(&workspace);
     assert!(task_record.contains("# 翻译任务 000001 · 完成"));
     assert!(task_record.contains(THINKING_SENTINEL));
+    assert!(task_record.contains("## Raw Assistant"));
     assert_success(
         "Generic WriteBack",
         &run_att(
@@ -1990,8 +2017,8 @@ fn assert_success(stage: &str, output: &Output) {
 fn write_configuration(root: &Path, endpoint: &str) {
     let configuration = format!(
         r#"[prompts]
-locale = "zh-Hans"
 thinking_output = true
+source_echo = false
 
 [llm.clients.primary]
 url = "{endpoint}"
@@ -2030,14 +2057,7 @@ target_task_user_message_characters = 10000
 }
 
 fn write_rpg_maker_prompt(root: &Path) {
-    let prompt_root = distribution_root(root).join("prompts/rpg_maker/zh-Hans");
-    fs::create_dir_all(&prompt_root).expect("Prompt 目录应可建立");
-    fs::write(
-        prompt_root.join("system.md"),
-        "Translate {{source_language}} into {{target_language}}. Return the required JSON object.",
-    )
-    .expect("system Prompt 应可写入");
-    fs::write(prompt_root.join("thinking.md"), THINKING_PROMPT).expect("Thinking Prompt 应可写入");
+    write_translation_prompt(root);
 }
 
 fn write_mv_dialogue_rules(root: &Path) {
@@ -2057,51 +2077,94 @@ fn write_extract_rules(root: &Path, field: Option<&str>) {
 }
 
 fn write_generic_prompt(root: &Path) {
-    let prompt_root = distribution_root(root).join("prompts/generic/zh-Hans");
-    fs::create_dir_all(&prompt_root).expect("Generic Prompt 目录应可建立");
+    write_translation_prompt(root);
+}
+
+fn write_translation_prompt(root: &Path) {
+    let prompt_root = distribution_root(root).join("prompts/translation");
+    fs::create_dir_all(prompt_root.join("rules")).expect("Prompt 规则目录应可建立");
+    fs::create_dir_all(prompt_root.join("examples")).expect("Prompt 示例目录应可建立");
     fs::write(
         prompt_root.join("system.md"),
-        "Translate {{source_language}} into {{target_language}}. Return string values.",
+        "把 {{source_language}} 翻译成 {{target_language}}。",
     )
-    .expect("Generic system Prompt 应可写入");
+    .expect("共享 system Prompt 应可写入");
     fs::write(prompt_root.join("thinking.md"), THINKING_PROMPT)
-        .expect("Generic Thinking Prompt 应可写入");
+        .expect("共享 Thinking Prompt 应可写入");
+    fs::write(
+        prompt_root.join("rules/thinking.md"),
+        "只输出带 think 和 translations 的 JSON object。",
+    )
+    .expect("思考模式规则应可写入");
+    fs::write(
+        prompt_root.join("examples/thinking.md"),
+        "# 示例\n\n输入：{}\n\n输出：{\"think\":\"判断\",\"translations\":{}}",
+    )
+    .expect("思考模式示例应可写入");
 }
 
-fn expected_rpg_maker_description_user_message(units: &[(&str, Option<usize>)]) -> String {
-    let mut message = String::new();
-    for (index, (text, task_id)) in units.iter().copied().enumerate() {
-        if index > 0 {
-            message.push('\n');
-        }
-        message.push_str("## Database Text\n\nDescription [");
-        match task_id {
-            Some(task_id) => message.push_str(&task_id.to_string()),
-            None => message.push('-'),
-        }
-        message.push_str("] (free line breaking):\n\n> ");
-        message.push_str(text);
-        message.push('\n');
-    }
-    message
+fn expected_rpg_maker_description_user_message(units: &[(&str, Option<usize>)]) -> Value {
+    let groups = units
+        .iter()
+        .map(|(text, task_id)| {
+            let mut unit = json!({
+                "role": "description",
+                "text": [text]
+            });
+            if let Some(task_id) = task_id {
+                unit["id"] = json!(task_id.to_string());
+                unit["type"] = json!("free");
+            }
+            json!({
+                "kind": "database_entry",
+                "units": [unit]
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({ "groups": groups })
 }
 
-fn expected_generic_user_message(units: &[(&str, Option<usize>)]) -> String {
-    let mut message = "Groups:\nkind=\"dialogue\"\nunits:\n".to_owned();
-    for (text, task_id) in units.iter().copied() {
-        message.push('[');
-        match task_id {
-            Some(task_id) => message.push_str(&task_id.to_string()),
-            None => message.push('-'),
-        }
-        message.push_str("] ");
-        message.push_str(
-            &serde_json::to_string(text).expect("Generic user message 文本应可编码为 JSON"),
-        );
-        message.push('\n');
-    }
-    message.push('\n');
-    message
+fn expected_generic_user_message(units: &[(&str, Option<usize>)]) -> Value {
+    let units = units
+        .iter()
+        .map(|(text, task_id)| {
+            let mut unit = json!({ "text": [text] });
+            if let Some(task_id) = task_id {
+                unit["id"] = json!(task_id.to_string());
+                unit["type"] = json!("free");
+            }
+            unit
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "groups": [{
+            "kind": "dialogue",
+            "units": units
+        }]
+    })
+}
+
+fn parse_user_message(message: &str) -> Value {
+    serde_json::from_str(message).expect("模型 user message 必须是稳定 JSON")
+}
+
+fn user_message_texts(message: &Value) -> Vec<&str> {
+    message["groups"]
+        .as_array()
+        .expect("user message groups 必须是数组")
+        .iter()
+        .flat_map(|group| {
+            group["units"]
+                .as_array()
+                .expect("user message units 必须是数组")
+        })
+        .flat_map(|unit| {
+            unit["text"]
+                .as_array()
+                .expect("user message text 必须是数组")
+        })
+        .map(|text| text.as_str().expect("user message text 元素必须是字符串"))
+        .collect()
 }
 
 fn read_single_task_record_sharing_log_run_id(workspace: &Path) -> String {
@@ -2422,14 +2485,14 @@ fn read_items(path: &Path) -> Value {
 }
 
 fn serve_one_translation(listener: TcpListener) -> Result<Value, String> {
-    serve_one_response(listener, json!({ "1": [TRANSLATION] }))
+    serve_one_response(listener, json!({ "0": [TRANSLATION] }))
 }
 
 fn serve_one_generic_translation(
     listener: TcpListener,
     translation: &str,
 ) -> Result<Value, String> {
-    serve_one_response(listener, json!({ "1": translation }))
+    serve_one_response(listener, json!({ "0": [translation] }))
 }
 
 fn serve_two_responses(
@@ -2467,10 +2530,14 @@ fn serve_provider_spy(
                 requests.push(read_http_json(&mut stream)?);
                 write_chat_response(
                     &mut stream,
-                    &format!(
-                        "<why>{THINKING_SENTINEL}</why>\n{}",
-                        json!({ "1": "春日来信", "2": "秋日来信" })
-                    ),
+                    &json!({
+                        "think": THINKING_SENTINEL,
+                        "translations": {
+                            "0": ["春日来信"],
+                            "1": ["秋日来信"]
+                        }
+                    })
+                    .to_string(),
                 )?;
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -2487,8 +2554,11 @@ fn serve_provider_spy(
 
 fn serve_one_response(listener: TcpListener, model_output: Value) -> Result<Value, String> {
     let (mut stream, request) = accept_request(listener)?;
-    let assistant_json = serde_json::to_string(&model_output).map_err(|error| error.to_string())?;
-    let content = format!("<why>{THINKING_SENTINEL}</why>\n{assistant_json}");
+    let content = serde_json::to_string(&json!({
+        "think": THINKING_SENTINEL,
+        "translations": model_output
+    }))
+    .map_err(|error| error.to_string())?;
     write_chat_response(&mut stream, &content)?;
     Ok(request)
 }

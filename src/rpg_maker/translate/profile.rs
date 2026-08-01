@@ -7,14 +7,14 @@ use std::sync::Arc;
 
 use crate::language::{LanguageModule, LanguagePair};
 use crate::translation::profile::TranslationRequestConfiguration;
-pub(crate) use crate::translation_protocol::TranslationResponseEnvelope;
+pub(crate) use crate::translation_protocol::TranslationResponseMode;
 
 /// 一个 RPG Maker system prompt 及其唯一适用的规范语言对。
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct RpgMakerSystemPrompt {
     language_pair: LanguagePair,
     markdown: String,
-    response_envelope: TranslationResponseEnvelope,
+    response_mode: TranslationResponseMode,
 }
 
 impl fmt::Debug for RpgMakerSystemPrompt {
@@ -24,7 +24,7 @@ impl fmt::Debug for RpgMakerSystemPrompt {
             .debug_struct("RpgMakerSystemPrompt")
             .field("language_pair", &self.language_pair)
             .field("markdown_characters", &self.markdown.chars().count())
-            .field("response_envelope", &self.response_envelope)
+            .field("response_mode", &self.response_mode)
             .finish()
     }
 }
@@ -34,9 +34,9 @@ impl RpgMakerSystemPrompt {
     pub(crate) fn new(
         language_pair: LanguagePair,
         markdown: String,
-        response_envelope: TranslationResponseEnvelope,
+        response_mode: TranslationResponseMode,
     ) -> Result<Self, RpgMakerSystemPromptError> {
-        match Self::new_with_cancellation(language_pair, markdown, response_envelope, || {
+        match Self::new_with_cancellation(language_pair, markdown, response_mode, || {
             Ok::<_, Infallible>(())
         }) {
             Ok(result) => result,
@@ -47,7 +47,7 @@ impl RpgMakerSystemPrompt {
     pub(crate) fn new_with_cancellation<E>(
         language_pair: LanguagePair,
         markdown: String,
-        response_envelope: TranslationResponseEnvelope,
+        response_mode: TranslationResponseMode,
         mut ensure_running: impl FnMut() -> Result<(), E>,
     ) -> Result<Result<Self, RpgMakerSystemPromptError>, E> {
         const CANCELLATION_CHECK_CHARACTERS: usize = 16 * 1024;
@@ -70,7 +70,7 @@ impl RpgMakerSystemPrompt {
         Ok(Ok(Self {
             language_pair,
             markdown,
-            response_envelope,
+            response_mode,
         }))
     }
 
@@ -82,8 +82,8 @@ impl RpgMakerSystemPrompt {
         &self.markdown
     }
 
-    pub(crate) const fn response_envelope(&self) -> TranslationResponseEnvelope {
-        self.response_envelope
+    pub(crate) const fn response_mode(&self) -> TranslationResponseMode {
+        self.response_mode
     }
 }
 
@@ -260,17 +260,18 @@ mod tests {
         let prompt = RpgMakerSystemPrompt::new(
             language_pair(),
             "# 完整提示词".to_owned(),
-            TranslationResponseEnvelope::ThinkingThenJson,
+            TranslationResponseMode::new(true, true),
         )
         .expect("非空提示词合法");
         assert_eq!(prompt.language_pair(), &language_pair());
         assert_eq!(prompt.markdown(), "# 完整提示词");
         assert_eq!(
-            prompt.response_envelope(),
-            TranslationResponseEnvelope::ThinkingThenJson
+            prompt.response_mode(),
+            TranslationResponseMode::new(true, true)
         );
         let debug = format!("{prompt:?}");
-        assert!(debug.contains("ThinkingThenJson"));
+        assert!(debug.contains("thinking: true"));
+        assert!(debug.contains("source_echo: true"));
         assert!(debug.contains("markdown_characters: 7"));
         assert!(!debug.contains("[REDACTED]"));
         assert!(!debug.contains("# 完整提示词"));
@@ -278,7 +279,7 @@ mod tests {
         let error = RpgMakerSystemPrompt::new(
             language_pair(),
             " \n".to_owned(),
-            TranslationResponseEnvelope::JsonOnly,
+            TranslationResponseMode::new(false, false),
         )
         .expect_err("空白提示词必须失败");
         assert_eq!(error, RpgMakerSystemPromptError::Blank);
@@ -322,7 +323,7 @@ mod tests {
         let prompt = RpgMakerSystemPrompt::new(
             language_pair(),
             "system".to_owned(),
-            TranslationResponseEnvelope::JsonOnly,
+            TranslationResponseMode::new(false, true),
         )
         .unwrap();
         let resources = ResolvedRpgMakerTranslationResources::new(prompt, Arc::clone(&module));
@@ -330,8 +331,8 @@ mod tests {
         assert_eq!(resources.language_pair(), &language_pair());
         assert_eq!(resources.system_prompt().markdown(), "system");
         assert_eq!(
-            resources.system_prompt().response_envelope(),
-            TranslationResponseEnvelope::JsonOnly
+            resources.system_prompt().response_mode(),
+            TranslationResponseMode::new(false, true)
         );
         assert!(Arc::ptr_eq(&resources.source_language(), &module));
         let debug = format!("{resources:?}");

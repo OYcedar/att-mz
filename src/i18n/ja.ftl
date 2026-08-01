@@ -327,7 +327,6 @@ diagnostic-io-kind-value = { $code ->
    *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
-    [unsupported_prompt_locale] 小文字の auto またはサポートされている BCP 47 UI ロケールでなければなりません
     [language_policy_term_blank] 言語ポリシー用語を空白にできません
     [language_policy_term_surrounding_whitespace] 言語ポリシー用語の前後に空白を含められません
     [language_policy_term_duplicate] 言語ポリシー用語を重複させられません
@@ -436,17 +435,8 @@ task-record-final-result-heading = 最終結果
 task-record-no-request = 送信可能なモデルリクエストは作成されませんでした。
 task-record-empty-assistant = モデルは空のオブジェクトを返しました。
 task-record-parse-error = 解析エラー：{ $kind ->
-    [json] モデル応答の JSON が無効です（カテゴリ `{ $category }`、{ $line } 行 { $column } 列）
-    [thinking_not_allowed] 現在の応答モードでは思考出力を受け付けません（{ $line } 行 { $column } 列）
-    [thinking_envelope_missing] 必須の思考エンベロープがありません（{ $line } 行 { $column } 列）
-    [thinking_envelope_unclosed] 思考エンベロープが閉じられていません（{ $line } 行 { $column } 列）
     [thinking_empty] 思考内容が空です（{ $line } 行 { $column } 列）
-    [thinking_nested] 入れ子の思考エンベロープがあります（{ $line } 行 { $column } 列）
-    [thinking_repeated] 思考エンベロープが重複しています（{ $line } 行 { $column } 列）
-    [markdown_fence_no_body] Markdown フェンスに本文がありません（{ $line } 行 { $column } 列）
-    [markdown_fence_unsupported] 言語指定なし、または json 指定の単一 Markdown フェンスだけを受け付けます（{ $line } 行 { $column } 列）
-    [markdown_fence_unclosed] Markdown フェンスが閉じられていません（{ $line } 行 { $column } 列）
-   *[markdown_fence_invalid_closing] Markdown フェンスは末尾の独立行で閉じる必要があります（{ $line } 行 { $column } 列）
+   *[json] モデル応答の JSON が無効です（カテゴリ `{ $category }`、{ $line } 行 { $column } 列）
 }
 task-record-attempt-succeeded = 試行 { $number }：成功；finish reason { $finish_reason }
 task-record-attempt-token-usage = ；token `{ $prompt } / { $completion } / { $total }`

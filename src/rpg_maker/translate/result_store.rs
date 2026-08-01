@@ -1544,7 +1544,7 @@ mod tests {
     impl Error for FakeError {}
 
     fn task_id(value: usize) -> TaskId {
-        TaskId::new(value).expect("测试 Task ID 必须非零")
+        TaskId::new(value)
     }
 
     #[test]
@@ -1805,7 +1805,7 @@ mod tests {
                 final_response: FinalLlmResponseMetadata::new(None, None, "stop", None),
                 accepted: NonEmptyTaskItems::new(
                     AcceptedTranslationDecision::new(
-                        task_id(1),
+                        task_id(0),
                         TranslationPatch::new(
                             identity.clone(),
                             Vec::new(),
@@ -1847,7 +1847,7 @@ mod tests {
             final_response: FinalLlmResponseMetadata::new(None, None, "stop", None),
             accepted: NonEmptyTaskItems::new(
                 AcceptedTranslationDecision::new(
-                    task_id(1),
+                    task_id(0),
                     TranslationPatch::new(
                         identity.clone(),
                         Vec::new(),
@@ -2640,12 +2640,10 @@ mod tests {
     }
 
     fn complete_outcome(patches: Vec<TranslationPatch>) -> Arc<TranslationTaskOutcome> {
-        let mut decisions = patches.into_iter().enumerate().map(|(index, patch)| {
-            AcceptedTranslationDecision::new(
-                task_id(index.checked_add(1).expect("测试 Task ID 不得溢出")),
-                patch,
-            )
-        });
+        let mut decisions = patches
+            .into_iter()
+            .enumerate()
+            .map(|(index, patch)| AcceptedTranslationDecision::new(task_id(index), patch));
         let first = decisions.next().expect("测试任务至少包含一项译文");
         Arc::new(TranslationTaskOutcome::Complete {
             context: TranslationTaskOutcomeContext::new(

@@ -342,7 +342,6 @@ diagnostic-io-kind-value = { $code ->
    *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
-    [unsupported_prompt_locale] Значение должно быть ровно auto в нижнем регистре или поддерживаемой локалью интерфейса BCP 47
     [language_policy_term_blank] Термин языковой политики не должен быть пустым
     [language_policy_term_surrounding_whitespace] Термин языковой политики не должен содержать пробелы по краям
     [language_policy_term_duplicate] Термин языковой политики не должен повторяться
@@ -451,17 +450,8 @@ task-record-final-result-heading = Итоговый результат
 task-record-no-request = Не сформирован запрос к модели, готовый к отправке.
 task-record-empty-assistant = Модель вернула пустой объект.
 task-record-parse-error = Ошибка разбора: { $kind ->
-    [json] недопустимый JSON ответа модели (категория `{ $category }`), строка { $line }, столбец { $column }
-    [thinking_not_allowed] этот режим ответа не принимает рассуждение, строка { $line }, столбец { $column }
-    [thinking_envelope_missing] отсутствует обязательная оболочка рассуждения, строка { $line }, столбец { $column }
-    [thinking_envelope_unclosed] оболочка рассуждения не закрыта, строка { $line }, столбец { $column }
     [thinking_empty] содержимое рассуждения пусто, строка { $line }, столбец { $column }
-    [thinking_nested] обнаружена вложенная оболочка рассуждения, строка { $line }, столбец { $column }
-    [thinking_repeated] обнаружена повторная оболочка рассуждения, строка { $line }, столбец { $column }
-    [markdown_fence_no_body] блок Markdown не содержит тела, строка { $line }, столбец { $column }
-    [markdown_fence_unsupported] допускается только один блок Markdown без метки языка или с меткой json, строка { $line }, столбец { $column }
-    [markdown_fence_unclosed] блок Markdown не закрыт, строка { $line }, столбец { $column }
-   *[markdown_fence_invalid_closing] блок Markdown должен закрываться последней отдельной строкой, строка { $line }, столбец { $column }
+   *[json] недопустимый JSON ответа модели (категория `{ $category }`), строка { $line }, столбец { $column }
 }
 task-record-attempt-succeeded = Попытка { $number }: успешно; finish reason { $finish_reason }
 task-record-attempt-token-usage = ; токены `{ $prompt } / { $completion } / { $total }`

@@ -120,10 +120,14 @@ ATT 发布目录中的术语规格只定义 ATT 接受的文件、匹配方式�
 - 用数据库和发布终态判断结果；日志和任务记录只用于诊断。
 - 分别解释 Complete、Partial、Unavailable、取消与 outcome unknown；退出码零
   只代表进程正常结束，翻译是否完成要看权威状态。
-- 检查 Partial 或重试时，不要只数带 ID 的原文。任务记录只保存实际请求，但该请求必须
-  包含原 TaskBlock 的全部 Group 和 Unit；已完成或只提供语境的 Unit 使用 `[-]`，需要
-  模型输出的 Unit 才从 `[1]` 起连续编号。数据源与 Profile 未变时，前后两次记录中的块
-  边界和自然顺序应相同；只允许 ID、受 Placeholder 保护的显示文本和实际发送块集合变化。
+- 检查 Partial 或重试时，不要只数带 ID 的原文。任务记录中的 JSON user message 必须
+  包含原 TaskBlock 的全部 Group 和 Unit；语境 Unit 省略 ID，需要模型输出的 Unit 才在
+  每个块内从 `"0"` 连续编号。数据源与 Profile 未变时，前后两次记录中的块边界和自然
+  顺序应相同；只允许 ID、受 Placeholder 保护的显示文本和实际发送块集合变化。
+- 思考输出开启时，把任务记录中的 System、User、Thinking、Raw Assistant、逐 ID 诊断和
+  最终结果放在一起核对。Raw Assistant 是经过现行敏感信息替换的模型 `message.content`，
+  可用于人工或 agent 排查 JSON 结构、ID、原文回显、截断、转义和源语残留，但不是权威
+  状态；它缺失时只报告证据不足，不因此重发请求、重放或提交。
 - 当前发行版的 MV/MZ 项目数据库只接受当前 schema。旧项目不能由程序识别或迁移；确认
   数据库不符合当前发行规格时，在新的项目工作区重新 `Init + Extract`，不要修改旧库或
   从旧库自动带入译文。Generic JSONL 和 Generic 项目按各自现行规格处理。

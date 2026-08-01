@@ -13,7 +13,7 @@ Markdown：
 
 - 引擎、任务序号、尝试次数和最终结果；
 - 模型实际使用的 system 与 user message；
-- 请求过程、可用的 thinking 和 assistant 输出；
+- 请求过程、可读的 Thinking、逐 ID 译文和可用的 assistant 输出；
 - 每次失败尝试的结构化原因，包括可用的 HTTP code/type 和经过处理的供应商
   `error.message`；
 - 每个 ID 的验收结果；
@@ -21,8 +21,25 @@ Markdown：
 
 任务记录只为实际发出的含 ID TaskBlock 建立，不记录本轮完全没有 ID 的块。记录中的 user
 message 是实际请求，必须保留该稳定 TaskBlock 的全部 Group 和 Unit；无编号的 Current、
-复用、重复、非源语、完全保护和空文本仍作为语境出现。Partial 后再次运行时，已接受项以
-`[-]` 目标译文出现，待处理项重新从 `[1]` 编号，不能只记录孤立的失败原文。
+复用、重复、非源语、完全保护和空文本仍省略 ID 并作为语境出现。Partial 后再次运行时，
+已接受项以无 ID 的安全目标译文出现，待处理项在原块内重新从 `"0"` 编号，不能只记录
+孤立的失败原文。
+
+`thinking_output = true` 时，模型已经返回 `message.content` 的任务记录同时包含：
+
+- `Thinking`：从有效响应投影出的可读翻译判断；
+- 按 ID 展开的译文和验收诊断；
+- `Raw Assistant`：模型本次实际返回的 `message.content`。
+
+`Raw Assistant` 使用能够包住正文的动态 Markdown fence，只执行现行敏感信息闭集要求的
+精确替换。它不是 HTTP body、Header、供应商完整响应，也不能称为未经处理的字节副本。
+非思考模式的成功响应不额外显示 `Raw Assistant`；无效或未处理的 assistant 正文继续按
+现有失败记录保留。
+
+人工或 agent 排查译文返回时，可以对照 System、User、Thinking、Raw Assistant、逐 ID
+诊断和最终结果，确认模型实际返回的 JSON 结构、ID、原文回显、截断、转义与源语残留。
+这是一项有效的诊断证据，不是权威业务状态；Raw Assistant 缺失只表示证据不足，不授权
+重新请求、重放、验收或提交译文。
 
 记录中绝不写入 API key、Authorization 值或其他由
 [Chat Completions 规格](../runtime/chat-completions.md#6-敏感信息闭集唯一权威)定义的

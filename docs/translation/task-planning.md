@@ -1,7 +1,7 @@
 # TaskBlock 规划现行规格
 
-MV、MZ 和 Generic 共用同一套 TaskBlock 装箱与临时 ID 分配规则。引擎仍各自负责
-Current、语言、Placeholder、术语、去重、消息格式、响应验收和提交。
+MV、MZ 和 Generic 共用同一套 TaskBlock 装箱、临时 ID、JSON 消息和公共响应规则。
+引擎仍各自负责 Current、语言、Placeholder、术语、去重、引擎特有验收和提交。
 
 ## 1. Extract 先建立文本层次
 
@@ -42,8 +42,8 @@ Profile 目标必须反复得到完全相同的 Scope、Group、Unit 范围；�
 ## 3. 稳定字符目标
 
 `target_task_user_message_characters` 是稳定源文投影的装箱目标，不是最终 user message 的
-硬上限。稳定投影只使用 Group 类型、Unit 角色、完整原文、固定消息格式和固定 `[-]`
-槽位。
+硬上限。稳定投影只使用 Group 类型、Unit 角色、完整原文和固定 JSON 消息结构；它不使用
+实际临时 ID，也不根据本轮是否需要模型输出来增删 Unit。
 
 Group 不拆分，TaskBlock 不跨 Semantic Scope。当前块加入下一个完整 Group 后超过目标时，
 就在该 Group 前结束当前块；单个 Group 自身超过目标时独占一块。术语、目标译文、
@@ -52,10 +52,11 @@ Placeholder token 和数字 ID 会让最终消息长度发生变化，但不会�
 整个语料可以为空；Semantic Scope 和 Group 一旦存在就必须非空。数量不一致、字符计数或
 临时 ID 溢出属于明确的规划错误，不能截断、饱和计算或猜测对应关系。
 
-## 4. 临时 ID 与零 ID 块
+## 4. 临时 ID 与无 ID 块
 
 每个完整块按 Unit 自然顺序分配临时 ID。只有本轮模型代表获得 ID；编号在每个含 ID 的块
-内从 `1` 连续开始。其余 Unit 使用 `[-]`，只提供语境，不要求模型输出。
+内从 `0` 连续开始。其余 Unit 在 JSON user message 中省略 `id` 和 `type`，只提供语境，
+不要求模型输出。
 
 完整块没有任何 ID 时，本轮不发送它。过滤只是只读视图：不能把过滤后相邻的块重新合并，
 也不能把其中的 Group 移到其他块。TaskBlock 不持久化；每次 Translate 都从权威 Extract
@@ -80,6 +81,6 @@ Placeholder token 和数字 ID 会让最终消息长度发生变化，但不会�
 ## 6. Partial 重试
 
 假设一个完整块依次包含 A、B、C、D，第一次只有 A、C、D 通过验收。下一次 Translate
-仍使用同一个完整块：A、C、D 以 `[-]` 和安全目标译文提供语境，B 是唯一的 `[1]`。
-Task Record 只记录实际发出的块，但保存的 user message 必须包含这个完整 TaskBlock 的全部
-语境。
+仍使用同一个完整块：A、C、D 省略 ID 并以安全目标译文提供语境，B 是唯一带 `"0"` 的
+Unit。Task Record 只记录实际发出的块，但保存的 user message 必须包含这个完整
+TaskBlock 的全部语境。

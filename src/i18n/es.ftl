@@ -336,7 +336,6 @@ diagnostic-io-kind-value = { $code ->
    *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
-    [unsupported_prompt_locale] Debe ser exactamente auto en minúsculas o una configuración regional de interfaz BCP 47 compatible
     [language_policy_term_blank] El término de política lingüística no puede estar vacío
     [language_policy_term_surrounding_whitespace] El término de política lingüística no puede tener espacios al principio o al final
     [language_policy_term_duplicate] El término de política lingüística no puede estar duplicado
@@ -445,17 +444,8 @@ task-record-final-result-heading = Resultado final
 task-record-no-request = No se generó una solicitud de modelo lista para enviar.
 task-record-empty-assistant = El modelo devolvió un objeto vacío.
 task-record-parse-error = Error de análisis: { $kind ->
-    [json] JSON de respuesta del modelo no válido (categoría `{ $category }`), línea { $line }, columna { $column }
-    [thinking_not_allowed] este modo de respuesta no acepta razonamiento, línea { $line }, columna { $column }
-    [thinking_envelope_missing] falta el sobre de razonamiento obligatorio, línea { $line }, columna { $column }
-    [thinking_envelope_unclosed] el sobre de razonamiento no está cerrado, línea { $line }, columna { $column }
     [thinking_empty] el contenido del razonamiento está vacío, línea { $line }, columna { $column }
-    [thinking_nested] hay un sobre de razonamiento anidado, línea { $line }, columna { $column }
-    [thinking_repeated] hay un sobre de razonamiento repetido, línea { $line }, columna { $column }
-    [markdown_fence_no_body] el bloque Markdown no tiene contenido, línea { $line }, columna { $column }
-    [markdown_fence_unsupported] solo se acepta un bloque Markdown sin etiqueta de idioma o con etiqueta json, línea { $line }, columna { $column }
-    [markdown_fence_unclosed] el bloque Markdown no está cerrado, línea { $line }, columna { $column }
-   *[markdown_fence_invalid_closing] el bloque Markdown debe cerrarse en la última línea independiente, línea { $line }, columna { $column }
+   *[json] JSON de respuesta del modelo no válido (categoría `{ $category }`), línea { $line }, columna { $column }
 }
 task-record-attempt-succeeded = Intento { $number }: correcto; finish reason { $finish_reason }
 task-record-attempt-token-usage = ; tokens `{ $prompt } / { $completion } / { $total }`

@@ -33,10 +33,9 @@ pub(crate) use task_record::{
     GenericTaskResponseRecord,
 };
 pub(crate) use translate::{
-    AutomaticStateResources, GenericPlanningError, GenericUnitKey, GenericUnitMap, PlannedGroup,
-    PlannedTask, PlanningUnit, ResponseProblem, TranslationAcceptance, TranslationPlan,
-    ValidatedReuse, accept_parsed_response_with_cancellation,
-    current_translation_for_stored_with_cancellation,
+    AutomaticStateResources, GenericPlanningError, GenericUnitKey, GenericUnitMap, PlannedTask,
+    PlanningUnit, ResponseProblem, TranslationAcceptance, TranslationPlan, ValidatedReuse,
+    accept_parsed_response_with_cancellation, current_translation_for_stored_with_cancellation,
     plan_translation_with_validator_and_cancellation,
     terminology_hit_fingerprint_with_cancellation,
 };

@@ -16,9 +16,10 @@ use rusqlite::{Connection, OpenFlags};
 
 use super::translation_prompt::{
     PromptResourceLoadError, PromptTemplateError, SYSTEM_PROMPT_FILE_NAME,
-    THINKING_PROMPT_FILE_NAME, ensure_no_prompt_template_variables_with_cancellation,
-    parse_prompt_resource_with_cancellation, read_unparsed_prompt_resource,
-    render_system_prompt_template_with_cancellation,
+    THINKING_PROMPT_FILE_NAME, assemble_translation_system_prompt_with_cancellation,
+    ensure_no_prompt_template_variables_with_cancellation, parse_prompt_resource_with_cancellation,
+    read_unparsed_prompt_resource, render_system_prompt_template_with_cancellation,
+    translation_prompt_resource_paths,
 };
 #[cfg(test)]
 use super::translation_prompt::{
@@ -27,7 +28,7 @@ use super::translation_prompt::{
 use crate::application::config::{
     ConfigurationLoadError, ConfiguredExtractCommand, ConfiguredInitCommand,
     ConfiguredProjectLuaCommand, ConfiguredRpgMakerCommand, ConfiguredTranslateCommand,
-    ConfiguredWriteBackCommand, PromptLocaleResolutionError, TranslateConfiguration,
+    ConfiguredWriteBackCommand, TranslateConfiguration,
 };
 use crate::diagnostic::{
     BoxedError, DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact,
@@ -110,7 +111,6 @@ use crate::rpg_maker::translate::planner::RpgMakerTranslationTaskPlanningService
 use crate::rpg_maker::translate::profile::{
     ResolvedRpgMakerTranslationResources, RpgMakerSystemPrompt, RpgMakerSystemPromptError,
     RpgMakerTranslationPlanningConfiguration, RpgMakerTranslationProfile,
-    TranslationResponseEnvelope,
 };
 use crate::rpg_maker::translate::result_store::{
     RpgMakerTranslationResultStorageError, RpgMakerTranslationResultStorageService,
@@ -164,9 +164,8 @@ use crate::storage::file_system::{
 };
 use crate::storage::sqlite::SnapshotDatabaseError;
 use crate::translation::planning_resource::TranslationPlanningResourceReadingService;
+use crate::translation_protocol::TranslationResponseMode;
 use crate::user_text::sanitize_user_text;
-
-const RPG_MAKER_PROMPT_DIRECTORY_NAME: &str = "rpg_maker";
 
 #[derive(Clone, Copy, Debug, Default)]
 struct TokioAsyncDelay;
@@ -4469,6 +4468,8 @@ type ProductionRpgMakerTranslation = RpgMakerTranslationService<
 enum PromptResourceComponent {
     System,
     Thinking,
+    Rules,
+    Example,
 }
 
 impl PromptResourceComponent {
@@ -4476,6 +4477,8 @@ impl PromptResourceComponent {
         match self {
             Self::System => SYSTEM_PROMPT_FILE_NAME,
             Self::Thinking => THINKING_PROMPT_FILE_NAME,
+            Self::Rules => "rules",
+            Self::Example => "example",
         }
     }
 }
@@ -4485,8 +4488,12 @@ enum RpgMakerPromptPreparationError {
     Cancelled,
     SystemResource(PromptResourceLoadError),
     ThinkingResource(PromptResourceLoadError),
+    RulesResource(PromptResourceLoadError),
+    ExampleResource(PromptResourceLoadError),
     SystemTemplate(PromptTemplateError),
     ThinkingTemplate(PromptTemplateError),
+    RulesTemplate(PromptTemplateError),
+    ExampleTemplate(PromptTemplateError),
     SystemPrompt(RpgMakerSystemPromptError),
 }
 
@@ -4500,54 +4507,38 @@ fn ensure_rpg_maker_prompt_preparation_running(
     }
 }
 
-fn append_rpg_maker_prompt_text(
-    output: &mut String,
-    text: &str,
-    cancellation: &CooperativeCancellation,
-) -> Result<(), RpgMakerPromptPreparationError> {
-    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
-
-    let mut start = 0_usize;
-    while start < text.len() {
-        ensure_rpg_maker_prompt_preparation_running(cancellation)?;
-        let mut end = start
-            .saturating_add(CANCELLATION_CHECK_BYTES)
-            .min(text.len());
-        while end < text.len() && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        output.push_str(&text[start..end]);
-        start = end;
-    }
-    ensure_rpg_maker_prompt_preparation_running(cancellation)
-}
-
 fn assemble_rpg_maker_system_prompt_markdown_with_cancellation(
     rendered_system: String,
     thinking: Option<String>,
+    rules: String,
+    example: String,
+    response_mode: TranslationResponseMode,
     cancellation: &CooperativeCancellation,
-) -> Result<(String, TranslationResponseEnvelope), RpgMakerPromptPreparationError> {
-    ensure_rpg_maker_prompt_preparation_running(cancellation)?;
-    let mut prompt = rendered_system;
-    let response_envelope = if let Some(thinking) = thinking {
-        prompt.push_str("\n\n");
-        append_rpg_maker_prompt_text(&mut prompt, &thinking, cancellation)?;
-        TranslationResponseEnvelope::ThinkingThenJson
-    } else {
-        TranslationResponseEnvelope::JsonOnly
-    };
-    ensure_rpg_maker_prompt_preparation_running(cancellation)?;
-    Ok((prompt, response_envelope))
+) -> Result<(String, TranslationResponseMode), RpgMakerPromptPreparationError> {
+    let prompt = assemble_translation_system_prompt_with_cancellation(
+        rendered_system,
+        thinking,
+        rules,
+        example,
+        || ensure_rpg_maker_prompt_preparation_running(cancellation),
+    )?;
+    Ok((prompt, response_mode))
 }
 
 #[cfg(test)]
 fn assemble_rpg_maker_system_prompt_markdown(
     rendered_system: String,
     thinking: Option<&str>,
-) -> (String, TranslationResponseEnvelope) {
+    rules: &str,
+    example: &str,
+    response_mode: TranslationResponseMode,
+) -> (String, TranslationResponseMode) {
     assemble_rpg_maker_system_prompt_markdown_with_cancellation(
         rendered_system,
         thinking.map(str::to_owned),
+        rules.to_owned(),
+        example.to_owned(),
+        response_mode,
         &CooperativeCancellation::default(),
     )
     .expect("未请求取消时应完成 Prompt 拼接")
@@ -4617,34 +4608,51 @@ mod prompt_template_tests {
     }
 
     #[test]
-    fn thinking_component_rejects_all_template_delimiters() {
+    fn thinking_component_rejects_template_openers_and_allows_json_closers() {
         assert_eq!(ensure_no_prompt_template_variables("实际思考要求"), Ok(()));
-        for text in ["{{source_language}}", "前缀 {{", "后缀 }}"] {
+        for text in ["{{source_language}}", "前缀 {{"] {
             assert_eq!(
                 ensure_no_prompt_template_variables(text),
                 Err(PromptTemplateError::VariablesNotAllowed)
             );
         }
+        assert_eq!(ensure_no_prompt_template_variables("后缀 }}"), Ok(()));
     }
 
     #[test]
     fn rpg_maker_prompt_has_exact_json_only_assembly() {
-        let (prompt, envelope) =
-            assemble_rpg_maker_system_prompt_markdown("rendered system".to_owned(), None);
+        let mode = TranslationResponseMode::new(false, false);
+        let (prompt, response_mode) = assemble_rpg_maker_system_prompt_markdown(
+            "rendered system".to_owned(),
+            None,
+            "current rules",
+            "current example",
+            mode,
+        );
 
-        assert_eq!(prompt, "rendered system");
-        assert_eq!(envelope, TranslationResponseEnvelope::JsonOnly);
+        assert_eq!(
+            prompt,
+            "rendered system\n\ncurrent rules\n\ncurrent example"
+        );
+        assert_eq!(response_mode, mode);
     }
 
     #[test]
     fn rpg_maker_prompt_has_exact_thinking_assembly() {
-        let (prompt, envelope) = assemble_rpg_maker_system_prompt_markdown(
+        let mode = TranslationResponseMode::new(true, true);
+        let (prompt, response_mode) = assemble_rpg_maker_system_prompt_markdown(
             "rendered system".to_owned(),
             Some("thinking requirement"),
+            "current rules",
+            "current example",
+            mode,
         );
 
-        assert_eq!(prompt, "rendered system\n\nthinking requirement");
-        assert_eq!(envelope, TranslationResponseEnvelope::ThinkingThenJson);
+        assert_eq!(
+            prompt,
+            "rendered system\n\nthinking requirement\n\ncurrent rules\n\ncurrent example"
+        );
+        assert_eq!(response_mode, mode);
     }
 }
 
@@ -4676,36 +4684,30 @@ async fn build_production_translation_profile(
     ensure_translation_execution_build_running(cancellation)?;
     let profile_configuration = configuration.profile();
     let language_pair = project.language_pair().clone();
-    let prompt_locale = configuration
-        .prompt_locale()
-        .resolve(language_pair.target())
-        .map_err(ProductionTranslationExecutionBuildError::prompt_locale)?;
-    let prompt_directory = configuration
-        .prompt_root()
-        .join(RPG_MAKER_PROMPT_DIRECTORY_NAME)
-        .join(prompt_locale.as_str());
-    let system_path = prompt_directory.join(SYSTEM_PROMPT_FILE_NAME);
+    let response_mode =
+        TranslationResponseMode::new(configuration.thinking_output(), configuration.source_echo());
+    let prompt_paths =
+        translation_prompt_resource_paths(configuration.prompt_root(), response_mode);
+    let system_path = prompt_paths.system().to_path_buf();
+    let thinking_path = prompt_paths.thinking().map(Path::to_path_buf);
+    let rules_path = prompt_paths.rules().to_path_buf();
+    let example_path = prompt_paths.example().to_path_buf();
     ensure_translation_execution_build_running(cancellation)?;
     let system_template = read_unparsed_prompt_resource(file_system, &system_path).await;
     ensure_translation_execution_build_running(cancellation)?;
     let system_template = system_template.map_err(|source| {
         ProductionTranslationExecutionBuildError::prompt_resource(
-            prompt_locale,
             PromptResourceComponent::System,
             &system_path,
             source,
         )
     })?;
-    let thinking_path = configuration
-        .thinking_output()
-        .then(|| prompt_directory.join(THINKING_PROMPT_FILE_NAME));
     let thinking = if let Some(path) = thinking_path.as_deref() {
         ensure_translation_execution_build_running(cancellation)?;
         let thinking = read_unparsed_prompt_resource(file_system, path).await;
         ensure_translation_execution_build_running(cancellation)?;
         Some(thinking.map_err(|source| {
             ProductionTranslationExecutionBuildError::prompt_resource(
-                prompt_locale,
                 PromptResourceComponent::Thinking,
                 path,
                 source,
@@ -4714,6 +4716,26 @@ async fn build_production_translation_profile(
     } else {
         None
     };
+    ensure_translation_execution_build_running(cancellation)?;
+    let rules = read_unparsed_prompt_resource(file_system, &rules_path)
+        .await
+        .map_err(|source| {
+            ProductionTranslationExecutionBuildError::prompt_resource(
+                PromptResourceComponent::Rules,
+                &rules_path,
+                source,
+            )
+        })?;
+    ensure_translation_execution_build_running(cancellation)?;
+    let example = read_unparsed_prompt_resource(file_system, &example_path)
+        .await
+        .map_err(|source| {
+            ProductionTranslationExecutionBuildError::prompt_resource(
+                PromptResourceComponent::Example,
+                &example_path,
+                source,
+            )
+        })?;
 
     let prompt_language_pair = language_pair.clone();
     let prompt_cancellation = cancellation.clone();
@@ -4745,16 +4767,35 @@ async fn build_production_translation_profile(
                 }
                 None => None,
             };
-            let (prompt_markdown, response_envelope) =
+            let rules = parse_prompt_resource_with_cancellation(rules, || {
+                ensure_rpg_maker_prompt_preparation_running(&prompt_cancellation)
+            })?
+            .map_err(RpgMakerPromptPreparationError::RulesResource)?;
+            ensure_no_prompt_template_variables_with_cancellation(&rules, || {
+                ensure_rpg_maker_prompt_preparation_running(&prompt_cancellation)
+            })?
+            .map_err(RpgMakerPromptPreparationError::RulesTemplate)?;
+            let example = parse_prompt_resource_with_cancellation(example, || {
+                ensure_rpg_maker_prompt_preparation_running(&prompt_cancellation)
+            })?
+            .map_err(RpgMakerPromptPreparationError::ExampleResource)?;
+            ensure_no_prompt_template_variables_with_cancellation(&example, || {
+                ensure_rpg_maker_prompt_preparation_running(&prompt_cancellation)
+            })?
+            .map_err(RpgMakerPromptPreparationError::ExampleTemplate)?;
+            let (prompt_markdown, response_mode) =
                 assemble_rpg_maker_system_prompt_markdown_with_cancellation(
                     rendered_system,
                     thinking,
+                    rules,
+                    example,
+                    response_mode,
                     &prompt_cancellation,
                 )?;
             RpgMakerSystemPrompt::new_with_cancellation(
                 prompt_language_pair,
                 prompt_markdown,
-                response_envelope,
+                response_mode,
                 || ensure_rpg_maker_prompt_preparation_running(&prompt_cancellation),
             )?
             .map_err(RpgMakerPromptPreparationError::SystemPrompt)
@@ -4769,7 +4810,6 @@ async fn build_production_translation_profile(
             }
             RpgMakerPromptPreparationError::SystemResource(source) => {
                 ProductionTranslationExecutionBuildError::prompt_resource(
-                    prompt_locale,
                     PromptResourceComponent::System,
                     &system_path,
                     source,
@@ -4780,15 +4820,27 @@ async fn build_production_translation_profile(
                     .as_deref()
                     .expect("thinking Prompt 错误只会在启用 thinking 输出时产生");
                 ProductionTranslationExecutionBuildError::prompt_resource(
-                    prompt_locale,
                     PromptResourceComponent::Thinking,
                     path,
                     source,
                 )
             }
+            RpgMakerPromptPreparationError::RulesResource(source) => {
+                ProductionTranslationExecutionBuildError::prompt_resource(
+                    PromptResourceComponent::Rules,
+                    &rules_path,
+                    source,
+                )
+            }
+            RpgMakerPromptPreparationError::ExampleResource(source) => {
+                ProductionTranslationExecutionBuildError::prompt_resource(
+                    PromptResourceComponent::Example,
+                    &example_path,
+                    source,
+                )
+            }
             RpgMakerPromptPreparationError::SystemTemplate(source) => {
                 ProductionTranslationExecutionBuildError::prompt_template(
-                    prompt_locale,
                     PromptResourceComponent::System,
                     &system_path,
                     source,
@@ -4799,15 +4851,27 @@ async fn build_production_translation_profile(
                     .as_deref()
                     .expect("thinking Prompt 错误只会在启用 thinking 输出时产生");
                 ProductionTranslationExecutionBuildError::prompt_template(
-                    prompt_locale,
                     PromptResourceComponent::Thinking,
                     path,
                     source,
                 )
             }
+            RpgMakerPromptPreparationError::RulesTemplate(source) => {
+                ProductionTranslationExecutionBuildError::prompt_template(
+                    PromptResourceComponent::Rules,
+                    &rules_path,
+                    source,
+                )
+            }
+            RpgMakerPromptPreparationError::ExampleTemplate(source) => {
+                ProductionTranslationExecutionBuildError::prompt_template(
+                    PromptResourceComponent::Example,
+                    &example_path,
+                    source,
+                )
+            }
             RpgMakerPromptPreparationError::SystemPrompt(source) => {
                 ProductionTranslationExecutionBuildError::system_prompt(
-                    prompt_locale,
                     PromptResourceComponent::System,
                     &system_path,
                     source,
@@ -4984,51 +5048,26 @@ impl ProductionTranslationExecutionBuildError {
         Self::new(source, diagnostic)
     }
 
-    fn prompt_locale(source: PromptLocaleResolutionError) -> Self {
-        let diagnostic = SafeDiagnostic::new(
-            DiagnosticCode::PromptUnavailable,
-            DiagnosticStage::CommandPreparation,
-            DiagnosticSubject::field("target_language"),
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::NotFound,
-                format!(
-                    "target_language={}; automatic_prompt_locale=unsupported",
-                    source.target_language()
-                ),
-            ),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixConfiguration,
-        );
-        Self::new(source, diagnostic)
-    }
-
     fn prompt_resource(
-        locale: UiLocale,
         component: PromptResourceComponent,
         path: &Path,
         source: PromptResourceLoadError,
     ) -> Self {
-        let diagnostic = with_prompt_context(source.safe_diagnostic(), locale, component, path);
+        let diagnostic = with_prompt_context(source.safe_diagnostic(), component, path);
         Self::new(source, diagnostic)
     }
 
     fn prompt_template(
-        locale: UiLocale,
         component: PromptResourceComponent,
         path: &Path,
         source: PromptTemplateError,
     ) -> Self {
-        let diagnostic = with_prompt_context(
-            prompt_template_diagnostic(source, path),
-            locale,
-            component,
-            path,
-        );
+        let diagnostic =
+            with_prompt_context(prompt_template_diagnostic(source, path), component, path);
         Self::new(source, diagnostic)
     }
 
     fn system_prompt(
-        locale: UiLocale,
         component: PromptResourceComponent,
         path: &Path,
         source: RpgMakerSystemPromptError,
@@ -5046,7 +5085,7 @@ impl ProductionTranslationExecutionBuildError {
                 DiagnosticAction::FixConfiguration,
             ),
         };
-        let diagnostic = with_prompt_context(diagnostic, locale, component, path);
+        let diagnostic = with_prompt_context(diagnostic, component, path);
         Self::new(source, diagnostic)
     }
 
@@ -5117,14 +5156,13 @@ impl ProductionTranslationExecutionBuildError {
 
 fn with_prompt_context(
     diagnostic: SafeDiagnostic,
-    locale: UiLocale,
     component: PromptResourceComponent,
     path: &Path,
 ) -> SafeDiagnostic {
     diagnostic
         .with_recovery(RecoveryFact::path(path))
         .with_recovery(RecoveryFact::component(format!(
-            "locale={locale}; component={}",
+            "component={}",
             component.as_str()
         )))
 }

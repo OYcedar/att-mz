@@ -36,7 +36,7 @@ Prompt 和 Client 语义。人工 Lua 译文的绑定更少：术语、Prompt、
 ## 3. TaskBlock
 
 一个 JSONL 文件直接对应一个 Semantic Scope，TaskBlock 不跨越 JSONL 文件。ATT 先只使用完整原文、
-kind、自然顺序、固定消息格式和固定 `[-]` 槽位计算稳定字符数，再按文件内自然顺序把完整 Group 依次加入 TaskBlock。
+kind、自然顺序和固定 JSON 消息结构计算稳定字符数，再按文件内自然顺序把完整 Group 依次加入 TaskBlock。
 当前块已有 Group，并且加入下一个 Group 会让稳定源文投影超过 Profile 目标时，
 ATT 在这个 Group 前结束当前块，再建立下一个 TaskBlock。ATT 不重排、回填或跨越 JSONL 文件补充
 容量；一个文件可以产生多个 TaskBlock。
@@ -58,26 +58,33 @@ TaskBlock。完整公共规则见
 
 已有有效目标文本的语境项显示经过该 Unit Placeholder 绑定保护的目标文本，其他语境项
 显示保护后的原文。TaskBlock 汇总其中全部 Group 的术语命中，并按术语文件顺序提供一次。
-模型收到的 user message 只有 kind、有序文本、必要术语和临时 ID；Group ID 和 Unit ID
-留在 ATT 内部。
+模型收到的 user message 是公共 JSON 格式，只包含 kind、有序文本、必要术语和临时 ID；
+Group ID 和 Unit ID 留在 ATT 内部。Generic Unit 不输出 `role`。带 ID 的 Unit 使用
+`type: "free"`；语境 Unit 省略 `id` 和 `type`。每个 `text` 按 LF 拆成字符串数组，保留
+空行和末尾空槽。
 
 Current、复用、去重、语言判断、Placeholder token、术语和 ID 都不参与装箱。全部 Unit
 都已经 Current 时仍先建立完整 TaskBlock，随后得到零个实际请求。Partial 后重试也不会
-孤立发送失败 Unit；原块中的已完成 Unit 会以 `[-]` 目标译文继续提供语境。
+孤立发送失败 Unit；原块中的已完成 Unit 会省略 ID，以安全目标译文继续提供语境。
 
 ## 4. 响应与提交
 
-Generic 要求每个 value 为字符串：
+Generic 使用公共的四种 JSON 响应模式。关闭思考与原文回显时，每个 ID 的 value 是译文
+字符串数组：
 
 ```json
-{"1":"你好\n世界","2":"爱丽丝"}
+{"0":["你好","世界"],"1":["爱丽丝"]}
 ```
 
-字符串可以自由改变 LF 数量；CR、NUL 和纯空白字符串属于无效译文。每个 ID 独立执行
-Placeholder 恢复、源语残留检查和安全修复。目标语言由项目语言对和 Prompt 明确规定，
-ATT 依靠这条契约确定译文语言，不做短文本语言识别猜测。
+数组可以自由改变项数，验收后用 LF 连接成 Generic 译文。数组必须至少有一项，每项不得
+含 CR、LF 或 NUL，连接后的纯空白文本无效。思考与原文回显的其他组合、外层字段和 ID
+规则见[Prompt 规格](../translation/prompts.md)；原文回显只检查字符串数组形状，不比较
+内容。
 
-合法 ID 直接保存，其余 ID 形成 Partial。整个信封或 JSON 无法解析时，该任务不保存。
+每个 ID 独立执行 Placeholder 恢复、源语残留检查和安全修复。目标语言由项目语言对和
+Prompt 明确规定，ATT 依靠这条契约确定译文语言，不做短文本语言识别猜测。
+
+合法 ID 直接保存，其余 ID 形成 Partial。整个响应根结构或 JSON 无法解析时，该任务不保存。
 任务并发执行，并始终按自然顺序确认和提交；取消或后续失败时，已经确认的前序进度原样
 保留。
 

@@ -1,63 +1,136 @@
 # Prompt 与模型协议现行规格
 
-## 1. 资源选择
+## 1. 共用资源与组合
 
-每个引擎分别读取：
+MV、MZ 和 Generic 共用固定的中文 Prompt 资源：
 
 ```text
-<att-dir>/prompts/<prompt-engine>/<locale>/system.md
-<att-dir>/prompts/<prompt-engine>/<locale>/thinking.md
+<att-dir>/prompts/translation/
+├── system.md
+├── thinking.md
+├── rules/
+│   ├── plain.md
+│   ├── thinking.md
+│   ├── source-echo.md
+│   └── thinking-source-echo.md
+└── examples/
+    ├── plain.md
+    ├── thinking.md
+    ├── source-echo.md
+    └── thinking-source-echo.md
 ```
 
-`prompt-engine` 为 `rpg_maker` 或 `generic`。MV 与 MZ 共用 `rpg_maker`，Generic 使用
-`generic`。
+`system.md` 必须存在、为非空 UTF-8，并且只能使用 `{{source_language}}` 和
+`{{target_language}}` 两个模板变量，两者都必须出现。它只说明翻译任务和质量要求，
+不提未启用的响应模式。
 
-`[prompts].locale` 为具体 locale 时精确选择；`auto` 使用目标语言能够映射到的 locale，
-ATT 不回退到其他目录。`system.md` 必须存在、为非空 UTF-8，并且只能使用
-`{{source_language}}` 和 `{{target_language}}` 两个模板变量，两者必须都出现。
+`[prompts].thinking_output` 和 `[prompts].source_echo` 是互不排斥的必填布尔值。ATT 按
+当前组合选择一份规则和一份示例，并按以下顺序组成 system message：
 
-`thinking_output = false` 时只读取 `system.md`。为 `true` 时还读取非空 UTF-8
-`thinking.md`，将其附加到 system message；`thinking.md` 不接受模板变量。
+```text
+system.md
++ thinking.md（仅 thinking_output = true）
++ 当前组合的 rules 文件
++ 当前组合的 examples 文件
+```
 
-## 2. 模型消息
+思考关闭时不读取 `thinking.md`。每次请求只包含当前组合的规则和一个完整示例，不向模型
+介绍其他响应格式。Prompt 的指令固定为中文；项目语言对只替换源语言和目标语言变量，
+UI 语言不参与资源选择。
 
-一次请求只包含：
+## 2. User message
 
-1. 渲染后的 system message；
-2. 当前 TaskBlock 的一条 user message。
-
-user message 只携带模型完成当前任务所需的语境、实际术语、形状标记和临时数字 ID，
-不发送项目数据库身份。
-
-MV/MZ 的 value 是字符串数组，数组形状由 RPG Maker 翻译规格决定。Generic 的 value
-是一个字符串，并允许在 JSON 字符串中使用 `\n` 表示 LF：
+一次请求只包含渲染后的 system message，以及当前 TaskBlock 的一条 JSON user message：
 
 ```json
-{"1":"你好\n世界","2":"爱丽丝"}
+{
+  "terminology": [
+    {
+      "source": "原术语",
+      "translation": "参考译法"
+    }
+  ],
+  "groups": [
+    {
+      "kind": "dialogue",
+      "units": [
+        {
+          "role": "speaker",
+          "text": ["无编号语境"]
+        },
+        {
+          "id": "0",
+          "role": "body",
+          "type": "free",
+          "text": ["需要翻译的原文"]
+        }
+      ]
+    }
+  ]
+}
 ```
 
-## 3. 响应信封
+- 没有实际术语时省略 `terminology`；术语是专名和既有译法的参考，不是脱离语义的机械
+  替换命令。
+- `groups` 和 `units` 保留 TaskBlock 内的完整自然顺序。`kind` 表示实际 Group 类型；
+  `role` 只在数据源确有角色含义时出现。
+- 只有本轮需要模型输出的 Unit 才有 `id` 和 `type`。语境 Unit 省略这两个字段，不使用
+  占位编号。
+- `id` 是字符串，在每条 user message 中从 `"0"` 开始连续编号并保持唯一；下一个
+  TaskBlock 重新从 `"0"` 开始。
+- `text` 始终是字符串数组。`strict` 要求译文数组数量相同并逐项对应，包括空字符串所在
+  位置；`free` 允许按目标语言自然重新分行，但仍须返回至少一个字符串。
 
-默认响应必须是裸 JSON object，不能有 Markdown 围栏或前后说明。启用 thinking 输出时，
-响应必须为：
+消息只携带完成本次翻译所需的语境、实际术语、角色、形状和临时 ID，不发送项目数据库
+身份。Generic 的 text 按 LF 拆成数组并保留空行和末尾空槽；译文验收后再用 LF 连接。
 
-```text
-<why>非空思考</why>
-{"1":"译文"}
+## 3. 四种响应
+
+响应必须是一个裸 JSON object，不能带 Markdown 围栏或前后说明。两个开关形成四种
+格式。
+
+思考关闭、原文回显关闭：
+
+```json
+{"0":["译文"]}
 ```
 
-只允许一组精确小写、无属性的 `<why>...</why>`；其后除空白外只能是最终 JSON。
+思考开启、原文回显关闭：
 
-公共解析严格检查 thinking 信封和 JSON object，并按原始顺序保留全部 key，包括重复 key
-与不能解释为规范十进制数字的 key。引擎据此识别重复、非法、未知和缺少的 ID，再检查
-value 形状、Placeholder、语言和自身结构。
+```json
+{"think":"具体翻译判断","translations":{"0":["译文"]}}
+```
 
-信封、JSON 语法或最外层 object 无法解析时，该任务不提交。信封与 object 有效时逐项
-处理。每个 ID 独立验收；重复、非法、未知、缺少或 value 无效的 ID 形成 Partial，
-其他合法 ID 可以保存。
+思考关闭、原文回显开启：
+
+```json
+{"0":{"source":["原文"],"translation":["译文"]}}
+```
+
+思考与原文回显同时开启：
+
+```json
+{"think":"具体翻译判断","translations":{"0":{"source":["原文"],"translation":["译文"]}}}
+```
+
+思考模式的根对象必须且只能包含非空字符串 `think` 和 object `translations`。思考缺失、
+空白、类型错误、重复或存在其他根字段时，整份响应无效。非思考模式的根对象直接是 ID
+映射。
+
+原文回显模式中，每个 ID 的 value 必须且只能包含字符串数组 `source` 和
+`translation`。ATT 校验 `source` 的字段与数组形状，但不比较其内容，也不把它写入
+译文状态；译文仍只通过 ID 关联。回显字段无效只拒绝对应 ID，不影响其他合法 ID。
+
+公共解析按原始顺序保留全部 key，包括重复 key 和非法 ID。ID 只接受 `"0"` 或不带前导
+零的规范十进制字符串；负数、`"00"`、`"01"`、非数字和溢出值都无效。引擎据此识别
+重复、非法、未知和缺少的 ID，再逐项检查 translation 的 strict/free 形状、Placeholder、
+语言和引擎语义。
+
+JSON 语法、最外层 object 或思考模式根结构无效时，该任务不提交。根结构有效时，
+每个 ID 独立验收；重复、非法、未知、缺少或 value 无效形成 Partial，其他合法 ID 可以保存。
 
 ## 4. Prompt 变化
 
-Translate 把实际 `system.md`、可选 `thinking.md`、语言对和模型 Client 的语义身份纳入
-自动译文状态。相关内容改变时，受影响的自动译文不再是 Current。人工 Lua 修订不绑定
-Prompt 或 Client。
+Translate 把实际组成的 system message、两个 Prompt 开关、语言对和模型 Client 的语义
+身份纳入自动译文状态。任一相关内容改变时，受影响的自动译文不再是 Current。人工 Lua
+修订不绑定 Prompt 或 Client。

@@ -30,10 +30,11 @@ use super::config::{
     ConfiguredTranslateCommand,
 };
 use super::translation_prompt::{
-    PromptResourceLoadError, PromptTemplateError, SYSTEM_PROMPT_FILE_NAME,
-    THINKING_PROMPT_FILE_NAME, ensure_no_prompt_template_variables_with_cancellation,
-    parse_prompt_resource_with_cancellation, read_unparsed_prompt_resource,
-    render_system_prompt_template_with_cancellation,
+    PromptResourceLoadError, PromptTemplateError,
+    assemble_translation_system_prompt_with_cancellation,
+    ensure_no_prompt_template_variables_with_cancellation, parse_prompt_resource_with_cancellation,
+    read_unparsed_prompt_resource, render_system_prompt_template_with_cancellation,
+    translation_prompt_resource_paths,
 };
 use crate::diagnostic::{
     DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
@@ -53,8 +54,8 @@ use crate::generic::{
     GenericPlanningError, GenericProject, GenericProjectError, GenericProjectStore,
     GenericProtectedText, GenericStoredSnapshot, GenericTaskRecordDocument, GenericTaskRecordIssue,
     GenericTaskRecordState, GenericTaskResponseRecord, GenericUnitKey, GenericUnitMap,
-    GenericWriteBackCandidate, GenericWriteBackError, PlannedGroup, PlannedTask, PlanningUnit,
-    ResponseProblem, TranslationAcceptance, TranslationPlan, TranslationWrite, ValidatedReuse,
+    GenericWriteBackCandidate, GenericWriteBackError, PlannedTask, PlanningUnit, ResponseProblem,
+    TranslationAcceptance, TranslationPlan, TranslationWrite, ValidatedReuse,
     accept_parsed_response_with_cancellation, build_write_back_candidate_with_cancellation,
     current_translation_for_stored_with_cancellation,
     ensure_input_fingerprints_current_with_cancellation,
@@ -114,15 +115,18 @@ use crate::translation::task_planning::TaskId;
 use crate::translation::task_record::{
     ConfiguredTranslationTaskRecordSink, MarkdownTranslationTaskRecordSink,
 };
+use crate::translation::user_message::{
+    TranslationReturnType, TranslationUserGroup, TranslationUserMessage,
+    TranslationUserTerminology, TranslationUserUnit, render_translation_user_message,
+};
 #[cfg(test)]
 use crate::translation_protocol::parse_translation_response;
 use crate::translation_protocol::{
-    ParsedTranslationResponse, TranslationResponseEnvelope, TranslationTaskResponseParseError,
+    ParsedTranslationResponse, TranslationResponseMode, TranslationTaskResponseParseError,
     TranslationTaskResponseParseErrorKind, parse_translation_response_with_cancellation,
 };
 
 const GENERIC_ENGINE_NAME: &str = "generic";
-const GENERIC_PROMPT_DIRECTORY_NAME: &str = "generic";
 const WRITE_BACK_SCRATCH_PREFIX: &str = ".generic-write-back-";
 const WRITE_BACK_PUBLICATION_CANCELLABLE: u8 = 0;
 const WRITE_BACK_PUBLICATION_CANCELLED: u8 = 1;
@@ -581,11 +585,14 @@ fn generic_operation_diagnostic(stage: &'static str) -> SafeDiagnostic {
             DiagnosticImpact::Unchanged,
             DiagnosticAction::FixConfiguration,
         ),
-        "选择 Generic Prompt 语言"
-        | "读取 Generic system Prompt"
-        | "渲染 Generic system Prompt"
-        | "读取 Generic thinking Prompt"
-        | "校验 Generic thinking Prompt" => (
+        "读取翻译 system Prompt"
+        | "渲染翻译 system Prompt"
+        | "读取翻译 thinking Prompt"
+        | "校验翻译 thinking Prompt"
+        | "读取翻译响应规则 Prompt"
+        | "校验翻译响应规则 Prompt"
+        | "读取翻译示例 Prompt"
+        | "校验翻译示例 Prompt" => (
             DiagnosticCode::PromptUnavailable,
             DiagnosticStage::CommandPreparation,
             DiagnosticFailureKind::InvalidValue,
@@ -1721,7 +1728,7 @@ impl ProductionGenericCommandRunner {
                     terminology,
                     language_module: source_language,
                     system_prompt: prompt.system_prompt,
-                    response_envelope: prompt.response_envelope,
+                    response_mode: prompt.response_mode,
                     client: Arc::clone(configuration.client()),
                     llm: llm.clone(),
                     retry_delays: configuration
@@ -2288,7 +2295,7 @@ fn generic_lua_execution_diagnostic(source: &GenericLuaExecutionError) -> SafeDi
 
 struct LoadedGenericPrompt {
     system_prompt: String,
-    response_envelope: TranslationResponseEnvelope,
+    response_mode: TranslationResponseMode,
     fingerprint: Sha256Fingerprint,
 }
 
@@ -2297,8 +2304,12 @@ enum GenericPromptPreparationError {
     Cancelled,
     SystemResource(PromptResourceLoadError),
     ThinkingResource(PromptResourceLoadError),
+    RulesResource(PromptResourceLoadError),
+    ExampleResource(PromptResourceLoadError),
     SystemTemplate(PromptTemplateError),
     ThinkingTemplate(PromptTemplateError),
+    RulesTemplate(PromptTemplateError),
+    ExampleTemplate(PromptTemplateError),
 }
 
 async fn load_generic_prompt(
@@ -2308,34 +2319,30 @@ async fn load_generic_prompt(
     language_pair: &crate::language::LanguagePair,
     cancellation: &CooperativeCancellation,
 ) -> Result<LoadedGenericPrompt, GenericCommandError> {
-    let prompt_locale = configuration
-        .prompt_locale()
-        .resolve(language_pair.target())
-        .map_err(|source| GenericCommandError::operation("选择 Generic Prompt 语言", source))?;
-    let prompt_directory = configuration
-        .prompt_root()
-        .join(GENERIC_PROMPT_DIRECTORY_NAME)
-        .join(prompt_locale.as_str());
-    let template =
-        read_unparsed_prompt_resource(file_system, &prompt_directory.join(SYSTEM_PROMPT_FILE_NAME))
-            .await
-            .map_err(|source| {
-                generic_prompt_resource_failure("读取 Generic system Prompt", source)
-            })?;
-    let thinking = if configuration.thinking_output() {
+    let response_mode =
+        TranslationResponseMode::new(configuration.thinking_output(), configuration.source_echo());
+    let prompt_paths =
+        translation_prompt_resource_paths(configuration.prompt_root(), response_mode);
+    let template = read_unparsed_prompt_resource(file_system, prompt_paths.system())
+        .await
+        .map_err(|source| generic_prompt_resource_failure("读取翻译 system Prompt", source))?;
+    let thinking = if let Some(path) = prompt_paths.thinking() {
         Some(
-            read_unparsed_prompt_resource(
-                file_system,
-                &prompt_directory.join(THINKING_PROMPT_FILE_NAME),
-            )
-            .await
-            .map_err(|source| {
-                generic_prompt_resource_failure("读取 Generic thinking Prompt", source)
-            })?,
+            read_unparsed_prompt_resource(file_system, path)
+                .await
+                .map_err(|source| {
+                    generic_prompt_resource_failure("读取翻译 thinking Prompt", source)
+                })?,
         )
     } else {
         None
     };
+    let rules = read_unparsed_prompt_resource(file_system, prompt_paths.rules())
+        .await
+        .map_err(|source| generic_prompt_resource_failure("读取翻译响应规则 Prompt", source))?;
+    let example = read_unparsed_prompt_resource(file_system, prompt_paths.example())
+        .await
+        .map_err(|source| generic_prompt_resource_failure("读取翻译示例 Prompt", source))?;
     let language_pair = language_pair.clone();
     let prompt_cancellation = cancellation.clone();
     cpu.execute(move || {
@@ -2344,46 +2351,57 @@ async fn load_generic_prompt(
             ensure_generic_prompt_preparation_running(&prompt_cancellation)
         })?
         .map_err(GenericPromptPreparationError::SystemResource)?;
-        let mut system_prompt =
+        let rendered_system =
             render_system_prompt_template_with_cancellation(&template, &language_pair, || {
                 ensure_generic_prompt_preparation_running(&prompt_cancellation)
             })?
             .map_err(GenericPromptPreparationError::SystemTemplate)?;
-        let response_envelope = match thinking {
-            Some(thinking) => {
-                let thinking = parse_prompt_resource_with_cancellation(thinking, || {
-                    ensure_generic_prompt_preparation_running(&prompt_cancellation)
-                })?
-                .map_err(GenericPromptPreparationError::ThinkingResource)?;
-                ensure_no_prompt_template_variables_with_cancellation(&thinking, || {
-                    ensure_generic_prompt_preparation_running(&prompt_cancellation)
-                })?
-                .map_err(GenericPromptPreparationError::ThinkingTemplate)?;
-                system_prompt.push_str("\n\n");
-                append_generic_prompt_text(&mut system_prompt, &thinking, &prompt_cancellation)?;
-                TranslationResponseEnvelope::ThinkingThenJson
-            }
-            None => TranslationResponseEnvelope::JsonOnly,
-        };
-        let chunk_size =
-            std::num::NonZeroUsize::new(64 * 1024).expect("Prompt 指纹取消检查块大小必须非零");
-        let mut hasher = Sha256FramedHasher::new(b"att.generic.system-prompt");
-        hasher
-            .try_frame_chunks(1, system_prompt.as_bytes(), chunk_size, || {
+        let thinking = if let Some(thinking) = thinking {
+            let thinking = parse_prompt_resource_with_cancellation(thinking, || {
                 ensure_generic_prompt_preparation_running(&prompt_cancellation)
             })?
-            .frame(
-                2,
-                match response_envelope {
-                    TranslationResponseEnvelope::JsonOnly => b"json-only",
-                    TranslationResponseEnvelope::ThinkingThenJson => b"thinking-then-json",
-                },
-            );
-        ensure_generic_prompt_preparation_running(&prompt_cancellation)?;
+            .map_err(GenericPromptPreparationError::ThinkingResource)?;
+            ensure_no_prompt_template_variables_with_cancellation(&thinking, || {
+                ensure_generic_prompt_preparation_running(&prompt_cancellation)
+            })?
+            .map_err(GenericPromptPreparationError::ThinkingTemplate)?;
+            Some(thinking)
+        } else {
+            None
+        };
+        let rules = parse_prompt_resource_with_cancellation(rules, || {
+            ensure_generic_prompt_preparation_running(&prompt_cancellation)
+        })?
+        .map_err(GenericPromptPreparationError::RulesResource)?;
+        ensure_no_prompt_template_variables_with_cancellation(&rules, || {
+            ensure_generic_prompt_preparation_running(&prompt_cancellation)
+        })?
+        .map_err(GenericPromptPreparationError::RulesTemplate)?;
+
+        let example = parse_prompt_resource_with_cancellation(example, || {
+            ensure_generic_prompt_preparation_running(&prompt_cancellation)
+        })?
+        .map_err(GenericPromptPreparationError::ExampleResource)?;
+        ensure_no_prompt_template_variables_with_cancellation(&example, || {
+            ensure_generic_prompt_preparation_running(&prompt_cancellation)
+        })?
+        .map_err(GenericPromptPreparationError::ExampleTemplate)?;
+        let system_prompt = assemble_translation_system_prompt_with_cancellation(
+            rendered_system,
+            thinking,
+            rules,
+            example,
+            || ensure_generic_prompt_preparation_running(&prompt_cancellation),
+        )?;
+
+        let fingerprint =
+            generic_prompt_fingerprint_with_cancellation(&system_prompt, response_mode, || {
+                ensure_generic_prompt_preparation_running(&prompt_cancellation)
+            })?;
         Ok::<_, GenericPromptPreparationError>(LoadedGenericPrompt {
             system_prompt,
-            response_envelope,
-            fingerprint: hasher.finish(),
+            response_mode,
+            fingerprint,
         })
     })
     .await
@@ -2391,16 +2409,28 @@ async fn load_generic_prompt(
     .map_err(|source| match source {
         GenericPromptPreparationError::Cancelled => GenericCommandError::Cancelled,
         GenericPromptPreparationError::SystemResource(source) => {
-            generic_prompt_resource_failure("读取 Generic system Prompt", source)
+            generic_prompt_resource_failure("读取翻译 system Prompt", source)
         }
         GenericPromptPreparationError::ThinkingResource(source) => {
-            generic_prompt_resource_failure("读取 Generic thinking Prompt", source)
+            generic_prompt_resource_failure("读取翻译 thinking Prompt", source)
+        }
+        GenericPromptPreparationError::RulesResource(source) => {
+            generic_prompt_resource_failure("读取翻译响应规则 Prompt", source)
+        }
+        GenericPromptPreparationError::ExampleResource(source) => {
+            generic_prompt_resource_failure("读取翻译示例 Prompt", source)
         }
         GenericPromptPreparationError::SystemTemplate(source) => {
-            GenericCommandError::operation("渲染 Generic system Prompt", source)
+            GenericCommandError::operation("渲染翻译 system Prompt", source)
         }
         GenericPromptPreparationError::ThinkingTemplate(source) => {
-            GenericCommandError::operation("校验 Generic thinking Prompt", source)
+            GenericCommandError::operation("校验翻译 thinking Prompt", source)
+        }
+        GenericPromptPreparationError::RulesTemplate(source) => {
+            GenericCommandError::operation("校验翻译响应规则 Prompt", source)
+        }
+        GenericPromptPreparationError::ExampleTemplate(source) => {
+            GenericCommandError::operation("校验翻译示例 Prompt", source)
         }
     })
 }
@@ -2415,26 +2445,34 @@ fn ensure_generic_prompt_preparation_running(
     }
 }
 
-fn append_generic_prompt_text(
-    output: &mut String,
-    text: &str,
-    cancellation: &CooperativeCancellation,
-) -> Result<(), GenericPromptPreparationError> {
-    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
-
-    let mut start = 0_usize;
-    while start < text.len() {
-        ensure_generic_prompt_preparation_running(cancellation)?;
-        let mut end = start
-            .saturating_add(CANCELLATION_CHECK_BYTES)
-            .min(text.len());
-        while end < text.len() && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        output.push_str(&text[start..end]);
-        start = end;
-    }
-    ensure_generic_prompt_preparation_running(cancellation)
+fn generic_prompt_fingerprint_with_cancellation<E>(
+    system_prompt: &str,
+    response_mode: TranslationResponseMode,
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<Sha256Fingerprint, E> {
+    let chunk_size =
+        std::num::NonZeroUsize::new(64 * 1024).expect("Prompt 指纹取消检查块大小必须非零");
+    let mut hasher = Sha256FramedHasher::new(b"att.translation.system-prompt");
+    hasher
+        .try_frame_chunks(1, system_prompt.as_bytes(), chunk_size, &mut ensure_running)?
+        .frame(
+            2,
+            if response_mode.thinking() {
+                b"thinking=true"
+            } else {
+                b"thinking=false"
+            },
+        )
+        .frame(
+            3,
+            if response_mode.source_echo() {
+                b"source-echo=true"
+            } else {
+                b"source-echo=false"
+            },
+        );
+    ensure_running()?;
+    Ok(hasher.finish())
 }
 
 #[derive(Clone)]
@@ -3089,8 +3127,8 @@ fn generic_response_problem_diagnostic(
         ResponseProblem::UnexpectedId(id) => format!("problem=unexpected_id; output_id={id}"),
         ResponseProblem::DuplicateId(id) => format!("problem=duplicate_id; output_id={id}"),
         ResponseProblem::MissingId(id) => format!("problem=missing_id; output_id={id}"),
-        ResponseProblem::NonStringValue(id) => {
-            format!("problem=non_string_value; output_id={id}")
+        ResponseProblem::InvalidValue { output_id, .. } => {
+            format!("problem=invalid_value; output_id={output_id}")
         }
         ResponseProblem::InvalidTranslation { output_id, .. } => {
             format!("problem=invalid_translation; output_id={output_id}")
@@ -3160,7 +3198,7 @@ struct GenericTaskExecution {
     terminology: Arc<CompiledTerminology>,
     language_module: Arc<dyn LanguageModule>,
     system_prompt: String,
-    response_envelope: TranslationResponseEnvelope,
+    response_mode: TranslationResponseMode,
     client: Arc<crate::runtime::llm::OpenAiChatCompletionClient>,
     llm: OpenAiChatCompletionExecutor,
     retry_delays: Vec<Duration>,
@@ -3372,7 +3410,7 @@ struct GenericTaskRequestContext {
     terminology: Arc<CompiledTerminology>,
     language_module: Arc<dyn LanguageModule>,
     system_prompt: Arc<String>,
-    response_envelope: TranslationResponseEnvelope,
+    response_mode: TranslationResponseMode,
     client: Arc<crate::runtime::llm::OpenAiChatCompletionClient>,
     llm: OpenAiChatCompletionExecutor,
     retry_delays: Arc<Vec<Duration>>,
@@ -3427,7 +3465,7 @@ async fn execute_owned_generic_task(
         context.placeholder_rules.clone(),
         Arc::clone(&context.language_module),
         system_prompt,
-        context.response_envelope,
+        context.response_mode,
         context.client.as_ref(),
         &context.llm,
         context.retry_delays.as_slice(),
@@ -3452,7 +3490,7 @@ async fn execute_generic_tasks(
         terminology,
         language_module,
         system_prompt,
-        response_envelope,
+        response_mode,
         client,
         llm,
         retry_delays,
@@ -3473,7 +3511,7 @@ async fn execute_generic_tasks(
         terminology,
         language_module,
         system_prompt: Arc::new(system_prompt),
-        response_envelope,
+        response_mode,
         client,
         llm,
         retry_delays: Arc::new(retry_delays),
@@ -3714,7 +3752,7 @@ async fn execute_generic_task(
     placeholder_rules: GenericCompiledPlaceholderRules,
     language_module: Arc<dyn LanguageModule>,
     system_prompt: String,
-    response_envelope: TranslationResponseEnvelope,
+    response_mode: TranslationResponseMode,
     client: &crate::runtime::llm::OpenAiChatCompletionClient,
     llm: &OpenAiChatCompletionExecutor,
     retry_delays: &[Duration],
@@ -3764,7 +3802,7 @@ async fn execute_generic_task(
                     if matches!(finish_reason, LlmFinishReason::Stop) {
                         match parse_translation_response_with_cancellation(
                             &content,
-                            response_envelope,
+                            response_mode,
                             || {
                                 ensure_generic_response_processing_running(
                                     &response_cancellation,
@@ -3820,6 +3858,7 @@ async fn execute_generic_task(
                                 if record_evidence {
                                     response_record = Some(
                                         GenericTaskResponseRecord::parsed_with_cancellation(
+                                            content,
                                             parsed,
                                             || {
                                                 ensure_generic_response_processing_running(
@@ -3965,112 +4004,39 @@ fn render_generic_user_message_with_cancellation(
     cancellation: &CooperativeCancellation,
 ) -> Result<String, GenericPlanningError> {
     ensure_message_render_running(cancellation)?;
-    let mut output = b"Groups:\n".to_vec();
-    if !task.terminology_indices().is_empty() {
-        output.extend_from_slice(b"terminology:\n");
-        for index in task.terminology_indices() {
-            ensure_message_render_running(cancellation)?;
-            let entry = &terminology.entries()[*index];
-            append_json_string_with_cancellation(&mut output, entry.term(), cancellation)?;
-            output.extend_from_slice(b" => ");
-            append_json_string_with_cancellation(&mut output, entry.translation(), cancellation)?;
-            output.push(b'\n');
-        }
+    let mut selected_terminology = Vec::with_capacity(task.terminology_indices().len());
+    for index in task.terminology_indices() {
+        ensure_message_render_running(cancellation)?;
+        let entry = &terminology.entries()[*index];
+        selected_terminology.push(TranslationUserTerminology::new(
+            entry.term(),
+            entry.translation(),
+        ));
     }
+    let mut groups = Vec::with_capacity(task.groups().len());
     for group in task.groups() {
         ensure_message_render_running(cancellation)?;
-        append_generic_group_message_with_cancellation(&mut output, group, cancellation)?;
-        output.push(b'\n');
+        let mut units = Vec::with_capacity(group.units().len());
+        for unit in group.units() {
+            ensure_message_render_running(cancellation)?;
+            units.push(match unit.output_id() {
+                Some(id) => TranslationUserUnit::translated(
+                    id,
+                    None,
+                    TranslationReturnType::Free,
+                    unit.text(),
+                ),
+                None => TranslationUserUnit::context(None, unit.text()),
+            });
+        }
+        groups.push(TranslationUserGroup::new(group.kind(), units));
     }
     ensure_message_render_running(cancellation)?;
-    Ok(String::from_utf8(output)
-        .expect("ASCII 结构与 serde_json 字符串编码必须组成 UTF-8 模型消息"))
-}
-
-fn append_generic_group_message_with_cancellation(
-    output: &mut Vec<u8>,
-    group: &PlannedGroup,
-    cancellation: &CooperativeCancellation,
-) -> Result<(), GenericPlanningError> {
-    ensure_message_render_running(cancellation)?;
-    output.extend_from_slice(b"kind=");
-    append_json_string_with_cancellation(output, group.kind(), cancellation)?;
-    output.push(b'\n');
-    output.extend_from_slice(b"units:\n");
-    for unit in group.units() {
-        ensure_message_render_running(cancellation)?;
-        match unit.output_id() {
-            Some(output_id) => {
-                output.push(b'[');
-                output.extend_from_slice(output_id.to_string().as_bytes());
-                output.extend_from_slice(b"] ");
-            }
-            None => output.extend_from_slice(b"[-] "),
-        }
-        append_json_string_with_cancellation(output, unit.text(), cancellation)?;
-        output.push(b'\n');
-    }
-    ensure_message_render_running(cancellation)
-}
-
-fn append_json_string_with_cancellation(
-    output: &mut Vec<u8>,
-    value: &str,
-    cancellation: &CooperativeCancellation,
-) -> Result<(), GenericPlanningError> {
-    let (result, cancelled) = {
-        let mut writer = CancellableMessageWriter::new(output, cancellation);
-        let result = serde_json::to_writer(&mut writer, value);
-        (result, writer.cancelled)
-    };
-    if cancelled {
-        return Err(GenericPlanningError::Cancelled);
-    }
-    result.expect("向内存写入受信 UTF-8 JSON 字符串不能失败");
-    ensure_message_render_running(cancellation)
-}
-
-struct CancellableMessageWriter<'a> {
-    output: &'a mut Vec<u8>,
-    cancellation: &'a CooperativeCancellation,
-    bytes_until_check: usize,
-    cancelled: bool,
-}
-
-impl<'a> CancellableMessageWriter<'a> {
-    fn new(output: &'a mut Vec<u8>, cancellation: &'a CooperativeCancellation) -> Self {
-        Self {
-            output,
-            cancellation,
-            bytes_until_check: 0,
-            cancelled: false,
-        }
-    }
-}
-
-impl io::Write for CancellableMessageWriter<'_> {
-    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
-        const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
-
-        if input.is_empty() {
-            return Ok(0);
-        }
-        if self.bytes_until_check == 0 {
-            if self.cancellation.is_requested() {
-                self.cancelled = true;
-                return Err(io::Error::other("Generic 模型消息渲染已取消"));
-            }
-            self.bytes_until_check = CANCELLATION_CHECK_BYTES;
-        }
-        let written = input.len().min(self.bytes_until_check);
-        self.output.extend_from_slice(&input[..written]);
-        self.bytes_until_check -= written;
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
+    render_translation_user_message(
+        &TranslationUserMessage::new(selected_terminology, groups),
+        cancellation,
+    )
+    .map_err(|_| GenericPlanningError::Cancelled)
 }
 
 fn ensure_message_render_running(
@@ -5662,7 +5628,31 @@ mod tests {
     }
 
     fn task_id(value: usize) -> TaskId {
-        TaskId::new(value).expect("测试 Task ID 必须非零")
+        TaskId::new(value)
+    }
+
+    #[test]
+    fn generic_prompt_fingerprint_includes_both_response_switches() {
+        let modes = [
+            TranslationResponseMode::new(false, false),
+            TranslationResponseMode::new(true, false),
+            TranslationResponseMode::new(false, true),
+            TranslationResponseMode::new(true, true),
+        ];
+        let fingerprints = modes.map(|mode| {
+            generic_prompt_fingerprint_with_cancellation("相同 Prompt 正文", mode, || {
+                Ok::<_, ()>(())
+            })
+            .expect("未取消的 Prompt 指纹应建立")
+        });
+        for left in 0..fingerprints.len() {
+            for right in left + 1..fingerprints.len() {
+                assert_ne!(
+                    fingerprints[left], fingerprints[right],
+                    "不同响应开关组合必须产生不同自动译文语义指纹"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -6001,7 +5991,7 @@ mod tests {
             DiagnosticAction::FixInput,
         ));
         assert_interrupted(generic_prompt_resource_failure(
-            "读取 Generic system Prompt",
+            "读取翻译 system Prompt",
             PromptResourceLoadError::Read(ReadFileError::Io {
                 path: PathBuf::from("system.md"),
                 source: SystemFileSystemError::Windows(WindowsFsError::LockCancelled {
@@ -6657,19 +6647,19 @@ mod tests {
         .expect("翻译任务应该可规划");
         let message = render_generic_user_message(&prepared.plan.tasks()[0], terminology.as_ref());
 
-        assert!(message.contains("\"魔王\" => \"魔王（Demon King）\""));
+        assert!(message.contains("\"source\":\"魔王\",\"translation\":\"魔王（Demon King）\""));
         assert_eq!(
             message
-                .matches("\"魔王\" => \"魔王（Demon King）\"")
+                .matches("\"source\":\"魔王\",\"translation\":\"魔王（Demon King）\"")
                 .count(),
             1,
             "TaskBlock 命中的术语必须按文件顺序合并后只提供一次"
         );
-        assert!(message.contains("kind=\"dialogue\""));
-        assert!(message.contains("[-] \"已有上下文 "));
-        assert!(message.contains("[-] \"あ "));
-        assert!(message.contains("[1] \"あ "));
-        assert!(message.contains("[2] \"こんにちは\""));
+        assert!(message.contains("\"kind\":\"dialogue\""));
+        assert!(message.contains("\"text\":[\"已有上下文 "));
+        assert!(message.contains("\"text\":[\"あ "));
+        assert!(message.contains("\"id\":\"0\""));
+        assert!(message.contains("\"id\":\"1\""));
         assert!(
             prepared.plan.reused().is_empty(),
             "只供阅读的源文回退不能成为重复 Unit 的复用译文"
@@ -6803,9 +6793,10 @@ mod tests {
         assert!(reuse_context.starts_with("「你好 ") && reuse_context.ends_with('」'));
         assert!(placeholder_token::contains_reserved_prefix(reuse_context));
         assert_eq!(task.groups()[1].units()[0].output_id(), None);
-        assert_eq!(task.groups()[2].units()[0].output_id(), Some(task_id(1)));
+        assert_eq!(task.groups()[2].units()[0].output_id(), Some(task_id(0)));
         let message = render_generic_user_message(task, terminology.as_ref());
-        assert!(message.contains("[-] \"「你好 "));
+        assert!(message.contains("\"text\":[\"「你好 "));
+        assert!(message.contains("\"id\":\"0\""));
         assert!(!message.contains("{name}"));
     }
 
@@ -6907,8 +6898,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(rendered.contains("\\\""));
-        assert!(rendered.contains("\\n"));
-        assert!(rendered.contains("[10]"));
+        assert!(rendered.contains("\",\"魔王\"]"));
+        assert!(rendered.contains("\"id\":\"10\""));
     }
 
     #[test]
@@ -7336,11 +7327,11 @@ mod tests {
             task.expected_output_ids()
                 .map(TaskId::get)
                 .collect::<Vec<_>>(),
-            [1]
+            [0]
         );
         let parsed = parse_translation_response(
-            r#"{"1":"你好 {invented}"}"#,
-            TranslationResponseEnvelope::JsonOnly,
+            r#"{"0":["你好 {invented}"]}"#,
+            TranslationResponseMode::new(false, false),
         )
         .expect("响应应该可解析");
         let mut validation_counts = HashMap::<String, usize>::new();
@@ -7368,7 +7359,7 @@ mod tests {
                     output_id,
                     key,
                     ..
-                } if *output_id == task_id(1)
+                } if *output_id == task_id(0)
                     && key.group_id() == "target"
                     && key.unit_id() == "unit"
             )
@@ -7431,7 +7422,7 @@ mod tests {
                 .expected_output_ids()
                 .map(TaskId::get)
                 .collect::<Vec<_>>(),
-            [1],
+            [0],
             "复用失败的目标不能从同一次 Translate 消失"
         );
     }

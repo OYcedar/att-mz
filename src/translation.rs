@@ -7,3 +7,4 @@ pub(crate) mod planning_resource;
 pub(crate) mod profile;
 pub(crate) mod task_planning;
 pub(crate) mod task_record;
+pub(crate) mod user_message;

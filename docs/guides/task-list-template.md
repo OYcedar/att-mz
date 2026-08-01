@@ -16,7 +16,7 @@
 - 调用 cwd：<绝对路径>
 - 固定配置：<ATT 发布目录/config.toml；SHA-256>
 - 固定项目目录：<ATT 发布目录/projects>
-- 固定 Prompt 目录：<ATT 发布目录/prompts；运行 Translate 时填写实际 locale>
+- 固定 Prompt 目录：<ATT 发布目录/prompts/translation；SHA-256 或资源身份>
 - ATT 项目：
   - <mv | mz | generic>/<项目名>：<工作区；负责的内容；来源身份>
 - 已读取产品文档：<发布目录内相对路径>

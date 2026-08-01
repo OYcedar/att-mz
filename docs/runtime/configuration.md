@@ -32,8 +32,8 @@ CLI 不接受自定义配置路径，也不搜索当前工作目录、环境变�
 
 ```toml
 [prompts]
-locale = "auto"
 thinking_output = true
+source_echo = false
 
 [translation]
 record_translation_tasks = true
@@ -44,7 +44,10 @@ llm_client = "primary"
 target_task_user_message_characters = 24000
 ```
 
-- Prompt 的 `locale` 与 `thinking_output` 都必填；
+- Prompt 的 `thinking_output` 与 `source_echo` 都必填，分别控制可读翻译思考和原文回显；
+  两个开关互不排斥，可以同时开启；
+- 两个开关及其实际选择的 Prompt 内容都进入自动译文状态；改变任一开关会使受影响的
+  自动译文不再是 Current；
 - `record_translation_tasks` 可省略，默认 `true`；只有操作者明确不需要可读的模型任务记录时才设为 `false`；
 - Profile 的 `id` 和 `llm_client` 必须非空；
 - `llm_client` 必须引用现有 Client；

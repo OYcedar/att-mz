@@ -1,6 +1,6 @@
 [prompts]
-locale = "auto"
 thinking_output = true
+source_echo = false
 
 [llm.clients.primary]
 url = "https://api.example.com/v1/chat/completions"
