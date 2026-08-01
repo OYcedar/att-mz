@@ -31,6 +31,7 @@
 
 - [CLI](cli.md)
 - [配置](configuration.md)
+- [发行物](distribution.md)
 - [Chat Completions](chat-completions.md)
 - [SQLite](sqlite.md)
 - [项目日志](project-log.md)

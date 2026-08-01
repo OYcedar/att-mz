@@ -812,6 +812,10 @@ fn current_markdown_files() -> Vec<PathBuf> {
     let root = workspace_root();
     let mut files = vec![root.join("AGENTS.md"), root.join("README.md")];
     files.extend(collect_files_with_extension(&root.join("docs"), "md"));
+    files.extend(collect_files_with_extension(
+        &root.join("maintenance"),
+        "md",
+    ));
     files.extend(collect_files_with_extension(&root.join("skills"), "md"));
     files.sort();
     files.dedup();

@@ -162,7 +162,14 @@ function Test-SynchronizedResources {
         }
     }
 
-    foreach ($forbidden in @('AGENTS.md', 'config.example.toml', 'src', 'tests', 'target')) {
+    foreach ($forbidden in @(
+            'AGENTS.md',
+            'maintenance',
+            'config.example.toml',
+            'src',
+            'tests',
+            'target'
+        )) {
         $path = Join-Path $distributionRoot $forbidden
         if (Test-Path -LiteralPath $path) {
             $failures.Add("发行目录包含开发材料：$path")

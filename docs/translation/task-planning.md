@@ -13,13 +13,16 @@ Semantic Scope
    └─ Unit
 ```
 
-- Unit 是最小翻译和验收对象，保留自己的身份、角色、原文与来源语境；
+- Unit 是能够独立验收、提交或传播译文的最小翻译对象，保留自己的身份、角色、原文与
+  来源语境；必须共同生成和验收的多行或多项内容属于同一个 Unit，不能按显示行拆分；
 - Group 是不能拆开的语义整体，包含理解其中任一 Unit 所需的全部兄弟 Unit；
 - Semantic Scope 是允许连续组合 Group 的最大自然范围，TaskBlock 不能跨越它。
 
 Generic 中一个 JSONL 文件就是一个 Semantic Scope，一行是一个 Group。RPG Maker 的
 Semantic Scope、Group 和 Unit 由 Extract 保存的物理顺序和引擎语义明确建立，Translate
-不得再通过相邻路径或 owner 类型猜测层次。
+不得再通过相邻路径或 owner 类型猜测层次。物理文件、asset owner、读取批次、规则来源和
+适配器边界本身都不是语义边界；多个提取来源共同描述同一领域范围时，Extract 必须按数据源
+语义把它们归入正确的 Group 和 Semantic Scope，并建立统一自然顺序。
 
 ## 2. 固定规划顺序
 
@@ -36,8 +39,15 @@ Translate 始终按以下顺序工作：
 
 装箱时不读取译文状态。Current、复用、全局去重、非源语、完全保护、Placeholder token、
 术语命中、临时 ID 数值和以前的任务记录都不能改变块边界。相同 Extract 数据和相同
-Profile 目标必须反复得到完全相同的 Scope、Group、Unit 范围；重试只允许改变哪些 Unit
-带 ID，以及无编号 Unit 显示原文还是目标译文。
+Profile 目标必须反复得到完全相同的 Scope、Group、Unit 范围。实现可以提前计算语言、
+Current、复用或模型代表等状态候选，但这些候选不能成为装箱输入，也不能改变完整块；上述
+顺序规定的是语义依赖，不要求彼此独立的计算机械串行执行。
+
+在数据源快照、Extract 产生的三层结构与自然顺序、Profile 及其他明确参与装箱的稳定输入
+相同时，完整装箱结果必须跨翻译状态保持结构幂等：TaskBlock 的数量、顺序、边界，以及每个
+块包含的 Group 和 Unit 都完全相同。译文状态和模型责任只能改变哪些 Unit 带 ID、无编号
+Unit 显示原文还是目标译文，以及哪些无 ID 块不进入执行流水线；不能改变完整装箱结果。
+这不要求持久化 TaskBlock，也不要求不同状态下最终发送的消息逐字相同。
 
 ## 3. 稳定字符目标
 
