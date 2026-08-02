@@ -99,9 +99,10 @@ MZ 的 `101.parameters[4]` 可以缺少；存在时必须是字符串，纯空�
 
 Builtin 明确不读取插件参数、插件命令 `356/357`、`note`/`meta`、`MapInfos.json`、任意
 自定义 `data/*.json`、事件脚本 `355/655`、普通事件注释 `108/408`、普通 JavaScript 或其他
-未列出的字段与事件 code。已知结构中的这些内容应使用 [Extract Rules](rules.md)；需要把
-独立材料整理为 JSONL 时，建立独立的 [Generic 项目](../generic/README.md)。Builtin 没有
-插件文本分支，也不会因为内容看起来像玩家可见文本而推断字段语义。
+未列出的字段与事件 code。已知结构中的这些内容应先按 [Extract Rules](rules.md)判断；
+只有 Rules 也无法形成确定、完整、可逆读写时，才把独立材料整理为 JSONL 并建立
+[Generic 项目](../generic/README.md)。Builtin 没有覆盖、内容复杂、数量多或位于插件相关
+位置，都不能单独作为选择 Generic 的依据；ATT 也不会仅凭内容可见性猜测字段语义。
 
 Rules 的字段、来源、路径、捕获、顺序和错误范围由[规则规格](rules.md)定义。
 

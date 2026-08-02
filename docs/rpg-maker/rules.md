@@ -13,12 +13,6 @@ MV 姓名投影与 Extract Rules 的字段、默认值、互斥关系、解析�
 作用域、控制符和形状规则。提取、翻译阶段文档只说明状态交接，字段定义全部回到这里。外部
 作者读完本规格即可写对规则，真实行为不需要从源码反推。
 
-每个规范代码块前面都有一枚机器可读标记，说明它能拿来做什么：
-
-- `<!-- att-example: valid -->`：可直接交给相应生产解析器的完整有效输入；
-- `<!-- att-example: invalid -->`：必须被生产边界拒绝的完整输入；
-- `<!-- att-example: illustrative -->`：语法片段、数据夹具或物化结果，不是完整规则文件。
-
 ## 1. 三类文件解决不同问题
 
 | 文件 | 命令位置 | 它拥有的事实 | 它不负责 |
@@ -36,7 +30,6 @@ MV 姓名投影与 Extract Rules 的字段、默认值、互斥关系、解析�
 三类文件都是严格 UTF-8 TOML，根恰好包含 `rule` 数组。非空定义使用一个或多个
 `[[rule]]`；权威空定义统一写作：
 
-<!-- att-example: valid -->
 ```toml
 rule = []
 ```
@@ -44,7 +37,6 @@ rule = []
 零字节文件、只有注释的文件、缺少 `rule`、未知字段、重复字段或错误类型，都按普通
 无效输入处理，而不是空定义。文件只接受本规格列出的根、字段和值。
 
-<!-- att-example: invalid -->
 ```toml
 # 缺少必需的 rule 根；注释文件不是空定义。
 ```
@@ -76,7 +68,6 @@ rule = []
 生产解析与编译边界验收；MV 姓名规则和 Extract Rules 遵循同一套 TOML/PCRE2 转义原则，
 只是还要分别补齐 `speaker` 捕获，或 Extract 来源与 `text` 捕获。
 
-<!-- att-example: valid -->
 ```toml
 [[rule]]
 pattern = '\A(?<text>正文)\z'
@@ -91,14 +82,12 @@ pattern = '\A(?<text>正文)\z'
 例如，键的实际字节是 `a"b`（字母、双引号、字母）时，使用 TOML 单引号保住路径文本，
 再按 JSON string 把双引号写成 `\"`：
 
-<!-- att-example: illustrative -->
 ```toml
 path = '["a\"b"]'
 ```
 
 匹配游戏文本中的字面 `\SE[Bell]`，PCRE2 仍需用 `\\` 匹配一个反斜杠：
 
-<!-- att-example: valid -->
 ```toml
 [[rule]]
 pattern = '\\SE\[[^]]+\]'
@@ -114,7 +103,6 @@ pattern = '\\SE\[[^]]+\]'
 |---|---|---:|---|---|
 | `pattern` | string | 是 | 无 | 非空 PCRE2；必须恰好有一个名为 `speaker` 的命名捕获 |
 
-<!-- att-example: valid -->
 ```toml
 [[rule]]
 pattern = '\A\\N<(?<speaker>[^>]*)>\z'
@@ -123,7 +111,6 @@ pattern = '\A\\N<(?<speaker>[^>]*)>\z'
 未命名捕获随意使用，命名捕获则只有 `speaker` 一个位置。`pattern = ""` 会在编译边界
 作为空模式错误被拒绝——它不会变成一条到处零宽命中的规则。
 
-<!-- att-example: invalid -->
 ```toml
 [[rule]]
 pattern = ''
@@ -166,7 +153,6 @@ ATT 将从行首到最后一个 marker 结束处投影成 Literal/SpeakerSlot。
 后续连续 `401` 仍组成同一 DialogueBody。空或纯空白 `speaker` 只冻结已匹配外壳，不建立
 Speaker。
 
-<!-- att-example: illustrative -->
 ```text
 源第一行：\N< 勇者 >   你好
 pattern ：\A\\N<(?<speaker>[^>]*)>
@@ -214,7 +200,6 @@ Body    ：不由这一行建立
 
 ### 4.1 完整根结构和字段表
 
-<!-- att-example: valid -->
 ```toml
 [[rule]]
 file = "QuestEntries.json"
@@ -236,7 +221,6 @@ pattern = '\A\[title\](?<text>.+)\z'
 `file`、`plugin`、`code+parameter` 三种来源恰好选择一个，`code` 与 `parameter` 必须
 成对出现。字段到此为止：`label`、`priority`、`required`、`translate` 和版本字段都不存在。
 
-<!-- att-example: invalid -->
 ```toml
 [[rule]]
 file = "Actors.json"
@@ -338,7 +322,6 @@ Map 的规范文件名是 `Map` + 1～4,294,967,295 (`u32::MAX`) 的十进制 ID
 `Map4294967296.json` 不是 Map。这些近似名或越界名若作为精确安全 `file` 提供，则是普通
 自定义 DataFile。`Map*.json` 只遍历规范 Map，不匹配它们。
 
-<!-- att-example: valid -->
 ```toml
 [[rule]]
 file = "Map000.json"
@@ -347,7 +330,6 @@ path = 'displayName'
 
 上例合法，但来源身份是自定义 DataFile，不是 Map 0。系统不存在 Map 0。
 
-<!-- att-example: invalid -->
 ```toml
 [[rule]]
 file = "data/QuestEntries.json"
@@ -358,7 +340,6 @@ path = 'title'
 
 路径不是 JSONPath。完整语法为：
 
-<!-- att-example: illustrative -->
 ```ebnf
 path          = segment, { (".", bare-key) | bracket-step } ;
 segment       = bare-key | bracket-step ;
@@ -372,14 +353,12 @@ json-string   = JSON string token, including its double quotes ;
 键。quoted key 完整采用 JSON string 转义，因此 `path = '[""]'` 合法并选择空对象键；
 整个 `path = ''` 仍非法。
 
-<!-- att-example: valid -->
 ```toml
 [[rule]]
 file = "QuestEntries.json"
 path = '[""]'
 ```
 
-<!-- att-example: invalid -->
 ```toml
 [[rule]]
 file = "QuestEntries.json"
@@ -394,12 +373,10 @@ key 都不在其中。
 `decode_json = true` 只在所有路径步骤完成后额外解码一次，并要求额外解码结果仍是
 string。
 
-<!-- att-example: illustrative -->
 ```json
 {"payload":"{\"entry\":\"{\\\"title\\\":\\\"星港\\\"}\"}"}
 ```
 
-<!-- att-example: valid -->
 ```toml
 [[rule]]
 file = "QuestEntries.json"
@@ -436,7 +413,6 @@ path = 'payload.entry.title'
 字节位置排列；规则编号不参与排序。数组下标按数值顺序（`2` 在 `10` 前），而不是按
 位置字符串排序。
 
-<!-- att-example: valid -->
 ```toml
 [[rule]]
 file = "QuestEntries.json"
@@ -444,7 +420,6 @@ path = '[].line'
 pattern = '<t>(?<text>.*?)</t>'
 ```
 
-<!-- att-example: illustrative -->
 ```text
  源值：A<t>第一段</t>B<t>第二段</t>C
 物化组：
@@ -470,6 +445,12 @@ recipe：Literal("A<t>") + Slot(0) + Literal("</t>B<t>") + Slot(1) + Literal("</
 插件来源只读取 `js/plugins.js` 中名称精确匹配且 `status = true` 的参数。插件文件存在、
 但插件禁用或名称大小写不同，均不建立该来源。事件来源扫描规范 Map、CommonEvents 和
 Troops 中的事件列表；`code` 本身没有 ATT 预设语义。
+
+每个命中的事件 command 独立选择自己的一个 `parameters[parameter]`，可选路径和
+`pattern` 只作用于这个参数最终得到的单个 string。Rules 不会把相邻 `355/655`、多条
+command 或多个参数拼成一个脚本块，也不解析 JavaScript 语法。单条参数内边界确定且可逆
+的字面量可以用 Rules；需要跨 command 组合、依赖完整脚本语法或把一个译文同步到多个
+目标时，Rules 无法完整表达，应由外部转换建立独立 Generic 项目。
 
 整份 TOML 先严格解析和编译，再针对冻结来源执行。任一规则的来源身份、参数、路径类型、
 JSON 解码、最终 string、捕获、重建或物理 Claim 不成立，整个 Rules owner 候选失败，
@@ -540,7 +521,6 @@ owner 内、跨 owner Store 和 WriteBack 发布前使用同一规则。
 
 ### 6.1 RPG Maker scope
 
-<!-- att-example: valid -->
 ```toml
 [[rule]]
 scopes = ["event_dialogue", "event_choices"]
@@ -643,7 +623,6 @@ UTF-8 字符边界。自定义规则零命中合法。ATT 先求出每条规则�
 可以跨元素，但 `<msg>`、`</msg>` 这类实际 opaque 前后壳必须各自位于单个元素，拼接 LF
 只能留在 NaturalText 捕获中。
 
-<!-- att-example: valid -->
 ```toml
 [[rule]]
 scopes = ["event_dialogue"]
@@ -656,8 +635,9 @@ NaturalText，`\C[2]` 是 NaturalText 内的 Builtin 保护段。三者可以自
 同理，Extract 省略 `pattern` 得到的完整 Unit `<Help:炎之剑的说明>`，可以在
 `database_entry` scope 使用 `\A<Help:(?<text>.*?)>\z`：前后壳成为 opaque，正文保持
 NaturalText，但 Unit 原文、Group、recipe、持久身份和去重输入都不改变。Placeholder
-只保护明确跨度，不承担 `<Help:...>` grammar 的候选验收；需要这种责任时应在 ATT 之外
-完成格式转换和写回，并由独立 Generic 项目处理翻译。
+只保护明确跨度，不承担 `<Help:...>` grammar 的候选验收。需要由 ATT 保证前后壳时，应把
+Extract Rule 改为用 `text` 捕获正文，让前后壳进入 recipe，再重新 Extract。只有实际来源
+或写回关系超出 Extract Rules 的表达能力时，才由外部转换和独立 Generic 项目负责。
 
 例如源 `Lines` 为 `["<msg>第一行", "第二行</msg>"]` 时，若模式启用 DOTALL，元素边界
 位于 `text` 捕获中，因此合法；无 `text` 捕获并把两行整体保护的模式则使该单元规划失败。
@@ -694,7 +674,6 @@ Builtin 原控制符仍按内建控制语义拒绝；Custom 原片段不会反�
 
 假设术语 trigger 是 `勇者`：
 
-<!-- att-example: illustrative -->
 ```text
 原文：<actor title="勇者">勇者</actor>
 规则：<actor title="勇者">(?<text>.*?)</actor>

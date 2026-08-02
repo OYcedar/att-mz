@@ -868,8 +868,9 @@ mod tests {
     use crate::rpg_maker::write_back::rewriter::RpgMakerRewrittenFile;
 
     use crate::storage::file_system::{
-        BoundScopedDirectory, ScopedDirectoryEntry, ScopedDirectoryPath, ScopedDirectoryScope,
-        StagedDirectory, StagingCleanupFailure,
+        BoundScopedDirectory, DirectoryRecoveryError, DirectoryRecoveryOutcome,
+        ScopedDirectoryEntry, ScopedDirectoryPath, ScopedDirectoryScope, StagedDirectory,
+        StagingCleanupFailure,
     };
 
     type PrepareError = DirectoryPrepareError<FakeError>;
@@ -897,6 +898,13 @@ mod tests {
     impl RecoverableDirectoryPublisher for FakeRecoverablePublisher {
         type Error = FakeError;
         type StagingState = usize;
+
+        async fn recover(
+            &self,
+            _target_root: PathBuf,
+        ) -> Result<DirectoryRecoveryOutcome, DirectoryRecoveryError<Self::Error>> {
+            Ok(DirectoryRecoveryOutcome::Unchanged)
+        }
 
         async fn prepare(
             &self,

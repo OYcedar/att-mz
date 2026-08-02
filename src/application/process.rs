@@ -504,9 +504,10 @@ fn render_generic_command_result(
                 render_project_log_warning_if_present(localizer, warning.as_ref(), stderr).is_err();
             let diagnostic_failed =
                 render_safe_diagnostic(&error.safe_diagnostic(), localizer, stderr).is_err();
-            let related_failed = error.related_diagnostic().is_some_and(|related| {
-                render_safe_diagnostic(&related, localizer, stderr).is_err()
-            });
+            let mut related_failed = false;
+            for related in error.related_diagnostics() {
+                related_failed |= render_safe_diagnostic(&related, localizer, stderr).is_err();
+            }
             let shutdown_failed = render_generic_shutdown_errors(
                 shutdown_errors,
                 DiagnosticImpact::ProgressPreserved,

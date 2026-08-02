@@ -158,9 +158,10 @@ use crate::runtime::sqlite::{
 };
 use crate::runtime::windows::WindowsFsError;
 use crate::storage::file_system::{
-    DirectoryDiscardError, DirectoryPrepareError, DirectoryPublishError,
-    DirectoryStageRequestError, DirectoryTreeFingerprintError, ExistingDirectoryResolver,
-    FileReader, ListDirectoryError, ReadFileError, ResolveDirectoryError, StagingCleanupFailure,
+    DirectoryDiscardError, DirectoryPrepareError, DirectoryPublishError, DirectoryRecoveryError,
+    DirectoryRecoveryOutcome, DirectoryStageRequestError, DirectoryTreeFingerprintError,
+    ExistingDirectoryResolver, FileReader, ListDirectoryError, ReadFileError,
+    RecoverableDirectoryPublisher, ResolveDirectoryError, StagingCleanupFailure,
 };
 use crate::storage::sqlite::SnapshotDatabaseError;
 use crate::translation::planning_resource::TranslationPlanningResourceReadingService;
@@ -1469,6 +1470,84 @@ impl ProductionRpgMakerCommandRunner {
                 );
             }
         };
+        let directory_publisher = file_system.directory_publisher(command.publisher().clone());
+        let recovery_target = project_workspace.workspace_root().to_path_buf();
+        let engine_workspace_root = recovery_target
+            .parent()
+            .expect("固定项目工作区必有引擎父目录")
+            .to_path_buf();
+        let recovery = drive_command(
+            async {
+                match file_system
+                    .resolve_existing_directory(engine_workspace_root)
+                    .await
+                {
+                    Ok(_) => directory_publisher
+                        .recover(recovery_target)
+                        .await
+                        .map_err(ProjectWorkspaceConvergenceError::Recover),
+                    Err(ResolveDirectoryError::NotFound { .. }) => {
+                        Ok(DirectoryRecoveryOutcome::Unchanged)
+                    }
+                    Err(source) => {
+                        Err(ProjectWorkspaceConvergenceError::ObserveEngineWorkspaceRoot(source))
+                    }
+                }
+            },
+            termination_signals,
+            || {
+                cancellation.request();
+                file_system.cancel_waits();
+                sqlite.cancel_waits();
+            },
+            || {
+                defer_terminal_progress_status(
+                    progress.safe_stopping(progress_safe_stopping(self.locale)),
+                );
+            },
+        )
+        .await
+        .map(
+            |result: Result<DirectoryRecoveryOutcome, ProductionWorkspaceConvergenceError>| {
+                result.map_err(|source| map_init_error(InitServiceError::Workspace(source)))
+            },
+        );
+        match recovery {
+            DrivenCommand::Finished(Ok(_)) => {}
+            DrivenCommand::Finished(Err(error)) => {
+                let shutdown = roots.shutdown().await;
+                drop(project_lease_guard);
+                return ProductionCommandRunReport::failed_before_logging_with_shutdown(
+                    error, shutdown,
+                );
+            }
+            DrivenCommand::Interrupted(result) => {
+                let error = interrupted_non_cancellation_error(result);
+                let shutdown = finish_terminal_progress(progress, roots.shutdown().await);
+                drop(project_lease_guard);
+                return match error {
+                    Some(error) => ProductionCommandRunReport::failed_before_logging_with_shutdown(
+                        error, shutdown,
+                    ),
+                    None => ProductionCommandRunReport::interrupted_before_logging(shutdown),
+                };
+            }
+            DrivenCommand::SignalFailed { source, result } => {
+                let outcome = match result {
+                    Ok(DirectoryRecoveryOutcome::Recovered) => {
+                        SignalOutcomeSource::CompletedStateApplied
+                    }
+                    Ok(DirectoryRecoveryOutcome::Unchanged) => SignalOutcomeSource::Cancelled,
+                    Err(error) => SignalOutcomeSource::CommandFailed(error),
+                };
+                let shutdown = finish_terminal_progress(progress, roots.shutdown().await);
+                drop(project_lease_guard);
+                return ProductionCommandRunReport::failed_before_logging_with_shutdown(
+                    ProductionCommandError::signal(source, outcome),
+                    shutdown,
+                );
+            }
+        }
         let (game_root, plan_source) = match arguments.path.clone() {
             Some(path) => (path, ProjectLogValueSource::Explicit),
             None => {
@@ -1522,7 +1601,6 @@ impl ProductionRpgMakerCommandRunner {
                 );
             }
         };
-        let directory_publisher = file_system.directory_publisher(command.publisher().clone());
         let database = ProjectDatabaseCreationService::new(sqlite.clone());
         let database_reconciler =
             ProjectDatabaseStateReconciliationService::new(sqlite.clone(), sqlite.clone());
@@ -5607,6 +5685,7 @@ fn init_workspace_failure_report(
             };
             (class, report)
         }
+        ProjectWorkspaceConvergenceError::Recover(source) => init_recovery_failure_report(source),
         ProjectWorkspaceConvergenceError::Prepare(source) => init_prepare_failure_report(source),
         ProjectWorkspaceConvergenceError::Publish(source) => init_publish_failure_report(source),
         ProjectWorkspaceConvergenceError::CancellationCleanup(source) => (
@@ -5623,6 +5702,19 @@ fn init_workspace_failure_report(
     }
 }
 
+fn init_recovery_failure_report(
+    source: DirectoryRecoveryError<Box<SystemFileSystemError>>,
+) -> (InitFailureClass, FailureReport) {
+    let diagnostic = source.source_error().safe_diagnostic(
+        DiagnosticStage::Init,
+        DiagnosticImpact::Unchanged,
+        DiagnosticAction::CheckProjectState,
+    );
+    let report = ProductionCommandError::report_diagnostic(source, diagnostic);
+    let class = init_failure_class_from_report(&report, InitFailureClass::ProjectState);
+    (class, report)
+}
+
 fn init_prepare_failure_report(
     source: DirectoryPrepareError<Box<SystemFileSystemError>>,
 ) -> (InitFailureClass, FailureReport) {
@@ -5631,7 +5723,6 @@ fn init_prepare_failure_report(
         source,
         cleanup_failure,
     } = source;
-    let recovery_required = cleanup_failure.is_some();
     let diagnostic = source
         .safe_diagnostic(
             DiagnosticStage::Init,
@@ -5651,14 +5742,8 @@ fn init_prepare_failure_report(
             DiagnosticStage::Init,
         ));
     }
-    (
-        if recovery_required {
-            InitFailureClass::RecoveryRequired
-        } else {
-            InitFailureClass::ProjectState
-        },
-        report,
-    )
+    let class = init_failure_class_from_report(&report, InitFailureClass::ProjectState);
+    (class, report)
 }
 
 fn init_publish_failure_report(
@@ -5865,6 +5950,31 @@ enum InitFailureClass {
     Internal,
 }
 
+fn init_failure_class_from_report(
+    report: &FailureReport,
+    fallback: InitFailureClass,
+) -> InitFailureClass {
+    let primary = report.primary.public();
+    let has_impact = |expected| {
+        primary.impact == expected
+            || report
+                .related
+                .iter()
+                .any(|failure| failure.public().impact == expected)
+    };
+    if has_impact(DiagnosticImpact::OutcomeUnknown) {
+        InitFailureClass::OutcomeUnknown
+    } else if has_impact(DiagnosticImpact::RecoveryRequired) {
+        InitFailureClass::RecoveryRequired
+    } else if has_impact(DiagnosticImpact::StateAppliedFinalizationFailed) {
+        InitFailureClass::StateAppliedFinalizationFailed
+    } else if primary.action == DiagnosticAction::ReportBug {
+        InitFailureClass::Internal
+    } else {
+        fallback
+    }
+}
+
 fn init_workspace_diagnostic(
     source: &ProductionWorkspaceConvergenceError,
 ) -> (InitFailureClass, SafeDiagnostic) {
@@ -5917,6 +6027,14 @@ fn init_workspace_diagnostic(
                 DiagnosticAction::CheckPathAndPermissions,
             ),
         ),
+        ProjectWorkspaceConvergenceError::ObserveEngineWorkspaceRoot(source) => (
+            Class::ProjectState,
+            init_directory_diagnostic(
+                source,
+                DiagnosticCode::ProjectState,
+                DiagnosticAction::CheckProjectState,
+            ),
+        ),
         ProjectWorkspaceConvergenceError::WorkspaceRoot(source) => (
             Class::ProjectState,
             init_directory_diagnostic(
@@ -5963,6 +6081,23 @@ fn init_workspace_diagnostic(
         ),
         ProjectWorkspaceConvergenceError::InvalidStageRequest(source) => {
             (Class::Internal, init_stage_request_diagnostic(source))
+        }
+        ProjectWorkspaceConvergenceError::Recover(source) => {
+            let diagnostic = source.source_error().safe_diagnostic(
+                DiagnosticStage::Init,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckProjectState,
+            );
+            let class = match diagnostic.impact {
+                DiagnosticImpact::OutcomeUnknown => Class::OutcomeUnknown,
+                DiagnosticImpact::RecoveryRequired => Class::RecoveryRequired,
+                DiagnosticImpact::StateAppliedFinalizationFailed => {
+                    Class::StateAppliedFinalizationFailed
+                }
+                _ if diagnostic.action == DiagnosticAction::ReportBug => Class::Internal,
+                _ => Class::ProjectState,
+            };
+            (class, diagnostic)
         }
         ProjectWorkspaceConvergenceError::Prepare(source) => {
             (Class::ProjectState, init_prepare_diagnostic(source))
@@ -7004,7 +7139,7 @@ where
                 DiagnosticStage::WriteBack,
                 DiagnosticImpact::RecoveryRequired,
             );
-            ProductionCommandError::ProjectState(Box::new(report))
+            map_project_failure_report(report)
         }
         WriteBackServiceError::OpenProject(source) => {
             let diagnostic = SafeDiagnostic::new(
@@ -7026,22 +7161,14 @@ where
                 DiagnosticAction::CheckProjectState,
             );
             let report = ProductionCommandError::report_diagnostic(source, diagnostic);
-            if report.primary.public().action == DiagnosticAction::ReportBug {
-                ProductionCommandError::Internal(Box::new(report))
-            } else {
-                ProductionCommandError::ProjectState(Box::new(report))
-            }
+            map_project_failure_report(report)
         }
         WriteBackServiceError::PrepareCandidate(source) => {
             let report = source.into_write_back_failure_report(
                 DiagnosticStage::WriteBack,
                 DiagnosticImpact::Unchanged,
             );
-            if report.primary.public().action == DiagnosticAction::ReportBug {
-                ProductionCommandError::Internal(Box::new(report))
-            } else {
-                ProductionCommandError::ProjectState(Box::new(report))
-            }
+            map_project_failure_report(report)
         }
         WriteBackServiceError::ValidateCandidate {
             candidate_root: _,
@@ -7051,7 +7178,7 @@ where
                 DiagnosticStage::WriteBack,
                 DiagnosticImpact::Unchanged,
             );
-            ProductionCommandError::ProjectState(Box::new(report))
+            map_project_failure_report(report)
         }
         WriteBackServiceError::ValidateCandidateAndDiscard {
             candidate_root: _,
@@ -7067,43 +7194,24 @@ where
                 DiagnosticImpact::RecoveryRequired,
             );
             let report = append_related_report(report, discard_report);
-            ProductionCommandError::ProjectState(Box::new(report))
+            map_project_failure_report(report)
         }
         WriteBackServiceError::Publish { state, source } => {
-            let (impact, variant) = match &state {
-                WriteBackPublishFailureState::NotPublished { .. } => (
-                    DiagnosticImpact::Unchanged,
-                    WriteBackReportVariant::ProjectState,
-                ),
-                WriteBackPublishFailureState::PublishedWithResiduals { .. } => (
-                    DiagnosticImpact::StateAppliedFinalizationFailed,
-                    WriteBackReportVariant::StateAppliedFinalizationFailed,
-                ),
-                WriteBackPublishFailureState::RecoveryRequired { .. } => (
-                    DiagnosticImpact::RecoveryRequired,
-                    WriteBackReportVariant::RecoveryRequired,
-                ),
-                WriteBackPublishFailureState::OutcomeUnknown { .. } => (
-                    DiagnosticImpact::OutcomeUnknown,
-                    WriteBackReportVariant::OutcomeUnknown,
-                ),
+            let impact = match &state {
+                WriteBackPublishFailureState::NotPublished { .. } => DiagnosticImpact::Unchanged,
+                WriteBackPublishFailureState::PublishedWithResiduals { .. } => {
+                    DiagnosticImpact::StateAppliedFinalizationFailed
+                }
+                WriteBackPublishFailureState::RecoveryRequired { .. } => {
+                    DiagnosticImpact::RecoveryRequired
+                }
+                WriteBackPublishFailureState::OutcomeUnknown { .. } => {
+                    DiagnosticImpact::OutcomeUnknown
+                }
             };
             let report =
                 source.into_write_back_failure_report(DiagnosticStage::Publication, impact);
-            match variant {
-                WriteBackReportVariant::ProjectState => {
-                    ProductionCommandError::ProjectState(Box::new(report))
-                }
-                WriteBackReportVariant::StateAppliedFinalizationFailed => {
-                    ProductionCommandError::StateAppliedButFinalizationFailed(Box::new(report))
-                }
-                WriteBackReportVariant::RecoveryRequired => {
-                    ProductionCommandError::RecoveryRequired(Box::new(report))
-                }
-                WriteBackReportVariant::OutcomeUnknown => {
-                    ProductionCommandError::OutcomeUnknown(Box::new(report))
-                }
-            }
+            map_project_failure_report(report)
         }
     }
 }
@@ -7112,13 +7220,6 @@ fn append_related_report(mut primary: FailureReport, related: FailureReport) -> 
     primary.related.push(related.primary);
     primary.related.extend(related.related);
     primary
-}
-
-enum WriteBackReportVariant {
-    ProjectState,
-    StateAppliedFinalizationFailed,
-    RecoveryRequired,
-    OutcomeUnknown,
 }
 
 fn project_database_read_diagnostic(
@@ -8674,6 +8775,34 @@ mod command_result_renderer_tests {
         )
     }
 
+    #[derive(Debug)]
+    struct TestPublishingFailure {
+        override_impact: Option<DiagnosticImpact>,
+        related_impact: Option<DiagnosticImpact>,
+    }
+
+    impl fmt::Display for TestPublishingFailure {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("测试发布失败")
+        }
+    }
+
+    impl Error for TestPublishingFailure {}
+
+    impl WriteBackPublishingDiagnostic for TestPublishingFailure {
+        fn into_write_back_failure_report(
+            self,
+            _stage: DiagnosticStage,
+            impact: DiagnosticImpact,
+        ) -> FailureReport {
+            let report = test_report(self.override_impact.unwrap_or(impact));
+            match self.related_impact {
+                Some(related) => report.with_related_report(test_report(related)),
+                None => report,
+            }
+        }
+    }
+
     #[test]
     fn recovery_required_is_not_collapsed_into_state_applied_finalization_failure() {
         let report = test_report(DiagnosticImpact::Unchanged)
@@ -8696,6 +8825,135 @@ mod command_result_renderer_tests {
         assert!(matches!(
             map_project_failure_report(report),
             ProductionCommandError::OutcomeUnknown(_)
+        ));
+    }
+
+    #[test]
+    fn init_prepare_preserves_recovery_and_unknown_source_impacts() {
+        for (source, expected) in [
+            (
+                SystemFileSystemError::JournalCorrupt {
+                    path: PathBuf::from("C:/project/.directory-publish-test.journal"),
+                    reason: "invalid journal".to_owned(),
+                },
+                DiagnosticImpact::RecoveryRequired,
+            ),
+            (
+                SystemFileSystemError::OutcomeUnknown {
+                    target_root: PathBuf::from("C:/project/workspace"),
+                    artifacts: vec![PathBuf::from("C:/project/.directory-publish-test.journal")],
+                    reason: "unknown exchange state".to_owned(),
+                },
+                DiagnosticImpact::OutcomeUnknown,
+            ),
+        ] {
+            let mapped = map_init_error(InitServiceError::Workspace(
+                ProjectWorkspaceConvergenceError::Prepare(DirectoryPrepareError::NotPrepared {
+                    target_root: PathBuf::from("C:/project/workspace"),
+                    source: Box::new(source),
+                    cleanup_failure: None,
+                }),
+            ));
+            assert_eq!(mapped.failure_report().primary.public().impact, expected);
+            assert!(matches!(
+                (expected, mapped),
+                (
+                    DiagnosticImpact::RecoveryRequired,
+                    ProductionCommandError::RecoveryRequired(_)
+                ) | (
+                    DiagnosticImpact::OutcomeUnknown,
+                    ProductionCommandError::OutcomeUnknown(_)
+                )
+            ));
+        }
+    }
+
+    #[test]
+    fn init_explicit_recovery_preserves_recovery_and_unknown_impacts() {
+        for (source, expected) in [
+            (
+                SystemFileSystemError::JournalCorrupt {
+                    path: PathBuf::from("C:/project/.directory-publish-test.journal"),
+                    reason: "invalid journal".to_owned(),
+                },
+                DiagnosticImpact::RecoveryRequired,
+            ),
+            (
+                SystemFileSystemError::OutcomeUnknown {
+                    target_root: PathBuf::from("C:/project/workspace"),
+                    artifacts: vec![PathBuf::from("C:/project/.directory-publish-test.journal")],
+                    reason: "unknown exchange state".to_owned(),
+                },
+                DiagnosticImpact::OutcomeUnknown,
+            ),
+        ] {
+            let workspace_error: ProductionWorkspaceConvergenceError =
+                ProjectWorkspaceConvergenceError::Recover(DirectoryRecoveryError::new(
+                    PathBuf::from("C:/project/workspace"),
+                    Box::new(source),
+                ));
+            let mapped = map_init_error(InitServiceError::Workspace(workspace_error));
+            assert_eq!(mapped.failure_report().primary.public().impact, expected);
+            assert!(matches!(
+                (expected, mapped),
+                (
+                    DiagnosticImpact::RecoveryRequired,
+                    ProductionCommandError::RecoveryRequired(_)
+                ) | (
+                    DiagnosticImpact::OutcomeUnknown,
+                    ProductionCommandError::OutcomeUnknown(_)
+                )
+            ));
+        }
+    }
+
+    #[test]
+    fn write_back_preparation_and_discard_preserve_strongest_impact() {
+        type Error = WriteBackServiceError<
+            SystemFileSystemError,
+            SystemFileSystemError,
+            TestPublishingFailure,
+            SystemFileSystemError,
+        >;
+
+        let prepared = map_write_back_error(Error::PrepareCandidate(TestPublishingFailure {
+            override_impact: Some(DiagnosticImpact::OutcomeUnknown),
+            related_impact: None,
+        }));
+        assert!(matches!(
+            prepared,
+            ProductionCommandError::OutcomeUnknown(_)
+        ));
+
+        let discarded = map_write_back_error(Error::ValidateCandidateAndDiscard {
+            candidate_root: PathBuf::from("C:/project/candidate"),
+            source: TestPublishingFailure {
+                override_impact: None,
+                related_impact: None,
+            },
+            discard: TestPublishingFailure {
+                override_impact: None,
+                related_impact: None,
+            },
+        });
+        assert!(matches!(
+            discarded,
+            ProductionCommandError::RecoveryRequired(_)
+        ));
+
+        let publish_cleanup = map_write_back_error(Error::Publish {
+            state: WriteBackPublishFailureState::NotPublished {
+                output_root: PathBuf::from("C:/project/write_back"),
+                residual_paths: vec![PathBuf::from("C:/project/.write-back-residual")],
+            },
+            source: TestPublishingFailure {
+                override_impact: None,
+                related_impact: Some(DiagnosticImpact::RecoveryRequired),
+            },
+        });
+        assert!(matches!(
+            publish_cleanup,
+            ProductionCommandError::RecoveryRequired(_)
         ));
     }
 
@@ -8860,5 +9118,183 @@ mod command_result_renderer_tests {
             "dialogue_body"
         );
         assert_eq!(diagnostic["payload"]["max_fullwidth_chars"], 28);
+    }
+}
+
+#[cfg(test)]
+mod init_entry_recovery_tests {
+    use std::fs;
+
+    use super::*;
+    use crate::application::arguments::{InitArguments, ProjectArguments};
+    use crate::language::LanguageId;
+    use crate::rpg_maker::MaxFullwidthChars;
+    use crate::runtime::filesystem::{
+        DirectoryPublisherConfig, SystemFileSystemConfig, TestPublishFaultAction,
+        TestPublishFaultPoint, register_test_publish_faults,
+    };
+    use crate::storage::file_system::{
+        DirectoryPublishIntent, DirectorySourceMapping, DirectoryStageRequest,
+        RecoverableDirectoryPublisher,
+    };
+
+    fn init_command(
+        projects_root: &Path,
+        game_root: Option<PathBuf>,
+        include_settings: bool,
+    ) -> ConfiguredInitCommand {
+        let width =
+            include_settings.then(|| MaxFullwidthChars::new(20).expect("测试显示宽度应有效"));
+        ConfiguredInitCommand::for_test(
+            InitArguments {
+                project: ProjectArguments {
+                    name: "entry-recovery".parse().expect("测试项目名应有效"),
+                },
+                path: game_root,
+                source_language: include_settings
+                    .then(|| "ja".parse::<LanguageId>().expect("测试原文语言应有效")),
+                target_language: include_settings
+                    .then(|| "zh-Hans".parse::<LanguageId>().expect("测试译文语言应有效")),
+                dialogue_max_fullwidth_chars: width,
+                scrolling_text_max_fullwidth_chars: width,
+                help_description_max_fullwidth_chars: width,
+            },
+            projects_root,
+            "mz",
+        )
+    }
+
+    fn write_minimal_mz_game(game_root: &Path) {
+        fs::create_dir_all(game_root.join("data")).expect("测试 data 目录应可建立");
+        fs::create_dir_all(game_root.join("js")).expect("测试 js 目录应可建立");
+        fs::write(game_root.join("data/System.json"), b"{}").expect("测试数据文件应可写入");
+        fs::write(game_root.join("js/rmmz_core.js"), b"/* MZ */").expect("测试核心脚本应可写入");
+    }
+
+    fn copy_tree(source: &Path, target: &Path) {
+        fs::create_dir(target).expect("候选根应可建立");
+        for entry in fs::read_dir(source).expect("项目工作区应可读取") {
+            let entry = entry.expect("项目工作区目录项应可读取");
+            let source_path = entry.path();
+            let target_path = target.join(entry.file_name());
+            if entry
+                .file_type()
+                .expect("项目工作区目录项类型应可读取")
+                .is_dir()
+            {
+                copy_tree(&source_path, &target_path);
+            } else {
+                fs::copy(&source_path, &target_path).expect("项目工作区文件应可复制");
+            }
+        }
+    }
+
+    fn finish_successful_report(mut report: ProductionCommandRunReport) {
+        match &report.result {
+            CommandRunResult::Succeeded(_) => {}
+            CommandRunResult::Interrupted => panic!("Init 不应取消"),
+            CommandRunResult::Failed(error) => panic!("Init 应成功，实际为 {error}"),
+        }
+        assert!(report.shutdown_error.is_none());
+        if let Some(project_log) = report.pending_project_log.take() {
+            assert!(project_log.finish().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn init_recovers_missing_workspace_before_reusing_omitted_path() {
+        let temporary = tempfile::tempdir().expect("临时目录应可建立");
+        let projects_root = temporary.path().join("projects");
+        let game_root = temporary.path().join("game");
+        fs::create_dir(&projects_root).expect("项目根应可建立");
+        write_minimal_mz_game(&game_root);
+
+        let mut signals = TerminationSignals::new();
+        let first = ProductionRpgMakerCommandRunner::new(
+            RpgMakerLayout::MZ,
+            UiLocale::SimplifiedChinese,
+            ProgressMode::Off,
+        )
+        .run_init(
+            init_command(&projects_root, Some(game_root.clone()), true),
+            &mut signals,
+        )
+        .await;
+        finish_successful_report(first);
+
+        let workspace = projects_root.join("mz/entry-recovery");
+        let replacement = temporary.path().join("replacement");
+        copy_tree(&workspace, &replacement);
+        let file_system = SystemFileSystem::new(SystemFileSystemConfig::production())
+            .expect("测试文件系统根应可建立");
+        let publisher = file_system.directory_publisher(
+            DirectoryPublisherConfig::production(
+                projects_root.join(".att-locks/directory-publish/mz"),
+            )
+            .expect("测试发布配置应有效"),
+        );
+        let staged = publisher
+            .prepare(
+                DirectoryStageRequest::new(
+                    workspace.clone(),
+                    DirectoryPublishIntent::ReplaceExisting,
+                    vec![
+                        DirectorySourceMapping::new(replacement, PathBuf::new())
+                            .expect("测试来源映射应有效"),
+                    ],
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .expect("测试候选请求应有效"),
+            )
+            .await
+            .expect("测试替换候选应可准备");
+        let canonical_workspace = workspace
+            .parent()
+            .expect("工作区应有父目录")
+            .canonicalize()
+            .expect("工作区父目录应可规范化")
+            .join(workspace.file_name().expect("工作区应有名称"));
+        register_test_publish_faults(
+            canonical_workspace,
+            [(
+                TestPublishFaultPoint::BeforeBackupCleanup,
+                TestPublishFaultAction::Error,
+            )],
+        );
+        assert!(matches!(
+            publisher.publish(staged).await,
+            Err(DirectoryPublishError::PublishedWithResiduals { .. })
+        ));
+        file_system
+            .shutdown()
+            .await
+            .expect("测试文件系统根应可关闭");
+
+        fs::remove_dir_all(&workspace).expect("测试应可移除已发布目标以模拟中断现场");
+
+        let mut signals = TerminationSignals::new();
+        let resumed = ProductionRpgMakerCommandRunner::new(
+            RpgMakerLayout::MZ,
+            UiLocale::SimplifiedChinese,
+            ProgressMode::Off,
+        )
+        .run_init(init_command(&projects_root, None, false), &mut signals)
+        .await;
+        finish_successful_report(resumed);
+
+        assert!(workspace.join("project.db").is_file());
+        assert!(
+            fs::read_dir(workspace.parent().expect("工作区应有父目录"))
+                .expect("引擎项目根应可读取")
+                .all(|entry| {
+                    let name = entry
+                        .expect("引擎项目目录项应可读取")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned();
+                    !name.starts_with(".directory-publish-")
+                })
+        );
     }
 }

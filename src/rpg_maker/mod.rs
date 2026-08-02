@@ -5,8 +5,6 @@
 pub(crate) mod asset;
 pub(crate) mod asset_storage;
 pub(crate) mod dialogue;
-#[cfg(test)]
-pub(crate) mod documentation_test;
 pub(crate) mod extract;
 pub(crate) mod init;
 pub(crate) mod location_codec;

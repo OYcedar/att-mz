@@ -21,7 +21,7 @@ use crate::rpg_maker::project_database::{
 use crate::storage::file_system::{
     BoundScopedDirectory, DirectChildDirectoryEnsurer, DirectoryDiscardError, DirectoryEntry,
     DirectoryEntryKind, DirectoryLister, DirectoryPrepareError, DirectoryPublishError,
-    DirectoryPublishIntent, DirectorySourceMapping, DirectoryStageRequest,
+    DirectoryPublishIntent, DirectoryRecoveryError, DirectorySourceMapping, DirectoryStageRequest,
     DirectoryStageRequestError, DirectoryTreeFingerprintError, DirectoryTreeFingerprintRequest,
     DirectoryTreeFingerprinter, DirectoryTreeRoot, ExistingDirectoryResolver, FileReader,
     ListDirectoryError, ReadFileError, RecoverableDirectoryPublisher, ResolveDirectoryError,
@@ -253,6 +253,31 @@ where
             self.rpg_maker_layout,
             &request.name,
         );
+        let engine_workspace_root = final_layout
+            .workspace_root()
+            .parent()
+            .expect("固定项目工作区必有引擎父目录")
+            .to_path_buf();
+        match self
+            .file_system
+            .resolve_existing_directory(engine_workspace_root)
+            .await
+        {
+            Ok(_) => {
+                let _ = self
+                    .directories
+                    .recover(final_layout.workspace_root().to_path_buf())
+                    .await
+                    .map_err(ProjectWorkspaceConvergenceError::Recover)?;
+            }
+            Err(ResolveDirectoryError::NotFound { .. }) => {}
+            Err(error) => {
+                return Err(ProjectWorkspaceConvergenceError::ObserveEngineWorkspaceRoot(error));
+            }
+        }
+        if self.cancellation.is_requested() {
+            return Ok(OperationCompletion::Cancelled);
+        }
         let target_exists = match self
             .file_system
             .resolve_existing_directory(final_layout.workspace_root().to_path_buf())
@@ -978,6 +1003,7 @@ pub(crate) enum ProjectWorkspaceConvergenceError<D, S, I, R, E, P, A> {
         core_script: &'static str,
     },
     EngineWorkspaceRoot(E),
+    ObserveEngineWorkspaceRoot(ResolveDirectoryError<E>),
     WorkspaceRoot(ResolveDirectoryError<E>),
     InspectExistingDatabase(I),
     MissingInitialSettings(Vec<MissingInitialProjectSetting>),
@@ -985,6 +1011,7 @@ pub(crate) enum ProjectWorkspaceConvergenceError<D, S, I, R, E, P, A> {
     ObserveExistingSource(DirectoryTreeFingerprintError<P>),
     ObserveInputSource(DirectoryTreeFingerprintError<P>),
     InvalidStageRequest(DirectoryStageRequestError),
+    Recover(DirectoryRecoveryError<A>),
     Prepare(DirectoryPrepareError<A>),
     ObservePreservedDirectory(ResolveDirectoryError<E>),
     PreserveObservability {
@@ -1025,11 +1052,13 @@ impl<D, S, I, R, E, P, A> ProjectWorkspaceConvergenceError<D, S, I, R, E, P, A> 
             | Self::MissingInitialSettings(_)
             | Self::ObserveInputSource(_) => Impact::ConfigurationOrInput,
             Self::InvalidStageRequest(_) => Impact::Internal,
-            Self::WorkspaceRoot(_)
+            Self::ObserveEngineWorkspaceRoot(_)
+            | Self::WorkspaceRoot(_)
             | Self::InspectExistingDatabase(_)
             | Self::ObserveWorkspaceStructure(_)
             | Self::ObserveExistingSource(_)
             | Self::ObservePreservedDirectory(_) => Impact::ProjectState,
+            Self::Recover(_) => Impact::ProjectState,
             Self::Prepare(DirectoryPrepareError::NotPrepared {
                 cleanup_failure, ..
             }) => {
@@ -1121,6 +1150,9 @@ where
             Self::EngineWorkspaceRoot(error) => {
                 write!(formatter, "无法建立 RPG Maker 项目集合目录：{error}")
             }
+            Self::ObserveEngineWorkspaceRoot(error) => {
+                write!(formatter, "无法检查 RPG Maker 项目集合目录：{error}")
+            }
             Self::WorkspaceRoot(error) => write!(formatter, "项目工作区根无效：{error}"),
             Self::InspectExistingDatabase(error) => {
                 write!(formatter, "现存项目数据库无效：{error}")
@@ -1145,6 +1177,7 @@ where
                 write!(formatter, "无法检查本次游戏来源：{error}")
             }
             Self::InvalidStageRequest(error) => write!(formatter, "工作区候选请求无效：{error}"),
+            Self::Recover(error) => error.fmt(formatter),
             Self::Prepare(error) => write!(formatter, "无法准备工作区候选：{error}"),
             Self::ObservePreservedDirectory(error) => {
                 write!(formatter, "无法检查现存可观测性目录：{error}")
@@ -1340,6 +1373,7 @@ mod tests {
     use std::fs;
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     use super::*;
@@ -1462,7 +1496,7 @@ mod tests {
     struct FakeWorkspaceFileSystem {
         observations: Observations,
         namespace_error: Option<FakeError>,
-        target_exists: bool,
+        target_exists: Arc<AtomicBool>,
         workspace_structure: WorkspaceStructureObservation,
         existing_source: ExistingSourceObservation,
         candidate_fingerprint: [u8; 32],
@@ -1505,7 +1539,7 @@ mod tests {
             }
             if path == Path::new("C:/projects/mz/game") {
                 self.observations.event("workspace_root");
-                if self.target_exists {
+                if self.target_exists.load(Ordering::Acquire) {
                     return Ok(path);
                 }
                 return Err(ResolveDirectoryError::NotFound { path });
@@ -1891,6 +1925,8 @@ mod tests {
         observations: Observations,
         discard_error: Arc<Mutex<Option<FakeError>>>,
         preservation_failure: Option<PreservationFailure>,
+        target_exists: Arc<AtomicBool>,
+        recover_target_state: Option<bool>,
     }
 
     impl FileReader for FakeWorkspaceFileSystem {
@@ -1993,6 +2029,21 @@ mod tests {
     impl RecoverableDirectoryPublisher for FakePublisher {
         type Error = FakeError;
         type StagingState = usize;
+
+        async fn recover(
+            &self,
+            _target_root: PathBuf,
+        ) -> Result<
+            crate::storage::file_system::DirectoryRecoveryOutcome,
+            DirectoryRecoveryError<Self::Error>,
+        > {
+            if let Some(target_exists) = self.recover_target_state {
+                self.observations.event("recover");
+                self.target_exists.store(target_exists, Ordering::Release);
+                return Ok(crate::storage::file_system::DirectoryRecoveryOutcome::Recovered);
+            }
+            Ok(crate::storage::file_system::DirectoryRecoveryOutcome::Unchanged)
+        }
 
         async fn prepare(
             &self,
@@ -2113,6 +2164,7 @@ mod tests {
         Observations,
     ) {
         let observations = Observations::default();
+        let target_exists = Arc::new(AtomicBool::new(target_exists));
         (
             ProjectWorkspaceConvergenceService::new(
                 PathBuf::from("C:/projects"),
@@ -2132,7 +2184,7 @@ mod tests {
                 FakeWorkspaceFileSystem {
                     observations: observations.clone(),
                     namespace_error: None,
-                    target_exists,
+                    target_exists: Arc::clone(&target_exists),
                     workspace_structure,
                     existing_source,
                     candidate_fingerprint: [candidate_fingerprint; 32],
@@ -2142,6 +2194,8 @@ mod tests {
                     observations: observations.clone(),
                     discard_error: Arc::new(Mutex::new(None)),
                     preservation_failure: None,
+                    target_exists,
+                    recover_target_state: None,
                 },
                 CooperativeCancellation::default(),
             )
@@ -2423,6 +2477,86 @@ mod tests {
         assert!(!observations.events().contains(&"prepare"));
         assert!(!observations.events().contains(&"snapshot_database"));
         assert!(!observations.events().contains(&"reconcile_database"));
+    }
+
+    #[tokio::test]
+    async fn recovery_precedes_state_inheritance_and_unchanged_decision() {
+        for target_exists_before_recovery in [true, false] {
+            let current = database_state(0x33, Vec::new());
+            let (mut service, observations) = service(
+                target_exists_before_recovery,
+                WorkspaceStructureObservation::Complete,
+                ExistingSourceObservation::Fingerprint([0x33; 32]),
+                0x33,
+                Ok(current.clone()),
+                Ok(ProjectDatabaseReconciliation::for_test(current)),
+                Ok(()),
+            );
+            service.directories.recover_target_state = Some(true);
+
+            let outcome = service
+                .converge(omitted_settings_request())
+                .await
+                .expect("恢复后的项目应在同一次 Init 中继承设置并完成判断");
+
+            assert_eq!(
+                outcome,
+                OperationCompletion::Completed(ProjectWorkspaceConvergence::Unchanged)
+            );
+            let events = observations.events();
+            let recover = events
+                .iter()
+                .position(|event| *event == "recover")
+                .expect("应先调用显式目录恢复");
+            let workspace = events
+                .iter()
+                .position(|event| *event == "workspace_root")
+                .expect("恢复后应重新观察项目工作区");
+            let inspect = events
+                .iter()
+                .position(|event| *event == "inspect_database")
+                .expect("恢复后应读取现存数据库设置");
+            assert!(recover < workspace && workspace < inspect);
+            assert!(!events.contains(&"prepare"));
+            assert!(!events.contains(&"publish"));
+        }
+    }
+
+    #[tokio::test]
+    async fn recovered_missing_target_uses_replace_existing_for_changed_input() {
+        let current = database_state(0x33, Vec::new());
+        let updated = database_state(0x44, Vec::new());
+        let (mut service, observations) = service(
+            false,
+            WorkspaceStructureObservation::Complete,
+            ExistingSourceObservation::Fingerprint([0x33; 32]),
+            0x44,
+            Ok(current),
+            Ok(ProjectDatabaseReconciliation::for_test(updated)),
+            Ok(()),
+        );
+        service.directories.recover_target_state = Some(true);
+
+        let outcome = service
+            .converge(omitted_settings_request())
+            .await
+            .expect("恢复后的旧项目应在同一次 Init 中按新输入更新");
+
+        assert!(matches!(
+            outcome,
+            OperationCompletion::Completed(ProjectWorkspaceConvergence::Updated { .. })
+        ));
+        let stage_requests = observations
+            .stage_requests
+            .lock()
+            .expect("stage requests mutex should not be poisoned");
+        assert_eq!(stage_requests.len(), 1);
+        assert_eq!(
+            stage_requests[0].publish_intent(),
+            DirectoryPublishIntent::ReplaceExisting
+        );
+        assert!(observations.events().contains(&"snapshot_database"));
+        assert!(!observations.events().contains(&"create_database"));
     }
 
     #[tokio::test]

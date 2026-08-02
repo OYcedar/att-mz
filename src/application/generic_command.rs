@@ -99,9 +99,9 @@ use crate::runtime::project_log::{
 };
 use crate::runtime::windows::WindowsFsError;
 use crate::storage::file_system::{
-    DirectoryPrepareError, DirectoryPublishError, DirectoryPublishIntent, DirectorySourceMapping,
-    DirectoryStageRequest, FileReader, ReadFileError, RecoverableDirectoryPublisher,
-    StagingCleanupFailure,
+    DirectoryDiscardError, DirectoryPrepareError, DirectoryPublishError, DirectoryPublishIntent,
+    DirectorySourceMapping, DirectoryStageRequest, FileReader, ReadFileError,
+    RecoverableDirectoryPublisher, StagingCleanupFailure,
 };
 use crate::translation::placeholder::PlaceholderRuleCompilationError;
 use crate::translation::placeholder_projection::LanguageTextProjectionError;
@@ -361,6 +361,43 @@ impl fmt::Display for GenericShutdownError {
 
 impl Error for GenericShutdownError {}
 
+/// 候选目录或 Generic scratch 清理的类型化失败。
+#[derive(Debug)]
+pub(crate) struct GenericDiscardFailure {
+    diagnostic: SafeDiagnostic,
+    source: Box<dyn Error + Send + Sync>,
+}
+
+impl GenericDiscardFailure {
+    fn new(diagnostic: SafeDiagnostic, source: impl Error + Send + Sync + 'static) -> Self {
+        Self {
+            diagnostic,
+            source: Box::new(source),
+        }
+    }
+
+    fn safe_diagnostic(&self) -> SafeDiagnostic {
+        self.diagnostic.clone()
+    }
+
+    #[cfg(test)]
+    fn source_error(&self) -> &(dyn Error + 'static) {
+        self.source.as_ref()
+    }
+}
+
+impl fmt::Display for GenericDiscardFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl Error for GenericDiscardFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Generic 命令仍掌握完整阶段时建立的具体失败。
 #[derive(Debug)]
 pub(crate) enum GenericCommandError {
@@ -368,6 +405,7 @@ pub(crate) enum GenericCommandError {
     Operation {
         stage: &'static str,
         diagnostic: SafeDiagnostic,
+        related_diagnostics: Vec<SafeDiagnostic>,
         source: Box<dyn Error + Send + Sync>,
     },
     Signal {
@@ -377,8 +415,7 @@ pub(crate) enum GenericCommandError {
     },
     PublishDiscard {
         operation: Box<GenericCommandError>,
-        discard: String,
-        recovery_paths: Vec<PathBuf>,
+        discard: GenericDiscardFailure,
     },
 }
 
@@ -387,6 +424,7 @@ impl GenericCommandError {
         Self::Operation {
             stage,
             diagnostic: generic_operation_diagnostic(stage),
+            related_diagnostics: Vec::new(),
             source: Box::new(source),
         }
     }
@@ -399,6 +437,21 @@ impl GenericCommandError {
         Self::Operation {
             stage,
             diagnostic,
+            related_diagnostics: Vec::new(),
+            source: Box::new(source),
+        }
+    }
+
+    fn diagnosed_with_related(
+        stage: &'static str,
+        source: impl Error + Send + Sync + 'static,
+        diagnostic: SafeDiagnostic,
+        related_diagnostics: Vec<SafeDiagnostic>,
+    ) -> Self {
+        Self::Operation {
+            stage,
+            diagnostic,
+            related_diagnostics,
             source: Box::new(source),
         }
     }
@@ -446,36 +499,36 @@ impl GenericCommandError {
                     DiagnosticAction::Retry,
                 )
             }
-            Self::PublishDiscard { recovery_paths, .. } => {
-                let mut diagnostic = SafeDiagnostic::new(
-                    DiagnosticCode::WriteBackDiscard,
-                    DiagnosticStage::Publication,
-                    DiagnosticSubject::operation("generic_write_back_candidate_cleanup"),
-                    DiagnosticReason::failure(DiagnosticFailureKind::RollbackFailed),
-                    DiagnosticImpact::RecoveryRequired,
-                    DiagnosticAction::PreserveRecoveryArtifacts,
-                );
-                for path in recovery_paths {
-                    diagnostic = diagnostic.with_recovery(RecoveryFact::path(path));
-                }
-                diagnostic
-            }
+            Self::PublishDiscard { operation, .. } => operation.safe_diagnostic(),
         }
     }
 
-    /// 信号接收或候选清理失败可能伴随一个更早的业务失败。
-    pub(crate) fn related_diagnostic(&self) -> Option<SafeDiagnostic> {
+    /// 信号接收、候选清理或目录准备失败可能伴随更早的业务失败。
+    pub(crate) fn related_diagnostics(&self) -> Vec<SafeDiagnostic> {
         match self {
+            Self::Operation {
+                related_diagnostics,
+                ..
+            } => related_diagnostics.clone(),
             Self::Signal {
                 operation: Some(operation),
                 ..
+            } => {
+                let mut diagnostics = vec![operation.safe_diagnostic()];
+                diagnostics.extend(operation.related_diagnostics());
+                diagnostics
             }
-            | Self::PublishDiscard { operation, .. } => Some(operation.safe_diagnostic()),
+            Self::PublishDiscard {
+                operation, discard, ..
+            } => {
+                let mut diagnostics = operation.related_diagnostics();
+                diagnostics.push(discard.safe_diagnostic());
+                diagnostics
+            }
             Self::Cancelled
-            | Self::Operation { .. }
             | Self::Signal {
                 operation: None, ..
-            } => None,
+            } => Vec::new(),
         }
     }
 }
@@ -508,9 +561,26 @@ impl Error for GenericCommandError {
         match self {
             Self::Operation { source, .. } => Some(source.as_ref()),
             Self::Signal { source, .. } => Some(source),
-            Self::Cancelled | Self::PublishDiscard { .. } => None,
+            Self::PublishDiscard { operation, .. } => Some(operation.as_ref()),
+            Self::Cancelled => None,
         }
     }
+}
+
+fn generic_discard_failure(
+    source: impl Error + Send + Sync + 'static,
+    mut diagnostic: SafeDiagnostic,
+    recovery_paths: &[PathBuf],
+) -> GenericDiscardFailure {
+    diagnostic.code = DiagnosticCode::WriteBackDiscard;
+    diagnostic.stage = DiagnosticStage::Publication;
+    diagnostic.subject = DiagnosticSubject::operation("generic_write_back_candidate_cleanup");
+    diagnostic.impact = DiagnosticImpact::RecoveryRequired;
+    diagnostic.action = DiagnosticAction::PreserveRecoveryArtifacts;
+    for path in recovery_paths {
+        diagnostic = diagnostic.with_recovery(RecoveryFact::path(path));
+    }
+    GenericDiscardFailure::new(diagnostic, source)
 }
 
 fn generic_operation_diagnostic(stage: &'static str) -> SafeDiagnostic {
@@ -4686,27 +4756,26 @@ fn generic_scratch_command_error(
     stage: &'static str,
     source: GenericScratchError,
 ) -> GenericCommandError {
-    if matches!(&source, GenericScratchError::Cancelled) {
-        return GenericCommandError::Cancelled;
-    }
-    if matches!(
-        &source,
-        GenericScratchError::CleanupAfterFailure { operation, .. }
-            if matches!(operation.as_ref(), GenericScratchError::Cancelled)
-    ) {
-        let GenericScratchError::CleanupAfterFailure { cleanup, .. } = source else {
-            unreachable!("上方模式已经确认取消后的清理失败");
-        };
+    if let GenericScratchError::CleanupAfterFailure { operation, cleanup } = source {
         let recovery_paths = scratch_cleanup_recovery_path(&cleanup)
             .into_iter()
-            .collect();
+            .collect::<Vec<_>>();
+        let operation = if matches!(operation.as_ref(), GenericScratchError::Cancelled) {
+            GenericCommandError::Cancelled
+        } else {
+            GenericCommandError::operation(stage, *operation)
+        };
+        let discard = generic_scratch_discard_failure(*cleanup, &recovery_paths);
         return GenericCommandError::PublishDiscard {
-            operation: Box::new(GenericCommandError::Cancelled),
-            discard: cleanup.to_string(),
-            recovery_paths,
+            operation: Box::new(operation),
+            discard,
         };
     }
-    GenericCommandError::operation(stage, source)
+    if matches!(source, GenericScratchError::Cancelled) {
+        GenericCommandError::Cancelled
+    } else {
+        GenericCommandError::operation(stage, source)
+    }
 }
 
 fn scratch_cleanup_recovery_path(source: &GenericScratchError) -> Option<PathBuf> {
@@ -4720,6 +4789,68 @@ fn scratch_cleanup_recovery_path(source: &GenericScratchError) -> Option<PathBuf
         | GenericScratchError::InvalidRelativePath(_)
         | GenericScratchError::InvalidMaterializedFile { .. }
         | GenericScratchError::TargetNotDirectory(_) => None,
+    }
+}
+
+fn generic_scratch_discard_failure(
+    source: GenericScratchError,
+    recovery_paths: &[PathBuf],
+) -> GenericDiscardFailure {
+    let diagnostic = generic_scratch_cleanup_diagnostic(&source);
+    generic_discard_failure(source, diagnostic, recovery_paths)
+}
+
+fn generic_scratch_cleanup_diagnostic(source: &GenericScratchError) -> SafeDiagnostic {
+    match source {
+        GenericScratchError::Io {
+            operation,
+            path,
+            source,
+        } => SafeDiagnostic::io(
+            DiagnosticCode::WriteBackDiscard,
+            DiagnosticStage::Publication,
+            DiagnosticSubject::path(path),
+            operation,
+            source,
+            DiagnosticImpact::RecoveryRequired,
+            DiagnosticAction::PreserveRecoveryArtifacts,
+        ),
+        GenericScratchError::UnsafeCleanupTarget { scratch_root, .. } => SafeDiagnostic::new(
+            DiagnosticCode::WriteBackDiscard,
+            DiagnosticStage::Publication,
+            DiagnosticSubject::path(scratch_root),
+            DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
+            DiagnosticImpact::RecoveryRequired,
+            DiagnosticAction::PreserveRecoveryArtifacts,
+        ),
+        GenericScratchError::CleanupAfterFailure { cleanup, .. } => {
+            generic_scratch_cleanup_diagnostic(cleanup)
+        }
+        GenericScratchError::Cancelled => SafeDiagnostic::new(
+            DiagnosticCode::WriteBackDiscard,
+            DiagnosticStage::Publication,
+            DiagnosticSubject::operation("generic_write_back_candidate_cleanup"),
+            DiagnosticReason::failure(DiagnosticFailureKind::LockCancelled),
+            DiagnosticImpact::RecoveryRequired,
+            DiagnosticAction::PreserveRecoveryArtifacts,
+        ),
+        GenericScratchError::InvalidRelativePath(path)
+        | GenericScratchError::TargetNotDirectory(path) => SafeDiagnostic::new(
+            DiagnosticCode::WriteBackDiscard,
+            DiagnosticStage::Publication,
+            DiagnosticSubject::path(path),
+            DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
+            DiagnosticImpact::RecoveryRequired,
+            DiagnosticAction::PreserveRecoveryArtifacts,
+        ),
+        GenericScratchError::InvalidMaterializedFile { path, .. } => SafeDiagnostic::new(
+            DiagnosticCode::WriteBackDiscard,
+            DiagnosticStage::Publication,
+            DiagnosticSubject::path(path),
+            DiagnosticReason::failure(DiagnosticFailureKind::GenericSourceDocumentInvalid),
+            DiagnosticImpact::RecoveryRequired,
+            DiagnosticAction::PreserveRecoveryArtifacts,
+        ),
     }
 }
 
@@ -4880,7 +5011,7 @@ impl GenericCommandRunReport {
             let mut diagnostics = match &result {
                 GenericCommandRunResult::Failed(error) => {
                     let mut diagnostics = vec![error.safe_diagnostic()];
-                    diagnostics.extend(error.related_diagnostic());
+                    diagnostics.extend(error.related_diagnostics());
                     diagnostics
                 }
                 GenericCommandRunResult::Succeeded(_) | GenericCommandRunResult::Interrupted => {
@@ -4892,37 +5023,39 @@ impl GenericCommandRunReport {
                     .iter()
                     .map(GenericShutdownError::safe_diagnostic),
             );
-            let outcome = if !shutdown_errors.is_empty() {
-                ProjectLogRunOutcome::Failed
-            } else {
-                match &result {
-                    GenericCommandRunResult::Succeeded(_) => ProjectLogRunOutcome::Succeeded,
-                    GenericCommandRunResult::Interrupted => ProjectLogRunOutcome::Cancelled,
-                    GenericCommandRunResult::Failed(error)
-                        if matches!(
-                            error.safe_diagnostic().impact,
-                            DiagnosticImpact::RecoveryRequired
-                        ) =>
-                    {
-                        ProjectLogRunOutcome::RecoveryRequired
-                    }
-                    GenericCommandRunResult::Failed(error)
-                        if matches!(
-                            error.safe_diagnostic().impact,
-                            DiagnosticImpact::OutcomeUnknown
-                        ) =>
-                    {
-                        ProjectLogRunOutcome::OutcomeUnknown
-                    }
-                    GenericCommandRunResult::Failed(_) => ProjectLogRunOutcome::Failed,
-                }
-            };
+            let outcome = generic_project_log_outcome(&result, &shutdown_errors, &diagnostics);
             PendingProjectLog::new(project_log, outcome, diagnostics)
         });
         Self {
             result,
             shutdown_errors,
             pending_project_log,
+        }
+    }
+}
+
+fn generic_project_log_outcome(
+    result: &GenericCommandRunResult,
+    shutdown_errors: &[GenericShutdownError],
+    diagnostics: &[SafeDiagnostic],
+) -> ProjectLogRunOutcome {
+    if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.impact == DiagnosticImpact::OutcomeUnknown)
+    {
+        ProjectLogRunOutcome::OutcomeUnknown
+    } else if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.impact == DiagnosticImpact::RecoveryRequired)
+    {
+        ProjectLogRunOutcome::RecoveryRequired
+    } else if !shutdown_errors.is_empty() {
+        ProjectLogRunOutcome::Failed
+    } else {
+        match result {
+            GenericCommandRunResult::Succeeded(_) => ProjectLogRunOutcome::Succeeded,
+            GenericCommandRunResult::Interrupted => ProjectLogRunOutcome::Cancelled,
+            GenericCommandRunResult::Failed(_) => ProjectLogRunOutcome::Failed,
         }
     }
 }
@@ -4956,11 +5089,14 @@ async fn publish_generic_write_back(
     if cancellation.is_requested() {
         return match cleanup_write_back_source(&workspace_root, &scratch_root) {
             Ok(()) => Err(GenericCommandError::Cancelled),
-            Err(cleanup) => Err(GenericCommandError::PublishDiscard {
-                operation: Box::new(GenericCommandError::Cancelled),
-                discard: cleanup.to_string(),
-                recovery_paths: vec![scratch_root],
-            }),
+            Err(cleanup) => {
+                let recovery_paths = vec![scratch_root];
+                let discard = generic_scratch_discard_failure(cleanup, &recovery_paths);
+                Err(GenericCommandError::PublishDiscard {
+                    operation: Box::new(GenericCommandError::Cancelled),
+                    discard,
+                })
+            }
         };
     }
 
@@ -5046,8 +5182,13 @@ async fn publish_generic_write_back(
         return discard_after_failure(&publisher, staged, GenericCommandError::Cancelled).await;
     }
     publisher.publish(staged).await.map_err(|source| {
-        let diagnostic = generic_publish_diagnostic(&source);
-        GenericCommandError::diagnosed("发布 Generic 写回目录", source, diagnostic)
+        let (diagnostic, related_diagnostics) = generic_publish_diagnostics(&source);
+        GenericCommandError::diagnosed_with_related(
+            "发布 Generic 写回目录",
+            source,
+            diagnostic,
+            related_diagnostics,
+        )
     })?;
     Ok(GenericCommandOutput::WriteBack {
         project: project_name,
@@ -5064,7 +5205,34 @@ fn generic_prepare_error(
     if cancellation.is_requested() && directory_prepare_cancelled_without_cleanup(&source) {
         GenericCommandError::Cancelled
     } else {
-        GenericCommandError::operation("准备 Generic 写回候选", source)
+        let DirectoryPrepareError::NotPrepared {
+            target_root,
+            source: prepare_source,
+            cleanup_failure,
+        } = source;
+        let diagnostic = prepare_source
+            .safe_diagnostic(
+                DiagnosticStage::Publication,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckPathAndPermissions,
+            )
+            .with_recovery(RecoveryFact::path(&target_root));
+        let related_diagnostics = cleanup_failure
+            .as_ref()
+            .map(generic_staging_cleanup_diagnostic)
+            .into_iter()
+            .collect();
+        let source = DirectoryPrepareError::NotPrepared {
+            target_root,
+            source: prepare_source,
+            cleanup_failure,
+        };
+        GenericCommandError::diagnosed_with_related(
+            "准备 Generic 写回候选",
+            source,
+            diagnostic,
+            related_diagnostics,
+        )
     }
 }
 
@@ -5085,11 +5253,14 @@ fn generic_scratch_handoff_failure(
 ) -> GenericCommandError {
     match cleanup_write_back_source(workspace_root, scratch_root) {
         Ok(()) => operation,
-        Err(cleanup) => GenericCommandError::PublishDiscard {
-            operation: Box::new(operation),
-            discard: cleanup.to_string(),
-            recovery_paths: vec![scratch_root.to_path_buf()],
-        },
+        Err(cleanup) => {
+            let recovery_paths = vec![scratch_root.to_path_buf()];
+            let discard = generic_scratch_discard_failure(cleanup, &recovery_paths);
+            GenericCommandError::PublishDiscard {
+                operation: Box::new(operation),
+                discard,
+            }
+        }
     }
 }
 
@@ -5113,14 +5284,14 @@ fn directory_prepare_cancelled_without_cleanup(
     }
 }
 
-fn generic_publish_diagnostic(
+fn generic_publish_diagnostics(
     source: &DirectoryPublishError<Box<SystemFileSystemError>>,
-) -> SafeDiagnostic {
+) -> (SafeDiagnostic, Vec<SafeDiagnostic>) {
     match source {
         DirectoryPublishError::TargetAlreadyExists {
             target_root,
             cleanup_failure,
-        } => with_staging_cleanup(
+        } => with_staging_cleanup_diagnostic(
             SafeDiagnostic::new(
                 DiagnosticCode::WriteBackPublish,
                 DiagnosticStage::Publication,
@@ -5134,7 +5305,7 @@ fn generic_publish_diagnostic(
         DirectoryPublishError::TargetMissing {
             target_root,
             cleanup_failure,
-        } => with_staging_cleanup(
+        } => with_staging_cleanup_diagnostic(
             SafeDiagnostic::new(
                 DiagnosticCode::WriteBackPublish,
                 DiagnosticStage::Publication,
@@ -5148,7 +5319,7 @@ fn generic_publish_diagnostic(
         DirectoryPublishError::TargetNotDirectory {
             target_root,
             cleanup_failure,
-        } => with_staging_cleanup(
+        } => with_staging_cleanup_diagnostic(
             SafeDiagnostic::new(
                 DiagnosticCode::WriteBackPublish,
                 DiagnosticStage::Publication,
@@ -5168,7 +5339,7 @@ fn generic_publish_diagnostic(
             target_root,
             source,
             cleanup_failure,
-        } => with_staging_cleanup(
+        } => with_staging_cleanup_diagnostic(
             source
                 .safe_diagnostic(
                     DiagnosticStage::Publication,
@@ -5182,55 +5353,76 @@ fn generic_publish_diagnostic(
             target_root,
             residual_path,
             source,
-        } => source
-            .safe_diagnostic(
-                DiagnosticStage::Publication,
-                DiagnosticImpact::StateAppliedFinalizationFailed,
-                DiagnosticAction::PreserveRecoveryArtifacts,
-            )
-            .with_recovery(RecoveryFact::path(target_root))
-            .with_recovery(RecoveryFact::path(residual_path)),
+        } => (
+            source
+                .safe_diagnostic(
+                    DiagnosticStage::Publication,
+                    DiagnosticImpact::StateAppliedFinalizationFailed,
+                    DiagnosticAction::PreserveRecoveryArtifacts,
+                )
+                .with_recovery(RecoveryFact::path(target_root))
+                .with_recovery(RecoveryFact::path(residual_path)),
+            Vec::new(),
+        ),
         DirectoryPublishError::RecoveryRequired {
             target_root,
             recovery_artifacts,
             source,
-        } => with_recovery_paths(
-            source
-                .safe_diagnostic(
-                    DiagnosticStage::Publication,
-                    DiagnosticImpact::RecoveryRequired,
-                    DiagnosticAction::PreserveRecoveryArtifacts,
-                )
-                .with_recovery(RecoveryFact::path(target_root)),
-            recovery_artifacts,
+        } => (
+            with_recovery_paths(
+                source
+                    .safe_diagnostic(
+                        DiagnosticStage::Publication,
+                        DiagnosticImpact::RecoveryRequired,
+                        DiagnosticAction::PreserveRecoveryArtifacts,
+                    )
+                    .with_recovery(RecoveryFact::path(target_root)),
+                recovery_artifacts,
+            ),
+            Vec::new(),
         ),
         DirectoryPublishError::OutcomeUnknown {
             target_root,
             recovery_artifacts,
             source,
-        } => with_recovery_paths(
-            source
-                .safe_diagnostic(
-                    DiagnosticStage::Publication,
-                    DiagnosticImpact::OutcomeUnknown,
-                    DiagnosticAction::PreserveRecoveryArtifacts,
-                )
-                .with_recovery(RecoveryFact::path(target_root)),
-            recovery_artifacts,
+        } => (
+            with_recovery_paths(
+                source
+                    .safe_diagnostic(
+                        DiagnosticStage::Publication,
+                        DiagnosticImpact::OutcomeUnknown,
+                        DiagnosticAction::PreserveRecoveryArtifacts,
+                    )
+                    .with_recovery(RecoveryFact::path(target_root)),
+                recovery_artifacts,
+            ),
+            Vec::new(),
         ),
     }
 }
 
-fn with_staging_cleanup(
-    mut diagnostic: SafeDiagnostic,
+fn with_staging_cleanup_diagnostic(
+    diagnostic: SafeDiagnostic,
     cleanup: Option<&StagingCleanupFailure<Box<SystemFileSystemError>>>,
+) -> (SafeDiagnostic, Vec<SafeDiagnostic>) {
+    let related = cleanup
+        .map(generic_staging_cleanup_diagnostic)
+        .into_iter()
+        .collect();
+    (diagnostic, related)
+}
+
+fn generic_staging_cleanup_diagnostic(
+    cleanup: &StagingCleanupFailure<Box<SystemFileSystemError>>,
 ) -> SafeDiagnostic {
-    if let Some(cleanup) = cleanup {
-        diagnostic = diagnostic
-            .with_recovery(RecoveryFact::path(cleanup.residual_path()))
-            .with_recovery(RecoveryFact::component("candidate_cleanup=failed"));
-    }
-    diagnostic
+    cleanup
+        .source()
+        .safe_diagnostic(
+            DiagnosticStage::Publication,
+            DiagnosticImpact::RecoveryRequired,
+            DiagnosticAction::PreserveRecoveryArtifacts,
+        )
+        .with_recovery(RecoveryFact::path(cleanup.residual_path()))
 }
 
 fn with_recovery_paths(mut diagnostic: SafeDiagnostic, paths: &[PathBuf]) -> SafeDiagnostic {
@@ -5511,18 +5703,31 @@ async fn discard_after_failure<P>(
 ) -> Result<GenericCommandOutput, GenericCommandError>
 where
     P: RecoverableDirectoryPublisher,
+    P::Error: SafeDiagnosticSource,
 {
     match publisher.discard(staged).await {
         Ok(()) => Err(operation),
         Err(discard) => {
-            let recovery_path = discard.staging_root().to_path_buf();
+            let discard = generic_directory_discard_failure(discard);
             Err(GenericCommandError::PublishDiscard {
                 operation: Box::new(operation),
-                discard: discard.to_string(),
-                recovery_paths: vec![recovery_path],
+                discard,
             })
         }
     }
+}
+
+fn generic_directory_discard_failure<E>(source: DirectoryDiscardError<E>) -> GenericDiscardFailure
+where
+    E: Error + Send + Sync + SafeDiagnosticSource + 'static,
+{
+    let recovery_paths = vec![source.staging_root().to_path_buf()];
+    let diagnostic = source.source().safe_diagnostic_source(
+        DiagnosticStage::Publication,
+        DiagnosticImpact::RecoveryRequired,
+        DiagnosticAction::PreserveRecoveryArtifacts,
+    );
+    generic_discard_failure(source, diagnostic, &recovery_paths)
 }
 
 #[derive(Debug)]
@@ -6350,6 +6555,80 @@ mod tests {
     }
 
     #[test]
+    fn directory_prepare_preserves_recovery_and_unknown_impacts() {
+        for (source, expected_impact, expected_outcome) in [
+            (
+                SystemFileSystemError::JournalCorrupt {
+                    path: PathBuf::from(".directory-publish-test.journal"),
+                    reason: "invalid journal".to_owned(),
+                },
+                DiagnosticImpact::RecoveryRequired,
+                ProjectLogRunOutcome::RecoveryRequired,
+            ),
+            (
+                SystemFileSystemError::OutcomeUnknown {
+                    target_root: PathBuf::from("write_back"),
+                    artifacts: vec![PathBuf::from(".directory-publish-test.journal")],
+                    reason: "unknown exchange state".to_owned(),
+                },
+                DiagnosticImpact::OutcomeUnknown,
+                ProjectLogRunOutcome::OutcomeUnknown,
+            ),
+        ] {
+            let error = generic_prepare_error(
+                &CooperativeCancellation::default(),
+                DirectoryPrepareError::NotPrepared {
+                    target_root: PathBuf::from("write_back"),
+                    source: Box::new(source),
+                    cleanup_failure: None,
+                },
+            );
+            assert_eq!(error.safe_diagnostic().impact, expected_impact);
+            let mut diagnostics = vec![error.safe_diagnostic()];
+            diagnostics.extend(error.related_diagnostics());
+            assert_eq!(
+                generic_project_log_outcome(
+                    &GenericCommandRunResult::Failed(error),
+                    &[],
+                    &diagnostics,
+                ),
+                expected_outcome
+            );
+        }
+    }
+
+    #[test]
+    fn directory_publish_cleanup_is_a_related_recovery_failure() {
+        let source = DirectoryPublishError::TargetAlreadyExists {
+            target_root: PathBuf::from("write_back"),
+            cleanup_failure: Some(StagingCleanupFailure::new(
+                PathBuf::from(".directory-publish-test.stage"),
+                Box::new(SystemFileSystemError::Closed),
+            )),
+        };
+        let (diagnostic, related_diagnostics) = generic_publish_diagnostics(&source);
+        assert_eq!(diagnostic.impact, DiagnosticImpact::Unchanged);
+        assert_eq!(related_diagnostics.len(), 1);
+        assert_eq!(
+            related_diagnostics[0].impact,
+            DiagnosticImpact::RecoveryRequired
+        );
+
+        let error = GenericCommandError::diagnosed_with_related(
+            "发布 Generic 写回目录",
+            source,
+            diagnostic,
+            related_diagnostics,
+        );
+        let mut diagnostics = vec![error.safe_diagnostic()];
+        diagnostics.extend(error.related_diagnostics());
+        assert_eq!(
+            generic_project_log_outcome(&GenericCommandRunResult::Failed(error), &[], &diagnostics,),
+            ProjectLogRunOutcome::RecoveryRequired
+        );
+    }
+
+    #[test]
     fn cancelled_scratch_cleanup_failure_keeps_primary_and_recovery_path() {
         let scratch_root = PathBuf::from("project/.generic-write-back-test");
         let error = generic_scratch_command_error(
@@ -6364,17 +6643,156 @@ mod tests {
             },
         );
 
+        assert_eq!(
+            error.safe_diagnostic().impact,
+            DiagnosticImpact::ProgressPreserved
+        );
+        let related = error.related_diagnostics();
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].impact, DiagnosticImpact::RecoveryRequired);
+        assert_eq!(related[0].recovery, vec![RecoveryFact::path(&scratch_root)]);
+
         match error {
-            GenericCommandError::PublishDiscard {
-                operation,
-                recovery_paths,
-                ..
-            } => {
+            GenericCommandError::PublishDiscard { operation, .. } => {
                 assert!(operation.is_cancelled());
-                assert_eq!(recovery_paths, vec![scratch_root]);
             }
             other => panic!("取消后的清理失败必须保留双错误，实际为 {other}"),
         }
+    }
+
+    #[test]
+    fn failed_scratch_materialization_cleanup_keeps_primary_and_recovery_path() {
+        let scratch_root = PathBuf::from("project/.generic-write-back-test");
+        let source_file = scratch_root.join("dialogue.jsonl");
+        let error = generic_scratch_command_error(
+            "建立 Generic 写回暂存来源",
+            GenericScratchError::CleanupAfterFailure {
+                operation: Box::new(GenericScratchError::Io {
+                    operation: "写入暂存 JSONL",
+                    path: source_file,
+                    source: io::Error::from_raw_os_error(5),
+                }),
+                cleanup: Box::new(GenericScratchError::Io {
+                    operation: "删除暂存来源",
+                    path: scratch_root.clone(),
+                    source: io::Error::from_raw_os_error(5),
+                }),
+            },
+        );
+
+        assert_eq!(error.safe_diagnostic().impact, DiagnosticImpact::Unchanged);
+        let related = error.related_diagnostics();
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].impact, DiagnosticImpact::RecoveryRequired);
+        assert_eq!(related[0].code, DiagnosticCode::WriteBackDiscard);
+        assert_eq!(related[0].recovery, vec![RecoveryFact::path(&scratch_root)]);
+        assert_eq!(
+            related[0].subject,
+            DiagnosticSubject::operation("generic_write_back_candidate_cleanup")
+        );
+        assert!(matches!(
+            &related[0].reason,
+            DiagnosticReason::Io {
+                operation,
+                error_kind: crate::diagnostic::SafeIoKind::PermissionDenied,
+                raw_os_code: Some(5),
+                ..
+            } if operation == "删除暂存来源"
+        ));
+
+        let primary_source = Error::source(&error).expect("双重失败必须以主业务错误为 source");
+        assert!(
+            primary_source
+                .downcast_ref::<GenericCommandError>()
+                .is_some()
+        );
+
+        match &error {
+            GenericCommandError::PublishDiscard { operation, discard } => {
+                assert!(!operation.is_cancelled());
+                assert!(matches!(
+                    operation.as_ref(),
+                    GenericCommandError::Operation { .. }
+                ));
+                let cleanup = discard
+                    .source_error()
+                    .downcast_ref::<GenericScratchError>()
+                    .expect("应保留真实 scratch 清理错误");
+                let io_source = Error::source(cleanup)
+                    .and_then(|source| source.downcast_ref::<io::Error>())
+                    .expect("scratch 清理错误链应保留 io::Error");
+                assert_eq!(io_source.raw_os_error(), Some(5));
+            }
+            other => panic!("暂存建立与清理双重失败必须保留主错误和恢复路径，实际为 {other}"),
+        }
+
+        let mut diagnostics = vec![error.safe_diagnostic()];
+        diagnostics.extend(error.related_diagnostics());
+        assert_eq!(
+            generic_project_log_outcome(&GenericCommandRunResult::Failed(error), &[], &diagnostics,),
+            ProjectLogRunOutcome::RecoveryRequired
+        );
+    }
+
+    #[test]
+    fn directory_discard_preserves_typed_io_failure_as_related_diagnostic() {
+        let stage_root = PathBuf::from("project/.directory-publish-test.stage");
+        let source = DirectoryDiscardError::new(
+            stage_root.clone(),
+            Box::new(SystemFileSystemError::Io {
+                operation: "discard_directory_candidate",
+                path: stage_root.clone(),
+                source: io::Error::from_raw_os_error(32),
+            }),
+        );
+        let discard = generic_directory_discard_failure(source);
+        let error = GenericCommandError::PublishDiscard {
+            operation: Box::new(GenericCommandError::message(
+                "发布前复查 Generic 输入",
+                "input changed",
+            )),
+            discard,
+        };
+
+        assert!(matches!(
+            Error::source(&error),
+            Some(source) if source.downcast_ref::<GenericCommandError>().is_some()
+        ));
+        let related = error.related_diagnostics();
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].impact, DiagnosticImpact::RecoveryRequired);
+        let DiagnosticReason::Io {
+            operation,
+            error_kind,
+            raw_os_code,
+            ..
+        } = &related[0].reason
+        else {
+            panic!("目录丢弃必须保留结构化 I/O 诊断")
+        };
+        assert_eq!(operation, "discard_directory_candidate");
+        assert_eq!(*raw_os_code, Some(32));
+        assert_eq!(*error_kind, io::Error::from_raw_os_error(32).kind().into());
+        assert_eq!(related[0].recovery, vec![RecoveryFact::path(&stage_root)]);
+
+        let GenericCommandError::PublishDiscard { discard, .. } = &error else {
+            unreachable!("上方已建立 PublishDiscard")
+        };
+        let discard_source = discard
+            .source_error()
+            .downcast_ref::<DirectoryDiscardError<Box<SystemFileSystemError>>>()
+            .expect("应保留真实目录丢弃错误");
+        let SystemFileSystemError::Io { source, .. } = discard_source.source().as_ref() else {
+            panic!("目录丢弃错误应保留文件系统 I/O 原因")
+        };
+        assert_eq!(source.raw_os_error(), Some(32));
+
+        let mut diagnostics = vec![error.safe_diagnostic()];
+        diagnostics.extend(error.related_diagnostics());
+        assert_eq!(
+            generic_project_log_outcome(&GenericCommandRunResult::Failed(error), &[], &diagnostics,),
+            ProjectLogRunOutcome::RecoveryRequired
+        );
     }
 
     #[test]

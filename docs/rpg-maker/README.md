@@ -3,9 +3,9 @@
 ATT 的 `mv` 与 `mz` 命令域处理 RPG Maker MV/MZ 原生 JSON 数据和事件。两者共享同一套
 业务能力，项目身份、来源和工作区则各自独立保存。
 
-支持范围是 MV 与 MZ 两代引擎，XP、VX、VX Ace 不在其中。插件脚本、自定义二进制或
-Rules 无法完整表达的格式，先由外部操作者整理成 [Generic JSONL](../generic/jsonl.md)，
-再交给独立的 Generic 项目处理。
+支持范围是 MV 与 MZ 两代引擎，XP、VX、VX Ace 不在其中。只有 Builtin 与 Rules 都无法
+完整表达的来源，才由外部操作者整理成 [Generic JSONL](../generic/jsonl.md)，再交给独立
+Generic 项目处理。
 
 ## 调查游戏
 
@@ -21,13 +21,16 @@ Rules 无法完整表达的格式，先由外部操作者整理成 [Generic JSON
 
 ## 选择提取能力
 
+必须先读 [Extract 精确覆盖](extraction.md)与 [Rules 完整规格](rules.md)，再为每类来源做
+选择。不能把“Builtin 未覆盖”“位于插件”“内容复杂”或“数量多”当成 Generic 的依据。
+
 | 内容 | 能力 |
 |---|---|
 | ATT 覆盖矩阵内的标准数据库、事件和系统文本 | Builtin |
-| 已知文件、字段、插件参数或事件参数路径 | Extract Rules |
+| 已知数据文件、确定字段路径、启用插件参数或指定事件参数 | Extract Rules |
 | MV 第一条消息行中由明确语法包裹的说话人 | MV dialogue rules |
 | 已经提取但不可让模型改写的控制符或协议片段 | Placeholder |
-| 上述能力无法完整表达的内容 | 外部转换加独立 Generic 项目 |
+| Builtin 与 Rules 无法形成确定、完整、可逆读写的内容 | 外部转换加独立 Generic 项目 |
 
 Builtin 和 Rules 可以在同一项目中搭配使用，只要两者声明的物理修改互不竞争。一个
 游戏同时使用 RPG Maker 与 Generic 项目时，任务清单必须记录每部分内容的唯一所有者。
@@ -40,5 +43,8 @@ Builtin 和 Rules 可以在同一项目中搭配使用，只要两者声明的�
 - [Translate](translation.md)：准备语境、全局去重、模型验收和 Current；
 - [WriteBack](write-back.md)：从冻结来源构建并发布候选。
 
-独立 [Lua](../lua/README.md) 的舞台是项目数据库：它不进入上述阶段，也不接触游戏
-文件。
+独立 [Lua](../lua/README.md) 只操作项目数据库：它不进入上述阶段，也不接触游戏文件。
+
+完整任务顺序见[翻译项目指南](../guides/translation-project.md)，失败或不完整结果见
+[诊断与恢复指南](../guides/diagnosis-and-recovery.md)，遗漏、补译、输出和实际加载见
+[全量验收指南](../guides/acceptance.md)。

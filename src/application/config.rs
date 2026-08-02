@@ -618,6 +618,19 @@ impl ConfiguredInitCommand {
     pub(crate) const fn publisher(&self) -> &DirectoryPublisherConfig {
         &self.publisher
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        arguments: InitArguments,
+        projects_root: &Path,
+        engine_storage_name: &str,
+    ) -> Self {
+        Self {
+            arguments,
+            common: CommonCommandConfiguration::build(projects_root),
+            publisher: build_directory_publisher_configuration(projects_root, engine_storage_name),
+        }
+    }
 }
 
 pub(crate) struct ConfiguredExtractCommand {

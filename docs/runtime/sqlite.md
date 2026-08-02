@@ -40,7 +40,46 @@ Extract 的同一 owner 或整个 Generic 同步原子提交。Translate 准备�
 状态只绑定来源、Group 语境、语言、结构和实际 Placeholder。各引擎规格决定失效
 范围。
 
-## 4. Lua 会话
+## 4. Lua 审查使用的当前表
+
+当前发行版没有独立的项目状态或 Unit 导出命令。可信操作者可以通过
+[Lua](../lua/README.md)的只读 SQL 查看当前数据库；下面这些表和列是本发行版审查与精确
+locator 所需的权威位置。
+
+Generic：
+
+| 表 | 审查使用的列 |
+| --- | --- |
+| `generic_file` | `relative_path`、`ordinal` |
+| `generic_group` | `group_id`、`relative_path`、`ordinal`、`kind` |
+| `generic_unit` | `group_id`、`unit_id`、`ordinal`、`source_text`、`translation`、`translation_origin`、`translation_state` |
+
+Generic 自然顺序是 file、group、unit ordinal；精确 locator 是 `group_id + unit_id`。
+`translation`、`translation_origin` 和 `translation_state` 要么全空，要么全有。
+
+MV/MZ：
+
+| 表 | 审查使用的列 |
+| --- | --- |
+| `rpg_maker_text_group` | `owner`、`group_location`、`semantic_order_key`、`group_kind` |
+| `rpg_maker_text_unit` | `owner`、`group_location`、`unit_role`、`semantic_order_key`、`source_content_json`、`source_context_json`、`translation_content_json`、`translation_state` |
+
+MV/MZ 按 group 与 unit 的 `semantic_order_key` 排列；一个完整 Group 由相同
+`group_location` 的全部 Unit 组成，可以同时包含 builtin 与 rules owner。owner 仍属于精确
+locator，后者是 `owner + group_location + unit_role`。`group_location` 与 `unit_role` 是
+不透明编码，只能逐字使用。数据库不单独保存人工/自动 origin；
+`translation_state` 也是不透明指纹，不能由 SQL 自行解释。
+
+两种引擎中，译文列为 NULL 只表示没有译文状态，不等于“应当翻译”。空白、没有源语
+NaturalText 或完全受保护的 Unit 也可以合法保持 NULL。真正的 `needs_translation`、自动
+译文是否适配本次 Prompt/Profile/Client，以及 RPG Maker Semantic Scope 与 TaskBlock，
+由 Translate 使用当前资源在运行时计算，不是上述表中的持久字段。
+
+因此 SQL 可以完整列出当前 Unit、译文与 locator，却不能单独代替 Translate 的状态判断，
+也不能把任务记录临时 ID 可靠映射成 locator。完整审查方法和导出完整性条件见
+[Lua 审查流程](../lua/README.md#4-完整审查与人工或-agent-修订)。
+
+## 5. Lua 会话
 
 独立 Lua 使用同一个项目数据库，外面包着一个 `BEGIN IMMEDIATE`；事务边界由 ATT
 掌握，脚本只管写逻辑。运行结束后 ATT 先验证 schema、metadata、领域不变量、
@@ -50,8 +89,13 @@ Extract 的同一 owner 或整个 Generic 同步原子提交。Translate 准备�
 Lua 可以建立自己的私有表，ATT 不读取、迁移或解释它们。直接修改 ATT 表属于可信
 高级操作：可以做，但结果必须通过最终不变量检查。
 
-## 5. 诊断与日志
+## 6. 诊断与日志
 
 SQLite 出错时，诊断保留操作、数据库路径、primary/extended code、事务最终状态和
 恢复位置。SQL、参数、结果与游戏正文不进普通项目日志；数据库的恢复和重放另有
 依据，项目日志不参与。
+
+事务明确回滚时可以在修正根因后重新执行。诊断为 `outcome_unknown` 时，停止同一项目的
+Lua、Extract、Translate 和其他写入并保留数据库及 sidecar。当前 CLI 没有独立的只读
+`status` 或事务恢复命令；不能为了“观察”再运行会取得写事务的 Lua，也不能手工编辑库。
+现行公开接口无法确认的现场必须作为产品能力限制报告。

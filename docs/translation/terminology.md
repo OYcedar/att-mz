@@ -20,7 +20,6 @@ ATT 术语的预期内容是需要固定写法的游戏专有名称和游戏内�
 
 术语文件使用严格 TOML，只允许一个 `term` 数组：
 
-<!-- att-example: valid -->
 ```toml
 [[term]]
 term = "ミレア"
@@ -45,7 +44,6 @@ triggers = ["星読み", "星を読む者"]
 
 省略 `triggers` 与显式写空数组含义不同，后者是无效输入：
 
-<!-- att-example: invalid -->
 ```toml
 [[term]]
 term = "ミレア"

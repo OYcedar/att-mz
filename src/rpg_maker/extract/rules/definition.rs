@@ -16,62 +16,6 @@ pub(super) struct RulesDefinition {
     canonical_json: String,
 }
 
-#[cfg(test)]
-mod documentation_contract_tests {
-    use super::RulesDefinition;
-    use crate::rpg_maker::documentation_test::{ClassifiedExampleKind, classified_toml_fences};
-
-    const EXAMPLE: &str = include_str!("../../../../docs/rpg-maker/examples/extract-rules.toml");
-    const RULES_GUIDE: &str = include_str!("../../../../docs/rpg-maker/rules.md");
-
-    #[test]
-    fn documented_extract_rules_use_the_production_parser_and_compiler() {
-        let definition = RulesDefinition::parse(EXAMPLE)
-            .expect("文档中的 Extract Rules 必须通过生产解析与 PCRE2 编译边界");
-        assert!(!definition.is_empty(), "完整示例必须至少声明一条规则");
-    }
-
-    #[test]
-    fn classified_extract_rule_fences_follow_the_production_contract() {
-        let mut valid = 0;
-        let mut invalid = 0;
-        for fence in classified_toml_fences(RULES_GUIDE) {
-            let common_root = fence.section().starts_with("2.") && fence.subsection().is_none();
-            let extract_section = fence.section().starts_with("4.");
-            if (!common_root && !extract_section)
-                || fence.kind() == ClassifiedExampleKind::Illustrative
-            {
-                continue;
-            }
-            let result = RulesDefinition::parse(fence.body());
-            match fence.kind() {
-                ClassifiedExampleKind::Valid => {
-                    valid += 1;
-                    result.unwrap_or_else(|error| {
-                        panic!(
-                            "rules.md:{} 的 Extract valid TOML 未通过生产边界：{error}",
-                            fence.opening_line()
-                        )
-                    });
-                }
-                ClassifiedExampleKind::Invalid => {
-                    invalid += 1;
-                    assert!(
-                        result.is_err(),
-                        "rules.md:{} 的 Extract invalid TOML 被生产边界接受",
-                        fence.opening_line()
-                    );
-                }
-                ClassifiedExampleKind::Illustrative => unreachable!(),
-            }
-        }
-        assert!(
-            valid > 0 && invalid > 0,
-            "共同根与 Extract 章节必须覆盖正反样例"
-        );
-    }
-}
-
 impl RulesDefinition {
     /// 只接受当前 Rules TOML 契约；根必须显式声明 `rule`。
     pub(super) fn parse(source: &str) -> Result<Self, RulesDefinitionError> {

@@ -32,8 +32,9 @@ Placeholder 与内置控制符，为每个 Unit 判定去向：Current、需要�
 - 已有多种不同 Current：全部保留，不报冲突；有未译成员时，从未译成员重新选代表；
 - 已有 Current 永远不被覆盖。
 
-去重族、代表项和传播关系只在本次 Translate 运行中计算，不写入数据库。相同原文
-需要不同译文时，在自动翻译后使用[原子数据库 Lua](../lua/README.md)精确修改。
+去重族、代表项和传播关系只在本次 Translate 运行中计算，不写入数据库。已定位 Unit 的
+同文异译、质量修订，或由人工或 agent 补译，都使用[原子数据库 Lua](../lua/README.md)的精确
+locator 与人工状态；Lua 不参与本次自动去重。
 
 ## 3. TaskBlock 与模型形状
 
@@ -76,3 +77,8 @@ Partial 后重试重新判断 ID，但不重新装箱。原块中的已完成 Un
 
 结果分为 Complete、Partial 与 Unavailable。退出码成功只说明结果已经明确；Partial
 和 Unavailable 仍意味着完整翻译目标尚未达成。
+
+Partial 会保留合法 ID 和已确认前序进度；再次运行会重新判断剩余 ID 而不改变稳定装箱。
+是否继续同一 Translate、修正资源，还是由人工或 agent 修订，要按
+[诊断与恢复指南](../guides/diagnosis-and-recovery.md#64-translate)根据具体原因与实际进展判断，
+不能把任一选择当成所有失败的固定做法。

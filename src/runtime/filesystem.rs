@@ -17,7 +17,7 @@ use std::time::Duration;
 
 #[cfg(test)]
 use std::collections::VecDeque;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 #[cfg(test)]
 use std::sync::OnceLock;
 
@@ -41,7 +41,8 @@ use crate::runtime::performance::RunPerformanceCounters;
 use crate::storage::file_system::{
     BoundScopedDirectory, DirectChildDirectoryEnsurer, DirectoryDiscardError, DirectoryEntry,
     DirectoryEntryKind, DirectoryFileOverlay, DirectoryLister, DirectoryPrepareError,
-    DirectoryPublishError, DirectoryPublishIntent, DirectorySourceMapping, DirectoryStageRequest,
+    DirectoryPublishError, DirectoryPublishIntent, DirectoryRecoveryError,
+    DirectoryRecoveryOutcome, DirectorySourceMapping, DirectoryStageRequest,
     DirectoryTreeFingerprintError, DirectoryTreeFingerprintRequest, DirectoryTreeFingerprinter,
     ExclusiveFileLease, ExclusiveFileLeaseError, ExclusiveFileLeaseProvider,
     ExclusiveFileLeaseRequest, ExistingDirectoryResolver, FileReader, ListDirectoryError, ReadFile,
@@ -67,7 +68,7 @@ const DIRECTORY_TREE_FINGERPRINT_DOMAIN: &[u8] = b"directory-tree-fingerprint";
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TestPublishFaultPoint {
+pub(crate) enum TestPublishFaultPoint {
     BeforeOriginalMove,
     AfterOriginalJournal,
     AfterOriginalMove,
@@ -78,11 +79,12 @@ enum TestPublishFaultPoint {
     BeforeRestoreMove,
     BeforeBackupCleanup,
     BeforeJournalCleanup,
+    BeforeRecoveryCleanup,
 }
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TestPublishFaultAction {
+pub(crate) enum TestPublishFaultAction {
     Error,
     Abort,
 }
@@ -161,7 +163,7 @@ fn cancel_test_candidate_copy_after_chunk(source: &Path, cancellation: &AtomicBo
     }
 }
 #[cfg(test)]
-fn register_test_publish_faults(
+pub(crate) fn register_test_publish_faults(
     target_root: PathBuf,
     faults: impl IntoIterator<Item = (TestPublishFaultPoint, TestPublishFaultAction)>,
 ) {
@@ -356,10 +358,30 @@ pub(crate) enum SystemFileSystemError {
         path: PathBuf,
         reason: String,
     },
+    RecoveryJournalCorrupt {
+        path: PathBuf,
+        artifacts: Vec<PathBuf>,
+        reason: String,
+    },
     RecoveryRequired {
         target_root: PathBuf,
         artifacts: Vec<PathBuf>,
         reason: String,
+    },
+    RecoveryCleanupFailed {
+        target_root: PathBuf,
+        artifacts: Vec<PathBuf>,
+        source: Box<SystemFileSystemError>,
+    },
+    PublishedRecoveryCleanupFailed {
+        target_root: PathBuf,
+        artifacts: Vec<PathBuf>,
+        source: Box<SystemFileSystemError>,
+    },
+    RecoveryOutcomeUnknown {
+        target_root: PathBuf,
+        artifacts: Vec<PathBuf>,
+        source: Box<SystemFileSystemError>,
     },
     OutcomeUnknown {
         target_root: PathBuf,
@@ -428,6 +450,16 @@ impl fmt::Display for SystemFileSystemError {
                 "目录恢复 journal 损坏 {}：{reason}",
                 path.display()
             ),
+            Self::RecoveryJournalCorrupt {
+                path,
+                artifacts,
+                reason,
+            } => write!(
+                formatter,
+                "目录恢复 journal 损坏 {}（恢复产物：{}）：{reason}",
+                path.display(),
+                display_paths(artifacts)
+            ),
             Self::RecoveryRequired {
                 target_root,
                 artifacts,
@@ -435,6 +467,36 @@ impl fmt::Display for SystemFileSystemError {
             } => write!(
                 formatter,
                 "目录 {} 需要继续恢复（{}）：{reason}",
+                target_root.display(),
+                display_paths(artifacts)
+            ),
+            Self::RecoveryCleanupFailed {
+                target_root,
+                artifacts,
+                source,
+            } => write!(
+                formatter,
+                "目录 {} 已恢复到明确状态，但清理受管产物失败（{}）：{source}",
+                target_root.display(),
+                display_paths(artifacts)
+            ),
+            Self::PublishedRecoveryCleanupFailed {
+                target_root,
+                artifacts,
+                source,
+            } => write!(
+                formatter,
+                "目录 {} 已确认发布，但清理受管产物失败（{}）：{source}",
+                target_root.display(),
+                display_paths(artifacts)
+            ),
+            Self::RecoveryOutcomeUnknown {
+                target_root,
+                artifacts,
+                source,
+            } => write!(
+                formatter,
+                "无法确认目录 {} 与受管恢复产物的关系（{}）：{source}",
                 target_root.display(),
                 display_paths(artifacts)
             ),
@@ -460,7 +522,16 @@ impl Error for SystemFileSystemError {
             Self::WindowsOrdinalCaseKey { source, .. } => Some(source),
             Self::DirectChildRollbackFailed { operation, .. }
             | Self::ScopedEditRollbackFailed { operation, .. }
-            | Self::ObservationCleanupFailed { operation, .. } => Some(operation),
+            | Self::ObservationCleanupFailed { operation, .. }
+            | Self::RecoveryCleanupFailed {
+                source: operation, ..
+            }
+            | Self::PublishedRecoveryCleanupFailed {
+                source: operation, ..
+            }
+            | Self::RecoveryOutcomeUnknown {
+                source: operation, ..
+            } => Some(operation),
             Self::Closed
             | Self::WorkerPanicked
             | Self::InvalidPath { .. }
@@ -468,6 +539,7 @@ impl Error for SystemFileSystemError {
             | Self::WrongPublisherInstance
             | Self::InvalidStagedIdentity { .. }
             | Self::JournalCorrupt { .. }
+            | Self::RecoveryJournalCorrupt { .. }
             | Self::RecoveryRequired { .. }
             | Self::OutcomeUnknown { .. } => None,
         }
@@ -611,6 +683,27 @@ impl SystemFileSystemError {
                 DiagnosticAction::PreserveRecoveryArtifacts,
             )
             .with_recovery(RecoveryFact::path(path)),
+            Self::RecoveryJournalCorrupt {
+                path,
+                artifacts,
+                reason,
+            } => {
+                let mut diagnostic = SafeDiagnostic::new(
+                    DiagnosticCode::FileSystemOperation,
+                    stage,
+                    DiagnosticSubject::path(path),
+                    DiagnosticReason::failure_with_detail(
+                        DiagnosticFailureKind::JournalCorrupt,
+                        reason,
+                    ),
+                    DiagnosticImpact::RecoveryRequired,
+                    DiagnosticAction::PreserveRecoveryArtifacts,
+                );
+                for artifact in artifacts {
+                    diagnostic = diagnostic.with_recovery(RecoveryFact::path(artifact));
+                }
+                diagnostic
+            }
             Self::RecoveryRequired {
                 target_root,
                 artifacts,
@@ -621,6 +714,39 @@ impl SystemFileSystemError {
                 artifacts,
                 reason,
                 DiagnosticImpact::RecoveryRequired,
+            ),
+            Self::RecoveryCleanupFailed {
+                target_root,
+                artifacts,
+                source,
+            } => recovery_cleanup_diagnostic(
+                stage,
+                target_root,
+                artifacts,
+                source,
+                DiagnosticImpact::RecoveryRequired,
+            ),
+            Self::PublishedRecoveryCleanupFailed {
+                target_root,
+                artifacts,
+                source,
+            } => recovery_cleanup_diagnostic(
+                stage,
+                target_root,
+                artifacts,
+                source,
+                DiagnosticImpact::StateAppliedFinalizationFailed,
+            ),
+            Self::RecoveryOutcomeUnknown {
+                target_root,
+                artifacts,
+                source,
+            } => recovery_cleanup_diagnostic(
+                stage,
+                target_root,
+                artifacts,
+                source,
+                DiagnosticImpact::OutcomeUnknown,
             ),
             Self::OutcomeUnknown {
                 target_root,
@@ -698,6 +824,39 @@ impl SafeDiagnosticSource for SystemFileSystemError {
                     .with_primary_recovery(RecoveryFact::path(temporary_path));
                 primary.with_related_report(related)
             }
+            Self::RecoveryCleanupFailed {
+                target_root,
+                artifacts,
+                source,
+            } => recovery_cleanup_failure_report(
+                *source,
+                target_root,
+                artifacts,
+                stage,
+                DiagnosticImpact::RecoveryRequired,
+            ),
+            Self::PublishedRecoveryCleanupFailed {
+                target_root,
+                artifacts,
+                source,
+            } => recovery_cleanup_failure_report(
+                *source,
+                target_root,
+                artifacts,
+                stage,
+                DiagnosticImpact::StateAppliedFinalizationFailed,
+            ),
+            Self::RecoveryOutcomeUnknown {
+                target_root,
+                artifacts,
+                source,
+            } => recovery_cleanup_failure_report(
+                *source,
+                target_root,
+                artifacts,
+                stage,
+                DiagnosticImpact::OutcomeUnknown,
+            ),
             source => {
                 let public = source.safe_diagnostic(stage, impact, fallback_action);
                 FailureReport::new(ReportedFailure::new(public, source))
@@ -733,6 +892,47 @@ fn recovery_diagnostic(
         diagnostic = diagnostic.with_recovery(RecoveryFact::path(artifact));
     }
     diagnostic
+}
+
+fn recovery_cleanup_diagnostic(
+    stage: DiagnosticStage,
+    target_root: &Path,
+    artifacts: &[PathBuf],
+    source: &SystemFileSystemError,
+    impact: DiagnosticImpact,
+) -> SafeDiagnostic {
+    let mut diagnostic =
+        source.safe_diagnostic(stage, impact, DiagnosticAction::PreserveRecoveryArtifacts);
+    // 外层恢复分支已经确认目标终态；内层错误只说明清理为何失败，不能推翻该终态。
+    diagnostic.impact = impact;
+    diagnostic.action = DiagnosticAction::PreserveRecoveryArtifacts;
+    if impact != DiagnosticImpact::OutcomeUnknown {
+        diagnostic = diagnostic.with_recovery(RecoveryFact::path(target_root));
+    }
+    for artifact in artifacts {
+        diagnostic = diagnostic.with_recovery(RecoveryFact::path(artifact));
+    }
+    diagnostic
+}
+
+fn recovery_cleanup_failure_report(
+    source: SystemFileSystemError,
+    target_root: PathBuf,
+    artifacts: Vec<PathBuf>,
+    stage: DiagnosticStage,
+    impact: DiagnosticImpact,
+) -> FailureReport {
+    let mut report = source
+        .into_failure_report(stage, impact, DiagnosticAction::PreserveRecoveryArtifacts)
+        .with_all_impacts(impact)
+        .with_primary_action(DiagnosticAction::PreserveRecoveryArtifacts);
+    if impact != DiagnosticImpact::OutcomeUnknown {
+        report = report.with_primary_recovery(RecoveryFact::path(target_root));
+    }
+    for artifact in artifacts {
+        report = report.with_primary_recovery(RecoveryFact::path(artifact));
+    }
+    report
 }
 
 fn windows_fs_error_detail(source: &WindowsFsError) -> String {
@@ -1797,6 +1997,26 @@ impl RecoverableDirectoryPublisher for SystemDirectoryPublisher {
     type Error = Box<SystemFileSystemError>;
     type StagingState = SystemStagingState;
 
+    async fn recover(
+        &self,
+        target_root: PathBuf,
+    ) -> Result<DirectoryRecoveryOutcome, DirectoryRecoveryError<Self::Error>> {
+        let publisher_config = self.config.clone();
+        let cancellation = self.inner.pool.cancellation();
+        let error_target = target_root.clone();
+        let result = self
+            .inner
+            .pool
+            .execute("recover_directory_target", &error_target, move || {
+                recover_directory_target_sync(target_root, &publisher_config, &cancellation)
+            })
+            .await
+            .map_err(|source| {
+                DirectoryRecoveryError::new(error_target.clone(), Box::new(source))
+            })?;
+        result.map_err(|source| DirectoryRecoveryError::new(error_target, Box::new(source)))
+    }
+
     async fn prepare(
         &self,
         request: DirectoryStageRequest,
@@ -1871,6 +2091,43 @@ impl RecoverableDirectoryPublisher for SystemDirectoryPublisher {
             .map_err(|source| DirectoryDiscardError::new(staging_root.clone(), Box::new(source)))?
             .map_err(|source| DirectoryDiscardError::new(staging_root, Box::new(source)))
     }
+}
+
+fn recover_directory_target_sync(
+    target_root: PathBuf,
+    publisher_config: &DirectoryPublisherConfig,
+    cancellation: &AtomicBool,
+) -> Result<DirectoryRecoveryOutcome, SystemFileSystemError> {
+    if !target_root.is_absolute() {
+        return Err(SystemFileSystemError::InvalidPath {
+            path: target_root,
+            reason: "发布目标必须是绝对路径",
+        });
+    }
+    let parent = target_root
+        .parent()
+        .ok_or_else(|| SystemFileSystemError::InvalidPath {
+            path: target_root.clone(),
+            reason: "发布目标必须拥有父目录",
+        })?;
+    let parent_root = validate_local_case_insensitive_ntfs_directory(parent)?;
+    let parent_handle = open_directory(&parent_root, false)?;
+    let target_name =
+        target_root
+            .file_name()
+            .ok_or_else(|| SystemFileSystemError::InvalidPath {
+                path: target_root.clone(),
+                reason: "发布目标必须拥有目录名",
+            })?;
+    validate_windows_name(target_name, &target_root)?;
+    let target_root = parent_root.join(target_name);
+    let lock_path = target_lock_path(&publisher_config.lock_directory, &target_root)?;
+    let target_lock = ExclusiveFileLock::acquire(&lock_path, cancellation)?;
+    let target_artifact_key = target_lock.identity(&lock_path)?.stable_hex();
+    let outcome = recover_target(&target_root, &target_artifact_key, publisher_config)?;
+    drop(target_lock);
+    drop(parent_handle);
+    Ok(outcome)
 }
 
 fn absolutize(path: PathBuf) -> Result<PathBuf, SystemFileSystemError> {
@@ -3038,7 +3295,7 @@ fn prepare_directory_sync(
         let lock_path = target_lock_path(&publisher_config.lock_directory, &target_root)?;
         let target_lock = ExclusiveFileLock::acquire(&lock_path, cancellation)?;
         let target_artifact_key = target_lock.identity(&lock_path)?.stable_hex();
-        recover_target(&target_root, &target_artifact_key, &publisher_config)?;
+        let _ = recover_target(&target_root, &target_artifact_key, &publisher_config)?;
 
         let operation_id = secure_uuid_v4("生成目录发布操作 ID")?;
         let stem = format!("{RESERVED_PREFIX}{target_artifact_key}-{operation_id}");
@@ -5040,18 +5297,145 @@ fn identity_at(path: &Path) -> Result<Option<FileIdentity>, SystemFileSystemErro
     }
 }
 
+fn recovery_cleanup_failed(
+    target_root: &Path,
+    artifacts: Vec<PathBuf>,
+    source: SystemFileSystemError,
+) -> SystemFileSystemError {
+    SystemFileSystemError::RecoveryCleanupFailed {
+        target_root: target_root.to_path_buf(),
+        artifacts,
+        source: Box::new(source),
+    }
+}
+
+fn published_recovery_cleanup_failed(
+    target_root: &Path,
+    artifacts: Vec<PathBuf>,
+    source: SystemFileSystemError,
+) -> SystemFileSystemError {
+    SystemFileSystemError::PublishedRecoveryCleanupFailed {
+        target_root: target_root.to_path_buf(),
+        artifacts,
+        source: Box::new(source),
+    }
+}
+
+fn recovery_outcome_unknown(
+    target_root: &Path,
+    artifacts: Vec<PathBuf>,
+    source: SystemFileSystemError,
+) -> SystemFileSystemError {
+    SystemFileSystemError::RecoveryOutcomeUnknown {
+        target_root: target_root.to_path_buf(),
+        artifacts,
+        source: Box::new(source),
+    }
+}
+
 fn recover_target(
     target_root: &Path,
     target_artifact_key: &str,
     _config: &DirectoryPublisherConfig,
-) -> Result<(), SystemFileSystemError> {
+) -> Result<DirectoryRecoveryOutcome, SystemFileSystemError> {
     let parent = target_root.parent().expect("受信发布目标必有父目录");
     let prefix = format!("{RESERVED_PREFIX}{target_artifact_key}-");
+    let artifacts = scan_recovery_artifacts(target_root, parent, &prefix, &[])?;
+    let mut remaining = artifacts.clone();
+    let mut changed = false;
+    let journals = artifacts
+        .iter()
+        .filter(|path| path.extension() == Some(OsStr::new("journal")))
+        .cloned()
+        .collect::<Vec<_>>();
+    for journal in journals {
+        recover_journal(target_root, &journal, &remaining)?;
+        remaining.retain(|path| path.file_stem() != journal.file_stem());
+        changed = true;
+    }
+
+    // journal 恢复完成后重新列举；错误只报告这次确实观察到、仍未处理的路径。
+    let scanned_residuals = scan_recovery_artifacts(target_root, parent, &prefix, &remaining)?;
+    let mut residuals = Vec::new();
+    let mut metadata = Vec::new();
+    for (index, artifact) in scanned_residuals.iter().enumerate() {
+        let observed = match fs::symlink_metadata(artifact) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(recovery_outcome_unknown(
+                    target_root,
+                    merge_recovery_artifacts(&residuals, &scanned_residuals[index..]),
+                    io_error("读取目录恢复产物元数据", artifact, source),
+                ));
+            }
+        };
+        residuals.push(artifact.clone());
+        metadata.push(observed);
+    }
+    for (artifact, metadata) in residuals.iter().zip(&metadata) {
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(SystemFileSystemError::OutcomeUnknown {
+                target_root: target_root.to_path_buf(),
+                artifacts: residuals.clone(),
+                reason: "恢复产物路径被 reparse point 占用".to_owned(),
+            });
+        }
+        if artifact.extension() != Some(OsStr::new("stage")) {
+            return Err(SystemFileSystemError::OutcomeUnknown {
+                target_root: target_root.to_path_buf(),
+                artifacts: residuals.clone(),
+                reason: "journal 恢复后仍有 journal 或无 journal 的备份残留".to_owned(),
+            });
+        }
+    }
+
+    // 能到这里的只可能是尚未建立 journal 的孤立候选；它们从未接管目标。
+    for (index, stage) in residuals.iter().enumerate() {
+        let cleanup = (|| {
+            let pinned = pin_directory_without_reparse(stage)?;
+            let identity = FileIdentity::of(pinned.file(), stage)?;
+            drop(pinned);
+            remove_directory_tree_if_identity(stage, identity)
+        })();
+        if let Err(source) = cleanup {
+            return Err(recovery_cleanup_failed(
+                target_root,
+                residuals[index..].to_vec(),
+                source,
+            ));
+        }
+        changed = true;
+    }
+    Ok(if changed {
+        DirectoryRecoveryOutcome::Recovered
+    } else {
+        DirectoryRecoveryOutcome::Unchanged
+    })
+}
+
+fn scan_recovery_artifacts(
+    target_root: &Path,
+    parent: &Path,
+    prefix: &str,
+    last_known: &[PathBuf],
+) -> Result<Vec<PathBuf>, SystemFileSystemError> {
     let mut artifacts = Vec::new();
-    for entry in
-        fs::read_dir(parent).map_err(|source| io_error("列举目录恢复产物", parent, source))?
-    {
-        let entry = entry.map_err(|source| io_error("读取目录恢复产物", parent, source))?;
+    let entries = fs::read_dir(parent).map_err(|source| {
+        recovery_outcome_unknown(
+            target_root,
+            last_known.to_vec(),
+            io_error("列举目录恢复产物", parent, source),
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| {
+            recovery_outcome_unknown(
+                target_root,
+                merge_recovery_artifacts(last_known, &artifacts),
+                io_error("读取目录恢复产物", parent, source),
+            )
+        })?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
@@ -5062,75 +5446,67 @@ fn recover_target(
             artifacts.push(entry.path());
         }
     }
-    let journals = artifacts
-        .iter()
-        .filter(|path| path.extension() == Some(OsStr::new("journal")))
+    artifacts.sort();
+    Ok(artifacts)
+}
+
+fn merge_recovery_artifacts(left: &[PathBuf], right: &[PathBuf]) -> Vec<PathBuf> {
+    left.iter()
+        .chain(right)
         .cloned()
-        .collect::<Vec<_>>();
-    for journal in journals {
-        recover_journal(target_root, &journal)?;
-    }
-    for artifact in artifacts {
-        let metadata = match fs::symlink_metadata(&artifact) {
-            Ok(metadata) => metadata,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
-            Err(source) => {
-                return Err(io_error("读取目录恢复产物元数据", &artifact, source));
-            }
-        };
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(SystemFileSystemError::OutcomeUnknown {
-                target_root: target_root.to_path_buf(),
-                artifacts: vec![artifact],
-                reason: "恢复产物路径被 reparse point 占用".to_owned(),
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn pending_operation_artifacts(
+    observed_artifacts: &[PathBuf],
+    journal: &Path,
+    current_operation: impl IntoIterator<Item = PathBuf>,
+) -> Vec<PathBuf> {
+    observed_artifacts
+        .iter()
+        .filter(|path| path.file_stem() != journal.file_stem())
+        .cloned()
+        .chain(current_operation)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn recover_journal(
+    target_root: &Path,
+    journal: &Path,
+    observed_artifacts: &[PathBuf],
+) -> Result<(), SystemFileSystemError> {
+    let parent = target_root.parent().expect("受信发布目标必有父目录");
+    let records = match read_journal(journal) {
+        Ok(records) => records,
+        Err(SystemFileSystemError::JournalCorrupt { path, reason }) => {
+            return Err(SystemFileSystemError::RecoveryJournalCorrupt {
+                path,
+                artifacts: observed_artifacts.to_vec(),
+                reason,
             });
         }
-        match artifact.extension().and_then(OsStr::to_str) {
-            Some("stage") => {
-                let journal = artifact.with_extension("journal");
-                if !path_exists(&journal)? {
-                    let pinned = pin_directory_without_reparse(&artifact)?;
-                    let identity = FileIdentity::of(pinned.file(), &artifact)?;
-                    drop(pinned);
-                    remove_directory_tree_if_identity(&artifact, identity)?;
-                }
-            }
-            Some("backup") => {
-                let journal = artifact.with_extension("journal");
-                if !path_exists(&journal)? {
-                    return Err(SystemFileSystemError::OutcomeUnknown {
-                        target_root: target_root.to_path_buf(),
-                        artifacts: vec![artifact],
-                        reason: "备份存在但缺少对应 journal".to_owned(),
-                    });
-                }
-            }
-            Some("journal") => {
-                return Err(SystemFileSystemError::OutcomeUnknown {
-                    target_root: target_root.to_path_buf(),
-                    artifacts: vec![artifact],
-                    reason: "journal 恢复后仍然残留".to_owned(),
-                });
-            }
-            _ => unreachable!("恢复产物已按受信后缀筛选"),
+        Err(source @ SystemFileSystemError::RecoveryJournalCorrupt { .. })
+        | Err(source @ SystemFileSystemError::RecoveryRequired { .. })
+        | Err(source @ SystemFileSystemError::RecoveryCleanupFailed { .. })
+        | Err(source @ SystemFileSystemError::PublishedRecoveryCleanupFailed { .. })
+        | Err(source @ SystemFileSystemError::RecoveryOutcomeUnknown { .. })
+        | Err(source @ SystemFileSystemError::OutcomeUnknown { .. }) => return Err(source),
+        Err(source) => {
+            return Err(recovery_outcome_unknown(
+                target_root,
+                observed_artifacts.to_vec(),
+                source,
+            ));
         }
-    }
-    Ok(())
-}
-
-fn path_exists(path: &Path) -> Result<bool, SystemFileSystemError> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(source) => Err(io_error("读取路径存在状态", path, source)),
-    }
-}
-
-fn recover_journal(target_root: &Path, journal: &Path) -> Result<(), SystemFileSystemError> {
-    let parent = target_root.parent().expect("受信发布目标必有父目录");
-    let records = read_journal(journal)?;
+    };
     if records.is_empty() {
-        remove_file_if_exists(journal)?;
+        remove_file_if_exists(journal).map_err(|source| {
+            recovery_cleanup_failed(target_root, observed_artifacts.to_vec(), source)
+        })?;
         return Ok(());
     }
     let record = records.last().expect("非空 journal 必有末帧");
@@ -5139,18 +5515,25 @@ fn recover_journal(target_root: &Path, journal: &Path) -> Result<(), SystemFileS
         .expect("受信发布目标必有名称")
         .encode_wide()
         .collect();
-    let recorded_target_key = windows_ordinal_case_key_from_utf16(&record.target_name, journal)?;
-    let requested_target_key = windows_ordinal_case_key_from_utf16(&target_name, target_root)?;
+    let recorded_target_key = windows_ordinal_case_key_from_utf16(&record.target_name, journal)
+        .map_err(|source| {
+            recovery_outcome_unknown(target_root, observed_artifacts.to_vec(), source)
+        })?;
+    let requested_target_key = windows_ordinal_case_key_from_utf16(&target_name, target_root)
+        .map_err(|source| {
+            recovery_outcome_unknown(target_root, observed_artifacts.to_vec(), source)
+        })?;
     if recorded_target_key != requested_target_key {
         return Err(SystemFileSystemError::OutcomeUnknown {
             target_root: target_root.to_path_buf(),
-            artifacts: vec![journal.to_path_buf()],
+            artifacts: observed_artifacts.to_vec(),
             reason: "journal 目标名称与恢复请求不一致".to_owned(),
         });
     }
     let journal_stem = journal.file_stem().and_then(OsStr::to_str).ok_or_else(|| {
-        SystemFileSystemError::JournalCorrupt {
+        SystemFileSystemError::RecoveryJournalCorrupt {
             path: journal.to_path_buf(),
+            artifacts: observed_artifacts.to_vec(),
             reason: "journal 文件名不是受信 ASCII 发布名称".to_owned(),
         }
     })?;
@@ -5159,8 +5542,9 @@ fn recover_journal(target_root: &Path, journal: &Path) -> Result<(), SystemFileS
         .strip_prefix(RESERVED_PREFIX)
         .and_then(|value| value.strip_suffix(&operation_suffix))
         .filter(|value| value.len() == 48 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .ok_or_else(|| SystemFileSystemError::JournalCorrupt {
+        .ok_or_else(|| SystemFileSystemError::RecoveryJournalCorrupt {
             path: journal.to_path_buf(),
+            artifacts: observed_artifacts.to_vec(),
             reason: "journal 文件名与操作 ID 或目标锁身份不一致".to_owned(),
         })?;
     let expected_stem = format!("{RESERVED_PREFIX}{artifact_key}{operation_suffix}");
@@ -5171,77 +5555,210 @@ fn recover_journal(target_root: &Path, journal: &Path) -> Result<(), SystemFileS
         .encode_utf16()
         .collect::<Vec<_>>();
     if record.stage_name != expected_stage_name || record.backup_name != expected_backup_name {
-        return Err(SystemFileSystemError::JournalCorrupt {
+        return Err(SystemFileSystemError::RecoveryJournalCorrupt {
             path: journal.to_path_buf(),
+            artifacts: observed_artifacts.to_vec(),
             reason: "journal 恢复产物名称不属于该发布操作".to_owned(),
         });
     }
     let stage = parent.join(OsString::from_wide(&record.stage_name));
     let backup = parent.join(OsString::from_wide(&record.backup_name));
-    let target_identity = identity_at(target_root)?;
-    let stage_identity = identity_at(&stage)?;
-    let backup_identity = identity_at(&backup)?;
+    let target_identity = identity_at(target_root).map_err(|source| {
+        recovery_outcome_unknown(target_root, observed_artifacts.to_vec(), source)
+    })?;
     if target_identity == Some(record.candidate_identity) {
-        remove_matching_directory(&backup, record.original_identity, target_root, journal)?;
-        remove_matching_directory(&stage, record.candidate_identity, target_root, journal)?;
-        remove_file_if_exists(journal)?;
+        let stage_identity = identity_at(&stage).map_err(|source| {
+            published_recovery_cleanup_failed(target_root, observed_artifacts.to_vec(), source)
+        })?;
+        let backup_identity = identity_at(&backup).map_err(|source| {
+            published_recovery_cleanup_failed(target_root, observed_artifacts.to_vec(), source)
+        })?;
+        let mut current = Vec::new();
+        if backup_identity.is_some() {
+            current.push(backup.clone());
+        }
+        if stage_identity.is_some() {
+            current.push(stage.clone());
+        }
+        current.push(journal.to_path_buf());
+        let pending = pending_operation_artifacts(observed_artifacts, journal, current);
+        #[cfg(test)]
+        if hit_test_publish_fault(target_root, TestPublishFaultPoint::BeforeRecoveryCleanup) {
+            return Err(published_recovery_cleanup_failed(
+                target_root,
+                pending,
+                injected_publish_error("清理已发布目录的恢复产物", journal),
+            ));
+        }
+        remove_matching_directory(&backup, record.original_identity)
+            .map_err(|source| published_recovery_cleanup_failed(target_root, pending, source))?;
+        let mut current = Vec::new();
+        if stage_identity.is_some() {
+            current.push(stage.clone());
+        }
+        current.push(journal.to_path_buf());
+        let pending = pending_operation_artifacts(observed_artifacts, journal, current);
+        #[cfg(test)]
+        if hit_test_publish_fault(target_root, TestPublishFaultPoint::BeforeRecoveryCleanup) {
+            return Err(published_recovery_cleanup_failed(
+                target_root,
+                pending,
+                injected_publish_error("清理已发布目录的恢复产物", journal),
+            ));
+        }
+        remove_matching_directory(&stage, record.candidate_identity)
+            .map_err(|source| published_recovery_cleanup_failed(target_root, pending, source))?;
+        remove_file_if_exists(journal).map_err(|source| {
+            published_recovery_cleanup_failed(
+                target_root,
+                pending_operation_artifacts(observed_artifacts, journal, [journal.to_path_buf()]),
+                source,
+            )
+        })?;
         return Ok(());
     }
     if target_identity == Some(record.original_identity) {
-        remove_matching_directory(&stage, record.candidate_identity, target_root, journal)?;
-        remove_matching_directory(&backup, record.original_identity, target_root, journal)?;
-        remove_file_if_exists(journal)?;
+        let stage_identity = identity_at(&stage).map_err(|source| {
+            recovery_cleanup_failed(target_root, observed_artifacts.to_vec(), source)
+        })?;
+        let backup_identity = identity_at(&backup).map_err(|source| {
+            recovery_cleanup_failed(target_root, observed_artifacts.to_vec(), source)
+        })?;
+        let mut current = Vec::new();
+        if stage_identity.is_some() {
+            current.push(stage.clone());
+        }
+        if backup_identity.is_some() {
+            current.push(backup.clone());
+        }
+        current.push(journal.to_path_buf());
+        let pending = pending_operation_artifacts(observed_artifacts, journal, current);
+        remove_matching_directory(&stage, record.candidate_identity)
+            .map_err(|source| recovery_cleanup_failed(target_root, pending, source))?;
+        let mut current = Vec::new();
+        if backup_identity.is_some() {
+            current.push(backup.clone());
+        }
+        current.push(journal.to_path_buf());
+        let pending = pending_operation_artifacts(observed_artifacts, journal, current);
+        remove_matching_directory(&backup, record.original_identity)
+            .map_err(|source| recovery_cleanup_failed(target_root, pending, source))?;
+        remove_file_if_exists(journal).map_err(|source| {
+            recovery_cleanup_failed(
+                target_root,
+                pending_operation_artifacts(observed_artifacts, journal, [journal.to_path_buf()]),
+                source,
+            )
+        })?;
         return Ok(());
     }
     if target_identity.is_some() {
         return Err(SystemFileSystemError::OutcomeUnknown {
             target_root: target_root.to_path_buf(),
-            artifacts: vec![stage, backup, journal.to_path_buf()],
+            artifacts: observed_artifacts.to_vec(),
             reason: "目标被未知文件身份占用".to_owned(),
         });
     }
+    let stage_identity = identity_at(&stage).map_err(|source| {
+        recovery_outcome_unknown(target_root, observed_artifacts.to_vec(), source)
+    })?;
+    let backup_identity = identity_at(&backup).map_err(|source| {
+        recovery_outcome_unknown(target_root, observed_artifacts.to_vec(), source)
+    })?;
     if backup_identity == Some(record.original_identity) {
         if let Err(source) =
             rename_without_replace_if_identity(&backup, target_root, record.original_identity)
         {
             return Err(SystemFileSystemError::OutcomeUnknown {
                 target_root: target_root.to_path_buf(),
-                artifacts: vec![stage, backup, journal.to_path_buf()],
+                artifacts: observed_artifacts.to_vec(),
                 reason: format!(
                     "恢复旧目标时备份身份或重命名状态变化：{}",
                     windows_fs_error_detail(&source)
                 ),
             });
         }
-        if identity_at(target_root)? != Some(record.original_identity) {
+        let mut post_restore_current = Vec::new();
+        if stage_identity.is_some() {
+            post_restore_current.push(stage.clone());
+        }
+        post_restore_current.push(journal.to_path_buf());
+        let post_restore_artifacts =
+            pending_operation_artifacts(observed_artifacts, journal, post_restore_current);
+        let restored_identity = identity_at(target_root).map_err(|source| {
+            recovery_outcome_unknown(target_root, post_restore_artifacts.clone(), source)
+        })?;
+        if restored_identity != Some(record.original_identity) {
             return Err(SystemFileSystemError::OutcomeUnknown {
                 target_root: target_root.to_path_buf(),
-                artifacts: vec![stage, backup, journal.to_path_buf()],
+                artifacts: post_restore_artifacts,
                 reason: "恢复旧目标后文件身份不匹配".to_owned(),
             });
         }
-        if stage_identity == Some(record.candidate_identity) {
-            remove_directory_tree_if_identity(&stage, record.candidate_identity)?;
-        } else if stage_identity.is_some() {
-            return Err(SystemFileSystemError::OutcomeUnknown {
-                target_root: target_root.to_path_buf(),
-                artifacts: vec![stage, journal.to_path_buf()],
-                reason: "候选路径出现未知文件身份".to_owned(),
-            });
+        #[cfg(test)]
+        if hit_test_publish_fault(target_root, TestPublishFaultPoint::BeforeRecoveryCleanup) {
+            let mut current = Vec::new();
+            if stage_identity.is_some() {
+                current.push(stage.clone());
+            }
+            current.push(journal.to_path_buf());
+            let pending = pending_operation_artifacts(observed_artifacts, journal, current);
+            return Err(recovery_cleanup_failed(
+                target_root,
+                pending,
+                injected_publish_error("清理已恢复目录的受管产物", journal),
+            ));
         }
-        remove_file_if_exists(journal)?;
+        if stage_identity == Some(record.candidate_identity) {
+            remove_directory_tree_if_identity(&stage, record.candidate_identity).map_err(
+                |source| {
+                    recovery_cleanup_failed(
+                        target_root,
+                        pending_operation_artifacts(
+                            observed_artifacts,
+                            journal,
+                            [stage.clone(), journal.to_path_buf()],
+                        ),
+                        source,
+                    )
+                },
+            )?;
+        } else if stage_identity.is_some() {
+            return Err(recovery_cleanup_failed(
+                target_root,
+                pending_operation_artifacts(
+                    observed_artifacts,
+                    journal,
+                    [stage.clone(), journal.to_path_buf()],
+                ),
+                SystemFileSystemError::InvalidStagedIdentity { path: stage },
+            ));
+        }
+        remove_file_if_exists(journal).map_err(|source| {
+            recovery_cleanup_failed(
+                target_root,
+                pending_operation_artifacts(observed_artifacts, journal, [journal.to_path_buf()]),
+                source,
+            )
+        })?;
         return Ok(());
     }
     if backup_identity.is_some() {
         return Err(SystemFileSystemError::OutcomeUnknown {
             target_root: target_root.to_path_buf(),
-            artifacts: vec![stage, backup, journal.to_path_buf()],
+            artifacts: observed_artifacts.to_vec(),
             reason: "备份路径出现未知文件身份".to_owned(),
         });
     }
+    let mut current = Vec::new();
+    if stage_identity.is_some() {
+        current.push(stage);
+    }
+    current.push(journal.to_path_buf());
+    let pending = pending_operation_artifacts(observed_artifacts, journal, current);
     Err(SystemFileSystemError::RecoveryRequired {
         target_root: target_root.to_path_buf(),
-        artifacts: vec![stage, journal.to_path_buf()],
+        artifacts: pending,
         reason: "目标与已知旧目录均缺失".to_owned(),
     })
 }
@@ -5249,16 +5766,12 @@ fn recover_journal(target_root: &Path, journal: &Path) -> Result<(), SystemFileS
 fn remove_matching_directory(
     path: &Path,
     expected: FileIdentity,
-    target_root: &Path,
-    journal: &Path,
 ) -> Result<(), SystemFileSystemError> {
     match identity_at(path)? {
         None => Ok(()),
         Some(identity) if identity == expected => remove_directory_tree_if_identity(path, expected),
-        Some(_) => Err(SystemFileSystemError::OutcomeUnknown {
-            target_root: target_root.to_path_buf(),
-            artifacts: vec![path.to_path_buf(), journal.to_path_buf()],
-            reason: "恢复产物路径出现未知文件身份".to_owned(),
+        Some(_) => Err(SystemFileSystemError::InvalidStagedIdentity {
+            path: path.to_path_buf(),
         }),
     }
 }
@@ -5267,6 +5780,77 @@ fn remove_matching_directory(
 mod tests {
     use super::*;
     use std::ops::Deref;
+
+    fn nested_unknown_cleanup_source(target_root: &Path, artifact: &Path) -> SystemFileSystemError {
+        SystemFileSystemError::OutcomeUnknown {
+            target_root: target_root.to_path_buf(),
+            artifacts: vec![artifact.to_path_buf()],
+            reason: "测试中的恢复产物身份未知".to_owned(),
+        }
+    }
+
+    fn single_managed_artifact(parent: &Path, extension: &str) -> PathBuf {
+        let matches = fs::read_dir(parent)
+            .expect("应该可列举测试恢复产物")
+            .map(|entry| entry.expect("应该可读取测试恢复目录项").path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.starts_with(RESERVED_PREFIX))
+                    && path.extension() == Some(OsStr::new(extension))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1, "测试现场应只有一个 {extension} 产物");
+        matches.into_iter().next().expect("已经确认唯一产物")
+    }
+
+    #[test]
+    fn confirmed_recovery_state_overrides_nested_cleanup_impact() {
+        let target = PathBuf::from("C:/projects/game");
+        let artifact = PathBuf::from("C:/projects/.directory-publish-test.stage");
+
+        for (error, expected) in [
+            (
+                recovery_cleanup_failed(
+                    &target,
+                    vec![artifact.clone()],
+                    nested_unknown_cleanup_source(&target, &artifact),
+                ),
+                DiagnosticImpact::RecoveryRequired,
+            ),
+            (
+                published_recovery_cleanup_failed(
+                    &target,
+                    vec![artifact.clone()],
+                    nested_unknown_cleanup_source(&target, &artifact),
+                ),
+                DiagnosticImpact::StateAppliedFinalizationFailed,
+            ),
+        ] {
+            let diagnostic = error.safe_diagnostic(
+                DiagnosticStage::Init,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckProjectState,
+            );
+            assert_eq!(diagnostic.impact, expected);
+            assert_eq!(
+                diagnostic.action,
+                DiagnosticAction::PreserveRecoveryArtifacts
+            );
+
+            let report = error.into_failure_report(
+                DiagnosticStage::Init,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckProjectState,
+            );
+            assert!(
+                report
+                    .public_diagnostics()
+                    .all(|diagnostic| diagnostic.impact == expected),
+                "内层机制诊断不得推翻外层已经确认的恢复终态"
+            );
+        }
+    }
 
     #[test]
     fn joining_workers_waits_for_all_workers_after_one_panics() {
@@ -7440,6 +8024,44 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn corrupt_recovery_journal_reports_the_complete_observed_inventory() {
+        let temporary = tempfile::tempdir().expect("应该可创建临时目录");
+        let target = temporary.path().join("target");
+        let stem = ".directory-publish-test-operation";
+        let journal = temporary.path().join(format!("{stem}.journal"));
+        let stage = temporary.path().join(format!("{stem}.stage"));
+        let backup = temporary.path().join(format!("{stem}.backup"));
+        fs::create_dir(&stage).expect("应该可创建候选恢复产物");
+        fs::create_dir(&backup).expect("应该可创建备份恢复产物");
+        let payload = b"{}";
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(payload);
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        fs::write(&journal, bytes).expect("应该可写入损坏 journal");
+        let mut observed = vec![stage, backup, journal.clone()];
+        observed.sort();
+
+        let error = recover_journal(&target, &journal, &observed)
+            .expect_err("损坏 journal 必须拒绝自动恢复");
+        let SystemFileSystemError::RecoveryJournalCorrupt { artifacts, .. } = &error else {
+            panic!("恢复入口必须保留完整受管现场，实际为 {error:?}")
+        };
+        assert_eq!(artifacts, &observed);
+
+        let diagnostic = error.safe_diagnostic(
+            DiagnosticStage::Init,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::CheckProjectState,
+        );
+        assert_eq!(diagnostic.impact, DiagnosticImpact::RecoveryRequired);
+        assert_eq!(
+            diagnostic.recovery,
+            observed.iter().map(RecoveryFact::path).collect::<Vec<_>>()
+        );
+    }
+
     #[tokio::test]
     async fn target_lock_contention_waits_until_the_owner_releases() {
         let temporary = tempfile::tempdir().expect("应该可创建临时目录");
@@ -7659,10 +8281,16 @@ mod tests {
             .expect("第二个替换候选应可准备");
         register_test_publish_faults(
             trusted_target,
-            [(
-                TestPublishFaultPoint::BeforeBackupCleanup,
-                TestPublishFaultAction::Error,
-            )],
+            [
+                (
+                    TestPublishFaultPoint::BeforeBackupCleanup,
+                    TestPublishFaultAction::Error,
+                ),
+                (
+                    TestPublishFaultPoint::BeforeRecoveryCleanup,
+                    TestPublishFaultAction::Error,
+                ),
+            ],
         );
         assert!(matches!(
             root.publish(staged).await,
@@ -7671,6 +8299,42 @@ mod tests {
         assert_eq!(
             fs::read(target.join("snapshot/content/value.txt")).expect("新目标应已可见"),
             b"new"
+        );
+
+        let recovery = root
+            .recover(target.clone())
+            .await
+            .expect_err("已发布目标的恢复清理故障必须保留精确终态");
+        let published_artifacts = match recovery.source_error().as_ref() {
+            SystemFileSystemError::PublishedRecoveryCleanupFailed { artifacts, .. } => {
+                assert!(artifacts.iter().all(|path| path.exists()));
+                assert!(artifacts.windows(2).all(|paths| paths[0] < paths[1]));
+                artifacts.clone()
+            }
+            source => panic!("恢复必须保留已确认发布终态，实际为 {source:?}"),
+        };
+        let diagnostic = recovery.source_error().safe_diagnostic(
+            DiagnosticStage::Init,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::CheckProjectState,
+        );
+        assert_eq!(
+            diagnostic.impact,
+            DiagnosticImpact::StateAppliedFinalizationFailed
+        );
+        assert_eq!(diagnostic.recovery.len(), published_artifacts.len() + 1);
+
+        assert_eq!(
+            root.recover(target.clone())
+                .await
+                .expect("故障消失后显式恢复应清理已发布目标的残留"),
+            DirectoryRecoveryOutcome::Recovered
+        );
+        assert_eq!(
+            root.recover(target.clone())
+                .await
+                .expect("没有受管产物时恢复应明确返回未改变"),
+            DirectoryRecoveryOutcome::Unchanged
         );
 
         let staged = root
@@ -7807,6 +8471,30 @@ mod tests {
             assert!(!status.success(), "故障点 {phase} 必须终止子进程");
 
             let root = TestDirectoryPublisher::new(file_system_config());
+            if phase == "original-move" {
+                register_test_publish_faults(
+                    canonical_target(&target),
+                    [(
+                        TestPublishFaultPoint::BeforeRecoveryCleanup,
+                        TestPublishFaultAction::Error,
+                    )],
+                );
+                let recovery = root
+                    .recover(target.clone())
+                    .await
+                    .expect_err("旧目标恢复后的清理故障必须保留恢复现场");
+                assert!(matches!(
+                    recovery.source_error().as_ref(),
+                    SystemFileSystemError::RecoveryCleanupFailed { .. }
+                ));
+                let diagnostic = recovery.source_error().safe_diagnostic(
+                    DiagnosticStage::Init,
+                    DiagnosticImpact::Unchanged,
+                    DiagnosticAction::CheckProjectState,
+                );
+                assert_eq!(diagnostic.impact, DiagnosticImpact::RecoveryRequired);
+                assert!(diagnostic.recovery.len() >= 2);
+            }
             for _ in 0..2 {
                 let staged = root
                     .prepare(stage_request(
@@ -7824,6 +8512,64 @@ mod tests {
                 "故障点 {phase} 恢复了错误一侧"
             );
             root.shutdown().await.expect("恢复根应可终结");
+        }
+    }
+
+    #[tokio::test]
+    async fn residual_identity_changes_do_not_override_a_known_target_state() {
+        for (phase, extension, expected_impact) in [
+            ("original-move", "stage", DiagnosticImpact::RecoveryRequired),
+            (
+                "candidate-visible",
+                "backup",
+                DiagnosticImpact::StateAppliedFinalizationFailed,
+            ),
+        ] {
+            let temporary = tempfile::tempdir().expect("应该可创建临时目录");
+            let source = temporary.path().join("source");
+            fs::create_dir(&source).expect("应该可创建来源");
+            fs::write(source.join("value.txt"), b"new").expect("应该可写入新内容");
+            let target = temporary.path().join("target");
+            fs::create_dir_all(target.join("snapshot/content")).expect("应该可创建旧目标");
+            fs::write(target.join("snapshot/content/value.txt"), b"old").expect("应该可写入旧内容");
+            let status = subprocess_command(&format!("abort:{phase}"), &target, &source)
+                .status()
+                .expect("应该可等待故障子进程");
+            assert!(!status.success(), "故障点 {phase} 必须终止子进程");
+
+            let changed = single_managed_artifact(temporary.path(), extension);
+            fs::remove_dir_all(&changed).expect("应该可移除原受管目录");
+            fs::create_dir(&changed).expect("应该可建立不同身份的占位目录");
+
+            let root = TestDirectoryPublisher::new(file_system_config());
+            let recovery = root
+                .recover(target.clone())
+                .await
+                .expect_err("身份异常必须保留恢复现场");
+            let diagnostic = recovery.source_error().safe_diagnostic(
+                DiagnosticStage::Init,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckProjectState,
+            );
+            assert_eq!(diagnostic.impact, expected_impact);
+            match (phase, recovery.source_error().as_ref()) {
+                ("original-move", SystemFileSystemError::RecoveryCleanupFailed { .. }) => {}
+                (
+                    "candidate-visible",
+                    SystemFileSystemError::PublishedRecoveryCleanupFailed { .. },
+                ) => {}
+                (_, actual) => panic!("目标终态分类错误：{actual:?}"),
+            }
+            let expected_contents = if phase == "original-move" {
+                b"old".as_slice()
+            } else {
+                b"new".as_slice()
+            };
+            assert_eq!(
+                fs::read(target.join("snapshot/content/value.txt")).expect("目标内容应可读取"),
+                expected_contents
+            );
+            root.shutdown().await.expect("文件系统根应可终结");
         }
     }
 }

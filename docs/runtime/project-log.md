@@ -36,7 +36,8 @@ SQL、参数、查询结果、Lua 变量和游戏正文不会自动变成日志�
 `run.finished`，并完成 flush/sync。`run.finished.outcome` 只使用以下终态：
 
 - `succeeded`：业务得到明确成功结果；
-- `failed`：业务明确失败，且不需要操作者保留恢复现场；
+- `failed`：主运行明确失败，未被投影为下面的专用终态；仍要读取主诊断和全部相关诊断的
+  `impact` 与 `recovery`，其中个别诊断仍可能要求保留恢复现场；
 - `cancelled`：合作取消完成；
 - `recovery_required`：业务状态已经明确，但操作者必须按诊断保留或处理恢复现场；
 - `outcome_unknown`：提交、发布或进程异常使最终状态确实无法确认。
@@ -49,6 +50,10 @@ Translate 的任务事实不依赖 Markdown 任务记录开关。每个实际任
 `task.finished` 保存 `complete`、`partial`、`unavailable` 或 `failed`；存在具体原因时，
 另写 `task.diagnostic`。本轮存在 Partial 或 Unavailable 时，`result.partial` 保存完整汇总。
 关闭 Markdown 任务记录不会删除这些 JSONL 事件。
+
+这些事件以模型任务为单位，不保存临时输出 ID 到项目数据库精确 locator 的通用映射。
+项目日志因此不能直接驱动 Lua 补译；需要人工或 agent 修订时，从当前数据库按
+[Lua 审查流程](../lua/README.md#4-完整审查与人工或-agent-修订)重新取得 Unit 与 locator。
 
 WriteBack 需要人工调整布局时，每个布局单元写 Warn 事件
 `write_back.manual_layout_required`。payload kind 是 `manual_layout_required`，包含受影响

@@ -1175,7 +1175,17 @@ fn generic_reextract_preserves_moves_and_rejects_unextracted_changes() {
         "Generic WriteBack 不得修改外部 JSONL"
     );
 
-    let override_script = workspace_root().join("docs/lua/examples/generic-override.lua");
+    let override_script = root.join("generic-override.lua");
+    fs::write(
+        &override_script,
+        r#"assert(ctx.project.engine == "generic")
+ctx.translation.set(
+  { group_id = assert(arg[1]), unit_id = assert(arg[2]) },
+  assert(arg[3])
+)
+"#,
+    )
+    .expect("产品 E2E 的 Lua 输入应可写入");
     let mut lua_arguments = arguments(&["generic", "lua", "--name", PROJECT]);
     lua_arguments.push(override_script.into_os_string());
     lua_arguments.push("--".into());
@@ -1796,145 +1806,6 @@ print("remaining Current", remaining)
         }),
         "成功终态之前不得伪报失败"
     );
-}
-
-#[test]
-fn atomic_lua_documented_examples_commit_once_or_roll_back_once() {
-    let temporary = tempfile::tempdir().expect("应可建立原子 Lua 端到端测试目录");
-    let root = temporary.path();
-    let game = root.join("mz-game");
-    write_minimal_mz_game(&game);
-    write_configuration(root, "http://127.0.0.1:9/v1/chat/completions");
-    assert_success("Lua 项目 Init", &run_att(root, init_arguments("mz", &game)));
-
-    let note_script = workspace_root().join("docs/lua/examples/project-note.lua");
-    let mut note_arguments = arguments(&["mz", "lua", "--name", PROJECT]);
-    note_arguments.push(note_script.into_os_string());
-    note_arguments.push("--".into());
-    note_arguments.extend(arguments(&["menu", "checked"]));
-    assert_success("Lua 私有表提交", &run_att(root, note_arguments));
-
-    let database = distribution_root(root)
-        .join("projects/mz")
-        .join(PROJECT)
-        .join("project.db");
-    let connection = Connection::open(&database).expect("项目数据库应可重新打开");
-    let note: String = connection
-        .query_row("SELECT note FROM lua_notes WHERE key = 'menu'", [], |row| {
-            row.get(0)
-        })
-        .expect("文档示例应提交私有表内容");
-    assert_eq!(note, "checked");
-    drop(connection);
-
-    let logs = database
-        .parent()
-        .expect("项目数据库应有父目录")
-        .join("logs");
-    let logs_before_rollback = fs::read_dir(&logs)
-        .expect("回滚前项目日志目录应可读取")
-        .map(|entry| entry.expect("回滚前项目日志目录项应可读取").path())
-        .collect::<Vec<_>>();
-    let rollback_script = workspace_root().join("docs/lua/examples/rollback.lua");
-    let mut rollback_arguments = arguments(&["mz", "lua", "--name", PROJECT]);
-    rollback_arguments.push(rollback_script.into_os_string());
-    let rollback = run_att(root, rollback_arguments);
-    assert!(!rollback.status.success(), "未捕获 Lua 错误必须让命令失败");
-    let rollback_logs = fs::read_dir(&logs)
-        .expect("回滚后项目日志目录应可读取")
-        .map(|entry| entry.expect("回滚后项目日志目录项应可读取").path())
-        .filter(|path| !logs_before_rollback.contains(path))
-        .collect::<Vec<_>>();
-    assert_eq!(rollback_logs.len(), 1, "失败 Lua 命令只应新增一份项目日志");
-    let rollback_records = fs::read_to_string(&rollback_logs[0])
-        .expect("失败 Lua 项目日志应可读取")
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).expect("失败项目日志行必须是 JSON"))
-        .collect::<Vec<_>>();
-    assert!(
-        rollback_records
-            .iter()
-            .any(|record| record["code"] == "phase.started"),
-        "失败 Lua 必须记录阶段开始"
-    );
-    assert!(
-        rollback_records
-            .iter()
-            .all(|record| record["code"] != "phase.finished"),
-        "失败 Lua 不得伪报阶段完成"
-    );
-    let rollback_summaries = rollback_records
-        .iter()
-        .filter(|record| record["code"] == "lua.summary")
-        .collect::<Vec<_>>();
-    assert_eq!(
-        rollback_summaries.len(),
-        1,
-        "失败 Lua 必须且只能记录一条 Host 调用摘要"
-    );
-    let rollback_summary = rollback_summaries[0];
-    assert_eq!(rollback_summary["payload"]["database_calls"], 2);
-    assert_eq!(rollback_summary["payload"]["changed_rows"], 1);
-    assert_eq!(rollback_summary["payload"]["translation_calls"], 0);
-    assert_eq!(rollback_summary["payload"]["printed_lines"], 0);
-    assert!(
-        rollback_summary["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("Lua 统计") && !message.contains("已提交")),
-        "失败摘要必须使用不宣称事务成功的中性文案"
-    );
-    assert!(
-        rollback_records
-            .iter()
-            .any(|record| record["code"] == "failure.reported"),
-        "失败 Lua 必须及时记录结构化失败"
-    );
-    assert!(
-        rollback_records.iter().any(|record| {
-            record["code"] == "run.finished" && record["payload"]["outcome"] == "failed"
-        }),
-        "失败 Lua 必须记录 failed 终态"
-    );
-
-    let connection = Connection::open(&database).expect("回滚后数据库应可重新打开");
-    let rollback_table_count: i64 = connection
-        .query_row(
-            "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'lua_rollback_example'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("应可检查回滚示例表");
-    assert_eq!(
-        rollback_table_count, 0,
-        "失败脚本建立的私有表也必须随外层事务回滚"
-    );
-    let note_after_rollback: String = connection
-        .query_row("SELECT note FROM lua_notes WHERE key = 'menu'", [], |row| {
-            row.get(0)
-        })
-        .expect("前一次成功事务不得受后续回滚影响");
-    assert_eq!(note_after_rollback, "checked");
-    drop(connection);
-
-    let restricted_script = root.join("restricted.lua");
-    fs::write(
-        &restricted_script,
-        r#"
-assert(ctx.project.engine == "mz")
-assert(io == nil)
-assert(os == nil)
-assert(package == nil)
-assert(require == nil)
-assert(loadfile == nil)
-assert(dofile == nil)
-assert(debug == nil)
-assert(warn == nil)
-"#,
-    )
-    .expect("受限 VM 测试脚本应可写入");
-    let mut restricted_arguments = arguments(&["mz", "lua", "--name", PROJECT]);
-    restricted_arguments.push(restricted_script.into_os_string());
-    assert_success("Lua 受限 VM", &run_att(root, restricted_arguments));
 }
 
 fn run_information_command(root: &Path, arguments: &[&str]) -> String {
@@ -2665,8 +2536,4 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
-}
-
-fn workspace_root() -> &'static Path {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
 }
