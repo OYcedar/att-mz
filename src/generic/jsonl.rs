@@ -14,8 +14,10 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::diagnostic::{
-    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
-    DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
+    Diagnostic, FileSystemDiagnosticContext, FileSystemDiagnosticStage, FileSystemIssue,
+    FileSystemOperation, FileSystemOrdinalKeyPhase, FileSystemProblem, GenericDiagnosticStage,
+    GenericIssue, GenericJsonErrorCategory, GenericJsonlLocation, GenericProblem,
+    GenericTextViolation, IoFailure, SafeIdentifier, SafePath,
 };
 use crate::execution::CooperativeCancellation;
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
@@ -239,12 +241,12 @@ pub(crate) enum GenericJsonlError {
         path: PathBuf,
     },
     Io {
-        operation: &'static str,
+        operation: FileSystemOperation,
         path: PathBuf,
         source: io::Error,
     },
     Windows {
-        operation: &'static str,
+        operation: FileSystemOperation,
         path: PathBuf,
         source: WindowsFsError,
     },
@@ -291,7 +293,7 @@ pub(crate) enum GenericJsonlError {
         field: &'static str,
     },
     InvalidText {
-        character: &'static str,
+        violation: GenericTextViolation,
     },
     EmptyUnits {
         group_id: String,
@@ -424,7 +426,8 @@ impl fmt::Display for GenericJsonlError {
                 source,
             } => write!(
                 formatter,
-                "{operation} Generic 输入失败：{}（{source}）",
+                "{} Generic 输入失败：{}（{source}）",
+                operation.as_str(),
                 path.display()
             ),
             Self::Windows {
@@ -433,7 +436,8 @@ impl fmt::Display for GenericJsonlError {
                 source,
             } => write!(
                 formatter,
-                "{operation} Generic 输入失败：{}（{source}）",
+                "{} Generic 输入失败：{}（{source}）",
+                operation.as_str(),
                 path.display()
             ),
             Self::WindowsOrdinalCaseKey { path, source } => write!(
@@ -495,9 +499,14 @@ impl fmt::Display for GenericJsonlError {
                 path.display()
             ),
             Self::BlankField { field } => write!(formatter, "{field} 不能为空"),
-            Self::InvalidText { character } => {
-                write!(formatter, "unit.text 不允许包含 {character}")
-            }
+            Self::InvalidText { violation } => write!(
+                formatter,
+                "unit.text 不允许包含 {}",
+                match violation {
+                    GenericTextViolation::CarriageReturn => "CR（U+000D）",
+                    GenericTextViolation::Nul => "NUL（U+0000）",
+                }
+            ),
             Self::EmptyUnits { group_id } => {
                 write!(formatter, "Generic Group {group_id:?} 的 units 不能为空")
             }
@@ -554,341 +563,232 @@ impl Error for GenericJsonlError {
     }
 }
 
-impl SafeDiagnosticSource for GenericJsonlError {
-    fn safe_diagnostic_source(
-        &self,
-        stage: DiagnosticStage,
-        impact: DiagnosticImpact,
-        fallback_action: DiagnosticAction,
-    ) -> SafeDiagnostic {
+impl GenericJsonlError {
+    /// 在仍持有 JSONL 物理位置和后端类别的位置建立当前诊断契约。
+    /// 状态影响由调用方按命令事务事实组合，不由解析器猜测。
+    pub(crate) fn diagnostic(&self, stage: GenericDiagnosticStage) -> Diagnostic {
         match self {
-            Self::Cancelled => SafeDiagnostic::new(
-                DiagnosticCode::ExtractDocumentRead,
+            Self::SourceNotDirectory { path } => file_system_diagnostic(
                 stage,
-                DiagnosticSubject::operation("generic_jsonl_scan"),
-                DiagnosticReason::failure(DiagnosticFailureKind::LockCancelled),
-                impact,
-                DiagnosticAction::Retry,
-            ),
-            Self::SourceNotDirectory { path } => SafeDiagnostic::new(
-                DiagnosticCode::ExtractDocumentRead,
-                stage,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
-                impact,
-                DiagnosticAction::FixInput,
+                FileSystemOperation::Open,
+                FileSystemProblem::NotDirectory {
+                    path: SafePath::new(path),
+                },
             ),
             Self::Io {
                 operation,
                 path,
                 source,
-            } => SafeDiagnostic::io(
-                DiagnosticCode::FileSystemOperation,
+            } => file_system_diagnostic(
                 stage,
-                DiagnosticSubject::path(path),
                 *operation,
-                source,
-                impact,
-                DiagnosticAction::CheckPathAndPermissions,
+                FileSystemProblem::Io {
+                    path: SafePath::new(path),
+                    failure: IoFailure::from_error(source),
+                },
             ),
-            Self::Windows { source, .. } => source.safe_diagnostic(
-                DiagnosticCode::FileSystemOperation,
-                stage,
-                impact,
-                fallback_action,
-            ),
+            Self::Windows {
+                operation, source, ..
+            } => source.diagnostic(FileSystemDiagnosticContext::new(
+                file_system_stage(stage),
+                *operation,
+            )),
             Self::WindowsOrdinalCaseKey { path, source } => match source {
                 WindowsOrdinalCaseKeyError::InputTooLarge { maximum, observed } => {
-                    SafeDiagnostic::new(
-                        DiagnosticCode::FileSystemOperation,
+                    file_system_diagnostic(
                         stage,
-                        DiagnosticSubject::path(path),
-                        DiagnosticReason::Resource {
-                            resource: "Windows 文件名 UTF-16 单元数".to_owned(),
-                            actual: *observed,
-                            maximum: Some(*maximum),
+                        FileSystemOperation::WindowsOrdinalCaseKey,
+                        FileSystemProblem::OrdinalKeyTooLarge {
+                            path: SafePath::new(path),
+                            observed: *observed,
+                            maximum: *maximum,
                         },
-                        impact,
-                        DiagnosticAction::FixInput,
                     )
                 }
-                WindowsOrdinalCaseKeyError::WindowsApi { phase, source } => SafeDiagnostic::io(
-                    DiagnosticCode::FileSystemOperation,
+                WindowsOrdinalCaseKeyError::WindowsApi { phase, source } => file_system_diagnostic(
                     stage,
-                    DiagnosticSubject::path(path),
-                    "windows_ordinal_case_key",
-                    source,
-                    impact,
-                    DiagnosticAction::CheckPathAndPermissions,
-                )
-                .with_recovery(RecoveryFact::component(format!(
-                    "windows_ordinal_case_key_phase={}",
-                    phase.as_str()
-                ))),
+                    FileSystemOperation::WindowsOrdinalCaseKey,
+                    FileSystemProblem::OrdinalKeyIo {
+                        path: SafePath::new(path),
+                        phase: match phase {
+                            crate::windows_path::WindowsOrdinalCaseKeyPhase::Measure => {
+                                FileSystemOrdinalKeyPhase::Measure
+                            }
+                            crate::windows_path::WindowsOrdinalCaseKeyPhase::Map => {
+                                FileSystemOrdinalKeyPhase::Map
+                            }
+                        },
+                        failure: IoFailure::from_error(source),
+                    },
+                ),
             },
-            Self::HardLinkedFile { path, link_count } => generic_jsonl_invalid(
+            Self::HardLinkedFile { path, link_count } => file_system_diagnostic(
                 stage,
-                impact,
-                path,
-                format!("format=jsonl; failure=hard_link; link_count={link_count}"),
+                FileSystemOperation::Metadata,
+                FileSystemProblem::HardLink {
+                    path: SafePath::new(path),
+                    link_count: *link_count,
+                },
             ),
             Self::WindowsCaseConflict {
                 first_path,
                 second_path,
-            } => generic_jsonl_invalid(
+            } => file_system_diagnostic(
                 stage,
-                impact,
-                second_path,
-                "format=jsonl; failure=windows_case_conflict".to_owned(),
-            )
-            .with_recovery(RecoveryFact::path(first_path)),
-            Self::NonRegularFileSystemObject { path } => generic_jsonl_invalid(
-                stage,
-                impact,
-                path,
-                "format=jsonl; failure=non_regular_filesystem_object".to_owned(),
-            ),
-            Self::PathEscaped { root, path } => generic_jsonl_invalid(
-                stage,
-                impact,
-                path,
-                "format=jsonl; failure=path_escape".to_owned(),
-            )
-            .with_recovery(RecoveryFact::path(root)),
-            Self::InvalidUtf8 { path, source } => SafeDiagnostic::new(
-                DiagnosticCode::ExtractDocumentRead,
-                stage,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::InvalidUtf8 {
-                    valid_up_to: u64::try_from(source.valid_up_to()).unwrap_or(u64::MAX),
-                    error_len: source
-                        .error_len()
-                        .map(|length| u64::try_from(length).unwrap_or(u64::MAX)),
+                FileSystemOperation::WindowsOrdinalCaseKey,
+                FileSystemProblem::CaseCollision {
+                    first_path: SafePath::new(first_path),
+                    second_path: SafePath::new(second_path),
                 },
-                impact,
-                DiagnosticAction::FixInput,
             ),
-            Self::BlankLine { path, line } => generic_jsonl_invalid(
+            Self::NonRegularFileSystemObject { path } => file_system_diagnostic(
                 stage,
-                impact,
-                path,
-                format!("format=jsonl; failure=blank_line; jsonl_line={line}"),
-            )
-            .with_recovery(RecoveryFact::component(format!("jsonl_line={line}"))),
-            Self::InvalidJson {
-                path,
-                line,
-                serde_line,
-                serde_column,
-                source,
-            } => {
-                let category = JsonErrorCategory::from(source);
-                generic_jsonl_invalid(
-                    stage,
-                    impact,
-                    path,
-                    format!(
-                        "format=jsonl; json_category={category}; jsonl_line={line}; json_line={}; json_column={}",
-                        serde_line, serde_column
-                    ),
+                FileSystemOperation::Metadata,
+                FileSystemProblem::UnexpectedObject {
+                    path: SafePath::new(path),
+                },
+            ),
+            Self::PathEscaped { root, path } => file_system_diagnostic(
+                stage,
+                FileSystemOperation::ResolveDirectory,
+                FileSystemProblem::OutsideScope {
+                    root: SafePath::new(root),
+                    path: SafePath::new(path),
+                },
+            ),
+            Self::InvalidGroup { path, line, source } => {
+                group_problem(source, Some(jsonl_location(path, *line))).map_or_else(
+                    || source.diagnostic(stage),
+                    |problem| generic_diagnostic(stage, problem),
                 )
-                .with_recovery(RecoveryFact::component(format!("jsonl_line={line}")))
             }
-            Self::InvalidGroup { path, line, source } => generic_jsonl_invalid(
+            Self::Cancelled
+            | Self::InvalidUtf8 { .. }
+            | Self::BlankLine { .. }
+            | Self::InvalidJson { .. }
+            | Self::BlankField { .. }
+            | Self::InvalidText { .. }
+            | Self::EmptyUnits { .. }
+            | Self::DuplicateUnitId { .. }
+            | Self::DuplicateGroupId { .. }
+            | Self::Serialize { .. } => generic_diagnostic(
                 stage,
-                impact,
-                path,
-                format!(
-                    "format=jsonl; failure=invalid_group; jsonl_line={line}; {}",
-                    generic_group_error_detail(source)
-                ),
-            )
-            .with_recovery(RecoveryFact::component(format!("jsonl_line={line}"))),
-            Self::BlankField { field } => SafeDiagnostic::new(
-                DiagnosticCode::ExtractDocumentRead,
-                stage,
-                DiagnosticSubject::field(field),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::GenericSourceDocumentInvalid,
-                    "format=jsonl; failure=blank_field",
-                ),
-                impact,
-                DiagnosticAction::FixInput,
-            ),
-            Self::InvalidText { character } => SafeDiagnostic::new(
-                DiagnosticCode::ExtractDocumentRead,
-                stage,
-                DiagnosticSubject::field("unit.text"),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::GenericSourceDocumentInvalid,
-                    format!("format=jsonl; failure=forbidden_character; character={character}"),
-                ),
-                impact,
-                DiagnosticAction::FixInput,
-            ),
-            Self::EmptyUnits { group_id } => SafeDiagnostic::new(
-                DiagnosticCode::ExtractDocumentRead,
-                stage,
-                DiagnosticSubject::field("units"),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::GenericSourceDocumentInvalid,
-                    format!("format=jsonl; failure=empty_units; group_id={group_id}"),
-                ),
-                impact,
-                DiagnosticAction::FixInput,
-            ),
-            Self::DuplicateUnitId {
-                group_id,
-                unit_id,
-                first_ordinal,
-                second_ordinal,
-            } => SafeDiagnostic::new(
-                DiagnosticCode::ExtractDocumentRead,
-                stage,
-                DiagnosticSubject::field("unit.id"),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::GenericSourceDocumentInvalid,
-                    format!(
-                        "format=jsonl; failure=duplicate_unit_id; group_id={group_id}; unit_id={unit_id}; first_ordinal={first_ordinal}; second_ordinal={second_ordinal}"
-                    ),
-                ),
-                impact,
-                DiagnosticAction::FixInput,
-            ),
-            Self::DuplicateGroupId {
-                group_id,
-                first_path,
-                first_line,
-                second_path,
-                second_line,
-            } => generic_jsonl_invalid(
-                stage,
-                impact,
-                second_path,
-                format!(
-                    "format=jsonl; failure=duplicate_group_id; group_id={group_id}; first_line={first_line}; second_line={second_line}"
-                ),
-            )
-            .with_recovery(RecoveryFact::path(first_path))
-            .with_recovery(RecoveryFact::component(format!(
-                "first_jsonl_line={first_line}; second_jsonl_line={second_line}"
-            ))),
-            Self::Serialize { source } => SafeDiagnostic::new(
-                DiagnosticCode::InternalOperation,
-                stage,
-                DiagnosticSubject::operation("serialize_generic_jsonl"),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::InternalInvariant,
-                    format!(
-                        "json_category={}; json_line={}; json_column={}",
-                        JsonErrorCategory::from(source),
-                        source.line(),
-                        source.column()
-                    ),
-                ),
-                impact,
-                fallback_action,
+                group_problem(self, None).expect("Generic JSONL 格式错误必须具有封闭问题投影"),
             ),
         }
     }
 }
 
-fn generic_jsonl_invalid(
-    stage: DiagnosticStage,
-    impact: DiagnosticImpact,
-    path: &Path,
-    detail: String,
-) -> SafeDiagnostic {
-    SafeDiagnostic::new(
-        DiagnosticCode::ExtractDocumentRead,
-        stage,
-        DiagnosticSubject::path(path),
-        DiagnosticReason::failure_with_detail(
-            DiagnosticFailureKind::GenericSourceDocumentInvalid,
-            detail,
-        ),
-        impact,
-        DiagnosticAction::FixInput,
+fn generic_diagnostic(stage: GenericDiagnosticStage, problem: GenericProblem) -> Diagnostic {
+    Diagnostic::generic(GenericIssue::jsonl(stage, problem))
+}
+
+fn file_system_diagnostic(
+    stage: GenericDiagnosticStage,
+    operation: FileSystemOperation,
+    problem: FileSystemProblem,
+) -> Diagnostic {
+    Diagnostic::file_system(FileSystemIssue::new(
+        FileSystemDiagnosticContext::new(file_system_stage(stage), operation),
+        problem,
+    ))
+}
+
+const fn file_system_stage(stage: GenericDiagnosticStage) -> FileSystemDiagnosticStage {
+    match stage {
+        GenericDiagnosticStage::ProjectOpening | GenericDiagnosticStage::Init => {
+            FileSystemDiagnosticStage::Project
+        }
+        GenericDiagnosticStage::Extract => FileSystemDiagnosticStage::Extract,
+        GenericDiagnosticStage::Translate | GenericDiagnosticStage::TaskRecord => {
+            FileSystemDiagnosticStage::Translate
+        }
+        GenericDiagnosticStage::WriteBack => FileSystemDiagnosticStage::WriteBack,
+    }
+}
+
+fn jsonl_location(path: &Path, line: usize) -> GenericJsonlLocation {
+    GenericJsonlLocation::line(
+        path,
+        NonZeroUsize::new(line).expect("Generic JSONL 物理行号必须从一开始"),
     )
 }
 
-fn generic_group_error_detail(source: &GenericJsonlError) -> String {
+fn group_problem(
+    source: &GenericJsonlError,
+    location: Option<GenericJsonlLocation>,
+) -> Option<GenericProblem> {
     match source {
-        GenericJsonlError::Cancelled => "failure=cancelled".to_owned(),
-        GenericJsonlError::BlankField { field } => {
-            format!("failure=blank_field; field={field}")
-        }
-        GenericJsonlError::InvalidText { character } => {
-            format!("failure=forbidden_character; field=unit.text; character={character}")
-        }
-        GenericJsonlError::EmptyUnits { group_id } => {
-            format!("failure=empty_units; group_id={group_id}")
-        }
+        GenericJsonlError::Cancelled => Some(GenericProblem::Cancelled),
+        GenericJsonlError::InvalidUtf8 { path, source } => Some(GenericProblem::InvalidUtf8 {
+            path: SafePath::new(path),
+            valid_up_to: source.valid_up_to(),
+            error_len: source.error_len(),
+        }),
+        GenericJsonlError::BlankLine { path, line } => Some(GenericProblem::BlankJsonlLine {
+            location: jsonl_location(path, *line),
+        }),
+        GenericJsonlError::InvalidJson {
+            path,
+            line,
+            serde_line,
+            serde_column,
+            source,
+        } => Some(GenericProblem::InvalidJson {
+            location: jsonl_location(path, *line),
+            json_line: *serde_line,
+            json_column: *serde_column,
+            category: GenericJsonErrorCategory::from(JsonErrorCategory::from(source)),
+        }),
+        GenericJsonlError::InvalidGroup { source, .. } => group_problem(source, location),
+        GenericJsonlError::BlankField { field } => Some(GenericProblem::BlankField {
+            location,
+            field: SafeIdentifier::from_validated(field),
+        }),
+        GenericJsonlError::InvalidText { violation } => Some(GenericProblem::InvalidText {
+            location,
+            violation: *violation,
+        }),
+        GenericJsonlError::EmptyUnits { group_id } => Some(GenericProblem::EmptyUnits {
+            location,
+            group_id: SafeIdentifier::new(group_id).ok(),
+        }),
         GenericJsonlError::DuplicateUnitId {
             group_id,
             unit_id,
             first_ordinal,
             second_ordinal,
-        } => format!(
-            "failure=duplicate_unit_id; group_id={group_id}; unit_id={unit_id}; first_ordinal={first_ordinal}; second_ordinal={second_ordinal}"
-        ),
-        GenericJsonlError::InvalidGroup { source, .. } => generic_group_error_detail(source),
-        GenericJsonlError::InvalidJson {
-            source,
-            serde_line,
-            serde_column,
-            ..
-        } => {
-            format!(
-                "failure=invalid_json; json_category={}; json_line={}; json_column={}",
-                JsonErrorCategory::from(source),
-                serde_line,
-                serde_column
-            )
-        }
-        GenericJsonlError::Serialize { source } => {
-            format!(
-                "failure=invalid_json; json_category={}; json_line={}; json_column={}",
-                JsonErrorCategory::from(source),
-                source.line(),
-                source.column()
-            )
-        }
-        GenericJsonlError::InvalidUtf8 { source, .. } => format!(
-            "failure=invalid_utf8; valid_up_to={}; error_len={}",
-            source.valid_up_to(),
-            source
-                .error_len()
-                .map_or_else(|| "none".to_owned(), |length| length.to_string())
-        ),
-        GenericJsonlError::BlankLine { line, .. } => {
-            format!("failure=blank_line; jsonl_line={line}")
-        }
-        GenericJsonlError::SourceNotDirectory { .. } => "failure=invalid_path".to_owned(),
-        GenericJsonlError::Io { operation, .. } => {
-            format!("failure=io; operation={operation}")
-        }
-        GenericJsonlError::Windows { operation, .. } => {
-            format!("failure=filesystem; operation={operation}")
-        }
-        GenericJsonlError::WindowsOrdinalCaseKey { .. } => {
-            "failure=windows_ordinal_case_key".to_owned()
-        }
-        GenericJsonlError::HardLinkedFile { link_count, .. } => {
-            format!("failure=hard_link; link_count={link_count}")
-        }
-        GenericJsonlError::WindowsCaseConflict { .. } => "failure=windows_case_conflict".to_owned(),
-        GenericJsonlError::NonRegularFileSystemObject { .. } => {
-            "failure=non_regular_filesystem_object".to_owned()
-        }
-        GenericJsonlError::PathEscaped { .. } => "failure=path_escape".to_owned(),
+        } => Some(GenericProblem::DuplicateUnitId {
+            location,
+            group_id: SafeIdentifier::new(group_id).ok(),
+            unit_id: SafeIdentifier::new(unit_id).ok(),
+            first_ordinal: *first_ordinal,
+            second_ordinal: *second_ordinal,
+        }),
         GenericJsonlError::DuplicateGroupId {
+            group_id,
+            first_path,
             first_line,
+            second_path,
             second_line,
-            ..
-        } => format!(
-            "failure=duplicate_group_id; first_line={first_line}; second_line={second_line}"
-        ),
+        } => Some(GenericProblem::DuplicateGroupId {
+            group_id: SafeIdentifier::new(group_id).ok(),
+            first: jsonl_location(first_path, *first_line),
+            second: jsonl_location(second_path, *second_line),
+        }),
+        GenericJsonlError::Serialize { source } => Some(GenericProblem::SerializeJson {
+            category: GenericJsonErrorCategory::from(JsonErrorCategory::from(source)),
+            line: source.line(),
+            column: source.column(),
+        }),
+        GenericJsonlError::SourceNotDirectory { .. }
+        | GenericJsonlError::Io { .. }
+        | GenericJsonlError::Windows { .. }
+        | GenericJsonlError::WindowsOrdinalCaseKey { .. }
+        | GenericJsonlError::HardLinkedFile { .. }
+        | GenericJsonlError::WindowsCaseConflict { .. }
+        | GenericJsonlError::NonRegularFileSystemObject { .. }
+        | GenericJsonlError::PathEscaped { .. } => None,
     }
 }
 
@@ -967,14 +867,14 @@ fn read_jsonl_file_with_probe(
     let mut pinned =
         crate::runtime::windows::pin_regular_file_for_snapshot_read(path).map_err(|source| {
             GenericJsonlError::Windows {
-                operation: "固定稳定读取文件",
+                operation: FileSystemOperation::Open,
                 path: path.to_path_buf(),
                 source,
             }
         })?;
     let link_count =
         number_of_links(pinned.file(), path).map_err(|source| GenericJsonlError::Windows {
-            operation: "读取文件硬链接数",
+            operation: FileSystemOperation::Metadata,
             path: path.to_path_buf(),
             source,
         })?;
@@ -986,7 +886,7 @@ fn read_jsonl_file_with_probe(
     }
     let expected_identity =
         FileIdentity::of(pinned.file(), path).map_err(|source| GenericJsonlError::Windows {
-            operation: "读取文件身份",
+            operation: FileSystemOperation::Metadata,
             path: path.to_path_buf(),
             source,
         })?;
@@ -1022,7 +922,7 @@ fn read_snapshot_file_with_probe(
             Err(source) if source.kind() == io::ErrorKind::Interrupted => continue,
             Err(source) => {
                 return Err(GenericJsonlError::Io {
-                    operation: "读取",
+                    operation: FileSystemOperation::Read,
                     path: path.clone(),
                     source,
                 });
@@ -1034,7 +934,7 @@ fn read_snapshot_file_with_probe(
         raw_bytes
             .try_reserve(read)
             .map_err(|source| GenericJsonlError::Io {
-                operation: "扩展 Generic 输入读取缓冲区",
+                operation: FileSystemOperation::Read,
                 path: path.clone(),
                 source: io::Error::new(io::ErrorKind::OutOfMemory, source),
             })?;
@@ -1043,19 +943,19 @@ fn read_snapshot_file_with_probe(
     ensure_not_cancelled(cancellation, JsonlCancellationBoundary::FileReadChunk)?;
     let actual_identity =
         FileIdentity::of(file, &path).map_err(|source| GenericJsonlError::Windows {
-            operation: "重新读取文件身份",
+            operation: FileSystemOperation::Metadata,
             path: path.clone(),
             source,
         })?;
     if actual_identity != expected_identity {
         return Err(GenericJsonlError::Windows {
-            operation: "确认稳定读取文件身份",
+            operation: FileSystemOperation::Metadata,
             path: path.clone(),
             source: WindowsFsError::FileIdentityChanged { path },
         });
     }
     let link_count = number_of_links(file, &path).map_err(|source| GenericJsonlError::Windows {
-        operation: "重新读取文件硬链接数",
+        operation: FileSystemOperation::Metadata,
         path: path.clone(),
         source,
     })?;
@@ -1066,7 +966,7 @@ fn read_snapshot_file_with_probe(
 }
 
 fn windows_input_error(
-    operation: &'static str,
+    operation: FileSystemOperation,
     path: &Path,
     source: WindowsFsError,
 ) -> GenericJsonlError {
@@ -1567,13 +1467,13 @@ fn validate_text_with_cancellation(
     for chunk in bytes.chunks(CANCELLATION_CHECK_CHUNK_BYTES.get()) {
         ensure_not_cancelled(cancellation, JsonlCancellationBoundary::TextChunk)?;
         for byte in chunk {
-            let character = match byte {
-                b'\r' => Some("CR（U+000D）"),
-                b'\0' => Some("NUL（U+0000）"),
+            let violation = match byte {
+                b'\r' => Some(GenericTextViolation::CarriageReturn),
+                b'\0' => Some(GenericTextViolation::Nul),
                 _ => None,
             };
-            if let Some(character) = character {
-                return Err(GenericJsonlError::InvalidText { character });
+            if let Some(violation) = violation {
+                return Err(GenericJsonlError::InvalidText { violation });
             }
         }
     }
@@ -1589,7 +1489,7 @@ fn collect_jsonl_files(
 ) -> Result<Vec<PinnedJsonlFile>, GenericJsonlError> {
     ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Scan)?;
     let pinned_root = pin_directory_without_reparse(source_root)
-        .map_err(|source| windows_input_error("固定 Generic 输入根", source_root, source))?;
+        .map_err(|source| windows_input_error(FileSystemOperation::Open, source_root, source))?;
     let resolved_root = pinned_root.resolved_path().to_path_buf();
     let root_lifetime = Arc::new(PinnedDirectoryLifetime {
         _root: Some(pinned_root),
@@ -1655,7 +1555,7 @@ fn scan_directory(
     ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Scan)?;
     let directory_path = &directory.path;
     let entries = fs::read_dir(directory_path).map_err(|source| GenericJsonlError::Io {
-        operation: "列举",
+        operation: FileSystemOperation::ListDirectory,
         path: directory_path.to_path_buf(),
         source,
     })?;
@@ -1665,7 +1565,7 @@ fn scan_directory(
     for entry in entries {
         ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Scan)?;
         let entry = entry.map_err(|source| GenericJsonlError::Io {
-            operation: "读取目录项",
+            operation: FileSystemOperation::ListDirectory,
             path: directory_path.to_path_buf(),
             source,
         })?;
@@ -1681,22 +1581,22 @@ fn scan_directory(
             });
         }
         let file_type = entry.file_type().map_err(|source| GenericJsonlError::Io {
-            operation: "读取目录项类型",
+            operation: FileSystemOperation::Metadata,
             path: path.clone(),
             source,
         })?;
         if file_type.is_symlink() {
             return Err(GenericJsonlError::Windows {
-                operation: "拒绝 Generic 输入 reparse point",
+                operation: FileSystemOperation::ListDirectory,
                 path: path.clone(),
                 source: WindowsFsError::ReparsePoint { path },
             });
         }
         if file_type.is_dir() {
             let child = open_directory(&path, false)
-                .map_err(|source| windows_input_error("固定 Generic 输入子目录", &path, source))?;
+                .map_err(|source| windows_input_error(FileSystemOperation::Open, &path, source))?;
             let metadata = child.metadata().map_err(|source| GenericJsonlError::Io {
-                operation: "读取 Generic 输入子目录元数据",
+                operation: FileSystemOperation::Metadata,
                 path: path.clone(),
                 source,
             })?;
@@ -1719,12 +1619,10 @@ fn scan_directory(
             return Err(GenericJsonlError::NonRegularFileSystemObject { path });
         }
 
-        let file = open_regular_file_for_snapshot_read(&path).map_err(|source| {
-            windows_input_error("固定 Generic 输入文件稳定读取", &path, source)
-        })?;
-        let link_count = number_of_links(&file, &path).map_err(|source| {
-            windows_input_error("读取 Generic 输入文件硬链接数", &path, source)
-        })?;
+        let file = open_regular_file_for_snapshot_read(&path)
+            .map_err(|source| windows_input_error(FileSystemOperation::Open, &path, source))?;
+        let link_count = number_of_links(&file, &path)
+            .map_err(|source| windows_input_error(FileSystemOperation::Metadata, &path, source))?;
         if link_count != 1 {
             return Err(GenericJsonlError::HardLinkedFile { path, link_count });
         }
@@ -1736,7 +1634,7 @@ fn scan_directory(
         }
 
         let expected_identity = FileIdentity::of(&file, &path)
-            .map_err(|source| windows_input_error("读取 Generic 输入文件身份", &path, source))?;
+            .map_err(|source| windows_input_error(FileSystemOperation::Metadata, &path, source))?;
         files.push(PinnedJsonlFile {
             relative_path,
             path,
@@ -1885,7 +1783,7 @@ fn frame_path(hasher: &mut Sha256FramedHasher, tag: u8, path: &Path) {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::diagnostic::render_safe_diagnostic;
+    use crate::diagnostic::{DiagnosticReport, StateEffect, render_diagnostic_report};
     use crate::i18n::{UiLocale, UiLocalizer};
 
     use super::*;
@@ -1989,7 +1887,7 @@ mod tests {
         assert!(matches!(
             validate_text("before\0middle\rafter"),
             Err(GenericJsonlError::InvalidText {
-                character: "NUL（U+0000）"
+                violation: GenericTextViolation::Nul
             })
         ));
     }
@@ -2537,42 +2435,25 @@ mod tests {
             "测试输入必须确保 serde 原始错误确实携带 sentinel"
         );
 
-        let diagnostic = error.safe_diagnostic_source(
-            DiagnosticStage::Extract,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixInput,
+        let report = DiagnosticReport::new(
+            StateEffect::Unchanged,
+            error.diagnostic(GenericDiagnosticStage::Extract),
         );
-
-        assert!(matches!(
-            diagnostic.subject,
-            DiagnosticSubject::Path { ref path } if path.ends_with("nested/bad.jsonl")
-        ));
-        assert!(matches!(
-            diagnostic.reason,
-            DiagnosticReason::FailureWithDetail {
-                failure: DiagnosticFailureKind::GenericSourceDocumentInvalid,
-                ref detail,
-            } if detail.contains("json_category=data")
-                && detail.contains("jsonl_line=1")
-                && detail.contains("json_line=1")
-                && detail.contains("json_column=")
-        ));
-        assert!(diagnostic.recovery.iter().any(
-            |fact| matches!(fact, RecoveryFact::Component { name } if name == "jsonl_line=1")
-        ));
-        let serialized = serde_json::to_string(&diagnostic).expect("公开诊断应可序列化");
+        let value = serde_json::to_value(&report).expect("公开诊断应可序列化");
+        assert_eq!(value["primary"]["code"], "generic.jsonl.invalid_json");
+        assert_eq!(value["primary"]["stage"], "extract");
+        let problem = &value["primary"]["issue"]["details"]["problem"];
+        assert_eq!(problem["location"]["path"], "nested/bad.jsonl");
+        assert_eq!(problem["location"]["line"], 1);
+        assert_eq!(problem["json_line"], 1);
+        assert_eq!(problem["category"], "data");
+        assert!(problem["json_column"].as_u64().is_some());
+        let serialized = serde_json::to_string(&report).expect("公开诊断应可序列化");
         assert!(!serialized.contains(SENTINEL));
 
-        let mut rendered = Vec::new();
-        render_safe_diagnostic(
-            &diagnostic,
-            &UiLocalizer::new(UiLocale::English),
-            &mut rendered,
-        )
-        .expect("公开诊断应可渲染");
-        let rendered = String::from_utf8(rendered).expect("诊断应为 UTF-8");
+        let rendered = render_diagnostic_report(&report, &UiLocalizer::new(UiLocale::English));
         assert!(rendered.contains("json_category=data"));
-        assert!(rendered.contains("jsonl_line=1"));
+        assert!(rendered.contains("line=1"));
         assert!(rendered.contains("json_column="));
         assert!(!rendered.contains(SENTINEL));
     }

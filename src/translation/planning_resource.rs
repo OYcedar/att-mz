@@ -18,10 +18,18 @@ use aho_corasick::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::diagnostic::{
+    Diagnostic, DiagnosticReport, FileSystemDiagnosticStage, IoFailure, RuntimeOperation,
+    StateEffect, TerminologyField, TranslationIssue, TranslationJsonFailureKind,
+    TranslationPlanningResourceKind, TranslationPlanningResourceOrigin,
+    TranslationPlanningResourceProblem, TranslationPlanningWorkerOperation,
+};
 use crate::execution::CooperativeCancellation;
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::execution::isolated::{IsolatedOperationError, run_isolated_operation};
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
+use crate::runtime::cpu::CpuExecutorUnavailable;
+use crate::runtime::filesystem::SystemFileSystemError;
 use crate::storage::file_system::{FileReader, ReadFile, ReadFileError};
 
 use super::placeholder::PlaceholderRuleDefinition;
@@ -1448,6 +1456,204 @@ where
             Self::InvalidTerminology { source, .. } => Some(source),
             Self::ParsePlaceholderRulesCompute { source, .. } => Some(source),
             Self::InvalidPlaceholderRules { source, .. } => Some(source),
+        }
+    }
+}
+
+impl TranslationPlanningResourceReadingError<SystemFileSystemError, CpuExecutorUnavailable> {
+    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
+        match self {
+            Self::Cancelled => planning_resource_report(
+                TranslationPlanningResourceKind::Terminology,
+                TranslationPlanningResourceOrigin::ProjectSnapshot,
+                TranslationPlanningResourceProblem::Cancelled,
+            ),
+            Self::ReadTerminology { source, .. } | Self::ReadPlaceholderRules { source, .. } => {
+                source.diagnostic_report_at(FileSystemDiagnosticStage::Translate)
+            }
+            Self::ParseTerminologyCompute { source, .. }
+            | Self::ParsePlaceholderRulesCompute { source, .. } => DiagnosticReport::new(
+                StateEffect::Unchanged,
+                source.diagnostic_for(RuntimeOperation::PrepareRpgMakerPlanningResources),
+            ),
+            Self::InvalidTerminology { path, source } => planning_resource_report(
+                TranslationPlanningResourceKind::Terminology,
+                planning_resource_origin(path.as_deref()),
+                terminology_problem(source),
+            ),
+            Self::InvalidPlaceholderRules { path, source } => planning_resource_report(
+                TranslationPlanningResourceKind::PlaceholderRules,
+                planning_resource_origin(path.as_deref()),
+                placeholder_definition_problem(source),
+            ),
+        }
+    }
+}
+
+fn planning_resource_report(
+    resource: TranslationPlanningResourceKind,
+    origin: TranslationPlanningResourceOrigin,
+    problem: TranslationPlanningResourceProblem,
+) -> DiagnosticReport {
+    DiagnosticReport::new(
+        StateEffect::Unchanged,
+        Diagnostic::translation(TranslationIssue::PlanningResource {
+            resource,
+            origin,
+            problem,
+        }),
+    )
+}
+
+fn planning_resource_origin(path: Option<&std::path::Path>) -> TranslationPlanningResourceOrigin {
+    path.map_or(TranslationPlanningResourceOrigin::ProjectSnapshot, |path| {
+        TranslationPlanningResourceOrigin::external(path)
+    })
+}
+
+fn planning_worker_operation(operation: &str) -> TranslationPlanningWorkerOperation {
+    match operation {
+        "att-resource-utf8" => TranslationPlanningWorkerOperation::Utf8Validation,
+        "att-term-toml" => TranslationPlanningWorkerOperation::ParseTerminology,
+        "att-placeholder-toml" => TranslationPlanningWorkerOperation::ParsePlaceholderRules,
+        "att-term-matcher" => TranslationPlanningWorkerOperation::CompileTerminologyMatcher,
+        _ => TranslationPlanningWorkerOperation::Unknown,
+    }
+}
+
+fn terminology_field(field: &str) -> TerminologyField {
+    match field {
+        "term" => TerminologyField::Term,
+        "translation" => TerminologyField::Translation,
+        "trigger" => TerminologyField::Trigger,
+        _ => TerminologyField::Unknown,
+    }
+}
+
+pub(crate) fn translation_json_failure(source: &serde_json::Error) -> TranslationJsonFailureKind {
+    match source.classify() {
+        serde_json::error::Category::Io => TranslationJsonFailureKind::Io,
+        serde_json::error::Category::Syntax => TranslationJsonFailureKind::Syntax,
+        serde_json::error::Category::Data => TranslationJsonFailureKind::Data,
+        serde_json::error::Category::Eof => TranslationJsonFailureKind::Eof,
+    }
+}
+
+pub(crate) fn terminology_problem(
+    source: &TerminologyDefinitionError,
+) -> TranslationPlanningResourceProblem {
+    match source {
+        TerminologyDefinitionError::Cancelled => TranslationPlanningResourceProblem::Cancelled,
+        TerminologyDefinitionError::StartWorker { operation, source } => {
+            TranslationPlanningResourceProblem::WorkerStart {
+                operation: planning_worker_operation(operation),
+                failure: IoFailure::from_error(source),
+            }
+        }
+        TerminologyDefinitionError::InvalidUtf8(source) => {
+            TranslationPlanningResourceProblem::InvalidUtf8 {
+                valid_up_to: source.valid_up_to(),
+                error_len: source.error_len(),
+            }
+        }
+        TerminologyDefinitionError::InvalidToml(source) => {
+            let span = source.span();
+            TranslationPlanningResourceProblem::InvalidToml {
+                span_start: span.as_ref().map(|span| span.start),
+                span_end: span.map(|span| span.end),
+            }
+        }
+        TerminologyDefinitionError::InvalidSnapshot(source) => {
+            TranslationPlanningResourceProblem::InvalidSnapshotJson {
+                category: translation_json_failure(source),
+                line: source.line(),
+                column: source.column(),
+            }
+        }
+        TerminologyDefinitionError::EncodeSnapshot(source) => {
+            TranslationPlanningResourceProblem::SnapshotEncodingJson {
+                category: translation_json_failure(source),
+                line: source.line(),
+                column: source.column(),
+            }
+        }
+        TerminologyDefinitionError::BlankField {
+            entry_number,
+            field,
+        } => TranslationPlanningResourceProblem::BlankField {
+            entry_number: *entry_number,
+            field: terminology_field(field),
+        },
+        TerminologyDefinitionError::SurroundingWhitespace {
+            entry_number,
+            field,
+        } => TranslationPlanningResourceProblem::SurroundingWhitespace {
+            entry_number: *entry_number,
+            field: terminology_field(field),
+        },
+        TerminologyDefinitionError::ControlCharacter {
+            entry_number,
+            field,
+            character,
+        } => TranslationPlanningResourceProblem::ControlCharacter {
+            entry_number: *entry_number,
+            field: terminology_field(field),
+            code_point: u32::from(*character),
+        },
+        TerminologyDefinitionError::EmptyTriggers { entry_number } => {
+            TranslationPlanningResourceProblem::EmptyTriggers {
+                entry_number: *entry_number,
+            }
+        }
+        TerminologyDefinitionError::DuplicateTerm { .. } => {
+            TranslationPlanningResourceProblem::DuplicateTerm
+        }
+        TerminologyDefinitionError::DuplicateTrigger { .. } => {
+            TranslationPlanningResourceProblem::DuplicateTrigger
+        }
+        TerminologyDefinitionError::CompileMatcher(_) => {
+            TranslationPlanningResourceProblem::MatcherConstruction
+        }
+    }
+}
+
+fn placeholder_definition_problem(
+    source: &PlaceholderDefinitionError,
+) -> TranslationPlanningResourceProblem {
+    match source {
+        PlaceholderDefinitionError::Cancelled => TranslationPlanningResourceProblem::Cancelled,
+        PlaceholderDefinitionError::StartWorker { operation, source } => {
+            TranslationPlanningResourceProblem::WorkerStart {
+                operation: planning_worker_operation(operation),
+                failure: IoFailure::from_error(source),
+            }
+        }
+        PlaceholderDefinitionError::InvalidUtf8(source) => {
+            TranslationPlanningResourceProblem::InvalidUtf8 {
+                valid_up_to: source.valid_up_to(),
+                error_len: source.error_len(),
+            }
+        }
+        PlaceholderDefinitionError::InvalidToml(source) => {
+            let span = source.span();
+            TranslationPlanningResourceProblem::InvalidToml {
+                span_start: span.as_ref().map(|span| span.start),
+                span_end: span.map(|span| span.end),
+            }
+        }
+        PlaceholderDefinitionError::InvalidSnapshot(source) => {
+            TranslationPlanningResourceProblem::InvalidSnapshotJson {
+                category: translation_json_failure(source),
+                line: source.line(),
+                column: source.column(),
+            }
+        }
+        PlaceholderDefinitionError::EncodeSnapshot(source) => {
+            TranslationPlanningResourceProblem::SnapshotEncodingJson {
+                category: translation_json_failure(source),
+                line: source.line(),
+                column: source.column(),
+            }
         }
     }
 }

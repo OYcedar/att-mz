@@ -7,6 +7,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use super::text::{RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, TextGroupKind};
+use crate::diagnostic::{RpgMakerDiagnosticRole, RpgMakerProjectionModelViolation};
 
 /// 标量字段的稳定、由提取器生成的语义键。
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -61,6 +62,17 @@ impl TextUnitRole {
             | TextGroupKind::Map
             | TextGroupKind::EventCommand
             | TextGroupKind::PluginParameter => matches!(self, Self::Scalar(_)),
+        }
+    }
+
+    /// 将领域角色投影为公开诊断角色；标量字段键已经由 `ScalarFieldKey` 校验。
+    pub(crate) fn diagnostic_role(&self) -> RpgMakerDiagnosticRole {
+        match self {
+            Self::Scalar(field) => RpgMakerDiagnosticRole::scalar(field.as_str()),
+            Self::DialogueSpeaker => RpgMakerDiagnosticRole::DialogueSpeaker,
+            Self::DialogueBody => RpgMakerDiagnosticRole::DialogueBody,
+            Self::Choices => RpgMakerDiagnosticRole::Choices,
+            Self::ScrollingText => RpgMakerDiagnosticRole::ScrollingText,
         }
     }
 }
@@ -965,6 +977,49 @@ pub(crate) enum ProjectionModelError {
         actual: usize,
     },
     MixedDirectAndInlineSpeaker,
+}
+
+impl ProjectionModelError {
+    /// 保留投影模型的封闭原因和数值位置，不把 `Display` 当成诊断协议。
+    pub(crate) fn diagnostic_violation(&self) -> RpgMakerProjectionModelViolation {
+        match self {
+            Self::EmptyScalarFieldKey => RpgMakerProjectionModelViolation::EmptyScalarFieldKey,
+            Self::EventBlockCoverageRequired => {
+                RpgMakerProjectionModelViolation::EventBlockCoverageRequired
+            }
+            Self::InvalidEventBlockCoverage => {
+                RpgMakerProjectionModelViolation::InvalidEventBlockCoverage
+            }
+            Self::MutationClaimTargetMismatch => {
+                RpgMakerProjectionModelViolation::MutationClaimTargetMismatch
+            }
+            Self::RecipeHasNoTextSlot => RpgMakerProjectionModelViolation::RecipeHasNoTextSlot,
+            Self::DuplicateProjectionSlot {
+                role,
+                source_line_index,
+            } => RpgMakerProjectionModelViolation::DuplicateProjectionSlot {
+                role: role.diagnostic_role(),
+                source_line_index: *source_line_index,
+            },
+            Self::MultipleBodyLinesInPhysicalLine => {
+                RpgMakerProjectionModelViolation::MultipleBodyLinesInPhysicalLine
+            }
+            Self::DuplicateDialogueBodyLine { source_line_index } => {
+                RpgMakerProjectionModelViolation::DuplicateDialogueBodyLine {
+                    source_line_index: *source_line_index,
+                }
+            }
+            Self::NonContiguousDialogueBodyLines { expected, actual } => {
+                RpgMakerProjectionModelViolation::NonContiguousDialogueBodyLines {
+                    expected: *expected,
+                    actual: *actual,
+                }
+            }
+            Self::MixedDirectAndInlineSpeaker => {
+                RpgMakerProjectionModelViolation::MixedDirectAndInlineSpeaker
+            }
+        }
+    }
 }
 
 impl fmt::Display for ProjectionModelError {

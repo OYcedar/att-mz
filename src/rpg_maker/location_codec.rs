@@ -12,6 +12,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use super::text::{RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource};
+use crate::diagnostic::{
+    RpgMakerJsonFailureKind, RpgMakerLocationCodecFailure, RpgMakerProjectionCodecFailure,
+    RpgMakerStorageCodecOperation,
+};
 use crate::json_diagnostic::JsonErrorCategory;
 use crate::rpg_maker::model::{
     DialogueLinePart, DialogueLineRecipe, DialogueWriteRecipe, DirectSpeakerTarget, DirectTextPart,
@@ -144,37 +148,38 @@ impl Error for RpgMakerLocationCodecError {
 }
 
 impl RpgMakerLocationCodecError {
-    /// 只投影闭集编解码原因、JSON 坐标和规范 ID，不公开原始 JSON 或文件名正文。
-    pub(crate) fn safe_diagnostic_detail(&self) -> String {
+    /// 投影编解码器仍掌握的闭集类别、JSON 坐标和数值 ID。
+    pub(crate) fn diagnostic_failure(&self) -> RpgMakerLocationCodecFailure {
         match self {
-            Self::Encode(source) => {
-                format!(
-                    "codec=location; operation=encode; {}",
-                    codec_json_error_detail(source)
-                )
-            }
-            Self::Decode(source) => {
-                format!(
-                    "codec=location; operation=decode; {}",
-                    codec_json_error_detail(source)
-                )
-            }
-            Self::NonCanonical => "codec=location; kind=non_canonical".to_owned(),
-            Self::InvalidDataFile(_) => "codec=location; kind=invalid_data_file".to_owned(),
+            Self::Encode(source) => RpgMakerLocationCodecFailure::Json {
+                operation: RpgMakerStorageCodecOperation::Encode,
+                category: codec_json_failure(source),
+                line: source.line(),
+                column: source.column(),
+            },
+            Self::Decode(source) => RpgMakerLocationCodecFailure::Json {
+                operation: RpgMakerStorageCodecOperation::Decode,
+                category: codec_json_failure(source),
+                line: source.line(),
+                column: source.column(),
+            },
+            Self::NonCanonical => RpgMakerLocationCodecFailure::NonCanonical,
+            Self::InvalidDataFile(_) => RpgMakerLocationCodecFailure::InvalidDataFile,
             Self::InvalidMapId(map_id) => {
-                format!("codec=location; kind=invalid_map_id; map_id={map_id}")
+                RpgMakerLocationCodecFailure::InvalidMapId { map_id: *map_id }
             }
         }
     }
 }
 
-fn codec_json_error_detail(source: &serde_json::Error) -> String {
-    let category = JsonErrorCategory::from(source);
-    format!(
-        "json_category={category}; json_line={}; json_column={}",
-        source.line(),
-        source.column()
-    )
+fn codec_json_failure(source: &serde_json::Error) -> RpgMakerJsonFailureKind {
+    match JsonErrorCategory::from(source) {
+        JsonErrorCategory::Io => RpgMakerJsonFailureKind::Io,
+        JsonErrorCategory::Syntax => RpgMakerJsonFailureKind::Syntax,
+        JsonErrorCategory::Data => RpgMakerJsonFailureKind::Data,
+        JsonErrorCategory::Eof => RpgMakerJsonFailureKind::Eof,
+        JsonErrorCategory::DuplicateObjectKey => RpgMakerJsonFailureKind::DuplicateObjectKey,
+    }
 }
 
 struct StoredLocation {
@@ -893,30 +898,28 @@ impl Error for RpgMakerProjectionCodecError {
 }
 
 impl RpgMakerProjectionCodecError {
-    /// 只投影闭集投影模型、嵌套位置和 JSON 坐标，不公开原始 JSON 或文本槽正文。
-    pub(crate) fn safe_diagnostic_detail(&self) -> String {
+    /// 投影编解码器仍掌握的嵌套位置、模型不变量和 JSON 坐标。
+    pub(crate) fn diagnostic_failure(&self) -> RpgMakerProjectionCodecFailure {
         match self {
-            Self::Encode(source) => {
-                format!(
-                    "codec=projection; operation=encode; {}",
-                    codec_json_error_detail(source)
-                )
-            }
-            Self::Decode(source) => {
-                format!(
-                    "codec=projection; operation=decode; {}",
-                    codec_json_error_detail(source)
-                )
-            }
-            Self::NonCanonical => "codec=projection; kind=non_canonical".to_owned(),
-            Self::Location(source) => format!(
-                "codec=projection; kind=invalid_location; {}",
-                source.safe_diagnostic_detail()
-            ),
-            Self::Projection(source) => format!(
-                "codec=projection; kind=invalid_projection; {}",
-                crate::rpg_maker::dialogue::projection_model_detail(source)
-            ),
+            Self::Encode(source) => RpgMakerProjectionCodecFailure::Json {
+                operation: RpgMakerStorageCodecOperation::Encode,
+                category: codec_json_failure(source),
+                line: source.line(),
+                column: source.column(),
+            },
+            Self::Decode(source) => RpgMakerProjectionCodecFailure::Json {
+                operation: RpgMakerStorageCodecOperation::Decode,
+                category: codec_json_failure(source),
+                line: source.line(),
+                column: source.column(),
+            },
+            Self::NonCanonical => RpgMakerProjectionCodecFailure::NonCanonical,
+            Self::Location(source) => RpgMakerProjectionCodecFailure::Location {
+                failure: Box::new(source.diagnostic_failure()),
+            },
+            Self::Projection(source) => RpgMakerProjectionCodecFailure::Projection {
+                violation: source.diagnostic_violation(),
+            },
         }
     }
 }

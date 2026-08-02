@@ -69,25 +69,27 @@ stage、backup 和 journal，不递归读取或删除无关内容。恢复依据
 属于它的 `.directory-publish-*.(stage|backup|journal)` 受管产物，并按 journal 自动恢复或
 清理。`prepare` 在锁内还会再次检查，防止恢复后到候选建立前状态变化：
 
-- 公开记录没有 `PublishedWithResiduals` 字符串。主诊断或相关诊断的 `impact =
-  "state_applied_finalization_failed"`，且 `recovery[*].path` 同时列出目标和受管残留时，表示
-  新输出已经发布，只有收尾失败。RPG Maker WriteBack 还会写
-  `publication.finished.payload.outcome = "recovery_required"`；Generic WriteBack 和 Init 不写
-  这条事件，不能因事件缺失否定诊断。保留现场，先消除占用、权限或身份变化等清理失败
-  原因，再用同一项目、同一目标和当前预期输入执行一次相应命令；MV/MZ Init 会先清理残留
-  再读取现存项目，WriteBack 会先清理残留再建立新候选；
-- 若主诊断或相关诊断的 `impact = "recovery_required"`，只有
-  `recovery[*].path` 列出与同一操作匹配的 backup/journal 或可清理 stage，且
-  `reason.failure` 不是 `journal_corrupt`、`reason.detail` 也不是“目标与已知旧目录均缺失”
-  或缺少必要 backup，才先修正诊断中的文件系统原因，再用同一项目、同一目标和相同输入
-  执行一次相应 MV/MZ Init 或 WriteBack；MV/MZ Init 会先恢复旧目标，再继承恢复后数据库的
-  设置并重新判断 `Unchanged | Updated`，WriteBack 会先恢复旧目标或清理 stage，再处理新
-  候选。I/O 原因读取 `reason.kind = "io"` 下的 `operation`、`error_kind` 和
-  `raw_os_code`；其他失败读取 `reason.kind`、`reason.failure` 和可用的 `reason.detail`；
-- 自动恢复本身报告 `reason.failure = "journal_corrupt"`、目标与已知旧目录均缺失、缺少
-  必要 backup，或一次恢复后仍得到同样的 `impact = "recovery_required"` 时，现行接口无法
-  修复；保留新诊断和全部 `recovery[*].path` 并报告，不继续重跑，也不手工删除、改名或移动；
-- `outcome_unknown` 表示目标内容或身份无法确认，禁止用重跑试探，也不能自行处理目录。
+- `DiagnosticReport.effect = "applied_finalization_failed"` 且具体 Publication issue 为
+  `published_finalization_failed` 时，`output_root` 与 `residual_path` 证明新输出已经发布、只有
+  收尾失败。`publication.finished.payload.result.kind` 为 `recovery_required`，并引用同一
+  `diagnostic.publication` occurrence。保留现场，先消除其嵌套 backend diagnostic 指出的
+  占用、权限或身份变化，再用同一项目、同一目标和当前预期输入执行一次相应命令；MV/MZ
+  Init 会先清理残留再读取现存项目，WriteBack 会先清理残留再建立新候选；
+- `DiagnosticReport.effect = "recovery_required"` 时，具体 Publication 或 FileSystem issue
+  必须同时给出 `output_root` 或 `target_root`，以及属于同一目标的
+  `recovery_artifacts`。只有这些路径是可匹配的 backup/journal 或可清理 stage，并且主报告
+  及递归 related report 都没有 `filesystem.journal_corrupt`、目标与已知旧目录均缺失或缺少
+  必要 backup，才先修正类型化 backend diagnostic 指出的文件系统原因，再用同一项目、
+  同一目标和相同输入执行一次相应 MV/MZ Init 或 WriteBack；
+- 文件系统 I/O 问题读取 `filesystem.io` issue 中的 `context.operation`、
+  `problem.failure.kind` 与 `problem.failure.raw_os_code`；其他问题按稳定 `code` 和封闭
+  `problem.kind` 分流，不解析本地化 `message`；
+- 自动恢复本身报告 `filesystem.journal_corrupt`、目标与已知旧目录均缺失、缺少必要
+  backup，或一次恢复后仍得到 `effect = "recovery_required"` 时，现行接口无法修复；保留
+  新 occurrence 中的完整 report 和全部 `recovery_artifacts`，不继续重跑，也不手工删除、
+  改名或移动；
+- `effect = "outcome_unknown"` 或 `publication.finished.payload.result.kind =
+  "outcome_unknown"` 表示目标内容或身份无法确认，禁止用重跑试探，也不能自行处理目录。
 
 当前 CLI 没有独立的 `recover` 或 `status` 子命令，也没有公开的 journal 解码与人工交换
 步骤。满足上述条件时，同目标命令就是现行自动恢复入口；`outcome_unknown` 无法通过它安全确认时，
@@ -99,10 +101,10 @@ stage、backup 和 journal，不递归读取或删除无关内容。恢复依据
 
 只在 MV/MZ Init 诊断同时包含以下事实时，把这次失败当作一次可重试的目录发布失败：
 
-- code 为 `filesystem.operation`，阶段为“发布”；
-- 结构化 IO 原因的 operation 是“无覆盖重命名”，`error_kind = permission_denied`，
-  `raw_os_code = 5`；不解析本地化展示文本；
-- 影响为“状态未改变”；
+- code 为 `filesystem.io`，stage 为 `publication`；
+- FileSystem issue 的 `context.operation = "rename"`，`problem.failure.kind =
+  "permission_denied"`，`problem.failure.raw_os_code = 5`；不解析本地化展示文本；
+- `DiagnosticReport.effect = "unchanged"`；
 - `<att-dir>/projects/<engine>/<name>` 不存在，且诊断没有 `recovery_required` 或
   `outcome_unknown`。
 

@@ -20,14 +20,30 @@ use crate::generic::{
     validated_manual_translation_state_with_compiled_rules_for_connection_with_cancellation,
 };
 use crate::language::{LanguageText, LanguageTextSegment};
-use crate::translation::placeholder::PlaceholderRuleCompilationError;
+#[cfg(test)]
+use crate::translation::placeholder::PlaceholderWorkerOperation;
+use crate::translation::placeholder::{
+    PlaceholderProtectionError, PlaceholderRuleCompilationError,
+};
 use crate::translation::planning_resource::CompiledTerminology;
 
 use super::{
     ProjectLuaCallError, ProjectLuaDatabasePrerequisiteError, ProjectLuaEngineAdapter,
     ProjectLuaSchemaObjectKind, ProjectLuaValue, project_lua_object_contains_field,
-    project_lua_worker_spawn_message, take_project_lua_object_field,
+    take_project_lua_object_field,
 };
+
+fn generic_call_violation(violation: crate::diagnostic::LuaValueViolation) -> ProjectLuaCallError {
+    ProjectLuaCallError::violation(violation).with_engine(crate::diagnostic::LuaEngine::Generic)
+}
+
+fn generic_state_error() -> ProjectLuaCallError {
+    generic_call_violation(crate::diagnostic::LuaValueViolation::StateMismatch)
+}
+
+fn generic_sqlite_error(source: rusqlite::Error) -> ProjectLuaCallError {
+    ProjectLuaCallError::sqlite(source).with_engine(crate::diagnostic::LuaEngine::Generic)
+}
 
 const GENERIC_ATT_TABLES: &[&str] = &[
     "generic_project",
@@ -89,9 +105,7 @@ impl GenericProjectLuaAdapter {
                 .baseline
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let cache = &baseline.as_ref().ok_or_else(|| {
-                ProjectLuaCallError::new("generic_project", "缺少 Generic Lua 脚本前译文状态")
-            })?;
+            let cache = &baseline.as_ref().ok_or_else(generic_state_error)?;
             cache.placeholder.clone()
         };
         let current = compiled_placeholder_resource_for_connection_with_cancellation(
@@ -107,9 +121,7 @@ impl GenericProjectLuaAdapter {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         baseline
             .as_mut()
-            .ok_or_else(|| {
-                ProjectLuaCallError::new("generic_project", "缺少 Generic Lua 脚本前译文状态")
-            })?
+            .ok_or_else(generic_state_error)?
             .placeholder = current.clone();
         ensure_generic_lua_running(&self.cancellation)?;
         Ok(current)
@@ -127,9 +139,7 @@ impl GenericProjectLuaAdapter {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             baseline
                 .as_ref()
-                .ok_or_else(|| {
-                    ProjectLuaCallError::new("generic_project", "缺少 Generic Lua 脚本前译文状态")
-                })?
+                .ok_or_else(generic_state_error)?
                 .terminology
                 .clone()
         };
@@ -146,9 +156,7 @@ impl GenericProjectLuaAdapter {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         baseline
             .as_mut()
-            .ok_or_else(|| {
-                ProjectLuaCallError::new("generic_project", "缺少 Generic Lua 脚本前译文状态")
-            })?
+            .ok_or_else(generic_state_error)?
             .terminology = current.clone();
         ensure_generic_lua_running(&self.cancellation)?;
         Ok(current)
@@ -213,14 +221,12 @@ impl ProjectLuaEngineAdapter for GenericProjectLuaAdapter {
                  WHERE group_id = ?3 AND unit_id = ?4",
                 params![translation, state.as_bytes().as_slice(), group_id, unit_id],
             )
-            .map_err(|source| {
-                ProjectLuaCallError::new("sqlite", format!("写入 Generic 人工译文失败：{source}"))
-            })?;
+            .map_err(generic_sqlite_error)?;
         if changed != 1 {
-            return Err(ProjectLuaCallError::new(
-                "unit_not_found",
-                "Generic locator 没有命中唯一 Unit",
-            ));
+            return Err(
+                generic_call_violation(crate::diagnostic::LuaValueViolation::UnknownUnit)
+                    .with_generic_locator(None, &group_id, &unit_id),
+            );
         }
         Ok(u64::try_from(changed).expect("受支持平台的 usize 必须能表示为 u64"))
     }
@@ -241,14 +247,12 @@ impl ProjectLuaEngineAdapter for GenericProjectLuaAdapter {
                  WHERE group_id = ?1 AND unit_id = ?2",
                 params![group_id, unit_id],
             )
-            .map_err(|source| {
-                ProjectLuaCallError::new("sqlite", format!("清除 Generic 人工译文失败：{source}"))
-            })?;
+            .map_err(generic_sqlite_error)?;
         if changed != 1 {
-            return Err(ProjectLuaCallError::new(
-                "unit_not_found",
-                "Generic locator 没有命中唯一 Unit",
-            ));
+            return Err(
+                generic_call_violation(crate::diagnostic::LuaValueViolation::UnknownUnit)
+                    .with_generic_locator(None, &group_id, &unit_id),
+            );
         }
         Ok(u64::try_from(changed).expect("受支持平台的 usize 必须能表示为 u64"))
     }
@@ -262,7 +266,8 @@ impl ProjectLuaEngineAdapter for GenericProjectLuaAdapter {
             || project.name() != self.expected_project.project_name().as_str()
         {
             return Err(ProjectLuaDatabasePrerequisiteError::invalid_project_state(
-                "Lua 项目身份与打开的 Generic 项目不一致",
+                crate::diagnostic::LuaEngine::Generic,
+                crate::diagnostic::LuaValueViolation::StateMismatch,
             ));
         }
         validate_current_generic_schema_with_cancellation(connection, &self.cancellation)
@@ -277,10 +282,7 @@ impl ProjectLuaEngineAdapter for GenericProjectLuaAdapter {
         if project.engine() != "generic"
             || project.name() != self.expected_project.project_name().as_str()
         {
-            return Err(ProjectLuaCallError::new(
-                "project_identity",
-                "Lua 项目身份与打开的 Generic 项目不一致",
-            ));
+            return Err(generic_state_error());
         }
         let placeholder = compiled_placeholder_resource_for_connection_with_cancellation(
             connection,
@@ -319,10 +321,7 @@ impl ProjectLuaEngineAdapter for GenericProjectLuaAdapter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if slot.is_some() {
-            return Err(ProjectLuaCallError::new(
-                "generic_project",
-                "Generic Lua 适配器不能重复执行",
-            ));
+            return Err(generic_state_error());
         }
         *slot = Some(baseline);
         Ok(())
@@ -336,10 +335,7 @@ impl ProjectLuaEngineAdapter for GenericProjectLuaAdapter {
         if project.engine() != "generic"
             || project.name() != self.expected_project.project_name().as_str()
         {
-            return Err(ProjectLuaCallError::new(
-                "project_identity",
-                "Lua 项目身份与打开的 Generic 项目不一致",
-            ));
+            return Err(generic_state_error());
         }
         let placeholder = self.placeholder_resource_for_connection(connection)?;
         let terminology = self.terminology_resource_for_connection(connection)?;
@@ -363,9 +359,7 @@ impl ProjectLuaEngineAdapter for GenericProjectLuaAdapter {
             .baseline
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let baseline = baseline.as_ref().ok_or_else(|| {
-            ProjectLuaCallError::new("generic_project", "缺少 Generic Lua 脚本前译文状态")
-        })?;
+        let baseline = baseline.as_ref().ok_or_else(generic_state_error)?;
         self.validate_translation_states(
             connection,
             &baseline.translations,
@@ -397,16 +391,10 @@ impl GenericProjectLuaAdapter {
                  ORDER BY generic_group.relative_path, generic_group.ordinal,
                           generic_unit.ordinal",
             )
-            .map_err(|source| {
-                ProjectLuaCallError::new("sqlite", format!("准备检查 Generic 译文失败：{source}"))
-            })?;
-        let mut rows = statement.query([]).map_err(|source| {
-            ProjectLuaCallError::new("sqlite", format!("检查 Generic 译文失败：{source}"))
-        })?;
+            .map_err(generic_sqlite_error)?;
+        let mut rows = statement.query([]).map_err(generic_sqlite_error)?;
         let mut initial_index = 0_usize;
-        while let Some(row) = rows.next().map_err(|source| {
-            ProjectLuaCallError::new("sqlite", format!("读取 Generic 译文失败：{source}"))
-        })? {
+        while let Some(row) = rows.next().map_err(generic_sqlite_error)? {
             ensure_generic_lua_running(&self.cancellation)?;
             let group_id = sqlite_text_with_cancellation(
                 row,
@@ -458,21 +446,13 @@ impl GenericProjectLuaAdapter {
                 &self.cancellation,
             )?;
             ensure_generic_lua_running(&self.cancellation)?;
-            let initial_entry = initial_translations.get(initial_index).ok_or_else(|| {
-                ProjectLuaCallError::new(
-                    "translation_state",
-                    "Lua 修改了 Generic Unit 身份或新增了未受管 Unit",
-                )
-            })?;
+            let initial_entry = initial_translations
+                .get(initial_index)
+                .ok_or_else(generic_state_error)?;
             let group_terminology_hit = group_terminology_hits
                 .get(initial_index)
                 .copied()
-                .ok_or_else(|| {
-                    ProjectLuaCallError::new(
-                        "translation_state",
-                        "Generic Group 术语命中状态缺少对应 Unit",
-                    )
-                })?;
+                .ok_or_else(generic_state_error)?;
             initial_index += 1;
             if !generic_text_eq_with_cancellation(
                 &initial_entry.group_id,
@@ -483,18 +463,14 @@ impl GenericProjectLuaAdapter {
                 &unit_id,
                 &self.cancellation,
             )? {
-                return Err(ProjectLuaCallError::new(
-                    "translation_state",
-                    "Lua 修改了 Generic Unit 身份、顺序或新增了未受管 Unit",
-                ));
+                return Err(generic_state_error().with_generic_locator(None, &group_id, &unit_id));
             }
             let initial = &initial_entry.state;
             let Some(translation) = translation else {
                 if origin.is_some() || state.is_some() {
-                    return Err(ProjectLuaCallError::new(
-                        "translation_state",
-                        "Generic 空译文仍带有 origin 或 state",
-                    ));
+                    return Err(
+                        generic_state_error().with_generic_locator(None, &group_id, &unit_id)
+                    );
                 }
                 continue;
             };
@@ -512,23 +488,19 @@ impl GenericProjectLuaAdapter {
                 .map_err(generic_placeholder_error)?;
             ensure_generic_lua_running(&self.cancellation)?;
             let (Some(origin), Some(state)) = (origin, state) else {
-                return Err(ProjectLuaCallError::new(
-                    "translation_state",
-                    "Generic 译文缺少 origin 或 state",
-                ));
+                return Err(generic_state_error().with_generic_locator(None, &group_id, &unit_id));
             };
             let origin = match origin.as_str() {
                 "automatic" => TranslationOrigin::Automatic,
                 "manual" => TranslationOrigin::Manual,
                 _ => {
-                    return Err(ProjectLuaCallError::new(
-                        "translation_state",
-                        "Generic 译文 origin 无效",
-                    ));
+                    return Err(
+                        generic_state_error().with_generic_locator(None, &group_id, &unit_id)
+                    );
                 }
             };
-            let state = Sha256Fingerprint::from_slice(&state).map_err(|source| {
-                ProjectLuaCallError::new("translation_state", source.to_string())
+            let state = Sha256Fingerprint::from_slice(&state).map_err(|_| {
+                generic_state_error().with_generic_locator(None, &group_id, &unit_id)
             })?;
             let state_unchanged = initial.as_ref().is_some_and(|initial| {
                 initial.origin == origin
@@ -541,10 +513,7 @@ impl GenericProjectLuaAdapter {
                 continue;
             }
             if origin != TranslationOrigin::Manual {
-                return Err(ProjectLuaCallError::new(
-                    "translation_state",
-                    "新增或改变状态的 Generic 译文必须通过人工状态校验",
-                ));
+                return Err(generic_state_error().with_generic_locator(None, &group_id, &unit_id));
             }
             ensure_generic_lua_running(&self.cancellation)?;
             let expected =
@@ -560,23 +529,14 @@ impl GenericProjectLuaAdapter {
                 .map_err(generic_error)?;
             ensure_generic_lua_running(&self.cancellation)?;
             if state != expected {
-                return Err(ProjectLuaCallError::new(
-                    "translation_state",
-                    "Generic 人工译文状态与当前项目事实不一致",
-                ));
+                return Err(generic_state_error().with_generic_locator(None, &group_id, &unit_id));
             }
         }
         if initial_index != initial_translations.len() {
-            return Err(ProjectLuaCallError::new(
-                "translation_state",
-                "Lua 删除了受管 Generic Unit",
-            ));
+            return Err(generic_state_error());
         }
         if initial_index != group_terminology_hits.len() {
-            return Err(ProjectLuaCallError::new(
-                "translation_state",
-                "Generic Group 术语命中状态与 Unit 数量不一致",
-            ));
+            return Err(generic_state_error());
         }
         ensure_generic_lua_running(&self.cancellation)
     }
@@ -598,29 +558,14 @@ fn group_terminology_hits_for_units(
              ORDER BY generic_group.relative_path, generic_group.ordinal,
                       generic_unit.ordinal",
         )
-        .map_err(|source| {
-            ProjectLuaCallError::new(
-                "sqlite",
-                format!("准备计算 Generic Group 术语命中失败：{source}"),
-            )
-        })?;
-    let mut rows = statement.query([]).map_err(|source| {
-        ProjectLuaCallError::new(
-            "sqlite",
-            format!("计算 Generic Group 术语命中失败：{source}"),
-        )
-    })?;
+        .map_err(generic_sqlite_error)?;
+    let mut rows = statement.query([]).map_err(generic_sqlite_error)?;
     let mut output = Vec::new();
     let mut current_group_id = None::<String>;
     let mut current_group_texts = Vec::<LanguageText>::new();
     let mut current_group_unit_count = 0_usize;
 
-    while let Some(row) = rows.next().map_err(|source| {
-        ProjectLuaCallError::new(
-            "sqlite",
-            format!("读取 Generic Group 术语命中事实失败：{source}"),
-        )
-    })? {
+    while let Some(row) = rows.next().map_err(generic_sqlite_error)? {
         ensure_generic_lua_running(cancellation)?;
         let group_id = sqlite_text_with_cancellation(
             row,
@@ -671,11 +616,8 @@ fn group_terminology_hits_for_units(
         ensure_generic_lua_running(cancellation)?;
         let language_text = protected
             .language_text_with_cancellation(|| ensure_generic_lua_running(cancellation))?
-            .map_err(|source| {
-                ProjectLuaCallError::new(
-                    "placeholder",
-                    format!("无法建立 Generic Group 术语扫描文本：{source}"),
-                )
+            .map_err(|_| {
+                generic_call_violation(crate::diagnostic::LuaValueViolation::InvalidTranslation)
             })?;
         current_group_texts.push(language_text);
         current_group_unit_count += 1;
@@ -741,28 +683,16 @@ fn capture_initial_translation_states(
              ORDER BY generic_group.relative_path, generic_group.ordinal,
                       generic_unit.ordinal",
         )
-        .map_err(|source| {
-            ProjectLuaCallError::new("sqlite", format!("准备捕获 Generic 译文状态失败：{source}"))
-        })?;
-    let mut rows = statement.query([]).map_err(|source| {
-        ProjectLuaCallError::new("sqlite", format!("捕获 Generic 译文状态失败：{source}"))
-    })?;
+        .map_err(generic_sqlite_error)?;
+    let mut rows = statement.query([]).map_err(generic_sqlite_error)?;
     let mut states = Vec::new();
     let mut unit_index = 0_usize;
-    while let Some(row) = rows.next().map_err(|source| {
-        ProjectLuaCallError::new("sqlite", format!("读取 Generic 译文状态失败：{source}"))
-    })? {
+    while let Some(row) = rows.next().map_err(generic_sqlite_error)? {
         ensure_generic_lua_running(cancellation)?;
-        let group_terminology_hit =
-            group_terminology_hits
-                .get(unit_index)
-                .copied()
-                .ok_or_else(|| {
-                    ProjectLuaCallError::new(
-                        "translation_state",
-                        "脚本前 Generic Group 术语命中状态缺少对应 Unit",
-                    )
-                })?;
+        let group_terminology_hit = group_terminology_hits
+            .get(unit_index)
+            .copied()
+            .ok_or_else(generic_state_error)?;
         unit_index += 1;
         let group_id = sqlite_text_with_cancellation(
             row,
@@ -807,14 +737,13 @@ fn capture_initial_translation_states(
                     "automatic" => TranslationOrigin::Automatic,
                     "manual" => TranslationOrigin::Manual,
                     _ => {
-                        return Err(ProjectLuaCallError::new(
-                            "translation_state",
-                            "Generic 脚本前译文 origin 无效",
-                        ));
+                        return Err(
+                            generic_state_error().with_generic_locator(None, &group_id, &unit_id)
+                        );
                     }
                 };
-                let state = Sha256Fingerprint::from_slice(&state).map_err(|source| {
-                    ProjectLuaCallError::new("translation_state", source.to_string())
+                let state = Sha256Fingerprint::from_slice(&state).map_err(|_| {
+                    generic_state_error().with_generic_locator(None, &group_id, &unit_id)
                 })?;
                 validate_translation_text(&translation, cancellation)?;
                 let kind = sqlite_text_with_cancellation(
@@ -847,10 +776,7 @@ fn capture_initial_translation_states(
                 })
             }
             _ => {
-                return Err(ProjectLuaCallError::new(
-                    "translation_state",
-                    "Generic 脚本前译文状态不完整",
-                ));
+                return Err(generic_state_error().with_generic_locator(None, &group_id, &unit_id));
             }
         };
         states.push(InitialTranslationEntry {
@@ -860,10 +786,7 @@ fn capture_initial_translation_states(
         });
     }
     if unit_index != group_terminology_hits.len() {
-        return Err(ProjectLuaCallError::new(
-            "translation_state",
-            "脚本前 Generic Group 术语命中状态与 Unit 数量不一致",
-        ));
+        return Err(generic_state_error());
     }
     ensure_generic_lua_running(cancellation)?;
     Ok(states)
@@ -895,13 +818,15 @@ fn generic_text_eq_with_cancellation(
 fn generic_placeholder_error(error: GenericPlaceholderError) -> ProjectLuaCallError {
     match error {
         GenericPlaceholderError::Compilation(PlaceholderRuleCompilationError::StartWorker {
-            operation,
+            operation: _,
             source,
-        }) => ProjectLuaCallError::new(
-            "worker_spawn",
-            project_lua_worker_spawn_message(operation, &source),
-        ),
-        error => ProjectLuaCallError::new("placeholder", error.to_string()),
+        })
+        | GenericPlaceholderError::Protection(PlaceholderProtectionError::StartWorker {
+            operation: _,
+            source,
+        }) => ProjectLuaCallError::worker_spawn(source)
+            .with_engine(crate::diagnostic::LuaEngine::Generic),
+        _ => generic_call_violation(crate::diagnostic::LuaValueViolation::InvalidTranslation),
     }
 }
 
@@ -1029,8 +954,8 @@ fn clone_sqlite_blob_with_cancellation(
     Ok(cloned)
 }
 
-fn sqlite_read_error(operation: &'static str, source: rusqlite::Error) -> ProjectLuaCallError {
-    ProjectLuaCallError::new("sqlite", format!("{operation}：{source}"))
+fn sqlite_read_error(_operation: &'static str, source: rusqlite::Error) -> ProjectLuaCallError {
+    generic_sqlite_error(source)
 }
 
 fn is_att_table(name: &str) -> bool {
@@ -1041,18 +966,16 @@ fn is_att_table(name: &str) -> bool {
 
 fn parse_locator(locator: ProjectLuaValue) -> Result<(String, String), ProjectLuaCallError> {
     let Some(mut fields) = locator.into_object() else {
-        return Err(ProjectLuaCallError::new(
-            "invalid_locator",
-            "Generic locator 必须是只含 group_id 与 unit_id 的 table",
+        return Err(generic_call_violation(
+            crate::diagnostic::LuaValueViolation::InvalidLocator,
         ));
     };
     if fields.len() != 2
         || !project_lua_object_contains_field(&fields, "group_id")
         || !project_lua_object_contains_field(&fields, "unit_id")
     {
-        return Err(ProjectLuaCallError::new(
-            "invalid_locator",
-            "Generic locator 必须且只能包含 group_id 与 unit_id",
+        return Err(generic_call_violation(
+            crate::diagnostic::LuaValueViolation::InvalidLocator,
         ));
     }
     let group_id = take_nonempty_text(&mut fields, "group_id")?;
@@ -1067,16 +990,16 @@ fn take_nonempty_text(
     let Some(value) =
         take_project_lua_object_field(fields, field).and_then(ProjectLuaValue::into_text)
     else {
-        return Err(ProjectLuaCallError::new(
-            "invalid_locator",
-            format!("Generic locator.{field} 必须是字符串"),
-        ));
+        return Err(
+            generic_call_violation(crate::diagnostic::LuaValueViolation::InvalidLocator)
+                .with_field(field),
+        );
     };
     if value.is_empty() {
-        return Err(ProjectLuaCallError::new(
-            "invalid_locator",
-            format!("Generic locator.{field} 不能为空"),
-        ));
+        return Err(
+            generic_call_violation(crate::diagnostic::LuaValueViolation::InvalidLocator)
+                .with_field(field),
+        );
     }
     Ok(value)
 }
@@ -1086,9 +1009,8 @@ fn parse_translation(
     cancellation: &CooperativeCancellation,
 ) -> Result<String, ProjectLuaCallError> {
     let Some(value) = value.into_text() else {
-        return Err(ProjectLuaCallError::new(
-            "invalid_translation",
-            "Generic translation 必须是 UTF-8 字符串",
+        return Err(generic_call_violation(
+            crate::diagnostic::LuaValueViolation::InvalidTranslation,
         ));
     };
     validate_translation_text(&value, cancellation)?;
@@ -1116,21 +1038,18 @@ fn validate_translation_text(
     }
     ensure_generic_lua_running(cancellation)?;
     if !has_non_whitespace {
-        return Err(ProjectLuaCallError::new(
-            "invalid_translation",
-            "Generic translation 不能为空白",
+        return Err(generic_call_violation(
+            crate::diagnostic::LuaValueViolation::InvalidTranslation,
         ));
     }
     if has_carriage_return {
-        return Err(ProjectLuaCallError::new(
-            "invalid_translation",
-            "Generic translation 不能包含 CR（U+000D）",
+        return Err(generic_call_violation(
+            crate::diagnostic::LuaValueViolation::InvalidTranslation,
         ));
     }
     if has_nul {
-        return Err(ProjectLuaCallError::new(
-            "invalid_translation",
-            "Generic translation 不能包含 NUL（U+0000）",
+        return Err(generic_call_violation(
+            crate::diagnostic::LuaValueViolation::InvalidTranslation,
         ));
     }
     Ok(())
@@ -1140,10 +1059,7 @@ fn ensure_generic_lua_running(
     cancellation: &CooperativeCancellation,
 ) -> Result<(), ProjectLuaCallError> {
     if cancellation.is_requested() {
-        Err(ProjectLuaCallError::new(
-            "cancelled",
-            "Generic Lua 校验已取消",
-        ))
+        Err(ProjectLuaCallError::cancelled().with_engine(crate::diagnostic::LuaEngine::Generic))
     } else {
         Ok(())
     }
@@ -1152,23 +1068,23 @@ fn ensure_generic_lua_running(
 fn generic_prerequisite_error(error: GenericProjectError) -> ProjectLuaDatabasePrerequisiteError {
     match error {
         GenericProjectError::Cancelled => ProjectLuaDatabasePrerequisiteError::Cancelled,
-        GenericProjectError::Sqlite { operation, source } => {
-            ProjectLuaDatabasePrerequisiteError::sqlite(operation, &source)
-        }
-        error => ProjectLuaDatabasePrerequisiteError::invalid_project_state(error.to_string()),
+        GenericProjectError::Sqlite { source, .. } => ProjectLuaDatabasePrerequisiteError::sqlite(
+            super::ProjectLuaSqliteOperation::ReadCurrentAttSchema,
+            source,
+        ),
+        _ => ProjectLuaDatabasePrerequisiteError::invalid_project_state(
+            crate::diagnostic::LuaEngine::Generic,
+            crate::diagnostic::LuaValueViolation::StateMismatch,
+        ),
     }
 }
 
 fn generic_error(error: crate::generic::GenericProjectError) -> ProjectLuaCallError {
     match error {
         GenericProjectError::Cancelled => {
-            ProjectLuaCallError::new("cancelled", "Generic Lua 校验已取消")
+            ProjectLuaCallError::cancelled().with_engine(crate::diagnostic::LuaEngine::Generic)
         }
-        GenericProjectError::WorkerStart { operation, source } => ProjectLuaCallError::new(
-            "worker_spawn",
-            project_lua_worker_spawn_message(operation, &source),
-        ),
-        error => ProjectLuaCallError::new("generic_project", error.to_string()),
+        _ => generic_state_error(),
     }
 }
 
@@ -1189,6 +1105,30 @@ mod tests {
         ProjectLuaFailure, ProjectLuaProgram, ProjectLuaProject, ProjectLuaRunError,
         ProjectLuaRunRequest, run_project_lua,
     };
+
+    #[test]
+    fn placeholder_worker_start_keeps_typed_operation_and_os_code() {
+        let failures = [
+            GenericPlaceholderError::Compilation(PlaceholderRuleCompilationError::StartWorker {
+                operation: PlaceholderWorkerOperation::CompileCustomRules,
+                source: std::io::Error::from_raw_os_error(8),
+            }),
+            GenericPlaceholderError::Protection(PlaceholderProtectionError::StartWorker {
+                operation: PlaceholderWorkerOperation::MatchText,
+                source: std::io::Error::from_raw_os_error(8),
+            }),
+        ];
+
+        for failure in failures {
+            let error = generic_placeholder_error(failure);
+            assert_eq!(error.kind(), "worker_spawn");
+            assert!(matches!(
+                error.issue,
+                super::super::ProjectLuaCallIssue::WorkerSpawn { ref failure, .. }
+                    if failure.raw_os_code == Some(8)
+            ));
+        }
+    }
 
     fn project_with_jsonl(
         jsonl: &str,
@@ -1352,9 +1292,7 @@ mod tests {
         ] {
             assert!(matches!(
                 run(&database_path, source),
-                Err(ProjectLuaRunError::RolledBack(
-                    ProjectLuaFailure::Host { .. }
-                ))
+                Err(ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(_)))
             ));
         }
         let translation: Option<String> = Connection::open(database_path)
@@ -1421,10 +1359,8 @@ mod tests {
         .expect_err("无效资源不能提交");
         assert!(matches!(
             error,
-            ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
-                operation: "translation.validate",
-                ..
-            })
+            ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(error))
+                if error.operation() == Some("translation.validate")
         ));
         let resource: String = Connection::open(&database_path)
             .expect("应重开数据库")
@@ -1453,10 +1389,8 @@ mod tests {
         .expect_err("JSON 合法但 PCRE2 无效的 Placeholder 资源不能提交");
         assert!(matches!(
             error,
-            ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
-                operation: "translation.validate",
-                ..
-            })
+            ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(error))
+                if error.operation() == Some("translation.validate")
         ));
         let placeholder: String = Connection::open(&database_path)
             .expect("应重开数据库")
@@ -1484,10 +1418,8 @@ mod tests {
                 .expect_err("类型或语义无效的 terminology 资源不能提交");
             assert!(matches!(
                 error,
-                ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
-                    operation: "translation.validate",
-                    ..
-                })
+                ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(error))
+                    if error.operation() == Some("translation.validate")
             ));
             let terminology: String = Connection::open(&database_path)
                 .expect("应重开数据库")
@@ -1560,10 +1492,8 @@ ctx.translation.set(
         .expect_err("实际 Placeholder binding 改变时旧 state 不能继续使用");
         assert!(matches!(
             changed_binding,
-            ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
-                operation: "translation.validate",
-                ..
-            })
+            ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(error))
+                if error.operation() == Some("translation.validate")
         ));
 
         let equivalent_rules = r#"[{"pattern":"\\{[a-z]+\\}"}]"#;
@@ -1609,10 +1539,8 @@ ctx.translation.set(
         .expect_err("自动译文所属 Group 的术语命中变化时必须回滚");
         assert!(matches!(
             error,
-            ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
-                operation: "translation.validate",
-                ..
-            })
+            ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(error))
+                if error.operation() == Some("translation.validate")
         ));
         let stored: String = Connection::open(database_path)
             .expect("应重开数据库")
@@ -1682,10 +1610,8 @@ ctx.translation.set(
         .expect_err("未翻译 sibling 改变 Group 术语命中时旧自动状态必须回滚");
         assert!(matches!(
             error,
-            ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
-                operation: "translation.validate",
-                ..
-            })
+            ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(error))
+                if error.operation() == Some("translation.validate")
         ));
     }
 
@@ -1760,11 +1686,9 @@ ctx.translation.set(
             let result = run(&database_path, &source);
             assert!(
                 matches!(
-                    result,
-                    Err(ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
-                        operation: "translation.validate",
-                        ..
-                    }))
+                    &result,
+                    Err(ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(error)))
+                        if error.operation() == Some("translation.validate")
                 ),
                 "伪造 {origin} 状态的实际结果：{result:?}"
             );
@@ -1798,10 +1722,8 @@ ctx.translation.set(
             let source = format!("ctx.db.execute({statement:?})");
             assert!(matches!(
                 run(&database_path, &source),
-                Err(ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
-                    operation: "translation.validate",
-                    ..
-                }))
+                Err(ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(error)))
+                    if error.operation() == Some("translation.validate")
             ));
         }
 
@@ -1864,8 +1786,11 @@ ctx.translation.set(
         assert!(matches!(
             error,
             ProjectLuaRunError::RolledBack(ProjectLuaFailure::DatabasePrerequisite(
-                ProjectLuaDatabasePrerequisiteError::InvalidProjectState(ref detail)
-            )) if detail.contains("definition_mismatches=table/translation_resource")
+                ProjectLuaDatabasePrerequisiteError::InvalidProjectState {
+                    engine: crate::diagnostic::LuaEngine::Generic,
+                    violation: crate::diagnostic::LuaValueViolation::StateMismatch,
+                }
+            ))
         ));
         let marker_count: i64 = Connection::open(database_path)
             .expect("应重开 Generic 数据库")

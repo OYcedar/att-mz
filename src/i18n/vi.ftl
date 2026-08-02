@@ -51,29 +51,7 @@ cli-argument-conflict = Không thể dùng { $argument } cùng các đối số 
 cli-wrong-number-of-values = Số lượng giá trị cho { $argument } không đúng.
 cli-invalid-utf8 = Một đối số dòng lệnh không phải Unicode hợp lệ.
 cli-parse-failure = Không thể phân tích dòng lệnh.
-log-label-phase-check-project = kiểm tra dự án
-log-label-phase-scan-source = quét nguồn
-log-label-phase-prepare-candidate = chuẩn bị bản ứng viên
-log-label-phase-update-database = cập nhật cơ sở dữ liệu
-log-label-phase-publish = xuất bản
-log-label-phase-builtin = trích xuất tích hợp
-log-label-phase-rules = trích xuất theo quy tắc
-log-label-phase-lua = xử lý Lua
-log-label-phase-planning = lập kế hoạch
-log-label-phase-confirmed-tasks = xác nhận tác vụ
-log-label-phase-no-work = không cần xử lý
-log-label-phase-read-assets = đọc tài nguyên
-log-label-phase-plan-rpg-maker-write-back = lập kế hoạch ghi lại RPG Maker
-log-label-phase-rewrite-documents = ghi lại tài liệu
-log-label-phase-validate-candidate = xác thực bản ứng viên
-log-label-task-complete = hoàn tất
-log-label-task-partial = một phần
-log-label-task-unavailable = không khả dụng
-log-label-task-failed = thất bại
-error-state-applied-finalization = Kết quả đã có hiệu lực nhưng bước hoàn tất thất bại. Hãy kiểm tra trạng thái dự án trước khi thử lại.
 error-no-executable-extract-owner = Sau khi xóa không còn owner Extract có thể chạy, vì vậy kế hoạch không được lưu.
-error-plan-save-failed-applied = Kết quả lệnh đã có hiệu lực nhưng kế hoạch chạy mới không được lưu. Lần tới hãy chỉ định rõ các tùy chọn mong muốn.
-error-plan-save-outcome-unknown = Kết quả lệnh đã có hiệu lực nhưng không thể xác nhận commit kế hoạch chạy. Lần tới hãy chỉ định rõ các tùy chọn mong muốn.
 plan-source-explicit = đầu vào chỉ định
 plan-source-project-state = trạng thái dự án
 plan-source-product-default = hành vi sản phẩm
@@ -141,35 +119,68 @@ log-lua-print = Lua: { $message }
 log-lua-summary = Thống kê Lua: { $database_calls } lần gọi cơ sở dữ liệu, { $changed_rows } hàng thay đổi, { $translation_calls } lần gọi bản dịch và { $printed_lines } dòng print.
 log-plan-resolved = Lệnh { $command } lấy kế hoạch từ { $source }.
 log-phase-started = Bắt đầu giai đoạn: { $phase }.
-log-phase-finished = Hoàn tất giai đoạn: { $phase }.
 log-retry-summary = Đã thực hiện { $count } lần thử lại.
-log-no-work = Không cần công việc: { $reason }.
-log-no-work-translation-up-to-date = bản dịch đã khớp với nguồn và hồ sơ hiện tại
-log-partial-result = Có { $count } kết quả một phần cần chú ý.
 log-translation-task-started = Tác vụ dịch { $index }/{ $total } đã bắt đầu.
 log-translation-task-finished = Tác vụ dịch { $index } kết thúc với kết quả { $outcome }.
-log-translation-task-diagnostic = Tác vụ dịch { $index } báo chẩn đoán sau { $attempts } lần thử: { $diagnostic }
+log-run-recovery-required = Lệnh { $command } kết thúc ở trạng thái cần khôi phục; hãy làm theo các vị trí khôi phục trong chẩn đoán.
+log-phase-completed = Giai đoạn đã hoàn tất: { $phase }.
+log-phase-stopped = { $outcome ->
+    [failed] Giai đoạn thất bại: { $phase }.
+    [cancelled] Giai đoạn đã bị hủy: { $phase }.
+   *[other] Giai đoạn đã dừng: { $phase }.
+}
+log-cancellation-requested = Đã yêu cầu hủy sau khi xác nhận { $confirmed } trên { $total } mục.
+log-cancellation-requested-indeterminate = Đã yêu cầu hủy sau khi xác nhận { $confirmed } mục; chưa biết tổng số.
+log-run-plan-finalized = { $result ->
+    [saved] Đã lưu kế hoạch chạy.
+    [not_saved] Chưa lưu kế hoạch chạy.
+    [saved_finalization_failed] Đã lưu kế hoạch chạy nhưng bước hoàn tất thất bại.
+    [outcome_unknown] Chưa biết trạng thái cuối của kế hoạch chạy.
+   *[other] Bước hoàn tất kế hoạch dừng với kết quả không xác định.
+}
+log-translation-finished = { $result ->
+    [not_started] Bản dịch chưa bắt đầu.
+    [no_work] Bản dịch kết thúc vì không có nội dung cần xử lý.
+    [complete] Bản dịch đã hoàn tất.
+    [incomplete] Bản dịch kết thúc nhưng vẫn còn phần chưa hoàn tất.
+    [failed] Bản dịch thất bại.
+    [cancelled] Bản dịch đã bị hủy.
+   *[other] Bản dịch dừng với kết quả không xác định.
+}
+log-publication-started = Đã bắt đầu xuất bản vào thư mục gốc { $path }.
+log-publication-finished = { $result ->
+    [published] Xuất bản đã hoàn tất.
+    [not_published] Xuất bản không thay đổi đầu ra.
+    [recovery_required] Xuất bản đã dừng và cần khôi phục.
+    [outcome_unknown] Chưa biết trạng thái cuối của việc xuất bản.
+   *[other] Xuất bản dừng với kết quả không xác định.
+}
+log-project-log-degraded = Nhật ký dự án gặp sự cố; đã ghi nhận { $failure_kinds } nhóm lỗi.
+log-task-outcome-value = { $outcome ->
+    [complete] hoàn tất
+    [partial] hoàn tất một phần
+    [unavailable] không khả dụng
+    [failed] thất bại
+    [not_committed_after_earlier_failure] chưa commit do lỗi trước đó
+    [cancelled] đã hủy
+   *[other] kết thúc với kết quả không xác định
+}
 diagnostic-title = Lỗi [{ $code }]
 diagnostic-stage = Giai đoạn: { $stage }
-diagnostic-subject = Vị trí: { $subject }
-diagnostic-subject-value = { $kind ->
-    [command] lệnh { $value }
-    [field] trường { $value }
-    [project] dự án { $value }
-    [profile] hồ sơ { $value }
-    [component] thành phần { $value }
-   *[other] { $value }
-}
-diagnostic-reason = Nguyên nhân: { $reason }
-diagnostic-impact = Ảnh hưởng: { $impact }
-diagnostic-action = Cách xử lý: { $action }
-diagnostic-recovery = Khôi phục: { $recovery }
-diagnostic-recovery-value = { $kind ->
-    [component] thành phần { $value }
-    [transaction] giao dịch { $value }
-   *[other] { $value }
-}
+diagnostic-location = Vị trí: { $subject }
+diagnostic-explanation = Nguyên nhân: { $reason }
+diagnostic-effect = Ảnh hưởng: { $impact }
+diagnostic-resolution = Cách xử lý: { $action }
 diagnostic-related = Lỗi liên quan { $index }:
+diagnostic-relation-value = { $code ->
+    [cleanup] dọn dẹp
+    [rollback] hoàn tác
+    [discard] loại bỏ
+    [finalization] hoàn tất
+    [shutdown] tắt
+    [observability] khả năng quan sát
+   *[other] { $code }
+}
 diagnostic-stage-value = { $code ->
     [process_startup] Khởi động tiến trình
     [process_output] Đầu ra tiến trình
@@ -186,23 +197,27 @@ diagnostic-stage-value = { $code ->
     [publication] Phát hành
     [shutdown] Tắt
     [logging] Nhật ký dự án
+    [runtime] Thời gian chạy
    *[other] __ATT_FALLBACK__
 }
-diagnostic-impact-value = { $code ->
+diagnostic-effect-value = { $code ->
     [unchanged] Trạng thái không thay đổi
-    [valid_progress_preserved] Tiến độ hợp lệ đã được giữ lại
-    [result_applied_but_run_plan_not_saved] Kết quả đã được áp dụng nhưng kế hoạch chạy chưa được lưu
-    [state_applied_but_finalization_failed] Trạng thái đã được áp dụng nhưng bước hoàn tất chưa xong
+    [progress_preserved] Tiến độ hợp lệ đã được giữ lại
+    [applied] Trạng thái đã được áp dụng
+    [applied_run_plan_not_saved] Trạng thái đã được áp dụng nhưng kế hoạch chạy chưa được lưu
+    [applied_finalization_failed] Trạng thái đã được áp dụng nhưng bước hoàn tất chưa xong
     [recovery_required] Cần khôi phục trước khi có thể tin cậy trạng thái
     [outcome_unknown] Không rõ trạng thái cuối cùng
    *[other] __ATT_FALLBACK__
 }
-diagnostic-action-value = { $code ->
+diagnostic-resolution-value = { $code ->
     [fix_configuration] Sửa trường cấu hình được nêu rồi thử lại
     [fix_input] Sửa dữ liệu đầu vào được nêu rồi thử lại
+    [fix_placeholder_rules] Sửa quy tắc Placeholder được nêu rồi thử lại
+    [adjust_manual_layout] Điều chỉnh thủ công ngắt dòng và bố cục tại các vị trí đã nêu theo chiều rộng hiển thị được chỉ định
     [check_path_and_permissions] Kiểm tra đường dẫn, trạng thái hệ thống tệp và quyền
     [check_project_state] Kiểm tra và sửa trạng thái dự án rồi thử lại
-    [retry_after_resolving_contention] Chờ thao tác xung đột kết thúc rồi thử lại
+    [resolve_contention] Chờ thao tác xung đột kết thúc rồi thử lại
     [check_model_service] Kiểm tra phản hồi của dịch vụ mô hình và giới hạn tài khoản
     [preserve_recovery_artifacts] Không xóa các tạo phẩm khôi phục được liệt kê; hãy khôi phục đầu ra trước khi thử lại
     [retry] Thử lại thao tác
@@ -211,16 +226,14 @@ diagnostic-action-value = { $code ->
 }
 diagnostic-failure-value = { $code ->
     [missing_required_value] Thiếu một giá trị bắt buộc
-    [extract_plan_required] Không có kế hoạch Extract có thể tái sử dụng; hãy cung cấp --builtin hoặc --rules
     [generic_extract_required] Dữ liệu JSONL không còn khớp với lần Extract gần nhất; hãy chạy lại att generic extract
     [conflicting_values] Các giá trị được cung cấp xung đột với nhau
     [invalid_syntax] Cú pháp của giá trị không hợp lệ
     [invalid_encoding] Mã hóa văn bản không hợp lệ
     [invalid_value] Giá trị vi phạm hợp đồng bắt buộc
     [not_found] Đối tượng bắt buộc không tồn tại
-    [busy] Tài nguyên đang được thao tác khác sử dụng
     [state_mismatch] Trạng thái dự án đã lưu không đáp ứng thao tác này
-    [requirement_failed] Điều kiện tiên quyết bắt buộc chưa được đáp ứng
+    [unsupported_windows_code_page] Bảng mã Windows không phải UTF-8
     [transaction_rolled_back] Giao dịch thất bại và các thay đổi đã được hoàn tác
     [transaction_outcome_unknown] Giao dịch kết thúc mà không xác nhận được commit hay hoàn tác
     [finalization_failed] Kết quả thao tác đã tồn tại nhưng bước hoàn tất thất bại
@@ -250,81 +263,32 @@ diagnostic-failure-value = { $code ->
     [response_parsing_failed] Phản hồi mô hình không phải JSON hợp lệ
     [invalid_response_contract] Phản hồi mô hình không đáp ứng hợp đồng phản hồi bắt buộc
     [transport_failed] Truyền tải HTTP thất bại trước khi nhận được phản hồi hợp lệ
-    [lua_database_open_failed] Máy chủ Lua không thể mở phiên cơ sở dữ liệu dự án
-    [lua_context_creation_failed] Môi trường Lua không thể tạo ngữ cảnh VM
     [lua_compilation_failed] Không thể biên dịch chương trình Lua chính
     [lua_execution_failed] Chương trình Lua chính thất bại trong khi chạy
-    [lua_host_call_failed] Lời gọi khả năng máy chủ Lua thất bại
-    [lua_finalization_failed] Máy chủ Lua không thể hoàn tất mọi tài nguyên đã liên kết
-    [rules_definition_invalid] Chương trình Rules không đáp ứng hợp đồng định nghĩa Rules
-    [rules_document_read_failed] Không thể đọc tài liệu nguồn mà chương trình Rules yêu cầu
-    [rules_no_non_blank_match] Mục Rules không tạo ra đơn vị ngữ nghĩa khác trống
-    [rules_invalid_target] Mục Rules đã chọn giá trị không thể dùng làm đích văn bản
     [rules_pattern_match_failed] Không thể đánh giá mẫu PCRE2 của Rules
     [rules_zero_width_match] Mẫu Rules tạo ra kết quả khớp có độ rộng bằng không
     [rules_overlapping_capture] Mẫu Rules tạo ra các vùng bắt văn bản chồng lấp
     [rules_missing_text_capture] Vùng bắt văn bản có tên bắt buộc không tham gia kết quả khớp
     [rules_invalid_capture_range] Kết quả khớp hoặc vùng bắt Rules nằm ngoài ranh giới ký tự UTF-8 hợp lệ
-    [rules_duplicate_target] Hai mục Rules yêu cầu cùng một đích văn bản vật lý
-    [rules_invalid_materialization] Công thức chiếu Rules không thể dựng lại giá trị nguồn
-    [rules_snapshot_invalid] Các nhóm Rules đã trích xuất không tạo thành ảnh chụp tài sản hợp lệ
-    [rules_snapshot_store_failed] Không thể commit ảnh chụp trích xuất Rules đã xác minh
-    [write_back_extraction_out_of_date] Tài sản đã trích xuất không còn khớp với nguồn dự án hiện tại
-    [write_back_asset_snapshot_invalid] Tài sản RPG Maker đã lưu không tạo thành ảnh chụp ghi ngược hợp lệ
-    [source_document_invalid] Tài liệu nguồn RPG Maker không đáp ứng định dạng bắt buộc
-    [generic_source_document_invalid] Tài liệu nguồn Generic JSONL không đáp ứng định dạng bắt buộc
-    [write_back_mutation_invalid] Không thể áp dụng thay đổi bản dịch đã xác minh vào vị trí nguồn đã đóng băng
-    [write_back_output_path_invalid] Tệp được viết lại nằm ngoài cây đầu ra RPG Maker được phép
-    [write_back_output_path_duplicate] Nhiều tệp được viết lại nhắm đến cùng một đường dẫn đầu ra
-    [write_back_candidate_project_mismatch] Ứng viên ghi ngược đã chuẩn bị thuộc về dự án khác
     [write_back_candidate_invalid] Ứng viên ghi ngược không đáp ứng cấu trúc cây data/js bắt buộc
-    [write_back_not_published] Ứng viên ghi ngược không thay thế thư mục đầu ra hiện tại
-    [write_back_published_with_residuals] Đầu ra đã được phát hành nhưng không thể xóa một số tạo phẩm khôi phục
     [write_back_recovery_required] Cần khôi phục thư mục đầu ra trước khi có thể tin cậy nội dung
+    [already_exists] Đối tượng đích đã tồn tại
+    [cancelled] Thao tác đã bị hủy
+    [concurrent_modification] Trạng thái dự án đã bị thay đổi đồng thời
+    [duplicate_identifier] Mã định danh bị trùng lặp
+    [extraction_out_of_date] Bản trích xuất đã lưu không còn khớp với nguồn hiện tại
+    [invalid_content] Nội dung vi phạm hợp đồng bắt buộc
+    [manual_layout_required] Cần điều chỉnh ngắt dòng hoặc bố cục theo cách thủ công
+    [operation_failed] Thao tác thất bại
+    [placeholder_projection_failed] Phép chiếu Placeholder không giữ nguyên cấu trúc bắt buộc
+    [profile_not_found] Profile dịch đã chọn không tồn tại
+    [recovery_required] Cần khôi phục trước khi có thể tin cậy kết quả
+    [resource_limit] Đã đạt giới hạn tài nguyên bắt buộc
+    [resource_limit_exceeded] Thao tác vượt quá giới hạn tài nguyên của dịch vụ
+    [source_snapshot_mismatch] Nguồn không còn khớp với snapshot đã lưu
+    [unavailable] Công việc được yêu cầu tạm thời không khả dụng
     [internal_invariant] Một bất biến nội bộ đã bị vi phạm; đây là lỗi của ATT
    *[other] __ATT_FALLBACK__
-}
-diagnostic-io-kind-value = { $code ->
-    [not_found] Không tìm thấy
-    [permission_denied] Quyền bị từ chối
-    [connection_refused] Kết nối bị từ chối
-    [connection_reset] Kết nối bị đặt lại
-    [host_unreachable] Không thể truy cập máy chủ
-    [network_unreachable] Không thể truy cập mạng
-    [connection_aborted] Kết nối bị hủy
-    [not_connected] Chưa kết nối
-    [address_in_use] Địa chỉ đang được sử dụng
-    [address_not_available] Địa chỉ không khả dụng
-    [network_down] Mạng ngừng hoạt động
-    [broken_pipe] Đường ống bị hỏng
-    [already_exists] Đã tồn tại
-    [would_block] Thao tác sẽ bị chặn
-    [not_a_directory] Không phải thư mục
-    [is_a_directory] Là thư mục
-    [directory_not_empty] Thư mục không trống
-    [read_only_filesystem] Hệ thống tệp chỉ đọc
-    [stale_network_file_handle] Handle tệp mạng đã cũ
-    [invalid_input] Đầu vào thao tác không hợp lệ
-    [invalid_data] Dữ liệu không hợp lệ
-    [timed_out] Thao tác hết thời gian chờ
-    [write_zero] Việc ghi không tiến triển
-    [storage_full] Bộ nhớ lưu trữ đã đầy
-    [not_seekable] Không thể di chuyển vị trí trong đối tượng
-    [quota_exceeded] Vượt hạn ngạch lưu trữ
-    [file_too_large] Tệp quá lớn đối với hệ thống nền
-    [resource_busy] Tài nguyên đang bận
-    [executable_file_busy] Tệp thực thi đang bận
-    [deadlock] Thao tác sẽ gây bế tắc
-    [crosses_devices] Thao tác đi qua nhiều thiết bị hệ thống tệp
-    [too_many_links] Quá nhiều liên kết hệ thống tệp
-    [invalid_filename] Tên tệp không hợp lệ
-    [argument_list_too_long] Danh sách đối số hệ điều hành quá dài
-    [interrupted] Thao tác bị gián đoạn
-    [unsupported] Thao tác không được hỗ trợ
-    [unexpected_eof] Kết thúc tệp ngoài dự kiến
-    [out_of_memory] Hệ điều hành không thể cấp phát bộ nhớ
-    [other] Lỗi hệ điều hành khác
-   *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
     [language_policy_term_blank] Thuật ngữ chính sách ngôn ngữ không được để trống
@@ -367,47 +331,6 @@ diagnostic-configuration-rule-value = { $code ->
     [referenced_client_not_found] Máy khách LLM được tham chiếu không tồn tại
    *[other] __ATT_FALLBACK__
 }
-diagnostic-io-reason = Thao tác { $operation }: { $kind }
-diagnostic-io-reason-with-os-code = Thao tác { $operation }: { $kind } (HĐH { $os_code })
-diagnostic-io-reason-with-system-message = Thao tác { $operation }: { $kind }: { $system_message }
-diagnostic-io-reason-with-os-code-and-system-message = Thao tác { $operation }: { $kind } (HĐH { $os_code }): { $system_message }
-diagnostic-failure-with-detail = { $failure }: { $detail }
-diagnostic-invalid-utf8 = UTF-8 không hợp lệ tại byte { $valid_up_to }, độ dài không hợp lệ { $error_len } byte
-diagnostic-incomplete-utf8 = Chuỗi UTF-8 chưa hoàn chỉnh sau byte { $valid_up_to }
-diagnostic-toml-failure-value = { $code ->
-    [syntax] Cú pháp TOML không hợp lệ
-    [missing_field] Thiếu trường cấu hình bắt buộc
-    [unknown_field] Cấu hình chứa trường không xác định
-    [duplicate_field] Trường cấu hình được khai báo nhiều lần
-    [type_mismatch] Cần kiểu { $expected }
-    [invalid_value] Giá trị cấu hình vi phạm hợp đồng của trường
-   *[other] __ATT_FALLBACK__
-}
-diagnostic-toml-expected-kind-value = { $code ->
-    [string] chuỗi
-    [integer] số nguyên
-    [boolean] giá trị Boolean
-    [string_or_boolean] chuỗi hoặc giá trị Boolean
-    [string_array] mảng chuỗi
-    [integer_array] mảng số nguyên
-    [string_pair_array] mảng các cặp chuỗi
-    [table] bảng
-    [table_array] mảng bảng
-   *[other] __ATT_FALLBACK__
-}
-diagnostic-invalid-toml = TOML không hợp lệ ({ $resource }): { $failure }
-diagnostic-invalid-toml-at = TOML không hợp lệ tại dòng { $line }, cột { $column } ({ $resource }): { $failure }
-diagnostic-http-no-details = Yêu cầu dịch vụ mô hình thất bại mà không có chi tiết trạng thái HTTP công khai
-diagnostic-http-status = Trạng thái HTTP { $status }
-diagnostic-http-retry-after = Retry-After { $seconds } giây
-diagnostic-http-provider-code = Mã lỗi nhà cung cấp { $code }
-diagnostic-http-provider-type = Loại lỗi nhà cung cấp { $kind }
-diagnostic-http-provider-message = Thông báo lỗi nhà cung cấp { $message }
-diagnostic-http-fact-separator = ;{ " " }
-diagnostic-sqlite = Mã lỗi SQLite chính { $primary_code }, mã mở rộng { $extended_code }
-diagnostic-windows-status = Thao tác Windows { $operation } thất bại với NTSTATUS { $status }
-diagnostic-resource = { $resource }: thực tế { $actual }
-diagnostic-resource-with-maximum = { $resource }: thực tế { $actual }, tối đa { $maximum }
 task-record-title = Tác vụ dịch { $ordinal } · { $state }
 task-record-state-label = { $state ->
     [complete] Hoàn tất
@@ -466,45 +389,6 @@ task-record-final-status = Trạng thái: { $state ->
 }
 task-record-accepted-written = Đã nhận: { $accepted } mục, ghi vào { $written } vị trí thực tế
 task-record-accepted-outcome-unknown = Đã kiểm tra: { $accepted } mục; không thể xác nhận kết quả commit cơ sở dữ liệu
-task-record-rejected-heading = Không được nhận:
-task-record-rejected-item = { $id }: { $reason }
-task-record-protocol-diagnostic = Chẩn đoán giao thức: { $diagnostic }
-task-record-unavailable-reason = Lý do không khả dụng: { $reason }
 task-record-task-diagnostic = Chẩn đoán tác vụ: `{ $code }`; lý do { $reason }
-task-record-rejection-reason = { $code ->
-    [missing] Thiếu đầu ra mô hình
-    [duplicate] Đầu ra mô hình bị lặp
-    [invalid_shape] { $detail }
-    [invalid_shape_array] Bản dịch phải là một mảng chuỗi
-    [invalid_shape_item] Mục { $line } của mảng bản dịch phải là chuỗi
-    [line_count_mismatch] Số dòng không khớp (mong đợi { $expected }, thực tế { $actual })
-    [invalid_line_text] Dòng { $line } chứa ký tự điều khiển không hợp lệ
-    [blank_line_mismatch] Trạng thái trống ở dòng { $line } không khớp (mong đợi: { $expected_blank ->
-        [blank] trống
-       *[other] không trống
-    })
-    [blank_translation] Bản dịch trống
-    [no_natural_language_text] Bản dịch không có văn bản ngôn ngữ tự nhiên
-    [contains_byte_order_mark] Bản dịch chứa BOM
-    [placeholder_mismatch] Placeholder không khớp: { $detail }
-    [unexpected_placeholder] Placeholder không mong đợi: { $detail }
-    [placeholder_normalization_ambiguous] Chuẩn hóa placeholder không rõ ràng: { $detail }
-    [source_residual] Phát hiện phần còn lại của ngôn ngữ nguồn: { $detail }
-   *[other] { $detail }
-}
-task-record-protocol-detail = { $code ->
-    [non_stop_finish] finish reason không phải stop: { $detail }
-    [invalid_response] { $detail }
-    [invalid_id] Mục mô hình thứ { $index } có ID không hợp lệ
-    [unknown_id] Mục mô hình thứ { $index } trả về ID lạ { $detail }
-   *[other] { $detail }
-}
-task-record-unavailable-detail = { $code ->
-    [model_response_unusable] Không thể phân tích phản hồi mô hình
-    [all_outputs_rejected] Mọi đầu ra mô hình đều không vượt qua kiểm tra
-    [recoverable_request_exhausted] Đã hết ngân sách thử lại cho yêu cầu có thể phục hồi
-    [retry_after_exceeds_maximum] Retry-After vượt quá thời gian chờ tối đa đã cấu hình
-   *[other] { $code }
-}
 task-record-duration-seconds = { $value } giây
 task-record-duration-milliseconds = { $value } mili giây

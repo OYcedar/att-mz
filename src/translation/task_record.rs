@@ -12,18 +12,25 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use time::OffsetDateTime;
 
 use crate::diagnostic::{
-    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
-    DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
+    Diagnostic, DiagnosticReport, IoFailure, ObservabilityComponent, ObservabilityIssue,
+    ObservabilityPathFailure, ObservabilityWriteFailure, RelatedFailureRelation, SafePath,
+    StateEffect, render_diagnostic_report,
 };
 use crate::execution::llm_request::{
     LlmRequestAttemptOutcome, LlmRequestAttemptRecord, LlmRequestRetryWaitRecord,
 };
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
-use crate::json_diagnostic::JsonErrorCategory;
 use crate::llm::{ApiKeyRedactor, LlmClientRecordMetadata};
 use crate::runtime::cpu::RayonCpuExecutor;
-use crate::runtime::filesystem::SystemFileSystem;
-use crate::runtime::project_log::ProjectLogger;
+use crate::runtime::filesystem::{
+    SystemFileSystem, SystemFileSystemError, TerminalObservationOperation,
+};
+use crate::runtime::windows::WindowsFsError;
+use crate::windows_path::WindowsOrdinalCaseKeyError;
+
+pub(crate) trait TaskRecordDiagnosticRecorder: Send + Sync {
+    fn record_task_record_diagnostic(&self, report: DiagnosticReport);
+}
 
 /// 一个已经固定业务终态、可以异步写入的模型任务记录。
 pub(crate) trait TranslationTaskRecordArtifact: Send {
@@ -89,20 +96,23 @@ pub(crate) struct MarkdownTranslationTaskRecordSink {
     locale: UiLocale,
     render_parallelism: usize,
     file_system: SystemFileSystem,
-    warnings: ProjectLogger,
+    diagnostics: Arc<dyn TaskRecordDiagnosticRecorder>,
     pending: Arc<Mutex<PendingTranslationTaskRecords>>,
 }
 
 impl MarkdownTranslationTaskRecordSink {
-    pub(crate) fn new(
+    pub(crate) fn new<R>(
         directory: PathBuf,
         run_id: String,
         client: LlmClientRecordMetadata,
         locale: UiLocale,
         cpu: RayonCpuExecutor,
         file_system: SystemFileSystem,
-        warnings: ProjectLogger,
-    ) -> Self {
+        diagnostics: R,
+    ) -> Self
+    where
+        R: TaskRecordDiagnosticRecorder + 'static,
+    {
         Self {
             directory,
             run_id,
@@ -112,7 +122,7 @@ impl MarkdownTranslationTaskRecordSink {
             // 继续复用会被 Ctrl-C 取消或随业务根关闭的 CPU 执行器。
             render_parallelism: cpu.parallelism().get(),
             file_system,
-            warnings,
+            diagnostics: Arc::new(diagnostics),
             pending: Arc::new(Mutex::new(PendingTranslationTaskRecords::default())),
         }
     }
@@ -151,17 +161,13 @@ impl MarkdownTranslationTaskRecordSink {
         }
         if let Err(error) = self.file_system.shutdown().await {
             let redactor = self.client.api_key_redactor();
-            let diagnostics = error
-                .into_failure_report(
-                    DiagnosticStage::Logging,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::Retry,
-                )
-                .public_diagnostics()
-                .cloned()
-                .map(|diagnostic| diagnostic.map_dynamic_text(|value| redactor.redact(value)))
-                .collect::<Vec<_>>();
-            self.warnings.record_task_record_failures(diagnostics);
+            self.diagnostics
+                .record_task_record_diagnostic(task_record_file_system_report(
+                    &error,
+                    &self.directory,
+                    redactor,
+                    TaskRecordFileOperation::Shutdown,
+                ));
         }
     }
 
@@ -177,66 +183,41 @@ impl MarkdownTranslationTaskRecordSink {
             document.render(&run_id, &client, locale, total_tasks)
         })
         .await;
-        let markdown = match markdown {
-            Ok(Ok(markdown)) => markdown,
-            Ok(Err(error)) => {
-                let path = self
-                    .client
-                    .api_key_redactor()
-                    .redact(&path.to_string_lossy());
-                let category = JsonErrorCategory::from(&error);
-                self.warnings.record_task_record_failure(
-                    SafeDiagnostic::new(
-                        DiagnosticCode::LogSerialize,
-                        DiagnosticStage::Logging,
-                        DiagnosticSubject::path(&path),
-                        DiagnosticReason::failure_with_detail(
-                            DiagnosticFailureKind::RequestSerializationFailed,
-                            format!(
-                                "json_category={category}; line={}; column={}",
-                                error.line(),
-                                error.column()
-                            ),
-                        ),
-                        DiagnosticImpact::Unchanged,
-                        DiagnosticAction::ReportBug,
-                    )
-                    .with_recovery(RecoveryFact::path(&path)),
-                );
-                return;
-            }
-            Err(error) => {
-                self.warnings
-                    .record_task_record_failure(task_record_render_join_failure(
-                        &error,
-                        &path,
-                        &self.client,
-                    ));
-                return;
-            }
-        };
+        let markdown =
+            match markdown {
+                Ok(Ok(markdown)) => markdown,
+                Ok(Err(error)) => {
+                    let path = redacted_safe_path(&path, self.client.api_key_redactor());
+                    self.diagnostics
+                        .record_task_record_diagnostic(DiagnosticReport::new(
+                            StateEffect::Unchanged,
+                            Diagnostic::observability(ObservabilityIssue::serialize_json(
+                                ObservabilityComponent::TaskRecord,
+                                path,
+                                &error,
+                            )),
+                        ));
+                    return;
+                }
+                Err(error) => {
+                    self.diagnostics.record_task_record_diagnostic(
+                        task_record_render_join_failure(&error, &path, &self.client),
+                    );
+                    return;
+                }
+            };
         if let Err(error) = self
             .file_system
             .write_new_terminal_observation_file(path.clone(), markdown.into_bytes())
             .await
         {
-            let diagnostics = error
-                .into_failure_report(
-                    DiagnosticStage::Logging,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckPathAndPermissions,
-                )
-                .public_diagnostics()
-                .cloned()
-                .map(|diagnostic| {
-                    let redactor = self.client.api_key_redactor();
-                    let recovery_path = redactor.redact(&path.to_string_lossy());
-                    diagnostic
-                        .map_dynamic_text(|value| redactor.redact(value))
-                        .with_recovery(RecoveryFact::path(recovery_path))
-                })
-                .collect::<Vec<_>>();
-            self.warnings.record_task_record_failures(diagnostics);
+            self.diagnostics
+                .record_task_record_diagnostic(task_record_file_system_report(
+                    &error,
+                    &path,
+                    self.client.api_key_redactor(),
+                    TaskRecordFileOperation::Write,
+                ));
         }
     }
 }
@@ -245,29 +226,342 @@ fn task_record_render_join_failure(
     source: &tokio::task::JoinError,
     path: &Path,
     client: &LlmClientRecordMetadata,
-) -> SafeDiagnostic {
+) -> DiagnosticReport {
     let redactor = client.api_key_redactor();
-    let path = redactor.redact(&path.to_string_lossy());
-    let (failure, action) = if source.is_panic() {
-        (
-            DiagnosticFailureKind::WorkerPanicked,
-            DiagnosticAction::ReportBug,
-        )
+    let path = redacted_safe_path(path, redactor);
+    let issue = if source.is_panic() {
+        ObservabilityIssue::worker(ObservabilityComponent::TaskRecord, 1)
     } else {
-        (
-            DiagnosticFailureKind::ExecutorClosed,
-            DiagnosticAction::Retry,
-        )
+        ObservabilityIssue::worker_cancelled(ObservabilityComponent::TaskRecord, 1)
     };
-    SafeDiagnostic::new(
-        DiagnosticCode::InternalOperation,
-        DiagnosticStage::Logging,
-        DiagnosticSubject::path(&path),
-        DiagnosticReason::failure(failure),
-        DiagnosticImpact::Unchanged,
-        action,
+    DiagnosticReport::new(StateEffect::Unchanged, Diagnostic::observability(issue)).with_related(
+        RelatedFailureRelation::Observability,
+        DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::observability(ObservabilityIssue::write_failure(
+                ObservabilityComponent::TaskRecord,
+                Some(path),
+                None,
+                1,
+                ObservabilityWriteFailure::NotPersisted,
+            )),
+        ),
     )
-    .with_recovery(RecoveryFact::path(path))
+}
+
+#[derive(Clone, Copy)]
+enum TaskRecordFileOperation {
+    Create,
+    Write,
+    Flush,
+    Sync,
+    Cleanup,
+    Shutdown,
+}
+
+fn task_record_file_system_report(
+    error: &SystemFileSystemError,
+    fallback_path: &Path,
+    redactor: &ApiKeyRedactor,
+    operation: TaskRecordFileOperation,
+) -> DiagnosticReport {
+    match error {
+        SystemFileSystemError::ObservationCleanupFailed {
+            temporary_path,
+            operation: primary,
+            cleanup,
+        } => task_record_file_system_report(
+            primary,
+            fallback_path,
+            redactor,
+            TaskRecordFileOperation::Write,
+        )
+        .with_related(
+            RelatedFailureRelation::Cleanup,
+            task_record_file_system_report(
+                cleanup,
+                temporary_path,
+                redactor,
+                TaskRecordFileOperation::Cleanup,
+            ),
+        ),
+        SystemFileSystemError::DirectChildRollbackFailed {
+            operation: primary,
+            rollback,
+            ..
+        }
+        | SystemFileSystemError::ScopedEditRollbackFailed {
+            operation: primary,
+            rollback,
+            ..
+        } => task_record_file_system_report(primary, fallback_path, redactor, operation)
+            .with_related(
+                RelatedFailureRelation::Rollback,
+                task_record_file_system_report(
+                    rollback,
+                    fallback_path,
+                    redactor,
+                    TaskRecordFileOperation::Cleanup,
+                ),
+            ),
+        SystemFileSystemError::RecoveryCleanupFailed {
+            target_root,
+            source: cleanup,
+            ..
+        }
+        | SystemFileSystemError::PublishedRecoveryCleanupFailed {
+            target_root,
+            source: cleanup,
+            ..
+        } => task_record_write_report(
+            redacted_safe_path(target_root, redactor),
+            ObservabilityWriteFailure::RecoveryRequired,
+            operation,
+        )
+        .with_related(
+            RelatedFailureRelation::Cleanup,
+            task_record_file_system_report(
+                cleanup,
+                target_root,
+                redactor,
+                TaskRecordFileOperation::Cleanup,
+            ),
+        ),
+        SystemFileSystemError::RecoveryOutcomeUnknown {
+            target_root,
+            source: finalization,
+            ..
+        } => task_record_write_report(
+            redacted_safe_path(target_root, redactor),
+            ObservabilityWriteFailure::OutcomeUnknown,
+            operation,
+        )
+        .with_related(
+            RelatedFailureRelation::Finalization,
+            task_record_file_system_report(
+                finalization,
+                target_root,
+                redactor,
+                TaskRecordFileOperation::Cleanup,
+            ),
+        ),
+        SystemFileSystemError::WorkerPanicked => DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::observability(ObservabilityIssue::worker(
+                ObservabilityComponent::TaskRecord,
+                1,
+            )),
+        ),
+        SystemFileSystemError::Closed => DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::observability(ObservabilityIssue::channel(
+                ObservabilityComponent::TaskRecord,
+                None,
+                1,
+            )),
+        ),
+        SystemFileSystemError::Io { path, source, .. } => {
+            let operation = match error.terminal_observation_operation() {
+                Some(TerminalObservationOperation::Create) => TaskRecordFileOperation::Create,
+                Some(TerminalObservationOperation::Write) => TaskRecordFileOperation::Write,
+                Some(TerminalObservationOperation::Flush) => TaskRecordFileOperation::Flush,
+                Some(TerminalObservationOperation::Sync) => TaskRecordFileOperation::Sync,
+                Some(TerminalObservationOperation::Cleanup) => TaskRecordFileOperation::Cleanup,
+                None => operation,
+            };
+            task_record_write_report(
+                redacted_safe_path(path, redactor),
+                ObservabilityWriteFailure::Io {
+                    failure: IoFailure::from_error(source),
+                },
+                operation,
+            )
+        }
+        SystemFileSystemError::Windows(source) => {
+            let (path, failure) = task_record_windows_failure(source, fallback_path, redactor);
+            task_record_write_report(path, failure, operation)
+        }
+        SystemFileSystemError::WindowsOrdinalCaseKey { path, source } => {
+            let failure = match source {
+                WindowsOrdinalCaseKeyError::InputTooLarge { .. } => {
+                    ObservabilityWriteFailure::Path {
+                        failure: ObservabilityPathFailure::Invalid,
+                    }
+                }
+                WindowsOrdinalCaseKeyError::WindowsApi { source, .. } => {
+                    ObservabilityWriteFailure::Io {
+                        failure: IoFailure::from_error(source),
+                    }
+                }
+            };
+            task_record_write_report(redacted_safe_path(path, redactor), failure, operation)
+        }
+        SystemFileSystemError::InvalidPath { path, .. } => task_record_write_report(
+            redacted_safe_path(path, redactor),
+            ObservabilityWriteFailure::Path {
+                failure: ObservabilityPathFailure::Invalid,
+            },
+            operation,
+        ),
+        SystemFileSystemError::Cancelled { path, .. } => task_record_write_report(
+            redacted_safe_path(path, redactor),
+            ObservabilityWriteFailure::Cancelled,
+            operation,
+        ),
+        SystemFileSystemError::WrongPublisherInstance => task_record_write_report(
+            redacted_safe_path(fallback_path, redactor),
+            ObservabilityWriteFailure::InvalidState,
+            operation,
+        ),
+        SystemFileSystemError::InvalidStagedIdentity { path } => task_record_write_report(
+            redacted_safe_path(path, redactor),
+            ObservabilityWriteFailure::IdentityChanged,
+            operation,
+        ),
+        SystemFileSystemError::JournalCorrupt { path, .. }
+        | SystemFileSystemError::RecoveryJournalCorrupt { path, .. } => task_record_write_report(
+            redacted_safe_path(path, redactor),
+            ObservabilityWriteFailure::InvalidState,
+            operation,
+        ),
+        SystemFileSystemError::RecoveryRequired { target_root, .. } => task_record_write_report(
+            redacted_safe_path(target_root, redactor),
+            ObservabilityWriteFailure::RecoveryRequired,
+            operation,
+        ),
+        SystemFileSystemError::OutcomeUnknown { target_root, .. } => task_record_write_report(
+            redacted_safe_path(target_root, redactor),
+            ObservabilityWriteFailure::OutcomeUnknown,
+            operation,
+        ),
+    }
+}
+
+fn task_record_windows_failure(
+    source: &WindowsFsError,
+    fallback_path: &Path,
+    redactor: &ApiKeyRedactor,
+) -> (SafePath, ObservabilityWriteFailure) {
+    match source {
+        WindowsFsError::Io { path, source, .. } => (
+            redacted_safe_path(path, redactor),
+            ObservabilityWriteFailure::Io {
+                failure: IoFailure::from_error(source),
+            },
+        ),
+        WindowsFsError::ReparsePoint { path } => (
+            redacted_safe_path(path, redactor),
+            ObservabilityWriteFailure::Path {
+                failure: ObservabilityPathFailure::ReparsePoint,
+            },
+        ),
+        WindowsFsError::NonLocalVolume { path } => (
+            redacted_safe_path(path, redactor),
+            ObservabilityWriteFailure::Path {
+                failure: ObservabilityPathFailure::NonLocalVolume,
+            },
+        ),
+        WindowsFsError::NonNtfsVolume { path, .. } => (
+            redacted_safe_path(path, redactor),
+            ObservabilityWriteFailure::Path {
+                failure: ObservabilityPathFailure::NonNtfsVolume,
+            },
+        ),
+        WindowsFsError::CaseSensitiveDirectory { path } => (
+            redacted_safe_path(path, redactor),
+            ObservabilityWriteFailure::Path {
+                failure: ObservabilityPathFailure::CaseSensitiveDirectory,
+            },
+        ),
+        WindowsFsError::LockCancelled { path } => (
+            redacted_safe_path(path, redactor),
+            ObservabilityWriteFailure::Cancelled,
+        ),
+        WindowsFsError::RenameTargetExists { path } => (
+            redacted_safe_path(path, redactor),
+            ObservabilityWriteFailure::TargetExists,
+        ),
+        WindowsFsError::FileIdentityChanged { path } => (
+            redacted_safe_path(path, redactor),
+            ObservabilityWriteFailure::IdentityChanged,
+        ),
+        WindowsFsError::Cryptography { status, .. } => (
+            redacted_safe_path(fallback_path, redactor),
+            ObservabilityWriteFailure::WindowsStatus { status: *status },
+        ),
+    }
+}
+
+fn task_record_write_report(
+    path: SafePath,
+    failure: ObservabilityWriteFailure,
+    operation: TaskRecordFileOperation,
+) -> DiagnosticReport {
+    let issue = match operation {
+        TaskRecordFileOperation::Create => match failure {
+            ObservabilityWriteFailure::Io { failure } => ObservabilityIssue::create_failure(
+                ObservabilityComponent::TaskRecord,
+                path,
+                failure,
+            ),
+            _ => ObservabilityIssue::write_failure(
+                ObservabilityComponent::TaskRecord,
+                Some(path),
+                None,
+                1,
+                failure,
+            ),
+        },
+        TaskRecordFileOperation::Write => ObservabilityIssue::write_failure(
+            ObservabilityComponent::TaskRecord,
+            Some(path),
+            None,
+            1,
+            failure,
+        ),
+        TaskRecordFileOperation::Flush => match failure {
+            ObservabilityWriteFailure::Io { failure } => ObservabilityIssue::flush_failure(
+                ObservabilityComponent::TaskRecord,
+                Some(path),
+                failure,
+            ),
+            _ => ObservabilityIssue::write_failure(
+                ObservabilityComponent::TaskRecord,
+                Some(path),
+                None,
+                1,
+                failure,
+            ),
+        },
+        TaskRecordFileOperation::Sync => match failure {
+            ObservabilityWriteFailure::Io { failure } => ObservabilityIssue::sync_failure(
+                ObservabilityComponent::TaskRecord,
+                Some(path),
+                failure,
+            ),
+            _ => ObservabilityIssue::write_failure(
+                ObservabilityComponent::TaskRecord,
+                Some(path),
+                None,
+                1,
+                failure,
+            ),
+        },
+        TaskRecordFileOperation::Cleanup => {
+            ObservabilityIssue::cleanup_failure(ObservabilityComponent::TaskRecord, path, failure)
+        }
+        TaskRecordFileOperation::Shutdown => match failure {
+            ObservabilityWriteFailure::ExecutorClosed => {
+                ObservabilityIssue::channel(ObservabilityComponent::TaskRecord, None, 1)
+            }
+            _ => ObservabilityIssue::worker_cancelled(ObservabilityComponent::TaskRecord, 1),
+        },
+    };
+    DiagnosticReport::new(StateEffect::Unchanged, Diagnostic::observability(issue))
+}
+
+fn redacted_safe_path(path: &Path, redactor: &ApiKeyRedactor) -> SafePath {
+    SafePath::new(redactor.redact(&path.to_string_lossy()))
 }
 
 /// 按任务记录本地化规则渲染一次共享 LLM attempt。
@@ -347,7 +641,7 @@ pub(crate) fn render_task_record_attempt(
                     localizer,
                     UiMessage::TaskRecordAttemptRetryable {
                         number: number as u64,
-                        code: diagnostic.code.as_str(),
+                        code: diagnostic.primary().code(),
                         duration: &duration,
                     }
                 )
@@ -404,7 +698,7 @@ pub(crate) fn render_task_record_attempt(
                     localizer,
                     UiMessage::TaskRecordAttemptFailed {
                         number: number as u64,
-                        code: diagnostic.code.as_str(),
+                        code: diagnostic.primary().code(),
                         duration: &duration,
                     }
                 )
@@ -432,10 +726,10 @@ fn render_diagnostic_reason(
     output: &mut String,
     localizer: &UiLocalizer,
     api_key_redactor: &ApiKeyRedactor,
-    diagnostic: &SafeDiagnostic,
+    diagnostic: &DiagnosticReport,
 ) {
     let reason = markdown_inline_code(
-        &api_key_redactor.redact(&diagnostic.reason.render_localized(localizer)),
+        &api_key_redactor.redact(&render_diagnostic_report(diagnostic, localizer)),
     );
     let _ = writeln!(
         output,
@@ -575,11 +869,19 @@ mod tests {
     use secrecy::SecretString;
     use serde_json::Map;
     use tempfile::tempdir;
+    use uuid::Uuid;
 
     use super::*;
+    use crate::observability::RunId;
     use crate::runtime::cpu::CpuExecutorConfig;
-    use crate::runtime::filesystem::SystemFileSystemConfig;
-    use crate::runtime::project_log::start_project_log;
+    use crate::runtime::filesystem::{
+        SystemFileSystemConfig, TestObservationFaultPoint, register_test_observation_faults,
+    };
+    use crate::runtime::performance::RunPerformanceCounters;
+    use crate::runtime::project_log::{
+        DiagnosticScope, ProjectLogCommand, ProjectLogContext, ProjectLogEngine, ProjectLogRuntime,
+        ProjectLogSink, ProjectLogger, RunFinished,
+    };
 
     fn client() -> LlmClientRecordMetadata {
         LlmClientRecordMetadata::new(
@@ -595,6 +897,91 @@ mod tests {
             NonZeroUsize::new(worker_threads).expect("测试 CPU worker 数必须非零"),
         ))
         .expect("测试 CPU 根应可启动")
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedLogBytes(Arc<Mutex<Vec<u8>>>);
+
+    impl SharedLogBytes {
+        fn records(&self) -> Vec<serde_json::Value> {
+            let bytes = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            String::from_utf8(bytes)
+                .expect("项目日志必须是 UTF-8")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("每行必须是 JSON"))
+                .collect()
+        }
+    }
+
+    impl ProjectLogSink for SharedLogBytes {
+        fn write_record(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(bytes);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn sync(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestTaskRecordRecorder(ProjectLogger);
+
+    impl TaskRecordDiagnosticRecorder for TestTaskRecordRecorder {
+        fn record_task_record_diagnostic(&self, report: DiagnosticReport) {
+            self.0
+                .record_diagnostic(DiagnosticScope::TaskRecord, report)
+                .expect("测试 TaskRecord occurrence 必须可写入");
+        }
+    }
+
+    fn project_log(project: &str) -> (ProjectLogRuntime, TestTaskRecordRecorder, SharedLogBytes) {
+        let bytes = SharedLogBytes::default();
+        let context = ProjectLogContext::new(
+            UiLocale::SimplifiedChinese,
+            ProjectLogEngine::Generic,
+            project,
+            ProjectLogCommand::Extract,
+        )
+        .expect("测试项目日志 context 必须有效");
+        let drop_report = DiagnosticReport::new(
+            StateEffect::OutcomeUnknown,
+            Diagnostic::observability(ObservabilityIssue::worker(
+                ObservabilityComponent::ProjectLog,
+                1,
+            )),
+        );
+        let runtime = ProjectLogRuntime::start(
+            context,
+            RunId::from_uuid(Uuid::new_v4()),
+            bytes.clone(),
+            Arc::new(RunPerformanceCounters::default()),
+            drop_report,
+        )
+        .expect("测试项目日志必须启动");
+        let logger = TestTaskRecordRecorder(runtime.logger());
+        (runtime, logger, bytes)
+    }
+
+    fn finish_project_log(
+        runtime: ProjectLogRuntime,
+        bytes: &SharedLogBytes,
+    ) -> Vec<serde_json::Value> {
+        runtime
+            .finish(RunFinished::Succeeded, Vec::new())
+            .expect("测试项目日志必须正常结束");
+        bytes.records()
     }
 
     struct ThreadRecordingArtifact {
@@ -645,6 +1032,28 @@ mod tests {
             _total_tasks: usize,
         ) -> Result<String, serde_json::Error> {
             panic!("测试任务记录渲染 panic")
+        }
+    }
+
+    struct InvalidJsonArtifact;
+
+    impl TranslationTaskRecordArtifact for InvalidJsonArtifact {
+        fn task_index(&self) -> usize {
+            0
+        }
+
+        fn total_tasks(&self) -> usize {
+            1
+        }
+
+        fn render(
+            &self,
+            _run_id: &str,
+            _client: &LlmClientRecordMetadata,
+            _locale: UiLocale,
+            _total_tasks: usize,
+        ) -> Result<String, serde_json::Error> {
+            serde_json::from_str::<serde_json::Value>("{").map(|_| String::new())
         }
     }
 
@@ -745,9 +1154,7 @@ mod tests {
         let file_system = SystemFileSystem::new(SystemFileSystemConfig::production())
             .expect("文件系统执行根应可建立");
         let cpu = cpu(1);
-        let log_runtime =
-            start_project_log(temporary.path().join("logs"), "render-thread".to_owned());
-        let logger = log_runtime.logger();
+        let (log_runtime, logger, log_bytes) = project_log("render-thread");
         let rendered_on = Arc::new(Mutex::new(None));
         let calling_thread = std::thread::current().id();
         let sink = MarkdownTranslationTaskRecordSink::new(
@@ -780,7 +1187,12 @@ mod tests {
             "# rendered\n"
         );
         cpu.shutdown().expect("测试 CPU 根应可关闭");
-        drop(log_runtime);
+        let records = finish_project_log(log_runtime, &log_bytes);
+        assert!(
+            records
+                .iter()
+                .all(|record| record["code"] != "diagnostic.task_record")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -791,9 +1203,7 @@ mod tests {
         let file_system = SystemFileSystem::new(SystemFileSystemConfig::production())
             .expect("文件系统执行根应可建立");
         let cpu = cpu(1);
-        let log_runtime =
-            start_project_log(temporary.path().join("logs"), "render-panic".to_owned());
-        let logger = log_runtime.logger();
+        let (log_runtime, logger, log_bytes) = project_log("render-panic");
         let sink = MarkdownTranslationTaskRecordSink::new(
             record_directory.clone(),
             "render-panic".to_owned(),
@@ -808,22 +1218,173 @@ mod tests {
         sink.finish().await;
 
         assert!(!record_directory.join("task-000001.md").exists());
-        assert_eq!(logger.health().task_record_failures, 1);
-        let diagnostic = logger
-            .take_warning()
-            .and_then(|warning| warning.task_records)
-            .and_then(|warning| warning.diagnostic)
-            .expect("阻塞渲染失败应留下任务记录诊断");
-        assert_eq!(diagnostic.code, DiagnosticCode::InternalOperation);
-        assert_eq!(diagnostic.stage, DiagnosticStage::Logging);
-        assert_eq!(
-            diagnostic.reason,
-            DiagnosticReason::failure(DiagnosticFailureKind::WorkerPanicked)
-        );
-        assert_eq!(diagnostic.impact, DiagnosticImpact::Unchanged);
-        assert_eq!(diagnostic.action, DiagnosticAction::ReportBug);
         cpu.shutdown().expect("测试 CPU 根应可关闭");
-        drop(log_runtime);
+        let records = finish_project_log(log_runtime, &log_bytes);
+        let diagnostics = records
+            .iter()
+            .filter(|record| record["code"] == "diagnostic.task_record")
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0]["payload"]["report"]["primary"]["code"],
+            "observability.task_record.worker"
+        );
+        assert_eq!(diagnostics[0]["payload"]["report"]["effect"], "unchanged");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn serialization_failure_preserves_json_category_and_position() {
+        let temporary = tempdir().expect("应建立临时目录");
+        let record_directory = temporary.path().join("task-records");
+        std::fs::create_dir_all(&record_directory).expect("应建立任务记录目录");
+        let file_system = SystemFileSystem::new(SystemFileSystemConfig::production())
+            .expect("文件系统执行根应可建立");
+        let cpu = cpu(1);
+        let (log_runtime, logger, log_bytes) = project_log("render-json");
+        let sink = MarkdownTranslationTaskRecordSink::new(
+            record_directory.clone(),
+            "render-json".to_owned(),
+            client(),
+            UiLocale::SimplifiedChinese,
+            cpu.clone(),
+            file_system,
+            logger,
+        );
+        sink.submit(InvalidJsonArtifact);
+
+        sink.finish().await;
+
+        assert!(!record_directory.join("task-000001.md").exists());
+        cpu.shutdown().expect("测试 CPU 根应可关闭");
+        let records = finish_project_log(log_runtime, &log_bytes);
+        let diagnostic = records
+            .iter()
+            .find(|record| record["code"] == "diagnostic.task_record")
+            .expect("序列化故障必须形成 TaskRecord occurrence");
+        assert_eq!(
+            diagnostic["payload"]["report"]["primary"]["code"],
+            "observability.task_record.serialize"
+        );
+        let problem = &diagnostic["payload"]["report"]["primary"]["issue"]["details"]["problem"];
+        assert_eq!(problem["category"], "eof");
+        assert_eq!(problem["line"], 1);
+        assert_eq!(problem["column"], 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn flush_and_sync_failures_use_distinct_typed_codes_and_preserve_cleanup() {
+        for (name, fault, code, with_cleanup_failure) in [
+            (
+                "flush",
+                TestObservationFaultPoint::BeforeFlush,
+                "observability.task_record.flush",
+                true,
+            ),
+            (
+                "sync",
+                TestObservationFaultPoint::BeforeSync,
+                "observability.task_record.sync",
+                false,
+            ),
+        ] {
+            let temporary = tempdir().expect("应建立临时目录");
+            let record_directory = temporary.path().join("task-records");
+            std::fs::create_dir_all(&record_directory).expect("应建立任务记录目录");
+            let target = record_directory.join("task-000001.md");
+            let faults = if with_cleanup_failure {
+                vec![fault, TestObservationFaultPoint::BeforeCleanup]
+            } else {
+                vec![fault]
+            };
+            register_test_observation_faults(target.clone(), faults);
+            let file_system = SystemFileSystem::new(SystemFileSystemConfig::production())
+                .expect("文件系统执行根应可建立");
+            let cpu = cpu(1);
+            let (log_runtime, logger, log_bytes) = project_log(name);
+            let sink = MarkdownTranslationTaskRecordSink::new(
+                record_directory,
+                name.to_owned(),
+                client(),
+                UiLocale::SimplifiedChinese,
+                cpu.clone(),
+                file_system,
+                logger,
+            );
+            sink.submit(ThreadRecordingArtifact {
+                rendered_on: Arc::new(Mutex::new(None)),
+            });
+
+            sink.finish().await;
+
+            assert!(!target.exists(), "写入故障不得暴露最终任务记录");
+            cpu.shutdown().expect("测试 CPU 根应可关闭");
+            let records = finish_project_log(log_runtime, &log_bytes);
+            let diagnostic = records
+                .iter()
+                .find(|record| record["code"] == "diagnostic.task_record")
+                .expect("flush/sync 故障必须形成 TaskRecord occurrence");
+            assert_eq!(diagnostic["payload"]["report"]["primary"]["code"], code);
+            let related = diagnostic["payload"]["report"]["related"]
+                .as_array()
+                .expect("related 必须是数组");
+            assert_eq!(related.len(), usize::from(with_cleanup_failure));
+            if with_cleanup_failure {
+                assert_eq!(related[0]["relation"], "cleanup");
+                assert_eq!(
+                    related[0]["report"]["primary"]["code"],
+                    "observability.task_record.cleanup"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn existing_record_is_preserved_and_reports_redacted_typed_write_failure() {
+        let temporary = tempdir().expect("应建立临时目录");
+        let record_directory = temporary.path().join("unused-key").join("task-records");
+        std::fs::create_dir_all(&record_directory).expect("应建立任务记录目录");
+        let target = record_directory.join("task-000001.md");
+        std::fs::write(&target, "existing").expect("应建立既有任务记录");
+        let file_system = SystemFileSystem::new(SystemFileSystemConfig::production())
+            .expect("文件系统执行根应可建立");
+        let cpu = cpu(1);
+        let (log_runtime, logger, log_bytes) = project_log("record-conflict");
+        let sink = MarkdownTranslationTaskRecordSink::new(
+            record_directory,
+            "record-conflict".to_owned(),
+            client(),
+            UiLocale::SimplifiedChinese,
+            cpu.clone(),
+            file_system,
+            logger,
+        );
+        sink.submit(ThreadRecordingArtifact {
+            rendered_on: Arc::new(Mutex::new(None)),
+        });
+
+        sink.finish().await;
+
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("既有任务记录必须保留"),
+            "existing"
+        );
+        cpu.shutdown().expect("测试 CPU 根应可关闭");
+        let records = finish_project_log(log_runtime, &log_bytes);
+        let diagnostic = records
+            .iter()
+            .find(|record| record["code"] == "diagnostic.task_record")
+            .expect("无覆盖冲突必须形成 TaskRecord occurrence");
+        assert_eq!(
+            diagnostic["payload"]["report"]["primary"]["code"],
+            "observability.task_record.write"
+        );
+        assert_eq!(
+            diagnostic["payload"]["report"]["primary"]["issue"]["details"]["problem"]["failure"]["kind"],
+            "target_exists"
+        );
+        let serialized = serde_json::to_string(&records).expect("日志记录必须可序列化");
+        assert!(!serialized.contains("unused-key"));
+        assert!(serialized.contains("[REDACTED API KEY]"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -834,9 +1395,7 @@ mod tests {
         let file_system = SystemFileSystem::new(SystemFileSystemConfig::production())
             .expect("文件系统执行根应可建立");
         let cpu = cpu(1);
-        let log_runtime =
-            start_project_log(temporary.path().join("logs"), "cancelled-cpu".to_owned());
-        let logger = log_runtime.logger();
+        let (log_runtime, logger, log_bytes) = project_log("cancelled-cpu");
         let rendered_on = Arc::new(Mutex::new(None));
         let sink = MarkdownTranslationTaskRecordSink::new(
             record_directory.clone(),
@@ -854,14 +1413,18 @@ mod tests {
 
         sink.finish().await;
 
-        assert_eq!(logger.health().task_record_failures, 0);
         assert_eq!(
             std::fs::read_to_string(record_directory.join("task-000001.md"))
                 .expect("业务 CPU 取消后仍应写入终态任务记录"),
             "# rendered\n"
         );
         cpu.shutdown().expect("测试 CPU 根应可关闭");
-        drop(log_runtime);
+        let records = finish_project_log(log_runtime, &log_bytes);
+        assert!(
+            records
+                .iter()
+                .all(|record| record["code"] != "diagnostic.task_record")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -876,9 +1439,7 @@ mod tests {
             .expect("文件系统执行根应可建立");
         let cpu = cpu(WORKERS);
         assert_eq!(cpu.parallelism().get(), WORKERS);
-        let log_runtime =
-            start_project_log(temporary.path().join("logs"), "bounded-window".to_owned());
-        let logger = log_runtime.logger();
+        let (log_runtime, logger, log_bytes) = project_log("bounded-window");
         let sink = MarkdownTranslationTaskRecordSink::new(
             record_directory.clone(),
             "bounded-window".to_owned(),
@@ -928,8 +1489,12 @@ mod tests {
                 .count(),
             DOCUMENTS
         );
-        assert_eq!(logger.health().task_record_failures, 0);
         cpu.shutdown().expect("测试 CPU 根应可关闭");
-        drop(log_runtime);
+        let records = finish_project_log(log_runtime, &log_bytes);
+        assert!(
+            records
+                .iter()
+                .all(|record| record["code"] != "diagnostic.task_record")
+        );
     }
 }

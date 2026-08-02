@@ -6,6 +6,11 @@ use std::error::Error;
 use std::fmt;
 use std::num::NonZeroU32;
 
+use crate::diagnostic::{
+    RpgMakerDiagnosticGroupKind, RpgMakerDiagnosticLocation, RpgMakerDiagnosticLocationStep,
+    RpgMakerDiagnosticSource,
+};
+
 /// RPG Maker `data/` 中由 Builtin 理解语义的标准数据文件。
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum StandardDataFile {
@@ -300,6 +305,40 @@ impl RpgMakerLocation {
     pub(crate) fn steps(&self) -> &[RpgMakerLocationStep] {
         &self.steps
     }
+
+    /// 将已经校验的领域位置投影为结构化公开位置。
+    pub(crate) fn diagnostic_location(&self) -> RpgMakerDiagnosticLocation {
+        let source = match &self.source {
+            RpgMakerSource::Data(file) => RpgMakerDiagnosticSource::data(file.file_name()),
+            RpgMakerSource::DataFile(file) => RpgMakerDiagnosticSource::data_file(file.as_str()),
+            RpgMakerSource::Map(map_id) => RpgMakerDiagnosticSource::map(map_id.get()),
+            RpgMakerSource::PluginParameter {
+                plugin_index,
+                plugin_name,
+                parameter_name,
+            } => RpgMakerDiagnosticSource::plugin_parameter(
+                *plugin_index,
+                plugin_name,
+                parameter_name,
+            ),
+        };
+        let steps = self
+            .steps
+            .iter()
+            .map(|step| match step {
+                RpgMakerLocationStep::ObjectKey(key) => {
+                    RpgMakerDiagnosticLocationStep::object_key(key)
+                }
+                RpgMakerLocationStep::ArrayIndex(index) => {
+                    RpgMakerDiagnosticLocationStep::array_index(*index)
+                }
+                RpgMakerLocationStep::DecodeJsonString => {
+                    RpgMakerDiagnosticLocationStep::decode_json_string()
+                }
+            })
+            .collect();
+        RpgMakerDiagnosticLocation::new(source, steps)
+    }
 }
 
 impl fmt::Display for RpgMakerLocation {
@@ -332,6 +371,19 @@ impl TextGroupKind {
         Self::EventCommand,
         Self::PluginParameter,
     ];
+
+    pub(crate) const fn diagnostic_group_kind(self) -> RpgMakerDiagnosticGroupKind {
+        match self {
+            Self::DatabaseEntry => RpgMakerDiagnosticGroupKind::DatabaseEntry,
+            Self::System => RpgMakerDiagnosticGroupKind::System,
+            Self::Map => RpgMakerDiagnosticGroupKind::Map,
+            Self::EventDialogue => RpgMakerDiagnosticGroupKind::EventDialogue,
+            Self::EventChoices => RpgMakerDiagnosticGroupKind::EventChoices,
+            Self::EventScrollingText => RpgMakerDiagnosticGroupKind::EventScrollingText,
+            Self::EventCommand => RpgMakerDiagnosticGroupKind::EventCommand,
+            Self::PluginParameter => RpgMakerDiagnosticGroupKind::PluginParameter,
+        }
+    }
 
     /// RPG Maker 资产持久化和受信协议共用的唯一名称。
     pub(crate) const fn storage_name(self) -> &'static str {

@@ -1,6 +1,14 @@
 use std::sync::Arc;
 
 use self::rules::RulesProgram;
+use crate::diagnostic::{
+    Diagnostic, DiagnosticReport, RpgMakerBackendCause, RpgMakerExtractionComputeOperation,
+    RpgMakerExtractionProblem, RpgMakerExtractionSource, RpgMakerIssue,
+    RpgMakerRulesCommandNonStringFact,
+    RpgMakerRulesCommandNonStringType as DiagnosticRulesCommandNonStringType, RuntimeOperation,
+    StateEffect,
+};
+use crate::execution::cpu::CpuTaskExecutionError;
 use crate::progress::{NoopProgressObserver, ProgressObserver, ProgressSnapshot};
 use crate::project_name::ProjectName;
 
@@ -10,6 +18,37 @@ mod model;
 pub(crate) mod rules;
 pub(crate) mod service;
 pub(crate) mod store;
+
+/// Extract 上层编排只消费 CPU 边界已类型化的根原因。
+/// 具体 owner 和操作由 Builtin/Rules 调用点补全。
+pub(crate) trait RpgMakerExtractionCpuDiagnostic {
+    fn extraction_cpu_diagnostic(&self) -> Diagnostic;
+}
+
+impl RpgMakerExtractionCpuDiagnostic
+    for CpuTaskExecutionError<crate::runtime::cpu::CpuExecutorUnavailable>
+{
+    fn extraction_cpu_diagnostic(&self) -> Diagnostic {
+        self.diagnostic_for(RuntimeOperation::ExecuteTask)
+    }
+}
+
+fn extraction_compute_report(
+    source: &impl RpgMakerExtractionCpuDiagnostic,
+    owner: RpgMakerExtractionSource,
+    operation: RpgMakerExtractionComputeOperation,
+) -> DiagnosticReport {
+    DiagnosticReport::new(
+        StateEffect::Unchanged,
+        Diagnostic::rpg_maker(RpgMakerIssue::extraction(
+            RpgMakerExtractionProblem::Compute {
+                source: owner,
+                operation,
+                cause: RpgMakerBackendCause::new(source.extraction_cpu_diagnostic()),
+            },
+        )),
+    )
+}
 
 /// 提取指定 RPG Maker 游戏文本所需的输入。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -129,6 +168,31 @@ pub struct RulesCommandNonStringWarning {
     pub parameter: usize,
     pub actual_type: RulesCommandNonStringType,
     pub skipped_count: u64,
+}
+
+impl RulesCommandNonStringWarning {
+    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
+        let actual_type = match self.actual_type {
+            RulesCommandNonStringType::Null => DiagnosticRulesCommandNonStringType::Null,
+            RulesCommandNonStringType::Boolean => DiagnosticRulesCommandNonStringType::Boolean,
+            RulesCommandNonStringType::Number => DiagnosticRulesCommandNonStringType::Number,
+            RulesCommandNonStringType::Array => DiagnosticRulesCommandNonStringType::Array,
+            RulesCommandNonStringType::Object => DiagnosticRulesCommandNonStringType::Object,
+        };
+        DiagnosticReport::new(
+            StateEffect::ProgressPreserved,
+            Diagnostic::rpg_maker(RpgMakerIssue::rules_command_non_string(
+                RpgMakerRulesCommandNonStringFact::new(
+                    self.rule_number,
+                    &self.source_file,
+                    self.command_code,
+                    self.parameter,
+                    actual_type,
+                    self.skipped_count,
+                ),
+            )),
+        )
+    }
 }
 
 #[cfg(test)]

@@ -104,21 +104,6 @@ impl TranslationTaskResponseParseError {
     pub(crate) const fn column(self) -> NonZeroUsize {
         self.column
     }
-
-    pub(crate) fn business_message(self) -> String {
-        let message = match self.kind {
-            TranslationTaskResponseParseErrorKind::Json(category) => {
-                return format!(
-                    "模型响应 JSON 无效：类别 {}，第 {} 行、第 {} 列",
-                    category.code(),
-                    self.line,
-                    self.column
-                );
-            }
-            TranslationTaskResponseParseErrorKind::ThinkingEmpty => "模型响应的思考内容为空",
-        };
-        format!("{message}，第 {} 行、第 {} 列", self.line, self.column)
-    }
 }
 
 /// Assistant JSON 中保持原始顺序和重复项的一个条目。
@@ -131,6 +116,7 @@ pub(crate) struct ParsedTranslationAssistantEntry {
 }
 
 impl ParsedTranslationAssistantEntry {
+    #[cfg(test)]
     pub(crate) fn id(&self) -> &str {
         &self.id
     }

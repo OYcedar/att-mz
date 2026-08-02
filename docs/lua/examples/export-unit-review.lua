@@ -50,7 +50,7 @@ else
       SELECT json_object(
         'kind', text_group.group_kind,
         'owner', text_unit.owner,
-        'group_location', text_unit.group_location,
+        'group_location', text_group.group_location,
         'unit_role', text_unit.unit_role,
         'source_content_json', text_unit.source_content_json,
         'source_context_json', text_unit.source_context_json,
@@ -62,7 +62,7 @@ else
       FROM main.rpg_maker_text_group AS text_group
       JOIN main.rpg_maker_text_unit AS text_unit
         ON text_unit.owner = text_group.owner
-       AND text_unit.group_location = text_group.group_location
+       AND text_unit.group_id = text_group.group_id
       ORDER BY text_group.semantic_order_key,
                text_unit.semantic_order_key,
                CASE text_unit.owner WHEN 'builtin' THEN 0 ELSE 1 END

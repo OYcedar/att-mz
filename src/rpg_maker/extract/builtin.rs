@@ -9,14 +9,15 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 
 use crate::diagnostic::{
-    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
-    DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
+    Diagnostic, DiagnosticReport, ReportedFailure, RpgMakerBuiltinDocumentProblem,
+    RpgMakerDiagnosticLocation, RpgMakerDiagnosticOwner, RpgMakerDialogueDefinitionOrigin,
+    RpgMakerExtractionComputeOperation, RpgMakerExtractionSource, RpgMakerIssue, StateEffect,
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::json::StackSafeJsonValue;
 use crate::rpg_maker::dialogue::{
     DialoguePhysicalLine, MvDialogueDefinition, MvDialogueDefinitionError,
-    MvDialogueProjectionError, MvDialogueProjector, projection_model_detail,
+    MvDialogueProjectionError, MvDialogueProjector,
 };
 use crate::rpg_maker::model::{
     DialogueLinePart, DialogueLineRecipe, DialogueWriteRecipe, DirectSpeakerTarget, DirectTextPart,
@@ -37,8 +38,13 @@ use super::model::{
     BuiltinSnapshot, ExtractedTextGroup, ExtractedTextUnit, RpgMakerLocation, RpgMakerLocationStep,
     RpgMakerSource, SnapshotModelError, TextGroupKind,
 };
-use super::store::{BuiltinProjectDefinitionUpdate, BuiltinSnapshotStore};
-use super::{ExtractProgress, ExtractProgressPhase};
+use super::store::{
+    BuiltinProjectDefinitionUpdate, BuiltinSnapshotStore, RpgMakerExtractionStoreDiagnostic,
+};
+use super::{
+    ExtractProgress, ExtractProgressPhase, RpgMakerExtractionCpuDiagnostic,
+    extraction_compute_report,
+};
 
 /// 刷新 RPG Maker 内置规格能够确定的标准文本资产。
 pub(crate) trait BuiltInExtraction: Send + Sync {
@@ -234,6 +240,7 @@ where
             .replace_builtin(project, snapshot, project_definition_update)
             .await
             .map_err(BuiltInExtractionError::Persist)?;
+        progress.determinate(ExtractProgressPhase::BuiltinCommit, 1, 1);
         Ok(())
     }
 }
@@ -317,57 +324,54 @@ where
 impl<RE, SE, CE> BuiltInExtractionError<RE, SE, CE>
 where
     RE: RpgMakerProjectDocumentReadingDiagnostic,
-    SE: SafeDiagnosticSource,
-    CpuTaskExecutionError<CE>: SafeDiagnosticSource,
+    SE: RpgMakerExtractionStoreDiagnostic,
+    CpuTaskExecutionError<CE>: RpgMakerExtractionCpuDiagnostic,
 {
-    /// 在仍持有 Builtin 阶段错误类型时建立唯一公开投影。
-    pub(crate) fn safe_diagnostic(&self) -> SafeDiagnostic {
+    /// 在仍持有 Builtin 阶段错误类型时建立唯一封闭公开报告。
+    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
         match self {
-            Self::CompileDialogueDefinition(source) => source.safe_diagnostic_source(
-                DiagnosticStage::Extract,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
+            Self::CompileDialogueDefinition(source) => {
+                source.diagnostic_report(RpgMakerDialogueDefinitionOrigin::ProjectSnapshot)
+            }
+            Self::ReadDocuments(source) => source.document_reading_diagnostic_report(
+                crate::diagnostic::RpgMakerDocumentConsumer::Builtin,
             ),
-            Self::ReadDocuments(source) => source.safe_document_reading_diagnostic(
-                DiagnosticCode::ExtractDocumentRead,
-                DiagnosticStage::Extract,
+            Self::ScheduleCompute(source) => extraction_compute_report(
+                source,
+                RpgMakerExtractionSource::builtin(),
+                RpgMakerExtractionComputeOperation::BuiltinBuildSnapshot,
             ),
-            Self::ScheduleCompute(source) => source.safe_diagnostic_source(
-                DiagnosticStage::Extract,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::Retry,
-            ),
-            Self::MalformedDocument(source) => source.safe_diagnostic_source(
-                DiagnosticStage::Extract,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            ),
-            Self::BuildSnapshot(source) => snapshot_model_safe_diagnostic(source),
-            Self::ProjectDialogue(source) => source.safe_diagnostic_source(
-                DiagnosticStage::Extract,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            ),
-            Self::Persist(source) => source
-                .safe_diagnostic_source(
-                    DiagnosticStage::Extract,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckProjectState,
-                )
-                .with_recovery(RecoveryFact::component("owner=builtin")),
+            Self::MalformedDocument(source) => source.diagnostic_report(),
+            Self::BuildSnapshot(source) => {
+                source.diagnostic_report(RpgMakerExtractionSource::builtin())
+            }
+            Self::ProjectDialogue(source) => source.diagnostic_report(),
+            Self::Persist(source) => {
+                source.extraction_store_diagnostic_report(RpgMakerDiagnosticOwner::Builtin)
+            }
         }
+    }
+
+    pub(crate) fn into_diagnostic_failure(self) -> ReportedFailure
+    where
+        RE: Error + Send + Sync + 'static,
+        SE: Error + Send + Sync + 'static,
+        CE: Error + Send + Sync + 'static,
+    {
+        let report = self.diagnostic_report();
+        ReportedFailure::new(report, self)
     }
 }
 
 /// 一个所选标准 RPG Maker 文档不符合固定结构。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BuiltinDocumentError {
-    location: String,
+    location: BuiltinDocumentLocation,
     reason: BuiltinDocumentFailure,
 }
 
 impl BuiltinDocumentError {
-    fn new(location: impl Into<String>, reason: BuiltinDocumentFailure) -> Self {
+    fn new(location: impl Into<BuiltinDocumentLocation>, reason: BuiltinDocumentFailure) -> Self {
         Self {
             location: location.into(),
             reason,
@@ -375,101 +379,112 @@ impl BuiltinDocumentError {
     }
 
     #[cfg(test)]
-    pub(crate) fn location(&self) -> &str {
-        &self.location
+    pub(crate) fn location(&self) -> String {
+        self.location.to_string()
     }
 
-    fn reason_detail(&self) -> (DiagnosticFailureKind, String) {
-        match &self.reason {
-            BuiltinDocumentFailure::MissingDocument => (
-                DiagnosticFailureKind::NotFound,
-                "structure=document_missing".to_owned(),
-            ),
-            BuiltinDocumentFailure::ExpectedObject => (
-                DiagnosticFailureKind::InvalidValue,
-                "structure=expected_object".to_owned(),
-            ),
-            BuiltinDocumentFailure::ExpectedArray => (
-                DiagnosticFailureKind::InvalidValue,
-                "structure=expected_array".to_owned(),
-            ),
-            BuiltinDocumentFailure::ExpectedString => (
-                DiagnosticFailureKind::InvalidValue,
-                "structure=expected_string".to_owned(),
-            ),
-            BuiltinDocumentFailure::MissingValue => (
-                DiagnosticFailureKind::MissingRequiredValue,
-                "structure=field_or_element_missing".to_owned(),
-            ),
-            BuiltinDocumentFailure::EventCodeMustBeInteger => (
-                DiagnosticFailureKind::InvalidValue,
-                "structure=event_command; field=code; expected=integer".to_owned(),
-            ),
-            BuiltinDocumentFailure::EventParametersMissing => (
-                DiagnosticFailureKind::MissingRequiredValue,
-                "structure=event_command; field=parameters".to_owned(),
-            ),
-            BuiltinDocumentFailure::EventIndentMustBeInteger => (
-                DiagnosticFailureKind::InvalidValue,
-                "structure=event_command; field=indent; expected=integer".to_owned(),
-            ),
-            BuiltinDocumentFailure::ContinuationWithoutStart { command_code } => (
-                DiagnosticFailureKind::RequirementFailed,
-                format!(
-                    "structure=event_command; command_code={command_code}; required_start_command=missing"
-                ),
-            ),
-            BuiltinDocumentFailure::ChoiceIndexInvalid {
-                actual,
-                option_count,
-            } => (
-                DiagnosticFailureKind::InvalidValue,
-                format!(
-                    "structure=choice_branch; command_code=402; choice_index={}; option_count={option_count}",
-                    actual.map_or_else(|| "not_integer".to_owned(), |value| value.to_string())
-                ),
-            ),
-            BuiltinDocumentFailure::DuplicateChoiceBranch { choice_index } => (
-                DiagnosticFailureKind::ConflictingValues,
-                format!(
-                    "structure=choice_branch; command_code=402; duplicate_choice_index={choice_index}"
-                ),
-            ),
-            BuiltinDocumentFailure::ChoiceBranchTextMismatch { choice_index } => (
-                DiagnosticFailureKind::ConflictingValues,
-                format!(
-                    "structure=choice_branch; command_code=402; choice_index={choice_index}; branch_text=does_not_match_command_102"
-                ),
-            ),
-            BuiltinDocumentFailure::ChoiceEndMissing => (
-                DiagnosticFailureKind::RequirementFailed,
-                "structure=choice_block; start_command=102; end_command=404; state=missing"
-                    .to_owned(),
-            ),
-            BuiltinDocumentFailure::ChoiceBranchesIncomplete { expected, actual } => (
-                DiagnosticFailureKind::RequirementFailed,
-                format!(
-                    "structure=choice_block; start_command=102; branch_command=402; expected_branches={expected}; actual_branches={actual}"
-                ),
-            ),
+    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
+        DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::rpg_maker(RpgMakerIssue::builtin_document(
+                self.location.diagnostic_location(),
+                match &self.reason {
+                    BuiltinDocumentFailure::MissingDocument => {
+                        RpgMakerBuiltinDocumentProblem::MissingDocument
+                    }
+                    BuiltinDocumentFailure::ExpectedObject => {
+                        RpgMakerBuiltinDocumentProblem::ExpectedObject
+                    }
+                    BuiltinDocumentFailure::ExpectedArray => {
+                        RpgMakerBuiltinDocumentProblem::ExpectedArray
+                    }
+                    BuiltinDocumentFailure::ExpectedString => {
+                        RpgMakerBuiltinDocumentProblem::ExpectedString
+                    }
+                    BuiltinDocumentFailure::MissingValue => {
+                        RpgMakerBuiltinDocumentProblem::MissingValue
+                    }
+                    BuiltinDocumentFailure::EventCodeMustBeInteger => {
+                        RpgMakerBuiltinDocumentProblem::EventCodeMustBeInteger
+                    }
+                    BuiltinDocumentFailure::EventParametersMissing => {
+                        RpgMakerBuiltinDocumentProblem::EventParametersMissing
+                    }
+                    BuiltinDocumentFailure::EventIndentMustBeInteger => {
+                        RpgMakerBuiltinDocumentProblem::EventIndentMustBeInteger
+                    }
+                    BuiltinDocumentFailure::ContinuationWithoutStart { command_code } => {
+                        RpgMakerBuiltinDocumentProblem::ContinuationWithoutStart {
+                            command_code: *command_code,
+                        }
+                    }
+                    BuiltinDocumentFailure::ChoiceIndexInvalid {
+                        actual,
+                        option_count,
+                    } => RpgMakerBuiltinDocumentProblem::ChoiceIndexInvalid {
+                        actual: *actual,
+                        option_count: *option_count,
+                    },
+                    BuiltinDocumentFailure::DuplicateChoiceBranch { choice_index } => {
+                        RpgMakerBuiltinDocumentProblem::DuplicateChoiceBranch {
+                            choice_index: *choice_index,
+                        }
+                    }
+                    BuiltinDocumentFailure::ChoiceBranchTextMismatch { choice_index } => {
+                        RpgMakerBuiltinDocumentProblem::ChoiceBranchTextMismatch {
+                            choice_index: *choice_index,
+                        }
+                    }
+                    BuiltinDocumentFailure::ChoiceEndMissing => {
+                        RpgMakerBuiltinDocumentProblem::ChoiceEndMissing
+                    }
+                    BuiltinDocumentFailure::ChoiceBranchesIncomplete { expected, actual } => {
+                        RpgMakerBuiltinDocumentProblem::ChoiceBranchesIncomplete {
+                            expected: *expected,
+                            actual: *actual,
+                        }
+                    }
+                },
+            )),
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BuiltinDocumentLocation {
+    Source(RpgMakerSource),
+    Value(RpgMakerLocation),
+}
+
+impl BuiltinDocumentLocation {
+    fn diagnostic_location(&self) -> RpgMakerDiagnosticLocation {
+        match self {
+            Self::Source(source) => {
+                RpgMakerLocation::value(source.clone(), Vec::new()).diagnostic_location()
+            }
+            Self::Value(location) => location.diagnostic_location(),
         }
     }
+}
 
-    pub(crate) fn safe_diagnostic(
-        &self,
-        stage: DiagnosticStage,
-        impact: DiagnosticImpact,
-        action: DiagnosticAction,
-    ) -> SafeDiagnostic {
-        let (failure, detail) = self.reason_detail();
-        SafeDiagnostic::new(
-            DiagnosticCode::ExtractBuiltin,
-            stage,
-            DiagnosticSubject::field(&self.location),
-            DiagnosticReason::failure_with_detail(failure, detail),
-            impact,
-            action,
-        )
+impl From<RpgMakerSource> for BuiltinDocumentLocation {
+    fn from(value: RpgMakerSource) -> Self {
+        Self::Source(value)
+    }
+}
+
+impl From<RpgMakerLocation> for BuiltinDocumentLocation {
+    fn from(value: RpgMakerLocation) -> Self {
+        Self::Value(value)
+    }
+}
+
+impl fmt::Display for BuiltinDocumentLocation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source(source) => source.fmt(formatter),
+            Self::Value(location) => location.fmt(formatter),
+        }
     }
 }
 
@@ -480,17 +495,6 @@ impl fmt::Display for BuiltinDocumentError {
 }
 
 impl Error for BuiltinDocumentError {}
-
-impl SafeDiagnosticSource for BuiltinDocumentError {
-    fn safe_diagnostic_source(
-        &self,
-        stage: DiagnosticStage,
-        impact: DiagnosticImpact,
-        fallback_action: DiagnosticAction,
-    ) -> SafeDiagnostic {
-        self.safe_diagnostic(stage, impact, fallback_action)
-    }
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum BuiltinDocumentFailure {
@@ -550,158 +554,6 @@ impl fmt::Display for BuiltinDocumentFailure {
             }
         }
     }
-}
-
-fn snapshot_model_safe_diagnostic(source: &SnapshotModelError) -> SafeDiagnostic {
-    let (subject, failure, detail) = match source {
-        SnapshotModelError::BlankSourceContent { exact_location } => (
-            DiagnosticSubject::field(exact_location.to_string()),
-            DiagnosticFailureKind::InvalidValue,
-            "structure=text_unit; source_content=blank".to_owned(),
-        ),
-        SnapshotModelError::ContentShapeMismatch {
-            role,
-            exact_location,
-        } => (
-            DiagnosticSubject::field(exact_location.to_string()),
-            DiagnosticFailureKind::InvalidValue,
-            format!(
-                "structure=text_unit; role={}; content_shape=mismatch",
-                builtin_role_name(role)
-            ),
-        ),
-        SnapshotModelError::DirectGroupRequiresValue {
-            role,
-            exact_location,
-        } => (
-            DiagnosticSubject::field(exact_location.to_string()),
-            DiagnosticFailureKind::InvalidValue,
-            format!(
-                "structure=direct_group; role={}; required_content_shape=value",
-                builtin_role_name(role)
-            ),
-        ),
-        SnapshotModelError::InvalidSourceLine {
-            source_line_index,
-            exact_location,
-        } => (
-            DiagnosticSubject::field(exact_location.to_string()),
-            DiagnosticFailureKind::InvalidValue,
-            format!(
-                "structure=text_unit; source_line_index={source_line_index}; forbidden_character=cr_lf_or_nul"
-            ),
-        ),
-        SnapshotModelError::EmptyGroup { group_location } => (
-            DiagnosticSubject::field(group_location.to_string()),
-            DiagnosticFailureKind::MissingRequiredValue,
-            "structure=text_group; units=empty".to_owned(),
-        ),
-        SnapshotModelError::EmptyProjection { group_location } => (
-            DiagnosticSubject::field(group_location.to_string()),
-            DiagnosticFailureKind::MissingRequiredValue,
-            "structure=text_group; projection_recipes=empty".to_owned(),
-        ),
-        SnapshotModelError::DuplicateLogicalLocation { logical_location } => (
-            DiagnosticSubject::field(logical_location.group_location().to_string()),
-            DiagnosticFailureKind::ConflictingValues,
-            format!(
-                "structure=snapshot; duplicate_logical_location=true; role={}",
-                builtin_role_name(logical_location.role())
-            ),
-        ),
-        SnapshotModelError::ConflictingGroupKind {
-            group_location,
-            first,
-            second,
-        } => (
-            DiagnosticSubject::field(group_location.to_string()),
-            DiagnosticFailureKind::ConflictingValues,
-            format!(
-                "structure=text_group; first_kind={}; second_kind={}",
-                builtin_group_kind_name(*first),
-                builtin_group_kind_name(*second)
-            ),
-        ),
-        SnapshotModelError::ConflictingSemanticOrderKey { group_location, .. } => (
-            DiagnosticSubject::field(group_location.to_string()),
-            DiagnosticFailureKind::InternalInvariant,
-            "structure=text_group; semantic_order_key=conflicting".to_owned(),
-        ),
-        SnapshotModelError::SemanticOrderProjection {
-            exact_location,
-            source,
-        } => (
-            DiagnosticSubject::field(exact_location.to_string()),
-            DiagnosticFailureKind::InternalInvariant,
-            format!("structure=semantic_order_key; reason={source}"),
-        ),
-        SnapshotModelError::MutationClaimConflict { .. } => (
-            DiagnosticSubject::operation("build_builtin_snapshot_claim_index"),
-            DiagnosticFailureKind::ConflictingValues,
-            "structure=mutation_claim; resource_kind=value; access=conflicting".to_owned(),
-        ),
-        SnapshotModelError::RecipeRoleMismatch {
-            group_location,
-            units,
-            referenced,
-        } => (
-            DiagnosticSubject::field(group_location.to_string()),
-            DiagnosticFailureKind::InvalidValue,
-            format!(
-                "structure=projection_recipe; role_set=mismatch; unit_role_count={}; referenced_role_count={}",
-                units.len(),
-                referenced.len()
-            ),
-        ),
-        SnapshotModelError::RecipeLineMismatch {
-            group_location,
-            role,
-            expected,
-            referenced,
-        } => (
-            DiagnosticSubject::field(group_location.to_string()),
-            DiagnosticFailureKind::InvalidValue,
-            format!(
-                "structure=projection_recipe; role={}; line_set=mismatch; expected_count={}; referenced_count={}; first_missing={}; first_unexpected={}",
-                builtin_role_name(role),
-                expected.len(),
-                referenced.len(),
-                optional_usize(expected.difference(referenced).next().copied()),
-                optional_usize(referenced.difference(expected).next().copied())
-            ),
-        ),
-        SnapshotModelError::Projection(source) => (
-            DiagnosticSubject::operation("build_builtin_projection"),
-            DiagnosticFailureKind::InternalInvariant,
-            projection_model_detail(source),
-        ),
-    };
-    SafeDiagnostic::new(
-        DiagnosticCode::ExtractBuiltin,
-        DiagnosticStage::Extract,
-        subject,
-        DiagnosticReason::failure_with_detail(failure, detail),
-        DiagnosticImpact::Unchanged,
-        DiagnosticAction::ReportBug,
-    )
-}
-
-fn builtin_role_name(role: &TextUnitRole) -> &'static str {
-    match role {
-        TextUnitRole::Scalar(_) => "scalar",
-        TextUnitRole::DialogueSpeaker => "dialogue_speaker",
-        TextUnitRole::DialogueBody => "dialogue_body",
-        TextUnitRole::Choices => "choices",
-        TextUnitRole::ScrollingText => "scrolling_text",
-    }
-}
-
-fn builtin_group_kind_name(kind: TextGroupKind) -> &'static str {
-    kind.storage_name()
-}
-
-fn optional_usize(value: Option<usize>) -> String {
-    value.map_or_else(|| "none".to_owned(), |value| value.to_string())
 }
 
 #[derive(Debug)]
@@ -1022,7 +874,7 @@ fn take_data_document(
         .remove(&RpgMakerDocumentId::Data(file))
         .ok_or_else(|| {
             BuiltinDocumentError::new(
-                format!("data/{}", file.file_name()),
+                RpgMakerSource::data(file),
                 BuiltinDocumentFailure::MissingDocument,
             )
         })
@@ -1058,7 +910,7 @@ fn extract_database_entries(
 ) -> Result<(), BuildBuiltinSnapshotError> {
     let source = RpgMakerSource::data(file);
     let root = required_data_document(documents, file)?;
-    let entries = expect_array(root, source.to_string())?;
+    let entries = expect_array(root, source.clone())?;
 
     for (entry_index, entry) in entries.iter().enumerate() {
         if entry.is_null() {
@@ -1066,7 +918,7 @@ fn extract_database_entries(
         }
         let entry_steps = vec![RpgMakerLocationStep::index(entry_index)];
         let entry_location = RpgMakerLocation::value(source.clone(), entry_steps.clone());
-        let object = expect_object(entry, entry_location.to_string())?;
+        let object = expect_object(entry, entry_location.clone())?;
         let mut fields = Vec::new();
         for field_name in field_names {
             let mut field_steps = entry_steps.clone();
@@ -1086,7 +938,7 @@ fn extract_system(
 ) -> Result<(), BuildBuiltinSnapshotError> {
     let source = RpgMakerSource::data(StandardDataFile::System);
     let root = required_data_document(documents, StandardDataFile::System)?;
-    let object = expect_object(root, source.to_string())?;
+    let object = expect_object(root, source.clone())?;
 
     let mut identity_fields = Vec::new();
     for field_name in ["gameTitle", "currencyUnit"] {
@@ -1107,7 +959,7 @@ fn extract_system(
     let terms = object
         .get("terms")
         .ok_or_else(|| missing_value(&terms_location))?;
-    let terms = expect_object(terms, terms_location.to_string())?;
+    let terms = expect_object(terms, terms_location.clone())?;
     for field_name in ["basic", "commands", "params"] {
         let steps = vec![
             RpgMakerLocationStep::key("terms"),
@@ -1134,7 +986,7 @@ fn extract_system(
     let messages = terms
         .get("messages")
         .ok_or_else(|| missing_value(&messages_location))?;
-    let messages = expect_object(messages, messages_location.to_string())?;
+    let messages = expect_object(messages, messages_location.clone())?;
     extract_string_object_group(
         groups,
         source.clone(),
@@ -1169,7 +1021,7 @@ fn extract_string_array_group(
     field_prefix: &str,
 ) -> Result<(), BuildBuiltinSnapshotError> {
     let group_location = RpgMakerLocation::value(source.clone(), steps.clone());
-    let values = expect_array(value, group_location.to_string())?;
+    let values = expect_array(value, group_location.clone())?;
     let mut fields = Vec::new();
     for (index, value) in values.iter().enumerate() {
         if value.is_null() {
@@ -1225,7 +1077,7 @@ fn extract_maps(
             continue;
         };
         let source = RpgMakerSource::map_id(*map_id);
-        let root = expect_object(document, source.to_string())?;
+        let root = expect_object(document, source.clone())?;
 
         let display_location = RpgMakerLocation::value(
             source.clone(),
@@ -1246,7 +1098,7 @@ fn extract_maps(
         let events = root
             .get("events")
             .ok_or_else(|| missing_value(&events_location))?;
-        let events = expect_array(events, events_location.to_string())?;
+        let events = expect_array(events, events_location.clone())?;
         extract_map_event_lists(source, events, dialogue_projection, groups)?;
     }
     Ok(())
@@ -1267,27 +1119,27 @@ fn extract_map_event_lists(
             RpgMakerLocationStep::index(event_index),
         ];
         let event_location = RpgMakerLocation::value(source.clone(), event_steps.clone());
-        let event = expect_object(event, event_location.to_string())?;
+        let event = expect_object(event, event_location.clone())?;
         let mut pages_steps = event_steps.clone();
         pages_steps.push(RpgMakerLocationStep::key("pages"));
         let pages_location = RpgMakerLocation::value(source.clone(), pages_steps.clone());
         let pages = event
             .get("pages")
             .ok_or_else(|| missing_value(&pages_location))?;
-        let pages = expect_array(pages, pages_location.to_string())?;
+        let pages = expect_array(pages, pages_location.clone())?;
 
         for (page_index, page) in pages.iter().enumerate() {
             let mut page_steps = pages_steps.clone();
             page_steps.push(RpgMakerLocationStep::index(page_index));
             let page_location = RpgMakerLocation::value(source.clone(), page_steps.clone());
-            let page = expect_object(page, page_location.to_string())?;
+            let page = expect_object(page, page_location.clone())?;
             let mut list_steps = page_steps;
             list_steps.push(RpgMakerLocationStep::key("list"));
             let list_location = RpgMakerLocation::value(source.clone(), list_steps.clone());
             let list = page
                 .get("list")
                 .ok_or_else(|| missing_value(&list_location))?;
-            let list = expect_array(list, list_location.to_string())?;
+            let list = expect_array(list, list_location.clone())?;
             extract_event_list(
                 source.clone(),
                 list_steps,
@@ -1307,21 +1159,21 @@ fn extract_common_events(
 ) -> Result<(), BuildBuiltinSnapshotError> {
     let source = RpgMakerSource::data(StandardDataFile::CommonEvents);
     let root = required_data_document(documents, StandardDataFile::CommonEvents)?;
-    let events = expect_array(root, source.to_string())?;
+    let events = expect_array(root, source.clone())?;
     for (event_index, event) in events.iter().enumerate() {
         if event.is_null() {
             continue;
         }
         let event_steps = vec![RpgMakerLocationStep::index(event_index)];
         let event_location = RpgMakerLocation::value(source.clone(), event_steps.clone());
-        let event = expect_object(event, event_location.to_string())?;
+        let event = expect_object(event, event_location.clone())?;
         let mut list_steps = event_steps;
         list_steps.push(RpgMakerLocationStep::key("list"));
         let list_location = RpgMakerLocation::value(source.clone(), list_steps.clone());
         let list = event
             .get("list")
             .ok_or_else(|| missing_value(&list_location))?;
-        let list = expect_array(list, list_location.to_string())?;
+        let list = expect_array(list, list_location.clone())?;
         extract_event_list(
             source.clone(),
             list_steps,
@@ -1340,33 +1192,33 @@ fn extract_troops(
 ) -> Result<(), BuildBuiltinSnapshotError> {
     let source = RpgMakerSource::data(StandardDataFile::Troops);
     let root = required_data_document(documents, StandardDataFile::Troops)?;
-    let troops = expect_array(root, source.to_string())?;
+    let troops = expect_array(root, source.clone())?;
     for (troop_index, troop) in troops.iter().enumerate() {
         if troop.is_null() {
             continue;
         }
         let troop_steps = vec![RpgMakerLocationStep::index(troop_index)];
         let troop_location = RpgMakerLocation::value(source.clone(), troop_steps.clone());
-        let troop = expect_object(troop, troop_location.to_string())?;
+        let troop = expect_object(troop, troop_location.clone())?;
         let mut pages_steps = troop_steps;
         pages_steps.push(RpgMakerLocationStep::key("pages"));
         let pages_location = RpgMakerLocation::value(source.clone(), pages_steps.clone());
         let pages = troop
             .get("pages")
             .ok_or_else(|| missing_value(&pages_location))?;
-        let pages = expect_array(pages, pages_location.to_string())?;
+        let pages = expect_array(pages, pages_location.clone())?;
         for (page_index, page) in pages.iter().enumerate() {
             let mut page_steps = pages_steps.clone();
             page_steps.push(RpgMakerLocationStep::index(page_index));
             let page_location = RpgMakerLocation::value(source.clone(), page_steps.clone());
-            let page = expect_object(page, page_location.to_string())?;
+            let page = expect_object(page, page_location.clone())?;
             let mut list_steps = page_steps;
             list_steps.push(RpgMakerLocationStep::key("list"));
             let list_location = RpgMakerLocation::value(source.clone(), list_steps.clone());
             let list = page
                 .get("list")
                 .ok_or_else(|| missing_value(&list_location))?;
-            let list = expect_array(list, list_location.to_string())?;
+            let list = expect_array(list, list_location.clone())?;
             extract_event_list(
                 source.clone(),
                 list_steps,
@@ -1492,7 +1344,7 @@ fn extract_event_list(
             }
             401 | 405 => {
                 return Err(BuiltinDocumentError::new(
-                    command.location.to_string(),
+                    command.location.clone(),
                     BuiltinDocumentFailure::ContinuationWithoutStart {
                         command_code: command.code,
                     },
@@ -1506,7 +1358,7 @@ fn extract_event_list(
 
     if let Some(frame) = choice_frames.into_iter().flatten().next() {
         return Err(BuiltinDocumentError::new(
-            frame.group_location().to_string(),
+            frame.group_location().clone(),
             BuiltinDocumentFailure::ChoiceEndMissing,
         )
         .into());
@@ -1534,20 +1386,29 @@ fn command_at<'a>(
     let mut command_steps = list_steps.to_vec();
     command_steps.push(RpgMakerLocationStep::index(command_index));
     let location = RpgMakerLocation::value(source.clone(), command_steps);
-    let command = expect_object(&list[command_index], location.to_string())?;
+    let command = expect_object(&list[command_index], location.clone())?;
     let code = command.get("code").and_then(Value::as_i64).ok_or_else(|| {
         BuiltinDocumentError::new(
-            location.to_string(),
+            location.clone(),
             BuiltinDocumentFailure::EventCodeMustBeInteger,
         )
     })?;
     let parameters = command.get("parameters").ok_or_else(|| {
         BuiltinDocumentError::new(
-            location.to_string(),
+            location.clone(),
             BuiltinDocumentFailure::EventParametersMissing,
         )
     })?;
-    let parameters = expect_array(parameters, format!("{location}.parameters"))?;
+    let parameters_location = RpgMakerLocation::value(
+        location.source().clone(),
+        location
+            .steps()
+            .iter()
+            .cloned()
+            .chain([RpgMakerLocationStep::key("parameters")])
+            .collect(),
+    );
+    let parameters = expect_array(parameters, parameters_location)?;
     Ok(EventCommand {
         code,
         parameters,
@@ -1560,12 +1421,12 @@ fn command_indent(
     command_index: usize,
     location: &RpgMakerLocation,
 ) -> Result<i64, BuiltinDocumentError> {
-    expect_object(&list[command_index], location.to_string())?
+    expect_object(&list[command_index], location.clone())?
         .get("indent")
         .and_then(Value::as_i64)
         .ok_or_else(|| {
             BuiltinDocumentError::new(
-                location.to_string(),
+                location.clone(),
                 BuiltinDocumentFailure::EventIndentMustBeInteger,
             )
         })
@@ -1755,7 +1616,7 @@ impl PendingChoiceExtraction {
             .filter(|index| *index < self.choice_texts.len())
             .ok_or_else(|| {
                 BuiltinDocumentError::new(
-                    index_location.to_string(),
+                    index_location.clone(),
                     BuiltinDocumentFailure::ChoiceIndexInvalid {
                         actual: raw_choice_index,
                         option_count: self.choice_texts.len(),
@@ -1764,7 +1625,7 @@ impl PendingChoiceExtraction {
             })?;
         if !self.branch_indexes.insert(choice_index) {
             return Err(BuiltinDocumentError::new(
-                index_location.to_string(),
+                index_location.clone(),
                 BuiltinDocumentFailure::DuplicateChoiceBranch { choice_index },
             )
             .into());
@@ -1773,7 +1634,7 @@ impl PendingChoiceExtraction {
         let branch_text = parameter_string(parameters, 1, &text_location)?;
         if branch_text != self.choice_texts[choice_index] {
             return Err(BuiltinDocumentError::new(
-                text_location.to_string(),
+                text_location,
                 BuiltinDocumentFailure::ChoiceBranchTextMismatch { choice_index },
             )
             .into());
@@ -1806,7 +1667,7 @@ impl PendingChoiceExtraction {
         ]);
         if self.branch_indexes.len() != self.choice_texts.len() {
             return Err(BuiltinDocumentError::new(
-                self.group_location.to_string(),
+                self.group_location.clone(),
                 BuiltinDocumentFailure::ChoiceBranchesIncomplete {
                     expected: self.choice_texts.len(),
                     actual: self.branch_indexes.len(),
@@ -1847,7 +1708,7 @@ fn begin_choices(
     let choices = parameters
         .first()
         .ok_or_else(|| missing_value(&choices_location))?;
-    let choices = expect_array(choices, choices_location.to_string())?;
+    let choices = expect_array(choices, choices_location.clone())?;
     let choice_texts = choices
         .iter()
         .enumerate()
@@ -2076,7 +1937,7 @@ fn required_data_document(
         .document(RpgMakerDocumentId::Data(file))
         .ok_or_else(|| {
             BuiltinDocumentError::new(
-                format!("data/{}", file.file_name()),
+                RpgMakerSource::data(file),
                 BuiltinDocumentFailure::MissingDocument,
             )
         })
@@ -2084,7 +1945,7 @@ fn required_data_document(
 
 fn expect_object(
     value: &Value,
-    location: impl Into<String>,
+    location: impl Into<BuiltinDocumentLocation>,
 ) -> Result<&Map<String, Value>, BuiltinDocumentError> {
     value
         .as_object()
@@ -2093,7 +1954,7 @@ fn expect_object(
 
 fn expect_array(
     value: &Value,
-    location: impl Into<String>,
+    location: impl Into<BuiltinDocumentLocation>,
 ) -> Result<&[Value], BuiltinDocumentError> {
     value
         .as_array()
@@ -2106,7 +1967,7 @@ fn expect_string<'a>(
     location: &RpgMakerLocation,
 ) -> Result<&'a str, BuiltinDocumentError> {
     value.as_str().ok_or_else(|| {
-        BuiltinDocumentError::new(location.to_string(), BuiltinDocumentFailure::ExpectedString)
+        BuiltinDocumentError::new(location.clone(), BuiltinDocumentFailure::ExpectedString)
     })
 }
 
@@ -2122,7 +1983,7 @@ fn expect_string_field<'a>(
 }
 
 fn missing_value(location: &RpgMakerLocation) -> BuiltinDocumentError {
-    BuiltinDocumentError::new(location.to_string(), BuiltinDocumentFailure::MissingValue)
+    BuiltinDocumentError::new(location.clone(), BuiltinDocumentFailure::MissingValue)
 }
 
 #[cfg(test)]
@@ -2215,41 +2076,51 @@ mod tests {
 
     impl Error for FakeError {}
 
-    impl SafeDiagnosticSource for FakeError {
-        fn safe_diagnostic_source(
+    impl RpgMakerProjectDocumentReadingDiagnostic for FakeError {
+        fn document_reading_diagnostic_report(
             &self,
-            stage: DiagnosticStage,
-            impact: DiagnosticImpact,
-            fallback_action: DiagnosticAction,
-        ) -> SafeDiagnostic {
-            SafeDiagnostic::new(
-                DiagnosticCode::InternalOperation,
-                stage,
-                DiagnosticSubject::component("typed_fake_root"),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::InvalidValue,
-                    "source=fake_root",
-                ),
-                impact,
-                fallback_action,
+            consumer: crate::diagnostic::RpgMakerDocumentConsumer,
+        ) -> DiagnosticReport {
+            DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::rpg_maker(RpgMakerIssue::document(
+                    consumer,
+                    crate::diagnostic::RpgMakerDocumentOperation::Read,
+                    crate::diagnostic::RpgMakerDocumentProblem::NotFound {
+                        path: crate::diagnostic::SafePath::new("fake/data/Items.json"),
+                    },
+                )),
             )
         }
     }
 
-    impl RpgMakerProjectDocumentReadingDiagnostic for FakeError {
-        fn safe_document_reading_diagnostic(
+    impl RpgMakerExtractionStoreDiagnostic for FakeError {
+        fn extraction_store_diagnostic_report(
             &self,
-            code: DiagnosticCode,
-            stage: DiagnosticStage,
-        ) -> SafeDiagnostic {
-            SafeDiagnostic::new(
-                code,
-                stage,
-                DiagnosticSubject::component("fake_builtin_document_reader"),
-                DiagnosticReason::failure(DiagnosticFailureKind::InvalidValue),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
+            owner: RpgMakerDiagnosticOwner,
+        ) -> DiagnosticReport {
+            DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::rpg_maker(RpgMakerIssue::extraction(
+                    crate::diagnostic::RpgMakerExtractionProblem::Store {
+                        owner,
+                        database_path: crate::diagnostic::SafePath::new("fake/project.sqlite3"),
+                        operation:
+                            crate::diagnostic::RpgMakerExtractionStoreOperation::CommitSnapshot,
+                        problem:
+                            crate::diagnostic::RpgMakerExtractionStoreProblem::DatabaseNotFound,
+                    },
+                )),
             )
+        }
+    }
+
+    impl RpgMakerExtractionCpuDiagnostic for CpuTaskExecutionError<FakeError> {
+        fn extraction_cpu_diagnostic(&self) -> Diagnostic {
+            Diagnostic::runtime(crate::diagnostic::RuntimeIssue::ExecutorClosed {
+                component: crate::diagnostic::RuntimeComponent::CpuExecutor,
+                operation: crate::diagnostic::RuntimeOperation::ExecuteTask,
+            })
         }
     }
 
@@ -2548,10 +2419,11 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(
-            snapshots.last(),
-            Some(&ProgressSnapshot::indeterminate(
-                ExtractProgressPhase::BuiltinCommit
-            ))
+            &snapshots[snapshots.len() - 2..],
+            [
+                ProgressSnapshot::indeterminate(ExtractProgressPhase::BuiltinCommit),
+                ProgressSnapshot::determinate(ExtractProgressPhase::BuiltinCommit, 1, 1),
+            ]
         );
 
         let selections = service
@@ -2788,29 +2660,54 @@ mod tests {
         >;
 
         let read_error = DiagnosticExtractionError::ReadDocuments(FakeError("read"));
-        let diagnostic = read_error.safe_diagnostic();
-        assert_eq!(diagnostic.code, DiagnosticCode::ExtractDocumentRead);
-        assert_eq!(diagnostic.stage, DiagnosticStage::Extract);
+        let wire = serde_json::to_value(read_error.diagnostic_report())
+            .expect("Builtin 文档根诊断必须可序列化");
+        assert_eq!(wire["effect"], "unchanged");
+        assert_eq!(wire["primary"]["code"], "rpg_maker.document.not_found");
+        assert_eq!(wire["primary"]["stage"], "extract");
         assert_eq!(
-            diagnostic.subject,
-            DiagnosticSubject::component("fake_builtin_document_reader")
+            wire["primary"]["issue"]["details"]["problem"]["consumer"],
+            "builtin"
+        );
+        assert_eq!(
+            wire["primary"]["issue"]["details"]["problem"]["operation"],
+            "read"
         );
 
         let document_error = BuiltinDocumentError::new(
-            "data/Items.json[1].name",
+            RpgMakerLocation::value(
+                RpgMakerSource::data(StandardDataFile::Items),
+                vec![
+                    RpgMakerLocationStep::index(1),
+                    RpgMakerLocationStep::key("name"),
+                ],
+            ),
             BuiltinDocumentFailure::ExpectedString,
         );
-        let error = DiagnosticExtractionError::MalformedDocument(document_error);
-        let diagnostic = error.safe_diagnostic();
+        let wire = serde_json::to_value(document_error.diagnostic_report())
+            .expect("Builtin 文档诊断必须可序列化");
+        assert_eq!(wire["primary"]["code"], "rpg_maker.builtin.expected_string");
+        assert_eq!(wire["primary"]["stage"], "extract");
         assert_eq!(
-            diagnostic.subject,
-            DiagnosticSubject::field("data/Items.json[1].name")
+            wire["primary"]["issue"]["details"]["problem"]["location"]["source"]["file"],
+            "Items.json"
         );
-        let DiagnosticReason::FailureWithDetail { failure, detail } = diagnostic.reason else {
-            panic!("Builtin 文档错误应公开具体结构原因")
-        };
-        assert_eq!(failure, DiagnosticFailureKind::InvalidValue);
-        assert_eq!(detail, "structure=expected_string");
+        assert_eq!(
+            wire["primary"]["issue"]["details"]["problem"]["location"]["steps"][0]["index"],
+            1
+        );
+        assert_eq!(
+            wire["primary"]["issue"]["details"]["problem"]["location"]["steps"][1]["key"],
+            "name"
+        );
+        let error = DiagnosticExtractionError::MalformedDocument(document_error);
+        let wire = serde_json::to_value(error.diagnostic_report())
+            .expect("Builtin 文档阶段诊断必须可序列化");
+        assert_eq!(wire["primary"]["code"], "rpg_maker.builtin.expected_string");
+        assert_eq!(
+            wire["primary"]["issue"]["details"]["problem"]["problem"]["kind"],
+            "expected_string"
+        );
 
         let group_location = RpgMakerLocation::value(
             RpgMakerSource::data(StandardDataFile::Items),
@@ -2822,26 +2719,29 @@ mod tests {
                 first: TextGroupKind::DatabaseEntry,
                 second: TextGroupKind::EventCommand,
             });
-        let diagnostic = error.safe_diagnostic();
+        let wire = serde_json::to_value(error.diagnostic_report())
+            .expect("Builtin SnapshotModelError 必须可序列化");
         assert_eq!(
-            diagnostic.subject,
-            DiagnosticSubject::field(group_location.to_string())
+            wire["primary"]["code"],
+            "rpg_maker.extract.snapshot.conflicting_group_kind"
         );
-        let DiagnosticReason::FailureWithDetail { failure, detail } = diagnostic.reason else {
-            panic!("SnapshotModelError 应按具体变体投影")
-        };
-        assert_eq!(failure, DiagnosticFailureKind::ConflictingValues);
-        assert!(detail.contains("first_kind=database_entry"));
-        assert!(detail.contains("second_kind=event_command"));
+        assert_eq!(
+            wire["primary"]["issue"]["details"]["problem"]["problem"]["violation"]["first"],
+            "database_entry"
+        );
+        assert_eq!(
+            wire["primary"]["issue"]["details"]["problem"]["problem"]["violation"]["second"],
+            "event_command"
+        );
 
         const SOURCE_BODY: &str = "ROOT_SOURCE_BODY_SENTINEL";
         let error = DiagnosticExtractionError::Persist(FakeError(SOURCE_BODY));
-        let diagnostic = error.safe_diagnostic();
-        assert_eq!(diagnostic.code, DiagnosticCode::InternalOperation);
-        assert!(matches!(
-            diagnostic.recovery.as_slice(),
-            [RecoveryFact::Component { name }] if name == "owner=builtin"
-        ));
+        let diagnostic = error.diagnostic_report();
+        assert_eq!(
+            diagnostic.primary().code(),
+            "rpg_maker.extract.store.database_not_found"
+        );
+        assert_eq!(diagnostic.effect(), StateEffect::Unchanged);
         assert!(
             !serde_json::to_string(&diagnostic)
                 .expect("Builtin 根诊断应可序列化")
@@ -3371,17 +3271,13 @@ mod tests {
             panic!("MZ 原生 Speaker 类型错误必须保持文档结构错误语义");
         };
         assert_eq!(
-            error.location,
+            error.location(),
             "data/CommonEvents.json[1].list[0].parameters[4]"
         );
         assert_eq!(error.reason, BuiltinDocumentFailure::ExpectedString);
-        assert_eq!(
-            error.reason_detail(),
-            (
-                DiagnosticFailureKind::InvalidValue,
-                "structure=expected_string".to_owned()
-            )
-        );
+        let wire =
+            serde_json::to_value(error.diagnostic_report()).expect("Builtin 文档错误必须可序列化");
+        assert_eq!(wire["primary"]["code"], "rpg_maker.builtin.expected_string");
     }
 
     #[test]

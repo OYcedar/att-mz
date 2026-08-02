@@ -51,29 +51,7 @@ cli-argument-conflict = { $argument }은(는) 함께 제공된 다른 인수와 
 cli-wrong-number-of-values = { $argument }에 제공된 값의 개수가 올바르지 않습니다.
 cli-invalid-utf8 = 명령줄 인수가 올바른 Unicode가 아닙니다.
 cli-parse-failure = 명령줄을 해석할 수 없습니다.
-log-label-phase-check-project = 프로젝트 확인
-log-label-phase-scan-source = 원본 검색
-log-label-phase-prepare-candidate = 후보 준비
-log-label-phase-update-database = 데이터베이스 업데이트
-log-label-phase-publish = 게시
-log-label-phase-builtin = 기본 제공 추출
-log-label-phase-rules = 규칙 추출
-log-label-phase-lua = Lua 처리
-log-label-phase-planning = 계획
-log-label-phase-confirmed-tasks = 작업 확인
-log-label-phase-no-work = 작업 불필요
-log-label-phase-read-assets = 자산 읽기
-log-label-phase-plan-rpg-maker-write-back = RPG Maker 쓰기 계획
-log-label-phase-rewrite-documents = 문서 다시 쓰기
-log-label-phase-validate-candidate = 후보 검증
-log-label-task-complete = 완료
-log-label-task-partial = 일부 사용 가능
-log-label-task-unavailable = 사용 불가
-log-label-task-failed = 실패
-error-state-applied-finalization = 결과는 적용되었지만 마무리에 실패했습니다. 재시도 전에 프로젝트 상태를 확인하세요.
 error-no-executable-extract-owner = 지운 뒤 실행 가능한 Extract owner가 없어 계획을 저장하지 않았습니다.
-error-plan-save-failed-applied = 명령 결과는 적용되었지만 새 실행 계획을 저장하지 못했습니다. 다음 실행에서는 의도한 옵션을 명시하세요.
-error-plan-save-outcome-unknown = 명령 결과는 적용되었지만 실행 계획 커밋 결과를 확인할 수 없습니다. 다음 실행에서는 의도한 옵션을 명시하세요.
 plan-source-explicit = 명시적 입력
 plan-source-project-state = 프로젝트 상태
 plan-source-product-default = 제품 동작
@@ -141,35 +119,68 @@ log-lua-print = Lua: { $message }
 log-lua-summary = Lua 실행 통계: 데이터베이스 호출 { $database_calls }회, 변경 행 { $changed_rows }개, 번역 호출 { $translation_calls }회, print { $printed_lines }줄.
 log-plan-resolved = 명령 { $command }의 계획 출처: { $source }.
 log-phase-started = 단계 시작: { $phase }.
-log-phase-finished = 단계 완료: { $phase }.
 log-retry-summary = { $count }회 재시도했습니다.
-log-no-work = 작업이 필요하지 않았습니다: { $reason }.
-log-no-work-translation-up-to-date = 번역이 현재 원본 및 프로필과 일치합니다
-log-partial-result = 주의가 필요한 부분 결과가 { $count }개 있습니다.
 log-translation-task-started = 번역 작업 { $index }/{ $total } 시작.
 log-translation-task-finished = 번역 작업 { $index }이 결과 { $outcome }으로 종료되었습니다.
-log-translation-task-diagnostic = 번역 작업 { $index }이 { $attempts }회 시도 후 진단을 보고했습니다: { $diagnostic }
+log-run-recovery-required = 명령 { $command }이 복구가 필요한 상태로 끝났습니다. 진단에 표시된 복구 위치를 확인하십시오.
+log-phase-completed = 단계 완료: { $phase }.
+log-phase-stopped = { $outcome ->
+    [failed] 단계 실패: { $phase }.
+    [cancelled] 단계 취소됨: { $phase }.
+   *[other] 단계 중지됨: { $phase }.
+}
+log-cancellation-requested = { $total }개 중 { $confirmed }개를 확인한 뒤 취소가 요청되었습니다.
+log-cancellation-requested-indeterminate = { $confirmed }개를 확인한 뒤 취소가 요청되었습니다. 전체 개수는 알 수 없습니다.
+log-run-plan-finalized = { $result ->
+    [saved] 실행 계획을 저장했습니다.
+    [not_saved] 실행 계획을 저장하지 못했습니다.
+    [saved_finalization_failed] 실행 계획은 저장했지만 마무리 작업이 실패했습니다.
+    [outcome_unknown] 실행 계획의 최종 상태를 알 수 없습니다.
+   *[other] 실행 계획 마무리가 알 수 없는 결과로 중지되었습니다.
+}
+log-translation-finished = { $result ->
+    [not_started] 번역이 시작되지 않았습니다.
+    [no_work] 번역할 내용이 없어 종료되었습니다.
+    [complete] 번역이 완료되었습니다.
+    [incomplete] 완료되지 않은 작업이 남은 채 번역이 종료되었습니다.
+    [failed] 번역이 실패했습니다.
+    [cancelled] 번역이 취소되었습니다.
+   *[other] 번역이 알 수 없는 결과로 중지되었습니다.
+}
+log-publication-started = 출력 루트 { $path }에 게시를 시작했습니다.
+log-publication-finished = { $result ->
+    [published] 게시가 완료되었습니다.
+    [not_published] 게시가 출력을 변경하지 않았습니다.
+    [recovery_required] 게시가 중지되었으며 복구가 필요합니다.
+    [outcome_unknown] 게시의 최종 상태를 알 수 없습니다.
+   *[other] 게시가 알 수 없는 결과로 중지되었습니다.
+}
+log-project-log-degraded = 프로젝트 로그에 문제가 발생하여 { $failure_kinds }개 장애 범주를 기록했습니다.
+log-task-outcome-value = { $outcome ->
+    [complete] 완료
+    [partial] 일부 완료
+    [unavailable] 사용 불가
+    [failed] 실패
+    [not_committed_after_earlier_failure] 이전 실패로 미커밋
+    [cancelled] 취소됨
+   *[other] 알 수 없는 결과로 종료
+}
 diagnostic-title = 오류 [{ $code }]
 diagnostic-stage = 단계: { $stage }
-diagnostic-subject = 위치: { $subject }
-diagnostic-subject-value = { $kind ->
-    [command] 명령 { $value }
-    [field] 필드 { $value }
-    [project] 프로젝트 { $value }
-    [profile] 프로필 { $value }
-    [component] 구성 요소 { $value }
-   *[other] { $value }
-}
-diagnostic-reason = 원인: { $reason }
-diagnostic-impact = 영향: { $impact }
-diagnostic-action = 조치: { $action }
-diagnostic-recovery = 복구 위치: { $recovery }
-diagnostic-recovery-value = { $kind ->
-    [component] 구성 요소 { $value }
-    [transaction] 트랜잭션 { $value }
-   *[other] { $value }
-}
+diagnostic-location = 위치: { $subject }
+diagnostic-explanation = 원인: { $reason }
+diagnostic-effect = 영향: { $impact }
+diagnostic-resolution = 조치: { $action }
 diagnostic-related = 관련 오류 { $index }:
+diagnostic-relation-value = { $code ->
+    [cleanup] 정리
+    [rollback] 롤백
+    [discard] 폐기
+    [finalization] 마무리
+    [shutdown] 종료
+    [observability] 관측성
+   *[other] { $code }
+}
 diagnostic-stage-value = { $code ->
     [process_startup] 프로세스 시작
     [process_output] 프로세스 출력
@@ -186,23 +197,27 @@ diagnostic-stage-value = { $code ->
     [publication] 게시
     [shutdown] 종료
     [logging] 프로젝트 로그
+    [runtime] 런타임
    *[other] __ATT_FALLBACK__
 }
-diagnostic-impact-value = { $code ->
+diagnostic-effect-value = { $code ->
     [unchanged] 상태가 변경되지 않았습니다
-    [valid_progress_preserved] 유효한 진행 상황을 보존했습니다
-    [result_applied_but_run_plan_not_saved] 결과는 적용되었지만 실행 계획은 저장되지 않았습니다
-    [state_applied_but_finalization_failed] 상태는 적용되었지만 마무리가 완료되지 않았습니다
+    [progress_preserved] 유효한 진행 상황을 보존했습니다
+    [applied] 상태를 적용했습니다
+    [applied_run_plan_not_saved] 상태는 적용되었지만 실행 계획은 저장되지 않았습니다
+    [applied_finalization_failed] 상태는 적용되었지만 마무리가 완료되지 않았습니다
     [recovery_required] 상태를 신뢰하기 전에 복구가 필요합니다
     [outcome_unknown] 최종 상태를 알 수 없습니다
    *[other] __ATT_FALLBACK__
 }
-diagnostic-action-value = { $code ->
+diagnostic-resolution-value = { $code ->
     [fix_configuration] 표시된 구성 필드를 수정한 후 다시 시도하세요
     [fix_input] 표시된 입력을 수정한 후 다시 시도하세요
+    [fix_placeholder_rules] 표시된 Placeholder 규칙을 수정한 후 다시 시도하세요
+    [adjust_manual_layout] 표시된 위치와 표시 너비에 맞게 줄바꿈과 레이아웃을 수동으로 조정하세요
     [check_path_and_permissions] 경로, 파일 시스템 상태 및 권한을 확인하세요
     [check_project_state] 프로젝트 상태를 확인하고 수정한 후 다시 시도하세요
-    [retry_after_resolving_contention] 충돌하는 작업이 끝날 때까지 기다린 후 다시 시도하세요
+    [resolve_contention] 충돌하는 작업이 끝날 때까지 기다린 후 다시 시도하세요
     [check_model_service] 모델 서비스 응답과 계정 한도를 확인하세요
     [preserve_recovery_artifacts] 나열된 복구 산출물을 삭제하지 말고, 출력을 복구한 후 다시 시도하세요
     [retry] 작업을 다시 시도하세요
@@ -211,16 +226,14 @@ diagnostic-action-value = { $code ->
 }
 diagnostic-failure-value = { $code ->
     [missing_required_value] 필수 값이 없습니다
-    [extract_plan_required] 재사용할 수 있는 Extract 계획이 저장되어 있지 않습니다. --builtin 또는 --rules를 지정하세요
     [generic_extract_required] JSONL 입력이 최근 Extract와 일치하지 않습니다. att generic extract를 다시 실행하세요
     [conflicting_values] 제공한 값이 서로 충돌합니다
     [invalid_syntax] 값의 구문이 잘못되었습니다
     [invalid_encoding] 텍스트 인코딩이 잘못되었습니다
     [invalid_value] 값이 필수 계약을 위반합니다
     [not_found] 필요한 객체가 없습니다
-    [busy] 다른 작업이 리소스를 사용 중입니다
     [state_mismatch] 저장된 프로젝트 상태가 이 작업의 요구 사항을 충족하지 않습니다
-    [requirement_failed] 필수 선행 조건이 충족되지 않았습니다
+    [unsupported_windows_code_page] Windows 코드 페이지가 UTF-8이 아닙니다
     [transaction_rolled_back] 트랜잭션이 실패하여 변경 사항을 롤백했습니다
     [transaction_outcome_unknown] 트랜잭션의 커밋 또는 롤백 결과를 확인할 수 없습니다
     [finalization_failed] 작업 결과는 존재하지만 마무리에 실패했습니다
@@ -250,81 +263,32 @@ diagnostic-failure-value = { $code ->
     [response_parsing_failed] 모델 응답이 유효한 JSON이 아닙니다
     [invalid_response_contract] 모델 응답이 필수 응답 계약을 충족하지 않습니다
     [transport_failed] 유효한 응답을 받기 전에 HTTP 전송이 실패했습니다
-    [lua_database_open_failed] Lua 호스트가 프로젝트 데이터베이스 세션을 열 수 없습니다
-    [lua_context_creation_failed] Lua 런타임이 VM 컨텍스트를 만들 수 없습니다
     [lua_compilation_failed] Lua 주 프로그램을 컴파일할 수 없습니다
     [lua_execution_failed] Lua 주 프로그램 실행 중 오류가 발생했습니다
-    [lua_host_call_failed] Lua 호스트 기능 호출에 실패했습니다
-    [lua_finalization_failed] Lua 호스트가 바인딩된 모든 리소스를 마무리할 수 없습니다
-    [rules_definition_invalid] Rules 프로그램이 Rules 정의 계약을 충족하지 않습니다
-    [rules_document_read_failed] Rules 프로그램에 필요한 원본 문서를 읽을 수 없습니다
-    [rules_no_non_blank_match] Rules 항목이 공백이 아닌 의미 단위를 만들지 못했습니다
-    [rules_invalid_target] Rules 항목이 텍스트 대상으로 사용할 수 없는 값을 선택했습니다
     [rules_pattern_match_failed] Rules PCRE2 패턴을 평가할 수 없습니다
     [rules_zero_width_match] Rules 패턴이 너비가 0인 일치를 만들었습니다
     [rules_overlapping_capture] Rules 패턴이 겹치는 텍스트 캡처를 만들었습니다
     [rules_missing_text_capture] 필수 명명 텍스트 캡처가 일치에 참여하지 않았습니다
     [rules_invalid_capture_range] Rules 일치 또는 캡처 범위가 유효한 UTF-8 문자 경계를 벗어났습니다
-    [rules_duplicate_target] 두 Rules 항목이 같은 실제 텍스트 대상을 요구합니다
-    [rules_invalid_materialization] Rules 투영 레시피로 원본 값을 재구성할 수 없습니다
-    [rules_snapshot_invalid] 추출된 Rules 그룹이 유효한 자산 스냅샷을 구성하지 않습니다
-    [rules_snapshot_store_failed] 검증된 Rules 추출 스냅샷을 커밋할 수 없습니다
-    [write_back_extraction_out_of_date] 추출한 자산이 현재 프로젝트 원본과 더 이상 일치하지 않습니다
-    [write_back_asset_snapshot_invalid] 저장된 RPG Maker 자산이 유효한 쓰기 반영 스냅샷을 구성하지 않습니다
-    [source_document_invalid] RPG Maker 원본 문서가 필수 문서 형식을 충족하지 않습니다
-    [generic_source_document_invalid] Generic JSONL 원본 문서가 필수 형식을 충족하지 않습니다
-    [write_back_mutation_invalid] 검증된 번역 변경을 고정된 원본 위치에 적용할 수 없습니다
-    [write_back_output_path_invalid] 다시 쓴 파일이 허용된 RPG Maker 출력 트리 밖에 있습니다
-    [write_back_output_path_duplicate] 둘 이상의 다시 쓴 파일이 같은 출력 경로를 대상으로 합니다
-    [write_back_candidate_project_mismatch] 준비된 쓰기 반영 후보가 다른 프로젝트에 속합니다
     [write_back_candidate_invalid] 쓰기 반영 후보가 필수 data/js 트리 구조를 충족하지 않습니다
-    [write_back_not_published] 쓰기 반영 후보가 현재 출력 디렉터리를 대체하지 않았습니다
-    [write_back_published_with_residuals] 출력을 게시했지만 일부 복구 산출물을 제거할 수 없습니다
     [write_back_recovery_required] 내용을 신뢰하기 전에 출력 디렉터리를 복구해야 합니다
+    [already_exists] 대상 개체가 이미 존재합니다
+    [cancelled] 작업이 취소되었습니다
+    [concurrent_modification] 프로젝트 상태가 동시에 변경되었습니다
+    [duplicate_identifier] 식별자가 중복되었습니다
+    [extraction_out_of_date] 저장된 추출 결과가 현재 원본과 더 이상 일치하지 않습니다
+    [invalid_content] 내용이 필수 계약을 위반합니다
+    [manual_layout_required] 줄 바꿈 또는 레이아웃을 수동으로 조정해야 합니다
+    [operation_failed] 작업에 실패했습니다
+    [placeholder_projection_failed] Placeholder 투영이 필수 구조를 보존하지 못했습니다
+    [profile_not_found] 선택한 번역 Profile이 존재하지 않습니다
+    [recovery_required] 결과를 신뢰하려면 먼저 복구해야 합니다
+    [resource_limit] 필요한 리소스 한도에 도달했습니다
+    [resource_limit_exceeded] 작업이 백엔드 리소스 한도를 초과했습니다
+    [source_snapshot_mismatch] 원본이 저장된 스냅샷과 더 이상 일치하지 않습니다
+    [unavailable] 요청한 작업을 일시적으로 사용할 수 없습니다
     [internal_invariant] 내부 불변 조건을 위반했습니다. ATT 결함입니다
    *[other] __ATT_FALLBACK__
-}
-diagnostic-io-kind-value = { $code ->
-    [not_found] 찾을 수 없음
-    [permission_denied] 권한이 거부됨
-    [connection_refused] 연결이 거부됨
-    [connection_reset] 연결이 재설정됨
-    [host_unreachable] 호스트에 연결할 수 없음
-    [network_unreachable] 네트워크에 연결할 수 없음
-    [connection_aborted] 연결이 중단됨
-    [not_connected] 연결되지 않음
-    [address_in_use] 주소가 이미 사용 중임
-    [address_not_available] 주소를 사용할 수 없음
-    [network_down] 네트워크가 중단됨
-    [broken_pipe] 파이프가 끊어짐
-    [already_exists] 이미 존재함
-    [would_block] 작업이 차단됨
-    [not_a_directory] 디렉터리가 아님
-    [is_a_directory] 디렉터리임
-    [directory_not_empty] 디렉터리가 비어 있지 않음
-    [read_only_filesystem] 읽기 전용 파일 시스템
-    [stale_network_file_handle] 네트워크 파일 핸들이 만료됨
-    [invalid_input] 작업 입력이 잘못됨
-    [invalid_data] 데이터가 잘못됨
-    [timed_out] 작업 시간 초과
-    [write_zero] 쓰기가 진행되지 않음
-    [storage_full] 저장 공간이 가득 참
-    [not_seekable] 객체에서 탐색할 수 없음
-    [quota_exceeded] 저장 공간 할당량 초과
-    [file_too_large] 파일이 기반 시스템에서 처리할 수 있는 크기를 초과함
-    [resource_busy] 리소스가 사용 중임
-    [executable_file_busy] 실행 파일이 사용 중임
-    [deadlock] 작업이 교착 상태를 일으킴
-    [crosses_devices] 작업이 파일 시스템 장치를 가로지름
-    [too_many_links] 파일 시스템 링크가 너무 많음
-    [invalid_filename] 파일 이름이 잘못됨
-    [argument_list_too_long] 운영 체제 인수 목록이 너무 김
-    [interrupted] 작업이 중단됨
-    [unsupported] 지원되지 않는 작업
-    [unexpected_eof] 예기치 않은 파일 끝
-    [out_of_memory] 운영 체제가 메모리를 할당할 수 없음
-    [other] 기타 운영 체제 오류
-   *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
     [language_policy_term_blank] 언어 정책 용어는 비워 둘 수 없습니다
@@ -367,47 +331,6 @@ diagnostic-configuration-rule-value = { $code ->
     [referenced_client_not_found] 참조된 LLM 클라이언트가 없습니다
    *[other] __ATT_FALLBACK__
 }
-diagnostic-io-reason = 작업 { $operation }: { $kind }
-diagnostic-io-reason-with-os-code = 작업 { $operation }: { $kind }(OS { $os_code })
-diagnostic-io-reason-with-system-message = 작업 { $operation }: { $kind }: { $system_message }
-diagnostic-io-reason-with-os-code-and-system-message = 작업 { $operation }: { $kind }(OS { $os_code }): { $system_message }
-diagnostic-failure-with-detail = { $failure }: { $detail }
-diagnostic-invalid-utf8 = 바이트 { $valid_up_to }의 UTF-8이 잘못되었습니다. 잘못된 길이는 { $error_len }바이트입니다
-diagnostic-incomplete-utf8 = 바이트 { $valid_up_to } 뒤의 UTF-8 시퀀스가 불완전합니다
-diagnostic-toml-failure-value = { $code ->
-    [syntax] TOML 구문이 잘못되었습니다
-    [missing_field] 필수 구성 필드가 없습니다
-    [unknown_field] 구성에 알 수 없는 필드가 있습니다
-    [duplicate_field] 구성 필드가 두 번 이상 선언되었습니다
-    [type_mismatch] { $expected }이어야 합니다
-    [invalid_value] 구성 값이 필드 계약을 위반합니다
-   *[other] __ATT_FALLBACK__
-}
-diagnostic-toml-expected-kind-value = { $code ->
-    [string] 문자열
-    [integer] 정수
-    [boolean] 부울 값
-    [string_or_boolean] 문자열 또는 부울 값
-    [string_array] 문자열 배열
-    [integer_array] 정수 배열
-    [string_pair_array] 문자열 쌍 배열
-    [table] 테이블
-    [table_array] 테이블 배열
-   *[other] __ATT_FALLBACK__
-}
-diagnostic-invalid-toml = 잘못된 TOML({ $resource }): { $failure }
-diagnostic-invalid-toml-at = { $line }줄 { $column }열의 TOML이 잘못되었습니다({ $resource }): { $failure }
-diagnostic-http-no-details = 모델 서비스 요청이 실패했지만 공개 가능한 HTTP 상태 세부 정보가 없습니다
-diagnostic-http-status = HTTP 상태 { $status }
-diagnostic-http-retry-after = Retry-After { $seconds }초
-diagnostic-http-provider-code = 공급자 오류 코드 { $code }
-diagnostic-http-provider-type = 공급자 오류 형식 { $kind }
-diagnostic-http-provider-message = 공급자 오류 메시지 { $message }
-diagnostic-http-fact-separator = ;{ " " }
-diagnostic-sqlite = SQLite 기본 오류 코드 { $primary_code }, 확장 오류 코드 { $extended_code }
-diagnostic-windows-status = Windows 작업 { $operation }이 실패했습니다. NTSTATUS { $status }
-diagnostic-resource = { $resource }: 실제 { $actual }
-diagnostic-resource-with-maximum = { $resource }: 실제 { $actual }, 최댓값 { $maximum }
 task-record-title = 번역 작업 { $ordinal } · { $state }
 task-record-state-label = { $state ->
     [complete] 완료
@@ -466,45 +389,6 @@ task-record-final-status = 상태: { $state ->
 }
 task-record-accepted-written = 수락: { $accepted }개 항목, 실제 위치 { $written }곳에 기록
 task-record-accepted-outcome-unknown = 검수 완료: { $accepted }개 항목; 데이터베이스 커밋 결과를 확인할 수 없음
-task-record-rejected-heading = 수락되지 않음:
-task-record-rejected-item = { $id }: { $reason }
-task-record-protocol-diagnostic = 프로토콜 진단: { $diagnostic }
-task-record-unavailable-reason = 사용 불가 원인: { $reason }
 task-record-task-diagnostic = 작업 진단: `{ $code }`; 원인 { $reason }
-task-record-rejection-reason = { $code ->
-    [missing] 모델 출력 누락
-    [duplicate] 모델 출력 중복
-    [invalid_shape] { $detail }
-    [invalid_shape_array] 번역은 문자열 배열이어야 합니다
-    [invalid_shape_item] 번역 배열의 { $line }번째 항목은 문자열이어야 합니다
-    [line_count_mismatch] 줄 수 불일치(예상 { $expected }, 실제 { $actual })
-    [invalid_line_text] { $line }번째 줄에 잘못된 제어 문자가 있음
-    [blank_line_mismatch] { $line }번째 줄의 공백 상태 불일치(예상: { $expected_blank ->
-        [blank] 공백
-       *[other] 공백 아님
-    })
-    [blank_translation] 번역문이 비어 있음
-    [no_natural_language_text] 번역문에 자연어 텍스트가 없음
-    [contains_byte_order_mark] 번역문에 BOM이 포함됨
-    [placeholder_mismatch] 자리표시자 불일치: { $detail }
-    [unexpected_placeholder] 알 수 없는 자리표시자: { $detail }
-    [placeholder_normalization_ambiguous] 자리표시자 정규화가 모호함: { $detail }
-    [source_residual] 원문 언어 잔류 감지: { $detail }
-   *[other] { $detail }
-}
-task-record-protocol-detail = { $code ->
-    [non_stop_finish] finish reason이 stop이 아님: { $detail }
-    [invalid_response] { $detail }
-    [invalid_id] 모델의 { $index }번째 항목 ID가 잘못됨
-    [unknown_id] 모델의 { $index }번째 항목이 알 수 없는 ID { $detail }을 반환함
-   *[other] { $detail }
-}
-task-record-unavailable-detail = { $code ->
-    [model_response_unusable] 모델 응답을 구문 분석할 수 없음
-    [all_outputs_rejected] 모든 모델 출력이 검수에서 거부됨
-    [recoverable_request_exhausted] 복구 가능한 요청의 재시도 예산 소진
-    [retry_after_exceeds_maximum] Retry-After가 설정된 최대 대기 시간을 초과함
-   *[other] { $code }
-}
 task-record-duration-seconds = { $value }초
 task-record-duration-milliseconds = { $value }밀리초

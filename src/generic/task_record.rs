@@ -9,7 +9,7 @@ use std::time::Duration;
 use serde_json::value::RawValue;
 use time::OffsetDateTime;
 
-use crate::diagnostic::SafeDiagnostic;
+use crate::diagnostic::{DiagnosticReport, render_diagnostic_report};
 use crate::execution::llm_request::LlmRequestAttemptRecord;
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
 use crate::llm::{ChatMessage, ChatMessageRole, LlmClientRecordMetadata};
@@ -23,8 +23,6 @@ use crate::translation_protocol::{
     ParsedTranslationResponse, TranslationTaskResponseParseError,
     TranslationTaskResponseParseErrorKind,
 };
-
-use super::ResponseProblem;
 
 #[derive(Debug)]
 pub(crate) enum GenericTaskResponseRecord {
@@ -96,118 +94,12 @@ impl GenericTaskResponseRecord {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GenericTaskRecordIssue {
-    id: String,
-    code: &'static str,
-    detail: Option<String>,
-}
-
-impl GenericTaskRecordIssue {
-    pub(crate) fn from_response_problem_with_cancellation<E>(
-        problem: &ResponseProblem,
-        mut ensure_running: impl FnMut() -> Result<(), E>,
-    ) -> Result<Self, E> {
-        ensure_running()?;
-        let issue = match problem {
-            ResponseProblem::InvalidId(id) => Self {
-                id: clone_task_record_text(id, &mut ensure_running)?,
-                code: "invalid_id",
-                detail: None,
-            },
-            ResponseProblem::UnexpectedId(id) => Self {
-                id: id.to_string(),
-                code: "unexpected_id",
-                detail: None,
-            },
-            ResponseProblem::DuplicateId(id) => Self {
-                id: id.to_string(),
-                code: "duplicate_id",
-                detail: None,
-            },
-            ResponseProblem::MissingId(id) => Self {
-                id: id.to_string(),
-                code: "missing_id",
-                detail: None,
-            },
-            ResponseProblem::InvalidValue { output_id, detail } => Self {
-                id: output_id.to_string(),
-                code: "invalid_value",
-                detail: Some(clone_task_record_text(detail, &mut ensure_running)?),
-            },
-            ResponseProblem::InvalidTranslation { output_id, detail } => Self {
-                id: output_id.to_string(),
-                code: "invalid_translation",
-                detail: Some(clone_task_record_text(detail, &mut ensure_running)?),
-            },
-            ResponseProblem::InvalidDestination {
-                output_id,
-                key,
-                detail,
-            } => Self {
-                id: {
-                    let mut id = output_id.to_string();
-                    id.push(':');
-                    append_task_record_text(&mut id, key.group_id(), &mut ensure_running)?;
-                    id.push('/');
-                    append_task_record_text(&mut id, key.unit_id(), &mut ensure_running)?;
-                    id
-                },
-                code: "invalid_destination_translation",
-                detail: Some(clone_task_record_text(detail, &mut ensure_running)?),
-            },
-        };
-        ensure_running()?;
-        Ok(issue)
-    }
-
-    pub(crate) fn commit_conflicts(count: usize) -> Self {
-        Self {
-            id: "commit".to_owned(),
-            code: "cas_conflict",
-            detail: Some(format!("{count} 个 Unit 在提交前已发生变化")),
-        }
-    }
-}
-
-fn clone_task_record_text<E>(
-    text: &str,
-    ensure_running: &mut impl FnMut() -> Result<(), E>,
-) -> Result<String, E> {
-    let mut output = String::with_capacity(text.len());
-    append_task_record_text(&mut output, text, ensure_running)?;
-    Ok(output)
-}
-
-fn append_task_record_text<E>(
-    output: &mut String,
-    text: &str,
-    ensure_running: &mut impl FnMut() -> Result<(), E>,
-) -> Result<(), E> {
-    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
-
-    let mut start = 0_usize;
-    while start < text.len() {
-        ensure_running()?;
-        let mut end = start
-            .saturating_add(CANCELLATION_CHECK_BYTES)
-            .min(text.len());
-        while end < text.len() && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        output.push_str(&text[start..end]);
-        start = end;
-    }
-    ensure_running()
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct GenericTaskRecordState {
     code: &'static str,
     accepted: usize,
     written: usize,
-    issues: Vec<GenericTaskRecordIssue>,
-    diagnostic: Option<SafeDiagnostic>,
+    diagnostics: Vec<DiagnosticReport>,
 }
 
 impl GenericTaskRecordState {
@@ -215,32 +107,26 @@ impl GenericTaskRecordState {
         complete: bool,
         accepted: usize,
         written: usize,
-        issues: Vec<GenericTaskRecordIssue>,
+        diagnostics: Vec<DiagnosticReport>,
     ) -> Self {
         Self {
-            code: if complete && issues.is_empty() {
+            code: if complete && diagnostics.is_empty() {
                 "complete"
             } else {
                 "partial"
             },
             accepted,
             written,
-            issues,
-            diagnostic: None,
+            diagnostics,
         }
     }
 
-    pub(crate) fn unavailable(code: &'static str) -> Self {
+    pub(crate) fn unavailable(diagnostic: DiagnosticReport) -> Self {
         Self {
             code: "unavailable",
             accepted: 0,
             written: 0,
-            issues: vec![GenericTaskRecordIssue {
-                id: "task".to_owned(),
-                code,
-                detail: None,
-            }],
-            diagnostic: None,
+            diagnostics: vec![diagnostic],
         }
     }
 
@@ -249,8 +135,7 @@ impl GenericTaskRecordState {
             code: "cancelled",
             accepted: 0,
             written: 0,
-            issues: Vec::new(),
-            diagnostic: None,
+            diagnostics: Vec::new(),
         }
     }
 
@@ -259,22 +144,16 @@ impl GenericTaskRecordState {
             code: "not_committed",
             accepted: 0,
             written: 0,
-            issues: vec![GenericTaskRecordIssue {
-                id: "task".to_owned(),
-                code: "prior_task_failed",
-                detail: None,
-            }],
-            diagnostic: None,
+            diagnostics: Vec::new(),
         }
     }
 
-    pub(crate) fn failed(diagnostic: SafeDiagnostic) -> Self {
+    pub(crate) fn failed(diagnostic: DiagnosticReport) -> Self {
         Self {
             code: "execution_failed",
             accepted: 0,
             written: 0,
-            issues: Vec::new(),
-            diagnostic: Some(diagnostic),
+            diagnostics: vec![diagnostic],
         }
     }
 }
@@ -481,43 +360,22 @@ fn render_generic_task_record(
             }
         )
     );
-    if !document.state.issues.is_empty() {
-        let _ = writeln!(
-            output,
-            "- {}",
-            task_record_text(&localizer, UiMessage::TaskRecordRejectedHeading)
-        );
-        for issue in &document.state.issues {
-            let detail = issue.detail.as_deref().unwrap_or(issue.code);
-            let reason = markdown_inline_code(&redactor.redact(detail));
-            let id = markdown_inline_code(&redactor.redact(&issue.id));
-            let _ = writeln!(
-                output,
-                "  - {}",
-                task_record_text(
-                    &localizer,
-                    UiMessage::TaskRecordRejectedItem {
-                        id: &id,
-                        reason: &reason,
-                    }
-                )
-            );
-        }
-    }
-    if let Some(diagnostic) = &document.state.diagnostic {
-        let reason =
-            markdown_inline_code(&redactor.redact(&diagnostic.reason.render_localized(&localizer)));
+    for diagnostic in &document.state.diagnostics {
+        let code = diagnostic.primary().code();
+        let reason = markdown_inline_code(code);
         let _ = writeln!(
             output,
             "- {}",
             task_record_text(
                 &localizer,
                 UiMessage::TaskRecordTaskDiagnostic {
-                    code: diagnostic.code.as_str(),
+                    code,
                     reason: &reason,
                 }
             )
         );
+        let rendered = redactor.redact(&render_diagnostic_report(diagnostic, &localizer));
+        output.push_str(&markdown_fence(&rendered, "text"));
     }
     Ok(output)
 }

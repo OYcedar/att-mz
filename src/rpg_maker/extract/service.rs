@@ -91,36 +91,26 @@ where
             return Ok(OperationCompletion::Cancelled);
         }
 
-        let total_owners = u64::from(self.built_in_extraction.is_some() as u8)
-            + u64::from(self.selected_rules.is_some() as u8);
-        let mut completed_owners = 0_u64;
         let mut committed_owners = Vec::new();
         let mut rules_warnings = Vec::new();
 
         if let Some(built_in_extraction) = &self.built_in_extraction {
-            self.observe_owner(
-                ExtractProgressPhase::Builtin,
-                completed_owners,
-                total_owners,
-            );
+            // Builtin 与 Rules 是两个独立的生命周期阶段。不能用跨 owner 的累计
+            // 分母，否则 Builtin 的完成快照会被误解为 Rules 尚未开始。
+            self.observe_owner(ExtractProgressPhase::Builtin, 0, 1);
             built_in_extraction
                 .refresh(&project, self.progress.clone())
                 .await
                 .map_err(ExtractServiceError::BuiltIn)?;
-            completed_owners += 1;
             committed_owners.push(RpgMakerAssetOwner::Builtin);
-            self.observe_owner(
-                ExtractProgressPhase::Builtin,
-                completed_owners,
-                total_owners,
-            );
+            self.observe_owner(ExtractProgressPhase::Builtin, 1, 1);
             if self.selected_rules.is_some() && self.cancellation.is_requested() {
                 return Ok(OperationCompletion::Cancelled);
             }
         }
 
         if let Some(selected_rules) = &self.selected_rules {
-            self.observe_owner(ExtractProgressPhase::Rules, completed_owners, total_owners);
+            self.observe_owner(ExtractProgressPhase::Rules, 0, 1);
             let error_path = selected_rules.program().diagnostic_path().to_path_buf();
             let rules_output = selected_rules
                 .executor()
@@ -136,8 +126,7 @@ where
                     source,
                 })?;
             rules_warnings = rules_output.warnings;
-            completed_owners += 1;
-            self.observe_owner(ExtractProgressPhase::Rules, completed_owners, total_owners);
+            self.observe_owner(ExtractProgressPhase::Rules, 1, 1);
         }
 
         Ok(OperationCompletion::Completed(ExtractOutput {
@@ -208,5 +197,217 @@ where
             Self::BuiltIn(source) => Some(source),
             Self::Rules { source, .. } => Some(source),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::progress::{ProgressAmount, ProgressSnapshot};
+    use crate::project_lease::{ProjectCommandLease, ProjectCommandLeaseProvider};
+    use crate::project_name::ProjectName;
+    use crate::rpg_maker::extract::builtin::BuiltInExtraction;
+    use crate::rpg_maker::extract::rules::{RulesExtraction, RulesExtractionOutput, RulesProgram};
+    use crate::rpg_maker::project::{OpenedProject, test_layout_profile};
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct FakeError;
+
+    impl fmt::Display for FakeError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("fake error")
+        }
+    }
+
+    impl Error for FakeError {}
+
+    #[derive(Clone)]
+    struct FakeProjectOpener {
+        project: OpenedProject,
+    }
+
+    impl ExistingProjectOpener for FakeProjectOpener {
+        type Error = FakeError;
+
+        async fn open(&self, _name: &ProjectName) -> Result<OpenedProject, Self::Error> {
+            Ok(self.project.clone())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct FakeLease;
+
+    impl ProjectCommandLeaseProvider for FakeLease {
+        type Error = FakeError;
+        type LeaseState = ();
+
+        async fn acquire(
+            &self,
+            _project: &ProjectName,
+        ) -> Result<ProjectCommandLease<Self::LeaseState>, ProjectCommandLeaseError<Self::Error>>
+        {
+            Ok(ProjectCommandLease::for_test(()))
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct FakeBuiltIn;
+
+    impl BuiltInExtraction for FakeBuiltIn {
+        type Error = FakeError;
+
+        async fn refresh(
+            &self,
+            _project: &OpenedProject,
+            progress: ExtractProgress,
+        ) -> Result<(), Self::Error> {
+            progress.determinate(ExtractProgressPhase::BuiltinDocuments, 0, 0);
+            progress.indeterminate(ExtractProgressPhase::BuiltinCommit);
+            progress.determinate(ExtractProgressPhase::BuiltinCommit, 1, 1);
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct FakeRules;
+
+    impl RulesExtraction for FakeRules {
+        type Error = FakeError;
+
+        async fn replace(
+            &self,
+            _project: &OpenedProject,
+            _program: RulesProgram,
+            progress: ExtractProgress,
+        ) -> Result<RulesExtractionOutput, Self::Error> {
+            progress.determinate(ExtractProgressPhase::RulesMatches, 0, 0);
+            progress.indeterminate(ExtractProgressPhase::RulesCommit);
+            progress.determinate(ExtractProgressPhase::RulesCommit, 1, 1);
+            Ok(RulesExtractionOutput::default())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingProgress {
+        snapshots: Arc<Mutex<Vec<ProgressSnapshot<ExtractProgressPhase>>>>,
+    }
+
+    impl RecordingProgress {
+        fn snapshots(&self) -> Vec<ProgressSnapshot<ExtractProgressPhase>> {
+            self.snapshots.lock().expect("进度记录锁不应中毒").clone()
+        }
+    }
+
+    impl ProgressObserver<ExtractProgressPhase> for RecordingProgress {
+        fn observe(&self, snapshot: ProgressSnapshot<ExtractProgressPhase>) {
+            self.snapshots
+                .lock()
+                .expect("进度记录锁不应中毒")
+                .push(snapshot);
+        }
+    }
+
+    #[tokio::test]
+    async fn builtin_and_rules_owner_phases_each_complete_before_the_next_phase_starts() {
+        let project = OpenedProject::new(
+            "demo".parse().expect("项目名应合法"),
+            PathBuf::from("C:/projects/demo"),
+            PathBuf::from("C:/projects/demo/project.db"),
+            "ja".to_owned(),
+            "zh-Hans".to_owned(),
+            test_layout_profile(),
+        );
+        let progress = RecordingProgress::default();
+        let rules = RulesProgram::from_toml(PathBuf::from("rules.toml"), b"rule = []".to_vec())
+            .expect("测试 Rules 应合法");
+        let extract = ExtractService::new(
+            FakeProjectOpener { project },
+            Some(FakeBuiltIn),
+            Some(SelectedRules::new(rules, FakeRules)),
+            FakeLease,
+            CooperativeCancellation::default(),
+        )
+        .with_progress(progress.clone());
+
+        let completion = extract
+            .execute(ExtractInput {
+                name: "demo".parse().expect("项目名应合法"),
+            })
+            .await
+            .expect("Extract 应成功");
+        assert!(matches!(completion, OperationCompletion::Completed(_)));
+
+        let lifecycle_phases = progress
+            .snapshots()
+            .into_iter()
+            .filter(|snapshot| {
+                matches!(
+                    snapshot.phase,
+                    ExtractProgressPhase::Builtin
+                        | ExtractProgressPhase::BuiltinCommit
+                        | ExtractProgressPhase::Rules
+                        | ExtractProgressPhase::RulesCommit
+                )
+            })
+            .map(|snapshot| (snapshot.phase, snapshot.amount))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lifecycle_phases,
+            [
+                (
+                    ExtractProgressPhase::Builtin,
+                    ProgressAmount::Determinate {
+                        completed: 0,
+                        total: 1,
+                    },
+                ),
+                (
+                    ExtractProgressPhase::BuiltinCommit,
+                    ProgressAmount::Indeterminate,
+                ),
+                (
+                    ExtractProgressPhase::BuiltinCommit,
+                    ProgressAmount::Determinate {
+                        completed: 1,
+                        total: 1,
+                    },
+                ),
+                (
+                    ExtractProgressPhase::Builtin,
+                    ProgressAmount::Determinate {
+                        completed: 1,
+                        total: 1,
+                    },
+                ),
+                (
+                    ExtractProgressPhase::Rules,
+                    ProgressAmount::Determinate {
+                        completed: 0,
+                        total: 1,
+                    },
+                ),
+                (
+                    ExtractProgressPhase::RulesCommit,
+                    ProgressAmount::Indeterminate,
+                ),
+                (
+                    ExtractProgressPhase::RulesCommit,
+                    ProgressAmount::Determinate {
+                        completed: 1,
+                        total: 1,
+                    },
+                ),
+                (
+                    ExtractProgressPhase::Rules,
+                    ProgressAmount::Determinate {
+                        completed: 1,
+                        total: 1,
+                    },
+                ),
+            ],
+            "commit 必须在所属 owner 完成且下一 owner 开始前显式完成"
+        );
     }
 }

@@ -8,6 +8,14 @@ use std::sync::Arc;
 
 use super::asset::RpgMakerAssetOwner;
 use super::project::{MaxFullwidthChars, RpgMakerWriteBackLayoutProfile};
+use crate::diagnostic::{
+    Diagnostic, DiagnosticReport, FileSystemDiagnosticContext, FileSystemDiagnosticStage,
+    FileSystemIssue, FileSystemOperation, FileSystemPathViolation, FileSystemProblem,
+    RelatedFailureRelation, RpgMakerDiagnosticStage, RpgMakerEngineKind, RpgMakerInitialSetting,
+    RpgMakerIssue, RpgMakerProjectProblem, RuntimeBoundaryOperation, RuntimeComponent,
+    RuntimeIssue, SafeIdentifier, SafePath, SqliteDiagnosticContext, SqliteDiagnosticStage,
+    SqliteOperation, SqliteTransactionState, StateEffect,
+};
 use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::language::{LanguageId, LanguagePair};
 use crate::progress::{NoopProgressObserver, ProgressObserver, ProgressSnapshot};
@@ -15,9 +23,12 @@ use crate::project_lease::{ProjectCommandLeaseError, ProjectCommandLeaseProvider
 use crate::project_name::ProjectName;
 use crate::rpg_maker::RpgMakerLayout;
 use crate::rpg_maker::project_database::{
-    NewProject, ProjectDatabaseCreator, ProjectDatabaseStateReconciler, ProjectWorkspaceLayout,
+    NewProject, ProjectDatabaseCreateError, ProjectDatabaseCreator, ProjectDatabaseInspectionError,
+    ProjectDatabaseReconciliationError, ProjectDatabaseStateReconciler, ProjectWorkspaceLayout,
     SourceSnapshotFingerprint,
 };
+use crate::runtime::filesystem::SystemFileSystemError;
+use crate::runtime::sqlite::SqliteRuntimeError;
 use crate::storage::file_system::{
     BoundScopedDirectory, DirectChildDirectoryEnsurer, DirectoryDiscardError, DirectoryEntry,
     DirectoryEntryKind, DirectoryLister, DirectoryPrepareError, DirectoryPublishError,
@@ -485,18 +496,21 @@ where
 
         self.observe(InitProgressPhase::UpdatingDatabase);
         if target_exists {
+            let snapshot_source = final_layout.database_path().to_path_buf();
+            let snapshot_destination = staged_layout.database_path().to_path_buf();
             if let Err(source) = self
                 .database_snapshotter
-                .snapshot_database(
-                    final_layout.database_path().to_path_buf(),
-                    staged_layout.database_path().to_path_buf(),
-                )
+                .snapshot_database(snapshot_source.clone(), snapshot_destination.clone())
                 .await
             {
                 return Err(discard_candidate_failure(
                     &self.directories,
                     staged,
-                    ProjectWorkspaceCandidateFailure::SnapshotDatabase(source),
+                    ProjectWorkspaceCandidateFailure::SnapshotDatabase {
+                        source_path: snapshot_source,
+                        destination_path: snapshot_destination,
+                        source,
+                    },
                 )
                 .await);
             }
@@ -916,7 +930,11 @@ where
 pub(crate) enum ProjectWorkspaceCandidateFailure<D, S, R, P> {
     FingerprintCandidate(DirectoryTreeFingerprintError<P>),
     CreateDatabase(D),
-    SnapshotDatabase(SnapshotDatabaseError<S>),
+    SnapshotDatabase {
+        source_path: PathBuf,
+        destination_path: PathBuf,
+        source: SnapshotDatabaseError<S>,
+    },
     ReconcileDatabase(R),
 }
 
@@ -1024,6 +1042,264 @@ pub(crate) enum ProjectWorkspaceConvergenceError<D, S, I, R, E, P, A> {
     },
     CancellationCleanup(DirectoryDiscardError<A>),
     Publish(DirectoryPublishError<A>),
+}
+
+type ProductionWorkspaceConvergenceError = ProjectWorkspaceConvergenceError<
+    ProjectDatabaseCreateError<SqliteRuntimeError>,
+    SqliteRuntimeError,
+    ProjectDatabaseInspectionError<SqliteRuntimeError>,
+    ProjectDatabaseReconciliationError<SqliteRuntimeError, SqliteRuntimeError>,
+    SystemFileSystemError,
+    Box<SystemFileSystemError>,
+    Box<SystemFileSystemError>,
+>;
+
+impl ProductionWorkspaceConvergenceError {
+    /// Init 语义所有者建立主错误与候选丢弃错误的唯一结构化报告。
+    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
+        match self {
+            Self::SourceGameRoot(source)
+            | Self::ObserveEngineWorkspaceRoot(source)
+            | Self::WorkspaceRoot(source)
+            | Self::ObservePreservedDirectory(source) => {
+                source.diagnostic_report_at(FileSystemDiagnosticStage::Init)
+            }
+            Self::ObserveGameLayout(source) | Self::ObserveWorkspaceStructure(source) => {
+                source.diagnostic_report_at(FileSystemDiagnosticStage::Init)
+            }
+            Self::InvalidGameLayout {
+                game_root,
+                engine,
+                data_relative,
+                js_relative,
+                core_script,
+            } => init_project_report(RpgMakerProjectProblem::InvalidGameLayout {
+                game_root: SafePath::new(game_root),
+                engine: match *engine {
+                    "mv" => RpgMakerEngineKind::Mv,
+                    "mz" => RpgMakerEngineKind::Mz,
+                    _ => unreachable!("RpgMakerLayout 只会提供 MV 或 MZ"),
+                },
+                data_relative: SafePath::new(data_relative),
+                js_relative: SafePath::new(js_relative),
+                core_script: SafeIdentifier::from_validated(core_script),
+            }),
+            Self::EngineWorkspaceRoot(source) => source.diagnostic_report(
+                FileSystemDiagnosticContext::new(
+                    FileSystemDiagnosticStage::Init,
+                    FileSystemOperation::Create,
+                ),
+                StateEffect::Unchanged,
+            ),
+            Self::InspectExistingDatabase(source) => source.diagnostic_report(),
+            Self::MissingInitialSettings(settings) => {
+                init_project_report(RpgMakerProjectProblem::MissingInitialSettings {
+                    settings: settings.iter().copied().map(initial_setting).collect(),
+                })
+            }
+            Self::ObserveExistingSource(source) | Self::ObserveInputSource(source) => {
+                source.diagnostic_report_at(FileSystemDiagnosticStage::Init)
+            }
+            Self::InvalidStageRequest(_) => DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::runtime(RuntimeIssue::InternalInvariant {
+                    stage: crate::diagnostic::DiagnosticStage::Init,
+                    component: RuntimeComponent::FileSystemExecutor,
+                    operation: RuntimeBoundaryOperation::InitWorkspaceStageRequestInvalid,
+                }),
+            ),
+            Self::Recover(source) => source.diagnostic_report(),
+            Self::Prepare(source) => source.diagnostic_report(),
+            Self::PreserveObservability { failure, discard } => {
+                attach_optional_discard(preserve_observability_report(failure), discard.as_ref())
+            }
+            Self::CandidateFailure { failure, discard } => {
+                attach_optional_discard(candidate_failure_report(failure), discard.as_ref())
+            }
+            Self::CancellationCleanup(source) => source.diagnostic_report(),
+            Self::Publish(source) => source.diagnostic_report(),
+        }
+    }
+}
+
+fn init_project_report(problem: RpgMakerProjectProblem) -> DiagnosticReport {
+    DiagnosticReport::new(
+        StateEffect::Unchanged,
+        Diagnostic::rpg_maker(RpgMakerIssue::project(
+            RpgMakerDiagnosticStage::Init,
+            problem,
+        )),
+    )
+}
+
+const fn initial_setting(setting: MissingInitialProjectSetting) -> RpgMakerInitialSetting {
+    match setting {
+        MissingInitialProjectSetting::SourceLanguage => RpgMakerInitialSetting::SourceLanguage,
+        MissingInitialProjectSetting::TargetLanguage => RpgMakerInitialSetting::TargetLanguage,
+        MissingInitialProjectSetting::DialogueMaxFullwidthChars => {
+            RpgMakerInitialSetting::DialogueMaxFullwidthChars
+        }
+        MissingInitialProjectSetting::ScrollingTextMaxFullwidthChars => {
+            RpgMakerInitialSetting::ScrollingTextMaxFullwidthChars
+        }
+        MissingInitialProjectSetting::HelpDescriptionMaxFullwidthChars => {
+            RpgMakerInitialSetting::HelpDescriptionMaxFullwidthChars
+        }
+    }
+}
+
+fn attach_optional_discard(
+    report: DiagnosticReport,
+    discard: Option<&DirectoryDiscardError<Box<SystemFileSystemError>>>,
+) -> DiagnosticReport {
+    match discard {
+        Some(discard) => {
+            report.with_related(RelatedFailureRelation::Discard, discard.diagnostic_report())
+        }
+        None => report,
+    }
+}
+
+fn preserve_observability_report(
+    failure: &PreserveObservabilityFailure<SystemFileSystemError, Box<SystemFileSystemError>>,
+) -> DiagnosticReport {
+    let context = FileSystemDiagnosticContext::new(
+        FileSystemDiagnosticStage::Init,
+        FileSystemOperation::PrepareCandidate,
+    );
+    let report = |problem| {
+        DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::file_system(FileSystemIssue::new(context, problem)),
+        )
+    };
+    match failure {
+        PreserveObservabilityFailure::Bind(source) => match source {
+            ScopedDirectoryBindError::WrongEditorInstance => {
+                report(FileSystemProblem::WrongPublisherInstance)
+            }
+            ScopedDirectoryBindError::CandidateFinalized { root }
+            | ScopedDirectoryBindError::CandidateIdentityChanged { root } => {
+                report(FileSystemProblem::IdentityChanged {
+                    path: SafePath::new(root),
+                })
+            }
+            ScopedDirectoryBindError::Failed { source, .. } => {
+                source.diagnostic_report(context, StateEffect::Unchanged)
+            }
+        },
+        PreserveObservabilityFailure::List { source, .. } => {
+            source.diagnostic_report_at(FileSystemDiagnosticStage::Init)
+        }
+        PreserveObservabilityFailure::Read { source, .. } => {
+            source.diagnostic_report_at(FileSystemDiagnosticStage::Init)
+        }
+        PreserveObservabilityFailure::InvalidCandidatePath { path, .. } => {
+            report(FileSystemProblem::InvalidPath {
+                path: SafePath::new(path),
+                violation: FileSystemPathViolation::OutsideScope,
+            })
+        }
+        PreserveObservabilityFailure::Edit { source, .. } => match source {
+            ScopedDirectoryEditError::WrongEditorInstance => {
+                report(FileSystemProblem::WrongPublisherInstance)
+            }
+            ScopedDirectoryEditError::OutsideScope { path }
+            | ScopedDirectoryEditError::ScopeRootMutation { path } => {
+                report(FileSystemProblem::InvalidPath {
+                    path: SafePath::new(path),
+                    violation: FileSystemPathViolation::OutsideScope,
+                })
+            }
+            ScopedDirectoryEditError::NotFound { path } => report(FileSystemProblem::NotFound {
+                path: SafePath::new(path),
+            }),
+            ScopedDirectoryEditError::NotFile { path } => report(FileSystemProblem::NotFile {
+                path: SafePath::new(path),
+            }),
+            ScopedDirectoryEditError::NotDirectory { path } => {
+                report(FileSystemProblem::NotDirectory {
+                    path: SafePath::new(path),
+                })
+            }
+            ScopedDirectoryEditError::CandidateIdentityChanged { root } => {
+                report(FileSystemProblem::IdentityChanged {
+                    path: SafePath::new(root),
+                })
+            }
+            ScopedDirectoryEditError::Failed { source, .. } => {
+                source.diagnostic_report(context, StateEffect::Unchanged)
+            }
+        },
+    }
+}
+
+fn candidate_failure_report(
+    failure: &ProjectWorkspaceCandidateFailure<
+        ProjectDatabaseCreateError<SqliteRuntimeError>,
+        SqliteRuntimeError,
+        ProjectDatabaseReconciliationError<SqliteRuntimeError, SqliteRuntimeError>,
+        Box<SystemFileSystemError>,
+    >,
+) -> DiagnosticReport {
+    match failure {
+        ProjectWorkspaceCandidateFailure::FingerprintCandidate(source) => {
+            source.diagnostic_report_at(FileSystemDiagnosticStage::Init)
+        }
+        ProjectWorkspaceCandidateFailure::CreateDatabase(source) => source.diagnostic_report(),
+        ProjectWorkspaceCandidateFailure::SnapshotDatabase {
+            source_path,
+            destination_path,
+            source,
+        } => snapshot_database_report(source_path, destination_path, source),
+        ProjectWorkspaceCandidateFailure::ReconcileDatabase(source) => source.diagnostic_report(),
+    }
+}
+
+fn snapshot_database_report(
+    source_path: &Path,
+    destination_path: &Path,
+    failure: &SnapshotDatabaseError<SqliteRuntimeError>,
+) -> DiagnosticReport {
+    match failure {
+        SnapshotDatabaseError::SourceNotFound => {
+            init_project_report(RpgMakerProjectProblem::DatabaseNotFound {
+                path: SafePath::new(source_path),
+            })
+        }
+        SnapshotDatabaseError::DestinationAlreadyExists => {
+            init_project_report(RpgMakerProjectProblem::DatabaseAlreadyExists {
+                path: SafePath::new(destination_path),
+            })
+        }
+        SnapshotDatabaseError::NotCreated(source) => source.diagnostic_report(
+            destination_path,
+            SqliteDiagnosticContext::new(
+                SqliteDiagnosticStage::Init,
+                SqliteOperation::Backup,
+                SqliteTransactionState::RolledBack,
+            ),
+            StateEffect::Unchanged,
+        ),
+        SnapshotDatabaseError::ResidualArtifact(source) => source.diagnostic_report(
+            destination_path,
+            SqliteDiagnosticContext::new(
+                SqliteDiagnosticStage::Init,
+                SqliteOperation::Cleanup,
+                SqliteTransactionState::RolledBack,
+            ),
+            StateEffect::RecoveryRequired,
+        ),
+        SnapshotDatabaseError::OutcomeUnknown(source) => source.diagnostic_report(
+            destination_path,
+            SqliteDiagnosticContext::new(
+                SqliteDiagnosticStage::Init,
+                SqliteOperation::Backup,
+                SqliteTransactionState::OutcomeUnknown,
+            ),
+            StateEffect::OutcomeUnknown,
+        ),
+    }
 }
 
 /// 工作区收敛失败已经造成的最高层用户影响。
@@ -1217,7 +1493,9 @@ where
                 write!(formatter, "无法建立候选来源指纹：{error}")
             }
             Self::CreateDatabase(error) => write!(formatter, "无法创建候选数据库：{error}"),
-            Self::SnapshotDatabase(error) => write!(formatter, "无法复制现存数据库：{error}"),
+            Self::SnapshotDatabase { source, .. } => {
+                write!(formatter, "无法复制现存数据库：{source}")
+            }
             Self::ReconcileDatabase(error) => write!(formatter, "无法对账候选数据库：{error}"),
         }
     }
@@ -1234,7 +1512,7 @@ where
         match self {
             Self::FingerprintCandidate(source) => Some(source),
             Self::CreateDatabase(source) => Some(source),
-            Self::SnapshotDatabase(source) => Some(source),
+            Self::SnapshotDatabase { source, .. } => Some(source),
             Self::ReconcileDatabase(source) => Some(source),
         }
     }
@@ -3373,9 +3651,10 @@ mod tests {
         assert!(matches!(
             error,
             ProjectWorkspaceConvergenceError::CandidateFailure {
-                failure: ProjectWorkspaceCandidateFailure::SnapshotDatabase(
-                    SnapshotDatabaseError::NotCreated(FakeError("backup"))
-                ),
+                failure: ProjectWorkspaceCandidateFailure::SnapshotDatabase {
+                    source: SnapshotDatabaseError::NotCreated(FakeError("backup")),
+                    ..
+                },
                 discard: None,
             }
         ));
@@ -3416,9 +3695,10 @@ mod tests {
         assert!(matches!(
             error,
             ProjectWorkspaceConvergenceError::CandidateFailure {
-                failure: ProjectWorkspaceCandidateFailure::SnapshotDatabase(
-                    SnapshotDatabaseError::NotCreated(FakeError("backup"))
-                ),
+                failure: ProjectWorkspaceCandidateFailure::SnapshotDatabase {
+                    source: SnapshotDatabaseError::NotCreated(FakeError("backup")),
+                    ..
+                },
                 discard: Some(ref discard),
             } if discard.source() == &FakeError("discard")
                 && discard.staging_root() == Path::new("C:/projects/.game-stage")

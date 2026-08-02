@@ -7,7 +7,12 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::path::PathBuf;
 
+use crate::diagnostic::{
+    DiagnosticReport, FileSystemDiagnosticContext, FileSystemDiagnosticStage, FileSystemOperation,
+    StateEffect,
+};
 use crate::project_name::ProjectName;
+use crate::runtime::filesystem::SystemFileSystemError;
 use crate::storage::file_system::{
     ExclusiveFileLease, ExclusiveFileLeaseError, ExclusiveFileLeaseProvider,
     ExclusiveFileLeaseRequest,
@@ -159,6 +164,20 @@ impl<E: Error + 'static> Error for ProjectCommandLeaseError<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Unavailable { source, .. } => Some(source),
+        }
+    }
+}
+
+impl ProjectCommandLeaseError<Box<SystemFileSystemError>> {
+    pub(crate) fn diagnostic_report_at(
+        &self,
+        stage: FileSystemDiagnosticStage,
+    ) -> DiagnosticReport {
+        match self {
+            Self::Unavailable { source, .. } => source.diagnostic_report(
+                FileSystemDiagnosticContext::new(stage, FileSystemOperation::AcquireExclusiveLease),
+                StateEffect::Unchanged,
+            ),
         }
     }
 }

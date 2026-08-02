@@ -47,6 +47,9 @@ use crate::rpg_maker::translate::semantics::{
 };
 use crate::rpg_maker::write_back::planner::{RpgMakerWriteBackGroup, RpgMakerWriteBackUnit};
 use crate::storage::sqlite::{SqliteRow, SqliteValue};
+use crate::translation::placeholder::PlaceholderProtectionError;
+#[cfg(test)]
+use crate::translation::placeholder::PlaceholderWorkerOperation;
 use crate::translation::planning_resource::{
     CompiledTerminology, TerminologyDefinitionError, TerminologyEntry,
     compile_terminology_with_cancellation,
@@ -55,9 +58,22 @@ use crate::translation::planning_resource::{
 use super::{
     ProjectLuaCallError, ProjectLuaCancellation, ProjectLuaDatabasePrerequisiteError,
     ProjectLuaEngineAdapter, ProjectLuaProject, ProjectLuaSchemaObjectKind, ProjectLuaValue,
-    project_lua_object_contains_field, project_lua_worker_spawn_message,
-    take_project_lua_object_field,
+    project_lua_object_contains_field, take_project_lua_object_field,
 };
+
+fn rpg_maker_call_violation(
+    violation: crate::diagnostic::LuaValueViolation,
+) -> ProjectLuaCallError {
+    ProjectLuaCallError::violation(violation).with_engine(crate::diagnostic::LuaEngine::RpgMaker)
+}
+
+fn rpg_maker_state_error() -> ProjectLuaCallError {
+    rpg_maker_call_violation(crate::diagnostic::LuaValueViolation::StateMismatch)
+}
+
+fn rpg_maker_sqlite_error(source: rusqlite::Error) -> ProjectLuaCallError {
+    ProjectLuaCallError::sqlite(source).with_engine(crate::diagnostic::LuaEngine::RpgMaker)
+}
 
 const RPG_MAKER_ATT_TABLES: &[&str] = &[
     "metadata",
@@ -117,7 +133,7 @@ impl RpgMakerProjectLuaAdapter {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let cache = &baseline
                 .as_ref()
-                .ok_or_else(|| invalid_database("缺少 RPG Maker Lua 脚本前译文状态"))?
+                .ok_or_else(rpg_maker_state_error)?
                 .placeholder_cache;
             if text_eq_with_cancellation(&cache.canonical_json, &canonical_json, cancellation)? {
                 return Ok((cache.service.clone(), cache.rules.clone()));
@@ -133,7 +149,7 @@ impl RpgMakerProjectLuaAdapter {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cache = &mut baseline
             .as_mut()
-            .ok_or_else(|| invalid_database("缺少 RPG Maker Lua 脚本前译文状态"))?
+            .ok_or_else(rpg_maker_state_error)?
             .placeholder_cache;
         if text_eq_with_cancellation(&cache.canonical_json, &canonical_json, cancellation)? {
             return Ok((cache.service.clone(), cache.rules.clone()));
@@ -231,7 +247,7 @@ impl ProjectLuaEngineAdapter for RpgMakerProjectLuaAdapter {
         let group_context = group_contexts
             .get(&locator.group_location)
             .copied()
-            .ok_or_else(|| invalid_database("人工译文 Unit 缺少完整 Group 语境"))?;
+            .ok_or_else(rpg_maker_state_error)?;
         let LoadedUnit {
             owner,
             group_location,
@@ -281,7 +297,9 @@ impl ProjectLuaEngineAdapter for RpgMakerProjectLuaAdapter {
                     if source.kind() == "cancelled" {
                         source
                     } else {
-                        ProjectLuaCallError::new("invalid_translation", source.message())
+                        rpg_maker_call_violation(
+                            crate::diagnostic::LuaValueViolation::InvalidTranslation,
+                        )
                     }
                 })?;
         cancellation.ensure_running()?;
@@ -290,7 +308,13 @@ impl ProjectLuaEngineAdapter for RpgMakerProjectLuaAdapter {
                 "UPDATE main.rpg_maker_text_unit
                  SET translation_content_json = ?1,
                      translation_state = ?2
-                 WHERE owner = ?3 AND group_location = ?4 AND unit_role = ?5",
+                 WHERE owner = ?3
+                   AND group_id = (
+                       SELECT group_id
+                       FROM main.rpg_maker_text_group
+                       WHERE owner = ?3 AND group_location = ?4
+                   )
+                   AND unit_role = ?5",
                 params![
                     translation_json,
                     state.as_bytes().as_slice(),
@@ -299,13 +323,15 @@ impl ProjectLuaEngineAdapter for RpgMakerProjectLuaAdapter {
                     locator.unit_role
                 ],
             )
-            .map_err(|source| {
-                ProjectLuaCallError::new("sqlite", format!("写入 RPG Maker 人工译文失败：{source}"))
-            })?;
+            .map_err(rpg_maker_sqlite_error)?;
         if changed != 1 {
-            return Err(ProjectLuaCallError::new(
-                "unit_not_found",
-                "RPG Maker locator 没有命中唯一 Unit",
+            return Err(rpg_maker_call_violation(
+                crate::diagnostic::LuaValueViolation::UnknownUnit,
+            )
+            .with_rpg_maker_locator(
+                locator.owner.storage_name(),
+                &locator.group_location,
+                &locator.unit_role,
             ));
         }
         Ok(u64::try_from(changed).expect("受支持平台的 usize 必须能表示为 u64"))
@@ -324,20 +350,28 @@ impl ProjectLuaEngineAdapter for RpgMakerProjectLuaAdapter {
                 "UPDATE main.rpg_maker_text_unit
                  SET translation_content_json = NULL,
                      translation_state = NULL
-                 WHERE owner = ?1 AND group_location = ?2 AND unit_role = ?3",
+                 WHERE owner = ?1
+                   AND group_id = (
+                       SELECT group_id
+                       FROM main.rpg_maker_text_group
+                       WHERE owner = ?1 AND group_location = ?2
+                   )
+                   AND unit_role = ?3",
                 params![
                     locator.owner.storage_name(),
                     locator.group_location,
                     locator.unit_role
                 ],
             )
-            .map_err(|source| {
-                ProjectLuaCallError::new("sqlite", format!("清除 RPG Maker 人工译文失败：{source}"))
-            })?;
+            .map_err(rpg_maker_sqlite_error)?;
         if changed != 1 {
-            return Err(ProjectLuaCallError::new(
-                "unit_not_found",
-                "RPG Maker locator 没有命中唯一 Unit",
+            return Err(rpg_maker_call_violation(
+                crate::diagnostic::LuaValueViolation::UnknownUnit,
+            )
+            .with_rpg_maker_locator(
+                locator.owner.storage_name(),
+                &locator.group_location,
+                &locator.unit_role,
             ));
         }
         Ok(u64::try_from(changed).expect("受支持平台的 usize 必须能表示为 u64"))
@@ -356,12 +390,18 @@ impl ProjectLuaEngineAdapter for RpgMakerProjectLuaAdapter {
             Err(CurrentAttSchemaValidationError::Cancelled) => {
                 Err(ProjectLuaDatabasePrerequisiteError::Cancelled)
             }
-            Err(CurrentAttSchemaValidationError::Read(source)) => Err(
-                ProjectLuaDatabasePrerequisiteError::sqlite("read_current_att_schema", &source),
-            ),
-            Err(CurrentAttSchemaValidationError::Invalid(reason)) => Err(
-                ProjectLuaDatabasePrerequisiteError::invalid_project_state(reason.safe_fact()),
-            ),
+            Err(CurrentAttSchemaValidationError::Read(source)) => {
+                Err(ProjectLuaDatabasePrerequisiteError::sqlite(
+                    super::ProjectLuaSqliteOperation::ReadCurrentAttSchema,
+                    source,
+                ))
+            }
+            Err(CurrentAttSchemaValidationError::Invalid(_reason)) => {
+                Err(ProjectLuaDatabasePrerequisiteError::invalid_project_state(
+                    crate::diagnostic::LuaEngine::RpgMaker,
+                    crate::diagnostic::LuaValueViolation::StateMismatch,
+                ))
+            }
         }
     }
 
@@ -380,7 +420,7 @@ impl ProjectLuaEngineAdapter for RpgMakerProjectLuaAdapter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if slot.is_some() {
-            return Err(invalid_database("RPG Maker Lua 适配器不能重复执行"));
+            return Err(rpg_maker_state_error());
         }
         *slot = Some(baseline);
         cancellation.ensure_running()?;
@@ -398,9 +438,7 @@ impl ProjectLuaEngineAdapter for RpgMakerProjectLuaAdapter {
             .translation_baseline
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let baseline = baseline
-            .as_ref()
-            .ok_or_else(|| invalid_database("缺少 RPG Maker Lua 脚本前译文状态"))?;
+        let baseline = baseline.as_ref().ok_or_else(rpg_maker_state_error)?;
         validate_rpg_maker_project(
             connection,
             project.name(),
@@ -613,9 +651,8 @@ struct ParsedLocator {
 
 fn parse_locator(locator: ProjectLuaValue) -> Result<ParsedLocator, ProjectLuaCallError> {
     let Some(mut fields) = locator.into_object() else {
-        return Err(ProjectLuaCallError::new(
-            "invalid_locator",
-            "RPG Maker locator 必须是只含 owner、group_location 与 unit_role 的 table",
+        return Err(rpg_maker_call_violation(
+            crate::diagnostic::LuaValueViolation::InvalidLocator,
         ));
     };
     if fields.len() != 3
@@ -623,31 +660,24 @@ fn parse_locator(locator: ProjectLuaValue) -> Result<ParsedLocator, ProjectLuaCa
         || !project_lua_object_contains_field(&fields, "group_location")
         || !project_lua_object_contains_field(&fields, "unit_role")
     {
-        return Err(ProjectLuaCallError::new(
-            "invalid_locator",
-            "RPG Maker locator 必须且只能包含 owner、group_location 与 unit_role",
+        return Err(rpg_maker_call_violation(
+            crate::diagnostic::LuaValueViolation::InvalidLocator,
         ));
     }
     let owner_raw = take_locator_text(&mut fields, "owner")?;
     let owner = RpgMakerAssetOwner::from_storage_name(&owner_raw).ok_or_else(|| {
-        ProjectLuaCallError::new(
-            "invalid_locator",
-            "RPG Maker locator.owner 必须是 builtin 或 rules",
-        )
+        rpg_maker_call_violation(crate::diagnostic::LuaValueViolation::InvalidLocator)
+            .with_field("owner")
     })?;
     let group_location = take_locator_text(&mut fields, "group_location")?;
-    RpgMakerLocationCodec::decode(&group_location).map_err(|source| {
-        ProjectLuaCallError::new(
-            "invalid_locator",
-            format!("RPG Maker locator.group_location 无效：{source}"),
-        )
+    RpgMakerLocationCodec::decode(&group_location).map_err(|_| {
+        rpg_maker_call_violation(crate::diagnostic::LuaValueViolation::InvalidLocator)
+            .with_field("group_location")
     })?;
     let unit_role = take_locator_text(&mut fields, "unit_role")?;
-    RpgMakerProjectionCodec::decode_role(&unit_role).map_err(|source| {
-        ProjectLuaCallError::new(
-            "invalid_locator",
-            format!("RPG Maker locator.unit_role 无效：{source}"),
-        )
+    RpgMakerProjectionCodec::decode_role(&unit_role).map_err(|_| {
+        rpg_maker_call_violation(crate::diagnostic::LuaValueViolation::InvalidLocator)
+            .with_field("unit_role")
     })?;
     Ok(ParsedLocator {
         owner,
@@ -663,16 +693,16 @@ fn take_locator_text(
     let Some(value) =
         take_project_lua_object_field(fields, field).and_then(ProjectLuaValue::into_text)
     else {
-        return Err(ProjectLuaCallError::new(
-            "invalid_locator",
-            format!("RPG Maker locator.{field} 必须是字符串"),
-        ));
+        return Err(
+            rpg_maker_call_violation(crate::diagnostic::LuaValueViolation::InvalidLocator)
+                .with_field(field),
+        );
     };
     if value.is_empty() || value.chars().all(char::is_whitespace) {
-        return Err(ProjectLuaCallError::new(
-            "invalid_locator",
-            format!("RPG Maker locator.{field} 不能为空白"),
-        ));
+        return Err(
+            rpg_maker_call_violation(crate::diagnostic::LuaValueViolation::InvalidLocator)
+                .with_field(field),
+        );
     }
     Ok(value)
 }
@@ -721,20 +751,17 @@ fn load_group_context_fingerprints(
     };
     let mut group_statement = connection
         .prepare(group_sql)
-        .map_err(|source| invalid_database(format!("读取完整 Group 语境失败：{source}")))?;
+        .map_err(|_| rpg_maker_state_error())?;
     let mut group_rows = match only_location {
         Some(location) => group_statement.query(params![location]),
         None => group_statement.query([]),
     }
-    .map_err(|source| invalid_database(format!("读取完整 Group 语境失败：{source}")))?;
+    .map_err(|_| rpg_maker_state_error())?;
     let mut group_indexes = RpgMakerGroupIndexes::default();
     let mut logical_locations = HashMap::<String, usize>::new();
     let mut semantic_orders = HashMap::<RpgMakerSemanticOrderKey, String>::new();
     let mut groups = Vec::<LoadedGroupContext>::new();
-    while let Some(row) = group_rows
-        .next()
-        .map_err(|source| invalid_database(format!("读取完整 Group 语境失败：{source}")))?
-    {
+    while let Some(row) = group_rows.next().map_err(|_| rpg_maker_state_error())? {
         cancellation.ensure_running()?;
         let owner_raw =
             sqlite_text_with_cancellation(row, 0, "owner", cancellation).map_err(|source| {
@@ -751,32 +778,28 @@ fn load_group_context_fingerprints(
         let kind_raw = sqlite_text_with_cancellation(row, 3, "group_kind", cancellation).map_err(
             |source| invalid_database_sqlite_read_error(source, "读取完整 Group 语境失败"),
         )?;
-        let owner = RpgMakerAssetOwner::from_storage_name(&owner_raw)
-            .ok_or_else(|| invalid_database("完整 Group 语境包含无效 owner"))?;
+        let owner =
+            RpgMakerAssetOwner::from_storage_name(&owner_raw).ok_or_else(rpg_maker_state_error)?;
         let semantic_order_key = RpgMakerSemanticOrderKey::decode(&semantic_order_key)
-            .map_err(|source| invalid_database(format!("完整 Group 语境顺序键无效：{source}")))?;
-        let kind = TextGroupKind::from_storage_name(&kind_raw)
-            .ok_or_else(|| invalid_database("完整 Group 语境包含无效 kind"))?;
-        let location = RpgMakerLocationCodec::decode(&location_raw)
-            .map_err(|source| invalid_database(format!("完整 Group 语境位置无效：{source}")))?;
+            .map_err(|_| rpg_maker_state_error())?;
+        let kind = TextGroupKind::from_storage_name(&kind_raw).ok_or_else(rpg_maker_state_error)?;
+        let location =
+            RpgMakerLocationCodec::decode(&location_raw).map_err(|_| rpg_maker_state_error())?;
         let index = if let Some(index) = logical_locations.get(&location_raw).copied() {
             let existing = &groups[index];
             if existing.kind != kind
                 || existing.semantic_order_key != semantic_order_key
                 || existing.location != location
             {
-                return Err(invalid_database(format!(
-                    "跨 owner 的 Group 定义不一致：{location_raw}"
-                )));
+                return Err(rpg_maker_state_error());
             }
             index
         } else {
-            if let Some(first) =
-                semantic_orders.insert(semantic_order_key.clone(), location_raw.clone())
+            if semantic_orders
+                .insert(semantic_order_key.clone(), location_raw.clone())
+                .is_some()
             {
-                return Err(invalid_database(format!(
-                    "不同 Group 使用了相同 semantic_order_key：{first} / {location_raw}"
-                )));
+                return Err(rpg_maker_state_error());
             }
             let index = groups.len();
             logical_locations.insert(location_raw.clone(), index);
@@ -790,7 +813,7 @@ fn load_group_context_fingerprints(
             index
         };
         if !group_indexes.insert(owner, location_raw, index, cancellation)? {
-            return Err(invalid_database("完整 Group 语境包含重复 Group 身份"));
+            return Err(rpg_maker_state_error());
         }
     }
     drop(group_rows);
@@ -798,33 +821,36 @@ fn load_group_context_fingerprints(
 
     cancellation.ensure_running()?;
     let unit_sql = if only_location.is_some() {
-        "SELECT unit.owner, unit.group_location, unit.unit_role,
+        "SELECT unit.owner, text_group.group_location, unit.unit_role,
                 unit.semantic_order_key, unit.source_content_json,
                 unit.source_context_json
          FROM main.rpg_maker_text_unit AS unit
-         WHERE unit.group_location = ?1
+         JOIN main.rpg_maker_text_group AS text_group
+           ON text_group.owner = unit.owner
+          AND text_group.group_id = unit.group_id
+         WHERE text_group.group_location = ?1
          ORDER BY unit.semantic_order_key,
                   CASE unit.owner WHEN 'builtin' THEN 0 WHEN 'rules' THEN 1 END"
     } else {
-        "SELECT unit.owner, unit.group_location, unit.unit_role,
+        "SELECT unit.owner, text_group.group_location, unit.unit_role,
                 unit.semantic_order_key, unit.source_content_json,
                 unit.source_context_json
          FROM main.rpg_maker_text_unit AS unit
+         JOIN main.rpg_maker_text_group AS text_group
+           ON text_group.owner = unit.owner
+          AND text_group.group_id = unit.group_id
          ORDER BY unit.semantic_order_key,
                   CASE unit.owner WHEN 'builtin' THEN 0 WHEN 'rules' THEN 1 END"
     };
     let mut unit_statement = connection
         .prepare(unit_sql)
-        .map_err(|source| invalid_database(format!("读取完整 Group Unit 失败：{source}")))?;
+        .map_err(|_| rpg_maker_state_error())?;
     let mut unit_rows = match only_location {
         Some(location) => unit_statement.query(params![location]),
         None => unit_statement.query([]),
     }
-    .map_err(|source| invalid_database(format!("读取完整 Group Unit 失败：{source}")))?;
-    while let Some(row) = unit_rows
-        .next()
-        .map_err(|source| invalid_database(format!("读取完整 Group Unit 失败：{source}")))?
-    {
+    .map_err(|_| rpg_maker_state_error())?;
+    while let Some(row) = unit_rows.next().map_err(|_| rpg_maker_state_error())? {
         cancellation.ensure_running()?;
         let owner_raw =
             sqlite_text_with_cancellation(row, 0, "owner", cancellation).map_err(|source| {
@@ -850,21 +876,21 @@ fn load_group_context_fingerprints(
             sqlite_text_with_cancellation(row, 5, "source_context_json", cancellation).map_err(
                 |source| invalid_database_sqlite_read_error(source, "读取完整 Group Unit 失败"),
             )?;
-        let owner = RpgMakerAssetOwner::from_storage_name(&owner_raw)
-            .ok_or_else(|| invalid_database("完整 Group Unit 包含无效 owner"))?;
+        let owner =
+            RpgMakerAssetOwner::from_storage_name(&owner_raw).ok_or_else(rpg_maker_state_error)?;
         let index = group_indexes
             .get(owner, &location_raw, cancellation)?
-            .ok_or_else(|| invalid_database("完整 Group Unit 缺少所属 Group"))?;
+            .ok_or_else(rpg_maker_state_error)?;
         let semantic_order_key = RpgMakerSemanticOrderKey::decode(&semantic_order_key)
-            .map_err(|source| invalid_database(format!("完整 Group Unit 顺序键无效：{source}")))?;
-        let role = RpgMakerProjectionCodec::decode_role(&role_raw)
-            .map_err(|source| invalid_database(format!("完整 Group Unit 角色无效：{source}")))?;
+            .map_err(|_| rpg_maker_state_error())?;
+        let role =
+            RpgMakerProjectionCodec::decode_role(&role_raw).map_err(|_| rpg_maker_state_error())?;
         let source_content: TextUnitContent =
             parse_json_with_cancellation(&source_json, "完整 Group Unit 原文", cancellation)?;
         let context: serde_json::Value =
             parse_json_with_cancellation(&context_json, "完整 Group Unit 上下文", cancellation)?;
         if !context.is_object() {
-            return Err(invalid_database("完整 Group Unit 上下文必须是 JSON object"));
+            return Err(rpg_maker_state_error());
         }
         let group = &mut groups[index];
         if group
@@ -872,14 +898,10 @@ fn load_group_context_fingerprints(
             .iter()
             .any(|unit| unit.semantic_order_key == semantic_order_key)
         {
-            return Err(invalid_database(format!(
-                "同一完整 Group 的不同 Unit 使用了相同 semantic_order_key：{location_raw}"
-            )));
+            return Err(rpg_maker_state_error());
         }
         if group.units.iter().any(|unit| unit.identity.role() == &role) {
-            return Err(invalid_database(format!(
-                "同一完整 Group 包含重复 Unit 角色：{location_raw} / {role_raw}"
-            )));
+            return Err(rpg_maker_state_error());
         }
         group.units.push(LoadedGroupContextUnit {
             semantic_order_key,
@@ -900,10 +922,7 @@ fn load_group_context_fingerprints(
     for mut group in groups {
         cancellation.ensure_running()?;
         if group.units.is_empty() {
-            return Err(invalid_database(format!(
-                "完整 Group 不得为空：{}",
-                group.location_raw
-            )));
+            return Err(rpg_maker_state_error());
         }
         group
             .units
@@ -922,15 +941,15 @@ fn load_group_context_fingerprints(
             .insert(group.location_raw, fingerprint)
             .is_some()
         {
-            return Err(invalid_database("完整 Group 语境位置重复"));
+            return Err(rpg_maker_state_error());
         }
     }
     cancellation.ensure_running()?;
     Ok(fingerprints)
 }
 
-fn group_context_fingerprint_error(source: GroupContextFingerprintError) -> ProjectLuaCallError {
-    invalid_database(format!("无法建立完整 Group 语境指纹：{source}"))
+fn group_context_fingerprint_error(_source: GroupContextFingerprintError) -> ProjectLuaCallError {
+    rpg_maker_state_error()
 }
 
 fn load_unit(
@@ -950,31 +969,25 @@ fn load_unit(
                     resource.canonical_json,
                     text_unit.owner
              FROM main.rpg_maker_text_unit AS text_unit
-             JOIN main.rpg_maker_text_group AS text_group
-               ON text_group.owner = text_unit.owner
-              AND text_group.group_location = text_unit.group_location
+              JOIN main.rpg_maker_text_group AS text_group
+                ON text_group.owner = text_unit.owner
+               AND text_group.group_id = text_unit.group_id
              CROSS JOIN main.metadata
              JOIN main.rpg_maker_translation_resource AS resource
                ON resource.resource_kind = 'placeholder_rules'
-             WHERE text_unit.owner = ?1
-               AND text_unit.group_location = ?2
-               AND text_unit.unit_role = ?3",
+              WHERE text_unit.owner = ?1
+                AND text_group.group_location = ?2
+                AND text_unit.unit_role = ?3",
         )
-        .map_err(|source| {
-            ProjectLuaCallError::new("sqlite", format!("读取 RPG Maker Lua Unit 失败：{source}"))
-        })?;
+        .map_err(rpg_maker_sqlite_error)?;
     let mut rows = statement
         .query(params![
             locator.owner.storage_name(),
             locator.group_location,
             locator.unit_role
         ])
-        .map_err(|source| {
-            ProjectLuaCallError::new("sqlite", format!("读取 RPG Maker Lua Unit 失败：{source}"))
-        })?;
-    let row: Option<UnitRow> = match rows.next().map_err(|source| {
-        ProjectLuaCallError::new("sqlite", format!("读取 RPG Maker Lua Unit 失败：{source}"))
-    })? {
+        .map_err(rpg_maker_sqlite_error)?;
+    let row: Option<UnitRow> = match rows.next().map_err(rpg_maker_sqlite_error)? {
         Some(row) => Some((
             sqlite_text_with_cancellation(row, 0, "group_kind", cancellation)
                 .map_err(|source| lua_sqlite_read_error(source, "读取 RPG Maker Lua Unit 失败"))?,
@@ -1006,19 +1019,22 @@ fn load_unit(
         owner_raw,
     )) = row
     else {
-        return Err(ProjectLuaCallError::new(
-            "unit_not_found",
-            "RPG Maker locator 没有命中唯一 Unit",
-        ));
+        return Err(
+            rpg_maker_call_violation(crate::diagnostic::LuaValueViolation::UnknownUnit)
+                .with_rpg_maker_locator(
+                    locator.owner.storage_name(),
+                    &locator.group_location,
+                    &locator.unit_role,
+                ),
+        );
     };
-    let owner = RpgMakerAssetOwner::from_storage_name(&owner_raw)
-        .ok_or_else(|| invalid_database("Unit owner 无效"))?;
-    let kind = TextGroupKind::from_storage_name(&kind_raw)
-        .ok_or_else(|| invalid_database("Unit group_kind 无效"))?;
+    let owner =
+        RpgMakerAssetOwner::from_storage_name(&owner_raw).ok_or_else(rpg_maker_state_error)?;
+    let kind = TextGroupKind::from_storage_name(&kind_raw).ok_or_else(rpg_maker_state_error)?;
     let group_location = RpgMakerLocationCodec::decode(&locator.group_location)
-        .map_err(|source| invalid_database(format!("Unit group_location 无效：{source}")))?;
+        .map_err(|_| rpg_maker_state_error())?;
     let role = RpgMakerProjectionCodec::decode_role(&locator.unit_role)
-        .map_err(|source| invalid_database(format!("Unit role 无效：{source}")))?;
+        .map_err(|_| rpg_maker_state_error())?;
     let source_content: TextUnitContent = parse_json_with_cancellation(
         &source_content_json,
         "Unit source_content_json",
@@ -1026,9 +1042,9 @@ fn load_unit(
     )?;
     cancellation.ensure_running()?;
     validate_text_unit_content_structure(kind, &role, TextUnitContentView::from(&source_content))
-        .map_err(|source| invalid_database(format!("Unit 原文结构无效：{source:?}")))?;
+        .map_err(|_| rpg_maker_state_error())?;
     if content_is_blank(&source_content, cancellation)? {
-        return Err(invalid_database("Unit 原文不能为空白"));
+        return Err(rpg_maker_state_error());
     }
     let context: serde_json::Value = parse_json_with_cancellation(
         &source_context_json,
@@ -1036,9 +1052,7 @@ fn load_unit(
         cancellation,
     )?;
     if !context.is_object() {
-        return Err(invalid_database(
-            "Unit source_context_json 必须是 JSON object",
-        ));
+        return Err(rpg_maker_state_error());
     }
     let source = parse_canonical_language(&source_language, "source_language")?;
     let target = parse_canonical_language(&target_language, "target_language")?;
@@ -1064,9 +1078,8 @@ fn parse_translation(
     match source {
         TextUnitContent::Value(_) => {
             let Some(value) = value.into_text() else {
-                return Err(ProjectLuaCallError::new(
-                    "invalid_translation",
-                    "这个 RPG Maker Unit 的 translation 必须是 UTF-8 字符串",
+                return Err(rpg_maker_call_violation(
+                    crate::diagnostic::LuaValueViolation::InvalidTranslation,
                 ));
             };
             cancellation.ensure_running()?;
@@ -1074,18 +1087,16 @@ fn parse_translation(
         }
         TextUnitContent::Lines(_) => {
             let Some(values) = value.into_array() else {
-                return Err(ProjectLuaCallError::new(
-                    "invalid_translation",
-                    "这个 RPG Maker Unit 的 translation 必须是无洞字符串数组",
+                return Err(rpg_maker_call_violation(
+                    crate::diagnostic::LuaValueViolation::InvalidTranslation,
                 ));
             };
             let mut lines = Vec::with_capacity(values.len());
             for value in values {
                 cancellation.ensure_running()?;
                 let Some(value) = value.into_text() else {
-                    return Err(ProjectLuaCallError::new(
-                        "invalid_translation",
-                        "RPG Maker 行数组的每一项都必须是 UTF-8 字符串",
+                    return Err(rpg_maker_call_violation(
+                        crate::diagnostic::LuaValueViolation::InvalidTranslation,
                     ));
                 };
                 lines.push(value);
@@ -1105,24 +1116,19 @@ fn validate_translation_structure(
 ) -> Result<(), ProjectLuaCallError> {
     cancellation.ensure_running()?;
     if content_is_blank(translation, cancellation)? {
-        return Err(ProjectLuaCallError::new(
-            "invalid_translation",
-            "RPG Maker translation 不能为空白",
+        return Err(rpg_maker_call_violation(
+            crate::diagnostic::LuaValueViolation::InvalidTranslation,
         ));
     }
     let contains_forbidden = content_contains_forbidden(translation, cancellation)?;
     if contains_forbidden {
-        return Err(ProjectLuaCallError::new(
-            "invalid_translation",
-            "RPG Maker translation 包含该结构不允许的 CR、LF 或 NUL",
+        return Err(rpg_maker_call_violation(
+            crate::diagnostic::LuaValueViolation::InvalidTranslation,
         ));
     }
     validate_text_unit_content_structure(kind, role, TextUnitContentView::from(translation))
-        .map_err(|source| {
-            ProjectLuaCallError::new(
-                "invalid_translation",
-                format!("RPG Maker translation 结构与 Unit 不匹配：{source:?}"),
-            )
+        .map_err(|_| {
+            rpg_maker_call_violation(crate::diagnostic::LuaValueViolation::InvalidTranslation)
         })?;
     cancellation.ensure_running()?;
     if matches!(role, TextUnitRole::Choices | TextUnitRole::ScrollingText) {
@@ -1131,21 +1137,15 @@ fn validate_translation_structure(
             .as_lines()
             .expect("严格对齐角色的译文必须是行数组");
         if source_lines.len() != translation_lines.len() {
-            return Err(ProjectLuaCallError::new(
-                "invalid_translation",
-                format!(
-                    "严格对齐 Unit 的译文项数必须是 {}，实际为 {}",
-                    source_lines.len(),
-                    translation_lines.len()
-                ),
+            return Err(rpg_maker_call_violation(
+                crate::diagnostic::LuaValueViolation::InvalidTranslation,
             ));
         }
         for (source, translation) in source_lines.iter().zip(translation_lines) {
             cancellation.ensure_running()?;
             if text_is_blank(source, cancellation)? != text_is_blank(translation, cancellation)? {
-                return Err(ProjectLuaCallError::new(
-                    "invalid_translation",
-                    "严格对齐 Unit 的空白槽位置不能改变",
+                return Err(rpg_maker_call_violation(
+                    crate::diagnostic::LuaValueViolation::InvalidTranslation,
                 ));
             }
         }
@@ -1193,9 +1193,8 @@ fn validate_translation_placeholders(
     let source_multiset = placeholder_multiset(source_placeholders, cancellation)?;
     let translation_multiset = placeholder_multiset(&translation_placeholders, cancellation)?;
     if !source_multiset.eq_with_cancellation(&translation_multiset, cancellation)? {
-        return Err(ProjectLuaCallError::new(
-            "placeholder_mismatch",
-            "人工译文没有完整保留原文实际命中的 Placeholder",
+        return Err(rpg_maker_call_violation(
+            crate::diagnostic::LuaValueViolation::InvalidTranslation,
         ));
     }
     cancellation.ensure_running()?;
@@ -1227,9 +1226,8 @@ fn validate_unchanged_current_placeholders(
     let source_multiset = placeholder_multiset(source_placeholders, cancellation)?;
     let translation_multiset = placeholder_multiset(&translation_placeholders, cancellation)?;
     if !source_multiset.builtin_eq_with_cancellation(&translation_multiset, cancellation)? {
-        return Err(ProjectLuaCallError::new(
-            "placeholder_mismatch",
-            "已有 Current 没有完整保留原文要求的 Builtin 控制符",
+        return Err(rpg_maker_call_violation(
+            crate::diagnostic::LuaValueViolation::InvalidTranslation,
         ));
     }
     cancellation.ensure_running()?;
@@ -1245,7 +1243,7 @@ fn compile_placeholder_rules(
         parse_json_with_cancellation(canonical_json, "Placeholder 资源", cancellation)?;
     let canonical = encode_json_with_cancellation(&definitions, "Placeholder 资源", cancellation)?;
     if !text_eq_with_cancellation(&canonical, canonical_json, cancellation)? {
-        return Err(invalid_database("Placeholder 资源不是规范紧凑 JSON"));
+        return Err(rpg_maker_state_error());
     }
     cancellation.ensure_running()?;
     let compiled = service
@@ -1263,7 +1261,7 @@ fn compile_terminology_resource(
         parse_json_with_cancellation(canonical_json, "terminology 资源", cancellation)?;
     let canonical = encode_json_with_cancellation(&entries, "terminology", cancellation)?;
     if !text_eq_with_cancellation(&canonical, canonical_json, cancellation)? {
-        return Err(invalid_database("terminology 资源不是规范紧凑 JSON"));
+        return Err(rpg_maker_state_error());
     }
     cancellation.ensure_running()?;
     match compile_terminology_with_cancellation(entries, &|| cancellation.ensure_running().is_err())
@@ -1273,15 +1271,12 @@ fn compile_terminology_resource(
             Ok(Arc::new(terminology))
         }
         Err(TerminologyDefinitionError::Cancelled) => Err(rpg_maker_lua_cancelled()),
-        Err(TerminologyDefinitionError::StartWorker { operation, source }) => {
-            Err(ProjectLuaCallError::new(
-                "worker_spawn",
-                project_lua_worker_spawn_message(operation, &source),
-            ))
-        }
-        Err(source) => Err(invalid_database(format!(
-            "terminology 资源语义无效：{source}"
-        ))),
+        Err(TerminologyDefinitionError::StartWorker {
+            operation: _,
+            source,
+        }) => Err(ProjectLuaCallError::worker_spawn(source)
+            .with_engine(crate::diagnostic::LuaEngine::RpgMaker)),
+        Err(_) => Err(rpg_maker_state_error()),
     }
 }
 
@@ -1323,26 +1318,21 @@ fn load_group_terminology_dependencies(
     cancellation.ensure_running()?;
     let mut statement = connection
         .prepare(
-            "SELECT unit.group_location, text_group.group_kind,
+            "SELECT text_group.group_location, text_group.group_kind,
                     unit.source_content_json
              FROM main.rpg_maker_text_unit AS unit
              JOIN main.rpg_maker_text_group AS text_group
                ON text_group.owner = unit.owner
-              AND text_group.group_location = unit.group_location
+               AND text_group.group_id = unit.group_id
              ORDER BY text_group.semantic_order_key,
                       unit.semantic_order_key,
                       CASE unit.owner WHEN 'builtin' THEN 0 WHEN 'rules' THEN 1 END",
         )
-        .map_err(|source| invalid_database(format!("读取完整 Group 术语事实失败：{source}")))?;
-    let mut rows = statement
-        .query([])
-        .map_err(|source| invalid_database(format!("读取完整 Group 术语事实失败：{source}")))?;
+        .map_err(|_| rpg_maker_state_error())?;
+    let mut rows = statement.query([]).map_err(|_| rpg_maker_state_error())?;
     let mut groups =
         HashMap::<String, (TextGroupKind, BTreeMap<usize, TerminologyDependency>)>::new();
-    while let Some(row) = rows
-        .next()
-        .map_err(|source| invalid_database(format!("读取完整 Group 术语事实失败：{source}")))?
-    {
+    while let Some(row) = rows.next().map_err(|_| rpg_maker_state_error())? {
         cancellation.ensure_running()?;
         let location_raw = sqlite_text_with_cancellation(row, 0, "group_location", cancellation)
             .map_err(|source| {
@@ -1355,8 +1345,7 @@ fn load_group_terminology_dependencies(
             sqlite_text_with_cancellation(row, 2, "source_content_json", cancellation).map_err(
                 |source| invalid_database_sqlite_read_error(source, "读取完整 Group 术语事实失败"),
             )?;
-        let kind = TextGroupKind::from_storage_name(&kind_raw)
-            .ok_or_else(|| invalid_database("完整 Group 术语事实包含无效 kind"))?;
+        let kind = TextGroupKind::from_storage_name(&kind_raw).ok_or_else(rpg_maker_state_error)?;
         let source: TextUnitContent =
             parse_json_with_cancellation(&source_json, "完整 Group 术语事实原文", cancellation)?;
         let facts = prepare_current_resource_facts(
@@ -1369,15 +1358,13 @@ fn load_group_terminology_dependencies(
             cancellation,
         )?;
         if facts.term_indices().len() != facts.terminology_dependencies().len() {
-            return Err(invalid_database("完整 Group 术语索引与依赖数量不一致"));
+            return Err(rpg_maker_state_error());
         }
         let (group_kind, dependencies) = groups
             .entry(location_raw.clone())
             .or_insert_with(|| (kind, BTreeMap::new()));
         if *group_kind != kind {
-            return Err(invalid_database(format!(
-                "跨 owner 的 Group kind 不一致：{location_raw}"
-            )));
+            return Err(rpg_maker_state_error());
         }
         for (&term_index, dependency) in facts
             .term_indices()
@@ -1387,9 +1374,7 @@ fn load_group_terminology_dependencies(
             cancellation.ensure_running()?;
             if let Some(existing) = dependencies.get(&term_index) {
                 if existing != dependency {
-                    return Err(invalid_database(format!(
-                        "相同术语索引产生了不一致依赖：{location_raw} / {term_index}"
-                    )));
+                    return Err(rpg_maker_state_error());
                 }
             } else {
                 dependencies.insert(term_index, dependency.clone());
@@ -1408,21 +1393,18 @@ fn load_group_terminology_dependencies(
     Ok(completed)
 }
 
-fn resource_semantic_error(source: ResolvedTranslationSemanticError) -> ProjectLuaCallError {
-    invalid_database(format!(
-        "无法按当前 Placeholder 与 Terminology 建立 Unit 资源事实：{source}"
-    ))
+fn resource_semantic_error(_source: ResolvedTranslationSemanticError) -> ProjectLuaCallError {
+    rpg_maker_state_error()
 }
 
 fn placeholder_compilation_error(source: PlaceholderRuleCompilationError) -> ProjectLuaCallError {
     match source {
-        PlaceholderRuleCompilationError::StartWorker { operation, source } => {
-            ProjectLuaCallError::new(
-                "worker_spawn",
-                project_lua_worker_spawn_message(operation, &source),
-            )
-        }
-        source => invalid_database(format!("Placeholder 资源语义无效：{source}")),
+        PlaceholderRuleCompilationError::StartWorker {
+            operation: _,
+            source,
+        } => ProjectLuaCallError::worker_spawn(source)
+            .with_engine(crate::diagnostic::LuaEngine::RpgMaker),
+        _ => rpg_maker_state_error(),
     }
 }
 
@@ -1446,14 +1428,20 @@ fn protect_content(
             custom,
             || cancellation.ensure_running(),
         )?
-        .map_err(|source| {
-            ProjectLuaCallError::new(
-                "placeholder",
-                format!("无法按当前规则保护 RPG Maker 文本：{source}"),
-            )
-        })?;
+        .map_err(placeholder_protection_error)?;
     cancellation.ensure_running()?;
     Ok(protected.into_parts().1)
+}
+
+fn placeholder_protection_error(source: PlaceholderProtectionError) -> ProjectLuaCallError {
+    match source {
+        PlaceholderProtectionError::StartWorker {
+            operation: _,
+            source,
+        } => ProjectLuaCallError::worker_spawn(source)
+            .with_engine(crate::diagnostic::LuaEngine::RpgMaker),
+        _ => rpg_maker_call_violation(crate::diagnostic::LuaValueViolation::InvalidTranslation),
+    }
 }
 
 fn content_text_and_line_boundaries(
@@ -1790,12 +1778,8 @@ impl TerminologyDependencyProof {
     }
 }
 
-fn manual_state_error(source: ManualTranslationStateError) -> ProjectLuaCallError {
-    ProjectLuaCallError::new("translation_state", source.to_string())
-}
-
-fn invalid_database(message: impl Into<String>) -> ProjectLuaCallError {
-    ProjectLuaCallError::new("rpg_maker_project", message)
+fn manual_state_error(_source: ManualTranslationStateError) -> ProjectLuaCallError {
+    rpg_maker_state_error()
 }
 
 fn with_unit_locator(
@@ -1804,17 +1788,11 @@ fn with_unit_locator(
     group_location: &str,
     unit_role: &str,
 ) -> ProjectLuaCallError {
-    ProjectLuaCallError::new(
-        source.kind(),
-        format!(
-            "Unit locator owner={owner}, group_location={group_location}, unit_role={unit_role}：{}",
-            source.message()
-        ),
-    )
+    source.with_rpg_maker_locator(owner, group_location, unit_role)
 }
 
 fn rpg_maker_lua_cancelled() -> ProjectLuaCallError {
-    ProjectLuaCallError::new("cancelled", "RPG Maker Lua 项目处理已取消")
+    ProjectLuaCallError::cancelled().with_engine(crate::diagnostic::LuaEngine::RpgMaker)
 }
 
 const CANCELLATION_TEXT_CHUNK_BYTES: usize = 64 * 1024;
@@ -2105,24 +2083,20 @@ fn clone_sqlite_blob_with_cancellation(
 
 fn invalid_database_sqlite_read_error(
     source: CancellableSqliteReadError,
-    operation: &'static str,
+    _operation: &'static str,
 ) -> ProjectLuaCallError {
     match source {
-        CancellableSqliteReadError::Sqlite(source) => {
-            invalid_database(format!("{operation}：{source}"))
-        }
+        CancellableSqliteReadError::Sqlite(source) => rpg_maker_sqlite_error(source),
         CancellableSqliteReadError::Cancelled(source) => source,
     }
 }
 
 fn lua_sqlite_read_error(
     source: CancellableSqliteReadError,
-    operation: &'static str,
+    _operation: &'static str,
 ) -> ProjectLuaCallError {
     match source {
-        CancellableSqliteReadError::Sqlite(source) => {
-            ProjectLuaCallError::new("sqlite", format!("{operation}：{source}"))
-        }
+        CancellableSqliteReadError::Sqlite(source) => rpg_maker_sqlite_error(source),
         CancellableSqliteReadError::Cancelled(source) => source,
     }
 }
@@ -2220,7 +2194,7 @@ impl Read for CancellableJsonReader<'_> {
 
 fn parse_json_with_cancellation<T>(
     source: &str,
-    label: &str,
+    _label: &str,
     cancellation: RpgMakerLuaCancellation<'_>,
 ) -> Result<T, ProjectLuaCallError>
 where
@@ -2228,7 +2202,7 @@ where
 {
     match deserialize_json_with_cancellation(source, cancellation)? {
         Ok(value) => Ok(value),
-        Err(source) => Err(invalid_database(format!("{label} JSON 无效：{source}"))),
+        Err(_) => Err(rpg_maker_state_error()),
     }
 }
 
@@ -2294,7 +2268,7 @@ impl Write for CancellableJsonWriter<'_> {
 
 fn encode_json_with_cancellation<T>(
     value: &T,
-    label: &str,
+    _label: &str,
     cancellation: RpgMakerLuaCancellation<'_>,
 ) -> Result<String, ProjectLuaCallError>
 where
@@ -2313,18 +2287,17 @@ where
             Ok(String::from_utf8(writer.output).expect("serde_json 必须生成有效 UTF-8"))
         }
         Err(_) if writer.cancelled => Err(rpg_maker_lua_cancelled()),
-        Err(source) => Err(invalid_database(format!("无法重新编码 {label}：{source}"))),
+        Err(_) => Err(rpg_maker_state_error()),
     }
 }
 
 fn parse_canonical_language(
     value: &str,
-    field: &'static str,
+    _field: &'static str,
 ) -> Result<LanguageId, ProjectLuaCallError> {
-    let language = LanguageId::parse(value)
-        .map_err(|source| invalid_database(format!("{field} 无效：{source}")))?;
+    let language = LanguageId::parse(value).map_err(|_| rpg_maker_state_error())?;
     if language.as_str() != value {
-        return Err(invalid_database(format!("{field} 不是规范语言 ID")));
+        return Err(rpg_maker_state_error());
     }
     Ok(language)
 }
@@ -2340,15 +2313,12 @@ fn capture_rpg_maker_translation_baseline(
             "SELECT source_language, target_language
              FROM main.metadata",
         )
-        .map_err(|source| invalid_database(format!("读取脚本前语言对失败：{source}")))?;
+        .map_err(|_| rpg_maker_state_error())?;
     let mut metadata_rows = metadata_statement
         .query([])
-        .map_err(|source| invalid_database(format!("读取脚本前语言对失败：{source}")))?;
+        .map_err(|_| rpg_maker_state_error())?;
     let mut metadata = Vec::new();
-    while let Some(row) = metadata_rows
-        .next()
-        .map_err(|source| invalid_database(format!("读取脚本前语言对失败：{source}")))?
-    {
+    while let Some(row) = metadata_rows.next().map_err(|_| rpg_maker_state_error())? {
         cancellation.ensure_running()?;
         metadata.push((
             sqlite_text_with_cancellation(row, 0, "source_language", cancellation).map_err(
@@ -2362,7 +2332,7 @@ fn capture_rpg_maker_translation_baseline(
     drop(metadata_rows);
     drop(metadata_statement);
     if metadata.len() != 1 {
-        return Err(invalid_database("脚本前 metadata 必须恰好包含一行"));
+        return Err(rpg_maker_state_error());
     }
     let (source_language, target_language) = metadata.pop().expect("长度已确认");
     cancellation.ensure_running()?;
@@ -2379,15 +2349,12 @@ fn capture_rpg_maker_translation_baseline(
              FROM main.rpg_maker_translation_resource
              ORDER BY resource_kind",
         )
-        .map_err(|source| invalid_database(format!("读取脚本前翻译资源失败：{source}")))?;
+        .map_err(|_| rpg_maker_state_error())?;
     let mut resource_query = resource_statement
         .query([])
-        .map_err(|source| invalid_database(format!("读取脚本前翻译资源失败：{source}")))?;
+        .map_err(|_| rpg_maker_state_error())?;
     let mut resource_rows = Vec::new();
-    while let Some(row) = resource_query
-        .next()
-        .map_err(|source| invalid_database(format!("读取脚本前翻译资源失败：{source}")))?
-    {
+    while let Some(row) = resource_query.next().map_err(|_| rpg_maker_state_error())? {
         cancellation.ensure_running()?;
         resource_rows.push((
             sqlite_text_with_cancellation(row, 0, "resource_kind", cancellation).map_err(
@@ -2401,31 +2368,23 @@ fn capture_rpg_maker_translation_baseline(
     drop(resource_query);
     drop(resource_statement);
     if resource_rows.len() != 2 {
-        return Err(invalid_database(
-            "脚本前 rpg_maker_translation_resource 必须恰好包含两项",
-        ));
+        return Err(rpg_maker_state_error());
     }
     let placeholder_json = resource_rows
         .iter()
         .find_map(|(kind, json)| (kind == "placeholder_rules").then_some(json))
-        .ok_or_else(|| invalid_database("脚本前缺少 placeholder_rules 资源"))?;
+        .ok_or_else(rpg_maker_state_error)?;
     let terminology_json = resource_rows
         .iter()
         .find_map(|(kind, json)| (kind == "terminology").then_some(json))
-        .ok_or_else(|| invalid_database("脚本前缺少 terminology 资源"))?;
+        .ok_or_else(rpg_maker_state_error)?;
     let placeholder_json = clone_text_with_cancellation(placeholder_json, cancellation)?;
     let terminology_json = clone_text_with_cancellation(terminology_json, cancellation)?;
     drop(resource_rows);
     cancellation.ensure_running()?;
     let placeholder_service =
-        Pcre2PlaceholderService::new_with_cancellation(|| cancellation.ensure_running())?.map_err(
-            |source| {
-                ProjectLuaCallError::new(
-                    "internal",
-                    format!("无法建立 RPG Maker 内置 Placeholder：{source}"),
-                )
-            },
-        )?;
+        Pcre2PlaceholderService::new_with_cancellation(|| cancellation.ensure_running())?
+            .map_err(|_| rpg_maker_state_error())?;
     cancellation.ensure_running()?;
     let placeholder_rules =
         compile_placeholder_rules(&placeholder_service, &placeholder_json, cancellation)?;
@@ -2443,27 +2402,24 @@ fn capture_rpg_maker_translation_baseline(
     cancellation.ensure_running()?;
     let mut current_statement = connection
         .prepare(
-            "SELECT unit.owner, unit.group_location, unit.unit_role,
+            "SELECT unit.owner, text_group.group_location, unit.unit_role,
                     text_group.group_kind, unit.source_content_json,
                     unit.source_context_json, unit.translation_content_json,
                     unit.translation_state
              FROM main.rpg_maker_text_unit AS unit
              JOIN main.rpg_maker_text_group AS text_group
                ON text_group.owner = unit.owner
-              AND text_group.group_location = unit.group_location
+               AND text_group.group_id = unit.group_id
              WHERE unit.translation_content_json IS NOT NULL
                 OR unit.translation_state IS NOT NULL",
         )
-        .map_err(|source| invalid_database(format!("读取脚本前 Current 失败：{source}")))?;
+        .map_err(|_| rpg_maker_state_error())?;
     let mut current_rows = current_statement
         .query([])
-        .map_err(|source| invalid_database(format!("读取脚本前 Current 失败：{source}")))?;
+        .map_err(|_| rpg_maker_state_error())?;
 
     let mut currents = RpgMakerCurrentBaselines::default();
-    while let Some(current_row) = current_rows
-        .next()
-        .map_err(|source| invalid_database(format!("读取脚本前 Current 失败：{source}")))?
-    {
+    while let Some(current_row) = current_rows.next().map_err(|_| rpg_maker_state_error())? {
         cancellation.ensure_running()?;
         let owner_raw = sqlite_text_with_cancellation(current_row, 0, "owner", cancellation)
             .map_err(|source| {
@@ -2508,28 +2464,26 @@ fn capture_rpg_maker_translation_baseline(
         let (Some(translation_content_json), Some(translation_state)) =
             (translation_content_json, translation_state)
         else {
-            return Err(invalid_database(
-                "脚本前 Unit 译文与状态必须同时存在或同时为空",
-            ));
+            return Err(rpg_maker_state_error());
         };
         cancellation.ensure_running()?;
         let translation_state = Sha256Fingerprint::from_slice(&translation_state)
-            .map_err(|source| invalid_database(format!("脚本前 Unit 译文状态无效：{source}")))?;
-        let owner = RpgMakerAssetOwner::from_storage_name(&owner_raw)
-            .ok_or_else(|| invalid_database("脚本前 Unit owner 无效"))?;
-        let kind = TextGroupKind::from_storage_name(&group_kind)
-            .ok_or_else(|| invalid_database("脚本前 Unit group_kind 无效"))?;
-        let location = RpgMakerLocationCodec::decode(&group_location)
-            .map_err(|source| invalid_database(format!("脚本前 Unit 位置无效：{source}")))?;
+            .map_err(|_| rpg_maker_state_error())?;
+        let owner =
+            RpgMakerAssetOwner::from_storage_name(&owner_raw).ok_or_else(rpg_maker_state_error)?;
+        let kind =
+            TextGroupKind::from_storage_name(&group_kind).ok_or_else(rpg_maker_state_error)?;
+        let location =
+            RpgMakerLocationCodec::decode(&group_location).map_err(|_| rpg_maker_state_error())?;
         let role = RpgMakerProjectionCodec::decode_role(&unit_role)
-            .map_err(|source| invalid_database(format!("脚本前 Unit role 无效：{source}")))?;
+            .map_err(|_| rpg_maker_state_error())?;
         cancellation.ensure_running()?;
         let source: TextUnitContent =
             parse_json_with_cancellation(&source_content_json, "脚本前 Unit 原文", cancellation)?;
         let context: serde_json::Value =
             parse_json_with_cancellation(&source_context_json, "脚本前 Unit 上下文", cancellation)?;
         if !context.is_object() {
-            return Err(invalid_database("脚本前 Unit 上下文必须是 JSON object"));
+            return Err(rpg_maker_state_error());
         }
         let resource_facts = prepare_current_resource_facts(
             engine,
@@ -2551,7 +2505,7 @@ fn capture_rpg_maker_translation_baseline(
         let group_context = group_contexts
             .get(&group_location)
             .copied()
-            .ok_or_else(|| invalid_database("脚本前 Current 缺少完整 Group 语境"))?;
+            .ok_or_else(rpg_maker_state_error)?;
         let manual_state = manual_translation_state_fingerprint_with_cancellation(
             engine,
             &language_pair,
@@ -2566,7 +2520,7 @@ fn capture_rpg_maker_translation_baseline(
         } else {
             let terminology_dependencies = group_terminology_dependencies
                 .get(&group_location)
-                .ok_or_else(|| invalid_database("脚本前 Current 缺少完整 Group 术语事实"))?;
+                .ok_or_else(rpg_maker_state_error)?;
             RpgMakerTranslationOrigin::Automatic(TerminologyDependencyProof::from_dependencies(
                 terminology_dependencies,
                 cancellation,
@@ -2583,7 +2537,7 @@ fn capture_rpg_maker_translation_baseline(
             origin,
         };
         if !currents.insert(owner_raw, group_location, unit_role, baseline, cancellation)? {
-            return Err(invalid_database("脚本前 Unit 身份重复"));
+            return Err(rpg_maker_state_error());
         }
     }
     drop(current_rows);
@@ -2657,26 +2611,21 @@ fn validate_metadata_and_resources(
                     help_description_max_fullwidth_chars
              FROM main.metadata",
         )
-        .map_err(|source| invalid_database(format!("读取 metadata 失败：{source}")))?;
+        .map_err(|_| rpg_maker_state_error())?;
     let mut metadata_rows = metadata_statement
         .query([])
-        .map_err(|source| invalid_database(format!("读取 metadata 失败：{source}")))?;
+        .map_err(|_| rpg_maker_state_error())?;
     let mut metadata = Vec::new();
-    while let Some(row) = metadata_rows
-        .next()
-        .map_err(|source| invalid_database(format!("读取 metadata 失败：{source}")))?
-    {
+    while let Some(row) = metadata_rows.next().map_err(|_| rpg_maker_state_error())? {
         cancellation.ensure_running()?;
         for (index, column) in [
             (4, "dialogue_max_fullwidth_chars"),
             (5, "scrolling_text_max_fullwidth_chars"),
             (6, "help_description_max_fullwidth_chars"),
         ] {
-            let value = row
-                .get_ref(index)
-                .map_err(|source| invalid_database(format!("读取 metadata 失败：{source}")))?;
+            let value = row.get_ref(index).map_err(|_| rpg_maker_state_error())?;
             max_fullwidth_chars_from_rusqlite_value(value, column)
-                .map_err(|source| invalid_database(source.safe_fact()))?;
+                .map_err(|_| rpg_maker_state_error())?;
         }
         metadata.push((
             sqlite_text_with_cancellation(row, 0, "name", cancellation).map_err(|source| {
@@ -2698,17 +2647,16 @@ fn validate_metadata_and_resources(
     drop(metadata_statement);
     cancellation.ensure_running()?;
     let [(name, source_language, target_language, source_fingerprint)] = metadata.as_slice() else {
-        return Err(invalid_database("metadata 必须恰好包含一行"));
+        return Err(rpg_maker_state_error());
     };
     name.parse::<ProjectName>()
-        .map_err(|source| invalid_database(format!("metadata.name 无效：{source}")))?;
+        .map_err(|_| rpg_maker_state_error())?;
     if name != expected_project_name {
-        return Err(invalid_database("metadata.name 与本次命令选中的项目不一致"));
+        return Err(rpg_maker_state_error());
     }
     let source_language = parse_canonical_language(source_language, "metadata.source_language")?;
     let target_language = parse_canonical_language(target_language, "metadata.target_language")?;
-    Sha256Fingerprint::from_slice(source_fingerprint)
-        .map_err(|source| invalid_database(format!("metadata 来源指纹无效：{source}")))?;
+    Sha256Fingerprint::from_slice(source_fingerprint).map_err(|_| rpg_maker_state_error())?;
 
     cancellation.ensure_running()?;
     let mut resource_statement = connection
@@ -2717,15 +2665,12 @@ fn validate_metadata_and_resources(
              FROM main.rpg_maker_translation_resource
              ORDER BY resource_kind",
         )
-        .map_err(|source| invalid_database(format!("读取翻译资源失败：{source}")))?;
+        .map_err(|_| rpg_maker_state_error())?;
     let mut resource_rows = resource_statement
         .query([])
-        .map_err(|source| invalid_database(format!("读取翻译资源失败：{source}")))?;
+        .map_err(|_| rpg_maker_state_error())?;
     let mut resources = Vec::new();
-    while let Some(row) = resource_rows
-        .next()
-        .map_err(|source| invalid_database(format!("读取翻译资源失败：{source}")))?
-    {
+    while let Some(row) = resource_rows.next().map_err(|_| rpg_maker_state_error())? {
         cancellation.ensure_running()?;
         resources.push((
             sqlite_text_with_cancellation(row, 0, "resource_kind", cancellation)
@@ -2738,14 +2683,12 @@ fn validate_metadata_and_resources(
     drop(resource_statement);
     cancellation.ensure_running()?;
     if resources.len() != 2 {
-        return Err(invalid_database(
-            "rpg_maker_translation_resource 必须恰好包含两项",
-        ));
+        return Err(rpg_maker_state_error());
     }
     let terminology = resources
         .iter()
         .find_map(|(kind, json)| (kind == "terminology").then_some(json))
-        .ok_or_else(|| invalid_database("缺少 terminology 资源"))?;
+        .ok_or_else(rpg_maker_state_error)?;
     let terminology = if text_eq_with_cancellation(
         &translation_baseline.terminology_cache.canonical_json,
         terminology,
@@ -2759,7 +2702,7 @@ fn validate_metadata_and_resources(
     let placeholder = resources
         .iter()
         .find_map(|(kind, json)| (kind == "placeholder_rules").then_some(json))
-        .ok_or_else(|| invalid_database("缺少 placeholder_rules 资源"))?;
+        .ok_or_else(rpg_maker_state_error)?;
     let service = translation_baseline.placeholder_cache.service.clone();
     let placeholder_rules = if text_eq_with_cancellation(
         &translation_baseline.placeholder_cache.canonical_json,
@@ -2777,14 +2720,14 @@ fn validate_metadata_and_resources(
             "SELECT definition_kind, canonical_json
              FROM main.rpg_maker_project_definition",
         )
-        .map_err(|source| invalid_database(format!("读取项目定义失败：{source}")))?;
+        .map_err(|_| rpg_maker_state_error())?;
     let mut definition_rows = definition_statement
         .query([])
-        .map_err(|source| invalid_database(format!("读取项目定义失败：{source}")))?;
+        .map_err(|_| rpg_maker_state_error())?;
     let mut definitions = Vec::new();
     while let Some(row) = definition_rows
         .next()
-        .map_err(|source| invalid_database(format!("读取项目定义失败：{source}")))?
+        .map_err(|_| rpg_maker_state_error())?
     {
         cancellation.ensure_running()?;
         definitions.push((
@@ -2798,16 +2741,14 @@ fn validate_metadata_and_resources(
     drop(definition_statement);
     cancellation.ensure_running()?;
     if definitions.len() != 1 {
-        return Err(invalid_database(
-            "rpg_maker_project_definition 必须恰好包含一项",
-        ));
+        return Err(rpg_maker_state_error());
     }
     let (kind, canonical_json) = definitions.pop().expect("长度已确认");
     if kind != "mv_dialogue_rules" {
-        return Err(invalid_database("项目定义种类无效"));
+        return Err(rpg_maker_state_error());
     }
     validate_mv_dialogue_definition_canonical_json(&canonical_json)
-        .map_err(|source| invalid_database(source.safe_fact()))?;
+        .map_err(|_| rpg_maker_state_error())?;
     cancellation.ensure_running()?;
     Ok(ValidatedRpgMakerResources {
         dialogue_definition_json: canonical_json,
@@ -2825,15 +2766,10 @@ fn validate_run_plans(
     cancellation.ensure_running()?;
     let mut statement = connection
         .prepare(SELECT_RUN_PLAN_SINGLETONS)
-        .map_err(|source| invalid_database(format!("读取运行方案失败：{source}")))?;
-    let mut query = statement
-        .query([])
-        .map_err(|source| invalid_database(format!("读取运行方案失败：{source}")))?;
+        .map_err(|_| rpg_maker_state_error())?;
+    let mut query = statement.query([]).map_err(|_| rpg_maker_state_error())?;
     let mut rows = Vec::new();
-    while let Some(row) = query
-        .next()
-        .map_err(|source| invalid_database(format!("读取运行方案失败：{source}")))?
-    {
+    while let Some(row) = query.next().map_err(|_| rpg_maker_state_error())? {
         cancellation.ensure_running()?;
         let mut values = Vec::with_capacity(5);
         for index in 0..5 {
@@ -2848,15 +2784,9 @@ fn validate_run_plans(
     drop(query);
     drop(statement);
     cancellation.ensure_running()?;
-    let plans = decode_project_run_plans(rows).map_err(|source| {
-        invalid_database(format!(
-            "{}：{}",
-            source.safe_subject(),
-            source.safe_detail()
-        ))
-    })?;
+    let plans = decode_project_run_plans(rows).map_err(|_| rpg_maker_state_error())?;
     if plans.init().is_none() {
-        return Err(invalid_database("Init 运行方案必须存在"));
+        return Err(rpg_maker_state_error());
     }
     cancellation.ensure_running()
 }
@@ -2910,15 +2840,12 @@ fn validate_assets(
              FROM main.rpg_maker_asset_owner_state
              ORDER BY CASE owner WHEN 'builtin' THEN 0 WHEN 'rules' THEN 1 END",
         )
-        .map_err(|source| invalid_database(format!("读取资产 owner 失败：{source}")))?;
+        .map_err(|_| rpg_maker_state_error())?;
     let mut owner_rows = owner_statement
         .query([])
-        .map_err(|source| invalid_database(format!("读取资产 owner 失败：{source}")))?;
+        .map_err(|_| rpg_maker_state_error())?;
     let mut owner_fingerprints = HashMap::new();
-    while let Some(owner_row) = owner_rows
-        .next()
-        .map_err(|source| invalid_database(format!("读取资产 owner 失败：{source}")))?
-    {
+    while let Some(owner_row) = owner_rows.next().map_err(|_| rpg_maker_state_error())? {
         cancellation.ensure_running()?;
         let owner_raw = sqlite_text_with_cancellation(owner_row, 0, "owner", cancellation)
             .map_err(|source| invalid_database_sqlite_read_error(source, "读取资产 owner 失败"))?;
@@ -2934,15 +2861,14 @@ fn validate_assets(
                 .map_err(|source| {
                     invalid_database_sqlite_read_error(source, "读取资产 owner 失败")
                 })?;
-        let owner = RpgMakerAssetOwner::from_storage_name(&owner_raw)
-            .ok_or_else(|| invalid_database("资产 owner 无效"))?;
+        let owner =
+            RpgMakerAssetOwner::from_storage_name(&owner_raw).ok_or_else(rpg_maker_state_error)?;
         cancellation.ensure_running()?;
-        Sha256Fingerprint::from_slice(&source_fingerprint)
-            .map_err(|source| invalid_database(format!("owner 来源指纹无效：{source}")))?;
+        Sha256Fingerprint::from_slice(&source_fingerprint).map_err(|_| rpg_maker_state_error())?;
         let asset = Sha256Fingerprint::from_slice(&asset_fingerprint)
-            .map_err(|source| invalid_database(format!("owner 资产指纹无效：{source}")))?;
+            .map_err(|_| rpg_maker_state_error())?;
         if owner_fingerprints.insert(owner, asset).is_some() {
-            return Err(invalid_database("资产 owner 重复"));
+            return Err(rpg_maker_state_error());
         }
     }
     drop(owner_rows);
@@ -2957,18 +2883,15 @@ fn validate_assets(
              ORDER BY CASE owner WHEN 'builtin' THEN 0 WHEN 'rules' THEN 1 END,
                       semantic_order_key",
         )
-        .map_err(|source| invalid_database(format!("读取 RPG Maker Group 失败：{source}")))?;
+        .map_err(|_| rpg_maker_state_error())?;
     let mut group_rows = group_statement
         .query([])
-        .map_err(|source| invalid_database(format!("读取 RPG Maker Group 失败：{source}")))?;
+        .map_err(|_| rpg_maker_state_error())?;
     let mut group_order_keys =
         HashMap::<RpgMakerAssetOwner, HashMap<RpgMakerSemanticOrderKey, String>>::new();
     let mut groups = Vec::new();
     let mut group_indexes = RpgMakerGroupIndexes::default();
-    while let Some(group_row) = group_rows
-        .next()
-        .map_err(|source| invalid_database(format!("读取 RPG Maker Group 失败：{source}")))?
-    {
+    while let Some(group_row) = group_rows.next().map_err(|_| rpg_maker_state_error())? {
         cancellation.ensure_running()?;
         let owner_raw = sqlite_text_with_cancellation(group_row, 0, "owner", cancellation)
             .map_err(|source| {
@@ -2992,35 +2915,33 @@ fn validate_assets(
                 .map_err(|source| {
                     invalid_database_sqlite_read_error(source, "读取 RPG Maker Group 失败")
                 })?;
-        let owner = RpgMakerAssetOwner::from_storage_name(&owner_raw)
-            .ok_or_else(|| invalid_database("Group owner 无效"))?;
+        let owner =
+            RpgMakerAssetOwner::from_storage_name(&owner_raw).ok_or_else(rpg_maker_state_error)?;
         if !owner_fingerprints.contains_key(&owner) {
-            return Err(invalid_database("Group 引用了未激活的 owner"));
+            return Err(rpg_maker_state_error());
         }
         let semantic_order_key = RpgMakerSemanticOrderKey::decode(&semantic_order_key)
-            .map_err(|source| invalid_database(format!("Group 顺序键无效：{source}")))?;
-        if let Some(first) = group_order_keys
+            .map_err(|_| rpg_maker_state_error())?;
+        if group_order_keys
             .entry(owner)
             .or_default()
             .insert(semantic_order_key.clone(), location_raw.clone())
+            .is_some()
         {
-            return Err(invalid_database(format!(
-                "不同 Group 使用了相同 semantic_order_key：{first} / {location_raw}"
-            )));
+            return Err(rpg_maker_state_error());
         }
         cancellation.ensure_running()?;
-        let location = RpgMakerLocationCodec::decode(&location_raw)
-            .map_err(|source| invalid_database(format!("Group 位置无效：{source}")))?;
-        let kind = TextGroupKind::from_storage_name(&kind_raw)
-            .ok_or_else(|| invalid_database("Group kind 无效"))?;
+        let location =
+            RpgMakerLocationCodec::decode(&location_raw).map_err(|_| rpg_maker_state_error())?;
+        let kind = TextGroupKind::from_storage_name(&kind_raw).ok_or_else(rpg_maker_state_error)?;
         cancellation.ensure_running()?;
         let recipes = RpgMakerProjectionCodec::decode_recipes(&recipes_raw)
-            .map_err(|source| invalid_database(format!("Group 配方无效：{source}")))?;
+            .map_err(|_| rpg_maker_state_error())?;
         cancellation.ensure_running()?;
         let index = groups.len();
         let indexed_location = clone_text_with_cancellation(&location_raw, cancellation)?;
         if !group_indexes.insert(owner, indexed_location, index, cancellation)? {
-            return Err(invalid_database("Group 身份重复"));
+            return Err(rpg_maker_state_error());
         }
         groups.push(StoredGroup {
             owner,
@@ -3040,24 +2961,21 @@ fn validate_assets(
     cancellation.ensure_running()?;
     let mut unit_statement = connection
         .prepare(
-            "SELECT unit.owner, unit.group_location, unit.unit_role, unit.semantic_order_key,
+            "SELECT unit.owner, text_group.group_location, unit.unit_role, unit.semantic_order_key,
                     unit.source_content_json, unit.source_context_json,
                     unit.translation_content_json, unit.translation_state
              FROM main.rpg_maker_text_unit AS unit
              JOIN main.rpg_maker_text_group AS text_group
                ON text_group.owner = unit.owner
-              AND text_group.group_location = unit.group_location
+               AND text_group.group_id = unit.group_id
              ORDER BY CASE unit.owner WHEN 'builtin' THEN 0 WHEN 'rules' THEN 1 END,
                       text_group.semantic_order_key, unit.semantic_order_key",
         )
-        .map_err(|source| invalid_database(format!("读取 RPG Maker Unit 失败：{source}")))?;
+        .map_err(|_| rpg_maker_state_error())?;
     let mut unit_rows = unit_statement
         .query([])
-        .map_err(|source| invalid_database(format!("读取 RPG Maker Unit 失败：{source}")))?;
-    while let Some(unit_row) = unit_rows
-        .next()
-        .map_err(|source| invalid_database(format!("读取 RPG Maker Unit 失败：{source}")))?
-    {
+        .map_err(|_| rpg_maker_state_error())?;
+    while let Some(unit_row) = unit_rows.next().map_err(|_| rpg_maker_state_error())? {
         cancellation.ensure_running()?;
         let owner_raw = sqlite_text_with_cancellation(unit_row, 0, "owner", cancellation).map_err(
             |source| invalid_database_sqlite_read_error(source, "读取 RPG Maker Unit 失败"),
@@ -3097,26 +3015,24 @@ fn validate_assets(
                 .map_err(|source| {
                     invalid_database_sqlite_read_error(source, "读取 RPG Maker Unit 失败")
                 })?;
-        let owner = RpgMakerAssetOwner::from_storage_name(&owner_raw)
-            .ok_or_else(|| invalid_database("Unit owner 无效"))?;
+        let owner =
+            RpgMakerAssetOwner::from_storage_name(&owner_raw).ok_or_else(rpg_maker_state_error)?;
         let index = group_indexes
             .get(owner, &location_raw, cancellation)?
-            .ok_or_else(|| invalid_database("Unit 缺少所属 Group"))?;
+            .ok_or_else(rpg_maker_state_error)?;
         let group = &mut groups[index];
         let semantic_order_key = RpgMakerSemanticOrderKey::decode(&semantic_order_key)
-            .map_err(|source| invalid_database(format!("Unit 顺序键无效：{source}")))?;
+            .map_err(|_| rpg_maker_state_error())?;
         if group
             .units
             .iter()
             .any(|unit| unit.semantic_order_key == semantic_order_key)
         {
-            return Err(invalid_database(
-                "同一 Group 的不同 Unit 使用了相同 semantic_order_key",
-            ));
+            return Err(rpg_maker_state_error());
         }
         cancellation.ensure_running()?;
-        let role = RpgMakerProjectionCodec::decode_role(&role_raw)
-            .map_err(|source| invalid_database(format!("Unit role 无效：{source}")))?;
+        let role =
+            RpgMakerProjectionCodec::decode_role(&role_raw).map_err(|_| rpg_maker_state_error())?;
         let source: TextUnitContent =
             parse_json_with_cancellation(&source_json, "Unit 原文", cancellation).map_err(
                 |source| with_unit_locator(source, &owner_raw, &location_raw, &role_raw),
@@ -3132,7 +3048,7 @@ fn validate_assets(
         let translation_state = match translation_state {
             Some(state) => Some(
                 Sha256Fingerprint::from_slice(&state)
-                    .map_err(|source| invalid_database(format!("Unit 译文状态无效：{source}")))
+                    .map_err(|_| rpg_maker_state_error())
                     .map_err(|source| {
                         with_unit_locator(source, &owner_raw, &location_raw, &role_raw)
                     })?,
@@ -3144,7 +3060,7 @@ fn validate_assets(
             (Some(_), Some(_)) => {}
             _ => {
                 return Err(with_unit_locator(
-                    invalid_database("Unit 译文与状态必须同时存在或同时为空"),
+                    rpg_maker_state_error(),
                     &owner_raw,
                     &location_raw,
                     &role_raw,
@@ -3157,7 +3073,7 @@ fn validate_assets(
             )?;
         if !context.is_object() {
             return Err(with_unit_locator(
-                invalid_database("Unit 上下文必须是 JSON object"),
+                rpg_maker_state_error(),
                 &owner_raw,
                 &location_raw,
                 &role_raw,
@@ -3170,7 +3086,7 @@ fn validate_assets(
                 .copied()
                 .ok_or_else(|| {
                     with_unit_locator(
-                        invalid_database("Unit 缺少完整 Group 语境"),
+                        rpg_maker_state_error(),
                         &owner_raw,
                         &location_raw,
                         &role_raw,
@@ -3221,9 +3137,7 @@ fn validate_assets(
                         .eq_with_cancellation(&placeholder_facts, cancellation)?;
                 if !unchanged_semantics {
                     return Err(with_unit_locator(
-                        invalid_database(
-                            "已有 Current 只允许在语义事实不变时保留原 translation_state",
-                        ),
+                        rpg_maker_state_error(),
                         &owner_raw,
                         &location_raw,
                         &role_raw,
@@ -3268,7 +3182,7 @@ fn validate_assets(
                         .get(&location_raw)
                         .ok_or_else(|| {
                             with_unit_locator(
-                                invalid_database("已有自动译文缺少完整 Group 术语事实"),
+                                rpg_maker_state_error(),
                                 &owner_raw,
                                 &location_raw,
                                 &role_raw,
@@ -3282,9 +3196,7 @@ fn validate_assets(
                         .eq_with_cancellation(&current_dependencies, cancellation)?
                     {
                         return Err(with_unit_locator(
-                            invalid_database(
-                                "已有自动译文只允许在完整 Group 实际命中的 Terminology 不变时保留原 translation_state",
-                            ),
+                            rpg_maker_state_error(),
                             &owner_raw,
                             &location_raw,
                             &role_raw,
@@ -3325,9 +3237,7 @@ fn validate_assets(
                 cancellation.ensure_running()?;
                 if manual_state != *state {
                     return Err(with_unit_locator(
-                        invalid_database(
-                            "新增或改写的 translation_state 必须等于当前 Unit 的人工译文状态",
-                        ),
+                        rpg_maker_state_error(),
                         &owner_raw,
                         &location_raw,
                         &role_raw,
@@ -3337,7 +3247,7 @@ fn validate_assets(
         }
         cancellation.ensure_running()?;
         let write_back = RpgMakerWriteBackUnit::new(role, source, translation)
-            .map_err(|source| invalid_database(format!("Unit 结构无效：{source}")))?;
+            .map_err(|_| rpg_maker_state_error())?;
         group.units.push(StoredUnit {
             role_raw,
             source_json,
@@ -3412,14 +3322,12 @@ fn validate_assets(
             write_back_units,
             recipes,
         )
-        .map_err(|source| invalid_database(format!("Group 领域结构无效：{source}")))?;
+        .map_err(|_| rpg_maker_state_error())?;
         cancellation.ensure_running()?;
         for lock in validated.mutation_claims().locks() {
             cancellation.ensure_running()?;
             let resource_key = RpgMakerProjectionCodec::encode_mutation_resource(lock.resource())
-                .map_err(|source| {
-                invalid_database(format!("无法编码 Group Claim：{source}"))
-            })?;
+                .map_err(|_| rpg_maker_state_error())?;
             cancellation.ensure_running()?;
             logical_claims
                 .entry(group.owner)
@@ -3441,20 +3349,20 @@ fn validate_assets(
     cancellation.ensure_running()?;
     let mut claim_statement = connection
         .prepare(
-            "SELECT owner, group_location, resource_key, access
-             FROM main.rpg_maker_mutation_claim
-             ORDER BY CASE owner WHEN 'builtin' THEN 0 WHEN 'rules' THEN 1 END,
-                      resource_key, access, group_location",
+            "SELECT claim.owner, text_group.group_location, claim.resource_key, claim.access
+             FROM main.rpg_maker_mutation_claim AS claim
+             JOIN main.rpg_maker_text_group AS text_group
+               ON text_group.owner = claim.owner
+              AND text_group.group_id = claim.group_id
+             ORDER BY CASE claim.owner WHEN 'builtin' THEN 0 WHEN 'rules' THEN 1 END,
+                      claim.resource_key, claim.access, text_group.group_location",
         )
-        .map_err(|source| invalid_database(format!("读取 Mutation Claim 失败：{source}")))?;
+        .map_err(|_| rpg_maker_state_error())?;
     let mut claim_rows = claim_statement
         .query([])
-        .map_err(|source| invalid_database(format!("读取 Mutation Claim 失败：{source}")))?;
+        .map_err(|_| rpg_maker_state_error())?;
     let mut stored_claims = HashMap::<RpgMakerAssetOwner, Vec<EncodedMutationClaim>>::new();
-    while let Some(claim_row) = claim_rows
-        .next()
-        .map_err(|source| invalid_database(format!("读取 Mutation Claim 失败：{source}")))?
-    {
+    while let Some(claim_row) = claim_rows.next().map_err(|_| rpg_maker_state_error())? {
         cancellation.ensure_running()?;
         let owner_raw = sqlite_text_with_cancellation(claim_row, 0, "owner", cancellation)
             .map_err(|source| {
@@ -3472,25 +3380,25 @@ fn validate_assets(
             .map_err(|source| {
                 invalid_database_sqlite_read_error(source, "读取 Mutation Claim 失败")
             })?;
-        let owner = RpgMakerAssetOwner::from_storage_name(&owner_raw)
-            .ok_or_else(|| invalid_database("Claim owner 无效"))?;
+        let owner =
+            RpgMakerAssetOwner::from_storage_name(&owner_raw).ok_or_else(rpg_maker_state_error)?;
         let semantic_order_key = group_indexes
             .get(owner, &location_raw, cancellation)?
             .and_then(|index| groups.get(index))
             .map(|group| group.semantic_order_key.clone())
-            .ok_or_else(|| invalid_database("Claim 缺少所属 Group"))?;
+            .ok_or_else(rpg_maker_state_error)?;
         cancellation.ensure_running()?;
         let resource = RpgMakerProjectionCodec::decode_mutation_resource(&resource_raw)
-            .map_err(|source| invalid_database(format!("Claim resource 无效：{source}")))?;
+            .map_err(|_| rpg_maker_state_error())?;
         if RpgMakerProjectionCodec::encode_mutation_resource(&resource)
-            .map_err(|source| invalid_database(format!("无法重新编码 Claim resource：{source}")))?
+            .map_err(|_| rpg_maker_state_error())?
             != resource_raw
         {
-            return Err(invalid_database("Claim resource 不是规范编码"));
+            return Err(rpg_maker_state_error());
         }
         cancellation.ensure_running()?;
         let access = MutationResourceAccess::from_storage_name(&access_raw)
-            .ok_or_else(|| invalid_database("Claim access 无效"))?;
+            .ok_or_else(rpg_maker_state_error)?;
         stored_claims
             .entry(owner)
             .or_default()
@@ -3508,12 +3416,11 @@ fn validate_assets(
         cancellation.ensure_running()?;
         let logical = logical_claims.remove(owner).unwrap_or_default();
         cancellation.ensure_running()?;
-        let expected_summary = collision_summary(&logical)
-            .map_err(|source| invalid_database(format!("Claim 语义冲突：{source}")))?;
+        let expected_summary = collision_summary(&logical).map_err(|_| rpg_maker_state_error())?;
         cancellation.ensure_running()?;
         let actual_summary = stored_claims.remove(owner).unwrap_or_default();
         if actual_summary != expected_summary {
-            return Err(invalid_database("Mutation Claim 摘要与 Group 配方不一致"));
+            return Err(rpg_maker_state_error());
         }
         let builder = fingerprint_builders
             .get_mut(owner)
@@ -3529,7 +3436,7 @@ fn validate_assets(
         }
     }
     if !stored_claims.is_empty() || !logical_claims.is_empty() {
-        return Err(invalid_database("Mutation Claim 引用了未激活 owner"));
+        return Err(rpg_maker_state_error());
     }
     for (owner, expected) in owner_fingerprints {
         cancellation.ensure_running()?;
@@ -3539,10 +3446,7 @@ fn validate_assets(
             .finish();
         cancellation.ensure_running()?;
         if actual != expected {
-            return Err(invalid_database(format!(
-                "{} 资产指纹与当前 Group、Unit、Claim 不一致",
-                owner.storage_name()
-            )));
+            return Err(rpg_maker_state_error());
         }
     }
     cancellation.ensure_running()
@@ -3573,6 +3477,32 @@ mod tests {
         ProjectLuaFailure, ProjectLuaProgram, ProjectLuaProject, ProjectLuaRunError,
         ProjectLuaRunRequest, run_project_lua,
     };
+
+    #[test]
+    fn placeholder_worker_start_keeps_typed_os_code() {
+        let compilation =
+            placeholder_compilation_error(PlaceholderRuleCompilationError::StartWorker {
+                operation: PlaceholderWorkerOperation::CompileCustomRules,
+                source: io::Error::from_raw_os_error(8),
+            });
+        assert_eq!(compilation.kind(), "worker_spawn");
+        assert!(matches!(
+            compilation.issue,
+            super::super::ProjectLuaCallIssue::WorkerSpawn { ref failure, .. }
+                if failure.raw_os_code == Some(8)
+        ));
+
+        let protection = placeholder_protection_error(PlaceholderProtectionError::StartWorker {
+            operation: PlaceholderWorkerOperation::MatchText,
+            source: io::Error::from_raw_os_error(8),
+        });
+        assert_eq!(protection.kind(), "worker_spawn");
+        assert!(matches!(
+            protection.issue,
+            super::super::ProjectLuaCallIssue::WorkerSpawn { ref failure, .. }
+                if failure.raw_os_code == Some(8)
+        ));
+    }
 
     struct TestProject {
         _temporary: tempfile::TempDir,
@@ -3737,8 +3667,8 @@ mod tests {
         transaction
             .execute(
                 "INSERT INTO rpg_maker_text_group
-                 (owner, group_location, semantic_order_key, group_kind, projection_recipe_json)
-                 VALUES ('builtin', ?1, ?2, 'database_entry', ?3)",
+                 (owner, group_id, group_location, semantic_order_key, group_kind, projection_recipe_json)
+                 VALUES ('builtin', 1, ?1, ?2, 'database_entry', ?3)",
                 params![
                     group_location,
                     group_semantic_order_key
@@ -3751,12 +3681,11 @@ mod tests {
         transaction
             .execute(
                 "INSERT INTO rpg_maker_text_unit
-                 (owner, group_location, unit_role, semantic_order_key,
+                 (owner, group_id, unit_role, semantic_order_key,
                   source_content_json, source_context_json,
                   translation_content_json, translation_state)
-                 VALUES ('builtin', ?1, ?2, ?3, ?4, ?5, NULL, NULL)",
+                 VALUES ('builtin', 1, ?1, ?2, ?3, ?4, NULL, NULL)",
                 params![
-                    group_location,
                     unit_role,
                     unit_semantic_order_key
                         .encode()
@@ -3770,13 +3699,9 @@ mod tests {
             transaction
                 .execute(
                     "INSERT INTO rpg_maker_mutation_claim
-                     (owner, group_location, resource_key, access)
-                     VALUES ('builtin', ?1, ?2, ?3)",
-                    params![
-                        claim.group_location,
-                        claim.resource_key,
-                        claim.access.storage_name()
-                    ],
+                     (owner, group_id, resource_key, access)
+                     VALUES ('builtin', 1, ?1, ?2)",
+                    params![claim.resource_key, claim.access.storage_name()],
                 )
                 .expect("应插入 Claim");
         }
@@ -3893,20 +3818,19 @@ mod tests {
         transaction
             .execute(
                 "INSERT INTO rpg_maker_text_group
-                 (owner, group_location, semantic_order_key, group_kind, projection_recipe_json)
-                 VALUES ('rules', ?1, ?2, 'database_entry', ?3)",
+                 (owner, group_id, group_location, semantic_order_key, group_kind, projection_recipe_json)
+                 VALUES ('rules', 1, ?1, ?2, 'database_entry', ?3)",
                 params![project.group_location, group_order_blob, recipes_json],
             )
             .expect("应插入 Rules Group");
         transaction
             .execute(
                 "INSERT INTO rpg_maker_text_unit
-                 (owner, group_location, unit_role, semantic_order_key,
+                 (owner, group_id, unit_role, semantic_order_key,
                   source_content_json, source_context_json,
                   translation_content_json, translation_state)
-                 VALUES ('rules', ?1, ?2, ?3, ?4, '{}', NULL, NULL)",
+                 VALUES ('rules', 1, ?1, ?2, ?3, '{}', NULL, NULL)",
                 params![
-                    project.group_location,
                     sibling_role_raw,
                     sibling_order.encode().expect("应编码兄弟顺序键"),
                     sibling_source_json
@@ -3917,13 +3841,9 @@ mod tests {
             transaction
                 .execute(
                     "INSERT INTO rpg_maker_mutation_claim
-                     (owner, group_location, resource_key, access)
-                     VALUES ('rules', ?1, ?2, ?3)",
-                    params![
-                        claim.group_location,
-                        claim.resource_key,
-                        claim.access.storage_name()
-                    ],
+                     (owner, group_id, resource_key, access)
+                     VALUES ('rules', 1, ?1, ?2)",
+                    params![claim.resource_key, claim.access.storage_name()],
                 )
                 .expect("应插入 Rules Claim");
         }
@@ -3963,7 +3883,12 @@ mod tests {
             .execute(
                 "UPDATE rpg_maker_text_unit
                  SET translation_content_json = ?1, translation_state = ?2
-                 WHERE owner = 'builtin' AND group_location = ?3 AND unit_role = ?4",
+                 WHERE owner = 'builtin'
+                   AND group_id = (
+                       SELECT group_id FROM rpg_maker_text_group
+                       WHERE owner = 'builtin' AND group_location = ?3
+                   )
+                   AND unit_role = ?4",
                 params![
                     translation,
                     [0xa5_u8; 32].as_slice(),
@@ -4145,24 +4070,19 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO rpg_maker_text_group
-                 (owner, group_location, semantic_order_key, group_kind, projection_recipe_json)
-                 VALUES ('rules', ?1, ?2, 'database_entry', ?3)",
+                 (owner, group_id, group_location, semantic_order_key, group_kind, projection_recipe_json)
+                 VALUES ('rules', 1, ?1, ?2, 'database_entry', ?3)",
                 params![project.group_location, group_order, recipes],
             )
             .expect("应插入跨 owner 同一 Group");
         connection
             .execute(
                 "INSERT INTO rpg_maker_text_unit
-                 (owner, group_location, unit_role, semantic_order_key,
+                 (owner, group_id, unit_role, semantic_order_key,
                   source_content_json, source_context_json,
                   translation_content_json, translation_state)
-                 VALUES ('rules', ?1, ?2, ?3, ?4, '{}', NULL, NULL)",
-                params![
-                    project.group_location,
-                    sibling_role,
-                    sibling_order,
-                    sibling_source
-                ],
+                 VALUES ('rules', 1, ?1, ?2, ?3, '{}', NULL, NULL)",
+                params![sibling_role, sibling_order, sibling_source],
             )
             .expect("应插入跨 owner 兄弟 Unit");
 
@@ -4178,7 +4098,12 @@ mod tests {
             .execute(
                 "UPDATE rpg_maker_text_unit
                  SET translation_content_json = ?1, translation_state = ?2
-                 WHERE owner = 'rules' AND group_location = ?3 AND unit_role = ?4",
+                 WHERE owner = 'rules'
+                   AND group_id = (
+                       SELECT group_id FROM rpg_maker_text_group
+                       WHERE owner = 'rules' AND group_location = ?3
+                   )
+                   AND unit_role = ?4",
                 params![
                     sibling_translation,
                     [0x81_u8; 32].as_slice(),
@@ -4199,7 +4124,12 @@ mod tests {
             .execute(
                 "UPDATE rpg_maker_text_unit
                  SET source_content_json = ?1
-                 WHERE owner = 'rules' AND group_location = ?2 AND unit_role = ?3",
+                 WHERE owner = 'rules'
+                   AND group_id = (
+                       SELECT group_id FROM rpg_maker_text_group
+                       WHERE owner = 'rules' AND group_location = ?2
+                   )
+                   AND unit_role = ?3",
                 params![changed_source, project.group_location, sibling_role],
             )
             .expect("应更新兄弟原文");
@@ -4285,7 +4215,10 @@ mod tests {
             &format!(
                 r#"ctx.db.execute(
                      [=[UPDATE rpg_maker_text_unit SET translation_content_json = ?1
-                        WHERE owner = 'rules' AND group_location = ?2 AND unit_role = ?3]=],
+                        WHERE owner = 'rules'
+                          AND group_id = (SELECT group_id FROM rpg_maker_text_group
+                                          WHERE owner = 'rules' AND group_location = ?2)
+                          AND unit_role = ?3]=],
                      {{[=[{changed_target}]=], [=[{}]=], [=[{}]=]}}
                    )"#,
                 project.group_location, sibling_role
@@ -4296,8 +4229,14 @@ mod tests {
         let original_source: String = Connection::open(&project.database_path)
             .expect("应重开项目数据库")
             .query_row(
-                "SELECT source_content_json FROM rpg_maker_text_unit
-                 WHERE owner = 'rules' AND group_location = ?1 AND unit_role = ?2",
+                "SELECT unit.source_content_json
+                 FROM rpg_maker_text_unit AS unit
+                 JOIN rpg_maker_text_group AS text_group
+                   ON text_group.owner = unit.owner
+                  AND text_group.group_id = unit.group_id
+                 WHERE unit.owner = 'rules'
+                   AND text_group.group_location = ?1
+                   AND unit.unit_role = ?2",
                 params![project.group_location, sibling_role],
                 |row| row.get(0),
             )
@@ -4310,28 +4249,44 @@ mod tests {
             &format!(
                 r#"ctx.db.execute(
                      [=[UPDATE rpg_maker_text_unit SET source_content_json = ?1
-                        WHERE owner = 'rules' AND group_location = ?2 AND unit_role = ?3]=],
+                        WHERE owner = 'rules'
+                          AND group_id = (SELECT group_id FROM rpg_maker_text_group
+                                          WHERE owner = 'rules' AND group_location = ?2)
+                          AND unit_role = ?3]=],
                      {{[=[{changed_source}]=], [=[{}]=], [=[{}]=]}}
                    )"#,
                 project.group_location, sibling_role
             ),
         )
         .expect_err("兄弟原文变化后不得保留原 Current 状态");
-        let ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
-            operation: "translation.validate",
-            message,
-            ..
-        }) = error
-        else {
+        let ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(host_error)) = error else {
             panic!("完整 Group 语境失效应由翻译最终校验拒绝");
         };
-        assert!(message.contains("已有 Current 只允许在语义事实不变时保留"));
-        assert!(message.contains(&project.group_location));
+        assert_eq!(host_error.operation(), Some("translation.validate"));
+        assert!(matches!(
+            host_error.issue,
+            super::super::ProjectLuaCallIssue::Violation(
+                crate::diagnostic::LuaValueViolation::StateMismatch
+            )
+        ));
+        assert!(matches!(
+            host_error.locator,
+            Some(crate::diagnostic::LuaLocator::RpgMaker {
+                group_location: Some(ref group_location),
+                ..
+            }) if group_location.as_str() == project.group_location
+        ));
         let stored_source: String = Connection::open(&project.database_path)
             .expect("应重开项目数据库")
             .query_row(
-                "SELECT source_content_json FROM rpg_maker_text_unit
-                 WHERE owner = 'rules' AND group_location = ?1 AND unit_role = ?2",
+                "SELECT unit.source_content_json
+                 FROM rpg_maker_text_unit AS unit
+                 JOIN rpg_maker_text_group AS text_group
+                   ON text_group.owner = unit.owner
+                  AND text_group.group_id = unit.group_id
+                 WHERE unit.owner = 'rules'
+                   AND text_group.group_location = ?1
+                   AND unit.unit_role = ?2",
                 params![project.group_location, sibling_role],
                 |row| row.get(0),
             )
@@ -4415,9 +4370,14 @@ mod tests {
         let connection = Connection::open(&project.database_path).expect("应重开数据库");
         let (translation, state): (String, Vec<u8>) = connection
             .query_row(
-                "SELECT translation_content_json, translation_state
-                 FROM rpg_maker_text_unit
-                 WHERE owner = 'builtin' AND group_location = ?1 AND unit_role = ?2",
+                "SELECT unit.translation_content_json, unit.translation_state
+                 FROM rpg_maker_text_unit AS unit
+                 JOIN rpg_maker_text_group AS text_group
+                   ON text_group.owner = unit.owner
+                  AND text_group.group_id = unit.group_id
+                 WHERE unit.owner = 'builtin'
+                   AND text_group.group_location = ?1
+                   AND unit.unit_role = ?2",
                 params![project.group_location, project.unit_role],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -4431,7 +4391,10 @@ mod tests {
             &format!(
                 r#"ctx.db.execute(
                      [=[UPDATE rpg_maker_text_unit SET translation_content_json = ?1
-                        WHERE owner = 'builtin' AND group_location = ?2 AND unit_role = ?3]=],
+                        WHERE owner = 'builtin'
+                          AND group_id = (SELECT group_id FROM rpg_maker_text_group
+                                          WHERE owner = 'builtin' AND group_location = ?2)
+                          AND unit_role = ?3]=],
                      {{[=["人工修订 \\V[1] {{hero}}"]=], [=[{}]=], [=[{}]=]}}
                    )"#,
                 project.group_location, project.unit_role
@@ -4441,9 +4404,14 @@ mod tests {
         let connection = Connection::open(&project.database_path).expect("应重开数据库");
         let (translation_after, state_after): (String, Vec<u8>) = connection
             .query_row(
-                "SELECT translation_content_json, translation_state
-                 FROM rpg_maker_text_unit
-                 WHERE owner = 'builtin' AND group_location = ?1 AND unit_role = ?2",
+                "SELECT unit.translation_content_json, unit.translation_state
+                 FROM rpg_maker_text_unit AS unit
+                 JOIN rpg_maker_text_group AS text_group
+                   ON text_group.owner = unit.owner
+                  AND text_group.group_id = unit.group_id
+                 WHERE unit.owner = 'builtin'
+                   AND text_group.group_location = ?1
+                   AND unit.unit_role = ?2",
                 params![project.group_location, project.unit_role],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -4457,24 +4425,31 @@ mod tests {
             &format!(
                 r#"ctx.db.execute(
                      [=[UPDATE main.rpg_maker_text_unit SET translation_state = ?1
-                        WHERE owner = 'builtin' AND group_location = ?2 AND unit_role = ?3]=],
+                        WHERE owner = 'builtin'
+                          AND group_id = (SELECT group_id FROM main.rpg_maker_text_group
+                                          WHERE owner = 'builtin' AND group_location = ?2)
+                          AND unit_role = ?3]=],
                      {{ctx.db.blob(string.rep("x", 32)), [=[{}]=], [=[{}]=]}}
                    )"#,
                 project.group_location, project.unit_role
             ),
         )
         .expect_err("直接 SQL 不能伪造新的 Current 状态");
-        let ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
-            operation: "translation.validate",
-            message,
-            ..
-        }) = state_error
+        let ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(host_error)) = state_error
         else {
             panic!("伪造 Current 状态必须返回带 locator 的最终校验错误");
         };
-        assert!(message.contains("owner=builtin"));
-        assert!(message.contains(&project.group_location));
-        assert!(message.contains(&project.unit_role));
+        assert_eq!(host_error.operation(), Some("translation.validate"));
+        assert!(matches!(
+            host_error.locator,
+            Some(crate::diagnostic::LuaLocator::RpgMaker {
+                owner: Some(ref owner),
+                group_location: Some(ref group_location),
+                unit_role: Some(ref unit_role),
+            }) if owner.as_str() == "builtin"
+                && group_location.as_str() == project.group_location
+                && unit_role.as_str() == project.unit_role
+        ));
 
         run(
             &project,
@@ -4484,8 +4459,14 @@ mod tests {
         let cleared: Option<String> = Connection::open(&project.database_path)
             .expect("应重开数据库")
             .query_row(
-                "SELECT translation_content_json FROM rpg_maker_text_unit
-                 WHERE owner = 'builtin' AND group_location = ?1 AND unit_role = ?2",
+                "SELECT unit.translation_content_json
+                 FROM rpg_maker_text_unit AS unit
+                 JOIN rpg_maker_text_group AS text_group
+                   ON text_group.owner = unit.owner
+                  AND text_group.group_id = unit.group_id
+                 WHERE unit.owner = 'builtin'
+                   AND text_group.group_location = ?1
+                   AND unit.unit_role = ?2",
                 params![project.group_location, project.unit_role],
                 |row| row.get(0),
             )
@@ -4516,7 +4497,12 @@ mod tests {
             .execute(
                 "UPDATE rpg_maker_text_unit
                  SET translation_content_json = ?1
-                 WHERE owner = 'builtin' AND group_location = ?2 AND unit_role = ?3",
+                 WHERE owner = 'builtin'
+                   AND group_id = (
+                       SELECT group_id FROM rpg_maker_text_group
+                       WHERE owner = 'builtin' AND group_location = ?2
+                   )
+                   AND unit_role = ?3",
                 params![
                     accepted_translation,
                     project.group_location,
@@ -4535,9 +4521,14 @@ mod tests {
         let cleared: (Option<String>, Option<Vec<u8>>) = Connection::open(&project.database_path)
             .expect("应重开数据库")
             .query_row(
-                "SELECT translation_content_json, translation_state
-                     FROM rpg_maker_text_unit
-                     WHERE owner = 'builtin' AND group_location = ?1 AND unit_role = ?2",
+                "SELECT unit.translation_content_json, unit.translation_state
+                 FROM rpg_maker_text_unit AS unit
+                 JOIN rpg_maker_text_group AS text_group
+                   ON text_group.owner = unit.owner
+                  AND text_group.group_id = unit.group_id
+                 WHERE unit.owner = 'builtin'
+                   AND text_group.group_location = ?1
+                   AND unit.unit_role = ?2",
                 params![project.group_location, project.unit_role],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -4581,7 +4572,12 @@ mod tests {
             .execute(
                 "UPDATE rpg_maker_text_unit
                  SET translation_content_json = ?1
-                 WHERE owner = 'builtin' AND group_location = ?2 AND unit_role = ?3",
+                 WHERE owner = 'builtin'
+                   AND group_id = (
+                       SELECT group_id FROM rpg_maker_text_group
+                       WHERE owner = 'builtin' AND group_location = ?2
+                   )
+                   AND unit_role = ?3",
                 params![
                     accepted_translation,
                     project.group_location,
@@ -4618,7 +4614,12 @@ mod tests {
                 .execute(
                     "UPDATE rpg_maker_text_unit
                      SET translation_content_json = ?1
-                     WHERE owner = 'builtin' AND group_location = ?2 AND unit_role = ?3",
+                     WHERE owner = 'builtin'
+                       AND group_id = (
+                           SELECT group_id FROM rpg_maker_text_group
+                           WHERE owner = 'builtin' AND group_location = ?2
+                       )
+                       AND unit_role = ?3",
                     params![
                         invalid_translation,
                         project.group_location,
@@ -4629,17 +4630,25 @@ mod tests {
 
             let error = run(&project, "return")
                 .expect_err("未改 Current 仍必须保留所需 Placeholder 并拒绝额外 Builtin");
-            let ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
-                kind: "placeholder_mismatch",
-                operation: "translation.validate",
-                message,
-                ..
-            }) = error
-            else {
+            let ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(host_error)) = error else {
                 panic!("非法未改 Current 必须返回带 locator 的 Placeholder 错误");
             };
-            assert!(message.contains(&project.group_location));
-            assert!(message.contains(&project.unit_role));
+            assert!(matches!(
+                host_error.issue,
+                super::super::ProjectLuaCallIssue::Violation(
+                    crate::diagnostic::LuaValueViolation::InvalidTranslation
+                )
+            ));
+            assert_eq!(host_error.operation(), Some("translation.validate"));
+            assert!(matches!(
+                host_error.locator,
+                Some(crate::diagnostic::LuaLocator::RpgMaker {
+                    group_location: Some(ref group_location),
+                    unit_role: Some(ref unit_role),
+                    ..
+                }) if group_location.as_str() == project.group_location
+                    && unit_role.as_str() == project.unit_role
+            ));
 
             run(
                 &project,
@@ -4666,16 +4675,17 @@ mod tests {
         ] {
             assert!(matches!(
                 run(&project, &source),
-                Err(ProjectLuaRunError::RolledBack(
-                    ProjectLuaFailure::Host { .. }
-                ))
+                Err(ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(_)))
             ));
         }
         let forged_state = format!(
             r#"ctx.db.execute(
                  [=[UPDATE main.rpg_maker_text_unit
                     SET translation_content_json = ?1, translation_state = ?2
-                    WHERE owner = 'builtin' AND group_location = ?3 AND unit_role = ?4]=],
+                    WHERE owner = 'builtin'
+                      AND group_id = (SELECT group_id FROM main.rpg_maker_text_group
+                                      WHERE owner = 'builtin' AND group_location = ?3)
+                      AND unit_role = ?4]=],
                  {{
                    [=["伪造 \\V[1] {{hero}}"]=],
                    ctx.db.blob(string.rep("x", 32)),
@@ -4687,16 +4697,20 @@ mod tests {
         );
         assert!(matches!(
             run(&project, &forged_state),
-            Err(ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
-                operation: "translation.validate",
-                ..
-            }))
+            Err(ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(error)))
+                if error.operation() == Some("translation.validate")
         ));
         let translation: Option<String> = Connection::open(&project.database_path)
             .expect("应重开数据库")
             .query_row(
-                "SELECT translation_content_json FROM rpg_maker_text_unit
-                 WHERE owner = 'builtin' AND group_location = ?1 AND unit_role = ?2",
+                "SELECT unit.translation_content_json
+                 FROM rpg_maker_text_unit AS unit
+                 JOIN rpg_maker_text_group AS text_group
+                   ON text_group.owner = unit.owner
+                  AND text_group.group_id = unit.group_id
+                 WHERE unit.owner = 'builtin'
+                   AND text_group.group_location = ?1
+                   AND unit.unit_role = ?2",
                 params![project.group_location, project.unit_role],
                 |row| row.get(0),
             )
@@ -4737,10 +4751,8 @@ ctx.db.execute("CREATE TABLE lua_private (value TEXT)")
         .expect_err("无效 Placeholder 资源不能提交");
         assert!(matches!(
             error,
-            ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
-                operation: "translation.validate",
-                ..
-            })
+            ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(error))
+                if error.operation() == Some("translation.validate")
         ));
         let resource: String = Connection::open(&project.database_path)
             .expect("应重开数据库")
@@ -4786,10 +4798,8 @@ ctx.db.execute("CREATE TABLE lua_private (value TEXT)")
             assert!(
                 matches!(
                     &error,
-                    ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
-                        operation: "translation.validate",
-                        ..
-                    })
+                    ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(error))
+                        if error.operation() == Some("translation.validate")
                 ),
                 "无效定义应在最终校验阶段回滚，实际为 {error:?}"
             );
@@ -4853,10 +4863,8 @@ ctx.db.execute("CREATE TABLE lua_private (value TEXT)")
                 .expect_err("非 INTEGER 或超出 u32 的布局宽度不能提交");
                 assert!(matches!(
                     error,
-                    ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
-                        operation: "translation.validate",
-                        ..
-                    })
+                    ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(error))
+                        if error.operation() == Some("translation.validate")
                 ));
                 let (value, kind): (i64, String) = Connection::open(&project.database_path)
                     .expect("应重开项目数据库")
@@ -4903,10 +4911,8 @@ ctx.db.execute("CREATE TABLE lua_private (value TEXT)")
             .expect_err("Unicode 首尾空白的 Translate Profile 不能提交");
             assert!(matches!(
                 error,
-                ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
-                    operation: "translation.validate",
-                    ..
-                })
+                ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(error))
+                    if error.operation() == Some("translation.validate")
             ));
             let count: i64 = Connection::open(&project.database_path)
                 .expect("应重开项目数据库")
@@ -4931,10 +4937,8 @@ ctx.db.execute("CREATE TABLE lua_private (value TEXT)")
         .expect_err("既有 Translate Profile 也不能改成 Unicode 空白前缀");
         assert!(matches!(
             error,
-            ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
-                operation: "translation.validate",
-                ..
-            })
+            ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(error))
+                if error.operation() == Some("translation.validate")
         ));
         let profile: String = Connection::open(&project.database_path)
             .expect("应重开项目数据库")
@@ -4970,9 +4974,12 @@ ctx.translation.set({}, [=[译文 \V[1]]=])
                 "SELECT resource.canonical_json, unit.translation_content_json
                  FROM rpg_maker_translation_resource AS resource
                  CROSS JOIN rpg_maker_text_unit AS unit
+                 JOIN rpg_maker_text_group AS text_group
+                   ON text_group.owner = unit.owner
+                  AND text_group.group_id = unit.group_id
                  WHERE resource.resource_kind = 'placeholder_rules'
                    AND unit.owner = 'builtin'
-                   AND unit.group_location = ?1
+                   AND text_group.group_location = ?1
                    AND unit.unit_role = ?2",
                 params![project.group_location, project.unit_role],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -5006,10 +5013,8 @@ ctx.translation.set({}, [=[译文 \V[1]]=])
 
         assert!(matches!(
             error,
-            ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
-                operation: "translation.validate",
-                ..
-            })
+            ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(error))
+                if error.operation() == Some("translation.validate")
         ));
         assert_eq!(stored_resource(&project, "terminology"), initial);
     }
@@ -5085,10 +5090,8 @@ ctx.translation.set({}, [=[译文 \V[1]]=])
 
         assert!(matches!(
             error,
-            ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
-                operation: "translation.validate",
-                ..
-            })
+            ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(error))
+                if error.operation() == Some("translation.validate")
         ));
     }
 
@@ -5103,7 +5106,10 @@ ctx.translation.set({}, [=[译文 \V[1]]=])
         let script = format!(
             r#"ctx.db.execute(
   "UPDATE rpg_maker_text_unit SET translation_content_json = ?1 " ..
-  "WHERE owner = 'builtin' AND group_location = ?2 AND unit_role = ?3",
+  "WHERE owner = 'builtin' " ..
+  "AND group_id = (SELECT group_id FROM rpg_maker_text_group " ..
+  "                WHERE owner = 'builtin' AND group_location = ?2) " ..
+  "AND unit_role = ?3",
   {{[=[{changed_translation}]=], [=[{}]=], [=[{}]=]}}
 )"#,
             project.group_location, project.unit_role
@@ -5114,8 +5120,14 @@ ctx.translation.set({}, [=[译文 \V[1]]=])
         let stored: String = Connection::open(&project.database_path)
             .expect("应重开项目数据库")
             .query_row(
-                "SELECT translation_content_json FROM rpg_maker_text_unit
-                 WHERE owner = 'builtin' AND group_location = ?1 AND unit_role = ?2",
+                "SELECT unit.translation_content_json
+                 FROM rpg_maker_text_unit AS unit
+                 JOIN rpg_maker_text_group AS text_group
+                   ON text_group.owner = unit.owner
+                  AND text_group.group_id = unit.group_id
+                 WHERE unit.owner = 'builtin'
+                   AND text_group.group_location = ?1
+                   AND unit.unit_role = ?2",
                 params![project.group_location, project.unit_role],
                 |row| row.get(0),
             )
@@ -5143,8 +5155,11 @@ ctx.translation.set({}, [=[译文 \V[1]]=])
             assert!(matches!(
                 &error,
                 ProjectLuaRunError::RolledBack(ProjectLuaFailure::DatabasePrerequisite(
-                    ProjectLuaDatabasePrerequisiteError::InvalidProjectState(message)
-                )) if message.contains("database_component=att_schema")
+                    ProjectLuaDatabasePrerequisiteError::InvalidProjectState {
+                        engine: crate::diagnostic::LuaEngine::RpgMaker,
+                        violation: crate::diagnostic::LuaValueViolation::StateMismatch,
+                    }
+                ))
             ));
 
             let script_started: i64 = Connection::open(&project.database_path)
@@ -5171,10 +5186,8 @@ ctx.translation.set({}, [=[译文 \V[1]]=])
         .expect_err("不能把项目数据库改成另一个项目");
         assert!(matches!(
             name_error,
-            ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
-                operation: "translation.validate",
-                ..
-            })
+            ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(error))
+                if error.operation() == Some("translation.validate")
         ));
 
         let missing_init_error = run(
@@ -5184,10 +5197,8 @@ ctx.translation.set({}, [=[译文 \V[1]]=])
         .expect_err("不能删除 Init 运行方案");
         assert!(matches!(
             missing_init_error,
-            ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
-                operation: "translation.validate",
-                ..
-            })
+            ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(error))
+                if error.operation() == Some("translation.validate")
         ));
 
         let invalid_init_error = run(
@@ -5200,10 +5211,8 @@ ctx.translation.set({}, [=[译文 \V[1]]=])
         .expect_err("不能把 Init 来源改成相对路径");
         assert!(matches!(
             invalid_init_error,
-            ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
-                operation: "translation.validate",
-                ..
-            })
+            ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(error))
+                if error.operation() == Some("translation.validate")
         ));
 
         let connection = Connection::open(&project.database_path).expect("应重开数据库");

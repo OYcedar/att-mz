@@ -14,9 +14,13 @@ use std::time::Duration;
 use futures_util::FutureExt;
 use rusqlite::{Connection, OpenFlags};
 
+use super::project_log::{
+    ActiveProjectLog, CommandLogStart, PendingProjectLog, ProjectLogHandle, ProjectLogLuaPrintSink,
+    ProjectLuaSummaryGuard, start_command_log,
+};
 use super::translation_prompt::{
-    PromptResourceLoadError, PromptTemplateError, SYSTEM_PROMPT_FILE_NAME,
-    THINKING_PROMPT_FILE_NAME, assemble_translation_system_prompt_with_cancellation,
+    PromptResourceLoadError, PromptTemplateError,
+    assemble_translation_system_prompt_with_cancellation,
     ensure_no_prompt_template_variables_with_cancellation, parse_prompt_resource_with_cancellation,
     read_unparsed_prompt_resource, render_system_prompt_template_with_cancellation,
     translation_prompt_resource_paths,
@@ -31,10 +35,13 @@ use crate::application::config::{
     ConfiguredWriteBackCommand, TranslateConfiguration,
 };
 use crate::diagnostic::{
-    BoxedError, DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact,
-    DiagnosticReason, DiagnosticStage, DiagnosticSubject, FailureReport, RecoveryFact,
-    ReportedFailure, SafeDiagnostic, SafeDiagnosticSource, render_failure_report,
-    render_safe_diagnostic,
+    BoxedError, Diagnostic, DiagnosticReport, DiagnosticStage, IoFailure, PromptProblem,
+    RelatedFailureRelation, ReportedFailure, RpgMakerDiagnosticStage, RpgMakerIssue,
+    RpgMakerProjectProblem, RuntimeBoundaryOperation, RuntimeComponent, RuntimeEngine,
+    RuntimeIssue, RuntimeOperation, RuntimePanicBoundary, SafeIdentifier, SafePath,
+    SqliteDiagnosticContext, SqliteDiagnosticStage, SqliteDriverFailure, SqliteIssue,
+    SqliteOperation, SqliteProblem, SqliteTransactionState, StateEffect, TranslationIssue,
+    render_diagnostic_report,
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::execution::{CooperativeCancellation, OperationCompletion};
@@ -42,24 +49,23 @@ use crate::i18n::{UiLocale, UiLocalizer, UiMessage, project_log_value_source_lab
 use crate::language::LanguageModuleCatalogError;
 use crate::progress::{
     ProgressAmount, ProgressMode, ProgressObserver, ProgressSnapshot, TerminalProgress,
-    TerminalProgressFailure, TerminalProgressFailureKind, TerminalProgressFailures,
-    TerminalProgressObserver,
+    TerminalProgressFailures, TerminalProgressObserver,
 };
 use crate::project_lease::{
     AlreadyHeldProjectCommandLeaseProvider, ProjectCommandLease, ProjectCommandLeaseError,
     ProjectCommandLeaseProvider, ProjectCommandLeaseService,
 };
 use crate::project_lua::{
-    ProjectLuaCallError, ProjectLuaCancellation, ProjectLuaDatabasePrerequisiteError,
-    ProjectLuaFailure, ProjectLuaPrintSink, ProjectLuaProgram, ProjectLuaProject,
-    ProjectLuaRunError, ProjectLuaRunMetrics, ProjectLuaRunReport, ProjectLuaRunRequest,
-    ProjectLuaSqliteError, compile_project_lua_program_with_cancellation,
+    ProjectLuaCancellation, ProjectLuaDatabasePrerequisiteError, ProjectLuaFailure,
+    ProjectLuaProgram, ProjectLuaProject, ProjectLuaRunError, ProjectLuaRunRequest,
+    compile_project_lua_program_with_cancellation,
     fingerprint_project_lua_program_with_cancellation, rpg_maker_project_lua_adapter,
     run_project_lua,
 };
 use crate::rpg_maker::RpgMakerLayout;
 use crate::rpg_maker::dialogue::{
     MvDialogueDefinition, MvDialogueDefinitionError, MvDialogueProjector,
+    external_invalid_utf8_diagnostic_report,
 };
 use crate::rpg_maker::extract::builtin::{
     BuiltInExtractionError, BuiltInExtractionService, MvDialogueDefinitionSelection,
@@ -77,8 +83,7 @@ use crate::rpg_maker::extract::store::asset_store::RpgMakerExtractionAssetStore;
 use crate::rpg_maker::extract::{ExtractInput, ExtractOutput, ExtractProgressPhase, SelectedRules};
 use crate::rpg_maker::init::{
     InitInput, InitOutcome, InitOutput, InitProgressPhase, InitService, InitServiceError,
-    InitStaleOwner, MissingInitialProjectSetting, ProjectWorkspaceCandidateFailure,
-    ProjectWorkspaceConvergenceError, ProjectWorkspaceConvergenceService,
+    InitStaleOwner, ProjectWorkspaceConvergenceError, ProjectWorkspaceConvergenceService,
 };
 use crate::rpg_maker::project::{
     ExistingProjectOpener, ExistingProjectOpeningError, ExistingProjectOpeningService,
@@ -122,16 +127,23 @@ use crate::rpg_maker::translate::service::{
 use crate::rpg_maker::translate::task_record::{
     ConfiguredTranslationTaskRecordSink, MarkdownTranslationTaskRecordSink,
 };
-use crate::rpg_maker::write_back::asset_reader::RpgMakerWriteBackAssetReadingService;
+#[cfg(test)]
+use crate::rpg_maker::write_back::WriteBackPublishFailureState;
+use crate::rpg_maker::write_back::asset_reader::{
+    RpgMakerWriteBackAssetReadingError, RpgMakerWriteBackAssetReadingService,
+};
 use crate::rpg_maker::write_back::planner::{
     ConservativeRpgMakerWriteBackTextLayouter, RpgMakerWriteBackService,
+    RpgMakerWriteBackServiceError, write_back_planning_compute_report,
 };
 use crate::rpg_maker::write_back::publisher::RpgMakerWriteBackPublishingService;
-use crate::rpg_maker::write_back::rewriter::RpgMakerWriteBackDocumentRewritingService;
+use crate::rpg_maker::write_back::rewriter::{
+    RpgMakerWriteBackDocumentRewritingError, RpgMakerWriteBackDocumentRewritingService,
+};
 use crate::rpg_maker::write_back::{
     WriteBackInput, WriteBackLog, WriteBackLogEvent, WriteBackLogPublicationOutcome,
-    WriteBackOutput, WriteBackProgressPhase, WriteBackPublishFailureState,
-    WriteBackPublishingDiagnostic, WriteBackService, WriteBackServiceError,
+    WriteBackOutput, WriteBackProgressPhase, WriteBackPublishingDiagnostic, WriteBackService,
+    WriteBackServiceError,
 };
 use crate::runtime::cpu::{
     CpuExecutorConfig, CpuExecutorShutdownError, CpuExecutorStartError, CpuExecutorUnavailable,
@@ -146,25 +158,28 @@ use crate::runtime::llm::{
 };
 use crate::runtime::performance::RunPerformanceCounters;
 use crate::runtime::project_log::{
-    ProjectLog, ProjectLogAmount, ProjectLogCode, ProjectLogContext, ProjectLogEvent,
-    ProjectLogLevel, ProjectLogManualLayoutLocation, ProjectLogNoWorkReason, ProjectLogPayload,
-    ProjectLogPhase, ProjectLogRunOutcome, ProjectLogRuntime, ProjectLogValueSource,
-    ProjectLogWarning, ProjectLogger, disabled_project_log, start_project_log,
+    DiagnosticOccurrenceId, DiagnosticScope, ExtractOwnerSelection, PhaseStopOutcome,
+    ProjectLogAmount, ProjectLogCommand, ProjectLogEngine, ProjectLogEvent, ProjectLogPhase,
+    PublicationFinished, PublicationSummary, ResolvedRunPlan, RpgMakerPublicationSummary,
+    RpgMakerTranslationSummary, RunPlanFinalization, RunPlanTransactionState,
+    RunPlanValueSource as ProjectLogValueSource, TaskCounterInvariantError, TaskFinishedOutcome,
+    TaskPosition, TranslationEngineSummary, TranslationFinished, TranslationTaskCounters,
 };
-use crate::runtime::run_id::generate_run_id;
 use crate::runtime::sqlite::{
     RusqliteFinalTransactionExecutor, RusqliteStorage, RusqliteStorageConfiguration,
     SqliteRuntimeError,
 };
-use crate::runtime::windows::WindowsFsError;
+#[cfg(test)]
 use crate::storage::file_system::{
     DirectoryDiscardError, DirectoryPrepareError, DirectoryPublishError, DirectoryRecoveryError,
-    DirectoryRecoveryOutcome, DirectoryStageRequestError, DirectoryTreeFingerprintError,
-    ExistingDirectoryResolver, FileReader, ListDirectoryError, ReadFileError,
-    RecoverableDirectoryPublisher, ResolveDirectoryError, StagingCleanupFailure,
+    StagingCleanupFailure,
 };
-use crate::storage::sqlite::SnapshotDatabaseError;
+use crate::storage::file_system::{
+    DirectoryRecoveryOutcome, ExistingDirectoryResolver, FileReader, ReadFileError,
+    RecoverableDirectoryPublisher, ResolveDirectoryError,
+};
 use crate::translation::planning_resource::TranslationPlanningResourceReadingService;
+use crate::translation::task_record::TaskRecordDiagnosticRecorder;
 use crate::translation_protocol::TranslationResponseMode;
 use crate::user_text::sanitize_user_text;
 
@@ -382,84 +397,10 @@ fn finish_terminal_progress<P>(
     mut shutdown: ShutdownFailures,
 ) -> ShutdownFailures {
     if let Err(failures) = progress.finish() {
-        shutdown.push("terminal progress", failures);
+        let report = failures.diagnostic_report();
+        shutdown.push("terminal progress", failures, report);
     }
     shutdown
-}
-
-impl SafeDiagnosticSource for TerminalProgressFailure {
-    fn safe_diagnostic_source(
-        &self,
-        stage: DiagnosticStage,
-        impact: DiagnosticImpact,
-        fallback_action: DiagnosticAction,
-    ) -> SafeDiagnostic {
-        let detail = format!(
-            "kind={}; operation={}; io_kind={:?}; os_code={:?}",
-            self.kind().as_str(),
-            self.operation().as_str(),
-            self.io_error_kind(),
-            self.raw_os_error(),
-        );
-        SafeDiagnostic::new(
-            DiagnosticCode::StateFinalizationFailed,
-            stage,
-            DiagnosticSubject::component("terminal progress"),
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::FinalizationFailed,
-                detail,
-            ),
-            impact,
-            if self.kind() == TerminalProgressFailureKind::RendererThreadPanicked {
-                DiagnosticAction::ReportBug
-            } else {
-                fallback_action
-            },
-        )
-    }
-}
-
-impl SafeDiagnosticSource for TerminalProgressFailures {
-    fn safe_diagnostic_source(
-        &self,
-        stage: DiagnosticStage,
-        impact: DiagnosticImpact,
-        fallback_action: DiagnosticAction,
-    ) -> SafeDiagnostic {
-        self.failures().first().map_or_else(
-            || {
-                SafeDiagnostic::new(
-                    DiagnosticCode::StateFinalizationFailed,
-                    stage,
-                    DiagnosticSubject::component("terminal progress"),
-                    DiagnosticReason::failure(DiagnosticFailureKind::FinalizationFailed),
-                    impact,
-                    fallback_action,
-                )
-            },
-            |failure| failure.safe_diagnostic_source(stage, impact, fallback_action),
-        )
-    }
-
-    fn into_failure_report(
-        self,
-        stage: DiagnosticStage,
-        impact: DiagnosticImpact,
-        fallback_action: DiagnosticAction,
-    ) -> FailureReport {
-        let mut failures = self.failures().to_vec().into_iter();
-        let Some(primary) = failures.next() else {
-            let public = self.safe_diagnostic_source(stage, impact, fallback_action);
-            return FailureReport::new(ReportedFailure::new(public, self));
-        };
-        let public = primary.safe_diagnostic_source(stage, impact, fallback_action);
-        let mut report = FailureReport::new(ReportedFailure::new(public, primary));
-        for related in failures {
-            let public = related.safe_diagnostic_source(stage, impact, fallback_action);
-            report = report.with_related(ReportedFailure::new(public, related));
-        }
-        report
-    }
 }
 
 #[derive(Clone, Default)]
@@ -469,39 +410,35 @@ pub(crate) struct CommandPanicBoundary {
 
 #[derive(Clone)]
 struct CommandPanicContext {
-    diagnostics: Vec<SafeDiagnostic>,
-    logger: Option<ProjectLogger>,
+    report: DiagnosticReport,
 }
 
 impl CommandPanicBoundary {
-    pub(crate) fn from_logged(diagnostics: Vec<SafeDiagnostic>, logger: ProjectLogger) -> Self {
-        let boundary = Self::default();
-        boundary.register_project_log(diagnostics, logger);
-        boundary
+    pub(crate) fn from_report(report: DiagnosticReport) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(Some(CommandPanicContext { report }))),
+        }
     }
 
-    fn prepare(&self, command: &'static str, stage: DiagnosticStage, project_workspace: &Path) {
+    fn prepare(
+        &self,
+        engine: RuntimeEngine,
+        command: crate::diagnostic::RuntimeCommand,
+        project_workspace: &Path,
+    ) {
         *self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(CommandPanicContext {
-            diagnostics: vec![command_panic_diagnostic(
-                command,
-                stage,
-                project_workspace,
-                None,
-            )],
-            logger: None,
-        });
-    }
-
-    fn register_project_log(&self, diagnostics: Vec<SafeDiagnostic>, logger: ProjectLogger) {
-        *self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(CommandPanicContext {
-            diagnostics,
-            logger: Some(logger),
+            report: DiagnosticReport::new(
+                StateEffect::OutcomeUnknown,
+                Diagnostic::runtime(RuntimeIssue::CommandPanicked {
+                    engine,
+                    command,
+                    project_workspace: SafePath::new(project_workspace),
+                    log_path: None,
+                }),
+            ),
         });
     }
 
@@ -512,55 +449,17 @@ impl CommandPanicBoundary {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
             .unwrap_or_else(|| CommandPanicContext {
-                diagnostics: vec![SafeDiagnostic::new(
-                    DiagnosticCode::InternalOperation,
-                    DiagnosticStage::CommandPreparation,
-                    DiagnosticSubject::operation("run_command"),
-                    DiagnosticReason::failure(DiagnosticFailureKind::InternalInvariant),
-                    DiagnosticImpact::OutcomeUnknown,
-                    DiagnosticAction::ReportBug,
-                )],
-                logger: None,
+                report: DiagnosticReport::new(
+                    StateEffect::OutcomeUnknown,
+                    Diagnostic::runtime(RuntimeIssue::ProcessPanicked {
+                        boundary: RuntimePanicBoundary::AfterCliParsing,
+                    }),
+                ),
             });
-        let mut diagnostics = context.diagnostics.into_iter();
-        let primary = diagnostics.next().unwrap_or_else(|| {
-            SafeDiagnostic::new(
-                DiagnosticCode::InternalOperation,
-                DiagnosticStage::CommandPreparation,
-                DiagnosticSubject::operation("run_command"),
-                DiagnosticReason::failure(DiagnosticFailureKind::InternalInvariant),
-                DiagnosticImpact::OutcomeUnknown,
-                DiagnosticAction::ReportBug,
-            )
-        });
-        let mut report =
-            FailureReport::new(ReportedFailure::new(primary, ApplicationScopePanicked));
-        for diagnostic in diagnostics {
-            report = report.with_related(ReportedFailure::new(
-                diagnostic,
-                RelatedFailurePreservedDuringPanic,
-            ));
-        }
-        if let Some(warning) = context.logger.and_then(|logger| logger.take_warning()) {
-            for category in [warning.project_log, warning.task_records]
-                .into_iter()
-                .flatten()
-            {
-                if let Some(diagnostic) = category.diagnostic {
-                    report = report.with_related(ReportedFailure::new(
-                        diagnostic,
-                        ObservabilityDegradedWhileReportingPanic,
-                    ));
-                }
-                for diagnostic in category.related_diagnostics {
-                    report = report.with_related(ReportedFailure::new(
-                        diagnostic,
-                        ObservabilityDegradedWhileReportingPanic,
-                    ));
-                }
-            }
-        }
-        ProductionCommandError::Internal(Box::new(report))
+        ProductionCommandError::Internal(Box::new(ReportedFailure::new(
+            context.report,
+            ApplicationScopePanicked,
+        )))
     }
 }
 
@@ -575,34 +474,13 @@ impl fmt::Display for ApplicationScopePanicked {
 
 impl Error for ApplicationScopePanicked {}
 
-#[derive(Debug)]
-struct RelatedFailurePreservedDuringPanic;
-
-impl fmt::Display for RelatedFailurePreservedDuringPanic {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a related safe failure was preserved while reporting a panic")
-    }
-}
-
-impl Error for RelatedFailurePreservedDuringPanic {}
-
-#[derive(Debug)]
-struct ObservabilityDegradedWhileReportingPanic;
-
-impl fmt::Display for ObservabilityDegradedWhileReportingPanic {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("observability degraded while reporting a command panic")
-    }
-}
-
-impl Error for ObservabilityDegradedWhileReportingPanic {}
-
 trait CommandRootShutdown: Send + Sync {
-    type Error: Error + SafeDiagnosticSource + Send + Sync + 'static;
+    type Error: Error + Send + Sync + 'static;
 
     const COMPONENT: &'static str;
 
     fn shutdown_root(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    fn shutdown_diagnostic_report(source: &Self::Error) -> DiagnosticReport;
 }
 
 impl CommandRootShutdown for RayonCpuExecutor {
@@ -612,6 +490,10 @@ impl CommandRootShutdown for RayonCpuExecutor {
 
     async fn shutdown_root(&self) -> Result<(), Self::Error> {
         self.shutdown()
+    }
+
+    fn shutdown_diagnostic_report(source: &Self::Error) -> DiagnosticReport {
+        DiagnosticReport::new(StateEffect::AppliedFinalizationFailed, source.diagnostic())
     }
 }
 
@@ -623,6 +505,10 @@ impl CommandRootShutdown for SystemFileSystem {
     async fn shutdown_root(&self) -> Result<(), Self::Error> {
         self.shutdown().await
     }
+
+    fn shutdown_diagnostic_report(source: &Self::Error) -> DiagnosticReport {
+        source.shutdown_diagnostic_report()
+    }
 }
 
 impl CommandRootShutdown for RusqliteStorage {
@@ -632,6 +518,10 @@ impl CommandRootShutdown for RusqliteStorage {
 
     async fn shutdown_root(&self) -> Result<(), Self::Error> {
         self.shutdown().await
+    }
+
+    fn shutdown_diagnostic_report(source: &Self::Error) -> DiagnosticReport {
+        source.shutdown_diagnostic_report()
     }
 }
 
@@ -677,7 +567,8 @@ where
     if let Some(root) = root
         && let Err(source) = root.shutdown_root().await
     {
-        failures.push(R::COMPONENT, source);
+        let report = R::shutdown_diagnostic_report(&source);
+        failures.push(R::COMPONENT, source, report);
     }
 }
 
@@ -845,24 +736,6 @@ mod command_root_guard_tests {
 
     impl Error for TestRootShutdownError {}
 
-    impl SafeDiagnosticSource for TestRootShutdownError {
-        fn safe_diagnostic_source(
-            &self,
-            stage: DiagnosticStage,
-            impact: DiagnosticImpact,
-            fallback_action: DiagnosticAction,
-        ) -> SafeDiagnostic {
-            SafeDiagnostic::new(
-                DiagnosticCode::ShutdownComponent,
-                stage,
-                DiagnosticSubject::component("test command root"),
-                DiagnosticReason::failure(DiagnosticFailureKind::FinalizationFailed),
-                impact,
-                fallback_action,
-            )
-        }
-    }
-
     impl<C> CommandRootShutdown for TestRoot<C>
     where
         C: TestRootComponent,
@@ -881,6 +754,16 @@ mod command_root_guard_tests {
             } else {
                 Ok(())
             }
+        }
+
+        fn shutdown_diagnostic_report(_source: &Self::Error) -> DiagnosticReport {
+            DiagnosticReport::new(
+                StateEffect::AppliedFinalizationFailed,
+                Diagnostic::runtime(RuntimeIssue::WorkerPanicked {
+                    component: RuntimeComponent::Process,
+                    operation: RuntimeOperation::Shutdown,
+                }),
+            )
         }
     }
 
@@ -1010,9 +893,10 @@ impl ProductionRpgMakerCommandRunner {
         command: ConfiguredRpgMakerCommand,
         termination_signals: &mut TerminationSignals,
     ) -> ProductionCommandRunReport {
-        let (command_name, stage, project_workspace) = command_panic_context(self.layout, &command);
+        let (engine, command_name, project_workspace) =
+            command_panic_context(self.layout, &command);
         self.panic_boundary
-            .prepare(command_name, stage, &project_workspace);
+            .prepare(engine, command_name, &project_workspace);
         let panic_boundary = self.panic_boundary.clone();
         catch_command_panic(panic_boundary, async move {
             match command {
@@ -1061,6 +945,10 @@ impl ProductionRpgMakerCommandRunner {
         let file_system = roots.file_system().clone();
         let sqlite = roots.sqlite().clone();
         let project_name = command.project_name().clone();
+        let database_path =
+            ProjectWorkspaceLayout::for_project(&projects_root, self.layout, &project_name)
+                .database_path()
+                .to_path_buf();
         let script_path = command.script().script_path().to_path_buf();
         let script_read = drive_command(
             file_system.read_file(script_path),
@@ -1122,25 +1010,23 @@ impl ProductionRpgMakerCommandRunner {
             }
         };
 
-        let script_identity = script.resolved_path().to_string_lossy().into_owned();
+        let script_path = script.resolved_path().to_path_buf();
+        let script_identity = script_path.to_string_lossy().into_owned();
         let script_source = script.into_bytes();
         let project_log = start_command_log(CommandLogStart {
             common: command.common(),
             locale: self.locale,
-            engine: self.layout.engine().storage_name(),
+            engine: project_log_engine(self.layout),
             project: project_name.as_str(),
-            command: "lua",
-            stage: DiagnosticStage::Lua,
-            profile: None,
+            command: ProjectLogCommand::Lua,
             performance,
-            panic_boundary: Some(&self.panic_boundary),
         });
         let mut lua_summary = ProjectLuaSummaryGuard::new(&project_log);
 
         let program_arguments = command.arguments().to_vec();
         let preflight_cancellation = lua_cancellation.clone();
-        let preflight_logger = project_log.logger.clone();
-        let preflight_context = project_log.context.clone();
+        let preflight_log = project_log.handle().clone();
+        let preflight_database_path = database_path.clone();
         let preparation = drive_command(
             async move {
                 let result = tokio::task::spawn_blocking(move || {
@@ -1150,15 +1036,10 @@ impl ProductionRpgMakerCommandRunner {
                         &program,
                         &preflight_cancellation,
                     )?;
-                    preflight_logger.emit(ProjectLogEvent::new(
-                        ProjectLogLevel::Info,
-                        ProjectLogCode::LuaScript,
-                        preflight_context,
-                        ProjectLogPayload::LuaScript {
-                            identity: program.identity().to_owned(),
-                            fingerprint: fingerprint.hex(),
-                        },
-                    ));
+                    if let Ok(event) = ProjectLogEvent::lua_script(&script_path, fingerprint.hex())
+                    {
+                        preflight_log.emit(event);
+                    }
                     compile_project_lua_program_with_cancellation(
                         &program,
                         &preflight_cancellation,
@@ -1170,7 +1051,10 @@ impl ProductionRpgMakerCommandRunner {
                 match result {
                     Ok(prepared) => Ok(OperationCompletion::Completed(prepared)),
                     Err(ProjectLuaFailure::Cancelled) => Ok(OperationCompletion::Cancelled),
-                    Err(source) => Err(ProductionCommandError::project_lua_preflight(source)),
+                    Err(source) => Err(ProductionCommandError::project_lua_preflight(
+                        source,
+                        &preflight_database_path,
+                    )),
                 }
             },
             termination_signals,
@@ -1184,6 +1068,12 @@ impl ProductionRpgMakerCommandRunner {
                 defer_terminal_progress_status(
                     progress.safe_stopping(progress_safe_stopping(self.locale)),
                 );
+                project_log
+                    .handle()
+                    .emit(ProjectLogEvent::CancellationRequested {
+                        confirmed: 0,
+                        total: None,
+                    });
             },
         )
         .await;
@@ -1195,9 +1085,7 @@ impl ProductionRpgMakerCommandRunner {
                         .map(|_completion| OperationCompletion::<RpgMakerCommandOutput>::Cancelled)
                 });
                 let shutdown = finish_terminal_progress(progress, roots.shutdown().await);
-                let outcome = project_log_outcome(&execution, &shutdown);
-                let diagnostics = project_log_failure_diagnostics(&execution, &shutdown);
-                let pending = PendingProjectLog::new(project_log, outcome, diagnostics);
+                let pending = pending_project_log_for_execution(project_log, &execution, &shutdown);
                 return ProductionCommandRunReport::from_completion_with_project_log(
                     execution,
                     shutdown,
@@ -1222,6 +1110,12 @@ impl ProductionRpgMakerCommandRunner {
                 defer_terminal_progress_status(
                     progress.safe_stopping(progress_safe_stopping(self.locale)),
                 );
+                project_log
+                    .handle()
+                    .emit(ProjectLogEvent::CancellationRequested {
+                        confirmed: 0,
+                        total: None,
+                    });
             },
         )
         .await;
@@ -1229,16 +1123,10 @@ impl ProductionRpgMakerCommandRunner {
             DrivenCommand::Finished(Ok(lease)) => lease,
             DrivenCommand::Finished(Err(error)) => {
                 let shutdown = roots.shutdown().await;
-                let pending = PendingProjectLog::new(
-                    project_log,
-                    ProjectLogRunOutcome::Failed,
-                    error
-                        .failure_report()
-                        .public_diagnostics()
-                        .cloned()
-                        .chain(shutdown.public_diagnostics().cloned())
-                        .collect(),
-                );
+                let pending = project_log.pending_failure(report_with_shutdown(
+                    error.failure_report().report().clone(),
+                    &shutdown,
+                ));
                 return ProductionCommandRunReport::construction_failed_with_shutdown_and_project_log(
                     error,
                     shutdown,
@@ -1249,27 +1137,21 @@ impl ProductionRpgMakerCommandRunner {
                 let error = interrupted_non_cancellation_error(result);
                 let shutdown = finish_terminal_progress(progress, roots.shutdown().await);
                 if let Some(error) = error {
-                    let pending = PendingProjectLog::new(
-                        project_log,
-                        ProjectLogRunOutcome::Failed,
-                        error
-                            .failure_report()
-                            .public_diagnostics()
-                            .cloned()
-                            .chain(shutdown.public_diagnostics().cloned())
-                            .collect(),
-                    );
+                    let pending = project_log.pending_failure(report_with_shutdown(
+                        error.failure_report().report().clone(),
+                        &shutdown,
+                    ));
                     return ProductionCommandRunReport::construction_failed_with_shutdown_and_project_log(
                         error,
                         shutdown,
                         Some(pending),
                     );
                 }
-                let pending = PendingProjectLog::new(
-                    project_log,
-                    ProjectLogRunOutcome::Cancelled,
-                    shutdown.public_diagnostics().cloned().collect(),
-                );
+                let pending = if let Some(report) = shutdown_report(&shutdown) {
+                    project_log.pending_failure(report)
+                } else {
+                    project_log.pending_cancelled()
+                };
                 return ProductionCommandRunReport {
                     result: CommandRunResult::Interrupted,
                     shutdown_error: (!shutdown.is_empty()).then_some(shutdown),
@@ -1286,16 +1168,10 @@ impl ProductionRpgMakerCommandRunner {
                 };
                 let error = ProductionCommandError::signal(source, outcome);
                 let shutdown = finish_terminal_progress(progress, roots.shutdown().await);
-                let pending = PendingProjectLog::new(
-                    project_log,
-                    ProjectLogRunOutcome::Failed,
-                    error
-                        .failure_report()
-                        .public_diagnostics()
-                        .cloned()
-                        .chain(shutdown.public_diagnostics().cloned())
-                        .collect(),
-                );
+                let pending = project_log.pending_failure(report_with_shutdown(
+                    error.failure_report().report().clone(),
+                    &shutdown,
+                ));
                 return ProductionCommandRunReport::construction_failed_with_shutdown_and_project_log(
                     error,
                     shutdown,
@@ -1312,10 +1188,7 @@ impl ProductionRpgMakerCommandRunner {
         progress_observer.observe(ProgressSnapshot::indeterminate(
             ProjectLuaProgressPhase::Running,
         ));
-        let database_path =
-            ProjectWorkspaceLayout::for_project(&projects_root, self.layout, &project_name)
-                .database_path()
-                .to_path_buf();
+        let execution_database_path = database_path.clone();
         let request = ProjectLuaRunRequest::new(
             ProjectLuaProject::new(project_name.as_str(), self.layout.engine().storage_name()),
             program,
@@ -1329,14 +1202,19 @@ impl ProductionRpgMakerCommandRunner {
             async move {
                 let result = tokio::task::spawn_blocking(move || {
                     let connection = Connection::open_with_flags(
-                        &database_path,
+                        &execution_database_path,
                         OpenFlags::SQLITE_OPEN_READ_WRITE,
                     )
                     .map_err(|source| ProjectLuaExecutionError::Open {
-                        path: database_path,
+                        path: execution_database_path.clone(),
                         source,
                     })?;
-                    run_project_lua(connection, request).map_err(ProjectLuaExecutionError::Run)
+                    run_project_lua(connection, request).map_err(|source| {
+                        ProjectLuaExecutionError::Run {
+                            path: execution_database_path,
+                            source,
+                        }
+                    })
                 })
                 .await
                 .map_err(ProductionCommandError::project_lua_worker)?;
@@ -1347,7 +1225,7 @@ impl ProductionRpgMakerCommandRunner {
                         },
                         report,
                     ))),
-                    Err(ProjectLuaExecutionError::Run(error))
+                    Err(ProjectLuaExecutionError::Run { source: error, .. })
                         if project_lua_run_was_cancelled(&error) =>
                     {
                         Ok(OperationCompletion::Cancelled)
@@ -1366,22 +1244,37 @@ impl ProductionRpgMakerCommandRunner {
                 defer_terminal_progress_status(
                     progress.safe_stopping(progress_safe_stopping(self.locale)),
                 );
+                let (confirmed, total) = progress_observer.confirmed_amount();
+                project_log
+                    .handle()
+                    .emit(ProjectLogEvent::CancellationRequested { confirmed, total });
             },
         )
         .await;
         drop(project_lease_guard);
-        if completed_project_lua_report(&execution).is_some() {
-            progress_observer.finish();
+        if business_completed(&execution) {
+            progress_observer.complete_phase(ProjectLuaProgressPhase::Running);
         }
+        finish_progress_business_state(&progress_observer, &execution);
         let report = lua_metrics.report();
         lua_summary.emit(report);
         let execution = execution.map(|result| {
             result.map(|completion| map_completion(completion, |(output, _report)| output))
         });
         let shutdown = finish_terminal_progress(progress, roots.shutdown().await);
-        let outcome = project_log_outcome(&execution, &shutdown);
-        let diagnostics = project_log_failure_diagnostics(&execution, &shutdown);
-        let pending = PendingProjectLog::new(project_log, outcome, diagnostics);
+        let terminal_diagnostic = record_failed_phase(
+            &progress_observer,
+            &project_log,
+            &execution,
+            &shutdown,
+            DiagnosticScope::Run,
+        );
+        let pending = pending_project_log_with_occurrence(
+            project_log,
+            &execution,
+            &shutdown,
+            terminal_diagnostic,
+        );
         ProductionCommandRunReport::from_completion_with_project_log(
             execution,
             shutdown,
@@ -1645,7 +1538,7 @@ impl ProductionRpgMakerCommandRunner {
         )
         .await
         .map(|result| result.map_err(map_init_error));
-        progress_observer.finish();
+        finish_progress_business_state(&progress_observer, &execution);
         let shutdown = roots.shutdown().await;
         let reused_path = (plan_source == ProjectLogValueSource::ProjectState)
             .then(|| resolved_game_root.clone());
@@ -1678,23 +1571,14 @@ impl ProductionRpgMakerCommandRunner {
         let project_log = start_command_log(CommandLogStart {
             common: command.common(),
             locale: self.locale,
-            engine: self.layout.engine().storage_name(),
+            engine: project_log_engine(self.layout),
             project: command.arguments.project.name.as_str(),
-            command: "init",
-            stage: DiagnosticStage::Init,
-            profile: None,
+            command: ProjectLogCommand::Init,
             performance: Arc::clone(&performance),
-            panic_boundary: Some(&self.panic_boundary),
         });
-        project_log.logger.emit(ProjectLogEvent::new(
-            ProjectLogLevel::Info,
-            ProjectLogCode::RunPlanResolved,
-            project_log.context.clone(),
-            ProjectLogPayload::RunPlan {
-                source: plan_source,
-                selections: vec![resolved_game_root.to_string_lossy().into_owned()],
-            },
-        ));
+        project_log.handle().emit(ProjectLogEvent::RunPlanResolved {
+            plan: ResolvedRunPlan::init(plan_source, &resolved_game_root),
+        });
         let replacement = InitRunPlan::new(resolved_game_root)
             .map(ProjectRunPlanReplacement::Init)
             .map_err(ProductionCommandError::invalid_run_plan);
@@ -1723,11 +1607,9 @@ impl ProductionRpgMakerCommandRunner {
                             progress.safe_stopping(progress_safe_stopping(self.locale)),
                         );
                         let (confirmed, total) = progress_observer.confirmed_amount();
-                        project_log.emit_cancellation(
-                            ProjectLogCode::CancellationRequested,
-                            confirmed,
-                            total,
-                        );
+                        project_log
+                            .handle()
+                            .emit(ProjectLogEvent::CancellationRequested { confirmed, total });
                     },
                 )
                 .await
@@ -1736,10 +1618,19 @@ impl ProductionRpgMakerCommandRunner {
         };
         drop(project_lease_guard);
         let shutdown = finish_terminal_progress(progress, shutdown);
-        let log_outcome = project_log_outcome(&execution, &shutdown);
-        let failure_diagnostics = project_log_failure_diagnostics(&execution, &shutdown);
-        let pending_project_log =
-            PendingProjectLog::new(project_log, log_outcome, failure_diagnostics);
+        let terminal_diagnostic = record_failed_phase(
+            &progress_observer,
+            &project_log,
+            &execution,
+            &shutdown,
+            DiagnosticScope::Run,
+        );
+        let pending_project_log = pending_project_log_with_occurrence(
+            project_log,
+            &execution,
+            &shutdown,
+            terminal_diagnostic,
+        );
         ProductionCommandRunReport::from_completion_with_project_log(
             execution.map(|result| {
                 result.map(|completion| {
@@ -1935,13 +1826,10 @@ impl ProductionRpgMakerCommandRunner {
         let project_log = start_command_log(CommandLogStart {
             common: command.common(),
             locale: self.locale,
-            engine: self.layout.engine().storage_name(),
+            engine: project_log_engine(self.layout),
             project: command.project_name().as_str(),
-            command: "extract",
-            stage: DiagnosticStage::Extract,
-            profile: None,
+            command: ProjectLogCommand::Extract,
             performance: Arc::clone(&performance),
-            panic_boundary: Some(&self.panic_boundary),
         });
         let progress_observer =
             ProductionProgressObserver::new(progress.observer(), &project_log, extract_phase_code);
@@ -1957,7 +1845,7 @@ impl ProductionRpgMakerCommandRunner {
                         definition,
                     }),
                     Err(source) => {
-                        let diagnostic = source.safe_diagnostic();
+                        let diagnostic = source.diagnostic_report();
                         let shutdown = roots.shutdown().await;
                         drop(project_lease_guard);
                         return observed_construction_failure(
@@ -1980,7 +1868,7 @@ impl ProductionRpgMakerCommandRunner {
                 match load_rules_program(&file_system, selected.rules_path()).await {
                     Ok(program) => Some(program),
                     Err(source) => {
-                        let diagnostic = source.safe_diagnostic();
+                        let diagnostic = source.diagnostic_report();
                         let shutdown = roots.shutdown().await;
                         drop(project_lease_guard);
                         return observed_construction_failure(
@@ -2001,7 +1889,7 @@ impl ProductionRpgMakerCommandRunner {
                 ) {
                     Ok(program) => Some(program),
                     Err(error) => {
-                        let diagnostic = error.safe_diagnostic(&database_path);
+                        let diagnostic = error.diagnostic_report(&database_path);
                         let shutdown = roots.shutdown().await;
                         drop(project_lease_guard);
                         return observed_construction_failure(
@@ -2050,16 +1938,9 @@ impl ProductionRpgMakerCommandRunner {
                 .await;
             }
         };
-        let mut selections = Vec::new();
-        if builtin_enabled {
-            selections.push(String::from("Builtin"));
-        }
-        if rules_program
+        let rules_enabled = rules_program
             .as_ref()
-            .is_some_and(|program| !program.is_empty())
-        {
-            selections.push(String::from("Rules"));
-        }
+            .is_some_and(|program| !program.is_empty());
         let disabled_owners = [command
             .rpg_maker()
             .rules()
@@ -2069,17 +1950,20 @@ impl ProductionRpgMakerCommandRunner {
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
-        let has_saved_plan = !selections.is_empty();
-        let presented_owners = selections.clone();
-        project_log.logger.emit(ProjectLogEvent::new(
-            ProjectLogLevel::Info,
-            ProjectLogCode::RunPlanResolved,
-            project_log.context.clone(),
-            ProjectLogPayload::RunPlan {
-                source: plan_source,
-                selections,
-            },
-        ));
+        let has_saved_plan = builtin_enabled || rules_enabled;
+        let presented_owners = [
+            builtin_enabled.then_some(String::from("Builtin")),
+            rules_enabled.then_some(String::from("Rules")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        project_log.handle().emit(ProjectLogEvent::RunPlanResolved {
+            plan: ResolvedRunPlan::rpg_maker_extract(
+                plan_source,
+                ExtractOwnerSelection::new(builtin_enabled, rules_enabled),
+            ),
+        });
         let opener = PreopenedProject::new(opened_project);
         let document_config = command.rpg_maker().document();
         let document_reader =
@@ -2139,20 +2023,14 @@ impl ProductionRpgMakerCommandRunner {
             || {
                 defer_terminal_progress_status(progress.safe_stopping(safe_stopping));
                 let (confirmed, total) = progress_observer.confirmed_amount();
-                project_log.emit_cancellation(
-                    ProjectLogCode::CancellationRequested,
-                    confirmed,
-                    total,
-                );
+                project_log
+                    .handle()
+                    .emit(ProjectLogEvent::CancellationRequested { confirmed, total });
             },
         )
         .await
         .map(|result| result.map_err(map_extract_error));
-        if matches!(&execution, DrivenCommand::Interrupted(_)) {
-            let (confirmed, total) = progress_observer.confirmed_amount();
-            project_log.emit_cancellation(ProjectLogCode::SafeStopFinished, confirmed, total);
-        }
-        progress_observer.finish();
+        finish_progress_business_state(&progress_observer, &execution);
         let shutdown = roots.shutdown().await;
         if !matches!(execution, DrivenCommand::Interrupted(_)) {
             defer_terminal_progress_status(progress.finalizing(progress_finalizing(self.locale)));
@@ -2175,37 +2053,34 @@ impl ProductionRpgMakerCommandRunner {
                     progress.safe_stopping(progress_safe_stopping(self.locale)),
                 );
                 let (confirmed, total) = progress_observer.confirmed_amount();
-                project_log.emit_cancellation(
-                    ProjectLogCode::CancellationRequested,
-                    confirmed,
-                    total,
-                );
+                project_log
+                    .handle()
+                    .emit(ProjectLogEvent::CancellationRequested { confirmed, total });
             },
         )
         .await;
         if let Some(output) = completed_output(&execution) {
             for warning in &output.rules_warnings {
-                project_log.logger.emit_reliable(ProjectLogEvent::new(
-                    ProjectLogLevel::Warn,
-                    ProjectLogCode::ExtractRulesCommandNonStringSkipped,
-                    project_log.context.clone(),
-                    ProjectLogPayload::RulesCommandNonStringSkipped {
-                        rule_number: u64::try_from(warning.rule_number).unwrap_or(u64::MAX),
-                        source_file: warning.source_file.clone(),
-                        command_code: warning.command_code,
-                        parameter: u64::try_from(warning.parameter).unwrap_or(u64::MAX),
-                        actual_type: warning.actual_type.as_str().to_owned(),
-                        skipped_count: warning.skipped_count,
-                    },
-                ));
+                project_log
+                    .handle()
+                    .record_diagnostic(DiagnosticScope::Extract, warning.diagnostic_report());
             }
         }
         drop(project_lease_guard);
         let shutdown = finish_terminal_progress(progress, shutdown);
-        let log_outcome = project_log_outcome(&execution, &shutdown);
-        let failure_diagnostics = project_log_failure_diagnostics(&execution, &shutdown);
-        let pending_project_log =
-            PendingProjectLog::new(project_log, log_outcome, failure_diagnostics);
+        let terminal_diagnostic = record_failed_phase(
+            &progress_observer,
+            &project_log,
+            &execution,
+            &shutdown,
+            DiagnosticScope::Run,
+        );
+        let pending_project_log = pending_project_log_with_occurrence(
+            project_log,
+            &execution,
+            &shutdown,
+            terminal_diagnostic,
+        );
         ProductionCommandRunReport::from_completion_with_project_log(
             execution.map(|result| {
                 result.map(|completion| {
@@ -2416,25 +2291,21 @@ impl ProductionRpgMakerCommandRunner {
                 );
             }
         };
-        let mut project_log = start_command_log(CommandLogStart {
+        let project_log = start_command_log(CommandLogStart {
             common: command.common(),
             locale: self.locale,
-            engine: self.layout.engine().storage_name(),
+            engine: project_log_engine(self.layout),
             project: command.project_name().as_str(),
-            command: "translate",
-            stage: DiagnosticStage::Translate,
-            profile: Some(&profile_id),
+            command: ProjectLogCommand::Translate,
             performance: Arc::clone(&performance),
-            panic_boundary: Some(&self.panic_boundary),
         });
-        project_log.set_profile(&profile_id);
         let progress_observer = ProductionProgressObserver::new(
             progress.observer(),
             &project_log,
             translate_phase_code,
         );
-        let replacement = match TranslateRunPlan::new(profile_id.clone()) {
-            Ok(plan) => ProjectRunPlanReplacement::Translate(plan),
+        let translate_plan = match TranslateRunPlan::new(profile_id.clone()) {
+            Ok(plan) => plan,
             Err(error) => {
                 let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
@@ -2446,15 +2317,16 @@ impl ProductionRpgMakerCommandRunner {
                 .await;
             }
         };
-        project_log.logger.emit(ProjectLogEvent::new(
-            ProjectLogLevel::Info,
-            ProjectLogCode::RunPlanResolved,
-            project_log.context.clone(),
-            ProjectLogPayload::RunPlan {
-                source: profile_source,
-                selections: vec![profile_id.clone()],
-            },
-        ));
+        let resolved_plan = ResolvedRunPlan::translate_validated(
+            profile_source,
+            translate_plan.profile_identifier().clone(),
+            command.terminology_path(),
+            command.placeholder_rules_path(),
+        );
+        let replacement = ProjectRunPlanReplacement::Translate(translate_plan);
+        project_log.handle().emit(ProjectLogEvent::RunPlanResolved {
+            plan: resolved_plan,
+        });
         let additional_pem_roots =
             match load_additional_pem_roots(&file_system, command.llm()).await {
                 Ok(value) => value,
@@ -2498,15 +2370,18 @@ impl ProductionRpgMakerCommandRunner {
                             self.locale,
                             cpu.clone(),
                             observation_file_system,
-                            project_log.logger.clone(),
+                            project_log.handle().clone(),
                         ),
                     )),
                     true,
                 ),
                 Err(error) => {
                     project_log
-                        .logger
-                        .record_task_record_failure(error.safe_diagnostic());
+                        .handle()
+                        .record_task_record_diagnostic(DiagnosticReport::new(
+                            StateEffect::Unchanged,
+                            error.diagnostic(),
+                        ));
                     (ConfiguredTranslationTaskRecordSink::disabled(), false)
                 }
             }
@@ -2552,19 +2427,13 @@ impl ProductionRpgMakerCommandRunner {
             || {
                 defer_terminal_progress_status(progress.safe_stopping(safe_stopping));
                 let (confirmed, total) = progress_observer.confirmed_amount();
-                project_log.emit_cancellation(
-                    ProjectLogCode::CancellationRequested,
-                    confirmed,
-                    total,
-                );
+                project_log
+                    .handle()
+                    .emit(ProjectLogEvent::CancellationRequested { confirmed, total });
             },
         )
         .await
         .map(|result| result.map_err(map_translate_error));
-        if matches!(&execution, DrivenCommand::Interrupted(_)) {
-            let (confirmed, total) = progress_observer.confirmed_amount();
-            project_log.emit_cancellation(ProjectLogCode::SafeStopFinished, confirmed, total);
-        }
         business_log.emit_retry_summary();
         let no_model_work = matches!(
             &execution,
@@ -2575,21 +2444,19 @@ impl ProductionRpgMakerCommandRunner {
             progress_observer.observe(ProgressSnapshot::indeterminate(
                 TranslateProgressPhase::NoWork,
             ));
-            project_log.logger.emit(ProjectLogEvent::new(
-                ProjectLogLevel::Info,
-                ProjectLogCode::NoWork,
-                project_log.context.clone(),
-                ProjectLogPayload::NoWork {
-                    reason: ProjectLogNoWorkReason::TranslationUpToDate,
-                },
-            ));
         }
-        progress_observer.finish();
+        finish_progress_business_state(&progress_observer, &execution);
         llm.shutdown().await;
         // 任务记录渲染仍使用本次命令的 CPU 根。必须在关闭根之前完成旁路记录；
         // 记录故障只写入日志健康状态，不改变翻译、取消或运行方案的终态。
         task_records.finish().await;
         let shutdown = roots.shutdown().await;
+        // Translation 业务终态必须在 RunPlan 持久化前确定；后者失败不能把已经完成的
+        // 翻译改写成 Failed，也不能丢失正常业务汇总。
+        let terminal_diagnostic = business_log.emit_translation_finished(&execution);
+        if let Some((_, diagnostic, _)) = terminal_diagnostic {
+            progress_observer.stop_active(PhaseStopOutcome::Failed { diagnostic });
+        }
         if !matches!(execution, DrivenCommand::Interrupted(_)) {
             defer_terminal_progress_status(progress.finalizing(progress_finalizing(self.locale)));
         }
@@ -2611,20 +2478,20 @@ impl ProductionRpgMakerCommandRunner {
                     progress.safe_stopping(progress_safe_stopping(self.locale)),
                 );
                 let (confirmed, total) = progress_observer.confirmed_amount();
-                project_log.emit_cancellation(
-                    ProjectLogCode::CancellationRequested,
-                    confirmed,
-                    total,
-                );
+                project_log
+                    .handle()
+                    .emit(ProjectLogEvent::CancellationRequested { confirmed, total });
             },
         )
         .await;
         drop(project_lease_guard);
         let shutdown = finish_terminal_progress(progress, shutdown);
-        let log_outcome = project_log_outcome(&execution, &shutdown);
-        let failure_diagnostics = project_log_failure_diagnostics(&execution, &shutdown);
-        let pending_project_log =
-            PendingProjectLog::new(project_log, log_outcome, failure_diagnostics);
+        let pending_project_log = pending_project_log_for_translation_execution(
+            project_log,
+            &execution,
+            &shutdown,
+            terminal_diagnostic,
+        );
         ProductionCommandRunReport::from_completion_with_project_log(
             execution.map(|result| {
                 result.map(|completion| {
@@ -2775,13 +2642,10 @@ impl ProductionRpgMakerCommandRunner {
         let project_log = start_command_log(CommandLogStart {
             common: command.common(),
             locale: self.locale,
-            engine: self.layout.engine().storage_name(),
+            engine: project_log_engine(self.layout),
             project: command.project_name().as_str(),
-            command: "write-back",
-            stage: DiagnosticStage::WriteBack,
-            profile: None,
+            command: ProjectLogCommand::WriteBack,
             performance: Arc::clone(&performance),
-            panic_boundary: Some(&self.panic_boundary),
         });
         let progress_observer = ProductionProgressObserver::new(
             progress.observer(),
@@ -2808,11 +2672,12 @@ impl ProductionRpgMakerCommandRunner {
         )
         .with_progress(progress_observer.clone());
         let publisher = RpgMakerWriteBackPublishingService::new(directory_publisher.clone());
+        let business_log = ProductionBusinessLog::from_active(&project_log);
         let service = WriteBackService::new(
             opener,
             write_back,
             publisher,
-            ProductionBusinessLog::from_active(&project_log),
+            business_log.clone(),
             AlreadyHeldProjectCommandLeaseProvider::new(&project_lease_guard),
             cancellation.clone(),
         )
@@ -2833,28 +2698,39 @@ impl ProductionRpgMakerCommandRunner {
             || {
                 defer_terminal_progress_status(progress.safe_stopping(safe_stopping));
                 let (confirmed, total) = progress_observer.confirmed_amount();
-                project_log.emit_cancellation(
-                    ProjectLogCode::CancellationRequested,
-                    confirmed,
-                    total,
-                );
+                project_log
+                    .handle()
+                    .emit(ProjectLogEvent::CancellationRequested { confirmed, total });
             },
         )
         .await
         .map(|result| result.map_err(map_write_back_error));
-        if matches!(&execution, DrivenCommand::Interrupted(_)) {
-            let (confirmed, total) = progress_observer.confirmed_amount();
-            project_log.emit_cancellation(ProjectLogCode::SafeStopFinished, confirmed, total);
-        }
         emit_write_back_manual_layout_diagnostics(&execution, &project_log);
-        progress_observer.finish();
+        finish_progress_business_state(&progress_observer, &execution);
         let shutdown = roots.shutdown().await;
         drop(project_lease_guard);
         let shutdown = finish_terminal_progress(progress, shutdown);
-        let log_outcome = project_log_outcome(&execution, &shutdown);
-        let failure_diagnostics = project_log_failure_diagnostics(&execution, &shutdown);
-        let pending_project_log =
-            PendingProjectLog::new(project_log, log_outcome, failure_diagnostics);
+        let diagnostic_scope = if business_log.has_pending_publication_failure() {
+            DiagnosticScope::Publication
+        } else {
+            DiagnosticScope::Run
+        };
+        let terminal_diagnostic = record_failed_phase(
+            &progress_observer,
+            &project_log,
+            &execution,
+            &shutdown,
+            diagnostic_scope,
+        );
+        if let Some((_, diagnostic)) = terminal_diagnostic {
+            business_log.emit_publication_failure(diagnostic);
+        }
+        let pending_project_log = pending_project_log_with_occurrence(
+            project_log,
+            &execution,
+            &shutdown,
+            terminal_diagnostic,
+        );
         ProductionCommandRunReport::from_completion_with_project_log(
             execution.map(|result| {
                 result.map(|completion| {
@@ -2883,24 +2759,9 @@ fn emit_write_back_manual_layout_diagnostics(
         _ => return,
     };
     for diagnostic in output.manual_layout_diagnostics() {
-        let locations = diagnostic
-            .locations()
-            .iter()
-            .map(|location| ProjectLogManualLayoutLocation {
-                group_location: location.group_location().to_string(),
-                role: location.role_name(),
-            })
-            .collect();
-        project_log.logger.emit_reliable(ProjectLogEvent::new(
-            ProjectLogLevel::Warn,
-            ProjectLogCode::WriteBackManualLayoutRequired,
-            project_log.context.clone(),
-            ProjectLogPayload::ManualLayoutRequired {
-                locations,
-                region: diagnostic.region_name().to_owned(),
-                max_fullwidth_chars: u64::from(diagnostic.max_fullwidth_chars()),
-            },
-        ));
+        project_log
+            .handle()
+            .record_diagnostic(DiagnosticScope::WriteBack, diagnostic.diagnostic_report());
     }
 }
 
@@ -2967,14 +2828,10 @@ impl Error for RulesProgramInputError {
 }
 
 impl RulesProgramInputError {
-    fn safe_diagnostic(&self) -> SafeDiagnostic {
+    fn diagnostic_report(&self) -> DiagnosticReport {
         match self {
-            Self::Read { source, .. } => safe_command_input_file_read(
-                source,
-                DiagnosticCode::ExtractRules,
-                DiagnosticAction::FixInput,
-            ),
-            Self::Invalid { path, source } => source.safe_diagnostic(path),
+            Self::Read { source, .. } => source.command_preparation_diagnostic_report(),
+            Self::Invalid { path, source } => source.diagnostic_report(path),
         }
     }
 }
@@ -3092,64 +2949,14 @@ impl Error for MvDialogueDefinitionInputError {
 }
 
 impl MvDialogueDefinitionInputError {
-    fn safe_diagnostic(&self) -> SafeDiagnostic {
+    fn diagnostic_report(&self) -> DiagnosticReport {
         match self {
-            Self::Read { source, .. } => safe_command_input_file_read(
-                source,
-                DiagnosticCode::ExtractBuiltin,
-                DiagnosticAction::FixInput,
-            ),
-            Self::InvalidUtf8 { path, source } => SafeDiagnostic::new(
-                DiagnosticCode::ExtractBuiltin,
-                DiagnosticStage::CommandPreparation,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::InvalidUtf8 {
-                    valid_up_to: u64::try_from(source.valid_up_to()).unwrap_or(u64::MAX),
-                    error_len: source
-                        .error_len()
-                        .map(|value| u64::try_from(value).unwrap_or(u64::MAX)),
-                },
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixInput,
-            ),
-            Self::InvalidDefinition { path, source } => source
-                .safe_diagnostic_source(
-                    DiagnosticStage::CommandPreparation,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::FixInput,
-                )
-                .with_recovery(crate::diagnostic::RecoveryFact::path(path)),
+            Self::Read { source, .. } => source.command_preparation_diagnostic_report(),
+            Self::InvalidUtf8 { path, source } => {
+                external_invalid_utf8_diagnostic_report(path, source)
+            }
+            Self::InvalidDefinition { path, source } => source.external_diagnostic_report(path),
         }
-    }
-}
-
-fn safe_command_input_file_read(
-    source: &ReadFileError<SystemFileSystemError>,
-    code: DiagnosticCode,
-    action: DiagnosticAction,
-) -> SafeDiagnostic {
-    match source {
-        ReadFileError::NotFound { path } => SafeDiagnostic::new(
-            code,
-            DiagnosticStage::CommandPreparation,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
-            DiagnosticImpact::Unchanged,
-            action,
-        ),
-        ReadFileError::NotFile { path } => SafeDiagnostic::new(
-            code,
-            DiagnosticStage::CommandPreparation,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
-            DiagnosticImpact::Unchanged,
-            action,
-        ),
-        ReadFileError::Io { source, .. } => source.safe_diagnostic(
-            DiagnosticStage::CommandPreparation,
-            DiagnosticImpact::Unchanged,
-            action,
-        ),
     }
 }
 
@@ -3171,156 +2978,35 @@ async fn catch_command_panic(
     }
 }
 
-pub(crate) struct ActiveProjectLog {
-    run_id: Option<String>,
-    runtime: ProjectLogRuntime,
-    logger: ProjectLogger,
-    context: ProjectLogContext,
-    performance: Arc<RunPerformanceCounters>,
-}
-
-pub(crate) struct ProjectLuaSummaryGuard {
-    logger: ProjectLogger,
-    context: ProjectLogContext,
-    metrics: Option<ProjectLuaRunMetrics>,
-    emitted: bool,
-}
-
-impl ProjectLuaSummaryGuard {
-    pub(crate) fn new(project_log: &ActiveProjectLog) -> Self {
-        Self {
-            logger: project_log.logger.clone(),
-            context: project_log.context.clone(),
-            metrics: None,
-            emitted: false,
-        }
-    }
-
-    pub(crate) fn track(&mut self, metrics: ProjectLuaRunMetrics) {
-        self.metrics = Some(metrics);
-    }
-
-    pub(crate) fn emit(&mut self, report: ProjectLuaRunReport) {
-        if self.emitted {
-            return;
-        }
-        emit_project_lua_summary(&self.logger, &self.context, report);
-        self.emitted = true;
-    }
-}
-
-impl Drop for ProjectLuaSummaryGuard {
-    fn drop(&mut self) {
-        if self.emitted {
-            return;
-        }
-        let report = self
-            .metrics
-            .as_ref()
-            .map_or_else(ProjectLuaRunReport::default, ProjectLuaRunMetrics::report);
-        emit_project_lua_summary(&self.logger, &self.context, report);
-        self.emitted = true;
-    }
-}
-
-pub(crate) struct PendingProjectLog {
-    active: ActiveProjectLog,
-    outcome: ProjectLogRunOutcome,
-    failures: Vec<SafeDiagnostic>,
-}
-
-impl PendingProjectLog {
-    pub(crate) fn new(
-        active: ActiveProjectLog,
-        outcome: ProjectLogRunOutcome,
-        failures: Vec<SafeDiagnostic>,
-    ) -> Self {
-        Self {
-            active,
-            outcome,
-            failures,
-        }
-    }
-
-    pub(crate) fn finish(self) -> Option<ProjectLogWarning> {
-        finish_project_log(self.active, self.outcome, self.failures)
-    }
-
-    pub(crate) fn finish_with_failure(
-        self,
-        error: &ProductionCommandError,
-    ) -> Option<ProjectLogWarning> {
-        let mut failures = error
-            .failure_report()
-            .public_diagnostics()
-            .cloned()
-            .collect::<Vec<_>>();
-        failures.extend(self.failures);
-        finish_project_log(self.active, ProjectLogRunOutcome::Failed, failures)
-    }
-
-    pub(crate) fn finish_with_diagnostic(
-        mut self,
-        diagnostic: SafeDiagnostic,
-    ) -> Option<ProjectLogWarning> {
-        self.failures.insert(0, diagnostic);
-        finish_project_log(self.active, ProjectLogRunOutcome::Failed, self.failures)
-    }
-
-    /// 在最终终端呈现前把 runtime 的 Drop 兜底切换为进程输出 panic。
-    ///
-    /// 返回的边界保留同一组安全投影供 CLI 使用；若呈现期间 unwind 消费并丢弃
-    /// `PendingProjectLog`，runtime 会先写出这些诊断和未知终态。
-    pub(crate) fn arm_presentation_panic(&mut self) -> CommandPanicBoundary {
-        let mut diagnostics = self
-            .active
-            .runtime
-            .unfinished_failures()
-            .unwrap_or_default();
-        let presentation = match diagnostics.first().cloned() {
-            Some(mut diagnostic) => {
-                diagnostic.stage = DiagnosticStage::ProcessOutput;
-                diagnostic.impact = DiagnosticImpact::OutcomeUnknown;
-                diagnostic.action = DiagnosticAction::ReportBug;
-                diagnostic
-            }
-            None => SafeDiagnostic::new(
-                DiagnosticCode::InternalOperation,
-                DiagnosticStage::ProcessOutput,
-                DiagnosticSubject::operation("render_command_result"),
-                DiagnosticReason::failure(DiagnosticFailureKind::InternalInvariant),
-                DiagnosticImpact::OutcomeUnknown,
-                DiagnosticAction::ReportBug,
-            ),
-        };
-        diagnostics.clear();
-        diagnostics.push(presentation);
-        diagnostics.extend(self.failures.iter().cloned());
-        self.active.runtime.arm_unfinished_terminal(
-            self.active.context.clone(),
-            diagnostics.clone(),
-            Arc::clone(&self.active.performance),
-        );
-        CommandPanicBoundary::from_logged(diagnostics, self.active.logger.clone())
-    }
-}
-
 #[derive(Clone)]
 struct ProductionProgressObserver<P> {
     terminal: TerminalProgressObserver<P>,
     project_log: Option<ProgressProjectLog>,
-    phase_code: fn(P) -> ProjectLogPhase,
+    phase_code: fn(P) -> Option<ProjectLogPhase>,
     state: Arc<Mutex<ProgressLogState<P>>>,
 }
 
 #[derive(Clone)]
 struct ProgressProjectLog {
-    logger: ProjectLogger,
-    context: ProjectLogContext,
+    handle: ProjectLogHandle,
+}
+
+#[derive(Clone, Copy)]
+enum PhaseEvent {
+    Started,
+    Completed,
+    Stopped(PhaseStopOutcome),
 }
 
 struct ProgressLogState<P> {
-    phase: Option<P>,
+    // 同一命令可在 owner 阶段内发布细分阶段，随后再回到 owner；日志必须保留每个
+    // 阶段的独立终态，不能把最近快照误当成唯一活动阶段。
+    latest_amount: ProgressAmount,
+    phases: Vec<TrackedProgressPhase<P>>,
+}
+
+struct TrackedProgressPhase<P> {
+    phase: P,
     amount: ProgressAmount,
     finished: bool,
 }
@@ -3332,55 +3018,78 @@ where
     fn new(
         terminal: TerminalProgressObserver<P>,
         project_log: &ActiveProjectLog,
-        phase_code: fn(P) -> ProjectLogPhase,
+        phase_code: fn(P) -> Option<ProjectLogPhase>,
     ) -> Self {
         Self {
             terminal,
             project_log: Some(ProgressProjectLog {
-                logger: project_log.logger.clone(),
-                context: project_log.context.clone(),
+                handle: project_log.handle().clone(),
             }),
             phase_code,
             state: Arc::new(Mutex::new(ProgressLogState {
-                phase: None,
-                amount: ProgressAmount::Indeterminate,
-                finished: false,
+                latest_amount: ProgressAmount::Indeterminate,
+                phases: Vec::new(),
             })),
         }
     }
 
     fn without_project_log(
         terminal: TerminalProgressObserver<P>,
-        phase_code: fn(P) -> ProjectLogPhase,
+        phase_code: fn(P) -> Option<ProjectLogPhase>,
     ) -> Self {
         Self {
             terminal,
             project_log: None,
             phase_code,
             state: Arc::new(Mutex::new(ProgressLogState {
-                phase: None,
-                amount: ProgressAmount::Indeterminate,
-                finished: false,
+                latest_amount: ProgressAmount::Indeterminate,
+                phases: Vec::new(),
             })),
         }
     }
 
-    fn finish(&self) {
-        let event = {
+    fn complete_phase(&self, target: P) {
+        let completed = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            match (state.phase, state.finished) {
-                (Some(phase), false) => {
-                    state.finished = true;
-                    Some((ProjectLogCode::PhaseFinished, phase, state.amount))
-                }
-                (None, _) | (Some(_), true) => None,
-            }
+            state
+                .phases
+                .iter_mut()
+                .find(|phase| phase.phase == target && !phase.finished)
+                .map(|phase| {
+                    phase.finished = true;
+                    (phase.phase, phase.amount)
+                })
         };
-        if let Some((code, phase, amount)) = event {
-            self.emit_log_event(code, phase, amount);
+        if let Some((phase, amount)) = completed {
+            self.emit_log_event(PhaseEvent::Completed, phase, amount);
+        }
+    }
+
+    fn stop_active(&self, outcome: PhaseStopOutcome) {
+        self.finish_active(PhaseEvent::Stopped(outcome));
+    }
+
+    fn finish_active(&self, event: PhaseEvent) {
+        let phases = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state
+                .phases
+                .iter_mut()
+                .filter(|phase| !phase.finished)
+                .map(|phase| {
+                    phase.finished = true;
+                    (phase.phase, phase.amount)
+                })
+                .collect::<Vec<_>>()
+        };
+        for (phase, amount) in phases {
+            self.emit_log_event(event, phase, amount);
         }
     }
 
@@ -3389,31 +3098,31 @@ where
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match state.amount {
+        match state.latest_amount {
             ProgressAmount::Indeterminate => (0, None),
             ProgressAmount::Determinate { completed, total } => (completed, Some(total)),
         }
     }
 
-    fn emit_log_event(&self, code: ProjectLogCode, phase: P, amount: ProgressAmount) {
+    fn emit_log_event(&self, event: PhaseEvent, phase: P, amount: ProgressAmount) {
         let Some(project_log) = &self.project_log else {
             return;
         };
-        let phase_code = (self.phase_code)(phase);
-        project_log.logger.emit(ProjectLogEvent::new(
-            ProjectLogLevel::Info,
-            code,
-            project_log.context.clone(),
-            ProjectLogPayload::Phase {
-                phase: phase_code,
-                amount: match amount {
-                    ProgressAmount::Indeterminate => ProjectLogAmount::Indeterminate,
-                    ProgressAmount::Determinate { completed, total } => {
-                        ProjectLogAmount::Determinate { completed, total }
-                    }
-                },
-            },
-        ));
+        let Some(phase_code) = (self.phase_code)(phase) else {
+            return;
+        };
+        let amount = match amount {
+            ProgressAmount::Indeterminate => ProjectLogAmount::Indeterminate,
+            ProgressAmount::Determinate { completed, total } => {
+                ProjectLogAmount::Determinate { completed, total }
+            }
+        };
+        let event = match event {
+            PhaseEvent::Started => ProjectLogEvent::phase_started(phase_code, amount),
+            PhaseEvent::Completed => ProjectLogEvent::phase_completed(phase_code, amount),
+            PhaseEvent::Stopped(outcome) => ProjectLogEvent::phase_stopped(phase_code, outcome),
+        };
+        project_log.handle.emit(event);
     }
 }
 
@@ -3429,35 +3138,37 @@ where
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if state.phase != Some(snapshot.phase) {
-                if let Some(previous) = state.phase
-                    && !state.finished
-                {
-                    events.push((ProjectLogCode::PhaseFinished, previous, state.amount));
-                }
-                state.phase = Some(snapshot.phase);
-                state.amount = snapshot.amount;
-                state.finished = false;
-                events.push((
-                    ProjectLogCode::PhaseStarted,
-                    snapshot.phase,
-                    snapshot.amount,
-                ));
-            } else {
-                state.amount = snapshot.amount;
-            }
-            if matches!(
-                snapshot.amount,
-                ProgressAmount::Determinate { completed, total }
-                    if total > 0 && completed == total
-            ) && !state.finished
+            state.latest_amount = snapshot.amount;
+            let (phase, started) = match state
+                .phases
+                .iter()
+                .position(|phase| phase.phase == snapshot.phase)
             {
-                state.finished = true;
-                events.push((
-                    ProjectLogCode::PhaseFinished,
-                    snapshot.phase,
+                Some(index) => (&mut state.phases[index], false),
+                None => {
+                    state.phases.push(TrackedProgressPhase {
+                        phase: snapshot.phase,
+                        amount: snapshot.amount,
+                        finished: false,
+                    });
+                    (
+                        state.phases.last_mut().expect("刚插入的进度阶段必须可读取"),
+                        true,
+                    )
+                }
+            };
+            if !phase.finished {
+                phase.amount = snapshot.amount;
+                if started {
+                    events.push((PhaseEvent::Started, snapshot.phase, snapshot.amount));
+                }
+                if matches!(
                     snapshot.amount,
-                ));
+                    ProgressAmount::Determinate { completed, total } if completed == total
+                ) {
+                    phase.finished = true;
+                    events.push((PhaseEvent::Completed, snapshot.phase, snapshot.amount));
+                }
             }
         }
         for (code, phase, amount) in events {
@@ -3466,18 +3177,18 @@ where
     }
 }
 
-const fn init_phase_code(phase: InitProgressPhase) -> ProjectLogPhase {
-    match phase {
+const fn init_phase_code(phase: InitProgressPhase) -> Option<ProjectLogPhase> {
+    Some(match phase {
         InitProgressPhase::CheckingProject => ProjectLogPhase::CheckProject,
         InitProgressPhase::ScanningSource => ProjectLogPhase::ScanSource,
         InitProgressPhase::PreparingCandidate => ProjectLogPhase::PrepareCandidate,
         InitProgressPhase::UpdatingDatabase => ProjectLogPhase::UpdateDatabase,
         InitProgressPhase::Publishing => ProjectLogPhase::Publish,
-    }
+    })
 }
 
-const fn extract_phase_code(phase: ExtractProgressPhase) -> ProjectLogPhase {
-    match phase {
+const fn extract_phase_code(phase: ExtractProgressPhase) -> Option<ProjectLogPhase> {
+    Some(match phase {
         ExtractProgressPhase::Builtin => ProjectLogPhase::Builtin,
         ExtractProgressPhase::BuiltinDocuments => ProjectLogPhase::BuiltinDocuments,
         ExtractProgressPhase::BuiltinWorkUnits => ProjectLogPhase::BuiltinWorkUnits,
@@ -3486,102 +3197,76 @@ const fn extract_phase_code(phase: ExtractProgressPhase) -> ProjectLogPhase {
         ExtractProgressPhase::RulesDocuments => ProjectLogPhase::RulesDocuments,
         ExtractProgressPhase::RulesMatches => ProjectLogPhase::RulesMatches,
         ExtractProgressPhase::RulesCommit => ProjectLogPhase::RulesCommit,
+    })
+}
+
+const fn translate_phase_code(phase: TranslateProgressPhase) -> Option<ProjectLogPhase> {
+    match phase {
+        TranslateProgressPhase::Planning => Some(ProjectLogPhase::Planning),
+        TranslateProgressPhase::ConfirmedTasks => Some(ProjectLogPhase::ConfirmedTasks),
+        TranslateProgressPhase::NoWork => None,
     }
 }
 
-const fn translate_phase_code(phase: TranslateProgressPhase) -> ProjectLogPhase {
-    match phase {
-        TranslateProgressPhase::Planning => ProjectLogPhase::Planning,
-        TranslateProgressPhase::ConfirmedTasks => ProjectLogPhase::ConfirmedTasks,
-        TranslateProgressPhase::NoWork => ProjectLogPhase::NoWork,
-    }
+const fn project_lua_phase_code(_: ProjectLuaProgressPhase) -> Option<ProjectLogPhase> {
+    Some(ProjectLogPhase::Lua)
 }
 
-const fn project_lua_phase_code(_: ProjectLuaProgressPhase) -> ProjectLogPhase {
-    ProjectLogPhase::Lua
-}
-
-const fn write_back_phase_code(phase: WriteBackProgressPhase) -> ProjectLogPhase {
-    match phase {
+const fn write_back_phase_code(phase: WriteBackProgressPhase) -> Option<ProjectLogPhase> {
+    Some(match phase {
         WriteBackProgressPhase::ReadingAssets => ProjectLogPhase::ReadAssets,
         WriteBackProgressPhase::PlanningTranslations => ProjectLogPhase::PlanRpgMakerWriteBack,
         WriteBackProgressPhase::RewritingDocuments => ProjectLogPhase::RewriteDocuments,
         WriteBackProgressPhase::PreparingCandidate => ProjectLogPhase::PrepareCandidate,
         WriteBackProgressPhase::ValidatingCandidate => ProjectLogPhase::ValidateCandidate,
         WriteBackProgressPhase::Publishing => ProjectLogPhase::Publish,
-    }
+    })
 }
 
-impl ActiveProjectLog {
-    pub(crate) fn run_id(&self) -> Option<&str> {
-        self.run_id.as_deref()
-    }
-
-    pub(crate) fn set_profile(&mut self, profile: &str) {
-        self.context = self.context.clone().with_profile(profile);
-    }
-
-    pub(crate) fn logger(&self) -> &ProjectLogger {
-        &self.logger
-    }
-
-    pub(crate) fn context(&self) -> &ProjectLogContext {
-        &self.context
-    }
-
-    pub(crate) fn performance(&self) -> &Arc<RunPerformanceCounters> {
-        &self.performance
-    }
-
-    fn emit_cancellation(&self, code: ProjectLogCode, confirmed: u64, total: Option<u64>) {
-        self.logger.emit(ProjectLogEvent::new(
-            ProjectLogLevel::Info,
-            code,
-            self.context.clone(),
-            ProjectLogPayload::Cancellation { confirmed, total },
-        ));
+const fn project_log_engine(layout: RpgMakerLayout) -> ProjectLogEngine {
+    match layout.engine() {
+        crate::rpg_maker::RpgMakerEngine::Mv => ProjectLogEngine::RpgMakerMv,
+        crate::rpg_maker::RpgMakerEngine::Mz => ProjectLogEngine::RpgMakerMz,
     }
 }
 
 fn command_panic_context(
     layout: RpgMakerLayout,
     command: &ConfiguredRpgMakerCommand,
-) -> (&'static str, DiagnosticStage, PathBuf) {
-    let (command_name, stage, common, project_name) = match command {
+) -> (RuntimeEngine, crate::diagnostic::RuntimeCommand, PathBuf) {
+    let (command_name, common, project_name) = match command {
         ConfiguredRpgMakerCommand::Init(command) => (
-            "init",
-            DiagnosticStage::Init,
+            crate::diagnostic::RuntimeCommand::Init,
             command.common(),
             command.arguments.project.name.as_str(),
         ),
         ConfiguredRpgMakerCommand::Extract(command) => (
-            "extract",
-            DiagnosticStage::Extract,
+            crate::diagnostic::RuntimeCommand::Extract,
             command.common(),
             command.project_name().as_str(),
         ),
         ConfiguredRpgMakerCommand::Translate(command) => (
-            "translate",
-            DiagnosticStage::Translate,
+            crate::diagnostic::RuntimeCommand::Translate,
             command.common(),
             command.project_name().as_str(),
         ),
         ConfiguredRpgMakerCommand::WriteBack(command) => (
-            "write-back",
-            DiagnosticStage::WriteBack,
+            crate::diagnostic::RuntimeCommand::WriteBack,
             command.common(),
             command.project_name().as_str(),
         ),
         ConfiguredRpgMakerCommand::Lua(command) => (
-            "lua",
-            DiagnosticStage::Lua,
+            crate::diagnostic::RuntimeCommand::Lua,
             command.common(),
             command.project_name().as_str(),
         ),
     };
     (
+        match layout.engine() {
+            crate::rpg_maker::RpgMakerEngine::Mv => RuntimeEngine::RpgMakerMv,
+            crate::rpg_maker::RpgMakerEngine::Mz => RuntimeEngine::RpgMakerMz,
+        },
         command_name,
-        stage,
         common
             .projects_root()
             .join(layout.engine().storage_name())
@@ -3589,232 +3274,144 @@ fn command_panic_context(
     )
 }
 
-fn command_panic_diagnostic(
-    command: &'static str,
-    stage: DiagnosticStage,
-    project_workspace: &Path,
-    log_path: Option<&Path>,
-) -> SafeDiagnostic {
-    let mut diagnostic = SafeDiagnostic::new(
-        DiagnosticCode::InternalOperation,
-        stage,
-        DiagnosticSubject::command(command),
-        DiagnosticReason::failure(DiagnosticFailureKind::InternalInvariant),
-        DiagnosticImpact::OutcomeUnknown,
-        DiagnosticAction::ReportBug,
-    )
-    .with_recovery(RecoveryFact::path(project_workspace));
-    if let Some(log_path) = log_path {
-        diagnostic = diagnostic.with_recovery(RecoveryFact::path(log_path));
+fn report_with_shutdown(
+    mut report: DiagnosticReport,
+    shutdown: &ShutdownFailures,
+) -> DiagnosticReport {
+    for related in shutdown.diagnostic_reports() {
+        report = report.with_related(RelatedFailureRelation::Shutdown, related.clone());
     }
-    diagnostic
+    report
 }
 
-pub(crate) struct CommandLogStart<'a> {
-    pub(crate) common: &'a crate::application::config::CommonCommandConfiguration,
-    pub(crate) locale: UiLocale,
-    pub(crate) engine: &'a str,
-    pub(crate) project: &'a str,
-    pub(crate) command: &'static str,
-    pub(crate) stage: DiagnosticStage,
-    pub(crate) profile: Option<&'a str>,
-    pub(crate) performance: Arc<RunPerformanceCounters>,
-    pub(crate) panic_boundary: Option<&'a CommandPanicBoundary>,
-}
-
-pub(crate) fn start_command_log(input: CommandLogStart<'_>) -> ActiveProjectLog {
-    start_command_log_with_run_id(input, generate_run_id())
-}
-
-fn start_command_log_with_run_id(
-    input: CommandLogStart<'_>,
-    generated_run_id: Result<crate::observability::RunId, WindowsFsError>,
-) -> ActiveProjectLog {
-    let CommandLogStart {
-        common,
-        locale,
-        engine,
-        project,
-        command,
-        stage,
-        profile,
-        performance,
-        panic_boundary,
-    } = input;
-    let logs_root = common
-        .projects_root()
-        .join(engine)
-        .join(project)
-        .join("logs");
-    let project_workspace = logs_root
-        .parent()
-        .expect("logs 路径必须位于项目工作区内")
-        .to_path_buf();
-    let (run_id, mut runtime) = start_project_log_with_run_id(logs_root, generated_run_id);
-    let logger = runtime.logger();
-    let mut context = ProjectLogContext::new(locale.as_str())
-        .with_engine(engine)
-        .with_project(project)
-        .with_command(command);
-    if let Some(profile) = profile {
-        context = context.with_profile(profile);
+fn shutdown_report(shutdown: &ShutdownFailures) -> Option<DiagnosticReport> {
+    let mut reports = shutdown.diagnostic_reports();
+    let mut primary = reports.next()?.clone();
+    for related in reports {
+        primary = primary.with_related(RelatedFailureRelation::Shutdown, related.clone());
     }
-    logger.set_context(context.clone());
-    install_immediate_project_log_warning_presenter(&logger, locale);
-    let panic_diagnostic =
-        command_panic_diagnostic(command, stage, &project_workspace, runtime.path());
-    runtime.arm_unfinished_terminal(
-        context.clone(),
-        vec![panic_diagnostic.clone()],
-        Arc::clone(&performance),
-    );
-    if let Some(panic_boundary) = panic_boundary {
-        panic_boundary.register_project_log(vec![panic_diagnostic], logger.clone());
-    }
-    logger.emit(ProjectLogEvent::new(
-        ProjectLogLevel::Info,
-        ProjectLogCode::RunStarted,
-        context.clone(),
-        ProjectLogPayload::Run { outcome: None },
-    ));
-    ActiveProjectLog {
-        run_id,
-        runtime,
-        logger,
-        context,
-        performance,
-    }
+    Some(primary)
 }
 
-fn install_immediate_project_log_warning_presenter(logger: &ProjectLogger, locale: UiLocale) {
-    logger.install_warning_presenter(move |warning| {
-        let localizer = UiLocalizer::new(locale);
-        let mut stderr = io::stderr();
-        let result = (|| -> io::Result<()> {
-            if let Some(project_log) = &warning.project_log {
-                writeln!(stderr, "{}", localizer.format(UiMessage::NoticeLogDegraded))?;
-                if let Some(diagnostic) = &project_log.diagnostic {
-                    render_safe_diagnostic(diagnostic, &localizer, &mut stderr)?;
-                }
-                for diagnostic in &project_log.related_diagnostics {
-                    render_safe_diagnostic(diagnostic, &localizer, &mut stderr)?;
-                }
-            }
-            if let Some(task_records) = &warning.task_records {
-                writeln!(
-                    stderr,
-                    "{}",
-                    localizer.format(UiMessage::NoticeTaskRecordsDegraded)
-                )?;
-                if let Some(diagnostic) = &task_records.diagnostic {
-                    render_safe_diagnostic(diagnostic, &localizer, &mut stderr)?;
-                }
-                for diagnostic in &task_records.related_diagnostics {
-                    render_safe_diagnostic(diagnostic, &localizer, &mut stderr)?;
-                }
-            }
-            stderr.flush()
-        })();
-        result.map_err(|source| {
-            Box::new(SafeDiagnostic::io(
-                DiagnosticCode::StateFinalizationFailed,
-                DiagnosticStage::ProcessOutput,
-                DiagnosticSubject::operation("write_observability_warning"),
-                "write_stderr",
-                &source,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::Retry,
-            ))
-        })
-    });
-}
-
-fn start_project_log_with_run_id(
-    logs_root: PathBuf,
-    generated_run_id: Result<crate::observability::RunId, WindowsFsError>,
-) -> (Option<String>, ProjectLogRuntime) {
-    match generated_run_id {
-        Ok(run_id) => {
-            let run_id = run_id.to_string();
-            let runtime = start_project_log(logs_root, run_id.clone());
-            (Some(run_id), runtime)
-        }
-        Err(source) => (
-            None,
-            disabled_project_log(run_id_failure_diagnostic(&source)),
-        ),
-    }
-}
-
-fn run_id_failure_diagnostic(source: &WindowsFsError) -> SafeDiagnostic {
-    source.safe_diagnostic(
-        DiagnosticCode::InternalOperation,
-        DiagnosticStage::ProcessStartup,
-        DiagnosticImpact::Unchanged,
-        DiagnosticAction::Retry,
+fn signal_report(source: &io::Error, effect: StateEffect) -> DiagnosticReport {
+    DiagnosticReport::new(
+        effect,
+        Diagnostic::runtime(RuntimeIssue::Io {
+            component: RuntimeComponent::Process,
+            operation: RuntimeOperation::ReceiveTerminationSignal,
+            failure: IoFailure::from_error(source),
+        }),
     )
 }
 
-fn finish_project_log(
+fn pending_project_log_for_execution<T>(
     project_log: ActiveProjectLog,
-    outcome: ProjectLogRunOutcome,
-    failures: Vec<SafeDiagnostic>,
-) -> Option<ProjectLogWarning> {
-    let performance = project_log.performance.snapshot();
-    let logger = project_log.logger;
-    let _health = project_log.runtime.finish_with_performance(
-        outcome,
-        project_log.context,
-        failures,
-        performance,
-    );
-    logger.take_warning()
-}
-
-fn project_log_failure_diagnostics<T>(
     execution: &DrivenCommand<Result<OperationCompletion<T>, ProductionCommandError>>,
     shutdown: &ShutdownFailures,
-) -> Vec<SafeDiagnostic> {
-    let mut diagnostics = match execution {
-        DrivenCommand::Interrupted(Err(error)) if error.was_cancelled_wait() => Vec::new(),
-        DrivenCommand::Finished(Err(error)) | DrivenCommand::Interrupted(Err(error)) => error
-            .failure_report()
-            .public_diagnostics()
-            .cloned()
-            .collect(),
-        DrivenCommand::SignalFailed { source, result } => {
-            let signal_impact = if matches!(result, Ok(OperationCompletion::Completed(_))) {
-                DiagnosticImpact::StateAppliedFinalizationFailed
-            } else {
-                DiagnosticImpact::Unchanged
-            };
-            let signal = signal_diagnostic(source, signal_impact);
-            match result {
-                Err(error) => error
-                    .failure_report()
-                    .public_diagnostics()
-                    .cloned()
-                    .chain(std::iter::once(signal))
-                    .collect(),
-                Ok(_) => vec![signal],
-            }
+) -> PendingProjectLog {
+    let report = execution_failure_report(execution, shutdown).or_else(|| match execution {
+        DrivenCommand::Finished(Ok(_)) | DrivenCommand::Interrupted(Ok(_)) => {
+            shutdown_report(shutdown)
         }
-        DrivenCommand::Finished(Ok(_)) | DrivenCommand::Interrupted(Ok(_)) => Vec::new(),
-    };
-    diagnostics.extend(shutdown.public_diagnostics().cloned());
-    diagnostics
+        DrivenCommand::Finished(Err(_))
+        | DrivenCommand::Interrupted(Err(_))
+        | DrivenCommand::SignalFailed { .. } => None,
+    });
+    if let Some(report) = report {
+        project_log.pending_failure(report)
+    } else if matches!(
+        execution,
+        DrivenCommand::Interrupted(_) | DrivenCommand::Finished(Ok(OperationCompletion::Cancelled))
+    ) {
+        project_log.pending_cancelled()
+    } else {
+        project_log.pending_succeeded()
+    }
 }
 
-fn signal_diagnostic(source: &io::Error, impact: DiagnosticImpact) -> SafeDiagnostic {
-    SafeDiagnostic::io(
-        DiagnosticCode::SignalRegistration,
-        DiagnosticStage::Shutdown,
-        DiagnosticSubject::component("Windows control signal"),
-        "receive_signal",
-        source,
-        impact,
-        DiagnosticAction::Retry,
-    )
+fn execution_failure_report<T>(
+    execution: &DrivenCommand<Result<OperationCompletion<T>, ProductionCommandError>>,
+    shutdown: &ShutdownFailures,
+) -> Option<DiagnosticReport> {
+    match execution {
+        DrivenCommand::Interrupted(Err(error)) if error.was_cancelled_wait() => None,
+        DrivenCommand::Finished(Err(error)) | DrivenCommand::Interrupted(Err(error)) => Some(
+            report_with_shutdown(error.failure_report().report().clone(), shutdown),
+        ),
+        DrivenCommand::SignalFailed { source, result } => {
+            let effect = if matches!(result, Ok(OperationCompletion::Completed(_))) {
+                StateEffect::AppliedFinalizationFailed
+            } else {
+                StateEffect::Unchanged
+            };
+            let signal = signal_report(source, effect);
+            Some(match result {
+                Err(error) => report_with_shutdown(
+                    error
+                        .failure_report()
+                        .report()
+                        .clone()
+                        .with_related(RelatedFailureRelation::Shutdown, signal),
+                    shutdown,
+                ),
+                Ok(_) => report_with_shutdown(signal, shutdown),
+            })
+        }
+        DrivenCommand::Finished(Ok(_)) | DrivenCommand::Interrupted(Ok(_)) => None,
+    }
+}
+
+fn record_failed_phase<P, T>(
+    observer: &ProductionProgressObserver<P>,
+    project_log: &ActiveProjectLog,
+    execution: &DrivenCommand<Result<OperationCompletion<T>, ProductionCommandError>>,
+    shutdown: &ShutdownFailures,
+    scope: DiagnosticScope,
+) -> Option<(StateEffect, DiagnosticOccurrenceId)>
+where
+    P: Copy + Eq,
+{
+    let report = execution_failure_report(execution, shutdown)?;
+    let effect = report.effect();
+    let diagnostic = project_log.handle().record_diagnostic(scope, report)?;
+    observer.stop_active(PhaseStopOutcome::Failed { diagnostic });
+    Some((effect, diagnostic))
+}
+
+fn pending_project_log_with_occurrence<T>(
+    project_log: ActiveProjectLog,
+    execution: &DrivenCommand<Result<OperationCompletion<T>, ProductionCommandError>>,
+    shutdown: &ShutdownFailures,
+    terminal_diagnostic: Option<(StateEffect, DiagnosticOccurrenceId)>,
+) -> PendingProjectLog {
+    if let Some((effect, diagnostic)) = terminal_diagnostic {
+        project_log.pending_failure_with_occurrence(effect, diagnostic)
+    } else {
+        pending_project_log_for_execution(project_log, execution, shutdown)
+    }
+}
+
+fn pending_project_log_for_translation_execution(
+    project_log: ActiveProjectLog,
+    execution: &DrivenCommand<Result<OperationCompletion<TranslateOutput>, ProductionCommandError>>,
+    shutdown: &ShutdownFailures,
+    terminal_diagnostic: Option<(StateEffect, DiagnosticOccurrenceId, &'static str)>,
+) -> PendingProjectLog {
+    if shutdown.is_empty()
+        && matches!(
+            execution,
+            DrivenCommand::Finished(Err(_)) | DrivenCommand::Interrupted(Err(_))
+        )
+        && let Some((effect, diagnostic, code)) = terminal_diagnostic
+        && execution_failure_report(execution, shutdown).is_some_and(|report| {
+            report.effect() == effect
+                && report.primary().code() == code
+                && report.related().is_empty()
+        })
+    {
+        return project_log.pending_failure_with_occurrence(effect, diagnostic);
+    }
+    pending_project_log_for_execution(project_log, execution, shutdown)
 }
 
 async fn observed_construction_failure(
@@ -3822,19 +3419,8 @@ async fn observed_construction_failure(
     error: ProductionCommandError,
     shutdown: ShutdownFailures,
 ) -> ProductionCommandRunReport {
-    let outcome = match &error {
-        ProductionCommandError::OutcomeUnknown(_)
-        | ProductionCommandError::RunPlanOutcomeUnknown(_) => ProjectLogRunOutcome::OutcomeUnknown,
-        ProductionCommandError::RecoveryRequired(_) => ProjectLogRunOutcome::RecoveryRequired,
-        _ => ProjectLogRunOutcome::Failed,
-    };
-    let mut diagnostics = error
-        .failure_report()
-        .public_diagnostics()
-        .cloned()
-        .collect::<Vec<_>>();
-    diagnostics.extend(shutdown.public_diagnostics().cloned());
-    let pending_project_log = PendingProjectLog::new(project_log, outcome, diagnostics);
+    let report = report_with_shutdown(error.failure_report().report().clone(), &shutdown);
+    let pending_project_log = project_log.pending_failure(report);
     ProductionCommandRunReport::construction_failed_with_shutdown_and_project_log(
         error,
         shutdown,
@@ -3854,6 +3440,28 @@ fn business_completed<T>(
     )
 }
 
+fn finish_progress_business_state<P, T>(
+    observer: &ProductionProgressObserver<P>,
+    execution: &DrivenCommand<Result<OperationCompletion<T>, ProductionCommandError>>,
+) where
+    P: Copy + Eq,
+{
+    if matches!(
+        execution,
+        DrivenCommand::Finished(Ok(OperationCompletion::Cancelled))
+            | DrivenCommand::Interrupted(Ok(OperationCompletion::Cancelled))
+            | DrivenCommand::SignalFailed {
+                result: Ok(OperationCompletion::Cancelled),
+                ..
+            }
+    ) || matches!(
+        execution,
+        DrivenCommand::Interrupted(Err(error)) if error.was_cancelled_wait()
+    ) {
+        observer.stop_active(PhaseStopOutcome::Cancelled);
+    }
+}
+
 fn completed_output<T>(
     execution: &DrivenCommand<Result<OperationCompletion<T>, ProductionCommandError>>,
 ) -> Option<&T> {
@@ -3865,6 +3473,251 @@ fn completed_output<T>(
         | DrivenCommand::Finished(Err(_))
         | DrivenCommand::Interrupted(Err(_))
         | DrivenCommand::SignalFailed { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod progress_lifecycle_tests {
+    use super::*;
+    use crate::application::arguments::{InitArguments, ProjectArguments};
+
+    fn active_project_log(projects_root: &Path) -> ActiveProjectLog {
+        let command = ConfiguredInitCommand::for_test(
+            InitArguments {
+                project: ProjectArguments {
+                    name: "phase-contract".parse().expect("测试项目名应有效"),
+                },
+                path: None,
+                source_language: None,
+                target_language: None,
+                dialogue_max_fullwidth_chars: None,
+                scrolling_text_max_fullwidth_chars: None,
+                help_description_max_fullwidth_chars: None,
+            },
+            projects_root,
+            "mv",
+        );
+        start_command_log(CommandLogStart {
+            common: command.common(),
+            locale: UiLocale::SimplifiedChinese,
+            engine: ProjectLogEngine::RpgMakerMv,
+            project: "phase-contract",
+            command: ProjectLogCommand::Init,
+            performance: Arc::new(RunPerformanceCounters::default()),
+        })
+    }
+
+    fn observer() -> (
+        TerminalProgress<InitProgressPhase>,
+        ProductionProgressObserver<InitProgressPhase>,
+    ) {
+        let terminal = TerminalProgress::stderr(ProgressMode::Off, |_| String::new());
+        let observer =
+            ProductionProgressObserver::without_project_log(terminal.observer(), init_phase_code);
+        (terminal, observer)
+    }
+
+    fn cancelled_wait_error() -> ProductionCommandError {
+        let report = DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::runtime(RuntimeIssue::Cancelled {
+                component: RuntimeComponent::Process,
+                operation: RuntimeOperation::ExecuteTask,
+            }),
+        );
+        ProductionCommandError::Internal(Box::new(ReportedFailure::new(
+            report,
+            io::Error::other("测试取消等待"),
+        )))
+    }
+
+    #[test]
+    fn zero_total_phase_is_completed_for_the_project_log_lifecycle() {
+        let (terminal, observer) = observer();
+
+        observer.observe(ProgressSnapshot::determinate(
+            InitProgressPhase::ScanningSource,
+            0,
+            0,
+        ));
+
+        let state = observer
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            state.phases[0].finished,
+            "ProjectLog 生命周期必须把 0/0 作为已完成，而终端仍自行省略 0/0"
+        );
+        assert_eq!(state.phases.len(), 1);
+        assert_eq!(state.phases[0].phase, InitProgressPhase::ScanningSource);
+        drop(state);
+        terminal.finish().expect("关闭静默进度不应失败");
+    }
+
+    #[test]
+    fn interrupted_cancelled_wait_stops_the_active_phase() {
+        let (terminal, observer) = observer();
+        observer.observe(ProgressSnapshot::indeterminate(
+            InitProgressPhase::ScanningSource,
+        ));
+
+        let execution: DrivenCommand<Result<OperationCompletion<()>, ProductionCommandError>> =
+            DrivenCommand::Interrupted(Err(cancelled_wait_error()));
+        finish_progress_business_state(&observer, &execution);
+
+        let state = observer
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            state.phases.iter().all(|phase| phase.finished),
+            "取消等待必须停止已开始阶段，避免 ProjectLog 收尾时报告 active_phase"
+        );
+        drop(state);
+        terminal.finish().expect("关闭静默进度不应失败");
+    }
+
+    #[test]
+    fn nested_extract_progress_does_not_restart_the_owner_phase() {
+        let terminal = TerminalProgress::stderr(ProgressMode::Off, |_| String::new());
+        let observer = ProductionProgressObserver::without_project_log(
+            terminal.observer(),
+            extract_phase_code,
+        );
+
+        observer.observe(ProgressSnapshot::determinate(
+            ExtractProgressPhase::Builtin,
+            0,
+            1,
+        ));
+        observer.observe(ProgressSnapshot::indeterminate(
+            ExtractProgressPhase::BuiltinDocuments,
+        ));
+        observer.observe(ProgressSnapshot::determinate(
+            ExtractProgressPhase::BuiltinDocuments,
+            0,
+            0,
+        ));
+        observer.observe(ProgressSnapshot::determinate(
+            ExtractProgressPhase::Builtin,
+            1,
+            1,
+        ));
+
+        let state = observer
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            state.phases.len(),
+            2,
+            "同一 owner 回到完成快照时不得建立第二个日志阶段"
+        );
+        assert!(state.phases.iter().all(|phase| phase.finished));
+        assert_eq!(state.phases[0].phase, ExtractProgressPhase::Builtin);
+        assert_eq!(
+            state.phases[1].phase,
+            ExtractProgressPhase::BuiltinDocuments
+        );
+        drop(state);
+        terminal.finish().expect("关闭静默进度不应失败");
+    }
+
+    #[test]
+    fn successful_business_finish_leaves_active_phase_for_log_contract_validation() {
+        let temporary = tempfile::tempdir().expect("临时目录应可建立");
+        let project_log = active_project_log(temporary.path());
+        let terminal = TerminalProgress::stderr(ProgressMode::Off, |_| String::new());
+        let observer =
+            ProductionProgressObserver::new(terminal.observer(), &project_log, init_phase_code);
+        observer.observe(ProgressSnapshot::indeterminate(
+            InitProgressPhase::CheckingProject,
+        ));
+
+        let execution: DrivenCommand<Result<OperationCompletion<()>, ProductionCommandError>> =
+            DrivenCommand::Finished(Ok(OperationCompletion::Completed(())));
+        finish_progress_business_state(&observer, &execution);
+
+        let state = observer
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(state.phases.len(), 1);
+        assert!(!state.phases[0].finished, "普通成功收尾不得合成阶段完成");
+        drop(state);
+
+        let warning = project_log
+            .pending_succeeded()
+            .finish()
+            .expect("未完成阶段必须被项目日志合同捕获");
+        assert!(
+            warning.project_log.iter().any(|report| {
+                let wire = serde_json::to_value(report).expect("合同诊断应可序列化");
+                wire["primary"]["issue"]["details"]["problem"]["violation"]["kind"]
+                    == "active_phase"
+            }),
+            "应保留 active_phase 项目日志合同诊断"
+        );
+        terminal.finish().expect("关闭静默进度不应失败");
+    }
+
+    #[test]
+    fn planning_completed_only_finishes_the_planning_phase() {
+        let temporary = tempfile::tempdir().expect("临时目录应可建立");
+        let project_log = active_project_log(temporary.path());
+        let terminal = TerminalProgress::stderr(ProgressMode::Off, |_| String::new());
+        let observer = ProductionProgressObserver::new(
+            terminal.observer(),
+            &project_log,
+            translate_phase_code,
+        );
+        observer.observe(ProgressSnapshot::indeterminate(
+            TranslateProgressPhase::Planning,
+        ));
+        observer.observe(ProgressSnapshot::indeterminate(
+            TranslateProgressPhase::ConfirmedTasks,
+        ));
+        let business_log = ProductionBusinessLog::for_translation(&project_log, observer.clone());
+
+        RpgMakerTranslationLog::emit(
+            &business_log,
+            RpgMakerTranslationLogEvent::PlanningCompleted {
+                total_tasks: 0,
+                unresolved_units: 0,
+            },
+        );
+
+        let state = observer
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            state
+                .phases
+                .iter()
+                .find(|phase| phase.phase == TranslateProgressPhase::Planning)
+                .expect("Planning 阶段应已开始")
+                .finished
+        );
+        assert!(
+            !state
+                .phases
+                .iter()
+                .find(|phase| phase.phase == TranslateProgressPhase::ConfirmedTasks)
+                .expect("ConfirmedTasks 阶段应已开始")
+                .finished,
+            "PlanningCompleted 不得完成其他阶段"
+        );
+        drop(state);
+
+        observer.stop_active(PhaseStopOutcome::Cancelled);
+        drop(business_log);
+        assert!(
+            project_log.pending_cancelled().finish().is_none(),
+            "显式完成 Planning 并停止其余阶段后应通过日志合同"
+        );
+        terminal.finish().expect("关闭静默进度不应失败");
     }
 }
 
@@ -3892,57 +3745,68 @@ async fn finalize_run_plan<T>(
     } = input;
     let transaction_executor = RusqliteFinalTransactionExecutor::new_with_performance(
         sqlite_configuration,
-        Arc::clone(&project_log.performance),
+        Arc::clone(project_log.performance()),
     );
     let finalizer = FinalProjectRunPlanPersistenceService::new(transaction_executor.clone());
     let finalization = drive_command(
-        finalizer.replace_final(database_path, replacement),
+        finalizer.replace_final(database_path.clone(), replacement),
         termination_signals,
         || transaction_executor.cancel_waits(),
         on_cancellation,
     )
     .await;
-    merge_run_plan_finalization(execution, finalization, project_log)
+    merge_run_plan_finalization(execution, finalization, &database_path, project_log)
 }
 
 fn merge_run_plan_finalization<T>(
     execution: DrivenCommand<Result<OperationCompletion<T>, ProductionCommandError>>,
     finalization: DrivenCommand<Result<(), ProjectRunPlanReplaceError<SqliteRuntimeError>>>,
+    database_path: &Path,
     project_log: &ActiveProjectLog,
 ) -> DrivenCommand<Result<OperationCompletion<T>, ProductionCommandError>> {
     match finalization {
-        DrivenCommand::Finished(result) => match observe_run_plan_result(result, project_log) {
-            Ok(()) => finish_successful_execution(execution),
-            Err(error) => replace_success_with_plan_error(execution, Err(error)),
-        },
+        DrivenCommand::Finished(result) => {
+            match observe_run_plan_result(result, database_path, project_log) {
+                Ok(()) => finish_successful_execution(execution),
+                Err(error) => replace_success_with_plan_error(execution, Err(error)),
+            }
+        }
         DrivenCommand::Interrupted(result) => match result {
             // 保存期间到达信号但保存已成功：业务结果与运行方案都已生效。
             // 最终命令状态只表达已经完整完成的结果，不保留过时的中断形态。
             Ok(()) => {
-                emit_run_plan_saved(project_log);
+                emit_run_plan_saved(project_log, database_path);
                 finish_successful_execution(execution)
             }
             // 信号取消了方案保存本身：业务结果已完整生效并按成功呈现，
             // 方案未保存进入项目日志，由下次运行重新提供输入。
             Err(error) if run_plan_wait_was_cancelled(&error) => {
-                emit_run_plan_error_fact(&error, project_log);
+                emit_run_plan_error_fact(&error, database_path, true, project_log);
                 finish_successful_execution(execution)
             }
-            Err(error) => {
-                DrivenCommand::Interrupted(Err(observe_run_plan_error(error, project_log)))
-            }
+            Err(error) => DrivenCommand::Interrupted(Err(observe_run_plan_error(
+                error,
+                database_path,
+                false,
+                project_log,
+            ))),
         },
         DrivenCommand::SignalFailed { source, result } => {
             let result = match result {
                 Ok(()) => {
-                    emit_run_plan_saved(project_log);
+                    emit_run_plan_saved(project_log, database_path);
                     take_successful_execution_result(execution)
                 }
                 Err(error) if run_plan_wait_was_cancelled(&error) => {
-                    emit_run_plan_error_fact(&error, project_log);
+                    emit_run_plan_error_fact(&error, database_path, true, project_log);
                     take_successful_execution_result(execution)
                 }
-                Err(error) => Err(observe_run_plan_error(error, project_log)),
+                Err(error) => Err(observe_run_plan_error(
+                    error,
+                    database_path,
+                    false,
+                    project_log,
+                )),
             };
             DrivenCommand::SignalFailed { source, result }
         }
@@ -3951,45 +3815,93 @@ fn merge_run_plan_finalization<T>(
 
 fn observe_run_plan_result(
     result: Result<(), ProjectRunPlanReplaceError<SqliteRuntimeError>>,
+    database_path: &Path,
     project_log: &ActiveProjectLog,
 ) -> Result<(), ProductionCommandError> {
     match result {
         Ok(()) => {
-            emit_run_plan_saved(project_log);
+            emit_run_plan_saved(project_log, database_path);
             Ok(())
         }
-        Err(error) => Err(observe_run_plan_error(error, project_log)),
+        Err(error) => Err(observe_run_plan_error(
+            error,
+            database_path,
+            false,
+            project_log,
+        )),
     }
 }
 
-fn emit_run_plan_saved(project_log: &ActiveProjectLog) {
-    project_log.logger.emit(ProjectLogEvent::new(
-        ProjectLogLevel::Info,
-        ProjectLogCode::RunPlanSaved,
-        project_log.context.clone(),
-        ProjectLogPayload::None,
-    ));
+fn emit_run_plan_saved(project_log: &ActiveProjectLog, database_path: &Path) {
+    project_log
+        .handle()
+        .emit(ProjectLogEvent::RunPlanFinalized {
+            database: SafePath::new(database_path),
+            result: RunPlanFinalization::Saved {
+                transaction: RunPlanTransactionState::Committed,
+                run_continues: true,
+            },
+        });
 }
 
 fn observe_run_plan_error(
     error: ProjectRunPlanReplaceError<SqliteRuntimeError>,
+    database_path: &Path,
+    run_continues: bool,
     project_log: &ActiveProjectLog,
 ) -> ProductionCommandError {
-    emit_run_plan_error_fact(&error, project_log);
+    emit_run_plan_error_fact(&error, database_path, run_continues, project_log);
     map_run_plan_replace_error(error)
 }
 
-fn emit_run_plan_error_fact<E>(
-    error: &ProjectRunPlanReplaceError<E>,
+fn emit_run_plan_error_fact(
+    error: &ProjectRunPlanReplaceError<SqliteRuntimeError>,
+    database_path: &Path,
+    run_continues: bool,
     project_log: &ActiveProjectLog,
 ) {
-    let (level, code) = run_plan_replace_log_fact(error);
-    project_log.logger.emit(ProjectLogEvent::new(
-        level,
-        code,
-        project_log.context.clone(),
-        ProjectLogPayload::None,
-    ));
+    let report = error.diagnostic_report();
+    let Some(diagnostic) = project_log
+        .handle()
+        .record_diagnostic(DiagnosticScope::RunPlan, report)
+    else {
+        return;
+    };
+    let result = match error {
+        ProjectRunPlanReplaceError::DatabaseNotFound { .. } => RunPlanFinalization::NotSaved {
+            transaction: RunPlanTransactionState::NotStarted,
+            run_continues,
+            diagnostic,
+        },
+        ProjectRunPlanReplaceError::RequirementFailed { .. }
+        | ProjectRunPlanReplaceError::RequirementFinalizationFailed { .. }
+        | ProjectRunPlanReplaceError::RollbackConfirmed { .. } => RunPlanFinalization::NotSaved {
+            transaction: RunPlanTransactionState::RolledBack,
+            run_continues,
+            diagnostic,
+        },
+        ProjectRunPlanReplaceError::RequirementOutcomeUnknown { .. }
+        | ProjectRunPlanReplaceError::OutcomeUnknown { .. } => {
+            RunPlanFinalization::OutcomeUnknown {
+                transaction: RunPlanTransactionState::OutcomeUnknown,
+                run_continues,
+                diagnostic,
+            }
+        }
+        ProjectRunPlanReplaceError::CommittedButFinalizationFailed { .. } => {
+            RunPlanFinalization::SavedFinalizationFailed {
+                transaction: RunPlanTransactionState::Committed,
+                run_continues,
+                diagnostic,
+            }
+        }
+    };
+    project_log
+        .handle()
+        .emit(ProjectLogEvent::RunPlanFinalized {
+            database: SafePath::new(database_path),
+            result,
+        });
 }
 
 fn run_plan_wait_was_cancelled(error: &ProjectRunPlanReplaceError<SqliteRuntimeError>) -> bool {
@@ -4019,95 +3931,26 @@ fn take_successful_execution_result<T>(
     }
 }
 
-fn run_plan_replace_log_fact<E>(
-    error: &ProjectRunPlanReplaceError<E>,
-) -> (ProjectLogLevel, ProjectLogCode) {
-    match error {
-        ProjectRunPlanReplaceError::DatabaseNotFound { .. }
-        | ProjectRunPlanReplaceError::RequirementFailed { .. }
-        | ProjectRunPlanReplaceError::RollbackConfirmed { .. } => {
-            (ProjectLogLevel::Warn, ProjectLogCode::RunPlanSaveFailed)
-        }
-        ProjectRunPlanReplaceError::OutcomeUnknown { .. } => (
-            ProjectLogLevel::Error,
-            ProjectLogCode::RunPlanSaveOutcomeUnknown,
-        ),
-        ProjectRunPlanReplaceError::CommittedButFinalizationFailed { .. } => (
-            ProjectLogLevel::Error,
-            ProjectLogCode::RunPlanSavedFinalizationFailed,
-        ),
-    }
-}
-
 fn map_run_plan_replace_error(
     error: ProjectRunPlanReplaceError<SqliteRuntimeError>,
 ) -> ProductionCommandError {
-    let (diagnostic, terminal) = match &error {
-        ProjectRunPlanReplaceError::DatabaseNotFound { path } => (
-            SafeDiagnostic::new(
-                DiagnosticCode::RunPlanSaveFailed,
-                DiagnosticStage::RunPlanFinalization,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
-                DiagnosticImpact::ResultAppliedPlanNotSaved,
-                DiagnosticAction::Retry,
-            ),
-            0_u8,
-        ),
-        ProjectRunPlanReplaceError::RequirementFailed { path } => (
-            SafeDiagnostic::new(
-                DiagnosticCode::RunPlanSaveFailed,
-                DiagnosticStage::RunPlanFinalization,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure(DiagnosticFailureKind::RequirementFailed),
-                DiagnosticImpact::ResultAppliedPlanNotSaved,
-                DiagnosticAction::CheckProjectState,
-            ),
-            0,
-        ),
-        ProjectRunPlanReplaceError::RollbackConfirmed { path, source } => (
-            source
-                .safe_diagnostic(
-                    DiagnosticStage::RunPlanFinalization,
-                    DiagnosticImpact::ResultAppliedPlanNotSaved,
-                    DiagnosticAction::Retry,
-                )
-                .with_recovery(crate::diagnostic::RecoveryFact::path(path))
-                .with_recovery(crate::diagnostic::RecoveryFact::transaction(
-                    "rollback_confirmed",
-                )),
-            0,
-        ),
-        ProjectRunPlanReplaceError::OutcomeUnknown { path, source } => (
-            source
-                .safe_diagnostic(
-                    DiagnosticStage::RunPlanFinalization,
-                    DiagnosticImpact::OutcomeUnknown,
-                    DiagnosticAction::PreserveRecoveryArtifacts,
-                )
-                .with_recovery(crate::diagnostic::RecoveryFact::path(path))
-                .with_recovery(crate::diagnostic::RecoveryFact::transaction(
-                    "outcome_unknown",
-                )),
-            1,
-        ),
-        ProjectRunPlanReplaceError::CommittedButFinalizationFailed { path, source } => (
-            source
-                .safe_diagnostic(
-                    DiagnosticStage::RunPlanFinalization,
-                    DiagnosticImpact::StateAppliedFinalizationFailed,
-                    DiagnosticAction::Retry,
-                )
-                .with_recovery(crate::diagnostic::RecoveryFact::path(path))
-                .with_recovery(crate::diagnostic::RecoveryFact::transaction("committed")),
-            2,
-        ),
-    };
+    let diagnostic = error.diagnostic_report();
+    let effect = diagnostic.effect();
     let report = ProductionCommandError::report_diagnostic(error, diagnostic);
-    match terminal {
-        0 => ProductionCommandError::ResultAppliedButRunPlanNotSaved(Box::new(report)),
-        1 => ProductionCommandError::RunPlanOutcomeUnknown(Box::new(report)),
-        _ => ProductionCommandError::StateAppliedButFinalizationFailed(Box::new(report)),
+    match effect {
+        StateEffect::OutcomeUnknown => {
+            ProductionCommandError::RunPlanOutcomeUnknown(Box::new(report))
+        }
+        StateEffect::AppliedFinalizationFailed => {
+            ProductionCommandError::StateAppliedButFinalizationFailed(Box::new(report))
+        }
+        StateEffect::RecoveryRequired => ProductionCommandError::RecoveryRequired(Box::new(report)),
+        StateEffect::AppliedRunPlanNotSaved
+        | StateEffect::Unchanged
+        | StateEffect::ProgressPreserved
+        | StateEffect::Applied => {
+            ProductionCommandError::ResultAppliedButRunPlanNotSaved(Box::new(report))
+        }
     }
 }
 
@@ -4124,10 +3967,17 @@ fn replace_success_with_plan_error<T>(
 
 #[derive(Clone)]
 struct ProductionBusinessLog {
-    logger: ProjectLogger,
-    context: ProjectLogContext,
+    handle: ProjectLogHandle,
     translation_total: Arc<AtomicU64>,
+    translation_started: Arc<AtomicU64>,
     translation_confirmed: Arc<AtomicU64>,
+    translation_complete: Arc<AtomicU64>,
+    translation_partial: Arc<AtomicU64>,
+    translation_unavailable: Arc<AtomicU64>,
+    translation_failed: Arc<AtomicU64>,
+    translation_cancelled: Arc<AtomicU64>,
+    terminal_task_diagnostic: Arc<Mutex<Option<(DiagnosticOccurrenceId, &'static str)>>>,
+    pending_publication_failure: Arc<Mutex<Option<WriteBackLogPublicationOutcome>>>,
     translation_retry_attempts: Arc<AtomicU64>,
     translation_retry_recovered: Arc<AtomicU64>,
     translation_retry_exhausted: Arc<AtomicU64>,
@@ -4137,10 +3987,17 @@ struct ProductionBusinessLog {
 impl ProductionBusinessLog {
     fn from_active(project_log: &ActiveProjectLog) -> Self {
         Self {
-            logger: project_log.logger.clone(),
-            context: project_log.context.clone(),
+            handle: project_log.handle().clone(),
             translation_total: Arc::new(AtomicU64::new(0)),
+            translation_started: Arc::new(AtomicU64::new(0)),
             translation_confirmed: Arc::new(AtomicU64::new(0)),
+            translation_complete: Arc::new(AtomicU64::new(0)),
+            translation_partial: Arc::new(AtomicU64::new(0)),
+            translation_unavailable: Arc::new(AtomicU64::new(0)),
+            translation_failed: Arc::new(AtomicU64::new(0)),
+            translation_cancelled: Arc::new(AtomicU64::new(0)),
+            terminal_task_diagnostic: Arc::new(Mutex::new(None)),
+            pending_publication_failure: Arc::new(Mutex::new(None)),
             translation_retry_attempts: Arc::new(AtomicU64::new(0)),
             translation_retry_recovered: Arc::new(AtomicU64::new(0)),
             translation_retry_exhausted: Arc::new(AtomicU64::new(0)),
@@ -4163,45 +4020,231 @@ impl ProductionBusinessLog {
         if attempted == 0 {
             return;
         }
-        self.logger.emit(ProjectLogEvent::new(
-            ProjectLogLevel::Info,
-            ProjectLogCode::RetrySummary,
-            self.context.clone(),
-            ProjectLogPayload::RetrySummary {
-                attempted,
-                recovered: self.translation_retry_recovered.load(Ordering::Acquire),
-                exhausted: self.translation_retry_exhausted.load(Ordering::Acquire),
-            },
-        ));
+        self.handle.emit(ProjectLogEvent::RetrySummary {
+            attempted,
+            recovered: self.translation_retry_recovered.load(Ordering::Acquire),
+            exhausted: self.translation_retry_exhausted.load(Ordering::Acquire),
+        });
     }
-}
 
-#[derive(Clone)]
-pub(crate) struct ProjectLogLuaPrintSink {
-    logger: ProjectLogger,
-    context: ProjectLogContext,
-}
-
-impl ProjectLogLuaPrintSink {
-    pub(crate) fn from_active(project_log: &ActiveProjectLog) -> Self {
-        Self {
-            logger: project_log.logger.clone(),
-            context: project_log.context.clone(),
-        }
+    fn translation_counters(&self) -> Result<TranslationTaskCounters, DiagnosticReport> {
+        let planned = self.translation_total.load(Ordering::Acquire);
+        let started = self.translation_started.load(Ordering::Acquire);
+        let complete = self.translation_complete.load(Ordering::Acquire);
+        let partial = self.translation_partial.load(Ordering::Acquire);
+        let unavailable = self.translation_unavailable.load(Ordering::Acquire);
+        let failed = self.translation_failed.load(Ordering::Acquire);
+        let cancelled = self.translation_cancelled.load(Ordering::Acquire);
+        let not_started = planned.saturating_sub(started);
+        TranslationTaskCounters::new(
+            planned,
+            started,
+            complete,
+            partial,
+            unavailable,
+            failed,
+            cancelled,
+            not_started,
+        )
+        .map_err(|source| {
+            let violation = match source {
+                TaskCounterInvariantError::StartedBreakdown => {
+                    crate::diagnostic::TranslationTaskCounterInvariant::StartedBreakdown
+                }
+                TaskCounterInvariantError::PlannedBreakdown => {
+                    crate::diagnostic::TranslationTaskCounterInvariant::PlannedBreakdown
+                }
+                TaskCounterInvariantError::Overflow => {
+                    crate::diagnostic::TranslationTaskCounterInvariant::Overflow
+                }
+            };
+            DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::runtime(RuntimeIssue::TranslationTaskCountersInvalid {
+                    planned,
+                    started,
+                    complete,
+                    partial,
+                    unavailable,
+                    failed,
+                    cancelled,
+                    not_started,
+                    violation,
+                }),
+            )
+        })
     }
-}
 
-impl ProjectLuaPrintSink for ProjectLogLuaPrintSink {
-    fn print(&self, bytes: &[u8]) -> Result<(), ProjectLuaCallError> {
-        self.logger.emit(ProjectLogEvent::new(
-            ProjectLogLevel::Info,
-            ProjectLogCode::LuaPrint,
-            self.context.clone(),
-            ProjectLogPayload::LuaPrint {
-                message: String::from_utf8_lossy(bytes).into_owned(),
-            },
-        ));
-        Ok(())
+    fn translation_summary(output: &TranslateOutput) -> TranslationEngineSummary {
+        let summary = output.summary;
+        TranslationEngineSummary::RpgMaker(RpgMakerTranslationSummary {
+            accepted_decisions: usize_to_u64(summary.accepted_decisions, "已接受决策数"),
+            written_locations: usize_to_u64(summary.written_locations, "已写入位置数"),
+            remaining_decisions: usize_to_u64(summary.remaining_decisions, "剩余决策数"),
+            remaining_locations: usize_to_u64(summary.remaining_locations, "剩余位置数"),
+            protocol_diagnostics: usize_to_u64(summary.protocol_diagnostics, "协议诊断数"),
+            recoverable_request_exhaustions: usize_to_u64(
+                summary.recoverable_request_exhaustions,
+                "可恢复请求耗尽数",
+            ),
+            retained: usize_to_u64(summary.retained, "保留决策数"),
+            invalidated: usize_to_u64(summary.invalidated, "失效决策数"),
+            not_applicable: usize_to_u64(summary.not_applicable, "不适用决策数"),
+            reused: usize_to_u64(summary.reused, "复用决策数"),
+        })
+    }
+
+    /// 写出 Translate 命令唯一的业务终态；返回失败终态复用的 occurrence。
+    fn emit_translation_finished(
+        &self,
+        execution: &DrivenCommand<
+            Result<OperationCompletion<TranslateOutput>, ProductionCommandError>,
+        >,
+    ) -> Option<(StateEffect, DiagnosticOccurrenceId, &'static str)> {
+        let tasks = match self.translation_counters() {
+            Ok(tasks) => tasks,
+            Err(report) => {
+                // task.finished 诊断未能登记时，应用层计数可能比 logger 实际接受的
+                // 事件更靠前。终态改从 runtime 的状态机取数，仍写出唯一的 Failed，
+                // 而不是让 finish() 以缺少 translation.finished 再次掩盖首因。
+                let planned = self.translation_total.load(Ordering::Acquire);
+                let code = report.primary().code();
+                let diagnostic = self.handle.record_diagnostic(DiagnosticScope::Run, report);
+                let tasks = self.handle.translation_task_counters(planned);
+                if let (Some(diagnostic), Some(tasks)) = (diagnostic, tasks) {
+                    self.handle.emit(ProjectLogEvent::TranslationFinished {
+                        result: TranslationFinished::Failed {
+                            tasks,
+                            summary: None,
+                            diagnostic,
+                        },
+                    });
+                    return Some((StateEffect::Unchanged, diagnostic, code));
+                }
+                // logger 自身已经不可用时，emit 仍由 handle 尝试一次最小终态；它会把
+                // 无法表达的状态转换记录为独立 observability 诊断，绝不伪造成功。
+                self.handle.emit(ProjectLogEvent::TranslationFinished {
+                    result: TranslationFinished::NotStarted,
+                });
+                return None;
+            }
+        };
+        let completed = match execution {
+            DrivenCommand::Finished(Ok(OperationCompletion::Completed(output)))
+            | DrivenCommand::Interrupted(Ok(OperationCompletion::Completed(output)))
+            | DrivenCommand::SignalFailed {
+                result: Ok(OperationCompletion::Completed(output)),
+                ..
+            } => Some(output),
+            _ => None,
+        };
+        let result = if let Some(output) = completed {
+            let summary = Self::translation_summary(output);
+            if output.summary.total_tasks == 0 {
+                TranslationFinished::NoWork { tasks, summary }
+            } else if output.summary.partial_tasks == 0
+                && output.summary.unavailable_tasks == 0
+                && output.summary.remaining_decisions == 0
+                && output.summary.remaining_locations == 0
+            {
+                TranslationFinished::Complete { tasks, summary }
+            } else {
+                TranslationFinished::Incomplete { tasks, summary }
+            }
+        } else if matches!(
+            execution,
+            DrivenCommand::Finished(Ok(OperationCompletion::Cancelled))
+                | DrivenCommand::Interrupted(Ok(_))
+                | DrivenCommand::SignalFailed {
+                    result: Ok(OperationCompletion::Cancelled),
+                    ..
+                }
+        ) {
+            TranslationFinished::Cancelled {
+                tasks,
+                summary: None,
+            }
+        } else {
+            let error = match execution {
+                DrivenCommand::Finished(Err(error)) | DrivenCommand::Interrupted(Err(error)) => {
+                    Some(error)
+                }
+                DrivenCommand::SignalFailed {
+                    result: Err(error), ..
+                } => Some(error),
+                DrivenCommand::SignalFailed { result: Ok(_), .. }
+                | DrivenCommand::Finished(Ok(_))
+                | DrivenCommand::Interrupted(Ok(_)) => None,
+            };
+            let existing = *self
+                .terminal_task_diagnostic
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let diagnostic = existing.or_else(|| {
+                error.and_then(|error| {
+                    let report = error.failure_report().report().clone();
+                    let code = report.primary().code();
+                    self.handle
+                        .record_diagnostic(DiagnosticScope::RunPlan, report)
+                        .map(|diagnostic| (diagnostic, code))
+                })
+            });
+            let Some((diagnostic, code)) = diagnostic else {
+                self.handle.emit(ProjectLogEvent::TranslationFinished {
+                    result: TranslationFinished::NotStarted,
+                });
+                return None;
+            };
+            self.handle.emit(ProjectLogEvent::TranslationFinished {
+                result: TranslationFinished::Failed {
+                    tasks,
+                    summary: None,
+                    diagnostic,
+                },
+            });
+            let effect = error
+                .map(|error| error.failure_report().report().effect())
+                .unwrap_or(StateEffect::ProgressPreserved);
+            return Some((effect, diagnostic, code));
+        };
+        self.handle
+            .emit(ProjectLogEvent::TranslationFinished { result });
+        None
+    }
+
+    fn has_pending_publication_failure(&self) -> bool {
+        self.pending_publication_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
+    fn emit_publication_failure(&self, diagnostic: DiagnosticOccurrenceId) {
+        let outcome = self
+            .pending_publication_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let Some(outcome) = outcome else {
+            return;
+        };
+        let result = match outcome {
+            WriteBackLogPublicationOutcome::NotPublished => {
+                PublicationFinished::NotPublished { diagnostic }
+            }
+            WriteBackLogPublicationOutcome::PublishedWithResiduals
+            | WriteBackLogPublicationOutcome::RecoveryRequired => {
+                PublicationFinished::RecoveryRequired { diagnostic }
+            }
+            WriteBackLogPublicationOutcome::OutcomeUnknown => {
+                PublicationFinished::OutcomeUnknown { diagnostic }
+            }
+            WriteBackLogPublicationOutcome::Published { .. } => {
+                unreachable!("成功发布已经立即写出 publication.finished")
+            }
+        };
+        self.handle
+            .emit(ProjectLogEvent::PublicationFinished { result });
     }
 }
 
@@ -4211,7 +4254,10 @@ enum ProjectLuaExecutionError {
         path: PathBuf,
         source: rusqlite::Error,
     },
-    Run(ProjectLuaRunError),
+    Run {
+        path: PathBuf,
+        source: ProjectLuaRunError,
+    },
 }
 
 impl fmt::Display for ProjectLuaExecutionError {
@@ -4222,7 +4268,7 @@ impl fmt::Display for ProjectLuaExecutionError {
                 "无法打开 RPG Maker 项目数据库 {}：{source}",
                 path.display()
             ),
-            Self::Run(source) => source.fmt(formatter),
+            Self::Run { source, .. } => source.fmt(formatter),
         }
     }
 }
@@ -4231,7 +4277,7 @@ impl Error for ProjectLuaExecutionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Open { source, .. } => Some(source),
-            Self::Run(source) => Some(source),
+            Self::Run { source, .. } => Some(source),
         }
     }
 }
@@ -4245,18 +4291,9 @@ impl fmt::Display for ProjectLuaPreflightError {
     }
 }
 
-impl Error for ProjectLuaPreflightError {}
-
-fn project_lua_sqlite_reason(
-    source: &ProjectLuaSqliteError,
-    fallback: DiagnosticFailureKind,
-) -> DiagnosticReason {
-    match source.sqlite_codes() {
-        Some((primary_code, extended_code)) => DiagnosticReason::Sqlite {
-            primary_code,
-            extended_code,
-        },
-        None => DiagnosticReason::failure(fallback),
+impl Error for ProjectLuaPreflightError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.0)
     }
 }
 
@@ -4268,69 +4305,32 @@ fn project_lua_run_was_cancelled(error: &ProjectLuaRunError) -> bool {
     )
 }
 
-fn completed_project_lua_report(
-    execution: &DrivenCommand<
-        Result<
-            OperationCompletion<(RpgMakerCommandOutput, ProjectLuaRunReport)>,
-            ProductionCommandError,
-        >,
-    >,
-) -> Option<ProjectLuaRunReport> {
-    match execution {
-        DrivenCommand::Finished(Ok(OperationCompletion::Completed((_, report))))
-        | DrivenCommand::Interrupted(Ok(OperationCompletion::Completed((_, report))))
-        | DrivenCommand::SignalFailed {
-            result: Ok(OperationCompletion::Completed((_, report))),
-            ..
-        } => Some(*report),
-        DrivenCommand::Finished(Ok(OperationCompletion::Cancelled))
-        | DrivenCommand::Interrupted(Ok(OperationCompletion::Cancelled))
-        | DrivenCommand::Finished(Err(_))
-        | DrivenCommand::Interrupted(Err(_))
-        | DrivenCommand::SignalFailed { .. } => None,
-    }
-}
-
-fn emit_project_lua_summary(
-    logger: &ProjectLogger,
-    context: &ProjectLogContext,
-    report: ProjectLuaRunReport,
-) {
-    logger.emit_reliable(ProjectLogEvent::new(
-        ProjectLogLevel::Info,
-        ProjectLogCode::LuaSummary,
-        context.clone(),
-        ProjectLogPayload::LuaSummary {
-            database_calls: report.database_calls(),
-            changed_rows: report.changed_rows(),
-            translation_calls: report.translation_calls(),
-            printed_lines: report.printed_lines(),
-        },
-    ));
-}
-
 impl RpgMakerTranslationLog for ProductionBusinessLog {
     fn emit(&self, event: RpgMakerTranslationLogEvent) {
         match event {
-            RpgMakerTranslationLogEvent::PlanningUnresolved { units } => {
-                self.logger.emit_reliable(ProjectLogEvent::new(
-                    ProjectLogLevel::Warn,
-                    ProjectLogCode::PartialResult,
-                    self.context.clone(),
-                    ProjectLogPayload::ResultSummary {
-                        complete: 0,
-                        partial: 0,
-                        unavailable: u64::try_from(units).unwrap_or(u64::MAX),
-                        manual_review: 0,
-                    },
-                ));
+            RpgMakerTranslationLogEvent::PlanningCompleted { total_tasks, .. } => {
+                self.translation_total.store(
+                    u64::try_from(total_tasks).expect("当前目标平台的任务总数必须能用 u64 表达"),
+                    Ordering::Release,
+                );
+                if let Some(progress) = &self.translation_progress {
+                    progress.complete_phase(TranslateProgressPhase::Planning);
+                }
             }
             RpgMakerTranslationLogEvent::TaskStarted {
                 task_index,
                 total_tasks,
             } => {
-                let total = u64::try_from(total_tasks).unwrap_or(u64::MAX);
-                self.translation_total.store(total, Ordering::Relaxed);
+                let total =
+                    u64::try_from(total_tasks).expect("当前目标平台的任务总数必须能用 u64 表达");
+                let ordinal = u64::try_from(task_index.get())
+                    .expect("当前目标平台的任务序号必须能用 u64 表达")
+                    .checked_add(1)
+                    .expect("任务序号加一不得溢出");
+                let task = TaskPosition::new(ordinal, total)
+                    .expect("Planner 必须产生处于任务总数范围内的序号");
+                self.translation_total.store(total, Ordering::Release);
+                increment_counter(&self.translation_started, 1, "已开始翻译任务");
                 if let Some(progress) = &self.translation_progress {
                     progress.observe(ProgressSnapshot::determinate(
                         TranslateProgressPhase::ConfirmedTasks,
@@ -4338,119 +4338,122 @@ impl RpgMakerTranslationLog for ProductionBusinessLog {
                         total,
                     ));
                 }
-                let ordinal = u64::try_from(task_index.get())
-                    .unwrap_or(u64::MAX)
-                    .saturating_add(1);
-                self.logger.emit(ProjectLogEvent::new(
-                    ProjectLogLevel::Debug,
-                    ProjectLogCode::TaskStarted,
-                    self.context.clone(),
-                    ProjectLogPayload::Task {
-                        ordinal,
-                        total,
-                        outcome: None,
-                        attempts: None,
-                    },
-                ));
+                self.handle.emit(ProjectLogEvent::TaskStarted { task });
             }
             RpgMakerTranslationLogEvent::TaskFinished {
                 task_index,
                 outcome,
                 attempts,
                 retry_exhausted,
-                diagnostic,
             } => {
+                let total = self.translation_total.load(Ordering::Acquire);
                 let ordinal = u64::try_from(task_index.get())
-                    .unwrap_or(u64::MAX)
-                    .saturating_add(1);
-                let total = self.translation_total.load(Ordering::Relaxed);
-                let is_confirmed = matches!(
-                    outcome,
-                    RpgMakerTranslationLogTaskOutcome::Complete
-                        | RpgMakerTranslationLogTaskOutcome::Partial
-                        | RpgMakerTranslationLogTaskOutcome::Unavailable
-                );
-                let retries = attempts
+                    .expect("当前目标平台的任务序号必须能用 u64 表达")
+                    .checked_add(1)
+                    .expect("任务序号加一不得溢出");
+                let task =
+                    TaskPosition::new(ordinal, total).expect("已开始任务必须保留原始任务总数");
+                let attempts = attempts
                     .map(|value| {
-                        u64::try_from(value.get())
-                            .unwrap_or(u64::MAX)
-                            .saturating_sub(1)
+                        u64::try_from(value.get()).expect("当前目标平台的尝试次数必须能用 u64 表达")
                     })
                     .unwrap_or(0);
-                let attempt_count =
-                    attempts.map(|value| u64::try_from(value.get()).unwrap_or(u64::MAX));
+                let retries = attempts.saturating_sub(1);
                 if retries > 0 {
-                    self.translation_retry_attempts
-                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                            Some(current.saturating_add(retries))
-                        })
-                        .expect("重试计数更新闭包始终返回新值");
+                    increment_counter(&self.translation_retry_attempts, retries, "翻译重试次数");
                     if retry_exhausted {
-                        self.translation_retry_exhausted
-                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                                Some(current.saturating_add(1))
-                            })
-                            .expect("重试耗尽计数更新闭包始终返回新值");
+                        increment_counter(&self.translation_retry_exhausted, 1, "重试耗尽任务数");
                     } else {
-                        self.translation_retry_recovered
-                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                                Some(current.saturating_add(1))
-                            })
-                            .expect("重试恢复计数更新闭包始终返回新值");
+                        increment_counter(&self.translation_retry_recovered, 1, "重试恢复任务数");
                     }
                 }
-                let outcome = match outcome {
-                    RpgMakerTranslationLogTaskOutcome::Complete => {
-                        crate::runtime::project_log::ProjectLogTaskOutcome::Complete
+                let diagnostics = outcome
+                    .diagnostics()
+                    .cloned()
+                    .filter_map(|report| {
+                        let code = report.primary().code();
+                        self.handle
+                            .record_diagnostic(DiagnosticScope::TranslationTask, report)
+                            .map(|diagnostic| (diagnostic, code))
+                    })
+                    .collect::<Vec<_>>();
+                let diagnostic = diagnostics.first().copied();
+                let log_outcome = match &outcome {
+                    RpgMakerTranslationLogTaskOutcome::Complete { .. } => {
+                        increment_counter(&self.translation_complete, 1, "完整任务数");
+                        Some(TaskFinishedOutcome::Complete)
                     }
-                    RpgMakerTranslationLogTaskOutcome::Partial => {
-                        crate::runtime::project_log::ProjectLogTaskOutcome::Partial
+                    RpgMakerTranslationLogTaskOutcome::Partial { .. } => {
+                        increment_counter(&self.translation_partial, 1, "部分完成任务数");
+                        diagnostic
+                            .map(|(diagnostic, _)| TaskFinishedOutcome::Partial { diagnostic })
                     }
-                    RpgMakerTranslationLogTaskOutcome::Unavailable => {
-                        crate::runtime::project_log::ProjectLogTaskOutcome::Unavailable
+                    RpgMakerTranslationLogTaskOutcome::Unavailable { .. } => {
+                        increment_counter(&self.translation_unavailable, 1, "Unavailable 任务数");
+                        diagnostic
+                            .map(|(diagnostic, _)| TaskFinishedOutcome::Unavailable { diagnostic })
                     }
-                    RpgMakerTranslationLogTaskOutcome::ExecutionFailed
-                    | RpgMakerTranslationLogTaskOutcome::CommitFailed
-                    | RpgMakerTranslationLogTaskOutcome::NotCommitted
-                    | RpgMakerTranslationLogTaskOutcome::InvalidResult => {
-                        crate::runtime::project_log::ProjectLogTaskOutcome::Failed
+                    RpgMakerTranslationLogTaskOutcome::Cancelled => {
+                        increment_counter(&self.translation_cancelled, 1, "取消任务数");
+                        Some(TaskFinishedOutcome::Cancelled)
+                    }
+                    RpgMakerTranslationLogTaskOutcome::ExecutionFailed { .. }
+                    | RpgMakerTranslationLogTaskOutcome::CommitFailed { .. }
+                    | RpgMakerTranslationLogTaskOutcome::InvalidResult { .. } => {
+                        increment_counter(&self.translation_failed, 1, "失败任务数");
+                        diagnostic.map(|(diagnostic, _)| TaskFinishedOutcome::Failed { diagnostic })
+                    }
+                    RpgMakerTranslationLogTaskOutcome::NotCommittedAfterEarlierFailure {
+                        ..
+                    } => {
+                        increment_counter(&self.translation_failed, 1, "前序失败后未提交任务数");
+                        self.terminal_task_diagnostic
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .as_ref()
+                            .copied()
+                            .map(|(diagnostic, _)| {
+                                TaskFinishedOutcome::NotCommittedAfterEarlierFailure { diagnostic }
+                            })
                     }
                 };
-                let finished = ProjectLogEvent::new(
-                    ProjectLogLevel::Debug,
-                    ProjectLogCode::TaskFinished,
-                    self.context.clone(),
-                    ProjectLogPayload::Task {
-                        ordinal,
-                        total,
-                        outcome: Some(outcome),
-                        attempts: attempt_count,
-                    },
-                );
-                if outcome == crate::runtime::project_log::ProjectLogTaskOutcome::Complete {
-                    self.logger.emit(finished);
-                } else {
-                    self.logger.emit_reliable(finished);
+                if let Some(TaskFinishedOutcome::Failed {
+                    diagnostic: task_diagnostic,
+                }) = log_outcome
+                {
+                    let mut terminal = self
+                        .terminal_task_diagnostic
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let code = diagnostic
+                        .filter(|(occurrence, _)| *occurrence == task_diagnostic)
+                        .map(|(_, code)| code)
+                        .or_else(|| {
+                            terminal
+                                .as_ref()
+                                .filter(|(occurrence, _)| *occurrence == task_diagnostic)
+                                .map(|(_, code)| *code)
+                        })
+                        .expect("已写入项目日志的失败任务必须持有主诊断代码");
+                    if terminal.is_none() {
+                        *terminal = Some((task_diagnostic, code));
+                    }
                 }
-                if let Some(diagnostic) = diagnostic {
-                    debug_assert!(attempt_count.is_some());
-                    self.logger.emit_reliable(ProjectLogEvent::new(
-                        ProjectLogLevel::Warn,
-                        ProjectLogCode::TaskDiagnostic,
-                        self.context.clone(),
-                        ProjectLogPayload::TaskDiagnostic {
-                            ordinal,
-                            total,
-                            attempts: attempt_count.unwrap_or(0),
-                            diagnostic,
-                        },
-                    ));
+                if let Some(log_outcome) = log_outcome {
+                    self.handle.emit(ProjectLogEvent::TaskFinished {
+                        task,
+                        attempts,
+                        outcome: log_outcome,
+                    });
                 }
-                if is_confirmed {
-                    let confirmed = self
-                        .translation_confirmed
-                        .fetch_add(1, Ordering::AcqRel)
-                        .saturating_add(1);
+                if matches!(
+                    &outcome,
+                    RpgMakerTranslationLogTaskOutcome::Complete { .. }
+                        | RpgMakerTranslationLogTaskOutcome::Partial { .. }
+                        | RpgMakerTranslationLogTaskOutcome::Unavailable { .. }
+                ) {
+                    let confirmed =
+                        increment_counter(&self.translation_confirmed, 1, "已确认翻译任务");
                     if let Some(progress) = &self.translation_progress {
                         progress.observe(ProgressSnapshot::determinate(
                             TranslateProgressPhase::ConfirmedTasks,
@@ -4464,57 +4467,70 @@ impl RpgMakerTranslationLog for ProductionBusinessLog {
     }
 }
 
+fn increment_counter(counter: &AtomicU64, amount: u64, name: &'static str) -> u64 {
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(amount)
+        })
+        .unwrap_or_else(|_| panic!("{name}不得溢出"))
+        .checked_add(amount)
+        .expect("fetch_update 已验证加法")
+}
+
 impl WriteBackLog for ProductionBusinessLog {
     fn emit(&self, event: WriteBackLogEvent) {
         match event {
-            WriteBackLogEvent::PublicationStarted { output_root: _ } => {
-                self.logger.emit(ProjectLogEvent::new(
-                    ProjectLogLevel::Info,
-                    ProjectLogCode::PublicationStarted,
-                    self.context.clone(),
-                    ProjectLogPayload::Publication {
-                        outcome:
-                            crate::runtime::project_log::ProjectLogPublicationOutcome::NotPublished,
-                        published_items: None,
-                    },
-                ));
+            WriteBackLogEvent::PublicationStarted { output_root } => {
+                self.handle
+                    .emit(ProjectLogEvent::publication_started(output_root));
             }
             WriteBackLogEvent::PublicationFinished {
-                output_root: _,
-                outcome,
+                outcome: WriteBackLogPublicationOutcome::Published { summary },
+                ..
             } => {
-                use crate::runtime::project_log::ProjectLogPublicationOutcome as LogOutcome;
-                let (level, log_outcome, manual_review) = match outcome {
-                    WriteBackLogPublicationOutcome::Published { summary, .. } => (
-                        ProjectLogLevel::Info,
-                        LogOutcome::Published,
-                        u64::try_from(summary.manual_layout_units).unwrap_or(u64::MAX),
-                    ),
-                    WriteBackLogPublicationOutcome::NotPublished => {
-                        (ProjectLogLevel::Warn, LogOutcome::NotPublished, 0)
-                    }
-                    WriteBackLogPublicationOutcome::PublishedWithResiduals => {
-                        (ProjectLogLevel::Warn, LogOutcome::RecoveryRequired, 0)
-                    }
-                    WriteBackLogPublicationOutcome::RecoveryRequired => {
-                        (ProjectLogLevel::Error, LogOutcome::RecoveryRequired, 0)
-                    }
-                    WriteBackLogPublicationOutcome::OutcomeUnknown => {
-                        (ProjectLogLevel::Error, LogOutcome::OutcomeUnknown, 0)
-                    }
-                };
-                self.logger.emit(ProjectLogEvent::new(
-                    level,
-                    ProjectLogCode::PublicationFinished,
-                    self.context.clone(),
-                    ProjectLogPayload::Publication {
-                        outcome: log_outcome,
-                        published_items: (manual_review > 0).then_some(manual_review),
+                self.handle.emit(ProjectLogEvent::PublicationFinished {
+                    result: PublicationFinished::Published {
+                        summary: PublicationSummary::RpgMaker(RpgMakerPublicationSummary {
+                            translated_units: usize_to_u64(
+                                summary.translated_units,
+                                "已翻译写回单元数",
+                            ),
+                            original_units: usize_to_u64(
+                                summary.original_units,
+                                "保留原文写回单元数",
+                            ),
+                            auto_wrapped_units: usize_to_u64(
+                                summary.auto_wrapped_units,
+                                "自动换行单元数",
+                            ),
+                            inserted_line_breaks: usize_to_u64(
+                                summary.inserted_line_breaks,
+                                "新增换行数",
+                            ),
+                            inserted_fullwidth_indents: usize_to_u64(
+                                summary.inserted_fullwidth_indents,
+                                "新增全角缩进数",
+                            ),
+                            manual_layout_units: usize_to_u64(
+                                summary.manual_layout_units,
+                                "人工布局单元数",
+                            ),
+                        }),
                     },
-                ));
+                });
+            }
+            WriteBackLogEvent::PublicationFinished { outcome, .. } => {
+                *self
+                    .pending_publication_failure
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(outcome);
             }
         }
     }
+}
+
+fn usize_to_u64(value: usize, name: &'static str) -> u64 {
+    u64::try_from(value).unwrap_or_else(|_| panic!("{name}必须能用 u64 表达"))
 }
 
 type ProductionTranslationProfile = Arc<RpgMakerTranslationProfile<OpenAiChatCompletionClient>>;
@@ -4548,17 +4564,6 @@ enum PromptResourceComponent {
     Thinking,
     Rules,
     Example,
-}
-
-impl PromptResourceComponent {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::System => SYSTEM_PROMPT_FILE_NAME,
-            Self::Thinking => THINKING_PROMPT_FILE_NAME,
-            Self::Rules => "rules",
-            Self::Example => "example",
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -5081,7 +5086,7 @@ fn ensure_translation_execution_build_running(
 
 struct ProductionTranslationExecutionBuildError {
     class: TranslationExecutionBuildFailureClass,
-    diagnostic: Box<SafeDiagnostic>,
+    diagnostic: Box<DiagnosticReport>,
     source: BoxedError,
 }
 
@@ -5093,13 +5098,12 @@ enum TranslationExecutionBuildFailureClass {
 
 impl ProductionTranslationExecutionBuildError {
     fn cancelled() -> Self {
-        let diagnostic = SafeDiagnostic::new(
-            DiagnosticCode::InternalOperation,
-            DiagnosticStage::CommandPreparation,
-            DiagnosticSubject::operation("build_translation_execution"),
-            DiagnosticReason::failure(DiagnosticFailureKind::LockCancelled),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::Retry,
+        let diagnostic = DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::runtime(RuntimeIssue::Cancelled {
+                component: RuntimeComponent::CpuExecutor,
+                operation: RuntimeOperation::ExecuteTask,
+            }),
         );
         Self::new(TranslationExecutionBuildCancelled, diagnostic)
     }
@@ -5116,13 +5120,15 @@ impl ProductionTranslationExecutionBuildError {
         operation: &'static str,
         source: CpuTaskExecutionError<CpuExecutorUnavailable>,
     ) -> Self {
-        let diagnostic = source
-            .safe_diagnostic_source(
-                DiagnosticStage::CommandPreparation,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::ReportBug,
-            )
-            .with_recovery(RecoveryFact::component(operation));
+        let operation = match operation {
+            "prepare_rpg_maker_prompt" => RuntimeOperation::PrepareRpgMakerPrompt,
+            "compile_rpg_maker_builtin_placeholders" => {
+                RuntimeOperation::CompileRpgMakerBuiltinPlaceholders
+            }
+            _ => RuntimeOperation::ExecuteTask,
+        };
+        let diagnostic =
+            DiagnosticReport::new(StateEffect::Unchanged, source.diagnostic_for(operation));
         Self::new(source, diagnostic)
     }
 
@@ -5131,7 +5137,8 @@ impl ProductionTranslationExecutionBuildError {
         path: &Path,
         source: PromptResourceLoadError,
     ) -> Self {
-        let diagnostic = with_prompt_context(source.safe_diagnostic(), component, path);
+        let _ = (component, path);
+        let diagnostic = source.diagnostic_report();
         Self::new(source, diagnostic)
     }
 
@@ -5140,8 +5147,8 @@ impl ProductionTranslationExecutionBuildError {
         path: &Path,
         source: PromptTemplateError,
     ) -> Self {
-        let diagnostic =
-            with_prompt_context(prompt_template_diagnostic(source, path), component, path);
+        let _ = component;
+        let diagnostic = DiagnosticReport::new(StateEffect::Unchanged, source.diagnostic(path));
         Self::new(source, diagnostic)
     }
 
@@ -5150,20 +5157,16 @@ impl ProductionTranslationExecutionBuildError {
         path: &Path,
         source: RpgMakerSystemPromptError,
     ) -> Self {
+        let _ = component;
         let diagnostic = match &source {
-            RpgMakerSystemPromptError::Blank => SafeDiagnostic::new(
-                DiagnosticCode::PromptUnavailable,
-                DiagnosticStage::CommandPreparation,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::MissingRequiredValue,
-                    "resource=system_prompt; content=blank_after_template_render",
-                ),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixConfiguration,
+            RpgMakerSystemPromptError::Blank => DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::translation(TranslationIssue::Prompt {
+                    path: SafePath::new(path),
+                    problem: PromptProblem::Empty,
+                }),
             ),
         };
-        let diagnostic = with_prompt_context(diagnostic, component, path);
         Self::new(source, diagnostic)
     }
 
@@ -5175,47 +5178,30 @@ impl ProductionTranslationExecutionBuildError {
             language_id,
             available_ids,
         } = &source;
-        let available_ids = available_ids
+        let available_languages = available_ids
             .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        let diagnostic = SafeDiagnostic::new(
-            DiagnosticCode::LanguageModuleUnavailable,
-            DiagnosticStage::CommandPreparation,
-            DiagnosticSubject::field("source_language"),
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::NotFound,
-                format!(
-                    "requested_id={language_id}; available_ids={}",
-                    if available_ids.is_empty() {
-                        "none"
-                    } else {
-                        &available_ids
-                    }
-                ),
-            ),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixConfiguration,
-        )
-        .with_recovery(RecoveryFact::component(format!(
-            "target_language={}",
-            language_pair.target()
-        )));
-        Self::new(source, diagnostic)
-    }
-
-    fn builtin_placeholder_compile(source: Pcre2PlaceholderConstructionError) -> Self {
-        let diagnostic = source.safe_diagnostic_source(
-            DiagnosticStage::CommandPreparation,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::ReportBug,
+            .map(SafeIdentifier::from_validated)
+            .collect();
+        let diagnostic = DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::translation(TranslationIssue::LanguageModuleUnavailable {
+                requested_language: SafeIdentifier::from_validated(language_id),
+                target_language: SafeIdentifier::from_validated(language_pair.target()),
+                available_languages,
+            }),
         );
         Self::new(source, diagnostic)
     }
 
-    fn new(source: impl Error + Send + Sync + 'static, diagnostic: SafeDiagnostic) -> Self {
-        let class = if diagnostic.action == DiagnosticAction::ReportBug {
+    fn builtin_placeholder_compile(source: Pcre2PlaceholderConstructionError) -> Self {
+        let diagnostic = source.diagnostic_report();
+        Self::new(source, diagnostic)
+    }
+
+    fn new(source: impl Error + Send + Sync + 'static, diagnostic: DiagnosticReport) -> Self {
+        let class = if diagnostic.primary().resolution()
+            == crate::diagnostic::DiagnosticResolution::ReportBug
+        {
             TranslationExecutionBuildFailureClass::Internal
         } else {
             TranslationExecutionBuildFailureClass::ConfigurationOrInput
@@ -5227,55 +5213,9 @@ impl ProductionTranslationExecutionBuildError {
         }
     }
 
-    const fn diagnostic(&self) -> &SafeDiagnostic {
+    const fn diagnostic(&self) -> &DiagnosticReport {
         &self.diagnostic
     }
-}
-
-fn with_prompt_context(
-    diagnostic: SafeDiagnostic,
-    component: PromptResourceComponent,
-    path: &Path,
-) -> SafeDiagnostic {
-    diagnostic
-        .with_recovery(RecoveryFact::path(path))
-        .with_recovery(RecoveryFact::component(format!(
-            "component={}",
-            component.as_str()
-        )))
-}
-
-fn prompt_template_diagnostic(source: PromptTemplateError, path: &Path) -> SafeDiagnostic {
-    let (failure, detail) = match source {
-        PromptTemplateError::InvalidSyntax => (
-            DiagnosticFailureKind::InvalidSyntax,
-            "template_error=invalid_syntax; allowed_variables=source_language,target_language",
-        ),
-        PromptTemplateError::UnknownVariable => (
-            DiagnosticFailureKind::InvalidValue,
-            "template_error=unknown_variable; allowed_variables=source_language,target_language",
-        ),
-        PromptTemplateError::MissingSourceLanguage => (
-            DiagnosticFailureKind::MissingRequiredValue,
-            "template_error=missing_variable; variable=source_language",
-        ),
-        PromptTemplateError::MissingTargetLanguage => (
-            DiagnosticFailureKind::MissingRequiredValue,
-            "template_error=missing_variable; variable=target_language",
-        ),
-        PromptTemplateError::VariablesNotAllowed => (
-            DiagnosticFailureKind::InvalidSyntax,
-            "template_error=variables_not_allowed",
-        ),
-    };
-    SafeDiagnostic::new(
-        DiagnosticCode::PromptUnavailable,
-        DiagnosticStage::CommandPreparation,
-        DiagnosticSubject::path(path),
-        DiagnosticReason::failure_with_detail(failure, detail),
-        DiagnosticImpact::Unchanged,
-        DiagnosticAction::FixConfiguration,
-    )
 }
 
 impl fmt::Debug for ProductionTranslationExecutionBuildError {
@@ -5294,7 +5234,7 @@ impl fmt::Display for ProductionTranslationExecutionBuildError {
         write!(
             formatter,
             "failed to build the translation execution context ({})",
-            self.diagnostic.code
+            self.diagnostic.primary().code()
         )
     }
 }
@@ -5349,8 +5289,7 @@ async fn drive_project_lease<P>(
     on_cancellation: impl FnOnce(),
 ) -> DrivenCommand<Result<ProjectCommandLease<P::LeaseState>, ProductionCommandError>>
 where
-    P: ProjectCommandLeaseProvider,
-    P::Error: SafeDiagnosticSource,
+    P: ProjectCommandLeaseProvider<Error = Box<SystemFileSystemError>>,
 {
     drive_command(
         provider.acquire(project),
@@ -5626,6 +5565,16 @@ fn map_completion<T, U>(
     }
 }
 
+#[derive(Clone, Copy)]
+enum InitFailureClass {
+    ConfigurationOrInput,
+    ProjectState,
+    StateAppliedFinalizationFailed,
+    RecoveryRequired,
+    OutcomeUnknown,
+    Internal,
+}
+
 fn map_init_error(
     error: InitServiceError<ProductionWorkspaceConvergenceError, Infallible>,
 ) -> ProductionCommandError {
@@ -5633,7 +5582,7 @@ fn map_init_error(
         error @ InitServiceError::ProjectLease(_) => ProductionCommandError::prevalidated_boundary(
             error,
             DiagnosticStage::Init,
-            "init_project_lease_already_held",
+            RuntimeBoundaryOperation::InitProjectLeaseAlreadyHeld,
         ),
         InitServiceError::Workspace(source) => {
             let (class, report) = init_workspace_failure_report(source);
@@ -5661,1170 +5610,73 @@ fn map_init_error(
 
 fn init_workspace_failure_report(
     source: ProductionWorkspaceConvergenceError,
-) -> (InitFailureClass, FailureReport) {
-    match source {
-        ProjectWorkspaceConvergenceError::PreserveObservability { failure, discard } => {
-            let diagnostic = init_preserve_observability_diagnostic(&failure);
-            let mut report = ProductionCommandError::report_diagnostic(failure, diagnostic);
-            let class = if let Some(discard) = discard {
-                report = report.with_related_report(init_discard_failure_report(discard));
-                InitFailureClass::RecoveryRequired
-            } else {
-                InitFailureClass::ProjectState
-            };
-            (class, report)
-        }
-        ProjectWorkspaceConvergenceError::CandidateFailure { failure, discard } => {
-            let diagnostic = init_candidate_diagnostic(&failure);
-            let mut report = ProductionCommandError::report_diagnostic(failure, diagnostic);
-            let class = if let Some(discard) = discard {
-                report = report.with_related_report(init_discard_failure_report(discard));
-                InitFailureClass::RecoveryRequired
-            } else {
-                InitFailureClass::ProjectState
-            };
-            (class, report)
-        }
-        ProjectWorkspaceConvergenceError::Recover(source) => init_recovery_failure_report(source),
-        ProjectWorkspaceConvergenceError::Prepare(source) => init_prepare_failure_report(source),
-        ProjectWorkspaceConvergenceError::Publish(source) => init_publish_failure_report(source),
-        ProjectWorkspaceConvergenceError::CancellationCleanup(source) => (
-            InitFailureClass::RecoveryRequired,
-            init_discard_failure_report(source),
-        ),
-        source => {
-            let (class, diagnostic) = init_workspace_diagnostic(&source);
-            (
-                class,
-                ProductionCommandError::report_diagnostic(source, diagnostic),
-            )
-        }
-    }
-}
-
-fn init_recovery_failure_report(
-    source: DirectoryRecoveryError<Box<SystemFileSystemError>>,
-) -> (InitFailureClass, FailureReport) {
-    let diagnostic = source.source_error().safe_diagnostic(
-        DiagnosticStage::Init,
-        DiagnosticImpact::Unchanged,
-        DiagnosticAction::CheckProjectState,
-    );
-    let report = ProductionCommandError::report_diagnostic(source, diagnostic);
-    let class = init_failure_class_from_report(&report, InitFailureClass::ProjectState);
-    (class, report)
-}
-
-fn init_prepare_failure_report(
-    source: DirectoryPrepareError<Box<SystemFileSystemError>>,
-) -> (InitFailureClass, FailureReport) {
-    let DirectoryPrepareError::NotPrepared {
-        target_root,
-        source,
-        cleanup_failure,
-    } = source;
-    let diagnostic = source
-        .safe_diagnostic(
-            DiagnosticStage::Init,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
-        )
-        .with_recovery(RecoveryFact::path(&target_root));
-    let primary = DirectoryPrepareError::NotPrepared {
-        target_root,
-        source,
-        cleanup_failure: None,
-    };
-    let mut report = ProductionCommandError::report_diagnostic(primary, diagnostic);
-    if let Some(cleanup) = cleanup_failure {
-        report = report.with_related_report(init_staging_cleanup_failure_report(
-            cleanup,
-            DiagnosticStage::Init,
-        ));
-    }
-    let class = init_failure_class_from_report(&report, InitFailureClass::ProjectState);
-    (class, report)
-}
-
-fn init_publish_failure_report(
-    source: DirectoryPublishError<Box<SystemFileSystemError>>,
-) -> (InitFailureClass, FailureReport) {
-    macro_rules! report_with_optional_cleanup {
-        ($variant:ident, $target_root:expr, $cleanup_failure:expr, $diagnostic:expr) => {{
-            let target_root = $target_root;
-            let cleanup_failure = $cleanup_failure;
-            let recovery_required = cleanup_failure.is_some();
-            let diagnostic = $diagnostic;
-            let primary: DirectoryPublishError<Box<SystemFileSystemError>> =
-                DirectoryPublishError::$variant {
-                    target_root,
-                    cleanup_failure: None,
-                };
-            let mut report = ProductionCommandError::report_diagnostic(primary, diagnostic);
-            if let Some(cleanup) = cleanup_failure {
-                report = report.with_related_report(init_staging_cleanup_failure_report(
-                    cleanup,
-                    DiagnosticStage::Publication,
-                ));
+) -> (InitFailureClass, ReportedFailure) {
+    let diagnostic = source.diagnostic_report();
+    let class = match diagnostic.effect() {
+        StateEffect::AppliedFinalizationFailed => InitFailureClass::StateAppliedFinalizationFailed,
+        StateEffect::RecoveryRequired => InitFailureClass::RecoveryRequired,
+        StateEffect::OutcomeUnknown => InitFailureClass::OutcomeUnknown,
+        StateEffect::Unchanged
+        | StateEffect::ProgressPreserved
+        | StateEffect::Applied
+        | StateEffect::AppliedRunPlanNotSaved => match &source {
+            ProjectWorkspaceConvergenceError::SourceGameRoot(_)
+            | ProjectWorkspaceConvergenceError::ObserveGameLayout(_)
+            | ProjectWorkspaceConvergenceError::InvalidGameLayout { .. }
+            | ProjectWorkspaceConvergenceError::EngineWorkspaceRoot(_)
+            | ProjectWorkspaceConvergenceError::MissingInitialSettings(_)
+            | ProjectWorkspaceConvergenceError::ObserveInputSource(_) => {
+                InitFailureClass::ConfigurationOrInput
             }
-            (
-                if recovery_required {
-                    InitFailureClass::RecoveryRequired
-                } else {
-                    InitFailureClass::ProjectState
-                },
-                report,
-            )
-        }};
-        ($variant:ident, $target_root:expr, $source:expr, $cleanup_failure:expr, $diagnostic:expr) => {{
-            let target_root = $target_root;
-            let source = $source;
-            let cleanup_failure = $cleanup_failure;
-            let recovery_required = cleanup_failure.is_some();
-            let diagnostic = $diagnostic;
-            let primary: DirectoryPublishError<Box<SystemFileSystemError>> =
-                DirectoryPublishError::$variant {
-                    target_root,
-                    source,
-                    cleanup_failure: None,
-                };
-            let mut report = ProductionCommandError::report_diagnostic(primary, diagnostic);
-            if let Some(cleanup) = cleanup_failure {
-                report = report.with_related_report(init_staging_cleanup_failure_report(
-                    cleanup,
-                    DiagnosticStage::Publication,
-                ));
-            }
-            (
-                if recovery_required {
-                    InitFailureClass::RecoveryRequired
-                } else {
-                    InitFailureClass::ProjectState
-                },
-                report,
-            )
-        }};
-    }
-
-    match source {
-        DirectoryPublishError::TargetAlreadyExists {
-            target_root,
-            cleanup_failure,
-        } => {
-            let diagnostic = SafeDiagnostic::new(
-                DiagnosticCode::ProjectState,
-                DiagnosticStage::Publication,
-                DiagnosticSubject::path(&target_root),
-                DiagnosticReason::failure(DiagnosticFailureKind::TargetAlreadyExists),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            );
-            report_with_optional_cleanup!(
-                TargetAlreadyExists,
-                target_root,
-                cleanup_failure,
-                diagnostic
-            )
-        }
-        DirectoryPublishError::TargetMissing {
-            target_root,
-            cleanup_failure,
-        } => {
-            let diagnostic = SafeDiagnostic::new(
-                DiagnosticCode::ProjectState,
-                DiagnosticStage::Publication,
-                DiagnosticSubject::path(&target_root),
-                DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            );
-            report_with_optional_cleanup!(TargetMissing, target_root, cleanup_failure, diagnostic)
-        }
-        DirectoryPublishError::TargetNotDirectory {
-            target_root,
-            cleanup_failure,
-        } => {
-            let diagnostic = SafeDiagnostic::new(
-                DiagnosticCode::ProjectState,
-                DiagnosticStage::Publication,
-                DiagnosticSubject::path(&target_root),
-                DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            );
-            report_with_optional_cleanup!(
-                TargetNotDirectory,
-                target_root,
-                cleanup_failure,
-                diagnostic
-            )
-        }
-        DirectoryPublishError::NotAttempted {
-            target_root,
-            source,
-            cleanup_failure,
-        } => {
-            let diagnostic = source
-                .safe_diagnostic(
-                    DiagnosticStage::Publication,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckProjectState,
-                )
-                .with_recovery(RecoveryFact::path(&target_root));
-            report_with_optional_cleanup!(
-                NotAttempted,
-                target_root,
-                source,
-                cleanup_failure,
-                diagnostic
-            )
-        }
-        DirectoryPublishError::NotPublished {
-            target_root,
-            source,
-            cleanup_failure,
-        } => {
-            let diagnostic = source
-                .safe_diagnostic(
-                    DiagnosticStage::Publication,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckProjectState,
-                )
-                .with_recovery(RecoveryFact::path(&target_root));
-            report_with_optional_cleanup!(
-                NotPublished,
-                target_root,
-                source,
-                cleanup_failure,
-                diagnostic
-            )
-        }
-        source => {
-            let (class, diagnostic) = init_publish_diagnostic(&source);
-            (
-                class,
-                ProductionCommandError::report_diagnostic(source, diagnostic),
-            )
-        }
-    }
-}
-
-fn init_staging_cleanup_failure_report(
-    cleanup: StagingCleanupFailure<Box<SystemFileSystemError>>,
-    stage: DiagnosticStage,
-) -> FailureReport {
-    let (residual_path, source) = cleanup.into_parts();
-    (*source)
-        .into_failure_report(
-            stage,
-            DiagnosticImpact::RecoveryRequired,
-            DiagnosticAction::PreserveRecoveryArtifacts,
-        )
-        .with_primary_recovery(RecoveryFact::path(residual_path))
-        .with_primary_recovery(RecoveryFact::component("candidate_cleanup=failed"))
-}
-
-fn init_discard_failure_report(
-    source: DirectoryDiscardError<Box<SystemFileSystemError>>,
-) -> FailureReport {
-    let (staging_root, source) = source.into_parts();
-    (*source)
-        .into_failure_report(
-            DiagnosticStage::Init,
-            DiagnosticImpact::RecoveryRequired,
-            DiagnosticAction::PreserveRecoveryArtifacts,
-        )
-        .with_primary_recovery(crate::diagnostic::RecoveryFact::path(&staging_root))
-        .with_primary_recovery(crate::diagnostic::RecoveryFact::component(
-            "candidate_cleanup=failed",
-        ))
-}
-
-#[derive(Clone, Copy)]
-enum InitFailureClass {
-    ConfigurationOrInput,
-    ProjectState,
-    StateAppliedFinalizationFailed,
-    RecoveryRequired,
-    OutcomeUnknown,
-    Internal,
-}
-
-fn init_failure_class_from_report(
-    report: &FailureReport,
-    fallback: InitFailureClass,
-) -> InitFailureClass {
-    let primary = report.primary.public();
-    let has_impact = |expected| {
-        primary.impact == expected
-            || report
-                .related
-                .iter()
-                .any(|failure| failure.public().impact == expected)
-    };
-    if has_impact(DiagnosticImpact::OutcomeUnknown) {
-        InitFailureClass::OutcomeUnknown
-    } else if has_impact(DiagnosticImpact::RecoveryRequired) {
-        InitFailureClass::RecoveryRequired
-    } else if has_impact(DiagnosticImpact::StateAppliedFinalizationFailed) {
-        InitFailureClass::StateAppliedFinalizationFailed
-    } else if primary.action == DiagnosticAction::ReportBug {
-        InitFailureClass::Internal
-    } else {
-        fallback
-    }
-}
-
-fn init_workspace_diagnostic(
-    source: &ProductionWorkspaceConvergenceError,
-) -> (InitFailureClass, SafeDiagnostic) {
-    use InitFailureClass as Class;
-
-    match source {
-        ProjectWorkspaceConvergenceError::SourceGameRoot(source) => (
-            Class::ConfigurationOrInput,
-            init_directory_diagnostic(
-                source,
-                DiagnosticCode::CommandInput,
-                DiagnosticAction::FixInput,
-            ),
-        ),
-        ProjectWorkspaceConvergenceError::ObserveGameLayout(source) => (
-            Class::ConfigurationOrInput,
-            init_directory_listing_diagnostic(
-                source,
-                DiagnosticCode::CommandInput,
-                DiagnosticAction::FixInput,
-            ),
-        ),
-        ProjectWorkspaceConvergenceError::InvalidGameLayout {
-            game_root,
-            engine,
-            data_relative,
-            js_relative,
-            core_script,
-        } => (
-            Class::ConfigurationOrInput,
-            SafeDiagnostic::new(
-                DiagnosticCode::CommandInput,
-                DiagnosticStage::Init,
-                DiagnosticSubject::path(game_root),
-                DiagnosticReason::failure(DiagnosticFailureKind::RequirementFailed),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixInput,
-            )
-            .with_recovery(crate::diagnostic::RecoveryFact::component(format!(
-                "engine={engine}; data={}; js={}; core={core_script}",
-                data_relative.display(),
-                js_relative.display(),
-            ))),
-        ),
-        ProjectWorkspaceConvergenceError::EngineWorkspaceRoot(source) => (
-            Class::ConfigurationOrInput,
-            source.safe_diagnostic(
-                DiagnosticStage::Init,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckPathAndPermissions,
-            ),
-        ),
-        ProjectWorkspaceConvergenceError::ObserveEngineWorkspaceRoot(source) => (
-            Class::ProjectState,
-            init_directory_diagnostic(
-                source,
-                DiagnosticCode::ProjectState,
-                DiagnosticAction::CheckProjectState,
-            ),
-        ),
-        ProjectWorkspaceConvergenceError::WorkspaceRoot(source) => (
-            Class::ProjectState,
-            init_directory_diagnostic(
-                source,
-                DiagnosticCode::ProjectState,
-                DiagnosticAction::CheckProjectState,
-            ),
-        ),
-        ProjectWorkspaceConvergenceError::InspectExistingDatabase(source) => (
-            Class::ProjectState,
-            init_database_inspection_diagnostic(source),
-        ),
-        ProjectWorkspaceConvergenceError::MissingInitialSettings(settings) => {
-            let mut diagnostic = SafeDiagnostic::new(
-                DiagnosticCode::CommandInput,
-                DiagnosticStage::Init,
-                DiagnosticSubject::component("initial project settings"),
-                DiagnosticReason::failure(DiagnosticFailureKind::MissingRequiredValue),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixInput,
-            );
-            for setting in settings {
-                diagnostic = diagnostic.with_recovery(crate::diagnostic::RecoveryFact::component(
-                    init_setting_flag(*setting),
-                ));
-            }
-            (Class::ConfigurationOrInput, diagnostic)
-        }
-        ProjectWorkspaceConvergenceError::ObserveWorkspaceStructure(source) => (
-            Class::ProjectState,
-            init_directory_listing_diagnostic(
-                source,
-                DiagnosticCode::ProjectState,
-                DiagnosticAction::CheckProjectState,
-            ),
-        ),
-        ProjectWorkspaceConvergenceError::ObserveExistingSource(source) => (
-            Class::ProjectState,
-            init_fingerprint_diagnostic(source, DiagnosticAction::CheckProjectState),
-        ),
-        ProjectWorkspaceConvergenceError::ObserveInputSource(source) => (
-            Class::ConfigurationOrInput,
-            init_fingerprint_diagnostic(source, DiagnosticAction::FixInput),
-        ),
-        ProjectWorkspaceConvergenceError::InvalidStageRequest(source) => {
-            (Class::Internal, init_stage_request_diagnostic(source))
-        }
-        ProjectWorkspaceConvergenceError::Recover(source) => {
-            let diagnostic = source.source_error().safe_diagnostic(
-                DiagnosticStage::Init,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            );
-            let class = match diagnostic.impact {
-                DiagnosticImpact::OutcomeUnknown => Class::OutcomeUnknown,
-                DiagnosticImpact::RecoveryRequired => Class::RecoveryRequired,
-                DiagnosticImpact::StateAppliedFinalizationFailed => {
-                    Class::StateAppliedFinalizationFailed
-                }
-                _ if diagnostic.action == DiagnosticAction::ReportBug => Class::Internal,
-                _ => Class::ProjectState,
-            };
-            (class, diagnostic)
-        }
-        ProjectWorkspaceConvergenceError::Prepare(source) => {
-            (Class::ProjectState, init_prepare_diagnostic(source))
-        }
-        ProjectWorkspaceConvergenceError::ObservePreservedDirectory(source) => (
-            Class::ProjectState,
-            init_directory_diagnostic(
-                source,
-                DiagnosticCode::ProjectState,
-                DiagnosticAction::CheckProjectState,
-            ),
-        ),
-        ProjectWorkspaceConvergenceError::PreserveObservability { failure, .. } => (
-            Class::ProjectState,
-            init_preserve_observability_diagnostic(failure),
-        ),
-        ProjectWorkspaceConvergenceError::CandidateFailure { failure, .. } => {
-            (Class::ProjectState, init_candidate_diagnostic(failure))
-        }
-        ProjectWorkspaceConvergenceError::CancellationCleanup(source) => {
-            (Class::ProjectState, init_discard_diagnostic(source))
-        }
-        ProjectWorkspaceConvergenceError::Publish(source) => init_publish_diagnostic(source),
-    }
-}
-
-const fn init_setting_flag(setting: MissingInitialProjectSetting) -> &'static str {
-    match setting {
-        MissingInitialProjectSetting::SourceLanguage => "--source-language",
-        MissingInitialProjectSetting::TargetLanguage => "--target-language",
-        MissingInitialProjectSetting::DialogueMaxFullwidthChars => "--dialogue-max-fullwidth-chars",
-        MissingInitialProjectSetting::ScrollingTextMaxFullwidthChars => {
-            "--scrolling-text-max-fullwidth-chars"
-        }
-        MissingInitialProjectSetting::HelpDescriptionMaxFullwidthChars => {
-            "--help-description-max-fullwidth-chars"
-        }
-    }
-}
-
-fn init_directory_diagnostic(
-    source: &ResolveDirectoryError<SystemFileSystemError>,
-    code: DiagnosticCode,
-    action: DiagnosticAction,
-) -> SafeDiagnostic {
-    match source {
-        ResolveDirectoryError::NotFound { path } => SafeDiagnostic::new(
-            code,
-            DiagnosticStage::Init,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
-            DiagnosticImpact::Unchanged,
-            action,
-        ),
-        ResolveDirectoryError::NotDirectory { path } => SafeDiagnostic::new(
-            code,
-            DiagnosticStage::Init,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
-            DiagnosticImpact::Unchanged,
-            action,
-        ),
-        ResolveDirectoryError::Io { path, source } => source
-            .safe_diagnostic(DiagnosticStage::Init, DiagnosticImpact::Unchanged, action)
-            .with_recovery(crate::diagnostic::RecoveryFact::path(path)),
-    }
-}
-
-fn init_directory_listing_diagnostic(
-    source: &ListDirectoryError<SystemFileSystemError>,
-    code: DiagnosticCode,
-    action: DiagnosticAction,
-) -> SafeDiagnostic {
-    match source {
-        ListDirectoryError::NotFound { path } => SafeDiagnostic::new(
-            code,
-            DiagnosticStage::Init,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
-            DiagnosticImpact::Unchanged,
-            action,
-        ),
-        ListDirectoryError::NotDirectory { path } => SafeDiagnostic::new(
-            code,
-            DiagnosticStage::Init,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
-            DiagnosticImpact::Unchanged,
-            action,
-        ),
-        ListDirectoryError::Io { path, source } => source
-            .safe_diagnostic(DiagnosticStage::Init, DiagnosticImpact::Unchanged, action)
-            .with_recovery(crate::diagnostic::RecoveryFact::path(path)),
-    }
-}
-
-fn init_fingerprint_diagnostic(
-    source: &DirectoryTreeFingerprintError<Box<SystemFileSystemError>>,
-    action: DiagnosticAction,
-) -> SafeDiagnostic {
-    match source {
-        DirectoryTreeFingerprintError::NotFound { path } => SafeDiagnostic::new(
-            DiagnosticCode::CommandInput,
-            DiagnosticStage::Init,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
-            DiagnosticImpact::Unchanged,
-            action,
-        ),
-        DirectoryTreeFingerprintError::NotDirectory { path } => SafeDiagnostic::new(
-            DiagnosticCode::CommandInput,
-            DiagnosticStage::Init,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
-            DiagnosticImpact::Unchanged,
-            action,
-        ),
-        DirectoryTreeFingerprintError::ChangedDuringObservation { path } => SafeDiagnostic::new(
-            DiagnosticCode::ProjectState,
-            DiagnosticStage::Init,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(DiagnosticFailureKind::FileIdentityChanged),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::Retry,
-        ),
-        DirectoryTreeFingerprintError::Failed { path, source } => source
-            .safe_diagnostic_source(DiagnosticStage::Init, DiagnosticImpact::Unchanged, action)
-            .with_recovery(crate::diagnostic::RecoveryFact::path(path)),
-    }
-}
-
-fn init_stage_request_diagnostic(source: &DirectoryStageRequestError) -> SafeDiagnostic {
-    let mut diagnostic = SafeDiagnostic::new(
-        DiagnosticCode::InternalOperation,
-        DiagnosticStage::Init,
-        DiagnosticSubject::operation("prepare_workspace_candidate"),
-        DiagnosticReason::failure(DiagnosticFailureKind::InternalInvariant),
-        DiagnosticImpact::Unchanged,
-        DiagnosticAction::ReportBug,
-    );
-    match source {
-        DirectoryStageRequestError::EmptyTargetRoot => {
-            diagnostic = diagnostic.with_recovery(crate::diagnostic::RecoveryFact::component(
-                "invalid_field=target_root",
-            ));
-        }
-        DirectoryStageRequestError::EmptySourceDirectory => {
-            diagnostic = diagnostic.with_recovery(crate::diagnostic::RecoveryFact::component(
-                "invalid_field=source_directory",
-            ));
-        }
-        DirectoryStageRequestError::EmptySourceMappings => {
-            diagnostic = diagnostic.with_recovery(crate::diagnostic::RecoveryFact::component(
-                "invalid_field=source_mappings",
-            ));
-        }
-        DirectoryStageRequestError::InvalidRelativePath { path } => {
-            diagnostic = diagnostic.with_recovery(crate::diagnostic::RecoveryFact::path(path));
-        }
-        DirectoryStageRequestError::OverlappingSourceTargets { first, second }
-        | DirectoryStageRequestError::OverlappingOverlays { first, second }
-        | DirectoryStageRequestError::OverlappingEmptyDirectories { first, second } => {
-            diagnostic = diagnostic
-                .with_recovery(crate::diagnostic::RecoveryFact::path(first))
-                .with_recovery(crate::diagnostic::RecoveryFact::path(second));
-        }
-        DirectoryStageRequestError::OverlayOutsideSourceMappings { relative_file } => {
-            diagnostic =
-                diagnostic.with_recovery(crate::diagnostic::RecoveryFact::path(relative_file));
-        }
-        DirectoryStageRequestError::EmptyDirectoryOverlapsSourceTarget {
-            empty_directory,
-            source_target,
-        } => {
-            diagnostic = diagnostic
-                .with_recovery(crate::diagnostic::RecoveryFact::path(empty_directory))
-                .with_recovery(crate::diagnostic::RecoveryFact::path(source_target));
-        }
-        DirectoryStageRequestError::EmptyDirectoryOverlapsOverlay {
-            empty_directory,
-            overlay,
-        } => {
-            diagnostic = diagnostic
-                .with_recovery(crate::diagnostic::RecoveryFact::path(empty_directory))
-                .with_recovery(crate::diagnostic::RecoveryFact::path(overlay));
-        }
-    }
-    diagnostic
-}
-
-fn init_database_inspection_diagnostic(
-    source: &ProjectDatabaseInspectionError<SqliteRuntimeError>,
-) -> SafeDiagnostic {
-    match source {
-        ProjectDatabaseInspectionError::DatabaseNotFound { path } => SafeDiagnostic::new(
-            DiagnosticCode::ProjectState,
-            DiagnosticStage::Init,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
-        ),
-        ProjectDatabaseInspectionError::ReadDatabase {
-            path,
-            stage,
-            query_ids,
-            source,
-        } => {
-            let mut diagnostic = source.safe_diagnostic_source(
-                DiagnosticStage::Init,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            );
-            diagnostic = diagnostic
-                .with_recovery(crate::diagnostic::RecoveryFact::path(path))
-                .with_recovery(crate::diagnostic::RecoveryFact::component(format!(
-                    "database_stage={stage}"
-                )));
-            for query_id in query_ids {
-                diagnostic = diagnostic.with_recovery(crate::diagnostic::RecoveryFact::component(
-                    format!("database_query_id={query_id}"),
-                ));
-            }
-            diagnostic
-        }
-        ProjectDatabaseInspectionError::InvalidDatabase { path, reason } => {
-            let mut diagnostic = SafeDiagnostic::new(
-                DiagnosticCode::ProjectState,
-                DiagnosticStage::Init,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::StateMismatch,
-                    reason.safe_fact(),
-                ),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            );
-            if let Some(fact) = reason.recovery_fact() {
-                diagnostic = diagnostic.with_recovery(fact.clone());
-            }
-            diagnostic
-        }
-    }
-}
-
-fn init_database_create_diagnostic(
-    source: &ProjectDatabaseCreateError<SqliteRuntimeError>,
-) -> SafeDiagnostic {
-    match source {
-        ProjectDatabaseCreateError::AlreadyExists { path } => SafeDiagnostic::new(
-            DiagnosticCode::ProjectState,
-            DiagnosticStage::Init,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(DiagnosticFailureKind::TargetAlreadyExists),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
-        ),
-        ProjectDatabaseCreateError::NotCreated { path, source } => source
-            .safe_diagnostic_source(
-                DiagnosticStage::Init,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            )
-            .with_recovery(crate::diagnostic::RecoveryFact::path(path)),
-        ProjectDatabaseCreateError::OutcomeUnknown { path, source } => source
-            .safe_diagnostic_source(
-                DiagnosticStage::Init,
-                DiagnosticImpact::OutcomeUnknown,
-                DiagnosticAction::PreserveRecoveryArtifacts,
-            )
-            .with_recovery(crate::diagnostic::RecoveryFact::path(path)),
-        ProjectDatabaseCreateError::ResidualArtifact { path, source } => source
-            .safe_diagnostic_source(
-                DiagnosticStage::Init,
-                DiagnosticImpact::RecoveryRequired,
-                DiagnosticAction::PreserveRecoveryArtifacts,
-            )
-            .with_recovery(crate::diagnostic::RecoveryFact::path(path)),
-    }
-}
-
-fn init_database_reconciliation_diagnostic(
-    source: &ProjectDatabaseReconciliationError<SqliteRuntimeError, SqliteRuntimeError>,
-) -> SafeDiagnostic {
-    match source {
-        ProjectDatabaseReconciliationError::Inspection(source) => {
-            init_database_inspection_diagnostic(source)
-        }
-        ProjectDatabaseReconciliationError::ConcurrentModification { path } => SafeDiagnostic::new(
-            DiagnosticCode::ProjectState,
-            DiagnosticStage::Init,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(DiagnosticFailureKind::FileIdentityChanged),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::Retry,
-        ),
-        ProjectDatabaseReconciliationError::DatabaseNotFound { path } => SafeDiagnostic::new(
-            DiagnosticCode::ProjectState,
-            DiagnosticStage::Init,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
-        ),
-        ProjectDatabaseReconciliationError::NotCommitted { path, source } => source
-            .safe_diagnostic_source(
-                DiagnosticStage::Init,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            )
-            .with_recovery(crate::diagnostic::RecoveryFact::path(path))
-            .with_recovery(crate::diagnostic::RecoveryFact::component(
-                "database_stage=reconcile_project_database",
-            ))
-            .with_recovery(crate::diagnostic::RecoveryFact::transaction("rolled_back")),
-        ProjectDatabaseReconciliationError::OutcomeUnknown { path, source } => source
-            .safe_diagnostic_source(
-                DiagnosticStage::Init,
-                DiagnosticImpact::OutcomeUnknown,
-                DiagnosticAction::PreserveRecoveryArtifacts,
-            )
-            .with_recovery(crate::diagnostic::RecoveryFact::path(path))
-            .with_recovery(crate::diagnostic::RecoveryFact::component(
-                "database_stage=reconcile_project_database",
-            )),
-    }
-}
-
-fn init_snapshot_database_diagnostic(
-    source: &SnapshotDatabaseError<SqliteRuntimeError>,
-) -> SafeDiagnostic {
-    match source {
-        SnapshotDatabaseError::SourceNotFound => SafeDiagnostic::new(
-            DiagnosticCode::ProjectState,
-            DiagnosticStage::Init,
-            DiagnosticSubject::operation("snapshot_project_database"),
-            DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
-        ),
-        SnapshotDatabaseError::DestinationAlreadyExists => SafeDiagnostic::new(
-            DiagnosticCode::ProjectState,
-            DiagnosticStage::Init,
-            DiagnosticSubject::operation("snapshot_project_database"),
-            DiagnosticReason::failure(DiagnosticFailureKind::TargetAlreadyExists),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
-        ),
-        SnapshotDatabaseError::NotCreated(source) => source.safe_diagnostic_source(
-            DiagnosticStage::Init,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
-        ),
-        SnapshotDatabaseError::ResidualArtifact(source) => source.safe_diagnostic_source(
-            DiagnosticStage::Init,
-            DiagnosticImpact::RecoveryRequired,
-            DiagnosticAction::PreserveRecoveryArtifacts,
-        ),
-        SnapshotDatabaseError::OutcomeUnknown(source) => source.safe_diagnostic_source(
-            DiagnosticStage::Init,
-            DiagnosticImpact::OutcomeUnknown,
-            DiagnosticAction::PreserveRecoveryArtifacts,
-        ),
-    }
-}
-
-fn init_candidate_diagnostic(
-    source: &ProjectWorkspaceCandidateFailure<
-        ProjectDatabaseCreateError<SqliteRuntimeError>,
-        SqliteRuntimeError,
-        ProjectDatabaseReconciliationError<SqliteRuntimeError, SqliteRuntimeError>,
-        Box<SystemFileSystemError>,
-    >,
-) -> SafeDiagnostic {
-    match source {
-        ProjectWorkspaceCandidateFailure::FingerprintCandidate(source) => {
-            init_fingerprint_diagnostic(source, DiagnosticAction::CheckProjectState)
-        }
-        ProjectWorkspaceCandidateFailure::CreateDatabase(source) => {
-            init_database_create_diagnostic(source)
-        }
-        ProjectWorkspaceCandidateFailure::SnapshotDatabase(source) => {
-            init_snapshot_database_diagnostic(source)
-        }
-        ProjectWorkspaceCandidateFailure::ReconcileDatabase(source) => {
-            init_database_reconciliation_diagnostic(source)
-        }
-    }
-}
-
-fn init_preserve_observability_diagnostic(
-    source: &crate::rpg_maker::init::PreserveObservabilityFailure<
-        SystemFileSystemError,
-        Box<SystemFileSystemError>,
-    >,
-) -> SafeDiagnostic {
-    use crate::rpg_maker::init::PreserveObservabilityFailure;
-    use crate::storage::file_system::{ScopedDirectoryBindError, ScopedDirectoryEditError};
-
-    let invalid_path = |path: &PathBuf, kind: DiagnosticFailureKind| {
-        SafeDiagnostic::new(
-            DiagnosticCode::ProjectState,
-            DiagnosticStage::Init,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(kind),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
-        )
-    };
-    match source {
-        PreserveObservabilityFailure::Bind(source) => match source {
-            ScopedDirectoryBindError::WrongEditorInstance => SafeDiagnostic::new(
-                DiagnosticCode::ProjectState,
-                DiagnosticStage::Init,
-                DiagnosticSubject::component("preserved observability candidate"),
-                DiagnosticReason::failure(DiagnosticFailureKind::WrongPublisherInstance),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::ReportBug,
-            ),
-            ScopedDirectoryBindError::CandidateFinalized { root } => {
-                invalid_path(root, DiagnosticFailureKind::StateMismatch)
-            }
-            ScopedDirectoryBindError::CandidateIdentityChanged { root } => {
-                invalid_path(root, DiagnosticFailureKind::FileIdentityChanged)
-            }
-            ScopedDirectoryBindError::Failed { root, source } => source
-                .safe_diagnostic(
-                    DiagnosticStage::Init,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckPathAndPermissions,
-                )
-                .with_recovery(crate::diagnostic::RecoveryFact::path(root)),
+            ProjectWorkspaceConvergenceError::InvalidStageRequest(_) => InitFailureClass::Internal,
+            _ => InitFailureClass::ProjectState,
         },
-        PreserveObservabilityFailure::List { path, source } => init_directory_listing_diagnostic(
-            source,
-            DiagnosticCode::ProjectState,
-            DiagnosticAction::CheckProjectState,
-        )
-        .with_recovery(crate::diagnostic::RecoveryFact::path(path)),
-        PreserveObservabilityFailure::Read { path, source } => match source {
-            ReadFileError::NotFound { path } => invalid_path(path, DiagnosticFailureKind::NotFound),
-            ReadFileError::NotFile { path } => {
-                invalid_path(path, DiagnosticFailureKind::InvalidPath)
-            }
-            ReadFileError::Io { path, source } => source
-                .safe_diagnostic(
-                    DiagnosticStage::Init,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckPathAndPermissions,
-                )
-                .with_recovery(crate::diagnostic::RecoveryFact::path(path)),
-        }
-        .with_recovery(crate::diagnostic::RecoveryFact::path(path)),
-        PreserveObservabilityFailure::InvalidCandidatePath { path, .. } => {
-            invalid_path(path, DiagnosticFailureKind::InvalidPath)
-        }
-        PreserveObservabilityFailure::Edit { path, source } => match source {
-            ScopedDirectoryEditError::Failed { path, source } => source
-                .safe_diagnostic(
-                    DiagnosticStage::Init,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckPathAndPermissions,
-                )
-                .with_recovery(crate::diagnostic::RecoveryFact::path(path)),
-            ScopedDirectoryEditError::WrongEditorInstance => SafeDiagnostic::new(
-                DiagnosticCode::ProjectState,
-                DiagnosticStage::Init,
-                DiagnosticSubject::component("preserved observability candidate"),
-                DiagnosticReason::failure(DiagnosticFailureKind::WrongPublisherInstance),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::ReportBug,
-            ),
-            ScopedDirectoryEditError::OutsideScope { path }
-            | ScopedDirectoryEditError::ScopeRootMutation { path }
-            | ScopedDirectoryEditError::NotFile { path }
-            | ScopedDirectoryEditError::NotDirectory { path } => {
-                invalid_path(path, DiagnosticFailureKind::InvalidPath)
-            }
-            ScopedDirectoryEditError::NotFound { path } => {
-                invalid_path(path, DiagnosticFailureKind::NotFound)
-            }
-            ScopedDirectoryEditError::CandidateIdentityChanged { root } => {
-                invalid_path(root, DiagnosticFailureKind::FileIdentityChanged)
-            }
-        }
-        .with_recovery(crate::diagnostic::RecoveryFact::path(path)),
-    }
+    };
+    (
+        class,
+        ProductionCommandError::report_diagnostic(source, diagnostic),
+    )
 }
 
-fn init_prepare_diagnostic(
-    source: &DirectoryPrepareError<Box<SystemFileSystemError>>,
-) -> SafeDiagnostic {
-    match source {
-        DirectoryPrepareError::NotPrepared {
-            target_root,
-            source,
-            cleanup_failure,
-        } => with_staging_cleanup(
-            source
-                .safe_diagnostic(
-                    DiagnosticStage::Init,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckProjectState,
-                )
-                .with_recovery(crate::diagnostic::RecoveryFact::path(target_root)),
-            cleanup_failure.as_ref(),
-        ),
-    }
+trait BuiltInExtractDiagnostic: Error + Send + Sync + Sized + 'static {
+    fn into_extract_diagnostic(self) -> ReportedFailure;
 }
 
-fn init_discard_diagnostic(
-    source: &DirectoryDiscardError<Box<SystemFileSystemError>>,
-) -> SafeDiagnostic {
-    source
-        .source()
-        .safe_diagnostic(
-            DiagnosticStage::Init,
-            DiagnosticImpact::RecoveryRequired,
-            DiagnosticAction::PreserveRecoveryArtifacts,
-        )
-        .with_recovery(crate::diagnostic::RecoveryFact::path(source.staging_root()))
-}
-
-fn init_publish_diagnostic(
-    source: &DirectoryPublishError<Box<SystemFileSystemError>>,
-) -> (InitFailureClass, SafeDiagnostic) {
-    use InitFailureClass as Class;
-
-    match source {
-        DirectoryPublishError::TargetAlreadyExists {
-            target_root,
-            cleanup_failure,
-        } => (
-            Class::ProjectState,
-            with_staging_cleanup(
-                SafeDiagnostic::new(
-                    DiagnosticCode::ProjectState,
-                    DiagnosticStage::Publication,
-                    DiagnosticSubject::path(target_root),
-                    DiagnosticReason::failure(DiagnosticFailureKind::TargetAlreadyExists),
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckProjectState,
-                ),
-                cleanup_failure.as_ref(),
-            ),
-        ),
-        DirectoryPublishError::TargetMissing {
-            target_root,
-            cleanup_failure,
-        } => (
-            Class::ProjectState,
-            with_staging_cleanup(
-                SafeDiagnostic::new(
-                    DiagnosticCode::ProjectState,
-                    DiagnosticStage::Publication,
-                    DiagnosticSubject::path(target_root),
-                    DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckProjectState,
-                ),
-                cleanup_failure.as_ref(),
-            ),
-        ),
-        DirectoryPublishError::TargetNotDirectory {
-            target_root,
-            cleanup_failure,
-        } => (
-            Class::ProjectState,
-            with_staging_cleanup(
-                SafeDiagnostic::new(
-                    DiagnosticCode::ProjectState,
-                    DiagnosticStage::Publication,
-                    DiagnosticSubject::path(target_root),
-                    DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckProjectState,
-                ),
-                cleanup_failure.as_ref(),
-            ),
-        ),
-        DirectoryPublishError::NotAttempted {
-            target_root,
-            source,
-            cleanup_failure,
-        }
-        | DirectoryPublishError::NotPublished {
-            target_root,
-            source,
-            cleanup_failure,
-        } => (
-            Class::ProjectState,
-            with_staging_cleanup(
-                source
-                    .safe_diagnostic(
-                        DiagnosticStage::Publication,
-                        DiagnosticImpact::Unchanged,
-                        DiagnosticAction::CheckProjectState,
-                    )
-                    .with_recovery(crate::diagnostic::RecoveryFact::path(target_root)),
-                cleanup_failure.as_ref(),
-            ),
-        ),
-        DirectoryPublishError::PublishedWithResiduals {
-            target_root,
-            residual_path,
-            source,
-        } => (
-            Class::StateAppliedFinalizationFailed,
-            source
-                .safe_diagnostic(
-                    DiagnosticStage::Publication,
-                    DiagnosticImpact::StateAppliedFinalizationFailed,
-                    DiagnosticAction::PreserveRecoveryArtifacts,
-                )
-                .with_recovery(crate::diagnostic::RecoveryFact::path(target_root))
-                .with_recovery(crate::diagnostic::RecoveryFact::path(residual_path)),
-        ),
-        DirectoryPublishError::RecoveryRequired {
-            target_root,
-            recovery_artifacts,
-            source,
-        } => (
-            Class::RecoveryRequired,
-            with_recovery_paths(
-                source
-                    .safe_diagnostic(
-                        DiagnosticStage::Publication,
-                        DiagnosticImpact::RecoveryRequired,
-                        DiagnosticAction::PreserveRecoveryArtifacts,
-                    )
-                    .with_recovery(crate::diagnostic::RecoveryFact::path(target_root)),
-                recovery_artifacts,
-            ),
-        ),
-        DirectoryPublishError::OutcomeUnknown {
-            target_root,
-            recovery_artifacts,
-            source,
-        } => (
-            Class::OutcomeUnknown,
-            with_recovery_paths(
-                source
-                    .safe_diagnostic(
-                        DiagnosticStage::Publication,
-                        DiagnosticImpact::OutcomeUnknown,
-                        DiagnosticAction::PreserveRecoveryArtifacts,
-                    )
-                    .with_recovery(crate::diagnostic::RecoveryFact::path(target_root)),
-                recovery_artifacts,
-            ),
-        ),
-    }
-}
-
-fn with_staging_cleanup<E>(
-    mut diagnostic: SafeDiagnostic,
-    cleanup: Option<&StagingCleanupFailure<E>>,
-) -> SafeDiagnostic {
-    if let Some(cleanup) = cleanup {
-        diagnostic = diagnostic
-            .with_recovery(crate::diagnostic::RecoveryFact::path(
-                cleanup.residual_path(),
-            ))
-            .with_recovery(crate::diagnostic::RecoveryFact::component(
-                "candidate_cleanup=failed",
-            ));
-    }
-    diagnostic
-}
-
-fn with_recovery_paths(mut diagnostic: SafeDiagnostic, paths: &[PathBuf]) -> SafeDiagnostic {
-    for path in paths {
-        diagnostic = diagnostic.with_recovery(crate::diagnostic::RecoveryFact::path(path));
-    }
-    diagnostic
-}
-
-trait ExtractSafeDiagnostic {
-    fn safe_diagnostic(&self) -> SafeDiagnostic;
-}
-
-trait ExtractFailureReport: Error + Send + Sync + Sized + 'static {
-    fn into_extract_failure_report(self) -> FailureReport;
-}
-
-impl<RE, SE, CE> ExtractSafeDiagnostic for BuiltInExtractionError<RE, SE, CE>
-where
-    RE: RpgMakerProjectDocumentReadingDiagnostic,
-    SE: SafeDiagnosticSource,
-    crate::execution::cpu::CpuTaskExecutionError<CE>: SafeDiagnosticSource,
-{
-    fn safe_diagnostic(&self) -> SafeDiagnostic {
-        BuiltInExtractionError::safe_diagnostic(self)
-    }
-}
-
-impl<RE, SE, CE> ExtractFailureReport for BuiltInExtractionError<RE, SE, CE>
+impl<RE, SE, CE> BuiltInExtractDiagnostic for BuiltInExtractionError<RE, SE, CE>
 where
     RE: Error + RpgMakerProjectDocumentReadingDiagnostic + Send + Sync + 'static,
-    SE: Error + SafeDiagnosticSource + Send + Sync + 'static,
+    SE: Error
+        + crate::rpg_maker::extract::store::RpgMakerExtractionStoreDiagnostic
+        + Send
+        + Sync
+        + 'static,
     CE: Error + Send + Sync + 'static,
-    crate::execution::cpu::CpuTaskExecutionError<CE>: SafeDiagnosticSource,
+    crate::execution::cpu::CpuTaskExecutionError<CE>:
+        crate::rpg_maker::extract::RpgMakerExtractionCpuDiagnostic,
 {
-    fn into_extract_failure_report(self) -> FailureReport {
-        let diagnostic = ExtractSafeDiagnostic::safe_diagnostic(&self);
-        match self {
-            BuiltInExtractionError::Persist(source) => source
-                .into_failure_report(
-                    DiagnosticStage::Extract,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckProjectState,
-                )
-                .with_primary_recovery(crate::diagnostic::RecoveryFact::component("owner=builtin")),
-            source => FailureReport::new(ReportedFailure::new(diagnostic, source)),
-        }
+    fn into_extract_diagnostic(self) -> ReportedFailure {
+        self.into_diagnostic_failure()
     }
 }
 
-impl<DE, SE, CE> ExtractFailureReport for RulesExtractionError<DE, SE, CE>
+trait RulesExtractDiagnostic: Error + Send + Sync + Sized + 'static {
+    fn into_extract_diagnostic(self) -> ReportedFailure;
+}
+
+impl<DE, SE, CE> RulesExtractDiagnostic for RulesExtractionError<DE, SE, CE>
 where
     DE: Error + RpgMakerProjectDocumentReadingDiagnostic + Send + Sync + 'static,
-    SE: Error + SafeDiagnosticSource + Send + Sync + 'static,
+    SE: Error
+        + crate::rpg_maker::extract::store::RpgMakerExtractionStoreDiagnostic
+        + Send
+        + Sync
+        + 'static,
     CE: Error + Send + Sync + 'static,
-    crate::execution::cpu::CpuTaskExecutionError<CE>: SafeDiagnosticSource,
+    crate::execution::cpu::CpuTaskExecutionError<CE>:
+        crate::rpg_maker::extract::RpgMakerExtractionCpuDiagnostic,
 {
-    fn into_extract_failure_report(self) -> FailureReport {
-        RulesExtractionError::into_failure_report(self)
+    fn into_extract_diagnostic(self) -> ReportedFailure {
+        self.into_diagnostic_failure()
     }
 }
 
@@ -6833,8 +5685,8 @@ fn map_extract_error<OE, BE, RE, PE>(
 ) -> ProductionCommandError
 where
     OE: Error + Send + Sync + 'static,
-    BE: ExtractFailureReport,
-    RE: ExtractFailureReport,
+    BE: BuiltInExtractDiagnostic,
+    RE: RulesExtractDiagnostic,
     PE: Error + Send + Sync + 'static,
 {
     match error {
@@ -6842,33 +5694,27 @@ where
             ProductionCommandError::prevalidated_boundary(
                 error,
                 DiagnosticStage::Extract,
-                "extract_project_lease_already_held",
+                RuntimeBoundaryOperation::ExtractProjectLeaseAlreadyHeld,
             )
         }
         error @ ExtractServiceError::OpenProject(_) => {
             ProductionCommandError::prevalidated_boundary(
                 error,
                 DiagnosticStage::Extract,
-                "extract_project_already_opened",
+                RuntimeBoundaryOperation::ExtractProjectAlreadyOpened,
             )
         }
         ExtractServiceError::BuiltIn(source) => {
-            map_project_failure_report(source.into_extract_failure_report())
+            map_project_failure_report(source.into_extract_diagnostic())
         }
         ExtractServiceError::Rules {
             rules_path: _,
             completed_owners,
             source,
         } => {
-            let mut report = source.into_extract_failure_report();
+            let mut report = source.into_extract_diagnostic();
             if !completed_owners.is_empty() {
-                report = report.with_primary_impact(DiagnosticImpact::ProgressPreserved);
-                for owner in completed_owners {
-                    report = report.with_primary_recovery(RecoveryFact::component(format!(
-                        "completed_owner={}",
-                        owner.storage_name()
-                    )));
-                }
+                report = report.with_effect(StateEffect::ProgressPreserved);
             }
             map_project_failure_report(report)
         }
@@ -6879,18 +5725,51 @@ trait ProductionExternalModelFailure: Error + Send + Sync + 'static {
     fn into_external_model_failure(self) -> ProductionCommandError;
 }
 
+trait ProductionTranslationAssetFailure: Error + Send + Sync + Sized + 'static {
+    fn into_asset_failure(self) -> ReportedFailure;
+}
+
+impl ProductionTranslationAssetFailure
+    for crate::rpg_maker::translate::asset_reader::RpgMakerTranslationAssetReadingError<
+        crate::runtime::sqlite::SqliteRuntimeError,
+        crate::runtime::cpu::CpuExecutorUnavailable,
+    >
+{
+    fn into_asset_failure(self) -> ReportedFailure {
+        let report = self.diagnostic_report();
+        ReportedFailure::new(report, self)
+    }
+}
+
+trait ProductionTranslationPlanningFailure: Error + Send + Sync + Sized + 'static {
+    fn into_planning_failure(self) -> ReportedFailure;
+}
+
+impl ProductionTranslationPlanningFailure
+    for crate::rpg_maker::translate::planner::RpgMakerTranslationTaskPlanningError<
+        crate::translation::planning_resource::TranslationPlanningResourceReadingError<
+            crate::runtime::filesystem::SystemFileSystemError,
+            crate::runtime::cpu::CpuExecutorUnavailable,
+        >,
+        crate::runtime::cpu::CpuExecutorUnavailable,
+    >
+{
+    fn into_planning_failure(self) -> ReportedFailure {
+        self.into_reported_failure()
+    }
+}
+
 trait ProductionTranslationResultStorageFailure: Error + Send + Sync + Sized + 'static {
-    fn into_result_storage_failure_report(self) -> FailureReport;
+    fn into_result_storage_failure(self) -> ReportedFailure;
 }
 
 impl<S, C> ProductionTranslationResultStorageFailure for RpgMakerTranslationResultStorageError<S, C>
 where
-    S: Error + SafeDiagnosticSource + Send + Sync + 'static,
+    S: Error + Send + Sync + 'static,
     C: Error + Send + Sync + 'static,
-    crate::execution::cpu::CpuTaskExecutionError<C>: SafeDiagnosticSource,
 {
-    fn into_result_storage_failure_report(self) -> FailureReport {
-        self.into_failure_report()
+    fn into_result_storage_failure(self) -> ReportedFailure {
+        self.into_reported_failure()
     }
 }
 
@@ -6902,9 +5781,9 @@ impl<R, P, E, S> ProductionExternalModelFailure
         S,
     >
 where
-    R: Error + SafeDiagnosticSource + Send + Sync + 'static,
-    P: Error + SafeDiagnosticSource + Send + Sync + 'static,
-    E: Error + SafeDiagnosticSource + Send + Sync + 'static,
+    R: ProductionTranslationAssetFailure,
+    P: ProductionTranslationPlanningFailure,
+    E: Error + Send + Sync + 'static,
     S: ProductionTranslationResultStorageFailure,
 {
     fn into_external_model_failure(self) -> ProductionCommandError {
@@ -6912,87 +5791,52 @@ where
 
         match self {
             TranslationError::ReadAssets(source) => {
-                let diagnostic = source.safe_diagnostic_source(
-                    DiagnosticStage::Translate,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckProjectState,
-                );
-                map_project_diagnostic(source, diagnostic)
+                map_project_failure_report(source.into_asset_failure())
             }
             TranslationError::PlanTasks(source) => {
-                let diagnostic = source.safe_diagnostic_source(
-                    DiagnosticStage::Translate,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::FixInput,
-                );
+                let report = source.into_planning_failure();
                 if matches!(
-                    diagnostic.action,
-                    DiagnosticAction::FixInput
-                        | DiagnosticAction::FixConfiguration
-                        | DiagnosticAction::CheckPathAndPermissions
+                    report.report().primary().resolution(),
+                    crate::diagnostic::DiagnosticResolution::FixInput
+                        | crate::diagnostic::DiagnosticResolution::FixConfiguration
+                        | crate::diagnostic::DiagnosticResolution::FixPlaceholderRules
+                        | crate::diagnostic::DiagnosticResolution::CheckPathAndPermissions
                 ) {
-                    ProductionCommandError::ConfigurationOrInput(Box::new(
-                        ProductionCommandError::report_diagnostic(source, diagnostic),
-                    ))
+                    ProductionCommandError::ConfigurationOrInput(Box::new(report))
                 } else {
-                    map_project_diagnostic(source, diagnostic)
+                    map_project_failure_report(report)
                 }
             }
             TranslationError::ApplyPreparation(source) => {
-                map_project_failure_report(source.into_result_storage_failure_report())
+                map_project_failure_report(source.into_result_storage_failure())
             }
-            TranslationError::ExecuteTask { task_index, source } => match source {
+            TranslationError::ExecuteTask {
+                task_index: _,
+                source,
+                diagnostic,
+            } => match source {
                 RpgMakerTranslationTaskExecutionError::FatalRequest { attempt, source } => {
-                    let diagnostic = source
-                        .safe_diagnostic(None, DiagnosticImpact::ProgressPreserved)
-                        .with_recovery(crate::diagnostic::RecoveryFact::component(format!(
-                            "task={task_index}; attempt={attempt}"
-                        )));
+                    let source: RpgMakerTranslationTaskExecutionError<
+                        OpenAiChatCompletionError,
+                        E,
+                    > = RpgMakerTranslationTaskExecutionError::FatalRequest { attempt, source };
                     ProductionCommandError::ExternalModel(Box::new(
                         ProductionCommandError::report_diagnostic(source, diagnostic),
                     ))
                 }
                 RpgMakerTranslationTaskExecutionError::ProcessResponse { attempt, source } => {
-                    let diagnostic = source
-                        .safe_diagnostic_source(
-                            DiagnosticStage::ModelRequest,
-                            DiagnosticImpact::ProgressPreserved,
-                            DiagnosticAction::CheckModelService,
-                        )
-                        .with_recovery(crate::diagnostic::RecoveryFact::component(format!(
-                            "task={task_index}; attempt={attempt}"
-                        )));
                     let execution_error: RpgMakerTranslationTaskExecutionError<
                         OpenAiChatCompletionError,
                         E,
                     > = RpgMakerTranslationTaskExecutionError::ProcessResponse { attempt, source };
                     map_project_diagnostic(execution_error, diagnostic)
                 }
-                source @ RpgMakerTranslationTaskExecutionError::RetryWaitCancelled { attempt } => {
-                    let diagnostic = SafeDiagnostic::new(
-                        DiagnosticCode::ModelRequest,
-                        DiagnosticStage::ModelRequest,
-                        DiagnosticSubject::component("LLM retry wait"),
-                        DiagnosticReason::failure(DiagnosticFailureKind::LockCancelled),
-                        DiagnosticImpact::ProgressPreserved,
-                        DiagnosticAction::Retry,
-                    )
-                    .with_recovery(crate::diagnostic::RecoveryFact::component(format!(
-                        "task={task_index}; attempt={attempt}"
-                    )));
+                source @ RpgMakerTranslationTaskExecutionError::LlmRequestCancelled { .. } => {
                     ProductionCommandError::ExternalModel(Box::new(
                         ProductionCommandError::report_diagnostic(source, diagnostic),
                     ))
                 }
                 RpgMakerTranslationTaskExecutionError::InternalInvariant { invariant } => {
-                    let diagnostic = invariant
-                        .safe_diagnostic(
-                            DiagnosticStage::Translate,
-                            DiagnosticImpact::ProgressPreserved,
-                        )
-                        .with_recovery(crate::diagnostic::RecoveryFact::component(format!(
-                            "task_ordinal={task_index}"
-                        )));
                     let source: RpgMakerTranslationTaskExecutionError<
                         OpenAiChatCompletionError,
                         E,
@@ -7002,73 +5846,53 @@ where
                     ))
                 }
             },
-            TranslationError::CommitTask { task_index, source } => {
-                let report = source
-                    .into_result_storage_failure_report()
-                    .with_primary_recovery(crate::diagnostic::RecoveryFact::component(format!(
-                        "task={task_index}"
-                    )));
-                map_project_failure_report(report)
-            }
-            source @ TranslationError::InvalidTaskResultSequence {
-                expected_task_index,
-                actual_task_index,
-            } => {
-                let diagnostic = SafeDiagnostic::new(
-                    DiagnosticCode::StateFinalizationFailed,
-                    DiagnosticStage::Translate,
-                    DiagnosticSubject::operation("translation result ordering"),
-                    DiagnosticReason::failure(DiagnosticFailureKind::InternalInvariant),
-                    DiagnosticImpact::StateAppliedFinalizationFailed,
-                    DiagnosticAction::ReportBug,
-                )
-                .with_recovery(crate::diagnostic::RecoveryFact::component(format!(
-                    "expected_task={expected_task_index}; actual_task={actual_task_index:?}"
-                )));
-                ProductionCommandError::StateAppliedButFinalizationFailed(Box::new(
+            TranslationError::CommitTask {
+                task_index: _,
+                source,
+                diagnostic,
+            } => map_project_diagnostic(source, diagnostic),
+            source @ TranslationError::InvalidTaskResultSequence { .. } => {
+                let diagnostic = match &source {
+                    TranslationError::InvalidTaskResultSequence { diagnostic, .. } => {
+                        diagnostic.clone()
+                    }
+                    _ => unreachable!("匹配的翻译结果序列错误必须保留其结构化诊断"),
+                };
+                ProductionCommandError::Internal(Box::new(
                     ProductionCommandError::report_diagnostic(source, diagnostic),
                 ))
             }
             TranslationError::FinalizeResultStore(source) => {
-                map_project_failure_report(source.into_result_storage_failure_report())
+                map_project_failure_report(source.into_result_storage_failure())
             }
             TranslationError::OperationAndFinalization {
                 primary,
                 finalization,
             } => primary
                 .into_external_model_failure()
-                .with_related_finalization_report(
-                    finalization.into_result_storage_failure_report(),
-                ),
+                .with_related_finalization_report(finalization.into_result_storage_failure()),
         }
     }
 }
 
 fn map_project_diagnostic(
     source: impl Error + Send + Sync + 'static,
-    diagnostic: SafeDiagnostic,
+    diagnostic: DiagnosticReport,
 ) -> ProductionCommandError {
     let report = ProductionCommandError::report_diagnostic(source, diagnostic);
     map_project_failure_report(report)
 }
 
-fn map_project_failure_report(report: FailureReport) -> ProductionCommandError {
-    let impact = report.primary.public().impact;
-    let action = report.primary.public().action;
-    let has_impact = |expected| {
-        impact == expected
-            || report
-                .related
-                .iter()
-                .any(|failure| failure.public().impact == expected)
-    };
-    if has_impact(DiagnosticImpact::OutcomeUnknown) {
+fn map_project_failure_report(report: ReportedFailure) -> ProductionCommandError {
+    let effect = report.report().effect();
+    let resolution = report.report().primary().resolution();
+    if effect == StateEffect::OutcomeUnknown {
         ProductionCommandError::OutcomeUnknown(Box::new(report))
-    } else if has_impact(DiagnosticImpact::RecoveryRequired) {
+    } else if effect == StateEffect::RecoveryRequired {
         ProductionCommandError::RecoveryRequired(Box::new(report))
-    } else if has_impact(DiagnosticImpact::StateAppliedFinalizationFailed) {
+    } else if effect == StateEffect::AppliedFinalizationFailed {
         ProductionCommandError::StateAppliedButFinalizationFailed(Box::new(report))
-    } else if action == DiagnosticAction::ReportBug {
+    } else if resolution == crate::diagnostic::DiagnosticResolution::ReportBug {
         ProductionCommandError::Internal(Box::new(report))
     } else {
         ProductionCommandError::ProjectState(Box::new(report))
@@ -7088,14 +5912,14 @@ where
             ProductionCommandError::prevalidated_boundary(
                 error,
                 DiagnosticStage::Translate,
-                "translate_project_lease_already_held",
+                RuntimeBoundaryOperation::TranslateProjectLeaseAlreadyHeld,
             )
         }
         error @ TranslateServiceError::ReadProject { .. } => {
             ProductionCommandError::prevalidated_boundary(
                 error,
                 DiagnosticStage::Translate,
-                "translate_project_already_opened",
+                RuntimeBoundaryOperation::TranslateProjectAlreadyOpened,
             )
         }
         TranslateServiceError::BuildExecution(source) => {
@@ -7105,79 +5929,105 @@ where
     }
 }
 
+trait ProductionWriteBackPreparationFailure: Error + Send + Sync + Sized + 'static {
+    fn into_write_back_preparation_failure(self) -> ReportedFailure;
+}
+
+trait ProductionWriteBackAssetFailure: Error + Send + Sync + Sized + 'static {
+    fn into_write_back_asset_failure(self) -> ReportedFailure;
+}
+
+impl ProductionWriteBackAssetFailure
+    for RpgMakerWriteBackAssetReadingError<SqliteRuntimeError, CpuExecutorUnavailable>
+{
+    fn into_write_back_asset_failure(self) -> ReportedFailure {
+        self.into_reported_failure()
+    }
+}
+
+trait ProductionWriteBackRewriteFailure: Error + Send + Sync + Sized + 'static {
+    fn into_write_back_rewrite_failure(self) -> ReportedFailure;
+}
+
+impl<R> ProductionWriteBackRewriteFailure
+    for RpgMakerWriteBackDocumentRewritingError<R, CpuExecutorUnavailable>
+where
+    R: Error + RpgMakerProjectDocumentReadingDiagnostic + Send + Sync + 'static,
+{
+    fn into_write_back_rewrite_failure(self) -> ReportedFailure {
+        self.into_reported_failure()
+    }
+}
+
+impl<R, D> ProductionWriteBackPreparationFailure
+    for RpgMakerWriteBackServiceError<R, D, CpuExecutorUnavailable>
+where
+    R: ProductionWriteBackAssetFailure,
+    D: ProductionWriteBackRewriteFailure,
+{
+    fn into_write_back_preparation_failure(self) -> ReportedFailure {
+        match self {
+            RpgMakerWriteBackServiceError::ReadAssets(source) => {
+                source.into_write_back_asset_failure()
+            }
+            RpgMakerWriteBackServiceError::SchedulePlanning(source) => {
+                let report = write_back_planning_compute_report(&source);
+                ReportedFailure::new(report, source)
+            }
+            RpgMakerWriteBackServiceError::InvalidPlan(source) => {
+                let report = source.diagnostic_report();
+                ReportedFailure::new(report, source)
+            }
+            RpgMakerWriteBackServiceError::RewriteDocuments(source) => {
+                source.into_write_back_rewrite_failure()
+            }
+        }
+    }
+}
+
 fn map_write_back_error<OE, SE, PE, KE>(
     error: WriteBackServiceError<OE, SE, PE, KE>,
 ) -> ProductionCommandError
 where
     OE: Error + Send + Sync + 'static,
-    SE: Error + SafeDiagnosticSource + Send + Sync + 'static,
+    SE: ProductionWriteBackPreparationFailure,
     PE: Error + WriteBackPublishingDiagnostic + Send + Sync + 'static,
     KE: Error + Send + Sync + 'static,
 {
     match error {
-        WriteBackServiceError::ProjectLease(source) => {
-            let project = match &source {
-                ProjectCommandLeaseError::Unavailable { project, .. } => project.to_string(),
-            };
-            let diagnostic = SafeDiagnostic::new(
-                DiagnosticCode::ProjectUnavailable,
-                DiagnosticStage::ProjectOpening,
-                DiagnosticSubject::Project { name: project },
-                DiagnosticReason::failure(DiagnosticFailureKind::Busy),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::RetryAfterResolvingContention,
-            );
-            ProductionCommandError::ProjectUnavailable(Box::new(
-                ProductionCommandError::report_diagnostic(source, diagnostic),
-            ))
+        error @ WriteBackServiceError::ProjectLease(_) => {
+            ProductionCommandError::prevalidated_boundary(
+                error,
+                DiagnosticStage::WriteBack,
+                RuntimeBoundaryOperation::WriteBackProjectLeaseAlreadyHeld,
+            )
         }
         WriteBackServiceError::CancellationDiscard {
             candidate_root: _,
             discard,
         } => {
-            let report = discard.into_write_back_failure_report(
-                DiagnosticStage::WriteBack,
-                DiagnosticImpact::RecoveryRequired,
-            );
+            let report = discard.into_write_back_failure_report();
             map_project_failure_report(report)
         }
-        WriteBackServiceError::OpenProject(source) => {
-            let diagnostic = SafeDiagnostic::new(
-                DiagnosticCode::ProjectState,
-                DiagnosticStage::ProjectOpening,
-                DiagnosticSubject::operation("open_write_back_project"),
-                DiagnosticReason::failure(DiagnosticFailureKind::StateMismatch),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            );
-            ProductionCommandError::ProjectState(Box::new(
-                ProductionCommandError::report_diagnostic(source, diagnostic),
-            ))
+        error @ WriteBackServiceError::OpenProject(_) => {
+            ProductionCommandError::prevalidated_boundary(
+                error,
+                DiagnosticStage::WriteBack,
+                RuntimeBoundaryOperation::WriteBackProjectAlreadyOpened,
+            )
         }
         WriteBackServiceError::Prepare(source) => {
-            let diagnostic = source.safe_diagnostic_source(
-                DiagnosticStage::WriteBack,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            );
-            let report = ProductionCommandError::report_diagnostic(source, diagnostic);
-            map_project_failure_report(report)
+            map_project_failure_report(source.into_write_back_preparation_failure())
         }
         WriteBackServiceError::PrepareCandidate(source) => {
-            let report = source.into_write_back_failure_report(
-                DiagnosticStage::WriteBack,
-                DiagnosticImpact::Unchanged,
-            );
+            let report = source.into_write_back_failure_report();
             map_project_failure_report(report)
         }
         WriteBackServiceError::ValidateCandidate {
             candidate_root: _,
             source,
         } => {
-            let report = source.into_write_back_failure_report(
-                DiagnosticStage::WriteBack,
-                DiagnosticImpact::Unchanged,
-            );
+            let report = source.into_write_back_failure_report();
             map_project_failure_report(report)
         }
         WriteBackServiceError::ValidateCandidateAndDiscard {
@@ -7185,286 +6035,67 @@ where
             source,
             discard,
         } => {
-            let report = source.into_write_back_failure_report(
-                DiagnosticStage::WriteBack,
-                DiagnosticImpact::Unchanged,
+            let report = source.into_write_back_failure_report().with_related(
+                RelatedFailureRelation::Discard,
+                discard.into_write_back_failure_report(),
             );
-            let discard_report = discard.into_write_back_failure_report(
-                DiagnosticStage::WriteBack,
-                DiagnosticImpact::RecoveryRequired,
-            );
-            let report = append_related_report(report, discard_report);
             map_project_failure_report(report)
         }
-        WriteBackServiceError::Publish { state, source } => {
-            let impact = match &state {
-                WriteBackPublishFailureState::NotPublished { .. } => DiagnosticImpact::Unchanged,
-                WriteBackPublishFailureState::PublishedWithResiduals { .. } => {
-                    DiagnosticImpact::StateAppliedFinalizationFailed
-                }
-                WriteBackPublishFailureState::RecoveryRequired { .. } => {
-                    DiagnosticImpact::RecoveryRequired
-                }
-                WriteBackPublishFailureState::OutcomeUnknown { .. } => {
-                    DiagnosticImpact::OutcomeUnknown
-                }
-            };
-            let report =
-                source.into_write_back_failure_report(DiagnosticStage::Publication, impact);
+        WriteBackServiceError::Publish { state: _, source } => {
+            let report = source.into_write_back_failure_report();
             map_project_failure_report(report)
         }
-    }
-}
-
-fn append_related_report(mut primary: FailureReport, related: FailureReport) -> FailureReport {
-    primary.related.push(related.primary);
-    primary.related.extend(related.related);
-    primary
-}
-
-fn project_database_read_diagnostic(
-    source: &ProjectDatabaseReadError<SqliteRuntimeError>,
-) -> SafeDiagnostic {
-    match source {
-        ProjectDatabaseReadError::DatabaseNotFound { path } => SafeDiagnostic::new(
-            DiagnosticCode::ProjectUnavailable,
-            DiagnosticStage::ProjectOpening,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
-        ),
-        ProjectDatabaseReadError::ReadDatabase {
-            path,
-            stage,
-            query_id,
-            source,
-        } => source
-            .safe_diagnostic(
-                DiagnosticStage::ProjectOpening,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            )
-            .with_recovery(crate::diagnostic::RecoveryFact::path(path))
-            .with_recovery(crate::diagnostic::RecoveryFact::component(format!(
-                "database_stage={stage}"
-            )))
-            .with_recovery(crate::diagnostic::RecoveryFact::component(format!(
-                "database_query_id={query_id}"
-            ))),
-        ProjectDatabaseReadError::InvalidMetadata { path, reason } => SafeDiagnostic::new(
-            DiagnosticCode::ProjectState,
-            DiagnosticStage::ProjectOpening,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::StateMismatch,
-                reason.safe_fact(),
-            ),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
-        ),
-    }
-}
-
-fn project_directory_diagnostic(
-    source: &ResolveDirectoryError<SystemFileSystemError>,
-) -> SafeDiagnostic {
-    match source {
-        ResolveDirectoryError::NotFound { path } => SafeDiagnostic::new(
-            DiagnosticCode::ProjectState,
-            DiagnosticStage::ProjectOpening,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
-        ),
-        ResolveDirectoryError::NotDirectory { path } => SafeDiagnostic::new(
-            DiagnosticCode::ProjectState,
-            DiagnosticStage::ProjectOpening,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
-        ),
-        ResolveDirectoryError::Io { path, source } => source
-            .safe_diagnostic(
-                DiagnosticStage::ProjectOpening,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            )
-            .with_recovery(crate::diagnostic::RecoveryFact::path(path)),
-    }
-}
-
-fn project_fingerprint_diagnostic(
-    source: &DirectoryTreeFingerprintError<Box<SystemFileSystemError>>,
-) -> SafeDiagnostic {
-    match source {
-        DirectoryTreeFingerprintError::NotFound { path } => SafeDiagnostic::new(
-            DiagnosticCode::ProjectState,
-            DiagnosticStage::ProjectOpening,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
-        ),
-        DirectoryTreeFingerprintError::NotDirectory { path } => SafeDiagnostic::new(
-            DiagnosticCode::ProjectState,
-            DiagnosticStage::ProjectOpening,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
-        ),
-        DirectoryTreeFingerprintError::ChangedDuringObservation { path } => SafeDiagnostic::new(
-            DiagnosticCode::ProjectState,
-            DiagnosticStage::ProjectOpening,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(DiagnosticFailureKind::StateMismatch),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::Retry,
-        ),
-        DirectoryTreeFingerprintError::Failed { path, source } => source
-            .safe_diagnostic_source(
-                DiagnosticStage::ProjectOpening,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            )
-            .with_recovery(crate::diagnostic::RecoveryFact::path(path)),
-    }
-}
-
-fn project_log_outcome<T>(
-    execution: &DrivenCommand<Result<OperationCompletion<T>, ProductionCommandError>>,
-    shutdown: &ShutdownFailures,
-) -> ProjectLogRunOutcome {
-    match execution {
-        // 信号到达但业务完整完成与正常完成同为成功终态。
-        DrivenCommand::Finished(Ok(OperationCompletion::Completed(_)))
-        | DrivenCommand::Interrupted(Ok(OperationCompletion::Completed(_)))
-            if shutdown.is_empty() =>
-        {
-            ProjectLogRunOutcome::Succeeded
-        }
-        DrivenCommand::Finished(Ok(OperationCompletion::Completed(_)))
-        | DrivenCommand::Interrupted(Ok(OperationCompletion::Completed(_))) => {
-            ProjectLogRunOutcome::Failed
-        }
-        DrivenCommand::Finished(Ok(OperationCompletion::Cancelled))
-        | DrivenCommand::Interrupted(Ok(OperationCompletion::Cancelled))
-            if shutdown.is_empty() =>
-        {
-            ProjectLogRunOutcome::Cancelled
-        }
-        DrivenCommand::Finished(Ok(OperationCompletion::Cancelled))
-        | DrivenCommand::Interrupted(Ok(OperationCompletion::Cancelled)) => {
-            ProjectLogRunOutcome::Failed
-        }
-        DrivenCommand::Interrupted(Err(error))
-            if error.was_cancelled_wait() && shutdown.is_empty() =>
-        {
-            ProjectLogRunOutcome::Cancelled
-        }
-        DrivenCommand::Finished(Err(ProductionCommandError::RecoveryRequired(_)))
-        | DrivenCommand::Interrupted(Err(ProductionCommandError::RecoveryRequired(_))) => {
-            ProjectLogRunOutcome::RecoveryRequired
-        }
-        DrivenCommand::Finished(Err(
-            ProductionCommandError::OutcomeUnknown(_)
-            | ProductionCommandError::RunPlanOutcomeUnknown(_),
-        ))
-        | DrivenCommand::Interrupted(Err(
-            ProductionCommandError::OutcomeUnknown(_)
-            | ProductionCommandError::RunPlanOutcomeUnknown(_),
-        )) => ProjectLogRunOutcome::OutcomeUnknown,
-        DrivenCommand::Finished(Err(_)) | DrivenCommand::Interrupted(Err(_)) => {
-            ProjectLogRunOutcome::Failed
-        }
-        DrivenCommand::SignalFailed {
-            result: Err(ProductionCommandError::RecoveryRequired(_)),
-            ..
-        } => ProjectLogRunOutcome::RecoveryRequired,
-        DrivenCommand::SignalFailed {
-            result:
-                Err(
-                    ProductionCommandError::OutcomeUnknown(_)
-                    | ProductionCommandError::RunPlanOutcomeUnknown(_),
-                ),
-            ..
-        } => ProjectLogRunOutcome::OutcomeUnknown,
-        DrivenCommand::SignalFailed { .. } => ProjectLogRunOutcome::Failed,
     }
 }
 
 #[derive(Debug)]
 pub(crate) enum ProductionCommandError {
-    ConfigurationOrInput(Box<FailureReport>),
-    ProjectUnavailable(Box<FailureReport>),
-    ProjectState(Box<FailureReport>),
-    ExternalModel(Box<FailureReport>),
-    ResultAppliedButRunPlanNotSaved(Box<FailureReport>),
-    RunPlanOutcomeUnknown(Box<FailureReport>),
-    StateAppliedButFinalizationFailed(Box<FailureReport>),
-    RecoveryRequired(Box<FailureReport>),
-    OutcomeUnknown(Box<FailureReport>),
-    Internal(Box<FailureReport>),
-    Signal(Box<FailureReport>),
+    ConfigurationOrInput(Box<ReportedFailure>),
+    ProjectUnavailable(Box<ReportedFailure>),
+    ProjectState(Box<ReportedFailure>),
+    ExternalModel(Box<ReportedFailure>),
+    ResultAppliedButRunPlanNotSaved(Box<ReportedFailure>),
+    RunPlanOutcomeUnknown(Box<ReportedFailure>),
+    StateAppliedButFinalizationFailed(Box<ReportedFailure>),
+    RecoveryRequired(Box<ReportedFailure>),
+    OutcomeUnknown(Box<ReportedFailure>),
+    Internal(Box<ReportedFailure>),
+    Signal(Box<ReportedFailure>),
 }
 
 impl ProductionCommandError {
-    fn report(
-        source: impl Error + Send + Sync + 'static,
-        code: DiagnosticCode,
-        stage: DiagnosticStage,
-        subject: DiagnosticSubject,
-        reason: DiagnosticReason,
-        impact: DiagnosticImpact,
-        action: DiagnosticAction,
-    ) -> FailureReport {
-        FailureReport::new(ReportedFailure::new(
-            SafeDiagnostic::new(code, stage, subject, reason, impact, action),
-            source,
-        ))
-    }
-
     fn report_diagnostic(
         source: impl Error + Send + Sync + 'static,
-        diagnostic: SafeDiagnostic,
-    ) -> FailureReport {
-        FailureReport::new(ReportedFailure::new(diagnostic, source))
+        diagnostic: DiagnosticReport,
+    ) -> ReportedFailure {
+        ReportedFailure::new(diagnostic, source)
     }
 
     pub(crate) fn stdout_write(source: io::Error) -> Self {
-        let diagnostic = SafeDiagnostic::io(
-            DiagnosticCode::StateFinalizationFailed,
-            DiagnosticStage::ProcessOutput,
-            DiagnosticSubject::operation("write_stdout"),
-            "write_stdout",
-            &source,
-            DiagnosticImpact::StateAppliedFinalizationFailed,
-            DiagnosticAction::Retry,
+        let report = DiagnosticReport::new(
+            StateEffect::AppliedFinalizationFailed,
+            Diagnostic::runtime(RuntimeIssue::Io {
+                component: RuntimeComponent::Process,
+                operation: RuntimeOperation::WriteStdout,
+                failure: IoFailure::from_error(&source),
+            }),
         );
-        Self::StateAppliedButFinalizationFailed(Box::new(Self::report_diagnostic(
-            source, diagnostic,
-        )))
+        Self::StateAppliedButFinalizationFailed(Box::new(ReportedFailure::new(report, source)))
     }
 
     pub(crate) fn stderr_write(source: io::Error) -> Self {
-        let diagnostic = SafeDiagnostic::io(
-            DiagnosticCode::StateFinalizationFailed,
-            DiagnosticStage::ProcessOutput,
-            DiagnosticSubject::operation("write_stderr"),
-            "write_stderr",
-            &source,
-            DiagnosticImpact::StateAppliedFinalizationFailed,
-            DiagnosticAction::Retry,
+        let report = DiagnosticReport::new(
+            StateEffect::AppliedFinalizationFailed,
+            Diagnostic::runtime(RuntimeIssue::Io {
+                component: RuntimeComponent::Process,
+                operation: RuntimeOperation::WriteStderr,
+                failure: IoFailure::from_error(&source),
+            }),
         );
-        Self::StateAppliedButFinalizationFailed(Box::new(Self::report_diagnostic(
-            source, diagnostic,
-        )))
+        Self::StateAppliedButFinalizationFailed(Box::new(ReportedFailure::new(report, source)))
     }
 
-    fn into_failure_report(self) -> FailureReport {
+    fn into_reported_failure(self) -> ReportedFailure {
         match self {
             Self::ConfigurationOrInput(report)
             | Self::ProjectUnavailable(report)
@@ -7480,19 +6111,17 @@ impl ProductionCommandError {
         }
     }
 
-    fn with_related_finalization_report(self, related: FailureReport) -> Self {
+    fn with_related_finalization_report(self, related: ReportedFailure) -> Self {
         let primary_outcome_unknown = matches!(
             &self,
             Self::OutcomeUnknown(_) | Self::RunPlanOutcomeUnknown(_)
         );
-        let related_outcome_unknown = related
-            .public_diagnostics()
-            .any(|diagnostic| diagnostic.impact == DiagnosticImpact::OutcomeUnknown);
+        let related_outcome_unknown = related.report().effect() == StateEffect::OutcomeUnknown;
         let primary_recovery_required = matches!(&self, Self::RecoveryRequired(_));
-        let related_recovery_required = related
-            .public_diagnostics()
-            .any(|diagnostic| diagnostic.impact == DiagnosticImpact::RecoveryRequired);
-        let report = self.into_failure_report().with_related_report(related);
+        let related_recovery_required = related.report().effect() == StateEffect::RecoveryRequired;
+        let report = self
+            .into_reported_failure()
+            .with_related(RelatedFailureRelation::Finalization, related);
         if primary_outcome_unknown || related_outcome_unknown {
             Self::OutcomeUnknown(Box::new(report))
         } else if primary_recovery_required || related_recovery_required {
@@ -7503,73 +6132,40 @@ impl ProductionCommandError {
     }
 
     fn configuration_load(source: ConfigurationLoadError) -> Self {
-        let diagnostic = source.safe_diagnostic();
-        Self::ConfigurationOrInput(Box::new(Self::report_diagnostic(source, diagnostic)))
+        let report = DiagnosticReport::new(StateEffect::Unchanged, source.diagnostic());
+        Self::ConfigurationOrInput(Box::new(ReportedFailure::new(report, source)))
     }
 
     fn input_directory(source: ResolveDirectoryError<SystemFileSystemError>) -> Self {
-        let diagnostic = match &source {
-            ResolveDirectoryError::NotFound { path } => SafeDiagnostic::new(
-                DiagnosticCode::CommandInput,
-                DiagnosticStage::CommandPreparation,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixInput,
-            ),
-            ResolveDirectoryError::NotDirectory { path } => SafeDiagnostic::new(
-                DiagnosticCode::CommandInput,
-                DiagnosticStage::CommandPreparation,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixInput,
-            ),
-            ResolveDirectoryError::Io { path, source } => source
-                .safe_diagnostic(
-                    DiagnosticStage::CommandPreparation,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckPathAndPermissions,
-                )
-                .with_recovery(crate::diagnostic::RecoveryFact::path(path)),
-        };
+        let diagnostic = source.command_preparation_diagnostic_report();
         Self::ConfigurationOrInput(Box::new(Self::report_diagnostic(source, diagnostic)))
     }
 
     fn run_plan_resolution(source: RunPlanResolutionError) -> Self {
-        let (subject, reason) = match &source {
-            RunPlanResolutionError::InitPathRequired => (
-                DiagnosticSubject::field("--path"),
-                DiagnosticReason::failure(DiagnosticFailureKind::MissingRequiredValue),
-            ),
-            RunPlanResolutionError::NoReusableExtractPlan => (
-                DiagnosticSubject::operation("extract_selection"),
-                DiagnosticReason::failure(DiagnosticFailureKind::ExtractPlanRequired),
-            ),
-            RunPlanResolutionError::ProfileRequired => (
-                DiagnosticSubject::field("PROFILE_ID"),
-                DiagnosticReason::failure(DiagnosticFailureKind::MissingRequiredValue),
-            ),
-            RunPlanResolutionError::SavedProfileUnavailable { profile_id } => (
-                DiagnosticSubject::profile(profile_id),
-                DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
-            ),
+        let problem = match &source {
+            RunPlanResolutionError::InitPathRequired
+            | RunPlanResolutionError::NoReusableExtractPlan
+            | RunPlanResolutionError::ProfileRequired => RpgMakerProjectProblem::RunPlanRequired,
+            RunPlanResolutionError::SavedProfileUnavailable { profile_id } => {
+                RpgMakerProjectProblem::SavedProfileUnavailable {
+                    profile_id: SafeIdentifier::from_validated(profile_id),
+                }
+            }
         };
-        Self::ConfigurationOrInput(Box::new(Self::report(
-            source,
-            DiagnosticCode::CommandRunPlan,
-            DiagnosticStage::CommandPreparation,
-            subject,
-            reason,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixInput,
-        )))
+        let diagnostic = DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::rpg_maker(RpgMakerIssue::project(
+                RpgMakerDiagnosticStage::CommandPreparation,
+                problem,
+            )),
+        );
+        Self::ConfigurationOrInput(Box::new(Self::report_diagnostic(source, diagnostic)))
     }
 
     fn translation_execution_build(source: ProductionTranslationExecutionBuildError) -> Self {
         let class = source.class;
         let diagnostic = source.diagnostic().clone();
-        let report = Box::new(FailureReport::new(ReportedFailure::new(diagnostic, source)));
+        let report = Box::new(ReportedFailure::new(diagnostic, source));
         match class {
             TranslationExecutionBuildFailureClass::ConfigurationOrInput => {
                 Self::ConfigurationOrInput(report)
@@ -7578,68 +6174,40 @@ impl ProductionCommandError {
         }
     }
 
-    fn project_lease<E>(source: ProjectCommandLeaseError<E>) -> Self
-    where
-        E: Error + SafeDiagnosticSource + Send + Sync + 'static,
-    {
-        let diagnostic = match &source {
-            ProjectCommandLeaseError::Unavailable { project, source } => source
-                .safe_diagnostic_source(
-                    DiagnosticStage::ProjectOpening,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::RetryAfterResolvingContention,
-                )
-                .with_recovery(crate::diagnostic::RecoveryFact::component(format!(
-                    "project={project}"
-                ))),
-        };
+    fn project_lease(source: ProjectCommandLeaseError<Box<SystemFileSystemError>>) -> Self {
+        let diagnostic =
+            source.diagnostic_report_at(crate::diagnostic::FileSystemDiagnosticStage::Project);
         Self::ProjectUnavailable(Box::new(Self::report_diagnostic(source, diagnostic)))
     }
 
     fn prevalidated_boundary(
         source: impl Error + Send + Sync + 'static,
         stage: DiagnosticStage,
-        operation: &'static str,
+        operation: RuntimeBoundaryOperation,
     ) -> Self {
-        Self::Internal(Box::new(Self::report(
-            source,
-            DiagnosticCode::InternalOperation,
-            stage,
-            DiagnosticSubject::operation(operation),
-            DiagnosticReason::failure(DiagnosticFailureKind::InternalInvariant),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::ReportBug,
-        )))
+        let report = DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::runtime(RuntimeIssue::InternalInvariant {
+                stage,
+                component: RuntimeComponent::Process,
+                operation,
+            }),
+        );
+        Self::Internal(Box::new(Self::report_diagnostic(source, report)))
     }
 
     fn existing_project_opening(source: ProductionProjectOpeningError) -> Self {
-        let diagnostic = match &source {
-            ExistingProjectOpeningError::ReadProjectRecord(source) => {
-                project_database_read_diagnostic(source)
-            }
-            ExistingProjectOpeningError::ResolveSourceData(source)
-            | ExistingProjectOpeningError::ResolveSourceJs(source) => {
-                project_directory_diagnostic(source)
-            }
-            ExistingProjectOpeningError::FingerprintSource(source) => {
-                project_fingerprint_diagnostic(source)
-            }
-            ExistingProjectOpeningError::SourceSnapshotMismatch {
-                persisted,
-                observed,
-            } => SafeDiagnostic::new(
-                DiagnosticCode::ProjectState,
-                DiagnosticStage::ProjectOpening,
-                DiagnosticSubject::operation("verify_source_snapshot"),
-                DiagnosticReason::failure(DiagnosticFailureKind::StateMismatch),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
+        let diagnostic = source.diagnostic_report();
+        let unavailable = matches!(
+            &source,
+            ExistingProjectOpeningError::ReadProjectRecord(
+                ProjectDatabaseReadError::DatabaseNotFound { .. }
+            ) | ExistingProjectOpeningError::ResolveSourceData(
+                ResolveDirectoryError::NotFound { .. } | ResolveDirectoryError::NotDirectory { .. }
+            ) | ExistingProjectOpeningError::ResolveSourceJs(
+                ResolveDirectoryError::NotFound { .. } | ResolveDirectoryError::NotDirectory { .. }
             )
-            .with_recovery(crate::diagnostic::RecoveryFact::component(format!(
-                "persisted={persisted:?}; observed={observed:?}"
-            ))),
-        };
-        let unavailable = diagnostic.code == DiagnosticCode::ProjectUnavailable;
+        );
         let report = Self::report_diagnostic(source, diagnostic);
         if unavailable {
             Self::ProjectUnavailable(Box::new(report))
@@ -7649,50 +6217,8 @@ impl ProductionCommandError {
     }
 
     fn project_run_plan_read(source: ProjectRunPlanReadError<SqliteRuntimeError>) -> Self {
-        let (diagnostic, unavailable) = match &source {
-            ProjectRunPlanReadError::DatabaseNotFound { path } => (
-                SafeDiagnostic::new(
-                    DiagnosticCode::ProjectUnavailable,
-                    DiagnosticStage::ProjectOpening,
-                    DiagnosticSubject::path(path),
-                    DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckProjectState,
-                ),
-                true,
-            ),
-            ProjectRunPlanReadError::ReadDatabase { path, source } => (
-                source
-                    .safe_diagnostic(
-                        DiagnosticStage::ProjectOpening,
-                        DiagnosticImpact::Unchanged,
-                        DiagnosticAction::CheckProjectState,
-                    )
-                    .with_recovery(crate::diagnostic::RecoveryFact::path(path)),
-                false,
-            ),
-            ProjectRunPlanReadError::InvalidState { path, reason } => {
-                let mut diagnostic = SafeDiagnostic::new(
-                    DiagnosticCode::ProjectState,
-                    DiagnosticStage::ProjectOpening,
-                    DiagnosticSubject::path(path),
-                    DiagnosticReason::failure_with_detail(
-                        DiagnosticFailureKind::StateMismatch,
-                        reason.safe_detail(),
-                    ),
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckProjectState,
-                )
-                .with_recovery(crate::diagnostic::RecoveryFact::component(format!(
-                    "run_plan_subject={}",
-                    reason.safe_subject()
-                )));
-                if let Some(fact) = reason.recovery_fact() {
-                    diagnostic = diagnostic.with_recovery(fact.clone());
-                }
-                (diagnostic, false)
-            }
-        };
+        let unavailable = matches!(source, ProjectRunPlanReadError::DatabaseNotFound { .. });
+        let diagnostic = source.diagnostic_report();
         let report = Self::report_diagnostic(source, diagnostic);
         if unavailable {
             Self::ProjectUnavailable(Box::new(report))
@@ -7702,481 +6228,169 @@ impl ProductionCommandError {
     }
 
     fn file_system_build(source: SystemFileSystemBuildError) -> Self {
-        let diagnostic = source.safe_diagnostic();
-        Self::Internal(Box::new(Self::report_diagnostic(source, diagnostic)))
+        let report = DiagnosticReport::new(StateEffect::Unchanged, source.diagnostic());
+        Self::Internal(Box::new(ReportedFailure::new(report, source)))
     }
 
     fn sqlite_start(source: SqliteRuntimeError) -> Self {
-        let diagnostic = source.safe_diagnostic(
-            DiagnosticStage::ProcessStartup,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::Retry,
-        );
+        let diagnostic = source.startup_diagnostic_report();
         Self::Internal(Box::new(Self::report_diagnostic(source, diagnostic)))
     }
 
     fn http_client_build(source: OpenAiExecutorBuildError) -> Self {
-        let diagnostic = source.safe_diagnostic();
-        let report = Self::report_diagnostic(source, diagnostic);
-        match report.primary.public().action {
-            DiagnosticAction::FixConfiguration => Self::ConfigurationOrInput(Box::new(report)),
-            _ => Self::Internal(Box::new(report)),
+        let configuration = matches!(
+            source,
+            OpenAiExecutorBuildError::InvalidProxy(_)
+                | OpenAiExecutorBuildError::InvalidCertificate(_)
+        );
+        let report = ReportedFailure::new(
+            DiagnosticReport::new(StateEffect::Unchanged, source.diagnostic()),
+            source,
+        );
+        if configuration {
+            Self::ConfigurationOrInput(Box::new(report))
+        } else {
+            Self::Internal(Box::new(report))
         }
     }
 
     fn cpu_start(source: CpuExecutorStartError) -> Self {
-        let diagnostic = match &source {
-            CpuExecutorStartError::AvailableParallelism(error) => SafeDiagnostic::io(
-                DiagnosticCode::InternalOperation,
-                DiagnosticStage::ProcessStartup,
-                DiagnosticSubject::component("Rayon CPU workers"),
-                "detect_available_parallelism",
-                error,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::Retry,
-            ),
-            CpuExecutorStartError::TooManyWorkerThreads { requested, maximum } => {
-                SafeDiagnostic::new(
-                    DiagnosticCode::InternalOperation,
-                    DiagnosticStage::ProcessStartup,
-                    DiagnosticSubject::component("Rayon CPU workers"),
-                    DiagnosticReason::Resource {
-                        resource: "worker_threads".to_owned(),
-                        actual: u64::try_from(*requested).unwrap_or(u64::MAX),
-                        maximum: Some(u64::try_from(*maximum).unwrap_or(u64::MAX)),
-                    },
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::ReportBug,
-                )
-            }
-            CpuExecutorStartError::Build(_) => SafeDiagnostic::new(
-                DiagnosticCode::InternalOperation,
-                DiagnosticStage::ProcessStartup,
-                DiagnosticSubject::component("Rayon CPU pool"),
-                DiagnosticReason::failure(DiagnosticFailureKind::ExternalServiceUnavailable),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::Retry,
-            ),
-        };
-        Self::Internal(Box::new(Self::report_diagnostic(source, diagnostic)))
+        let report = DiagnosticReport::new(StateEffect::Unchanged, source.diagnostic());
+        Self::Internal(Box::new(ReportedFailure::new(report, source)))
     }
 
     fn pem_read(source: ReadFileError<SystemFileSystemError>) -> Self {
-        let diagnostic = match &source {
-            ReadFileError::NotFound { path } => SafeDiagnostic::new(
-                DiagnosticCode::FileSystemOperation,
-                DiagnosticStage::CommandPreparation,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixConfiguration,
-            ),
-            ReadFileError::NotFile { path } => SafeDiagnostic::new(
-                DiagnosticCode::FileSystemOperation,
-                DiagnosticStage::CommandPreparation,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixConfiguration,
-            ),
-            ReadFileError::Io { source, .. } => source.safe_diagnostic(
-                DiagnosticStage::CommandPreparation,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixConfiguration,
-            ),
-        };
+        let diagnostic = source.command_preparation_diagnostic_report();
         Self::ConfigurationOrInput(Box::new(Self::report_diagnostic(source, diagnostic)))
     }
 
     fn lua_script_read(source: ReadFileError<SystemFileSystemError>) -> Self {
-        let diagnostic = match &source {
-            ReadFileError::NotFound { path } => SafeDiagnostic::new(
-                DiagnosticCode::LuaExecution,
-                DiagnosticStage::CommandPreparation,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixInput,
-            ),
-            ReadFileError::NotFile { path } => SafeDiagnostic::new(
-                DiagnosticCode::LuaExecution,
-                DiagnosticStage::CommandPreparation,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixInput,
-            ),
-            ReadFileError::Io { path, source } => source
-                .safe_diagnostic(
-                    DiagnosticStage::CommandPreparation,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckPathAndPermissions,
-                )
-                .with_recovery(RecoveryFact::path(path)),
-        };
+        let diagnostic = source.command_preparation_diagnostic_report();
         Self::ConfigurationOrInput(Box::new(Self::report_diagnostic(source, diagnostic)))
     }
 
     fn project_lua_worker(source: tokio::task::JoinError) -> Self {
-        Self::Internal(Box::new(Self::report(
-            source,
-            DiagnosticCode::LuaExecution,
-            DiagnosticStage::Lua,
-            DiagnosticSubject::component("Lua blocking worker"),
-            DiagnosticReason::failure(DiagnosticFailureKind::WorkerPanicked),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::ReportBug,
-        )))
+        let report = DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::runtime(RuntimeIssue::WorkerPanicked {
+                component: RuntimeComponent::CpuExecutor,
+                operation: RuntimeOperation::ExecuteTask,
+            }),
+        );
+        Self::Internal(Box::new(ReportedFailure::new(report, source)))
     }
 
-    fn project_lua_preflight(source: ProjectLuaFailure) -> Self {
-        let source = ProjectLuaPreflightError(source);
-        let detail = source.to_string();
-        let (code, reason, action, class, subject) = match &source.0 {
-            ProjectLuaFailure::Compile(_) => (
-                DiagnosticCode::LuaExecution,
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::LuaCompilationFailed,
-                    &detail,
-                ),
-                DiagnosticAction::FixInput,
-                2_u8,
-                DiagnosticSubject::component("Lua program"),
-            ),
-            ProjectLuaFailure::Cancelled
-            | ProjectLuaFailure::DatabasePrerequisite(
-                ProjectLuaDatabasePrerequisiteError::Cancelled,
-            ) => (
-                DiagnosticCode::LuaExecution,
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::LockCancelled,
-                    &detail,
-                ),
-                DiagnosticAction::Retry,
-                2,
-                DiagnosticSubject::component("Lua program"),
-            ),
-            ProjectLuaFailure::Context(_) => (
-                DiagnosticCode::LuaExecution,
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::LuaContextCreationFailed,
-                    &detail,
-                ),
-                DiagnosticAction::ReportBug,
-                1,
-                DiagnosticSubject::component("Lua program"),
-            ),
-            ProjectLuaFailure::Script(_) => (
-                DiagnosticCode::LuaExecution,
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::LuaExecutionFailed,
-                    &detail,
-                ),
-                DiagnosticAction::FixInput,
-                2,
-                DiagnosticSubject::component("Lua program"),
-            ),
+    fn project_lua_preflight(source: ProjectLuaFailure, database_path: &Path) -> Self {
+        let class = match &source {
             ProjectLuaFailure::DatabasePrerequisite(
-                ProjectLuaDatabasePrerequisiteError::InvalidProjectState(state),
-            ) => (
-                DiagnosticCode::ProjectState,
-                DiagnosticReason::failure_with_detail(DiagnosticFailureKind::StateMismatch, state),
-                DiagnosticAction::CheckProjectState,
-                0,
-                DiagnosticSubject::operation("validate_project_lua_database"),
-            ),
-            ProjectLuaFailure::DatabasePrerequisite(
-                ProjectLuaDatabasePrerequisiteError::Sqlite(error),
+                ProjectLuaDatabasePrerequisiteError::InvalidProjectState { .. }
+                | ProjectLuaDatabasePrerequisiteError::Sqlite(_),
             )
-            | ProjectLuaFailure::Database(error) => (
-                DiagnosticCode::SqliteOperation,
-                project_lua_sqlite_reason(error, DiagnosticFailureKind::LuaFinalizationFailed),
-                DiagnosticAction::CheckProjectState,
-                0,
-                DiagnosticSubject::operation(error.operation()),
-            ),
-            ProjectLuaFailure::Host {
-                kind: "worker_spawn",
-                operation,
-                ..
-            } => (
-                DiagnosticCode::InternalOperation,
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::WorkerSpawnFailed,
-                    &detail,
-                ),
-                DiagnosticAction::ReportBug,
-                1,
-                DiagnosticSubject::operation(operation),
-            ),
-            ProjectLuaFailure::Host { .. } => (
-                DiagnosticCode::LuaExecution,
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::LuaHostCallFailed,
-                    &detail,
-                ),
-                DiagnosticAction::FixInput,
-                2,
-                DiagnosticSubject::component("Lua program"),
-            ),
-            ProjectLuaFailure::Validation(_) => (
-                DiagnosticCode::LuaExecution,
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::LuaFinalizationFailed,
-                    &detail,
-                ),
-                DiagnosticAction::CheckProjectState,
-                0,
-                DiagnosticSubject::component("Lua program"),
-            ),
-            ProjectLuaFailure::Panicked => (
-                DiagnosticCode::LuaExecution,
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::WorkerPanicked,
-                    &detail,
-                ),
-                DiagnosticAction::ReportBug,
-                1,
-                DiagnosticSubject::component("Lua program"),
-            ),
+            | ProjectLuaFailure::Database(_)
+            | ProjectLuaFailure::Validation { .. } => 0_u8,
+            ProjectLuaFailure::Context(_) | ProjectLuaFailure::Panicked => 1,
+            ProjectLuaFailure::Host(error) if error.is_worker_spawn() => 1,
+            _ => 2,
         };
-        let diagnostic = SafeDiagnostic::new(
-            code,
-            DiagnosticStage::CommandPreparation,
-            subject,
-            reason,
-            DiagnosticImpact::Unchanged,
-            action,
-        );
-        let report = Self::report_diagnostic(source, diagnostic);
+        let report = source.preflight_diagnostic_report(database_path);
+        let reported = ReportedFailure::new(report, ProjectLuaPreflightError(source));
         match class {
-            0 => Self::ProjectState(Box::new(report)),
-            1 => Self::Internal(Box::new(report)),
-            _ => Self::ConfigurationOrInput(Box::new(report)),
+            0 => Self::ProjectState(Box::new(reported)),
+            1 => Self::Internal(Box::new(reported)),
+            _ => Self::ConfigurationOrInput(Box::new(reported)),
         }
     }
 
     fn project_lua_execution(source: ProjectLuaExecutionError) -> Self {
-        let detail = source.to_string();
-        let (code, reason, impact, action, class, subject) = match &source {
-            ProjectLuaExecutionError::Open { path, .. } => (
-                DiagnosticCode::LuaExecution,
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::LuaDatabaseOpenFailed,
-                    &detail,
-                ),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
+        let (class, report) = match &source {
+            ProjectLuaExecutionError::Open { path, source } => (
                 0_u8,
-                DiagnosticSubject::path(path),
-            ),
-            ProjectLuaExecutionError::Run(
-                ProjectLuaRunError::RollbackOutcomeUnknown { .. }
-                | ProjectLuaRunError::CommitOutcomeUnknown(_),
-            ) => (
-                DiagnosticCode::LuaExecution,
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::LuaFinalizationFailed,
-                    &detail,
+                DiagnosticReport::new(
+                    StateEffect::Unchanged,
+                    Diagnostic::sqlite(SqliteIssue::new(
+                        SqliteDiagnosticContext::new(
+                            SqliteDiagnosticStage::Lua,
+                            SqliteOperation::Open,
+                            SqliteTransactionState::NotStarted,
+                        ),
+                        SqliteProblem::Driver {
+                            database: SafePath::new(path),
+                            query_id: None,
+                            query_ordinal: None,
+                            failure: SqliteDriverFailure::from_error(source),
+                        },
+                    )),
                 ),
-                DiagnosticImpact::OutcomeUnknown,
-                DiagnosticAction::PreserveRecoveryArtifacts,
-                1,
-                DiagnosticSubject::operation("project_lua_transaction"),
             ),
-            ProjectLuaExecutionError::Run(
-                ProjectLuaRunError::NotStarted(failure) | ProjectLuaRunError::RolledBack(failure),
-            ) => {
-                let (code, reason, action, class, subject) = match failure {
-                    ProjectLuaFailure::Compile(_) => (
-                        DiagnosticCode::LuaExecution,
-                        DiagnosticReason::failure_with_detail(
-                            DiagnosticFailureKind::LuaCompilationFailed,
-                            &detail,
-                        ),
-                        DiagnosticAction::FixInput,
-                        2,
-                        DiagnosticSubject::operation("project_lua_transaction"),
-                    ),
-                    ProjectLuaFailure::Script(_) => (
-                        DiagnosticCode::LuaExecution,
-                        DiagnosticReason::failure_with_detail(
-                            DiagnosticFailureKind::LuaExecutionFailed,
-                            &detail,
-                        ),
-                        DiagnosticAction::FixInput,
-                        2,
-                        DiagnosticSubject::operation("project_lua_transaction"),
-                    ),
-                    ProjectLuaFailure::DatabasePrerequisite(
-                        ProjectLuaDatabasePrerequisiteError::InvalidProjectState(state),
-                    ) => (
-                        DiagnosticCode::ProjectState,
-                        DiagnosticReason::failure_with_detail(
-                            DiagnosticFailureKind::StateMismatch,
-                            state,
-                        ),
-                        DiagnosticAction::CheckProjectState,
-                        0,
-                        DiagnosticSubject::operation("validate_project_lua_database"),
-                    ),
-                    ProjectLuaFailure::DatabasePrerequisite(
-                        ProjectLuaDatabasePrerequisiteError::Sqlite(error),
-                    )
-                    | ProjectLuaFailure::Database(error) => (
-                        DiagnosticCode::SqliteOperation,
-                        project_lua_sqlite_reason(error, DiagnosticFailureKind::LuaExecutionFailed),
-                        DiagnosticAction::CheckProjectState,
-                        0,
-                        DiagnosticSubject::operation(error.operation()),
-                    ),
-                    ProjectLuaFailure::Host {
-                        kind: "worker_spawn",
-                        operation,
-                        ..
-                    } => (
-                        DiagnosticCode::InternalOperation,
-                        DiagnosticReason::failure_with_detail(
-                            DiagnosticFailureKind::WorkerSpawnFailed,
-                            &detail,
-                        ),
-                        DiagnosticAction::ReportBug,
-                        3,
-                        DiagnosticSubject::operation(operation),
-                    ),
-                    ProjectLuaFailure::Host {
-                        operation: "translation.capture",
-                        ..
-                    } => (
-                        DiagnosticCode::ProjectState,
-                        DiagnosticReason::failure_with_detail(
-                            DiagnosticFailureKind::StateMismatch,
-                            &detail,
-                        ),
-                        DiagnosticAction::CheckProjectState,
-                        0,
-                        DiagnosticSubject::operation("translation.capture"),
-                    ),
-                    ProjectLuaFailure::Host { .. } => (
-                        DiagnosticCode::LuaExecution,
-                        DiagnosticReason::failure_with_detail(
-                            DiagnosticFailureKind::LuaHostCallFailed,
-                            &detail,
-                        ),
-                        DiagnosticAction::FixInput,
-                        2,
-                        DiagnosticSubject::operation("project_lua_transaction"),
-                    ),
-                    ProjectLuaFailure::Validation(_) => (
-                        DiagnosticCode::LuaExecution,
-                        DiagnosticReason::failure_with_detail(
-                            DiagnosticFailureKind::LuaFinalizationFailed,
-                            &detail,
-                        ),
-                        DiagnosticAction::FixInput,
-                        2,
-                        DiagnosticSubject::operation("project_lua_transaction"),
-                    ),
-                    ProjectLuaFailure::Context(_) | ProjectLuaFailure::Panicked => (
-                        DiagnosticCode::LuaExecution,
-                        DiagnosticReason::failure_with_detail(
-                            DiagnosticFailureKind::WorkerPanicked,
-                            &detail,
-                        ),
-                        DiagnosticAction::ReportBug,
-                        3,
-                        DiagnosticSubject::operation("project_lua_transaction"),
-                    ),
-                    ProjectLuaFailure::Cancelled
-                    | ProjectLuaFailure::DatabasePrerequisite(
-                        ProjectLuaDatabasePrerequisiteError::Cancelled,
-                    ) => (
-                        DiagnosticCode::LuaExecution,
-                        DiagnosticReason::failure_with_detail(
-                            DiagnosticFailureKind::LockCancelled,
-                            &detail,
-                        ),
-                        DiagnosticAction::Retry,
-                        0,
-                        DiagnosticSubject::operation("project_lua_transaction"),
-                    ),
+            ProjectLuaExecutionError::Run { path, source } => {
+                let class = match source {
+                    ProjectLuaRunError::RollbackOutcomeUnknown { .. }
+                    | ProjectLuaRunError::CommitOutcomeUnknown(_) => 1,
+                    ProjectLuaRunError::NotStarted(failure)
+                    | ProjectLuaRunError::RolledBack(failure) => match failure {
+                        ProjectLuaFailure::DatabasePrerequisite(
+                            ProjectLuaDatabasePrerequisiteError::InvalidProjectState { .. }
+                            | ProjectLuaDatabasePrerequisiteError::Sqlite(_),
+                        )
+                        | ProjectLuaFailure::Database(_)
+                        | ProjectLuaFailure::Validation { .. }
+                        | ProjectLuaFailure::Cancelled
+                        | ProjectLuaFailure::DatabasePrerequisite(
+                            ProjectLuaDatabasePrerequisiteError::Cancelled,
+                        ) => 0,
+                        ProjectLuaFailure::Context(_) | ProjectLuaFailure::Panicked => 3,
+                        ProjectLuaFailure::Host(error) if error.is_worker_spawn() => 3,
+                        _ => 2,
+                    },
                 };
-                (
-                    code,
-                    reason,
-                    DiagnosticImpact::Unchanged,
-                    action,
-                    class,
-                    subject,
-                )
+                (class, source.diagnostic_report(path))
             }
         };
-        let diagnostic =
-            SafeDiagnostic::new(code, DiagnosticStage::Lua, subject, reason, impact, action);
-        let report = Self::report_diagnostic(source, diagnostic);
+        let reported = ReportedFailure::new(report, source);
         match class {
-            0 => Self::ProjectState(Box::new(report)),
-            1 => Self::OutcomeUnknown(Box::new(report)),
-            2 => Self::ConfigurationOrInput(Box::new(report)),
-            _ => Self::Internal(Box::new(report)),
+            0 => Self::ProjectState(Box::new(reported)),
+            1 => Self::OutcomeUnknown(Box::new(reported)),
+            2 => Self::ConfigurationOrInput(Box::new(reported)),
+            _ => Self::Internal(Box::new(reported)),
         }
     }
 
     fn invalid_run_plan(source: InvalidRunPlanValue) -> Self {
-        let failure = match &source {
-            InvalidRunPlanValue::EmptyPath { .. }
-            | InvalidRunPlanValue::EmptyExtractOwners
-            | InvalidRunPlanValue::EmptyRulesDefinition
-            | InvalidRunPlanValue::EmptyProfileId => DiagnosticFailureKind::MissingRequiredValue,
-            InvalidRunPlanValue::RelativePath { .. }
-            | InvalidRunPlanValue::PathContainsNul { .. }
-            | InvalidRunPlanValue::InvalidWindowsPathEncoding { .. } => {
-                DiagnosticFailureKind::InvalidPath
-            }
-            InvalidRunPlanValue::InvalidRulesCanonicalJson { .. }
-            | InvalidRunPlanValue::RulesCanonicalJsonNotArray
-            | InvalidRunPlanValue::RulesCanonicalJsonEncodingFailed { .. }
-            | InvalidRunPlanValue::InvalidRulesSemantics { .. }
-            | InvalidRunPlanValue::NonCanonicalRulesJson
-            | InvalidRunPlanValue::ProfileIdHasOuterWhitespace => {
-                DiagnosticFailureKind::InvalidValue
-            }
-        };
-        let mut diagnostic = SafeDiagnostic::new(
-            DiagnosticCode::CommandRunPlan,
-            DiagnosticStage::RunPlanFinalization,
-            DiagnosticSubject::field(source.safe_subject()),
-            DiagnosticReason::failure_with_detail(failure, source.safe_detail()),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixInput,
-        );
-        if let Some(fact) = source.recovery_fact() {
-            diagnostic = diagnostic.with_recovery(fact.clone());
-        }
+        let diagnostic = source.diagnostic_report(RpgMakerDiagnosticStage::CommandPreparation);
         Self::ConfigurationOrInput(Box::new(Self::report_diagnostic(source, diagnostic)))
     }
 
     fn signal(source: io::Error, outcome: SignalOutcomeSource) -> Self {
-        let impact = match &outcome {
-            SignalOutcomeSource::CompletedStateApplied => {
-                DiagnosticImpact::StateAppliedFinalizationFailed
-            }
+        let effect = match &outcome {
+            SignalOutcomeSource::CompletedStateApplied => StateEffect::AppliedFinalizationFailed,
             SignalOutcomeSource::Cancelled | SignalOutcomeSource::CommandFailed(_) => {
-                DiagnosticImpact::Unchanged
+                StateEffect::Unchanged
             }
         };
-        let signal = ReportedFailure::new(signal_diagnostic(&source, impact), source);
+        let signal = ReportedFailure::new(
+            DiagnosticReport::new(
+                effect,
+                Diagnostic::runtime(RuntimeIssue::Io {
+                    component: RuntimeComponent::TerminationSignals,
+                    operation: RuntimeOperation::ReceiveTerminationSignal,
+                    failure: IoFailure::from_error(&source),
+                }),
+            ),
+            source,
+        );
         match outcome {
-            SignalOutcomeSource::CommandFailed(command) => {
-                Self::Signal(Box::new(command.into_failure_report().with_related(signal)))
-            }
+            SignalOutcomeSource::CommandFailed(command) => Self::Signal(Box::new(
+                command
+                    .into_reported_failure()
+                    .with_related(RelatedFailureRelation::Shutdown, signal),
+            )),
             SignalOutcomeSource::CompletedStateApplied | SignalOutcomeSource::Cancelled => {
-                Self::Signal(Box::new(FailureReport::new(signal)))
+                Self::Signal(Box::new(signal))
             }
         }
     }
 
-    fn failure_report(&self) -> &FailureReport {
+    pub(crate) fn failure_report(&self) -> &ReportedFailure {
         match self {
             Self::ConfigurationOrInput(report)
             | Self::ProjectUnavailable(report)
@@ -8194,44 +6408,54 @@ impl ProductionCommandError {
 
     fn was_cancelled_wait(&self) -> bool {
         let report = self.failure_report();
-        report.related.is_empty() && report.primary.public().reason.is_wait_cancelled()
+        report.report().related().is_empty()
+            && report.report().primary().issue().summary_code() == "lock_cancelled"
     }
 }
 
 #[cfg(test)]
 mod project_lua_diagnostic_tests {
     use super::*;
+    use crate::project_lua::ProjectLuaSqliteError;
 
-    fn primary(error: &ProductionCommandError) -> &SafeDiagnostic {
-        error.failure_report().primary.public()
+    fn primary(error: &ProductionCommandError) -> &Diagnostic {
+        error.failure_report().report().primary()
     }
 
     #[test]
     fn database_prerequisite_state_is_project_state_in_preflight_and_execution() {
         let failure = ProjectLuaFailure::DatabasePrerequisite(
-            ProjectLuaDatabasePrerequisiteError::InvalidProjectState(
-                "database_component=att_schema; violation=test".to_owned(),
-            ),
+            ProjectLuaDatabasePrerequisiteError::InvalidProjectState {
+                engine: crate::diagnostic::LuaEngine::Generic,
+                violation: crate::diagnostic::LuaValueViolation::StateMismatch,
+            },
         );
+        let database_path = Path::new("project.db");
         let errors = [
-            ProductionCommandError::project_lua_preflight(failure.clone()),
-            ProductionCommandError::project_lua_execution(ProjectLuaExecutionError::Run(
-                ProjectLuaRunError::RolledBack(failure),
-            )),
+            ProductionCommandError::project_lua_preflight(failure.clone(), database_path),
+            ProductionCommandError::project_lua_execution(ProjectLuaExecutionError::Run {
+                path: database_path.to_path_buf(),
+                source: ProjectLuaRunError::RolledBack(failure),
+            }),
         ];
 
         for error in &errors {
             assert!(matches!(error, ProductionCommandError::ProjectState(_)));
             let diagnostic = primary(error);
-            assert_eq!(diagnostic.code, DiagnosticCode::ProjectState);
+            assert_eq!(diagnostic.code(), "lua.database_prerequisite");
             assert_eq!(
-                diagnostic.reason,
-                DiagnosticReason::FailureWithDetail {
-                    failure: DiagnosticFailureKind::StateMismatch,
-                    detail: "database_component=att_schema; violation=test".to_owned(),
-                }
+                diagnostic.resolution(),
+                crate::diagnostic::DiagnosticResolution::CheckProjectState
             );
-            assert_eq!(diagnostic.action, DiagnosticAction::CheckProjectState);
+            let serialized = serde_json::to_value(diagnostic).expect("诊断应可序列化");
+            assert_eq!(
+                serialized["issue"]["details"]["problem"]["engine"],
+                "generic"
+            );
+            assert_eq!(
+                serialized["issue"]["details"]["problem"]["violation"],
+                "state_mismatch"
+            );
         }
     }
 
@@ -8251,30 +6475,29 @@ mod project_lua_diagnostic_tests {
             )
             .expect_err("重复值应产生扩展 SQLite code");
         assert!(source.to_string().contains("sensitive_driver_message"));
-        let sqlite = ProjectLuaSqliteError::new("read_current_att_schema", &source);
+        let sqlite = ProjectLuaSqliteError::new(
+            crate::project_lua::ProjectLuaSqliteOperation::ReadCurrentAttSchema,
+            source,
+        );
         let failure = ProjectLuaFailure::DatabasePrerequisite(
             ProjectLuaDatabasePrerequisiteError::Sqlite(sqlite),
         );
+        let database_path = Path::new("project.db");
         let errors = [
-            ProductionCommandError::project_lua_preflight(failure.clone()),
-            ProductionCommandError::project_lua_execution(ProjectLuaExecutionError::Run(
-                ProjectLuaRunError::RolledBack(failure),
-            )),
+            ProductionCommandError::project_lua_preflight(failure.clone(), database_path),
+            ProductionCommandError::project_lua_execution(ProjectLuaExecutionError::Run {
+                path: database_path.to_path_buf(),
+                source: ProjectLuaRunError::RolledBack(failure),
+            }),
         ];
 
         for error in &errors {
             assert!(matches!(error, ProductionCommandError::ProjectState(_)));
             let diagnostic = primary(error);
-            assert_eq!(diagnostic.code, DiagnosticCode::SqliteOperation);
-            assert_eq!(
-                diagnostic.reason,
-                DiagnosticReason::Sqlite {
-                    primary_code: 19,
-                    extended_code: 2067,
-                }
-            );
-            assert_eq!(diagnostic.action, DiagnosticAction::CheckProjectState);
+            assert_eq!(diagnostic.code(), "sqlite.driver");
             let serialized = serde_json::to_string(diagnostic).expect("公开诊断应可序列化");
+            assert!(serialized.contains("\"primary_code\":19"));
+            assert!(serialized.contains("\"extended_code\":2067"));
             assert!(!serialized.contains("sensitive_driver_message"));
             assert!(!serialized.contains("secret-value"));
         }
@@ -8295,7 +6518,7 @@ impl fmt::Display for ProductionCommandError {
 
 impl Error for ProductionCommandError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(self.failure_report().primary.source_error())
+        Some(self.failure_report().source_error())
     }
 }
 
@@ -8308,41 +6531,39 @@ impl ShutdownFailures {
     fn push(
         &mut self,
         component: &'static str,
-        source: impl Error + SafeDiagnosticSource + Send + Sync + 'static,
+        source: impl Error + Send + Sync + 'static,
+        report: DiagnosticReport,
     ) {
-        let report = source.into_failure_report(
-            DiagnosticStage::Shutdown,
-            DiagnosticImpact::StateAppliedFinalizationFailed,
-            DiagnosticAction::Retry,
-        );
         self.failures.push(ShutdownFailure {
             component,
-            reported: report.primary,
+            reported: ReportedFailure::new(report, source),
         });
-        self.failures
-            .extend(report.related.into_iter().map(|reported| ShutdownFailure {
-                component,
-                reported,
-            }));
     }
 
     #[cfg(test)]
     pub(super) fn push_for_test(
         &mut self,
         component: &'static str,
-        source: impl Error + SafeDiagnosticSource + Send + Sync + 'static,
+        source: impl Error + Send + Sync + 'static,
     ) {
-        self.push(component, source);
+        let report = DiagnosticReport::new(
+            StateEffect::AppliedFinalizationFailed,
+            Diagnostic::runtime(RuntimeIssue::WorkerPanicked {
+                component: RuntimeComponent::Process,
+                operation: RuntimeOperation::Shutdown,
+            }),
+        );
+        self.push(component, source, report);
     }
 
     fn is_empty(&self) -> bool {
         self.failures.is_empty()
     }
 
-    fn public_diagnostics(&self) -> impl Iterator<Item = &SafeDiagnostic> {
+    fn diagnostic_reports(&self) -> impl Iterator<Item = &DiagnosticReport> {
         self.failures
             .iter()
-            .map(|failure| failure.reported.public())
+            .map(|failure| failure.reported.report())
     }
 }
 
@@ -8505,26 +6726,31 @@ impl CommandResultRenderer {
                     stdout,
                     "{}",
                     localizer.format(UiMessage::ResultTranslateSummary {
-                        total: u64::try_from(output.summary.total_tasks).unwrap_or(u64::MAX),
-                        complete: u64::try_from(output.summary.complete_tasks).unwrap_or(u64::MAX),
-                        partial: u64::try_from(output.summary.partial_tasks).unwrap_or(u64::MAX),
-                        unavailable: u64::try_from(output.summary.unavailable_tasks)
-                            .unwrap_or(u64::MAX),
-                        written: u64::try_from(output.summary.written_locations)
-                            .unwrap_or(u64::MAX),
-                        remaining: u64::try_from(output.summary.remaining_locations)
-                            .unwrap_or(u64::MAX),
+                        total: usize_to_u64(output.summary.total_tasks, "任务总数"),
+                        complete: usize_to_u64(output.summary.complete_tasks, "完整任务数"),
+                        partial: usize_to_u64(output.summary.partial_tasks, "部分任务数"),
+                        unavailable: usize_to_u64(
+                            output.summary.unavailable_tasks,
+                            "不可用任务数",
+                        ),
+                        written: usize_to_u64(output.summary.written_locations, "已写位置数"),
+                        remaining: usize_to_u64(
+                            output.summary.remaining_locations,
+                            "剩余位置数",
+                        ),
                     })
                 )?;
                 writeln!(
                     stdout,
                     "{}",
                     localizer.format(UiMessage::ResultTranslateConvergence {
-                        retained: u64::try_from(output.summary.retained).unwrap_or(u64::MAX),
-                        invalidated: u64::try_from(output.summary.invalidated).unwrap_or(u64::MAX),
-                        not_applicable: u64::try_from(output.summary.not_applicable)
-                            .unwrap_or(u64::MAX),
-                        reused: u64::try_from(output.summary.reused).unwrap_or(u64::MAX),
+                        retained: usize_to_u64(output.summary.retained, "保留决策数"),
+                        invalidated: usize_to_u64(output.summary.invalidated, "失效决策数"),
+                        not_applicable: usize_to_u64(
+                            output.summary.not_applicable,
+                            "不适用决策数",
+                        ),
+                        reused: usize_to_u64(output.summary.reused, "复用决策数"),
                     })
                 )?;
                 if output.summary.total_tasks == 0 {
@@ -8564,17 +6790,21 @@ impl CommandResultRenderer {
                     stdout,
                     "{}",
                     localizer.format(UiMessage::ResultWriteBackSummary {
-                        translated: u64::try_from(output.summary.translated_units)
-                            .unwrap_or(u64::MAX),
-                        original: u64::try_from(output.summary.original_units).unwrap_or(u64::MAX),
-                        auto_wrapped: u64::try_from(output.summary.auto_wrapped_units)
-                            .unwrap_or(u64::MAX),
-                        breaks: u64::try_from(output.summary.inserted_line_breaks)
-                            .unwrap_or(u64::MAX),
-                        indents: u64::try_from(output.summary.inserted_fullwidth_indents)
-                            .unwrap_or(u64::MAX),
-                        manual: u64::try_from(output.summary.manual_layout_units)
-                            .unwrap_or(u64::MAX),
+                        translated: usize_to_u64(output.summary.translated_units, "已翻译 Unit 数"),
+                        original: usize_to_u64(output.summary.original_units, "保留原文 Unit 数"),
+                        auto_wrapped: usize_to_u64(
+                            output.summary.auto_wrapped_units,
+                            "自动换行 Unit 数",
+                        ),
+                        breaks: usize_to_u64(output.summary.inserted_line_breaks, "插入换行数"),
+                        indents: usize_to_u64(
+                            output.summary.inserted_fullwidth_indents,
+                            "插入全角缩进数",
+                        ),
+                        manual: usize_to_u64(
+                            output.summary.manual_layout_units,
+                            "人工布局 Unit 数",
+                        ),
                     })
                 )?;
                 if output.summary.manual_layout_units > 0 {
@@ -8582,8 +6812,10 @@ impl CommandResultRenderer {
                         stdout,
                         "{}",
                         localizer.format(UiMessage::NoticeManualLayout {
-                            count: u64::try_from(output.summary.manual_layout_units)
-                                .unwrap_or(u64::MAX),
+                            count: usize_to_u64(
+                                output.summary.manual_layout_units,
+                                "人工布局 Unit 数",
+                            ),
                         })
                     )?;
                 }
@@ -8613,10 +6845,10 @@ impl CommandResultRenderer {
                         stderr,
                         "{}",
                         localizer.format(UiMessage::WarningRulesCommandNonStringSkipped {
-                            rule_number: u64::try_from(warning.rule_number).unwrap_or(u64::MAX),
+                            rule_number: usize_to_u64(warning.rule_number, "规则号"),
                             source_file: &source_file,
                             command_code: &command_code,
-                            parameter: u64::try_from(warning.parameter).unwrap_or(u64::MAX),
+                            parameter: usize_to_u64(warning.parameter, "参数索引"),
                             actual_type: warning.actual_type.as_str(),
                             skipped_count: warning.skipped_count,
                         })
@@ -8660,11 +6892,21 @@ impl CommandResultRenderer {
         stderr: &mut dyn Write,
     ) -> io::Result<()> {
         if let Some(error) = command_error {
-            render_failure_report(error.failure_report(), localizer, stderr)?;
+            writeln!(
+                stderr,
+                "{}",
+                render_diagnostic_report(error.failure_report().report(), localizer)
+            )?;
         }
         if let Some(shutdown) = shutdown_error {
-            let related_offset =
-                command_error.map(|error| error.failure_report().related.len().saturating_add(1));
+            let related_offset = command_error.map(|error| {
+                error
+                    .failure_report()
+                    .report()
+                    .related()
+                    .len()
+                    .saturating_add(1)
+            });
             render_shutdown_failures(shutdown, related_offset, localizer, stderr)?;
         }
         Ok(())
@@ -8685,29 +6927,37 @@ fn render_shutdown_failures(
     localizer: &UiLocalizer,
     stderr: &mut dyn Write,
 ) -> io::Result<()> {
-    let mut diagnostics = failures.public_diagnostics();
+    let mut diagnostics = failures.diagnostic_reports();
     if let Some(offset) = related_offset {
         for (index, diagnostic) in diagnostics.enumerate() {
             writeln!(
                 stderr,
                 "{}",
                 localizer.format(UiMessage::DiagnosticRelated {
-                    index: u64::try_from(offset.saturating_add(index)).unwrap_or(u64::MAX),
+                    index: usize_to_u64(offset.saturating_add(index), "相关诊断序号"),
                 })
             )?;
-            render_safe_diagnostic(diagnostic, localizer, stderr)?;
+            writeln!(
+                stderr,
+                "{}",
+                render_diagnostic_report(diagnostic, localizer)
+            )?;
         }
     } else if let Some(primary) = diagnostics.next() {
-        render_safe_diagnostic(primary, localizer, stderr)?;
+        writeln!(stderr, "{}", render_diagnostic_report(primary, localizer))?;
         for (index, diagnostic) in diagnostics.enumerate() {
             writeln!(
                 stderr,
                 "{}",
                 localizer.format(UiMessage::DiagnosticRelated {
-                    index: u64::try_from(index.saturating_add(1)).unwrap_or(u64::MAX),
+                    index: usize_to_u64(index.saturating_add(1), "相关诊断序号"),
                 })
             )?;
-            render_safe_diagnostic(diagnostic, localizer, stderr)?;
+            writeln!(
+                stderr,
+                "{}",
+                render_diagnostic_report(diagnostic, localizer)
+            )?;
         }
     }
     Ok(())
@@ -8761,24 +7011,23 @@ mod command_result_renderer_tests {
 
     impl Error for TestFailure {}
 
-    fn test_report(impact: DiagnosticImpact) -> FailureReport {
+    fn test_report(effect: StateEffect) -> ReportedFailure {
         ProductionCommandError::report_diagnostic(
             TestFailure,
-            SafeDiagnostic::new(
-                DiagnosticCode::ProjectState,
-                DiagnosticStage::Publication,
-                DiagnosticSubject::operation("test_failure"),
-                DiagnosticReason::failure(DiagnosticFailureKind::FinalizationFailed),
-                impact,
-                DiagnosticAction::PreserveRecoveryArtifacts,
+            DiagnosticReport::new(
+                effect,
+                Diagnostic::runtime(RuntimeIssue::WorkerPanicked {
+                    component: RuntimeComponent::Process,
+                    operation: RuntimeOperation::Shutdown,
+                }),
             ),
         )
     }
 
     #[derive(Debug)]
     struct TestPublishingFailure {
-        override_impact: Option<DiagnosticImpact>,
-        related_impact: Option<DiagnosticImpact>,
+        effect: StateEffect,
+        related_effect: Option<StateEffect>,
     }
 
     impl fmt::Display for TestPublishingFailure {
@@ -8790,38 +7039,76 @@ mod command_result_renderer_tests {
     impl Error for TestPublishingFailure {}
 
     impl WriteBackPublishingDiagnostic for TestPublishingFailure {
-        fn into_write_back_failure_report(
-            self,
-            _stage: DiagnosticStage,
-            impact: DiagnosticImpact,
-        ) -> FailureReport {
-            let report = test_report(self.override_impact.unwrap_or(impact));
-            match self.related_impact {
-                Some(related) => report.with_related_report(test_report(related)),
+        fn into_write_back_failure_report(self) -> ReportedFailure {
+            let Self {
+                effect,
+                related_effect,
+            } = self;
+            let report = ReportedFailure::new(
+                test_report(effect).into_report(),
+                TestPublishingFailure {
+                    effect,
+                    related_effect,
+                },
+            );
+            match related_effect {
+                Some(related) => {
+                    report.with_related(RelatedFailureRelation::Cleanup, test_report(related))
+                }
                 None => report,
             }
         }
     }
 
+    #[derive(Debug)]
+    struct TestPreparationFailure;
+
+    impl fmt::Display for TestPreparationFailure {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("测试写回准备失败")
+        }
+    }
+
+    impl Error for TestPreparationFailure {}
+
+    impl ProductionWriteBackPreparationFailure for TestPreparationFailure {
+        fn into_write_back_preparation_failure(self) -> ReportedFailure {
+            ReportedFailure::new(test_report(StateEffect::Unchanged).into_report(), self)
+        }
+    }
+
+    fn report_tree_contains(
+        report: &DiagnosticReport,
+        predicate: &impl Fn(&DiagnosticReport) -> bool,
+    ) -> bool {
+        predicate(report)
+            || report
+                .related()
+                .iter()
+                .any(|related| report_tree_contains(related.report(), predicate))
+    }
+
     #[test]
     fn recovery_required_is_not_collapsed_into_state_applied_finalization_failure() {
-        let report = test_report(DiagnosticImpact::Unchanged)
-            .with_related_report(test_report(DiagnosticImpact::RecoveryRequired));
+        let report = test_report(StateEffect::Unchanged).with_related(
+            RelatedFailureRelation::Cleanup,
+            test_report(StateEffect::RecoveryRequired),
+        );
         let error = map_project_failure_report(report);
         assert!(matches!(error, ProductionCommandError::RecoveryRequired(_)));
 
-        let execution: DrivenCommand<Result<OperationCompletion<()>, ProductionCommandError>> =
-            DrivenCommand::Finished(Err(error));
         assert_eq!(
-            project_log_outcome(&execution, &ShutdownFailures::default()),
-            ProjectLogRunOutcome::RecoveryRequired
+            error.failure_report().report().effect(),
+            StateEffect::RecoveryRequired
         );
     }
 
     #[test]
     fn outcome_unknown_has_priority_over_recovery_required() {
-        let report = test_report(DiagnosticImpact::RecoveryRequired)
-            .with_related_report(test_report(DiagnosticImpact::OutcomeUnknown));
+        let report = test_report(StateEffect::RecoveryRequired).with_related(
+            RelatedFailureRelation::Finalization,
+            test_report(StateEffect::OutcomeUnknown),
+        );
         assert!(matches!(
             map_project_failure_report(report),
             ProductionCommandError::OutcomeUnknown(_)
@@ -8834,17 +7121,20 @@ mod command_result_renderer_tests {
             (
                 SystemFileSystemError::JournalCorrupt {
                     path: PathBuf::from("C:/project/.directory-publish-test.journal"),
-                    reason: "invalid journal".to_owned(),
+                    violation: crate::diagnostic::FileSystemJournalViolation::CrcMismatch {
+                        frame_index: 1,
+                    },
                 },
-                DiagnosticImpact::RecoveryRequired,
+                StateEffect::RecoveryRequired,
             ),
             (
                 SystemFileSystemError::OutcomeUnknown {
                     target_root: PathBuf::from("C:/project/workspace"),
                     artifacts: vec![PathBuf::from("C:/project/.directory-publish-test.journal")],
-                    reason: "unknown exchange state".to_owned(),
+                    violation:
+                        crate::diagnostic::FileSystemRecoveryViolation::TargetIdentityUnknown,
                 },
-                DiagnosticImpact::OutcomeUnknown,
+                StateEffect::OutcomeUnknown,
             ),
         ] {
             let mapped = map_init_error(InitServiceError::Workspace(
@@ -8854,14 +7144,14 @@ mod command_result_renderer_tests {
                     cleanup_failure: None,
                 }),
             ));
-            assert_eq!(mapped.failure_report().primary.public().impact, expected);
+            assert_eq!(mapped.failure_report().report().effect(), expected);
             assert!(matches!(
                 (expected, mapped),
                 (
-                    DiagnosticImpact::RecoveryRequired,
+                    StateEffect::RecoveryRequired,
                     ProductionCommandError::RecoveryRequired(_)
                 ) | (
-                    DiagnosticImpact::OutcomeUnknown,
+                    StateEffect::OutcomeUnknown,
                     ProductionCommandError::OutcomeUnknown(_)
                 )
             ));
@@ -8874,17 +7164,20 @@ mod command_result_renderer_tests {
             (
                 SystemFileSystemError::JournalCorrupt {
                     path: PathBuf::from("C:/project/.directory-publish-test.journal"),
-                    reason: "invalid journal".to_owned(),
+                    violation: crate::diagnostic::FileSystemJournalViolation::CrcMismatch {
+                        frame_index: 1,
+                    },
                 },
-                DiagnosticImpact::RecoveryRequired,
+                StateEffect::RecoveryRequired,
             ),
             (
                 SystemFileSystemError::OutcomeUnknown {
                     target_root: PathBuf::from("C:/project/workspace"),
                     artifacts: vec![PathBuf::from("C:/project/.directory-publish-test.journal")],
-                    reason: "unknown exchange state".to_owned(),
+                    violation:
+                        crate::diagnostic::FileSystemRecoveryViolation::TargetIdentityUnknown,
                 },
-                DiagnosticImpact::OutcomeUnknown,
+                StateEffect::OutcomeUnknown,
             ),
         ] {
             let workspace_error: ProductionWorkspaceConvergenceError =
@@ -8893,14 +7186,14 @@ mod command_result_renderer_tests {
                     Box::new(source),
                 ));
             let mapped = map_init_error(InitServiceError::Workspace(workspace_error));
-            assert_eq!(mapped.failure_report().primary.public().impact, expected);
+            assert_eq!(mapped.failure_report().report().effect(), expected);
             assert!(matches!(
                 (expected, mapped),
                 (
-                    DiagnosticImpact::RecoveryRequired,
+                    StateEffect::RecoveryRequired,
                     ProductionCommandError::RecoveryRequired(_)
                 ) | (
-                    DiagnosticImpact::OutcomeUnknown,
+                    StateEffect::OutcomeUnknown,
                     ProductionCommandError::OutcomeUnknown(_)
                 )
             ));
@@ -8911,14 +7204,14 @@ mod command_result_renderer_tests {
     fn write_back_preparation_and_discard_preserve_strongest_impact() {
         type Error = WriteBackServiceError<
             SystemFileSystemError,
-            SystemFileSystemError,
+            TestPreparationFailure,
             TestPublishingFailure,
             SystemFileSystemError,
         >;
 
         let prepared = map_write_back_error(Error::PrepareCandidate(TestPublishingFailure {
-            override_impact: Some(DiagnosticImpact::OutcomeUnknown),
-            related_impact: None,
+            effect: StateEffect::OutcomeUnknown,
+            related_effect: None,
         }));
         assert!(matches!(
             prepared,
@@ -8928,12 +7221,12 @@ mod command_result_renderer_tests {
         let discarded = map_write_back_error(Error::ValidateCandidateAndDiscard {
             candidate_root: PathBuf::from("C:/project/candidate"),
             source: TestPublishingFailure {
-                override_impact: None,
-                related_impact: None,
+                effect: StateEffect::Unchanged,
+                related_effect: None,
             },
             discard: TestPublishingFailure {
-                override_impact: None,
-                related_impact: None,
+                effect: StateEffect::RecoveryRequired,
+                related_effect: None,
             },
         });
         assert!(matches!(
@@ -8947,8 +7240,8 @@ mod command_result_renderer_tests {
                 residual_paths: vec![PathBuf::from("C:/project/.write-back-residual")],
             },
             source: TestPublishingFailure {
-                override_impact: None,
-                related_impact: Some(DiagnosticImpact::RecoveryRequired),
+                effect: StateEffect::Unchanged,
+                related_effect: Some(StateEffect::RecoveryRequired),
             },
         });
         assert!(matches!(
@@ -8962,12 +7255,7 @@ mod command_result_renderer_tests {
         let ProductionCommandError::RecoveryRequired(report) = mapped else {
             panic!("Init 清理失败必须映射为 RecoveryRequired");
         };
-        let diagnostics = report.public_diagnostics().collect::<Vec<_>>();
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.impact == DiagnosticImpact::RecoveryRequired)
-        );
+        assert_eq!(report.report().effect(), StateEffect::RecoveryRequired);
     }
 
     #[test]
@@ -9009,9 +7297,9 @@ mod command_result_renderer_tests {
         let ProductionCommandError::RecoveryRequired(report) = mapped else {
             panic!("Init 发布清理失败必须映射为 RecoveryRequired");
         };
-        assert!(report.public_diagnostics().any(|diagnostic| {
-            diagnostic.stage == DiagnosticStage::Publication
-                && diagnostic.impact == DiagnosticImpact::RecoveryRequired
+        assert!(report_tree_contains(report.report(), &|diagnostic| {
+            diagnostic.primary().stage() == DiagnosticStage::Publication
+                && diagnostic.effect() == StateEffect::RecoveryRequired
         }));
     }
 
@@ -9059,65 +7347,6 @@ mod command_result_renderer_tests {
         assert!(stderr.contains("data/Map007.json"), "{stderr}");
         assert!(stderr.contains("dialogue_body"), "{stderr}");
         assert!(stderr.contains("28"), "{stderr}");
-    }
-
-    #[test]
-    fn write_back_output_is_connected_to_the_same_run_project_log() {
-        let temporary = tempfile::tempdir().expect("临时日志目录应可建立");
-        let run_id = "550e8400-e29b-41d4-a716-446655440097";
-        let runtime = start_project_log(temporary.path().to_path_buf(), run_id.to_owned());
-        let log_path = runtime.path().expect("项目日志应有路径").to_path_buf();
-        let logger = runtime.logger();
-        let context = ProjectLogContext::new("zh-Hans")
-            .with_engine("mz")
-            .with_project("manual-layout")
-            .with_command("write-back");
-        logger.set_context(context.clone());
-        let active = ActiveProjectLog {
-            run_id: Some(run_id.to_owned()),
-            runtime,
-            logger,
-            context,
-            performance: Arc::new(RunPerformanceCounters::default()),
-        };
-        let output = WriteBackOutput::for_test(
-            "manual-layout"
-                .parse::<ProjectName>()
-                .expect("项目名应有效"),
-            PathBuf::from("C:/project/write_back"),
-            RpgMakerWriteBackSummary {
-                manual_layout_units: 1,
-                ..RpgMakerWriteBackSummary::default()
-            },
-            vec![ManualLayoutDiagnostic::for_test(
-                vec![LogicalTextLocation::new(
-                    RpgMakerLocation::value(
-                        RpgMakerSource::map(7),
-                        vec![RpgMakerLocationStep::key("events")],
-                    ),
-                    TextUnitRole::DialogueBody,
-                )],
-                RpgMakerWriteBackLayoutRegion::DialogueBody,
-                MaxFullwidthChars::new(28).expect("宽度应有效"),
-            )],
-        );
-        let execution = DrivenCommand::Finished(Ok(OperationCompletion::Completed(output)));
-
-        emit_write_back_manual_layout_diagnostics(&execution, &active);
-        assert!(finish_project_log(active, ProjectLogRunOutcome::Succeeded, Vec::new()).is_none());
-
-        let records = std::fs::read_to_string(log_path).expect("项目日志应可读取");
-        let diagnostic = records
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("日志行应有效"))
-            .find(|record| record["code"] == "write_back.manual_layout_required")
-            .expect("WriteBackOutput 的人工布局诊断必须接入项目日志");
-        assert_eq!(diagnostic["run_id"], run_id);
-        assert_eq!(
-            diagnostic["payload"]["locations"][0]["role"],
-            "dialogue_body"
-        );
-        assert_eq!(diagnostic["payload"]["max_fullwidth_chars"], 28);
     }
 }
 

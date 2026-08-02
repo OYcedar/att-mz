@@ -24,9 +24,10 @@ use rusqlite::{Connection, ErrorCode, OpenFlags, Statement, params_from_iter};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 use crate::diagnostic::{
-    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
-    DiagnosticStage, DiagnosticSubject, FailureReport, RecoveryFact, ReportedFailure,
-    SafeDiagnostic, SafeDiagnosticSource,
+    Diagnostic, DiagnosticReport, IoFailure, RelatedFailureRelation, RuntimeComponent,
+    RuntimeIssue, RuntimeOperation, SafeIdentifier, SafePath, SqliteDiagnosticContext,
+    SqliteDiagnosticStage, SqliteDriverFailure, SqliteDriverKind, SqliteIssue, SqliteOperation,
+    SqliteProblem, SqliteTransactionState, StateEffect,
 };
 use crate::runtime::performance::{
     RunPerformanceCounters, SqliteTransactionControl, SqliteTransactionScope,
@@ -357,6 +358,320 @@ pub(crate) enum SqliteRuntimeError {
 }
 
 impl SqliteRuntimeError {
+    /// SQLite 生产根建立阶段尚不存在项目数据库路径时使用的完整诊断。
+    pub(crate) fn startup_diagnostic_report(&self) -> DiagnosticReport {
+        self.startup_diagnostic_report_with_query(None, None)
+    }
+
+    fn startup_diagnostic_report_with_query(
+        &self,
+        query_id: Option<SafeIdentifier>,
+        query_ordinal: Option<usize>,
+    ) -> DiagnosticReport {
+        let runtime =
+            |issue| DiagnosticReport::new(StateEffect::Unchanged, Diagnostic::runtime(issue));
+        let sqlite = |problem| {
+            DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::sqlite(SqliteIssue::new(
+                    SqliteDiagnosticContext::new(
+                        SqliteDiagnosticStage::ProcessStartup,
+                        SqliteOperation::Open,
+                        SqliteTransactionState::NotStarted,
+                    ),
+                    problem,
+                )),
+            )
+        };
+        match self {
+            Self::Closed => runtime(RuntimeIssue::ExecutorClosed {
+                component: RuntimeComponent::SqliteExecutor,
+                operation: RuntimeOperation::StartWorker,
+            }),
+            Self::AvailableParallelism { source } => runtime(RuntimeIssue::Io {
+                component: RuntimeComponent::SqliteExecutor,
+                operation: RuntimeOperation::DetectAvailableParallelism,
+                failure: IoFailure::from_error(source),
+            }),
+            Self::Cancelled { .. } => runtime(RuntimeIssue::Cancelled {
+                component: RuntimeComponent::SqliteExecutor,
+                operation: RuntimeOperation::StartWorker,
+            }),
+            Self::InteractiveSessionAlreadyOpen => {
+                sqlite(SqliteProblem::RootInteractiveSessionAlreadyOpen)
+            }
+            Self::WorkerSpawn { source, .. } => runtime(RuntimeIssue::Io {
+                component: RuntimeComponent::SqliteExecutor,
+                operation: RuntimeOperation::StartWorker,
+                failure: IoFailure::from_error(source),
+            }),
+            Self::WorkerPanicked(_) => runtime(RuntimeIssue::WorkerPanicked {
+                component: RuntimeComponent::SqliteExecutor,
+                operation: RuntimeOperation::StartWorker,
+            }),
+            Self::Io { path, .. }
+            | Self::WindowsFileSystem { path, .. }
+            | Self::InvalidTarget { path }
+            | Self::UnexpectedArtifact { path } => self.diagnostic_report(
+                path,
+                SqliteDiagnosticContext::new(
+                    SqliteDiagnosticStage::ProcessStartup,
+                    SqliteOperation::Open,
+                    SqliteTransactionState::NotStarted,
+                ),
+                StateEffect::Unchanged,
+            ),
+            Self::Driver { source, .. } => sqlite(SqliteProblem::RootDriver {
+                query_id,
+                query_ordinal,
+                failure: sqlite_driver_failure(source),
+            }),
+            Self::QueryContext {
+                query_id: id,
+                ordinal,
+                source,
+            } => source
+                .startup_diagnostic_report_with_query(SafeIdentifier::new(id).ok(), Some(*ordinal)),
+            Self::InvalidValue(_) => sqlite(SqliteProblem::RootInvalidValue),
+            Self::Internal(_) => sqlite(SqliteProblem::RootInternalInvariant),
+            Self::BackupIncomplete(_) => sqlite(SqliteProblem::RootBackupIncomplete),
+            Self::Cleanup { primary, failures } => {
+                let mut report =
+                    primary.startup_diagnostic_report_with_query(query_id.clone(), query_ordinal);
+                for failure in failures {
+                    report = report.with_related(
+                        RelatedFailureRelation::Cleanup,
+                        failure
+                            .startup_diagnostic_report_with_query(query_id.clone(), query_ordinal),
+                    );
+                }
+                report
+            }
+        }
+    }
+
+    /// SQLite 根关闭失败时建立固定 Shutdown 诊断，不要求项目数据库路径。
+    pub(crate) fn shutdown_diagnostic_report(&self) -> DiagnosticReport {
+        self.shutdown_diagnostic_report_with_query(None, None)
+    }
+
+    fn shutdown_diagnostic_report_with_query(
+        &self,
+        query_id: Option<SafeIdentifier>,
+        query_ordinal: Option<usize>,
+    ) -> DiagnosticReport {
+        let effect = if matches!(self, Self::Internal(_)) {
+            StateEffect::OutcomeUnknown
+        } else {
+            StateEffect::AppliedFinalizationFailed
+        };
+        let runtime = |issue| DiagnosticReport::new(effect, Diagnostic::runtime(issue));
+        let sqlite = |problem| {
+            DiagnosticReport::new(
+                effect,
+                Diagnostic::sqlite(SqliteIssue::new(
+                    SqliteDiagnosticContext::new(
+                        SqliteDiagnosticStage::Shutdown,
+                        SqliteOperation::Shutdown,
+                        if effect == StateEffect::OutcomeUnknown {
+                            SqliteTransactionState::OutcomeUnknown
+                        } else {
+                            SqliteTransactionState::FinalizationFailed
+                        },
+                    ),
+                    problem,
+                )),
+            )
+        };
+        match self {
+            Self::Closed => runtime(RuntimeIssue::ExecutorClosed {
+                component: RuntimeComponent::SqliteExecutor,
+                operation: RuntimeOperation::Shutdown,
+            }),
+            Self::AvailableParallelism { source } | Self::WorkerSpawn { source, .. } => {
+                runtime(RuntimeIssue::Io {
+                    component: RuntimeComponent::SqliteExecutor,
+                    operation: RuntimeOperation::Shutdown,
+                    failure: IoFailure::from_error(source),
+                })
+            }
+            Self::Cancelled { .. } => runtime(RuntimeIssue::Cancelled {
+                component: RuntimeComponent::SqliteExecutor,
+                operation: RuntimeOperation::Shutdown,
+            }),
+            Self::WorkerPanicked(_) => runtime(RuntimeIssue::WorkerPanicked {
+                component: RuntimeComponent::SqliteExecutor,
+                operation: RuntimeOperation::Shutdown,
+            }),
+            Self::InteractiveSessionAlreadyOpen => {
+                sqlite(SqliteProblem::RootInteractiveSessionAlreadyOpen)
+            }
+            Self::Io { path, .. }
+            | Self::WindowsFileSystem { path, .. }
+            | Self::InvalidTarget { path }
+            | Self::UnexpectedArtifact { path } => self.diagnostic_report(
+                path,
+                SqliteDiagnosticContext::new(
+                    SqliteDiagnosticStage::Shutdown,
+                    SqliteOperation::Shutdown,
+                    if effect == StateEffect::OutcomeUnknown {
+                        SqliteTransactionState::OutcomeUnknown
+                    } else {
+                        SqliteTransactionState::FinalizationFailed
+                    },
+                ),
+                effect,
+            ),
+            Self::Driver { source, .. } => sqlite(SqliteProblem::RootDriver {
+                query_id,
+                query_ordinal,
+                failure: sqlite_driver_failure(source),
+            }),
+            Self::QueryContext {
+                query_id: id,
+                ordinal,
+                source,
+            } => source.shutdown_diagnostic_report_with_query(
+                SafeIdentifier::new(id).ok(),
+                Some(*ordinal),
+            ),
+            Self::InvalidValue(_) => sqlite(SqliteProblem::RootInvalidValue),
+            Self::Internal(_) => sqlite(SqliteProblem::RootInternalInvariant),
+            Self::BackupIncomplete(_) => sqlite(SqliteProblem::RootBackupIncomplete),
+            Self::Cleanup { primary, failures } => {
+                let mut report =
+                    primary.shutdown_diagnostic_report_with_query(query_id.clone(), query_ordinal);
+                for failure in failures {
+                    report = report.with_related(
+                        RelatedFailureRelation::Cleanup,
+                        failure
+                            .shutdown_diagnostic_report_with_query(query_id.clone(), query_ordinal),
+                    );
+                }
+                report
+            }
+        }
+    }
+
+    /// SQLite 根在仍持有 rusqlite 闭集变体、数值代码和查询位置时建立报告。
+    pub(crate) fn diagnostic_report(
+        &self,
+        database: &Path,
+        context: SqliteDiagnosticContext,
+        effect: StateEffect,
+    ) -> DiagnosticReport {
+        self.diagnostic_report_with_query(database, context, effect, None, None)
+    }
+
+    /// 调用方仍持有领域查询标识时，将它作为结构化位置附加到 SQLite 根报告。
+    /// 无效的外部标识不会作为字符串协议进入公开诊断。
+    pub(crate) fn diagnostic_report_for_query(
+        &self,
+        database: &Path,
+        context: SqliteDiagnosticContext,
+        effect: StateEffect,
+        query_id: &str,
+        query_ordinal: Option<usize>,
+    ) -> DiagnosticReport {
+        self.diagnostic_report_with_query(
+            database,
+            context,
+            effect,
+            SafeIdentifier::new(query_id).ok(),
+            query_ordinal,
+        )
+    }
+
+    fn diagnostic_report_with_query(
+        &self,
+        database: &Path,
+        context: SqliteDiagnosticContext,
+        effect: StateEffect,
+        query_id: Option<SafeIdentifier>,
+        query_ordinal: Option<usize>,
+    ) -> DiagnosticReport {
+        let database = SafePath::new(database);
+        let report = |problem| {
+            DiagnosticReport::new(
+                effect,
+                Diagnostic::sqlite(SqliteIssue::new(context, problem)),
+            )
+        };
+        match self {
+            Self::Closed => report(SqliteProblem::ExecutorClosed { database }),
+            Self::AvailableParallelism { source } => report(SqliteProblem::Io {
+                database,
+                failure: IoFailure::from_error(source),
+            }),
+            Self::Cancelled { .. } => report(SqliteProblem::Cancelled { database }),
+            Self::InteractiveSessionAlreadyOpen => {
+                report(SqliteProblem::InteractiveSessionAlreadyOpen { database })
+            }
+            Self::WorkerSpawn { source, .. } => report(SqliteProblem::WorkerStart {
+                database,
+                failure: IoFailure::from_error(source),
+            }),
+            Self::WorkerPanicked(_) => report(SqliteProblem::WorkerPanicked { database }),
+            Self::Io { source, .. } => report(SqliteProblem::Io {
+                database,
+                failure: IoFailure::from_error(source),
+            }),
+            Self::WindowsFileSystem { source, .. } => match source {
+                WindowsFsError::Io { source, .. } => report(SqliteProblem::Io {
+                    database,
+                    failure: IoFailure::from_error(source),
+                }),
+                _ => report(SqliteProblem::InvalidTarget { database }),
+            },
+            Self::Driver { source, .. } => report(SqliteProblem::Driver {
+                database,
+                query_id,
+                query_ordinal,
+                failure: sqlite_driver_failure(source),
+            }),
+            Self::QueryContext {
+                query_id: id,
+                ordinal,
+                source,
+            } => source.diagnostic_report_with_query(
+                Path::new(database.as_str()),
+                context,
+                effect,
+                SafeIdentifier::new(id).ok(),
+                Some(*ordinal),
+            ),
+            Self::InvalidTarget { .. } => report(SqliteProblem::InvalidTarget { database }),
+            Self::UnexpectedArtifact { .. } => {
+                report(SqliteProblem::UnexpectedArtifact { database })
+            }
+            Self::InvalidValue(_) => report(SqliteProblem::InvalidValue { database }),
+            Self::Internal(_) => report(SqliteProblem::InternalInvariant { database }),
+            Self::BackupIncomplete(_) => report(SqliteProblem::BackupIncomplete { database }),
+            Self::Cleanup { primary, failures } => {
+                let mut result = primary.diagnostic_report_with_query(
+                    Path::new(database.as_str()),
+                    context,
+                    effect,
+                    query_id.clone(),
+                    query_ordinal,
+                );
+                for failure in failures {
+                    result = result.with_related(
+                        RelatedFailureRelation::Cleanup,
+                        failure.diagnostic_report_with_query(
+                            Path::new(database.as_str()),
+                            context.with_operation(SqliteOperation::Cleanup),
+                            effect,
+                            query_id.clone(),
+                            query_ordinal,
+                        ),
+                    );
+                }
+                result
+            }
+        }
+    }
+
     fn driver(operation: &'static str, source: rusqlite::Error) -> Self {
         if sqlite_busy_wait_cancelled()
             && matches!(
@@ -390,71 +705,6 @@ impl SqliteRuntimeError {
             query_id: query.id().to_owned(),
             ordinal,
             source: Box::new(source),
-        }
-    }
-}
-
-impl SafeDiagnosticSource for SqliteRuntimeError {
-    fn safe_diagnostic_source(
-        &self,
-        stage: DiagnosticStage,
-        impact: DiagnosticImpact,
-        fallback_action: DiagnosticAction,
-    ) -> SafeDiagnostic {
-        self.safe_diagnostic(stage, impact, fallback_action)
-    }
-
-    fn into_failure_report(
-        self,
-        stage: DiagnosticStage,
-        impact: DiagnosticImpact,
-        fallback_action: DiagnosticAction,
-    ) -> FailureReport {
-        match self {
-            Self::Cleanup { primary, failures } => {
-                // Cleanup 只聚合多个具体原因；事务是否回滚、结果未知或状态已生效由仍持有
-                // 终态的外层错误决定，不能在 SQLite 根里一律改写成 RecoveryRequired。
-                let failure_count = failures.len();
-                let mut report = (*primary)
-                    .into_failure_report(stage, impact, fallback_action)
-                    .with_primary_recovery(RecoveryFact::component(format!(
-                        "sqlite_cleanup_failures={failure_count}"
-                    )));
-                for failure in failures {
-                    report = report.with_related_report(failure.into_failure_report(
-                        stage,
-                        impact,
-                        fallback_action,
-                    ));
-                }
-                report
-            }
-            Self::QueryContext {
-                query_id,
-                ordinal,
-                source,
-            } => {
-                let public = source
-                    .safe_diagnostic(stage, impact, fallback_action)
-                    .with_recovery(RecoveryFact::component(format!(
-                        "sqlite_query_id={query_id}"
-                    )))
-                    .with_recovery(RecoveryFact::component(format!(
-                        "sqlite_query_ordinal={ordinal}"
-                    )));
-                FailureReport::new(ReportedFailure::new(
-                    public,
-                    Self::QueryContext {
-                        query_id,
-                        ordinal,
-                        source,
-                    },
-                ))
-            }
-            source => {
-                let public = source.safe_diagnostic(stage, impact, fallback_action);
-                FailureReport::new(ReportedFailure::new(public, source))
-            }
         }
     }
 }
@@ -554,234 +804,184 @@ impl Error for SqliteRuntimeError {
     }
 }
 
-impl SqliteRuntimeError {
-    /// 在 rusqlite/IO 类型仍然存在时提取稳定代码；SQL、参数和值正文不会进入投影。
-    pub(crate) fn safe_diagnostic(
-        &self,
-        stage: DiagnosticStage,
-        impact: DiagnosticImpact,
-        fallback_action: DiagnosticAction,
-    ) -> SafeDiagnostic {
-        match self {
-            Self::Closed => sqlite_failure(
-                stage,
-                "storage",
-                DiagnosticFailureKind::ExecutorClosed,
-                impact,
-                DiagnosticAction::Retry,
+fn sqlite_driver_failure(source: &rusqlite::Error) -> SqliteDriverFailure {
+    let (kind, column_index, column_name, parameter_actual, parameter_expected, changed_rows) =
+        match source {
+            rusqlite::Error::SqliteFailure(_, _) => (
+                SqliteDriverKind::SqliteFailure,
+                None,
+                None,
+                None,
+                None,
+                None,
             ),
-            Self::AvailableParallelism { source } => SafeDiagnostic::io(
-                DiagnosticCode::SqliteOperation,
-                stage,
-                DiagnosticSubject::component("SQLite short workers"),
-                "detect_available_parallelism",
-                source,
-                impact,
-                DiagnosticAction::Retry,
+            rusqlite::Error::SqliteSingleThreadedMode => (
+                SqliteDriverKind::SingleThreadedMode,
+                None,
+                None,
+                None,
+                None,
+                None,
             ),
-            Self::Cancelled { operation } => sqlite_failure(
-                stage,
-                operation,
-                DiagnosticFailureKind::LockCancelled,
-                impact,
-                DiagnosticAction::Retry,
+            rusqlite::Error::FromSqlConversionFailure(index, _, _) => (
+                SqliteDriverKind::ColumnConversion,
+                Some(*index),
+                None,
+                None,
+                None,
+                None,
             ),
-            Self::InteractiveSessionAlreadyOpen => sqlite_failure(
-                stage,
-                "interactive_session",
-                DiagnosticFailureKind::InteractiveSessionAlreadyOpen,
-                impact,
-                DiagnosticAction::RetryAfterResolvingContention,
+            rusqlite::Error::IntegralValueOutOfRange(index, _) => (
+                SqliteDriverKind::IntegralOutOfRange,
+                Some(*index),
+                None,
+                None,
+                None,
+                None,
             ),
-            Self::WorkerSpawn { worker, source } => SafeDiagnostic::io(
-                DiagnosticCode::SqliteOperation,
-                stage,
-                DiagnosticSubject::component(format!("SQLite worker {worker}")),
-                "spawn_worker",
-                source,
-                impact,
-                DiagnosticAction::Retry,
+            rusqlite::Error::Utf8Error(index, _) => (
+                SqliteDriverKind::InvalidUtf8,
+                Some(*index),
+                None,
+                None,
+                None,
+                None,
             ),
-            Self::WorkerPanicked(worker) => sqlite_failure(
-                stage,
-                worker,
-                DiagnosticFailureKind::WorkerPanicked,
-                impact,
-                DiagnosticAction::ReportBug,
-            ),
-            Self::Io {
-                operation,
-                path,
-                source,
-            } => SafeDiagnostic::io(
-                DiagnosticCode::SqliteOperation,
-                stage,
-                DiagnosticSubject::path(path),
-                operation,
-                source,
-                impact,
-                DiagnosticAction::CheckPathAndPermissions,
-            ),
-            Self::WindowsFileSystem {
-                operation, source, ..
-            } => source
-                .safe_diagnostic(
-                    DiagnosticCode::SqliteOperation,
-                    stage,
-                    impact,
-                    fallback_action,
-                )
-                .with_recovery(RecoveryFact::component(format!(
-                    "sqlite_operation={operation}"
-                ))),
-            Self::Driver { operation, source } => SafeDiagnostic::new(
-                DiagnosticCode::SqliteOperation,
-                stage,
-                DiagnosticSubject::operation(operation),
-                sqlite_driver_reason(source),
-                impact,
-                fallback_action,
-            )
-            .with_recovery(sqlite_driver_recovery(source)),
-            Self::QueryContext {
-                query_id,
-                ordinal,
-                source,
-            } => source
-                .safe_diagnostic(stage, impact, fallback_action)
-                .with_recovery(RecoveryFact::component(format!(
-                    "sqlite_query_id={query_id}"
-                )))
-                .with_recovery(RecoveryFact::component(format!(
-                    "sqlite_query_ordinal={ordinal}"
-                ))),
-            Self::InvalidTarget { path } => SafeDiagnostic::new(
-                DiagnosticCode::SqliteOperation,
-                stage,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
-                impact,
-                fallback_action,
-            ),
-            Self::UnexpectedArtifact { path } => SafeDiagnostic::new(
-                DiagnosticCode::SqliteOperation,
-                stage,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure(DiagnosticFailureKind::UnexpectedArtifact),
-                impact,
-                DiagnosticAction::CheckProjectState,
-            ),
-            Self::InvalidValue(_) => sqlite_failure(
-                stage,
-                "input_value",
-                DiagnosticFailureKind::InvalidValue,
-                impact,
-                fallback_action,
-            ),
-            Self::Internal(_) => sqlite_failure(
-                stage,
-                "internal_invariant",
-                DiagnosticFailureKind::InternalInvariant,
-                impact,
-                DiagnosticAction::ReportBug,
-            ),
-            Self::BackupIncomplete(_) => sqlite_failure(
-                stage,
-                "online_backup",
-                DiagnosticFailureKind::BackupIncomplete,
-                impact,
-                DiagnosticAction::Retry,
-            ),
-            Self::Cleanup { primary, failures } => {
-                // 与 owning 投影一致，保留调用方已经确定的事务终态。
-                primary
-                    .safe_diagnostic(stage, impact, fallback_action)
-                    .with_recovery(RecoveryFact::component(format!(
-                        "sqlite_cleanup_failures={}",
-                        failures.len()
-                    )))
+            rusqlite::Error::NulError(_) => {
+                (SqliteDriverKind::EmbeddedNul, None, None, None, None, None)
             }
-        }
-    }
-}
-
-fn sqlite_failure(
-    stage: DiagnosticStage,
-    operation: impl AsRef<str>,
-    failure: DiagnosticFailureKind,
-    impact: DiagnosticImpact,
-    action: DiagnosticAction,
-) -> SafeDiagnostic {
-    SafeDiagnostic::new(
-        DiagnosticCode::SqliteOperation,
-        stage,
-        DiagnosticSubject::operation(operation),
-        DiagnosticReason::failure(failure),
-        impact,
-        action,
-    )
-}
-
-fn sqlite_driver_reason(source: &rusqlite::Error) -> DiagnosticReason {
-    match source.sqlite_error() {
-        Some(error) => DiagnosticReason::Sqlite {
-            primary_code: error.extended_code & 0xff,
-            extended_code: error.extended_code,
+            rusqlite::Error::InvalidParameterName(_) => (
+                SqliteDriverKind::InvalidParameterName,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            rusqlite::Error::InvalidPath(_) => {
+                (SqliteDriverKind::InvalidPath, None, None, None, None, None)
+            }
+            rusqlite::Error::ExecuteReturnedResults => (
+                SqliteDriverKind::ExecuteReturnedRows,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            rusqlite::Error::QueryReturnedNoRows => {
+                (SqliteDriverKind::NoRows, None, None, None, None, None)
+            }
+            rusqlite::Error::QueryReturnedMoreThanOneRow => {
+                (SqliteDriverKind::MultipleRows, None, None, None, None, None)
+            }
+            rusqlite::Error::InvalidColumnIndex(index) => (
+                SqliteDriverKind::InvalidColumnIndex,
+                Some(*index),
+                None,
+                None,
+                None,
+                None,
+            ),
+            rusqlite::Error::InvalidColumnName(name) => (
+                SqliteDriverKind::InvalidColumnName,
+                None,
+                SafeIdentifier::new(name).ok(),
+                None,
+                None,
+                None,
+            ),
+            rusqlite::Error::InvalidColumnType(index, name, _) => (
+                SqliteDriverKind::InvalidColumnType,
+                Some(*index),
+                SafeIdentifier::new(name).ok(),
+                None,
+                None,
+                None,
+            ),
+            rusqlite::Error::StatementChangedRows(actual) => (
+                SqliteDriverKind::UnexpectedChangedRows,
+                None,
+                None,
+                None,
+                None,
+                Some(*actual),
+            ),
+            rusqlite::Error::ToSqlConversionFailure(_) => (
+                SqliteDriverKind::ParameterConversion,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            rusqlite::Error::InvalidQuery => {
+                (SqliteDriverKind::InvalidQuery, None, None, None, None, None)
+            }
+            rusqlite::Error::UnwindingPanic => (
+                SqliteDriverKind::CallbackPanicked,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            rusqlite::Error::MultipleStatement => (
+                SqliteDriverKind::MultipleStatements,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            rusqlite::Error::InvalidParameterCount(actual, expected) => (
+                SqliteDriverKind::InvalidParameterCount,
+                None,
+                None,
+                Some(*actual),
+                Some(*expected),
+                None,
+            ),
+            rusqlite::Error::SqlInputError { .. } => {
+                (SqliteDriverKind::SqlInput, None, None, None, None, None)
+            }
+            rusqlite::Error::InvalidDatabaseIndex(_) => (
+                SqliteDriverKind::InvalidDatabaseIndex,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            _ => (
+                SqliteDriverKind::RusqliteNonSqliteFailure,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        };
+    let (primary_code, extended_code) = source.sqlite_error().map_or((None, None), |error| {
+        (Some(error.extended_code & 0xff), Some(error.extended_code))
+    });
+    SqliteDriverFailure {
+        kind,
+        primary_code,
+        extended_code,
+        column_index,
+        column_name,
+        parameter_actual,
+        parameter_expected,
+        changed_rows,
+        sql_offset: match source {
+            rusqlite::Error::SqlInputError { offset, .. } => Some(*offset),
+            _ => None,
         },
-        None => DiagnosticReason::failure_with_detail(
-            DiagnosticFailureKind::InvalidValue,
-            sqlite_driver_failure_detail(source),
-        ),
-    }
-}
-
-fn sqlite_driver_recovery(source: &rusqlite::Error) -> RecoveryFact {
-    let fact = match source {
-        rusqlite::Error::InvalidParameterCount(actual, expected) => {
-            format!("sqlite_parameter_count_actual={actual},expected={expected}")
-        }
-        rusqlite::Error::InvalidColumnIndex(index)
-        | rusqlite::Error::IntegralValueOutOfRange(index, _)
-        | rusqlite::Error::Utf8Error(index, _)
-        | rusqlite::Error::FromSqlConversionFailure(index, _, _)
-        | rusqlite::Error::InvalidColumnType(index, _, _) => {
-            format!("sqlite_column_index={index}")
-        }
-        rusqlite::Error::StatementChangedRows(actual) => {
-            format!("sqlite_changed_rows={actual}")
-        }
-        _ => format!(
-            "sqlite_driver_kind={}",
-            sqlite_driver_failure_detail(source)
-        ),
-    };
-    RecoveryFact::component(fact)
-}
-
-/// 把 rusqlite 自身的闭集变体投影成稳定且不包含 SQL、参数或数据正文的原因。
-fn sqlite_driver_failure_detail(source: &rusqlite::Error) -> &'static str {
-    match source {
-        rusqlite::Error::SqliteFailure(_, _) => "sqlite_failure",
-        rusqlite::Error::SqliteSingleThreadedMode => "sqlite_single_threaded_mode",
-        rusqlite::Error::FromSqlConversionFailure(_, _, _) => "column_conversion_failed",
-        rusqlite::Error::IntegralValueOutOfRange(_, _) => "integral_value_out_of_range",
-        rusqlite::Error::Utf8Error(_, _) => "column_invalid_utf8",
-        rusqlite::Error::NulError(_) => "embedded_nul",
-        rusqlite::Error::InvalidParameterName(_) => "invalid_parameter_name",
-        rusqlite::Error::InvalidPath(_) => "invalid_path",
-        rusqlite::Error::ExecuteReturnedResults => "execute_returned_rows",
-        rusqlite::Error::QueryReturnedNoRows => "query_returned_no_rows",
-        rusqlite::Error::QueryReturnedMoreThanOneRow => "query_returned_more_than_one_row",
-        rusqlite::Error::InvalidColumnIndex(_) => "invalid_column_index",
-        rusqlite::Error::InvalidColumnName(_) => "invalid_column_name",
-        rusqlite::Error::InvalidColumnType(_, _, _) => "invalid_column_type",
-        rusqlite::Error::StatementChangedRows(_) => "unexpected_changed_row_count",
-        rusqlite::Error::ToSqlConversionFailure(_) => "parameter_conversion_failed",
-        rusqlite::Error::InvalidQuery => "invalid_query_kind",
-        rusqlite::Error::UnwindingPanic => "sqlite_callback_panicked",
-        rusqlite::Error::MultipleStatement => "multiple_statements_not_allowed",
-        rusqlite::Error::InvalidParameterCount(_, _) => "invalid_parameter_count",
-        _ => "unclassified_rusqlite_error",
+        database_index: match source {
+            rusqlite::Error::InvalidDatabaseIndex(index) => Some(*index),
+            _ => None,
+        },
     }
 }
 
@@ -3893,6 +4093,67 @@ mod tests {
     use crate::storage::sqlite::SqliteBatch;
     use futures_util::task::noop_waker_ref;
 
+    #[test]
+    fn driver_leaf_preserves_database_query_column_codes_and_transaction() {
+        let source = SqliteRuntimeError::QueryContext {
+            query_id: "load_units".to_owned(),
+            ordinal: 3,
+            source: Box::new(SqliteRuntimeError::Driver {
+                operation: "query",
+                source: rusqlite::Error::InvalidColumnIndex(5),
+            }),
+        };
+        let report = source.diagnostic_report(
+            Path::new("database.sqlite"),
+            SqliteDiagnosticContext::new(
+                crate::diagnostic::SqliteDiagnosticStage::Translate,
+                SqliteOperation::Query,
+                crate::diagnostic::SqliteTransactionState::Active,
+            ),
+            StateEffect::Unchanged,
+        );
+        assert_eq!(
+            serde_json::to_value(report).expect("报告应可序列化"),
+            serde_json::json!({
+                "effect": "unchanged",
+                "primary": {
+                    "code": "sqlite.driver",
+                    "stage": "translate",
+                    "issue": {
+                        "family": "sqlite",
+                        "details": {
+                            "context": {
+                                "stage": "translate",
+                                "operation": "query",
+                                "transaction": "active"
+                            },
+                            "problem": {
+                                "kind": "driver",
+                                "database": "database.sqlite",
+                                "query_id": "load_units",
+                                "query_ordinal": 3,
+                                "failure": {
+                                    "kind": "invalid_column_index",
+                                    "primary_code": null,
+                                    "extended_code": null,
+                                    "column_index": 5,
+                                    "column_name": null,
+                                    "parameter_actual": null,
+                                    "parameter_expected": null,
+                                    "changed_rows": null,
+                                    "sql_offset": null,
+                                    "database_index": null
+                                }
+                            }
+                        }
+                    },
+                    "resolution": "retry"
+                },
+                "related": []
+            })
+        );
+    }
+
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
@@ -4305,18 +4566,12 @@ mod tests {
             SqliteRuntimeError::AvailableParallelism { source }
                 if source.raw_os_error() == Some(5)
         ));
-        let diagnostic = error.safe_diagnostic(
-            DiagnosticStage::CommandPreparation,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::Retry,
+        let report = error.startup_diagnostic_report();
+        let wire = serde_json::to_value(report).expect("启动诊断必须可序列化");
+        assert_eq!(
+            wire.pointer("/primary/issue/details/failure/raw_os_code"),
+            Some(&serde_json::json!(5))
         );
-        assert!(matches!(
-            diagnostic.reason,
-            DiagnosticReason::Io {
-                raw_os_code: Some(5),
-                ..
-            }
-        ));
     }
 
     #[tokio::test]
@@ -4600,21 +4855,25 @@ mod tests {
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE),
             Some("SQL_AND_PARAMETER_BODY_SENTINEL".to_owned()),
         );
-        let diagnostic = SqliteRuntimeError::Driver {
+        let report = SqliteRuntimeError::Driver {
             operation: "execute_transaction",
             source,
         }
-        .safe_diagnostic(
-            DiagnosticStage::Translate,
-            DiagnosticImpact::ProgressPreserved,
-            DiagnosticAction::CheckProjectState,
+        .diagnostic_report(
+            Path::new("D:/projects/game/project.db"),
+            SqliteDiagnosticContext::new(
+                SqliteDiagnosticStage::Translate,
+                SqliteOperation::Execute,
+                SqliteTransactionState::NotStarted,
+            ),
+            StateEffect::ProgressPreserved,
         );
-        let serialized = serde_json::to_string(&diagnostic).expect("诊断应可序列化");
+        let serialized = serde_json::to_string(&report).expect("诊断应可序列化");
 
         assert!(!serialized.contains("SQL_AND_PARAMETER_BODY_SENTINEL"));
         assert!(serialized.contains("\"primary_code\":19"));
         assert!(serialized.contains("\"extended_code\":2067"));
-        assert!(serialized.contains("execute_transaction"));
+        assert!(serialized.contains("\"operation\":\"execute\""));
     }
 
     #[test]
@@ -4704,18 +4963,23 @@ mod tests {
                     ..
                 })
         ));
-        let diagnostic = query_error.safe_diagnostic(
-            DiagnosticStage::ProjectOpening,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
+        let report = query_error.diagnostic_report(
+            Path::new("D:/projects/game/project.db"),
+            SqliteDiagnosticContext::new(
+                SqliteDiagnosticStage::Project,
+                SqliteOperation::Query,
+                SqliteTransactionState::RolledBack,
+            ),
+            StateEffect::Unchanged,
         );
-        assert!(diagnostic.recovery.contains(&RecoveryFact::component(
-            "sqlite_query_id=snapshot.missing_table"
-        )));
-        assert!(
-            diagnostic
-                .recovery
-                .contains(&RecoveryFact::component("sqlite_query_ordinal=1"))
+        let wire = serde_json::to_value(report).expect("查询诊断必须可序列化");
+        assert_eq!(
+            wire.pointer("/primary/issue/details/problem/query_id"),
+            Some(&serde_json::json!("snapshot.missing_table"))
+        );
+        assert_eq!(
+            wire.pointer("/primary/issue/details/problem/query_ordinal"),
+            Some(&serde_json::json!(1))
         );
 
         let commit_error = read_queries_in_snapshot(
@@ -4973,22 +5237,28 @@ mod tests {
             "绑定批量命令参数",
             rusqlite::Error::InvalidParameterCount(3, 5),
         );
-        let diagnostic = source.safe_diagnostic(
-            DiagnosticStage::Extract,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::ReportBug,
+        let report = source.diagnostic_report(
+            Path::new("D:/projects/game/project.db"),
+            SqliteDiagnosticContext::new(
+                SqliteDiagnosticStage::Extract,
+                SqliteOperation::Execute,
+                SqliteTransactionState::Active,
+            ),
+            StateEffect::Unchanged,
         );
-
+        let wire = serde_json::to_value(report).expect("参数计数诊断必须可序列化");
         assert_eq!(
-            diagnostic.reason,
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::InvalidValue,
-                "invalid_parameter_count"
-            )
+            wire.pointer("/primary/issue/details/problem/failure/kind"),
+            Some(&serde_json::json!("invalid_parameter_count"))
         );
-        assert!(diagnostic.recovery.contains(&RecoveryFact::component(
-            "sqlite_parameter_count_actual=3,expected=5"
-        )));
+        assert_eq!(
+            wire.pointer("/primary/issue/details/problem/failure/parameter_actual"),
+            Some(&serde_json::json!(3))
+        );
+        assert_eq!(
+            wire.pointer("/primary/issue/details/problem/failure/parameter_expected"),
+            Some(&serde_json::json!(5))
+        );
     }
 
     #[test]

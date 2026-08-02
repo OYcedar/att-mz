@@ -6,8 +6,12 @@ use std::fmt;
 use std::path::PathBuf;
 
 use crate::diagnostic::{
-    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
-    DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
+    Diagnostic, DiagnosticReport, RpgMakerComputeFailure, RpgMakerDiagnosticStage, RpgMakerIssue,
+    RpgMakerJsonFailureKind, RpgMakerProjectProblem, RpgMakerSemanticOrderLevel,
+    RpgMakerTranslationAssetComputeOperation, RpgMakerTranslationAssetProblem,
+    RpgMakerTranslationResourceKind, RpgMakerTranslationSnapshotViolation, SafeIdentifier,
+    SafePath, SqliteDiagnosticContext, SqliteDiagnosticStage, SqliteOperation,
+    SqliteTransactionState, StateEffect,
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::fingerprint::Sha256Fingerprint;
@@ -17,11 +21,10 @@ use crate::rpg_maker::asset_storage::{
     OwnerPartitionedSqliteRow as OwnerSqliteRow,
     RPG_MAKER_ASSET_OWNER_ORDER as TRANSLATION_OWNER_ORDER, RPG_MAKER_ASSET_OWNER_STATE_PROJECTION,
     RPG_MAKER_TEXT_GROUP_CORE_PROJECTION, RPG_MAKER_TEXT_UNIT_CONTENT_PROJECTION,
-    RPG_MAKER_TEXT_UNIT_LOCATION_PROJECTION, RpgMakerAssetOwnerStateStorageRow,
-    RpgMakerAssetStorageRowDecoder, RpgMakerAssetStorageRowError, RpgMakerTextGroupStorageRow,
-    RpgMakerTextUnitIdentityStorageRow, RpgMakerTextUnitLocationStorageRow,
-    RpgMakerTextUnitStorageRow, merge_owner_partitions, rpg_maker_asset_owner_order as owner_order,
-    sort_owner_state_rows,
+    RpgMakerAssetOwnerStateStorageRow, RpgMakerAssetStorageRowDecoder,
+    RpgMakerAssetStorageRowError, RpgMakerTextGroupStorageRow, RpgMakerTextUnitIdentityStorageRow,
+    RpgMakerTextUnitLocationStorageRow, RpgMakerTextUnitStorageRow, merge_owner_partitions,
+    rpg_maker_asset_owner_order as owner_order, sort_owner_state_rows,
 };
 #[cfg(test)]
 use crate::rpg_maker::location_codec::{RpgMakerLocationCodec, RpgMakerProjectionCodec};
@@ -40,6 +43,8 @@ use crate::rpg_maker::semantic_order::{
     RpgMakerSemanticScopeKey,
 };
 use crate::rpg_maker::text::{RpgMakerLocation, TextGroupKind};
+use crate::runtime::cpu::CpuExecutorUnavailable;
+use crate::runtime::sqlite::SqliteRuntimeError;
 use crate::storage::sqlite::{
     QueryExistingDatabaseError, SqliteQuery, SqliteQueryExecutor, SqliteRow, SqliteValue,
 };
@@ -68,15 +73,15 @@ fn read_translation_owners() -> String {
 fn read_translation_owner_groups() -> String {
     format!(
         "SELECT\n    {RPG_MAKER_TEXT_GROUP_CORE_PROJECTION}\n\
-         FROM rpg_maker_text_group\n\
-         WHERE owner = ?\n\
-         ORDER BY semantic_order_key"
+         FROM rpg_maker_text_group AS text_group\n\
+         WHERE text_group.owner = ?\n\
+         ORDER BY text_group.semantic_order_key"
     )
 }
 
 fn read_translation_owner_units() -> String {
     format!(
-        "SELECT\n    {RPG_MAKER_TEXT_UNIT_LOCATION_PROJECTION},\n    \
+        "SELECT\n    text_group.group_location,\n    \
          text_group.group_kind,\n    \
          text_group.semantic_order_key,\n    \
          {RPG_MAKER_TEXT_UNIT_CONTENT_PROJECTION},\n    \
@@ -85,7 +90,7 @@ fn read_translation_owner_units() -> String {
          CROSS JOIN rpg_maker_text_unit AS unit\n  \
                     INDEXED BY rpg_maker_text_unit_owner_group_order_idx\n  \
            ON unit.owner = text_group.owner\n \
-          AND text_group.group_location = unit.group_location\n\
+          AND unit.group_id = text_group.group_id\n\
          WHERE text_group.owner = ?\n\
          ORDER BY text_group.semantic_order_key,\n         \
           unit.semantic_order_key"
@@ -328,126 +333,371 @@ impl<Q: Error + 'static, C: Error + 'static> Error for RpgMakerTranslationAssetR
     }
 }
 
-impl<Q, C> SafeDiagnosticSource for RpgMakerTranslationAssetReadingError<Q, C>
-where
-    Q: SafeDiagnosticSource,
-    CpuTaskExecutionError<C>: SafeDiagnosticSource,
-{
-    fn safe_diagnostic_source(
-        &self,
-        stage: DiagnosticStage,
-        impact: DiagnosticImpact,
-        _fallback_action: DiagnosticAction,
-    ) -> SafeDiagnostic {
+impl RpgMakerTranslationAssetReadingError<SqliteRuntimeError, CpuExecutorUnavailable> {
+    /// 在仍掌握数据库路径、快照阶段和叶子结构时建立唯一公开报告。
+    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
         match self {
-            Self::DatabaseNotFound { database_path } => SafeDiagnostic::new(
-                DiagnosticCode::ProjectUnavailable,
-                stage,
-                DiagnosticSubject::path(database_path),
-                DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
-                impact,
-                DiagnosticAction::CheckProjectState,
-            )
-            .with_recovery(RecoveryFact::component("project_database")),
+            Self::DatabaseNotFound { database_path } => DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::rpg_maker(RpgMakerIssue::project(
+                    RpgMakerDiagnosticStage::TranslatePlanning,
+                    RpgMakerProjectProblem::DatabaseNotFound {
+                        path: SafePath::new(database_path),
+                    },
+                )),
+            ),
             Self::Query {
                 database_path,
                 source,
-            } => diagnostic_at_database_path(
-                source.safe_diagnostic_source(stage, impact, DiagnosticAction::CheckProjectState),
+            } => source.diagnostic_report(
                 database_path,
-                "read_rpg_maker_translation_snapshot",
+                SqliteDiagnosticContext::new(
+                    SqliteDiagnosticStage::Translate,
+                    SqliteOperation::Query,
+                    translation_snapshot_query_transaction(source),
+                ),
+                StateEffect::Unchanged,
             ),
             Self::ProjectSnapshotChanged {
                 database_path,
                 expected,
                 actual,
-            } => SafeDiagnostic::new(
-                DiagnosticCode::ProjectState,
-                stage,
-                DiagnosticSubject::path(database_path),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::StateMismatch,
-                    format!(
-                        "expected_source_fingerprint={}; actual_source_fingerprint={}",
-                        expected.hex(),
-                        actual.hex()
-                    ),
-                ),
-                impact,
-                DiagnosticAction::CheckProjectState,
-            )
-            .with_recovery(RecoveryFact::component(
-                "metadata.source_snapshot_fingerprint",
-            )),
+            } => translation_asset_report(
+                database_path,
+                RpgMakerTranslationAssetProblem::ProjectSnapshotChanged {
+                    expected: SafeIdentifier::from_validated(expected.hex()),
+                    actual: SafeIdentifier::from_validated(actual.hex()),
+                },
+            ),
             Self::ExtractionOutOfDate {
                 database_path,
                 owners,
-            } => SafeDiagnostic::new(
-                DiagnosticCode::ProjectState,
-                stage,
-                DiagnosticSubject::path(database_path),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::StateMismatch,
-                    format!(
-                        "stale_rpg_maker_asset_owners={}",
-                        owners
-                            .iter()
-                            .map(|owner| owner.storage_name())
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    ),
-                ),
-                impact,
-                DiagnosticAction::CheckProjectState,
-            )
-            .with_recovery(RecoveryFact::component("rerun_extract")),
+            } => translation_asset_report(
+                database_path,
+                RpgMakerTranslationAssetProblem::ExtractionOutOfDate {
+                    owners: owners
+                        .iter()
+                        .map(|owner| owner.diagnostic_owner())
+                        .collect(),
+                },
+            ),
             Self::SchedulePreparation {
                 database_path,
                 source,
-            } => diagnostic_at_database_path(
-                source.safe_diagnostic_source(stage, impact, DiagnosticAction::Retry),
+            } => translation_asset_compute_report(
                 database_path,
-                "prepare_rpg_maker_translation_snapshot",
+                RpgMakerTranslationAssetComputeOperation::PrepareSnapshot,
+                source,
             ),
             Self::ScheduleDecode {
                 database_path,
                 source,
-            } => diagnostic_at_database_path(
-                source.safe_diagnostic_source(stage, impact, DiagnosticAction::Retry),
+            } => translation_asset_compute_report(
                 database_path,
-                "decode_rpg_maker_translation_units",
+                RpgMakerTranslationAssetComputeOperation::DecodeUnits,
+                source,
             ),
             Self::ScheduleAssembly {
                 database_path,
                 source,
-            } => diagnostic_at_database_path(
-                source.safe_diagnostic_source(stage, impact, DiagnosticAction::Retry),
+            } => translation_asset_compute_report(
                 database_path,
-                "assemble_rpg_maker_translation_corpus",
+                RpgMakerTranslationAssetComputeOperation::AssembleCorpus,
+                source,
             ),
             Self::InvalidSnapshot {
                 database_path,
                 source,
-            } => SafeDiagnostic::new(
-                DiagnosticCode::ProjectState,
-                stage,
-                DiagnosticSubject::path(database_path),
-                source.safe_reason(),
-                impact,
-                DiagnosticAction::CheckProjectState,
-            )
-            .with_recovery(RecoveryFact::component("rpg_maker_translation_snapshot")),
+            } => translation_asset_report(
+                database_path,
+                RpgMakerTranslationAssetProblem::InvalidSnapshot {
+                    violation: source.diagnostic_violation(),
+                },
+            ),
         }
     }
 }
 
-fn diagnostic_at_database_path(
-    mut diagnostic: SafeDiagnostic,
+fn translation_asset_compute_report(
     database_path: &std::path::Path,
-    operation: &'static str,
-) -> SafeDiagnostic {
-    diagnostic.subject = DiagnosticSubject::path(database_path);
-    diagnostic.with_recovery(RecoveryFact::component(operation))
+    operation: RpgMakerTranslationAssetComputeOperation,
+    source: &CpuTaskExecutionError<CpuExecutorUnavailable>,
+) -> DiagnosticReport {
+    let failure = match source {
+        CpuTaskExecutionError::Cancelled => RpgMakerComputeFailure::Cancelled,
+        CpuTaskExecutionError::Unavailable(CpuExecutorUnavailable::ShuttingDown) => {
+            RpgMakerComputeFailure::ExecutorClosed
+        }
+        CpuTaskExecutionError::Unavailable(CpuExecutorUnavailable::StatePoisoned) => {
+            RpgMakerComputeFailure::StatePoisoned
+        }
+        CpuTaskExecutionError::TaskPanicked => RpgMakerComputeFailure::WorkerPanicked,
+    };
+    translation_asset_report(
+        database_path,
+        RpgMakerTranslationAssetProblem::Compute { operation, failure },
+    )
+}
+
+fn translation_asset_report(
+    database_path: &std::path::Path,
+    problem: RpgMakerTranslationAssetProblem,
+) -> DiagnosticReport {
+    DiagnosticReport::new(
+        StateEffect::Unchanged,
+        Diagnostic::rpg_maker(RpgMakerIssue::translation_asset(database_path, problem)),
+    )
+}
+
+fn translation_snapshot_query_transaction(source: &SqliteRuntimeError) -> SqliteTransactionState {
+    match source {
+        SqliteRuntimeError::QueryContext { .. } => SqliteTransactionState::RolledBack,
+        SqliteRuntimeError::Cleanup { .. }
+        | SqliteRuntimeError::Driver { .. }
+        | SqliteRuntimeError::Internal(_) => SqliteTransactionState::OutcomeUnknown,
+        SqliteRuntimeError::Closed
+        | SqliteRuntimeError::AvailableParallelism { .. }
+        | SqliteRuntimeError::Cancelled { .. }
+        | SqliteRuntimeError::InteractiveSessionAlreadyOpen
+        | SqliteRuntimeError::WorkerSpawn { .. }
+        | SqliteRuntimeError::WorkerPanicked(_)
+        | SqliteRuntimeError::Io { .. }
+        | SqliteRuntimeError::WindowsFileSystem { .. }
+        | SqliteRuntimeError::InvalidTarget { .. }
+        | SqliteRuntimeError::UnexpectedArtifact { .. }
+        | SqliteRuntimeError::InvalidValue(_)
+        | SqliteRuntimeError::BackupIncomplete(_) => SqliteTransactionState::NotStarted,
+    }
+}
+
+impl InvalidRpgMakerTranslationAssetSnapshot {
+    fn diagnostic_violation(&self) -> RpgMakerTranslationSnapshotViolation {
+        match self {
+            Self::WrongQueryResultSetCount { expected, actual } => {
+                RpgMakerTranslationSnapshotViolation::WrongQueryResultSetCount {
+                    expected: *expected,
+                    actual: *actual,
+                }
+            }
+            Self::WrongColumnCount { expected, actual } => {
+                RpgMakerTranslationSnapshotViolation::WrongColumnCount {
+                    expected: *expected,
+                    actual: *actual,
+                }
+            }
+            Self::WrongColumnType {
+                column,
+                expected,
+                actual,
+            } => RpgMakerTranslationSnapshotViolation::WrongColumnType {
+                column: SafeIdentifier::from_validated(column),
+                expected: SafeIdentifier::from_validated(expected),
+                actual: SafeIdentifier::from_validated(actual),
+            },
+            Self::InvalidSemanticOrderKey { column, source } => {
+                RpgMakerTranslationSnapshotViolation::InvalidSemanticOrderKey {
+                    column: SafeIdentifier::from_validated(column),
+                    violation: source.diagnostic_violation(),
+                }
+            }
+            Self::UnknownOwner => RpgMakerTranslationSnapshotViolation::UnknownOwner,
+            Self::InactiveOwner(owner) => RpgMakerTranslationSnapshotViolation::InactiveOwner {
+                owner: owner.diagnostic_owner(),
+            },
+            Self::DuplicateOwner(owner) => RpgMakerTranslationSnapshotViolation::DuplicateOwner {
+                owner: owner.diagnostic_owner(),
+            },
+            Self::InvalidOwnerSourceFingerprintLength { owner, actual } => {
+                RpgMakerTranslationSnapshotViolation::InvalidOwnerSourceFingerprintLength {
+                    owner: owner.diagnostic_owner(),
+                    actual: *actual,
+                }
+            }
+            Self::InvalidOwnerAssetFingerprintLength { owner, actual } => {
+                RpgMakerTranslationSnapshotViolation::InvalidOwnerAssetFingerprintLength {
+                    owner: owner.diagnostic_owner(),
+                    actual: *actual,
+                }
+            }
+            Self::InvalidMetadataRowCount { actual } => {
+                RpgMakerTranslationSnapshotViolation::InvalidMetadataRowCount { actual: *actual }
+            }
+            Self::InvalidMetadataFingerprintLength { actual } => {
+                RpgMakerTranslationSnapshotViolation::InvalidMetadataFingerprintLength {
+                    actual: *actual,
+                }
+            }
+            Self::MissingTranslationResource(kind) => {
+                RpgMakerTranslationSnapshotViolation::MissingTranslationResource {
+                    resource_kind: kind.diagnostic_kind(),
+                }
+            }
+            Self::DuplicateTranslationResource(kind) => {
+                RpgMakerTranslationSnapshotViolation::DuplicateTranslationResource {
+                    resource_kind: kind.diagnostic_kind(),
+                }
+            }
+            Self::UnknownTranslationResource => {
+                RpgMakerTranslationSnapshotViolation::UnknownTranslationResource
+            }
+            Self::BlankTranslationResource(kind) => {
+                RpgMakerTranslationSnapshotViolation::BlankTranslationResource {
+                    resource_kind: kind.diagnostic_kind(),
+                }
+            }
+            Self::UnknownGroupKind => RpgMakerTranslationSnapshotViolation::UnknownGroupKind,
+            Self::InvalidLocation(source) => {
+                RpgMakerTranslationSnapshotViolation::InvalidLocation {
+                    failure: source.diagnostic_failure(),
+                }
+            }
+            Self::InvalidSemanticScope(source) => {
+                RpgMakerTranslationSnapshotViolation::InvalidSemanticScope {
+                    group_location: source.location().diagnostic_location(),
+                }
+            }
+            Self::InvalidRole(source) => RpgMakerTranslationSnapshotViolation::InvalidRole {
+                failure: source.diagnostic_failure(),
+            },
+            Self::RoleDoesNotBelongToGroup { role, kind } => {
+                RpgMakerTranslationSnapshotViolation::RoleDoesNotBelongToGroup {
+                    role: role.diagnostic_role(),
+                    group_kind: kind.diagnostic_group_kind(),
+                }
+            }
+            Self::InvalidSourceContent(source) => {
+                RpgMakerTranslationSnapshotViolation::InvalidSourceContent {
+                    category: asset_json_failure(source),
+                    line: source.line(),
+                    column: source.column(),
+                }
+            }
+            Self::InvalidTranslationContent(source) => {
+                RpgMakerTranslationSnapshotViolation::InvalidTranslationContent {
+                    category: asset_json_failure(source),
+                    line: source.line(),
+                    column: source.column(),
+                }
+            }
+            Self::SourceContentShapeMismatch { role } => {
+                RpgMakerTranslationSnapshotViolation::SourceContentShapeMismatch {
+                    role: role.diagnostic_role(),
+                }
+            }
+            Self::TranslationContentShapeMismatch { role } => {
+                RpgMakerTranslationSnapshotViolation::TranslationContentShapeMismatch {
+                    role: role.diagnostic_role(),
+                }
+            }
+            Self::BlankSourceContent => RpgMakerTranslationSnapshotViolation::BlankSourceContent,
+            Self::BlankTranslationContent => {
+                RpgMakerTranslationSnapshotViolation::BlankTranslationContent
+            }
+            Self::InvalidSourceLineText { index } => {
+                RpgMakerTranslationSnapshotViolation::InvalidSourceLineText { index: *index }
+            }
+            Self::InvalidTranslationLineText { index } => {
+                RpgMakerTranslationSnapshotViolation::InvalidTranslationLineText { index: *index }
+            }
+            Self::AlignedLineCountMismatch { expected, actual } => {
+                RpgMakerTranslationSnapshotViolation::AlignedLineCountMismatch {
+                    expected: *expected,
+                    actual: *actual,
+                }
+            }
+            Self::AlignedBlankSlotMismatch { index } => {
+                RpgMakerTranslationSnapshotViolation::AlignedBlankSlotMismatch { index: *index }
+            }
+            Self::InvalidSourceContext(source) => {
+                RpgMakerTranslationSnapshotViolation::InvalidSourceContext {
+                    category: asset_json_failure(source),
+                    line: source.line(),
+                    column: source.column(),
+                }
+            }
+            Self::SourceContextMustBeObject => {
+                RpgMakerTranslationSnapshotViolation::SourceContextMustBeObject
+            }
+            Self::InvalidTranslationStatePair => {
+                RpgMakerTranslationSnapshotViolation::InvalidTranslationStatePair
+            }
+            Self::InvalidTranslationStateLength { actual } => {
+                RpgMakerTranslationSnapshotViolation::InvalidTranslationStateLength {
+                    actual: *actual,
+                }
+            }
+            Self::DuplicateGroup {
+                owner,
+                group_location,
+            } => RpgMakerTranslationSnapshotViolation::DuplicateGroup {
+                owner: owner.diagnostic_owner(),
+                group_location: group_location.diagnostic_location(),
+            },
+            Self::MissingGroup {
+                owner,
+                group_location,
+            } => RpgMakerTranslationSnapshotViolation::MissingGroup {
+                owner: owner.diagnostic_owner(),
+                group_location: group_location.diagnostic_location(),
+            },
+            Self::EmptyGroup {
+                owner,
+                group_location,
+            } => RpgMakerTranslationSnapshotViolation::EmptyGroup {
+                owner: owner.diagnostic_owner(),
+                group_location: group_location.diagnostic_location(),
+            },
+            Self::InconsistentGroupDefinition {
+                owner,
+                group_location,
+            } => RpgMakerTranslationSnapshotViolation::InconsistentGroupDefinition {
+                owner: owner.diagnostic_owner(),
+                group_location: group_location.diagnostic_location(),
+            },
+            Self::DuplicateSemanticOrderKey { level } => {
+                RpgMakerTranslationSnapshotViolation::DuplicateSemanticOrderKey {
+                    level: level.diagnostic_level(),
+                }
+            }
+            Self::DuplicateLogicalUnit {
+                owner,
+                group_location,
+                role,
+            } => RpgMakerTranslationSnapshotViolation::DuplicateLogicalUnit {
+                owner: owner.diagnostic_owner(),
+                group_location: group_location.diagnostic_location(),
+                role: role.diagnostic_role(),
+            },
+        }
+    }
+}
+
+impl TranslationSnapshotResourceKind {
+    const fn diagnostic_kind(self) -> RpgMakerTranslationResourceKind {
+        match self {
+            Self::Terminology => RpgMakerTranslationResourceKind::Terminology,
+            Self::PlaceholderRules => RpgMakerTranslationResourceKind::PlaceholderRules,
+        }
+    }
+}
+
+impl TranslationSnapshotSemanticOrderLevel {
+    const fn diagnostic_level(self) -> RpgMakerSemanticOrderLevel {
+        match self {
+            Self::Group => RpgMakerSemanticOrderLevel::Group,
+            Self::Unit => RpgMakerSemanticOrderLevel::Unit,
+        }
+    }
+}
+
+fn asset_json_failure(source: &serde_json::Error) -> RpgMakerJsonFailureKind {
+    match JsonErrorCategory::from(source) {
+        JsonErrorCategory::Io => RpgMakerJsonFailureKind::Io,
+        JsonErrorCategory::Syntax => RpgMakerJsonFailureKind::Syntax,
+        JsonErrorCategory::Data => RpgMakerJsonFailureKind::Data,
+        JsonErrorCategory::Eof => RpgMakerJsonFailureKind::Eof,
+        JsonErrorCategory::DuplicateObjectKey => RpgMakerJsonFailureKind::DuplicateObjectKey,
+    }
 }
 
 #[derive(Debug)]
@@ -469,15 +719,15 @@ pub(crate) enum InvalidRpgMakerTranslationAssetSnapshot {
         column: &'static str,
         source: RpgMakerSemanticOrderKeyDecodeError,
     },
-    UnknownOwner(String),
-    InactiveOwner(String),
-    DuplicateOwner(String),
+    UnknownOwner,
+    InactiveOwner(RpgMakerAssetOwner),
+    DuplicateOwner(RpgMakerAssetOwner),
     InvalidOwnerSourceFingerprintLength {
-        owner: String,
+        owner: RpgMakerAssetOwner,
         actual: usize,
     },
     InvalidOwnerAssetFingerprintLength {
-        owner: String,
+        owner: RpgMakerAssetOwner,
         actual: usize,
     },
     InvalidMetadataRowCount {
@@ -486,11 +736,11 @@ pub(crate) enum InvalidRpgMakerTranslationAssetSnapshot {
     InvalidMetadataFingerprintLength {
         actual: usize,
     },
-    MissingTranslationResource(&'static str),
-    DuplicateTranslationResource(String),
-    UnknownTranslationResource(String),
-    BlankTranslationResource(String),
-    UnknownGroupKind(String),
+    MissingTranslationResource(TranslationSnapshotResourceKind),
+    DuplicateTranslationResource(TranslationSnapshotResourceKind),
+    UnknownTranslationResource,
+    BlankTranslationResource(TranslationSnapshotResourceKind),
+    UnknownGroupKind,
     InvalidLocation(RpgMakerLocationCodecError),
     InvalidSemanticScope(RpgMakerSemanticScopeError),
     InvalidRole(RpgMakerProjectionCodecError),
@@ -544,15 +794,25 @@ pub(crate) enum InvalidRpgMakerTranslationAssetSnapshot {
         group_location: Box<RpgMakerLocation>,
     },
     DuplicateSemanticOrderKey {
-        level: &'static str,
-        first: String,
-        second: String,
+        level: TranslationSnapshotSemanticOrderLevel,
     },
     DuplicateLogicalUnit {
         owner: RpgMakerAssetOwner,
         group_location: Box<RpgMakerLocation>,
         role: TextUnitRole,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TranslationSnapshotResourceKind {
+    Terminology,
+    PlaceholderRules,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TranslationSnapshotSemanticOrderLevel {
+    Group,
+    Unit,
 }
 
 impl fmt::Display for InvalidRpgMakerTranslationAssetSnapshot {
@@ -573,16 +833,24 @@ impl fmt::Display for InvalidRpgMakerTranslationAssetSnapshot {
             Self::InvalidSemanticOrderKey { column, source } => {
                 write!(formatter, "列 {column} 不是规范语义顺序键：{source}")
             }
-            Self::UnknownOwner(owner) => write!(formatter, "未知资产所有者：{owner}"),
-            Self::InactiveOwner(owner) => write!(formatter, "文本单元引用未激活 owner：{owner}"),
-            Self::DuplicateOwner(owner) => write!(formatter, "资产 owner 状态重复：{owner}"),
+            Self::UnknownOwner => formatter.write_str("未知资产所有者"),
+            Self::InactiveOwner(owner) => write!(
+                formatter,
+                "文本单元引用未激活 owner：{}",
+                owner.storage_name()
+            ),
+            Self::DuplicateOwner(owner) => {
+                write!(formatter, "资产 owner 状态重复：{}", owner.storage_name())
+            }
             Self::InvalidOwnerSourceFingerprintLength { owner, actual } => write!(
                 formatter,
-                "owner {owner} 的来源指纹必须是 32 字节 BLOB，实际为 {actual} 字节"
+                "owner {} 的来源指纹必须是 32 字节 BLOB，实际为 {actual} 字节",
+                owner.storage_name()
             ),
             Self::InvalidOwnerAssetFingerprintLength { owner, actual } => write!(
                 formatter,
-                "owner {owner} 的资产指纹必须是 32 字节 BLOB，实际为 {actual} 字节"
+                "owner {} 的资产指纹必须是 32 字节 BLOB，实际为 {actual} 字节",
+                owner.storage_name()
             ),
             Self::InvalidMetadataRowCount { actual } => {
                 write!(formatter, "metadata 必须恰好一行，实际为 {actual} 行")
@@ -591,11 +859,15 @@ impl fmt::Display for InvalidRpgMakerTranslationAssetSnapshot {
                 formatter,
                 "metadata 来源指纹必须是 32 字节 BLOB，实际为 {actual} 字节"
             ),
-            Self::MissingTranslationResource(kind) => write!(formatter, "缺少翻译资源 {kind}"),
-            Self::DuplicateTranslationResource(kind) => write!(formatter, "翻译资源重复：{kind}"),
-            Self::UnknownTranslationResource(kind) => write!(formatter, "未知翻译资源：{kind}"),
-            Self::BlankTranslationResource(kind) => write!(formatter, "翻译资源 {kind} 为空"),
-            Self::UnknownGroupKind(kind) => write!(formatter, "未知文本组类型：{kind}"),
+            Self::MissingTranslationResource(kind) => write!(formatter, "缺少翻译资源 {kind:?}"),
+            Self::DuplicateTranslationResource(kind) => {
+                write!(formatter, "翻译资源重复：{kind:?}")
+            }
+            Self::UnknownTranslationResource => formatter.write_str("未知翻译资源"),
+            Self::BlankTranslationResource(kind) => {
+                write!(formatter, "翻译资源 {kind:?} 为空")
+            }
+            Self::UnknownGroupKind => formatter.write_str("未知文本组类型"),
             Self::InvalidLocation(source) => write!(formatter, "组位置无效：{source}"),
             Self::InvalidSemanticScope(source) => write!(formatter, "语义范围无效：{source}"),
             Self::InvalidRole(source) => write!(formatter, "单元角色无效：{source}"),
@@ -675,14 +947,9 @@ impl fmt::Display for InvalidRpgMakerTranslationAssetSnapshot {
                 "同一资产组的类型或 semantic_order_key 不一致：{} / {group_location}",
                 owner.storage_name()
             ),
-            Self::DuplicateSemanticOrderKey {
-                level,
-                first,
-                second,
-            } => write!(
-                formatter,
-                "不同 {level} 使用了相同 semantic_order_key：{first} / {second}"
-            ),
+            Self::DuplicateSemanticOrderKey { level } => {
+                write!(formatter, "不同 {level:?} 使用了相同 semantic_order_key")
+            }
             Self::DuplicateLogicalUnit {
                 owner,
                 group_location,
@@ -709,176 +976,6 @@ impl Error for InvalidRpgMakerTranslationAssetSnapshot {
             _ => None,
         }
     }
-}
-
-impl InvalidRpgMakerTranslationAssetSnapshot {
-    fn safe_reason(&self) -> DiagnosticReason {
-        let detail = match self {
-            Self::WrongQueryResultSetCount { expected, actual } => {
-                format!("wrong_query_result_set_count: expected={expected}; actual={actual}")
-            }
-            Self::WrongColumnCount { expected, actual } => {
-                format!("wrong_column_count: expected={expected}; actual={actual}")
-            }
-            Self::WrongColumnType {
-                column,
-                expected,
-                actual,
-            } => {
-                format!("wrong_column_type: column={column}; expected={expected}; actual={actual}")
-            }
-            Self::InvalidSemanticOrderKey { column, source } => {
-                format!("invalid_semantic_order_key: column={column}; reason={source}")
-            }
-            Self::UnknownOwner(_) => "unknown_rpg_maker_asset_owner".to_owned(),
-            Self::InactiveOwner(_) => "unit_references_inactive_rpg_maker_asset_owner".to_owned(),
-            Self::DuplicateOwner(_) => "duplicate_rpg_maker_asset_owner_state".to_owned(),
-            Self::InvalidOwnerSourceFingerprintLength { actual, .. } => {
-                format!("invalid_owner_source_fingerprint_length: expected=32; actual={actual}")
-            }
-            Self::InvalidOwnerAssetFingerprintLength { actual, .. } => {
-                format!("invalid_owner_asset_fingerprint_length: expected=32; actual={actual}")
-            }
-            Self::InvalidMetadataRowCount { actual } => {
-                format!("invalid_metadata_row_count: expected=1; actual={actual}")
-            }
-            Self::InvalidMetadataFingerprintLength { actual } => {
-                format!("invalid_metadata_source_fingerprint_length: expected=32; actual={actual}")
-            }
-            Self::MissingTranslationResource(kind) => {
-                format!("missing_translation_resource: kind={kind}")
-            }
-            Self::DuplicateTranslationResource(_) => "duplicate_translation_resource".to_owned(),
-            Self::UnknownTranslationResource(_) => "unknown_translation_resource".to_owned(),
-            Self::BlankTranslationResource(_) => "blank_translation_resource".to_owned(),
-            Self::UnknownGroupKind(_) => "unknown_text_group_kind".to_owned(),
-            Self::InvalidLocation(source) => {
-                format!("invalid_group_location: {}", location_codec_detail(source))
-            }
-            Self::InvalidSemanticScope(source) => {
-                format!("invalid_semantic_scope: {source}")
-            }
-            Self::InvalidRole(source) => {
-                format!("invalid_unit_role: {}", projection_codec_detail(source))
-            }
-            Self::RoleDoesNotBelongToGroup { role, kind } => format!(
-                "role_does_not_belong_to_group: role={}; group_kind={}",
-                unit_role_kind(role),
-                text_group_kind(*kind)
-            ),
-            Self::InvalidSourceContent(source) => {
-                format!("invalid_source_content_json: {}", json_error_detail(source))
-            }
-            Self::InvalidTranslationContent(source) => format!(
-                "invalid_translation_content_json: {}",
-                json_error_detail(source)
-            ),
-            Self::SourceContentShapeMismatch { role } => format!(
-                "source_content_shape_mismatch: role={}",
-                unit_role_kind(role)
-            ),
-            Self::TranslationContentShapeMismatch { role } => format!(
-                "translation_content_shape_mismatch: role={}",
-                unit_role_kind(role)
-            ),
-            Self::BlankSourceContent => "blank_source_content".to_owned(),
-            Self::BlankTranslationContent => "blank_translation_content".to_owned(),
-            Self::InvalidSourceLineText { index } => {
-                format!("invalid_source_line_text: line_index={index}")
-            }
-            Self::InvalidTranslationLineText { index } => {
-                format!("invalid_translation_line_text: line_index={index}")
-            }
-            Self::AlignedLineCountMismatch { expected, actual } => {
-                format!("aligned_line_count_mismatch: expected={expected}; actual={actual}")
-            }
-            Self::AlignedBlankSlotMismatch { index } => {
-                format!("aligned_blank_slot_mismatch: line_index={index}")
-            }
-            Self::InvalidSourceContext(source) => {
-                format!("invalid_source_context_json: {}", json_error_detail(source))
-            }
-            Self::SourceContextMustBeObject => "source_context_must_be_object".to_owned(),
-            Self::InvalidTranslationStatePair => {
-                "translation_content_and_state_presence_mismatch".to_owned()
-            }
-            Self::InvalidTranslationStateLength { actual } => {
-                format!("invalid_translation_state_length: expected=32; actual={actual}")
-            }
-            Self::DuplicateGroup {
-                owner,
-                group_location,
-            } => format!(
-                "duplicate_rpg_maker_text_group: owner={}; group_location={group_location}",
-                owner.storage_name()
-            ),
-            Self::MissingGroup {
-                owner,
-                group_location,
-            } => format!(
-                "rpg_maker_text_unit_missing_group: owner={}; group_location={group_location}",
-                owner.storage_name()
-            ),
-            Self::EmptyGroup {
-                owner,
-                group_location,
-            } => format!(
-                "rpg_maker_text_group_is_empty: owner={}; group_location={group_location}",
-                owner.storage_name()
-            ),
-            Self::InconsistentGroupDefinition {
-                owner,
-                group_location,
-            } => format!(
-                "inconsistent_group_definition: owner={}; group_location={group_location}",
-                owner.storage_name()
-            ),
-            Self::DuplicateSemanticOrderKey { level, .. } => {
-                format!("duplicate_semantic_order_key: level={level}")
-            }
-            Self::DuplicateLogicalUnit {
-                owner,
-                group_location,
-                role,
-            } => format!(
-                "duplicate_logical_unit: owner={}; group_location={group_location}; role={}",
-                owner.storage_name(),
-                unit_role_kind(role)
-            ),
-        };
-        DiagnosticReason::failure_with_detail(DiagnosticFailureKind::StateMismatch, detail)
-    }
-}
-
-fn json_error_detail(source: &serde_json::Error) -> String {
-    let category = JsonErrorCategory::from(source);
-    format!(
-        "json_category={category}; line={}; column={}",
-        source.line(),
-        source.column()
-    )
-}
-
-fn location_codec_detail(source: &RpgMakerLocationCodecError) -> String {
-    source.safe_diagnostic_detail()
-}
-
-fn projection_codec_detail(source: &RpgMakerProjectionCodecError) -> String {
-    source.safe_diagnostic_detail()
-}
-
-const fn unit_role_kind(role: &TextUnitRole) -> &'static str {
-    match role {
-        TextUnitRole::Scalar(_) => "scalar",
-        TextUnitRole::DialogueSpeaker => "dialogue_speaker",
-        TextUnitRole::DialogueBody => "dialogue_body",
-        TextUnitRole::Choices => "choices",
-        TextUnitRole::ScrollingText => "scrolling_text",
-    }
-}
-
-const fn text_group_kind(kind: TextGroupKind) -> &'static str {
-    kind.storage_name()
 }
 
 fn map_query_error<Q, C>(
@@ -1063,25 +1160,24 @@ fn decode_owner_states(
     let mut snapshots = Vec::new();
     for row in rows {
         let RpgMakerAssetOwnerStateStorageRow {
-            owner_name,
             owner,
             source_snapshot_fingerprint: source_bytes,
             asset_snapshot_fingerprint: asset_bytes,
         } = RpgMakerAssetOwnerStateStorageRow::decode(row).map_err(map_storage_row_error)?;
         if !active.insert(owner) {
             return Err(InvalidRpgMakerTranslationAssetSnapshot::DuplicateOwner(
-                owner_name,
+                owner,
             ));
         }
         let source = SourceSnapshotFingerprint::from_slice(&source_bytes).map_err(|error| {
             InvalidRpgMakerTranslationAssetSnapshot::InvalidOwnerSourceFingerprintLength {
-                owner: owner.storage_name().to_owned(),
+                owner,
                 actual: error.actual(),
             }
         })?;
         let asset = AssetSnapshotFingerprint::from_slice(&asset_bytes).map_err(|error| {
             InvalidRpgMakerTranslationAssetSnapshot::InvalidOwnerAssetFingerprintLength {
-                owner: owner.storage_name().to_owned(),
+                owner,
                 actual: error.actual(),
             }
         })?;
@@ -1109,36 +1205,44 @@ fn decode_resources(
         let kind = row
             .required_text("resource_kind")
             .map_err(map_storage_row_error)?;
-        let resource = match kind.as_str() {
-            TERMINOLOGY_RESOURCE_KIND => &mut terminology,
-            PLACEHOLDER_RULES_RESOURCE_KIND => &mut placeholders,
+        let (resource, resource_kind) = match kind.as_str() {
+            TERMINOLOGY_RESOURCE_KIND => (
+                &mut terminology,
+                TranslationSnapshotResourceKind::Terminology,
+            ),
+            PLACEHOLDER_RULES_RESOURCE_KIND => (
+                &mut placeholders,
+                TranslationSnapshotResourceKind::PlaceholderRules,
+            ),
             _ => {
-                return Err(
-                    InvalidRpgMakerTranslationAssetSnapshot::UnknownTranslationResource(kind),
-                );
+                return Err(InvalidRpgMakerTranslationAssetSnapshot::UnknownTranslationResource);
             }
         };
         let canonical_json = row
             .required_text("canonical_json")
             .map_err(map_storage_row_error)?;
         if canonical_json.is_empty() {
-            return Err(InvalidRpgMakerTranslationAssetSnapshot::BlankTranslationResource(kind));
+            return Err(
+                InvalidRpgMakerTranslationAssetSnapshot::BlankTranslationResource(resource_kind),
+            );
         }
         if resource.is_some() {
             return Err(
-                InvalidRpgMakerTranslationAssetSnapshot::DuplicateTranslationResource(kind),
+                InvalidRpgMakerTranslationAssetSnapshot::DuplicateTranslationResource(
+                    resource_kind,
+                ),
             );
         }
         *resource = Some(canonical_json);
     }
     let terminology = terminology.ok_or(
         InvalidRpgMakerTranslationAssetSnapshot::MissingTranslationResource(
-            TERMINOLOGY_RESOURCE_KIND,
+            TranslationSnapshotResourceKind::Terminology,
         ),
     )?;
     let placeholders = placeholders.ok_or(
         InvalidRpgMakerTranslationAssetSnapshot::MissingTranslationResource(
-            PLACEHOLDER_RULES_RESOURCE_KIND,
+            TranslationSnapshotResourceKind::PlaceholderRules,
         ),
     )?;
     Ok((terminology, placeholders))
@@ -1160,7 +1264,7 @@ fn decode_groups(
         .map(|OwnerSqliteRow { owner, row }| {
             if !active_owners.contains(owner) {
                 return Err(InvalidRpgMakerTranslationAssetSnapshot::InactiveOwner(
-                    owner.storage_name().to_owned(),
+                    owner,
                 ));
             }
             let mut row =
@@ -1201,7 +1305,7 @@ fn decode_unit(
 ) -> Result<DecodedUnit, InvalidRpgMakerTranslationAssetSnapshot> {
     if !active_owners.contains(owner) {
         return Err(InvalidRpgMakerTranslationAssetSnapshot::InactiveOwner(
-            owner.storage_name().to_owned(),
+            owner,
         ));
     }
     let mut row = RpgMakerAssetStorageRowDecoder::new(row, 9).map_err(map_storage_row_error)?;
@@ -1210,9 +1314,8 @@ fn decode_unit(
     let group_kind_raw = row
         .required_text("group_kind")
         .map_err(map_storage_row_error)?;
-    let kind = TextGroupKind::from_storage_name(group_kind_raw.as_str()).ok_or(
-        InvalidRpgMakerTranslationAssetSnapshot::UnknownGroupKind(group_kind_raw),
-    )?;
+    let kind = TextGroupKind::from_storage_name(group_kind_raw.as_str())
+        .ok_or(InvalidRpgMakerTranslationAssetSnapshot::UnknownGroupKind)?;
     let group_semantic_order_key = row
         .required_blob("semantic_order_key")
         .and_then(|encoded| {
@@ -1388,11 +1491,11 @@ fn map_storage_row_error(
         RpgMakerAssetStorageRowError::InvalidSemanticOrderKey { column, source } => {
             InvalidRpgMakerTranslationAssetSnapshot::InvalidSemanticOrderKey { column, source }
         }
-        RpgMakerAssetStorageRowError::UnknownOwner(owner) => {
-            InvalidRpgMakerTranslationAssetSnapshot::UnknownOwner(owner)
+        RpgMakerAssetStorageRowError::UnknownOwner(_) => {
+            InvalidRpgMakerTranslationAssetSnapshot::UnknownOwner
         }
-        RpgMakerAssetStorageRowError::UnknownGroupKind(kind) => {
-            InvalidRpgMakerTranslationAssetSnapshot::UnknownGroupKind(kind)
+        RpgMakerAssetStorageRowError::UnknownGroupKind(_) => {
+            InvalidRpgMakerTranslationAssetSnapshot::UnknownGroupKind
         }
         RpgMakerAssetStorageRowError::InvalidLocation(source) => {
             InvalidRpgMakerTranslationAssetSnapshot::InvalidLocation(source)
@@ -1449,12 +1552,10 @@ fn assemble_corpus(
             }
             continue;
         }
-        if let Some(existing_index) = group_order_keys.get(&group.semantic_order_key).copied() {
+        if group_order_keys.contains_key(&group.semantic_order_key) {
             return Err(
                 InvalidRpgMakerTranslationAssetSnapshot::DuplicateSemanticOrderKey {
-                    level: "Group",
-                    first: groups[existing_index].group_location.to_string(),
-                    second: group.group_location.to_string(),
+                    level: TranslationSnapshotSemanticOrderLevel::Group,
                 },
             );
         }
@@ -1509,15 +1610,16 @@ fn assemble_corpus(
                 },
             );
         }
-        if let Some((first_location, first_role)) = unit_order_keys.insert(
-            unit.semantic_order_key.clone(),
-            (unit.group_location.clone(), unit.role.clone()),
-        ) {
+        if unit_order_keys
+            .insert(
+                unit.semantic_order_key.clone(),
+                (unit.group_location.clone(), unit.role.clone()),
+            )
+            .is_some()
+        {
             return Err(
                 InvalidRpgMakerTranslationAssetSnapshot::DuplicateSemanticOrderKey {
-                    level: "Unit",
-                    first: format!("{first_location} / {first_role:?}"),
-                    second: format!("{} / {:?}", group.group_location, unit.role),
+                    level: TranslationSnapshotSemanticOrderLevel::Unit,
                 },
             );
         }
@@ -1582,8 +1684,6 @@ mod tests {
     use crate::project_name::ProjectName;
     use crate::rpg_maker::model::{ScalarFieldKey, TextUnitRole};
     use crate::rpg_maker::text::{RpgMakerLocationStep, RpgMakerSource};
-    use crate::runtime::cpu::CpuExecutorUnavailable;
-    use crate::runtime::sqlite::SqliteRuntimeError;
     use rusqlite::params_from_iter;
 
     use super::*;
@@ -1663,22 +1763,33 @@ mod tests {
                 actual: SourceSnapshotFingerprint::from_bytes([0x22; 32]),
             };
 
-        let diagnostic = error.safe_diagnostic_source(
-            DiagnosticStage::Translate,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
+        assert_eq!(
+            serde_json::to_value(error.diagnostic_report()).expect("报告可序列化"),
+            serde_json::json!({
+                "effect": "unchanged",
+                "primary": {
+                    "code": "rpg_maker.translate.asset_snapshot.project_changed",
+                    "stage": "translate",
+                    "issue": {
+                        "family": "rpg_maker",
+                        "details": {
+                            "stage": "translate_planning",
+                            "problem": {
+                                "kind": "translation_asset",
+                                "database_path": "C:/projects/demo/project.db",
+                                "problem": {
+                                    "kind": "project_snapshot_changed",
+                                    "expected": "1111111111111111111111111111111111111111111111111111111111111111",
+                                    "actual": "2222222222222222222222222222222222222222222222222222222222222222"
+                                }
+                            }
+                        }
+                    },
+                    "resolution": "check_project_state"
+                },
+                "related": []
+            })
         );
-
-        assert!(matches!(
-            diagnostic.subject,
-            DiagnosticSubject::Path { ref path } if path.ends_with("project.db")
-        ));
-        let DiagnosticReason::FailureWithDetail { failure, detail } = diagnostic.reason else {
-            panic!("指纹变化必须保留结构化详情");
-        };
-        assert_eq!(failure, DiagnosticFailureKind::StateMismatch);
-        assert!(detail.contains(&"11".repeat(32)));
-        assert!(detail.contains(&"22".repeat(32)));
     }
 
     #[test]
@@ -1688,33 +1799,45 @@ mod tests {
                 database_path: PathBuf::from("C:/projects/demo/project.db"),
                 source: CpuTaskExecutionError::Cancelled,
             };
-        let cancelled = cancelled.safe_diagnostic_source(
-            DiagnosticStage::Translate,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::Retry,
+        assert_eq!(
+            serde_json::to_value(cancelled.diagnostic_report()).expect("报告可序列化"),
+            serde_json::json!({
+                "effect": "unchanged",
+                "primary": {
+                    "code": "rpg_maker.translate.asset_snapshot.decode_units.cancelled",
+                    "stage": "translate",
+                    "issue": {
+                        "family": "rpg_maker",
+                        "details": {
+                            "stage": "translate_planning",
+                            "problem": {
+                                "kind": "translation_asset",
+                                "database_path": "C:/projects/demo/project.db",
+                                "problem": {
+                                    "kind": "compute",
+                                    "operation": "decode_units",
+                                    "failure": "cancelled"
+                                }
+                            }
+                        }
+                    },
+                    "resolution": "retry"
+                },
+                "related": []
+            })
         );
-        assert!(matches!(
-            cancelled.reason,
-            DiagnosticReason::Failure {
-                failure: DiagnosticFailureKind::LockCancelled
-            }
-        ));
-        assert!(matches!(cancelled.subject, DiagnosticSubject::Path { .. }));
 
         let sentinel = "RAW_DATABASE_ROW_SENTINEL";
         let invalid: ProductionAssetReadingError =
             RpgMakerTranslationAssetReadingError::InvalidSnapshot {
                 database_path: PathBuf::from("C:/projects/demo/project.db"),
-                source: InvalidRpgMakerTranslationAssetSnapshot::UnknownOwner(sentinel.to_owned()),
+                source: map_storage_row_error(RpgMakerAssetStorageRowError::UnknownOwner(
+                    sentinel.to_owned(),
+                )),
             };
-        let invalid = invalid.safe_diagnostic_source(
-            DiagnosticStage::Translate,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
-        );
-        let rendered = invalid.reason.render();
-        assert!(rendered.contains("unknown_rpg_maker_asset_owner"));
-        assert!(!rendered.contains(sentinel));
+        let wire = serde_json::to_string(&invalid.diagnostic_report()).expect("报告可序列化");
+        assert!(wire.contains("rpg_maker.translate.asset_snapshot.unknown_owner"));
+        assert!(!wire.contains(sentinel));
     }
 
     #[test]
@@ -1732,23 +1855,21 @@ mod tests {
                     ),
                 ),
             };
-        let projection = projection.safe_diagnostic_source(
-            DiagnosticStage::Translate,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
+        assert_eq!(
+            serde_json::to_value(projection.diagnostic_report()).expect("报告可序列化")["primary"]
+                ["issue"]["details"]["problem"]["problem"]["violation"],
+            serde_json::json!({
+                "kind": "invalid_role",
+                "failure": {
+                    "kind": "projection",
+                    "violation": {
+                        "kind": "non_contiguous_dialogue_body_lines",
+                        "expected": 2,
+                        "actual": 4
+                    }
+                }
+            })
         );
-        let projection = projection.reason.render();
-        for fact in [
-            "codec=projection",
-            "structure=non_contiguous_dialogue_body_lines",
-            "expected=2",
-            "actual=4",
-        ] {
-            assert!(
-                projection.contains(fact),
-                "投影诊断缺少 {fact}: {projection}"
-            );
-        }
 
         let group_location = RpgMakerLocation::value(
             RpgMakerSource::map(3),
@@ -1763,16 +1884,21 @@ mod tests {
                     role: TextUnitRole::DialogueBody,
                 },
             };
-        let group = group
-            .safe_diagnostic_source(
-                DiagnosticStage::Translate,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            )
-            .reason
-            .render();
-        assert!(group.contains("group_location=data/Map003.json.events"));
-        assert!(group.contains("role=dialogue_body"));
+        assert_eq!(
+            serde_json::to_value(group.diagnostic_report()).expect("报告可序列化")["primary"]["issue"]
+                ["details"]["problem"]["problem"]["violation"],
+            serde_json::json!({
+                "kind": "duplicate_logical_unit",
+                "owner": "builtin",
+                "group_location": {
+                    "source": { "kind": "map", "map_id": 3 },
+                    "steps": [
+                        { "kind": "object_key", "key": "events" }
+                    ]
+                },
+                "role": { "kind": "dialogue_body" }
+            })
+        );
     }
 
     #[tokio::test]
@@ -2073,10 +2199,8 @@ mod tests {
         assert!(matches!(
             error,
             InvalidRpgMakerTranslationAssetSnapshot::DuplicateSemanticOrderKey {
-                level: "Group",
-                ref first,
-                ref second,
-            } if first == &first_location.to_string() && second == &second_location.to_string()
+                level: TranslationSnapshotSemanticOrderLevel::Group,
+            }
         ));
     }
 
@@ -2172,15 +2296,11 @@ mod tests {
         )
         .expect_err("同一 Group 的不同 Unit 共用 semantic_order_key 必须失败");
 
-        let expected_first = format!("{group_location} / {first_role:?}");
-        let expected_second = format!("{group_location} / {second_role:?}");
         assert!(matches!(
             error,
             InvalidRpgMakerTranslationAssetSnapshot::DuplicateSemanticOrderKey {
-                level: "Unit",
-                ref first,
-                ref second,
-            } if first == &expected_first && second == &expected_second
+                level: TranslationSnapshotSemanticOrderLevel::Unit,
+            }
         ));
     }
 
@@ -2236,15 +2356,11 @@ mod tests {
         )
         .expect_err("不同 owner 和 Group 的 Unit 共用 semantic_order_key 必须失败");
 
-        let expected_first = format!("{first_location} / {first_role:?}");
-        let expected_second = format!("{second_location} / {second_role:?}");
         assert!(matches!(
             error,
             InvalidRpgMakerTranslationAssetSnapshot::DuplicateSemanticOrderKey {
-                level: "Unit",
-                ref first,
-                ref second,
-            } if first == &expected_first && second == &expected_second
+                level: TranslationSnapshotSemanticOrderLevel::Unit,
+            }
         ));
     }
 
@@ -2268,26 +2384,28 @@ mod tests {
                 );
                 CREATE TABLE rpg_maker_text_group (
                     owner TEXT NOT NULL,
+                    group_id INTEGER NOT NULL CHECK (group_id > 0),
                     group_location TEXT NOT NULL,
                     semantic_order_key BLOB NOT NULL,
                     group_kind TEXT NOT NULL,
-                    PRIMARY KEY (owner, group_location),
+                    PRIMARY KEY (owner, group_id),
+                    UNIQUE (owner, group_location),
                     UNIQUE (owner, semantic_order_key)
                 );
                 CREATE TABLE rpg_maker_text_unit (
                     owner TEXT NOT NULL,
-                    group_location TEXT NOT NULL,
+                    group_id INTEGER NOT NULL CHECK (group_id > 0),
                     unit_role TEXT NOT NULL,
                     semantic_order_key BLOB NOT NULL,
                     source_content_json TEXT NOT NULL,
                     source_context_json TEXT NOT NULL,
                     translation_content_json TEXT,
                     translation_state BLOB,
-                    PRIMARY KEY (owner, group_location, unit_role),
+                    PRIMARY KEY (owner, group_id, unit_role),
                     UNIQUE (owner, semantic_order_key)
                 );
                 CREATE INDEX rpg_maker_text_unit_owner_group_order_idx
-                    ON rpg_maker_text_unit(owner, group_location, semantic_order_key);
+                    ON rpg_maker_text_unit(owner, group_id, semantic_order_key);
 
                 INSERT INTO metadata VALUES (zeroblob(32));
                 INSERT INTO rpg_maker_asset_owner_state VALUES
@@ -2297,12 +2415,12 @@ mod tests {
                     ('terminology', '[]'),
                     ('placeholder_rules', '[]');
                 INSERT INTO rpg_maker_text_group VALUES
-                    ('builtin', 'group-b', X'010000000000000001000000000000000000', 'map'),
-                    ('builtin', 'group-a', X'010000000000000000000000000000000000', 'map'),
-                    ('rules', 'group-r', X'010000000000000000000000000000000000', 'map');
+                    ('builtin', 2, 'group-b', X'010000000000000001000000000000000000', 'map'),
+                    ('builtin', 1, 'group-a', X'010000000000000000000000000000000000', 'map'),
+                    ('rules', 1, 'group-r', X'010000000000000000000000000000000000', 'map');
                 INSERT INTO rpg_maker_text_unit VALUES
-                    ('builtin', 'group-b', 'role-z', X'010000000000000001000000000000000000', '"z"', '{}', NULL, NULL),
-                    ('builtin', 'group-a', 'role-y', X'010000000000000000000000000000000000', '"y"', '{}', NULL, NULL);
+                    ('builtin', 2, 'role-z', X'010000000000000001000000000000000000', '"z"', '{}', NULL, NULL),
+                    ('builtin', 1, 'role-y', X'010000000000000000000000000000000000', '"y"', '{}', NULL, NULL);
                 "#,
             )
             .expect("测试快照表与行应可建立");
@@ -2371,9 +2489,9 @@ mod tests {
                 assert!(
                     details.iter().any(|detail| {
                         detail.contains("rpg_maker_text_unit_owner_group_order_idx")
-                            && detail.contains("group_location=?")
+                            && detail.contains("group_id=?")
                     }),
-                    "Unit 必须按 owner 与 group_location 定位，不能为每个 Group 扫描整个 owner：{details:?}"
+                    "Unit 必须按 owner 与内部 group_id 定位，不能为每个 Group 扫描整个 owner：{details:?}"
                 );
             }
         }
@@ -2459,8 +2577,7 @@ mod tests {
         .expect_err("未知 group_kind 必须先于损坏的 role 和 source JSON 报告");
         assert!(matches!(
             unknown_kind,
-            InvalidRpgMakerTranslationAssetSnapshot::UnknownGroupKind(ref kind)
-                if kind == "unknown_kind"
+            InvalidRpgMakerTranslationAssetSnapshot::UnknownGroupKind
         ));
 
         let invalid_group_order = decode_unit(

@@ -29,13 +29,13 @@ pub(crate) use project::{
     validated_manual_translation_state_with_compiled_rules_for_connection_with_cancellation,
 };
 pub(crate) use task_record::{
-    GenericTaskRecordDocument, GenericTaskRecordIssue, GenericTaskRecordState,
-    GenericTaskResponseRecord,
+    GenericTaskRecordDocument, GenericTaskRecordState, GenericTaskResponseRecord,
 };
 pub(crate) use translate::{
-    AutomaticStateResources, GenericPlanningError, GenericUnitKey, GenericUnitMap, PlannedTask,
-    PlanningUnit, ResponseProblem, TranslationAcceptance, TranslationPlan, ValidatedReuse,
-    accept_parsed_response_with_cancellation, current_translation_for_stored_with_cancellation,
+    AutomaticStateResources, GenericPlanningError, GenericPlanningUnitLocator, GenericUnitKey,
+    GenericUnitMap, PlannedTask, PlanningUnit, ResponseProblem, TranslationAcceptance,
+    TranslationPlan, ValidatedReuse, accept_parsed_response_with_cancellation,
+    current_translation_for_stored_with_cancellation,
     plan_translation_with_validator_and_cancellation,
     terminology_hit_fingerprint_with_cancellation,
 };
@@ -45,7 +45,7 @@ pub(crate) use write_back::{
 };
 
 #[cfg(test)]
-pub(crate) use placeholder::{GenericPlaceholderRuleDefinition, validate_translation_placeholders};
+pub(crate) use placeholder::GenericPlaceholderRuleDefinition;
 #[cfg(test)]
 pub(crate) use project::manual_translation_state_for_connection;
 #[cfg(test)]

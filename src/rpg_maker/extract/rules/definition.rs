@@ -437,66 +437,57 @@ pub(crate) enum InvalidPathReason {
     },
 }
 
-impl InvalidPathReason {
-    fn code(self) -> &'static str {
-        match self {
-            Self::Empty => "empty",
-            Self::UnsupportedJsonPath { .. } => "unsupported_json_path",
-            Self::UnexpectedDot { .. } => "unexpected_dot",
-            Self::DotBeforeBracket { .. } => "dot_before_bracket",
-            Self::MissingDot { .. } => "missing_dot",
-            Self::InvalidBareKey { .. } => "invalid_bare_key",
-            Self::TrailingDot { .. } => "trailing_dot",
-            Self::UnclosedBracket { .. } => "unclosed_bracket",
-            Self::MissingQuotedKey { .. } => "missing_quoted_key",
-            Self::InvalidQuotedKey { .. } => "invalid_quoted_key_json",
-            Self::QuotedKeyMissingClose { .. } => "quoted_key_missing_close",
-            Self::InvalidBracket { .. } => "invalid_bracket",
-            Self::IndexOutOfRange { .. } => "index_out_of_range",
-        }
-    }
-
-    fn offset(self) -> Option<usize> {
-        match self {
-            Self::Empty => None,
-            Self::UnsupportedJsonPath { offset }
-            | Self::UnexpectedDot { offset }
-            | Self::DotBeforeBracket { offset }
-            | Self::MissingDot { offset }
-            | Self::InvalidBareKey { offset }
-            | Self::TrailingDot { offset }
-            | Self::UnclosedBracket { offset }
-            | Self::MissingQuotedKey { offset }
-            | Self::InvalidQuotedKey { offset, .. }
-            | Self::QuotedKeyMissingClose { offset }
-            | Self::InvalidBracket { offset }
-            | Self::IndexOutOfRange { offset } => Some(offset),
-        }
-    }
-
-    fn safe_detail(self) -> String {
-        let mut detail = format!("path_error={}", self.code());
-        if let Some(offset) = self.offset() {
-            detail.push_str(&format!("; byte_offset={offset}"));
-        }
-        if let Self::InvalidQuotedKey {
-            json_category,
-            line,
-            column,
-            ..
-        } = self
-        {
-            detail.push_str(&format!(
-                "; json_category={json_category}; json_line={line}; json_column={column}"
-            ));
-        }
-        detail
-    }
-}
-
 impl fmt::Display for InvalidPathReason {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.code())
+        match self {
+            Self::Empty => formatter.write_str("路径不能为空"),
+            Self::UnsupportedJsonPath { offset } => {
+                write!(formatter, "路径第 {offset} 个字节处不支持 JSONPath 语法")
+            }
+            Self::UnexpectedDot { offset } => {
+                write!(formatter, "路径第 {offset} 个字节处出现了意外的点号")
+            }
+            Self::DotBeforeBracket { offset } => {
+                write!(
+                    formatter,
+                    "路径第 {offset} 个字节处的点号后不能直接跟方括号"
+                )
+            }
+            Self::MissingDot { offset } => {
+                write!(formatter, "路径第 {offset} 个字节处缺少分隔点号")
+            }
+            Self::InvalidBareKey { offset } => {
+                write!(formatter, "路径第 {offset} 个字节处的裸键无效")
+            }
+            Self::TrailingDot { offset } => {
+                write!(formatter, "路径第 {offset} 个字节处以点号结束")
+            }
+            Self::UnclosedBracket { offset } => {
+                write!(formatter, "路径第 {offset} 个字节处的方括号没有闭合")
+            }
+            Self::MissingQuotedKey { offset } => {
+                write!(formatter, "路径第 {offset} 个字节处缺少带引号的键")
+            }
+            Self::InvalidQuotedKey {
+                offset,
+                json_category,
+                line,
+                column,
+            } => write!(
+                formatter,
+                "路径第 {offset} 个字节处的带引号键不是有效 JSON 字符串（{}，第 {line} 行第 {column} 列）",
+                json_error_category_name(*json_category)
+            ),
+            Self::QuotedKeyMissingClose { offset } => {
+                write!(formatter, "路径第 {offset} 个字节处的带引号键没有闭合")
+            }
+            Self::InvalidBracket { offset } => {
+                write!(formatter, "路径第 {offset} 个字节处的方括号内容无效")
+            }
+            Self::IndexOutOfRange { offset } => {
+                write!(formatter, "路径第 {offset} 个字节处的数组索引超出范围")
+            }
+        }
     }
 }
 
@@ -607,119 +598,132 @@ pub(crate) enum RulesDefinitionError {
     },
 }
 
-impl RulesDefinitionError {
-    /// 从仍持有解析器类型的位置投影可公开事实；不读取任意错误文本或规则正文。
-    pub(super) fn safe_detail(&self) -> String {
+pub(super) fn write_pcre2_error(
+    formatter: &mut fmt::Formatter<'_>,
+    source: &pcre2::Error,
+) -> fmt::Result {
+    let kind = match source.kind() {
+        pcre2::ErrorKind::Compile => "编译",
+        pcre2::ErrorKind::JIT => "JIT",
+        pcre2::ErrorKind::Match => "匹配",
+        pcre2::ErrorKind::Info => "信息查询",
+        pcre2::ErrorKind::Option => "选项",
+        _ => "未知",
+    };
+    write!(formatter, "PCRE2 {kind}错误（代码 {}", source.code())?;
+    if let Some(offset) = source.offset() {
+        write!(formatter, "，偏移 {offset}")?;
+    }
+    formatter.write_str("）")
+}
+
+fn json_error_category_name(category: JsonErrorCategory) -> &'static str {
+    match category {
+        JsonErrorCategory::Io => "I/O 错误",
+        JsonErrorCategory::Syntax => "语法错误",
+        JsonErrorCategory::Data => "数据错误",
+        JsonErrorCategory::Eof => "意外结束",
+        JsonErrorCategory::DuplicateObjectKey => "重复对象键",
+    }
+}
+
+fn rule_source_name(source: &str) -> &str {
+    match source {
+        "file" => "文件",
+        "plugin" => "插件",
+        "command" => "事件命令",
+        _ => source,
+    }
+}
+
+impl fmt::Display for RulesDefinitionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidToml(source) => {
-                let mut detail = "format=toml; error=syntax_or_schema".to_owned();
+                formatter.write_str("Rules TOML 格式或结构无效")?;
                 if let Some(span) = source.span() {
-                    detail.push_str(&format!(
-                        "; byte_start={}; byte_end={}",
-                        span.start, span.end
-                    ));
+                    write!(formatter, "（字节范围 {}..{}）", span.start, span.end)?;
                 }
-                detail
+                Ok(())
             }
-            Self::InvalidCanonicalJson(source) => format!(
-                "format=canonical_json; json_category={}; json_line={}; json_column={}",
-                json_error_classification(source),
+            Self::InvalidCanonicalJson(source) => write!(
+                formatter,
+                "保存的 Rules canonical JSON 无效（{}，第 {} 行第 {} 列）",
+                json_error_category_name(JsonErrorCategory::from(source)),
                 source.line(),
                 source.column()
             ),
-            Self::EncodeCanonicalJson(source) => format!(
-                "operation=encode_canonical_json; json_category={}; json_line={}; json_column={}",
-                json_error_classification(source),
+            Self::EncodeCanonicalJson(source) => write!(
+                formatter,
+                "Rules canonical JSON 编码失败（{}，第 {} 行第 {} 列）",
+                json_error_category_name(JsonErrorCategory::from(source)),
                 source.line(),
                 source.column()
             ),
             Self::NonCanonicalJson => {
-                "format=canonical_json; error=non_canonical_encoding".to_owned()
+                formatter.write_str("保存的 Rules canonical JSON 不符合当前规范编码")
             }
             Self::MissingSource { rule_number } => {
-                format!("rule={rule_number}; field=source; error=missing")
+                write!(formatter, "Rules 规则 {rule_number} 没有声明来源")
             }
-            Self::ConflictingSources { rule_number } => format!(
-                "rule={rule_number}; field=source; error=conflicting_file_plugin_or_command"
+            Self::ConflictingSources { rule_number } => write!(
+                formatter,
+                "Rules 规则 {rule_number} 同时声明了互斥的文件、插件或事件命令来源"
             ),
-            Self::ParameterWithoutCode { rule_number } => format!(
-                "rule={rule_number}; source=non_command; field=parameter; error=requires_code"
+            Self::ParameterWithoutCode { rule_number } => write!(
+                formatter,
+                "Rules 规则 {rule_number} 声明了 parameter，但没有声明 code"
             ),
-            Self::MissingParameter { rule_number } => {
-                format!("rule={rule_number}; source=command; field=parameter; error=missing")
-            }
-            Self::InvalidCode { rule_number, code } => format!(
-                "rule={rule_number}; source=command; field=code; actual={code}; expected=non_negative_integer"
+            Self::MissingParameter { rule_number } => write!(
+                formatter,
+                "Rules 规则 {rule_number} 声明了 code，但没有声明 parameter"
+            ),
+            Self::InvalidCode { rule_number, code } => write!(
+                formatter,
+                "Rules 规则 {rule_number} 的 code 为 {code}，必须是非负整数"
             ),
             Self::MissingPath {
                 rule_number,
                 source,
-            } => format!(
-                "rule={rule_number}; source={source}; target=path; field=path; error=missing"
+            } => write!(
+                formatter,
+                "Rules 规则 {rule_number} 的{}来源缺少 path",
+                rule_source_name(source)
             ),
             Self::EmptyField { rule_number, field } => {
-                format!("rule={rule_number}; field={field}; error=empty")
+                write!(
+                    formatter,
+                    "Rules 规则 {rule_number} 的字段 {field:?} 不能为空"
+                )
             }
-            Self::InvalidFile { rule_number, .. } => format!(
-                "rule={rule_number}; source=file; field=file; error=unsafe_data_file_name; expected=exact_json_basename_or_map_wildcard"
+            Self::InvalidFile { rule_number, .. } => write!(
+                formatter,
+                "Rules 规则 {rule_number} 的 file 必须是安全的精确 .json 基名或 Map*.json"
             ),
             Self::InvalidPath {
                 rule_number,
                 reason,
                 ..
-            } => format!(
-                "rule={rule_number}; target=path; field=path; {}",
-                reason.safe_detail()
-            ),
+            } => write!(formatter, "Rules 规则 {rule_number} 的 path 无效：{reason}"),
             Self::EmptyPattern { rule_number } => {
-                format!("rule={rule_number}; field=pattern; error=empty")
+                write!(formatter, "Rules 规则 {rule_number} 的 pattern 不能为空")
             }
             Self::InvalidPattern {
                 rule_number,
                 source,
                 ..
-            } => format!(
-                "rule={rule_number}; field=pattern; error=invalid_pcre2; {}",
-                pcre2_error_detail(source)
-            ),
+            } => {
+                write!(formatter, "Rules 规则 {rule_number} 的 pattern 无法编译：")?;
+                write_pcre2_error(formatter, source)
+            }
             Self::InvalidNamedCaptures {
                 rule_number,
                 actual_count,
-            } => format!(
-                "rule={rule_number}; field=pattern.named_captures; error=expected_only_text; actual_count={}",
-                actual_count
+            } => write!(
+                formatter,
+                "Rules 规则 {rule_number} 的 pattern 必须且只能有一个名为 text 的命名捕获，实际有 {actual_count} 个"
             ),
         }
-    }
-}
-
-pub(super) fn pcre2_error_detail(source: &pcre2::Error) -> String {
-    let kind = match source.kind() {
-        pcre2::ErrorKind::Compile => "compile",
-        pcre2::ErrorKind::JIT => "jit",
-        pcre2::ErrorKind::Match => "match",
-        pcre2::ErrorKind::Info => "info",
-        pcre2::ErrorKind::Option => "option",
-        _ => "unknown",
-    };
-    let mut detail = format!("pcre2_kind={kind}; pcre2_code={}", source.code());
-    if let Some(offset) = source.offset() {
-        detail.push_str(&format!("; pcre2_offset={offset}"));
-    }
-    detail
-}
-
-fn json_error_classification(source: &serde_json::Error) -> &'static str {
-    JsonErrorCategory::from(source).storage_name()
-}
-
-impl fmt::Display for RulesDefinitionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "Rules definition invalid: {}",
-            self.safe_detail()
-        )
     }
 }
 
@@ -789,6 +793,23 @@ pattern = '(?i)\AGabText\s+(?<text>.+)\z'
                 Err(RulesDefinitionError::InvalidToml(_))
             ));
         }
+    }
+
+    #[test]
+    fn definition_error_display_is_human_text_not_detail_protocol() {
+        let error = RulesDefinition::parse(
+            r#"
+[[rule]]
+file = "Actors.json"
+path = ''
+"#,
+        )
+        .expect_err("空路径必须失败");
+
+        let rendered = error.to_string();
+        assert_eq!(rendered, "Rules 规则 1 的 path 无效：路径不能为空");
+        assert!(!rendered.contains("rule="));
+        assert!(!rendered.contains("path_error="));
     }
 
     #[test]

@@ -51,29 +51,7 @@ cli-argument-conflict = { $argument } cannot be used with the other provided arg
 cli-wrong-number-of-values = The wrong number of values was provided for { $argument }.
 cli-invalid-utf8 = A command-line argument is not valid Unicode.
 cli-parse-failure = The command line could not be parsed.
-log-label-phase-check-project = checking project
-log-label-phase-scan-source = scanning source
-log-label-phase-prepare-candidate = preparing candidate
-log-label-phase-update-database = updating database
-log-label-phase-publish = publishing
-log-label-phase-builtin = built-in extraction
-log-label-phase-rules = rules extraction
-log-label-phase-lua = Lua processing
-log-label-phase-planning = planning
-log-label-phase-confirmed-tasks = confirming tasks
-log-label-phase-no-work = no work required
-log-label-phase-read-assets = reading assets
-log-label-phase-plan-rpg-maker-write-back = planning RPG Maker write-back
-log-label-phase-rewrite-documents = rewriting documents
-log-label-phase-validate-candidate = validating candidate
-log-label-task-complete = complete
-log-label-task-partial = partial
-log-label-task-unavailable = unavailable
-log-label-task-failed = failed
-error-state-applied-finalization = The result took effect, but finalization failed. Inspect the project state before retrying.
 error-no-executable-extract-owner = Clearing these owners leaves no executable Extract owner, so no plan was saved.
-error-plan-save-failed-applied = The command result took effect, but the new run plan was not saved. Pass the intended options explicitly next time.
-error-plan-save-outcome-unknown = The command result took effect, but the run-plan commit outcome is unknown. Pass the intended options explicitly next time.
 plan-source-explicit = explicit input
 plan-source-project-state = project state
 plan-source-product-default = product behavior
@@ -144,41 +122,71 @@ log-lua-print = Lua: { $message }
 log-lua-summary = Lua activity: database calls { $database_calls }, changed rows { $changed_rows }, translation calls { $translation_calls }, printed lines { $printed_lines }.
 log-plan-resolved = Command { $command } resolved its plan from { $source }.
 log-phase-started = Phase started: { $phase }.
-log-phase-finished = Phase finished: { $phase }.
 log-retry-summary = { $count ->
     [one] 1 retry was performed.
    *[other] { $count } retries were performed.
 }
-log-no-work = No work was required: { $reason }.
-log-no-work-translation-up-to-date = translations already match the current source and profile
-log-partial-result = { $count ->
-    [one] 1 partial result requires attention.
-   *[other] { $count } partial results require attention.
-}
 log-translation-task-started = Translation task { $index }/{ $total } started.
 log-translation-task-finished = Translation task { $index } finished with outcome { $outcome }.
-log-translation-task-diagnostic = Translation task { $index } reported a diagnostic after { $attempts } attempts: { $diagnostic }
+log-run-recovery-required = Command { $command } ended in a state that requires recovery; follow the recovery locations in the diagnostic.
+log-phase-completed = Phase completed: { $phase }.
+log-phase-stopped = { $outcome ->
+    [failed] Phase failed: { $phase }.
+    [cancelled] Phase cancelled: { $phase }.
+   *[other] Phase stopped: { $phase }.
+}
+log-cancellation-requested = Cancellation requested after { $confirmed } of { $total } items were confirmed.
+log-cancellation-requested-indeterminate = Cancellation requested after { $confirmed } items were confirmed; the total is not known.
+log-run-plan-finalized = { $result ->
+    [saved] The run plan was saved.
+    [not_saved] The run plan was not saved.
+    [saved_finalization_failed] The run plan was saved, but finalization failed.
+    [outcome_unknown] The final state of the run plan is unknown.
+   *[other] Run-plan finalization stopped without a recognized result.
+}
+log-translation-finished = { $result ->
+    [not_started] Translation did not start.
+    [no_work] Translation finished with no work required.
+    [complete] Translation completed.
+    [incomplete] Translation finished with incomplete work.
+    [failed] Translation failed.
+    [cancelled] Translation was cancelled.
+   *[other] Translation stopped without a recognized result.
+}
+log-publication-started = Publication started for output root { $path }.
+log-publication-finished = { $result ->
+    [published] Publication completed.
+    [not_published] Publication did not modify the output.
+    [recovery_required] Publication stopped and requires recovery.
+    [outcome_unknown] The final publication state is unknown.
+   *[other] Publication stopped without a recognized result.
+}
+log-project-log-degraded = The project log degraded; { $failure_kinds } failure categories were recorded.
+log-task-outcome-value = { $outcome ->
+    [complete] completed
+    [partial] partially completed
+    [unavailable] unavailable
+    [failed] failed
+    [not_committed_after_earlier_failure] not committed after an earlier failure
+    [cancelled] cancelled
+   *[other] ended without a recognized result
+}
 diagnostic-title = Error [{ $code }]
 diagnostic-stage = Stage: { $stage }
-diagnostic-subject = Location: { $subject }
-diagnostic-subject-value = { $kind ->
-    [command] command { $value }
-    [field] field { $value }
-    [project] project { $value }
-    [profile] profile { $value }
-    [component] component { $value }
-   *[other] { $value }
-}
-diagnostic-reason = Reason: { $reason }
-diagnostic-impact = Impact: { $impact }
-diagnostic-action = Action: { $action }
-diagnostic-recovery = Recovery: { $recovery }
-diagnostic-recovery-value = { $kind ->
-    [component] component { $value }
-    [transaction] transaction { $value }
-   *[other] { $value }
-}
+diagnostic-location = Location: { $subject }
+diagnostic-explanation = Reason: { $reason }
+diagnostic-effect = Impact: { $impact }
+diagnostic-resolution = Action: { $action }
 diagnostic-related = Related error { $index }:
+diagnostic-relation-value = { $code ->
+    [cleanup] cleanup
+    [rollback] rollback
+    [discard] discard
+    [finalization] finalization
+    [shutdown] shutdown
+    [observability] observability
+   *[other] { $code }
+}
 diagnostic-stage-value = { $code ->
     [process_startup] Process startup
     [process_output] Process output
@@ -195,23 +203,27 @@ diagnostic-stage-value = { $code ->
     [publication] Publication
     [shutdown] Shutdown
     [logging] Project logging
+    [runtime] Runtime
    *[other] __ATT_FALLBACK__
 }
-diagnostic-impact-value = { $code ->
+diagnostic-effect-value = { $code ->
     [unchanged] State was not changed
-    [valid_progress_preserved] Valid progress was preserved
-    [result_applied_but_run_plan_not_saved] Result was applied, but the run plan was not saved
-    [state_applied_but_finalization_failed] State was applied, but finalization did not complete
+    [progress_preserved] Valid progress was preserved
+    [applied] State was applied
+    [applied_run_plan_not_saved] State was applied, but the run plan was not saved
+    [applied_finalization_failed] State was applied, but finalization did not complete
     [recovery_required] Recovery is required before the state can be trusted
     [outcome_unknown] The final state is unknown
    *[other] __ATT_FALLBACK__
 }
-diagnostic-action-value = { $code ->
+diagnostic-resolution-value = { $code ->
     [fix_configuration] Correct the named configuration field and retry
     [fix_input] Correct the named input and retry
+    [fix_placeholder_rules] Correct the indicated Placeholder rule and retry
+    [adjust_manual_layout] Manually adjust line breaks and layout at the indicated locations for the stated display width
     [check_path_and_permissions] Check the path, filesystem state, and permissions
     [check_project_state] Inspect the project state, correct it, and retry
-    [retry_after_resolving_contention] Wait for the competing operation to finish, then retry
+    [resolve_contention] Wait for the competing operation to finish, then retry
     [check_model_service] Check the model service response and account limits
     [preserve_recovery_artifacts] Do not delete the listed recovery artifacts; recover the output before retrying
     [retry] Retry the operation
@@ -220,16 +232,14 @@ diagnostic-action-value = { $code ->
 }
 diagnostic-failure-value = { $code ->
     [missing_required_value] A required value is missing
-    [extract_plan_required] No reusable Extract plan is saved; provide --builtin or --rules
     [generic_extract_required] The JSONL input no longer matches the latest Extract; run att generic extract again
     [conflicting_values] The supplied values conflict
     [invalid_syntax] The value has invalid syntax
     [invalid_encoding] The value has invalid text encoding
     [invalid_value] The value violates the required contract
     [not_found] The required object does not exist
-    [busy] The resource is held by another operation
     [state_mismatch] The stored project state does not satisfy this operation
-    [requirement_failed] A required precondition is not satisfied
+    [unsupported_windows_code_page] The Windows code page is not UTF-8
     [transaction_rolled_back] The transaction failed and its changes were rolled back
     [transaction_outcome_unknown] The transaction ended without a confirmed commit or rollback result
     [finalization_failed] The operation result exists but finalization failed
@@ -259,81 +269,32 @@ diagnostic-failure-value = { $code ->
     [response_parsing_failed] The model response is not valid JSON
     [invalid_response_contract] The model response does not satisfy the required response contract
     [transport_failed] The HTTP transport failed before a valid response arrived
-    [lua_database_open_failed] The Lua host could not open the project database session
-    [lua_context_creation_failed] The Lua runtime could not create the VM context
     [lua_compilation_failed] the Lua main program could not be compiled
     [lua_execution_failed] The Lua main program failed while it was running
-    [lua_host_call_failed] A Lua host capability call failed
-    [lua_finalization_failed] The Lua host could not finalize all bound resources
-    [rules_definition_invalid] The Rules program does not satisfy the Rules definition contract
-    [rules_document_read_failed] A source document required by the Rules program could not be read
-    [rules_no_non_blank_match] The Rules entry produced no non-blank semantic unit
-    [rules_invalid_target] The Rules entry selected a value that cannot be used as a text target
     [rules_pattern_match_failed] The Rules PCRE2 pattern could not be evaluated
     [rules_zero_width_match] The Rules pattern produced a zero-width match
     [rules_overlapping_capture] The Rules pattern produced overlapping text captures
     [rules_missing_text_capture] The required named text capture did not participate in the match
     [rules_invalid_capture_range] The Rules match or text capture is outside valid UTF-8 character boundaries
-    [rules_duplicate_target] Two Rules entries claim the same physical text target
-    [rules_invalid_materialization] The Rules projection recipe cannot reconstruct the source value
-    [rules_snapshot_invalid] The extracted Rules groups do not form a valid asset snapshot
-    [rules_snapshot_store_failed] The validated Rules extraction snapshot could not be committed
-    [write_back_extraction_out_of_date] The extracted assets no longer match the current project source
-    [write_back_asset_snapshot_invalid] The stored RPG Maker assets do not form a valid write-back snapshot
-    [source_document_invalid] An RPG Maker source document does not satisfy the required document format
-    [generic_source_document_invalid] A Generic JSONL source document does not satisfy the required format
-    [write_back_mutation_invalid] A validated translation mutation cannot be applied to its frozen source location
-    [write_back_output_path_invalid] A rewritten file is outside the permitted RPG Maker output tree
-    [write_back_output_path_duplicate] More than one rewritten file targets the same output path
-    [write_back_candidate_project_mismatch] The prepared write-back candidate belongs to a different project
     [write_back_candidate_invalid] The write-back candidate does not satisfy the required data/js tree structure
-    [write_back_not_published] The write-back candidate did not replace the current output directory
-    [write_back_published_with_residuals] The output was published, but one or more recovery artifacts could not be removed
     [write_back_recovery_required] The output directory requires recovery before its contents can be trusted
+    [already_exists] The target object already exists
+    [cancelled] The operation was cancelled
+    [concurrent_modification] The project state changed concurrently
+    [duplicate_identifier] An identifier is duplicated
+    [extraction_out_of_date] The stored extraction no longer matches the current source
+    [invalid_content] The content violates the required contract
+    [manual_layout_required] Manual line-break or layout adjustment is required
+    [operation_failed] The operation failed
+    [placeholder_projection_failed] Placeholder projection did not preserve the required structure
+    [profile_not_found] The selected translation Profile does not exist
+    [recovery_required] Recovery is required before the result can be trusted
+    [resource_limit] A required resource limit was reached
+    [resource_limit_exceeded] The operation exceeded a backend resource limit
+    [source_snapshot_mismatch] The source no longer matches the stored snapshot
+    [unavailable] The requested work is temporarily unavailable
     [internal_invariant] An internal invariant was violated; this is an ATT defect
    *[other] __ATT_FALLBACK__
-}
-diagnostic-io-kind-value = { $code ->
-    [not_found] Not found
-    [permission_denied] Permission denied
-    [connection_refused] Connection refused
-    [connection_reset] Connection reset
-    [host_unreachable] Host unreachable
-    [network_unreachable] Network unreachable
-    [connection_aborted] Connection aborted
-    [not_connected] Not connected
-    [address_in_use] Address already in use
-    [address_not_available] Address unavailable
-    [network_down] Network down
-    [broken_pipe] Broken pipe
-    [already_exists] Already exists
-    [would_block] Operation would block
-    [not_a_directory] Not a directory
-    [is_a_directory] Is a directory
-    [directory_not_empty] Directory not empty
-    [read_only_filesystem] Read-only filesystem
-    [stale_network_file_handle] Stale network file handle
-    [invalid_input] Invalid operation input
-    [invalid_data] Invalid data
-    [timed_out] Operation timed out
-    [write_zero] Write made no progress
-    [storage_full] Storage is full
-    [not_seekable] Object is not seekable
-    [quota_exceeded] Storage quota exceeded
-    [file_too_large] File is too large for the underlying system
-    [resource_busy] Resource is busy
-    [executable_file_busy] Executable file is busy
-    [deadlock] Operation would deadlock
-    [crosses_devices] Operation crosses filesystem devices
-    [too_many_links] Too many filesystem links
-    [invalid_filename] Invalid filename
-    [argument_list_too_long] Operating-system argument list is too long
-    [interrupted] Operation was interrupted
-    [unsupported] Operation is unsupported
-    [unexpected_eof] Unexpected end of file
-    [out_of_memory] Operating system could not allocate memory
-    [other] Other operating-system error
-   *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
     [language_policy_term_blank] Language policy term must not be blank
@@ -376,47 +337,6 @@ diagnostic-configuration-rule-value = { $code ->
     [referenced_client_not_found] Referenced LLM client does not exist
    *[other] __ATT_FALLBACK__
 }
-diagnostic-io-reason = Operation { $operation }: { $kind }
-diagnostic-io-reason-with-os-code = Operation { $operation }: { $kind } (OS { $os_code })
-diagnostic-io-reason-with-system-message = Operation { $operation }: { $kind }: { $system_message }
-diagnostic-io-reason-with-os-code-and-system-message = Operation { $operation }: { $kind } (OS { $os_code }): { $system_message }
-diagnostic-failure-with-detail = { $failure }: { $detail }
-diagnostic-invalid-utf8 = Invalid UTF-8 at byte { $valid_up_to }, invalid length { $error_len }
-diagnostic-incomplete-utf8 = Incomplete UTF-8 sequence after byte { $valid_up_to }
-diagnostic-toml-failure-value = { $code ->
-    [syntax] TOML syntax is invalid
-    [missing_field] A required configuration field is missing
-    [unknown_field] The configuration contains an unknown field
-    [duplicate_field] The configuration field is declared more than once
-    [type_mismatch] Expected { $expected }
-    [invalid_value] The configuration value violates the field contract
-   *[other] __ATT_FALLBACK__
-}
-diagnostic-toml-expected-kind-value = { $code ->
-    [string] a string
-    [integer] an integer
-    [boolean] a Boolean
-    [string_or_boolean] a string or Boolean
-    [string_array] an array of strings
-    [integer_array] an array of integers
-    [string_pair_array] an array of string pairs
-    [table] a table
-    [table_array] an array of tables
-   *[other] __ATT_FALLBACK__
-}
-diagnostic-invalid-toml = Invalid TOML ({ $resource }): { $failure }
-diagnostic-invalid-toml-at = Invalid TOML at line { $line }, column { $column } ({ $resource }): { $failure }
-diagnostic-http-no-details = The model service request failed without any public HTTP status details
-diagnostic-http-status = HTTP status { $status }
-diagnostic-http-retry-after = Retry-After { $seconds } seconds
-diagnostic-http-provider-code = Provider error code { $code }
-diagnostic-http-provider-type = Provider error type { $kind }
-diagnostic-http-provider-message = Provider error message { $message }
-diagnostic-http-fact-separator = ;{ " " }
-diagnostic-sqlite = SQLite primary error code { $primary_code }, extended error code { $extended_code }
-diagnostic-windows-status = Windows operation { $operation } failed with NTSTATUS { $status }
-diagnostic-resource = { $resource }: actual { $actual }
-diagnostic-resource-with-maximum = { $resource }: actual { $actual }, maximum { $maximum }
 task-record-title = Translation task { $ordinal } · { $state }
 task-record-state-label = { $state ->
     [complete] Complete
@@ -475,45 +395,6 @@ task-record-final-status = Status: { $state ->
 }
 task-record-accepted-written = Accepted: { $accepted } items; written to { $written } actual locations
 task-record-accepted-outcome-unknown = Validated: { $accepted } items; database commit outcome cannot be confirmed
-task-record-rejected-heading = Not accepted:
-task-record-rejected-item = { $id }: { $reason }
-task-record-protocol-diagnostic = Protocol diagnostic: { $diagnostic }
-task-record-unavailable-reason = Unavailable reason: { $reason }
 task-record-task-diagnostic = Task diagnostic: `{ $code }`; reason { $reason }
-task-record-rejection-reason = { $code ->
-    [missing] Missing model output
-    [duplicate] Duplicate model output
-    [invalid_shape] { $detail }
-    [invalid_shape_array] The translation must be a string array
-    [invalid_shape_item] Translation array item { $line } must be a string
-    [line_count_mismatch] Line count mismatch (expected { $expected }, actual { $actual })
-    [invalid_line_text] Line { $line } contains invalid control characters
-    [blank_line_mismatch] Blank state mismatch on line { $line } (expected { $expected_blank ->
-        [blank] blank
-       *[other] non-blank
-    })
-    [blank_translation] Translation is blank
-    [no_natural_language_text] Translation contains no natural-language text
-    [contains_byte_order_mark] Translation contains a BOM
-    [placeholder_mismatch] Placeholder mismatch: { $detail }
-    [unexpected_placeholder] Unexpected placeholder: { $detail }
-    [placeholder_normalization_ambiguous] Placeholder normalization is ambiguous: { $detail }
-    [source_residual] Source-language residue detected: { $detail }
-   *[other] { $detail }
-}
-task-record-protocol-detail = { $code ->
-    [non_stop_finish] finish reason is not stop: { $detail }
-    [invalid_response] { $detail }
-    [invalid_id] Model item { $index } has an invalid ID
-    [unknown_id] Model item { $index } returned unknown ID { $detail }
-   *[other] { $detail }
-}
-task-record-unavailable-detail = { $code ->
-    [model_response_unusable] Model response could not be parsed
-    [all_outputs_rejected] All model outputs failed validation
-    [recoverable_request_exhausted] Retry budget for recoverable requests was exhausted
-    [retry_after_exceeds_maximum] Retry-After exceeds the configured maximum wait
-   *[other] { $code }
-}
 task-record-duration-seconds = { $value } seconds
 task-record-duration-milliseconds = { $value } ms

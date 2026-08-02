@@ -21,13 +21,14 @@ use rayon::prelude::*;
 use rusqlite::Connection;
 use time::OffsetDateTime;
 
-use super::command::{
-    ActiveProjectLog, CommandLogStart, PendingProjectLog, ProjectLogLuaPrintSink,
-    ProjectLuaSummaryGuard, TerminationSignals, start_command_log,
-};
+use super::command::TerminationSignals;
 use super::config::{
-    ConfiguredGenericCommand, ConfiguredGenericWriteBackCommand, ConfiguredProjectLuaCommand,
-    ConfiguredTranslateCommand,
+    ConfigurationLoadError, ConfiguredGenericCommand, ConfiguredGenericWriteBackCommand,
+    ConfiguredProjectLuaCommand, ConfiguredTranslateCommand,
+};
+use super::project_log::{
+    ActiveProjectLog, CommandLogStart, PendingProjectLog, ProjectLogHandle, ProjectLogLuaPrintSink,
+    ProjectLuaSummaryGuard, start_command_log,
 };
 use super::translation_prompt::{
     PromptResourceLoadError, PromptTemplateError,
@@ -37,8 +38,23 @@ use super::translation_prompt::{
     translation_prompt_resource_paths,
 };
 use crate::diagnostic::{
-    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
-    DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
+    ByteRange, Diagnostic, DiagnosticReport, FileSystemDiagnosticContext,
+    FileSystemDiagnosticStage, FileSystemIssue, FileSystemOperation, FileSystemPathViolation,
+    FileSystemProblem, GenericDiagnosticStage, GenericIssue, GenericJsonErrorCategory,
+    GenericLanguageProjectionProblem, GenericPlaceholderMultisetProblem, GenericProblem,
+    GenericRepairApplicationProblem, GenericResponseDestinationProblem,
+    GenericTaskResponseJsonCategory, GenericTaskResponseProblem, GenericTaskUnavailableReason,
+    GenericTranslationPreparationProblem, GenericUnitLocator as DiagnosticGenericUnitLocator,
+    IoFailure, Pcre2Failure, Pcre2FailureKind, PlaceholderIssue,
+    PlaceholderMatchRangeViolation as DiagnosticMatchRangeViolation,
+    PlaceholderRuleOrigin as DiagnosticPlaceholderRuleOrigin,
+    PlaceholderRuleSource as DiagnosticPlaceholderRuleSource,
+    PlaceholderWorkerOperation as DiagnosticPlaceholderWorkerOperation, PublicationIssue,
+    PublicationProblem, PublicationRequestViolation, PublicationStep, RelatedFailureRelation,
+    ReportedFailure, RuntimeComponent, RuntimeIssue, RuntimeOperation, SafeIdentifier, SafeIoKind,
+    SafePath, SqliteDiagnosticContext, SqliteDiagnosticStage, SqliteDriverFailure, SqliteIssue,
+    SqliteOperation, SqliteProblem, SqliteTransactionState, StateEffect, TranslationIssue,
+    TranslationPlanningResourceOrigin, TranslationTaskPlanningProblem,
 };
 use crate::execution::CooperativeCancellation;
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
@@ -51,8 +67,8 @@ use crate::generic::build_write_back_candidate;
 use crate::generic::{
     AutomaticStateResources, CancellableTextMap, CommitTranslationsOutcome, ExtractOutcome,
     GenericCompiledPlaceholderRules, GenericInitRequest, GenericPlaceholderService,
-    GenericPlanningError, GenericProject, GenericProjectError, GenericProjectStore,
-    GenericProtectedText, GenericStoredSnapshot, GenericTaskRecordDocument, GenericTaskRecordIssue,
+    GenericPlanningError, GenericPlanningUnitLocator, GenericProject, GenericProjectError,
+    GenericProjectStore, GenericProtectedText, GenericStoredSnapshot, GenericTaskRecordDocument,
     GenericTaskRecordState, GenericTaskResponseRecord, GenericUnitKey, GenericUnitMap,
     GenericWriteBackCandidate, GenericWriteBackError, PlannedTask, PlanningUnit, ResponseProblem,
     TranslationAcceptance, TranslationPlan, TranslationWrite, ValidatedReuse,
@@ -65,7 +81,8 @@ use crate::generic::{
 };
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
 use crate::language::{
-    LanguageAnalysis, LanguageModule, LanguageOperationCancelled, LanguageText, LanguageTextSegment,
+    LanguageAnalysis, LanguageId, LanguageModule, LanguageModuleCatalogError,
+    LanguageOperationCancelled, LanguageRepairApplicationError, LanguageText, LanguageTextSegment,
 };
 use crate::llm::{
     ChatMessage, ChatMessageRole, LlmClientConcurrency, LlmClientSemanticIdentity, LlmFinishReason,
@@ -80,40 +97,54 @@ use crate::project_lease::{
     ProjectCommandLeaseError, ProjectCommandLeaseProvider, ProjectCommandLeaseService,
 };
 use crate::project_lua::{
-    ProjectLuaCancellation, ProjectLuaDatabasePrerequisiteError, ProjectLuaFailure,
-    ProjectLuaProgram, ProjectLuaProject, ProjectLuaRunError, ProjectLuaRunRequest,
-    ProjectLuaSqliteError, compile_project_lua_program_with_cancellation,
+    ProjectLuaCancellation, ProjectLuaFailure, ProjectLuaProgram, ProjectLuaProject,
+    ProjectLuaRunError, ProjectLuaRunRequest, compile_project_lua_program_with_cancellation,
     fingerprint_project_lua_program_with_cancellation, generic_project_lua_adapter,
     run_project_lua,
 };
 use crate::project_name::ProjectName;
-use crate::runtime::cpu::{CpuExecutorUnavailable, RayonCpuExecutor};
+use crate::runtime::cpu::{
+    CpuExecutorShutdownError, CpuExecutorStartError, CpuExecutorUnavailable, RayonCpuExecutor,
+};
 use crate::runtime::filesystem::{
     SystemDirectoryPublisher, SystemFileSystem, SystemFileSystemBuildError, SystemFileSystemError,
 };
 use crate::runtime::llm::OpenAiChatCompletionExecutor;
 use crate::runtime::performance::RunPerformanceCounters;
 use crate::runtime::project_log::{
-    ProjectLog, ProjectLogCode, ProjectLogContext, ProjectLogEvent, ProjectLogLevel,
-    ProjectLogPayload, ProjectLogRunOutcome, ProjectLogTaskOutcome, ProjectLogger,
+    DiagnosticScope, GenericPublicationSummary as ProjectLogGenericPublicationSummary,
+    GenericTranslationSummary as ProjectLogGenericTranslationSummary, PhaseStopOutcome,
+    ProjectLogAmount, ProjectLogCommand, ProjectLogEngine, ProjectLogEvent, ProjectLogPhase,
+    PublicationFinished, PublicationSummary, ResolvedRunPlan, RunPlanFinalization,
+    RunPlanTransactionState, RunPlanValueSource, TaskFinishedOutcome, TaskPosition,
+    TranslationEngineSummary, TranslationFinished, TranslationTaskCounters,
 };
 use crate::runtime::windows::WindowsFsError;
 use crate::storage::file_system::{
-    DirectoryDiscardError, DirectoryPrepareError, DirectoryPublishError, DirectoryPublishIntent,
-    DirectorySourceMapping, DirectoryStageRequest, FileReader, ReadFileError,
-    RecoverableDirectoryPublisher, StagingCleanupFailure,
+    DirectoryDiscardError, DirectoryPrepareError, DirectoryPublicationDiagnosticSource,
+    DirectoryPublishIntent, DirectorySourceMapping, DirectoryStageRequest,
+    DirectoryStageRequestError, FileReader, ReadFileError, RecoverableDirectoryPublisher,
 };
-use crate::translation::placeholder::PlaceholderRuleCompilationError;
-use crate::translation::placeholder_projection::LanguageTextProjectionError;
+use crate::translation::placeholder::{
+    PlaceholderMatchRangeViolation, PlaceholderPcre2ErrorKind, PlaceholderProtectionError,
+    PlaceholderRestoreError, PlaceholderRuleOrigin, PlaceholderWorkerOperation,
+};
+use crate::translation::placeholder_projection::{
+    LanguageTextProjectionError, PlaceholderMultisetError,
+};
 use crate::translation::placeholder_token;
 use crate::translation::planning_resource::{
-    CompiledTerminology, PlaceholderDefinitionError, TerminologyDefinitionError,
-    TranslationPlanningResourceReader, TranslationPlanningResourceReadingError,
-    TranslationPlanningResourceReadingService,
+    CompiledTerminology, TranslationPlanningResourceReader,
+    TranslationPlanningResourceReadingError, TranslationPlanningResourceReadingService,
 };
-use crate::translation::task_planning::TaskId;
+#[cfg(test)]
+use crate::translation::planning_resource::{
+    PlaceholderDefinitionError, TerminologyDefinitionError,
+};
+use crate::translation::task_planning::{TaskId, TaskPlanningError};
 use crate::translation::task_record::{
     ConfiguredTranslationTaskRecordSink, MarkdownTranslationTaskRecordSink,
+    TaskRecordDiagnosticRecorder,
 };
 use crate::translation::user_message::{
     TranslationReturnType, TranslationUserGroup, TranslationUserMessage,
@@ -122,8 +153,9 @@ use crate::translation::user_message::{
 #[cfg(test)]
 use crate::translation_protocol::parse_translation_response;
 use crate::translation_protocol::{
-    ParsedTranslationResponse, TranslationResponseMode, TranslationTaskResponseParseError,
-    TranslationTaskResponseParseErrorKind, parse_translation_response_with_cancellation,
+    ParsedTranslationResponse, TranslationResponseMode, TranslationTaskResponseJsonErrorCategory,
+    TranslationTaskResponseParseError, TranslationTaskResponseParseErrorKind,
+    parse_translation_response_with_cancellation,
 };
 
 const GENERIC_ENGINE_NAME: &str = "generic";
@@ -232,7 +264,7 @@ fn record_generic_terminal_progress_failures(
                 .failures()
                 .iter()
                 .cloned()
-                .map(|failure| GenericShutdownError::new("terminal progress", failure)),
+                .map(GenericShutdownError::terminal_progress),
         );
     }
 }
@@ -325,76 +357,86 @@ pub(crate) struct GenericCommandRunReport {
 #[derive(Debug)]
 pub(crate) struct GenericShutdownError {
     component: &'static str,
-    detail: String,
-    diagnostic: SafeDiagnostic,
+    failure: ReportedFailure,
 }
 
 impl GenericShutdownError {
-    fn new<E>(component: &'static str, source: E) -> Self
-    where
-        E: fmt::Display + SafeDiagnosticSource,
-    {
-        let diagnostic = source
-            .safe_diagnostic_source(
-                DiagnosticStage::Shutdown,
-                DiagnosticImpact::ProgressPreserved,
-                DiagnosticAction::Retry,
-            )
-            .with_recovery(RecoveryFact::component(component));
+    fn new(
+        component: &'static str,
+        source: impl Error + Send + Sync + 'static,
+        report: DiagnosticReport,
+    ) -> Self {
         Self {
             component,
-            detail: source.to_string(),
-            diagnostic,
+            failure: ReportedFailure::new(report, source),
         }
     }
 
-    pub(crate) fn safe_diagnostic(&self) -> SafeDiagnostic {
-        self.diagnostic.clone()
+    fn cpu(source: CpuExecutorShutdownError) -> Self {
+        let report =
+            DiagnosticReport::new(StateEffect::AppliedFinalizationFailed, source.diagnostic());
+        Self::new("CPU executor", source, report)
+    }
+
+    fn file_system(source: SystemFileSystemError) -> Self {
+        let report = source.shutdown_diagnostic_report();
+        Self::new("filesystem", source, report)
+    }
+
+    fn terminal_progress(source: crate::progress::TerminalProgressFailure) -> Self {
+        let report = source.diagnostic_report();
+        Self::new("terminal progress", source, report)
+    }
+
+    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
+        self.failure.report().clone()
     }
 }
 
 impl fmt::Display for GenericShutdownError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{} 关闭失败：{}", self.component, self.detail)
+        write!(formatter, "{} 关闭失败：{}", self.component, self.failure)
     }
 }
 
-impl Error for GenericShutdownError {}
+impl Error for GenericShutdownError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.failure.source_error())
+    }
+}
 
 /// 候选目录或 Generic scratch 清理的类型化失败。
 #[derive(Debug)]
 pub(crate) struct GenericDiscardFailure {
-    diagnostic: SafeDiagnostic,
-    source: Box<dyn Error + Send + Sync>,
+    failure: ReportedFailure,
 }
 
 impl GenericDiscardFailure {
-    fn new(diagnostic: SafeDiagnostic, source: impl Error + Send + Sync + 'static) -> Self {
+    fn new(report: DiagnosticReport, source: impl Error + Send + Sync + 'static) -> Self {
         Self {
-            diagnostic,
-            source: Box::new(source),
+            failure: ReportedFailure::new(report, source),
         }
     }
 
-    fn safe_diagnostic(&self) -> SafeDiagnostic {
-        self.diagnostic.clone()
+    fn diagnostic_report(&self) -> DiagnosticReport {
+        self.failure.report().clone()
     }
 
     #[cfg(test)]
     fn source_error(&self) -> &(dyn Error + 'static) {
-        self.source.as_ref()
+        self.failure.source_error()
     }
 }
 
 impl fmt::Display for GenericDiscardFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.source.fmt(formatter)
+        self.failure.fmt(formatter)
     }
 }
 
 impl Error for GenericDiscardFailure {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(self.source.as_ref())
+        Some(self.failure.source_error())
     }
 }
 
@@ -403,10 +445,7 @@ impl Error for GenericDiscardFailure {
 pub(crate) enum GenericCommandError {
     Cancelled,
     Operation {
-        stage: &'static str,
-        diagnostic: SafeDiagnostic,
-        related_diagnostics: Vec<SafeDiagnostic>,
-        source: Box<dyn Error + Send + Sync>,
+        failure: ReportedFailure,
     },
     Signal {
         source: io::Error,
@@ -420,116 +459,51 @@ pub(crate) enum GenericCommandError {
 }
 
 impl GenericCommandError {
-    fn operation(stage: &'static str, source: impl Error + Send + Sync + 'static) -> Self {
+    fn reported(source: impl Error + Send + Sync + 'static, report: DiagnosticReport) -> Self {
         Self::Operation {
-            stage,
-            diagnostic: generic_operation_diagnostic(stage),
-            related_diagnostics: Vec::new(),
-            source: Box::new(source),
+            failure: ReportedFailure::new(report, source),
         }
     }
 
-    fn diagnosed(
-        stage: &'static str,
-        source: impl Error + Send + Sync + 'static,
-        diagnostic: SafeDiagnostic,
-    ) -> Self {
-        Self::Operation {
-            stage,
-            diagnostic,
-            related_diagnostics: Vec::new(),
-            source: Box::new(source),
-        }
+    fn configuration(source: ConfigurationLoadError) -> Self {
+        let report = DiagnosticReport::new(StateEffect::Unchanged, source.diagnostic());
+        Self::reported(source, report)
     }
 
-    fn diagnosed_with_related(
-        stage: &'static str,
-        source: impl Error + Send + Sync + 'static,
-        diagnostic: SafeDiagnostic,
-        related_diagnostics: Vec<SafeDiagnostic>,
-    ) -> Self {
-        Self::Operation {
-            stage,
-            diagnostic,
-            related_diagnostics,
-            source: Box::new(source),
-        }
+    fn missing_profile_id() -> Self {
+        Self::reported(
+            MissingGenericProfileId,
+            DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::generic(GenericIssue::project(
+                    GenericDiagnosticStage::Translate,
+                    GenericProblem::MissingProfileId,
+                )),
+            ),
+        )
     }
 
-    fn message(stage: &'static str, detail: impl Into<String>) -> Self {
-        Self::operation(stage, MessageError(detail.into()))
+    fn language_module(source: LanguageModuleCatalogError, target_language: &LanguageId) -> Self {
+        let LanguageModuleCatalogError::UnknownLanguageId {
+            language_id,
+            available_ids,
+        } = &source;
+        let report = DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::translation(TranslationIssue::LanguageModuleUnavailable {
+                requested_language: SafeIdentifier::from_validated(language_id.as_str()),
+                target_language: SafeIdentifier::from_validated(target_language.as_str()),
+                available_languages: available_ids
+                    .iter()
+                    .map(|language| SafeIdentifier::from_validated(language.as_str()))
+                    .collect(),
+            }),
+        );
+        Self::reported(source, report)
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
         matches!(self, Self::Cancelled)
-    }
-
-    pub(crate) fn safe_diagnostic(&self) -> SafeDiagnostic {
-        match self {
-            Self::Cancelled => SafeDiagnostic::new(
-                DiagnosticCode::ProjectUnavailable,
-                DiagnosticStage::Shutdown,
-                DiagnosticSubject::command("generic"),
-                DiagnosticReason::failure(DiagnosticFailureKind::LockCancelled),
-                DiagnosticImpact::ProgressPreserved,
-                DiagnosticAction::Retry,
-            ),
-            Self::Operation { diagnostic, .. } => diagnostic.clone(),
-            Self::Signal {
-                source,
-                operation,
-                state_applied,
-            } => {
-                let impact = if *state_applied {
-                    DiagnosticImpact::StateAppliedFinalizationFailed
-                } else {
-                    operation
-                        .as_ref()
-                        .map_or(DiagnosticImpact::Unchanged, |error| {
-                            error.safe_diagnostic().impact
-                        })
-                };
-                SafeDiagnostic::io(
-                    DiagnosticCode::SignalRegistration,
-                    DiagnosticStage::Shutdown,
-                    DiagnosticSubject::component("Windows control signal"),
-                    "receive_signal",
-                    source,
-                    impact,
-                    DiagnosticAction::Retry,
-                )
-            }
-            Self::PublishDiscard { operation, .. } => operation.safe_diagnostic(),
-        }
-    }
-
-    /// 信号接收、候选清理或目录准备失败可能伴随更早的业务失败。
-    pub(crate) fn related_diagnostics(&self) -> Vec<SafeDiagnostic> {
-        match self {
-            Self::Operation {
-                related_diagnostics,
-                ..
-            } => related_diagnostics.clone(),
-            Self::Signal {
-                operation: Some(operation),
-                ..
-            } => {
-                let mut diagnostics = vec![operation.safe_diagnostic()];
-                diagnostics.extend(operation.related_diagnostics());
-                diagnostics
-            }
-            Self::PublishDiscard {
-                operation, discard, ..
-            } => {
-                let mut diagnostics = operation.related_diagnostics();
-                diagnostics.push(discard.safe_diagnostic());
-                diagnostics
-            }
-            Self::Cancelled
-            | Self::Signal {
-                operation: None, ..
-            } => Vec::new(),
-        }
     }
 }
 
@@ -537,7 +511,7 @@ impl fmt::Display for GenericCommandError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Cancelled => formatter.write_str("Generic 命令已取消"),
-            Self::Operation { stage, source, .. } => write!(formatter, "{stage} 失败：{source}"),
+            Self::Operation { failure } => failure.fmt(formatter),
             Self::Signal {
                 source, operation, ..
             } => {
@@ -559,7 +533,7 @@ impl fmt::Display for GenericCommandError {
 impl Error for GenericCommandError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Operation { source, .. } => Some(source.as_ref()),
+            Self::Operation { failure } => Some(failure.source_error()),
             Self::Signal { source, .. } => Some(source),
             Self::PublishDiscard { operation, .. } => Some(operation.as_ref()),
             Self::Cancelled => None,
@@ -567,312 +541,118 @@ impl Error for GenericCommandError {
     }
 }
 
-fn generic_discard_failure(
-    source: impl Error + Send + Sync + 'static,
-    mut diagnostic: SafeDiagnostic,
-    recovery_paths: &[PathBuf],
-) -> GenericDiscardFailure {
-    diagnostic.code = DiagnosticCode::WriteBackDiscard;
-    diagnostic.stage = DiagnosticStage::Publication;
-    diagnostic.subject = DiagnosticSubject::operation("generic_write_back_candidate_cleanup");
-    diagnostic.impact = DiagnosticImpact::RecoveryRequired;
-    diagnostic.action = DiagnosticAction::PreserveRecoveryArtifacts;
-    for path in recovery_paths {
-        diagnostic = diagnostic.with_recovery(RecoveryFact::path(path));
+pub(crate) fn generic_command_error_report(error: &GenericCommandError) -> DiagnosticReport {
+    match error {
+        GenericCommandError::Cancelled => DiagnosticReport::new(
+            StateEffect::ProgressPreserved,
+            Diagnostic::runtime(RuntimeIssue::Cancelled {
+                component: RuntimeComponent::Process,
+                operation: RuntimeOperation::ExecuteTask,
+            }),
+        ),
+        GenericCommandError::Operation { failure } => failure.report().clone(),
+        GenericCommandError::Signal {
+            source,
+            operation,
+            state_applied,
+        } => {
+            let effect = if *state_applied {
+                StateEffect::AppliedFinalizationFailed
+            } else {
+                operation
+                    .as_ref()
+                    .map_or(StateEffect::Unchanged, |operation| {
+                        generic_command_error_report(operation).effect()
+                    })
+            };
+            let mut report = DiagnosticReport::new(
+                effect,
+                Diagnostic::runtime(RuntimeIssue::Io {
+                    component: RuntimeComponent::TerminationSignals,
+                    operation: RuntimeOperation::ReceiveTerminationSignal,
+                    failure: IoFailure::from_error(source),
+                }),
+            );
+            if let Some(operation) = operation {
+                report = report.with_related(
+                    RelatedFailureRelation::Finalization,
+                    generic_command_error_report(operation),
+                );
+            }
+            report
+        }
+        GenericCommandError::PublishDiscard { operation, discard } => {
+            generic_command_error_report(operation)
+                .with_related(RelatedFailureRelation::Discard, discard.diagnostic_report())
+        }
     }
-    GenericDiscardFailure::new(diagnostic, source)
 }
 
-fn generic_operation_diagnostic(stage: &'static str) -> SafeDiagnostic {
-    let (code, diagnostic_stage, failure, impact, action) = match stage {
-        "启动文件运行能力" => (
-            DiagnosticCode::FileSystemBuild,
-            DiagnosticStage::CommandPreparation,
-            DiagnosticFailureKind::RequirementFailed,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::Retry,
+fn generic_read_file_report(
+    source: &ReadFileError<SystemFileSystemError>,
+    stage: FileSystemDiagnosticStage,
+) -> DiagnosticReport {
+    let context = FileSystemDiagnosticContext::new(stage, FileSystemOperation::Read);
+    match source {
+        ReadFileError::NotFound { path } => DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::file_system(FileSystemIssue::new(
+                context,
+                FileSystemProblem::NotFound {
+                    path: SafePath::new(path),
+                },
+            )),
         ),
-        "启动 CPU 运行能力" => (
-            DiagnosticCode::InternalOperation,
-            DiagnosticStage::CommandPreparation,
-            DiagnosticFailureKind::WorkerSpawnFailed,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::ReportBug,
+        ReadFileError::NotFile { path } => DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::file_system(FileSystemIssue::new(
+                context,
+                FileSystemProblem::NotFile {
+                    path: SafePath::new(path),
+                },
+            )),
         ),
-        "取得项目租约" => (
-            DiagnosticCode::ProjectUnavailable,
-            DiagnosticStage::ProjectOpening,
-            DiagnosticFailureKind::Busy,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::RetryAfterResolvingContention,
-        ),
-        "打开 Generic 项目" => (
-            DiagnosticCode::ProjectUnavailable,
-            DiagnosticStage::ProjectOpening,
-            DiagnosticFailureKind::StateMismatch,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
-        ),
-        "初始化 Generic 项目" => (
-            DiagnosticCode::ProjectState,
-            DiagnosticStage::Init,
-            DiagnosticFailureKind::RequirementFailed,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixInput,
-        ),
-        "读取 Lua 脚本" => (
-            DiagnosticCode::LuaExecution,
-            DiagnosticStage::CommandPreparation,
-            DiagnosticFailureKind::NotFound,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixInput,
-        ),
-        "编译 Lua 脚本" => (
-            DiagnosticCode::LuaExecution,
-            DiagnosticStage::CommandPreparation,
-            DiagnosticFailureKind::LuaCompilationFailed,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixInput,
-        ),
-        "执行 Generic Lua" => (
-            DiagnosticCode::LuaExecution,
-            DiagnosticStage::Lua,
-            DiagnosticFailureKind::LuaExecutionFailed,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixInput,
-        ),
-        "选择 Translate Profile" | "读取 Translate Profile" | "读取 WriteBack Profile" => (
-            DiagnosticCode::ConfigurationProfileNotFound,
-            DiagnosticStage::CommandPreparation,
-            DiagnosticFailureKind::MissingRequiredValue,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixConfiguration,
-        ),
-        "选择源语言模块" => (
-            DiagnosticCode::LanguageModuleUnavailable,
-            DiagnosticStage::CommandPreparation,
-            DiagnosticFailureKind::RequirementFailed,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixConfiguration,
-        ),
-        "读取翻译 system Prompt"
-        | "渲染翻译 system Prompt"
-        | "读取翻译 thinking Prompt"
-        | "校验翻译 thinking Prompt"
-        | "读取翻译响应规则 Prompt"
-        | "校验翻译响应规则 Prompt"
-        | "读取翻译示例 Prompt"
-        | "校验翻译示例 Prompt" => (
-            DiagnosticCode::PromptUnavailable,
-            DiagnosticStage::CommandPreparation,
-            DiagnosticFailureKind::InvalidValue,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixConfiguration,
-        ),
-        "读取翻译资源" | "编译 Generic Placeholder" => (
-            DiagnosticCode::CommandInput,
-            DiagnosticStage::Translate,
-            DiagnosticFailureKind::InvalidValue,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixInput,
-        ),
-        "读取 Generic 翻译资源" => (
-            DiagnosticCode::SqliteOperation,
-            DiagnosticStage::Translate,
-            DiagnosticFailureKind::StateMismatch,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
-        ),
-        "复查 Generic 输入" => (
-            DiagnosticCode::ProjectState,
-            DiagnosticStage::Translate,
-            DiagnosticFailureKind::GenericExtractRequired,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixInput,
-        ),
-        "复查 Generic 写回输入" => (
-            DiagnosticCode::ProjectState,
-            DiagnosticStage::WriteBack,
-            DiagnosticFailureKind::GenericExtractRequired,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixInput,
-        ),
-        "保存 Generic 翻译资源并清除失效译文" => (
-            DiagnosticCode::SqliteOperation,
-            DiagnosticStage::Translate,
-            DiagnosticFailureKind::TransactionRolledBack,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
-        ),
-        "调度 Generic 翻译计划" => (
-            DiagnosticCode::InternalOperation,
-            DiagnosticStage::Translate,
-            DiagnosticFailureKind::WorkerPanicked,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::ReportBug,
-        ),
-        "建立 Generic 翻译计划" => (
-            DiagnosticCode::CommandRunPlan,
-            DiagnosticStage::Translate,
-            DiagnosticFailureKind::RequirementFailed,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixInput,
-        ),
-        "调度 Generic 模型消息" | "建立 Generic 模型消息" => (
-            DiagnosticCode::InternalOperation,
-            DiagnosticStage::Translate,
-            DiagnosticFailureKind::WorkerPanicked,
-            DiagnosticImpact::ProgressPreserved,
-            DiagnosticAction::ReportBug,
-        ),
-        "提交 Generic 去重复用译文" | "提交 Generic 模型译文" => (
-            DiagnosticCode::SqliteOperation,
-            DiagnosticStage::Translate,
-            DiagnosticFailureKind::TransactionRolledBack,
-            DiagnosticImpact::ProgressPreserved,
-            DiagnosticAction::CheckProjectState,
-        ),
-        "启动 LLM 运行能力" => (
-            DiagnosticCode::HttpClientBuild,
-            DiagnosticStage::ModelRequest,
-            DiagnosticFailureKind::RequirementFailed,
-            DiagnosticImpact::ProgressPreserved,
-            DiagnosticAction::FixConfiguration,
-        ),
-        "读取附加 PEM" => (
-            DiagnosticCode::FileSystemOperation,
-            DiagnosticStage::CommandPreparation,
-            DiagnosticFailureKind::NotFound,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckPathAndPermissions,
-        ),
-        "保存 Generic 最近 Profile" => (
-            DiagnosticCode::StateFinalizationFailed,
-            DiagnosticStage::Translate,
-            DiagnosticFailureKind::FinalizationFailed,
-            DiagnosticImpact::StateAppliedFinalizationFailed,
-            DiagnosticAction::CheckProjectState,
-        ),
-        "建立 Generic 写回候选" => (
-            DiagnosticCode::WriteBackCandidate,
-            DiagnosticStage::WriteBack,
-            DiagnosticFailureKind::WriteBackCandidateInvalid,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
-        ),
-        "调度 Generic Current 复查" | "复查 Generic Current" => (
-            DiagnosticCode::WriteBackValidate,
-            DiagnosticStage::WriteBack,
-            DiagnosticFailureKind::WriteBackCandidateInvalid,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
-        ),
-        "建立 Generic 写回暂存来源" | "建立 Generic 目录候选请求" => (
-            DiagnosticCode::WriteBackCandidate,
-            DiagnosticStage::WriteBack,
-            DiagnosticFailureKind::WriteBackOutputPathInvalid,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckPathAndPermissions,
-        ),
-        "准备 Generic 写回候选" => (
-            DiagnosticCode::WriteBackCandidate,
-            DiagnosticStage::Publication,
-            DiagnosticFailureKind::WriteBackNotPublished,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckPathAndPermissions,
-        ),
-        "清理 Generic 写回暂存来源" => (
-            DiagnosticCode::WriteBackDiscard,
-            DiagnosticStage::Publication,
-            DiagnosticFailureKind::RollbackFailed,
-            DiagnosticImpact::RecoveryRequired,
-            DiagnosticAction::PreserveRecoveryArtifacts,
-        ),
-        "发布前复查 Generic 输入" => (
-            DiagnosticCode::WriteBackValidate,
-            DiagnosticStage::WriteBack,
-            DiagnosticFailureKind::WriteBackExtractionOutOfDate,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixInput,
-        ),
-        "检查 Generic 写回目录" => (
-            DiagnosticCode::WriteBackCandidate,
-            DiagnosticStage::WriteBack,
-            DiagnosticFailureKind::InvalidPath,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckPathAndPermissions,
-        ),
-        "发布 Generic 写回目录" => (
-            DiagnosticCode::WriteBackPublish,
-            DiagnosticStage::Publication,
-            DiagnosticFailureKind::WriteBackNotPublished,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
-        ),
-        _ => (
-            DiagnosticCode::InternalOperation,
-            DiagnosticStage::CommandPreparation,
-            DiagnosticFailureKind::InternalInvariant,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::ReportBug,
-        ),
+        ReadFileError::Io { source, .. } => {
+            source.diagnostic_report(context, StateEffect::Unchanged)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MissingGenericProfileId;
+
+impl fmt::Display for MissingGenericProfileId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("首次 Generic Translate 必须显式提供 Profile ID")
+    }
+}
+
+impl Error for MissingGenericProfileId {}
+
+fn generic_blocking_join_failure(
+    source: tokio::task::JoinError,
+    effect: StateEffect,
+) -> GenericCommandError {
+    let issue = if source.is_panic() {
+        RuntimeIssue::WorkerPanicked {
+            component: RuntimeComponent::TokioRuntime,
+            operation: RuntimeOperation::ExecuteTask,
+        }
+    } else {
+        RuntimeIssue::ExecutorClosed {
+            component: RuntimeComponent::TokioRuntime,
+            operation: RuntimeOperation::ExecuteTask,
+        }
     };
-    SafeDiagnostic::new(
-        code,
-        diagnostic_stage,
-        DiagnosticSubject::operation(stage),
-        DiagnosticReason::failure(failure),
-        impact,
-        action,
+    GenericCommandError::reported(
+        source,
+        DiagnosticReport::new(effect, Diagnostic::runtime(issue)),
     )
 }
 
-fn generic_read_file_diagnostic(
-    source: &ReadFileError<SystemFileSystemError>,
-    stage: DiagnosticStage,
-    action: DiagnosticAction,
-) -> SafeDiagnostic {
-    match source {
-        ReadFileError::NotFound { path } => SafeDiagnostic::new(
-            DiagnosticCode::FileSystemOperation,
-            stage,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
-            DiagnosticImpact::Unchanged,
-            action,
-        ),
-        ReadFileError::NotFile { path } => SafeDiagnostic::new(
-            DiagnosticCode::FileSystemOperation,
-            stage,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::InvalidValue,
-                "expected=file; actual=not_file",
-            ),
-            DiagnosticImpact::Unchanged,
-            action,
-        ),
-        ReadFileError::Io { path, source } => source
-            .safe_diagnostic_source(stage, DiagnosticImpact::Unchanged, action)
-            .with_recovery(RecoveryFact::path(path)),
-    }
-}
-
-#[derive(Debug)]
-struct MessageError(String);
-
-impl fmt::Display for MessageError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl Error for MessageError {}
-
 #[derive(Clone, Debug)]
 struct GenericCommandPanicContext {
-    command: &'static str,
-    stage: DiagnosticStage,
+    command: crate::diagnostic::RuntimeCommand,
     project_workspace: PathBuf,
 }
 
@@ -888,10 +668,9 @@ impl fmt::Display for GenericApplicationScopePanicked {
 impl Error for GenericApplicationScopePanicked {}
 
 fn generic_command_panic_context(command: &ConfiguredGenericCommand) -> GenericCommandPanicContext {
-    let (command_name, stage, projects_root, project_name) = match command {
+    let (command, projects_root, project_name) = match command {
         ConfiguredGenericCommand::Init { arguments, common } => (
-            "init",
-            DiagnosticStage::Init,
+            crate::diagnostic::RuntimeCommand::Init,
             common.projects_root(),
             arguments.project.name.as_str(),
         ),
@@ -899,52 +678,43 @@ fn generic_command_panic_context(command: &ConfiguredGenericCommand) -> GenericC
             project_name,
             common,
         } => (
-            "extract",
-            DiagnosticStage::Extract,
+            crate::diagnostic::RuntimeCommand::Extract,
             common.projects_root(),
             project_name.as_str(),
         ),
         ConfiguredGenericCommand::Translate(command) => (
-            "translate",
-            DiagnosticStage::Translate,
+            crate::diagnostic::RuntimeCommand::Translate,
             command.common().projects_root(),
             command.project_name().as_str(),
         ),
         ConfiguredGenericCommand::WriteBack(command) => (
-            "write-back",
-            DiagnosticStage::WriteBack,
+            crate::diagnostic::RuntimeCommand::WriteBack,
             command.common().projects_root(),
             command.project_name().as_str(),
         ),
         ConfiguredGenericCommand::Lua(command) => (
-            "lua",
-            DiagnosticStage::Lua,
+            crate::diagnostic::RuntimeCommand::Lua,
             command.common().projects_root(),
             command.project_name().as_str(),
         ),
     };
     GenericCommandPanicContext {
-        command: command_name,
-        stage,
+        command,
         project_workspace: projects_root.join(GENERIC_ENGINE_NAME).join(project_name),
     }
 }
 
 fn generic_command_panic_error(context: GenericCommandPanicContext) -> GenericCommandError {
-    let diagnostic = SafeDiagnostic::new(
-        DiagnosticCode::InternalOperation,
-        context.stage,
-        DiagnosticSubject::command(context.command),
-        DiagnosticReason::failure(DiagnosticFailureKind::InternalInvariant),
-        DiagnosticImpact::OutcomeUnknown,
-        DiagnosticAction::ReportBug,
-    )
-    .with_recovery(RecoveryFact::path(context.project_workspace));
-    GenericCommandError::diagnosed(
-        "执行 Generic 命令",
-        GenericApplicationScopePanicked,
-        diagnostic,
-    )
+    let report = DiagnosticReport::new(
+        StateEffect::OutcomeUnknown,
+        Diagnostic::runtime(RuntimeIssue::CommandPanicked {
+            engine: crate::diagnostic::RuntimeEngine::Generic,
+            command: context.command,
+            project_workspace: SafePath::new(context.project_workspace),
+            log_path: None,
+        }),
+    );
+    GenericCommandError::reported(GenericApplicationScopePanicked, report)
 }
 
 async fn catch_generic_command_panic(
@@ -1002,8 +772,7 @@ impl ProductionGenericCommandRunner {
                 ) {
                     Ok(file_system) => file_system,
                     Err(source) => {
-                        return GenericCommandRunReport::failed(GenericCommandError::operation(
-                            "启动文件运行能力",
+                        return GenericCommandRunReport::failed(generic_file_system_build_failure(
                             source,
                         ));
                     }
@@ -1040,12 +809,12 @@ impl ProductionGenericCommandRunner {
                         source_language: arguments.source_language,
                         target_language: arguments.target_language,
                     };
+                    let database_path = request.workspace_root.join("project.db");
                     let init_cancellation = operation_cancellation.clone();
                     let (_, project) = run_project_blocking(
-                        "初始化 Generic 项目",
-                        DiagnosticStage::Init,
-                        DiagnosticImpact::Unchanged,
-                        DiagnosticAction::FixInput,
+                        GenericDiagnosticStage::Init,
+                        StateEffect::Unchanged,
+                        database_path,
                         move || {
                             GenericProjectStore::initialize_with_cancellation(
                                 request,
@@ -1059,15 +828,27 @@ impl ProductionGenericCommandRunner {
                         start_command_log(CommandLogStart {
                             common: &common,
                             locale,
-                            engine: GENERIC_ENGINE_NAME,
+                            engine: ProjectLogEngine::Generic,
                             project: project.project_name().as_str(),
-                            command: "init",
-                            stage: DiagnosticStage::Init,
-                            profile: None,
+                            command: ProjectLogCommand::Init,
                             performance,
-                            panic_boundary: None,
                         }),
                     );
+                    if let Some(handle) = generic_project_log_handle(&operation_project_log) {
+                        handle.emit(ProjectLogEvent::RunPlanResolved {
+                            plan: ResolvedRunPlan::init(
+                                RunPlanValueSource::Explicit,
+                                project.source_root(),
+                            ),
+                        });
+                        handle.emit(ProjectLogEvent::RunPlanFinalized {
+                            database: crate::diagnostic::SafePath::new(project.database_path()),
+                            result: RunPlanFinalization::Saved {
+                                transaction: RunPlanTransactionState::Committed,
+                                run_continues: false,
+                            },
+                        });
+                    }
                     Ok(GenericCommandOutput::Init { project })
                 };
                 drive_and_shutdown(
@@ -1090,13 +871,13 @@ impl ProductionGenericCommandRunner {
             } => {
                 let performance = Arc::new(RunPerformanceCounters::default());
                 let project_log = generic_project_log_slot();
+                let extract_project_log = generic_extract_project_log_state();
                 start_existing_generic_project_log(
                     &project_log,
                     &common,
                     self.locale,
                     &project_name,
-                    "extract",
-                    DiagnosticStage::Extract,
+                    ProjectLogCommand::Extract,
                     Arc::clone(&performance),
                 );
                 let file_system = match start_file_system(
@@ -1106,10 +887,7 @@ impl ProductionGenericCommandRunner {
                     Ok(file_system) => file_system,
                     Err(source) => {
                         return GenericCommandRunReport::from_driven(
-                            Driven::Finished(Err(GenericCommandError::operation(
-                                "启动文件运行能力",
-                                source,
-                            ))),
+                            Driven::Finished(Err(generic_file_system_build_failure(source))),
                             Vec::new(),
                             take_generic_project_log(&project_log),
                         );
@@ -1130,8 +908,14 @@ impl ProductionGenericCommandRunner {
                 let output_name = project_name.clone();
                 let operation_cancellation = cancellation.clone();
                 let cancellation_file_system = file_system.clone();
+                let operation_project_log = Arc::clone(&project_log);
+                let operation_extract_project_log = Arc::clone(&extract_project_log);
                 let operation = async move {
                     ensure_generic_operation_running(&operation_cancellation)?;
+                    start_generic_extract_project_log(
+                        &operation_project_log,
+                        &operation_extract_project_log,
+                    );
                     operation_progress.observe(ProgressSnapshot::indeterminate(
                         GenericProgressPhase::Extracting,
                     ));
@@ -1140,20 +924,24 @@ impl ProductionGenericCommandRunner {
                         .await
                         .map_err(generic_project_lease_failure)?;
                     ensure_generic_operation_running(&operation_cancellation)?;
+                    let database_path = store.database_path().to_path_buf();
                     let open_store = store.clone();
-                    run_project_blocking(
-                        "打开 Generic 项目",
-                        DiagnosticStage::ProjectOpening,
-                        DiagnosticImpact::Unchanged,
-                        DiagnosticAction::CheckProjectState,
+                    let project = run_project_blocking(
+                        GenericDiagnosticStage::ProjectOpening,
+                        StateEffect::Unchanged,
+                        database_path.clone(),
                         move || open_store.open(),
                     )
                     .await?;
+                    resolve_generic_extract_run_plan(
+                        &operation_project_log,
+                        &operation_extract_project_log,
+                        project.database_path(),
+                    );
                     let outcome = run_project_blocking(
-                        "同步 Generic JSONL",
-                        DiagnosticStage::Extract,
-                        DiagnosticImpact::ProgressPreserved,
-                        DiagnosticAction::FixInput,
+                        GenericDiagnosticStage::Extract,
+                        StateEffect::ProgressPreserved,
+                        database_path,
                         move || store.extract(),
                     )
                     .await?;
@@ -1162,7 +950,7 @@ impl ProductionGenericCommandRunner {
                         outcome,
                     })
                 };
-                drive_and_shutdown(
+                drive_extract_and_shutdown(
                     operation,
                     termination_signals,
                     move || {
@@ -1172,6 +960,7 @@ impl ProductionGenericCommandRunner {
                     file_system,
                     Vec::new(),
                     project_log,
+                    extract_project_log,
                     progress,
                 )
                 .await
@@ -1201,13 +990,10 @@ impl ProductionGenericCommandRunner {
             start_command_log(CommandLogStart {
                 common: command.common(),
                 locale: self.locale,
-                engine: GENERIC_ENGINE_NAME,
+                engine: ProjectLogEngine::Generic,
                 project: project_name.as_str(),
-                command: "lua",
-                stage: DiagnosticStage::Lua,
-                profile: None,
+                command: ProjectLogCommand::Lua,
                 performance: Arc::clone(&performance),
-                panic_boundary: None,
             }),
         );
         let mut lua_summary = {
@@ -1226,10 +1012,7 @@ impl ProductionGenericCommandRunner {
                 Ok(file_system) => file_system,
                 Err(source) => {
                     return GenericCommandRunReport::from_driven(
-                        Driven::Finished(Err(GenericCommandError::operation(
-                            "启动文件运行能力",
-                            source,
-                        ))),
+                        Driven::Finished(Err(generic_file_system_build_failure(source))),
                         Vec::new(),
                         take_generic_project_log(&project_log),
                     );
@@ -1262,7 +1045,7 @@ impl ProductionGenericCommandRunner {
             project_log.as_ref().map_or((None, None), |project_log| {
                 (
                     Some(Arc::new(ProjectLogLuaPrintSink::from_active(project_log))),
-                    Some((project_log.logger().clone(), project_log.context().clone())),
+                    Some(project_log.handle().clone()),
                 )
             })
         };
@@ -1272,15 +1055,11 @@ impl ProductionGenericCommandRunner {
                 .read_file(script_path.clone())
                 .await
                 .map_err(|source| {
-                    generic_read_file_failure(
-                        "读取 Lua 脚本",
-                        source,
-                        DiagnosticStage::CommandPreparation,
-                        DiagnosticAction::FixInput,
-                    )
+                    generic_read_file_failure(source, FileSystemDiagnosticStage::CommandPreparation)
                 })?;
             let identity = script.resolved_path().to_string_lossy().into_owned();
             let source = script.into_bytes();
+            let preflight_database_path = store.database_path().to_path_buf();
             let preflight_cancellation = operation_lua_cancellation.clone();
             let preparation = tokio::task::spawn_blocking(move || {
                 let program = ProjectLuaProgram::new(identity, source, arguments);
@@ -1288,39 +1067,25 @@ impl ProductionGenericCommandRunner {
                     &program,
                     &preflight_cancellation,
                 )?;
-                if let Some((preflight_logger, preflight_context)) = preflight_log {
-                    preflight_logger.emit(ProjectLogEvent::new(
-                        ProjectLogLevel::Info,
-                        ProjectLogCode::LuaScript,
-                        preflight_context,
-                        ProjectLogPayload::LuaScript {
-                            identity: program.identity().to_owned(),
-                            fingerprint: fingerprint.hex(),
-                        },
-                    ));
+                if let Some(preflight_log) = preflight_log {
+                    preflight_log.emit(
+                        ProjectLogEvent::lua_script(program.identity(), fingerprint.hex())
+                            .expect("Lua 程序指纹必须保持非空且不含控制字符"),
+                    );
                 }
                 compile_project_lua_program_with_cancellation(&program, &preflight_cancellation)?;
                 Ok::<_, ProjectLuaFailure>(program)
             })
             .await;
             let preparation = preparation
-                .map_err(|source| GenericCommandError::operation("准备 Generic Lua", source))?;
+                .map_err(|source| generic_blocking_join_failure(source, StateEffect::Unchanged))?;
             let program = match preparation {
                 Ok(prepared) => prepared,
                 Err(ProjectLuaFailure::Cancelled) => return Err(GenericCommandError::Cancelled),
                 Err(source) => {
+                    let report = source.preflight_diagnostic_report(&preflight_database_path);
                     let source = GenericLuaPreflightError(source);
-                    let detail = source.to_string();
-                    let diagnostic = project_lua_failure_diagnostic(
-                        &source.0,
-                        DiagnosticStage::CommandPreparation,
-                        &detail,
-                    );
-                    return Err(GenericCommandError::diagnosed(
-                        "编译 Lua 脚本",
-                        source,
-                        diagnostic,
-                    ));
+                    return Err(GenericCommandError::reported(source, report));
                 }
             };
             ensure_generic_operation_running(&operation_cancellation)?;
@@ -1330,11 +1095,11 @@ impl ProductionGenericCommandRunner {
                 .await
                 .map_err(generic_project_lease_failure)?;
             ensure_generic_operation_running(&operation_cancellation)?;
+            let project_database_path = store.database_path().to_path_buf();
             let project = run_project_blocking(
-                "打开 Generic 项目",
-                DiagnosticStage::ProjectOpening,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
+                GenericDiagnosticStage::ProjectOpening,
+                StateEffect::Unchanged,
+                project_database_path,
                 move || store.open(),
             )
             .await?;
@@ -1356,6 +1121,7 @@ impl ProductionGenericCommandRunner {
             operation_progress.observe(ProgressSnapshot::indeterminate(
                 GenericProgressPhase::RunningLua,
             ));
+            let diagnostic_database_path = database_path.clone();
             let execution = tokio::task::spawn_blocking(move || {
                 let open_path = database_path.clone();
                 let connection = Connection::open_with_flags(
@@ -1371,18 +1137,15 @@ impl ProductionGenericCommandRunner {
             .await;
             let report = lua_metrics.report();
             lua_summary.emit(report);
-            let execution = execution
-                .map_err(|source| GenericCommandError::operation("执行 Generic Lua", source))?;
+            let execution = execution.map_err(|source| {
+                generic_blocking_join_failure(source, StateEffect::OutcomeUnknown)
+            })?;
             match execution {
                 Ok(_) => {}
                 Err(source) if source.is_cancelled() => return Err(GenericCommandError::Cancelled),
                 Err(source) => {
-                    let diagnostic = generic_lua_execution_diagnostic(&source);
-                    return Err(GenericCommandError::diagnosed(
-                        "执行 Generic Lua",
-                        source,
-                        diagnostic,
-                    ));
+                    let report = source.diagnostic_report(&diagnostic_database_path);
+                    return Err(GenericCommandError::reported(source, report));
                 }
             }
             Ok(GenericCommandOutput::Lua {
@@ -1413,13 +1176,13 @@ impl ProductionGenericCommandRunner {
         let performance = Arc::new(RunPerformanceCounters::default());
         let project_name = command.project_name().clone();
         let project_log = generic_project_log_slot();
+        let translate_project_log = generic_translate_project_log_state();
         start_existing_generic_project_log(
             &project_log,
             command.common(),
             self.locale,
             &project_name,
-            "translate",
-            DiagnosticStage::Translate,
+            ProjectLogCommand::Translate,
             Arc::clone(&performance),
         );
         let file_system_configuration = command.common().filesystem().clone();
@@ -1427,28 +1190,39 @@ impl ProductionGenericCommandRunner {
             match start_file_system(file_system_configuration.clone(), Arc::clone(&performance)) {
                 Ok(file_system) => file_system,
                 Err(source) => {
-                    return GenericCommandRunReport::from_driven(
-                        Driven::Finished(Err(GenericCommandError::operation(
-                            "启动文件运行能力",
-                            source,
-                        ))),
+                    let driven = Driven::Finished(Err(generic_file_system_build_failure(source)));
+                    let terminal_occurrence = finish_generic_translate_project_log(
+                        &project_log,
+                        &translate_project_log,
+                        &driven,
+                    );
+                    return GenericCommandRunReport::from_driven_with_terminal_occurrence(
+                        driven,
                         Vec::new(),
                         take_generic_project_log(&project_log),
+                        terminal_occurrence,
                     );
                 }
             };
         let cpu = match RayonCpuExecutor::start(command.cpu()) {
             Ok(cpu) => cpu,
             Err(source) => {
-                let error = GenericCommandError::operation("启动 CPU 运行能力", source);
+                let error = generic_cpu_start_failure(source);
                 let mut shutdown_errors = Vec::new();
                 if let Err(source) = file_system.shutdown().await {
-                    shutdown_errors.push(GenericShutdownError::new("filesystem", source));
+                    shutdown_errors.push(GenericShutdownError::file_system(source));
                 }
-                return GenericCommandRunReport::from_driven(
-                    Driven::Finished(Err(error)),
+                let driven = Driven::Finished(Err(error));
+                let terminal_occurrence = finish_generic_translate_project_log(
+                    &project_log,
+                    &translate_project_log,
+                    &driven,
+                );
+                return GenericCommandRunReport::from_driven_with_terminal_occurrence(
+                    driven,
                     shutdown_errors,
                     take_generic_project_log(&project_log),
+                    terminal_occurrence,
                 );
             }
         };
@@ -1472,8 +1246,15 @@ impl ProductionGenericCommandRunner {
         let output_name = project_name.clone();
         let locale = self.locale;
         let operation_project_log = Arc::clone(&project_log);
+        let operation_translate_project_log = Arc::clone(&translate_project_log);
         let operation = async move {
             ensure_generic_operation_running(&operation_cancellation)?;
+            start_generic_translate_phase(
+                &operation_project_log,
+                &operation_translate_project_log,
+                ProjectLogPhase::Planning,
+                ProjectLogAmount::Indeterminate,
+            );
             operation_progress.observe(ProgressSnapshot::indeterminate(
                 GenericProgressPhase::PlanningTranslation,
             ));
@@ -1483,41 +1264,36 @@ impl ProductionGenericCommandRunner {
                 .map_err(generic_project_lease_failure)?;
             ensure_generic_operation_running(&operation_cancellation)?;
 
+            let database_path = store.database_path().to_path_buf();
             let initial_store = store.clone();
             let (snapshot, _live, current_resources) = run_project_blocking(
-                "复查 Generic 输入",
-                DiagnosticStage::Translate,
-                DiagnosticImpact::ProgressPreserved,
-                DiagnosticAction::CheckProjectState,
+                GenericDiagnosticStage::Translate,
+                StateEffect::ProgressPreserved,
+                database_path.clone(),
                 move || initial_store.load_current_translation_state(),
             )
             .await?;
             let project = snapshot.project().clone();
+            let profile_source = if command.resolved_profile_id().is_some() {
+                RunPlanValueSource::Explicit
+            } else {
+                RunPlanValueSource::ProjectState
+            };
             let profile_id = command
                 .resolved_profile_id()
                 .map(str::to_owned)
                 .or_else(|| project.last_profile_id().map(str::to_owned))
-                .ok_or_else(|| {
-                    GenericCommandError::message(
-                        "选择 Translate Profile",
-                        "首次 Generic Translate 必须显式提供 PROFILE_ID",
-                    )
-                })?;
-            let command = command.resolve_profile(&profile_id).map_err(|source| {
-                GenericCommandError::operation("读取 Translate Profile", source)
-            })?;
-            if let Some(project_log) = operation_project_log
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_mut()
-            {
-                project_log.set_profile(&profile_id);
-            }
+                .ok_or_else(GenericCommandError::missing_profile_id)?;
+            let command = command
+                .resolve_profile(&profile_id)
+                .map_err(GenericCommandError::configuration)?;
             let configuration = command.translation();
             let source_language = configuration
                 .language_modules()
                 .resolve(project.language_pair().source())
-                .map_err(|source| GenericCommandError::operation("选择源语言模块", source))?;
+                .map_err(|source| {
+                    GenericCommandError::language_module(source, project.language_pair().target())
+                })?;
 
             let prompt = load_generic_prompt(
                 &operation_file_system,
@@ -1546,14 +1322,24 @@ impl ProductionGenericCommandRunner {
                         ))
                     })
                     .await
-                    .map_err(|source| {
-                        generic_cpu_execution_failure("调度 Generic 翻译资源复制", source)
-                    })?
-                    .map_err(|source| {
-                        generic_preparation_failure("复制 Generic 翻译资源", source)
-                    })?;
+                    .map_err(generic_cpu_execution_failure)?
+                    .map_err(generic_preparation_failure)?;
             let terminology_path = command.terminology_path().map(Path::to_path_buf);
             let placeholder_rules_path = command.placeholder_rules_path().map(Path::to_path_buf);
+            resolve_generic_translate_run_plan(
+                &operation_project_log,
+                &operation_translate_project_log,
+                project.database_path(),
+                profile_source,
+                &profile_id,
+                terminology_path.as_deref(),
+                placeholder_rules_path.as_deref(),
+            );
+            let placeholder_rule_source = placeholder_rules_path
+                .as_ref()
+                .map_or(GenericPlaceholderRuleSource::ProjectSnapshot, |path| {
+                    GenericPlaceholderRuleSource::ExternalFile(path.clone())
+                });
             let (terminology, placeholder_rules, terminology_json, placeholder_json) =
                 if terminology_path.is_none() && placeholder_rules_path.is_none() {
                     (
@@ -1580,21 +1366,21 @@ impl ProductionGenericCommandRunner {
                     let (terminology, placeholder_definitions, terminology_json, placeholder_json) =
                         resources.into_parts();
                     let placeholder_compile_cancellation = operation_cancellation.clone();
+                    let placeholder_compile_source = placeholder_rule_source.clone();
                     let placeholder_rules = operation_cpu
                         .execute(move || {
                             GenericPlaceholderService::default()
                                 .compile_with_cancellation(placeholder_definitions, || {
                                     ensure_generic_cpu_running(&placeholder_compile_cancellation)
                                 })?
-                                .map_err(GenericPreparationError::Placeholder)
+                                .map_err(|source| GenericPreparationError::Placeholder {
+                                    rule_source: placeholder_compile_source,
+                                    source,
+                                })
                         })
                         .await
-                        .map_err(|source| {
-                            generic_cpu_execution_failure("调度 Generic Placeholder 编译", source)
-                        })?
-                        .map_err(|source| {
-                            generic_preparation_failure("编译 Generic Placeholder", source)
-                        })?;
+                        .map_err(generic_cpu_execution_failure)?
+                        .map_err(generic_preparation_failure)?;
                     (
                         terminology,
                         placeholder_rules,
@@ -1610,6 +1396,7 @@ impl ProductionGenericCommandRunner {
             let planning_snapshot = snapshot;
             let planning_terms = Arc::clone(&terminology);
             let planning_rules = placeholder_rules.clone();
+            let planning_rule_source = placeholder_rule_source;
             let planning_language = Arc::clone(&source_language);
             let planning_prompt = prompt.fingerprint;
             let planning_client = Arc::clone(configuration.client());
@@ -1632,6 +1419,7 @@ impl ProductionGenericCommandRunner {
                         &planning_snapshot,
                         planning_terms,
                         &planning_rules,
+                        &planning_rule_source,
                         planning_language,
                         AutomaticStateResources {
                             prompt: planning_prompt,
@@ -1644,8 +1432,8 @@ impl ProductionGenericCommandRunner {
                     )
                 })
                 .await
-                .map_err(|source| generic_cpu_execution_failure("调度 Generic 翻译计划", source))?
-                .map_err(|source| generic_preparation_failure("建立 Generic 翻译计划", source))?;
+                .map_err(generic_cpu_execution_failure)?
+                .map_err(generic_preparation_failure)?;
 
             let PreparedGenericTranslation { plan, facts } = prepared;
             let (invalidations, reused, tasks) = plan.into_parts();
@@ -1688,33 +1476,53 @@ impl ProductionGenericCommandRunner {
                     ))
                 })
                 .await
-                .map_err(|source| {
-                    generic_cpu_execution_failure("调度 Generic 翻译计划转换", source)
-                })?
-                .map_err(|source| generic_preparation_failure("转换 Generic 翻译计划", source))?;
+                .map_err(generic_cpu_execution_failure)?
+                .map_err(generic_preparation_failure)?;
             let mut summary = GenericTranslationSummary {
                 total_tasks: tasks.len(),
                 ..GenericTranslationSummary::default()
             };
+            let task_project_log = install_generic_translate_task_log(
+                &operation_project_log,
+                &operation_translate_project_log,
+                tasks.len(),
+            );
+            complete_generic_translate_phase(
+                &operation_project_log,
+                &operation_translate_project_log,
+                ProjectLogPhase::Planning,
+                ProjectLogAmount::Determinate {
+                    completed: generic_count(tasks.len()),
+                    total: generic_count(tasks.len()),
+                },
+            );
             if tasks.is_empty() {
                 operation_progress.observe(ProgressSnapshot::indeterminate(
                     GenericProgressPhase::NoModelWork,
                 ));
             } else {
+                start_generic_translate_phase(
+                    &operation_project_log,
+                    &operation_translate_project_log,
+                    ProjectLogPhase::ConfirmedTasks,
+                    ProjectLogAmount::Determinate {
+                        completed: 0,
+                        total: generic_count(tasks.len()),
+                    },
+                );
                 operation_progress.observe(ProgressSnapshot::determinate(
                     GenericProgressPhase::ConfirmedTasks,
                     0,
-                    u64::try_from(tasks.len()).unwrap_or(u64::MAX),
+                    generic_count(tasks.len()),
                 ));
             }
             ensure_generic_operation_running(&operation_cancellation)?;
             if apply_translation_resources {
                 let save_store = store.clone();
                 let resource_outcome = run_project_blocking(
-                    "保存 Generic 翻译资源并清除失效译文",
-                    DiagnosticStage::Translate,
-                    DiagnosticImpact::ProgressPreserved,
-                    DiagnosticAction::Retry,
+                    GenericDiagnosticStage::Translate,
+                    StateEffect::ProgressPreserved,
+                    database_path.clone(),
                     move || {
                         save_store.apply_translation_resources(
                             expected_raw_fingerprint,
@@ -1735,10 +1543,9 @@ impl ProductionGenericCommandRunner {
                 let commit_store = store.clone();
                 let reuse_profile = profile_id.clone();
                 let outcome = run_project_blocking(
-                    "提交 Generic 去重复用译文",
-                    DiagnosticStage::Translate,
-                    DiagnosticImpact::ProgressPreserved,
-                    DiagnosticAction::Retry,
+                    GenericDiagnosticStage::Translate,
+                    StateEffect::ProgressPreserved,
+                    database_path.clone(),
                     move || {
                         commit_store.commit_translations_for_profile(
                             expected_raw_fingerprint,
@@ -1749,6 +1556,9 @@ impl ProductionGenericCommandRunner {
                 )
                 .await?;
                 add_commit_outcome(&mut summary, &outcome);
+                if outcome.committed > 0 {
+                    mark_generic_translate_profile_saved(&operation_translate_project_log);
+                }
             }
 
             ensure_generic_operation_running(&operation_cancellation)?;
@@ -1759,7 +1569,11 @@ impl ProductionGenericCommandRunner {
                 let llm = OpenAiChatCompletionExecutor::new(
                     configuration.llm().with_pem_roots(pem_roots),
                 )
-                .map_err(|source| GenericCommandError::operation("启动 LLM 运行能力", source))?;
+                .map_err(|source| {
+                    let report =
+                        DiagnosticReport::new(StateEffect::ProgressPreserved, source.diagnostic());
+                    GenericCommandError::reported(source, report)
+                })?;
                 *operation_llm_holder
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(llm.clone());
@@ -1773,12 +1587,8 @@ impl ProductionGenericCommandRunner {
                         Ok::<_, GenericPreparationError>(metadata)
                     })
                     .await
-                    .map_err(|source| {
-                        generic_cpu_execution_failure("调度 Generic LLM 记录信息", source)
-                    })?
-                    .map_err(|source| {
-                        generic_preparation_failure("建立 Generic LLM 记录信息", source)
-                    })?;
+                    .map_err(generic_cpu_execution_failure)?
+                    .map_err(generic_preparation_failure)?;
                 let task_records = configure_generic_task_records(
                     command.record_translation_tasks(),
                     &operation_project_log,
@@ -1810,7 +1620,8 @@ impl ProductionGenericCommandRunner {
                     cpu: operation_cpu.clone(),
                     cancellation: operation_cancellation.clone(),
                     task_records: task_records.clone(),
-                    project_log: generic_task_project_log(&operation_project_log),
+                    project_log: task_project_log,
+                    translate_project_log: Arc::clone(&operation_translate_project_log),
                     progress: operation_progress.clone(),
                 })
                 .await;
@@ -1821,6 +1632,15 @@ impl ProductionGenericCommandRunner {
                 task_records.finish().await;
                 let task_summary = task_result?;
                 merge_task_summary(&mut summary, task_summary);
+                complete_generic_translate_phase(
+                    &operation_project_log,
+                    &operation_translate_project_log,
+                    ProjectLogPhase::ConfirmedTasks,
+                    ProjectLogAmount::Determinate {
+                        completed: generic_count(summary.total_tasks),
+                        total: generic_count(summary.total_tasks),
+                    },
+                );
             }
 
             ensure_generic_operation_running(&operation_cancellation)?;
@@ -1828,13 +1648,13 @@ impl ProductionGenericCommandRunner {
                 let remember_store = store.clone();
                 let remembered_profile = profile_id.clone();
                 run_project_blocking(
-                    "保存 Generic 最近 Profile",
-                    DiagnosticStage::Translate,
-                    DiagnosticImpact::ProgressPreserved,
-                    DiagnosticAction::Retry,
+                    GenericDiagnosticStage::Translate,
+                    StateEffect::ProgressPreserved,
+                    database_path,
                     move || remember_store.remember_profile(&remembered_profile),
                 )
                 .await?;
+                mark_generic_translate_profile_saved(&operation_translate_project_log);
             }
             Ok(GenericCommandOutput::Translate {
                 project: output_name,
@@ -1843,7 +1663,9 @@ impl ProductionGenericCommandRunner {
             })
         };
 
+        let cancellation_project_log = Arc::clone(&project_log);
         let driven = drive(operation, termination_signals, || {
+            emit_generic_cancellation_requested(&cancellation_project_log);
             progress.safe_stopping();
             cancellation.request();
             cpu.cancel_waits();
@@ -1860,16 +1682,19 @@ impl ProductionGenericCommandRunner {
         progress.finalizing();
         let mut shutdown_errors = Vec::new();
         if let Err(source) = cpu.shutdown() {
-            shutdown_errors.push(GenericShutdownError::new("CPU executor", source));
+            shutdown_errors.push(GenericShutdownError::cpu(source));
         }
         if let Err(source) = file_system.shutdown().await {
-            shutdown_errors.push(GenericShutdownError::new("filesystem", source));
+            shutdown_errors.push(GenericShutdownError::file_system(source));
         }
         record_generic_terminal_progress_failures(progress.finish(), &mut shutdown_errors);
-        GenericCommandRunReport::from_driven(
+        let terminal_occurrence =
+            finish_generic_translate_project_log(&project_log, &translate_project_log, &driven);
+        GenericCommandRunReport::from_driven_with_terminal_occurrence(
             driven,
             shutdown_errors,
             take_generic_project_log(&project_log),
+            terminal_occurrence,
         )
     }
 
@@ -1881,13 +1706,13 @@ impl ProductionGenericCommandRunner {
         let performance = Arc::new(RunPerformanceCounters::default());
         let project_name = command.project_name().clone();
         let project_log = generic_project_log_slot();
+        let publication_occurrence = generic_terminal_occurrence_slot();
         start_existing_generic_project_log(
             &project_log,
             command.common(),
             self.locale,
             &project_name,
-            "write-back",
-            DiagnosticStage::WriteBack,
+            ProjectLogCommand::WriteBack,
             Arc::clone(&performance),
         );
         let file_system_configuration = command.common().filesystem().clone();
@@ -1896,10 +1721,7 @@ impl ProductionGenericCommandRunner {
                 Ok(file_system) => file_system,
                 Err(source) => {
                     return GenericCommandRunReport::from_driven(
-                        Driven::Finished(Err(GenericCommandError::operation(
-                            "启动文件运行能力",
-                            source,
-                        ))),
+                        Driven::Finished(Err(generic_file_system_build_failure(source))),
                         Vec::new(),
                         take_generic_project_log(&project_log),
                     );
@@ -1908,10 +1730,10 @@ impl ProductionGenericCommandRunner {
         let cpu = match RayonCpuExecutor::start(command.cpu()) {
             Ok(cpu) => cpu,
             Err(source) => {
-                let error = GenericCommandError::operation("启动 CPU 运行能力", source);
+                let error = generic_cpu_start_failure(source);
                 let mut shutdown_errors = Vec::new();
                 if let Err(source) = file_system.shutdown().await {
-                    shutdown_errors.push(GenericShutdownError::new("filesystem", source));
+                    shutdown_errors.push(GenericShutdownError::file_system(source));
                 }
                 return GenericCommandRunReport::from_driven(
                     Driven::Finished(Err(error)),
@@ -1939,7 +1761,8 @@ impl ProductionGenericCommandRunner {
         let operation_cancellation = cancellation.clone();
         let operation_publication_gate = publication_gate.clone();
         let output_name = project_name.clone();
-        let operation_project_log = Arc::clone(&project_log);
+        let operation_project_log = generic_project_log_handle(&project_log);
+        let operation_publication_occurrence = Arc::clone(&publication_occurrence);
         let operation = async move {
             ensure_generic_operation_running(&operation_cancellation)?;
             operation_progress.observe(ProgressSnapshot::indeterminate(
@@ -1951,12 +1774,12 @@ impl ProductionGenericCommandRunner {
                 .map_err(generic_project_lease_failure)?;
             ensure_generic_operation_running(&operation_cancellation)?;
 
+            let database_path = store.database_path().to_path_buf();
             let initial_store = store.clone();
             let (snapshot, live, current_resources) = run_project_blocking(
-                "复查 Generic 写回输入",
-                DiagnosticStage::WriteBack,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
+                GenericDiagnosticStage::WriteBack,
+                StateEffect::Unchanged,
+                database_path,
                 move || initial_store.load_current_translation_state(),
             )
             .await?;
@@ -1989,29 +1812,22 @@ impl ProductionGenericCommandRunner {
                     Ok::<_, GenericPreparationError>((snapshot, has_automatic))
                 })
                 .await
-                .map_err(|source| {
-                    generic_cpu_execution_failure("调度 Generic 自动译文复查", source)
-                })?
-                .map_err(|source| generic_preparation_failure("复查 Generic 自动译文", source))?;
+                .map_err(generic_cpu_execution_failure)?
+                .map_err(generic_preparation_failure)?;
             let automatic_resources = if has_automatic_translation {
                 match project.last_profile_id().map(str::to_owned) {
                     Some(profile_id) => {
-                        let configuration =
-                            command.resolve_translation(&profile_id).map_err(|source| {
-                                GenericCommandError::operation("读取 WriteBack Profile", source)
-                            })?;
-                        if let Some(project_log) = operation_project_log
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .as_mut()
-                        {
-                            project_log.set_profile(&profile_id);
-                        }
+                        let configuration = command
+                            .resolve_translation(&profile_id)
+                            .map_err(GenericCommandError::configuration)?;
                         let source_language = configuration
                             .language_modules()
                             .resolve(project.language_pair().source())
                             .map_err(|source| {
-                                GenericCommandError::operation("选择源语言模块", source)
+                                GenericCommandError::language_module(
+                                    source,
+                                    project.language_pair().target(),
+                                )
                             })?;
                         let prompt = load_generic_prompt(
                             &operation_file_system,
@@ -2048,15 +1864,8 @@ impl ProductionGenericCommandRunner {
                                     })
                                 })
                                 .await
-                                .map_err(|source| {
-                                    generic_cpu_execution_failure(
-                                        "调度 Generic 自动资源指纹",
-                                        source,
-                                    )
-                                })?
-                                .map_err(|source| {
-                                    generic_preparation_failure("建立 Generic 自动资源指纹", source)
-                                })?,
+                                .map_err(generic_cpu_execution_failure)?
+                                .map_err(generic_preparation_failure)?,
                         )
                     }
                     None => None,
@@ -2080,10 +1889,8 @@ impl ProductionGenericCommandRunner {
                     Ok::<_, GenericPreparationError>((current_snapshot, current_translations))
                 })
                 .await
-                .map_err(|source| {
-                    generic_cpu_execution_failure("调度 Generic Current 复查", source)
-                })?
-                .map_err(|source| generic_preparation_failure("复查 Generic Current", source))?;
+                .map_err(generic_cpu_execution_failure)?
+                .map_err(generic_preparation_failure)?;
             ensure_generic_operation_running(&operation_cancellation)?;
             let candidate_cancellation = operation_cancellation.clone();
             let (write_back_project, candidate) = operation_cpu
@@ -2098,7 +1905,7 @@ impl ProductionGenericCommandRunner {
                     .map(|candidate| (project, candidate))
                 })
                 .await
-                .map_err(|source| generic_cpu_execution_failure("建立 Generic 写回候选", source))?
+                .map_err(generic_cpu_execution_failure)?
                 .map_err(generic_write_back_candidate_failure)?;
             publish_generic_write_back(
                 directory_publisher,
@@ -2107,6 +1914,8 @@ impl ProductionGenericCommandRunner {
                 candidate,
                 operation_cancellation,
                 operation_publication_gate,
+                operation_project_log,
+                operation_publication_occurrence,
                 move || {
                     operation_progress.observe(ProgressSnapshot::indeterminate(
                         GenericProgressPhase::PublishingWriteBack,
@@ -2117,10 +1926,12 @@ impl ProductionGenericCommandRunner {
         };
 
         let cancellation_publication_gate = publication_gate;
+        let cancellation_project_log = Arc::clone(&project_log);
         let driven = drive_write_back(operation, termination_signals, || {
             if !cancellation_publication_gate.request_cancellation() {
                 return false;
             }
+            emit_generic_cancellation_requested(&cancellation_project_log);
             progress.safe_stopping();
             cancellation.request();
             cpu.cancel_waits();
@@ -2131,16 +1942,20 @@ impl ProductionGenericCommandRunner {
         progress.finalizing();
         let mut shutdown_errors = Vec::new();
         if let Err(source) = cpu.shutdown() {
-            shutdown_errors.push(GenericShutdownError::new("CPU executor", source));
+            shutdown_errors.push(GenericShutdownError::cpu(source));
         }
         if let Err(source) = file_system.shutdown().await {
-            shutdown_errors.push(GenericShutdownError::new("filesystem", source));
+            shutdown_errors.push(GenericShutdownError::file_system(source));
         }
         record_generic_terminal_progress_failures(progress.finish(), &mut shutdown_errors);
-        GenericCommandRunReport::from_driven(
+        let terminal_occurrence = *publication_occurrence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        GenericCommandRunReport::from_driven_with_terminal_occurrence(
             driven,
             shutdown_errors,
             take_generic_project_log(&project_log),
+            terminal_occurrence,
         )
     }
 }
@@ -2175,6 +1990,28 @@ impl GenericLuaExecutionError {
             )
         )
     }
+
+    fn diagnostic_report(&self, database_path: &Path) -> DiagnosticReport {
+        match self {
+            Self::Open { path, source } => DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::sqlite(SqliteIssue::new(
+                    SqliteDiagnosticContext::new(
+                        SqliteDiagnosticStage::Lua,
+                        SqliteOperation::Open,
+                        SqliteTransactionState::NotStarted,
+                    ),
+                    SqliteProblem::Driver {
+                        database: SafePath::new(path),
+                        query_id: None,
+                        query_ordinal: None,
+                        failure: SqliteDriverFailure::from_error(source),
+                    },
+                )),
+            ),
+            Self::Run(source) => source.diagnostic_report(database_path),
+        }
+    }
 }
 
 impl fmt::Display for GenericLuaExecutionError {
@@ -2197,168 +2034,6 @@ impl Error for GenericLuaExecutionError {
         match self {
             Self::Open { source, .. } => Some(source),
             Self::Run(source) => Some(source),
-        }
-    }
-}
-
-fn project_lua_failure_diagnostic(
-    source: &ProjectLuaFailure,
-    stage: DiagnosticStage,
-    detail: &str,
-) -> SafeDiagnostic {
-    let (code, reason, action, subject) = match source {
-        ProjectLuaFailure::Compile(_) => (
-            DiagnosticCode::LuaExecution,
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::LuaCompilationFailed,
-                detail,
-            ),
-            DiagnosticAction::FixInput,
-            DiagnosticSubject::operation("project_lua_transaction"),
-        ),
-        ProjectLuaFailure::Cancelled
-        | ProjectLuaFailure::DatabasePrerequisite(ProjectLuaDatabasePrerequisiteError::Cancelled) => {
-            (
-                DiagnosticCode::LuaExecution,
-                DiagnosticReason::failure_with_detail(DiagnosticFailureKind::LockCancelled, detail),
-                DiagnosticAction::Retry,
-                DiagnosticSubject::operation("project_lua_transaction"),
-            )
-        }
-        ProjectLuaFailure::Context(_) => (
-            DiagnosticCode::LuaExecution,
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::LuaContextCreationFailed,
-                detail,
-            ),
-            DiagnosticAction::ReportBug,
-            DiagnosticSubject::operation("project_lua_transaction"),
-        ),
-        ProjectLuaFailure::Script(_) => (
-            DiagnosticCode::LuaExecution,
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::LuaExecutionFailed,
-                detail,
-            ),
-            DiagnosticAction::FixInput,
-            DiagnosticSubject::operation("project_lua_transaction"),
-        ),
-        ProjectLuaFailure::DatabasePrerequisite(
-            ProjectLuaDatabasePrerequisiteError::InvalidProjectState(state),
-        ) => (
-            DiagnosticCode::ProjectState,
-            DiagnosticReason::failure_with_detail(DiagnosticFailureKind::StateMismatch, state),
-            DiagnosticAction::CheckProjectState,
-            DiagnosticSubject::operation("validate_project_lua_database"),
-        ),
-        ProjectLuaFailure::DatabasePrerequisite(ProjectLuaDatabasePrerequisiteError::Sqlite(
-            error,
-        ))
-        | ProjectLuaFailure::Database(error) => (
-            DiagnosticCode::SqliteOperation,
-            project_lua_sqlite_reason(error, DiagnosticFailureKind::LuaExecutionFailed),
-            DiagnosticAction::CheckProjectState,
-            DiagnosticSubject::operation(error.operation()),
-        ),
-        ProjectLuaFailure::Host {
-            kind: "worker_spawn",
-            operation,
-            ..
-        } => (
-            DiagnosticCode::InternalOperation,
-            DiagnosticReason::failure_with_detail(DiagnosticFailureKind::WorkerSpawnFailed, detail),
-            DiagnosticAction::ReportBug,
-            DiagnosticSubject::operation(operation),
-        ),
-        ProjectLuaFailure::Host {
-            operation: "translation.capture",
-            ..
-        } => (
-            DiagnosticCode::ProjectState,
-            DiagnosticReason::failure_with_detail(DiagnosticFailureKind::StateMismatch, detail),
-            DiagnosticAction::CheckProjectState,
-            DiagnosticSubject::operation("translation.capture"),
-        ),
-        ProjectLuaFailure::Host { .. } => (
-            DiagnosticCode::LuaExecution,
-            DiagnosticReason::failure_with_detail(DiagnosticFailureKind::LuaHostCallFailed, detail),
-            DiagnosticAction::FixInput,
-            DiagnosticSubject::operation("project_lua_transaction"),
-        ),
-        ProjectLuaFailure::Validation(_) => (
-            DiagnosticCode::LuaExecution,
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::LuaFinalizationFailed,
-                detail,
-            ),
-            DiagnosticAction::FixInput,
-            DiagnosticSubject::operation("project_lua_transaction"),
-        ),
-        ProjectLuaFailure::Panicked => (
-            DiagnosticCode::LuaExecution,
-            DiagnosticReason::failure_with_detail(DiagnosticFailureKind::WorkerPanicked, detail),
-            DiagnosticAction::ReportBug,
-            DiagnosticSubject::operation("project_lua_transaction"),
-        ),
-    };
-    SafeDiagnostic::new(
-        code,
-        stage,
-        subject,
-        reason,
-        DiagnosticImpact::Unchanged,
-        action,
-    )
-}
-
-fn project_lua_sqlite_reason(
-    source: &ProjectLuaSqliteError,
-    fallback: DiagnosticFailureKind,
-) -> DiagnosticReason {
-    match source.sqlite_codes() {
-        Some((primary_code, extended_code)) => DiagnosticReason::Sqlite {
-            primary_code,
-            extended_code,
-        },
-        None => DiagnosticReason::failure(fallback),
-    }
-}
-
-fn generic_lua_execution_diagnostic(source: &GenericLuaExecutionError) -> SafeDiagnostic {
-    let detail = source.to_string();
-    match source {
-        GenericLuaExecutionError::Open { path, .. } => SafeDiagnostic::new(
-            DiagnosticCode::LuaExecution,
-            DiagnosticStage::Lua,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::LuaDatabaseOpenFailed,
-                &detail,
-            ),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
-        ),
-        GenericLuaExecutionError::Run(
-            ProjectLuaRunError::RollbackOutcomeUnknown { .. }
-            | ProjectLuaRunError::CommitOutcomeUnknown(_),
-        ) => SafeDiagnostic::new(
-            DiagnosticCode::LuaExecution,
-            DiagnosticStage::Lua,
-            DiagnosticSubject::operation("project_lua_transaction"),
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::LuaFinalizationFailed,
-                &detail,
-            ),
-            DiagnosticImpact::OutcomeUnknown,
-            DiagnosticAction::PreserveRecoveryArtifacts,
-        )
-        .with_recovery(RecoveryFact::transaction("outcome_unknown")),
-        GenericLuaExecutionError::Run(ProjectLuaRunError::NotStarted(failure)) => {
-            project_lua_failure_diagnostic(failure, DiagnosticStage::Lua, &detail)
-        }
-        GenericLuaExecutionError::Run(ProjectLuaRunError::RolledBack(failure)) => {
-            project_lua_failure_diagnostic(failure, DiagnosticStage::Lua, &detail)
-                .with_recovery(RecoveryFact::transaction("rolled_back"))
         }
     }
 }
@@ -2395,24 +2070,26 @@ async fn load_generic_prompt(
         translation_prompt_resource_paths(configuration.prompt_root(), response_mode);
     let template = read_unparsed_prompt_resource(file_system, prompt_paths.system())
         .await
-        .map_err(|source| generic_prompt_resource_failure("读取翻译 system Prompt", source))?;
+        .map_err(generic_prompt_resource_failure)?;
     let thinking = if let Some(path) = prompt_paths.thinking() {
         Some(
             read_unparsed_prompt_resource(file_system, path)
                 .await
-                .map_err(|source| {
-                    generic_prompt_resource_failure("读取翻译 thinking Prompt", source)
-                })?,
+                .map_err(generic_prompt_resource_failure)?,
         )
     } else {
         None
     };
     let rules = read_unparsed_prompt_resource(file_system, prompt_paths.rules())
         .await
-        .map_err(|source| generic_prompt_resource_failure("读取翻译响应规则 Prompt", source))?;
+        .map_err(generic_prompt_resource_failure)?;
     let example = read_unparsed_prompt_resource(file_system, prompt_paths.example())
         .await
-        .map_err(|source| generic_prompt_resource_failure("读取翻译示例 Prompt", source))?;
+        .map_err(generic_prompt_resource_failure)?;
+    let system_path = prompt_paths.system().to_path_buf();
+    let thinking_path = prompt_paths.thinking().map(Path::to_path_buf);
+    let rules_path = prompt_paths.rules().to_path_buf();
+    let example_path = prompt_paths.example().to_path_buf();
     let language_pair = language_pair.clone();
     let prompt_cancellation = cancellation.clone();
     cpu.execute(move || {
@@ -2475,34 +2152,45 @@ async fn load_generic_prompt(
         })
     })
     .await
-    .map_err(|source| generic_cpu_execution_failure("调度 Generic Prompt 准备", source))?
+    .map_err(generic_cpu_execution_failure)?
     .map_err(|source| match source {
         GenericPromptPreparationError::Cancelled => GenericCommandError::Cancelled,
         GenericPromptPreparationError::SystemResource(source) => {
-            generic_prompt_resource_failure("读取翻译 system Prompt", source)
+            generic_prompt_resource_failure(source)
         }
         GenericPromptPreparationError::ThinkingResource(source) => {
-            generic_prompt_resource_failure("读取翻译 thinking Prompt", source)
+            generic_prompt_resource_failure(source)
         }
         GenericPromptPreparationError::RulesResource(source) => {
-            generic_prompt_resource_failure("读取翻译响应规则 Prompt", source)
+            generic_prompt_resource_failure(source)
         }
         GenericPromptPreparationError::ExampleResource(source) => {
-            generic_prompt_resource_failure("读取翻译示例 Prompt", source)
+            generic_prompt_resource_failure(source)
         }
         GenericPromptPreparationError::SystemTemplate(source) => {
-            GenericCommandError::operation("渲染翻译 system Prompt", source)
+            generic_prompt_template_failure(&system_path, source)
         }
-        GenericPromptPreparationError::ThinkingTemplate(source) => {
-            GenericCommandError::operation("校验翻译 thinking Prompt", source)
-        }
+        GenericPromptPreparationError::ThinkingTemplate(source) => generic_prompt_template_failure(
+            thinking_path
+                .as_deref()
+                .expect("thinking 模板失败必须对应已选择的 thinking 资源"),
+            source,
+        ),
         GenericPromptPreparationError::RulesTemplate(source) => {
-            GenericCommandError::operation("校验翻译响应规则 Prompt", source)
+            generic_prompt_template_failure(&rules_path, source)
         }
         GenericPromptPreparationError::ExampleTemplate(source) => {
-            GenericCommandError::operation("校验翻译示例 Prompt", source)
+            generic_prompt_template_failure(&example_path, source)
         }
     })
+}
+
+fn generic_prompt_template_failure(
+    path: &Path,
+    source: PromptTemplateError,
+) -> GenericCommandError {
+    let report = DiagnosticReport::new(StateEffect::Unchanged, source.diagnostic(path));
+    GenericCommandError::reported(source, report)
 }
 
 fn ensure_generic_prompt_preparation_running(
@@ -2566,17 +2254,43 @@ struct PreparedGenericGroup {
 #[derive(Debug)]
 enum GenericPreparationError {
     Cancelled,
-    Placeholder(crate::generic::GenericPlaceholderError),
-    LanguageProjection(LanguageTextProjectionError),
+    Placeholder {
+        rule_source: GenericPlaceholderRuleSource,
+        source: crate::generic::GenericPlaceholderError,
+    },
+    PlaceholderProtection {
+        rule_source: GenericPlaceholderRuleSource,
+        locator: GenericUnitLocator,
+        source: PlaceholderProtectionError,
+    },
+    LanguageProjection {
+        locator: GenericUnitLocator,
+        source: LanguageTextProjectionError,
+    },
     Planning(GenericPlanningError),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum GenericPlaceholderRuleSource {
+    ExternalFile(PathBuf),
+    ProjectSnapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GenericUnitLocator {
+    relative_path: PathBuf,
+    group_id: String,
+    unit_id: String,
+    role: String,
 }
 
 impl fmt::Display for GenericPreparationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Cancelled => formatter.write_str("Generic CPU 工作已取消"),
-            Self::Placeholder(source) => source.fmt(formatter),
-            Self::LanguageProjection(source) => source.fmt(formatter),
+            Self::Placeholder { source, .. } => source.fmt(formatter),
+            Self::PlaceholderProtection { source, .. } => source.fmt(formatter),
+            Self::LanguageProjection { source, .. } => source.fmt(formatter),
             Self::Planning(source) => source.fmt(formatter),
         }
     }
@@ -2586,10 +2300,39 @@ impl Error for GenericPreparationError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Cancelled => None,
-            Self::Placeholder(source) => Some(source),
-            Self::LanguageProjection(source) => Some(source),
+            Self::Placeholder { source, .. } => Some(source),
+            Self::PlaceholderProtection { source, .. } => Some(source),
+            Self::LanguageProjection { source, .. } => Some(source),
             Self::Planning(source) => Some(source),
         }
+    }
+}
+
+fn generic_placeholder_protection_failure(
+    source: crate::generic::GenericPlaceholderError,
+    rule_source: &GenericPlaceholderRuleSource,
+    relative_path: &Path,
+    group_id: &str,
+    unit_id: &str,
+    role: &str,
+) -> GenericPreparationError {
+    match source {
+        crate::generic::GenericPlaceholderError::Protection(source) => {
+            GenericPreparationError::PlaceholderProtection {
+                rule_source: rule_source.clone(),
+                locator: GenericUnitLocator {
+                    relative_path: relative_path.to_path_buf(),
+                    group_id: group_id.to_owned(),
+                    unit_id: unit_id.to_owned(),
+                    role: role.to_owned(),
+                },
+                source,
+            }
+        }
+        source => GenericPreparationError::Placeholder {
+            rule_source: rule_source.clone(),
+            source,
+        },
     }
 }
 
@@ -2620,13 +2363,13 @@ fn ensure_generic_operation_running(
 }
 
 fn generic_cpu_execution_failure(
-    stage: &'static str,
     source: CpuTaskExecutionError<CpuExecutorUnavailable>,
 ) -> GenericCommandError {
     match source {
         CpuTaskExecutionError::Cancelled => GenericCommandError::Cancelled,
         source @ (CpuTaskExecutionError::Unavailable(_) | CpuTaskExecutionError::TaskPanicked) => {
-            GenericCommandError::operation(stage, source)
+            let report = DiagnosticReport::new(StateEffect::ProgressPreserved, source.diagnostic());
+            GenericCommandError::reported(source, report)
         }
     }
 }
@@ -2641,7 +2384,8 @@ fn generic_project_lease_failure(
             GenericCommandError::Cancelled
         }
         ProjectCommandLeaseError::Unavailable { .. } => {
-            GenericCommandError::operation("取得项目租约", source)
+            let report = source.diagnostic_report_at(FileSystemDiagnosticStage::Project);
+            GenericCommandError::reported(source, report)
         }
     }
 }
@@ -2662,31 +2406,26 @@ fn read_file_error_is_cancelled(source: &ReadFileError<SystemFileSystemError>) -
 }
 
 fn generic_read_file_failure(
-    operation: &'static str,
     source: ReadFileError<SystemFileSystemError>,
-    stage: DiagnosticStage,
-    action: DiagnosticAction,
+    stage: FileSystemDiagnosticStage,
 ) -> GenericCommandError {
     if read_file_error_is_cancelled(&source) {
         GenericCommandError::Cancelled
     } else {
-        let diagnostic = generic_read_file_diagnostic(&source, stage, action);
-        GenericCommandError::diagnosed(operation, source, diagnostic)
+        let report = generic_read_file_report(&source, stage);
+        GenericCommandError::reported(source, report)
     }
 }
 
-fn generic_prompt_resource_failure(
-    operation: &'static str,
-    source: PromptResourceLoadError,
-) -> GenericCommandError {
+fn generic_prompt_resource_failure(source: PromptResourceLoadError) -> GenericCommandError {
     if matches!(
         &source,
         PromptResourceLoadError::Read(source) if read_file_error_is_cancelled(source)
     ) {
         GenericCommandError::Cancelled
     } else {
-        let diagnostic = source.safe_diagnostic();
-        GenericCommandError::diagnosed(operation, source, diagnostic)
+        let report = source.diagnostic_report();
+        GenericCommandError::reported(source, report)
     }
 }
 
@@ -2708,65 +2447,539 @@ fn generic_translation_resource_failure(
     };
     if cancelled {
         GenericCommandError::Cancelled
-    } else if let Some((operation, worker_source)) = translation_resource_worker_start(&source) {
-        let diagnostic = SafeDiagnostic::io(
-            DiagnosticCode::InternalOperation,
-            DiagnosticStage::Translate,
-            DiagnosticSubject::operation(operation),
-            "spawn_worker",
-            worker_source,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::ReportBug,
-        );
-        GenericCommandError::diagnosed("读取翻译资源", source, diagnostic)
     } else {
-        GenericCommandError::operation("读取翻译资源", source)
+        let report = generic_translation_resource_report(&source);
+        GenericCommandError::reported(source, report)
     }
 }
 
-fn translation_resource_worker_start<F, C>(
-    source: &TranslationPlanningResourceReadingError<F, C>,
-) -> Option<(&'static str, &io::Error)> {
-    match source {
-        TranslationPlanningResourceReadingError::InvalidTerminology {
-            source: TerminologyDefinitionError::StartWorker { operation, source },
-            ..
-        }
-        | TranslationPlanningResourceReadingError::InvalidPlaceholderRules {
-            source: PlaceholderDefinitionError::StartWorker { operation, source },
-            ..
-        } => Some((*operation, source)),
-        _ => None,
-    }
+fn generic_translation_resource_report(
+    source: &TranslationPlanningResourceReadingError<SystemFileSystemError, CpuExecutorUnavailable>,
+) -> DiagnosticReport {
+    source.diagnostic_report()
 }
 
-fn generic_preparation_failure(
-    stage: &'static str,
-    source: GenericPreparationError,
-) -> GenericCommandError {
+fn generic_preparation_failure(source: GenericPreparationError) -> GenericCommandError {
     if source.is_cancelled() {
         GenericCommandError::Cancelled
-    } else if let GenericPreparationError::Placeholder(
-        crate::generic::GenericPlaceholderError::Compilation(
-            PlaceholderRuleCompilationError::StartWorker {
-                operation,
-                source: worker_source,
+    } else {
+        let report = generic_preparation_report(&source);
+        GenericCommandError::reported(source, report)
+    }
+}
+
+fn generic_preparation_report(source: &GenericPreparationError) -> DiagnosticReport {
+    if let Some(report) = generic_placeholder_protection_report(source) {
+        return report;
+    }
+    let preparation = |unit, problem| {
+        DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::generic(GenericIssue::project(
+                GenericDiagnosticStage::Translate,
+                GenericProblem::TranslationPreparation { unit, problem },
+            )),
+        )
+    };
+    match source {
+        GenericPreparationError::Cancelled => DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::runtime(RuntimeIssue::Cancelled {
+                component: RuntimeComponent::CpuExecutor,
+                operation: RuntimeOperation::ExecuteTask,
+            }),
+        ),
+        GenericPreparationError::Placeholder {
+            rule_source,
+            source,
+        } => match source {
+            crate::generic::GenericPlaceholderError::InvalidResourceSnapshot(source) => {
+                preparation(
+                    None,
+                    GenericTranslationPreparationProblem::InvalidPlaceholderSnapshot {
+                        category: GenericJsonErrorCategory::from(
+                            crate::json_diagnostic::JsonErrorCategory::from(source),
+                        ),
+                        line: source.line(),
+                        column: source.column(),
+                    },
+                )
+            }
+            crate::generic::GenericPlaceholderError::Compilation(source) => {
+                let origin = match rule_source {
+                    GenericPlaceholderRuleSource::ExternalFile(path) => {
+                        TranslationPlanningResourceOrigin::external(path)
+                    }
+                    GenericPlaceholderRuleSource::ProjectSnapshot => {
+                        TranslationPlanningResourceOrigin::ProjectSnapshot
+                    }
+                };
+                DiagnosticReport::new(
+                    StateEffect::Unchanged,
+                    Diagnostic::translation(TranslationIssue::PlaceholderCompilation {
+                        origin,
+                        problem: source.diagnostic_problem(),
+                    }),
+                )
+            }
+            crate::generic::GenericPlaceholderError::Protection(_) => preparation(
+                None,
+                GenericTranslationPreparationProblem::UnexpectedUnlocatedPlaceholderProtection,
+            ),
+            crate::generic::GenericPlaceholderError::Restore(source) => match source {
+                PlaceholderRestoreError::Projection(source) => preparation(
+                    None,
+                    GenericTranslationPreparationProblem::PlaceholderRestoreProjection {
+                        problem: generic_language_projection_problem(source),
+                    },
+                ),
+                PlaceholderRestoreError::Multiset(source) => preparation(
+                    None,
+                    GenericTranslationPreparationProblem::PlaceholderRestoreMultiset {
+                        problem: generic_placeholder_multiset_problem(source),
+                    },
+                ),
+            },
+            crate::generic::GenericPlaceholderError::ManualTranslationMismatch => preparation(
+                None,
+                GenericTranslationPreparationProblem::ManualTranslationPlaceholderMismatch,
+            ),
+        },
+        GenericPreparationError::PlaceholderProtection { .. } => {
+            unreachable!("带定位的 Placeholder 失败已在函数入口处理")
+        }
+        GenericPreparationError::LanguageProjection { locator, source } => preparation(
+            Some(diagnostic_generic_unit_locator(locator)),
+            GenericTranslationPreparationProblem::LanguageProjection {
+                problem: generic_language_projection_problem(source),
             },
         ),
-    ) = &source
-    {
-        let diagnostic = SafeDiagnostic::io(
-            DiagnosticCode::InternalOperation,
-            DiagnosticStage::Translate,
-            DiagnosticSubject::operation("custom_placeholder_compile"),
-            *operation,
-            worker_source,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::ReportBug,
-        );
-        GenericCommandError::diagnosed(stage, source, diagnostic)
-    } else {
-        GenericCommandError::operation(stage, source)
+        GenericPreparationError::Planning(source) => generic_planning_report(source),
+    }
+}
+
+fn diagnostic_generic_unit_locator(locator: &GenericUnitLocator) -> DiagnosticGenericUnitLocator {
+    DiagnosticGenericUnitLocator::new(
+        &locator.relative_path,
+        &locator.group_id,
+        &locator.unit_id,
+        Some(&locator.role),
+    )
+}
+
+const fn generic_language_projection_problem(
+    source: &LanguageTextProjectionError,
+) -> GenericLanguageProjectionProblem {
+    match source {
+        LanguageTextProjectionError::TokenIndexConstruction => {
+            GenericLanguageProjectionProblem::TokenIndexConstruction
+        }
+        LanguageTextProjectionError::EmptyToken => GenericLanguageProjectionProblem::EmptyToken,
+        LanguageTextProjectionError::MissingToken { .. } => {
+            GenericLanguageProjectionProblem::MissingToken
+        }
+        LanguageTextProjectionError::RepeatedToken { .. } => {
+            GenericLanguageProjectionProblem::RepeatedToken
+        }
+        LanguageTextProjectionError::OverlappingToken { .. } => {
+            GenericLanguageProjectionProblem::OverlappingToken
+        }
+        LanguageTextProjectionError::ChangedTokenOrder { position, .. } => {
+            GenericLanguageProjectionProblem::ChangedTokenOrder {
+                position: *position,
+            }
+        }
+        LanguageTextProjectionError::ChangedSegmentCount { expected, actual } => {
+            GenericLanguageProjectionProblem::ChangedSegmentCount {
+                expected: *expected,
+                actual: *actual,
+            }
+        }
+        LanguageTextProjectionError::ChangedSegmentKind { segment_index } => {
+            GenericLanguageProjectionProblem::ChangedSegmentKind {
+                segment_index: *segment_index,
+            }
+        }
+        LanguageTextProjectionError::MissingOrderedToken { segment_index } => {
+            GenericLanguageProjectionProblem::MissingOrderedToken {
+                segment_index: *segment_index,
+            }
+        }
+        LanguageTextProjectionError::UnusedOrderedToken => {
+            GenericLanguageProjectionProblem::UnusedOrderedToken
+        }
+    }
+}
+
+const fn generic_placeholder_multiset_problem(
+    source: &PlaceholderMultisetError,
+) -> GenericPlaceholderMultisetProblem {
+    match source {
+        PlaceholderMultisetError::Mismatch { .. } => GenericPlaceholderMultisetProblem::Mismatch,
+        PlaceholderMultisetError::Unexpected { .. } => {
+            GenericPlaceholderMultisetProblem::Unexpected
+        }
+        PlaceholderMultisetError::OrderMismatch { .. } => {
+            GenericPlaceholderMultisetProblem::OrderMismatch
+        }
+    }
+}
+
+fn generic_response_restore_problem(
+    source: &PlaceholderRestoreError,
+) -> GenericResponseDestinationProblem {
+    match source {
+        PlaceholderRestoreError::Projection(source) => {
+            GenericResponseDestinationProblem::PlaceholderRestoreProjection {
+                problem: generic_language_projection_problem(source),
+            }
+        }
+        PlaceholderRestoreError::Multiset(source) => {
+            GenericResponseDestinationProblem::PlaceholderRestoreMultiset {
+                problem: generic_placeholder_multiset_problem(source),
+            }
+        }
+    }
+}
+
+fn generic_response_placeholder_problem(
+    source: &crate::generic::GenericPlaceholderError,
+) -> GenericResponseDestinationProblem {
+    match source {
+        crate::generic::GenericPlaceholderError::InvalidResourceSnapshot(source) => {
+            GenericResponseDestinationProblem::InvalidPlaceholderSnapshot {
+                category: GenericJsonErrorCategory::from(
+                    crate::json_diagnostic::JsonErrorCategory::from(source),
+                ),
+                line: source.line(),
+                column: source.column(),
+            }
+        }
+        crate::generic::GenericPlaceholderError::Compilation(source) => {
+            GenericResponseDestinationProblem::PlaceholderCompilation {
+                problem: source.diagnostic_problem(),
+            }
+        }
+        crate::generic::GenericPlaceholderError::Protection(source) => {
+            GenericResponseDestinationProblem::PlaceholderProtection {
+                problem: source.diagnostic_issue(),
+            }
+        }
+        crate::generic::GenericPlaceholderError::Restore(source) => {
+            generic_response_restore_problem(source)
+        }
+        crate::generic::GenericPlaceholderError::ManualTranslationMismatch => {
+            GenericResponseDestinationProblem::PlaceholderBindingMismatch
+        }
+    }
+}
+
+const fn generic_repair_application_problem(
+    source: &LanguageRepairApplicationError,
+) -> GenericRepairApplicationProblem {
+    match source {
+        LanguageRepairApplicationError::InvalidNaturalSegment { segment_index } => {
+            GenericRepairApplicationProblem::InvalidNaturalSegment {
+                segment_index: *segment_index,
+            }
+        }
+        LanguageRepairApplicationError::DuplicatePosition {
+            segment_index,
+            byte_offset,
+        } => GenericRepairApplicationProblem::DuplicatePosition {
+            segment_index: *segment_index,
+            byte_offset: *byte_offset,
+        },
+        LanguageRepairApplicationError::InvalidCharacterBoundary {
+            segment_index,
+            byte_offset,
+        } => GenericRepairApplicationProblem::InvalidCharacterBoundary {
+            segment_index: *segment_index,
+            byte_offset: *byte_offset,
+        },
+        LanguageRepairApplicationError::MissingCharacter {
+            segment_index,
+            byte_offset,
+        } => GenericRepairApplicationProblem::MissingCharacter {
+            segment_index: *segment_index,
+            byte_offset: *byte_offset,
+        },
+        LanguageRepairApplicationError::UnexpectedCharacter {
+            segment_index,
+            byte_offset,
+            ..
+        } => GenericRepairApplicationProblem::UnexpectedCharacter {
+            segment_index: *segment_index,
+            byte_offset: *byte_offset,
+        },
+    }
+}
+
+fn generic_planning_report(source: &GenericPlanningError) -> DiagnosticReport {
+    match source {
+        GenericPlanningError::Cancelled => DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::translation(TranslationIssue::TaskPlanning {
+                problem: TranslationTaskPlanningProblem::Cancelled,
+            }),
+        ),
+        GenericPlanningError::TaskPlanning(source) => DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::translation(TranslationIssue::TaskPlanning {
+                problem: generic_task_planning_problem(source),
+            }),
+        ),
+        GenericPlanningError::MissingCurrentContext(locator) => generic_planning_fact_report(
+            locator,
+            GenericTranslationPreparationProblem::MissingCurrentContext {
+                group_id: SafeIdentifier::from_validated(locator.group_id()),
+                unit_id: SafeIdentifier::from_validated(locator.unit_id()),
+            },
+        ),
+        GenericPlanningError::Missing(locator) => generic_planning_fact_report(
+            locator,
+            GenericTranslationPreparationProblem::MissingPlanningFact {
+                group_id: SafeIdentifier::from_validated(locator.group_id()),
+                unit_id: SafeIdentifier::from_validated(locator.unit_id()),
+            },
+        ),
+        GenericPlanningError::Unknown(locator) => generic_planning_fact_report(
+            locator,
+            GenericTranslationPreparationProblem::UnknownPlanningFact {
+                group_id: SafeIdentifier::from_validated(locator.group_id()),
+                unit_id: SafeIdentifier::from_validated(locator.unit_id()),
+            },
+        ),
+        GenericPlanningError::Duplicate(locator) => generic_planning_fact_report(
+            locator,
+            GenericTranslationPreparationProblem::DuplicatePlanningFact {
+                group_id: SafeIdentifier::from_validated(locator.group_id()),
+                unit_id: SafeIdentifier::from_validated(locator.unit_id()),
+            },
+        ),
+    }
+}
+
+fn generic_planning_fact_report(
+    locator: &GenericPlanningUnitLocator,
+    problem: GenericTranslationPreparationProblem,
+) -> DiagnosticReport {
+    DiagnosticReport::new(
+        StateEffect::Unchanged,
+        Diagnostic::generic(GenericIssue::project(
+            GenericDiagnosticStage::Translate,
+            GenericProblem::TranslationPreparation {
+                unit: Some(DiagnosticGenericUnitLocator::new(
+                    locator.relative_path(),
+                    locator.group_id(),
+                    locator.unit_id(),
+                    Some(locator.role()),
+                )),
+                problem,
+            },
+        )),
+    )
+}
+
+const fn generic_task_planning_problem(
+    source: &TaskPlanningError,
+) -> TranslationTaskPlanningProblem {
+    match source {
+        TaskPlanningError::Cancelled => TranslationTaskPlanningProblem::Cancelled,
+        TaskPlanningError::EmptyScope => TranslationTaskPlanningProblem::EmptyScope,
+        TaskPlanningError::EmptyGroup => TranslationTaskPlanningProblem::EmptyGroup,
+        TaskPlanningError::UnitCountOverflow => TranslationTaskPlanningProblem::UnitCountOverflow,
+        TaskPlanningError::CharacterCountOverflow => {
+            TranslationTaskPlanningProblem::CharacterCountOverflow
+        }
+        TaskPlanningError::ResponsibilityCountMismatch { expected, actual } => {
+            TranslationTaskPlanningProblem::ResponsibilityCountMismatch {
+                expected: *expected,
+                actual: *actual,
+            }
+        }
+        TaskPlanningError::TaskIdOverflow => TranslationTaskPlanningProblem::TaskIdOverflow,
+    }
+}
+
+fn generic_placeholder_protection_report(
+    source: &GenericPreparationError,
+) -> Option<DiagnosticReport> {
+    let GenericPreparationError::PlaceholderProtection {
+        rule_source,
+        locator,
+        source,
+    } = source
+    else {
+        return None;
+    };
+    let rule_source = match rule_source {
+        GenericPlaceholderRuleSource::ExternalFile(path) => {
+            DiagnosticPlaceholderRuleSource::external_file(path)
+        }
+        GenericPlaceholderRuleSource::ProjectSnapshot => {
+            DiagnosticPlaceholderRuleSource::ProjectSnapshot
+        }
+    };
+    let unit = DiagnosticGenericUnitLocator::new(
+        &locator.relative_path,
+        &locator.group_id,
+        &locator.unit_id,
+        Some(&locator.role),
+    );
+    let problem = placeholder_protection_issue(source);
+    Some(DiagnosticReport::new(
+        StateEffect::Unchanged,
+        Diagnostic::translation(TranslationIssue::Placeholder {
+            rule_source,
+            unit,
+            problem,
+        }),
+    ))
+}
+
+fn placeholder_protection_issue(source: &PlaceholderProtectionError) -> PlaceholderIssue {
+    match source {
+        PlaceholderProtectionError::StartWorker { operation, source } => {
+            PlaceholderIssue::WorkerStart {
+                operation: diagnostic_placeholder_worker_operation(*operation),
+                io_kind: SafeIoKind::from(source.kind()),
+                raw_os_code: source.raw_os_error(),
+            }
+        }
+        PlaceholderProtectionError::Match { rule, source } => PlaceholderIssue::PatternMatch {
+            rule_origin: Some(diagnostic_placeholder_rule_origin(rule.origin())),
+            rule_number: rule.rule_number(),
+            pcre2: Pcre2Failure {
+                kind: diagnostic_pcre2_failure_kind(source.kind()),
+                code: source.code(),
+                offset: source.offset(),
+            },
+        },
+        PlaceholderProtectionError::EmptyMatch { matched } => PlaceholderIssue::EmptyMatch {
+            rule_origin: diagnostic_placeholder_rule_origin(matched.rule().origin()),
+            rule_number: matched.rule().rule_number(),
+            match_range: known_placeholder_range(matched.start_byte(), matched.end_byte()),
+        },
+        PlaceholderProtectionError::MissingTextCapture {
+            rule_number,
+            whole_match_start_byte,
+            whole_match_end_byte,
+        } => PlaceholderIssue::MissingTextCapture {
+            rule_number: *rule_number,
+            match_range: known_placeholder_range(*whole_match_start_byte, *whole_match_end_byte),
+        },
+        PlaceholderProtectionError::InvalidMatchRange {
+            rule_number,
+            whole_match_start_byte,
+            whole_match_end_byte,
+            capture_start_byte,
+            capture_end_byte,
+            violation,
+        } => PlaceholderIssue::InvalidMatchRange {
+            rule_number: *rule_number,
+            whole_match_start_byte: *whole_match_start_byte,
+            whole_match_end_byte: *whole_match_end_byte,
+            capture_start_byte: *capture_start_byte,
+            capture_end_byte: *capture_end_byte,
+            violation: diagnostic_match_range_violation(*violation),
+        },
+        PlaceholderProtectionError::OverlappingMatches { first, second } => {
+            PlaceholderIssue::OverlappingMatches {
+                first_origin: diagnostic_placeholder_rule_origin(first.rule().origin()),
+                first_rule_number: first.rule().rule_number(),
+                first_range: known_placeholder_range(first.start_byte(), first.end_byte()),
+                second_origin: diagnostic_placeholder_rule_origin(second.rule().origin()),
+                second_rule_number: second.rule().rule_number(),
+                second_range: known_placeholder_range(second.start_byte(), second.end_byte()),
+            }
+        }
+        PlaceholderProtectionError::CrossesLineBoundary {
+            matched,
+            source_line_index,
+        } => PlaceholderIssue::CrossesLineBoundary {
+            rule_origin: diagnostic_placeholder_rule_origin(matched.rule().origin()),
+            rule_number: matched.rule().rule_number(),
+            source_line_index: *source_line_index,
+        },
+        PlaceholderProtectionError::ReservedTokenNamespace {
+            start_byte,
+            end_byte,
+        } => PlaceholderIssue::ReservedTokenNamespace {
+            range: known_placeholder_range(*start_byte, *end_byte),
+        },
+    }
+}
+
+fn known_placeholder_range(start: usize, end: usize) -> ByteRange {
+    ByteRange::new(start, end).expect("Placeholder 叶子错误必须保持已确认的正向匹配范围")
+}
+
+const fn diagnostic_placeholder_rule_origin(
+    origin: PlaceholderRuleOrigin,
+) -> DiagnosticPlaceholderRuleOrigin {
+    match origin {
+        PlaceholderRuleOrigin::BuiltIn => DiagnosticPlaceholderRuleOrigin::Builtin,
+        PlaceholderRuleOrigin::Custom => DiagnosticPlaceholderRuleOrigin::Custom,
+    }
+}
+
+const fn diagnostic_placeholder_worker_operation(
+    operation: PlaceholderWorkerOperation,
+) -> DiagnosticPlaceholderWorkerOperation {
+    match operation {
+        PlaceholderWorkerOperation::CompileCustomRules => {
+            DiagnosticPlaceholderWorkerOperation::CompileCustomRules
+        }
+        PlaceholderWorkerOperation::MatchText => DiagnosticPlaceholderWorkerOperation::MatchText,
+    }
+}
+
+const fn diagnostic_pcre2_failure_kind(kind: PlaceholderPcre2ErrorKind) -> Pcre2FailureKind {
+    match kind {
+        PlaceholderPcre2ErrorKind::Compile => Pcre2FailureKind::Compile,
+        PlaceholderPcre2ErrorKind::Jit => Pcre2FailureKind::Jit,
+        PlaceholderPcre2ErrorKind::Match => Pcre2FailureKind::Match,
+        PlaceholderPcre2ErrorKind::Info => Pcre2FailureKind::Info,
+        PlaceholderPcre2ErrorKind::Option => Pcre2FailureKind::Option,
+        PlaceholderPcre2ErrorKind::Unrecognized => Pcre2FailureKind::Unrecognized,
+    }
+}
+
+const fn diagnostic_match_range_violation(
+    violation: PlaceholderMatchRangeViolation,
+) -> DiagnosticMatchRangeViolation {
+    match violation {
+        PlaceholderMatchRangeViolation::WholeStartAfterEnd => {
+            DiagnosticMatchRangeViolation::WholeStartAfterEnd
+        }
+        PlaceholderMatchRangeViolation::WholeEndBeyondText => {
+            DiagnosticMatchRangeViolation::WholeEndBeyondText
+        }
+        PlaceholderMatchRangeViolation::WholeStartNotUtf8Boundary => {
+            DiagnosticMatchRangeViolation::WholeStartNotUtf8Boundary
+        }
+        PlaceholderMatchRangeViolation::WholeEndNotUtf8Boundary => {
+            DiagnosticMatchRangeViolation::WholeEndNotUtf8Boundary
+        }
+        PlaceholderMatchRangeViolation::CaptureStartAfterEnd => {
+            DiagnosticMatchRangeViolation::CaptureStartAfterEnd
+        }
+        PlaceholderMatchRangeViolation::CaptureEndBeyondText => {
+            DiagnosticMatchRangeViolation::CaptureEndBeyondText
+        }
+        PlaceholderMatchRangeViolation::CaptureStartNotUtf8Boundary => {
+            DiagnosticMatchRangeViolation::CaptureStartNotUtf8Boundary
+        }
+        PlaceholderMatchRangeViolation::CaptureEndNotUtf8Boundary => {
+            DiagnosticMatchRangeViolation::CaptureEndNotUtf8Boundary
+        }
+        PlaceholderMatchRangeViolation::CaptureStartsBeforeWhole => {
+            DiagnosticMatchRangeViolation::CaptureStartsBeforeWhole
+        }
+        PlaceholderMatchRangeViolation::CaptureEndsAfterWhole => {
+            DiagnosticMatchRangeViolation::CaptureEndsAfterWhole
+        }
     }
 }
 
@@ -2774,14 +2987,18 @@ fn generic_write_back_candidate_failure(source: GenericWriteBackError) -> Generi
     if source.is_cancelled() {
         GenericCommandError::Cancelled
     } else {
-        GenericCommandError::operation("建立 Generic 写回候选", source)
+        let report = source.diagnostic_report(StateEffect::Unchanged);
+        GenericCommandError::reported(source, report)
     }
 }
 
+// 这是翻译规划边界：每项参数都有独立的所有权和取消语义，合并为可变上下文会掩盖它们。
+#[allow(clippy::too_many_arguments)]
 fn prepare_generic_translation(
     snapshot: &GenericStoredSnapshot,
     terminology: Arc<CompiledTerminology>,
     placeholder_rules: &GenericCompiledPlaceholderRules,
+    placeholder_rule_source: &GenericPlaceholderRuleSource,
     source_language: Arc<dyn LanguageModule>,
     base_resources: AutomaticStateResources,
     target_task_characters: std::num::NonZeroUsize,
@@ -2793,12 +3010,12 @@ fn prepare_generic_translation(
         ensure_generic_cpu_running(cancellation)?;
         for group in file.groups() {
             ensure_generic_cpu_running(cancellation)?;
-            groups.push(group);
+            groups.push((file.relative_path(), group));
         }
     }
     let prepared_groups = groups
         .par_iter()
-        .map(|group| {
+        .map(|(relative_path, group)| {
             ensure_generic_cpu_running(cancellation)?;
             let service = GenericPlaceholderService::default();
             let mut prepared_units = Vec::with_capacity(group.units().len());
@@ -2811,10 +3028,27 @@ fn prepare_generic_translation(
                         placeholder_rules,
                         || ensure_generic_cpu_running(cancellation),
                     )?
-                    .map_err(GenericPreparationError::Placeholder)?;
+                    .map_err(|source| {
+                        generic_placeholder_protection_failure(
+                            source,
+                            placeholder_rule_source,
+                            relative_path,
+                            group.id(),
+                            unit.id(),
+                            group.kind(),
+                        )
+                    })?;
                 let language_text = protected
                     .language_text_with_cancellation(|| ensure_generic_cpu_running(cancellation))?
-                    .map_err(GenericPreparationError::LanguageProjection)?;
+                    .map_err(|source| GenericPreparationError::LanguageProjection {
+                        locator: GenericUnitLocator {
+                            relative_path: relative_path.to_path_buf(),
+                            group_id: group.id().to_owned(),
+                            unit_id: unit.id().to_owned(),
+                            role: group.kind().to_owned(),
+                        },
+                        source,
+                    })?;
                 let analysis = source_language
                     .analyze_source_with_cancellation(&language_text, &mut || {
                         ensure_generic_language_running(cancellation)
@@ -2844,6 +3078,7 @@ fn prepare_generic_translation(
                     ..base_resources
                 };
                 let mut planning = PlanningUnit::from_stored_with_cancellation(
+                    relative_path,
                     snapshot.project(),
                     group,
                     unit,
@@ -2953,12 +3188,12 @@ fn collect_generic_current_translations(
         ensure_generic_cpu_running(cancellation)?;
         for group in file.groups() {
             ensure_generic_cpu_running(cancellation)?;
-            groups.push(group);
+            groups.push((file.relative_path(), group));
         }
     }
     let prepared_groups = groups
         .par_iter()
-        .map(|group| {
+        .map(|(relative_path, group)| {
             ensure_generic_cpu_running(cancellation)?;
             let service = GenericPlaceholderService::default();
             let mut protected_units = Vec::with_capacity(group.units().len());
@@ -2971,10 +3206,27 @@ fn collect_generic_current_translations(
                         placeholder_rules,
                         || ensure_generic_cpu_running(cancellation),
                     )?
-                    .map_err(GenericPreparationError::Placeholder)?;
+                    .map_err(|source| {
+                        generic_placeholder_protection_failure(
+                            source,
+                            &GenericPlaceholderRuleSource::ProjectSnapshot,
+                            relative_path,
+                            group.id(),
+                            unit.id(),
+                            group.kind(),
+                        )
+                    })?;
                 let language_text = protected
                     .language_text_with_cancellation(|| ensure_generic_cpu_running(cancellation))?
-                    .map_err(GenericPreparationError::LanguageProjection)?;
+                    .map_err(|source| GenericPreparationError::LanguageProjection {
+                        locator: GenericUnitLocator {
+                            relative_path: relative_path.to_path_buf(),
+                            group_id: group.id().to_owned(),
+                            unit_id: unit.id().to_owned(),
+                            role: group.kind().to_owned(),
+                        },
+                        source,
+                    })?;
                 ensure_generic_cpu_running(cancellation)?;
                 protected_units.push((unit, protected, language_text));
             }
@@ -3172,75 +3424,99 @@ fn natural_segments(language_text: &LanguageText) -> impl Iterator<Item = &str> 
 
 fn generic_task_response_diagnostic(
     task_index: usize,
-    failure: DiagnosticFailureKind,
-    detail: impl AsRef<str>,
-) -> SafeDiagnostic {
-    SafeDiagnostic::new(
-        DiagnosticCode::ModelRequest,
-        DiagnosticStage::ModelRequest,
-        DiagnosticSubject::operation(format!(
-            "generic_translation_task_{}",
-            generic_task_ordinal(task_index)
+    total_tasks: usize,
+    problem: GenericTaskResponseProblem,
+) -> DiagnosticReport {
+    DiagnosticReport::new(
+        StateEffect::ProgressPreserved,
+        Diagnostic::generic(GenericIssue::project(
+            GenericDiagnosticStage::Translate,
+            GenericProblem::TaskResponse {
+                task_ordinal: generic_task_ordinal(task_index),
+                total_tasks: generic_count(total_tasks),
+                problem,
+            },
         )),
-        DiagnosticReason::failure_with_detail(failure, detail),
-        DiagnosticImpact::ProgressPreserved,
-        DiagnosticAction::Retry,
     )
 }
 
 fn generic_response_problem_diagnostic(
     task_index: usize,
+    total_tasks: usize,
     problem: &ResponseProblem,
-) -> SafeDiagnostic {
-    let detail = match problem {
-        ResponseProblem::InvalidId(id) => format!("problem=invalid_id; actual_id={id}"),
-        ResponseProblem::UnexpectedId(id) => format!("problem=unexpected_id; output_id={id}"),
-        ResponseProblem::DuplicateId(id) => format!("problem=duplicate_id; output_id={id}"),
-        ResponseProblem::MissingId(id) => format!("problem=missing_id; output_id={id}"),
-        ResponseProblem::InvalidValue { output_id, .. } => {
-            format!("problem=invalid_value; output_id={output_id}")
-        }
-        ResponseProblem::InvalidTranslation { output_id, .. } => {
-            format!("problem=invalid_translation; output_id={output_id}")
-        }
-        ResponseProblem::InvalidDestination { output_id, .. } => {
-            format!("problem=invalid_destination_translation; output_id={output_id}")
-        }
-    };
-    generic_task_response_diagnostic(
-        task_index,
-        DiagnosticFailureKind::InvalidResponseContract,
-        detail,
-    )
+) -> DiagnosticReport {
+    generic_task_response_diagnostic(task_index, total_tasks, problem.clone())
 }
 
 fn generic_response_parse_diagnostic(
     task_index: usize,
+    total_tasks: usize,
     error: TranslationTaskResponseParseError,
-) -> SafeDiagnostic {
-    let parse_kind = match error.kind() {
+) -> DiagnosticReport {
+    let problem = match error.kind() {
         TranslationTaskResponseParseErrorKind::Json(category) => {
-            format!("json_{}", category.code())
+            GenericTaskResponseProblem::InvalidJson {
+                category: match category {
+                    TranslationTaskResponseJsonErrorCategory::Io => {
+                        GenericTaskResponseJsonCategory::Io
+                    }
+                    TranslationTaskResponseJsonErrorCategory::Syntax => {
+                        GenericTaskResponseJsonCategory::Syntax
+                    }
+                    TranslationTaskResponseJsonErrorCategory::Shape => {
+                        GenericTaskResponseJsonCategory::Shape
+                    }
+                    TranslationTaskResponseJsonErrorCategory::UnexpectedEof => {
+                        GenericTaskResponseJsonCategory::UnexpectedEof
+                    }
+                },
+                line: error.line(),
+                column: error.column(),
+            }
         }
-        kind => kind.code().to_owned(),
+        TranslationTaskResponseParseErrorKind::ThinkingEmpty => {
+            GenericTaskResponseProblem::ThinkingEmpty {
+                line: error.line(),
+                column: error.column(),
+            }
+        }
     };
-    generic_task_response_diagnostic(
-        task_index,
-        DiagnosticFailureKind::ResponseParsingFailed,
-        format!(
-            "parse_kind={parse_kind}; line={}; column={}",
-            error.line(),
-            error.column()
-        ),
+    generic_task_response_diagnostic(task_index, total_tasks, problem)
+}
+
+fn generic_unavailable_task_diagnostic(
+    task_index: usize,
+    total_tasks: usize,
+    reason: GenericTaskUnavailableReason,
+) -> DiagnosticReport {
+    DiagnosticReport::new(
+        StateEffect::ProgressPreserved,
+        Diagnostic::generic(GenericIssue::project(
+            GenericDiagnosticStage::Translate,
+            GenericProblem::TaskUnavailable {
+                task_ordinal: generic_task_ordinal(task_index),
+                total_tasks: generic_count(total_tasks),
+                reason,
+            },
+        )),
     )
 }
 
-fn generic_unavailable_task_diagnostic(task_index: usize, reason: &'static str) -> SafeDiagnostic {
-    generic_task_response_diagnostic(
-        task_index,
-        DiagnosticFailureKind::ExternalServiceUnavailable,
-        format!("reason={reason}"),
-    )
+fn generic_task_execution_error_report(
+    error: &GenericCommandError,
+    task_index: usize,
+    total_tasks: usize,
+) -> DiagnosticReport {
+    let report = generic_command_error_report(error);
+    if matches!(report.primary().code(), "generic.translation.failed") {
+        generic_unavailable_task_diagnostic(
+            task_index,
+            total_tasks,
+            GenericTaskUnavailableReason::RequestFailed,
+        )
+    } else {
+        report
+    }
 }
 
 fn empty_terminology_fingerprint() -> Sha256Fingerprint {
@@ -3277,94 +3553,212 @@ struct GenericTaskExecution {
     cancellation: CooperativeCancellation,
     task_records: ConfiguredTranslationTaskRecordSink,
     project_log: GenericTaskProjectLog,
+    translate_project_log: GenericTranslateProjectLogStateRef,
     progress: TerminalProgressObserver<GenericProgressPhase>,
 }
 
 #[derive(Clone)]
 struct GenericTaskProjectLog {
-    logger: ProjectLogger,
-    context: ProjectLogContext,
+    handle: ProjectLogHandle,
+    state: Arc<Mutex<GenericTaskLogState>>,
+}
+
+#[derive(Clone, Copy)]
+enum GenericTaskTerminal {
+    Complete,
+    Partial,
+    Unavailable,
+    Failed,
+    NotCommittedAfterEarlierFailure,
+    Cancelled,
+}
+
+#[derive(Default)]
+struct GenericTaskLogState {
+    planned: u64,
+    started: u64,
+    complete: u64,
+    partial: u64,
+    unavailable: u64,
+    failed: u64,
+    cancelled: u64,
+    failure_occurrence: Option<(
+        crate::runtime::project_log::DiagnosticOccurrenceId,
+        StateEffect,
+    )>,
 }
 
 impl GenericTaskProjectLog {
-    fn started(&self, task_index: usize, total_tasks: usize) {
-        self.logger.emit(ProjectLogEvent::new(
-            ProjectLogLevel::Debug,
-            ProjectLogCode::TaskStarted,
-            self.context.clone(),
-            ProjectLogPayload::Task {
-                ordinal: generic_task_ordinal(task_index),
-                total: u64::try_from(total_tasks).unwrap_or(u64::MAX),
-                outcome: None,
-                attempts: None,
-            },
-        ));
+    fn new(handle: ProjectLogHandle, total_tasks: usize) -> Self {
+        Self {
+            handle,
+            state: Arc::new(Mutex::new(GenericTaskLogState {
+                planned: generic_count(total_tasks),
+                ..GenericTaskLogState::default()
+            })),
+        }
+    }
+
+    fn position(&self, task_index: usize) -> TaskPosition {
+        let total = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .planned;
+        TaskPosition::new(generic_task_ordinal(task_index), total)
+            .expect("Generic task index 必须位于已确认的计划范围内")
+    }
+
+    fn started(&self, task_index: usize) {
+        let task = self.position(task_index);
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.started = state
+                .started
+                .checked_add(1)
+                .expect("Generic task started 计数不得溢出");
+        }
+        self.handle.emit(ProjectLogEvent::TaskStarted { task });
     }
 
     fn finished(
         &self,
         task_index: usize,
-        total_tasks: usize,
         attempts: usize,
-        outcome: ProjectLogTaskOutcome,
-        diagnostics: impl IntoIterator<Item = SafeDiagnostic>,
+        terminal: GenericTaskTerminal,
+        diagnostics: impl IntoIterator<Item = DiagnosticReport>,
     ) {
-        let ordinal = generic_task_ordinal(task_index);
-        let total = u64::try_from(total_tasks).unwrap_or(u64::MAX);
-        let attempts = u64::try_from(attempts).unwrap_or(u64::MAX);
-        let finished = ProjectLogEvent::new(
-            ProjectLogLevel::Debug,
-            ProjectLogCode::TaskFinished,
-            self.context.clone(),
-            ProjectLogPayload::Task {
-                ordinal,
-                total,
-                outcome: Some(outcome),
-                attempts: Some(attempts),
-            },
-        );
-        if outcome == ProjectLogTaskOutcome::Complete {
-            self.logger.emit(finished);
-        } else {
-            self.logger.emit_reliable(finished);
-        }
+        let task = self.position(task_index);
+        let earlier_failure = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let counter = match terminal {
+                GenericTaskTerminal::Complete => &mut state.complete,
+                GenericTaskTerminal::Partial => &mut state.partial,
+                GenericTaskTerminal::Unavailable => &mut state.unavailable,
+                GenericTaskTerminal::Failed
+                | GenericTaskTerminal::NotCommittedAfterEarlierFailure => &mut state.failed,
+                GenericTaskTerminal::Cancelled => &mut state.cancelled,
+            };
+            *counter = counter
+                .checked_add(1)
+                .expect("Generic task 终态计数不得溢出");
+            match terminal {
+                GenericTaskTerminal::NotCommittedAfterEarlierFailure => {
+                    state.failure_occurrence.map(|(occurrence, _)| occurrence)
+                }
+                _ => None,
+            }
+        };
+        let mut occurrence = None;
         for diagnostic in diagnostics {
-            self.logger.emit_reliable(ProjectLogEvent::new(
-                ProjectLogLevel::Warn,
-                ProjectLogCode::TaskDiagnostic,
-                self.context.clone(),
-                ProjectLogPayload::TaskDiagnostic {
-                    ordinal,
-                    total,
-                    attempts,
-                    diagnostic,
-                },
-            ));
+            let effect = diagnostic.effect();
+            let id = self
+                .handle
+                .record_diagnostic(DiagnosticScope::TranslationTask, diagnostic);
+            if occurrence.is_none() {
+                occurrence = id;
+            }
+            if matches!(terminal, GenericTaskTerminal::Failed)
+                && let Some(id) = id
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.failure_occurrence.is_none() {
+                    state.failure_occurrence = Some((id, effect));
+                }
+            }
         }
+        let outcome = match terminal {
+            GenericTaskTerminal::Complete => TaskFinishedOutcome::Complete,
+            GenericTaskTerminal::Partial => {
+                let Some(diagnostic) = occurrence else {
+                    return;
+                };
+                TaskFinishedOutcome::Partial { diagnostic }
+            }
+            GenericTaskTerminal::Unavailable => {
+                let Some(diagnostic) = occurrence else {
+                    return;
+                };
+                TaskFinishedOutcome::Unavailable { diagnostic }
+            }
+            GenericTaskTerminal::Failed => {
+                let Some(diagnostic) = occurrence else {
+                    return;
+                };
+                TaskFinishedOutcome::Failed { diagnostic }
+            }
+            GenericTaskTerminal::NotCommittedAfterEarlierFailure => {
+                let Some(diagnostic) = earlier_failure else {
+                    return;
+                };
+                TaskFinishedOutcome::NotCommittedAfterEarlierFailure { diagnostic }
+            }
+            GenericTaskTerminal::Cancelled => TaskFinishedOutcome::Cancelled,
+        };
+        self.handle.emit(ProjectLogEvent::TaskFinished {
+            task,
+            attempts: generic_count(attempts),
+            outcome,
+        });
     }
 
-    fn partial_result(&self, summary: GenericTaskSummary) {
-        if summary.partial_tasks == 0 && summary.unavailable_tasks == 0 {
-            return;
+    fn counters(&self) -> TranslationTaskCounters {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(counters) = self.handle.translation_task_counters(state.planned) {
+            return counters;
         }
-        self.logger.emit_reliable(ProjectLogEvent::new(
-            ProjectLogLevel::Warn,
-            ProjectLogCode::PartialResult,
-            self.context.clone(),
-            ProjectLogPayload::ResultSummary {
-                complete: u64::try_from(summary.complete_tasks).unwrap_or(u64::MAX),
-                partial: u64::try_from(summary.partial_tasks).unwrap_or(u64::MAX),
-                unavailable: u64::try_from(summary.unavailable_tasks).unwrap_or(u64::MAX),
-                manual_review: u64::try_from(summary.response_problems).unwrap_or(u64::MAX),
-            },
-        ));
+        // logger 已不可用时不会再有可持久化的 JSONL；保留本地快照仅供进程终态分类，
+        // 不把它当作已写入的任务事实。
+        let not_started = state
+            .planned
+            .checked_sub(state.started)
+            .expect("Generic 已开始任务数不得超过计划数");
+        TranslationTaskCounters::new(
+            state.planned,
+            state.started,
+            state.complete,
+            state.partial,
+            state.unavailable,
+            state.failed,
+            state.cancelled,
+            not_started,
+        )
+        .expect("Generic task 日志计数必须满足状态机恒等式")
+    }
+
+    fn failure_occurrence(
+        &self,
+    ) -> Option<(
+        crate::runtime::project_log::DiagnosticOccurrenceId,
+        StateEffect,
+    )> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .failure_occurrence
     }
 }
 
 fn generic_task_ordinal(task_index: usize) -> u64 {
-    u64::try_from(task_index)
-        .unwrap_or(u64::MAX)
-        .saturating_add(1)
+    generic_count(task_index)
+        .checked_add(1)
+        .expect("Generic task ordinal 不得溢出")
+}
+
+fn generic_count(value: usize) -> u64 {
+    u64::try_from(value).expect("当前平台 usize 必须能够无损表示为 u64")
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -3437,16 +3831,14 @@ impl GenericTaskRecordDraft {
 enum GenericPreparedTaskOutcome {
     Accepted {
         writes: Vec<TranslationWrite>,
-        issues: Vec<GenericTaskRecordIssue>,
-        diagnostics: Vec<SafeDiagnostic>,
+        diagnostics: Vec<DiagnosticReport>,
         accepted_units: usize,
         response_problems: usize,
         response_complete: bool,
         accepted_outputs: usize,
     },
     Unavailable {
-        reason: &'static str,
-        diagnostic: SafeDiagnostic,
+        diagnostic: DiagnosticReport,
     },
     Failed(GenericCommandError),
     Cancelled,
@@ -3517,12 +3909,12 @@ async fn execute_owned_generic_task(
             Ok::<_, GenericPreparationError>((task, expected_outputs, system_prompt, user_message))
         })
         .await
-        .map_err(|source| generic_cpu_execution_failure("调度 Generic 模型消息", source))?
+        .map_err(generic_cpu_execution_failure)?
         .map_err(|source| {
             if source.is_cancelled() {
                 GenericCommandError::Cancelled
             } else {
-                generic_preparation_failure("建立 Generic 模型消息", source)
+                generic_preparation_failure(source)
             }
         })?;
     execute_generic_task(
@@ -3547,6 +3939,15 @@ async fn execute_owned_generic_task(
     .await
 }
 
+async fn execute_indexed_generic_task(
+    context: GenericTaskRequestContext,
+    task_index: usize,
+    task: PlannedTask,
+) -> (usize, Result<GenericPreparedTask, GenericCommandError>) {
+    let result = execute_owned_generic_task(context, task_index, task).await;
+    (task_index, result)
+}
+
 async fn execute_generic_tasks(
     input: GenericTaskExecution,
 ) -> Result<GenericTaskSummary, GenericCommandError> {
@@ -3569,6 +3970,7 @@ async fn execute_generic_tasks(
         cancellation,
         task_records,
         project_log,
+        translate_project_log,
         progress,
     } = input;
     let total_tasks = tasks.len();
@@ -3596,8 +3998,8 @@ async fn execute_generic_tasks(
         let Some((task_index, task)) = remaining.next() else {
             break;
         };
-        project_log.started(task_index, total_tasks);
-        tasks.push_back(execute_owned_generic_task(
+        project_log.started(task_index);
+        tasks.push_back(execute_indexed_generic_task(
             request_context.clone(),
             task_index,
             task,
@@ -3606,7 +4008,7 @@ async fn execute_generic_tasks(
 
     let mut summary = GenericTaskSummary::default();
     let mut terminal_error = None;
-    while let Some(prepared) = tasks.next().await {
+    while let Some((scheduled_task_index, prepared)) = tasks.next().await {
         let GenericPreparedTask {
             task_index,
             outcome,
@@ -3615,6 +4017,18 @@ async fn execute_generic_tasks(
         } = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
+                let report =
+                    generic_task_execution_error_report(&error, scheduled_task_index, total_tasks);
+                project_log.finished(
+                    scheduled_task_index,
+                    0,
+                    if error.is_cancelled() {
+                        GenericTaskTerminal::Cancelled
+                    } else {
+                        GenericTaskTerminal::Failed
+                    },
+                    (!error.is_cancelled()).then_some(report),
+                );
                 if terminal_error.is_none() {
                     cancellation.request();
                     terminal_error = Some(error);
@@ -3623,17 +4037,62 @@ async fn execute_generic_tasks(
             }
         };
         if terminal_error.is_some() {
+            let prior_was_cancelled = terminal_error
+                .as_ref()
+                .is_some_and(GenericCommandError::is_cancelled);
+            match &outcome {
+                GenericPreparedTaskOutcome::Cancelled => project_log.finished(
+                    task_index,
+                    attempt_count,
+                    GenericTaskTerminal::Cancelled,
+                    std::iter::empty(),
+                ),
+                GenericPreparedTaskOutcome::Unavailable { diagnostic, .. } => project_log.finished(
+                    task_index,
+                    attempt_count,
+                    GenericTaskTerminal::Unavailable,
+                    [diagnostic.clone()],
+                ),
+                GenericPreparedTaskOutcome::Accepted { .. } => project_log.finished(
+                    task_index,
+                    attempt_count,
+                    if prior_was_cancelled {
+                        GenericTaskTerminal::Cancelled
+                    } else {
+                        GenericTaskTerminal::NotCommittedAfterEarlierFailure
+                    },
+                    std::iter::empty(),
+                ),
+                GenericPreparedTaskOutcome::Failed(error) => project_log.finished(
+                    task_index,
+                    attempt_count,
+                    GenericTaskTerminal::Failed,
+                    [generic_task_execution_error_report(
+                        error,
+                        task_index,
+                        total_tasks,
+                    )],
+                ),
+            }
             if let Some(record) = record {
                 let state = match outcome {
                     GenericPreparedTaskOutcome::Cancelled => GenericTaskRecordState::cancelled(),
-                    GenericPreparedTaskOutcome::Unavailable { reason, .. } => {
-                        GenericTaskRecordState::unavailable(reason)
+                    GenericPreparedTaskOutcome::Unavailable { diagnostic } => {
+                        GenericTaskRecordState::unavailable(diagnostic)
                     }
                     GenericPreparedTaskOutcome::Accepted { .. } => {
-                        GenericTaskRecordState::not_committed_due_to_prior_failure()
+                        if prior_was_cancelled {
+                            GenericTaskRecordState::cancelled()
+                        } else {
+                            GenericTaskRecordState::not_committed_due_to_prior_failure()
+                        }
                     }
                     GenericPreparedTaskOutcome::Failed(ref error) => {
-                        GenericTaskRecordState::failed(error.safe_diagnostic())
+                        GenericTaskRecordState::failed(generic_task_execution_error_report(
+                            error,
+                            task_index,
+                            total_tasks,
+                        ))
                     }
                 };
                 task_records.submit(record.finish(state));
@@ -3643,8 +4102,7 @@ async fn execute_generic_tasks(
         match outcome {
             GenericPreparedTaskOutcome::Accepted {
                 writes,
-                mut issues,
-                diagnostics,
+                mut diagnostics,
                 accepted_units,
                 response_problems,
                 response_complete,
@@ -3656,13 +4114,13 @@ async fn execute_generic_tasks(
                         conflicts: Vec::new(),
                     })
                 } else {
+                    let database_path = store.database_path().to_path_buf();
                     let store = store.clone();
                     let profile_id = profile_id.clone();
                     run_project_blocking(
-                        "提交 Generic 模型译文",
-                        DiagnosticStage::Translate,
-                        DiagnosticImpact::ProgressPreserved,
-                        DiagnosticAction::Retry,
+                        GenericDiagnosticStage::Translate,
+                        StateEffect::ProgressPreserved,
+                        database_path,
                         move || {
                             store.commit_translations_for_profile(
                                 expected_raw_fingerprint,
@@ -3673,58 +4131,47 @@ async fn execute_generic_tasks(
                     )
                     .await
                 };
-                let commit =
-                    match commit {
-                        Ok(commit) => commit,
-                        Err(error) => {
-                            project_log.finished(
-                                task_index,
-                                total_tasks,
-                                attempt_count,
-                                ProjectLogTaskOutcome::Failed,
-                                [error.safe_diagnostic()],
-                            );
-                            if let Some(record) = record {
-                                task_records.submit(record.finish(GenericTaskRecordState::failed(
-                                    error.safe_diagnostic(),
-                                )));
-                            }
-                            cancellation.request();
-                            terminal_error = Some(error);
-                            continue;
+                let commit = match commit {
+                    Ok(commit) => commit,
+                    Err(error) => {
+                        let report =
+                            generic_task_execution_error_report(&error, task_index, total_tasks);
+                        project_log.finished(
+                            task_index,
+                            attempt_count,
+                            GenericTaskTerminal::Failed,
+                            [report.clone()],
+                        );
+                        if let Some(record) = record {
+                            task_records
+                                .submit(record.finish(GenericTaskRecordState::failed(report)));
                         }
-                    };
-                if !commit.conflicts.is_empty() {
-                    issues.push(GenericTaskRecordIssue::commit_conflicts(
-                        commit.conflicts.len(),
-                    ));
+                        cancellation.request();
+                        terminal_error = Some(error);
+                        continue;
+                    }
+                };
+                if commit.committed > 0 {
+                    mark_generic_translate_profile_saved(&translate_project_log);
                 }
-                let mut diagnostics = diagnostics;
                 if !commit.conflicts.is_empty() {
-                    diagnostics.push(SafeDiagnostic::new(
-                        DiagnosticCode::ProjectState,
-                        DiagnosticStage::Translate,
-                        DiagnosticSubject::operation(format!(
-                            "generic_translation_task_{}",
-                            generic_task_ordinal(task_index)
-                        )),
-                        DiagnosticReason::failure_with_detail(
-                            DiagnosticFailureKind::StateMismatch,
-                            format!("cas_conflicts={}", commit.conflicts.len()),
-                        ),
-                        DiagnosticImpact::ProgressPreserved,
-                        DiagnosticAction::Retry,
+                    diagnostics.push(generic_task_response_diagnostic(
+                        task_index,
+                        total_tasks,
+                        GenericTaskResponseProblem::CommitConflict {
+                            count: generic_count(commit.conflicts.len()),
+                        },
                     ));
                 }
                 let complete = response_complete && commit.conflicts.is_empty();
+                let task_record_diagnostics = diagnostics.clone();
                 project_log.finished(
                     task_index,
-                    total_tasks,
                     attempt_count,
                     if complete {
-                        ProjectLogTaskOutcome::Complete
+                        GenericTaskTerminal::Complete
                     } else {
-                        ProjectLogTaskOutcome::Partial
+                        GenericTaskTerminal::Partial
                     },
                     diagnostics,
                 );
@@ -3733,7 +4180,7 @@ async fn execute_generic_tasks(
                         response_complete,
                         accepted_outputs,
                         commit.committed,
-                        issues,
+                        task_record_diagnostics,
                     )));
                 }
                 summary.accepted_units += accepted_units;
@@ -3746,26 +4193,26 @@ async fn execute_generic_tasks(
                     summary.partial_tasks += 1;
                 }
             }
-            GenericPreparedTaskOutcome::Unavailable { reason, diagnostic } => {
+            GenericPreparedTaskOutcome::Unavailable { diagnostic } => {
                 project_log.finished(
                     task_index,
-                    total_tasks,
                     attempt_count,
-                    ProjectLogTaskOutcome::Unavailable,
-                    [diagnostic],
+                    GenericTaskTerminal::Unavailable,
+                    [diagnostic.clone()],
                 );
                 if let Some(record) = record {
-                    task_records.submit(record.finish(GenericTaskRecordState::unavailable(reason)));
+                    task_records
+                        .submit(record.finish(GenericTaskRecordState::unavailable(diagnostic)));
                 }
                 summary.unavailable_tasks += 1;
             }
             GenericPreparedTaskOutcome::Failed(error) => {
-                let diagnostic = error.safe_diagnostic();
+                let diagnostic =
+                    generic_task_execution_error_report(&error, task_index, total_tasks);
                 project_log.finished(
                     task_index,
-                    total_tasks,
                     attempt_count,
-                    ProjectLogTaskOutcome::Failed,
+                    GenericTaskTerminal::Failed,
                     [diagnostic.clone()],
                 );
                 if let Some(record) = record {
@@ -3775,6 +4222,12 @@ async fn execute_generic_tasks(
                 terminal_error = Some(error);
             }
             GenericPreparedTaskOutcome::Cancelled => {
+                project_log.finished(
+                    task_index,
+                    attempt_count,
+                    GenericTaskTerminal::Cancelled,
+                    std::iter::empty(),
+                );
                 if let Some(record) = record {
                     task_records.submit(record.finish(GenericTaskRecordState::cancelled()));
                 }
@@ -3787,15 +4240,15 @@ async fn execute_generic_tasks(
                 summary.complete_tasks + summary.partial_tasks + summary.unavailable_tasks;
             progress.observe(ProgressSnapshot::determinate(
                 GenericProgressPhase::ConfirmedTasks,
-                u64::try_from(confirmed).unwrap_or(u64::MAX),
-                u64::try_from(total_tasks).unwrap_or(u64::MAX),
+                generic_count(confirmed),
+                generic_count(total_tasks),
             ));
         }
         if terminal_error.is_none()
             && let Some((task_index, task)) = remaining.next()
         {
-            project_log.started(task_index, total_tasks);
-            tasks.push_back(execute_owned_generic_task(
+            project_log.started(task_index);
+            tasks.push_back(execute_indexed_generic_task(
                 request_context.clone(),
                 task_index,
                 task,
@@ -3804,10 +4257,7 @@ async fn execute_generic_tasks(
     }
     match terminal_error {
         Some(error) => Err(error),
-        None => {
-            project_log.partial_result(summary);
-            Ok(summary)
-        }
+        None => Ok(summary),
     }
 }
 
@@ -3873,31 +4323,23 @@ async fn execute_generic_task(
                         match parse_translation_response_with_cancellation(
                             &content,
                             response_mode,
-                            || {
-                                ensure_generic_response_processing_running(
-                                    &response_cancellation,
-                                )
-                            },
+                            || ensure_generic_response_processing_running(&response_cancellation),
                         )? {
                             Ok(parsed) => {
-                                ensure_generic_response_processing_running(
+                                ensure_generic_response_processing_running(&response_cancellation)?;
+                                let acceptance = accept_generic_response_with_cancellation(
+                                    task,
+                                    &parsed,
+                                    facts.as_ref(),
+                                    &placeholder_rules,
+                                    language_module.as_ref(),
                                     &response_cancellation,
                                 )?;
-                                let acceptance =
-                                    accept_generic_response_with_cancellation(
-                                        task,
-                                        &parsed,
-                                        facts.as_ref(),
-                                        &placeholder_rules,
-                                        language_module.as_ref(),
-                                        &response_cancellation,
-                                    )?;
                                 let accepted_outputs = acceptance.accepted_output_count();
                                 let (accepted, problems) = acceptance.into_parts();
                                 let accepted_units = accepted.len();
                                 let response_problems = problems.len();
                                 let response_complete = problems.is_empty();
-                                let mut issues = Vec::with_capacity(problems.len());
                                 let mut diagnostics = Vec::with_capacity(problems.len());
                                 for problem in &problems {
                                     ensure_generic_response_processing_running(
@@ -3905,18 +4347,9 @@ async fn execute_generic_task(
                                     )?;
                                     diagnostics.push(generic_response_problem_diagnostic(
                                         task_index,
+                                        total_tasks,
                                         problem,
                                     ));
-                                    issues.push(
-                                        GenericTaskRecordIssue::from_response_problem_with_cancellation(
-                                            problem,
-                                            || {
-                                                ensure_generic_response_processing_running(
-                                                    &response_cancellation,
-                                                )
-                                            },
-                                        )?,
-                                    );
                                 }
                                 let mut writes = Vec::with_capacity(accepted.len());
                                 for accepted in accepted {
@@ -3926,8 +4359,8 @@ async fn execute_generic_task(
                                     writes.push(accepted.into_write());
                                 }
                                 if record_evidence {
-                                    response_record = Some(
-                                        GenericTaskResponseRecord::parsed_with_cancellation(
+                                    response_record =
+                                        Some(GenericTaskResponseRecord::parsed_with_cancellation(
                                             content,
                                             parsed,
                                             || {
@@ -3935,12 +4368,10 @@ async fn execute_generic_task(
                                                     &response_cancellation,
                                                 )
                                             },
-                                        )?,
-                                    );
+                                        )?);
                                 }
                                 GenericPreparedTaskOutcome::Accepted {
                                     writes,
-                                    issues,
                                     diagnostics,
                                     accepted_units,
                                     response_problems,
@@ -3949,64 +4380,40 @@ async fn execute_generic_task(
                                 }
                             }
                             Err(error) => {
-                                ensure_generic_response_processing_running(
-                                    &response_cancellation,
-                                )?;
-                                let diagnostic =
-                                    generic_response_parse_diagnostic(task_index, error);
+                                ensure_generic_response_processing_running(&response_cancellation)?;
+                                let diagnostic = generic_response_parse_diagnostic(
+                                    task_index,
+                                    total_tasks,
+                                    error,
+                                );
                                 if record_evidence {
                                     response_record =
                                         Some(GenericTaskResponseRecord::invalid(content, error));
                                 }
-                                GenericPreparedTaskOutcome::Unavailable {
-                                    reason: "model_response_unusable",
-                                    diagnostic,
-                                }
+                                GenericPreparedTaskOutcome::Unavailable { diagnostic }
                             }
                         }
                     } else {
-                        let finish_reason = finish_reason.to_string();
                         if record_evidence {
-                            response_record =
-                                Some(GenericTaskResponseRecord::unprocessed(content));
+                            response_record = Some(GenericTaskResponseRecord::unprocessed(content));
                         }
                         GenericPreparedTaskOutcome::Unavailable {
-                            reason: "non_stop_finish",
                             diagnostic: generic_task_response_diagnostic(
                                 task_index,
-                                DiagnosticFailureKind::InvalidResponseContract,
-                                format!("finish_reason={finish_reason}"),
+                                total_tasks,
+                                GenericTaskResponseProblem::NonStopFinish,
                             ),
                         }
                     }
                 }
                 LlmRequestExecutionOutcome::RetryAfterExceedsMaximum { diagnostic, .. } => {
-                    GenericPreparedTaskOutcome::Unavailable {
-                        reason: "retry_after_exceeds_maximum",
-                        diagnostic,
-                    }
+                    GenericPreparedTaskOutcome::Unavailable { diagnostic }
                 }
                 LlmRequestExecutionOutcome::RetryBudgetExhausted { diagnostic, .. } => {
-                    GenericPreparedTaskOutcome::Unavailable {
-                        reason: "recoverable_request_exhausted",
-                        diagnostic,
-                    }
+                    GenericPreparedTaskOutcome::Unavailable { diagnostic }
                 }
-                LlmRequestExecutionOutcome::Fatal {
-                    cancelled,
-                    diagnostic,
-                    ..
-                } => {
-                    if cancelled {
-                        GenericPreparedTaskOutcome::Cancelled
-                    } else {
-                        GenericPreparedTaskOutcome::Unavailable {
-                            reason: "request_failed",
-                            diagnostic: diagnostic.unwrap_or_else(|| {
-                                generic_unavailable_task_diagnostic(task_index, "request_failed")
-                            }),
-                        }
-                    }
+                LlmRequestExecutionOutcome::Fatal { diagnostic, .. } => {
+                    GenericPreparedTaskOutcome::Unavailable { diagnostic }
                 }
                 LlmRequestExecutionOutcome::Cancelled { .. } => {
                     GenericPreparedTaskOutcome::Cancelled
@@ -4024,7 +4431,7 @@ async fn execute_generic_task(
             ));
         }
         Err(source) => {
-            let error = generic_cpu_execution_failure("调度 Generic 响应验收", source);
+            let error = generic_cpu_execution_failure(source);
             return Ok(GenericPreparedTask {
                 task_index,
                 outcome: GenericPreparedTaskOutcome::Failed(error),
@@ -4040,7 +4447,7 @@ async fn execute_generic_task(
             ));
         }
         Ok(Err(source)) => {
-            let error = GenericCommandError::operation("验收 Generic 模型响应", source);
+            let error = generic_preparation_failure(GenericPreparationError::Planning(source));
             return Ok(GenericPreparedTask {
                 task_index,
                 outcome: GenericPreparedTaskOutcome::Failed(error),
@@ -4124,7 +4531,10 @@ fn accept_generic_response_with(
     task: PlannedTask,
     parsed: &ParsedTranslationResponse,
     facts: &GenericUnitMap<GenericValidationFact>,
-    mut validator: impl FnMut(&GenericValidationFact, &str) -> Result<String, String>,
+    mut validator: impl FnMut(
+        &GenericValidationFact,
+        &str,
+    ) -> Result<String, GenericResponseDestinationProblem>,
 ) -> TranslationAcceptance {
     accept_generic_response_with_validator_and_cancellation(
         task,
@@ -4168,10 +4578,16 @@ fn accept_generic_response_with_validator_and_cancellation(
     mut validator: impl FnMut(
         &GenericValidationFact,
         &str,
-    ) -> Result<Result<String, String>, GenericPlanningError>,
+    ) -> Result<
+        Result<String, GenericResponseDestinationProblem>,
+        GenericPlanningError,
+    >,
     cancellation: &CooperativeCancellation,
 ) -> Result<TranslationAcceptance, GenericPlanningError> {
-    let mut cache = HashMap::<TaskId, CancellableTextMap<&str, Result<String, String>>>::new();
+    let mut cache = HashMap::<
+        TaskId,
+        CancellableTextMap<&str, Result<String, GenericResponseDestinationProblem>>,
+    >::new();
     accept_parsed_response_with_cancellation(
         task,
         parsed,
@@ -4181,7 +4597,7 @@ fn accept_generic_response_with_validator_and_cancellation(
                 ensure_generic_response_processing_running(cancellation)
             })?
             else {
-                return Ok(Err("响应代表项不属于当前 Generic 计划".to_owned()));
+                return Ok(Err(GenericResponseDestinationProblem::MissingPlanningFact));
             };
             let output_cache = cache
                 .entry(output_id)
@@ -4214,11 +4630,11 @@ fn validate_generic_candidate(
     facts: &GenericUnitMap<GenericValidationFact>,
     placeholder_rules: &GenericCompiledPlaceholderRules,
     language_module: &dyn LanguageModule,
-) -> Result<String, String> {
+) -> Result<String, GenericResponseDestinationProblem> {
     let fact = facts
         .get_with_cancellation(key, || Ok::<_, std::convert::Infallible>(()))
         .unwrap_or_else(|never| match never {})
-        .ok_or_else(|| "响应代表项不属于当前 Generic 计划".to_owned())?;
+        .ok_or(GenericResponseDestinationProblem::MissingPlanningFact)?;
     validate_generic_candidate_fact(fact, candidate, placeholder_rules, language_module)
 }
 
@@ -4229,13 +4645,13 @@ fn validate_generic_reuse_with_cancellation(
     placeholder_rules: &GenericCompiledPlaceholderRules,
     language_module: &dyn LanguageModule,
     cancellation: &CooperativeCancellation,
-) -> Result<Result<ValidatedReuse, String>, GenericPlanningError> {
+) -> Result<Result<ValidatedReuse, GenericResponseDestinationProblem>, GenericPlanningError> {
     ensure_generic_response_processing_running(cancellation)?;
     let Some(fact) = facts.get_with_cancellation(key, || {
         ensure_generic_response_processing_running(cancellation)
     })?
     else {
-        return Ok(Err("响应代表项不属于当前 Generic 计划".to_owned()));
+        return Ok(Err(GenericResponseDestinationProblem::MissingPlanningFact));
     };
     let final_translation = match validate_generic_candidate_fact_with_cancellation(
         fact,
@@ -4245,7 +4661,7 @@ fn validate_generic_reuse_with_cancellation(
         cancellation,
     )? {
         Ok(translation) => translation,
-        Err(detail) => return Ok(Err(detail)),
+        Err(problem) => return Ok(Err(problem)),
     };
     let service = GenericPlaceholderService::default();
     let context = match service.protect_with_cancellation(
@@ -4255,7 +4671,9 @@ fn validate_generic_reuse_with_cancellation(
         || ensure_generic_response_processing_running(cancellation),
     )? {
         Ok(context) => context,
-        Err(source) => return Ok(Err(source.to_string())),
+        Err(source) => {
+            return Ok(Err(generic_response_placeholder_problem(&source)));
+        }
     };
     let context_binding = context.binding_fingerprint_with_cancellation(|| {
         ensure_generic_response_processing_running(cancellation)
@@ -4265,7 +4683,7 @@ fn validate_generic_reuse_with_cancellation(
     })?;
     if context_binding != expected_binding {
         return Ok(Err(
-            "复用译文的 Placeholder 绑定与目标 Generic Unit 不一致".to_owned()
+            GenericResponseDestinationProblem::PlaceholderBindingMismatch,
         ));
     }
     let mut context_text = String::with_capacity(context.text().len());
@@ -4279,43 +4697,15 @@ fn validate_generic_candidate_fact(
     candidate: &str,
     placeholder_rules: &GenericCompiledPlaceholderRules,
     language_module: &dyn LanguageModule,
-) -> Result<String, String> {
-    let service = GenericPlaceholderService::default();
-    let restored = service
-        .restore(&fact.protected, candidate)
-        .map_err(|source| source.to_string())?;
-    let candidate_protected = service
-        .protect(&fact.kind, &restored, placeholder_rules)
-        .map_err(|source| source.to_string())?;
-    let language_text = candidate_protected
-        .language_text()
-        .map_err(|source| source.to_string())?;
-    if language_module
-        .find_source_residual(&fact.analysis, &language_text)
-        .map_err(|source| source.to_string())?
-        .is_some()
-    {
-        return Err("译文仍含不允许保留的源语言文本".to_owned());
-    }
-    let repair = language_module
-        .plan_translation_repair(&fact.analysis, &language_text)
-        .map_err(|source| source.to_string())?;
-    let repaired = language_text
-        .apply_repair(&repair)
-        .map_err(|source| source.to_string())?;
-    let final_translation = rebuild_original_placeholders(&candidate_protected, &repaired)?;
-    crate::generic::validate_translation_placeholders(
-        &service,
+) -> Result<String, GenericResponseDestinationProblem> {
+    validate_generic_candidate_fact_with_cancellation(
+        fact,
+        candidate,
         placeholder_rules,
-        &fact.kind,
-        &fact.source_text,
-        &final_translation,
+        language_module,
+        &CooperativeCancellation::default(),
     )
-    .map_err(|source| source.to_string())?;
-    if placeholder_token::contains_reserved_prefix(&final_translation) {
-        return Err("译文恢复后仍含 ATT 保留 token".to_owned());
-    }
-    Ok(final_translation)
+    .expect("不取消的候选验收必须完成")
 }
 
 fn validate_generic_candidate_fact_with_cancellation(
@@ -4324,27 +4714,33 @@ fn validate_generic_candidate_fact_with_cancellation(
     placeholder_rules: &GenericCompiledPlaceholderRules,
     language_module: &dyn LanguageModule,
     cancellation: &CooperativeCancellation,
-) -> Result<Result<String, String>, GenericPlanningError> {
+) -> Result<Result<String, GenericResponseDestinationProblem>, GenericPlanningError> {
     ensure_generic_response_processing_running(cancellation)?;
     let service = GenericPlaceholderService::default();
     let restored = match service.restore_with_cancellation(&fact.protected, candidate, || {
         ensure_generic_response_processing_running(cancellation)
     })? {
         Ok(restored) => restored,
-        Err(source) => return Ok(Err(source.to_string())),
+        Err(source) => return Ok(Err(generic_response_placeholder_problem(&source))),
     };
     let candidate_protected =
         match service.protect_with_cancellation(&fact.kind, &restored, placeholder_rules, || {
             ensure_generic_response_processing_running(cancellation)
         })? {
             Ok(protected) => protected,
-            Err(source) => return Ok(Err(source.to_string())),
+            Err(source) => {
+                return Ok(Err(generic_response_placeholder_problem(&source)));
+            }
         };
     let language_text = match candidate_protected.language_text_with_cancellation(|| {
         ensure_generic_response_processing_running(cancellation)
     })? {
         Ok(text) => text,
-        Err(source) => return Ok(Err(source.to_string())),
+        Err(source) => {
+            return Ok(Err(GenericResponseDestinationProblem::LanguageProjection {
+                problem: generic_language_projection_problem(&source),
+            }));
+        }
     };
     let residual = match language_module.find_source_residual_with_cancellation(
         &fact.analysis,
@@ -4352,11 +4748,15 @@ fn validate_generic_candidate_fact_with_cancellation(
         &mut || ensure_generic_language_running(cancellation),
     ) {
         Ok(Ok(residual)) => residual,
-        Ok(Err(source)) => return Ok(Err(source.to_string())),
+        Ok(Err(_)) => {
+            return Ok(Err(
+                GenericResponseDestinationProblem::LanguageAnalysisMismatch,
+            ));
+        }
         Err(LanguageOperationCancelled) => return Err(GenericPlanningError::Cancelled),
     };
     if residual.is_some() {
-        return Ok(Err("译文仍含不允许保留的源语言文本".to_owned()));
+        return Ok(Err(GenericResponseDestinationProblem::SourceResidual));
     }
     let repair = match language_module.plan_translation_repair_with_cancellation(
         &fact.analysis,
@@ -4364,14 +4764,22 @@ fn validate_generic_candidate_fact_with_cancellation(
         &mut || ensure_generic_language_running(cancellation),
     ) {
         Ok(Ok(repair)) => repair,
-        Ok(Err(source)) => return Ok(Err(source.to_string())),
+        Ok(Err(_)) => {
+            return Ok(Err(
+                GenericResponseDestinationProblem::RepairPlanningMismatch,
+            ));
+        }
         Err(LanguageOperationCancelled) => return Err(GenericPlanningError::Cancelled),
     };
     let repaired = match language_text.apply_repair_with_cancellation(&repair, || {
         ensure_generic_response_processing_running(cancellation)
     })? {
         Ok(repaired) => repaired,
-        Err(source) => return Ok(Err(source.to_string())),
+        Err(source) => {
+            return Ok(Err(GenericResponseDestinationProblem::RepairApplication {
+                problem: generic_repair_application_problem(&source),
+            }));
+        }
     };
     ensure_generic_response_processing_running(cancellation)?;
     let final_translation = match rebuild_original_placeholders_with_cancellation(
@@ -4380,7 +4788,7 @@ fn validate_generic_candidate_fact_with_cancellation(
         cancellation,
     )? {
         Ok(translation) => translation,
-        Err(detail) => return Ok(Err(detail)),
+        Err(problem) => return Ok(Err(problem)),
     };
     match crate::generic::validate_translation_placeholders_with_cancellation(
         &service,
@@ -4391,44 +4799,20 @@ fn validate_generic_candidate_fact_with_cancellation(
         || ensure_generic_response_processing_running(cancellation),
     )? {
         Ok(()) => {}
-        Err(source) => return Ok(Err(source.to_string())),
+        Err(source) => return Ok(Err(generic_response_placeholder_problem(&source))),
     }
     if contains_reserved_prefix_with_cancellation(&final_translation, cancellation)? {
-        return Ok(Err("译文恢复后仍含 ATT 保留 token".to_owned()));
+        return Ok(Err(GenericResponseDestinationProblem::ReservedToken));
     }
     ensure_generic_response_processing_running(cancellation)?;
     Ok(Ok(final_translation))
-}
-
-#[cfg(test)]
-fn rebuild_original_placeholders(
-    protected: &GenericProtectedText,
-    repaired: &LanguageText,
-) -> Result<String, String> {
-    let mut output = String::new();
-    let mut placeholders = protected.placeholders().iter();
-    for segment in repaired.segments() {
-        match segment {
-            LanguageTextSegment::NaturalText(text) => output.push_str(text),
-            LanguageTextSegment::OpaqueBoundary => {
-                let placeholder = placeholders
-                    .next()
-                    .ok_or_else(|| "语言修复增加了 Placeholder 边界".to_owned())?;
-                output.push_str(placeholder.original());
-            }
-        }
-    }
-    if placeholders.next().is_some() {
-        return Err("语言修复删除了 Placeholder 边界".to_owned());
-    }
-    Ok(output)
 }
 
 fn rebuild_original_placeholders_with_cancellation(
     protected: &GenericProtectedText,
     repaired: &LanguageText,
     cancellation: &CooperativeCancellation,
-) -> Result<Result<String, String>, GenericPlanningError> {
+) -> Result<Result<String, GenericResponseDestinationProblem>, GenericPlanningError> {
     ensure_generic_response_processing_running(cancellation)?;
     let mut output = String::new();
     let mut placeholders = protected.placeholders().iter();
@@ -4440,7 +4824,9 @@ fn rebuild_original_placeholders_with_cancellation(
             }
             LanguageTextSegment::OpaqueBoundary => {
                 let Some(placeholder) = placeholders.next() else {
-                    return Ok(Err("语言修复增加了 Placeholder 边界".to_owned()));
+                    return Ok(Err(
+                        GenericResponseDestinationProblem::PlaceholderBoundaryAdded,
+                    ));
                 };
                 append_generic_response_text(&mut output, placeholder.original(), cancellation)?;
             }
@@ -4448,7 +4834,9 @@ fn rebuild_original_placeholders_with_cancellation(
     }
     ensure_generic_response_processing_running(cancellation)?;
     if placeholders.next().is_some() {
-        return Ok(Err("语言修复删除了 Placeholder 边界".to_owned()));
+        return Ok(Err(
+            GenericResponseDestinationProblem::PlaceholderBoundaryRemoved,
+        ));
     }
     Ok(Ok(output))
 }
@@ -4486,18 +4874,18 @@ fn append_generic_response_text(
 }
 
 fn clone_generic_validation_result(
-    result: &Result<String, String>,
+    result: &Result<String, GenericResponseDestinationProblem>,
     cancellation: &CooperativeCancellation,
-) -> Result<Result<String, String>, GenericPlanningError> {
+) -> Result<Result<String, GenericResponseDestinationProblem>, GenericPlanningError> {
     let mut cloned = String::new();
     match result {
         Ok(value) => {
             append_generic_response_text(&mut cloned, value, cancellation)?;
             Ok(Ok(cloned))
         }
-        Err(detail) => {
-            append_generic_response_text(&mut cloned, detail, cancellation)?;
-            Ok(Err(cloned))
+        Err(problem) => {
+            ensure_generic_response_processing_running(cancellation)?;
+            Ok(Err(problem.clone()))
         }
     }
 }
@@ -4566,12 +4954,7 @@ async fn load_additional_pem_roots(
             .read_file(path.to_path_buf())
             .await
             .map_err(|source| {
-                generic_read_file_failure(
-                    "读取附加 PEM",
-                    source,
-                    DiagnosticStage::CommandPreparation,
-                    DiagnosticAction::FixConfiguration,
-                )
+                generic_read_file_failure(source, FileSystemDiagnosticStage::CommandPreparation)
             })?;
         roots.push(file.into_bytes());
     }
@@ -4594,23 +4977,115 @@ fn start_file_system(
     SystemFileSystem::new_with_performance(configuration, performance)
 }
 
+fn generic_file_system_build_failure(source: SystemFileSystemBuildError) -> GenericCommandError {
+    let report = DiagnosticReport::new(StateEffect::Unchanged, source.diagnostic());
+    GenericCommandError::reported(source, report)
+}
+
+fn generic_cpu_start_failure(source: CpuExecutorStartError) -> GenericCommandError {
+    let report = DiagnosticReport::new(StateEffect::Unchanged, source.diagnostic());
+    GenericCommandError::reported(source, report)
+}
+
 type GenericProjectLogSlot = Arc<Mutex<Option<ActiveProjectLog>>>;
+
+#[derive(Default)]
+struct GenericTranslateProjectLogState {
+    database_path: Option<PathBuf>,
+    run_plan_resolved: bool,
+    run_plan_finalized: bool,
+    translation_finished: bool,
+    profile_saved: bool,
+    tasks: Option<GenericTaskProjectLog>,
+    active_phase: Option<ProjectLogPhase>,
+}
+
+#[derive(Default)]
+struct GenericExtractProjectLogState {
+    database_path: Option<PathBuf>,
+    run_plan_resolved: bool,
+    run_plan_finalized: bool,
+    phase_started: bool,
+}
+
+type GenericExtractProjectLogStateRef = Arc<Mutex<GenericExtractProjectLogState>>;
+
+type GenericTranslateProjectLogStateRef = Arc<Mutex<GenericTranslateProjectLogState>>;
+#[derive(Clone, Copy)]
+struct GenericTerminalOccurrence {
+    diagnostic: crate::runtime::project_log::DiagnosticOccurrenceId,
+    outcome: GenericTerminalRunOutcome,
+}
+
+#[derive(Clone, Copy)]
+enum GenericTerminalRunOutcome {
+    FromEffect(StateEffect),
+    RecoveryRequired,
+}
+
+impl GenericTerminalOccurrence {
+    const fn from_effect(
+        diagnostic: crate::runtime::project_log::DiagnosticOccurrenceId,
+        effect: StateEffect,
+    ) -> Self {
+        Self {
+            diagnostic,
+            outcome: GenericTerminalRunOutcome::FromEffect(effect),
+        }
+    }
+
+    const fn recovery_required(
+        diagnostic: crate::runtime::project_log::DiagnosticOccurrenceId,
+    ) -> Self {
+        Self {
+            diagnostic,
+            outcome: GenericTerminalRunOutcome::RecoveryRequired,
+        }
+    }
+
+    fn into_pending(self, project_log: ActiveProjectLog) -> PendingProjectLog {
+        match self.outcome {
+            GenericTerminalRunOutcome::FromEffect(effect) => {
+                project_log.pending_failure_with_occurrence(effect, self.diagnostic)
+            }
+            GenericTerminalRunOutcome::RecoveryRequired => {
+                project_log.pending_recovery_required_with_occurrence(self.diagnostic)
+            }
+        }
+    }
+}
+type GenericTerminalOccurrenceSlot = Arc<Mutex<Option<GenericTerminalOccurrence>>>;
+
+fn generic_translate_project_log_state() -> GenericTranslateProjectLogStateRef {
+    Arc::new(Mutex::new(GenericTranslateProjectLogState::default()))
+}
+
+fn generic_terminal_occurrence_slot() -> GenericTerminalOccurrenceSlot {
+    Arc::new(Mutex::new(None))
+}
+
+fn generic_extract_project_log_state() -> GenericExtractProjectLogStateRef {
+    Arc::new(Mutex::new(GenericExtractProjectLogState::default()))
+}
 
 fn generic_project_log_slot() -> GenericProjectLogSlot {
     Arc::new(Mutex::new(None))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn start_existing_generic_project_log(
     slot: &GenericProjectLogSlot,
     common: &crate::application::config::CommonCommandConfiguration,
     locale: UiLocale,
     project: &ProjectName,
-    command: &'static str,
-    stage: DiagnosticStage,
+    command: ProjectLogCommand,
     performance: Arc<RunPerformanceCounters>,
 ) {
-    if !generic_workspace(common.projects_root(), project).is_dir() {
+    let workspace = generic_workspace(common.projects_root(), project);
+    // Path::is_dir 会把权限、I/O 和“同名普通文件”都压成 false，随后项目打开错误
+    // 便失去本次运行的 JSONL。仅在明确不存在项目时不建立日志；其余情况让标准日志
+    // 建立路径记录可观察的失败。
+    if matches!(std::fs::metadata(&workspace), Err(error) if error.kind() == io::ErrorKind::NotFound)
+    {
         return;
     }
     install_generic_project_log(
@@ -4618,13 +5093,10 @@ fn start_existing_generic_project_log(
         start_command_log(CommandLogStart {
             common,
             locale,
-            engine: GENERIC_ENGINE_NAME,
+            engine: ProjectLogEngine::Generic,
             project: project.as_str(),
             command,
-            stage,
-            profile: None,
             performance,
-            panic_boundary: None,
         }),
     );
 }
@@ -4646,16 +5118,559 @@ fn take_generic_project_log(slot: &GenericProjectLogSlot) -> Option<ActiveProjec
         .take()
 }
 
-fn generic_task_project_log(slot: &GenericProjectLogSlot) -> GenericTaskProjectLog {
+fn generic_project_log_handle(slot: &GenericProjectLogSlot) -> Option<ProjectLogHandle> {
+    slot.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map(|project_log| project_log.handle().clone())
+}
+
+/// 所有 Generic 命令经过同一条合作取消路径。此时不把尚未确认的工作伪造为完成量；
+/// logger 负责压缩重复信号，因此每次运行最多持久化一条 run.cancel_requested。
+fn emit_generic_cancellation_requested(project_log: &GenericProjectLogSlot) {
+    if let Some(handle) = generic_project_log_handle(project_log) {
+        handle.emit(ProjectLogEvent::CancellationRequested {
+            confirmed: 0,
+            total: None,
+        });
+    }
+}
+
+fn start_generic_extract_project_log(
+    project_log: &GenericProjectLogSlot,
+    state: &GenericExtractProjectLogStateRef,
+) {
+    if let Some(handle) = generic_project_log_handle(project_log) {
+        handle.emit(ProjectLogEvent::phase_started(
+            ProjectLogPhase::ScanSource,
+            ProjectLogAmount::Indeterminate,
+        ));
+    }
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .phase_started = true;
+}
+
+fn resolve_generic_extract_run_plan(
+    project_log: &GenericProjectLogSlot,
+    state: &GenericExtractProjectLogStateRef,
+    database_path: &Path,
+) {
+    if let Some(handle) = generic_project_log_handle(project_log) {
+        handle.emit(ProjectLogEvent::RunPlanResolved {
+            plan: ResolvedRunPlan::generic_extract(RunPlanValueSource::ProductDefault),
+        });
+    }
+    let mut state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.database_path = Some(database_path.to_path_buf());
+    state.run_plan_resolved = true;
+}
+
+fn finish_generic_extract_success(
+    project_log: &GenericProjectLogSlot,
+    state: &GenericExtractProjectLogStateRef,
+) {
+    let Some(handle) = generic_project_log_handle(project_log) else {
+        return;
+    };
+    let (database_path, complete_phase, finalize) = {
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let database_path = state.database_path.clone();
+        let complete_phase = std::mem::take(&mut state.phase_started);
+        let finalize = state.run_plan_resolved && !state.run_plan_finalized;
+        state.run_plan_finalized |= finalize;
+        (database_path, complete_phase, finalize)
+    };
+    if complete_phase {
+        handle.emit(ProjectLogEvent::phase_completed(
+            ProjectLogPhase::ScanSource,
+            ProjectLogAmount::Indeterminate,
+        ));
+    }
+    if finalize {
+        handle.emit(ProjectLogEvent::RunPlanFinalized {
+            database: crate::diagnostic::SafePath::new(
+                database_path
+                    .as_ref()
+                    .expect("Generic Extract run plan 必须保存数据库路径"),
+            ),
+            result: RunPlanFinalization::Saved {
+                transaction: RunPlanTransactionState::Committed,
+                run_continues: false,
+            },
+        });
+    }
+}
+
+fn finish_generic_extract_project_log(
+    project_log: &GenericProjectLogSlot,
+    state: &GenericExtractProjectLogStateRef,
+    driven: &Driven<Result<GenericCommandOutput, GenericCommandError>>,
+) -> Option<GenericTerminalOccurrence> {
+    if matches!(
+        driven,
+        Driven::Finished(Ok(GenericCommandOutput::Extract { .. }))
+            | Driven::Interrupted(Ok(GenericCommandOutput::Extract { .. }))
+    ) {
+        finish_generic_extract_success(project_log, state);
+        return None;
+    }
+    let handle = generic_project_log_handle(project_log)?;
+    let cancelled = match driven {
+        Driven::CancellationWon(_) => true,
+        Driven::Finished(Err(error)) | Driven::Interrupted(Err(error)) => error.is_cancelled(),
+        Driven::Finished(Ok(_)) | Driven::Interrupted(Ok(_)) | Driven::SignalFailed { .. } => false,
+    };
+    let report = match driven {
+        Driven::Finished(Err(error))
+        | Driven::Interrupted(Err(error))
+        | Driven::CancellationWon(Err(error)) => generic_command_error_report(error),
+        Driven::SignalFailed { source, .. } => DiagnosticReport::new(
+            StateEffect::AppliedFinalizationFailed,
+            Diagnostic::runtime(RuntimeIssue::Io {
+                component: RuntimeComponent::TerminationSignals,
+                operation: RuntimeOperation::ReceiveTerminationSignal,
+                failure: IoFailure::from_error(source),
+            }),
+        ),
+        Driven::CancellationWon(Ok(_)) => DiagnosticReport::new(
+            StateEffect::ProgressPreserved,
+            Diagnostic::runtime(RuntimeIssue::Cancelled {
+                component: RuntimeComponent::Process,
+                operation: RuntimeOperation::ExecuteTask,
+            }),
+        ),
+        Driven::Finished(Ok(_)) | Driven::Interrupted(Ok(_)) => return None,
+    };
+    let (database_path, resolved, finalized, phase_started) = {
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let values = (
+            state.database_path.clone(),
+            state.run_plan_resolved,
+            state.run_plan_finalized,
+            std::mem::take(&mut state.phase_started),
+        );
+        state.run_plan_finalized |= state.run_plan_resolved;
+        values
+    };
+    let effect = report.effect();
+    // 同一失败若还要表达 run_plan.finalized，必须以 RunPlan occurrence 引用；
+    // phase.stopped 不要求专属 scope，因此可安全复用这个主诊断。
+    let diagnostic = handle.record_diagnostic(
+        if resolved {
+            DiagnosticScope::RunPlan
+        } else {
+            DiagnosticScope::Extract
+        },
+        report,
+    )?;
+    if phase_started {
+        handle.emit(ProjectLogEvent::phase_stopped(
+            ProjectLogPhase::ScanSource,
+            if cancelled {
+                PhaseStopOutcome::Cancelled
+            } else {
+                PhaseStopOutcome::Failed { diagnostic }
+            },
+        ));
+    }
+    if resolved && !finalized {
+        handle.emit(ProjectLogEvent::RunPlanFinalized {
+            database: crate::diagnostic::SafePath::new(
+                database_path
+                    .as_ref()
+                    .expect("Generic Extract run plan 必须保存数据库路径"),
+            ),
+            result: if effect == StateEffect::OutcomeUnknown {
+                RunPlanFinalization::OutcomeUnknown {
+                    transaction: RunPlanTransactionState::OutcomeUnknown,
+                    run_continues: false,
+                    diagnostic,
+                }
+            } else {
+                RunPlanFinalization::NotSaved {
+                    transaction: RunPlanTransactionState::RolledBack,
+                    run_continues: false,
+                    diagnostic,
+                }
+            },
+        });
+    }
+    Some(GenericTerminalOccurrence::from_effect(diagnostic, effect))
+}
+
+fn start_generic_translate_phase(
+    project_log: &GenericProjectLogSlot,
+    state: &GenericTranslateProjectLogStateRef,
+    phase: ProjectLogPhase,
+    amount: ProjectLogAmount,
+) {
+    if let Some(handle) = generic_project_log_handle(project_log) {
+        handle.emit(ProjectLogEvent::phase_started(phase, amount));
+    }
+    let previous = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .active_phase
+        .replace(phase);
+    assert!(previous.is_none(), "开始新阶段前必须显式结束上一阶段");
+}
+
+fn complete_generic_translate_phase(
+    project_log: &GenericProjectLogSlot,
+    state: &GenericTranslateProjectLogStateRef,
+    phase: ProjectLogPhase,
+    amount: ProjectLogAmount,
+) {
+    let active = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .active_phase
+        .take();
+    assert_eq!(active, Some(phase), "只能完成当前活动阶段");
+    if let Some(handle) = generic_project_log_handle(project_log) {
+        handle.emit(ProjectLogEvent::phase_completed(phase, amount));
+    }
+}
+
+fn generic_task_project_log(
+    slot: &GenericProjectLogSlot,
+    total_tasks: usize,
+) -> GenericTaskProjectLog {
     let project_log = slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let project_log = project_log
         .as_ref()
         .expect("Generic Translate 必须在建立模型任务前建立项目日志");
-    GenericTaskProjectLog {
-        logger: project_log.logger().clone(),
-        context: project_log.context().clone(),
+    GenericTaskProjectLog::new(project_log.handle().clone(), total_tasks)
+}
+
+fn resolve_generic_translate_run_plan(
+    project_log: &GenericProjectLogSlot,
+    state: &GenericTranslateProjectLogStateRef,
+    database_path: &Path,
+    source: RunPlanValueSource,
+    profile_id: &str,
+    terminology_path: Option<&Path>,
+    placeholder_rules_path: Option<&Path>,
+) {
+    let plan =
+        ResolvedRunPlan::translate(source, profile_id, terminology_path, placeholder_rules_path)
+            .expect("已解析的 Generic Profile ID 必须可用于项目日志");
+    if let Some(handle) = generic_project_log_handle(project_log) {
+        handle.emit(ProjectLogEvent::RunPlanResolved { plan });
+    }
+    let mut state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.database_path = Some(database_path.to_path_buf());
+    state.run_plan_resolved = true;
+}
+
+fn install_generic_translate_task_log(
+    project_log: &GenericProjectLogSlot,
+    state: &GenericTranslateProjectLogStateRef,
+    total_tasks: usize,
+) -> GenericTaskProjectLog {
+    let tasks = generic_task_project_log(project_log, total_tasks);
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .tasks = Some(tasks.clone());
+    tasks
+}
+
+fn mark_generic_translate_profile_saved(state: &GenericTranslateProjectLogStateRef) {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .profile_saved = true;
+}
+
+fn project_log_generic_translation_summary(
+    summary: GenericTranslationSummary,
+) -> ProjectLogGenericTranslationSummary {
+    ProjectLogGenericTranslationSummary {
+        cleared_units: generic_count(summary.cleared_units),
+        reused_units: generic_count(summary.reused_units),
+        accepted_units: generic_count(summary.accepted_units),
+        written_units: generic_count(summary.written_units),
+        conflicted_units: generic_count(summary.conflicted_units),
+        response_problems: generic_count(summary.response_problems),
+    }
+}
+
+fn finish_generic_translate_success(
+    project_log: &GenericProjectLogSlot,
+    state: &GenericTranslateProjectLogStateRef,
+    summary: GenericTranslationSummary,
+) {
+    let Some(handle) = generic_project_log_handle(project_log) else {
+        return;
+    };
+    let (database_path, tasks, should_finalize) = {
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let database_path = state.database_path.clone();
+        let tasks = state.tasks.clone();
+        let should_finalize = state.run_plan_resolved && !state.run_plan_finalized;
+        state.run_plan_finalized |= should_finalize;
+        state.translation_finished = true;
+        (database_path, tasks, should_finalize)
+    };
+    if should_finalize {
+        handle.emit(ProjectLogEvent::RunPlanFinalized {
+            database: crate::diagnostic::SafePath::new(
+                database_path
+                    .as_ref()
+                    .expect("已解析的 Generic run plan 必须保存数据库路径"),
+            ),
+            result: RunPlanFinalization::Saved {
+                transaction: RunPlanTransactionState::Committed,
+                run_continues: false,
+            },
+        });
+    }
+    let tasks = tasks.map_or_else(
+        || TranslationTaskCounters::new(0, 0, 0, 0, 0, 0, 0, 0).expect("零任务汇总必须满足恒等式"),
+        |tasks| tasks.counters(),
+    );
+    let engine_summary =
+        TranslationEngineSummary::Generic(project_log_generic_translation_summary(summary));
+    let result = if tasks.planned == 0 {
+        TranslationFinished::NoWork {
+            tasks,
+            summary: engine_summary,
+        }
+    } else if tasks.partial == 0 && tasks.unavailable == 0 {
+        TranslationFinished::Complete {
+            tasks,
+            summary: engine_summary,
+        }
+    } else {
+        TranslationFinished::Incomplete {
+            tasks,
+            summary: engine_summary,
+        }
+    };
+    handle.emit(ProjectLogEvent::TranslationFinished { result });
+}
+
+fn finish_generic_translate_project_log(
+    project_log: &GenericProjectLogSlot,
+    state: &GenericTranslateProjectLogStateRef,
+    driven: &Driven<Result<GenericCommandOutput, GenericCommandError>>,
+) -> Option<GenericTerminalOccurrence> {
+    if let Some(summary) = generic_translate_success_summary(driven) {
+        finish_generic_translate_success(project_log, state, summary);
+        return None;
+    }
+    let handle = generic_project_log_handle(project_log)?;
+    let cancelled = generic_translate_was_cancelled(driven);
+    let error = generic_translate_driven_error(driven);
+    let (database_path, resolved, finalized, profile_saved, tasks, already_finished) = {
+        let state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            state.database_path.clone(),
+            state.run_plan_resolved,
+            state.run_plan_finalized,
+            state.profile_saved,
+            state.tasks.clone(),
+            state.translation_finished,
+        )
+    };
+    if already_finished {
+        return None;
+    }
+
+    let task_occurrence = tasks
+        .as_ref()
+        .and_then(GenericTaskProjectLog::failure_occurrence);
+    let report = match (error, driven) {
+        (Some(error), _) => generic_command_error_report(error),
+        (
+            None,
+            Driven::SignalFailed {
+                source,
+                result: Ok(_),
+            },
+        ) => DiagnosticReport::new(
+            StateEffect::AppliedFinalizationFailed,
+            Diagnostic::runtime(RuntimeIssue::Io {
+                component: RuntimeComponent::TerminationSignals,
+                operation: RuntimeOperation::ReceiveTerminationSignal,
+                failure: IoFailure::from_error(source),
+            }),
+        ),
+        (None, _) => DiagnosticReport::new(
+            StateEffect::ProgressPreserved,
+            Diagnostic::runtime(RuntimeIssue::Cancelled {
+                component: RuntimeComponent::Process,
+                operation: RuntimeOperation::ExecuteTask,
+            }),
+        ),
+    };
+    let report_effect = report.effect();
+    let occurrence = task_occurrence.or_else(|| {
+        handle
+            .record_diagnostic(
+                if resolved
+                    && tasks
+                        .as_ref()
+                        .is_none_or(|tasks| tasks.counters().started == 0)
+                {
+                    DiagnosticScope::RunPlan
+                } else {
+                    DiagnosticScope::Run
+                },
+                report.clone(),
+            )
+            .map(|id| (id, report_effect))
+    });
+
+    let active_phase = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .active_phase
+        .take();
+    if let Some(phase) = active_phase {
+        let outcome = if cancelled {
+            PhaseStopOutcome::Cancelled
+        } else if let Some((diagnostic, _)) = occurrence {
+            PhaseStopOutcome::Failed { diagnostic }
+        } else {
+            return None;
+        };
+        handle.emit(ProjectLogEvent::phase_stopped(phase, outcome));
+    }
+
+    let plan_occurrence = if resolved && !finalized && !profile_saved {
+        let no_task_started = tasks
+            .as_ref()
+            .is_none_or(|tasks| tasks.counters().started == 0);
+        if no_task_started {
+            occurrence
+        } else {
+            // task.finished 和 run_plan.finalized 各自拥有不同 scope；不能把同一个
+            // TranslationTask occurrence 偷渡给运行方案终态。
+            handle
+                .record_diagnostic(DiagnosticScope::RunPlan, report.clone())
+                .map(|id| (id, report_effect))
+        }
+    } else {
+        occurrence
+    };
+    if resolved
+        && !finalized
+        && let (Some(database_path), Some((diagnostic, effect))) =
+            (database_path.as_ref(), plan_occurrence)
+    {
+        let result = if profile_saved {
+            RunPlanFinalization::Saved {
+                transaction: RunPlanTransactionState::Committed,
+                run_continues: false,
+            }
+        } else if effect == StateEffect::OutcomeUnknown {
+            RunPlanFinalization::OutcomeUnknown {
+                transaction: RunPlanTransactionState::OutcomeUnknown,
+                run_continues: false,
+                diagnostic,
+            }
+        } else {
+            RunPlanFinalization::NotSaved {
+                transaction: RunPlanTransactionState::NotStarted,
+                run_continues: false,
+                diagnostic,
+            }
+        };
+        handle.emit(ProjectLogEvent::RunPlanFinalized {
+            database: crate::diagnostic::SafePath::new(database_path),
+            result,
+        });
+    }
+
+    let counters = tasks.as_ref().map_or_else(
+        || TranslationTaskCounters::new(0, 0, 0, 0, 0, 0, 0, 0).expect("零任务汇总必须满足恒等式"),
+        GenericTaskProjectLog::counters,
+    );
+    let result = if cancelled {
+        TranslationFinished::Cancelled {
+            tasks: counters,
+            summary: None,
+        }
+    } else if let Some((diagnostic, _)) = occurrence {
+        TranslationFinished::Failed {
+            tasks: counters,
+            summary: None,
+            diagnostic,
+        }
+    } else {
+        // logger 无法登记诊断时，公共句柄已经记录了独立的日志契约故障；此时不再
+        // 构造一个引用未知 occurrence 的翻译终态。
+        return None;
+    };
+    handle.emit(ProjectLogEvent::TranslationFinished { result });
+    let mut state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.run_plan_finalized |= resolved;
+    state.translation_finished = true;
+    occurrence
+        .map(|(diagnostic, effect)| GenericTerminalOccurrence::from_effect(diagnostic, effect))
+}
+
+fn generic_translate_success_summary(
+    driven: &Driven<Result<GenericCommandOutput, GenericCommandError>>,
+) -> Option<GenericTranslationSummary> {
+    match driven {
+        Driven::Finished(Ok(GenericCommandOutput::Translate { summary, .. }))
+        | Driven::Interrupted(Ok(GenericCommandOutput::Translate { summary, .. })) => {
+            Some(*summary)
+        }
+        Driven::Finished(Ok(_))
+        | Driven::Interrupted(Ok(_))
+        | Driven::CancellationWon(_)
+        | Driven::Finished(Err(_))
+        | Driven::Interrupted(Err(_))
+        | Driven::SignalFailed { .. } => None,
+    }
+}
+
+fn generic_translate_driven_error(
+    driven: &Driven<Result<GenericCommandOutput, GenericCommandError>>,
+) -> Option<&GenericCommandError> {
+    match driven {
+        Driven::Finished(Err(error))
+        | Driven::Interrupted(Err(error))
+        | Driven::CancellationWon(Err(error)) => Some(error),
+        Driven::SignalFailed {
+            result: Err(error), ..
+        } => Some(error),
+        Driven::Finished(Ok(_))
+        | Driven::Interrupted(Ok(_))
+        | Driven::CancellationWon(Ok(_))
+        | Driven::SignalFailed { result: Ok(_), .. } => None,
+    }
+}
+
+fn generic_translate_was_cancelled(
+    driven: &Driven<Result<GenericCommandOutput, GenericCommandError>>,
+) -> bool {
+    match driven {
+        Driven::CancellationWon(_) => true,
+        Driven::Finished(Err(error)) | Driven::Interrupted(Err(error)) => error.is_cancelled(),
+        Driven::Interrupted(Ok(_)) | Driven::Finished(Ok(_)) | Driven::SignalFailed { .. } => false,
     }
 }
 
@@ -4671,7 +5686,7 @@ fn configure_generic_task_records(
     if !requested {
         return ConfiguredTranslationTaskRecordSink::disabled();
     }
-    let (run_id, performance, logger) = {
+    let (run_id, performance, project_log_handle) = {
         let project_log = project_log
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -4684,7 +5699,7 @@ fn configure_generic_task_records(
         (
             run_id.to_owned(),
             Arc::clone(project_log.performance()),
-            project_log.logger().clone(),
+            project_log.handle().clone(),
         )
     };
     match SystemFileSystem::new_with_performance(file_system_configuration.clone(), performance) {
@@ -4696,11 +5711,14 @@ fn configure_generic_task_records(
                 locale,
                 cpu,
                 file_system,
-                logger,
+                project_log_handle.clone(),
             ),
         )),
         Err(error) => {
-            logger.record_task_record_failure(error.safe_diagnostic());
+            project_log_handle.record_task_record_diagnostic(DiagnosticReport::new(
+                StateEffect::Unchanged,
+                error.diagnostic(),
+            ));
             ConfiguredTranslationTaskRecordSink::disabled()
         }
     }
@@ -4713,10 +5731,9 @@ fn generic_workspace(projects_root: &Path, project: &ProjectName) -> PathBuf {
 }
 
 async fn run_project_blocking<T>(
-    stage: &'static str,
-    diagnostic_stage: DiagnosticStage,
-    impact: DiagnosticImpact,
-    fallback_action: DiagnosticAction,
+    diagnostic_stage: GenericDiagnosticStage,
+    effect: StateEffect,
+    database_path: PathBuf,
     operation: impl FnOnce() -> Result<T, GenericProjectError> + Send + 'static,
 ) -> Result<T, GenericCommandError>
 where
@@ -4724,20 +5741,18 @@ where
 {
     let result = tokio::task::spawn_blocking(operation)
         .await
-        .map_err(|source| GenericCommandError::operation(stage, source))?;
+        .map_err(|source| generic_blocking_join_failure(source, effect))?;
     match result {
         Ok(output) => Ok(output),
         Err(source) if source.is_cancelled() => Err(GenericCommandError::Cancelled),
         Err(source) => {
-            let diagnostic =
-                source.safe_diagnostic_source(diagnostic_stage, impact, fallback_action);
-            Err(GenericCommandError::diagnosed(stage, source, diagnostic))
+            let report = source.diagnostic_report(diagnostic_stage, &database_path, effect);
+            Err(GenericCommandError::reported(source, report))
         }
     }
 }
 
 async fn run_scratch_blocking<T>(
-    stage: &'static str,
     operation: impl FnOnce() -> Result<T, GenericScratchError> + Send + 'static,
 ) -> Result<T, GenericCommandError>
 where
@@ -4745,27 +5760,26 @@ where
 {
     let result = tokio::task::spawn_blocking(operation)
         .await
-        .map_err(|source| GenericCommandError::operation(stage, source))?;
+        .map_err(|source| generic_blocking_join_failure(source, StateEffect::Unchanged))?;
     match result {
         Ok(output) => Ok(output),
-        Err(source) => Err(generic_scratch_command_error(stage, source)),
+        Err(source) => Err(generic_scratch_command_error(source)),
     }
 }
 
-fn generic_scratch_command_error(
-    stage: &'static str,
-    source: GenericScratchError,
-) -> GenericCommandError {
+fn generic_scratch_command_error(source: GenericScratchError) -> GenericCommandError {
     if let GenericScratchError::CleanupAfterFailure { operation, cleanup } = source {
-        let recovery_paths = scratch_cleanup_recovery_path(&cleanup)
-            .into_iter()
-            .collect::<Vec<_>>();
         let operation = if matches!(operation.as_ref(), GenericScratchError::Cancelled) {
             GenericCommandError::Cancelled
         } else {
-            GenericCommandError::operation(stage, *operation)
+            let report = generic_scratch_report(
+                operation.as_ref(),
+                FileSystemDiagnosticStage::WriteBack,
+                StateEffect::Unchanged,
+            );
+            GenericCommandError::reported(*operation, report)
         };
-        let discard = generic_scratch_discard_failure(*cleanup, &recovery_paths);
+        let discard = generic_scratch_discard_failure(*cleanup);
         return GenericCommandError::PublishDiscard {
             operation: Box::new(operation),
             discard,
@@ -4774,83 +5788,86 @@ fn generic_scratch_command_error(
     if matches!(source, GenericScratchError::Cancelled) {
         GenericCommandError::Cancelled
     } else {
-        GenericCommandError::operation(stage, source)
+        let report = generic_scratch_report(
+            &source,
+            FileSystemDiagnosticStage::WriteBack,
+            StateEffect::Unchanged,
+        );
+        GenericCommandError::reported(source, report)
     }
 }
 
-fn scratch_cleanup_recovery_path(source: &GenericScratchError) -> Option<PathBuf> {
-    match source {
-        GenericScratchError::Io { path, .. } => Some(path.clone()),
-        GenericScratchError::UnsafeCleanupTarget { scratch_root, .. } => Some(scratch_root.clone()),
-        GenericScratchError::CleanupAfterFailure { cleanup, .. } => {
-            scratch_cleanup_recovery_path(cleanup)
-        }
-        GenericScratchError::Cancelled
-        | GenericScratchError::InvalidRelativePath(_)
-        | GenericScratchError::InvalidMaterializedFile { .. }
-        | GenericScratchError::TargetNotDirectory(_) => None,
-    }
+fn generic_scratch_discard_failure(source: GenericScratchError) -> GenericDiscardFailure {
+    let report = generic_scratch_report(
+        &source,
+        FileSystemDiagnosticStage::Publication,
+        StateEffect::RecoveryRequired,
+    );
+    GenericDiscardFailure::new(report, source)
 }
 
-fn generic_scratch_discard_failure(
-    source: GenericScratchError,
-    recovery_paths: &[PathBuf],
-) -> GenericDiscardFailure {
-    let diagnostic = generic_scratch_cleanup_diagnostic(&source);
-    generic_discard_failure(source, diagnostic, recovery_paths)
-}
-
-fn generic_scratch_cleanup_diagnostic(source: &GenericScratchError) -> SafeDiagnostic {
+fn generic_scratch_report(
+    source: &GenericScratchError,
+    stage: FileSystemDiagnosticStage,
+    effect: StateEffect,
+) -> DiagnosticReport {
+    let file_system = |operation, problem| {
+        DiagnosticReport::new(
+            effect,
+            Diagnostic::file_system(FileSystemIssue::new(
+                FileSystemDiagnosticContext::new(stage, operation),
+                problem,
+            )),
+        )
+    };
     match source {
         GenericScratchError::Io {
             operation,
             path,
             source,
-        } => SafeDiagnostic::io(
-            DiagnosticCode::WriteBackDiscard,
-            DiagnosticStage::Publication,
-            DiagnosticSubject::path(path),
-            operation,
-            source,
-            DiagnosticImpact::RecoveryRequired,
-            DiagnosticAction::PreserveRecoveryArtifacts,
+        } => file_system(
+            *operation,
+            FileSystemProblem::Io {
+                path: SafePath::new(path),
+                failure: IoFailure::from_error(source),
+            },
         ),
-        GenericScratchError::UnsafeCleanupTarget { scratch_root, .. } => SafeDiagnostic::new(
-            DiagnosticCode::WriteBackDiscard,
-            DiagnosticStage::Publication,
-            DiagnosticSubject::path(scratch_root),
-            DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
-            DiagnosticImpact::RecoveryRequired,
-            DiagnosticAction::PreserveRecoveryArtifacts,
+        GenericScratchError::UnsafeCleanupTarget {
+            workspace_root,
+            scratch_root,
+        } => file_system(
+            FileSystemOperation::Remove,
+            FileSystemProblem::OutsideScope {
+                root: SafePath::new(workspace_root),
+                path: SafePath::new(scratch_root),
+            },
         ),
         GenericScratchError::CleanupAfterFailure { cleanup, .. } => {
-            generic_scratch_cleanup_diagnostic(cleanup)
+            generic_scratch_report(cleanup, stage, effect)
         }
-        GenericScratchError::Cancelled => SafeDiagnostic::new(
-            DiagnosticCode::WriteBackDiscard,
-            DiagnosticStage::Publication,
-            DiagnosticSubject::operation("generic_write_back_candidate_cleanup"),
-            DiagnosticReason::failure(DiagnosticFailureKind::LockCancelled),
-            DiagnosticImpact::RecoveryRequired,
-            DiagnosticAction::PreserveRecoveryArtifacts,
+        GenericScratchError::Cancelled => DiagnosticReport::new(
+            effect,
+            Diagnostic::runtime(RuntimeIssue::Cancelled {
+                component: RuntimeComponent::FileSystemExecutor,
+                operation: RuntimeOperation::ExecuteTask,
+            }),
         ),
-        GenericScratchError::InvalidRelativePath(path)
-        | GenericScratchError::TargetNotDirectory(path) => SafeDiagnostic::new(
-            DiagnosticCode::WriteBackDiscard,
-            DiagnosticStage::Publication,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
-            DiagnosticImpact::RecoveryRequired,
-            DiagnosticAction::PreserveRecoveryArtifacts,
+        GenericScratchError::InvalidRelativePath(path) => file_system(
+            FileSystemOperation::ResolveDirectory,
+            FileSystemProblem::InvalidPath {
+                path: SafePath::new(path),
+                violation: FileSystemPathViolation::OutsideScope,
+            },
         ),
-        GenericScratchError::InvalidMaterializedFile { path, .. } => SafeDiagnostic::new(
-            DiagnosticCode::WriteBackDiscard,
-            DiagnosticStage::Publication,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(DiagnosticFailureKind::GenericSourceDocumentInvalid),
-            DiagnosticImpact::RecoveryRequired,
-            DiagnosticAction::PreserveRecoveryArtifacts,
+        GenericScratchError::TargetNotDirectory(path) => file_system(
+            FileSystemOperation::Metadata,
+            FileSystemProblem::NotDirectory {
+                path: SafePath::new(path),
+            },
         ),
+        GenericScratchError::InvalidMaterializedFile { source, .. } => {
+            source.diagnostic_report(effect)
+        }
     }
 }
 
@@ -4934,20 +5951,56 @@ async fn drive_and_shutdown(
     project_log: GenericProjectLogSlot,
     progress: GenericTerminalProgress,
 ) -> GenericCommandRunReport {
+    let cancellation_project_log = Arc::clone(&project_log);
     let driven = drive(operation, termination_signals, || {
+        emit_generic_cancellation_requested(&cancellation_project_log);
         progress.safe_stopping();
         cancel();
     })
     .await;
     progress.finalizing();
     if let Err(source) = file_system.shutdown().await {
-        shutdown_errors.push(GenericShutdownError::new("filesystem", source));
+        shutdown_errors.push(GenericShutdownError::file_system(source));
     }
     record_generic_terminal_progress_failures(progress.finish(), &mut shutdown_errors);
     GenericCommandRunReport::from_driven(
         driven,
         shutdown_errors,
         take_generic_project_log(&project_log),
+    )
+}
+
+// 进程驱动器显式持有信号、日志和终止依赖，避免由无类型上下文重新解释生命周期。
+#[allow(clippy::too_many_arguments)]
+async fn drive_extract_and_shutdown(
+    operation: impl Future<Output = Result<GenericCommandOutput, GenericCommandError>>,
+    termination_signals: &mut TerminationSignals,
+    cancel: impl FnOnce(),
+    file_system: SystemFileSystem,
+    mut shutdown_errors: Vec<GenericShutdownError>,
+    project_log: GenericProjectLogSlot,
+    extract_project_log: GenericExtractProjectLogStateRef,
+    progress: GenericTerminalProgress,
+) -> GenericCommandRunReport {
+    let cancellation_project_log = Arc::clone(&project_log);
+    let driven = drive(operation, termination_signals, || {
+        emit_generic_cancellation_requested(&cancellation_project_log);
+        progress.safe_stopping();
+        cancel();
+    })
+    .await;
+    progress.finalizing();
+    if let Err(source) = file_system.shutdown().await {
+        shutdown_errors.push(GenericShutdownError::file_system(source));
+    }
+    record_generic_terminal_progress_failures(progress.finish(), &mut shutdown_errors);
+    let terminal_occurrence =
+        finish_generic_extract_project_log(&project_log, &extract_project_log, &driven);
+    GenericCommandRunReport::from_driven_with_terminal_occurrence(
+        driven,
+        shutdown_errors,
+        take_generic_project_log(&project_log),
+        terminal_occurrence,
     )
 }
 
@@ -4964,6 +6017,15 @@ impl GenericCommandRunReport {
         driven: Driven<Result<GenericCommandOutput, GenericCommandError>>,
         shutdown_errors: Vec<GenericShutdownError>,
         project_log: Option<ActiveProjectLog>,
+    ) -> Self {
+        Self::from_driven_with_terminal_occurrence(driven, shutdown_errors, project_log, None)
+    }
+
+    fn from_driven_with_terminal_occurrence(
+        driven: Driven<Result<GenericCommandOutput, GenericCommandError>>,
+        shutdown_errors: Vec<GenericShutdownError>,
+        project_log: Option<ActiveProjectLog>,
+        terminal_occurrence: Option<GenericTerminalOccurrence>,
     ) -> Self {
         let result = match driven {
             // 信号到达后业务仍返回完整成功，说明事务或其他终态已经生效。
@@ -5008,23 +6070,34 @@ impl GenericCommandRunReport {
             },
         };
         let pending_project_log = project_log.map(|project_log| {
-            let mut diagnostics = match &result {
-                GenericCommandRunResult::Failed(error) => {
-                    let mut diagnostics = vec![error.safe_diagnostic()];
-                    diagnostics.extend(error.related_diagnostics());
-                    diagnostics
-                }
+            if shutdown_errors.is_empty() {
+                return match &result {
+                    GenericCommandRunResult::Succeeded(_) => project_log.pending_succeeded(),
+                    GenericCommandRunResult::Interrupted => project_log.pending_cancelled(),
+                    GenericCommandRunResult::Failed(error) => match terminal_occurrence {
+                        Some(occurrence) => occurrence.into_pending(project_log),
+                        None => project_log.pending_failure(generic_command_error_report(error)),
+                    },
+                };
+            }
+
+            let mut reports = shutdown_errors
+                .iter()
+                .map(GenericShutdownError::diagnostic_report);
+            let first_shutdown = reports
+                .next()
+                .expect("非空 shutdown_errors 必须产生至少一份报告");
+            let mut report = match &result {
+                GenericCommandRunResult::Failed(error) => generic_command_error_report(error)
+                    .with_related(RelatedFailureRelation::Shutdown, first_shutdown),
                 GenericCommandRunResult::Succeeded(_) | GenericCommandRunResult::Interrupted => {
-                    Vec::new()
+                    first_shutdown
                 }
             };
-            diagnostics.extend(
-                shutdown_errors
-                    .iter()
-                    .map(GenericShutdownError::safe_diagnostic),
-            );
-            let outcome = generic_project_log_outcome(&result, &shutdown_errors, &diagnostics);
-            PendingProjectLog::new(project_log, outcome, diagnostics)
+            for related in reports {
+                report = report.with_related(RelatedFailureRelation::Shutdown, related);
+            }
+            project_log.pending_failure(report)
         });
         Self {
             result,
@@ -5034,32 +6107,8 @@ impl GenericCommandRunReport {
     }
 }
 
-fn generic_project_log_outcome(
-    result: &GenericCommandRunResult,
-    shutdown_errors: &[GenericShutdownError],
-    diagnostics: &[SafeDiagnostic],
-) -> ProjectLogRunOutcome {
-    if diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.impact == DiagnosticImpact::OutcomeUnknown)
-    {
-        ProjectLogRunOutcome::OutcomeUnknown
-    } else if diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.impact == DiagnosticImpact::RecoveryRequired)
-    {
-        ProjectLogRunOutcome::RecoveryRequired
-    } else if !shutdown_errors.is_empty() {
-        ProjectLogRunOutcome::Failed
-    } else {
-        match result {
-            GenericCommandRunResult::Succeeded(_) => ProjectLogRunOutcome::Succeeded,
-            GenericCommandRunResult::Interrupted => ProjectLogRunOutcome::Cancelled,
-            GenericCommandRunResult::Failed(_) => ProjectLogRunOutcome::Failed,
-        }
-    }
-}
-
+// 发布编排必须独立持有候选、门闩和日志终态，保持副作用顺序可审计。
+#[allow(clippy::too_many_arguments)]
 async fn publish_generic_write_back(
     publisher: SystemDirectoryPublisher,
     project_name: ProjectName,
@@ -5067,6 +6116,8 @@ async fn publish_generic_write_back(
     candidate: GenericWriteBackCandidate,
     cancellation: CooperativeCancellation,
     publication_gate: GenericWriteBackPublicationGate,
+    project_log: Option<ProjectLogHandle>,
+    publication_occurrence: GenericTerminalOccurrenceSlot,
     publication_started: impl FnOnce() + Send,
 ) -> Result<GenericCommandOutput, GenericCommandError> {
     if cancellation.is_requested() {
@@ -5075,10 +6126,11 @@ async fn publish_generic_write_back(
     let workspace_root = project.workspace_root().to_path_buf();
     let translated_units = candidate.translated_units();
     let retained_source_units = candidate.retained_source_units();
+    let files = candidate.files().len();
     let scratch_candidate = candidate;
     let scratch_workspace = workspace_root.clone();
     let materialize_cancellation = cancellation.clone();
-    let scratch_root = run_scratch_blocking("建立 Generic 写回暂存来源", move || {
+    let scratch_root = run_scratch_blocking(move || {
         materialize_write_back_source(
             &scratch_workspace,
             &scratch_candidate,
@@ -5090,8 +6142,7 @@ async fn publish_generic_write_back(
         return match cleanup_write_back_source(&workspace_root, &scratch_root) {
             Ok(()) => Err(GenericCommandError::Cancelled),
             Err(cleanup) => {
-                let recovery_paths = vec![scratch_root];
-                let discard = generic_scratch_discard_failure(cleanup, &recovery_paths);
+                let discard = generic_scratch_discard_failure(cleanup);
                 Err(GenericCommandError::PublishDiscard {
                     operation: Box::new(GenericCommandError::Cancelled),
                     discard,
@@ -5102,19 +6153,10 @@ async fn publish_generic_write_back(
 
     let target_root = project.write_back_root();
     let request = (|| {
-        let publish_intent = publish_intent_for(&target_root).map_err(|source| {
-            Box::new(GenericCommandError::operation(
-                "检查 Generic 写回目录",
-                source,
-            ))
-        })?;
+        let publish_intent = publish_intent_for(&target_root)
+            .map_err(|source| Box::new(generic_scratch_command_error(source)))?;
         let mapping = DirectorySourceMapping::new(scratch_root.clone(), PathBuf::new()).map_err(
-            |source| {
-                Box::new(GenericCommandError::operation(
-                    "建立 Generic 目录候选请求",
-                    source,
-                ))
-            },
+            |source| Box::new(generic_publication_request_failure(&target_root, source)),
         )?;
         DirectoryStageRequest::new(
             target_root.clone(),
@@ -5123,12 +6165,7 @@ async fn publish_generic_write_back(
             Vec::new(),
             Vec::new(),
         )
-        .map_err(|source| {
-            Box::new(GenericCommandError::operation(
-                "建立 Generic 目录候选请求",
-                source,
-            ))
-        })
+        .map_err(|source| Box::new(generic_publication_request_failure(&target_root, source)))
     })()
     .map_err(|operation| {
         generic_scratch_handoff_failure(*operation, &workspace_root, &scratch_root)
@@ -5150,10 +6187,12 @@ async fn publish_generic_write_back(
     }
 
     if let Err(source) = cleanup_write_back_source(&workspace_root, &scratch_root) {
-        let diagnostic = generic_operation_diagnostic("清理 Generic 写回暂存来源")
-            .with_recovery(RecoveryFact::path(&scratch_root));
-        let operation =
-            GenericCommandError::diagnosed("清理 Generic 写回暂存来源", source, diagnostic);
+        let report = generic_scratch_report(
+            &source,
+            FileSystemDiagnosticStage::Publication,
+            StateEffect::RecoveryRequired,
+        );
+        let operation = GenericCommandError::reported(source, report);
         return discard_after_failure(&publisher, staged, operation).await;
     }
     if cancellation.is_requested() {
@@ -5161,11 +6200,11 @@ async fn publish_generic_write_back(
     }
 
     let recheck_cancellation = cancellation.clone();
+    let database_path = project.database_path().to_path_buf();
     if let Err(operation) = run_project_blocking(
-        "发布前复查 Generic 输入",
-        DiagnosticStage::WriteBack,
-        DiagnosticImpact::Unchanged,
-        DiagnosticAction::FixInput,
+        GenericDiagnosticStage::WriteBack,
+        StateEffect::Unchanged,
+        database_path,
         move || {
             ensure_input_fingerprints_current_with_cancellation(&project, &recheck_cancellation)
         },
@@ -5181,15 +6220,57 @@ async fn publish_generic_write_back(
     if !begin_generic_write_back_publication(&publication_gate, publication_started) {
         return discard_after_failure(&publisher, staged, GenericCommandError::Cancelled).await;
     }
-    publisher.publish(staged).await.map_err(|source| {
-        let (diagnostic, related_diagnostics) = generic_publish_diagnostics(&source);
-        GenericCommandError::diagnosed_with_related(
-            "发布 Generic 写回目录",
-            source,
-            diagnostic,
-            related_diagnostics,
-        )
-    })?;
+    if let Some(project_log) = &project_log {
+        project_log.emit(ProjectLogEvent::publication_started(&target_root));
+    }
+    if let Err(source) = publisher.publish(staged).await {
+        let report = source.diagnostic_report();
+        if let Some(project_log) = &project_log
+            && let Some(diagnostic) =
+                project_log.record_diagnostic(DiagnosticScope::Publication, report.clone())
+        {
+            let occurrence = match report.effect() {
+                StateEffect::AppliedFinalizationFailed | StateEffect::RecoveryRequired => {
+                    GenericTerminalOccurrence::recovery_required(diagnostic)
+                }
+                StateEffect::Unchanged
+                | StateEffect::ProgressPreserved
+                | StateEffect::Applied
+                | StateEffect::AppliedRunPlanNotSaved
+                | StateEffect::OutcomeUnknown => {
+                    GenericTerminalOccurrence::from_effect(diagnostic, report.effect())
+                }
+            };
+            *publication_occurrence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(occurrence);
+            let result = match report.effect() {
+                StateEffect::RecoveryRequired | StateEffect::AppliedFinalizationFailed => {
+                    PublicationFinished::RecoveryRequired { diagnostic }
+                }
+                StateEffect::OutcomeUnknown => PublicationFinished::OutcomeUnknown { diagnostic },
+                StateEffect::Unchanged
+                | StateEffect::ProgressPreserved
+                | StateEffect::Applied
+                | StateEffect::AppliedRunPlanNotSaved => {
+                    PublicationFinished::NotPublished { diagnostic }
+                }
+            };
+            project_log.emit(ProjectLogEvent::PublicationFinished { result });
+        }
+        return Err(GenericCommandError::reported(source, report));
+    }
+    if let Some(project_log) = &project_log {
+        project_log.emit(ProjectLogEvent::PublicationFinished {
+            result: PublicationFinished::Published {
+                summary: PublicationSummary::Generic(ProjectLogGenericPublicationSummary {
+                    files: generic_count(files),
+                    translated_units: generic_count(translated_units),
+                    retained_source_units: generic_count(retained_source_units),
+                }),
+            },
+        });
+    }
     Ok(GenericCommandOutput::WriteBack {
         project: project_name,
         output_root: target_root,
@@ -5205,34 +6286,8 @@ fn generic_prepare_error(
     if cancellation.is_requested() && directory_prepare_cancelled_without_cleanup(&source) {
         GenericCommandError::Cancelled
     } else {
-        let DirectoryPrepareError::NotPrepared {
-            target_root,
-            source: prepare_source,
-            cleanup_failure,
-        } = source;
-        let diagnostic = prepare_source
-            .safe_diagnostic(
-                DiagnosticStage::Publication,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckPathAndPermissions,
-            )
-            .with_recovery(RecoveryFact::path(&target_root));
-        let related_diagnostics = cleanup_failure
-            .as_ref()
-            .map(generic_staging_cleanup_diagnostic)
-            .into_iter()
-            .collect();
-        let source = DirectoryPrepareError::NotPrepared {
-            target_root,
-            source: prepare_source,
-            cleanup_failure,
-        };
-        GenericCommandError::diagnosed_with_related(
-            "准备 Generic 写回候选",
-            source,
-            diagnostic,
-            related_diagnostics,
-        )
+        let report = source.diagnostic_report();
+        GenericCommandError::reported(source, report)
     }
 }
 
@@ -5254,8 +6309,7 @@ fn generic_scratch_handoff_failure(
     match cleanup_write_back_source(workspace_root, scratch_root) {
         Ok(()) => operation,
         Err(cleanup) => {
-            let recovery_paths = vec![scratch_root.to_path_buf()];
-            let discard = generic_scratch_discard_failure(cleanup, &recovery_paths);
+            let discard = generic_scratch_discard_failure(cleanup);
             GenericCommandError::PublishDiscard {
                 operation: Box::new(operation),
                 discard,
@@ -5284,152 +6338,72 @@ fn directory_prepare_cancelled_without_cleanup(
     }
 }
 
-fn generic_publish_diagnostics(
-    source: &DirectoryPublishError<Box<SystemFileSystemError>>,
-) -> (SafeDiagnostic, Vec<SafeDiagnostic>) {
-    match source {
-        DirectoryPublishError::TargetAlreadyExists {
-            target_root,
-            cleanup_failure,
-        } => with_staging_cleanup_diagnostic(
-            SafeDiagnostic::new(
-                DiagnosticCode::WriteBackPublish,
-                DiagnosticStage::Publication,
-                DiagnosticSubject::path(target_root),
-                DiagnosticReason::failure(DiagnosticFailureKind::TargetAlreadyExists),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            ),
-            cleanup_failure.as_ref(),
-        ),
-        DirectoryPublishError::TargetMissing {
-            target_root,
-            cleanup_failure,
-        } => with_staging_cleanup_diagnostic(
-            SafeDiagnostic::new(
-                DiagnosticCode::WriteBackPublish,
-                DiagnosticStage::Publication,
-                DiagnosticSubject::path(target_root),
-                DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            ),
-            cleanup_failure.as_ref(),
-        ),
-        DirectoryPublishError::TargetNotDirectory {
-            target_root,
-            cleanup_failure,
-        } => with_staging_cleanup_diagnostic(
-            SafeDiagnostic::new(
-                DiagnosticCode::WriteBackPublish,
-                DiagnosticStage::Publication,
-                DiagnosticSubject::path(target_root),
-                DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            ),
-            cleanup_failure.as_ref(),
-        ),
-        DirectoryPublishError::NotAttempted {
-            target_root,
-            source,
-            cleanup_failure,
+fn generic_publication_request_failure(
+    output_root: &Path,
+    source: DirectoryStageRequestError,
+) -> GenericCommandError {
+    let violation = match &source {
+        DirectoryStageRequestError::EmptyTargetRoot => PublicationRequestViolation::EmptyTargetRoot,
+        DirectoryStageRequestError::EmptySourceDirectory => {
+            PublicationRequestViolation::EmptySourceDirectory
         }
-        | DirectoryPublishError::NotPublished {
-            target_root,
-            source,
-            cleanup_failure,
-        } => with_staging_cleanup_diagnostic(
-            source
-                .safe_diagnostic(
-                    DiagnosticStage::Publication,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckProjectState,
-                )
-                .with_recovery(RecoveryFact::path(target_root)),
-            cleanup_failure.as_ref(),
-        ),
-        DirectoryPublishError::PublishedWithResiduals {
-            target_root,
-            residual_path,
-            source,
-        } => (
-            source
-                .safe_diagnostic(
-                    DiagnosticStage::Publication,
-                    DiagnosticImpact::StateAppliedFinalizationFailed,
-                    DiagnosticAction::PreserveRecoveryArtifacts,
-                )
-                .with_recovery(RecoveryFact::path(target_root))
-                .with_recovery(RecoveryFact::path(residual_path)),
-            Vec::new(),
-        ),
-        DirectoryPublishError::RecoveryRequired {
-            target_root,
-            recovery_artifacts,
-            source,
-        } => (
-            with_recovery_paths(
-                source
-                    .safe_diagnostic(
-                        DiagnosticStage::Publication,
-                        DiagnosticImpact::RecoveryRequired,
-                        DiagnosticAction::PreserveRecoveryArtifacts,
-                    )
-                    .with_recovery(RecoveryFact::path(target_root)),
-                recovery_artifacts,
-            ),
-            Vec::new(),
-        ),
-        DirectoryPublishError::OutcomeUnknown {
-            target_root,
-            recovery_artifacts,
-            source,
-        } => (
-            with_recovery_paths(
-                source
-                    .safe_diagnostic(
-                        DiagnosticStage::Publication,
-                        DiagnosticImpact::OutcomeUnknown,
-                        DiagnosticAction::PreserveRecoveryArtifacts,
-                    )
-                    .with_recovery(RecoveryFact::path(target_root)),
-                recovery_artifacts,
-            ),
-            Vec::new(),
-        ),
-    }
-}
-
-fn with_staging_cleanup_diagnostic(
-    diagnostic: SafeDiagnostic,
-    cleanup: Option<&StagingCleanupFailure<Box<SystemFileSystemError>>>,
-) -> (SafeDiagnostic, Vec<SafeDiagnostic>) {
-    let related = cleanup
-        .map(generic_staging_cleanup_diagnostic)
-        .into_iter()
-        .collect();
-    (diagnostic, related)
-}
-
-fn generic_staging_cleanup_diagnostic(
-    cleanup: &StagingCleanupFailure<Box<SystemFileSystemError>>,
-) -> SafeDiagnostic {
-    cleanup
-        .source()
-        .safe_diagnostic(
-            DiagnosticStage::Publication,
-            DiagnosticImpact::RecoveryRequired,
-            DiagnosticAction::PreserveRecoveryArtifacts,
-        )
-        .with_recovery(RecoveryFact::path(cleanup.residual_path()))
-}
-
-fn with_recovery_paths(mut diagnostic: SafeDiagnostic, paths: &[PathBuf]) -> SafeDiagnostic {
-    for path in paths {
-        diagnostic = diagnostic.with_recovery(RecoveryFact::path(path));
-    }
-    diagnostic
+        DirectoryStageRequestError::EmptySourceMappings => {
+            PublicationRequestViolation::EmptySourceMappings
+        }
+        DirectoryStageRequestError::InvalidRelativePath { path } => {
+            PublicationRequestViolation::InvalidRelativePath {
+                path: SafePath::new(path),
+            }
+        }
+        DirectoryStageRequestError::OverlappingSourceTargets { first, second } => {
+            PublicationRequestViolation::OverlappingSourceTargets {
+                first: SafePath::new(first),
+                second: SafePath::new(second),
+            }
+        }
+        DirectoryStageRequestError::OverlappingOverlays { first, second } => {
+            PublicationRequestViolation::OverlappingOverlays {
+                first: SafePath::new(first),
+                second: SafePath::new(second),
+            }
+        }
+        DirectoryStageRequestError::OverlappingEmptyDirectories { first, second } => {
+            PublicationRequestViolation::OverlappingEmptyDirectories {
+                first: SafePath::new(first),
+                second: SafePath::new(second),
+            }
+        }
+        DirectoryStageRequestError::OverlayOutsideSourceMappings { relative_file } => {
+            PublicationRequestViolation::OverlayOutsideSourceMappings {
+                relative_file: SafePath::new(relative_file),
+            }
+        }
+        DirectoryStageRequestError::EmptyDirectoryOverlapsSourceTarget {
+            empty_directory,
+            source_target,
+        } => PublicationRequestViolation::EmptyDirectoryOverlapsSourceTarget {
+            empty_directory: SafePath::new(empty_directory),
+            source_target: SafePath::new(source_target),
+        },
+        DirectoryStageRequestError::EmptyDirectoryOverlapsOverlay {
+            empty_directory,
+            overlay,
+        } => PublicationRequestViolation::EmptyDirectoryOverlapsOverlay {
+            empty_directory: SafePath::new(empty_directory),
+            overlay: SafePath::new(overlay),
+        },
+    };
+    let report = DiagnosticReport::new(
+        StateEffect::Unchanged,
+        Diagnostic::publication(PublicationIssue::new(
+            PublicationStep::PrepareCandidate,
+            PublicationProblem::InvalidRequest {
+                output_root: SafePath::new(output_root),
+                violation,
+            },
+        )),
+    );
+    GenericCommandError::reported(source, report)
 }
 
 fn materialize_write_back_source(
@@ -5456,7 +6430,7 @@ fn materialize_write_back_source_with(
         uuid::Uuid::new_v4()
     ));
     fs::create_dir(&scratch_root).map_err(|source| GenericScratchError::Io {
-        operation: "建立暂存根",
+        operation: FileSystemOperation::Create,
         path: scratch_root.clone(),
         source,
     })?;
@@ -5489,7 +6463,7 @@ fn materialize_write_back_source_with(
         let parent = target.parent().expect("相对 JSONL 文件必须拥有暂存父目录");
         if let Err(source) = fs::create_dir_all(parent) {
             let operation = GenericScratchError::Io {
-                operation: "建立暂存子目录",
+                operation: FileSystemOperation::Create,
                 path: parent.to_path_buf(),
                 source,
             };
@@ -5508,7 +6482,7 @@ fn materialize_write_back_source_with(
                     GenericScratchError::Cancelled
                 } else {
                     GenericScratchError::Io {
-                        operation: "写入暂存 JSONL",
+                        operation: FileSystemOperation::Write,
                         path: target,
                         source,
                     }
@@ -5530,7 +6504,7 @@ fn materialize_write_back_source_with(
                         GenericScratchError::Cancelled
                     } else {
                         GenericScratchError::Io {
-                            operation: "读回暂存 JSONL",
+                            operation: FileSystemOperation::Read,
                             path: target,
                             source,
                         }
@@ -5670,7 +6644,7 @@ fn cleanup_write_back_source(
         Ok(()) => Ok(()),
         Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(source) => Err(GenericScratchError::Io {
-            operation: "删除暂存来源",
+            operation: FileSystemOperation::Remove,
             path: scratch_root.to_path_buf(),
             source,
         }),
@@ -5689,7 +6663,7 @@ fn publish_intent_for(target_root: &Path) -> Result<DirectoryPublishIntent, Gene
             Ok(DirectoryPublishIntent::CreateNew)
         }
         Err(source) => Err(GenericScratchError::Io {
-            operation: "读取目标 metadata",
+            operation: FileSystemOperation::Metadata,
             path: target_root.to_path_buf(),
             source,
         }),
@@ -5703,7 +6677,7 @@ async fn discard_after_failure<P>(
 ) -> Result<GenericCommandOutput, GenericCommandError>
 where
     P: RecoverableDirectoryPublisher,
-    P::Error: SafeDiagnosticSource,
+    P::Error: DirectoryPublicationDiagnosticSource,
 {
     match publisher.discard(staged).await {
         Ok(()) => Err(operation),
@@ -5719,15 +6693,10 @@ where
 
 fn generic_directory_discard_failure<E>(source: DirectoryDiscardError<E>) -> GenericDiscardFailure
 where
-    E: Error + Send + Sync + SafeDiagnosticSource + 'static,
+    E: Error + Send + Sync + DirectoryPublicationDiagnosticSource + 'static,
 {
-    let recovery_paths = vec![source.staging_root().to_path_buf()];
-    let diagnostic = source.source().safe_diagnostic_source(
-        DiagnosticStage::Publication,
-        DiagnosticImpact::RecoveryRequired,
-        DiagnosticAction::PreserveRecoveryArtifacts,
-    );
-    generic_discard_failure(source, diagnostic, &recovery_paths)
+    let report = source.diagnostic_report();
+    GenericDiscardFailure::new(report, source)
 }
 
 #[derive(Debug)]
@@ -5744,7 +6713,7 @@ enum GenericScratchError {
         scratch_root: PathBuf,
     },
     Io {
-        operation: &'static str,
+        operation: FileSystemOperation,
         path: PathBuf,
         source: io::Error,
     },
@@ -5788,7 +6757,12 @@ impl fmt::Display for GenericScratchError {
                 operation,
                 path,
                 source,
-            } => write!(formatter, "{operation} {} 失败：{source}", path.display()),
+            } => write!(
+                formatter,
+                "{} {} 失败：{source}",
+                operation.as_str(),
+                path.display()
+            ),
             Self::CleanupAfterFailure { operation, cleanup } => {
                 write!(formatter, "{operation}；随后清理也失败：{cleanup}")
             }
@@ -5816,6 +6790,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Barrier, Condvar, mpsc};
 
+    use crate::diagnostic::DiagnosticStage;
     use crate::generic::{
         GenericPlaceholderRuleDefinition, automatic_translation_state_fingerprint,
         manual_translation_state_fingerprint,
@@ -5824,6 +6799,7 @@ mod tests {
         JapaneseLanguageModule, JapaneseQuoteRepairPolicy, JapaneseResidualPolicy, LanguageId,
         LanguageModule, QuotePair,
     };
+    use crate::storage::file_system::{DirectoryPublishError, StagingCleanupFailure};
     use crate::translation::planning_resource::{TerminologyEntry, compile_terminology};
 
     use super::*;
@@ -5865,44 +6841,72 @@ mod tests {
         let workspace = PathBuf::from("projects/generic/panic-project");
         let report = catch_generic_command_panic(
             GenericCommandPanicContext {
-                command: "translate",
-                stage: DiagnosticStage::Translate,
+                command: crate::diagnostic::RuntimeCommand::Translate,
                 project_workspace: workspace.clone(),
             },
             async { panic!("不得读取的测试 panic payload") },
         )
         .await;
 
-        let GenericCommandRunResult::Failed(GenericCommandError::Operation { diagnostic, .. }) =
+        let GenericCommandRunResult::Failed(GenericCommandError::Operation { failure }) =
             report.result
         else {
             panic!("Generic 命令 panic 必须成为命令级结构化失败");
         };
-        assert_eq!(diagnostic.stage, DiagnosticStage::Translate);
-        assert_eq!(diagnostic.code, DiagnosticCode::InternalOperation);
-        assert_eq!(diagnostic.subject, DiagnosticSubject::command("translate"));
-        assert_eq!(diagnostic.impact, DiagnosticImpact::OutcomeUnknown);
-        assert_eq!(diagnostic.action, DiagnosticAction::ReportBug);
-        assert_eq!(diagnostic.recovery, vec![RecoveryFact::path(workspace)]);
+        let diagnostic = failure.report();
+        assert_eq!(diagnostic.effect(), StateEffect::OutcomeUnknown);
+        assert_eq!(diagnostic.primary().stage(), DiagnosticStage::Translate);
+        assert_eq!(diagnostic.primary().code(), "runtime.command_panicked");
+        let wire = serde_json::to_string(diagnostic).expect("panic 诊断必须可序列化");
+        assert!(wire.contains("\"command\":\"translate\""));
+        assert!(wire.contains(&workspace.to_string_lossy().to_string()));
+        assert!(!wire.contains("不得读取的测试 panic payload"));
     }
 
     #[test]
     fn generic_partial_response_diagnostic_keeps_task_and_output_id() {
         let diagnostic =
-            generic_response_problem_diagnostic(2, &ResponseProblem::MissingId(task_id(7)));
+            generic_response_problem_diagnostic(2, 3, &ResponseProblem::MissingId { output_id: 7 });
 
-        assert_eq!(diagnostic.code, DiagnosticCode::ModelRequest);
-        assert_eq!(diagnostic.stage, DiagnosticStage::ModelRequest);
+        assert_eq!(diagnostic.effect(), StateEffect::ProgressPreserved);
         assert_eq!(
-            diagnostic.subject,
-            DiagnosticSubject::operation("generic_translation_task_3")
+            diagnostic.primary().code(),
+            "generic.translation.response.missing_id"
+        );
+        let wire = serde_json::to_value(&diagnostic).expect("响应诊断必须可序列化");
+        assert_eq!(
+            wire["primary"]["issue"]["details"]["problem"]["task_ordinal"],
+            3
         );
         assert_eq!(
-            diagnostic.reason,
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::InvalidResponseContract,
-                "problem=missing_id; output_id=7"
-            )
+            wire["primary"]["issue"]["details"]["problem"]["total_tasks"],
+            3
+        );
+        assert_eq!(
+            wire["primary"]["issue"]["details"]["problem"]["problem"]["output_id"],
+            7
+        );
+    }
+
+    #[test]
+    fn generic_planning_fact_diagnostic_keeps_full_unit_locator() {
+        let locator = GenericPlanningUnitLocator::new(
+            "a.jsonl",
+            "group-a".to_owned(),
+            "unit-a".to_owned(),
+            "dialogue".to_owned(),
+        );
+        let report = generic_planning_report(&GenericPlanningError::Missing(locator));
+        let wire = serde_json::to_value(report).expect("规划诊断必须可序列化");
+
+        assert_eq!(
+            wire["primary"]["issue"]["details"]["problem"]["unit"],
+            serde_json::json!({
+                "relative_path": "a.jsonl",
+                "group_id": "group-a",
+                "unit_id": "unit-a",
+                "role": "dialogue",
+            })
         );
     }
 
@@ -6033,8 +7037,8 @@ mod tests {
             panic!("信号接收失败仍应报告运行失败");
         };
         assert_eq!(
-            error.safe_diagnostic().impact,
-            DiagnosticImpact::StateAppliedFinalizationFailed
+            generic_command_error_report(&error).effect(),
+            StateEffect::AppliedFinalizationFailed
         );
     }
 
@@ -6109,6 +7113,7 @@ mod tests {
                 &snapshot,
                 terminology,
                 &rules,
+                &GenericPlaceholderRuleSource::ProjectSnapshot,
                 language_module,
                 AutomaticStateResources {
                     prompt: fingerprint(1),
@@ -6135,7 +7140,7 @@ mod tests {
             .expect("运行中的 CPU 工作必须观察取消");
         assert!(source.is_cancelled());
 
-        let error = generic_preparation_failure("建立 Generic 翻译计划", source);
+        let error = generic_preparation_failure(source);
         let report =
             GenericCommandRunReport::from_driven(Driven::Finished(Err(error)), Vec::new(), None);
         assert!(matches!(
@@ -6149,10 +7154,143 @@ mod tests {
     }
 
     #[test]
+    fn generic_placeholder_failure_keeps_rule_source_unit_locator_and_match_range() {
+        let temporary = tempfile::tempdir().expect("应该可建立临时目录");
+        let source_root = temporary.path().join("source");
+        fs::create_dir(&source_root).expect("应该可建立输入目录");
+        fs::write(
+            source_root.join("a.jsonl"),
+            concat!(
+                r#"{"id":"group-a","kind":"dialogue","units":["#,
+                r#"{"id":"safe","text":"こんにちは"},"#,
+                r#"{"id":"unit-a","text":"甲触发缺组乙"}]}"#,
+                "\n"
+            ),
+        )
+        .expect("应该可写入首个 Generic 输入");
+        fs::write(
+            source_root.join("b.jsonl"),
+            concat!(
+                r#"{"id":"group-b","kind":"dialogue","units":["#,
+                r#"{"id":"unit-b","text":"丙触发缺组丁"}]}"#,
+                "\n"
+            ),
+        )
+        .expect("应该可写入第二个 Generic 输入");
+        let (store, _) = GenericProjectStore::initialize(GenericInitRequest {
+            project_name: "placeholder-locator".parse().expect("项目名应该合法"),
+            workspace_root: temporary.path().join("project"),
+            source_root: Some(source_root),
+            source_language: Some(LanguageId::parse("ja").expect("源语言应该合法")),
+            target_language: Some(LanguageId::parse("zh-Hans").expect("目标语言应该合法")),
+        })
+        .expect("Generic 项目应该可初始化");
+        store.extract().expect("Generic 输入应该可提取");
+        let snapshot = store.load_snapshot().expect("应该可读取 Generic 快照");
+        let rules = GenericPlaceholderService::default()
+            .compile(vec![GenericPlaceholderRuleDefinition::new(
+                Some(vec!["dialogue".to_owned()]),
+                r"(?:(?<text>保留)|触发缺组)",
+            )])
+            .expect("Placeholder 规则应该可编译");
+        let external_rules = temporary.path().join("rules/placeholders.toml");
+        let language_module: Arc<dyn LanguageModule> = Arc::new(JapaneseLanguageModule::new(
+            JapaneseResidualPolicy::new(NonZeroUsize::MIN, Vec::new())
+                .expect("日文残留策略应该合法"),
+            None,
+        ));
+
+        for expected_rule_source in [
+            GenericPlaceholderRuleSource::ExternalFile(external_rules),
+            GenericPlaceholderRuleSource::ProjectSnapshot,
+        ] {
+            let error = match prepare_generic_translation(
+                &snapshot,
+                Arc::new(CompiledTerminology::empty()),
+                &rules,
+                &expected_rule_source,
+                Arc::clone(&language_module),
+                AutomaticStateResources {
+                    prompt: fingerprint(91),
+                    client_semantics: fingerprint(92),
+                    language_module: fingerprint(93),
+                    terminology_hits: empty_terminology_fingerprint(),
+                },
+                NonZeroUsize::new(10_000).expect("常量应该非零"),
+                &CooperativeCancellation::default(),
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("最早的缺少 text 捕获应该阻止规划"),
+            };
+
+            let report = generic_placeholder_protection_report(&error)
+                .expect("Placeholder 叶子失败必须直接投影为结构化报告");
+            let wire = serde_json::to_value(&report).expect("诊断报告必须可序列化");
+            assert_eq!(
+                wire["primary"]["code"],
+                "translation.placeholder.missing_text_capture"
+            );
+            assert_eq!(wire["primary"]["stage"], "translate");
+            assert_eq!(wire["primary"]["resolution"], "fix_placeholder_rules");
+            assert_eq!(wire["effect"], "unchanged");
+            assert_eq!(
+                wire["primary"]["issue"]["details"]["unit"]["relative_path"],
+                "a.jsonl"
+            );
+            assert_eq!(
+                wire["primary"]["issue"]["details"]["unit"]["group_id"],
+                "group-a"
+            );
+            assert_eq!(
+                wire["primary"]["issue"]["details"]["unit"]["unit_id"],
+                "unit-a"
+            );
+            assert_eq!(
+                wire["primary"]["issue"]["details"]["unit"]["role"],
+                "dialogue"
+            );
+            assert_eq!(
+                wire["primary"]["issue"]["details"]["problem"]["rule_number"],
+                1
+            );
+            assert_eq!(
+                wire["primary"]["issue"]["details"]["problem"]["match_range"],
+                serde_json::json!({
+                    "start": "甲".len(),
+                    "end": "甲触发缺组".len(),
+                })
+            );
+
+            match error {
+                GenericPreparationError::PlaceholderProtection {
+                    rule_source,
+                    locator,
+                    source:
+                        PlaceholderProtectionError::MissingTextCapture {
+                            rule_number,
+                            whole_match_start_byte,
+                            whole_match_end_byte,
+                        },
+                } => {
+                    assert_eq!(rule_source, expected_rule_source);
+                    assert_eq!(locator.relative_path, Path::new("a.jsonl"));
+                    assert_eq!(locator.group_id, "group-a");
+                    assert_eq!(locator.unit_id, "unit-a");
+                    assert_eq!(locator.role, "dialogue");
+                    assert_eq!(rule_number, 1);
+                    assert_eq!(whole_match_start_byte, "甲".len());
+                    assert_eq!(whole_match_end_byte, "甲触发缺组".len());
+                }
+                other => panic!("应返回完整 Generic Placeholder 定位，实际为 {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn cancelled_cpu_schedule_becomes_interrupted() {
         let source: CpuTaskExecutionError<CpuExecutorUnavailable> =
             CpuTaskExecutionError::Cancelled;
-        let error = generic_cpu_execution_failure("调度 Generic 翻译计划", source);
+        let error = generic_cpu_execution_failure(source);
         let report =
             GenericCommandRunReport::from_driven(Driven::Finished(Err(error)), Vec::new(), None);
 
@@ -6187,16 +7325,13 @@ mod tests {
             },
         ));
         assert_interrupted(generic_read_file_failure(
-            "读取 Lua 脚本",
             ReadFileError::Io {
                 path: PathBuf::from("script.lua"),
                 source: cancelled_fs(),
             },
-            DiagnosticStage::CommandPreparation,
-            DiagnosticAction::FixInput,
+            FileSystemDiagnosticStage::CommandPreparation,
         ));
         assert_interrupted(generic_prompt_resource_failure(
-            "读取翻译 system Prompt",
             PromptResourceLoadError::Read(ReadFileError::Io {
                 path: PathBuf::from("system.md"),
                 source: SystemFileSystemError::Windows(WindowsFsError::LockCancelled {
@@ -6227,37 +7362,39 @@ mod tests {
             TranslationPlanningResourceReadingError<SystemFileSystemError, CpuExecutorUnavailable>;
 
         let failures = [
-            ResourceError::InvalidTerminology {
-                path: Some(PathBuf::from("terms.toml")),
-                source: TerminologyDefinitionError::StartWorker {
-                    operation: "att-term-matcher",
-                    source: io::Error::from_raw_os_error(8),
+            (
+                ResourceError::InvalidTerminology {
+                    path: Some(PathBuf::from("terms.toml")),
+                    source: TerminologyDefinitionError::StartWorker {
+                        operation: "att-term-matcher",
+                        source: io::Error::from_raw_os_error(8),
+                    },
                 },
-            },
-            ResourceError::InvalidPlaceholderRules {
-                path: Some(PathBuf::from("placeholders.toml")),
-                source: PlaceholderDefinitionError::StartWorker {
-                    operation: "att-placeholder-toml",
-                    source: io::Error::from_raw_os_error(8),
+                "translation.terminology.worker_start",
+            ),
+            (
+                ResourceError::InvalidPlaceholderRules {
+                    path: Some(PathBuf::from("placeholders.toml")),
+                    source: PlaceholderDefinitionError::StartWorker {
+                        operation: "att-placeholder-toml",
+                        source: io::Error::from_raw_os_error(8),
+                    },
                 },
-            },
+                "translation.placeholder_definition.worker_start",
+            ),
         ];
 
-        for source in failures {
-            let GenericCommandError::Operation { diagnostic, .. } =
+        for (source, expected_code) in failures {
+            let GenericCommandError::Operation { failure } =
                 generic_translation_resource_failure(source)
             else {
                 panic!("worker 启动失败必须保留为普通失败");
             };
-            assert_eq!(diagnostic.code, DiagnosticCode::InternalOperation);
-            assert!(matches!(
-                diagnostic.reason,
-                DiagnosticReason::Io {
-                    raw_os_code: Some(8),
-                    ..
-                }
-            ));
-            assert_eq!(diagnostic.action, DiagnosticAction::ReportBug);
+            let diagnostic = failure.report();
+            assert_eq!(diagnostic.effect(), StateEffect::Unchanged);
+            assert_eq!(diagnostic.primary().code(), expected_code);
+            let wire = serde_json::to_string(diagnostic).expect("worker 诊断必须可序列化");
+            assert!(wire.contains("\"raw_os_code\":8"));
         }
     }
 
@@ -6555,24 +7692,22 @@ mod tests {
     }
 
     #[test]
-    fn directory_prepare_preserves_recovery_and_unknown_impacts() {
-        for (source, expected_impact, expected_outcome) in [
+    fn directory_prepare_preserves_recovery_and_unknown_effects() {
+        for (source, expected_effect) in [
             (
                 SystemFileSystemError::JournalCorrupt {
                     path: PathBuf::from(".directory-publish-test.journal"),
-                    reason: "invalid journal".to_owned(),
+                    violation: crate::diagnostic::FileSystemJournalViolation::NotRegularFile,
                 },
-                DiagnosticImpact::RecoveryRequired,
-                ProjectLogRunOutcome::RecoveryRequired,
+                StateEffect::RecoveryRequired,
             ),
             (
                 SystemFileSystemError::OutcomeUnknown {
                     target_root: PathBuf::from("write_back"),
                     artifacts: vec![PathBuf::from(".directory-publish-test.journal")],
-                    reason: "unknown exchange state".to_owned(),
+                    violation: crate::diagnostic::FileSystemRecoveryViolation::ObservationFailed,
                 },
-                DiagnosticImpact::OutcomeUnknown,
-                ProjectLogRunOutcome::OutcomeUnknown,
+                StateEffect::OutcomeUnknown,
             ),
         ] {
             let error = generic_prepare_error(
@@ -6583,16 +7718,9 @@ mod tests {
                     cleanup_failure: None,
                 },
             );
-            assert_eq!(error.safe_diagnostic().impact, expected_impact);
-            let mut diagnostics = vec![error.safe_diagnostic()];
-            diagnostics.extend(error.related_diagnostics());
             assert_eq!(
-                generic_project_log_outcome(
-                    &GenericCommandRunResult::Failed(error),
-                    &[],
-                    &diagnostics,
-                ),
-                expected_outcome
+                generic_command_error_report(&error).effect(),
+                expected_effect
             );
         }
     }
@@ -6606,51 +7734,73 @@ mod tests {
                 Box::new(SystemFileSystemError::Closed),
             )),
         };
-        let (diagnostic, related_diagnostics) = generic_publish_diagnostics(&source);
-        assert_eq!(diagnostic.impact, DiagnosticImpact::Unchanged);
-        assert_eq!(related_diagnostics.len(), 1);
+        let report = source.diagnostic_report();
+        assert_eq!(report.effect(), StateEffect::RecoveryRequired);
+        assert_eq!(report.related().len(), 1);
         assert_eq!(
-            related_diagnostics[0].impact,
-            DiagnosticImpact::RecoveryRequired
+            report.related()[0].relation(),
+            RelatedFailureRelation::Cleanup
+        );
+        assert_eq!(
+            report.related()[0].report().effect(),
+            StateEffect::RecoveryRequired
         );
 
-        let error = GenericCommandError::diagnosed_with_related(
-            "发布 Generic 写回目录",
-            source,
-            diagnostic,
-            related_diagnostics,
-        );
-        let mut diagnostics = vec![error.safe_diagnostic()];
-        diagnostics.extend(error.related_diagnostics());
+        let error = GenericCommandError::reported(source, report);
         assert_eq!(
-            generic_project_log_outcome(&GenericCommandRunResult::Failed(error), &[], &diagnostics,),
-            ProjectLogRunOutcome::RecoveryRequired
+            generic_command_error_report(&error).effect(),
+            StateEffect::RecoveryRequired
         );
+    }
+
+    #[test]
+    fn directory_request_failure_keeps_output_root_and_invalid_path() {
+        let output_root = PathBuf::from("project/write_back");
+        let invalid_path = PathBuf::from("../outside");
+        let error = generic_publication_request_failure(
+            &output_root,
+            DirectoryStageRequestError::InvalidRelativePath {
+                path: invalid_path.clone(),
+            },
+        );
+        let report = generic_command_error_report(&error);
+
+        assert_eq!(report.effect(), StateEffect::Unchanged);
+        assert_eq!(
+            report.primary().code(),
+            "publication.request.invalid_relative_path"
+        );
+        let wire = serde_json::to_string(&report).expect("发布请求诊断必须可序列化");
+        assert!(wire.contains(&output_root.to_string_lossy().to_string()));
+        assert!(wire.contains(&invalid_path.to_string_lossy().to_string()));
     }
 
     #[test]
     fn cancelled_scratch_cleanup_failure_keeps_primary_and_recovery_path() {
         let scratch_root = PathBuf::from("project/.generic-write-back-test");
-        let error = generic_scratch_command_error(
-            "建立 Generic 写回暂存来源",
-            GenericScratchError::CleanupAfterFailure {
-                operation: Box::new(GenericScratchError::Cancelled),
-                cleanup: Box::new(GenericScratchError::Io {
-                    operation: "删除暂存来源",
-                    path: scratch_root.clone(),
-                    source: io::Error::from_raw_os_error(5),
-                }),
-            },
-        );
+        let error = generic_scratch_command_error(GenericScratchError::CleanupAfterFailure {
+            operation: Box::new(GenericScratchError::Cancelled),
+            cleanup: Box::new(GenericScratchError::Io {
+                operation: FileSystemOperation::Remove,
+                path: scratch_root.clone(),
+                source: io::Error::from_raw_os_error(5),
+            }),
+        });
 
+        let report = generic_command_error_report(&error);
+        assert_eq!(report.effect(), StateEffect::RecoveryRequired);
+        assert_eq!(report.primary().code(), "runtime.cancelled");
+        assert_eq!(report.related().len(), 1);
         assert_eq!(
-            error.safe_diagnostic().impact,
-            DiagnosticImpact::ProgressPreserved
+            report.related()[0].relation(),
+            RelatedFailureRelation::Discard
         );
-        let related = error.related_diagnostics();
-        assert_eq!(related.len(), 1);
-        assert_eq!(related[0].impact, DiagnosticImpact::RecoveryRequired);
-        assert_eq!(related[0].recovery, vec![RecoveryFact::path(&scratch_root)]);
+        assert_eq!(
+            report.related()[0].report().effect(),
+            StateEffect::RecoveryRequired
+        );
+        let wire = serde_json::to_string(&report).expect("scratch 诊断必须可序列化");
+        assert!(wire.contains(&scratch_root.to_string_lossy().to_string()));
 
         match error {
             GenericCommandError::PublishDiscard { operation, .. } => {
@@ -6664,41 +7814,35 @@ mod tests {
     fn failed_scratch_materialization_cleanup_keeps_primary_and_recovery_path() {
         let scratch_root = PathBuf::from("project/.generic-write-back-test");
         let source_file = scratch_root.join("dialogue.jsonl");
-        let error = generic_scratch_command_error(
-            "建立 Generic 写回暂存来源",
-            GenericScratchError::CleanupAfterFailure {
-                operation: Box::new(GenericScratchError::Io {
-                    operation: "写入暂存 JSONL",
-                    path: source_file,
-                    source: io::Error::from_raw_os_error(5),
-                }),
-                cleanup: Box::new(GenericScratchError::Io {
-                    operation: "删除暂存来源",
-                    path: scratch_root.clone(),
-                    source: io::Error::from_raw_os_error(5),
-                }),
-            },
-        );
+        let error = generic_scratch_command_error(GenericScratchError::CleanupAfterFailure {
+            operation: Box::new(GenericScratchError::Io {
+                operation: FileSystemOperation::Write,
+                path: source_file,
+                source: io::Error::from_raw_os_error(5),
+            }),
+            cleanup: Box::new(GenericScratchError::Io {
+                operation: FileSystemOperation::Remove,
+                path: scratch_root.clone(),
+                source: io::Error::from_raw_os_error(5),
+            }),
+        });
 
-        assert_eq!(error.safe_diagnostic().impact, DiagnosticImpact::Unchanged);
-        let related = error.related_diagnostics();
-        assert_eq!(related.len(), 1);
-        assert_eq!(related[0].impact, DiagnosticImpact::RecoveryRequired);
-        assert_eq!(related[0].code, DiagnosticCode::WriteBackDiscard);
-        assert_eq!(related[0].recovery, vec![RecoveryFact::path(&scratch_root)]);
+        let report = generic_command_error_report(&error);
+        assert_eq!(report.effect(), StateEffect::RecoveryRequired);
+        assert_eq!(report.primary().code(), "filesystem.io");
+        assert_eq!(report.related().len(), 1);
         assert_eq!(
-            related[0].subject,
-            DiagnosticSubject::operation("generic_write_back_candidate_cleanup")
+            report.related()[0].relation(),
+            RelatedFailureRelation::Discard
         );
-        assert!(matches!(
-            &related[0].reason,
-            DiagnosticReason::Io {
-                operation,
-                error_kind: crate::diagnostic::SafeIoKind::PermissionDenied,
-                raw_os_code: Some(5),
-                ..
-            } if operation == "删除暂存来源"
-        ));
+        let related = report.related()[0].report();
+        assert_eq!(related.effect(), StateEffect::RecoveryRequired);
+        assert_eq!(related.primary().code(), "filesystem.io");
+        let wire = serde_json::to_string(&report).expect("scratch 诊断必须可序列化");
+        assert!(wire.contains("\"operation\":\"write\""));
+        assert!(wire.contains("\"operation\":\"remove\""));
+        assert!(wire.contains("\"raw_os_code\":5"));
+        assert!(wire.contains(&scratch_root.to_string_lossy().to_string()));
 
         let primary_source = Error::source(&error).expect("双重失败必须以主业务错误为 source");
         assert!(
@@ -6726,11 +7870,9 @@ mod tests {
             other => panic!("暂存建立与清理双重失败必须保留主错误和恢复路径，实际为 {other}"),
         }
 
-        let mut diagnostics = vec![error.safe_diagnostic()];
-        diagnostics.extend(error.related_diagnostics());
         assert_eq!(
-            generic_project_log_outcome(&GenericCommandRunResult::Failed(error), &[], &diagnostics,),
-            ProjectLogRunOutcome::RecoveryRequired
+            generic_command_error_report(&error).effect(),
+            StateEffect::RecoveryRequired
         );
     }
 
@@ -6746,10 +7888,17 @@ mod tests {
             }),
         );
         let discard = generic_directory_discard_failure(source);
+        let operation_report = DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::generic(GenericIssue::project(
+                GenericDiagnosticStage::WriteBack,
+                GenericProblem::WriteBackSourceChanged,
+            )),
+        );
         let error = GenericCommandError::PublishDiscard {
-            operation: Box::new(GenericCommandError::message(
-                "发布前复查 Generic 输入",
-                "input changed",
+            operation: Box::new(GenericCommandError::reported(
+                io::Error::other("input changed"),
+                operation_report,
             )),
             discard,
         };
@@ -6758,22 +7907,21 @@ mod tests {
             Error::source(&error),
             Some(source) if source.downcast_ref::<GenericCommandError>().is_some()
         ));
-        let related = error.related_diagnostics();
-        assert_eq!(related.len(), 1);
-        assert_eq!(related[0].impact, DiagnosticImpact::RecoveryRequired);
-        let DiagnosticReason::Io {
-            operation,
-            error_kind,
-            raw_os_code,
-            ..
-        } = &related[0].reason
-        else {
-            panic!("目录丢弃必须保留结构化 I/O 诊断")
-        };
-        assert_eq!(operation, "discard_directory_candidate");
-        assert_eq!(*raw_os_code, Some(32));
-        assert_eq!(*error_kind, io::Error::from_raw_os_error(32).kind().into());
-        assert_eq!(related[0].recovery, vec![RecoveryFact::path(&stage_root)]);
+        let report = generic_command_error_report(&error);
+        assert_eq!(report.effect(), StateEffect::RecoveryRequired);
+        assert_eq!(report.related().len(), 1);
+        assert_eq!(
+            report.related()[0].relation(),
+            RelatedFailureRelation::Discard
+        );
+        let related = report.related()[0].report();
+        assert_eq!(related.effect(), StateEffect::RecoveryRequired);
+        assert_eq!(related.primary().code(), "publication.discard_failed");
+        let wire = serde_json::to_string(&report).expect("丢弃诊断必须可序列化");
+        assert!(wire.contains("\"operation\":\"remove\""));
+        assert!(!wire.contains("discard_directory_candidate"));
+        assert!(wire.contains("\"raw_os_code\":32"));
+        assert!(wire.contains(&stage_root.to_string_lossy().to_string()));
 
         let GenericCommandError::PublishDiscard { discard, .. } = &error else {
             unreachable!("上方已建立 PublishDiscard")
@@ -6787,11 +7935,9 @@ mod tests {
         };
         assert_eq!(source.raw_os_error(), Some(32));
 
-        let mut diagnostics = vec![error.safe_diagnostic()];
-        diagnostics.extend(error.related_diagnostics());
         assert_eq!(
-            generic_project_log_outcome(&GenericCommandRunResult::Failed(error), &[], &diagnostics,),
-            ProjectLogRunOutcome::RecoveryRequired
+            generic_command_error_report(&error).effect(),
+            StateEffect::RecoveryRequired
         );
     }
 
@@ -6844,81 +7990,6 @@ mod tests {
             !should_remember_profile_separately(&committed_with_conflicts),
             "成功的译文提交已在同一事务保存 Profile，不应再启动独立写事务"
         );
-    }
-
-    #[test]
-    fn generic_lua_runtime_diagnostic_keeps_transaction_state_and_concrete_cause() {
-        let source = GenericLuaExecutionError::Run(ProjectLuaRunError::RolledBack(
-            ProjectLuaFailure::Script("runtime-detail-sentinel".to_owned()),
-        ));
-        let expected_detail = source.to_string();
-
-        let diagnostic = generic_lua_execution_diagnostic(&source);
-
-        assert_eq!(
-            diagnostic.reason,
-            DiagnosticReason::FailureWithDetail {
-                failure: DiagnosticFailureKind::LuaExecutionFailed,
-                detail: expected_detail,
-            }
-        );
-        assert_eq!(
-            diagnostic.recovery,
-            vec![RecoveryFact::transaction("rolled_back")]
-        );
-    }
-
-    #[test]
-    fn project_lua_worker_start_is_internal_during_preflight_and_execution() {
-        let source = ProjectLuaFailure::Host {
-            domain: "isolated_worker",
-            kind: "worker_spawn",
-            operation: "compile_project_lua",
-            message: "worker-start-detail-sentinel".to_owned(),
-        };
-        let detail = source.to_string();
-
-        for stage in [DiagnosticStage::CommandPreparation, DiagnosticStage::Lua] {
-            let diagnostic = project_lua_failure_diagnostic(&source, stage, &detail);
-
-            assert_eq!(diagnostic.code, DiagnosticCode::InternalOperation);
-            assert_eq!(diagnostic.stage, stage);
-            assert_eq!(
-                diagnostic.subject,
-                DiagnosticSubject::operation("compile_project_lua")
-            );
-            assert_eq!(
-                diagnostic.reason,
-                DiagnosticReason::FailureWithDetail {
-                    failure: DiagnosticFailureKind::WorkerSpawnFailed,
-                    detail: detail.clone(),
-                }
-            );
-            assert_eq!(diagnostic.action, DiagnosticAction::ReportBug);
-        }
-    }
-
-    #[test]
-    fn other_project_lua_host_failures_remain_user_input_failures() {
-        let source = ProjectLuaFailure::Host {
-            domain: "translation",
-            kind: "invalid_translation",
-            operation: "translation.set",
-            message: "host-detail-sentinel".to_owned(),
-        };
-        let detail = source.to_string();
-
-        let diagnostic = project_lua_failure_diagnostic(&source, DiagnosticStage::Lua, &detail);
-
-        assert_eq!(diagnostic.code, DiagnosticCode::LuaExecution);
-        assert_eq!(
-            diagnostic.reason,
-            DiagnosticReason::FailureWithDetail {
-                failure: DiagnosticFailureKind::LuaHostCallFailed,
-                detail,
-            }
-        );
-        assert_eq!(diagnostic.action, DiagnosticAction::FixInput);
     }
 
     #[test]
@@ -7057,6 +8128,7 @@ mod tests {
             &snapshot,
             Arc::clone(&terminology),
             &placeholder_rules,
+            &GenericPlaceholderRuleSource::ProjectSnapshot,
             language_module,
             resources,
             NonZeroUsize::new(10_000).expect("常量应该非零"),
@@ -7184,6 +8256,7 @@ mod tests {
             &snapshot,
             Arc::clone(&terminology),
             &placeholder_rules,
+            &GenericPlaceholderRuleSource::ProjectSnapshot,
             language_module,
             AutomaticStateResources {
                 prompt: fingerprint(21),
@@ -7287,6 +8360,7 @@ mod tests {
             &snapshot,
             Arc::clone(&terminology),
             &placeholder_rules,
+            &GenericPlaceholderRuleSource::ProjectSnapshot,
             language_module,
             AutomaticStateResources {
                 prompt: fingerprint(31),
@@ -7578,6 +8652,8 @@ mod tests {
             candidate,
             CooperativeCancellation::default(),
             GenericWriteBackPublicationGate::default(),
+            None,
+            generic_terminal_occurrence_slot(),
             || {},
         )
         .await;
@@ -7658,6 +8734,8 @@ mod tests {
             candidate,
             CooperativeCancellation::default(),
             GenericWriteBackPublicationGate::default(),
+            None,
+            generic_terminal_occurrence_slot(),
             || {},
         )
         .await;
@@ -7733,6 +8811,7 @@ mod tests {
             &snapshot,
             Arc::clone(&terminology),
             &rules,
+            &GenericPlaceholderRuleSource::ProjectSnapshot,
             Arc::clone(&language_module),
             resources,
             NonZeroUsize::new(10_000).expect("常量应该非零"),
@@ -7775,11 +8854,11 @@ mod tests {
                 problem,
                 crate::generic::ResponseProblem::InvalidDestination {
                     output_id,
-                    key,
+                    destination,
                     ..
-                } if *output_id == task_id(0)
-                    && key.group_id() == "target"
-                    && key.unit_id() == "unit"
+                } if *output_id == 0
+                    && destination.group_id.as_ref().is_some_and(|id| id.to_string() == "target")
+                    && destination.unit_id.as_ref().is_some_and(|id| id.to_string() == "unit")
             )
         }));
 
@@ -7819,6 +8898,7 @@ mod tests {
             &snapshot,
             terminology,
             &rules,
+            &GenericPlaceholderRuleSource::ProjectSnapshot,
             language_module,
             resources,
             NonZeroUsize::new(10_000).expect("常量应该非零"),

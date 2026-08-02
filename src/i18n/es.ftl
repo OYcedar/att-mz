@@ -51,29 +51,7 @@ cli-argument-conflict = { $argument } no puede usarse con los demás argumentos 
 cli-wrong-number-of-values = Se proporcionó un número incorrecto de valores para { $argument }.
 cli-invalid-utf8 = Un argumento de la línea de comandos no es Unicode válido.
 cli-parse-failure = No se pudo analizar la línea de comandos.
-log-label-phase-check-project = comprobación del proyecto
-log-label-phase-scan-source = análisis del origen
-log-label-phase-prepare-candidate = preparación del candidato
-log-label-phase-update-database = actualización de la base de datos
-log-label-phase-publish = publicación
-log-label-phase-builtin = extracción integrada
-log-label-phase-rules = extracción por reglas
-log-label-phase-lua = procesamiento Lua
-log-label-phase-planning = planificación
-log-label-phase-confirmed-tasks = confirmación de tareas
-log-label-phase-no-work = sin trabajo necesario
-log-label-phase-read-assets = lectura de recursos
-log-label-phase-plan-rpg-maker-write-back = planificación de escritura de RPG Maker
-log-label-phase-rewrite-documents = reescritura de documentos
-log-label-phase-validate-candidate = validación del candidato
-log-label-task-complete = completo
-log-label-task-partial = parcial
-log-label-task-unavailable = no disponible
-log-label-task-failed = fallido
-error-state-applied-finalization = El resultado surtió efecto, pero falló la finalización. Revisa el estado del proyecto antes de reintentar.
 error-no-executable-extract-owner = Tras limpiar no queda ningún owner Extract ejecutable, por lo que el plan no se guardó.
-error-plan-save-failed-applied = El resultado surtió efecto, pero el nuevo plan no se guardó. La próxima vez indica explícitamente las opciones deseadas.
-error-plan-save-outcome-unknown = El resultado surtió efecto, pero no se puede confirmar el commit del plan. La próxima vez indica explícitamente las opciones deseadas.
 plan-source-explicit = entrada explícita
 plan-source-project-state = estado del proyecto
 plan-source-product-default = comportamiento del producto
@@ -144,41 +122,71 @@ log-lua-print = Lua: { $message }
 log-lua-summary = Actividad de Lua: { $database_calls } llamadas a la base de datos, { $changed_rows } filas modificadas, { $translation_calls } llamadas de traducción y { $printed_lines } líneas impresas.
 log-plan-resolved = El plan de { $command } procede de { $source }.
 log-phase-started = Fase iniciada: { $phase }.
-log-phase-finished = Fase terminada: { $phase }.
 log-retry-summary = { $count ->
     [one] Se realizó 1 reintento.
    *[other] Se realizaron { $count } reintentos.
 }
-log-no-work = No se necesitó trabajo: { $reason }.
-log-no-work-translation-up-to-date = las traducciones ya coinciden con el origen y el perfil actuales
-log-partial-result = { $count ->
-    [one] 1 resultado parcial requiere atención.
-   *[other] { $count } resultados parciales requieren atención.
-}
 log-translation-task-started = Tarea de traducción { $index }/{ $total } iniciada.
 log-translation-task-finished = Tarea de traducción { $index } terminada con resultado { $outcome }.
-log-translation-task-diagnostic = La tarea de traducción { $index } informó un diagnóstico tras { $attempts } intentos: { $diagnostic }
+log-run-recovery-required = El comando { $command } terminó en un estado que requiere recuperación; siga las ubicaciones indicadas en el diagnóstico.
+log-phase-completed = Fase completada: { $phase }.
+log-phase-stopped = { $outcome ->
+    [failed] La fase falló: { $phase }.
+    [cancelled] Fase cancelada: { $phase }.
+   *[other] Fase detenida: { $phase }.
+}
+log-cancellation-requested = Se solicitó la cancelación tras confirmar { $confirmed } de { $total } elementos.
+log-cancellation-requested-indeterminate = Se solicitó la cancelación tras confirmar { $confirmed } elementos; se desconoce el total.
+log-run-plan-finalized = { $result ->
+    [saved] El plan de ejecución se guardó.
+    [not_saved] El plan de ejecución no se guardó.
+    [saved_finalization_failed] El plan se guardó, pero falló la finalización.
+    [outcome_unknown] Se desconoce el estado final del plan de ejecución.
+   *[other] La finalización del plan se detuvo sin un resultado reconocido.
+}
+log-translation-finished = { $result ->
+    [not_started] La traducción no comenzó.
+    [no_work] La traducción terminó sin trabajo pendiente.
+    [complete] La traducción se completó.
+    [incomplete] La traducción terminó con trabajo incompleto.
+    [failed] La traducción falló.
+    [cancelled] La traducción se canceló.
+   *[other] La traducción se detuvo sin un resultado reconocido.
+}
+log-publication-started = Se inició la publicación en la raíz de salida { $path }.
+log-publication-finished = { $result ->
+    [published] La publicación se completó.
+    [not_published] La publicación no modificó la salida.
+    [recovery_required] La publicación se detuvo y requiere recuperación.
+    [outcome_unknown] Se desconoce el estado final de la publicación.
+   *[other] La publicación se detuvo sin un resultado reconocido.
+}
+log-project-log-degraded = El registro del proyecto se degradó; se registraron { $failure_kinds } categorías de fallo.
+log-task-outcome-value = { $outcome ->
+    [complete] completada
+    [partial] completada parcialmente
+    [unavailable] no disponible
+    [failed] fallida
+    [not_committed_after_earlier_failure] sin commit tras un error anterior
+    [cancelled] cancelada
+   *[other] terminada sin un resultado reconocido
+}
 diagnostic-title = Error [{ $code }]
 diagnostic-stage = Etapa: { $stage }
-diagnostic-subject = Ubicación: { $subject }
-diagnostic-subject-value = { $kind ->
-    [command] comando { $value }
-    [field] campo { $value }
-    [project] proyecto { $value }
-    [profile] perfil { $value }
-    [component] componente { $value }
-   *[other] { $value }
-}
-diagnostic-reason = Motivo: { $reason }
-diagnostic-impact = Impacto: { $impact }
-diagnostic-action = Acción: { $action }
-diagnostic-recovery = Recuperación: { $recovery }
-diagnostic-recovery-value = { $kind ->
-    [component] componente { $value }
-    [transaction] transacción { $value }
-   *[other] { $value }
-}
+diagnostic-location = Ubicación: { $subject }
+diagnostic-explanation = Motivo: { $reason }
+diagnostic-effect = Impacto: { $impact }
+diagnostic-resolution = Acción: { $action }
 diagnostic-related = Error relacionado { $index }:
+diagnostic-relation-value = { $code ->
+    [cleanup] limpieza
+    [rollback] reversión
+    [discard] descarte
+    [finalization] finalización
+    [shutdown] apagado
+    [observability] observabilidad
+   *[other] { $code }
+}
 diagnostic-stage-value = { $code ->
     [process_startup] Inicio del proceso
     [process_output] Salida del proceso
@@ -195,23 +203,27 @@ diagnostic-stage-value = { $code ->
     [publication] Publicación
     [shutdown] Cierre
     [logging] Registro del proyecto
+    [runtime] Tiempo de ejecución
    *[other] __ATT_FALLBACK__
 }
-diagnostic-impact-value = { $code ->
+diagnostic-effect-value = { $code ->
     [unchanged] El estado no cambió
-    [valid_progress_preserved] Se conservó el progreso válido
-    [result_applied_but_run_plan_not_saved] El resultado se aplicó, pero el plan de ejecución no se guardó
-    [state_applied_but_finalization_failed] El estado se aplicó, pero la finalización no terminó
+    [progress_preserved] Se conservó el progreso válido
+    [applied] El estado se aplicó
+    [applied_run_plan_not_saved] El estado se aplicó, pero el plan de ejecución no se guardó
+    [applied_finalization_failed] El estado se aplicó, pero la finalización no terminó
     [recovery_required] Es necesario recuperar antes de confiar en el estado
     [outcome_unknown] Se desconoce el estado final
    *[other] __ATT_FALLBACK__
 }
-diagnostic-action-value = { $code ->
+diagnostic-resolution-value = { $code ->
     [fix_configuration] Corrige el campo de configuración indicado y vuelve a intentarlo
     [fix_input] Corrige la entrada indicada y vuelve a intentarlo
+    [fix_placeholder_rules] Corrige la regla Placeholder indicada y vuelve a intentarlo
+    [adjust_manual_layout] Ajusta manualmente los saltos de línea y el diseño en las ubicaciones indicadas según el ancho de pantalla señalado
     [check_path_and_permissions] Comprueba la ruta, el estado del sistema de archivos y los permisos
     [check_project_state] Revisa y corrige el estado del proyecto y vuelve a intentarlo
-    [retry_after_resolving_contention] Espera a que termine la operación en conflicto y vuelve a intentarlo
+    [resolve_contention] Espera a que termine la operación en conflicto y vuelve a intentarlo
     [check_model_service] Comprueba la respuesta del servicio de modelos y los límites de la cuenta
     [preserve_recovery_artifacts] No elimines los artefactos de recuperación indicados; recupera la salida antes de volver a intentarlo
     [retry] Vuelve a intentar la operación
@@ -220,16 +232,14 @@ diagnostic-action-value = { $code ->
 }
 diagnostic-failure-value = { $code ->
     [missing_required_value] Falta un valor obligatorio
-    [extract_plan_required] No hay un plan Extract reutilizable guardado; proporciona --builtin o --rules
     [generic_extract_required] La entrada JSONL ya no coincide con el último Extract; vuelve a ejecutar att generic extract
     [conflicting_values] Los valores proporcionados son incompatibles
     [invalid_syntax] La sintaxis del valor no es válida
     [invalid_encoding] La codificación del texto no es válida
     [invalid_value] El valor incumple el contrato requerido
     [not_found] El objeto requerido no existe
-    [busy] Otra operación está usando el recurso
     [state_mismatch] El estado guardado del proyecto no satisface esta operación
-    [requirement_failed] No se cumple una condición previa obligatoria
+    [unsupported_windows_code_page] La página de códigos de Windows no es UTF-8
     [transaction_rolled_back] La transacción falló y sus cambios se revirtieron
     [transaction_outcome_unknown] La transacción terminó sin confirmar la aplicación ni la reversión
     [finalization_failed] El resultado de la operación existe, pero la finalización falló
@@ -259,81 +269,32 @@ diagnostic-failure-value = { $code ->
     [response_parsing_failed] La respuesta del modelo no es JSON válido
     [invalid_response_contract] La respuesta del modelo no cumple el contrato requerido
     [transport_failed] El transporte HTTP falló antes de recibir una respuesta válida
-    [lua_database_open_failed] El host Lua no pudo abrir la sesión de la base de datos del proyecto
-    [lua_context_creation_failed] El entorno Lua no pudo crear el contexto de VM
     [lua_compilation_failed] No se pudo compilar el programa Lua principal
     [lua_execution_failed] El programa Lua principal falló durante la ejecución
-    [lua_host_call_failed] Falló una llamada a una capacidad del host Lua
-    [lua_finalization_failed] El host Lua no pudo finalizar todos los recursos vinculados
-    [rules_definition_invalid] El programa Rules no cumple el contrato de definición de Rules
-    [rules_document_read_failed] No se pudo leer un documento de origen requerido por Rules
-    [rules_no_non_blank_match] La entrada Rules no produjo ninguna unidad semántica no vacía
-    [rules_invalid_target] La entrada Rules seleccionó un valor que no puede usarse como destino de texto
     [rules_pattern_match_failed] No se pudo evaluar el patrón PCRE2 de Rules
     [rules_zero_width_match] El patrón Rules produjo una coincidencia de ancho cero
     [rules_overlapping_capture] El patrón Rules produjo capturas de texto superpuestas
     [rules_missing_text_capture] La captura de texto con nombre requerida no participó en la coincidencia
     [rules_invalid_capture_range] La coincidencia o captura de Rules está fuera de los límites válidos de caracteres UTF-8
-    [rules_duplicate_target] Dos entradas Rules reclaman el mismo destino físico de texto
-    [rules_invalid_materialization] La receta de proyección Rules no puede reconstruir el valor de origen
-    [rules_snapshot_invalid] Los grupos Rules extraídos no forman una instantánea de recursos válida
-    [rules_snapshot_store_failed] No se pudo guardar la instantánea de extracción Rules validada
-    [write_back_extraction_out_of_date] Los recursos extraídos ya no coinciden con el origen actual del proyecto
-    [write_back_asset_snapshot_invalid] Los recursos RPG Maker guardados no forman una instantánea de reescritura válida
-    [source_document_invalid] Un documento de origen de RPG Maker no cumple el formato requerido
-    [generic_source_document_invalid] Un documento de origen JSONL Generic no cumple el formato requerido
-    [write_back_mutation_invalid] No se puede aplicar una modificación de traducción validada en su ubicación de origen congelada
-    [write_back_output_path_invalid] Un archivo reescrito está fuera del árbol de salida de RPG Maker permitido
-    [write_back_output_path_duplicate] Más de un archivo reescrito apunta a la misma ruta de salida
-    [write_back_candidate_project_mismatch] El candidato de reescritura preparado pertenece a otro proyecto
     [write_back_candidate_invalid] El candidato de reescritura no cumple la estructura de árbol data/js requerida
-    [write_back_not_published] El candidato de reescritura no reemplazó el directorio de salida actual
-    [write_back_published_with_residuals] La salida se publicó, pero no se pudieron eliminar algunos artefactos de recuperación
     [write_back_recovery_required] Hay que recuperar el directorio de salida antes de confiar en su contenido
+    [already_exists] El objeto de destino ya existe
+    [cancelled] La operación se canceló
+    [concurrent_modification] El estado del proyecto cambió de forma simultánea
+    [duplicate_identifier] Hay un identificador duplicado
+    [extraction_out_of_date] La extracción guardada ya no coincide con la fuente actual
+    [invalid_content] El contenido incumple el contrato requerido
+    [manual_layout_required] Se requiere ajustar manualmente los saltos de línea o el diseño
+    [operation_failed] La operación falló
+    [placeholder_projection_failed] La proyección de Placeholder no conservó la estructura requerida
+    [profile_not_found] El Profile de traducción seleccionado no existe
+    [recovery_required] Es necesario recuperar el estado antes de confiar en el resultado
+    [resource_limit] Se alcanzó un límite de recursos necesario
+    [resource_limit_exceeded] La operación superó un límite de recursos del servicio
+    [source_snapshot_mismatch] La fuente ya no coincide con la instantánea guardada
+    [unavailable] El trabajo solicitado no está disponible temporalmente
     [internal_invariant] Se incumplió un invariante interno; se trata de un defecto de ATT
    *[other] __ATT_FALLBACK__
-}
-diagnostic-io-kind-value = { $code ->
-    [not_found] No encontrado
-    [permission_denied] Permiso denegado
-    [connection_refused] Conexión rechazada
-    [connection_reset] Conexión restablecida
-    [host_unreachable] Host inaccesible
-    [network_unreachable] Red inaccesible
-    [connection_aborted] Conexión interrumpida
-    [not_connected] Sin conexión
-    [address_in_use] Dirección ya en uso
-    [address_not_available] Dirección no disponible
-    [network_down] Red fuera de servicio
-    [broken_pipe] Canalización rota
-    [already_exists] Ya existe
-    [would_block] La operación se bloquearía
-    [not_a_directory] No es un directorio
-    [is_a_directory] Es un directorio
-    [directory_not_empty] El directorio no está vacío
-    [read_only_filesystem] Sistema de archivos de solo lectura
-    [stale_network_file_handle] Identificador de archivo de red obsoleto
-    [invalid_input] Entrada de operación no válida
-    [invalid_data] Datos no válidos
-    [timed_out] La operación agotó el tiempo de espera
-    [write_zero] La escritura no progresó
-    [storage_full] El almacenamiento está lleno
-    [not_seekable] No se puede desplazar por el objeto
-    [quota_exceeded] Cuota de almacenamiento superada
-    [file_too_large] El archivo es demasiado grande para el sistema subyacente
-    [resource_busy] Recurso ocupado
-    [executable_file_busy] Archivo ejecutable ocupado
-    [deadlock] La operación provocaría un interbloqueo
-    [crosses_devices] La operación cruza dispositivos del sistema de archivos
-    [too_many_links] Demasiados enlaces del sistema de archivos
-    [invalid_filename] Nombre de archivo no válido
-    [argument_list_too_long] La lista de argumentos del sistema operativo es demasiado larga
-    [interrupted] Operación interrumpida
-    [unsupported] Operación no compatible
-    [unexpected_eof] Fin de archivo inesperado
-    [out_of_memory] El sistema operativo no pudo asignar memoria
-    [other] Otro error del sistema operativo
-   *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
     [language_policy_term_blank] El término de política lingüística no puede estar vacío
@@ -376,47 +337,6 @@ diagnostic-configuration-rule-value = { $code ->
     [referenced_client_not_found] El cliente LLM indicado no existe
    *[other] __ATT_FALLBACK__
 }
-diagnostic-io-reason = Operación { $operation }: { $kind }
-diagnostic-io-reason-with-os-code = Operación { $operation }: { $kind } (SO { $os_code })
-diagnostic-io-reason-with-system-message = Operación { $operation }: { $kind }: { $system_message }
-diagnostic-io-reason-with-os-code-and-system-message = Operación { $operation }: { $kind } (SO { $os_code }): { $system_message }
-diagnostic-failure-with-detail = { $failure }: { $detail }
-diagnostic-invalid-utf8 = UTF-8 no válido en el byte { $valid_up_to }, longitud no válida de { $error_len } bytes
-diagnostic-incomplete-utf8 = Secuencia UTF-8 incompleta después del byte { $valid_up_to }
-diagnostic-toml-failure-value = { $code ->
-    [syntax] La sintaxis TOML no es válida
-    [missing_field] Falta un campo de configuración obligatorio
-    [unknown_field] La configuración contiene un campo desconocido
-    [duplicate_field] El campo de configuración se declaró más de una vez
-    [type_mismatch] Se esperaba { $expected }
-    [invalid_value] El valor de configuración incumple el contrato del campo
-   *[other] __ATT_FALLBACK__
-}
-diagnostic-toml-expected-kind-value = { $code ->
-    [string] una cadena
-    [integer] un entero
-    [boolean] un booleano
-    [string_or_boolean] una cadena o un booleano
-    [string_array] una matriz de cadenas
-    [integer_array] una matriz de enteros
-    [string_pair_array] una matriz de pares de cadenas
-    [table] una tabla
-    [table_array] una matriz de tablas
-   *[other] __ATT_FALLBACK__
-}
-diagnostic-invalid-toml = TOML no válido ({ $resource }): { $failure }
-diagnostic-invalid-toml-at = TOML no válido en la línea { $line }, columna { $column } ({ $resource }): { $failure }
-diagnostic-http-no-details = La solicitud al servicio de modelos falló sin detalles públicos del estado HTTP
-diagnostic-http-status = Estado HTTP { $status }
-diagnostic-http-retry-after = Retry-After de { $seconds } segundos
-diagnostic-http-provider-code = Código de error del proveedor { $code }
-diagnostic-http-provider-type = Tipo de error del proveedor { $kind }
-diagnostic-http-provider-message = Mensaje de error del proveedor { $message }
-diagnostic-http-fact-separator = ;{ " " }
-diagnostic-sqlite = Código de error principal de SQLite { $primary_code }, código ampliado { $extended_code }
-diagnostic-windows-status = La operación de Windows { $operation } falló con NTSTATUS { $status }
-diagnostic-resource = { $resource }: valor real { $actual }
-diagnostic-resource-with-maximum = { $resource }: valor real { $actual }, máximo { $maximum }
 task-record-title = Tarea de traducción { $ordinal } · { $state }
 task-record-state-label = { $state ->
     [complete] Completada
@@ -475,45 +395,6 @@ task-record-final-status = Estado: { $state ->
 }
 task-record-accepted-written = Aceptadas: { $accepted } entradas, escritas en { $written } ubicaciones reales
 task-record-accepted-outcome-unknown = Validadas: { $accepted } entradas; no se puede confirmar el resultado del commit de la base de datos
-task-record-rejected-heading = No aceptadas:
-task-record-rejected-item = { $id }: { $reason }
-task-record-protocol-diagnostic = Diagnóstico de protocolo: { $diagnostic }
-task-record-unavailable-reason = Motivo de indisponibilidad: { $reason }
 task-record-task-diagnostic = Diagnóstico de tarea: `{ $code }`; motivo { $reason }
-task-record-rejection-reason = { $code ->
-    [missing] Falta la salida del modelo
-    [duplicate] Salida del modelo duplicada
-    [invalid_shape] { $detail }
-    [invalid_shape_array] La traducción debe ser una matriz de cadenas
-    [invalid_shape_item] El elemento { $line } de la matriz de traducción debe ser una cadena
-    [line_count_mismatch] El número de líneas no coincide (esperado { $expected }, real { $actual })
-    [invalid_line_text] La línea { $line } contiene caracteres de control no válidos
-    [blank_line_mismatch] El estado en blanco no coincide en la línea { $line } (esperado: { $expected_blank ->
-        [blank] en blanco
-       *[other] no en blanco
-    })
-    [blank_translation] La traducción está en blanco
-    [no_natural_language_text] La traducción no contiene texto en lenguaje natural
-    [contains_byte_order_mark] La traducción contiene un BOM
-    [placeholder_mismatch] Marcador de posición no coincidente: { $detail }
-    [unexpected_placeholder] Marcador de posición inesperado: { $detail }
-    [placeholder_normalization_ambiguous] Normalización ambigua del marcador: { $detail }
-    [source_residual] Se detectó texto residual del idioma de origen: { $detail }
-   *[other] { $detail }
-}
-task-record-protocol-detail = { $code ->
-    [non_stop_finish] finish reason no es stop: { $detail }
-    [invalid_response] { $detail }
-    [invalid_id] El elemento { $index } del modelo tiene un ID no válido
-    [unknown_id] El elemento { $index } del modelo devolvió el ID desconocido { $detail }
-   *[other] { $detail }
-}
-task-record-unavailable-detail = { $code ->
-    [model_response_unusable] No se pudo analizar la respuesta del modelo
-    [all_outputs_rejected] Todas las salidas del modelo fueron rechazadas
-    [recoverable_request_exhausted] Se agotó el presupuesto de reintentos recuperables
-    [retry_after_exceeds_maximum] Retry-After supera la espera máxima configurada
-   *[other] { $code }
-}
 task-record-duration-seconds = { $value } segundos
 task-record-duration-milliseconds = { $value } ms

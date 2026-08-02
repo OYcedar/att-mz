@@ -55,7 +55,7 @@ Retryable 包含 DNS/连接/发送/读取/完整请求超时或中断，以及 H
 502、503、504。`Retry-After` 支持秒数和 HTTP-date，并受 Client `max_retry_after_ms`
 约束。Translate 按 Client `retry_delays_ms` 执行有限重试；本地等待不消耗重试次数。
 运行根把 HTTP 状态、供应商稳定 code/type、标准 `error.message`、`Retry-After` 和
-结构化原因交给调用方，让多次逻辑 attempt 能汇总到同一条任务记录。三个供应商字段
+类型化 `HttpIssue` 交给调用方，让多次逻辑 attempt 能汇总到同一条任务记录。三个供应商字段
 彼此独立：其中一个缺失或类型错误，不会抹掉另外两个合法字符串。只读取顶层
 `error` 对象，不猜测顶层 `message`、`detail`、`error_description` 或纯文本正文。
 原始 Header 和任意非 200 wire body 留在运行根内部。
@@ -63,6 +63,13 @@ Retryable 包含 DNS/连接/发送/读取/完整请求超时或中断，以及 H
 Fatal 包含请求构造失败、TLS/证书问题、其他 HTTP 状态，以及不满足成功信封的 200
 响应。安全诊断会说明 HTTP 状态、`Retry-After`、供应商 code/type，以及标准信封中
 经过闭集替换和单行清理的 `error.message`。完整错误正文不落盘。
+
+`HttpIssue` 使用稳定 code 区分 DNS、连接、发送、读取、TLS、timeout、HTTP status、响应
+JSON 和成功信封错误。transport 保存经过清理的 Endpoint 对象、发生阶段、transport kind、
+可用的 I/O kind 与 raw OS code；status 还保存非成功响应正文读取失败的独立阶段和传输
+类别。Endpoint 只公开 scheme、host 和可选 port，不记录 path、query 或凭据。JSON 失败
+保存类别、行和列；成功信封失败保存封闭 violation。诊断 code、stage 和 resolution 由
+具体 issue 唯一推导，不从后端错误正文解析。
 
 ## 5. 生命周期
 
@@ -77,7 +84,7 @@ Thinking、Assistant、Provider 正文和普通用户内容都按普通内容处
 任何模块、日志、诊断、文档、测试或 Skill 中都保持原样，不增不减，也不另行复述。
 
 运行根的 Debug、CLI 和普通 JSONL 用稳定摘要说话：Client ID、阶段、Endpoint
-对象、HTTP 状态、超时种类、状态影响和经过处理的标准供应商错误字段都可以出现；
+对象、HTTP 状态、超时种类、`DiagnosticReport.effect` 和经过处理的标准供应商错误字段都可以出现；
 闭集值与完整请求、原始响应、Header 不出现。`error.message` 先精确替换当前 API key，
 再删除终端控制和双向控制字符并收敛为单行；没有可见内容时省略。这是运行根职责、
 稳定 schema、控制字符和输出体积的边界，与敏感性分类无关。

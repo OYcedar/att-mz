@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, HashSet};
-use std::ffi::{CString, c_char, c_void};
+use std::ffi::{CString, c_char, c_int, c_void};
 use std::num::NonZeroU32;
 use std::ptr;
 use std::rc::Rc;
@@ -18,9 +18,10 @@ use rusqlite::{Connection, params_from_iter};
 
 use super::{
     PROJECT_LUA_SOURCE_CHUNK_BYTES, ProjectLuaCallError, ProjectLuaCancellation,
-    ProjectLuaEngineAdapter, ProjectLuaFailure, ProjectLuaPrintSink, ProjectLuaProgram,
-    ProjectLuaRunRequest, ProjectLuaValue,
+    ProjectLuaCompilationFailure, ProjectLuaEngineAdapter, ProjectLuaFailure, ProjectLuaPrintSink,
+    ProjectLuaProgram, ProjectLuaRunRequest, ProjectLuaScriptFailure, ProjectLuaValue,
 };
+use crate::diagnostic::{LuaCompilerCategory, LuaOperation};
 
 pub(super) struct PreparedProjectLua {
     pub(super) lua: Lua,
@@ -28,6 +29,7 @@ pub(super) struct PreparedProjectLua {
     pub(super) connection: Rc<RefCell<Connection>>,
     pub(super) metrics: Arc<BindingMetrics>,
     pub(super) transaction_guard: Rc<BindingTransactionGuard>,
+    pub(super) script_identity: String,
 }
 
 #[derive(Debug, Default)]
@@ -106,7 +108,7 @@ impl BindingTransactionGuard {
     fn call<T>(
         &self,
         connection: &Connection,
-        operation: &'static str,
+        operation: LuaOperation,
         call: impl FnOnce(&Connection) -> Result<T, LuaHostCallError>,
     ) -> Result<T, LuaHostCallError> {
         if self.lost.get() || connection.is_autocommit() {
@@ -143,8 +145,9 @@ pub(super) fn prepare_lua(
     let lua = new_restricted_lua()?;
 
     let cancellation = request.cancellation.clone();
-    install_cancellation_guards(&lua, cancellation.clone())
-        .map_err(|error| ProjectLuaFailure::Context(error.to_string()))?;
+    install_cancellation_guards(&lua, cancellation.clone()).map_err(|_| {
+        ProjectLuaFailure::Context(super::ProjectLuaContextFailure::CancellationGuard)
+    })?;
     let hook_cancellation = cancellation.clone();
     lua.set_global_hook(
         HookTriggers::new().every_nth_instruction(cancel_check_instruction_interval.get()),
@@ -168,7 +171,7 @@ pub(super) fn prepare_lua(
             }
         },
     )
-    .map_err(|error| ProjectLuaFailure::Context(error.to_string()))?;
+    .map_err(|_| ProjectLuaFailure::Context(super::ProjectLuaContextFailure::InstructionHook))?;
 
     let function = compile_program(&lua, &request.program, &request.cancellation)?;
 
@@ -182,19 +185,19 @@ pub(super) fn prepare_lua(
         Arc::clone(&metrics),
         Rc::clone(&transaction_guard),
     )
-    .map_err(|error| ProjectLuaFailure::Context(error.to_string()))?;
+    .map_err(|_| ProjectLuaFailure::Context(super::ProjectLuaContextFailure::ContextTable))?;
     lua.globals()
         .set("ctx", context)
-        .map_err(|error| ProjectLuaFailure::Context(error.to_string()))?;
+        .map_err(|_| ProjectLuaFailure::Context(super::ProjectLuaContextFailure::PublishContext))?;
     install_arguments(&lua, request)
-        .map_err(|error| ProjectLuaFailure::Context(error.to_string()))?;
+        .map_err(|_| ProjectLuaFailure::Context(super::ProjectLuaContextFailure::Arguments))?;
     install_print(
         &lua,
         Arc::clone(&request.print_sink),
         Arc::clone(&metrics),
         cancellation,
     )
-    .map_err(|error| ProjectLuaFailure::Context(error.to_string()))?;
+    .map_err(|_| ProjectLuaFailure::Context(super::ProjectLuaContextFailure::PrintBinding))?;
 
     Ok(PreparedProjectLua {
         lua,
@@ -202,6 +205,7 @@ pub(super) fn prepare_lua(
         connection,
         metrics,
         transaction_guard,
+        script_identity: request.program.identity().to_owned(),
     })
 }
 
@@ -217,8 +221,9 @@ pub(super) fn validate_program(
 fn new_restricted_lua() -> Result<Lua, ProjectLuaFailure> {
     let libraries =
         StdLib::COROUTINE | StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8;
-    let lua = Lua::new_with(libraries, LuaOptions::default())
-        .map_err(|error| ProjectLuaFailure::Context(error.to_string()))?;
+    let lua = Lua::new_with(libraries, LuaOptions::default()).map_err(|_| {
+        ProjectLuaFailure::Context(super::ProjectLuaContextFailure::RuntimeCreation)
+    })?;
     remove_external_capabilities(&lua)?;
     Ok(lua)
 }
@@ -350,9 +355,11 @@ fn compile_program(
     program: &ProjectLuaProgram,
     cancellation: &ProjectLuaCancellation,
 ) -> Result<Function, ProjectLuaFailure> {
-    validate_lua_source_utf8(program.source(), cancellation)?;
-    let name = CString::new(program.identity())
-        .map_err(|error| ProjectLuaFailure::Compile(format!("invalid name: {error}")))?;
+    validate_lua_source_utf8(program, cancellation)?;
+    let name = CString::new(program.identity()).map_err(|_| ProjectLuaFailure::Compile {
+        script_identity: program.identity().to_owned(),
+        failure: ProjectLuaCompilationFailure::InvalidIdentity,
+    })?;
     let mut reader = CancellableLuaSourceReader {
         source: program.source(),
         cancellation: cancellation.clone(),
@@ -360,6 +367,7 @@ fn compile_program(
         cancelled: false,
     };
     let reader_data = (&mut reader as *mut CancellableLuaSourceReader).cast::<c_void>();
+    let load_status = Cell::new(mlua::ffi::LUA_OK);
     // SAFETY: 闭包成功时只在 Lua 栈留下一个值；lua_load 不持有 reader 数据，并且只会
     // 在本次同步调用返回前调用 read_lua_source_chunk。
     let result: mlua::Result<Function> = unsafe {
@@ -371,6 +379,7 @@ fn compile_program(
                 name.as_ptr(),
                 c"t".as_ptr(),
             );
+            load_status.set(status);
             if status != mlua::ffi::LUA_OK {
                 mlua::ffi::lua_error(state);
             }
@@ -379,13 +388,20 @@ fn compile_program(
     if reader.cancelled || cancellation.is_cancelled() {
         return Err(ProjectLuaFailure::Cancelled);
     }
-    result.map_err(|error| ProjectLuaFailure::Compile(error.to_string()))
+    result.map_err(|error| ProjectLuaFailure::Compile {
+        script_identity: program.identity().to_owned(),
+        failure: ProjectLuaCompilationFailure::Backend {
+            category: classify_lua_compilation_error(load_status.get(), &error),
+            line: lua_compilation_line(load_status.get(), &error),
+        },
+    })
 }
 
 fn validate_lua_source_utf8(
-    source: &[u8],
+    program: &ProjectLuaProgram,
     cancellation: &ProjectLuaCancellation,
 ) -> Result<(), ProjectLuaFailure> {
+    let source = program.source();
     if cancellation.is_cancelled() {
         return Err(ProjectLuaFailure::Cancelled);
     }
@@ -404,9 +420,10 @@ fn validate_lua_source_utf8(
                 pending.truncate(pending.len() - valid_up_to);
             }
             Err(_) => {
-                return Err(ProjectLuaFailure::Compile(
-                    "Lua 主程序必须是有效 UTF-8".to_owned(),
-                ));
+                return Err(ProjectLuaFailure::Compile {
+                    script_identity: program.identity().to_owned(),
+                    failure: ProjectLuaCompilationFailure::InvalidUtf8,
+                });
             }
         }
     }
@@ -416,10 +433,69 @@ fn validate_lua_source_utf8(
     if pending.is_empty() {
         Ok(())
     } else {
-        Err(ProjectLuaFailure::Compile(
-            "Lua 主程序必须是有效 UTF-8".to_owned(),
-        ))
+        Err(ProjectLuaFailure::Compile {
+            script_identity: program.identity().to_owned(),
+            failure: ProjectLuaCompilationFailure::InvalidUtf8,
+        })
     }
+}
+
+fn classify_mlua_error(error: &mlua::Error) -> LuaCompilerCategory {
+    match error {
+        mlua::Error::SyntaxError { .. } => LuaCompilerCategory::Syntax,
+        mlua::Error::MemoryError(_) => LuaCompilerCategory::Memory,
+        mlua::Error::SafetyError(_) => LuaCompilerCategory::Safety,
+        mlua::Error::CallbackError { .. } => LuaCompilerCategory::Callback,
+        mlua::Error::ExternalError(_) => LuaCompilerCategory::External,
+        _ => LuaCompilerCategory::Unknown,
+    }
+}
+
+/// 编译类别只来自 `lua_load` 的类型化状态码，不从供应商正文猜测。
+fn classify_lua_compilation_error(load_status: c_int, error: &mlua::Error) -> LuaCompilerCategory {
+    match load_status {
+        mlua::ffi::LUA_ERRSYNTAX => LuaCompilerCategory::Syntax,
+        mlua::ffi::LUA_ERRMEM => LuaCompilerCategory::Memory,
+        _ => classify_mlua_error(error),
+    }
+}
+
+fn lua_compilation_line(load_status: c_int, error: &mlua::Error) -> Option<usize> {
+    if load_status != mlua::ffi::LUA_ERRSYNTAX {
+        return None;
+    }
+    let message = match error {
+        mlua::Error::SyntaxError { message, .. } | mlua::Error::RuntimeError(message) => message,
+        _ => return None,
+    };
+    lua_syntax_message_line(message)
+}
+
+/// Lua 5.4 只在类型化 SyntaxError 的后端 message 字段中提供源码行号。
+/// 已由 `lua_load` 状态确认语法错误后，这里只提取首个 `:<decimal>:` 坐标，
+/// 不使用正文判断类别，也不保留或转发编译器正文。
+fn lua_syntax_message_line(message: &str) -> Option<usize> {
+    let bytes = message.as_bytes();
+    for colon in bytes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, byte)| (*byte == b':').then_some(index))
+    {
+        let start = colon + 1;
+        let digits = bytes[start..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if digits == 0 || bytes.get(start + digits) != Some(&b':') {
+            continue;
+        }
+        if let Ok(line) = message[start..start + digits].parse::<usize>()
+            && line > 0
+        {
+            return Some(line);
+        }
+    }
+    None
 }
 
 fn install_arguments(lua: &Lua, request: &ProjectLuaRunRequest) -> mlua::Result<()> {
@@ -436,9 +512,9 @@ fn remove_external_capabilities(lua: &Lua) -> Result<(), ProjectLuaFailure> {
     for name in [
         "io", "os", "package", "require", "loadfile", "dofile", "debug", "warn",
     ] {
-        globals
-            .raw_set(name, Value::Nil)
-            .map_err(|error| ProjectLuaFailure::Context(error.to_string()))?;
+        globals.raw_set(name, Value::Nil).map_err(|_| {
+            ProjectLuaFailure::Context(super::ProjectLuaContextFailure::RemoveExternalCapability)
+        })?;
     }
     Ok(())
 }
@@ -494,7 +570,7 @@ fn install_print(
         ensure_lua_not_cancelled(&cancellation)?;
         let result = sink
             .print(bytes.as_bytes().as_ref())
-            .map_err(|error| host_error("log", error, "print"));
+            .map_err(|error| host_error("log", error, LuaOperation::ExecuteScript));
         ensure_lua_not_cancelled(&cancellation)?;
         host_result_to_lua(lua, result, |_lua, ()| Ok(Value::Nil))
     })?;
@@ -542,21 +618,25 @@ fn build_database_table(
             query_metrics.record_database_call();
             ensure_lua_not_cancelled(&query_cancellation)?;
             let connection = query_connection.borrow();
-            let result = query_transaction_guard.call(&connection, "db.query", |connection| {
-                parse_sql_call(statement, parameters, &query_cancellation)
-                    .map_err(|error| host_error("binding", error, "db.query"))
-                    .and_then(|(statement, parameters)| {
-                        query_database(connection, &statement, &parameters, &query_cancellation)
-                            .map_err(|error| match error {
-                                DatabaseQueryError::Sqlite(error) => {
-                                    sqlite_host_error("db.query", &error)
-                                }
-                                DatabaseQueryError::Binding(error) => {
-                                    host_error("binding", error, "db.query")
-                                }
-                            })
-                    })
-            });
+            let result = query_transaction_guard.call(
+                &connection,
+                LuaOperation::QueryDatabase,
+                |connection| {
+                    parse_sql_call(statement, parameters, &query_cancellation)
+                        .map_err(|error| host_error("binding", error, LuaOperation::QueryDatabase))
+                        .and_then(|(statement, parameters)| {
+                            query_database(connection, &statement, &parameters, &query_cancellation)
+                                .map_err(|error| match error {
+                                    DatabaseQueryError::Sqlite(error) => {
+                                        sqlite_host_error(LuaOperation::QueryDatabase, error)
+                                    }
+                                    DatabaseQueryError::Binding(error) => {
+                                        host_error("binding", error, LuaOperation::QueryDatabase)
+                                    }
+                                })
+                        })
+                },
+            );
             let output = host_result_to_lua(lua, result, |lua, rows| {
                 rows_to_lua(lua, rows, &query_cancellation)
             });
@@ -574,16 +654,22 @@ fn build_database_table(
             execute_metrics.record_database_call();
             ensure_lua_not_cancelled(&execute_cancellation)?;
             let connection = connection.borrow();
-            let result = execute_transaction_guard.call(&connection, "db.execute", |connection| {
-                parse_sql_call(statement, parameters, &execute_cancellation)
-                    .map_err(|error| host_error("binding", error, "db.execute"))
-                    .and_then(|(statement, parameters)| {
-                        ensure_project_lua_call_running(&execute_cancellation)
-                            .map_err(|error| host_error("binding", error, "db.execute"))?;
-                        execute_database(connection, &statement, &parameters)
-                            .map_err(|error| sqlite_host_error("db.execute", &error))
-                    })
-            });
+            let result = execute_transaction_guard.call(
+                &connection,
+                LuaOperation::QueryDatabase,
+                |connection| {
+                    parse_sql_call(statement, parameters, &execute_cancellation)
+                        .map_err(|error| host_error("binding", error, LuaOperation::QueryDatabase))
+                        .and_then(|(statement, parameters)| {
+                            ensure_project_lua_call_running(&execute_cancellation).map_err(
+                                |error| host_error("binding", error, LuaOperation::QueryDatabase),
+                            )?;
+                            execute_database(connection, &statement, &parameters).map_err(|error| {
+                                sqlite_host_error(LuaOperation::QueryDatabase, error)
+                            })
+                        })
+                },
+            );
             let output = match result {
                 Ok(changed) => {
                     execute_metrics.record_changed_rows(changed);
@@ -608,15 +694,9 @@ fn build_database_table(
         let result = match value {
             Value::String(bytes) => {
                 clone_bytes_with_cancellation(bytes.as_bytes().as_ref(), &blob_cancellation)
-                    .map_err(|error| host_error("binding", error, "db.blob"))
+                    .map_err(|error| host_error("binding", error, LuaOperation::QueryDatabase))
             }
-            other => Err(LuaHostCallError::binding(
-                "db.blob",
-                format!(
-                    "ctx.db.blob 的参数必须是字符串，实际为 {}",
-                    other.type_name()
-                ),
-            )),
+            _ => Err(LuaHostCallError::binding(LuaOperation::QueryDatabase)),
         };
         let output = host_result_to_lua(lua, result, |lua, bytes| {
             lua.create_userdata(LuaBlob {
@@ -674,19 +754,25 @@ fn build_translation_table(
             set_metrics.record_translation_call();
             ensure_lua_not_cancelled(&set_cancellation)?;
             let connection = set_connection.borrow();
-            let result = set_transaction_guard.call(&connection, "translation.set", |connection| {
-                lua_to_project_value(locator, &set_cancellation)
-                    .and_then(|locator| {
-                        lua_to_project_value(translation, &set_cancellation)
-                            .map(|translation| (locator, translation))
-                    })
-                    .map_err(|error| host_error("binding", error, "translation.set"))
-                    .and_then(|(locator, translation)| {
-                        set_adapter
-                            .set_translation(connection, locator, translation)
-                            .map_err(|error| host_error("translation", error, "translation.set"))
-                    })
-            });
+            let result = set_transaction_guard.call(
+                &connection,
+                LuaOperation::SetTranslation,
+                |connection| {
+                    lua_to_project_value(locator, &set_cancellation)
+                        .and_then(|locator| {
+                            lua_to_project_value(translation, &set_cancellation)
+                                .map(|translation| (locator, translation))
+                        })
+                        .map_err(|error| host_error("binding", error, LuaOperation::SetTranslation))
+                        .and_then(|(locator, translation)| {
+                            set_adapter
+                                .set_translation(connection, locator, translation)
+                                .map_err(|error| {
+                                    host_error("translation", error, LuaOperation::SetTranslation)
+                                })
+                        })
+                },
+            );
             let output = match result {
                 Ok(changed) => {
                     set_metrics.record_changed_rows(changed);
@@ -708,18 +794,23 @@ fn build_translation_table(
             clear_metrics.record_translation_call();
             ensure_lua_not_cancelled(&clear_cancellation)?;
             let connection = connection.borrow();
-            let result =
-                clear_transaction_guard.call(&connection, "translation.clear", |connection| {
+            let result = clear_transaction_guard.call(
+                &connection,
+                LuaOperation::ClearTranslation,
+                |connection| {
                     lua_to_project_value(locator, &clear_cancellation)
-                        .map_err(|error| host_error("binding", error, "translation.clear"))
+                        .map_err(|error| {
+                            host_error("binding", error, LuaOperation::ClearTranslation)
+                        })
                         .and_then(|locator| {
                             adapter
                                 .clear_translation(connection, locator)
                                 .map_err(|error| {
-                                    host_error("translation", error, "translation.clear")
+                                    host_error("translation", error, LuaOperation::ClearTranslation)
                                 })
                         })
-                });
+                },
+            );
             let output = match result {
                 Ok(changed) => {
                     clear_metrics.record_changed_rows(changed);
@@ -761,11 +852,11 @@ fn parse_sql_call(
     ensure_project_lua_call_running(cancellation)?;
     let statement = match statement {
         Value::String(statement) => strict_text(&statement, "SQL", cancellation)?,
-        value => {
-            return Err(ProjectLuaCallError::new(
-                "invalid_statement",
-                format!("SQL 必须是字符串，实际为 {}", value.type_name()),
-            ));
+        _ => {
+            return Err(ProjectLuaCallError::violation(
+                crate::diagnostic::LuaValueViolation::UnexpectedType,
+            )
+            .with_field("statement"));
         }
     };
     let parameters = match parameters {
@@ -779,14 +870,11 @@ fn parse_sql_call(
             }
             parameters
         }
-        other => {
-            return Err(ProjectLuaCallError::new(
-                "invalid_parameters",
-                format!(
-                    "SQLite parameters 必须是无洞数组或 nil，实际为 {}",
-                    other.type_name()
-                ),
-            ));
+        _ => {
+            return Err(ProjectLuaCallError::violation(
+                crate::diagnostic::LuaValueViolation::UnexpectedType,
+            )
+            .with_field("parameters"));
         }
     };
     ensure_project_lua_call_running(cancellation)?;
@@ -801,24 +889,22 @@ fn lua_to_sqlite_value(
     let converted = match value {
         Value::Integer(value) => Ok(rusqlite::types::Value::Integer(value)),
         Value::Number(value) if value.is_finite() => Ok(rusqlite::types::Value::Real(value)),
-        Value::Number(_) => Err(ProjectLuaCallError::new(
-            "invalid_real",
-            "SQLite REAL 参数不得为 NaN 或 Inf",
+        Value::Number(_) => Err(ProjectLuaCallError::violation(
+            crate::diagnostic::LuaValueViolation::UnexpectedType,
         )),
         Value::String(value) => {
             strict_text(&value, "SQLite TEXT", cancellation).map(rusqlite::types::Value::Text)
         }
         Value::UserData(value) if value.is::<LuaSqliteNull>() => Ok(rusqlite::types::Value::Null),
         Value::UserData(value) if value.is::<LuaBlob>() => {
-            let value = value
-                .borrow::<LuaBlob>()
-                .map_err(|error| ProjectLuaCallError::new("invalid_blob", error.to_string()))?;
+            let value = value.borrow::<LuaBlob>().map_err(|_| {
+                ProjectLuaCallError::violation(crate::diagnostic::LuaValueViolation::InvalidBlob)
+            })?;
             clone_bytes_with_cancellation(&value.bytes, cancellation)
                 .map(rusqlite::types::Value::Blob)
         }
-        other => Err(ProjectLuaCallError::new(
-            "unsupported_parameter",
-            format!("SQLite 参数不支持 {}", other.type_name()),
+        _ => Err(ProjectLuaCallError::violation(
+            crate::diagnostic::LuaValueViolation::UnexpectedType,
         )),
     };
     ensure_project_lua_call_running(cancellation)?;
@@ -976,22 +1062,25 @@ fn dense_table_values(
     let mut indexed = BTreeMap::new();
     for pair in table.pairs::<Value, Value>() {
         ensure_project_lua_call_running(cancellation)?;
-        let (key, value) =
-            pair.map_err(|error| ProjectLuaCallError::new("invalid_array", error.to_string()))?;
+        let (key, value) = pair.map_err(|_| {
+            ProjectLuaCallError::violation(crate::diagnostic::LuaValueViolation::InvalidArrayIndex)
+        })?;
         let Value::Integer(index) = key else {
-            return Err(ProjectLuaCallError::new(
-                "invalid_array",
-                "数组不得包含非整数键",
+            return Err(ProjectLuaCallError::violation(
+                crate::diagnostic::LuaValueViolation::InvalidArrayIndex,
             ));
         };
         let index = usize::try_from(index)
             .ok()
             .filter(|index| *index > 0)
-            .ok_or_else(|| ProjectLuaCallError::new("invalid_array", "数组下标必须从 1 开始"))?;
+            .ok_or_else(|| {
+                ProjectLuaCallError::violation(
+                    crate::diagnostic::LuaValueViolation::InvalidArrayIndex,
+                )
+            })?;
         if indexed.insert(index, value).is_some() {
-            return Err(ProjectLuaCallError::new(
-                "invalid_array",
-                "数组必须无洞且连续",
+            return Err(ProjectLuaCallError::violation(
+                crate::diagnostic::LuaValueViolation::SparseArray,
             ));
         }
     }
@@ -999,9 +1088,8 @@ fn dense_table_values(
     for (offset, (index, value)) in indexed.into_iter().enumerate() {
         ensure_project_lua_call_running(cancellation)?;
         if index != offset + 1 {
-            return Err(ProjectLuaCallError::new(
-                "invalid_array",
-                "数组必须无洞且连续",
+            return Err(ProjectLuaCallError::violation(
+                crate::diagnostic::LuaValueViolation::SparseArray,
             ));
         }
         values.push(value);
@@ -1052,9 +1140,8 @@ fn lua_to_project_value_with_checkpoint(
                     completed_value = Some(ProjectLuaValue::Real(value));
                 }
                 Value::Number(_) => {
-                    return Err(ProjectLuaCallError::new(
-                        "invalid_real",
-                        "translation 参数不得包含 NaN 或 Inf",
+                    return Err(ProjectLuaCallError::violation(
+                        crate::diagnostic::LuaValueViolation::InvalidTranslation,
                     ));
                 }
                 Value::String(value) => {
@@ -1068,8 +1155,10 @@ fn lua_to_project_value_with_checkpoint(
                     completed_value = Some(ProjectLuaValue::Nil);
                 }
                 Value::UserData(value) if value.is::<LuaBlob>() => {
-                    let value = value.borrow::<LuaBlob>().map_err(|error| {
-                        ProjectLuaCallError::new("invalid_blob", error.to_string())
+                    let value = value.borrow::<LuaBlob>().map_err(|_| {
+                        ProjectLuaCallError::violation(
+                            crate::diagnostic::LuaValueViolation::InvalidBlob,
+                        )
                     })?;
                     completed_value = Some(ProjectLuaValue::Blob(clone_bytes_with_cancellation(
                         &value.bytes,
@@ -1079,9 +1168,8 @@ fn lua_to_project_value_with_checkpoint(
                 Value::Table(table) => {
                     let identity = table.to_pointer();
                     if !active_tables.insert(identity) {
-                        return Err(ProjectLuaCallError::new(
-                            "cyclic_table",
-                            "translation 参数不得包含循环 table",
+                        return Err(ProjectLuaCallError::violation(
+                            crate::diagnostic::LuaValueViolation::CyclicTable,
                         ));
                     }
                     let pairs =
@@ -1094,10 +1182,9 @@ fn lua_to_project_value_with_checkpoint(
                         string_fields: Vec::new(),
                     });
                 }
-                other => {
-                    return Err(ProjectLuaCallError::new(
-                        "unsupported_value",
-                        format!("translation 参数不支持 {}", other.type_name()),
+                _ => {
+                    return Err(ProjectLuaCallError::violation(
+                        crate::diagnostic::LuaValueViolation::UnexpectedType,
                     ));
                 }
             }
@@ -1138,9 +1225,9 @@ fn collect_project_table_pairs(
     let mut pairs = Vec::new();
     for pair in table.pairs::<Value, Value>() {
         project_value_conversion_checkpoint(cancellation, checkpoint)?;
-        pairs.push(
-            pair.map_err(|error| ProjectLuaCallError::new("invalid_table", error.to_string()))?,
-        );
+        pairs.push(pair.map_err(|_| {
+            ProjectLuaCallError::violation(crate::diagnostic::LuaValueViolation::InvalidTranslation)
+        })?);
     }
     project_value_conversion_checkpoint(cancellation, checkpoint)?;
     Ok(pairs)
@@ -1160,12 +1247,13 @@ fn insert_project_table_field(
                 .ok()
                 .filter(|index| *index > 0)
                 .ok_or_else(|| {
-                    ProjectLuaCallError::new("invalid_table", "数组下标必须从 1 开始")
+                    ProjectLuaCallError::violation(
+                        crate::diagnostic::LuaValueViolation::InvalidArrayIndex,
+                    )
                 })?;
             if frame.integer_fields.insert(index, value).is_some() {
-                return Err(ProjectLuaCallError::new(
-                    "duplicate_field",
-                    "translation table 包含重复字段",
+                return Err(ProjectLuaCallError::violation(
+                    crate::diagnostic::LuaValueViolation::InvalidTranslation,
                 ));
             }
         }
@@ -1173,13 +1261,9 @@ fn insert_project_table_field(
             let key = strict_text(&key, "translation 字段名", cancellation)?;
             frame.string_fields.push((key, value));
         }
-        other => {
-            return Err(ProjectLuaCallError::new(
-                "invalid_table",
-                format!(
-                    "translation table 只允许正整数或 UTF-8 字符串键，实际为 {}",
-                    other.type_name()
-                ),
+        _ => {
+            return Err(ProjectLuaCallError::violation(
+                crate::diagnostic::LuaValueViolation::InvalidTable,
             ));
         }
     }
@@ -1193,9 +1277,8 @@ fn finish_project_table(
 ) -> Result<ProjectLuaValue, ProjectLuaCallError> {
     let string_fields = sort_project_object_fields(frame.string_fields, cancellation, checkpoint)?;
     if !frame.integer_fields.is_empty() && !string_fields.is_empty() {
-        return Err(ProjectLuaCallError::new(
-            "mixed_table",
-            "translation table 不能混用数组下标和字段名",
+        return Err(ProjectLuaCallError::violation(
+            crate::diagnostic::LuaValueViolation::InvalidTranslation,
         ));
     }
     if !string_fields.is_empty() || frame.integer_fields.is_empty() {
@@ -1206,9 +1289,8 @@ fn finish_project_table(
     for (offset, (index, value)) in frame.integer_fields.into_iter().enumerate() {
         project_value_conversion_checkpoint(cancellation, checkpoint)?;
         if index != offset + 1 {
-            return Err(ProjectLuaCallError::new(
-                "invalid_array",
-                "translation 数组必须无洞且连续",
+            return Err(ProjectLuaCallError::violation(
+                crate::diagnostic::LuaValueViolation::SparseArray,
             ));
         }
         values.push(value);
@@ -1285,9 +1367,8 @@ fn sort_project_object_fields(
             checkpoint,
         )? == CmpOrdering::Equal
         {
-            return Err(ProjectLuaCallError::new(
-                "duplicate_field",
-                "translation table 包含重复字段",
+            return Err(ProjectLuaCallError::violation(
+                crate::diagnostic::LuaValueViolation::InvalidTranslation,
             ));
         }
     }
@@ -1342,7 +1423,7 @@ fn ensure_project_lua_call_running(
     cancellation: &ProjectLuaCancellation,
 ) -> Result<(), ProjectLuaCallError> {
     if cancellation.is_cancelled() {
-        Err(ProjectLuaCallError::new("cancelled", "ATT 中止了 Lua 脚本"))
+        Err(ProjectLuaCallError::cancelled())
     } else {
         Ok(())
     }
@@ -1411,14 +1492,13 @@ fn clone_utf8_text_with_checkpoint(
 
 fn strict_text(
     value: &mlua::LuaString,
-    role: &str,
+    _role: &str,
     cancellation: &ProjectLuaCancellation,
 ) -> Result<String, ProjectLuaCallError> {
     match clone_utf8_text_with_cancellation(value.as_bytes().as_ref(), cancellation)? {
         Ok(value) => Ok(value),
-        Err(_) => Err(ProjectLuaCallError::new(
-            "invalid_utf8",
-            format!("{role} 必须是 UTF-8 字符串"),
+        Err(_) => Err(ProjectLuaCallError::violation(
+            crate::diagnostic::LuaValueViolation::InvalidUtf8,
         )),
     }
 }
@@ -1492,18 +1572,19 @@ impl UserData for LuaBlob {
 #[derive(Clone, Debug)]
 struct LuaHostCallError {
     domain: &'static str,
-    kind: &'static str,
-    operation: &'static str,
-    message: String,
+    operation: LuaOperation,
+    error: ProjectLuaCallError,
 }
 
 impl LuaHostCallError {
-    fn binding(operation: &'static str, message: impl Into<String>) -> Self {
+    fn binding(operation: LuaOperation) -> Self {
         Self {
             domain: "binding",
-            kind: "invalid_value",
             operation,
-            message: message.into(),
+            error: ProjectLuaCallError::violation(
+                crate::diagnostic::LuaValueViolation::UnexpectedType,
+            )
+            .with_operation(operation),
         }
     }
 }
@@ -1511,14 +1592,16 @@ impl LuaHostCallError {
 impl UserData for LuaHostCallError {
     fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
         fields.add_field_method_get("domain", |_lua, this| Ok(this.domain));
-        fields.add_field_method_get("kind", |_lua, this| Ok(this.kind));
-        fields.add_field_method_get("operation", |_lua, this| Ok(this.operation));
-        fields.add_field_method_get("message", |_lua, this| Ok(this.message.clone()));
+        fields.add_field_method_get("kind", |_lua, this| Ok(this.error.kind()));
+        fields.add_field_method_get("operation", |_lua, this| {
+            Ok(super::lua_host_operation_name(this.operation))
+        });
+        fields.add_field_method_get("message", |_lua, this| Ok(this.error.message().to_owned()));
     }
 
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_meta_method(MetaMethod::ToString, |_lua, this, ()| {
-            Ok(this.message.clone())
+            Ok(this.error.message().to_owned())
         });
     }
 }
@@ -1526,38 +1609,29 @@ impl UserData for LuaHostCallError {
 fn host_error(
     domain: &'static str,
     error: ProjectLuaCallError,
-    operation: &'static str,
+    operation: LuaOperation,
 ) -> LuaHostCallError {
     LuaHostCallError {
         domain,
-        kind: error.kind(),
         operation,
-        message: error.message().to_owned(),
+        error: error.with_operation(operation),
     }
 }
 
-fn transaction_lost_error(operation: &'static str) -> LuaHostCallError {
+fn transaction_lost_error(operation: LuaOperation) -> LuaHostCallError {
     LuaHostCallError {
         domain: "database",
-        kind: "transaction_lost",
         operation,
-        message: "SQL 提前结束了 ATT 外层事务；本次 Lua 的全部数据库修改均不提交".to_owned(),
+        error: ProjectLuaCallError::violation(crate::diagnostic::LuaValueViolation::StateMismatch)
+            .with_operation(operation),
     }
 }
 
-fn sqlite_host_error(operation: &'static str, error: &rusqlite::Error) -> LuaHostCallError {
+fn sqlite_host_error(operation: LuaOperation, error: rusqlite::Error) -> LuaHostCallError {
     LuaHostCallError {
         domain: "sqlite",
-        kind: match error {
-            rusqlite::Error::MultipleStatement => "multiple_statements",
-            rusqlite::Error::ExecuteReturnedResults => "statement_returns_rows",
-            rusqlite::Error::InvalidQuery => "statement_returns_no_rows",
-            rusqlite::Error::InvalidParameterCount(_, _) => "invalid_parameter_count",
-            rusqlite::Error::SqliteFailure(_, _) => "sqlite_failure",
-            _ => "sqlite_driver",
-        },
         operation,
-        message: error.to_string(),
+        error: ProjectLuaCallError::sqlite(error).with_operation(operation),
     }
 }
 
@@ -1572,12 +1646,11 @@ where
     match result {
         Ok(value) => match success(lua, value) {
             Ok(value) => Ok(MultiValue::from_vec(vec![Value::Boolean(true), value])),
-            Err(error) => Ok(MultiValue::from_vec(vec![
+            Err(_error) => Ok(MultiValue::from_vec(vec![
                 Value::Boolean(false),
-                Value::UserData(lua.create_userdata(LuaHostCallError::binding(
-                    "binding.return",
-                    error.to_string(),
-                ))?),
+                Value::UserData(
+                    lua.create_userdata(LuaHostCallError::binding(LuaOperation::ExecuteScript))?,
+                ),
             ])),
         },
         Err(error) => Ok(MultiValue::from_vec(vec![
@@ -1590,6 +1663,8 @@ where
 pub(super) fn execute(
     lua: &Lua,
     function: Function,
+    script_identity: &str,
+    engine: crate::diagnostic::LuaEngine,
     cancellation: &ProjectLuaCancellation,
 ) -> Result<(), ProjectLuaFailure> {
     let runner: Function = lua
@@ -1597,119 +1672,42 @@ pub(super) fn execute(
             "return function(main) local ok, value = xpcall(main, function(error) return error end); return ok, value end",
         )
         .eval()
-        .map_err(|error| ProjectLuaFailure::Context(error.to_string()))?;
+        .map_err(|_| ProjectLuaFailure::Context(super::ProjectLuaContextFailure::ProtectedCallWrapper))?;
     let thread = lua
         .create_thread(runner)
-        .map_err(|error| ProjectLuaFailure::Context(error.to_string()))?;
+        .map_err(|_| ProjectLuaFailure::Context(super::ProjectLuaContextFailure::ThreadCreation))?;
     let result = thread.resume::<(bool, Value)>(function);
     if cancellation.is_cancelled() {
         return Err(ProjectLuaFailure::Cancelled);
     }
     if thread.status() == ThreadStatus::Resumable {
-        return Err(ProjectLuaFailure::Script(
-            "Lua 主程序不得主动 yield".to_owned(),
-        ));
+        return Err(ProjectLuaFailure::Script {
+            script_identity: script_identity.to_owned(),
+            failure: ProjectLuaScriptFailure::Yielded,
+        });
     }
-    let (succeeded, error) =
-        result.map_err(|error| ProjectLuaFailure::Script(error.to_string()))?;
+    let (succeeded, error) = result.map_err(|error| ProjectLuaFailure::Script {
+        script_identity: script_identity.to_owned(),
+        failure: ProjectLuaScriptFailure::Backend(classify_mlua_error(&error)),
+    })?;
     if succeeded {
         return Ok(());
     }
     if let Value::UserData(userdata) = &error
         && let Ok(error) = userdata.borrow::<LuaHostCallError>()
     {
-        let message = clone_utf8_text_with_cancellation(error.message.as_bytes(), cancellation)
-            .map_err(|_| ProjectLuaFailure::Cancelled)?
-            .expect("Rust String 必须保持有效 UTF-8");
         if cancellation.is_cancelled() {
             return Err(ProjectLuaFailure::Cancelled);
         }
-        return Err(ProjectLuaFailure::Host {
-            domain: error.domain,
-            kind: error.kind,
-            operation: error.operation,
-            message,
-        });
+        return Err(ProjectLuaFailure::Host(
+            error.error.clone().with_engine(engine),
+        ));
     }
-    Err(ProjectLuaFailure::Script(lua_value_description(
-        &error,
-        cancellation,
-    )?))
-}
-
-fn lua_value_description(
-    value: &Value,
-    cancellation: &ProjectLuaCancellation,
-) -> Result<String, ProjectLuaFailure> {
-    let mut checkpoint = || {};
-    lua_value_description_with_checkpoint(value, cancellation, &mut checkpoint)
-}
-
-fn lua_value_description_with_checkpoint(
-    value: &Value,
-    cancellation: &ProjectLuaCancellation,
-    checkpoint: &mut impl FnMut(),
-) -> Result<String, ProjectLuaFailure> {
-    if cancellation.is_cancelled() {
-        return Err(ProjectLuaFailure::Cancelled);
-    }
-    match value {
-        Value::String(value) => {
-            match clone_utf8_text_with_checkpoint(
-                value.as_bytes().as_ref(),
-                cancellation,
-                checkpoint,
-            )
-            .map_err(|_| ProjectLuaFailure::Cancelled)?
-            {
-                Ok(value) => Ok(value),
-                Err(_) => escaped_lua_bytes(value.as_bytes().as_ref(), cancellation, checkpoint),
-            }
-        }
-        Value::Error(error) => {
-            let description = error.to_string();
-            if cancellation.is_cancelled() {
-                Err(ProjectLuaFailure::Cancelled)
-            } else {
-                Ok(description)
-            }
-        }
-        other => {
-            let description = format!("Lua {} 错误值", other.type_name());
-            if cancellation.is_cancelled() {
-                Err(ProjectLuaFailure::Cancelled)
-            } else {
-                Ok(description)
-            }
-        }
-    }
-}
-
-fn escaped_lua_bytes(
-    bytes: &[u8],
-    cancellation: &ProjectLuaCancellation,
-    checkpoint: &mut impl FnMut(),
-) -> Result<String, ProjectLuaFailure> {
-    use std::fmt::Write as _;
-
-    let mut escaped = String::from("非 UTF-8 Lua 错误字符串（原始字节）：");
-    for chunk in bytes.chunks(PROJECT_LUA_SOURCE_CHUNK_BYTES.get()) {
-        if cancellation.is_cancelled() {
-            return Err(ProjectLuaFailure::Cancelled);
-        }
-        checkpoint();
-        if cancellation.is_cancelled() {
-            return Err(ProjectLuaFailure::Cancelled);
-        }
-        for byte in chunk {
-            write!(&mut escaped, "\\x{byte:02X}").expect("写入 String 不会失败");
-        }
-    }
-    if cancellation.is_cancelled() {
-        Err(ProjectLuaFailure::Cancelled)
-    } else {
-        Ok(escaped)
-    }
+    drop(error);
+    Err(ProjectLuaFailure::Script {
+        script_identity: script_identity.to_owned(),
+        failure: ProjectLuaScriptFailure::NonErrorValue,
+    })
 }
 
 #[cfg(test)]
@@ -1958,27 +1956,5 @@ mod tests {
         };
         assert_eq!(error.kind(), "cancelled");
         assert_eq!(observed, 5);
-    }
-
-    #[test]
-    fn large_script_error_value_observes_cancellation_between_chunks() {
-        let lua = Lua::new();
-        let bytes = vec![b'x'; PROJECT_LUA_SOURCE_CHUNK_BYTES.get() * 4];
-        let value = Value::String(lua.create_string(&bytes).expect("应建立大 Lua 错误字符串"));
-        let cancellation = ProjectLuaCancellation::default();
-        let cancel_from_checkpoint = cancellation.clone();
-        let mut observed_chunks = 0;
-        let result = {
-            let mut checkpoint = || {
-                observed_chunks += 1;
-                if observed_chunks == 2 {
-                    cancel_from_checkpoint.cancel();
-                }
-            };
-            lua_value_description_with_checkpoint(&value, &cancellation, &mut checkpoint)
-        };
-
-        assert_eq!(result, Err(ProjectLuaFailure::Cancelled));
-        assert_eq!(observed_chunks, 2);
     }
 }

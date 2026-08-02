@@ -31,9 +31,11 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use crate::diagnostic::{
-    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
-    DiagnosticStage, DiagnosticSubject, FailureReport, RecoveryFact, ReportedFailure,
-    SafeDiagnostic, SafeDiagnosticSource, SafeIoKind,
+    Diagnostic, DiagnosticReport, FileSystemDiagnosticContext, FileSystemDiagnosticStage,
+    FileSystemIssue, FileSystemJournalViolation, FileSystemOperation, FileSystemOrdinalKeyPhase,
+    FileSystemPathViolation, FileSystemProblem, FileSystemRecoveryViolation, IoFailure,
+    PublicationBackendCause, PublicationStep, RelatedFailureRelation, RuntimeComponent,
+    RuntimeIssue, RuntimeOperation, SafeIdentifier, SafePath, StateEffect,
 };
 use crate::fingerprint::Sha256Fingerprint;
 use crate::json_diagnostic::JsonErrorCategory;
@@ -41,12 +43,13 @@ use crate::runtime::performance::RunPerformanceCounters;
 use crate::storage::file_system::{
     BoundScopedDirectory, DirectChildDirectoryEnsurer, DirectoryDiscardError, DirectoryEntry,
     DirectoryEntryKind, DirectoryFileOverlay, DirectoryLister, DirectoryPrepareError,
-    DirectoryPublishError, DirectoryPublishIntent, DirectoryRecoveryError,
-    DirectoryRecoveryOutcome, DirectorySourceMapping, DirectoryStageRequest,
-    DirectoryTreeFingerprintError, DirectoryTreeFingerprintRequest, DirectoryTreeFingerprinter,
-    ExclusiveFileLease, ExclusiveFileLeaseError, ExclusiveFileLeaseProvider,
-    ExclusiveFileLeaseRequest, ExistingDirectoryResolver, FileReader, ListDirectoryError, ReadFile,
-    ReadFileError, RecoverableDirectoryPublisher, ResolveDirectoryError, ScopedDirectoryBindError,
+    DirectoryPublicationDiagnostic, DirectoryPublicationDiagnosticSource, DirectoryPublishError,
+    DirectoryPublishIntent, DirectoryRecoveryError, DirectoryRecoveryOutcome,
+    DirectorySourceMapping, DirectoryStageRequest, DirectoryTreeFingerprintError,
+    DirectoryTreeFingerprintRequest, DirectoryTreeFingerprinter, ExclusiveFileLease,
+    ExclusiveFileLeaseError, ExclusiveFileLeaseProvider, ExclusiveFileLeaseRequest,
+    ExistingDirectoryResolver, FileReader, ListDirectoryError, ReadFile, ReadFileError,
+    RecoverableDirectoryPublisher, ResolveDirectoryError, ScopedDirectoryBindError,
     ScopedDirectoryEditError, ScopedDirectoryEditor, ScopedDirectoryEntry,
     ScopedDirectoryEntryKind, ScopedDirectoryPath, ScopedDirectoryScope, StagedDirectory,
     StagingCleanupFailure,
@@ -64,6 +67,21 @@ use super::windows::{
 };
 
 const RESERVED_PREFIX: &str = ".directory-publish-";
+const OBSERVATION_CREATE_OPERATION: &str = "建立可观测性临时文件";
+const OBSERVATION_WRITE_OPERATION: &str = "写入可观测性临时文件";
+const OBSERVATION_FLUSH_OPERATION: &str = "flush 可观测性临时文件";
+const OBSERVATION_SYNC_OPERATION: &str = "sync 可观测性临时文件";
+const OBSERVATION_COMMIT_OPERATION: &str = "提交可观测性文件";
+const OBSERVATION_CLEANUP_OPERATION: &str = "清理可观测性临时文件";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TerminalObservationOperation {
+    Create,
+    Write,
+    Flush,
+    Sync,
+    Cleanup,
+}
 const DIRECTORY_TREE_FINGERPRINT_DOMAIN: &[u8] = b"directory-tree-fingerprint";
 
 #[cfg(test)]
@@ -101,8 +119,10 @@ static TEST_CANCEL_CANDIDATE_COPY_AFTER_CHUNK: OnceLock<Mutex<HashSet<PathBuf>>>
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum TestObservationFaultPoint {
+pub(crate) enum TestObservationFaultPoint {
     AfterPartialWrite,
+    BeforeFlush,
+    BeforeSync,
     BeforeRename,
     BeforeCleanup,
 }
@@ -113,7 +133,7 @@ static TEST_OBSERVATION_FAULTS: OnceLock<
 > = OnceLock::new();
 
 #[cfg(test)]
-fn register_test_observation_faults(
+pub(crate) fn register_test_observation_faults(
     path: PathBuf,
     faults: impl IntoIterator<Item = TestObservationFaultPoint>,
 ) {
@@ -280,35 +300,22 @@ impl Error for SystemFileSystemBuildError {
 }
 
 impl SystemFileSystemBuildError {
-    pub(crate) fn safe_diagnostic(&self) -> SafeDiagnostic {
-        match self {
-            Self::InvalidConfiguration(_) => SafeDiagnostic::new(
-                DiagnosticCode::FileSystemBuild,
-                DiagnosticStage::ProcessStartup,
-                DiagnosticSubject::component("filesystem"),
-                DiagnosticReason::failure(DiagnosticFailureKind::InvalidValue),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::ReportBug,
-            ),
-            Self::AvailableParallelism(source) => SafeDiagnostic::io(
-                DiagnosticCode::FileSystemBuild,
-                DiagnosticStage::ProcessStartup,
-                DiagnosticSubject::component("filesystem workers"),
-                "detect_available_parallelism",
-                source,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::Retry,
-            ),
-            Self::WorkerSpawn(source) => SafeDiagnostic::io(
-                DiagnosticCode::FileSystemBuild,
-                DiagnosticStage::ProcessStartup,
-                DiagnosticSubject::component("filesystem workers"),
-                "spawn_worker",
-                source,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::Retry,
-            ),
-        }
+    pub(crate) fn diagnostic(&self) -> Diagnostic {
+        Diagnostic::runtime(match self {
+            Self::InvalidConfiguration(_) => RuntimeIssue::InvalidConfiguration {
+                component: RuntimeComponent::FileSystemExecutor,
+            },
+            Self::AvailableParallelism(source) => RuntimeIssue::Io {
+                component: RuntimeComponent::FileSystemExecutor,
+                operation: RuntimeOperation::DetectAvailableParallelism,
+                failure: IoFailure::from_error(source),
+            },
+            Self::WorkerSpawn(source) => RuntimeIssue::Io {
+                component: RuntimeComponent::FileSystemExecutor,
+                operation: RuntimeOperation::StartWorker,
+                failure: IoFailure::from_error(source),
+            },
+        })
     }
 }
 
@@ -329,7 +336,7 @@ pub(crate) enum SystemFileSystemError {
     },
     InvalidPath {
         path: PathBuf,
-        reason: &'static str,
+        violation: FileSystemPathViolation,
     },
     Cancelled {
         operation: &'static str,
@@ -356,17 +363,17 @@ pub(crate) enum SystemFileSystemError {
     },
     JournalCorrupt {
         path: PathBuf,
-        reason: String,
+        violation: FileSystemJournalViolation,
     },
     RecoveryJournalCorrupt {
         path: PathBuf,
         artifacts: Vec<PathBuf>,
-        reason: String,
+        violation: FileSystemJournalViolation,
     },
     RecoveryRequired {
         target_root: PathBuf,
         artifacts: Vec<PathBuf>,
-        reason: String,
+        violation: FileSystemRecoveryViolation,
     },
     RecoveryCleanupFailed {
         target_root: PathBuf,
@@ -386,7 +393,7 @@ pub(crate) enum SystemFileSystemError {
     OutcomeUnknown {
         target_root: PathBuf,
         artifacts: Vec<PathBuf>,
-        reason: String,
+        violation: FileSystemRecoveryViolation,
     },
 }
 
@@ -406,8 +413,12 @@ impl fmt::Display for SystemFileSystemError {
                 "无法建立路径 {} 的 Windows ordinal 非大小写身份：{source}",
                 path.display()
             ),
-            Self::InvalidPath { path, reason } => {
-                write!(formatter, "文件系统路径无效 {}：{reason}", path.display())
+            Self::InvalidPath { path, violation } => {
+                write!(
+                    formatter,
+                    "文件系统路径无效 {}：{violation:?}",
+                    path.display()
+                )
             }
             Self::Cancelled { operation, path } => {
                 write!(formatter, "{operation}已取消：{}", path.display())
@@ -445,28 +456,28 @@ impl fmt::Display for SystemFileSystemError {
                 "可观测性文件写入失败（{operation}），且无法清理临时文件 {}：{cleanup}",
                 temporary_path.display()
             ),
-            Self::JournalCorrupt { path, reason } => write!(
+            Self::JournalCorrupt { path, violation } => write!(
                 formatter,
-                "目录恢复 journal 损坏 {}：{reason}",
+                "目录恢复 journal 损坏 {}：{violation:?}",
                 path.display()
             ),
             Self::RecoveryJournalCorrupt {
                 path,
                 artifacts,
-                reason,
+                violation,
             } => write!(
                 formatter,
-                "目录恢复 journal 损坏 {}（恢复产物：{}）：{reason}",
+                "目录恢复 journal 损坏 {}（恢复产物：{}）：{violation:?}",
                 path.display(),
                 display_paths(artifacts)
             ),
             Self::RecoveryRequired {
                 target_root,
                 artifacts,
-                reason,
+                violation,
             } => write!(
                 formatter,
-                "目录 {} 需要继续恢复（{}）：{reason}",
+                "目录 {} 需要继续恢复（{}）：{violation:?}",
                 target_root.display(),
                 display_paths(artifacts)
             ),
@@ -503,10 +514,10 @@ impl fmt::Display for SystemFileSystemError {
             Self::OutcomeUnknown {
                 target_root,
                 artifacts,
-                reason,
+                violation,
             } => write!(
                 formatter,
-                "目录 {} 的发布结果无法归类（{}）：{reason}",
+                "目录 {} 的发布结果无法归类（{}）：{violation:?}",
                 target_root.display(),
                 display_paths(artifacts)
             ),
@@ -547,431 +558,392 @@ impl Error for SystemFileSystemError {
 }
 
 impl SystemFileSystemError {
-    /// 将文件/发布根的类型化机制事实投影为 CLI 与 JSONL 共用诊断。
-    pub(crate) fn safe_diagnostic(
+    pub(crate) fn terminal_observation_operation(&self) -> Option<TerminalObservationOperation> {
+        let Self::Io { operation, .. } = self else {
+            return None;
+        };
+        match *operation {
+            OBSERVATION_CREATE_OPERATION => Some(TerminalObservationOperation::Create),
+            OBSERVATION_WRITE_OPERATION | OBSERVATION_COMMIT_OPERATION => {
+                Some(TerminalObservationOperation::Write)
+            }
+            OBSERVATION_FLUSH_OPERATION => Some(TerminalObservationOperation::Flush),
+            OBSERVATION_SYNC_OPERATION => Some(TerminalObservationOperation::Sync),
+            OBSERVATION_CLEANUP_OPERATION => Some(TerminalObservationOperation::Cleanup),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn shutdown_diagnostic_report(&self) -> DiagnosticReport {
+        self.diagnostic_report(
+            FileSystemDiagnosticContext::new(
+                FileSystemDiagnosticStage::Shutdown,
+                FileSystemOperation::Shutdown,
+            ),
+            StateEffect::AppliedFinalizationFailed,
+        )
+    }
+
+    /// 以调用处给出的闭集 stage/operation 建立报告；旧错误中的显示文本不参与投影。
+    pub(crate) fn diagnostic_report(
         &self,
-        stage: DiagnosticStage,
-        impact: DiagnosticImpact,
-        fallback_action: DiagnosticAction,
-    ) -> SafeDiagnostic {
+        context: FileSystemDiagnosticContext,
+        effect: StateEffect,
+    ) -> DiagnosticReport {
+        let report = |problem| {
+            DiagnosticReport::new(
+                effect,
+                Diagnostic::file_system(FileSystemIssue::new(context, problem)),
+            )
+        };
         match self {
-            Self::Io {
-                operation,
-                path,
-                source,
-            } => SafeDiagnostic::io(
-                DiagnosticCode::FileSystemOperation,
-                stage,
-                DiagnosticSubject::path(path),
-                operation,
-                source,
-                impact,
-                DiagnosticAction::CheckPathAndPermissions,
-            ),
-            Self::Windows(source) => source.safe_diagnostic(
-                DiagnosticCode::FileSystemOperation,
-                stage,
-                impact,
-                fallback_action,
-            ),
-            Self::Closed => SafeDiagnostic::new(
-                DiagnosticCode::FileSystemOperation,
-                stage,
-                DiagnosticSubject::component("filesystem"),
-                DiagnosticReason::failure(DiagnosticFailureKind::ExecutorClosed),
-                impact,
-                DiagnosticAction::Retry,
-            ),
-            Self::WorkerPanicked => SafeDiagnostic::new(
-                DiagnosticCode::FileSystemOperation,
-                stage,
-                DiagnosticSubject::component("filesystem worker"),
-                DiagnosticReason::failure(DiagnosticFailureKind::WorkerPanicked),
-                impact,
-                DiagnosticAction::ReportBug,
-            ),
+            Self::Io { path, source, .. } => report(FileSystemProblem::Io {
+                path: SafePath::new(path),
+                failure: IoFailure::from_error(source),
+            }),
+            Self::Windows(source) => DiagnosticReport::new(effect, source.diagnostic(context)),
+            Self::Closed => report(FileSystemProblem::ExecutorClosed),
+            Self::WorkerPanicked => report(FileSystemProblem::WorkerPanicked),
             Self::WindowsOrdinalCaseKey { path, source } => match source {
                 WindowsOrdinalCaseKeyError::InputTooLarge { maximum, observed } => {
-                    SafeDiagnostic::new(
-                        DiagnosticCode::FileSystemOperation,
-                        stage,
-                        DiagnosticSubject::path(path),
-                        DiagnosticReason::Resource {
-                            resource: "Windows 文件名 UTF-16 单元数".to_owned(),
-                            actual: *observed,
-                            maximum: Some(*maximum),
-                        },
-                        impact,
-                        fallback_action,
-                    )
+                    report(FileSystemProblem::OrdinalKeyTooLarge {
+                        path: SafePath::new(path),
+                        observed: *observed,
+                        maximum: *maximum,
+                    })
                 }
-                WindowsOrdinalCaseKeyError::WindowsApi { phase, source } => SafeDiagnostic::io(
-                    DiagnosticCode::FileSystemOperation,
-                    stage,
-                    DiagnosticSubject::path(path),
-                    "windows_ordinal_case_key",
-                    source,
-                    impact,
-                    DiagnosticAction::CheckPathAndPermissions,
-                )
-                .with_recovery(RecoveryFact::component(format!(
-                    "windows_ordinal_case_key_phase={}",
-                    phase.as_str()
-                ))),
+                WindowsOrdinalCaseKeyError::WindowsApi { phase, source } => {
+                    report(FileSystemProblem::OrdinalKeyIo {
+                        path: SafePath::new(path),
+                        phase: match phase {
+                            crate::windows_path::WindowsOrdinalCaseKeyPhase::Measure => {
+                                FileSystemOrdinalKeyPhase::Measure
+                            }
+                            crate::windows_path::WindowsOrdinalCaseKeyPhase::Map => {
+                                FileSystemOrdinalKeyPhase::Map
+                            }
+                        },
+                        failure: IoFailure::from_error(source),
+                    })
+                }
             },
-            Self::InvalidPath { path, reason } => SafeDiagnostic::new(
-                DiagnosticCode::FileSystemOperation,
-                stage,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure_with_detail(DiagnosticFailureKind::InvalidPath, reason),
-                impact,
-                fallback_action,
-            ),
-            Self::Cancelled { operation, path } => SafeDiagnostic::new(
-                DiagnosticCode::FileSystemOperation,
-                stage,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::LockCancelled,
-                    format!("operation={operation}"),
-                ),
-                impact,
-                DiagnosticAction::Retry,
-            ),
-            Self::WrongPublisherInstance => SafeDiagnostic::new(
-                DiagnosticCode::FileSystemOperation,
-                stage,
-                DiagnosticSubject::component("directory publisher"),
-                DiagnosticReason::failure(DiagnosticFailureKind::WrongPublisherInstance),
-                impact,
-                DiagnosticAction::ReportBug,
-            ),
-            Self::InvalidStagedIdentity { path } => SafeDiagnostic::new(
-                DiagnosticCode::FileSystemOperation,
-                stage,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure(DiagnosticFailureKind::FileIdentityChanged),
-                impact,
-                DiagnosticAction::PreserveRecoveryArtifacts,
-            ),
-            Self::DirectChildRollbackFailed { path, .. }
-            | Self::ScopedEditRollbackFailed { path, .. } => SafeDiagnostic::new(
-                DiagnosticCode::FileSystemOperation,
-                stage,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure(DiagnosticFailureKind::RollbackFailed),
-                DiagnosticImpact::RecoveryRequired,
-                DiagnosticAction::PreserveRecoveryArtifacts,
-            )
-            .with_recovery(RecoveryFact::path(path)),
-            Self::ObservationCleanupFailed {
-                temporary_path,
+            Self::InvalidPath { path, violation } => report(FileSystemProblem::InvalidPath {
+                path: SafePath::new(path),
+                violation: *violation,
+            }),
+            Self::Cancelled { path, .. } => report(FileSystemProblem::Cancelled {
+                path: SafePath::new(path),
+            }),
+            Self::WrongPublisherInstance => report(FileSystemProblem::WrongPublisherInstance),
+            Self::InvalidStagedIdentity { path } => report(FileSystemProblem::IdentityChanged {
+                path: SafePath::new(path),
+            }),
+            Self::DirectChildRollbackFailed {
                 operation,
+                rollback,
                 ..
-            } => operation
-                .safe_diagnostic(stage, impact, fallback_action)
-                .with_recovery(RecoveryFact::path(temporary_path)),
-            Self::JournalCorrupt { path, reason } => SafeDiagnostic::new(
-                DiagnosticCode::FileSystemOperation,
-                stage,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::JournalCorrupt,
-                    reason,
-                ),
-                DiagnosticImpact::RecoveryRequired,
-                DiagnosticAction::PreserveRecoveryArtifacts,
-            )
-            .with_recovery(RecoveryFact::path(path)),
+            }
+            | Self::ScopedEditRollbackFailed {
+                operation,
+                rollback,
+                ..
+            } => operation.diagnostic_report(context, effect).with_related(
+                RelatedFailureRelation::Rollback,
+                rollback.diagnostic_report(context, StateEffect::RecoveryRequired),
+            ),
+            Self::ObservationCleanupFailed {
+                operation, cleanup, ..
+            } => operation.diagnostic_report(context, effect).with_related(
+                RelatedFailureRelation::Cleanup,
+                cleanup.diagnostic_report(context, effect),
+            ),
+            Self::JournalCorrupt { path, violation } => report(FileSystemProblem::JournalCorrupt {
+                path: SafePath::new(path),
+                artifacts: Vec::new(),
+                violation: violation.clone(),
+            }),
             Self::RecoveryJournalCorrupt {
                 path,
                 artifacts,
-                reason,
-            } => {
-                let mut diagnostic = SafeDiagnostic::new(
-                    DiagnosticCode::FileSystemOperation,
-                    stage,
-                    DiagnosticSubject::path(path),
-                    DiagnosticReason::failure_with_detail(
-                        DiagnosticFailureKind::JournalCorrupt,
-                        reason,
-                    ),
-                    DiagnosticImpact::RecoveryRequired,
-                    DiagnosticAction::PreserveRecoveryArtifacts,
-                );
-                for artifact in artifacts {
-                    diagnostic = diagnostic.with_recovery(RecoveryFact::path(artifact));
-                }
-                diagnostic
-            }
+                violation,
+            } => DiagnosticReport::new(
+                StateEffect::RecoveryRequired,
+                Diagnostic::file_system(FileSystemIssue::new(
+                    context,
+                    FileSystemProblem::JournalCorrupt {
+                        path: SafePath::new(path),
+                        artifacts: safe_paths(artifacts),
+                        violation: violation.clone(),
+                    },
+                )),
+            ),
             Self::RecoveryRequired {
                 target_root,
                 artifacts,
-                reason,
-            } => recovery_diagnostic(
-                stage,
-                target_root,
-                artifacts,
-                reason,
-                DiagnosticImpact::RecoveryRequired,
+                violation,
+            } => DiagnosticReport::new(
+                StateEffect::RecoveryRequired,
+                Diagnostic::file_system(FileSystemIssue::new(
+                    context,
+                    FileSystemProblem::RecoveryRequired {
+                        target_root: SafePath::new(target_root),
+                        artifacts: safe_paths(artifacts),
+                        violation: *violation,
+                    },
+                )),
             ),
             Self::RecoveryCleanupFailed {
                 target_root,
                 artifacts,
                 source,
-            } => recovery_cleanup_diagnostic(
-                stage,
+            }
+            | Self::PublishedRecoveryCleanupFailed {
                 target_root,
                 artifacts,
                 source,
-                DiagnosticImpact::RecoveryRequired,
-            ),
-            Self::PublishedRecoveryCleanupFailed {
-                target_root,
-                artifacts,
-                source,
-            } => recovery_cleanup_diagnostic(
-                stage,
-                target_root,
-                artifacts,
-                source,
-                DiagnosticImpact::StateAppliedFinalizationFailed,
+            } => DiagnosticReport::new(
+                if matches!(self, Self::PublishedRecoveryCleanupFailed { .. }) {
+                    StateEffect::AppliedFinalizationFailed
+                } else {
+                    StateEffect::RecoveryRequired
+                },
+                Diagnostic::file_system(FileSystemIssue::new(
+                    context,
+                    FileSystemProblem::RecoveryCleanupFailed {
+                        target_root: SafePath::new(target_root),
+                        artifacts: safe_paths(artifacts),
+                    },
+                )),
+            )
+            .with_related(
+                RelatedFailureRelation::Cleanup,
+                source.diagnostic_report(context, effect),
             ),
             Self::RecoveryOutcomeUnknown {
                 target_root,
                 artifacts,
                 source,
-            } => recovery_cleanup_diagnostic(
-                stage,
-                target_root,
-                artifacts,
-                source,
-                DiagnosticImpact::OutcomeUnknown,
+            } => DiagnosticReport::new(
+                StateEffect::OutcomeUnknown,
+                Diagnostic::file_system(FileSystemIssue::new(
+                    context,
+                    FileSystemProblem::OutcomeUnknown {
+                        target_root: SafePath::new(target_root),
+                        artifacts: safe_paths(artifacts),
+                        violation: FileSystemRecoveryViolation::ObservationFailed,
+                    },
+                )),
+            )
+            .with_related(
+                RelatedFailureRelation::Finalization,
+                source.diagnostic_report(context, StateEffect::OutcomeUnknown),
             ),
             Self::OutcomeUnknown {
                 target_root,
                 artifacts,
-                reason,
-            } => recovery_diagnostic(
-                stage,
-                target_root,
-                artifacts,
-                reason,
-                DiagnosticImpact::OutcomeUnknown,
+                violation,
+            } => DiagnosticReport::new(
+                StateEffect::OutcomeUnknown,
+                Diagnostic::file_system(FileSystemIssue::new(
+                    context,
+                    FileSystemProblem::OutcomeUnknown {
+                        target_root: SafePath::new(target_root),
+                        artifacts: safe_paths(artifacts),
+                        violation: *violation,
+                    },
+                )),
             ),
         }
     }
 }
 
-impl SafeDiagnosticSource for SystemFileSystemError {
-    fn safe_diagnostic_source(
+impl ResolveDirectoryError<SystemFileSystemError> {
+    /// 解析目录的领域边界固定无状态变更；调用方只选择闭集阶段。
+    pub(crate) fn diagnostic_report_at(
         &self,
-        stage: DiagnosticStage,
-        impact: DiagnosticImpact,
-        fallback_action: DiagnosticAction,
-    ) -> SafeDiagnostic {
-        self.safe_diagnostic(stage, impact, fallback_action)
-    }
-
-    fn into_failure_report(
-        self,
-        stage: DiagnosticStage,
-        impact: DiagnosticImpact,
-        fallback_action: DiagnosticAction,
-    ) -> FailureReport {
+        stage: FileSystemDiagnosticStage,
+    ) -> DiagnosticReport {
+        let context =
+            FileSystemDiagnosticContext::new(stage, FileSystemOperation::ResolveDirectory);
         match self {
-            Self::DirectChildRollbackFailed {
-                path,
-                operation,
-                rollback,
-            }
-            | Self::ScopedEditRollbackFailed {
-                path,
-                operation,
-                rollback,
-            } => {
-                let primary = (*operation)
-                    .into_failure_report(
-                        stage,
-                        DiagnosticImpact::RecoveryRequired,
-                        DiagnosticAction::PreserveRecoveryArtifacts,
-                    )
-                    .with_primary_recovery(RecoveryFact::path(&path))
-                    .with_primary_recovery(RecoveryFact::component("rollback_failed"));
-                let related = (*rollback)
-                    .into_failure_report(
-                        stage,
-                        DiagnosticImpact::RecoveryRequired,
-                        DiagnosticAction::PreserveRecoveryArtifacts,
-                    )
-                    .with_primary_recovery(RecoveryFact::path(path));
-                primary.with_related_report(related)
-            }
-            Self::ObservationCleanupFailed {
-                temporary_path,
-                operation,
-                cleanup,
-            } => {
-                let primary = (*operation)
-                    .into_failure_report(stage, impact, fallback_action)
-                    .with_primary_recovery(RecoveryFact::path(&temporary_path));
-                let related = (*cleanup)
-                    .into_failure_report(
-                        stage,
-                        DiagnosticImpact::Unchanged,
-                        DiagnosticAction::CheckPathAndPermissions,
-                    )
-                    .with_primary_recovery(RecoveryFact::path(temporary_path));
-                primary.with_related_report(related)
-            }
-            Self::RecoveryCleanupFailed {
-                target_root,
-                artifacts,
-                source,
-            } => recovery_cleanup_failure_report(
-                *source,
-                target_root,
-                artifacts,
-                stage,
-                DiagnosticImpact::RecoveryRequired,
+            Self::NotFound { path } => DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::file_system(FileSystemIssue::new(
+                    context,
+                    FileSystemProblem::NotFound {
+                        path: SafePath::new(path),
+                    },
+                )),
             ),
-            Self::PublishedRecoveryCleanupFailed {
-                target_root,
-                artifacts,
-                source,
-            } => recovery_cleanup_failure_report(
-                *source,
-                target_root,
-                artifacts,
-                stage,
-                DiagnosticImpact::StateAppliedFinalizationFailed,
+            Self::NotDirectory { path } => DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::file_system(FileSystemIssue::new(
+                    context,
+                    FileSystemProblem::NotDirectory {
+                        path: SafePath::new(path),
+                    },
+                )),
             ),
-            Self::RecoveryOutcomeUnknown {
-                target_root,
-                artifacts,
-                source,
-            } => recovery_cleanup_failure_report(
-                *source,
-                target_root,
-                artifacts,
-                stage,
-                DiagnosticImpact::OutcomeUnknown,
+            Self::Io { source, .. } => source.diagnostic_report(context, StateEffect::Unchanged),
+        }
+    }
+
+    pub(crate) fn command_preparation_diagnostic_report(&self) -> DiagnosticReport {
+        self.diagnostic_report_at(FileSystemDiagnosticStage::CommandPreparation)
+    }
+}
+
+impl ListDirectoryError<SystemFileSystemError> {
+    pub(crate) fn diagnostic_report_at(
+        &self,
+        stage: FileSystemDiagnosticStage,
+    ) -> DiagnosticReport {
+        let context = FileSystemDiagnosticContext::new(stage, FileSystemOperation::ListDirectory);
+        match self {
+            Self::NotFound { path } => DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::file_system(FileSystemIssue::new(
+                    context,
+                    FileSystemProblem::NotFound {
+                        path: SafePath::new(path),
+                    },
+                )),
             ),
-            source => {
-                let public = source.safe_diagnostic(stage, impact, fallback_action);
-                FailureReport::new(ReportedFailure::new(public, source))
+            Self::NotDirectory { path } => DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::file_system(FileSystemIssue::new(
+                    context,
+                    FileSystemProblem::NotDirectory {
+                        path: SafePath::new(path),
+                    },
+                )),
+            ),
+            Self::Io { source, .. } => source.diagnostic_report(context, StateEffect::Unchanged),
+        }
+    }
+}
+
+impl DirectoryTreeFingerprintError<Box<SystemFileSystemError>> {
+    pub(crate) fn diagnostic_report_at(
+        &self,
+        stage: FileSystemDiagnosticStage,
+    ) -> DiagnosticReport {
+        let context = FileSystemDiagnosticContext::new(stage, FileSystemOperation::FingerprintTree);
+        match self {
+            Self::NotFound { path } => DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::file_system(FileSystemIssue::new(
+                    context,
+                    FileSystemProblem::NotFound {
+                        path: SafePath::new(path),
+                    },
+                )),
+            ),
+            Self::NotDirectory { path } => DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::file_system(FileSystemIssue::new(
+                    context,
+                    FileSystemProblem::NotDirectory {
+                        path: SafePath::new(path),
+                    },
+                )),
+            ),
+            Self::ChangedDuringObservation { path } => DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::file_system(FileSystemIssue::new(
+                    context,
+                    FileSystemProblem::IdentityChanged {
+                        path: SafePath::new(path),
+                    },
+                )),
+            ),
+            Self::Failed { source, .. } => {
+                source.diagnostic_report(context, StateEffect::Unchanged)
             }
         }
     }
 }
 
-fn recovery_diagnostic(
-    stage: DiagnosticStage,
-    target_root: &Path,
-    artifacts: &[PathBuf],
-    reason: &str,
-    impact: DiagnosticImpact,
-) -> SafeDiagnostic {
-    let mut diagnostic = SafeDiagnostic::new(
-        DiagnosticCode::FileSystemOperation,
-        stage,
-        DiagnosticSubject::path(target_root),
-        DiagnosticReason::failure_with_detail(
-            match impact {
-                DiagnosticImpact::OutcomeUnknown => {
-                    DiagnosticFailureKind::TransactionOutcomeUnknown
-                }
-                _ => DiagnosticFailureKind::FinalizationFailed,
-            },
-            reason,
-        ),
-        impact,
-        DiagnosticAction::PreserveRecoveryArtifacts,
-    );
-    for artifact in artifacts {
-        diagnostic = diagnostic.with_recovery(RecoveryFact::path(artifact));
+impl ReadFileError<SystemFileSystemError> {
+    /// 完整读取文件的领域边界固定无状态变更；调用方只选择闭集阶段。
+    pub(crate) fn diagnostic_report_at(
+        &self,
+        stage: FileSystemDiagnosticStage,
+    ) -> DiagnosticReport {
+        let context = FileSystemDiagnosticContext::new(stage, FileSystemOperation::Read);
+        match self {
+            Self::NotFound { path } => DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::file_system(FileSystemIssue::new(
+                    context,
+                    FileSystemProblem::NotFound {
+                        path: SafePath::new(path),
+                    },
+                )),
+            ),
+            Self::NotFile { path } => DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::file_system(FileSystemIssue::new(
+                    context,
+                    FileSystemProblem::NotFile {
+                        path: SafePath::new(path),
+                    },
+                )),
+            ),
+            Self::Io { source, .. } => source.diagnostic_report(context, StateEffect::Unchanged),
+        }
     }
-    diagnostic
+
+    pub(crate) fn command_preparation_diagnostic_report(&self) -> DiagnosticReport {
+        self.diagnostic_report_at(FileSystemDiagnosticStage::CommandPreparation)
+    }
 }
 
-fn recovery_cleanup_diagnostic(
-    stage: DiagnosticStage,
-    target_root: &Path,
-    artifacts: &[PathBuf],
-    source: &SystemFileSystemError,
-    impact: DiagnosticImpact,
-) -> SafeDiagnostic {
-    let mut diagnostic =
-        source.safe_diagnostic(stage, impact, DiagnosticAction::PreserveRecoveryArtifacts);
-    // 外层恢复分支已经确认目标终态；内层错误只说明清理为何失败，不能推翻该终态。
-    diagnostic.impact = impact;
-    diagnostic.action = DiagnosticAction::PreserveRecoveryArtifacts;
-    if impact != DiagnosticImpact::OutcomeUnknown {
-        diagnostic = diagnostic.with_recovery(RecoveryFact::path(target_root));
+impl DirectoryPublicationDiagnosticSource for Box<SystemFileSystemError> {
+    fn publication_diagnostic(&self, step: PublicationStep) -> DirectoryPublicationDiagnostic {
+        let operation = match step {
+            PublicationStep::Recover => crate::diagnostic::FileSystemOperation::RecoverTarget,
+            PublicationStep::PrepareCandidate => {
+                crate::diagnostic::FileSystemOperation::PrepareCandidate
+            }
+            PublicationStep::Publish | PublicationStep::Finalize => {
+                crate::diagnostic::FileSystemOperation::Rename
+            }
+            PublicationStep::DiscardCandidate | PublicationStep::CleanupResidual => {
+                crate::diagnostic::FileSystemOperation::Remove
+            }
+        };
+        let effect = if matches!(self.as_ref(), SystemFileSystemError::JournalCorrupt { .. }) {
+            StateEffect::RecoveryRequired
+        } else {
+            StateEffect::Unchanged
+        };
+        let report = self.as_ref().diagnostic_report(
+            FileSystemDiagnosticContext::new(
+                crate::diagnostic::FileSystemDiagnosticStage::Publication,
+                operation,
+            ),
+            effect,
+        );
+        publication_projection(report)
     }
-    for artifact in artifacts {
-        diagnostic = diagnostic.with_recovery(RecoveryFact::path(artifact));
-    }
-    diagnostic
 }
 
-fn recovery_cleanup_failure_report(
-    source: SystemFileSystemError,
-    target_root: PathBuf,
-    artifacts: Vec<PathBuf>,
-    stage: DiagnosticStage,
-    impact: DiagnosticImpact,
-) -> FailureReport {
-    let mut report = source
-        .into_failure_report(stage, impact, DiagnosticAction::PreserveRecoveryArtifacts)
-        .with_all_impacts(impact)
-        .with_primary_action(DiagnosticAction::PreserveRecoveryArtifacts);
-    if impact != DiagnosticImpact::OutcomeUnknown {
-        report = report.with_primary_recovery(RecoveryFact::path(target_root));
+fn publication_projection(report: DiagnosticReport) -> DirectoryPublicationDiagnostic {
+    let mut projection =
+        DirectoryPublicationDiagnostic::new(PublicationBackendCause::new(report.primary().clone()))
+            .with_effect(report.effect());
+    for related in report.related() {
+        projection = projection.with_related(
+            related.relation(),
+            publication_projection(related.report().clone()),
+        );
     }
-    for artifact in artifacts {
-        report = report.with_primary_recovery(RecoveryFact::path(artifact));
-    }
-    report
+    projection
 }
 
-fn windows_fs_error_detail(source: &WindowsFsError) -> String {
-    match source {
-        WindowsFsError::Io {
-            operation,
-            path,
-            source,
-        } => format!(
-            "operation={operation}, path={}, kind={}, os_code={:?}",
-            path.display(),
-            SafeIoKind::from(source.kind()).as_str(),
-            source.raw_os_error()
-        ),
-        WindowsFsError::ReparsePoint { path } => {
-            format!("path={}, reason=reparse_point", path.display())
-        }
-        WindowsFsError::NonLocalVolume { path } => {
-            format!("path={}, reason=non_local_volume", path.display())
-        }
-        WindowsFsError::NonNtfsVolume { path, actual } => {
-            format!("path={}, filesystem={actual}", path.display())
-        }
-        WindowsFsError::CaseSensitiveDirectory { path } => {
-            format!("path={}, reason=case_sensitive_directory", path.display())
-        }
-        WindowsFsError::LockCancelled { path } => {
-            format!("path={}, reason=lock_cancelled", path.display())
-        }
-        WindowsFsError::RenameTargetExists { path } => {
-            format!("path={}, reason=target_exists", path.display())
-        }
-        WindowsFsError::FileIdentityChanged { path } => {
-            format!("path={}, reason=file_identity_changed", path.display())
-        }
-        WindowsFsError::Cryptography { operation, status } => {
-            format!("operation={operation}, ntstatus={status:#010x}")
-        }
-    }
+fn safe_paths(paths: &[PathBuf]) -> Vec<SafePath> {
+    paths.iter().map(SafePath::new).collect()
 }
 
 impl From<WindowsFsError> for SystemFileSystemError {
@@ -1316,7 +1288,7 @@ fn remove_directory_tree_if_identity(
             } else {
                 return Err(SystemFileSystemError::InvalidPath {
                     path: child_path,
-                    reason: "待清理目录中存在非普通文件系统对象",
+                    violation: FileSystemPathViolation::UnexpectedObject,
                 });
             }
         }
@@ -1452,13 +1424,13 @@ fn write_new_terminal_observation_file_sync(
         .parent()
         .ok_or_else(|| SystemFileSystemError::InvalidPath {
             path: path.to_path_buf(),
-            reason: "终态可观测性文件必须包含父目录",
+            violation: FileSystemPathViolation::MissingParent,
         })?;
     let file_name = path
         .file_name()
         .ok_or_else(|| SystemFileSystemError::InvalidPath {
             path: path.to_path_buf(),
-            reason: "终态可观测性文件必须包含文件名",
+            violation: FileSystemPathViolation::MissingFileName,
         })?;
     let pinned_parent = create_directories_without_reparse(parent)?;
     let resolved_path = pinned_parent.resolved_path().join(file_name);
@@ -1474,7 +1446,7 @@ fn write_new_terminal_observation_file_sync(
         .write(true)
         .create_new(true)
         .open(&temporary_path)
-        .map_err(|source| io_error("建立可观测性临时文件", &temporary_path, source))?;
+        .map_err(|source| io_error(OBSERVATION_CREATE_OPERATION, &temporary_path, source))?;
     let temporary_identity = match FileIdentity::of(&file, &temporary_path) {
         Ok(identity) => identity,
         Err(source) => {
@@ -1486,7 +1458,7 @@ fn write_new_terminal_observation_file_sync(
                     temporary_path: temporary_path.clone(),
                     operation: Box::new(operation),
                     cleanup: Box::new(io_error(
-                        "清理可观测性临时文件",
+                        OBSERVATION_CLEANUP_OPERATION,
                         &temporary_path,
                         cleanup_source,
                     )),
@@ -1502,7 +1474,7 @@ fn write_new_terminal_observation_file_sync(
             && let Err(source) = file.write_all(&bytes[..partial_length])
         {
             drop(file);
-            let operation = io_error("写入可观测性临时文件", &temporary_path, source);
+            let operation = io_error(OBSERVATION_WRITE_OPERATION, &temporary_path, source);
             return cleanup_failed_terminal_observation(
                 path,
                 &temporary_path,
@@ -1512,7 +1484,7 @@ fn write_new_terminal_observation_file_sync(
         }
         drop(file);
         let operation = io_error(
-            "写入可观测性临时文件",
+            OBSERVATION_WRITE_OPERATION,
             &temporary_path,
             io::Error::other("测试注入的部分写入故障"),
         );
@@ -1524,9 +1496,59 @@ fn write_new_terminal_observation_file_sync(
         );
     }
 
-    if let Err(source) = file.write_all(bytes).and_then(|()| file.flush()) {
+    if let Err(source) = file.write_all(bytes) {
         drop(file);
-        let operation = io_error("写入可观测性临时文件", &temporary_path, source);
+        let operation = io_error(OBSERVATION_WRITE_OPERATION, &temporary_path, source);
+        return cleanup_failed_terminal_observation(
+            path,
+            &temporary_path,
+            temporary_identity,
+            operation,
+        );
+    }
+    #[cfg(test)]
+    if hit_test_observation_fault(path, TestObservationFaultPoint::BeforeFlush) {
+        drop(file);
+        let operation = io_error(
+            OBSERVATION_FLUSH_OPERATION,
+            &temporary_path,
+            io::Error::other("测试注入的 flush 故障"),
+        );
+        return cleanup_failed_terminal_observation(
+            path,
+            &temporary_path,
+            temporary_identity,
+            operation,
+        );
+    }
+    if let Err(source) = file.flush() {
+        drop(file);
+        let operation = io_error(OBSERVATION_FLUSH_OPERATION, &temporary_path, source);
+        return cleanup_failed_terminal_observation(
+            path,
+            &temporary_path,
+            temporary_identity,
+            operation,
+        );
+    }
+    #[cfg(test)]
+    if hit_test_observation_fault(path, TestObservationFaultPoint::BeforeSync) {
+        drop(file);
+        let operation = io_error(
+            OBSERVATION_SYNC_OPERATION,
+            &temporary_path,
+            io::Error::other("测试注入的 sync 故障"),
+        );
+        return cleanup_failed_terminal_observation(
+            path,
+            &temporary_path,
+            temporary_identity,
+            operation,
+        );
+    }
+    if let Err(source) = file.sync_all() {
+        drop(file);
+        let operation = io_error(OBSERVATION_SYNC_OPERATION, &temporary_path, source);
         return cleanup_failed_terminal_observation(
             path,
             &temporary_path,
@@ -1539,7 +1561,7 @@ fn write_new_terminal_observation_file_sync(
     #[cfg(test)]
     if hit_test_observation_fault(path, TestObservationFaultPoint::BeforeRename) {
         let operation = io_error(
-            "提交可观测性文件",
+            OBSERVATION_COMMIT_OPERATION,
             &resolved_path,
             io::Error::other("测试注入的重命名故障"),
         );
@@ -1572,7 +1594,7 @@ fn cleanup_failed_terminal_observation(
     let cleanup =
         if hit_test_observation_fault(_requested_path, TestObservationFaultPoint::BeforeCleanup) {
             Err(io_error(
-                "清理可观测性临时文件",
+                OBSERVATION_CLEANUP_OPERATION,
                 temporary_path,
                 io::Error::other("测试注入的临时文件清理故障"),
             ))
@@ -2101,14 +2123,14 @@ fn recover_directory_target_sync(
     if !target_root.is_absolute() {
         return Err(SystemFileSystemError::InvalidPath {
             path: target_root,
-            reason: "发布目标必须是绝对路径",
+            violation: FileSystemPathViolation::NotAbsolute,
         });
     }
     let parent = target_root
         .parent()
         .ok_or_else(|| SystemFileSystemError::InvalidPath {
             path: target_root.clone(),
-            reason: "发布目标必须拥有父目录",
+            violation: FileSystemPathViolation::MissingParent,
         })?;
     let parent_root = validate_local_case_insensitive_ntfs_directory(parent)?;
     let parent_handle = open_directory(&parent_root, false)?;
@@ -2117,7 +2139,7 @@ fn recover_directory_target_sync(
             .file_name()
             .ok_or_else(|| SystemFileSystemError::InvalidPath {
                 path: target_root.clone(),
-                reason: "发布目标必须拥有目录名",
+                violation: FileSystemPathViolation::MissingFileName,
             })?;
     validate_windows_name(target_name, &target_root)?;
     let target_root = parent_root.join(target_name);
@@ -2206,7 +2228,7 @@ fn ensure_direct_child_directory_sync(
         Ok(true) => return Ok(resolved_child),
         Ok(false) => SystemFileSystemError::InvalidPath {
             path: parent,
-            reason: "建立直接子目录期间父目录身份发生变化",
+            violation: FileSystemPathViolation::IdentityChanged,
         },
         Err(source) => source,
     };
@@ -2295,7 +2317,7 @@ fn list_directory_sync(
                     path: child.clone(),
                     source: SystemFileSystemError::InvalidPath {
                         path: child,
-                        reason: "目录列举拒绝硬链接文件",
+                        violation: FileSystemPathViolation::HardLink,
                     },
                 });
             }
@@ -2305,7 +2327,7 @@ fn list_directory_sync(
                 path: child.clone(),
                 source: SystemFileSystemError::InvalidPath {
                     path: child,
-                    reason: "目录列举包含非普通文件系统对象",
+                    violation: FileSystemPathViolation::UnexpectedObject,
                 },
             });
         };
@@ -2385,14 +2407,14 @@ fn bind_scoped_directory_sync(
         if declared_roots.insert(key, declared.clone()).is_some() {
             return Err(SystemFileSystemError::InvalidPath {
                 path: root.to_path_buf(),
-                reason: "候选编辑范围包含 Windows 非大小写语义下重复的顶层目录",
+                violation: FileSystemPathViolation::CaseCollision,
             });
         }
         let child = pin_directory_without_reparse(&path)?;
         if !child.metadata()?.is_dir() {
             return Err(SystemFileSystemError::InvalidPath {
                 path,
-                reason: "候选编辑范围根必须是普通目录",
+                violation: FileSystemPathViolation::NotDirectory,
             });
         }
     }
@@ -2482,7 +2504,7 @@ fn list_scoped_directory_sync(
                 relative,
                 SystemFileSystemError::InvalidPath {
                     path: child_path,
-                    reason: "候选编辑目录包含 Windows 大小写等价名称",
+                    violation: FileSystemPathViolation::CaseCollision,
                 },
             ));
         }
@@ -2502,7 +2524,7 @@ fn list_scoped_directory_sync(
                     relative,
                     SystemFileSystemError::InvalidPath {
                         path: child_path,
-                        reason: "候选编辑拒绝硬链接文件",
+                        violation: FileSystemPathViolation::HardLink,
                     },
                 ));
             }
@@ -2512,7 +2534,7 @@ fn list_scoped_directory_sync(
                 relative,
                 SystemFileSystemError::InvalidPath {
                     path: child_path,
-                    reason: "候选编辑目录包含非普通文件系统对象",
+                    violation: FileSystemPathViolation::UnexpectedObject,
                 },
             ));
         };
@@ -2557,7 +2579,7 @@ fn list_scoped_root_sync(
                 path: PathBuf::from("."),
                 source: Box::new(SystemFileSystemError::InvalidPath {
                     path: child_path,
-                    reason: "候选根包含 Windows 大小写等价名称",
+                    violation: FileSystemPathViolation::CaseCollision,
                 }),
             });
         }
@@ -2587,7 +2609,7 @@ fn list_scoped_root_sync(
                     path: PathBuf::from("."),
                     source: Box::new(SystemFileSystemError::InvalidPath {
                         path: child_path,
-                        reason: "候选编辑拒绝硬链接文件",
+                        violation: FileSystemPathViolation::HardLink,
                     }),
                 });
             }
@@ -2597,7 +2619,7 @@ fn list_scoped_root_sync(
                 path: PathBuf::from("."),
                 source: Box::new(SystemFileSystemError::InvalidPath {
                     path: child_path,
-                    reason: "候选根包含非普通文件系统对象",
+                    violation: FileSystemPathViolation::UnexpectedObject,
                 }),
             });
         };
@@ -2685,7 +2707,7 @@ fn write_existing_scoped_file(
             relative,
             SystemFileSystemError::InvalidPath {
                 path: absolute.to_path_buf(),
-                reason: "候选编辑拒绝硬链接文件",
+                violation: FileSystemPathViolation::HardLink,
             },
         ));
     }
@@ -3041,7 +3063,7 @@ fn fingerprint_directory(
                             &path,
                             SystemFileSystemError::InvalidPath {
                                 path: path.clone(),
-                                reason: "目录树包含 Windows 大小写等价名称",
+                                violation: FileSystemPathViolation::CaseCollision,
                             },
                         ));
                     }
@@ -3063,7 +3085,7 @@ fn fingerprint_directory(
                             &path,
                             SystemFileSystemError::InvalidPath {
                                 path: path.clone(),
-                                reason: "目录树包含非普通文件系统对象",
+                                violation: FileSystemPathViolation::UnexpectedObject,
                             },
                         ));
                     };
@@ -3134,7 +3156,7 @@ fn fingerprint_file(
             physical_path,
             SystemFileSystemError::InvalidPath {
                 path: physical_path.to_path_buf(),
-                reason: "目录树项不再是普通文件",
+                violation: FileSystemPathViolation::NotRegularFile,
             },
         ));
     }
@@ -3146,7 +3168,7 @@ fn fingerprint_file(
             physical_path,
             SystemFileSystemError::InvalidPath {
                 path: physical_path.to_path_buf(),
-                reason: "目录树包含硬链接文件",
+                violation: FileSystemPathViolation::HardLink,
             },
         ));
     }
@@ -3162,7 +3184,7 @@ fn fingerprint_file(
             physical_path,
             SystemFileSystemError::InvalidPath {
                 path: physical_path.to_path_buf(),
-                reason: "目录树包含共享同一物理文件身份的硬链接",
+                violation: FileSystemPathViolation::HardLink,
             },
         ));
     }
@@ -3270,7 +3292,7 @@ fn prepare_directory_sync(
         if !target_root.is_absolute() {
             return Err(SystemFileSystemError::InvalidPath {
                 path: target_root.clone(),
-                reason: "发布目标必须是绝对路径",
+                violation: FileSystemPathViolation::NotAbsolute,
             }
             .into());
         }
@@ -3278,7 +3300,7 @@ fn prepare_directory_sync(
             .parent()
             .ok_or_else(|| SystemFileSystemError::InvalidPath {
                 path: target_root.clone(),
-                reason: "发布目标必须拥有父目录",
+                violation: FileSystemPathViolation::MissingParent,
             })?;
         let parent_root = validate_local_case_insensitive_ntfs_directory(parent)?;
         let parent_handle = open_directory(&parent_root, false)?;
@@ -3288,7 +3310,7 @@ fn prepare_directory_sync(
                 .file_name()
                 .ok_or_else(|| SystemFileSystemError::InvalidPath {
                     path: target_root.clone(),
-                    reason: "发布目标必须拥有目录名",
+                    violation: FileSystemPathViolation::MissingFileName,
                 })?;
         validate_windows_name(target_name, &target_root)?;
         let target_root = parent_root.join(target_name);
@@ -3578,7 +3600,7 @@ fn build_candidate_manifest(
                 Ok(_) => {
                     return Err(SystemFileSystemError::InvalidPath {
                         path: source_path,
-                        reason: "复制来源目录在 manifest 构建期间增加了覆盖目标",
+                        violation: FileSystemPathViolation::SourceChanged,
                     });
                 }
             }
@@ -3634,7 +3656,7 @@ fn begin_candidate_directory_observation(
     if expected_identity.is_some_and(|expected| expected != source_identity) {
         return Err(SystemFileSystemError::InvalidPath {
             path: source.to_path_buf(),
-            reason: "复制来源目录在枚举后物理身份发生变化",
+            violation: FileSystemPathViolation::IdentityChanged,
         });
     }
     let source_entries = read_candidate_source_entries(&source_resolved, cancellation)?;
@@ -3688,7 +3710,7 @@ fn observe_candidate_source_tree(
             if after_identity != frame.source_identity || held_identity != frame.source_identity {
                 return Err(SystemFileSystemError::InvalidPath {
                     path: frame.source,
-                    reason: "复制来源目录在枚举期间物理身份发生变化",
+                    violation: FileSystemPathViolation::IdentityChanged,
                 });
             }
             continue;
@@ -3717,7 +3739,7 @@ fn observe_candidate_source_tree(
             if number_of_links(pinned_child.file(), &child_source)? != 1 {
                 return Err(SystemFileSystemError::InvalidPath {
                     path: child_source,
-                    reason: "复制来源包含硬链接文件",
+                    violation: FileSystemPathViolation::HardLink,
                 });
             }
             let overlay_index = observation.overlay_lookup.find(&child_relative)?;
@@ -3728,7 +3750,7 @@ fn observe_candidate_source_tree(
             {
                 return Err(SystemFileSystemError::InvalidPath {
                     path: child_relative,
-                    reason: "同一候选覆盖匹配了多个来源文件",
+                    violation: FileSystemPathViolation::OutsideScope,
                 });
             }
             let file = files.len();
@@ -3742,7 +3764,7 @@ fn observe_candidate_source_tree(
         } else {
             return Err(SystemFileSystemError::InvalidPath {
                 path: child_source,
-                reason: "复制来源包含非普通文件对象",
+                violation: FileSystemPathViolation::UnexpectedObject,
             });
         };
         directories[parent_directory]
@@ -3784,7 +3806,7 @@ fn read_candidate_source_entries(
         if !names.insert(windows_ordinal_case_key(&entry.name, &entry.physical_path)?) {
             return Err(SystemFileSystemError::InvalidPath {
                 path: entry.physical_path.clone(),
-                reason: "同一目录包含 Windows 大小写等价名称",
+                violation: FileSystemPathViolation::CaseCollision,
             });
         }
     }
@@ -3882,7 +3904,7 @@ fn prepare_candidate_source_tree<'a>(
                 if source_identity != manifest.expected_identity {
                     return Err(SystemFileSystemError::InvalidPath {
                         path: manifest.source.clone(),
-                        reason: "复制来源目录在 manifest 后物理身份发生变化",
+                        violation: FileSystemPathViolation::IdentityChanged,
                     });
                 }
                 validate_manifest_directory_entries(
@@ -3997,7 +4019,7 @@ fn validate_materialized_source_tree(
         if after_identity != manifest.expected_identity {
             return Err(SystemFileSystemError::InvalidPath {
                 path: manifest.source.clone(),
-                reason: "复制来源目录在物化期间物理身份发生变化",
+                violation: FileSystemPathViolation::IdentityChanged,
             });
         }
         validate_manifest_directory_entries(manifest, after.resolved_path(), cancellation)?;
@@ -4024,7 +4046,7 @@ fn validate_manifest_directory_entries(
     {
         return Err(SystemFileSystemError::InvalidPath {
             path: manifest.source.clone(),
-            reason: "复制来源目录在 manifest 后内容发生变化",
+            violation: FileSystemPathViolation::SourceChanged,
         });
     }
     Ok(())
@@ -4087,7 +4109,7 @@ fn validate_declared_windows_paths(
             {
                 return Err(SystemFileSystemError::InvalidPath {
                     path: path.to_path_buf(),
-                    reason: "候选声明对同一 Windows 路径使用了冲突的大小写拼写",
+                    violation: FileSystemPathViolation::CaseCollision,
                 });
             }
             node_index = child_index;
@@ -4127,7 +4149,7 @@ fn validate_complete_candidate(
             if !names.insert(windows_ordinal_case_key(&name, &child_path)?) {
                 return Err(SystemFileSystemError::InvalidPath {
                     path: child_path,
-                    reason: "发布候选的同一目录包含 Windows 大小写等价名称",
+                    violation: FileSystemPathViolation::CaseCollision,
                 });
             }
             let child = pin_path_without_reparse(&child_path)?;
@@ -4138,20 +4160,20 @@ fn validate_complete_candidate(
                 if number_of_links(child.file(), &child_path)? != 1 {
                     return Err(SystemFileSystemError::InvalidPath {
                         path: child_path,
-                        reason: "发布候选包含硬链接文件",
+                        violation: FileSystemPathViolation::HardLink,
                     });
                 }
                 let identity = FileIdentity::of(child.file(), &child_path)?;
                 if !file_identities.insert(identity) {
                     return Err(SystemFileSystemError::InvalidPath {
                         path: child_path,
-                        reason: "发布候选包含共享同一物理文件身份的硬链接",
+                        violation: FileSystemPathViolation::HardLink,
                     });
                 }
             } else {
                 return Err(SystemFileSystemError::InvalidPath {
                     path: child_path,
-                    reason: "发布候选包含非普通文件系统对象",
+                    violation: FileSystemPathViolation::UnexpectedObject,
                 });
             }
         }
@@ -4172,7 +4194,7 @@ fn ensure_source_is_physically_disjoint(
     if stage_ancestors.contains(&source_identity) {
         return Err(SystemFileSystemError::InvalidPath {
             path: source_root,
-            reason: "复制来源在物理文件树中包含候选目录",
+            violation: FileSystemPathViolation::OutsideScope,
         });
     }
     let source_ancestors = directory_ancestor_identities(&source_root)?;
@@ -4181,7 +4203,7 @@ fn ensure_source_is_physically_disjoint(
     if source_ancestors.contains(&stage_identity) {
         return Err(SystemFileSystemError::InvalidPath {
             path: source_root,
-            reason: "复制来源位于候选目录内部",
+            violation: FileSystemPathViolation::OutsideScope,
         });
     }
     let target_identity = match fs::symlink_metadata(target_root) {
@@ -4201,14 +4223,14 @@ fn ensure_source_is_physically_disjoint(
         if source_ancestors.contains(&target_identity) {
             return Err(SystemFileSystemError::InvalidPath {
                 path: source_root,
-                reason: "复制来源位于现存发布目标内部",
+                violation: FileSystemPathViolation::OutsideScope,
             });
         }
         let target_ancestors = directory_ancestor_identities(target_root)?;
         if target_ancestors.contains(&source_identity) {
             return Err(SystemFileSystemError::InvalidPath {
                 path: source_root,
-                reason: "复制来源在物理文件树中包含现存发布目标",
+                violation: FileSystemPathViolation::OutsideScope,
             });
         }
     }
@@ -4229,20 +4251,20 @@ fn pin_manifest_regular_file(
     if !before.is_file() {
         return Err(SystemFileSystemError::InvalidPath {
             path: manifest.source.clone(),
-            reason: "复制来源不再是普通文件",
+            violation: FileSystemPathViolation::NotRegularFile,
         });
     }
     let identity = FileIdentity::of(input.file(), &manifest.source)?;
     if identity != manifest.expected_identity || before.len() != manifest.observed_size {
         return Err(SystemFileSystemError::InvalidPath {
             path: manifest.source.clone(),
-            reason: "复制来源文件在枚举后身份或大小发生变化",
+            violation: FileSystemPathViolation::SourceChanged,
         });
     }
     if number_of_links(input.file(), &manifest.source)? != 1 {
         return Err(SystemFileSystemError::InvalidPath {
             path: manifest.source.clone(),
-            reason: "复制来源包含硬链接文件",
+            violation: FileSystemPathViolation::HardLink,
         });
     }
     Ok(input)
@@ -4261,7 +4283,7 @@ fn validate_materialized_source_file(
     {
         return Err(SystemFileSystemError::InvalidPath {
             path: manifest.source.clone(),
-            reason: "复制来源文件在稳定读取期间发生变化",
+            violation: FileSystemPathViolation::SourceChanged,
         });
     }
     Ok(())
@@ -4302,7 +4324,7 @@ fn copy_manifest_regular_file(
     if copied != manifest.observed_size {
         return Err(SystemFileSystemError::InvalidPath {
             path: manifest.source.clone(),
-            reason: "复制来源文件在稳定读取期间发生变化",
+            violation: FileSystemPathViolation::SourceChanged,
         });
     }
     output
@@ -4361,7 +4383,7 @@ fn validate_relative_windows_path(path: &Path) -> Result<(), SystemFileSystemErr
         let Component::Normal(name) = component else {
             return Err(SystemFileSystemError::InvalidPath {
                 path: path.to_path_buf(),
-                reason: "候选路径包含非普通相对段",
+                violation: FileSystemPathViolation::OutsideScope,
             });
         };
         validate_windows_name(name, path)?;
@@ -4376,7 +4398,7 @@ fn validate_windows_name(name: &OsStr, full_path: &Path) -> Result<(), SystemFil
     {
         return Err(SystemFileSystemError::InvalidPath {
             path: full_path.to_path_buf(),
-            reason: "Windows 名称为空或以点/空格结尾",
+            violation: FileSystemPathViolation::InvalidWindowsName,
         });
     }
     if wide.iter().any(|unit| {
@@ -4387,7 +4409,7 @@ fn validate_windows_name(name: &OsStr, full_path: &Path) -> Result<(), SystemFil
     }) {
         return Err(SystemFileSystemError::InvalidPath {
             path: full_path.to_path_buf(),
-            reason: "Windows 名称包含控制字符、ADS 或保留符号",
+            violation: FileSystemPathViolation::InvalidWindowsName,
         });
     }
     let base_end = wide
@@ -4405,7 +4427,7 @@ fn validate_windows_name(name: &OsStr, full_path: &Path) -> Result<(), SystemFil
     if reserved_device || wide_starts_with_ascii_ignore_case(&wide, RESERVED_PREFIX) {
         return Err(SystemFileSystemError::InvalidPath {
             path: full_path.to_path_buf(),
-            reason: "Windows 名称属于设备名或发布根保留命名空间",
+            violation: FileSystemPathViolation::ReservedWindowsName,
         });
     }
     Ok(())
@@ -4451,7 +4473,7 @@ fn trusted_lock_directory(path: &Path) -> Result<PathBuf, SystemFileSystemError>
         if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(SystemFileSystemError::InvalidPath {
                 path: current,
-                reason: "锁目录路径包含非普通目录或 reparse point",
+                violation: FileSystemPathViolation::ReparsePoint,
             });
         }
     }
@@ -4523,13 +4545,24 @@ struct JournalRecord {
     phase: JournalPhase,
 }
 
-fn journal_json_error_reason(prefix: &str, source: &serde_json::Error) -> String {
-    let category = JsonErrorCategory::from(source);
-    format!(
-        "{prefix}（json_category={category}, line={}, column={}）",
-        source.line(),
-        source.column()
+fn journal_json_coordinates(source: &serde_json::Error) -> (SafeIdentifier, u64, u64) {
+    (
+        SafeIdentifier::from_validated(JsonErrorCategory::from(source).storage_name()),
+        journal_usize_to_u64(source.line()),
+        journal_usize_to_u64(source.column()),
     )
+}
+
+fn journal_usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).expect("当前目标平台的 journal 数值必须能用 u64 表达")
+}
+
+const fn journal_phase_name(phase: JournalPhase) -> &'static str {
+    match phase {
+        JournalPhase::OriginalMoveIntent => "original_move_intent",
+        JournalPhase::CandidateMoveIntent => "candidate_move_intent",
+        JournalPhase::CandidateVisible => "candidate_visible",
+    }
 }
 
 fn append_journal(
@@ -4537,15 +4570,24 @@ fn append_journal(
     record: &JournalRecord,
     create_new: bool,
 ) -> Result<(), SystemFileSystemError> {
-    let payload =
-        serde_json::to_vec(record).map_err(|source| SystemFileSystemError::JournalCorrupt {
+    let payload = serde_json::to_vec(record).map_err(|source| {
+        let (category, line, column) = journal_json_coordinates(&source);
+        SystemFileSystemError::JournalCorrupt {
             path: path.to_path_buf(),
-            reason: journal_json_error_reason("journal 帧无法序列化", &source),
-        })?;
+            violation: FileSystemJournalViolation::Serialization {
+                category,
+                line,
+                column,
+            },
+        }
+    })?;
     let payload_len =
         u32::try_from(payload.len()).map_err(|_| SystemFileSystemError::JournalCorrupt {
             path: path.to_path_buf(),
-            reason: "journal 单帧无法用现行 u32 长度字段表达".to_owned(),
+            violation: FileSystemJournalViolation::FrameLengthOverflow {
+                actual: journal_usize_to_u64(payload.len()),
+                maximum: u64::from(u32::MAX),
+            },
         })?;
     let mut hasher = Hasher::new();
     hasher.update(&payload);
@@ -4554,7 +4596,7 @@ fn append_journal(
         .parent()
         .ok_or_else(|| SystemFileSystemError::InvalidPath {
             path: path.to_path_buf(),
-            reason: "目录发布 journal 路径没有父目录",
+            violation: FileSystemPathViolation::MissingParent,
         })?;
     let _pinned_parent = pin_directory_without_reparse(parent)?;
     let mut options = OpenOptions::new();
@@ -4572,7 +4614,7 @@ fn append_journal(
     if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(SystemFileSystemError::JournalCorrupt {
             path: path.to_path_buf(),
-            reason: "journal 路径不是普通文件".to_owned(),
+            violation: FileSystemJournalViolation::NotRegularFile,
         });
     }
     file.write_all(&payload_len.to_le_bytes())
@@ -4589,7 +4631,7 @@ fn read_journal(path: &Path) -> Result<Vec<JournalRecord>, SystemFileSystemError
     if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(SystemFileSystemError::JournalCorrupt {
             path: path.to_path_buf(),
-            reason: "journal 不是普通文件".to_owned(),
+            violation: FileSystemJournalViolation::NotRegularFile,
         });
     }
     let bytes = read_all_bytes(pinned.file_mut())
@@ -4620,19 +4662,29 @@ fn read_journal(path: &Path) -> Result<Vec<JournalRecord>, SystemFileSystemError
         if hasher.finalize() != expected_crc {
             return Err(SystemFileSystemError::JournalCorrupt {
                 path: path.to_path_buf(),
-                reason: "完整帧 CRC 不匹配".to_owned(),
+                violation: FileSystemJournalViolation::CrcMismatch {
+                    frame_index: journal_usize_to_u64(records.len() + 1),
+                },
             });
         }
         let record: JournalRecord = serde_json::from_slice(payload).map_err(|source| {
+            let (category, line, column) = journal_json_coordinates(&source);
             SystemFileSystemError::JournalCorrupt {
                 path: path.to_path_buf(),
-                reason: journal_json_error_reason("完整帧 JSON 无效", &source),
+                violation: FileSystemJournalViolation::InvalidJson {
+                    frame_index: journal_usize_to_u64(records.len() + 1),
+                    category,
+                    line,
+                    column,
+                },
             }
         })?;
         let parsed_operation = Uuid::parse_str(&record.operation_id).map_err(|_| {
             SystemFileSystemError::JournalCorrupt {
                 path: path.to_path_buf(),
-                reason: "operation_id 不符合 UUID 语法".to_owned(),
+                violation: FileSystemJournalViolation::InvalidOperationId {
+                    frame_index: journal_usize_to_u64(records.len() + 1),
+                },
             }
         })?;
         if parsed_operation.get_version_num() != 4
@@ -4640,7 +4692,9 @@ fn read_journal(path: &Path) -> Result<Vec<JournalRecord>, SystemFileSystemError
         {
             return Err(SystemFileSystemError::JournalCorrupt {
                 path: path.to_path_buf(),
-                reason: "operation_id 不是规范 UUID v4".to_owned(),
+                violation: FileSystemJournalViolation::NonCanonicalOperationId {
+                    frame_index: journal_usize_to_u64(records.len() + 1),
+                },
             });
         }
         if let Some(first) = records.first()
@@ -4653,7 +4707,9 @@ fn read_journal(path: &Path) -> Result<Vec<JournalRecord>, SystemFileSystemError
         {
             return Err(SystemFileSystemError::JournalCorrupt {
                 path: path.to_path_buf(),
-                reason: "同一 journal 的完整帧身份不一致".to_owned(),
+                violation: FileSystemJournalViolation::FrameIdentityMismatch {
+                    frame_index: journal_usize_to_u64(records.len() + 1),
+                },
             });
         }
         let expected_phase = match records.len() {
@@ -4663,14 +4719,20 @@ fn read_journal(path: &Path) -> Result<Vec<JournalRecord>, SystemFileSystemError
             _ => {
                 return Err(SystemFileSystemError::JournalCorrupt {
                     path: path.to_path_buf(),
-                    reason: "journal 包含多余完整帧".to_owned(),
+                    violation: FileSystemJournalViolation::ExtraFrame {
+                        frame_index: journal_usize_to_u64(records.len() + 1),
+                    },
                 });
             }
         };
         if record.phase != expected_phase {
             return Err(SystemFileSystemError::JournalCorrupt {
                 path: path.to_path_buf(),
-                reason: "journal 阶段顺序无效".to_owned(),
+                violation: FileSystemJournalViolation::PhaseOrder {
+                    frame_index: journal_usize_to_u64(records.len() + 1),
+                    expected: SafeIdentifier::from_validated(journal_phase_name(expected_phase)),
+                    actual: SafeIdentifier::from_validated(journal_phase_name(record.phase)),
+                },
             });
         }
         records.push(record);
@@ -5279,7 +5341,7 @@ fn remove_file_if_exists(path: &Path) -> Result<(), SystemFileSystemError> {
     if !pinned.metadata()?.is_file() {
         return Err(SystemFileSystemError::InvalidPath {
             path: path.to_path_buf(),
-            reason: "目录发布 journal 路径不是普通文件",
+            violation: FileSystemPathViolation::NotRegularFile,
         });
     }
     let identity = FileIdentity::of(pinned.file(), path)?;
@@ -5378,14 +5440,14 @@ fn recover_target(
             return Err(SystemFileSystemError::OutcomeUnknown {
                 target_root: target_root.to_path_buf(),
                 artifacts: residuals.clone(),
-                reason: "恢复产物路径被 reparse point 占用".to_owned(),
+                violation: FileSystemRecoveryViolation::ArtifactReparsePoint,
             });
         }
         if artifact.extension() != Some(OsStr::new("stage")) {
             return Err(SystemFileSystemError::OutcomeUnknown {
                 target_root: target_root.to_path_buf(),
                 artifacts: residuals.clone(),
-                reason: "journal 恢复后仍有 journal 或无 journal 的备份残留".to_owned(),
+                violation: FileSystemRecoveryViolation::UnexpectedResidualArtifact,
             });
         }
     }
@@ -5440,7 +5502,7 @@ fn scan_recovery_artifacts(
         let Some(name) = name.to_str() else {
             continue;
         };
-        if name.starts_with(&prefix)
+        if name.starts_with(prefix)
             && (name.ends_with(".journal") || name.ends_with(".stage") || name.ends_with(".backup"))
         {
             artifacts.push(entry.path());
@@ -5482,11 +5544,11 @@ fn recover_journal(
     let parent = target_root.parent().expect("受信发布目标必有父目录");
     let records = match read_journal(journal) {
         Ok(records) => records,
-        Err(SystemFileSystemError::JournalCorrupt { path, reason }) => {
+        Err(SystemFileSystemError::JournalCorrupt { path, violation }) => {
             return Err(SystemFileSystemError::RecoveryJournalCorrupt {
                 path,
                 artifacts: observed_artifacts.to_vec(),
-                reason,
+                violation,
             });
         }
         Err(source @ SystemFileSystemError::RecoveryJournalCorrupt { .. })
@@ -5527,14 +5589,14 @@ fn recover_journal(
         return Err(SystemFileSystemError::OutcomeUnknown {
             target_root: target_root.to_path_buf(),
             artifacts: observed_artifacts.to_vec(),
-            reason: "journal 目标名称与恢复请求不一致".to_owned(),
+            violation: FileSystemRecoveryViolation::TargetNameMismatch,
         });
     }
     let journal_stem = journal.file_stem().and_then(OsStr::to_str).ok_or_else(|| {
         SystemFileSystemError::RecoveryJournalCorrupt {
             path: journal.to_path_buf(),
             artifacts: observed_artifacts.to_vec(),
-            reason: "journal 文件名不是受信 ASCII 发布名称".to_owned(),
+            violation: FileSystemJournalViolation::InvalidArtifactFileName,
         }
     })?;
     let operation_suffix = format!("-{}", record.operation_id);
@@ -5545,7 +5607,7 @@ fn recover_journal(
         .ok_or_else(|| SystemFileSystemError::RecoveryJournalCorrupt {
             path: journal.to_path_buf(),
             artifacts: observed_artifacts.to_vec(),
-            reason: "journal 文件名与操作 ID 或目标锁身份不一致".to_owned(),
+            violation: FileSystemJournalViolation::ArtifactIdentityMismatch,
         })?;
     let expected_stem = format!("{RESERVED_PREFIX}{artifact_key}{operation_suffix}");
     let expected_stage_name = format!("{expected_stem}.stage")
@@ -5558,7 +5620,7 @@ fn recover_journal(
         return Err(SystemFileSystemError::RecoveryJournalCorrupt {
             path: journal.to_path_buf(),
             artifacts: observed_artifacts.to_vec(),
-            reason: "journal 恢复产物名称不属于该发布操作".to_owned(),
+            violation: FileSystemJournalViolation::ArtifactNamesMismatch,
         });
     }
     let stage = parent.join(OsString::from_wide(&record.stage_name));
@@ -5656,7 +5718,7 @@ fn recover_journal(
         return Err(SystemFileSystemError::OutcomeUnknown {
             target_root: target_root.to_path_buf(),
             artifacts: observed_artifacts.to_vec(),
-            reason: "目标被未知文件身份占用".to_owned(),
+            violation: FileSystemRecoveryViolation::TargetIdentityUnknown,
         });
     }
     let stage_identity = identity_at(&stage).map_err(|source| {
@@ -5669,14 +5731,11 @@ fn recover_journal(
         if let Err(source) =
             rename_without_replace_if_identity(&backup, target_root, record.original_identity)
         {
-            return Err(SystemFileSystemError::OutcomeUnknown {
-                target_root: target_root.to_path_buf(),
-                artifacts: observed_artifacts.to_vec(),
-                reason: format!(
-                    "恢复旧目标时备份身份或重命名状态变化：{}",
-                    windows_fs_error_detail(&source)
-                ),
-            });
+            return Err(recovery_outcome_unknown(
+                target_root,
+                observed_artifacts.to_vec(),
+                source.into(),
+            ));
         }
         let mut post_restore_current = Vec::new();
         if stage_identity.is_some() {
@@ -5692,7 +5751,7 @@ fn recover_journal(
             return Err(SystemFileSystemError::OutcomeUnknown {
                 target_root: target_root.to_path_buf(),
                 artifacts: post_restore_artifacts,
-                reason: "恢复旧目标后文件身份不匹配".to_owned(),
+                violation: FileSystemRecoveryViolation::RestoredIdentityMismatch,
             });
         }
         #[cfg(test)]
@@ -5747,7 +5806,7 @@ fn recover_journal(
         return Err(SystemFileSystemError::OutcomeUnknown {
             target_root: target_root.to_path_buf(),
             artifacts: observed_artifacts.to_vec(),
-            reason: "备份路径出现未知文件身份".to_owned(),
+            violation: FileSystemRecoveryViolation::BackupIdentityUnknown,
         });
     }
     let mut current = Vec::new();
@@ -5759,7 +5818,7 @@ fn recover_journal(
     Err(SystemFileSystemError::RecoveryRequired {
         target_root: target_root.to_path_buf(),
         artifacts: pending,
-        reason: "目标与已知旧目录均缺失".to_owned(),
+        violation: FileSystemRecoveryViolation::OriginalAndTargetMissing,
     })
 }
 
@@ -5779,13 +5838,91 @@ fn remove_matching_directory(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn init_recovery_report(error: &SystemFileSystemError) -> DiagnosticReport {
+        error.diagnostic_report(
+            FileSystemDiagnosticContext::new(
+                FileSystemDiagnosticStage::Init,
+                FileSystemOperation::RecoverTarget,
+            ),
+            StateEffect::Unchanged,
+        )
+    }
+
+    #[test]
+    fn invalid_path_leaf_uses_typed_violation_without_display_protocol() {
+        let source = SystemFileSystemError::InvalidPath {
+            path: PathBuf::from("candidate/data"),
+            violation: FileSystemPathViolation::HardLink,
+        };
+        let report = source.diagnostic_report(
+            FileSystemDiagnosticContext::new(
+                crate::diagnostic::FileSystemDiagnosticStage::Publication,
+                crate::diagnostic::FileSystemOperation::PrepareCandidate,
+            ),
+            StateEffect::Unchanged,
+        );
+        assert_eq!(
+            serde_json::to_value(report).expect("报告应可序列化"),
+            serde_json::json!({
+                "effect": "unchanged",
+                "primary": {
+                    "code": "filesystem.invalid_path",
+                    "stage": "publication",
+                    "issue": {
+                        "family": "file_system",
+                        "details": {
+                            "context": {
+                                "stage": "publication",
+                                "operation": "prepare_candidate"
+                            },
+                            "problem": {
+                                "kind": "invalid_path",
+                                "path": "candidate/data",
+                                "violation": "hard_link"
+                            }
+                        }
+                    },
+                    "resolution": "report_bug"
+                },
+                "related": []
+            })
+        );
+    }
+
+    #[test]
+    fn production_discard_error_projects_publication_and_file_system_facts() {
+        let error = DirectoryDiscardError::new(
+            PathBuf::from("D:/output/.directory-publish-game.stage"),
+            Box::new(SystemFileSystemError::Closed),
+        );
+        let value =
+            serde_json::to_value(error.diagnostic_report()).expect("生产目录丢弃诊断必须可序列化");
+
+        assert_eq!(value["effect"], "recovery_required");
+        assert_eq!(value["primary"]["code"], "publication.discard_failed");
+        assert_eq!(
+            value["primary"]["issue"]["details"]["problem"]["candidate_root"],
+            "D:/output/.directory-publish-game.stage"
+        );
+        assert_eq!(
+            value["primary"]["issue"]["details"]["problem"]["cause"]["diagnostic"]["issue"]["family"],
+            "file_system"
+        );
+        assert_eq!(
+            value["primary"]["issue"]["details"]["problem"]["cause"]["diagnostic"]["issue"]["details"]
+                ["context"]["operation"],
+            "remove"
+        );
+        assert_eq!(value["related"], serde_json::json!([]));
+    }
     use std::ops::Deref;
 
     fn nested_unknown_cleanup_source(target_root: &Path, artifact: &Path) -> SystemFileSystemError {
         SystemFileSystemError::OutcomeUnknown {
             target_root: target_root.to_path_buf(),
             artifacts: vec![artifact.to_path_buf()],
-            reason: "测试中的恢复产物身份未知".to_owned(),
+            violation: FileSystemRecoveryViolation::TargetIdentityUnknown,
         }
     }
 
@@ -5805,7 +5942,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_recovery_state_overrides_nested_cleanup_impact() {
+    fn nested_outcome_unknown_promotes_terminal_effect() {
         let target = PathBuf::from("C:/projects/game");
         let artifact = PathBuf::from("C:/projects/.directory-publish-test.stage");
 
@@ -5816,7 +5953,7 @@ mod tests {
                     vec![artifact.clone()],
                     nested_unknown_cleanup_source(&target, &artifact),
                 ),
-                DiagnosticImpact::RecoveryRequired,
+                StateEffect::OutcomeUnknown,
             ),
             (
                 published_recovery_cleanup_failed(
@@ -5824,31 +5961,16 @@ mod tests {
                     vec![artifact.clone()],
                     nested_unknown_cleanup_source(&target, &artifact),
                 ),
-                DiagnosticImpact::StateAppliedFinalizationFailed,
+                StateEffect::OutcomeUnknown,
             ),
         ] {
-            let diagnostic = error.safe_diagnostic(
-                DiagnosticStage::Init,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            );
-            assert_eq!(diagnostic.impact, expected);
+            let report = init_recovery_report(&error);
+            assert_eq!(report.effect(), expected);
             assert_eq!(
-                diagnostic.action,
-                DiagnosticAction::PreserveRecoveryArtifacts
+                report.primary().resolution(),
+                crate::diagnostic::DiagnosticResolution::PreserveRecoveryArtifacts
             );
-
-            let report = error.into_failure_report(
-                DiagnosticStage::Init,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            );
-            assert!(
-                report
-                    .public_diagnostics()
-                    .all(|diagnostic| diagnostic.impact == expected),
-                "内层机制诊断不得推翻外层已经确认的恢复终态"
-            );
+            assert_eq!(report.related().len(), 1, "清理根因必须作为相关失败保留");
         }
     }
 
@@ -6354,8 +6476,10 @@ mod tests {
         ];
         assert!(matches!(
             validate_declared_windows_paths(&mappings, &[], &[]),
-            Err(SystemFileSystemError::InvalidPath { reason, .. })
-                if reason.contains("大小写")
+            Err(SystemFileSystemError::InvalidPath {
+                violation: FileSystemPathViolation::CaseCollision,
+                ..
+            })
         ));
     }
 
@@ -6799,7 +6923,7 @@ mod tests {
                 if matches!(
                     *source,
                     SystemFileSystemError::InvalidPath {
-                        reason: "目录树包含硬链接文件",
+                        violation: FileSystemPathViolation::HardLink,
                         ..
                     }
                 )
@@ -6899,7 +7023,7 @@ mod tests {
             error,
             DirectoryPrepareError::NotPrepared { source, .. }
                 if matches!(*source, SystemFileSystemError::InvalidPath {
-                    reason: "复制来源包含硬链接文件",
+                    violation: FileSystemPathViolation::HardLink,
                     ..
                 })
         ));
@@ -6927,7 +7051,7 @@ mod tests {
         assert!(matches!(
             error,
             SystemFileSystemError::InvalidPath {
-                reason: "复制来源文件在枚举后身份或大小发生变化",
+                violation: FileSystemPathViolation::SourceChanged,
                 ..
             }
         ));
@@ -7032,7 +7156,7 @@ mod tests {
         assert!(matches!(
             error,
             SystemFileSystemError::InvalidPath {
-                reason: "复制来源文件在枚举后身份或大小发生变化",
+                violation: FileSystemPathViolation::SourceChanged,
                 ..
             }
         ));
@@ -7137,7 +7261,7 @@ mod tests {
         assert!(matches!(
             error,
             SystemFileSystemError::InvalidPath {
-                reason: "复制来源包含硬链接文件",
+                violation: FileSystemPathViolation::HardLink,
                 ..
             }
         ));
@@ -7220,7 +7344,7 @@ mod tests {
             root.list_directory(directory).await,
             Err(ListDirectoryError::Io {
                 source: SystemFileSystemError::InvalidPath {
-                    reason: "目录列举拒绝硬链接文件",
+                    violation: FileSystemPathViolation::HardLink,
                     ..
                 },
                 ..
@@ -7564,8 +7688,10 @@ mod tests {
             root.list_scoped_directory(&scope, scoped_path("assets"))
                 .await,
             Err(ScopedDirectoryEditError::Failed { source, .. })
-                if matches!(*source, SystemFileSystemError::InvalidPath { reason, .. }
-                    if reason.contains("硬链接"))
+                if matches!(*source, SystemFileSystemError::InvalidPath {
+                    violation: FileSystemPathViolation::HardLink,
+                    ..
+                })
         ));
         assert!(matches!(
             root.write_scoped_file(
@@ -7575,8 +7701,10 @@ mod tests {
             )
             .await,
             Err(ScopedDirectoryEditError::Failed { source, .. })
-                if matches!(*source, SystemFileSystemError::InvalidPath { reason, .. }
-                    if reason.contains("硬链接"))
+                if matches!(*source, SystemFileSystemError::InvalidPath {
+                    violation: FileSystemPathViolation::HardLink,
+                    ..
+                })
         ));
         assert_eq!(
             fs::read(staging_root.join("assets/catalog.json")).unwrap(),
@@ -7818,8 +7946,10 @@ mod tests {
         assert!(matches!(
             root.publish(staged).await,
             Err(DirectoryPublishError::NotAttempted { source, .. })
-                if matches!(*source, SystemFileSystemError::InvalidPath { reason, .. }
-                    if reason.contains("硬链接"))
+                if matches!(*source, SystemFileSystemError::InvalidPath {
+                    violation: FileSystemPathViolation::HardLink,
+                    ..
+                })
         ));
         assert_eq!(
             root.candidate_validation_counts(),
@@ -8019,8 +8149,10 @@ mod tests {
 
         assert!(matches!(
             read_journal(&path),
-            Err(SystemFileSystemError::JournalCorrupt { reason, .. })
-                if reason.contains("CRC")
+            Err(SystemFileSystemError::JournalCorrupt {
+                violation: FileSystemJournalViolation::CrcMismatch { frame_index: 1 },
+                ..
+            })
         ));
     }
 
@@ -8050,15 +8182,17 @@ mod tests {
         };
         assert_eq!(artifacts, &observed);
 
-        let diagnostic = error.safe_diagnostic(
-            DiagnosticStage::Init,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
-        );
-        assert_eq!(diagnostic.impact, DiagnosticImpact::RecoveryRequired);
+        let report = init_recovery_report(&error);
+        assert_eq!(report.effect(), StateEffect::RecoveryRequired);
+        let wire = serde_json::to_value(report).expect("恢复诊断必须可序列化");
         assert_eq!(
-            diagnostic.recovery,
-            observed.iter().map(RecoveryFact::path).collect::<Vec<_>>()
+            wire.pointer("/primary/issue/details/problem/artifacts"),
+            Some(&serde_json::json!(
+                observed
+                    .iter()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .collect::<Vec<_>>()
+            ))
         );
     }
 
@@ -8313,16 +8447,15 @@ mod tests {
             }
             source => panic!("恢复必须保留已确认发布终态，实际为 {source:?}"),
         };
-        let diagnostic = recovery.source_error().safe_diagnostic(
-            DiagnosticStage::Init,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
-        );
+        let report = init_recovery_report(recovery.source_error());
+        assert_eq!(report.effect(), StateEffect::AppliedFinalizationFailed);
+        let wire = serde_json::to_value(report).expect("已发布清理失败必须可序列化");
         assert_eq!(
-            diagnostic.impact,
-            DiagnosticImpact::StateAppliedFinalizationFailed
+            wire.pointer("/primary/issue/details/problem/artifacts")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(published_artifacts.len())
         );
-        assert_eq!(diagnostic.recovery.len(), published_artifacts.len() + 1);
 
         assert_eq!(
             root.recover(target.clone())
@@ -8487,13 +8620,14 @@ mod tests {
                     recovery.source_error().as_ref(),
                     SystemFileSystemError::RecoveryCleanupFailed { .. }
                 ));
-                let diagnostic = recovery.source_error().safe_diagnostic(
-                    DiagnosticStage::Init,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckProjectState,
+                let report = init_recovery_report(recovery.source_error());
+                assert_eq!(report.effect(), StateEffect::RecoveryRequired);
+                let wire = serde_json::to_value(report).expect("恢复失败必须可序列化");
+                assert!(
+                    wire.pointer("/primary/issue/details/problem/artifacts")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|artifacts| artifacts.len() >= 2)
                 );
-                assert_eq!(diagnostic.impact, DiagnosticImpact::RecoveryRequired);
-                assert!(diagnostic.recovery.len() >= 2);
             }
             for _ in 0..2 {
                 let staged = root
@@ -8517,12 +8651,12 @@ mod tests {
 
     #[tokio::test]
     async fn residual_identity_changes_do_not_override_a_known_target_state() {
-        for (phase, extension, expected_impact) in [
-            ("original-move", "stage", DiagnosticImpact::RecoveryRequired),
+        for (phase, extension, expected_effect) in [
+            ("original-move", "stage", StateEffect::RecoveryRequired),
             (
                 "candidate-visible",
                 "backup",
-                DiagnosticImpact::StateAppliedFinalizationFailed,
+                StateEffect::AppliedFinalizationFailed,
             ),
         ] {
             let temporary = tempfile::tempdir().expect("应该可创建临时目录");
@@ -8546,12 +8680,8 @@ mod tests {
                 .recover(target.clone())
                 .await
                 .expect_err("身份异常必须保留恢复现场");
-            let diagnostic = recovery.source_error().safe_diagnostic(
-                DiagnosticStage::Init,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            );
-            assert_eq!(diagnostic.impact, expected_impact);
+            let report = init_recovery_report(recovery.source_error());
+            assert_eq!(report.effect(), expected_effect);
             match (phase, recovery.source_error().as_ref()) {
                 ("original-move", SystemFileSystemError::RecoveryCleanupFailed { .. }) => {}
                 (

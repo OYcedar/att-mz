@@ -7,9 +7,11 @@ use pcre2::bytes::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::diagnostic::{
-    ConfigurationTomlFailureKind, DiagnosticAction, DiagnosticCode, DiagnosticFailureKind,
-    DiagnosticImpact, DiagnosticReason, DiagnosticStage, DiagnosticSubject, SafeDiagnostic,
-    SafeDiagnosticSource,
+    Diagnostic, DiagnosticReport, Pcre2Failure, Pcre2FailureKind, RpgMakerDiagnosticLocation,
+    RpgMakerDiagnosticLocationStep, RpgMakerDiagnosticSource, RpgMakerDialogueDefinitionOrigin,
+    RpgMakerDialogueDefinitionProblem, RpgMakerDialogueProjectionProblem, RpgMakerIssue,
+    RpgMakerJsonFailureKind, RpgMakerProjectionFailureKind, RpgMakerTomlFailureKind,
+    SafeIdentifier, StateEffect,
 };
 use crate::json_diagnostic::JsonErrorCategory;
 
@@ -17,7 +19,7 @@ use super::model::{
     DialogueLinePart, DialogueLineRecipe, DialogueWriteRecipe, ProjectionModelError,
     TextUnitContent, TextUnitRole,
 };
-use super::text::RpgMakerLocation;
+use super::text::{RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -558,13 +560,6 @@ impl MvDialogueTomlClassification {
             Self::Data => "data",
         }
     }
-
-    const fn diagnostic_failure(self) -> ConfigurationTomlFailureKind {
-        match self {
-            Self::Syntax => ConfigurationTomlFailureKind::Syntax,
-            Self::Data => ConfigurationTomlFailureKind::InvalidValue,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -647,112 +642,106 @@ impl Error for MvDialogueDefinitionError {
 }
 
 impl MvDialogueDefinitionError {
-    /// 只从类型化解析事实建立公开投影；规则正文与底层错误文本不会进入结果。
-    pub(crate) fn safe_diagnostic(
+    pub(crate) fn diagnostic_report(
         &self,
-        stage: DiagnosticStage,
-        impact: DiagnosticImpact,
-        fallback_action: DiagnosticAction,
-    ) -> SafeDiagnostic {
-        let (subject, reason, action) = match self {
-            Self::EmptyDocument => (
-                DiagnosticSubject::component("mv_dialogue_definition"),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::MissingRequiredValue,
-                    "structure=empty_document; required=rule_array",
-                ),
-                fallback_action,
-            ),
-            Self::MissingRuleArray => (
-                DiagnosticSubject::field("mv_dialogue.rule"),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::MissingRequiredValue,
-                    "structure=missing_rule_array",
-                ),
-                fallback_action,
-            ),
-            Self::InvalidToml(source) => (
-                DiagnosticSubject::component("mv_dialogue_definition"),
-                DiagnosticReason::InvalidToml {
-                    line: source.line,
-                    column: source.column,
-                    resource: "mv_dialogue_definition".to_owned(),
-                    failure: source.classification.diagnostic_failure(),
+        origin: RpgMakerDialogueDefinitionOrigin,
+    ) -> DiagnosticReport {
+        assert_eq!(
+            origin,
+            RpgMakerDialogueDefinitionOrigin::ProjectSnapshot,
+            "外部 MV Dialogue TOML 诊断必须使用 external_diagnostic_report 保留路径"
+        );
+        DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::rpg_maker(RpgMakerIssue::project_dialogue_definition(
+                self.diagnostic_problem(),
+            )),
+        )
+    }
+
+    pub(crate) fn external_diagnostic_report(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> DiagnosticReport {
+        DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::rpg_maker(RpgMakerIssue::external_dialogue_definition(
+                path,
+                self.diagnostic_problem(),
+            )),
+        )
+    }
+
+    pub(crate) fn diagnostic_problem(&self) -> RpgMakerDialogueDefinitionProblem {
+        match self {
+            Self::EmptyDocument => RpgMakerDialogueDefinitionProblem::EmptyDocument,
+            Self::MissingRuleArray => RpgMakerDialogueDefinitionProblem::MissingRuleArray,
+            Self::InvalidToml(source) => RpgMakerDialogueDefinitionProblem::InvalidToml {
+                failure: match source.classification {
+                    MvDialogueTomlClassification::Syntax => RpgMakerTomlFailureKind::Syntax,
+                    MvDialogueTomlClassification::Data => RpgMakerTomlFailureKind::InvalidValue,
                 },
-                fallback_action,
-            ),
-            Self::InvalidCanonicalJson(source) => (
-                DiagnosticSubject::component("project_mv_dialogue_definition"),
-                DiagnosticReason::failure_with_detail(
-                    json_failure_kind(source),
-                    json_error_detail("canonical_json", source),
-                ),
-                DiagnosticAction::CheckProjectState,
-            ),
-            Self::EncodeCanonicalJson(source) => (
-                DiagnosticSubject::operation("encode_mv_dialogue_definition"),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::InternalInvariant,
-                    json_error_detail("canonical_json", source),
-                ),
-                DiagnosticAction::ReportBug,
-            ),
-            Self::EmptyPattern { rule_number } => (
-                mv_dialogue_rule_subject(*rule_number, "pattern"),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::MissingRequiredValue,
-                    format!("rule_number={rule_number}; field=pattern"),
-                ),
-                fallback_action,
-            ),
+                line: source.line,
+                column: source.column,
+            },
+            Self::InvalidCanonicalJson(source) => {
+                RpgMakerDialogueDefinitionProblem::InvalidCanonicalJson {
+                    category: dialogue_json_failure(source),
+                    line: source.line(),
+                    column: source.column(),
+                }
+            }
+            Self::EncodeCanonicalJson(source) => {
+                RpgMakerDialogueDefinitionProblem::EncodeCanonicalJson {
+                    category: dialogue_json_failure(source),
+                    line: source.line(),
+                    column: source.column(),
+                }
+            }
+            Self::EmptyPattern { rule_number } => RpgMakerDialogueDefinitionProblem::EmptyPattern {
+                rule_number: *rule_number,
+            },
             Self::InvalidPattern {
                 rule_number,
                 source,
-            } => (
-                mv_dialogue_rule_subject(*rule_number, "pattern"),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::InvalidSyntax,
-                    format!(
-                        "rule_number={rule_number}; engine=pcre2; kind={}; code={}; offset={}",
-                        pcre2_error_kind(source),
-                        source.code(),
-                        optional_offset(source.offset())
-                    ),
-                ),
-                fallback_action,
-            ),
+            } => RpgMakerDialogueDefinitionProblem::InvalidPattern {
+                rule_number: *rule_number,
+                failure: dialogue_pcre2_failure(source),
+            },
             Self::InvalidNamedCaptures {
                 rule_number,
                 captures,
-            } => (
-                mv_dialogue_rule_subject(*rule_number, "named_captures"),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::InvalidValue,
-                    named_capture_detail(*rule_number, captures),
-                ),
-                fallback_action,
-            ),
-        };
-        SafeDiagnostic::new(
-            DiagnosticCode::ExtractBuiltin,
-            stage,
-            subject,
-            reason,
-            impact,
-            action,
-        )
+            } => {
+                let safe_actual_captures = captures
+                    .iter()
+                    .filter(|capture| is_safe_capture_name(capture))
+                    .map(SafeIdentifier::from_validated)
+                    .collect::<Vec<_>>();
+                RpgMakerDialogueDefinitionProblem::InvalidNamedCaptures {
+                    rule_number: *rule_number,
+                    hidden_count: captures.len().saturating_sub(safe_actual_captures.len()),
+                    actual_count: captures.len(),
+                    safe_actual_captures,
+                }
+            }
+        }
     }
 }
 
-impl SafeDiagnosticSource for MvDialogueDefinitionError {
-    fn safe_diagnostic_source(
-        &self,
-        stage: DiagnosticStage,
-        impact: DiagnosticImpact,
-        fallback_action: DiagnosticAction,
-    ) -> SafeDiagnostic {
-        self.safe_diagnostic(stage, impact, fallback_action)
-    }
+pub(crate) fn external_invalid_utf8_diagnostic_report(
+    path: impl AsRef<std::path::Path>,
+    source: &std::str::Utf8Error,
+) -> DiagnosticReport {
+    DiagnosticReport::new(
+        StateEffect::Unchanged,
+        Diagnostic::rpg_maker(RpgMakerIssue::external_dialogue_definition(
+            path,
+            RpgMakerDialogueDefinitionProblem::InvalidUtf8 {
+                valid_up_to: source.valid_up_to(),
+                error_len: source.error_len(),
+            },
+        )),
+    )
 }
 
 #[derive(Debug)]
@@ -867,124 +856,70 @@ impl Error for MvDialogueProjectionError {
 }
 
 impl MvDialogueProjectionError {
-    /// 输出规则号、逻辑位置与稳定机制码，但不输出被匹配的原文或规则正文。
-    pub(crate) fn safe_diagnostic(
-        &self,
-        stage: DiagnosticStage,
-        impact: DiagnosticImpact,
-        fallback_action: DiagnosticAction,
-    ) -> SafeDiagnostic {
-        let (subject, reason, action) = match self {
+    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
+        DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::rpg_maker(RpgMakerIssue::dialogue_projection(
+                self.diagnostic_problem(),
+            )),
+        )
+    }
+
+    pub(crate) fn diagnostic_problem(&self) -> RpgMakerDialogueProjectionProblem {
+        match self {
             Self::Match {
                 rule_number,
                 location,
                 source,
-            } => (
-                DiagnosticSubject::field(location.to_string()),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::InvalidValue,
-                    format!(
-                        "rule_number={rule_number}; operation=match; engine=pcre2; kind={}; code={}; offset={}",
-                        pcre2_error_kind(source),
-                        source.code(),
-                        optional_offset(source.offset())
-                    ),
-                ),
-                fallback_action,
-            ),
+            } => RpgMakerDialogueProjectionProblem::Match {
+                rule_number: *rule_number,
+                location: dialogue_diagnostic_location(location),
+                failure: dialogue_pcre2_failure(source),
+            },
             Self::ZeroWidthMatch {
                 rule_number,
                 location,
-            } => (
-                DiagnosticSubject::field(location.to_string()),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::InvalidValue,
-                    format!("rule_number={rule_number}; match=zero_width"),
-                ),
-                fallback_action,
-            ),
+            } => RpgMakerDialogueProjectionProblem::ZeroWidthMatch {
+                rule_number: *rule_number,
+                location: dialogue_diagnostic_location(location),
+            },
             Self::MissingSpeakerCapture {
                 rule_number,
                 location,
-            } => (
-                DiagnosticSubject::field(location.to_string()),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::MissingRequiredValue,
-                    format!("rule_number={rule_number}; capture=speaker; participation=missing"),
-                ),
-                fallback_action,
-            ),
+            } => RpgMakerDialogueProjectionProblem::MissingSpeakerCapture {
+                rule_number: *rule_number,
+                location: dialogue_diagnostic_location(location),
+            },
             Self::InvalidSpeakerCaptureRange {
                 rule_number,
                 location,
-            } => (
-                DiagnosticSubject::field(location.to_string()),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::InvalidValue,
-                    format!(
-                        "rule_number={rule_number}; capture=speaker; range=outside_complete_match_or_not_utf8_boundary"
-                    ),
-                ),
-                fallback_action,
-            ),
+            } => RpgMakerDialogueProjectionProblem::InvalidSpeakerCaptureRange {
+                rule_number: *rule_number,
+                location: dialogue_diagnostic_location(location),
+            },
             Self::MultipleRulesOwnField {
                 location,
                 first_rule,
                 second_rule,
-            } => (
-                DiagnosticSubject::field(location.to_string()),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::ConflictingValues,
-                    format!(
-                        "ownership=multiple_rules; first_rule={first_rule}; second_rule={second_rule}"
-                    ),
-                ),
-                fallback_action,
-            ),
-            Self::DifferentSpeakers { location } => (
-                DiagnosticSubject::field(location.to_string()),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::ConflictingValues,
-                    "capture=speaker; non_blank_values=different",
-                ),
-                fallback_action,
-            ),
-            Self::RuleCapturedNoSpeaker { rule_number } => (
-                mv_dialogue_rule_subject(*rule_number, "speaker"),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::RequirementFailed,
-                    format!("rule_number={rule_number}; non_blank_capture_count=0"),
-                ),
-                fallback_action,
-            ),
-            Self::InvalidRecipe(source) => (
-                DiagnosticSubject::operation("build_mv_dialogue_recipe"),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::InternalInvariant,
-                    projection_model_detail(source),
-                ),
-                DiagnosticAction::ReportBug,
-            ),
-        };
-        SafeDiagnostic::new(
-            DiagnosticCode::ExtractBuiltin,
-            stage,
-            subject,
-            reason,
-            impact,
-            action,
-        )
-    }
-}
-
-impl SafeDiagnosticSource for MvDialogueProjectionError {
-    fn safe_diagnostic_source(
-        &self,
-        stage: DiagnosticStage,
-        impact: DiagnosticImpact,
-        fallback_action: DiagnosticAction,
-    ) -> SafeDiagnostic {
-        self.safe_diagnostic(stage, impact, fallback_action)
+            } => RpgMakerDialogueProjectionProblem::MultipleRulesOwnField {
+                location: dialogue_diagnostic_location(location),
+                first_rule: *first_rule,
+                second_rule: *second_rule,
+            },
+            Self::DifferentSpeakers { location } => {
+                RpgMakerDialogueProjectionProblem::DifferentSpeakers {
+                    location: dialogue_diagnostic_location(location),
+                }
+            }
+            Self::RuleCapturedNoSpeaker { rule_number } => {
+                RpgMakerDialogueProjectionProblem::RuleCapturedNoSpeaker {
+                    rule_number: *rule_number,
+                }
+            }
+            Self::InvalidRecipe(source) => RpgMakerDialogueProjectionProblem::InvalidRecipe {
+                failure: dialogue_projection_failure(source),
+            },
+        }
     }
 }
 
@@ -1002,8 +937,8 @@ fn source_line_column(source: &str, byte_offset: usize) -> (u64, u64) {
         .count()
         + 1;
     (
-        u64::try_from(line).unwrap_or(u64::MAX),
-        u64::try_from(column).unwrap_or(u64::MAX),
+        u64::try_from(line).expect("当前目标平台的 JSON 行号必须能用 u64 表达"),
+        u64::try_from(column).expect("当前目标平台的 JSON 列号必须能用 u64 表达"),
     )
 }
 
@@ -1011,22 +946,98 @@ fn json_error_classification(source: &serde_json::Error) -> &'static str {
     JsonErrorCategory::from(source).storage_name()
 }
 
-fn json_failure_kind(source: &serde_json::Error) -> DiagnosticFailureKind {
+fn dialogue_json_failure(source: &serde_json::Error) -> RpgMakerJsonFailureKind {
     match JsonErrorCategory::from(source) {
-        JsonErrorCategory::Syntax
-        | JsonErrorCategory::Eof
-        | JsonErrorCategory::DuplicateObjectKey => DiagnosticFailureKind::InvalidSyntax,
-        JsonErrorCategory::Io | JsonErrorCategory::Data => DiagnosticFailureKind::InvalidValue,
+        JsonErrorCategory::Io => RpgMakerJsonFailureKind::Io,
+        JsonErrorCategory::Syntax => RpgMakerJsonFailureKind::Syntax,
+        JsonErrorCategory::Data => RpgMakerJsonFailureKind::Data,
+        JsonErrorCategory::Eof => RpgMakerJsonFailureKind::Eof,
+        JsonErrorCategory::DuplicateObjectKey => RpgMakerJsonFailureKind::DuplicateObjectKey,
     }
 }
 
-fn json_error_detail(format: &str, source: &serde_json::Error) -> String {
-    format!(
-        "format={format}; json_category={}; line={}; column={}",
-        json_error_classification(source),
-        source.line(),
-        source.column()
+fn dialogue_pcre2_failure(source: &pcre2::Error) -> Pcre2Failure {
+    Pcre2Failure {
+        kind: match source.kind() {
+            pcre2::ErrorKind::Compile => Pcre2FailureKind::Compile,
+            pcre2::ErrorKind::JIT => Pcre2FailureKind::Jit,
+            pcre2::ErrorKind::Match => Pcre2FailureKind::Match,
+            pcre2::ErrorKind::Info => Pcre2FailureKind::Info,
+            pcre2::ErrorKind::Option => Pcre2FailureKind::Option,
+            _ => Pcre2FailureKind::Unrecognized,
+        },
+        code: source.code(),
+        offset: source.offset(),
+    }
+}
+
+fn dialogue_diagnostic_location(location: &RpgMakerLocation) -> RpgMakerDiagnosticLocation {
+    RpgMakerDiagnosticLocation::new(
+        match location.source() {
+            RpgMakerSource::Data(file) => RpgMakerDiagnosticSource::data(file.file_name()),
+            RpgMakerSource::DataFile(file) => RpgMakerDiagnosticSource::data_file(file.as_str()),
+            RpgMakerSource::Map(map_id) => RpgMakerDiagnosticSource::map(map_id.get()),
+            RpgMakerSource::PluginParameter {
+                plugin_index,
+                plugin_name,
+                parameter_name,
+            } => RpgMakerDiagnosticSource::plugin_parameter(
+                *plugin_index,
+                plugin_name,
+                parameter_name,
+            ),
+        },
+        location
+            .steps()
+            .iter()
+            .map(|step| match step {
+                RpgMakerLocationStep::ObjectKey(key) => {
+                    RpgMakerDiagnosticLocationStep::object_key(key)
+                }
+                RpgMakerLocationStep::ArrayIndex(index) => {
+                    RpgMakerDiagnosticLocationStep::array_index(*index)
+                }
+                RpgMakerLocationStep::DecodeJsonString => {
+                    RpgMakerDiagnosticLocationStep::decode_json_string()
+                }
+            })
+            .collect(),
     )
+}
+
+fn dialogue_projection_failure(source: &ProjectionModelError) -> RpgMakerProjectionFailureKind {
+    match source {
+        ProjectionModelError::EmptyScalarFieldKey => {
+            RpgMakerProjectionFailureKind::EmptyScalarFieldKey
+        }
+        ProjectionModelError::EventBlockCoverageRequired => {
+            RpgMakerProjectionFailureKind::EventBlockCoverageRequired
+        }
+        ProjectionModelError::InvalidEventBlockCoverage => {
+            RpgMakerProjectionFailureKind::InvalidEventBlockCoverage
+        }
+        ProjectionModelError::MutationClaimTargetMismatch => {
+            RpgMakerProjectionFailureKind::MutationClaimTargetMismatch
+        }
+        ProjectionModelError::RecipeHasNoTextSlot => {
+            RpgMakerProjectionFailureKind::RecipeHasNoTextSlot
+        }
+        ProjectionModelError::DuplicateProjectionSlot { .. } => {
+            RpgMakerProjectionFailureKind::DuplicateProjectionSlot
+        }
+        ProjectionModelError::MultipleBodyLinesInPhysicalLine => {
+            RpgMakerProjectionFailureKind::MultipleBodyLinesInPhysicalLine
+        }
+        ProjectionModelError::DuplicateDialogueBodyLine { .. } => {
+            RpgMakerProjectionFailureKind::DuplicateDialogueBodyLine
+        }
+        ProjectionModelError::NonContiguousDialogueBodyLines { .. } => {
+            RpgMakerProjectionFailureKind::NonContiguousDialogueBodyLines
+        }
+        ProjectionModelError::MixedDirectAndInlineSpeaker => {
+            RpgMakerProjectionFailureKind::MixedDirectAndInlineSpeaker
+        }
+    }
 }
 
 fn pcre2_error_kind(source: &pcre2::Error) -> &'static str {
@@ -1038,14 +1049,6 @@ fn pcre2_error_kind(source: &pcre2::Error) -> &'static str {
         pcre2::ErrorKind::Option => "option",
         _ => "unknown",
     }
-}
-
-fn optional_offset(offset: Option<usize>) -> String {
-    offset.map_or_else(|| "none".to_owned(), |value| value.to_string())
-}
-
-fn mv_dialogue_rule_subject(rule_number: usize, field: &str) -> DiagnosticSubject {
-    DiagnosticSubject::field(format!("mv_dialogue.rule[{rule_number}].{field}"))
 }
 
 fn named_capture_detail(rule_number: usize, captures: &[String]) -> String {
@@ -1320,53 +1323,52 @@ pattern = '\\n<(?<speaker>[^>]+)>'
         let toml_error =
             MvDialogueDefinition::parse_toml(&format!("[[rule]\npattern = '{TOML_BODY}'\n"))
                 .expect_err("缺少右方括号的 TOML 应拒绝");
-        let diagnostic = toml_error.safe_diagnostic(
-            DiagnosticStage::CommandPreparation,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixInput,
-        );
-        assert_eq!(diagnostic.code, DiagnosticCode::ExtractBuiltin);
-        let DiagnosticReason::InvalidToml {
+        let RpgMakerDialogueDefinitionProblem::InvalidToml {
+            failure,
             line,
             column,
-            resource,
-            failure,
-        } = &diagnostic.reason
+        } = toml_error.diagnostic_problem()
         else {
             panic!("TOML 失败应提供分类与行列")
         };
-        assert_eq!(*line, Some(1));
+        assert_eq!(failure, RpgMakerTomlFailureKind::Syntax);
+        assert_eq!(line, Some(1));
         assert!(column.is_some());
-        assert_eq!(resource, "mv_dialogue_definition");
-        assert_eq!(*failure, ConfigurationTomlFailureKind::Syntax);
-        let serialized = serde_json::to_string(&diagnostic).expect("安全 TOML 诊断应可序列化");
-        assert!(!serialized.contains(TOML_BODY));
+        let wire =
+            serde_json::to_value(toml_error.external_diagnostic_report("config/mv-dialogue.toml"))
+                .expect("MV 对话定义诊断必须可序列化");
+        assert_eq!(
+            wire["primary"]["code"],
+            "rpg_maker.dialogue.definition.invalid_toml"
+        );
+        assert_eq!(wire["primary"]["stage"], "command_preparation");
+        assert_eq!(
+            wire["primary"]["issue"]["details"]["problem"]["problem"]["failure"],
+            "syntax"
+        );
+        assert!(!wire.to_string().contains(TOML_BODY));
 
         const TOML_DATA_VALUE: &str = "TOML_DATA_VALUE_SENTINEL";
         let toml_data_error =
             MvDialogueDefinition::parse_toml(&format!("other = '{TOML_DATA_VALUE}'\n"))
                 .expect_err("未知 TOML 字段应作为 data 分类拒绝");
-        let diagnostic = toml_data_error.safe_diagnostic(
-            DiagnosticStage::CommandPreparation,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixInput,
-        );
-        let DiagnosticReason::InvalidToml {
+        let RpgMakerDialogueDefinitionProblem::InvalidToml {
             line,
             column,
             failure,
-            ..
-        } = &diagnostic.reason
+        } = toml_data_error.diagnostic_problem()
         else {
             panic!("TOML data 失败应提供分类与行列")
         };
         assert!(line.is_some());
         assert!(column.is_some());
-        assert_eq!(*failure, ConfigurationTomlFailureKind::InvalidValue);
+        assert_eq!(failure, RpgMakerTomlFailureKind::InvalidValue);
         assert!(
-            !serde_json::to_string(&diagnostic)
-                .expect("安全 TOML data 诊断应可序列化")
-                .contains(TOML_DATA_VALUE)
+            !serde_json::to_string(
+                &toml_data_error.external_diagnostic_report("config/mv-dialogue.toml")
+            )
+            .expect("安全 TOML data 报告应可序列化")
+            .contains(TOML_DATA_VALUE)
         );
 
         const JSON_VALUE: &str = "JSON_VALUE_SENTINEL";
@@ -1374,22 +1376,23 @@ pattern = '\\n<(?<speaker>[^>]+)>'
             "{{\n\"rules\": \"{JSON_VALUE}\"\n}}"
         ))
         .expect_err("rules 类型错误的 JSON 应拒绝");
-        let diagnostic = json_error.safe_diagnostic(
-            DiagnosticStage::Extract,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
-        );
-        let DiagnosticReason::FailureWithDetail { detail, .. } = &diagnostic.reason else {
+        let RpgMakerDialogueDefinitionProblem::InvalidCanonicalJson {
+            category,
+            line,
+            column,
+        } = json_error.diagnostic_problem()
+        else {
             panic!("JSON 失败应提供闭集分类与行列")
         };
-        assert!(detail.contains("format=canonical_json"));
-        assert!(detail.contains("json_category=data"));
-        assert!(detail.contains("line=2"));
-        assert!(!detail.contains(JSON_VALUE));
+        assert_eq!(category, RpgMakerJsonFailureKind::Data);
+        assert_eq!(line, 2);
+        assert!(column > 0);
         assert!(
-            !serde_json::to_string(&diagnostic)
-                .expect("安全 JSON 诊断应可序列化")
-                .contains(JSON_VALUE)
+            !serde_json::to_string(
+                &json_error.diagnostic_report(RpgMakerDialogueDefinitionOrigin::ProjectSnapshot)
+            )
+            .expect("安全 JSON 报告应可序列化")
+            .contains(JSON_VALUE)
         );
 
         const PATTERN_BODY: &str = "PATTERN_BODY_SENTINEL";
@@ -1401,18 +1404,18 @@ pattern = '\\n<(?<speaker>[^>]+)>'
             Err(error) => error,
             Ok(_) => panic!("未闭合 PCRE2 应拒绝"),
         };
-        let diagnostic = pattern_error.safe_diagnostic(
-            DiagnosticStage::CommandPreparation,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixInput,
-        );
-        let DiagnosticReason::FailureWithDetail { detail, .. } = &diagnostic.reason else {
+        let RpgMakerDialogueDefinitionProblem::InvalidPattern { failure, .. } =
+            pattern_error.diagnostic_problem()
+        else {
             panic!("PCRE2 编译失败应提供稳定 code/offset")
         };
-        assert!(detail.contains("engine=pcre2"));
-        assert!(detail.contains("code="));
-        assert!(detail.contains("offset="));
-        assert!(!detail.contains(PATTERN_BODY));
+        assert_ne!(failure.code, 0);
+        assert!(failure.offset.is_some());
+        assert!(
+            !serde_json::to_string(&pattern_error.external_diagnostic_report("dialogue.toml"))
+                .expect("PCRE2 报告应可序列化")
+                .contains(PATTERN_BODY)
+        );
     }
 
     #[test]
@@ -1426,17 +1429,29 @@ pattern = '\\n<(?<speaker>[^>]+)>'
                 CONTROL_CAPTURE.to_owned(),
             ],
         };
-        let diagnostic = error.safe_diagnostic(
-            DiagnosticStage::CommandPreparation,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixInput,
-        );
-        let DiagnosticReason::FailureWithDetail { detail, .. } = &diagnostic.reason else {
+        let RpgMakerDialogueDefinitionProblem::InvalidNamedCaptures {
+            safe_actual_captures,
+            actual_count,
+            hidden_count,
+            ..
+        } = error.diagnostic_problem()
+        else {
             panic!("命名捕获错误应提供安全名称清单")
         };
-        assert!(detail.contains("safe_actual_captures=[speaker,safe_capture_2]"));
-        assert!(detail.contains("hidden_capture_count=1"));
-        assert!(!detail.contains(CONTROL_CAPTURE));
+        assert_eq!(actual_count, 3);
+        assert_eq!(hidden_count, 1);
+        assert_eq!(
+            safe_actual_captures
+                .iter()
+                .map(SafeIdentifier::as_str)
+                .collect::<Vec<_>>(),
+            ["speaker", "safe_capture_2"]
+        );
+        assert!(
+            !serde_json::to_string(&error.external_diagnostic_report("dialogue.toml"))
+                .expect("命名捕获报告应可序列化")
+                .contains(CONTROL_CAPTURE)
+        );
     }
 
     #[test]
@@ -1447,21 +1462,27 @@ pattern = '\\n<(?<speaker>[^>]+)>'
             first_rule: 2,
             second_rule: 5,
         };
-        let diagnostic = conflict.safe_diagnostic(
-            DiagnosticStage::Extract,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
-        );
-        assert_eq!(
-            diagnostic.subject,
-            DiagnosticSubject::field(exact_location.to_string())
-        );
-        let DiagnosticReason::FailureWithDetail { failure, detail } = diagnostic.reason else {
+        let RpgMakerDialogueProjectionProblem::MultipleRulesOwnField {
+            location,
+            first_rule,
+            second_rule,
+        } = conflict.diagnostic_problem()
+        else {
             panic!("规则冲突应提供具体 ownership 事实")
         };
-        assert_eq!(failure, DiagnosticFailureKind::ConflictingValues);
-        assert!(detail.contains("first_rule=2"));
-        assert!(detail.contains("second_rule=5"));
+        assert_eq!(first_rule, 2);
+        assert_eq!(second_rule, 5);
+        assert_eq!(location, dialogue_diagnostic_location(&exact_location));
+        let wire = serde_json::to_value(conflict.diagnostic_report())
+            .expect("MV 对话投影诊断必须可序列化");
+        assert_eq!(
+            wire["primary"]["code"],
+            "rpg_maker.dialogue.multiple_rules_own_field"
+        );
+        assert_eq!(
+            wire["primary"]["issue"]["details"]["problem"]["problem"]["location"]["steps"][1]["index"],
+            9
+        );
 
         let invalid_recipe = MvDialogueProjectionError::InvalidRecipe(Box::new(
             ProjectionModelError::NonContiguousDialogueBodyLines {
@@ -1469,17 +1490,14 @@ pattern = '\\n<(?<speaker>[^>]+)>'
                 actual: 5,
             },
         ));
-        let diagnostic = invalid_recipe.safe_diagnostic(
-            DiagnosticStage::Extract,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
-        );
-        let DiagnosticReason::FailureWithDetail { failure, detail } = diagnostic.reason else {
+        let RpgMakerDialogueProjectionProblem::InvalidRecipe { failure } =
+            invalid_recipe.diagnostic_problem()
+        else {
             panic!("配方错误应保留具体结构变体")
         };
-        assert_eq!(failure, DiagnosticFailureKind::InternalInvariant);
-        assert!(detail.contains("structure=non_contiguous_dialogue_body_lines"));
-        assert!(detail.contains("expected=3"));
-        assert!(detail.contains("actual=5"));
+        assert_eq!(
+            failure,
+            RpgMakerProjectionFailureKind::NonContiguousDialogueBodyLines
+        );
     }
 }

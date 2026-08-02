@@ -61,13 +61,19 @@ MV/MZ：
 
 | 表 | 审查使用的列 |
 | --- | --- |
-| `rpg_maker_text_group` | `owner`、`group_location`、`semantic_order_key`、`group_kind` |
-| `rpg_maker_text_unit` | `owner`、`group_location`、`unit_role`、`semantic_order_key`、`source_content_json`、`source_context_json`、`translation_content_json`、`translation_state` |
+| `rpg_maker_text_group` | `owner`、`group_id`、`group_location`、`semantic_order_key`、`group_kind` |
+| `rpg_maker_text_unit` | `owner`、`group_id`、`unit_role`、`semantic_order_key`、`source_content_json`、`source_context_json`、`translation_content_json`、`translation_state` |
+| `rpg_maker_mutation_claim` | `owner`、`group_id`、`resource_key`、`access` |
 
-MV/MZ 按 group 与 unit 的 `semantic_order_key` 排列；一个完整 Group 由相同
+`group_id` 是每个 owner 内从 1 开始分配的当前存储关联键，不是公开 locator。Unit 和
+Mutation Claim 不重复保存 `group_location`；查询它们时必须用 `owner + group_id` JOIN
+`rpg_maker_text_group`，再从 Group 取得 `group_location`。当前 schema 没有为旧列提供 view、
+别名或兼容读取。
+
+MV/MZ 按 Group 与 Unit 的 `semantic_order_key` 排列；一个完整逻辑 Group 由 JOIN 后具有相同
 `group_location` 的全部 Unit 组成，可以同时包含 builtin 与 rules owner。owner 仍属于精确
-locator，后者是 `owner + group_location + unit_role`。`group_location` 与 `unit_role` 是
-不透明编码，只能逐字使用。数据库不单独保存人工/自动 origin；
+locator，后者是 `owner + group_location + unit_role`；`group_id` 不进入 locator。
+`group_location` 与 `unit_role` 是不透明编码，只能逐字使用。数据库不单独保存人工/自动 origin；
 `translation_state` 也是不透明指纹，不能由 SQL 自行解释。
 
 两种引擎中，译文列为 NULL 只表示没有译文状态，不等于“应当翻译”。空白、没有源语
@@ -91,9 +97,16 @@ Lua 可以建立自己的私有表，ATT 不读取、迁移或解释它们。直
 
 ## 6. 诊断与日志
 
-SQLite 出错时，诊断保留操作、数据库路径、primary/extended code、事务最终状态和
-恢复位置。SQL、参数、结果与游戏正文不进普通项目日志；数据库的恢复和重放另有
-依据，项目日志不参与。
+SQLite 出错时，`SqliteIssue.context` 保存 stage、operation 和 transaction；具体 problem
+保存数据库路径、query ID/ordinal、driver kind、primary/extended code、column index/name、
+SQL offset、参数数量或 changed rows 等当时确实存在的结构化数值。根数据库尚未解析路径时
+使用对应的 root problem，不伪造路径。SQL、参数、结果与游戏正文不进普通项目日志，也
+不保存 `rusqlite::Error::to_string()` 形成的小协议。
+
+CLI 与 JSONL 消费同一份 `DiagnosticReport`。事务本身的主错误与 rollback、finalization、
+shutdown 等相关错误使用明确 relation 保存在同一原子 occurrence 内；report 的 `effect`
+说明状态未变、已经提交、收尾失败、需要恢复或结果未知。数据库的恢复和重放另有依据，
+项目日志不参与。
 
 事务明确回滚时可以在修正根因后重新执行。诊断为 `outcome_unknown` 时，停止同一项目的
 Lua、Extract、Translate 和其他写入并保留数据库及 sidecar。当前 CLI 没有独立的只读

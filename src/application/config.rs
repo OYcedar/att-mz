@@ -1344,8 +1344,10 @@ fn build_llm_client(
         invalid(
             format!("{field}.parameters").as_str(),
             ConfigurationValueRule::StrictJsonInvalid {
-                line: u64::try_from(error.line()).unwrap_or(u64::MAX),
-                column: u64::try_from(error.column()).unwrap_or(u64::MAX),
+                line: u64::try_from(error.line())
+                    .expect("当前目标平台的 JSON 行号必须能用 u64 表达"),
+                column: u64::try_from(error.column())
+                    .expect("当前目标平台的 JSON 列号必须能用 u64 表达"),
             },
         )
     })?;
@@ -1417,8 +1419,10 @@ fn build_llm_client(
         return Err(invalid(
             format!("{field}.max_concurrent_requests").as_str(),
             ConfigurationValueRule::RuntimeMaximumExceeded {
-                actual: u64::try_from(max_concurrent_requests.get()).unwrap_or(u64::MAX),
-                maximum: u64::try_from(tokio::sync::Semaphore::MAX_PERMITS).unwrap_or(u64::MAX),
+                actual: u64::try_from(max_concurrent_requests.get())
+                    .expect("当前目标平台的并发请求数必须能用 u64 表达"),
+                maximum: u64::try_from(tokio::sync::Semaphore::MAX_PERMITS)
+                    .expect("当前目标平台的信号量许可上限必须能用 u64 表达"),
             },
         ));
     }
@@ -1712,6 +1716,36 @@ pub(crate) enum DistributionLayoutError {
     ExecutableDirectoryMissing { path: PathBuf },
 }
 
+impl DistributionLayoutError {
+    pub(crate) fn diagnostic(&self) -> crate::diagnostic::Diagnostic {
+        use crate::diagnostic::{
+            Diagnostic, FileSystemDiagnosticContext, FileSystemDiagnosticStage, FileSystemIssue,
+            FileSystemOperation, FileSystemPathViolation, FileSystemProblem, IoFailure,
+            RuntimeComponent, RuntimeIssue, RuntimeOperation, SafePath,
+        };
+
+        match self {
+            Self::CurrentExecutable(source) => Diagnostic::runtime(RuntimeIssue::Io {
+                component: RuntimeComponent::Process,
+                operation: RuntimeOperation::ResolveCurrentExecutable,
+                failure: IoFailure::from_error(source),
+            }),
+            Self::ExecutableDirectoryMissing { path } => {
+                Diagnostic::file_system(FileSystemIssue::new(
+                    FileSystemDiagnosticContext::new(
+                        FileSystemDiagnosticStage::ProcessStartup,
+                        FileSystemOperation::ResolveDirectory,
+                    ),
+                    FileSystemProblem::InvalidPath {
+                        path: SafePath::new(path),
+                        violation: FileSystemPathViolation::MissingParent,
+                    },
+                ))
+            }
+        }
+    }
+}
+
 impl fmt::Display for DistributionLayoutError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1785,128 +1819,72 @@ impl ConfigurationLoadError {
         }
     }
 
-    /// 配置加载失败的唯一安全结构化投影。
-    ///
-    /// 进程启动路径与命令内延迟配置解析路径都消费这一份映射,同一失败在
-    /// 不同触发时机呈现完全相同的 code、reason 与恢复事实。
-    pub(crate) fn safe_diagnostic(&self) -> crate::diagnostic::SafeDiagnostic {
+    /// 在仍持有路径、字段和解析位置时建立当前版本的封闭诊断。
+    pub(crate) fn diagnostic(&self) -> crate::diagnostic::Diagnostic {
         use crate::diagnostic::{
-            DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact,
-            DiagnosticReason, DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic,
+            ConfigurationIssue, Diagnostic, IoFailure, SafeIdentifier, SafePath, SafeText,
         };
 
-        fn as_u64(value: usize) -> u64 {
-            u64::try_from(value).unwrap_or(u64::MAX)
-        }
-
-        match self {
-            Self::Open { path, source } => SafeDiagnostic::io(
-                DiagnosticCode::ConfigurationOpen,
-                DiagnosticStage::Configuration,
-                DiagnosticSubject::path(path),
-                "open_configuration",
-                source,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckPathAndPermissions,
-            ),
-            Self::NotAFile { path } => SafeDiagnostic::new(
-                DiagnosticCode::ConfigurationNotFile,
-                DiagnosticStage::Configuration,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixConfiguration,
-            ),
-            Self::Read { path, source } => SafeDiagnostic::io(
-                DiagnosticCode::ConfigurationRead,
-                DiagnosticStage::Configuration,
-                DiagnosticSubject::path(path),
-                "read_configuration",
-                source,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckPathAndPermissions,
-            ),
+        let issue = match self {
+            Self::Open { path, source } => ConfigurationIssue::Open {
+                path: SafePath::new(path),
+                failure: IoFailure::from_error(source),
+            },
+            Self::NotAFile { path } => ConfigurationIssue::NotFile {
+                path: SafePath::new(path),
+            },
+            Self::Read { path, source } => ConfigurationIssue::Read {
+                path: SafePath::new(path),
+                failure: IoFailure::from_error(source),
+            },
             Self::InvalidUtf8 {
                 path,
                 valid_up_to,
                 error_len,
-            } => SafeDiagnostic::new(
-                DiagnosticCode::ConfigurationInvalidUtf8,
-                DiagnosticStage::Configuration,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::InvalidUtf8 {
-                    valid_up_to: as_u64(*valid_up_to),
-                    error_len: error_len.map(as_u64),
-                },
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixConfiguration,
-            ),
+            } => ConfigurationIssue::InvalidUtf8 {
+                path: SafePath::new(path),
+                valid_up_to: *valid_up_to,
+                error_len: *error_len,
+            },
             Self::InvalidToml {
                 path,
                 location,
                 resource,
                 failure,
-            } => SafeDiagnostic::new(
-                DiagnosticCode::ConfigurationInvalidToml,
-                DiagnosticStage::Configuration,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::InvalidToml {
-                    line: location.map(|value| as_u64(value.line())),
-                    column: location.map(|value| as_u64(value.column())),
-                    resource: crate::user_text::sanitize_user_text(resource),
-                    failure: *failure,
-                },
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixConfiguration,
-            ),
-            Self::InvalidValue(source) => SafeDiagnostic::new(
-                DiagnosticCode::ConfigurationInvalidValue,
-                DiagnosticStage::Configuration,
-                DiagnosticSubject::field(source.field()),
-                DiagnosticReason::InvalidConfigurationValue {
-                    rule: source.reason().clone(),
-                },
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixConfiguration,
-            ),
-            Self::InvalidValueAtPath { path, source } => SafeDiagnostic::new(
-                DiagnosticCode::ConfigurationInvalidValue,
-                DiagnosticStage::Configuration,
-                DiagnosticSubject::field(source.field()),
-                DiagnosticReason::InvalidConfigurationValue {
-                    rule: source.reason().clone(),
-                },
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixConfiguration,
-            )
-            .with_recovery(RecoveryFact::path(path)),
-            Self::TranslationProfileNotFound { path, profile_id } => SafeDiagnostic::new(
-                DiagnosticCode::ConfigurationProfileNotFound,
-                DiagnosticStage::Configuration,
-                DiagnosticSubject::profile(profile_id),
-                DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixConfiguration,
-            )
-            .with_recovery(RecoveryFact::path(path)),
+            } => ConfigurationIssue::InvalidToml {
+                path: SafePath::new(path),
+                line: location.map(SourceLocation::line),
+                column: location.map(SourceLocation::column),
+                resource: SafeText::new(resource),
+                failure: *failure,
+            },
+            Self::InvalidValue(source) => ConfigurationIssue::InvalidValue {
+                path: None,
+                field: SafeIdentifier::from_validated(source.field()),
+                rule: source.reason().clone(),
+            },
+            Self::InvalidValueAtPath { path, source } => ConfigurationIssue::InvalidValue {
+                path: Some(SafePath::new(path)),
+                field: SafeIdentifier::from_validated(source.field()),
+                rule: source.reason().clone(),
+            },
+            Self::TranslationProfileNotFound { path, profile_id } => {
+                ConfigurationIssue::TranslationProfileNotFound {
+                    path: SafePath::new(path),
+                    profile_id: SafeIdentifier::from_validated(profile_id),
+                }
+            }
             Self::ProfileSelectionConflict {
                 path,
                 explicit_profile,
                 requested_profile,
-            } => SafeDiagnostic::new(
-                DiagnosticCode::ConfigurationProfileConflict,
-                DiagnosticStage::Configuration,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure(DiagnosticFailureKind::ConflictingValues),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixConfiguration,
-            )
-            .with_recovery(RecoveryFact::component(format!(
-                "explicit_profile={}; requested_profile={}",
-                crate::user_text::sanitize_user_text(explicit_profile),
-                crate::user_text::sanitize_user_text(requested_profile)
-            ))),
-        }
+            } => ConfigurationIssue::ProfileSelectionConflict {
+                path: SafePath::new(path),
+                explicit_profile: SafeIdentifier::from_validated(explicit_profile),
+                requested_profile: SafeIdentifier::from_validated(requested_profile),
+            },
+        };
+        Diagnostic::configuration(issue)
     }
 }
 
@@ -4189,6 +4167,63 @@ mod tests {
             ConfigurationLoadError::Open { ref path, .. }
                 if path == &directory.path().join("config.toml")
         ));
+    }
+
+    #[test]
+    fn invalid_utf8_builds_the_current_literal_diagnostic_contract() {
+        let error = ConfigurationLoadError::InvalidUtf8 {
+            path: PathBuf::from("C:/ATT/config.toml"),
+            valid_up_to: 7,
+            error_len: Some(2),
+        };
+        let actual = serde_json::to_value(error.diagnostic()).expect("诊断必须可序列化");
+        let expected: serde_json::Value = serde_json::from_str(
+            r#"{
+                "code":"configuration.invalid_utf8",
+                "stage":"configuration",
+                "issue":{
+                    "family":"configuration",
+                    "details":{
+                        "kind":"invalid_utf8",
+                        "path":"C:/ATT/config.toml",
+                        "valid_up_to":7,
+                        "error_len":2
+                    }
+                },
+                "resolution":"fix_configuration"
+            }"#,
+        )
+        .expect("独立字面量 JSON 必须有效");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn missing_distribution_directory_builds_a_typed_path_diagnostic() {
+        let error = DistributionLayoutError::ExecutableDirectoryMissing {
+            path: PathBuf::from("att.exe"),
+        };
+        assert_eq!(
+            serde_json::to_value(error.diagnostic()).expect("发行布局诊断必须可序列化"),
+            serde_json::json!({
+                "code": "filesystem.invalid_path",
+                "stage": "process_startup",
+                "issue": {
+                    "family": "file_system",
+                    "details": {
+                        "context": {
+                            "stage": "process_startup",
+                            "operation": "resolve_directory"
+                        },
+                        "problem": {
+                            "kind": "invalid_path",
+                            "path": "att.exe",
+                            "violation": "missing_parent"
+                        }
+                    }
+                },
+                "resolution": "report_bug"
+            })
+        );
     }
 
     #[test]

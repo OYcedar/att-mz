@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::project::{ExistingProjectOpener, OpenedProject, RpgMakerWriteBackLayoutProfile};
-use crate::diagnostic::{DiagnosticImpact, DiagnosticStage, FailureReport};
+use crate::diagnostic::ReportedFailure;
 use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::progress::{NoopProgressObserver, ProgressObserver, ProgressSnapshot};
 use crate::project_lease::{ProjectCommandLeaseError, ProjectCommandLeaseProvider};
@@ -249,11 +249,7 @@ where
 
 /// 命令边界只消费 Publisher 主动提供的安全投影，不解析任意错误链。
 pub(crate) trait WriteBackPublishingDiagnostic: Sized {
-    fn into_write_back_failure_report(
-        self,
-        stage: DiagnosticStage,
-        impact: DiagnosticImpact,
-    ) -> FailureReport;
+    fn into_write_back_failure_report(self) -> ReportedFailure;
 }
 
 /// 按固定业务顺序编排一次 RPG Maker 文本写回。
@@ -299,9 +295,14 @@ impl<O, S, P, J, K> WriteBackService<O, S, P, J, K> {
         self
     }
 
-    fn observe(&self, phase: WriteBackProgressPhase) {
+    fn start_phase(&self, phase: WriteBackProgressPhase) {
         self.progress
-            .observe(ProgressSnapshot::indeterminate(phase));
+            .observe(ProgressSnapshot::determinate(phase, 0, 1));
+    }
+
+    fn complete_phase(&self, phase: WriteBackProgressPhase) {
+        self.progress
+            .observe(ProgressSnapshot::determinate(phase, 1, 1));
     }
 }
 
@@ -354,12 +355,13 @@ where
         if self.cancellation.is_requested() {
             return Ok(OperationCompletion::Cancelled);
         }
-        self.observe(WriteBackProgressPhase::PreparingCandidate);
+        self.start_phase(WriteBackProgressPhase::PreparingCandidate);
         let candidate = self
             .publisher
             .prepare(&project, documents)
             .await
             .map_err(WriteBackServiceError::PrepareCandidate)?;
+        self.complete_phase(WriteBackProgressPhase::PreparingCandidate);
 
         if self.cancellation.is_requested() {
             let candidate_root = candidate.candidate_root().to_path_buf();
@@ -372,7 +374,7 @@ where
             };
         }
 
-        self.observe(WriteBackProgressPhase::ValidatingCandidate);
+        self.start_phase(WriteBackProgressPhase::ValidatingCandidate);
         if let Err(source) = self.publisher.validate(&candidate).await {
             let candidate_root = candidate.candidate_root().to_path_buf();
             return match self.publisher.discard(candidate).await {
@@ -387,6 +389,7 @@ where
                 }),
             };
         }
+        self.complete_phase(WriteBackProgressPhase::ValidatingCandidate);
 
         if self.cancellation.is_requested() {
             let candidate_root = candidate.candidate_root().to_path_buf();
@@ -402,7 +405,7 @@ where
         // 借用式业务校验已经通过；`publish` 现在按值接管 token，并在实际目标交换前
         // 再次复核完整候选以覆盖检查与使用之间的变化。从此边界开始，无论根返回何种
         // 终态，上层都不得再次尝试 discard。观察入口不可失败，因此不会成为发布门槛。
-        self.observe(WriteBackProgressPhase::Publishing);
+        self.start_phase(WriteBackProgressPhase::Publishing);
         let intended_output_root = project.write_back_root().to_path_buf();
         self.event_log.emit(WriteBackLogEvent::PublicationStarted {
             output_root: intended_output_root,
@@ -443,6 +446,7 @@ where
             output_root: output_root.clone(),
             outcome: WriteBackLogPublicationOutcome::Published { summary },
         });
+        self.complete_phase(WriteBackProgressPhase::Publishing);
 
         Ok(OperationCompletion::Completed(WriteBackOutput {
             name: project.name().clone(),
@@ -553,6 +557,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::progress::ProgressAmount;
     use crate::project_lease::{ProjectCommandLease, ProjectCommandLeaseProvider};
     use crate::rpg_maker::model::{LogicalTextLocation, ScalarFieldKey, TextUnitRole};
     use crate::rpg_maker::project::{MaxFullwidthChars, test_layout_profile};
@@ -573,6 +578,26 @@ mod tests {
 
     fn record(events: &Events, event: &'static str) {
         events.lock().expect("事件记录锁不应中毒").push(event);
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingProgress {
+        snapshots: Arc<Mutex<Vec<ProgressSnapshot<WriteBackProgressPhase>>>>,
+    }
+
+    impl RecordingProgress {
+        fn snapshots(&self) -> Vec<ProgressSnapshot<WriteBackProgressPhase>> {
+            self.snapshots.lock().expect("进度记录锁不应中毒").clone()
+        }
+    }
+
+    impl ProgressObserver<WriteBackProgressPhase> for RecordingProgress {
+        fn observe(&self, snapshot: ProgressSnapshot<WriteBackProgressPhase>) {
+            self.snapshots
+                .lock()
+                .expect("进度记录锁不应中毒")
+                .push(snapshot);
+        }
     }
 
     #[derive(Clone)]
@@ -778,6 +803,82 @@ mod tests {
                 "publish",
                 "publication_finished",
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_lifecycle_phases_have_explicit_start_and_completion() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let progress = RecordingProgress::default();
+
+        service(Arc::clone(&events), CooperativeCancellation::default())
+            .with_progress(progress.clone())
+            .execute(WriteBackInput {
+                name: "demo".parse().expect("项目名应合法"),
+            })
+            .await
+            .expect("写回应成功");
+
+        let candidate_phases = progress
+            .snapshots()
+            .into_iter()
+            .filter(|snapshot| {
+                matches!(
+                    snapshot.phase,
+                    WriteBackProgressPhase::PreparingCandidate
+                        | WriteBackProgressPhase::ValidatingCandidate
+                        | WriteBackProgressPhase::Publishing
+                )
+            })
+            .map(|snapshot| (snapshot.phase, snapshot.amount))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            candidate_phases,
+            [
+                (
+                    WriteBackProgressPhase::PreparingCandidate,
+                    ProgressAmount::Determinate {
+                        completed: 0,
+                        total: 1,
+                    },
+                ),
+                (
+                    WriteBackProgressPhase::PreparingCandidate,
+                    ProgressAmount::Determinate {
+                        completed: 1,
+                        total: 1,
+                    },
+                ),
+                (
+                    WriteBackProgressPhase::ValidatingCandidate,
+                    ProgressAmount::Determinate {
+                        completed: 0,
+                        total: 1,
+                    },
+                ),
+                (
+                    WriteBackProgressPhase::ValidatingCandidate,
+                    ProgressAmount::Determinate {
+                        completed: 1,
+                        total: 1,
+                    },
+                ),
+                (
+                    WriteBackProgressPhase::Publishing,
+                    ProgressAmount::Determinate {
+                        completed: 0,
+                        total: 1,
+                    },
+                ),
+                (
+                    WriteBackProgressPhase::Publishing,
+                    ProgressAmount::Determinate {
+                        completed: 1,
+                        total: 1,
+                    },
+                ),
+            ],
+            "候选阶段必须各自形成 started -> completed，不能留下 active_phase"
         );
     }
 

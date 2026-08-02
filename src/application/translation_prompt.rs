@@ -7,8 +7,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::diagnostic::{
-    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
-    DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
+    Diagnostic, DiagnosticReport, FileSystemDiagnosticContext, FileSystemDiagnosticStage,
+    FileSystemOperation, PromptProblem, PromptTemplateViolation, SafePath, StateEffect,
+    TranslationIssue,
 };
 use crate::language::LanguagePair;
 use crate::runtime::filesystem::{SystemFileSystem, SystemFileSystemError};
@@ -289,83 +290,47 @@ pub(crate) enum PromptResourceLoadError {
 }
 
 impl PromptResourceLoadError {
-    pub(crate) fn safe_diagnostic(&self) -> SafeDiagnostic {
+    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
+        let prompt = |path: &Path, problem| {
+            DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::translation(TranslationIssue::Prompt {
+                    path: SafePath::new(path),
+                    problem,
+                }),
+            )
+        };
         match self {
-            Self::Read(ReadFileError::NotFound { path }) => SafeDiagnostic::new(
-                DiagnosticCode::PromptUnavailable,
-                DiagnosticStage::CommandPreparation,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixConfiguration,
-            ),
-            Self::Read(ReadFileError::NotFile { path }) => SafeDiagnostic::new(
-                DiagnosticCode::PromptUnavailable,
-                DiagnosticStage::CommandPreparation,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::InvalidValue,
-                    "expected=file; actual=not_file",
+            Self::Read(ReadFileError::NotFound { path }) => prompt(path, PromptProblem::NotFound),
+            Self::Read(ReadFileError::NotFile { path }) => prompt(path, PromptProblem::NotFile),
+            Self::Read(ReadFileError::Io { source, .. }) => source.diagnostic_report(
+                FileSystemDiagnosticContext::new(
+                    FileSystemDiagnosticStage::CommandPreparation,
+                    FileSystemOperation::Read,
                 ),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixConfiguration,
+                StateEffect::Unchanged,
             ),
-            Self::Read(ReadFileError::Io { path, source }) => source
-                .safe_diagnostic_source(
-                    DiagnosticStage::CommandPreparation,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckPathAndPermissions,
-                )
-                .with_recovery(RecoveryFact::path(path)),
             Self::ResolvedFileNameMismatch {
                 requested_path,
                 resolved_path,
-            } => SafeDiagnostic::new(
-                DiagnosticCode::PromptUnavailable,
-                DiagnosticStage::CommandPreparation,
-                DiagnosticSubject::path(requested_path),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::FileIdentityChanged,
-                    format!(
-                        "expected_file_name={}; actual_file_name={}",
-                        requested_path
-                            .file_name()
-                            .map_or_else(|| "none".into(), |name| name.to_string_lossy()),
-                        resolved_path
-                            .file_name()
-                            .map_or_else(|| "none".into(), |name| name.to_string_lossy())
-                    ),
-                ),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckPathAndPermissions,
-            )
-            .with_recovery(RecoveryFact::path(resolved_path)),
+            } => prompt(
+                requested_path,
+                PromptProblem::ResolvedFileNameMismatch {
+                    resolved_path: SafePath::new(resolved_path),
+                },
+            ),
             Self::InvalidUtf8 {
                 path,
                 valid_up_to,
                 error_len,
-            } => SafeDiagnostic::new(
-                DiagnosticCode::PromptUnavailable,
-                DiagnosticStage::CommandPreparation,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::InvalidUtf8 {
-                    valid_up_to: u64::try_from(*valid_up_to).unwrap_or(u64::MAX),
-                    error_len: error_len.map(|length| u64::try_from(length).unwrap_or(u64::MAX)),
+            } => prompt(
+                path,
+                PromptProblem::InvalidUtf8 {
+                    valid_up_to: *valid_up_to,
+                    error_len: *error_len,
                 },
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixConfiguration,
             ),
-            Self::Empty { path } => SafeDiagnostic::new(
-                DiagnosticCode::PromptUnavailable,
-                DiagnosticStage::CommandPreparation,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::MissingRequiredValue,
-                    "resource=prompt; content=blank",
-                ),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixConfiguration,
-            ),
+            Self::Empty { path } => prompt(path, PromptProblem::Empty),
         }
     }
 }
@@ -567,6 +532,22 @@ pub(crate) enum PromptTemplateError {
     VariablesNotAllowed,
 }
 
+impl PromptTemplateError {
+    pub(crate) fn diagnostic(&self, path: &Path) -> Diagnostic {
+        let violation = match self {
+            Self::InvalidSyntax => PromptTemplateViolation::InvalidSyntax,
+            Self::UnknownVariable => PromptTemplateViolation::UnknownVariable,
+            Self::MissingSourceLanguage => PromptTemplateViolation::MissingSourceLanguage,
+            Self::MissingTargetLanguage => PromptTemplateViolation::MissingTargetLanguage,
+            Self::VariablesNotAllowed => PromptTemplateViolation::VariablesNotAllowed,
+        };
+        Diagnostic::translation(TranslationIssue::Prompt {
+            path: SafePath::new(path),
+            problem: PromptProblem::InvalidTemplate { violation },
+        })
+    }
+}
+
 impl fmt::Display for PromptTemplateError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -619,6 +600,49 @@ mod tests {
         )
         .expect("模板应渲染");
         assert_eq!(rendered, "ja -> zh-Hans / ja");
+    }
+
+    #[test]
+    fn prompt_leaf_errors_build_literal_current_diagnostics() {
+        let resource = PromptResourceLoadError::InvalidUtf8 {
+            path: PathBuf::from("D:/att/prompts/translation/system.md"),
+            valid_up_to: 17,
+            error_len: Some(2),
+        };
+        assert_eq!(
+            serde_json::to_value(resource.diagnostic_report())
+                .expect("Prompt 资源诊断必须可序列化"),
+            serde_json::json!({
+                "effect": "unchanged",
+                "primary": {
+                    "code": "translation.prompt.invalid_utf8",
+                    "stage": "command_preparation",
+                    "issue": {
+                        "family": "translation",
+                        "details": {
+                            "kind": "prompt",
+                            "path": "D:/att/prompts/translation/system.md",
+                            "problem": {
+                                "kind": "invalid_utf8",
+                                "valid_up_to": 17,
+                                "error_len": 2
+                            }
+                        }
+                    },
+                    "resolution": "fix_configuration"
+                },
+                "related": []
+            })
+        );
+
+        let template = PromptTemplateError::UnknownVariable
+            .diagnostic(Path::new("D:/att/prompts/translation/system.md"));
+        let wire = serde_json::to_value(template).expect("Prompt 模板诊断必须可序列化");
+        assert_eq!(wire["code"], "translation.prompt.invalid_template");
+        assert_eq!(
+            wire["issue"]["details"]["problem"]["violation"],
+            "unknown_variable"
+        );
     }
 
     #[test]

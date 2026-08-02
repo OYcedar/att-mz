@@ -456,7 +456,10 @@ command 或多个参数拼成一个脚本块，也不解析 JavaScript 语法。
 JSON 解码、最终 string、捕获、重建或物理 Claim 不成立，整个 Rules owner 候选失败，
 旧 Rules 快照保持不变。路径缺 key/越界只是该展开分支无产出，但最终仍需满足每条规则
 至少产出一个单元。成功时 CLI 的提取摘要仍写 stdout；每类非字符串跳过警告各写一行
-stderr，退出码仍为 0。警告按上述聚合键稳定排序，不包含原始参数值或逐命令位置。
+stderr，退出码仍为 0。每个聚合警告同时写为 `diagnostic.extract` occurrence，类型化 issue
+保存 `rule_number`、`source_file`、`command_code`、`parameter`、`actual_type` 与
+`skipped_count`，resolution 为 `fix_input`。警告按上述聚合键稳定排序，不包含原始参数值或
+逐命令位置。
 
 ## 5. 语义范围、自然顺序与 Mutation Claim
 
@@ -487,9 +490,12 @@ Rules 的跨来源顺序是稳定契约，与 OS 目录枚举顺序无关：
 `0x00 + fragment u64 大端`。数据库 BLOB 字典序必须与内存类型顺序完全一致；截断、未知
 标记、终止段后的尾部字节和非规范值都作为当前 schema 的普通无效数据处理。
 
-顺序进入资产快照和完整 Group 语境指纹，但不进入 owner、location、role 组成的主身份，
-也不绑定 TaskBlock 邻居、译文、临时 ID 或任务历史。并发可以改变完成时间，不能改变语义
-范围、Group/Unit 顺序、稳定装箱或提交顺序。
+顺序进入资产快照和完整 Group 语境指纹，但不进入 owner、location、role 组成的主身份。
+持久化时，每个 owner 按当前 Group 自然顺序分配从 1 开始的整数 `group_id`；Unit 和
+Mutation Claim 只用 `owner + group_id` 关联 Group，`group_location` 仍由 Group 唯一保存。
+这个整数只是当前 schema 的内部关联键，不进入领域 locator、资产指纹，也不绑定 TaskBlock
+邻居、译文、临时 ID 或任务历史。并发可以改变完成时间，不能改变语义范围、Group/Unit
+顺序、`group_id` 分配、稳定装箱或提交顺序。
 
 提取方不直接书写 `MutationClaim`。ATT 从完整 Value 和事件块 recipe 派生资源锁：
 `Intent` 表示将穿过资源，`Exclusive` 表示拥有该精确可变 Value。
@@ -499,8 +505,9 @@ owner 内、跨 owner Store 和 WriteBack 发布前使用同一规则。
 完整逻辑 Claim 由 group kind、location 和 recipe 决定并进入 owner 指纹。项目表
 `rpg_maker_mutation_claim` 不是这份完整清单，而是跨 owner 冲突摘要：每个
 `(owner, resource)` 至多一行；唯一 Exclusive 原样保留，共享 resource 的多个合法 Intent
-只保留自然顺序最早的 group 代表。WriteBack 会从 recipe 重建完整集合并严格验证该摘要，
-因此摘要不会放宽本节任何冲突规则。
+只保留自然顺序最早的 group 代表。表内代表通过 `owner + group_id` 指回 Group；需要领域
+位置时必须 JOIN Group 取得 `group_location`。WriteBack 会从 recipe 重建完整集合并严格
+验证该摘要，因此摘要不会放宽本节任何冲突规则。
 
 | 两个声明的关系 | 结果 |
 |---|---|

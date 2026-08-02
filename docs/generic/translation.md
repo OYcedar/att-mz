@@ -89,8 +89,21 @@ Prompt 明确规定，ATT 依靠这条契约确定译文语言，不做短文本
 任务并发执行，并始终按自然顺序确认和提交；取消或后续失败时，已经确认的前序进度原样
 保留。
 
-完成结果分为 Complete、Partial 与 Unavailable。Partial 和 Unavailable 是正常结果；
-退出成功只说明本次命令正常结束，项目是否全部译完以结果报告为准。
+每个实际开始的 Task 写 `task.finished`：Complete、Partial、Unavailable、Failed、
+NotCommittedAfterEarlierFailure 或 Cancelled。Partial、Unavailable 与 Failed 引用保存具体问题的
+`diagnostic.translation_task` occurrence。NotCommittedAfterEarlierFailure 只表示该 Task 已有
+可提交结果但未因前序失败而写入，并复用前序失败 occurrence，不把它重投影为当前 Task 的错误。
+每次命令恰好写一条 `translation.finished`：
+NotStarted、NoWork、Complete、Incomplete、Failed 或 Cancelled。含 Partial 或 Unavailable
+任务但业务结果明确时，Translate 结果是 Incomplete，退出码仍为 `0`；项目是否全部译完以
+该事件和数据库当前状态为准。
+
+`translation.finished` 固定保存 planned、started、complete、partial、unavailable、failed、
+cancelled 与 not_started Task 计数，并保存 Generic 专用的 cleared/reused/accepted/written/
+conflicted units 与 response problems。它取代按 Task 与 Unit 含义混合的通用 Partial 汇总。
+Placeholder 等规划错误发生在任何 Task 或模型请求之前时，结果为 Failed，具体
+`diagnostic.run_plan` occurrence 保留规则来源、规则号和完整 Generic Unit locator；数据库
+保持不变。
 
 Partial 会保留合法 ID 和已确认前序进度；再次运行只给仍需模型的 Unit 分配临时 ID，并
 继续提供稳定 TaskBlock 的完整语境。是否继续同一 Translate、修正资源，还是由人工或 agent

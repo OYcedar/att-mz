@@ -17,15 +17,14 @@ use tokio::sync::{Semaphore, watch};
 use url::Url;
 
 use crate::diagnostic::{
-    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
-    DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic,
+    Diagnostic, HttpEndpoint, HttpEnvelopeViolation, HttpIssue, HttpJsonCategory,
+    HttpResponseReadFailure, HttpTransportKind, HttpTransportPhase, SafeIdentifier, SafeText,
 };
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
-use crate::json_diagnostic::JsonErrorCategory;
 use crate::llm::{
     ApiKeyRedactor, ChatMessage, ChatMessageRole, LlmClientConcurrency, LlmClientRecordMetadata,
-    LlmClientSemanticIdentity, LlmFinishReason, LlmRequestError, LlmRequestExecutor, LlmResponse,
-    LlmUsage,
+    LlmClientSemanticIdentity, LlmFinishReason, LlmRequestError, LlmRequestExecutor,
+    LlmRequestFailure, LlmResponse, LlmUsage,
 };
 use crate::user_text::sanitize_user_text;
 
@@ -472,32 +471,12 @@ pub(crate) enum OpenAiExecutorBuildError {
 }
 
 impl OpenAiExecutorBuildError {
-    pub(crate) fn safe_diagnostic(&self) -> SafeDiagnostic {
-        let (subject, reason, action) = match self {
-            Self::InvalidProxy(_) => (
-                DiagnosticSubject::field("llm.proxy"),
-                DiagnosticFailureKind::InvalidValue,
-                DiagnosticAction::FixConfiguration,
-            ),
-            Self::InvalidCertificate(_) => (
-                DiagnosticSubject::field("llm.additional_pem_files"),
-                DiagnosticFailureKind::InvalidEncoding,
-                DiagnosticAction::FixConfiguration,
-            ),
-            Self::BuildClient(_) => (
-                DiagnosticSubject::component("LLM HTTP client"),
-                DiagnosticFailureKind::TransportFailed,
-                DiagnosticAction::Retry,
-            ),
-        };
-        SafeDiagnostic::new(
-            DiagnosticCode::HttpClientBuild,
-            DiagnosticStage::CommandPreparation,
-            subject,
-            DiagnosticReason::failure(reason),
-            DiagnosticImpact::Unchanged,
-            action,
-        )
+    pub(crate) fn diagnostic(&self) -> Diagnostic {
+        Diagnostic::http(match self {
+            Self::InvalidProxy(_) => HttpIssue::InvalidProxy,
+            Self::InvalidCertificate(_) => HttpIssue::InvalidCertificate,
+            Self::BuildClient(_) => HttpIssue::ClientBuild,
+        })
     }
 }
 
@@ -599,7 +578,7 @@ impl OpenAiChatCompletionExecutor {
             Err(source) => {
                 drop(active_permit);
                 drop(job);
-                return Err(classify_transport_error(source));
+                return Err(classify_transport_error(HttpTransportPhase::Send, source));
             }
         };
         let status = response.status();
@@ -647,7 +626,10 @@ impl OpenAiChatCompletionExecutor {
             Err(source) => {
                 drop(active_permit);
                 drop(job);
-                return Err(classify_transport_error(source));
+                return Err(classify_transport_error(
+                    HttpTransportPhase::ReadSuccessResponse,
+                    source,
+                ));
             }
         };
         drop(active_permit);
@@ -675,6 +657,19 @@ impl LlmRequestExecutor for OpenAiChatCompletionExecutor {
     ) -> Result<LlmResponse, LlmRequestError<Self::Error>> {
         self.execute_request(client, messages).await
     }
+
+    fn request_diagnostic(
+        &self,
+        client: &Self::Client,
+        source: &Self::Error,
+        retry_after: Option<Duration>,
+    ) -> Diagnostic {
+        let redactor = ApiKeyRedactor::new(client.api_key.clone());
+        source.diagnostic_for_endpoint(
+            safe_http_endpoint_with_redactor(&client.url, &redactor),
+            retry_after,
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -682,7 +677,10 @@ pub(crate) enum OpenAiChatCompletionError {
     WaitCancelled,
     ExecutorClosed,
     SerializeRequest(serde_json::Error),
-    Transport(reqwest::Error),
+    Transport {
+        phase: HttpTransportPhase,
+        source: reqwest::Error,
+    },
     HttpStatus {
         status: u16,
         provider_code: Option<String>,
@@ -692,7 +690,7 @@ pub(crate) enum OpenAiChatCompletionError {
     },
     ParseResponse(serde_json::Error),
     InvalidResponseWire {
-        reason: &'static str,
+        violation: HttpEnvelopeViolation,
     },
 }
 
@@ -702,15 +700,13 @@ impl fmt::Display for OpenAiChatCompletionError {
             Self::WaitCancelled => formatter.write_str("LLM 请求在等待本地许可时被取消"),
             Self::ExecutorClosed => formatter.write_str("LLM 根已关闭"),
             Self::SerializeRequest(_) => formatter.write_str("无法序列化 LLM 请求"),
-            Self::Transport(_) => formatter.write_str("LLM HTTP 传输失败"),
+            Self::Transport { .. } => formatter.write_str("LLM HTTP 传输失败"),
             Self::HttpStatus { status, .. } => write!(formatter, "LLM HTTP 状态 {status}"),
             Self::ParseResponse(_) => formatter.write_str("LLM 成功响应不是有效 JSON"),
-            Self::InvalidResponseWire { reason } => {
-                write!(
-                    formatter,
-                    "LLM 成功响应不符合 Chat Completions 契约：{reason}"
-                )
-            }
+            Self::InvalidResponseWire { violation } => write!(
+                formatter,
+                "LLM 成功响应不符合 Chat Completions 契约：{violation:?}"
+            ),
         }
     }
 }
@@ -719,7 +715,7 @@ impl Error for OpenAiChatCompletionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::SerializeRequest(source) => Some(source),
-            Self::Transport(source) => Some(source),
+            Self::Transport { source, .. } => Some(source),
             Self::HttpStatus {
                 response_body_error: Some(source),
                 ..
@@ -731,154 +727,84 @@ impl Error for OpenAiChatCompletionError {
 }
 
 impl OpenAiChatCompletionError {
-    /// 只公开 HTTP/传输、标准供应商错误投影与 JSON 解析器的稳定事实；请求、
-    /// 原始响应正文和 serde/reqwest 原始文本始终留在 source。
-    pub(crate) fn safe_diagnostic(
+    /// 只公开 endpoint 的 scheme/host/port；路径、查询、请求和响应正文不会进入诊断。
+    #[cfg(test)]
+    pub(crate) fn diagnostic(&self, endpoint: &Url, retry_after: Option<Duration>) -> Diagnostic {
+        self.diagnostic_for_endpoint(safe_http_endpoint(endpoint), retry_after)
+    }
+
+    fn diagnostic_for_endpoint(
         &self,
+        endpoint: HttpEndpoint,
         retry_after: Option<Duration>,
-        impact: DiagnosticImpact,
-    ) -> SafeDiagnostic {
-        match self {
-            Self::WaitCancelled => model_failure(
-                DiagnosticFailureKind::LockCancelled,
-                impact,
-                DiagnosticAction::Retry,
-            ),
-            Self::ExecutorClosed => model_failure(
-                DiagnosticFailureKind::ExecutorClosed,
-                impact,
-                DiagnosticAction::Retry,
-            ),
-            Self::SerializeRequest(source) => json_model_failure(
-                DiagnosticFailureKind::RequestSerializationFailed,
-                impact,
-                DiagnosticAction::ReportBug,
-                source,
-            ),
-            Self::Transport(source) => model_failure(
-                DiagnosticFailureKind::TransportFailed,
-                impact,
-                DiagnosticAction::CheckModelService,
-            )
-            .with_recovery(RecoveryFact::component(transport_classification(source))),
+    ) -> Diagnostic {
+        let issue = match self {
+            Self::WaitCancelled => HttpIssue::WaitCancelled { endpoint },
+            Self::ExecutorClosed => HttpIssue::ExecutorClosed { endpoint },
+            Self::SerializeRequest(source) => HttpIssue::RequestSerialization {
+                endpoint,
+                category: http_json_category(source),
+                line: source.line(),
+                column: source.column(),
+            },
+            Self::Transport { phase, source } => {
+                let io = error_chain_io(source);
+                HttpIssue::Transport {
+                    endpoint,
+                    phase: *phase,
+                    transport: typed_transport_kind(source, *phase),
+                    io_kind: io.map(|source| source.kind().into()),
+                    raw_os_code: io.and_then(std::io::Error::raw_os_error),
+                }
+            }
             Self::HttpStatus {
                 status,
                 provider_code,
                 provider_type,
                 provider_message,
                 response_body_error,
-            } => {
-                let diagnostic = SafeDiagnostic::new(
-                    DiagnosticCode::ModelRequest,
-                    DiagnosticStage::ModelRequest,
-                    DiagnosticSubject::component("LLM provider"),
-                    DiagnosticReason::Http {
-                        status: Some(*status),
-                        retry_after_seconds: retry_after.map(|value| value.as_secs()),
-                        provider_code: provider_code.clone(),
-                        provider_type: provider_type.clone(),
-                        provider_message: provider_message.clone(),
-                    },
-                    impact,
-                    if *status == 401 || *status == 403 {
-                        DiagnosticAction::FixConfiguration
-                    } else {
-                        DiagnosticAction::CheckModelService
-                    },
-                );
-                response_body_error
+            } => HttpIssue::Status {
+                endpoint,
+                status: *status,
+                retry_after_seconds: retry_after.map(|value| value.as_secs()),
+                provider_code: provider_code
                     .as_ref()
-                    .map_or(diagnostic.clone(), |source| {
-                        diagnostic.with_recovery(RecoveryFact::component(format!(
-                            "response_body_read={}",
-                            transport_classification(source)
-                        )))
-                    })
-            }
-            Self::ParseResponse(source) => json_model_failure(
-                DiagnosticFailureKind::ResponseParsingFailed,
-                impact,
-                DiagnosticAction::CheckModelService,
-                source,
-            ),
-            Self::InvalidResponseWire { reason } => model_failure(
-                DiagnosticFailureKind::InvalidResponseContract,
-                impact,
-                DiagnosticAction::CheckModelService,
-            )
-            .with_recovery(RecoveryFact::component(format!("contract={reason}"))),
-        }
+                    .and_then(|value| SafeIdentifier::new(value).ok()),
+                provider_type: provider_type
+                    .as_ref()
+                    .and_then(|value| SafeIdentifier::new(value).ok()),
+                provider_message: provider_message.as_ref().map(SafeText::new),
+                response_read_failure: response_body_error.as_ref().map(|source| {
+                    let io = error_chain_io(source);
+                    HttpResponseReadFailure {
+                        phase: HttpTransportPhase::ReadErrorResponse,
+                        transport: typed_transport_kind(
+                            source,
+                            HttpTransportPhase::ReadErrorResponse,
+                        ),
+                        io_kind: io.map(|source| source.kind().into()),
+                        raw_os_code: io.and_then(std::io::Error::raw_os_error),
+                    }
+                }),
+            },
+            Self::ParseResponse(source) => HttpIssue::ResponseJson {
+                endpoint,
+                category: http_json_category(source),
+                line: source.line(),
+                column: source.column(),
+            },
+            Self::InvalidResponseWire { violation } => HttpIssue::InvalidEnvelope {
+                endpoint,
+                violation: *violation,
+            },
+        };
+        Diagnostic::http(issue)
     }
 }
 
-impl crate::llm::LlmRequestDiagnosticSource for OpenAiChatCompletionError {
-    fn request_diagnostic(
-        &self,
-        retry_after: Option<Duration>,
-        impact: DiagnosticImpact,
-    ) -> SafeDiagnostic {
-        self.safe_diagnostic(retry_after, impact)
-    }
-
+impl LlmRequestFailure for OpenAiChatCompletionError {
     fn is_cancelled_wait(&self) -> bool {
         matches!(self, Self::WaitCancelled)
-    }
-}
-
-fn model_failure(
-    failure: DiagnosticFailureKind,
-    impact: DiagnosticImpact,
-    action: DiagnosticAction,
-) -> SafeDiagnostic {
-    SafeDiagnostic::new(
-        DiagnosticCode::ModelRequest,
-        DiagnosticStage::ModelRequest,
-        DiagnosticSubject::component("LLM request"),
-        DiagnosticReason::failure(failure),
-        impact,
-        action,
-    )
-}
-
-fn json_model_failure(
-    failure: DiagnosticFailureKind,
-    impact: DiagnosticImpact,
-    action: DiagnosticAction,
-    source: &serde_json::Error,
-) -> SafeDiagnostic {
-    let category = JsonErrorCategory::from(source);
-    SafeDiagnostic::new(
-        DiagnosticCode::ModelRequest,
-        DiagnosticStage::ModelRequest,
-        DiagnosticSubject::component("LLM request"),
-        DiagnosticReason::failure_with_detail(
-            failure,
-            format!(
-                "json_category={category}; line={}; column={}",
-                source.line(),
-                source.column()
-            ),
-        ),
-        impact,
-        action,
-    )
-}
-
-fn transport_classification(source: &reqwest::Error) -> &'static str {
-    if source.is_timeout() {
-        "transport=timeout"
-    } else if source.is_connect() {
-        "transport=connect"
-    } else if source.is_request() {
-        "transport=request"
-    } else if source.is_body() {
-        "transport=body"
-    } else if source.is_decode() {
-        "transport=decode"
-    } else if source.is_redirect() {
-        "transport=redirect"
-    } else {
-        "transport=other"
     }
 }
 
@@ -1037,15 +963,108 @@ fn retryable(source: OpenAiChatCompletionError) -> LlmRequestError<OpenAiChatCom
     }
 }
 
-fn classify_transport_error(source: reqwest::Error) -> LlmRequestError<OpenAiChatCompletionError> {
+fn classify_transport_error(
+    phase: HttpTransportPhase,
+    source: reqwest::Error,
+) -> LlmRequestError<OpenAiChatCompletionError> {
+    let phase = effective_transport_phase(phase, &source);
     let is_tls = error_chain_contains::<native_tls::Error>(&source);
     let retry = !source.is_builder()
         && !is_tls
         && (source.is_timeout() || source.is_connect() || source.is_request() || source.is_body());
     if retry {
-        retryable(OpenAiChatCompletionError::Transport(source))
+        retryable(OpenAiChatCompletionError::Transport { phase, source })
     } else {
-        LlmRequestError::Fatal(OpenAiChatCompletionError::Transport(source))
+        LlmRequestError::Fatal(OpenAiChatCompletionError::Transport { phase, source })
+    }
+}
+
+#[cfg(test)]
+fn safe_http_endpoint(endpoint: &Url) -> HttpEndpoint {
+    safe_http_endpoint_with_host(
+        endpoint,
+        endpoint
+            .host_str()
+            .expect("Chat Completions endpoint 在配置边界已经确认包含 host"),
+    )
+}
+
+fn safe_http_endpoint_with_redactor(endpoint: &Url, redactor: &ApiKeyRedactor) -> HttpEndpoint {
+    let host = endpoint
+        .host_str()
+        .expect("Chat Completions endpoint 在配置边界已经确认包含 host");
+    safe_http_endpoint_with_host(endpoint, &redactor.redact(host))
+}
+
+fn safe_http_endpoint_with_host(endpoint: &Url, host: &str) -> HttpEndpoint {
+    let scheme = match endpoint.scheme() {
+        "http" => crate::diagnostic::HttpScheme::Http,
+        "https" => crate::diagnostic::HttpScheme::Https,
+        _ => unreachable!("Chat Completions endpoint 在配置边界已经确认使用 HTTP(S)"),
+    };
+    HttpEndpoint::new(scheme, host, endpoint.port())
+}
+
+fn http_json_category(source: &serde_json::Error) -> HttpJsonCategory {
+    match source.classify() {
+        serde_json::error::Category::Io => HttpJsonCategory::Io,
+        serde_json::error::Category::Syntax => HttpJsonCategory::Syntax,
+        serde_json::error::Category::Data => HttpJsonCategory::Data,
+        serde_json::error::Category::Eof => HttpJsonCategory::Eof,
+    }
+}
+
+fn error_chain_io<'a>(source: &'a (dyn Error + 'static)) -> Option<&'a std::io::Error> {
+    let mut current = Some(source);
+    while let Some(error) = current {
+        if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            return Some(io);
+        }
+        current = error.source();
+    }
+    None
+}
+
+fn typed_transport_kind(source: &reqwest::Error, phase: HttpTransportPhase) -> HttpTransportKind {
+    if error_chain_contains::<native_tls::Error>(source) {
+        return HttpTransportKind::Tls;
+    }
+    if source.is_timeout() {
+        return HttpTransportKind::Timeout;
+    }
+    if source.is_connect()
+        && error_chain_io(source)
+            .and_then(std::io::Error::raw_os_error)
+            .is_some_and(|code| matches!(code, 11001..=11004))
+    {
+        return HttpTransportKind::Dns;
+    }
+    if source.is_connect() {
+        return HttpTransportKind::Connect;
+    }
+    if source.is_decode() {
+        return HttpTransportKind::Decode;
+    }
+    if source.is_redirect() {
+        return HttpTransportKind::Redirect;
+    }
+    match phase {
+        HttpTransportPhase::ReadErrorResponse | HttpTransportPhase::ReadSuccessResponse => {
+            HttpTransportKind::Read
+        }
+        HttpTransportPhase::Connect => HttpTransportKind::Connect,
+        HttpTransportPhase::Send => HttpTransportKind::Send,
+    }
+}
+
+fn effective_transport_phase(
+    declared: HttpTransportPhase,
+    source: &reqwest::Error,
+) -> HttpTransportPhase {
+    if source.is_connect() {
+        HttpTransportPhase::Connect
+    } else {
+        declared
     }
 }
 
@@ -1089,11 +1108,11 @@ fn parse_success_response(
     })?;
     let object = wire
         .as_object()
-        .ok_or_else(|| invalid_response("顶层必须为对象"))?;
+        .ok_or_else(|| invalid_response(HttpEnvelopeViolation::InvalidContract))?;
     let choices = object
         .get("choices")
         .and_then(Value::as_array)
-        .ok_or_else(|| invalid_response("choices 必须为数组"))?;
+        .ok_or_else(|| invalid_response(HttpEnvelopeViolation::MissingChoices))?;
     let mut matching_choices = choices.iter().filter(|choice| {
         choice
             .as_object()
@@ -1104,14 +1123,14 @@ fn parse_success_response(
     let Some(choice) = matching_choices.next() else {
         return Err(LlmRequestError::Fatal(
             OpenAiChatCompletionError::InvalidResponseWire {
-                reason: "choices 必须包含唯一的数值 index 0",
+                violation: HttpEnvelopeViolation::EmptyChoices,
             },
         ));
     };
     if matching_choices.next().is_some() {
         return Err(LlmRequestError::Fatal(
             OpenAiChatCompletionError::InvalidResponseWire {
-                reason: "choices 必须包含唯一的数值 index 0",
+                violation: HttpEnvelopeViolation::InvalidContract,
             },
         ));
     }
@@ -1121,15 +1140,15 @@ fn parse_success_response(
     let message = choice
         .get("message")
         .and_then(Value::as_object)
-        .ok_or_else(|| invalid_response("index 0 choice 的 message 必须为对象"))?;
+        .ok_or_else(|| invalid_response(HttpEnvelopeViolation::MissingMessage))?;
     let content = message
         .get("content")
         .and_then(Value::as_str)
-        .ok_or_else(|| invalid_response("index 0 choice 的 message.content 必须为字符串"))?;
+        .ok_or_else(|| invalid_response(HttpEnvelopeViolation::MissingContent))?;
     let finish_reason = choice
         .get("finish_reason")
         .and_then(Value::as_str)
-        .ok_or_else(|| invalid_response("index 0 choice 的 finish_reason 必须为字符串"))?;
+        .ok_or_else(|| invalid_response(HttpEnvelopeViolation::InvalidContract))?;
     let finish_reason = match finish_reason {
         "stop" => LlmFinishReason::Stop,
         "length" => LlmFinishReason::Length,
@@ -1147,8 +1166,10 @@ fn parse_success_response(
     ))
 }
 
-fn invalid_response(reason: &'static str) -> LlmRequestError<OpenAiChatCompletionError> {
-    LlmRequestError::Fatal(OpenAiChatCompletionError::InvalidResponseWire { reason })
+fn invalid_response(
+    violation: HttpEnvelopeViolation,
+) -> LlmRequestError<OpenAiChatCompletionError> {
+    LlmRequestError::Fatal(OpenAiChatCompletionError::InvalidResponseWire { violation })
 }
 
 fn parse_usage(value: &Value) -> Option<LlmUsage> {
@@ -1250,6 +1271,70 @@ mod tests {
     use std::thread;
 
     use super::*;
+
+    #[test]
+    fn http_status_leaf_uses_safe_endpoint_and_typed_provider_fields() {
+        let source = OpenAiChatCompletionError::HttpStatus {
+            status: 503,
+            provider_code: Some("server_busy".to_owned()),
+            provider_type: Some("temporary".to_owned()),
+            provider_message: Some("try_later".to_owned()),
+            response_body_error: None,
+        };
+        let endpoint =
+            Url::parse("https://api.example.test:8443/v1/chat/completions?api_key=must-not-leak")
+                .expect("测试 URL 有效");
+        assert_eq!(
+            serde_json::to_value(source.diagnostic(&endpoint, Some(Duration::from_secs(7))))
+                .expect("诊断应可序列化"),
+            serde_json::json!({
+                "code": "http.status",
+                "stage": "model_request",
+                "issue": {
+                    "family": "http",
+                    "details": {
+                        "kind": "status",
+                        "endpoint": {
+                            "scheme": "https",
+                            "host": "api.example.test",
+                            "port": 8443
+                        },
+                        "status": 503,
+                        "retry_after_seconds": 7,
+                        "provider_code": "server_busy",
+                        "provider_type": "temporary",
+                        "provider_message": "try_later",
+                        "response_read_failure": null
+                    }
+                },
+                "resolution": "check_model_service"
+            })
+        );
+    }
+
+    #[test]
+    fn executor_request_diagnostic_redacts_selected_api_key_from_host() {
+        let client = OpenAiChatCompletionClient::new(
+            Url::parse("https://test-secret.example.test/v1/chat/completions")
+                .expect("测试 URL 有效"),
+            SecretString::from("test-secret"),
+            "test-model",
+            NonZeroUsize::new(1).expect("测试并发非零"),
+            Duration::from_secs(2),
+            None,
+            Map::new(),
+        );
+        let executor = executor(1);
+        let diagnostic = LlmRequestExecutor::request_diagnostic(
+            &executor,
+            &client,
+            &OpenAiChatCompletionError::WaitCancelled,
+            None,
+        );
+        let wire = serde_json::to_string(&diagnostic).expect("诊断应可序列化");
+        assert!(!wire.contains("test-secret"));
+        assert!(wire.contains("[REDACTED API KEY]"));
+    }
 
     fn non_zero_usize(value: usize) -> NonZeroUsize {
         NonZeroUsize::new(value).expect("测试值必须非零")
@@ -1756,10 +1841,9 @@ mod tests {
             provider_message: Some("request\r\nforged".to_owned()),
             response_body_error: None,
         };
-        let diagnostic = source.safe_diagnostic(
-            Some(Duration::from_secs(3)),
-            DiagnosticImpact::ProgressPreserved,
-        );
+        let endpoint =
+            Url::parse("https://api.example.test/v1/chat/completions").expect("测试 endpoint 合法");
+        let diagnostic = source.diagnostic(&endpoint, Some(Duration::from_secs(3)));
         let serialized = serde_json::to_string(&diagnostic).expect("诊断应可序列化");
         assert!(!serialized.contains("PROVIDER_CODE_WITH_CONTROL"));
         assert!(!serialized.contains("\\r"));
@@ -1805,7 +1889,7 @@ mod tests {
         );
         assert_eq!(debug.matches("[REDACTED API KEY]").count(), 2);
 
-        let diagnostic = source.safe_diagnostic(None, DiagnosticImpact::ProgressPreserved);
+        let diagnostic = source.diagnostic(&client.url, None);
         let serialized = serde_json::to_string(&diagnostic).expect("诊断应可序列化");
         assert!(!serialized.contains("test-secret"));
         assert!(serialized.contains("before [REDACTED API KEY] after [REDACTED API KEY]"));
@@ -1834,11 +1918,15 @@ mod tests {
     fn json_diagnostics_keep_category_and_coordinates_without_request_or_response_text() {
         let serialization_source =
             serde_json::to_vec(&SerializationFailureSentinel).expect_err("测试序列化器必须失败");
+        let endpoint =
+            Url::parse("https://api.example.test/v1/chat/completions").expect("测试 endpoint 合法");
         let serialization = OpenAiChatCompletionError::SerializeRequest(serialization_source)
-            .safe_diagnostic(None, DiagnosticImpact::Unchanged);
+            .diagnostic(&endpoint, None);
         let serialization = serde_json::to_string(&serialization).expect("序列化诊断应可序列化");
-        assert!(serialization.contains("request_serialization_failed"));
-        assert!(serialization.contains("json_category=data; line=0; column=0"));
+        assert!(serialization.contains("http.request_serialization"));
+        assert!(serialization.contains("\"category\":\"data\""));
+        assert!(serialization.contains("\"line\":0"));
+        assert!(serialization.contains("\"column\":0"));
         assert!(!serialization.contains("REQUEST_AND_PARAMETER_BODY_SENTINEL"));
 
         let response_body = br#"{"payload":"RESPONSE_MODEL_BODY_SENTINEL",]"#;
@@ -1846,26 +1934,25 @@ mod tests {
             serde_json::from_slice::<Value>(response_body).expect_err("测试响应必须是无效 JSON");
         let line = parsing_source.line();
         let column = parsing_source.column();
-        let parsing = OpenAiChatCompletionError::ParseResponse(parsing_source)
-            .safe_diagnostic(None, DiagnosticImpact::ProgressPreserved);
+        let parsing =
+            OpenAiChatCompletionError::ParseResponse(parsing_source).diagnostic(&endpoint, None);
         let parsing = serde_json::to_string(&parsing).expect("解析诊断应可序列化");
-        assert!(parsing.contains("response_parsing_failed"));
-        assert!(parsing.contains(&format!(
-            "json_category=syntax; line={line}; column={column}"
-        )));
+        assert!(parsing.contains("http.response_json"));
+        assert!(parsing.contains("\"category\":\"syntax\""));
+        assert!(parsing.contains(&format!("\"line\":{line}")));
+        assert!(parsing.contains(&format!("\"column\":{column}")));
         assert!(!parsing.contains("RESPONSE_MODEL_BODY_SENTINEL"));
     }
 
     #[test]
     fn cancelled_local_admission_is_distinct_from_a_closed_executor() {
-        let cancelled = OpenAiChatCompletionError::WaitCancelled
-            .safe_diagnostic(None, DiagnosticImpact::ProgressPreserved);
-        assert!(cancelled.reason.is_wait_cancelled());
-
-        let closed = OpenAiChatCompletionError::ExecutorClosed
-            .safe_diagnostic(None, DiagnosticImpact::ProgressPreserved);
-        assert!(!closed.reason.is_wait_cancelled());
-        assert_ne!(cancelled.reason, closed.reason);
+        let endpoint =
+            Url::parse("https://api.example.test/v1/chat/completions").expect("测试 endpoint 合法");
+        let cancelled = OpenAiChatCompletionError::WaitCancelled.diagnostic(&endpoint, None);
+        let closed = OpenAiChatCompletionError::ExecutorClosed.diagnostic(&endpoint, None);
+        assert_eq!(cancelled.code(), "http.wait_cancelled");
+        assert_eq!(closed.code(), "http.executor_closed");
+        assert_ne!(cancelled, closed);
     }
 
     #[test]
@@ -2371,11 +2458,12 @@ mod tests {
             Error::source(&error).is_some(),
             "HTTP 状态错误的 source 必须保留响应正文读取错误"
         );
-        let diagnostic = error.safe_diagnostic(None, DiagnosticImpact::Unchanged);
-        assert!(diagnostic.recovery.iter().any(|fact| matches!(
-            fact,
-            RecoveryFact::Component { name } if name.starts_with("response_body_read=")
-        )));
+        let diagnostic = error.diagnostic(&client.url, None);
+        let diagnostic = serde_json::to_value(diagnostic).expect("HTTP 诊断应可序列化");
+        assert_eq!(
+            diagnostic["issue"]["details"]["response_read_failure"]["phase"],
+            "read_error_response"
+        );
         assert!(server.requests.recv_timeout(Duration::from_secs(1)).is_ok());
         server.worker.join().expect("测试服务器应正常退出");
         executor.shutdown().await;
@@ -2400,7 +2488,7 @@ mod tests {
                 )
                 .await,
             Err(LlmRequestError::Retryable {
-                source: OpenAiChatCompletionError::Transport(_),
+                source: OpenAiChatCompletionError::Transport { .. },
                 retry_after: None,
             })
         ));

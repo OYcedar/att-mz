@@ -1,0 +1,4 @@
+# 结构化诊断按值保留完整领域事实；在这些边界额外装箱会增加热路径分配，
+# 因此只对超过 1 KiB 的错误和枚举变体提示布局问题。
+large-error-threshold = 1024
+enum-variant-size-threshold = 1024

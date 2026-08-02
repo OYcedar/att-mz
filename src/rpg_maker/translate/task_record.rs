@@ -4,7 +4,6 @@
 //! 逐 ID 验收和数据库提交仍分别由原有语义所有者负责；本模块只接收它们建立的
 //! 确定事实并呈现，不参与恢复、重放、验收、提交或退出码判断。
 
-use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -15,7 +14,7 @@ use serde_json::Value;
 use serde_json::value::RawValue;
 use time::OffsetDateTime;
 
-use crate::diagnostic::SafeDiagnostic;
+use crate::diagnostic::{DiagnosticReport, render_diagnostic_report};
 pub(crate) use crate::execution::llm_request::LlmRequestAttemptRecord as TranslationTaskAttemptRecord;
 #[cfg(test)]
 use crate::execution::llm_request::{
@@ -42,8 +41,11 @@ pub(crate) use crate::translation_protocol::{
 };
 
 use super::pipeline::{
-    RpgMakerExecutableTask, RpgMakerTranslationTaskIndex, TranslationProtocolDiagnostic,
-    TranslationTaskOutcome, TranslationTaskUnavailableReason, TranslationUnitRejectionReason,
+    RpgMakerExecutableTask, RpgMakerTranslationTaskIndex, TranslationTaskOutcome,
+};
+#[cfg(test)]
+use super::pipeline::{
+    TranslationProtocolDiagnostic, TranslationTaskUnavailableReason, TranslationUnitRejectionReason,
 };
 
 /// RPG Maker 响应值不满足字符串数组形状时的精确原因。
@@ -61,35 +63,14 @@ pub(crate) enum TranslationAssistantValueError {
     SourceNonStringItem { item: NonZeroUsize },
 }
 
-impl TranslationAssistantValueError {
-    pub(crate) fn business_message(self) -> String {
-        match self {
-            Self::NotStringArray => "译文必须是字符串数组".to_owned(),
-            Self::NonStringItem { item } => format!("译文数组第 {item} 项必须是字符串"),
-            Self::SourceEchoNotObject => "原文回显模式下，每个 ID 的值必须是对象".to_owned(),
-            Self::SourceEchoMissingSource => "原文回显对象缺少 source 字段".to_owned(),
-            Self::SourceEchoMissingTranslation => "原文回显对象缺少 translation 字段".to_owned(),
-            Self::SourceEchoDuplicateSource => "原文回显对象包含重复的 source 字段".to_owned(),
-            Self::SourceEchoDuplicateTranslation => {
-                "原文回显对象包含重复的 translation 字段".to_owned()
-            }
-            Self::SourceEchoUnexpectedField => {
-                "原文回显对象包含 source 和 translation 之外的字段".to_owned()
-            }
-            Self::SourceNotStringArray => "原文回显的 source 必须是字符串数组".to_owned(),
-            Self::SourceNonStringItem { item } => {
-                format!("原文回显的 source 数组第 {item} 项必须是字符串")
-            }
-        }
-    }
-}
-
 /// Assistant JSON 中保持原始顺序的一个条目。
 #[derive(Debug)]
 pub(crate) struct TranslationAssistantEntry {
     id: String,
     value: TranslationAssistantRecordedValue,
+    #[cfg(test)]
     canonical_id: Option<TaskId>,
+    #[cfg(test)]
     value_error: Option<TranslationAssistantValueError>,
 }
 
@@ -124,7 +105,9 @@ impl TranslationAssistantEntry {
         Self {
             id,
             value,
+            #[cfg(test)]
             canonical_id: None,
+            #[cfg(test)]
             value_error: None,
         }
     }
@@ -132,13 +115,17 @@ impl TranslationAssistantEntry {
     pub(crate) fn projected(
         id: String,
         value: TranslationAssistantRecordedValue,
-        canonical_id: Option<TaskId>,
-        value_error: Option<TranslationAssistantValueError>,
+        #[cfg(test)] canonical_id: Option<TaskId>,
+        #[cfg(not(test))] _canonical_id: Option<TaskId>,
+        #[cfg(test)] value_error: Option<TranslationAssistantValueError>,
+        #[cfg(not(test))] _value_error: Option<TranslationAssistantValueError>,
     ) -> Self {
         Self {
             id,
             value,
+            #[cfg(test)]
             canonical_id,
+            #[cfg(test)]
             value_error,
         }
     }
@@ -369,38 +356,37 @@ impl TranslationTaskExecution {
 }
 
 /// Executor 技术失败及其已经建立的旁路证据。
+///
+/// 未取消的失败在仍掌握原始边界事实时必须已经形成诊断；取消是独立终态，不能用
+/// `None` 伪装成普通失败。
 #[derive(Debug)]
-pub(crate) struct TranslationTaskExecutionFailure<E> {
-    source: E,
-    evidence: TranslationTaskExecutionEvidence,
-    diagnostic: Option<SafeDiagnostic>,
-    cancelled: bool,
+pub(crate) enum TranslationTaskExecutionFailure<E> {
+    Failed {
+        source: E,
+        evidence: TranslationTaskExecutionEvidence,
+        diagnostic: DiagnosticReport,
+    },
+    Cancelled {
+        source: E,
+        evidence: TranslationTaskExecutionEvidence,
+    },
 }
 
 impl<E> TranslationTaskExecutionFailure<E> {
-    pub(crate) fn new(
+    pub(crate) fn failed(
         source: E,
         evidence: TranslationTaskExecutionEvidence,
-        diagnostic: Option<SafeDiagnostic>,
-        cancelled: bool,
+        diagnostic: DiagnosticReport,
     ) -> Self {
-        Self {
+        Self::Failed {
             source,
             evidence,
             diagnostic,
-            cancelled,
         }
     }
 
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        E,
-        TranslationTaskExecutionEvidence,
-        Option<SafeDiagnostic>,
-        bool,
-    ) {
-        (self.source, self.evidence, self.diagnostic, self.cancelled)
+    pub(crate) fn cancelled(source: E, evidence: TranslationTaskExecutionEvidence) -> Self {
+        Self::Cancelled { source, evidence }
     }
 }
 
@@ -415,14 +401,14 @@ pub(crate) enum TranslationTaskCommitFailureImpact {
 pub(crate) struct TranslationTaskCommitFailure<E> {
     source: E,
     impact: TranslationTaskCommitFailureImpact,
-    diagnostic: Option<SafeDiagnostic>,
+    diagnostic: DiagnosticReport,
 }
 
 impl<E> TranslationTaskCommitFailure<E> {
     pub(crate) fn new(
         source: E,
         impact: TranslationTaskCommitFailureImpact,
-        diagnostic: Option<SafeDiagnostic>,
+        diagnostic: DiagnosticReport,
     ) -> Self {
         Self {
             source,
@@ -431,7 +417,7 @@ impl<E> TranslationTaskCommitFailure<E> {
         }
     }
 
-    pub(crate) fn not_applied(source: E, diagnostic: Option<SafeDiagnostic>) -> Self {
+    pub(crate) fn not_applied(source: E, diagnostic: DiagnosticReport) -> Self {
         Self::new(
             source,
             TranslationTaskCommitFailureImpact::NotApplied,
@@ -439,13 +425,7 @@ impl<E> TranslationTaskCommitFailure<E> {
         )
     }
 
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        E,
-        TranslationTaskCommitFailureImpact,
-        Option<SafeDiagnostic>,
-    ) {
+    pub(crate) fn into_parts(self) -> (E, TranslationTaskCommitFailureImpact, DiagnosticReport) {
         (self.source, self.impact, self.diagnostic)
     }
 
@@ -473,22 +453,24 @@ pub(crate) enum TranslationTaskRecordFinalState {
         outcome: Arc<TranslationTaskOutcome>,
     },
     ExecutionFailedNoChanges {
-        diagnostic: Option<SafeDiagnostic>,
+        diagnostic: DiagnosticReport,
     },
     CommitNotApplied {
         outcome: Arc<TranslationTaskOutcome>,
         phase: TranslationTaskCommitPhase,
-        diagnostic: Option<SafeDiagnostic>,
+        diagnostic: DiagnosticReport,
     },
     CommitOutcomeUnknown {
         outcome: Arc<TranslationTaskOutcome>,
-        diagnostic: Option<SafeDiagnostic>,
+        diagnostic: DiagnosticReport,
     },
     NotCommittedAfterEarlierFailure {
         outcome: Arc<TranslationTaskOutcome>,
+        diagnostic: DiagnosticReport,
     },
     InvalidResultNoChanges {
         outcome: Arc<TranslationTaskOutcome>,
+        diagnostic: DiagnosticReport,
     },
     CancelledNoChanges {
         outcome: Option<Arc<TranslationTaskOutcome>>,
@@ -523,8 +505,8 @@ impl TranslationTaskRecordFinalState {
             | Self::UnavailableNoChanges { outcome }
             | Self::CommitNotApplied { outcome, .. }
             | Self::CommitOutcomeUnknown { outcome, .. }
-            | Self::NotCommittedAfterEarlierFailure { outcome }
-            | Self::InvalidResultNoChanges { outcome } => Some(outcome),
+            | Self::NotCommittedAfterEarlierFailure { outcome, .. }
+            | Self::InvalidResultNoChanges { outcome, .. } => Some(outcome),
             Self::ExecutionFailedNoChanges { .. } => None,
             Self::CancelledNoChanges { outcome } => outcome.as_deref(),
         }
@@ -551,11 +533,13 @@ impl TranslationTaskRecordFinalState {
         }
     }
 
-    fn diagnostic(&self) -> Option<&SafeDiagnostic> {
+    fn diagnostic(&self) -> Option<&DiagnosticReport> {
         match self {
             Self::ExecutionFailedNoChanges { diagnostic }
             | Self::CommitNotApplied { diagnostic, .. }
-            | Self::CommitOutcomeUnknown { diagnostic, .. } => diagnostic.as_ref(),
+            | Self::CommitOutcomeUnknown { diagnostic, .. }
+            | Self::NotCommittedAfterEarlierFailure { diagnostic, .. }
+            | Self::InvalidResultNoChanges { diagnostic, .. } => Some(diagnostic),
             _ => None,
         }
     }
@@ -578,6 +562,10 @@ pub(crate) struct TranslationTaskRecordDocument {
     evidence: TranslationTaskExecutionEvidence,
     total_duration: Duration,
     state: TranslationTaskRecordFinalState,
+    /// 与项目日志共用、已在仍掌握 Unit/Task 事实的边界建立的安全诊断。
+    ///
+    /// 任务记录只呈现这些报告，不能重新从 Outcome 的业务枚举拼接另一套原因文本。
+    outcome_diagnostics: Vec<DiagnosticReport>,
 }
 
 impl TranslationTaskRecordDocument {
@@ -598,7 +586,16 @@ impl TranslationTaskRecordDocument {
             evidence,
             total_duration,
             state,
+            outcome_diagnostics: Vec::new(),
         }
+    }
+
+    /// 附加本次正常业务 Outcome 已经建立的诊断。
+    ///
+    /// 只有流水线最终化线调用它：同一份报告会同时交给 ProjectLog 和 Markdown 任务记录。
+    pub(crate) fn with_outcome_diagnostics(mut self, diagnostics: Vec<DiagnosticReport>) -> Self {
+        self.outcome_diagnostics = diagnostics;
+        self
     }
 
     pub(crate) const fn task_index(&self) -> RpgMakerTranslationTaskIndex {
@@ -904,13 +901,6 @@ fn render_final_result(
     api_key_redactor: &ApiKeyRedactor,
     document: &TranslationTaskRecordDocument,
 ) -> Result<(), serde_json::Error> {
-    let response_parse_error = document
-        .evidence
-        .response
-        .as_ref()
-        .and_then(|response| response.parse_error.as_ref());
-    let response_parse_error_message =
-        response_parse_error.map(|parse_error| parse_error.business_message());
     let _ = writeln!(
         output,
         "- {}",
@@ -951,304 +941,29 @@ fn render_final_result(
                 );
             }
         }
-        if !outcome.unresolved().is_empty() {
-            let _ = writeln!(
-                output,
-                "- {}",
-                task_record_text(localizer, UiMessage::TaskRecordRejectedHeading)
-            );
-            let response_value_errors = response_value_errors_by_id(document);
-            for unresolved in outcome.unresolved() {
-                let reason = if matches!(
-                    (unresolved.reason(), response_parse_error_message.as_deref()),
-                    (
-                        TranslationUnitRejectionReason::InvalidShape { message },
-                        Some(parse_error)
-                    ) if message == parse_error
-                ) {
-                    task_record_text(
-                        localizer,
-                        UiMessage::TaskRecordUnavailableDetail {
-                            code: "model_response_unusable",
-                        },
-                    )
-                } else {
-                    rejection_reason(
-                        localizer,
-                        api_key_redactor,
-                        unresolved.reason(),
-                        response_value_errors
-                            .get(&unresolved.id())
-                            .copied()
-                            .flatten(),
-                    )
-                };
-                let id = markdown_inline_code(
-                    &api_key_redactor.redact(&unresolved.id().get().to_string()),
-                );
-                let _ = writeln!(
-                    output,
-                    "  - {}",
-                    task_record_text(
-                        localizer,
-                        UiMessage::TaskRecordRejectedItem {
-                            id: &id,
-                            reason: &reason,
-                        }
-                    )
-                );
-            }
-        }
-        for diagnostic in outcome.diagnostics() {
-            if matches!(
-                (diagnostic, response_parse_error_message.as_deref()),
-                (
-                    TranslationProtocolDiagnostic::InvalidResponse { message },
-                    Some(parse_error)
-                ) if message == parse_error
-            ) {
-                continue;
-            }
-            let diagnostic = protocol_diagnostic(localizer, api_key_redactor, diagnostic);
-            let _ = writeln!(
-                output,
-                "- {}",
-                task_record_text(
-                    localizer,
-                    UiMessage::TaskRecordProtocolDiagnostic {
-                        diagnostic: &diagnostic,
-                    }
-                )
-            );
-        }
-        if let TranslationTaskOutcome::Unavailable { reason, .. } = outcome {
-            let reason = unavailable_reason(localizer, reason);
-            let _ = writeln!(
-                output,
-                "- {}",
-                task_record_text(
-                    localizer,
-                    UiMessage::TaskRecordUnavailableReason { reason: &reason }
-                )
-            );
-        }
     }
-    if let Some(diagnostic) = document.state.diagnostic() {
-        let reason = markdown_inline_code(
-            &api_key_redactor.redact(&diagnostic.reason.render_localized(localizer)),
-        );
+    for diagnostic in document
+        .outcome_diagnostics
+        .iter()
+        .chain(document.state.diagnostic())
+    {
+        let code = diagnostic.primary().code();
+        let reason = markdown_inline_code(code);
         let _ = writeln!(
             output,
             "- {}",
             task_record_text(
                 localizer,
                 UiMessage::TaskRecordTaskDiagnostic {
-                    code: diagnostic.code.as_str(),
+                    code,
                     reason: &reason,
                 }
             )
         );
+        let rendered = api_key_redactor.redact(&render_diagnostic_report(diagnostic, localizer));
+        output.push_str(&markdown_fence(&rendered, "text"));
     }
     Ok(())
-}
-
-fn response_value_errors_by_id(
-    document: &TranslationTaskRecordDocument,
-) -> HashMap<TaskId, Option<TranslationAssistantValueError>> {
-    let Some(entries) = document
-        .evidence
-        .response
-        .as_ref()
-        .and_then(|response| response.ordered_entries.as_ref())
-    else {
-        return HashMap::new();
-    };
-    let mut errors = HashMap::with_capacity(entries.len());
-    for entry in entries {
-        let Some(id) = entry.canonical_id else {
-            continue;
-        };
-        match errors.entry(id) {
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert(entry.value_error);
-            }
-            std::collections::hash_map::Entry::Occupied(mut slot) => {
-                slot.insert(None);
-            }
-        }
-    }
-    errors
-}
-
-fn rejection_reason(
-    localizer: &UiLocalizer,
-    api_key_redactor: &ApiKeyRedactor,
-    reason: &TranslationUnitRejectionReason,
-    value_error: Option<TranslationAssistantValueError>,
-) -> String {
-    let (code, line, expected, actual, detail, expected_blank) = match reason {
-        TranslationUnitRejectionReason::Missing => ("missing", 0, 0, 0, String::new(), ""),
-        TranslationUnitRejectionReason::Duplicate => ("duplicate", 0, 0, 0, String::new(), ""),
-        TranslationUnitRejectionReason::InvalidShape { message } => match value_error {
-            Some(TranslationAssistantValueError::NotStringArray) => {
-                ("invalid_shape_array", 0, 0, 0, String::new(), "")
-            }
-            Some(TranslationAssistantValueError::NonStringItem { item }) => {
-                ("invalid_shape_item", item.get(), 0, 0, String::new(), "")
-            }
-            Some(error) => (
-                "invalid_shape",
-                0,
-                0,
-                0,
-                markdown_inline_code(&error.business_message()),
-                "",
-            ),
-            None => (
-                "invalid_shape",
-                0,
-                0,
-                0,
-                markdown_inline_code(&api_key_redactor.redact(message)),
-                "",
-            ),
-        },
-        TranslationUnitRejectionReason::LineCountMismatch { expected, actual } => (
-            "line_count_mismatch",
-            0,
-            *expected,
-            *actual,
-            String::new(),
-            "",
-        ),
-        TranslationUnitRejectionReason::InvalidLineText { line_index } => (
-            "invalid_line_text",
-            line_index.saturating_add(1),
-            0,
-            0,
-            String::new(),
-            "",
-        ),
-        TranslationUnitRejectionReason::BlankLineMismatch {
-            line_index,
-            expected_blank,
-        } => (
-            "blank_line_mismatch",
-            line_index.saturating_add(1),
-            0,
-            0,
-            String::new(),
-            if *expected_blank {
-                "blank"
-            } else {
-                "non_blank"
-            },
-        ),
-        TranslationUnitRejectionReason::BlankTranslation => {
-            ("blank_translation", 0, 0, 0, String::new(), "")
-        }
-        TranslationUnitRejectionReason::NoNaturalLanguageText => {
-            ("no_natural_language_text", 0, 0, 0, String::new(), "")
-        }
-        TranslationUnitRejectionReason::ContainsByteOrderMark => {
-            ("contains_byte_order_mark", 0, 0, 0, String::new(), "")
-        }
-        TranslationUnitRejectionReason::PlaceholderMismatch { token } => (
-            "placeholder_mismatch",
-            0,
-            0,
-            0,
-            markdown_inline_code(&api_key_redactor.redact(token)),
-            "",
-        ),
-        TranslationUnitRejectionReason::UnexpectedPlaceholderToken { token } => (
-            "unexpected_placeholder",
-            0,
-            0,
-            0,
-            markdown_inline_code(&api_key_redactor.redact(token)),
-            "",
-        ),
-        TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous { original } => (
-            "placeholder_normalization_ambiguous",
-            0,
-            0,
-            0,
-            markdown_inline_code(&api_key_redactor.redact(original)),
-            "",
-        ),
-        TranslationUnitRejectionReason::SourceResidual { fragment } => (
-            "source_residual",
-            0,
-            0,
-            0,
-            markdown_inline_code(&api_key_redactor.redact(fragment)),
-            "",
-        ),
-    };
-    task_record_text(
-        localizer,
-        UiMessage::TaskRecordRejectionReason {
-            code,
-            line: line as u64,
-            expected: expected as u64,
-            actual: actual as u64,
-            detail: &detail,
-            expected_blank,
-        },
-    )
-}
-
-fn protocol_diagnostic(
-    localizer: &UiLocalizer,
-    api_key_redactor: &ApiKeyRedactor,
-    diagnostic: &TranslationProtocolDiagnostic,
-) -> String {
-    let (code, index, detail) = match diagnostic {
-        TranslationProtocolDiagnostic::NonStopFinish { reason } => (
-            "non_stop_finish",
-            0,
-            markdown_inline_code(&api_key_redactor.redact(&reason.to_string())),
-        ),
-        TranslationProtocolDiagnostic::InvalidResponse { message } => (
-            "invalid_response",
-            0,
-            markdown_inline_code(&api_key_redactor.redact(message)),
-        ),
-        TranslationProtocolDiagnostic::InvalidId { item_index } => {
-            ("invalid_id", item_index.saturating_add(1), String::new())
-        }
-        TranslationProtocolDiagnostic::UnknownId { item_index, id } => (
-            "unknown_id",
-            item_index.saturating_add(1),
-            markdown_inline_code(&api_key_redactor.redact(&id.get().to_string())),
-        ),
-    };
-    task_record_text(
-        localizer,
-        UiMessage::TaskRecordProtocolDetail {
-            code,
-            index: index as u64,
-            detail: &detail,
-        },
-    )
-}
-
-fn unavailable_reason(
-    localizer: &UiLocalizer,
-    reason: &TranslationTaskUnavailableReason,
-) -> String {
-    let code = match reason {
-        TranslationTaskUnavailableReason::ModelResponseUnusable => "model_response_unusable",
-        TranslationTaskUnavailableReason::AllOutputsRejected => "all_outputs_rejected",
-        TranslationTaskUnavailableReason::RecoverableRequestExhausted { .. } => {
-            "recoverable_request_exhausted"
-        }
-        TranslationTaskUnavailableReason::RetryAfterExceedsConfiguredMaximum { .. } => {
-            "retry_after_exceeds_maximum"
-        }
-    };
-    task_record_text(localizer, UiMessage::TaskRecordUnavailableDetail { code })
 }
 
 fn markdown_heading_id(id: &str) -> String {
@@ -1328,6 +1043,8 @@ fn render_duration(localizer: &UiLocalizer, duration: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use secrecy::SecretString;
     use serde_json::{Map, json};
     use tempfile::tempdir;
@@ -1335,8 +1052,8 @@ mod tests {
 
     use super::*;
     use crate::diagnostic::{
-        DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact,
-        DiagnosticReason, DiagnosticStage, DiagnosticSubject,
+        Diagnostic, DiagnosticReport, HttpEndpoint, HttpIssue, HttpScheme, HttpTransportKind,
+        HttpTransportPhase, SafeIdentifier, SafeText, StateEffect,
     };
     use crate::fingerprint::Sha256Fingerprint;
     use crate::language::{
@@ -1351,7 +1068,7 @@ mod tests {
     };
     use crate::runtime::cpu::{CpuExecutorConfig, RayonCpuExecutor};
     use crate::runtime::filesystem::SystemFileSystemConfig;
-    use crate::runtime::project_log::start_project_log;
+    use crate::translation::task_record::TaskRecordDiagnosticRecorder;
     use crate::translation_protocol::parse_translation_response;
 
     use super::super::executor::FinalLlmResponseMetadata;
@@ -1363,11 +1080,59 @@ mod tests {
     };
     use super::super::profile::TranslationResponseMode;
 
+    #[derive(Clone, Default)]
+    struct RecordingTaskRecordDiagnostics(Arc<Mutex<Vec<DiagnosticReport>>>);
+
+    impl TaskRecordDiagnosticRecorder for RecordingTaskRecordDiagnostics {
+        fn record_task_record_diagnostic(&self, report: DiagnosticReport) {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(report);
+        }
+    }
+
+    impl RecordingTaskRecordDiagnostics {
+        fn reports(&self) -> Vec<DiagnosticReport> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
     fn language_pair() -> LanguagePair {
         LanguagePair::new(
             LanguageId::parse("ja").expect("测试源语言应合法"),
             LanguageId::parse("zh-Hans").expect("测试目标语言应合法"),
         )
+    }
+
+    fn test_http_status_report(
+        status: u16,
+        retry_after_seconds: Option<u64>,
+        provider_code: Option<&str>,
+        provider_type: Option<&str>,
+        provider_message: Option<&str>,
+    ) -> DiagnosticReport {
+        DiagnosticReport::new(
+            StateEffect::ProgressPreserved,
+            Diagnostic::http(HttpIssue::Status {
+                endpoint: HttpEndpoint::new(HttpScheme::Https, "example.test", None),
+                status,
+                retry_after_seconds,
+                provider_code: provider_code
+                    .map(|value| SafeIdentifier::new(value).expect("测试 provider code 合法")),
+                provider_type: provider_type
+                    .map(|value| SafeIdentifier::new(value).expect("测试 provider type 合法")),
+                provider_message: provider_message.map(SafeText::new),
+                response_read_failure: None,
+            }),
+        )
+    }
+
+    fn test_terminal_diagnostic() -> DiagnosticReport {
+        test_http_status_report(503, None, Some("busy"), Some("service_error"), None)
     }
 
     fn task_id(value: usize) -> TaskId {
@@ -1417,7 +1182,12 @@ mod tests {
                 NonZeroUsize::MIN,
                 Vec::new(),
             ),
-            final_response: FinalLlmResponseMetadata::new(None, None, "stop", None),
+            final_response: FinalLlmResponseMetadata::new(
+                None,
+                None,
+                crate::diagnostic::RpgMakerModelFinishReason::Stop,
+                None,
+            ),
             accepted: NonEmptyTaskItems::new(
                 AcceptedTranslationDecision::new(
                     task_id(0),
@@ -1440,7 +1210,12 @@ mod tests {
                 NonZeroUsize::MIN,
                 Vec::new(),
             ),
-            final_response: FinalLlmResponseMetadata::new(None, None, "stop", None),
+            final_response: FinalLlmResponseMetadata::new(
+                None,
+                None,
+                crate::diagnostic::RpgMakerModelFinishReason::Stop,
+                None,
+            ),
             accepted: NonEmptyTaskItems::new(
                 AcceptedTranslationDecision::new(
                     task_id(0),
@@ -1454,7 +1229,7 @@ mod tests {
                 Vec::new(),
             ),
             unresolved: NonEmptyTaskItems::new(
-                UnresolvedTranslationUnit::new(
+                UnresolvedTranslationUnit::for_test(
                     task_id(1),
                     0,
                     TranslationUnitRejectionReason::Missing,
@@ -1474,7 +1249,7 @@ mod tests {
             final_response: None,
             reason: TranslationTaskUnavailableReason::AllOutputsRejected,
             unresolved: NonEmptyTaskItems::new(
-                UnresolvedTranslationUnit::new(
+                UnresolvedTranslationUnit::for_test(
                     task_id(0),
                     0,
                     TranslationUnitRejectionReason::Missing,
@@ -1552,7 +1327,9 @@ mod tests {
                     json!(["公主", "第二行"]),
                 )],
             )),
-            TranslationTaskRecordFinalState::ExecutionFailedNoChanges { diagnostic: None },
+            TranslationTaskRecordFinalState::ExecutionFailedNoChanges {
+                diagnostic: test_terminal_diagnostic(),
+            },
         );
         let mut parameters = Map::new();
         parameters.insert("temperature".to_owned(), json!(0.2));
@@ -1571,7 +1348,8 @@ mod tests {
 
         assert_eq!(
             markdown,
-            r#"# 翻译任务 000001 · 执行失败
+            concat!(
+                r#"# 翻译任务 000001 · 执行失败
 
 `任务 1/3` · `尝试 1 次` · `验收 0/0` · `写入 0 处`
 
@@ -1630,7 +1408,41 @@ raw
 ## 最终结果
 
 - 状态：执行失败，未提交
-"#
+- 任务诊断：`http.status`；原因 `http.status`
+```text
+错误 ["#,
+                "\u{2068}",
+                r#"http.status"#,
+                "\u{2069}",
+                r#"]
+阶段："#,
+                "\u{2068}",
+                r#"模型请求"#,
+                "\u{2069}",
+                r#"
+位置："#,
+                "\u{2068}",
+                r#"https://example.test"#,
+                "\u{2069}",
+                r#"
+原因："#,
+                "\u{2068}",
+                r#"外部服务拒绝了请求; endpoint=https://example.test; status=503; provider_code=busy; provider_type=service_error"#,
+                "\u{2069}",
+                r#"
+影响："#,
+                "\u{2068}",
+                r#"已保留有效进度"#,
+                "\u{2069}",
+                r#"
+处理办法："#,
+                "\u{2068}",
+                r#"检查模型服务响应和账户配额"#,
+                "\u{2069}",
+                r#"
+```
+"#,
+            )
         );
     }
 
@@ -1659,15 +1471,20 @@ raw
                     TranslationProtocolDiagnostic::InvalidId { item_index: 3 },
                 ],
             ),
-            final_response: FinalLlmResponseMetadata::new(None, None, "stop", None),
+            final_response: FinalLlmResponseMetadata::new(
+                None,
+                None,
+                crate::diagnostic::RpgMakerModelFinishReason::Stop,
+                None,
+            ),
             accepted: NonEmptyTaskItems::new(accepted, Vec::new()),
             unresolved: NonEmptyTaskItems::new(
-                UnresolvedTranslationUnit::new(
+                UnresolvedTranslationUnit::for_test(
                     task_id(1),
                     0,
                     TranslationUnitRejectionReason::Duplicate,
                 ),
-                vec![UnresolvedTranslationUnit::new(
+                vec![UnresolvedTranslationUnit::for_test(
                     task_id(2),
                     0,
                     TranslationUnitRejectionReason::Missing,
@@ -1700,7 +1517,8 @@ raw
                 )),
             ),
             TranslationTaskRecordFinalState::PartialCommitted { outcome },
-        );
+        )
+        .with_outcome_diagnostics(vec![test_terminal_diagnostic()]);
         let markdown = render_task_record(
             "run-ids",
             &client("https://example.test", "model", Map::new(), "unused-key"),
@@ -1720,10 +1538,8 @@ raw
         );
         assert!(markdown.contains("```json\n{\"raw\":true}\n```"));
         assert!(markdown.contains("- 状态：部分完成，已确认提交"));
-        assert!(markdown.contains("  - `1`：重复模型输出"));
-        assert!(markdown.contains("  - `2`：缺少模型输出"));
-        assert!(markdown.contains("协议诊断：模型第 3 个条目返回了未知 ID `99`"));
-        assert!(markdown.contains("协议诊断：模型第 4 个条目的 ID 非法"));
+        assert!(markdown.contains("http.status"));
+        assert!(!markdown.contains("协议诊断："));
         assert!(!markdown.contains("## Assistant\n\n```json"));
     }
 
@@ -1743,7 +1559,9 @@ raw
                     NonZeroUsize::MIN,
                 ),
             )),
-            TranslationTaskRecordFinalState::ExecutionFailedNoChanges { diagnostic: None },
+            TranslationTaskRecordFinalState::ExecutionFailedNoChanges {
+                diagnostic: test_terminal_diagnostic(),
+            },
         );
         let markdown = render_task_record(
             "run-invalid",
@@ -1771,37 +1589,43 @@ raw
     }
 
     #[test]
-    fn assistant_value_shape_error_is_localized_with_one_based_item_number() {
-        let localizer = UiLocalizer::new(UiLocale::English);
-        let redactor = ApiKeyRedactor::new(SecretString::from("unused-key"));
-        let reason = rejection_reason(
-            &localizer,
-            &redactor,
-            &TranslationUnitRejectionReason::InvalidShape {
-                message: "译文数组第 1 项必须是字符串".to_owned(),
+    fn outcome_diagnostic_is_rendered_from_the_document() {
+        let document = document(
+            Vec::new(),
+            Vec::new(),
+            None,
+            TranslationTaskRecordFinalState::PartialCommitted {
+                outcome: test_partial_outcome(),
             },
-            Some(TranslationAssistantValueError::NonStringItem {
-                item: NonZeroUsize::MIN,
-            }),
-        );
+        )
+        .with_outcome_diagnostics(vec![test_terminal_diagnostic()]);
+        let markdown = render_task_record(
+            "run-outcome-diagnostic",
+            &client("https://example.test", "model", Map::new(), "unused-key"),
+            UiLocale::English,
+            &document,
+        )
+        .expect("任务记录应直接渲染流水线传入的结构化诊断");
 
-        assert_eq!(
-            reason, "Translation array item 1 must be a string",
-            "任务记录必须消费结构化数组项错误，而不是权威 outcome 的中文兼容正文"
-        );
+        assert!(markdown.contains("http.status"));
+        assert!(!markdown.contains("Translation array item"));
     }
 
     #[test]
     fn invalid_response_parse_error_is_rendered_once_for_the_real_unavailable_outcome() {
-        let parse_error = "模型响应 JSON 无效：类别 syntax，第 4 行、第 1 列";
+        let parse_error = TranslationTaskResponseParseError::new(
+            TranslationTaskResponseParseErrorKind::Json(
+                TranslationTaskResponseJsonErrorCategory::Syntax,
+            ),
+            NonZeroUsize::new(4).expect("测试行号非零"),
+            NonZeroUsize::MIN,
+        );
         let unresolved = (0..2)
             .map(|id| {
-                UnresolvedTranslationUnit::new(
+                UnresolvedTranslationUnit::for_test(
                     task_id(id),
                     0,
-                    TranslationUnitRejectionReason::InvalidShape {
-                        message: parse_error.to_owned(),
-                    },
+                    TranslationUnitRejectionReason::InvalidResponse,
                 )
             })
             .collect::<Vec<_>>();
@@ -1809,11 +1633,14 @@ raw
             context: TranslationTaskOutcomeContext::new(
                 RpgMakerTranslationTaskIndex::new(0),
                 NonZeroUsize::MIN,
-                vec![TranslationProtocolDiagnostic::InvalidResponse {
-                    message: parse_error.to_owned(),
-                }],
+                vec![TranslationProtocolDiagnostic::InvalidResponse { error: parse_error }],
             ),
-            final_response: Some(FinalLlmResponseMetadata::new(None, None, "stop", None)),
+            final_response: Some(FinalLlmResponseMetadata::new(
+                None,
+                None,
+                crate::diagnostic::RpgMakerModelFinishReason::Stop,
+                None,
+            )),
             reason: TranslationTaskUnavailableReason::ModelResponseUnusable,
             unresolved: NonEmptyTaskItems::new(
                 unresolved[0].clone(),
@@ -1834,17 +1661,12 @@ raw
                 Vec::new(),
                 Some(TranslationTaskResponseRecord::invalid(
                     "不是 JSON".to_owned(),
-                    TranslationTaskResponseParseError::new(
-                        TranslationTaskResponseParseErrorKind::Json(
-                            TranslationTaskResponseJsonErrorCategory::Syntax,
-                        ),
-                        NonZeroUsize::new(4).expect("测试行号非零"),
-                        NonZeroUsize::MIN,
-                    ),
+                    parse_error,
                 )),
             ),
             TranslationTaskRecordFinalState::UnavailableNoChanges { outcome },
-        );
+        )
+        .with_outcome_diagnostics(vec![test_terminal_diagnostic()]);
         let markdown = render_task_record(
             "run-invalid-real",
             &client("https://example.test", "model", Map::new(), "unused-key"),
@@ -1861,10 +1683,8 @@ raw
             "解析错误只应在原始 Assistant 上方出现一次"
         );
         assert!(markdown.contains("- 状态：不可用，项目未改变"));
-        assert!(markdown.contains("- 不可用原因：模型响应无法解析"));
-        assert!(markdown.contains("- 未接受："));
-        assert!(markdown.contains("  - `0`：模型响应无法解析"));
-        assert!(markdown.contains("  - `1`：模型响应无法解析"));
+        assert!(markdown.contains("http.status"));
+        assert!(!markdown.contains("- 不可用原因："));
         assert!(!markdown.contains("- 协议诊断："));
     }
 
@@ -1922,14 +1742,16 @@ raw
                 "unavailable",
             ),
             (
-                TranslationTaskRecordFinalState::ExecutionFailedNoChanges { diagnostic: None },
+                TranslationTaskRecordFinalState::ExecutionFailedNoChanges {
+                    diagnostic: test_terminal_diagnostic(),
+                },
                 "execution_failed",
             ),
             (
                 TranslationTaskRecordFinalState::CommitNotApplied {
                     outcome: Arc::clone(&complete),
                     phase: TranslationTaskCommitPhase::Preparation,
-                    diagnostic: None,
+                    diagnostic: test_terminal_diagnostic(),
                 },
                 "commit_preparation_failed",
             ),
@@ -1937,26 +1759,28 @@ raw
                 TranslationTaskRecordFinalState::CommitNotApplied {
                     outcome: Arc::clone(&complete),
                     phase: TranslationTaskCommitPhase::Transaction,
-                    diagnostic: None,
+                    diagnostic: test_terminal_diagnostic(),
                 },
                 "commit_not_applied",
             ),
             (
                 TranslationTaskRecordFinalState::CommitOutcomeUnknown {
                     outcome: Arc::clone(&complete),
-                    diagnostic: None,
+                    diagnostic: test_terminal_diagnostic(),
                 },
                 "commit_outcome_unknown",
             ),
             (
                 TranslationTaskRecordFinalState::NotCommittedAfterEarlierFailure {
                     outcome: Arc::clone(&complete),
+                    diagnostic: test_terminal_diagnostic(),
                 },
                 "not_committed_after_earlier_failure",
             ),
             (
                 TranslationTaskRecordFinalState::InvalidResultNoChanges {
                     outcome: Arc::clone(&complete),
+                    diagnostic: test_terminal_diagnostic(),
                 },
                 "invalid_result",
             ),
@@ -2012,7 +1836,7 @@ raw
             ),
             TranslationTaskRecordFinalState::CommitOutcomeUnknown {
                 outcome: test_complete_outcome(),
-                diagnostic: None,
+                diagnostic: test_terminal_diagnostic(),
             },
         );
         let markdown = render_task_record(
@@ -2033,13 +1857,15 @@ raw
 
     #[test]
     fn cancelled_retry_wait_never_claims_that_a_retry_happened() {
-        let diagnostic = SafeDiagnostic::new(
-            DiagnosticCode::ModelRequest,
-            DiagnosticStage::ModelRequest,
-            DiagnosticSubject::component("provider"),
-            DiagnosticReason::failure(DiagnosticFailureKind::TransportFailed),
-            DiagnosticImpact::ProgressPreserved,
-            DiagnosticAction::Retry,
+        let diagnostic = DiagnosticReport::new(
+            StateEffect::ProgressPreserved,
+            Diagnostic::http(HttpIssue::Transport {
+                endpoint: HttpEndpoint::new(HttpScheme::Https, "example.test", None),
+                phase: HttpTransportPhase::Send,
+                transport: HttpTransportKind::Timeout,
+                io_kind: None,
+                raw_os_code: None,
+            }),
         );
         let document = document(
             Vec::new(),
@@ -2068,29 +1894,23 @@ raw
             !markdown.contains("等待 `1.000 秒` 后重试"),
             "等待期间取消时不得声称等待完成或已经重试"
         );
-        assert!(markdown.contains("原因：`收到有效响应前 HTTP 传输失败`"));
+        assert!(markdown.contains("http.transport.timeout"));
         assert!(
             !markdown.contains(r#"{"kind":"failure""#),
-            "任务记录必须渲染可读原因，不能再显示 DiagnosticReason 的 JSON 外壳"
+            "任务记录必须渲染可读诊断，不能显示旧 reason 的 JSON 外壳"
         );
     }
 
     #[test]
     fn http_provider_message_is_visible_in_attempt_record_and_redacted_again() {
         const API_KEY: &str = "task-record-secret";
-        let diagnostic = SafeDiagnostic::new(
-            DiagnosticCode::ModelRequest,
-            DiagnosticStage::ModelRequest,
-            DiagnosticSubject::component("provider"),
-            DiagnosticReason::Http {
-                status: Some(400),
-                retry_after_seconds: None,
-                provider_code: Some("bad_request".to_owned()),
-                provider_type: Some("invalid_request_error".to_owned()),
-                provider_message: Some(format!("before {API_KEY} after")),
-            },
-            DiagnosticImpact::ProgressPreserved,
-            DiagnosticAction::CheckModelService,
+        let message = format!("before {API_KEY} after");
+        let diagnostic = test_http_status_report(
+            400,
+            None,
+            Some("bad_request"),
+            Some("invalid_request_error"),
+            Some(&message),
         );
         let document = document(
             Vec::new(),
@@ -2100,7 +1920,9 @@ raw
                 diagnostic,
             )],
             None,
-            TranslationTaskRecordFinalState::ExecutionFailedNoChanges { diagnostic: None },
+            TranslationTaskRecordFinalState::ExecutionFailedNoChanges {
+                diagnostic: test_terminal_diagnostic(),
+            },
         );
 
         let markdown = render_task_record(
@@ -2112,9 +1934,9 @@ raw
         .expect("任务记录应可渲染");
 
         assert!(!markdown.contains(API_KEY));
-        assert!(markdown.contains("供应商错误码 bad_request"));
-        assert!(markdown.contains("供应商错误类型 invalid_request_error"));
-        assert!(markdown.contains("供应商错误消息 before [REDACTED API KEY] after"));
+        assert!(markdown.contains("provider_code=bad_request"));
+        assert!(markdown.contains("provider_type=invalid_request_error"));
+        assert!(markdown.contains("provider_message=before [REDACTED API KEY] after"));
     }
 
     #[test]
@@ -2149,17 +1971,8 @@ raw
     fn api_key_replacement_covers_every_record_field_without_hiding_neighbors() {
         const KEY: &str = "actual\"api\\key";
         const NEIGHBOR: &str = "ordinary-neighbor";
-        let diagnostic = SafeDiagnostic::new(
-            DiagnosticCode::ModelRequest,
-            DiagnosticStage::ModelRequest,
-            DiagnosticSubject::component(format!("{NEIGHBOR}:{KEY}")),
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::TransportFailed,
-                format!("{NEIGHBOR}:{KEY}"),
-            ),
-            DiagnosticImpact::ProgressPreserved,
-            DiagnosticAction::Retry,
-        );
+        let diagnostic_message = format!("{NEIGHBOR}:{KEY}");
+        let diagnostic = test_http_status_report(503, None, None, None, Some(&diagnostic_message));
         let response = LlmResponse::new(
             format!("{NEIGHBOR}:{KEY}"),
             LlmFinishReason::Other(format!("{NEIGHBOR}:{KEY}")),
@@ -2197,9 +2010,7 @@ raw
                     json!({format!("{NEIGHBOR}:{KEY}"): format!("{NEIGHBOR}:{KEY}")}),
                 )],
             )),
-            TranslationTaskRecordFinalState::ExecutionFailedNoChanges {
-                diagnostic: Some(diagnostic),
-            },
+            TranslationTaskRecordFinalState::ExecutionFailedNoChanges { diagnostic },
         );
         let mut parameters = Map::new();
         parameters.insert(
@@ -2299,7 +2110,9 @@ raw
                 Vec::new(),
             ),
             evidence,
-            TranslationTaskRecordFinalState::ExecutionFailedNoChanges { diagnostic: None },
+            TranslationTaskRecordFinalState::ExecutionFailedNoChanges {
+                diagnostic: test_terminal_diagnostic(),
+            },
         );
 
         let markdown = render_task_record(
@@ -2346,22 +2159,25 @@ raw
                 NonZeroUsize::MIN,
                 vec![
                     TranslationProtocolDiagnostic::NonStopFinish {
-                        reason: format!("{NEIGHBOR}:{KEY}"),
+                        reason:
+                            crate::diagnostic::RpgMakerModelNonStopFinishReason::provider_specific(
+                                format!("{NEIGHBOR}:{KEY}"),
+                            ),
                     },
-                    TranslationProtocolDiagnostic::InvalidResponse {
-                        message: format!("{NEIGHBOR}:{KEY}\nprotocol"),
-                    },
+                    TranslationProtocolDiagnostic::InvalidId { item_index: 0 },
                 ],
             ),
             final_response: FinalLlmResponseMetadata::new(
                 None,
                 None,
-                format!("{NEIGHBOR}:{KEY}"),
+                crate::diagnostic::RpgMakerModelFinishReason::provider_specific(format!(
+                    "{NEIGHBOR}:{KEY}"
+                )),
                 None,
             ),
             accepted: NonEmptyTaskItems::new(accepted, Vec::new()),
             unresolved: NonEmptyTaskItems::new(
-                UnresolvedTranslationUnit::new(
+                UnresolvedTranslationUnit::for_test(
                     task_id(1),
                     0,
                     TranslationUnitRejectionReason::SourceResidual {
@@ -2369,18 +2185,18 @@ raw
                     },
                 ),
                 vec![
-                    UnresolvedTranslationUnit::new(
+                    UnresolvedTranslationUnit::for_test(
                         task_id(2),
                         0,
                         TranslationUnitRejectionReason::PlaceholderMismatch {
                             token: format!("{NEIGHBOR}:{KEY}"),
                         },
                     ),
-                    UnresolvedTranslationUnit::new(
+                    UnresolvedTranslationUnit::for_test(
                         task_id(3),
                         0,
                         TranslationUnitRejectionReason::InvalidShape {
-                            message: format!("{NEIGHBOR}:{KEY}\nshape"),
+                            problem: TranslationAssistantValueError::SourceEchoUnexpectedField,
                         },
                     ),
                 ],
@@ -2401,7 +2217,8 @@ raw
                 None,
             ),
             TranslationTaskRecordFinalState::PartialCommitted { outcome },
-        );
+        )
+        .with_outcome_diagnostics(vec![test_terminal_diagnostic()]);
         let markdown = render_task_record(
             "run-final-redaction",
             &client("https://example.test", "model", Map::new(), KEY),
@@ -2411,16 +2228,8 @@ raw
         .expect("最终诊断任务记录应可渲染");
 
         assert!(!markdown.contains(KEY));
-        assert!(markdown.matches("[REDACTED API KEY]").count() >= 5);
-        assert!(markdown.matches(NEIGHBOR).count() >= 5);
-        assert!(
-            markdown.contains("```\"ordinary``marker:[REDACTED API KEY]\\nsource\"```"),
-            "含反引号和控制字符的动态诊断必须使用足够长的行内代码围栏"
-        );
-        assert!(
-            markdown.contains("```\"ordinary``marker:[REDACTED API KEY]\\nshape\"```"),
-            "InvalidShape 兜底详情同样必须保持最终结果列表结构"
-        );
+        assert!(!markdown.contains(NEIGHBOR));
+        assert!(markdown.contains("http.status"));
     }
 
     #[test]
@@ -2486,54 +2295,6 @@ raw
         assert_eq!(markdown.matches("[REDACTED API KEY]").count(), 2);
     }
 
-    #[test]
-    fn response_value_error_index_keeps_only_unique_canonical_ids() {
-        let unique = TranslationAssistantEntry::projected(
-            "0".to_owned(),
-            TranslationAssistantRecordedValue::RawJson(
-                RawValue::from_string("{}".to_owned()).expect("测试 JSON 应合法"),
-            ),
-            Some(task_id(0)),
-            Some(TranslationAssistantValueError::NotStringArray),
-        );
-        let duplicate_first = TranslationAssistantEntry::projected(
-            "1".to_owned(),
-            TranslationAssistantRecordedValue::RawJson(
-                RawValue::from_string("{}".to_owned()).expect("测试 JSON 应合法"),
-            ),
-            Some(task_id(1)),
-            Some(TranslationAssistantValueError::NotStringArray),
-        );
-        let duplicate_second = TranslationAssistantEntry::projected(
-            "1".to_owned(),
-            TranslationAssistantRecordedValue::RawJson(
-                RawValue::from_string("[]".to_owned()).expect("测试 JSON 应合法"),
-            ),
-            Some(task_id(1)),
-            Some(TranslationAssistantValueError::NonStringItem {
-                item: NonZeroUsize::MIN,
-            }),
-        );
-        let document = document(
-            Vec::new(),
-            Vec::new(),
-            Some(TranslationTaskResponseRecord::parsed(
-                "raw".to_owned(),
-                None,
-                vec![unique, duplicate_first, duplicate_second],
-            )),
-            TranslationTaskRecordFinalState::CancelledNoChanges { outcome: None },
-        );
-
-        let errors = response_value_errors_by_id(&document);
-        assert_eq!(
-            errors.get(&task_id(0)).copied().flatten(),
-            Some(TranslationAssistantValueError::NotStringArray)
-        );
-        assert_eq!(errors.get(&task_id(1)).copied().flatten(), None);
-        assert_eq!(errors.get(&task_id(2)), None);
-    }
-
     #[tokio::test]
     async fn existing_target_is_reported_without_overwrite_or_business_failure() {
         let directory = tempdir().expect("临时目录应可建立");
@@ -2546,9 +2307,7 @@ raw
             .expect("文件系统执行根应可建立");
         let cpu = RayonCpuExecutor::start(CpuExecutorConfig::fixed(NonZeroUsize::MIN))
             .expect("CPU 执行根应可建立");
-        let log_runtime =
-            start_project_log(directory.path().join("logs"), "run-conflict".to_owned());
-        let logger = log_runtime.logger();
+        let diagnostics = RecordingTaskRecordDiagnostics::default();
         let sink = MarkdownTranslationTaskRecordSink::new(
             record_directory,
             "run-conflict".to_owned(),
@@ -2556,7 +2315,7 @@ raw
             UiLocale::SimplifiedChinese,
             cpu.clone(),
             file_system,
-            logger.clone(),
+            diagnostics.clone(),
         );
         sink.submit(document(
             Vec::new(),
@@ -2574,12 +2333,13 @@ raw
             "existing",
             "无覆盖写入失败不得改写既有任务记录"
         );
+        let reports = diagnostics.reports();
+        assert_eq!(reports.len(), 1);
         assert_eq!(
-            logger.health().task_record_failures,
-            1,
-            "任务记录故障必须进入独立、可见但非致命的任务记录健康状态"
+            reports[0].primary().code(),
+            "observability.task_record.write"
         );
+        assert_eq!(reports[0].effect(), StateEffect::Unchanged);
         cpu.shutdown().expect("CPU 执行根应可关闭");
-        drop(log_runtime);
     }
 }

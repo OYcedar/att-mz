@@ -51,29 +51,7 @@ cli-argument-conflict = { $argument } 不能與目前其他引數同時使用。
 cli-wrong-number-of-values = { $argument } 的值數量不正確。
 cli-invalid-utf8 = 命令列引數不是有效 Unicode。
 cli-parse-failure = 無法解析命令列。
-log-label-phase-check-project = 檢查專案
-log-label-phase-scan-source = 掃描來源
-log-label-phase-prepare-candidate = 準備候選目錄
-log-label-phase-update-database = 更新資料庫
-log-label-phase-publish = 發布結果
-log-label-phase-builtin = 內建擷取
-log-label-phase-rules = 規則擷取
-log-label-phase-lua = Lua 處理
-log-label-phase-planning = 規劃工作
-log-label-phase-confirmed-tasks = 確認工作
-log-label-phase-no-work = 無需處理
-log-label-phase-read-assets = 讀取資產
-log-label-phase-plan-rpg-maker-write-back = 規劃 RPG Maker 寫回
-log-label-phase-rewrite-documents = 改寫文件
-log-label-phase-validate-candidate = 驗證候選目錄
-log-label-task-complete = 完整
-log-label-task-partial = 部分可用
-log-label-task-unavailable = 無法使用
-log-label-task-failed = 失敗
-error-state-applied-finalization = 結果已生效，但收尾失敗。重試前請先檢查專案狀態。
 error-no-executable-extract-owner = 清除後沒有可執行的 Extract owner，因此未儲存方案。
-error-plan-save-failed-applied = 命令結果已生效，但新執行方案未儲存。下次請明確傳入預期選項。
-error-plan-save-outcome-unknown = 命令結果已生效，但無法確認執行方案提交結果。下次請明確傳入預期選項。
 plan-source-explicit = 明確輸入
 plan-source-project-state = 專案狀態
 plan-source-product-default = 產品行為
@@ -141,35 +119,68 @@ log-lua-print = Lua：{ $message }
 log-lua-summary = Lua 統計：資料庫呼叫 { $database_calls } 次，修改 { $changed_rows } 列，譯文呼叫 { $translation_calls } 次，print { $printed_lines } 列。
 log-plan-resolved = 命令 { $command } 的方案來自{ $source }。
 log-phase-started = 階段開始：{ $phase }。
-log-phase-finished = 階段完成：{ $phase }。
 log-retry-summary = 共執行 { $count } 次重試。
-log-no-work = 不需執行工作：{ $reason }。
-log-no-work-translation-up-to-date = 譯文已與目前來源和設定檔一致
-log-partial-result = 有 { $count } 個部分結果需要關注。
 log-translation-task-started = 翻譯工作 { $index }/{ $total } 已開始。
 log-translation-task-finished = 翻譯工作 { $index } 已結束，結果為 { $outcome }。
-log-translation-task-diagnostic = 翻譯工作 { $index } 在嘗試 { $attempts } 次後回報診斷：{ $diagnostic }
+log-run-recovery-required = 命令 { $command } 結束時需要復原；請依診斷中的復原位置處理。
+log-phase-completed = 階段已完成：{ $phase }。
+log-phase-stopped = { $outcome ->
+    [failed] 階段失敗：{ $phase }。
+    [cancelled] 階段已取消：{ $phase }。
+   *[other] 階段已停止：{ $phase }。
+}
+log-cancellation-requested = 已要求取消；已確認 { $confirmed }/{ $total } 項。
+log-cancellation-requested-indeterminate = 已要求取消；已確認 { $confirmed } 項，總數未知。
+log-run-plan-finalized = { $result ->
+    [saved] 執行計畫已儲存。
+    [not_saved] 執行計畫未儲存。
+    [saved_finalization_failed] 執行計畫已儲存，但收尾失敗。
+    [outcome_unknown] 執行計畫的最終狀態未知。
+   *[other] 執行計畫收尾停止，結果無法辨識。
+}
+log-translation-finished = { $result ->
+    [not_started] 翻譯未開始。
+    [no_work] 翻譯結束，沒有需要處理的內容。
+    [complete] 翻譯已完成。
+    [incomplete] 翻譯結束，但仍有未完成內容。
+    [failed] 翻譯失敗。
+    [cancelled] 翻譯已取消。
+   *[other] 翻譯已停止，結果無法辨識。
+}
+log-publication-started = 開始發佈至輸出根目錄 { $path }。
+log-publication-finished = { $result ->
+    [published] 發佈已完成。
+    [not_published] 發佈未修改輸出。
+    [recovery_required] 發佈已停止，需要復原。
+    [outcome_unknown] 發佈的最終狀態未知。
+   *[other] 發佈已停止，結果無法辨識。
+}
+log-project-log-degraded = 專案日誌發生故障；已記錄 { $failure_kinds } 類故障。
+log-task-outcome-value = { $outcome ->
+    [complete] 完成
+    [partial] 部分完成
+    [unavailable] 暫時無法使用
+    [failed] 失敗
+    [not_committed_after_earlier_failure] 因先前失敗未提交
+    [cancelled] 已取消
+   *[other] 結果無法辨識
+}
 diagnostic-title = 錯誤 [{ $code }]
 diagnostic-stage = 階段：{ $stage }
-diagnostic-subject = 位置：{ $subject }
-diagnostic-subject-value = { $kind ->
-    [command] 指令 { $value }
-    [field] 欄位 { $value }
-    [project] 專案 { $value }
-    [profile] 設定檔 { $value }
-    [component] 元件 { $value }
-   *[other] { $value }
-}
-diagnostic-reason = 原因：{ $reason }
-diagnostic-impact = 影響：{ $impact }
-diagnostic-action = 處理方式：{ $action }
-diagnostic-recovery = 復原位置：{ $recovery }
-diagnostic-recovery-value = { $kind ->
-    [component] 元件 { $value }
-    [transaction] 交易 { $value }
-   *[other] { $value }
-}
+diagnostic-location = 位置：{ $subject }
+diagnostic-explanation = 原因：{ $reason }
+diagnostic-effect = 影響：{ $impact }
+diagnostic-resolution = 處理方式：{ $action }
 diagnostic-related = 相關錯誤 { $index }：
+diagnostic-relation-value = { $code ->
+    [cleanup] 清理
+    [rollback] 回滾
+    [discard] 丟棄
+    [finalization] 收尾
+    [shutdown] 關閉
+    [observability] 可觀測性
+   *[other] { $code }
+}
 diagnostic-stage-value = { $code ->
     [process_startup] 處理程序啟動
     [process_output] 處理程序輸出
@@ -186,23 +197,27 @@ diagnostic-stage-value = { $code ->
     [publication] 發佈
     [shutdown] 關閉
     [logging] 專案記錄
+    [runtime] 執行階段
    *[other] __ATT_FALLBACK__
 }
-diagnostic-impact-value = { $code ->
+diagnostic-effect-value = { $code ->
     [unchanged] 狀態未變更
-    [valid_progress_preserved] 已保留有效進度
-    [result_applied_but_run_plan_not_saved] 結果已套用，但執行計畫未儲存
-    [state_applied_but_finalization_failed] 狀態已套用，但收尾未完成
+    [progress_preserved] 已保留有效進度
+    [applied] 狀態已套用
+    [applied_run_plan_not_saved] 狀態已套用，但執行計畫未儲存
+    [applied_finalization_failed] 狀態已套用，但收尾未完成
     [recovery_required] 必須先復原，才能信任目前狀態
     [outcome_unknown] 最終狀態未知
    *[other] __ATT_FALLBACK__
 }
-diagnostic-action-value = { $code ->
+diagnostic-resolution-value = { $code ->
     [fix_configuration] 修正指出的設定欄位後重試
     [fix_input] 修正指出的輸入後重試
+    [fix_placeholder_rules] 修正指出的 Placeholder 規則後重試
+    [adjust_manual_layout] 依指出的位置與顯示寬度人工調整換行與版面
     [check_path_and_permissions] 檢查路徑、檔案系統狀態與權限
     [check_project_state] 檢查並修正專案狀態後重試
-    [retry_after_resolving_contention] 等待衝突作業結束後重試
+    [resolve_contention] 等待衝突作業結束後重試
     [check_model_service] 檢查模型服務回應與帳戶配額
     [preserve_recovery_artifacts] 請勿刪除列出的復原產物；先復原輸出，再重試
     [retry] 重試此作業
@@ -211,16 +226,14 @@ diagnostic-action-value = { $code ->
 }
 diagnostic-failure-value = { $code ->
     [missing_required_value] 缺少必填值
-    [extract_plan_required] 專案沒有可重用的 Extract 計畫；請提供 --builtin 或 --rules
     [generic_extract_required] 目前 JSONL 輸入與最近一次 Extract 不一致；請重新執行 att generic extract
     [conflicting_values] 提供的值互相衝突
     [invalid_syntax] 值的語法無效
     [invalid_encoding] 文字編碼無效
     [invalid_value] 值不符合必要契約
     [not_found] 必要物件不存在
-    [busy] 資源正由其他作業持有
     [state_mismatch] 已儲存的專案狀態不符合此作業需求
-    [requirement_failed] 必要前置條件未滿足
+    [unsupported_windows_code_page] Windows 代碼頁不是 UTF-8
     [transaction_rolled_back] 交易失敗，變更已回復
     [transaction_outcome_unknown] 無法確認交易已提交或回復
     [finalization_failed] 作業結果已產生，但收尾失敗
@@ -250,81 +263,32 @@ diagnostic-failure-value = { $code ->
     [response_parsing_failed] 模型回應不是有效的 JSON
     [invalid_response_contract] 模型回應不符合必要的回應契約
     [transport_failed] 收到有效回應前 HTTP 傳輸失敗
-    [lua_database_open_failed] Lua 主機無法開啟專案資料庫工作階段
-    [lua_context_creation_failed] Lua 執行階段無法建立 VM 內容
     [lua_compilation_failed] 無法編譯 Lua 主程式
     [lua_execution_failed] Lua 主程式執行時失敗
-    [lua_host_call_failed] Lua 主機功能呼叫失敗
-    [lua_finalization_failed] Lua 主機無法完成所有已繫結資源的收尾
-    [rules_definition_invalid] Rules 程式不符合 Rules 定義契約
-    [rules_document_read_failed] 無法讀取 Rules 程式需要的來源文件
-    [rules_no_non_blank_match] Rules 項目未產生任何非空白語意單元
-    [rules_invalid_target] Rules 項目選取了不能作為文字目標的值
     [rules_pattern_match_failed] 無法評估 Rules 的 PCRE2 模式
     [rules_zero_width_match] Rules 模式產生了零寬度相符項目
     [rules_overlapping_capture] Rules 模式產生了重疊的文字擷取
     [rules_missing_text_capture] 必要的具名文字擷取未參與比對
     [rules_invalid_capture_range] Rules 相符項目或擷取範圍超出有效 UTF-8 字元邊界
-    [rules_duplicate_target] 兩個 Rules 項目宣告了相同的實體文字目標
-    [rules_invalid_materialization] Rules 投影配方無法重建來源值
-    [rules_snapshot_invalid] 擷取出的 Rules 群組無法組成有效的資產快照
-    [rules_snapshot_store_failed] 無法提交已驗證的 Rules 擷取快照
-    [write_back_extraction_out_of_date] 已擷取資產不再符合目前專案來源
-    [write_back_asset_snapshot_invalid] 已儲存的 RPG Maker 資產無法組成有效的寫回快照
-    [source_document_invalid] RPG Maker 來源文件不符合必要的文件格式
-    [generic_source_document_invalid] Generic JSONL 來源文件不符合必要格式
-    [write_back_mutation_invalid] 已驗證的翻譯變更無法套用到凍結的來源位置
-    [write_back_output_path_invalid] 重寫檔案位於允許的 RPG Maker 輸出樹之外
-    [write_back_output_path_duplicate] 多個重寫檔案指向相同輸出路徑
-    [write_back_candidate_project_mismatch] 已準備的寫回候選屬於另一個專案
     [write_back_candidate_invalid] 寫回候選不符合必要的 data/js 樹狀結構
-    [write_back_not_published] 寫回候選未取代目前的輸出目錄
-    [write_back_published_with_residuals] 輸出已發佈，但部分復原產物無法移除
     [write_back_recovery_required] 必須先復原輸出目錄，才能信任其中內容
+    [already_exists] 目標物件已存在
+    [cancelled] 操作已取消
+    [concurrent_modification] 專案狀態在操作期間遭到並行修改
+    [duplicate_identifier] 識別碼重複
+    [extraction_out_of_date] 已儲存的提取結果不再符合目前來源
+    [invalid_content] 內容不符合必要契約
+    [manual_layout_required] 需要手動調整換行或版面
+    [operation_failed] 操作失敗
+    [placeholder_projection_failed] Placeholder 投影未保留必要結構
+    [profile_not_found] 所選翻譯 Profile 不存在
+    [recovery_required] 必須先完成復原，才能信任該結果
+    [resource_limit] 已達到所需資源限制
+    [resource_limit_exceeded] 操作超出後端資源限制
+    [source_snapshot_mismatch] 來源不再符合已儲存的快照
+    [unavailable] 要求的工作暫時無法使用
     [internal_invariant] 內部不變條件遭破壞；這是 ATT 缺陷
    *[other] __ATT_FALLBACK__
-}
-diagnostic-io-kind-value = { $code ->
-    [not_found] 找不到物件
-    [permission_denied] 權限不足
-    [connection_refused] 連線遭拒
-    [connection_reset] 連線已重設
-    [host_unreachable] 無法連線到主機
-    [network_unreachable] 無法連線到網路
-    [connection_aborted] 連線已中止
-    [not_connected] 尚未連線
-    [address_in_use] 位址已在使用中
-    [address_not_available] 位址不可用
-    [network_down] 網路已中斷
-    [broken_pipe] 管道已中斷
-    [already_exists] 物件已存在
-    [would_block] 作業會封鎖
-    [not_a_directory] 物件不是目錄
-    [is_a_directory] 物件是目錄
-    [directory_not_empty] 目錄不是空的
-    [read_only_filesystem] 檔案系統是唯讀的
-    [stale_network_file_handle] 網路檔案控制代碼已失效
-    [invalid_input] 作業輸入無效
-    [invalid_data] 資料無效
-    [timed_out] 作業逾時
-    [write_zero] 寫入沒有進展
-    [storage_full] 儲存空間已滿
-    [not_seekable] 物件不支援搜尋位置
-    [quota_exceeded] 儲存配額已用盡
-    [file_too_large] 檔案超過底層系統可處理的大小
-    [resource_busy] 資源忙碌中
-    [executable_file_busy] 可執行檔正在使用中
-    [deadlock] 作業會造成死結
-    [crosses_devices] 作業跨越檔案系統裝置
-    [too_many_links] 檔案系統連結過多
-    [invalid_filename] 檔名無效
-    [argument_list_too_long] 作業系統引數清單太長
-    [interrupted] 作業已中斷
-    [unsupported] 不支援此作業
-    [unexpected_eof] 檔案意外結束
-    [out_of_memory] 作業系統無法配置記憶體
-    [other] 其他作業系統錯誤
-   *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
     [language_policy_term_blank] 語言原則詞彙不能為空白
@@ -367,47 +331,6 @@ diagnostic-configuration-rule-value = { $code ->
     [referenced_client_not_found] 參照的 LLM 用戶端不存在
    *[other] __ATT_FALLBACK__
 }
-diagnostic-io-reason = 作業 { $operation }：{ $kind }
-diagnostic-io-reason-with-os-code = 作業 { $operation }：{ $kind }（OS { $os_code }）
-diagnostic-io-reason-with-system-message = 作業 { $operation }：{ $kind }：{ $system_message }
-diagnostic-io-reason-with-os-code-and-system-message = 作業 { $operation }：{ $kind }（OS { $os_code }）：{ $system_message }
-diagnostic-failure-with-detail = { $failure }：{ $detail }
-diagnostic-invalid-utf8 = 第 { $valid_up_to } 位元組的 UTF-8 無效，無效長度為 { $error_len } 位元組
-diagnostic-incomplete-utf8 = 第 { $valid_up_to } 位元組後是未完成的 UTF-8 序列
-diagnostic-toml-failure-value = { $code ->
-    [syntax] TOML 語法無效
-    [missing_field] 缺少必填設定欄位
-    [unknown_field] 設定包含未知欄位
-    [duplicate_field] 設定欄位被重複宣告
-    [type_mismatch] 應為{ $expected }
-    [invalid_value] 設定值不符合欄位契約
-   *[other] __ATT_FALLBACK__
-}
-diagnostic-toml-expected-kind-value = { $code ->
-    [string] 字串
-    [integer] 整數
-    [boolean] 布林值
-    [string_or_boolean] 字串或布林值
-    [string_array] 字串陣列
-    [integer_array] 整數陣列
-    [string_pair_array] 字串配對陣列
-    [table] 表格
-    [table_array] 表格陣列
-   *[other] __ATT_FALLBACK__
-}
-diagnostic-invalid-toml = TOML 無效（{ $resource }）：{ $failure }
-diagnostic-invalid-toml-at = TOML 第 { $line } 列、第 { $column } 欄無效（{ $resource }）：{ $failure }
-diagnostic-http-no-details = 模型服務請求失敗，但未傳回可公開的 HTTP 狀態詳細資料
-diagnostic-http-status = HTTP 狀態碼 { $status }
-diagnostic-http-retry-after = Retry-After { $seconds } 秒
-diagnostic-http-provider-code = 供應商錯誤碼 { $code }
-diagnostic-http-provider-type = 供應商錯誤類型 { $kind }
-diagnostic-http-provider-message = 供應商錯誤訊息 { $message }
-diagnostic-http-fact-separator = ；
-diagnostic-sqlite = SQLite 主要錯誤碼 { $primary_code }，延伸錯誤碼 { $extended_code }
-diagnostic-windows-status = Windows 作業 { $operation } 失敗，NTSTATUS { $status }
-diagnostic-resource = { $resource }：實際值 { $actual }
-diagnostic-resource-with-maximum = { $resource }：實際值 { $actual }，上限 { $maximum }
 task-record-title = 翻譯任務 { $ordinal } · { $state }
 task-record-state-label = { $state ->
     [complete] 完成
@@ -466,45 +389,6 @@ task-record-final-status = 狀態：{ $state ->
 }
 task-record-accepted-written = 已接受：{ $accepted } 項，寫入 { $written } 個實際位置
 task-record-accepted-outcome-unknown = 已驗收：{ $accepted } 項；無法確認資料庫提交終態
-task-record-rejected-heading = 未接受：
-task-record-rejected-item = { $id }：{ $reason }
-task-record-protocol-diagnostic = 協定診斷：{ $diagnostic }
-task-record-unavailable-reason = 不可用原因：{ $reason }
 task-record-task-diagnostic = 任務診斷：`{ $code }`；原因 { $reason }
-task-record-rejection-reason = { $code ->
-    [missing] 缺少模型輸出
-    [duplicate] 重複模型輸出
-    [invalid_shape] { $detail }
-    [invalid_shape_array] 譯文必須是字串陣列
-    [invalid_shape_item] 譯文陣列第 { $line } 項必須是字串
-    [line_count_mismatch] 行數不符（預期 { $expected }，實際 { $actual }）
-    [invalid_line_text] 第 { $line } 行包含無效控制字元
-    [blank_line_mismatch] 第 { $line } 行空白狀態不符（預期{ $expected_blank ->
-        [blank] 空白
-       *[other] 非空白
-    }）
-    [blank_translation] 譯文為空
-    [no_natural_language_text] 譯文沒有自然語言文字
-    [contains_byte_order_mark] 譯文包含 BOM
-    [placeholder_mismatch] 預留位置不符：{ $detail }
-    [unexpected_placeholder] 出現未知預留位置：{ $detail }
-    [placeholder_normalization_ambiguous] 預留位置正規化有歧義：{ $detail }
-    [source_residual] 偵測到來源語言殘留：{ $detail }
-   *[other] { $detail }
-}
-task-record-protocol-detail = { $code ->
-    [non_stop_finish] finish reason 不是 stop：{ $detail }
-    [invalid_response] { $detail }
-    [invalid_id] 模型第 { $index } 個項目的 ID 無效
-    [unknown_id] 模型第 { $index } 個項目傳回未知 ID { $detail }
-   *[other] { $detail }
-}
-task-record-unavailable-detail = { $code ->
-    [model_response_unusable] 無法解析模型回應
-    [all_outputs_rejected] 所有模型輸出均未通過驗收
-    [recoverable_request_exhausted] 可復原請求的重試額度已用盡
-    [retry_after_exceeds_maximum] Retry-After 超過已設定的最長等待時間
-   *[other] { $code }
-}
 task-record-duration-seconds = { $value } 秒
 task-record-duration-milliseconds = { $value } 毫秒

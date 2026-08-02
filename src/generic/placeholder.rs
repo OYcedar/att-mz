@@ -272,28 +272,6 @@ pub(crate) fn validate_manual_translation_and_binding_with_cancellation<E>(
     )
 }
 
-/// 使用已经编译的规则检查译文与原文实际 Placeholder 绑定顺序。
-#[cfg(test)]
-pub(crate) fn validate_translation_placeholders(
-    service: &GenericPlaceholderService,
-    compiled: &GenericCompiledPlaceholderRules,
-    kind: &str,
-    source_text: &str,
-    translation: &str,
-) -> Result<(), GenericPlaceholderError> {
-    match validate_translation_placeholders_with_cancellation(
-        service,
-        compiled,
-        kind,
-        source_text,
-        translation,
-        || Ok::<(), Infallible>(()),
-    ) {
-        Ok(result) => result,
-        Err(never) => match never {},
-    }
-}
-
 pub(crate) fn validate_translation_placeholders_with_cancellation<E>(
     service: &GenericPlaceholderService,
     compiled: &GenericCompiledPlaceholderRules,

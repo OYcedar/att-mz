@@ -13,8 +13,10 @@ use std::sync::{Arc, Mutex};
 
 use super::{RpgMakerWriteBack, RpgMakerWriteBackSummary, WriteBackProgressPhase};
 use crate::diagnostic::{
-    DiagnosticAction, DiagnosticCode, DiagnosticImpact, DiagnosticStage, DiagnosticSubject,
-    RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
+    Diagnostic, DiagnosticReport, RpgMakerComputeFailure, RpgMakerIssue,
+    RpgMakerLogicalUnitLocator, RpgMakerManualLayoutRegion, RpgMakerWriteBackChoicesPlanViolation,
+    RpgMakerWriteBackDialoguePlanViolation, RpgMakerWriteBackMutationPlanViolation,
+    RpgMakerWriteBackPlanningProblem, StateEffect,
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::execution::{CooperativeCancellation, OperationCompletion};
@@ -29,6 +31,7 @@ use crate::rpg_maker::project::{MaxFullwidthChars, OpenedProject, RpgMakerWriteB
 use crate::rpg_maker::text::{
     RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, StandardDataFile, TextGroupKind,
 };
+use crate::runtime::cpu::CpuExecutorUnavailable;
 
 const MAX_PLANNING_PROGRESS_UPDATES: u64 = 1_024;
 
@@ -1385,21 +1388,21 @@ impl ReplaceDialogueMutation {
         if expects_speaker != speaker.is_some() || expects_speaker != source_speaker.is_some() {
             return Err(RpgMakerWriteBackMutationPlanError::InvalidDialogue {
                 group_location: Box::new(recipe.group_location().clone()),
-                message: "Speaker 槽与最终 Speaker 不一致",
+                violation: WriteBackDialoguePlanViolation::SpeakerSlotMismatch,
             });
         }
         let expects_body = referenced.contains(&TextUnitRole::DialogueBody);
         if !expects_body && body_lines.is_some() {
             return Err(RpgMakerWriteBackMutationPlanError::InvalidDialogue {
                 group_location: Box::new(recipe.group_location().clone()),
-                message: "没有 Body 槽的对话不能提供 Body 译文",
+                violation: WriteBackDialoguePlanViolation::UnexpectedBodyTranslation,
             });
         }
         if let Some(lines) = &body_lines {
             if lines.is_empty() {
                 return Err(RpgMakerWriteBackMutationPlanError::InvalidDialogue {
                     group_location: Box::new(recipe.group_location().clone()),
-                    message: "Body 没有产生显示行",
+                    violation: WriteBackDialoguePlanViolation::EmptyBodyLines,
                 });
             }
             let semantic_indexes = lines
@@ -1419,7 +1422,7 @@ impl ReplaceDialogueMutation {
             {
                 return Err(RpgMakerWriteBackMutationPlanError::InvalidDialogue {
                     group_location: Box::new(recipe.group_location().clone()),
-                    message: "Body 显示行的语义来源索引不连续",
+                    violation: WriteBackDialoguePlanViolation::NonContiguousBodySemanticIndexes,
                 });
             }
         }
@@ -1506,7 +1509,7 @@ impl ReplaceChoicesMutation {
         if source_lines.is_empty() || source_lines.len() != replacement_lines.len() {
             return Err(RpgMakerWriteBackMutationPlanError::InvalidChoices {
                 group_location: Box::new(group_location),
-                message: "选项原文与译文必须是等长非空行序列",
+                violation: WriteBackChoicesPlanViolation::EmptyOrMismatchedLineCount,
             });
         }
         if source_lines
@@ -1516,7 +1519,7 @@ impl ReplaceChoicesMutation {
         {
             return Err(RpgMakerWriteBackMutationPlanError::InvalidChoices {
                 group_location: Box::new(group_location),
-                message: "选项空白槽必须逐字保持冻结原文",
+                violation: WriteBackChoicesPlanViolation::BlankSlotChanged,
             });
         }
         let mut references = BTreeMap::<usize, usize>::new();
@@ -1530,7 +1533,7 @@ impl ReplaceChoicesMutation {
             else {
                 return Err(RpgMakerWriteBackMutationPlanError::InvalidChoices {
                     group_location: Box::new(group_location),
-                    message: "选项配方必须只包含一个 Choices 行槽",
+                    violation: WriteBackChoicesPlanViolation::InvalidRecipeShape,
                 });
             };
             if source_lines.get(*source_line_index).map(String::as_str)
@@ -1538,7 +1541,7 @@ impl ReplaceChoicesMutation {
             {
                 return Err(RpgMakerWriteBackMutationPlanError::InvalidChoices {
                     group_location: Box::new(group_location),
-                    message: "选项配方与冻结原文不一致",
+                    violation: WriteBackChoicesPlanViolation::RecipeSourceMismatch,
                 });
             }
             *references.entry(*source_line_index).or_default() += 1;
@@ -1548,7 +1551,7 @@ impl ReplaceChoicesMutation {
         {
             return Err(RpgMakerWriteBackMutationPlanError::InvalidChoices {
                 group_location: Box::new(group_location),
-                message: "每个选项必须同时对应 102 列表项和同层 402 标签",
+                violation: WriteBackChoicesPlanViolation::IncompleteCommandCoverage,
             });
         }
         Ok(Self {
@@ -1756,6 +1759,46 @@ impl RpgMakerWriteBackMutationPlan {
 }
 
 /// Mutation 计划构造时发现的内部冲突。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WriteBackDialoguePlanViolation {
+    SpeakerSlotMismatch,
+    UnexpectedBodyTranslation,
+    EmptyBodyLines,
+    NonContiguousBodySemanticIndexes,
+}
+
+impl fmt::Display for WriteBackDialoguePlanViolation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::SpeakerSlotMismatch => "Speaker 槽与最终 Speaker 不一致",
+            Self::UnexpectedBodyTranslation => "没有 Body 槽的对话不能提供 Body 译文",
+            Self::EmptyBodyLines => "Body 没有产生显示行",
+            Self::NonContiguousBodySemanticIndexes => "Body 显示行的语义来源索引不连续",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WriteBackChoicesPlanViolation {
+    EmptyOrMismatchedLineCount,
+    BlankSlotChanged,
+    InvalidRecipeShape,
+    RecipeSourceMismatch,
+    IncompleteCommandCoverage,
+}
+
+impl fmt::Display for WriteBackChoicesPlanViolation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::EmptyOrMismatchedLineCount => "选项原文与译文必须是等长非空行序列",
+            Self::BlankSlotChanged => "选项空白槽必须逐字保持冻结原文",
+            Self::InvalidRecipeShape => "选项配方必须只包含一个 Choices 行槽",
+            Self::RecipeSourceMismatch => "选项配方与冻结原文不一致",
+            Self::IncompleteCommandCoverage => "每个选项必须同时对应 102 列表项和同层 402 标签",
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RpgMakerWriteBackMutationPlanError {
     EmptyEventBody {
@@ -1766,11 +1809,11 @@ pub(crate) enum RpgMakerWriteBackMutationPlanError {
     },
     InvalidDialogue {
         group_location: Box<RpgMakerLocation>,
-        message: &'static str,
+        violation: WriteBackDialoguePlanViolation,
     },
     InvalidChoices {
         group_location: Box<RpgMakerLocation>,
-        message: &'static str,
+        violation: WriteBackChoicesPlanViolation,
     },
     DuplicateLocation {
         exact_location: Box<RpgMakerLocation>,
@@ -1791,12 +1834,12 @@ impl fmt::Display for RpgMakerWriteBackMutationPlanError {
             }
             Self::InvalidDialogue {
                 group_location,
-                message,
-            } => write!(formatter, "对话修改 {group_location} 无效：{message}"),
+                violation,
+            } => write!(formatter, "对话修改 {group_location} 无效：{violation}"),
             Self::InvalidChoices {
                 group_location,
-                message,
-            } => write!(formatter, "选项修改 {group_location} 无效：{message}"),
+                violation,
+            } => write!(formatter, "选项修改 {group_location} 无效：{violation}"),
             Self::DuplicateLocation { exact_location } => {
                 write!(formatter, "Mutation 计划重复修改物理地址：{exact_location}")
             }
@@ -1808,6 +1851,87 @@ impl fmt::Display for RpgMakerWriteBackMutationPlanError {
 }
 
 impl Error for RpgMakerWriteBackMutationPlanError {}
+
+impl RpgMakerWriteBackMutationPlanError {
+    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
+        DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::rpg_maker(RpgMakerIssue::write_back_planning(
+                RpgMakerWriteBackPlanningProblem::InvalidPlan {
+                    violation: self.diagnostic_violation(),
+                },
+            )),
+        )
+    }
+
+    fn diagnostic_violation(&self) -> RpgMakerWriteBackMutationPlanViolation {
+        match self {
+            Self::EmptyEventBody { group_location } => {
+                RpgMakerWriteBackMutationPlanViolation::EmptyEventBody {
+                    group_location: group_location.diagnostic_location(),
+                }
+            }
+            Self::EmptyEventReplacement { exact_location } => {
+                RpgMakerWriteBackMutationPlanViolation::EmptyEventReplacement {
+                    exact_location: exact_location.diagnostic_location(),
+                }
+            }
+            Self::InvalidDialogue {
+                group_location,
+                violation,
+            } => RpgMakerWriteBackMutationPlanViolation::InvalidDialogue {
+                group_location: group_location.diagnostic_location(),
+                violation: match violation {
+                    WriteBackDialoguePlanViolation::SpeakerSlotMismatch => {
+                        RpgMakerWriteBackDialoguePlanViolation::SpeakerSlotMismatch
+                    }
+                    WriteBackDialoguePlanViolation::UnexpectedBodyTranslation => {
+                        RpgMakerWriteBackDialoguePlanViolation::UnexpectedBodyTranslation
+                    }
+                    WriteBackDialoguePlanViolation::EmptyBodyLines => {
+                        RpgMakerWriteBackDialoguePlanViolation::EmptyBodyLines
+                    }
+                    WriteBackDialoguePlanViolation::NonContiguousBodySemanticIndexes => {
+                        RpgMakerWriteBackDialoguePlanViolation::NonContiguousBodySemanticIndexes
+                    }
+                },
+            },
+            Self::InvalidChoices {
+                group_location,
+                violation,
+            } => RpgMakerWriteBackMutationPlanViolation::InvalidChoices {
+                group_location: group_location.diagnostic_location(),
+                violation: match violation {
+                    WriteBackChoicesPlanViolation::EmptyOrMismatchedLineCount => {
+                        RpgMakerWriteBackChoicesPlanViolation::EmptyOrMismatchedLineCount
+                    }
+                    WriteBackChoicesPlanViolation::BlankSlotChanged => {
+                        RpgMakerWriteBackChoicesPlanViolation::BlankSlotChanged
+                    }
+                    WriteBackChoicesPlanViolation::InvalidRecipeShape => {
+                        RpgMakerWriteBackChoicesPlanViolation::InvalidRecipeShape
+                    }
+                    WriteBackChoicesPlanViolation::RecipeSourceMismatch => {
+                        RpgMakerWriteBackChoicesPlanViolation::RecipeSourceMismatch
+                    }
+                    WriteBackChoicesPlanViolation::IncompleteCommandCoverage => {
+                        RpgMakerWriteBackChoicesPlanViolation::IncompleteCommandCoverage
+                    }
+                },
+            },
+            Self::DuplicateLocation { exact_location } => {
+                RpgMakerWriteBackMutationPlanViolation::DuplicateLocation {
+                    exact_location: exact_location.diagnostic_location(),
+                }
+            }
+            Self::MutationClaimConflict { resource } => {
+                RpgMakerWriteBackMutationPlanViolation::MutationClaimConflict {
+                    resource: resource.diagnostic_location(),
+                }
+            }
+        }
+    }
+}
 
 /// 把领域 Mutation 应用到冻结 RPG Maker 文档并产生一个待发布候选。
 ///
@@ -1890,6 +2014,36 @@ impl ManualLayoutDiagnostic {
 
     pub(crate) fn max_fullwidth_chars(&self) -> u32 {
         self.max_fullwidth_chars.get()
+    }
+
+    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
+        let locations = self
+            .locations
+            .iter()
+            .map(|location| {
+                RpgMakerLogicalUnitLocator::new(
+                    location.group_location().diagnostic_location(),
+                    location.role().diagnostic_role(),
+                )
+            })
+            .collect();
+        let region = match self.region {
+            RpgMakerWriteBackLayoutRegion::DialogueBody => RpgMakerManualLayoutRegion::DialogueBody,
+            RpgMakerWriteBackLayoutRegion::ScrollingText => {
+                RpgMakerManualLayoutRegion::ScrollingText
+            }
+            RpgMakerWriteBackLayoutRegion::HelpDescription => {
+                RpgMakerManualLayoutRegion::HelpDescription
+            }
+        };
+        DiagnosticReport::new(
+            StateEffect::Applied,
+            Diagnostic::rpg_maker(RpgMakerIssue::manual_layout_required(
+                locations,
+                region,
+                self.max_fullwidth_chars.get(),
+            )),
+        )
     }
 }
 
@@ -2039,7 +2193,8 @@ where
             .cpu
             .execute(move || assemble_planned_rpg_maker_write_back(planned_groups))
             .await
-            .map_err(RpgMakerWriteBackServiceError::SchedulePlanning)?;
+            .map_err(RpgMakerWriteBackServiceError::SchedulePlanning)?
+            .map_err(RpgMakerWriteBackServiceError::InvalidPlan)?;
         if self.cancellation.is_requested() {
             return Ok(OperationCompletion::Cancelled);
         }
@@ -2157,7 +2312,7 @@ fn plan_rpg_maker_write_back(
         .into_iter()
         .map(|group| plan_rpg_maker_write_back_group(group, profile, layouter))
         .collect();
-    assemble_planned_rpg_maker_write_back(groups)
+    assemble_planned_rpg_maker_write_back(groups).expect("测试快照应产生有效 Mutation 计划")
 }
 
 fn plan_rpg_maker_write_back_group(
@@ -2232,7 +2387,7 @@ fn plan_rpg_maker_write_back_group(
 
 fn assemble_planned_rpg_maker_write_back(
     groups: Vec<PlannedRpgMakerWriteBackGroup>,
-) -> PlannedRpgMakerWriteBack {
+) -> Result<PlannedRpgMakerWriteBack, RpgMakerWriteBackMutationPlanError> {
     let mut mutations = Vec::new();
     let mut summary = RpgMakerWriteBackSummary::default();
     let mut manual_layout_diagnostics = Vec::new();
@@ -2243,13 +2398,12 @@ fn assemble_planned_rpg_maker_write_back(
     }
     summary.manual_layout_units = manual_layout_diagnostics.len();
 
-    let mutation_plan = RpgMakerWriteBackMutationPlan::new(mutations)
-        .expect("受信快照和布局结果不应产生冲突 Mutation");
-    PlannedRpgMakerWriteBack {
+    let mutation_plan = RpgMakerWriteBackMutationPlan::new(mutations)?;
+    Ok(PlannedRpgMakerWriteBack {
         mutation_plan,
         summary,
         manual_layout_diagnostics,
-    }
+    })
 }
 
 fn merge_rpg_maker_write_back_summary(
@@ -2666,6 +2820,7 @@ fn is_canonical_help_description(
 pub(crate) enum RpgMakerWriteBackServiceError<R, D, C> {
     ReadAssets(R),
     SchedulePlanning(CpuTaskExecutionError<C>),
+    InvalidPlan(RpgMakerWriteBackMutationPlanError),
     RewriteDocuments(D),
 }
 
@@ -2681,6 +2836,7 @@ where
             Self::SchedulePlanning(source) => {
                 write!(formatter, "调度 RPG Maker 写回规划失败：{source}")
             }
+            Self::InvalidPlan(source) => write!(formatter, "RPG Maker 写回规划无效：{source}"),
             Self::RewriteDocuments(source) => {
                 write!(formatter, "改写 RPG Maker 文档失败：{source}")
             }
@@ -2698,59 +2854,31 @@ where
         match self {
             Self::ReadAssets(source) => Some(source),
             Self::SchedulePlanning(source) => Some(source),
+            Self::InvalidPlan(source) => Some(source),
             Self::RewriteDocuments(source) => Some(source),
         }
     }
 }
 
-impl<R, D, C> RpgMakerWriteBackServiceError<R, D, C>
-where
-    R: SafeDiagnosticSource,
-    D: SafeDiagnosticSource,
-    CpuTaskExecutionError<C>: SafeDiagnosticSource,
-{
-    pub(crate) fn safe_diagnostic(&self) -> SafeDiagnostic {
-        match self {
-            Self::ReadAssets(source) => source.safe_diagnostic_source(
-                DiagnosticStage::WriteBack,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            ),
-            Self::SchedulePlanning(source) => {
-                let mut diagnostic = source.safe_diagnostic_source(
-                    DiagnosticStage::WriteBack,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::Retry,
-                );
-                diagnostic.code = DiagnosticCode::WriteBackPlan;
-                diagnostic.subject = DiagnosticSubject::operation("RPG Maker write-back planning");
-                diagnostic.with_recovery(RecoveryFact::component(
-                    "write_back_operation=plan_rpg_maker_mutations",
-                ))
-            }
-            Self::RewriteDocuments(source) => source.safe_diagnostic_source(
-                DiagnosticStage::WriteBack,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            ),
+pub(crate) fn write_back_planning_compute_report(
+    source: &CpuTaskExecutionError<CpuExecutorUnavailable>,
+) -> DiagnosticReport {
+    let failure = match source {
+        CpuTaskExecutionError::Cancelled => RpgMakerComputeFailure::Cancelled,
+        CpuTaskExecutionError::Unavailable(CpuExecutorUnavailable::ShuttingDown) => {
+            RpgMakerComputeFailure::ExecutorClosed
         }
-    }
-}
-
-impl<R, D, C> SafeDiagnosticSource for RpgMakerWriteBackServiceError<R, D, C>
-where
-    R: SafeDiagnosticSource,
-    D: SafeDiagnosticSource,
-    CpuTaskExecutionError<C>: SafeDiagnosticSource,
-{
-    fn safe_diagnostic_source(
-        &self,
-        _stage: DiagnosticStage,
-        _impact: DiagnosticImpact,
-        _fallback_action: DiagnosticAction,
-    ) -> SafeDiagnostic {
-        self.safe_diagnostic()
-    }
+        CpuTaskExecutionError::Unavailable(CpuExecutorUnavailable::StatePoisoned) => {
+            RpgMakerComputeFailure::StatePoisoned
+        }
+        CpuTaskExecutionError::TaskPanicked => RpgMakerComputeFailure::WorkerPanicked,
+    };
+    DiagnosticReport::new(
+        StateEffect::Unchanged,
+        Diagnostic::rpg_maker(RpgMakerIssue::write_back_planning(
+            RpgMakerWriteBackPlanningProblem::Compute { failure },
+        )),
+    )
 }
 
 #[cfg(test)]

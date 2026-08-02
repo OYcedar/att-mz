@@ -11,9 +11,8 @@ use windows_sys::Win32::Globalization::{CP_UTF8, GetACP};
 use super::arguments::AttArguments;
 use super::arguments::ProgressArgument;
 use super::command::{
-    CommandPanicBoundary, CommandResultRenderer, CommandRunResult, PendingProjectLog,
-    ProductionCommandError, ProductionCommandRunReport, ProductionRpgMakerCommandRunner,
-    TerminationSignals,
+    CommandPanicBoundary, CommandResultRenderer, CommandRunResult, ProductionCommandError,
+    ProductionCommandRunReport, ProductionRpgMakerCommandRunner, TerminationSignals,
 };
 use super::config::{
     ConfigurationLoadError, ConfiguredProductCommand, DistributionLayout, DistributionLayoutError,
@@ -21,15 +20,15 @@ use super::config::{
 };
 use super::generic_command::{
     GenericCommandOutput, GenericCommandRunReport, GenericCommandRunResult, GenericShutdownError,
-    ProductionGenericCommandRunner,
+    ProductionGenericCommandRunner, generic_command_error_report,
 };
+use super::project_log::{PendingProjectLog, ProjectLogWarning};
 use crate::diagnostic::{
-    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
-    DiagnosticStage, DiagnosticSubject, SafeDiagnostic, render_safe_diagnostic,
+    Diagnostic, DiagnosticReport, IoFailure, RuntimeComponent, RuntimeIssue, RuntimeOperation,
+    RuntimePanicBoundary, StateEffect, render_diagnostic_report,
 };
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
 use crate::progress::ProgressMode;
-use crate::runtime::project_log::{ObservabilityWarning, ProjectLogWarning};
 
 enum ProductCommandRunReport {
     RpgMaker(ProductionCommandRunReport),
@@ -62,34 +61,26 @@ fn run_guarded() -> ExitCode {
         // 进程运行时不满足最低要求时，完整 CLI 尚未解析，固定使用英语呈现；
         // run_from 不执行此检查，避免未嵌入 manifest 的 Rust 测试宿主受进程 ACP 影响。
         let localizer = UiLocalizer::new(UiLocale::English);
-        let exit = render_diagnostic_fatal(&localizer, &diagnostic, &mut stderr);
+        let exit = render_diagnostic_report_fatal(&localizer, &diagnostic, &mut stderr);
         return finalize_process_output(exit, &mut stdout, &mut stderr);
     }
     run_from(std::env::args_os(), &mut stdout, &mut stderr)
 }
 
-fn windows_utf8_process_diagnostic() -> Option<SafeDiagnostic> {
+fn windows_utf8_process_diagnostic() -> Option<DiagnosticReport> {
     // SAFETY: GetACP 没有参数，只读取当前进程的 Windows ANSI code page。
     let actual_code_page = unsafe { GetACP() };
     windows_utf8_process_diagnostic_for(actual_code_page)
 }
 
-fn windows_utf8_process_diagnostic_for(actual_code_page: u32) -> Option<SafeDiagnostic> {
+fn windows_utf8_process_diagnostic_for(actual_code_page: u32) -> Option<DiagnosticReport> {
     (actual_code_page != CP_UTF8).then(|| {
-        SafeDiagnostic::new(
-            DiagnosticCode::ProcessRuntimeStart,
-            DiagnosticStage::ProcessStartup,
-            DiagnosticSubject::component("Windows UTF-8 runtime"),
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::RequirementFailed,
-                format!(
-                    "ATT requires Windows 10 version 1903 or later and an official executable \
-                     with an embedded UTF-8 manifest; expected process code page {CP_UTF8}, \
-                     actual {actual_code_page}"
-                ),
-            ),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::ReportBug,
+        DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::runtime(RuntimeIssue::UnsupportedWindowsCodePage {
+                expected: CP_UTF8,
+                actual: actual_code_page,
+            }),
         )
     })
 }
@@ -98,19 +89,23 @@ fn render_uncaught_panic() -> ExitCode {
     // UI locale 尚未由完整 Clap 解析确认时，现行 CLI 契约固定使用英语兜底。
     let localizer = UiLocalizer::new(UiLocale::English);
     let mut stderr = io::stderr();
-    render_uncaught_panic_with(&localizer, &mut stderr)
+    render_uncaught_panic_with(
+        &localizer,
+        RuntimePanicBoundary::ProcessStartup,
+        &mut stderr,
+    )
 }
 
-fn render_uncaught_panic_with(localizer: &UiLocalizer, stderr: &mut dyn Write) -> ExitCode {
-    let diagnostic = SafeDiagnostic::new(
-        DiagnosticCode::InternalOperation,
-        DiagnosticStage::ProcessStartup,
-        DiagnosticSubject::Process,
-        DiagnosticReason::failure(DiagnosticFailureKind::InternalInvariant),
-        DiagnosticImpact::OutcomeUnknown,
-        DiagnosticAction::ReportBug,
+fn render_uncaught_panic_with(
+    localizer: &UiLocalizer,
+    boundary: RuntimePanicBoundary,
+    stderr: &mut dyn Write,
+) -> ExitCode {
+    let diagnostic = DiagnosticReport::new(
+        StateEffect::OutcomeUnknown,
+        Diagnostic::runtime(RuntimeIssue::ProcessPanicked { boundary }),
     );
-    render_diagnostic_fatal(localizer, &diagnostic, stderr)
+    render_diagnostic_report_fatal(localizer, &diagnostic, stderr)
 }
 
 fn run_from<A, S>(args: A, stdout: &mut dyn Write, stderr: &mut dyn Write) -> ExitCode
@@ -173,7 +168,7 @@ fn catch_after_cli_parsing(
         Err(payload) => {
             // 与命令 panic 边界一致，payload 只触发控制流，绝不读取或格式化。
             drop(payload);
-            render_uncaught_panic_with(localizer, stderr)
+            render_uncaught_panic_with(localizer, RuntimePanicBoundary::AfterCliParsing, stderr)
         }
     }
 }
@@ -201,16 +196,15 @@ fn run_after_cli_parsing(
     let runtime_parallelism = match std::thread::available_parallelism() {
         Ok(parallelism) => parallelism,
         Err(error) => {
-            let diagnostic = SafeDiagnostic::io(
-                DiagnosticCode::ProcessRuntimeStart,
-                DiagnosticStage::ProcessStartup,
-                DiagnosticSubject::component("Tokio"),
-                "detect_available_parallelism",
-                &error,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::Retry,
+            let diagnostic = DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::runtime(RuntimeIssue::Io {
+                    component: RuntimeComponent::TokioRuntime,
+                    operation: RuntimeOperation::DetectAvailableParallelism,
+                    failure: IoFailure::from_error(&error),
+                }),
             );
-            return render_diagnostic_fatal(localizer, &diagnostic, stderr);
+            return render_diagnostic_report_fatal(localizer, &diagnostic, stderr);
         }
     };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -220,16 +214,15 @@ fn run_after_cli_parsing(
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            let diagnostic = SafeDiagnostic::io(
-                DiagnosticCode::ProcessRuntimeStart,
-                DiagnosticStage::ProcessStartup,
-                DiagnosticSubject::component("Tokio"),
-                "build_runtime",
-                &error,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::Retry,
+            let diagnostic = DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::runtime(RuntimeIssue::Io {
+                    component: RuntimeComponent::TokioRuntime,
+                    operation: RuntimeOperation::BuildAsyncRuntime,
+                    failure: IoFailure::from_error(&error),
+                }),
             );
-            return render_diagnostic_fatal(localizer, &diagnostic, stderr);
+            return render_diagnostic_report_fatal(localizer, &diagnostic, stderr);
         }
     };
 
@@ -266,7 +259,8 @@ fn run_after_cli_parsing(
     let mut pending_project_log = report.pending_project_log;
     let panic_boundary = pending_project_log
         .as_mut()
-        .map(PendingProjectLog::arm_presentation_panic);
+        .map(PendingProjectLog::arm_presentation_panic)
+        .map(CommandPanicBoundary::from_report);
     catch_logged_presentation(panic_boundary, localizer, stderr, |stderr| {
         render_command_report(
             report.result,
@@ -291,8 +285,10 @@ fn render_command_report(
         (CommandRunResult::Succeeded(output), shutdown) => {
             if let Err(error) = CommandResultRenderer::render_success(&output, localizer, stdout) {
                 let command_error = ProductionCommandError::stdout_write(error);
-                let warning = pending_project_log
-                    .and_then(|project_log| project_log.finish_with_failure(&command_error));
+                let warning = pending_project_log.and_then(|project_log| {
+                    project_log
+                        .finish_with_diagnostic(command_error.failure_report().report().clone())
+                });
                 let warning_failed =
                     render_project_log_warning_if_present(localizer, warning.as_ref(), stderr)
                         .is_err();
@@ -311,8 +307,10 @@ fn render_command_report(
                 CommandResultRenderer::render_success_warnings(&output, localizer, stderr)
             {
                 let command_error = ProductionCommandError::stderr_write(error);
-                let warning = pending_project_log
-                    .and_then(|project_log| project_log.finish_with_failure(&command_error));
+                let warning = pending_project_log.and_then(|project_log| {
+                    project_log
+                        .finish_with_diagnostic(command_error.failure_report().report().clone())
+                });
                 let warning_failed =
                     render_project_log_warning_if_present(localizer, warning.as_ref(), stderr)
                         .is_err();
@@ -417,10 +415,10 @@ fn render_generic_command_report(
         shutdown_errors,
         mut pending_project_log,
     } = report;
-    let panic_boundary = pending_project_log
+    let panic_report = pending_project_log
         .as_mut()
         .map(PendingProjectLog::arm_presentation_panic);
-    catch_logged_presentation(panic_boundary, localizer, stderr, |stderr| {
+    catch_generic_logged_presentation(panic_report, localizer, stderr, |stderr| {
         render_generic_command_result(
             result,
             &shutdown_errors,
@@ -443,29 +441,30 @@ fn render_generic_command_result(
     match result {
         GenericCommandRunResult::Succeeded(output) => {
             if let Err(source) = render_generic_output(output, localizer, stdout) {
-                let diagnostic = SafeDiagnostic::io(
-                    DiagnosticCode::StateFinalizationFailed,
-                    DiagnosticStage::ProcessOutput,
-                    DiagnosticSubject::operation("write_stdout"),
-                    "write_stdout",
-                    &source,
-                    DiagnosticImpact::StateAppliedFinalizationFailed,
-                    DiagnosticAction::Retry,
+                let diagnostic = DiagnosticReport::new(
+                    StateEffect::AppliedFinalizationFailed,
+                    Diagnostic::runtime(RuntimeIssue::Io {
+                        component: RuntimeComponent::Process,
+                        operation: RuntimeOperation::WriteStdout,
+                        failure: IoFailure::from_error(&source),
+                    }),
                 );
                 let warning = pending_project_log
                     .and_then(|project_log| project_log.finish_with_diagnostic(diagnostic.clone()));
-                let warning_failed =
-                    render_project_log_warning_if_present(localizer, warning.as_ref(), stderr)
-                        .is_err();
-                let diagnostic_failed =
-                    render_safe_diagnostic(&diagnostic, localizer, stderr).is_err();
-                let shutdown_failed = render_generic_shutdown_errors(
-                    shutdown_errors,
-                    DiagnosticImpact::StateAppliedFinalizationFailed,
+                let warning_failed = render_generic_project_log_warning_if_present(
                     localizer,
+                    warning.as_ref(),
                     stderr,
                 )
                 .is_err();
+                let diagnostic_failed = writeln!(
+                    stderr,
+                    "{}",
+                    render_diagnostic_report(&diagnostic, localizer)
+                )
+                .is_err();
+                let shutdown_failed =
+                    render_generic_shutdown_errors(shutdown_errors, localizer, stderr).is_err();
                 if warning_failed || diagnostic_failed || shutdown_failed {
                     return ExitCode::FAILURE;
                 }
@@ -475,8 +474,12 @@ fn render_generic_command_result(
                 let warning_presentation_failed = warning
                     .as_ref()
                     .is_some_and(|warning| !warning.presentation_failures.is_empty());
-                if render_project_log_warning_if_present(localizer, warning.as_ref(), stderr)
-                    .is_err()
+                if render_generic_project_log_warning_if_present(
+                    localizer,
+                    warning.as_ref(),
+                    stderr,
+                )
+                .is_err()
                     || warning_presentation_failed
                 {
                     return ExitCode::FAILURE;
@@ -484,14 +487,7 @@ fn render_generic_command_result(
                 if shutdown_errors.is_empty() {
                     ExitCode::SUCCESS
                 } else {
-                    if render_generic_shutdown_errors(
-                        shutdown_errors,
-                        DiagnosticImpact::StateAppliedFinalizationFailed,
-                        localizer,
-                        stderr,
-                    )
-                    .is_err()
-                    {
+                    if render_generic_shutdown_errors(shutdown_errors, localizer, stderr).is_err() {
                         return ExitCode::FAILURE;
                     }
                     ExitCode::FAILURE
@@ -501,21 +497,18 @@ fn render_generic_command_result(
         GenericCommandRunResult::Failed(error) => {
             let warning = pending_project_log.and_then(PendingProjectLog::finish);
             let warning_failed =
-                render_project_log_warning_if_present(localizer, warning.as_ref(), stderr).is_err();
-            let diagnostic_failed =
-                render_safe_diagnostic(&error.safe_diagnostic(), localizer, stderr).is_err();
-            let mut related_failed = false;
-            for related in error.related_diagnostics() {
-                related_failed |= render_safe_diagnostic(&related, localizer, stderr).is_err();
-            }
-            let shutdown_failed = render_generic_shutdown_errors(
-                shutdown_errors,
-                DiagnosticImpact::ProgressPreserved,
-                localizer,
+                render_generic_project_log_warning_if_present(localizer, warning.as_ref(), stderr)
+                    .is_err();
+            let diagnostic = generic_command_error_report(&error);
+            let diagnostic_failed = writeln!(
                 stderr,
+                "{}",
+                render_diagnostic_report(&diagnostic, localizer)
             )
             .is_err();
-            if warning_failed || diagnostic_failed || related_failed || shutdown_failed {
+            let shutdown_failed =
+                render_generic_shutdown_errors(shutdown_errors, localizer, stderr).is_err();
+            if warning_failed || diagnostic_failed || shutdown_failed {
                 return ExitCode::FAILURE;
             }
             ExitCode::FAILURE
@@ -526,7 +519,7 @@ fn render_generic_command_result(
                 .as_ref()
                 .is_some_and(|warning| !warning.presentation_failures.is_empty());
             let warning_result =
-                render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
+                render_generic_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
             let cancellation_result =
                 writeln!(stderr, "{}", localizer.format(UiMessage::ResultCancelled));
             if warning_result.is_err()
@@ -537,14 +530,7 @@ fn render_generic_command_result(
             } else if shutdown_errors.is_empty() {
                 ExitCode::from(130)
             } else {
-                if render_generic_shutdown_errors(
-                    shutdown_errors,
-                    DiagnosticImpact::ProgressPreserved,
-                    localizer,
-                    stderr,
-                )
-                .is_err()
-                {
+                if render_generic_shutdown_errors(shutdown_errors, localizer, stderr).is_err() {
                     return ExitCode::FAILURE;
                 }
                 ExitCode::FAILURE
@@ -558,7 +544,8 @@ fn render_generic_output(
     localizer: &UiLocalizer,
     stdout: &mut dyn Write,
 ) -> io::Result<()> {
-    let count = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+    let count =
+        |value: usize| u64::try_from(value).expect("当前目标平台的结果计数必须能用 u64 表达");
     match output {
         GenericCommandOutput::Init { project } => writeln!(
             stdout,
@@ -687,16 +674,35 @@ fn render_generic_output(
 
 fn render_generic_shutdown_errors(
     errors: &[GenericShutdownError],
-    impact: DiagnosticImpact,
     localizer: &UiLocalizer,
     stderr: &mut dyn Write,
 ) -> io::Result<()> {
     for error in errors {
-        let mut diagnostic = error.safe_diagnostic();
-        diagnostic.impact = impact;
-        render_safe_diagnostic(&diagnostic, localizer, stderr)?;
+        writeln!(
+            stderr,
+            "{}",
+            render_diagnostic_report(&error.diagnostic_report(), localizer)
+        )?;
     }
     Ok(())
+}
+
+fn catch_generic_logged_presentation(
+    panic_report: Option<DiagnosticReport>,
+    localizer: &UiLocalizer,
+    stderr: &mut dyn Write,
+    presentation: impl FnOnce(&mut dyn Write) -> ExitCode,
+) -> ExitCode {
+    match catch_unwind(AssertUnwindSafe(|| presentation(stderr))) {
+        Ok(exit_code) => exit_code,
+        Err(payload) => {
+            let Some(report) = panic_report else {
+                std::panic::resume_unwind(payload);
+            };
+            drop(payload);
+            render_diagnostic_report_fatal(localizer, &report, stderr)
+        }
+    }
 }
 
 fn catch_logged_presentation(
@@ -724,12 +730,12 @@ fn catch_logged_presentation(
     }
 }
 
-fn render_diagnostic_fatal(
+fn render_diagnostic_report_fatal(
     localizer: &UiLocalizer,
-    diagnostic: &SafeDiagnostic,
+    report: &DiagnosticReport,
     stderr: &mut dyn Write,
 ) -> ExitCode {
-    if render_safe_diagnostic(diagnostic, localizer, stderr).is_err() {
+    if writeln!(stderr, "{}", render_diagnostic_report(report, localizer)).is_err() {
         return ExitCode::FAILURE;
     }
     ExitCode::FAILURE
@@ -740,35 +746,29 @@ fn render_project_log_warning(
     warning: &ProjectLogWarning,
     stderr: &mut dyn Write,
 ) -> io::Result<()> {
-    if let Some(project_log) = &warning.project_log {
-        render_observability_warning(localizer, UiMessage::NoticeLogDegraded, project_log, stderr)?;
+    // 日志降级后的诊断必须给出实际 JSONL 路径，调用者才能检查已保留的证据；路径
+    // 来自本地项目工作区，不从错误正文或外部响应拼接。
+    if let Some(path) = &warning.log_path {
+        writeln!(stderr, "project_log_path={}", path.display())?;
     }
-    if let Some(task_records) = &warning.task_records {
-        render_observability_warning(
-            localizer,
-            UiMessage::NoticeTaskRecordsDegraded,
-            task_records,
+    if !warning.project_log.is_empty() {
+        writeln!(stderr, "{}", localizer.format(UiMessage::NoticeLogDegraded))?;
+        for report in &warning.project_log {
+            writeln!(stderr, "{}", render_diagnostic_report(report, localizer))?;
+        }
+    }
+    if !warning.task_records.is_empty() {
+        writeln!(
             stderr,
+            "{}",
+            localizer.format(UiMessage::NoticeTaskRecordsDegraded)
         )?;
+        for report in &warning.task_records {
+            writeln!(stderr, "{}", render_diagnostic_report(report, localizer))?;
+        }
     }
-    for diagnostic in &warning.presentation_failures {
-        render_safe_diagnostic(diagnostic, localizer, stderr)?;
-    }
-    Ok(())
-}
-
-fn render_observability_warning(
-    localizer: &UiLocalizer,
-    banner: UiMessage<'_>,
-    warning: &ObservabilityWarning,
-    stderr: &mut dyn Write,
-) -> io::Result<()> {
-    writeln!(stderr, "{}", localizer.format(banner))?;
-    if let Some(diagnostic) = &warning.diagnostic {
-        render_safe_diagnostic(diagnostic, localizer, stderr)?;
-    }
-    for diagnostic in &warning.related_diagnostics {
-        render_safe_diagnostic(diagnostic, localizer, stderr)?;
+    for report in &warning.presentation_failures {
+        writeln!(stderr, "{}", render_diagnostic_report(report, localizer))?;
     }
     Ok(())
 }
@@ -784,21 +784,27 @@ fn render_project_log_warning_if_present(
     Ok(())
 }
 
+fn render_generic_project_log_warning_if_present(
+    localizer: &UiLocalizer,
+    warning: Option<&ProjectLogWarning>,
+    stderr: &mut dyn Write,
+) -> io::Result<()> {
+    render_project_log_warning_if_present(localizer, warning, stderr)
+}
+
 #[cfg(test)]
 fn render_fatal(
     localizer: &UiLocalizer,
     _error: &dyn std::fmt::Display,
     stderr: &mut dyn Write,
 ) -> ExitCode {
-    let diagnostic = SafeDiagnostic::new(
-        DiagnosticCode::InternalOperation,
-        DiagnosticStage::ProcessStartup,
-        DiagnosticSubject::Process,
-        DiagnosticReason::failure(DiagnosticFailureKind::InternalInvariant),
-        DiagnosticImpact::Unchanged,
-        DiagnosticAction::ReportBug,
+    let diagnostic = DiagnosticReport::new(
+        StateEffect::Unchanged,
+        Diagnostic::runtime(RuntimeIssue::ProcessPanicked {
+            boundary: RuntimePanicBoundary::ProcessStartup,
+        }),
     );
-    render_diagnostic_fatal(localizer, &diagnostic, stderr)
+    render_diagnostic_report_fatal(localizer, &diagnostic, stderr)
 }
 
 fn render_distribution_layout_error(
@@ -806,26 +812,8 @@ fn render_distribution_layout_error(
     error: &DistributionLayoutError,
     stderr: &mut dyn Write,
 ) -> ExitCode {
-    let diagnostic = match error {
-        DistributionLayoutError::CurrentExecutable(source) => SafeDiagnostic::io(
-            DiagnosticCode::ProcessRuntimeStart,
-            DiagnosticStage::ProcessStartup,
-            DiagnosticSubject::component("ATT executable"),
-            "resolve_current_executable",
-            source,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckPathAndPermissions,
-        ),
-        DistributionLayoutError::ExecutableDirectoryMissing { path } => SafeDiagnostic::new(
-            DiagnosticCode::ProcessRuntimeStart,
-            DiagnosticStage::ProcessStartup,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(DiagnosticFailureKind::InvalidValue),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::ReportBug,
-        ),
-    };
-    render_diagnostic_fatal(localizer, &diagnostic, stderr)
+    let report = DiagnosticReport::new(StateEffect::Unchanged, error.diagnostic());
+    render_diagnostic_report_fatal(localizer, &report, stderr)
 }
 
 fn render_configuration_load_error(
@@ -833,8 +821,8 @@ fn render_configuration_load_error(
     error: &ConfigurationLoadError,
     stderr: &mut dyn Write,
 ) -> ExitCode {
-    let diagnostic = error.safe_diagnostic();
-    render_diagnostic_fatal(localizer, &diagnostic, stderr)
+    let report = DiagnosticReport::new(StateEffect::Unchanged, error.diagnostic());
+    render_diagnostic_report_fatal(localizer, &report, stderr)
 }
 
 #[cfg(test)]
@@ -845,11 +833,11 @@ mod tests {
 
     use super::*;
     use crate::application::command::{RpgMakerCommandOutput, ShutdownFailures};
-    use crate::diagnostic::SafeDiagnosticSource;
+    use crate::diagnostic::DiagnosticStage;
     use crate::rpg_maker::extract::{
         ExtractOutput, RulesCommandNonStringType, RulesCommandNonStringWarning,
     };
-    use crate::runtime::project_log::ProjectLogValueSource;
+    use crate::runtime::project_log::RunPlanValueSource as ProjectLogValueSource;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum ObservedStream {
@@ -900,36 +888,6 @@ mod tests {
     }
 
     impl std::error::Error for TestShutdownError {}
-
-    impl SafeDiagnosticSource for TestShutdownError {
-        fn safe_diagnostic_source(
-            &self,
-            stage: DiagnosticStage,
-            impact: DiagnosticImpact,
-            fallback_action: DiagnosticAction,
-        ) -> SafeDiagnostic {
-            SafeDiagnostic::new(
-                DiagnosticCode::ShutdownComponent,
-                stage,
-                DiagnosticSubject::component("test shutdown root"),
-                DiagnosticReason::failure(DiagnosticFailureKind::FinalizationFailed),
-                impact,
-                fallback_action,
-            )
-        }
-    }
-
-    struct PanickingOutput;
-
-    impl Write for PanickingOutput {
-        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
-            std::panic::panic_any(Box::new("PRESENTATION_PANIC_BODY_SENTINEL"));
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
 
     #[derive(Default)]
     struct FailingOutput {
@@ -1087,7 +1045,7 @@ mod tests {
         assert!(
             String::from_utf8(stderr.bytes)
                 .expect("stderr 应为 UTF-8")
-                .contains("shutdown.component")
+                .contains("runtime.worker_panicked")
         );
         let order = order
             .lock()
@@ -1115,15 +1073,20 @@ mod tests {
 
         let diagnostic =
             windows_utf8_process_diagnostic_for(936).expect("非 UTF-8 代码页必须被拒绝");
-        assert_eq!(diagnostic.code, DiagnosticCode::ProcessRuntimeStart);
-        assert_eq!(diagnostic.stage, DiagnosticStage::ProcessStartup);
-        assert_eq!(diagnostic.impact, DiagnosticImpact::Unchanged);
-        assert_eq!(diagnostic.action, DiagnosticAction::ReportBug);
-        assert!(
-            diagnostic
-                .reason
-                .render_localized(&UiLocalizer::new(UiLocale::English))
-                .contains("actual 936")
+        assert_eq!(diagnostic.primary().code(), "runtime.windows_code_page");
+        assert_eq!(
+            diagnostic.primary().stage(),
+            DiagnosticStage::ProcessStartup
+        );
+        assert_eq!(diagnostic.effect(), StateEffect::Unchanged);
+        assert_eq!(
+            diagnostic.primary().resolution(),
+            crate::diagnostic::DiagnosticResolution::ReportBug
+        );
+        let wire = serde_json::to_value(diagnostic).expect("进程诊断必须可序列化");
+        assert_eq!(
+            wire["primary"]["issue"]["details"]["actual"],
+            serde_json::json!(936)
         );
     }
 
@@ -1155,112 +1118,16 @@ mod tests {
         let stderr = String::from_utf8(stderr).expect("stderr 应为 UTF-8");
         let plain = stderr.replace(['\u{2068}', '\u{2069}'], "");
         let stdout_position = stderr
-            .find("state.finalization_failed")
+            .find("runtime.stdout_write")
             .expect("stdout 写入失败必须成为主错误");
         let shutdown_position = stderr
-            .find("shutdown.component")
+            .find("runtime.worker_panicked")
             .expect("shutdown 失败必须继续呈现");
         assert!(
             stdout_position < shutdown_position,
             "stdout 主错误必须先于 shutdown 相关错误"
         );
         assert!(plain.contains("相关错误 1"));
-    }
-
-    #[test]
-    fn logged_presentation_panic_reports_the_same_safe_projection_to_cli_and_jsonl() {
-        use crate::diagnostic::RecoveryFact;
-        use crate::runtime::performance::RunPerformanceCounters;
-        use crate::runtime::project_log::{
-            ProjectLog, ProjectLogCode, ProjectLogContext, ProjectLogEvent, ProjectLogLevel,
-            ProjectLogPayload, start_project_log,
-        };
-        use std::sync::Arc;
-
-        const PANIC_BODY: &str = "PRESENTATION_PANIC_BODY_SENTINEL";
-        let directory = tempfile::tempdir().expect("临时日志目录应可建立");
-        let project_workspace = directory.path().join("rpg_maker_mz").join("project");
-        let logs_root = project_workspace.join("logs");
-        let run_id = "550e8400-e29b-41d4-a716-446655440098";
-        let mut runtime = start_project_log(logs_root, run_id.to_owned());
-        let log_path = runtime.path().expect("真实日志应有路径").to_path_buf();
-        let logger = runtime.logger();
-        let context = ProjectLogContext::new("zh-Hans")
-            .with_engine("rpg_maker_mz")
-            .with_project("project")
-            .with_command("write-back");
-        let diagnostic = SafeDiagnostic::new(
-            DiagnosticCode::InternalOperation,
-            DiagnosticStage::ProcessOutput,
-            DiagnosticSubject::command("write-back"),
-            DiagnosticReason::failure(DiagnosticFailureKind::InternalInvariant),
-            DiagnosticImpact::OutcomeUnknown,
-            DiagnosticAction::ReportBug,
-        )
-        .with_recovery(RecoveryFact::path(&project_workspace))
-        .with_recovery(RecoveryFact::path(&log_path));
-        runtime.arm_unfinished_terminal(
-            context.clone(),
-            vec![diagnostic.clone()],
-            Arc::new(RunPerformanceCounters::default()),
-        );
-        logger.emit(ProjectLogEvent::new(
-            ProjectLogLevel::Info,
-            ProjectLogCode::RunStarted,
-            context,
-            ProjectLogPayload::Run { outcome: None },
-        ));
-        let panic_boundary = CommandPanicBoundary::from_logged(vec![diagnostic.clone()], logger);
-        let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
-        let mut stderr = Vec::new();
-        let mut stdout = PanickingOutput;
-
-        let exit = catch_logged_presentation(
-            Some(panic_boundary),
-            &localizer,
-            &mut stderr,
-            move |_stderr| {
-                let _runtime = runtime;
-                stdout
-                    .write_all(b"result")
-                    .expect("测试输出必须在写入时触发 panic");
-                ExitCode::SUCCESS
-            },
-        );
-
-        assert_eq!(exit, ExitCode::FAILURE);
-        let stderr = String::from_utf8(stderr).expect("panic 诊断应为 UTF-8");
-        let plain = stderr.replace(['\u{2068}', '\u{2069}'], "");
-        assert!(plain.contains("internal.operation"));
-        assert!(plain.contains("进程输出"));
-        assert!(plain.contains("write-back"));
-        assert!(plain.contains(&project_workspace.to_string_lossy().to_string()));
-        assert!(plain.contains(&log_path.to_string_lossy().to_string()));
-        assert!(!stderr.contains(PANIC_BODY));
-
-        let raw = std::fs::read_to_string(&log_path).expect("panic 项目日志应可读取");
-        assert!(!raw.contains(PANIC_BODY));
-        let records = raw
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("日志行应为 JSON"))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            records
-                .iter()
-                .map(|record| record["code"].as_str().expect("日志 code 应为文本"))
-                .collect::<Vec<_>>(),
-            [
-                "run.started",
-                "performance.counters",
-                "failure.reported",
-                "run.finished",
-            ]
-        );
-        assert_eq!(
-            records[2]["payload"]["diagnostic"],
-            serde_json::to_value(diagnostic).expect("安全诊断应可序列化")
-        );
-        assert_eq!(records[3]["payload"]["outcome"], "outcome_unknown");
     }
 
     #[test]
@@ -1295,6 +1162,37 @@ mod tests {
         );
         assert!(!stdout.contains(PANIC_BODY));
         assert!(!String::from_utf8_lossy(&output.stderr).contains(PANIC_BODY));
+    }
+
+    #[test]
+    fn logged_presentation_panic_uses_pre_registered_report_without_exposing_payload() {
+        const PANIC_BODY: &str = "PRESENTATION_PANIC_BODY_SENTINEL";
+        let project_workspace = std::path::PathBuf::from("C:/project/workspace");
+        let log_path = std::path::PathBuf::from("C:/project/logs/run.jsonl");
+        let report = DiagnosticReport::new(
+            StateEffect::OutcomeUnknown,
+            Diagnostic::runtime(RuntimeIssue::ResultPresentationPanicked {
+                engine: crate::diagnostic::RuntimeEngine::RpgMakerMz,
+                command: crate::diagnostic::RuntimeCommand::WriteBack,
+                project_workspace: crate::diagnostic::SafePath::new(&project_workspace),
+                log_path: Some(crate::diagnostic::SafePath::new(&log_path)),
+            }),
+        );
+        let boundary = CommandPanicBoundary::from_report(report);
+        let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
+        let mut stderr = Vec::new();
+
+        let exit = catch_logged_presentation(Some(boundary), &localizer, &mut stderr, |_stderr| {
+            std::panic::panic_any(PANIC_BODY)
+        });
+
+        assert_eq!(exit, ExitCode::FAILURE);
+        let stderr = String::from_utf8(stderr).expect("panic 诊断应为 UTF-8");
+        let plain = stderr.replace(['\u{2068}', '\u{2069}'], "");
+        assert!(plain.contains("runtime.result_presentation_panicked"));
+        assert!(plain.contains(&project_workspace.to_string_lossy().to_string()));
+        assert!(plain.contains(&log_path.to_string_lossy().to_string()));
+        assert!(!stderr.contains(PANIC_BODY));
     }
 
     #[test]
@@ -1365,12 +1263,22 @@ mod tests {
     #[test]
     fn project_log_warning_write_failure_is_returned() {
         let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
+        let source = io::Error::from_raw_os_error(5);
         let warning = ProjectLogWarning {
-            project_log: Some(ObservabilityWarning {
-                diagnostic: None,
-                related_diagnostics: Vec::new(),
-            }),
-            task_records: None,
+            log_path: Some("C:\\project\\logs\\run.jsonl".into()),
+            project_log: vec![DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::observability(crate::diagnostic::ObservabilityIssue::write(
+                    crate::diagnostic::ObservabilityComponent::ProjectLog,
+                    Some(crate::diagnostic::SafePath::new(
+                        "C:\\project\\logs\\run.jsonl",
+                    )),
+                    None,
+                    1,
+                    &source,
+                )),
+            )],
+            task_records: Vec::new(),
             presentation_failures: Vec::new(),
         };
         let mut stderr = FailingOutput::default();
@@ -1431,16 +1339,11 @@ mod tests {
         let plain = stderr.replace(['\u{2068}', '\u{2069}'], "");
         assert!(plain.starts_with("错误 [configuration.invalid_toml]"));
         assert!(stderr.contains("settings.toml"));
-        assert!(plain.contains("TOML 第 3 行、第 7 列无效"));
+        assert!(plain.contains("line=3"));
+        assert!(plain.contains("column=7"));
         assert!(stderr.contains("llm.clients.primary"));
-        let expected_kind =
-            localizer.format(UiMessage::DiagnosticTomlExpectedKindValue { code: "table" });
-        let expected_failure = localizer.format(UiMessage::DiagnosticTomlFailureValue {
-            code: "type_mismatch",
-            expected: &expected_kind,
-        });
-        let expected_failure = expected_failure.replace(['\u{2068}', '\u{2069}'], "");
-        assert!(plain.contains(&expected_failure));
+        assert!(plain.contains("toml_failure=type_mismatch"));
+        assert!(plain.contains("expected=table"));
     }
 
     #[test]
@@ -1456,19 +1359,23 @@ mod tests {
             String::from_utf8(selected_stderr).expect("已选 locale 诊断应为 UTF-8");
         assert!(
             selected_stderr.contains(&selected.format(UiMessage::DiagnosticTitle {
-                code: DiagnosticCode::InternalOperation.as_str(),
+                code: "runtime.process_panicked",
             }))
         );
         assert!(!selected_stderr.contains(PANIC_BODY));
 
         let english = UiLocalizer::new(UiLocale::English);
         let mut startup_stderr = Vec::new();
-        let startup_exit = render_uncaught_panic_with(&english, &mut startup_stderr);
+        let startup_exit = render_uncaught_panic_with(
+            &english,
+            RuntimePanicBoundary::ProcessStartup,
+            &mut startup_stderr,
+        );
         assert_eq!(startup_exit, ExitCode::FAILURE);
         let startup_stderr = String::from_utf8(startup_stderr).expect("解析前诊断应为 UTF-8");
         assert!(
             startup_stderr.contains(&english.format(UiMessage::DiagnosticTitle {
-                code: DiagnosticCode::InternalOperation.as_str(),
+                code: "runtime.process_panicked",
             }))
         );
     }
@@ -1535,39 +1442,46 @@ mod tests {
     fn log_degradation_renders_the_safe_operation_path_and_os_code() {
         let localizer = UiLocalizer::new(crate::i18n::UiLocale::SimplifiedChinese);
         let source = io::Error::from_raw_os_error(5);
+        let task_record = DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::observability(crate::diagnostic::ObservabilityIssue::write(
+                crate::diagnostic::ObservabilityComponent::TaskRecord,
+                Some(crate::diagnostic::SafePath::new(
+                    "C:\\project\\task-records\\run\\task-000001.md",
+                )),
+                None,
+                1,
+                &source,
+            )),
+        )
+        .with_related(
+            crate::diagnostic::RelatedFailureRelation::Cleanup,
+            DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::observability(crate::diagnostic::ObservabilityIssue::cleanup(
+                    crate::diagnostic::ObservabilityComponent::TaskRecord,
+                    crate::diagnostic::SafePath::new(
+                        "C:\\project\\task-records\\run\\.task-000001.tmp",
+                    ),
+                    &source,
+                )),
+            ),
+        );
         let warning = ProjectLogWarning {
-            project_log: Some(ObservabilityWarning {
-                diagnostic: Some(SafeDiagnostic::io(
-                    DiagnosticCode::LogWrite,
-                    DiagnosticStage::Logging,
-                    DiagnosticSubject::path("C:\\project\\logs\\run.jsonl"),
-                    "write_all",
+            log_path: Some("C:\\project\\logs\\run.jsonl".into()),
+            project_log: vec![DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::observability(crate::diagnostic::ObservabilityIssue::write(
+                    crate::diagnostic::ObservabilityComponent::ProjectLog,
+                    Some(crate::diagnostic::SafePath::new(
+                        "C:\\project\\logs\\run.jsonl",
+                    )),
+                    None,
+                    1,
                     &source,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckPathAndPermissions,
                 )),
-                related_diagnostics: Vec::new(),
-            }),
-            task_records: Some(ObservabilityWarning {
-                diagnostic: Some(SafeDiagnostic::io(
-                    DiagnosticCode::FileSystemOperation,
-                    DiagnosticStage::Logging,
-                    DiagnosticSubject::path("C:\\project\\task-records\\run\\task-000001.md"),
-                    "persist_task_record",
-                    &source,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckPathAndPermissions,
-                )),
-                related_diagnostics: vec![SafeDiagnostic::io(
-                    DiagnosticCode::FileSystemOperation,
-                    DiagnosticStage::Logging,
-                    DiagnosticSubject::path("C:\\project\\task-records\\run\\.task-000001.tmp"),
-                    "cleanup_temporary_file",
-                    &source,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckPathAndPermissions,
-                )],
-            }),
+            )],
+            task_records: vec![task_record],
             presentation_failures: Vec::new(),
         };
         let mut stderr = Vec::new();
@@ -1578,13 +1492,10 @@ mod tests {
         let task_record_banner = localizer.format(UiMessage::NoticeTaskRecordsDegraded);
         assert_eq!(stderr.matches(project_log_banner.as_str()).count(), 1);
         assert_eq!(stderr.matches(task_record_banner.as_str()).count(), 1);
-        assert!(stderr.contains("log.write"));
+        assert!(stderr.contains("observability.project_log.write"));
         assert!(stderr.contains("C:\\project\\logs\\run.jsonl"));
-        assert!(stderr.contains("write_all"));
         assert!(stderr.contains("C:\\project\\task-records\\run\\task-000001.md"));
-        assert!(stderr.contains("persist_task_record"));
         assert!(stderr.contains("C:\\project\\task-records\\run\\.task-000001.tmp"));
-        assert!(stderr.contains("cleanup_temporary_file"));
-        assert!(stderr.contains("OS 5"));
+        assert!(stderr.contains("raw_os_code=5"));
     }
 }

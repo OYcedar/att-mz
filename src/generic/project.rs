@@ -15,8 +15,15 @@ use rusqlite::{Connection, DropBehavior, OpenFlags, Row, Transaction, params};
 use uuid::Uuid;
 
 use crate::diagnostic::{
-    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
-    DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
+    Diagnostic, DiagnosticReport, FileSystemDiagnosticContext, FileSystemDiagnosticStage,
+    FileSystemIssue, FileSystemOperation, FileSystemProblem, GenericDiagnosticStage, GenericIssue,
+    GenericJsonErrorCategory, GenericLanguageProjectionProblem, GenericLanguageViolation,
+    GenericPlaceholderMultisetProblem, GenericProblem, GenericProjectDatabaseProblem,
+    GenericProjectTranslationProblem, GenericResourceKind, IoFailure, RelatedFailureRelation,
+    SafeIdentifier, SafePath, SqliteDiagnosticContext, SqliteDiagnosticStage, SqliteDriverFailure,
+    SqliteIssue, SqliteOperation, SqliteProblem, SqliteTransactionState, StateEffect,
+    TranslationIssue, TranslationPlanningResourceKind, TranslationPlanningResourceOrigin,
+    TranslationPlanningResourceProblem,
 };
 use crate::execution::CooperativeCancellation;
 use crate::fingerprint::{SHA256_FINGERPRINT_BYTES, Sha256Fingerprint, Sha256FramedHasher};
@@ -27,10 +34,17 @@ use crate::runtime::sqlite::{
     apply_att_sqlite_cancellable_read_write_policy, apply_att_sqlite_new_database_page_policy,
     suspend_att_sqlite_cancellation,
 };
-use crate::translation::placeholder::PlaceholderRuleCompilationError;
+use crate::translation::placeholder::PlaceholderRestoreError;
+#[cfg(test)]
+use crate::translation::placeholder::{
+    PlaceholderProtectionError, PlaceholderRuleCompilationError, PlaceholderWorkerOperation,
+};
+use crate::translation::placeholder_projection::{
+    LanguageTextProjectionError, PlaceholderMultisetError,
+};
 use crate::translation::planning_resource::{
     CompiledTerminology, TerminologyDefinitionError, TerminologyEntry,
-    compile_terminology_with_cancellation,
+    compile_terminology_with_cancellation, terminology_problem, translation_json_failure,
 };
 
 use super::identity::CancellableTextMap;
@@ -41,8 +55,11 @@ use super::placeholder::{
     GenericCompiledPlaceholderRules, GenericPlaceholderError, GenericPlaceholderService,
     validate_translation_placeholders_and_binding_with_cancellation,
 };
+#[cfg(test)]
+use super::translate::GenericPlanningUnitLocator;
 use super::translate::{
-    GenericUnitKey, GenericUnitMap, manual_translation_state_fingerprint_with_cancellation,
+    GenericPlanningError, GenericUnitKey, GenericUnitMap,
+    manual_translation_state_fingerprint_with_cancellation,
 };
 
 const DATABASE_FILE_NAME: &str = "project.db";
@@ -496,9 +513,9 @@ impl TranslationOrigin {
         match value {
             "automatic" => Ok(Self::Automatic),
             "manual" => Ok(Self::Manual),
-            _ => Err(GenericProjectError::InvalidDatabase {
-                detail: format!("未知 translation_origin：{value:?}"),
-            }),
+            _ => Err(invalid_database(
+                GenericProjectDatabaseProblem::UnknownTranslationOrigin,
+            )),
         }
     }
 }
@@ -585,6 +602,10 @@ impl GenericProjectStore {
             database_path,
             cancellation,
         }
+    }
+
+    pub(crate) fn database_path(&self) -> &Path {
+        &self.database_path
     }
 
     #[cfg(test)]
@@ -708,7 +729,7 @@ impl GenericProjectStore {
             validate_source_write_back_separation(&source_root, &request.workspace_root)?;
             fs::create_dir_all(&request.workspace_root).map_err(|source| {
                 GenericProjectError::Io {
-                    operation: "建立 Generic 项目目录",
+                    operation: FileSystemOperation::Create,
                     path: request.workspace_root.clone(),
                     source,
                 }
@@ -742,7 +763,7 @@ impl GenericProjectStore {
         self.ensure_not_cancelled()?;
         ensure_initial_database_path_has_no_sidecars(
             &self.database_path,
-            "检查 Generic 初始数据库发布目标 sidecar",
+            FileSystemOperation::Metadata,
             "首次 Init 的发布目标旁存在不属于当前项目的 SQLite sidecar",
             &self.cancellation,
         )?;
@@ -754,7 +775,7 @@ impl GenericProjectStore {
             .create_new(true)
             .open(&candidate_path)
             .map_err(|source| GenericProjectError::Io {
-                operation: "建立 Generic 初始数据库候选",
+                operation: FileSystemOperation::Create,
                 path: candidate_path.clone(),
                 source,
             })?;
@@ -962,7 +983,14 @@ impl GenericProjectStore {
         let mut write_indexes = GenericUnitMap::with_capacity(writes.len());
         for (index, write) in writes.iter().enumerate() {
             self.ensure_not_cancelled()?;
-            validate_translation(&write.translation)?;
+            validate_translation(&write.translation).map_err(|problem| {
+                GenericProjectError::InvalidTranslation {
+                    group_id: Some(write.group_id.clone()),
+                    unit_id: Some(write.unit_id.clone()),
+                    problem,
+                    source: None,
+                }
+            })?;
             let key = GenericUnitKey::new(
                 clone_text_with_cancellation(&write.group_id, &self.cancellation)?,
                 clone_text_with_cancellation(&write.unit_id, &self.cancellation)?,
@@ -1090,18 +1118,20 @@ impl GenericProjectStore {
                             || self.ensure_not_cancelled(),
                         )?
                         else {
-                            return Err(GenericProjectError::InvalidDatabase {
-                                detail: format!(
-                                    "Generic 译文批量提交返回了未请求的 Unit：{group_id:?}/{unit_id:?}"
-                                ),
-                            });
+                            return Err(invalid_database(
+                                GenericProjectDatabaseProblem::UnexpectedCommittedUnit {
+                                    group_id: project_optional_safe_identifier(&group_id),
+                                    unit_id: project_optional_safe_identifier(&unit_id),
+                                },
+                            ));
                         };
                         if std::mem::replace(&mut applied[index], true) {
-                            return Err(GenericProjectError::InvalidDatabase {
-                                detail: format!(
-                                    "Generic 译文批量提交重复返回 Unit：{group_id:?}/{unit_id:?}"
-                                ),
-                            });
+                            return Err(invalid_database(
+                                GenericProjectDatabaseProblem::DuplicateCommittedUnit {
+                                    group_id: project_optional_safe_identifier(&group_id),
+                                    unit_id: project_optional_safe_identifier(&unit_id),
+                                },
+                            ));
                         }
                     }
                 }
@@ -1389,11 +1419,10 @@ impl GenericProjectStore {
     ) -> Result<GenericProject, GenericProjectError> {
         let row = load_generic_project_row_with_cancellation(connection, &self.cancellation)?;
         self.ensure_not_cancelled()?;
-        let project_name = row.project_name.parse::<ProjectName>().map_err(|detail| {
-            GenericProjectError::InvalidDatabase {
-                detail: format!("项目名称无效：{detail}"),
-            }
-        })?;
+        let project_name = row
+            .project_name
+            .parse::<ProjectName>()
+            .map_err(|_| invalid_database(GenericProjectDatabaseProblem::InvalidProjectName))?;
         self.ensure_not_cancelled()?;
         let source_root = decode_path_with_cancellation(&row.source_root, &self.cancellation)?;
         self.ensure_not_cancelled()?;
@@ -1470,8 +1499,15 @@ pub(crate) enum GenericTransactionFinalizationFailure {
         source: rusqlite::Error,
     },
     InvalidState {
-        detail: &'static str,
+        violation: GenericTransactionFinalizationViolation,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GenericTransactionFinalizationViolation {
+    CommitSucceededButTransactionActive,
+    CommitFailedButTransactionClosed,
+    RollbackSucceededButTransactionActive,
 }
 
 impl fmt::Display for GenericTransactionFinalizationFailure {
@@ -1480,7 +1516,17 @@ impl fmt::Display for GenericTransactionFinalizationFailure {
             Self::Sqlite { operation, source } => {
                 write!(formatter, "{operation}失败：{source}")
             }
-            Self::InvalidState { detail } => formatter.write_str(detail),
+            Self::InvalidState { violation } => formatter.write_str(match violation {
+                GenericTransactionFinalizationViolation::CommitSucceededButTransactionActive => {
+                    "COMMIT 返回成功后 Generic SQLite 连接仍处于事务中"
+                }
+                GenericTransactionFinalizationViolation::CommitFailedButTransactionClosed => {
+                    "COMMIT 返回错误后 Generic SQLite 连接已离开事务，结果无法确认"
+                }
+                GenericTransactionFinalizationViolation::RollbackSucceededButTransactionActive => {
+                    "ROLLBACK 返回成功后 Generic SQLite 连接仍处于事务中"
+                }
+            }),
         }
     }
 }
@@ -1560,7 +1606,8 @@ fn rollback_generic_transaction(
             operation: rollback_operation,
             primary: Some(Box::new(primary)),
             finalization: GenericTransactionFinalizationFailure::InvalidState {
-                detail: "ROLLBACK 返回成功后 Generic SQLite 连接仍处于事务中",
+                violation:
+                    GenericTransactionFinalizationViolation::RollbackSucceededButTransactionActive,
             },
         },
         Err(source) => GenericProjectError::TransactionOutcomeUnknown {
@@ -1590,7 +1637,8 @@ fn commit_generic_transaction(
             operation: commit_operation,
             primary: None,
             finalization: GenericTransactionFinalizationFailure::InvalidState {
-                detail: "COMMIT 返回成功后 Generic SQLite 连接仍处于事务中",
+                violation:
+                    GenericTransactionFinalizationViolation::CommitSucceededButTransactionActive,
             },
         }),
         Err(source) if is_autocommit => Err(GenericProjectError::TransactionOutcomeUnknown {
@@ -1600,7 +1648,8 @@ fn commit_generic_transaction(
                 source,
             })),
             finalization: GenericTransactionFinalizationFailure::InvalidState {
-                detail: "COMMIT 返回错误后连接已经进入 autocommit，无法确认提交结果",
+                violation:
+                    GenericTransactionFinalizationViolation::CommitFailedButTransactionClosed,
             },
         }),
         Err(source) => {
@@ -1620,7 +1669,8 @@ fn commit_generic_transaction(
                         source,
                     })),
                     finalization: GenericTransactionFinalizationFailure::InvalidState {
-                        detail: "COMMIT 失败后的 ROLLBACK 返回成功，但连接仍处于事务中",
+                        violation:
+                            GenericTransactionFinalizationViolation::RollbackSucceededButTransactionActive,
                     },
                 }),
                 Err(rollback) => Err(GenericProjectError::TransactionOutcomeUnknown {
@@ -1639,6 +1689,57 @@ fn commit_generic_transaction(
     };
     drop(suspension);
     result
+}
+
+#[derive(Debug)]
+pub(crate) enum GenericProjectResourceError {
+    InvalidSnapshot {
+        resource: GenericResourceKind,
+        source: serde_json::Error,
+    },
+    SnapshotEncoding {
+        resource: GenericResourceKind,
+        source: serde_json::Error,
+    },
+    TerminologyDefinition(TerminologyDefinitionError),
+    Placeholder(GenericPlaceholderError),
+    NonCanonicalSnapshot {
+        resource: GenericResourceKind,
+    },
+}
+
+impl fmt::Display for GenericProjectResourceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidSnapshot { resource, source } => {
+                write!(
+                    formatter,
+                    "{resource:?} 资源快照不是现行规范 JSON：{source}"
+                )
+            }
+            Self::SnapshotEncoding { resource, source } => {
+                write!(formatter, "{resource:?} 资源快照无法编码：{source}")
+            }
+            Self::TerminologyDefinition(source) => source.fmt(formatter),
+            Self::Placeholder(source) => source.fmt(formatter),
+            Self::NonCanonicalSnapshot { resource } => {
+                write!(formatter, "{resource:?} 资源快照不是规范紧凑 JSON")
+            }
+        }
+    }
+}
+
+impl Error for GenericProjectResourceError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidSnapshot { source, .. } | Self::SnapshotEncoding { source, .. } => {
+                Some(source)
+            }
+            Self::TerminologyDefinition(source) => Some(source),
+            Self::Placeholder(source) => Some(source),
+            Self::NonCanonicalSnapshot { .. } => None,
+        }
+    }
 }
 
 /// Generic 项目行为失败。
@@ -1664,12 +1765,8 @@ pub(crate) enum GenericProjectError {
         observed: String,
     },
     Io {
-        operation: &'static str,
+        operation: FileSystemOperation,
         path: PathBuf,
-        source: io::Error,
-    },
-    WorkerStart {
-        operation: &'static str,
         source: io::Error,
     },
     Sqlite {
@@ -1691,7 +1788,8 @@ pub(crate) enum GenericProjectError {
         cleanup: io::Error,
     },
     InvalidDatabase {
-        detail: String,
+        problem: GenericProjectDatabaseProblem,
+        source: Option<Box<GenericPlanningError>>,
     },
     InvalidLanguage(LanguageIdError),
     SameSourceAndTargetLanguage {
@@ -1701,7 +1799,12 @@ pub(crate) enum GenericProjectError {
     InputChangedDuringExtract,
     ExtractRequired,
     TranslationSnapshotChanged,
-    InvalidTranslation(String),
+    InvalidTranslation {
+        group_id: Option<String>,
+        unit_id: Option<String>,
+        problem: GenericProjectTranslationProblem,
+        source: Option<Box<GenericPlaceholderError>>,
+    },
     DuplicateTranslationWrite {
         group_id: String,
         unit_id: String,
@@ -1711,10 +1814,7 @@ pub(crate) enum GenericProjectError {
         unit_id: String,
     },
     BlankProfileId,
-    InvalidResource {
-        kind: &'static str,
-        detail: String,
-    },
+    InvalidResource(GenericProjectResourceError),
     UnitNotFound {
         group_id: String,
         unit_id: String,
@@ -1758,10 +1858,12 @@ impl fmt::Display for GenericProjectError {
                 operation,
                 path,
                 source,
-            } => write!(formatter, "{operation}失败：{}（{source}）", path.display()),
-            Self::WorkerStart { operation, source } => {
-                write!(formatter, "{operation}无法启动 worker：{source}")
-            }
+            } => write!(
+                formatter,
+                "{}失败：{}（{source}）",
+                operation.as_str(),
+                path.display()
+            ),
             Self::Sqlite { operation, source } => write!(formatter, "{operation}失败：{source}"),
             Self::TransactionNotCommitted { operation, source } => write!(
                 formatter,
@@ -1787,8 +1889,8 @@ impl fmt::Display for GenericProjectError {
                 "{original}；清理初始数据库候选失败：{}（{cleanup}）",
                 path.display()
             ),
-            Self::InvalidDatabase { detail } => {
-                write!(formatter, "Generic 项目数据库无效：{detail}")
+            Self::InvalidDatabase { problem, .. } => {
+                write!(formatter, "Generic 项目数据库无效：{problem:?}")
             }
             Self::InvalidLanguage(source) => write!(formatter, "Generic 项目语言无效：{source}"),
             Self::SameSourceAndTargetLanguage { language } => {
@@ -1804,8 +1906,14 @@ impl fmt::Display for GenericProjectError {
             Self::TranslationSnapshotChanged => {
                 formatter.write_str("Generic 翻译依据的 Extract 快照已经变化")
             }
-            Self::InvalidTranslation(detail) => {
-                write!(formatter, "Generic 译文无效：{detail}")
+            Self::InvalidTranslation {
+                problem, source, ..
+            } => {
+                write!(formatter, "Generic 译文无效：{problem:?}")?;
+                if let Some(source) = source {
+                    write!(formatter, "（{source}）")?;
+                }
+                Ok(())
             }
             Self::DuplicateTranslationWrite { group_id, unit_id } => write!(
                 formatter,
@@ -1816,9 +1924,7 @@ impl fmt::Display for GenericProjectError {
                 "同一批次重复清除 Generic Unit：{group_id:?}/{unit_id:?}"
             ),
             Self::BlankProfileId => formatter.write_str("Generic Profile ID 不能为空白"),
-            Self::InvalidResource { kind, detail } => {
-                write!(formatter, "Generic {kind} 资源无效：{detail}")
-            }
+            Self::InvalidResource(source) => write!(formatter, "Generic 翻译资源无效：{source}"),
             Self::UnitNotFound { group_id, unit_id } => {
                 write!(formatter, "Generic Unit 不存在：{group_id:?}/{unit_id:?}")
             }
@@ -1829,7 +1935,7 @@ impl fmt::Display for GenericProjectError {
 impl Error for GenericProjectError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Io { source, .. } | Self::WorkerStart { source, .. } => Some(source),
+            Self::Io { source, .. } => Some(source),
             Self::Sqlite { source, .. } | Self::TransactionNotCommitted { source, .. } => {
                 Some(source)
             }
@@ -1845,6 +1951,15 @@ impl Error for GenericProjectError {
             Self::InitialCandidateCleanup { original, .. } => Some(original.as_ref()),
             Self::InvalidLanguage(source) => Some(source),
             Self::Jsonl(source) => Some(source),
+            Self::InvalidTranslation {
+                source: Some(source),
+                ..
+            } => Some(source.as_ref()),
+            Self::InvalidResource(source) => Some(source),
+            Self::InvalidDatabase {
+                source: Some(source),
+                ..
+            } => Some(source.as_ref()),
             Self::Cancelled
             | Self::MissingInitialField(_)
             | Self::WorkspaceNotDirectory { .. }
@@ -1852,404 +1967,398 @@ impl Error for GenericProjectError {
             | Self::SourceWriteBackOverlap { .. }
             | Self::ProjectNotFound { .. }
             | Self::ProjectIdentityMismatch { .. }
-            | Self::InvalidDatabase { .. }
+            | Self::InvalidDatabase { source: None, .. }
             | Self::SameSourceAndTargetLanguage { .. }
             | Self::InputChangedDuringExtract
             | Self::ExtractRequired
             | Self::TranslationSnapshotChanged
-            | Self::InvalidTranslation(_)
+            | Self::InvalidTranslation { source: None, .. }
             | Self::DuplicateTranslationWrite { .. }
             | Self::DuplicateTranslationClear { .. }
             | Self::BlankProfileId
-            | Self::InvalidResource { .. }
             | Self::UnitNotFound { .. } => None,
         }
     }
 }
 
-impl SafeDiagnosticSource for GenericProjectError {
-    fn safe_diagnostic_source(
+impl GenericProjectError {
+    /// 在 Generic 项目边界仍掌握数据库路径、查询 ID、事务终态和后端类别时建立公开报告。
+    /// 原始错误正文只保留在 `Error::source`，不会进入 CLI 或 JSONL。
+    pub(crate) fn diagnostic_report(
         &self,
-        stage: DiagnosticStage,
-        impact: DiagnosticImpact,
-        fallback_action: DiagnosticAction,
-    ) -> SafeDiagnostic {
+        stage: GenericDiagnosticStage,
+        database: &Path,
+        effect: StateEffect,
+    ) -> DiagnosticReport {
+        let generic = |problem| {
+            DiagnosticReport::new(
+                effect,
+                Diagnostic::generic(GenericIssue::project(stage, problem)),
+            )
+        };
         match self {
-            Self::Cancelled => project_failure(
-                stage,
-                "generic_project_operation",
-                DiagnosticFailureKind::LockCancelled,
-                impact,
-                DiagnosticAction::Retry,
-            ),
-            Self::MissingInitialField(field) => SafeDiagnostic::new(
-                DiagnosticCode::CommandInput,
-                stage,
-                DiagnosticSubject::field(field),
-                DiagnosticReason::failure(DiagnosticFailureKind::MissingRequiredValue),
-                impact,
-                DiagnosticAction::FixInput,
-            ),
+            Self::Cancelled => generic(GenericProblem::ProjectCancelled),
+            Self::MissingInitialField(field) => generic(GenericProblem::MissingInitialField {
+                field: project_safe_identifier(field, "initial_field"),
+            }),
             Self::WorkspaceNotDirectory { path } | Self::SourceNotDirectory { path } => {
-                SafeDiagnostic::new(
-                    DiagnosticCode::CommandInput,
+                file_system_project_report(
                     stage,
-                    DiagnosticSubject::path(path),
-                    DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
-                    impact,
-                    DiagnosticAction::FixInput,
+                    FileSystemOperation::Open,
+                    FileSystemProblem::NotDirectory {
+                        path: SafePath::new(path),
+                    },
+                    effect,
                 )
             }
             Self::SourceWriteBackOverlap {
                 source_root,
                 write_back_root,
-            } => SafeDiagnostic::new(
-                DiagnosticCode::CommandInput,
+            } => generic(GenericProblem::SourceWriteBackOverlap {
+                source_root: SafePath::new(source_root),
+                write_back_root: SafePath::new(write_back_root),
+            }),
+            Self::ProjectNotFound { path } => file_system_project_report(
                 stage,
-                DiagnosticSubject::path(source_root),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::ConflictingValues,
-                    "generic_source_and_write_back_overlap",
-                ),
-                impact,
-                DiagnosticAction::FixInput,
-            )
-            .with_recovery(RecoveryFact::path(write_back_root)),
-            Self::ProjectNotFound { path } => SafeDiagnostic::new(
-                DiagnosticCode::ProjectUnavailable,
-                stage,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
-                impact,
-                DiagnosticAction::CheckPathAndPermissions,
-            ),
-            Self::ProjectIdentityMismatch { expected, observed } => SafeDiagnostic::new(
-                DiagnosticCode::ProjectState,
-                stage,
-                DiagnosticSubject::Project {
-                    name: observed.clone(),
+                FileSystemOperation::Open,
+                FileSystemProblem::NotFound {
+                    path: SafePath::new(path),
                 },
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::StateMismatch,
-                    format!("expected_project={expected}; observed_project={observed}"),
-                ),
-                impact,
-                DiagnosticAction::CheckProjectState,
+                effect,
             ),
+            Self::ProjectIdentityMismatch { expected, observed } => {
+                generic(GenericProblem::ProjectIdentityMismatch {
+                    expected: project_safe_identifier(expected, "expected_project"),
+                    observed: project_safe_identifier(observed, "observed_project"),
+                })
+            }
             Self::Io {
                 operation,
                 path,
                 source,
-            } => SafeDiagnostic::io(
-                DiagnosticCode::FileSystemOperation,
+            } => file_system_project_report(
                 stage,
-                DiagnosticSubject::path(path),
                 *operation,
-                source,
-                impact,
-                DiagnosticAction::CheckPathAndPermissions,
+                FileSystemProblem::Io {
+                    path: SafePath::new(path),
+                    failure: IoFailure::from_error(source),
+                },
+                effect,
             ),
-            Self::WorkerStart { operation, source } => SafeDiagnostic::io(
-                DiagnosticCode::InternalOperation,
+            Self::Sqlite { operation, source } => sqlite_project_report(
                 stage,
-                DiagnosticSubject::operation(operation),
-                "spawn_worker",
-                source,
-                impact,
-                DiagnosticAction::ReportBug,
-            ),
-            Self::Sqlite { operation, source } => {
-                sqlite_project_diagnostic(operation, source, stage, impact, fallback_action)
-            }
-            Self::TransactionNotCommitted { operation, source } => sqlite_project_diagnostic(
+                database,
                 operation,
                 source,
+                SqliteOperation::Execute,
+                SqliteTransactionState::Active,
+                effect,
+            ),
+            Self::TransactionNotCommitted { operation, source } => sqlite_project_report(
                 stage,
-                DiagnosticImpact::Unchanged,
-                fallback_action,
-            )
-            .with_recovery(RecoveryFact::transaction("rolled_back")),
+                database,
+                operation,
+                source,
+                SqliteOperation::Transaction,
+                SqliteTransactionState::RolledBack,
+                StateEffect::Unchanged,
+            ),
             Self::TransactionOutcomeUnknown {
-                operation,
+                operation: _,
                 primary,
                 finalization,
-            } => transaction_outcome_unknown_diagnostic(
-                operation,
-                primary.as_deref(),
-                finalization,
-                stage,
-            ),
+            } => {
+                let finalization = match finalization {
+                    GenericTransactionFinalizationFailure::Sqlite { operation, source } => {
+                        sqlite_project_report(
+                            stage,
+                            database,
+                            operation,
+                            source,
+                            SqliteOperation::Transaction,
+                            SqliteTransactionState::OutcomeUnknown,
+                            StateEffect::OutcomeUnknown,
+                        )
+                    }
+                    GenericTransactionFinalizationFailure::InvalidState { .. } => {
+                        DiagnosticReport::new(
+                            StateEffect::OutcomeUnknown,
+                            Diagnostic::sqlite(SqliteIssue::new(
+                                SqliteDiagnosticContext::new(
+                                    sqlite_project_stage(stage),
+                                    SqliteOperation::Transaction,
+                                    SqliteTransactionState::OutcomeUnknown,
+                                ),
+                                SqliteProblem::InternalInvariant {
+                                    database: SafePath::new(database),
+                                },
+                            )),
+                        )
+                    }
+                };
+                primary.as_deref().map_or(finalization.clone(), |primary| {
+                    primary
+                        .diagnostic_report(stage, database, StateEffect::Unchanged)
+                        .with_related(RelatedFailureRelation::Finalization, finalization)
+                })
+            }
             Self::InitialCandidateCleanup {
                 original,
                 path,
                 cleanup,
-            } => SafeDiagnostic::io(
-                DiagnosticCode::FileSystemOperation,
-                stage,
-                DiagnosticSubject::path(path),
-                "cleanup_generic_initial_database_candidate",
-                cleanup,
-                DiagnosticImpact::RecoveryRequired,
-                DiagnosticAction::PreserveRecoveryArtifacts,
-            )
-            .with_recovery(RecoveryFact::component(format!(
-                "primary_failure={}",
-                original
-                    .safe_diagnostic_source(stage, impact, fallback_action)
-                    .code
-            ))),
-            Self::InvalidDatabase { detail } => project_failure_with_detail(
-                stage,
-                "generic_project_database",
-                DiagnosticFailureKind::InvalidValue,
-                detail,
-                impact,
-                DiagnosticAction::CheckProjectState,
-            ),
-            Self::InvalidLanguage(source) => project_failure_with_detail(
-                stage,
-                "generic_language",
-                DiagnosticFailureKind::InvalidValue,
-                language_error_detail(source),
-                impact,
-                DiagnosticAction::FixInput,
-            ),
-            Self::SameSourceAndTargetLanguage { language } => project_failure_with_detail(
-                stage,
-                "generic_language_pair",
-                DiagnosticFailureKind::ConflictingValues,
-                format!("source_language_equals_target_language={language}"),
-                impact,
-                DiagnosticAction::FixInput,
-            ),
-            Self::Jsonl(source) => source.safe_diagnostic_source(stage, impact, fallback_action),
-            Self::InputChangedDuringExtract => project_failure(
-                stage,
-                "generic_input",
-                DiagnosticFailureKind::StateMismatch,
-                impact,
-                DiagnosticAction::Retry,
-            ),
-            Self::ExtractRequired => project_failure(
-                stage,
-                "generic_extract",
-                DiagnosticFailureKind::GenericExtractRequired,
-                impact,
-                DiagnosticAction::CheckProjectState,
-            ),
-            Self::TranslationSnapshotChanged => project_failure(
-                stage,
-                "generic_translation_snapshot",
-                DiagnosticFailureKind::StateMismatch,
-                impact,
-                DiagnosticAction::Retry,
-            ),
-            Self::InvalidTranslation(detail) => project_failure_with_detail(
-                stage,
-                "generic_translation",
-                DiagnosticFailureKind::InvalidValue,
-                detail,
-                impact,
-                DiagnosticAction::FixInput,
-            ),
-            Self::DuplicateTranslationWrite { group_id, unit_id } => project_failure_with_detail(
-                stage,
-                "generic_translation_write",
-                DiagnosticFailureKind::ConflictingValues,
-                format!("group_id={group_id}; unit_id={unit_id}"),
-                impact,
-                DiagnosticAction::FixInput,
-            ),
-            Self::DuplicateTranslationClear { group_id, unit_id } => project_failure_with_detail(
-                stage,
-                "generic_translation_clear",
-                DiagnosticFailureKind::ConflictingValues,
-                format!("group_id={group_id}; unit_id={unit_id}"),
-                impact,
-                DiagnosticAction::FixInput,
-            ),
-            Self::BlankProfileId => project_failure(
-                stage,
-                "generic_profile_id",
-                DiagnosticFailureKind::InvalidValue,
-                impact,
-                DiagnosticAction::FixInput,
-            ),
-            Self::InvalidResource { kind, detail } => project_failure_with_detail(
-                stage,
-                format!("generic_resource_{kind}"),
-                DiagnosticFailureKind::InvalidValue,
-                detail,
-                impact,
-                DiagnosticAction::FixInput,
-            ),
-            Self::UnitNotFound { group_id, unit_id } => project_failure_with_detail(
-                stage,
-                "generic_unit",
-                DiagnosticFailureKind::NotFound,
-                format!("group_id={group_id}; unit_id={unit_id}"),
-                impact,
-                DiagnosticAction::CheckProjectState,
-            ),
+            } => original
+                .diagnostic_report(stage, database, effect)
+                .with_related(
+                    RelatedFailureRelation::Cleanup,
+                    file_system_project_report(
+                        stage,
+                        FileSystemOperation::Remove,
+                        FileSystemProblem::Io {
+                            path: SafePath::new(path),
+                            failure: IoFailure::from_error(cleanup),
+                        },
+                        StateEffect::RecoveryRequired,
+                    ),
+                ),
+            Self::InvalidDatabase { problem, .. } => {
+                generic(GenericProblem::InvalidProjectDatabase {
+                    problem: problem.clone(),
+                })
+            }
+            Self::InvalidLanguage(source) => generic(GenericProblem::InvalidLanguage {
+                violation: generic_language_violation(source),
+            }),
+            Self::SameSourceAndTargetLanguage { language } => {
+                generic(GenericProblem::SameSourceAndTargetLanguage {
+                    language: project_safe_identifier(language, "language"),
+                })
+            }
+            Self::Jsonl(source) => DiagnosticReport::new(effect, source.diagnostic(stage)),
+            Self::InputChangedDuringExtract => generic(GenericProblem::InputChangedDuringExtract),
+            Self::ExtractRequired => generic(GenericProblem::ExtractRequired),
+            Self::TranslationSnapshotChanged => generic(GenericProblem::TranslationSnapshotChanged),
+            Self::InvalidTranslation {
+                group_id,
+                unit_id,
+                problem,
+                ..
+            } => generic(GenericProblem::InvalidTranslation {
+                group_id: group_id
+                    .as_deref()
+                    .and_then(|value| SafeIdentifier::new(value).ok()),
+                unit_id: unit_id
+                    .as_deref()
+                    .and_then(|value| SafeIdentifier::new(value).ok()),
+                problem: problem.clone(),
+            }),
+            Self::DuplicateTranslationWrite { group_id, unit_id } => {
+                generic(GenericProblem::DuplicateTranslationWrite {
+                    group_id: project_safe_identifier(group_id, "group_id"),
+                    unit_id: project_safe_identifier(unit_id, "unit_id"),
+                })
+            }
+            Self::DuplicateTranslationClear { group_id, unit_id } => {
+                generic(GenericProblem::DuplicateTranslationClear {
+                    group_id: project_safe_identifier(group_id, "group_id"),
+                    unit_id: project_safe_identifier(unit_id, "unit_id"),
+                })
+            }
+            Self::BlankProfileId => generic(GenericProblem::BlankProfileId),
+            Self::InvalidResource(source) => generic_project_resource_report(source, stage, effect),
+            Self::UnitNotFound { group_id, unit_id } => generic(GenericProblem::UnitNotFound {
+                group_id: project_safe_identifier(group_id, "group_id"),
+                unit_id: project_safe_identifier(unit_id, "unit_id"),
+            }),
         }
     }
 }
 
-fn project_failure(
-    stage: DiagnosticStage,
-    operation: impl AsRef<str>,
-    failure: DiagnosticFailureKind,
-    impact: DiagnosticImpact,
-    action: DiagnosticAction,
-) -> SafeDiagnostic {
-    SafeDiagnostic::new(
-        DiagnosticCode::ProjectState,
-        stage,
-        DiagnosticSubject::operation(operation),
-        DiagnosticReason::failure(failure),
-        impact,
-        action,
-    )
+fn project_safe_identifier(value: impl AsRef<str>, fallback: &'static str) -> SafeIdentifier {
+    SafeIdentifier::new(value).unwrap_or_else(|_| SafeIdentifier::from_validated(fallback))
 }
 
-fn project_failure_with_detail(
-    stage: DiagnosticStage,
-    operation: impl AsRef<str>,
-    failure: DiagnosticFailureKind,
-    detail: impl AsRef<str>,
-    impact: DiagnosticImpact,
-    action: DiagnosticAction,
-) -> SafeDiagnostic {
-    SafeDiagnostic::new(
-        DiagnosticCode::ProjectState,
-        stage,
-        DiagnosticSubject::operation(operation),
-        DiagnosticReason::failure_with_detail(failure, detail),
-        impact,
-        action,
-    )
+fn project_optional_safe_identifier(value: impl AsRef<str>) -> Option<SafeIdentifier> {
+    SafeIdentifier::new(value).ok()
 }
 
-fn sqlite_project_diagnostic(
-    operation: &'static str,
-    source: &rusqlite::Error,
-    stage: DiagnosticStage,
-    impact: DiagnosticImpact,
-    fallback_action: DiagnosticAction,
-) -> SafeDiagnostic {
-    let (reason, action) = source.sqlite_error().map_or_else(
-        || {
-            (
-                DiagnosticReason::failure(DiagnosticFailureKind::InvalidValue),
-                fallback_action,
-            )
-        },
-        |error| {
-            let extended_code = error.extended_code;
-            let primary_code = extended_code & 0xff;
-            let action = if sqlite_error_is_busy(source) {
-                DiagnosticAction::RetryAfterResolvingContention
-            } else {
-                fallback_action
-            };
-            (
-                DiagnosticReason::Sqlite {
-                    primary_code,
-                    extended_code,
-                },
-                action,
-            )
-        },
-    );
-    SafeDiagnostic::new(
-        DiagnosticCode::SqliteOperation,
-        stage,
-        DiagnosticSubject::operation(operation),
-        reason,
-        impact,
-        action,
-    )
+fn invalid_database(problem: GenericProjectDatabaseProblem) -> GenericProjectError {
+    GenericProjectError::InvalidDatabase {
+        problem,
+        source: None,
+    }
 }
 
-fn transaction_outcome_unknown_diagnostic(
-    operation: &'static str,
-    primary: Option<&GenericProjectError>,
-    finalization: &GenericTransactionFinalizationFailure,
-    stage: DiagnosticStage,
-) -> SafeDiagnostic {
-    let finalization_diagnostic = match finalization {
-        GenericTransactionFinalizationFailure::Sqlite { operation, source } => {
-            sqlite_project_diagnostic(
-                operation,
-                source,
-                stage,
-                DiagnosticImpact::OutcomeUnknown,
-                DiagnosticAction::PreserveRecoveryArtifacts,
-            )
-        }
-        GenericTransactionFinalizationFailure::InvalidState { detail } => {
-            project_failure_with_detail(
-                stage,
-                operation,
-                DiagnosticFailureKind::TransactionOutcomeUnknown,
-                detail,
-                DiagnosticImpact::OutcomeUnknown,
-                DiagnosticAction::PreserveRecoveryArtifacts,
-            )
-        }
+fn invalid_database_with_source(
+    problem: GenericProjectDatabaseProblem,
+    source: GenericPlanningError,
+) -> GenericProjectError {
+    GenericProjectError::InvalidDatabase {
+        problem,
+        source: Some(Box::new(source)),
+    }
+}
+
+fn generic_project_resource_report(
+    source: &GenericProjectResourceError,
+    stage: GenericDiagnosticStage,
+    effect: StateEffect,
+) -> DiagnosticReport {
+    let planning_resource = |resource, problem| {
+        DiagnosticReport::new(
+            effect,
+            Diagnostic::translation(TranslationIssue::PlanningResource {
+                resource,
+                origin: TranslationPlanningResourceOrigin::ProjectSnapshot,
+                problem,
+            }),
+        )
     };
-    let mut diagnostic = SafeDiagnostic::new(
-        DiagnosticCode::OperationOutcomeUnknown,
-        stage,
-        DiagnosticSubject::operation(operation),
-        finalization_diagnostic.reason,
-        DiagnosticImpact::OutcomeUnknown,
-        DiagnosticAction::PreserveRecoveryArtifacts,
-    )
-    .with_recovery(RecoveryFact::transaction("outcome_unknown"));
-
-    if let GenericTransactionFinalizationFailure::Sqlite {
-        operation: finalization_operation,
-        ..
-    } = finalization
-    {
-        diagnostic = diagnostic.with_recovery(RecoveryFact::component(format!(
-            "finalization_operation={finalization_operation}"
-        )));
-    }
-    if let Some(primary) = primary {
-        let primary = primary.safe_diagnostic_source(
-            stage,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::Retry,
-        );
-        diagnostic = diagnostic.with_recovery(RecoveryFact::component(format!(
-            "primary_code={}",
-            primary.code.as_str()
-        )));
-        if let DiagnosticReason::Sqlite {
-            primary_code,
-            extended_code,
-        } = primary.reason
-        {
-            diagnostic = diagnostic.with_recovery(RecoveryFact::component(format!(
-                "primary_sqlite={primary_code}/{extended_code}"
-            )));
+    match source {
+        GenericProjectResourceError::InvalidSnapshot { resource, source } => planning_resource(
+            translation_planning_resource_kind(*resource),
+            TranslationPlanningResourceProblem::InvalidSnapshotJson {
+                category: translation_json_failure(source),
+                line: source.line(),
+                column: source.column(),
+            },
+        ),
+        GenericProjectResourceError::SnapshotEncoding { resource, source } => planning_resource(
+            translation_planning_resource_kind(*resource),
+            TranslationPlanningResourceProblem::SnapshotEncodingJson {
+                category: translation_json_failure(source),
+                line: source.line(),
+                column: source.column(),
+            },
+        ),
+        GenericProjectResourceError::TerminologyDefinition(source) => planning_resource(
+            TranslationPlanningResourceKind::Terminology,
+            terminology_problem(source),
+        ),
+        GenericProjectResourceError::Placeholder(
+            GenericPlaceholderError::InvalidResourceSnapshot(source),
+        ) => planning_resource(
+            TranslationPlanningResourceKind::PlaceholderRules,
+            TranslationPlanningResourceProblem::InvalidSnapshotJson {
+                category: translation_json_failure(source),
+                line: source.line(),
+                column: source.column(),
+            },
+        ),
+        GenericProjectResourceError::Placeholder(GenericPlaceholderError::Compilation(source)) => {
+            DiagnosticReport::new(
+                effect,
+                Diagnostic::translation(TranslationIssue::PlaceholderCompilation {
+                    origin: TranslationPlanningResourceOrigin::ProjectSnapshot,
+                    problem: source.diagnostic_problem(),
+                }),
+            )
         }
+        GenericProjectResourceError::Placeholder(_) => DiagnosticReport::new(
+            effect,
+            Diagnostic::generic(GenericIssue::project(
+                stage,
+                GenericProblem::UnexpectedResourceState {
+                    resource: GenericResourceKind::PlaceholderRules,
+                },
+            )),
+        ),
+        GenericProjectResourceError::NonCanonicalSnapshot { resource } => DiagnosticReport::new(
+            effect,
+            Diagnostic::generic(GenericIssue::project(
+                stage,
+                GenericProblem::NonCanonicalResourceSnapshot {
+                    resource: *resource,
+                },
+            )),
+        ),
     }
-    diagnostic
 }
 
-fn language_error_detail(source: &LanguageIdError) -> &'static str {
+const fn translation_planning_resource_kind(
+    resource: GenericResourceKind,
+) -> TranslationPlanningResourceKind {
+    match resource {
+        GenericResourceKind::Terminology => TranslationPlanningResourceKind::Terminology,
+        GenericResourceKind::PlaceholderRules => TranslationPlanningResourceKind::PlaceholderRules,
+    }
+}
+
+fn file_system_project_report(
+    stage: GenericDiagnosticStage,
+    operation: FileSystemOperation,
+    problem: FileSystemProblem,
+    effect: StateEffect,
+) -> DiagnosticReport {
+    DiagnosticReport::new(
+        effect,
+        Diagnostic::file_system(FileSystemIssue::new(
+            FileSystemDiagnosticContext::new(file_system_project_stage(stage), operation),
+            problem,
+        )),
+    )
+}
+
+fn sqlite_project_report(
+    stage: GenericDiagnosticStage,
+    database: &Path,
+    query_id: &'static str,
+    source: &rusqlite::Error,
+    operation: SqliteOperation,
+    transaction: SqliteTransactionState,
+    effect: StateEffect,
+) -> DiagnosticReport {
+    DiagnosticReport::new(
+        effect,
+        Diagnostic::sqlite(SqliteIssue::new(
+            SqliteDiagnosticContext::new(sqlite_project_stage(stage), operation, transaction),
+            SqliteProblem::Driver {
+                database: SafePath::new(database),
+                query_id: SafeIdentifier::new(query_id).ok(),
+                query_ordinal: None,
+                failure: SqliteDriverFailure::from_error(source),
+            },
+        )),
+    )
+}
+
+const fn file_system_project_stage(stage: GenericDiagnosticStage) -> FileSystemDiagnosticStage {
+    match stage {
+        GenericDiagnosticStage::ProjectOpening => FileSystemDiagnosticStage::Project,
+        GenericDiagnosticStage::Init => FileSystemDiagnosticStage::Project,
+        GenericDiagnosticStage::Extract => FileSystemDiagnosticStage::Extract,
+        GenericDiagnosticStage::Translate | GenericDiagnosticStage::TaskRecord => {
+            FileSystemDiagnosticStage::Translate
+        }
+        GenericDiagnosticStage::WriteBack => FileSystemDiagnosticStage::WriteBack,
+    }
+}
+
+const fn sqlite_project_stage(stage: GenericDiagnosticStage) -> SqliteDiagnosticStage {
+    match stage {
+        GenericDiagnosticStage::ProjectOpening => SqliteDiagnosticStage::Project,
+        GenericDiagnosticStage::Init => SqliteDiagnosticStage::Init,
+        GenericDiagnosticStage::Extract => SqliteDiagnosticStage::Extract,
+        GenericDiagnosticStage::Translate | GenericDiagnosticStage::TaskRecord => {
+            SqliteDiagnosticStage::Translate
+        }
+        GenericDiagnosticStage::WriteBack => SqliteDiagnosticStage::WriteBack,
+    }
+}
+
+const fn generic_language_violation(source: &LanguageIdError) -> GenericLanguageViolation {
     match source {
-        LanguageIdError::Blank => "language_id_blank",
-        LanguageIdError::SurroundingWhitespace { .. } => "language_id_surrounding_whitespace",
-        LanguageIdError::Underscore { .. } => "language_id_uses_underscore",
-        LanguageIdError::InvalidSyntax { .. } => "language_id_invalid_syntax",
-        LanguageIdError::InvalidRegistryTag { .. } => "language_id_invalid_registry_tag",
-        LanguageIdError::CanonicalizationFailed { .. } => "language_id_canonicalization_failed",
+        LanguageIdError::Blank => GenericLanguageViolation::Blank,
+        LanguageIdError::SurroundingWhitespace { .. } => {
+            GenericLanguageViolation::SurroundingWhitespace
+        }
+        LanguageIdError::Underscore { .. } => GenericLanguageViolation::Underscore,
+        LanguageIdError::InvalidSyntax { .. } => GenericLanguageViolation::InvalidSyntax,
+        LanguageIdError::InvalidRegistryTag { .. } => GenericLanguageViolation::InvalidRegistryTag,
+        LanguageIdError::CanonicalizationFailed { .. } => {
+            GenericLanguageViolation::CanonicalizationFailed
+        }
         LanguageIdError::UndefinedPrimaryLanguage { .. } => {
-            "language_id_undefined_primary_language"
+            GenericLanguageViolation::UndefinedPrimaryLanguage
         }
     }
 }
@@ -2275,7 +2384,6 @@ impl GenericProjectError {
             | Self::ProjectNotFound { .. }
             | Self::ProjectIdentityMismatch { .. }
             | Self::Io { .. }
-            | Self::WorkerStart { .. }
             | Self::TransactionNotCommitted { .. }
             | Self::TransactionOutcomeUnknown { .. }
             | Self::InvalidDatabase { .. }
@@ -2284,11 +2392,11 @@ impl GenericProjectError {
             | Self::InputChangedDuringExtract
             | Self::ExtractRequired
             | Self::TranslationSnapshotChanged
-            | Self::InvalidTranslation(_)
+            | Self::InvalidTranslation { .. }
             | Self::DuplicateTranslationWrite { .. }
             | Self::DuplicateTranslationClear { .. }
             | Self::BlankProfileId
-            | Self::InvalidResource { .. }
+            | Self::InvalidResource(_)
             | Self::UnitNotFound { .. } => false,
         }
     }
@@ -2363,9 +2471,9 @@ fn load_generic_project_row_with_cancellation(
         .next()
         .map_err(|source| cancellable_sqlite_error(OPERATION, source, cancellation))?
     else {
-        return Err(GenericProjectError::InvalidDatabase {
-            detail: "缺少 generic_project 单例记录".to_owned(),
-        });
+        return Err(invalid_database(
+            GenericProjectDatabaseProblem::MissingProjectRow,
+        ));
     };
     let project = GenericProjectRow {
         project_name: clone_sqlite_text_column_with_cancellation(row, 0, OPERATION, cancellation)?,
@@ -2469,7 +2577,7 @@ pub(crate) fn validated_manual_translation_state_with_compiled_rules_for_connect
         translation,
         || ensure_generic_operation_not_cancelled(cancellation),
     )?
-    .map_err(manual_translation_placeholder_error)?;
+    .map_err(|source| manual_translation_placeholder_error(group_id, unit_id, source))?;
     manual_translation_state_from_facts(&facts, group_id, unit_id, binding, cancellation)
 }
 
@@ -2745,12 +2853,12 @@ fn invalid_sqlite_utf8_error(
     valid_up_to: usize,
     error_len: Option<usize>,
 ) -> GenericProjectError {
-    GenericProjectError::InvalidDatabase {
-        detail: format!(
-            "{operation}时 SQLite TEXT 第 {index} 列不是有效 UTF-8：valid_up_to={valid_up_to}; error_len={}",
-            error_len.map_or_else(|| "none".to_owned(), |length| length.to_string())
-        ),
-    }
+    invalid_database(GenericProjectDatabaseProblem::InvalidTextColumnUtf8 {
+        operation: project_safe_identifier(operation, "sqlite_text"),
+        column: index,
+        valid_up_to,
+        error_len,
+    })
 }
 
 fn manual_translation_state_from_facts(
@@ -2776,9 +2884,10 @@ fn manual_translation_state_from_facts(
         if source.is_cancelled() {
             GenericProjectError::Cancelled
         } else {
-            GenericProjectError::InvalidDatabase {
-                detail: format!("建立 Generic 人工译文状态失败：{source}"),
-            }
+            invalid_database_with_source(
+                GenericProjectDatabaseProblem::ManualTranslationStateFailure,
+                source,
+            )
         }
     })
 }
@@ -3074,9 +3183,12 @@ fn validate_stored_assets_match_live(
     let no_cancellation = CooperativeCancellation::default();
     let comparison_cancellation = cancellation.unwrap_or(&no_cancellation);
     if stored.files.len() != live.files().len() {
-        return Err(GenericProjectError::InvalidDatabase {
-            detail: "Generic 文件记录与当前 Extract 快照不一致".to_owned(),
-        });
+        return Err(invalid_database(
+            GenericProjectDatabaseProblem::SnapshotFileCount {
+                stored: stored.files.len(),
+                extracted: live.files().len(),
+            },
+        ));
     }
     for (file_ordinal, (stored_file, live_file)) in
         stored.files.iter().zip(live.files()).enumerate()
@@ -3088,12 +3200,11 @@ fn validate_stored_assets_match_live(
             || stored_file.relative_path != live_file.relative_path()
             || stored_file.groups.len() != live_file.groups().len()
         {
-            return Err(GenericProjectError::InvalidDatabase {
-                detail: format!(
-                    "Generic 文件记录与当前 Extract 快照不一致：{}",
-                    live_file.relative_path().display()
-                ),
-            });
+            return Err(invalid_database(
+                GenericProjectDatabaseProblem::SnapshotFileMismatch {
+                    relative_path: SafePath::new(live_file.relative_path()),
+                },
+            ));
         }
         for (group_ordinal, (stored_group, live_group)) in stored_file
             .groups
@@ -3125,12 +3236,12 @@ fn validate_stored_assets_match_live(
                 || stored_group.context_fingerprint != expected_context
                 || stored_group.units.len() != live_group.units().len()
             {
-                return Err(GenericProjectError::InvalidDatabase {
-                    detail: format!(
-                        "Generic Group 记录与当前 Extract 快照不一致：{:?}",
-                        live_group.id()
-                    ),
-                });
+                return Err(invalid_database(
+                    GenericProjectDatabaseProblem::SnapshotGroupMismatch {
+                        relative_path: SafePath::new(live_file.relative_path()),
+                        group_id: project_optional_safe_identifier(live_group.id()),
+                    },
+                ));
             }
             for (unit_ordinal, (stored_unit, live_unit)) in stored_group
                 .units
@@ -3152,13 +3263,13 @@ fn validate_stored_assets_match_live(
                     comparison_cancellation,
                 )?;
                 if stored_unit.ordinal != unit_ordinal || !unit_id_matches || !source_text_matches {
-                    return Err(GenericProjectError::InvalidDatabase {
-                        detail: format!(
-                            "Generic Unit 记录与当前 Extract 快照不一致：{:?}/{:?}",
-                            live_group.id(),
-                            live_unit.id()
-                        ),
-                    });
+                    return Err(invalid_database(
+                        GenericProjectDatabaseProblem::SnapshotUnitMismatch {
+                            relative_path: SafePath::new(live_file.relative_path()),
+                            group_id: project_optional_safe_identifier(live_group.id()),
+                            unit_id: project_optional_safe_identifier(live_unit.id()),
+                        },
+                    ));
                 }
             }
         }
@@ -3499,9 +3610,11 @@ fn load_snapshot_rows(
             clone_sqlite_blob_column_with_cancellation(row, 4, "解码 Generic Group", cancellation)?;
         cancellation.ensure_running()?;
         let Some(&file_index) = file_indexes.get(&path_bytes) else {
-            return Err(GenericProjectError::InvalidDatabase {
-                detail: format!("Generic Group {group_id:?} 引用了不存在的文件"),
-            });
+            return Err(invalid_database(
+                GenericProjectDatabaseProblem::GroupReferencesMissingFile {
+                    group_id: project_optional_safe_identifier(&group_id),
+                },
+            ));
         };
         let group_index = files[file_index].groups.len();
         let group_index_key = clone_text_with_cancellation(&group_id, cancellation)?;
@@ -3573,18 +3686,24 @@ fn load_snapshot_rows(
                 state_fingerprint: read_fingerprint(state, "translation_state")?,
             }),
             _ => {
-                return Err(GenericProjectError::InvalidDatabase {
-                    detail: format!("Generic Unit {group_id:?}/{unit_id:?} 的译文状态不完整"),
-                });
+                return Err(invalid_database(
+                    GenericProjectDatabaseProblem::IncompleteTranslationState {
+                        group_id: project_optional_safe_identifier(&group_id),
+                        unit_id: project_optional_safe_identifier(&unit_id),
+                    },
+                ));
             }
         };
         cancellation.ensure_running()?;
         let Some(&(file_index, group_index)) =
             group_indexes.get_with_cancellation(&group_id, || cancellation.ensure_running())?
         else {
-            return Err(GenericProjectError::InvalidDatabase {
-                detail: format!("Generic Unit {group_id:?}/{unit_id:?} 引用了不存在的 Group"),
-            });
+            return Err(invalid_database(
+                GenericProjectDatabaseProblem::UnitReferencesMissingGroup {
+                    group_id: project_optional_safe_identifier(&group_id),
+                    unit_id: project_optional_safe_identifier(&unit_id),
+                },
+            ));
         };
         files[file_index].groups[group_index]
             .units
@@ -3809,27 +3928,16 @@ fn validate_generic_schema_objects_with_cancellation(
     {
         return Ok(());
     }
-    let missing = schema_object_list_with_cancellation(&missing, cancellation)?;
-    let definition_mismatches =
-        schema_object_list_with_cancellation(&definition_mismatches, cancellation)?;
-    let unexpected = schema_object_list_with_cancellation(&unexpected, cancellation)?;
-    let mut detail = String::new();
-    append_text_with_cancellation(
-        &mut detail,
-        "Generic 受管 schema 与当前唯一定义不一致：expected_count=",
-        cancellation,
-    )?;
-    append_text_with_cancellation(&mut detail, &expected.len().to_string(), cancellation)?;
-    append_text_with_cancellation(&mut detail, "; actual_count=", cancellation)?;
-    append_text_with_cancellation(&mut detail, &actual.len().to_string(), cancellation)?;
-    append_text_with_cancellation(&mut detail, "; missing=", cancellation)?;
-    append_text_with_cancellation(&mut detail, &missing, cancellation)?;
-    append_text_with_cancellation(&mut detail, "; definition_mismatches=", cancellation)?;
-    append_text_with_cancellation(&mut detail, &definition_mismatches, cancellation)?;
-    append_text_with_cancellation(&mut detail, "; unexpected=", cancellation)?;
-    append_text_with_cancellation(&mut detail, &unexpected, cancellation)?;
     cancellation.ensure_running()?;
-    Err(GenericProjectError::InvalidDatabase { detail })
+    Err(invalid_database(
+        GenericProjectDatabaseProblem::SchemaMismatch {
+            expected_count: expected.len(),
+            actual_count: actual.len(),
+            missing,
+            definition_mismatches,
+            unexpected,
+        },
+    ))
 }
 
 fn schema_object_identity_equal_with_cancellation(
@@ -3870,31 +3978,13 @@ fn schema_object_equal_with_cancellation(
 fn schema_object_label_with_cancellation(
     object: &GenericSchemaObject,
     cancellation: &(impl GenericOperationCancellation + ?Sized),
-) -> Result<String, GenericProjectError> {
+) -> Result<SafeIdentifier, GenericProjectError> {
     let mut label = String::new();
     append_text_with_cancellation(&mut label, &object.kind, cancellation)?;
     append_text_with_cancellation(&mut label, "/", cancellation)?;
     append_text_with_cancellation(&mut label, &object.name, cancellation)?;
-    Ok(label)
-}
-
-fn schema_object_list_with_cancellation(
-    objects: &[String],
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
-) -> Result<String, GenericProjectError> {
-    if objects.is_empty() {
-        return Ok("none".to_owned());
-    }
-    let mut list = String::new();
-    for (index, object) in objects.iter().enumerate() {
-        cancellation.ensure_running()?;
-        if index != 0 {
-            append_text_with_cancellation(&mut list, ",", cancellation)?;
-        }
-        append_text_with_cancellation(&mut list, object, cancellation)?;
-    }
     cancellation.ensure_running()?;
-    Ok(list)
+    Ok(project_safe_identifier(label, "schema_object"))
 }
 
 fn validate_schema_with_cancellation(
@@ -3927,9 +4017,12 @@ fn validate_schema_with_compiled_resources(
             cancellable_sqlite_error("检查 Generic 翻译资源", source, cancellation)
         })?;
     if resource_count != 2 {
-        return Err(GenericProjectError::InvalidDatabase {
-            detail: "translation_resource 必须恰好包含术语与 Placeholder 两项".to_owned(),
-        });
+        return Err(invalid_database(
+            GenericProjectDatabaseProblem::TranslationResourceCount {
+                expected: 2,
+                actual: resource_count,
+            },
+        ));
     }
     ensure_generic_operation_not_cancelled(cancellation)?;
     let resources = load_translation_resources_rows_with_cancellation(connection, cancellation)?;
@@ -3944,9 +4037,9 @@ fn validate_schema_with_compiled_resources(
                 placeholder.canonical_json().as_bytes(),
                 cancellation,
             )? {
-                return Err(GenericProjectError::InvalidDatabase {
-                    detail: "Generic 已编译翻译资源与当前事务内容不一致".to_owned(),
-                });
+                return Err(invalid_database(
+                    GenericProjectDatabaseProblem::CompiledTranslationResourcesMismatch,
+                ));
             }
             GenericCompiledTranslationResources {
                 terminology: terminology.clone(),
@@ -3970,9 +4063,11 @@ fn validate_schema_with_compiled_resources(
         cancellation,
     )?;
     if let Some(table) = foreign_key_issue {
-        return Err(GenericProjectError::InvalidDatabase {
-            detail: format!("表 {table} 存在外键错误"),
-        });
+        return Err(invalid_database(
+            GenericProjectDatabaseProblem::ForeignKeyViolation {
+                table: project_safe_identifier(table, "unknown_table"),
+            },
+        ));
     }
     ensure_generic_operation_not_cancelled(cancellation)?;
     let quick_check = query_optional_first_text_with_cancellation(
@@ -3986,9 +4081,9 @@ fn validate_schema_with_compiled_resources(
         source: rusqlite::Error::QueryReturnedNoRows,
     })?;
     if quick_check != "ok" {
-        return Err(GenericProjectError::InvalidDatabase {
-            detail: format!("SQLite quick_check：{quick_check}"),
-        });
+        return Err(invalid_database(
+            GenericProjectDatabaseProblem::QuickCheckFailed,
+        ));
     }
     ensure_generic_operation_not_cancelled(cancellation)?;
     Ok(compiled_resources)
@@ -4028,26 +4123,26 @@ fn validate_project_connection_with_compiled_resources(
     let actual = store.read_project_with_connection(connection)?;
     ensure_generic_operation_not_cancelled(cancellation)?;
     if actual.project_name != expected.project_name {
-        return Err(GenericProjectError::InvalidDatabase {
-            detail: "Lua 修改了 Generic 项目名称".to_owned(),
-        });
+        return Err(invalid_database(
+            GenericProjectDatabaseProblem::LuaChangedProjectName,
+        ));
     }
     if actual.source_root != expected.source_root {
-        return Err(GenericProjectError::InvalidDatabase {
-            detail: "Lua 修改了 Generic 输入目录绑定".to_owned(),
-        });
+        return Err(invalid_database(
+            GenericProjectDatabaseProblem::LuaChangedSourceRoot,
+        ));
     }
     if actual.language_pair != expected.language_pair {
-        return Err(GenericProjectError::InvalidDatabase {
-            detail: "Lua 修改了 Generic 项目语言对".to_owned(),
-        });
+        return Err(invalid_database(
+            GenericProjectDatabaseProblem::LuaChangedLanguagePair,
+        ));
     }
     if actual.extracted_raw_fingerprint != expected.extracted_raw_fingerprint
         || actual.extracted_asset_fingerprint != expected.extracted_asset_fingerprint
     {
-        return Err(GenericProjectError::InvalidDatabase {
-            detail: "Lua 修改了 Generic Extract 指纹".to_owned(),
-        });
+        return Err(invalid_database(
+            GenericProjectDatabaseProblem::LuaChangedExtractFingerprint,
+        ));
     }
     validate_source_write_back_separation(&actual.source_root, &actual.workspace_root)?;
 
@@ -4065,9 +4160,9 @@ fn validate_project_connection_with_compiled_resources(
                 cancellable_sqlite_error("检查未 Extract 的 Generic 资产", source, cancellation)
             })?;
         if asset_count != 0 {
-            return Err(GenericProjectError::InvalidDatabase {
-                detail: "未 Extract 的 Generic 项目不能包含资产记录".to_owned(),
-            });
+            return Err(invalid_database(
+                GenericProjectDatabaseProblem::UnextractedProjectHasAssets { count: asset_count },
+            ));
         }
         ensure_generic_operation_not_cancelled(cancellation)?;
         return Ok(());
@@ -4111,7 +4206,7 @@ fn resolve_source_root(path: &Path) -> Result<PathBuf, GenericProjectError> {
         });
     }
     fs::canonicalize(path).map_err(|source| GenericProjectError::Io {
-        operation: "解析 Generic 输入目录",
+        operation: FileSystemOperation::ResolveDirectory,
         path: path.to_path_buf(),
         source,
     })
@@ -4148,7 +4243,7 @@ fn validate_source_write_back_separation(
 
 fn resolve_planned_path(path: &Path) -> Result<PathBuf, GenericProjectError> {
     let absolute = std::path::absolute(path).map_err(|source| GenericProjectError::Io {
-        operation: "建立 Generic 输出绝对路径",
+        operation: FileSystemOperation::ResolveDirectory,
         path: path.to_path_buf(),
         source,
     })?;
@@ -4164,20 +4259,20 @@ fn resolve_planned_path(path: &Path) -> Result<PathBuf, GenericProjectError> {
             }
             Err(source) if source.kind() == io::ErrorKind::NotFound => {
                 let component = cursor.file_name().ok_or_else(|| GenericProjectError::Io {
-                    operation: "解析 Generic 输出路径",
+                    operation: FileSystemOperation::ResolveDirectory,
                     path: absolute.clone(),
                     source: io::Error::new(io::ErrorKind::NotFound, "找不到可规范化的现存祖先目录"),
                 })?;
                 missing.push(component.to_os_string());
                 cursor = cursor.parent().ok_or_else(|| GenericProjectError::Io {
-                    operation: "解析 Generic 输出路径",
+                    operation: FileSystemOperation::ResolveDirectory,
                     path: absolute.clone(),
                     source: io::Error::new(io::ErrorKind::NotFound, "找不到可规范化的现存祖先目录"),
                 })?;
             }
             Err(source) => {
                 return Err(GenericProjectError::Io {
-                    operation: "解析 Generic 输出路径",
+                    operation: FileSystemOperation::ResolveDirectory,
                     path: cursor.to_path_buf(),
                     source,
                 });
@@ -4255,18 +4350,18 @@ fn publish_initial_database_candidate(
     ensure_generic_operation_not_cancelled(cancellation)?;
     ensure_initial_database_path_has_no_sidecars(
         candidate_path,
-        "检查 Generic 初始数据库候选 sidecar",
+        FileSystemOperation::Metadata,
         "候选数据库切换到 DELETE 后仍存在 SQLite sidecar",
         cancellation,
     )?;
     ensure_initial_database_path_has_no_sidecars(
         database_path,
-        "检查 Generic 初始数据库发布目标 sidecar",
+        FileSystemOperation::Metadata,
         "首次 Init 的发布目标旁存在不属于当前项目的 SQLite sidecar",
         cancellation,
     )?;
     fs::rename(candidate_path, database_path).map_err(|source| GenericProjectError::Io {
-        operation: "发布 Generic 初始数据库",
+        operation: FileSystemOperation::Rename,
         path: database_path.to_path_buf(),
         source,
     })
@@ -4274,7 +4369,7 @@ fn publish_initial_database_candidate(
 
 fn ensure_initial_database_path_has_no_sidecars(
     database_path: &Path,
-    operation: &'static str,
+    operation: FileSystemOperation,
     present_message: &'static str,
     cancellation: &CooperativeCancellation,
 ) -> Result<(), GenericProjectError> {
@@ -4329,21 +4424,15 @@ fn cleanup_initial_database_candidate(candidate_path: &Path) -> Result<(), (Path
     }
 }
 
-fn validate_translation(translation: &str) -> Result<(), GenericProjectError> {
+fn validate_translation(translation: &str) -> Result<(), GenericProjectTranslationProblem> {
     if translation.chars().all(char::is_whitespace) {
-        return Err(GenericProjectError::InvalidTranslation(
-            "译文不能为空白".to_owned(),
-        ));
+        return Err(GenericProjectTranslationProblem::Blank);
     }
     if translation.contains('\r') {
-        return Err(GenericProjectError::InvalidTranslation(
-            "译文不能包含 CR（U+000D）".to_owned(),
-        ));
+        return Err(GenericProjectTranslationProblem::CarriageReturn);
     }
     if translation.contains('\0') {
-        return Err(GenericProjectError::InvalidTranslation(
-            "译文不能包含 NUL（U+0000）".to_owned(),
-        ));
+        return Err(GenericProjectTranslationProblem::Nul);
     }
     Ok(())
 }
@@ -4509,9 +4598,11 @@ fn compile_terminology_resource_with_cancellation(
         return Err(GenericProjectError::Cancelled);
     }
     cancellation.ensure_running()?;
-    let entries = entries_result.map_err(|source| GenericProjectError::InvalidResource {
-        kind: TERMINOLOGY_RESOURCE,
-        detail: source.to_string(),
+    let entries = entries_result.map_err(|source| {
+        GenericProjectError::InvalidResource(GenericProjectResourceError::InvalidSnapshot {
+            resource: GenericResourceKind::Terminology,
+            source,
+        })
     })?;
 
     let mut encoded = Vec::with_capacity(canonical_json.len());
@@ -4524,15 +4615,18 @@ fn compile_terminology_resource_with_cancellation(
         return Err(GenericProjectError::Cancelled);
     }
     cancellation.ensure_running()?;
-    encode_result.map_err(|source| GenericProjectError::InvalidResource {
-        kind: TERMINOLOGY_RESOURCE,
-        detail: source.to_string(),
+    encode_result.map_err(|source| {
+        GenericProjectError::InvalidResource(GenericProjectResourceError::SnapshotEncoding {
+            resource: GenericResourceKind::Terminology,
+            source,
+        })
     })?;
     if !bytes_equal_with_cancellation(&encoded, canonical_json.as_bytes(), cancellation)? {
-        return Err(GenericProjectError::InvalidResource {
-            kind: TERMINOLOGY_RESOURCE,
-            detail: "资源快照不是规范紧凑 JSON".to_owned(),
-        });
+        return Err(GenericProjectError::InvalidResource(
+            GenericProjectResourceError::NonCanonicalSnapshot {
+                resource: GenericResourceKind::Terminology,
+            },
+        ));
     }
 
     let compiled =
@@ -4548,13 +4642,9 @@ fn compile_terminology_resource_with_cancellation(
 fn terminology_resource_error(source: TerminologyDefinitionError) -> GenericProjectError {
     match source {
         TerminologyDefinitionError::Cancelled => GenericProjectError::Cancelled,
-        TerminologyDefinitionError::StartWorker { operation, source } => {
-            GenericProjectError::WorkerStart { operation, source }
-        }
-        source => GenericProjectError::InvalidResource {
-            kind: TERMINOLOGY_RESOURCE,
-            detail: source.to_string(),
-        },
+        source => GenericProjectError::InvalidResource(
+            GenericProjectResourceError::TerminologyDefinition(source),
+        ),
     }
 }
 
@@ -4576,15 +4666,18 @@ fn compile_placeholder_resource_with_cancellation(
         return Err(GenericProjectError::Cancelled);
     }
     cancellation.ensure_running()?;
-    encode_result.map_err(|source| GenericProjectError::InvalidResource {
-        kind: PLACEHOLDER_RULES_RESOURCE,
-        detail: source.to_string(),
+    encode_result.map_err(|source| {
+        GenericProjectError::InvalidResource(GenericProjectResourceError::SnapshotEncoding {
+            resource: GenericResourceKind::PlaceholderRules,
+            source,
+        })
     })?;
     if !bytes_equal_with_cancellation(&encoded, canonical_json.as_bytes(), cancellation)? {
-        return Err(GenericProjectError::InvalidResource {
-            kind: PLACEHOLDER_RULES_RESOURCE,
-            detail: "资源快照不是规范紧凑 JSON".to_owned(),
-        });
+        return Err(GenericProjectError::InvalidResource(
+            GenericProjectResourceError::NonCanonicalSnapshot {
+                resource: GenericResourceKind::PlaceholderRules,
+            },
+        ));
     }
     let compiled = service
         .compile_with_cancellation(definitions, || cancellation.ensure_running())?
@@ -4598,25 +4691,117 @@ fn compile_placeholder_resource_with_cancellation(
 }
 
 fn placeholder_resource_error(source: GenericPlaceholderError) -> GenericProjectError {
-    match source {
-        GenericPlaceholderError::Compilation(PlaceholderRuleCompilationError::StartWorker {
-            operation,
-            source,
-        }) => GenericProjectError::WorkerStart { operation, source },
-        source => GenericProjectError::InvalidResource {
-            kind: PLACEHOLDER_RULES_RESOURCE,
-            detail: source.to_string(),
-        },
+    GenericProjectError::InvalidResource(GenericProjectResourceError::Placeholder(source))
+}
+
+fn manual_translation_placeholder_error(
+    group_id: &str,
+    unit_id: &str,
+    source: GenericPlaceholderError,
+) -> GenericProjectError {
+    let problem = generic_project_translation_problem(&source);
+    GenericProjectError::InvalidTranslation {
+        group_id: Some(group_id.to_owned()),
+        unit_id: Some(unit_id.to_owned()),
+        problem,
+        source: Some(Box::new(source)),
     }
 }
 
-fn manual_translation_placeholder_error(source: GenericPlaceholderError) -> GenericProjectError {
+fn generic_project_translation_problem(
+    source: &GenericPlaceholderError,
+) -> GenericProjectTranslationProblem {
     match source {
-        GenericPlaceholderError::Compilation(PlaceholderRuleCompilationError::StartWorker {
-            operation,
-            source,
-        }) => GenericProjectError::WorkerStart { operation, source },
-        source => GenericProjectError::InvalidTranslation(source.to_string()),
+        GenericPlaceholderError::InvalidResourceSnapshot(source) => {
+            GenericProjectTranslationProblem::InvalidPlaceholderSnapshot {
+                category: GenericJsonErrorCategory::from(
+                    crate::json_diagnostic::JsonErrorCategory::from(source),
+                ),
+                line: source.line(),
+                column: source.column(),
+            }
+        }
+        GenericPlaceholderError::Compilation(source) => {
+            GenericProjectTranslationProblem::PlaceholderCompilation {
+                problem: source.diagnostic_problem(),
+            }
+        }
+        GenericPlaceholderError::Protection(source) => {
+            GenericProjectTranslationProblem::PlaceholderProtection {
+                problem: source.diagnostic_issue(),
+            }
+        }
+        GenericPlaceholderError::Restore(PlaceholderRestoreError::Projection(source)) => {
+            GenericProjectTranslationProblem::PlaceholderRestoreProjection {
+                problem: generic_project_language_projection_problem(source),
+            }
+        }
+        GenericPlaceholderError::Restore(PlaceholderRestoreError::Multiset(source)) => {
+            GenericProjectTranslationProblem::PlaceholderRestoreMultiset {
+                problem: generic_project_placeholder_multiset_problem(source),
+            }
+        }
+        GenericPlaceholderError::ManualTranslationMismatch => {
+            GenericProjectTranslationProblem::PlaceholderBindingMismatch
+        }
+    }
+}
+
+const fn generic_project_language_projection_problem(
+    source: &LanguageTextProjectionError,
+) -> GenericLanguageProjectionProblem {
+    match source {
+        LanguageTextProjectionError::TokenIndexConstruction => {
+            GenericLanguageProjectionProblem::TokenIndexConstruction
+        }
+        LanguageTextProjectionError::EmptyToken => GenericLanguageProjectionProblem::EmptyToken,
+        LanguageTextProjectionError::MissingToken { .. } => {
+            GenericLanguageProjectionProblem::MissingToken
+        }
+        LanguageTextProjectionError::RepeatedToken { .. } => {
+            GenericLanguageProjectionProblem::RepeatedToken
+        }
+        LanguageTextProjectionError::OverlappingToken { .. } => {
+            GenericLanguageProjectionProblem::OverlappingToken
+        }
+        LanguageTextProjectionError::ChangedTokenOrder { position, .. } => {
+            GenericLanguageProjectionProblem::ChangedTokenOrder {
+                position: *position,
+            }
+        }
+        LanguageTextProjectionError::ChangedSegmentCount { expected, actual } => {
+            GenericLanguageProjectionProblem::ChangedSegmentCount {
+                expected: *expected,
+                actual: *actual,
+            }
+        }
+        LanguageTextProjectionError::ChangedSegmentKind { segment_index } => {
+            GenericLanguageProjectionProblem::ChangedSegmentKind {
+                segment_index: *segment_index,
+            }
+        }
+        LanguageTextProjectionError::MissingOrderedToken { segment_index } => {
+            GenericLanguageProjectionProblem::MissingOrderedToken {
+                segment_index: *segment_index,
+            }
+        }
+        LanguageTextProjectionError::UnusedOrderedToken => {
+            GenericLanguageProjectionProblem::UnusedOrderedToken
+        }
+    }
+}
+
+const fn generic_project_placeholder_multiset_problem(
+    source: &PlaceholderMultisetError,
+) -> GenericPlaceholderMultisetProblem {
+    match source {
+        PlaceholderMultisetError::Mismatch { .. } => GenericPlaceholderMultisetProblem::Mismatch,
+        PlaceholderMultisetError::Unexpected { .. } => {
+            GenericPlaceholderMultisetProblem::Unexpected
+        }
+        PlaceholderMultisetError::OrderMismatch { .. } => {
+            GenericPlaceholderMultisetProblem::OrderMismatch
+        }
     }
 }
 
@@ -4643,14 +4828,16 @@ fn bytes_equal_with_cancellation(
 }
 
 fn to_i64(value: usize) -> Result<i64, GenericProjectError> {
-    i64::try_from(value).map_err(|_| GenericProjectError::InvalidDatabase {
-        detail: "序号超过 SQLite INTEGER 可表达范围".to_owned(),
-    })
+    i64::try_from(value)
+        .map_err(|_| invalid_database(GenericProjectDatabaseProblem::OrdinalTooLarge { value }))
 }
 
 fn from_i64(value: i64, field: &'static str) -> Result<usize, GenericProjectError> {
-    usize::try_from(value).map_err(|_| GenericProjectError::InvalidDatabase {
-        detail: format!("{field} 不是有效非负序号：{value}"),
+    usize::try_from(value).map_err(|_| {
+        invalid_database(GenericProjectDatabaseProblem::InvalidOrdinal {
+            field: project_safe_identifier(field, "ordinal"),
+            value,
+        })
     })
 }
 
@@ -4668,9 +4855,11 @@ fn read_fingerprint(
     field: &'static str,
 ) -> Result<Sha256Fingerprint, GenericProjectError> {
     let array = <[u8; SHA256_FINGERPRINT_BYTES]>::try_from(bytes).map_err(|bytes| {
-        GenericProjectError::InvalidDatabase {
-            detail: format!("{field} 必须是 32 字节，实际为 {}", bytes.len()),
-        }
+        invalid_database(GenericProjectDatabaseProblem::InvalidFingerprintLength {
+            field: project_safe_identifier(field, "fingerprint"),
+            expected: SHA256_FINGERPRINT_BYTES,
+            actual: bytes.len(),
+        })
     })?;
     Ok(Sha256Fingerprint::from_bytes(array))
 }
@@ -4694,9 +4883,11 @@ fn decode_path_with_cancellation(
 
     cancellation.ensure_running()?;
     if bytes.is_empty() || !bytes.len().is_multiple_of(2) {
-        return Err(GenericProjectError::InvalidDatabase {
-            detail: "路径 BLOB 必须是非空 UTF-16LE code units".to_owned(),
-        });
+        return Err(invalid_database(
+            GenericProjectDatabaseProblem::InvalidUtf16Path {
+                actual_bytes: bytes.len(),
+            },
+        ));
     }
     let mut units = Vec::with_capacity(bytes.len() / 2);
     for chunk in bytes.chunks(RESOURCE_CANCELLATION_CHECK_BYTES) {
@@ -4719,10 +4910,13 @@ fn decode_path_with_cancellation(
     bytes: &[u8],
     cancellation: &(impl GenericOperationCancellation + ?Sized),
 ) -> Result<PathBuf, GenericProjectError> {
-    if validate_utf8_bytes_with_cancellation(bytes, cancellation)?.is_err() {
-        return Err(GenericProjectError::InvalidDatabase {
-            detail: "路径不是有效 UTF-8".to_owned(),
-        });
+    if let Err(source) = validate_utf8_bytes_with_cancellation(bytes, cancellation)? {
+        return Err(invalid_database(
+            GenericProjectDatabaseProblem::InvalidUtf8Path {
+                valid_up_to: source.valid_up_to,
+                error_len: source.error_len,
+            },
+        ));
     }
     // SAFETY: 上面的分块校验已经确认整份字节串是 UTF-8。
     let value = unsafe { std::str::from_utf8_unchecked(bytes) };
@@ -4874,55 +5068,71 @@ mod tests {
     }
 
     #[test]
-    fn resource_worker_start_failures_remain_internal_operation_errors() {
+    fn resource_worker_start_failures_preserve_typed_backend_facts() {
         assert!(matches!(
             terminology_resource_error(TerminologyDefinitionError::Cancelled),
             GenericProjectError::Cancelled
         ));
 
         let errors = [
-            terminology_resource_error(TerminologyDefinitionError::StartWorker {
-                operation: "启动术语测试 worker",
-                source: io::Error::from_raw_os_error(8),
-            }),
-            placeholder_resource_error(GenericPlaceholderError::Compilation(
-                PlaceholderRuleCompilationError::StartWorker {
-                    operation: "启动 Placeholder 资源测试 worker",
+            (
+                terminology_resource_error(TerminologyDefinitionError::StartWorker {
+                    operation: "启动术语测试 worker",
                     source: io::Error::from_raw_os_error(8),
-                },
-            )),
-            manual_translation_placeholder_error(GenericPlaceholderError::Compilation(
-                PlaceholderRuleCompilationError::StartWorker {
-                    operation: "启动人工译文测试 worker",
-                    source: io::Error::from_raw_os_error(8),
-                },
-            )),
+                }),
+                "translation.terminology.worker_start",
+            ),
+            (
+                placeholder_resource_error(GenericPlaceholderError::Compilation(
+                    PlaceholderRuleCompilationError::StartWorker {
+                        operation: PlaceholderWorkerOperation::CompileCustomRules,
+                        source: io::Error::from_raw_os_error(8),
+                    },
+                )),
+                "translation.placeholder.compilation.worker_start",
+            ),
+            (
+                manual_translation_placeholder_error(
+                    "group-a",
+                    "unit-a",
+                    GenericPlaceholderError::Compilation(
+                        PlaceholderRuleCompilationError::StartWorker {
+                            operation: PlaceholderWorkerOperation::CompileCustomRules,
+                            source: io::Error::from_raw_os_error(8),
+                        },
+                    ),
+                ),
+                "translation.placeholder.compilation.worker_start",
+            ),
+            (
+                manual_translation_placeholder_error(
+                    "group-a",
+                    "unit-a",
+                    GenericPlaceholderError::Protection(PlaceholderProtectionError::StartWorker {
+                        operation: PlaceholderWorkerOperation::MatchText,
+                        source: io::Error::from_raw_os_error(8),
+                    }),
+                ),
+                "translation.placeholder.worker_start",
+            ),
         ];
 
-        for error in errors {
-            let (operation, source) = match &error {
-                GenericProjectError::WorkerStart { operation, source } => (operation, source),
-                other => panic!("worker 启动失败不得归类为用户输入无效：{other:?}"),
-            };
-            assert_eq!(source.raw_os_error(), Some(8));
+        for (error, expected_code) in errors {
             assert!(std::error::Error::source(&error).is_some());
-            assert!(error.to_string().contains(*operation));
 
-            let diagnostic = error.safe_diagnostic_source(
-                DiagnosticStage::Translate,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::Retry,
+            let diagnostic = error.diagnostic_report(
+                GenericDiagnosticStage::Translate,
+                Path::new("project.db"),
+                StateEffect::Unchanged,
             );
-            assert_eq!(diagnostic.code, DiagnosticCode::InternalOperation);
-            assert!(matches!(
-                diagnostic.reason,
-                DiagnosticReason::Io {
-                    ref operation,
-                    raw_os_code: Some(8),
-                    ..
-                } if operation == "spawn_worker"
-            ));
-            assert_eq!(diagnostic.action, DiagnosticAction::ReportBug);
+            assert_eq!(diagnostic.effect(), StateEffect::Unchanged);
+            assert_eq!(diagnostic.primary().code(), expected_code);
+            assert_eq!(
+                diagnostic.primary().resolution(),
+                crate::diagnostic::DiagnosticResolution::Retry
+            );
+            let wire = serde_json::to_string(&diagnostic).expect("worker 诊断必须可序列化");
+            assert!(wire.contains("\"raw_os_code\":8"));
         }
     }
 
@@ -5088,13 +5298,59 @@ mod tests {
             .unwrap();
         let mut rows = statement.query([]).unwrap();
         let row = rows.next().unwrap().unwrap();
+        let error =
+            clone_sqlite_text_column_with_cancellation(row, 0, "读取测试 TEXT", &never_cancel)
+                .expect_err("无效 UTF-8 TEXT 必须拒绝");
         assert!(matches!(
-            clone_sqlite_text_column_with_cancellation(row, 0, "读取测试 TEXT", &never_cancel,),
-            Err(GenericProjectError::InvalidDatabase { ref detail })
-                if detail.contains("SQLite TEXT 第 0 列不是有效 UTF-8")
-                    && detail.contains("valid_up_to=0")
-                    && detail.contains("error_len=1")
+            &error,
+            GenericProjectError::InvalidDatabase {
+                problem: GenericProjectDatabaseProblem::InvalidTextColumnUtf8 {
+                    column: 0,
+                    valid_up_to: 0,
+                    error_len: Some(1),
+                    ..
+                },
+                source: None,
+            }
         ));
+        let wire = serde_json::to_value(error.diagnostic_report(
+            GenericDiagnosticStage::ProjectOpening,
+            Path::new("project.db"),
+            StateEffect::Unchanged,
+        ))
+        .expect("数据库诊断必须可序列化");
+        assert_eq!(
+            wire["primary"]["code"],
+            "generic.project.database.text_column_invalid_utf8"
+        );
+        assert_eq!(
+            wire["primary"]["issue"]["details"]["problem"]["problem"]["column"],
+            0
+        );
+    }
+
+    #[test]
+    fn invalid_database_source_is_only_available_through_error_source() {
+        let sentinel = "sensitive-source-locator";
+        let error = invalid_database_with_source(
+            GenericProjectDatabaseProblem::ManualTranslationStateFailure,
+            GenericPlanningError::Missing(GenericPlanningUnitLocator::new(
+                "private.jsonl",
+                sentinel,
+                "unit",
+                "dialogue",
+            )),
+        );
+
+        assert!(std::error::Error::source(&error).is_some());
+        let wire = serde_json::to_string(&error.diagnostic_report(
+            GenericDiagnosticStage::Translate,
+            Path::new("project.db"),
+            StateEffect::Unchanged,
+        ))
+        .expect("数据库诊断必须可序列化");
+        assert!(wire.contains("generic.project.database.manual_translation_state"));
+        assert!(!wire.contains(sentinel));
     }
 
     #[test]
@@ -5160,59 +5416,47 @@ mod tests {
     #[test]
     fn project_diagnostics_preserve_io_sqlite_and_state_facts() {
         let io_error = GenericProjectError::Io {
-            operation: "读取 Generic 测试输入",
+            operation: FileSystemOperation::Read,
             path: PathBuf::from("nested/input.jsonl"),
             source: io::Error::from_raw_os_error(5),
         };
-        let io_diagnostic = io_error.safe_diagnostic_source(
-            DiagnosticStage::Extract,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::Retry,
+        let io_diagnostic = io_error.diagnostic_report(
+            GenericDiagnosticStage::Extract,
+            Path::new("project.db"),
+            StateEffect::Unchanged,
         );
-        assert!(matches!(
-            io_diagnostic.subject,
-            DiagnosticSubject::Path { ref path } if path.ends_with("nested/input.jsonl")
-        ));
-        assert!(matches!(
-            io_diagnostic.reason,
-            DiagnosticReason::Io {
-                raw_os_code: Some(5),
-                ..
-            }
-        ));
+        assert_eq!(io_diagnostic.primary().code(), "filesystem.io");
+        let wire = serde_json::to_string(&io_diagnostic).expect("I/O 诊断必须可序列化");
+        assert!(wire.contains("nested/input.jsonl"));
+        assert!(wire.contains("\"raw_os_code\":5"));
 
         let connection = Connection::open_in_memory().unwrap();
         let source = connection
             .execute("INSERT INTO missing_table VALUES (1)", [])
             .expect_err("不存在的表必须产生 SQLite driver 错误");
-        let sqlite_diagnostic = GenericProjectError::Sqlite {
+        let sqlite_error = GenericProjectError::Sqlite {
             operation: "写入 Generic 测试数据库",
             source,
-        }
-        .safe_diagnostic_source(
-            DiagnosticStage::Translate,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::Retry,
+        };
+        let sqlite_diagnostic = sqlite_error.diagnostic_report(
+            GenericDiagnosticStage::Translate,
+            Path::new("project.db"),
+            StateEffect::Unchanged,
         );
-        assert!(matches!(
-            sqlite_diagnostic.reason,
-            DiagnosticReason::Sqlite {
-                primary_code: 1,
-                extended_code: 1,
-            }
-        ));
+        assert_eq!(sqlite_diagnostic.primary().code(), "sqlite.driver");
+        let wire = serde_json::to_string(&sqlite_diagnostic).expect("SQLite 诊断必须可序列化");
+        assert!(wire.contains("\"primary_code\":1"));
+        assert!(wire.contains("\"extended_code\":1"));
 
-        let state_diagnostic = GenericProjectError::ExtractRequired.safe_diagnostic_source(
-            DiagnosticStage::Translate,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::Retry,
+        let state_diagnostic = GenericProjectError::ExtractRequired.diagnostic_report(
+            GenericDiagnosticStage::Translate,
+            Path::new("project.db"),
+            StateEffect::Unchanged,
         );
-        assert!(matches!(
-            state_diagnostic.reason,
-            DiagnosticReason::Failure {
-                failure: DiagnosticFailureKind::GenericExtractRequired,
-            }
-        ));
+        assert_eq!(
+            state_diagnostic.primary().code(),
+            "generic.project.extract_required"
+        );
     }
 
     #[test]
@@ -5311,8 +5555,15 @@ mod tests {
             validate_current_generic_schema(&connection).expect_err("约束变化必须拒绝");
         assert!(matches!(
             definition_error,
-            GenericProjectError::InvalidDatabase { ref detail }
-                if detail.contains("definition_mismatches=table/translation_resource")
+            GenericProjectError::InvalidDatabase {
+                problem: GenericProjectDatabaseProblem::SchemaMismatch {
+                    ref definition_mismatches,
+                    ..
+                },
+                ..
+            } if definition_mismatches
+                .iter()
+                .any(|object| object.as_str() == "table/translation_resource")
         ));
 
         connection
@@ -5326,8 +5577,15 @@ mod tests {
             validate_current_generic_schema(&connection).expect_err("附加受管索引必须拒绝");
         assert!(matches!(
             attached_object_error,
-            GenericProjectError::InvalidDatabase { ref detail }
-                if detail.contains("unexpected=index/unexpected_generic_unit_index")
+            GenericProjectError::InvalidDatabase {
+                problem: GenericProjectDatabaseProblem::SchemaMismatch {
+                    ref unexpected,
+                    ..
+                },
+                ..
+            } if unexpected
+                .iter()
+                .any(|object| object.as_str() == "index/unexpected_generic_unit_index")
         ));
     }
 
@@ -5354,8 +5612,15 @@ mod tests {
 
         assert!(matches!(
             store.open(),
-            Err(GenericProjectError::InvalidDatabase { ref detail })
-                if detail.contains("definition_mismatches=table/translation_resource")
+            Err(GenericProjectError::InvalidDatabase {
+                problem: GenericProjectDatabaseProblem::SchemaMismatch {
+                    ref definition_mismatches,
+                    ..
+                },
+                ..
+            }) if definition_mismatches
+                .iter()
+                .any(|object| object.as_str() == "table/translation_resource")
         ));
     }
 
@@ -5378,10 +5643,12 @@ mod tests {
 
         assert!(matches!(
             store.open(),
-            Err(GenericProjectError::InvalidResource {
-                kind: TERMINOLOGY_RESOURCE,
-                ..
-            })
+            Err(GenericProjectError::InvalidResource(
+                GenericProjectResourceError::InvalidSnapshot {
+                    resource: GenericResourceKind::Terminology,
+                    ..
+                }
+            ))
         ));
     }
 
@@ -5528,7 +5795,7 @@ mod tests {
             assert!(matches!(
                 error,
                 GenericProjectError::Io {
-                    operation: "检查 Generic 初始数据库发布目标 sidecar",
+                    operation: FileSystemOperation::Metadata,
                     ref path,
                     ref source,
                 } if path == &stale_sidecar && source.kind() == io::ErrorKind::AlreadyExists
@@ -5586,7 +5853,7 @@ mod tests {
             assert!(matches!(
                 error,
                 GenericProjectError::Io {
-                    operation: "检查 Generic 初始数据库发布目标 sidecar",
+                    operation: FileSystemOperation::Metadata,
                     ref path,
                     ref source,
                 } if path == &stale_sidecar && source.kind() == io::ErrorKind::AlreadyExists
@@ -6525,19 +6792,25 @@ mod tests {
             other => panic!("应保留主取消与回滚失败，实际为 {other:?}"),
         }
         assert!(!error.is_cancelled());
-        let diagnostic = error.safe_diagnostic_source(
-            DiagnosticStage::Extract,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::Retry,
+        let diagnostic = error.diagnostic_report(
+            GenericDiagnosticStage::Extract,
+            Path::new("project.db"),
+            StateEffect::Unchanged,
         );
-        assert_eq!(diagnostic.code, DiagnosticCode::OperationOutcomeUnknown);
-        assert_eq!(diagnostic.impact, DiagnosticImpact::OutcomeUnknown);
-        assert!(diagnostic.recovery.iter().any(|fact| {
-            matches!(
-                fact,
-                RecoveryFact::Component { name } if name == "primary_code=project.state"
-            )
-        }));
+        assert_eq!(diagnostic.effect(), StateEffect::OutcomeUnknown);
+        assert_eq!(diagnostic.related().len(), 1);
+        assert_eq!(
+            diagnostic.related()[0].relation(),
+            RelatedFailureRelation::Finalization
+        );
+        assert_eq!(
+            diagnostic.related()[0].report().effect(),
+            StateEffect::OutcomeUnknown
+        );
+        assert_eq!(
+            diagnostic.related()[0].report().primary().code(),
+            "sqlite.driver"
+        );
     }
 
     #[test]
@@ -6674,18 +6947,15 @@ mod tests {
             0
         );
         drop(finalization);
-        let diagnostic = error.safe_diagnostic_source(
-            DiagnosticStage::Translate,
-            DiagnosticImpact::OutcomeUnknown,
-            DiagnosticAction::Retry,
+        let diagnostic = error.diagnostic_report(
+            GenericDiagnosticStage::Translate,
+            Path::new("project.db"),
+            StateEffect::OutcomeUnknown,
         );
-        assert_eq!(diagnostic.impact, DiagnosticImpact::Unchanged);
-        assert!(diagnostic.recovery.iter().any(|fact| {
-            matches!(
-                fact,
-                RecoveryFact::Transaction { state } if state == "rolled_back"
-            )
-        }));
+        assert_eq!(diagnostic.effect(), StateEffect::Unchanged);
+        assert!(diagnostic.related().is_empty());
+        let wire = serde_json::to_string(&diagnostic).expect("回滚终态诊断必须可序列化");
+        assert!(wire.contains("\"transaction\":\"rolled_back\""));
     }
 
     #[test]
@@ -6760,20 +7030,26 @@ mod tests {
             other => panic!("应保留 COMMIT 与 ROLLBACK 两个失败，实际为 {other:?}"),
         }
         assert!(!error.is_cancelled());
-        let diagnostic = error.safe_diagnostic_source(
-            DiagnosticStage::Translate,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::Retry,
+        let diagnostic = error.diagnostic_report(
+            GenericDiagnosticStage::Translate,
+            Path::new("project.db"),
+            StateEffect::Unchanged,
         );
-        assert_eq!(diagnostic.code, DiagnosticCode::OperationOutcomeUnknown);
-        assert_eq!(diagnostic.impact, DiagnosticImpact::OutcomeUnknown);
-        assert!(diagnostic.recovery.iter().any(|fact| {
-            matches!(
-                fact,
-                RecoveryFact::Component { name }
-                    if name.starts_with("primary_sqlite=")
-            )
-        }));
+        assert_eq!(diagnostic.effect(), StateEffect::OutcomeUnknown);
+        assert_eq!(diagnostic.primary().code(), "sqlite.driver");
+        assert_eq!(diagnostic.related().len(), 1);
+        assert_eq!(
+            diagnostic.related()[0].relation(),
+            RelatedFailureRelation::Finalization
+        );
+        assert_eq!(
+            diagnostic.related()[0].report().effect(),
+            StateEffect::OutcomeUnknown
+        );
+        let wire = serde_json::to_string(&diagnostic).expect("事务未知诊断必须可序列化");
+        assert_eq!(wire.matches("sqlite.driver").count(), 2);
+        assert!(wire.contains("\"transaction\":\"active\""));
+        assert!(wire.contains("\"transaction\":\"outcome_unknown\""));
     }
 
     #[test]
@@ -6844,36 +7120,34 @@ mod tests {
             .extracted_raw_fingerprint()
             .expect("已提取项目应保存原始指纹");
 
-        for (case, terminology_json, expected_detail) in [
-            ("条目类型错误", "[1]", None),
+        for (case, terminology_json, expected_code) in [
+            (
+                "条目类型错误",
+                "[1]",
+                "translation.terminology.invalid_snapshot_json",
+            ),
             (
                 "术语重复",
                 r#"[{"term":"同名","translation":"译文一","triggers":["触发一"]},{"term":"同名","translation":"译文二","triggers":["触发二"]}]"#,
-                Some("术语重复"),
+                "translation.terminology.duplicate_term",
             ),
             (
                 "术语含首尾空白",
                 r#"[{"term":" 原文","translation":"译文","triggers":["原文"]}]"#,
-                Some("含首尾空白"),
+                "translation.terminology.surrounding_whitespace",
             ),
         ] {
             let error = store
                 .apply_translation_resources(expected_raw_fingerprint, terminology_json, "[]", &[])
                 .expect_err(case);
-            match error {
-                GenericProjectError::InvalidResource {
-                    kind: TERMINOLOGY_RESOURCE,
-                    detail,
-                } => {
-                    if let Some(expected_detail) = expected_detail {
-                        assert!(
-                            detail.contains(expected_detail),
-                            "{case} 应保留具体定义错误，实际为 {detail:?}"
-                        );
-                    }
-                }
-                other => panic!("{case} 应作为 terminology 资源无效返回，实际为 {other:?}"),
-            }
+            assert!(matches!(&error, GenericProjectError::InvalidResource(_)));
+            assert!(std::error::Error::source(&error).is_some());
+            let diagnostic = error.diagnostic_report(
+                GenericDiagnosticStage::Translate,
+                store.database_path(),
+                StateEffect::Unchanged,
+            );
+            assert_eq!(diagnostic.primary().code(), expected_code);
 
             let resources = store
                 .load_translation_resources()

@@ -5,4 +5,5 @@ pub(crate) mod command;
 pub(crate) mod config;
 pub(crate) mod generic_command;
 pub(crate) mod process;
+pub(crate) mod project_log;
 pub(crate) mod translation_prompt;

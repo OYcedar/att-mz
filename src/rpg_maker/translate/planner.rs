@@ -11,14 +11,16 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use crate::diagnostic::{
-    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
-    DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
+    Diagnostic, DiagnosticReport, IoFailure, ReportedFailure, RpgMakerDiagnosticScope,
+    RpgMakerIssue, RpgMakerOutputContractViolation, RpgMakerPlaceholderMultisetViolation,
+    RpgMakerPlaceholderProjectionProblem, RpgMakerTranslationPlanningProblem, RuntimeComponent,
+    RuntimeIssue, RuntimeOperation, SafeIdentifier, StateEffect, TranslationIssue,
+    TranslationPlanningResourceOrigin, TranslationTaskPlanningProblem,
 };
 use crate::execution::CooperativeCancellation;
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::execution::isolated::{IsolatedOperationError, run_isolated_operation};
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
-use crate::json_diagnostic::JsonErrorCategory;
 use crate::language::{LanguageAnalysis, LanguageOperationCancelled, LanguagePair};
 use crate::llm::{ChatMessage, ChatMessageRole, LlmClientConcurrency, LlmClientSemanticIdentity};
 use crate::rpg_maker::RpgMakerEngine;
@@ -27,7 +29,8 @@ use crate::rpg_maker::model::{TextUnitContent, TextUnitRole};
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::semantic_order::{RpgMakerSemanticOrderKey, RpgMakerSemanticScopeKey};
 use crate::rpg_maker::text::{RpgMakerSource, StandardDataFile, TextGroupKind};
-use crate::storage::file_system::ReadFileError;
+use crate::runtime::cpu::CpuExecutorUnavailable;
+use crate::runtime::filesystem::SystemFileSystemError;
 use crate::translation::placeholder_projection::LanguageTextProjectionError;
 use crate::translation::task_planning::{
     AssignedTaskBlock, StableGroupCharacters, TaskId, TaskPlanningError, TaskPlanningGroupLayout,
@@ -52,7 +55,8 @@ use super::pipeline::{
     ExpectedTranslationValidation, GroupContextFingerprint, RpgMakerExecutableTask,
     RpgMakerTranslationCorpus, RpgMakerTranslationInput, RpgMakerTranslationPlan,
     RpgMakerTranslationScope, RpgMakerTranslationTaskIndex, RpgMakerTranslationTaskPlanner,
-    TerminologyDependency, TranslationInvalidation, TranslationPlanPreparation,
+    TerminologyDependency, TranslationInvalidation, TranslationPlaceholderProjectionFailure,
+    TranslationPlaceholderProtectionFailure, TranslationPlanPreparation,
     TranslationPlanPreparationCounts, TranslationPlanningFailure, TranslationPlanningFailureReason,
     TranslationPropagationTarget, TranslationStateContext, TranslationUnitIdentity,
     TranslationVirtualReason,
@@ -70,8 +74,7 @@ use super::semantics::{
     manual_translation_state_fingerprint_with_cancellation,
 };
 use crate::translation::planning_resource::{
-    CompiledTerminology, PlaceholderDefinitionError, TerminologyDefinitionError,
-    TranslationPlanningResourceReader, TranslationPlanningResourceReadingError,
+    CompiledTerminology, TranslationPlanningResourceReader, TranslationPlanningResourceReadingError,
 };
 
 /// 使用三个职责模块与 CPU 根建立确定性 RPG Maker 翻译计划。
@@ -116,6 +119,7 @@ struct ResolvedCorpusSemantics {
     semantics: Arc<ResolvedTranslationSemantics>,
     system_markdown: String,
     task_language_pair: LanguagePair,
+    placeholder_rule_source: super::pipeline::TranslationPlaceholderRuleSource,
 }
 
 impl<R, C, L> RpgMakerTranslationTaskPlanningService<R, C, L>
@@ -220,6 +224,10 @@ where
             }
         };
         let (terminology_path, placeholder_rules_path) = input.into_parts();
+        let placeholder_rule_source = placeholder_rules_path.as_ref().map_or(
+            super::pipeline::TranslationPlaceholderRuleSource::ProjectSnapshot,
+            |path| super::pipeline::TranslationPlaceholderRuleSource::ExternalFile(path.clone()),
+        );
         let resources = self
             .resources
             .read(
@@ -254,7 +262,10 @@ where
                 );
             }
             Ok(result) => {
-                result.map_err(RpgMakerTranslationTaskPlanningError::InvalidPlaceholderRules)?
+                let origin = placeholder_rule_source.clone();
+                result.map_err(|source| {
+                    RpgMakerTranslationTaskPlanningError::InvalidPlaceholderRules { origin, source }
+                })?
             }
         };
         let task_language_pair = LanguagePair::new(source_language_id, target_language_id);
@@ -276,6 +287,7 @@ where
             semantics,
             system_markdown,
             task_language_pair,
+            placeholder_rule_source,
         })
     }
 }
@@ -306,6 +318,7 @@ where
             semantics,
             system_markdown,
             task_language_pair,
+            placeholder_rule_source,
         } = self
             .resolve_corpus_semantics(project, profile, corpus, input)
             .await?;
@@ -481,6 +494,10 @@ where
                         }
                     }
                 })?;
+        let planning_failures = planning_failures
+            .into_iter()
+            .map(|failure| failure.with_rule_source(placeholder_rule_source.clone()))
+            .collect();
 
         let assignment_cancellation = self.cancellation.clone();
         let assigned = self
@@ -1028,12 +1045,12 @@ fn planning_failure_reason(
     match source {
         ResolvedTranslationSemanticError::ProtectPlaceholder(source) => {
             TranslationPlanningFailureReason::PlaceholderProtection {
-                message: placeholder_protection_failure_detail(&source),
+                failure: placeholder_protection_planning_failure(source),
             }
         }
         ResolvedTranslationSemanticError::ProjectLanguageText(source) => {
             TranslationPlanningFailureReason::PlaceholderProjection {
-                message: placeholder_projection_failure_detail(&source),
+                failure: placeholder_projection_planning_failure(source),
             }
         }
         #[cfg(test)]
@@ -1043,71 +1060,112 @@ fn planning_failure_reason(
     }
 }
 
-fn placeholder_protection_failure_detail(source: &PlaceholderProtectionError) -> String {
+fn placeholder_protection_planning_failure(
+    source: PlaceholderProtectionError,
+) -> TranslationPlaceholderProtectionFailure {
     match source {
-        PlaceholderProtectionError::StartWorker { operation, source } => format!(
-            "placeholder_match_worker_start_failed; operation={operation}; os_code={:?}; reason={source}",
-            source.raw_os_error()
-        ),
-        PlaceholderProtectionError::Match(source) => format!(
-            "pcre2_match_failed; kind={}; code={}; offset={:?}",
-            pcre2_error_kind(source),
-            source.code(),
-            source.offset()
-        ),
-        PlaceholderProtectionError::EmptyMatch { .. } => "placeholder_empty_match".to_owned(),
-        PlaceholderProtectionError::MissingTextCapture { rule_number } => {
-            format!("placeholder_text_capture_missing; rule={rule_number}")
+        PlaceholderProtectionError::StartWorker { operation, source } => {
+            TranslationPlaceholderProtectionFailure::WorkerStart {
+                operation,
+                io_kind: source.kind(),
+                raw_os_code: source.raw_os_error(),
+            }
         }
-        PlaceholderProtectionError::InvalidMatchRange { rule_number } => {
-            format!("placeholder_match_range_invalid; rule={rule_number}")
+        PlaceholderProtectionError::Match { rule, source } => {
+            TranslationPlaceholderProtectionFailure::Pcre2 {
+                rule,
+                kind: source.kind(),
+                code: source.code(),
+                offset: source.offset(),
+            }
         }
-        PlaceholderProtectionError::OverlappingMatches { .. } => {
-            "placeholder_matches_overlap".to_owned()
+        PlaceholderProtectionError::EmptyMatch { matched } => {
+            TranslationPlaceholderProtectionFailure::EmptyMatch { matched }
+        }
+        PlaceholderProtectionError::MissingTextCapture {
+            rule_number,
+            whole_match_start_byte,
+            whole_match_end_byte,
+        } => TranslationPlaceholderProtectionFailure::MissingTextCapture {
+            rule_number,
+            whole_match_start_byte,
+            whole_match_end_byte,
+        },
+        PlaceholderProtectionError::InvalidMatchRange {
+            rule_number,
+            whole_match_start_byte,
+            whole_match_end_byte,
+            capture_start_byte,
+            capture_end_byte,
+            violation,
+        } => TranslationPlaceholderProtectionFailure::InvalidMatchRange {
+            rule_number,
+            whole_match_start_byte,
+            whole_match_end_byte,
+            capture_start_byte,
+            capture_end_byte,
+            violation,
+        },
+        PlaceholderProtectionError::OverlappingMatches { first, second } => {
+            TranslationPlaceholderProtectionFailure::OverlappingMatches { first, second }
         }
         PlaceholderProtectionError::CrossesLineBoundary {
-            rule_number,
+            matched,
             source_line_index,
-        } => {
-            let rule = rule_number.map_or_else(|| "builtin".to_owned(), |value| value.to_string());
-            format!(
-                "placeholder_crosses_line_boundary; rule={rule}; source_line_index={source_line_index}"
-            )
-        }
-        PlaceholderProtectionError::ReservedTokenNamespace => {
-            "source_uses_reserved_token_namespace".to_owned()
-        }
+        } => TranslationPlaceholderProtectionFailure::CrossesLineBoundary {
+            matched,
+            source_line_index,
+        },
+        PlaceholderProtectionError::ReservedTokenNamespace {
+            start_byte,
+            end_byte,
+        } => TranslationPlaceholderProtectionFailure::ReservedTokenNamespace {
+            start_byte,
+            end_byte,
+        },
     }
 }
 
-fn placeholder_projection_failure_detail(source: &LanguageTextProjectionError) -> String {
+fn placeholder_projection_planning_failure(
+    source: LanguageTextProjectionError,
+) -> TranslationPlaceholderProjectionFailure {
     match source {
         LanguageTextProjectionError::TokenIndexConstruction => {
-            "placeholder_token_index_construction_failed".to_owned()
+            TranslationPlaceholderProjectionFailure::TokenIndexConstruction
         }
-        LanguageTextProjectionError::EmptyToken => "empty_placeholder_token".to_owned(),
-        LanguageTextProjectionError::MissingToken { .. } => {
-            "protected_text_missing_placeholder_token".to_owned()
+        LanguageTextProjectionError::EmptyToken => {
+            TranslationPlaceholderProjectionFailure::EmptyToken
         }
-        LanguageTextProjectionError::RepeatedToken { .. } => {
-            "protected_text_repeats_placeholder_token".to_owned()
+        LanguageTextProjectionError::MissingToken { token } => {
+            TranslationPlaceholderProjectionFailure::MissingToken { token }
         }
-        LanguageTextProjectionError::OverlappingToken { .. } => {
-            "placeholder_tokens_overlap".to_owned()
+        LanguageTextProjectionError::RepeatedToken { token } => {
+            TranslationPlaceholderProjectionFailure::RepeatedToken { token }
         }
-        LanguageTextProjectionError::ChangedTokenOrder { position, .. } => {
-            format!("placeholder_token_order_changed; position={position}")
+        LanguageTextProjectionError::OverlappingToken { token } => {
+            TranslationPlaceholderProjectionFailure::OverlappingToken { token }
         }
+        LanguageTextProjectionError::ChangedTokenOrder {
+            position,
+            expected_token,
+            actual_token,
+        } => TranslationPlaceholderProjectionFailure::ChangedTokenOrder {
+            position,
+            expected_token,
+            actual_token,
+        },
         LanguageTextProjectionError::ChangedSegmentCount { expected, actual } => {
-            format!("segment_count_changed; expected={expected}; actual={actual}")
+            TranslationPlaceholderProjectionFailure::ChangedSegmentCount { expected, actual }
         }
         LanguageTextProjectionError::ChangedSegmentKind { segment_index } => {
-            format!("segment_kind_changed; segment={segment_index}")
+            TranslationPlaceholderProjectionFailure::ChangedSegmentKind { segment_index }
         }
         LanguageTextProjectionError::MissingOrderedToken { segment_index } => {
-            format!("ordered_token_missing; segment={segment_index}")
+            TranslationPlaceholderProjectionFailure::MissingOrderedToken { segment_index }
         }
-        LanguageTextProjectionError::UnusedOrderedToken => "ordered_token_unused".to_owned(),
+        LanguageTextProjectionError::UnusedOrderedToken => {
+            TranslationPlaceholderProjectionFailure::UnusedOrderedToken
+        }
     }
 }
 
@@ -2019,7 +2077,10 @@ pub(crate) enum RpgMakerTranslationTaskPlanningError<R, C> {
     ReadResources(R),
     PrepareResourcesCompute(CpuTaskExecutionError<C>),
     CompilePlaceholdersCompute(CpuTaskExecutionError<C>),
-    InvalidPlaceholderRules(PlaceholderRuleCompilationError),
+    InvalidPlaceholderRules {
+        origin: super::pipeline::TranslationPlaceholderRuleSource,
+        source: PlaceholderRuleCompilationError,
+    },
     PrepareCorpusCompute(CpuTaskExecutionError<C>),
     InvalidCorpus(CorpusPlanningError),
     PreprocessScopesCompute(CpuTaskExecutionError<C>),
@@ -2057,7 +2118,9 @@ impl<R: fmt::Display, C: fmt::Display> fmt::Display for RpgMakerTranslationTaskP
             Self::CompilePlaceholdersCompute(source) => {
                 write!(formatter, "无法调度占位符规则编译：{source}")
             }
-            Self::InvalidPlaceholderRules(source) => write!(formatter, "占位符规则无效：{source}"),
+            Self::InvalidPlaceholderRules { source, .. } => {
+                write!(formatter, "占位符规则无效：{source}")
+            }
             Self::PrepareCorpusCompute(source) => {
                 write!(formatter, "无法调度 RPG Maker 语料排序：{source}")
             }
@@ -2099,7 +2162,7 @@ impl<R: Error + 'static, C: Error + 'static> Error for RpgMakerTranslationTaskPl
             Self::ReadResources(source) => Some(source),
             Self::PrepareResourcesCompute(source) => Some(source),
             Self::CompilePlaceholdersCompute(source) => Some(source),
-            Self::InvalidPlaceholderRules(source) => Some(source),
+            Self::InvalidPlaceholderRules { source, .. } => Some(source),
             Self::PrepareCorpusCompute(source) => Some(source),
             Self::InvalidCorpus(source) => Some(source),
             Self::PreprocessScopesCompute(source) => Some(source),
@@ -2115,698 +2178,311 @@ impl<R: Error + 'static, C: Error + 'static> Error for RpgMakerTranslationTaskPl
     }
 }
 
-impl<R, C> SafeDiagnosticSource for RpgMakerTranslationTaskPlanningError<R, C>
-where
-    R: SafeDiagnosticSource,
-    CpuTaskExecutionError<C>: SafeDiagnosticSource,
-{
-    fn safe_diagnostic_source(
-        &self,
-        stage: DiagnosticStage,
-        impact: DiagnosticImpact,
-        _fallback_action: DiagnosticAction,
-    ) -> SafeDiagnostic {
+type ProductionPlanningResourceError =
+    TranslationPlanningResourceReadingError<SystemFileSystemError, CpuExecutorUnavailable>;
+
+impl RpgMakerTranslationTaskPlanningError<ProductionPlanningResourceError, CpuExecutorUnavailable> {
+    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
         match self {
             Self::ResolvedLanguagePairMismatch {
                 project_source,
                 project_target,
                 resolved_source,
                 resolved_target,
-            } => SafeDiagnostic::new(
-                DiagnosticCode::ConfigurationInvalidValue,
-                stage,
-                DiagnosticSubject::field("rpg_maker.translation.language_pair"),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::ConflictingValues,
-                    format!(
-                        "project={project_source}->{project_target}; resolved={resolved_source}->{resolved_target}"
-                    ),
-                ),
-                impact,
-                DiagnosticAction::FixConfiguration,
+            } => rpg_maker_planning_report(
+                RpgMakerTranslationPlanningProblem::LanguagePairMismatch {
+                    project_source: SafeIdentifier::new(project_source).ok(),
+                    project_target: SafeIdentifier::new(project_target).ok(),
+                    resolved_source: SafeIdentifier::new(resolved_source).ok(),
+                    resolved_target: SafeIdentifier::new(resolved_target).ok(),
+                },
             ),
-            Self::ReadResources(source) => {
-                source.safe_diagnostic_source(stage, impact, DiagnosticAction::FixInput)
+            Self::ReadResources(source) => source.diagnostic_report(),
+            Self::PrepareResourcesCompute(source) => {
+                planner_cpu_report(source, RuntimeOperation::PrepareRpgMakerPlanningResources)
             }
-            Self::PrepareResourcesCompute(source) => planning_cpu_diagnostic(
-                source,
-                stage,
-                impact,
-                "prepare_translation_planning_context",
-                None,
-            ),
             Self::CompilePlaceholdersCompute(source) => {
-                planning_cpu_diagnostic(source, stage, impact, "compile_placeholder_rules", None)
+                planner_cpu_report(source, RuntimeOperation::CompileRpgMakerCustomPlaceholders)
             }
-            Self::InvalidPlaceholderRules(source) => {
-                placeholder_compilation_diagnostic(source, stage, impact)
-            }
+            Self::InvalidPlaceholderRules { origin, source } => DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::translation(TranslationIssue::PlaceholderCompilation {
+                    origin: planning_placeholder_origin(origin),
+                    problem: source.diagnostic_problem(),
+                }),
+            ),
             Self::PrepareCorpusCompute(source) => {
-                planning_cpu_diagnostic(source, stage, impact, "prepare_translation_corpus", None)
+                planner_cpu_report(source, RuntimeOperation::PrepareRpgMakerTranslationCorpus)
             }
-            Self::InvalidCorpus(source) => SafeDiagnostic::new(
-                DiagnosticCode::ProjectState,
-                stage,
-                DiagnosticSubject::operation("rpg_maker_translation_corpus"),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::StateMismatch,
-                    source.to_string(),
-                ),
-                impact,
-                DiagnosticAction::CheckProjectState,
-            ),
-            Self::PreprocessScopesCompute(source) => planning_cpu_diagnostic(
+            Self::InvalidCorpus(source) => rpg_maker_planning_report(corpus_problem(source)),
+            Self::PreprocessScopesCompute(source) => planner_cpu_report(
                 source,
-                stage,
-                impact,
-                "preprocess_translation_scopes",
-                None,
+                RuntimeOperation::PreprocessRpgMakerTranslationScopes,
             ),
-            Self::InvalidScopePreprocessing { scope, source } => SafeDiagnostic::new(
-                DiagnosticCode::InternalOperation,
-                stage,
-                DiagnosticSubject::operation("translation_scope_preprocessing"),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::InternalInvariant,
-                    scope_preprocessing_detail(source),
-                ),
-                impact,
-                DiagnosticAction::ReportBug,
-            )
-            .with_recovery(RecoveryFact::component(format!(
-                "scope={}",
-                safe_scope_label(scope)
-            ))),
-            Self::DeduplicateCompute(source) => planning_cpu_diagnostic(
+            Self::InvalidScopePreprocessing { scope, source } => {
+                rpg_maker_planning_report(scope_preprocessing_problem(scope, source))
+            }
+            Self::DeduplicateCompute(source) => planner_cpu_report(
                 source,
-                stage,
-                impact,
-                "deduplicate_translation_corpus",
-                None,
+                RuntimeOperation::DeduplicateRpgMakerTranslationCorpus,
             ),
-            Self::StartDeduplicationWorker { operation, source } => SafeDiagnostic::io(
-                DiagnosticCode::InternalOperation,
-                stage,
-                DiagnosticSubject::operation("deduplicate_translation_corpus"),
-                "spawn_worker",
-                source,
-                impact,
-                DiagnosticAction::Retry,
-            )
-            .with_recovery(RecoveryFact::component(*operation)),
+            Self::StartDeduplicationWorker { source, .. } => DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::runtime(RuntimeIssue::Io {
+                    component: RuntimeComponent::CpuExecutor,
+                    operation: RuntimeOperation::DeduplicateRpgMakerTranslationCorpus,
+                    failure: IoFailure::from_error(source),
+                }),
+            ),
             Self::PlanScopesCompute(source) => {
-                planning_cpu_diagnostic(source, stage, impact, "plan_translation_scopes", None)
+                planner_cpu_report(source, RuntimeOperation::PlanRpgMakerTranslationScopes)
             }
-            Self::FinalizePlanCompute(source) => planning_cpu_diagnostic(
-                source,
-                stage,
-                impact,
-                "finalize_translation_task_order",
-                None,
-            ),
-            Self::TaskPlanning(source) => SafeDiagnostic::new(
-                if source.is_cancelled() {
-                    DiagnosticCode::CommandInput
-                } else {
-                    DiagnosticCode::InternalOperation
-                },
-                stage,
-                DiagnosticSubject::operation("task_block_planning"),
-                DiagnosticReason::failure_with_detail(
-                    if source.is_cancelled() {
-                        DiagnosticFailureKind::LockCancelled
-                    } else {
-                        DiagnosticFailureKind::InternalInvariant
-                    },
-                    source.to_string(),
-                ),
-                impact,
-                if source.is_cancelled() {
-                    DiagnosticAction::Retry
-                } else {
-                    DiagnosticAction::ReportBug
-                },
-            ),
-            Self::InvalidOutputContract(source) => SafeDiagnostic::new(
-                DiagnosticCode::InternalOperation,
-                stage,
-                source.diagnostic_subject(),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::InternalInvariant,
-                    source.safe_detail(),
-                ),
-                impact,
-                DiagnosticAction::ReportBug,
-            ),
-        }
-    }
-}
-
-impl<F, C> SafeDiagnosticSource for TranslationPlanningResourceReadingError<F, C>
-where
-    F: SafeDiagnosticSource,
-    CpuTaskExecutionError<C>: SafeDiagnosticSource,
-{
-    fn safe_diagnostic_source(
-        &self,
-        stage: DiagnosticStage,
-        impact: DiagnosticImpact,
-        _fallback_action: DiagnosticAction,
-    ) -> SafeDiagnostic {
-        match self {
-            Self::Cancelled => SafeDiagnostic::new(
-                DiagnosticCode::CommandInput,
-                stage,
-                DiagnosticSubject::operation("translation_planning_resources"),
-                DiagnosticReason::failure(DiagnosticFailureKind::LockCancelled),
-                impact,
-                DiagnosticAction::Retry,
-            ),
-            Self::ReadTerminology { source, .. } => {
-                read_planning_resource_diagnostic(source, stage, impact, "terminology")
+            Self::FinalizePlanCompute(source) => {
+                planner_cpu_report(source, RuntimeOperation::FinalizeRpgMakerTranslationPlan)
             }
-            Self::ReadPlaceholderRules { source, .. } => {
-                read_planning_resource_diagnostic(source, stage, impact, "placeholder_rules")
-            }
-            Self::ParseTerminologyCompute { path, source } => planning_resource_cpu_diagnostic(
-                source,
-                path.as_deref(),
-                stage,
-                impact,
-                "parse_terminology",
+            Self::TaskPlanning(source) => DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::translation(TranslationIssue::TaskPlanning {
+                    problem: task_planning_problem(source),
+                }),
             ),
-            Self::InvalidTerminology { path, source } => {
-                terminology_definition_diagnostic(path.as_deref(), source, stage, impact)
-            }
-            Self::ParsePlaceholderRulesCompute { path, source } => {
-                planning_resource_cpu_diagnostic(
-                    source,
-                    path.as_deref(),
-                    stage,
-                    impact,
-                    "parse_placeholder_rules",
-                )
-            }
-            Self::InvalidPlaceholderRules { path, source } => {
-                placeholder_definition_diagnostic(path.as_deref(), source, stage, impact)
+            Self::InvalidOutputContract(source) => {
+                rpg_maker_planning_report(output_contract_problem(source))
             }
         }
     }
-}
 
-fn planning_cpu_diagnostic<C>(
-    source: &CpuTaskExecutionError<C>,
-    stage: DiagnosticStage,
-    impact: DiagnosticImpact,
-    operation: &'static str,
-    scope: Option<&RpgMakerSemanticScopeKey>,
-) -> SafeDiagnostic
-where
-    CpuTaskExecutionError<C>: SafeDiagnosticSource,
-{
-    let mut diagnostic = source
-        .safe_diagnostic_source(stage, impact, DiagnosticAction::Retry)
-        .with_recovery(RecoveryFact::component(operation));
-    if let Some(scope) = scope {
-        diagnostic = diagnostic.with_recovery(RecoveryFact::component(format!(
-            "scope={}",
-            safe_scope_label(scope)
-        )));
-    }
-    diagnostic
-}
-
-fn planning_resource_cpu_diagnostic<C>(
-    source: &CpuTaskExecutionError<C>,
-    path: Option<&std::path::Path>,
-    stage: DiagnosticStage,
-    impact: DiagnosticImpact,
-    operation: &'static str,
-) -> SafeDiagnostic
-where
-    CpuTaskExecutionError<C>: SafeDiagnosticSource,
-{
-    let mut diagnostic = planning_cpu_diagnostic(source, stage, impact, operation, None);
-    if let Some(path) = path {
-        diagnostic.subject = DiagnosticSubject::path(path);
-    } else {
-        diagnostic = diagnostic.with_recovery(RecoveryFact::component("project_resource_snapshot"));
-    }
-    diagnostic
-}
-
-fn read_planning_resource_diagnostic<F>(
-    source: &ReadFileError<F>,
-    stage: DiagnosticStage,
-    impact: DiagnosticImpact,
-    resource: &'static str,
-) -> SafeDiagnostic
-where
-    F: SafeDiagnosticSource,
-{
-    match source {
-        ReadFileError::NotFound { path } => SafeDiagnostic::new(
-            DiagnosticCode::CommandInput,
-            stage,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
-            impact,
-            DiagnosticAction::CheckPathAndPermissions,
-        )
-        .with_recovery(RecoveryFact::component(resource)),
-        ReadFileError::NotFile { path } => SafeDiagnostic::new(
-            DiagnosticCode::CommandInput,
-            stage,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::InvalidValue,
-                "path_is_not_a_regular_file",
-            ),
-            impact,
-            DiagnosticAction::CheckPathAndPermissions,
-        )
-        .with_recovery(RecoveryFact::component(resource)),
-        ReadFileError::Io { path, source } => {
-            let mut diagnostic = source.safe_diagnostic_source(
-                stage,
-                impact,
-                DiagnosticAction::CheckPathAndPermissions,
-            );
-            diagnostic.subject = DiagnosticSubject::path(path);
-            diagnostic.with_recovery(RecoveryFact::component(resource))
-        }
+    pub(crate) fn into_reported_failure(self) -> ReportedFailure {
+        let report = self.diagnostic_report();
+        ReportedFailure::new(report, self)
     }
 }
 
-fn terminology_definition_diagnostic(
-    path: Option<&std::path::Path>,
-    source: &TerminologyDefinitionError,
-    stage: DiagnosticStage,
-    impact: DiagnosticImpact,
-) -> SafeDiagnostic {
-    match source {
-        TerminologyDefinitionError::Cancelled => SafeDiagnostic::new(
-            DiagnosticCode::CommandInput,
-            stage,
-            DiagnosticSubject::operation("terminology"),
-            DiagnosticReason::failure(DiagnosticFailureKind::LockCancelled),
-            impact,
-            DiagnosticAction::Retry,
-        ),
-        TerminologyDefinitionError::StartWorker { operation, source } => {
-            resource_definition_diagnostic(
-                path,
-                "terminology",
-                DiagnosticReason::io(*operation, source),
-                stage,
-                impact,
-                true,
-            )
-        }
-        TerminologyDefinitionError::InvalidUtf8(source) => resource_definition_diagnostic(
-            path,
-            "terminology",
-            DiagnosticReason::InvalidUtf8 {
-                valid_up_to: usize_as_u64(source.valid_up_to()),
-                error_len: source.error_len().map(usize_as_u64),
-            },
-            stage,
-            impact,
-            false,
-        ),
-        TerminologyDefinitionError::InvalidToml(source) => resource_definition_diagnostic(
-            path,
-            "terminology",
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::InvalidSyntax,
-                toml_error_detail(source),
-            ),
-            stage,
-            impact,
-            false,
-        ),
-        TerminologyDefinitionError::InvalidSnapshot(source) => resource_definition_diagnostic(
-            path,
-            "terminology",
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::StateMismatch,
-                format!("invalid_snapshot_json; {}", serde_json_error_detail(source)),
-            ),
-            stage,
-            impact,
-            false,
-        ),
-        TerminologyDefinitionError::EncodeSnapshot(source) => resource_definition_diagnostic(
-            path,
-            "terminology",
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::InternalInvariant,
-                format!(
-                    "encode_snapshot_failed; {}",
-                    serde_json_error_detail(source)
-                ),
-            ),
-            stage,
-            impact,
-            true,
-        ),
-        TerminologyDefinitionError::BlankField {
-            entry_number,
-            field,
-        } => resource_definition_diagnostic(
-            path,
-            "terminology",
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::InvalidValue,
-                format!("blank_field; entry={entry_number}; field={field}"),
-            ),
-            stage,
-            impact,
-            false,
-        ),
-        TerminologyDefinitionError::SurroundingWhitespace {
-            entry_number,
-            field,
-        } => resource_definition_diagnostic(
-            path,
-            "terminology",
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::InvalidValue,
-                format!("surrounding_whitespace; entry={entry_number}; field={field}"),
-            ),
-            stage,
-            impact,
-            false,
-        ),
-        TerminologyDefinitionError::ControlCharacter {
-            entry_number,
-            field,
-            character,
-        } => resource_definition_diagnostic(
-            path,
-            "terminology",
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::InvalidValue,
-                format!(
-                    "control_character; entry={entry_number}; field={field}; codepoint=U+{:04X}",
-                    u32::from(*character)
-                ),
-            ),
-            stage,
-            impact,
-            false,
-        ),
-        TerminologyDefinitionError::EmptyTriggers { entry_number } => {
-            resource_definition_diagnostic(
-                path,
-                "terminology",
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::InvalidValue,
-                    format!("empty_triggers; entry={entry_number}"),
-                ),
-                stage,
-                impact,
-                false,
-            )
-        }
-        TerminologyDefinitionError::DuplicateTerm { .. } => resource_definition_diagnostic(
-            path,
-            "terminology",
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::ConflictingValues,
-                "duplicate_term",
-            ),
-            stage,
-            impact,
-            false,
-        ),
-        TerminologyDefinitionError::DuplicateTrigger { .. } => resource_definition_diagnostic(
-            path,
-            "terminology",
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::ConflictingValues,
-                "duplicate_trigger",
-            ),
-            stage,
-            impact,
-            false,
-        ),
-        TerminologyDefinitionError::CompileMatcher(_) => resource_definition_diagnostic(
-            path,
-            "terminology",
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::InvalidValue,
-                "terminology_matcher_build_failed",
-            ),
-            stage,
-            impact,
-            false,
-        ),
-    }
-}
-
-fn placeholder_definition_diagnostic(
-    path: Option<&std::path::Path>,
-    source: &PlaceholderDefinitionError,
-    stage: DiagnosticStage,
-    impact: DiagnosticImpact,
-) -> SafeDiagnostic {
-    match source {
-        PlaceholderDefinitionError::Cancelled => SafeDiagnostic::new(
-            DiagnosticCode::CommandInput,
-            stage,
-            DiagnosticSubject::operation("placeholder_rules"),
-            DiagnosticReason::failure(DiagnosticFailureKind::LockCancelled),
-            impact,
-            DiagnosticAction::Retry,
-        ),
-        PlaceholderDefinitionError::StartWorker { operation, source } => {
-            resource_definition_diagnostic(
-                path,
-                "placeholder_rules",
-                DiagnosticReason::io(*operation, source),
-                stage,
-                impact,
-                true,
-            )
-        }
-        PlaceholderDefinitionError::InvalidUtf8(source) => resource_definition_diagnostic(
-            path,
-            "placeholder_rules",
-            DiagnosticReason::InvalidUtf8 {
-                valid_up_to: usize_as_u64(source.valid_up_to()),
-                error_len: source.error_len().map(usize_as_u64),
-            },
-            stage,
-            impact,
-            false,
-        ),
-        PlaceholderDefinitionError::InvalidToml(source) => resource_definition_diagnostic(
-            path,
-            "placeholder_rules",
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::InvalidSyntax,
-                toml_error_detail(source),
-            ),
-            stage,
-            impact,
-            false,
-        ),
-        PlaceholderDefinitionError::InvalidSnapshot(source) => resource_definition_diagnostic(
-            path,
-            "placeholder_rules",
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::StateMismatch,
-                format!("invalid_snapshot_json; {}", serde_json_error_detail(source)),
-            ),
-            stage,
-            impact,
-            false,
-        ),
-        PlaceholderDefinitionError::EncodeSnapshot(source) => resource_definition_diagnostic(
-            path,
-            "placeholder_rules",
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::InternalInvariant,
-                format!(
-                    "encode_snapshot_failed; {}",
-                    serde_json_error_detail(source)
-                ),
-            ),
-            stage,
-            impact,
-            true,
-        ),
-    }
-}
-
-fn resource_definition_diagnostic(
-    path: Option<&std::path::Path>,
-    resource: &'static str,
-    reason: DiagnosticReason,
-    stage: DiagnosticStage,
-    impact: DiagnosticImpact,
-    internal: bool,
-) -> SafeDiagnostic {
-    let external = path.is_some();
-    let code = if internal {
-        DiagnosticCode::InternalOperation
-    } else if external {
-        DiagnosticCode::CommandInput
-    } else {
-        DiagnosticCode::ProjectState
-    };
-    let action = if internal {
-        DiagnosticAction::ReportBug
-    } else if external {
-        DiagnosticAction::FixInput
-    } else {
-        DiagnosticAction::CheckProjectState
-    };
-    let subject = path.map_or_else(
-        || DiagnosticSubject::component(format!("project_{resource}_snapshot")),
-        DiagnosticSubject::path,
-    );
-    SafeDiagnostic::new(code, stage, subject, reason, impact, action)
-}
-
-fn placeholder_compilation_diagnostic(
-    source: &PlaceholderRuleCompilationError,
-    stage: DiagnosticStage,
-    impact: DiagnosticImpact,
-) -> SafeDiagnostic {
-    let (rule_number, detail) = match source {
-        PlaceholderRuleCompilationError::StartWorker { operation, source } => {
-            return SafeDiagnostic::io(
-                DiagnosticCode::InternalOperation,
-                stage,
-                DiagnosticSubject::operation("custom_placeholder_compile"),
-                *operation,
-                source,
-                impact,
-                DiagnosticAction::ReportBug,
-            );
-        }
-        PlaceholderRuleCompilationError::EmptyScopes { rule_number } => {
-            (*rule_number, "empty_scopes".to_owned())
-        }
-        PlaceholderRuleCompilationError::UnknownScope { rule_number, .. } => {
-            (*rule_number, "unknown_scope".to_owned())
-        }
-        PlaceholderRuleCompilationError::DuplicateScope { rule_number, .. } => {
-            (*rule_number, "duplicate_scope".to_owned())
-        }
-        PlaceholderRuleCompilationError::EmptyPattern { rule_number } => {
-            (*rule_number, "empty_pattern".to_owned())
-        }
-        PlaceholderRuleCompilationError::InvalidPattern {
-            rule_number,
-            source,
-        } => (
-            *rule_number,
-            format!(
-                "invalid_pcre2_pattern; kind={}; code={}; offset={:?}",
-                pcre2_error_kind(source),
-                source.code(),
-                source.offset()
-            ),
-        ),
-        PlaceholderRuleCompilationError::InvalidNamedCaptures {
-            rule_number,
-            captures,
-        } => (
-            *rule_number,
-            format!("invalid_named_capture_set; actual_count={}", captures.len()),
-        ),
-    };
-    SafeDiagnostic::new(
-        DiagnosticCode::CommandInput,
-        stage,
-        DiagnosticSubject::operation(format!("placeholder_rule_{rule_number}")),
-        DiagnosticReason::failure_with_detail(DiagnosticFailureKind::InvalidValue, detail),
-        impact,
-        DiagnosticAction::FixInput,
+fn rpg_maker_planning_report(problem: RpgMakerTranslationPlanningProblem) -> DiagnosticReport {
+    DiagnosticReport::new(
+        StateEffect::Unchanged,
+        Diagnostic::rpg_maker(RpgMakerIssue::translation_planning(problem)),
     )
 }
 
-pub(crate) fn scope_preprocessing_detail(source: &ScopePreprocessingError) -> String {
+fn planner_cpu_report(
+    source: &CpuTaskExecutionError<CpuExecutorUnavailable>,
+    operation: RuntimeOperation,
+) -> DiagnosticReport {
+    DiagnosticReport::new(StateEffect::Unchanged, source.diagnostic_for(operation))
+}
+
+fn planning_placeholder_origin(
+    source: &super::pipeline::TranslationPlaceholderRuleSource,
+) -> TranslationPlanningResourceOrigin {
+    match source {
+        super::pipeline::TranslationPlaceholderRuleSource::ExternalFile(path) => {
+            TranslationPlanningResourceOrigin::external(path)
+        }
+        super::pipeline::TranslationPlaceholderRuleSource::ProjectSnapshot => {
+            TranslationPlanningResourceOrigin::ProjectSnapshot
+        }
+    }
+}
+
+fn diagnostic_scope(scope: &RpgMakerSemanticScopeKey) -> RpgMakerDiagnosticScope {
+    match scope {
+        RpgMakerSemanticScopeKey::StandardDatabase(file) => {
+            RpgMakerDiagnosticScope::StandardDatabase {
+                file: SafeIdentifier::from_validated(file.file_name()),
+            }
+        }
+        RpgMakerSemanticScopeKey::DataFile(file) => RpgMakerDiagnosticScope::DataFile {
+            path: crate::diagnostic::SafePath::new(file.to_string()),
+        },
+        RpgMakerSemanticScopeKey::System => RpgMakerDiagnosticScope::System,
+        RpgMakerSemanticScopeKey::Map(map_id) => RpgMakerDiagnosticScope::Map {
+            map_id: u64::from(map_id.get()),
+        },
+        RpgMakerSemanticScopeKey::CommonEvent(event_id) => RpgMakerDiagnosticScope::CommonEvent {
+            event_id: *event_id,
+        },
+        RpgMakerSemanticScopeKey::Troop(troop_id) => RpgMakerDiagnosticScope::Troop {
+            troop_id: *troop_id,
+        },
+        RpgMakerSemanticScopeKey::Plugin { plugin_index, .. } => RpgMakerDiagnosticScope::Plugin {
+            plugin_index: *plugin_index,
+        },
+    }
+}
+
+fn corpus_problem(source: &CorpusPlanningError) -> RpgMakerTranslationPlanningProblem {
+    match source {
+        CorpusPlanningError::EmptySemanticScope { scope } => {
+            RpgMakerTranslationPlanningProblem::EmptySemanticScope {
+                scope: diagnostic_scope(scope),
+            }
+        }
+        CorpusPlanningError::EmptyGroup { scope, kind } => {
+            RpgMakerTranslationPlanningProblem::EmptyGroup {
+                scope: diagnostic_scope(scope),
+                group_kind: kind.diagnostic_group_kind(),
+            }
+        }
+    }
+}
+
+fn scope_preprocessing_problem(
+    scope: &RpgMakerSemanticScopeKey,
+    source: &ScopePreprocessingError,
+) -> RpgMakerTranslationPlanningProblem {
     match source {
         ScopePreprocessingError::StateLocation(source) => {
-            format!(
-                "encode_translation_state_location: {}",
-                location_codec_detail(source)
-            )
+            RpgMakerTranslationPlanningProblem::ScopeLocationCodec {
+                scope: diagnostic_scope(scope),
+                failure: source.diagnostic_failure(),
+            }
         }
-        ScopePreprocessingError::StateRole(source) => format!(
-            "encode_translation_state_role: {}",
-            projection_codec_detail(source)
-        ),
-        ScopePreprocessingError::SemanticOrder(source) => {
-            format!("encode_translation_semantic_order: {source}")
+        ScopePreprocessingError::StateRole(source) => {
+            RpgMakerTranslationPlanningProblem::ScopeProjectionCodec {
+                scope: diagnostic_scope(scope),
+                failure: source.diagnostic_failure(),
+            }
+        }
+        ScopePreprocessingError::SemanticOrder(_) => {
+            RpgMakerTranslationPlanningProblem::ScopeSemanticOrderLengthOverflow {
+                scope: diagnostic_scope(scope),
+            }
         }
     }
 }
 
-fn location_codec_detail(
-    source: &crate::rpg_maker::location_codec::RpgMakerLocationCodecError,
-) -> String {
-    source.safe_diagnostic_detail()
+fn task_planning_problem(source: &TaskPlanningError) -> TranslationTaskPlanningProblem {
+    match source {
+        TaskPlanningError::Cancelled => TranslationTaskPlanningProblem::Cancelled,
+        TaskPlanningError::EmptyScope => TranslationTaskPlanningProblem::EmptyScope,
+        TaskPlanningError::EmptyGroup => TranslationTaskPlanningProblem::EmptyGroup,
+        TaskPlanningError::UnitCountOverflow => TranslationTaskPlanningProblem::UnitCountOverflow,
+        TaskPlanningError::CharacterCountOverflow => {
+            TranslationTaskPlanningProblem::CharacterCountOverflow
+        }
+        TaskPlanningError::ResponsibilityCountMismatch { expected, actual } => {
+            TranslationTaskPlanningProblem::ResponsibilityCountMismatch {
+                expected: *expected,
+                actual: *actual,
+            }
+        }
+        TaskPlanningError::TaskIdOverflow => TranslationTaskPlanningProblem::TaskIdOverflow,
+    }
 }
 
-fn projection_codec_detail(
-    source: &crate::rpg_maker::location_codec::RpgMakerProjectionCodecError,
-) -> String {
-    source.safe_diagnostic_detail()
-}
-
-fn toml_error_detail(source: &toml::de::Error) -> String {
-    source.span().map_or_else(
-        || "invalid_toml".to_owned(),
-        |span| {
-            format!(
-                "invalid_toml; byte_start={}; byte_end={}",
-                span.start, span.end
-            )
+fn output_contract_problem(
+    source: &ExpectedTranslationOutputContractError,
+) -> RpgMakerTranslationPlanningProblem {
+    let violation = match source {
+        ExpectedTranslationOutputContractError::PropagationContextCountMismatch {
+            target_count,
+            context_count,
+            ..
+        } => RpgMakerOutputContractViolation::PropagationContextCountMismatch {
+            target_count: *target_count,
+            context_count: *context_count,
         },
-    )
-}
-
-fn serde_json_error_detail(source: &serde_json::Error) -> String {
-    let category = JsonErrorCategory::from(source);
-    format!(
-        "json_category={category}; line={}; column={}",
-        source.line(),
-        source.column()
-    )
-}
-
-fn pcre2_error_kind(source: &pcre2::Error) -> &'static str {
-    match source.kind() {
-        pcre2::ErrorKind::Compile => "compile",
-        pcre2::ErrorKind::JIT => "jit",
-        pcre2::ErrorKind::Match => "match",
-        pcre2::ErrorKind::Info => "info",
-        pcre2::ErrorKind::Option => "option",
-        _ => "unknown",
+        ExpectedTranslationOutputContractError::PlaceholderIndexInvalid { source, .. } => {
+            RpgMakerOutputContractViolation::PlaceholderIndexInvalid {
+                failure: language_projection_problem(source),
+            }
+        }
+        ExpectedTranslationOutputContractError::ProtectedPlaceholderMultisetMismatch {
+            kind,
+            ..
+        } => RpgMakerOutputContractViolation::ProtectedPlaceholderMultisetMismatch {
+            violation: match kind {
+                super::pipeline::PlaceholderMultisetErrorKind::Mismatch => {
+                    RpgMakerPlaceholderMultisetViolation::Mismatch
+                }
+                super::pipeline::PlaceholderMultisetErrorKind::Unexpected => {
+                    RpgMakerPlaceholderMultisetViolation::Unexpected
+                }
+                super::pipeline::PlaceholderMultisetErrorKind::OrderMismatch => {
+                    RpgMakerPlaceholderMultisetViolation::OrderMismatch
+                }
+            },
+        },
+        ExpectedTranslationOutputContractError::ProtectedPlaceholderCrossesLineBoundary {
+            placeholder_index,
+            ..
+        } => RpgMakerOutputContractViolation::ProtectedPlaceholderCrossesLineBoundary {
+            placeholder_index: *placeholder_index,
+        },
+        ExpectedTranslationOutputContractError::ProtectedLineCountMismatch {
+            expected,
+            actual,
+            ..
+        } => RpgMakerOutputContractViolation::ProtectedLineCountMismatch {
+            expected: *expected,
+            actual: *actual,
+        },
+        ExpectedTranslationOutputContractError::ScalarAlignedCountInvalid { actual, .. } => {
+            RpgMakerOutputContractViolation::ScalarAlignedCountInvalid { actual: *actual }
+        }
+        ExpectedTranslationOutputContractError::LinesAlignedCountMismatch {
+            expected,
+            actual,
+            ..
+        } => RpgMakerOutputContractViolation::LinesAlignedCountMismatch {
+            expected: *expected,
+            actual: *actual,
+        },
+    };
+    RpgMakerTranslationPlanningProblem::OutputContract {
+        task_id: source.diagnostic_task_id(),
+        unit: source.diagnostic_unit_locator(),
+        violation,
     }
 }
 
-fn safe_scope_label(scope: &RpgMakerSemanticScopeKey) -> String {
-    match scope {
-        RpgMakerSemanticScopeKey::StandardDatabase(file) => format!("data/{}", file.file_name()),
-        RpgMakerSemanticScopeKey::DataFile(file) => format!("data/{file}"),
-        RpgMakerSemanticScopeKey::System => "data/System.json".to_owned(),
-        RpgMakerSemanticScopeKey::Map(map_id) => format!("Map{:03}", map_id.get()),
-        RpgMakerSemanticScopeKey::CommonEvent(event_id) => format!("CommonEvent[{event_id}]"),
-        RpgMakerSemanticScopeKey::Troop(troop_id) => format!("Troop[{troop_id}]"),
-        RpgMakerSemanticScopeKey::Plugin { plugin_index, .. } => {
-            format!("Plugin[index={plugin_index}]")
+fn language_projection_problem(
+    source: &LanguageTextProjectionError,
+) -> RpgMakerPlaceholderProjectionProblem {
+    match source {
+        LanguageTextProjectionError::TokenIndexConstruction => {
+            RpgMakerPlaceholderProjectionProblem::TokenIndexConstruction
+        }
+        LanguageTextProjectionError::EmptyToken => RpgMakerPlaceholderProjectionProblem::EmptyToken,
+        LanguageTextProjectionError::MissingToken { token } => {
+            RpgMakerPlaceholderProjectionProblem::missing_token(token)
+        }
+        LanguageTextProjectionError::RepeatedToken { token } => {
+            RpgMakerPlaceholderProjectionProblem::repeated_token(token)
+        }
+        LanguageTextProjectionError::OverlappingToken { token } => {
+            RpgMakerPlaceholderProjectionProblem::overlapping_token(token)
+        }
+        LanguageTextProjectionError::ChangedTokenOrder {
+            position,
+            expected_token,
+            actual_token,
+        } => RpgMakerPlaceholderProjectionProblem::changed_token_order(
+            *position,
+            expected_token,
+            actual_token,
+        ),
+        LanguageTextProjectionError::ChangedSegmentCount { expected, actual } => {
+            RpgMakerPlaceholderProjectionProblem::ChangedSegmentCount {
+                expected: *expected,
+                actual: *actual,
+            }
+        }
+        LanguageTextProjectionError::ChangedSegmentKind { segment_index } => {
+            RpgMakerPlaceholderProjectionProblem::ChangedSegmentKind {
+                segment_index: *segment_index,
+            }
+        }
+        LanguageTextProjectionError::MissingOrderedToken { segment_index } => {
+            RpgMakerPlaceholderProjectionProblem::MissingOrderedToken {
+                segment_index: *segment_index,
+            }
+        }
+        LanguageTextProjectionError::UnusedOrderedToken => {
+            RpgMakerPlaceholderProjectionProblem::UnusedOrderedToken
         }
     }
-}
-
-fn usize_as_u64(value: usize) -> u64 {
-    u64::try_from(value).expect("当前目标平台的 usize 必须可表示为 u64")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2875,8 +2551,6 @@ mod tests {
 
     use crate::rpg_maker::model::{ScalarFieldKey, TextUnitContent, TextUnitRole};
     use crate::rpg_maker::text::{RpgMakerLocation, RpgMakerLocationStep};
-    use crate::runtime::cpu::CpuExecutorUnavailable;
-    use crate::runtime::filesystem::SystemFileSystemError;
     use crate::storage::file_system::{FileReader, ReadFile, ReadFileError};
 
     use super::*;
@@ -2889,6 +2563,7 @@ mod tests {
         ResolvedRpgMakerTranslationResources, RpgMakerSystemPrompt,
         RpgMakerTranslationPlanningConfiguration, RpgMakerTranslationProfile,
     };
+    use crate::translation::placeholder::{PlaceholderRuleOrigin, PlaceholderWorkerOperation};
     use crate::translation::planning_resource::{
         TranslationPlanningResourceReadingService, TranslationPlanningResources,
     };
@@ -2924,11 +2599,6 @@ mod tests {
     }
 
     impl Error for FakeError {}
-
-    type ProductionResourceError =
-        TranslationPlanningResourceReadingError<SystemFileSystemError, CpuExecutorUnavailable>;
-    type ProductionPlanningError =
-        RpgMakerTranslationTaskPlanningError<ProductionResourceError, CpuExecutorUnavailable>;
 
     #[test]
     fn cancellable_global_semantics_preserves_fingerprint_and_observes_chunks() {
@@ -3187,162 +2857,6 @@ mod tests {
                 "owner、Group/Unit 顺序、兄弟原文和 source context 都必须属于完整 Group 语境"
             );
         }
-    }
-
-    #[test]
-    fn planning_diagnostic_preserves_resource_path_and_utf8_offset() {
-        let invalid_bytes = vec![0xff];
-        let invalid_utf8 = std::str::from_utf8(&invalid_bytes).expect_err("测试字节必须不是 UTF-8");
-        let error: ProductionPlanningError = RpgMakerTranslationTaskPlanningError::ReadResources(
-            TranslationPlanningResourceReadingError::InvalidTerminology {
-                path: Some(PathBuf::from("C:/game/terms.toml")),
-                source: TerminologyDefinitionError::InvalidUtf8(invalid_utf8),
-            },
-        );
-
-        let diagnostic = error.safe_diagnostic_source(
-            DiagnosticStage::Translate,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixInput,
-        );
-
-        assert!(matches!(
-            diagnostic.subject,
-            DiagnosticSubject::Path { ref path } if path.ends_with("terms.toml")
-        ));
-        assert_eq!(
-            diagnostic.reason,
-            DiagnosticReason::InvalidUtf8 {
-                valid_up_to: 0,
-                error_len: Some(1),
-            }
-        );
-        assert_eq!(diagnostic.action, DiagnosticAction::FixInput);
-    }
-
-    #[test]
-    fn planning_diagnostic_uses_stable_resource_facts_and_preserves_rule_number() {
-        let sentinel = "TRANSLATION_RESOURCE_VALUE_SENTINEL";
-        let terminology: ProductionPlanningError =
-            RpgMakerTranslationTaskPlanningError::ReadResources(
-                TranslationPlanningResourceReadingError::InvalidTerminology {
-                    path: Some(PathBuf::from("C:/game/terms.toml")),
-                    source: TerminologyDefinitionError::DuplicateTerm {
-                        term: sentinel.to_owned(),
-                    },
-                },
-            );
-        let terminology = terminology.safe_diagnostic_source(
-            DiagnosticStage::Translate,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixInput,
-        );
-        assert!(!terminology.reason.render().contains(sentinel));
-        assert!(terminology.reason.render().contains("duplicate_term"));
-
-        let placeholder: ProductionPlanningError =
-            RpgMakerTranslationTaskPlanningError::InvalidPlaceholderRules(
-                PlaceholderRuleCompilationError::UnknownScope {
-                    rule_number: 7,
-                    scope: sentinel.to_owned(),
-                },
-            );
-        let placeholder = placeholder.safe_diagnostic_source(
-            DiagnosticStage::Translate,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixInput,
-        );
-        assert!(matches!(
-            placeholder.subject,
-            DiagnosticSubject::Operation { ref name } if name == "placeholder_rule_7"
-        ));
-        assert!(!placeholder.reason.render().contains(sentinel));
-        assert!(placeholder.reason.render().contains("unknown_scope"));
-    }
-
-    #[test]
-    fn planning_diagnostic_preserves_cpu_cancellation() {
-        let cancelled: ProductionPlanningError =
-            RpgMakerTranslationTaskPlanningError::PrepareCorpusCompute(
-                CpuTaskExecutionError::Cancelled,
-            );
-        let cancelled = cancelled.safe_diagnostic_source(
-            DiagnosticStage::Translate,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::Retry,
-        );
-        assert!(matches!(
-            cancelled.reason,
-            DiagnosticReason::Failure {
-                failure: DiagnosticFailureKind::LockCancelled
-            }
-        ));
-    }
-
-    #[test]
-    fn invalid_output_contract_is_a_safe_planner_failure() {
-        let sentinel = "PLANNER_PLACEHOLDER_TOKEN_SENTINEL";
-        let identity = TranslationUnitIdentity::new(
-            RpgMakerAssetOwner::Builtin,
-            TextGroupKind::DatabaseEntry,
-            RpgMakerLocation::value(RpgMakerSource::map(9), vec![RpgMakerLocationStep::index(2)]),
-            TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法")),
-            TextUnitContent::Value("原文".to_owned()),
-            "{}",
-        );
-        let error: ProductionPlanningError =
-            RpgMakerTranslationTaskPlanningError::InvalidOutputContract(
-                ExpectedTranslationOutputContractError::placeholder_index_invalid(
-                    task_id(4),
-                    &identity,
-                    LanguageTextProjectionError::MissingToken {
-                        token: sentinel.to_owned(),
-                    },
-                ),
-            );
-
-        let diagnostic = error.safe_diagnostic_source(
-            DiagnosticStage::Translate,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::Retry,
-        );
-
-        assert_eq!(diagnostic.code, DiagnosticCode::InternalOperation);
-        assert_eq!(diagnostic.action, DiagnosticAction::ReportBug);
-        assert!(matches!(
-            diagnostic.subject,
-            DiagnosticSubject::Operation { ref name }
-                if name.contains("translation_output_contract")
-                    && name.contains("unit=4")
-                    && name.contains("owner=builtin")
-                    && name.contains("group_kind=database_entry")
-                    && name.contains("Map009.json[2]")
-                    && name.contains("role=name")
-        ));
-        assert!(
-            diagnostic
-                .reason
-                .render()
-                .contains("placeholder_index_invalid")
-        );
-        assert!(diagnostic.reason.render().contains("unit=4"));
-        assert!(diagnostic.reason.render().contains("owner=builtin"));
-        assert!(
-            diagnostic
-                .reason
-                .render()
-                .contains("group_kind=database_entry")
-        );
-        assert!(diagnostic.reason.render().contains("Map009.json[2]"));
-        assert!(diagnostic.reason.render().contains("role=name"));
-        assert!(
-            diagnostic
-                .reason
-                .render()
-                .contains("missing_required_placeholder_token")
-        );
-        assert!(!diagnostic.reason.render().contains(sentinel));
-        assert!(!format!("{error:?}").contains(sentinel));
     }
 
     impl LlmClientSemanticIdentity for () {
@@ -5633,8 +5147,240 @@ pattern = '保護対象'
         assert!(tasks.is_empty());
     }
 
+    #[test]
+    fn planning_failure_projection_preserves_typed_backend_fields() {
+        let cases = vec![
+            (
+                LanguageTextProjectionError::TokenIndexConstruction,
+                TranslationPlaceholderProjectionFailure::TokenIndexConstruction,
+            ),
+            (
+                LanguageTextProjectionError::EmptyToken,
+                TranslationPlaceholderProjectionFailure::EmptyToken,
+            ),
+            (
+                LanguageTextProjectionError::MissingToken {
+                    token: "<ATT_MISSING>".to_owned(),
+                },
+                TranslationPlaceholderProjectionFailure::MissingToken {
+                    token: "<ATT_MISSING>".to_owned(),
+                },
+            ),
+            (
+                LanguageTextProjectionError::RepeatedToken {
+                    token: "<ATT_REPEAT>".to_owned(),
+                },
+                TranslationPlaceholderProjectionFailure::RepeatedToken {
+                    token: "<ATT_REPEAT>".to_owned(),
+                },
+            ),
+            (
+                LanguageTextProjectionError::OverlappingToken {
+                    token: "<ATT_OVERLAP>".to_owned(),
+                },
+                TranslationPlaceholderProjectionFailure::OverlappingToken {
+                    token: "<ATT_OVERLAP>".to_owned(),
+                },
+            ),
+            (
+                LanguageTextProjectionError::ChangedTokenOrder {
+                    position: 3,
+                    expected_token: "<ATT_EXPECTED>".to_owned(),
+                    actual_token: "<ATT_ACTUAL>".to_owned(),
+                },
+                TranslationPlaceholderProjectionFailure::ChangedTokenOrder {
+                    position: 3,
+                    expected_token: "<ATT_EXPECTED>".to_owned(),
+                    actual_token: "<ATT_ACTUAL>".to_owned(),
+                },
+            ),
+            (
+                LanguageTextProjectionError::ChangedSegmentCount {
+                    expected: 5,
+                    actual: 4,
+                },
+                TranslationPlaceholderProjectionFailure::ChangedSegmentCount {
+                    expected: 5,
+                    actual: 4,
+                },
+            ),
+            (
+                LanguageTextProjectionError::ChangedSegmentKind { segment_index: 7 },
+                TranslationPlaceholderProjectionFailure::ChangedSegmentKind { segment_index: 7 },
+            ),
+            (
+                LanguageTextProjectionError::MissingOrderedToken { segment_index: 2 },
+                TranslationPlaceholderProjectionFailure::MissingOrderedToken { segment_index: 2 },
+            ),
+            (
+                LanguageTextProjectionError::UnusedOrderedToken,
+                TranslationPlaceholderProjectionFailure::UnusedOrderedToken,
+            ),
+        ];
+
+        for (source, expected) in cases {
+            assert_eq!(placeholder_projection_planning_failure(source), expected);
+        }
+    }
+
+    #[test]
+    fn planning_failure_protection_preserves_worker_fields() {
+        let worker_source = io::Error::from_raw_os_error(8);
+        let expected_io_kind = worker_source.kind();
+        assert_eq!(
+            placeholder_protection_planning_failure(PlaceholderProtectionError::StartWorker {
+                operation: PlaceholderWorkerOperation::MatchText,
+                source: worker_source,
+            }),
+            TranslationPlaceholderProtectionFailure::WorkerStart {
+                operation: PlaceholderWorkerOperation::MatchText,
+                io_kind: expected_io_kind,
+                raw_os_code: Some(8),
+            }
+        );
+    }
+
     #[tokio::test]
-    async fn placeholder_projection_failure_suppresses_its_complete_task_block_and_invalidates_old_translation()
+    async fn missing_text_capture_keeps_rule_range_and_unit_locator_without_source_body() {
+        let placeholder_path = PathBuf::from("C:/input/placeholders.toml");
+        let reader = TranslationPlanningResourceReadingService::new(
+            MemoryFileReader {
+                files: Arc::new(BTreeMap::from([(
+                    placeholder_path.clone(),
+                    r#"
+                        [[rule]]
+                        pattern = '(?:(?<text>保留)|欠落)'
+                    "#
+                    .as_bytes()
+                    .to_vec(),
+                )])),
+            },
+            ImmediateCpu,
+        );
+        let planner = RpgMakerTranslationTaskPlanningService::<_, _, ()>::new(
+            reader,
+            translation_resources(),
+            Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
+            ImmediateCpu,
+        );
+        let sensitive_source = "翻译欠落です";
+
+        let (_, preparation, tasks) = planner
+            .plan(
+                &project(),
+                &profile(10_000),
+                RpgMakerTranslationCorpus::new(vec![group(
+                    RpgMakerSource::data(StandardDataFile::Items),
+                    4,
+                    sensitive_source,
+                    None,
+                    Vec::new(),
+                )]),
+                RpgMakerTranslationInput::new(None, Some(placeholder_path)),
+            )
+            .await
+            .expect("缺少 text 捕获应形成规划失败")
+            .into_parts();
+
+        let [failure] = preparation.planning_failures() else {
+            panic!("应只保留一个规划失败")
+        };
+        assert_eq!(
+            failure.reason(),
+            &TranslationPlanningFailureReason::PlaceholderProtection {
+                failure: TranslationPlaceholderProtectionFailure::MissingTextCapture {
+                    rule_number: 1,
+                    whole_match_start_byte: "翻译".len(),
+                    whole_match_end_byte: "翻译欠落".len(),
+                },
+            }
+        );
+        assert_eq!(
+            failure.identity().group_location().source(),
+            &RpgMakerSource::data(StandardDataFile::Items)
+        );
+        assert_eq!(
+            failure.identity().role(),
+            &TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法"))
+        );
+        let diagnostic =
+            serde_json::to_value(failure.diagnostic_report()).expect("规划失败诊断必须可序列化");
+        assert_eq!(
+            diagnostic["primary"]["code"],
+            "translation.placeholder.missing_text_capture"
+        );
+        assert_eq!(
+            diagnostic["primary"]["issue"]["details"]["problem"]["rule_source"]["path"],
+            "C:/input/placeholders.toml"
+        );
+        assert_eq!(
+            diagnostic["primary"]["issue"]["details"]["problem"]["unit"]["role"]["field"],
+            "name"
+        );
+        assert!(!format!("{:?}", failure.reason()).contains(sensitive_source));
+        assert!(!diagnostic.to_string().contains(sensitive_source));
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_placeholder_match_keeps_rule_and_utf8_byte_range() {
+        let placeholder_path = PathBuf::from("C:/input/placeholders.toml");
+        let reader = TranslationPlanningResourceReadingService::new(
+            MemoryFileReader {
+                files: Arc::new(BTreeMap::from([(
+                    placeholder_path.clone(),
+                    r#"
+                        [[rule]]
+                        pattern = '(?=欠落)'
+                    "#
+                    .as_bytes()
+                    .to_vec(),
+                )])),
+            },
+            ImmediateCpu,
+        );
+        let planner = RpgMakerTranslationTaskPlanningService::<_, _, ()>::new(
+            reader,
+            translation_resources(),
+            Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
+            ImmediateCpu,
+        );
+
+        let (_, preparation, tasks) = planner
+            .plan(
+                &project(),
+                &profile(10_000),
+                RpgMakerTranslationCorpus::new(vec![group(
+                    RpgMakerSource::data(StandardDataFile::Items),
+                    4,
+                    "翻译欠落です",
+                    None,
+                    Vec::new(),
+                )]),
+                RpgMakerTranslationInput::new(None, Some(placeholder_path)),
+            )
+            .await
+            .expect("空匹配应形成规划失败")
+            .into_parts();
+
+        let [failure] = preparation.planning_failures() else {
+            panic!("应只保留一个规划失败")
+        };
+        let TranslationPlanningFailureReason::PlaceholderProtection {
+            failure: TranslationPlaceholderProtectionFailure::EmptyMatch { matched },
+        } = failure.reason()
+        else {
+            panic!("应保留类型化的 Placeholder 空匹配")
+        };
+        assert_eq!(matched.rule().origin(), PlaceholderRuleOrigin::Custom);
+        assert_eq!(matched.rule().rule_number(), Some(1));
+        assert_eq!(matched.start_byte(), "翻译".len());
+        assert_eq!(matched.end_byte(), "翻译".len());
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn placeholder_overlap_failure_suppresses_its_complete_task_block_and_invalidates_old_translation()
      {
         let placeholder_path = PathBuf::from("C:/input/placeholders.toml");
         let reader = TranslationPlanningResourceReadingService::new(
@@ -5686,10 +5432,31 @@ pattern = '保護対象'
             .into_parts();
 
         assert_eq!(preparation.planning_failures().len(), 1);
-        assert!(matches!(
-            preparation.planning_failures()[0].reason(),
-            TranslationPlanningFailureReason::PlaceholderProtection { .. }
-        ));
+        let TranslationPlanningFailureReason::PlaceholderProtection {
+            failure: TranslationPlaceholderProtectionFailure::OverlappingMatches { first, second },
+        } = preparation.planning_failures()[0].reason()
+        else {
+            panic!("应保留类型化的 Placeholder 重叠失败")
+        };
+        assert_eq!(first.rule().origin(), PlaceholderRuleOrigin::Custom);
+        assert_eq!(first.rule().rule_number(), Some(1));
+        assert_eq!(first.start_byte(), "翻译".len());
+        assert_eq!(first.end_byte(), "翻译<BAD>".len());
+        assert_eq!(second.rule().origin(), PlaceholderRuleOrigin::Custom);
+        assert_eq!(second.rule().rule_number(), Some(2));
+        assert_eq!(second.start_byte(), "翻译<".len());
+        assert_eq!(second.end_byte(), "翻译<BAD".len());
+        assert_eq!(
+            preparation.planning_failures()[0]
+                .identity()
+                .group_location()
+                .source(),
+            &RpgMakerSource::data(StandardDataFile::Items)
+        );
+        assert_eq!(
+            preparation.planning_failures()[0].identity().role(),
+            &TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法"))
+        );
         assert_eq!(preparation.invalidations().len(), 1);
         assert_eq!(preparation.invalidated(), 1);
         assert!(
@@ -5753,13 +5520,20 @@ pattern = '保護対象'
             .into_parts();
 
         assert_eq!(preparation.planning_failures().len(), 1);
-        assert_eq!(
-            preparation.planning_failures()[0].reason(),
-            &TranslationPlanningFailureReason::PlaceholderProtection {
-                message: "placeholder_crosses_line_boundary; rule=1; source_line_index=0"
-                    .to_owned(),
-            }
-        );
+        let TranslationPlanningFailureReason::PlaceholderProtection {
+            failure:
+                TranslationPlaceholderProtectionFailure::CrossesLineBoundary {
+                    matched,
+                    source_line_index,
+                },
+        } = preparation.planning_failures()[0].reason()
+        else {
+            panic!("应保留类型化的跨行 Placeholder 失败")
+        };
+        assert_eq!(matched.rule().origin(), PlaceholderRuleOrigin::Custom);
+        assert_eq!(matched.rule().rule_number(), Some(1));
+        assert_eq!(*source_line_index, 0);
+        assert!(matched.start_byte() < matched.end_byte());
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].expected_outputs().len(), 1);
         assert!(tasks[0].messages()[1].content().contains("正常な翻訳"));

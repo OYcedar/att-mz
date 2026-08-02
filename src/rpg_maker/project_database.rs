@@ -8,6 +8,13 @@ use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 
+use crate::diagnostic::{
+    Diagnostic, DiagnosticReport, RpgMakerDiagnosticStage, RpgMakerIssue,
+    RpgMakerLanguageIdViolation, RpgMakerProjectDefinitionStage,
+    RpgMakerProjectDefinitionViolation, RpgMakerProjectMetadataViolation, RpgMakerProjectProblem,
+    SafeIdentifier, SafePath, SafeText, SqliteDiagnosticContext, SqliteDiagnosticStage,
+    SqliteOperation, SqliteTransactionState, StateEffect,
+};
 use crate::fingerprint::{InvalidSha256FingerprintLength, Sha256Fingerprint};
 use crate::json_diagnostic::JsonErrorCategory;
 use crate::language::{LanguageId, LanguageIdError, LanguagePair};
@@ -16,6 +23,7 @@ use crate::rpg_maker::RpgMakerLayout;
 use crate::rpg_maker::asset::RpgMakerAssetOwner;
 use crate::rpg_maker::asset_storage::rpg_maker_asset_owner_order;
 use crate::rpg_maker::dialogue::{MvDialogueDefinition, MvDialogueDefinitionError};
+use crate::runtime::sqlite::SqliteRuntimeError;
 use crate::storage::sqlite::{
     CreateDatabaseError, ExecuteTransactionError, QueryExistingDatabaseError, SqliteCommand,
     SqliteDatabaseCreator, SqliteQuery, SqliteQueryExecutor, SqliteRow, SqliteTransactionExecutor,
@@ -70,6 +78,7 @@ pub(crate) const RPG_MAKER_MUTATION_CLAIM_TABLE_NAME: &str = "rpg_maker_mutation
 
 const CREATE_RPG_MAKER_TEXT_GROUP_TABLE: &str = r#"CREATE TABLE rpg_maker_text_group (
     owner                  TEXT NOT NULL CHECK (owner IN ('builtin', 'rules')),
+    group_id               INTEGER NOT NULL CHECK (group_id > 0),
     group_location         TEXT NOT NULL CHECK (length(group_location) > 0),
     semantic_order_key     BLOB NOT NULL CHECK (
         typeof(semantic_order_key) = 'blob'
@@ -87,14 +96,15 @@ const CREATE_RPG_MAKER_TEXT_GROUP_TABLE: &str = r#"CREATE TABLE rpg_maker_text_g
         'plugin_parameter'
     )),
     projection_recipe_json TEXT NOT NULL CHECK (length(projection_recipe_json) > 0),
-    PRIMARY KEY (owner, group_location),
+    PRIMARY KEY (owner, group_id),
+    UNIQUE (owner, group_location),
     UNIQUE (owner, semantic_order_key),
     FOREIGN KEY (owner) REFERENCES rpg_maker_asset_owner_state(owner) ON DELETE CASCADE
 )"#;
 
 const CREATE_RPG_MAKER_TEXT_UNIT_TABLE: &str = r#"CREATE TABLE rpg_maker_text_unit (
     owner                    TEXT NOT NULL CHECK (owner IN ('builtin', 'rules')),
-    group_location           TEXT NOT NULL CHECK (length(group_location) > 0),
+    group_id                 INTEGER NOT NULL CHECK (group_id > 0),
     unit_role                TEXT NOT NULL CHECK (length(unit_role) > 0),
     semantic_order_key       BLOB NOT NULL CHECK (
         typeof(semantic_order_key) = 'blob'
@@ -111,10 +121,10 @@ const CREATE_RPG_MAKER_TEXT_UNIT_TABLE: &str = r#"CREATE TABLE rpg_maker_text_un
     ),
     translation_content_json TEXT,
     translation_state        BLOB,
-    PRIMARY KEY (owner, group_location, unit_role),
+    PRIMARY KEY (owner, group_id, unit_role),
     UNIQUE (owner, semantic_order_key),
-    FOREIGN KEY (owner, group_location)
-        REFERENCES rpg_maker_text_group(owner, group_location) ON DELETE CASCADE,
+    FOREIGN KEY (owner, group_id)
+        REFERENCES rpg_maker_text_group(owner, group_id) ON DELETE CASCADE,
     CHECK (
         (translation_content_json IS NULL AND translation_state IS NULL)
         OR (
@@ -127,20 +137,22 @@ const CREATE_RPG_MAKER_TEXT_UNIT_TABLE: &str = r#"CREATE TABLE rpg_maker_text_un
     )
 )"#;
 
-pub(crate) const CREATE_RPG_MAKER_TEXT_UNIT_OWNER_GROUP_ORDER_INDEX: &str = "CREATE INDEX rpg_maker_text_unit_owner_group_order_idx ON rpg_maker_text_unit(owner, group_location, semantic_order_key)";
+pub(crate) const CREATE_RPG_MAKER_TEXT_UNIT_OWNER_GROUP_ORDER_INDEX: &str = "CREATE INDEX rpg_maker_text_unit_owner_group_order_idx ON rpg_maker_text_unit(owner, group_id, semantic_order_key)";
+pub(crate) const DROP_RPG_MAKER_TEXT_UNIT_OWNER_GROUP_ORDER_INDEX: &str =
+    "DROP INDEX rpg_maker_text_unit_owner_group_order_idx";
 
 const CREATE_RPG_MAKER_MUTATION_CLAIM_TABLE: &str = r#"CREATE TABLE rpg_maker_mutation_claim (
-    owner          TEXT NOT NULL CHECK (owner IN ('builtin', 'rules')),
-    group_location TEXT NOT NULL CHECK (length(group_location) > 0),
-    resource_key   TEXT NOT NULL CHECK (length(resource_key) > 0),
-    access         TEXT NOT NULL CHECK (access IN ('intent', 'exclusive')),
-    PRIMARY KEY (owner, group_location, resource_key),
-    FOREIGN KEY (owner, group_location)
-        REFERENCES rpg_maker_text_group(owner, group_location) ON DELETE CASCADE
+    owner        TEXT NOT NULL CHECK (owner IN ('builtin', 'rules')),
+    group_id     INTEGER NOT NULL CHECK (group_id > 0),
+    resource_key TEXT NOT NULL CHECK (length(resource_key) > 0),
+    access       TEXT NOT NULL CHECK (access IN ('intent', 'exclusive')),
+    PRIMARY KEY (owner, group_id, resource_key),
+    FOREIGN KEY (owner, group_id)
+        REFERENCES rpg_maker_text_group(owner, group_id) ON DELETE CASCADE
 )"#;
 
-pub(crate) const CREATE_RPG_MAKER_MUTATION_CLAIM_RESOURCE_INDEX: &str = "CREATE INDEX rpg_maker_mutation_claim_resource_idx ON rpg_maker_mutation_claim(resource_key, access, owner, group_location)";
-pub(crate) const CREATE_RPG_MAKER_MUTATION_CLAIM_OWNER_RESOURCE_INDEX: &str = "CREATE INDEX rpg_maker_mutation_claim_owner_resource_idx ON rpg_maker_mutation_claim(owner, resource_key, access, group_location)";
+pub(crate) const CREATE_RPG_MAKER_MUTATION_CLAIM_RESOURCE_INDEX: &str = "CREATE INDEX rpg_maker_mutation_claim_resource_idx ON rpg_maker_mutation_claim(resource_key, access, owner, group_id)";
+pub(crate) const CREATE_RPG_MAKER_MUTATION_CLAIM_OWNER_RESOURCE_INDEX: &str = "CREATE INDEX rpg_maker_mutation_claim_owner_resource_idx ON rpg_maker_mutation_claim(owner, resource_key, access, group_id)";
 pub(crate) const DROP_RPG_MAKER_MUTATION_CLAIM_RESOURCE_INDEX: &str =
     "DROP INDEX rpg_maker_mutation_claim_resource_idx";
 pub(crate) const DROP_RPG_MAKER_MUTATION_CLAIM_OWNER_RESOURCE_INDEX: &str =
@@ -241,7 +253,6 @@ const SELECT_QUICK_CHECK: &str = "PRAGMA quick_check";
 const SELECT_FOREIGN_KEY_CHECK: &str = "PRAGMA foreign_key_check";
 
 const PROJECT_RECORD_QUERY_ID: &str = "project_database.project_record";
-const PROJECT_RECORD_READ_STAGE: &str = "read_project_record";
 
 const UPDATE_METADATA: &str = r#"UPDATE metadata
 SET source_language = ?1,
@@ -620,12 +631,7 @@ where
             .query_existing_database(database_path.clone(), query)
             .await
             .map_err(|error| {
-                ProjectDatabaseReadError::from_executor(
-                    database_path.clone(),
-                    PROJECT_RECORD_READ_STAGE,
-                    query_id,
-                    error,
-                )
+                ProjectDatabaseReadError::from_executor(database_path.clone(), query_id, error)
             })?;
 
         record_from_rows(requested_name, layout, rows)
@@ -873,7 +879,6 @@ pub(crate) enum ProjectDatabaseReadError<E> {
     },
     ReadDatabase {
         path: PathBuf,
-        stage: &'static str,
         query_id: String,
         source: E,
     },
@@ -886,7 +891,6 @@ pub(crate) enum ProjectDatabaseReadError<E> {
 impl<E> ProjectDatabaseReadError<E> {
     fn from_executor(
         path: PathBuf,
-        stage: &'static str,
         query_id: String,
         error: QueryExistingDatabaseError<E>,
     ) -> Self {
@@ -894,7 +898,6 @@ impl<E> ProjectDatabaseReadError<E> {
             QueryExistingDatabaseError::NotFound => Self::DatabaseNotFound { path },
             QueryExistingDatabaseError::QueryFailed(source) => Self::ReadDatabase {
                 path,
-                stage,
                 query_id,
                 source,
             },
@@ -910,12 +913,11 @@ impl<E: fmt::Display> fmt::Display for ProjectDatabaseReadError<E> {
             }
             Self::ReadDatabase {
                 path,
-                stage,
                 query_id,
                 source,
             } => write!(
                 formatter,
-                "无法读取项目数据库 {}（阶段 {stage}，查询 {query_id}）：{source}",
+                "无法读取项目数据库 {}（查询 {query_id}）：{source}",
                 path.display()
             ),
             Self::InvalidMetadata { path, reason } => {
@@ -934,6 +936,56 @@ impl<E: Error + 'static> Error for ProjectDatabaseReadError<E> {
         match self {
             Self::ReadDatabase { source, .. } => Some(source),
             Self::DatabaseNotFound { .. } | Self::InvalidMetadata { .. } => None,
+        }
+    }
+}
+
+fn rpg_maker_project_report(
+    stage: RpgMakerDiagnosticStage,
+    effect: StateEffect,
+    problem: RpgMakerProjectProblem,
+) -> DiagnosticReport {
+    DiagnosticReport::new(
+        effect,
+        Diagnostic::rpg_maker(RpgMakerIssue::project(stage, problem)),
+    )
+}
+
+impl ProjectDatabaseReadError<SqliteRuntimeError> {
+    /// 打开现存项目时保留数据库路径、查询标识和 SQLite 数值类别。
+    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
+        match self {
+            Self::DatabaseNotFound { path } => rpg_maker_project_report(
+                RpgMakerDiagnosticStage::ProjectOpening,
+                StateEffect::Unchanged,
+                RpgMakerProjectProblem::DatabaseNotFound {
+                    path: SafePath::new(path),
+                },
+            ),
+            Self::ReadDatabase {
+                path,
+                query_id,
+                source,
+                ..
+            } => source.diagnostic_report_for_query(
+                path,
+                SqliteDiagnosticContext::new(
+                    SqliteDiagnosticStage::Project,
+                    SqliteOperation::Query,
+                    SqliteTransactionState::NotStarted,
+                ),
+                StateEffect::Unchanged,
+                query_id,
+                None,
+            ),
+            Self::InvalidMetadata { path, reason } => rpg_maker_project_report(
+                RpgMakerDiagnosticStage::ProjectOpening,
+                StateEffect::Unchanged,
+                RpgMakerProjectProblem::InvalidMetadata {
+                    path: SafePath::new(path),
+                    violation: reason.diagnostic_violation(),
+                },
+            ),
         }
     }
 }
@@ -982,61 +1034,161 @@ pub(crate) enum InvalidProjectMetadata {
 }
 
 impl InvalidProjectMetadata {
-    /// 只从 metadata 错误仍持有的类型化字段建立公开事实。
-    ///
-    /// 数据库中的定义正文、源文本以及底层错误 `Display` 均不会进入结果。
-    pub(crate) fn safe_fact(&self) -> String {
+    fn diagnostic_violation(&self) -> RpgMakerProjectMetadataViolation {
         match self {
-            Self::MissingRow => "metadata=missing_row".to_owned(),
-            Self::MultipleRows => "metadata=multiple_rows".to_owned(),
+            Self::MissingRow => RpgMakerProjectMetadataViolation::MissingRow,
+            Self::MultipleRows => RpgMakerProjectMetadataViolation::MultipleRows,
             Self::WrongColumnCount { expected, actual } => {
-                format!("metadata=wrong_column_count; expected={expected}; actual={actual}")
+                RpgMakerProjectMetadataViolation::WrongColumnCount {
+                    expected: metadata_usize_to_u64(*expected),
+                    actual: metadata_usize_to_u64(*actual),
+                }
             }
             Self::WrongColumnType {
                 column,
                 expected,
                 actual,
-            } => format!(
-                "metadata=wrong_column_type; column={column}; expected={expected}; actual={actual}"
-            ),
-            // ProjectName 当前只提供面向人的 String 错误；在它改为闭集类型前不能把该
-            // 任意文本误当作结构化诊断。字段身份仍保留，内部 Display 继续用于因果链。
-            Self::InvalidProjectName { .. } => {
-                "metadata=invalid_project_name; field=name".to_owned()
+            } => RpgMakerProjectMetadataViolation::WrongColumnType {
+                column: SafeIdentifier::from_validated(column),
+                expected: SafeIdentifier::from_validated(expected),
+                actual: SafeIdentifier::from_validated(actual),
+            },
+            Self::InvalidProjectName { .. } => RpgMakerProjectMetadataViolation::InvalidProjectName,
+            Self::NameMismatch { requested, stored } => {
+                RpgMakerProjectMetadataViolation::NameMismatch {
+                    requested: SafeText::new(requested),
+                    stored: SafeText::new(stored),
+                }
             }
-            Self::NameMismatch { requested, stored } => format!(
-                "metadata=name_mismatch; requested={}; stored={}",
-                crate::user_text::sanitize_user_text(requested),
-                crate::user_text::sanitize_user_text(stored)
-            ),
-            Self::InvalidLanguage { column, source } => format!(
-                "metadata=invalid_language; column={column}; {}",
-                language_id_failure_safe_fact(source)
-            ),
+            Self::InvalidLanguage { column, source } => {
+                RpgMakerProjectMetadataViolation::InvalidLanguage {
+                    column: SafeIdentifier::from_validated(column),
+                    violation: language_id_diagnostic_violation(source),
+                }
+            }
             Self::NonCanonicalLanguage {
                 column,
                 stored,
                 canonical,
-            } => format!(
-                "metadata=noncanonical_language; column={column}; stored={}; canonical={}",
-                crate::user_text::sanitize_user_text(stored),
-                crate::user_text::sanitize_user_text(canonical)
-            ),
+            } => RpgMakerProjectMetadataViolation::NonCanonicalLanguage {
+                column: SafeIdentifier::from_validated(column),
+                stored: SafeText::new(stored),
+                canonical: SafeText::new(canonical),
+            },
             Self::InvalidLineWidth { column, actual } => {
-                format!(
-                    "metadata=invalid_line_width; column={column}; expected=positive_u32; actual={actual}"
-                )
+                RpgMakerProjectMetadataViolation::InvalidLineWidth {
+                    column: SafeIdentifier::from_validated(column),
+                    actual: *actual,
+                }
             }
-            Self::InvalidSourceSnapshotFingerprintLength { actual } => format!(
-                "metadata=invalid_source_fingerprint_length; field=source_snapshot_fingerprint; expected=32; actual={actual}"
-            ),
-            Self::InvalidDialogueDefinition { stage, failure } => format!(
-                "metadata=invalid_dialogue_definition; definition={}; stage={}; {}",
-                ProjectDefinitionKind::MvDialogueRules.storage_name(),
-                stage.as_str(),
-                project_definition_failure_safe_fact(failure)
-            ),
+            Self::InvalidSourceSnapshotFingerprintLength { actual } => {
+                RpgMakerProjectMetadataViolation::InvalidSourceSnapshotFingerprintLength {
+                    expected: 32,
+                    actual: metadata_usize_to_u64(*actual),
+                }
+            }
+            Self::InvalidDialogueDefinition { stage, failure } => {
+                RpgMakerProjectMetadataViolation::InvalidDialogueDefinition {
+                    stage: project_definition_diagnostic_stage(*stage),
+                    violation: project_definition_diagnostic_violation(failure),
+                }
+            }
         }
+    }
+}
+
+fn metadata_usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).expect("当前目标平台的 metadata 数值必须能用 u64 表达")
+}
+
+const fn language_id_diagnostic_violation(source: &LanguageIdError) -> RpgMakerLanguageIdViolation {
+    match source {
+        LanguageIdError::Blank => RpgMakerLanguageIdViolation::Blank,
+        LanguageIdError::SurroundingWhitespace { .. } => {
+            RpgMakerLanguageIdViolation::SurroundingWhitespace
+        }
+        LanguageIdError::Underscore { .. } => RpgMakerLanguageIdViolation::UnderscoreSeparator,
+        LanguageIdError::InvalidSyntax { .. } => RpgMakerLanguageIdViolation::InvalidRfc5646Syntax,
+        LanguageIdError::InvalidRegistryTag { .. } => {
+            RpgMakerLanguageIdViolation::InvalidIanaRegistryTag
+        }
+        LanguageIdError::CanonicalizationFailed { .. } => {
+            RpgMakerLanguageIdViolation::CanonicalizationFailed
+        }
+        LanguageIdError::UndefinedPrimaryLanguage { .. } => {
+            RpgMakerLanguageIdViolation::UndefinedPrimaryLanguage
+        }
+    }
+}
+
+const fn project_definition_diagnostic_stage(
+    stage: ProjectDefinitionStage,
+) -> RpgMakerProjectDefinitionStage {
+    match stage {
+        ProjectDefinitionStage::Decode => RpgMakerProjectDefinitionStage::Decode,
+        ProjectDefinitionStage::Compile => RpgMakerProjectDefinitionStage::Compile,
+        ProjectDefinitionStage::Encode => RpgMakerProjectDefinitionStage::Encode,
+    }
+}
+
+fn project_definition_diagnostic_violation(
+    failure: &ProjectDefinitionFailure,
+) -> RpgMakerProjectDefinitionViolation {
+    match failure {
+        ProjectDefinitionFailure::EmptyDocument => {
+            RpgMakerProjectDefinitionViolation::EmptyDocument
+        }
+        ProjectDefinitionFailure::MissingRuleArray => {
+            RpgMakerProjectDefinitionViolation::MissingRuleArray
+        }
+        ProjectDefinitionFailure::InvalidToml {
+            byte_start,
+            byte_end,
+        } => RpgMakerProjectDefinitionViolation::InvalidToml {
+            byte_start: byte_start.map(metadata_usize_to_u64),
+            byte_end: byte_end.map(metadata_usize_to_u64),
+        },
+        ProjectDefinitionFailure::InvalidJson {
+            category,
+            line,
+            column,
+        } => RpgMakerProjectDefinitionViolation::InvalidJson {
+            category: SafeIdentifier::from_validated(category.storage_name()),
+            line: metadata_usize_to_u64(*line),
+            column: metadata_usize_to_u64(*column),
+        },
+        ProjectDefinitionFailure::EncodeJson {
+            category,
+            line,
+            column,
+        } => RpgMakerProjectDefinitionViolation::EncodeJson {
+            category: SafeIdentifier::from_validated(category.storage_name()),
+            line: metadata_usize_to_u64(*line),
+            column: metadata_usize_to_u64(*column),
+        },
+        ProjectDefinitionFailure::EmptyPattern { rule_number } => {
+            RpgMakerProjectDefinitionViolation::EmptyPattern {
+                rule_number: metadata_usize_to_u64(*rule_number),
+            }
+        }
+        ProjectDefinitionFailure::InvalidPattern {
+            rule_number,
+            kind,
+            code,
+            offset,
+        } => RpgMakerProjectDefinitionViolation::InvalidPattern {
+            rule_number: metadata_usize_to_u64(*rule_number),
+            category: SafeIdentifier::from_validated(kind.as_str()),
+            backend_code: *code,
+            offset: offset.map(metadata_usize_to_u64),
+        },
+        ProjectDefinitionFailure::InvalidNamedCaptures {
+            rule_number,
+            actual_count,
+        } => RpgMakerProjectDefinitionViolation::InvalidNamedCaptures {
+            rule_number: metadata_usize_to_u64(*rule_number),
+            actual_count: metadata_usize_to_u64(*actual_count),
+        },
     }
 }
 
@@ -1091,7 +1243,7 @@ impl fmt::Display for InvalidProjectMetadata {
                     formatter,
                     "MV 对话定义在 {} 阶段无效：{}",
                     stage.as_str(),
-                    project_definition_failure_safe_fact(failure)
+                    failure
                 )
             }
         }
@@ -1591,80 +1743,54 @@ pub(crate) enum InvalidProjectDatabaseIntegrity {
 
 impl fmt::Display for InvalidCurrentProjectDatabase {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.safe_fact())
-    }
-}
-
-impl InvalidCurrentProjectDatabase {
-    /// 只从闭集 reason 的类型化字段建立可公开事实，不读取任意错误文本或持久正文。
-    pub(crate) fn safe_fact(&self) -> String {
         match self {
-            Self::Schema(reason) => {
-                format!("database_component=att_schema; {}", reason.safe_fact())
+            Self::Schema(reason) => write!(formatter, "ATT schema 无效：{reason}"),
+            Self::Metadata(reason) => write!(formatter, "项目 metadata 无效：{reason}"),
+            Self::OwnerState(reason) => write!(formatter, "资源 owner 状态无效：{reason}"),
+            Self::TranslationResources(reason) => {
+                write!(formatter, "翻译资源无效：{reason}")
             }
-            Self::Metadata(reason) => {
-                format!("database_component=metadata; {}", reason.safe_fact())
+            Self::ProjectDefinitions(reason) => {
+                write!(formatter, "项目定义无效：{reason}")
             }
-            Self::OwnerState(reason) => {
-                format!("database_component=owner_state; {}", reason.safe_fact())
-            }
-            Self::TranslationResources(reason) => format!(
-                "database_component=translation_resources; {}",
-                reason.safe_fact()
-            ),
-            Self::ProjectDefinitions(reason) => format!(
-                "database_component=project_definitions; {}",
-                reason.safe_fact()
-            ),
-            Self::RunPlans(reason) => format!(
-                "database_component=run_plans; subject={}; detail={}",
-                reason.safe_subject(),
-                reason.safe_detail()
-            ),
-            Self::Integrity(reason) => {
-                format!("database_component=integrity; {}", reason.safe_fact())
-            }
-        }
-    }
-
-    /// 返回领域错误已经筛选过的恢复事实；其他数据库状态错误没有额外恢复位置。
-    pub(crate) const fn recovery_fact(&self) -> Option<&crate::diagnostic::RecoveryFact> {
-        match self {
-            Self::RunPlans(reason) => reason.recovery_fact(),
-            _ => None,
+            Self::RunPlans(reason) => write!(formatter, "运行方案无效：{reason}"),
+            Self::Integrity(reason) => write!(formatter, "数据库完整性检查失败：{reason}"),
         }
     }
 }
 
-impl InvalidAttSchema {
-    fn safe_fact(&self) -> String {
+impl fmt::Display for InvalidAttSchema {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::WrongColumnCount {
                 query,
                 expected,
                 actual,
-            } => format!(
-                "violation=wrong_column_count; query={query}; expected={expected}; actual={actual}"
+            } => write!(
+                formatter,
+                "查询 {query} 应返回 {expected} 列，实际为 {actual} 列"
             ),
             Self::WrongRowCount {
                 query,
                 expected,
                 actual,
-            } => format!(
-                "violation=wrong_row_count; query={query}; expected={expected}; actual={actual}"
+            } => write!(
+                formatter,
+                "查询 {query} 应返回 {expected} 行，实际为 {actual} 行"
             ),
             Self::WrongColumnType {
                 field,
                 expected,
                 actual,
-            } => format!(
-                "violation=wrong_column_type; field={}; expected={}; actual={}",
+            } => write!(
+                formatter,
+                "字段 {} 应为 {}，实际为 {}",
                 field.as_str(),
                 expected.as_str(),
                 actual.as_str()
             ),
             Self::NegativeSchemaVersion { actual } => {
-                format!("violation=negative_schema_version; actual={actual}")
+                write!(formatter, "schema_version 不能为负数，实际为 {actual}")
             }
             Self::ObjectMismatch {
                 expected_count,
@@ -1672,235 +1798,240 @@ impl InvalidAttSchema {
                 missing,
                 definition_mismatches,
                 unexpected_count,
-            } => format!(
-                "violation=att_schema_object_mismatch; expected_count={expected_count}; actual_count={actual_count}; missing={}; definition_mismatches={}; unexpected_count={unexpected_count}",
-                att_schema_object_list(missing),
-                att_schema_object_list(definition_mismatches)
+            } => write!(
+                formatter,
+                "应有 {expected_count} 个 schema 对象，实际为 {actual_count} 个；缺少 {}；定义不符 {}；另有 {unexpected_count} 个未预期对象",
+                render_att_schema_objects(missing),
+                render_att_schema_objects(definition_mismatches)
             ),
         }
     }
 }
 
-impl InvalidOwnerState {
-    fn safe_fact(&self) -> String {
+impl fmt::Display for InvalidOwnerState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::WrongColumnCount { expected, actual } => {
-                format!("violation=wrong_column_count; expected={expected}; actual={actual}")
+                write!(formatter, "应有 {expected} 列，实际为 {actual} 列")
             }
             Self::WrongColumnType {
                 field,
                 expected,
                 actual,
-            } => format!(
-                "violation=wrong_column_type; field={}; expected={}; actual={}",
+            } => write!(
+                formatter,
+                "字段 {} 应为 {}，实际为 {}",
                 field.as_str(),
                 expected.as_str(),
                 actual.as_str()
             ),
-            Self::UnknownOwner => "violation=unknown_owner".to_owned(),
+            Self::UnknownOwner => formatter.write_str("包含未知的资源 owner"),
             Self::InvalidFingerprintLength {
                 owner,
                 field,
                 expected,
                 actual,
-            } => format!(
-                "violation=invalid_fingerprint_length; owner={}; field={}; expected={expected}; actual={actual}",
+            } => write!(
+                formatter,
+                "owner {} 的字段 {} 应为 {expected} 字节，实际为 {actual} 字节",
                 owner.storage_name(),
                 field.as_str()
             ),
             Self::DuplicateOwner { owner } => {
-                format!("violation=duplicate_owner; owner={}", owner.storage_name())
+                write!(formatter, "owner {} 出现重复记录", owner.storage_name())
             }
         }
     }
 }
 
-impl InvalidTranslationResources {
-    fn safe_fact(&self) -> String {
+impl fmt::Display for InvalidTranslationResources {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::WrongColumnCount { expected, actual } => {
-                format!("violation=wrong_column_count; expected={expected}; actual={actual}")
+                write!(formatter, "应有 {expected} 列，实际为 {actual} 列")
             }
             Self::WrongColumnType {
                 field,
                 expected,
                 actual,
-            } => format!(
-                "violation=wrong_column_type; field={}; expected={}; actual={}",
+            } => write!(
+                formatter,
+                "字段 {} 应为 {}，实际为 {}",
                 field.as_str(),
                 expected.as_str(),
                 actual.as_str()
             ),
-            Self::UnknownResourceKind => "violation=unknown_resource_kind".to_owned(),
+            Self::UnknownResourceKind => formatter.write_str("包含未知的翻译资源类型"),
             Self::InvalidJson {
                 resource,
                 category,
                 line,
                 column,
-            } => format!(
-                "violation=invalid_json; resource={}; json_category={}; line={line}; column={column}",
+            } => write!(
+                formatter,
+                "资源 {} 的 JSON 无效（{}，第 {line} 行第 {column} 列）",
                 resource.storage_name(),
                 category.storage_name()
             ),
-            Self::JsonMustBeArray { resource } => format!(
-                "violation=json_shape; resource={}; expected=array",
+            Self::JsonMustBeArray { resource } => write!(
+                formatter,
+                "资源 {} 的 JSON 必须是数组",
                 resource.storage_name()
             ),
-            Self::DuplicateResource { resource } => format!(
-                "violation=duplicate_resource; resource={}",
-                resource.storage_name()
-            ),
-            Self::WrongResourceCount { expected, actual } => {
-                format!("violation=wrong_resource_count; expected={expected}; actual={actual}")
+            Self::DuplicateResource { resource } => {
+                write!(formatter, "资源 {} 出现重复记录", resource.storage_name())
             }
-            Self::MissingResource { resource } => format!(
-                "violation=missing_resource; resource={}",
-                resource.storage_name()
-            ),
+            Self::WrongResourceCount { expected, actual } => {
+                write!(formatter, "应有 {expected} 项资源，实际为 {actual} 项")
+            }
+            Self::MissingResource { resource } => {
+                write!(formatter, "缺少资源 {}", resource.storage_name())
+            }
         }
     }
 }
 
-impl InvalidProjectDefinitions {
-    pub(crate) fn safe_fact(&self) -> String {
+impl fmt::Display for InvalidProjectDefinitions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::WrongRowCount { expected, actual } => {
-                format!("violation=wrong_row_count; expected={expected}; actual={actual}")
+                write!(formatter, "应有 {expected} 行，实际为 {actual} 行")
             }
             Self::WrongColumnCount { expected, actual } => {
-                format!("violation=wrong_column_count; expected={expected}; actual={actual}")
+                write!(formatter, "应有 {expected} 列，实际为 {actual} 列")
             }
             Self::WrongColumnType {
                 field,
                 expected,
                 actual,
-            } => format!(
-                "violation=wrong_column_type; field={}; expected={}; actual={}",
+            } => write!(
+                formatter,
+                "字段 {} 应为 {}，实际为 {}",
                 field.as_str(),
                 expected.as_str(),
                 actual.as_str()
             ),
-            Self::UnknownDefinitionKind => "violation=unknown_definition_kind".to_owned(),
+            Self::UnknownDefinitionKind => formatter.write_str("包含未知的项目定义类型"),
             Self::InvalidDefinition {
                 definition,
                 stage,
                 failure,
-            } => format!(
-                "violation=invalid_definition; definition={}; stage={}; {}",
+            } => write!(
+                formatter,
+                "定义 {} 在 {} 阶段无效：{failure}",
                 definition.storage_name(),
-                stage.as_str(),
-                project_definition_failure_safe_fact(failure)
+                stage.as_str()
             ),
-            Self::NonCanonicalJson { definition } => format!(
-                "violation=noncanonical_json; definition={}",
+            Self::NonCanonicalJson { definition } => write!(
+                formatter,
+                "定义 {} 未使用当前规范 JSON 编码",
                 definition.storage_name()
             ),
         }
     }
 }
 
-impl InvalidProjectDatabaseIntegrity {
-    fn safe_fact(&self) -> String {
+impl fmt::Display for InvalidProjectDatabaseIntegrity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::QuickCheckWrongRowCount { expected, actual } => format!(
-                "violation=quick_check_wrong_row_count; expected={expected}; actual={actual}"
-            ),
-            Self::QuickCheckWrongColumnCount { expected, actual } => format!(
-                "violation=quick_check_wrong_column_count; expected={expected}; actual={actual}"
-            ),
-            Self::QuickCheckWrongColumnType { expected, actual } => format!(
-                "violation=quick_check_wrong_column_type; expected={}; actual={}",
+            Self::QuickCheckWrongRowCount { expected, actual } => {
+                write!(
+                    formatter,
+                    "quick_check 应返回 {expected} 行，实际为 {actual} 行"
+                )
+            }
+            Self::QuickCheckWrongColumnCount { expected, actual } => {
+                write!(
+                    formatter,
+                    "quick_check 应返回 {expected} 列，实际为 {actual} 列"
+                )
+            }
+            Self::QuickCheckWrongColumnType { expected, actual } => write!(
+                formatter,
+                "quick_check 应返回 {}，实际为 {}",
                 expected.as_str(),
                 actual.as_str()
             ),
-            Self::QuickCheckFailed => "violation=quick_check_failed".to_owned(),
+            Self::QuickCheckFailed => formatter.write_str("SQLite quick_check 没有返回 ok"),
             Self::ForeignKeyViolations { actual } => {
-                format!("violation=foreign_key_check; actual={actual}")
+                write!(formatter, "foreign_key_check 返回 {actual} 项违反")
             }
         }
     }
 }
 
-fn project_definition_failure_safe_fact(failure: &ProjectDefinitionFailure) -> String {
-    match failure {
-        ProjectDefinitionFailure::EmptyDocument => "failure=empty_document".to_owned(),
-        ProjectDefinitionFailure::MissingRuleArray => "failure=missing_rule_array".to_owned(),
-        ProjectDefinitionFailure::InvalidToml {
-            byte_start,
-            byte_end,
-        } => format!(
-            "failure=invalid_toml; byte_start={}; byte_end={}",
-            optional_usize(*byte_start),
-            optional_usize(*byte_end)
-        ),
-        ProjectDefinitionFailure::InvalidJson {
-            category,
-            line,
-            column,
-        } => format!(
-            "failure=invalid_json; json_category={}; line={line}; column={column}",
-            category.storage_name()
-        ),
-        ProjectDefinitionFailure::EncodeJson {
-            category,
-            line,
-            column,
-        } => format!(
-            "failure=encode_json; json_category={}; line={line}; column={column}",
-            category.storage_name()
-        ),
-        ProjectDefinitionFailure::EmptyPattern { rule_number } => {
-            format!("failure=empty_pattern; rule_number={rule_number}")
-        }
-        ProjectDefinitionFailure::InvalidPattern {
-            rule_number,
-            kind,
-            code,
-            offset,
-        } => format!(
-            "failure=invalid_pattern; rule_number={rule_number}; engine=pcre2; kind={}; code={code}; offset={}",
-            kind.as_str(),
-            optional_usize(*offset)
-        ),
-        ProjectDefinitionFailure::InvalidNamedCaptures {
-            rule_number,
-            actual_count,
-        } => format!(
-            "failure=invalid_named_captures; rule_number={rule_number}; actual_count={actual_count}"
-        ),
-    }
-}
-
-fn language_id_failure_safe_fact(source: &LanguageIdError) -> &'static str {
-    match source {
-        LanguageIdError::Blank => "language_failure=blank",
-        LanguageIdError::SurroundingWhitespace { .. } => "language_failure=surrounding_whitespace",
-        LanguageIdError::Underscore { .. } => "language_failure=underscore_separator",
-        LanguageIdError::InvalidSyntax { .. } => "language_failure=invalid_rfc5646_syntax",
-        LanguageIdError::InvalidRegistryTag { .. } => "language_failure=invalid_iana_registry_tag",
-        LanguageIdError::CanonicalizationFailed { .. } => {
-            "language_failure=canonicalization_failed"
-        }
-        LanguageIdError::UndefinedPrimaryLanguage { .. } => {
-            "language_failure=undefined_primary_language"
+impl fmt::Display for ProjectDefinitionFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyDocument => formatter.write_str("定义正文为空"),
+            Self::MissingRuleArray => formatter.write_str("缺少规则数组"),
+            Self::InvalidToml {
+                byte_start,
+                byte_end,
+            } => match (byte_start, byte_end) {
+                (Some(start), Some(end)) => {
+                    write!(formatter, "TOML 无效，字节范围为 {start}..{end}")
+                }
+                _ => formatter.write_str("TOML 无效"),
+            },
+            Self::InvalidJson {
+                category,
+                line,
+                column,
+            } => write!(
+                formatter,
+                "JSON 无效（{}，第 {line} 行第 {column} 列）",
+                category.storage_name()
+            ),
+            Self::EncodeJson {
+                category,
+                line,
+                column,
+            } => write!(
+                formatter,
+                "JSON 重新编码失败（{}，第 {line} 行第 {column} 列）",
+                category.storage_name()
+            ),
+            Self::EmptyPattern { rule_number } => {
+                write!(formatter, "规则 {rule_number} 的 pattern 为空")
+            }
+            Self::InvalidPattern {
+                rule_number,
+                kind,
+                code,
+                offset,
+            } => {
+                write!(
+                    formatter,
+                    "规则 {rule_number} 的 PCRE2 pattern 无效（{}，代码 {code}",
+                    kind.as_str()
+                )?;
+                if let Some(offset) = offset {
+                    write!(formatter, "，偏移 {offset}")?;
+                }
+                formatter.write_str("）")
+            }
+            Self::InvalidNamedCaptures {
+                rule_number,
+                actual_count,
+            } => write!(
+                formatter,
+                "规则 {rule_number} 必须只声明 text 命名捕获，实际为 {actual_count} 个"
+            ),
         }
     }
 }
 
-fn att_schema_object_list(objects: &[AttSchemaObject]) -> String {
+fn render_att_schema_objects(objects: &[AttSchemaObject]) -> String {
     if objects.is_empty() {
-        "none".to_owned()
+        "无".to_owned()
     } else {
         objects
             .iter()
             .map(|object| object.as_str())
             .collect::<Vec<_>>()
-            .join(",")
+            .join("、")
     }
-}
-
-fn optional_usize(value: Option<usize>) -> String {
-    value.map_or_else(|| "none".to_owned(), |value| value.to_string())
 }
 
 impl Error for InvalidCurrentProjectDatabase {
@@ -2848,7 +2979,6 @@ pub(crate) enum ProjectDatabaseInspectionError<E> {
     },
     ReadDatabase {
         path: PathBuf,
-        stage: &'static str,
         query_ids: Vec<String>,
         source: E,
     },
@@ -2866,12 +2996,11 @@ impl<E: fmt::Display> fmt::Display for ProjectDatabaseInspectionError<E> {
             }
             Self::ReadDatabase {
                 path,
-                stage,
                 query_ids,
                 source,
             } => write!(
                 formatter,
-                "检查项目数据库 {} 的{stage}失败（查询 {}）：{source}",
+                "检查项目数据库 {} 失败（查询 {}）：{source}",
                 path.display(),
                 query_ids.join(",")
             ),
@@ -2888,6 +3017,46 @@ impl<E: Error + 'static> Error for ProjectDatabaseInspectionError<E> {
             Self::ReadDatabase { source, .. } => Some(source),
             Self::InvalidDatabase { reason, .. } => Some(reason),
             Self::DatabaseNotFound { .. } => None,
+        }
+    }
+}
+
+impl ProjectDatabaseInspectionError<SqliteRuntimeError> {
+    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
+        match self {
+            Self::DatabaseNotFound { path } => rpg_maker_project_report(
+                RpgMakerDiagnosticStage::Init,
+                StateEffect::Unchanged,
+                RpgMakerProjectProblem::DatabaseNotFound {
+                    path: SafePath::new(path),
+                },
+            ),
+            Self::ReadDatabase {
+                path,
+                query_ids,
+                source,
+                ..
+            } => {
+                let query_id = query_ids.first().map_or("project.inspect", String::as_str);
+                source.diagnostic_report_for_query(
+                    path,
+                    SqliteDiagnosticContext::new(
+                        SqliteDiagnosticStage::Init,
+                        SqliteOperation::Query,
+                        SqliteTransactionState::NotStarted,
+                    ),
+                    StateEffect::Unchanged,
+                    query_id,
+                    None,
+                )
+            }
+            Self::InvalidDatabase { path, .. } => rpg_maker_project_report(
+                RpgMakerDiagnosticStage::Init,
+                StateEffect::Unchanged,
+                RpgMakerProjectProblem::InvalidDatabase {
+                    path: SafePath::new(path),
+                },
+            ),
         }
     }
 }
@@ -2942,6 +3111,46 @@ where
             Self::Inspection(source) => Some(source),
             Self::NotCommitted { source, .. } | Self::OutcomeUnknown { source, .. } => Some(source),
             Self::ConcurrentModification { .. } | Self::DatabaseNotFound { .. } => None,
+        }
+    }
+}
+
+impl ProjectDatabaseReconciliationError<SqliteRuntimeError, SqliteRuntimeError> {
+    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
+        match self {
+            Self::Inspection(source) => source.diagnostic_report(),
+            Self::ConcurrentModification { path } => rpg_maker_project_report(
+                RpgMakerDiagnosticStage::Init,
+                StateEffect::Unchanged,
+                RpgMakerProjectProblem::ConcurrentModification {
+                    path: SafePath::new(path),
+                },
+            ),
+            Self::DatabaseNotFound { path } => rpg_maker_project_report(
+                RpgMakerDiagnosticStage::Init,
+                StateEffect::Unchanged,
+                RpgMakerProjectProblem::DatabaseNotFound {
+                    path: SafePath::new(path),
+                },
+            ),
+            Self::NotCommitted { path, source } => source.diagnostic_report(
+                path,
+                SqliteDiagnosticContext::new(
+                    SqliteDiagnosticStage::Init,
+                    SqliteOperation::Transaction,
+                    SqliteTransactionState::RolledBack,
+                ),
+                StateEffect::Unchanged,
+            ),
+            Self::OutcomeUnknown { path, source } => source.diagnostic_report(
+                path,
+                SqliteDiagnosticContext::new(
+                    SqliteDiagnosticStage::Init,
+                    SqliteOperation::Transaction,
+                    SqliteTransactionState::OutcomeUnknown,
+                ),
+                StateEffect::OutcomeUnknown,
+            ),
         }
     }
 }
@@ -3021,7 +3230,6 @@ where
 async fn read_inspection_snapshot<Q>(
     queries: &Q,
     database_path: &Path,
-    stage: &'static str,
     requested: Vec<SqliteQuery>,
 ) -> Result<Vec<Vec<SqliteRow>>, ProjectDatabaseInspectionError<Q::Error>>
 where
@@ -3043,7 +3251,6 @@ where
             QueryExistingDatabaseError::QueryFailed(source) => {
                 ProjectDatabaseInspectionError::ReadDatabase {
                     path: database_path.to_path_buf(),
-                    stage,
                     query_ids,
                     source,
                 }
@@ -3062,7 +3269,6 @@ where
     let snapshot = read_inspection_snapshot(
         queries,
         &database_path,
-        "读取项目数据库一致快照",
         vec![
             SqliteQuery::new(SELECT_SCHEMA_VERSION, Vec::new())
                 .with_id("project_database.inspect.schema_version"),
@@ -3553,6 +3759,47 @@ where
     }
 }
 
+impl ProjectDatabaseCreateError<SqliteRuntimeError> {
+    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
+        match self {
+            Self::AlreadyExists { path } => rpg_maker_project_report(
+                RpgMakerDiagnosticStage::Init,
+                StateEffect::Unchanged,
+                RpgMakerProjectProblem::DatabaseAlreadyExists {
+                    path: SafePath::new(path),
+                },
+            ),
+            Self::NotCreated { path, source } => source.diagnostic_report(
+                path,
+                SqliteDiagnosticContext::new(
+                    SqliteDiagnosticStage::Init,
+                    SqliteOperation::Transaction,
+                    SqliteTransactionState::RolledBack,
+                ),
+                StateEffect::Unchanged,
+            ),
+            Self::OutcomeUnknown { path, source } => source.diagnostic_report(
+                path,
+                SqliteDiagnosticContext::new(
+                    SqliteDiagnosticStage::Init,
+                    SqliteOperation::Transaction,
+                    SqliteTransactionState::OutcomeUnknown,
+                ),
+                StateEffect::OutcomeUnknown,
+            ),
+            Self::ResidualArtifact { path, source } => source.diagnostic_report(
+                path,
+                SqliteDiagnosticContext::new(
+                    SqliteDiagnosticStage::Init,
+                    SqliteOperation::Cleanup,
+                    SqliteTransactionState::RolledBack,
+                ),
+                StateEffect::RecoveryRequired,
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3639,6 +3886,83 @@ mod tests {
                 "rpg_maker_mutation_claim_resource_idx",
             ]
         );
+    }
+
+    #[test]
+    fn asset_tables_use_owner_local_group_ids_as_the_only_child_identity() {
+        assert!(
+            CREATE_RPG_MAKER_TEXT_GROUP_TABLE
+                .contains("group_id               INTEGER NOT NULL CHECK (group_id > 0)")
+        );
+        assert!(CREATE_RPG_MAKER_TEXT_GROUP_TABLE.contains("PRIMARY KEY (owner, group_id)"));
+        assert!(CREATE_RPG_MAKER_TEXT_GROUP_TABLE.contains("UNIQUE (owner, group_location)"));
+        assert!(CREATE_RPG_MAKER_TEXT_GROUP_TABLE.contains("UNIQUE (owner, semantic_order_key)"));
+
+        for child_table in [
+            CREATE_RPG_MAKER_TEXT_UNIT_TABLE,
+            CREATE_RPG_MAKER_MUTATION_CLAIM_TABLE,
+        ] {
+            assert!(child_table.contains("group_id"));
+            assert!(!child_table.contains("group_location"));
+            assert!(child_table.contains("FOREIGN KEY (owner, group_id)"));
+            assert!(child_table.contains("REFERENCES rpg_maker_text_group(owner, group_id)"));
+        }
+        assert!(
+            CREATE_RPG_MAKER_TEXT_UNIT_OWNER_GROUP_ORDER_INDEX
+                .ends_with("(owner, group_id, semantic_order_key)")
+        );
+        assert!(
+            CREATE_RPG_MAKER_MUTATION_CLAIM_RESOURCE_INDEX
+                .ends_with("(resource_key, access, owner, group_id)")
+        );
+        assert!(
+            CREATE_RPG_MAKER_MUTATION_CLAIM_OWNER_RESOURCE_INDEX
+                .ends_with("(owner, resource_key, access, group_id)")
+        );
+    }
+
+    #[test]
+    fn metadata_read_diagnostic_keeps_concrete_column_contract() {
+        let error = ProjectDatabaseReadError::<SqliteRuntimeError>::InvalidMetadata {
+            path: PathBuf::from("D:/projects/mz/alice/project.db"),
+            reason: InvalidProjectMetadata::WrongColumnType {
+                column: "source_language",
+                expected: "TEXT",
+                actual: "INTEGER",
+            },
+        };
+
+        let wire =
+            serde_json::to_value(error.diagnostic_report()).expect("metadata 诊断必须可序列化");
+        assert_eq!(wire["effect"], "unchanged");
+        assert_eq!(
+            wire["primary"],
+            serde_json::json!({
+                "code": "rpg_maker.project.metadata.wrong_column_type",
+                "stage": "project_opening",
+                "issue": {
+                    "family": "rpg_maker",
+                    "details": {
+                        "stage": "project_opening",
+                        "problem": {
+                            "kind": "project",
+                            "problem": {
+                                "kind": "invalid_metadata",
+                                "path": "D:/projects/mz/alice/project.db",
+                                "violation": {
+                                    "kind": "wrong_column_type",
+                                    "column": "source_language",
+                                    "expected": "TEXT",
+                                    "actual": "INTEGER"
+                                }
+                            }
+                        }
+                    }
+                },
+                "resolution": "check_project_state"
+            })
+        );
+        assert_eq!(wire["related"], serde_json::json!([]));
     }
 
     #[test]

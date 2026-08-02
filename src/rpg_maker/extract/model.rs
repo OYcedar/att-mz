@@ -4,6 +4,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
 
+use crate::diagnostic::{
+    Diagnostic, DiagnosticReport, RpgMakerExtractionProblem, RpgMakerExtractionSemanticOrderKey,
+    RpgMakerExtractionSemanticOrderProjectionViolation, RpgMakerExtractionSnapshotViolation,
+    RpgMakerExtractionSource, RpgMakerIssue, StateEffect,
+};
 use crate::rpg_maker::model::{
     DirectTextPart, DirectTextRecipe, LogicalTextLocation, MutationClaim, MutationClaimIndex,
     MutationClaimSet, ProjectionModelError, ScalarFieldKey, TextProjectionRecipe, TextUnitContent,
@@ -562,6 +567,174 @@ pub(crate) enum SnapshotModelError {
         referenced: BTreeSet<usize>,
     },
     Projection(ProjectionModelError),
+}
+
+impl SnapshotModelError {
+    /// 在 Extract 快照边界保留 owner、精确位置、角色与全部数值事实。
+    pub(crate) fn diagnostic_report(&self, source: RpgMakerExtractionSource) -> DiagnosticReport {
+        DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::rpg_maker(RpgMakerIssue::extraction(
+                RpgMakerExtractionProblem::Snapshot {
+                    source,
+                    violation: self.diagnostic_violation(),
+                },
+            )),
+        )
+    }
+
+    pub(crate) fn diagnostic_violation(&self) -> RpgMakerExtractionSnapshotViolation {
+        match self {
+            Self::BlankSourceContent { exact_location } => {
+                RpgMakerExtractionSnapshotViolation::BlankSourceContent {
+                    location: exact_location.diagnostic_location(),
+                }
+            }
+            Self::ContentShapeMismatch {
+                role,
+                exact_location,
+            } => RpgMakerExtractionSnapshotViolation::ContentShapeMismatch {
+                role: role.diagnostic_role(),
+                location: exact_location.diagnostic_location(),
+            },
+            Self::DirectGroupRequiresValue {
+                role,
+                exact_location,
+            } => RpgMakerExtractionSnapshotViolation::DirectGroupRequiresValue {
+                role: role.diagnostic_role(),
+                location: exact_location.diagnostic_location(),
+            },
+            Self::InvalidSourceLine {
+                source_line_index,
+                exact_location,
+            } => RpgMakerExtractionSnapshotViolation::InvalidSourceLine {
+                source_line_index: *source_line_index,
+                location: exact_location.diagnostic_location(),
+            },
+            Self::EmptyGroup { group_location } => {
+                RpgMakerExtractionSnapshotViolation::EmptyGroup {
+                    group_location: group_location.diagnostic_location(),
+                }
+            }
+            Self::EmptyProjection { group_location } => {
+                RpgMakerExtractionSnapshotViolation::EmptyProjection {
+                    group_location: group_location.diagnostic_location(),
+                }
+            }
+            Self::DuplicateLogicalLocation { logical_location } => {
+                RpgMakerExtractionSnapshotViolation::DuplicateLogicalLocation {
+                    group_location: logical_location.group_location().diagnostic_location(),
+                    role: logical_location.role().diagnostic_role(),
+                }
+            }
+            Self::ConflictingGroupKind {
+                group_location,
+                first,
+                second,
+            } => RpgMakerExtractionSnapshotViolation::ConflictingGroupKind {
+                group_location: group_location.diagnostic_location(),
+                first: first.diagnostic_group_kind(),
+                second: second.diagnostic_group_kind(),
+            },
+            Self::ConflictingSemanticOrderKey {
+                group_location,
+                first,
+                second,
+            } => {
+                let (first_path, first_fragment) = first.diagnostic_parts();
+                let (second_path, second_fragment) = second.diagnostic_parts();
+                RpgMakerExtractionSnapshotViolation::ConflictingSemanticOrderKey {
+                    group_location: group_location.diagnostic_location(),
+                    first: RpgMakerExtractionSemanticOrderKey::new(first_path, first_fragment),
+                    second: RpgMakerExtractionSemanticOrderKey::new(second_path, second_fragment),
+                }
+            }
+            Self::SemanticOrderProjection {
+                exact_location,
+                source,
+            } => RpgMakerExtractionSnapshotViolation::SemanticOrderProjection {
+                location: exact_location.diagnostic_location(),
+                violation: semantic_order_projection_violation(*source),
+            },
+            Self::MutationClaimConflict { resource } => {
+                RpgMakerExtractionSnapshotViolation::MutationClaimConflict {
+                    resource: resource.diagnostic_location(),
+                }
+            }
+            Self::RecipeRoleMismatch {
+                group_location,
+                units,
+                referenced,
+            } => RpgMakerExtractionSnapshotViolation::RecipeRoleMismatch {
+                group_location: group_location.diagnostic_location(),
+                units: units.iter().map(TextUnitRole::diagnostic_role).collect(),
+                referenced: referenced
+                    .iter()
+                    .map(TextUnitRole::diagnostic_role)
+                    .collect(),
+            },
+            Self::RecipeLineMismatch {
+                group_location,
+                role,
+                expected,
+                referenced,
+            } => RpgMakerExtractionSnapshotViolation::RecipeLineMismatch {
+                group_location: group_location.diagnostic_location(),
+                role: role.diagnostic_role(),
+                expected: expected.iter().copied().collect(),
+                referenced: referenced.iter().copied().collect(),
+            },
+            Self::Projection(source) => RpgMakerExtractionSnapshotViolation::Projection {
+                violation: source.diagnostic_violation(),
+            },
+        }
+    }
+}
+
+fn semantic_order_projection_violation(
+    source: RpgMakerSemanticOrderProjectionError,
+) -> RpgMakerExtractionSemanticOrderProjectionViolation {
+    match source {
+        RpgMakerSemanticOrderProjectionError::MissingSourceDocument => {
+            RpgMakerExtractionSemanticOrderProjectionViolation::MissingSourceDocument
+        }
+        RpgMakerSemanticOrderProjectionError::UnsupportedBuiltinPluginSource => {
+            RpgMakerExtractionSemanticOrderProjectionViolation::UnsupportedBuiltinPluginSource
+        }
+        RpgMakerSemanticOrderProjectionError::ExpectedObject => {
+            RpgMakerExtractionSemanticOrderProjectionViolation::ExpectedObject
+        }
+        RpgMakerSemanticOrderProjectionError::MissingObjectKey => {
+            RpgMakerExtractionSemanticOrderProjectionViolation::MissingObjectKey
+        }
+        RpgMakerSemanticOrderProjectionError::ExpectedArray => {
+            RpgMakerExtractionSemanticOrderProjectionViolation::ExpectedArray
+        }
+        RpgMakerSemanticOrderProjectionError::MissingArrayIndex => {
+            RpgMakerExtractionSemanticOrderProjectionViolation::MissingArrayIndex
+        }
+        RpgMakerSemanticOrderProjectionError::ExpectedEncodedJsonString => {
+            RpgMakerExtractionSemanticOrderProjectionViolation::ExpectedEncodedJsonString
+        }
+        RpgMakerSemanticOrderProjectionError::InvalidEncodedJson => {
+            RpgMakerExtractionSemanticOrderProjectionViolation::InvalidEncodedJson
+        }
+        RpgMakerSemanticOrderProjectionError::MissingPhysicalOrdinal => {
+            RpgMakerExtractionSemanticOrderProjectionViolation::MissingPhysicalOrdinal
+        }
+        RpgMakerSemanticOrderProjectionError::ExtraPhysicalOrdinal => {
+            RpgMakerExtractionSemanticOrderProjectionViolation::ExtraPhysicalOrdinal
+        }
+        RpgMakerSemanticOrderProjectionError::ArrayOrdinalMismatch { index, ordinal } => {
+            RpgMakerExtractionSemanticOrderProjectionViolation::ArrayOrdinalMismatch {
+                index,
+                ordinal,
+            }
+        }
+        RpgMakerSemanticOrderProjectionError::OrdinalOverflow => {
+            RpgMakerExtractionSemanticOrderProjectionViolation::OrdinalOverflow
+        }
+    }
 }
 
 impl fmt::Display for SnapshotModelError {

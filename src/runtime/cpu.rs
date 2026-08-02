@@ -11,10 +11,7 @@ use rayon::prelude::*;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
-use crate::diagnostic::{
-    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
-    DiagnosticStage, DiagnosticSubject, SafeDiagnostic, SafeDiagnosticSource,
-};
+use crate::diagnostic::{Diagnostic, IoFailure, RuntimeComponent, RuntimeIssue, RuntimeOperation};
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 
 /// CPU 工作池的产品配置。
@@ -74,6 +71,29 @@ impl Error for CpuExecutorStartError {
     }
 }
 
+impl CpuExecutorStartError {
+    /// CPU 根仍持有 `io::ErrorKind` 和 Rayon 数值上限时建立安全诊断。
+    pub(crate) fn diagnostic(&self) -> Diagnostic {
+        let issue = match self {
+            Self::AvailableParallelism(source) => RuntimeIssue::Io {
+                component: RuntimeComponent::CpuExecutor,
+                operation: RuntimeOperation::DetectAvailableParallelism,
+                failure: IoFailure::from_error(source),
+            },
+            Self::TooManyWorkerThreads { requested, maximum } => RuntimeIssue::ResourceLimit {
+                component: RuntimeComponent::CpuExecutor,
+                operation: RuntimeOperation::StartWorker,
+                requested: *requested,
+                maximum: *maximum,
+            },
+            Self::Build(_) => RuntimeIssue::InvalidConfiguration {
+                component: RuntimeComponent::CpuExecutor,
+            },
+        };
+        Diagnostic::runtime(issue)
+    }
+}
+
 /// CPU 工作池当前无法接收任务的原因。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CpuExecutorUnavailable {
@@ -92,35 +112,35 @@ impl fmt::Display for CpuExecutorUnavailable {
 
 impl Error for CpuExecutorUnavailable {}
 
-impl SafeDiagnosticSource for CpuTaskExecutionError<CpuExecutorUnavailable> {
-    fn safe_diagnostic_source(
-        &self,
-        stage: DiagnosticStage,
-        impact: DiagnosticImpact,
-        _fallback_action: DiagnosticAction,
-    ) -> SafeDiagnostic {
-        let (failure, action) = match self {
-            Self::Cancelled => (
-                DiagnosticFailureKind::LockCancelled,
-                DiagnosticAction::Retry,
-            ),
-            Self::Unavailable(CpuExecutorUnavailable::ShuttingDown) => (
-                DiagnosticFailureKind::ExecutorClosed,
-                DiagnosticAction::Retry,
-            ),
-            Self::Unavailable(CpuExecutorUnavailable::StatePoisoned) | Self::TaskPanicked => (
-                DiagnosticFailureKind::WorkerPanicked,
-                DiagnosticAction::ReportBug,
-            ),
+impl CpuTaskExecutionError<CpuExecutorUnavailable> {
+    pub(crate) fn diagnostic(&self) -> Diagnostic {
+        self.diagnostic_for(RuntimeOperation::ExecuteTask)
+    }
+
+    pub(crate) fn diagnostic_for(&self, operation: RuntimeOperation) -> Diagnostic {
+        let issue = match self {
+            Self::Cancelled => RuntimeIssue::Cancelled {
+                component: RuntimeComponent::CpuExecutor,
+                operation,
+            },
+            Self::Unavailable(CpuExecutorUnavailable::ShuttingDown) => {
+                RuntimeIssue::ExecutorClosed {
+                    component: RuntimeComponent::CpuExecutor,
+                    operation,
+                }
+            }
+            Self::Unavailable(CpuExecutorUnavailable::StatePoisoned) => {
+                RuntimeIssue::StatePoisoned {
+                    component: RuntimeComponent::CpuExecutor,
+                    operation,
+                }
+            }
+            Self::TaskPanicked => RuntimeIssue::WorkerPanicked {
+                component: RuntimeComponent::CpuExecutor,
+                operation,
+            },
         };
-        SafeDiagnostic::new(
-            DiagnosticCode::InternalOperation,
-            stage,
-            DiagnosticSubject::component("CPU worker"),
-            DiagnosticReason::failure(failure),
-            impact,
-            action,
-        )
+        Diagnostic::runtime(issue)
     }
 }
 
@@ -142,31 +162,17 @@ impl fmt::Display for CpuExecutorShutdownError {
 
 impl Error for CpuExecutorShutdownError {}
 
-impl SafeDiagnosticSource for CpuExecutorShutdownError {
-    fn safe_diagnostic_source(
-        &self,
-        stage: DiagnosticStage,
-        impact: DiagnosticImpact,
-        _fallback_action: DiagnosticAction,
-    ) -> SafeDiagnostic {
-        let (reason, action) = match self {
-            Self::ConcurrentShutdown => (
-                DiagnosticReason::failure(DiagnosticFailureKind::ConcurrentShutdown),
-                DiagnosticAction::Retry,
-            ),
-            Self::StatePoisoned => (
-                DiagnosticReason::failure(DiagnosticFailureKind::ExecutorStatePoisoned),
-                DiagnosticAction::ReportBug,
-            ),
-        };
-        SafeDiagnostic::new(
-            DiagnosticCode::ShutdownComponent,
-            stage,
-            DiagnosticSubject::component("CPU executor"),
-            reason,
-            impact,
-            action,
-        )
+impl CpuExecutorShutdownError {
+    pub(crate) fn diagnostic(&self) -> Diagnostic {
+        Diagnostic::runtime(match self {
+            Self::ConcurrentShutdown => RuntimeIssue::ConcurrentShutdown {
+                component: RuntimeComponent::CpuExecutor,
+            },
+            Self::StatePoisoned => RuntimeIssue::StatePoisoned {
+                component: RuntimeComponent::CpuExecutor,
+                operation: RuntimeOperation::Shutdown,
+            },
+        })
     }
 }
 
@@ -562,6 +568,33 @@ mod tests {
             result,
             Err(CpuExecutorStartError::AvailableParallelism(_))
         ));
+    }
+
+    #[test]
+    fn resource_limit_leaf_has_literal_typed_wire() {
+        let diagnostic = CpuExecutorStartError::TooManyWorkerThreads {
+            requested: 9,
+            maximum: 8,
+        }
+        .diagnostic();
+        assert_eq!(
+            serde_json::to_value(diagnostic).expect("诊断应可序列化"),
+            serde_json::json!({
+                "code": "runtime.resource_limit",
+                "stage": "process_startup",
+                "issue": {
+                    "family": "runtime",
+                    "details": {
+                        "kind": "resource_limit",
+                        "component": "cpu_executor",
+                        "operation": "start_worker",
+                        "requested": 9,
+                        "maximum": 8
+                    }
+                },
+                "resolution": "report_bug"
+            })
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

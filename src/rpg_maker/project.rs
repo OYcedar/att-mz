@@ -7,15 +7,22 @@ use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
 
+use crate::diagnostic::{
+    Diagnostic, DiagnosticReport, FileSystemDiagnosticStage, RpgMakerDiagnosticStage,
+    RpgMakerIssue, RpgMakerProjectProblem, SafeIdentifier, StateEffect,
+};
 use crate::language::{LanguageId, LanguagePair};
 use crate::project_name::ProjectName;
 #[cfg(test)]
 use crate::rpg_maker::RpgMakerLayout;
 use crate::rpg_maker::dialogue::MvDialogueDefinition;
+use crate::rpg_maker::project_database::ProjectDatabaseReadError;
 use crate::rpg_maker::project_database::{
     ProjectDatabaseRecordReader, ProjectWorkspaceLayout, SourceSnapshotFingerprint,
     StoredProjectRecord,
 };
+use crate::runtime::filesystem::SystemFileSystemError;
+use crate::runtime::sqlite::SqliteRuntimeError;
 use crate::storage::file_system::{
     DirectoryTreeFingerprintError, DirectoryTreeFingerprintRequest, DirectoryTreeFingerprinter,
     DirectoryTreeRoot, ExistingDirectoryResolver, ResolveDirectoryError,
@@ -252,6 +259,40 @@ where
             Self::ResolveSourceData(error) | Self::ResolveSourceJs(error) => Some(error),
             Self::FingerprintSource(error) => Some(error),
             Self::SourceSnapshotMismatch { .. } => None,
+        }
+    }
+}
+
+impl
+    ExistingProjectOpeningError<
+        ProjectDatabaseReadError<SqliteRuntimeError>,
+        SystemFileSystemError,
+        Box<SystemFileSystemError>,
+    >
+{
+    /// 项目开启边界消费下层的同一份安全报告，不从显示正文重建事实。
+    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
+        match self {
+            Self::ReadProjectRecord(source) => source.diagnostic_report(),
+            Self::ResolveSourceData(source) | Self::ResolveSourceJs(source) => {
+                source.diagnostic_report_at(FileSystemDiagnosticStage::Project)
+            }
+            Self::FingerprintSource(source) => {
+                source.diagnostic_report_at(FileSystemDiagnosticStage::Project)
+            }
+            Self::SourceSnapshotMismatch {
+                persisted,
+                observed,
+            } => DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::rpg_maker(RpgMakerIssue::project(
+                    RpgMakerDiagnosticStage::ProjectOpening,
+                    RpgMakerProjectProblem::SourceSnapshotMismatch {
+                        persisted: SafeIdentifier::from_validated(persisted.hex()),
+                        observed: SafeIdentifier::from_validated(observed.hex()),
+                    },
+                )),
+            ),
         }
     }
 }

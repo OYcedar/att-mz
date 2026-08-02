@@ -22,6 +22,14 @@ use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::{Connection, ErrorCode, InterruptHandle};
 use sha2::{Digest, Sha256};
 
+use crate::diagnostic::{
+    Diagnostic, DiagnosticReport, IoFailure, LuaCompilationProblem, LuaCompilerCategory,
+    LuaContextProblem, LuaEngine, LuaIssue, LuaLocator, LuaOperation, LuaProblem, LuaScriptProblem,
+    LuaValidationProblem, LuaValueViolation, RelatedFailureRelation, RuntimeComponent,
+    RuntimeIssue, RuntimeOperation, SafeIdentifier, SafePath, SqliteDiagnosticContext,
+    SqliteDiagnosticStage, SqliteDriverFailure, SqliteIssue, SqliteOperation, SqliteProblem,
+    SqliteTransactionState, StateEffect,
+};
 use crate::fingerprint::Sha256Fingerprint;
 
 use self::binding::{BindingMetrics, PreparedProjectLua, prepare_lua, validate_program};
@@ -122,69 +130,247 @@ pub(crate) fn take_project_lua_object_field(
     Some(fields.swap_remove(index).1)
 }
 
-pub(crate) fn project_lua_worker_spawn_message(
-    operation: &'static str,
-    source: &std::io::Error,
-) -> String {
-    match source.raw_os_error() {
-        Some(code) => format!(
-            "operation={operation}; raw_os_code={code}; io_kind={:?}; system_message={}",
-            source.kind(),
-            std::io::Error::from_raw_os_error(code)
-        ),
-        None => format!(
-            "operation={operation}; raw_os_code=none; io_kind={:?}",
-            source.kind()
-        ),
-    }
-}
-
 /// 引擎适配器或脚本输出接收器返回的稳定错误。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProjectLuaCallError {
-    kind: &'static str,
-    message: String,
+    issue: ProjectLuaCallIssue,
+    engine: Option<LuaEngine>,
+    operation: Option<LuaOperation>,
+    field: Option<crate::diagnostic::SafeIdentifier>,
+    locator: Option<LuaLocator>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum ProjectLuaCallIssue {
+    Cancelled,
+    Violation(LuaValueViolation),
+    Sqlite {
+        failure: SqliteDriverFailure,
+        source: Arc<rusqlite::Error>,
+    },
+    WorkerSpawn {
+        failure: IoFailure,
+        source: Arc<std::io::Error>,
+    },
+}
+
+impl PartialEq for ProjectLuaCallIssue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Cancelled, Self::Cancelled) => true,
+            (Self::Violation(left), Self::Violation(right)) => left == right,
+            (Self::Sqlite { failure: left, .. }, Self::Sqlite { failure: right, .. }) => {
+                left == right
+            }
+            (Self::WorkerSpawn { failure: left, .. }, Self::WorkerSpawn { failure: right, .. }) => {
+                left == right
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ProjectLuaCallIssue {}
+
 impl ProjectLuaCallError {
-    pub(crate) fn new(kind: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) const fn cancelled() -> Self {
         Self {
-            kind,
-            message: message.into(),
+            issue: ProjectLuaCallIssue::Cancelled,
+            engine: None,
+            operation: None,
+            field: None,
+            locator: None,
         }
     }
 
-    pub(crate) const fn kind(&self) -> &'static str {
-        self.kind
+    pub(crate) const fn violation(violation: LuaValueViolation) -> Self {
+        Self {
+            issue: ProjectLuaCallIssue::Violation(violation),
+            engine: None,
+            operation: None,
+            field: None,
+            locator: None,
+        }
     }
 
-    pub(crate) fn message(&self) -> &str {
-        &self.message
+    pub(crate) fn sqlite(source: rusqlite::Error) -> Self {
+        Self {
+            issue: ProjectLuaCallIssue::Sqlite {
+                failure: SqliteDriverFailure::from_error(&source),
+                source: Arc::new(source),
+            },
+            engine: None,
+            operation: None,
+            field: None,
+            locator: None,
+        }
+    }
+
+    pub(crate) fn worker_spawn(source: std::io::Error) -> Self {
+        Self {
+            issue: ProjectLuaCallIssue::WorkerSpawn {
+                failure: IoFailure::from_error(&source),
+                source: Arc::new(source),
+            },
+            engine: None,
+            operation: None,
+            field: None,
+            locator: None,
+        }
+    }
+
+    pub(crate) fn with_field(mut self, field: impl AsRef<str>) -> Self {
+        self.field = crate::diagnostic::SafeIdentifier::new(field.as_ref()).ok();
+        self
+    }
+
+    pub(crate) fn with_generic_locator(
+        mut self,
+        relative_path: Option<&std::path::Path>,
+        group_id: &str,
+        unit_id: &str,
+    ) -> Self {
+        self.locator = Some(LuaLocator::Generic {
+            relative_path: relative_path.map(SafePath::new),
+            group_id: crate::diagnostic::SafeIdentifier::new(group_id).ok(),
+            unit_id: crate::diagnostic::SafeIdentifier::new(unit_id).ok(),
+        });
+        self
+    }
+
+    pub(crate) fn with_rpg_maker_locator(
+        mut self,
+        owner: &str,
+        group_location: &str,
+        unit_role: &str,
+    ) -> Self {
+        self.locator = Some(LuaLocator::RpgMaker {
+            owner: crate::diagnostic::SafeIdentifier::new(owner).ok(),
+            group_location: crate::diagnostic::SafeIdentifier::new(group_location).ok(),
+            unit_role: crate::diagnostic::SafeIdentifier::new(unit_role).ok(),
+        });
+        self
+    }
+
+    pub(crate) fn with_operation(mut self, operation: LuaOperation) -> Self {
+        self.operation = Some(operation);
+        self
+    }
+
+    pub(crate) fn with_engine(mut self, engine: LuaEngine) -> Self {
+        self.engine = Some(engine);
+        self
+    }
+
+    pub(crate) const fn kind(&self) -> &'static str {
+        match self.issue {
+            ProjectLuaCallIssue::Cancelled => "cancelled",
+            ProjectLuaCallIssue::Violation(LuaValueViolation::UnknownUnit) => "unit_not_found",
+            ProjectLuaCallIssue::Violation(LuaValueViolation::InvalidLocator) => "invalid_locator",
+            ProjectLuaCallIssue::Violation(LuaValueViolation::InvalidTranslation) => {
+                "invalid_translation"
+            }
+            ProjectLuaCallIssue::Violation(LuaValueViolation::InvalidTable) => "invalid_table",
+            ProjectLuaCallIssue::Violation(LuaValueViolation::CyclicTable) => "cyclic_table",
+            ProjectLuaCallIssue::Violation(LuaValueViolation::TransactionLost) => {
+                "transaction_lost"
+            }
+            ProjectLuaCallIssue::Violation(_) => "invalid_value",
+            ProjectLuaCallIssue::Sqlite { .. } => "sqlite",
+            ProjectLuaCallIssue::WorkerSpawn { .. } => "worker_spawn",
+        }
+    }
+
+    pub(crate) const fn message(&self) -> &'static str {
+        match self.issue {
+            ProjectLuaCallIssue::Cancelled => "Lua 调用已取消",
+            ProjectLuaCallIssue::Violation(LuaValueViolation::UnknownUnit) => "目标 Unit 不存在",
+            ProjectLuaCallIssue::Violation(LuaValueViolation::InvalidLocator) => {
+                "Unit locator 无效"
+            }
+            ProjectLuaCallIssue::Violation(LuaValueViolation::InvalidTranslation) => {
+                "译文不满足项目规则"
+            }
+            ProjectLuaCallIssue::Violation(LuaValueViolation::InvalidTable) => "Lua table 结构无效",
+            ProjectLuaCallIssue::Violation(LuaValueViolation::CyclicTable) => {
+                "Lua table 存在循环引用"
+            }
+            ProjectLuaCallIssue::Violation(LuaValueViolation::TransactionLost) => {
+                "Lua 脚本已失去外层事务"
+            }
+            ProjectLuaCallIssue::Violation(_) => "Lua 参数或项目状态无效",
+            ProjectLuaCallIssue::Sqlite { .. } => "SQLite 调用失败",
+            ProjectLuaCallIssue::WorkerSpawn { .. } => "无法启动 Lua 辅助 worker",
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn operation(&self) -> Option<&'static str> {
+        match self.operation {
+            Some(operation) => Some(lua_host_operation_name(operation)),
+            None => None,
+        }
+    }
+
+    pub(crate) const fn is_worker_spawn(&self) -> bool {
+        matches!(self.issue, ProjectLuaCallIssue::WorkerSpawn { .. })
     }
 }
 
 impl fmt::Display for ProjectLuaCallError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message)
+        formatter.write_str(self.message())
     }
 }
 
-impl Error for ProjectLuaCallError {}
+impl Error for ProjectLuaCallError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match &self.issue {
+            ProjectLuaCallIssue::Sqlite { source, .. } => Some(source.as_ref()),
+            ProjectLuaCallIssue::WorkerSpawn { source, .. } => Some(source.as_ref()),
+            ProjectLuaCallIssue::Cancelled | ProjectLuaCallIssue::Violation(_) => None,
+        }
+    }
+}
+
+const fn lua_host_operation_name(operation: LuaOperation) -> &'static str {
+    match operation {
+        LuaOperation::CreateContext => "binding",
+        LuaOperation::CompileScript => "compile",
+        LuaOperation::ExecuteScript => "execute",
+        LuaOperation::ValidatePrerequisites => "translation.capture",
+        LuaOperation::SetTranslation => "translation.set",
+        LuaOperation::ClearTranslation => "translation.clear",
+        LuaOperation::QueryDatabase => "db.query",
+        LuaOperation::ValidateDatabase => "translation.validate",
+        LuaOperation::BeginTransaction => "transaction.begin",
+        LuaOperation::CommitTransaction => "transaction.commit",
+        LuaOperation::RollbackTransaction => "transaction.rollback",
+        LuaOperation::InstallAuthorizer => "authorizer.install",
+        LuaOperation::RemoveAuthorizer => "authorizer.remove",
+    }
+}
 
 /// 引擎在脚本执行前校验数据库时能够返回的失败。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ProjectLuaDatabasePrerequisiteError {
     Cancelled,
-    InvalidProjectState(String),
+    InvalidProjectState {
+        engine: crate::diagnostic::LuaEngine,
+        violation: crate::diagnostic::LuaValueViolation,
+    },
     Sqlite(ProjectLuaSqliteError),
 }
 
 impl ProjectLuaDatabasePrerequisiteError {
-    pub(crate) fn invalid_project_state(detail: impl Into<String>) -> Self {
-        Self::InvalidProjectState(detail.into())
+    pub(crate) const fn invalid_project_state(
+        engine: crate::diagnostic::LuaEngine,
+        violation: crate::diagnostic::LuaValueViolation,
+    ) -> Self {
+        Self::InvalidProjectState { engine, violation }
     }
 
-    pub(crate) fn sqlite(operation: &'static str, source: &rusqlite::Error) -> Self {
+    pub(crate) fn sqlite(operation: ProjectLuaSqliteOperation, source: rusqlite::Error) -> Self {
         Self::Sqlite(ProjectLuaSqliteError::new(operation, source))
     }
 }
@@ -472,7 +658,7 @@ impl ProjectLuaCancellation {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if active.is_some() {
             return Err(ProjectLuaFailure::Context(
-                "同一个 Lua 取消令牌正在供另一次执行使用".to_owned(),
+                ProjectLuaContextFailure::InterruptRegistration,
             ));
         }
         *active = Some(interrupt);
@@ -533,43 +719,120 @@ impl ProjectLuaRunReport {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct ProjectLuaSqliteError {
-    operation: &'static str,
-    code: Option<i32>,
-    message: String,
+    operation: ProjectLuaSqliteOperation,
+    failure: SqliteDriverFailure,
+    source: Arc<rusqlite::Error>,
+}
+
+impl PartialEq for ProjectLuaSqliteError {
+    fn eq(&self, other: &Self) -> bool {
+        self.operation == other.operation && self.failure == other.failure
+    }
+}
+
+impl Eq for ProjectLuaSqliteError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectLuaSqliteOperation {
+    EnableForeignKeys,
+    BeginImmediate,
+    InstallAuthorizer,
+    RemoveAuthorizer,
+    Commit,
+    Rollback,
+    ReadCurrentAttSchema,
+    ReadProtectedSchema,
+    QuickCheck,
+    ReadTempSchema,
+    InstallBusyHandler,
+    InstallCancellation,
+    ForeignKeyCheck,
+}
+
+impl ProjectLuaSqliteOperation {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::EnableForeignKeys => "enable_foreign_keys",
+            Self::BeginImmediate => "begin_immediate",
+            Self::InstallAuthorizer => "install_authorizer",
+            Self::RemoveAuthorizer => "remove_authorizer",
+            Self::Commit => "commit",
+            Self::Rollback => "rollback",
+            Self::ReadCurrentAttSchema => "read_current_att_schema",
+            Self::ReadProtectedSchema => "read_protected_schema",
+            Self::QuickCheck => "quick_check",
+            Self::ReadTempSchema => "read_temp_schema",
+            Self::InstallBusyHandler => "install_sqlite_busy_handler",
+            Self::InstallCancellation => "install_sqlite_cancellation",
+            Self::ForeignKeyCheck => "foreign_key_check",
+        }
+    }
+}
+
+impl AsRef<str> for ProjectLuaSqliteOperation {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for ProjectLuaSqliteOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 impl ProjectLuaSqliteError {
-    pub(crate) fn new(operation: &'static str, source: &rusqlite::Error) -> Self {
+    pub(crate) fn new(operation: ProjectLuaSqliteOperation, source: rusqlite::Error) -> Self {
         Self {
             operation,
-            code: source.sqlite_error().map(|error| error.extended_code),
-            message: source.to_string(),
+            failure: SqliteDriverFailure::from_error(&source),
+            source: Arc::new(source),
         }
     }
 
-    pub(crate) const fn operation(&self) -> &'static str {
+    #[cfg(test)]
+    pub(crate) const fn operation(&self) -> ProjectLuaSqliteOperation {
         self.operation
     }
 
+    #[cfg(test)]
     pub(crate) const fn sqlite_codes(&self) -> Option<(i32, i32)> {
-        match self.code {
-            Some(extended_code) => Some((extended_code & 0xff, extended_code)),
-            None => None,
+        match (self.failure.primary_code, self.failure.extended_code) {
+            (Some(primary), Some(extended)) => Some((primary, extended)),
+            _ => None,
         }
     }
 }
 
 impl fmt::Display for ProjectLuaSqliteError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.code {
-            Some(code) => write!(
-                formatter,
-                "{} 失败（SQLite code {code}）：{}",
-                self.operation, self.message
-            ),
-            None => write!(formatter, "{} 失败：{}", self.operation, self.message),
+        write!(formatter, "{} 失败", self.operation.as_str())
+    }
+}
+
+impl Error for ProjectLuaSqliteError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+impl fmt::Display for ProjectLuaDatabasePrerequisiteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cancelled => formatter.write_str("Lua 数据库前置检查已取消"),
+            Self::InvalidProjectState { .. } => formatter.write_str("Lua 数据库前置状态无效"),
+            Self::Sqlite(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for ProjectLuaDatabasePrerequisiteError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Sqlite(source) => Some(source),
+            Self::Cancelled | Self::InvalidProjectState { .. } => None,
         }
     }
 }
@@ -578,52 +841,122 @@ impl fmt::Display for ProjectLuaSqliteError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ProjectLuaFailure {
     Cancelled,
-    Context(String),
-    Compile(String),
-    Script(String),
-    DatabasePrerequisite(ProjectLuaDatabasePrerequisiteError),
-    Host {
-        domain: &'static str,
-        kind: &'static str,
-        operation: &'static str,
-        message: String,
+    Context(ProjectLuaContextFailure),
+    Compile {
+        script_identity: String,
+        failure: ProjectLuaCompilationFailure,
     },
+    Script {
+        script_identity: String,
+        failure: ProjectLuaScriptFailure,
+    },
+    DatabasePrerequisite(ProjectLuaDatabasePrerequisiteError),
+    Host(ProjectLuaCallError),
     Database(ProjectLuaSqliteError),
-    Validation(String),
+    Validation {
+        engine: crate::diagnostic::LuaEngine,
+        failure: ProjectLuaValidationFailure,
+    },
     Panicked,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectLuaContextFailure {
+    InterruptRegistration,
+    CancellationGuard,
+    InstructionHook,
+    ContextTable,
+    PublishContext,
+    Arguments,
+    PrintBinding,
+    RuntimeCreation,
+    RemoveExternalCapability,
+    ProtectedCallWrapper,
+    ThreadCreation,
+    ConcurrentSqliteWait,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectLuaCompilationFailure {
+    InvalidIdentity,
+    InvalidUtf8,
+    Backend {
+        category: LuaCompilerCategory,
+        line: Option<usize>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectLuaScriptFailure {
+    Yielded,
+    Backend(LuaCompilerCategory),
+    NonErrorValue,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectLuaValidationFailure {
+    #[cfg(test)]
+    AdapterState,
+    ForeignKey,
+    QuickCheck,
+    ProtectedSchemaChanged,
+    TemporarySchemaObject,
 }
 
 impl fmt::Display for ProjectLuaFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Cancelled => formatter.write_str("Lua 执行已取消"),
-            Self::Context(message) => write!(formatter, "无法建立 Lua 执行环境：{message}"),
-            Self::Compile(message) => write!(formatter, "Lua 脚本编译失败：{message}"),
-            Self::Script(message) => write!(formatter, "Lua 脚本运行失败：{message}"),
+            Self::Context(failure) => write!(formatter, "无法建立 Lua 执行环境：{failure:?}"),
+            Self::Compile { failure, .. } => write!(formatter, "Lua 脚本编译失败：{failure:?}"),
+            Self::Script { failure, .. } => write!(formatter, "Lua 脚本运行失败：{failure:?}"),
             Self::DatabasePrerequisite(ProjectLuaDatabasePrerequisiteError::Cancelled) => {
                 formatter.write_str("Lua 执行已取消")
             }
             Self::DatabasePrerequisite(
-                ProjectLuaDatabasePrerequisiteError::InvalidProjectState(message),
-            ) => {
-                write!(formatter, "Lua 执行前项目数据库状态无效：{message}")
-            }
+                ProjectLuaDatabasePrerequisiteError::InvalidProjectState { .. },
+            ) => formatter.write_str("Lua 执行前项目数据库状态无效"),
             Self::DatabasePrerequisite(ProjectLuaDatabasePrerequisiteError::Sqlite(error)) => {
                 write!(formatter, "Lua 执行前数据库检查失败：{error}")
             }
-            Self::Host {
-                domain,
-                kind,
-                operation,
-                message,
-            } => write!(
-                formatter,
-                "Lua Host 调用 {operation} 失败（{domain}/{kind}）：{message}"
-            ),
+            Self::Host(source) => write!(formatter, "Lua Host 调用失败：{source}"),
             Self::Database(error) => error.fmt(formatter),
-            Self::Validation(message) => write!(formatter, "Lua 提交前数据库校验失败：{message}"),
+            Self::Validation { failure, .. } => {
+                write!(formatter, "Lua 提交前数据库校验失败：{failure:?}")
+            }
             Self::Panicked => formatter.write_str("Lua worker panic"),
         }
+    }
+}
+
+impl Error for ProjectLuaFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::DatabasePrerequisite(source) => Some(source),
+            Self::Host(source) => Some(source),
+            Self::Database(source) => Some(source),
+            Self::Cancelled
+            | Self::Context(_)
+            | Self::Compile { .. }
+            | Self::Script { .. }
+            | Self::Validation { .. }
+            | Self::Panicked => None,
+        }
+    }
+}
+
+impl ProjectLuaFailure {
+    /// 脚本预检尚未建立写事务；数据库类错误仍使用调用方提供的真实项目路径。
+    pub(crate) fn preflight_diagnostic_report(
+        &self,
+        database_path: &std::path::Path,
+    ) -> DiagnosticReport {
+        failure_report(
+            self,
+            database_path,
+            StateEffect::Unchanged,
+            SqliteTransactionState::NotStarted,
+        )
     }
 }
 
@@ -659,7 +992,302 @@ impl fmt::Display for ProjectLuaRunError {
     }
 }
 
-impl Error for ProjectLuaRunError {}
+impl Error for ProjectLuaRunError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::NotStarted(failure) | Self::RolledBack(failure) => Some(failure),
+            Self::RollbackOutcomeUnknown { failure, .. } => Some(failure),
+            Self::CommitOutcomeUnknown(source) => Some(source),
+        }
+    }
+}
+
+impl ProjectLuaRunError {
+    pub(crate) fn diagnostic_report(&self, database_path: &std::path::Path) -> DiagnosticReport {
+        match self {
+            Self::NotStarted(failure) => failure_report(
+                failure,
+                database_path,
+                StateEffect::Unchanged,
+                SqliteTransactionState::NotStarted,
+            ),
+            Self::RolledBack(failure) => failure_report(
+                failure,
+                database_path,
+                StateEffect::Unchanged,
+                SqliteTransactionState::RolledBack,
+            ),
+            Self::RollbackOutcomeUnknown { failure, rollback } => failure_report(
+                failure,
+                database_path,
+                StateEffect::OutcomeUnknown,
+                SqliteTransactionState::OutcomeUnknown,
+            )
+            .with_related(
+                RelatedFailureRelation::Rollback,
+                sqlite_report(
+                    rollback,
+                    database_path,
+                    StateEffect::OutcomeUnknown,
+                    SqliteTransactionState::OutcomeUnknown,
+                ),
+            ),
+            Self::CommitOutcomeUnknown(source) => sqlite_report(
+                source,
+                database_path,
+                StateEffect::OutcomeUnknown,
+                SqliteTransactionState::OutcomeUnknown,
+            ),
+        }
+    }
+}
+
+fn failure_report(
+    failure: &ProjectLuaFailure,
+    database_path: &std::path::Path,
+    effect: StateEffect,
+    transaction: SqliteTransactionState,
+) -> DiagnosticReport {
+    match failure {
+        ProjectLuaFailure::Database(source)
+        | ProjectLuaFailure::DatabasePrerequisite(ProjectLuaDatabasePrerequisiteError::Sqlite(
+            source,
+        )) => sqlite_report(source, database_path, effect, transaction),
+        ProjectLuaFailure::Cancelled
+        | ProjectLuaFailure::DatabasePrerequisite(ProjectLuaDatabasePrerequisiteError::Cancelled) => {
+            DiagnosticReport::new(
+                effect,
+                Diagnostic::lua(LuaIssue::new(LuaProblem::Cancelled)),
+            )
+        }
+        ProjectLuaFailure::Context(problem) => DiagnosticReport::new(
+            effect,
+            Diagnostic::lua(LuaIssue::new(LuaProblem::ContextCreation {
+                problem: context_problem(*problem),
+            })),
+        ),
+        ProjectLuaFailure::Compile {
+            script_identity,
+            failure,
+        } => DiagnosticReport::new(
+            effect,
+            Diagnostic::lua(LuaIssue::new(LuaProblem::Compilation {
+                script: SafePath::new(script_identity),
+                problem: compilation_problem(*failure),
+                line: compilation_line(*failure),
+            })),
+        ),
+        ProjectLuaFailure::Script {
+            script_identity,
+            failure,
+        } => DiagnosticReport::new(
+            effect,
+            Diagnostic::lua(LuaIssue::new(LuaProblem::ScriptExecution {
+                script: SafePath::new(script_identity),
+                problem: script_problem(*failure),
+            })),
+        ),
+        ProjectLuaFailure::DatabasePrerequisite(
+            ProjectLuaDatabasePrerequisiteError::InvalidProjectState { engine, violation },
+        ) => DiagnosticReport::new(
+            effect,
+            Diagnostic::lua(LuaIssue::new(LuaProblem::DatabasePrerequisite {
+                engine: Some(*engine),
+                violation: *violation,
+            })),
+        ),
+        ProjectLuaFailure::Validation { engine, failure } => DiagnosticReport::new(
+            effect,
+            Diagnostic::lua(LuaIssue::new(LuaProblem::Validation {
+                engine: *engine,
+                problem: validation_problem(*failure),
+            })),
+        ),
+        ProjectLuaFailure::Host(source) => match &source.issue {
+            ProjectLuaCallIssue::Sqlite { failure, .. } => DiagnosticReport::new(
+                effect,
+                Diagnostic::sqlite(SqliteIssue::new(
+                    SqliteDiagnosticContext::new(
+                        SqliteDiagnosticStage::Lua,
+                        source
+                            .operation
+                            .map_or(SqliteOperation::Execute, lua_sqlite_operation),
+                        transaction,
+                    ),
+                    SqliteProblem::Driver {
+                        database: SafePath::new(database_path),
+                        query_id: source.operation.map(|operation| {
+                            SafeIdentifier::from_validated(lua_host_operation_name(operation))
+                        }),
+                        query_ordinal: None,
+                        failure: failure.clone(),
+                    },
+                )),
+            ),
+            ProjectLuaCallIssue::WorkerSpawn { failure, .. } => DiagnosticReport::new(
+                effect,
+                Diagnostic::runtime(RuntimeIssue::Io {
+                    component: RuntimeComponent::CpuExecutor,
+                    operation: RuntimeOperation::StartWorker,
+                    failure: failure.clone(),
+                }),
+            ),
+            ProjectLuaCallIssue::Cancelled => DiagnosticReport::new(
+                effect,
+                Diagnostic::lua(LuaIssue::new(LuaProblem::Cancelled)),
+            ),
+            ProjectLuaCallIssue::Violation(violation) => match (source.engine, source.operation) {
+                (Some(engine), Some(operation)) => DiagnosticReport::new(
+                    effect,
+                    Diagnostic::lua(LuaIssue::new(LuaProblem::HostCall {
+                        engine,
+                        operation,
+                        violation: *violation,
+                        field: source.field.clone(),
+                        locator: source.locator.clone(),
+                    })),
+                ),
+                _ => DiagnosticReport::new(
+                    effect,
+                    Diagnostic::lua(LuaIssue::new(LuaProblem::ContextCreation {
+                        problem: LuaContextProblem::ContextTable,
+                    })),
+                ),
+            },
+        },
+        ProjectLuaFailure::Panicked => DiagnosticReport::new(
+            effect,
+            Diagnostic::lua(LuaIssue::new(LuaProblem::WorkerPanicked)),
+        ),
+    }
+}
+
+fn sqlite_report(
+    source: &ProjectLuaSqliteError,
+    database_path: &std::path::Path,
+    effect: StateEffect,
+    transaction: SqliteTransactionState,
+) -> DiagnosticReport {
+    DiagnosticReport::new(
+        effect,
+        Diagnostic::sqlite(SqliteIssue::new(
+            SqliteDiagnosticContext::new(
+                SqliteDiagnosticStage::Lua,
+                source.operation.sqlite_operation(),
+                transaction,
+            ),
+            SqliteProblem::Driver {
+                database: SafePath::new(database_path),
+                query_id: Some(SafeIdentifier::from_validated(source.operation.as_str())),
+                query_ordinal: None,
+                failure: source.failure.clone(),
+            },
+        )),
+    )
+}
+
+const fn context_problem(failure: ProjectLuaContextFailure) -> LuaContextProblem {
+    match failure {
+        ProjectLuaContextFailure::InterruptRegistration => LuaContextProblem::InterruptRegistration,
+        ProjectLuaContextFailure::CancellationGuard => LuaContextProblem::CancellationGuard,
+        ProjectLuaContextFailure::InstructionHook => LuaContextProblem::InstructionHook,
+        ProjectLuaContextFailure::ContextTable => LuaContextProblem::ContextTable,
+        ProjectLuaContextFailure::PublishContext => LuaContextProblem::PublishContext,
+        ProjectLuaContextFailure::Arguments => LuaContextProblem::Arguments,
+        ProjectLuaContextFailure::PrintBinding => LuaContextProblem::PrintBinding,
+        ProjectLuaContextFailure::RuntimeCreation => LuaContextProblem::RuntimeCreation,
+        ProjectLuaContextFailure::RemoveExternalCapability => {
+            LuaContextProblem::RemoveExternalCapability
+        }
+        ProjectLuaContextFailure::ProtectedCallWrapper => LuaContextProblem::ProtectedCallWrapper,
+        ProjectLuaContextFailure::ThreadCreation => LuaContextProblem::ThreadCreation,
+        ProjectLuaContextFailure::ConcurrentSqliteWait => LuaContextProblem::ConcurrentSqliteWait,
+    }
+}
+
+const fn compilation_problem(failure: ProjectLuaCompilationFailure) -> LuaCompilationProblem {
+    match failure {
+        ProjectLuaCompilationFailure::InvalidIdentity => LuaCompilationProblem::InvalidIdentity,
+        ProjectLuaCompilationFailure::InvalidUtf8 => LuaCompilationProblem::InvalidUtf8,
+        ProjectLuaCompilationFailure::Backend { category, .. } => {
+            LuaCompilationProblem::Backend { category }
+        }
+    }
+}
+
+const fn compilation_line(failure: ProjectLuaCompilationFailure) -> Option<usize> {
+    match failure {
+        ProjectLuaCompilationFailure::Backend { line, .. } => line,
+        ProjectLuaCompilationFailure::InvalidIdentity
+        | ProjectLuaCompilationFailure::InvalidUtf8 => None,
+    }
+}
+
+const fn script_problem(failure: ProjectLuaScriptFailure) -> LuaScriptProblem {
+    match failure {
+        ProjectLuaScriptFailure::Yielded => LuaScriptProblem::Yielded,
+        ProjectLuaScriptFailure::NonErrorValue => LuaScriptProblem::NonErrorValue,
+        ProjectLuaScriptFailure::Backend(category) => LuaScriptProblem::Backend { category },
+    }
+}
+
+const fn validation_problem(failure: ProjectLuaValidationFailure) -> LuaValidationProblem {
+    match failure {
+        #[cfg(test)]
+        ProjectLuaValidationFailure::AdapterState => LuaValidationProblem::AdapterState,
+        ProjectLuaValidationFailure::ProtectedSchemaChanged => {
+            LuaValidationProblem::ProtectedSchemaChanged
+        }
+        ProjectLuaValidationFailure::TemporarySchemaObject => {
+            LuaValidationProblem::TemporarySchemaObject
+        }
+        ProjectLuaValidationFailure::ForeignKey => LuaValidationProblem::ForeignKey,
+        ProjectLuaValidationFailure::QuickCheck => LuaValidationProblem::QuickCheck,
+    }
+}
+
+fn project_lua_engine(project: &ProjectLuaProject) -> crate::diagnostic::LuaEngine {
+    match project.engine() {
+        "rpg_maker" => crate::diagnostic::LuaEngine::RpgMaker,
+        _ => crate::diagnostic::LuaEngine::Generic,
+    }
+}
+
+impl ProjectLuaSqliteOperation {
+    const fn sqlite_operation(self) -> SqliteOperation {
+        match self {
+            Self::Commit | Self::Rollback | Self::BeginImmediate => SqliteOperation::Transaction,
+            Self::ReadCurrentAttSchema
+            | Self::ReadProtectedSchema
+            | Self::QuickCheck
+            | Self::ReadTempSchema => SqliteOperation::Query,
+            Self::EnableForeignKeys
+            | Self::InstallAuthorizer
+            | Self::RemoveAuthorizer
+            | Self::InstallBusyHandler
+            | Self::InstallCancellation
+            | Self::ForeignKeyCheck => SqliteOperation::Execute,
+        }
+    }
+}
+
+const fn lua_sqlite_operation(operation: LuaOperation) -> SqliteOperation {
+    match operation {
+        LuaOperation::QueryDatabase => SqliteOperation::Query,
+        LuaOperation::BeginTransaction
+        | LuaOperation::CommitTransaction
+        | LuaOperation::RollbackTransaction => SqliteOperation::Transaction,
+        LuaOperation::SetTranslation
+        | LuaOperation::ClearTranslation
+        | LuaOperation::ValidateDatabase
+        | LuaOperation::ValidatePrerequisites
+        | LuaOperation::InstallAuthorizer
+        | LuaOperation::RemoveAuthorizer
+        | LuaOperation::CreateContext
+        | LuaOperation::CompileScript
+        | LuaOperation::ExecuteScript => SqliteOperation::Execute,
+    }
+}
 
 /// 在调用方已经打开的现存项目数据库上运行一个原子脚本。
 ///
@@ -689,6 +1317,7 @@ fn execute_prepared(
         connection,
         metrics,
         transaction_guard,
+        script_identity,
     } = prepared;
 
     request
@@ -702,7 +1331,7 @@ fn execute_prepared(
     {
         request.cancellation.unregister_interrupt();
         return Err(ProjectLuaRunError::NotStarted(ProjectLuaFailure::Database(
-            ProjectLuaSqliteError::new("enable_foreign_keys", &source),
+            ProjectLuaSqliteError::new(ProjectLuaSqliteOperation::EnableForeignKeys, source),
         )));
     }
 
@@ -724,7 +1353,10 @@ fn execute_prepared(
             ) {
             ProjectLuaFailure::Cancelled
         } else {
-            ProjectLuaFailure::Database(ProjectLuaSqliteError::new("begin_immediate", &source))
+            ProjectLuaFailure::Database(ProjectLuaSqliteError::new(
+                ProjectLuaSqliteOperation::BeginImmediate,
+                source,
+            ))
         };
         return Err(ProjectLuaRunError::NotStarted(failure));
     }
@@ -794,17 +1426,11 @@ fn execute_prepared(
         Ok(Ok(())) => None,
         Ok(Err(_)) if request.cancellation.is_cancelled() => Some(ProjectLuaFailure::Cancelled),
         Ok(Err(error)) if error.kind() == "cancelled" => Some(ProjectLuaFailure::Cancelled),
-        Ok(Err(error)) => Some(
-            match clone_project_lua_text_with_cancellation(error.message(), &request.cancellation) {
-                Ok(message) => ProjectLuaFailure::Host {
-                    domain: "translation",
-                    kind: error.kind(),
-                    operation: "translation.capture",
-                    message,
-                },
-                Err(failure) => failure,
-            },
-        ),
+        Ok(Err(error)) => Some(ProjectLuaFailure::Host(
+            error
+                .with_engine(project_lua_engine(&request.project))
+                .with_operation(LuaOperation::ValidatePrerequisites),
+        )),
         Err(_) => Some(ProjectLuaFailure::Panicked),
     };
     if let Some(failure) = capture_failure {
@@ -817,12 +1443,21 @@ fn execute_prepared(
         return rollback_after_failure(
             &connection,
             &request.cancellation,
-            ProjectLuaFailure::Database(ProjectLuaSqliteError::new("install_authorizer", &source)),
+            ProjectLuaFailure::Database(ProjectLuaSqliteError::new(
+                ProjectLuaSqliteOperation::InstallAuthorizer,
+                source,
+            )),
         );
     }
 
     let execution = catch_unwind(AssertUnwindSafe(|| {
-        binding::execute(&lua, function, &request.cancellation)
+        binding::execute(
+            &lua,
+            function,
+            &script_identity,
+            project_lua_engine(&request.project),
+            &request.cancellation,
+        )
     }));
     let failure = match execution {
         Ok(Ok(())) if request.cancellation.is_cancelled() => Some(ProjectLuaFailure::Cancelled),
@@ -838,12 +1473,11 @@ fn execute_prepared(
         return finish_confirmed_rollback(
             &connection,
             &request.cancellation,
-            ProjectLuaFailure::Host {
-                domain: "database",
-                kind: "transaction_lost",
-                operation: "transaction",
-                message: "SQL 提前结束了 ATT 外层事务；后续数据库调用已被拒绝".to_owned(),
-            },
+            ProjectLuaFailure::Host(
+                ProjectLuaCallError::violation(LuaValueViolation::TransactionLost)
+                    .with_engine(project_lua_engine(&request.project))
+                    .with_operation(LuaOperation::RollbackTransaction),
+            ),
         );
     }
     if let Some(failure) = failure {
@@ -854,7 +1488,10 @@ fn execute_prepared(
         return rollback_after_failure(
             &connection,
             &request.cancellation,
-            ProjectLuaFailure::Database(ProjectLuaSqliteError::new("remove_authorizer", &source)),
+            ProjectLuaFailure::Database(ProjectLuaSqliteError::new(
+                ProjectLuaSqliteOperation::RemoveAuthorizer,
+                source,
+            )),
         );
     }
 
@@ -887,12 +1524,17 @@ fn execute_prepared(
     let commit = connection.borrow().execute_batch("COMMIT");
     match commit {
         Ok(()) => Ok(metrics.report()),
-        Err(source) if connection.borrow().is_autocommit() => Err(
-            ProjectLuaRunError::CommitOutcomeUnknown(ProjectLuaSqliteError::new("commit", &source)),
-        ),
+        Err(source) if connection.borrow().is_autocommit() => {
+            Err(ProjectLuaRunError::CommitOutcomeUnknown(
+                ProjectLuaSqliteError::new(ProjectLuaSqliteOperation::Commit, source),
+            ))
+        }
         Err(source) => rollback_after_commit_failure(
             &connection,
-            ProjectLuaFailure::Database(ProjectLuaSqliteError::new("commit", &source)),
+            ProjectLuaFailure::Database(ProjectLuaSqliteError::new(
+                ProjectLuaSqliteOperation::Commit,
+                source,
+            )),
         ),
     }
 }
@@ -937,7 +1579,7 @@ fn rollback(
         Ok(()) => Err(ProjectLuaRunError::RolledBack(failure)),
         Err(source) => Err(ProjectLuaRunError::RollbackOutcomeUnknown {
             failure,
-            rollback: ProjectLuaSqliteError::new("rollback", &source),
+            rollback: ProjectLuaSqliteError::new(ProjectLuaSqliteOperation::Rollback, source),
         }),
     }
 }
@@ -990,7 +1632,7 @@ fn install_sqlite_cancellation(
     });
     if !installed {
         return Err(ProjectLuaFailure::Context(
-            "当前 worker 已有另一次 SQLite Lua 等待".to_owned(),
+            ProjectLuaContextFailure::ConcurrentSqliteWait,
         ));
     }
 
@@ -1002,8 +1644,8 @@ fn install_sqlite_cancellation(
             *mode.borrow_mut() = None;
         });
         return Err(ProjectLuaFailure::Database(ProjectLuaSqliteError::new(
-            "install_sqlite_busy_handler",
-            &source,
+            ProjectLuaSqliteOperation::InstallBusyHandler,
+            source,
         )));
     }
 
@@ -1019,8 +1661,8 @@ fn install_sqlite_cancellation(
             *mode.borrow_mut() = None;
         });
         return Err(ProjectLuaFailure::Database(ProjectLuaSqliteError::new(
-            "install_sqlite_cancellation",
-            &source,
+            ProjectLuaSqliteOperation::InstallCancellation,
+            source,
         )));
     }
 
@@ -1190,39 +1832,17 @@ fn ensure_project_lua_running(
     }
 }
 
-fn clone_project_lua_text_with_cancellation(
-    source: &str,
-    cancellation: &ProjectLuaCancellation,
-) -> Result<String, ProjectLuaFailure> {
-    ensure_project_lua_running(cancellation)?;
-    let mut cloned = String::with_capacity(source.len());
-    let mut start = 0;
-    while start < source.len() {
-        ensure_project_lua_running(cancellation)?;
-        let mut end = start
-            .saturating_add(PROJECT_LUA_SOURCE_CHUNK_BYTES.get())
-            .min(source.len());
-        while !source.is_char_boundary(end) {
-            end -= 1;
-        }
-        cloned.push_str(&source[start..end]);
-        start = end;
-    }
-    ensure_project_lua_running(cancellation)?;
-    Ok(cloned)
-}
-
 fn sqlite_schema_text_with_cancellation(
     row: &rusqlite::Row<'_>,
     index: usize,
     column: &'static str,
-    operation: &'static str,
+    operation: ProjectLuaSqliteOperation,
     cancellation: &ProjectLuaCancellation,
 ) -> Result<String, ProjectLuaFailure> {
     ensure_project_lua_running(cancellation)?;
     match row
         .get_ref(index)
-        .map_err(|source| project_lua_sqlite_failure(operation, &source))?
+        .map_err(|source| project_lua_sqlite_failure(operation, source))?
     {
         rusqlite::types::ValueRef::Text(bytes) => {
             clone_sqlite_schema_text_with_cancellation(bytes, index, operation, cancellation)
@@ -1230,7 +1850,7 @@ fn sqlite_schema_text_with_cancellation(
         value => {
             let source =
                 rusqlite::Error::InvalidColumnType(index, column.to_owned(), value.data_type());
-            Err(project_lua_sqlite_failure(operation, &source))
+            Err(project_lua_sqlite_failure(operation, source))
         }
     }
 }
@@ -1239,13 +1859,13 @@ fn sqlite_optional_schema_text_with_cancellation(
     row: &rusqlite::Row<'_>,
     index: usize,
     column: &'static str,
-    operation: &'static str,
+    operation: ProjectLuaSqliteOperation,
     cancellation: &ProjectLuaCancellation,
 ) -> Result<Option<String>, ProjectLuaFailure> {
     ensure_project_lua_running(cancellation)?;
     match row
         .get_ref(index)
-        .map_err(|source| project_lua_sqlite_failure(operation, &source))?
+        .map_err(|source| project_lua_sqlite_failure(operation, source))?
     {
         rusqlite::types::ValueRef::Null => Ok(None),
         rusqlite::types::ValueRef::Text(bytes) => {
@@ -1255,7 +1875,7 @@ fn sqlite_optional_schema_text_with_cancellation(
         value => {
             let source =
                 rusqlite::Error::InvalidColumnType(index, column.to_owned(), value.data_type());
-            Err(project_lua_sqlite_failure(operation, &source))
+            Err(project_lua_sqlite_failure(operation, source))
         }
     }
 }
@@ -1263,7 +1883,7 @@ fn sqlite_optional_schema_text_with_cancellation(
 fn clone_sqlite_schema_text_with_cancellation(
     bytes: &[u8],
     index: usize,
-    operation: &'static str,
+    operation: ProjectLuaSqliteOperation,
     cancellation: &ProjectLuaCancellation,
 ) -> Result<String, ProjectLuaFailure> {
     ensure_project_lua_running(cancellation)?;
@@ -1291,7 +1911,7 @@ fn clone_sqlite_schema_text_with_cancellation(
                     rusqlite::types::Type::Text,
                     Box::new(source),
                 );
-                return Err(project_lua_sqlite_failure(operation, &source));
+                return Err(project_lua_sqlite_failure(operation, source));
             }
         }
     }
@@ -1302,22 +1922,22 @@ fn clone_sqlite_schema_text_with_cancellation(
             rusqlite::types::Type::Text,
             Box::new(source),
         );
-        return Err(project_lua_sqlite_failure(operation, &source));
+        return Err(project_lua_sqlite_failure(operation, source));
     }
     ensure_project_lua_running(cancellation)?;
     Ok(text)
 }
 
 fn project_lua_sqlite_failure(
-    operation: &'static str,
-    source: &rusqlite::Error,
+    operation: ProjectLuaSqliteOperation,
+    source: rusqlite::Error,
 ) -> ProjectLuaFailure {
     ProjectLuaFailure::Database(ProjectLuaSqliteError::new(operation, source))
 }
 
 fn sqlite_result_with_cancellation<T>(
     result: rusqlite::Result<T>,
-    operation: &'static str,
+    operation: ProjectLuaSqliteOperation,
     cancellation: &ProjectLuaCancellation,
 ) -> Result<T, ProjectLuaFailure> {
     match result {
@@ -1334,7 +1954,7 @@ fn sqlite_result_with_cancellation<T>(
         {
             Err(ProjectLuaFailure::Cancelled)
         }
-        Err(source) => Err(project_lua_sqlite_failure(operation, &source)),
+        Err(source) => Err(project_lua_sqlite_failure(operation, source)),
     }
 }
 
@@ -1410,24 +2030,26 @@ fn snapshot_protected_schema(
              WHERE type IN ('table', 'index', 'view', 'trigger')
              ORDER BY type, name",
         ),
-        "read_protected_schema",
+        ProjectLuaSqliteOperation::ReadProtectedSchema,
         cancellation,
     )?;
     let mut rows = sqlite_result_with_cancellation(
         statement.query([]),
-        "read_protected_schema",
+        ProjectLuaSqliteOperation::ReadProtectedSchema,
         cancellation,
     )?;
     let mut entries = Vec::new();
-    while let Some(row) =
-        sqlite_result_with_cancellation(rows.next(), "read_protected_schema", cancellation)?
-    {
+    while let Some(row) = sqlite_result_with_cancellation(
+        rows.next(),
+        ProjectLuaSqliteOperation::ReadProtectedSchema,
+        cancellation,
+    )? {
         ensure_project_lua_running(cancellation)?;
         let raw_kind = sqlite_schema_text_with_cancellation(
             row,
             0,
             "type",
-            "read_protected_schema",
+            ProjectLuaSqliteOperation::ReadProtectedSchema,
             cancellation,
         )?;
         let Some(kind) = ProjectLuaSchemaObjectKind::from_sqlite(&raw_kind) else {
@@ -1437,21 +2059,21 @@ fn snapshot_protected_schema(
             row,
             1,
             "name",
-            "read_protected_schema",
+            ProjectLuaSqliteOperation::ReadProtectedSchema,
             cancellation,
         )?;
         let table_name = sqlite_schema_text_with_cancellation(
             row,
             2,
             "tbl_name",
-            "read_protected_schema",
+            ProjectLuaSqliteOperation::ReadProtectedSchema,
             cancellation,
         )?;
         let sql = sqlite_optional_schema_text_with_cancellation(
             row,
             3,
             "sql",
-            "read_protected_schema",
+            ProjectLuaSqliteOperation::ReadProtectedSchema,
             cancellation,
         )?;
         ensure_project_lua_running(cancellation)?;
@@ -1488,11 +2110,17 @@ fn validate_before_commit(
     ensure_project_lua_running(cancellation)?;
     let current_schema = snapshot_protected_schema(connection, adapter, cancellation)?;
     if !protected_schema_eq_with_cancellation(&current_schema, protected_schema, cancellation)? {
-        return Err(ProjectLuaFailure::Validation(
-            "ATT 管理的 SQLite schema 已改变".to_owned(),
-        ));
+        return Err(ProjectLuaFailure::Validation {
+            engine: project_lua_engine(project),
+            failure: ProjectLuaValidationFailure::ProtectedSchemaChanged,
+        });
     }
-    validate_no_protected_temp_schema(connection, adapter, cancellation)?;
+    validate_no_protected_temp_schema(
+        connection,
+        adapter,
+        project_lua_engine(project),
+        cancellation,
+    )?;
 
     ensure_project_lua_running(cancellation)?;
     if let Err(error) = adapter.validate_database(connection, project) {
@@ -1500,58 +2128,65 @@ fn validate_before_commit(
             return Err(ProjectLuaFailure::Cancelled);
         }
         ensure_project_lua_running(cancellation)?;
-        let message = clone_project_lua_text_with_cancellation(error.message(), cancellation)?;
-        return Err(ProjectLuaFailure::Host {
-            domain: "translation",
-            kind: error.kind(),
-            operation: "translation.validate",
-            message,
-        });
+        return Err(ProjectLuaFailure::Host(
+            error
+                .with_engine(project_lua_engine(project))
+                .with_operation(LuaOperation::ValidateDatabase),
+        ));
     }
     ensure_project_lua_running(cancellation)?;
     let has_foreign_key_violation = sqlite_result_with_cancellation(
         connection
             .prepare("PRAGMA main.foreign_key_check")
             .and_then(|mut statement| statement.exists([])),
-        "foreign_key_check",
+        ProjectLuaSqliteOperation::ForeignKeyCheck,
         cancellation,
     )?;
     if has_foreign_key_violation {
-        return Err(ProjectLuaFailure::Validation(
-            "SQLite foreign_key_check 返回了违规记录".to_owned(),
-        ));
+        return Err(ProjectLuaFailure::Validation {
+            engine: project_lua_engine(project),
+            failure: ProjectLuaValidationFailure::ForeignKey,
+        });
     }
 
     ensure_project_lua_running(cancellation)?;
     let mut statement = sqlite_result_with_cancellation(
         connection.prepare("PRAGMA main.quick_check"),
-        "quick_check",
+        ProjectLuaSqliteOperation::QuickCheck,
         cancellation,
     )?;
-    let mut rows =
-        sqlite_result_with_cancellation(statement.query([]), "quick_check", cancellation)?;
+    let mut rows = sqlite_result_with_cancellation(
+        statement.query([]),
+        ProjectLuaSqliteOperation::QuickCheck,
+        cancellation,
+    )?;
     let mut row_count = 0_u64;
-    while let Some(row) = sqlite_result_with_cancellation(rows.next(), "quick_check", cancellation)?
-    {
+    while let Some(row) = sqlite_result_with_cancellation(
+        rows.next(),
+        ProjectLuaSqliteOperation::QuickCheck,
+        cancellation,
+    )? {
         ensure_project_lua_running(cancellation)?;
         row_count = row_count.saturating_add(1);
         let result = sqlite_schema_text_with_cancellation(
             row,
             0,
             "quick_check",
-            "quick_check",
+            ProjectLuaSqliteOperation::QuickCheck,
             cancellation,
         )?;
         if !project_lua_text_eq_with_cancellation(&result, "ok", cancellation)? {
-            return Err(ProjectLuaFailure::Validation(
-                "SQLite quick_check 报告数据库结构错误".to_owned(),
-            ));
+            return Err(ProjectLuaFailure::Validation {
+                engine: project_lua_engine(project),
+                failure: ProjectLuaValidationFailure::QuickCheck,
+            });
         }
     }
     if row_count != 1 {
-        return Err(ProjectLuaFailure::Validation(
-            "SQLite quick_check 未返回唯一的 ok".to_owned(),
-        ));
+        return Err(ProjectLuaFailure::Validation {
+            engine: project_lua_engine(project),
+            failure: ProjectLuaValidationFailure::QuickCheck,
+        });
     }
     ensure_project_lua_running(cancellation)
 }
@@ -1559,6 +2194,7 @@ fn validate_before_commit(
 fn validate_no_protected_temp_schema(
     connection: &Connection,
     adapter: &dyn ProjectLuaEngineAdapter,
+    engine: LuaEngine,
     cancellation: &ProjectLuaCancellation,
 ) -> Result<(), ProjectLuaFailure> {
     ensure_project_lua_running(cancellation)?;
@@ -1568,27 +2204,42 @@ fn validate_no_protected_temp_schema(
              FROM temp.sqlite_schema
              WHERE type IN ('table', 'index', 'view', 'trigger')",
         ),
-        "read_temp_schema",
+        ProjectLuaSqliteOperation::ReadTempSchema,
         cancellation,
     )?;
-    let mut rows =
-        sqlite_result_with_cancellation(statement.query([]), "read_temp_schema", cancellation)?;
-    while let Some(row) =
-        sqlite_result_with_cancellation(rows.next(), "read_temp_schema", cancellation)?
-    {
+    let mut rows = sqlite_result_with_cancellation(
+        statement.query([]),
+        ProjectLuaSqliteOperation::ReadTempSchema,
+        cancellation,
+    )?;
+    while let Some(row) = sqlite_result_with_cancellation(
+        rows.next(),
+        ProjectLuaSqliteOperation::ReadTempSchema,
+        cancellation,
+    )? {
         ensure_project_lua_running(cancellation)?;
-        let raw_kind =
-            sqlite_schema_text_with_cancellation(row, 0, "type", "read_temp_schema", cancellation)?;
+        let raw_kind = sqlite_schema_text_with_cancellation(
+            row,
+            0,
+            "type",
+            ProjectLuaSqliteOperation::ReadTempSchema,
+            cancellation,
+        )?;
         let Some(kind) = ProjectLuaSchemaObjectKind::from_sqlite(&raw_kind) else {
             continue;
         };
-        let name =
-            sqlite_schema_text_with_cancellation(row, 1, "name", "read_temp_schema", cancellation)?;
+        let name = sqlite_schema_text_with_cancellation(
+            row,
+            1,
+            "name",
+            ProjectLuaSqliteOperation::ReadTempSchema,
+            cancellation,
+        )?;
         let table_name = sqlite_schema_text_with_cancellation(
             row,
             2,
             "tbl_name",
-            "read_temp_schema",
+            ProjectLuaSqliteOperation::ReadTempSchema,
             cancellation,
         )?;
         ensure_project_lua_running(cancellation)?;
@@ -1604,9 +2255,10 @@ fn validate_no_protected_temp_schema(
             );
         ensure_project_lua_running(cancellation)?;
         if protected {
-            return Err(ProjectLuaFailure::Validation(
-                "TEMP schema 不能使用 ATT 管理的对象名称".to_owned(),
-            ));
+            return Err(ProjectLuaFailure::Validation {
+                engine,
+                failure: ProjectLuaValidationFailure::TemporarySchemaObject,
+            });
         }
     }
     ensure_project_lua_running(cancellation)
