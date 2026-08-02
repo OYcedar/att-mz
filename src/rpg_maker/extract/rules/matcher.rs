@@ -14,8 +14,13 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 
 use crate::diagnostic::{
-    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
-    DiagnosticStage, DiagnosticSubject, SafeDiagnostic,
+    ByteRange, Diagnostic, DiagnosticReport, Pcre2Failure, Pcre2FailureKind, RpgMakerIssue,
+    RpgMakerJsonFailureKind, RpgMakerJsonValueKind, RpgMakerProjectionFailureKind,
+    RpgMakerRulesCommandNonStringFact,
+    RpgMakerRulesCommandNonStringType as DiagnosticNonStringType, RpgMakerRulesDiagnosticSource,
+    RpgMakerRulesInvalidTarget, RpgMakerRulesMatchContext, RpgMakerRulesMatchProblem,
+    RpgMakerRulesMatchSource, RpgMakerRulesMaterializationFailure, RpgMakerRulesValueStep,
+    SafeIdentifier, SafeText, StateEffect,
 };
 use crate::json::{StackSafeJsonError, StackSafeJsonValue, from_str as parse_json};
 use crate::rpg_maker::model::{
@@ -31,7 +36,7 @@ use super::super::{RulesCommandNonStringType, RulesCommandNonStringWarning};
 #[cfg(test)]
 use super::definition::RulesDefinition;
 use super::definition::{
-    CompiledPath, FileRuleSource, PathSegment, RuleDefinition, RuleSource, pcre2_error_detail,
+    CompiledPath, FileRuleSource, PathSegment, RuleDefinition, RuleSource, write_pcre2_error,
 };
 
 /// 一组已经由文档读取边界冻结的 Rules 输入。
@@ -171,16 +176,18 @@ impl JsonValueKind {
             Some(Value::Object(_)) => Self::Object,
         }
     }
+}
 
-    const fn as_str(self) -> &'static str {
+impl fmt::Display for JsonValueKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Missing => "missing",
-            Self::Null => "null",
-            Self::Boolean => "boolean",
-            Self::Number => "number",
-            Self::String => "string",
-            Self::Array => "array",
-            Self::Object => "object",
+            Self::Missing => formatter.write_str("缺失"),
+            Self::Null => formatter.write_str("null"),
+            Self::Boolean => formatter.write_str("布尔值"),
+            Self::Number => formatter.write_str("数字"),
+            Self::String => formatter.write_str("字符串"),
+            Self::Array => formatter.write_str("数组"),
+            Self::Object => formatter.write_str("对象"),
         }
     }
 }
@@ -214,39 +221,37 @@ impl RulesMatchContext {
             has_declared_path: rule.path().is_some(),
         }
     }
+}
 
-    fn safe_detail(&self) -> String {
-        let mut detail = match &self.source {
-            RulesDiagnosticSource::DataFile { file } => {
-                format!("source=data_file; file={}", json_string(file))
-            }
-            RulesDiagnosticSource::Plugin {
+impl fmt::Display for RulesDiagnosticSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DataFile { file } => write!(formatter, "数据文件 {file:?}"),
+            Self::Plugin {
                 plugin_index,
                 plugin_name,
-            } => format!(
-                "source=plugin; plugin_index={plugin_index}; plugin={}",
-                json_string(plugin_name)
-            ),
-            RulesDiagnosticSource::Command {
+            } => write!(formatter, "索引为 {plugin_index} 的插件 {plugin_name:?}"),
+            Self::Command {
                 file,
                 code,
                 parameter,
-            } => format!(
-                "source=command; file={}; code={code}; parameter={parameter}",
-                json_string(file)
+            } => write!(
+                formatter,
+                "文件 {file:?} 中 code 为 {code} 的事件命令的第 {parameter} 个参数"
             ),
-        };
-        if self.has_declared_path {
-            detail.push_str("; target=path");
-        } else {
-            detail.push_str("; target=command_parameter");
         }
-        detail
     }
 }
 
-fn json_string(value: &str) -> String {
-    serde_json::to_string(value).expect("字符串始终可以编码为 JSON")
+impl fmt::Display for RulesMatchContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "来源为 {}，目标为", self.source)?;
+        if self.has_declared_path {
+            formatter.write_str("声明的 path")
+        } else {
+            formatter.write_str("事件命令参数")
+        }
+    }
 }
 
 /// 最终字符串的物化替换配方。
@@ -2451,73 +2456,86 @@ pub(crate) enum RulesInvalidTargetReason {
 }
 
 impl RulesInvalidTargetReason {
-    fn safe_detail(&self) -> String {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::InvalidDataFileName { file, .. } => format!(
-                "target=data_file; file={}; error=unsafe_data_file_name",
-                json_string(file)
-            ),
+            Self::InvalidDataFileName { source, .. } => Some(source),
+            Self::NestedJsonDecode { source, .. } => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for RulesInvalidTargetReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidDataFileName { file, .. } => {
+                write!(formatter, "数据文件名 {file:?} 不安全")
+            }
             Self::PluginFieldType {
                 plugin_index,
                 plugin_name,
                 field,
                 expected,
                 actual,
-            } => format!(
-                "source=plugin; plugin_index={plugin_index}; plugin={}; target={field}; expected={expected}; actual={}",
-                json_string(plugin_name),
-                actual.as_str()
+            } => write!(
+                formatter,
+                "插件 {plugin_name:?}（索引 {plugin_index}）的字段 {field:?} 类型不符，需要 {expected}，实际为{actual}"
             ),
-            Self::PluginPathMissingParameter { at } => format!(
-                "source=plugin; target=path; actual_path={}; error=first_step_must_select_parameter",
-                render_value_steps(at)
+            Self::PluginPathMissingParameter { at } => write!(
+                formatter,
+                "插件路径 {} 的第一步必须选择插件参数",
+                ValueStepsDisplay(at)
             ),
-            Self::PluginGroupMissingParameter { at } => format!(
-                "source=plugin; target=group_path; actual_path={}; error=first_step_must_select_parameter",
-                render_value_steps(at)
+            Self::PluginGroupMissingParameter { at } => write!(
+                formatter,
+                "插件分组路径 {} 的第一步必须选择插件参数",
+                ValueStepsDisplay(at)
             ),
             Self::PluginGroupCrossesParameters {
                 expected_parameter,
                 actual_parameter,
                 at,
-            } => format!(
-                "source=plugin; target=group_path; actual_path={}; expected_parameter={}; actual_parameter={}; error=crosses_plugin_parameters",
-                render_value_steps(at),
-                json_string(expected_parameter),
-                json_string(actual_parameter)
+            } => write!(
+                formatter,
+                "插件分组路径 {} 跨越了参数：需要 {expected_parameter:?}，实际为 {actual_parameter:?}",
+                ValueStepsDisplay(at)
             ),
-            Self::NestedJsonDecode { phase, at, source } => format!(
-                "target={phase}; actual_path={}; error=invalid_nested_json; json_category={}; json_line={}; json_column={}",
-                render_value_steps(at),
-                json_error_classification(source),
+            Self::NestedJsonDecode { phase, at, source } => write!(
+                formatter,
+                "{}阶段在路径 {} 读取到无效的嵌套 JSON（{}，第 {} 行第 {} 列）",
+                nested_json_phase_name(phase),
+                ValueStepsDisplay(at),
+                json_failure_name(source),
                 source.line(),
                 source.column()
             ),
-            Self::ExpectedObject { at, key, actual } => format!(
-                "target=path; actual_path={}; step=key; key={}; expected=object; actual={}",
-                render_value_steps(at),
-                json_string(key),
-                actual.as_str()
+            Self::ExpectedObject { at, key, actual } => write!(
+                formatter,
+                "路径 {} 需要对象才能读取键 {key:?}，实际为{actual}",
+                ValueStepsDisplay(at)
             ),
-            Self::ExpectedArray { at, index, actual } => {
-                let selector = index.map_or_else(|| "[]".to_owned(), |value| format!("[{value}]"));
-                format!(
-                    "target=path; actual_path={}; step={selector}; expected=array; actual={}",
-                    render_value_steps(at),
-                    actual.as_str()
-                )
-            }
+            Self::ExpectedArray { at, index, actual } => match index {
+                Some(index) => write!(
+                    formatter,
+                    "路径 {} 需要数组才能读取索引 {index}，实际为{actual}",
+                    ValueStepsDisplay(at)
+                ),
+                None => write!(
+                    formatter,
+                    "路径 {} 需要数组才能展开元素，实际为{actual}",
+                    ValueStepsDisplay(at)
+                ),
+            },
             Self::CommandParametersType {
                 file,
                 code,
                 parameter,
                 at,
                 actual,
-            } => format!(
-                "source=command; file={}; code={code}; parameter={parameter}; target=parameters; actual_path={}; expected=array; actual={}",
-                json_string(file),
-                render_value_steps(at),
-                actual.as_str()
+            } => write!(
+                formatter,
+                "文件 {file:?} 中 code 为 {code} 的事件命令第 {parameter} 个参数要求 parameters 为数组，路径 {} 实际为{actual}",
+                ValueStepsDisplay(at)
             ),
             Self::CommandParameterMissing {
                 file,
@@ -2525,29 +2543,21 @@ impl RulesInvalidTargetReason {
                 parameter,
                 available,
                 at,
-            } => format!(
-                "source=command; file={}; code={code}; target=parameters[{parameter}]; actual_path={}; available_parameters={available}; error=missing_parameter",
-                json_string(file),
-                render_value_steps(at)
+            } => write!(
+                formatter,
+                "文件 {file:?} 中 code 为 {code} 的事件命令缺少第 {parameter} 个参数，路径 {} 只有 {available} 个参数",
+                ValueStepsDisplay(at)
             ),
-            Self::DecodeJsonTargetType { at, actual } => format!(
-                "target=decode_json; actual_path={}; expected=string; actual={}",
-                render_value_steps(at),
-                actual.as_str()
+            Self::DecodeJsonTargetType { at, actual } => write!(
+                formatter,
+                "decode_json 只能用于字符串，路径 {} 实际为{actual}",
+                ValueStepsDisplay(at)
             ),
-            Self::FinalTargetType { at, actual } => format!(
-                "target=text; actual_path={}; expected=string; actual={}",
-                render_value_steps(at),
-                actual.as_str()
+            Self::FinalTargetType { at, actual } => write!(
+                formatter,
+                "路径 {} 的最终值必须是字符串，实际为{actual}",
+                ValueStepsDisplay(at)
             ),
-        }
-    }
-
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::InvalidDataFileName { source, .. } => Some(source),
-            Self::NestedJsonDecode { source, .. } => Some(source.as_ref()),
-            _ => None,
         }
     }
 }
@@ -2569,52 +2579,49 @@ pub(crate) enum RulesMaterializationReason {
     },
 }
 
-impl RulesMaterializationReason {
-    fn safe_detail(&self) -> String {
+impl fmt::Display for RulesMaterializationReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Projection { at, source } => format!(
-                "target=projection_recipe; actual_path={}; projection_error={}",
-                render_value_steps(at),
-                projection_error_code(source),
+            Self::Projection { at, source } => write!(
+                formatter,
+                "路径 {} 的投影配方不符合模型约束：{source}",
+                ValueStepsDisplay(at)
             ),
             #[cfg(test)]
             Self::UnitCount {
                 at,
                 expected,
                 actual,
-            } => format!(
-                "target=projection_recipe; actual_path={}; expected_units={expected}; actual_units={actual}",
-                render_value_steps(at)
+            } => write!(
+                formatter,
+                "路径 {} 的投影配方需要 {expected} 个文本单元，实际有 {actual} 个",
+                ValueStepsDisplay(at)
             ),
-            Self::RoundTripMismatch { at } => format!(
-                "target=projection_recipe; actual_path={}; error=round_trip_mismatch",
-                render_value_steps(at)
+            Self::RoundTripMismatch { at } => write!(
+                formatter,
+                "路径 {} 的投影配方无法无损往返重建",
+                ValueStepsDisplay(at)
             ),
         }
     }
 }
 
-fn projection_error_code(source: &ProjectionModelError) -> &'static str {
-    match source {
-        ProjectionModelError::EmptyScalarFieldKey => "empty_scalar_field_key",
-        ProjectionModelError::EventBlockCoverageRequired => "event_block_coverage_required",
-        ProjectionModelError::InvalidEventBlockCoverage => "invalid_event_block_coverage",
-        ProjectionModelError::MutationClaimTargetMismatch => "mutation_claim_target_mismatch",
-        ProjectionModelError::RecipeHasNoTextSlot => "recipe_has_no_text_slot",
-        ProjectionModelError::DuplicateProjectionSlot { .. } => "duplicate_projection_slot",
-        ProjectionModelError::MultipleBodyLinesInPhysicalLine => {
-            "multiple_body_lines_in_physical_line"
-        }
-        ProjectionModelError::DuplicateDialogueBodyLine { .. } => "duplicate_dialogue_body_line",
-        ProjectionModelError::NonContiguousDialogueBodyLines { .. } => {
-            "non_contiguous_dialogue_body_lines"
-        }
-        ProjectionModelError::MixedDirectAndInlineSpeaker => "mixed_direct_and_inline_speaker",
+fn nested_json_phase_name(phase: &str) -> &str {
+    match phase {
+        "path_traversal" => "路径遍历",
+        "decode_json_target" => "decode_json 目标",
+        _ => "未知",
     }
 }
 
-fn json_error_classification(source: &StackSafeJsonError) -> &'static str {
-    source.diagnostic_category().storage_name()
+fn json_failure_name(source: &StackSafeJsonError) -> &'static str {
+    match source.diagnostic_category() {
+        crate::json_diagnostic::JsonErrorCategory::Io => "I/O 错误",
+        crate::json_diagnostic::JsonErrorCategory::Syntax => "语法错误",
+        crate::json_diagnostic::JsonErrorCategory::Data => "数据错误",
+        crate::json_diagnostic::JsonErrorCategory::Eof => "意外结束",
+        crate::json_diagnostic::JsonErrorCategory::DuplicateObjectKey => "重复对象键",
+    }
 }
 
 impl RulesMatchError {
@@ -2656,174 +2663,425 @@ impl RulesMatchError {
         }
     }
 
-    fn safe_projection(&self) -> (DiagnosticFailureKind, String) {
-        match self {
-            Self::Context { source, .. } => source.safe_projection(),
-            Self::NoNonBlankMatch {
-                rule_number,
-                skipped_non_strings,
-            } => {
-                let mut detail = format!("rule={rule_number}; error=no_non_blank_match");
-                if !skipped_non_strings.is_empty() {
-                    detail.push_str("; skipped_non_strings=");
-                    detail.push_str(&render_non_string_warnings(skipped_non_strings));
-                }
-                (DiagnosticFailureKind::RulesNoNonBlankMatch, detail)
-            }
-            Self::InvalidTarget {
-                rule_number,
-                reason,
-            } => (
-                DiagnosticFailureKind::RulesInvalidTarget,
-                format!("rule={rule_number}; {}", reason.safe_detail()),
-            ),
-            Self::PatternMatch {
-                rule_number,
-                at,
-                source,
-            } => (
-                DiagnosticFailureKind::RulesPatternMatchFailed,
-                format!(
-                    "rule={rule_number}; actual_path={}; {}",
-                    render_value_steps(at),
-                    pcre2_error_detail(source)
-                ),
-            ),
-            Self::ZeroWidthMatch {
-                rule_number,
-                at,
-                start,
-                end,
-            } => (
-                DiagnosticFailureKind::RulesZeroWidthMatch,
-                format!(
-                    "rule={rule_number}; actual_path={}; match_start={start}; match_end={end}; error=zero_width_match",
-                    render_value_steps(at)
-                ),
-            ),
-            Self::OverlappingMatch {
-                rule_number,
-                at,
-                previous_end,
-                start,
-                end,
-            } => (
-                DiagnosticFailureKind::RulesOverlappingCapture,
-                format!(
-                    "rule={rule_number}; actual_path={}; capture=text; previous_end={previous_end}; capture_start={start}; capture_end={end}; error=overlap",
-                    render_value_steps(at)
-                ),
-            ),
-            Self::MissingTextCapture { rule_number, at } => (
-                DiagnosticFailureKind::RulesMissingTextCapture,
-                format!(
-                    "rule={rule_number}; actual_path={}; capture=text; error=not_participating",
-                    render_value_steps(at)
-                ),
-            ),
-            Self::InvalidCaptureRange {
-                rule_number,
-                at,
-                text_bytes,
-                whole_start,
-                whole_end,
-                capture_start,
-                capture_end,
-            } => (
-                DiagnosticFailureKind::RulesInvalidCaptureRange,
-                format!(
-                    "rule={rule_number}; actual_path={}; text_bytes={text_bytes}; match_start={whole_start}; match_end={whole_end}; capture_start={capture_start}; capture_end={capture_end}; error=invalid_utf8_or_match_range",
-                    render_value_steps(at)
-                ),
-            ),
-            Self::DuplicateTarget {
-                first_rule,
-                second_rule,
-                source,
-                steps,
-            } => (
-                DiagnosticFailureKind::RulesDuplicateTarget,
-                format!(
-                    "first_rule={first_rule}; second_rule={second_rule}; {}; target_path={}",
-                    render_match_source(source),
-                    render_value_steps(steps)
-                ),
-            ),
-            Self::InvalidMaterialization {
-                rule_number,
-                reason,
-            } => (
-                DiagnosticFailureKind::RulesInvalidMaterialization,
-                format!("rule={rule_number}; {}", reason.safe_detail()),
-            ),
-        }
-    }
-
-    /// 公开 Rules 路径、规则、来源、目标结构与稳定底层代码；正文和值留在 source。
-    pub(super) fn safe_diagnostic(&self, rules_path: &Path) -> SafeDiagnostic {
-        let (failure, mut detail) = self.safe_projection();
-        let (_, context) = self.core_and_context();
-        if let Some(context) = context {
-            detail.push_str("; ");
-            detail.push_str(&context.safe_detail());
-        }
-        SafeDiagnostic::new(
-            DiagnosticCode::ExtractRules,
-            DiagnosticStage::Extract,
-            DiagnosticSubject::path(rules_path),
-            DiagnosticReason::failure_with_detail(failure, detail),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixInput,
+    pub(super) fn diagnostic_report(&self, rules_path: &Path) -> DiagnosticReport {
+        let (core, context) = self.core_and_context();
+        DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::rpg_maker(RpgMakerIssue::rules_match(
+                rules_path,
+                context.map(rules_match_context),
+                rules_match_problem(core),
+            )),
         )
     }
 }
 
-fn render_value_steps(steps: &[RulesValueStep]) -> String {
-    let mut result = "$".to_owned();
-    for step in steps {
-        match step {
-            RulesValueStep::Key(key) => result.push_str(&format!("[{}]", json_string(key))),
-            RulesValueStep::Index(index) => result.push_str(&format!("[{index}]")),
-            RulesValueStep::DecodeJsonString => result.push_str("<decode_json>"),
-        }
-    }
-    json_string(&result)
-}
-
-fn render_non_string_warnings(warnings: &[RulesCommandNonStringWarning]) -> String {
-    let mut rendered = String::from("[");
-    for (index, warning) in warnings.iter().enumerate() {
-        if index > 0 {
-            rendered.push(',');
-        }
-        rendered.push_str(&format!(
-            "{{\"rule\":{},\"file\":{},\"code\":{},\"parameter\":{},\"actual_type\":{},\"skipped_count\":{}}}",
-            warning.rule_number,
-            json_string(&warning.source_file),
-            warning.command_code,
-            warning.parameter,
-            json_string(warning.actual_type.as_str()),
-            warning.skipped_count,
-        ));
-    }
-    rendered.push(']');
-    rendered
-}
-
-fn render_match_source(source: &RulesMatchSource) -> String {
-    match source {
-        RulesMatchSource::DataFile { file } => {
-            format!("source=data_file; file={}", json_string(file))
-        }
-        RulesMatchSource::PluginParameter {
+fn rules_match_context(context: &RulesMatchContext) -> RpgMakerRulesMatchContext {
+    let source = match &context.source {
+        RulesDiagnosticSource::DataFile { file } => RpgMakerRulesDiagnosticSource::DataFile {
+            file: SafeText::new(file),
+        },
+        RulesDiagnosticSource::Plugin {
             plugin_index,
             plugin_name,
-            parameter_name,
-        } => format!(
-            "source=plugin_parameter; plugin_index={plugin_index}; plugin={}; parameter={}",
-            json_string(plugin_name),
-            json_string(parameter_name)
-        ),
+        } => RpgMakerRulesDiagnosticSource::Plugin {
+            plugin_index: *plugin_index,
+            plugin_name: SafeText::new(plugin_name),
+        },
+        RulesDiagnosticSource::Command {
+            file,
+            code,
+            parameter,
+        } => RpgMakerRulesDiagnosticSource::Command {
+            file: SafeText::new(file),
+            code: *code,
+            parameter: *parameter,
+        },
+    };
+    RpgMakerRulesMatchContext::new(source, context.has_declared_path)
+}
+
+fn rules_match_problem(source: &RulesMatchError) -> RpgMakerRulesMatchProblem {
+    match source {
+        RulesMatchError::Context { .. } => unreachable!("调用方已经拆出 Rules 匹配上下文"),
+        RulesMatchError::NoNonBlankMatch {
+            rule_number,
+            skipped_non_strings,
+        } => RpgMakerRulesMatchProblem::NoNonBlankMatch {
+            rule_number: *rule_number,
+            skipped_non_strings: skipped_non_strings
+                .iter()
+                .map(|warning| {
+                    RpgMakerRulesCommandNonStringFact::new(
+                        warning.rule_number,
+                        &warning.source_file,
+                        warning.command_code,
+                        warning.parameter,
+                        match warning.actual_type {
+                            RulesCommandNonStringType::Null => DiagnosticNonStringType::Null,
+                            RulesCommandNonStringType::Boolean => DiagnosticNonStringType::Boolean,
+                            RulesCommandNonStringType::Number => DiagnosticNonStringType::Number,
+                            RulesCommandNonStringType::Array => DiagnosticNonStringType::Array,
+                            RulesCommandNonStringType::Object => DiagnosticNonStringType::Object,
+                        },
+                        warning.skipped_count,
+                    )
+                })
+                .collect(),
+        },
+        RulesMatchError::InvalidTarget {
+            rule_number,
+            reason,
+        } => RpgMakerRulesMatchProblem::InvalidTarget {
+            rule_number: *rule_number,
+            reason: rules_invalid_target(reason),
+        },
+        RulesMatchError::PatternMatch {
+            rule_number,
+            at,
+            source,
+        } => RpgMakerRulesMatchProblem::PatternMatch {
+            rule_number: *rule_number,
+            at: rules_value_steps(at),
+            failure: rules_pcre2_failure(source),
+        },
+        RulesMatchError::ZeroWidthMatch {
+            rule_number,
+            at,
+            start,
+            end,
+        } => RpgMakerRulesMatchProblem::ZeroWidthMatch {
+            rule_number: *rule_number,
+            at: rules_value_steps(at),
+            match_range: ByteRange::new(*start, *end).expect("Rules 匹配器的零宽范围必须保持有效"),
+        },
+        RulesMatchError::OverlappingMatch {
+            rule_number,
+            at,
+            previous_end,
+            start,
+            end,
+        } => RpgMakerRulesMatchProblem::OverlappingMatch {
+            rule_number: *rule_number,
+            at: rules_value_steps(at),
+            previous_end: *previous_end,
+            match_range: ByteRange::new(*start, *end)
+                .expect("Rules 匹配器的重叠捕获范围必须保持有效"),
+        },
+        RulesMatchError::MissingTextCapture { rule_number, at } => {
+            RpgMakerRulesMatchProblem::MissingTextCapture {
+                rule_number: *rule_number,
+                at: rules_value_steps(at),
+            }
+        }
+        RulesMatchError::InvalidCaptureRange {
+            rule_number,
+            at,
+            text_bytes,
+            whole_start,
+            whole_end,
+            capture_start,
+            capture_end,
+        } => RpgMakerRulesMatchProblem::InvalidCaptureRange {
+            rule_number: *rule_number,
+            at: rules_value_steps(at),
+            text_bytes: *text_bytes,
+            whole_start: *whole_start,
+            whole_end: *whole_end,
+            capture_start: *capture_start,
+            capture_end: *capture_end,
+        },
+        RulesMatchError::DuplicateTarget {
+            first_rule,
+            second_rule,
+            source,
+            steps,
+        } => RpgMakerRulesMatchProblem::DuplicateTarget {
+            first_rule: *first_rule,
+            second_rule: *second_rule,
+            source: match source {
+                RulesMatchSource::DataFile { file } => RpgMakerRulesMatchSource::DataFile {
+                    file: SafeText::new(file),
+                },
+                RulesMatchSource::PluginParameter {
+                    plugin_index,
+                    plugin_name,
+                    parameter_name,
+                } => RpgMakerRulesMatchSource::PluginParameter {
+                    plugin_index: *plugin_index,
+                    plugin_name: SafeText::new(plugin_name),
+                    parameter_name: SafeText::new(parameter_name),
+                },
+            },
+            steps: rules_value_steps(steps),
+        },
+        RulesMatchError::InvalidMaterialization {
+            rule_number,
+            reason,
+        } => RpgMakerRulesMatchProblem::InvalidMaterialization {
+            rule_number: *rule_number,
+            reason: rules_materialization_failure(reason),
+        },
+    }
+}
+
+fn rules_invalid_target(source: &RulesInvalidTargetReason) -> RpgMakerRulesInvalidTarget {
+    match source {
+        RulesInvalidTargetReason::InvalidDataFileName { file, .. } => {
+            RpgMakerRulesInvalidTarget::InvalidDataFileName {
+                file: SafeText::new(file),
+            }
+        }
+        RulesInvalidTargetReason::PluginFieldType {
+            plugin_index,
+            plugin_name,
+            field,
+            expected,
+            actual,
+        } => RpgMakerRulesInvalidTarget::PluginFieldType {
+            plugin_index: *plugin_index,
+            plugin_name: SafeText::new(plugin_name),
+            field: SafeIdentifier::from_validated(field),
+            expected: SafeIdentifier::from_validated(expected),
+            actual: rules_json_value_kind(*actual),
+        },
+        RulesInvalidTargetReason::PluginPathMissingParameter { at } => {
+            RpgMakerRulesInvalidTarget::PluginPathMissingParameter {
+                at: rules_value_steps(at),
+            }
+        }
+        RulesInvalidTargetReason::PluginGroupMissingParameter { at } => {
+            RpgMakerRulesInvalidTarget::PluginGroupMissingParameter {
+                at: rules_value_steps(at),
+            }
+        }
+        RulesInvalidTargetReason::PluginGroupCrossesParameters {
+            expected_parameter,
+            actual_parameter,
+            at,
+        } => RpgMakerRulesInvalidTarget::PluginGroupCrossesParameters {
+            expected_parameter: SafeText::new(expected_parameter),
+            actual_parameter: SafeText::new(actual_parameter),
+            at: rules_value_steps(at),
+        },
+        RulesInvalidTargetReason::NestedJsonDecode { phase, at, source } => {
+            RpgMakerRulesInvalidTarget::NestedJsonDecode {
+                phase: SafeIdentifier::from_validated(phase),
+                at: rules_value_steps(at),
+                category: rules_json_failure(source),
+                line: source.line(),
+                column: source.column(),
+            }
+        }
+        RulesInvalidTargetReason::ExpectedObject { at, key, actual } => {
+            RpgMakerRulesInvalidTarget::ExpectedObject {
+                at: rules_value_steps(at),
+                key: SafeText::new(key),
+                actual: rules_json_value_kind(*actual),
+            }
+        }
+        RulesInvalidTargetReason::ExpectedArray { at, index, actual } => {
+            RpgMakerRulesInvalidTarget::ExpectedArray {
+                at: rules_value_steps(at),
+                index: *index,
+                actual: rules_json_value_kind(*actual),
+            }
+        }
+        RulesInvalidTargetReason::CommandParametersType {
+            file,
+            code,
+            parameter,
+            at,
+            actual,
+        } => RpgMakerRulesInvalidTarget::CommandParametersType {
+            file: SafeText::new(file),
+            code: *code,
+            parameter: *parameter,
+            at: rules_value_steps(at),
+            actual: rules_json_value_kind(*actual),
+        },
+        RulesInvalidTargetReason::CommandParameterMissing {
+            file,
+            code,
+            parameter,
+            available,
+            at,
+        } => RpgMakerRulesInvalidTarget::CommandParameterMissing {
+            file: SafeText::new(file),
+            code: *code,
+            parameter: *parameter,
+            available: *available,
+            at: rules_value_steps(at),
+        },
+        RulesInvalidTargetReason::DecodeJsonTargetType { at, actual } => {
+            RpgMakerRulesInvalidTarget::DecodeJsonTargetType {
+                at: rules_value_steps(at),
+                actual: rules_json_value_kind(*actual),
+            }
+        }
+        RulesInvalidTargetReason::FinalTargetType { at, actual } => {
+            RpgMakerRulesInvalidTarget::FinalTargetType {
+                at: rules_value_steps(at),
+                actual: rules_json_value_kind(*actual),
+            }
+        }
+    }
+}
+
+fn rules_materialization_failure(
+    source: &RulesMaterializationReason,
+) -> RpgMakerRulesMaterializationFailure {
+    match source {
+        RulesMaterializationReason::Projection { at, source } => {
+            RpgMakerRulesMaterializationFailure::Projection {
+                at: rules_value_steps(at),
+                failure: match source {
+                    ProjectionModelError::EmptyScalarFieldKey => {
+                        RpgMakerProjectionFailureKind::EmptyScalarFieldKey
+                    }
+                    ProjectionModelError::EventBlockCoverageRequired => {
+                        RpgMakerProjectionFailureKind::EventBlockCoverageRequired
+                    }
+                    ProjectionModelError::InvalidEventBlockCoverage => {
+                        RpgMakerProjectionFailureKind::InvalidEventBlockCoverage
+                    }
+                    ProjectionModelError::MutationClaimTargetMismatch => {
+                        RpgMakerProjectionFailureKind::MutationClaimTargetMismatch
+                    }
+                    ProjectionModelError::RecipeHasNoTextSlot => {
+                        RpgMakerProjectionFailureKind::RecipeHasNoTextSlot
+                    }
+                    ProjectionModelError::DuplicateProjectionSlot { .. } => {
+                        RpgMakerProjectionFailureKind::DuplicateProjectionSlot
+                    }
+                    ProjectionModelError::MultipleBodyLinesInPhysicalLine => {
+                        RpgMakerProjectionFailureKind::MultipleBodyLinesInPhysicalLine
+                    }
+                    ProjectionModelError::DuplicateDialogueBodyLine { .. } => {
+                        RpgMakerProjectionFailureKind::DuplicateDialogueBodyLine
+                    }
+                    ProjectionModelError::NonContiguousDialogueBodyLines { .. } => {
+                        RpgMakerProjectionFailureKind::NonContiguousDialogueBodyLines
+                    }
+                    ProjectionModelError::MixedDirectAndInlineSpeaker => {
+                        RpgMakerProjectionFailureKind::MixedDirectAndInlineSpeaker
+                    }
+                },
+            }
+        }
+        #[cfg(test)]
+        RulesMaterializationReason::UnitCount {
+            at,
+            expected,
+            actual,
+        } => RpgMakerRulesMaterializationFailure::UnitCount {
+            at: rules_value_steps(at),
+            expected: *expected,
+            actual: *actual,
+        },
+        RulesMaterializationReason::RoundTripMismatch { at } => {
+            RpgMakerRulesMaterializationFailure::RoundTripMismatch {
+                at: rules_value_steps(at),
+            }
+        }
+    }
+}
+
+fn rules_value_steps(source: &[RulesValueStep]) -> Vec<RpgMakerRulesValueStep> {
+    source
+        .iter()
+        .map(|step| match step {
+            RulesValueStep::Key(key) => RpgMakerRulesValueStep::key(key),
+            RulesValueStep::Index(index) => RpgMakerRulesValueStep::Index { index: *index },
+            RulesValueStep::DecodeJsonString => RpgMakerRulesValueStep::DecodeJsonString,
+        })
+        .collect()
+}
+
+fn rules_json_value_kind(source: JsonValueKind) -> RpgMakerJsonValueKind {
+    match source {
+        JsonValueKind::Missing => RpgMakerJsonValueKind::Missing,
+        JsonValueKind::Null => RpgMakerJsonValueKind::Null,
+        JsonValueKind::Boolean => RpgMakerJsonValueKind::Boolean,
+        JsonValueKind::Number => RpgMakerJsonValueKind::Number,
+        JsonValueKind::String => RpgMakerJsonValueKind::String,
+        JsonValueKind::Array => RpgMakerJsonValueKind::Array,
+        JsonValueKind::Object => RpgMakerJsonValueKind::Object,
+    }
+}
+
+fn rules_json_failure(source: &StackSafeJsonError) -> RpgMakerJsonFailureKind {
+    match source.diagnostic_category() {
+        crate::json_diagnostic::JsonErrorCategory::Io => RpgMakerJsonFailureKind::Io,
+        crate::json_diagnostic::JsonErrorCategory::Syntax => RpgMakerJsonFailureKind::Syntax,
+        crate::json_diagnostic::JsonErrorCategory::Data => RpgMakerJsonFailureKind::Data,
+        crate::json_diagnostic::JsonErrorCategory::Eof => RpgMakerJsonFailureKind::Eof,
+        crate::json_diagnostic::JsonErrorCategory::DuplicateObjectKey => {
+            RpgMakerJsonFailureKind::DuplicateObjectKey
+        }
+    }
+}
+
+fn rules_pcre2_failure(source: &pcre2::Error) -> Pcre2Failure {
+    Pcre2Failure {
+        kind: match source.kind() {
+            pcre2::ErrorKind::Compile => Pcre2FailureKind::Compile,
+            pcre2::ErrorKind::JIT => Pcre2FailureKind::Jit,
+            pcre2::ErrorKind::Match => Pcre2FailureKind::Match,
+            pcre2::ErrorKind::Info => Pcre2FailureKind::Info,
+            pcre2::ErrorKind::Option => Pcre2FailureKind::Option,
+            _ => Pcre2FailureKind::Unrecognized,
+        },
+        code: source.code(),
+        offset: source.offset(),
+    }
+}
+
+struct ValueStepsDisplay<'a>(&'a [RulesValueStep]);
+
+impl fmt::Display for ValueStepsDisplay<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("$")?;
+        for step in self.0 {
+            match step {
+                RulesValueStep::Key(key) => write!(formatter, "[{key:?}]")?,
+                RulesValueStep::Index(index) => write!(formatter, "[{index}]")?,
+                RulesValueStep::DecodeJsonString => formatter.write_str("<decode_json>")?,
+            }
+        }
+        Ok(())
+    }
+}
+
+fn write_non_string_warnings(
+    formatter: &mut fmt::Formatter<'_>,
+    warnings: &[RulesCommandNonStringWarning],
+) -> fmt::Result {
+    for (index, warning) in warnings.iter().enumerate() {
+        if index > 0 {
+            formatter.write_str("；")?;
+        }
+        write!(
+            formatter,
+            "规则 {}：文件 {:?} 中 code 为 {} 的第 {} 个参数是{}，跳过 {} 次",
+            warning.rule_number,
+            warning.source_file,
+            warning.command_code,
+            warning.parameter,
+            command_non_string_type_name(warning.actual_type),
+            warning.skipped_count,
+        )?;
+    }
+    Ok(())
+}
+
+fn command_non_string_type_name(source: RulesCommandNonStringType) -> &'static str {
+    match source {
+        RulesCommandNonStringType::Null => "null",
+        RulesCommandNonStringType::Boolean => "布尔值",
+        RulesCommandNonStringType::Number => "数字",
+        RulesCommandNonStringType::Array => "数组",
+        RulesCommandNonStringType::Object => "对象",
     }
 }
 
@@ -2831,7 +3089,7 @@ impl fmt::Display for RulesMatchError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Context { context, source } => {
-                write!(formatter, "{source}; {}", context.safe_detail())
+                write!(formatter, "{source}（{context}）")
             }
             Self::NoNonBlankMatch {
                 rule_number,
@@ -2842,11 +3100,8 @@ impl fmt::Display for RulesMatchError {
                     "Rules 规则 {rule_number} 没有产生任何非空语义单元"
                 )?;
                 if !skipped_non_strings.is_empty() {
-                    write!(
-                        formatter,
-                        "；跳过的 command 非字符串参数：{}",
-                        render_non_string_warnings(skipped_non_strings)
-                    )?;
+                    formatter.write_str("；跳过的 command 非字符串参数：")?;
+                    write_non_string_warnings(formatter, skipped_non_strings)?;
                 }
                 Ok(())
             }
@@ -2856,17 +3111,16 @@ impl fmt::Display for RulesMatchError {
             } => write!(
                 formatter,
                 "Rules 规则 {rule_number} 命中了无效目标：{}",
-                reason.safe_detail()
+                reason
             ),
             Self::PatternMatch {
                 rule_number,
                 source,
                 ..
-            } => write!(
-                formatter,
-                "Rules 规则 {rule_number} 执行 PCRE2 失败：{}",
-                pcre2_error_detail(source)
-            ),
+            } => {
+                write!(formatter, "Rules 规则 {rule_number} 执行 PCRE2 失败：")?;
+                write_pcre2_error(formatter, source)
+            }
             Self::ZeroWidthMatch { rule_number, .. } => {
                 write!(formatter, "Rules 规则 {rule_number} 产生了零宽匹配")
             }
@@ -2888,7 +3142,8 @@ impl fmt::Display for RulesMatchError {
                 steps,
             } => write!(
                 formatter,
-                "Rules 规则 {first_rule} 与 {second_rule} 重复拥有同一物理目标：{source}{steps:?}"
+                "Rules 规则 {first_rule} 与 {second_rule} 重复拥有同一物理目标：{source} 中的路径 {}",
+                ValueStepsDisplay(steps)
             ),
             Self::InvalidMaterialization {
                 rule_number,
@@ -2896,7 +3151,7 @@ impl fmt::Display for RulesMatchError {
             } => write!(
                 formatter,
                 "Rules 规则 {rule_number} 的物化配方无效：{}",
-                reason.safe_detail()
+                reason
             ),
         }
     }
@@ -2924,6 +3179,25 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn match_error_display_is_human_text_not_detail_protocol() {
+        let error = RulesMatchError::InvalidTarget {
+            rule_number: 2,
+            reason: RulesInvalidTargetReason::FinalTargetType {
+                at: vec![RulesValueStep::Key("entry".to_owned())],
+                actual: JsonValueKind::Number,
+            },
+        };
+
+        let rendered = error.to_string();
+        assert_eq!(
+            rendered,
+            "Rules 规则 2 命中了无效目标：路径 $[\"entry\"] 的最终值必须是字符串，实际为数字"
+        );
+        assert!(!rendered.contains("target="));
+        assert!(!rendered.contains("actual_path="));
+    }
 
     #[test]
     fn file_path_expands_arrays_and_materializes_multiple_regex_matches() {
@@ -3056,19 +3330,46 @@ path = 'Payload.Message'
         )]);
 
         let error = match_rules(&definition, &input).expect_err("嵌套 JSON 必须失败");
-        let diagnostic = error.safe_diagnostic(Path::new("rules/main.toml"));
-        let serialized = serde_json::to_string(&diagnostic).expect("诊断应可序列化");
-
-        assert!(serialized.contains("rules/main.toml"));
-        assert!(serialized.contains("rule=1"));
-        assert!(serialized.contains("source=data_file"));
-        assert!(serialized.contains("Custom.json"));
-        assert!(serialized.contains("target=path"));
-        assert!(serialized.contains("actual_path="));
-        assert!(serialized.contains("json_category=syntax"));
-        assert!(serialized.contains("json_line=1"));
-        assert!(serialized.contains("json_column="));
-        assert!(!serialized.contains("SOURCE_JSON_VALUE_SENTINEL"));
+        let value = serde_json::to_value(error.diagnostic_report(Path::new("rules/main.toml")))
+            .expect("类型化 Rules 匹配诊断应可序列化");
+        assert_eq!(value["primary"]["code"], "rpg_maker.rules.invalid_target");
+        assert_eq!(value["primary"]["stage"], "extract");
+        assert_eq!(
+            value["primary"]["issue"]["details"]["problem"]["rules_path"],
+            "rules/main.toml"
+        );
+        assert_eq!(
+            value["primary"]["issue"]["details"]["problem"]["kind"],
+            "rules_match"
+        );
+        assert_eq!(
+            value["primary"]["issue"]["details"]["problem"]["context"]["source"]["kind"],
+            "data_file"
+        );
+        assert_eq!(
+            value["primary"]["issue"]["details"]["problem"]["problem"]["reason"]["kind"],
+            "nested_json_decode"
+        );
+        assert_eq!(
+            value["primary"]["issue"]["details"]["problem"]["problem"]["reason"]["category"],
+            "syntax"
+        );
+        assert_eq!(
+            value["primary"]["issue"]["details"]["problem"]["problem"]["rule_number"],
+            1
+        );
+        assert!(
+            value["primary"]["issue"]["details"]["problem"]["problem"]["reason"]["at"].is_array()
+        );
+        assert_eq!(
+            value["primary"]["issue"]["details"]["problem"]["problem"]["reason"]["line"],
+            1
+        );
+        assert!(
+            value["primary"]["issue"]["details"]["problem"]["problem"]["reason"]["column"]
+                .is_number()
+        );
+        assert!(!value.to_string().contains("SOURCE_JSON_VALUE_SENTINEL"));
     }
 
     #[test]
@@ -3255,12 +3556,15 @@ decode_json = true
             }
             error => panic!("应返回携带跳过事实的零命中错误：{error:?}"),
         }
-        let diagnostic = serde_json::to_string(&error.safe_diagnostic(Path::new("rules.toml")))
-            .expect("安全诊断应可序列化");
-        assert!(diagnostic.contains("skipped_non_strings"));
-        assert!(diagnostic.contains("actual_type"));
-        assert!(diagnostic.contains("number"));
-        assert!(diagnostic.contains("skipped_count"));
+        let diagnostic = serde_json::to_value(error.diagnostic_report(Path::new("rules.toml")))
+            .expect("类型化诊断应可序列化");
+        let problem = &diagnostic["primary"]["issue"]["details"]["problem"]["problem"];
+        assert_eq!(problem["kind"], "no_non_blank_match");
+        assert_eq!(problem["rule_number"], 1);
+        assert_eq!(problem["skipped_non_strings"][0]["actual_type"], "null");
+        assert_eq!(problem["skipped_non_strings"][0]["skipped_count"], 1);
+        assert_eq!(problem["skipped_non_strings"][1]["actual_type"], "number");
+        assert_eq!(problem["skipped_non_strings"][1]["skipped_count"], 1);
     }
 
     #[test]
@@ -4104,9 +4408,9 @@ path = '{deep_path}.command_text'
         match (shared, reference) {
             (Ok(shared), Ok(reference)) => assert_eq!(shared, reference),
             (Err(shared), Err(reference)) => assert_eq!(
-                shared.safe_diagnostic(Path::new("Rules.toml")),
-                reference.safe_diagnostic(Path::new("Rules.toml")),
-                "共享路径匹配与逐规则参考实现必须保留相同的安全结构化诊断",
+                shared.diagnostic_report(Path::new("Rules.toml")),
+                reference.diagnostic_report(Path::new("Rules.toml")),
+                "共享路径匹配与逐规则参考实现必须保留相同的类型化诊断",
             ),
             (shared, reference) => panic!(
                 "共享路径匹配与逐规则参考实现结果分歧：shared={shared:?}, reference={reference:?}"

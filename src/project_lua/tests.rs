@@ -12,13 +12,167 @@ use sha2::{Digest, Sha256};
 use crate::fingerprint::Sha256Fingerprint;
 
 use super::{
-    ProjectLuaCallError, ProjectLuaCancellation, ProjectLuaDatabasePrerequisiteError,
-    ProjectLuaEngineAdapter, ProjectLuaFailure, ProjectLuaPrintSink, ProjectLuaProgram,
-    ProjectLuaProject, ProjectLuaRunError, ProjectLuaRunRequest, ProjectLuaSchemaObjectKind,
-    ProjectLuaValue, compile_project_lua_program, compile_project_lua_program_with_cancellation,
+    ProjectLuaCallError, ProjectLuaCancellation, ProjectLuaCompilationFailure,
+    ProjectLuaDatabasePrerequisiteError, ProjectLuaEngineAdapter, ProjectLuaFailure,
+    ProjectLuaPrintSink, ProjectLuaProgram, ProjectLuaProject, ProjectLuaRunError,
+    ProjectLuaRunRequest, ProjectLuaSchemaObjectKind, ProjectLuaScriptFailure,
+    ProjectLuaSqliteError, ProjectLuaSqliteOperation, ProjectLuaValidationFailure, ProjectLuaValue,
+    compile_project_lua_program, compile_project_lua_program_with_cancellation,
     fingerprint_project_lua_program_with_cancellation, rollback, run_project_lua,
     take_project_lua_object_field,
 };
+
+fn sqlite_diagnostic_json(operation: &str, transaction: &str, query_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "code": "sqlite.driver",
+        "stage": "lua",
+        "issue": {
+            "family": "sqlite",
+            "details": {
+                "context": {
+                    "stage": "lua",
+                    "operation": operation,
+                    "transaction": transaction
+                },
+                "problem": {
+                    "kind": "driver",
+                    "database": "project.db",
+                    "query_id": query_id,
+                    "query_ordinal": null,
+                    "failure": {
+                        "kind": "execute_returned_rows",
+                        "primary_code": null,
+                        "extended_code": null,
+                        "column_index": null,
+                        "column_name": null,
+                        "parameter_actual": null,
+                        "parameter_expected": null,
+                        "changed_rows": null,
+                        "sql_offset": null,
+                        "database_index": null
+                    }
+                }
+            }
+        },
+        "resolution": "retry"
+    })
+}
+
+#[test]
+fn incomplete_external_locator_identifiers_do_not_panic_or_enter_diagnostic_wire() {
+    let error =
+        ProjectLuaCallError::violation(crate::diagnostic::LuaValueViolation::InvalidLocator)
+            .with_field("field\u{0000}")
+            .with_generic_locator(
+                Some(std::path::Path::new("data/dialogue.jsonl")),
+                "group\u{0001}",
+                "unit\u{0002}",
+            );
+    let report = ProjectLuaRunError::NotStarted(ProjectLuaFailure::Host(error))
+        .diagnostic_report(std::path::Path::new("project.db"));
+    let wire = serde_json::to_string(&report).expect("诊断必须可序列化");
+
+    assert!(!wire.contains("field\\u0000"));
+    assert!(!wire.contains("group\\u0001"));
+    assert!(!wire.contains("unit\\u0002"));
+    assert!(!wire.contains("data/dialogue.jsonl"));
+}
+
+#[test]
+fn diagnostic_report_serializes_all_project_lua_transaction_outcomes() {
+    let database_path = std::path::Path::new("project.db");
+
+    let not_started =
+        ProjectLuaRunError::NotStarted(ProjectLuaFailure::Database(ProjectLuaSqliteError::new(
+            ProjectLuaSqliteOperation::ReadCurrentAttSchema,
+            rusqlite::Error::ExecuteReturnedResults,
+        )));
+    assert_eq!(
+        serde_json::to_value(not_started.diagnostic_report(database_path))
+            .expect("未开始报告应可序列化"),
+        serde_json::json!({
+            "effect": "unchanged",
+            "primary": sqlite_diagnostic_json(
+                "query",
+                "not_started",
+                "read_current_att_schema"
+            ),
+            "related": []
+        })
+    );
+
+    let rolled_back =
+        ProjectLuaRunError::RolledBack(ProjectLuaFailure::Database(ProjectLuaSqliteError::new(
+            ProjectLuaSqliteOperation::ReadCurrentAttSchema,
+            rusqlite::Error::ExecuteReturnedResults,
+        )));
+    assert_eq!(
+        serde_json::to_value(rolled_back.diagnostic_report(database_path))
+            .expect("已回滚报告应可序列化"),
+        serde_json::json!({
+            "effect": "unchanged",
+            "primary": sqlite_diagnostic_json(
+                "query",
+                "rolled_back",
+                "read_current_att_schema"
+            ),
+            "related": []
+        })
+    );
+
+    let rollback_unknown = ProjectLuaRunError::RollbackOutcomeUnknown {
+        failure: ProjectLuaFailure::Database(ProjectLuaSqliteError::new(
+            ProjectLuaSqliteOperation::ReadCurrentAttSchema,
+            rusqlite::Error::ExecuteReturnedResults,
+        )),
+        rollback: ProjectLuaSqliteError::new(
+            ProjectLuaSqliteOperation::Rollback,
+            rusqlite::Error::ExecuteReturnedResults,
+        ),
+    };
+    assert_eq!(
+        serde_json::to_value(rollback_unknown.diagnostic_report(database_path))
+            .expect("回滚结果未知报告应可序列化"),
+        serde_json::json!({
+            "effect": "outcome_unknown",
+            "primary": sqlite_diagnostic_json(
+                "query",
+                "outcome_unknown",
+                "read_current_att_schema"
+            ),
+            "related": [{
+                "relation": "rollback",
+                "report": {
+                    "effect": "outcome_unknown",
+                    "primary": sqlite_diagnostic_json(
+                        "transaction",
+                        "outcome_unknown",
+                        "rollback"
+                    ),
+                    "related": []
+                }
+            }]
+        })
+    );
+
+    let commit_unknown = ProjectLuaRunError::CommitOutcomeUnknown(ProjectLuaSqliteError::new(
+        ProjectLuaSqliteOperation::Commit,
+        rusqlite::Error::ExecuteReturnedResults,
+    ));
+    assert_eq!(
+        serde_json::to_value(commit_unknown.diagnostic_report(database_path))
+            .expect("提交结果未知报告应可序列化"),
+        serde_json::json!({
+            "effect": "outcome_unknown",
+            "primary": sqlite_diagnostic_json(
+                "transaction",
+                "outcome_unknown",
+                "commit"
+            ),
+            "related": []
+        })
+    );
+}
 
 #[derive(Debug, Default)]
 struct TestAdapter {
@@ -46,23 +200,21 @@ impl ProjectLuaEngineAdapter for TestAdapter {
         translation: ProjectLuaValue,
     ) -> Result<u64, ProjectLuaCallError> {
         let Some(mut locator) = locator.into_object() else {
-            return Err(ProjectLuaCallError::new(
-                "invalid_locator",
-                "locator 必须是 object",
+            return Err(ProjectLuaCallError::violation(
+                crate::diagnostic::LuaValueViolation::InvalidLocator,
             ));
         };
         let Some(id) =
             take_project_lua_object_field(&mut locator, "id").and_then(ProjectLuaValue::into_text)
         else {
-            return Err(ProjectLuaCallError::new(
-                "invalid_locator",
-                "locator.id 必须是字符串",
-            ));
+            return Err(ProjectLuaCallError::violation(
+                crate::diagnostic::LuaValueViolation::InvalidLocator,
+            )
+            .with_field("id"));
         };
         let Some(translation) = translation.into_text() else {
-            return Err(ProjectLuaCallError::new(
-                "invalid_translation",
-                "translation 必须是字符串",
+            return Err(ProjectLuaCallError::violation(
+                crate::diagnostic::LuaValueViolation::InvalidTranslation,
             ));
         };
         let changed = connection
@@ -70,9 +222,11 @@ impl ProjectLuaEngineAdapter for TestAdapter {
                 "UPDATE main.units SET translation = ?1 WHERE id = ?2",
                 rusqlite::params![translation, id],
             )
-            .map_err(|error| ProjectLuaCallError::new("sqlite", error.to_string()))?;
+            .map_err(ProjectLuaCallError::sqlite)?;
         if changed != 1 {
-            return Err(ProjectLuaCallError::new("unknown_unit", "目标 Unit 不存在"));
+            return Err(ProjectLuaCallError::violation(
+                crate::diagnostic::LuaValueViolation::UnknownUnit,
+            ));
         }
         if let Some(calls) = &self.observed_translation_calls {
             calls.fetch_add(1, Ordering::SeqCst);
@@ -89,25 +243,24 @@ impl ProjectLuaEngineAdapter for TestAdapter {
         locator: ProjectLuaValue,
     ) -> Result<u64, ProjectLuaCallError> {
         let Some(mut locator) = locator.into_object() else {
-            return Err(ProjectLuaCallError::new(
-                "invalid_locator",
-                "locator 必须是 object",
+            return Err(ProjectLuaCallError::violation(
+                crate::diagnostic::LuaValueViolation::InvalidLocator,
             ));
         };
         let Some(id) =
             take_project_lua_object_field(&mut locator, "id").and_then(ProjectLuaValue::into_text)
         else {
-            return Err(ProjectLuaCallError::new(
-                "invalid_locator",
-                "locator.id 必须是字符串",
-            ));
+            return Err(ProjectLuaCallError::violation(
+                crate::diagnostic::LuaValueViolation::InvalidLocator,
+            )
+            .with_field("id"));
         };
         let changed = connection
             .execute(
                 "UPDATE main.units SET translation = NULL WHERE id = ?1",
                 [id],
             )
-            .map_err(|error| ProjectLuaCallError::new("sqlite", error.to_string()))?;
+            .map_err(ProjectLuaCallError::sqlite)?;
         Ok(u64::try_from(changed).expect("受支持平台的 usize 必须能表示为 u64"))
     }
 
@@ -128,7 +281,9 @@ impl ProjectLuaEngineAdapter for TestAdapter {
         _project: &ProjectLuaProject,
     ) -> Result<(), ProjectLuaCallError> {
         if self.fail_validation {
-            Err(ProjectLuaCallError::new("invalid_project", "测试校验失败"))
+            Err(ProjectLuaCallError::violation(
+                crate::diagnostic::LuaValueViolation::StateMismatch,
+            ))
         } else {
             Ok(())
         }
@@ -159,7 +314,7 @@ impl ProjectLuaPrintSink for SignalPrintSink {
     fn print(&self, _bytes: &[u8]) -> Result<(), ProjectLuaCallError> {
         if let Some(sender) = self.sender.lock().expect("测试信号锁不应中毒").take() {
             sender.send(()).map_err(|_| {
-                ProjectLuaCallError::new("test_signal", "无法发送 Lua 测试启动信号")
+                ProjectLuaCallError::violation(crate::diagnostic::LuaValueViolation::StateMismatch)
             })?;
         }
         Ok(())
@@ -313,10 +468,8 @@ fn failed_validation_rolls_back_every_change() {
     .expect_err("最终校验失败应回滚");
     assert!(matches!(
         error,
-        ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
-            operation: "translation.validate",
-            ..
-        })
+        ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(error))
+            if error.operation() == Some("translation.validate")
     ));
 
     let translation: Option<String> = Connection::open(path)
@@ -339,7 +492,8 @@ fn invalid_project_state_prerequisite_keeps_its_typed_failure() {
             Arc::new(TestAdapter {
                 prerequisite_failure: Some(
                     ProjectLuaDatabasePrerequisiteError::invalid_project_state(
-                        "database_component=att_schema; violation=test",
+                        crate::diagnostic::LuaEngine::Generic,
+                        crate::diagnostic::LuaValueViolation::StateMismatch,
                     ),
                 ),
                 ..TestAdapter::default()
@@ -351,9 +505,10 @@ fn invalid_project_state_prerequisite_keeps_its_typed_failure() {
     assert_eq!(
         error,
         ProjectLuaRunError::RolledBack(ProjectLuaFailure::DatabasePrerequisite(
-            ProjectLuaDatabasePrerequisiteError::InvalidProjectState(
-                "database_component=att_schema; violation=test".to_owned()
-            )
+            ProjectLuaDatabasePrerequisiteError::InvalidProjectState {
+                engine: crate::diagnostic::LuaEngine::Generic,
+                violation: crate::diagnostic::LuaValueViolation::StateMismatch,
+            }
         ))
     );
 }
@@ -370,8 +525,10 @@ fn sqlite_prerequisite_preserves_primary_and_extended_codes() {
     let source = source_connection
         .execute("INSERT INTO private_secret VALUES ('sensitive-value')", [])
         .expect_err("重复值应产生扩展 SQLite code");
-    let prerequisite =
-        ProjectLuaDatabasePrerequisiteError::sqlite("read_current_att_schema", &source);
+    let prerequisite = ProjectLuaDatabasePrerequisiteError::sqlite(
+        ProjectLuaSqliteOperation::ReadCurrentAttSchema,
+        source,
+    );
 
     let error = run_project_lua(
         database(),
@@ -391,7 +548,10 @@ fn sqlite_prerequisite_preserves_primary_and_extended_codes() {
     else {
         panic!("应保留 typed SQLite 前置检查失败");
     };
-    assert_eq!(source.operation(), "read_current_att_schema");
+    assert_eq!(
+        source.operation(),
+        ProjectLuaSqliteOperation::ReadCurrentAttSchema
+    );
     assert_eq!(source.sqlite_codes(), Some((19, 2067)));
 }
 
@@ -421,7 +581,7 @@ fn failed_commit_reports_unknown_outcome_after_sqlite_ends_the_transaction() {
     assert!(matches!(
         error,
         ProjectLuaRunError::CommitOutcomeUnknown(ref sqlite_error)
-            if sqlite_error.operation == "commit"
+            if sqlite_error.operation == ProjectLuaSqliteOperation::Commit
     ));
 
     let translation: Option<String> = Connection::open(path)
@@ -459,15 +619,21 @@ fn failed_rollback_reports_unknown_outcome_while_transaction_remains_open() {
 
     let error = rollback(
         &connection,
-        ProjectLuaFailure::Validation("测试主失败".to_owned()),
+        ProjectLuaFailure::Validation {
+            engine: crate::diagnostic::LuaEngine::Generic,
+            failure: ProjectLuaValidationFailure::AdapterState,
+        },
     )
     .expect_err("ROLLBACK 被 SQLite 拒绝时必须报告未知结果");
     assert!(matches!(
         error,
         ProjectLuaRunError::RollbackOutcomeUnknown {
-            failure: ProjectLuaFailure::Validation(ref message),
+            failure: ProjectLuaFailure::Validation {
+                engine: crate::diagnostic::LuaEngine::Generic,
+                failure: ProjectLuaValidationFailure::AdapterState,
+            },
             ref rollback,
-        } if message == "测试主失败" && rollback.operation == "rollback"
+        } if rollback.operation == ProjectLuaSqliteOperation::Rollback
     ));
     assert!(!connection.borrow().is_autocommit());
 }
@@ -516,7 +682,7 @@ error("stop")
     .expect_err("未捕获错误应回滚");
     assert!(matches!(
         error,
-        ProjectLuaRunError::RolledBack(ProjectLuaFailure::Script(_))
+        ProjectLuaRunError::RolledBack(ProjectLuaFailure::Script { .. })
     ));
     let current: String = Connection::open(path)
         .expect("应再次重开数据库")
@@ -561,12 +727,9 @@ assert(not escaped_write_ok)
     .expect_err("提前结束外层事务必须让整个脚本失败");
     assert!(matches!(
         error,
-        ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
-            domain: "database",
-            kind: "transaction_lost",
-            operation: "transaction",
-            ..
-        })
+        ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(error))
+            if error.kind() == "transaction_lost"
+                && error.operation() == Some("transaction.rollback")
     ));
 
     let translation: Option<String> = Connection::open(path)
@@ -631,7 +794,7 @@ ctx.db.execute("ALTER TABLE temp.private_shadow RENAME TO UnItS")
 
     assert!(matches!(
         error,
-        ProjectLuaRunError::RolledBack(ProjectLuaFailure::Validation(_))
+        ProjectLuaRunError::RolledBack(ProjectLuaFailure::Validation { .. })
     ));
 }
 
@@ -844,10 +1007,8 @@ fn failed_translation_host_call_is_included_in_failure_metrics() {
         .expect_err("不存在的 Unit 必须让 translation.set 失败并回滚");
     assert!(matches!(
         error,
-        ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host {
-            operation: "translation.set",
-            ..
-        })
+        ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(error))
+            if error.operation() == Some("translation.set")
     ));
     let report = metrics.report();
     assert_eq!(report.translation_calls(), 1);
@@ -1165,8 +1326,10 @@ fn top_level_coroutine_yield_remains_a_script_error() {
 
     assert!(matches!(
         error,
-        ProjectLuaRunError::RolledBack(ProjectLuaFailure::Script(message))
-            if message.contains("不得主动 yield")
+        ProjectLuaRunError::RolledBack(ProjectLuaFailure::Script {
+            failure: ProjectLuaScriptFailure::Yielded,
+            ..
+        })
     ));
 }
 
@@ -1355,8 +1518,41 @@ fn invalid_utf8_script_is_rejected_before_transaction() {
     let error = run_project_lua(database(), request).expect_err("无效 UTF-8 必须被拒绝");
     assert!(matches!(
         error,
-        ProjectLuaRunError::NotStarted(ProjectLuaFailure::Compile(_))
+        ProjectLuaRunError::NotStarted(ProjectLuaFailure::Compile {
+            failure: ProjectLuaCompilationFailure::InvalidUtf8,
+            ..
+        })
     ));
+}
+
+#[test]
+fn syntax_error_keeps_compiler_line_without_exposing_backend_message() {
+    let program = ProjectLuaProgram::new(
+        "invalid.lua",
+        b"local first = 1\nlocal = 2\n".to_vec(),
+        Vec::new(),
+    );
+    let error = compile_project_lua_program(&program).expect_err("Lua 语法错误必须失败");
+    let ProjectLuaFailure::Compile {
+        failure: ProjectLuaCompilationFailure::Backend { category, line },
+        ..
+    } = &error
+    else {
+        panic!("必须保留类型化 Lua 编译失败");
+    };
+    assert_eq!(*category, crate::diagnostic::LuaCompilerCategory::Syntax);
+    assert_eq!(*line, Some(2));
+
+    let wire =
+        serde_json::to_value(error.preflight_diagnostic_report(std::path::Path::new("project.db")))
+            .expect("Lua 编译诊断必须可序列化");
+    assert_eq!(wire["primary"]["code"], "lua.compilation");
+    assert_eq!(wire["primary"]["issue"]["details"]["problem"]["line"], 2);
+    assert_eq!(
+        wire["primary"]["issue"]["details"]["problem"]["problem"]["category"],
+        "syntax"
+    );
+    assert!(!wire.to_string().contains("near"));
 }
 
 #[test]

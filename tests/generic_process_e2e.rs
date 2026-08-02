@@ -2,11 +2,17 @@
 
 //! Generic CLI 的独立生产进程边界测试。
 
+use std::collections::BTreeSet;
 use std::fs;
+use std::io::ErrorKind;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const PROJECT: &str = "generic-observable";
+const MISSING_CAPTURE_PROJECT: &str = "generic-missing-text-capture";
+const MISSING_CAPTURE_API_KEY: &str = "PRIVATE_MISSING_CAPTURE_API_KEY";
+const MISSING_CAPTURE_SOURCE: &str = "秘密本文あ甲触发缺组乙";
 
 #[test]
 fn generic_progress_modes_and_jsonl_diagnostic_are_observable() {
@@ -222,9 +228,9 @@ target_task_user_message_characters = 10000
         {
             let record: serde_json::Value =
                 serde_json::from_str(line).expect("Generic 项目日志行应为 JSON");
-            if record["code"] == "observability.task_record_failed" {
+            if record["code"] == "diagnostic.task_record" {
                 assert_eq!(record["run_id"], expected_run_id);
-                assert_eq!(record["command"], "translate");
+                assert_eq!(record["context"]["command"], "translate");
                 assert_eq!(record["level"], "warn");
                 observed_same_run_log = true;
             }
@@ -267,8 +273,8 @@ target_task_user_message_characters = 10000
         "诊断必须指出损坏行号：{stderr}"
     );
     assert!(
-        stderr.contains("Generic JSONL source document"),
-        "诊断必须使用 Generic JSONL 文案：{stderr}"
+        stderr.contains("generic.jsonl.invalid_json") && stderr.contains("operation=parse_jsonl"),
+        "诊断必须使用 Generic JSONL 的稳定错误码和操作：{stderr}"
     );
     assert!(
         stderr.contains("json_category=data")
@@ -284,6 +290,400 @@ target_task_user_message_characters = 10000
         !stderr.contains("RPG Maker"),
         "Generic JSONL 诊断不得复用 RPG Maker 文案：{stderr}"
     );
+}
+
+#[test]
+fn generic_missing_text_capture_reports_exact_leaf_without_model_request_or_state_change() {
+    let temporary = tempfile::tempdir().expect("应可建立 MissingTextCapture 进程测试目录");
+    let root = temporary.path();
+    let input = root.join("input");
+    fs::create_dir(&input).expect("应可建立 MissingTextCapture 输入目录");
+    fs::write(
+        input.join("story.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "id": "scene",
+                "kind": "dialogue",
+                "units": [{
+                    "id": "broken-unit",
+                    "text": MISSING_CAPTURE_SOURCE,
+                }],
+            })
+        ),
+    )
+    .expect("应可写入 MissingTextCapture Generic JSONL");
+
+    let placeholders = root.join("external-placeholders.toml");
+    fs::write(
+        &placeholders,
+        concat!(
+            "[[rule]]\n",
+            "scopes = [\"dialogue\"]\n",
+            "pattern = '(?:(?<text>保留)|触发缺组)'\n",
+        ),
+    )
+    .expect("应可写入缺少 text 捕获的外部 Placeholder 规则");
+
+    let provider = TcpListener::bind(("127.0.0.1", 0)).expect("本地 Provider 端口应可绑定");
+    provider
+        .set_nonblocking(true)
+        .expect("Provider spy 应可设为非阻塞");
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        provider.local_addr().expect("本地 Provider 地址应可读取")
+    );
+    write_missing_capture_distribution(root, &endpoint);
+
+    let input_argument = input.to_str().expect("临时输入路径应是 Unicode");
+    assert_success(
+        "MissingTextCapture Generic Init",
+        &run_att(
+            root,
+            "off",
+            &[
+                "generic",
+                "init",
+                "--name",
+                MISSING_CAPTURE_PROJECT,
+                "--path",
+                input_argument,
+                "--source-language",
+                "ja",
+                "--target-language",
+                "zh-Hans",
+            ],
+        ),
+    );
+    assert_success(
+        "MissingTextCapture Generic Extract",
+        &run_att(
+            root,
+            "off",
+            &["generic", "extract", "--name", MISSING_CAPTURE_PROJECT],
+        ),
+    );
+
+    let workspace = distribution_root(root)
+        .join("projects/generic")
+        .join(MISSING_CAPTURE_PROJECT);
+    let database = workspace.join("project.db");
+    let database_before = fs::read(&database).expect("Translate 前数据库应可读取");
+    let logs_before = project_log_paths(&workspace.join("logs"));
+
+    let placeholder_argument = placeholders
+        .to_str()
+        .expect("临时 Placeholder 路径应是 Unicode");
+    let translate = run_att(
+        root,
+        "off",
+        &[
+            "generic",
+            "translate",
+            "--name",
+            MISSING_CAPTURE_PROJECT,
+            "local",
+            "--placeholders",
+            placeholder_argument,
+        ],
+    );
+    assert_eq!(
+        translate.status.code(),
+        Some(1),
+        "MissingTextCapture 必须是普通失败\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&translate.stdout),
+        String::from_utf8_lossy(&translate.stderr)
+    );
+
+    let mut provider_connections = 0_u64;
+    loop {
+        match provider.accept() {
+            Ok((_stream, _address)) => provider_connections += 1,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+            Err(error) => panic!("读取 Provider spy 连接失败：{error}"),
+        }
+    }
+    assert_eq!(
+        provider_connections, 0,
+        "源文 Placeholder 规划失败前不得建立任何模型连接"
+    );
+    assert_eq!(
+        fs::read(&database).expect("Translate 后数据库应可读取"),
+        database_before,
+        "MissingTextCapture 失败前后 SQLite 文件字节必须完全一致"
+    );
+    assert!(
+        !workspace.join("task-records").exists(),
+        "零模型请求的规划失败不得建立任务记录"
+    );
+
+    let match_text = "触发缺组";
+    let match_start = MISSING_CAPTURE_SOURCE
+        .find(match_text)
+        .expect("测试源文必须包含 Placeholder 完整匹配");
+    let match_end = match_start + match_text.len();
+    let stderr = String::from_utf8(translate.stderr).expect("诊断 stderr 必须是 UTF-8");
+    for expected in [
+        "translation.placeholder.missing_text_capture".to_owned(),
+        "Translation".to_owned(),
+        placeholders.display().to_string(),
+        "relative_path=story.jsonl".to_owned(),
+        "group_id=scene".to_owned(),
+        "unit_id=broken-unit".to_owned(),
+        "role=dialogue".to_owned(),
+        "rule_number=1".to_owned(),
+        format!("match_range={match_start}..{match_end}"),
+        "State was not changed".to_owned(),
+        "Correct the indicated Placeholder rule and retry".to_owned(),
+    ] {
+        assert!(
+            stderr.contains(&expected),
+            "stderr 必须保留 MissingTextCapture 事实 {expected:?}：{stderr}"
+        );
+    }
+    for private in [MISSING_CAPTURE_SOURCE, MISSING_CAPTURE_API_KEY] {
+        assert!(
+            !stderr.contains(private),
+            "stderr 不得泄露受保护内容 {private:?}：{stderr}"
+        );
+    }
+
+    let logs_after = project_log_paths(&workspace.join("logs"));
+    let new_logs = logs_after
+        .difference(&logs_before)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        new_logs.len(),
+        1,
+        "一次 Translate 必须新增且只新增一份 RunId 项目日志：{new_logs:?}"
+    );
+    let log_text = fs::read_to_string(&new_logs[0]).expect("Translate 项目日志应可读取");
+    for private in [MISSING_CAPTURE_SOURCE, MISSING_CAPTURE_API_KEY] {
+        assert!(
+            !log_text.contains(private),
+            "项目日志不得泄露受保护内容 {private:?}"
+        );
+    }
+    let records = log_text
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("项目日志行必须是 JSON"))
+        .collect::<Vec<_>>();
+    assert!(!records.is_empty(), "Translate 项目日志不得为空");
+    for record in &records {
+        let fields = record
+            .as_object()
+            .expect("项目日志顶层必须是 object")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            fields,
+            BTreeSet::from([
+                "timestamp",
+                "sequence",
+                "run_id",
+                "level",
+                "code",
+                "context",
+                "payload",
+                "message",
+            ]),
+            "项目日志顶层必须使用唯一现行契约：{record}"
+        );
+        assert_eq!(record["context"]["locale"], "en");
+        assert_eq!(record["context"]["engine"], "generic");
+        assert_eq!(record["context"]["project"], MISSING_CAPTURE_PROJECT);
+        assert_eq!(record["context"]["command"], "translate");
+    }
+
+    let diagnostic_records = records
+        .iter()
+        .filter(|record| record["code"] == "diagnostic.run_plan")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        diagnostic_records.len(),
+        1,
+        "MissingTextCapture 必须形成一条原子 RunPlan occurrence：{log_text}"
+    );
+    let occurrence = &diagnostic_records[0]["payload"];
+    assert_eq!(diagnostic_records[0]["level"], "error");
+    assert!(
+        occurrence["id"].as_u64().is_some(),
+        "occurrence ID 必须是 RunId 内单调编号：{occurrence}"
+    );
+    assert_eq!(occurrence["scope"], "run_plan");
+    assert_eq!(occurrence["report"]["effect"], "unchanged");
+    assert_eq!(
+        occurrence["report"]["primary"]["code"],
+        "translation.placeholder.missing_text_capture"
+    );
+    assert_eq!(occurrence["report"]["primary"]["stage"], "translate");
+    assert_eq!(
+        occurrence["report"]["primary"]["resolution"],
+        "fix_placeholder_rules"
+    );
+    assert_eq!(occurrence["report"]["related"], serde_json::json!([]));
+    let issue = &occurrence["report"]["primary"]["issue"];
+    assert_eq!(issue["family"], "translation");
+    assert_eq!(issue["details"]["kind"], "placeholder");
+    assert_eq!(
+        issue["details"]["rule_source"],
+        serde_json::json!({
+            "kind": "external_file",
+            "path": placeholders.display().to_string(),
+        })
+    );
+    assert_eq!(
+        issue["details"]["unit"],
+        serde_json::json!({
+            "relative_path": "story.jsonl",
+            "group_id": "scene",
+            "unit_id": "broken-unit",
+            "role": "dialogue",
+        })
+    );
+    assert_eq!(
+        issue["details"]["problem"],
+        serde_json::json!({
+            "kind": "missing_text_capture",
+            "rule_number": 1,
+            "match_range": {
+                "start": match_start,
+                "end": match_end,
+            },
+        })
+    );
+
+    assert!(
+        records
+            .iter()
+            .all(|record| record["code"] != "task.started"),
+        "规划失败不得声明模型 Task 已开始：{log_text}"
+    );
+    assert!(
+        records
+            .iter()
+            .all(|record| record["code"] != "retry.summary"),
+        "零模型请求不得产生 Retry 汇总：{log_text}"
+    );
+    assert!(
+        records.iter().all(|record| {
+            record["code"] != "phase.completed" || record["payload"]["phase"] != "planning"
+        }),
+        "失败的 planning phase 不得伪造 completed：{log_text}"
+    );
+    let stopped = records
+        .iter()
+        .filter(|record| {
+            record["code"] == "phase.stopped" && record["payload"]["phase"] == "planning"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stopped.len(),
+        1,
+        "失败 planning 必须恰好停止一次：{log_text}"
+    );
+    assert_eq!(
+        stopped[0]["payload"]["outcome"]["diagnostic"],
+        occurrence["id"]
+    );
+    let translation_finished = records
+        .iter()
+        .filter(|record| record["code"] == "translation.finished")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        translation_finished.len(),
+        1,
+        "每次 Translate 必须恰好产生一个翻译终态：{log_text}"
+    );
+    assert_eq!(
+        translation_finished[0]["payload"]["result"]["kind"],
+        "failed"
+    );
+    assert_eq!(
+        translation_finished[0]["payload"]["result"]["diagnostic"],
+        occurrence["id"]
+    );
+}
+
+fn write_missing_capture_distribution(root: &Path, endpoint: &str) {
+    let distribution = distribution_root(root);
+    fs::create_dir_all(&distribution).expect("MissingTextCapture 发行目录应可建立");
+    fs::write(
+        distribution.join("config.toml"),
+        format!(
+            r#"[prompts]
+thinking_output = true
+source_echo = false
+
+[llm.clients.local]
+url = "{endpoint}"
+api_key = "{MISSING_CAPTURE_API_KEY}"
+model = "unused-model"
+max_concurrent_requests = 1
+connect_timeout_ms = 1000
+read_timeout_ms = 1000
+request_timeout_ms = 1000
+proxy = false
+additional_pem_files = []
+retry_delays_ms = [1]
+max_retry_after_ms = 1
+parameters = '''
+{{}}
+'''
+
+[[languages]]
+type = "japanese"
+id = "ja"
+minimum_kana_characters = 1
+allowed_terms = []
+quote_repair_pairs = [["“", "”"], ["‘", "’"]]
+
+[translation]
+
+[[translation.profiles]]
+id = "local"
+llm_client = "local"
+target_task_user_message_characters = 10000
+"#
+        ),
+    )
+    .expect("MissingTextCapture 测试配置应可写入");
+    let prompt_root = distribution.join("prompts/translation");
+    fs::create_dir_all(prompt_root.join("rules")).expect("Prompt 规则目录应可建立");
+    fs::create_dir_all(prompt_root.join("examples")).expect("Prompt 示例目录应可建立");
+    fs::write(
+        prompt_root.join("system.md"),
+        "把 {{source_language}} 翻译成 {{target_language}}。",
+    )
+    .expect("system Prompt 应可写入");
+    fs::write(
+        prompt_root.join("thinking.md"),
+        "在 think 中写出影响译文的判断。",
+    )
+    .expect("Thinking Prompt 应可写入");
+    fs::write(
+        prompt_root.join("rules/thinking.md"),
+        "只输出带 think 和 translations 的 JSON object。",
+    )
+    .expect("思考模式规则应可写入");
+    fs::write(
+        prompt_root.join("examples/thinking.md"),
+        "# 示例\n\n输入：{}\n\n输出：{\"think\":\"判断\",\"translations\":{}}",
+    )
+    .expect("思考模式示例应可写入");
+}
+
+fn project_log_paths(directory: &Path) -> BTreeSet<PathBuf> {
+    fs::read_dir(directory)
+        .expect("项目日志目录应可读取")
+        .map(|entry| entry.expect("项目日志项应可读取").path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .collect()
 }
 
 fn run_att(root: &Path, progress: &str, arguments: &[&str]) -> Output {

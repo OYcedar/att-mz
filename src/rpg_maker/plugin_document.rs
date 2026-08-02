@@ -34,18 +34,6 @@ pub(crate) enum PluginsEnvelopeFailure {
     RootType,
 }
 
-impl PluginsEnvelopeFailure {
-    pub(crate) const fn storage_name(self) -> &'static str {
-        match self {
-            Self::Declaration => "declaration",
-            Self::Prefix => "prefix",
-            Self::Assignment => "assignment",
-            Self::Terminator => "terminator",
-            Self::RootType => "root_type",
-        }
-    }
-}
-
 impl fmt::Display for PluginsEnvelopeFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {

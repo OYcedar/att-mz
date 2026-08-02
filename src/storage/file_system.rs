@@ -7,6 +7,10 @@ use std::fmt;
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 
+use crate::diagnostic::{
+    Diagnostic, DiagnosticReport, PublicationBackendCause, PublicationIssue, PublicationProblem,
+    PublicationStep, RelatedFailureRelation, SafePath, StateEffect,
+};
 use crate::fingerprint::Sha256Fingerprint;
 
 pub(crate) use super::scoped_path::ScopedDirectoryPath;
@@ -1289,6 +1293,99 @@ pub(crate) struct StagingCleanupFailure<E> {
     source: E,
 }
 
+/// 底层文件系统根把自己的封闭叶子报告提供给目录发布语义所有者。
+pub(crate) trait DirectoryPublicationDiagnosticSource {
+    fn publication_diagnostic(&self, step: PublicationStep) -> DirectoryPublicationDiagnostic;
+}
+
+pub(crate) struct DirectoryPublicationDiagnostic {
+    effect: StateEffect,
+    primary: PublicationBackendCause,
+    related: Vec<(RelatedFailureRelation, DirectoryPublicationDiagnostic)>,
+}
+
+impl DirectoryPublicationDiagnostic {
+    pub(crate) fn new(primary: PublicationBackendCause) -> Self {
+        Self {
+            effect: StateEffect::Unchanged,
+            primary,
+            related: Vec::new(),
+        }
+    }
+
+    /// 根实现保留已知状态影响，发布层不能在包装原因时将其降级。
+    pub(crate) fn with_effect(mut self, effect: StateEffect) -> Self {
+        self.effect = effect;
+        self
+    }
+
+    pub(crate) fn with_related(
+        mut self,
+        relation: RelatedFailureRelation,
+        related: DirectoryPublicationDiagnostic,
+    ) -> Self {
+        self.related.push((relation, related));
+        self
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        StateEffect,
+        PublicationBackendCause,
+        Vec<(RelatedFailureRelation, DirectoryPublicationDiagnostic)>,
+    ) {
+        (self.effect, self.primary, self.related)
+    }
+}
+
+fn publication_report(
+    effect: StateEffect,
+    step: PublicationStep,
+    problem: PublicationProblem,
+) -> DiagnosticReport {
+    DiagnosticReport::new(
+        effect,
+        Diagnostic::publication(PublicationIssue::new(step, problem)),
+    )
+}
+
+fn cleanup_report<E>(failure: &StagingCleanupFailure<E>) -> DiagnosticReport
+where
+    E: DirectoryPublicationDiagnosticSource,
+{
+    let projection = failure
+        .source()
+        .publication_diagnostic(PublicationStep::CleanupResidual);
+    let (source_effect, cause, related) = projection.into_parts();
+    attach_backend_related(
+        publication_report(
+            StateEffect::RecoveryRequired.strongest(source_effect),
+            PublicationStep::CleanupResidual,
+            PublicationProblem::CleanupFailed {
+                residual_path: SafePath::new(failure.residual_path()),
+                cause,
+            },
+        ),
+        related,
+    )
+}
+
+fn attach_backend_related(
+    mut report: DiagnosticReport,
+    related: Vec<(RelatedFailureRelation, DirectoryPublicationDiagnostic)>,
+) -> DiagnosticReport {
+    for (relation, projection) in related {
+        let (effect, cause, nested) = projection.into_parts();
+        let related_report = attach_backend_related(
+            DiagnosticReport::new(effect, cause.into_diagnostic()),
+            nested,
+        );
+        report = report.with_related(relation, related_report);
+    }
+    report
+}
+
 impl<E> StagingCleanupFailure<E> {
     pub(crate) fn new(residual_path: PathBuf, source: E) -> Self {
         Self {
@@ -1303,10 +1400,6 @@ impl<E> StagingCleanupFailure<E> {
 
     pub(crate) fn source(&self) -> &E {
         &self.source
-    }
-
-    pub(crate) fn into_parts(self) -> (PathBuf, E) {
-        (self.residual_path, self.source)
     }
 }
 
@@ -1343,6 +1436,45 @@ pub(crate) enum DirectoryPrepareError<E> {
     },
 }
 
+impl<E> DirectoryPrepareError<E>
+where
+    E: DirectoryPublicationDiagnosticSource,
+{
+    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
+        match self {
+            Self::NotPrepared {
+                target_root,
+                source,
+                cleanup_failure,
+            } => {
+                let projection = source.publication_diagnostic(PublicationStep::PrepareCandidate);
+                let (source_effect, cause, related) = projection.into_parts();
+                let mut report = attach_backend_related(
+                    publication_report(
+                        StateEffect::Unchanged.strongest(source_effect),
+                        PublicationStep::PrepareCandidate,
+                        PublicationProblem::PrepareFailed {
+                            output_root: SafePath::new(target_root),
+                            candidate_root: cleanup_failure
+                                .as_ref()
+                                .map(|failure| SafePath::new(failure.residual_path())),
+                            cause,
+                        },
+                    ),
+                    related,
+                );
+                if let Some(cleanup_failure) = cleanup_failure {
+                    report = report.with_related(
+                        RelatedFailureRelation::Cleanup,
+                        cleanup_report(cleanup_failure),
+                    );
+                }
+                report
+            }
+        }
+    }
+}
+
 /// 显式恢复是否实际处理了属于该目标的受管发布产物。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DirectoryRecoveryOutcome {
@@ -1357,6 +1489,27 @@ pub(crate) struct DirectoryRecoveryError<E> {
     source: E,
 }
 
+impl<E> DirectoryRecoveryError<E>
+where
+    E: DirectoryPublicationDiagnosticSource,
+{
+    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
+        let projection = self.source.publication_diagnostic(PublicationStep::Recover);
+        let (source_effect, cause, related) = projection.into_parts();
+        attach_backend_related(
+            publication_report(
+                StateEffect::RecoveryRequired.strongest(source_effect),
+                PublicationStep::Recover,
+                PublicationProblem::RecoveryFailed {
+                    output_root: SafePath::new(&self.target_root),
+                    cause,
+                },
+            ),
+            related,
+        )
+    }
+}
+
 impl<E> DirectoryRecoveryError<E> {
     pub(crate) fn new(target_root: PathBuf, source: E) -> Self {
         Self {
@@ -1365,6 +1518,7 @@ impl<E> DirectoryRecoveryError<E> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn source_error(&self) -> &E {
         &self.source
     }
@@ -1471,6 +1625,179 @@ pub(crate) enum DirectoryPublishError<E> {
         recovery_artifacts: Vec<PathBuf>,
         source: E,
     },
+}
+
+impl<E> DirectoryPublishError<E>
+where
+    E: DirectoryPublicationDiagnosticSource,
+{
+    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
+        match self {
+            Self::TargetAlreadyExists {
+                target_root,
+                cleanup_failure,
+            } => publication_state_report(
+                cleanup_failure.as_ref(),
+                PublicationProblem::TargetAlreadyExists {
+                    output_root: SafePath::new(target_root),
+                },
+            ),
+            Self::TargetMissing {
+                target_root,
+                cleanup_failure,
+            } => publication_state_report(
+                cleanup_failure.as_ref(),
+                PublicationProblem::TargetMissing {
+                    output_root: SafePath::new(target_root),
+                },
+            ),
+            Self::TargetNotDirectory {
+                target_root,
+                cleanup_failure,
+            } => publication_state_report(
+                cleanup_failure.as_ref(),
+                PublicationProblem::TargetNotDirectory {
+                    output_root: SafePath::new(target_root),
+                },
+            ),
+            Self::NotAttempted {
+                target_root,
+                source,
+                cleanup_failure,
+            } => publication_failure_report(
+                source,
+                cleanup_failure.as_ref(),
+                StateEffect::Unchanged,
+                PublicationStep::Publish,
+                |cause| PublicationProblem::NotAttempted {
+                    output_root: SafePath::new(target_root),
+                    cause,
+                },
+            ),
+            Self::NotPublished {
+                target_root,
+                source,
+                cleanup_failure,
+            } => publication_failure_report(
+                source,
+                cleanup_failure.as_ref(),
+                StateEffect::Unchanged,
+                PublicationStep::Publish,
+                |cause| PublicationProblem::NotPublished {
+                    output_root: SafePath::new(target_root),
+                    cause,
+                },
+            ),
+            Self::PublishedWithResiduals {
+                target_root,
+                residual_path,
+                source,
+            } => {
+                let projection = source.publication_diagnostic(PublicationStep::CleanupResidual);
+                let (source_effect, cause, related) = projection.into_parts();
+                attach_backend_related(
+                    publication_report(
+                        StateEffect::AppliedFinalizationFailed.strongest(source_effect),
+                        PublicationStep::Finalize,
+                        PublicationProblem::PublishedFinalizationFailed {
+                            output_root: SafePath::new(target_root),
+                            residual_path: SafePath::new(residual_path),
+                            cause,
+                        },
+                    ),
+                    related,
+                )
+            }
+            Self::RecoveryRequired {
+                target_root,
+                recovery_artifacts,
+                source,
+            } => {
+                let projection = source.publication_diagnostic(PublicationStep::Recover);
+                let (source_effect, cause, related) = projection.into_parts();
+                attach_backend_related(
+                    publication_report(
+                        StateEffect::RecoveryRequired.strongest(source_effect),
+                        PublicationStep::Publish,
+                        PublicationProblem::RecoveryRequired {
+                            output_root: SafePath::new(target_root),
+                            recovery_artifacts: recovery_artifacts
+                                .iter()
+                                .map(SafePath::new)
+                                .collect(),
+                            cause,
+                        },
+                    ),
+                    related,
+                )
+            }
+            Self::OutcomeUnknown {
+                target_root,
+                recovery_artifacts,
+                source,
+            } => {
+                let projection = source.publication_diagnostic(PublicationStep::Recover);
+                let (source_effect, cause, related) = projection.into_parts();
+                attach_backend_related(
+                    publication_report(
+                        StateEffect::OutcomeUnknown.strongest(source_effect),
+                        PublicationStep::Publish,
+                        PublicationProblem::OutcomeUnknown {
+                            output_root: SafePath::new(target_root),
+                            recovery_artifacts: recovery_artifacts
+                                .iter()
+                                .map(SafePath::new)
+                                .collect(),
+                            cause,
+                        },
+                    ),
+                    related,
+                )
+            }
+        }
+    }
+}
+
+fn publication_state_report<E>(
+    cleanup_failure: Option<&StagingCleanupFailure<E>>,
+    problem: PublicationProblem,
+) -> DiagnosticReport
+where
+    E: DirectoryPublicationDiagnosticSource,
+{
+    let mut report = publication_report(StateEffect::Unchanged, PublicationStep::Publish, problem);
+    if let Some(cleanup_failure) = cleanup_failure {
+        report = report.with_related(
+            RelatedFailureRelation::Cleanup,
+            cleanup_report(cleanup_failure),
+        );
+    }
+    report
+}
+
+fn publication_failure_report<E>(
+    source: &E,
+    cleanup_failure: Option<&StagingCleanupFailure<E>>,
+    effect: StateEffect,
+    step: PublicationStep,
+    problem: impl FnOnce(PublicationBackendCause) -> PublicationProblem,
+) -> DiagnosticReport
+where
+    E: DirectoryPublicationDiagnosticSource,
+{
+    let projection = source.publication_diagnostic(step);
+    let (source_effect, cause, related) = projection.into_parts();
+    let mut report = attach_backend_related(
+        publication_report(effect.strongest(source_effect), step, problem(cause)),
+        related,
+    );
+    if let Some(cleanup_failure) = cleanup_failure {
+        report = report.with_related(
+            RelatedFailureRelation::Cleanup,
+            cleanup_report(cleanup_failure),
+        );
+    }
+    report
 }
 
 impl<E> fmt::Display for DirectoryPublishError<E>
@@ -1625,16 +1952,37 @@ impl<E> DirectoryDiscardError<E> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn staging_root(&self) -> &Path {
         &self.staging_root
     }
 
+    #[cfg(test)]
     pub(crate) fn source(&self) -> &E {
         &self.source
     }
+}
 
-    pub(crate) fn into_parts(self) -> (PathBuf, E) {
-        (self.staging_root, self.source)
+impl<E> DirectoryDiscardError<E>
+where
+    E: DirectoryPublicationDiagnosticSource,
+{
+    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
+        let projection = self
+            .source
+            .publication_diagnostic(PublicationStep::DiscardCandidate);
+        let (source_effect, cause, related) = projection.into_parts();
+        attach_backend_related(
+            publication_report(
+                StateEffect::RecoveryRequired.strongest(source_effect),
+                PublicationStep::DiscardCandidate,
+                PublicationProblem::DiscardFailed {
+                    candidate_root: SafePath::new(&self.staging_root),
+                    cause,
+                },
+            ),
+            related,
+        )
     }
 }
 
@@ -2339,6 +2687,166 @@ mod directory_stage_tests {
     }
 
     impl Error for TestError {}
+
+    impl DirectoryPublicationDiagnosticSource for TestError {
+        fn publication_diagnostic(&self, step: PublicationStep) -> DirectoryPublicationDiagnostic {
+            let operation = match step {
+                PublicationStep::Recover => crate::diagnostic::FileSystemOperation::RecoverTarget,
+                PublicationStep::PrepareCandidate => {
+                    crate::diagnostic::FileSystemOperation::PrepareCandidate
+                }
+                PublicationStep::Publish | PublicationStep::Finalize => {
+                    crate::diagnostic::FileSystemOperation::Rename
+                }
+                PublicationStep::DiscardCandidate | PublicationStep::CleanupResidual => {
+                    crate::diagnostic::FileSystemOperation::Remove
+                }
+            };
+            let projection = DirectoryPublicationDiagnostic::new(PublicationBackendCause::new(
+                Diagnostic::file_system(crate::diagnostic::FileSystemIssue::new(
+                    crate::diagnostic::FileSystemDiagnosticContext::new(
+                        crate::diagnostic::FileSystemDiagnosticStage::Publication,
+                        operation,
+                    ),
+                    crate::diagnostic::FileSystemProblem::ExecutorClosed,
+                )),
+            ));
+            if self.0 == "backend rollback failed" {
+                projection.with_related(
+                    RelatedFailureRelation::Rollback,
+                    DirectoryPublicationDiagnostic::new(PublicationBackendCause::new(
+                        Diagnostic::file_system(crate::diagnostic::FileSystemIssue::new(
+                            crate::diagnostic::FileSystemDiagnosticContext::new(
+                                crate::diagnostic::FileSystemDiagnosticStage::Publication,
+                                crate::diagnostic::FileSystemOperation::Remove,
+                            ),
+                            crate::diagnostic::FileSystemProblem::ExecutorClosed,
+                        )),
+                    )),
+                )
+            } else {
+                projection
+            }
+        }
+    }
+
+    #[test]
+    fn published_residual_wire_keeps_output_residual_and_cleanup_relation() {
+        let error = DirectoryPublishError::PublishedWithResiduals {
+            target_root: PathBuf::from("D:/output/game"),
+            residual_path: PathBuf::from("D:/output/.directory-publish-game.backup"),
+            source: TestError("must not enter wire"),
+        };
+
+        assert_eq!(
+            serde_json::to_value(error.diagnostic_report()).expect("发布诊断必须可序列化"),
+            serde_json::json!({
+                "effect": "applied_finalization_failed",
+                "primary": {
+                    "code": "publication.finalization_failed",
+                    "stage": "publication",
+                    "issue": {
+                        "family": "publication",
+                        "details": {
+                            "step": "finalize",
+                            "problem": {
+                                "kind": "published_finalization_failed",
+                                "output_root": "D:/output/game",
+                                "residual_path": "D:/output/.directory-publish-game.backup",
+                                "cause": {
+                                    "diagnostic": {
+                                        "code": "filesystem.executor_closed",
+                                        "stage": "publication",
+                                        "issue": {
+                                            "family": "file_system",
+                                            "details": {
+                                                "context": {
+                                                    "stage": "publication",
+                                                    "operation": "remove"
+                                                },
+                                                "problem": {
+                                                    "kind": "executor_closed"
+                                                }
+                                            }
+                                        },
+                                        "resolution": "retry"
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "resolution": "preserve_recovery_artifacts"
+                },
+                "related": []
+            })
+        );
+    }
+
+    #[test]
+    fn unpublished_main_and_cleanup_failures_are_one_recursive_report() {
+        let error = DirectoryPublishError::NotPublished {
+            target_root: PathBuf::from("D:/output/game"),
+            source: TestError("publish failed"),
+            cleanup_failure: Some(StagingCleanupFailure::new(
+                PathBuf::from("D:/output/.directory-publish-game.stage"),
+                TestError("cleanup failed"),
+            )),
+        };
+        let value = serde_json::to_value(error.diagnostic_report())
+            .expect("主错误和清理错误必须可原子序列化");
+
+        assert_eq!(value["effect"], "recovery_required");
+        assert_eq!(value["primary"]["code"], "publication.not_published");
+        assert_eq!(
+            value["primary"]["issue"]["details"]["problem"]["cause"]["diagnostic"]["issue"]["family"],
+            "file_system"
+        );
+        assert_eq!(value["related"][0]["relation"], "cleanup");
+        assert_eq!(
+            value["related"][0]["report"]["primary"]["code"],
+            "publication.cleanup_failed"
+        );
+        assert_eq!(
+            value["related"][0]["report"]["primary"]["issue"]["details"]["problem"]["residual_path"],
+            "D:/output/.directory-publish-game.stage"
+        );
+        assert_eq!(
+            value["related"][0]["report"]["primary"]["issue"]["details"]["problem"]["cause"]["diagnostic"]
+                ["issue"]["family"],
+            "file_system"
+        );
+        assert_eq!(
+            value["related"][0]["report"]["related"],
+            serde_json::json!([])
+        );
+        assert!(!value.to_string().contains("publish failed"));
+        assert!(!value.to_string().contains("cleanup failed"));
+    }
+
+    #[test]
+    fn backend_related_failure_is_lifted_out_of_publication_issue() {
+        let error = DirectoryPublishError::NotPublished {
+            target_root: PathBuf::from("D:/output/game"),
+            source: TestError("backend rollback failed"),
+            cleanup_failure: None,
+        };
+        let value = serde_json::to_value(error.diagnostic_report())
+            .expect("底层相关失败必须提升到报告关系树");
+
+        assert_eq!(value["related"][0]["relation"], "rollback");
+        assert_eq!(
+            value["related"][0]["report"]["primary"]["issue"]["family"],
+            "file_system"
+        );
+        assert_eq!(
+            value["related"][0]["report"]["primary"]["issue"]["details"]["context"]["operation"],
+            "remove"
+        );
+        assert_eq!(
+            value["related"][0]["report"]["related"],
+            serde_json::json!([])
+        );
+    }
 
     #[test]
     fn known_unpublished_states_preserve_candidate_cleanup_failure() {

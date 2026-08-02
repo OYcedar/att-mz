@@ -15,8 +15,15 @@ use pcre2::bytes::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::diagnostic::{
-    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
-    DiagnosticStage, DiagnosticSubject, SafeDiagnostic, SafeDiagnosticSource,
+    ByteRange, PlaceholderIssue as DiagnosticPlaceholderIssue,
+    PlaceholderMatchRangeViolation as DiagnosticPlaceholderMatchRangeViolation,
+    PlaceholderRuleOrigin as DiagnosticPlaceholderRuleOrigin,
+};
+use crate::diagnostic::{
+    Diagnostic, DiagnosticReport, IoFailure, Pcre2Failure, Pcre2FailureKind,
+    PlaceholderCompilationProblem,
+    PlaceholderWorkerOperation as DiagnosticPlaceholderWorkerOperation, StateEffect,
+    TranslationIssue,
 };
 use crate::execution::isolated::{IsolatedOperationError, run_isolated_operation};
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
@@ -29,6 +36,127 @@ use super::placeholder_token;
 
 const CUSTOM_SEMANTIC_LABEL: &str = "CUSTOM";
 const PLACEHOLDER_CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
+
+/// Placeholder 隔离 worker 正在执行的封闭操作。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PlaceholderWorkerOperation {
+    CompileCustomRules,
+    MatchText,
+}
+
+impl PlaceholderWorkerOperation {
+    pub(crate) const fn diagnostic_operation(self) -> DiagnosticPlaceholderWorkerOperation {
+        match self {
+            Self::CompileCustomRules => DiagnosticPlaceholderWorkerOperation::CompileCustomRules,
+            Self::MatchText => DiagnosticPlaceholderWorkerOperation::MatchText,
+        }
+    }
+}
+
+impl fmt::Display for PlaceholderWorkerOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::CompileCustomRules => "compile_custom_rules",
+            Self::MatchText => "match_text",
+        })
+    }
+}
+
+/// PCRE2 报告错误时正在执行的封闭操作类别。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PlaceholderPcre2ErrorKind {
+    Compile,
+    Jit,
+    Match,
+    Info,
+    Option,
+    Unrecognized,
+}
+
+impl fmt::Display for PlaceholderPcre2ErrorKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Compile => "compile",
+            Self::Jit => "jit",
+            Self::Match => "match",
+            Self::Info => "info",
+            Self::Option => "option",
+            Self::Unrecognized => "unrecognized",
+        })
+    }
+}
+
+/// PCRE2 原始错误及其可安全投影的类型化事实。
+#[derive(Debug)]
+pub(crate) struct PlaceholderPcre2Failure {
+    kind: PlaceholderPcre2ErrorKind,
+    code: i32,
+    offset: Option<usize>,
+    source: pcre2::Error,
+}
+
+impl PlaceholderPcre2Failure {
+    fn new(source: pcre2::Error) -> Self {
+        Self {
+            kind: placeholder_pcre2_error_kind(&source),
+            code: source.code(),
+            offset: source.offset(),
+            source,
+        }
+    }
+
+    pub(crate) const fn kind(&self) -> PlaceholderPcre2ErrorKind {
+        self.kind
+    }
+
+    pub(crate) const fn code(&self) -> i32 {
+        self.code
+    }
+
+    pub(crate) const fn offset(&self) -> Option<usize> {
+        self.offset
+    }
+
+    pub(crate) const fn diagnostic_failure(&self) -> Pcre2Failure {
+        Pcre2Failure {
+            kind: match self.kind {
+                PlaceholderPcre2ErrorKind::Compile => Pcre2FailureKind::Compile,
+                PlaceholderPcre2ErrorKind::Jit => Pcre2FailureKind::Jit,
+                PlaceholderPcre2ErrorKind::Match => Pcre2FailureKind::Match,
+                PlaceholderPcre2ErrorKind::Info => Pcre2FailureKind::Info,
+                PlaceholderPcre2ErrorKind::Option => Pcre2FailureKind::Option,
+                PlaceholderPcre2ErrorKind::Unrecognized => Pcre2FailureKind::Unrecognized,
+            },
+            code: self.code,
+            offset: self.offset,
+        }
+    }
+}
+
+impl fmt::Display for PlaceholderPcre2Failure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "PCRE2 {} 错误（code={}，offset={}）",
+            self.kind,
+            self.code,
+            self.offset
+                .map_or_else(|| "none".to_owned(), |value| value.to_string())
+        )
+    }
+}
+
+impl Error for PlaceholderPcre2Failure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+impl From<pcre2::Error> for PlaceholderPcre2Failure {
+    fn from(source: pcre2::Error) -> Self {
+        Self::new(source)
+    }
+}
 
 /// 外部 TOML 中一条自定义 Placeholder 规则的最小表达。
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -162,12 +290,13 @@ impl PlaceholderService {
         ) {
             Ok(result) => Ok(result),
             Err(IsolatedOperationError::Cancelled(cancellation)) => Err(cancellation),
-            Err(IsolatedOperationError::Start { operation, source }) => {
-                Ok(Err(PlaceholderRuleCompilationError::StartWorker {
-                    operation,
-                    source,
-                }))
-            }
+            Err(IsolatedOperationError::Start {
+                operation: _,
+                source,
+            }) => Ok(Err(PlaceholderRuleCompilationError::StartWorker {
+                operation: PlaceholderWorkerOperation::CompileCustomRules,
+                source,
+            })),
         }
     }
 
@@ -209,8 +338,13 @@ impl PlaceholderService {
         mut ensure_running: impl FnMut() -> Result<(), E>,
     ) -> Result<Result<ProtectedText, PlaceholderProtectionError>, E> {
         ensure_running()?;
-        if contains_reserved_prefix_with_cancellation(original, &mut ensure_running)? {
-            return Ok(Err(PlaceholderProtectionError::ReservedTokenNamespace));
+        if let Some(start_byte) =
+            reserved_prefix_start_with_cancellation(original, &mut ensure_running)?
+        {
+            return Ok(Err(PlaceholderProtectionError::ReservedTokenNamespace {
+                start_byte,
+                end_byte: start_byte + placeholder_token::PREFIX.len(),
+            }));
         }
 
         let mut has_applicable_custom_rule = false;
@@ -258,9 +392,12 @@ impl PlaceholderService {
                 Err(IsolatedOperationError::Cancelled(cancellation)) => {
                     return Err(cancellation);
                 }
-                Err(IsolatedOperationError::Start { operation, source }) => {
+                Err(IsolatedOperationError::Start {
+                    operation: _,
+                    source,
+                }) => {
                     return Ok(Err(PlaceholderProtectionError::StartWorker {
-                        operation,
+                        operation: PlaceholderWorkerOperation::MatchText,
                         source,
                     }));
                 }
@@ -289,14 +426,8 @@ impl PlaceholderService {
                 let previous: &SelectedSpan<'_> = &selected[previous_index];
                 if current.start < previous.end {
                     return Ok(Err(PlaceholderProtectionError::OverlappingMatches {
-                        first: clone_placeholder_text_with_cancellation(
-                            &previous.diagnostic_label,
-                            &mut ensure_running,
-                        )?,
-                        second: clone_placeholder_text_with_cancellation(
-                            &current.diagnostic_label,
-                            &mut ensure_running,
-                        )?,
+                        first: PlaceholderMatchReference::from_span(previous),
+                        second: PlaceholderMatchReference::from_span(current),
                     }));
                 }
                 if current.end > previous.end {
@@ -321,7 +452,7 @@ impl PlaceholderService {
                 .is_some_and(|separator| *separator < span.end)
             {
                 return Ok(Err(PlaceholderProtectionError::CrossesLineBoundary {
-                    rule_number: span.rule_number,
+                    matched: PlaceholderMatchReference::from_span(span),
                     source_line_index,
                 }));
             }
@@ -520,14 +651,14 @@ fn append_placeholder_text_with_cancellation<E>(
     ensure_running()
 }
 
-fn contains_reserved_prefix_with_cancellation<E>(
+fn reserved_prefix_start_with_cancellation<E>(
     text: &str,
     ensure_running: &mut impl FnMut() -> Result<(), E>,
-) -> Result<bool, E> {
+) -> Result<Option<usize>, E> {
     let overlap_bytes = placeholder_token::PREFIX.len().saturating_sub(1);
     if text.len() < placeholder_token::PREFIX.len() {
         ensure_running()?;
-        return Ok(false);
+        return Ok(None);
     }
 
     let mut start = 0_usize;
@@ -543,8 +674,8 @@ fn contains_reserved_prefix_with_cancellation<E>(
         while search_end < text.len() && !text.is_char_boundary(search_end) {
             search_end += 1;
         }
-        if placeholder_token::contains_reserved_prefix(&text[start..search_end]) {
-            return Ok(true);
+        if let Some(relative_start) = text[start..search_end].find(placeholder_token::PREFIX) {
+            return Ok(Some(start + relative_start));
         }
         if primary_end == text.len() {
             break;
@@ -552,7 +683,7 @@ fn contains_reserved_prefix_with_cancellation<E>(
         start = primary_end;
     }
     ensure_running()?;
-    Ok(false)
+    Ok(None)
 }
 
 fn rule_applies_to_scope_with_cancellation<E>(
@@ -611,12 +742,13 @@ fn placeholder_text_fingerprint_with_cancellation<E>(
     Ok(hasher.finish())
 }
 
-fn compile_regex(pattern: &str) -> Result<Regex, pcre2::Error> {
+fn compile_regex(pattern: &str) -> Result<Regex, PlaceholderPcre2Failure> {
     RegexBuilder::new()
         .utf(true)
         .ucp(true)
         .jit_if_available(true)
         .build(pattern)
+        .map_err(PlaceholderPcre2Failure::from)
 }
 
 fn should_isolate_placeholder_matching(
@@ -655,10 +787,17 @@ fn collect_builtin_matches(
 ) -> Result<Vec<OwnedSelectedSpan>, PlaceholderProtectionError> {
     let mut selected = Vec::new();
     for matched in builtin.regex.find_iter(original.as_bytes()) {
-        let matched = matched.map_err(PlaceholderProtectionError::Match)?;
+        let matched = matched.map_err(|source| PlaceholderProtectionError::Match {
+            rule: PlaceholderRuleReference::built_in(),
+            source: PlaceholderPcre2Failure::from(source),
+        })?;
         if matched.start() == matched.end() {
             return Err(PlaceholderProtectionError::EmptyMatch {
-                label: builtin.semantic_label.to_owned(),
+                matched: PlaceholderMatchReference::new(
+                    PlaceholderRuleReference::built_in(),
+                    matched.start(),
+                    matched.end(),
+                ),
             });
         }
         selected.push(OwnedSelectedSpan {
@@ -666,7 +805,6 @@ fn collect_builtin_matches(
             end: matched.end(),
             origin: PlaceholderRuleOrigin::BuiltIn,
             semantic_label: builtin.semantic_label,
-            diagnostic_label: builtin.semantic_label.to_owned(),
             rule_number: None,
             segment: PlaceholderSegment::Whole,
         });
@@ -684,36 +822,54 @@ fn collect_custom_matches(
 ) -> Result<Vec<OwnedSelectedSpan>, PlaceholderProtectionError> {
     let mut result = Vec::new();
     for captures in rule.regex.captures_iter(original.as_bytes()) {
-        let captures = captures.map_err(PlaceholderProtectionError::Match)?;
+        let rule_reference = PlaceholderRuleReference::custom(rule.rule_number);
+        let captures = captures.map_err(|source| PlaceholderProtectionError::Match {
+            rule: rule_reference,
+            source: PlaceholderPcre2Failure::from(source),
+        })?;
         let whole = captures
             .get(0)
             .expect("PCRE2 成功 captures 必须包含整个匹配");
-        if !valid_utf8_range(original, whole.start(), whole.end()) {
+        if let Some(violation) = whole_range_violation(original, whole.start(), whole.end()) {
             return Err(PlaceholderProtectionError::InvalidMatchRange {
                 rule_number: rule.rule_number,
+                whole_match_start_byte: whole.start(),
+                whole_match_end_byte: whole.end(),
+                capture_start_byte: None,
+                capture_end_byte: None,
+                violation,
             });
         }
         if whole.start() == whole.end() {
             return Err(PlaceholderProtectionError::EmptyMatch {
-                label: custom_diagnostic_label(rule.rule_number),
+                matched: PlaceholderMatchReference::new(rule_reference, whole.start(), whole.end()),
             });
         }
-        let diagnostic_label = custom_diagnostic_label(rule.rule_number);
         let protected = if rule.has_text_capture {
             let capture = match captures.name("text") {
                 Some(capture) => capture,
                 None => {
                     return Err(PlaceholderProtectionError::MissingTextCapture {
                         rule_number: rule.rule_number,
+                        whole_match_start_byte: whole.start(),
+                        whole_match_end_byte: whole.end(),
                     });
                 }
             };
-            if !valid_utf8_range(original, capture.start(), capture.end())
-                || capture.start() < whole.start()
-                || capture.end() > whole.end()
-            {
+            if let Some(violation) = capture_range_violation(
+                original,
+                whole.start(),
+                whole.end(),
+                capture.start(),
+                capture.end(),
+            ) {
                 return Err(PlaceholderProtectionError::InvalidMatchRange {
                     rule_number: rule.rule_number,
+                    whole_match_start_byte: whole.start(),
+                    whole_match_end_byte: whole.end(),
+                    capture_start_byte: Some(capture.start()),
+                    capture_end_byte: Some(capture.end()),
+                    violation,
                 });
             }
             let mut protected = Vec::with_capacity(2);
@@ -723,7 +879,6 @@ fn collect_custom_matches(
                     end: capture.start(),
                     origin: PlaceholderRuleOrigin::Custom,
                     semantic_label: CUSTOM_SEMANTIC_LABEL,
-                    diagnostic_label: diagnostic_label.clone(),
                     rule_number: Some(rule.rule_number),
                     segment: PlaceholderSegment::Begin,
                 });
@@ -734,7 +889,6 @@ fn collect_custom_matches(
                     end: whole.end(),
                     origin: PlaceholderRuleOrigin::Custom,
                     semantic_label: CUSTOM_SEMANTIC_LABEL,
-                    diagnostic_label: diagnostic_label.clone(),
                     rule_number: Some(rule.rule_number),
                     segment: PlaceholderSegment::End,
                 });
@@ -746,7 +900,6 @@ fn collect_custom_matches(
                 end: whole.end(),
                 origin: PlaceholderRuleOrigin::Custom,
                 semantic_label: CUSTOM_SEMANTIC_LABEL,
-                diagnostic_label: diagnostic_label.clone(),
                 rule_number: Some(rule.rule_number),
                 segment: PlaceholderSegment::Whole,
             }]
@@ -756,12 +909,46 @@ fn collect_custom_matches(
     Ok(result)
 }
 
-fn valid_utf8_range(text: &str, start: usize, end: usize) -> bool {
-    start <= end && end <= text.len() && text.is_char_boundary(start) && text.is_char_boundary(end)
+fn whole_range_violation(
+    text: &str,
+    start: usize,
+    end: usize,
+) -> Option<PlaceholderMatchRangeViolation> {
+    if start > end {
+        Some(PlaceholderMatchRangeViolation::WholeStartAfterEnd)
+    } else if end > text.len() {
+        Some(PlaceholderMatchRangeViolation::WholeEndBeyondText)
+    } else if !text.is_char_boundary(start) {
+        Some(PlaceholderMatchRangeViolation::WholeStartNotUtf8Boundary)
+    } else if !text.is_char_boundary(end) {
+        Some(PlaceholderMatchRangeViolation::WholeEndNotUtf8Boundary)
+    } else {
+        None
+    }
 }
 
-fn custom_diagnostic_label(rule_number: usize) -> String {
-    format!("CUSTOM_{rule_number:04}")
+fn capture_range_violation(
+    text: &str,
+    whole_start: usize,
+    whole_end: usize,
+    capture_start: usize,
+    capture_end: usize,
+) -> Option<PlaceholderMatchRangeViolation> {
+    if capture_start > capture_end {
+        Some(PlaceholderMatchRangeViolation::CaptureStartAfterEnd)
+    } else if capture_end > text.len() {
+        Some(PlaceholderMatchRangeViolation::CaptureEndBeyondText)
+    } else if !text.is_char_boundary(capture_start) {
+        Some(PlaceholderMatchRangeViolation::CaptureStartNotUtf8Boundary)
+    } else if !text.is_char_boundary(capture_end) {
+        Some(PlaceholderMatchRangeViolation::CaptureEndNotUtf8Boundary)
+    } else if capture_start < whole_start {
+        Some(PlaceholderMatchRangeViolation::CaptureStartsBeforeWhole)
+    } else if capture_end > whole_end {
+        Some(PlaceholderMatchRangeViolation::CaptureEndsAfterWhole)
+    } else {
+        None
+    }
 }
 
 struct OwnedSelectedSpan {
@@ -769,7 +956,6 @@ struct OwnedSelectedSpan {
     end: usize,
     origin: PlaceholderRuleOrigin,
     semantic_label: &'static str,
-    diagnostic_label: String,
     rule_number: Option<usize>,
     segment: PlaceholderSegment,
 }
@@ -781,7 +967,6 @@ impl OwnedSelectedSpan {
             end: self.end,
             origin: self.origin,
             semantic_label: self.semantic_label,
-            diagnostic_label: self.diagnostic_label,
             rule_number: self.rule_number,
             scope,
             segment: self.segment,
@@ -794,7 +979,6 @@ struct SelectedSpan<'a> {
     end: usize,
     origin: PlaceholderRuleOrigin,
     semantic_label: &'static str,
-    diagnostic_label: String,
     rule_number: Option<usize>,
     scope: &'a str,
     segment: PlaceholderSegment,
@@ -879,6 +1063,180 @@ fn semantic_token(label: &str, segment: PlaceholderSegment, index: usize) -> Str
 pub(crate) enum PlaceholderRuleOrigin {
     BuiltIn,
     Custom,
+}
+
+impl PlaceholderRuleOrigin {
+    pub(crate) const fn diagnostic_origin(self) -> DiagnosticPlaceholderRuleOrigin {
+        match self {
+            Self::BuiltIn => DiagnosticPlaceholderRuleOrigin::Builtin,
+            Self::Custom => DiagnosticPlaceholderRuleOrigin::Custom,
+        }
+    }
+}
+
+/// 能保证内置规则与自定义规则号关系的规则引用。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PlaceholderRuleReference {
+    origin: PlaceholderRuleOrigin,
+    rule_number: Option<usize>,
+}
+
+impl PlaceholderRuleReference {
+    const fn built_in() -> Self {
+        Self {
+            origin: PlaceholderRuleOrigin::BuiltIn,
+            rule_number: None,
+        }
+    }
+
+    const fn custom(rule_number: usize) -> Self {
+        Self {
+            origin: PlaceholderRuleOrigin::Custom,
+            rule_number: Some(rule_number),
+        }
+    }
+
+    fn from_parts(origin: PlaceholderRuleOrigin, rule_number: Option<usize>) -> Self {
+        match (origin, rule_number) {
+            (PlaceholderRuleOrigin::BuiltIn, None) => Self::built_in(),
+            (PlaceholderRuleOrigin::Custom, Some(rule_number)) => Self::custom(rule_number),
+            _ => unreachable!("Placeholder 匹配必须保留与来源一致的规则号"),
+        }
+    }
+
+    pub(crate) const fn origin(self) -> PlaceholderRuleOrigin {
+        self.origin
+    }
+
+    pub(crate) const fn rule_number(self) -> Option<usize> {
+        self.rule_number
+    }
+}
+
+impl fmt::Display for PlaceholderRuleReference {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.rule_number {
+            Some(rule_number) => write!(formatter, "自定义规则 {rule_number}"),
+            None => formatter.write_str("内置规则"),
+        }
+    }
+}
+
+/// 一次已确认匹配的规则来源与 UTF-8 字节范围。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PlaceholderMatchReference {
+    rule: PlaceholderRuleReference,
+    start_byte: usize,
+    end_byte: usize,
+}
+
+impl PlaceholderMatchReference {
+    const fn new(rule: PlaceholderRuleReference, start_byte: usize, end_byte: usize) -> Self {
+        Self {
+            rule,
+            start_byte,
+            end_byte,
+        }
+    }
+
+    fn from_span(span: &SelectedSpan<'_>) -> Self {
+        Self::new(
+            PlaceholderRuleReference::from_parts(span.origin, span.rule_number),
+            span.start,
+            span.end,
+        )
+    }
+
+    pub(crate) const fn rule(self) -> PlaceholderRuleReference {
+        self.rule
+    }
+
+    pub(crate) const fn start_byte(self) -> usize {
+        self.start_byte
+    }
+
+    pub(crate) const fn end_byte(self) -> usize {
+        self.end_byte
+    }
+}
+
+impl fmt::Display for PlaceholderMatchReference {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}（UTF-8 字节范围 {}..{}）",
+            self.rule, self.start_byte, self.end_byte
+        )
+    }
+}
+
+/// PCRE2 返回的匹配范围违反了哪一项 UTF-8 或包含关系。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PlaceholderMatchRangeViolation {
+    WholeStartAfterEnd,
+    WholeEndBeyondText,
+    WholeStartNotUtf8Boundary,
+    WholeEndNotUtf8Boundary,
+    CaptureStartAfterEnd,
+    CaptureEndBeyondText,
+    CaptureStartNotUtf8Boundary,
+    CaptureEndNotUtf8Boundary,
+    CaptureStartsBeforeWhole,
+    CaptureEndsAfterWhole,
+}
+
+impl PlaceholderMatchRangeViolation {
+    pub(crate) const fn diagnostic_violation(self) -> DiagnosticPlaceholderMatchRangeViolation {
+        match self {
+            Self::WholeStartAfterEnd => {
+                DiagnosticPlaceholderMatchRangeViolation::WholeStartAfterEnd
+            }
+            Self::WholeEndBeyondText => {
+                DiagnosticPlaceholderMatchRangeViolation::WholeEndBeyondText
+            }
+            Self::WholeStartNotUtf8Boundary => {
+                DiagnosticPlaceholderMatchRangeViolation::WholeStartNotUtf8Boundary
+            }
+            Self::WholeEndNotUtf8Boundary => {
+                DiagnosticPlaceholderMatchRangeViolation::WholeEndNotUtf8Boundary
+            }
+            Self::CaptureStartAfterEnd => {
+                DiagnosticPlaceholderMatchRangeViolation::CaptureStartAfterEnd
+            }
+            Self::CaptureEndBeyondText => {
+                DiagnosticPlaceholderMatchRangeViolation::CaptureEndBeyondText
+            }
+            Self::CaptureStartNotUtf8Boundary => {
+                DiagnosticPlaceholderMatchRangeViolation::CaptureStartNotUtf8Boundary
+            }
+            Self::CaptureEndNotUtf8Boundary => {
+                DiagnosticPlaceholderMatchRangeViolation::CaptureEndNotUtf8Boundary
+            }
+            Self::CaptureStartsBeforeWhole => {
+                DiagnosticPlaceholderMatchRangeViolation::CaptureStartsBeforeWhole
+            }
+            Self::CaptureEndsAfterWhole => {
+                DiagnosticPlaceholderMatchRangeViolation::CaptureEndsAfterWhole
+            }
+        }
+    }
+}
+
+impl fmt::Display for PlaceholderMatchRangeViolation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::WholeStartAfterEnd => "whole_start_after_end",
+            Self::WholeEndBeyondText => "whole_end_beyond_text",
+            Self::WholeStartNotUtf8Boundary => "whole_start_not_utf8_boundary",
+            Self::WholeEndNotUtf8Boundary => "whole_end_not_utf8_boundary",
+            Self::CaptureStartAfterEnd => "capture_start_after_end",
+            Self::CaptureEndBeyondText => "capture_end_beyond_text",
+            Self::CaptureStartNotUtf8Boundary => "capture_start_not_utf8_boundary",
+            Self::CaptureEndNotUtf8Boundary => "capture_end_not_utf8_boundary",
+            Self::CaptureStartsBeforeWhole => "capture_starts_before_whole",
+            Self::CaptureEndsAfterWhole => "capture_ends_after_whole",
+        })
+    }
 }
 
 /// Placeholder 对应完整匹配，或 `text` 捕获两侧的外壳。
@@ -1158,29 +1516,15 @@ impl From<PlaceholderMultisetError> for PlaceholderRestoreError {
 }
 
 #[derive(Debug)]
-pub(crate) struct Pcre2PlaceholderConstructionError(pcre2::Error);
+pub(crate) struct Pcre2PlaceholderConstructionError(PlaceholderPcre2Failure);
 
 impl Pcre2PlaceholderConstructionError {
-    pub(crate) fn safe_diagnostic(
-        &self,
-        stage: DiagnosticStage,
-        impact: DiagnosticImpact,
-    ) -> SafeDiagnostic {
-        SafeDiagnostic::new(
-            DiagnosticCode::InternalOperation,
-            stage,
-            DiagnosticSubject::operation("builtin_placeholder_compile"),
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::InternalInvariant,
-                format!(
-                    "engine=pcre2; kind={}; code={}; offset={}",
-                    pcre2_error_kind(&self.0),
-                    self.0.code(),
-                    optional_offset(self.0.offset())
-                ),
-            ),
-            impact,
-            DiagnosticAction::ReportBug,
+    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
+        DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::translation(TranslationIssue::BuiltinPlaceholderCompile {
+                pcre2: self.0.diagnostic_failure(),
+            }),
         )
     }
 }
@@ -1197,36 +1541,21 @@ impl Error for Pcre2PlaceholderConstructionError {
     }
 }
 
-impl SafeDiagnosticSource for Pcre2PlaceholderConstructionError {
-    fn safe_diagnostic_source(
-        &self,
-        stage: DiagnosticStage,
-        impact: DiagnosticImpact,
-        _fallback_action: DiagnosticAction,
-    ) -> SafeDiagnostic {
-        self.safe_diagnostic(stage, impact)
-    }
-}
-
-fn pcre2_error_kind(source: &pcre2::Error) -> &'static str {
+fn placeholder_pcre2_error_kind(source: &pcre2::Error) -> PlaceholderPcre2ErrorKind {
     match source.kind() {
-        pcre2::ErrorKind::Compile => "compile",
-        pcre2::ErrorKind::JIT => "jit",
-        pcre2::ErrorKind::Match => "match",
-        pcre2::ErrorKind::Info => "info",
-        pcre2::ErrorKind::Option => "option",
-        _ => "unknown",
+        pcre2::ErrorKind::Compile => PlaceholderPcre2ErrorKind::Compile,
+        pcre2::ErrorKind::JIT => PlaceholderPcre2ErrorKind::Jit,
+        pcre2::ErrorKind::Match => PlaceholderPcre2ErrorKind::Match,
+        pcre2::ErrorKind::Info => PlaceholderPcre2ErrorKind::Info,
+        pcre2::ErrorKind::Option => PlaceholderPcre2ErrorKind::Option,
+        _ => PlaceholderPcre2ErrorKind::Unrecognized,
     }
-}
-
-fn optional_offset(offset: Option<usize>) -> String {
-    offset.map_or_else(|| "none".to_owned(), |value| value.to_string())
 }
 
 #[derive(Debug)]
 pub(crate) enum PlaceholderRuleCompilationError {
     StartWorker {
-        operation: &'static str,
+        operation: PlaceholderWorkerOperation,
         source: io::Error,
     },
     EmptyScopes {
@@ -1245,7 +1574,7 @@ pub(crate) enum PlaceholderRuleCompilationError {
     },
     InvalidPattern {
         rule_number: usize,
-        source: pcre2::Error,
+        source: PlaceholderPcre2Failure,
     },
     InvalidNamedCaptures {
         rule_number: usize,
@@ -1259,7 +1588,9 @@ impl fmt::Display for PlaceholderRuleCompilationError {
             Self::StartWorker { operation, source } => {
                 write!(
                     formatter,
-                    "无法启动自定义 Placeholder 编译 worker {operation}：{source}"
+                    "无法启动自定义 Placeholder 编译 worker {operation}：kind={:?}，raw_os_error={:?}",
+                    source.kind(),
+                    source.raw_os_error()
                 )
             }
             Self::EmptyScopes { rule_number } => {
@@ -1305,31 +1636,84 @@ impl Error for PlaceholderRuleCompilationError {
     }
 }
 
+impl PlaceholderRuleCompilationError {
+    /// 把规则编译叶子错误投影为公开问题；规则来源由仍掌握路径或项目快照的调用方补充。
+    pub(crate) fn diagnostic_problem(&self) -> PlaceholderCompilationProblem {
+        match self {
+            Self::StartWorker { operation, source } => PlaceholderCompilationProblem::WorkerStart {
+                operation: operation.diagnostic_operation(),
+                failure: IoFailure::from_error(source),
+            },
+            Self::EmptyScopes { rule_number } => PlaceholderCompilationProblem::EmptyScopes {
+                rule_number: *rule_number,
+            },
+            Self::UnknownScope { rule_number, .. } => PlaceholderCompilationProblem::UnknownScope {
+                rule_number: *rule_number,
+            },
+            Self::DuplicateScope { rule_number, .. } => {
+                PlaceholderCompilationProblem::DuplicateScope {
+                    rule_number: *rule_number,
+                }
+            }
+            Self::EmptyPattern { rule_number } => PlaceholderCompilationProblem::EmptyPattern {
+                rule_number: *rule_number,
+            },
+            Self::InvalidPattern {
+                rule_number,
+                source,
+            } => PlaceholderCompilationProblem::InvalidPattern {
+                rule_number: *rule_number,
+                pcre2: source.diagnostic_failure(),
+            },
+            Self::InvalidNamedCaptures {
+                rule_number,
+                captures,
+            } => PlaceholderCompilationProblem::InvalidNamedCaptures {
+                rule_number: *rule_number,
+                actual_count: captures.len(),
+            },
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum PlaceholderProtectionError {
     StartWorker {
-        operation: &'static str,
+        operation: PlaceholderWorkerOperation,
         source: io::Error,
     },
-    Match(pcre2::Error),
+    Match {
+        rule: PlaceholderRuleReference,
+        source: PlaceholderPcre2Failure,
+    },
     EmptyMatch {
-        label: String,
+        matched: PlaceholderMatchReference,
     },
     MissingTextCapture {
         rule_number: usize,
+        whole_match_start_byte: usize,
+        whole_match_end_byte: usize,
     },
     InvalidMatchRange {
         rule_number: usize,
+        whole_match_start_byte: usize,
+        whole_match_end_byte: usize,
+        capture_start_byte: Option<usize>,
+        capture_end_byte: Option<usize>,
+        violation: PlaceholderMatchRangeViolation,
     },
     OverlappingMatches {
-        first: String,
-        second: String,
+        first: PlaceholderMatchReference,
+        second: PlaceholderMatchReference,
     },
     CrossesLineBoundary {
-        rule_number: Option<usize>,
+        matched: PlaceholderMatchReference,
         source_line_index: usize,
     },
-    ReservedTokenNamespace,
+    ReservedTokenNamespace {
+        start_byte: usize,
+        end_byte: usize,
+    },
 }
 
 impl fmt::Display for PlaceholderProtectionError {
@@ -1338,43 +1722,53 @@ impl fmt::Display for PlaceholderProtectionError {
             Self::StartWorker { operation, source } => {
                 write!(
                     formatter,
-                    "无法启动 Placeholder 匹配 worker {operation}：{source}"
+                    "无法启动 Placeholder 匹配 worker {operation}：kind={:?}，raw_os_error={:?}",
+                    source.kind(),
+                    source.raw_os_error()
                 )
             }
-            Self::Match(source) => write!(formatter, "PCRE2 匹配失败：{source}"),
-            Self::EmptyMatch { label } => write!(formatter, "占位符规则 {label} 产生空匹配"),
-            Self::MissingTextCapture { rule_number } => {
+            Self::Match { rule, source } => {
+                write!(formatter, "{rule}执行 PCRE2 匹配失败：{source}")
+            }
+            Self::EmptyMatch { matched } => write!(formatter, "{matched}产生空匹配"),
+            Self::MissingTextCapture {
+                rule_number,
+                whole_match_start_byte,
+                whole_match_end_byte,
+            } => {
                 write!(
                     formatter,
-                    "占位符规则 {rule_number} 的 text 命名组未参与匹配"
+                    "占位符规则 {rule_number} 的 text 命名组未参与 UTF-8 字节范围 {whole_match_start_byte}..{whole_match_end_byte} 的完整匹配"
                 )
             }
-            Self::InvalidMatchRange { rule_number } => write!(
+            Self::InvalidMatchRange {
+                rule_number,
+                whole_match_start_byte,
+                whole_match_end_byte,
+                capture_start_byte,
+                capture_end_byte,
+                violation,
+            } => write!(
                 formatter,
-                "占位符规则 {rule_number} 的完整匹配与 text 捕获必须位于原文 UTF-8 字符边界内，且 text 捕获必须包含在完整匹配中"
+                "占位符规则 {rule_number} 返回无效匹配范围：whole={whole_match_start_byte}..{whole_match_end_byte}，capture={capture_start_byte:?}..{capture_end_byte:?}，violation={violation}"
             ),
             Self::OverlappingMatches { first, second } => {
                 write!(formatter, "占位符匹配区间重叠：{first} 与 {second}")
             }
             Self::CrossesLineBoundary {
-                rule_number,
+                matched,
                 source_line_index,
-            } => match rule_number {
-                Some(rule_number) => write!(
-                    formatter,
-                    "占位符规则 {rule_number} 的不透明保护跨度跨越第 {} 个文本单元边界",
-                    source_line_index + 1
-                ),
-                None => write!(
-                    formatter,
-                    "内置占位符的不透明保护跨度跨越第 {} 个文本单元边界",
-                    source_line_index + 1
-                ),
-            },
-            Self::ReservedTokenNamespace => write!(
+            } => write!(
                 formatter,
-                "原文包含保留的 ATT token 前缀 {:?}",
-                placeholder_token::PREFIX
+                "{matched}的不透明保护跨度跨越第 {} 个文本单元边界",
+                source_line_index + 1
+            ),
+            Self::ReservedTokenNamespace {
+                start_byte,
+                end_byte,
+            } => write!(
+                formatter,
+                "原文在 UTF-8 字节范围 {start_byte}..{end_byte} 包含保留的 ATT token 前缀"
             ),
         }
     }
@@ -1384,10 +1778,85 @@ impl Error for PlaceholderProtectionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::StartWorker { source, .. } => Some(source),
-            Self::Match(source) => Some(source),
+            Self::Match { source, .. } => Some(source),
             _ => None,
         }
     }
+}
+
+impl PlaceholderProtectionError {
+    /// 在最了解 PCRE2 匹配语义的边界建立公开问题，避免各引擎重复解释叶子错误。
+    pub(crate) fn diagnostic_issue(&self) -> DiagnosticPlaceholderIssue {
+        match self {
+            Self::StartWorker { operation, source } => DiagnosticPlaceholderIssue::WorkerStart {
+                operation: operation.diagnostic_operation(),
+                io_kind: source.kind().into(),
+                raw_os_code: source.raw_os_error(),
+            },
+            Self::Match { rule, source } => DiagnosticPlaceholderIssue::PatternMatch {
+                rule_origin: Some(rule.origin().diagnostic_origin()),
+                rule_number: rule.rule_number(),
+                pcre2: source.diagnostic_failure(),
+            },
+            Self::EmptyMatch { matched } => DiagnosticPlaceholderIssue::EmptyMatch {
+                rule_origin: matched.rule().origin().diagnostic_origin(),
+                rule_number: matched.rule().rule_number(),
+                match_range: diagnostic_match_range(matched.start_byte(), matched.end_byte()),
+            },
+            Self::MissingTextCapture {
+                rule_number,
+                whole_match_start_byte,
+                whole_match_end_byte,
+            } => DiagnosticPlaceholderIssue::MissingTextCapture {
+                rule_number: *rule_number,
+                match_range: diagnostic_match_range(*whole_match_start_byte, *whole_match_end_byte),
+            },
+            Self::InvalidMatchRange {
+                rule_number,
+                whole_match_start_byte,
+                whole_match_end_byte,
+                capture_start_byte,
+                capture_end_byte,
+                violation,
+            } => DiagnosticPlaceholderIssue::InvalidMatchRange {
+                rule_number: *rule_number,
+                whole_match_start_byte: *whole_match_start_byte,
+                whole_match_end_byte: *whole_match_end_byte,
+                capture_start_byte: *capture_start_byte,
+                capture_end_byte: *capture_end_byte,
+                violation: violation.diagnostic_violation(),
+            },
+            Self::OverlappingMatches { first, second } => {
+                DiagnosticPlaceholderIssue::OverlappingMatches {
+                    first_origin: first.rule().origin().diagnostic_origin(),
+                    first_rule_number: first.rule().rule_number(),
+                    first_range: diagnostic_match_range(first.start_byte(), first.end_byte()),
+                    second_origin: second.rule().origin().diagnostic_origin(),
+                    second_rule_number: second.rule().rule_number(),
+                    second_range: diagnostic_match_range(second.start_byte(), second.end_byte()),
+                }
+            }
+            Self::CrossesLineBoundary {
+                matched,
+                source_line_index,
+            } => DiagnosticPlaceholderIssue::CrossesLineBoundary {
+                rule_origin: matched.rule().origin().diagnostic_origin(),
+                rule_number: matched.rule().rule_number(),
+                source_line_index: *source_line_index,
+            },
+            Self::ReservedTokenNamespace {
+                start_byte,
+                end_byte,
+            } => DiagnosticPlaceholderIssue::ReservedTokenNamespace {
+                range: diagnostic_match_range(*start_byte, *end_byte),
+            },
+        }
+    }
+}
+
+fn diagnostic_match_range(start: usize, end: usize) -> ByteRange {
+    ByteRange::new(start, end)
+        .expect("Placeholder 已确认匹配或 token 范围必须保持 UTF-8 字节正向顺序")
 }
 
 #[cfg(test)]
@@ -1484,11 +1953,11 @@ mod tests {
     #[test]
     fn match_worker_start_failure_keeps_operation_and_os_error() {
         let error = PlaceholderProtectionError::StartWorker {
-            operation: "att-placeholder-match",
+            operation: PlaceholderWorkerOperation::MatchText,
             source: io::Error::from_raw_os_error(8),
         };
 
-        assert!(error.to_string().contains("att-placeholder-match"));
+        assert!(error.to_string().contains("match_text"));
         assert_eq!(
             error
                 .source()
@@ -1496,6 +1965,297 @@ mod tests {
                 .and_then(io::Error::raw_os_error),
             Some(8)
         );
+    }
+
+    #[test]
+    fn invalid_pattern_keeps_typed_pcre2_facts_without_pattern_text() {
+        let sensitive_pattern = "(?<sensitive";
+        let error = PlaceholderService
+            .compile_custom(
+                vec![PlaceholderRuleDefinition::new(None, sensitive_pattern)],
+                |_| true,
+            )
+            .expect_err("不完整的命名捕获组必须拒绝编译");
+
+        match &error {
+            PlaceholderRuleCompilationError::InvalidPattern {
+                rule_number,
+                source,
+            } => {
+                assert_eq!(*rule_number, 1);
+                assert_eq!(source.kind(), PlaceholderPcre2ErrorKind::Compile);
+                assert_ne!(source.code(), 0);
+                assert!(source.offset().is_some());
+            }
+            other => panic!("应返回 PCRE2 编译错误，实际为 {other:?}"),
+        }
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("kind=compile") || rendered.contains("compile"));
+        assert!(!rendered.contains(sensitive_pattern));
+        assert!(!rendered.contains("sensitive"));
+    }
+
+    #[test]
+    fn empty_matches_keep_rule_origin_number_and_utf8_byte_range() {
+        let sensitive_source = "甲";
+        let custom = PlaceholderService
+            .compile_custom(
+                vec![PlaceholderRuleDefinition::new(None, r"(?=甲)")],
+                |_| true,
+            )
+            .expect("零宽规则应可编译");
+        let custom_error = PlaceholderService
+            .protect("dialogue", sensitive_source, &[], &custom, None)
+            .expect_err("零宽自定义匹配必须拒绝保护");
+        match &custom_error {
+            PlaceholderProtectionError::EmptyMatch { matched } => {
+                assert_eq!(matched.rule().origin(), PlaceholderRuleOrigin::Custom);
+                assert_eq!(matched.rule().rule_number(), Some(1));
+                assert_eq!(matched.start_byte(), 0);
+                assert_eq!(matched.end_byte(), 0);
+            }
+            other => panic!("应返回自定义空匹配，实际为 {other:?}"),
+        }
+
+        let builtin = PlaceholderService
+            .compile_builtin(r"(?=甲)", "SENSITIVE_LABEL")
+            .expect("零宽内置规则应可编译");
+        let builtin_error = PlaceholderService
+            .protect(
+                "dialogue",
+                sensitive_source,
+                &[],
+                &empty_rules(),
+                Some(&builtin),
+            )
+            .expect_err("零宽内置匹配必须拒绝保护");
+        match &builtin_error {
+            PlaceholderProtectionError::EmptyMatch { matched } => {
+                assert_eq!(matched.rule().origin(), PlaceholderRuleOrigin::BuiltIn);
+                assert_eq!(matched.rule().rule_number(), None);
+                assert_eq!(matched.start_byte(), 0);
+                assert_eq!(matched.end_byte(), 0);
+            }
+            other => panic!("应返回内置空匹配，实际为 {other:?}"),
+        }
+
+        assert!(!custom_error.to_string().contains(sensitive_source));
+        assert!(!builtin_error.to_string().contains(sensitive_source));
+        assert!(!builtin_error.to_string().contains("SENSITIVE_LABEL"));
+    }
+
+    #[test]
+    fn overlapping_matches_keep_both_rule_references_and_ranges() {
+        let sensitive_source = "甲敏感乙";
+        let custom = PlaceholderService
+            .compile_custom(
+                vec![
+                    PlaceholderRuleDefinition::new(None, "敏感"),
+                    PlaceholderRuleDefinition::new(None, "敏感"),
+                ],
+                |_| true,
+            )
+            .expect("重叠规则本身应可编译");
+
+        let error = PlaceholderService
+            .protect("dialogue", sensitive_source, &[], &custom, None)
+            .expect_err("同一区间的两条规则必须报告重叠");
+
+        match &error {
+            PlaceholderProtectionError::OverlappingMatches { first, second } => {
+                assert_eq!(first.rule().origin(), PlaceholderRuleOrigin::Custom);
+                assert_eq!(first.rule().rule_number(), Some(1));
+                assert_eq!(second.rule().origin(), PlaceholderRuleOrigin::Custom);
+                assert_eq!(second.rule().rule_number(), Some(2));
+                assert_eq!(first.start_byte(), "甲".len());
+                assert_eq!(first.end_byte(), "甲敏感".len());
+                assert_eq!(second.start_byte(), first.start_byte());
+                assert_eq!(second.end_byte(), first.end_byte());
+            }
+            other => panic!("应返回匹配重叠错误，实际为 {other:?}"),
+        }
+
+        let rendered = error.to_string();
+        assert!(!rendered.contains(sensitive_source));
+        assert!(!rendered.contains("敏感"));
+    }
+
+    #[test]
+    fn missing_text_capture_projects_exact_safe_issue_from_real_match() {
+        let sensitive_source = "前乙后";
+        let custom = PlaceholderService
+            .compile_custom(
+                vec![PlaceholderRuleDefinition::new(None, r"(?:(?<text>甲)|乙)")],
+                |_| true,
+            )
+            .expect("可选 text 分支规则应可编译");
+
+        let error = PlaceholderService
+            .protect("dialogue", sensitive_source, &[], &custom, None)
+            .expect_err("未参与匹配的 text 捕获必须拒绝保护");
+        let wire = serde_json::to_value(error.diagnostic_issue()).expect("问题可序列化");
+
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "kind": "missing_text_capture",
+                "rule_number": 1,
+                "match_range": { "start": 3, "end": 6 }
+            })
+        );
+        assert!(!wire.to_string().contains(sensitive_source));
+        assert!(!wire.to_string().contains('乙'));
+    }
+
+    #[test]
+    fn overlapping_matches_project_both_rules_and_utf8_ranges() {
+        let custom = PlaceholderService
+            .compile_custom(
+                vec![
+                    PlaceholderRuleDefinition::new(None, "敏感"),
+                    PlaceholderRuleDefinition::new(None, "敏感"),
+                ],
+                |_| true,
+            )
+            .expect("重叠规则本身应可编译");
+        let error = PlaceholderService
+            .protect("dialogue", "甲敏感乙", &[], &custom, None)
+            .expect_err("重叠规则必须拒绝保护");
+
+        assert_eq!(
+            serde_json::to_value(error.diagnostic_issue()).expect("问题可序列化"),
+            serde_json::json!({
+                "kind": "overlapping_matches",
+                "first_origin": "custom",
+                "first_rule_number": 1,
+                "first_range": { "start": 3, "end": 9 },
+                "second_origin": "custom",
+                "second_rule_number": 2,
+                "second_range": { "start": 3, "end": 9 }
+            })
+        );
+    }
+
+    #[test]
+    fn match_range_validation_reports_each_exact_violation() {
+        let text = "甲乙";
+        assert_eq!(
+            whole_range_violation(text, 4, 3),
+            Some(PlaceholderMatchRangeViolation::WholeStartAfterEnd)
+        );
+        assert_eq!(
+            whole_range_violation(text, 0, text.len() + 1),
+            Some(PlaceholderMatchRangeViolation::WholeEndBeyondText)
+        );
+        assert_eq!(
+            whole_range_violation(text, 1, 3),
+            Some(PlaceholderMatchRangeViolation::WholeStartNotUtf8Boundary)
+        );
+        assert_eq!(
+            whole_range_violation(text, 0, 1),
+            Some(PlaceholderMatchRangeViolation::WholeEndNotUtf8Boundary)
+        );
+        assert_eq!(
+            capture_range_violation(text, 0, text.len(), 4, 3),
+            Some(PlaceholderMatchRangeViolation::CaptureStartAfterEnd)
+        );
+        assert_eq!(
+            capture_range_violation(text, 0, text.len(), 0, text.len() + 1),
+            Some(PlaceholderMatchRangeViolation::CaptureEndBeyondText)
+        );
+        assert_eq!(
+            capture_range_violation(text, 0, text.len(), 1, 3),
+            Some(PlaceholderMatchRangeViolation::CaptureStartNotUtf8Boundary)
+        );
+        assert_eq!(
+            capture_range_violation(text, 0, text.len(), 0, 1),
+            Some(PlaceholderMatchRangeViolation::CaptureEndNotUtf8Boundary)
+        );
+        assert_eq!(
+            capture_range_violation(text, 3, text.len(), 0, 3),
+            Some(PlaceholderMatchRangeViolation::CaptureStartsBeforeWhole)
+        );
+        assert_eq!(
+            capture_range_violation(text, 0, 3, 0, text.len()),
+            Some(PlaceholderMatchRangeViolation::CaptureEndsAfterWhole)
+        );
+        assert_eq!(capture_range_violation(text, 0, text.len(), 0, 3), None);
+    }
+
+    #[test]
+    fn line_boundary_failure_keeps_match_reference_without_source_text() {
+        let sensitive_source = "甲敏感乙";
+        let custom = PlaceholderService
+            .compile_custom(vec![PlaceholderRuleDefinition::new(None, "敏感")], |_| {
+                true
+            })
+            .expect("规则应可编译");
+
+        let error = PlaceholderService
+            .protect("dialogue", sensitive_source, &["甲敏".len()], &custom, None)
+            .expect_err("匹配跨越文本单元边界时必须拒绝保护");
+
+        match &error {
+            PlaceholderProtectionError::CrossesLineBoundary {
+                matched,
+                source_line_index,
+            } => {
+                assert_eq!(*source_line_index, 0);
+                assert_eq!(matched.rule().rule_number(), Some(1));
+                assert_eq!(matched.start_byte(), "甲".len());
+                assert_eq!(matched.end_byte(), "甲敏感".len());
+            }
+            other => panic!("应返回跨文本单元边界错误，实际为 {other:?}"),
+        }
+
+        let rendered = error.to_string();
+        assert!(!rendered.contains(sensitive_source));
+        assert!(!rendered.contains("敏感"));
+    }
+
+    #[test]
+    fn missing_text_capture_keeps_whole_match_utf8_byte_range_without_source_text() {
+        let service = PlaceholderService;
+        let custom = service
+            .compile_custom(
+                vec![PlaceholderRuleDefinition::new(
+                    None,
+                    r"(?:(?<text>保留)|触发缺组)",
+                )],
+                |_| true,
+            )
+            .expect("规则应可编译");
+        let sensitive_source = "甲触发缺组乙";
+
+        let error = service
+            .protect("dialogue", sensitive_source, &[], &custom, None)
+            .expect_err("未参与匹配的 text 命名组必须拒绝保护");
+
+        match &error {
+            PlaceholderProtectionError::MissingTextCapture {
+                rule_number,
+                whole_match_start_byte,
+                whole_match_end_byte,
+            } => {
+                assert_eq!(*rule_number, 1);
+                assert_eq!(*whole_match_start_byte, "甲".len());
+                assert_eq!(*whole_match_end_byte, "甲触发缺组".len());
+            }
+            other => panic!("应返回缺少 text 捕获错误，实际为 {other:?}"),
+        }
+
+        let rendered = error.to_string();
+        assert_eq!(
+            rendered,
+            format!(
+                "占位符规则 1 的 text 命名组未参与 UTF-8 字节范围 {}..{} 的完整匹配",
+                "甲".len(),
+                "甲触发缺组".len()
+            )
+        );
+        assert!(!rendered.contains(sensitive_source));
+        assert!(!rendered.contains("触发缺组"));
     }
 
     #[test]
@@ -1588,39 +2348,52 @@ mod tests {
         original.push_str(placeholder_token::PREFIX);
         original.push_str("tail");
 
-        assert!(
-            contains_reserved_prefix_with_cancellation(&original, &mut || {
-                Ok::<_, Infallible>(())
-            })
-            .expect("检查不会取消")
+        assert_eq!(
+            reserved_prefix_start_with_cancellation(&original, &mut || { Ok::<_, Infallible>(()) })
+                .expect("检查不会取消"),
+            Some(prefix_start)
         );
+
+        let error = PlaceholderService
+            .protect("dialogue", &original, &[], &empty_rules(), None)
+            .expect_err("保留 token 前缀必须拒绝保护");
+        match &error {
+            PlaceholderProtectionError::ReservedTokenNamespace {
+                start_byte,
+                end_byte,
+            } => {
+                assert_eq!(*start_byte, prefix_start);
+                assert_eq!(*end_byte, prefix_start + placeholder_token::PREFIX.len());
+            }
+            other => panic!("应返回保留 token 命名空间错误，实际为 {other:?}"),
+        }
+        assert!(!error.to_string().contains(&original));
     }
 
     #[test]
     fn cancellable_span_sort_is_stable_and_can_stop_during_merge() {
-        fn span(start: usize, diagnostic_label: String) -> SelectedSpan<'static> {
+        fn span(start: usize, marker: &'static str) -> SelectedSpan<'static> {
             SelectedSpan {
                 start,
                 end: start + 1,
                 origin: PlaceholderRuleOrigin::Custom,
                 semantic_label: CUSTOM_SEMANTIC_LABEL,
-                diagnostic_label,
                 rule_number: Some(1),
-                scope: "dialogue",
+                scope: marker,
                 segment: PlaceholderSegment::Whole,
             }
         }
 
-        let mut equal = vec![span(1, "first".to_owned()), span(1, "second".to_owned())];
+        let mut equal = vec![span(1, "first"), span(1, "second")];
         stable_sort_selected_spans_with_cancellation(&mut equal, &mut || Ok::<_, Infallible>(()))
             .expect("检查不会取消");
-        assert_eq!(equal[0].diagnostic_label, "first");
-        assert_eq!(equal[1].diagnostic_label, "second");
+        assert_eq!(equal[0].scope, "first");
+        assert_eq!(equal[1].scope, "second");
 
         let length = 4_096_usize;
         let mut descending = (0..length)
             .rev()
-            .map(|start| span(start, String::new()))
+            .map(|start| span(start, "descending"))
             .collect::<Vec<_>>();
         let mut polls = 0_usize;
         let result = stable_sort_selected_spans_with_cancellation(&mut descending, &mut || {

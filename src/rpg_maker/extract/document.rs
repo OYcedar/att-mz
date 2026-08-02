@@ -16,8 +16,11 @@ use futures_util::stream::{self, StreamExt};
 use serde_json::{Map, Value};
 
 use crate::diagnostic::{
-    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
-    DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
+    Diagnostic, DiagnosticReport, FileSystemDiagnosticContext, FileSystemDiagnosticStage,
+    FileSystemIssue, FileSystemOperation, FileSystemOrdinalKeyPhase, FileSystemProblem, IoFailure,
+    RpgMakerBackendCause, RpgMakerDocumentConsumer, RpgMakerDocumentOperation,
+    RpgMakerDocumentProblem, RpgMakerIssue, RpgMakerJsonFailureKind,
+    RpgMakerPluginsEnvelopeFailure, RuntimeOperation, SafePath, StateEffect,
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::json::{StackSafeJsonError, StackSafeJsonValue, from_str as parse_json};
@@ -868,16 +871,52 @@ pub(crate) enum RpgMakerProjectDocumentReadingError<F, L, C> {
     },
 }
 
-/// 共享文档读取失败只提供读取事实，责任 code 与阶段由真实消费域明确给出。
+/// 共享文档读取失败保留读取事实，消费域只选择自己的封闭身份。
 ///
-/// Builtin、Rules 与 WriteBack 共享同一个读取器，但分别拥有不同的用户操作。
-/// 使用专用契约可阻止共享错误根据通用 stage 猜测责任域。
+/// Builtin、Rules 与 WriteBack 共享同一个读取器，但分别拥有不同的诊断阶段。
+/// code、stage 和 resolution 均由消费域与具体问题联合推导，调用方不能任意组合。
 pub(crate) trait RpgMakerProjectDocumentReadingDiagnostic {
-    fn safe_document_reading_diagnostic(
+    fn document_reading_diagnostic_report(
         &self,
-        code: DiagnosticCode,
-        stage: DiagnosticStage,
-    ) -> SafeDiagnostic;
+        consumer: RpgMakerDocumentConsumer,
+    ) -> DiagnosticReport;
+}
+
+/// 文档读取器依赖的文件系统边界只返回已类型化的根原因。
+trait RpgMakerDocumentFileSystemDiagnostic {
+    fn document_file_system_diagnostic(
+        &self,
+        stage: FileSystemDiagnosticStage,
+        operation: FileSystemOperation,
+    ) -> Diagnostic;
+}
+
+impl RpgMakerDocumentFileSystemDiagnostic for crate::runtime::filesystem::SystemFileSystemError {
+    fn document_file_system_diagnostic(
+        &self,
+        stage: FileSystemDiagnosticStage,
+        operation: FileSystemOperation,
+    ) -> Diagnostic {
+        self.diagnostic_report(
+            FileSystemDiagnosticContext::new(stage, operation),
+            StateEffect::Unchanged,
+        )
+        .primary()
+        .clone()
+    }
+}
+
+/// 文档解析调度边界只返回已类型化的 CPU 运行时原因。
+trait RpgMakerDocumentCpuDiagnostic {
+    fn document_cpu_diagnostic(&self, operation: RuntimeOperation) -> Diagnostic;
+}
+
+impl RpgMakerDocumentCpuDiagnostic
+    for CpuTaskExecutionError<crate::runtime::cpu::CpuExecutorUnavailable>
+{
+    fn document_cpu_diagnostic(&self, operation: RuntimeOperation) -> Diagnostic {
+        self.diagnostic_for(operation)
+    }
 }
 
 impl<F, L, C> RpgMakerProjectDocumentReadingError<F, L, C> {
@@ -898,203 +937,202 @@ impl<F, L, C> RpgMakerProjectDocumentReadingError<F, L, C> {
 impl<F, L, C> RpgMakerProjectDocumentReadingDiagnostic
     for RpgMakerProjectDocumentReadingError<F, L, C>
 where
-    F: SafeDiagnosticSource,
-    L: SafeDiagnosticSource,
-    CpuTaskExecutionError<C>: SafeDiagnosticSource,
+    F: RpgMakerDocumentFileSystemDiagnostic,
+    L: RpgMakerDocumentFileSystemDiagnostic,
+    CpuTaskExecutionError<C>: RpgMakerDocumentCpuDiagnostic,
 {
-    fn safe_document_reading_diagnostic(
+    fn document_reading_diagnostic_report(
         &self,
-        code: DiagnosticCode,
-        stage: DiagnosticStage,
-    ) -> SafeDiagnostic {
-        match self {
-            Self::ListData(source) | Self::ListJs(source) => {
-                list_directory_diagnostic(source, code, stage)
-            }
-            Self::FileNameCaseMismatch(source) => SafeDiagnostic::new(
-                code,
-                stage,
-                DiagnosticSubject::path(source.requested()),
-                DiagnosticReason::failure(DiagnosticFailureKind::StateMismatch),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixInput,
-            )
-            .with_recovery(RecoveryFact::path(source.actual())),
+        consumer: RpgMakerDocumentConsumer,
+    ) -> DiagnosticReport {
+        let stage = document_file_system_stage(consumer);
+        let (operation, problem) = match self {
+            Self::ListData(source) => (
+                RpgMakerDocumentOperation::ListData,
+                list_directory_problem(source, stage),
+            ),
+            Self::ListJs(source) => (
+                RpgMakerDocumentOperation::ListJs,
+                list_directory_problem(source, stage),
+            ),
+            Self::FileNameCaseMismatch(source) => (
+                RpgMakerDocumentOperation::ResolveFileName,
+                RpgMakerDocumentProblem::FileNameCaseMismatch {
+                    requested: SafePath::new(source.requested()),
+                    actual: SafePath::new(source.actual()),
+                },
+            ),
             Self::FileNameCaseKey { path, source } => match source {
                 WindowsOrdinalCaseKeyError::InputTooLarge { maximum, observed } => {
-                    SafeDiagnostic::new(
-                        code,
-                        stage,
-                        DiagnosticSubject::path(path),
-                        DiagnosticReason::Resource {
-                            resource: "Windows 文件名 UTF-16 单元数".to_owned(),
-                            actual: *observed,
-                            maximum: Some(*maximum),
+                    (
+                        RpgMakerDocumentOperation::ResolveFileName,
+                        RpgMakerDocumentProblem::FileNameTooLarge {
+                            path: SafePath::new(path),
+                            observed: *observed,
+                            maximum: *maximum,
                         },
-                        DiagnosticImpact::Unchanged,
-                        DiagnosticAction::FixInput,
                     )
                 }
-                WindowsOrdinalCaseKeyError::WindowsApi { phase, source } => SafeDiagnostic::io(
-                    code,
-                    stage,
-                    DiagnosticSubject::path(path),
-                    "windows_ordinal_case_key",
-                    source,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::Retry,
-                )
-                .with_recovery(RecoveryFact::component(format!(
-                    "windows_ordinal_case_key_phase={}",
-                    phase.as_str()
-                ))),
+                WindowsOrdinalCaseKeyError::WindowsApi { phase, source } => (
+                    RpgMakerDocumentOperation::ResolveFileName,
+                    RpgMakerDocumentProblem::Backend {
+                        path: SafePath::new(path),
+                        cause: RpgMakerBackendCause::new(Diagnostic::file_system(
+                            FileSystemIssue::new(
+                                FileSystemDiagnosticContext::new(
+                                    stage,
+                                    FileSystemOperation::WindowsOrdinalCaseKey,
+                                ),
+                                FileSystemProblem::OrdinalKeyIo {
+                                    path: SafePath::new(path),
+                                    phase: match phase {
+                                        crate::windows_path::WindowsOrdinalCaseKeyPhase::Measure => {
+                                            FileSystemOrdinalKeyPhase::Measure
+                                        }
+                                        crate::windows_path::WindowsOrdinalCaseKeyPhase::Map => {
+                                            FileSystemOrdinalKeyPhase::Map
+                                        }
+                                    },
+                                    failure: IoFailure::from_error(source),
+                                },
+                            ),
+                        )),
+                    },
+                ),
             },
-            Self::ReadDocument { source, .. } => read_document_diagnostic(source, code, stage),
-            Self::ScheduleParse { path, source } => {
-                let mut diagnostic = source.safe_diagnostic_source(
-                    stage,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::Retry,
-                );
-                diagnostic.code = code;
-                diagnostic.with_recovery(RecoveryFact::path(path))
-            }
-            Self::InvalidUtf8 { path, source } => SafeDiagnostic::new(
-                code,
-                stage,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::InvalidUtf8 {
-                    valid_up_to: u64::try_from(source.valid_up_to()).unwrap_or(u64::MAX),
-                    error_len: source
-                        .error_len()
-                        .map(|value| u64::try_from(value).unwrap_or(u64::MAX)),
-                },
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixInput,
+            Self::ReadDocument { source, .. } => (
+                RpgMakerDocumentOperation::Read,
+                read_document_problem(source, stage),
             ),
-            Self::InvalidJson { path, source } => SafeDiagnostic::new(
-                code,
-                stage,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure(DiagnosticFailureKind::SourceDocumentInvalid),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixInput,
-            )
-            .with_recovery(RecoveryFact::component(format!(
-                "json_line={}; json_column={}",
-                source.line(),
-                source.column()
-            ))),
-            Self::InvalidPluginsEnvelope { path, failure } => {
-                source_document_invalid(path, None, Some(*failure), code, stage)
+            Self::ScheduleParse { path, source } => {
+                (
+                    RpgMakerDocumentOperation::ScheduleParse,
+                    RpgMakerDocumentProblem::Backend {
+                        path: SafePath::new(path),
+                        cause: RpgMakerBackendCause::new(
+                            source.document_cpu_diagnostic(RuntimeOperation::ExecuteTask),
+                        ),
+                    },
+                )
             }
-            Self::InvalidPluginRecord { path, index } => {
-                source_document_invalid(path, Some(*index), None, code, stage)
-            }
-        }
+            Self::InvalidUtf8 { path, source } => (
+                RpgMakerDocumentOperation::Parse,
+                RpgMakerDocumentProblem::InvalidUtf8 {
+                    path: SafePath::new(path),
+                    valid_up_to: source.valid_up_to(),
+                    error_len: source.error_len(),
+                },
+            ),
+            Self::InvalidJson { path, source } => (
+                RpgMakerDocumentOperation::Parse,
+                RpgMakerDocumentProblem::InvalidJson {
+                    path: SafePath::new(path),
+                    category: rpg_maker_json_failure(source.diagnostic_category()),
+                    line: source.line(),
+                    column: source.column(),
+                },
+            ),
+            Self::InvalidPluginsEnvelope { path, failure } => (
+                RpgMakerDocumentOperation::Parse,
+                RpgMakerDocumentProblem::InvalidPluginsEnvelope {
+                    path: SafePath::new(path),
+                    failure: rpg_maker_plugins_envelope_failure(*failure),
+                },
+            ),
+            Self::InvalidPluginRecord { path, index } => (
+                RpgMakerDocumentOperation::Parse,
+                RpgMakerDocumentProblem::InvalidPluginRecord {
+                    path: SafePath::new(path),
+                    index: *index,
+                },
+            ),
+        };
+        DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::rpg_maker(RpgMakerIssue::document(consumer, operation, problem)),
+        )
     }
 }
 
-fn list_directory_diagnostic<E>(
+fn document_file_system_stage(consumer: RpgMakerDocumentConsumer) -> FileSystemDiagnosticStage {
+    match consumer {
+        RpgMakerDocumentConsumer::Builtin | RpgMakerDocumentConsumer::Rules => {
+            FileSystemDiagnosticStage::Extract
+        }
+        RpgMakerDocumentConsumer::WriteBack => FileSystemDiagnosticStage::WriteBack,
+    }
+}
+
+fn list_directory_problem<E>(
     source: &ListDirectoryError<E>,
-    code: DiagnosticCode,
-    stage: DiagnosticStage,
-) -> SafeDiagnostic
+    stage: FileSystemDiagnosticStage,
+) -> RpgMakerDocumentProblem
 where
-    E: SafeDiagnosticSource,
+    E: RpgMakerDocumentFileSystemDiagnostic,
 {
     match source {
-        ListDirectoryError::NotFound { path } => SafeDiagnostic::new(
-            code,
-            stage,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixInput,
-        ),
-        ListDirectoryError::NotDirectory { path } => SafeDiagnostic::new(
-            code,
-            stage,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixInput,
-        ),
-        ListDirectoryError::Io { path, source } => {
-            let mut diagnostic = source.safe_diagnostic_source(
-                stage,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckPathAndPermissions,
-            );
-            diagnostic.code = code;
-            diagnostic.with_recovery(RecoveryFact::path(path))
-        }
+        ListDirectoryError::NotFound { path } => RpgMakerDocumentProblem::NotFound {
+            path: SafePath::new(path),
+        },
+        ListDirectoryError::NotDirectory { path } => RpgMakerDocumentProblem::NotDirectory {
+            path: SafePath::new(path),
+        },
+        ListDirectoryError::Io { path, source } => RpgMakerDocumentProblem::Backend {
+            path: SafePath::new(path),
+            cause: RpgMakerBackendCause::new(
+                source.document_file_system_diagnostic(stage, FileSystemOperation::ListDirectory),
+            ),
+        },
     }
 }
 
-fn read_document_diagnostic<E>(
+fn read_document_problem<E>(
     source: &ReadFileError<E>,
-    code: DiagnosticCode,
-    stage: DiagnosticStage,
-) -> SafeDiagnostic
+    stage: FileSystemDiagnosticStage,
+) -> RpgMakerDocumentProblem
 where
-    E: SafeDiagnosticSource,
+    E: RpgMakerDocumentFileSystemDiagnostic,
 {
     match source {
-        ReadFileError::NotFound { path } => SafeDiagnostic::new(
-            code,
-            stage,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixInput,
-        ),
-        ReadFileError::NotFile { path } => SafeDiagnostic::new(
-            code,
-            stage,
-            DiagnosticSubject::path(path),
-            DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixInput,
-        ),
-        ReadFileError::Io { path, source } => {
-            let mut diagnostic = source.safe_diagnostic_source(
-                stage,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckPathAndPermissions,
-            );
-            diagnostic.code = code;
-            diagnostic.with_recovery(RecoveryFact::path(path))
+        ReadFileError::NotFound { path } => RpgMakerDocumentProblem::NotFound {
+            path: SafePath::new(path),
+        },
+        ReadFileError::NotFile { path } => RpgMakerDocumentProblem::NotFile {
+            path: SafePath::new(path),
+        },
+        ReadFileError::Io { path, source } => RpgMakerDocumentProblem::Backend {
+            path: SafePath::new(path),
+            cause: RpgMakerBackendCause::new(
+                source.document_file_system_diagnostic(stage, FileSystemOperation::Read),
+            ),
+        },
+    }
+}
+
+fn rpg_maker_json_failure(
+    category: crate::json_diagnostic::JsonErrorCategory,
+) -> RpgMakerJsonFailureKind {
+    match category {
+        crate::json_diagnostic::JsonErrorCategory::Io => RpgMakerJsonFailureKind::Io,
+        crate::json_diagnostic::JsonErrorCategory::Syntax => RpgMakerJsonFailureKind::Syntax,
+        crate::json_diagnostic::JsonErrorCategory::Data => RpgMakerJsonFailureKind::Data,
+        crate::json_diagnostic::JsonErrorCategory::Eof => RpgMakerJsonFailureKind::Eof,
+        crate::json_diagnostic::JsonErrorCategory::DuplicateObjectKey => {
+            RpgMakerJsonFailureKind::DuplicateObjectKey
         }
     }
 }
 
-fn source_document_invalid(
-    path: &Path,
-    plugin_index: Option<usize>,
-    envelope_failure: Option<PluginsEnvelopeFailure>,
-    code: DiagnosticCode,
-    stage: DiagnosticStage,
-) -> SafeDiagnostic {
-    let mut diagnostic = SafeDiagnostic::new(
-        code,
-        stage,
-        DiagnosticSubject::path(path),
-        DiagnosticReason::failure(DiagnosticFailureKind::SourceDocumentInvalid),
-        DiagnosticImpact::Unchanged,
-        DiagnosticAction::FixInput,
-    );
-    if let Some(index) = plugin_index {
-        diagnostic =
-            diagnostic.with_recovery(RecoveryFact::component(format!("plugin_index={index}")));
+fn rpg_maker_plugins_envelope_failure(
+    failure: PluginsEnvelopeFailure,
+) -> RpgMakerPluginsEnvelopeFailure {
+    match failure {
+        PluginsEnvelopeFailure::Declaration => RpgMakerPluginsEnvelopeFailure::Declaration,
+        PluginsEnvelopeFailure::Prefix => RpgMakerPluginsEnvelopeFailure::Prefix,
+        PluginsEnvelopeFailure::Assignment => RpgMakerPluginsEnvelopeFailure::Assignment,
+        PluginsEnvelopeFailure::Terminator => RpgMakerPluginsEnvelopeFailure::Terminator,
+        PluginsEnvelopeFailure::RootType => RpgMakerPluginsEnvelopeFailure::RootType,
     }
-    if let Some(failure) = envelope_failure {
-        diagnostic = diagnostic.with_recovery(RecoveryFact::component(format!(
-            "plugins_envelope_failure={}",
-            failure.storage_name()
-        )));
-    }
-    diagnostic
 }
 
 impl<F, L, C> fmt::Display for RpgMakerProjectDocumentReadingError<F, L, C>
@@ -1705,9 +1743,9 @@ var $plugins =
     }
 
     #[test]
-    fn document_read_diagnostics_require_explicit_calling_code_and_stage() {
-        // 共享读取器同时服务 Builtin、Rules 与 WriteBack；责任 code 和阶段
-        // 必须由真实调用域成对给出，读取错误不再按 stage 猜测。
+    fn document_read_diagnostics_derive_code_and_stage_from_the_consumer() {
+        // 共享读取器同时服务 Builtin、Rules 与 WriteBack；调用方只选择
+        // 消费域，code、stage 和 resolution 由封闭问题模型推导。
         let error: RpgMakerProjectDocumentReadingError<
             crate::runtime::filesystem::SystemFileSystemError,
             crate::runtime::filesystem::SystemFileSystemError,
@@ -1717,26 +1755,29 @@ var $plugins =
             source: invalid_utf8_error(),
         };
 
-        let builtin = error.safe_document_reading_diagnostic(
-            DiagnosticCode::ExtractDocumentRead,
-            DiagnosticStage::Extract,
-        );
-        assert_eq!(builtin.code, DiagnosticCode::ExtractDocumentRead);
-        assert_eq!(builtin.stage, DiagnosticStage::Extract);
+        let builtin = error
+            .document_reading_diagnostic_report(RpgMakerDocumentConsumer::Builtin)
+            .primary()
+            .clone();
+        assert_eq!(builtin.code(), "rpg_maker.document.invalid_utf8");
+        assert_eq!(builtin.stage(), crate::diagnostic::DiagnosticStage::Extract);
 
-        let rules = error.safe_document_reading_diagnostic(
-            DiagnosticCode::ExtractRules,
-            DiagnosticStage::Extract,
-        );
-        assert_eq!(rules.code, DiagnosticCode::ExtractRules);
-        assert_eq!(rules.stage, DiagnosticStage::Extract);
+        let rules = error
+            .document_reading_diagnostic_report(RpgMakerDocumentConsumer::Rules)
+            .primary()
+            .clone();
+        assert_eq!(rules.code(), "rpg_maker.document.invalid_utf8");
+        assert_eq!(rules.stage(), crate::diagnostic::DiagnosticStage::Extract);
 
-        let write_back = error.safe_document_reading_diagnostic(
-            DiagnosticCode::WriteBackDocumentRead,
-            DiagnosticStage::WriteBack,
+        let write_back = error
+            .document_reading_diagnostic_report(RpgMakerDocumentConsumer::WriteBack)
+            .primary()
+            .clone();
+        assert_eq!(write_back.code(), "rpg_maker.document.invalid_utf8");
+        assert_eq!(
+            write_back.stage(),
+            crate::diagnostic::DiagnosticStage::WriteBack
         );
-        assert_eq!(write_back.code, DiagnosticCode::WriteBackDocumentRead);
-        assert_eq!(write_back.stage, DiagnosticStage::WriteBack);
     }
 
     #[tokio::test]
@@ -1792,20 +1833,39 @@ var $plugins =
             crate::runtime::filesystem::SystemFileSystemError,
             crate::runtime::cpu::CpuExecutorUnavailable,
         > = RpgMakerProjectDocumentReadingError::InvalidPluginsEnvelope {
-            path: plugins,
+            path: plugins.clone(),
             failure: PluginsEnvelopeFailure::Prefix,
         };
-        let diagnostic = diagnostic_error.safe_document_reading_diagnostic(
-            DiagnosticCode::ExtractRules,
-            DiagnosticStage::Extract,
+        let report =
+            diagnostic_error.document_reading_diagnostic_report(RpgMakerDocumentConsumer::Rules);
+        assert_eq!(
+            serde_json::to_value(report).expect("文档诊断应可序列化"),
+            serde_json::json!({
+                "effect": "unchanged",
+                "primary": {
+                    "code": "rpg_maker.document.invalid_plugins_envelope",
+                    "stage": "extract",
+                    "issue": {
+                        "family": "rpg_maker",
+                        "details": {
+                            "stage": "extract_document",
+                            "problem": {
+                                "kind": "document",
+                                "consumer": "rules",
+                                "operation": "parse",
+                                "problem": {
+                                    "kind": "invalid_plugins_envelope",
+                                    "path": plugins,
+                                    "failure": "prefix"
+                                }
+                            }
+                        }
+                    },
+                    "resolution": "fix_input"
+                },
+                "related": []
+            })
         );
-        assert!(diagnostic.recovery.iter().any(|fact| {
-            matches!(
-                fact,
-                RecoveryFact::Component { name }
-                    if name == "plugins_envelope_failure=prefix"
-            )
-        }));
     }
 
     #[tokio::test]

@@ -17,9 +17,13 @@ use aho_corasick::{Anchored, MatchKind, automaton::Automaton, nfa::noncontiguous
 use serde_json::value::RawValue;
 use time::OffsetDateTime;
 
+#[cfg(test)]
+use crate::diagnostic::RpgMakerModelNonStopFinishReason;
 use crate::diagnostic::{
-    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
-    DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
+    RpgMakerBackendCause, RpgMakerIssue, RpgMakerLanguageModuleKind, RpgMakerLanguageRepairProblem,
+    RpgMakerModelFinishReason, RpgMakerResponseInvariantProblem,
+    RpgMakerResponseLanguageProjectionProblem, RpgMakerResponseProcessingProblem,
+    RpgMakerResponseProcessingScope, SafeIdentifier, StateEffect,
 };
 use crate::execution::CooperativeCancellation;
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
@@ -31,16 +35,18 @@ use crate::execution::llm_request::{
 };
 use crate::fingerprint::Sha256FramedHasher;
 use crate::language::{
-    LanguageId, LanguageModule, LanguageModuleError, LanguageOperationCancelled, LanguagePair,
-    LanguageRepairApplicationError, LanguageText, LanguageTextSegment,
+    LanguageId, LanguageModule, LanguageModuleError, LanguageModuleKind,
+    LanguageOperationCancelled, LanguagePair, LanguageRepairApplicationError, LanguageText,
+    LanguageTextSegment,
 };
 #[cfg(test)]
 use crate::llm::LlmRequestError;
 use crate::llm::{
-    LlmClientConcurrency, LlmFinishReason, LlmRequestDiagnosticSource, LlmRequestExecutor,
-    LlmResponse, LlmUsage,
+    LlmClientConcurrency, LlmFinishReason, LlmRequestExecutor, LlmRequestFailure, LlmResponse,
+    LlmUsage,
 };
 use crate::rpg_maker::model::TextUnitContent;
+use crate::runtime::cpu::CpuExecutorUnavailable;
 use crate::translation::placeholder_projection::{
     LanguageTextProjectionError, PlaceholderBindingIndex, PlaceholderMultisetError,
     PlaceholderTextScan,
@@ -53,6 +59,7 @@ use crate::translation_protocol::{
     parse_translation_response_with_cancellation,
 };
 
+use super::pipeline::rpg_maker_diagnostic_unit;
 use super::pipeline::{
     AcceptedTranslationDecision, AppliedPlaceholder, ExpectedLineShape, ExpectedTranslationOutput,
     NonEmptyTaskItems, PlaceholderRuleOrigin, RpgMakerExecutableTask,
@@ -79,7 +86,7 @@ const RESPONSE_PROCESSING_CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
 pub(crate) struct FinalLlmResponseMetadata {
     provider_request_id: Option<String>,
     provider_response_id: Option<String>,
-    finish_reason: String,
+    finish_reason: RpgMakerModelFinishReason,
     usage: Option<LlmUsage>,
 }
 
@@ -87,13 +94,13 @@ impl FinalLlmResponseMetadata {
     pub(crate) fn new(
         provider_request_id: Option<String>,
         provider_response_id: Option<String>,
-        finish_reason: impl Into<String>,
+        finish_reason: RpgMakerModelFinishReason,
         usage: Option<LlmUsage>,
     ) -> Self {
         Self {
             provider_request_id,
             provider_response_id,
-            finish_reason: finish_reason.into(),
+            finish_reason,
             usage,
         }
     }
@@ -117,12 +124,12 @@ impl FinalLlmResponseMetadata {
             None => None,
         };
         let finish_reason = match response.finish_reason() {
-            LlmFinishReason::Stop => "stop".to_owned(),
-            LlmFinishReason::Length => "length".to_owned(),
-            LlmFinishReason::ContentFilter => "content_filter".to_owned(),
-            LlmFinishReason::Other(value) => {
-                clone_response_processing_text_with_cancellation(value, ensure_running)?
-            }
+            LlmFinishReason::Stop => RpgMakerModelFinishReason::Stop,
+            LlmFinishReason::Length => RpgMakerModelFinishReason::Length,
+            LlmFinishReason::ContentFilter => RpgMakerModelFinishReason::ContentFilter,
+            LlmFinishReason::Other(value) => RpgMakerModelFinishReason::provider_specific(
+                clone_response_processing_text_with_cancellation(value, ensure_running)?,
+            ),
         };
         ensure_running()?;
         Ok(Self::new(
@@ -143,7 +150,7 @@ impl FinalLlmResponseMetadata {
         self.provider_response_id.as_deref()
     }
 
-    pub(crate) fn finish_reason(&self) -> &str {
+    pub(crate) fn finish_reason(&self) -> &RpgMakerModelFinishReason {
         &self.finish_reason
     }
 
@@ -212,7 +219,7 @@ pub(crate) enum TranslationCandidateInvariantLocation {
     PreparedCandidate,
 }
 
-#[derive(Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) enum TranslationInternalInvariant {
     ResponseAttemptZero {
         task_index: RpgMakerTranslationTaskIndex,
@@ -250,114 +257,9 @@ pub(crate) enum TranslationInternalInvariant {
     },
 }
 
-impl TranslationInternalInvariant {
-    pub(crate) fn safe_diagnostic(
-        &self,
-        stage: DiagnosticStage,
-        impact: DiagnosticImpact,
-    ) -> SafeDiagnostic {
-        SafeDiagnostic::new(
-            DiagnosticCode::InternalOperation,
-            stage,
-            self.diagnostic_subject(),
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::InternalInvariant,
-                self.safe_detail(),
-            ),
-            impact,
-            DiagnosticAction::ReportBug,
-        )
-    }
-
-    pub(crate) fn safe_detail(&self) -> String {
-        match self {
-            Self::ResponseAttemptZero { task_index } => {
-                format!(
-                    "response_attempt_zero; task={}; attempt=0",
-                    task_index.get()
-                )
-            }
-            Self::ExpectedOutputsEmpty { task_index } => {
-                format!(
-                    "expected_outputs_empty; task={}; expected_output_count=0",
-                    task_index.get()
-                )
-            }
-            Self::LanguagePairMismatch {
-                task_index,
-                task_source,
-                task_target,
-                resolved_source,
-                resolved_target,
-            } => format!(
-                "language_pair_mismatch; task={}; task_source={}; task_target={}; resolved_source={}; resolved_target={}",
-                task_index.get(),
-                task_source.as_str(),
-                task_target.as_str(),
-                resolved_source.as_str(),
-                resolved_target.as_str()
-            ),
-            Self::RepairSegmentRangeMissing {
-                location,
-                line_index,
-                start,
-                end,
-                actual,
-            } => format!(
-                "repair_segment_range_missing; {}; line_index={line_index}; start={start}; end={end}; actual={actual}",
-                candidate_location_detail(*location)
-            ),
-            Self::RepairLineBoundaryMissing {
-                location,
-                line_index,
-                segment_index,
-                actual,
-            } => format!(
-                "repair_line_boundary_missing; {}; line_index={line_index}; segment_index={segment_index}; actual={actual}",
-                candidate_location_detail(*location)
-            ),
-            Self::RepairUnassignedSegments {
-                location,
-                consumed,
-                actual,
-            } => format!(
-                "repair_unassigned_segments; {}; consumed={consumed}; actual={actual}",
-                candidate_location_detail(*location)
-            ),
-            Self::ReservedTokenAfterRestore { location } => format!(
-                "reserved_token_after_restore; {}",
-                candidate_location_detail(*location)
-            ),
-        }
-    }
-
-    fn diagnostic_subject(&self) -> DiagnosticSubject {
-        match self {
-            Self::ResponseAttemptZero { task_index }
-            | Self::ExpectedOutputsEmpty { task_index }
-            | Self::LanguagePairMismatch { task_index, .. } => {
-                translation_task_subject(*task_index)
-            }
-            Self::RepairSegmentRangeMissing { location, .. }
-            | Self::RepairLineBoundaryMissing { location, .. }
-            | Self::RepairUnassignedSegments { location, .. }
-            | Self::ReservedTokenAfterRestore { location } => candidate_location_subject(*location),
-        }
-    }
-}
-
-impl fmt::Debug for TranslationInternalInvariant {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_tuple("TranslationInternalInvariant")
-            .field(&self.safe_detail())
-            .finish()
-    }
-}
-
 impl fmt::Display for TranslationInternalInvariant {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.safe_detail())
+        formatter.write_str("翻译响应处理内部不变量已破坏")
     }
 }
 
@@ -367,50 +269,15 @@ impl Error for TranslationInternalInvariant {
     }
 }
 
-fn translation_task_subject(task_index: RpgMakerTranslationTaskIndex) -> DiagnosticSubject {
-    DiagnosticSubject::operation(format!("translation_task_{}", task_index.get()))
+pub(crate) trait ResponseProcessingCpuFailure:
+    Error + Send + Sync + Sized + 'static
+{
+    fn diagnostic(error: &CpuTaskExecutionError<Self>) -> crate::diagnostic::Diagnostic;
 }
 
-fn translation_unit_subject(
-    task_index: RpgMakerTranslationTaskIndex,
-    unit_id: TaskId,
-) -> DiagnosticSubject {
-    DiagnosticSubject::operation(format!(
-        "translation_task_{}_unit_{}",
-        task_index.get(),
-        unit_id.get()
-    ))
-}
-
-fn candidate_location_subject(
-    location: TranslationCandidateInvariantLocation,
-) -> DiagnosticSubject {
-    match location {
-        TranslationCandidateInvariantLocation::TaskUnit {
-            task_index,
-            unit_id,
-        } => translation_unit_subject(task_index, unit_id),
-        #[cfg(test)]
-        TranslationCandidateInvariantLocation::PreparedCandidate => {
-            DiagnosticSubject::operation("prepared_translation_candidate")
-        }
-    }
-}
-
-fn candidate_location_detail(location: TranslationCandidateInvariantLocation) -> String {
-    match location {
-        TranslationCandidateInvariantLocation::TaskUnit {
-            task_index,
-            unit_id,
-        } => format!(
-            "scope=task_unit; task={}; unit={}",
-            task_index.get(),
-            unit_id.get()
-        ),
-        #[cfg(test)]
-        TranslationCandidateInvariantLocation::PreparedCandidate => {
-            "scope=prepared_candidate".to_owned()
-        }
+impl ResponseProcessingCpuFailure for CpuExecutorUnavailable {
+    fn diagnostic(error: &CpuTaskExecutionError<Self>) -> crate::diagnostic::Diagnostic {
+        error.diagnostic()
     }
 }
 
@@ -440,9 +307,11 @@ pub(crate) trait TranslationTaskResponseProcessor: Send + Sync {
         >,
     > + Send;
 
-    fn task_record_diagnostic(&self, _error: &Self::Error) -> Option<SafeDiagnostic> {
-        None
-    }
+    fn task_record_diagnostic(
+        &self,
+        _task: &RpgMakerExecutableTask,
+        _error: &Self::Error,
+    ) -> crate::diagnostic::DiagnosticReport;
 
     /// 错误是否明确来自响应处理等待 CPU 入场或已入场计算中的合作取消。
     ///
@@ -554,6 +423,7 @@ where
 impl<C> TranslationTaskResponseProcessor for TranslationTaskResponseProcessingService<C>
 where
     C: CpuTaskExecutor,
+    C::Error: ResponseProcessingCpuFailure,
 {
     type Error = TranslationTaskResponseProcessingError<C::Error>;
 
@@ -616,8 +486,12 @@ where
         }
     }
 
-    fn task_record_diagnostic(&self, error: &Self::Error) -> Option<SafeDiagnostic> {
-        Some(response_processing_task_record_diagnostic(error))
+    fn task_record_diagnostic(
+        &self,
+        task: &RpgMakerExecutableTask,
+        error: &Self::Error,
+    ) -> crate::diagnostic::DiagnosticReport {
+        error.diagnostic_report(task)
     }
 
     fn is_cancelled_wait(&self, error: &Self::Error) -> bool {
@@ -631,74 +505,6 @@ where
     }
 }
 
-fn response_processing_task_record_diagnostic<C>(
-    error: &TranslationTaskResponseProcessingError<C>,
-) -> SafeDiagnostic {
-    match error {
-        TranslationTaskResponseProcessingError::Cancelled => SafeDiagnostic::new(
-            DiagnosticCode::InternalOperation,
-            DiagnosticStage::Translate,
-            DiagnosticSubject::component("translation_response_cpu_task"),
-            DiagnosticReason::failure(DiagnosticFailureKind::LockCancelled),
-            DiagnosticImpact::ProgressPreserved,
-            DiagnosticAction::Retry,
-        ),
-        TranslationTaskResponseProcessingError::ScheduleCompute(source) => {
-            let failure = match source {
-                CpuTaskExecutionError::Cancelled => DiagnosticFailureKind::LockCancelled,
-                CpuTaskExecutionError::Unavailable(_) => DiagnosticFailureKind::ExecutorClosed,
-                CpuTaskExecutionError::TaskPanicked => DiagnosticFailureKind::WorkerPanicked,
-            };
-            SafeDiagnostic::new(
-                DiagnosticCode::InternalOperation,
-                DiagnosticStage::Translate,
-                DiagnosticSubject::component("translation_response_cpu_task"),
-                DiagnosticReason::failure(failure),
-                DiagnosticImpact::ProgressPreserved,
-                DiagnosticAction::ReportBug,
-            )
-        }
-        TranslationTaskResponseProcessingError::LanguageProjection(source) => SafeDiagnostic::new(
-            DiagnosticCode::InternalOperation,
-            DiagnosticStage::Translate,
-            DiagnosticSubject::component("translation_response_placeholder_projection"),
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::InternalInvariant,
-                language_projection_detail(source),
-            ),
-            DiagnosticImpact::ProgressPreserved,
-            DiagnosticAction::ReportBug,
-        ),
-        TranslationTaskResponseProcessingError::LanguageModule(source) => SafeDiagnostic::new(
-            DiagnosticCode::InternalOperation,
-            DiagnosticStage::Translate,
-            DiagnosticSubject::component("translation_response_language_analysis"),
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::InternalInvariant,
-                source.safe_diagnostic_detail(),
-            ),
-            DiagnosticImpact::ProgressPreserved,
-            DiagnosticAction::ReportBug,
-        ),
-        TranslationTaskResponseProcessingError::LanguageRepair(source) => SafeDiagnostic::new(
-            DiagnosticCode::InternalOperation,
-            DiagnosticStage::Translate,
-            DiagnosticSubject::component("translation_response_language_repair"),
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::InternalInvariant,
-                language_repair_detail(source),
-            ),
-            DiagnosticImpact::ProgressPreserved,
-            DiagnosticAction::ReportBug,
-        ),
-        TranslationTaskResponseProcessingError::InternalInvariant { invariant } => invariant
-            .safe_diagnostic(
-                DiagnosticStage::Translate,
-                DiagnosticImpact::ProgressPreserved,
-            ),
-    }
-}
-
 fn map_response_processing_error<C>(
     error: TranslationResponseTechnicalError,
 ) -> TranslationTaskResponseProcessingError<C> {
@@ -706,14 +512,14 @@ fn map_response_processing_error<C>(
         TranslationResponseTechnicalError::Cancelled => {
             TranslationTaskResponseProcessingError::Cancelled
         }
-        TranslationResponseTechnicalError::LanguageModule(source) => {
-            TranslationTaskResponseProcessingError::LanguageModule(source)
+        TranslationResponseTechnicalError::LanguageModule { unit_id, source } => {
+            TranslationTaskResponseProcessingError::LanguageModule { unit_id, source }
         }
-        TranslationResponseTechnicalError::LanguageProjection(source) => {
-            TranslationTaskResponseProcessingError::LanguageProjection(source)
+        TranslationResponseTechnicalError::LanguageProjection { unit_id, source } => {
+            TranslationTaskResponseProcessingError::LanguageProjection { unit_id, source }
         }
-        TranslationResponseTechnicalError::LanguageRepair(source) => {
-            TranslationTaskResponseProcessingError::LanguageRepair(source)
+        TranslationResponseTechnicalError::LanguageRepair { unit_id, source } => {
+            TranslationTaskResponseProcessingError::LanguageRepair { unit_id, source }
         }
         TranslationResponseTechnicalError::InternalInvariant { invariant } => {
             TranslationTaskResponseProcessingError::InternalInvariant { invariant }
@@ -726,9 +532,18 @@ fn map_response_processing_error<C>(
 pub(crate) enum TranslationTaskResponseProcessingError<C> {
     Cancelled,
     ScheduleCompute(CpuTaskExecutionError<C>),
-    LanguageModule(LanguageModuleError),
-    LanguageProjection(LanguageTextProjectionError),
-    LanguageRepair(LanguageRepairApplicationError),
+    LanguageModule {
+        unit_id: TaskId,
+        source: LanguageModuleError,
+    },
+    LanguageProjection {
+        unit_id: TaskId,
+        source: LanguageTextProjectionError,
+    },
+    LanguageRepair {
+        unit_id: TaskId,
+        source: LanguageRepairApplicationError,
+    },
     InternalInvariant {
         invariant: TranslationInternalInvariant,
     },
@@ -742,9 +557,15 @@ where
         match self {
             Self::Cancelled => formatter.write_str("译后响应处理已取消"),
             Self::ScheduleCompute(source) => write!(formatter, "调度译后 CPU 验收失败：{source}"),
-            Self::LanguageModule(source) => write!(formatter, "译后语言事实不一致：{source}"),
-            Self::LanguageProjection(source) => write!(formatter, "译后语言投影失败：{source}"),
-            Self::LanguageRepair(source) => write!(formatter, "译后语言修复无法安全应用：{source}"),
+            Self::LanguageModule { source, .. } => {
+                write!(formatter, "译后语言事实不一致：{source}")
+            }
+            Self::LanguageProjection { source, .. } => {
+                write!(formatter, "译后语言投影失败：{source}")
+            }
+            Self::LanguageRepair { source, .. } => {
+                write!(formatter, "译后语言修复无法安全应用：{source}")
+            }
             Self::InternalInvariant { invariant } => {
                 write!(formatter, "翻译任务内部不变量已破坏：{invariant}")
             }
@@ -760,157 +581,278 @@ where
         match self {
             Self::Cancelled => None,
             Self::ScheduleCompute(source) => Some(source),
-            Self::LanguageModule(source) => Some(source),
-            Self::LanguageProjection(source) => Some(source),
-            Self::LanguageRepair(source) => Some(source),
+            Self::LanguageModule { source, .. } => Some(source),
+            Self::LanguageProjection { source, .. } => Some(source),
+            Self::LanguageRepair { source, .. } => Some(source),
             Self::InternalInvariant { .. } => None,
         }
     }
 }
 
-impl<C> SafeDiagnosticSource for TranslationTaskResponseProcessingError<C>
+impl<C> TranslationTaskResponseProcessingError<C>
 where
-    CpuTaskExecutionError<C>: SafeDiagnosticSource,
+    C: ResponseProcessingCpuFailure,
 {
-    fn safe_diagnostic_source(
+    /// 在响应处理仍持有 Planner Task 与 Unit 身份时建立唯一公开诊断。
+    ///
+    /// 状态影响固定为已保存既有进度；调用方不能覆盖阶段、代码、影响或处理办法。
+    pub(crate) fn diagnostic_report(
         &self,
-        stage: DiagnosticStage,
-        impact: DiagnosticImpact,
-        _fallback_action: DiagnosticAction,
-    ) -> SafeDiagnostic {
-        match self {
-            Self::Cancelled => SafeDiagnostic::new(
-                DiagnosticCode::InternalOperation,
-                stage,
-                DiagnosticSubject::component("translation_response_cpu_task"),
-                DiagnosticReason::failure(DiagnosticFailureKind::LockCancelled),
-                impact,
-                DiagnosticAction::Retry,
+        task: &RpgMakerExecutableTask,
+    ) -> crate::diagnostic::DiagnosticReport {
+        let task_scope = || RpgMakerResponseProcessingScope::task(task.index().get());
+        let unit_scope = |unit_id| response_processing_unit_scope(task, unit_id);
+        let (scope, problem) = match self {
+            Self::Cancelled => (task_scope(), RpgMakerResponseProcessingProblem::Cancelled),
+            Self::ScheduleCompute(source) => (
+                task_scope(),
+                RpgMakerResponseProcessingProblem::Compute {
+                    cause: RpgMakerBackendCause::new(C::diagnostic(source)),
+                },
             ),
-            Self::ScheduleCompute(CpuTaskExecutionError::TaskPanicked) => SafeDiagnostic::new(
-                DiagnosticCode::InternalOperation,
-                stage,
-                DiagnosticSubject::component("translation_response_cpu_task"),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::WorkerPanicked,
-                    "response_processing_task_panicked",
-                ),
-                impact,
-                DiagnosticAction::ReportBug,
+            Self::LanguageModule { unit_id, source } => (
+                unit_scope(*unit_id),
+                RpgMakerResponseProcessingProblem::LanguageModuleMismatch {
+                    expected: language_module_kind(source.expected()),
+                    actual: language_module_kind(source.actual()),
+                },
             ),
-            Self::ScheduleCompute(source) => source
-                .safe_diagnostic_source(stage, impact, DiagnosticAction::Retry)
-                .with_recovery(RecoveryFact::component("process_translation_response")),
-            Self::LanguageProjection(source) => SafeDiagnostic::new(
-                DiagnosticCode::InternalOperation,
-                stage,
-                DiagnosticSubject::component("translation_response_placeholder_projection"),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::InternalInvariant,
-                    language_projection_detail(source),
-                ),
-                impact,
-                DiagnosticAction::ReportBug,
+            Self::LanguageProjection { unit_id, source } => (
+                unit_scope(*unit_id),
+                RpgMakerResponseProcessingProblem::LanguageProjection {
+                    problem: response_language_projection_problem(source),
+                },
             ),
-            Self::LanguageModule(source) => SafeDiagnostic::new(
-                DiagnosticCode::InternalOperation,
-                stage,
-                DiagnosticSubject::component("translation_response_language_analysis"),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::InternalInvariant,
-                    source.safe_diagnostic_detail(),
-                ),
-                impact,
-                DiagnosticAction::ReportBug,
+            Self::LanguageRepair { unit_id, source } => (
+                unit_scope(*unit_id),
+                RpgMakerResponseProcessingProblem::LanguageRepair {
+                    problem: language_repair_problem(source),
+                },
             ),
-            Self::LanguageRepair(source) => SafeDiagnostic::new(
-                DiagnosticCode::InternalOperation,
-                stage,
-                DiagnosticSubject::component("translation_response_language_repair"),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::InternalInvariant,
-                    language_repair_detail(source),
-                ),
-                impact,
-                DiagnosticAction::ReportBug,
+            Self::InternalInvariant { invariant } => (
+                invariant_scope(task, invariant),
+                RpgMakerResponseProcessingProblem::InternalInvariant {
+                    problem: response_invariant_problem(invariant),
+                },
             ),
-            Self::InternalInvariant { invariant } => invariant.safe_diagnostic(stage, impact),
+        };
+        crate::diagnostic::DiagnosticReport::new(
+            StateEffect::ProgressPreserved,
+            crate::diagnostic::Diagnostic::rpg_maker(RpgMakerIssue::response_processing(
+                scope, problem,
+            )),
+        )
+    }
+}
+
+fn response_processing_unit_scope(
+    task: &RpgMakerExecutableTask,
+    unit_id: TaskId,
+) -> RpgMakerResponseProcessingScope {
+    let unit = task
+        .expected_outputs()
+        .iter()
+        .find(|output| output.id() == unit_id)
+        .map(|output| rpg_maker_diagnostic_unit(output.identity()));
+    match unit {
+        Some(unit) => RpgMakerResponseProcessingScope::unit(task.index().get(), unit),
+        None => RpgMakerResponseProcessingScope::task(task.index().get()),
+    }
+}
+
+fn invariant_scope(
+    task: &RpgMakerExecutableTask,
+    invariant: &TranslationInternalInvariant,
+) -> RpgMakerResponseProcessingScope {
+    match invariant {
+        TranslationInternalInvariant::RepairSegmentRangeMissing { location, .. }
+        | TranslationInternalInvariant::RepairLineBoundaryMissing { location, .. }
+        | TranslationInternalInvariant::RepairUnassignedSegments { location, .. }
+        | TranslationInternalInvariant::ReservedTokenAfterRestore { location } => match location {
+            TranslationCandidateInvariantLocation::TaskUnit { unit_id, .. } => {
+                response_processing_unit_scope(task, *unit_id)
+            }
+            #[cfg(test)]
+            TranslationCandidateInvariantLocation::PreparedCandidate => {
+                RpgMakerResponseProcessingScope::task(task.index().get())
+            }
+        },
+        TranslationInternalInvariant::ResponseAttemptZero { .. }
+        | TranslationInternalInvariant::ExpectedOutputsEmpty { .. }
+        | TranslationInternalInvariant::LanguagePairMismatch { .. } => {
+            RpgMakerResponseProcessingScope::task(task.index().get())
         }
     }
 }
 
-pub(super) fn language_projection_detail(source: &LanguageTextProjectionError) -> String {
+const fn language_module_kind(kind: LanguageModuleKind) -> RpgMakerLanguageModuleKind {
+    match kind {
+        LanguageModuleKind::Japanese => RpgMakerLanguageModuleKind::Japanese,
+        LanguageModuleKind::English => RpgMakerLanguageModuleKind::English,
+    }
+}
+
+fn response_language_projection_problem(
+    source: &LanguageTextProjectionError,
+) -> RpgMakerResponseLanguageProjectionProblem {
     match source {
         LanguageTextProjectionError::TokenIndexConstruction => {
-            "placeholder_token_index_construction_failed".to_owned()
+            RpgMakerResponseLanguageProjectionProblem::TokenIndexConstruction
         }
-        LanguageTextProjectionError::EmptyToken => "empty_placeholder_token".to_owned(),
+        LanguageTextProjectionError::EmptyToken => {
+            RpgMakerResponseLanguageProjectionProblem::EmptyToken
+        }
         LanguageTextProjectionError::MissingToken { .. } => {
-            "missing_required_placeholder_token".to_owned()
+            RpgMakerResponseLanguageProjectionProblem::MissingToken
         }
         LanguageTextProjectionError::RepeatedToken { .. } => {
-            "repeated_placeholder_token".to_owned()
+            RpgMakerResponseLanguageProjectionProblem::RepeatedToken
         }
         LanguageTextProjectionError::OverlappingToken { .. } => {
-            "overlapping_placeholder_tokens".to_owned()
+            RpgMakerResponseLanguageProjectionProblem::OverlappingToken
         }
         LanguageTextProjectionError::ChangedTokenOrder { position, .. } => {
-            format!("placeholder_token_order_changed; position={position}")
+            RpgMakerResponseLanguageProjectionProblem::ChangedTokenOrder {
+                position: *position,
+            }
         }
         LanguageTextProjectionError::ChangedSegmentCount { expected, actual } => {
-            format!("language_repair_changed_segment_count; expected={expected}; actual={actual}")
+            RpgMakerResponseLanguageProjectionProblem::ChangedSegmentCount {
+                expected: *expected,
+                actual: *actual,
+            }
         }
         LanguageTextProjectionError::ChangedSegmentKind { segment_index } => {
-            format!("language_repair_changed_segment_kind; segment_index={segment_index}")
+            RpgMakerResponseLanguageProjectionProblem::ChangedSegmentKind {
+                segment_index: *segment_index,
+            }
         }
         LanguageTextProjectionError::MissingOrderedToken { segment_index } => {
-            format!("missing_ordered_placeholder_token; segment_index={segment_index}")
+            RpgMakerResponseLanguageProjectionProblem::MissingOrderedToken {
+                segment_index: *segment_index,
+            }
         }
         LanguageTextProjectionError::UnusedOrderedToken => {
-            "unused_ordered_placeholder_token".to_owned()
+            RpgMakerResponseLanguageProjectionProblem::UnusedOrderedToken
         }
     }
 }
 
-fn language_repair_detail(source: &LanguageRepairApplicationError) -> String {
+fn language_repair_problem(
+    source: &LanguageRepairApplicationError,
+) -> RpgMakerLanguageRepairProblem {
     match source {
         LanguageRepairApplicationError::InvalidNaturalSegment { segment_index } => {
-            format!("repair_targets_non_natural_segment; segment_index={segment_index}")
+            RpgMakerLanguageRepairProblem::InvalidNaturalSegment {
+                segment_index: *segment_index,
+            }
         }
         LanguageRepairApplicationError::DuplicatePosition {
             segment_index,
             byte_offset,
-        } => format!(
-            "duplicate_repair_position; segment_index={segment_index}; byte_offset={byte_offset}"
-        ),
+        } => RpgMakerLanguageRepairProblem::DuplicatePosition {
+            segment_index: *segment_index,
+            byte_offset: *byte_offset,
+        },
         LanguageRepairApplicationError::InvalidCharacterBoundary {
             segment_index,
             byte_offset,
-        } => format!(
-            "repair_position_not_character_boundary; segment_index={segment_index}; byte_offset={byte_offset}"
-        ),
+        } => RpgMakerLanguageRepairProblem::InvalidCharacterBoundary {
+            segment_index: *segment_index,
+            byte_offset: *byte_offset,
+        },
         LanguageRepairApplicationError::MissingCharacter {
             segment_index,
             byte_offset,
-        } => format!(
-            "repair_position_has_no_character; segment_index={segment_index}; byte_offset={byte_offset}"
-        ),
+        } => RpgMakerLanguageRepairProblem::MissingCharacter {
+            segment_index: *segment_index,
+            byte_offset: *byte_offset,
+        },
         LanguageRepairApplicationError::UnexpectedCharacter {
             segment_index,
             byte_offset,
+            expected,
+            actual,
+        } => RpgMakerLanguageRepairProblem::UnexpectedCharacter {
+            segment_index: *segment_index,
+            byte_offset: *byte_offset,
+            expected_code_point: u32::from(*expected),
+            actual_code_point: u32::from(*actual),
+        },
+    }
+}
+
+fn response_invariant_problem(
+    invariant: &TranslationInternalInvariant,
+) -> RpgMakerResponseInvariantProblem {
+    match invariant {
+        TranslationInternalInvariant::ResponseAttemptZero { .. } => {
+            RpgMakerResponseInvariantProblem::ResponseAttemptZero
+        }
+        TranslationInternalInvariant::ExpectedOutputsEmpty { .. } => {
+            RpgMakerResponseInvariantProblem::ExpectedOutputsEmpty
+        }
+        TranslationInternalInvariant::LanguagePairMismatch {
+            task_source,
+            task_target,
+            resolved_source,
+            resolved_target,
             ..
-        } => format!(
-            "repair_expected_character_mismatch; segment_index={segment_index}; byte_offset={byte_offset}"
-        ),
+        } => RpgMakerResponseInvariantProblem::LanguagePairMismatch {
+            task_source: SafeIdentifier::from_validated(task_source.as_str()),
+            task_target: SafeIdentifier::from_validated(task_target.as_str()),
+            resolved_source: SafeIdentifier::from_validated(resolved_source.as_str()),
+            resolved_target: SafeIdentifier::from_validated(resolved_target.as_str()),
+        },
+        TranslationInternalInvariant::RepairSegmentRangeMissing {
+            line_index,
+            start,
+            end,
+            actual,
+            ..
+        } => RpgMakerResponseInvariantProblem::RepairSegmentRangeMissing {
+            line_index: *line_index,
+            start: *start,
+            end: *end,
+            actual: *actual,
+        },
+        TranslationInternalInvariant::RepairLineBoundaryMissing {
+            line_index,
+            segment_index,
+            actual,
+            ..
+        } => RpgMakerResponseInvariantProblem::RepairLineBoundaryMissing {
+            line_index: *line_index,
+            segment_index: *segment_index,
+            actual: *actual,
+        },
+        TranslationInternalInvariant::RepairUnassignedSegments {
+            consumed, actual, ..
+        } => RpgMakerResponseInvariantProblem::RepairUnassignedSegments {
+            consumed: *consumed,
+            actual: *actual,
+        },
+        TranslationInternalInvariant::ReservedTokenAfterRestore { .. } => {
+            RpgMakerResponseInvariantProblem::ReservedTokenAfterRestore
+        }
     }
 }
 
 #[derive(Debug)]
 enum TranslationResponseTechnicalError {
     Cancelled,
-    LanguageModule(LanguageModuleError),
-    LanguageProjection(LanguageTextProjectionError),
-    LanguageRepair(LanguageRepairApplicationError),
+    LanguageModule {
+        unit_id: TaskId,
+        source: LanguageModuleError,
+    },
+    LanguageProjection {
+        unit_id: TaskId,
+        source: LanguageTextProjectionError,
+    },
+    LanguageRepair {
+        unit_id: TaskId,
+        source: LanguageRepairApplicationError,
+    },
     InternalInvariant {
         invariant: TranslationInternalInvariant,
     },
@@ -1039,7 +981,7 @@ impl<L, D, R, P> RpgMakerTranslationTaskExecutor
     for RpgMakerTranslationTaskExecutionService<L, D, R, P>
 where
     L: LlmRequestExecutor,
-    L::Error: LlmRequestDiagnosticSource,
+    L::Error: LlmRequestFailure,
     D: AsyncDelay,
     R: TranslationTaskResponseProcessor,
     P: TranslationTaskExecutionProfile<LlmClient = L::Client>,
@@ -1057,13 +999,19 @@ where
             let invariant = TranslationInternalInvariant::ExpectedOutputsEmpty {
                 task_index: task.index(),
             };
-            let diagnostic =
-                invariant.safe_diagnostic(DiagnosticStage::Translate, DiagnosticImpact::Unchanged);
-            return Err(TranslationTaskExecutionFailure::new(
+            let diagnostic = crate::diagnostic::DiagnosticReport::new(
+                StateEffect::Unchanged,
+                crate::diagnostic::Diagnostic::rpg_maker(RpgMakerIssue::response_processing(
+                    invariant_scope(task, &invariant),
+                    RpgMakerResponseProcessingProblem::InternalInvariant {
+                        problem: response_invariant_problem(&invariant),
+                    },
+                )),
+            );
+            return Err(TranslationTaskExecutionFailure::failed(
                 RpgMakerTranslationTaskExecutionError::InternalInvariant { invariant },
                 evidence.finish(None),
-                Some(diagnostic),
-                false,
+                diagnostic,
             ));
         }
         let request_execution = execute_llm_request_with_retry(
@@ -1095,10 +1043,7 @@ where
                     TranslationTaskUnavailableReason::RetryAfterExceedsConfiguredMaximum {
                         retry_after,
                         maximum,
-                        diagnostic: diagnostic.with_recovery(RecoveryFact::component(format!(
-                            "configured_max_retry_after_seconds={}",
-                            maximum.as_secs()
-                        ))),
+                        diagnostic,
                     },
                 );
                 return Ok(TranslationTaskExecution::new(
@@ -1124,26 +1069,22 @@ where
                 attempt,
                 source,
                 diagnostic,
-                cancelled,
             } => {
-                return Err(TranslationTaskExecutionFailure::new(
+                return Err(TranslationTaskExecutionFailure::failed(
                     RpgMakerTranslationTaskExecutionError::FatalRequest {
                         attempt: attempt.get(),
                         source,
                     },
                     evidence.finish(None),
                     diagnostic,
-                    cancelled,
                 ));
             }
             LlmRequestExecutionOutcome::Cancelled { attempt } => {
-                return Err(TranslationTaskExecutionFailure::new(
-                    RpgMakerTranslationTaskExecutionError::RetryWaitCancelled {
+                return Err(TranslationTaskExecutionFailure::cancelled(
+                    RpgMakerTranslationTaskExecutionError::LlmRequestCancelled {
                         attempt: attempt.get(),
                     },
                     evidence.finish(None),
-                    None,
-                    true,
                 ));
             }
         };
@@ -1161,18 +1102,29 @@ where
                 Err(source) => {
                     let cancelled = self.cancellation.is_requested()
                         && self.response_processor.is_cancelled_wait(&source);
-                    let diagnostic = (!cancelled)
-                        .then(|| self.response_processor.task_record_diagnostic(&source))
-                        .flatten();
-                    Err(TranslationTaskExecutionFailure::new(
-                        RpgMakerTranslationTaskExecutionError::ProcessResponse {
-                            attempt: attempt.get(),
-                            source,
-                        },
-                        evidence.finish(None),
-                        diagnostic,
-                        cancelled,
-                    ))
+                    let error = RpgMakerTranslationTaskExecutionError::ProcessResponse {
+                        attempt: attempt.get(),
+                        source,
+                    };
+                    if cancelled {
+                        Err(TranslationTaskExecutionFailure::cancelled(
+                            error,
+                            evidence.finish(None),
+                        ))
+                    } else {
+                        let diagnostic = match &error {
+                            RpgMakerTranslationTaskExecutionError::ProcessResponse {
+                                source,
+                                ..
+                            } => self.response_processor.task_record_diagnostic(task, source),
+                            _ => unreachable!("刚建立的响应处理错误必须保持原始原因"),
+                        };
+                        Err(TranslationTaskExecutionFailure::failed(
+                            error,
+                            evidence.finish(None),
+                            diagnostic,
+                        ))
+                    }
                 }
             };
         }
@@ -1197,18 +1149,28 @@ where
                 let (source, response) = failure.into_parts();
                 let cancelled = self.cancellation.is_requested()
                     && self.response_processor.is_cancelled_wait(&source);
-                let diagnostic = (!cancelled)
-                    .then(|| self.response_processor.task_record_diagnostic(&source))
-                    .flatten();
-                Err(TranslationTaskExecutionFailure::new(
-                    RpgMakerTranslationTaskExecutionError::ProcessResponse {
-                        attempt: attempt.get(),
-                        source,
-                    },
-                    evidence.finish(Some(response)),
-                    diagnostic,
-                    cancelled,
-                ))
+                let error = RpgMakerTranslationTaskExecutionError::ProcessResponse {
+                    attempt: attempt.get(),
+                    source,
+                };
+                if cancelled {
+                    Err(TranslationTaskExecutionFailure::cancelled(
+                        error,
+                        evidence.finish(Some(response)),
+                    ))
+                } else {
+                    let diagnostic = match &error {
+                        RpgMakerTranslationTaskExecutionError::ProcessResponse {
+                            source, ..
+                        } => self.response_processor.task_record_diagnostic(task, source),
+                        _ => unreachable!("刚建立的响应处理错误必须保持原始原因"),
+                    };
+                    Err(TranslationTaskExecutionFailure::failed(
+                        error,
+                        evidence.finish(Some(response)),
+                        diagnostic,
+                    ))
+                }
             }
         }
     }
@@ -1218,7 +1180,7 @@ where
 impl<L, D, R, P> RpgMakerTranslationTaskExecutionService<L, D, R, P>
 where
     L: LlmRequestExecutor,
-    L::Error: LlmRequestDiagnosticSource,
+    L::Error: LlmRequestFailure,
     D: AsyncDelay,
     R: TranslationTaskResponseProcessor,
     P: TranslationTaskExecutionProfile<LlmClient = L::Client>,
@@ -1232,7 +1194,8 @@ where
     {
         match <Self as RpgMakerTranslationTaskExecutor>::execute(self, profile, &task).await {
             Ok(execution) => Ok(execution.into_parts().0),
-            Err(failure) => Err(failure.into_parts().0),
+            Err(TranslationTaskExecutionFailure::Failed { source, .. })
+            | Err(TranslationTaskExecutionFailure::Cancelled { source, .. }) => Err(source),
         }
     }
 }
@@ -1267,7 +1230,7 @@ pub(crate) enum RpgMakerTranslationTaskExecutionError<L, R> {
         attempt: usize,
         source: R,
     },
-    RetryWaitCancelled {
+    LlmRequestCancelled {
         attempt: usize,
     },
     InternalInvariant {
@@ -1288,8 +1251,8 @@ where
             Self::ProcessResponse { attempt, source } => {
                 write!(formatter, "第 {attempt} 次模型响应无法处理：{source}")
             }
-            Self::RetryWaitCancelled { attempt } => {
-                write!(formatter, "第 {attempt} 次 LLM 请求后的重试等待已取消")
+            Self::LlmRequestCancelled { attempt } => {
+                write!(formatter, "第 {attempt} 次 LLM 请求已取消")
             }
             Self::InternalInvariant { invariant } => {
                 write!(formatter, "翻译任务内部不变量已破坏：{invariant}")
@@ -1307,7 +1270,7 @@ where
         match self {
             Self::FatalRequest { source, .. } => Some(source),
             Self::ProcessResponse { source, .. } => Some(source),
-            Self::RetryWaitCancelled { .. } | Self::InternalInvariant { .. } => None,
+            Self::LlmRequestCancelled { .. } | Self::InternalInvariant { .. } => None,
         }
     }
 }
@@ -1339,20 +1302,9 @@ fn process_response(
             return Err(cancelled_response_processing_failure(raw_assistant));
         }
     };
-    let finish_reason = match clone_response_processing_text_with_cancellation(
-        final_response.finish_reason(),
-        &mut ensure_running,
-    ) {
-        Ok(finish_reason) => finish_reason,
-        Err(ResponseProcessingCancelled) => {
-            return Err(cancelled_response_processing_failure(raw_assistant));
-        }
-    };
     let mut diagnostics = Vec::new();
-    if response.finish_reason() != &LlmFinishReason::Stop {
-        diagnostics.push(TranslationProtocolDiagnostic::NonStopFinish {
-            reason: finish_reason,
-        });
+    if let Some(reason) = final_response.finish_reason().non_stop() {
+        diagnostics.push(TranslationProtocolDiagnostic::NonStopFinish { reason });
     }
 
     let parsed = match parse_model_response_with_cancellation(
@@ -1479,15 +1431,10 @@ fn process_response(
     let outputs = match parsed {
         Ok(outputs) => outputs,
         Err(parse_error) => {
-            let message = parse_error.business_message();
-            diagnostics.push(TranslationProtocolDiagnostic::InvalidResponse {
-                message: message.clone(),
-            });
+            diagnostics.push(TranslationProtocolDiagnostic::InvalidResponse { error: parse_error });
             let unresolved = match unresolved_all_with_cancellation(
                 &input.expected_outputs,
-                TranslationUnitRejectionReason::InvalidShape {
-                    message: message.clone(),
-                },
+                TranslationUnitRejectionReason::InvalidResponse,
                 &mut ensure_running,
             ) {
                 Ok(unresolved) => unresolved,
@@ -1565,10 +1512,10 @@ fn process_response(
         }
         let translation_lines = match candidates.pop().expect("唯一候选必须存在") {
             Ok(lines) => lines,
-            Err(message) => {
+            Err(problem) => {
                 unresolved.push(unresolved_unit(
                     expected,
-                    TranslationUnitRejectionReason::InvalidShape { message },
+                    TranslationUnitRejectionReason::InvalidShape { problem },
                 ));
                 continue;
             }
@@ -1604,19 +1551,28 @@ fn process_response(
             }
             Err(TranslationCandidateTechnicalError::LanguageModule(source)) => {
                 return Err(TranslationResponseTechnicalFailure::new(
-                    TranslationResponseTechnicalError::LanguageModule(source),
+                    TranslationResponseTechnicalError::LanguageModule {
+                        unit_id: expected.id(),
+                        source,
+                    },
                     response_record,
                 ));
             }
             Err(TranslationCandidateTechnicalError::LanguageProjection(source)) => {
                 return Err(TranslationResponseTechnicalFailure::new(
-                    TranslationResponseTechnicalError::LanguageProjection(source),
+                    TranslationResponseTechnicalError::LanguageProjection {
+                        unit_id: expected.id(),
+                        source,
+                    },
                     response_record,
                 ));
             }
             Err(TranslationCandidateTechnicalError::LanguageRepair(source)) => {
                 return Err(TranslationResponseTechnicalFailure::new(
-                    TranslationResponseTechnicalError::LanguageRepair(source),
+                    TranslationResponseTechnicalError::LanguageRepair {
+                        unit_id: expected.id(),
+                        source,
+                    },
                     response_record,
                 ));
             }
@@ -1896,7 +1852,7 @@ struct ModelOutputForAcceptance {
     translation: Result<Vec<String>, TranslationAssistantValueError>,
 }
 
-type ModelOutputsById = BTreeMap<TaskId, Vec<Result<Vec<String>, String>>>;
+type ModelOutputsById = BTreeMap<TaskId, Vec<Result<Vec<String>, TranslationAssistantValueError>>>;
 
 fn append_response_processing_text_with_cancellation<E>(
     output: &mut String,
@@ -2010,11 +1966,7 @@ fn collect_model_outputs_with_cancellation<E>(
             diagnostics.push(TranslationProtocolDiagnostic::UnknownId { item_index, id });
             continue;
         }
-        by_id.entry(id).or_default().push(
-            output
-                .translation
-                .map_err(TranslationAssistantValueError::business_message),
-        );
+        by_id.entry(id).or_default().push(output.translation);
     }
     ensure_running()?;
     Ok(by_id)
@@ -2151,7 +2103,12 @@ fn unresolved_unit(
     expected: &ExpectedTranslationOutput,
     reason: TranslationUnitRejectionReason,
 ) -> UnresolvedTranslationUnit {
-    UnresolvedTranslationUnit::new(expected.id(), expected.propagation_targets().len(), reason)
+    UnresolvedTranslationUnit::new(
+        expected.id(),
+        rpg_maker_diagnostic_unit(expected.identity()),
+        expected.propagation_targets().len(),
+        reason,
+    )
 }
 
 fn unresolved_all(
@@ -2637,6 +2594,7 @@ pub(super) fn accept_prepared_translation_candidate(
     }
 }
 
+#[derive(Debug)]
 pub(crate) enum TranslationCandidateTechnicalError {
     LanguageModule(LanguageModuleError),
     LanguageProjection(LanguageTextProjectionError),
@@ -2644,26 +2602,6 @@ pub(crate) enum TranslationCandidateTechnicalError {
     InternalInvariant {
         invariant: TranslationInternalInvariant,
     },
-}
-
-impl TranslationCandidateTechnicalError {
-    pub(crate) fn safe_detail(&self) -> String {
-        match self {
-            Self::LanguageModule(source) => source.safe_diagnostic_detail(),
-            Self::LanguageProjection(source) => language_projection_detail(source),
-            Self::LanguageRepair(source) => language_repair_detail(source),
-            Self::InternalInvariant { invariant } => invariant.safe_detail(),
-        }
-    }
-}
-
-impl fmt::Debug for TranslationCandidateTechnicalError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_tuple("TranslationCandidateTechnicalError")
-            .field(&self.safe_detail())
-            .finish()
-    }
 }
 
 impl fmt::Display for TranslationCandidateTechnicalError {
@@ -3435,35 +3373,77 @@ mod tests {
 
     impl Error for FakeError {}
 
+    fn split_execution_failure<E>(
+        failure: TranslationTaskExecutionFailure<E>,
+    ) -> (
+        E,
+        TranslationTaskExecutionEvidence,
+        Option<crate::diagnostic::DiagnosticReport>,
+        bool,
+    ) {
+        match failure {
+            TranslationTaskExecutionFailure::Failed {
+                source,
+                evidence,
+                diagnostic,
+            } => (source, evidence, Some(diagnostic), false),
+            TranslationTaskExecutionFailure::Cancelled { source, evidence } => {
+                (source, evidence, None, true)
+            }
+        }
+    }
+
+    impl ResponseProcessingCpuFailure for FakeError {
+        fn diagnostic(error: &CpuTaskExecutionError<Self>) -> crate::diagnostic::Diagnostic {
+            use crate::diagnostic::{RuntimeComponent, RuntimeIssue, RuntimeOperation};
+
+            crate::diagnostic::Diagnostic::runtime(match error {
+                CpuTaskExecutionError::Cancelled => RuntimeIssue::Cancelled {
+                    component: RuntimeComponent::CpuExecutor,
+                    operation: RuntimeOperation::ExecuteTask,
+                },
+                CpuTaskExecutionError::Unavailable(_) => RuntimeIssue::ExecutorClosed {
+                    component: RuntimeComponent::CpuExecutor,
+                    operation: RuntimeOperation::ExecuteTask,
+                },
+                CpuTaskExecutionError::TaskPanicked => RuntimeIssue::WorkerPanicked {
+                    component: RuntimeComponent::CpuExecutor,
+                    operation: RuntimeOperation::ExecuteTask,
+                },
+            })
+        }
+    }
+
     fn task_id(value: usize) -> TaskId {
         TaskId::new(value)
     }
 
-    impl LlmRequestDiagnosticSource for FakeError {
-        fn request_diagnostic(
-            &self,
-            retry_after: Option<Duration>,
-            impact: DiagnosticImpact,
-        ) -> crate::diagnostic::SafeDiagnostic {
-            crate::diagnostic::SafeDiagnostic::new(
-                crate::diagnostic::DiagnosticCode::ModelRequest,
-                crate::diagnostic::DiagnosticStage::ModelRequest,
-                crate::diagnostic::DiagnosticSubject::component("fake LLM provider"),
-                crate::diagnostic::DiagnosticReason::Http {
-                    status: Some(503),
-                    retry_after_seconds: retry_after.map(|value| value.as_secs()),
-                    provider_code: Some("temporarily_unavailable".to_owned()),
-                    provider_type: Some("service_error".to_owned()),
-                    provider_message: None,
-                },
-                impact,
-                crate::diagnostic::DiagnosticAction::CheckModelService,
-            )
-        }
-
+    impl LlmRequestFailure for FakeError {
         fn is_cancelled_wait(&self) -> bool {
             self.0 == "cancelled-wait"
         }
+    }
+
+    fn fake_request_diagnostic(retry_after: Option<Duration>) -> crate::diagnostic::Diagnostic {
+        crate::diagnostic::Diagnostic::http(crate::diagnostic::HttpIssue::Status {
+            endpoint: crate::diagnostic::HttpEndpoint::new(
+                crate::diagnostic::HttpScheme::Https,
+                "api.example.test",
+                None,
+            ),
+            status: 503,
+            retry_after_seconds: retry_after.map(|value| value.as_secs()),
+            provider_code: Some(
+                crate::diagnostic::SafeIdentifier::new("temporarily_unavailable")
+                    .expect("测试 provider code 合法"),
+            ),
+            provider_type: Some(
+                crate::diagnostic::SafeIdentifier::new("service_error")
+                    .expect("测试 provider type 合法"),
+            ),
+            provider_message: None,
+            response_read_failure: None,
+        })
     }
 
     impl LlmClientConcurrency for &'static str {
@@ -3551,40 +3531,37 @@ mod tests {
 
     #[test]
     fn response_diagnostic_distinguishes_cpu_cancel_unavailable_and_task_panic() {
-        let cases: [(ProductionResponseError, DiagnosticFailureKind); 3] = [
+        let cases: [(ProductionResponseError, &str); 3] = [
             (
                 TranslationTaskResponseProcessingError::ScheduleCompute(
                     CpuTaskExecutionError::Cancelled,
                 ),
-                DiagnosticFailureKind::LockCancelled,
+                "runtime.cancelled",
             ),
             (
                 TranslationTaskResponseProcessingError::ScheduleCompute(
                     CpuTaskExecutionError::Unavailable(CpuExecutorUnavailable::ShuttingDown),
                 ),
-                DiagnosticFailureKind::ExecutorClosed,
+                "runtime.executor_closed",
             ),
             (
                 TranslationTaskResponseProcessingError::ScheduleCompute(
                     CpuTaskExecutionError::TaskPanicked,
                 ),
-                DiagnosticFailureKind::WorkerPanicked,
+                "runtime.worker_panicked",
             ),
         ];
 
+        let task = task();
         for (error, expected) in cases {
-            let diagnostic = error.safe_diagnostic_source(
-                DiagnosticStage::ModelRequest,
-                DiagnosticImpact::ProgressPreserved,
-                DiagnosticAction::Retry,
+            let report = error.diagnostic_report(&task);
+            assert_eq!(report.effect(), StateEffect::ProgressPreserved);
+            assert_eq!(
+                report.primary().code(),
+                "rpg_maker.translation.response.compute_failed"
             );
-            match diagnostic.reason {
-                DiagnosticReason::Failure { failure }
-                | DiagnosticReason::FailureWithDetail { failure, .. } => {
-                    assert_eq!(failure, expected);
-                }
-                reason => panic!("CPU 诊断原因类型错误：{reason:?}"),
-            }
+            let serialized = serde_json::to_string(&report).expect("响应诊断应可序列化");
+            assert!(serialized.contains(expected));
         }
     }
 
@@ -3592,44 +3569,42 @@ mod tests {
     fn response_diagnostic_treats_projection_and_repair_as_internal_without_copying_text() {
         let sentinel = "MODEL_OR_TOKEN_BODY_SENTINEL";
         let projection: ProductionResponseError =
-            TranslationTaskResponseProcessingError::LanguageProjection(
-                LanguageTextProjectionError::MissingToken {
+            TranslationTaskResponseProcessingError::LanguageProjection {
+                unit_id: TaskId::new(0),
+                source: LanguageTextProjectionError::MissingToken {
                     token: sentinel.to_owned(),
                 },
-            );
-        let projection = projection.safe_diagnostic_source(
-            DiagnosticStage::ModelRequest,
-            DiagnosticImpact::ProgressPreserved,
-            DiagnosticAction::CheckModelService,
+            };
+        let task = task();
+        let projection = projection.diagnostic_report(&task);
+        assert_eq!(
+            projection.primary().code(),
+            "rpg_maker.translation.response.missing_token"
         );
-        assert_eq!(projection.code, DiagnosticCode::InternalOperation);
-        assert_eq!(projection.action, DiagnosticAction::ReportBug);
-        assert!(
-            projection
-                .reason
-                .render()
-                .contains("missing_required_placeholder_token")
-        );
-        assert!(!projection.reason.render().contains(sentinel));
+        let projection = serde_json::to_string(&projection).expect("投影诊断应可序列化");
+        assert!(!projection.contains(sentinel));
 
         let repair: ProductionResponseError =
-            TranslationTaskResponseProcessingError::LanguageRepair(
-                LanguageRepairApplicationError::UnexpectedCharacter {
+            TranslationTaskResponseProcessingError::LanguageRepair {
+                unit_id: TaskId::new(0),
+                source: LanguageRepairApplicationError::UnexpectedCharacter {
                     segment_index: 4,
                     byte_offset: 9,
                     expected: '密',
                     actual: '钥',
                 },
-            );
-        let repair = repair.safe_diagnostic_source(
-            DiagnosticStage::ModelRequest,
-            DiagnosticImpact::ProgressPreserved,
-            DiagnosticAction::CheckModelService,
+            };
+        let repair = repair.diagnostic_report(&task);
+        assert_eq!(
+            repair.primary().code(),
+            "rpg_maker.translation.response.repair_unexpected_character"
         );
-        assert_eq!(repair.action, DiagnosticAction::ReportBug);
-        assert!(repair.reason.render().contains("segment_index=4"));
-        assert!(!repair.reason.render().contains('密'));
-        assert!(!repair.reason.render().contains('钥'));
+        let repair = serde_json::to_string(&repair).expect("修复诊断应可序列化");
+        assert!(repair.contains("\"segment_index\":4"));
+        assert!(repair.contains("\"expected_code_point\":23494"));
+        assert!(repair.contains("\"actual_code_point\":38053"));
+        assert!(!repair.contains('密'));
+        assert!(!repair.contains('钥'));
     }
 
     fn japanese_module() -> Arc<dyn LanguageModule> {
@@ -5181,7 +5156,9 @@ mod tests {
         ));
         assert!(result.diagnostics().iter().any(|diagnostic| matches!(
             diagnostic,
-            TranslationProtocolDiagnostic::NonStopFinish { .. }
+            TranslationProtocolDiagnostic::NonStopFinish {
+                reason: RpgMakerModelNonStopFinishReason::Length
+            }
         )));
         assert!(result.diagnostics().iter().any(|diagnostic| matches!(
             diagnostic,
@@ -5221,8 +5198,9 @@ mod tests {
         assert_eq!(result.unresolved()[0].id(), task_id(1));
         assert!(matches!(
             result.unresolved()[0].reason(),
-            TranslationUnitRejectionReason::InvalidShape { message }
-                if message == "译文数组第 1 项必须是字符串"
+            TranslationUnitRejectionReason::InvalidShape {
+                problem: TranslationAssistantValueError::NonStringItem { item }
+            } if *item == NonZeroUsize::MIN
         ));
         assert!(result.diagnostics().iter().any(|diagnostic| matches!(
             diagnostic,
@@ -5265,8 +5243,9 @@ mod tests {
         assert_eq!(outcome.unresolved()[0].id(), task_id(0));
         assert!(matches!(
             outcome.unresolved()[0].reason(),
-            TranslationUnitRejectionReason::InvalidShape { message }
-                if message == "译文数组第 1 项必须是字符串"
+            TranslationUnitRejectionReason::InvalidShape {
+                problem: TranslationAssistantValueError::NonStringItem { item }
+            } if *item == NonZeroUsize::MIN
         ));
         drop(outcome);
     }
@@ -5298,7 +5277,7 @@ mod tests {
         ));
         assert!(matches!(
             invalid_json.unresolved()[0].reason(),
-            TranslationUnitRejectionReason::InvalidShape { .. }
+            TranslationUnitRejectionReason::InvalidResponse
         ));
         assert!(matches!(
             invalid_json.diagnostics(),
@@ -5604,12 +5583,12 @@ mod tests {
                 )
                 .await
                 .expect_err("译前分析与当前源语言模块不匹配必须是技术错误");
-        let TranslationTaskResponseProcessingError::LanguageModule(source) = &mismatch_error else {
+        let TranslationTaskResponseProcessingError::LanguageModule { source, .. } = &mismatch_error
+        else {
             panic!("应返回语言模块错配");
         };
-        let detail = source.safe_diagnostic_detail();
-        assert!(detail.contains("expected=EnglishLanguageModule"));
-        assert!(detail.contains("actual=JapaneseLanguageModule"));
+        assert_eq!(source.expected(), LanguageModuleKind::English);
+        assert_eq!(source.actual(), LanguageModuleKind::Japanese);
 
         let invariant_error = processor
             .process(
@@ -5659,6 +5638,15 @@ mod tests {
                 .pop_front()
                 .expect("测试应准备足够响应")
         }
+
+        fn request_diagnostic(
+            &self,
+            _client: &Self::Client,
+            _source: &Self::Error,
+            retry_after: Option<Duration>,
+        ) -> crate::diagnostic::Diagnostic {
+            fake_request_diagnostic(retry_after)
+        }
     }
 
     #[derive(Clone)]
@@ -5677,6 +5665,15 @@ mod tests {
         ) -> Result<LlmResponse, LlmRequestError<Self::Error>> {
             self.cancellation.request();
             Err(LlmRequestError::Fatal(FakeError("cancelled-wait")))
+        }
+
+        fn request_diagnostic(
+            &self,
+            _client: &Self::Client,
+            _source: &Self::Error,
+            retry_after: Option<Duration>,
+        ) -> crate::diagnostic::Diagnostic {
+            fake_request_diagnostic(retry_after)
         }
     }
 
@@ -5847,10 +5844,10 @@ mod tests {
             .expect("取消必须立即打断 Retry-After 等待")
             .expect("Executor 任务不应 panic");
         let failure = result.expect_err("等待期间取消必须返回已取消执行证据");
-        let (source, evidence, diagnostic, cancelled) = failure.into_parts();
+        let (source, evidence, diagnostic, cancelled) = split_execution_failure(failure);
         assert!(matches!(
             source,
-            RpgMakerTranslationTaskExecutionError::RetryWaitCancelled { attempt: 1 }
+            RpgMakerTranslationTaskExecutionError::LlmRequestCancelled { attempt: 1 }
         ));
         assert!(cancelled);
         assert!(diagnostic.is_none());
@@ -5884,18 +5881,19 @@ mod tests {
         let failure = RpgMakerTranslationTaskExecutor::execute(&service, &profile, &task)
             .await
             .expect_err("等待 LLM 本地入场时的合作取消必须返回取消终态");
-        let (source, evidence, diagnostic, cancelled) = failure.into_parts();
+        let (source, evidence, diagnostic, cancelled) = split_execution_failure(failure);
 
         assert!(matches!(
             source,
-            RpgMakerTranslationTaskExecutionError::FatalRequest {
-                attempt: 1,
-                source: FakeError("cancelled-wait"),
-            }
+            RpgMakerTranslationTaskExecutionError::LlmRequestCancelled { attempt: 1 }
         ));
         assert_eq!(evidence.attempt_count(), 1);
         assert!(diagnostic.is_none());
         assert!(cancelled);
+        assert!(
+            !evidence.has_cancelled_retry_wait(),
+            "等待 LLM 本地入场的取消不得伪装成 Retry-After 等待"
+        );
     }
 
     #[tokio::test]
@@ -5929,7 +5927,7 @@ mod tests {
         let failure = RpgMakerTranslationTaskExecutor::execute(&service, &profile, &task)
             .await
             .expect_err("等待响应 CPU 入场时的合作取消必须返回取消终态");
-        let (source, evidence, diagnostic, cancelled) = failure.into_parts();
+        let (source, evidence, diagnostic, cancelled) = split_execution_failure(failure);
 
         assert!(matches!(
             source,
@@ -5993,7 +5991,7 @@ mod tests {
         let failure = RpgMakerTranslationTaskExecutor::execute(&service, &profile, &task)
             .await
             .expect_err("已经进入 CPU 的响应处理必须观察共享取消");
-        let (source, evidence, diagnostic, cancelled) = failure.into_parts();
+        let (source, evidence, diagnostic, cancelled) = split_execution_failure(failure);
 
         assert!(matches!(
             source,
@@ -6043,7 +6041,7 @@ mod tests {
         let failure = RpgMakerTranslationTaskExecutor::execute(&service, &profile, &task)
             .await
             .expect_err("解析后的任务语言对不一致必须返回技术失败");
-        let (source, evidence, _diagnostic, cancelled) = failure.into_parts();
+        let (source, evidence, _diagnostic, cancelled) = split_execution_failure(failure);
 
         assert!(matches!(
             source,
@@ -6254,31 +6252,32 @@ mod tests {
                 ) => {}
                 (_, status) => panic!("意外任务状态：{status:?}"),
             }
-            let diagnostic = outcome
-                .request_diagnostic()
-                .expect("重试耗尽必须保留具体安全诊断");
+            let diagnostic = match &outcome {
+                TranslationTaskOutcome::Unavailable {
+                    reason:
+                        TranslationTaskUnavailableReason::RecoverableRequestExhausted { diagnostic }
+                        | TranslationTaskUnavailableReason::RetryAfterExceedsConfiguredMaximum {
+                            diagnostic,
+                            ..
+                        },
+                    ..
+                } => diagnostic,
+                _ => unreachable!("上方已经确认这是带请求诊断的 Unavailable 结果"),
+            };
+            assert_eq!(diagnostic.primary().code(), "http.status");
+            assert_eq!(diagnostic.effect(), StateEffect::ProgressPreserved);
+            let value = serde_json::to_value(diagnostic).expect("任务诊断应可序列化");
+            let details = &value["primary"]["issue"]["details"];
+            assert_eq!(details["status"], 503);
             assert_eq!(
-                diagnostic.code,
-                crate::diagnostic::DiagnosticCode::ModelRequest
+                details["retry_after_seconds"],
+                (expected_status == "retry-after")
+                    .then_some(3)
+                    .map_or(serde_json::Value::Null, serde_json::Value::from)
             );
-            assert_eq!(
-                diagnostic.stage,
-                crate::diagnostic::DiagnosticStage::ModelRequest
-            );
-            assert_eq!(diagnostic.impact, DiagnosticImpact::ProgressPreserved);
-            assert!(matches!(
-                &diagnostic.reason,
-                crate::diagnostic::DiagnosticReason::Http {
-                    status: Some(503),
-                    retry_after_seconds,
-                    provider_code: Some(code),
-                    provider_type: Some(kind),
-                    provider_message: None,
-                } if *retry_after_seconds
-                    == (expected_status == "retry-after").then_some(3)
-                    && code == "temporarily_unavailable"
-                    && kind == "service_error"
-            ));
+            assert_eq!(details["provider_code"], "temporarily_unavailable");
+            assert_eq!(details["provider_type"], "service_error");
+            assert!(details["provider_message"].is_null());
             let serialized = serde_json::to_string(diagnostic).expect("任务诊断应可序列化");
             assert!(
                 !serialized.contains("busy"),

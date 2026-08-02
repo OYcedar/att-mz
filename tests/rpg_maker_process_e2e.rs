@@ -451,6 +451,152 @@ fn mz_partial_retry_reuses_the_complete_task_block_across_real_processes() {
 }
 
 #[test]
+fn mz_translate_keeps_applied_translation_when_run_plan_transaction_rolls_back() {
+    let temporary = tempfile::tempdir().expect("应可建立 RunPlan 回滚进程测试目录");
+    let root = temporary.path();
+    let game = root.join("mz-game");
+    write_minimal_mz_game(&game);
+    write_translation_prompt(root);
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("本地模型服务端口应可绑定");
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().expect("本地模型地址应可读取")
+    );
+    write_configuration(root, &endpoint);
+
+    let project = "run-plan-rollback";
+    let mut init = init_arguments("mz", &game);
+    let name_position = init
+        .iter()
+        .position(|value| value == "--name")
+        .expect("Init 参数必须包含项目名");
+    init[name_position + 1] = project.into();
+    assert_success("RunPlan 回滚 MZ Init", &run_att(root, init));
+    assert_success(
+        "RunPlan 回滚 MZ Extract",
+        &run_att(
+            root,
+            arguments(&["mz", "extract", "--name", project, "--builtin"]),
+        ),
+    );
+
+    let workspace = distribution_root(root).join("projects/mz").join(project);
+    let database = workspace.join("project.db");
+    let logs = workspace.join("logs");
+    let logs_before = fs::read_dir(&logs)
+        .expect("Translate 前日志目录应可读取")
+        .map(|entry| entry.expect("Translate 前日志项应可读取").path())
+        .collect::<Vec<_>>();
+    let server_database = database.clone();
+    let server = thread::spawn(move || {
+        serve_translation_after_installing_run_plan_rollback(listener, &server_database)
+    });
+
+    let translate = run_att(
+        root,
+        arguments(&["mz", "translate", "--name", project, "local"]),
+    );
+    server
+        .join()
+        .expect("RunPlan 回滚服务线程不得 panic")
+        .expect("RunPlan 回滚服务必须完成请求并安装触发器");
+    assert_eq!(
+        translate.status.code(),
+        Some(1),
+        "RunPlan 未保存必须保留独立失败退出语义\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&translate.stdout),
+        String::from_utf8_lossy(&translate.stderr)
+    );
+
+    let connection = Connection::open(&database).expect("RunPlan 回滚后数据库应可打开");
+    let translation: Option<String> = connection
+        .query_row(
+            "SELECT translation_content_json
+             FROM rpg_maker_text_unit
+             WHERE translation_content_json IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("业务已提交的译文应可读取");
+    assert_eq!(
+        translation
+            .as_deref()
+            .map(serde_json::from_str::<Value>)
+            .transpose()
+            .expect("已提交译文必须是规范 JSON"),
+        Some(json!(TRANSLATION)),
+        "RunPlan 回滚不得回滚已经确认的翻译业务结果"
+    );
+    let saved_profile_count: i64 = connection
+        .query_row("SELECT count(*) FROM translate_run_plan", [], |row| {
+            row.get(0)
+        })
+        .expect("Translate RunPlan 行数应可读取");
+    assert_eq!(saved_profile_count, 0, "回滚后不得保存本次 Profile");
+    connection
+        .execute_batch("DROP TRIGGER att_e2e_reject_translate_run_plan")
+        .expect("测试触发器应可清理");
+    drop(connection);
+
+    let new_logs = fs::read_dir(&logs)
+        .expect("Translate 后日志目录应可读取")
+        .map(|entry| entry.expect("Translate 后日志项应可读取").path())
+        .filter(|path| !logs_before.contains(path))
+        .collect::<Vec<_>>();
+    assert_eq!(new_logs.len(), 1, "一次 Translate 只能新增一份项目日志");
+    let records = read_project_log_records(&new_logs[0]);
+    let translation_finished = records
+        .iter()
+        .position(|record| {
+            record["code"] == "translation.finished"
+                && record["payload"]["result"]["kind"] == "complete"
+        })
+        .expect("RunPlan 保存前必须先记录完整翻译业务终态");
+    let run_plan_diagnostic = records
+        .iter()
+        .position(|record| record["code"] == "diagnostic.run_plan")
+        .expect("RunPlan 回滚必须形成独立 occurrence");
+    let diagnostic = records[run_plan_diagnostic]["payload"]["id"]
+        .as_u64()
+        .expect("RunPlan occurrence ID 必须为正整数");
+    assert!(
+        translation_finished < run_plan_diagnostic,
+        "翻译业务终态必须先于 RunPlan 持久化失败"
+    );
+    assert_eq!(
+        records[run_plan_diagnostic]["payload"]["report"]["effect"],
+        "applied_run_plan_not_saved"
+    );
+    assert_eq!(
+        records[run_plan_diagnostic]["payload"]["report"]["primary"]["stage"],
+        "run_plan_finalization"
+    );
+    assert_eq!(
+        records[run_plan_diagnostic]["payload"]["report"]["primary"]["issue"]["family"],
+        "sqlite"
+    );
+    let finalized = records
+        .iter()
+        .find(|record| record["code"] == "run_plan.finalized")
+        .expect("RunPlan 回滚必须写入最终化事件");
+    assert_eq!(finalized["payload"]["result"]["kind"], "not_saved");
+    assert_eq!(finalized["payload"]["result"]["transaction"], "rolled_back");
+    assert_eq!(finalized["payload"]["result"]["run_continues"], false);
+    assert_eq!(finalized["payload"]["result"]["diagnostic"], diagnostic);
+    assert!(
+        records.iter().all(|record| {
+            !(record["code"] == "run_plan.finalized"
+                && record["payload"]["result"]["kind"] == "saved")
+        }),
+        "回滚路径不得同时伪报 RunPlan 已保存"
+    );
+    let terminal = records.last().expect("运行日志必须有唯一终态");
+    assert_eq!(terminal["code"], "run.finished");
+    assert_eq!(terminal["payload"]["result"]["kind"], "failed");
+}
+
+#[test]
 fn generic_partial_retry_reuses_the_complete_task_block_across_real_processes() {
     let temporary = tempfile::tempdir().expect("应可建立 Generic Partial 重试端到端测试目录");
     let root = temporary.path();
@@ -694,10 +840,16 @@ fn generic_source_placeholder_failure_sends_no_incomplete_task_block() {
     );
     let stderr = String::from_utf8(output.stderr).expect("Generic 失败诊断必须是 UTF-8");
     for expected in [
-        "建立 Generic 翻译计划",
-        "必要前置条件未满足",
+        "translation.placeholder.overlapping_matches",
+        "relative_path=story.jsonl",
+        "group_id=scene",
+        "unit_id=broken",
+        "first_rule_number=1",
+        "second_rule_number=2",
+        "first_range=19..25",
+        "second_range=19..25",
         "状态未改变",
-        "修正指出的输入后重试",
+        "修正指出的 Placeholder 规则后重试",
     ] {
         assert!(
             stderr.contains(expected),
@@ -772,16 +924,16 @@ fn task_record_write_failure_warns_once_without_changing_translate_success() {
                 .map(|line| serde_json::from_str::<Value>(line).expect("日志行应为 JSON"))
                 .collect::<Vec<_>>()
         })
-        .filter(|record| record["code"] == "observability.task_record_failed")
+        .filter(|record| record["code"] == "diagnostic.task_record")
         .collect::<Vec<_>>();
     assert!(
         !task_record_failures.is_empty(),
         "任务记录故障必须写入 Translate 的同 RunId JSONL"
     );
     assert!(task_record_failures.iter().all(|record| {
-        record["command"] == "translate"
+        record["context"]["command"] == "translate"
             && record["level"] == "warn"
-            && record["payload"]["diagnostic"]["stage"] == "logging"
+            && record["payload"]["report"]["primary"]["stage"] == "logging"
     }));
 }
 
@@ -1322,8 +1474,8 @@ fn generic_lua_syntax_failure_is_logged_and_reported_before_project_open() {
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8(output.stderr).expect("stderr 必须是 UTF-8");
     assert!(
-        stderr.contains("near '='"),
-        "语法诊断必须保留 Lua 编译器给出的具体原因：{stderr}"
+        stderr.contains("lua.compilation") && !stderr.contains("near '='"),
+        "语法诊断必须显示稳定 Lua 编译代码，且不得泄露后端动态正文：{stderr}"
     );
 
     let logs = distribution_root(root)
@@ -1364,21 +1516,23 @@ fn generic_lua_syntax_failure_is_logged_and_reported_before_project_open() {
     }
     let failure = records
         .iter()
-        .find(|record| record["code"] == "failure.reported")
+        .find(|record| record["code"] == "diagnostic.run")
         .expect("语法失败日志必须保存主错误");
     assert_eq!(
-        failure["payload"]["diagnostic"]["reason"]["kind"],
-        "failure_with_detail"
+        failure["payload"]["report"]["primary"]["code"],
+        "lua.compilation"
     );
-    assert!(
-        failure["payload"]["diagnostic"]["reason"]["detail"]
-            .as_str()
-            .is_some_and(|detail| detail.contains("near '='")),
-        "日志诊断必须保留同一份 Lua 编译原因"
+    assert_eq!(
+        failure["payload"]["report"]["primary"]["issue"]["family"],
+        "lua"
+    );
+    assert_eq!(
+        failure["payload"]["report"]["primary"]["issue"]["details"]["problem"]["kind"],
+        "compilation"
     );
     assert!(
         records.iter().any(|record| {
-            record["code"] == "run.finished" && record["payload"]["outcome"] == "failed"
+            record["code"] == "run.finished" && record["payload"]["result"]["kind"] == "failed"
         }),
         "语法失败日志必须写入明确终态"
     );
@@ -1473,9 +1627,12 @@ fn mv_lua_clear_trusts_unchanged_current_with_additional_custom_placeholder_byte
     let connection = Connection::open(&database).expect("MV 项目数据库应可打开");
     let mut statement = connection
         .prepare(
-            "SELECT owner, group_location, unit_role, source_content_json
-             FROM rpg_maker_text_unit
-             ORDER BY owner, group_location, unit_role",
+            "SELECT unit.owner, text_group.group_location, unit.unit_role, unit.source_content_json
+             FROM rpg_maker_text_unit AS unit
+             JOIN rpg_maker_text_group AS text_group
+               ON text_group.owner = unit.owner
+              AND text_group.group_id = unit.group_id
+             ORDER BY unit.owner, text_group.group_location, unit.unit_role",
         )
         .expect("MV Unit locator 查询应可准备");
     let placeholder_units = statement
@@ -1542,7 +1699,12 @@ fn mv_lua_clear_trusts_unchanged_current_with_additional_custom_placeholder_byte
         .query_row(
             "SELECT translation_content_json, translation_state
              FROM rpg_maker_text_unit
-             WHERE owner = ?1 AND group_location = ?2 AND unit_role = ?3",
+             WHERE owner = ?1
+               AND group_id = (
+                   SELECT group_id FROM rpg_maker_text_group
+                   WHERE owner = ?1 AND group_location = ?2
+               )
+               AND unit_role = ?3",
             (
                 corrupted_owner,
                 corrupted_group_location,
@@ -1566,7 +1728,12 @@ fn mv_lua_clear_trusts_unchanged_current_with_additional_custom_placeholder_byte
             .execute(
                 "UPDATE rpg_maker_text_unit
                  SET translation_content_json = ?1
-                 WHERE owner = ?2 AND group_location = ?3 AND unit_role = ?4",
+                 WHERE owner = ?2
+                   AND group_id = (
+                       SELECT group_id FROM rpg_maker_text_group
+                       WHERE owner = ?2 AND group_location = ?3
+                   )
+                   AND unit_role = ?4",
                 (
                     &translation_with_additional_lf,
                     corrupted_owner,
@@ -1581,7 +1748,12 @@ fn mv_lua_clear_trusts_unchanged_current_with_additional_custom_placeholder_byte
         .query_row(
             "SELECT translation_content_json, translation_state
              FROM rpg_maker_text_unit
-             WHERE owner = ?1 AND group_location = ?2 AND unit_role = ?3",
+             WHERE owner = ?1
+               AND group_id = (
+                   SELECT group_id FROM rpg_maker_text_group
+                   WHERE owner = ?1 AND group_location = ?2
+               )
+               AND unit_role = ?3",
             (
                 corrupted_owner,
                 corrupted_group_location,
@@ -1631,7 +1803,12 @@ fn mv_lua_clear_trusts_unchanged_current_with_additional_custom_placeholder_byte
         .query_row(
             "SELECT translation_content_json, translation_state
              FROM rpg_maker_text_unit
-             WHERE owner = ?1 AND group_location = ?2 AND unit_role = ?3",
+             WHERE owner = ?1
+               AND group_id = (
+                   SELECT group_id FROM rpg_maker_text_group
+                   WHERE owner = ?1 AND group_location = ?2
+               )
+               AND unit_role = ?3",
             (first_owner, first_group_location, first_unit_role),
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -1641,7 +1818,12 @@ fn mv_lua_clear_trusts_unchanged_current_with_additional_custom_placeholder_byte
         .query_row(
             "SELECT translation_content_json, translation_state
              FROM rpg_maker_text_unit
-             WHERE owner = ?1 AND group_location = ?2 AND unit_role = ?3",
+             WHERE owner = ?1
+               AND group_id = (
+                   SELECT group_id FROM rpg_maker_text_group
+                   WHERE owner = ?1 AND group_location = ?2
+               )
+               AND unit_role = ?3",
             (
                 corrupted_owner,
                 corrupted_group_location,
@@ -1669,10 +1851,13 @@ fn mv_lua_clear_trusts_unchanged_current_with_additional_custom_placeholder_byte
         &clear_script,
         r#"local expected = assert(tonumber(arg[1]), "missing expected count")
 local rows = ctx.db.query([=[
-SELECT owner, group_location, unit_role
-FROM rpg_maker_text_unit
-WHERE translation_content_json IS NOT NULL OR translation_state IS NOT NULL
-ORDER BY owner, group_location, unit_role
+SELECT unit.owner, text_group.group_location, unit.unit_role
+FROM rpg_maker_text_unit AS unit
+JOIN rpg_maker_text_group AS text_group
+  ON text_group.owner = unit.owner
+ AND text_group.group_id = unit.group_id
+WHERE unit.translation_content_json IS NOT NULL OR unit.translation_state IS NOT NULL
+ORDER BY unit.owner, text_group.group_location, unit.unit_role
 ]=])
 assert(#rows == expected, "Current count changed before clear")
 print("selected Current", #rows)
@@ -1791,7 +1976,7 @@ print("remaining Current", remaining)
     let succeeded = records
         .iter()
         .position(|record| {
-            record["code"] == "run.finished" && record["payload"]["outcome"] == "succeeded"
+            record["code"] == "run.finished" && record["payload"]["result"]["kind"] == "succeeded"
         })
         .expect("成功运行必须记录 succeeded 终态");
     assert_eq!(
@@ -1801,8 +1986,11 @@ print("remaining Current", remaining)
     );
     assert!(
         records[..succeeded].iter().all(|record| {
-            record["code"] != "failure.reported"
-                && !(record["code"] == "run.finished" && record["payload"]["outcome"] == "failed")
+            !record["code"]
+                .as_str()
+                .is_some_and(|code| code.starts_with("diagnostic."))
+                && !(record["code"] == "run.finished"
+                    && record["payload"]["result"]["kind"] == "failed")
         }),
         "成功终态之前不得伪报失败"
     );
@@ -2067,7 +2255,7 @@ fn read_task_records_sharing_log_run_ids(workspace: &Path) -> Vec<(OsString, Str
             assert!(
                 log.lines().any(|line| {
                     serde_json::from_str::<Value>(line)
-                        .is_ok_and(|record| record["command"] == "translate")
+                        .is_ok_and(|record| record["context"]["command"] == "translate")
                 }),
                 "同 RunId 项目日志必须属于 Translate"
             );
@@ -2307,7 +2495,7 @@ fn read_owner_units(database: &Path, owner: &str) -> Vec<(Value, Option<Value>)>
              FROM rpg_maker_text_unit AS unit
              JOIN rpg_maker_text_group AS group_row
                ON group_row.owner = unit.owner
-              AND group_row.group_location = unit.group_location
+              AND group_row.group_id = unit.group_id
              WHERE unit.owner = ?1
              ORDER BY group_row.semantic_order_key, unit.semantic_order_key",
         )
@@ -2355,8 +2543,42 @@ fn read_items(path: &Path) -> Value {
     .expect("Items.json 必须是有效 JSON")
 }
 
+fn read_project_log_records(path: &Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("{} 应可读取：{error}", path.display()))
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("项目日志行必须是 JSON object"))
+        .collect()
+}
+
 fn serve_one_translation(listener: TcpListener) -> Result<Value, String> {
     serve_one_response(listener, json!({ "0": [TRANSLATION] }))
+}
+
+fn serve_translation_after_installing_run_plan_rollback(
+    listener: TcpListener,
+    database: &Path,
+) -> Result<Value, String> {
+    let (mut stream, request) = accept_request(listener)?;
+    let connection = Connection::open(database)
+        .map_err(|error| format!("打开 RunPlan 回滚测试数据库失败：{error}"))?;
+    connection
+        .execute_batch(
+            "CREATE TRIGGER att_e2e_reject_translate_run_plan
+             BEFORE INSERT ON translate_run_plan
+             BEGIN
+               SELECT RAISE(ABORT, 'run plan rollback e2e');
+             END;",
+        )
+        .map_err(|error| format!("安装 RunPlan 回滚测试触发器失败：{error}"))?;
+    drop(connection);
+    let content = serde_json::to_string(&json!({
+        "think": THINKING_SENTINEL,
+        "translations": { "0": [TRANSLATION] }
+    }))
+    .map_err(|error| error.to_string())?;
+    write_chat_response(&mut stream, &content)?;
+    Ok(request)
 }
 
 fn serve_one_generic_translation(

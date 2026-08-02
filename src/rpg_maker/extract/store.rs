@@ -6,6 +6,7 @@
 use std::error::Error;
 use std::future::Future;
 
+use crate::diagnostic::{DiagnosticReport, RpgMakerDiagnosticOwner};
 use crate::rpg_maker::dialogue::MvDialogueDefinition;
 use crate::rpg_maker::project::OpenedProject;
 
@@ -14,6 +15,14 @@ use super::model::{BuiltinSnapshot, RulesSnapshot};
 pub(crate) mod asset_store;
 #[cfg(test)]
 pub(crate) use asset_store::RpgMakerExtractionAssetStoreError;
+
+/// Store 在仍持有 SQLite、编码和事务事实时建立公开报告。
+pub(crate) trait RpgMakerExtractionStoreDiagnostic {
+    fn extraction_store_diagnostic_report(
+        &self,
+        owner: RpgMakerDiagnosticOwner,
+    ) -> DiagnosticReport;
+}
 
 /// Builtin 快照与 MV 对话定义在同一事务中的更新意图。
 ///

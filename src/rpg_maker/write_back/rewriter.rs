@@ -16,8 +16,10 @@ use super::planner::{
     SetTextMutation,
 };
 use crate::diagnostic::{
-    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
-    DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
+    Diagnostic, DiagnosticReport, FileSystemOrdinalKeyPhase, IoFailure, ReportedFailure,
+    RpgMakerComputeFailure, RpgMakerDocumentConsumer, RpgMakerIssue, RpgMakerJsonFailureKind,
+    RpgMakerWriteBackDocumentRewriteProblem, RpgMakerWriteBackMutationViolation, SafePath,
+    StateEffect,
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::json::{
@@ -39,6 +41,7 @@ use crate::rpg_maker::structured_path::{
     value_at_plain_steps_mut as shared_value_at_plain_steps_mut,
 };
 use crate::rpg_maker::text::{RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource};
+use crate::runtime::cpu::CpuExecutorUnavailable;
 use crate::windows_path::{WindowsOrdinalCaseKey, WindowsOrdinalCaseKeyError};
 
 /// 一个已经完成安全相对路径校验的完整文件替换。
@@ -365,12 +368,17 @@ impl MutableDocuments {
         location: &RpgMakerLocation,
     ) -> Result<(&mut Value, RpgMakerDocumentId), RpgMakerWriteBackDocumentRewriteFailure> {
         let id = document_id(source).ok_or_else(|| {
-            mutation_failure(location, "插件参数位置不能作为 RPG Maker JSON 文档地址")
+            mutation_failure(
+                location,
+                WriteBackMutationViolation::PluginParameterAsDocument,
+            )
         })?;
-        let document = self
-            .documents
-            .get_mut(&id)
-            .ok_or_else(|| mutation_failure(location, "文档读取器没有返回 Mutation 请求的文档"))?;
+        let document = self.documents.get_mut(&id).ok_or_else(|| {
+            mutation_failure(
+                location,
+                WriteBackMutationViolation::RequestedDocumentMissing,
+            )
+        })?;
         Ok((&mut *document, id))
     }
 
@@ -519,7 +527,10 @@ fn prepare_rewrite_jobs(
         let documents = match key {
             PhysicalDocumentKey::Json(id) => {
                 let value = json_documents.remove(&id).ok_or_else(|| {
-                    mutation_failure(representative, "文档读取器没有返回 Mutation 请求的文档")
+                    mutation_failure(
+                        representative,
+                        WriteBackMutationViolation::RequestedDocumentMissing,
+                    )
                 })?;
                 MutableDocuments::from_document(id, value)
             }
@@ -580,7 +591,7 @@ fn mutation_document_key(
         if physical_document_key(other.source()) != key {
             return Err(mutation_failure(
                 other,
-                "一项原子 Mutation 跨越了不同物理文档",
+                WriteBackMutationViolation::CrossDocumentMutation,
             ));
         }
     }
@@ -628,7 +639,7 @@ fn validate_structural_conflicts(
         if pair[0].0 == pair[1].0 {
             return Err(mutation_failure(
                 pair[0].1,
-                "两个结构修改指向同一冻结事件命令",
+                WriteBackMutationViolation::DuplicateStructuralTarget,
             ));
         }
     }
@@ -768,15 +779,18 @@ fn apply_structural_operations(
         if has_decode_boundary {
             return Err(mutation_failure(
                 &representative,
-                "事件容器路径不能包含 DecodeJsonString",
+                WriteBackMutationViolation::DecodeBoundaryInEventContainer,
             ));
         }
 
         let (document, id) = documents.document_mut(&key.source, &representative)?;
         edit_value_at_steps(document, &key.steps, &representative, |value| {
-            let list = value
-                .as_array_mut()
-                .ok_or_else(|| mutation_failure(&representative, "事件 list 位置不是数组"))?;
+            let list = value.as_array_mut().ok_or_else(|| {
+                mutation_failure(
+                    &representative,
+                    WriteBackMutationViolation::EventListNotArray,
+                )
+            })?;
             let mut replacements = Vec::<StructuralReplacement>::with_capacity(operations.len());
             for operation in operations {
                 let operation_location = operation.location().clone();
@@ -793,7 +807,7 @@ fn apply_structural_operations(
                 {
                     return Err(mutation_failure(
                         &operation_location,
-                        "两个结构修改的冻结命令范围发生重叠",
+                        WriteBackMutationViolation::OverlappingFrozenRanges,
                     ));
                 }
                 replacements.push(replacement);
@@ -976,7 +990,7 @@ fn apply_decoded_json_mutations(
     let location = representative.mutation.exact_location();
     let raw = container.as_str().ok_or_else(|| IndexedMutationFailure {
         ordinal: representative.ordinal,
-        source: mutation_failure(location, "DecodeJsonString 的目标不是字符串"),
+        source: mutation_failure(location, WriteBackMutationViolation::DecodeTargetNotString),
     })?;
     let decoded = decode_nested_json(raw, location).map_err(|source| IndexedMutationFailure {
         ordinal: representative.ordinal,
@@ -1076,7 +1090,7 @@ fn apply_mutations_within_decoded_value(
                                 ordinal: representative.ordinal,
                                 source: mutation_failure(
                                     &location,
-                                    "DecodeJsonString 的目标不是字符串",
+                                    WriteBackMutationViolation::DecodeTargetNotString,
                                 ),
                             })
                             .and_then(|raw| {
@@ -1231,27 +1245,35 @@ fn plugin_parameter_mut<'a>(
     let Some((stored_index, fields)) = plugins.get_mut(plugin_index) else {
         return Err(mutation_failure(
             location,
-            "plugins.js 中不存在指定插件索引",
+            WriteBackMutationViolation::PluginIndexMissing,
         ));
     };
     if *stored_index != plugin_index {
-        return Err(mutation_failure(location, "插件记录索引与数组位置不一致"));
+        return Err(mutation_failure(
+            location,
+            WriteBackMutationViolation::PluginIndexMismatch,
+        ));
     }
     let actual_name = fields.get("name").and_then(Value::as_str);
     if actual_name != Some(plugin_name) {
         return Err(mutation_failure(
             location,
-            "插件索引处的 name 与结构化位置不一致",
+            WriteBackMutationViolation::PluginNameMismatch,
         ));
     }
     let parameters = fields
         .as_object_mut()
         .and_then(|fields| fields.get_mut("parameters"))
         .and_then(Value::as_object_mut)
-        .ok_or_else(|| mutation_failure(location, "插件记录的 parameters 不是对象"))?;
-    parameters
-        .get_mut(parameter_name)
-        .ok_or_else(|| mutation_failure(location, "插件参数名在指定插件记录中不存在"))
+        .ok_or_else(|| {
+            mutation_failure(
+                location,
+                WriteBackMutationViolation::PluginParametersNotObject,
+            )
+        })?;
+    parameters.get_mut(parameter_name).ok_or_else(|| {
+        mutation_failure(location, WriteBackMutationViolation::PluginParameterMissing)
+    })
 }
 
 fn replace_string_at(
@@ -1262,13 +1284,13 @@ fn replace_string_at(
     location: &RpgMakerLocation,
 ) -> Result<(), RpgMakerWriteBackDocumentRewriteFailure> {
     edit_value_at_steps(value, steps, location, |value| {
-        let actual = value
-            .as_str()
-            .ok_or_else(|| mutation_failure(location, "目标值不是字符串"))?;
+        let actual = value.as_str().ok_or_else(|| {
+            mutation_failure(location, WriteBackMutationViolation::TargetNotString)
+        })?;
         if actual != expected {
             return Err(mutation_failure(
                 location,
-                "目标字符串与 expected_original 不一致",
+                WriteBackMutationViolation::ExpectedOriginalMismatch,
             ));
         }
         *value = Value::String(replacement.to_owned());
@@ -1386,7 +1408,7 @@ fn rewrite_structured_path_error(
     match error {
         StructuredPathError::Access(error) => structured_path_access_failure(error, location),
         StructuredPathError::ExpectedEncodedJsonString => {
-            mutation_failure(location, "DecodeJsonString 的目标不是字符串")
+            mutation_failure(location, WriteBackMutationViolation::DecodeTargetNotString)
         }
         StructuredPathError::Decode(source) | StructuredPathError::Encode(source) => source,
     }
@@ -1398,14 +1420,21 @@ fn structured_path_access_failure(
 ) -> RpgMakerWriteBackDocumentRewriteFailure {
     match error {
         StructuredPathAccessError::ExpectedObject | StructuredPathAccessError::MissingObjectKey => {
-            mutation_failure(location, "对象路径不存在或父值不是对象")
+            mutation_failure(
+                location,
+                WriteBackMutationViolation::ObjectPathMissingOrWrongType,
+            )
         }
         StructuredPathAccessError::ExpectedArray | StructuredPathAccessError::MissingArrayIndex => {
-            mutation_failure(location, "数组路径越界或父值不是数组")
+            mutation_failure(
+                location,
+                WriteBackMutationViolation::ArrayPathMissingOrWrongType,
+            )
         }
-        StructuredPathAccessError::UnexpectedDecodeBoundary => {
-            mutation_failure(location, "普通路径片段意外包含 DecodeJsonString")
-        }
+        StructuredPathAccessError::UnexpectedDecodeBoundary => mutation_failure(
+            location,
+            WriteBackMutationViolation::UnexpectedDecodeBoundary,
+        ),
     }
 }
 
@@ -1415,10 +1444,16 @@ fn structural_key(
     location: &RpgMakerLocation,
 ) -> Result<StructuralKey, RpgMakerWriteBackDocumentRewriteFailure> {
     let Some((last, list_steps)) = steps.split_last() else {
-        return Err(mutation_failure(location, "事件命令位置缺少数组索引"));
+        return Err(mutation_failure(
+            location,
+            WriteBackMutationViolation::MissingCommandArrayIndex,
+        ));
     };
     let RpgMakerLocationStep::ArrayIndex(start_index) = last else {
-        return Err(mutation_failure(location, "事件命令位置末步不是数组索引"));
+        return Err(mutation_failure(
+            location,
+            WriteBackMutationViolation::CommandPathNotArrayIndex,
+        ));
     };
     Ok(StructuralKey {
         source: source.clone(),
@@ -1457,11 +1492,14 @@ fn apply_choices_mutation(
     let key = structural_key(source, steps, location)?;
     let (document, id) = documents.document_mut(source, location)?;
     let list = event_list_mut(document, &key.list_steps, location)?;
-    let header = list
-        .get(key.start_index)
-        .ok_or_else(|| mutation_failure(location, "选项起始命令索引越界"))?;
+    let header = list.get(key.start_index).ok_or_else(|| {
+        mutation_failure(location, WriteBackMutationViolation::ChoiceStartOutOfBounds)
+    })?;
     if command_code(header, location)? != 102 {
-        return Err(mutation_failure(location, "选项起始命令不是 102"));
+        return Err(mutation_failure(
+            location,
+            WriteBackMutationViolation::ChoiceStartNot102,
+        ));
     }
     let header_indent = command_indent(header, location)?;
     let current_choices = command_parameter_array(header, 0, location)?;
@@ -1473,7 +1511,7 @@ fn apply_choices_mutation(
     {
         return Err(mutation_failure(
             location,
-            "冻结 102.parameters[0] 与选项原文不一致",
+            WriteBackMutationViolation::FrozenChoicesMismatch,
         ));
     }
 
@@ -1494,12 +1532,11 @@ fn apply_choices_mutation(
                 .and_then(Value::as_u64)
                 .and_then(|value| usize::try_from(value).ok())
                 .ok_or_else(|| {
-                    mutation_failure(location, "同层 402.parameters[0] 不是有效选项索引")
+                    mutation_failure(location, WriteBackMutationViolation::InvalidChoiceIndex)
                 })?;
-            let label = parameters
-                .get(1)
-                .and_then(Value::as_str)
-                .ok_or_else(|| mutation_failure(location, "同层 402.parameters[1] 不是字符串"))?;
+            let label = parameters.get(1).and_then(Value::as_str).ok_or_else(|| {
+                mutation_failure(location, WriteBackMutationViolation::ChoiceLabelNotString)
+            })?;
             if mutation
                 .source_lines()
                 .get(choice_index)
@@ -1508,22 +1545,31 @@ fn apply_choices_mutation(
             {
                 return Err(mutation_failure(
                     location,
-                    "同层 402 标签与冻结 102 选项不一致",
+                    WriteBackMutationViolation::ChoiceLabelMismatch,
                 ));
             }
             if branches.insert(choice_index, command_index).is_some() {
-                return Err(mutation_failure(location, "同层 402 重复选项索引"));
+                return Err(mutation_failure(
+                    location,
+                    WriteBackMutationViolation::DuplicateChoiceIndex,
+                ));
             }
         }
         command_index += 1;
     }
     if !found_end {
-        return Err(mutation_failure(location, "选项块缺少同层 404 结束命令"));
+        return Err(mutation_failure(
+            location,
+            WriteBackMutationViolation::MissingChoiceEnd,
+        ));
     }
     if branches.len() != mutation.source_lines().len()
         || (0..mutation.source_lines().len()).any(|index| !branches.contains_key(&index))
     {
-        return Err(mutation_failure(location, "选项块没有完整覆盖全部同层 402"));
+        return Err(mutation_failure(
+            location,
+            WriteBackMutationViolation::IncompleteChoiceCoverage,
+        ));
     }
 
     let mut expected_targets = BTreeSet::new();
@@ -1552,7 +1598,7 @@ fn apply_choices_mutation(
     if actual_targets != expected_targets {
         return Err(mutation_failure(
             location,
-            "选项配方目标与冻结 102/402 块不一致",
+            WriteBackMutationViolation::ChoiceRecipeTargetMismatch,
         ));
     }
 
@@ -1617,27 +1663,33 @@ fn prepare_event_body_replacement(
 ) -> Result<StructuralReplacement, RpgMakerWriteBackDocumentRewriteFailure> {
     let location = mutation.group_location();
     let (header_code, body_code) = (105, 405);
-    let header = list
-        .get(key.start_index)
-        .ok_or_else(|| mutation_failure(location, "事件正文起始命令索引越界"))?;
+    let header = list.get(key.start_index).ok_or_else(|| {
+        mutation_failure(
+            location,
+            WriteBackMutationViolation::EventBodyStartOutOfBounds,
+        )
+    })?;
     if command_code(header, location)? != header_code {
         return Err(mutation_failure(
             location,
-            "事件正文起始命令码与正文类型不一致",
+            WriteBackMutationViolation::EventBodyCodeMismatch,
         ));
     }
 
     let body_start = key.start_index + 1;
     let body_end = body_start + mutation.segments().len();
     if body_end > list.len() {
-        return Err(mutation_failure(location, "事件正文段数超过冻结命令列表"));
+        return Err(mutation_failure(
+            location,
+            WriteBackMutationViolation::EventBodyTooLong,
+        ));
     }
     if let Some(command) = list.get(body_end)
         && command_code(command, location)? == body_code
     {
         return Err(mutation_failure(
             location,
-            "Mutation 没有覆盖完整冻结事件正文块",
+            WriteBackMutationViolation::IncompleteEventBodyCoverage,
         ));
     }
 
@@ -1654,14 +1706,14 @@ fn prepare_event_body_replacement(
         if command_code(command, segment.exact_location())? != body_code {
             return Err(mutation_failure(
                 segment.exact_location(),
-                "冻结正文命令码与 Mutation 类型不一致",
+                WriteBackMutationViolation::FrozenBodyCodeMismatch,
             ));
         }
         let original = command_text(command, body_code, body_code, segment.exact_location())?;
         if original != segment.expected_original() {
             return Err(mutation_failure(
                 segment.exact_location(),
-                "冻结正文与 expected_original 不一致",
+                WriteBackMutationViolation::FrozenBodyMismatch,
             ));
         }
         for line in segment.replacement_lines() {
@@ -1693,26 +1745,38 @@ fn prepare_dialogue_replacement(
     if recipe.group_location() != location {
         return Err(mutation_failure(
             location,
-            "对话 Mutation 与物化配方的组位置不一致",
+            WriteBackMutationViolation::DialogueRecipeLocationMismatch,
         ));
     }
 
-    let header = list
-        .get(key.start_index)
-        .ok_or_else(|| mutation_failure(location, "对话起始命令索引越界"))?;
+    let header = list.get(key.start_index).ok_or_else(|| {
+        mutation_failure(
+            location,
+            WriteBackMutationViolation::DialogueStartOutOfBounds,
+        )
+    })?;
     if command_code(header, location)? != 101 {
-        return Err(mutation_failure(location, "对话起始命令不是 101"));
+        return Err(mutation_failure(
+            location,
+            WriteBackMutationViolation::DialogueStartNot101,
+        ));
     }
 
     let body_start = key.start_index + 1;
     let body_end = body_start + recipe.lines().len();
     if body_end > list.len() {
-        return Err(mutation_failure(location, "对话配方段数超过冻结命令列表"));
+        return Err(mutation_failure(
+            location,
+            WriteBackMutationViolation::DialogueRecipeTooLong,
+        ));
     }
     if let Some(command) = list.get(body_end)
         && command_code(command, location)? == 401
     {
-        return Err(mutation_failure(location, "对话配方没有覆盖完整 401 块"));
+        return Err(mutation_failure(
+            location,
+            WriteBackMutationViolation::IncompleteDialogueCoverage,
+        ));
     }
 
     // 先在局部副本上验证并物化全部目标；任何一步失败都不会修改候选文档。
@@ -1729,7 +1793,7 @@ fn prepare_dialogue_replacement(
         if current != direct_speaker.expected_raw() {
             return Err(mutation_failure(
                 direct_speaker.physical_location(),
-                "冻结 Speaker 与 expected_raw 不一致",
+                WriteBackMutationViolation::FrozenSpeakerMismatch,
             ));
         }
         set_command_parameter_text(
@@ -1755,14 +1819,14 @@ fn prepare_dialogue_replacement(
         if command_code(command, line_recipe.physical_location())? != 401 {
             return Err(mutation_failure(
                 line_recipe.physical_location(),
-                "冻结对话正文命令不是 401",
+                WriteBackMutationViolation::FrozenDialogueCodeMismatch,
             ));
         }
         let current = command_text(command, 401, 401, line_recipe.physical_location())?;
         if current != line_recipe.expected_raw() {
             return Err(mutation_failure(
                 line_recipe.physical_location(),
-                "冻结对话正文与 expected_raw 不一致",
+                WriteBackMutationViolation::FrozenDialogueBodyMismatch,
             ));
         }
     }
@@ -1780,7 +1844,7 @@ fn prepare_dialogue_replacement(
             None if encountered_body => {
                 return Err(mutation_failure(
                     line_recipe.physical_location(),
-                    "对话结构行不能位于正文行之后",
+                    WriteBackMutationViolation::StructureAfterBody,
                 ));
             }
             None => structural_templates.push((line_recipe, command)),
@@ -1805,7 +1869,10 @@ fn prepare_dialogue_replacement(
 
     if let Some(lines) = mutation.body_lines() {
         body_templates.last().ok_or_else(|| {
-            mutation_failure(location, "对话 Mutation 提供正文译文但配方没有 BodyLine")
+            mutation_failure(
+                location,
+                WriteBackMutationViolation::TranslationWithoutBodyRecipe,
+            )
         })?;
         for (output_index, line) in lines.iter().enumerate() {
             let (_, line_recipe, command) = body_templates
@@ -1840,7 +1907,7 @@ fn prepare_dialogue_replacement(
                 .ok_or_else(|| {
                     mutation_failure(
                         line_recipe.physical_location(),
-                        "冻结对话正文不以物化 Speaker shell 开头",
+                        WriteBackMutationViolation::FrozenBodyMissingSpeakerShell,
                     )
                 })?;
             let mut text = render_dialogue_prefix(
@@ -1878,7 +1945,7 @@ fn dialogue_body_index(
     if body_position.is_some_and(|index| index + 1 != parts.len()) {
         return Err(mutation_failure(
             location,
-            "对话 BodyLine 必须是物理行的最后一部分",
+            WriteBackMutationViolation::BodyLineNotLast,
         ));
     }
     Ok(body_position.map(|position| {
@@ -1898,10 +1965,9 @@ fn render_dialogue_prefix(
     for part in parts {
         match part {
             DialogueLinePart::Literal(value) => prefix.push_str(value),
-            DialogueLinePart::SpeakerSlot => prefix.push_str(
-                speaker
-                    .ok_or_else(|| mutation_failure(location, "内嵌 SpeakerSlot 缺少 Speaker"))?,
-            ),
+            DialogueLinePart::SpeakerSlot => prefix.push_str(speaker.ok_or_else(|| {
+                mutation_failure(location, WriteBackMutationViolation::MissingEmbeddedSpeaker)
+            })?),
             DialogueLinePart::BodyLine { .. } => break,
         }
     }
@@ -1924,7 +1990,10 @@ fn validate_dialogue_parameter_location(
         RpgMakerLocationStep::index(parameter_index),
     ]);
     if target_source != source || steps != expected {
-        return Err(mutation_failure(location, "对话参数位置不属于物化的冻结块"));
+        return Err(mutation_failure(
+            location,
+            WriteBackMutationViolation::DialogueParameterOutsideBlock,
+        ));
     }
     Ok(())
 }
@@ -1946,7 +2015,7 @@ fn validate_event_segment_location(
     if segment_source != source || steps != expected {
         return Err(mutation_failure(
             location,
-            "事件正文段位置不属于指定冻结正文块",
+            WriteBackMutationViolation::EventBodySegmentOutsideBlock,
         ));
     }
     Ok(())
@@ -1959,7 +2028,7 @@ fn event_list_mut<'a>(
 ) -> Result<&'a mut Vec<Value>, RpgMakerWriteBackDocumentRewriteFailure> {
     value_at_structural_steps_mut(document, list_steps, location)?
         .as_array_mut()
-        .ok_or_else(|| mutation_failure(location, "事件 list 位置不是数组"))
+        .ok_or_else(|| mutation_failure(location, WriteBackMutationViolation::EventListNotArray))
 }
 
 fn value_at_structural_steps_mut<'a>(
@@ -1972,15 +2041,25 @@ fn value_at_structural_steps_mut<'a>(
             RpgMakerLocationStep::ObjectKey(key) => value
                 .as_object_mut()
                 .and_then(|object| object.get_mut(key))
-                .ok_or_else(|| mutation_failure(location, "结构路径对象字段不存在"))?,
+                .ok_or_else(|| {
+                    mutation_failure(
+                        location,
+                        WriteBackMutationViolation::StructuralObjectFieldMissing,
+                    )
+                })?,
             RpgMakerLocationStep::ArrayIndex(index) => value
                 .as_array_mut()
                 .and_then(|array| array.get_mut(*index))
-                .ok_or_else(|| mutation_failure(location, "结构路径数组索引越界"))?,
+                .ok_or_else(|| {
+                    mutation_failure(
+                        location,
+                        WriteBackMutationViolation::StructuralArrayIndexOutOfBounds,
+                    )
+                })?,
             RpgMakerLocationStep::DecodeJsonString => {
                 return Err(mutation_failure(
                     location,
-                    "事件或标签容器路径不能包含 DecodeJsonString",
+                    WriteBackMutationViolation::DecodeBoundaryInStructuralPath,
                 ));
             }
         };
@@ -1996,7 +2075,12 @@ fn command_code(
         .as_object()
         .and_then(|object| object.get("code"))
         .and_then(Value::as_i64)
-        .ok_or_else(|| mutation_failure(location, "事件命令不是带整数 code 的对象"))
+        .ok_or_else(|| {
+            mutation_failure(
+                location,
+                WriteBackMutationViolation::CommandCodeMissingOrInvalid,
+            )
+        })
 }
 
 fn command_indent(
@@ -2007,7 +2091,12 @@ fn command_indent(
         .as_object()
         .and_then(|object| object.get("indent"))
         .and_then(Value::as_i64)
-        .ok_or_else(|| mutation_failure(location, "事件命令不是带整数 indent 的对象"))
+        .ok_or_else(|| {
+            mutation_failure(
+                location,
+                WriteBackMutationViolation::CommandIndentMissingOrInvalid,
+            )
+        })
 }
 
 fn command_parameters<'a>(
@@ -2019,7 +2108,12 @@ fn command_parameters<'a>(
         .and_then(|object| object.get("parameters"))
         .and_then(Value::as_array)
         .map(Vec::as_slice)
-        .ok_or_else(|| mutation_failure(location, "事件命令缺少 parameters 数组"))
+        .ok_or_else(|| {
+            mutation_failure(
+                location,
+                WriteBackMutationViolation::CommandParametersMissing,
+            )
+        })
 }
 
 fn command_parameter_array<'a>(
@@ -2030,7 +2124,12 @@ fn command_parameter_array<'a>(
     command_parameters(command, location)?
         .get(parameter_index)
         .and_then(Value::as_array)
-        .ok_or_else(|| mutation_failure(location, "事件命令目标参数不是数组"))
+        .ok_or_else(|| {
+            mutation_failure(
+                location,
+                WriteBackMutationViolation::CommandParameterNotArray,
+            )
+        })
 }
 
 fn command_parameter_array_mut<'a>(
@@ -2044,7 +2143,12 @@ fn command_parameter_array_mut<'a>(
         .and_then(Value::as_array_mut)
         .and_then(|parameters| parameters.get_mut(parameter_index))
         .and_then(Value::as_array_mut)
-        .ok_or_else(|| mutation_failure(location, "事件命令目标参数不是数组"))
+        .ok_or_else(|| {
+            mutation_failure(
+                location,
+                WriteBackMutationViolation::CommandParameterNotArray,
+            )
+        })
 }
 
 fn command_text<'a>(
@@ -2055,7 +2159,10 @@ fn command_text<'a>(
 ) -> Result<&'a str, RpgMakerWriteBackDocumentRewriteFailure> {
     let code = command_code(command, location)?;
     if code != first_code && code != continuation_code {
-        return Err(mutation_failure(location, "事件命令码不属于目标文本块"));
+        return Err(mutation_failure(
+            location,
+            WriteBackMutationViolation::CommandCodeOutsideTextBlock,
+        ));
     }
     command
         .as_object()
@@ -2063,7 +2170,7 @@ fn command_text<'a>(
         .and_then(Value::as_array)
         .and_then(|parameters| parameters.first())
         .and_then(Value::as_str)
-        .ok_or_else(|| mutation_failure(location, "事件文本命令缺少字符串 parameters[0]"))
+        .ok_or_else(|| mutation_failure(location, WriteBackMutationViolation::CommandTextMissing))
 }
 
 fn command_parameter_text<'a>(
@@ -2077,7 +2184,12 @@ fn command_parameter_text<'a>(
         .and_then(Value::as_array)
         .and_then(|parameters| parameters.get(parameter_index))
         .and_then(Value::as_str)
-        .ok_or_else(|| mutation_failure(location, "事件命令目标参数不是字符串"))
+        .ok_or_else(|| {
+            mutation_failure(
+                location,
+                WriteBackMutationViolation::CommandParameterNotString,
+            )
+        })
 }
 
 fn set_command_parameter_text(
@@ -2091,9 +2203,17 @@ fn set_command_parameter_text(
         .and_then(|object| object.get_mut("parameters"))
         .and_then(Value::as_array_mut)
         .and_then(|parameters| parameters.get_mut(parameter_index))
-        .ok_or_else(|| mutation_failure(location, "事件命令目标参数不存在"))?;
+        .ok_or_else(|| {
+            mutation_failure(
+                location,
+                WriteBackMutationViolation::CommandParameterMissing,
+            )
+        })?;
     if !parameter.is_string() {
-        return Err(mutation_failure(location, "事件命令目标参数不是字符串"));
+        return Err(mutation_failure(
+            location,
+            WriteBackMutationViolation::CommandParameterNotString,
+        ));
     }
     *parameter = Value::String(text.to_owned());
     Ok(())
@@ -2106,17 +2226,28 @@ fn rewrite_command(
     location: &RpgMakerLocation,
 ) -> Result<Value, RpgMakerWriteBackDocumentRewriteFailure> {
     let mut command = StackSafeJsonValue::new(clone_value(template));
-    let object = command
-        .as_object_mut()
-        .ok_or_else(|| mutation_failure(location, "事件命令模板不是对象"))?;
+    let object = command.as_object_mut().ok_or_else(|| {
+        mutation_failure(
+            location,
+            WriteBackMutationViolation::CommandTemplateNotObject,
+        )
+    })?;
     object.insert("code".to_owned(), Value::from(code));
     let parameters = object
         .get_mut("parameters")
         .and_then(Value::as_array_mut)
-        .ok_or_else(|| mutation_failure(location, "事件命令模板缺少 parameters 数组"))?;
-    let first = parameters
-        .first_mut()
-        .ok_or_else(|| mutation_failure(location, "事件命令模板缺少 parameters[0]"))?;
+        .ok_or_else(|| {
+            mutation_failure(
+                location,
+                WriteBackMutationViolation::CommandTemplateParametersMissing,
+            )
+        })?;
+    let first = parameters.first_mut().ok_or_else(|| {
+        mutation_failure(
+            location,
+            WriteBackMutationViolation::CommandTemplateTextMissing,
+        )
+    })?;
     *first = Value::String(text.to_owned());
     Ok(command.into_inner())
 }
@@ -2185,11 +2316,152 @@ fn relative_document_path(id: &RpgMakerDocumentId) -> PathBuf {
 
 fn mutation_failure(
     location: &RpgMakerLocation,
-    message: impl Into<String>,
+    violation: WriteBackMutationViolation,
 ) -> RpgMakerWriteBackDocumentRewriteFailure {
     RpgMakerWriteBackDocumentRewriteFailure::InvalidMutation {
         location: Box::new(location.clone()),
-        message: message.into(),
+        violation,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WriteBackMutationViolation {
+    PluginParameterAsDocument,
+    RequestedDocumentMissing,
+    CrossDocumentMutation,
+    DuplicateStructuralTarget,
+    DecodeBoundaryInEventContainer,
+    EventListNotArray,
+    OverlappingFrozenRanges,
+    DecodeTargetNotString,
+    PluginIndexMissing,
+    PluginIndexMismatch,
+    PluginNameMismatch,
+    PluginParametersNotObject,
+    PluginParameterMissing,
+    TargetNotString,
+    ExpectedOriginalMismatch,
+    ObjectPathMissingOrWrongType,
+    ArrayPathMissingOrWrongType,
+    UnexpectedDecodeBoundary,
+    MissingCommandArrayIndex,
+    CommandPathNotArrayIndex,
+    ChoiceStartOutOfBounds,
+    ChoiceStartNot102,
+    FrozenChoicesMismatch,
+    InvalidChoiceIndex,
+    ChoiceLabelNotString,
+    ChoiceLabelMismatch,
+    DuplicateChoiceIndex,
+    MissingChoiceEnd,
+    IncompleteChoiceCoverage,
+    ChoiceRecipeTargetMismatch,
+    EventBodyStartOutOfBounds,
+    EventBodyCodeMismatch,
+    EventBodyTooLong,
+    IncompleteEventBodyCoverage,
+    FrozenBodyCodeMismatch,
+    FrozenBodyMismatch,
+    DialogueRecipeLocationMismatch,
+    DialogueStartOutOfBounds,
+    DialogueStartNot101,
+    DialogueRecipeTooLong,
+    IncompleteDialogueCoverage,
+    FrozenSpeakerMismatch,
+    FrozenDialogueCodeMismatch,
+    FrozenDialogueBodyMismatch,
+    StructureAfterBody,
+    TranslationWithoutBodyRecipe,
+    FrozenBodyMissingSpeakerShell,
+    BodyLineNotLast,
+    MissingEmbeddedSpeaker,
+    DialogueParameterOutsideBlock,
+    EventBodySegmentOutsideBlock,
+    StructuralObjectFieldMissing,
+    StructuralArrayIndexOutOfBounds,
+    DecodeBoundaryInStructuralPath,
+    CommandCodeMissingOrInvalid,
+    CommandIndentMissingOrInvalid,
+    CommandParametersMissing,
+    CommandParameterNotArray,
+    CommandCodeOutsideTextBlock,
+    CommandTextMissing,
+    CommandParameterNotString,
+    CommandParameterMissing,
+    CommandTemplateNotObject,
+    CommandTemplateParametersMissing,
+    CommandTemplateTextMissing,
+}
+
+impl fmt::Display for WriteBackMutationViolation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::PluginParameterAsDocument => "插件参数位置不能作为 RPG Maker JSON 文档地址",
+            Self::RequestedDocumentMissing => "文档读取器没有返回 Mutation 请求的文档",
+            Self::CrossDocumentMutation => "一项原子 Mutation 跨越了不同物理文档",
+            Self::DuplicateStructuralTarget => "两个结构修改指向同一冻结事件命令",
+            Self::DecodeBoundaryInEventContainer => "事件容器路径不能包含 DecodeJsonString",
+            Self::EventListNotArray => "事件 list 位置不是数组",
+            Self::OverlappingFrozenRanges => "两个结构修改的冻结命令范围发生重叠",
+            Self::DecodeTargetNotString => "DecodeJsonString 的目标不是字符串",
+            Self::PluginIndexMissing => "plugins.js 中不存在指定插件索引",
+            Self::PluginIndexMismatch => "插件记录索引与数组位置不一致",
+            Self::PluginNameMismatch => "插件索引处的 name 与结构化位置不一致",
+            Self::PluginParametersNotObject => "插件记录的 parameters 不是对象",
+            Self::PluginParameterMissing => "插件参数名在指定插件记录中不存在",
+            Self::TargetNotString => "目标值不是字符串",
+            Self::ExpectedOriginalMismatch => "目标字符串与 expected_original 不一致",
+            Self::ObjectPathMissingOrWrongType => "对象路径不存在或父值不是对象",
+            Self::ArrayPathMissingOrWrongType => "数组路径越界或父值不是数组",
+            Self::UnexpectedDecodeBoundary => "普通路径片段意外包含 DecodeJsonString",
+            Self::MissingCommandArrayIndex => "事件命令位置缺少数组索引",
+            Self::CommandPathNotArrayIndex => "事件命令位置末步不是数组索引",
+            Self::ChoiceStartOutOfBounds => "选项起始命令索引越界",
+            Self::ChoiceStartNot102 => "选项起始命令不是 102",
+            Self::FrozenChoicesMismatch => "冻结 102.parameters[0] 与选项原文不一致",
+            Self::InvalidChoiceIndex => "同层 402.parameters[0] 不是有效选项索引",
+            Self::ChoiceLabelNotString => "同层 402.parameters[1] 不是字符串",
+            Self::ChoiceLabelMismatch => "同层 402 标签与冻结 102 选项不一致",
+            Self::DuplicateChoiceIndex => "同层 402 重复选项索引",
+            Self::MissingChoiceEnd => "选项块缺少同层 404 结束命令",
+            Self::IncompleteChoiceCoverage => "选项块没有完整覆盖全部同层 402",
+            Self::ChoiceRecipeTargetMismatch => "选项配方目标与冻结 102/402 块不一致",
+            Self::EventBodyStartOutOfBounds => "事件正文起始命令索引越界",
+            Self::EventBodyCodeMismatch => "事件正文起始命令码与正文类型不一致",
+            Self::EventBodyTooLong => "事件正文段数超过冻结命令列表",
+            Self::IncompleteEventBodyCoverage => "Mutation 没有覆盖完整冻结事件正文块",
+            Self::FrozenBodyCodeMismatch => "冻结正文命令码与 Mutation 类型不一致",
+            Self::FrozenBodyMismatch => "冻结正文与 expected_original 不一致",
+            Self::DialogueRecipeLocationMismatch => "对话 Mutation 与物化配方的组位置不一致",
+            Self::DialogueStartOutOfBounds => "对话起始命令索引越界",
+            Self::DialogueStartNot101 => "对话起始命令不是 101",
+            Self::DialogueRecipeTooLong => "对话配方段数超过冻结命令列表",
+            Self::IncompleteDialogueCoverage => "对话配方没有覆盖完整 401 块",
+            Self::FrozenSpeakerMismatch => "冻结 Speaker 与 expected_raw 不一致",
+            Self::FrozenDialogueCodeMismatch => "冻结对话正文命令不是 401",
+            Self::FrozenDialogueBodyMismatch => "冻结对话正文与 expected_raw 不一致",
+            Self::StructureAfterBody => "对话结构行不能位于正文行之后",
+            Self::TranslationWithoutBodyRecipe => "对话 Mutation 提供正文译文但配方没有 BodyLine",
+            Self::FrozenBodyMissingSpeakerShell => "冻结对话正文不以物化 Speaker shell 开头",
+            Self::BodyLineNotLast => "对话 BodyLine 必须是物理行的最后一部分",
+            Self::MissingEmbeddedSpeaker => "内嵌 SpeakerSlot 缺少 Speaker",
+            Self::DialogueParameterOutsideBlock => "对话参数位置不属于物化的冻结块",
+            Self::EventBodySegmentOutsideBlock => "事件正文段位置不属于指定冻结正文块",
+            Self::StructuralObjectFieldMissing => "结构路径对象字段不存在",
+            Self::StructuralArrayIndexOutOfBounds => "结构路径数组索引越界",
+            Self::DecodeBoundaryInStructuralPath => "事件或标签容器路径不能包含 DecodeJsonString",
+            Self::CommandCodeMissingOrInvalid => "事件命令不是带整数 code 的对象",
+            Self::CommandIndentMissingOrInvalid => "事件命令不是带整数 indent 的对象",
+            Self::CommandParametersMissing => "事件命令缺少 parameters 数组",
+            Self::CommandParameterNotArray => "事件命令目标参数不是数组",
+            Self::CommandCodeOutsideTextBlock => "事件命令码不属于目标文本块",
+            Self::CommandTextMissing => "事件文本命令缺少字符串 parameters[0]",
+            Self::CommandParameterNotString => "事件命令目标参数不是字符串",
+            Self::CommandParameterMissing => "事件命令目标参数不存在",
+            Self::CommandTemplateNotObject => "事件命令模板不是对象",
+            Self::CommandTemplateParametersMissing => "事件命令模板缺少 parameters 数组",
+            Self::CommandTemplateTextMissing => "事件命令模板缺少 parameters[0]",
+        })
     }
 }
 
@@ -2233,43 +2505,23 @@ where
     }
 }
 
-impl<R, C> RpgMakerWriteBackDocumentRewritingError<R, C>
+impl<R> RpgMakerWriteBackDocumentRewritingError<R, CpuExecutorUnavailable>
 where
-    R: RpgMakerProjectDocumentReadingDiagnostic,
-    CpuTaskExecutionError<C>: SafeDiagnosticSource,
+    R: RpgMakerProjectDocumentReadingDiagnostic + Error + Send + Sync + 'static,
 {
-    pub(crate) fn safe_diagnostic(&self) -> SafeDiagnostic {
+    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
         match self {
-            Self::ReadDocuments(source) => source.safe_document_reading_diagnostic(
-                DiagnosticCode::WriteBackDocumentRead,
-                DiagnosticStage::WriteBack,
-            ),
-            Self::ScheduleRewrite(source) => source
-                .safe_diagnostic_source(
-                    DiagnosticStage::WriteBack,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::Retry,
-                )
-                .with_recovery(RecoveryFact::component(
-                    "write_back_operation=rewrite_documents",
-                )),
-            Self::Rewrite(source) => source.safe_diagnostic(),
+            Self::ReadDocuments(source) => {
+                source.document_reading_diagnostic_report(RpgMakerDocumentConsumer::WriteBack)
+            }
+            Self::ScheduleRewrite(source) => rewrite_compute_report(source),
+            Self::Rewrite(source) => source.diagnostic_report(),
         }
     }
-}
 
-impl<R, C> SafeDiagnosticSource for RpgMakerWriteBackDocumentRewritingError<R, C>
-where
-    R: RpgMakerProjectDocumentReadingDiagnostic,
-    CpuTaskExecutionError<C>: SafeDiagnosticSource,
-{
-    fn safe_diagnostic_source(
-        &self,
-        _stage: DiagnosticStage,
-        _impact: DiagnosticImpact,
-        _fallback_action: DiagnosticAction,
-    ) -> SafeDiagnostic {
-        self.safe_diagnostic()
+    pub(crate) fn into_reported_failure(self) -> ReportedFailure {
+        let report = self.diagnostic_report();
+        ReportedFailure::new(report, self)
     }
 }
 
@@ -2278,7 +2530,7 @@ where
 pub(crate) enum RpgMakerWriteBackDocumentRewriteFailure {
     InvalidMutation {
         location: Box<RpgMakerLocation>,
-        message: String,
+        violation: WriteBackMutationViolation,
     },
     DecodeNestedJson {
         location: Box<RpgMakerLocation>,
@@ -2314,8 +2566,11 @@ pub(crate) enum RpgMakerWriteBackDocumentRewriteFailure {
 impl fmt::Display for RpgMakerWriteBackDocumentRewriteFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidMutation { location, message } => {
-                write!(formatter, "Mutation {location} 无法应用：{message}")
+            Self::InvalidMutation {
+                location,
+                violation,
+            } => {
+                write!(formatter, "Mutation {location} 无法应用：{violation}")
             }
             Self::DecodeNestedJson { location, source } => {
                 write!(
@@ -2378,130 +2633,204 @@ impl Error for RpgMakerWriteBackDocumentRewriteFailure {
 }
 
 impl RpgMakerWriteBackDocumentRewriteFailure {
-    pub(crate) fn safe_diagnostic(&self) -> SafeDiagnostic {
-        match self {
-            Self::InvalidMutation { location, .. } => SafeDiagnostic::new(
-                DiagnosticCode::WriteBackRewrite,
-                DiagnosticStage::WriteBack,
-                DiagnosticSubject::operation(format!("Mutation {location}")),
-                DiagnosticReason::failure(DiagnosticFailureKind::WriteBackMutationInvalid),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            ),
-            Self::DecodeNestedJson { location, source } => SafeDiagnostic::new(
-                DiagnosticCode::WriteBackRewrite,
-                DiagnosticStage::WriteBack,
-                DiagnosticSubject::operation(format!("Mutation {location}")),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::WriteBackMutationInvalid,
-                    format!(
-                        "rewrite_error=decode_nested_json; {}",
-                        source.safe_diagnostic_detail()
-                    ),
-                ),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            ),
-            Self::EncodeNestedJson { location, source } => SafeDiagnostic::new(
-                DiagnosticCode::WriteBackRewrite,
-                DiagnosticStage::WriteBack,
-                DiagnosticSubject::operation(format!("Mutation {location}")),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::WriteBackMutationInvalid,
-                    format!(
-                        "rewrite_error=encode_nested_json; {}",
-                        source.safe_diagnostic_detail()
-                    ),
-                ),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::ReportBug,
-            ),
-            Self::SerializeDocument { path, source } => SafeDiagnostic::new(
-                DiagnosticCode::WriteBackRewrite,
-                DiagnosticStage::WriteBack,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::SourceDocumentInvalid,
-                    format!(
-                        "rewrite_error=serialize_document; {}",
-                        source.safe_diagnostic_detail()
-                    ),
-                ),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::ReportBug,
-            ),
-            Self::InvalidOutputPath { path } => SafeDiagnostic::new(
-                DiagnosticCode::WriteBackRewrite,
-                DiagnosticStage::WriteBack,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure(DiagnosticFailureKind::WriteBackOutputPathInvalid),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::ReportBug,
-            ),
-            Self::DuplicateOutputPath { path } => SafeDiagnostic::new(
-                DiagnosticCode::WriteBackRewrite,
-                DiagnosticStage::WriteBack,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure(DiagnosticFailureKind::WriteBackOutputPathDuplicate),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::ReportBug,
-            ),
+    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
+        let problem = match self {
+            Self::InvalidMutation {
+                location,
+                violation,
+            } => RpgMakerWriteBackDocumentRewriteProblem::InvalidMutation {
+                location: location.diagnostic_location(),
+                violation: diagnostic_mutation_violation(*violation),
+            },
+            Self::DecodeNestedJson { location, source } => {
+                RpgMakerWriteBackDocumentRewriteProblem::DecodeNestedJson {
+                    location: location.diagnostic_location(),
+                    category: rewrite_json_failure(source),
+                    line: source.line(),
+                    column: source.column(),
+                }
+            }
+            Self::EncodeNestedJson { location, source } => {
+                RpgMakerWriteBackDocumentRewriteProblem::EncodeNestedJson {
+                    location: location.diagnostic_location(),
+                    category: rewrite_json_failure(source),
+                    line: source.line(),
+                    column: source.column(),
+                }
+            }
+            Self::SerializeDocument { path, source } => {
+                RpgMakerWriteBackDocumentRewriteProblem::SerializeDocument {
+                    path: SafePath::new(path),
+                    category: rewrite_json_failure(source),
+                    line: source.line(),
+                    column: source.column(),
+                }
+            }
+            Self::InvalidOutputPath { path } => {
+                RpgMakerWriteBackDocumentRewriteProblem::InvalidOutputPath {
+                    path: SafePath::new(path),
+                }
+            }
+            Self::DuplicateOutputPath { path } => {
+                RpgMakerWriteBackDocumentRewriteProblem::DuplicateOutputPath {
+                    path: SafePath::new(path),
+                }
+            }
             Self::OutputPathCaseKey { path, source } => match source {
                 WindowsOrdinalCaseKeyError::InputTooLarge { maximum, observed } => {
-                    SafeDiagnostic::new(
-                        DiagnosticCode::WriteBackRewrite,
-                        DiagnosticStage::WriteBack,
-                        DiagnosticSubject::path(path),
-                        DiagnosticReason::Resource {
-                            resource: "Windows 文件名 UTF-16 单元数".to_owned(),
-                            actual: *observed,
-                            maximum: Some(*maximum),
-                        },
-                        DiagnosticImpact::Unchanged,
-                        DiagnosticAction::ReportBug,
-                    )
+                    RpgMakerWriteBackDocumentRewriteProblem::OrdinalCaseKeyInputTooLarge {
+                        path: SafePath::new(path),
+                        observed: *observed,
+                        maximum: *maximum,
+                    }
                 }
-                WindowsOrdinalCaseKeyError::WindowsApi { phase, source } => SafeDiagnostic::io(
-                    DiagnosticCode::WriteBackRewrite,
-                    DiagnosticStage::WriteBack,
-                    DiagnosticSubject::path(path),
-                    "windows_ordinal_case_key",
-                    source,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::Retry,
-                )
-                .with_recovery(RecoveryFact::component(format!(
-                    "windows_ordinal_case_key_phase={}",
-                    phase.as_str()
-                ))),
+                WindowsOrdinalCaseKeyError::WindowsApi { phase, source } => {
+                    RpgMakerWriteBackDocumentRewriteProblem::OrdinalCaseKeyIo {
+                        path: SafePath::new(path),
+                        phase: match phase {
+                            crate::windows_path::WindowsOrdinalCaseKeyPhase::Measure => {
+                                FileSystemOrdinalKeyPhase::Measure
+                            }
+                            crate::windows_path::WindowsOrdinalCaseKeyPhase::Map => {
+                                FileSystemOrdinalKeyPhase::Map
+                            }
+                        },
+                        failure: IoFailure::from_error(source),
+                    }
+                }
             },
-            Self::MissingChangedDocument { id } => SafeDiagnostic::new(
-                DiagnosticCode::WriteBackRewrite,
-                DiagnosticStage::WriteBack,
-                DiagnosticSubject::path(relative_document_path(id)),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::InternalInvariant,
-                    "rewrite_error=missing_changed_document",
-                ),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::ReportBug,
-            ),
+            Self::MissingChangedDocument { id } => {
+                RpgMakerWriteBackDocumentRewriteProblem::MissingChangedDocument {
+                    path: SafePath::new(relative_document_path(id)),
+                }
+            }
             Self::InvalidPluginOrder {
                 expected_index,
                 stored_index,
-            } => SafeDiagnostic::new(
-                DiagnosticCode::WriteBackRewrite,
-                DiagnosticStage::WriteBack,
-                DiagnosticSubject::field("plugin_order"),
-                DiagnosticReason::failure(DiagnosticFailureKind::StateMismatch),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            )
-            .with_recovery(RecoveryFact::component(format!(
-                "expected_index={expected_index}; stored_index={stored_index}"
-            ))),
+            } => RpgMakerWriteBackDocumentRewriteProblem::PluginOrderMismatch {
+                expected_index: *expected_index,
+                stored_index: *stored_index,
+            },
+        };
+        rewrite_report(problem)
+    }
+}
+
+fn rewrite_report(problem: RpgMakerWriteBackDocumentRewriteProblem) -> DiagnosticReport {
+    DiagnosticReport::new(
+        StateEffect::Unchanged,
+        Diagnostic::rpg_maker(RpgMakerIssue::write_back_document_rewrite(problem)),
+    )
+}
+
+fn rewrite_compute_report(
+    source: &CpuTaskExecutionError<CpuExecutorUnavailable>,
+) -> DiagnosticReport {
+    let failure = match source {
+        CpuTaskExecutionError::Cancelled => RpgMakerComputeFailure::Cancelled,
+        CpuTaskExecutionError::Unavailable(CpuExecutorUnavailable::ShuttingDown) => {
+            RpgMakerComputeFailure::ExecutorClosed
+        }
+        CpuTaskExecutionError::Unavailable(CpuExecutorUnavailable::StatePoisoned) => {
+            RpgMakerComputeFailure::StatePoisoned
+        }
+        CpuTaskExecutionError::TaskPanicked => RpgMakerComputeFailure::WorkerPanicked,
+    };
+    rewrite_report(RpgMakerWriteBackDocumentRewriteProblem::RewriteCompute { failure })
+}
+
+fn rewrite_json_failure(source: &StackSafeJsonError) -> RpgMakerJsonFailureKind {
+    match source.diagnostic_category() {
+        crate::json_diagnostic::JsonErrorCategory::Io => RpgMakerJsonFailureKind::Io,
+        crate::json_diagnostic::JsonErrorCategory::Syntax => RpgMakerJsonFailureKind::Syntax,
+        crate::json_diagnostic::JsonErrorCategory::Data => RpgMakerJsonFailureKind::Data,
+        crate::json_diagnostic::JsonErrorCategory::Eof => RpgMakerJsonFailureKind::Eof,
+        crate::json_diagnostic::JsonErrorCategory::DuplicateObjectKey => {
+            RpgMakerJsonFailureKind::DuplicateObjectKey
         }
     }
+}
+
+macro_rules! map_mutation_violation {
+    ($value:expr; $($variant:ident),+ $(,)?) => {
+        match $value {
+            $(WriteBackMutationViolation::$variant =>
+                RpgMakerWriteBackMutationViolation::$variant,)+
+        }
+    };
+}
+
+fn diagnostic_mutation_violation(
+    violation: WriteBackMutationViolation,
+) -> RpgMakerWriteBackMutationViolation {
+    map_mutation_violation!(
+        violation;
+        PluginParameterAsDocument,
+        RequestedDocumentMissing,
+        CrossDocumentMutation,
+        DuplicateStructuralTarget,
+        DecodeBoundaryInEventContainer,
+        EventListNotArray,
+        OverlappingFrozenRanges,
+        DecodeTargetNotString,
+        PluginIndexMissing,
+        PluginIndexMismatch,
+        PluginNameMismatch,
+        PluginParametersNotObject,
+        PluginParameterMissing,
+        TargetNotString,
+        ExpectedOriginalMismatch,
+        ObjectPathMissingOrWrongType,
+        ArrayPathMissingOrWrongType,
+        UnexpectedDecodeBoundary,
+        MissingCommandArrayIndex,
+        CommandPathNotArrayIndex,
+        ChoiceStartOutOfBounds,
+        ChoiceStartNot102,
+        FrozenChoicesMismatch,
+        InvalidChoiceIndex,
+        ChoiceLabelNotString,
+        ChoiceLabelMismatch,
+        DuplicateChoiceIndex,
+        MissingChoiceEnd,
+        IncompleteChoiceCoverage,
+        ChoiceRecipeTargetMismatch,
+        EventBodyStartOutOfBounds,
+        EventBodyCodeMismatch,
+        EventBodyTooLong,
+        IncompleteEventBodyCoverage,
+        FrozenBodyCodeMismatch,
+        FrozenBodyMismatch,
+        DialogueRecipeLocationMismatch,
+        DialogueStartOutOfBounds,
+        DialogueStartNot101,
+        DialogueRecipeTooLong,
+        IncompleteDialogueCoverage,
+        FrozenSpeakerMismatch,
+        FrozenDialogueCodeMismatch,
+        FrozenDialogueBodyMismatch,
+        StructureAfterBody,
+        TranslationWithoutBodyRecipe,
+        FrozenBodyMissingSpeakerShell,
+        BodyLineNotLast,
+        MissingEmbeddedSpeaker,
+        DialogueParameterOutsideBlock,
+        EventBodySegmentOutsideBlock,
+        StructuralObjectFieldMissing,
+        StructuralArrayIndexOutOfBounds,
+        DecodeBoundaryInStructuralPath,
+        CommandCodeMissingOrInvalid,
+        CommandIndentMissingOrInvalid,
+        CommandParametersMissing,
+        CommandParameterNotArray,
+        CommandCodeOutsideTextBlock,
+        CommandTextMissing,
+        CommandParameterNotString,
+        CommandParameterMissing,
+        CommandTemplateNotObject,
+        CommandTemplateParametersMissing,
+        CommandTemplateTextMissing,
+    )
 }
 
 #[cfg(test)]
@@ -2511,7 +2840,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::diagnostic::render_safe_diagnostic;
+    use crate::diagnostic::render_diagnostic_report;
     use crate::i18n::{UiLocale, UiLocalizer};
     use crate::lossless_json::LosslessJsonError;
     use crate::rpg_maker::extract::document::{
@@ -2548,20 +2877,18 @@ mod tests {
         ];
 
         for (id, expected_path) in cases {
-            let diagnostic = RpgMakerWriteBackDocumentRewriteFailure::MissingChangedDocument { id }
-                .safe_diagnostic();
-            assert_eq!(diagnostic.code, DiagnosticCode::WriteBackRewrite);
-            assert_eq!(diagnostic.stage, DiagnosticStage::WriteBack);
-            assert_eq!(diagnostic.subject, DiagnosticSubject::path(expected_path));
+            let report = RpgMakerWriteBackDocumentRewriteFailure::MissingChangedDocument { id }
+                .diagnostic_report();
             assert_eq!(
-                diagnostic.reason,
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::InternalInvariant,
-                    "rewrite_error=missing_changed_document",
-                )
+                report.primary().code(),
+                "rpg_maker.write_back.rewrite.missing_changed_document"
             );
-            assert_eq!(diagnostic.impact, DiagnosticImpact::Unchanged);
-            assert_eq!(diagnostic.action, DiagnosticAction::ReportBug);
+            assert_eq!(report.effect(), StateEffect::Unchanged);
+            assert_eq!(
+                serde_json::to_value(&report).expect("写回诊断应可序列化")["primary"]["issue"]["details"]
+                    ["problem"]["problem"]["path"],
+                serde_json::json!(expected_path)
+            );
         }
     }
 
@@ -2587,14 +2914,9 @@ mod tests {
                     location: Box::new(location.clone()),
                     source: backend_error(),
                 },
-                DiagnosticAction::CheckProjectState,
-                &[
-                    "rewrite_error=decode_nested_json",
-                    "json_backend=serde_json",
-                    "json_category=eof",
-                    "json_line=1",
-                    "json_column=",
-                ][..],
+                "rpg_maker.write_back.rewrite.decode_nested_json",
+                &["\"category\":\"eof\"", "\"line\":1", "\"column\":"][..],
+                &["json_category=eof", "line=1", "column="][..],
             ),
             (
                 RpgMakerWriteBackDocumentRewriteFailure::EncodeNestedJson {
@@ -2605,49 +2927,40 @@ mod tests {
                         column: 9,
                     },
                 },
-                DiagnosticAction::ReportBug,
+                "rpg_maker.write_back.rewrite.encode_nested_json",
                 &[
-                    "rewrite_error=encode_nested_json",
-                    "json_backend=lossless",
-                    "json_category=duplicate_object_key",
-                    "byte_offset=17",
-                    "json_line=2",
-                    "json_column=9",
+                    "\"category\":\"duplicate_object_key\"",
+                    "\"line\":2",
+                    "\"column\":9",
                 ][..],
+                &["json_category=duplicate_object_key", "line=2", "column=9"][..],
             ),
             (
                 RpgMakerWriteBackDocumentRewriteFailure::SerializeDocument {
                     path: PathBuf::from("data/Items.json"),
                     source: backend_error(),
                 },
-                DiagnosticAction::ReportBug,
-                &[
-                    "rewrite_error=serialize_document",
-                    "json_backend=serde_json",
-                    "json_category=eof",
-                ][..],
+                "rpg_maker.write_back.rewrite.serialize_document",
+                &["\"kind\":\"serialize_document\"", "\"category\":\"eof\""][..],
+                &["json_category=eof", "line=1", "column="][..],
             ),
         ];
 
-        for (source, expected_action, expected_facts) in cases {
-            let diagnostic = source.safe_diagnostic();
-            assert_eq!(diagnostic.action, expected_action);
-            let json = serde_json::to_string(&diagnostic).expect("安全诊断应可序列化");
-            let mut cli = Vec::new();
-            render_safe_diagnostic(
-                &diagnostic,
-                &UiLocalizer::new(UiLocale::SimplifiedChinese),
-                &mut cli,
-            )
-            .expect("安全诊断应可渲染");
-            let cli = String::from_utf8(cli).expect("CLI 诊断应为 UTF-8");
+        for (source, expected_code, expected_json_facts, expected_cli_facts) in cases {
+            let report = source.diagnostic_report();
+            assert_eq!(report.primary().code(), expected_code);
+            let json = serde_json::to_string(&report).expect("安全诊断应可序列化");
+            let cli =
+                render_diagnostic_report(&report, &UiLocalizer::new(UiLocale::SimplifiedChinese));
             assert!(
                 !json.contains(JSON_BODY),
                 "JSONL 不应复制 JSON 正文：{json}"
             );
             assert!(!cli.contains(JSON_BODY), "CLI 不应复制 JSON 正文：{cli}");
-            for fact in expected_facts {
+            for fact in expected_json_facts {
                 assert!(json.contains(fact), "JSONL 缺少 {fact}: {json}");
+            }
+            for fact in expected_cli_facts {
                 assert!(cli.contains(fact), "CLI 缺少 {fact}: {cli}");
             }
         }
@@ -2680,18 +2993,15 @@ mod tests {
     impl Error for FakeError {}
 
     impl RpgMakerProjectDocumentReadingDiagnostic for FakeError {
-        fn safe_document_reading_diagnostic(
+        fn document_reading_diagnostic_report(
             &self,
-            code: DiagnosticCode,
-            stage: DiagnosticStage,
-        ) -> SafeDiagnostic {
-            SafeDiagnostic::new(
-                code,
-                stage,
-                DiagnosticSubject::component("fake_write_back_document_reader"),
-                DiagnosticReason::failure(DiagnosticFailureKind::InvalidValue),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixInput,
+            consumer: RpgMakerDocumentConsumer,
+        ) -> DiagnosticReport {
+            assert_eq!(consumer, RpgMakerDocumentConsumer::WriteBack);
+            rewrite_report(
+                RpgMakerWriteBackDocumentRewriteProblem::MissingChangedDocument {
+                    path: SafePath::new("fake_write_back_document_reader"),
+                },
             )
         }
     }
@@ -2787,13 +3097,15 @@ mod tests {
             crate::runtime::cpu::CpuExecutorUnavailable,
         > = RpgMakerWriteBackDocumentRewritingError::ReadDocuments(FakeError);
 
-        let diagnostic = error.safe_diagnostic();
+        let report = error.diagnostic_report();
 
-        assert_eq!(diagnostic.code, DiagnosticCode::WriteBackDocumentRead);
-        assert_eq!(diagnostic.stage, DiagnosticStage::WriteBack);
         assert_eq!(
-            diagnostic.subject,
-            DiagnosticSubject::component("fake_write_back_document_reader")
+            report.primary().code(),
+            "rpg_maker.write_back.rewrite.missing_changed_document"
+        );
+        assert_eq!(
+            report.primary().stage(),
+            crate::diagnostic::DiagnosticStage::WriteBack
         );
     }
 
@@ -3385,13 +3697,13 @@ mod tests {
         });
         let original = document.clone();
         let error = edit_value_at_steps(&mut document, location.steps(), &location, |value| {
-            let text = value
-                .as_str()
-                .ok_or_else(|| mutation_failure(&location, "测试 Value 不是字符串"))?;
+            let text = value.as_str().ok_or_else(|| {
+                mutation_failure(&location, WriteBackMutationViolation::TargetNotString)
+            })?;
             if text != "<Help:漂移原文>" {
                 return Err(mutation_failure(
                     &location,
-                    "Value 与 expected_original 不一致",
+                    WriteBackMutationViolation::ExpectedOriginalMismatch,
                 ));
             }
             Ok(())
@@ -3400,8 +3712,10 @@ mod tests {
 
         assert!(matches!(
             error,
-            RpgMakerWriteBackDocumentRewriteFailure::InvalidMutation { message, .. }
-                if message.contains("expected_original")
+            RpgMakerWriteBackDocumentRewriteFailure::InvalidMutation {
+                violation: WriteBackMutationViolation::ExpectedOriginalMismatch,
+                ..
+            }
         ));
         assert_eq!(document, original, "失败不得提交任何一层 decoded string");
     }
@@ -3884,9 +4198,15 @@ mod tests {
         assert_eq!(map["list"][1]["parameters"][0], "兔女郎魅魔");
         assert_eq!(map["list"][2]["parameters"][0], "译文");
 
-        for (documents, expected_message) in [
-            (documents("来源已变化", false), "expected_raw"),
-            (documents("台词", true), "完整 401 块"),
+        for (documents, expected_violation) in [
+            (
+                documents("来源已变化", false),
+                WriteBackMutationViolation::FrozenDialogueBodyMismatch,
+            ),
+            (
+                documents("台词", true),
+                WriteBackMutationViolation::IncompleteDialogueCoverage,
+            ),
         ] {
             let error = rewrite_documents(
                 project_name(),
@@ -3897,8 +4217,8 @@ mod tests {
             .expect_err("来源或块长度漂移必须失败");
             assert!(matches!(
                 error,
-                RpgMakerWriteBackDocumentRewriteFailure::InvalidMutation { message, .. }
-                    if message.contains(expected_message)
+                RpgMakerWriteBackDocumentRewriteFailure::InvalidMutation { violation, .. }
+                    if violation == expected_violation
             ));
         }
     }
@@ -4103,8 +4423,10 @@ mod tests {
         .expect_err("滚动正文不能接受 401 命令");
         assert!(matches!(
             error,
-            RpgMakerWriteBackDocumentRewriteFailure::InvalidMutation { message, .. }
-                if message.contains("命令码")
+            RpgMakerWriteBackDocumentRewriteFailure::InvalidMutation {
+                violation: WriteBackMutationViolation::FrozenBodyCodeMismatch,
+                ..
+            }
         ));
     }
 
@@ -4159,8 +4481,10 @@ mod tests {
 
         assert!(matches!(
             error,
-            RpgMakerWriteBackDocumentRewriteFailure::InvalidMutation { message, .. }
-                if message.contains("code")
+            RpgMakerWriteBackDocumentRewriteFailure::InvalidMutation {
+                violation: WriteBackMutationViolation::CommandCodeMissingOrInvalid,
+                ..
+            }
         ));
     }
 
@@ -4200,8 +4524,10 @@ mod tests {
 
         assert!(matches!(
             error,
-            RpgMakerWriteBackDocumentRewriteFailure::InvalidMutation { message, .. }
-                if message.contains("name")
+            RpgMakerWriteBackDocumentRewriteFailure::InvalidMutation {
+                violation: WriteBackMutationViolation::PluginNameMismatch,
+                ..
+            }
         ));
     }
 
@@ -4233,8 +4559,10 @@ mod tests {
 
         assert!(matches!(
             error,
-            RpgMakerWriteBackDocumentRewriteFailure::InvalidMutation { message, .. }
-                if message.contains("expected_original")
+            RpgMakerWriteBackDocumentRewriteFailure::InvalidMutation {
+                violation: WriteBackMutationViolation::ExpectedOriginalMismatch,
+                ..
+            }
         ));
     }
 

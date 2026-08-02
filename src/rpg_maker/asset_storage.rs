@@ -3,6 +3,8 @@
 //! 本模块只拥有 SQLite 行如何还原为 RPG Maker 资产的共同事实。Translate 与 WriteBack
 //! 仍分别拥有查询条件、阶段特有列、快照新鲜度、领域校验、组装和错误语义。
 
+use std::fmt;
+
 use crate::rpg_maker::asset::RpgMakerAssetOwner;
 use crate::rpg_maker::location_codec::{
     RpgMakerLocationCodec, RpgMakerLocationCodecError, RpgMakerProjectionCodec,
@@ -22,9 +24,6 @@ pub(crate) const RPG_MAKER_ASSET_OWNER_STATE_PROJECTION: &str =
 /// RPG Maker 文本组在各读取阶段共同消费的列顺序。
 pub(crate) const RPG_MAKER_TEXT_GROUP_CORE_PROJECTION: &str =
     "group_location,\n    group_kind,\n    semantic_order_key";
-
-/// RPG Maker 文本单元位置列；Translate 会在其后插入阶段特有的组事实。
-pub(crate) const RPG_MAKER_TEXT_UNIT_LOCATION_PROJECTION: &str = "unit.group_location";
 
 /// RPG Maker 文本单元在位置之后由各读取阶段共同消费的列顺序。
 pub(crate) const RPG_MAKER_TEXT_UNIT_CONTENT_PROJECTION: &str = "unit.unit_role,\n    \
@@ -122,6 +121,32 @@ pub(crate) enum RpgMakerAssetStorageRowError {
     InvalidTranslationContent(serde_json::Error),
 }
 
+impl fmt::Display for RpgMakerAssetStorageRowError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WrongColumnCount { expected, actual } => {
+                write!(formatter, "列数应为 {expected}，实际为 {actual}")
+            }
+            Self::WrongColumnType {
+                column,
+                expected,
+                actual,
+            } => write!(formatter, "列 {column} 应为 {expected}，实际为 {actual}"),
+            Self::InvalidSemanticOrderKey { column, source } => {
+                write!(formatter, "列 {column} 的语义顺序键无效：{source}")
+            }
+            Self::UnknownOwner(actual) => write!(formatter, "未知 owner：{actual}"),
+            Self::UnknownGroupKind(actual) => write!(formatter, "未知文本组类型：{actual}"),
+            Self::InvalidLocation(source) => write!(formatter, "位置无效：{source}"),
+            Self::InvalidRole(source) => write!(formatter, "文本角色无效：{source}"),
+            Self::InvalidSourceContent(source) => write!(formatter, "原文 JSON 无效：{source}"),
+            Self::InvalidTranslationContent(source) => {
+                write!(formatter, "译文 JSON 无效：{source}")
+            }
+        }
+    }
+}
+
 /// 已验证列数、按共享投影顺序消费拥有型值的原始行解码器。
 pub(crate) struct RpgMakerAssetStorageRowDecoder {
     values: std::vec::IntoIter<SqliteValue>,
@@ -211,7 +236,6 @@ impl RpgMakerAssetStorageRowDecoder {
 }
 
 pub(crate) struct RpgMakerAssetOwnerStateStorageRow {
-    pub(crate) owner_name: String,
     pub(crate) owner: RpgMakerAssetOwner,
     pub(crate) source_snapshot_fingerprint: Vec<u8>,
     pub(crate) asset_snapshot_fingerprint: Vec<u8>,
@@ -222,9 +246,8 @@ impl RpgMakerAssetOwnerStateStorageRow {
         let mut row = RpgMakerAssetStorageRowDecoder::new(row, 3)?;
         let owner_name = row.required_text("owner")?;
         let owner = RpgMakerAssetOwner::from_storage_name(owner_name.as_str())
-            .ok_or_else(|| RpgMakerAssetStorageRowError::UnknownOwner(owner_name.clone()))?;
+            .ok_or(RpgMakerAssetStorageRowError::UnknownOwner(owner_name))?;
         Ok(Self {
-            owner_name,
             owner,
             source_snapshot_fingerprint: row.required_blob("source_snapshot_fingerprint")?,
             asset_snapshot_fingerprint: row.required_blob("asset_snapshot_fingerprint")?,

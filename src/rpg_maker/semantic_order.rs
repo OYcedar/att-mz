@@ -41,12 +41,12 @@ impl RpgMakerSemanticScopeKey {
             RpgMakerSource::Data(StandardDataFile::CommonEvents) => first_array_index(location)
                 .map(Self::CommonEvent)
                 .ok_or_else(|| RpgMakerSemanticScopeError::MissingArrayIndex {
-                    location: location.to_string(),
+                    location: Box::new(location.clone()),
                 }),
             RpgMakerSource::Data(StandardDataFile::Troops) => first_array_index(location)
                 .map(Self::Troop)
                 .ok_or_else(|| RpgMakerSemanticScopeError::MissingArrayIndex {
-                    location: location.to_string(),
+                    location: Box::new(location.clone()),
                 }),
             RpgMakerSource::Data(file) => Ok(Self::StandardDatabase(*file)),
             RpgMakerSource::DataFile(file) => Ok(Self::DataFile(file.clone())),
@@ -86,7 +86,15 @@ fn first_array_index(location: &RpgMakerLocation) -> Option<usize> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RpgMakerSemanticScopeError {
-    MissingArrayIndex { location: String },
+    MissingArrayIndex { location: Box<RpgMakerLocation> },
+}
+
+impl RpgMakerSemanticScopeError {
+    pub(crate) fn location(&self) -> &RpgMakerLocation {
+        match self {
+            Self::MissingArrayIndex { location } => location,
+        }
+    }
 }
 
 impl fmt::Display for RpgMakerSemanticScopeError {
@@ -115,6 +123,11 @@ impl RpgMakerSemanticOrderKey {
             physical_path,
             fragment,
         }
+    }
+
+    /// 为封闭诊断保留顺序键的完整结构，不经过 Debug 文本或存储编码。
+    pub(crate) fn diagnostic_parts(&self) -> (Vec<u64>, u64) {
+        (self.physical_path.clone(), self.fragment)
     }
 
     #[cfg(test)]
@@ -469,6 +482,22 @@ pub(crate) enum RpgMakerSemanticOrderKeyDecodeError {
     Truncated,
     UnknownMarker { actual: u8 },
     TrailingBytes,
+}
+
+impl RpgMakerSemanticOrderKeyDecodeError {
+    pub(crate) const fn diagnostic_violation(
+        self,
+    ) -> crate::diagnostic::RpgMakerSemanticOrderKeyViolation {
+        match self {
+            Self::Truncated => crate::diagnostic::RpgMakerSemanticOrderKeyViolation::Truncated,
+            Self::UnknownMarker { actual } => {
+                crate::diagnostic::RpgMakerSemanticOrderKeyViolation::UnknownMarker { actual }
+            }
+            Self::TrailingBytes => {
+                crate::diagnostic::RpgMakerSemanticOrderKeyViolation::TrailingBytes
+            }
+        }
+    }
 }
 
 impl fmt::Display for RpgMakerSemanticOrderKeyDecodeError {

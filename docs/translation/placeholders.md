@@ -23,8 +23,10 @@ pattern = '<msg>(?<text>.*?)</msg>'
 
 没有 `text` 命名捕获时，完整匹配是不透明保护段。存在 `text` 捕获时，捕获本身仍是可
 翻译的 NaturalText，完整匹配中捕获前后的字节分别成为不透明 wrapper。一个规则最多有
-一个命名捕获，并且只能命名为 `text`。规则按文件顺序执行；实际保护跨度重叠时会在
-Translate 准备阶段明确失败。
+一个命名捕获，并且只能命名为 `text`。一旦规则声明 `text`，该捕获必须参与这条规则的
+每一次完整匹配；例如让另一条 alternation 分支在不捕获 `text` 的情况下也能匹配，会以
+`translation.placeholder.missing_text_capture` 明确失败。规则按文件顺序执行；空匹配、
+无效 UTF-8 字节范围或实际保护跨度重叠也会在 Translate 准备阶段明确失败。
 
 ## 引擎负责 scope
 
@@ -46,6 +48,14 @@ Placeholder 绑定建立安全表示时才显示目标文本，否则显示保�
 
 任一 Unit 的原文无法完成保护或语言投影时，ATT 不会删除它后发送残缺 Group。包含该
 Unit 的完整 TaskBlock 不发送，并按相应引擎的规划失败语义报告。
+
+Placeholder 叶子问题使用稳定 code 区分 worker 启动、PCRE2 匹配、空匹配、缺少 `text`
+捕获、无效范围、重叠、跨文本单元边界和保留 token namespace。诊断保留规则来源
+（外部文件路径或 `project_snapshot`）、实际规则号、可证明的 UTF-8 字节范围，以及完整
+引擎 locator：Generic 使用 relative path、group ID、unit ID 和 role；RPG Maker 使用
+owner、group location 与 role。具体 issue 唯一决定 `resolution = fix_placeholder_rules`；
+诊断不保存游戏正文。规划因此失败时不发模型请求，数据库保持不变，并由
+`translation.finished` 的 failed 结果引用同一 occurrence。
 
 `translate --placeholders FILE` 在模型请求之前完整解析并原子替换当前项目规则。省略参数
 时复用当前规则；`rule = []` 显式清空。解析失败时项目保持不变，也不发出请求。

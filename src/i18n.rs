@@ -491,52 +491,40 @@ pub(crate) enum UiMessage<'a> {
     },
     CliInvalidUtf8,
     CliParseFailure,
-    ErrorStateAppliedFinalization,
     DiagnosticTitle {
         code: &'a str,
     },
     DiagnosticStage {
         stage: &'a str,
     },
-    DiagnosticSubject {
+    DiagnosticLocation {
         subject: &'a str,
     },
-    DiagnosticSubjectValue {
-        kind: &'a str,
-        value: &'a str,
-    },
-    DiagnosticReason {
+    DiagnosticExplanation {
         reason: &'a str,
     },
-    DiagnosticImpact {
+    DiagnosticEffect {
         impact: &'a str,
     },
-    DiagnosticAction {
+    DiagnosticResolution {
         action: &'a str,
-    },
-    DiagnosticRecovery {
-        recovery: &'a str,
-    },
-    DiagnosticRecoveryValue {
-        kind: &'a str,
-        value: &'a str,
     },
     DiagnosticRelated {
         index: u64,
     },
+    DiagnosticRelationValue {
+        code: &'a str,
+    },
     DiagnosticStageValue {
         code: &'a str,
     },
-    DiagnosticImpactValue {
+    DiagnosticEffectValue {
         code: &'a str,
     },
-    DiagnosticActionValue {
+    DiagnosticResolutionValue {
         code: &'a str,
     },
     DiagnosticFailureValue {
-        code: &'a str,
-    },
-    DiagnosticIoKindValue {
         code: &'a str,
     },
     DiagnosticConfigurationRuleValue {
@@ -546,113 +534,10 @@ pub(crate) enum UiMessage<'a> {
         actual: u64,
         maximum: u64,
     },
-    DiagnosticIoReason {
-        operation: &'a str,
-        kind: &'a str,
-    },
-    DiagnosticIoReasonWithOsCode {
-        operation: &'a str,
-        kind: &'a str,
-        os_code: &'a str,
-    },
-    DiagnosticIoReasonWithSystemMessage {
-        operation: &'a str,
-        kind: &'a str,
-        system_message: &'a str,
-    },
-    DiagnosticIoReasonWithOsCodeAndSystemMessage {
-        operation: &'a str,
-        kind: &'a str,
-        os_code: &'a str,
-        system_message: &'a str,
-    },
-    DiagnosticFailureWithDetail {
-        failure: &'a str,
-        detail: &'a str,
-    },
-    DiagnosticInvalidUtf8 {
-        valid_up_to: u64,
-        error_len: u64,
-    },
-    DiagnosticIncompleteUtf8 {
-        valid_up_to: u64,
-    },
-    DiagnosticTomlFailureValue {
-        code: &'a str,
-        expected: &'a str,
-    },
-    DiagnosticTomlExpectedKindValue {
-        code: &'a str,
-    },
-    DiagnosticInvalidToml {
-        resource: &'a str,
-        failure: &'a str,
-    },
-    DiagnosticInvalidTomlAt {
-        line: u64,
-        column: u64,
-        resource: &'a str,
-        failure: &'a str,
-    },
-    DiagnosticHttpNoDetails,
-    DiagnosticHttpStatus {
-        status: u64,
-    },
-    DiagnosticHttpRetryAfter {
-        seconds: u64,
-    },
-    DiagnosticHttpProviderCode {
-        code: &'a str,
-    },
-    DiagnosticHttpProviderType {
-        kind: &'a str,
-    },
-    DiagnosticHttpProviderMessage {
-        message: &'a str,
-    },
-    DiagnosticHttpFactSeparator,
-    DiagnosticSqlite {
-        primary_code: &'a str,
-        extended_code: &'a str,
-    },
-    DiagnosticWindowsStatus {
-        operation: &'a str,
-        status: &'a str,
-    },
-    DiagnosticResource {
-        resource: &'a str,
-        actual: u64,
-    },
-    DiagnosticResourceWithMaximum {
-        resource: &'a str,
-        actual: u64,
-        maximum: u64,
-    },
     ErrorNoExecutableExtractOwner,
-    ErrorPlanSaveFailedApplied,
-    ErrorPlanSaveOutcomeUnknown,
     PlanSourceExplicit,
     PlanSourceProjectState,
     PlanSourceProductDefault,
-    LogLabelPhaseCheckProject,
-    LogLabelPhaseScanSource,
-    LogLabelPhasePrepareCandidate,
-    LogLabelPhaseUpdateDatabase,
-    LogLabelPhasePublish,
-    LogLabelPhaseBuiltin,
-    LogLabelPhaseRules,
-    LogLabelPhaseLua,
-    LogLabelPhasePlanning,
-    LogLabelPhaseConfirmedTasks,
-    LogLabelPhaseNoWork,
-    LogLabelPhaseReadAssets,
-    LogLabelPhasePlanRpgMakerWriteBack,
-    LogLabelPhaseRewriteDocuments,
-    LogLabelPhaseValidateCandidate,
-    LogLabelTaskComplete,
-    LogLabelTaskPartial,
-    LogLabelTaskUnavailable,
-    LogLabelTaskFailed,
     NoticeInitReusePath {
         path: &'a str,
     },
@@ -802,6 +687,9 @@ pub(crate) enum UiMessage<'a> {
     LogRunCancelled {
         command: &'a str,
     },
+    LogRunRecoveryRequired {
+        command: &'a str,
+    },
     LogPerformanceCounters {
         sqlite_control_attempted_total: u64,
         candidate_validation_started: u64,
@@ -827,17 +715,36 @@ pub(crate) enum UiMessage<'a> {
     LogPhaseStarted {
         phase: &'a str,
     },
-    LogPhaseFinished {
+    LogPhaseCompleted {
         phase: &'a str,
     },
+    LogPhaseStopped {
+        phase: &'a str,
+        outcome: &'a str,
+    },
+    LogCancellationRequested {
+        confirmed: u64,
+        total: u64,
+    },
+    LogCancellationRequestedIndeterminate {
+        confirmed: u64,
+    },
+    LogRunPlanFinalized {
+        result: &'a str,
+    },
+    LogTranslationFinished {
+        result: &'a str,
+    },
+    LogPublicationStarted {
+        path: &'a str,
+    },
+    LogPublicationFinished {
+        result: &'a str,
+    },
+    LogProjectLogDegraded {
+        failure_kinds: u64,
+    },
     LogRetrySummary {
-        count: u64,
-    },
-    LogNoWork {
-        reason: &'a str,
-    },
-    LogNoWorkTranslationUpToDate,
-    LogPartialResult {
         count: u64,
     },
     LogTranslationTaskStarted {
@@ -848,10 +755,8 @@ pub(crate) enum UiMessage<'a> {
         index: u64,
         outcome: &'a str,
     },
-    LogTranslationTaskDiagnostic {
-        index: u64,
-        attempts: u64,
-        diagnostic: &'a str,
+    LogTaskOutcomeValue {
+        outcome: &'a str,
     },
     TaskRecordTitle {
         ordinal: &'a str,
@@ -948,36 +853,9 @@ pub(crate) enum UiMessage<'a> {
     TaskRecordAcceptedOutcomeUnknown {
         accepted: u64,
     },
-    TaskRecordRejectedHeading,
-    TaskRecordRejectedItem {
-        id: &'a str,
-        reason: &'a str,
-    },
-    TaskRecordProtocolDiagnostic {
-        diagnostic: &'a str,
-    },
-    TaskRecordUnavailableReason {
-        reason: &'a str,
-    },
     TaskRecordTaskDiagnostic {
         code: &'a str,
         reason: &'a str,
-    },
-    TaskRecordRejectionReason {
-        code: &'a str,
-        line: u64,
-        expected: u64,
-        actual: u64,
-        detail: &'a str,
-        expected_blank: &'a str,
-    },
-    TaskRecordProtocolDetail {
-        code: &'a str,
-        index: u64,
-        detail: &'a str,
-    },
-    TaskRecordUnavailableDetail {
-        code: &'a str,
     },
     TaskRecordDurationSeconds {
         value: &'a str,
@@ -1045,74 +923,23 @@ impl UiMessage<'_> {
             Self::CliWrongNumberOfValues { .. } => "cli-wrong-number-of-values",
             Self::CliInvalidUtf8 => "cli-invalid-utf8",
             Self::CliParseFailure => "cli-parse-failure",
-            Self::ErrorStateAppliedFinalization => "error-state-applied-finalization",
             Self::DiagnosticTitle { .. } => "diagnostic-title",
             Self::DiagnosticStage { .. } => "diagnostic-stage",
-            Self::DiagnosticSubject { .. } => "diagnostic-subject",
-            Self::DiagnosticSubjectValue { .. } => "diagnostic-subject-value",
-            Self::DiagnosticReason { .. } => "diagnostic-reason",
-            Self::DiagnosticImpact { .. } => "diagnostic-impact",
-            Self::DiagnosticAction { .. } => "diagnostic-action",
-            Self::DiagnosticRecovery { .. } => "diagnostic-recovery",
-            Self::DiagnosticRecoveryValue { .. } => "diagnostic-recovery-value",
+            Self::DiagnosticLocation { .. } => "diagnostic-location",
+            Self::DiagnosticExplanation { .. } => "diagnostic-explanation",
+            Self::DiagnosticEffect { .. } => "diagnostic-effect",
+            Self::DiagnosticResolution { .. } => "diagnostic-resolution",
             Self::DiagnosticRelated { .. } => "diagnostic-related",
+            Self::DiagnosticRelationValue { .. } => "diagnostic-relation-value",
             Self::DiagnosticStageValue { .. } => "diagnostic-stage-value",
-            Self::DiagnosticImpactValue { .. } => "diagnostic-impact-value",
-            Self::DiagnosticActionValue { .. } => "diagnostic-action-value",
+            Self::DiagnosticEffectValue { .. } => "diagnostic-effect-value",
+            Self::DiagnosticResolutionValue { .. } => "diagnostic-resolution-value",
             Self::DiagnosticFailureValue { .. } => "diagnostic-failure-value",
-            Self::DiagnosticIoKindValue { .. } => "diagnostic-io-kind-value",
             Self::DiagnosticConfigurationRuleValue { .. } => "diagnostic-configuration-rule-value",
-            Self::DiagnosticIoReason { .. } => "diagnostic-io-reason",
-            Self::DiagnosticIoReasonWithOsCode { .. } => "diagnostic-io-reason-with-os-code",
-            Self::DiagnosticIoReasonWithSystemMessage { .. } => {
-                "diagnostic-io-reason-with-system-message"
-            }
-            Self::DiagnosticIoReasonWithOsCodeAndSystemMessage { .. } => {
-                "diagnostic-io-reason-with-os-code-and-system-message"
-            }
-            Self::DiagnosticFailureWithDetail { .. } => "diagnostic-failure-with-detail",
-            Self::DiagnosticInvalidUtf8 { .. } => "diagnostic-invalid-utf8",
-            Self::DiagnosticIncompleteUtf8 { .. } => "diagnostic-incomplete-utf8",
-            Self::DiagnosticTomlFailureValue { .. } => "diagnostic-toml-failure-value",
-            Self::DiagnosticTomlExpectedKindValue { .. } => "diagnostic-toml-expected-kind-value",
-            Self::DiagnosticInvalidToml { .. } => "diagnostic-invalid-toml",
-            Self::DiagnosticInvalidTomlAt { .. } => "diagnostic-invalid-toml-at",
-            Self::DiagnosticHttpNoDetails => "diagnostic-http-no-details",
-            Self::DiagnosticHttpStatus { .. } => "diagnostic-http-status",
-            Self::DiagnosticHttpRetryAfter { .. } => "diagnostic-http-retry-after",
-            Self::DiagnosticHttpProviderCode { .. } => "diagnostic-http-provider-code",
-            Self::DiagnosticHttpProviderType { .. } => "diagnostic-http-provider-type",
-            Self::DiagnosticHttpProviderMessage { .. } => "diagnostic-http-provider-message",
-            Self::DiagnosticHttpFactSeparator => "diagnostic-http-fact-separator",
-            Self::DiagnosticSqlite { .. } => "diagnostic-sqlite",
-            Self::DiagnosticWindowsStatus { .. } => "diagnostic-windows-status",
-            Self::DiagnosticResource { .. } => "diagnostic-resource",
-            Self::DiagnosticResourceWithMaximum { .. } => "diagnostic-resource-with-maximum",
             Self::ErrorNoExecutableExtractOwner => "error-no-executable-extract-owner",
-            Self::ErrorPlanSaveFailedApplied => "error-plan-save-failed-applied",
-            Self::ErrorPlanSaveOutcomeUnknown => "error-plan-save-outcome-unknown",
             Self::PlanSourceExplicit => "plan-source-explicit",
             Self::PlanSourceProjectState => "plan-source-project-state",
             Self::PlanSourceProductDefault => "plan-source-product-default",
-            Self::LogLabelPhaseCheckProject => "log-label-phase-check-project",
-            Self::LogLabelPhaseScanSource => "log-label-phase-scan-source",
-            Self::LogLabelPhasePrepareCandidate => "log-label-phase-prepare-candidate",
-            Self::LogLabelPhaseUpdateDatabase => "log-label-phase-update-database",
-            Self::LogLabelPhasePublish => "log-label-phase-publish",
-            Self::LogLabelPhaseBuiltin => "log-label-phase-builtin",
-            Self::LogLabelPhaseRules => "log-label-phase-rules",
-            Self::LogLabelPhaseLua => "log-label-phase-lua",
-            Self::LogLabelPhasePlanning => "log-label-phase-planning",
-            Self::LogLabelPhaseConfirmedTasks => "log-label-phase-confirmed-tasks",
-            Self::LogLabelPhaseNoWork => "log-label-phase-no-work",
-            Self::LogLabelPhaseReadAssets => "log-label-phase-read-assets",
-            Self::LogLabelPhasePlanRpgMakerWriteBack => "log-label-phase-plan-rpg-maker-write-back",
-            Self::LogLabelPhaseRewriteDocuments => "log-label-phase-rewrite-documents",
-            Self::LogLabelPhaseValidateCandidate => "log-label-phase-validate-candidate",
-            Self::LogLabelTaskComplete => "log-label-task-complete",
-            Self::LogLabelTaskPartial => "log-label-task-partial",
-            Self::LogLabelTaskUnavailable => "log-label-task-unavailable",
-            Self::LogLabelTaskFailed => "log-label-task-failed",
             Self::NoticeInitReusePath { .. } => "notice-init-reuse-path",
             Self::NoticeExtractReuseOwners { .. } => "notice-extract-reuse-owners",
             Self::NoticeTranslateReuseProfile { .. } => "notice-translate-reuse-profile",
@@ -1173,20 +1000,28 @@ impl UiMessage<'_> {
             Self::LogRunFailed { .. } => "log-run-failed",
             Self::LogRunOutcomeUnknown { .. } => "log-run-outcome-unknown",
             Self::LogRunCancelled { .. } => "log-run-cancelled",
+            Self::LogRunRecoveryRequired { .. } => "log-run-recovery-required",
             Self::LogPerformanceCounters { .. } => "log-performance-counters",
             Self::LogLuaScript { .. } => "log-lua-script",
             Self::LogLuaPrint { .. } => "log-lua-print",
             Self::LogLuaSummary { .. } => "log-lua-summary",
             Self::LogPlanResolved { .. } => "log-plan-resolved",
             Self::LogPhaseStarted { .. } => "log-phase-started",
-            Self::LogPhaseFinished { .. } => "log-phase-finished",
+            Self::LogPhaseCompleted { .. } => "log-phase-completed",
+            Self::LogPhaseStopped { .. } => "log-phase-stopped",
+            Self::LogCancellationRequested { .. } => "log-cancellation-requested",
+            Self::LogCancellationRequestedIndeterminate { .. } => {
+                "log-cancellation-requested-indeterminate"
+            }
+            Self::LogRunPlanFinalized { .. } => "log-run-plan-finalized",
+            Self::LogTranslationFinished { .. } => "log-translation-finished",
+            Self::LogPublicationStarted { .. } => "log-publication-started",
+            Self::LogPublicationFinished { .. } => "log-publication-finished",
+            Self::LogProjectLogDegraded { .. } => "log-project-log-degraded",
             Self::LogRetrySummary { .. } => "log-retry-summary",
-            Self::LogNoWork { .. } => "log-no-work",
-            Self::LogNoWorkTranslationUpToDate => "log-no-work-translation-up-to-date",
-            Self::LogPartialResult { .. } => "log-partial-result",
             Self::LogTranslationTaskStarted { .. } => "log-translation-task-started",
             Self::LogTranslationTaskFinished { .. } => "log-translation-task-finished",
-            Self::LogTranslationTaskDiagnostic { .. } => "log-translation-task-diagnostic",
+            Self::LogTaskOutcomeValue { .. } => "log-task-outcome-value",
             Self::TaskRecordTitle { .. } => "task-record-title",
             Self::TaskRecordStateLabel { .. } => "task-record-state-label",
             Self::TaskRecordSummaryWithWritten { .. } => "task-record-summary-with-written",
@@ -1218,14 +1053,7 @@ impl UiMessage<'_> {
             Self::TaskRecordFinalStatus { .. } => "task-record-final-status",
             Self::TaskRecordAcceptedWritten { .. } => "task-record-accepted-written",
             Self::TaskRecordAcceptedOutcomeUnknown { .. } => "task-record-accepted-outcome-unknown",
-            Self::TaskRecordRejectedHeading => "task-record-rejected-heading",
-            Self::TaskRecordRejectedItem { .. } => "task-record-rejected-item",
-            Self::TaskRecordProtocolDiagnostic { .. } => "task-record-protocol-diagnostic",
-            Self::TaskRecordUnavailableReason { .. } => "task-record-unavailable-reason",
             Self::TaskRecordTaskDiagnostic { .. } => "task-record-task-diagnostic",
-            Self::TaskRecordRejectionReason { .. } => "task-record-rejection-reason",
-            Self::TaskRecordProtocolDetail { .. } => "task-record-protocol-detail",
-            Self::TaskRecordUnavailableDetail { .. } => "task-record-unavailable-detail",
             Self::TaskRecordDurationSeconds { .. } => "task-record-duration-seconds",
             Self::TaskRecordDurationMilliseconds { .. } => "task-record-duration-milliseconds",
         }
@@ -1286,9 +1114,9 @@ impl UiMessage<'_> {
                 set_text(&mut arguments, "region", region);
                 set_number(&mut arguments, "max_fullwidth_chars", max_fullwidth_chars);
             }
-            Self::NoticeManualLayout { count }
-            | Self::LogRetrySummary { count }
-            | Self::LogPartialResult { count } => set_number(&mut arguments, "count", count),
+            Self::NoticeManualLayout { count } | Self::LogRetrySummary { count } => {
+                set_number(&mut arguments, "count", count);
+            }
             Self::ProgressExtractOwner { owner } => {
                 set_text(&mut arguments, "owner", owner);
             }
@@ -1399,7 +1227,10 @@ impl UiMessage<'_> {
             | Self::LogRunSucceeded { command }
             | Self::LogRunFailed { command }
             | Self::LogRunOutcomeUnknown { command }
-            | Self::LogRunCancelled { command } => set_text(&mut arguments, "command", command),
+            | Self::LogRunCancelled { command }
+            | Self::LogRunRecoveryRequired { command } => {
+                set_text(&mut arguments, "command", command);
+            }
             Self::LogPerformanceCounters {
                 sqlite_control_attempted_total,
                 candidate_validation_started,
@@ -1444,10 +1275,29 @@ impl UiMessage<'_> {
                 set_text(&mut arguments, "command", command);
                 set_text(&mut arguments, "source", source);
             }
-            Self::LogPhaseStarted { phase } | Self::LogPhaseFinished { phase } => {
+            Self::LogPhaseStarted { phase } | Self::LogPhaseCompleted { phase } => {
                 set_text(&mut arguments, "phase", phase);
             }
-            Self::LogNoWork { reason } => set_text(&mut arguments, "reason", reason),
+            Self::LogPhaseStopped { phase, outcome } => {
+                set_text(&mut arguments, "phase", phase);
+                set_text(&mut arguments, "outcome", outcome);
+            }
+            Self::LogCancellationRequested { confirmed, total } => {
+                set_number(&mut arguments, "confirmed", confirmed);
+                set_number(&mut arguments, "total", total);
+            }
+            Self::LogCancellationRequestedIndeterminate { confirmed } => {
+                set_number(&mut arguments, "confirmed", confirmed);
+            }
+            Self::LogRunPlanFinalized { result }
+            | Self::LogTranslationFinished { result }
+            | Self::LogPublicationFinished { result } => {
+                set_text(&mut arguments, "result", result);
+            }
+            Self::LogPublicationStarted { path } => set_text(&mut arguments, "path", path),
+            Self::LogProjectLogDegraded { failure_kinds } => {
+                set_number(&mut arguments, "failure_kinds", failure_kinds);
+            }
             Self::LogTranslationTaskStarted { index, total } => {
                 set_number(&mut arguments, "index", index);
                 set_number(&mut arguments, "total", total);
@@ -1456,14 +1306,8 @@ impl UiMessage<'_> {
                 set_number(&mut arguments, "index", index);
                 set_text(&mut arguments, "outcome", outcome);
             }
-            Self::LogTranslationTaskDiagnostic {
-                index,
-                attempts,
-                diagnostic,
-            } => {
-                set_number(&mut arguments, "index", index);
-                set_number(&mut arguments, "attempts", attempts);
-                set_text(&mut arguments, "diagnostic", diagnostic);
+            Self::LogTaskOutcomeValue { outcome } => {
+                set_text(&mut arguments, "outcome", outcome);
             }
             Self::TaskRecordTitle { ordinal, state } => {
                 set_text(&mut arguments, "ordinal", ordinal);
@@ -1570,46 +1414,9 @@ impl UiMessage<'_> {
             Self::TaskRecordAcceptedOutcomeUnknown { accepted } => {
                 set_number(&mut arguments, "accepted", accepted);
             }
-            Self::TaskRecordRejectedItem { id, reason } => {
-                set_text(&mut arguments, "id", id);
-                set_text(&mut arguments, "reason", reason);
-            }
-            Self::TaskRecordProtocolDiagnostic { diagnostic } => {
-                set_text(&mut arguments, "diagnostic", diagnostic);
-            }
-            Self::TaskRecordUnavailableReason { reason } => {
-                set_text(&mut arguments, "reason", reason);
-            }
             Self::TaskRecordTaskDiagnostic { code, reason } => {
                 set_text(&mut arguments, "code", code);
                 set_text(&mut arguments, "reason", reason);
-            }
-            Self::TaskRecordRejectionReason {
-                code,
-                line,
-                expected,
-                actual,
-                detail,
-                expected_blank,
-            } => {
-                set_text(&mut arguments, "code", code);
-                set_number(&mut arguments, "line", line);
-                set_number(&mut arguments, "expected", expected);
-                set_number(&mut arguments, "actual", actual);
-                set_text(&mut arguments, "detail", detail);
-                set_text(&mut arguments, "expected_blank", expected_blank);
-            }
-            Self::TaskRecordProtocolDetail {
-                code,
-                index,
-                detail,
-            } => {
-                set_text(&mut arguments, "code", code);
-                set_number(&mut arguments, "index", index);
-                set_text(&mut arguments, "detail", detail);
-            }
-            Self::TaskRecordUnavailableDetail { code } => {
-                set_text(&mut arguments, "code", code);
             }
             Self::TaskRecordDurationSeconds { value } => {
                 set_text(&mut arguments, "value", value);
@@ -1619,26 +1426,16 @@ impl UiMessage<'_> {
             }
             Self::DiagnosticTitle { code } => set_text(&mut arguments, "code", code),
             Self::DiagnosticStage { stage } => set_text(&mut arguments, "stage", stage),
-            Self::DiagnosticSubject { subject } => set_text(&mut arguments, "subject", subject),
-            Self::DiagnosticSubjectValue { kind, value } => {
-                set_text(&mut arguments, "kind", kind);
-                set_text(&mut arguments, "value", value);
-            }
-            Self::DiagnosticReason { reason } => set_text(&mut arguments, "reason", reason),
-            Self::DiagnosticImpact { impact } => set_text(&mut arguments, "impact", impact),
-            Self::DiagnosticAction { action } => set_text(&mut arguments, "action", action),
-            Self::DiagnosticRecovery { recovery } => set_text(&mut arguments, "recovery", recovery),
-            Self::DiagnosticRecoveryValue { kind, value } => {
-                set_text(&mut arguments, "kind", kind);
-                set_text(&mut arguments, "value", value);
-            }
+            Self::DiagnosticLocation { subject } => set_text(&mut arguments, "subject", subject),
+            Self::DiagnosticExplanation { reason } => set_text(&mut arguments, "reason", reason),
+            Self::DiagnosticEffect { impact } => set_text(&mut arguments, "impact", impact),
+            Self::DiagnosticResolution { action } => set_text(&mut arguments, "action", action),
             Self::DiagnosticRelated { index } => set_number(&mut arguments, "index", index),
             Self::DiagnosticStageValue { code }
-            | Self::DiagnosticImpactValue { code }
-            | Self::DiagnosticActionValue { code }
-            | Self::DiagnosticFailureValue { code }
-            | Self::DiagnosticIoKindValue { code }
-            | Self::DiagnosticTomlExpectedKindValue { code } => {
+            | Self::DiagnosticRelationValue { code }
+            | Self::DiagnosticEffectValue { code }
+            | Self::DiagnosticResolutionValue { code }
+            | Self::DiagnosticFailureValue { code } => {
                 set_text(&mut arguments, "code", code);
             }
             Self::DiagnosticConfigurationRuleValue {
@@ -1651,111 +1448,6 @@ impl UiMessage<'_> {
                 set_text(&mut arguments, "code", code);
                 set_number(&mut arguments, "line", line);
                 set_number(&mut arguments, "column", column);
-                set_number(&mut arguments, "actual", actual);
-                set_number(&mut arguments, "maximum", maximum);
-            }
-            Self::DiagnosticIoReason { operation, kind } => {
-                set_text(&mut arguments, "operation", operation);
-                set_text(&mut arguments, "kind", kind);
-            }
-            Self::DiagnosticIoReasonWithOsCode {
-                operation,
-                kind,
-                os_code,
-            } => {
-                set_text(&mut arguments, "operation", operation);
-                set_text(&mut arguments, "kind", kind);
-                set_text(&mut arguments, "os_code", os_code);
-            }
-            Self::DiagnosticIoReasonWithSystemMessage {
-                operation,
-                kind,
-                system_message,
-            } => {
-                set_text(&mut arguments, "operation", operation);
-                set_text(&mut arguments, "kind", kind);
-                set_text(&mut arguments, "system_message", system_message);
-            }
-            Self::DiagnosticIoReasonWithOsCodeAndSystemMessage {
-                operation,
-                kind,
-                os_code,
-                system_message,
-            } => {
-                set_text(&mut arguments, "operation", operation);
-                set_text(&mut arguments, "kind", kind);
-                set_text(&mut arguments, "os_code", os_code);
-                set_text(&mut arguments, "system_message", system_message);
-            }
-            Self::DiagnosticFailureWithDetail { failure, detail } => {
-                set_text(&mut arguments, "failure", failure);
-                set_text(&mut arguments, "detail", detail);
-            }
-            Self::DiagnosticInvalidUtf8 {
-                valid_up_to,
-                error_len,
-            } => {
-                set_number(&mut arguments, "valid_up_to", valid_up_to);
-                set_number(&mut arguments, "error_len", error_len);
-            }
-            Self::DiagnosticIncompleteUtf8 { valid_up_to } => {
-                set_number(&mut arguments, "valid_up_to", valid_up_to);
-            }
-            Self::DiagnosticTomlFailureValue { code, expected } => {
-                set_text(&mut arguments, "code", code);
-                set_text(&mut arguments, "expected", expected);
-            }
-            Self::DiagnosticInvalidToml { resource, failure } => {
-                set_text(&mut arguments, "resource", resource);
-                set_text(&mut arguments, "failure", failure);
-            }
-            Self::DiagnosticInvalidTomlAt {
-                line,
-                column,
-                resource,
-                failure,
-            } => {
-                set_number(&mut arguments, "line", line);
-                set_number(&mut arguments, "column", column);
-                set_text(&mut arguments, "resource", resource);
-                set_text(&mut arguments, "failure", failure);
-            }
-            Self::DiagnosticHttpStatus { status } => {
-                set_number(&mut arguments, "status", status);
-            }
-            Self::DiagnosticHttpRetryAfter { seconds } => {
-                set_number(&mut arguments, "seconds", seconds);
-            }
-            Self::DiagnosticHttpProviderCode { code } => {
-                set_text(&mut arguments, "code", code);
-            }
-            Self::DiagnosticHttpProviderType { kind } => {
-                set_text(&mut arguments, "kind", kind);
-            }
-            Self::DiagnosticHttpProviderMessage { message } => {
-                set_text(&mut arguments, "message", message);
-            }
-            Self::DiagnosticSqlite {
-                primary_code,
-                extended_code,
-            } => {
-                set_text(&mut arguments, "primary_code", primary_code);
-                set_text(&mut arguments, "extended_code", extended_code);
-            }
-            Self::DiagnosticWindowsStatus { operation, status } => {
-                set_text(&mut arguments, "operation", operation);
-                set_text(&mut arguments, "status", status);
-            }
-            Self::DiagnosticResource { resource, actual } => {
-                set_text(&mut arguments, "resource", resource);
-                set_number(&mut arguments, "actual", actual);
-            }
-            Self::DiagnosticResourceWithMaximum {
-                resource,
-                actual,
-                maximum,
-            } => {
-                set_text(&mut arguments, "resource", resource);
                 set_number(&mut arguments, "actual", actual);
                 set_number(&mut arguments, "maximum", maximum);
             }
@@ -1801,35 +1493,10 @@ impl UiMessage<'_> {
             | Self::CliMissingSubcommand
             | Self::CliInvalidUtf8
             | Self::CliParseFailure
-            | Self::ErrorStateAppliedFinalization
-            | Self::DiagnosticHttpNoDetails
-            | Self::DiagnosticHttpFactSeparator
             | Self::ErrorNoExecutableExtractOwner
-            | Self::ErrorPlanSaveFailedApplied
-            | Self::ErrorPlanSaveOutcomeUnknown
             | Self::PlanSourceExplicit
             | Self::PlanSourceProjectState
             | Self::PlanSourceProductDefault
-            | Self::LogLabelPhaseCheckProject
-            | Self::LogLabelPhaseScanSource
-            | Self::LogLabelPhasePrepareCandidate
-            | Self::LogLabelPhaseUpdateDatabase
-            | Self::LogLabelPhasePublish
-            | Self::LogLabelPhaseBuiltin
-            | Self::LogLabelPhaseRules
-            | Self::LogLabelPhaseLua
-            | Self::LogLabelPhasePlanning
-            | Self::LogLabelPhaseConfirmedTasks
-            | Self::LogLabelPhaseNoWork
-            | Self::LogLabelPhaseReadAssets
-            | Self::LogLabelPhasePlanRpgMakerWriteBack
-            | Self::LogLabelPhaseRewriteDocuments
-            | Self::LogLabelPhaseValidateCandidate
-            | Self::LogLabelTaskComplete
-            | Self::LogLabelTaskPartial
-            | Self::LogLabelTaskUnavailable
-            | Self::LogLabelTaskFailed
-            | Self::LogNoWorkTranslationUpToDate
             | Self::NoticeNoModelRequest
             | Self::NoticeLogDegraded
             | Self::NoticeTaskRecordsDegraded
@@ -1870,8 +1537,7 @@ impl UiMessage<'_> {
             | Self::TaskRecordAttemptsHeading
             | Self::TaskRecordFinalResultHeading
             | Self::TaskRecordNoRequest
-            | Self::TaskRecordEmptyAssistant
-            | Self::TaskRecordRejectedHeading => {}
+            | Self::TaskRecordEmptyAssistant => {}
         }
         arguments
     }
@@ -1883,17 +1549,6 @@ pub(crate) fn project_log_value_source_label(code: &str) -> Option<UiMessage<'st
         "explicit" => Some(UiMessage::PlanSourceExplicit),
         "project_state" => Some(UiMessage::PlanSourceProjectState),
         "product_default" => Some(UiMessage::PlanSourceProductDefault),
-        _ => None,
-    }
-}
-
-/// 把翻译任务 payload 的稳定结果代码映射到本地化标签。
-pub(crate) fn project_log_task_outcome_label(code: &str) -> Option<UiMessage<'static>> {
-    match code {
-        "complete" => Some(UiMessage::LogLabelTaskComplete),
-        "partial" => Some(UiMessage::LogLabelTaskPartial),
-        "unavailable" => Some(UiMessage::LogLabelTaskUnavailable),
-        "failed" => Some(UiMessage::LogLabelTaskFailed),
         _ => None,
     }
 }
@@ -2097,6 +1752,166 @@ mod tests {
     }
 
     #[test]
+    fn current_diagnostic_stages_and_summaries_render_in_every_locale() {
+        const STAGES: &[&str] = &[
+            "process_startup",
+            "process_output",
+            "configuration",
+            "command_preparation",
+            "project_opening",
+            "init",
+            "extract",
+            "translate",
+            "write_back",
+            "lua",
+            "model_request",
+            "run_plan_finalization",
+            "publication",
+            "shutdown",
+            "logging",
+            "runtime",
+        ];
+        const SUMMARIES: &[&str] = &[
+            "already_exists",
+            "backup_incomplete",
+            "cancelled",
+            "concurrent_modification",
+            "concurrent_shutdown",
+            "conflicting_values",
+            "duplicate_identifier",
+            "executor_closed",
+            "executor_state_poisoned",
+            "external_service_rejected",
+            "external_service_unavailable",
+            "extraction_out_of_date",
+            "file_identity_changed",
+            "finalization_failed",
+            "generic_extract_required",
+            "interactive_session_already_open",
+            "internal_invariant",
+            "invalid_content",
+            "invalid_encoding",
+            "invalid_path",
+            "invalid_response_contract",
+            "invalid_syntax",
+            "invalid_value",
+            "journal_corrupt",
+            "lock_cancelled",
+            "lua_compilation_failed",
+            "lua_execution_failed",
+            "manual_layout_required",
+            "missing_required_value",
+            "non_local_volume",
+            "non_ntfs_volume",
+            "not_found",
+            "operation_failed",
+            "placeholder_projection_failed",
+            "profile_not_found",
+            "recovery_required",
+            "reparse_point_forbidden",
+            "request_serialization_failed",
+            "unsupported_windows_code_page",
+            "resource_limit",
+            "resource_limit_exceeded",
+            "response_parsing_failed",
+            "rollback_failed",
+            "rules_invalid_capture_range",
+            "rules_missing_text_capture",
+            "rules_overlapping_capture",
+            "rules_pattern_match_failed",
+            "rules_zero_width_match",
+            "source_snapshot_mismatch",
+            "state_mismatch",
+            "target_already_exists",
+            "transaction_outcome_unknown",
+            "transaction_rolled_back",
+            "transport_failed",
+            "unavailable",
+            "unexpected_artifact",
+            "worker_channel_closed",
+            "worker_panicked",
+            "worker_spawn_failed",
+            "write_back_candidate_invalid",
+            "write_back_recovery_required",
+            "wrong_publisher_instance",
+            "case_sensitive_directory",
+        ];
+
+        for locale in UiLocale::ALL {
+            let localizer = UiLocalizer::new(locale);
+            for code in STAGES {
+                let rendered = localizer.format(UiMessage::DiagnosticStageValue { code });
+                assert!(
+                    !rendered.contains("__ATT_FALLBACK__"),
+                    "{locale} 缺少诊断阶段 {code}"
+                );
+            }
+            for code in SUMMARIES {
+                let rendered = localizer.format(UiMessage::DiagnosticFailureValue { code });
+                assert!(
+                    !rendered.contains("__ATT_FALLBACK__"),
+                    "{locale} 缺少诊断摘要 {code}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn current_diagnostic_effects_and_resolutions_render_in_every_locale() {
+        for locale in UiLocale::ALL {
+            let localizer = UiLocalizer::new(locale);
+            for code in [
+                "unchanged",
+                "progress_preserved",
+                "applied",
+                "applied_run_plan_not_saved",
+                "applied_finalization_failed",
+                "recovery_required",
+                "outcome_unknown",
+            ] {
+                let rendered = localizer.format(UiMessage::DiagnosticEffectValue { code });
+                assert!(
+                    !rendered.contains("__ATT_FALLBACK__"),
+                    "{locale} 缺少诊断状态影响 {code}"
+                );
+            }
+            for code in [
+                "fix_configuration",
+                "fix_input",
+                "fix_placeholder_rules",
+                "adjust_manual_layout",
+                "check_path_and_permissions",
+                "check_project_state",
+                "resolve_contention",
+                "check_model_service",
+                "preserve_recovery_artifacts",
+                "retry",
+                "report_bug",
+            ] {
+                let rendered = localizer.format(UiMessage::DiagnosticResolutionValue { code });
+                assert!(
+                    !rendered.contains("__ATT_FALLBACK__"),
+                    "{locale} 缺少诊断处理办法 {code}"
+                );
+            }
+            for code in [
+                "cleanup",
+                "rollback",
+                "discard",
+                "finalization",
+                "shutdown",
+                "observability",
+            ] {
+                let rendered = localizer.format(UiMessage::DiagnosticRelationValue { code });
+                assert!(
+                    !rendered.contains("__ATT_FALLBACK__"),
+                    "{locale} 缺少相关诊断关系 {code}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn russian_and_arabic_retry_summaries_use_locale_plural_rules() {
         let russian = UiLocalizer::new(UiLocale::Russian);
         assert!(
@@ -2155,18 +1970,11 @@ mod tests {
     }
 
     #[test]
-    fn project_log_string_codes_have_closed_localized_labels() {
+    fn project_log_value_sources_have_closed_localized_labels() {
         for source in ["explicit", "project_state", "product_default"] {
             assert!(project_log_value_source_label(source).is_some(), "{source}");
         }
-        for outcome in ["complete", "partial", "unavailable", "failed"] {
-            assert!(
-                project_log_task_outcome_label(outcome).is_some(),
-                "{outcome}"
-            );
-        }
         assert!(project_log_value_source_label("future").is_none());
-        assert!(project_log_task_outcome_label("future").is_none());
     }
 
     fn catalog_schema(source: &str) -> BTreeMap<String, BTreeSet<String>> {
@@ -2293,40 +2101,28 @@ mod tests {
             UiMessage::CliWrongNumberOfValues { argument: "--path" },
             UiMessage::CliInvalidUtf8,
             UiMessage::CliParseFailure,
-            UiMessage::ErrorStateAppliedFinalization,
             UiMessage::DiagnosticTitle {
                 code: "project.state",
             },
             UiMessage::DiagnosticStage { stage: "extract" },
-            UiMessage::DiagnosticSubject {
+            UiMessage::DiagnosticLocation {
                 subject: "project demo",
             },
-            UiMessage::DiagnosticSubjectValue {
-                kind: "project",
-                value: "demo",
-            },
-            UiMessage::DiagnosticReason {
+            UiMessage::DiagnosticExplanation {
                 reason: "state mismatch",
             },
-            UiMessage::DiagnosticImpact {
+            UiMessage::DiagnosticEffect {
                 impact: "unchanged",
             },
-            UiMessage::DiagnosticAction {
+            UiMessage::DiagnosticResolution {
                 action: "check project state",
             },
-            UiMessage::DiagnosticRecovery {
-                recovery: "C:\\project",
-            },
-            UiMessage::DiagnosticRecoveryValue {
-                kind: "transaction",
-                value: "rolled_back",
-            },
             UiMessage::DiagnosticRelated { index: 1 },
+            UiMessage::DiagnosticRelationValue { code: "cleanup" },
             UiMessage::DiagnosticStageValue { code: "extract" },
-            UiMessage::DiagnosticImpactValue { code: "unchanged" },
-            UiMessage::DiagnosticActionValue { code: "retry" },
+            UiMessage::DiagnosticEffectValue { code: "unchanged" },
+            UiMessage::DiagnosticResolutionValue { code: "retry" },
             UiMessage::DiagnosticFailureValue { code: "not_found" },
-            UiMessage::DiagnosticIoKindValue { code: "not_found" },
             UiMessage::DiagnosticConfigurationRuleValue {
                 code: "value_blank",
                 line: 0,
@@ -2334,101 +2130,10 @@ mod tests {
                 actual: 0,
                 maximum: 0,
             },
-            UiMessage::DiagnosticIoReason {
-                operation: "read",
-                kind: "not found",
-            },
-            UiMessage::DiagnosticIoReasonWithOsCode {
-                operation: "read",
-                kind: "not found",
-                os_code: "2",
-            },
-            UiMessage::DiagnosticIoReasonWithSystemMessage {
-                operation: "read",
-                kind: "not found",
-                system_message: "file missing",
-            },
-            UiMessage::DiagnosticIoReasonWithOsCodeAndSystemMessage {
-                operation: "read",
-                kind: "not found",
-                os_code: "2",
-                system_message: "file missing",
-            },
-            UiMessage::DiagnosticFailureWithDetail {
-                failure: "not found",
-                detail: "fixture",
-            },
-            UiMessage::DiagnosticInvalidUtf8 {
-                valid_up_to: 4,
-                error_len: 1,
-            },
-            UiMessage::DiagnosticIncompleteUtf8 { valid_up_to: 4 },
-            UiMessage::DiagnosticTomlFailureValue {
-                code: "type_mismatch",
-                expected: "a string",
-            },
-            UiMessage::DiagnosticTomlExpectedKindValue { code: "string" },
-            UiMessage::DiagnosticInvalidToml {
-                resource: "configuration",
-                failure: "invalid syntax",
-            },
-            UiMessage::DiagnosticInvalidTomlAt {
-                line: 1,
-                column: 2,
-                resource: "configuration",
-                failure: "invalid syntax",
-            },
-            UiMessage::DiagnosticHttpNoDetails,
-            UiMessage::DiagnosticHttpStatus { status: 429 },
-            UiMessage::DiagnosticHttpRetryAfter { seconds: 7 },
-            UiMessage::DiagnosticHttpProviderCode { code: "rate_limit" },
-            UiMessage::DiagnosticHttpProviderType { kind: "quota" },
-            UiMessage::DiagnosticHttpProviderMessage {
-                message: "request rejected",
-            },
-            UiMessage::DiagnosticHttpFactSeparator,
-            UiMessage::DiagnosticSqlite {
-                primary_code: "5",
-                extended_code: "517",
-            },
-            UiMessage::DiagnosticWindowsStatus {
-                operation: "rename",
-                status: "0xc0000001",
-            },
-            UiMessage::DiagnosticResource {
-                resource: "request bytes",
-                actual: 10,
-            },
-            UiMessage::DiagnosticResourceWithMaximum {
-                resource: "request bytes",
-                actual: 10,
-                maximum: 8,
-            },
             UiMessage::ErrorNoExecutableExtractOwner,
-            UiMessage::ErrorPlanSaveFailedApplied,
-            UiMessage::ErrorPlanSaveOutcomeUnknown,
             UiMessage::PlanSourceExplicit,
             UiMessage::PlanSourceProjectState,
             UiMessage::PlanSourceProductDefault,
-            UiMessage::LogLabelPhaseCheckProject,
-            UiMessage::LogLabelPhaseScanSource,
-            UiMessage::LogLabelPhasePrepareCandidate,
-            UiMessage::LogLabelPhaseUpdateDatabase,
-            UiMessage::LogLabelPhasePublish,
-            UiMessage::LogLabelPhaseBuiltin,
-            UiMessage::LogLabelPhaseRules,
-            UiMessage::LogLabelPhaseLua,
-            UiMessage::LogLabelPhasePlanning,
-            UiMessage::LogLabelPhaseConfirmedTasks,
-            UiMessage::LogLabelPhaseNoWork,
-            UiMessage::LogLabelPhaseReadAssets,
-            UiMessage::LogLabelPhasePlanRpgMakerWriteBack,
-            UiMessage::LogLabelPhaseRewriteDocuments,
-            UiMessage::LogLabelPhaseValidateCandidate,
-            UiMessage::LogLabelTaskComplete,
-            UiMessage::LogLabelTaskPartial,
-            UiMessage::LogLabelTaskUnavailable,
-            UiMessage::LogLabelTaskFailed,
             UiMessage::NoticeInitReusePath { path: "path" },
             UiMessage::NoticeExtractReuseOwners { owners: "owners" },
             UiMessage::NoticeTranslateReuseProfile { profile: "profile" },
@@ -2544,6 +2249,7 @@ mod tests {
             UiMessage::LogRunFailed { command: "extract" },
             UiMessage::LogRunOutcomeUnknown { command: "extract" },
             UiMessage::LogRunCancelled { command: "extract" },
+            UiMessage::LogRunRecoveryRequired { command: "extract" },
             UiMessage::LogPerformanceCounters {
                 sqlite_control_attempted_total: 7,
                 candidate_validation_started: 11,
@@ -2565,20 +2271,31 @@ mod tests {
                 source: "explicit",
             },
             UiMessage::LogPhaseStarted { phase: "scan" },
-            UiMessage::LogPhaseFinished { phase: "scan" },
+            UiMessage::LogPhaseCompleted { phase: "scan" },
+            UiMessage::LogPhaseStopped {
+                phase: "scan",
+                outcome: "failed",
+            },
+            UiMessage::LogCancellationRequested {
+                confirmed: 2,
+                total: 3,
+            },
+            UiMessage::LogCancellationRequestedIndeterminate { confirmed: 2 },
+            UiMessage::LogRunPlanFinalized { result: "saved" },
+            UiMessage::LogTranslationFinished { result: "complete" },
+            UiMessage::LogPublicationStarted { path: "output" },
+            UiMessage::LogPublicationFinished {
+                result: "published",
+            },
+            UiMessage::LogProjectLogDegraded { failure_kinds: 2 },
             UiMessage::LogRetrySummary { count: 3 },
-            UiMessage::LogNoWork { reason: "current" },
-            UiMessage::LogNoWorkTranslationUpToDate,
-            UiMessage::LogPartialResult { count: 3 },
             UiMessage::LogTranslationTaskStarted { index: 1, total: 3 },
             UiMessage::LogTranslationTaskFinished {
                 index: 1,
                 outcome: "complete",
             },
-            UiMessage::LogTranslationTaskDiagnostic {
-                index: 1,
-                attempts: 3,
-                diagnostic: "diagnostic",
+            UiMessage::LogTaskOutcomeValue {
+                outcome: "complete",
             },
             UiMessage::TaskRecordTitle {
                 ordinal: "000001",
@@ -2657,34 +2374,9 @@ mod tests {
                 written: 6,
             },
             UiMessage::TaskRecordAcceptedOutcomeUnknown { accepted: 4 },
-            UiMessage::TaskRecordRejectedHeading,
-            UiMessage::TaskRecordRejectedItem {
-                id: "1",
-                reason: "missing",
-            },
-            UiMessage::TaskRecordProtocolDiagnostic {
-                diagnostic: "unknown ID",
-            },
-            UiMessage::TaskRecordUnavailableReason { reason: "unusable" },
             UiMessage::TaskRecordTaskDiagnostic {
                 code: "model.request",
                 reason: "{}",
-            },
-            UiMessage::TaskRecordRejectionReason {
-                code: "missing",
-                line: 1,
-                expected: 2,
-                actual: 1,
-                detail: "detail",
-                expected_blank: "blank",
-            },
-            UiMessage::TaskRecordProtocolDetail {
-                code: "unknown_id",
-                index: 1,
-                detail: "99",
-            },
-            UiMessage::TaskRecordUnavailableDetail {
-                code: "model_response_unusable",
             },
             UiMessage::TaskRecordDurationSeconds { value: "1.250" },
             UiMessage::TaskRecordDurationMilliseconds { value: "12" },

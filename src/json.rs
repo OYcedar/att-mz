@@ -54,44 +54,6 @@ impl StackSafeJsonError {
             Self::Backend(source) => JsonErrorCategory::from(source),
         }
     }
-
-    /// 只投影解析器闭集原因和坐标，不公开原始 JSON 或后端错误文本。
-    pub(crate) fn safe_diagnostic_detail(&self) -> String {
-        match self {
-            Self::Syntax {
-                source:
-                    LosslessJsonError::Syntax {
-                        byte_offset,
-                        reason: _,
-                    },
-                line,
-                column,
-            } => {
-                let category = self.diagnostic_category();
-                format!(
-                    "json_backend=lossless; json_category={category}; byte_offset={byte_offset}; json_line={line}; json_column={column}"
-                )
-            }
-            Self::Syntax {
-                source: LosslessJsonError::DuplicateObjectKey { byte_offset },
-                line,
-                column,
-            } => {
-                let category = self.diagnostic_category();
-                format!(
-                    "json_backend=lossless; json_category={category}; byte_offset={byte_offset}; json_line={line}; json_column={column}"
-                )
-            }
-            Self::Backend(source) => {
-                let category = self.diagnostic_category();
-                format!(
-                    "json_backend=serde_json; json_category={category}; json_line={}; json_column={}",
-                    source.line(),
-                    source.column()
-                )
-            }
-        }
-    }
 }
 
 impl fmt::Display for StackSafeJsonError {

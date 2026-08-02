@@ -50,10 +50,11 @@ ATT 从冻结来源建立完整内容树，并按 recipe 把 Current 译文写�
 修订后重新 WriteBack。能够由显式硬换行解决的 locator 应不再告警；已经证明为游戏有效
 但布局器无法理解的内容可以继续告警，其完成证据是逐项记录和实际加载，不是告警消失。
 
-发布成功后，这些诊断逐项写入 stderr，并以 Warn 事件
-`write_back.manual_layout_required` 写入当前 RunId 的 JSONL。只有人工布局总数不足以让
-操作者找到需要处理的位置。人工布局本身不改变成功发布的业务结果；若警告无法呈现，按
-独立的进程呈现失败处理。
+发布成功后，这些诊断逐项写入 stderr，并以 `diagnostic.write_back` Warn occurrence 写入
+当前 RunId 的 JSONL。每个 occurrence 的具体 RpgMaker issue 保存 `group_location`、`role`、
+`region` 和 `max_fullwidth_chars`，`resolution` 固定为 `adjust_manual_layout`；只有
+`publication.finished` 中的 `manual_layout_units` 总数不足以让操作者找到需要处理的位置。
+人工布局本身不改变成功发布的业务结果；若警告无法呈现，按独立的进程呈现失败处理。
 
 ## 2. 完整验证
 
@@ -80,10 +81,20 @@ ATT 从冻结来源建立完整内容树，并按 recipe 把 Current 译文写�
 发布完成后按[全量验收指南](../guides/acceptance.md)检查全部输出差异、源语残留、人工布局、
 组合项目覆盖和实际加载；WriteBack 成功本身不是整个翻译任务的完成证明。
 
-恢复判断不能只看 `run.finished`。读取 `publication.finished`，以及主诊断和全部相关诊断的
-`impact`、`reason` 与 `recovery[*].path`；发布已经生效但收尾失败时，运行终态也可能是
-`failed`。保持项目、输入、目标和恢复产物不变，先按[目录发布规格第 4 节](../runtime/directory-publishing.md#4-一次发布与恢复)
-排除损坏 journal、目标与已知旧目录均缺失、缺少必要 backup 等不能自动修复的情况，并
-修正实际文件系统原因。只有符合自动恢复条件时，才执行一次同一项目、同一目标的
+每次命令写 `publication.started` 和唯一 `publication.finished`。成功时
+`payload.result.kind = "published"`，其 RPG Maker 汇总保存 translated/original/
+auto-wrapped units、插入换行、全角缩进和 manual-layout units；失败时 result 为
+`not_published`、`recovery_required` 或 `outcome_unknown`，并引用同一
+`diagnostic.publication` occurrence。
+
+恢复判断不能只看 `run.finished`。从 `publication.finished` 取得 occurrence ID，再读取该
+原子诊断的 `report.effect`、`primary` 和递归 `related`。目录发布 issue 直接保存
+`output_root`、`candidate_root`、`residual_path` 或 `recovery_artifacts`；嵌套 backend
+diagnostic 保存具体文件系统 code、operation、I/O kind 与 OS code。发布已经生效但收尾
+失败时，effect 为 `applied_finalization_failed`，运行终态也可能是 `failed`。保持项目、
+输入、目标和恢复产物不变，先按
+[目录发布规格第 4 节](../runtime/directory-publishing.md#4-一次发布与恢复)排除
+`filesystem.journal_corrupt`、目标与已知旧目录均缺失、缺少必要 backup 等不能自动修复的
+情况，并修正实际文件系统原因。只有符合自动恢复条件时，才执行一次同一项目、同一目标的
 WriteBack；下一次同目标发布准备会先按 journal 恢复。`outcome_unknown` 禁止重跑试探，
 两者不能互相替代。

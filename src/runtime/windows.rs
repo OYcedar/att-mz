@@ -34,8 +34,8 @@ use windows_sys::Win32::System::SystemServices::FILE_CS_FLAG_CASE_SENSITIVE_DIR;
 use windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED;
 
 use crate::diagnostic::{
-    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
-    DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic,
+    Diagnostic, FileSystemDiagnosticContext, FileSystemIssue, FileSystemProblem, IoFailure,
+    SafePath, SafeText,
 };
 
 /// Win32 文件系统边界保留的精确失败。
@@ -75,97 +75,41 @@ pub(crate) enum WindowsFsError {
 }
 
 impl WindowsFsError {
-    /// 在仍持有 Win32/NTSTATUS 类型化事实的位置建立公开诊断，不读取 `Display`。
-    pub(crate) fn safe_diagnostic(
-        &self,
-        code: DiagnosticCode,
-        stage: DiagnosticStage,
-        impact: DiagnosticImpact,
-        fallback_action: DiagnosticAction,
-    ) -> SafeDiagnostic {
-        match self {
-            Self::Io {
-                operation,
-                path,
-                source,
-            } => SafeDiagnostic::io(
-                code,
-                stage,
-                DiagnosticSubject::path(path),
-                operation,
-                source,
-                impact,
-                DiagnosticAction::CheckPathAndPermissions,
-            ),
-            Self::ReparsePoint { path } => SafeDiagnostic::new(
-                code,
-                stage,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure(DiagnosticFailureKind::ReparsePointForbidden),
-                impact,
-                fallback_action,
-            ),
-            Self::NonLocalVolume { path } => SafeDiagnostic::new(
-                code,
-                stage,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure(DiagnosticFailureKind::NonLocalVolume),
-                impact,
-                fallback_action,
-            ),
-            Self::NonNtfsVolume { path, actual } => SafeDiagnostic::new(
-                code,
-                stage,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure(DiagnosticFailureKind::NonNtfsVolume),
-                impact,
-                fallback_action,
-            )
-            .with_recovery(RecoveryFact::component(format!("filesystem={actual}"))),
-            Self::CaseSensitiveDirectory { path } => SafeDiagnostic::new(
-                code,
-                stage,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure(DiagnosticFailureKind::CaseSensitiveDirectory),
-                impact,
-                fallback_action,
-            ),
-            Self::LockCancelled { path } => SafeDiagnostic::new(
-                code,
-                stage,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure(DiagnosticFailureKind::LockCancelled),
-                impact,
-                DiagnosticAction::Retry,
-            ),
-            Self::RenameTargetExists { path } => SafeDiagnostic::new(
-                code,
-                stage,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure(DiagnosticFailureKind::TargetAlreadyExists),
-                impact,
-                fallback_action,
-            ),
-            Self::FileIdentityChanged { path } => SafeDiagnostic::new(
-                code,
-                stage,
-                DiagnosticSubject::path(path),
-                DiagnosticReason::failure(DiagnosticFailureKind::FileIdentityChanged),
-                impact,
-                fallback_action,
-            ),
-            Self::Cryptography { operation, status } => SafeDiagnostic::new(
-                code,
-                stage,
-                DiagnosticSubject::operation(operation),
-                DiagnosticReason::WindowsStatus {
-                    operation: (*operation).to_owned(),
-                    status: *status,
-                },
-                impact,
-                DiagnosticAction::Retry,
-            ),
-        }
+    /// 调用边界用闭集 context 指明当前文件操作；不会解释旧的显示字符串。
+    pub(crate) fn diagnostic(&self, context: FileSystemDiagnosticContext) -> Diagnostic {
+        let problem = match self {
+            Self::Io { path, source, .. } => FileSystemProblem::Io {
+                path: SafePath::new(path),
+                failure: IoFailure::from_error(source),
+            },
+            Self::ReparsePoint { path } => FileSystemProblem::ReparsePoint {
+                path: SafePath::new(path),
+            },
+            Self::NonLocalVolume { path } => FileSystemProblem::NonLocalVolume {
+                path: SafePath::new(path),
+            },
+            Self::NonNtfsVolume { path, actual } => FileSystemProblem::NonNtfsVolume {
+                path: SafePath::new(path),
+                actual: SafeText::new(actual),
+            },
+            Self::CaseSensitiveDirectory { path } => FileSystemProblem::CaseSensitiveDirectory {
+                path: SafePath::new(path),
+            },
+            Self::LockCancelled { path } => FileSystemProblem::Cancelled {
+                path: SafePath::new(path),
+            },
+            Self::RenameTargetExists { path } => FileSystemProblem::TargetExists {
+                path: SafePath::new(path),
+            },
+            Self::FileIdentityChanged { path } => FileSystemProblem::IdentityChanged {
+                path: SafePath::new(path),
+            },
+            Self::Cryptography { status, .. } => FileSystemProblem::WindowsStatus {
+                operation: context.operation(),
+                status: *status,
+            },
+        };
+        Diagnostic::file_system(FileSystemIssue::new(context, problem))
     }
 }
 
@@ -997,12 +941,10 @@ mod tests {
             path: PathBuf::from("C:\\game\r\nforged\\Data.json"),
             source: io::Error::new(io::ErrorKind::PermissionDenied, "API_KEY_SECRET"),
         };
-        let diagnostic = error.safe_diagnostic(
-            DiagnosticCode::FileSystemOperation,
-            DiagnosticStage::Extract,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckPathAndPermissions,
-        );
+        let diagnostic = error.diagnostic(FileSystemDiagnosticContext::new(
+            crate::diagnostic::FileSystemDiagnosticStage::Extract,
+            crate::diagnostic::FileSystemOperation::Open,
+        ));
         let serialized = serde_json::to_string(&diagnostic).expect("诊断应可序列化");
 
         assert!(!serialized.contains("API_KEY_SECRET"));
@@ -1010,7 +952,8 @@ mod tests {
         assert!(!serialized.contains("\\n"));
         assert!(serialized.contains("C:\\\\game forged\\\\Data.json"));
         assert!(serialized.contains("permission_denied"));
-        assert!(serialized.contains("open_file"));
+        assert!(serialized.contains("\"operation\":\"open\""));
+        assert!(!serialized.contains("open_file"));
     }
 
     fn symlink_unavailable(error: &io::Error) -> bool {

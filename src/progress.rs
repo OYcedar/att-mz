@@ -15,6 +15,11 @@ use std::time::{Duration, Instant};
 
 use unicode_width::UnicodeWidthStr;
 
+use crate::diagnostic::{
+    Diagnostic, DiagnosticReport, IoFailure, RelatedFailureRelation, RuntimeComponent,
+    RuntimeIssue, RuntimeOperation, StateEffect,
+};
+
 const DYNAMIC_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 const DYNAMIC_BAR_WIDTH: usize = 20;
 const PLAIN_PROGRESS_BUCKETS: u64 = 10;
@@ -211,6 +216,22 @@ impl TerminalProgressOperation {
             Self::JoinRenderer => "join_renderer",
         }
     }
+
+    const fn diagnostic_operation(self) -> RuntimeOperation {
+        match self {
+            Self::StartRenderer => RuntimeOperation::StartTerminalProgressRenderer,
+            Self::PublishCompletion => RuntimeOperation::PublishTerminalProgressCompletion,
+            Self::RenderPlainLine => RuntimeOperation::RenderTerminalProgressPlainLine,
+            Self::RenderDynamicLine => RuntimeOperation::RenderTerminalProgressDynamicLine,
+            Self::RenderStatus => RuntimeOperation::RenderTerminalProgressStatus,
+            Self::ClearDynamicLine => RuntimeOperation::ClearTerminalProgressDynamicLine,
+            Self::RenderFinalMessage => RuntimeOperation::RenderTerminalProgressFinalMessage,
+            Self::Finalizing => RuntimeOperation::FinalizeTerminalProgress,
+            Self::SafeStopping => RuntimeOperation::ReportTerminalProgressSafeStop,
+            Self::Finish => RuntimeOperation::FinishTerminalProgress,
+            Self::JoinRenderer => RuntimeOperation::JoinTerminalProgressRenderer,
+        }
+    }
 }
 
 /// 一项已经确认的终端进度呈现失败。
@@ -219,7 +240,6 @@ pub(crate) struct TerminalProgressFailure {
     kind: TerminalProgressFailureKind,
     operation: TerminalProgressOperation,
     source: Option<Arc<io::Error>>,
-    detail: String,
 }
 
 impl TerminalProgressFailure {
@@ -228,12 +248,10 @@ impl TerminalProgressFailure {
         operation: TerminalProgressOperation,
         source: io::Error,
     ) -> Self {
-        let detail = source.to_string();
         Self {
             kind,
             operation,
             source: Some(Arc::new(source)),
-            detail,
         }
     }
 
@@ -242,23 +260,23 @@ impl TerminalProgressFailure {
             kind: TerminalProgressFailureKind::ControlChannelClosed,
             operation,
             source: None,
-            detail: String::from("终端进度渲染线程的 control channel 已关闭"),
         }
     }
 
-    fn worker_panicked(detail: String) -> Self {
+    fn worker_panicked() -> Self {
         Self {
             kind: TerminalProgressFailureKind::RendererThreadPanicked,
             operation: TerminalProgressOperation::JoinRenderer,
             source: None,
-            detail,
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn kind(&self) -> TerminalProgressFailureKind {
         self.kind
     }
 
+    #[cfg(test)]
     pub(crate) const fn operation(&self) -> TerminalProgressOperation {
         self.operation
     }
@@ -273,9 +291,33 @@ impl TerminalProgressFailure {
             .and_then(|source| source.raw_os_error())
     }
 
-    #[cfg(test)]
-    pub(crate) fn detail(&self) -> &str {
-        &self.detail
+    /// 投影一项终端呈现收尾失败；panic 正文不进入公开诊断。
+    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
+        let operation = self.operation.diagnostic_operation();
+        let issue = match self.kind {
+            TerminalProgressFailureKind::RendererThreadStart
+            | TerminalProgressFailureKind::WriterWrite
+            | TerminalProgressFailureKind::WriterFlush => RuntimeIssue::Io {
+                component: RuntimeComponent::TerminalProgress,
+                operation,
+                failure: self.source.as_deref().map_or_else(
+                    || IoFailure::from_parts(io::ErrorKind::Other.into(), None),
+                    IoFailure::from_error,
+                ),
+            },
+            TerminalProgressFailureKind::ControlChannelClosed => RuntimeIssue::ExecutorClosed {
+                component: RuntimeComponent::TerminalProgress,
+                operation,
+            },
+            TerminalProgressFailureKind::RendererThreadPanicked => RuntimeIssue::WorkerPanicked {
+                component: RuntimeComponent::TerminalProgress,
+                operation,
+            },
+        };
+        DiagnosticReport::new(
+            StateEffect::AppliedFinalizationFailed,
+            Diagnostic::runtime(issue),
+        )
     }
 
     fn same_fact(&self, other: &Self) -> bool {
@@ -283,7 +325,6 @@ impl TerminalProgressFailure {
             && self.operation == other.operation
             && self.io_error_kind() == other.io_error_kind()
             && self.raw_os_error() == other.raw_os_error()
-            && self.detail == other.detail
     }
 }
 
@@ -291,10 +332,9 @@ impl fmt::Display for TerminalProgressFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "terminal progress {} failed during {}: {}",
+            "terminal progress {} failed during {}",
             self.kind.as_str(),
-            self.operation.as_str(),
-            self.detail
+            self.operation.as_str()
         )
     }
 }
@@ -316,6 +356,21 @@ pub(crate) struct TerminalProgressFailures {
 impl TerminalProgressFailures {
     pub(crate) fn failures(&self) -> &[TerminalProgressFailure] {
         &self.failures
+    }
+
+    /// 保留首项和全部后续失败的自然发生顺序；每项都是独立的 Shutdown 相关失败。
+    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
+        let Some((primary, related)) = self.failures.split_first() else {
+            unreachable!("TerminalProgressFailures 只会由至少一项已记录失败构造")
+        };
+        related
+            .iter()
+            .fold(primary.diagnostic_report(), |report, failure| {
+                report.with_related(
+                    RelatedFailureRelation::Shutdown,
+                    failure.diagnostic_report(),
+                )
+            })
     }
 }
 
@@ -628,12 +683,12 @@ impl<P> TerminalProgress<P> {
             handle.send_finish(message);
         }
         if let Some(worker) = self.worker.take()
-            && let Err(panic) = worker.join()
+            && worker.join().is_err()
         {
+            // panic payload 可能包含游戏正文、模型响应或路径；终端呈现只能公开已确认的
+            // worker/component/operation，不能把 payload 转为字符串或写入日志。
             self.health
-                .record(TerminalProgressFailure::worker_panicked(panic_detail(
-                    panic,
-                )));
+                .record(TerminalProgressFailure::worker_panicked());
         }
         self.observer = TerminalProgressObserver::silent();
         self.finished = true;
@@ -761,16 +816,6 @@ fn spawn_renderer_thread(task: Box<dyn FnOnce() + Send + 'static>) -> io::Result
     thread::Builder::new()
         .name(String::from("att-terminal-progress"))
         .spawn(task)
-}
-
-fn panic_detail(panic: Box<dyn std::any::Any + Send + 'static>) -> String {
-    if let Some(message) = panic.downcast_ref::<&str>() {
-        return (*message).to_owned();
-    }
-    if let Some(message) = panic.downcast_ref::<String>() {
-        return message.clone();
-    }
-    String::from("渲染线程以非文本 panic payload 结束")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1581,7 +1626,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_panic_is_returned_by_finish_with_payload() {
+    fn worker_panic_is_returned_without_exposing_payload() {
         let progress =
             TerminalProgress::with_writer(ProgressMode::Plain, false, PanickingWriter, phase_label);
         progress.observe(ProgressSnapshot::determinate(Phase::Translating, 1, 1));
@@ -1594,12 +1639,31 @@ mod tests {
             TerminalProgressFailureKind::RendererThreadPanicked,
             TerminalProgressOperation::JoinRenderer,
         ));
+        let rendered = failures.to_string();
+        let diagnostic =
+            serde_json::to_string(&failures.diagnostic_report()).expect("进度诊断必须可序列化");
         assert!(
-            failures
-                .failures()
-                .iter()
-                .any(|failure| failure.detail().contains("injected renderer panic")),
-            "panic payload 必须保留: {failures}"
+            !rendered.contains("injected renderer panic")
+                && !diagnostic.contains("injected renderer panic"),
+            "panic payload 不能进入进程呈现或结构化诊断"
+        );
+    }
+
+    #[test]
+    fn progress_failure_uses_io_category_without_exposing_error_message() {
+        let failure = TerminalProgressFailure::io(
+            TerminalProgressFailureKind::WriterWrite,
+            TerminalProgressOperation::RenderStatus,
+            io::Error::other("progress secret sentinel"),
+        );
+        let rendered = failure.to_string();
+        let diagnostic =
+            serde_json::to_string(&failure.diagnostic_report()).expect("进度诊断必须可序列化");
+        assert_eq!(failure.io_error_kind(), Some(io::ErrorKind::Other));
+        assert!(
+            !rendered.contains("progress secret sentinel")
+                && !diagnostic.contains("progress secret sentinel"),
+            "I/O 错误正文不能成为呈现或诊断协议的一部分"
         );
     }
 

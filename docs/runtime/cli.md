@@ -98,8 +98,15 @@ stdout 呈现进度和最终业务结果，警告、降级和错误走 stderr。
 
 Partial、Unavailable、跳过项、人工布局、取消后已经生效的状态和任务记录写入或收尾故障都
 必须有结构化诊断。当前项目 JSONL 仍可写时，这些事实进入同一 RunId；项目日志无法建立
-或继续写入时，stderr 显示具体阶段、对象、稳定 code、原因和处理办法。日志队列丢弃普通
-事件时，警告同时报告实际丢失数量和日志路径，不能只显示笼统的降级横幅。
+或继续写入时，stderr 显示同一份安全 `DiagnosticReport`：`effect`、主诊断的稳定 code、
+stage、类型化 issue 和 resolution，以及带明确 relation 的相关报告。CLI 不从 `Display`、
+本地化阶段名或拼接字符串反推这些事实。日志队列丢弃普通事件时，警告同时报告实际丢失
+数量和日志路径，不能只显示笼统的降级横幅。
+
+项目日志中的独立问题以原子 `diagnostic.*` occurrence 保存；`phase.stopped`、
+`task.finished`、`run_plan.finalized`、`translation.finished`、`publication.finished` 与
+`run.finished` 只引用 occurrence ID，不复制一份泛化错误。Partial 与 Unavailable 的完整
+Task 计数和引擎汇总由唯一 `translation.finished` 保存。
 
 项目日志或任务记录故障本身不改变已经确定的业务结果和项目状态。用于呈现警告、错误、
 成功结果或取消终态的 stdout/stderr 写入、flush、后台线程或 channel 失败时，进程不能
@@ -109,6 +116,6 @@ Partial、Unavailable、跳过项、人工布局、取消后已经生效的状�
 - `1`：输入、运行、提交、发布或呈现失败；
 - `130`：受控取消。
 
-状态已经明确但必须保留或处理恢复现场时，ATT 显示 `recovery_required`、影响范围、恢复
-位置和下一步。只有提交、发布或进程异常使最终状态确实无法确认时才显示
+状态已经明确但必须保留或处理恢复现场时，ATT 显示 `recovery_required`、`report.effect`、
+具体 issue 中的恢复路径事实和类型化 resolution。只有提交、发布或进程异常使最终状态确实无法确认时才显示
 `outcome_unknown`；两种终态都不能伪造成成功或回滚。

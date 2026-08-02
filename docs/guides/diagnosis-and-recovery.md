@@ -40,24 +40,27 @@
 
 ### 2.2 当前阶段的业务结果
 
-例如 Init 是否建立项目、Extract 哪些 owner 提交、Translate 是 Complete、Partial 还是
-Unavailable、Lua 事务是否提交、WriteBack 是否发布及是否要求人工布局。
+例如 Init 是否建立项目、Extract 哪些 owner 提交、Translate 的 `translation.finished` 是
+Complete、Incomplete 还是其他终态、各 Task 是 Partial 或 Unavailable、Lua 事务是否提交、
+WriteBack 是否发布及是否要求人工布局。
 
 ### 2.3 状态影响
 
-- 状态未改变；
-- 前序进度已提交；
-- 本次完整提交；
-- 新输出已发布但有残留现场；
-- 状态明确且必须恢复；
-- 是否生效无法确认。
+- `unchanged`：状态未改变；
+- `progress_preserved`：前序进度已提交；
+- `applied`：本次操作已经生效；
+- `applied_run_plan_not_saved`：业务已经生效，但 RunPlan 未保存；
+- `applied_finalization_failed`：业务已经生效，但收尾失败；
+- `recovery_required`：状态明确且必须保留或处理恢复现场；
+- `outcome_unknown`：是否生效无法确认。
 
 只有这三个维度都明确，才能决定继续、修正后重做、人工或 agent 修订、处理恢复现场，
 还是停止写入。
 
 ## 3. 通用处理顺序
 
-1. 读取结构化诊断中的阶段、对象、稳定 code、原因、影响、动作与恢复位置。
+1. 读取 occurrence 的 `scope` 和 `report`；检查 `effect`、主诊断的 `code`、`stage`、具体
+   `issue`、类型化 `resolution`，以及递归 `related`。
 2. 完整读取拥有该事实的阶段规格，以及诊断涉及的公共或运行时规格。
 3. 从规格指定的权威位置重新观察当前状态；不要解析自由文本猜测。
 4. 确定最早失效的事实和项目内可用操作。
@@ -82,9 +85,9 @@ Unavailable，Extract 可能带警告，WriteBack 可能保留原文或要求人
 生效的部分，不能把
 整个运行当作未发生。
 
-`run.finished` 只汇总进程结果。只要主诊断或任一相关诊断的 `impact =
-"recovery_required"`，即使 `run.finished` 是 `failed`，仍必须按第 4.4 节处理该诊断和它的
-全部恢复路径；不能只按进程终态选择恢复办法。
+`run.finished` 只汇总进程结果并引用主 occurrence。只要该 occurrence 的主 report 或任一
+递归 related report 的 `effect = "recovery_required"`，即使 `run.finished` 是 `failed`，
+仍必须按第 4.4 节处理具体 issue 中列出的全部恢复产物；不能只按进程终态选择恢复办法。
 
 ### 4.3 `cancelled`
 
@@ -95,20 +98,24 @@ Unavailable，Extract 可能带警告，WriteBack 可能保留原文或要求人
 ### 4.4 `recovery_required`
 
 业务状态已经明确，但诊断列出的现场必须保留。若这是目录发布恢复，读取
-[目录发布规格](../runtime/directory-publishing.md)。只有恢复路径是该目标受管的
-`.directory-publish-*.(stage|backup|journal)` 时，才保持项目、目标、输入和恢复产物不变，
-并继续检查结构化原因与产物组合。诊断的 `recovery[*].path` 列出与同一操作匹配的
-backup/journal 或可清理 stage，且 `reason.failure` 不是 `journal_corrupt`、
-`reason.detail` 也不是“目标与已知旧目录均缺失”或缺少必要 backup 时，先修正实际文件
-系统原因，再执行一次相应 MV/MZ Init 或 WriteBack；MV/MZ Init 会在从 `project.db` 复用
-省略的游戏路径、读取项目状态和继承设置之前恢复，WriteBack 会在建立新候选之前恢复。
-I/O 原因读取 `reason.kind = "io"` 下的 `operation`、
-`error_kind` 和 `raw_os_code`；其他失败读取 `reason.kind`、`reason.failure` 和可用的
-`reason.detail`。
+[目录发布规格](../runtime/directory-publishing.md)。从 `publication.finished` 引用的
+`diagnostic.publication` occurrence 读取完整 report；Publication issue 直接保存
+`output_root`、`candidate_root`、`residual_path` 或 `recovery_artifacts`，嵌套 backend
+diagnostic 保存具体文件系统问题。只有恢复产物是该目标受管的
+`.directory-publish-*.(stage|backup|journal)`，且与同一 `output_root` 匹配时，才保持项目、
+目标、输入和恢复产物不变并继续判断。
 
-自动恢复本身报告 `reason.failure = "journal_corrupt"`、目标与已知旧目录均缺失、缺少
-必要 backup，或一次恢复后仍得到相同 `impact = "recovery_required"` 时，现行接口没有
-修复入口。保留新的完整诊断和所有 `recovery[*].path`，停止重跑；不自行删除、改名或移动。
+`recovery_artifacts` 列出与同一操作匹配的 backup/journal 或可清理 stage，且主 report 与
+全部 related report 都没有 `filesystem.journal_corrupt`、目标与已知旧目录均缺失或缺少
+必要 backup 时，先修正实际文件系统问题，再执行一次相应 MV/MZ Init 或 WriteBack；MV/MZ
+Init 会在从 `project.db` 复用省略的游戏路径、读取项目状态和继承设置之前恢复，WriteBack
+会在建立新候选之前恢复。I/O 问题读取 `filesystem.io` issue 的
+`context.operation`、`problem.failure.kind` 和 `problem.failure.raw_os_code`；其他问题按
+稳定 code 与封闭 `problem.kind` 分流。
+
+自动恢复本身报告 `filesystem.journal_corrupt`、目标与已知旧目录均缺失、缺少必要
+backup，或一次恢复后仍得到 `effect = "recovery_required"` 时，现行接口没有修复入口。
+保留新的完整 occurrence 和具体 issue 中的全部路径，停止重跑；不自行删除、改名或移动。
 
 SQLite 恢复仍只按 [SQLite 规格](../runtime/sqlite.md)处理，不能把目录恢复方法套到数据库。
 Generic 初始数据库候选和 WriteBack scratch 也不属于目录发布器，分别按第 6.2、6.6 节
@@ -200,8 +207,10 @@ Complete 只说明当前项目本轮 Translate 的目标明确完成。进入全
 
 #### Partial
 
-合法 ID 已经保存，失败项留给后续处理。先读取当前 RunId 的 `task.finished`、
-`task.diagnostic`、`result.partial` 与可用任务记录，按原因分类：
+合法 ID 已经保存，失败项留给后续处理。先读取当前 RunId 的 `task.finished`、它引用的
+`diagnostic.translation_task` occurrence、唯一 `translation.finished` 与可用任务记录。
+`translation.finished.payload.result.kind` 应为 `incomplete`，其中保存完整任务计数和引擎
+专用汇总；按具体 issue 和 `resolution` 分类：
 
 - 暂时性外部失败或模型偶发输出，且再次运行有合理进展预期：使用同一项目、Profile 和
   资源再次 Translate；Current 保留，ATT 重新为仍需模型的 Unit 分配临时 ID，并保留完整
@@ -259,15 +268,15 @@ Model 或参数问题不能靠重跑或擅自换配置解决。只有任务明�
   或译文语法则返回相应阶段修正。游戏有效但布局器无法理解的控制语法可以保留，必须记录
   原因，并在所有相关实际场景中确认显示正确；这种情况重新 WriteBack 后仍有警告是预期
   结果，不能靠反复加换行消除；
-- 主诊断或相关诊断的 `impact = "state_applied_finalization_failed"`，且恢复路径列出目标和
-  `.directory-publish-*` 残留：新输出已发布；先修正诊断中的清理失败原因，再按第 4.4 节
-  条件执行一次同目标命令。RPG Maker WriteBack 的 `publication.finished.payload.outcome =
-  "recovery_required"` 是补充证据；Generic WriteBack 不写该事件，只按结构化诊断判断；
-- 主诊断或相关诊断的 `impact = "recovery_required"`：保留 `.directory-publish-*` 现场，
-  按第 4.4 节的 `reason` 与产物条件分流；只有符合自动恢复条件时才执行一次同目标、同输入
-  命令；
-- operation 为 `generic_write_back_candidate_cleanup` 时遍历主诊断和全部相关诊断的每个
-  恢复路径：`.directory-publish-*` 仍按第 4.4 节条件分流；项目内
+- `report.effect = "applied_finalization_failed"` 且 Publication issue 给出 `output_root` 与
+  `residual_path`：新输出已发布；先修正嵌套 backend diagnostic 中的清理失败，再按第 4.4
+  节条件执行一次同目标命令。`publication.finished.payload.result.kind =
+  "recovery_required"` 并引用同一 occurrence；Generic 与 RPG Maker 都使用该契约；
+- 主 report 或 related report 的 `effect = "recovery_required"`：保留 issue 中列出的
+  `.directory-publish-*` 现场，按第 4.4 节的稳定 code、类型化问题与产物组合分流；只有符合
+  自动恢复条件时才执行一次同目标、同输入命令；
+- Generic occurrence 的 `related` 中存在 `relation = "cleanup"` 时，遍历每个 FileSystem
+  issue 的精确 path：`.directory-publish-*` 仍按第 4.4 节条件分流；项目内
   `.generic-write-back-*` 没有清理旧残留的公开入口。两类路径可以在同一运行同时存在，
   必须分别处理。对后者再按相关主诊断判断输出是否发布。
   主状态明确未发布时，修正原失败后可以重新 WriteBack，但只会建立新 scratch，不会清除

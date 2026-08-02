@@ -235,7 +235,8 @@ fn scan_line(line: &str) -> Option<Vec<DisplayToken<'_>>> {
         tokens.push(DisplayToken {
             text: grapheme,
             kind,
-            width_cells: UnicodeWidthStr::width_cjk(grapheme) as u64,
+            width_cells: u64::try_from(UnicodeWidthStr::width_cjk(grapheme))
+                .expect("当前目标平台的字素宽度必须能用 u64 表达"),
         });
         offset += grapheme.len();
     }
@@ -393,7 +394,7 @@ impl<'tokens, 'text> WrapLineIndex<'tokens, 'text> {
     ) -> u64 {
         observation.observe_width_query();
         let width = self.width_prefix[end] - self.width_prefix[start];
-        u64::try_from(width).unwrap_or(u64::MAX)
+        u64::try_from(width).expect("当前目标平台的布局宽度必须能用 u64 表达")
     }
 
     fn valid_output_range(

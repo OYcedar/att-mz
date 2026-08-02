@@ -51,29 +51,7 @@ cli-argument-conflict = { $argument } は指定済みのほかの引数と同時
 cli-wrong-number-of-values = { $argument } に指定された値の数が正しくありません。
 cli-invalid-utf8 = コマンドライン引数が有効な Unicode ではありません。
 cli-parse-failure = コマンドラインを解析できませんでした。
-log-label-phase-check-project = プロジェクト確認
-log-label-phase-scan-source = ソース走査
-log-label-phase-prepare-candidate = 候補準備
-log-label-phase-update-database = データベース更新
-log-label-phase-publish = 公開
-log-label-phase-builtin = 組み込み抽出
-log-label-phase-rules = ルール抽出
-log-label-phase-lua = Lua 処理
-log-label-phase-planning = 計画
-log-label-phase-confirmed-tasks = タスク確認
-log-label-phase-no-work = 作業不要
-log-label-phase-read-assets = アセット読み取り
-log-label-phase-plan-rpg-maker-write-back = RPG Maker 書き戻し計画
-log-label-phase-rewrite-documents = ドキュメント書き換え
-log-label-phase-validate-candidate = 候補検証
-log-label-task-complete = 完了
-log-label-task-partial = 一部利用可能
-log-label-task-unavailable = 利用不可
-log-label-task-failed = 失敗
-error-state-applied-finalization = 結果は反映されましたが、終了処理に失敗しました。再試行前にプロジェクト状態を確認してください。
 error-no-executable-extract-owner = 消去後に実行可能な Extract owner がないため、プランは保存されませんでした。
-error-plan-save-failed-applied = コマンド結果は反映されましたが、新しい実行プランは保存されませんでした。次回は意図したオプションを明示してください。
-error-plan-save-outcome-unknown = コマンド結果は反映されましたが、実行プランのコミット結果を確認できません。次回は意図したオプションを明示してください。
 plan-source-explicit = 明示入力
 plan-source-project-state = プロジェクト状態
 plan-source-product-default = 製品動作
@@ -141,35 +119,68 @@ log-lua-print = Lua：{ $message }
 log-lua-summary = Lua 実行統計：データベース呼び出し { $database_calls } 回、変更行 { $changed_rows } 行、翻訳呼び出し { $translation_calls } 回、print { $printed_lines } 行。
 log-plan-resolved = コマンド { $command } のプラン元: { $source }。
 log-phase-started = フェーズ開始: { $phase }。
-log-phase-finished = フェーズ完了: { $phase }。
 log-retry-summary = { $count } 回再試行しました。
-log-no-work = 作業は不要でした: { $reason }。
-log-no-work-translation-up-to-date = 翻訳は現在のソースとプロファイルに一致しています
-log-partial-result = 注意が必要な部分結果が { $count } 件あります。
 log-translation-task-started = 翻訳タスク { $index }/{ $total } を開始しました。
 log-translation-task-finished = 翻訳タスク { $index } は結果 { $outcome } で終了しました。
-log-translation-task-diagnostic = 翻訳タスク { $index } は { $attempts } 回の試行後に診断を報告しました: { $diagnostic }
+log-run-recovery-required = コマンド { $command } は復旧が必要な状態で終了しました。診断に示された復旧場所を確認してください。
+log-phase-completed = フェーズ完了: { $phase }。
+log-phase-stopped = { $outcome ->
+    [failed] フェーズ失敗: { $phase }。
+    [cancelled] フェーズをキャンセルしました: { $phase }。
+   *[other] フェーズ停止: { $phase }。
+}
+log-cancellation-requested = { $total } 件中 { $confirmed } 件の確定後にキャンセルが要求されました。
+log-cancellation-requested-indeterminate = { $confirmed } 件の確定後にキャンセルが要求されました。総数は不明です。
+log-run-plan-finalized = { $result ->
+    [saved] 実行計画を保存しました。
+    [not_saved] 実行計画は保存されませんでした。
+    [saved_finalization_failed] 実行計画は保存されましたが、終了処理に失敗しました。
+    [outcome_unknown] 実行計画の最終状態は不明です。
+   *[other] 実行計画の終了処理が不明な結果で停止しました。
+}
+log-translation-finished = { $result ->
+    [not_started] 翻訳は開始されませんでした。
+    [no_work] 翻訳対象がないため終了しました。
+    [complete] 翻訳が完了しました。
+    [incomplete] 未完了の作業を残して翻訳が終了しました。
+    [failed] 翻訳に失敗しました。
+    [cancelled] 翻訳をキャンセルしました。
+   *[other] 翻訳が不明な結果で停止しました。
+}
+log-publication-started = 出力ルート { $path } への公開を開始しました。
+log-publication-finished = { $result ->
+    [published] 公開が完了しました。
+    [not_published] 公開による出力変更はありませんでした。
+    [recovery_required] 公開が停止し、復旧が必要です。
+    [outcome_unknown] 公開の最終状態は不明です。
+   *[other] 公開が不明な結果で停止しました。
+}
+log-project-log-degraded = プロジェクトログで障害が発生し、{ $failure_kinds } 種類の障害を記録しました。
+log-task-outcome-value = { $outcome ->
+    [complete] 完了
+    [partial] 一部完了
+    [unavailable] 利用不可
+    [failed] 失敗
+    [not_committed_after_earlier_failure] 先行失敗により未コミット
+    [cancelled] キャンセル
+   *[other] 不明な結果で終了
+}
 diagnostic-title = エラー [{ $code }]
 diagnostic-stage = 段階：{ $stage }
-diagnostic-subject = 場所：{ $subject }
-diagnostic-subject-value = { $kind ->
-    [command] コマンド { $value }
-    [field] フィールド { $value }
-    [project] プロジェクト { $value }
-    [profile] プロファイル { $value }
-    [component] コンポーネント { $value }
-   *[other] { $value }
-}
-diagnostic-reason = 原因：{ $reason }
-diagnostic-impact = 影響：{ $impact }
-diagnostic-action = 対処：{ $action }
-diagnostic-recovery = 復旧場所：{ $recovery }
-diagnostic-recovery-value = { $kind ->
-    [component] コンポーネント { $value }
-    [transaction] トランザクション { $value }
-   *[other] { $value }
-}
+diagnostic-location = 場所：{ $subject }
+diagnostic-explanation = 原因：{ $reason }
+diagnostic-effect = 影響：{ $impact }
+diagnostic-resolution = 対処：{ $action }
 diagnostic-related = 関連エラー { $index }：
+diagnostic-relation-value = { $code ->
+    [cleanup] クリーンアップ
+    [rollback] ロールバック
+    [discard] 破棄
+    [finalization] 終了処理
+    [shutdown] シャットダウン
+    [observability] 可観測性
+   *[other] { $code }
+}
 diagnostic-stage-value = { $code ->
     [process_startup] プロセス起動
     [process_output] プロセス出力
@@ -186,23 +197,27 @@ diagnostic-stage-value = { $code ->
     [publication] 公開
     [shutdown] 終了処理
     [logging] プロジェクトログ
+    [runtime] ランタイム
    *[other] __ATT_FALLBACK__
 }
-diagnostic-impact-value = { $code ->
+diagnostic-effect-value = { $code ->
     [unchanged] 状態は変更されていません
-    [valid_progress_preserved] 有効な進捗は保存されました
-    [result_applied_but_run_plan_not_saved] 結果は適用されましたが、実行プランは保存されませんでした
-    [state_applied_but_finalization_failed] 状態は適用されましたが、確定処理は完了しませんでした
+    [progress_preserved] 有効な進捗は保存されました
+    [applied] 状態は適用されました
+    [applied_run_plan_not_saved] 状態は適用されましたが、実行プランは保存されませんでした
+    [applied_finalization_failed] 状態は適用されましたが、確定処理は完了しませんでした
     [recovery_required] 状態を信頼する前に復旧が必要です
     [outcome_unknown] 最終状態は不明です
    *[other] __ATT_FALLBACK__
 }
-diagnostic-action-value = { $code ->
+diagnostic-resolution-value = { $code ->
     [fix_configuration] 指定された設定項目を修正して再試行してください
     [fix_input] 指定された入力を修正して再試行してください
+    [fix_placeholder_rules] 指定された Placeholder ルールを修正して再試行してください
+    [adjust_manual_layout] 指定された位置と表示幅に合わせて改行とレイアウトを手動で調整してください
     [check_path_and_permissions] パス、ファイルシステムの状態、権限を確認してください
     [check_project_state] プロジェクトの状態を確認・修正して再試行してください
-    [retry_after_resolving_contention] 競合する操作の完了を待ってから再試行してください
+    [resolve_contention] 競合する操作の完了を待ってから再試行してください
     [check_model_service] モデルサービスの応答とアカウント制限を確認してください
     [preserve_recovery_artifacts] 記載された復旧用ファイルを削除せず、出力を復旧してから再試行してください
     [retry] 操作を再試行してください
@@ -211,16 +226,14 @@ diagnostic-action-value = { $code ->
 }
 diagnostic-failure-value = { $code ->
     [missing_required_value] 必須値がありません
-    [extract_plan_required] 再利用可能な Extract プランが保存されていません。--builtin または --rules を指定してください
     [generic_extract_required] JSONL 入力が直近の Extract と一致しません。att generic extract を再実行してください
     [conflicting_values] 指定された値が競合しています
     [invalid_syntax] 値の構文が無効です
     [invalid_encoding] テキストのエンコーディングが無効です
     [invalid_value] 値が必要な契約に違反しています
     [not_found] 必要な対象が存在しません
-    [busy] リソースは別の操作によって使用中です
     [state_mismatch] 保存されたプロジェクト状態がこの操作の要件を満たしていません
-    [requirement_failed] 必要な前提条件が満たされていません
+    [unsupported_windows_code_page] Windows のコードページが UTF-8 ではありません
     [transaction_rolled_back] トランザクションが失敗し、変更はロールバックされました
     [transaction_outcome_unknown] トランザクションのコミットまたはロールバックを確認できませんでした
     [finalization_failed] 操作結果は存在しますが、確定処理に失敗しました
@@ -250,81 +263,32 @@ diagnostic-failure-value = { $code ->
     [response_parsing_failed] モデル応答が有効な JSON ではありません
     [invalid_response_contract] モデル応答が必要な応答契約を満たしていません
     [transport_failed] 有効な応答を受け取る前に HTTP 転送が失敗しました
-    [lua_database_open_failed] Lua ホストがプロジェクトデータベースのセッションを開けませんでした
-    [lua_context_creation_failed] Lua ランタイムが VM コンテキストを作成できませんでした
     [lua_compilation_failed] Lua メインプログラムをコンパイルできませんでした
     [lua_execution_failed] Lua メインプログラムの実行中に失敗しました
-    [lua_host_call_failed] Lua ホスト機能の呼び出しに失敗しました
-    [lua_finalization_failed] Lua ホストがすべてのバインド済みリソースを確定できませんでした
-    [rules_definition_invalid] Rules プログラムが Rules 定義契約を満たしていません
-    [rules_document_read_failed] Rules プログラムに必要なソース文書を読み取れませんでした
-    [rules_no_non_blank_match] Rules エントリから空白以外の意味単位が生成されませんでした
-    [rules_invalid_target] Rules エントリがテキスト対象として使用できない値を選択しました
     [rules_pattern_match_failed] Rules の PCRE2 パターンを評価できませんでした
     [rules_zero_width_match] Rules パターンがゼロ幅一致を生成しました
     [rules_overlapping_capture] Rules パターンが重複するテキストキャプチャを生成しました
     [rules_missing_text_capture] 必須の名前付きテキストキャプチャが一致に参加しませんでした
     [rules_invalid_capture_range] Rules の一致またはキャプチャ範囲が有効な UTF-8 文字境界外です
-    [rules_duplicate_target] 2 つの Rules エントリが同じ物理テキスト対象を要求しています
-    [rules_invalid_materialization] Rules の投影レシピでソース値を再構築できません
-    [rules_snapshot_invalid] 抽出された Rules グループが有効なアセットスナップショットを形成しません
-    [rules_snapshot_store_failed] 検証済み Rules 抽出スナップショットをコミットできませんでした
-    [write_back_extraction_out_of_date] 抽出済みアセットが現在のプロジェクトソースと一致しません
-    [write_back_asset_snapshot_invalid] 保存された RPG Maker アセットが有効な書き戻しスナップショットを形成しません
-    [source_document_invalid] RPG Maker のソース文書が必要な文書形式を満たしていません
-    [generic_source_document_invalid] Generic JSONL のソース文書が必要な形式を満たしていません
-    [write_back_mutation_invalid] 検証済み翻訳変更を固定されたソース位置に適用できません
-    [write_back_output_path_invalid] 書き換えたファイルが許可された RPG Maker 出力ツリー外にあります
-    [write_back_output_path_duplicate] 複数の書き換えファイルが同じ出力パスを対象にしています
-    [write_back_candidate_project_mismatch] 準備済み書き戻し候補は別のプロジェクトに属しています
     [write_back_candidate_invalid] 書き戻し候補が必要な data/js ツリー構造を満たしていません
-    [write_back_not_published] 書き戻し候補が現在の出力ディレクトリを置き換えませんでした
-    [write_back_published_with_residuals] 出力は公開されましたが、一部の復旧成果物を削除できませんでした
     [write_back_recovery_required] 内容を信頼する前に出力ディレクトリの復旧が必要です
+    [already_exists] 対象オブジェクトは既に存在します
+    [cancelled] 操作はキャンセルされました
+    [concurrent_modification] 操作中にプロジェクト状態が同時変更されました
+    [duplicate_identifier] 識別子が重複しています
+    [extraction_out_of_date] 保存済みの抽出結果は現在のソースと一致しません
+    [invalid_content] 内容が必須契約に違反しています
+    [manual_layout_required] 改行またはレイアウトの手動調整が必要です
+    [operation_failed] 操作に失敗しました
+    [placeholder_projection_failed] Placeholder の投影で必須構造が保持されませんでした
+    [profile_not_found] 選択した翻訳 Profile は存在しません
+    [recovery_required] 結果を信頼する前に復旧が必要です
+    [resource_limit] 必要なリソース上限に達しました
+    [resource_limit_exceeded] 操作がバックエンドのリソース上限を超えました
+    [source_snapshot_mismatch] ソースは保存済みスナップショットと一致しません
+    [unavailable] 要求された作業は一時的に利用できません
     [internal_invariant] 内部不変条件に違反しました。ATT の不具合です
    *[other] __ATT_FALLBACK__
-}
-diagnostic-io-kind-value = { $code ->
-    [not_found] 見つかりません
-    [permission_denied] 権限がありません
-    [connection_refused] 接続が拒否されました
-    [connection_reset] 接続がリセットされました
-    [host_unreachable] ホストに到達できません
-    [network_unreachable] ネットワークに到達できません
-    [connection_aborted] 接続が中止されました
-    [not_connected] 接続されていません
-    [address_in_use] アドレスは使用中です
-    [address_not_available] アドレスを使用できません
-    [network_down] ネットワークが停止しています
-    [broken_pipe] パイプが切断されています
-    [already_exists] すでに存在します
-    [would_block] 操作はブロックされます
-    [not_a_directory] ディレクトリではありません
-    [is_a_directory] ディレクトリです
-    [directory_not_empty] ディレクトリが空ではありません
-    [read_only_filesystem] 読み取り専用ファイルシステムです
-    [stale_network_file_handle] ネットワークファイルハンドルが失効しています
-    [invalid_input] 操作入力が無効です
-    [invalid_data] データが無効です
-    [timed_out] 操作がタイムアウトしました
-    [write_zero] 書き込みが進行しませんでした
-    [storage_full] ストレージがいっぱいです
-    [not_seekable] 対象をシークできません
-    [quota_exceeded] ストレージ割り当てを超過しました
-    [file_too_large] ファイルが基盤システムで扱えるサイズを超えています
-    [resource_busy] リソースは使用中です
-    [executable_file_busy] 実行可能ファイルは使用中です
-    [deadlock] 操作がデッドロックを引き起こします
-    [crosses_devices] 操作がファイルシステムデバイスをまたいでいます
-    [too_many_links] ファイルシステムリンクが多すぎます
-    [invalid_filename] ファイル名が無効です
-    [argument_list_too_long] OS の引数リストが長すぎます
-    [interrupted] 操作が中断されました
-    [unsupported] 操作はサポートされていません
-    [unexpected_eof] 予期しないファイル終端です
-    [out_of_memory] OS がメモリを割り当てられませんでした
-    [other] その他の OS エラー
-   *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
     [language_policy_term_blank] 言語ポリシー用語を空白にできません
@@ -367,47 +331,6 @@ diagnostic-configuration-rule-value = { $code ->
     [referenced_client_not_found] 参照された LLM クライアントが存在しません
    *[other] __ATT_FALLBACK__
 }
-diagnostic-io-reason = 操作 { $operation }：{ $kind }
-diagnostic-io-reason-with-os-code = 操作 { $operation }：{ $kind }（OS { $os_code }）
-diagnostic-io-reason-with-system-message = 操作 { $operation }：{ $kind }：{ $system_message }
-diagnostic-io-reason-with-os-code-and-system-message = 操作 { $operation }：{ $kind }（OS { $os_code }）：{ $system_message }
-diagnostic-failure-with-detail = { $failure }：{ $detail }
-diagnostic-invalid-utf8 = バイト { $valid_up_to } の UTF-8 が無効です。無効な長さは { $error_len } バイトです
-diagnostic-incomplete-utf8 = バイト { $valid_up_to } の後に未完了の UTF-8 シーケンスがあります
-diagnostic-toml-failure-value = { $code ->
-    [syntax] TOML 構文が無効です
-    [missing_field] 必須の設定フィールドがありません
-    [unknown_field] 設定に不明なフィールドがあります
-    [duplicate_field] 設定フィールドが複数回宣言されています
-    [type_mismatch] { $expected }が必要です
-    [invalid_value] 設定値がフィールド契約に違反しています
-   *[other] __ATT_FALLBACK__
-}
-diagnostic-toml-expected-kind-value = { $code ->
-    [string] 文字列
-    [integer] 整数
-    [boolean] 真偽値
-    [string_or_boolean] 文字列または真偽値
-    [string_array] 文字列の配列
-    [integer_array] 整数の配列
-    [string_pair_array] 文字列ペアの配列
-    [table] テーブル
-    [table_array] テーブルの配列
-   *[other] __ATT_FALLBACK__
-}
-diagnostic-invalid-toml = TOML が無効です（{ $resource }）：{ $failure }
-diagnostic-invalid-toml-at = { $line } 行 { $column } 列の TOML が無効です（{ $resource }）：{ $failure }
-diagnostic-http-no-details = モデルサービスへのリクエストは失敗しましたが、公開可能な HTTP 状態の詳細はありません
-diagnostic-http-status = HTTP ステータス { $status }
-diagnostic-http-retry-after = Retry-After { $seconds } 秒
-diagnostic-http-provider-code = プロバイダーエラーコード { $code }
-diagnostic-http-provider-type = プロバイダーエラー種別 { $kind }
-diagnostic-http-provider-message = プロバイダーエラーメッセージ { $message }
-diagnostic-http-fact-separator = ；
-diagnostic-sqlite = SQLite 主エラーコード { $primary_code }、拡張エラーコード { $extended_code }
-diagnostic-windows-status = Windows 操作 { $operation } が失敗しました。NTSTATUS { $status }
-diagnostic-resource = { $resource }：実際値 { $actual }
-diagnostic-resource-with-maximum = { $resource }：実際値 { $actual }、上限 { $maximum }
 task-record-title = 翻訳タスク { $ordinal } · { $state }
 task-record-state-label = { $state ->
     [complete] 完了
@@ -466,45 +389,6 @@ task-record-final-status = 状態：{ $state ->
 }
 task-record-accepted-written = 受理：{ $accepted } 項目、実位置 { $written } 箇所へ書き込み
 task-record-accepted-outcome-unknown = 検収済み：{ $accepted } 項目；データベースのコミット結果を確認できません
-task-record-rejected-heading = 未受理：
-task-record-rejected-item = { $id }：{ $reason }
-task-record-protocol-diagnostic = プロトコル診断：{ $diagnostic }
-task-record-unavailable-reason = 利用不可の理由：{ $reason }
 task-record-task-diagnostic = タスク診断：`{ $code }`；理由 { $reason }
-task-record-rejection-reason = { $code ->
-    [missing] モデル出力がありません
-    [duplicate] モデル出力が重複しています
-    [invalid_shape] { $detail }
-    [invalid_shape_array] 翻訳は文字列配列である必要があります
-    [invalid_shape_item] 翻訳配列の { $line } 番目の項目は文字列である必要があります
-    [line_count_mismatch] 行数不一致（期待 { $expected }、実際 { $actual }）
-    [invalid_line_text] { $line } 行目に無効な制御文字があります
-    [blank_line_mismatch] { $line } 行目の空白状態不一致（期待：{ $expected_blank ->
-        [blank] 空白
-       *[other] 非空白
-    }）
-    [blank_translation] 翻訳が空です
-    [no_natural_language_text] 翻訳に自然言語テキストがありません
-    [contains_byte_order_mark] 翻訳に BOM が含まれます
-    [placeholder_mismatch] プレースホルダー不一致：{ $detail }
-    [unexpected_placeholder] 未知のプレースホルダー：{ $detail }
-    [placeholder_normalization_ambiguous] プレースホルダーの正規化が曖昧です：{ $detail }
-    [source_residual] 原文言語の残留を検出：{ $detail }
-   *[other] { $detail }
-}
-task-record-protocol-detail = { $code ->
-    [non_stop_finish] finish reason が stop ではありません：{ $detail }
-    [invalid_response] { $detail }
-    [invalid_id] モデルの { $index } 番目の項目の ID が無効です
-    [unknown_id] モデルの { $index } 番目の項目が未知の ID { $detail } を返しました
-   *[other] { $detail }
-}
-task-record-unavailable-detail = { $code ->
-    [model_response_unusable] モデルレスポンスを解析できません
-    [all_outputs_rejected] すべてのモデル出力が検収で拒否されました
-    [recoverable_request_exhausted] 回復可能なリクエストの再試行回数を使い切りました
-    [retry_after_exceeds_maximum] Retry-After が設定済み最大待機時間を超えています
-   *[other] { $code }
-}
 task-record-duration-seconds = { $value } 秒
 task-record-duration-milliseconds = { $value } ミリ秒

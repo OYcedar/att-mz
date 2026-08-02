@@ -1422,15 +1422,18 @@ mod tests {
                 Ok(_) => panic!("不透明保护跨度不得吞掉两个 Lines 槽之间的 LF"),
                 Err(error) => error,
             };
-            assert!(matches!(
-                error,
-                ResolvedTranslationSemanticError::ProtectPlaceholder(
-                    PlaceholderProtectionError::CrossesLineBoundary {
-                        rule_number: Some(1),
-                        source_line_index: 0,
-                    }
-                )
-            ));
+            let ResolvedTranslationSemanticError::ProtectPlaceholder(
+                PlaceholderProtectionError::CrossesLineBoundary {
+                    matched,
+                    source_line_index,
+                },
+            ) = error
+            else {
+                panic!("应保留跨 Lines 槽边界的 Placeholder 匹配定位")
+            };
+            assert_eq!(matched.rule().rule_number(), Some(1));
+            assert_eq!(source_line_index, 0);
+            assert!(matched.start_byte() < matched.end_byte());
         }
         assert!(
             semantics

@@ -87,6 +87,25 @@ local changed = ctx.db.execute(
 `lua_` 前缀。读取或直接修改 ATT 表属于可信高级操作，当前相关表与列见
 [SQLite 规格](../runtime/sqlite.md#4-lua-审查使用的当前表)。
 
+MV/MZ 的 `group_location` 只保存在 Group 表。Unit 和 Mutation Claim 使用 owner 内的
+`group_id` 关联 Group；审查 Unit 必须显式 JOIN 当前表，不能从 Unit 读取旧列：
+
+```lua
+local rows = ctx.db.query([=[
+  SELECT text_group.group_location, text_unit.unit_role
+  FROM rpg_maker_text_unit AS text_unit
+  JOIN rpg_maker_text_group AS text_group
+    ON text_group.owner = text_unit.owner
+   AND text_group.group_id = text_unit.group_id
+  WHERE text_unit.owner = ?1
+  ORDER BY text_group.semantic_order_key, text_unit.semantic_order_key
+]=], { "builtin" })
+```
+
+这是当前 raw schema；没有兼容 view、旧列别名或历史格式读取。直接修改 Unit 时，先用同一
+`owner + group_id` 关系定位行，或在 `WHERE` 中从 Group 按 `owner + group_location` 取得
+`group_id`。
+
 以下操作始终拒绝：
 
 - `BEGIN`、`COMMIT`、`ROLLBACK`、`SAVEPOINT` 和 `RELEASE`；
@@ -125,6 +144,7 @@ ctx.translation.set(
   Placeholder；
 - Generic locator 是 `group_id + unit_id`；MV/MZ locator 是
   `owner + group_location + unit_role`；
+- MV/MZ 表内的整数 `group_id` 只负责 owner 内关联，不属于 locator；
 - MV/MZ 的 `group_location` 与 `unit_role` 是不透明稳定字符串，必须逐字使用数据库原值；
 - `set` 写入人工翻译状态，人工与 agent 修订使用同一状态；
 - `clear(locator)` 同时清除该 Unit 的译文与状态；
@@ -181,13 +201,14 @@ hex 只含 `0-9a-f` 且长度恰好为字节数的两倍，再逐对解码成 UT
 
 导出只有在以下事实全部成立时才完整：
 
-- 日志顶层 `engine`、`project`、`command = "lua"` 与本次项目一致，全部检查使用同一 RunId；
+- 日志顶层 `context.engine`、`context.project`、`context.command = "lua"` 与本次项目一致，
+  全部检查使用同一 RunId；
 - 恰好一条 `lua.script` 的 `payload.identity` 是实际解析后的脚本路径，
   `payload.fingerprint` 等于这份脚本 UTF-8 原始字节的 SHA-256；
 - 恰好一条 `lua.summary`，其 `payload` 为 `database_calls = 1`、`changed_rows = 0`、
   `translation_calls = 0`、`printed_lines = 1`；
 - 恰好一条 `lua.print`，没有日志丢弃、写入降级或呈现失败诊断，唯一 `run.finished` 的
-  `payload.outcome = "succeeded"`；
+  `payload.result.kind = "succeeded"`；
 - 信封前缀、字节数和 hex 完整性有效；解码结果是有效 UTF-8 与 JSON；
   `format = "att-unit-review-v1"`；`unit_count` 与 `units` 数组长度一致。
 

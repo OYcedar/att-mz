@@ -5,6 +5,7 @@
 //! 本来就只能出现一次，多个 Intent 则保留自然顺序最早的组作为确定性代表。
 
 use std::fmt;
+use std::sync::Arc;
 
 use rayon::prelude::*;
 
@@ -16,7 +17,7 @@ pub(crate) struct EncodedMutationClaim {
     pub(crate) resource_key: String,
     pub(crate) access: MutationResourceAccess,
     pub(crate) group_location: String,
-    pub(crate) semantic_order_key: RpgMakerSemanticOrderKey,
+    pub(crate) semantic_order_key: Arc<RpgMakerSemanticOrderKey>,
 }
 
 impl EncodedMutationClaim {
@@ -25,6 +26,20 @@ impl EncodedMutationClaim {
         access: MutationResourceAccess,
         group_location: String,
         semantic_order_key: RpgMakerSemanticOrderKey,
+    ) -> Self {
+        Self::with_shared_semantic_order_key(
+            resource_key,
+            access,
+            group_location,
+            Arc::new(semantic_order_key),
+        )
+    }
+
+    pub(crate) fn with_shared_semantic_order_key(
+        resource_key: String,
+        access: MutationResourceAccess,
+        group_location: String,
+        semantic_order_key: Arc<RpgMakerSemanticOrderKey>,
     ) -> Self {
         Self {
             resource_key,
@@ -195,6 +210,29 @@ mod tests {
         assert_eq!(summary[1].resource_key, "resource");
         assert_eq!(summary[1].group_location, "group-z");
         assert_eq!(summary[1].semantic_order_key.physical_path(), &[2]);
+    }
+
+    #[test]
+    fn shared_constructor_reuses_the_group_semantic_order_key() {
+        let semantic_order_key = Arc::new(RpgMakerSemanticOrderKey::new(vec![2, 7], 1));
+        let first = EncodedMutationClaim::with_shared_semantic_order_key(
+            "first".to_owned(),
+            MutationResourceAccess::Intent,
+            "group".to_owned(),
+            Arc::clone(&semantic_order_key),
+        );
+        let second = EncodedMutationClaim::with_shared_semantic_order_key(
+            "second".to_owned(),
+            MutationResourceAccess::Exclusive,
+            "group".to_owned(),
+            Arc::clone(&semantic_order_key),
+        );
+
+        assert!(Arc::ptr_eq(
+            &first.semantic_order_key,
+            &second.semantic_order_key
+        ));
+        assert!(Arc::ptr_eq(&first.semantic_order_key, &semantic_order_key));
     }
 
     #[test]

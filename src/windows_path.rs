@@ -136,15 +136,6 @@ pub(crate) enum WindowsOrdinalCaseKeyPhase {
     Map,
 }
 
-impl WindowsOrdinalCaseKeyPhase {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Measure => "measure",
-            Self::Map => "map",
-        }
-    }
-}
-
 impl fmt::Display for WindowsOrdinalCaseKeyPhase {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {

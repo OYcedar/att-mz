@@ -6,14 +6,20 @@ use std::error::Error;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::diagnostic::{
-    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
-    DiagnosticStage, DiagnosticSubject, FailureReport, RecoveryFact, ReportedFailure,
-    SafeDiagnostic, SafeDiagnosticSource,
+    Diagnostic, DiagnosticReport, RpgMakerBackendCause, RpgMakerExtractionClaimSummaryViolation,
+    RpgMakerExtractionConflictRowViolation, RpgMakerExtractionIndexDecisionViolation,
+    RpgMakerExtractionMutationConflict, RpgMakerExtractionProblem,
+    RpgMakerExtractionSnapshotEncodingViolation, RpgMakerExtractionStoreOperation,
+    RpgMakerExtractionStoreProblem, RpgMakerExtractionStoredDefinitionViolation, RpgMakerIssue,
+    RpgMakerJsonFailureKind, RpgMakerMutationAccess, SafeIdentifier, SafePath, SafeText,
+    SqliteDiagnosticContext, SqliteDiagnosticStage, SqliteOperation, SqliteTransactionState,
+    StateEffect,
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::json_diagnostic::JsonErrorCategory;
@@ -35,36 +41,42 @@ use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::project_database::{
     AssetSnapshotFingerprint, CREATE_RPG_MAKER_MUTATION_CLAIM_OWNER_RESOURCE_INDEX,
     CREATE_RPG_MAKER_MUTATION_CLAIM_RESOURCE_INDEX,
+    CREATE_RPG_MAKER_TEXT_UNIT_OWNER_GROUP_ORDER_INDEX,
     DROP_RPG_MAKER_MUTATION_CLAIM_OWNER_RESOURCE_INDEX,
-    DROP_RPG_MAKER_MUTATION_CLAIM_RESOURCE_INDEX, MV_DIALOGUE_RULES_DEFINITION_KIND,
+    DROP_RPG_MAKER_MUTATION_CLAIM_RESOURCE_INDEX, DROP_RPG_MAKER_TEXT_UNIT_OWNER_GROUP_ORDER_INDEX,
+    MV_DIALOGUE_RULES_DEFINITION_KIND,
 };
-use crate::rpg_maker::semantic_order::RpgMakerSemanticOrderKey;
 use crate::rpg_maker::text::{RpgMakerLocation, TextGroupKind};
+use crate::runtime::sqlite::SqliteRuntimeError;
 use crate::storage::sqlite::{
     ExecuteTransactionError, QueryExistingDatabaseError, SqliteBatch, SqliteCommand, SqliteQuery,
     SqliteQueryExecutor, SqliteRow, SqliteTransactionExecutor, SqliteTransactionPlan,
     SqliteTransactionStep, SqliteValue,
 };
 
+use super::super::RpgMakerExtractionCpuDiagnostic;
 use super::super::model::{BuiltinSnapshot, ExtractedTextGroup, RulesSnapshot};
-use super::{BuiltinProjectDefinitionUpdate, BuiltinSnapshotStore, RulesSnapshotStore};
+use super::{
+    BuiltinProjectDefinitionUpdate, BuiltinSnapshotStore, RpgMakerExtractionStoreDiagnostic,
+    RulesSnapshotStore,
+};
 
 const INSERT_CLAIM_PREFIX: &str = r#"INSERT INTO rpg_maker_mutation_claim (
-    owner, group_location, resource_key, access
+    owner, group_id, resource_key, access
 )"#;
 #[cfg(test)]
 const INSERT_CLAIM: &str = r#"INSERT INTO rpg_maker_mutation_claim (
-    owner, group_location, resource_key, access
+    owner, group_id, resource_key, access
 ) VALUES (?1, ?2, ?3, ?4)"#;
 
 const FIND_MUTATION_CLAIM_CONFLICT: &str = r#"WITH
-other_sample(owner, group_location, resource_key, access, semantic_order_key) AS MATERIALIZED (
-    SELECT claim.owner, claim.group_location, claim.resource_key, claim.access, text_group.semantic_order_key
+other_sample(owner, group_id, group_location, resource_key, access, semantic_order_key) AS MATERIALIZED (
+    SELECT claim.owner, claim.group_id, text_group.group_location, claim.resource_key, claim.access, text_group.semantic_order_key
     FROM rpg_maker_mutation_claim AS claim
          INDEXED BY rpg_maker_mutation_claim_owner_resource_idx
     JOIN rpg_maker_text_group AS text_group
       ON text_group.owner = claim.owner
-     AND text_group.group_location = claim.group_location
+     AND text_group.group_id = claim.group_id
     WHERE claim.owner = ?3
     LIMIT CASE WHEN ?2 < 9223372036854775807 THEN ?2 + 1 ELSE -1 END
 ),
@@ -86,7 +98,7 @@ conflicts(
     SELECT
         incoming.resource_key,
         incoming.owner,
-        incoming.group_location,
+        incoming_group.group_location,
         incoming.access,
         current.owner,
         current.group_location,
@@ -100,7 +112,7 @@ conflicts(
          INDEXED BY rpg_maker_mutation_claim_resource_idx
     JOIN rpg_maker_text_group AS incoming_group
       ON incoming_group.owner = incoming.owner
-     AND incoming_group.group_location = incoming.group_location
+     AND incoming_group.group_id = incoming.group_id
     WHERE other_count.value <= ?2
       AND incoming.owner = ?1
       AND incoming.resource_key = current.resource_key
@@ -111,10 +123,10 @@ conflicts(
     SELECT
         incoming.resource_key,
         incoming.owner,
-        incoming.group_location,
+        incoming_group.group_location,
         incoming.access,
         current.owner,
-        current.group_location,
+        current_group.group_location,
         current.access,
         incoming_group.semantic_order_key,
         CASE current.owner WHEN 'builtin' THEN 0 WHEN 'rules' THEN 1 ELSE 2 END,
@@ -126,10 +138,10 @@ conflicts(
          INDEXED BY rpg_maker_mutation_claim_resource_idx
     JOIN rpg_maker_text_group AS incoming_group
       ON incoming_group.owner = incoming.owner
-     AND incoming_group.group_location = incoming.group_location
+     AND incoming_group.group_id = incoming.group_id
     JOIN rpg_maker_text_group AS current_group
       ON current_group.owner = current.owner
-     AND current_group.group_location = current.group_location
+     AND current_group.group_id = current.group_id
     WHERE other_count.value > ?2
       AND incoming.owner = ?1
       AND current.owner = ?3
@@ -168,16 +180,16 @@ ON CONFLICT(owner) DO UPDATE SET
     asset_snapshot_fingerprint = excluded.asset_snapshot_fingerprint"#;
 
 const INSERT_GROUP_PREFIX: &str = r#"INSERT INTO rpg_maker_text_group (
-    owner, group_location, semantic_order_key, group_kind, projection_recipe_json
+    owner, group_id, group_location, semantic_order_key, group_kind, projection_recipe_json
 )"#;
 #[cfg(test)]
 const INSERT_GROUP: &str = r#"INSERT INTO rpg_maker_text_group (
-    owner, group_location, semantic_order_key, group_kind, projection_recipe_json
-) VALUES (?1, ?2, ?3, ?4, ?5)"#;
+    owner, group_id, group_location, semantic_order_key, group_kind, projection_recipe_json
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#;
 
 const INSERT_UNIT_PREFIX: &str = r#"INSERT INTO rpg_maker_text_unit (
     owner,
-    group_location,
+    group_id,
     unit_role,
     semantic_order_key,
     source_content_json,
@@ -188,7 +200,7 @@ const INSERT_UNIT_PREFIX: &str = r#"INSERT INTO rpg_maker_text_unit (
 #[cfg(test)]
 const INSERT_UNIT: &str = r#"INSERT INTO rpg_maker_text_unit (
     owner,
-    group_location,
+    group_id,
     unit_role,
     semantic_order_key,
     source_content_json,
@@ -214,6 +226,7 @@ FROM rpg_maker_asset_owner_state
 WHERE owner = ?"#;
 
 const READ_OWNER_GROUPS: &str = r#"SELECT
+    group_id,
     group_location,
     semantic_order_key,
     group_kind,
@@ -223,7 +236,7 @@ WHERE owner = ?
 ORDER BY semantic_order_key"#;
 
 const READ_OWNER_UNITS: &str = r#"SELECT
-    unit.group_location,
+    text_group.group_location,
     unit.unit_role,
     unit.semantic_order_key,
     unit.source_content_json,
@@ -234,17 +247,21 @@ FROM rpg_maker_text_group AS text_group
 CROSS JOIN rpg_maker_text_unit AS unit
            INDEXED BY rpg_maker_text_unit_owner_group_order_idx
   ON unit.owner = text_group.owner
- AND unit.group_location = text_group.group_location
+ AND unit.group_id = text_group.group_id
 WHERE text_group.owner = ?
 ORDER BY text_group.semantic_order_key, unit.semantic_order_key"#;
 
 const READ_OWNER_CLAIMS: &str = r#"SELECT
-    resource_key,
-    access,
-    group_location
-FROM rpg_maker_mutation_claim INDEXED BY rpg_maker_mutation_claim_owner_resource_idx
-WHERE owner = ?
-ORDER BY owner, resource_key, access, group_location"#;
+    claim.resource_key,
+    claim.access,
+    text_group.group_location
+FROM rpg_maker_mutation_claim AS claim
+     INDEXED BY rpg_maker_mutation_claim_owner_resource_idx
+JOIN rpg_maker_text_group AS text_group
+  ON text_group.owner = claim.owner
+ AND text_group.group_id = claim.group_id
+WHERE claim.owner = ?
+ORDER BY claim.owner, claim.resource_key, claim.access, claim.group_id"#;
 
 // 只需知道另一 owner 是否存在第 incoming_count + 1 行，无需为小 Rules owner
 // 扫描完整 Builtin 索引。返回一行表示 incoming_count 不小于其他 owner 的总量。
@@ -253,6 +270,18 @@ WHERE NOT EXISTS (
     SELECT 1
     FROM rpg_maker_mutation_claim
          INDEXED BY rpg_maker_mutation_claim_owner_resource_idx
+    WHERE owner = ?1
+    LIMIT 1 OFFSET ?2
+)"#;
+
+// 与 Claim 索引策略相同：只有 incoming owner 至少覆盖另一 owner 的全部 Unit，才在
+// 同一事务内移除并重建跨 owner 的读取索引。这样大 Builtin 写入不再逐行维护该索引，
+// 小 Rules 更新也不会为了很大的 Builtin 表付出整表重建成本。
+const DECIDE_UNIT_INDEX_REBUILD: &str = r#"SELECT 1
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM rpg_maker_text_unit
+         INDEXED BY rpg_maker_text_unit_owner_group_order_idx
     WHERE owner = ?1
     LIMIT 1 OFFSET ?2
 )"#;
@@ -288,22 +317,35 @@ where
         Option<Vec<SqliteTransactionStep>>,
         RpgMakerExtractionAssetStoreError<C::Error, <S as SqliteQueryExecutor>::Error>,
     > {
+        let database_path = project.database_path().to_path_buf();
         let ordered_groups = groups.into_iter().enumerate().collect::<Vec<_>>();
         let batches = self
             .cpu
             .execute(move || split_groups(ordered_groups))
             .await
-            .map_err(RpgMakerExtractionAssetStoreError::ScheduleEncoding)?;
+            .map_err(
+                |source| RpgMakerExtractionAssetStoreError::ScheduleEncoding {
+                    database_path: database_path.clone(),
+                    source,
+                },
+            )?;
         let encoded_batches = self
             .cpu
             .execute_ordered_map(batches, encode_batch)
             .await
-            .map_err(RpgMakerExtractionAssetStoreError::ScheduleEncoding)?
+            .map_err(
+                |source| RpgMakerExtractionAssetStoreError::ScheduleEncoding {
+                    database_path: database_path.clone(),
+                    source,
+                },
+            )?
             .into_iter()
             .collect::<Result<Vec<_>, _>>()
-            .map_err(RpgMakerExtractionAssetStoreError::EncodeSnapshot)?;
+            .map_err(|source| RpgMakerExtractionAssetStoreError::EncodeSnapshot {
+                database_path: database_path.clone(),
+                source,
+            })?;
 
-        let database_path = project.database_path().to_path_buf();
         let current_owner_state = self.read_owner_state(database_path.clone(), owner).await?;
         let project_definition = match project_definition_update {
             None => None,
@@ -311,11 +353,14 @@ where
                 let current = self.read_project_definition(database_path.clone()).await?;
                 let replacement = match update {
                     BuiltinProjectDefinitionUpdate::Reuse => None,
-                    BuiltinProjectDefinitionUpdate::Replace(definition) => Some(
-                        definition
-                            .to_canonical_json()
-                            .map_err(RpgMakerExtractionAssetStoreError::EncodeProjectDefinition)?,
-                    ),
+                    BuiltinProjectDefinitionUpdate::Replace(definition) => {
+                        Some(definition.to_canonical_json().map_err(|source| {
+                            RpgMakerExtractionAssetStoreError::EncodeProjectDefinition {
+                                database_path: database_path.clone(),
+                                source,
+                            }
+                        })?)
+                    }
                 };
                 Some(ResolvedProjectDefinition {
                     current_canonical_json: current,
@@ -337,8 +382,16 @@ where
                 Ok::<_, EncodeAssetSnapshotError>((encoded, project_definition))
             })
             .await
-            .map_err(RpgMakerExtractionAssetStoreError::ScheduleEncoding)?
-            .map_err(RpgMakerExtractionAssetStoreError::EncodeSnapshot)?;
+            .map_err(
+                |source| RpgMakerExtractionAssetStoreError::ScheduleEncoding {
+                    database_path: database_path.clone(),
+                    source,
+                },
+            )?
+            .map_err(|source| RpgMakerExtractionAssetStoreError::EncodeSnapshot {
+                database_path: database_path.clone(),
+                source,
+            })?;
 
         let has_previous_owner = !current_owner_state.is_empty();
         let owner_state_is_current = owner_state_matches(
@@ -362,7 +415,12 @@ where
                     (encoded, current, snapshot_is_current)
                 })
                 .await
-                .map_err(RpgMakerExtractionAssetStoreError::ScheduleEncoding)?;
+                .map_err(
+                    |source| RpgMakerExtractionAssetStoreError::ScheduleEncoding {
+                        database_path: database_path.clone(),
+                        source,
+                    },
+                )?;
             if snapshot_is_current {
                 return Ok(None);
             }
@@ -383,6 +441,9 @@ where
                 encoded.claim_summary.len(),
             )
             .await?;
+        let unit_index_maintenance = self
+            .decide_unit_index_maintenance(database_path.clone(), owner, encoded.units.len())
+            .await?;
         let replacement = project_definition.and_then(|definition| definition.replacement);
         let steps = self
             .cpu
@@ -394,10 +455,16 @@ where
                     previous_unit_rows,
                     replacement,
                     claim_index_maintenance,
+                    unit_index_maintenance,
                 )
             })
             .await
-            .map_err(RpgMakerExtractionAssetStoreError::ScheduleEncoding)?;
+            .map_err(
+                |source| RpgMakerExtractionAssetStoreError::ScheduleEncoding {
+                    database_path: database_path.clone(),
+                    source,
+                },
+            )?;
         Ok(Some(steps))
     }
 
@@ -464,7 +531,13 @@ where
                     .with_id(format!("extract.{}.owner_state", owner.storage_name())),
             )
             .await
-            .map_err(|error| map_query_error(database_path, error))
+            .map_err(|error| {
+                map_query_error(
+                    database_path,
+                    crate::diagnostic::RpgMakerExtractionStoreOperation::ReadOwnerState,
+                    error,
+                )
+            })
     }
 
     async fn read_stored_snapshot_rows(
@@ -491,10 +564,17 @@ where
                 ],
             )
             .await
-            .map_err(|error| map_query_error(database_path, error))?;
+            .map_err(|error| {
+                map_query_error(
+                    database_path.clone(),
+                    crate::diagnostic::RpgMakerExtractionStoreOperation::ReadSnapshot,
+                    error,
+                )
+            })?;
         let actual = query_results.len();
         let [owner_state, groups, units, claims] = query_results.try_into().map_err(|_| {
             RpgMakerExtractionAssetStoreError::UnexpectedSnapshotQueryResultCount {
+                database_path,
                 expected: 4,
                 actual,
             }
@@ -522,7 +602,13 @@ where
                     .with_id(format!("extract.{}.units", owner.storage_name())),
             )
             .await
-            .map_err(|error| map_query_error(database_path, error))
+            .map_err(|error| {
+                map_query_error(
+                    database_path,
+                    crate::diagnostic::RpgMakerExtractionStoreOperation::ReadStoredUnits,
+                    error,
+                )
+            })
     }
 
     async fn read_project_definition(
@@ -558,11 +644,11 @@ where
         owner: RpgMakerAssetOwner,
         incoming_claim_count: usize,
     ) -> Result<
-        ClaimIndexMaintenance,
+        IndexMaintenance,
         RpgMakerExtractionAssetStoreError<C::Error, <S as SqliteQueryExecutor>::Error>,
     > {
         if incoming_claim_count == 0 {
-            return Ok(ClaimIndexMaintenance::Online);
+            return Ok(IndexMaintenance::Online);
         }
         // 该查询只选择等价的物理写入算法，不参与正确性判断；即使外部进程在查询与
         // 写事务之间改变数据库，事务内的精确冲突检查仍是唯一权威结果。
@@ -586,9 +672,61 @@ where
                 )),
             )
             .await
-            .map_err(|error| map_query_error(database_path.clone(), error))?;
-        decode_claim_index_maintenance(rows).map_err(|source| {
+            .map_err(|error| {
+                map_query_error(
+                    database_path.clone(),
+                    crate::diagnostic::RpgMakerExtractionStoreOperation::DecideClaimIndexMaintenance,
+                    error,
+                )
+            })?;
+        decode_index_maintenance(rows).map_err(|source| {
             RpgMakerExtractionAssetStoreError::InvalidClaimIndexMaintenanceDecision {
+                database_path,
+                source,
+            }
+        })
+    }
+
+    async fn decide_unit_index_maintenance(
+        &self,
+        database_path: PathBuf,
+        owner: RpgMakerAssetOwner,
+        incoming_unit_count: usize,
+    ) -> Result<
+        IndexMaintenance,
+        RpgMakerExtractionAssetStoreError<C::Error, <S as SqliteQueryExecutor>::Error>,
+    > {
+        if incoming_unit_count == 0 {
+            return Ok(IndexMaintenance::Online);
+        }
+        // 索引重建只改变写入的物理算法。真正的行约束、外键、自然顺序和事务终态仍由
+        // 同一写事务负责，因此此处的快照查询不会成为正确性依据。
+        let incoming_unit_count = i64::try_from(incoming_unit_count)
+            .expect("内存中的 Unit 数量必须可写入 SQLite INTEGER");
+        let other_owner = other_owner_storage_name(owner);
+        let rows = self
+            .sqlite
+            .query_existing_database(
+                database_path.clone(),
+                SqliteQuery::new(
+                    DECIDE_UNIT_INDEX_REBUILD,
+                    vec![text(other_owner), SqliteValue::Integer(incoming_unit_count)],
+                )
+                .with_id(format!(
+                    "extract.{}.unit_index_maintenance",
+                    owner.storage_name()
+                )),
+            )
+            .await
+            .map_err(|error| {
+                map_query_error(
+                    database_path.clone(),
+                    crate::diagnostic::RpgMakerExtractionStoreOperation::DecideUnitIndexMaintenance,
+                    error,
+                )
+            })?;
+        decode_index_maintenance(rows).map_err(|source| {
+            RpgMakerExtractionAssetStoreError::InvalidUnitIndexMaintenanceDecision {
                 database_path,
                 source,
             }
@@ -648,17 +786,29 @@ where
 /// RPG Maker 提取快照替换的阶段化错误。
 #[derive(Debug)]
 pub(crate) enum RpgMakerExtractionAssetStoreError<C, S> {
-    ScheduleEncoding(CpuTaskExecutionError<C>),
-    EncodeSnapshot(EncodeAssetSnapshotError),
-    EncodeProjectDefinition(MvDialogueDefinitionError),
+    ScheduleEncoding {
+        database_path: PathBuf,
+        source: CpuTaskExecutionError<C>,
+    },
+    EncodeSnapshot {
+        database_path: PathBuf,
+        source: EncodeAssetSnapshotError,
+    },
+    EncodeProjectDefinition {
+        database_path: PathBuf,
+        source: MvDialogueDefinitionError,
+    },
     DatabaseNotFound {
         database_path: PathBuf,
+        operation: crate::diagnostic::RpgMakerExtractionStoreOperation,
     },
     ReadCurrentState {
         database_path: PathBuf,
+        operation: crate::diagnostic::RpgMakerExtractionStoreOperation,
         source: S,
     },
     UnexpectedSnapshotQueryResultCount {
+        database_path: PathBuf,
         expected: usize,
         actual: usize,
     },
@@ -672,7 +822,11 @@ pub(crate) enum RpgMakerExtractionAssetStoreError<C, S> {
     },
     InvalidClaimIndexMaintenanceDecision {
         database_path: PathBuf,
-        source: ClaimIndexMaintenanceDecisionError,
+        source: IndexMaintenanceDecisionError,
+    },
+    InvalidUnitIndexMaintenanceDecision {
+        database_path: PathBuf,
+        source: IndexMaintenanceDecisionError,
     },
     MutationClaimConflict {
         database_path: PathBuf,
@@ -712,23 +866,30 @@ where
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ScheduleEncoding(source) => write!(formatter, "资产编码任务执行失败：{source}"),
-            Self::EncodeSnapshot(source) => write!(formatter, "资产快照编码失败：{source}"),
-            Self::EncodeProjectDefinition(source) => {
+            Self::ScheduleEncoding { source, .. } => {
+                write!(formatter, "资产编码任务执行失败：{source}")
+            }
+            Self::EncodeSnapshot { source, .. } => {
+                write!(formatter, "资产快照编码失败：{source}")
+            }
+            Self::EncodeProjectDefinition { source, .. } => {
                 write!(formatter, "MV 对话定义编码失败：{source}")
             }
-            Self::DatabaseNotFound { database_path } => {
+            Self::DatabaseNotFound { database_path, .. } => {
                 write!(formatter, "项目数据库不存在：{}", database_path.display())
             }
             Self::ReadCurrentState {
                 database_path,
                 source,
+                ..
             } => write!(
                 formatter,
                 "无法读取当前 owner 快照 {}：{source}",
                 database_path.display()
             ),
-            Self::UnexpectedSnapshotQueryResultCount { expected, actual } => write!(
+            Self::UnexpectedSnapshotQueryResultCount {
+                expected, actual, ..
+            } => write!(
                 formatter,
                 "资产快照查询应返回 {expected} 组结果，实际为 {actual} 组"
             ),
@@ -754,6 +915,14 @@ where
             } => write!(
                 formatter,
                 "Claim 索引维护策略查询返回无效结果 {}：{source}",
+                database_path.display()
+            ),
+            Self::InvalidUnitIndexMaintenanceDecision {
+                database_path,
+                source,
+            } => write!(
+                formatter,
+                "Unit 索引维护策略查询返回无效结果 {}：{source}",
                 database_path.display()
             ),
             Self::MutationClaimConflict {
@@ -836,14 +1005,15 @@ where
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::ScheduleEncoding(source) => Some(source),
-            Self::EncodeSnapshot(source) => Some(source),
-            Self::EncodeProjectDefinition(source) => Some(source),
+            Self::ScheduleEncoding { source, .. } => Some(source),
+            Self::EncodeSnapshot { source, .. } => Some(source),
+            Self::EncodeProjectDefinition { source, .. } => Some(source),
             Self::ReadCurrentState { source, .. } | Self::ReadProjectDefinition { source, .. } => {
                 Some(source)
             }
             Self::InvalidProjectDefinition { source, .. } => Some(source),
-            Self::InvalidClaimIndexMaintenanceDecision { source, .. } => Some(source),
+            Self::InvalidClaimIndexMaintenanceDecision { source, .. }
+            | Self::InvalidUnitIndexMaintenanceDecision { source, .. } => Some(source),
             Self::InvalidMutationClaimConflictRow { source, .. } => Some(source),
             Self::MutationClaimConflictOutcomeUnknown { source, .. }
             | Self::InvalidMutationClaimConflictRowOutcomeUnknown { source, .. }
@@ -857,300 +1027,366 @@ where
     }
 }
 
-impl<C, S> RpgMakerExtractionAssetStoreError<C, S>
+/// 提取 Store 只要求 SQLite 根错误提供已经类型化的报告，不读取其 Display 正文。
+trait RpgMakerExtractionSqliteDiagnostic {
+    fn extraction_sqlite_diagnostic_report(
+        &self,
+        database_path: &std::path::Path,
+        operation: RpgMakerExtractionStoreOperation,
+        effect: StateEffect,
+        transaction: SqliteTransactionState,
+    ) -> DiagnosticReport;
+}
+
+impl RpgMakerExtractionSqliteDiagnostic for SqliteRuntimeError {
+    fn extraction_sqlite_diagnostic_report(
+        &self,
+        database_path: &std::path::Path,
+        operation: RpgMakerExtractionStoreOperation,
+        effect: StateEffect,
+        transaction: SqliteTransactionState,
+    ) -> DiagnosticReport {
+        let sqlite_operation = if operation == RpgMakerExtractionStoreOperation::CommitSnapshot {
+            SqliteOperation::Transaction
+        } else {
+            SqliteOperation::Query
+        };
+        self.diagnostic_report(
+            database_path,
+            SqliteDiagnosticContext::new(
+                SqliteDiagnosticStage::Extract,
+                sqlite_operation,
+                transaction,
+            ),
+            effect,
+        )
+    }
+}
+
+impl<C, S> RpgMakerExtractionStoreDiagnostic for RpgMakerExtractionAssetStoreError<C, S>
 where
-    CpuTaskExecutionError<C>: SafeDiagnosticSource,
-    S: SafeDiagnosticSource,
+    CpuTaskExecutionError<C>: RpgMakerExtractionCpuDiagnostic,
+    S: RpgMakerExtractionSqliteDiagnostic,
 {
-    /// 在 owner store 仍持有数据库路径与事务终态时建立安全投影。
-    pub(crate) fn safe_diagnostic(&self, stage: DiagnosticStage) -> SafeDiagnostic {
+    fn extraction_store_diagnostic_report(
+        &self,
+        owner: crate::diagnostic::RpgMakerDiagnosticOwner,
+    ) -> DiagnosticReport {
+        let database_path = self.database_path();
+        let operation = self.operation();
+        let effect = self.effect();
         match self {
-            Self::ScheduleEncoding(source) => source.safe_diagnostic_source(
-                stage,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::Retry,
-            ),
-            Self::EncodeSnapshot(source) => source.safe_diagnostic(stage),
-            Self::EncodeProjectDefinition(source) => source
-                .safe_diagnostic(
-                    stage,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::ReportBug,
-                )
-                .with_recovery(RecoveryFact::component(
-                    "operation=encode_project_definition",
-                )),
-            Self::DatabaseNotFound { database_path } => SafeDiagnostic::new(
-                DiagnosticCode::ProjectUnavailable,
-                stage,
-                DiagnosticSubject::path(database_path),
-                DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            ),
-            Self::ReadCurrentState {
+            Self::ScheduleEncoding { source, .. } => extraction_store_report(
+                owner,
                 database_path,
-                source,
+                operation,
+                effect,
+                RpgMakerExtractionStoreProblem::Backend {
+                    cause: RpgMakerBackendCause::new(source.extraction_cpu_diagnostic()),
+                },
+            ),
+            Self::EncodeSnapshot { source, .. } => extraction_store_report(
+                owner,
+                database_path,
+                operation,
+                effect,
+                RpgMakerExtractionStoreProblem::SnapshotEncoding {
+                    violation: source.diagnostic_violation(),
+                },
+            ),
+            Self::EncodeProjectDefinition { source, .. } => extraction_store_report(
+                owner,
+                database_path,
+                operation,
+                effect,
+                RpgMakerExtractionStoreProblem::ProjectDefinitionEncoding {
+                    problem: source.diagnostic_problem(),
+                },
+            ),
+            Self::DatabaseNotFound { .. } => extraction_store_report(
+                owner,
+                database_path,
+                operation,
+                effect,
+                RpgMakerExtractionStoreProblem::DatabaseNotFound,
+            ),
+            Self::ReadCurrentState { source, .. } | Self::ReadProjectDefinition { source, .. } => {
+                let backend = source.extraction_sqlite_diagnostic_report(
+                    database_path,
+                    operation,
+                    effect,
+                    SqliteTransactionState::NotStarted,
+                );
+                extraction_store_backend_report(owner, database_path, operation, effect, &backend)
             }
-            | Self::ReadProjectDefinition {
+            Self::UnexpectedSnapshotQueryResultCount {
+                expected, actual, ..
+            } => extraction_store_report(
+                owner,
                 database_path,
-                source,
-            } => source
-                .safe_diagnostic_source(
-                    stage,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckProjectState,
-                )
-                .with_recovery(RecoveryFact::path(database_path)),
-            Self::UnexpectedSnapshotQueryResultCount { expected, actual } => SafeDiagnostic::new(
-                DiagnosticCode::ProjectState,
-                stage,
-                DiagnosticSubject::operation("read_extraction_snapshot"),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::StateMismatch,
-                    format!("expected_query_sets={expected}, actual_query_sets={actual}"),
-                ),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
+                operation,
+                effect,
+                RpgMakerExtractionStoreProblem::UnexpectedQueryResultSetCount {
+                    expected: *expected,
+                    actual: *actual,
+                },
             ),
-            Self::InvalidProjectDefinition {
+            Self::InvalidProjectDefinition { source, .. } => extraction_store_report(
+                owner,
                 database_path,
-                source,
-            } => invalid_project_definition_diagnostic(database_path, source, stage),
-            Self::InvalidClaimIndexMaintenanceDecision {
-                database_path,
-                source,
-            } => SafeDiagnostic::new(
-                DiagnosticCode::InternalOperation,
-                stage,
-                DiagnosticSubject::path(database_path),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::InternalInvariant,
-                    source.safe_detail(),
-                ),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::ReportBug,
+                operation,
+                effect,
+                RpgMakerExtractionStoreProblem::InvalidStoredProjectDefinition {
+                    violation: source.diagnostic_violation(),
+                },
             ),
-            Self::MutationClaimConflict {
+            Self::InvalidClaimIndexMaintenanceDecision { source, .. } => extraction_store_report(
+                owner,
                 database_path,
-                conflict,
-            } => SafeDiagnostic::new(
-                DiagnosticCode::ProjectState,
-                stage,
-                DiagnosticSubject::path(database_path),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::ConflictingValues,
-                    format!("mutation_resource={}", conflict.resource),
-                ),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            )
-            .with_recovery(RecoveryFact::component(format!(
-                "incoming_owner={}",
-                conflict.incoming_owner.storage_name()
-            )))
-            .with_recovery(RecoveryFact::component(format!(
-                "incoming_group={}",
-                conflict.incoming_group_location
-            )))
-            .with_recovery(RecoveryFact::component(format!(
-                "incoming_access={}",
-                conflict.incoming_access.storage_name()
-            )))
-            .with_recovery(RecoveryFact::component(format!(
-                "current_owner={}",
-                conflict.current_owner.storage_name()
-            )))
-            .with_recovery(RecoveryFact::component(format!(
-                "current_group={}",
-                conflict.current_group_location
-            )))
-            .with_recovery(RecoveryFact::component(format!(
-                "current_access={}",
-                conflict.current_access.storage_name()
-            )))
-            .with_recovery(RecoveryFact::transaction("rolled_back")),
-            Self::ConcurrentModification { database_path } => SafeDiagnostic::new(
-                DiagnosticCode::ProjectState,
-                stage,
-                DiagnosticSubject::path(database_path),
-                DiagnosticReason::failure(DiagnosticFailureKind::StateMismatch),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::Retry,
-            )
-            .with_recovery(RecoveryFact::component("operation=commit_extract_snapshot"))
-            .with_recovery(RecoveryFact::transaction("rolled_back")),
-            Self::InvalidMutationClaimConflictRow {
+                operation,
+                effect,
+                RpgMakerExtractionStoreProblem::InvalidClaimIndexDecision {
+                    violation: source.diagnostic_violation(),
+                },
+            ),
+            Self::InvalidUnitIndexMaintenanceDecision { source, .. } => extraction_store_report(
+                owner,
                 database_path,
-                source,
-            } => SafeDiagnostic::new(
-                DiagnosticCode::ProjectState,
-                stage,
-                DiagnosticSubject::path(database_path),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::StateMismatch,
-                    source.safe_detail(),
-                ),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            )
-            .with_recovery(RecoveryFact::transaction("rolled_back")),
+                operation,
+                effect,
+                RpgMakerExtractionStoreProblem::InvalidUnitIndexDecision {
+                    violation: source.diagnostic_violation(),
+                },
+            ),
+            Self::MutationClaimConflict { conflict, .. } => extraction_store_report(
+                owner,
+                database_path,
+                operation,
+                effect,
+                RpgMakerExtractionStoreProblem::MutationClaimConflict {
+                    conflict: conflict.diagnostic_conflict(),
+                    transaction: SqliteTransactionState::RolledBack,
+                },
+            ),
+            Self::ConcurrentModification { .. } => extraction_store_report(
+                owner,
+                database_path,
+                operation,
+                effect,
+                RpgMakerExtractionStoreProblem::ConcurrentModification {
+                    transaction: SqliteTransactionState::RolledBack,
+                },
+            ),
+            Self::InvalidMutationClaimConflictRow { source, .. } => extraction_store_report(
+                owner,
+                database_path,
+                operation,
+                effect,
+                RpgMakerExtractionStoreProblem::InvalidConflictRow {
+                    violation: source.diagnostic_violation(),
+                    transaction: SqliteTransactionState::RolledBack,
+                },
+            ),
             Self::MutationClaimConflictOutcomeUnknown {
-                database_path,
-                source,
-                ..
-            }
-            | Self::InvalidMutationClaimConflictRowOutcomeUnknown {
-                database_path,
-                source,
-                ..
-            } => source
-                .safe_diagnostic_source(
-                    stage,
-                    DiagnosticImpact::OutcomeUnknown,
-                    DiagnosticAction::PreserveRecoveryArtifacts,
-                )
-                .with_recovery(RecoveryFact::path(database_path))
-                .with_recovery(RecoveryFact::transaction("outcome_unknown")),
-            Self::NotCommitted {
-                database_path,
-                source,
+                conflict, source, ..
             } => {
-                let mut diagnostic = source.safe_diagnostic_source(
-                    stage,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckProjectState,
+                let backend = source.extraction_sqlite_diagnostic_report(
+                    database_path,
+                    operation,
+                    effect,
+                    SqliteTransactionState::OutcomeUnknown,
                 );
-                diagnostic.impact = DiagnosticImpact::Unchanged;
-                diagnostic
-                    .with_recovery(RecoveryFact::path(database_path))
-                    .with_recovery(RecoveryFact::transaction("rolled_back"))
+                let report = extraction_store_report(
+                    owner,
+                    database_path,
+                    operation,
+                    effect,
+                    RpgMakerExtractionStoreProblem::MutationClaimConflictOutcomeUnknown {
+                        conflict: conflict.diagnostic_conflict(),
+                        cause: RpgMakerBackendCause::new(backend.primary().clone()),
+                    },
+                );
+                copy_related_reports(report, &backend)
             }
-            Self::OutcomeUnknown {
-                database_path,
-                source,
+            Self::InvalidMutationClaimConflictRowOutcomeUnknown {
+                row_error, source, ..
             } => {
-                let mut diagnostic = source.safe_diagnostic_source(
-                    stage,
-                    DiagnosticImpact::OutcomeUnknown,
-                    DiagnosticAction::PreserveRecoveryArtifacts,
+                let backend = source.extraction_sqlite_diagnostic_report(
+                    database_path,
+                    operation,
+                    effect,
+                    SqliteTransactionState::OutcomeUnknown,
                 );
-                diagnostic.impact = DiagnosticImpact::OutcomeUnknown;
-                diagnostic
-                    .with_recovery(RecoveryFact::path(database_path))
-                    .with_recovery(RecoveryFact::transaction("outcome_unknown"))
+                let report = extraction_store_report(
+                    owner,
+                    database_path,
+                    operation,
+                    effect,
+                    RpgMakerExtractionStoreProblem::InvalidConflictRowOutcomeUnknown {
+                        violation: row_error.diagnostic_violation(),
+                        cause: RpgMakerBackendCause::new(backend.primary().clone()),
+                    },
+                );
+                copy_related_reports(report, &backend)
+            }
+            Self::NotCommitted { source, .. } => {
+                let backend = source.extraction_sqlite_diagnostic_report(
+                    database_path,
+                    operation,
+                    effect,
+                    SqliteTransactionState::RolledBack,
+                );
+                let report = extraction_store_report(
+                    owner,
+                    database_path,
+                    operation,
+                    effect,
+                    RpgMakerExtractionStoreProblem::NotCommitted {
+                        cause: RpgMakerBackendCause::new(backend.primary().clone()),
+                        transaction: SqliteTransactionState::RolledBack,
+                    },
+                );
+                copy_related_reports(report, &backend)
+            }
+            Self::OutcomeUnknown { source, .. } => {
+                let backend = source.extraction_sqlite_diagnostic_report(
+                    database_path,
+                    operation,
+                    effect,
+                    SqliteTransactionState::OutcomeUnknown,
+                );
+                let report = extraction_store_report(
+                    owner,
+                    database_path,
+                    operation,
+                    effect,
+                    RpgMakerExtractionStoreProblem::OutcomeUnknown {
+                        cause: RpgMakerBackendCause::new(backend.primary().clone()),
+                        transaction: SqliteTransactionState::OutcomeUnknown,
+                    },
+                );
+                copy_related_reports(report, &backend)
             }
         }
     }
 }
 
-impl<C, S> SafeDiagnosticSource for RpgMakerExtractionAssetStoreError<C, S>
-where
-    C: Error + Send + Sync + 'static,
-    S: Error + SafeDiagnosticSource + Send + Sync + 'static,
-    CpuTaskExecutionError<C>: SafeDiagnosticSource,
-{
-    fn safe_diagnostic_source(
-        &self,
-        stage: DiagnosticStage,
-        _impact: DiagnosticImpact,
-        _fallback_action: DiagnosticAction,
-    ) -> SafeDiagnostic {
-        self.safe_diagnostic(stage)
-    }
-
-    fn into_failure_report(
-        self,
-        stage: DiagnosticStage,
-        _impact: DiagnosticImpact,
-        _fallback_action: DiagnosticAction,
-    ) -> FailureReport {
+impl<C, S> RpgMakerExtractionAssetStoreError<C, S> {
+    fn database_path(&self) -> &std::path::Path {
         match self {
-            Self::NotCommitted {
-                database_path,
-                source,
-            } => source
-                .into_failure_report(
-                    stage,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckProjectState,
-                )
-                .with_primary_impact(DiagnosticImpact::Unchanged)
-                .with_primary_recovery(RecoveryFact::path(database_path))
-                .with_primary_recovery(RecoveryFact::transaction("rolled_back")),
-            Self::OutcomeUnknown {
-                database_path,
-                source,
-            } => source
-                .into_failure_report(
-                    stage,
-                    DiagnosticImpact::OutcomeUnknown,
-                    DiagnosticAction::PreserveRecoveryArtifacts,
-                )
-                .with_primary_impact(DiagnosticImpact::OutcomeUnknown)
-                .with_primary_recovery(RecoveryFact::path(database_path))
-                .with_primary_recovery(RecoveryFact::transaction("outcome_unknown")),
-            Self::MutationClaimConflictOutcomeUnknown {
-                database_path,
-                conflict,
-                source,
-            } => {
-                let evidence = MutationClaimConflictEvidence {
-                    database_path: database_path.clone(),
-                    conflict,
-                };
-                source
-                    .into_failure_report(
-                        stage,
-                        DiagnosticImpact::OutcomeUnknown,
-                        DiagnosticAction::PreserveRecoveryArtifacts,
-                    )
-                    .with_primary_impact(DiagnosticImpact::OutcomeUnknown)
-                    .with_primary_recovery(RecoveryFact::path(database_path))
-                    .with_primary_recovery(RecoveryFact::transaction("outcome_unknown"))
-                    .with_related(ReportedFailure::new(
-                        evidence.safe_diagnostic(stage),
-                        evidence,
-                    ))
-            }
-            Self::InvalidMutationClaimConflictRowOutcomeUnknown {
-                database_path,
-                row_error,
-                source,
-            } => {
-                let related = SafeDiagnostic::new(
-                    DiagnosticCode::ProjectState,
-                    stage,
-                    DiagnosticSubject::path(&database_path),
-                    DiagnosticReason::failure_with_detail(
-                        DiagnosticFailureKind::StateMismatch,
-                        row_error.safe_detail(),
-                    ),
-                    DiagnosticImpact::OutcomeUnknown,
-                    DiagnosticAction::CheckProjectState,
-                )
-                .with_recovery(RecoveryFact::transaction("outcome_unknown"));
-                source
-                    .into_failure_report(
-                        stage,
-                        DiagnosticImpact::OutcomeUnknown,
-                        DiagnosticAction::PreserveRecoveryArtifacts,
-                    )
-                    .with_primary_impact(DiagnosticImpact::OutcomeUnknown)
-                    .with_primary_recovery(RecoveryFact::path(database_path))
-                    .with_primary_recovery(RecoveryFact::transaction("outcome_unknown"))
-                    .with_related(ReportedFailure::new(related, row_error))
-            }
-            source => {
-                let public = source.safe_diagnostic(stage);
-                FailureReport::new(ReportedFailure::new(public, source))
-            }
+            Self::ScheduleEncoding { database_path, .. }
+            | Self::EncodeSnapshot { database_path, .. }
+            | Self::EncodeProjectDefinition { database_path, .. }
+            | Self::DatabaseNotFound { database_path, .. }
+            | Self::ReadCurrentState { database_path, .. }
+            | Self::UnexpectedSnapshotQueryResultCount { database_path, .. }
+            | Self::ReadProjectDefinition { database_path, .. }
+            | Self::InvalidProjectDefinition { database_path, .. }
+            | Self::InvalidClaimIndexMaintenanceDecision { database_path, .. }
+            | Self::InvalidUnitIndexMaintenanceDecision { database_path, .. }
+            | Self::MutationClaimConflict { database_path, .. }
+            | Self::ConcurrentModification { database_path }
+            | Self::MutationClaimConflictOutcomeUnknown { database_path, .. }
+            | Self::InvalidMutationClaimConflictRow { database_path, .. }
+            | Self::InvalidMutationClaimConflictRowOutcomeUnknown { database_path, .. }
+            | Self::NotCommitted { database_path, .. }
+            | Self::OutcomeUnknown { database_path, .. } => database_path,
         }
     }
+
+    fn operation(&self) -> RpgMakerExtractionStoreOperation {
+        match self {
+            Self::ScheduleEncoding { .. } => RpgMakerExtractionStoreOperation::ScheduleEncoding,
+            Self::EncodeSnapshot { .. } => RpgMakerExtractionStoreOperation::EncodeSnapshot,
+            Self::EncodeProjectDefinition { .. } => {
+                RpgMakerExtractionStoreOperation::EncodeProjectDefinition
+            }
+            Self::DatabaseNotFound { operation, .. } | Self::ReadCurrentState { operation, .. } => {
+                *operation
+            }
+            Self::UnexpectedSnapshotQueryResultCount { .. } => {
+                RpgMakerExtractionStoreOperation::ReadSnapshot
+            }
+            Self::ReadProjectDefinition { .. } | Self::InvalidProjectDefinition { .. } => {
+                RpgMakerExtractionStoreOperation::ReadProjectDefinition
+            }
+            Self::InvalidClaimIndexMaintenanceDecision { .. } => {
+                RpgMakerExtractionStoreOperation::DecideClaimIndexMaintenance
+            }
+            Self::InvalidUnitIndexMaintenanceDecision { .. } => {
+                RpgMakerExtractionStoreOperation::DecideUnitIndexMaintenance
+            }
+            Self::MutationClaimConflict { .. }
+            | Self::ConcurrentModification { .. }
+            | Self::MutationClaimConflictOutcomeUnknown { .. }
+            | Self::InvalidMutationClaimConflictRow { .. }
+            | Self::InvalidMutationClaimConflictRowOutcomeUnknown { .. }
+            | Self::NotCommitted { .. }
+            | Self::OutcomeUnknown { .. } => RpgMakerExtractionStoreOperation::CommitSnapshot,
+        }
+    }
+
+    const fn effect(&self) -> StateEffect {
+        match self {
+            Self::MutationClaimConflictOutcomeUnknown { .. }
+            | Self::InvalidMutationClaimConflictRowOutcomeUnknown { .. }
+            | Self::OutcomeUnknown { .. } => StateEffect::OutcomeUnknown,
+            _ => StateEffect::Unchanged,
+        }
+    }
+}
+
+fn extraction_store_report(
+    owner: crate::diagnostic::RpgMakerDiagnosticOwner,
+    database_path: &std::path::Path,
+    operation: RpgMakerExtractionStoreOperation,
+    effect: StateEffect,
+    problem: RpgMakerExtractionStoreProblem,
+) -> DiagnosticReport {
+    DiagnosticReport::new(
+        effect,
+        Diagnostic::rpg_maker(RpgMakerIssue::extraction(
+            RpgMakerExtractionProblem::Store {
+                owner,
+                database_path: SafePath::new(database_path),
+                operation,
+                problem,
+            },
+        )),
+    )
+}
+
+fn extraction_store_backend_report(
+    owner: crate::diagnostic::RpgMakerDiagnosticOwner,
+    database_path: &std::path::Path,
+    operation: RpgMakerExtractionStoreOperation,
+    effect: StateEffect,
+    backend: &DiagnosticReport,
+) -> DiagnosticReport {
+    let report = extraction_store_report(
+        owner,
+        database_path,
+        operation,
+        effect,
+        RpgMakerExtractionStoreProblem::Backend {
+            cause: RpgMakerBackendCause::new(backend.primary().clone()),
+        },
+    );
+    copy_related_reports(report, backend)
+}
+
+fn copy_related_reports(
+    mut target: DiagnosticReport,
+    backend: &DiagnosticReport,
+) -> DiagnosticReport {
+    for related in backend.related() {
+        target = target.with_related(related.relation(), related.report().clone());
+    }
+    target
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ClaimIndexMaintenance {
+enum IndexMaintenance {
     Online,
     Rebuild,
 }
@@ -1167,73 +1403,10 @@ pub(crate) struct MutationClaimConflictDetails {
 }
 
 #[derive(Debug)]
-struct MutationClaimConflictEvidence {
-    database_path: PathBuf,
-    conflict: MutationClaimConflictDetails,
-}
-
-impl MutationClaimConflictEvidence {
-    fn safe_diagnostic(&self, stage: DiagnosticStage) -> SafeDiagnostic {
-        SafeDiagnostic::new(
-            DiagnosticCode::ProjectState,
-            stage,
-            DiagnosticSubject::path(&self.database_path),
-            DiagnosticReason::failure_with_detail(
-                DiagnosticFailureKind::ConflictingValues,
-                format!("mutation_resource={}", self.conflict.resource),
-            ),
-            DiagnosticImpact::OutcomeUnknown,
-            DiagnosticAction::PreserveRecoveryArtifacts,
-        )
-        .with_recovery(RecoveryFact::component(format!(
-            "incoming_owner={}",
-            self.conflict.incoming_owner.storage_name()
-        )))
-        .with_recovery(RecoveryFact::component(format!(
-            "incoming_group={}",
-            self.conflict.incoming_group_location
-        )))
-        .with_recovery(RecoveryFact::component(format!(
-            "incoming_access={}",
-            self.conflict.incoming_access.storage_name()
-        )))
-        .with_recovery(RecoveryFact::component(format!(
-            "current_owner={}",
-            self.conflict.current_owner.storage_name()
-        )))
-        .with_recovery(RecoveryFact::component(format!(
-            "current_group={}",
-            self.conflict.current_group_location
-        )))
-        .with_recovery(RecoveryFact::component(format!(
-            "current_access={}",
-            self.conflict.current_access.storage_name()
-        )))
-        .with_recovery(RecoveryFact::transaction("outcome_unknown"))
-    }
-}
-
-impl fmt::Display for MutationClaimConflictEvidence {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "资源 {}：新 owner {} 的组 {} ({}) 与现有 owner {} 的组 {} ({}) 冲突",
-            self.conflict.resource,
-            self.conflict.incoming_owner.storage_name(),
-            self.conflict.incoming_group_location,
-            self.conflict.incoming_access.storage_name(),
-            self.conflict.current_owner.storage_name(),
-            self.conflict.current_group_location,
-            self.conflict.current_access.storage_name(),
-        )
-    }
-}
-
-impl Error for MutationClaimConflictEvidence {}
-
-#[derive(Debug)]
 pub(crate) enum MutationClaimConflictRowError {
-    UnexpectedQueryId,
+    UnexpectedQueryId {
+        actual: String,
+    },
     ColumnCount {
         actual: usize,
     },
@@ -1258,37 +1431,33 @@ pub(crate) enum MutationClaimConflictRowError {
     NonCanonicalResource,
 }
 
-impl MutationClaimConflictRowError {
-    fn safe_detail(&self) -> String {
-        match self {
-            Self::UnexpectedQueryId => "unexpected_conflict_query_id".to_owned(),
-            Self::ColumnCount { actual } => {
-                format!("conflict_row_expected_columns=7, actual_columns={actual}")
-            }
-            Self::ColumnType { column, actual } => {
-                format!("conflict_row_column={column}, expected_type=text, actual_type={actual}")
-            }
-            Self::UnknownOwner { column } => {
-                format!("conflict_row_column={column}, owner_invalid")
-            }
-            Self::UnknownAccess { column } => {
-                format!("conflict_row_column={column}, access_invalid")
-            }
-            Self::InvalidGroupLocation { column, .. } => {
-                format!("conflict_row_column={column}, group_location_invalid")
-            }
-            Self::NonCanonicalGroupLocation { column } => {
-                format!("conflict_row_column={column}, group_location_non_canonical")
-            }
-            Self::InvalidResource(_) => "conflict_row_resource_invalid".to_owned(),
-            Self::NonCanonicalResource => "conflict_row_resource_non_canonical".to_owned(),
-        }
-    }
-}
-
 impl fmt::Display for MutationClaimConflictRowError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.safe_detail())
+        match self {
+            Self::UnexpectedQueryId { actual } => {
+                write!(formatter, "冲突查询返回了非预期的 query ID：{actual}")
+            }
+            Self::ColumnCount { actual } => {
+                write!(formatter, "冲突查询应返回 7 列，实际为 {actual} 列")
+            }
+            Self::ColumnType { column, actual } => {
+                write!(formatter, "冲突查询列 {column} 应为 TEXT，实际为 {actual}")
+            }
+            Self::UnknownOwner { column } => {
+                write!(formatter, "冲突查询列 {column} 包含未知 owner")
+            }
+            Self::UnknownAccess { column } => {
+                write!(formatter, "冲突查询列 {column} 包含未知访问方式")
+            }
+            Self::InvalidGroupLocation { column, .. } => {
+                write!(formatter, "冲突查询列 {column} 包含无效 Group 位置")
+            }
+            Self::NonCanonicalGroupLocation { column } => {
+                write!(formatter, "冲突查询列 {column} 包含非 canonical Group 位置")
+            }
+            Self::InvalidResource(_) => formatter.write_str("冲突查询包含无效资源位置"),
+            Self::NonCanonicalResource => formatter.write_str("冲突查询包含非 canonical 资源位置"),
+        }
     }
 }
 
@@ -1303,7 +1472,7 @@ impl Error for MutationClaimConflictRowError {
 }
 
 #[derive(Debug)]
-pub(crate) enum ClaimIndexMaintenanceDecisionError {
+pub(crate) enum IndexMaintenanceDecisionError {
     RowCount {
         actual: usize,
     },
@@ -1316,30 +1485,27 @@ pub(crate) enum ClaimIndexMaintenanceDecisionError {
     },
 }
 
-impl ClaimIndexMaintenanceDecisionError {
-    fn safe_detail(&self) -> String {
+impl fmt::Display for IndexMaintenanceDecisionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::RowCount { actual } => {
-                format!("expected_rows=0_or_1, actual_rows={actual}")
+                write!(
+                    formatter,
+                    "索引维护判断应返回 0 或 1 行，实际为 {actual} 行"
+                )
             }
             Self::ColumnCount { actual } => {
-                format!("expected_columns=1, actual_columns={actual}")
+                write!(formatter, "索引维护判断应返回 1 列，实际为 {actual} 列")
             }
             Self::Value { kind, integer } => match integer {
-                Some(value) => format!("expected_integer=1, actual_integer={value}"),
-                None => format!("expected_value_type=integer, actual_value_type={kind}"),
+                Some(value) => write!(formatter, "索引维护判断应返回整数 1，实际为 {value}"),
+                None => write!(formatter, "索引维护判断应返回整数，实际类型为 {kind}"),
             },
         }
     }
 }
 
-impl fmt::Display for ClaimIndexMaintenanceDecisionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.safe_detail())
-    }
-}
-
-impl Error for ClaimIndexMaintenanceDecisionError {}
+impl Error for IndexMaintenanceDecisionError {}
 
 #[derive(Debug)]
 pub(crate) enum StoredProjectDefinitionError {
@@ -1381,55 +1547,6 @@ impl Error for StoredProjectDefinitionError {
             | Self::NonCanonical => None,
         }
     }
-}
-
-fn invalid_project_definition_diagnostic(
-    database_path: &PathBuf,
-    source: &StoredProjectDefinitionError,
-    stage: DiagnosticStage,
-) -> SafeDiagnostic {
-    if let StoredProjectDefinitionError::Invalid(source) = source {
-        return source
-            .safe_diagnostic(
-                stage,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
-            )
-            .with_recovery(RecoveryFact::path(database_path))
-            .with_recovery(RecoveryFact::component("definition_kind=mv_dialogue_rules"));
-    }
-    let (subject, detail) = match source {
-        StoredProjectDefinitionError::Missing => (
-            DiagnosticSubject::field("rpg_maker_project_definition"),
-            "definition_kind=mv_dialogue_rules; expected_rows=1; actual_rows=0".to_owned(),
-        ),
-        StoredProjectDefinitionError::Multiple => (
-            DiagnosticSubject::field("rpg_maker_project_definition"),
-            "definition_kind=mv_dialogue_rules; expected_rows=1; actual_rows=multiple".to_owned(),
-        ),
-        StoredProjectDefinitionError::WrongColumnCount { actual } => (
-            DiagnosticSubject::field("canonical_json"),
-            format!("expected_columns=1; actual_columns={actual}"),
-        ),
-        StoredProjectDefinitionError::WrongColumnType { actual } => (
-            DiagnosticSubject::field("canonical_json"),
-            format!("expected_type=text; actual_type={actual}"),
-        ),
-        StoredProjectDefinitionError::NonCanonical => (
-            DiagnosticSubject::field("canonical_json"),
-            "definition_kind=mv_dialogue_rules; encoding=non_canonical".to_owned(),
-        ),
-        StoredProjectDefinitionError::Invalid(_) => unreachable!("已在函数入口处理"),
-    };
-    SafeDiagnostic::new(
-        DiagnosticCode::ProjectState,
-        stage,
-        subject,
-        DiagnosticReason::failure_with_detail(DiagnosticFailureKind::StateMismatch, detail),
-        DiagnosticImpact::Unchanged,
-        DiagnosticAction::CheckProjectState,
-    )
-    .with_recovery(RecoveryFact::path(database_path))
 }
 
 #[derive(Debug)]
@@ -1477,121 +1594,184 @@ impl Error for EncodeAssetSnapshotError {
 }
 
 impl EncodeAssetSnapshotError {
-    fn safe_diagnostic(&self, stage: DiagnosticStage) -> SafeDiagnostic {
-        let (subject, reason) = match self {
-            Self::Location(source) => (
-                DiagnosticSubject::field("group_location"),
-                codec_failure_reason("location", location_codec_failure_detail(source)),
-            ),
-            Self::Projection(source) => (
-                DiagnosticSubject::field("projection_recipe_json"),
-                codec_failure_reason("projection", projection_codec_failure_detail(source)),
-            ),
-            Self::SourceContent(source) => (
-                DiagnosticSubject::field("source_content_json"),
-                json_encoding_failure_reason("source_content_json", source),
-            ),
-            Self::SourceContext(source) => (
-                DiagnosticSubject::field("source_context_json"),
-                json_encoding_failure_reason("source_context_json", source),
-            ),
-            Self::DuplicateGroupLocation { group_location } => (
-                DiagnosticSubject::field(group_location.to_string()),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::ConflictingValues,
-                    "duplicate_group_location",
-                ),
-            ),
+    fn diagnostic_violation(&self) -> RpgMakerExtractionSnapshotEncodingViolation {
+        match self {
+            Self::Location(source) => {
+                RpgMakerExtractionSnapshotEncodingViolation::InvalidLocation {
+                    failure: source.diagnostic_failure(),
+                }
+            }
+            Self::Projection(source) => {
+                RpgMakerExtractionSnapshotEncodingViolation::InvalidProjection {
+                    failure: source.diagnostic_failure(),
+                }
+            }
+            Self::SourceContent(source) => {
+                RpgMakerExtractionSnapshotEncodingViolation::InvalidSourceContentJson {
+                    category: rpg_maker_json_failure(source),
+                    line: source.line(),
+                    column: source.column(),
+                }
+            }
+            Self::SourceContext(source) => {
+                RpgMakerExtractionSnapshotEncodingViolation::InvalidSourceContextJson {
+                    category: rpg_maker_json_failure(source),
+                    line: source.line(),
+                    column: source.column(),
+                }
+            }
+            Self::DuplicateGroupLocation { group_location } => {
+                RpgMakerExtractionSnapshotEncodingViolation::DuplicateGroupLocation {
+                    group_location: group_location.diagnostic_location(),
+                }
+            }
             Self::InvalidClaimSummary(source) => {
-                let (kind, resource_key) = match source {
-                    MutationClaimSummaryError::MixedAccess { resource_key } => {
-                        ("mixed_access", resource_key)
-                    }
-                    MutationClaimSummaryError::MultipleExclusive { resource_key } => {
-                        ("multiple_exclusive", resource_key)
-                    }
+                let (resource_key, violation) = match source {
+                    MutationClaimSummaryError::MixedAccess { resource_key } => (
+                        resource_key,
+                        RpgMakerExtractionClaimSummaryViolation::MixedAccess,
+                    ),
+                    MutationClaimSummaryError::MultipleExclusive { resource_key } => (
+                        resource_key,
+                        RpgMakerExtractionClaimSummaryViolation::MultipleExclusive,
+                    ),
                 };
                 let resource = RpgMakerProjectionCodec::decode_mutation_resource(resource_key)
                     .expect("内存 Claim resource_key 由当前规范编码器生成");
-                (
-                    DiagnosticSubject::field(resource.to_string()),
-                    DiagnosticReason::failure_with_detail(
-                        DiagnosticFailureKind::InternalInvariant,
-                        format!("claim_summary_invalid={kind}"),
-                    ),
-                )
+                RpgMakerExtractionSnapshotEncodingViolation::InvalidClaimSummary {
+                    resource: resource.diagnostic_location(),
+                    violation,
+                }
             }
-        };
-        SafeDiagnostic::new(
-            DiagnosticCode::InternalOperation,
-            stage,
-            subject,
-            reason,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::ReportBug,
+        }
+    }
+}
+
+impl StoredProjectDefinitionError {
+    fn diagnostic_violation(&self) -> RpgMakerExtractionStoredDefinitionViolation {
+        match self {
+            Self::Missing => RpgMakerExtractionStoredDefinitionViolation::Missing,
+            Self::Multiple => RpgMakerExtractionStoredDefinitionViolation::Multiple,
+            Self::WrongColumnCount { actual } => {
+                RpgMakerExtractionStoredDefinitionViolation::WrongColumnCount {
+                    expected: 1,
+                    actual: *actual,
+                }
+            }
+            Self::WrongColumnType { actual } => {
+                RpgMakerExtractionStoredDefinitionViolation::WrongColumnType {
+                    column: SafeIdentifier::from_validated("canonical_json"),
+                    expected: SafeIdentifier::from_validated("text"),
+                    actual: SafeIdentifier::from_validated(actual),
+                }
+            }
+            Self::Invalid(source) => RpgMakerExtractionStoredDefinitionViolation::Invalid {
+                problem: source.diagnostic_problem(),
+            },
+            Self::NonCanonical => RpgMakerExtractionStoredDefinitionViolation::NonCanonical,
+        }
+    }
+}
+
+impl IndexMaintenanceDecisionError {
+    fn diagnostic_violation(&self) -> RpgMakerExtractionIndexDecisionViolation {
+        match self {
+            Self::RowCount { actual } => RpgMakerExtractionIndexDecisionViolation::RowCount {
+                maximum: 1,
+                actual: *actual,
+            },
+            Self::ColumnCount { actual } => RpgMakerExtractionIndexDecisionViolation::ColumnCount {
+                expected: 1,
+                actual: *actual,
+            },
+            Self::Value { kind, integer } => RpgMakerExtractionIndexDecisionViolation::Value {
+                expected_integer: 1,
+                actual_kind: SafeIdentifier::from_validated(kind),
+                actual_integer: *integer,
+            },
+        }
+    }
+}
+
+impl MutationClaimConflictRowError {
+    fn diagnostic_violation(&self) -> RpgMakerExtractionConflictRowViolation {
+        match self {
+            Self::UnexpectedQueryId { actual } => {
+                RpgMakerExtractionConflictRowViolation::UnexpectedQueryId {
+                    actual: SafeText::new(actual),
+                }
+            }
+            Self::ColumnCount { actual } => RpgMakerExtractionConflictRowViolation::ColumnCount {
+                expected: 7,
+                actual: *actual,
+            },
+            Self::ColumnType { column, actual } => {
+                RpgMakerExtractionConflictRowViolation::ColumnType {
+                    column: SafeIdentifier::from_validated(column),
+                    expected: SafeIdentifier::from_validated("text"),
+                    actual: SafeIdentifier::from_validated(actual),
+                }
+            }
+            Self::UnknownOwner { column } => RpgMakerExtractionConflictRowViolation::UnknownOwner {
+                column: SafeIdentifier::from_validated(column),
+            },
+            Self::UnknownAccess { column } => {
+                RpgMakerExtractionConflictRowViolation::UnknownAccess {
+                    column: SafeIdentifier::from_validated(column),
+                }
+            }
+            Self::InvalidGroupLocation { column, source } => {
+                RpgMakerExtractionConflictRowViolation::InvalidGroupLocation {
+                    column: SafeIdentifier::from_validated(column),
+                    failure: source.diagnostic_failure(),
+                }
+            }
+            Self::NonCanonicalGroupLocation { column } => {
+                RpgMakerExtractionConflictRowViolation::NonCanonicalGroupLocation {
+                    column: SafeIdentifier::from_validated(column),
+                }
+            }
+            Self::InvalidResource(source) => {
+                RpgMakerExtractionConflictRowViolation::InvalidResource {
+                    failure: source.diagnostic_failure(),
+                }
+            }
+            Self::NonCanonicalResource => {
+                RpgMakerExtractionConflictRowViolation::NonCanonicalResource
+            }
+        }
+    }
+}
+
+impl MutationClaimConflictDetails {
+    fn diagnostic_conflict(&self) -> RpgMakerExtractionMutationConflict {
+        RpgMakerExtractionMutationConflict::new(
+            self.resource.diagnostic_location(),
+            self.incoming_owner.diagnostic_owner(),
+            self.incoming_group_location.diagnostic_location(),
+            diagnostic_mutation_access(self.incoming_access),
+            self.current_owner.diagnostic_owner(),
+            self.current_group_location.diagnostic_location(),
+            diagnostic_mutation_access(self.current_access),
         )
-        .with_recovery(RecoveryFact::component(
-            "operation=encode_extraction_snapshot",
-        ))
     }
 }
 
-fn codec_failure_reason(kind: &str, detail: String) -> DiagnosticReason {
-    DiagnosticReason::failure_with_detail(
-        DiagnosticFailureKind::InternalInvariant,
-        format!("codec={kind}; {detail}"),
-    )
-}
-
-fn location_codec_failure_detail(source: &RpgMakerLocationCodecError) -> String {
-    match source {
-        RpgMakerLocationCodecError::Encode(error) => {
-            format!("operation=encode; {}", json_error_coordinates(error))
-        }
-        RpgMakerLocationCodecError::Decode(error) => {
-            format!("operation=decode; {}", json_error_coordinates(error))
-        }
-        RpgMakerLocationCodecError::NonCanonical => "kind=non_canonical".to_owned(),
-        RpgMakerLocationCodecError::InvalidDataFile(_) => "kind=invalid_data_file".to_owned(),
-        RpgMakerLocationCodecError::InvalidMapId(map_id) => {
-            format!("kind=invalid_map_id; map_id={map_id}")
-        }
+const fn diagnostic_mutation_access(access: MutationResourceAccess) -> RpgMakerMutationAccess {
+    match access {
+        MutationResourceAccess::Intent => RpgMakerMutationAccess::Intent,
+        MutationResourceAccess::Exclusive => RpgMakerMutationAccess::Exclusive,
     }
 }
 
-fn projection_codec_failure_detail(source: &RpgMakerProjectionCodecError) -> String {
-    match source {
-        RpgMakerProjectionCodecError::Encode(error) => {
-            format!("operation=encode; {}", json_error_coordinates(error))
-        }
-        RpgMakerProjectionCodecError::Decode(error) => {
-            format!("operation=decode; {}", json_error_coordinates(error))
-        }
-        RpgMakerProjectionCodecError::NonCanonical => "kind=non_canonical".to_owned(),
-        RpgMakerProjectionCodecError::Location(location) => {
-            format!(
-                "kind=invalid_location; {}",
-                location_codec_failure_detail(location)
-            )
-        }
-        RpgMakerProjectionCodecError::Projection(_) => "kind=projection_model_invalid".to_owned(),
+fn rpg_maker_json_failure(source: &serde_json::Error) -> RpgMakerJsonFailureKind {
+    match JsonErrorCategory::from(source) {
+        JsonErrorCategory::Io => RpgMakerJsonFailureKind::Io,
+        JsonErrorCategory::Syntax => RpgMakerJsonFailureKind::Syntax,
+        JsonErrorCategory::Data => RpgMakerJsonFailureKind::Data,
+        JsonErrorCategory::Eof => RpgMakerJsonFailureKind::Eof,
+        JsonErrorCategory::DuplicateObjectKey => RpgMakerJsonFailureKind::DuplicateObjectKey,
     }
-}
-
-fn json_encoding_failure_reason(field: &str, source: &serde_json::Error) -> DiagnosticReason {
-    DiagnosticReason::failure_with_detail(
-        DiagnosticFailureKind::InternalInvariant,
-        format!("field={field}; {}", json_error_coordinates(source)),
-    )
-}
-
-fn json_error_coordinates(source: &serde_json::Error) -> String {
-    let category = JsonErrorCategory::from(source);
-    format!(
-        "json_category={category}; json_line={}; json_column={}",
-        source.line(),
-        source.column()
-    )
 }
 
 #[derive(Default)]
@@ -1629,7 +1809,7 @@ struct EncodedSnapshot {
     #[cfg(test)]
     claims: Vec<EncodedClaim>,
     /// SQLite 只持久化每个资源的冲突充分代表。
-    claim_summary: Vec<EncodedClaim>,
+    claim_summary: Vec<PersistedClaim>,
     fingerprint: AssetSnapshotFingerprint,
 }
 
@@ -1675,32 +1855,46 @@ impl EncodedSnapshot {
         // 并行 Extract 批次的输入顺序不是领域顺序。指纹、无变化判断和后续读取
         // 必须只由 semantic_order_key 决定，不能绑定 Vec 或工作完成顺序。
         groups.par_sort_unstable_by(|left, right| {
-            left.semantic_order_key.cmp(&right.semantic_order_key)
+            left.semantic_order_key_blob
+                .cmp(&right.semantic_order_key_blob)
         });
-        let group_ranks = groups
+        for (index, group) in groups.iter_mut().enumerate() {
+            group.group_id =
+                i64::try_from(index + 1).expect("内存中的 Group 自然顺序必须可写入 SQLite INTEGER");
+        }
+        let group_ids = groups
             .iter()
-            .enumerate()
-            .map(|(rank, group)| (group.group_location.as_str(), rank))
+            .map(|group| (group.group_location.as_str(), group.group_id))
             .collect::<HashMap<_, _>>();
         units.par_iter_mut().for_each(|unit| {
-            unit.group_semantic_rank = *group_ranks
+            unit.group_id = *group_ids
                 .get(unit.group_location.as_str())
                 .expect("Extract Unit 必须属于同一快照中的完整 Group");
         });
         units.par_sort_unstable_by(|left, right| {
-            left.group_semantic_rank
-                .cmp(&right.group_semantic_rank)
-                .then_with(|| left.semantic_order_key.cmp(&right.semantic_order_key))
+            left.group_id.cmp(&right.group_id).then_with(|| {
+                left.semantic_order_key_blob
+                    .cmp(&right.semantic_order_key_blob)
+            })
         });
 
         let fingerprint =
             asset_snapshot_fingerprint(owner, project_definition_json, &groups, &units, &claims);
         #[cfg(test)]
-        let claim_summary =
+        let logical_claim_summary =
             collision_summary(&claims).map_err(EncodeAssetSnapshotError::InvalidClaimSummary)?;
         #[cfg(not(test))]
-        let claim_summary = collision_summary_owned(claims)
+        let logical_claim_summary = collision_summary_owned(claims)
             .map_err(EncodeAssetSnapshotError::InvalidClaimSummary)?;
+        let claim_summary = logical_claim_summary
+            .into_iter()
+            .map(|claim| PersistedClaim {
+                group_id: *group_ids
+                    .get(claim.group_location.as_str())
+                    .expect("Claim 必须属于同一快照中的完整 Group"),
+                claim,
+            })
+            .collect();
         Ok(Self {
             #[cfg(test)]
             owner,
@@ -1803,23 +1997,43 @@ impl EncodedSnapshot {
         }
     }
 
-    fn prepare_physical_write_order(&mut self, claim_index_maintenance: ClaimIndexMaintenance) {
+    fn prepare_physical_write_order(
+        &mut self,
+        claim_index_maintenance: IndexMaintenance,
+        unit_index_maintenance: IndexMaintenance,
+    ) {
         // 指纹、无变化判断和译文继承均已完成，以下排序只优化 SQLite B-tree 写入。
         // 自然顺序仍由持久化的 semantic_order_key 表达，读取契约继续按该字段排序。
-        self.groups
-            .par_sort_unstable_by(|left, right| left.group_location.cmp(&right.group_location));
-        self.units.par_sort_unstable_by(|left, right| {
-            left.group_location
-                .cmp(&right.group_location)
-                .then_with(|| left.semantic_order_key.cmp(&right.semantic_order_key))
-                .then_with(|| left.unit_role.cmp(&right.unit_role))
-        });
-        if claim_index_maintenance == ClaimIndexMaintenance::Rebuild {
+        self.groups.par_sort_unstable_by_key(|group| group.group_id);
+        if unit_index_maintenance == IndexMaintenance::Rebuild {
+            // 读取索引会在事务尾部由 SQLite 批量构建；写入期间仅维护主键，按其
+            // (owner, group_id, unit_role) 顺序写入可减少 B-tree 分裂。
+            self.units.par_sort_unstable_by(|left, right| {
+                left.group_id
+                    .cmp(&right.group_id)
+                    .then_with(|| left.unit_role.cmp(&right.unit_role))
+                    .then_with(|| {
+                        left.semantic_order_key_blob
+                            .cmp(&right.semantic_order_key_blob)
+                    })
+            });
+        } else {
+            self.units.par_sort_unstable_by(|left, right| {
+                left.group_id
+                    .cmp(&right.group_id)
+                    .then_with(|| {
+                        left.semantic_order_key_blob
+                            .cmp(&right.semantic_order_key_blob)
+                    })
+                    .then_with(|| left.unit_role.cmp(&right.unit_role))
+            });
+        }
+        if claim_index_maintenance == IndexMaintenance::Rebuild {
             // 两个命名二级索引已暂时删除，此时只需顺序维护
-            // PRIMARY KEY(owner, group_location, resource_key)。CREATE INDEX 会自行按资源键排序。
+            // PRIMARY KEY(owner, group_id, resource_key)。CREATE INDEX 会自行按资源键排序。
             self.claim_summary.par_sort_unstable_by(|left, right| {
-                left.group_location
-                    .cmp(&right.group_location)
+                left.group_id
+                    .cmp(&right.group_id)
                     .then_with(|| left.resource_key.cmp(&right.resource_key))
                     .then_with(|| left.access.cmp(&right.access))
             });
@@ -1849,18 +2063,17 @@ fn stored_group_row_matches(row: Option<&SqliteRow>, expected: &EncodedGroup) ->
     let Some(row) = row else {
         return false;
     };
-    let Ok(expected_order_key) = expected.semantic_order_key.encode() else {
-        return false;
-    };
     matches!(
         row.values(),
         [
+            SqliteValue::Integer(group_id),
             SqliteValue::Text(group_location),
             SqliteValue::Blob(semantic_order_key),
             SqliteValue::Text(group_kind),
             SqliteValue::Text(projection_recipe_json),
-        ] if group_location == &expected.group_location
-            && semantic_order_key == &expected_order_key
+        ] if group_id == &expected.group_id
+            && group_location == &expected.group_location
+            && semantic_order_key == &expected.semantic_order_key_blob
             && group_kind == expected.group_kind
             && projection_recipe_json == &expected.projection_recipe_json
     )
@@ -1868,9 +2081,6 @@ fn stored_group_row_matches(row: Option<&SqliteRow>, expected: &EncodedGroup) ->
 
 fn stored_unit_row_matches(row: Option<&SqliteRow>, expected: &EncodedUnit) -> bool {
     let Some(row) = row else {
-        return false;
-    };
-    let Ok(expected_order_key) = expected.semantic_order_key.encode() else {
         return false;
     };
     matches!(
@@ -1885,7 +2095,7 @@ fn stored_unit_row_matches(row: Option<&SqliteRow>, expected: &EncodedUnit) -> b
             translation_state,
         ] if group_location == &expected.group_location
             && unit_role == &expected.unit_role
-            && semantic_order_key == &expected_order_key
+            && semantic_order_key == &expected.semantic_order_key_blob
             && source_content_json == &expected.source_content_json
             && source_context_json == &expected.source_context_json
             && stored_translation_pair_is_valid(translation_content_json, translation_state)
@@ -1900,7 +2110,7 @@ fn stored_translation_pair_is_valid(content: &SqliteValue, state: &SqliteValue) 
     }
 }
 
-fn stored_claim_row_matches(row: Option<&SqliteRow>, expected: &EncodedClaim) -> bool {
+fn stored_claim_row_matches(row: Option<&SqliteRow>, expected: &PersistedClaim) -> bool {
     let Some(row) = row else {
         return false;
     };
@@ -1918,19 +2128,20 @@ fn stored_claim_row_matches(row: Option<&SqliteRow>, expected: &EncodedClaim) ->
 }
 
 struct EncodedGroup {
+    /// `merge` 按完整 owner 快照的自然顺序分配；批次编码期间为 0。
+    group_id: i64,
     group_location: String,
-    semantic_order_key: RpgMakerSemanticOrderKey,
+    semantic_order_key_blob: Vec<u8>,
     group_kind: &'static str,
     projection_recipe_json: String,
 }
 
 struct EncodedUnit {
+    /// `merge` 从所属 Group 取得；批次编码期间为 0。
+    group_id: i64,
     group_location: String,
-    /// 完整快照建立后得到的 Group 自然顺序位置，只用于规范化并行 Extract
-    /// 结果；它不进入持久化身份或数据库。
-    group_semantic_rank: usize,
     unit_role: String,
-    semantic_order_key: RpgMakerSemanticOrderKey,
+    semantic_order_key_blob: Vec<u8>,
     source_content_json: String,
     source_context_json: String,
     translation: Option<EncodedTranslation>,
@@ -1997,6 +2208,19 @@ fn unit_identity_hash(
 
 type EncodedClaim = EncodedMutationClaim;
 
+struct PersistedClaim {
+    group_id: i64,
+    claim: EncodedClaim,
+}
+
+impl std::ops::Deref for PersistedClaim {
+    type Target = EncodedClaim;
+
+    fn deref(&self) -> &Self::Target {
+        &self.claim
+    }
+}
+
 #[derive(Serialize)]
 struct DialogueBodySourceContext<'a> {
     source_speaker: &'a str,
@@ -2022,7 +2246,11 @@ fn encode_batch(
 ) -> Result<EncodedBatch, EncodeAssetSnapshotError> {
     let mut encoded = EncodedBatch::default();
     for (_group_order, group) in groups {
-        let group_semantic_order_key = group.semantic_order_key().clone();
+        let group_semantic_order_key_blob = group
+            .semantic_order_key()
+            .encode()
+            .expect("已经建立的 Group 语义顺序键必须可编码");
+        let group_semantic_order_key = Arc::new(group.semantic_order_key().clone());
         let group_location = RpgMakerLocationCodec::encode(group.group_location())
             .map_err(EncodeAssetSnapshotError::Location)?;
         let source_speaker = group
@@ -2038,17 +2266,21 @@ fn encode_batch(
             .transpose()?;
 
         for unit in group.units() {
+            let semantic_order_key_blob = unit
+                .semantic_order_key()
+                .encode()
+                .expect("已经建立的 Unit 语义顺序键必须可编码");
             let source_context_json = if matches!(unit.role(), TextUnitRole::DialogueBody) {
                 dialogue_context.as_deref().unwrap_or("{}")
             } else {
                 "{}"
             };
             encoded.units.push(EncodedUnit {
+                group_id: 0,
                 group_location: group_location.clone(),
-                group_semantic_rank: 0,
                 unit_role: RpgMakerProjectionCodec::encode_role(unit.role())
                     .map_err(EncodeAssetSnapshotError::Projection)?,
-                semantic_order_key: unit.semantic_order_key().clone(),
+                semantic_order_key_blob,
                 source_content_json: serde_json::to_string(unit.source_content())
                     .map_err(EncodeAssetSnapshotError::SourceContent)?,
                 source_context_json: source_context_json.to_owned(),
@@ -2057,18 +2289,21 @@ fn encode_batch(
         }
 
         for lock in group.mutation_claims().locks() {
-            encoded.claims.push(EncodedClaim::new(
-                RpgMakerProjectionCodec::encode_mutation_resource(lock.resource())
-                    .map_err(EncodeAssetSnapshotError::Projection)?,
-                lock.access(),
-                group_location.clone(),
-                group_semantic_order_key.clone(),
-            ));
+            encoded
+                .claims
+                .push(EncodedClaim::with_shared_semantic_order_key(
+                    RpgMakerProjectionCodec::encode_mutation_resource(lock.resource())
+                        .map_err(EncodeAssetSnapshotError::Projection)?,
+                    lock.access(),
+                    group_location.clone(),
+                    Arc::clone(&group_semantic_order_key),
+                ));
         }
 
         encoded.groups.push(EncodedGroup {
+            group_id: 0,
             group_location,
-            semantic_order_key: group_semantic_order_key,
+            semantic_order_key_blob: group_semantic_order_key_blob,
             group_kind: group_kind_name(group.kind()),
             projection_recipe_json: RpgMakerProjectionCodec::encode_recipes(group.recipes())
                 .map_err(EncodeAssetSnapshotError::Projection)?,
@@ -2090,18 +2325,18 @@ fn asset_snapshot_fingerprint(
 ) -> AssetSnapshotFingerprint {
     let mut builder = RpgMakerTextSnapshotFingerprintBuilder::new(owner, project_definition_json);
     for group in groups {
-        builder.group(
+        builder.group_encoded(
             &group.group_location,
-            &group.semantic_order_key,
+            &group.semantic_order_key_blob,
             group.group_kind,
             &group.projection_recipe_json,
         );
     }
     for unit in units {
-        builder.unit(
+        builder.unit_encoded(
             &unit.group_location,
             &unit.unit_role,
-            &unit.semantic_order_key,
+            &unit.semantic_order_key_blob,
             &unit.source_content_json,
             &unit.source_context_json,
         );
@@ -2123,7 +2358,28 @@ fn build_transaction_plan(
     snapshot: EncodedSnapshot,
     previous_unit_rows: Vec<SqliteRow>,
     project_definition_replacement: Option<String>,
-    claim_index_maintenance: ClaimIndexMaintenance,
+    claim_index_maintenance: IndexMaintenance,
+) -> SqliteTransactionPlan {
+    build_transaction_plan_with_index_maintenance(
+        owner,
+        source_snapshot_fingerprint,
+        snapshot,
+        previous_unit_rows,
+        project_definition_replacement,
+        claim_index_maintenance,
+        IndexMaintenance::Online,
+    )
+}
+
+#[cfg(test)]
+fn build_transaction_plan_with_index_maintenance(
+    owner: RpgMakerAssetOwner,
+    source_snapshot_fingerprint: [u8; 32],
+    snapshot: EncodedSnapshot,
+    previous_unit_rows: Vec<SqliteRow>,
+    project_definition_replacement: Option<String>,
+    claim_index_maintenance: IndexMaintenance,
+    unit_index_maintenance: IndexMaintenance,
 ) -> SqliteTransactionPlan {
     SqliteTransactionPlan::new(build_transaction_steps(
         owner,
@@ -2132,6 +2388,7 @@ fn build_transaction_plan(
         previous_unit_rows,
         project_definition_replacement,
         claim_index_maintenance,
+        unit_index_maintenance,
     ))
 }
 
@@ -2141,10 +2398,11 @@ fn build_transaction_steps(
     mut snapshot: EncodedSnapshot,
     previous_unit_rows: Vec<SqliteRow>,
     project_definition_replacement: Option<String>,
-    claim_index_maintenance: ClaimIndexMaintenance,
+    claim_index_maintenance: IndexMaintenance,
+    unit_index_maintenance: IndexMaintenance,
 ) -> Vec<SqliteTransactionStep> {
     snapshot.inherit_translations(previous_unit_rows);
-    snapshot.prepare_physical_write_order(claim_index_maintenance);
+    snapshot.prepare_physical_write_order(claim_index_maintenance, unit_index_maintenance);
     let EncodedSnapshot {
         groups,
         units,
@@ -2156,7 +2414,7 @@ fn build_transaction_steps(
         .expect("内存中的 Claim 摘要数量必须可写入 SQLite INTEGER");
     let other_owner = other_owner_storage_name(owner);
     let mut steps = Vec::new();
-    if claim_index_maintenance == ClaimIndexMaintenance::Rebuild {
+    if claim_index_maintenance == IndexMaintenance::Rebuild {
         // 最大真实项目表明：当本 owner 至少覆盖其余 owner 的全部 Claim 时，边写边
         // 维护两个二级索引会成为主要耗时。SQLite 的事务性 DDL 让索引重建与快照
         // 替换共享同一回滚边界；任何后续失败都会恢复旧行和原索引定义。
@@ -2166,6 +2424,14 @@ fn build_transaction_steps(
         ));
         steps.push(execute(
             DROP_RPG_MAKER_MUTATION_CLAIM_RESOURCE_INDEX,
+            Vec::new(),
+        ));
+    }
+    if unit_index_maintenance == IndexMaintenance::Rebuild {
+        // 这个索引没有承载约束；删除和重建均在当前替换事务内，任何失败都会恢复旧
+        // schema 与旧快照。它只在大 owner 精确覆盖另一 owner 时重建。
+        steps.push(execute(
+            DROP_RPG_MAKER_TEXT_UNIT_OWNER_GROUP_ORDER_INDEX,
             Vec::new(),
         ));
     }
@@ -2190,16 +2456,12 @@ fn build_transaction_steps(
         ],
     ));
     if !groups.is_empty() {
-        let mut parameter_values = Vec::with_capacity(groups.len().saturating_mul(4));
+        let mut parameter_values = Vec::with_capacity(groups.len().saturating_mul(5));
         for group in groups {
             parameter_values.extend([
+                SqliteValue::Integer(group.group_id),
                 text(group.group_location),
-                SqliteValue::Blob(
-                    group
-                        .semantic_order_key
-                        .encode()
-                        .expect("内存中的语义顺序键必须可编码"),
-                ),
+                SqliteValue::Blob(group.semantic_order_key_blob),
                 text(group.group_kind),
                 text(group.projection_recipe_json),
             ]);
@@ -2207,7 +2469,7 @@ fn build_transaction_steps(
         steps.push(SqliteTransactionStep::ExecuteMany(
             SqliteBatch::bulk_insert_flat(
                 INSERT_GROUP_PREFIX,
-                4,
+                5,
                 vec![text(owner.storage_name())],
                 parameter_values,
             ),
@@ -2215,9 +2477,10 @@ fn build_transaction_steps(
     }
     if !claim_summary.is_empty() {
         let mut parameter_values = Vec::with_capacity(claim_summary.len().saturating_mul(3));
-        for claim in claim_summary {
+        for persisted_claim in claim_summary {
+            let PersistedClaim { group_id, claim } = persisted_claim;
             parameter_values.extend([
-                text(claim.group_location),
+                SqliteValue::Integer(group_id),
                 text(claim.resource_key),
                 text(claim.access.storage_name()),
             ]);
@@ -2231,7 +2494,7 @@ fn build_transaction_steps(
             ),
         ));
     }
-    if claim_index_maintenance == ClaimIndexMaintenance::Rebuild {
+    if claim_index_maintenance == IndexMaintenance::Rebuild {
         steps.push(execute(
             CREATE_RPG_MAKER_MUTATION_CLAIM_RESOURCE_INDEX,
             Vec::new(),
@@ -2267,13 +2530,9 @@ fn build_transaction_steps(
                 None => (SqliteValue::Null, SqliteValue::Null),
             };
             parameter_values.extend([
-                text(unit.group_location),
+                SqliteValue::Integer(unit.group_id),
                 text(unit.unit_role),
-                SqliteValue::Blob(
-                    unit.semantic_order_key
-                        .encode()
-                        .expect("内存中的语义顺序键必须可编码"),
-                ),
+                SqliteValue::Blob(unit.semantic_order_key_blob),
                 text(unit.source_content_json),
                 text(unit.source_context_json),
                 translation_content_json,
@@ -2289,34 +2548,40 @@ fn build_transaction_steps(
             ),
         ));
     }
+    if unit_index_maintenance == IndexMaintenance::Rebuild {
+        steps.push(execute(
+            CREATE_RPG_MAKER_TEXT_UNIT_OWNER_GROUP_ORDER_INDEX,
+            Vec::new(),
+        ));
+    }
     steps
 }
 
-fn decode_claim_index_maintenance(
+fn decode_index_maintenance(
     rows: Vec<SqliteRow>,
-) -> Result<ClaimIndexMaintenance, ClaimIndexMaintenanceDecisionError> {
+) -> Result<IndexMaintenance, IndexMaintenanceDecisionError> {
     let mut rows = rows.into_iter();
     let Some(row) = rows.next() else {
-        return Ok(ClaimIndexMaintenance::Online);
+        return Ok(IndexMaintenance::Online);
     };
     if rows.next().is_some() {
-        return Err(ClaimIndexMaintenanceDecisionError::RowCount {
+        return Err(IndexMaintenanceDecisionError::RowCount {
             actual: 2 + rows.count(),
         });
     }
     let values = row.into_values();
     if values.len() != 1 {
-        return Err(ClaimIndexMaintenanceDecisionError::ColumnCount {
+        return Err(IndexMaintenanceDecisionError::ColumnCount {
             actual: values.len(),
         });
     }
     match values.into_iter().next().expect("已确认策略查询恰好有一列") {
-        SqliteValue::Integer(1) => Ok(ClaimIndexMaintenance::Rebuild),
-        SqliteValue::Integer(value) => Err(ClaimIndexMaintenanceDecisionError::Value {
+        SqliteValue::Integer(1) => Ok(IndexMaintenance::Rebuild),
+        SqliteValue::Integer(value) => Err(IndexMaintenanceDecisionError::Value {
             kind: "integer",
             integer: Some(value),
         }),
-        value => Err(ClaimIndexMaintenanceDecisionError::Value {
+        value => Err(IndexMaintenanceDecisionError::Value {
             kind: value.kind_name(),
             integer: None,
         }),
@@ -2375,9 +2640,10 @@ fn map_persist_error<C, S>(
     error: ExecuteTransactionError<S>,
 ) -> RpgMakerExtractionAssetStoreError<C, S> {
     match error {
-        ExecuteTransactionError::NotFound => {
-            RpgMakerExtractionAssetStoreError::DatabaseNotFound { database_path }
-        }
+        ExecuteTransactionError::NotFound => RpgMakerExtractionAssetStoreError::DatabaseNotFound {
+            database_path,
+            operation: crate::diagnostic::RpgMakerExtractionStoreOperation::CommitSnapshot,
+        },
         ExecuteTransactionError::RequirementFailed => {
             RpgMakerExtractionAssetStoreError::ConcurrentModification { database_path }
         }
@@ -2385,7 +2651,7 @@ fn map_persist_error<C, S>(
             if query_id != "extract.mutation_claim_conflict" {
                 return RpgMakerExtractionAssetStoreError::InvalidMutationClaimConflictRow {
                     database_path,
-                    source: MutationClaimConflictRowError::UnexpectedQueryId,
+                    source: MutationClaimConflictRowError::UnexpectedQueryId { actual: query_id },
                 };
             }
             match decode_mutation_claim_conflict_row(row) {
@@ -2419,7 +2685,9 @@ fn map_persist_error<C, S>(
                 Ok(None) => {
                     RpgMakerExtractionAssetStoreError::InvalidMutationClaimConflictRowOutcomeUnknown {
                         database_path,
-                        row_error: MutationClaimConflictRowError::UnexpectedQueryId,
+                        row_error: MutationClaimConflictRowError::UnexpectedQueryId {
+                            actual: query_id,
+                        },
                         source,
                     }
                 }
@@ -2538,15 +2806,20 @@ fn conflict_row_group_location(
 
 fn map_query_error<C, S>(
     database_path: PathBuf,
+    operation: crate::diagnostic::RpgMakerExtractionStoreOperation,
     error: QueryExistingDatabaseError<S>,
 ) -> RpgMakerExtractionAssetStoreError<C, S> {
     match error {
         QueryExistingDatabaseError::NotFound => {
-            RpgMakerExtractionAssetStoreError::DatabaseNotFound { database_path }
+            RpgMakerExtractionAssetStoreError::DatabaseNotFound {
+                database_path,
+                operation,
+            }
         }
         QueryExistingDatabaseError::QueryFailed(source) => {
             RpgMakerExtractionAssetStoreError::ReadCurrentState {
                 database_path,
+                operation,
                 source,
             }
         }
@@ -2559,7 +2832,11 @@ fn map_project_definition_query_error<C, S>(
 ) -> RpgMakerExtractionAssetStoreError<C, S> {
     match error {
         QueryExistingDatabaseError::NotFound => {
-            RpgMakerExtractionAssetStoreError::DatabaseNotFound { database_path }
+            RpgMakerExtractionAssetStoreError::DatabaseNotFound {
+                database_path,
+                operation:
+                    crate::diagnostic::RpgMakerExtractionStoreOperation::ReadProjectDefinition,
+            }
         }
         QueryExistingDatabaseError::QueryFailed(source) => {
             RpgMakerExtractionAssetStoreError::ReadProjectDefinition {
@@ -2587,6 +2864,7 @@ mod tests {
         TextUnitContent, TextUnitRole,
     };
     use crate::rpg_maker::project::test_layout_profile;
+    use crate::rpg_maker::semantic_order::RpgMakerSemanticOrderKey;
     use crate::rpg_maker::text::{DataFileName, StandardDataFile};
     use crate::rpg_maker::translate::asset_reader::RpgMakerTranslationAssetReadingService;
     use crate::rpg_maker::translate::pipeline::RpgMakerTranslationAssetReader;
@@ -2742,7 +3020,10 @@ mod tests {
                     .expect("owner state 锁不应中毒")
                     .clone());
             }
-            if query.statement() == DECIDE_CLAIM_INDEX_REBUILD {
+            if matches!(
+                query.statement(),
+                DECIDE_CLAIM_INDEX_REBUILD | DECIDE_UNIT_INDEX_REBUILD
+            ) {
                 assert!(matches!(
                     query.parameters(),
                     [
@@ -2904,7 +3185,14 @@ mod tests {
 
         assert_eq!(encoded.groups.len(), 1);
         assert_eq!(encoded.units.len(), 2);
-        assert!(!encoded.claims.is_empty());
+        assert!(
+            encoded.claims.len() > 1,
+            "共享顺序键测试需要同一 Group 产生多个 Claim"
+        );
+        assert!(encoded.claims[1..].iter().all(|claim| Arc::ptr_eq(
+            &encoded.claims[0].semantic_order_key,
+            &claim.semantic_order_key
+        )));
         assert_eq!(encoded.groups[0].group_kind, "event_dialogue");
         RpgMakerProjectionCodec::decode_recipes(&encoded.groups[0].projection_recipe_json)
             .expect("配方必须是可逆的内部 canonical JSON");
@@ -2940,6 +3228,191 @@ mod tests {
     }
 
     #[test]
+    fn cached_semantic_order_blobs_preserve_fingerprint_and_transaction_values() {
+        let snapshot = EncodedSnapshot::merge(
+            RpgMakerAssetOwner::Builtin,
+            vec![
+                encode_test_batch(vec![scalar_group(1, "name", "原文")]).expect("测试快照应可编码"),
+            ],
+            None,
+        )
+        .expect("测试快照应可合并");
+
+        for group in &snapshot.groups {
+            let decoded = RpgMakerSemanticOrderKey::decode(&group.semantic_order_key_blob)
+                .expect("缓存的 Group 顺序键 BLOB 应可解码");
+            assert_eq!(
+                group.semantic_order_key_blob,
+                decoded.encode().expect("Group 顺序键应可重新编码")
+            );
+        }
+        for unit in &snapshot.units {
+            let decoded = RpgMakerSemanticOrderKey::decode(&unit.semantic_order_key_blob)
+                .expect("缓存的 Unit 顺序键 BLOB 应可解码");
+            assert_eq!(
+                unit.semantic_order_key_blob,
+                decoded.encode().expect("Unit 顺序键应可重新编码")
+            );
+        }
+
+        let mut legacy =
+            RpgMakerTextSnapshotFingerprintBuilder::new(RpgMakerAssetOwner::Builtin, None);
+        for group in &snapshot.groups {
+            let semantic_order_key =
+                RpgMakerSemanticOrderKey::decode(&group.semantic_order_key_blob)
+                    .expect("缓存的 Group 顺序键 BLOB 应可解码");
+            legacy.group(
+                &group.group_location,
+                &semantic_order_key,
+                group.group_kind,
+                &group.projection_recipe_json,
+            );
+        }
+        for unit in &snapshot.units {
+            let semantic_order_key =
+                RpgMakerSemanticOrderKey::decode(&unit.semantic_order_key_blob)
+                    .expect("缓存的 Unit 顺序键 BLOB 应可解码");
+            legacy.unit(
+                &unit.group_location,
+                &unit.unit_role,
+                &semantic_order_key,
+                &unit.source_content_json,
+                &unit.source_context_json,
+            );
+        }
+        for claim in &snapshot.claims {
+            legacy.claim(
+                &claim.resource_key,
+                claim.access.storage_name(),
+                &claim.group_location,
+            );
+        }
+        assert_eq!(
+            snapshot.fingerprint,
+            AssetSnapshotFingerprint::from_bytes(legacy.finish().into_bytes()),
+            "缓存编码不得改变资产指纹"
+        );
+
+        let expected_group_blob = snapshot.groups[0].semantic_order_key_blob.clone();
+        let expected_unit_blob = snapshot.units[0].semantic_order_key_blob.clone();
+        let plan = build_transaction_plan(
+            RpgMakerAssetOwner::Builtin,
+            [0xa5; 32],
+            snapshot,
+            Vec::new(),
+            None,
+            IndexMaintenance::Online,
+        );
+        let blob_parameter = |statement: &str, index: usize| {
+            plan.steps()
+                .iter()
+                .find_map(|step| match step {
+                    SqliteTransactionStep::ExecuteMany(batch) if batch.statement() == statement => {
+                        batch.parameter_rows().next().map(|row| row[index].clone())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("事务应包含顺序键参数：{statement}"))
+        };
+        assert_eq!(
+            blob_parameter(INSERT_GROUP, 2),
+            SqliteValue::Blob(expected_group_blob)
+        );
+        assert_eq!(
+            blob_parameter(INSERT_UNIT, 2),
+            SqliteValue::Blob(expected_unit_blob)
+        );
+    }
+
+    #[test]
+    fn cached_blob_sort_matches_structured_semantic_order() {
+        let group_keys = vec![
+            RpgMakerSemanticOrderKey::new(vec![2], 0),
+            RpgMakerSemanticOrderKey::new(vec![1, u64::MAX], 0),
+            RpgMakerSemanticOrderKey::new(vec![1], u64::MAX),
+        ];
+        let mut groups = (10..=12)
+            .zip(group_keys.iter().cloned())
+            .map(|(index, key)| {
+                let mut group = scalar_group(index, "name", "原文");
+                group.set_semantic_order_key(key);
+                group
+            })
+            .collect::<Vec<_>>();
+        let mut unit_group = two_field_group(false);
+        let unit_group_key = unit_group.semantic_order_key().clone();
+        let unit_group_location = RpgMakerLocationCodec::encode(unit_group.group_location())
+            .expect("双字段测试组位置应可编码");
+        let unit_keys = vec![
+            RpgMakerSemanticOrderKey::new(vec![9, 2], 7),
+            RpgMakerSemanticOrderKey::new(vec![9, 1], u64::MAX),
+        ];
+        for (unit, key) in unit_group.units_mut().iter_mut().zip(&unit_keys) {
+            unit.set_semantic_order_key(key.clone());
+        }
+        groups.push(unit_group);
+
+        let snapshot = EncodedSnapshot::merge(
+            RpgMakerAssetOwner::Builtin,
+            vec![encode_test_batch(groups).expect("测试快照应可编码")],
+            None,
+        )
+        .expect("测试快照应可合并");
+
+        let mut expected_groups = group_keys;
+        expected_groups.push(unit_group_key);
+        expected_groups.sort_unstable();
+        let actual_groups = snapshot
+            .groups
+            .iter()
+            .map(|group| {
+                RpgMakerSemanticOrderKey::decode(&group.semantic_order_key_blob)
+                    .expect("缓存的 Group 顺序键应可解码")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual_groups, expected_groups);
+        assert_eq!(
+            snapshot
+                .groups
+                .iter()
+                .map(|group| group.group_id)
+                .collect::<Vec<_>>(),
+            (1..=i64::try_from(snapshot.groups.len()).expect("Group 数量应可编码"))
+                .collect::<Vec<_>>(),
+            "Group ID 必须在 owner 内按自然顺序从 1 连续分配"
+        );
+        for unit in &snapshot.units {
+            let group = snapshot
+                .groups
+                .iter()
+                .find(|group| group.group_location == unit.group_location)
+                .expect("Unit 必须能按逻辑位置找到 Group");
+            assert_eq!(unit.group_id, group.group_id);
+        }
+        for claim in &snapshot.claim_summary {
+            let group = snapshot
+                .groups
+                .iter()
+                .find(|group| group.group_location == claim.group_location)
+                .expect("Claim 必须能按逻辑位置找到 Group");
+            assert_eq!(claim.group_id, group.group_id);
+        }
+
+        let mut expected_units = unit_keys;
+        expected_units.sort_unstable();
+        let actual_units = snapshot
+            .units
+            .iter()
+            .filter(|unit| unit.group_location == unit_group_location)
+            .map(|unit| {
+                RpgMakerSemanticOrderKey::decode(&unit.semantic_order_key_blob)
+                    .expect("缓存的 Unit 顺序键应可解码")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual_units, expected_units);
+    }
+
+    #[test]
     fn collision_summary_folds_repeated_intents_but_fingerprint_keeps_every_logical_claim() {
         let snapshot = EncodedSnapshot::merge(
             RpgMakerAssetOwner::Builtin,
@@ -2971,8 +3444,8 @@ mod tests {
         assert_eq!(logical.len(), 2, "完整逻辑 Claim 不得因持久化摘要而丢失");
         assert_eq!(summary.len(), 1, "同资源的多个 Intent 只持久化一个代表");
         assert_eq!(
-            summary[0].semantic_order_key,
-            RpgMakerSemanticOrderKey::from_group_location(&RpgMakerLocation::value(
+            summary[0].semantic_order_key.as_ref(),
+            &RpgMakerSemanticOrderKey::from_group_location(&RpgMakerLocation::value(
                 RpgMakerSource::data(StandardDataFile::Items),
                 vec![RpgMakerLocationStep::index(1)],
             )),
@@ -2983,12 +3456,17 @@ mod tests {
             "摘要代表必须保留自然首组"
         );
 
+        let summary_claims = snapshot
+            .claim_summary
+            .iter()
+            .map(|claim| claim.claim.clone())
+            .collect::<Vec<_>>();
         let summary_only_fingerprint = asset_snapshot_fingerprint(
             RpgMakerAssetOwner::Builtin,
             None,
             &snapshot.groups,
             &snapshot.units,
-            &snapshot.claim_summary,
+            &summary_claims,
         );
         assert_ne!(
             snapshot.fingerprint, summary_only_fingerprint,
@@ -3116,12 +3594,12 @@ mod tests {
             forward_groups
                 .groups
                 .iter()
-                .map(|group| &group.semantic_order_key)
+                .map(|group| &group.semantic_order_key_blob)
                 .collect::<Vec<_>>(),
             reverse_groups
                 .groups
                 .iter()
-                .map(|group| &group.semantic_order_key)
+                .map(|group| &group.semantic_order_key_blob)
                 .collect::<Vec<_>>(),
             "相同语义键必须恢复相同 Group 自然顺序"
         );
@@ -3166,10 +3644,7 @@ mod tests {
             .encode()
             .expect("旧 Unit 的语义顺序键应可编码");
         assert_ne!(
-            previous_semantic_order_key,
-            unit.semantic_order_key
-                .encode()
-                .expect("新 Unit 的语义顺序键应可编码"),
+            previous_semantic_order_key, unit.semantic_order_key_blob,
             "测试必须使用不同顺序，证明顺序不属于继承身份"
         );
         let previous = SqliteRow::new(vec![
@@ -3207,7 +3682,7 @@ mod tests {
             snapshot,
             Vec::new(),
             None,
-            ClaimIndexMaintenance::Online,
+            IndexMaintenance::Online,
         );
         let statements = plan_statements(&plan);
 
@@ -3238,7 +3713,7 @@ mod tests {
         );
         for (statement, prefix, row_parameter_count) in [
             (INSERT_CLAIM, INSERT_CLAIM_PREFIX, 3),
-            (INSERT_GROUP, INSERT_GROUP_PREFIX, 4),
+            (INSERT_GROUP, INSERT_GROUP_PREFIX, 5),
             (INSERT_UNIT, INSERT_UNIT_PREFIX, 7),
         ] {
             let batch = plan
@@ -3278,7 +3753,7 @@ mod tests {
             snapshot,
             Vec::new(),
             None,
-            ClaimIndexMaintenance::Rebuild,
+            IndexMaintenance::Rebuild,
         );
         let statements = plan_statements(&plan);
         let position = |statement: &str| {
@@ -3316,7 +3791,7 @@ mod tests {
             snapshot,
             Vec::new(),
             None,
-            ClaimIndexMaintenance::Online,
+            IndexMaintenance::Online,
         );
         let statements = plan_statements(&plan);
 
@@ -3356,7 +3831,7 @@ mod tests {
             make_snapshot(),
             Vec::new(),
             None,
-            ClaimIndexMaintenance::Rebuild,
+            IndexMaintenance::Rebuild,
         );
         let batch = |statement: &str| {
             rebuild
@@ -3373,8 +3848,8 @@ mod tests {
         let group_keys = batch(INSERT_GROUP)
             .parameter_rows()
             .map(|row| match &row[0] {
-                SqliteValue::Text(value) => value.clone(),
-                value => panic!("group_location 应为 TEXT，实际为 {}", value.kind_name()),
+                SqliteValue::Integer(value) => *value,
+                value => panic!("group_id 应为 INTEGER，实际为 {}", value.kind_name()),
             })
             .collect::<Vec<_>>();
         assert!(group_keys.windows(2).all(|pair| pair[0] <= pair[1]));
@@ -3383,14 +3858,10 @@ mod tests {
             .parameter_rows()
             .map(|row| match (&row[0], &row[1], &row[2]) {
                 (
-                    SqliteValue::Text(group_location),
+                    SqliteValue::Integer(group_id),
                     SqliteValue::Text(unit_role),
                     SqliteValue::Blob(semantic_order_key),
-                ) => (
-                    group_location.clone(),
-                    semantic_order_key.clone(),
-                    unit_role.clone(),
-                ),
+                ) => (*group_id, semantic_order_key.clone(), unit_role.clone()),
                 _ => panic!("Unit 物理键应保持规范类型"),
             })
             .collect::<Vec<_>>();
@@ -3400,16 +3871,16 @@ mod tests {
             .parameter_rows()
             .map(|row| match (&row[0], &row[1], &row[2]) {
                 (
-                    SqliteValue::Text(group_location),
+                    SqliteValue::Integer(group_id),
                     SqliteValue::Text(resource_key),
                     SqliteValue::Text(access),
-                ) => (group_location.clone(), resource_key.clone(), access.clone()),
+                ) => (*group_id, resource_key.clone(), access.clone()),
                 _ => panic!("Claim 物理键应保持规范类型"),
             })
             .collect::<Vec<_>>();
         assert!(
             rebuild_claim_keys.windows(2).all(|pair| pair[0] <= pair[1]),
-            "重建路径应按 Claim 主键的 group_location/resource_key 顺序写入"
+            "重建路径应按 Claim 主键的 group_id/resource_key 顺序写入"
         );
 
         let online = build_transaction_plan(
@@ -3418,7 +3889,7 @@ mod tests {
             make_snapshot(),
             Vec::new(),
             None,
-            ClaimIndexMaintenance::Online,
+            IndexMaintenance::Online,
         );
         let online_claims = online
             .steps()
@@ -3433,10 +3904,10 @@ mod tests {
             .parameter_rows()
             .map(|row| match (&row[0], &row[1], &row[2]) {
                 (
-                    SqliteValue::Text(group_location),
+                    SqliteValue::Integer(group_id),
                     SqliteValue::Text(resource_key),
                     SqliteValue::Text(access),
-                ) => (resource_key.clone(), access.clone(), group_location.clone()),
+                ) => (resource_key.clone(), access.clone(), *group_id),
                 _ => panic!("Claim 物理键应保持规范类型"),
             })
             .collect::<Vec<_>>();
@@ -3468,7 +3939,7 @@ mod tests {
                 RpgMakerAssetOwner::Rules,
                 other_claim_count - 1,
             ),
-            ClaimIndexMaintenance::Online,
+            IndexMaintenance::Online,
             "incoming 少一条时必须在线维护"
         );
         assert_eq!(
@@ -3477,7 +3948,7 @@ mod tests {
                 RpgMakerAssetOwner::Rules,
                 other_claim_count,
             ),
-            ClaimIndexMaintenance::Rebuild,
+            IndexMaintenance::Rebuild,
             "incoming 与其他 owner 总量相等时必须重建"
         );
         assert_eq!(
@@ -3486,8 +3957,77 @@ mod tests {
                 RpgMakerAssetOwner::Rules,
                 other_claim_count + 1,
             ),
-            ClaimIndexMaintenance::Rebuild,
+            IndexMaintenance::Rebuild,
             "incoming 更多时必须重建"
+        );
+    }
+
+    #[test]
+    fn unit_index_rebuild_decision_uses_the_exact_other_owner_crossover() {
+        let owner = RpgMakerAssetOwner::Builtin;
+        let snapshot = EncodedSnapshot::merge(
+            owner,
+            vec![
+                encode_test_batch(vec![
+                    scalar_group(1, "name", "原文一"),
+                    scalar_group(2, "name", "原文二"),
+                ])
+                .expect("快照应可编码"),
+            ],
+            None,
+        )
+        .expect("快照应可合并");
+        let other_unit_count = snapshot.units.len();
+        assert!(other_unit_count > 1);
+
+        let connection = Connection::open_in_memory().expect("应创建内存数据库");
+        create_current_schema(&connection);
+        seed_snapshot(&connection, &snapshot, r#""译文""#, &[0x44; 32]);
+
+        assert_eq!(
+            query_unit_index_maintenance(
+                &connection,
+                RpgMakerAssetOwner::Rules,
+                other_unit_count - 1,
+            ),
+            IndexMaintenance::Online,
+        );
+        assert_eq!(
+            query_unit_index_maintenance(&connection, RpgMakerAssetOwner::Rules, other_unit_count,),
+            IndexMaintenance::Rebuild,
+        );
+    }
+
+    #[test]
+    fn dominant_unit_owner_rebuilds_the_read_index_inside_the_replacement_transaction() {
+        let snapshot = EncodedSnapshot::merge(
+            RpgMakerAssetOwner::Builtin,
+            vec![encode_test_batch(vec![scalar_group(1, "name", "原文")]).expect("快照应可编码")],
+            None,
+        )
+        .expect("快照应可合并");
+        let plan = build_transaction_plan_with_index_maintenance(
+            RpgMakerAssetOwner::Builtin,
+            [0xa5; 32],
+            snapshot,
+            Vec::new(),
+            None,
+            IndexMaintenance::Online,
+            IndexMaintenance::Rebuild,
+        );
+        let statements = plan_statements(&plan);
+        let position = |statement: &str| {
+            statements
+                .iter()
+                .position(|actual| actual == statement)
+                .unwrap_or_else(|| panic!("事务应包含：{statement}"))
+        };
+        assert!(
+            position(DROP_RPG_MAKER_TEXT_UNIT_OWNER_GROUP_ORDER_INDEX)
+                < position(DELETE_OWNER_UNITS)
+        );
+        assert!(
+            position(INSERT_UNIT) < position(CREATE_RPG_MAKER_TEXT_UNIT_OWNER_GROUP_ORDER_INDEX)
         );
     }
 
@@ -3559,7 +4099,7 @@ mod tests {
                 snapshot,
                 Vec::new(),
                 None,
-                ClaimIndexMaintenance::Rebuild,
+                IndexMaintenance::Rebuild,
             ),
         )
         .expect("超过 229,974 个 Claim 的生产事务应原子提交");
@@ -3762,7 +4302,7 @@ mod tests {
                 new,
                 previous_unit_rows,
                 None,
-                ClaimIndexMaintenance::Rebuild,
+                IndexMaintenance::Rebuild,
             ),
         )
         .expect("配方外壳变化应完成替换");
@@ -3819,7 +4359,7 @@ mod tests {
                 new,
                 previous_unit_rows,
                 None,
-                ClaimIndexMaintenance::Rebuild,
+                IndexMaintenance::Rebuild,
             ),
         )
         .expect("来源变化应完成替换");
@@ -3887,7 +4427,7 @@ mod tests {
             conflicting_rules,
             previous_unit_rows,
             None,
-            ClaimIndexMaintenance::Rebuild,
+            IndexMaintenance::Rebuild,
         );
         assert!(
             plan_statements(&plan)
@@ -3963,7 +4503,7 @@ mod tests {
             new,
             previous_rows.units.clone(),
             None,
-            ClaimIndexMaintenance::Rebuild,
+            IndexMaintenance::Rebuild,
         )
         .steps()
         .to_vec();
@@ -4016,6 +4556,7 @@ mod tests {
                 READ_OWNER_STATE.to_owned(),
                 READ_PROJECT_DEFINITION.to_owned(),
                 DECIDE_CLAIM_INDEX_REBUILD.to_owned(),
+                DECIDE_UNIT_INDEX_REBUILD.to_owned(),
             ]
         );
         let plans = harness.sqlite.plans.lock().expect("事务记录锁不应中毒");
@@ -4148,37 +4689,44 @@ mod tests {
                 EncodeAssetSnapshotError::DuplicateGroupLocation {
                     group_location: Box::new(location),
                 },
-                "data/Items.json[7]",
+                "Items.json",
                 "duplicate_group_location",
             ),
             (
                 EncodeAssetSnapshotError::InvalidClaimSummary(
                     MutationClaimSummaryError::MixedAccess { resource_key },
                 ),
-                "data/Items.json",
-                "claim_summary_invalid=mixed_access",
+                "Items.json",
+                "mixed_access",
             ),
             (
                 EncodeAssetSnapshotError::Location(RpgMakerLocationCodecError::NonCanonical),
-                "group_location",
-                "kind=non_canonical",
+                "invalid_location",
+                "non_canonical",
             ),
             (
                 EncodeAssetSnapshotError::SourceContent(json_error()),
-                "source_content_json",
-                "json_category=eof",
+                "invalid_source_content_json",
+                "eof",
             ),
             (
                 EncodeAssetSnapshotError::SourceContext(json_error()),
-                "source_context_json",
-                "json_category=eof",
+                "invalid_source_context_json",
+                "eof",
             ),
         ];
 
         for (error, subject, detail) in cases {
-            let serialized =
-                serde_json::to_string(&error.safe_diagnostic(DiagnosticStage::Extract))
-                    .expect("安全诊断应可序列化");
+            let serialized = serde_json::to_string(&extraction_store_report(
+                crate::diagnostic::RpgMakerDiagnosticOwner::Builtin,
+                std::path::Path::new(r"C:\projects\demo\project.db"),
+                RpgMakerExtractionStoreOperation::EncodeSnapshot,
+                StateEffect::Unchanged,
+                RpgMakerExtractionStoreProblem::SnapshotEncoding {
+                    violation: error.diagnostic_violation(),
+                },
+            ))
+            .expect("安全诊断应可序列化");
             assert!(serialized.contains(subject), "{serialized}");
             assert!(serialized.contains(detail), "{serialized}");
         }
@@ -4188,32 +4736,27 @@ mod tests {
     fn stored_project_definition_diagnostics_distinguish_every_row_failure() {
         let path = PathBuf::from(r"C:\projects\demo\project.db");
         let cases = [
-            (
-                StoredProjectDefinitionError::Missing,
-                "expected_rows=1; actual_rows=0",
-            ),
-            (
-                StoredProjectDefinitionError::Multiple,
-                "expected_rows=1; actual_rows=multiple",
-            ),
+            (StoredProjectDefinitionError::Missing, "missing"),
+            (StoredProjectDefinitionError::Multiple, "multiple"),
             (
                 StoredProjectDefinitionError::WrongColumnCount { actual: 3 },
-                "expected_columns=1; actual_columns=3",
+                "wrong_column_count",
             ),
             (
                 StoredProjectDefinitionError::WrongColumnType { actual: "BLOB" },
-                "expected_type=text; actual_type=BLOB",
+                "wrong_column_type",
             ),
-            (
-                StoredProjectDefinitionError::NonCanonical,
-                "encoding=non_canonical",
-            ),
+            (StoredProjectDefinitionError::NonCanonical, "non_canonical"),
         ];
         for (error, detail) in cases {
-            let serialized = serde_json::to_string(&invalid_project_definition_diagnostic(
+            let serialized = serde_json::to_string(&extraction_store_report(
+                crate::diagnostic::RpgMakerDiagnosticOwner::Builtin,
                 &path,
-                &error,
-                DiagnosticStage::Extract,
+                RpgMakerExtractionStoreOperation::ReadProjectDefinition,
+                StateEffect::Unchanged,
+                RpgMakerExtractionStoreProblem::InvalidStoredProjectDefinition {
+                    violation: error.diagnostic_violation(),
+                },
             ))
             .expect("安全诊断应可序列化");
             assert!(serialized.contains("project.db"), "{serialized}");
@@ -4222,10 +4765,14 @@ mod tests {
 
         let invalid =
             StoredProjectDefinitionError::Invalid(MvDialogueDefinitionError::EmptyDocument);
-        let serialized = serde_json::to_string(&invalid_project_definition_diagnostic(
+        let serialized = serde_json::to_string(&extraction_store_report(
+            crate::diagnostic::RpgMakerDiagnosticOwner::Builtin,
             &path,
-            &invalid,
-            DiagnosticStage::Extract,
+            RpgMakerExtractionStoreOperation::ReadProjectDefinition,
+            StateEffect::Unchanged,
+            RpgMakerExtractionStoreProblem::InvalidStoredProjectDefinition {
+                violation: invalid.diagnostic_violation(),
+            },
         ))
         .expect("无效定义诊断应可序列化");
         assert!(serialized.contains("empty_document"), "{serialized}");
@@ -4341,6 +4888,7 @@ mod tests {
                 READ_OWNER_UNITS.to_owned(),
                 READ_OWNER_CLAIMS.to_owned(),
                 DECIDE_CLAIM_INDEX_REBUILD.to_owned(),
+                DECIDE_UNIT_INDEX_REBUILD.to_owned(),
             ]
         );
         assert_eq!(
@@ -4393,6 +4941,7 @@ mod tests {
                 READ_OWNER_UNITS.to_owned(),
                 READ_OWNER_CLAIMS.to_owned(),
                 DECIDE_CLAIM_INDEX_REBUILD.to_owned(),
+                DECIDE_UNIT_INDEX_REBUILD.to_owned(),
             ]
         );
         assert_eq!(
@@ -4447,6 +4996,7 @@ mod tests {
                 READ_OWNER_STATE.to_owned(),
                 READ_OWNER_UNITS.to_owned(),
                 DECIDE_CLAIM_INDEX_REBUILD.to_owned(),
+                DECIDE_UNIT_INDEX_REBUILD.to_owned(),
             ]
         );
         let plans = harness.sqlite.plans.lock().expect("事务记录锁不应中毒");
@@ -4619,7 +5169,7 @@ mod tests {
                 snapshot,
                 Vec::new(),
                 None,
-                ClaimIndexMaintenance::Rebuild,
+                IndexMaintenance::Rebuild,
             ),
         )
         .expect("消费式事务计划应完整写入快照");
@@ -4671,7 +5221,7 @@ mod tests {
                 snapshot,
                 Vec::new(),
                 None,
-                ClaimIndexMaintenance::Rebuild,
+                IndexMaintenance::Rebuild,
             ),
         )
         .expect("乱序输入应完整写入当前 schema");
@@ -4735,7 +5285,7 @@ mod tests {
         let current = snapshot_rows(&snapshot);
         assert!(snapshot.matches_rows_ref(&current, &[0xa5; 32]));
 
-        for column in 0..4 {
+        for column in 0..5 {
             let mut damaged = current.clone();
             let mut values = damaged.groups[0].values().to_vec();
             values[column] = SqliteValue::Null;
@@ -4833,9 +5383,9 @@ mod tests {
                 assert!(
                     details.iter().any(|detail| {
                         detail.contains("rpg_maker_text_unit_owner_group_order_idx")
-                            && detail.contains("group_location=?")
+                            && detail.contains("group_id=?")
                     }),
-                    "深快照 Unit 必须按 owner 与 group_location 定位：{details:?}"
+                    "深快照 Unit 必须按 owner 与 group_id 定位：{details:?}"
                 );
             }
         }
@@ -4902,7 +5452,12 @@ mod tests {
         assert_eq!(sample.claims.len(), 1);
         let sample_location = large_data_root_location(1);
         assert_eq!(sample.groups[0].group_location, sample_location);
-        assert_eq!(sample.groups[0].semantic_order_key.fragment(), 0);
+        assert_eq!(
+            RpgMakerSemanticOrderKey::decode(&sample.groups[0].semantic_order_key_blob)
+                .expect("Group 模板顺序键应可解码")
+                .fragment(),
+            0
+        );
         assert_eq!(sample.groups[0].group_kind, "database_entry");
         assert_eq!(
             sample.groups[0].projection_recipe_json,
@@ -4910,7 +5465,12 @@ mod tests {
         );
         assert_eq!(sample.units[0].group_location, sample_location);
         assert_eq!(sample.units[0].unit_role, LARGE_GROUP_UNIT_ROLE_JSON);
-        assert_eq!(sample.units[0].semantic_order_key.fragment(), 1);
+        assert_eq!(
+            RpgMakerSemanticOrderKey::decode(&sample.units[0].semantic_order_key_blob)
+                .expect("Unit 模板顺序键应可解码")
+                .fragment(),
+            1
+        );
         assert_eq!(
             sample.units[0].source_content_json,
             LARGE_GROUP_UNIT_SOURCE_CONTENT_JSON
@@ -4941,9 +5501,10 @@ mod tests {
 
         {
             let mut statement = transaction
-                .prepare("INSERT INTO rpg_maker_text_group VALUES (?1, ?2, ?3, ?4, ?5)")
+                .prepare("INSERT INTO rpg_maker_text_group VALUES (?1, ?2, ?3, ?4, ?5, ?6)")
                 .expect("大 Group 写入语句应准备一次");
             for group_order in 0..total {
+                let group_id = i64::try_from(group_order + 1).expect("Group ID 应可编码");
                 let location = large_data_root_location(group_order + 1);
                 let recipe = large_data_root_recipe(&location);
                 let semantic_order_key = RpgMakerSemanticOrderKey::new(
@@ -4959,6 +5520,7 @@ mod tests {
                 statement
                     .execute(rusqlite::params![
                         owner.storage_name(),
+                        group_id,
                         location,
                         semantic_order_key.encode().expect("Group 顺序键应可编码"),
                         "database_entry",
@@ -4975,6 +5537,7 @@ mod tests {
                 )
                 .expect("大 Unit 写入语句应准备一次");
             for ordinal in 1..=total {
+                let group_id = i64::try_from(ordinal).expect("Group ID 应可编码");
                 let location = large_data_root_location(ordinal);
                 let semantic_order_key = RpgMakerSemanticOrderKey::new(
                     vec![u64::try_from(ordinal - 1).expect("测试顺序应可编码为 u64")],
@@ -4990,7 +5553,7 @@ mod tests {
                 statement
                     .execute(rusqlite::params![
                         owner.storage_name(),
-                        location,
+                        group_id,
                         LARGE_GROUP_UNIT_ROLE_JSON,
                         semantic_order_key.encode().expect("Unit 顺序键应可编码"),
                         LARGE_GROUP_UNIT_SOURCE_CONTENT_JSON,
@@ -5005,14 +5568,11 @@ mod tests {
                 .prepare("INSERT INTO rpg_maker_mutation_claim VALUES (?1, ?2, ?3, 'exclusive')")
                 .expect("大 Claim 写入语句应准备一次");
             for ordinal in 1..=total {
+                let group_id = i64::try_from(ordinal).expect("Group ID 应可编码");
                 let location = large_data_root_location(ordinal);
                 fingerprint_builder.claim(&location, "exclusive", &location);
                 statement
-                    .execute(rusqlite::params![
-                        owner.storage_name(),
-                        &location,
-                        &location,
-                    ])
+                    .execute(rusqlite::params![owner.storage_name(), group_id, &location,])
                     .expect("大 Claim 应通过复用语句写入");
             }
         }
@@ -5326,13 +5886,9 @@ mod tests {
             .iter()
             .map(|group| {
                 SqliteRow::new(vec![
+                    SqliteValue::Integer(group.group_id),
                     text(group.group_location.clone()),
-                    SqliteValue::Blob(
-                        group
-                            .semantic_order_key
-                            .encode()
-                            .expect("测试 Group 顺序键应可编码"),
-                    ),
+                    SqliteValue::Blob(group.semantic_order_key_blob.clone()),
                     text(group.group_kind),
                     text(group.projection_recipe_json.clone()),
                 ])
@@ -5352,11 +5908,7 @@ mod tests {
                 SqliteRow::new(vec![
                     text(unit.group_location.clone()),
                     text(unit.unit_role.clone()),
-                    SqliteValue::Blob(
-                        unit.semantic_order_key
-                            .encode()
-                            .expect("测试 Unit 顺序键应可编码"),
-                    ),
+                    SqliteValue::Blob(unit.semantic_order_key_blob.clone()),
                     text(unit.source_content_json.clone()),
                     text(unit.source_context_json.clone()),
                     translation_content_json,
@@ -5389,7 +5941,7 @@ mod tests {
     ) -> StoredSnapshotRows {
         StoredSnapshotRows {
             owner_state: read_rows(connection, READ_OWNER_STATE, owner, 2),
-            groups: read_rows(connection, READ_OWNER_GROUPS, owner, 4),
+            groups: read_rows(connection, READ_OWNER_GROUPS, owner, 5),
             units: read_rows(connection, READ_OWNER_UNITS, owner, 7),
             claims: read_rows(connection, READ_OWNER_CLAIMS, owner, 3),
         }
@@ -5423,18 +5975,41 @@ mod tests {
         connection: &Connection,
         owner: RpgMakerAssetOwner,
         incoming_claim_count: usize,
-    ) -> ClaimIndexMaintenance {
+    ) -> IndexMaintenance {
+        query_index_maintenance(
+            connection,
+            DECIDE_CLAIM_INDEX_REBUILD,
+            owner,
+            incoming_claim_count,
+        )
+    }
+
+    fn query_unit_index_maintenance(
+        connection: &Connection,
+        owner: RpgMakerAssetOwner,
+        incoming_unit_count: usize,
+    ) -> IndexMaintenance {
+        query_index_maintenance(
+            connection,
+            DECIDE_UNIT_INDEX_REBUILD,
+            owner,
+            incoming_unit_count,
+        )
+    }
+
+    fn query_index_maintenance(
+        connection: &Connection,
+        statement: &str,
+        owner: RpgMakerAssetOwner,
+        incoming_count: usize,
+    ) -> IndexMaintenance {
         let other_owner = other_owner_storage_name(owner);
-        let incoming_claim_count =
-            i64::try_from(incoming_claim_count).expect("测试 Claim 数量应可编码");
-        let mut statement = connection
-            .prepare(DECIDE_CLAIM_INDEX_REBUILD)
-            .expect("索引策略查询应可准备");
+        let incoming_count = i64::try_from(incoming_count).expect("测试资产数量应可编码");
+        let mut statement = connection.prepare(statement).expect("索引策略查询应可准备");
         let rows = statement
-            .query_map(
-                rusqlite::params![other_owner, incoming_claim_count],
-                |row| row.get::<_, i64>(0),
-            )
+            .query_map(rusqlite::params![other_owner, incoming_count], |row| {
+                row.get::<_, i64>(0)
+            })
             .expect("索引策略查询应可执行")
             .map(|value| {
                 SqliteRow::new(vec![SqliteValue::Integer(
@@ -5442,7 +6017,7 @@ mod tests {
                 )])
             })
             .collect::<Vec<_>>();
-        decode_claim_index_maintenance(rows).expect("真实 SQLite 应返回规范策略结果")
+        decode_index_maintenance(rows).expect("真实 SQLite 应返回规范策略结果")
     }
 
     fn read_claim_index_schema(connection: &Connection) -> Vec<(String, String)> {
@@ -5525,38 +6100,40 @@ ORDER BY name"#,
                 INSERT INTO rpg_maker_translation_resource VALUES ('placeholder_rules', '[]');
                 CREATE TABLE rpg_maker_text_group (
                     owner TEXT NOT NULL,
+                    group_id INTEGER NOT NULL CHECK (group_id > 0),
                     group_location TEXT NOT NULL,
                     semantic_order_key BLOB NOT NULL,
                     group_kind TEXT NOT NULL,
                     projection_recipe_json TEXT NOT NULL,
-                    PRIMARY KEY (owner, group_location),
+                    PRIMARY KEY (owner, group_id),
+                    UNIQUE (owner, group_location),
                     UNIQUE (owner, semantic_order_key),
                     FOREIGN KEY (owner) REFERENCES rpg_maker_asset_owner_state(owner) ON DELETE CASCADE
                 );
                 CREATE TABLE rpg_maker_text_unit (
                     owner TEXT NOT NULL,
-                    group_location TEXT NOT NULL,
+                    group_id INTEGER NOT NULL CHECK (group_id > 0),
                     unit_role TEXT NOT NULL,
                     semantic_order_key BLOB NOT NULL,
                     source_content_json TEXT NOT NULL,
                     source_context_json TEXT NOT NULL,
                     translation_content_json TEXT,
                     translation_state BLOB,
-                    PRIMARY KEY (owner, group_location, unit_role),
+                    PRIMARY KEY (owner, group_id, unit_role),
                     UNIQUE (owner, semantic_order_key),
-                    FOREIGN KEY (owner, group_location)
-                        REFERENCES rpg_maker_text_group(owner, group_location) ON DELETE CASCADE
+                    FOREIGN KEY (owner, group_id)
+                        REFERENCES rpg_maker_text_group(owner, group_id) ON DELETE CASCADE
                 );
                 CREATE INDEX rpg_maker_text_unit_owner_group_order_idx
-                    ON rpg_maker_text_unit(owner, group_location, semantic_order_key);
+                    ON rpg_maker_text_unit(owner, group_id, semantic_order_key);
                 CREATE TABLE rpg_maker_mutation_claim (
                     owner TEXT NOT NULL,
-                    group_location TEXT NOT NULL,
+                    group_id INTEGER NOT NULL CHECK (group_id > 0),
                     resource_key TEXT NOT NULL,
                     access TEXT NOT NULL CHECK (access IN ('intent', 'exclusive')),
-                    PRIMARY KEY (owner, group_location, resource_key),
-                    FOREIGN KEY (owner, group_location)
-                        REFERENCES rpg_maker_text_group(owner, group_location) ON DELETE CASCADE
+                    PRIMARY KEY (owner, group_id, resource_key),
+                    FOREIGN KEY (owner, group_id)
+                        REFERENCES rpg_maker_text_group(owner, group_id) ON DELETE CASCADE
                 );
                 "#,
             )
@@ -5588,14 +6165,12 @@ ORDER BY name"#,
         for group in &snapshot.groups {
             connection
                 .execute(
-                    "INSERT INTO rpg_maker_text_group VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO rpg_maker_text_group VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     (
                         snapshot.owner.storage_name(),
+                        group.group_id,
                         &group.group_location,
-                        group
-                            .semantic_order_key
-                            .encode()
-                            .expect("测试 Group 顺序键应可编码"),
+                        &group.semantic_order_key_blob,
                         group.group_kind,
                         &group.projection_recipe_json,
                     ),
@@ -5608,11 +6183,9 @@ ORDER BY name"#,
                     "INSERT INTO rpg_maker_text_unit VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     rusqlite::params![
                         snapshot.owner.storage_name(),
-                        &unit.group_location,
+                        unit.group_id,
                         &unit.unit_role,
-                        unit.semantic_order_key
-                            .encode()
-                            .expect("测试 Unit 顺序键应可编码"),
+                        &unit.semantic_order_key_blob,
                         &unit.source_content_json,
                         &unit.source_context_json,
                         translation,
@@ -5627,7 +6200,7 @@ ORDER BY name"#,
                     "INSERT INTO rpg_maker_mutation_claim VALUES (?1, ?2, ?3, ?4)",
                     (
                         snapshot.owner.storage_name(),
-                        &claim.group_location,
+                        claim.group_id,
                         &claim.resource_key,
                         claim.access.storage_name(),
                     ),
@@ -5763,21 +6336,19 @@ ORDER BY name"#,
                 }],
             },
         };
-        let report = not_committed.into_failure_report(
-            DiagnosticStage::Extract,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
+        let report = not_committed.extraction_store_diagnostic_report(
+            crate::diagnostic::RpgMakerDiagnosticOwner::Builtin,
         );
-        assert_eq!(report.primary.public().impact, DiagnosticImpact::Unchanged);
-        assert_eq!(report.related.len(), 1);
+        assert_eq!(report.effect(), StateEffect::Unchanged);
+        assert_eq!(report.related().len(), 1);
         assert_eq!(
-            report.related[0].public().impact,
-            DiagnosticImpact::Unchanged,
+            report.related()[0].report().effect(),
+            StateEffect::Unchanged,
             "事务已确认回滚时，连接清理详情不能把整体误分类为状态已生效"
         );
-        let primary = serde_json::to_string(report.primary.public()).expect("主诊断应可序列化");
+        let primary = serde_json::to_string(&report).expect("主诊断应可序列化");
         let related =
-            serde_json::to_string(report.related[0].public()).expect("相关诊断应可序列化");
+            serde_json::to_string(report.related()[0].report()).expect("相关诊断应可序列化");
         assert!(primary.contains("project.db"));
         assert!(primary.contains("rolled_back"));
         assert!(primary.contains("\"raw_os_code\":5"));
@@ -5798,27 +6369,21 @@ ORDER BY name"#,
                 }],
             },
         };
-        let report = outcome_unknown.into_failure_report(
-            DiagnosticStage::Extract,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
+        let report = outcome_unknown.extraction_store_diagnostic_report(
+            crate::diagnostic::RpgMakerDiagnosticOwner::Builtin,
         );
+        assert_eq!(report.effect(), StateEffect::OutcomeUnknown);
+        assert_eq!(report.related().len(), 1);
         assert_eq!(
-            report.primary.public().impact,
-            DiagnosticImpact::OutcomeUnknown
-        );
-        assert_eq!(report.related.len(), 1);
-        assert_eq!(
-            report.related[0].public().impact,
-            DiagnosticImpact::OutcomeUnknown,
+            report.related()[0].report().effect(),
+            StateEffect::OutcomeUnknown,
             "事务终态未知时，连接清理详情不能把整体降级为已知终态"
         );
-        let serialized =
-            serde_json::to_string(report.primary.public()).expect("结果未知诊断应可序列化");
+        let serialized = serde_json::to_string(&report).expect("结果未知诊断应可序列化");
         assert!(serialized.contains("outcome_unknown"));
         assert!(serialized.contains("\"raw_os_code\":1117"));
         assert!(
-            serde_json::to_string(report.related[0].public())
+            serde_json::to_string(report.related()[0].report())
                 .expect("结果未知的清理诊断应可序列化")
                 .contains("\"raw_os_code\":6")
         );
@@ -5834,26 +6399,15 @@ ORDER BY name"#,
                 source: std::io::Error::from_raw_os_error(1117),
             },
         };
-        let report = conflict_unknown.into_failure_report(
-            DiagnosticStage::Extract,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
+        let report = conflict_unknown.extraction_store_diagnostic_report(
+            crate::diagnostic::RpgMakerDiagnosticOwner::Builtin,
         );
-        assert_eq!(
-            report.primary.public().impact,
-            DiagnosticImpact::OutcomeUnknown
-        );
-        assert_eq!(report.related.len(), 1);
-        assert_eq!(
-            report.related[0].public().impact,
-            DiagnosticImpact::OutcomeUnknown,
-            "冲突事实不能把未知回滚终态误写成 unchanged"
-        );
-        let related =
-            serde_json::to_string(report.related[0].public()).expect("冲突事实应可序列化");
-        assert!(related.contains("data/Items.json[1].name"));
-        assert!(related.contains("outcome_unknown"));
-        assert!(!related.contains("[\\\"v\\\""));
+        assert_eq!(report.effect(), StateEffect::OutcomeUnknown);
+        assert!(report.related().is_empty());
+        let serialized = serde_json::to_string(&report).expect("冲突事实应可序列化");
+        assert!(serialized.contains("Items.json"));
+        assert!(serialized.contains("outcome_unknown"));
+        assert!(!serialized.contains("[\\\"v\\\""));
     }
 
     fn to_rusqlite_value(value: &SqliteValue) -> RusqliteValue {

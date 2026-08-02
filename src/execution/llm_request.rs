@@ -8,9 +8,9 @@ use std::future::Future;
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
-use crate::diagnostic::{DiagnosticImpact, SafeDiagnostic};
+use crate::diagnostic::{DiagnosticReport, StateEffect};
 use crate::llm::{
-    ChatMessage, LlmFinishReason, LlmRequestDiagnosticSource, LlmRequestError, LlmRequestExecutor,
+    ChatMessage, LlmFinishReason, LlmRequestError, LlmRequestExecutor, LlmRequestFailure,
     LlmResponse, LlmUsage,
 };
 
@@ -66,7 +66,7 @@ impl LlmRequestAttemptRecord {
     pub(crate) fn retryable(
         attempt: NonZeroUsize,
         duration: Duration,
-        diagnostic: SafeDiagnostic,
+        diagnostic: DiagnosticReport,
         retry_after: Option<Duration>,
         retry_wait: Option<LlmRequestRetryWaitRecord>,
     ) -> Self {
@@ -100,7 +100,7 @@ impl LlmRequestAttemptRecord {
     pub(crate) fn failed(
         attempt: NonZeroUsize,
         duration: Duration,
-        diagnostic: SafeDiagnostic,
+        diagnostic: DiagnosticReport,
     ) -> Self {
         Self {
             attempt,
@@ -127,12 +127,12 @@ pub(crate) enum LlmRequestAttemptOutcome {
         usage: Option<LlmUsage>,
     },
     Retryable {
-        diagnostic: SafeDiagnostic,
+        diagnostic: DiagnosticReport,
         retry_after: Option<Duration>,
         retry_wait: Option<LlmRequestRetryWaitRecord>,
     },
     Failed {
-        diagnostic: SafeDiagnostic,
+        diagnostic: DiagnosticReport,
     },
     Cancelled,
 }
@@ -166,19 +166,18 @@ pub(crate) enum LlmRequestExecutionOutcome<E> {
     },
     RetryAfterExceedsMaximum {
         attempt: NonZeroUsize,
-        diagnostic: SafeDiagnostic,
+        diagnostic: DiagnosticReport,
         retry_after: Duration,
         maximum: Duration,
     },
     RetryBudgetExhausted {
         attempt: NonZeroUsize,
-        diagnostic: SafeDiagnostic,
+        diagnostic: DiagnosticReport,
     },
     Fatal {
         attempt: NonZeroUsize,
         source: E,
-        diagnostic: Option<SafeDiagnostic>,
-        cancelled: bool,
+        diagnostic: DiagnosticReport,
     },
     Cancelled {
         attempt: NonZeroUsize,
@@ -264,7 +263,6 @@ pub(crate) async fn execute_llm_request_with_retry<L, D>(
 ) -> LlmRequestExecution<L::Error>
 where
     L: LlmRequestExecutor,
-    L::Error: LlmRequestDiagnosticSource,
     D: AsyncDelay,
 {
     execute_llm_request_with_retry_inner(
@@ -293,7 +291,6 @@ async fn execute_llm_request_with_retry_inner<L, D, H>(
 ) -> LlmRequestExecution<L::Error>
 where
     L: LlmRequestExecutor,
-    L::Error: LlmRequestDiagnosticSource,
     D: AsyncDelay,
     H: Fn(),
 {
@@ -335,30 +332,33 @@ where
             }
             Err(LlmRequestError::Fatal(source)) => {
                 let cancelled = cancellation.is_requested() && source.is_cancelled_wait();
-                let diagnostic = (!cancelled)
-                    .then(|| source.request_diagnostic(None, DiagnosticImpact::ProgressPreserved));
-                if let Some(diagnostic) = &diagnostic {
-                    evidence.record(|| {
-                        LlmRequestAttemptRecord::failed(
-                            attempt,
-                            AttemptEvidenceBuilder::duration(attempt_started),
-                            diagnostic.clone(),
-                        )
-                    });
-                } else {
+                if cancelled {
                     evidence.record(|| {
                         LlmRequestAttemptRecord::cancelled(
                             attempt,
                             AttemptEvidenceBuilder::duration(attempt_started),
                         )
                     });
+                    return finish(LlmRequestExecutionOutcome::Cancelled { attempt }, evidence);
                 }
+                let diagnostic = {
+                    DiagnosticReport::new(
+                        StateEffect::ProgressPreserved,
+                        llm.request_diagnostic(client, &source, None),
+                    )
+                };
+                evidence.record(|| {
+                    LlmRequestAttemptRecord::failed(
+                        attempt,
+                        AttemptEvidenceBuilder::duration(attempt_started),
+                        diagnostic.clone(),
+                    )
+                });
                 return finish(
                     LlmRequestExecutionOutcome::Fatal {
                         attempt,
                         source,
                         diagnostic,
-                        cancelled,
                     },
                     evidence,
                 );
@@ -374,19 +374,13 @@ where
                             AttemptEvidenceBuilder::duration(attempt_started),
                         )
                     });
-                    return finish(
-                        LlmRequestExecutionOutcome::Fatal {
-                            attempt,
-                            source,
-                            diagnostic: None,
-                            cancelled: true,
-                        },
-                        evidence,
-                    );
+                    return finish(LlmRequestExecutionOutcome::Cancelled { attempt }, evidence);
                 }
 
-                let diagnostic =
-                    source.request_diagnostic(retry_after, DiagnosticImpact::ProgressPreserved);
+                let diagnostic = DiagnosticReport::new(
+                    StateEffect::ProgressPreserved,
+                    llm.request_diagnostic(client, &source, retry_after),
+                );
                 if let Some(retry_after) = retry_after
                     && retry_after > policy.max_retry_after
                 {
@@ -488,10 +482,8 @@ mod tests {
     use std::fmt;
     use std::sync::{Arc, Barrier, Mutex};
 
-    use crate::diagnostic::{
-        DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticReason, DiagnosticStage,
-        DiagnosticSubject,
-    };
+    use crate::diagnostic::{Diagnostic, RuntimeComponent, RuntimeIssue, RuntimeOperation};
+    use crate::llm::LlmRequestFailure;
 
     use super::*;
 
@@ -506,22 +498,7 @@ mod tests {
 
     impl Error for FakeError {}
 
-    impl LlmRequestDiagnosticSource for FakeError {
-        fn request_diagnostic(
-            &self,
-            _retry_after: Option<Duration>,
-            impact: DiagnosticImpact,
-        ) -> SafeDiagnostic {
-            SafeDiagnostic::new(
-                DiagnosticCode::ModelRequest,
-                DiagnosticStage::ModelRequest,
-                DiagnosticSubject::component(self.0),
-                DiagnosticReason::failure(DiagnosticFailureKind::TransportFailed),
-                impact,
-                DiagnosticAction::Retry,
-            )
-        }
-
+    impl LlmRequestFailure for FakeError {
         fn is_cancelled_wait(&self) -> bool {
             self.0 == "cancelled-wait"
         }
@@ -550,6 +527,18 @@ mod tests {
                 .expect("响应队列锁不应中毒")
                 .pop_front()
                 .expect("测试必须准备足够响应")
+        }
+
+        fn request_diagnostic(
+            &self,
+            _client: &Self::Client,
+            _source: &Self::Error,
+            _retry_after: Option<Duration>,
+        ) -> Diagnostic {
+            Diagnostic::runtime(RuntimeIssue::ExecutorClosed {
+                component: RuntimeComponent::Process,
+                operation: RuntimeOperation::ExecuteTask,
+            })
         }
     }
 

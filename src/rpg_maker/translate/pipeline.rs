@@ -11,10 +11,16 @@ use std::fmt;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::diagnostic::SafeDiagnostic;
+use crate::diagnostic::{
+    Diagnostic, DiagnosticReport, RpgMakerIssue, RpgMakerModelNonStopFinishReason,
+    RpgMakerResponseInvariantProblem, RpgMakerResponseProcessingProblem,
+    RpgMakerResponseProcessingScope, RpgMakerTaskResponseJsonCategory, RpgMakerTaskResponseProblem,
+    RpgMakerTaskResponseUnitProblem, RpgMakerTaskResponseValueProblem, RpgMakerUnitLocator,
+    StateEffect,
+};
 use crate::execution::ordered::{
     OrderedExecutionError, OrderedExecutionHandler, OrderedExecutionLimits,
     OrderedFinalizationDisposition, OrderedTaskResult, execute_ordered,
@@ -31,18 +37,24 @@ use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::project_database::{AssetSnapshotFingerprint, SourceSnapshotFingerprint};
 use crate::rpg_maker::semantic_order::{RpgMakerSemanticOrderKey, RpgMakerSemanticScopeKey};
 use crate::rpg_maker::text::{RpgMakerLocation, TextGroupKind};
+use crate::translation::placeholder::{
+    PlaceholderMatchRangeViolation, PlaceholderMatchReference, PlaceholderPcre2ErrorKind,
+    PlaceholderRuleReference, PlaceholderWorkerOperation,
+};
 use crate::translation::placeholder_projection::{
     LanguageTextProjectionError, PlaceholderBindingIndex, PlaceholderMultisetError,
 };
 use crate::translation::task_planning::TaskId;
+use crate::translation_protocol::TranslationTaskResponseJsonErrorCategory;
 
 use super::executor::FinalLlmResponseMetadata;
 use super::profile::RpgMakerTranslationProfile as ConfiguredRpgMakerTranslationProfile;
 use super::task_record::{
-    NoOpTranslationTaskRecordSink, TranslationTaskCommitFailure,
+    NoOpTranslationTaskRecordSink, TranslationAssistantValueError, TranslationTaskCommitFailure,
     TranslationTaskCommitFailureImpact, TranslationTaskCommitPhase, TranslationTaskExecution,
     TranslationTaskExecutionEvidence, TranslationTaskExecutionFailure,
     TranslationTaskRecordDocument, TranslationTaskRecordFinalState, TranslationTaskRecordSink,
+    TranslationTaskResponseParseError, TranslationTaskResponseParseErrorKind,
 };
 
 /// 模型响应返回后仍要执行验收、传播准备和顺序提交；这些本地完成项可以在内存中
@@ -829,6 +841,13 @@ impl TranslationPlanPreparation {
 pub(crate) struct TranslationPlanningFailure {
     identity: TranslationUnitIdentity,
     reason: TranslationPlanningFailureReason,
+    rule_source: TranslationPlaceholderRuleSource,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TranslationPlaceholderRuleSource {
+    ExternalFile(PathBuf),
+    ProjectSnapshot,
 }
 
 impl TranslationPlanningFailure {
@@ -836,20 +855,357 @@ impl TranslationPlanningFailure {
         identity: TranslationUnitIdentity,
         reason: TranslationPlanningFailureReason,
     ) -> Self {
-        Self { identity, reason }
+        Self {
+            identity,
+            reason,
+            rule_source: TranslationPlaceholderRuleSource::ProjectSnapshot,
+        }
+    }
+
+    pub(crate) fn with_rule_source(
+        mut self,
+        rule_source: TranslationPlaceholderRuleSource,
+    ) -> Self {
+        self.rule_source = rule_source;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn identity(&self) -> &TranslationUnitIdentity {
+        &self.identity
     }
 
     #[cfg(test)]
     pub(crate) fn reason(&self) -> &TranslationPlanningFailureReason {
         &self.reason
     }
+
+    /// 将规划器掌握的叶子原因和完整 RPG Maker Unit 身份一次性投影为公开诊断。
+    ///
+    /// 规则来源由 Planner 在解析本次资源时保存；调用方不得再从展示文本猜测来源。
+    #[cfg(test)]
+    pub(crate) fn diagnostic_report(&self) -> crate::diagnostic::DiagnosticReport {
+        crate::diagnostic::DiagnosticReport::new(
+            crate::diagnostic::StateEffect::Unchanged,
+            crate::diagnostic::Diagnostic::rpg_maker(self.diagnostic_issue()),
+        )
+    }
+
+    #[cfg(test)]
+    fn diagnostic_issue(&self) -> crate::diagnostic::RpgMakerIssue {
+        let unit = rpg_maker_diagnostic_unit(&self.identity);
+        match &self.reason {
+            TranslationPlanningFailureReason::PlaceholderProtection { failure } => {
+                crate::diagnostic::RpgMakerIssue::placeholder_planning(
+                    match &self.rule_source {
+                        TranslationPlaceholderRuleSource::ExternalFile(path) => {
+                            crate::diagnostic::PlaceholderRuleSource::external_file(path)
+                        }
+                        TranslationPlaceholderRuleSource::ProjectSnapshot => {
+                            crate::diagnostic::PlaceholderRuleSource::ProjectSnapshot
+                        }
+                    },
+                    unit,
+                    placeholder_protection_diagnostic(failure),
+                )
+            }
+            TranslationPlanningFailureReason::PlaceholderProjection { failure } => {
+                crate::diagnostic::RpgMakerIssue::placeholder_projection(
+                    unit,
+                    placeholder_projection_diagnostic(failure),
+                )
+            }
+        }
+    }
+}
+
+pub(super) fn rpg_maker_diagnostic_unit(
+    identity: &TranslationUnitIdentity,
+) -> crate::diagnostic::RpgMakerUnitLocator {
+    crate::diagnostic::RpgMakerUnitLocator::new(
+        identity.owner().diagnostic_owner(),
+        identity.kind().diagnostic_group_kind(),
+        identity.group_location().diagnostic_location(),
+        identity.role().diagnostic_role(),
+    )
+}
+
+#[cfg(test)]
+fn placeholder_protection_diagnostic(
+    failure: &TranslationPlaceholderProtectionFailure,
+) -> crate::diagnostic::PlaceholderIssue {
+    use crate::diagnostic::{
+        ByteRange, Pcre2Failure, Pcre2FailureKind, PlaceholderIssue,
+        PlaceholderMatchRangeViolation as RangeViolation, PlaceholderRuleOrigin as RuleOrigin,
+        PlaceholderWorkerOperation as DiagnosticWorkerOperation,
+    };
+
+    let range = |start, end| {
+        ByteRange::new(start, end).expect("Placeholder 匹配器建立的已确认匹配范围必须有效")
+    };
+    let origin = |value| match value {
+        PlaceholderRuleOrigin::BuiltIn => RuleOrigin::Builtin,
+        PlaceholderRuleOrigin::Custom => RuleOrigin::Custom,
+    };
+    match failure {
+        TranslationPlaceholderProtectionFailure::WorkerStart {
+            operation,
+            io_kind,
+            raw_os_code,
+        } => PlaceholderIssue::WorkerStart {
+            operation: match operation {
+                PlaceholderWorkerOperation::CompileCustomRules => {
+                    DiagnosticWorkerOperation::CompileCustomRules
+                }
+                PlaceholderWorkerOperation::MatchText => DiagnosticWorkerOperation::MatchText,
+            },
+            io_kind: (*io_kind).into(),
+            raw_os_code: *raw_os_code,
+        },
+        TranslationPlaceholderProtectionFailure::Pcre2 {
+            rule,
+            kind,
+            code,
+            offset,
+        } => PlaceholderIssue::PatternMatch {
+            rule_origin: Some(origin(rule.origin())),
+            rule_number: rule.rule_number(),
+            pcre2: Pcre2Failure {
+                kind: match kind {
+                    PlaceholderPcre2ErrorKind::Compile => Pcre2FailureKind::Compile,
+                    PlaceholderPcre2ErrorKind::Jit => Pcre2FailureKind::Jit,
+                    PlaceholderPcre2ErrorKind::Match => Pcre2FailureKind::Match,
+                    PlaceholderPcre2ErrorKind::Info => Pcre2FailureKind::Info,
+                    PlaceholderPcre2ErrorKind::Option => Pcre2FailureKind::Option,
+                    PlaceholderPcre2ErrorKind::Unrecognized => Pcre2FailureKind::Unrecognized,
+                },
+                code: *code,
+                offset: *offset,
+            },
+        },
+        TranslationPlaceholderProtectionFailure::EmptyMatch { matched } => {
+            PlaceholderIssue::EmptyMatch {
+                rule_origin: origin(matched.rule().origin()),
+                rule_number: matched.rule().rule_number(),
+                match_range: range(matched.start_byte(), matched.end_byte()),
+            }
+        }
+        TranslationPlaceholderProtectionFailure::MissingTextCapture {
+            rule_number,
+            whole_match_start_byte,
+            whole_match_end_byte,
+        } => PlaceholderIssue::MissingTextCapture {
+            rule_number: *rule_number,
+            match_range: range(*whole_match_start_byte, *whole_match_end_byte),
+        },
+        TranslationPlaceholderProtectionFailure::InvalidMatchRange {
+            rule_number,
+            whole_match_start_byte,
+            whole_match_end_byte,
+            capture_start_byte,
+            capture_end_byte,
+            violation,
+        } => PlaceholderIssue::InvalidMatchRange {
+            rule_number: *rule_number,
+            whole_match_start_byte: *whole_match_start_byte,
+            whole_match_end_byte: *whole_match_end_byte,
+            capture_start_byte: *capture_start_byte,
+            capture_end_byte: *capture_end_byte,
+            violation: match violation {
+                PlaceholderMatchRangeViolation::WholeStartAfterEnd => {
+                    RangeViolation::WholeStartAfterEnd
+                }
+                PlaceholderMatchRangeViolation::WholeEndBeyondText => {
+                    RangeViolation::WholeEndBeyondText
+                }
+                PlaceholderMatchRangeViolation::WholeStartNotUtf8Boundary => {
+                    RangeViolation::WholeStartNotUtf8Boundary
+                }
+                PlaceholderMatchRangeViolation::WholeEndNotUtf8Boundary => {
+                    RangeViolation::WholeEndNotUtf8Boundary
+                }
+                PlaceholderMatchRangeViolation::CaptureStartAfterEnd => {
+                    RangeViolation::CaptureStartAfterEnd
+                }
+                PlaceholderMatchRangeViolation::CaptureEndBeyondText => {
+                    RangeViolation::CaptureEndBeyondText
+                }
+                PlaceholderMatchRangeViolation::CaptureStartNotUtf8Boundary => {
+                    RangeViolation::CaptureStartNotUtf8Boundary
+                }
+                PlaceholderMatchRangeViolation::CaptureEndNotUtf8Boundary => {
+                    RangeViolation::CaptureEndNotUtf8Boundary
+                }
+                PlaceholderMatchRangeViolation::CaptureStartsBeforeWhole => {
+                    RangeViolation::CaptureStartsBeforeWhole
+                }
+                PlaceholderMatchRangeViolation::CaptureEndsAfterWhole => {
+                    RangeViolation::CaptureEndsAfterWhole
+                }
+            },
+        },
+        TranslationPlaceholderProtectionFailure::OverlappingMatches { first, second } => {
+            PlaceholderIssue::OverlappingMatches {
+                first_origin: origin(first.rule().origin()),
+                first_rule_number: first.rule().rule_number(),
+                first_range: range(first.start_byte(), first.end_byte()),
+                second_origin: origin(second.rule().origin()),
+                second_rule_number: second.rule().rule_number(),
+                second_range: range(second.start_byte(), second.end_byte()),
+            }
+        }
+        TranslationPlaceholderProtectionFailure::CrossesLineBoundary {
+            matched,
+            source_line_index,
+        } => PlaceholderIssue::CrossesLineBoundary {
+            rule_origin: origin(matched.rule().origin()),
+            rule_number: matched.rule().rule_number(),
+            source_line_index: *source_line_index,
+        },
+        TranslationPlaceholderProtectionFailure::ReservedTokenNamespace {
+            start_byte,
+            end_byte,
+        } => PlaceholderIssue::ReservedTokenNamespace {
+            range: range(*start_byte, *end_byte),
+        },
+    }
+}
+
+#[cfg(test)]
+pub(super) fn placeholder_projection_diagnostic(
+    failure: &TranslationPlaceholderProjectionFailure,
+) -> crate::diagnostic::RpgMakerPlaceholderProjectionProblem {
+    use crate::diagnostic::RpgMakerPlaceholderProjectionProblem as Problem;
+
+    match failure {
+        TranslationPlaceholderProjectionFailure::TokenIndexConstruction => {
+            Problem::TokenIndexConstruction
+        }
+        TranslationPlaceholderProjectionFailure::EmptyToken => Problem::EmptyToken,
+        TranslationPlaceholderProjectionFailure::MissingToken { token } => {
+            Problem::missing_token(token)
+        }
+        TranslationPlaceholderProjectionFailure::RepeatedToken { token } => {
+            Problem::repeated_token(token)
+        }
+        TranslationPlaceholderProjectionFailure::OverlappingToken { token } => {
+            Problem::overlapping_token(token)
+        }
+        TranslationPlaceholderProjectionFailure::ChangedTokenOrder {
+            position,
+            expected_token,
+            actual_token,
+        } => Problem::changed_token_order(*position, expected_token, actual_token),
+        TranslationPlaceholderProjectionFailure::ChangedSegmentCount { expected, actual } => {
+            Problem::ChangedSegmentCount {
+                expected: *expected,
+                actual: *actual,
+            }
+        }
+        TranslationPlaceholderProjectionFailure::ChangedSegmentKind { segment_index } => {
+            Problem::ChangedSegmentKind {
+                segment_index: *segment_index,
+            }
+        }
+        TranslationPlaceholderProjectionFailure::MissingOrderedToken { segment_index } => {
+            Problem::MissingOrderedToken {
+                segment_index: *segment_index,
+            }
+        }
+        TranslationPlaceholderProjectionFailure::UnusedOrderedToken => Problem::UnusedOrderedToken,
+    }
 }
 
 /// 规划期失败与模型响应拒绝分属不同阶段，不共享 ID、attempt 或拒绝原因。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TranslationPlanningFailureReason {
-    PlaceholderProtection { message: String },
-    PlaceholderProjection { message: String },
+    PlaceholderProtection {
+        failure: TranslationPlaceholderProtectionFailure,
+    },
+    PlaceholderProjection {
+        failure: TranslationPlaceholderProjectionFailure,
+    },
+}
+
+/// Placeholder 保护阶段对外可以安全保留的确定事实。
+///
+/// 该类型不保存原文、`Display` 正文或后端错误字符串。规则引用和匹配范围
+/// 由 Placeholder 保护算法直接建立，不从展示文本反向解析。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TranslationPlaceholderProtectionFailure {
+    WorkerStart {
+        operation: PlaceholderWorkerOperation,
+        io_kind: std::io::ErrorKind,
+        raw_os_code: Option<i32>,
+    },
+    Pcre2 {
+        rule: PlaceholderRuleReference,
+        kind: PlaceholderPcre2ErrorKind,
+        code: i32,
+        offset: Option<usize>,
+    },
+    EmptyMatch {
+        matched: PlaceholderMatchReference,
+    },
+    MissingTextCapture {
+        rule_number: usize,
+        whole_match_start_byte: usize,
+        whole_match_end_byte: usize,
+    },
+    InvalidMatchRange {
+        rule_number: usize,
+        whole_match_start_byte: usize,
+        whole_match_end_byte: usize,
+        capture_start_byte: Option<usize>,
+        capture_end_byte: Option<usize>,
+        violation: PlaceholderMatchRangeViolation,
+    },
+    OverlappingMatches {
+        first: PlaceholderMatchReference,
+        second: PlaceholderMatchReference,
+    },
+    CrossesLineBoundary {
+        matched: PlaceholderMatchReference,
+        source_line_index: usize,
+    },
+    ReservedTokenNamespace {
+        start_byte: usize,
+        end_byte: usize,
+    },
+}
+
+/// Placeholder 语言投影阶段对外可以安全保留的确定事实。
+///
+/// token 由 Placeholder 保护算法生成，不保存被保护的游戏正文。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TranslationPlaceholderProjectionFailure {
+    TokenIndexConstruction,
+    EmptyToken,
+    MissingToken {
+        token: String,
+    },
+    RepeatedToken {
+        token: String,
+    },
+    OverlappingToken {
+        token: String,
+    },
+    ChangedTokenOrder {
+        position: usize,
+        expected_token: String,
+        actual_token: String,
+    },
+    ChangedSegmentCount {
+        expected: usize,
+        actual: usize,
+    },
+    ChangedSegmentKind {
+        segment_index: usize,
+    },
+    MissingOrderedToken {
+        segment_index: usize,
+    },
+    UnusedOrderedToken,
 }
 
 /// 任务在确定计划中的序号。
@@ -1018,7 +1374,7 @@ pub(crate) struct ExpectedTranslationOutputContractTarget {
     owner: RpgMakerAssetOwner,
     group_kind: TextGroupKind,
     group_location: RpgMakerLocation,
-    role: String,
+    role: TextUnitRole,
 }
 
 impl ExpectedTranslationOutputContractTarget {
@@ -1027,26 +1383,17 @@ impl ExpectedTranslationOutputContractTarget {
             owner: identity.owner(),
             group_kind: identity.kind(),
             group_location: identity.group_location().clone(),
-            role: identity.role_label(),
+            role: identity.role().clone(),
         }
     }
 
-    fn safe_detail(&self) -> String {
-        format!(
-            "owner={}; group_kind={}; location={}; role={}",
-            self.owner.storage_name(),
-            self.group_kind.storage_name(),
-            self.group_location,
-            self.role
+    fn diagnostic_unit_locator(&self) -> RpgMakerUnitLocator {
+        RpgMakerUnitLocator::new(
+            self.owner.diagnostic_owner(),
+            self.group_kind.diagnostic_group_kind(),
+            self.group_location.diagnostic_location(),
+            self.role.diagnostic_role(),
         )
-    }
-
-    fn diagnostic_subject(&self, unit_id: TaskId) -> crate::diagnostic::DiagnosticSubject {
-        crate::diagnostic::DiagnosticSubject::operation(format!(
-            "translation_output_contract; unit={}; {}",
-            unit_id.get(),
-            self.safe_detail()
-        ))
     }
 }
 
@@ -1133,64 +1480,85 @@ impl ExpectedTranslationOutputContractError {
         }
     }
 
-    pub(crate) fn diagnostic_subject(&self) -> crate::diagnostic::DiagnosticSubject {
-        let (target, unit_id) = self.target_and_unit();
-        target.diagnostic_subject(unit_id)
+    pub(crate) fn diagnostic_unit_locator(&self) -> RpgMakerUnitLocator {
+        self.target_and_unit().0.diagnostic_unit_locator()
     }
 
-    pub(crate) fn safe_detail(&self) -> String {
-        let failure = match self {
-            Self::PropagationContextCountMismatch {
-                target_count,
-                context_count,
-                ..
-            } => format!(
-                "propagation_context_count_mismatch; targets={target_count}; contexts={context_count}"
-            ),
-            Self::PlaceholderIndexInvalid { source, .. } => format!(
-                "placeholder_index_invalid; {}",
-                super::executor::language_projection_detail(source)
-            ),
-            Self::ProtectedPlaceholderMultisetMismatch { kind, .. } => format!(
-                "protected_placeholder_multiset_mismatch; kind={}",
-                kind.as_str()
-            ),
-            Self::ProtectedPlaceholderCrossesLineBoundary {
-                placeholder_index, ..
-            } => format!(
-                "protected_placeholder_crosses_line_boundary; placeholder_index={placeholder_index}"
-            ),
-            Self::ProtectedLineCountMismatch {
-                expected, actual, ..
-            } => format!("protected_line_count_mismatch; expected={expected}; actual={actual}"),
-            Self::ScalarAlignedCountInvalid { actual, .. } => {
-                format!("scalar_aligned_count_invalid; expected=1; actual={actual}")
-            }
-            Self::LinesAlignedCountMismatch {
-                expected, actual, ..
-            } => format!("lines_aligned_count_mismatch; expected={expected}; actual={actual}"),
-        };
-        let (target, unit_id) = self.target_and_unit();
-        format!(
-            "{failure}; unit={}; {}",
-            unit_id.get(),
-            target.safe_detail()
-        )
+    pub(crate) fn diagnostic_task_id(&self) -> usize {
+        self.target_and_unit().1.get()
     }
 }
 
 impl fmt::Debug for ExpectedTranslationOutputContractError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (target, unit_id) = self.target_and_unit();
         formatter
-            .debug_tuple("ExpectedTranslationOutputContractError")
-            .field(&self.safe_detail())
-            .finish()
+            .debug_struct("ExpectedTranslationOutputContractError")
+            .field("unit_id", &unit_id.get())
+            .field("target", target)
+            .finish_non_exhaustive()
     }
 }
 
 impl fmt::Display for ExpectedTranslationOutputContractError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.safe_detail())
+        match self {
+            Self::PropagationContextCountMismatch {
+                unit_id,
+                target_count,
+                context_count,
+                ..
+            } => write!(
+                formatter,
+                "任务 {} 的传播目标有 {target_count} 项，但状态上下文有 {context_count} 项",
+                unit_id.get()
+            ),
+            Self::PlaceholderIndexInvalid { unit_id, .. } => {
+                write!(formatter, "任务 {} 的 Placeholder 索引无效", unit_id.get())
+            }
+            Self::ProtectedPlaceholderMultisetMismatch { unit_id, kind, .. } => write!(
+                formatter,
+                "任务 {} 的受保护 Placeholder 与原文不一致（{}）",
+                unit_id.get(),
+                kind.as_str()
+            ),
+            Self::ProtectedPlaceholderCrossesLineBoundary {
+                unit_id,
+                placeholder_index,
+                ..
+            } => write!(
+                formatter,
+                "任务 {} 的第 {placeholder_index} 个受保护 Placeholder 跨越了换行符",
+                unit_id.get()
+            ),
+            Self::ProtectedLineCountMismatch {
+                unit_id,
+                expected,
+                actual,
+                ..
+            } => write!(
+                formatter,
+                "任务 {} 的受保护文本应有 {expected} 行，实际为 {actual} 行",
+                unit_id.get()
+            ),
+            Self::ScalarAlignedCountInvalid {
+                unit_id, actual, ..
+            } => write!(
+                formatter,
+                "任务 {} 的标量文本只能对齐 1 行，实际为 {actual} 行",
+                unit_id.get()
+            ),
+            Self::LinesAlignedCountMismatch {
+                unit_id,
+                expected,
+                actual,
+                ..
+            } => write!(
+                formatter,
+                "任务 {} 的行数应为 {expected}，实际为 {actual}",
+                unit_id.get()
+            ),
+        }
     }
 }
 
@@ -1649,8 +2017,9 @@ pub(crate) enum TranslationUnitRejectionReason {
     Missing,
     Duplicate,
     InvalidShape {
-        message: String,
+        problem: TranslationAssistantValueError,
     },
+    InvalidResponse,
     LineCountMismatch {
         expected: usize,
         actual: usize,
@@ -1683,6 +2052,7 @@ pub(crate) enum TranslationUnitRejectionReason {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct UnresolvedTranslationUnit {
     id: TaskId,
+    unit: RpgMakerUnitLocator,
     location_count: usize,
     reason: TranslationUnitRejectionReason,
 }
@@ -1690,11 +2060,13 @@ pub(crate) struct UnresolvedTranslationUnit {
 impl UnresolvedTranslationUnit {
     pub(crate) fn new(
         id: TaskId,
+        unit: RpgMakerUnitLocator,
         propagation_target_count: usize,
         reason: TranslationUnitRejectionReason,
     ) -> Self {
         Self {
             id,
+            unit,
             location_count: 1 + propagation_target_count,
             reason,
         }
@@ -1704,6 +2076,14 @@ impl UnresolvedTranslationUnit {
         self.id
     }
 
+    /// 这个拒绝仍持有的完整 RPG Maker Unit 定位。
+    ///
+    /// Executor 在验收候选时建立它，后续诊断只能消费该事实，不能再按 ID 回查
+    /// 可变计划或从展示文本猜测位置。
+    pub(crate) fn unit(&self) -> &RpgMakerUnitLocator {
+        &self.unit
+    }
+
     pub(crate) fn reason(&self) -> &TranslationUnitRejectionReason {
         &self.reason
     }
@@ -1711,15 +2091,51 @@ impl UnresolvedTranslationUnit {
     pub(crate) const fn location_count(&self) -> usize {
         self.location_count
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        id: TaskId,
+        propagation_target_count: usize,
+        reason: TranslationUnitRejectionReason,
+    ) -> Self {
+        use crate::diagnostic::{
+            RpgMakerDiagnosticGroupKind, RpgMakerDiagnosticLocation, RpgMakerDiagnosticOwner,
+            RpgMakerDiagnosticRole, RpgMakerDiagnosticSource,
+        };
+
+        Self::new(
+            id,
+            RpgMakerUnitLocator::new(
+                RpgMakerDiagnosticOwner::Builtin,
+                RpgMakerDiagnosticGroupKind::DatabaseEntry,
+                RpgMakerDiagnosticLocation::new(
+                    RpgMakerDiagnosticSource::data("Items.json"),
+                    Vec::new(),
+                ),
+                RpgMakerDiagnosticRole::scalar("description"),
+            ),
+            propagation_target_count,
+            reason,
+        )
+    }
 }
 
 /// 无法绑定为某个可写译文、但必须进入结构化运行诊断的模型协议事实。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TranslationProtocolDiagnostic {
-    NonStopFinish { reason: String },
-    InvalidResponse { message: String },
-    InvalidId { item_index: usize },
-    UnknownId { item_index: usize, id: TaskId },
+    NonStopFinish {
+        reason: RpgMakerModelNonStopFinishReason,
+    },
+    InvalidResponse {
+        error: TranslationTaskResponseParseError,
+    },
+    InvalidId {
+        item_index: usize,
+    },
+    UnknownId {
+        item_index: usize,
+        id: TaskId,
+    },
 }
 
 /// 一个任务没有任何可用译文的正常原因。
@@ -1728,12 +2144,12 @@ pub(crate) enum TranslationTaskUnavailableReason {
     ModelResponseUnusable,
     AllOutputsRejected,
     RecoverableRequestExhausted {
-        diagnostic: SafeDiagnostic,
+        diagnostic: DiagnosticReport,
     },
     RetryAfterExceedsConfiguredMaximum {
         retry_after: Duration,
         maximum: Duration,
-        diagnostic: SafeDiagnostic,
+        diagnostic: DiagnosticReport,
     },
 }
 
@@ -1879,22 +2295,6 @@ impl TranslationTaskOutcome {
         &self.context().diagnostics
     }
 
-    /// 网络预算耗尽仍作为正常任务结果保留时，对应的安全、具体请求诊断。
-    pub(crate) fn request_diagnostic(&self) -> Option<&SafeDiagnostic> {
-        match self {
-            Self::Unavailable {
-                reason:
-                    TranslationTaskUnavailableReason::RecoverableRequestExhausted { diagnostic }
-                    | TranslationTaskUnavailableReason::RetryAfterExceedsConfiguredMaximum {
-                        diagnostic,
-                        ..
-                    },
-                ..
-            } => Some(diagnostic),
-            Self::Complete { .. } | Self::Partial { .. } | Self::Unavailable { .. } => None,
-        }
-    }
-
     pub(crate) fn accepted_location_count(&self) -> usize {
         self.accepted()
             .iter()
@@ -1907,6 +2307,281 @@ impl TranslationTaskOutcome {
             .iter()
             .map(UnresolvedTranslationUnit::location_count)
             .sum()
+    }
+}
+
+/// 将模型响应协议与单元验收仍持有的事实一次性投影成公开诊断。
+///
+/// 这必须发生在有完整 TaskBlock 和 Unit locator 的编排边界；项目日志和 CLI 只引用
+/// 这里建立的 occurrence，不能由业务结果反推一个笼统的运行时错误。
+fn task_response_report(
+    scope: RpgMakerResponseProcessingScope,
+    problem: RpgMakerTaskResponseProblem,
+) -> DiagnosticReport {
+    DiagnosticReport::new(
+        StateEffect::ProgressPreserved,
+        Diagnostic::rpg_maker(RpgMakerIssue::task_response(scope, problem)),
+    )
+}
+
+/// 有序执行器在仍掌握计划位置时拒绝错序或缺失结果。
+///
+/// 这不是运行时字符串协议：RPG Maker 诊断保留期望与实际任务序号，终端错误和任务
+/// 事件复用同一份报告。
+fn task_result_sequence_report(
+    expected_task_index: RpgMakerTranslationTaskIndex,
+    actual_task_index: Option<RpgMakerTranslationTaskIndex>,
+) -> DiagnosticReport {
+    let problem = match actual_task_index {
+        Some(actual_task_index) => RpgMakerResponseInvariantProblem::TaskResultIndexMismatch {
+            expected_task_index: expected_task_index.get(),
+            actual_task_index: actual_task_index.get(),
+        },
+        None => RpgMakerResponseInvariantProblem::TaskResultSequenceIncomplete {
+            expected_task_index: expected_task_index.get(),
+        },
+    };
+    DiagnosticReport::new(
+        StateEffect::ProgressPreserved,
+        Diagnostic::rpg_maker(RpgMakerIssue::response_processing(
+            RpgMakerResponseProcessingScope::task(expected_task_index.get()),
+            RpgMakerResponseProcessingProblem::InternalInvariant { problem },
+        )),
+    )
+}
+
+fn task_response_parse_problem(
+    error: TranslationTaskResponseParseError,
+) -> RpgMakerTaskResponseProblem {
+    match error.kind() {
+        TranslationTaskResponseParseErrorKind::Json(category) => {
+            RpgMakerTaskResponseProblem::InvalidJson {
+                category: match category {
+                    TranslationTaskResponseJsonErrorCategory::Io => {
+                        RpgMakerTaskResponseJsonCategory::Io
+                    }
+                    TranslationTaskResponseJsonErrorCategory::Syntax => {
+                        RpgMakerTaskResponseJsonCategory::Syntax
+                    }
+                    TranslationTaskResponseJsonErrorCategory::Shape => {
+                        RpgMakerTaskResponseJsonCategory::Shape
+                    }
+                    TranslationTaskResponseJsonErrorCategory::UnexpectedEof => {
+                        RpgMakerTaskResponseJsonCategory::UnexpectedEof
+                    }
+                },
+                line: error.line().get(),
+                column: error.column().get(),
+            }
+        }
+        TranslationTaskResponseParseErrorKind::ThinkingEmpty => {
+            RpgMakerTaskResponseProblem::ThinkingEmpty {
+                line: error.line().get(),
+                column: error.column().get(),
+            }
+        }
+    }
+}
+
+fn task_response_value_problem(
+    problem: TranslationAssistantValueError,
+) -> RpgMakerTaskResponseValueProblem {
+    match problem {
+        TranslationAssistantValueError::NotStringArray => {
+            RpgMakerTaskResponseValueProblem::TranslationNotArray
+        }
+        TranslationAssistantValueError::NonStringItem { item } => {
+            RpgMakerTaskResponseValueProblem::TranslationNonStringItem { item: item.get() }
+        }
+        TranslationAssistantValueError::SourceEchoNotObject => {
+            RpgMakerTaskResponseValueProblem::SourceEchoNotObject
+        }
+        TranslationAssistantValueError::SourceEchoMissingSource => {
+            RpgMakerTaskResponseValueProblem::SourceEchoMissingSource
+        }
+        TranslationAssistantValueError::SourceEchoMissingTranslation => {
+            RpgMakerTaskResponseValueProblem::SourceEchoMissingTranslation
+        }
+        TranslationAssistantValueError::SourceEchoDuplicateSource => {
+            RpgMakerTaskResponseValueProblem::SourceEchoDuplicateSource
+        }
+        TranslationAssistantValueError::SourceEchoDuplicateTranslation => {
+            RpgMakerTaskResponseValueProblem::SourceEchoDuplicateTranslation
+        }
+        TranslationAssistantValueError::SourceEchoUnexpectedField => {
+            RpgMakerTaskResponseValueProblem::SourceEchoUnexpectedField
+        }
+        TranslationAssistantValueError::SourceNotStringArray => {
+            RpgMakerTaskResponseValueProblem::SourceNotArray
+        }
+        TranslationAssistantValueError::SourceNonStringItem { item } => {
+            RpgMakerTaskResponseValueProblem::SourceNonStringItem { item: item.get() }
+        }
+    }
+}
+
+fn task_response_unit_problem(
+    reason: &TranslationUnitRejectionReason,
+) -> Option<RpgMakerTaskResponseUnitProblem> {
+    Some(match reason {
+        TranslationUnitRejectionReason::Missing => RpgMakerTaskResponseUnitProblem::Missing,
+        TranslationUnitRejectionReason::Duplicate => RpgMakerTaskResponseUnitProblem::Duplicate,
+        TranslationUnitRejectionReason::InvalidShape { problem } => {
+            RpgMakerTaskResponseUnitProblem::InvalidValue {
+                problem: task_response_value_problem(*problem),
+            }
+        }
+        // JSON/Thinking 解析失败属于整个 TaskBlock，已经由协议诊断精确表达；不能伪造
+        // 每个 Unit 各自发生了形状错误。
+        TranslationUnitRejectionReason::InvalidResponse => return None,
+        TranslationUnitRejectionReason::LineCountMismatch { expected, actual } => {
+            RpgMakerTaskResponseUnitProblem::LineCountMismatch {
+                expected: *expected,
+                actual: *actual,
+            }
+        }
+        TranslationUnitRejectionReason::InvalidLineText { line_index } => {
+            RpgMakerTaskResponseUnitProblem::InvalidLineText {
+                line_index: *line_index,
+            }
+        }
+        TranslationUnitRejectionReason::BlankLineMismatch {
+            line_index,
+            expected_blank,
+        } => RpgMakerTaskResponseUnitProblem::BlankLineMismatch {
+            line_index: *line_index,
+            expected_blank: *expected_blank,
+        },
+        TranslationUnitRejectionReason::BlankTranslation => {
+            RpgMakerTaskResponseUnitProblem::BlankTranslation
+        }
+        TranslationUnitRejectionReason::NoNaturalLanguageText => {
+            RpgMakerTaskResponseUnitProblem::NoNaturalLanguageText
+        }
+        TranslationUnitRejectionReason::ContainsByteOrderMark => {
+            RpgMakerTaskResponseUnitProblem::ContainsByteOrderMark
+        }
+        TranslationUnitRejectionReason::PlaceholderMismatch { .. } => {
+            RpgMakerTaskResponseUnitProblem::PlaceholderMismatch
+        }
+        TranslationUnitRejectionReason::UnexpectedPlaceholderToken { .. } => {
+            RpgMakerTaskResponseUnitProblem::UnexpectedPlaceholderToken
+        }
+        TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous { .. } => {
+            RpgMakerTaskResponseUnitProblem::PlaceholderNormalizationAmbiguous
+        }
+        TranslationUnitRejectionReason::SourceResidual { .. } => {
+            RpgMakerTaskResponseUnitProblem::SourceResidual
+        }
+    })
+}
+
+fn task_response_protocol_report(
+    task_index: RpgMakerTranslationTaskIndex,
+    diagnostic: &TranslationProtocolDiagnostic,
+) -> DiagnosticReport {
+    let problem = match diagnostic {
+        TranslationProtocolDiagnostic::NonStopFinish { reason } => {
+            RpgMakerTaskResponseProblem::NonStopFinish {
+                reason: reason.clone(),
+            }
+        }
+        TranslationProtocolDiagnostic::InvalidResponse { error } => {
+            task_response_parse_problem(*error)
+        }
+        TranslationProtocolDiagnostic::InvalidId { item_index } => {
+            RpgMakerTaskResponseProblem::InvalidId {
+                item_index: *item_index,
+            }
+        }
+        TranslationProtocolDiagnostic::UnknownId { item_index, id } => {
+            RpgMakerTaskResponseProblem::UnknownId {
+                item_index: *item_index,
+                output_id: id.get(),
+            }
+        }
+    };
+    task_response_report(
+        RpgMakerResponseProcessingScope::task(task_index.get()),
+        problem,
+    )
+}
+
+fn task_response_unit_report(
+    task_index: RpgMakerTranslationTaskIndex,
+    unresolved: &UnresolvedTranslationUnit,
+) -> Option<DiagnosticReport> {
+    let problem = task_response_unit_problem(unresolved.reason())?;
+    Some(task_response_report(
+        RpgMakerResponseProcessingScope::unit(task_index.get(), unresolved.unit().clone()),
+        RpgMakerTaskResponseProblem::UnitRejected {
+            output_id: unresolved.id().get(),
+            problem,
+        },
+    ))
+}
+
+/// 为本次正常业务结果取得它全部、且不泄露模型正文的诊断。
+///
+/// `Partial` 与 `Unavailable` 必定至少产生一条报告：前者来自被拒绝 Unit，后者来自
+/// 解析、请求或全部拒绝事实。因此 ProjectLog 不再需要用内部不变量补洞。
+fn task_outcome_diagnostics(
+    task: &RpgMakerExecutableTask,
+    outcome: &TranslationTaskOutcome,
+) -> Vec<DiagnosticReport> {
+    let task_index = task.index();
+    let protocol_reports = || {
+        outcome
+            .diagnostics()
+            .iter()
+            .map(|diagnostic| task_response_protocol_report(task_index, diagnostic))
+            .collect::<Vec<_>>()
+    };
+    let unit_reports = || {
+        outcome
+            .unresolved()
+            .iter()
+            .filter_map(|unresolved| task_response_unit_report(task_index, unresolved))
+            .collect::<Vec<_>>()
+    };
+
+    match outcome {
+        TranslationTaskOutcome::Complete { .. } => protocol_reports(),
+        TranslationTaskOutcome::Partial { .. } => {
+            let mut reports = unit_reports();
+            reports.extend(protocol_reports());
+            debug_assert!(!reports.is_empty());
+            reports
+        }
+        TranslationTaskOutcome::Unavailable { reason, .. } => match reason {
+            TranslationTaskUnavailableReason::RecoverableRequestExhausted { diagnostic }
+            | TranslationTaskUnavailableReason::RetryAfterExceedsConfiguredMaximum {
+                diagnostic,
+                ..
+            } => vec![diagnostic.clone()],
+            TranslationTaskUnavailableReason::ModelResponseUnusable => {
+                let reports = protocol_reports();
+                if reports.is_empty() {
+                    vec![task_response_report(
+                        RpgMakerResponseProcessingScope::task(task_index.get()),
+                        RpgMakerTaskResponseProblem::ModelResponseUnusable,
+                    )]
+                } else {
+                    reports
+                }
+            }
+            TranslationTaskUnavailableReason::AllOutputsRejected => {
+                let mut reports = unit_reports();
+                reports.extend(protocol_reports());
+                if reports.is_empty() {
+                    reports.push(task_response_report(
+                        RpgMakerResponseProcessingScope::task(task_index.get()),
+                        RpgMakerTaskResponseProblem::AllOutputsRejected,
+                    ));
+                }
+                reports
+            }
+        },
     }
 }
 
@@ -2160,8 +2835,9 @@ pub(crate) trait RpgMakerTranslation: Send + Sync {
 /// RPG Maker 翻译向普通 JSONL 可观测性边界提交的摘要业务事实。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RpgMakerTranslationLogEvent {
-    PlanningUnresolved {
-        units: usize,
+    PlanningCompleted {
+        total_tasks: usize,
+        unresolved_units: usize,
     },
     TaskStarted {
         task_index: RpgMakerTranslationTaskIndex,
@@ -2172,20 +2848,79 @@ pub(crate) enum RpgMakerTranslationLogEvent {
         outcome: RpgMakerTranslationLogTaskOutcome,
         attempts: Option<NonZeroUsize>,
         retry_exhausted: bool,
-        diagnostic: Option<SafeDiagnostic>,
     },
 }
 
+/// 一个业务终态必须引用的一组诊断。
+///
+/// 首项是该 TaskFinished 的主 occurrence，余项是同一响应中其余被拒绝 Unit 或协议
+/// 问题。调用方不能构造空集合。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RpgMakerTaskDiagnosticReports {
+    primary: DiagnosticReport,
+    related: Vec<DiagnosticReport>,
+}
+
+impl RpgMakerTaskDiagnosticReports {
+    fn from_reports(reports: Vec<DiagnosticReport>) -> Self {
+        let mut reports = reports.into_iter();
+        let primary = reports
+            .next()
+            .expect("部分、不可用或失败的 RPG Maker 翻译任务必须在拥有原始边界事实时建立诊断");
+        Self {
+            primary,
+            related: reports.collect(),
+        }
+    }
+
+    fn reports(&self) -> impl Iterator<Item = &DiagnosticReport> {
+        std::iter::once(&self.primary).chain(self.related.iter())
+    }
+}
+
 /// 一项任务在顺序最终化边界得到的可观察终态。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RpgMakerTranslationLogTaskOutcome {
-    Complete,
-    Partial,
-    Unavailable,
-    ExecutionFailed,
-    CommitFailed,
-    NotCommitted,
-    InvalidResult,
+    Complete {
+        diagnostics: Vec<DiagnosticReport>,
+    },
+    Partial {
+        diagnostics: RpgMakerTaskDiagnosticReports,
+    },
+    Unavailable {
+        diagnostics: RpgMakerTaskDiagnosticReports,
+    },
+    ExecutionFailed {
+        diagnostic: DiagnosticReport,
+    },
+    CommitFailed {
+        diagnostic: DiagnosticReport,
+    },
+    Cancelled,
+    NotCommittedAfterEarlierFailure {
+        /// 导致当前任务不再提交的首个真实失败；ProjectLog 复用其既有 occurrence。
+        cause: DiagnosticReport,
+    },
+    InvalidResult {
+        diagnostic: DiagnosticReport,
+    },
+}
+
+impl RpgMakerTranslationLogTaskOutcome {
+    pub(crate) fn diagnostics(&self) -> Box<dyn Iterator<Item = &DiagnosticReport> + '_> {
+        match self {
+            Self::Complete { diagnostics } => Box::new(diagnostics.iter()),
+            Self::Partial { diagnostics } | Self::Unavailable { diagnostics } => {
+                Box::new(diagnostics.reports())
+            }
+            Self::ExecutionFailed { diagnostic }
+            | Self::CommitFailed { diagnostic }
+            | Self::InvalidResult { diagnostic } => Box::new(std::iter::once(diagnostic)),
+            Self::Cancelled | Self::NotCommittedAfterEarlierFailure { .. } => {
+                Box::new(std::iter::empty())
+            }
+        }
+    }
 }
 
 /// 同步、不可失败的 RPG Maker 翻译观察入口。
@@ -2203,8 +2938,11 @@ enum TranslationTaskStageError<E, S> {
     Execution {
         source: E,
         evidence: TranslationTaskExecutionEvidence,
-        diagnostic: Option<SafeDiagnostic>,
-        cancelled: bool,
+        diagnostic: DiagnosticReport,
+    },
+    Cancelled {
+        source: E,
+        evidence: TranslationTaskExecutionEvidence,
     },
     InvalidResult {
         actual_task_index: RpgMakerTranslationTaskIndex,
@@ -2223,14 +2961,17 @@ enum TranslationTaskPipelineError<E, S> {
     ExecuteTask {
         task_index: RpgMakerTranslationTaskIndex,
         source: E,
+        diagnostic: DiagnosticReport,
     },
     CommitTask {
         task_index: RpgMakerTranslationTaskIndex,
         source: S,
+        diagnostic: DiagnosticReport,
     },
     InvalidTaskResultSequence {
         expected_task_index: RpgMakerTranslationTaskIndex,
         actual_task_index: Option<RpgMakerTranslationTaskIndex>,
+        diagnostic: DiagnosticReport,
     },
 }
 
@@ -2241,13 +2982,17 @@ where
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ExecuteTask { task_index, source } => {
+            Self::ExecuteTask {
+                task_index, source, ..
+            } => {
                 write!(
                     formatter,
                     "RPG Maker 翻译任务 {task_index} 执行失败：{source}"
                 )
             }
-            Self::CommitTask { task_index, source } => {
+            Self::CommitTask {
+                task_index, source, ..
+            } => {
                 write!(
                     formatter,
                     "RPG Maker 翻译任务 {task_index} 提交失败：{source}"
@@ -2256,6 +3001,7 @@ where
             Self::InvalidTaskResultSequence {
                 expected_task_index,
                 actual_task_index: Some(actual_task_index),
+                ..
             } => write!(
                 formatter,
                 "RPG Maker 翻译结果序列损坏：期待任务 {expected_task_index}，却收到任务 {actual_task_index}"
@@ -2263,6 +3009,7 @@ where
             Self::InvalidTaskResultSequence {
                 expected_task_index,
                 actual_task_index: None,
+                ..
             } => write!(
                 formatter,
                 "RPG Maker 翻译结果序列不完整：执行通道在任务 {expected_task_index} 返回前关闭"
@@ -2363,6 +3110,7 @@ where
     project: &'a OpenedProject,
     profile: &'a P::Profile,
     total_tasks: usize,
+    prior_failure_diagnostic: Mutex<Option<DiagnosticReport>>,
 }
 
 impl<R, P, E, S, J, K> OrderedExecutionHandler<RpgMakerExecutableTask>
@@ -2396,14 +3144,17 @@ where
 
         match self.service.task_executor.execute(self.profile, task).await {
             Ok(execution) => Ok(execution),
-            Err(failure) => {
-                let (source, evidence, diagnostic, cancelled) = failure.into_parts();
-                Err(TranslationTaskStageError::Execution {
-                    source,
-                    evidence,
-                    diagnostic,
-                    cancelled,
-                })
+            Err(TranslationTaskExecutionFailure::Failed {
+                source,
+                evidence,
+                diagnostic,
+            }) => Err(TranslationTaskStageError::Execution {
+                source,
+                evidence,
+                diagnostic,
+            }),
+            Err(TranslationTaskExecutionFailure::Cancelled { source, evidence }) => {
+                Err(TranslationTaskStageError::Cancelled { source, evidence })
             }
         }
     }
@@ -2464,68 +3215,75 @@ where
                 source,
                 evidence,
                 diagnostic,
-                cancelled,
             }) => {
                 let attempts = NonZeroUsize::new(evidence.attempt_count());
-                if cancelled {
-                    self.service
-                        .event_log
-                        .emit(RpgMakerTranslationLogEvent::TaskFinished {
-                            task_index: scheduled_task_index,
-                            outcome: RpgMakerTranslationLogTaskOutcome::NotCommitted,
-                            attempts,
-                            retry_exhausted: false,
-                            diagnostic: diagnostic.clone(),
-                        });
-                    self.service.record_task(|| {
-                        TranslationTaskRecordDocument::new(
-                            self.total_tasks,
-                            task,
-                            evidence,
-                            TranslationTaskRecordFinalState::CancelledNoChanges { outcome: None },
-                        )
-                    });
-                    drop(source);
-                    Ok(())
-                } else {
-                    self.service
-                        .event_log
-                        .emit(RpgMakerTranslationLogEvent::TaskFinished {
-                            task_index: scheduled_task_index,
-                            outcome: RpgMakerTranslationLogTaskOutcome::ExecutionFailed,
-                            attempts,
-                            retry_exhausted: false,
-                            diagnostic: diagnostic.clone(),
-                        });
-                    self.service.record_task(|| {
-                        TranslationTaskRecordDocument::new(
-                            self.total_tasks,
-                            task,
-                            evidence,
-                            TranslationTaskRecordFinalState::ExecutionFailedNoChanges {
-                                diagnostic,
-                            },
-                        )
-                    });
-                    Err(TranslationTaskPipelineError::ExecuteTask {
+                self.remember_failure_diagnostic(&diagnostic);
+                self.service
+                    .event_log
+                    .emit(RpgMakerTranslationLogEvent::TaskFinished {
                         task_index: scheduled_task_index,
-                        source,
-                    })
-                }
+                        outcome: RpgMakerTranslationLogTaskOutcome::ExecutionFailed {
+                            diagnostic: diagnostic.clone(),
+                        },
+                        attempts,
+                        retry_exhausted: false,
+                    });
+                self.service.record_task(|| {
+                    TranslationTaskRecordDocument::new(
+                        self.total_tasks,
+                        task,
+                        evidence,
+                        TranslationTaskRecordFinalState::ExecutionFailedNoChanges {
+                            diagnostic: diagnostic.clone(),
+                        },
+                    )
+                });
+                Err(TranslationTaskPipelineError::ExecuteTask {
+                    task_index: scheduled_task_index,
+                    source,
+                    diagnostic,
+                })
             }
-            OrderedTaskResult::PreparationFailed(TranslationTaskStageError::InvalidResult {
-                actual_task_index,
-                outcome,
+            OrderedTaskResult::ExecutionFailed(TranslationTaskStageError::Cancelled {
+                source,
                 evidence,
             }) => {
                 self.service
                     .event_log
                     .emit(RpgMakerTranslationLogEvent::TaskFinished {
                         task_index: scheduled_task_index,
-                        outcome: RpgMakerTranslationLogTaskOutcome::InvalidResult,
+                        outcome: RpgMakerTranslationLogTaskOutcome::Cancelled,
+                        attempts: NonZeroUsize::new(evidence.attempt_count()),
+                        retry_exhausted: false,
+                    });
+                self.service.record_task(|| {
+                    TranslationTaskRecordDocument::new(
+                        self.total_tasks,
+                        task,
+                        evidence,
+                        TranslationTaskRecordFinalState::CancelledNoChanges { outcome: None },
+                    )
+                });
+                drop(source);
+                Ok(())
+            }
+            OrderedTaskResult::PreparationFailed(TranslationTaskStageError::InvalidResult {
+                actual_task_index,
+                outcome,
+                evidence,
+            }) => {
+                let diagnostic =
+                    task_result_sequence_report(scheduled_task_index, Some(actual_task_index));
+                self.remember_failure_diagnostic(&diagnostic);
+                self.service
+                    .event_log
+                    .emit(RpgMakerTranslationLogEvent::TaskFinished {
+                        task_index: scheduled_task_index,
+                        outcome: RpgMakerTranslationLogTaskOutcome::InvalidResult {
+                            diagnostic: diagnostic.clone(),
+                        },
                         attempts: Some(outcome.attempts()),
                         retry_exhausted: false,
-                        diagnostic: None,
                     });
                 self.service.record_task(|| {
                     TranslationTaskRecordDocument::new(
@@ -2534,12 +3292,14 @@ where
                         evidence,
                         TranslationTaskRecordFinalState::InvalidResultNoChanges {
                             outcome: Arc::clone(&outcome),
+                            diagnostic: diagnostic.clone(),
                         },
                     )
                 });
                 Err(TranslationTaskPipelineError::InvalidTaskResultSequence {
                     expected_task_index: scheduled_task_index,
                     actual_task_index: Some(actual_task_index),
+                    diagnostic,
                 })
             }
             OrderedTaskResult::PreparationFailed(
@@ -2655,6 +3415,24 @@ where
     J: RpgMakerTranslationLog,
     K: TranslationTaskRecordSink,
 {
+    fn remember_failure_diagnostic(&self, diagnostic: &DiagnosticReport) {
+        let mut prior = self
+            .prior_failure_diagnostic
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if prior.is_none() {
+            *prior = Some(diagnostic.clone());
+        }
+    }
+
+    fn prior_failure_diagnostic(&self) -> DiagnosticReport {
+        self.prior_failure_diagnostic
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("前序失败后停止提交的任务必须保留首个失败诊断")
+    }
+
     fn record_not_applied(
         &self,
         task: RpgMakerExecutableTask,
@@ -2663,14 +3441,32 @@ where
         kind: TranslationTaskRecordFinalStateKind,
     ) {
         let task_index = task.index();
+        let prior_failure = match kind {
+            TranslationTaskRecordFinalStateKind::Cancelled => None,
+            TranslationTaskRecordFinalStateKind::EarlierFailure => {
+                Some(self.prior_failure_diagnostic())
+            }
+        };
+        let observed_outcome = match kind {
+            TranslationTaskRecordFinalStateKind::Cancelled => {
+                RpgMakerTranslationLogTaskOutcome::Cancelled
+            }
+            TranslationTaskRecordFinalStateKind::EarlierFailure => {
+                RpgMakerTranslationLogTaskOutcome::NotCommittedAfterEarlierFailure {
+                    cause: prior_failure
+                        .as_ref()
+                        .expect("前序失败终态必须持有其原始诊断")
+                        .clone(),
+                }
+            }
+        };
         self.service
             .event_log
             .emit(RpgMakerTranslationLogEvent::TaskFinished {
                 task_index,
-                outcome: RpgMakerTranslationLogTaskOutcome::NotCommitted,
+                outcome: observed_outcome,
                 attempts: Some(outcome.attempts()),
                 retry_exhausted: false,
-                diagnostic: None,
             });
         let state = match kind {
             TranslationTaskRecordFinalStateKind::Cancelled => {
@@ -2681,6 +3477,7 @@ where
             TranslationTaskRecordFinalStateKind::EarlierFailure => {
                 TranslationTaskRecordFinalState::NotCommittedAfterEarlierFailure {
                     outcome: Arc::clone(&outcome),
+                    diagnostic: prior_failure.expect("前序失败终态必须持有其原始诊断"),
                 }
             }
         };
@@ -2699,34 +3496,40 @@ where
     ) -> Result<(), TranslationTaskPipelineError<E::Error, S::Error>> {
         let task_index = task.index();
         let (source, impact, diagnostic) = failure.into_parts();
+        self.remember_failure_diagnostic(&diagnostic);
         self.service
             .event_log
             .emit(RpgMakerTranslationLogEvent::TaskFinished {
                 task_index,
-                outcome: RpgMakerTranslationLogTaskOutcome::CommitFailed,
+                outcome: RpgMakerTranslationLogTaskOutcome::CommitFailed {
+                    diagnostic: diagnostic.clone(),
+                },
                 attempts: Some(outcome.attempts()),
                 retry_exhausted: false,
-                diagnostic: diagnostic.clone(),
             });
         let state = match impact {
             TranslationTaskCommitFailureImpact::NotApplied => {
                 TranslationTaskRecordFinalState::CommitNotApplied {
                     outcome: Arc::clone(&outcome),
                     phase,
-                    diagnostic,
+                    diagnostic: diagnostic.clone(),
                 }
             }
             TranslationTaskCommitFailureImpact::OutcomeUnknown => {
                 TranslationTaskRecordFinalState::CommitOutcomeUnknown {
                     outcome: Arc::clone(&outcome),
-                    diagnostic,
+                    diagnostic: diagnostic.clone(),
                 }
             }
         };
         self.service.record_task(|| {
             TranslationTaskRecordDocument::new(self.total_tasks, task, evidence, state)
         });
-        Err(TranslationTaskPipelineError::CommitTask { task_index, source })
+        Err(TranslationTaskPipelineError::CommitTask {
+            task_index,
+            source,
+            diagnostic,
+        })
     }
 
     fn record_success(
@@ -2746,11 +3549,22 @@ where
                 ..
             }
         );
+        // 任务记录与项目日志必须消费同一份在 Task/Unit 定位仍完整时建立的诊断，不能
+        // 各自从 Outcome 的展示枚举重新推导原因。
+        let diagnostics = task_outcome_diagnostics(&task, outcome.as_ref());
         let observed_outcome = match outcome.as_ref() {
-            TranslationTaskOutcome::Complete { .. } => RpgMakerTranslationLogTaskOutcome::Complete,
-            TranslationTaskOutcome::Partial { .. } => RpgMakerTranslationLogTaskOutcome::Partial,
+            TranslationTaskOutcome::Complete { .. } => {
+                RpgMakerTranslationLogTaskOutcome::Complete {
+                    diagnostics: diagnostics.clone(),
+                }
+            }
+            TranslationTaskOutcome::Partial { .. } => RpgMakerTranslationLogTaskOutcome::Partial {
+                diagnostics: RpgMakerTaskDiagnosticReports::from_reports(diagnostics.clone()),
+            },
             TranslationTaskOutcome::Unavailable { .. } => {
-                RpgMakerTranslationLogTaskOutcome::Unavailable
+                RpgMakerTranslationLogTaskOutcome::Unavailable {
+                    diagnostics: RpgMakerTaskDiagnosticReports::from_reports(diagnostics.clone()),
+                }
             }
         };
         self.service
@@ -2760,7 +3574,6 @@ where
                 outcome: observed_outcome,
                 attempts: Some(outcome.attempts()),
                 retry_exhausted,
-                diagnostic: outcome.request_diagnostic().cloned(),
             });
         let state = match outcome.as_ref() {
             TranslationTaskOutcome::Complete { .. } => {
@@ -2781,6 +3594,7 @@ where
         };
         self.service.record_task(|| {
             TranslationTaskRecordDocument::new(self.total_tasks, task, evidence, state)
+                .with_outcome_diagnostics(diagnostics)
         });
     }
 }
@@ -2788,6 +3602,7 @@ where
 fn translation_stage_error_kind<E, S>(error: &TranslationTaskStageError<E, S>) -> &'static str {
     match error {
         TranslationTaskStageError::Execution { .. } => "execution",
+        TranslationTaskStageError::Cancelled { .. } => "cancelled",
         TranslationTaskStageError::InvalidResult { .. } => "invalid_result",
         TranslationTaskStageError::CommitPreparation { .. } => "commit_preparation",
     }
@@ -2850,17 +3665,16 @@ where
             );
             report.record_planning_failures(&planning_failures);
 
+            self.event_log
+                .emit(RpgMakerTranslationLogEvent::PlanningCompleted {
+                    total_tasks: tasks.len(),
+                    unresolved_units: planning_failures.len(),
+                });
+
             self.result_store
                 .apply_preparation(project, preparation)
                 .await
                 .map_err(RpgMakerTranslationServiceError::ApplyPreparation)?;
-
-            if !planning_failures.is_empty() {
-                self.event_log
-                    .emit(RpgMakerTranslationLogEvent::PlanningUnresolved {
-                        units: planning_failures.len(),
-                    });
-            }
 
             if self.cancellation.is_requested() {
                 return Ok(OperationCompletion::Cancelled);
@@ -2872,6 +3686,7 @@ where
                 project,
                 profile,
                 total_tasks: task_count,
+                prior_failure_diagnostic: Mutex::new(None),
             };
             let limits = OrderedExecutionLimits::new(
                 profile.max_concurrent_requests(),
@@ -2881,27 +3696,51 @@ where
                 .await
                 .map_err(|failure| match failure {
                     OrderedExecutionError::Finalization { source, .. } => match source {
-                        TranslationTaskPipelineError::ExecuteTask { task_index, source } => {
-                            RpgMakerTranslationServiceError::ExecuteTask { task_index, source }
-                        }
-                        TranslationTaskPipelineError::CommitTask { task_index, source } => {
-                            RpgMakerTranslationServiceError::CommitTask { task_index, source }
-                        }
+                        TranslationTaskPipelineError::ExecuteTask {
+                            task_index,
+                            source,
+                            diagnostic,
+                        } => RpgMakerTranslationServiceError::ExecuteTask {
+                            task_index,
+                            source,
+                            diagnostic,
+                        },
+                        TranslationTaskPipelineError::CommitTask {
+                            task_index,
+                            source,
+                            diagnostic,
+                        } => RpgMakerTranslationServiceError::CommitTask {
+                            task_index,
+                            source,
+                            diagnostic,
+                        },
                         TranslationTaskPipelineError::InvalidTaskResultSequence {
                             expected_task_index,
                             actual_task_index,
+                            diagnostic,
                         } => RpgMakerTranslationServiceError::InvalidTaskResultSequence {
                             expected_task_index,
                             actual_task_index,
+                            diagnostic,
                         },
                     },
                     OrderedExecutionError::IncompleteResultSequence {
                         expected_ordinal,
                         actual_ordinal,
-                    } => RpgMakerTranslationServiceError::InvalidTaskResultSequence {
-                        expected_task_index: RpgMakerTranslationTaskIndex::new(expected_ordinal),
-                        actual_task_index: actual_ordinal.map(RpgMakerTranslationTaskIndex::new),
-                    },
+                    } => {
+                        let expected_task_index =
+                            RpgMakerTranslationTaskIndex::new(expected_ordinal);
+                        let actual_task_index =
+                            actual_ordinal.map(RpgMakerTranslationTaskIndex::new);
+                        RpgMakerTranslationServiceError::InvalidTaskResultSequence {
+                            expected_task_index,
+                            actual_task_index,
+                            diagnostic: task_result_sequence_report(
+                                expected_task_index,
+                                actual_task_index,
+                            ),
+                        }
+                    }
                 })?;
             Ok(completion)
         }
@@ -2932,14 +3771,18 @@ pub(crate) enum RpgMakerTranslationServiceError<R, P, E, S> {
     ExecuteTask {
         task_index: RpgMakerTranslationTaskIndex,
         source: E,
+        /// 任务仍持有 Planner Task/Unit 定位时建立的安全诊断。
+        diagnostic: DiagnosticReport,
     },
     CommitTask {
         task_index: RpgMakerTranslationTaskIndex,
         source: S,
+        diagnostic: DiagnosticReport,
     },
     InvalidTaskResultSequence {
         expected_task_index: RpgMakerTranslationTaskIndex,
         actual_task_index: Option<RpgMakerTranslationTaskIndex>,
+        diagnostic: DiagnosticReport,
     },
     FinalizeResultStore(S),
     OperationAndFinalization {
@@ -2964,13 +3807,17 @@ where
             Self::ApplyPreparation(source) => {
                 write!(formatter, "无法应用 RPG Maker 翻译准备：{source}")
             }
-            Self::ExecuteTask { task_index, source } => {
+            Self::ExecuteTask {
+                task_index, source, ..
+            } => {
                 write!(
                     formatter,
                     "RPG Maker 翻译任务 {task_index} 执行失败：{source}"
                 )
             }
-            Self::CommitTask { task_index, source } => {
+            Self::CommitTask {
+                task_index, source, ..
+            } => {
                 write!(
                     formatter,
                     "RPG Maker 翻译任务 {task_index} 提交失败：{source}"
@@ -2979,6 +3826,7 @@ where
             Self::InvalidTaskResultSequence {
                 expected_task_index,
                 actual_task_index: Some(actual_task_index),
+                ..
             } => write!(
                 formatter,
                 "RPG Maker 翻译结果序列损坏：期待任务 {expected_task_index}，却收到任务 {actual_task_index}"
@@ -2986,6 +3834,7 @@ where
             Self::InvalidTaskResultSequence {
                 expected_task_index,
                 actual_task_index: None,
+                ..
             } => write!(
                 formatter,
                 "RPG Maker 翻译结果序列不完整：执行通道在任务 {expected_task_index} 返回前关闭"
@@ -3062,6 +3911,31 @@ mod tests {
 
     fn task_id(value: usize) -> TaskId {
         TaskId::new(value)
+    }
+
+    fn test_retry_exhausted_report() -> crate::diagnostic::DiagnosticReport {
+        crate::diagnostic::DiagnosticReport::new(
+            crate::diagnostic::StateEffect::ProgressPreserved,
+            crate::diagnostic::Diagnostic::http(crate::diagnostic::HttpIssue::Status {
+                endpoint: crate::diagnostic::HttpEndpoint::new(
+                    crate::diagnostic::HttpScheme::Https,
+                    "example.test",
+                    None,
+                ),
+                status: 503,
+                retry_after_seconds: Some(2),
+                provider_code: Some(
+                    crate::diagnostic::SafeIdentifier::new("busy")
+                        .expect("测试 provider code 合法"),
+                ),
+                provider_type: Some(
+                    crate::diagnostic::SafeIdentifier::new("service_error")
+                        .expect("测试 provider type 合法"),
+                ),
+                provider_message: None,
+                response_read_failure: None,
+            }),
+        )
     }
 
     #[test]
@@ -3422,12 +4296,19 @@ mod tests {
                     .cancel_on_start
                     .as_ref()
                     .is_some_and(|(_, cancellation)| cancellation.is_requested());
-                Err(TranslationTaskExecutionFailure::new(
-                    FakeError("execute"),
-                    TranslationTaskExecutionEvidence::synthetic(NonZeroUsize::MIN),
-                    None,
-                    cancelled,
-                ))
+                let evidence = TranslationTaskExecutionEvidence::synthetic(NonZeroUsize::MIN);
+                if cancelled {
+                    Err(TranslationTaskExecutionFailure::cancelled(
+                        FakeError("execute"),
+                        evidence,
+                    ))
+                } else {
+                    Err(TranslationTaskExecutionFailure::failed(
+                        FakeError("execute"),
+                        evidence,
+                        test_retry_exhausted_report(),
+                    ))
+                }
             } else {
                 let outcome_task_index = self
                     .outcome_index_at
@@ -3506,7 +4387,7 @@ mod tests {
             if self.fail_commit_preparation_at.contains(&index) {
                 Err(TranslationTaskCommitFailure::not_applied(
                     FakeError("prepare-commit"),
-                    None,
+                    test_retry_exhausted_report(),
                 ))
             } else {
                 record(&self.events, Event::PreparedCommit(index));
@@ -3525,12 +4406,12 @@ mod tests {
                 Err(TranslationTaskCommitFailure::new(
                     FakeError("commit-unknown"),
                     TranslationTaskCommitFailureImpact::OutcomeUnknown,
-                    None,
+                    test_retry_exhausted_report(),
                 ))
             } else if self.fail_commit_at == Some(index) {
                 Err(TranslationTaskCommitFailure::not_applied(
                     FakeError("commit"),
-                    None,
+                    test_retry_exhausted_report(),
                 ))
             } else {
                 record(&self.events, Event::Commit(index));
@@ -3572,25 +4453,32 @@ mod tests {
                 } => {
                     self.started_not_finalized.fetch_sub(1, Ordering::SeqCst);
                     match outcome {
-                        RpgMakerTranslationLogTaskOutcome::Complete
-                        | RpgMakerTranslationLogTaskOutcome::Partial
-                        | RpgMakerTranslationLogTaskOutcome::Unavailable => {
+                        RpgMakerTranslationLogTaskOutcome::Complete { .. }
+                        | RpgMakerTranslationLogTaskOutcome::Partial { .. }
+                        | RpgMakerTranslationLogTaskOutcome::Unavailable { .. } => {
                             record(&self.events, Event::LogTask(task_index.get()));
                         }
-                        RpgMakerTranslationLogTaskOutcome::CommitFailed => {
+                        RpgMakerTranslationLogTaskOutcome::CommitFailed { .. } => {
                             record(&self.events, Event::LogCommitFailure(task_index.get()));
                         }
-                        RpgMakerTranslationLogTaskOutcome::NotCommitted => {
+                        RpgMakerTranslationLogTaskOutcome::Cancelled
+                        | RpgMakerTranslationLogTaskOutcome::NotCommittedAfterEarlierFailure {
+                            ..
+                        } => {
                             record(&self.events, Event::LogNotCommitted(task_index.get()));
                         }
-                        RpgMakerTranslationLogTaskOutcome::ExecutionFailed
-                        | RpgMakerTranslationLogTaskOutcome::InvalidResult => {
+                        RpgMakerTranslationLogTaskOutcome::ExecutionFailed { .. }
+                        | RpgMakerTranslationLogTaskOutcome::InvalidResult { .. } => {
                             record(&self.events, Event::LogExecutionFailure(task_index.get()));
                         }
                     }
                 }
-                RpgMakerTranslationLogEvent::PlanningUnresolved { .. } => {
-                    record(&self.events, Event::LogPlanningFailure);
+                RpgMakerTranslationLogEvent::PlanningCompleted {
+                    unresolved_units, ..
+                } => {
+                    if *unresolved_units > 0 {
+                        record(&self.events, Event::LogPlanningFailure);
+                    }
                 }
             }
             self.records
@@ -3816,7 +4704,10 @@ mod tests {
         .with_test_planning_failures(vec![TranslationPlanningFailure::new(
             translation_identity_at(99, "description"),
             TranslationPlanningFailureReason::PlaceholderProtection {
-                message: "实际保护跨度冲突".to_owned(),
+                failure: TranslationPlaceholderProtectionFailure::ReservedTokenNamespace {
+                    start_byte: 2,
+                    end_byte: 9,
+                },
             },
         )]);
         let harness =
@@ -3842,7 +4733,10 @@ mod tests {
         assert!(matches!(
             records.as_slice(),
             [
-                RpgMakerTranslationLogEvent::PlanningUnresolved { units: 1 },
+                RpgMakerTranslationLogEvent::PlanningCompleted {
+                    unresolved_units: 1,
+                    ..
+                },
                 ..
             ]
         ));
@@ -4044,6 +4938,7 @@ mod tests {
             RpgMakerTranslationServiceError::CommitTask {
                 task_index,
                 source: FakeError("prepare-commit"),
+                ..
             } if task_index == RpgMakerTranslationTaskIndex::new(3)
         ));
         let final_events = events(&harness.events);
@@ -4089,6 +4984,7 @@ mod tests {
             RpgMakerTranslationServiceError::CommitTask {
                 task_index,
                 source: FakeError("commit"),
+                ..
             } if task_index == RpgMakerTranslationTaskIndex::new(0)
         ));
         let final_events = events(&harness.events);
@@ -4194,6 +5090,7 @@ mod tests {
             RpgMakerTranslationServiceError::InvalidTaskResultSequence {
                 expected_task_index,
                 actual_task_index: Some(actual_task_index),
+                ..
             } if expected_task_index == RpgMakerTranslationTaskIndex::new(0)
                 && actual_task_index == RpgMakerTranslationTaskIndex::new(9)
         ));
@@ -4250,6 +5147,7 @@ mod tests {
             RpgMakerTranslationServiceError::InvalidTaskResultSequence {
                 expected_task_index,
                 actual_task_index: Some(actual_task_index),
+                ..
             } if expected_task_index == RpgMakerTranslationTaskIndex::new(3)
                 && actual_task_index == RpgMakerTranslationTaskIndex::new(9)
         ));
@@ -4288,13 +5186,17 @@ mod tests {
 
         let (result, ()) = tokio::join!(run, release_earlier_failure);
         let error = result.expect_err("两个执行失败必须上交最早计划序号");
-        assert!(matches!(
-            error,
-            RpgMakerTranslationServiceError::ExecuteTask {
-                task_index,
-                source: FakeError("execute")
-            } if task_index == RpgMakerTranslationTaskIndex::new(1)
-        ));
+        let RpgMakerTranslationServiceError::ExecuteTask {
+            task_index,
+            source: FakeError("execute"),
+            diagnostic,
+        } = error
+        else {
+            panic!("第二个任务执行失败应保留任务诊断")
+        };
+        assert_eq!(task_index, RpgMakerTranslationTaskIndex::new(1));
+        assert_eq!(diagnostic.primary().code(), "http.status");
+        assert_eq!(diagnostic.effect(), StateEffect::ProgressPreserved);
         assert_eq!(
             events(&harness.events)
                 .into_iter()
@@ -4342,7 +5244,8 @@ mod tests {
             error,
             RpgMakerTranslationServiceError::ExecuteTask {
                 task_index,
-                source: FakeError("execute")
+                source: FakeError("execute"),
+                ..
             } if task_index == RpgMakerTranslationTaskIndex::new(1)
         ));
         let events = events(&harness.events);
@@ -4396,7 +5299,8 @@ mod tests {
             error,
             RpgMakerTranslationServiceError::CommitTask {
                 task_index,
-                source: FakeError("commit")
+                source: FakeError("commit"),
+                ..
             } if task_index == RpgMakerTranslationTaskIndex::new(1)
         ));
         let events = events(&harness.events);
@@ -4412,10 +5316,9 @@ mod tests {
             event,
             RpgMakerTranslationLogEvent::TaskFinished {
                 task_index,
-                outcome: RpgMakerTranslationLogTaskOutcome::CommitFailed,
+                outcome: RpgMakerTranslationLogTaskOutcome::CommitFailed { .. },
                 attempts: Some(_),
                 retry_exhausted: false,
-                diagnostic: None,
             } if *task_index == RpgMakerTranslationTaskIndex::new(1)
         )));
         assert_eq!(
@@ -4444,7 +5347,8 @@ mod tests {
             error,
             RpgMakerTranslationServiceError::CommitTask {
                 task_index,
-                source: FakeError("commit-unknown")
+                source: FakeError("commit-unknown"),
+                ..
             } if task_index == RpgMakerTranslationTaskIndex::new(0)
         ));
         assert_eq!(
@@ -4508,6 +5412,7 @@ mod tests {
             RpgMakerTranslationServiceError::CommitTask {
                 task_index,
                 source: FakeError("commit"),
+                ..
             } if task_index == RpgMakerTranslationTaskIndex::new(0)
         ));
         assert_all_started_tasks_observed(&harness.log_records, &harness.task_records);
@@ -4644,25 +5549,24 @@ mod tests {
             .filter_map(|event| match event {
                 RpgMakerTranslationLogEvent::TaskFinished {
                     outcome, attempts, ..
-                } => Some((*outcome, *attempts)),
+                } => Some((
+                    match outcome {
+                        RpgMakerTranslationLogTaskOutcome::Complete { .. } => "complete",
+                        RpgMakerTranslationLogTaskOutcome::Partial { .. } => "partial",
+                        RpgMakerTranslationLogTaskOutcome::Unavailable { .. } => "unavailable",
+                        _ => "unexpected",
+                    },
+                    *attempts,
+                )),
                 _ => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(
             completed,
             vec![
-                (
-                    RpgMakerTranslationLogTaskOutcome::Partial,
-                    NonZeroUsize::new(1)
-                ),
-                (
-                    RpgMakerTranslationLogTaskOutcome::Unavailable,
-                    NonZeroUsize::new(1)
-                ),
-                (
-                    RpgMakerTranslationLogTaskOutcome::Complete,
-                    NonZeroUsize::new(1)
-                ),
+                ("partial", NonZeroUsize::new(1)),
+                ("unavailable", NonZeroUsize::new(1)),
+                ("complete", NonZeroUsize::new(1)),
             ]
         );
     }
@@ -4695,23 +5599,21 @@ mod tests {
             .iter()
             .find_map(|event| match event {
                 RpgMakerTranslationLogEvent::TaskFinished {
-                    outcome: RpgMakerTranslationLogTaskOutcome::Unavailable,
+                    outcome: RpgMakerTranslationLogTaskOutcome::Unavailable { diagnostics },
                     attempts: Some(attempts),
                     retry_exhausted: true,
-                    diagnostic: Some(diagnostic),
                     ..
-                } if attempts.get() == 3 => Some(diagnostic),
+                } if attempts.get() == 3 => diagnostics.reports().next(),
                 _ => None,
             })
             .expect("任务观察必须携带重试耗尽的安全诊断");
-        assert!(matches!(
-            &diagnostic.reason,
-            crate::diagnostic::DiagnosticReason::Http {
-                status: Some(503),
-                retry_after_seconds: Some(2),
-                ..
-            }
-        ));
+        assert_eq!(diagnostic.primary().code(), "http.status");
+        let value = serde_json::to_value(diagnostic).expect("任务诊断应可序列化");
+        assert_eq!(value["primary"]["issue"]["details"]["status"], 503);
+        assert_eq!(
+            value["primary"]["issue"]["details"]["retry_after_seconds"],
+            2
+        );
     }
 
     #[tokio::test]
@@ -4888,7 +5790,11 @@ mod tests {
             )
         };
         let unresolved = |output: &ExpectedTranslationOutput, reason| {
-            UnresolvedTranslationUnit::new(output.id(), output.propagation_targets().len(), reason)
+            UnresolvedTranslationUnit::for_test(
+                output.id(),
+                output.propagation_targets().len(),
+                reason,
+            )
         };
 
         match kind {
@@ -4901,7 +5807,7 @@ mod tests {
                 final_response: FinalLlmResponseMetadata::new(
                     Some(format!("request-{}", task_index.get())),
                     Some(format!("response-{}", task_index.get())),
-                    "stop",
+                    crate::diagnostic::RpgMakerModelFinishReason::Stop,
                     None,
                 ),
                 accepted: test_non_empty(expected.iter().map(patch).collect()),
@@ -4918,7 +5824,7 @@ mod tests {
                 final_response: FinalLlmResponseMetadata::new(
                     Some(format!("request-{}", task_index.get())),
                     Some(format!("response-{}", task_index.get())),
-                    "stop",
+                    crate::diagnostic::RpgMakerModelFinishReason::Stop,
                     None,
                 ),
                 accepted: test_non_empty(vec![patch(&expected[0])]),
@@ -4932,13 +5838,19 @@ mod tests {
                     task_index,
                     NonZeroUsize::MIN,
                     vec![TranslationProtocolDiagnostic::InvalidResponse {
-                        message: "无法解析模型 JSON".to_owned(),
+                        error: TranslationTaskResponseParseError::new(
+                            TranslationTaskResponseParseErrorKind::Json(
+                                TranslationTaskResponseJsonErrorCategory::Syntax,
+                            ),
+                            NonZeroUsize::MIN,
+                            NonZeroUsize::MIN,
+                        ),
                     }],
                 ),
                 final_response: Some(FinalLlmResponseMetadata::new(
                     Some(format!("request-{}", task_index.get())),
                     Some(format!("response-{}", task_index.get())),
-                    "length",
+                    crate::diagnostic::RpgMakerModelFinishReason::Length,
                     None,
                 )),
                 reason: TranslationTaskUnavailableReason::ModelResponseUnusable,
@@ -4946,12 +5858,7 @@ mod tests {
                     expected
                         .iter()
                         .map(|output| {
-                            unresolved(
-                                output,
-                                TranslationUnitRejectionReason::InvalidShape {
-                                    message: "无法解析模型 JSON".to_owned(),
-                                },
-                            )
+                            unresolved(output, TranslationUnitRejectionReason::InvalidResponse)
                         })
                         .collect(),
                 ),
@@ -4964,20 +5871,7 @@ mod tests {
                 ),
                 final_response: None,
                 reason: TranslationTaskUnavailableReason::RecoverableRequestExhausted {
-                    diagnostic: SafeDiagnostic::new(
-                        crate::diagnostic::DiagnosticCode::ModelRequest,
-                        crate::diagnostic::DiagnosticStage::ModelRequest,
-                        crate::diagnostic::DiagnosticSubject::component("test provider"),
-                        crate::diagnostic::DiagnosticReason::Http {
-                            status: Some(503),
-                            retry_after_seconds: Some(2),
-                            provider_code: Some("busy".to_owned()),
-                            provider_type: Some("service_error".to_owned()),
-                            provider_message: None,
-                        },
-                        crate::diagnostic::DiagnosticImpact::ProgressPreserved,
-                        crate::diagnostic::DiagnosticAction::CheckModelService,
-                    ),
+                    diagnostic: test_retry_exhausted_report(),
                 },
                 unresolved: test_non_empty(
                     expected

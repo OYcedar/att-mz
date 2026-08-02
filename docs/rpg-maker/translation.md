@@ -75,8 +75,19 @@ Partial 后重试重新判断 ID，但不重新装箱。原块中的已完成 Un
 失败或取消都不会把它带走。提交时重新检查来源、owner、Unit、译文和语义状态，发现
 并发变化则不覆盖新状态。
 
-结果分为 Complete、Partial 与 Unavailable。退出码成功只说明结果已经明确；Partial
-和 Unavailable 仍意味着完整翻译目标尚未达成。
+每个实际开始的 Task 写 `task.finished`：Complete、Partial、Unavailable、Failed、
+NotCommittedAfterEarlierFailure 或 Cancelled；Partial、Unavailable 与 Failed 引用相应
+`diagnostic.translation_task` occurrence。NotCommittedAfterEarlierFailure 仅表示已有可提交结果
+但因前序失败没有写入，并复用前序失败 occurrence。每次命令恰好写
+一条 `translation.finished`：NotStarted、NoWork、Complete、Incomplete、Failed 或
+Cancelled。含 Partial 或 Unavailable 任务但业务结果明确时，Translate 结果是 Incomplete，
+退出码仍为 `0`；完整翻译目标尚未达成。
+
+`translation.finished` 固定保存完整 Task 计数，并保存 RPG Maker 专用的 accepted decisions、
+written/remaining locations、remaining decisions、protocol diagnostics、recoverable request
+exhaustions 和 reconciliation 计数。Placeholder 等规划错误在任何模型请求前形成带完整
+owner、group location 和 role 的 `diagnostic.run_plan` occurrence；结果为 Failed，数据库
+保持不变。
 
 Partial 会保留合法 ID 和已确认前序进度；再次运行会重新判断剩余 ID 而不改变稳定装箱。
 是否继续同一 Translate、修正资源，还是由人工或 agent 修订，要按

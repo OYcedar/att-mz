@@ -13,13 +13,13 @@ use std::str::Utf8Error;
 use serde_json::Value;
 
 use crate::diagnostic::{
-    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
-    DiagnosticStage, DiagnosticSubject, FailureReport, RecoveryFact, ReportedFailure,
-    SafeDiagnostic, SafeDiagnosticSource,
+    ByteRange, Diagnostic, DiagnosticReport, Pcre2Failure, Pcre2FailureKind, RpgMakerIssue,
+    RpgMakerJsonFailureKind, RpgMakerRulesDefinitionOrigin, RpgMakerRulesDefinitionProblem,
+    RpgMakerRulesPathFailure, RpgMakerRulesSourceKind, SafeIdentifier, StateEffect,
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::json::StackSafeJsonValue;
-use crate::rpg_maker::model::{ProjectionModelError, TextUnitContent};
+use crate::rpg_maker::model::TextUnitContent;
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::semantic_order::{
     RpgMakerSemanticOrderKey, RpgMakerSemanticOrderProjectionError,
@@ -28,7 +28,9 @@ use crate::rpg_maker::text::{
     DataFileName, RpgMakerLocation, RpgMakerLocationStep, StandardDataFile,
 };
 
-use self::definition::{FileRuleSource, RuleSource, RulesDefinition, RulesDefinitionError};
+use self::definition::{
+    FileRuleSource, InvalidPathReason, RuleSource, RulesDefinition, RulesDefinitionError,
+};
 use self::matcher::{
     MatchedRuleTarget, RulesMatchError, RulesMatchInput, RulesPlugin, RulesSourceMatchWorkUnit,
     build_source_match_plan, finish_source_matches,
@@ -77,8 +79,12 @@ impl RulesProgram {
     ) -> Result<Self, RulesProgramError> {
         let text = String::from_utf8(bytes)
             .map_err(|source| RulesProgramError::InvalidUtf8(source.utf8_error()))?;
-        let definition =
-            RulesDefinition::parse(&text).map_err(RulesProgramError::InvalidDefinition)?;
+        let definition = RulesDefinition::parse(&text).map_err(|source| {
+            RulesProgramError::InvalidDefinition {
+                origin: RulesDefinitionOrigin::ExternalToml,
+                source,
+            }
+        })?;
         Ok(Self {
             diagnostic_path,
             definition,
@@ -89,8 +95,13 @@ impl RulesProgram {
         diagnostic_path: PathBuf,
         canonical_json: &str,
     ) -> Result<Self, RulesProgramError> {
-        let definition = RulesDefinition::parse_canonical_json(canonical_json)
-            .map_err(RulesProgramError::InvalidDefinition)?;
+        let definition =
+            RulesDefinition::parse_canonical_json(canonical_json).map_err(|source| {
+                RulesProgramError::InvalidDefinition {
+                    origin: RulesDefinitionOrigin::ProjectSnapshot,
+                    source,
+                }
+            })?;
         Ok(Self {
             diagnostic_path,
             definition,
@@ -114,37 +125,44 @@ impl RulesProgram {
 #[derive(Debug)]
 pub(crate) enum RulesProgramError {
     InvalidUtf8(Utf8Error),
-    InvalidDefinition(RulesDefinitionError),
+    InvalidDefinition {
+        origin: RulesDefinitionOrigin,
+        source: RulesDefinitionError,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RulesDefinitionOrigin {
+    ExternalToml,
+    ProjectSnapshot,
 }
 
 impl RulesProgramError {
-    pub(crate) fn safe_diagnostic(&self, rules_path: &std::path::Path) -> SafeDiagnostic {
-        match self {
-            Self::InvalidUtf8(source) => SafeDiagnostic::new(
-                DiagnosticCode::ExtractRules,
-                DiagnosticStage::CommandPreparation,
-                DiagnosticSubject::path(rules_path),
-                DiagnosticReason::InvalidUtf8 {
-                    valid_up_to: u64::try_from(source.valid_up_to()).unwrap_or(u64::MAX),
-                    error_len: source
-                        .error_len()
-                        .map(|value| u64::try_from(value).unwrap_or(u64::MAX)),
+    pub(crate) fn diagnostic_report(&self, rules_path: &std::path::Path) -> DiagnosticReport {
+        let (origin, problem) = match self {
+            Self::InvalidUtf8(source) => (
+                RpgMakerRulesDefinitionOrigin::ExternalToml,
+                RpgMakerRulesDefinitionProblem::InvalidUtf8 {
+                    valid_up_to: source.valid_up_to(),
+                    error_len: source.error_len(),
                 },
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixInput,
             ),
-            Self::InvalidDefinition(source) => SafeDiagnostic::new(
-                DiagnosticCode::ExtractRules,
-                DiagnosticStage::CommandPreparation,
-                DiagnosticSubject::path(rules_path),
-                DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::RulesDefinitionInvalid,
-                    source.safe_detail(),
-                ),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixInput,
+            Self::InvalidDefinition { origin, source } => (
+                match origin {
+                    RulesDefinitionOrigin::ExternalToml => {
+                        RpgMakerRulesDefinitionOrigin::ExternalToml
+                    }
+                    RulesDefinitionOrigin::ProjectSnapshot => {
+                        RpgMakerRulesDefinitionOrigin::ProjectSnapshot
+                    }
+                },
+                rules_definition_problem(source),
             ),
-        }
+        };
+        DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::rpg_maker(RpgMakerIssue::rules_definition(origin, rules_path, problem)),
+        )
     }
 }
 
@@ -152,7 +170,7 @@ impl fmt::Display for RulesProgramError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidUtf8(source) => write!(formatter, "Rules 定义不是 UTF-8：{source}"),
-            Self::InvalidDefinition(source) => source.fmt(formatter),
+            Self::InvalidDefinition { source, .. } => source.fmt(formatter),
         }
     }
 }
@@ -161,7 +179,206 @@ impl Error for RulesProgramError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::InvalidUtf8(source) => Some(source),
-            Self::InvalidDefinition(source) => Some(source),
+            Self::InvalidDefinition { source, .. } => Some(source),
+        }
+    }
+}
+
+fn rules_definition_problem(source: &RulesDefinitionError) -> RpgMakerRulesDefinitionProblem {
+    match source {
+        RulesDefinitionError::InvalidToml(source) => RpgMakerRulesDefinitionProblem::InvalidToml {
+            byte_range: source
+                .span()
+                .and_then(|span| ByteRange::new(span.start, span.end).ok()),
+        },
+        RulesDefinitionError::InvalidCanonicalJson(source) => {
+            RpgMakerRulesDefinitionProblem::InvalidCanonicalJson {
+                category: rpg_maker_json_failure(source),
+                line: source.line(),
+                column: source.column(),
+            }
+        }
+        RulesDefinitionError::EncodeCanonicalJson(source) => {
+            RpgMakerRulesDefinitionProblem::EncodeCanonicalJson {
+                category: rpg_maker_json_failure(source),
+                line: source.line(),
+                column: source.column(),
+            }
+        }
+        RulesDefinitionError::NonCanonicalJson => RpgMakerRulesDefinitionProblem::NonCanonicalJson,
+        RulesDefinitionError::MissingSource { rule_number } => {
+            RpgMakerRulesDefinitionProblem::MissingSource {
+                rule_number: *rule_number,
+            }
+        }
+        RulesDefinitionError::ConflictingSources { rule_number } => {
+            RpgMakerRulesDefinitionProblem::ConflictingSources {
+                rule_number: *rule_number,
+            }
+        }
+        RulesDefinitionError::ParameterWithoutCode { rule_number } => {
+            RpgMakerRulesDefinitionProblem::ParameterWithoutCode {
+                rule_number: *rule_number,
+            }
+        }
+        RulesDefinitionError::MissingParameter { rule_number } => {
+            RpgMakerRulesDefinitionProblem::MissingParameter {
+                rule_number: *rule_number,
+            }
+        }
+        RulesDefinitionError::InvalidCode { rule_number, code } => {
+            RpgMakerRulesDefinitionProblem::InvalidCode {
+                rule_number: *rule_number,
+                code: *code,
+            }
+        }
+        RulesDefinitionError::MissingPath {
+            rule_number,
+            source,
+        } => RpgMakerRulesDefinitionProblem::MissingPath {
+            rule_number: *rule_number,
+            source: match *source {
+                "file" => RpgMakerRulesSourceKind::File,
+                "plugin" => RpgMakerRulesSourceKind::Plugin,
+                "command" => RpgMakerRulesSourceKind::Command,
+                _ => unreachable!("Rules 定义只会保存封闭来源"),
+            },
+        },
+        RulesDefinitionError::EmptyField { rule_number, field } => {
+            RpgMakerRulesDefinitionProblem::EmptyField {
+                rule_number: *rule_number,
+                field: SafeIdentifier::from_validated(field),
+            }
+        }
+        RulesDefinitionError::InvalidFile { rule_number } => {
+            RpgMakerRulesDefinitionProblem::InvalidFile {
+                rule_number: *rule_number,
+            }
+        }
+        RulesDefinitionError::InvalidPath {
+            rule_number,
+            reason,
+        } => RpgMakerRulesDefinitionProblem::InvalidPath {
+            rule_number: *rule_number,
+            failure: rules_path_failure(*reason),
+        },
+        RulesDefinitionError::EmptyPattern { rule_number } => {
+            RpgMakerRulesDefinitionProblem::EmptyPattern {
+                rule_number: *rule_number,
+            }
+        }
+        RulesDefinitionError::InvalidPattern {
+            rule_number,
+            source,
+        } => RpgMakerRulesDefinitionProblem::InvalidPattern {
+            rule_number: *rule_number,
+            failure: pcre2_failure(source),
+        },
+        RulesDefinitionError::InvalidNamedCaptures {
+            rule_number,
+            actual_count,
+        } => RpgMakerRulesDefinitionProblem::InvalidNamedCaptures {
+            rule_number: *rule_number,
+            actual_count: *actual_count,
+        },
+    }
+}
+
+fn rpg_maker_json_failure(source: &serde_json::Error) -> RpgMakerJsonFailureKind {
+    match crate::json_diagnostic::JsonErrorCategory::from(source) {
+        crate::json_diagnostic::JsonErrorCategory::Io => RpgMakerJsonFailureKind::Io,
+        crate::json_diagnostic::JsonErrorCategory::Syntax => RpgMakerJsonFailureKind::Syntax,
+        crate::json_diagnostic::JsonErrorCategory::Data => RpgMakerJsonFailureKind::Data,
+        crate::json_diagnostic::JsonErrorCategory::Eof => RpgMakerJsonFailureKind::Eof,
+        crate::json_diagnostic::JsonErrorCategory::DuplicateObjectKey => {
+            RpgMakerJsonFailureKind::DuplicateObjectKey
+        }
+    }
+}
+
+fn pcre2_failure(source: &pcre2::Error) -> Pcre2Failure {
+    Pcre2Failure {
+        kind: match source.kind() {
+            pcre2::ErrorKind::Compile => Pcre2FailureKind::Compile,
+            pcre2::ErrorKind::JIT => Pcre2FailureKind::Jit,
+            pcre2::ErrorKind::Match => Pcre2FailureKind::Match,
+            pcre2::ErrorKind::Info => Pcre2FailureKind::Info,
+            pcre2::ErrorKind::Option => Pcre2FailureKind::Option,
+            _ => Pcre2FailureKind::Unrecognized,
+        },
+        code: source.code(),
+        offset: source.offset(),
+    }
+}
+
+fn rules_path_failure(source: InvalidPathReason) -> RpgMakerRulesPathFailure {
+    match source {
+        InvalidPathReason::Empty => RpgMakerRulesPathFailure::Empty,
+        InvalidPathReason::UnsupportedJsonPath { offset } => {
+            RpgMakerRulesPathFailure::UnsupportedJsonPath {
+                byte_offset: offset,
+            }
+        }
+        InvalidPathReason::UnexpectedDot { offset } => RpgMakerRulesPathFailure::UnexpectedDot {
+            byte_offset: offset,
+        },
+        InvalidPathReason::DotBeforeBracket { offset } => {
+            RpgMakerRulesPathFailure::DotBeforeBracket {
+                byte_offset: offset,
+            }
+        }
+        InvalidPathReason::MissingDot { offset } => RpgMakerRulesPathFailure::MissingDot {
+            byte_offset: offset,
+        },
+        InvalidPathReason::InvalidBareKey { offset } => RpgMakerRulesPathFailure::InvalidBareKey {
+            byte_offset: offset,
+        },
+        InvalidPathReason::TrailingDot { offset } => RpgMakerRulesPathFailure::TrailingDot {
+            byte_offset: offset,
+        },
+        InvalidPathReason::UnclosedBracket { offset } => {
+            RpgMakerRulesPathFailure::UnclosedBracket {
+                byte_offset: offset,
+            }
+        }
+        InvalidPathReason::MissingQuotedKey { offset } => {
+            RpgMakerRulesPathFailure::MissingQuotedKey {
+                byte_offset: offset,
+            }
+        }
+        InvalidPathReason::InvalidQuotedKey {
+            offset,
+            json_category,
+            line,
+            column,
+        } => RpgMakerRulesPathFailure::InvalidQuotedKey {
+            byte_offset: offset,
+            json_category: match json_category {
+                crate::json_diagnostic::JsonErrorCategory::Io => RpgMakerJsonFailureKind::Io,
+                crate::json_diagnostic::JsonErrorCategory::Syntax => {
+                    RpgMakerJsonFailureKind::Syntax
+                }
+                crate::json_diagnostic::JsonErrorCategory::Data => RpgMakerJsonFailureKind::Data,
+                crate::json_diagnostic::JsonErrorCategory::Eof => RpgMakerJsonFailureKind::Eof,
+                crate::json_diagnostic::JsonErrorCategory::DuplicateObjectKey => {
+                    RpgMakerJsonFailureKind::DuplicateObjectKey
+                }
+            },
+            line,
+            column,
+        },
+        InvalidPathReason::QuotedKeyMissingClose { offset } => {
+            RpgMakerRulesPathFailure::QuotedKeyMissingClose {
+                byte_offset: offset,
+            }
+        }
+        InvalidPathReason::InvalidBracket { offset } => RpgMakerRulesPathFailure::InvalidBracket {
+            byte_offset: offset,
+        },
+        InvalidPathReason::IndexOutOfRange { offset } => {
+            RpgMakerRulesPathFailure::IndexOutOfRange {
+                byte_offset: offset,
+            }
         }
     }
 }
@@ -170,7 +387,10 @@ impl Error for RulesProgramError {
 pub(crate) fn validate_rules_canonical_json(source: &str) -> Result<(), RulesProgramError> {
     RulesDefinition::parse_canonical_json(source)
         .map(|_| ())
-        .map_err(RulesProgramError::InvalidDefinition)
+        .map_err(|source| RulesProgramError::InvalidDefinition {
+            origin: RulesDefinitionOrigin::ProjectSnapshot,
+            source,
+        })
 }
 
 /// 读取、解析、匹配并原子提交一次 Rules 快照。
@@ -213,6 +433,7 @@ where
                 .deactivate_rules(project)
                 .await
                 .map_err(|source| RulesExtractionError::Persist { rules_path, source })?;
+            progress.determinate(ExtractProgressPhase::RulesCommit, 1, 1);
             return Ok(RulesExtractionOutput::default());
         }
 
@@ -287,6 +508,7 @@ where
             .replace_rules(project, candidate.snapshot)
             .await
             .map_err(|source| RulesExtractionError::Persist { rules_path, source })?;
+        progress.determinate(ExtractProgressPhase::RulesCommit, 1, 1);
         Ok(RulesExtractionOutput {
             warnings: candidate.warnings,
         })
@@ -578,179 +800,44 @@ pub(crate) enum RulesExtractionError<DE, SE, CE> {
 
 impl<DE, SE, CE> RulesExtractionError<DE, SE, CE>
 where
-    DE: Error + RpgMakerProjectDocumentReadingDiagnostic + Send + Sync + 'static,
-    SE: Error + SafeDiagnosticSource + Send + Sync + 'static,
-    CE: Error + Send + Sync + 'static,
-    CpuTaskExecutionError<CE>: SafeDiagnosticSource,
+    DE: RpgMakerProjectDocumentReadingDiagnostic,
+    SE: super::store::RpgMakerExtractionStoreDiagnostic,
+    CpuTaskExecutionError<CE>: super::RpgMakerExtractionCpuDiagnostic,
 {
-    /// 在直接依赖仍持有文件路径、OS/SQLite code 与 CPU 终态时建立具体安全投影。
-    ///
-    /// 借用型映射与拥有型 `FailureReport` 共用这份闭集投影；拥有型路径另行保留具体
-    /// source 以及 Store 已经拆出的相关错误。
-    pub(crate) fn safe_diagnostic(&self) -> SafeDiagnostic {
+    /// 在 Rules、文档、CPU 与 Store 仍持有闭集事实时建立唯一公开报告。
+    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
         match self {
-            Self::ReadDocuments { rules_path, source } => with_rules_context(
-                source.safe_document_reading_diagnostic(
-                    DiagnosticCode::ExtractRules,
-                    DiagnosticStage::Extract,
-                ),
-                rules_path,
-                "read_documents",
+            Self::ReadDocuments { source, .. } => source.document_reading_diagnostic_report(
+                crate::diagnostic::RpgMakerDocumentConsumer::Rules,
             ),
-            Self::InvalidTarget { rules_path, source } => source.safe_diagnostic(rules_path),
-            Self::InvalidSnapshot { rules_path, source } => {
-                snapshot_model_diagnostic(source, rules_path)
-            }
-            Self::MatchSourceCompute { rules_path, source } => with_rules_context(
-                source.safe_diagnostic_source(
-                    DiagnosticStage::Extract,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::Retry,
-                ),
-                rules_path,
-                "match_source",
+            Self::InvalidTarget { rules_path, source } => source.diagnostic_report(rules_path),
+            Self::InvalidSnapshot { rules_path, source } => source.diagnostic_report(
+                crate::diagnostic::RpgMakerExtractionSource::rules(rules_path),
             ),
-            Self::BuildSnapshotCompute { rules_path, source } => with_rules_context(
-                source.safe_diagnostic_source(
-                    DiagnosticStage::Extract,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::Retry,
-                ),
-                rules_path,
-                "build_snapshot",
+            Self::MatchSourceCompute { rules_path, source } => super::extraction_compute_report(
+                source,
+                crate::diagnostic::RpgMakerExtractionSource::rules(rules_path),
+                crate::diagnostic::RpgMakerExtractionComputeOperation::RulesMatchSource,
             ),
-            Self::Persist { rules_path, source } => with_rules_context(
-                source.safe_diagnostic_source(
-                    DiagnosticStage::Extract,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckProjectState,
-                ),
-                rules_path,
-                "persist_snapshot",
-            )
-            .with_recovery(RecoveryFact::component("owner=rules")),
+            Self::BuildSnapshotCompute { rules_path, source } => super::extraction_compute_report(
+                source,
+                crate::diagnostic::RpgMakerExtractionSource::rules(rules_path),
+                crate::diagnostic::RpgMakerExtractionComputeOperation::RulesBuildSnapshot,
+            ),
+            Self::Persist { source, .. } => source.extraction_store_diagnostic_report(
+                crate::diagnostic::RpgMakerDiagnosticOwner::Rules,
+            ),
         }
     }
 
-    /// 消费完整 Rules 阶段错误，保留具体主类型以及 Store 已经拆出的相关错误。
-    pub(crate) fn into_failure_report(self) -> FailureReport {
-        let diagnostic = self.safe_diagnostic();
-        match self {
-            Self::ReadDocuments { source, .. } => {
-                FailureReport::new(ReportedFailure::new(diagnostic, source))
-            }
-            Self::InvalidTarget { source, .. } => {
-                FailureReport::new(ReportedFailure::new(diagnostic, source))
-            }
-            Self::InvalidSnapshot { source, .. } => {
-                FailureReport::new(ReportedFailure::new(diagnostic, source))
-            }
-            Self::MatchSourceCompute { rules_path, source } => source
-                .into_failure_report(
-                    DiagnosticStage::Extract,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::Retry,
-                )
-                .with_primary_recovery(RecoveryFact::path(rules_path))
-                .with_primary_recovery(RecoveryFact::component("rules_operation=match_source")),
-            Self::BuildSnapshotCompute { rules_path, source } => source
-                .into_failure_report(
-                    DiagnosticStage::Extract,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::Retry,
-                )
-                .with_primary_recovery(RecoveryFact::path(rules_path))
-                .with_primary_recovery(RecoveryFact::component("rules_operation=build_snapshot")),
-            Self::Persist { rules_path, source } => source
-                .into_failure_report(
-                    DiagnosticStage::Extract,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckProjectState,
-                )
-                .with_primary_recovery(RecoveryFact::path(rules_path))
-                .with_primary_recovery(RecoveryFact::component("rules_operation=persist_snapshot"))
-                .with_primary_recovery(RecoveryFact::component("owner=rules")),
-        }
-    }
-}
-
-fn with_rules_context(
-    diagnostic: SafeDiagnostic,
-    rules_path: &std::path::Path,
-    operation: &'static str,
-) -> SafeDiagnostic {
-    diagnostic
-        .with_recovery(RecoveryFact::path(rules_path))
-        .with_recovery(RecoveryFact::component(format!(
-            "rules_operation={operation}"
-        )))
-}
-
-fn snapshot_model_diagnostic(
-    source: &SnapshotModelError,
-    rules_path: &std::path::Path,
-) -> SafeDiagnostic {
-    SafeDiagnostic::new(
-        DiagnosticCode::ExtractRules,
-        DiagnosticStage::Extract,
-        DiagnosticSubject::path(rules_path),
-        DiagnosticReason::failure_with_detail(
-            DiagnosticFailureKind::RulesSnapshotInvalid,
-            snapshot_model_fact(source),
-        ),
-        DiagnosticImpact::Unchanged,
-        DiagnosticAction::ReportBug,
-    )
-}
-
-fn snapshot_model_fact(source: &SnapshotModelError) -> String {
-    let variant = match source {
-        SnapshotModelError::BlankSourceContent { .. } => "blank_source_content",
-        SnapshotModelError::ContentShapeMismatch { .. } => "content_shape_mismatch",
-        SnapshotModelError::DirectGroupRequiresValue { .. } => "direct_group_requires_value",
-        SnapshotModelError::InvalidSourceLine { .. } => "invalid_source_line",
-        SnapshotModelError::EmptyGroup { .. } => "empty_group",
-        SnapshotModelError::EmptyProjection { .. } => "empty_projection",
-        SnapshotModelError::DuplicateLogicalLocation { .. } => "duplicate_logical_location",
-        SnapshotModelError::ConflictingGroupKind { .. } => "conflicting_group_kind",
-        SnapshotModelError::ConflictingSemanticOrderKey { .. } => "conflicting_semantic_order_key",
-        SnapshotModelError::SemanticOrderProjection { .. } => "semantic_order_projection",
-        SnapshotModelError::MutationClaimConflict { .. } => "mutation_claim_conflict",
-        SnapshotModelError::RecipeRoleMismatch { .. } => "recipe_role_mismatch",
-        SnapshotModelError::RecipeLineMismatch { .. } => "recipe_line_mismatch",
-        SnapshotModelError::Projection(source) => projection_model_variant(source),
-    };
-    format!("snapshot_error={variant}")
-}
-
-fn projection_model_variant(source: &ProjectionModelError) -> &'static str {
-    match source {
-        ProjectionModelError::EmptyScalarFieldKey => "projection.empty_scalar_field_key",
-        ProjectionModelError::EventBlockCoverageRequired => {
-            "projection.event_block_coverage_required"
-        }
-        ProjectionModelError::InvalidEventBlockCoverage => {
-            "projection.invalid_event_block_coverage"
-        }
-        ProjectionModelError::MutationClaimTargetMismatch => {
-            "projection.mutation_claim_target_mismatch"
-        }
-        ProjectionModelError::RecipeHasNoTextSlot => "projection.recipe_has_no_text_slot",
-        ProjectionModelError::DuplicateProjectionSlot { .. } => {
-            "projection.duplicate_projection_slot"
-        }
-        ProjectionModelError::MultipleBodyLinesInPhysicalLine => {
-            "projection.multiple_body_lines_in_physical_line"
-        }
-        ProjectionModelError::DuplicateDialogueBodyLine { .. } => {
-            "projection.duplicate_dialogue_body_line"
-        }
-        ProjectionModelError::NonContiguousDialogueBodyLines { .. } => {
-            "projection.non_contiguous_dialogue_body_lines"
-        }
-        ProjectionModelError::MixedDirectAndInlineSpeaker => {
-            "projection.mixed_direct_and_inline_speaker"
-        }
+    pub(crate) fn into_diagnostic_failure(self) -> crate::diagnostic::ReportedFailure
+    where
+        DE: Error + Send + Sync + 'static,
+        SE: Error + Send + Sync + 'static,
+        CE: Error + Send + Sync + 'static,
+    {
+        let report = self.diagnostic_report();
+        crate::diagnostic::ReportedFailure::new(report, self)
     }
 }
 
@@ -832,7 +919,7 @@ mod tests {
     use crate::progress::{ProgressObserver, ProgressSnapshot};
     use crate::project_name::ProjectName;
     use crate::rpg_maker::extract::document::RpgMakerProjectDocumentReadingError;
-    use crate::rpg_maker::model::{DirectTextPart, TextProjectionRecipe};
+    use crate::rpg_maker::model::{DirectTextPart, ProjectionModelError, TextProjectionRecipe};
     use crate::rpg_maker::text::MapId;
     use crate::runtime::filesystem::{SystemFileSystem, SystemFileSystemConfig};
     use crate::storage::file_system::FileReader;
@@ -1257,7 +1344,7 @@ path = 'entries[0].right.Name'
         for bytes in [Vec::new(), b"# comment only\n".to_vec()] {
             assert!(matches!(
                 RulesProgram::from_toml(PathBuf::from("rules.toml"), bytes),
-                Err(RulesProgramError::InvalidDefinition(_))
+                Err(RulesProgramError::InvalidDefinition { .. })
             ));
         }
         assert!(
@@ -1269,42 +1356,64 @@ path = 'entries[0].right.Name'
 
     #[test]
     fn rules_definition_diagnostics_keep_typed_locations_without_rule_payloads() {
-        fn toml_diagnostic(source: &str) -> String {
+        fn toml_diagnostic(source: &str) -> serde_json::Value {
             let path = PathBuf::from("rules/safe-main.toml");
             let error = RulesProgram::from_toml(path.clone(), source.as_bytes().to_vec())
                 .expect_err("样本必须被 Rules 输入边界拒绝");
-            serde_json::to_string(&error.safe_diagnostic(&path)).expect("诊断应可序列化")
+            serde_json::to_value(error.diagnostic_report(&path)).expect("诊断应可序列化")
         }
 
         let invalid_toml =
             toml_diagnostic("[[rule]]\ncode = 'TOML_VALUE_SENTINEL'\nparameter = 0\n");
-        assert!(invalid_toml.contains("format=toml"));
-        assert!(invalid_toml.contains("byte_start="));
-        assert!(!invalid_toml.contains("TOML_VALUE_SENTINEL"));
+        assert_eq!(
+            invalid_toml["primary"]["issue"]["details"]["problem"]["problem"]["kind"],
+            "invalid_toml"
+        );
+        assert!(
+            invalid_toml["primary"]["issue"]["details"]["problem"]["problem"]["byte_range"]
+                .is_object()
+        );
+        assert!(!invalid_toml.to_string().contains("TOML_VALUE_SENTINEL"));
 
         let invalid_path = toml_diagnostic(
             "[[rule]]\nfile = 'Actors.json'\npath = 'PATH_PAYLOAD_SENTINEL..name'\n",
         );
-        assert!(invalid_path.contains("rule=1"));
-        assert!(invalid_path.contains("target=path"));
-        assert!(invalid_path.contains("path_error=unexpected_dot"));
-        assert!(invalid_path.contains("byte_offset="));
-        assert!(!invalid_path.contains("PATH_PAYLOAD_SENTINEL"));
+        let invalid_path_problem =
+            &invalid_path["primary"]["issue"]["details"]["problem"]["problem"];
+        assert_eq!(invalid_path_problem["kind"], "invalid_path");
+        assert_eq!(invalid_path_problem["rule_number"], 1);
+        assert_eq!(invalid_path_problem["failure"]["kind"], "unexpected_dot");
+        assert!(invalid_path_problem["failure"]["byte_offset"].is_number());
+        assert!(!invalid_path.to_string().contains("PATH_PAYLOAD_SENTINEL"));
 
         let invalid_pattern = toml_diagnostic(
             "[[rule]]\ncode = 401\nparameter = 0\npattern = '(?<text>PATTERN_PAYLOAD_SENTINEL'\n",
         );
-        assert!(invalid_pattern.contains("rule=1"));
-        assert!(invalid_pattern.contains("pcre2_kind=compile"));
-        assert!(invalid_pattern.contains("pcre2_code="));
-        assert!(invalid_pattern.contains("pcre2_offset="));
-        assert!(!invalid_pattern.contains("PATTERN_PAYLOAD_SENTINEL"));
+        let invalid_pattern_problem =
+            &invalid_pattern["primary"]["issue"]["details"]["problem"]["problem"];
+        assert_eq!(invalid_pattern_problem["kind"], "invalid_pattern");
+        assert_eq!(invalid_pattern_problem["rule_number"], 1);
+        assert_eq!(invalid_pattern_problem["failure"]["kind"], "compile");
+        assert!(invalid_pattern_problem["failure"]["code"].is_number());
+        assert!(invalid_pattern_problem["failure"]["offset"].is_number());
+        assert!(
+            !invalid_pattern
+                .to_string()
+                .contains("PATTERN_PAYLOAD_SENTINEL")
+        );
 
         let invalid_capture = toml_diagnostic(
             "[[rule]]\ncode = 401\nparameter = 0\npattern = '(?<CAPTURE_NAME_SENTINEL>.+)'\n",
         );
-        assert!(invalid_capture.contains("actual_count=1"));
-        assert!(!invalid_capture.contains("CAPTURE_NAME_SENTINEL"));
+        let invalid_capture_problem =
+            &invalid_capture["primary"]["issue"]["details"]["problem"]["problem"];
+        assert_eq!(invalid_capture_problem["kind"], "invalid_named_captures");
+        assert_eq!(invalid_capture_problem["actual_count"], 1);
+        assert!(
+            !invalid_capture
+                .to_string()
+                .contains("CAPTURE_NAME_SENTINEL")
+        );
 
         let path = PathBuf::from("rules/safe-main.toml");
         let canonical_error = RulesProgram::from_canonical_json(
@@ -1312,13 +1421,71 @@ path = 'entries[0].right.Name'
             r#"[{"code":"CANONICAL_VALUE_SENTINEL","parameter":0}]"#,
         )
         .expect_err("错误类型的 canonical 字段必须失败");
-        let canonical = serde_json::to_string(&canonical_error.safe_diagnostic(&path))
+        let canonical = serde_json::to_value(canonical_error.diagnostic_report(&path))
             .expect("canonical 诊断应可序列化");
-        assert!(canonical.contains("format=canonical_json"));
-        assert!(canonical.contains("json_category=data"));
-        assert!(canonical.contains("json_line=1"));
-        assert!(canonical.contains("json_column="));
-        assert!(!canonical.contains("CANONICAL_VALUE_SENTINEL"));
+        let canonical_problem = &canonical["primary"]["issue"]["details"]["problem"]["problem"];
+        assert_eq!(
+            canonical["primary"]["issue"]["details"]["problem"]["origin"],
+            "project_snapshot"
+        );
+        assert_eq!(canonical_problem["kind"], "invalid_canonical_json");
+        assert_eq!(canonical_problem["category"], "data");
+        assert_eq!(canonical_problem["line"], 1);
+        assert!(canonical_problem["column"].is_number());
+        assert!(!canonical.to_string().contains("CANONICAL_VALUE_SENTINEL"));
+    }
+
+    #[test]
+    fn rules_definition_wire_is_derived_from_the_leaf_error() {
+        let path = PathBuf::from("rules/safe-main.toml");
+        let error = RulesProgram::from_toml(path.clone(), vec![0xff])
+            .expect_err("无效 UTF-8 必须在 Rules 输入边界失败");
+
+        assert_eq!(
+            serde_json::to_value(error.diagnostic_report(&path)).expect("诊断必须可序列化"),
+            serde_json::json!({
+                "effect": "unchanged",
+                "primary": {
+                    "code": "rpg_maker.rules.definition.invalid_utf8",
+                    "stage": "command_preparation",
+                    "issue": {
+                        "family": "rpg_maker",
+                        "details": {
+                            "stage": "rules_definition_input",
+                            "problem": {
+                                "kind": "rules_definition",
+                                "origin": "external_toml",
+                                "rules_path": "rules/safe-main.toml",
+                                "problem": {
+                                    "kind": "invalid_utf8",
+                                    "valid_up_to": 0,
+                                    "error_len": 1
+                                }
+                            }
+                        }
+                    },
+                    "resolution": "fix_input"
+                },
+                "related": []
+            })
+        );
+
+        let invalid = RulesProgram::from_toml(
+            path.clone(),
+            b"[[rule]]\nfile = 'Actors.json'\npath = 'PAYLOAD_SENTINEL..name'\n".to_vec(),
+        )
+        .expect_err("无效 Rules 路径必须失败");
+        let value = serde_json::to_value(invalid.diagnostic_report(&path))
+            .expect("Rules 路径诊断必须可序列化");
+        assert_eq!(
+            value["primary"]["issue"]["details"]["problem"]["problem"]["kind"],
+            "invalid_path"
+        );
+        assert_eq!(
+            value["primary"]["issue"]["details"]["problem"]["problem"]["failure"]["kind"],
+            "unexpected_dot"
+        );
+        assert!(!value.to_string().contains("PAYLOAD_SENTINEL"));
     }
 
     #[tokio::test]
@@ -1494,9 +1661,10 @@ parameter = 0
         assert_eq!(state.deactivations.load(Ordering::SeqCst), 1);
         assert_eq!(
             progress.snapshots(),
-            [ProgressSnapshot::indeterminate(
-                ExtractProgressPhase::RulesCommit
-            )]
+            [
+                ProgressSnapshot::indeterminate(ExtractProgressPhase::RulesCommit),
+                ProgressSnapshot::determinate(ExtractProgressPhase::RulesCommit, 1, 1),
+            ]
         );
     }
 
@@ -1543,69 +1711,51 @@ parameter = 0
 
     impl Error for FakeError {}
 
-    impl SafeDiagnosticSource for FakeError {
-        fn safe_diagnostic_source(
-            &self,
-            stage: DiagnosticStage,
-            impact: DiagnosticImpact,
-            fallback_action: DiagnosticAction,
-        ) -> SafeDiagnostic {
-            SafeDiagnostic::new(
-                DiagnosticCode::InternalOperation,
-                stage,
-                DiagnosticSubject::component("fake_rules_dependency"),
-                DiagnosticReason::failure(DiagnosticFailureKind::InternalInvariant),
-                impact,
-                fallback_action,
-            )
-        }
-    }
-
     impl RpgMakerProjectDocumentReadingDiagnostic for FakeError {
-        fn safe_document_reading_diagnostic(
+        fn document_reading_diagnostic_report(
             &self,
-            code: DiagnosticCode,
-            stage: DiagnosticStage,
-        ) -> SafeDiagnostic {
-            SafeDiagnostic::new(
-                code,
-                stage,
-                DiagnosticSubject::component("fake_rules_document_reader"),
-                DiagnosticReason::failure(DiagnosticFailureKind::InvalidValue),
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
+            consumer: crate::diagnostic::RpgMakerDocumentConsumer,
+        ) -> DiagnosticReport {
+            DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::rpg_maker(RpgMakerIssue::document(
+                    consumer,
+                    crate::diagnostic::RpgMakerDocumentOperation::Read,
+                    crate::diagnostic::RpgMakerDocumentProblem::NotFound {
+                        path: crate::diagnostic::SafePath::new("fake/data/Items.json"),
+                    },
+                )),
             )
         }
     }
 
-    impl SafeDiagnosticSource for CpuTaskExecutionError<FakeError> {
-        fn safe_diagnostic_source(
+    impl super::super::store::RpgMakerExtractionStoreDiagnostic for FakeError {
+        fn extraction_store_diagnostic_report(
             &self,
-            stage: DiagnosticStage,
-            impact: DiagnosticImpact,
-            fallback_action: DiagnosticAction,
-        ) -> SafeDiagnostic {
-            match self {
-                Self::Unavailable(source) => {
-                    source.safe_diagnostic_source(stage, impact, fallback_action)
-                }
-                Self::Cancelled => SafeDiagnostic::new(
-                    DiagnosticCode::InternalOperation,
-                    stage,
-                    DiagnosticSubject::component("fake Rules CPU worker"),
-                    DiagnosticReason::failure(DiagnosticFailureKind::LockCancelled),
-                    impact,
-                    DiagnosticAction::Retry,
-                ),
-                Self::TaskPanicked => SafeDiagnostic::new(
-                    DiagnosticCode::InternalOperation,
-                    stage,
-                    DiagnosticSubject::component("fake Rules CPU worker"),
-                    DiagnosticReason::failure(DiagnosticFailureKind::WorkerPanicked),
-                    impact,
-                    DiagnosticAction::ReportBug,
-                ),
-            }
+            owner: crate::diagnostic::RpgMakerDiagnosticOwner,
+        ) -> DiagnosticReport {
+            DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::rpg_maker(RpgMakerIssue::extraction(
+                    crate::diagnostic::RpgMakerExtractionProblem::Store {
+                        owner,
+                        database_path: crate::diagnostic::SafePath::new("fake/project.sqlite3"),
+                        operation:
+                            crate::diagnostic::RpgMakerExtractionStoreOperation::CommitSnapshot,
+                        problem:
+                            crate::diagnostic::RpgMakerExtractionStoreProblem::DatabaseNotFound,
+                    },
+                )),
+            )
+        }
+    }
+
+    impl super::super::RpgMakerExtractionCpuDiagnostic for CpuTaskExecutionError<FakeError> {
+        fn extraction_cpu_diagnostic(&self) -> Diagnostic {
+            Diagnostic::runtime(crate::diagnostic::RuntimeIssue::ExecutorClosed {
+                component: crate::diagnostic::RuntimeComponent::CpuExecutor,
+                operation: crate::diagnostic::RuntimeOperation::ExecuteTask,
+            })
         }
     }
 
@@ -1624,18 +1774,33 @@ parameter = 0
                     Some(&ordinary_parameter),
                 ),
             };
-        let diagnostic = error.safe_diagnostic();
+        let diagnostic = error.diagnostic_report();
         let serialized = serde_json::to_string(&diagnostic).expect("诊断应可序列化");
 
         assert!(!serialized.contains("ORIGINAL_TEXT_AND_JSON_BODY_SENTINEL"));
-        assert!(serialized.contains("extract.rules"));
+        assert!(serialized.contains("rpg_maker.rules.invalid_target"));
         assert!(serialized.contains("rules/main.toml"));
-        assert!(serialized.contains("rules_invalid_target"));
-        assert!(serialized.contains("rule=7"));
-        assert!(serialized.contains("plugin_index=3"));
-        assert!(serialized.contains("target=parameters"));
-        assert!(serialized.contains("expected=object"));
-        assert!(serialized.contains("actual=string"));
+        let wire = serde_json::to_value(diagnostic).expect("Rules 诊断必须可序列化");
+        assert_eq!(
+            wire["primary"]["issue"]["details"]["problem"]["problem"]["rule_number"],
+            7
+        );
+        assert_eq!(
+            wire["primary"]["issue"]["details"]["problem"]["problem"]["reason"]["plugin_index"],
+            3
+        );
+        assert_eq!(
+            wire["primary"]["issue"]["details"]["problem"]["problem"]["reason"]["field"],
+            "parameters"
+        );
+        assert_eq!(
+            wire["primary"]["issue"]["details"]["problem"]["problem"]["reason"]["expected"],
+            "object"
+        );
+        assert_eq!(
+            wire["primary"]["issue"]["details"]["problem"]["problem"]["reason"]["actual"],
+            "string"
+        );
     }
 
     #[test]
@@ -1647,7 +1812,7 @@ parameter = 0
         >;
         type TypedRulesError = RulesExtractionError<
             TypedDocumentError,
-            crate::runtime::sqlite::SqliteRuntimeError,
+            FakeError,
             crate::runtime::cpu::CpuExecutorUnavailable,
         >;
 
@@ -1667,18 +1832,17 @@ parameter = 0
                 },
             },
         };
-        let borrowed = read_error.safe_diagnostic();
-        assert_eq!(borrowed.code, DiagnosticCode::ExtractRules);
-        assert_eq!(borrowed.stage, DiagnosticStage::Extract);
-        let report = read_error.into_failure_report();
-        assert!(report.primary.source_error().is::<TypedDocumentError>());
-        let read = serde_json::to_string(report.primary.public()).expect("文档诊断应可序列化");
+        let borrowed = read_error.diagnostic_report();
         assert_eq!(
-            report.primary.public().subject,
-            DiagnosticSubject::path(&document_path)
+            borrowed.primary().code(),
+            "rpg_maker.document.backend_failed"
         );
-        assert!(read.contains(rules_path.to_string_lossy().as_ref()));
-        assert!(read.contains("read_rules_document"));
+        assert_eq!(borrowed.effect(), StateEffect::Unchanged);
+        let failure = read_error.into_diagnostic_failure();
+        assert!(failure.source_error().is::<TypedRulesError>());
+        let read = serde_json::to_string(failure.report()).expect("文档诊断应可序列化");
+        assert!(read.contains(r#"C:\\games\\demo\\data\\Items.json"#));
+        assert!(read.contains("filesystem.io"));
         assert!(read.contains("\"raw_os_code\":5"));
 
         let cpu_error: TypedRulesError = RulesExtractionError::MatchSourceCompute {
@@ -1687,27 +1851,21 @@ parameter = 0
                 crate::runtime::cpu::CpuExecutorUnavailable::StatePoisoned,
             ),
         };
-        let report = cpu_error.into_failure_report();
-        assert!(
-            report
-                .primary
-                .source_error()
-                .is::<CpuTaskExecutionError<crate::runtime::cpu::CpuExecutorUnavailable>>()
-        );
-        let cpu = serde_json::to_string(report.primary.public()).expect("CPU 诊断应可序列化");
-        assert!(cpu.contains("worker_panicked"));
-        assert!(cpu.contains("rules_operation=match_source"));
+        let failure = cpu_error.into_diagnostic_failure();
+        assert!(failure.source_error().is::<TypedRulesError>());
+        let cpu = serde_json::to_string(failure.report()).expect("CPU 诊断应可序列化");
+        assert!(cpu.contains("state_poisoned"));
+        assert!(cpu.contains("rules_match_source"));
         assert!(cpu.contains("rules/main.toml"));
 
         let build_cpu_error: TypedRulesError = RulesExtractionError::BuildSnapshotCompute {
             rules_path: rules_path.clone(),
             source: CpuTaskExecutionError::Cancelled,
         };
-        let report = build_cpu_error.into_failure_report();
-        let build_cpu =
-            serde_json::to_string(report.primary.public()).expect("快照 CPU 诊断应可序列化");
-        assert!(build_cpu.contains("lock_cancelled"));
-        assert!(build_cpu.contains("rules_operation=build_snapshot"));
+        let failure = build_cpu_error.into_diagnostic_failure();
+        let build_cpu = serde_json::to_string(failure.report()).expect("快照 CPU 诊断应可序列化");
+        assert!(build_cpu.contains("cancelled"));
+        assert!(build_cpu.contains("rules_build_snapshot"));
 
         let ordinary_parameter = json!("ORIGINAL_AND_JSON_BODY_SENTINEL");
         let target_error: TypedRulesError = RulesExtractionError::InvalidTarget {
@@ -1721,22 +1879,22 @@ parameter = 0
                 Some(&ordinary_parameter),
             ),
         };
-        let report = target_error.into_failure_report();
-        assert!(report.primary.source_error().is::<RulesMatchError>());
-        let target = serde_json::to_string(report.primary.public()).expect("匹配诊断应可序列化");
-        assert!(target.contains("rules_invalid_target"));
-        assert!(target.contains("rule=7"));
+        let failure = target_error.into_diagnostic_failure();
+        assert!(failure.source_error().is::<TypedRulesError>());
+        let target = serde_json::to_string(failure.report()).expect("匹配诊断应可序列化");
+        assert!(target.contains("rpg_maker.rules.invalid_target"));
+        assert!(target.contains("\"rule_number\":7"));
         assert!(!target.contains("ORIGINAL_AND_JSON_BODY_SENTINEL"));
 
         let snapshot_error: TypedRulesError = RulesExtractionError::InvalidSnapshot {
             rules_path,
             source: SnapshotModelError::Projection(ProjectionModelError::EmptyScalarFieldKey),
         };
-        let report = snapshot_error.into_failure_report();
-        assert!(report.primary.source_error().is::<SnapshotModelError>());
-        let snapshot = serde_json::to_string(report.primary.public()).expect("快照诊断应可序列化");
-        assert!(snapshot.contains("rules_snapshot_invalid"));
-        assert!(snapshot.contains("snapshot_error=projection.empty_scalar_field_key"));
+        let failure = snapshot_error.into_diagnostic_failure();
+        assert!(failure.source_error().is::<TypedRulesError>());
+        let snapshot = serde_json::to_string(failure.report()).expect("快照诊断应可序列化");
+        assert!(snapshot.contains("rpg_maker.extract.snapshot.invalid_projection"));
+        assert!(snapshot.contains("empty_scalar_field_key"));
     }
 
     #[test]
@@ -1772,27 +1930,20 @@ parameter = 0
             },
         };
 
-        let borrowed = error.safe_diagnostic();
-        assert_eq!(borrowed.impact, DiagnosticImpact::OutcomeUnknown);
-        let report = error.into_failure_report();
+        let borrowed = error.diagnostic_report();
+        assert_eq!(borrowed.effect(), StateEffect::OutcomeUnknown);
+        assert_eq!(borrowed.related().len(), 1);
         assert_eq!(
-            report.primary.public().impact,
-            DiagnosticImpact::OutcomeUnknown
+            borrowed.related()[0].report().effect(),
+            StateEffect::OutcomeUnknown
         );
-        assert_eq!(report.related.len(), 1);
-        assert_eq!(
-            report.related[0].public().impact,
-            DiagnosticImpact::OutcomeUnknown
-        );
-        let primary =
-            serde_json::to_string(report.primary.public()).expect("Store 主诊断应可序列化");
-        let related =
-            serde_json::to_string(report.related[0].public()).expect("Store 相关诊断应可序列化");
-        assert!(primary.contains("rules/main.toml"));
+        let failure = error.into_diagnostic_failure();
+        assert!(failure.source_error().is::<TypedRulesError>());
+        let primary = serde_json::to_string(failure.report()).expect("Store 主诊断应可序列化");
         assert!(primary.contains("project.db"));
         assert!(primary.contains("outcome_unknown"));
         assert!(primary.contains("\"raw_os_code\":1117"));
-        assert!(related.contains("\"raw_os_code\":6"));
+        assert!(primary.contains("\"raw_os_code\":6"));
     }
 
     #[derive(Clone)]

@@ -6,6 +6,10 @@ use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 
+use crate::diagnostic::{
+    Diagnostic, DiagnosticReport, GenericDiagnosticStage, GenericIssue, GenericProblem,
+    GenericWriteBackSnapshotProblem, SafeIdentifier, SafePath, StateEffect,
+};
 use crate::execution::CooperativeCancellation;
 
 #[cfg(test)]
@@ -61,9 +65,7 @@ impl GenericWriteBackCandidate {
 #[derive(Debug)]
 pub(crate) enum GenericWriteBackError {
     SourceChanged,
-    SnapshotMismatch {
-        detail: String,
-    },
+    SnapshotMismatch(GenericWriteBackSnapshotProblem),
     MaterializedMismatch {
         path: PathBuf,
         bytes_changed: bool,
@@ -76,8 +78,8 @@ impl fmt::Display for GenericWriteBackError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::SourceChanged => formatter.write_str("Generic 输入已变化，请先运行 Extract"),
-            Self::SnapshotMismatch { detail } => {
-                write!(formatter, "Generic 数据库快照与当前输入不一致：{detail}")
+            Self::SnapshotMismatch(problem) => {
+                write!(formatter, "Generic 数据库快照与当前输入不一致：{problem:?}")
             }
             Self::MaterializedMismatch {
                 path,
@@ -97,9 +99,9 @@ impl Error for GenericWriteBackError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Jsonl(source) => Some(source),
-            Self::SourceChanged
-            | Self::SnapshotMismatch { .. }
-            | Self::MaterializedMismatch { .. } => None,
+            Self::SourceChanged | Self::SnapshotMismatch(_) | Self::MaterializedMismatch { .. } => {
+                None
+            }
         }
     }
 }
@@ -107,6 +109,35 @@ impl Error for GenericWriteBackError {
 impl GenericWriteBackError {
     pub(crate) fn is_cancelled(&self) -> bool {
         matches!(self, Self::Jsonl(source) if source.is_cancelled())
+    }
+
+    pub(crate) fn diagnostic_report(&self, effect: StateEffect) -> DiagnosticReport {
+        let diagnostic = match self {
+            Self::SourceChanged => Diagnostic::generic(GenericIssue::project(
+                GenericDiagnosticStage::WriteBack,
+                GenericProblem::WriteBackSourceChanged,
+            )),
+            Self::SnapshotMismatch(problem) => Diagnostic::generic(GenericIssue::project(
+                GenericDiagnosticStage::WriteBack,
+                GenericProblem::WriteBackSnapshotMismatch {
+                    problem: problem.clone(),
+                },
+            )),
+            Self::MaterializedMismatch {
+                path,
+                bytes_changed,
+                structure_changed,
+            } => Diagnostic::generic(GenericIssue::project(
+                GenericDiagnosticStage::WriteBack,
+                GenericProblem::WriteBackMaterializedMismatch {
+                    path: SafePath::new(path),
+                    bytes_changed: *bytes_changed,
+                    structure_changed: *structure_changed,
+                },
+            )),
+            Self::Jsonl(source) => source.diagnostic(GenericDiagnosticStage::WriteBack),
+        };
+        DiagnosticReport::new(effect, diagnostic)
     }
 }
 
@@ -143,9 +174,12 @@ pub(crate) fn build_write_back_candidate_with_cancellation(
         return Err(GenericWriteBackError::SourceChanged);
     }
     if stored.files().len() != live.files().len() {
-        return Err(GenericWriteBackError::SnapshotMismatch {
-            detail: "文件数量不同".to_owned(),
-        });
+        return Err(GenericWriteBackError::SnapshotMismatch(
+            GenericWriteBackSnapshotProblem::FileCount {
+                stored: stored.files().len(),
+                input: live.files().len(),
+            },
+        ));
     }
 
     let built_files = stored
@@ -192,29 +226,38 @@ fn build_write_back_file(
 ) -> Result<BuiltWriteBackFile, GenericWriteBackError> {
     ensure_write_back_running(cancellation)?;
     if stored_file.relative_path() != live_file.relative_path() {
-        return Err(GenericWriteBackError::SnapshotMismatch {
-            detail: format!(
-                "文件位置不同：数据库 {}，输入 {}",
-                stored_file.relative_path().display(),
-                live_file.relative_path().display()
-            ),
-        });
+        return Err(GenericWriteBackError::SnapshotMismatch(
+            GenericWriteBackSnapshotProblem::FilePath {
+                stored_path: SafePath::new(stored_file.relative_path()),
+                input_path: SafePath::new(live_file.relative_path()),
+            },
+        ));
     }
     if stored_file.groups().len() != live_file.groups().len() {
-        return Err(GenericWriteBackError::SnapshotMismatch {
-            detail: format!("{} 的 Group 数量不同", live_file.relative_path().display()),
-        });
+        return Err(GenericWriteBackError::SnapshotMismatch(
+            GenericWriteBackSnapshotProblem::GroupCount {
+                relative_path: SafePath::new(live_file.relative_path()),
+                stored: stored_file.groups().len(),
+                input: live_file.groups().len(),
+            },
+        ));
     }
 
     let mut translated_units = 0;
     let mut retained_source_units = 0;
     let mut output_groups = Vec::with_capacity(live_file.groups().len());
-    for (stored_group, live_group) in stored_file.groups().iter().zip(live_file.groups()) {
+    for (group_ordinal, (stored_group, live_group)) in stored_file
+        .groups()
+        .iter()
+        .zip(live_file.groups())
+        .enumerate()
+    {
         ensure_write_back_running(cancellation)?;
         validate_group_shape(
             stored_group,
             live_group,
             live_file.relative_path(),
+            group_ordinal,
             cancellation,
         )?;
         let mut output_units = Vec::with_capacity(live_group.units().len());
@@ -251,6 +294,7 @@ fn validate_group_shape(
     stored: &super::project::GenericStoredGroup,
     live: &super::jsonl::GenericGroup,
     path: &Path,
+    group_ordinal: usize,
     cancellation: &CooperativeCancellation,
 ) -> Result<(), GenericWriteBackError> {
     ensure_write_back_running(cancellation)?;
@@ -258,11 +302,17 @@ fn validate_group_shape(
         || !text_equal_with_cancellation(stored.kind(), live.kind(), cancellation)?
         || stored.units().len() != live.units().len()
     {
-        return Err(GenericWriteBackError::SnapshotMismatch {
-            detail: format!("{} 中的 Group {} 结构不同", path.display(), live.id()),
-        });
+        return Err(GenericWriteBackError::SnapshotMismatch(
+            GenericWriteBackSnapshotProblem::GroupShape {
+                relative_path: SafePath::new(path),
+                group_ordinal,
+                group_id: SafeIdentifier::new(live.id()).ok(),
+            },
+        ));
     }
-    for (stored_unit, live_unit) in stored.units().iter().zip(live.units()) {
+    for (unit_ordinal, (stored_unit, live_unit)) in
+        stored.units().iter().zip(live.units()).enumerate()
+    {
         ensure_write_back_text_running(live_unit.text(), cancellation)?;
         if !text_equal_with_cancellation(stored_unit.id(), live_unit.id(), cancellation)?
             || !text_equal_with_cancellation(
@@ -271,14 +321,15 @@ fn validate_group_shape(
                 cancellation,
             )?
         {
-            return Err(GenericWriteBackError::SnapshotMismatch {
-                detail: format!(
-                    "{} 中的 Unit {}/{} 结构或原文不同",
-                    path.display(),
-                    live.id(),
-                    live_unit.id()
-                ),
-            });
+            return Err(GenericWriteBackError::SnapshotMismatch(
+                GenericWriteBackSnapshotProblem::UnitShapeOrSource {
+                    relative_path: SafePath::new(path),
+                    group_ordinal,
+                    unit_ordinal,
+                    group_id: SafeIdentifier::new(live.id()).ok(),
+                    unit_id: SafeIdentifier::new(live_unit.id()).ok(),
+                },
+            ));
         }
     }
     Ok(())
@@ -296,14 +347,17 @@ fn validate_round_trip(
         cancellation,
     )?;
     if source.groups().len() != candidate.groups().len() {
-        return Err(GenericWriteBackError::SnapshotMismatch {
-            detail: format!(
-                "{} 的候选往返后 Group 数量变化",
-                source.relative_path().display()
-            ),
-        });
+        return Err(GenericWriteBackError::SnapshotMismatch(
+            GenericWriteBackSnapshotProblem::RoundTripGroupCount {
+                relative_path: SafePath::new(source.relative_path()),
+                source: source.groups().len(),
+                candidate: candidate.groups().len(),
+            },
+        ));
     }
-    for (original_group, candidate_group) in source.groups().iter().zip(candidate.groups()) {
+    for (group_ordinal, (original_group, candidate_group)) in
+        source.groups().iter().zip(candidate.groups()).enumerate()
+    {
         ensure_write_back_running(cancellation)?;
         if !text_equal_with_cancellation(original_group.id(), candidate_group.id(), cancellation)?
             || !text_equal_with_cancellation(
@@ -313,19 +367,32 @@ fn validate_round_trip(
             )?
             || original_group.units().len() != candidate_group.units().len()
         {
-            return Err(GenericWriteBackError::SnapshotMismatch {
-                detail: format!(
-                    "{} 的候选改变了 Group 结构",
-                    source.relative_path().display()
-                ),
-            });
+            return Err(GenericWriteBackError::SnapshotMismatch(
+                GenericWriteBackSnapshotProblem::RoundTripGroupShape {
+                    relative_path: SafePath::new(source.relative_path()),
+                    group_ordinal,
+                    group_id: SafeIdentifier::new(original_group.id()).ok(),
+                },
+            ));
         }
-        for (original, candidate) in original_group.units().iter().zip(candidate_group.units()) {
+        for (unit_ordinal, (original, candidate)) in original_group
+            .units()
+            .iter()
+            .zip(candidate_group.units())
+            .enumerate()
+        {
             ensure_write_back_text_running(candidate.text(), cancellation)?;
             if !text_equal_with_cancellation(original.id(), candidate.id(), cancellation)? {
-                return Err(GenericWriteBackError::SnapshotMismatch {
-                    detail: format!("{} 的候选改变了 Unit ID", source.relative_path().display()),
-                });
+                return Err(GenericWriteBackError::SnapshotMismatch(
+                    GenericWriteBackSnapshotProblem::RoundTripUnitId {
+                        relative_path: SafePath::new(source.relative_path()),
+                        group_ordinal,
+                        unit_ordinal,
+                        group_id: SafeIdentifier::new(original_group.id()).ok(),
+                        expected_unit_id: SafeIdentifier::new(original.id()).ok(),
+                        actual_unit_id: SafeIdentifier::new(candidate.id()).ok(),
+                    },
+                ));
             }
             let expected = translations
                 .get_parts_with_cancellation(original_group.id(), original.id(), || {
@@ -333,14 +400,15 @@ fn validate_round_trip(
                 })?
                 .map_or(original.text(), String::as_str);
             if !text_equal_with_cancellation(candidate.text(), expected, cancellation)? {
-                return Err(GenericWriteBackError::SnapshotMismatch {
-                    detail: format!(
-                        "{} 的候选 Unit {}/{} text 不符合预期",
-                        source.relative_path().display(),
-                        original_group.id(),
-                        original.id()
-                    ),
-                });
+                return Err(GenericWriteBackError::SnapshotMismatch(
+                    GenericWriteBackSnapshotProblem::RoundTripUnitText {
+                        relative_path: SafePath::new(source.relative_path()),
+                        group_ordinal,
+                        unit_ordinal,
+                        group_id: SafeIdentifier::new(original_group.id()).ok(),
+                        unit_id: SafeIdentifier::new(original.id()).ok(),
+                    },
+                ));
             }
         }
     }

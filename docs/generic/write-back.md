@@ -38,16 +38,26 @@ Extract。
 
 诊断属于目录发布器且恢复路径是 `.directory-publish-*.(stage|backup|journal)` 时，保持
 项目、输入、目标和恢复产物不变，按[目录发布规格第 4 节](../runtime/directory-publishing.md#4-一次发布与恢复)
-检查主诊断和全部相关诊断的 `impact`、`reason` 与 `recovery[*].path`。先排除损坏 journal、
+读取 `diagnostic.publication` occurrence 的 `report.effect`、`primary` 和递归 `related`。
+目录发布 issue 直接保存 `output_root`、`candidate_root`、`residual_path` 或
+`recovery_artifacts`，嵌套 backend diagnostic 保存具体文件系统 code、operation、I/O kind
+和 OS code；不从本地化 message 或通用 detail 猜测。先排除 `filesystem.journal_corrupt`、
 目标与已知旧目录均缺失、缺少必要 backup 等不能自动修复的情况，并修正实际文件系统
 原因；只有符合自动恢复条件时，才执行一次同一项目、同一目标的 WriteBack。
 
-若 operation 是 `generic_write_back_candidate_cleanup`，遍历主诊断和全部相关诊断列出的
-每个恢复路径：`.directory-publish-*` 仍按上一段条件判断，不能因为路径名匹配就直接重跑；项目工作区中的
-`.generic-write-back-*` 没有公开清理入口。两类残留可能同时存在，处理前者不表示后者已经
-解决。对 scratch 残留读取相关主诊断：状态明确未发布时，修正原失败后可以重新 WriteBack，
-但新运行不会清除旧路径；旧残留必须报告，只有操作者核实精确路径并明确授权外部删除后
-才能处理。诊断为 `outcome_unknown` 时禁止重跑试探，保留现场并报告。
+若同一 occurrence 的 `related` 中存在 `relation = "cleanup"`，逐项读取其 FileSystem issue
+中的精确 path：`.directory-publish-*` 仍按上一段条件判断，不能因为路径名匹配就直接重跑；
+项目工作区中的 `.generic-write-back-*` 没有公开清理入口。两类残留可能同时存在，处理前者
+不表示后者已经解决。对 scratch 残留同时读取主 report 和
+`publication.finished.payload.result`：结果明确 `not_published` 时，修正原失败后可以重新
+WriteBack，但新运行不会清除旧路径；旧残留必须报告，只有操作者核实精确路径并明确授权
+外部删除后才能处理。result 为 `outcome_unknown` 或 report effect 为 `outcome_unknown` 时
+禁止重跑试探，保留现场并报告。
+
+Generic WriteBack 必须写 `publication.started` 和唯一 `publication.finished`。成功结果为
+`published`，汇总 `files`、`translated_units` 与 `retained_source_units`；失败结果为
+`not_published`、`recovery_required` 或 `outcome_unknown`，并引用同一
+`diagnostic.publication` occurrence，不复制诊断。
 
 发布完成后，外部操作者仍需消费全部译后 JSONL，并按
 [全量验收指南](../guides/acceptance.md)核对完整写回、源语残留、组合项目和实际消费者。

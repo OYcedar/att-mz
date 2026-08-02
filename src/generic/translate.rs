@@ -4,12 +4,14 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
-#[cfg(test)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 
+use crate::diagnostic::{
+    GenericResponseDestinationProblem, GenericResponseTextProblem, GenericResponseValueProblem,
+    GenericTaskResponseProblem, GenericUnitLocator as DiagnosticGenericUnitLocator,
+};
 use crate::execution::CooperativeCancellation;
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::language::LanguagePair;
@@ -55,6 +57,47 @@ impl GenericUnitKey {
 
     pub(crate) fn unit_id(&self) -> &str {
         &self.unit_id
+    }
+}
+
+/// 规划阶段保留的完整自然位置；稳定身份仍只由 [`GenericUnitKey`] 决定。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GenericPlanningUnitLocator {
+    relative_path: PathBuf,
+    group_id: String,
+    unit_id: String,
+    role: String,
+}
+
+impl GenericPlanningUnitLocator {
+    pub(crate) fn new(
+        relative_path: impl AsRef<Path>,
+        group_id: impl Into<String>,
+        unit_id: impl Into<String>,
+        role: impl Into<String>,
+    ) -> Self {
+        Self {
+            relative_path: relative_path.as_ref().to_path_buf(),
+            group_id: group_id.into(),
+            unit_id: unit_id.into(),
+            role: role.into(),
+        }
+    }
+
+    pub(crate) fn relative_path(&self) -> &Path {
+        &self.relative_path
+    }
+
+    pub(crate) fn group_id(&self) -> &str {
+        &self.group_id
+    }
+
+    pub(crate) fn unit_id(&self) -> &str {
+        &self.unit_id
+    }
+
+    pub(crate) fn role(&self) -> &str {
+        &self.role
     }
 }
 
@@ -209,6 +252,7 @@ fn generic_unit_key_matches_parts_with_cancellation<E>(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PlanningUnit {
     key: GenericUnitKey,
+    locator: GenericPlanningUnitLocator,
     protected_text: String,
     placeholder_binding_fingerprint: Sha256Fingerprint,
     terminology_indices: Vec<usize>,
@@ -254,10 +298,27 @@ pub(crate) struct AutomaticStateResources {
     pub(crate) terminology_hits: Sha256Fingerprint,
 }
 
+/// 测试中从受信持久化记录建立 PlanningUnit 所需的全部事实。
+///
+/// 生产路径使用带取消检查的独立参数版本；这个测试夹具把同一组事实作为一个值传入，避免
+/// 测试辅助函数重新形成难以维护的长参数列表。
+#[cfg(test)]
+struct StoredPlanningUnitInput<'a> {
+    relative_path: &'a Path,
+    project: &'a GenericProject,
+    group: &'a GenericStoredGroup,
+    unit: &'a GenericStoredUnit,
+    protected: &'a GenericProtectedText,
+    terminology_indices: Vec<usize>,
+    needs_translation: bool,
+    resources: AutomaticStateResources,
+}
+
 impl PlanningUnit {
     #[cfg(test)]
     pub(crate) fn new(
         key: GenericUnitKey,
+        locator: GenericPlanningUnitLocator,
         protected_text: String,
         placeholder_binding_fingerprint: Sha256Fingerprint,
         needs_translation: bool,
@@ -269,6 +330,7 @@ impl PlanningUnit {
             .map(|text| CurrentContext::SafeTarget(text.clone()));
         Self {
             key,
+            locator,
             protected_text,
             placeholder_binding_fingerprint,
             terminology_indices: Vec::new(),
@@ -283,23 +345,16 @@ impl PlanningUnit {
 
     /// 用持久化记录和本次实际资源计算 Current，调用方不需要解释状态字段。
     #[cfg(test)]
-    pub(crate) fn from_stored(
-        project: &GenericProject,
-        group: &GenericStoredGroup,
-        unit: &GenericStoredUnit,
-        protected: &GenericProtectedText,
-        terminology_indices: Vec<usize>,
-        needs_translation: bool,
-        resources: AutomaticStateResources,
-    ) -> Self {
+    fn from_stored(input: StoredPlanningUnitInput<'_>) -> Self {
         Self::from_stored_with_cancellation(
-            project,
-            group,
-            unit,
-            protected,
-            terminology_indices,
-            needs_translation,
-            resources,
+            input.relative_path,
+            input.project,
+            input.group,
+            input.unit,
+            input.protected,
+            input.terminology_indices,
+            input.needs_translation,
+            input.resources,
             &CooperativeCancellation::default(),
         )
         .expect("不取消的受信 PlanningUnit 必须可以建立")
@@ -307,6 +362,7 @@ impl PlanningUnit {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_stored_with_cancellation(
+        relative_path: &Path,
         project: &GenericProject,
         group: &GenericStoredGroup,
         unit: &GenericStoredUnit,
@@ -349,6 +405,12 @@ impl PlanningUnit {
             (None, previous)
         };
         Ok(Self {
+            locator: GenericPlanningUnitLocator::new(
+                relative_path,
+                clone_translation_text(group.id(), cancellation)?,
+                clone_translation_text(unit.id(), cancellation)?,
+                clone_translation_text(group.kind(), cancellation)?,
+            ),
             key,
             protected_text: clone_translation_text(protected.text(), cancellation)?,
             placeholder_binding_fingerprint,
@@ -364,6 +426,10 @@ impl PlanningUnit {
 
     pub(crate) fn key(&self) -> &GenericUnitKey {
         &self.key
+    }
+
+    pub(crate) fn locator(&self) -> &GenericPlanningUnitLocator {
+        &self.locator
     }
 
     pub(crate) fn needs_candidate(&self) -> bool {
@@ -574,6 +640,7 @@ impl PlannedGroup {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PlannedDestination {
     key: GenericUnitKey,
+    locator: GenericPlanningUnitLocator,
     expected_source_text: String,
     expected_group_context: Sha256Fingerprint,
     expected_state_fingerprint: Sha256Fingerprint,
@@ -648,10 +715,10 @@ impl TranslationPlan {
 pub(crate) enum GenericPlanningError {
     Cancelled,
     TaskPlanning(TaskPlanningError),
-    MissingCurrentContext(GenericUnitKey),
-    Missing(GenericUnitKey),
-    Unknown(GenericUnitKey),
-    Duplicate(GenericUnitKey),
+    MissingCurrentContext(GenericPlanningUnitLocator),
+    Missing(GenericPlanningUnitLocator),
+    Unknown(GenericPlanningUnitLocator),
+    Duplicate(GenericPlanningUnitLocator),
 }
 
 impl fmt::Display for GenericPlanningError {
@@ -659,25 +726,25 @@ impl fmt::Display for GenericPlanningError {
         match self {
             Self::Cancelled => formatter.write_str("Generic 翻译规划已取消"),
             Self::TaskPlanning(source) => source.fmt(formatter),
-            Self::MissingCurrentContext(key) => write!(
+            Self::MissingCurrentContext(locator) => write!(
                 formatter,
                 "Current Generic Unit 缺少安全目标语境：{}/{}",
-                key.group_id, key.unit_id
+                locator.group_id, locator.unit_id
             ),
-            Self::Missing(key) => write!(
+            Self::Missing(locator) => write!(
                 formatter,
                 "缺少 Generic Unit 的规划事实：{}/{}",
-                key.group_id, key.unit_id
+                locator.group_id, locator.unit_id
             ),
-            Self::Unknown(key) => write!(
+            Self::Unknown(locator) => write!(
                 formatter,
                 "规划事实引用了不存在的 Generic Unit：{}/{}",
-                key.group_id, key.unit_id
+                locator.group_id, locator.unit_id
             ),
-            Self::Duplicate(key) => write!(
+            Self::Duplicate(locator) => write!(
                 formatter,
                 "同一 Generic Unit 出现多份规划事实：{}/{}",
-                key.group_id, key.unit_id
+                locator.group_id, locator.unit_id
             ),
         }
     }
@@ -753,12 +820,14 @@ fn deduplication_keys_equal_with_cancellation(
 
 struct SnapshotUnitFacts<'a> {
     key: GenericUnitKey,
+    locator: GenericPlanningUnitLocator,
     source_text: &'a str,
     group_context: Sha256Fingerprint,
 }
 
 struct UnitFacts<'input, 'snapshot> {
     key: GenericUnitKey,
+    locator: GenericPlanningUnitLocator,
     input: &'input PlanningUnit,
     source_text: &'snapshot str,
     group_context: Sha256Fingerprint,
@@ -796,9 +865,7 @@ fn resolve_planning_inputs<'input>(
             .insert_with_cancellation(key, unit, || ensure_planning_not_cancelled(is_cancelled))?
             .is_some()
         {
-            return Err(GenericPlanningError::Duplicate(
-                clone_planning_key_with_cancellation(&unit.key, is_cancelled)?,
-            ));
+            return Err(GenericPlanningError::Duplicate(unit.locator().clone()));
         }
     }
 
@@ -809,9 +876,7 @@ fn resolve_planning_inputs<'input>(
         let Some(input) = supplied
             .get_with_cancellation(&natural.key, || ensure_planning_not_cancelled(is_cancelled))?
         else {
-            return Err(GenericPlanningError::Missing(
-                clone_planning_key_with_cancellation(&natural.key, is_cancelled)?,
-            ));
+            return Err(GenericPlanningError::Missing(natural.locator.clone()));
         };
         resolved.push(*input);
         let previous = known.insert_with_cancellation(
@@ -826,9 +891,7 @@ fn resolve_planning_inputs<'input>(
         if !known
             .contains_with_cancellation(&unit.key, || ensure_planning_not_cancelled(is_cancelled))?
         {
-            return Err(GenericPlanningError::Unknown(
-                clone_planning_key_with_cancellation(&unit.key, is_cancelled)?,
-            ));
+            return Err(GenericPlanningError::Unknown(unit.locator().clone()));
         }
     }
     Ok(resolved)
@@ -843,7 +906,7 @@ struct Family {
 pub(crate) fn plan_translation(
     snapshot: &GenericStoredSnapshot,
     planning_units: &[PlanningUnit],
-    reuse_validator: impl Fn(&GenericUnitKey, &str) -> Result<String, String>,
+    reuse_validator: impl Fn(&GenericUnitKey, &str) -> Result<String, GenericResponseDestinationProblem>,
 ) -> Result<TranslationPlan, GenericPlanningError> {
     plan_translation_with_cancellation(
         snapshot,
@@ -860,7 +923,7 @@ pub(crate) fn plan_translation_with_cancellation(
     snapshot: &GenericStoredSnapshot,
     planning_units: &[PlanningUnit],
     target_task_characters: NonZeroUsize,
-    reuse_validator: impl Fn(&GenericUnitKey, &str) -> Result<String, String>,
+    reuse_validator: impl Fn(&GenericUnitKey, &str) -> Result<String, GenericResponseDestinationProblem>,
     cancellation: &CooperativeCancellation,
 ) -> Result<TranslationPlan, GenericPlanningError> {
     plan_translation_with_validator_and_cancellation(
@@ -880,7 +943,10 @@ pub(crate) fn plan_translation_with_validator_and_cancellation(
     reuse_validator: impl Fn(
         &GenericUnitKey,
         &str,
-    ) -> Result<Result<ValidatedReuse, String>, GenericPlanningError>,
+    ) -> Result<
+        Result<ValidatedReuse, GenericResponseDestinationProblem>,
+        GenericPlanningError,
+    >,
     cancellation: &CooperativeCancellation,
 ) -> Result<TranslationPlan, GenericPlanningError> {
     let is_cancelled = || cancellation.is_requested();
@@ -901,6 +967,12 @@ pub(crate) fn plan_translation_with_validator_and_cancellation(
                 );
                 natural_units.push(SnapshotUnitFacts {
                     key,
+                    locator: GenericPlanningUnitLocator::new(
+                        file.relative_path(),
+                        clone_planning_text_with_cancellation(group.id(), &is_cancelled)?,
+                        clone_planning_text_with_cancellation(unit.id(), &is_cancelled)?,
+                        clone_planning_text_with_cancellation(group.kind(), &is_cancelled)?,
+                    ),
                     source_text: unit.source_text(),
                     group_context: group.context_fingerprint(),
                 });
@@ -913,6 +985,7 @@ pub(crate) fn plan_translation_with_validator_and_cancellation(
         .zip(resolved_inputs)
         .map(|(natural, input)| UnitFacts {
             key: natural.key,
+            locator: natural.locator,
             input,
             source_text: natural.source_text,
             group_context: natural.group_context,
@@ -996,7 +1069,7 @@ pub(crate) fn plan_translation_with_validator_and_cancellation(
             };
             let Some(context) = fact.input.current_context.as_ref() else {
                 return Err(GenericPlanningError::MissingCurrentContext(
-                    clone_planning_key_with_cancellation(&fact.key, &is_cancelled)?,
+                    fact.locator.clone(),
                 ));
             };
             if first_reuse_candidate.is_none() {
@@ -1020,7 +1093,7 @@ pub(crate) fn plan_translation_with_validator_and_cancellation(
             if fact.input.current_translation.is_some() {
                 let Some(context) = fact.input.current_context.as_ref() else {
                     return Err(GenericPlanningError::MissingCurrentContext(
-                        clone_planning_key_with_cancellation(&fact.key, &is_cancelled)?,
+                        fact.locator.clone(),
                     ));
                 };
                 let previous = known_targets.insert_with_cancellation(
@@ -1057,6 +1130,7 @@ pub(crate) fn plan_translation_with_validator_and_cancellation(
                     let fact = &facts[*unit_index];
                     destinations.push(PlannedDestination {
                         key: clone_planning_key_with_cancellation(&fact.key, &is_cancelled)?,
+                        locator: fact.locator.clone(),
                         expected_source_text: clone_planning_text_with_cancellation(
                             fact.source_text,
                             &is_cancelled,
@@ -1094,6 +1168,7 @@ pub(crate) fn plan_translation_with_validator_and_cancellation(
                 let fact = &facts[unit_index];
                 let destination = PlannedDestination {
                     key: clone_planning_key_with_cancellation(&fact.key, &is_cancelled)?,
+                    locator: fact.locator.clone(),
                     expected_source_text: clone_planning_text_with_cancellation(
                         fact.source_text,
                         &is_cancelled,
@@ -1167,6 +1242,7 @@ pub(crate) fn plan_translation_with_validator_and_cancellation(
             let fact = &facts[*unit_index];
             destinations.push(PlannedDestination {
                 key: clone_planning_key_with_cancellation(&fact.key, &is_cancelled)?,
+                locator: fact.locator.clone(),
                 expected_source_text: clone_planning_text_with_cancellation(
                     fact.source_text,
                     &is_cancelled,
@@ -1499,27 +1575,8 @@ impl AcceptedTranslation {
     }
 }
 
-/// 可解析响应中单个 ID 的问题；其他合法 ID 仍可保存。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ResponseProblem {
-    InvalidId(String),
-    UnexpectedId(TaskId),
-    DuplicateId(TaskId),
-    MissingId(TaskId),
-    InvalidValue {
-        output_id: TaskId,
-        detail: String,
-    },
-    InvalidTranslation {
-        output_id: TaskId,
-        detail: String,
-    },
-    InvalidDestination {
-        output_id: TaskId,
-        key: GenericUnitKey,
-        detail: String,
-    },
-}
+/// 可解析响应中单个 ID 的安全问题；日志与任务记录直接复用这一封闭类型。
+pub(crate) type ResponseProblem = GenericTaskResponseProblem;
 
 /// 一次响应的部分验收结果。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1562,8 +1619,10 @@ impl fmt::Display for GenericResponseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "Generic 模型响应不符合翻译响应协议：{}",
-            self.source.business_message()
+            "Generic 模型响应不符合翻译响应协议：{}，第 {} 行、第 {} 列",
+            self.source.kind().code(),
+            self.source.line(),
+            self.source.column(),
         )
     }
 }
@@ -1580,7 +1639,11 @@ pub(crate) fn accept_response(
     task: &PlannedTask,
     assistant_response: &str,
     response_mode: TranslationResponseMode,
-    validator: impl FnMut(TaskId, &GenericUnitKey, &str) -> Result<String, String>,
+    validator: impl FnMut(
+        TaskId,
+        &GenericUnitKey,
+        &str,
+    ) -> Result<String, GenericResponseDestinationProblem>,
 ) -> Result<TranslationAcceptance, GenericResponseError> {
     let parsed = parse_translation_response(assistant_response, response_mode)
         .map_err(|source| GenericResponseError { source })?;
@@ -1594,7 +1657,11 @@ pub(crate) fn accept_response(
 pub(crate) fn accept_parsed_response(
     task: PlannedTask,
     parsed: &ParsedTranslationResponse,
-    mut validator: impl FnMut(TaskId, &GenericUnitKey, &str) -> Result<String, String>,
+    mut validator: impl FnMut(
+        TaskId,
+        &GenericUnitKey,
+        &str,
+    ) -> Result<String, GenericResponseDestinationProblem>,
 ) -> TranslationAcceptance {
     accept_parsed_response_with_cancellation(
         task,
@@ -1612,7 +1679,10 @@ pub(crate) fn accept_parsed_response_with_cancellation(
         TaskId,
         &GenericUnitKey,
         &str,
-    ) -> Result<Result<String, String>, GenericPlanningError>,
+    ) -> Result<
+        Result<String, GenericResponseDestinationProblem>,
+        GenericPlanningError,
+    >,
     is_cancelled: impl Fn() -> bool,
 ) -> Result<TranslationAcceptance, GenericPlanningError> {
     ensure_planning_not_cancelled(&is_cancelled)?;
@@ -1634,13 +1704,13 @@ pub(crate) fn accept_parsed_response_with_cancellation(
     for entry in entries {
         ensure_planning_not_cancelled(&is_cancelled)?;
         let Some(output_id) = entry.canonical_id() else {
-            problems.push(ResponseProblem::InvalidId(
-                clone_planning_text_with_cancellation(entry.id(), &is_cancelled)?,
-            ));
+            problems.push(ResponseProblem::InvalidId);
             continue;
         };
         if !outputs.contains_key(&output_id) {
-            problems.push(ResponseProblem::UnexpectedId(output_id));
+            problems.push(ResponseProblem::UnexpectedId {
+                output_id: response_output_id(output_id),
+            });
             continue;
         }
         observed.insert(output_id);
@@ -1651,7 +1721,9 @@ pub(crate) fn accept_parsed_response_with_cancellation(
             > 1
         {
             if reported_duplicates.insert(output_id) {
-                problems.push(ResponseProblem::DuplicateId(output_id));
+                problems.push(ResponseProblem::DuplicateId {
+                    output_id: response_output_id(output_id),
+                });
             }
             continue;
         }
@@ -1660,15 +1732,19 @@ pub(crate) fn accept_parsed_response_with_cancellation(
         })?;
         let candidate = match generic_translation_candidate(decoded, &is_cancelled)? {
             Ok(candidate) => candidate,
-            Err(detail) => {
-                problems.push(ResponseProblem::InvalidValue { output_id, detail });
+            Err(problem) => {
+                problems.push(ResponseProblem::InvalidValue {
+                    output_id: response_output_id(output_id),
+                    problem,
+                });
                 continue;
             }
         };
-        if let Err(detail) = validate_candidate_text_with_cancellation(&candidate, &is_cancelled)? {
+        if let Err(problem) = validate_candidate_text_with_cancellation(&candidate, &is_cancelled)?
+        {
             problems.push(ResponseProblem::InvalidTranslation {
-                output_id,
-                detail: detail.to_owned(),
+                output_id: response_output_id(output_id),
+                problem,
             });
             continue;
         }
@@ -1682,23 +1758,23 @@ pub(crate) fn accept_parsed_response_with_cancellation(
             ensure_planning_not_cancelled(&is_cancelled)?;
             let candidate = match validator(output_id, &destination.key, &candidate)? {
                 Ok(candidate) => candidate,
-                Err(detail) => {
+                Err(problem) => {
                     problems.push(ResponseProblem::InvalidDestination {
-                        output_id,
-                        key: destination.key,
-                        detail,
+                        output_id: response_output_id(output_id),
+                        destination: diagnostic_response_locator(&destination.locator),
+                        problem,
                     });
                     continue;
                 }
             };
             ensure_planning_not_cancelled(&is_cancelled)?;
-            if let Err(detail) =
+            if let Err(problem) =
                 validate_candidate_text_with_cancellation(&candidate, &is_cancelled)?
             {
                 problems.push(ResponseProblem::InvalidDestination {
-                    output_id,
-                    key: destination.key,
-                    detail: detail.to_owned(),
+                    output_id: response_output_id(output_id),
+                    destination: diagnostic_response_locator(&destination.locator),
+                    problem: GenericResponseDestinationProblem::InvalidTranslation { problem },
                 });
                 continue;
             }
@@ -1719,7 +1795,9 @@ pub(crate) fn accept_parsed_response_with_cancellation(
     for output_id in outputs.keys() {
         ensure_planning_not_cancelled(&is_cancelled)?;
         if !observed.contains(output_id) {
-            problems.push(ResponseProblem::MissingId(*output_id));
+            problems.push(ResponseProblem::MissingId {
+                output_id: response_output_id(*output_id),
+            });
         }
     }
     ensure_planning_not_cancelled(&is_cancelled)?;
@@ -1730,38 +1808,48 @@ pub(crate) fn accept_parsed_response_with_cancellation(
     })
 }
 
+fn response_output_id(output_id: TaskId) -> u64 {
+    u64::try_from(output_id.get()).expect("当前平台 usize 必须能够无损表示为 u64")
+}
+
+fn diagnostic_response_locator(
+    locator: &GenericPlanningUnitLocator,
+) -> DiagnosticGenericUnitLocator {
+    DiagnosticGenericUnitLocator::new(
+        locator.relative_path(),
+        locator.group_id(),
+        locator.unit_id(),
+        Some(locator.role()),
+    )
+}
+
 fn generic_translation_candidate(
     decoded: DecodedTranslationAssistantValue,
     is_cancelled: &impl Fn() -> bool,
-) -> Result<Result<String, String>, GenericPlanningError> {
+) -> Result<Result<String, GenericResponseValueProblem>, GenericPlanningError> {
     let translation = match decoded {
         DecodedTranslationAssistantValue::Translation(translation) => translation,
         DecodedTranslationAssistantValue::SourceEcho(DecodedSourceEchoValue::Fields {
             source,
             translation,
         }) => {
-            if let Err(detail) = validate_response_string_array_shape(source, "source") {
-                return Ok(Err(detail));
+            if let Err(problem) = validate_response_string_array_shape(source, true) {
+                return Ok(Err(problem));
             }
             translation
         }
         DecodedTranslationAssistantValue::SourceEcho(DecodedSourceEchoValue::NotObject) => {
-            return Ok(Err(
-                "原文回显模式下，每个 ID 的值必须是只含 source 和 translation 的对象".to_owned(),
-            ));
+            return Ok(Err(GenericResponseValueProblem::SourceEchoNotObject));
         }
         DecodedTranslationAssistantValue::SourceEcho(DecodedSourceEchoValue::InvalidFields(
             error,
-        )) => return Ok(Err(source_echo_fields_error_detail(error))),
+        )) => return Ok(Err(source_echo_fields_problem(error))),
     };
 
     let lines = match translation {
         DecodedJsonStringArray::Strings(lines) => lines,
         invalid => {
-            return Ok(Err(response_string_array_shape_detail(
-                invalid,
-                "translation",
-            )));
+            return Ok(Err(response_string_array_shape_problem(invalid, false)));
         }
     };
     join_translation_lines_with_cancellation(lines, is_cancelled).map(Ok)
@@ -1769,36 +1857,51 @@ fn generic_translation_candidate(
 
 fn validate_response_string_array_shape(
     value: DecodedJsonStringArray,
-    field: &str,
-) -> Result<(), String> {
+    source_field: bool,
+) -> Result<(), GenericResponseValueProblem> {
     match value {
         DecodedJsonStringArray::Strings(_) => Ok(()),
-        invalid => Err(response_string_array_shape_detail(invalid, field)),
+        invalid => Err(response_string_array_shape_problem(invalid, source_field)),
     }
 }
 
-fn response_string_array_shape_detail(value: DecodedJsonStringArray, field: &str) -> String {
-    match value {
-        DecodedJsonStringArray::NotArray => format!("{field} 必须是字符串数组"),
-        DecodedJsonStringArray::NonStringItem { item } => {
-            format!("{field} 的第 {} 项必须是字符串", item.get())
+fn response_string_array_shape_problem(
+    value: DecodedJsonStringArray,
+    source_field: bool,
+) -> GenericResponseValueProblem {
+    match (source_field, value) {
+        (true, DecodedJsonStringArray::NotArray) => GenericResponseValueProblem::SourceNotArray,
+        (true, DecodedJsonStringArray::NonStringItem { item }) => {
+            GenericResponseValueProblem::SourceNonStringItem { item }
         }
-        DecodedJsonStringArray::Strings(_) => unreachable!("字符串数组不应进入形状错误分支"),
+        (false, DecodedJsonStringArray::NotArray) => {
+            GenericResponseValueProblem::TranslationNotArray
+        }
+        (false, DecodedJsonStringArray::NonStringItem { item }) => {
+            GenericResponseValueProblem::TranslationNonStringItem { item }
+        }
+        (_, DecodedJsonStringArray::Strings(_)) => {
+            unreachable!("字符串数组不应进入形状错误分支")
+        }
     }
 }
 
-fn source_echo_fields_error_detail(error: DecodedSourceEchoFieldsError) -> String {
+fn source_echo_fields_problem(error: DecodedSourceEchoFieldsError) -> GenericResponseValueProblem {
     match error {
-        DecodedSourceEchoFieldsError::MissingSource => "原文回显对象缺少 source".to_owned(),
+        DecodedSourceEchoFieldsError::MissingSource => {
+            GenericResponseValueProblem::SourceEchoMissingSource
+        }
         DecodedSourceEchoFieldsError::MissingTranslation => {
-            "原文回显对象缺少 translation".to_owned()
+            GenericResponseValueProblem::SourceEchoMissingTranslation
         }
-        DecodedSourceEchoFieldsError::DuplicateSource => "原文回显对象包含重复的 source".to_owned(),
+        DecodedSourceEchoFieldsError::DuplicateSource => {
+            GenericResponseValueProblem::SourceEchoDuplicateSource
+        }
         DecodedSourceEchoFieldsError::DuplicateTranslation => {
-            "原文回显对象包含重复的 translation".to_owned()
+            GenericResponseValueProblem::SourceEchoDuplicateTranslation
         }
-        DecodedSourceEchoFieldsError::UnexpectedField { field } => {
-            format!("原文回显对象包含未知字段 {field}")
+        DecodedSourceEchoFieldsError::UnexpectedField { .. } => {
+            GenericResponseValueProblem::SourceEchoUnexpectedField
         }
     }
 }
@@ -1828,7 +1931,7 @@ fn join_translation_lines_with_cancellation(
 fn validate_candidate_text_with_cancellation(
     candidate: &str,
     is_cancelled: &impl Fn() -> bool,
-) -> Result<Result<(), &'static str>, GenericPlanningError> {
+) -> Result<Result<(), GenericResponseTextProblem>, GenericPlanningError> {
     const CANCELLATION_CHECK_CHARACTERS: usize = 16 * 1024;
 
     let mut has_non_whitespace = false;
@@ -1837,10 +1940,10 @@ fn validate_candidate_text_with_cancellation(
             ensure_planning_not_cancelled(is_cancelled)?;
         }
         if character == '\r' {
-            return Ok(Err("译文不能包含 CR（U+000D）"));
+            return Ok(Err(GenericResponseTextProblem::CarriageReturn));
         }
         if character == '\0' {
-            return Ok(Err("译文不能包含 NUL（U+0000）"));
+            return Ok(Err(GenericResponseTextProblem::Nul));
         }
         has_non_whitespace |= !character.is_whitespace();
     }
@@ -1848,7 +1951,7 @@ fn validate_candidate_text_with_cancellation(
     if has_non_whitespace {
         Ok(Ok(()))
     } else {
-        Ok(Err("译文不能为空白"))
+        Ok(Err(GenericResponseTextProblem::Blank))
     }
 }
 
@@ -2215,18 +2318,25 @@ mod tests {
         snapshot
             .files()
             .iter()
-            .flat_map(|file| file.groups())
-            .flat_map(|group| {
-                group.units().iter().map(|unit| {
-                    PlanningUnit::new(
-                        GenericUnitKey::new(group.id().to_owned(), unit.id().to_owned()),
-                        format!("<{}>", unit.source_text()),
-                        fingerprint(if unit.source_text() == "同文" { 1 } else { 2 }),
-                        true,
-                        unit.translation()
-                            .map(|translation| translation.translation().to_owned()),
-                        fingerprint(7),
-                    )
+            .flat_map(|file| {
+                file.groups().iter().flat_map(move |group| {
+                    group.units().iter().map(move |unit| {
+                        PlanningUnit::new(
+                            GenericUnitKey::new(group.id().to_owned(), unit.id().to_owned()),
+                            GenericPlanningUnitLocator::new(
+                                file.relative_path(),
+                                group.id().to_owned(),
+                                unit.id().to_owned(),
+                                group.kind().to_owned(),
+                            ),
+                            format!("<{}>", unit.source_text()),
+                            fingerprint(if unit.source_text() == "同文" { 1 } else { 2 }),
+                            true,
+                            unit.translation()
+                                .map(|translation| translation.translation().to_owned()),
+                            fingerprint(7),
+                        )
+                    })
                 })
             })
             .collect()
@@ -2382,6 +2492,12 @@ mod tests {
                     let model_representative = model_groups.contains(&group_index);
                     PlanningUnit::new(
                         GenericUnitKey::new(group.id().to_owned(), unit.id().to_owned()),
+                        GenericPlanningUnitLocator::new(
+                            snapshot.files()[0].relative_path(),
+                            group.id().to_owned(),
+                            unit.id().to_owned(),
+                            group.kind().to_owned(),
+                        ),
                         format!("<{}>", unit.source_text()),
                         fingerprint(u8::try_from(group_index + 1).expect("测试索引应可表示")),
                         model_representative,
@@ -2610,7 +2726,7 @@ mod tests {
             NonZeroUsize::MAX,
             |key, candidate| {
                 if key.group_id() == "g3" {
-                    Ok(Err("目标 kind 不接受该译文".to_owned()))
+                    Ok(Err(GenericResponseDestinationProblem::ValidatorRejected))
                 } else {
                     Ok(Ok(ValidatedReuse::new(
                         format!("{candidate}-已验收"),
@@ -2728,15 +2844,16 @@ mod tests {
             }),
             ..original.clone()
         };
-        let current = PlanningUnit::from_stored(
+        let current = PlanningUnit::from_stored(StoredPlanningUnitInput {
+            relative_path: Path::new("a.jsonl"),
             project,
             group,
-            &automatic,
-            &protected,
-            Vec::new(),
-            true,
+            unit: &automatic,
+            protected: &protected,
+            terminology_indices: Vec::new(),
+            needs_translation: true,
             resources,
-        );
+        });
         assert_eq!(
             current.current_translation(),
             Some("直接 SQL 修改后的正文"),
@@ -2748,15 +2865,16 @@ mod tests {
             client_semantics: fingerprint(26),
             ..resources
         };
-        let stale = PlanningUnit::from_stored(
+        let stale = PlanningUnit::from_stored(StoredPlanningUnitInput {
+            relative_path: Path::new("a.jsonl"),
             project,
             group,
-            &automatic,
-            &protected,
-            Vec::new(),
-            true,
-            changed_resources,
-        );
+            unit: &automatic,
+            protected: &protected,
+            terminology_indices: Vec::new(),
+            needs_translation: true,
+            resources: changed_resources,
+        });
         assert!(stale.current_translation().is_none());
 
         let manual_state = manual_translation_state_fingerprint(
@@ -2774,15 +2892,16 @@ mod tests {
             }),
             ..original.clone()
         };
-        let current = PlanningUnit::from_stored(
+        let current = PlanningUnit::from_stored(StoredPlanningUnitInput {
+            relative_path: Path::new("a.jsonl"),
             project,
             group,
-            &manual,
-            &protected,
-            Vec::new(),
-            true,
-            changed_resources,
-        );
+            unit: &manual,
+            protected: &protected,
+            terminology_indices: Vec::new(),
+            needs_translation: true,
+            resources: changed_resources,
+        });
         assert_eq!(current.current_translation(), Some("人工修订"));
     }
 
@@ -2805,12 +2924,12 @@ mod tests {
         assert_eq!(acceptance.accepted().len(), 2, "同文族传播到两个 Unit");
         assert!(acceptance.problems().iter().any(|problem| matches!(
             problem,
-            ResponseProblem::InvalidValue { output_id, .. } if *output_id == task_id(1)
+            ResponseProblem::InvalidValue { output_id, .. } if *output_id == 1
         )));
         assert!(
             acceptance
                 .problems()
-                .contains(&ResponseProblem::UnexpectedId(task_id(99)))
+                .contains(&ResponseProblem::UnexpectedId { output_id: 99 })
         );
     }
 
@@ -2842,8 +2961,10 @@ mod tests {
         assert_eq!(partial.accepted().len(), 1);
         assert!(matches!(
             partial.problems(),
-            [ResponseProblem::InvalidValue { output_id, detail }]
-                if *output_id == task_id(0) && detail.contains("source 必须是字符串数组")
+            [ResponseProblem::InvalidValue {
+                output_id: 0,
+                problem: GenericResponseValueProblem::SourceNotArray,
+            }]
         ));
     }
 
@@ -2874,7 +2995,7 @@ mod tests {
         );
         assert!(matches!(
             acceptance.problems(),
-            [ResponseProblem::InvalidValue { output_id, .. }] if *output_id == task_id(1)
+            [ResponseProblem::InvalidValue { output_id, .. }] if *output_id == 1
         ));
     }
 
@@ -2891,18 +3012,25 @@ mod tests {
                 .expect("响应应可解析");
         let polls = Cell::new(0_usize);
 
-        let result = accept_parsed_response_with_cancellation(
-            plan.tasks()[0].clone(),
-            &parsed,
-            |_, _, _| -> Result<Result<String, String>, GenericPlanningError> {
-                panic!("长候选正文扫描被取消后不应进入目标验收")
-            },
-            || {
-                let next = polls.get() + 1;
-                polls.set(next);
-                next >= 7
-            },
-        );
+        let result =
+            accept_parsed_response_with_cancellation(
+                plan.tasks()[0].clone(),
+                &parsed,
+                |_,
+                 _,
+                 _|
+                 -> Result<
+                    Result<String, GenericResponseDestinationProblem>,
+                    GenericPlanningError,
+                > {
+                    panic!("长候选正文扫描被取消后不应进入目标验收")
+                },
+                || {
+                    let next = polls.get() + 1;
+                    polls.set(next);
+                    next >= 7
+                },
+            );
 
         assert!(matches!(result, Err(GenericPlanningError::Cancelled)));
         assert_eq!(polls.get(), 7);
@@ -2922,7 +3050,7 @@ mod tests {
             TranslationResponseMode::new(false, false),
             |_, key, candidate| {
                 if key.group_id() == "g3" {
-                    Err("目标 kind 不接受该译文".to_owned())
+                    Err(GenericResponseDestinationProblem::ValidatorRejected)
                 } else {
                     Ok(candidate.to_owned())
                 }
@@ -2943,9 +3071,14 @@ mod tests {
             acceptance
                 .problems()
                 .contains(&ResponseProblem::InvalidDestination {
-                    output_id: task_id(0),
-                    key: GenericUnitKey::new("g3".to_owned(), "u1".to_owned()),
-                    detail: "目标 kind 不接受该译文".to_owned(),
+                    output_id: 0,
+                    destination: DiagnosticGenericUnitLocator::new(
+                        "b.jsonl",
+                        "g3",
+                        "u1",
+                        Some("dialogue"),
+                    ),
+                    problem: GenericResponseDestinationProblem::ValidatorRejected,
                 })
         );
         assert_eq!(
@@ -2968,7 +3101,7 @@ mod tests {
             TranslationResponseMode::new(false, false),
             |output_id, _, candidate| {
                 if output_id == task_id(0) {
-                    Err("该去重族的目标均拒绝译文".to_owned())
+                    Err(GenericResponseDestinationProblem::ValidatorRejected)
                 } else {
                     Ok(candidate.to_owned())
                 }
@@ -2983,14 +3116,24 @@ mod tests {
             acceptance.problems(),
             [
                 ResponseProblem::InvalidDestination {
-                    output_id: task_id(0),
-                    key: GenericUnitKey::new("g1".to_owned(), "u1".to_owned()),
-                    detail: "该去重族的目标均拒绝译文".to_owned(),
+                    output_id: 0,
+                    destination: DiagnosticGenericUnitLocator::new(
+                        "a.jsonl",
+                        "g1",
+                        "u1",
+                        Some("dialogue"),
+                    ),
+                    problem: GenericResponseDestinationProblem::ValidatorRejected,
                 },
                 ResponseProblem::InvalidDestination {
-                    output_id: task_id(0),
-                    key: GenericUnitKey::new("g3".to_owned(), "u1".to_owned()),
-                    detail: "该去重族的目标均拒绝译文".to_owned(),
+                    output_id: 0,
+                    destination: DiagnosticGenericUnitLocator::new(
+                        "b.jsonl",
+                        "g3",
+                        "u1",
+                        Some("dialogue"),
+                    ),
+                    problem: GenericResponseDestinationProblem::ValidatorRejected,
                 },
             ],
             "消费 destinations 后仍应保持原有目标顺序"
@@ -3015,8 +3158,8 @@ mod tests {
         assert_eq!(
             acceptance.problems(),
             [
-                ResponseProblem::DuplicateId(task_id(0)),
-                ResponseProblem::MissingId(task_id(1))
+                ResponseProblem::DuplicateId { output_id: 0 },
+                ResponseProblem::MissingId { output_id: 1 }
             ]
         );
     }

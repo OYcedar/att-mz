@@ -16,7 +16,7 @@ use serde_json::{Map, Value};
 #[cfg(test)]
 use url::{Url, form_urlencoded};
 
-use crate::diagnostic::{DiagnosticImpact, SafeDiagnostic};
+use crate::diagnostic::Diagnostic;
 use crate::fingerprint::Sha256Fingerprint;
 
 /// 发送给 LLM 的消息角色。
@@ -209,13 +209,21 @@ where
 /// 已经确定的协议、认证、模型、资源上限和请求正文事实。
 pub(crate) trait LlmRequestExecutor: Send + Sync {
     type Client: Send + Sync + 'static;
-    type Error: Error + Send + Sync + 'static;
+    type Error: LlmRequestFailure + Error + Send + Sync + 'static;
 
     fn request<'a>(
         &'a self,
         client: &'a Self::Client,
         messages: &'a [ChatMessage],
     ) -> impl Future<Output = Result<LlmResponse, LlmRequestError<Self::Error>>> + Send + 'a;
+
+    /// 在执行器仍同时持有 Client 协议事实与根错误类型时建立唯一安全诊断。
+    fn request_diagnostic(
+        &self,
+        client: &Self::Client,
+        source: &Self::Error,
+        retry_after: Option<Duration>,
+    ) -> Diagnostic;
 }
 
 /// 一个受信 LLM Client 对译文结果有影响的稳定语义身份。
@@ -227,19 +235,8 @@ pub(crate) trait LlmClientSemanticIdentity: Send + Sync {
     fn semantic_fingerprint(&self) -> Sha256Fingerprint;
 }
 
-/// LLM 根错误能够公开的唯一结构化投影。
-///
-/// 实现必须直接读取具体根错误的类型化字段；不得返回请求、原始响应正文、Header 值，
-/// 也不得通过 `Display` 或 source 链补猜事实。供应商标准错误消息必须先按敏感信息契约
-/// 脱敏并清理为单行文本；`retry_after` 来自同一次请求的响应头，因而由仍同时持有根错误
-/// 与请求包装事实的位置传入。
-pub(crate) trait LlmRequestDiagnosticSource {
-    fn request_diagnostic(
-        &self,
-        retry_after: Option<Duration>,
-        impact: DiagnosticImpact,
-    ) -> SafeDiagnostic;
-
+/// LLM 根错误只公开合作取消判断；诊断投影由仍持有 Client 协议事实的执行器负责。
+pub(crate) trait LlmRequestFailure {
     /// 该根错误是否明确表示请求仍在等待本地入场资源时被合作取消。
     ///
     /// 调用方还必须同时观察自己的取消令牌；单凭错误类别不得把根关闭等技术失败

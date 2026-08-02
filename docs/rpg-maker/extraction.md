@@ -25,6 +25,12 @@ Extract 的执行者是 Builtin 与 Rules 两类能力，Lua 不在其中。
 各 owner 的提交彼此独立：Builtin 成功而后续 Rules 失败时，Builtin 的新结果落库，
 旧 Rules 快照保持。
 
+`run_plan.resolved` 使用类型化 Extract selection 保存 Builtin/Rules 选择；最终
+`run_plan.finalized` 保存数据库路径、事务状态、运行是否继续和必要的诊断 occurrence ID，
+不使用自由字符串列表。owner 失败时，`diagnostic.extract` occurrence 保留具体 owner、来源、
+位置、稳定 code 和 `report.effect`；已提交 owner 使用 `progress_preserved`，不能被后续失败
+误报成整个 Extract 未发生。
+
 ## 2. 资产与身份
 
 Extract 先按引擎结构建立明确的 `Semantic Scope → Group → Unit`。每个 Group 保存 kind、
@@ -120,3 +126,9 @@ owner 成功提交时：
 
 Extract 只负责提取，全程不发出模型请求。成功结果必须包含 owner、Group、Unit、冲突
 摘要和来源指纹，供 Translate 与 WriteBack 重新检查。
+
+Rules command 省略 path 后跳过非字符串参数时，每个聚合事实形成
+`diagnostic.extract` Warn occurrence，具体 RpgMaker issue 保存 rule number、source file、
+command code、parameter、actual type 和 skipped count，resolution 为 `fix_input`。警告不保存
+原始参数值或逐命令位置，也不改变成功提交和退出码。Extract 的 phase 只有明确成功后才写
+`phase.completed`；失败或取消写 `phase.stopped` 并引用诊断，不得在失败路径出现完成事件。
