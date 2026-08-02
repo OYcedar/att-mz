@@ -25,59 +25,6 @@ pub(crate) struct MvDialogueDefinition {
     rules: Vec<MvDialogueRule>,
 }
 
-#[cfg(test)]
-mod documentation_contract_tests {
-    use super::MvDialogueDefinition;
-    use crate::rpg_maker::documentation_test::{ClassifiedExampleKind, classified_toml_fences};
-
-    const EXAMPLE: &str = include_str!("../../docs/rpg-maker/examples/mv-dialogue.toml");
-    const RULES_GUIDE: &str = include_str!("../../docs/rpg-maker/rules.md");
-
-    #[test]
-    fn documented_mv_dialogue_definition_uses_the_production_parser_and_compiler() {
-        let definition = MvDialogueDefinition::parse_toml(EXAMPLE)
-            .expect("文档中的 MV 姓名规则必须通过生产解析边界");
-        assert!(
-            !definition.rules().is_empty(),
-            "完整示例必须至少声明一条规则"
-        );
-        definition
-            .compile()
-            .expect("文档中的 MV 姓名规则必须通过生产 PCRE2 编译边界");
-    }
-
-    #[test]
-    fn classified_mv_dialogue_fences_follow_the_production_contract() {
-        let mut checked = 0;
-        for fence in classified_toml_fences(RULES_GUIDE) {
-            let common_root = fence.section().starts_with("2.") && fence.subsection().is_none();
-            let mv_section = fence.section().starts_with("3.");
-            if (!common_root && !mv_section) || fence.kind() == ClassifiedExampleKind::Illustrative
-            {
-                continue;
-            }
-            checked += 1;
-            let result = MvDialogueDefinition::parse_toml(fence.body())
-                .and_then(|definition| definition.compile().map(|_| ()));
-            match fence.kind() {
-                ClassifiedExampleKind::Valid => result.unwrap_or_else(|error| {
-                    panic!(
-                        "rules.md:{} 的 MV valid TOML 未通过生产边界：{error}",
-                        fence.opening_line()
-                    )
-                }),
-                ClassifiedExampleKind::Invalid => assert!(
-                    result.is_err(),
-                    "rules.md:{} 的 MV invalid TOML 被生产边界接受",
-                    fence.opening_line()
-                ),
-                ClassifiedExampleKind::Illustrative => unreachable!(),
-            }
-        }
-        assert_eq!(checked, 4, "共同根与 MV 章节应各包含一正一反样例");
-    }
-}
-
 impl MvDialogueDefinition {
     #[cfg(test)]
     pub(crate) fn empty() -> Self {

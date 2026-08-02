@@ -41,6 +41,12 @@ message 是实际请求，必须保留该稳定 TaskBlock 的全部 Group 和 Un
 这是一项有效的诊断证据，不是权威业务状态；Raw Assistant 缺失只表示证据不足，不授权
 重新请求、重放、验收或提交译文。
 
+任务记录中的数字 ID 只属于本次请求，消息不携带 Generic 的 `group_id + unit_id` 或
+MV/MZ 的 `owner + group_location + unit_role`。因此记录不能直接充当 Lua locator，也没有
+保存通用的“逐失败原因到稳定 Unit”映射。需要人工或 agent 补译时，先按
+[Lua 审查流程](../lua/README.md#4-完整审查与人工或-agent-修订)从当前数据库重新取得精确
+locator 和完整 Unit 集合，再结合本记录的请求语境诊断。
+
 记录中绝不写入 API key、Authorization 值或其他由
 [Chat Completions 规格](../runtime/chat-completions.md#6-敏感信息闭集唯一权威)定义的
 敏感值。任务记录不保存非 2xx 原始 body；供应商标准错误消息沿用同一闭集替换并清理为

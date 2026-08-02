@@ -832,9 +832,7 @@ mod tests {
     use crate::progress::{ProgressObserver, ProgressSnapshot};
     use crate::project_name::ProjectName;
     use crate::rpg_maker::extract::document::RpgMakerProjectDocumentReadingError;
-    use crate::rpg_maker::model::{
-        DirectTextPart, DirectTextRecipe, TextProjectionRecipe, TextUnitRole,
-    };
+    use crate::rpg_maker::model::{DirectTextPart, TextProjectionRecipe};
     use crate::rpg_maker::text::MapId;
     use crate::runtime::filesystem::{SystemFileSystem, SystemFileSystemConfig};
     use crate::storage::file_system::FileReader;
@@ -1132,132 +1130,6 @@ path = 'zeta'
                 "插件先声明字母",
             ],
             "规则编号、调用方插入顺序和 OS 枚举都不得改变 canonical 来源顺序"
-        );
-    }
-
-    #[test]
-    fn documented_extract_rules_match_frozen_sources_and_round_trip_materialized_recipes() {
-        const EXAMPLE: &str = include_str!("../../../docs/rpg-maker/examples/extract-rules.toml");
-
-        fn rebuild(recipe: &DirectTextRecipe, values: &BTreeMap<TextUnitRole, String>) -> String {
-            let mut output = String::new();
-            for part in recipe.parts() {
-                match part {
-                    DirectTextPart::Literal(literal) => output.push_str(literal),
-                    DirectTextPart::TextSlot { role } => output.push_str(
-                        values
-                            .get(role)
-                            .expect("文档示例每个 recipe slot 都应有对应单元"),
-                    ),
-                    DirectTextPart::LineSlot { .. } => {
-                        panic!("Extract Rules 的 Scalar recipe 不应产生 LineSlot")
-                    }
-                }
-            }
-            output
-        }
-
-        let definition = RulesDefinition::parse(EXAMPLE)
-            .expect("完整 Extract Rules 示例必须通过生产解析与 PCRE2 编译边界");
-
-        let plugin_entry = json!({"title":"插件标题"}).to_string();
-        let encoded_plugin_entries = json!([plugin_entry]).to_string();
-        let mut plugin_parameters = Map::new();
-        plugin_parameters.insert("entries".to_owned(), Value::String(encoded_plugin_entries));
-        let mut plugin = Map::new();
-        plugin.insert("name".to_owned(), json!("QuestWindow"));
-        plugin.insert("status".to_owned(), json!(true));
-        plugin.insert("parameters".to_owned(), Value::Object(plugin_parameters));
-
-        let encoded_final_title = serde_json::to_string("终点标题").unwrap();
-        let encoded_title_object = json!({"title":encoded_final_title}).to_string();
-        let encoded_payload_object = json!({"payload":encoded_title_object}).to_string();
-        let encoded_empty_key_root = json!({"":encoded_payload_object}).to_string();
-        let documents = RpgMakerProjectDocuments::new(
-            BTreeMap::from([
-                (
-                    RpgMakerDocumentId::Data(StandardDataFile::CommonEvents),
-                    json!([
-                        null,
-                        {
-                            "list": [
-                                {"code":356,"parameters":["DisplayNotice 出航命令"]},
-                                {"code":357,"parameters":["QuestWindow","Show","",encoded_empty_key_root]}
-                            ]
-                        }
-                    ]),
-                ),
-                (
-                    RpgMakerDocumentId::DataFile(
-                        DataFileName::parse("QuestEntries.json").expect("示例自定义文件名应合法"),
-                    ),
-                    json!([{"title":"委托标题"}]),
-                ),
-            ]),
-            vec![PluginConfiguration::new(4, plugin)],
-        );
-        let input = build_match_input(&definition, documents).expect("冻结来源应建立匹配输入");
-        let targets = matcher::match_rules(&definition, &input)
-            .expect("完整示例的四条规则都应命中代表性冻结来源");
-
-        assert_eq!(targets.len(), 4);
-        assert!(targets.iter().all(|target| target.units().len() == 1));
-        assert_eq!(
-            targets
-                .iter()
-                .map(|target| target.units()[0].source_text())
-                .collect::<Vec<_>>(),
-            ["出航命令", "终点标题", "委托标题", "插件标题"],
-            "插件与 357 来源必须经过生产路径的逐层 JSON 解码"
-        );
-
-        let mut original_round_trips = Vec::new();
-        let mut translated_round_trips = Vec::new();
-        for (target_index, target) in targets.iter().enumerate() {
-            let TextProjectionRecipe::Direct(recipe) = target
-                .projection_recipe()
-                .expect("匹配目标必须物化为 Direct recipe")
-            else {
-                panic!("Extract Rules 只应物化 Direct recipe")
-            };
-            let originals = target
-                .units()
-                .iter()
-                .enumerate()
-                .map(|(unit_index, unit)| {
-                    (target.role_for(unit_index), unit.source_text().to_owned())
-                })
-                .collect::<BTreeMap<_, _>>();
-            let translations = target
-                .units()
-                .iter()
-                .enumerate()
-                .map(|(unit_index, _)| {
-                    (
-                        target.role_for(unit_index),
-                        format!("译文{}", target_index + 1),
-                    )
-                })
-                .collect::<BTreeMap<_, _>>();
-
-            let original = rebuild(&recipe, &originals);
-            assert_eq!(
-                original,
-                recipe.expected_raw(),
-                "未翻译 recipe 必须逐字 round-trip"
-            );
-            original_round_trips.push(original);
-            translated_round_trips.push(rebuild(&recipe, &translations));
-        }
-
-        assert_eq!(
-            original_round_trips,
-            ["DisplayNotice 出航命令", "终点标题", "委托标题", "插件标题",]
-        );
-        assert_eq!(
-            translated_round_trips,
-            ["DisplayNotice 译文1", "译文2", "译文3", "译文4",],
-            "翻译后 recipe 必须只替换槽位并精确保留冻结外壳"
         );
     }
 

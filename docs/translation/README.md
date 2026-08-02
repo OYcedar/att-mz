@@ -1,16 +1,26 @@
-# 公共翻译能力
+# 公共翻译能力导航
 
-MV、MZ 和 Generic 各自拥有自己的项目状态与业务流程，同时复用语义相同的翻译能力：
+MV、MZ 和 Generic 各自拥有项目状态与流程，同时复用语义相同的翻译能力。资源仍由每个
+项目分别保存；公共配置中的 Profile 定义可以复用，但每个项目独立记录实际选择。
 
-- [语言](language.md)：语言 ID、源语判断、源语残留检查和安全修复；
-- [术语](terminology.md)：ATT 接受的术语文件、命中和模型上下文；术语内容的发现、筛选
-  与定译由[通用游戏术语表制作 Skill](../../skills/extract-game-terminology/SKILL.md)
-  负责；
-- [Placeholder](placeholders.md)：不可改写片段的保护与恢复；
-- [TaskBlock 规划](task-planning.md)：Unit、Group、Semantic Scope、稳定装箱与临时 ID；
-- [Prompt 与模型协议](prompts.md)：共用中文 Prompt、JSON 消息、四种响应模式和临时 ID；
-- [模型任务记录](task-records.md)：可读请求与结果记录。
+按当前问题读取：
 
-复用的是能力，不是数据：资源在每个项目内分别保存，修改任一项目都不会影响另一个
-项目。翻译 Profile 由公共配置统一定义；每个项目分别保存自己最近成功使用的
-Profile ID。
+| 当前问题 | 必读规格 |
+| --- | --- |
+| 源语言、目标语言、源语判断、残留或安全修复 | [语言](language.md) |
+| ATT 术语文件、匹配、保存或失效 | [术语](terminology.md) |
+| 不可改写内容、token、捕获、恢复或重叠 | [Placeholder](placeholders.md)；MV/MZ 同时读 [Rules](../rpg-maker/rules.md) |
+| Unit、Group、Semantic Scope、稳定装箱或临时 ID | [TaskBlock 规划](task-planning.md) |
+| System/User、响应 JSON、ID、形状或逐项验收 | [Prompt 与模型协议](prompts.md) |
+| 请求、响应、Thinking、Raw Assistant 或逐 ID 诊断 | [模型任务记录](task-records.md) |
+| HTTP、超时、限速或运行时有限重试 | [Chat Completions](../runtime/chat-completions.md) |
+| Current、Partial、Unavailable 或引擎状态 | 对应 [MV/MZ Translate](../rpg-maker/translation.md)或 [Generic Translate](../generic/translation.md) |
+| 人工或 agent 补译、定点修订 | [Lua](../lua/README.md)与[全量验收指南](../guides/acceptance.md) |
+
+术语内容的发现、筛选和定译不由 ATT 文件格式决定。需要从实际游戏制作术语表时，使用
+[通用游戏术语表制作 Skill](../../skills/extract-game-terminology/SKILL.md)，再按 ATT
+[术语规格](terminology.md)接入。
+
+处理失败、不完整结果或重复无进展时，先走
+[诊断与恢复指南](../guides/diagnosis-and-recovery.md#64-translate)，不能从某一种错误推导
+通用重试、换模型或 Lua 方案。

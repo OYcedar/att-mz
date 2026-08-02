@@ -6,18 +6,21 @@ ATT 是一个 Windows x64 命令行翻译工具，提供三个各自独立的命
 - `mz`：RPG Maker MZ；
 - `generic`：只处理 ATT 约定的 JSONL，不关心具体游戏格式。
 
-同一个游戏可以同时建立 MV/MZ 项目和 Generic 项目，两者分工明确：RPG Maker 原生数据
-交给 MZ 项目；插件脚本或其他原生提取没有覆盖的文本，由熟悉格式的操作者整理成
-JSONL，交给 Generic 项目。两个项目各自保存自己的数据库、译文、术语、Placeholder、
-日志和输出，互不共享。公共配置中的 Profile 定义可以复用，但每个项目分别记录自己的
-选择，模型任务记录也分别留在各自项目中。
+同一个游戏可以同时建立 MV/MZ 项目和 Generic 项目。MV/MZ 内容先核对 Builtin，再按
+Rules 规格判断原生能力；不能因为 Builtin 未覆盖或内容复杂就直接改用 Generic。只有
+MV/MZ 原生能力无法完整表达的来源，才由熟悉格式的操作者整理成 JSONL，交给独立
+Generic 项目。
+
+多个项目各自保存数据库、译文、术语、Placeholder、日志和输出，互不共享；每段内容只
+能有一个项目所有者。公共配置中的 Profile 定义可以复用，但每个项目分别记录自己的选择，
+模型任务记录也分别留在各自项目中。
 
 把任意游戏格式整理成 Generic JSONL，以及把 Generic 输出放回游戏，由了解目标格式的
 操作者或外部工具完成；ATT 专注于 JSONL 之上的翻译流程。
 
 ## 基本流程
 
-每种项目都走同样清晰的四步：
+每种项目都以四个产品命令推进：
 
 1. `init` 建立或更新项目；
 2. `extract` 读取当前输入，建立可翻译内容；
@@ -27,8 +30,11 @@ JSONL，交给 Generic 项目。两个项目各自保存自己的数据库、译
 MV/MZ 的 Init 会保存游戏来源副本。Generic 始终绑定外部 JSONL 目录：修改 JSONL 后
 重新执行 Extract，ATT 只清除受影响内容的旧状态。
 
-Lua 是独立的数据库操作命令，不参与 Extract、Translate 或 WriteBack。翻译完成后，
-可以用它精确修订译文，或按项目需要修改数据库。
+Lua 是独立的数据库操作命令，不参与 Extract、Translate 或 WriteBack。Translate 后或需要
+补译、审校时，可以用它完整审查当前 Unit、由人工或 agent 精确修订译文，或按项目需要
+修改数据库。
+WriteBack 之后仍要检查全部输出、外部转换和实际消费者；四个命令都成功并不自动表示
+整个游戏翻译完成。
 
 ## 运行环境
 
@@ -42,5 +48,8 @@ Placeholder 和 Lua 等显式输入路径仍以调用 cwd 为基准。
 
 ## 文档入口
 
-想了解怎样选择引擎、各命令和文件格式遵守什么约定，从
-[ATT 文档总入口](docs/README.md)开始。
+从 [ATT 文档总入口](docs/README.md)按当前任务或状态进入：
+
+- [翻译项目指南](docs/guides/translation-project.md)
+- [诊断与恢复指南](docs/guides/diagnosis-and-recovery.md)
+- [全量验收指南](docs/guides/acceptance.md)

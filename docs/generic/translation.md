@@ -30,8 +30,9 @@ Prompt 和 Client 语义。人工 Lua 译文的绑定更少：术语、Prompt、
 - 已经有多种不同 Current：全部保留；存在未译成员时，从未译成员重新选择代表；
 - 已有 Current 始终优先，任何传播都会跳过它们。
 
-去重的作用是减少请求；相同原文需要不同译文时，多种译文可以共存。少量例外可在翻译后
-使用[原子数据库 Lua](../lua/README.md)精确修订。
+去重的作用是减少请求；相同原文需要不同译文时，多种译文可以共存。已定位 Unit 的
+同文异译、质量修订，或由人工或 agent 补译，都使用[原子数据库 Lua](../lua/README.md)精确提交，
+不改写全局去重规则。
 
 ## 3. TaskBlock
 
@@ -90,3 +91,8 @@ Prompt 明确规定，ATT 依靠这条契约确定译文语言，不做短文本
 
 完成结果分为 Complete、Partial 与 Unavailable。Partial 和 Unavailable 是正常结果；
 退出成功只说明本次命令正常结束，项目是否全部译完以结果报告为准。
+
+Partial 会保留合法 ID 和已确认前序进度；再次运行只给仍需模型的 Unit 分配临时 ID，并
+继续提供稳定 TaskBlock 的完整语境。是否继续同一 Translate、修正资源，还是由人工或 agent
+修订，要按[诊断与恢复指南](../guides/diagnosis-and-recovery.md#64-translate)根据具体原因与
+实际进展判断。

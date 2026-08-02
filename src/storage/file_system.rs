@@ -1343,6 +1343,56 @@ pub(crate) enum DirectoryPrepareError<E> {
     },
 }
 
+/// 显式恢复是否实际处理了属于该目标的受管发布产物。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirectoryRecoveryOutcome {
+    Unchanged,
+    Recovered,
+}
+
+/// 在调用方观察目标状态之前，恢复该目标的受管发布产物失败。
+#[derive(Debug)]
+pub(crate) struct DirectoryRecoveryError<E> {
+    target_root: PathBuf,
+    source: E,
+}
+
+impl<E> DirectoryRecoveryError<E> {
+    pub(crate) fn new(target_root: PathBuf, source: E) -> Self {
+        Self {
+            target_root,
+            source,
+        }
+    }
+
+    pub(crate) fn source_error(&self) -> &E {
+        &self.source
+    }
+}
+
+impl<E> fmt::Display for DirectoryRecoveryError<E>
+where
+    E: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "无法恢复目录发布目标 {}：{}",
+            self.target_root.display(),
+            self.source
+        )
+    }
+}
+
+impl<E> Error for DirectoryRecoveryError<E>
+where
+    E: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 impl<E> fmt::Display for DirectoryPrepareError<E>
 where
     E: fmt::Display,
@@ -1620,6 +1670,12 @@ where
 pub(crate) trait RecoverableDirectoryPublisher: Send + Sync {
     type Error: Error + Send + Sync + 'static;
     type StagingState: Send + 'static;
+
+    /// 在调用方观察目标状态之前，恢复或清理当前目标命名空间中的受管发布产物。
+    fn recover(
+        &self,
+        target_root: PathBuf,
+    ) -> impl Future<Output = Result<DirectoryRecoveryOutcome, DirectoryRecoveryError<Self::Error>>> + Send;
 
     fn prepare(
         &self,
@@ -2181,6 +2237,13 @@ mod directory_stage_tests {
         type Error = Infallible;
         type StagingState = ();
 
+        async fn recover(
+            &self,
+            _target_root: PathBuf,
+        ) -> Result<DirectoryRecoveryOutcome, DirectoryRecoveryError<Self::Error>> {
+            Ok(DirectoryRecoveryOutcome::Unchanged)
+        }
+
         async fn prepare(
             &self,
             request: DirectoryStageRequest,
@@ -2227,6 +2290,7 @@ mod directory_stage_tests {
         .expect("测试准备请求应该合法");
 
         assert_send(publisher.prepare(request));
+        assert_send(publisher.recover(PathBuf::from("target")));
         assert_send(publisher.publish(StagedDirectory::new(
             PathBuf::from("target"),
             PathBuf::from("stage"),

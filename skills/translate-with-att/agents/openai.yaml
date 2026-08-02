@@ -1,4 +1,4 @@
 interface:
   display_name: "ATT 翻译任务"
-  short_description: "规划、执行、诊断和审校 ATT 的 MV、MZ 与 Generic 翻译"
-  default_prompt: "使用 $translate-with-att 规划并执行这个 ATT 翻译任务。"
+  short_description: "按现行文档规划、执行、恢复、修订和验收 ATT 游戏翻译"
+  default_prompt: "使用 $translate-with-att，先按实际发行版文档确定当前状态和必读规格，再完成这个 ATT 翻译任务。"

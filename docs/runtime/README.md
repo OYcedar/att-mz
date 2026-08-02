@@ -1,38 +1,20 @@
 # ATT 运行时导航
 
-## 命令需要哪些发行资源和配置
+按观察到的问题选择规格；命令参数与状态含义不在本页重复定义。
 
-| 命令 | 固定资源与读取的配置 |
-|---|---|
-| Help、Version | 无 |
-| Init、Extract、MV/MZ WriteBack、Lua | `<att-dir>/config.toml` 与固定的 `<att-dir>/projects/`；没有额外配置字段 |
-| Translate | 固定的 `projects/`、`prompts/`，以及 `[prompts]`、`[translation]`、全部 `[[languages]]`、所选 Profile 和 Client |
-| Generic WriteBack | 固定的 `projects/`；存在自动译文时还读取固定 `prompts/` 和上述翻译配置 |
+| 当前问题 | 必读规格 |
+| --- | --- |
+| 命令语法、保存选择、取消、输出或退出码 | [CLI](cli.md) |
+| 固定配置、语言、Profile、Client 或参数 | [配置](configuration.md) |
+| HTTP、连接、超时、代理、限速、重试或敏感信息 | [Chat Completions](chat-completions.md) |
+| 项目数据库、Unit 状态、事务、锁、schema 或提交结果未知 | [SQLite](sqlite.md) |
+| RunId、结构化诊断、任务事件、日志降级或呈现失败 | [项目日志](project-log.md) |
+| candidate、stage、backup、journal、目录交换或发布终态 | [目录发布](directory-publishing.md) |
+| `att.exe` 同目录必须包含什么、资源是否一致 | [发行物](distribution.md) |
 
-所有业务命令都读取 `att.exe` 同目录下唯一的 `config.toml`。ATT 只解析当前命令真正用到
-的配置值；没被选中的 Client，其凭据始终留在配置文件里。
+出现 `failed`、`cancelled`、`recovery_required`、`outcome_unknown`、Partial、Unavailable 或
+业务结果与退出码看似矛盾时，同时读取
+[诊断与恢复指南](../guides/diagnosis-and-recovery.md)。
 
-## 项目保存什么选择
-
-- Init 保存项目来源和语言；
-- MV/MZ Extract 保存 Builtin/Rules 选择；
-- Translate 保存最近成功使用的 Profile、当前术语和 Placeholder；
-- Generic 保存外部 JSONL 根与最近成功 Extract 的输入指纹；
-- Lua 每次读取本次显式脚本，不保存脚本或运行方案；
-- WriteBack 没有可保存的运行选项。
-
-## 哪些值不能配置
-
-线程、worker、内部窗口、批次、SQLite 策略、日志缓冲、锁路径、发布目录和项目规模都由
-负责执行的代码决定，配置因此保持精简。文件、目录、Group、Unit、Task、Lua 和 SQL
-结果的总量都不设上限。
-
-## 继续阅读
-
-- [CLI](cli.md)
-- [配置](configuration.md)
-- [发行物](distribution.md)
-- [Chat Completions](chat-completions.md)
-- [SQLite](sqlite.md)
-- [项目日志](project-log.md)
-- [目录发布](directory-publishing.md)
+各值的责任边界是固定的：数据库拥有项目和译文状态，目录 journal 拥有发布恢复事实，
+项目日志与模型任务记录只提供诊断证据。任一记录都不能替代另一责任方的权威状态。

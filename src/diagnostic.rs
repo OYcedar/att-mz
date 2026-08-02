@@ -1557,6 +1557,22 @@ impl FailureReport {
         self
     }
 
+    /// 用已经确认的外层终态覆盖整份错误报告中的机制层终态。
+    ///
+    /// 只在外层已经观察到事务或发布结果、内层错误仅说明后续清理原因时使用。
+    pub(crate) fn with_all_impacts(mut self, impact: DiagnosticImpact) -> Self {
+        self.primary.public.impact = impact;
+        for related in &mut self.related {
+            related.public.impact = impact;
+        }
+        self
+    }
+
+    pub(crate) fn with_primary_action(mut self, action: DiagnosticAction) -> Self {
+        self.primary.public.action = action;
+        self
+    }
+
     pub(crate) fn public_diagnostics(&self) -> impl Iterator<Item = &SafeDiagnostic> {
         std::iter::once(self.primary.public())
             .chain(self.related.iter().map(ReportedFailure::public))
