@@ -694,6 +694,11 @@ fn generic_partial_retry_reuses_the_complete_task_block_across_real_processes() 
     let first_user = first_request["messages"][1]["content"]
         .as_str()
         .expect("Generic 首次请求 user message 必须是字符串");
+    assert_pretty_translation_user_message(first_user);
+    assert!(
+        first_task_records[0].1.contains(first_user),
+        "任务记录必须保留实际发送给模型的格式化 user message"
+    );
     assert_eq!(
         parse_user_message(first_user),
         expected_generic_user_message(&[
@@ -2205,6 +2210,12 @@ fn expected_generic_user_message(units: &[(&str, Option<usize>)]) -> Value {
 
 fn parse_user_message(message: &str) -> Value {
     serde_json::from_str(message).expect("模型 user message 必须是稳定 JSON")
+}
+
+fn assert_pretty_translation_user_message(message: &str) {
+    assert!(message.starts_with("{\n  \""));
+    assert!(message.contains("\n  \"groups\": ["));
+    assert!(message.ends_with("\n}"));
 }
 
 fn user_message_texts(message: &Value) -> Vec<&str> {

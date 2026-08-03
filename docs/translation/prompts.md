@@ -70,6 +70,10 @@ UI 语言不参与资源选择。
 }
 ```
 
+ATT 使用稳定的两空格缩进 JSON 把该对象作为实际 user message 发送给模型；模型任务记录
+保存同一份正文。缩进不改变字段、顺序或语义，TaskBlock 装箱继续按紧凑的完整原文结构投影
+计数，因此 Profile 的字符目标仍不是最终 user message 的硬上限。
+
 - 没有实际术语时省略 `terminology`；术语是专名和既有译法的参考，不是脱离语义的机械
   替换命令。
 - `groups` 和 `units` 保留 TaskBlock 内的完整自然顺序。`kind` 表示实际 Group 类型；
