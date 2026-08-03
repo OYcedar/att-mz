@@ -148,7 +148,7 @@ impl fmt::Display for TranslationUserMessageCancelled {
 
 impl std::error::Error for TranslationUserMessageCancelled {}
 
-/// 把受信 TaskBlock 投影成唯一 JSON wire，并在任意长度正文复制期间观察取消。
+/// 把受信 TaskBlock 投影成两空格缩进的 JSON wire，并在任意长度正文复制期间观察取消。
 pub(crate) fn render_translation_user_message(
     message: &TranslationUserMessage<'_>,
     cancellation: &CooperativeCancellation,
@@ -163,7 +163,7 @@ pub(crate) fn render_translation_user_message(
             cancellation,
             cancelled: false,
         };
-        let result = serde_json::to_writer(&mut writer, message);
+        let result = serde_json::to_writer_pretty(&mut writer, message);
         (result, writer.cancelled)
     };
     if cancelled || cancellation.is_requested() {
@@ -175,8 +175,9 @@ pub(crate) fn render_translation_user_message(
 
 /// 返回一个完整源 Group 在首个位置和后续位置占用的稳定 JSON 字符数。
 ///
-/// 计数使用与实际 user message 相同的 `serde_json` 实现，但不保存序列化正文。调用方应
-/// 传入省略 ID 与 `type`、并使用原始源文的 Group，从而保持装箱与本轮模型责任无关。
+/// 计数使用紧凑 JSON 作为完整源 Group 的稳定结构投影，不把展示缩进计入 TaskBlock 装箱
+/// 目标。调用方应传入省略 ID 与 `type`、并使用原始源文的 Group，从而保持装箱与本轮模型
+/// 责任无关。
 pub(crate) fn measure_translation_user_group(
     group: &TranslationUserGroup<'_>,
     cancellation: &CooperativeCancellation,
@@ -302,7 +303,37 @@ mod tests {
 
         assert_eq!(
             render_translation_user_message(&message, &cancellation).unwrap(),
-            r#"{"terminology":[{"source":"魔王","translation":"魔王"}],"groups":[{"kind":"dialogue","units":[{"role":"speaker","text":["村人"]},{"id":"0","role":"body","type":"free","text":["第一行","",""]}]}]}"#
+            r#"{
+  "terminology": [
+    {
+      "source": "魔王",
+      "translation": "魔王"
+    }
+  ],
+  "groups": [
+    {
+      "kind": "dialogue",
+      "units": [
+        {
+          "role": "speaker",
+          "text": [
+            "村人"
+          ]
+        },
+        {
+          "id": "0",
+          "role": "body",
+          "type": "free",
+          "text": [
+            "第一行",
+            "",
+            ""
+          ]
+        }
+      ]
+    }
+  ]
+}"#
         );
     }
 
@@ -317,7 +348,47 @@ mod tests {
         );
         assert_eq!(
             render_translation_user_message(&message, &CooperativeCancellation::default()).unwrap(),
-            r#"{"groups":[{"kind":"name","units":[{"text":["context"]}]}]}"#
+            r#"{
+  "groups": [
+    {
+      "kind": "name",
+      "units": [
+        {
+          "text": [
+            "context"
+          ]
+        }
+      ]
+    }
+  ]
+}"#
         );
+    }
+
+    #[test]
+    fn group_measurement_remains_a_compact_structural_projection() {
+        let group =
+            TranslationUserGroup::new("name", vec![TranslationUserUnit::context(None, "context")]);
+        let (first, following) =
+            measure_translation_user_group(&group, &CooperativeCancellation::default())
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            first,
+            r#"{"groups":[{"kind":"name","units":[{"text":["context"]}]}]}"#
+                .chars()
+                .count()
+        );
+        assert_eq!(
+            following,
+            r#"{"kind":"name","units":[{"text":["context"]}]}"#.chars().count() + 1
+        );
+
+        let wire = render_translation_user_message(
+            &TranslationUserMessage::new(Vec::new(), vec![group]),
+            &CooperativeCancellation::default(),
+        )
+        .unwrap();
+        assert!(wire.chars().count() > first);
     }
 }
