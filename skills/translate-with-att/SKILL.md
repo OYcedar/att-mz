@@ -1,6 +1,6 @@
 ---
 name: translate-with-att
-description: 使用 ATT 规划、建立、继续、诊断、审校、修订、写回和验收 RPG Maker MV、MZ、Generic 或组合式游戏翻译。适用于项目选择、Init、Extract、Builtin、Rules、JSONL、Translate、语言、术语、Placeholder、Prompt、模型任务记录、Lua、WriteBack、运行错误和发布恢复。用户明确使用 ATT、提供 ATT 项目或要求继续已有 ATT 翻译任务时使用。不用于开发 ATT 源码、其他翻译工具或普通文本翻译。
+description: 使用 ATT 规划、建立、继续、诊断、审校、修订、写回和验收 RPG Maker MV、MZ、Generic 或组合式游戏翻译。适用于用户明确使用 ATT、提供 ATT 项目，或要求处理项目选择、Init、Extract、Builtin、Rules、JSONL、Translate、语言、术语、Placeholder、Prompt、模型任务记录、Lua、WriteBack、运行错误、发布恢复和已有翻译任务续作。
 ---
 
 # 使用 ATT 完成翻译任务
