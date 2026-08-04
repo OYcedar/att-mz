@@ -2033,6 +2033,10 @@ mod tests {
         )
         .unwrap();
         let link = source.join("linked.jsonl");
+        let expected_link = source
+            .canonicalize()
+            .expect("应该可规范化无 reparse 的输入根")
+            .join("linked.jsonl");
         if let Err(error) = std::os::windows::fs::symlink_file(&outside, &link) {
             if symlink_unavailable(&error) {
                 return;
@@ -2042,13 +2046,20 @@ mod tests {
 
         let error = scan_input_tree(&source).expect_err("Generic 输入不得读取 reparse 目标");
 
-        assert!(matches!(
-            error,
+        match error {
             GenericJsonlError::Windows {
-                source: WindowsFsError::ReparsePoint { path },
+                path,
+                source: WindowsFsError::ReparsePoint { path: reparse_path },
                 ..
-            } if path == link
-        ));
+            } => {
+                assert_eq!(path, expected_link, "外层错误必须指向被拒绝的目录项");
+                assert_eq!(
+                    reparse_path, expected_link,
+                    "Windows 错误必须指向被拒绝的 reparse point"
+                );
+            }
+            other => panic!("预期 reparse point 错误，实际：{other:?}"),
+        }
         assert!(fs::read_to_string(&outside).unwrap().contains("secret"));
     }
 
