@@ -1,60 +1,78 @@
-# ATT
+<div align="center">
 
-**ATT 是一个面向 Agent 的游戏翻译命令行工具。**
+# 🎮 ATT
 
-它把游戏翻译中复杂、繁重的自动化工作——文本提取、状态管理、批量模型请求、失败恢复、
-译文写回——全部交给程序完成；把调查、判断、审校等高价值智能工作留给 Agent。两者配合，
-即可实现对游戏的全自动翻译。
+**面向 Agent 的游戏翻译命令行工具**
 
-## 分工：ATT 做什么，Agent 做什么
+繁重的工作交给 ATT，重要的判断交给 Agent。
 
-| ATT 自动完成（繁重的确定性工作） | Agent 智能完成（高价值的判断工作） |
+![平台](https://img.shields.io/badge/平台-Windows%20x64-0078D6)
+![支持游戏](https://img.shields.io/badge/支持-RPG%20Maker%20MV%20%2F%20MZ-green)
+![界面语言](https://img.shields.io/badge/界面语言-10%20种-orange)
+![许可](https://img.shields.io/badge/许可-AGPL--3.0--only-blue)
+
+[快速开始](#-快速开始) ·
+[支持什么](#-支持什么) ·
+[遇到问题](#-遇到问题) ·
+[完整文档](docs/README.md)
+
+</div>
+
+---
+
+翻译一个游戏，既有大量重复、繁重的工作，也有需要理解和判断的工作。
+ATT 负责前者，Agent 负责后者——你把任务交给 Agent，它驱动 ATT 完成整个翻译。
+
+## 🤝 各自负责什么
+
+| ⚙️ ATT 自动完成 | 🧠 Agent 完成 |
 | --- | --- |
-| 从游戏数据中精确提取全部可翻译文本 | 调查游戏结构，圈定翻译范围 |
-| 上下文分组、全局去重、任务装箱 | 为每类文本选择正确的提取能力 |
-| 模型请求、并发限速、超时重试 | 制作术语表、提取规则与 Placeholder |
-| 译文状态持久化，中断后断点续译 | 审校译文质量，用 Lua 精确修订 |
-| 原子写回、失败恢复、结构化诊断 | 对照游戏实际运行效果完成最终验收 |
+| 按已选择的 Builtin、Rules 或 JSONL 输入提取文本 | 调查游戏结构，确定完整翻译范围 |
+| 把文本按场景分组、去掉重复、打包成翻译任务 | 制作术语表，统一角色名、地名等写法 |
+| 批量调用翻译模型，自动处理超时和重试 | 检查译文质量，逐条修正不满意的地方 |
+| 记住每一段的翻译进度，中断后可以继续 | 遇到异常时判断原因，决定下一步 |
+| 把译文安全地写回游戏文件 | 对照游戏实际运行效果做最终验收 |
 
-## 支持范围
+## ✨ 支持什么
 
-- **RPG Maker MV / MZ**：原生支持。标准数据库、事件、系统文本走 Builtin；插件参数、
-  `note` 标签、指定事件参数等走 Extract Rules；两代引擎共享同一套能力（XP、VX、
-  VX Ace 不在支持范围内）。
-- **Generic**：面向任意游戏或文本的通用域。ATT 理解约定的 JSONL 契约；把游戏格式转成
-  JSONL、以及把译后 JSONL 放回游戏，由了解目标格式的操作者或外部工具完成。
-- **语言**：源语言当前内置日语与英语模块（判断哪些文本需要翻译、验收译文无源语残留），
-  目标语言可以是任意语言。
-- **模型服务**：任何兼容 Chat Completions 的接口，在 `config.toml` 中配置 URL、
-  API Key 和模型 ID 即可使用。
+- **🕹️ RPG Maker MV / MZ**：直接支持标准数据库、地图事件对话和系统文本；插件参数、
+  `note` 等非标准位置需要明确的 Extract Rules（更早的 XP、VX、VX Ace 不支持）。
+- **🧩 其他游戏**：把游戏文本整理成 ATT 规定的文本清单格式（JSONL）即可翻译；
+  清单与原游戏格式之间的提取和写回由你或外部工具负责。
+- **🌐 语言**：自动判断哪些日语、英语文本需要翻译，并按配置检查不允许的源语残留；
+  目标语言不限。
+- **🔌 翻译模型**：任何兼容 OpenAI Chat Completions 接口的服务都可以，
+  填上接口地址、API Key 和模型名即可使用。
 
-## 运行环境
+## 📦 使用前准备
 
-- Windows 10 1903 或更高版本，x64；
-- 完整支持中文、Emoji、空格、长路径等 Unicode 路径；
-- 界面支持十种语言，按系统语言自动选择，也可用 `--ui-language` 指定。
+- 一台 Windows x64 电脑；
+- 一个可用的翻译模型服务（见上文）；
+- 推荐使用一个能执行命令、读写文件的 Agent；也可以手动运行 ATT。
 
-## 快速开始
+## 🚀 快速开始
 
-### 1. 配置模型
+### 第 1 步：下载并解压
 
-发行包是一个独立目录，包含 `att.exe`、`config.toml`、`docs/`、`skills/` 等固定内容。
-打开 `att.exe` 旁边的 `config.toml`，填好三项即可使用：
+从 [GitHub Releases](https://github.com/yexi-by/att-mz/releases/latest) 下载 Windows x64
+压缩包和 `SHA256SUMS.txt`，核对 SHA-256 后完整解压到一个可写目录。不要只单独复制
+`att.exe`。
+
+### 第 2 步：填写模型配置
+
+ATT 是一个独立目录，里面有 `att.exe`、`config.toml`、`docs/`、`skills/` 等内容。
+打开 `att.exe` 旁边的 `config.toml`，找到 `[llm.clients.primary]`，填好三行：
 
 ```toml
 [llm.clients.primary]
-url = "https://api.example.com/v1/chat/completions"   # 你的模型接口地址
-api_key = "replace-with-api-key"                       # 你的 API Key
-model = "replace-with-model-id"                        # 你的模型 ID
+url = "https://api.example.com/v1/chat/completions"   # 模型接口地址
+api_key = "replace-with-api-key"                       # API Key
+model = "replace-with-model-id"                        # 模型名
 ```
 
-ATT 只读取程序同目录下的这一份配置。字段、语言模块、翻译 Profile 等完整说明见
-[配置规格](docs/runtime/configuration.md)。
+### 第 3 步：把任务交给 Agent（推荐）
 
-### 2. 搭配 Agent 使用（推荐）
-
-ATT 发行包自带 Agent 工作流（`skills/`）和完整产品文档（`docs/`）。把下面这段提示词
-交给你的 Agent，填入实际路径和语言，剩下的交给它：
+把下面这段话发给你的 Agent，替换掉尖括号里的内容：
 
 ```text
 使用 <ATT目录>/att.exe 对 <游戏目录> 进行翻译，严格遵循 <ATT目录>/skills 下的工作流。
@@ -68,38 +86,47 @@ ATT 发行包自带 Agent 工作流（`skills/`）和完整产品文档（`docs/
 - 如果 docs 和 skills 确实无法解决问题，立即停止操作并解释原因。
 ```
 
-Agent 会按工作流调查游戏、建立项目、执行翻译、审校修订并生成输出；你只需在关键节点
-确认结果。
+Agent 会自己读 `skills/` 里的工作流和 `docs/` 里的说明，完成调查、翻译、检查和输出，
+你只需要在关键节点确认结果。
 
-### 3. 手动使用
+### 第 4 步：也可以手动使用
 
-每个翻译项目按四个命令推进（以 MV 为例，MZ 与 Generic 同理）：
+在 PowerShell 中进入 ATT 解压目录。每个游戏翻译项目分四步（以 RPG Maker MV 为例）：
 
 ```text
-att mv init --name mygame --path "D:\Games\MyGame" --source-language ja --target-language zh-Hans --dialogue-max-fullwidth-chars 40 --scrolling-text-max-fullwidth-chars 40 --help-description-max-fullwidth-chars 34
-att mv extract --name mygame --builtin
-att mv translate --name mygame
-att mv write-back --name mygame
+init ──▶ extract ──▶ translate ──▶ write-back
+建立项目    提取文本     调用模型翻译     生成译后文件
 ```
 
-1. `init` 建立项目并保存游戏来源副本（原游戏始终保持原样）；
-2. `extract` 读取当前输入，建立可翻译内容；
-3. `translate` 调用模型生成并保存译文，中断后重跑即可续译；
-4. `write-back` 在项目工作区生成可检查的译后输出。
+```text
+.\att.exe mv init --name mygame --path "D:\Games\MyGame" --source-language ja --target-language zh-Hans --dialogue-max-fullwidth-chars 40 --scrolling-text-max-fullwidth-chars 40 --help-description-max-fullwidth-chars 34
+.\att.exe mv extract --name mygame --builtin
+.\att.exe mv translate --name mygame primary
+.\att.exe mv write-back --name mygame
+```
 
-需要人工或 Agent 精确修订译文时，使用独立的 `lua` 命令操作项目数据库。完整命令语法、
-参数与退出码见 [CLI 规格](docs/runtime/cli.md)。
+1. `init`：建立项目，并保存一份游戏副本，之后的操作都不改动原游戏；
+2. `extract`：从游戏里提取需要翻译的文本；
+3. `translate`：调用模型翻译，按 Ctrl-C 受控取消后可重新执行同一条命令继续；
+4. `write-back`：在项目文件夹里生成翻译后的游戏文件，供你检查。
 
-## 文档导航
+需要逐条查看或修改译文时，ATT 提供 Lua 脚本入口，适合人工或 Agent 精确修订。
 
-ATT 把权威知识全部放在发行包内，Agent 和用户读的是同一份：
+## ❓ 遇到问题
 
-- [文档总入口](docs/README.md)：按当前任务、阶段或观察到的结果路由到对应文档；
-- [翻译项目指南](docs/guides/translation-project.md)：从调查游戏到建立完整任务的完整流程；
-- [诊断与恢复指南](docs/guides/diagnosis-and-recovery.md)：失败、Partial、取消、状态不明时怎么办；
-- [全量验收指南](docs/guides/acceptance.md)：确认整个游戏翻译真正完成；
-- `skills/`：Agent 执行工作流（`translate-with-att`）与术语提取工作流（`extract-game-terminology`）。
+`docs/` 目录里有完整说明，从[文档总入口](docs/README.md)开始，按你当前的情况选择：
 
-## 许可
+| 你的情况 | 看什么 |
+| --- | --- |
+| 第一次翻译游戏 | [翻译项目指南](docs/guides/translation-project.md) |
+| 命令失败、结果不完整或状态不明 | [诊断与恢复指南](docs/guides/diagnosis-and-recovery.md) |
+| 检查整个游戏是否翻译完整 | [全量验收指南](docs/guides/acceptance.md) |
+| 查命令参数和配置写法 | [CLI 规格](docs/runtime/cli.md) · [配置规格](docs/runtime/configuration.md) |
 
-ATT 随包提供 Lua 与 PCRE2 等第三方组件，许可声明见 [licenses/](licenses/) 目录。
+## 📄 许可
+
+Copyright (C) 2026 yexi-by。
+
+ATT 1.0 及后续当前版本以 [GNU Affero General Public License v3.0 only](LICENSE) 发布，
+SPDX 标识为 `AGPL-3.0-only`。Lua、PCRE2、Rust crates 与构建运行库等第三方组件保留
+各自许可，声明见 [licenses/](licenses/) 目录。

@@ -225,6 +225,7 @@ channel 呈现时，属于独立的进程呈现失败。任何用户可见诊断
 | 实际测量、性能候选取舍或参数实验 | 先读[性能工程要求](maintenance/performance.md)，再读[性能验证指南](maintenance/performance-validation.md) |
 | 发行内容、发行根、禁止项或完整发行验证 | [发行物规格](docs/runtime/distribution.md) |
 | 修改、执行或诊断发行资源同步 | 先读[发行物规格](docs/runtime/distribution.md)，再检查[发行资源同步脚本](scripts/sync-dist-resources.ps1) |
+| 准备或发布公开 GitHub Release | 先读[发行物规格](docs/runtime/distribution.md)，再读[公开发行指南](maintenance/releasing.md)并检查当前 Release workflow |
 | RPG Maker Init、Extract、Rules、Translate 或 WriteBack | 对应的 [Init](docs/rpg-maker/init.md)、[Extract](docs/rpg-maker/extraction.md)、[Rules](docs/rpg-maker/rules.md)、[Translate](docs/rpg-maker/translation.md)或[WriteBack](docs/rpg-maker/write-back.md)规格 |
 | Generic JSONL、Init、Extract、Translate 或 WriteBack | 对应的 [JSONL](docs/generic/jsonl.md)、[Init](docs/generic/init.md)、[Extract](docs/generic/extraction.md)、[Translate](docs/generic/translation.md)或[WriteBack](docs/generic/write-back.md)规格 |
 | 原子数据库 Lua | [Lua 规格](docs/lua/README.md) |
@@ -238,6 +239,11 @@ channel 呈现时，属于独立的进程呈现失败。任何用户可见诊断
 
 发行物的精确内容、固定根目录、禁止项和完整验证要求只由发行物规格负责；资源同步脚本只
 实现和检查该规格明确列出的资源映射。
+
+公开 Release 只从远端 `main` 上已经存在且不可变的版本标签构建，由 GitHub Actions
+重新生成、验证并发布制品。不得上传本机 `dist/`，也不得在拥有 Release 写权限的发布阶段
+重新构建。根许可证、Cargo SPDX、README、发行包与 GitHub 仓库元数据必须表达同一许可
+和产品范围；旧版本的标签与 Release 保留其当时许可，不追溯改写。
 
 ## 9. 实现、验证与完成
 
