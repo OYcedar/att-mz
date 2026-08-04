@@ -1,0 +1,10 @@
+targets = ["x86_64-pc-windows-msvc"]
+ignore-dev-dependencies = true
+private = { ignore = true }
+
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]

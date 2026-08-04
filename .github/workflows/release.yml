@@ -1,0 +1,287 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "已经存在于 main 当前提交的版本标签，例如 v1.0.0"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and verify Windows x64 release
+    runs-on: windows-2025
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      PCRE2_SYS_STATIC: "1"
+      RUSTFLAGS: "-C target-feature=+crt-static"
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      release_name: ${{ steps.meta.outputs.release_name }}
+      archive_name: ${{ steps.package.outputs.archive_name }}
+      archive_sha256: ${{ steps.package.outputs.archive_sha256 }}
+      checksums_sha256: ${{ steps.package.outputs.checksums_sha256 }}
+
+    steps:
+      - name: Checkout main with complete history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: main
+          persist-credentials: false
+
+      - name: Resolve immutable release metadata
+        id: meta
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          if ($env:GITHUB_REF -cne 'refs/heads/main') {
+            throw "Release workflow 只能从 main 触发：$env:GITHUB_REF"
+          }
+          $tag = $env:RELEASE_TAG.Trim()
+          if ($tag -cnotmatch '^v(?<version>\d+\.\d+\.\d+)$') {
+            throw "版本标签必须是 vMAJOR.MINOR.PATCH：$tag"
+          }
+          git fetch --force origin main --tags
+          git show-ref --verify --quiet "refs/tags/$tag"
+          if ($LASTEXITCODE -ne 0) {
+            throw "远端标签不存在：$tag"
+          }
+          $tagCommit = (git rev-list -n 1 "refs/tags/$tag").Trim().ToLowerInvariant()
+          $mainCommit = (git rev-parse 'origin/main^{commit}').Trim().ToLowerInvariant()
+          $workflowCommit = $env:GITHUB_SHA.Trim().ToLowerInvariant()
+          if ($tagCommit -cne $mainCommit -or $workflowCommit -cne $mainCommit) {
+            throw "标签、远端 main 与 workflow 提交不一致：tag=$tagCommit main=$mainCommit workflow=$workflowCommit"
+          }
+          git checkout --detach $tagCommit
+
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $package = $metadata.packages | Where-Object { $_.name -ceq 'att' }
+          if ($null -eq $package -or $package.Count -ne 1) {
+            throw 'Cargo metadata 必须恰好包含一个 att package。'
+          }
+          $version = $Matches['version']
+          if ($package.version -cne $version) {
+            throw "Cargo 版本与标签不一致：tag=$version cargo=$($package.version)"
+          }
+          $manifest = Get-Content -Raw -LiteralPath 'att.exe.manifest'
+          $manifestVersion = "$version.0"
+          if ($manifest -notmatch ('version="' + [regex]::Escape($manifestVersion) + '"')) {
+            throw "Windows manifest 版本必须是 $manifestVersion"
+          }
+          $parts = $version.Split('.')
+          $releaseName = if ($parts[2] -ceq '0') {
+            "ATT $($parts[0]).$($parts[1])"
+          }
+          else {
+            "ATT $version"
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "release_name=$releaseName" >> $env:GITHUB_OUTPUT
+
+      - name: Confirm locked Rust toolchain
+        shell: pwsh
+        run: |
+          rustup show active-toolchain
+          rustc --version --verbose
+          cargo --version --verbose
+
+      - name: Rust format
+        shell: pwsh
+        run: cargo fmt --all -- --check
+
+      - name: Rust Clippy
+        shell: pwsh
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Rust tests
+        shell: pwsh
+        run: cargo test --locked --all-targets
+
+      - name: Build static Release executable
+        shell: pwsh
+        run: cargo build --locked --release --bin att
+
+      - name: Verify third-party license report
+        shell: pwsh
+        run: |
+          cargo binstall -V *> $null
+          if ($LASTEXITCODE -eq 0) {
+            cargo binstall cargo-about --version 0.9.1 --no-confirm
+          }
+          else {
+            cargo install cargo-about --version 0.9.1 --locked
+          }
+          New-Item -ItemType Directory -Path 'tmp' -Force | Out-Null
+          cargo about generate about.hbs --frozen --target x86_64-pc-windows-msvc --fail `
+            --output-file 'tmp\THIRD-PARTY-LICENSES.html'
+          $expected = (Get-FileHash -Algorithm SHA256 `
+            -LiteralPath 'licenses\THIRD-PARTY-LICENSES.html').Hash
+          $actual = (Get-FileHash -Algorithm SHA256 `
+            -LiteralPath 'tmp\THIRD-PARTY-LICENSES.html').Hash
+          if ($actual -cne $expected) {
+            throw '第三方许可清单与 Cargo.lock 或 cargo-about 配置不一致。'
+          }
+
+      - name: Assemble and verify dist
+        shell: pwsh
+        run: |
+          if (Test-Path -LiteralPath 'dist') {
+            throw '干净 checkout 不应包含 dist。'
+          }
+          New-Item -ItemType Directory -Path 'dist', 'dist\projects' | Out-Null
+          Copy-Item -LiteralPath 'target\x86_64-pc-windows-msvc\release\att.exe' `
+            -Destination 'dist\att.exe'
+          & .\scripts\sync-dist-resources.ps1
+          & .\scripts\verify-release-package.ps1 -ExpectedVersion '${{ steps.meta.outputs.version }}'
+
+      - name: Create maximum-compression ZIP and checksums
+        id: package
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          $archiveName = "att-v$env:RELEASE_VERSION-windows-x64.zip"
+          $outputRoot = Join-Path $PWD 'release-artifacts'
+          New-Item -ItemType Directory -Path $outputRoot | Out-Null
+          $archivePath = Join-Path $outputRoot $archiveName
+          Push-Location 'dist'
+          try {
+            & 7z a -tzip $archivePath '.\*' -mx=9 -mm=Deflate -mfb=258 -mpass=15 -bd
+            if ($LASTEXITCODE -ne 0) {
+              throw "7-Zip 创建发行包失败，退出码 $LASTEXITCODE"
+            }
+          }
+          finally {
+            Pop-Location
+          }
+
+          $extractRoot = Join-Path $outputRoot 'archive-check'
+          New-Item -ItemType Directory -Path $extractRoot | Out-Null
+          & 7z x $archivePath "-o$extractRoot" -bd
+          if ($LASTEXITCODE -ne 0) {
+            throw "7-Zip 复核发行包失败，退出码 $LASTEXITCODE"
+          }
+          & .\scripts\verify-release-package.ps1 `
+            -ExpectedVersion $env:RELEASE_VERSION `
+            -TargetRoot $extractRoot
+
+          $archiveSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $archivePath).Hash.ToLowerInvariant()
+          $checksumsPath = Join-Path $outputRoot 'SHA256SUMS.txt'
+          "$archiveSha *$archiveName" | Set-Content -LiteralPath $checksumsPath -Encoding ascii
+          $checksumsSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $checksumsPath).Hash.ToLowerInvariant()
+          "archive_name=$archiveName" >> $env:GITHUB_OUTPUT
+          "archive_sha256=$archiveSha" >> $env:GITHUB_OUTPUT
+          "checksums_sha256=$checksumsSha" >> $env:GITHUB_OUTPUT
+
+      - name: Upload verified release artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: att-release-${{ steps.meta.outputs.version }}
+          path: |
+            release-artifacts/${{ steps.package.outputs.archive_name }}
+            release-artifacts/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: windows-2025
+    timeout-minutes: 20
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout release notes from tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          ref: ${{ needs.build.outputs.tag }}
+          persist-credentials: false
+
+      - name: Download verified build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: att-release-${{ needs.build.outputs.version }}
+          path: release-artifacts
+
+      - name: Verify and publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+          RELEASE_NAME: ${{ needs.build.outputs.release_name }}
+          ARCHIVE_NAME: ${{ needs.build.outputs.archive_name }}
+          EXPECTED_ARCHIVE_SHA256: ${{ needs.build.outputs.archive_sha256 }}
+          EXPECTED_CHECKSUMS_SHA256: ${{ needs.build.outputs.checksums_sha256 }}
+        run: |
+          $archivePath = Join-Path 'release-artifacts' $env:ARCHIVE_NAME
+          $checksumsPath = Join-Path 'release-artifacts' 'SHA256SUMS.txt'
+          $archiveSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $archivePath).Hash.ToLowerInvariant()
+          $checksumsSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $checksumsPath).Hash.ToLowerInvariant()
+          if ($archiveSha -cne $env:EXPECTED_ARCHIVE_SHA256) {
+            throw "下载后的压缩包 SHA-256 不一致：$archiveSha"
+          }
+          if ($checksumsSha -cne $env:EXPECTED_CHECKSUMS_SHA256) {
+            throw "下载后的校验文件 SHA-256 不一致：$checksumsSha"
+          }
+          $checksumLine = (Get-Content -Raw -LiteralPath $checksumsPath).Trim()
+          if ($checksumLine -cne "$archiveSha *$env:ARCHIVE_NAME") {
+            throw "SHA256SUMS.txt 内容不一致：$checksumLine"
+          }
+
+          gh release view $env:RELEASE_TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            throw "Release 已存在：$env:RELEASE_TAG"
+          }
+
+          $created = $false
+          try {
+            gh release create $env:RELEASE_TAG $archivePath $checksumsPath `
+              --verify-tag `
+              --title $env:RELEASE_NAME `
+              --notes-file '.github\RELEASE_NOTES.md' `
+              --latest
+            if ($LASTEXITCODE -ne 0) {
+              throw "创建 GitHub Release 失败，退出码 $LASTEXITCODE"
+            }
+            $created = $true
+
+            $release = gh release view $env:RELEASE_TAG --json isDraft,isPrerelease,assets |
+              ConvertFrom-Json
+            if ($release.isDraft -or $release.isPrerelease) {
+              throw '正式 Release 不得是草稿或预发布。'
+            }
+            $archiveAsset = $release.assets | Where-Object { $_.name -ceq $env:ARCHIVE_NAME }
+            $checksumsAsset = $release.assets | Where-Object { $_.name -ceq 'SHA256SUMS.txt' }
+            if ($archiveAsset.Count -ne 1 -or $archiveAsset.digest -cne "sha256:$archiveSha") {
+              throw 'GitHub 上的压缩包摘要不一致。'
+            }
+            if ($checksumsAsset.Count -ne 1 -or $checksumsAsset.digest -cne "sha256:$checksumsSha") {
+              throw 'GitHub 上的校验文件摘要不一致。'
+            }
+          }
+          catch {
+            $failure = $_
+            if ($created) {
+              gh release delete $env:RELEASE_TAG --yes
+              $cleanupExitCode = $LASTEXITCODE
+              if ($cleanupExitCode -ne 0) {
+                throw "Release 复核失败，且删除不合格 Release 失败，退出码 $cleanupExitCode：$($failure.Exception.Message)"
+              }
+            }
+            throw $failure
+          }

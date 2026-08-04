@@ -3,22 +3,32 @@
 把仓库中的使用者资源同步到 dist，或只检查两边是否一致。
 
 .DESCRIPTION
-管理 README.md、config.example.toml -> config.toml、统一许可证目录、docs、prompts 和 skills。
+管理 README.md、LICENSE、config.example.toml -> config.toml、第三方许可证目录、docs、
+prompts 和 skills。
 不修改 att.exe 或运行库。
 
 .PARAMETER Check
 只比较文件集合和 SHA-256，不修改 dist。
+
+.PARAMETER TargetRoot
+可选的发行根；省略时使用仓库固定的 dist。供公开发行验证在干净暂存目录中复用。
 #>
 [CmdletBinding()]
 param(
-    [switch]$Check
+    [switch]$Check,
+    [string]$TargetRoot
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
-$distributionRoot = Join-Path $repositoryRoot 'dist'
+$distributionRoot = if ([string]::IsNullOrWhiteSpace($TargetRoot)) {
+    Join-Path $repositoryRoot 'dist'
+}
+else {
+    [System.IO.Path]::GetFullPath($TargetRoot)
+}
 
 if (-not (Test-Path -LiteralPath $distributionRoot -PathType Container)) {
     throw "发行目录不存在：$distributionRoot"
@@ -28,6 +38,10 @@ $fileMappings = @(
     [pscustomobject]@{
         Source = Join-Path $repositoryRoot 'README.md'
         Destination = Join-Path $distributionRoot 'README.md'
+    },
+    [pscustomobject]@{
+        Source = Join-Path $repositoryRoot 'LICENSE'
+        Destination = Join-Path $distributionRoot 'LICENSE'
     },
     [pscustomobject]@{
         Source = Join-Path $repositoryRoot 'config.example.toml'

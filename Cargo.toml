@@ -1,9 +1,12 @@
 [package]
 name = "att"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.97"
 publish = false
+description = "面向 Agent 的游戏翻译命令行工具"
+license = "AGPL-3.0-only"
+repository = "https://github.com/yexi-by/att-mz"
 
 [dependencies]
 aho-corasick = "1.1.4"
