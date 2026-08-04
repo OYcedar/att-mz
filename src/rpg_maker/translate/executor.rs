@@ -54,7 +54,7 @@ use crate::translation::placeholder_token;
 use crate::translation::task_planning::TaskId;
 use crate::translation_protocol::{
     DecodedJsonStringArray, DecodedSourceEchoFieldsError, DecodedSourceEchoValue,
-    DecodedTranslationAssistantValue, TranslationResponseMode,
+    DecodedTranslationAssistantValue, TranslationResponseMode, TranslationResponseRepair,
     parse_translation_response_with_cancellation,
 };
 
@@ -1252,7 +1252,11 @@ fn process_response(
         }
     };
     let (parsed, response_record) = match parsed {
-        Ok(ParsedModelOutputBatch { thinking, outputs }) => match raw_assistant {
+        Ok(ParsedModelOutputBatch {
+            thinking,
+            outputs,
+            repairs,
+        }) => match raw_assistant {
             Some(raw_assistant) => {
                 let mut entries = Vec::with_capacity(outputs.len());
                 let mut acceptance_outputs = Vec::with_capacity(outputs.len());
@@ -1299,8 +1303,12 @@ fn process_response(
                         translation,
                     });
                 }
-                let record =
-                    TranslationTaskResponseRecord::parsed(raw_assistant, thinking, entries);
+                let record = TranslationTaskResponseRecord::parsed_with_repairs(
+                    raw_assistant,
+                    thinking,
+                    entries,
+                    repairs,
+                );
                 (Ok(acceptance_outputs), Some(record))
             }
             None => {
@@ -1931,7 +1939,7 @@ fn parse_model_response_with_cancellation<E>(
         Ok(parsed) => parsed,
         Err(source) => return Ok(Err(source)),
     };
-    let (thinking, entries) = parsed.into_parts();
+    let (thinking, entries, repairs) = parsed.into_parts();
     let mut outputs = Vec::with_capacity(entries.len());
     for entry in entries {
         ensure_running()?;
@@ -1946,7 +1954,11 @@ fn parse_model_response_with_cancellation<E>(
         });
     }
     ensure_running()?;
-    Ok(Ok(ParsedModelOutputBatch { thinking, outputs }))
+    Ok(Ok(ParsedModelOutputBatch {
+        thinking,
+        outputs,
+        repairs,
+    }))
 }
 
 fn translation_lines_from_decoded_value(
@@ -2011,6 +2023,7 @@ fn translation_lines_from_array(
 struct ParsedModelOutputBatch {
     thinking: Option<String>,
     outputs: Vec<ParsedModelOutput>,
+    repairs: Vec<TranslationResponseRepair>,
 }
 
 #[cfg(test)]
@@ -3864,7 +3877,7 @@ mod tests {
     }
 
     #[test]
-    fn thinking_mode_requires_exact_non_blank_json_wrapper() {
+    fn thinking_mode_requires_exact_non_blank_wrapper_after_json_repair() {
         let mode = TranslationResponseMode::new(true, false);
         for value in [
             "{}",
@@ -3874,13 +3887,19 @@ mod tests {
             r#"{"think":"判断","translations":{},"extra":true}"#,
             r#"{"think":"判断","think":"重复","translations":{}}"#,
             r#"{"think":"判断"}"#,
-            "```json\n{\"think\":\"判断\",\"translations\":{}}\n```",
         ] {
             assert!(
                 parse_model_output_batch(value, mode).is_err(),
                 "协议外 thinking 响应必须拒绝：{value:?}"
             );
         }
+
+        let repaired = parse_model_output_batch(
+            "```json\n{\"think\":\"判断\",\"translations\":{}}\n```",
+            mode,
+        )
+        .expect("围栏只改变 JSON 外壳，不改变 thinking wrapper 契约");
+        assert!(repaired.is_empty());
     }
 
     #[test]
@@ -3910,18 +3929,20 @@ mod tests {
     }
 
     #[test]
-    fn response_parser_rejects_non_json_and_trailing_content() {
+    fn response_parser_repairs_supported_syntax_and_rejects_ambiguity_or_shape() {
         let mode = TranslationResponseMode::new(false, false);
         for value in [
             "说明：{}",
             "{} 后记",
-            "{}\n{}",
             "{\"0\":[\"译文\",]}",
             "{// comment\n}",
             "```json\n{}\n```",
-            "{\"0\":[\"截断",
-            "[]",
         ] {
+            parse_model_output_batch(value, mode)
+                .unwrap_or_else(|error| panic!("支持的 JSON 修复必须成功：{value:?}: {error:?}"));
+        }
+
+        for value in ["{}\n{}", "{\"0\":[\"截断", "[]"] {
             assert!(parse_model_output_batch(value, mode).is_err());
         }
     }

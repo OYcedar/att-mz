@@ -15,12 +15,13 @@ use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
 use crate::llm::{ChatMessage, ChatMessageRole, LlmClientRecordMetadata};
 use crate::translation::task_record::{
     TranslationTaskRecordArtifact, markdown_fence, markdown_heading_id, markdown_inline_code,
-    recorded_at_utc, render_client_parameters, render_duration, render_raw_assistant,
-    render_task_record_attempt, task_record_text,
+    recorded_at_utc, render_client_parameters, render_duration, render_json_repairs,
+    render_raw_assistant, render_repaired_raw_assistant, render_task_record_attempt,
+    task_record_text,
 };
 use crate::translation_protocol::{
     DecodedJsonStringArray, DecodedSourceEchoValue, DecodedTranslationAssistantValue,
-    ParsedTranslationResponse, TranslationTaskResponseParseError,
+    ParsedTranslationResponse, TranslationResponseRepair, TranslationTaskResponseParseError,
     TranslationTaskResponseParseErrorKind,
 };
 
@@ -29,6 +30,7 @@ pub(crate) enum GenericTaskResponseRecord {
     Parsed {
         thinking: Option<String>,
         entries: Vec<(String, GenericTaskRecordedValue)>,
+        repairs: Vec<TranslationResponseRepair>,
         raw_assistant: String,
     },
     Invalid {
@@ -53,7 +55,7 @@ impl GenericTaskResponseRecord {
         mut ensure_running: impl FnMut() -> Result<(), E>,
     ) -> Result<Self, E> {
         ensure_running()?;
-        let (thinking, entries) = parsed.into_parts();
+        let (thinking, entries, repairs) = parsed.into_parts();
         let mut recorded_entries = Vec::with_capacity(entries.len());
         for entry in entries {
             ensure_running()?;
@@ -75,6 +77,7 @@ impl GenericTaskResponseRecord {
         Ok(Self::Parsed {
             thinking,
             entries: recorded_entries,
+            repairs,
             raw_assistant,
         })
     }
@@ -391,6 +394,7 @@ fn render_response(
         GenericTaskResponseRecord::Parsed {
             thinking,
             entries,
+            repairs,
             raw_assistant,
         } => {
             if let Some(thinking) = thinking {
@@ -429,9 +433,14 @@ fn render_response(
                 }
                 output.push('\n');
             }
-            if thinking.is_some() {
+            render_json_repairs(output, repairs);
+            if thinking.is_some() || !repairs.is_empty() {
                 output.push_str("\n## Raw Assistant\n\n");
-                output.push_str(&render_raw_assistant(raw_assistant, redactor));
+                output.push_str(&if repairs.is_empty() {
+                    render_raw_assistant(raw_assistant, redactor)
+                } else {
+                    render_repaired_raw_assistant(raw_assistant, redactor)
+                });
             }
         }
         GenericTaskResponseRecord::Invalid {
@@ -440,7 +449,10 @@ fn render_response(
         } => {
             output.push_str("\n## Assistant\n\n");
             let category = match error.kind() {
-                TranslationTaskResponseParseErrorKind::Json(category) => category.code(),
+                TranslationTaskResponseParseErrorKind::Json(category)
+                | TranslationTaskResponseParseErrorKind::JsonRepair { category, .. } => {
+                    category.code()
+                }
                 _ => "",
             };
             let _ = writeln!(
@@ -583,14 +595,90 @@ mod tests {
     }
 
     #[test]
+    fn non_thinking_fenced_json_records_repairs_and_safe_text_raw_assistant() {
+        const API_KEY: &str = "quote\"slash\\value";
+        let encoded_api_key = serde_json::to_string(API_KEY).expect("API key 应可编码为 JSON");
+        let encoded_fragment = &encoded_api_key[1..encoded_api_key.len() - 1];
+        let raw_assistant = format!(
+            "\u{2003}\r\n```json\r\n{{\"0\":[\"before-{encoded_fragment}-after\"]}}\r\n```\r\n"
+        );
+        let parsed =
+            parse_translation_response(&raw_assistant, TranslationResponseMode::new(false, false))
+                .expect("非 thinking 的单一 Markdown 围栏应可保守修复");
+        let record =
+            GenericTaskResponseRecord::parsed_with_cancellation(raw_assistant, parsed, || {
+                Ok::<_, Infallible>(())
+            })
+            .expect("未取消的记录投影应成功");
+        let client = LlmClientRecordMetadata::new(
+            "https://example.test".to_owned(),
+            "model".to_owned(),
+            Map::new(),
+            ApiKeyRedactor::new(SecretString::from(API_KEY)),
+        );
+        let mut output = String::new();
+
+        render_response(
+            &mut output,
+            &UiLocalizer::new(UiLocale::SimplifiedChinese),
+            &client,
+            &record,
+        )
+        .expect("修复后的非 thinking 响应应该可渲染");
+
+        assert!(output.contains("## JSON Repairs"));
+        assert_eq!(output.matches("`removed_markdown_fence`").count(), 2);
+        assert!(output.contains("| `removed_markdown_fence` | 2 | 1 |"));
+        assert!(output.contains("| `removed_markdown_fence` | 4 | 1 |"));
+        assert!(output.contains("## Raw Assistant\n\n````text\n"));
+        assert!(!output.contains(API_KEY));
+        assert!(!output.contains(encoded_fragment));
+        assert!(output.contains("before-[REDACTED API KEY]-after"));
+    }
+
+    #[test]
+    fn non_thinking_strict_json_keeps_existing_record_shape() {
+        let raw_assistant = r#"{"0":["严格响应"]}"#.to_owned();
+        let parsed =
+            parse_translation_response(&raw_assistant, TranslationResponseMode::new(false, false))
+                .expect("严格 JSON 应直接解析");
+        let record =
+            GenericTaskResponseRecord::parsed_with_cancellation(raw_assistant, parsed, || {
+                Ok::<_, Infallible>(())
+            })
+            .expect("未取消的记录投影应成功");
+        let client = LlmClientRecordMetadata::new(
+            "https://example.test".to_owned(),
+            "model".to_owned(),
+            Map::new(),
+            ApiKeyRedactor::new(SecretString::from("unused-key")),
+        );
+        let mut output = String::new();
+
+        render_response(
+            &mut output,
+            &UiLocalizer::new(UiLocale::SimplifiedChinese),
+            &client,
+            &record,
+        )
+        .expect("严格非 thinking 响应应该可渲染");
+
+        assert!(output.contains("## Assistant\n\n### ID 0\n\n严格响应"));
+        assert!(!output.contains("## JSON Repairs"));
+        assert!(!output.contains("## Raw Assistant"));
+    }
+
+    #[test]
     fn invalid_response_renders_safe_raw_assistant_diagnostic() {
         const API_KEY: &str = "quote\"slash\\value";
         let encoded_api_key = serde_json::to_string(API_KEY).expect("API key 应可编码为 JSON");
         let encoded_fragment = &encoded_api_key[1..encoded_api_key.len() - 1];
-        let raw_assistant = format!("```malformed {{\"0\":[\"before-{encoded_fragment}-after\"]");
+        let raw_assistant = format!(
+            "```malformed\n{{\"0\":[\"before-{encoded_fragment}-after\"]}}\n```\n```json\n{{\"1\":[]}}\n```"
+        );
         let error =
             parse_translation_response(&raw_assistant, TranslationResponseMode::new(false, false))
-                .expect_err("不完整 JSON 应返回结构化解析错误");
+                .expect_err("多个候选 JSON 应返回结构化解析错误");
         let record = GenericTaskResponseRecord::invalid(raw_assistant, error);
         let client = LlmClientRecordMetadata::new(
             "https://example.test".to_owned(),
