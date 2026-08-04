@@ -1470,32 +1470,6 @@ pub(crate) enum RpgMakerResponseLanguageProjectionProblem {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
-pub(crate) enum RpgMakerLanguageRepairProblem {
-    InvalidNaturalSegment {
-        segment_index: usize,
-    },
-    DuplicatePosition {
-        segment_index: usize,
-        byte_offset: usize,
-    },
-    InvalidCharacterBoundary {
-        segment_index: usize,
-        byte_offset: usize,
-    },
-    MissingCharacter {
-        segment_index: usize,
-        byte_offset: usize,
-    },
-    UnexpectedCharacter {
-        segment_index: usize,
-        byte_offset: usize,
-        expected_code_point: u32,
-        actual_code_point: u32,
-    },
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub(crate) enum RpgMakerResponseInvariantProblem {
     ResponseAttemptZero,
     ExpectedOutputsEmpty,
@@ -1856,9 +1830,6 @@ pub(crate) enum RpgMakerResponseProcessingProblem {
     LanguageProjection {
         problem: RpgMakerResponseLanguageProjectionProblem,
     },
-    LanguageRepair {
-        problem: RpgMakerLanguageRepairProblem,
-    },
     InternalInvariant {
         problem: RpgMakerResponseInvariantProblem,
     },
@@ -1904,23 +1875,6 @@ impl RpgMakerResponseProcessingProblem {
                     "rpg_maker.translation.response.unused_ordered_token"
                 }
             },
-            Self::LanguageRepair { problem } => match problem {
-                RpgMakerLanguageRepairProblem::InvalidNaturalSegment { .. } => {
-                    "rpg_maker.translation.response.repair_invalid_natural_segment"
-                }
-                RpgMakerLanguageRepairProblem::DuplicatePosition { .. } => {
-                    "rpg_maker.translation.response.repair_duplicate_position"
-                }
-                RpgMakerLanguageRepairProblem::InvalidCharacterBoundary { .. } => {
-                    "rpg_maker.translation.response.repair_invalid_character_boundary"
-                }
-                RpgMakerLanguageRepairProblem::MissingCharacter { .. } => {
-                    "rpg_maker.translation.response.repair_missing_character"
-                }
-                RpgMakerLanguageRepairProblem::UnexpectedCharacter { .. } => {
-                    "rpg_maker.translation.response.repair_unexpected_character"
-                }
-            },
             Self::InternalInvariant { problem } => match problem {
                 RpgMakerResponseInvariantProblem::ResponseAttemptZero => {
                     "rpg_maker.translation.response.attempt_zero"
@@ -1959,7 +1913,6 @@ impl RpgMakerResponseProcessingProblem {
             Self::Compute { .. } => "external_service_unavailable",
             Self::LanguageModuleMismatch { .. }
             | Self::LanguageProjection { .. }
-            | Self::LanguageRepair { .. }
             | Self::InternalInvariant { .. } => "internal_invariant",
         }
     }
@@ -1979,7 +1932,6 @@ impl RpgMakerResponseProcessingProblem {
                 ),
             ],
             Self::LanguageProjection { problem } => response_language_projection_facts(problem),
-            Self::LanguageRepair { problem } => language_repair_facts(problem),
             Self::InternalInvariant { problem } => response_invariant_facts(problem),
         }
     }
@@ -2033,40 +1985,6 @@ fn response_language_projection_facts(
         RpgMakerResponseLanguageProjectionProblem::UnusedOrderedToken => {
             vec![("projection_failure", "unused_ordered_token".to_owned())]
         }
-    }
-}
-
-fn language_repair_facts(problem: &RpgMakerLanguageRepairProblem) -> Vec<(&'static str, String)> {
-    match problem {
-        RpgMakerLanguageRepairProblem::InvalidNaturalSegment { segment_index } => {
-            vec![("segment_index", segment_index.to_string())]
-        }
-        RpgMakerLanguageRepairProblem::DuplicatePosition {
-            segment_index,
-            byte_offset,
-        }
-        | RpgMakerLanguageRepairProblem::InvalidCharacterBoundary {
-            segment_index,
-            byte_offset,
-        }
-        | RpgMakerLanguageRepairProblem::MissingCharacter {
-            segment_index,
-            byte_offset,
-        } => vec![
-            ("segment_index", segment_index.to_string()),
-            ("byte_offset", byte_offset.to_string()),
-        ],
-        RpgMakerLanguageRepairProblem::UnexpectedCharacter {
-            segment_index,
-            byte_offset,
-            expected_code_point,
-            actual_code_point,
-        } => vec![
-            ("segment_index", segment_index.to_string()),
-            ("byte_offset", byte_offset.to_string()),
-            ("expected_code_point", expected_code_point.to_string()),
-            ("actual_code_point", actual_code_point.to_string()),
-        ],
     }
 }
 
@@ -6650,7 +6568,6 @@ impl RpgMakerIssue {
                 | RpgMakerResponseProcessingProblem::Compute { .. } => DiagnosticResolution::Retry,
                 RpgMakerResponseProcessingProblem::LanguageModuleMismatch { .. }
                 | RpgMakerResponseProcessingProblem::LanguageProjection { .. }
-                | RpgMakerResponseProcessingProblem::LanguageRepair { .. }
                 | RpgMakerResponseProcessingProblem::InternalInvariant { .. } => {
                     DiagnosticResolution::ReportBug
                 }
