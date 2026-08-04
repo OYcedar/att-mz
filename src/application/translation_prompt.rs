@@ -759,12 +759,20 @@ mod tests {
     }
 
     #[test]
-    fn every_selected_example_contains_one_valid_input_and_output_json() {
-        for example in [
-            PLAIN_EXAMPLE,
-            THINKING_EXAMPLE,
-            SOURCE_ECHO_EXAMPLE,
-            THINKING_SOURCE_ECHO_EXAMPLE,
+    fn every_selected_example_demonstrates_the_line_shape_contract() {
+        let mut shared_input = None;
+        let mut shared_translations = None;
+        for (mode, example) in [
+            (TranslationResponseMode::new(false, false), PLAIN_EXAMPLE),
+            (TranslationResponseMode::new(true, false), THINKING_EXAMPLE),
+            (
+                TranslationResponseMode::new(false, true),
+                SOURCE_ECHO_EXAMPLE,
+            ),
+            (
+                TranslationResponseMode::new(true, true),
+                THINKING_SOURCE_ECHO_EXAMPLE,
+            ),
         ] {
             let blocks = example
                 .split("```json")
@@ -772,9 +780,112 @@ mod tests {
                 .map(|tail| tail.split("```").next().expect("JSON 围栏必须闭合").trim())
                 .collect::<Vec<_>>();
             assert_eq!(blocks.len(), 2, "每份示例必须只有一组输入和输出");
-            for json in blocks {
-                serde_json::from_str::<serde_json::Value>(json)
-                    .expect("示例中的输入和输出都必须是合法 JSON");
+
+            let input = serde_json::from_str::<serde_json::Value>(blocks[0])
+                .expect("示例输入必须是合法 JSON");
+            let output = serde_json::from_str::<serde_json::Value>(blocks[1])
+                .expect("示例输出必须是合法 JSON");
+            if let Some(expected) = &shared_input {
+                assert_eq!(&input, expected, "四种响应模式必须使用同一份示例输入");
+            } else {
+                shared_input = Some(input.clone());
+            }
+            let translations = if mode.thinking() {
+                output
+                    .get("translations")
+                    .and_then(serde_json::Value::as_object)
+                    .expect("思考模式示例必须把译文放在 translations object 中")
+            } else {
+                output
+                    .as_object()
+                    .expect("非思考模式示例输出必须是 ID object")
+            };
+
+            let mut has_free_with_fewer_lines = false;
+            let mut has_free_with_more_lines = false;
+            let mut normalized_translations = serde_json::Map::new();
+            for group in input["groups"]
+                .as_array()
+                .expect("示例输入必须包含 groups 数组")
+            {
+                for unit in group["units"]
+                    .as_array()
+                    .expect("示例 Group 必须包含 units 数组")
+                {
+                    let Some(id) = unit.get("id").and_then(serde_json::Value::as_str) else {
+                        continue;
+                    };
+                    let source = unit["text"]
+                        .as_array()
+                        .expect("带 ID 的示例 Unit 必须包含 text 数组");
+                    let returned = translations
+                        .get(id)
+                        .unwrap_or_else(|| panic!("示例输出缺少 ID {id}"));
+                    let translation = if mode.source_echo() {
+                        let returned = returned
+                            .as_object()
+                            .expect("原文回显模式的 ID value 必须是 object");
+                        assert_eq!(
+                            returned
+                                .get("source")
+                                .and_then(serde_json::Value::as_array)
+                                .expect("原文回显模式必须包含 source 数组"),
+                            source,
+                            "原文回显必须等于对应输入 text"
+                        );
+                        returned
+                            .get("translation")
+                            .and_then(serde_json::Value::as_array)
+                            .expect("原文回显模式必须包含 translation 数组")
+                    } else {
+                        returned
+                            .as_array()
+                            .expect("非原文回显模式的 ID value 必须是译文数组")
+                    };
+
+                    match unit["type"].as_str().expect("带 ID 的 Unit 必须包含 type") {
+                        "free" => {
+                            has_free_with_fewer_lines |= translation.len() < source.len();
+                            has_free_with_more_lines |= translation.len() > source.len();
+                        }
+                        "strict" => {
+                            assert_eq!(
+                                translation.len(),
+                                source.len(),
+                                "strict 示例必须保持数组项数"
+                            );
+                            for (index, source_line) in source.iter().enumerate() {
+                                if source_line.as_str() == Some("") {
+                                    assert_eq!(
+                                        translation[index].as_str(),
+                                        Some(""),
+                                        "strict 示例必须保留输入空槽的位置"
+                                    );
+                                }
+                            }
+                        }
+                        other => panic!("示例包含未知翻译类型：{other}"),
+                    }
+                    normalized_translations
+                        .insert(id.to_owned(), serde_json::Value::Array(translation.clone()));
+                }
+            }
+
+            assert!(
+                has_free_with_fewer_lines,
+                "每份示例都必须展示 free 译文可以少于输入行数"
+            );
+            assert!(
+                has_free_with_more_lines,
+                "每份示例都必须展示 free 译文可以多于输入行数"
+            );
+            if let Some(expected) = &shared_translations {
+                assert_eq!(
+                    &normalized_translations, expected,
+                    "四种响应模式必须使用同一组示例译文"
+                );
+            } else {
+                shared_translations = Some(normalized_translations);
             }
         }
     }
