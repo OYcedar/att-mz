@@ -121,9 +121,11 @@ fn layout_pairs(
 
             let semantic_indent_required =
                 !wrapping_stack.is_empty() && continuation_indent_position(&tokens).is_some();
-            let first_line_indent_cells = semantic_indent_required
-                .then_some(CONTINUATION_INDENT_CELLS)
-                .unwrap_or_default();
+            let first_line_indent_cells = if semantic_indent_required {
+                CONTINUATION_INDENT_CELLS
+            } else {
+                0
+            };
             let first_line_max_cells = max_cells.saturating_sub(first_line_indent_cells);
 
             if line_width(&tokens) <= first_line_max_cells {
