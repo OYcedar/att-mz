@@ -1,6 +1,5 @@
 app-about = 再利用可能なプロジェクト状態でゲームと構造化テキストを翻訳します
 cli-ui-language-help = ヘルプ、診断、進捗、結果、プロジェクトログの言語: ar、zh-Hans、zh-Hant、en、fr、ru、es、ja、ko、vi
-cli-progress-help = 進捗表示モード: auto、plain、off
 cli-mz-about = RPG Maker MZ ゲームを翻訳します
 cli-mv-about = RPG Maker MV ゲームを翻訳します
 cli-generic-about = 規定の JSONL テキストを翻訳します
@@ -34,7 +33,6 @@ cli-print-help = ヘルプを表示します
 cli-print-version = バージョンを表示します
 cli-blank-value = 値を空にすることはできません。
 cli-invalid-positive-integer = 値は正の整数でなければなりません。
-cli-invalid-progress = 進捗モード { $value } は未対応です。auto、plain、off のいずれかを使用してください。
 cli-invalid-ui-language-argument = --ui-language の言語タグが無効です: { $value }。
 cli-unsupported-ui-language-argument = --ui-language で未対応の言語が指定されました: { $value }。
 cli-invalid-ui-language-environment = ATT_UI_LANGUAGE の言語タグが無効です: { $value }。

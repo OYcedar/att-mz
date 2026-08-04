@@ -6,7 +6,6 @@
 
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
-use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -22,7 +21,6 @@ use crate::diagnostic::{
 
 const DYNAMIC_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 const DYNAMIC_BAR_WIDTH: usize = 20;
-const PLAIN_PROGRESS_BUCKETS: u64 = 10;
 const FIRST_STRONG_ISOLATE: char = '\u{2068}';
 const POP_DIRECTIONAL_ISOLATE: char = '\u{2069}';
 
@@ -96,72 +94,6 @@ impl<P> ProgressObserver<P> for NoopProgressObserver {
     fn observe(&self, _snapshot: ProgressSnapshot<P>) {}
 }
 
-/// 用户选择的实时进度呈现模式。
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum ProgressMode {
-    /// 只在标准错误流连接终端时使用动态单行呈现。
-    #[default]
-    Auto,
-    /// 无条件输出稀疏、逐行、无控制序列的进度。
-    Plain,
-    /// 完全关闭实时进度。
-    Off,
-}
-
-impl ProgressMode {
-    #[cfg(test)]
-    pub(crate) const NAMES: [&'static str; 3] = ["auto", "plain", "off"];
-
-    #[cfg(test)]
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Plain => "plain",
-            Self::Off => "off",
-        }
-    }
-
-    const fn render_style(self, stderr_is_terminal: bool) -> RenderStyle {
-        match self {
-            Self::Auto if stderr_is_terminal => RenderStyle::Dynamic,
-            Self::Auto | Self::Off => RenderStyle::Silent,
-            Self::Plain => RenderStyle::Plain,
-        }
-    }
-}
-
-impl FromStr for ProgressMode {
-    type Err = ProgressModeParseError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "auto" => Ok(Self::Auto),
-            "plain" => Ok(Self::Plain),
-            "off" => Ok(Self::Off),
-            _ => Err(ProgressModeParseError),
-        }
-    }
-}
-
-/// 进度模式值不属于当前闭集。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ProgressModeParseError;
-
-impl fmt::Display for ProgressModeParseError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("expected one of: auto, plain, off")
-    }
-}
-
-impl std::error::Error for ProgressModeParseError {}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RenderStyle {
-    Dynamic,
-    Plain,
-    Silent,
-}
-
 /// 终端进度呈现失败的类型。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TerminalProgressFailureKind {
@@ -189,7 +121,6 @@ impl TerminalProgressFailureKind {
 pub(crate) enum TerminalProgressOperation {
     StartRenderer,
     PublishCompletion,
-    RenderPlainLine,
     RenderDynamicLine,
     RenderStatus,
     ClearDynamicLine,
@@ -205,7 +136,6 @@ impl TerminalProgressOperation {
         match self {
             Self::StartRenderer => "start_renderer",
             Self::PublishCompletion => "publish_completion",
-            Self::RenderPlainLine => "render_plain_line",
             Self::RenderDynamicLine => "render_dynamic_line",
             Self::RenderStatus => "render_status",
             Self::ClearDynamicLine => "clear_dynamic_line",
@@ -221,7 +151,6 @@ impl TerminalProgressOperation {
         match self {
             Self::StartRenderer => RuntimeOperation::StartTerminalProgressRenderer,
             Self::PublishCompletion => RuntimeOperation::PublishTerminalProgressCompletion,
-            Self::RenderPlainLine => RuntimeOperation::RenderTerminalProgressPlainLine,
             Self::RenderDynamicLine => RuntimeOperation::RenderTerminalProgressDynamicLine,
             Self::RenderStatus => RuntimeOperation::RenderTerminalProgressStatus,
             Self::ClearDynamicLine => RuntimeOperation::ClearTerminalProgressDynamicLine,
@@ -692,33 +621,28 @@ impl<P> TerminalProgress<P>
 where
     P: Eq + Send + 'static,
 {
-    /// 使用进程标准错误流创建渲染器，并据实际 TTY 状态解析 `auto`。
-    pub(crate) fn stderr<R>(mode: ProgressMode, render_phase: R) -> Self
+    /// 使用进程标准错误流创建固定的极简单行渲染器。
+    pub(crate) fn stderr<R>(render_phase: R) -> Self
     where
         R: Fn(&P) -> String + Send + 'static,
     {
         let stderr = io::stderr();
         let stderr_is_terminal = stderr.is_terminal();
-        Self::with_writer(mode, stderr_is_terminal, stderr, render_phase)
+        Self::with_writer(stderr_is_terminal, stderr, render_phase)
     }
 
     /// 使用调用方提供的输出能力创建渲染器。
     ///
-    /// `stderr_is_terminal` 必须来自承载标准错误流的真实终端判断；该参数也使终端
-    /// 策略能够在不依赖真实控制台的测试中完整验证。渲染线程无法创建时，返回携带
-    /// 启动失败健康状态的静默控制器；调用方仍可执行业务，但必须处理后续健康检查或收尾结果。
-    pub(crate) fn with_writer<W, R>(
-        mode: ProgressMode,
-        stderr_is_terminal: bool,
-        writer: W,
-        render_phase: R,
-    ) -> Self
+    /// `stderr_is_terminal` 必须来自承载标准错误流的真实终端判断。非交互输出保持静默；
+    /// 该参数也使终端策略能够在不依赖真实控制台的测试中完整验证。渲染线程无法创建时，
+    /// 返回携带启动失败健康状态的静默控制器；调用方仍可执行业务，但必须处理后续健康检查
+    /// 或收尾结果。
+    pub(crate) fn with_writer<W, R>(stderr_is_terminal: bool, writer: W, render_phase: R) -> Self
     where
         W: Write + Send + 'static,
         R: Fn(&P) -> String + Send + 'static,
     {
         Self::with_writer_and_spawner(
-            mode,
             stderr_is_terminal,
             writer,
             render_phase,
@@ -727,7 +651,6 @@ where
     }
 
     fn with_writer_and_spawner<W, R, S>(
-        mode: ProgressMode,
         stderr_is_terminal: bool,
         writer: W,
         render_phase: R,
@@ -738,8 +661,7 @@ where
         R: Fn(&P) -> String + Send + 'static,
         S: FnOnce(Box<dyn FnOnce() + Send + 'static>) -> io::Result<JoinHandle<()>>,
     {
-        let style = mode.render_style(stderr_is_terminal);
-        if style == RenderStyle::Silent {
+        if !stderr_is_terminal {
             return Self::silent();
         }
 
@@ -751,7 +673,6 @@ where
         let worker_health = Arc::clone(&health);
         let worker = spawn(Box::new(move || {
             run_renderer(
-                style,
                 writer,
                 render_phase,
                 worker_latest,
@@ -820,7 +741,6 @@ enum ActiveDisplay {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct SnapshotUpdate {
     accepted: bool,
-    plain_significant: bool,
 }
 
 struct RendererState<P> {
@@ -831,7 +751,6 @@ struct RendererState<P> {
     last_dynamic_render: Option<Instant>,
     spinner_frame: usize,
     dynamic_line_width: usize,
-    last_plain_line: Option<String>,
 }
 
 impl<P> RendererState<P>
@@ -847,7 +766,6 @@ where
             last_dynamic_render: None,
             spinner_frame: 0,
             dynamic_line_width: 0,
-            last_plain_line: None,
         }
     }
 
@@ -869,12 +787,13 @@ where
         self.dynamic_dirty = true;
     }
 
-    fn active_is_completed_snapshot(&self) -> bool {
+    fn active_snapshot_requires_render(&self) -> bool {
         self.active == ActiveDisplay::Snapshot
-            && self
-                .snapshot
-                .as_ref()
-                .is_some_and(|snapshot| snapshot.amount.is_complete())
+            && (self.dynamic_dirty
+                || self
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.amount.is_complete()))
     }
 }
 
@@ -886,16 +805,10 @@ where
     P: Eq,
 {
     let Some(previous) = previous else {
-        return SnapshotUpdate {
-            accepted: true,
-            plain_significant: true,
-        };
+        return SnapshotUpdate { accepted: true };
     };
     if previous.phase != incoming.phase {
-        return SnapshotUpdate {
-            accepted: true,
-            plain_significant: true,
-        };
+        return SnapshotUpdate { accepted: true };
     }
 
     match (previous.amount, incoming.amount) {
@@ -903,10 +816,9 @@ where
         (ProgressAmount::Determinate { .. }, ProgressAmount::Indeterminate) => {
             SnapshotUpdate::default()
         }
-        (ProgressAmount::Indeterminate, ProgressAmount::Determinate { .. }) => SnapshotUpdate {
-            accepted: true,
-            plain_significant: true,
-        },
+        (ProgressAmount::Indeterminate, ProgressAmount::Determinate { .. }) => {
+            SnapshotUpdate { accepted: true }
+        }
         (
             ProgressAmount::Determinate {
                 completed: previous_completed,
@@ -917,35 +829,12 @@ where
             if total != previous_total || completed <= previous_completed {
                 return SnapshotUpdate::default();
             }
-            SnapshotUpdate {
-                accepted: true,
-                plain_significant: plain_count_is_significant(previous_completed, completed, total),
-            }
+            SnapshotUpdate { accepted: true }
         }
     }
 }
 
-fn plain_count_is_significant(previous: u64, completed: u64, total: u64) -> bool {
-    if total == 0 {
-        return false;
-    }
-    if completed == total {
-        return true;
-    }
-    if total <= PLAIN_PROGRESS_BUCKETS {
-        return true;
-    }
-    progress_bucket(completed, total) > progress_bucket(previous, total)
-}
-
-fn progress_bucket(completed: u64, total: u64) -> u64 {
-    let completed = u128::from(completed);
-    let total = u128::from(total);
-    ((completed * u128::from(PLAIN_PROGRESS_BUCKETS)) / total) as u64
-}
-
 fn run_renderer<P, W, R>(
-    style: RenderStyle,
     mut writer: W,
     render_phase: R,
     latest: Arc<LatestSnapshot<P>>,
@@ -961,39 +850,21 @@ fn run_renderer<P, W, R>(
 
     loop {
         if let Some(snapshot) = latest.take() {
-            let update = state.accept_snapshot(snapshot);
-            if style == RenderStyle::Plain && update.plain_significant {
-                write_plain_active(
-                    &mut writer,
-                    &render_phase,
-                    &mut state,
-                    &mut writer_available,
-                    &health,
-                );
-            }
+            state.accept_snapshot(snapshot);
         }
 
         let mut should_finish = None;
         for control in control_receiver.try_iter() {
             match control {
                 RendererControl::Completion(snapshot) => {
-                    let update = state.accept_snapshot(snapshot);
-                    if style == RenderStyle::Plain && update.plain_significant {
-                        write_plain_active(
-                            &mut writer,
-                            &render_phase,
-                            &mut state,
-                            &mut writer_available,
-                            &health,
-                        );
-                    }
+                    state.accept_snapshot(snapshot);
                 }
                 RendererControl::Status {
                     message,
                     operation,
                     acknowledgement,
                 } => {
-                    if style == RenderStyle::Dynamic && state.active_is_completed_snapshot() {
+                    if state.active_snapshot_requires_render() {
                         write_dynamic_active(
                             &mut writer,
                             &render_phase,
@@ -1003,23 +874,13 @@ fn run_renderer<P, W, R>(
                         );
                     }
                     state.set_status(message);
-                    match style {
-                        RenderStyle::Dynamic => write_dynamic_active(
-                            &mut writer,
-                            &render_phase,
-                            &mut state,
-                            &mut writer_available,
-                            &health,
-                        ),
-                        RenderStyle::Plain => write_plain_active(
-                            &mut writer,
-                            &render_phase,
-                            &mut state,
-                            &mut writer_available,
-                            &health,
-                        ),
-                        RenderStyle::Silent => {}
-                    }
+                    write_dynamic_active(
+                        &mut writer,
+                        &render_phase,
+                        &mut state,
+                        &mut writer_available,
+                        &health,
+                    );
                     if acknowledgement.send(()).is_err() {
                         health.record(TerminalProgressFailure::channel_closed(operation));
                     }
@@ -1033,7 +894,6 @@ fn run_renderer<P, W, R>(
 
         if let Some(message) = should_finish {
             finish_rendering(
-                style,
                 &mut writer,
                 &mut state,
                 message.as_deref(),
@@ -1043,7 +903,7 @@ fn run_renderer<P, W, R>(
             return;
         }
 
-        if style == RenderStyle::Dynamic && dynamic_render_is_due(&state) {
+        if dynamic_render_is_due(&state) {
             write_dynamic_active(
                 &mut writer,
                 &render_phase,
@@ -1057,11 +917,7 @@ fn run_renderer<P, W, R>(
             return;
         }
 
-        let wait = match style {
-            RenderStyle::Dynamic => dynamic_wait(&state),
-            RenderStyle::Plain | RenderStyle::Silent => Duration::from_secs(60),
-        };
-        thread::park_timeout(wait);
+        thread::park_timeout(dynamic_wait(&state));
     }
 }
 
@@ -1095,40 +951,6 @@ fn dynamic_wait<P>(state: &RendererState<P>) -> Duration {
     })
 }
 
-fn write_plain_active<P, W, R>(
-    writer: &mut W,
-    render_phase: &R,
-    state: &mut RendererState<P>,
-    writer_available: &mut bool,
-    health: &ProgressHealth,
-) where
-    W: Write,
-    R: Fn(&P) -> String,
-{
-    if !*writer_available {
-        return;
-    }
-    let Some(line) = render_active_line(render_phase, state, None) else {
-        return;
-    };
-    if state.last_plain_line.as_deref() == Some(line.as_str()) {
-        return;
-    }
-    state.last_plain_line = Some(line.clone());
-    let operation = if state.active == ActiveDisplay::Status {
-        TerminalProgressOperation::RenderStatus
-    } else {
-        TerminalProgressOperation::RenderPlainLine
-    };
-    if write_and_flush(writer, operation, health, |writer| {
-        writeln!(writer, "{line}")
-    })
-    .is_err()
-    {
-        *writer_available = false;
-    }
-}
-
 fn write_dynamic_active<P, W, R>(
     writer: &mut W,
     render_phase: &R,
@@ -1143,7 +965,7 @@ fn write_dynamic_active<P, W, R>(
         return;
     }
     let frame = state.spinner_frame;
-    let Some(line) = render_active_line(render_phase, state, Some(frame)) else {
+    let Some(line) = render_active_line(render_phase, state, frame) else {
         return;
     };
     state.spinner_frame = state.spinner_frame.wrapping_add(1);
@@ -1170,7 +992,7 @@ fn write_dynamic_active<P, W, R>(
 fn render_active_line<P, R>(
     render_phase: &R,
     state: &RendererState<P>,
-    spinner_frame: Option<usize>,
+    spinner_frame: usize,
 ) -> Option<String>
 where
     R: Fn(&P) -> String,
@@ -1179,29 +1001,20 @@ where
         ActiveDisplay::Empty => None,
         ActiveDisplay::Status => {
             let status = state.status.as_deref()?;
-            Some(match spinner_frame {
-                Some(frame) => format!("[{}] {status}", spinner(frame)),
-                None => status.to_owned(),
-            })
+            Some(format!("[{}] {status}", spinner(spinner_frame)))
         }
         ActiveDisplay::Snapshot => {
             let snapshot = state.snapshot.as_ref()?;
             let label = sanitize_terminal_line(&render_phase(&snapshot.phase));
-            Some(match (spinner_frame, snapshot.amount) {
-                (Some(frame), ProgressAmount::Indeterminate)
-                | (Some(frame), ProgressAmount::Determinate { total: 0, .. }) => {
-                    format!("[{}] {label}", spinner(frame))
+            Some(match snapshot.amount {
+                ProgressAmount::Indeterminate | ProgressAmount::Determinate { total: 0, .. } => {
+                    format!("[{}] {label}", spinner(spinner_frame))
                 }
-                (Some(_), ProgressAmount::Determinate { completed, total }) => format!(
+                ProgressAmount::Determinate { completed, total } => format!(
                     "[{}] {label} {}",
                     progress_bar(completed, total),
                     isolated_count(completed, total)
                 ),
-                (None, ProgressAmount::Indeterminate)
-                | (None, ProgressAmount::Determinate { total: 0, .. }) => label,
-                (None, ProgressAmount::Determinate { completed, total }) => {
-                    format!("{label} {}", isolated_count(completed, total))
-                }
             })
         }
     }
@@ -1263,7 +1076,6 @@ fn clear_dynamic_line<P, W>(
 }
 
 fn finish_rendering<P, W>(
-    style: RenderStyle,
     writer: &mut W,
     state: &mut RendererState<P>,
     message: Option<&str>,
@@ -1276,37 +1088,18 @@ fn finish_rendering<P, W>(
         return;
     }
     let message = message.map(sanitize_terminal_line);
-    match style {
-        RenderStyle::Dynamic => {
-            clear_dynamic_line(writer, state, writer_available, health);
-            if let Some(message) = message
-                && *writer_available
-                && write_and_flush(
-                    writer,
-                    TerminalProgressOperation::RenderFinalMessage,
-                    health,
-                    |writer| writeln!(writer, "{message}"),
-                )
-                .is_err()
-            {
-                *writer_available = false;
-            }
-        }
-        RenderStyle::Plain => {
-            if let Some(message) = message
-                && state.last_plain_line.as_deref() != Some(message.as_str())
-                && write_and_flush(
-                    writer,
-                    TerminalProgressOperation::RenderFinalMessage,
-                    health,
-                    |writer| writeln!(writer, "{message}"),
-                )
-                .is_err()
-            {
-                *writer_available = false;
-            }
-        }
-        RenderStyle::Silent => {}
+    clear_dynamic_line(writer, state, writer_available, health);
+    if let Some(message) = message
+        && *writer_available
+        && write_and_flush(
+            writer,
+            TerminalProgressOperation::RenderFinalMessage,
+            health,
+            |writer| writeln!(writer, "{message}"),
+        )
+        .is_err()
+    {
+        *writer_available = false;
     }
 }
 
@@ -1431,47 +1224,25 @@ mod tests {
     }
 
     #[test]
-    fn progress_mode_has_exact_names_and_tty_policy() {
-        assert_eq!(ProgressMode::NAMES, ["auto", "plain", "off"]);
-        for mode in ProgressMode::NAMES {
-            assert_eq!(
-                mode.parse::<ProgressMode>().expect("模式应有效").as_str(),
-                mode
-            );
-        }
-        assert!("AUTO".parse::<ProgressMode>().is_err());
-
-        assert_eq!(ProgressMode::Auto.render_style(true), RenderStyle::Dynamic);
-        assert_eq!(ProgressMode::Auto.render_style(false), RenderStyle::Silent);
-        assert_eq!(ProgressMode::Plain.render_style(true), RenderStyle::Plain);
-        assert_eq!(ProgressMode::Plain.render_style(false), RenderStyle::Plain);
-        assert_eq!(ProgressMode::Off.render_style(true), RenderStyle::Silent);
-        assert_eq!(ProgressMode::Off.render_style(false), RenderStyle::Silent);
-    }
-
-    #[test]
-    fn auto_non_tty_and_off_are_completely_silent() {
-        for (mode, terminal) in [(ProgressMode::Auto, false), (ProgressMode::Off, true)] {
-            let writer = SharedWriter::default();
-            let output = writer.clone();
-            let progress = TerminalProgress::with_writer(mode, terminal, writer, phase_label);
-            progress.observe(ProgressSnapshot::indeterminate(Phase::Planning));
-            progress.finalizing("正在收尾").expect("静默模式应成功");
-            progress
-                .safe_stopping("正在安全停止")
-                .expect("静默模式应成功");
-            progress
-                .finish_with_message("完成")
-                .expect("静默模式应成功");
-            assert!(output.text().is_empty());
-        }
+    fn non_tty_is_completely_silent() {
+        let writer = SharedWriter::default();
+        let output = writer.clone();
+        let progress = TerminalProgress::with_writer(false, writer, phase_label);
+        progress.observe(ProgressSnapshot::indeterminate(Phase::Planning));
+        progress.finalizing("正在收尾").expect("静默模式应成功");
+        progress
+            .safe_stopping("正在安全停止")
+            .expect("静默模式应成功");
+        progress
+            .finish_with_message("完成")
+            .expect("静默模式应成功");
+        assert!(output.text().is_empty());
     }
 
     #[test]
     fn renderer_thread_start_failure_is_returned_with_io_context() {
         let progress = TerminalProgress::<Phase>::with_writer_and_spawner(
-            ProgressMode::Plain,
-            false,
+            true,
             SharedWriter::default(),
             phase_label,
             |_task| Err(io::Error::from_raw_os_error(8)),
@@ -1494,12 +1265,7 @@ mod tests {
 
     #[test]
     fn finalizing_returns_writer_write_failure_without_waiting_for_finish() {
-        let progress = TerminalProgress::with_writer(
-            ProgressMode::Plain,
-            false,
-            WriteFailingWriter,
-            phase_label,
-        );
+        let progress = TerminalProgress::with_writer(true, WriteFailingWriter, phase_label);
 
         let failures = progress
             .finalizing("正在收尾")
@@ -1521,12 +1287,7 @@ mod tests {
 
     #[test]
     fn safe_stopping_returns_writer_flush_failure() {
-        let progress = TerminalProgress::with_writer(
-            ProgressMode::Plain,
-            false,
-            FlushFailingWriter,
-            phase_label,
-        );
+        let progress = TerminalProgress::with_writer(true, FlushFailingWriter, phase_label);
 
         let failures = progress
             .safe_stopping("正在安全停止")
@@ -1551,12 +1312,7 @@ mod tests {
 
     #[test]
     fn finish_returns_final_message_write_failure() {
-        let progress = TerminalProgress::with_writer(
-            ProgressMode::Plain,
-            false,
-            WriteFailingWriter,
-            phase_label,
-        );
+        let progress = TerminalProgress::with_writer(true, WriteFailingWriter, phase_label);
 
         let failures = progress
             .finish_with_message("完成")
@@ -1571,8 +1327,7 @@ mod tests {
     #[test]
     fn closed_control_channel_is_returned_by_status_and_finish() {
         let progress = TerminalProgress::<Phase>::with_writer_and_spawner(
-            ProgressMode::Plain,
-            false,
+            true,
             SharedWriter::default(),
             phase_label,
             |_renderer| Ok(thread::spawn(|| {})),
@@ -1598,8 +1353,7 @@ mod tests {
     #[test]
     fn completion_observer_records_closed_control_channel_in_health_snapshot() {
         let progress = TerminalProgress::<Phase>::with_writer_and_spawner(
-            ProgressMode::Plain,
-            false,
+            true,
             SharedWriter::default(),
             phase_label,
             |_renderer| Ok(thread::spawn(|| {})),
@@ -1619,9 +1373,8 @@ mod tests {
 
     #[test]
     fn worker_panic_is_returned_without_exposing_payload() {
-        let progress =
-            TerminalProgress::with_writer(ProgressMode::Plain, false, PanickingWriter, phase_label);
-        progress.observe(ProgressSnapshot::determinate(Phase::Translating, 1, 1));
+        let progress = TerminalProgress::with_writer(true, PanickingWriter, phase_label);
+        let _ = progress.finalizing("正在收尾");
 
         let failures = progress
             .finish()
@@ -1695,26 +1448,15 @@ mod tests {
     }
 
     #[test]
-    fn plain_output_is_sparse_and_contains_no_terminal_control_sequences() {
+    fn dynamic_output_sanitizes_terminal_control_sequences() {
         let writer = SharedWriter::default();
         let output = writer.clone();
-        let progress =
-            TerminalProgress::with_writer(ProgressMode::Plain, false, writer, |_phase: &Phase| {
-                String::from("翻译\u{001b}[31m\n阶段")
-            });
+        let progress = TerminalProgress::with_writer(true, writer, |_phase: &Phase| {
+            String::from("翻译\u{001b}[31m\n阶段")
+        });
 
-        progress.observe(ProgressSnapshot::determinate(Phase::Translating, 0, 100));
-        thread::sleep(Duration::from_millis(10));
-        for completed in 1..10 {
-            progress.observe(ProgressSnapshot::determinate(
-                Phase::Translating,
-                completed,
-                100,
-            ));
-        }
-        thread::sleep(Duration::from_millis(10));
-        progress.observe(ProgressSnapshot::determinate(Phase::Translating, 10, 100));
-        thread::sleep(Duration::from_millis(10));
+        progress.observe(ProgressSnapshot::determinate(Phase::Translating, 5, 10));
+        thread::sleep(DYNAMIC_REFRESH_INTERVAL + Duration::from_millis(20));
         progress
             .safe_stopping("安全\u{001b}[2J\r\n停止")
             .expect("状态应成功呈现");
@@ -1726,13 +1468,12 @@ mod tests {
         let text = output.text();
         assert!(
             !text.contains('\u{001b}'),
-            "plain 不得包含 ANSI ESC：{text:?}"
+            "动态进度不得包含 ANSI ESC：{text:?}"
         );
-        assert!(!text.contains('\r'), "plain 不得包含回车刷新：{text:?}");
+        assert!(text.contains('\r'), "动态进度必须使用回车刷新：{text:?}");
         assert!(text.contains("翻译 [31m 阶段"), "{text:?}");
         assert!(text.contains("安全 [2J  停止"), "{text:?}");
         assert!(text.contains("结束 完成"), "{text:?}");
-        assert!(text.lines().count() <= 5, "逐项更新必须被稀疏化：{text:?}");
     }
 
     #[test]
@@ -1744,11 +1485,28 @@ mod tests {
                 .accepted
         );
 
-        for spinner_frame in [None, Some(0)] {
-            let text =
-                render_active_line(&phase_label, &state, spinner_frame).expect("零工作量仍有阶段");
-            assert!(!text.contains("0/0"), "零工作量不得伪造比例：{text:?}");
-            assert!(text.contains("翻译"), "零工作量仍可呈现阶段：{text:?}");
+        let text = render_active_line(&phase_label, &state, 0).expect("零工作量仍有阶段");
+        assert!(!text.contains("0/0"), "零工作量不得伪造比例：{text:?}");
+        assert!(text.contains("翻译"), "零工作量仍可呈现阶段：{text:?}");
+    }
+
+    #[test]
+    fn indeterminate_progress_uses_fixed_ascii_spinner_frames() {
+        let mut state = RendererState::new();
+        assert!(
+            state
+                .accept_snapshot(ProgressSnapshot::indeterminate(Phase::Planning))
+                .accepted
+        );
+
+        for (frame, expected) in ["[|] 规划", "[/] 规划", "[-] 规划", "[\\] 规划"]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                render_active_line(&phase_label, &state, frame).as_deref(),
+                Some(expected)
+            );
         }
     }
 
@@ -1756,7 +1514,7 @@ mod tests {
     fn dynamic_tty_uses_ascii_bar_and_clears_without_ansi() {
         let writer = SharedWriter::default();
         let output = writer.clone();
-        let progress = TerminalProgress::with_writer(ProgressMode::Auto, true, writer, phase_label);
+        let progress = TerminalProgress::with_writer(true, writer, phase_label);
         progress.observe(ProgressSnapshot::indeterminate(Phase::Planning));
         thread::sleep(Duration::from_millis(15));
         progress.observe(ProgressSnapshot::determinate(Phase::Translating, 5, 10));
@@ -1768,12 +1526,8 @@ mod tests {
         let text = output.text();
         assert!(text.contains('\r'), "动态终端必须使用单行刷新：{text:?}");
         assert!(
-            text.contains('#'),
-            "动态终端必须包含 ASCII 进度条：{text:?}"
-        );
-        assert!(
-            text.contains('-'),
-            "动态终端必须包含 ASCII 进度条：{text:?}"
+            text.contains("[##########----------]"),
+            "确定完成 5/10 时必须显示 20 格 ASCII 进度条：{text:?}"
         );
         assert!(text.contains("正在收尾"), "{text:?}");
         assert!(
@@ -1786,8 +1540,7 @@ mod tests {
     fn completion_count_is_rendered_before_finalizing_status() {
         let writer = SharedWriter::default();
         let output = writer.clone();
-        let progress =
-            TerminalProgress::with_writer(ProgressMode::Plain, false, writer, phase_label);
+        let progress = TerminalProgress::with_writer(true, writer, phase_label);
         progress.observe(ProgressSnapshot::determinate(Phase::Translating, 10, 10));
         progress.finalizing("正在保存运行方案").expect("状态应呈现");
         progress.finish().expect("收尾应成功");
@@ -1803,26 +1556,21 @@ mod tests {
         let writer = SharedWriter::default();
         let output = writer.clone();
         let (renderer_start, renderer_start_receiver) = mpsc::channel();
-        let progress = TerminalProgress::with_writer_and_spawner(
-            ProgressMode::Plain,
-            false,
-            writer,
-            phase_label,
-            move |renderer| {
+        let progress =
+            TerminalProgress::with_writer_and_spawner(true, writer, phase_label, move |renderer| {
                 Ok(thread::spawn(move || {
                     renderer_start_receiver
                         .recv_timeout(Duration::from_secs(2))
                         .expect("测试应允许渲染线程开始");
                     renderer();
                 }))
-            },
-        );
+            });
         let observer = progress.observer();
         let latest = Arc::clone(
             &observer
                 .dispatch
                 .as_ref()
-                .expect("plain 模式必须启动进度渲染器")
+                .expect("交互终端必须启动进度渲染器")
                 .latest,
         );
         let pending_guard = lock_after_poison(&latest.pending);
@@ -1896,14 +1644,13 @@ mod tests {
     fn completed_snapshot_survives_latest_slot_contention() {
         let writer = SharedWriter::default();
         let output = writer.clone();
-        let progress =
-            TerminalProgress::with_writer(ProgressMode::Plain, false, writer, phase_label);
+        let progress = TerminalProgress::with_writer(true, writer, phase_label);
         let observer = progress.observer();
         let latest = Arc::clone(
             &observer
                 .dispatch
                 .as_ref()
-                .expect("plain 模式必须启动进度渲染器")
+                .expect("交互终端必须启动进度渲染器")
                 .latest,
         );
         let pending_guard = lock_after_poison(&latest.pending);

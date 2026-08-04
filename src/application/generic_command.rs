@@ -89,8 +89,7 @@ use crate::llm::{
 #[cfg(not(test))]
 use crate::progress::ProgressObserver;
 use crate::progress::{
-    ProgressMode, ProgressSnapshot, TerminalProgress, TerminalProgressFailures,
-    TerminalProgressObserver,
+    ProgressSnapshot, TerminalProgress, TerminalProgressFailures, TerminalProgressObserver,
 };
 use crate::project_lease::{
     ProjectCommandLeaseError, ProjectCommandLeaseProvider, ProjectCommandLeaseService,
@@ -268,7 +267,7 @@ fn record_generic_terminal_progress_failures(
     }
 }
 
-fn generic_terminal_progress(mode: ProgressMode, locale: UiLocale) -> GenericTerminalProgress {
+fn generic_terminal_progress(locale: UiLocale) -> GenericTerminalProgress {
     let localizer = UiLocalizer::new(locale);
     let initializing = localizer.format(UiMessage::ProgressGenericInit);
     let extracting = localizer.format(UiMessage::ProgressGenericExtract);
@@ -278,7 +277,7 @@ fn generic_terminal_progress(mode: ProgressMode, locale: UiLocale) -> GenericTer
     let lua = localizer.format(UiMessage::ProgressProjectLua);
     let preparing_write_back = localizer.format(UiMessage::ProgressWriteBackPlanning);
     let publishing_write_back = localizer.format(UiMessage::ProgressWriteBackPublish);
-    let terminal = TerminalProgress::stderr(mode, move |phase| match phase {
+    let terminal = TerminalProgress::stderr(move |phase| match phase {
         GenericProgressPhase::Initializing => initializing.clone(),
         GenericProgressPhase::Extracting => extracting.clone(),
         GenericProgressPhase::PlanningTranslation => planning.clone(),
@@ -733,15 +732,11 @@ async fn catch_generic_command_panic(
 /// Generic 的生产命令执行器。
 pub(crate) struct ProductionGenericCommandRunner {
     locale: UiLocale,
-    progress_mode: ProgressMode,
 }
 
 impl ProductionGenericCommandRunner {
-    pub(crate) const fn new(locale: UiLocale, progress_mode: ProgressMode) -> Self {
-        Self {
-            locale,
-            progress_mode,
-        }
+    pub(crate) const fn new(locale: UiLocale) -> Self {
+        Self { locale }
     }
 
     pub(crate) async fn run(
@@ -778,7 +773,7 @@ impl ProductionGenericCommandRunner {
                 };
                 let project_log = generic_project_log_slot();
                 let cancellation = CooperativeCancellation::default();
-                let progress = generic_terminal_progress(self.progress_mode, self.locale);
+                let progress = generic_terminal_progress(self.locale);
                 let operation_progress = progress.observer();
                 let project_name = arguments.project.name.clone();
                 let workspace_root = generic_workspace(common.projects_root(), &project_name);
@@ -893,7 +888,7 @@ impl ProductionGenericCommandRunner {
                     }
                 };
                 let cancellation = CooperativeCancellation::default();
-                let progress = generic_terminal_progress(self.progress_mode, self.locale);
+                let progress = generic_terminal_progress(self.locale);
                 let operation_progress = progress.observer();
                 let store = GenericProjectStore::for_workspace_with_cancellation(
                     generic_workspace(common.projects_root(), &project_name),
@@ -1019,7 +1014,7 @@ impl ProductionGenericCommandRunner {
             };
         let cancellation = CooperativeCancellation::default();
         let lua_cancellation = ProjectLuaCancellation::default();
-        let progress = generic_terminal_progress(self.progress_mode, self.locale);
+        let progress = generic_terminal_progress(self.locale);
         let operation_progress = progress.observer();
         let script_path = command.script().script_path().to_path_buf();
         let arguments = command.arguments().to_vec();
@@ -1226,7 +1221,7 @@ impl ProductionGenericCommandRunner {
             }
         };
         let cancellation = CooperativeCancellation::default();
-        let progress = generic_terminal_progress(self.progress_mode, self.locale);
+        let progress = generic_terminal_progress(self.locale);
         let operation_progress = progress.observer();
         let llm_holder = Arc::new(Mutex::new(None::<OpenAiChatCompletionExecutor>));
         let store = GenericProjectStore::for_workspace_with_cancellation(
@@ -1743,7 +1738,7 @@ impl ProductionGenericCommandRunner {
         };
         let cancellation = CooperativeCancellation::default();
         let publication_gate = GenericWriteBackPublicationGate::default();
-        let progress = generic_terminal_progress(self.progress_mode, self.locale);
+        let progress = generic_terminal_progress(self.locale);
         let operation_progress = progress.observer();
         let store = GenericProjectStore::for_workspace_with_cancellation(
             generic_workspace(command.common().projects_root(), &project_name),

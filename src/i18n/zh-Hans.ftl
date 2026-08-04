@@ -1,6 +1,5 @@
 app-about = 使用可复用项目状态翻译游戏和结构化文本
 cli-ui-language-help = Help、诊断、进度、结果和项目日志使用的语言：ar、zh-Hans、zh-Hant、en、fr、ru、es、ja、ko 或 vi
-cli-progress-help = 实时进度模式：auto、plain 或 off
 cli-mz-about = 翻译 RPG Maker MZ 游戏
 cli-mv-about = 翻译 RPG Maker MV 游戏
 cli-generic-about = 翻译约定 JSONL 文本
@@ -34,7 +33,6 @@ cli-print-help = 显示帮助
 cli-print-version = 显示版本
 cli-blank-value = 值不能为空。
 cli-invalid-positive-integer = 值必须是正整数。
-cli-invalid-progress = 不支持进度模式 { $value }；请使用 auto、plain 或 off。
 cli-invalid-ui-language-argument = --ui-language 包含无效语言标签：{ $value }。
 cli-unsupported-ui-language-argument = --ui-language 指定了不支持的语言：{ $value }。
 cli-invalid-ui-language-environment = ATT_UI_LANGUAGE 包含无效语言标签：{ $value }。
