@@ -93,15 +93,11 @@ Init 前不存在，由 ATT 在实际需要时建立。游戏、JSONL、Rules、
 构建。标签使用 `vMAJOR.MINOR.PATCH`，版本必须同时等于 `Cargo.toml`、`Cargo.lock`、CLI
 `--version` 和 Windows manifest 中的版本；标签提交必须就是触发时的远端 `main`。
 
-构建 job 使用仓库固定的 Rust 工具链，在 Windows x64 MSVC 目标上执行格式、Clippy、测试
-和 Release 构建。PCRE2 与 MSVC CRT 必须静态链接；PE 导入表不得包含需要随包提供的非系统
-DLL。构建 job 还要用仓库固定的 cargo-about 配置重新生成 Windows x64 Release 第三方许可
-清单，并与仓库和发行包中的副本逐字节比较。构建 job 从空的 `dist/` 重新产生发行物、执行
-本规格第 4 节全部检查，并把 `dist/` 内容放在压缩包根目录。`projects/` 可以作为空目录进入
-压缩包，不得包含维护者或用户状态。
+标签建立前完成格式、Clippy、测试、第三方许可重生成、PE 依赖和本规格第 4 节完整检查。
+Release workflow 不重复这些检查；它只使用锁定工具链和依赖构建静态 `att.exe`，从空的
+`dist/` 同步已审查的发行资源，校验 `att.exe --version`，然后直接打包并发布。`projects/`
+作为空目录进入压缩包，不得包含维护者或用户状态。
 
 正式附件固定为 `att-vMAJOR.MINOR.PATCH-windows-x64.zip` 和 `SHA256SUMS.txt`。ZIP 使用
-兼容 Windows 常用解压工具的标准 Deflate，并采用可用工具的最高压缩级别。只有只读构建
-job 产生并上传制品；独立发布 job 下载同次 artifact、复核 SHA-256 后，才以现有标签和
-`.github/RELEASE_NOTES.md` 创建 GitHub Release。发布 job 不重新构建，任一复核失败都不得
-留下公开 Release。
+兼容 Windows 常用解压工具的标准 Deflate，并采用可用工具的最高压缩级别。同一 job 完成构建、
+打包和 GitHub Release 创建，不上传或下载中间 artifact。

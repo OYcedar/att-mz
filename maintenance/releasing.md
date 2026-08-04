@@ -76,8 +76,9 @@ do {
 gh run watch $run.databaseId --exit-status
 ```
 
-工作流必须确认标签提交等于远端 `main`，在只读构建 job 中重新生成和验证 `dist/`，再由
-独立发布 job 复核同次 artifact 的 SHA-256 并创建 Release。发布完成后检查：
+工作流必须确认标签提交等于远端 `main`，构建静态 `Release`，同步已审查的发行资源，
+使用最高级别 Deflate 打包并直接创建 Release。格式、Clippy、测试、第三方许可生成和完整
+发行检查在标签前完成，不在发包时重复运行。发布完成后检查：
 
 - Release 名称、标签、正文与当前版本一致；
 - `att-v1.0.0-windows-x64.zip` 和 `SHA256SUMS.txt` 都存在；
@@ -91,5 +92,5 @@ gh run watch $run.databaseId --exit-status
 分支；保留旧版本标签和 Release。删除前再次确认分支提交已经能够从 `main` 或现有标签
 到达。
 
-构建或验证失败时不创建 Release。发布 job 在创建后复核失败时删除本次 Release，但保留
-已有版本标签，供维护者判断是重跑相同提交，还是按第 2 节撤销尚未公开的标签并修复。
+构建或打包失败时不创建 Release。`gh release create` 失败但已建立 Release 时，workflow 立即删除
+该 Release，但保留已有版本标签，供维护者判断是重跑相同提交，还是按第 2 节撤销尚未公开的标签并修复。
