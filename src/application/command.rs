@@ -2653,6 +2653,10 @@ impl ProductionRpgMakerCommandRunner {
             write_back_phase_code,
         );
         let directory_publisher = file_system.directory_publisher(command.publisher().clone());
+        let text_normalizer = command
+            .rpg_maker()
+            .text_normalizers()
+            .resolve(opened_project.source_language());
         let opener = PreopenedProject::new(opened_project);
         let asset_reader = RpgMakerWriteBackAssetReadingService::new(sqlite.clone(), cpu.clone());
         let document_reader = RpgMakerProjectDocumentReadingService::new(
@@ -2669,7 +2673,11 @@ impl ProductionRpgMakerCommandRunner {
             rewriter,
             cpu.clone(),
             cancellation.clone(),
-        )
+        );
+        let write_back = match text_normalizer {
+            Some(normalizer) => write_back.with_text_normalizer(normalizer),
+            None => write_back,
+        }
         .with_progress(progress_observer.clone());
         let publisher = RpgMakerWriteBackPublishingService::new(directory_publisher.clone());
         let business_log = ProductionBusinessLog::from_active(&project_log);

@@ -102,6 +102,7 @@ fn layout_pairs(
     let max_cells = u64::from(max_fullwidth_chars.get()) * 2;
     let mut working_segments = Vec::with_capacity(pairs.len());
     let mut inserted_line_breaks = 0usize;
+    let mut wrapping_stack = Vec::new();
 
     for pair in pairs {
         let translated = pair.replacement().is_some();
@@ -114,19 +115,34 @@ fn layout_pairs(
                     hard_line.to_owned(),
                     source_semantic_line_index,
                 ));
+                update_wrapping_stack(&tokens, &mut wrapping_stack);
                 continue;
             }
 
-            if line_width(&tokens) <= max_cells {
-                lines.push(WorkingLine::semantic(
+            let semantic_indent_required =
+                !wrapping_stack.is_empty() && continuation_indent_position(&tokens).is_some();
+            let first_line_indent_cells = semantic_indent_required
+                .then_some(CONTINUATION_INDENT_CELLS)
+                .unwrap_or_default();
+            let first_line_max_cells = max_cells.saturating_sub(first_line_indent_cells);
+
+            if line_width(&tokens) <= first_line_max_cells {
+                lines.push(WorkingLine::semantic_with_indent(
                     hard_line.to_owned(),
                     source_semantic_line_index,
+                    semantic_indent_required,
                 ));
+                update_wrapping_stack(&tokens, &mut wrapping_stack);
                 continue;
             }
-            let wrapped = wrap_line(&tokens, max_cells)?;
+            let wrapped =
+                wrap_line_with_first_line_indent(&tokens, max_cells, first_line_indent_cells)?;
             inserted_line_breaks =
                 inserted_line_breaks.checked_add(wrapped.len().saturating_sub(1))?;
+            for text in &wrapped {
+                let line_tokens = scan_line(text)?;
+                update_wrapping_stack(&line_tokens, &mut wrapping_stack);
+            }
             lines.extend(
                 wrapped
                     .into_iter()
@@ -134,6 +150,7 @@ fn layout_pairs(
                     .map(|(index, text)| WorkingLine {
                         text,
                         automatically_generated_continuation: index > 0,
+                        semantic_indent_required: index == 0 && semantic_indent_required,
                         source_semantic_line_index,
                     }),
             );
@@ -161,6 +178,7 @@ struct WorkingSegment {
 struct WorkingLine {
     text: String,
     automatically_generated_continuation: bool,
+    semantic_indent_required: bool,
     /// 模型语义硬行的序号；自动续行始终继承母行序号。
     source_semantic_line_index: usize,
 }
@@ -170,6 +188,20 @@ impl WorkingLine {
         Self {
             text,
             automatically_generated_continuation: false,
+            semantic_indent_required: false,
+            source_semantic_line_index,
+        }
+    }
+
+    fn semantic_with_indent(
+        text: String,
+        source_semantic_line_index: usize,
+        semantic_indent_required: bool,
+    ) -> Self {
+        Self {
+            text,
+            automatically_generated_continuation: false,
+            semantic_indent_required,
             source_semantic_line_index,
         }
     }
@@ -304,7 +336,16 @@ struct BreakCandidate {
     tail_start: usize,
 }
 
+#[cfg(test)]
 fn wrap_line(tokens: &[DisplayToken<'_>], max_cells: u64) -> Option<Vec<String>> {
+    wrap_line_with_first_line_indent(tokens, max_cells, 0)
+}
+
+fn wrap_line_with_first_line_indent(
+    tokens: &[DisplayToken<'_>],
+    max_cells: u64,
+    first_line_indent_cells: u64,
+) -> Option<Vec<String>> {
     let candidates = collect_break_candidates(tokens);
     let min_tail_cells = MAX_TAIL_CELLS.min(max_cells.div_ceil(4));
     let mut observation = WrapSearchObservation::default();
@@ -314,6 +355,7 @@ fn wrap_line(tokens: &[DisplayToken<'_>], max_cells: u64) -> Option<Vec<String>>
         &candidates,
         max_cells,
         min_tail_cells,
+        first_line_indent_cells,
         &mut observation,
     )?;
     Some(
@@ -476,6 +518,7 @@ fn find_wrapped_ranges(
     candidates: &[BreakCandidate],
     max_cells: u64,
     min_tail_cells: u64,
+    first_line_indent_cells: u64,
     observation: &mut WrapSearchObservation,
 ) -> Option<Vec<(usize, usize)>> {
     let token_count = index.tokens.len();
@@ -490,7 +533,7 @@ fn find_wrapped_ranges(
     for &start in starts.iter().rev() {
         observation.observe_state();
         let line_max_cells = if start == 0 {
-            max_cells
+            max_cells.saturating_sub(first_line_indent_cells)
         } else {
             max_cells.saturating_sub(CONTINUATION_INDENT_CELLS)
         };
@@ -659,7 +702,7 @@ fn apply_continuation_indents(segments: &mut [WorkingSegment], max_cells: u64) -
     for segment in segments {
         for line in &mut segment.lines {
             let insert_at = if segment.translated
-                && line.automatically_generated_continuation
+                && (line.automatically_generated_continuation || line.semantic_indent_required)
                 && !wrapping_stack.is_empty()
             {
                 let tokens = scan_line(&line.text)?;
@@ -696,20 +739,10 @@ fn continuation_indent_position(tokens: &[DisplayToken<'_>]) -> Option<usize> {
 }
 
 fn update_wrapping_stack(tokens: &[DisplayToken<'_>], wrapping_stack: &mut Vec<&'static str>) {
-    let mut visible = tokens
+    for token in tokens
         .iter()
-        .filter(|token| token.kind == DisplayTokenKind::Visible);
-    if wrapping_stack.is_empty() {
-        let Some(first) = visible.next() else {
-            return;
-        };
-        let Some(closer) = pair_closer(first.text) else {
-            return;
-        };
-        wrapping_stack.push(closer);
-    }
-
-    for token in visible {
+        .filter(|token| token.kind == DisplayTokenKind::Visible)
+    {
         if wrapping_stack
             .last()
             .is_some_and(|closer| *closer == token.text)
@@ -932,6 +965,7 @@ mod tests {
             &candidates,
             max_cells,
             min_tail_cells,
+            0,
             &mut observation,
         )
         .map(|ranges| {
@@ -1196,16 +1230,56 @@ mod tests {
     }
 
     #[test]
-    fn preserves_semantic_line_after_leading_controls_byte_for_byte() {
+    fn inserts_indent_after_leading_controls_on_semantic_line() {
         let request = request(3, vec![segment(1, "原文", Some("「甲\n\\SE[2]乙」"))]);
 
         let applied = applied(&request);
 
         assert_eq!(
             line_texts(&applied.segments()[0]),
-            ["「甲", r"\SE[2]乙」"][..]
+            ["「甲", r"\SE[2]　乙」"][..]
         );
-        assert_eq!(applied.inserted_fullwidth_indents(), 0);
+        assert_eq!(applied.inserted_fullwidth_indents(), 1);
+    }
+
+    #[test]
+    fn indents_database_semantic_line_inside_unclosed_outer_parenthesis() {
+        let request = request(
+            20,
+            vec![segment(
+                1,
+                "原文",
+                Some("要解锁读取功能吗？\n（“保存”中将追加“读取”。\n之后也可更改）"),
+            )],
+        );
+
+        let applied = applied(&request);
+
+        assert_eq!(
+            line_texts(&applied.segments()[0]),
+            [
+                "要解锁读取功能吗？",
+                "（“保存”中将追加“读取”。",
+                "　之后也可更改）",
+            ][..]
+        );
+        assert_eq!(applied.inserted_fullwidth_indents(), 1);
+    }
+
+    #[test]
+    fn tracks_outer_symbols_that_open_after_text_on_a_semantic_line() {
+        let request = request(
+            20,
+            vec![segment(1, "原文", Some("前缀文字（第一行\n第二行）"))],
+        );
+
+        let applied = applied(&request);
+
+        assert_eq!(
+            line_texts(&applied.segments()[0]),
+            ["前缀文字（第一行", "　第二行）"][..]
+        );
+        assert_eq!(applied.inserted_fullwidth_indents(), 1);
     }
 
     #[test]
@@ -1222,17 +1296,20 @@ mod tests {
     }
 
     #[test]
-    fn line_mid_opening_pair_does_not_start_continuation_indent() {
+    fn line_mid_opening_pair_starts_continuation_indent() {
         let request = request(5, vec![segment(1, "原文", Some("他说「甲\n乙」"))]);
 
         let applied = applied(&request);
 
-        assert_eq!(line_texts(&applied.segments()[0]), ["他说「甲", "乙」"][..]);
-        assert_eq!(applied.inserted_fullwidth_indents(), 0);
+        assert_eq!(
+            line_texts(&applied.segments()[0]),
+            ["他说「甲", "　乙」"][..]
+        );
+        assert_eq!(applied.inserted_fullwidth_indents(), 1);
     }
 
     #[test]
-    fn semantic_lines_observe_cross_segment_state_without_inserting_indents() {
+    fn semantic_lines_observe_cross_segment_state_and_insert_indents() {
         let request = request(
             5,
             vec![
@@ -1246,8 +1323,12 @@ mod tests {
 
         assert_eq!(applied.segments().len(), 2);
         assert_eq!(line_texts(&applied.segments()[0]), ["「甲"][..]);
-        assert_eq!(line_texts(&applied.segments()[1]), ["【乙", "丙】」"][..]);
-        assert_eq!(applied.inserted_fullwidth_indents(), 0);
+        assert_eq!(
+            line_texts(&applied.segments()[1]),
+            ["　【乙", "　丙】」"][..]
+        );
+        assert_eq!(source_semantic_line_indexes(&applied.segments()[1]), [0, 1]);
+        assert_eq!(applied.inserted_fullwidth_indents(), 2);
     }
 
     #[test]
@@ -1276,13 +1357,48 @@ mod tests {
     }
 
     #[test]
-    fn semantic_hard_line_is_not_indented_or_rejected_by_width() {
+    fn semantic_hard_line_that_cannot_fit_after_indent_is_manual() {
         let request = request(3, vec![segment(1, "原文", Some("「甲\n乙丙」"))]);
+
+        assert_manual(&request);
+    }
+
+    #[test]
+    fn semantic_hard_line_reserves_indent_width_before_wrapping() {
+        let request = request(4, vec![segment(1, "原文", Some("「甲\n乙丙」"))]);
 
         let applied = applied(&request);
 
-        assert_eq!(line_texts(&applied.segments()[0]), ["「甲", "乙丙」"][..]);
+        assert_eq!(line_texts(&applied.segments()[0]), ["「甲", "　乙丙」"][..]);
         assert_eq!(applied.inserted_line_breaks(), 0);
-        assert_eq!(applied.inserted_fullwidth_indents(), 0);
+        assert_eq!(applied.inserted_fullwidth_indents(), 1);
+    }
+
+    #[test]
+    fn semantic_hard_line_can_be_rewrapped_after_reserving_indent_width() {
+        let request = request(4, vec![segment(1, "原文", Some("「甲\n乙丙，丁戊」"))]);
+
+        let applied = applied(&request);
+
+        assert_eq!(
+            line_texts(&applied.segments()[0]),
+            ["「甲", "　乙丙，", "　丁戊」"][..]
+        );
+        assert_eq!(
+            source_semantic_line_indexes(&applied.segments()[0]),
+            [0, 1, 1]
+        );
+        assert_eq!(applied.inserted_line_breaks(), 1);
+        assert_eq!(applied.inserted_fullwidth_indents(), 2);
+    }
+
+    #[test]
+    fn wrapping_state_isolated_between_layout_requests() {
+        let first = applied(&request(4, vec![segment(1, "原文", Some("「甲"))]));
+        let second = applied(&request(4, vec![segment(1, "原文", Some("乙」"))]));
+
+        assert_eq!(line_texts(&first.segments()[0]), ["「甲"][..]);
+        assert_eq!(line_texts(&second.segments()[0]), ["乙」"][..]);
+        assert_eq!(second.inserted_fullwidth_indents(), 0);
     }
 }

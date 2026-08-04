@@ -42,11 +42,10 @@ use crate::diagnostic::{
     FileSystemDiagnosticStage, FileSystemIssue, FileSystemOperation, FileSystemPathViolation,
     FileSystemProblem, GenericDiagnosticStage, GenericIssue, GenericJsonErrorCategory,
     GenericLanguageProjectionProblem, GenericPlaceholderMultisetProblem, GenericProblem,
-    GenericRepairApplicationProblem, GenericResponseDestinationProblem,
-    GenericTaskResponseJsonCategory, GenericTaskResponseProblem, GenericTaskUnavailableReason,
-    GenericTranslationPreparationProblem, GenericUnitLocator as DiagnosticGenericUnitLocator,
-    IoFailure, Pcre2Failure, Pcre2FailureKind, PlaceholderIssue,
-    PlaceholderMatchRangeViolation as DiagnosticMatchRangeViolation,
+    GenericResponseDestinationProblem, GenericTaskResponseJsonCategory, GenericTaskResponseProblem,
+    GenericTaskUnavailableReason, GenericTranslationPreparationProblem,
+    GenericUnitLocator as DiagnosticGenericUnitLocator, IoFailure, Pcre2Failure, Pcre2FailureKind,
+    PlaceholderIssue, PlaceholderMatchRangeViolation as DiagnosticMatchRangeViolation,
     PlaceholderRuleOrigin as DiagnosticPlaceholderRuleOrigin,
     PlaceholderRuleSource as DiagnosticPlaceholderRuleSource,
     PlaceholderWorkerOperation as DiagnosticPlaceholderWorkerOperation, PublicationIssue,
@@ -82,7 +81,7 @@ use crate::generic::{
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
 use crate::language::{
     LanguageAnalysis, LanguageId, LanguageModule, LanguageModuleCatalogError,
-    LanguageOperationCancelled, LanguageRepairApplicationError, LanguageText, LanguageTextSegment,
+    LanguageOperationCancelled, LanguageText, LanguageTextSegment,
 };
 use crate::llm::{
     ChatMessage, ChatMessageRole, LlmClientConcurrency, LlmClientSemanticIdentity, LlmFinishReason,
@@ -1761,6 +1760,7 @@ impl ProductionGenericCommandRunner {
         let operation_cancellation = cancellation.clone();
         let operation_publication_gate = publication_gate.clone();
         let output_name = project_name.clone();
+        let operation_text_normalizers = command.text_normalizers().clone();
         let operation_project_log = generic_project_log_handle(&project_log);
         let operation_publication_occurrence = Arc::clone(&publication_occurrence);
         let operation = async move {
@@ -1784,6 +1784,8 @@ impl ProductionGenericCommandRunner {
             )
             .await?;
             let project = snapshot.project().clone();
+            let text_normalizer =
+                operation_text_normalizers.resolve(project.language_pair().source());
             let terminology = current_resources.terminology();
             let placeholder_rules = current_resources.placeholder_rules();
 
@@ -1900,6 +1902,7 @@ impl ProductionGenericCommandRunner {
                         &current_snapshot,
                         &live,
                         &current_translations,
+                        text_normalizer.as_deref(),
                         &candidate_cancellation,
                     )
                     .map(|candidate| (project, candidate))
@@ -2671,47 +2674,6 @@ fn generic_response_placeholder_problem(
         crate::generic::GenericPlaceholderError::ManualTranslationMismatch => {
             GenericResponseDestinationProblem::PlaceholderBindingMismatch
         }
-    }
-}
-
-const fn generic_repair_application_problem(
-    source: &LanguageRepairApplicationError,
-) -> GenericRepairApplicationProblem {
-    match source {
-        LanguageRepairApplicationError::InvalidNaturalSegment { segment_index } => {
-            GenericRepairApplicationProblem::InvalidNaturalSegment {
-                segment_index: *segment_index,
-            }
-        }
-        LanguageRepairApplicationError::DuplicatePosition {
-            segment_index,
-            byte_offset,
-        } => GenericRepairApplicationProblem::DuplicatePosition {
-            segment_index: *segment_index,
-            byte_offset: *byte_offset,
-        },
-        LanguageRepairApplicationError::InvalidCharacterBoundary {
-            segment_index,
-            byte_offset,
-        } => GenericRepairApplicationProblem::InvalidCharacterBoundary {
-            segment_index: *segment_index,
-            byte_offset: *byte_offset,
-        },
-        LanguageRepairApplicationError::MissingCharacter {
-            segment_index,
-            byte_offset,
-        } => GenericRepairApplicationProblem::MissingCharacter {
-            segment_index: *segment_index,
-            byte_offset: *byte_offset,
-        },
-        LanguageRepairApplicationError::UnexpectedCharacter {
-            segment_index,
-            byte_offset,
-            ..
-        } => GenericRepairApplicationProblem::UnexpectedCharacter {
-            segment_index: *segment_index,
-            byte_offset: *byte_offset,
-        },
     }
 }
 
@@ -4758,33 +4720,10 @@ fn validate_generic_candidate_fact_with_cancellation(
     if residual.is_some() {
         return Ok(Err(GenericResponseDestinationProblem::SourceResidual));
     }
-    let repair = match language_module.plan_translation_repair_with_cancellation(
-        &fact.analysis,
-        &language_text,
-        &mut || ensure_generic_language_running(cancellation),
-    ) {
-        Ok(Ok(repair)) => repair,
-        Ok(Err(_)) => {
-            return Ok(Err(
-                GenericResponseDestinationProblem::RepairPlanningMismatch,
-            ));
-        }
-        Err(LanguageOperationCancelled) => return Err(GenericPlanningError::Cancelled),
-    };
-    let repaired = match language_text.apply_repair_with_cancellation(&repair, || {
-        ensure_generic_response_processing_running(cancellation)
-    })? {
-        Ok(repaired) => repaired,
-        Err(source) => {
-            return Ok(Err(GenericResponseDestinationProblem::RepairApplication {
-                problem: generic_repair_application_problem(&source),
-            }));
-        }
-    };
     ensure_generic_response_processing_running(cancellation)?;
     let final_translation = match rebuild_original_placeholders_with_cancellation(
         &candidate_protected,
-        &repaired,
+        &language_text,
         cancellation,
     )? {
         Ok(translation) => translation,
@@ -6812,6 +6751,14 @@ mod tests {
         TaskId::new(value)
     }
 
+    fn compact_json(message: &str) -> String {
+        serde_json::to_string(
+            &serde_json::from_str::<serde_json::Value>(message)
+                .expect("模型 user message 必须是有效 JSON"),
+        )
+        .expect("模型 user message 应该可以重新序列化")
+    }
+
     #[test]
     fn generic_prompt_fingerprint_includes_both_response_switches() {
         let modes = [
@@ -8136,20 +8083,20 @@ mod tests {
         )
         .expect("翻译任务应该可规划");
         let message = render_generic_user_message(&prepared.plan.tasks()[0], terminology.as_ref());
+        let wire = compact_json(&message);
 
-        assert!(message.contains("\"source\":\"魔王\",\"translation\":\"魔王（Demon King）\""));
+        assert!(wire.contains("\"source\":\"魔王\",\"translation\":\"魔王（Demon King）\""));
         assert_eq!(
-            message
-                .matches("\"source\":\"魔王\",\"translation\":\"魔王（Demon King）\"")
+            wire.matches("\"source\":\"魔王\",\"translation\":\"魔王（Demon King）\"")
                 .count(),
             1,
             "TaskBlock 命中的术语必须按文件顺序合并后只提供一次"
         );
-        assert!(message.contains("\"kind\":\"dialogue\""));
-        assert!(message.contains("\"text\":[\"已有上下文 "));
-        assert!(message.contains("\"text\":[\"あ "));
-        assert!(message.contains("\"id\":\"0\""));
-        assert!(message.contains("\"id\":\"1\""));
+        assert!(wire.contains("\"kind\":\"dialogue\""));
+        assert!(wire.contains("\"text\":[\"已有上下文 "));
+        assert!(wire.contains("\"text\":[\"あ "));
+        assert!(wire.contains("\"id\":\"0\""));
+        assert!(wire.contains("\"id\":\"1\""));
         assert!(
             prepared.plan.reused().is_empty(),
             "只供阅读的源文回退不能成为重复 Unit 的复用译文"
@@ -8176,7 +8123,7 @@ mod tests {
     }
 
     #[test]
-    fn repaired_reuse_is_reprotected_before_it_becomes_model_context() {
+    fn reused_translation_keeps_quote_style_when_reprotected_for_model_context() {
         let temporary = tempfile::tempdir().expect("应该可建立临时目录");
         let source_root = temporary.path().join("source");
         fs::create_dir_all(&source_root).expect("应该可建立输入目录");
@@ -8273,21 +8220,22 @@ mod tests {
         assert_eq!(prepared.plan.reused()[0].key().group_id(), "reuse");
         assert_eq!(
             prepared.plan.reused()[0].translation(),
-            "「你好 {name}」",
-            "提交值必须使用语言模块修复后的译文"
+            "“你好 {name}”",
+            "Translate 验收不得改写合格译文的引号风格"
         );
         let task = &prepared.plan.tasks()[0];
         assert_eq!(task.groups().len(), 3);
         let current_context = task.groups()[0].units()[0].text();
         let reuse_context = task.groups()[1].units()[0].text();
         assert!(current_context.starts_with("“你好 ") && current_context.ends_with('”'));
-        assert!(reuse_context.starts_with("「你好 ") && reuse_context.ends_with('」'));
+        assert!(reuse_context.starts_with("“你好 ") && reuse_context.ends_with('”'));
         assert!(placeholder_token::contains_reserved_prefix(reuse_context));
         assert_eq!(task.groups()[1].units()[0].output_id(), None);
         assert_eq!(task.groups()[2].units()[0].output_id(), Some(task_id(0)));
         let message = render_generic_user_message(task, terminology.as_ref());
-        assert!(message.contains("\"text\":[\"「你好 "));
-        assert!(message.contains("\"id\":\"0\""));
+        let wire = compact_json(&message);
+        assert!(wire.contains("“你好 "));
+        assert!(wire.contains("\"id\":\"0\""));
         assert!(!message.contains("{name}"));
     }
 
@@ -8387,6 +8335,7 @@ mod tests {
             .tasks()
             .iter()
             .map(|task| render_generic_user_message(task, terminology.as_ref()))
+            .map(|message| compact_json(&message))
             .collect::<Vec<_>>()
             .join("\n");
         assert!(rendered.contains("\\\""));

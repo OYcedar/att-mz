@@ -29,8 +29,13 @@ quote_repair_pairs = [["“", "”"], ["‘", "’"]]
 - `minimum_kana_characters` 是译后残留检查的正整数阈值，不是译前准入条件。它检查
   `allowed_terms` 之外连续出现的假名；目标译文中的汉字不按日语残留处理；
 - `allowed_terms` 列出允许保留在目标文本中的源语片段；
-- `quote_repair_pairs` 是成对的单字符开引号与闭引号；
+- `quote_repair_pairs` 是成对的单字符开引号与闭引号，供 WriteBack 在写入候选前按源文
+  引号拓扑规范化译文；Translate 不因引号样式或开闭方向差异拒绝合格译文；
 - 未在当前语言类型中声明的字段严格拒绝。
 
 Translate 启动时先校验全部语言定义，再按项目的源语言 ID 精确选择模块；找不到
 匹配定义时，会在发出任何模型请求之前失败。
+
+WriteBack 只读取当前项目源语言对应的 `id`、`type` 和 `quote_repair_pairs`。日文配置存在
+候选引号对时，WriteBack 会在 Generic、MV 和 MZ 的候选构建阶段共用同一规范化器；无法
+唯一确认源文拓扑、译文数量或布局时保持译文原样，不阻断发布。
