@@ -2153,7 +2153,7 @@ fn parse_quote_structure_with_cancellation<E>(
 
     let mut nodes = Vec::<PendingQuoteNode>::new();
     let mut stack = Vec::<usize>::new();
-    for (_segment_index, segment) in text.segments().iter().enumerate() {
+    for segment in text.segments() {
         ensure_running()?;
         let LanguageTextSegment::NaturalText(text) = segment else {
             continue;
