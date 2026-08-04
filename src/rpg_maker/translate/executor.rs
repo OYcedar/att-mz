@@ -20,10 +20,10 @@ use time::OffsetDateTime;
 #[cfg(test)]
 use crate::diagnostic::RpgMakerModelNonStopFinishReason;
 use crate::diagnostic::{
-    RpgMakerBackendCause, RpgMakerIssue, RpgMakerLanguageModuleKind, RpgMakerLanguageRepairProblem,
-    RpgMakerModelFinishReason, RpgMakerResponseInvariantProblem,
-    RpgMakerResponseLanguageProjectionProblem, RpgMakerResponseProcessingProblem,
-    RpgMakerResponseProcessingScope, SafeIdentifier, StateEffect,
+    RpgMakerBackendCause, RpgMakerIssue, RpgMakerLanguageModuleKind, RpgMakerModelFinishReason,
+    RpgMakerResponseInvariantProblem, RpgMakerResponseLanguageProjectionProblem,
+    RpgMakerResponseProcessingProblem, RpgMakerResponseProcessingScope, SafeIdentifier,
+    StateEffect,
 };
 use crate::execution::CooperativeCancellation;
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
@@ -36,8 +36,7 @@ use crate::execution::llm_request::{
 use crate::fingerprint::Sha256FramedHasher;
 use crate::language::{
     LanguageId, LanguageModule, LanguageModuleError, LanguageModuleKind,
-    LanguageOperationCancelled, LanguagePair, LanguageRepairApplicationError, LanguageText,
-    LanguageTextSegment,
+    LanguageOperationCancelled, LanguagePair, LanguageText, LanguageTextSegment,
 };
 #[cfg(test)]
 use crate::llm::LlmRequestError;
@@ -518,9 +517,6 @@ fn map_response_processing_error<C>(
         TranslationResponseTechnicalError::LanguageProjection { unit_id, source } => {
             TranslationTaskResponseProcessingError::LanguageProjection { unit_id, source }
         }
-        TranslationResponseTechnicalError::LanguageRepair { unit_id, source } => {
-            TranslationTaskResponseProcessingError::LanguageRepair { unit_id, source }
-        }
         TranslationResponseTechnicalError::InternalInvariant { invariant } => {
             TranslationTaskResponseProcessingError::InternalInvariant { invariant }
         }
@@ -539,10 +535,6 @@ pub(crate) enum TranslationTaskResponseProcessingError<C> {
     LanguageProjection {
         unit_id: TaskId,
         source: LanguageTextProjectionError,
-    },
-    LanguageRepair {
-        unit_id: TaskId,
-        source: LanguageRepairApplicationError,
     },
     InternalInvariant {
         invariant: TranslationInternalInvariant,
@@ -563,9 +555,6 @@ where
             Self::LanguageProjection { source, .. } => {
                 write!(formatter, "译后语言投影失败：{source}")
             }
-            Self::LanguageRepair { source, .. } => {
-                write!(formatter, "译后语言修复无法安全应用：{source}")
-            }
             Self::InternalInvariant { invariant } => {
                 write!(formatter, "翻译任务内部不变量已破坏：{invariant}")
             }
@@ -583,7 +572,6 @@ where
             Self::ScheduleCompute(source) => Some(source),
             Self::LanguageModule { source, .. } => Some(source),
             Self::LanguageProjection { source, .. } => Some(source),
-            Self::LanguageRepair { source, .. } => Some(source),
             Self::InternalInvariant { .. } => None,
         }
     }
@@ -621,12 +609,6 @@ where
                 unit_scope(*unit_id),
                 RpgMakerResponseProcessingProblem::LanguageProjection {
                     problem: response_language_projection_problem(source),
-                },
-            ),
-            Self::LanguageRepair { unit_id, source } => (
-                unit_scope(*unit_id),
-                RpgMakerResponseProcessingProblem::LanguageRepair {
-                    problem: language_repair_problem(source),
                 },
             ),
             Self::InternalInvariant { invariant } => (
@@ -738,50 +720,6 @@ fn response_language_projection_problem(
     }
 }
 
-fn language_repair_problem(
-    source: &LanguageRepairApplicationError,
-) -> RpgMakerLanguageRepairProblem {
-    match source {
-        LanguageRepairApplicationError::InvalidNaturalSegment { segment_index } => {
-            RpgMakerLanguageRepairProblem::InvalidNaturalSegment {
-                segment_index: *segment_index,
-            }
-        }
-        LanguageRepairApplicationError::DuplicatePosition {
-            segment_index,
-            byte_offset,
-        } => RpgMakerLanguageRepairProblem::DuplicatePosition {
-            segment_index: *segment_index,
-            byte_offset: *byte_offset,
-        },
-        LanguageRepairApplicationError::InvalidCharacterBoundary {
-            segment_index,
-            byte_offset,
-        } => RpgMakerLanguageRepairProblem::InvalidCharacterBoundary {
-            segment_index: *segment_index,
-            byte_offset: *byte_offset,
-        },
-        LanguageRepairApplicationError::MissingCharacter {
-            segment_index,
-            byte_offset,
-        } => RpgMakerLanguageRepairProblem::MissingCharacter {
-            segment_index: *segment_index,
-            byte_offset: *byte_offset,
-        },
-        LanguageRepairApplicationError::UnexpectedCharacter {
-            segment_index,
-            byte_offset,
-            expected,
-            actual,
-        } => RpgMakerLanguageRepairProblem::UnexpectedCharacter {
-            segment_index: *segment_index,
-            byte_offset: *byte_offset,
-            expected_code_point: u32::from(*expected),
-            actual_code_point: u32::from(*actual),
-        },
-    }
-}
-
 fn response_invariant_problem(
     invariant: &TranslationInternalInvariant,
 ) -> RpgMakerResponseInvariantProblem {
@@ -848,10 +786,6 @@ enum TranslationResponseTechnicalError {
     LanguageProjection {
         unit_id: TaskId,
         source: LanguageTextProjectionError,
-    },
-    LanguageRepair {
-        unit_id: TaskId,
-        source: LanguageRepairApplicationError,
     },
     InternalInvariant {
         invariant: TranslationInternalInvariant,
@@ -1561,15 +1495,6 @@ fn process_response(
             Err(TranslationCandidateTechnicalError::LanguageProjection(source)) => {
                 return Err(TranslationResponseTechnicalFailure::new(
                     TranslationResponseTechnicalError::LanguageProjection {
-                        unit_id: expected.id(),
-                        source,
-                    },
-                    response_record,
-                ));
-            }
-            Err(TranslationCandidateTechnicalError::LanguageRepair(source)) => {
-                return Err(TranslationResponseTechnicalFailure::new(
-                    TranslationResponseTechnicalError::LanguageRepair {
                         unit_id: expected.id(),
                         source,
                     },
@@ -2560,7 +2485,6 @@ pub(super) fn accept_prepared_translation_candidate(
 pub(crate) enum TranslationCandidateTechnicalError {
     LanguageModule(LanguageModuleError),
     LanguageProjection(LanguageTextProjectionError),
-    LanguageRepair(LanguageRepairApplicationError),
     InternalInvariant {
         invariant: TranslationInternalInvariant,
     },
@@ -2571,7 +2495,6 @@ impl fmt::Display for TranslationCandidateTechnicalError {
         match self {
             Self::LanguageModule(source) => write!(formatter, "语言模块失败：{source}"),
             Self::LanguageProjection(source) => write!(formatter, "语言投影失败：{source}"),
-            Self::LanguageRepair(source) => write!(formatter, "语言修复失败：{source}"),
             Self::InternalInvariant { invariant } => {
                 write!(formatter, "翻译候选内部不变量已破坏：{invariant}")
             }
@@ -2584,7 +2507,6 @@ impl Error for TranslationCandidateTechnicalError {
         match self {
             Self::LanguageModule(source) => Some(source),
             Self::LanguageProjection(source) => Some(source),
-            Self::LanguageRepair(source) => Some(source),
             Self::InternalInvariant { .. } => None,
         }
     }
@@ -3527,7 +3449,7 @@ mod tests {
     }
 
     #[test]
-    fn response_diagnostic_treats_projection_and_repair_as_internal_without_copying_text() {
+    fn response_diagnostic_treats_projection_as_internal_without_copying_text() {
         let sentinel = "MODEL_OR_TOKEN_BODY_SENTINEL";
         let projection: ProductionResponseError =
             TranslationTaskResponseProcessingError::LanguageProjection {
@@ -3544,28 +3466,6 @@ mod tests {
         );
         let projection = serde_json::to_string(&projection).expect("投影诊断应可序列化");
         assert!(!projection.contains(sentinel));
-
-        let repair: ProductionResponseError =
-            TranslationTaskResponseProcessingError::LanguageRepair {
-                unit_id: TaskId::new(0),
-                source: LanguageRepairApplicationError::UnexpectedCharacter {
-                    segment_index: 4,
-                    byte_offset: 9,
-                    expected: '密',
-                    actual: '钥',
-                },
-            };
-        let repair = repair.diagnostic_report(&task);
-        assert_eq!(
-            repair.primary().code(),
-            "rpg_maker.translation.response.repair_unexpected_character"
-        );
-        let repair = serde_json::to_string(&repair).expect("修复诊断应可序列化");
-        assert!(repair.contains("\"segment_index\":4"));
-        assert!(repair.contains("\"expected_code_point\":23494"));
-        assert!(repair.contains("\"actual_code_point\":38053"));
-        assert!(!repair.contains('密'));
-        assert!(!repair.contains('钥'));
     }
 
     fn japanese_module() -> Arc<dyn LanguageModule> {
