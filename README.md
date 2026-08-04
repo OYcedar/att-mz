@@ -54,7 +54,7 @@ ATT 负责前者，Agent 负责后者——你把任务交给 Agent，它驱动 
 
 ### 第 1 步：下载并解压
 
-从 [GitHub Releases](https://github.com/yexi-by/att-mz/releases/latest) 下载 Windows x64
+从 [GitHub Releases](https://github.com/yexi-by/att/releases/latest) 下载 Windows x64
 压缩包和 `SHA256SUMS.txt`，核对 SHA-256 后完整解压到一个可写目录。不要只单独复制
 `att.exe`。
 

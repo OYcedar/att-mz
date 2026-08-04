@@ -6,7 +6,7 @@ rust-version = "1.97"
 publish = false
 description = "面向 Agent 的游戏翻译命令行工具"
 license = "AGPL-3.0-only"
-repository = "https://github.com/yexi-by/att-mz"
+repository = "https://github.com/yexi-by/att"
 
 [dependencies]
 aho-corasick = "1.1.4"
