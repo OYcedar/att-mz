@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "crates/att-json-repair"]
+resolver = "3"
+
 [package]
 name = "att"
 version = "1.0.0"
@@ -9,6 +13,7 @@ license = "AGPL-3.0-only"
 repository = "https://github.com/yexi-by/att"
 
 [dependencies]
+att-json-repair = { path = "crates/att-json-repair" }
 aho-corasick = "1.1.4"
 async-channel = "2.5.0"
 clap = { version = "4.6.1", features = ["derive"] }

@@ -9,6 +9,9 @@ use std::fmt;
 use std::io::{self, BufReader, Read};
 use std::num::NonZeroUsize;
 
+use att_json_repair::{
+    RepairError, RepairErrorKind, RepairKind, RepairOutput, RepairPolicy, repair_with_cancellation,
+};
 use serde::de::{DeserializeOwned, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::value::RawValue;
@@ -64,13 +67,17 @@ impl TranslationTaskResponseJsonErrorCategory {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TranslationTaskResponseParseErrorKind {
     Json(TranslationTaskResponseJsonErrorCategory),
+    JsonRepair {
+        category: TranslationTaskResponseJsonErrorCategory,
+        repair: RepairErrorKind,
+    },
     ThinkingEmpty,
 }
 
 impl TranslationTaskResponseParseErrorKind {
     pub(crate) const fn code(self) -> &'static str {
         match self {
-            Self::Json(_) => "json",
+            Self::Json(_) | Self::JsonRepair { .. } => "json",
             Self::ThinkingEmpty => "thinking_empty",
         }
     }
@@ -257,6 +264,7 @@ pub(crate) enum DecodedSourceEchoFieldsError {
 pub(crate) struct ParsedTranslationResponse {
     thinking: Option<String>,
     entries: Vec<ParsedTranslationAssistantEntry>,
+    repairs: Vec<TranslationResponseRepair>,
 }
 
 impl ParsedTranslationResponse {
@@ -269,8 +277,50 @@ impl ParsedTranslationResponse {
         &self.entries
     }
 
-    pub(crate) fn into_parts(self) -> (Option<String>, Vec<ParsedTranslationAssistantEntry>) {
-        (self.thinking, self.entries)
+    #[cfg(test)]
+    pub(crate) fn repairs(&self) -> &[TranslationResponseRepair] {
+        &self.repairs
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Option<String>,
+        Vec<ParsedTranslationAssistantEntry>,
+        Vec<TranslationResponseRepair>,
+    ) {
+        (self.thinking, self.entries, self.repairs)
+    }
+}
+
+/// 一项相对于完整原始 Assistant 正文的 JSON 格式修复。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TranslationResponseRepair {
+    kind: RepairKind,
+    line: NonZeroUsize,
+    column: NonZeroUsize,
+}
+
+impl TranslationResponseRepair {
+    const fn new(kind: RepairKind, line: NonZeroUsize, column: NonZeroUsize) -> Self {
+        Self { kind, line, column }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn kind(self) -> RepairKind {
+        self.kind
+    }
+
+    pub(crate) const fn kind_code(self) -> &'static str {
+        self.kind.code()
+    }
+
+    pub(crate) const fn line(self) -> NonZeroUsize {
+        self.line
+    }
+
+    pub(crate) const fn column(self) -> NonZeroUsize {
+        self.column
     }
 }
 
@@ -319,6 +369,12 @@ impl<'de> Visitor<'de> for ModelOutputBatchVisitor {
 struct ThinkingModelOutputBatch {
     think: Box<RawValue>,
     translations: ModelOutputBatch,
+}
+
+#[derive(Debug)]
+enum TranslationResponseWire {
+    Plain(ModelOutputBatch),
+    Thinking(ThinkingModelOutputBatch),
 }
 
 #[derive(Debug)]
@@ -384,61 +440,137 @@ pub(crate) fn parse_translation_response_with_cancellation<E>(
     mut ensure_running: impl FnMut() -> Result<(), E>,
 ) -> Result<Result<ParsedTranslationResponse, TranslationTaskResponseParseError>, E> {
     ensure_running()?;
-    let value = trim_model_response_with_cancellation(value, &mut ensure_running)?;
-    let (thinking, batch) = if response_mode.thinking() {
-        let wrapper = match deserialize_json_with_cancellation::<ThinkingModelOutputBatch, _>(
-            value.value,
-            &mut ensure_running,
-        )? {
-            Ok(wrapper) => wrapper,
-            Err(source) => {
-                return Ok(Err(translation_response_json_error_with_cancellation(
-                    value,
-                    source,
-                    &mut ensure_running,
-                )?));
-            }
-        };
-        let Some(thinking) =
-            decode_owned_json_string_with_cancellation(wrapper.think.get(), &mut ensure_running)?
-        else {
-            return Ok(Err(value.error_at_with_cancellation(
-                TranslationTaskResponseParseErrorKind::Json(
-                    TranslationTaskResponseJsonErrorCategory::Shape,
-                ),
+    let value = LocatedModelResponse::new(value);
+    let strict_error = match deserialize_translation_response_wire_with_cancellation(
+        value.value,
+        response_mode,
+        &mut ensure_running,
+    )? {
+        Ok(wire) => {
+            return finish_translation_response_with_cancellation(
+                wire,
+                response_mode,
+                Vec::new(),
+                value,
                 0,
                 &mut ensure_running,
-            )?));
-        };
-        if response_text_is_whitespace_with_cancellation(&thinking, &mut ensure_running)? {
-            return Ok(Err(value.error_at_with_cancellation(
-                TranslationTaskResponseParseErrorKind::ThinkingEmpty,
-                0,
+            );
+        }
+        Err(source) => source,
+    };
+
+    if !matches!(
+        JsonErrorCategory::from(&strict_error),
+        JsonErrorCategory::Syntax | JsonErrorCategory::Eof
+    ) {
+        return Ok(Err(translation_response_json_error_with_cancellation(
+            value,
+            strict_error,
+            &mut ensure_running,
+        )?));
+    }
+
+    let repaired = match repair_with_cancellation(
+        value.value,
+        RepairPolicy::Conservative,
+        &mut ensure_running,
+    )? {
+        Ok(repaired) => repaired,
+        Err(repair_error) => {
+            return Ok(Err(translation_response_repair_error_with_cancellation(
+                value,
+                &strict_error,
+                repair_error,
                 &mut ensure_running,
             )?));
         }
-        (Some(thinking), wrapper.translations)
-    } else {
-        let batch = match deserialize_model_output_batch_with_cancellation(
-            value.value,
-            &mut ensure_running,
-        )? {
-            Ok(batch) => batch,
-            Err(source) => {
-                return Ok(Err(translation_response_json_error_with_cancellation(
+    };
+    let repairs =
+        translation_response_repairs_with_cancellation(value, &repaired, &mut ensure_running)?;
+    let repaired_wire = match deserialize_translation_response_wire_with_cancellation(
+        repaired.json(),
+        response_mode,
+        &mut ensure_running,
+    )? {
+        Ok(wire) => wire,
+        Err(source) => {
+            return Ok(Err(
+                repaired_translation_response_json_error_with_cancellation(
                     value,
+                    &repaired,
                     source,
                     &mut ensure_running,
+                )?,
+            ));
+        }
+    };
+    let root_original_offset = repaired.original_offset(0).unwrap_or_default();
+    finish_translation_response_with_cancellation(
+        repaired_wire,
+        response_mode,
+        repairs,
+        value,
+        root_original_offset,
+        &mut ensure_running,
+    )
+}
+
+fn deserialize_translation_response_wire_with_cancellation<E>(
+    value: &str,
+    response_mode: TranslationResponseMode,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<Result<TranslationResponseWire, serde_json::Error>, E> {
+    if response_mode.thinking() {
+        return Ok(
+            deserialize_json_with_cancellation::<ThinkingModelOutputBatch, _>(
+                value,
+                ensure_running,
+            )?
+            .map(TranslationResponseWire::Thinking),
+        );
+    }
+    Ok(
+        deserialize_model_output_batch_with_cancellation(value, ensure_running)?
+            .map(TranslationResponseWire::Plain),
+    )
+}
+
+fn finish_translation_response_with_cancellation<E>(
+    wire: TranslationResponseWire,
+    response_mode: TranslationResponseMode,
+    repairs: Vec<TranslationResponseRepair>,
+    source: LocatedModelResponse<'_>,
+    root_original_offset: usize,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<Result<ParsedTranslationResponse, TranslationTaskResponseParseError>, E> {
+    let (thinking, batch) = match wire {
+        TranslationResponseWire::Thinking(wrapper) => {
+            let Some(thinking) =
+                decode_owned_json_string_with_cancellation(wrapper.think.get(), ensure_running)?
+            else {
+                return Ok(Err(source.error_at_with_cancellation(
+                    TranslationTaskResponseParseErrorKind::Json(
+                        TranslationTaskResponseJsonErrorCategory::Shape,
+                    ),
+                    root_original_offset,
+                    ensure_running,
+                )?));
+            };
+            if response_text_is_whitespace_with_cancellation(&thinking, ensure_running)? {
+                return Ok(Err(source.error_at_with_cancellation(
+                    TranslationTaskResponseParseErrorKind::ThinkingEmpty,
+                    root_original_offset,
+                    ensure_running,
                 )?));
             }
-        };
-        (None, batch)
+            (Some(thinking), wrapper.translations)
+        }
+        TranslationResponseWire::Plain(batch) => (None, batch),
     };
     let mut entries = Vec::with_capacity(batch.0.len());
     for output in batch.0 {
         ensure_running()?;
-        let canonical_id =
-            parse_model_output_id_with_cancellation(&output.id, &mut ensure_running)?;
+        let canonical_id = parse_model_output_id_with_cancellation(&output.id, ensure_running)?;
         entries.push(ParsedTranslationAssistantEntry {
             canonical_id,
             id: output.id,
@@ -447,7 +579,12 @@ pub(crate) fn parse_translation_response_with_cancellation<E>(
         });
     }
     ensure_running()?;
-    Ok(Ok(ParsedTranslationResponse { thinking, entries }))
+    debug_assert_eq!(thinking.is_some(), response_mode.thinking());
+    Ok(Ok(ParsedTranslationResponse {
+        thinking,
+        entries,
+        repairs,
+    }))
 }
 
 fn translation_response_json_error_with_cancellation<E>(
@@ -455,14 +592,7 @@ fn translation_response_json_error_with_cancellation<E>(
     source: serde_json::Error,
     ensure_running: &mut impl FnMut() -> Result<(), E>,
 ) -> Result<TranslationTaskResponseParseError, E> {
-    let category = match JsonErrorCategory::from(&source) {
-        JsonErrorCategory::Io => TranslationTaskResponseJsonErrorCategory::Io,
-        JsonErrorCategory::Syntax | JsonErrorCategory::DuplicateObjectKey => {
-            TranslationTaskResponseJsonErrorCategory::Syntax
-        }
-        JsonErrorCategory::Data => TranslationTaskResponseJsonErrorCategory::Shape,
-        JsonErrorCategory::Eof => TranslationTaskResponseJsonErrorCategory::UnexpectedEof,
-    };
+    let category = translation_response_json_error_category(&source);
     let (line, column) = if matches!(
         category,
         TranslationTaskResponseJsonErrorCategory::UnexpectedEof
@@ -480,6 +610,170 @@ fn translation_response_json_error_with_cancellation<E>(
         line,
         column,
     ))
+}
+
+fn repaired_translation_response_json_error_with_cancellation<E>(
+    original: LocatedModelResponse<'_>,
+    repaired: &RepairOutput<'_>,
+    source: serde_json::Error,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<TranslationTaskResponseParseError, E> {
+    let category = translation_response_json_error_category(&source);
+    let output_offset = if matches!(
+        category,
+        TranslationTaskResponseJsonErrorCategory::UnexpectedEof
+    ) {
+        repaired.json().len()
+    } else {
+        json_location_byte_offset_with_cancellation(
+            repaired.json(),
+            source.line(),
+            source.column(),
+            ensure_running,
+        )?
+    };
+    let original_offset = repaired
+        .original_offset(output_offset)
+        .unwrap_or(original.value.len());
+    let (line, column) = original.location_at_with_cancellation(original_offset, ensure_running)?;
+    Ok(TranslationTaskResponseParseError::new(
+        TranslationTaskResponseParseErrorKind::Json(category),
+        line,
+        column,
+    ))
+}
+
+fn translation_response_repair_error_with_cancellation<E>(
+    original: LocatedModelResponse<'_>,
+    strict_source: &serde_json::Error,
+    repair_error: RepairError,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<TranslationTaskResponseParseError, E> {
+    let category = translation_response_json_error_category(strict_source);
+    let (line, column) =
+        original.location_at_with_cancellation(repair_error.original_offset(), ensure_running)?;
+    Ok(TranslationTaskResponseParseError::new(
+        TranslationTaskResponseParseErrorKind::JsonRepair {
+            category,
+            repair: repair_error.kind(),
+        },
+        line,
+        column,
+    ))
+}
+
+fn translation_response_json_error_category(
+    source: &serde_json::Error,
+) -> TranslationTaskResponseJsonErrorCategory {
+    match JsonErrorCategory::from(source) {
+        JsonErrorCategory::Io => TranslationTaskResponseJsonErrorCategory::Io,
+        JsonErrorCategory::Syntax | JsonErrorCategory::DuplicateObjectKey => {
+            TranslationTaskResponseJsonErrorCategory::Syntax
+        }
+        JsonErrorCategory::Data => TranslationTaskResponseJsonErrorCategory::Shape,
+        JsonErrorCategory::Eof => TranslationTaskResponseJsonErrorCategory::UnexpectedEof,
+    }
+}
+
+fn translation_response_repairs_with_cancellation<E>(
+    original: LocatedModelResponse<'_>,
+    repaired: &RepairOutput<'_>,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<Vec<TranslationResponseRepair>, E> {
+    let mut absolute_offsets = Vec::with_capacity(repaired.repairs().len());
+    for repair in repaired.repairs() {
+        ensure_running()?;
+        absolute_offsets.push(
+            original
+                .start
+                .saturating_add(repair.original_range().start.min(original.value.len()))
+                .min(original.raw.len()),
+        );
+    }
+    let locations =
+        response_locations_with_cancellation(original.raw, &absolute_offsets, ensure_running)?;
+    ensure_running()?;
+    Ok(repaired
+        .repairs()
+        .iter()
+        .zip(locations)
+        .map(|(repair, (line, column))| TranslationResponseRepair::new(repair.kind(), line, column))
+        .collect())
+}
+
+fn response_locations_with_cancellation<E>(
+    raw: &str,
+    byte_offsets: &[usize],
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<Vec<(NonZeroUsize, NonZeroUsize)>, E> {
+    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
+    const ONE: NonZeroUsize = NonZeroUsize::new(1).expect("一是非零值");
+
+    ensure_running()?;
+    let mut locations = vec![(ONE, ONE); byte_offsets.len()];
+    let bytes = raw.as_bytes();
+    let mut cursor = 0_usize;
+    let mut line = 1_usize;
+    let mut line_start = 0_usize;
+    let mut bytes_until_check = CANCELLATION_CHECK_BYTES;
+    let mut previous_offset = 0_usize;
+    for (index, offset) in byte_offsets.iter().copied().enumerate() {
+        ensure_running()?;
+        let offset = offset.min(bytes.len());
+        debug_assert!(
+            offset >= previous_offset,
+            "JSON 修复必须按原始 Assistant 的字节顺序记录"
+        );
+        previous_offset = offset;
+        while cursor < offset {
+            if bytes[cursor] == b'\n' {
+                line += 1;
+                line_start = cursor + 1;
+            }
+            cursor += 1;
+            bytes_until_check -= 1;
+            if bytes_until_check == 0 {
+                ensure_running()?;
+                bytes_until_check = CANCELLATION_CHECK_BYTES;
+            }
+        }
+        locations[index] = (
+            NonZeroUsize::new(line).expect("一基行号不可能为零"),
+            NonZeroUsize::new(offset - line_start + 1).expect("一基列号不可能为零"),
+        );
+    }
+    ensure_running()?;
+    Ok(locations)
+}
+
+fn json_location_byte_offset_with_cancellation<E>(
+    json: &str,
+    line: usize,
+    column: usize,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<usize, E> {
+    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
+
+    let target_line = line.max(1);
+    let target_column = column.max(1);
+    let mut current_line = 1_usize;
+    let mut current_column = 1_usize;
+    for (offset, byte) in json.bytes().enumerate() {
+        if offset.is_multiple_of(CANCELLATION_CHECK_BYTES) {
+            ensure_running()?;
+        }
+        if current_line == target_line && current_column == target_column {
+            return Ok(offset);
+        }
+        if byte == b'\n' {
+            current_line += 1;
+            current_column = 1;
+        } else {
+            current_column += 1;
+        }
+    }
+    ensure_running()?;
+    Ok(json.len())
 }
 
 fn parse_model_output_id_with_cancellation<E>(
@@ -891,32 +1185,6 @@ impl<'a> LocatedModelResponse<'a> {
         }
     }
 
-    fn advance(self, bytes: usize) -> Self {
-        Self {
-            raw: self.raw,
-            value: &self.value[bytes..],
-            start: self.start + bytes,
-        }
-    }
-
-    fn prefix(self, bytes: usize) -> Self {
-        Self {
-            raw: self.raw,
-            value: &self.value[..bytes],
-            start: self.start,
-        }
-    }
-
-    fn trim_with_cancellation<E>(
-        self,
-        ensure_running: &mut impl FnMut() -> Result<(), E>,
-    ) -> Result<Self, E> {
-        let leading = leading_whitespace_bytes_with_cancellation(self.value, ensure_running)?;
-        let value = self.advance(leading);
-        let trailing = trailing_whitespace_bytes_with_cancellation(value.value, ensure_running)?;
-        Ok(value.prefix(value.value.len() - trailing))
-    }
-
     fn location_at_with_cancellation<E>(
         self,
         local_byte_offset: usize,
@@ -998,59 +1266,6 @@ fn response_location_with_cancellation<E>(
     ))
 }
 
-fn trim_model_response_with_cancellation<'a, E>(
-    value: &'a str,
-    ensure_running: &mut impl FnMut() -> Result<(), E>,
-) -> Result<LocatedModelResponse<'a>, E> {
-    let value = LocatedModelResponse::new(value).trim_with_cancellation(ensure_running)?;
-    let value = if value.value.starts_with('\u{feff}') {
-        value.advance('\u{feff}'.len_utf8())
-    } else {
-        value
-    };
-    value.trim_with_cancellation(ensure_running)
-}
-
-fn leading_whitespace_bytes_with_cancellation<E>(
-    value: &str,
-    ensure_running: &mut impl FnMut() -> Result<(), E>,
-) -> Result<usize, E> {
-    const CANCELLATION_CHECK_CHARACTERS: usize = 16 * 1024;
-
-    let mut leading = 0_usize;
-    for (index, (offset, character)) in value.char_indices().enumerate() {
-        if index.is_multiple_of(CANCELLATION_CHECK_CHARACTERS) {
-            ensure_running()?;
-        }
-        if !character.is_whitespace() {
-            break;
-        }
-        leading = offset + character.len_utf8();
-    }
-    ensure_running()?;
-    Ok(leading)
-}
-
-fn trailing_whitespace_bytes_with_cancellation<E>(
-    value: &str,
-    ensure_running: &mut impl FnMut() -> Result<(), E>,
-) -> Result<usize, E> {
-    const CANCELLATION_CHECK_CHARACTERS: usize = 16 * 1024;
-
-    let mut trailing_start = value.len();
-    for (index, (offset, character)) in value.char_indices().rev().enumerate() {
-        if index.is_multiple_of(CANCELLATION_CHECK_CHARACTERS) {
-            ensure_running()?;
-        }
-        if !character.is_whitespace() {
-            break;
-        }
-        trailing_start = offset;
-    }
-    ensure_running()?;
-    Ok(value.len() - trailing_start)
-}
-
 fn response_text_is_whitespace_with_cancellation<E>(
     value: &str,
     ensure_running: &mut impl FnMut() -> Result<(), E>,
@@ -1103,6 +1318,7 @@ mod tests {
             ]
         );
         assert!(entries[0].1.is_some(), "规范 ID 0 必须可表示");
+        assert!(parsed.repairs().is_empty(), "严格 JSON 不应建立修复记录");
     }
 
     #[test]
@@ -1207,8 +1423,6 @@ mod tests {
             r#"{"think":"判断"}"#,
             r#"{"think":3,"translations":{"0":["译文"]}}"#,
             r#"{"think":"判断","translations":{"0":["译文"]},"extra":true}"#,
-            r#"{"think":"第一次","think":"第二次","translations":{"0":["译文"]}}"#,
-            r#"{"think":"判断","translations":{},"translations":{"0":["译文"]}}"#,
             r#"{"think":"判断","translations":[]}"#,
             r#"不是 JSON"#,
         ] {
@@ -1228,6 +1442,21 @@ mod tests {
             assert_eq!(
                 error.kind(),
                 TranslationTaskResponseParseErrorKind::ThinkingEmpty
+            );
+        }
+
+        for invalid in [
+            r#"[]"#,
+            r#"{"think":"第一次","think":"第二次","translations":{"0":["译文"]}}"#,
+            r#"{"think":"判断","translations":{},"translations":{"0":["译文"]}}"#,
+        ] {
+            let error = parse_translation_response(invalid, mode(true, false))
+                .expect_err("合法 JSON 的 shape 错误不能进入 repair");
+            assert_eq!(
+                error.kind(),
+                TranslationTaskResponseParseErrorKind::Json(
+                    TranslationTaskResponseJsonErrorCategory::Shape
+                )
             );
         }
     }
@@ -1338,11 +1567,28 @@ mod tests {
     }
 
     #[test]
-    fn reports_shape_and_full_response_location() {
+    fn repairs_model_json_without_weakening_shape_validation() {
         let parsed =
             parse_translation_response("\n{\"0\":[\"ok\"],\"1\":true}\n", mode(false, false))
                 .expect("值形状由逐 ID 验收");
         assert_eq!(parsed.entries()[1].raw_value().get(), "true");
+        assert!(parsed.repairs().is_empty());
+
+        let bom = parse_translation_response("\u{feff}{\"0\":[\"ok\"]}", mode(false, false))
+            .expect("BOM 应经过受控修复");
+        assert_eq!(bom.repairs().len(), 1);
+        assert_eq!(bom.repairs()[0].kind(), RepairKind::RemovedByteOrderMark);
+
+        let unicode_whitespace =
+            parse_translation_response("\u{2003}{\"0\":[\"ok\"]}\u{2003}", mode(false, false))
+                .expect("非 JSON 空白应经过受控修复");
+        assert_eq!(unicode_whitespace.repairs().len(), 2);
+        assert!(
+            unicode_whitespace
+                .repairs()
+                .iter()
+                .all(|repair| repair.kind() == RepairKind::NormalizedWhitespace)
+        );
 
         let error = parse_translation_response(
             "\n{\"think\":\"判断\",\"translations\":{\"0\":",
@@ -1352,15 +1598,72 @@ mod tests {
         assert_eq!(error.line().get(), 2);
         assert!(error.column().get() >= 35);
 
-        let fenced =
-            parse_translation_response("```json\n{\"0\":[\"ok\"]}\n```", mode(false, false))
-                .expect_err("当前协议只接受裸 JSON，不接受 Markdown 围栏");
-        assert!(matches!(
-            fenced.kind(),
+        let fenced = parse_translation_response(
+            "\u{2003}\r\n```json\r\n{\"0\":[\"ok\"]}\r\n```\r\n",
+            mode(false, false),
+        )
+        .expect("单一 Markdown 围栏应由协议边界修复");
+        assert_eq!(fenced.entries()[0].raw_value().get(), r#"["ok"]"#);
+        let fence_repairs = fenced
+            .repairs()
+            .iter()
+            .filter(|repair| repair.kind() == RepairKind::RemovedMarkdownFence)
+            .collect::<Vec<_>>();
+        assert_eq!(fence_repairs.len(), 2);
+        assert_eq!(
+            (
+                fence_repairs[0].line().get(),
+                fence_repairs[0].column().get()
+            ),
+            (2, 1)
+        );
+        assert_eq!(fence_repairs[0].kind_code(), "removed_markdown_fence");
+
+        let quoted = parse_translation_response(r#"{"0":["type: "free""]}"#, mode(false, false))
+            .expect("无歧义的内部双引号应被转义");
+        assert!(
+            quoted
+                .repairs()
+                .iter()
+                .any(|repair| repair.kind() == RepairKind::EscapedInternalQuote)
+        );
+        assert_eq!(
+            quoted.entries()[0]
+                .decode_translation_value_with_cancellation::<Infallible>(|| Ok(()))
+                .expect("未取消"),
+            DecodedTranslationAssistantValue::Translation(DecodedJsonStringArray::Strings(vec![
+                "type: \"free\"".to_owned(),
+            ]))
+        );
+
+        let repaired_shape = parse_translation_response(
+            "说明\r\n```json\r\n{\"think\":\"判断\",\"translations\":{\"0\":[\"ok\"]},\"extra\":true}\r\n```",
+            mode(true, false),
+        )
+        .expect_err("围栏修复后仍必须执行严格根结构验收");
+        assert_eq!(
+            repaired_shape.kind(),
             TranslationTaskResponseParseErrorKind::Json(
-                TranslationTaskResponseJsonErrorCategory::Syntax
+                TranslationTaskResponseJsonErrorCategory::Shape
             )
-        ));
+        );
+        assert_eq!(repaired_shape.line().get(), 3);
+        assert!(repaired_shape.column().get() > 40);
+
+        let repair_rejection = parse_translation_response(
+            "{\"0\":[\"first\"]}\n{\"1\":[\"second\"]}",
+            mode(false, false),
+        )
+        .expect_err("多个 JSON 候选必须由 Conservative 拒绝");
+        assert_eq!(
+            repair_rejection.kind(),
+            TranslationTaskResponseParseErrorKind::JsonRepair {
+                category: TranslationTaskResponseJsonErrorCategory::Syntax,
+                repair: RepairErrorKind::MultipleJsonCandidates,
+            }
+        );
+        assert_eq!(repair_rejection.line().get(), 2);
+        assert_eq!(repair_rejection.column().get(), 1);
     }
 
     #[test]
@@ -1380,6 +1683,22 @@ mod tests {
 
         assert!(matches!(parsed, Err("cancelled")));
         assert_eq!(polls.get(), 20);
+    }
+
+    #[test]
+    fn cancellable_parser_stops_during_json_repair() {
+        let response = format!("```json\n{{\"0\":[\"{}\"]}}\n```", "译".repeat(512 * 1024));
+        let polls = Cell::new(0_usize);
+
+        let parsed =
+            parse_translation_response_with_cancellation(&response, mode(false, false), || {
+                let next = polls.get() + 1;
+                polls.set(next);
+                if next >= 12 { Err("cancelled") } else { Ok(()) }
+            });
+
+        assert!(matches!(parsed, Err("cancelled")));
+        assert_eq!(polls.get(), 12);
     }
 
     #[test]

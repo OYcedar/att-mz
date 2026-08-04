@@ -3416,7 +3416,8 @@ fn generic_response_parse_diagnostic(
     error: TranslationTaskResponseParseError,
 ) -> DiagnosticReport {
     let problem = match error.kind() {
-        TranslationTaskResponseParseErrorKind::Json(category) => {
+        TranslationTaskResponseParseErrorKind::Json(category)
+        | TranslationTaskResponseParseErrorKind::JsonRepair { category, .. } => {
             GenericTaskResponseProblem::InvalidJson {
                 category: match category {
                     TranslationTaskResponseJsonErrorCategory::Io => {

@@ -26,6 +26,7 @@ use crate::runtime::filesystem::{
     SystemFileSystem, SystemFileSystemError, TerminalObservationOperation,
 };
 use crate::runtime::windows::WindowsFsError;
+use crate::translation_protocol::TranslationResponseRepair;
 use crate::windows_path::WindowsOrdinalCaseKeyError;
 
 pub(crate) trait TaskRecordDiagnosticRecorder: Send + Sync {
@@ -807,10 +808,45 @@ pub(crate) fn render_raw_assistant(
     raw_assistant: &str,
     api_key_redactor: &ApiKeyRedactor,
 ) -> String {
+    render_raw_assistant_with_language(raw_assistant, api_key_redactor, "json")
+}
+
+/// 把经过 JSON 修复的原始 Assistant 作为普通文本保存，避免围栏暗示正文自身是合法 JSON。
+pub(crate) fn render_repaired_raw_assistant(
+    raw_assistant: &str,
+    api_key_redactor: &ApiKeyRedactor,
+) -> String {
+    render_raw_assistant_with_language(raw_assistant, api_key_redactor, "text")
+}
+
+fn render_raw_assistant_with_language(
+    raw_assistant: &str,
+    api_key_redactor: &ApiKeyRedactor,
+    language: &str,
+) -> String {
     markdown_fence(
         &api_key_redactor.redact_text_with_json_strings(raw_assistant),
-        "json",
+        language,
     )
+}
+
+/// 渲染两个引擎共同使用的 JSON 修复事实，不复制 Assistant 正文。
+pub(crate) fn render_json_repairs(output: &mut String, repairs: &[TranslationResponseRepair]) {
+    if repairs.is_empty() {
+        return;
+    }
+    output.push_str("\n## JSON Repairs\n\n");
+    output.push_str("| Kind | Line | Column |\n");
+    output.push_str("| --- | ---: | ---: |\n");
+    for repair in repairs {
+        let _ = writeln!(
+            output,
+            "| `{}` | {} | {} |",
+            repair.kind_code(),
+            repair.line(),
+            repair.column(),
+        );
+    }
 }
 
 pub(crate) fn recorded_at_utc(now: OffsetDateTime) -> String {

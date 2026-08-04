@@ -1,0 +1,15 @@
+[package]
+name = "att-json-repair"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+publish = false
+description = "保留顺序与重复字段的模型 JSON 修复器"
+license = "AGPL-3.0-only"
+repository = "https://github.com/yexi-by/att"
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+serde_json = "1.0.149"

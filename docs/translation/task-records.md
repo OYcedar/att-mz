@@ -33,8 +33,14 @@ message 是实际请求，必须保留该稳定 TaskBlock 的全部 Group 和 Un
 
 `Raw Assistant` 使用能够包住正文的动态 Markdown fence，只执行现行敏感信息闭集要求的
 精确替换。它不是 HTTP body、Header、供应商完整响应，也不能称为未经处理的字节副本。
-非思考模式的成功响应不额外显示 `Raw Assistant`；无效或未处理的 assistant 正文继续按
-现有失败记录保留。
+响应经过 JSON 修复时，任务记录在解析结果之后增加 `JSON Repairs` 表格，按发生顺序保存
+稳定修复 kind 及其相对于完整原始 Assistant 的一基行、列，不保存被删除、插入或替换的
+正文片段。此时即使思考关闭，也显示 `Raw Assistant`；严格解析成功且思考关闭的响应仍不
+额外显示它。无效或未处理的 assistant 正文继续按现有失败记录保留。
+
+JSON 修复成功是响应解析事实，不是 Warn、Partial 或错误，不建立项目 JSONL diagnostic，
+也不改变任务终态、提交、退出码或重试语义。修复后的重复、非法、未知、缺少、Placeholder
+或其他逐 ID 问题继续使用现有验收和诊断。
 
 人工或 agent 排查译文返回时，可以对照 System、User、Thinking、Raw Assistant、逐 ID
 诊断和最终结果，确认模型实际返回的 JSON 结构、ID、原文回显、截断、转义与源语残留。

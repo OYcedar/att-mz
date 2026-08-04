@@ -2354,7 +2354,8 @@ fn task_response_parse_problem(
     error: TranslationTaskResponseParseError,
 ) -> RpgMakerTaskResponseProblem {
     match error.kind() {
-        TranslationTaskResponseParseErrorKind::Json(category) => {
+        TranslationTaskResponseParseErrorKind::Json(category)
+        | TranslationTaskResponseParseErrorKind::JsonRepair { category, .. } => {
             RpgMakerTaskResponseProblem::InvalidJson {
                 category: match category {
                     TranslationTaskResponseJsonErrorCategory::Io => {
