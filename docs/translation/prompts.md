@@ -38,6 +38,10 @@ system.md
 介绍其他响应格式。Prompt 的指令固定为中文；项目语言对只替换源语言和目标语言变量，
 UI 语言不参与资源选择。
 
+四种响应模式的示例使用相同的输入和译文事实，只改变响应包装。完整示例必须同时展示
+`free` 合并原文行与拆分原文行，以及 `strict` 保持数量和空槽位置，避免示例暗示
+`free` 也要逐行对应。
+
 ## 2. User message
 
 一次请求只包含渲染后的 system message，以及当前 TaskBlock 的一条 JSON user message：
