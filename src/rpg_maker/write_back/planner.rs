@@ -20,6 +20,7 @@ use crate::diagnostic::{
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::execution::{CooperativeCancellation, OperationCompletion};
+use crate::language::LanguageTextNormalizer;
 use crate::progress::{NoopProgressObserver, ProgressObserver, ProgressSnapshot};
 use crate::rpg_maker::model::{
     DialogueLinePart, DialogueWriteRecipe, DirectTextPart, DirectTextRecipe, LogicalTextLocation,
@@ -72,6 +73,35 @@ impl RpgMakerWriteBackUnit {
         self.translation_content
             .as_ref()
             .unwrap_or(&self.source_content)
+    }
+
+    fn normalize_translation(&mut self, normalizer: &dyn LanguageTextNormalizer) {
+        let Some(translation) = self.translation_content.as_mut() else {
+            return;
+        };
+        match (&self.source_content, translation) {
+            (TextUnitContent::Value(source), TextUnitContent::Value(translation)) => {
+                *translation = normalizer.normalize(source, translation);
+            }
+            (TextUnitContent::Lines(source), TextUnitContent::Lines(translation))
+                if matches!(self.role, TextUnitRole::Choices) =>
+            {
+                for (source, translation) in source.iter().zip(translation) {
+                    *translation = normalizer.normalize(source, translation);
+                }
+            }
+            (TextUnitContent::Lines(source), TextUnitContent::Lines(translation)) => {
+                let normalized = normalizer.normalize(&source.join("\n"), &translation.join("\n"));
+                let normalized = normalized
+                    .split('\n')
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                if normalized.len() == translation.len() {
+                    *translation = normalized;
+                }
+            }
+            _ => unreachable!("受信写回单元的原文与译文结构必须一致"),
+        }
     }
 }
 
@@ -2095,6 +2125,7 @@ pub(crate) struct RpgMakerWriteBackService<R, L, D, C> {
     document_rewriter: D,
     cpu: Arc<C>,
     cancellation: CooperativeCancellation,
+    text_normalizer: Option<Arc<dyn LanguageTextNormalizer>>,
     progress: Arc<dyn ProgressObserver<WriteBackProgressPhase>>,
 }
 
@@ -2112,8 +2143,17 @@ impl<R, L, D, C> RpgMakerWriteBackService<R, L, D, C> {
             document_rewriter,
             cpu: Arc::new(cpu),
             cancellation,
+            text_normalizer: None,
             progress: Arc::new(NoopProgressObserver),
         }
+    }
+
+    pub(crate) fn with_text_normalizer(
+        mut self,
+        normalizer: Arc<dyn LanguageTextNormalizer>,
+    ) -> Self {
+        self.text_normalizer = Some(normalizer);
+        self
     }
 
     /// 为 RPG Maker WriteBack 绑定同步、不可失败的业务进度观察者。
@@ -2181,6 +2221,7 @@ where
                 group,
                 profile,
                 layouter: Arc::clone(&self.text_layouter),
+                text_normalizer: self.text_normalizer.clone(),
                 progress: Arc::clone(&planning_progress),
             })
             .collect();
@@ -2235,6 +2276,7 @@ struct ProgressTrackedPlanningJob<L> {
     group: RpgMakerWriteBackGroup,
     profile: RpgMakerWriteBackLayoutProfile,
     layouter: Arc<L>,
+    text_normalizer: Option<Arc<dyn LanguageTextNormalizer>>,
     progress: Arc<PlanningProgress>,
 }
 
@@ -2290,7 +2332,12 @@ fn plan_rpg_maker_write_back_group_with_progress<L>(
 where
     L: RpgMakerWriteBackTextLayouter,
 {
-    let planned = plan_rpg_maker_write_back_group(job.group, &job.profile, job.layouter.as_ref());
+    let planned = plan_rpg_maker_write_back_group(
+        job.group,
+        &job.profile,
+        job.layouter.as_ref(),
+        job.text_normalizer.as_deref(),
+    );
     job.progress.complete();
     planned
 }
@@ -2310,7 +2357,7 @@ fn plan_rpg_maker_write_back(
     let groups = snapshot
         .into_groups()
         .into_iter()
-        .map(|group| plan_rpg_maker_write_back_group(group, profile, layouter))
+        .map(|group| plan_rpg_maker_write_back_group(group, profile, layouter, None))
         .collect();
     assemble_planned_rpg_maker_write_back(groups).expect("测试快照应产生有效 Mutation 计划")
 }
@@ -2319,6 +2366,7 @@ fn plan_rpg_maker_write_back_group(
     group: RpgMakerWriteBackGroup,
     profile: &RpgMakerWriteBackLayoutProfile,
     layouter: &impl RpgMakerWriteBackTextLayouter,
+    text_normalizer: Option<&dyn LanguageTextNormalizer>,
 ) -> PlannedRpgMakerWriteBackGroup {
     let mut mutations = Vec::new();
     let mut summary = RpgMakerWriteBackSummary::default();
@@ -2338,7 +2386,12 @@ fn plan_rpg_maker_write_back_group(
             }
         }
 
-        let (kind, group_location, units, recipes, mutation_claims) = group.into_parts();
+        let (kind, group_location, mut units, recipes, mutation_claims) = group.into_parts();
+        if let Some(normalizer) = text_normalizer {
+            for unit in &mut units {
+                unit.normalize_translation(normalizer);
+            }
+        }
         match kind {
             TextGroupKind::EventDialogue => plan_dialogue_group(
                 group_location,
@@ -2884,6 +2937,7 @@ pub(crate) fn write_back_planning_compute_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::language::{JapaneseQuoteNormalizer, JapaneseQuoteRepairPolicy, QuotePair};
     use crate::progress::ProgressAmount;
     use crate::rpg_maker::model::{
         DialogueLinePart, DialogueLineRecipe, DialogueWriteRecipe, DirectSpeakerTarget,
@@ -2901,6 +2955,49 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(snapshot);
         }
+    }
+
+    #[test]
+    fn write_back_unit_normalizes_quotes_across_dialogue_lines_but_not_across_choices() {
+        let normalizer = JapaneseQuoteNormalizer::new(
+            JapaneseQuoteRepairPolicy::new(vec![QuotePair::new('“', '”')])
+                .expect("测试引号策略应有效"),
+        );
+        let mut dialogue = RpgMakerWriteBackUnit::new(
+            TextUnitRole::DialogueBody,
+            TextUnitContent::Lines(vec!["「原文。".to_owned(), "続き」".to_owned()]),
+            Some(TextUnitContent::Lines(vec![
+                "「译文。".to_owned(),
+                "继续。”".to_owned(),
+            ])),
+        )
+        .expect("测试对话单元应有效");
+        dialogue.normalize_translation(&normalizer);
+        assert_eq!(
+            dialogue.translation_content,
+            Some(TextUnitContent::Lines(vec![
+                "「译文。".to_owned(),
+                "继续。」".to_owned(),
+            ]))
+        );
+
+        let mut choices = RpgMakerWriteBackUnit::new(
+            TextUnitRole::Choices,
+            TextUnitContent::Lines(vec!["「甲」".to_owned(), "「乙」".to_owned()]),
+            Some(TextUnitContent::Lines(vec![
+                "“甲".to_owned(),
+                "乙”".to_owned(),
+            ])),
+        )
+        .expect("测试选项单元应有效");
+        choices.normalize_translation(&normalizer);
+        assert_eq!(
+            choices.translation_content,
+            Some(TextUnitContent::Lines(vec![
+                "“甲".to_owned(),
+                "乙”".to_owned(),
+            ]))
+        );
     }
 
     #[test]

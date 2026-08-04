@@ -1,5 +1,6 @@
 //! Generic JSONL 写回候选的构造与往返验证。
 
+use std::borrow::Cow;
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -11,6 +12,7 @@ use crate::diagnostic::{
     GenericWriteBackSnapshotProblem, SafeIdentifier, SafePath, StateEffect,
 };
 use crate::execution::CooperativeCancellation;
+use crate::language::{LanguageOperationCancelled, LanguageTextNormalizer};
 
 #[cfg(test)]
 use super::jsonl::parse_file;
@@ -158,6 +160,7 @@ pub(crate) fn build_write_back_candidate(
         stored,
         live,
         current_translations,
+        None,
         &CooperativeCancellation::default(),
     )
 }
@@ -167,6 +170,7 @@ pub(crate) fn build_write_back_candidate_with_cancellation(
     stored: &GenericStoredSnapshot,
     live: &GenericInputSnapshot,
     current_translations: &GenericUnitMap<String>,
+    text_normalizer: Option<&dyn LanguageTextNormalizer>,
     cancellation: &CooperativeCancellation,
 ) -> Result<GenericWriteBackCandidate, GenericWriteBackError> {
     ensure_write_back_running(cancellation)?;
@@ -187,7 +191,13 @@ pub(crate) fn build_write_back_candidate_with_cancellation(
         .par_iter()
         .zip(live.files().par_iter())
         .map(|(stored_file, live_file)| {
-            build_write_back_file(stored_file, live_file, current_translations, cancellation)
+            build_write_back_file(
+                stored_file,
+                live_file,
+                current_translations,
+                text_normalizer,
+                cancellation,
+            )
         })
         .collect::<Vec<_>>();
 
@@ -222,6 +232,7 @@ fn build_write_back_file(
     stored_file: &super::project::GenericStoredFile,
     live_file: &GenericFile,
     translations: &GenericUnitMap<String>,
+    text_normalizer: Option<&dyn LanguageTextNormalizer>,
     cancellation: &CooperativeCancellation,
 ) -> Result<BuiltWriteBackFile, GenericWriteBackError> {
     ensure_write_back_running(cancellation)?;
@@ -270,19 +281,35 @@ fn build_write_back_file(
             let text = if let Some(translation) = translation {
                 ensure_write_back_text_running(translation, cancellation)?;
                 translated_units += 1;
-                translation.as_str()
+                match text_normalizer {
+                    Some(normalizer) => Cow::Owned(
+                        normalizer
+                            .normalize_with_cancellation(unit.text(), translation, &mut || {
+                                ensure_write_back_running(cancellation)
+                                    .map_err(|_| LanguageOperationCancelled)
+                            })
+                            .map_err(|LanguageOperationCancelled| GenericJsonlError::Cancelled)?,
+                    ),
+                    None => Cow::Borrowed(translation.as_str()),
+                }
             } else {
                 retained_source_units += 1;
-                unit.text()
+                Cow::Borrowed(unit.text())
             };
-            output_units.push(unit.clone_with_text_with_cancellation(text, cancellation)?);
+            output_units.push(unit.clone_with_text_with_cancellation(&text, cancellation)?);
         }
         output_groups
             .push(live_group.clone_with_units_with_cancellation(output_units, cancellation)?);
     }
 
     let bytes = serialize_groups_with_cancellation(&output_groups, cancellation)?;
-    let validated = validate_round_trip(live_file, bytes, translations, cancellation)?;
+    let validated = validate_round_trip(
+        live_file,
+        bytes,
+        translations,
+        text_normalizer,
+        cancellation,
+    )?;
     Ok(BuiltWriteBackFile {
         file: GenericWriteBackFile { validated },
         translated_units,
@@ -339,6 +366,7 @@ fn validate_round_trip(
     source: &GenericFile,
     candidate_bytes: Vec<u8>,
     translations: &GenericUnitMap<String>,
+    text_normalizer: Option<&dyn LanguageTextNormalizer>,
     cancellation: &CooperativeCancellation,
 ) -> Result<GenericFile, GenericWriteBackError> {
     let candidate = parse_file_with_cancellation(
@@ -394,12 +422,30 @@ fn validate_round_trip(
                     },
                 ));
             }
-            let expected = translations
-                .get_parts_with_cancellation(original_group.id(), original.id(), || {
-                    ensure_write_back_running(cancellation)
-                })?
-                .map_or(original.text(), String::as_str);
-            if !text_equal_with_cancellation(candidate.text(), expected, cancellation)? {
+            let translation = translations.get_parts_with_cancellation(
+                original_group.id(),
+                original.id(),
+                || ensure_write_back_running(cancellation),
+            )?;
+            let expected = match translation {
+                Some(translation) => match text_normalizer {
+                    Some(normalizer) => Cow::Owned(
+                        normalizer
+                            .normalize_with_cancellation(
+                                original.text(),
+                                translation.as_str(),
+                                &mut || {
+                                    ensure_write_back_running(cancellation)
+                                        .map_err(|_| LanguageOperationCancelled)
+                                },
+                            )
+                            .map_err(|LanguageOperationCancelled| GenericJsonlError::Cancelled)?,
+                    ),
+                    None => Cow::Borrowed(translation.as_str()),
+                },
+                None => Cow::Borrowed(original.text()),
+            };
+            if !text_equal_with_cancellation(candidate.text(), &expected, cancellation)? {
                 return Err(GenericWriteBackError::SnapshotMismatch(
                     GenericWriteBackSnapshotProblem::RoundTripUnitText {
                         relative_path: SafePath::new(source.relative_path()),
@@ -550,7 +596,9 @@ mod tests {
     use crate::generic::project::{
         GenericInitRequest, GenericProjectStore, TranslationOrigin, TranslationWrite,
     };
-    use crate::language::LanguageId;
+    use crate::language::{
+        JapaneseQuoteNormalizer, JapaneseQuoteRepairPolicy, LanguageId, QuotePair,
+    };
 
     use super::*;
 
@@ -637,6 +685,53 @@ mod tests {
                 .unwrap()
                 .bytes()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn candidate_normalizes_quotes_only_during_write_back() {
+        let temp = tempdir().unwrap();
+        let source_root = temp.path().join("source");
+        fs::create_dir(&source_root).unwrap();
+        fs::write(
+            source_root.join("scene.jsonl"),
+            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"「原文」\"}]}\n",
+        )
+        .unwrap();
+        let (store, _) = GenericProjectStore::initialize(GenericInitRequest {
+            project_name: "quote-write-back".parse().unwrap(),
+            workspace_root: temp.path().join("project"),
+            source_root: Some(source_root),
+            source_language: Some(LanguageId::parse("ja").unwrap()),
+            target_language: Some(LanguageId::parse("zh-Hans").unwrap()),
+        })
+        .unwrap();
+        store.extract().unwrap();
+        let (stored, live) = store.ensure_input_current().unwrap();
+        let mut translations = GenericUnitMap::new();
+        translations
+            .insert_with_cancellation(
+                GenericUnitKey::new("g".to_owned(), "u".to_owned()),
+                "「译文”".to_owned(),
+                || Ok::<_, std::convert::Infallible>(()),
+            )
+            .unwrap_or_else(|never| match never {});
+        let normalizer = JapaneseQuoteNormalizer::new(
+            JapaneseQuoteRepairPolicy::new(vec![QuotePair::new('“', '”')]).unwrap(),
+        );
+
+        let candidate = build_write_back_candidate_with_cancellation(
+            &stored,
+            &live,
+            &translations,
+            Some(&normalizer),
+            &CooperativeCancellation::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::str::from_utf8(candidate.files()[0].bytes()).unwrap(),
+            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"「译文」\"}]}\n"
         );
     }
 

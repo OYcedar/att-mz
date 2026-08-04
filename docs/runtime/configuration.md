@@ -70,7 +70,8 @@ quote_repair_pairs = [["“", "”"], ["‘", "’"]]
 ```
 
 每种语言类型只接受自己声明的字段。Translate 校验全部定义，再精确选择项目源语言
-模块。完整语义见[语言规格](../translation/language.md)。
+模块；WriteBack 另外读取同一语言表中的 `id`、`type` 和 `quote_repair_pairs`，建立写回
+文本规范化器，不消费 Prompt、残留阈值或模型 Profile。完整语义见[语言规格](../translation/language.md)。
 
 ## 4. LLM Client
 

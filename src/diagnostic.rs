@@ -25,10 +25,10 @@ pub(crate) use generic_issue::{
     GenericDiagnosticStage, GenericIssue, GenericJsonErrorCategory, GenericJsonlLocation,
     GenericLanguageProjectionProblem, GenericLanguageViolation, GenericPlaceholderMultisetProblem,
     GenericProblem, GenericProjectDatabaseProblem, GenericProjectTranslationProblem,
-    GenericRepairApplicationProblem, GenericResourceKind, GenericResponseDestinationProblem,
-    GenericResponseTextProblem, GenericResponseValueProblem, GenericTaskResponseJsonCategory,
-    GenericTaskResponseProblem, GenericTaskUnavailableReason, GenericTextViolation,
-    GenericTranslationPreparationProblem, GenericWriteBackSnapshotProblem,
+    GenericResourceKind, GenericResponseDestinationProblem, GenericResponseTextProblem,
+    GenericResponseValueProblem, GenericTaskResponseJsonCategory, GenericTaskResponseProblem,
+    GenericTaskUnavailableReason, GenericTextViolation, GenericTranslationPreparationProblem,
+    GenericWriteBackSnapshotProblem,
 };
 pub(crate) use issue::{
     ConfigurationIssue, DiagnosticIssue, GenericUnitLocator, IoFailure, Pcre2Failure,

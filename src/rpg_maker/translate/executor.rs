@@ -1827,9 +1827,6 @@ fn accept_translation_lines_candidate_at_with_cancellation(
         Err(TranslationCandidateValidationError::LanguageProjection(source)) => Ok(Err(
             TranslationCandidateTechnicalError::LanguageProjection(source),
         )),
-        Err(TranslationCandidateValidationError::LanguageRepair(source)) => Ok(Err(
-            TranslationCandidateTechnicalError::LanguageRepair(source),
-        )),
         Err(TranslationCandidateValidationError::InternalInvariant { invariant }) => {
             Ok(Err(TranslationCandidateTechnicalError::InternalInvariant {
                 invariant,
@@ -2337,38 +2334,12 @@ fn validate_and_restore_translation_lines_at_with_cancellation(
             },
         )));
     }
-    let repair = {
-        let mut language_check =
-            || ensure_running().map_err(|ResponseProcessingCancelled| LanguageOperationCancelled);
-        match language_module.plan_translation_repair_with_cancellation(
-            language_analysis,
-            &normalized,
-            &mut language_check,
-        ) {
-            Ok(Ok(repair)) => repair,
-            Ok(Err(source)) => {
-                return Ok(Err(TranslationCandidateValidationError::LanguageModule(
-                    source,
-                )));
-            }
-            Err(LanguageOperationCancelled) => return Err(ResponseProcessingCancelled),
-        }
-    };
-    let repaired = match normalized.apply_repair_with_cancellation(&repair, &mut ensure_running)? {
-        Ok(repaired) => repaired,
-        Err(source) => {
-            return Ok(Err(TranslationCandidateValidationError::LanguageRepair(
-                source,
-            )));
-        }
-    };
-
     let mut restored = Vec::with_capacity(lines.len());
     let mut segment_offset = 0;
     for (line_index, projection) in line_projections.iter().enumerate() {
         let segment_count = projection.language_text().segments().len();
         let line_end = segment_offset + segment_count;
-        let Some(repaired_segments) = repaired.segments().get(segment_offset..line_end) else {
+        let Some(repaired_segments) = normalized.segments().get(segment_offset..line_end) else {
             return Ok(Err(
                 TranslationCandidateValidationError::InternalInvariant {
                     invariant: TranslationInternalInvariant::RepairSegmentRangeMissing {
@@ -2376,7 +2347,7 @@ fn validate_and_restore_translation_lines_at_with_cancellation(
                         line_index,
                         start: segment_offset,
                         end: line_end,
-                        actual: repaired.segments().len(),
+                        actual: normalized.segments().len(),
                     },
                 },
             ));
@@ -2406,7 +2377,7 @@ fn validate_and_restore_translation_lines_at_with_cancellation(
         segment_offset = line_end;
         if line_index + 1 < lines.len() {
             if !matches!(
-                repaired.segments().get(segment_offset),
+                normalized.segments().get(segment_offset),
                 Some(LanguageTextSegment::OpaqueBoundary)
             ) {
                 return Ok(Err(
@@ -2415,7 +2386,7 @@ fn validate_and_restore_translation_lines_at_with_cancellation(
                             location: invariant_location,
                             line_index,
                             segment_index: segment_offset,
-                            actual: repaired.segments().len(),
+                            actual: normalized.segments().len(),
                         },
                     },
                 ));
@@ -2423,13 +2394,13 @@ fn validate_and_restore_translation_lines_at_with_cancellation(
             segment_offset += 1;
         }
     }
-    if segment_offset != repaired.segments().len() {
+    if segment_offset != normalized.segments().len() {
         return Ok(Err(
             TranslationCandidateValidationError::InternalInvariant {
                 invariant: TranslationInternalInvariant::RepairUnassignedSegments {
                     location: invariant_location,
                     consumed: segment_offset,
-                    actual: repaired.segments().len(),
+                    actual: normalized.segments().len(),
                 },
             },
         ));
@@ -2521,14 +2492,8 @@ fn validate_and_restore_translation_at(
             },
         ));
     }
-    let repair = language_module
-        .plan_translation_repair(language_analysis, &normalized)
-        .map_err(TranslationCandidateValidationError::LanguageModule)?;
-    let repaired = normalized
-        .apply_repair(&repair)
-        .map_err(TranslationCandidateValidationError::LanguageRepair)?;
     let restored = placeholder_bindings
-        .rebuild_original(&projected, &repaired)
+        .rebuild_original(&projected, &normalized)
         .map_err(TranslationCandidateValidationError::LanguageProjection)?;
     if placeholder_token::contains_reserved_prefix(&restored) {
         return Err(TranslationCandidateValidationError::InternalInvariant {
@@ -2585,9 +2550,6 @@ pub(super) fn accept_prepared_translation_candidate(
         Err(TranslationCandidateValidationError::LanguageProjection(source)) => Err(
             TranslationCandidateTechnicalError::LanguageProjection(source),
         ),
-        Err(TranslationCandidateValidationError::LanguageRepair(source)) => {
-            Err(TranslationCandidateTechnicalError::LanguageRepair(source))
-        }
         Err(TranslationCandidateValidationError::InternalInvariant { invariant }) => {
             Err(TranslationCandidateTechnicalError::InternalInvariant { invariant })
         }
@@ -2745,7 +2707,6 @@ enum TranslationCandidateValidationError {
     Rejected(TranslationUnitRejectionReason),
     LanguageModule(LanguageModuleError),
     LanguageProjection(LanguageTextProjectionError),
-    LanguageRepair(LanguageRepairApplicationError),
     InternalInvariant {
         invariant: TranslationInternalInvariant,
     },
@@ -5060,7 +5021,7 @@ mod tests {
     }
 
     #[test]
-    fn language_repair_rebuilds_tokens_in_source_order() {
+    fn translation_acceptance_preserves_quote_style_and_rebuilds_tokens_in_source_order() {
         let first = AppliedPlaceholder::new(
             "⟦ATT_FIRST_WHOLE_0000⟧",
             "<FIRST_ORIGINAL>",
@@ -5087,11 +5048,11 @@ mod tests {
             &analysis,
             module.as_ref(),
         )
-        .expect("唯一引号结构应修复，并保持源 token 顺序");
+        .expect("合格译文应保持原样，并恢复源 token 顺序");
 
         assert_eq!(
             restored,
-            "他说：「甲<FIRST_ORIGINAL>乙『<SECOND_ORIGINAL>』丙。」"
+            "他说：“甲<FIRST_ORIGINAL>乙‘<SECOND_ORIGINAL>’丙。”"
         );
     }
 

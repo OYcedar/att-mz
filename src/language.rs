@@ -1,4 +1,4 @@
-//! 跨游戏引擎共享的语言分析、源文残留检查与可选安全修复。
+//! 跨游戏引擎共享的语言分析、源文残留检查与写回文本规范化。
 //!
 //! 本模块只理解自然语言文本和不透明边界，不依赖游戏引擎位置、数据库、CLI、
 //! 占位符协议、LLM 或运行时根能力。
@@ -523,7 +523,6 @@ impl LanguageRepairPlan {
         &self.replacements
     }
 
-    #[cfg(test)]
     pub(crate) fn is_unchanged(&self) -> bool {
         self.replacements.is_empty()
     }
@@ -653,7 +652,7 @@ impl LanguageAnalysis {
     }
 }
 
-/// 一个语言模块只拥有译前判断、源文残留和可选安全修复三项职责。
+/// Translate 使用的源语言策略。
 pub(crate) trait LanguageModule: Send + Sync {
     /// 返回仅由当前语言策略决定的稳定语义指纹。
     fn semantic_fingerprint(&self) -> Sha256Fingerprint;
@@ -676,6 +675,7 @@ pub(crate) trait LanguageModule: Send + Sync {
         translation: &LanguageText,
     ) -> Result<Option<LanguageResidual>, LanguageModuleError>;
 
+    #[cfg(test)]
     fn plan_translation_repair(
         &self,
         analysis: &LanguageAnalysis,
@@ -705,19 +705,84 @@ pub(crate) trait LanguageModule: Send + Sync {
         ensure_running()?;
         Ok(residual)
     }
+}
 
-    fn plan_translation_repair_with_cancellation(
+/// WriteBack 在发布候选前执行的自然语言文本规范化。
+///
+/// 规范化只能在能够唯一证明修改安全时改变译文；无法判断时必须原样返回。
+pub(crate) trait LanguageTextNormalizer: Send + Sync {
+    fn normalize(&self, source: &str, translation: &str) -> String;
+
+    fn normalize_with_cancellation(
         &self,
-        analysis: &LanguageAnalysis,
-        translation: &LanguageText,
+        source: &str,
+        translation: &str,
         ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
-    ) -> Result<Result<LanguageRepairPlan, LanguageModuleError>, LanguageOperationCancelled> {
+    ) -> Result<String, LanguageOperationCancelled> {
         ensure_running()?;
-        let repair = self.plan_translation_repair(analysis, translation);
+        let normalized = self.normalize(source, translation);
         ensure_running()?;
-        Ok(repair)
+        Ok(normalized)
     }
 }
+
+/// 精确源语言 ID 到 WriteBack 文本规范化器的可选绑定集合。
+#[derive(Clone, Default)]
+pub(crate) struct LanguageTextNormalizerCatalog {
+    normalizers: BTreeMap<LanguageId, Arc<dyn LanguageTextNormalizer>>,
+}
+
+impl LanguageTextNormalizerCatalog {
+    pub(crate) fn new(
+        bindings: impl IntoIterator<Item = (LanguageId, Arc<dyn LanguageTextNormalizer>)>,
+    ) -> Result<Self, LanguageTextNormalizerCatalogBuildError> {
+        let mut normalizers = BTreeMap::new();
+        for (language_id, normalizer) in bindings {
+            if normalizers
+                .insert(language_id.clone(), normalizer)
+                .is_some()
+            {
+                return Err(
+                    LanguageTextNormalizerCatalogBuildError::DuplicateLanguageId { language_id },
+                );
+            }
+        }
+        Ok(Self { normalizers })
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        language_id: &LanguageId,
+    ) -> Option<Arc<dyn LanguageTextNormalizer>> {
+        self.normalizers.get(language_id).cloned()
+    }
+}
+
+impl fmt::Debug for LanguageTextNormalizerCatalog {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LanguageTextNormalizerCatalog")
+            .field("language_ids", &self.normalizers.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LanguageTextNormalizerCatalogBuildError {
+    DuplicateLanguageId { language_id: LanguageId },
+}
+
+impl fmt::Display for LanguageTextNormalizerCatalogBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateLanguageId { language_id } => {
+                write!(formatter, "写回文本规范化器的源语言 ID 重复：{language_id}")
+            }
+        }
+    }
+}
+
+impl Error for LanguageTextNormalizerCatalogBuildError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LanguageOperationCancelled;
@@ -956,6 +1021,115 @@ impl JapaneseQuoteRepairPolicy {
         ensure_running()?;
         Ok(pairs)
     }
+
+    fn contains_quote_character_with_cancellation<E>(
+        &self,
+        text: &str,
+        ensure_running: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        for (index, character) in text.chars().enumerate() {
+            if index % 256 == 0 {
+                ensure_running()?;
+            }
+            if JAPANESE_QUOTE_PAIRS
+                .iter()
+                .chain(self.candidate_pairs.iter())
+                .any(|pair| pair.opening() == character || pair.closing() == character)
+            {
+                return Ok(true);
+            }
+        }
+        ensure_running()?;
+        Ok(false)
+    }
+}
+
+/// 依据日文原文已经确认的引号拓扑规范化写回译文。
+#[derive(Clone, Debug)]
+pub(crate) struct JapaneseQuoteNormalizer {
+    policy: JapaneseQuoteRepairPolicy,
+}
+
+impl JapaneseQuoteNormalizer {
+    pub(crate) const fn new(policy: JapaneseQuoteRepairPolicy) -> Self {
+        Self { policy }
+    }
+
+    fn normalize_with_check<E>(
+        &self,
+        source: &str,
+        translation: &str,
+        mut ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<String, E> {
+        ensure_running()?;
+        if !self
+            .policy
+            .contains_quote_character_with_cancellation(source, &mut ensure_running)?
+            && !self
+                .policy
+                .contains_quote_character_with_cancellation(translation, &mut ensure_running)?
+        {
+            return clone_language_text_with_cancellation(translation, &mut ensure_running);
+        }
+        let source = LanguageText::new_with_cancellation(
+            vec![LanguageTextSegment::NaturalText(
+                clone_language_text_with_cancellation(source, &mut ensure_running)?,
+            )],
+            &mut ensure_running,
+        )?;
+        let translation_text = LanguageText::new_with_cancellation(
+            vec![LanguageTextSegment::NaturalText(
+                clone_language_text_with_cancellation(translation, &mut ensure_running)?,
+            )],
+            &mut ensure_running,
+        )?;
+        let Some(source_nodes) =
+            parse_japanese_quote_nodes_with_cancellation(&source, &mut ensure_running)?
+        else {
+            return clone_language_text_with_cancellation(translation, &mut ensure_running);
+        };
+        let plan = plan_japanese_quote_repair_with_cancellation(
+            &self.policy,
+            &source_nodes,
+            &translation_text,
+            &mut ensure_running,
+        )?;
+        if plan.is_unchanged() {
+            return clone_language_text_with_cancellation(translation, &mut ensure_running);
+        }
+        let repaired =
+            match translation_text.apply_repair_with_cancellation(&plan, &mut ensure_running)? {
+                Ok(repaired) => repaired,
+                Err(_) => {
+                    return clone_language_text_with_cancellation(translation, &mut ensure_running);
+                }
+            };
+        match repaired.segments() {
+            [LanguageTextSegment::NaturalText(text)] => {
+                clone_language_text_with_cancellation(text, &mut ensure_running)
+            }
+            [] if translation.is_empty() => Ok(String::new()),
+            _ => clone_language_text_with_cancellation(translation, &mut ensure_running),
+        }
+    }
+}
+
+impl LanguageTextNormalizer for JapaneseQuoteNormalizer {
+    fn normalize(&self, source: &str, translation: &str) -> String {
+        match self.normalize_with_check(source, translation, || Ok::<_, Infallible>(())) {
+            Ok(normalized) => normalized,
+            Err(unreachable) => match unreachable {},
+        }
+    }
+
+    fn normalize_with_cancellation(
+        &self,
+        source: &str,
+        translation: &str,
+        ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
+    ) -> Result<String, LanguageOperationCancelled> {
+        self.normalize_with_check(source, translation, ensure_running)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1082,24 +1256,8 @@ impl JapaneseLanguageModule {
                 }
             }
         }
-        let quote_structure = match parse_quote_structure_with_cancellation(
-            text,
-            &JAPANESE_QUOTE_PAIRS,
-            &mut ensure_running,
-        )? {
-            Some(nodes) => {
-                let mut structure = Vec::with_capacity(nodes.len());
-                for node in nodes {
-                    ensure_running()?;
-                    structure.push(JapaneseQuoteNode {
-                        pair: node.pair,
-                        parent: node.parent,
-                    });
-                }
-                Some(structure)
-            }
-            None => None,
-        };
+        let quote_structure =
+            parse_japanese_quote_nodes_with_cancellation(text, &mut ensure_running)?;
         ensure_running()?;
         Ok(LanguageAnalysis::Japanese(JapaneseLanguageAnalysis {
             needs_translation,
@@ -1135,6 +1293,7 @@ impl JapaneseLanguageModule {
         Ok(Ok(None))
     }
 
+    #[cfg(test)]
     fn plan_translation_repair_with_check<E>(
         &self,
         analysis: &LanguageAnalysis,
@@ -1154,43 +1313,12 @@ impl JapaneseLanguageModule {
             ensure_running()?;
             return Ok(Ok(LanguageRepairPlan::unchanged()));
         };
-        if source_nodes.is_empty() {
-            ensure_running()?;
-            return Ok(Ok(LanguageRepairPlan::unchanged()));
-        }
-        let pairs = policy.all_pairs_with_cancellation(&mut ensure_running)?;
-        let Some(target_nodes) = match_quote_structure_with_cancellation(
-            translation,
-            &pairs,
+        Ok(Ok(plan_japanese_quote_repair_with_cancellation(
+            policy,
             source_nodes,
+            translation,
             &mut ensure_running,
-        )?
-        else {
-            return Ok(Ok(LanguageRepairPlan::unchanged()));
-        };
-
-        let mut replacements = Vec::new();
-        for (source, target) in source_nodes.iter().zip(target_nodes) {
-            ensure_running()?;
-            if target.pair.opening() != source.pair.opening() {
-                replacements.push(LanguageCharacterReplacement::new(
-                    target.opening.segment_index,
-                    target.opening.byte_offset,
-                    target.pair.opening(),
-                    source.pair.opening(),
-                ));
-            }
-            if target.pair.closing() != source.pair.closing() {
-                replacements.push(LanguageCharacterReplacement::new(
-                    target.closing.segment_index,
-                    target.closing.byte_offset,
-                    target.pair.closing(),
-                    source.pair.closing(),
-                ));
-            }
-        }
-        ensure_running()?;
-        Ok(Ok(LanguageRepairPlan::replacing(replacements)))
+        )?))
     }
 }
 
@@ -1204,6 +1332,76 @@ pub(crate) struct JapaneseLanguageAnalysis {
 struct JapaneseQuoteNode {
     pair: QuotePair,
     parent: Option<usize>,
+}
+
+fn parse_japanese_quote_nodes_with_cancellation<E>(
+    text: &LanguageText,
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<Option<Vec<JapaneseQuoteNode>>, E> {
+    let Some(nodes) =
+        parse_quote_structure_with_cancellation(text, &JAPANESE_QUOTE_PAIRS, &mut ensure_running)?
+    else {
+        return Ok(None);
+    };
+    let mut structure = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        ensure_running()?;
+        structure.push(JapaneseQuoteNode {
+            pair: node.pair,
+            parent: node.parent,
+        });
+    }
+    ensure_running()?;
+    Ok(Some(structure))
+}
+
+fn plan_japanese_quote_repair_with_cancellation<E>(
+    policy: &JapaneseQuoteRepairPolicy,
+    source_nodes: &[JapaneseQuoteNode],
+    translation: &LanguageText,
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<LanguageRepairPlan, E> {
+    if source_nodes.is_empty() {
+        ensure_running()?;
+        return Ok(LanguageRepairPlan::unchanged());
+    }
+    let pairs = policy.all_pairs_with_cancellation(&mut ensure_running)?;
+    let Some(target_nodes) = match_quote_structure_with_cancellation(
+        translation,
+        &pairs,
+        source_nodes,
+        &mut ensure_running,
+    )?
+    else {
+        return Ok(LanguageRepairPlan::unchanged());
+    };
+
+    let mut replacements = Vec::new();
+    for (source, target) in source_nodes.iter().zip(target_nodes) {
+        ensure_running()?;
+        if target.opening_character != source.pair.opening() {
+            replacements.push(LanguageCharacterReplacement::new(
+                target.opening.segment_index,
+                target.opening.byte_offset,
+                target.opening_character,
+                source.pair.opening(),
+            ));
+        }
+        let closing_character = target
+            .closing_character
+            .expect("匹配引号节点必须拥有闭引号字符");
+        if closing_character != source.pair.closing() {
+            let closing = target.closing.expect("匹配引号节点必须拥有闭引号位置");
+            replacements.push(LanguageCharacterReplacement::new(
+                closing.segment_index,
+                closing.byte_offset,
+                closing_character,
+                source.pair.closing(),
+            ));
+        }
+    }
+    ensure_running()?;
+    Ok(LanguageRepairPlan::replacing(replacements))
 }
 
 impl LanguageModule for JapaneseLanguageModule {
@@ -1243,6 +1441,7 @@ impl LanguageModule for JapaneseLanguageModule {
         }
     }
 
+    #[cfg(test)]
     fn plan_translation_repair(
         &self,
         analysis: &LanguageAnalysis,
@@ -1272,15 +1471,6 @@ impl LanguageModule for JapaneseLanguageModule {
     ) -> Result<Result<Option<LanguageResidual>, LanguageModuleError>, LanguageOperationCancelled>
     {
         self.find_source_residual_with_check(analysis, translation, ensure_running)
-    }
-
-    fn plan_translation_repair_with_cancellation(
-        &self,
-        analysis: &LanguageAnalysis,
-        translation: &LanguageText,
-        ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
-    ) -> Result<Result<LanguageRepairPlan, LanguageModuleError>, LanguageOperationCancelled> {
-        self.plan_translation_repair_with_check(analysis, translation, ensure_running)
     }
 }
 
@@ -1464,6 +1654,7 @@ impl EnglishLanguageModule {
         Ok(Ok(None))
     }
 
+    #[cfg(test)]
     fn plan_translation_repair_with_check<E>(
         &self,
         analysis: &LanguageAnalysis,
@@ -1524,6 +1715,7 @@ impl LanguageModule for EnglishLanguageModule {
         }
     }
 
+    #[cfg(test)]
     fn plan_translation_repair(
         &self,
         analysis: &LanguageAnalysis,
@@ -1551,15 +1743,6 @@ impl LanguageModule for EnglishLanguageModule {
     ) -> Result<Result<Option<LanguageResidual>, LanguageModuleError>, LanguageOperationCancelled>
     {
         self.find_source_residual_with_check(analysis, translation, ensure_running)
-    }
-
-    fn plan_translation_repair_with_cancellation(
-        &self,
-        analysis: &LanguageAnalysis,
-        _translation: &LanguageText,
-        ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
-    ) -> Result<Result<LanguageRepairPlan, LanguageModuleError>, LanguageOperationCancelled> {
-        self.plan_translation_repair_with_check(analysis, ensure_running)
     }
 }
 
@@ -1943,15 +2126,20 @@ struct LanguageCharacterPosition {
 struct ParsedQuoteNode {
     pair: QuotePair,
     parent: Option<usize>,
-    opening: LanguageCharacterPosition,
-    closing: LanguageCharacterPosition,
 }
 
 struct PendingQuoteNode {
     pair: QuotePair,
     parent: Option<usize>,
+    closed: bool,
+}
+
+struct MatchedQuoteNode {
+    parent: Option<usize>,
     opening: LanguageCharacterPosition,
+    opening_character: char,
     closing: Option<LanguageCharacterPosition>,
+    closing_character: Option<char>,
 }
 
 fn parse_quote_structure_with_cancellation<E>(
@@ -1965,7 +2153,7 @@ fn parse_quote_structure_with_cancellation<E>(
 
     let mut nodes = Vec::<PendingQuoteNode>::new();
     let mut stack = Vec::<usize>::new();
-    for (segment_index, segment) in text.segments().iter().enumerate() {
+    for (_segment_index, segment) in text.segments().iter().enumerate() {
         ensure_running()?;
         let LanguageTextSegment::NaturalText(text) = segment else {
             continue;
@@ -1977,10 +2165,6 @@ fn parse_quote_structure_with_cancellation<E>(
                 continue;
             };
             let pair = pairs[pair_index];
-            let position = LanguageCharacterPosition {
-                segment_index,
-                byte_offset,
-            };
             let should_close = match role {
                 QuoteCharacterRole::Closing => true,
                 QuoteCharacterRole::Opening => false,
@@ -1995,14 +2179,13 @@ fn parse_quote_structure_with_cancellation<E>(
                 if nodes[node_index].pair != pair {
                     return Ok(None);
                 }
-                nodes[node_index].closing = Some(position);
+                nodes[node_index].closed = true;
             } else {
                 let node_index = nodes.len();
                 nodes.push(PendingQuoteNode {
                     pair,
                     parent: stack.last().copied(),
-                    opening: position,
-                    closing: None,
+                    closed: false,
                 });
                 stack.push(node_index);
             }
@@ -2014,14 +2197,12 @@ fn parse_quote_structure_with_cancellation<E>(
     let mut parsed = Vec::with_capacity(nodes.len());
     for node in nodes {
         ensure_running()?;
-        let Some(closing) = node.closing else {
+        if !node.closed {
             return Ok(None);
-        };
+        }
         parsed.push(ParsedQuoteNode {
             pair: node.pair,
             parent: node.parent,
-            opening: node.opening,
-            closing,
         });
     }
     ensure_running()?;
@@ -2038,7 +2219,7 @@ fn match_quote_structure_with_cancellation<E>(
     pairs: &[QuotePair],
     source_nodes: &[JapaneseQuoteNode],
     mut ensure_running: impl FnMut() -> Result<(), E>,
-) -> Result<Option<Vec<ParsedQuoteNode>>, E> {
+) -> Result<Option<Vec<MatchedQuoteNode>>, E> {
     let Some(roles) = quote_roles_with_cancellation(pairs, &mut ensure_running)? else {
         return Ok(None);
     };
@@ -2054,11 +2235,11 @@ fn match_quote_structure_with_cancellation<E>(
         let mut next_check = 0_usize;
         for (byte_offset, character) in text.char_indices() {
             ensure_language_text_progress(byte_offset, &mut next_check, &mut ensure_running)?;
-            let Some(&(pair_index, role)) = roles.get(&character) else {
+            let Some(&(_, role)) = roles.get(&character) else {
                 continue;
             };
             occurrences.push((
-                pairs[pair_index],
+                character,
                 role,
                 LanguageCharacterPosition {
                     segment_index,
@@ -2070,45 +2251,53 @@ fn match_quote_structure_with_cancellation<E>(
     if occurrences.len() != events.len() {
         return Ok(None);
     }
+    let allow_reversed_single_pair = source_nodes.len() == 1
+        && matches!(
+            occurrences.as_slice(),
+            [
+                (_, QuoteCharacterRole::Closing, _),
+                (_, QuoteCharacterRole::Opening, _)
+            ]
+        );
 
     let mut matched = Vec::with_capacity(source_nodes.len());
-    let mut target_pairs = Vec::with_capacity(source_nodes.len());
     for node in source_nodes {
         ensure_running()?;
-        matched.push(PendingQuoteNode {
-            pair: node.pair,
+        matched.push(MatchedQuoteNode {
             parent: node.parent,
             opening: LanguageCharacterPosition {
                 segment_index: usize::MAX,
                 byte_offset: usize::MAX,
             },
+            opening_character: '\0',
             closing: None,
+            closing_character: None,
         });
-        target_pairs.push(None);
     }
-    for (event, (pair, role, position)) in events.into_iter().zip(occurrences) {
+    for (event, (character, role, position)) in events.into_iter().zip(occurrences) {
         ensure_running()?;
         match event {
             QuoteEvent::Open(node_index) => {
                 if !matches!(
                     role,
                     QuoteCharacterRole::Opening | QuoteCharacterRole::Symmetric
-                ) {
+                ) && !(allow_reversed_single_pair && matches!(role, QuoteCharacterRole::Closing))
+                {
                     return Ok(None);
                 }
-                target_pairs[node_index] = Some(pair);
-                matched[node_index].pair = pair;
                 matched[node_index].opening = position;
+                matched[node_index].opening_character = character;
             }
             QuoteEvent::Close(node_index) => {
                 if !matches!(
                     role,
                     QuoteCharacterRole::Closing | QuoteCharacterRole::Symmetric
-                ) || target_pairs[node_index] != Some(pair)
+                ) && !(allow_reversed_single_pair && matches!(role, QuoteCharacterRole::Opening))
                 {
                     return Ok(None);
                 }
                 matched[node_index].closing = Some(position);
+                matched[node_index].closing_character = Some(character);
             }
         }
     }
@@ -2119,11 +2308,15 @@ fn match_quote_structure_with_cancellation<E>(
         let Some(closing) = node.closing else {
             return Ok(None);
         };
-        parsed.push(ParsedQuoteNode {
-            pair: node.pair,
+        let Some(closing_character) = node.closing_character else {
+            return Ok(None);
+        };
+        parsed.push(MatchedQuoteNode {
             parent: node.parent,
             opening: node.opening,
-            closing,
+            opening_character: node.opening_character,
+            closing: Some(closing),
+            closing_character: Some(closing_character),
         });
     }
     ensure_running()?;
@@ -2480,6 +2673,17 @@ mod tests {
         )
     }
 
+    fn japanese_quote_normalizer() -> JapaneseQuoteNormalizer {
+        JapaneseQuoteNormalizer::new(
+            JapaneseQuoteRepairPolicy::new(vec![
+                QuotePair::new('“', '”'),
+                QuotePair::new('‘', '’'),
+                QuotePair::new('"', '"'),
+            ])
+            .expect("日文引号策略有效"),
+        )
+    }
+
     fn english_module() -> EnglishLanguageModule {
         EnglishLanguageModule::new(
             EnglishTranslationDetectionPolicy::new(non_zero(2), non_zero(8), ["HP".to_owned()])
@@ -2803,6 +3007,31 @@ mod tests {
             .expect("分析类型一致");
 
         assert!(plan.is_unchanged());
+    }
+
+    #[test]
+    fn write_back_normalizer_repairs_mixed_and_reversed_quote_delimiters() {
+        let normalizer = japanese_quote_normalizer();
+
+        assert_eq!(
+            normalizer.normalize(
+                "「せっかくだ。\n弟子を育てるのも悪くはないだろう」",
+                "「难得的机会。\n培养个弟子也不错吧。”",
+            ),
+            "「难得的机会。\n培养个弟子也不错吧。」"
+        );
+        assert_eq!(normalizer.normalize("「勇者」", "”勇者“"), "「勇者」");
+    }
+
+    #[test]
+    fn write_back_normalizer_does_not_force_changed_or_incomplete_topology() {
+        let normalizer = japanese_quote_normalizer();
+
+        assert_eq!(
+            normalizer.normalize("「これは『勇者』だ」", "“勇者”与“魔王”"),
+            "“勇者”与“魔王”"
+        );
+        assert_eq!(normalizer.normalize("「勇者", "“勇者”"), "“勇者”");
     }
 
     #[test]

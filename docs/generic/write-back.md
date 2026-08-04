@@ -24,6 +24,10 @@ att generic write-back --name NAME
 
 Partial 项目允许写回。结果明确报告使用译文的 Unit 数与保留原文的 Unit 数。
 
+候选写入前按项目源语言执行共享文本规范化。日文 `quote_repair_pairs` 可修复译文中与
+源文拓扑一致但开闭符号混用或单一成对符号写反的情况；无法唯一证明安全时保持原文，
+不把引号差异重新变成 Translate 验收错误。
+
 ## 2. 验证与发布
 
 WriteBack 启动时确认外部输入与最近 Extract 一致，先在候选目录生成全部文件，再使用生产
