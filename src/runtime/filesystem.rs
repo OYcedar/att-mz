@@ -6875,6 +6875,10 @@ mod tests {
         fs::create_dir(&scripts).expect("应该可建立脚本目录");
         fs::write(&outside, b"outside").expect("应该可建立树外目标");
         let link = assets.join("linked.json");
+        let expected_link = assets
+            .canonicalize()
+            .expect("应该可规范化无 reparse 的资源根")
+            .join("linked.json");
         if let Err(error) = std::os::windows::fs::symlink_file(&outside, &link) {
             if symlink_unavailable(&error) {
                 return;
@@ -6887,15 +6891,21 @@ mod tests {
             .fingerprint_directory_tree(tree_fingerprint_request(&assets, &scripts))
             .await
             .expect_err("目录树指纹必须拒绝最终分量 reparse point");
-        assert!(matches!(
-            error,
-            DirectoryTreeFingerprintError::Failed { source, .. }
-                if matches!(
-                    source.as_ref(),
-                    SystemFileSystemError::Windows(WindowsFsError::ReparsePoint { path })
-                        if path == &link
-                )
-        ));
+        match error {
+            DirectoryTreeFingerprintError::Failed { path, source } => match *source {
+                SystemFileSystemError::Windows(WindowsFsError::ReparsePoint {
+                    path: reparse_path,
+                }) => {
+                    assert_eq!(path, expected_link, "外层错误必须指向被拒绝的目录项");
+                    assert_eq!(
+                        reparse_path, expected_link,
+                        "Windows 错误必须指向被拒绝的 reparse point"
+                    );
+                }
+                other => panic!("预期 Windows reparse point 错误，实际来源：{other:?}"),
+            },
+            other => panic!("预期目录树指纹失败，实际：{other:?}"),
+        }
         assert_eq!(fs::read(&outside).expect("树外目标仍应可读取"), b"outside");
 
         root.shutdown().await.expect("文件系统根应该可终结");

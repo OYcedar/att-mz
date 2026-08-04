@@ -3809,6 +3809,7 @@ fn write_terminal_sequence(
 #[cfg(test)]
 mod tests {
     use std::sync::Condvar;
+    use std::time::{Duration, Instant};
 
     use super::*;
     use crate::diagnostic::{
@@ -5027,7 +5028,7 @@ mod tests {
     }
 
     #[test]
-    fn first_write_failure_immediately_drains_queued_best_effort_events() {
+    fn first_write_failure_drains_queued_best_effort_events_before_finish() {
         let sink = GateFailAfterFirstSink::default();
         let encode_calls = Arc::new(AtomicUsize::new(0));
         let runtime = runtime_with_components(
@@ -5049,40 +5050,47 @@ mod tests {
             })
             .expect("触发首个 write 失败的必要事件必须入队");
         for _ in 0..32 {
-            logger
-                .emit(ProjectLogEvent::RetrySummary {
-                    attempted: 1,
-                    recovered: 1,
-                    exhausted: 0,
-                })
-                .expect("排空前的 BestEffort 事件必须入队");
-        }
-        sink.release();
-        for _ in 0..100_000 {
-            if logger.health().count(&ProjectLogFailureKey::Write {
-                path: None,
-                code: ProjectLogCode::LuaSummary,
-                io_kind: SafeIoKind::PermissionDenied,
-                raw_os_code: Some(5),
-            }) == 1
-            {
-                break;
-            }
-            thread::yield_now();
+            assert_eq!(
+                logger
+                    .emit(ProjectLogEvent::RetrySummary {
+                        attempted: 1,
+                        recovered: 1,
+                        exhausted: 0,
+                    })
+                    .expect("排空前的 BestEffort 事件必须能入队"),
+                EmitDisposition::Accepted
+            );
         }
         assert_eq!(
-            logger.health().count(&ProjectLogFailureKey::Write {
-                path: None,
-                code: ProjectLogCode::LuaSummary,
-                io_kind: SafeIoKind::PermissionDenied,
-                raw_os_code: Some(5),
-            }),
-            1
+            logger.inner.permits.in_flight.load(Ordering::Acquire),
+            32,
+            "测试必须先确认所有待排空事件都持有 permit"
         );
+        sink.release();
+        let write_failure = ProjectLogFailureKey::Write {
+            path: None,
+            code: ProjectLogCode::LuaSummary,
+            io_kind: SafeIoKind::PermissionDenied,
+            raw_os_code: Some(5),
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let failure_count = logger.health().count(&write_failure);
+            let permits_in_flight = logger.inner.permits.in_flight.load(Ordering::Acquire);
+            if failure_count == 1 && permits_in_flight == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "等待 write 失败排空队列超时：failure_count={failure_count}, permits_in_flight={permits_in_flight}"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(logger.health().count(&write_failure), 1);
         assert_eq!(
             logger.inner.permits.in_flight.load(Ordering::Acquire),
             0,
-            "首个 write 失败必须立即释放已排空 BestEffort 的 permit"
+            "首个 write 失败必须在业务收尾前释放已排空 BestEffort 的 permit"
         );
         let shutdown = runtime
             .finish(RunFinished::Succeeded, Vec::new())
