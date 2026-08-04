@@ -1,6 +1,5 @@
 app-about = Перевод игр и структурированного текста с повторно используемым состоянием проекта
 cli-ui-language-help = Язык справки, диагностики, прогресса, результатов и журналов проекта: ar, zh-Hans, zh-Hant, en, fr, ru, es, ja, ko или vi
-cli-progress-help = Режим текущего прогресса: auto, plain или off
 cli-mz-about = Перевести игру RPG Maker MZ
 cli-mv-about = Перевести игру RPG Maker MV
 cli-generic-about = Перевести структурированный текст JSONL
@@ -34,7 +33,6 @@ cli-print-help = Показать справку
 cli-print-version = Показать версию
 cli-blank-value = Значение не может быть пустым.
 cli-invalid-positive-integer = Значение должно быть положительным целым числом.
-cli-invalid-progress = Режим прогресса { $value } не поддерживается; используйте auto, plain или off.
 cli-invalid-ui-language-argument = --ui-language содержит недопустимый языковой тег: { $value }.
 cli-unsupported-ui-language-argument = --ui-language запрашивает неподдерживаемый язык: { $value }.
 cli-invalid-ui-language-environment = ATT_UI_LANGUAGE содержит недопустимый языковой тег: { $value }.

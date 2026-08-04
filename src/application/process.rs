@@ -9,7 +9,6 @@ use std::sync::Once;
 use windows_sys::Win32::Globalization::{CP_UTF8, GetACP};
 
 use super::arguments::AttArguments;
-use super::arguments::ProgressArgument;
 use super::command::{
     CommandPanicBoundary, CommandResultRenderer, CommandRunResult, ProductionCommandError,
     ProductionCommandRunReport, ProductionRpgMakerCommandRunner, TerminationSignals,
@@ -28,7 +27,6 @@ use crate::diagnostic::{
     RuntimePanicBoundary, StateEffect, render_diagnostic_report,
 };
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
-use crate::progress::ProgressMode;
 
 enum ProductCommandRunReport {
     RpgMaker(ProductionCommandRunReport),
@@ -180,11 +178,6 @@ fn run_after_cli_parsing(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> ExitCode {
-    let progress_mode = match arguments.progress {
-        ProgressArgument::Auto => ProgressMode::Auto,
-        ProgressArgument::Plain => ProgressMode::Plain,
-        ProgressArgument::Off => ProgressMode::Off,
-    };
     let distribution = match DistributionLayout::from_current_executable() {
         Ok(distribution) => distribution,
         Err(error) => return render_distribution_layout_error(localizer, &error, stderr),
@@ -234,13 +227,13 @@ fn run_after_cli_parsing(
         let report = match configuration {
             ConfiguredProductCommand::RpgMaker { layout, command } => {
                 ProductCommandRunReport::RpgMaker(
-                    ProductionRpgMakerCommandRunner::new(layout, locale, progress_mode)
+                    ProductionRpgMakerCommandRunner::new(layout, locale)
                         .run(command, &mut termination_signals)
                         .await,
                 )
             }
             ConfiguredProductCommand::Generic(command) => ProductCommandRunReport::Generic(
-                ProductionGenericCommandRunner::new(locale, progress_mode)
+                ProductionGenericCommandRunner::new(locale)
                     .run(command, &mut termination_signals)
                     .await,
             ),

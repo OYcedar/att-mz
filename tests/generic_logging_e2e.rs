@@ -1067,7 +1067,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<(), String> {
 fn run_att(root: &Path, arguments: &[&str]) -> Output {
     Command::new(stage_att_executable(root))
         .current_dir(root)
-        .args(["--ui-language", "en", "--progress", "off"])
+        .args(["--ui-language", "en"])
         .args(arguments)
         .output()
         .expect("att.exe 应可执行")
@@ -1077,7 +1077,7 @@ fn spawn_att_in_new_process_group(root: &Path, arguments: &[&str]) -> Child {
     let mut command = Command::new(stage_att_executable(root));
     command
         .current_dir(root)
-        .args(["--ui-language", "en", "--progress", "off"])
+        .args(["--ui-language", "en"])
         .args(arguments)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1125,7 +1125,7 @@ fn wait_for_child(mut child: Child, timeout: Duration) -> Result<Output, String>
 fn run_att_with_closed_stderr(root: &Path, arguments: &[&str]) -> Output {
     let mut child = Command::new(stage_att_executable(root))
         .current_dir(root)
-        .args(["--ui-language", "en", "--progress", "off"])
+        .args(["--ui-language", "en"])
         .args(arguments)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

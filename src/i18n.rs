@@ -417,7 +417,6 @@ fn windows_user_preferred_ui_languages() -> Vec<String> {
 pub(crate) enum UiMessage<'a> {
     AppAbout,
     CliUiLanguageHelp,
-    CliProgressHelp,
     CliMzAbout,
     CliMvAbout,
     CliGenericAbout,
@@ -451,9 +450,6 @@ pub(crate) enum UiMessage<'a> {
     CliPrintVersion,
     CliBlankValue,
     CliInvalidPositiveInteger,
-    CliInvalidProgress {
-        value: &'a str,
-    },
     CliInvalidUiLanguageArgument {
         value: &'a str,
     },
@@ -870,7 +866,6 @@ impl UiMessage<'_> {
         match self {
             Self::AppAbout => "app-about",
             Self::CliUiLanguageHelp => "cli-ui-language-help",
-            Self::CliProgressHelp => "cli-progress-help",
             Self::CliMzAbout => "cli-mz-about",
             Self::CliMvAbout => "cli-mv-about",
             Self::CliGenericAbout => "cli-generic-about",
@@ -904,7 +899,6 @@ impl UiMessage<'_> {
             Self::CliPrintVersion => "cli-print-version",
             Self::CliBlankValue => "cli-blank-value",
             Self::CliInvalidPositiveInteger => "cli-invalid-positive-integer",
-            Self::CliInvalidProgress { .. } => "cli-invalid-progress",
             Self::CliInvalidUiLanguageArgument { .. } => "cli-invalid-ui-language-argument",
             Self::CliUnsupportedUiLanguageArgument { .. } => "cli-unsupported-ui-language-argument",
             Self::CliInvalidUiLanguageEnvironment { .. } => "cli-invalid-ui-language-environment",
@@ -1062,8 +1056,7 @@ impl UiMessage<'_> {
     fn arguments(self) -> FluentArgs<'static> {
         let mut arguments = FluentArgs::new();
         match self {
-            Self::CliInvalidProgress { value }
-            | Self::CliInvalidUiLanguageArgument { value }
+            Self::CliInvalidUiLanguageArgument { value }
             | Self::CliUnsupportedUiLanguageArgument { value }
             | Self::CliInvalidUiLanguageEnvironment { value }
             | Self::CliUnsupportedUiLanguageEnvironment { value }
@@ -1453,7 +1446,6 @@ impl UiMessage<'_> {
             }
             Self::AppAbout
             | Self::CliUiLanguageHelp
-            | Self::CliProgressHelp
             | Self::CliMzAbout
             | Self::CliMvAbout
             | Self::CliGenericAbout
@@ -2045,7 +2037,6 @@ mod tests {
         vec![
             UiMessage::AppAbout,
             UiMessage::CliUiLanguageHelp,
-            UiMessage::CliProgressHelp,
             UiMessage::CliMzAbout,
             UiMessage::CliMvAbout,
             UiMessage::CliGenericAbout,
@@ -2079,7 +2070,6 @@ mod tests {
             UiMessage::CliPrintVersion,
             UiMessage::CliBlankValue,
             UiMessage::CliInvalidPositiveInteger,
-            UiMessage::CliInvalidProgress { value: "fast" },
             UiMessage::CliInvalidUiLanguageArgument { value: "bad" },
             UiMessage::CliUnsupportedUiLanguageArgument { value: "de" },
             UiMessage::CliInvalidUiLanguageEnvironment { value: "bad" },
@@ -2089,7 +2079,7 @@ mod tests {
             UiMessage::CliMissingRequiredArgument { value: "--name" },
             UiMessage::CliInvalidValue {
                 value: "bad",
-                argument: "--progress",
+                argument: "--source-language",
             },
             UiMessage::CliErrorHeading,
             UiMessage::CliTryHelp,

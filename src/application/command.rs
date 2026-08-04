@@ -48,8 +48,8 @@ use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage, project_log_value_source_label};
 use crate::language::LanguageModuleCatalogError;
 use crate::progress::{
-    ProgressAmount, ProgressMode, ProgressObserver, ProgressSnapshot, TerminalProgress,
-    TerminalProgressFailures, TerminalProgressObserver,
+    ProgressAmount, ProgressObserver, ProgressSnapshot, TerminalProgress, TerminalProgressFailures,
+    TerminalProgressObserver,
 };
 use crate::project_lease::{
     AlreadyHeldProjectCommandLeaseProvider, ProjectCommandLease, ProjectCommandLeaseError,
@@ -284,17 +284,14 @@ pub(crate) enum RpgMakerCommandOutput {
     },
 }
 
-fn init_terminal_progress(
-    mode: ProgressMode,
-    locale: UiLocale,
-) -> TerminalProgress<InitProgressPhase> {
+fn init_terminal_progress(locale: UiLocale) -> TerminalProgress<InitProgressPhase> {
     let localizer = UiLocalizer::new(locale);
     let checking = localizer.format(UiMessage::ProgressInitCheckProject);
     let scanning = localizer.format(UiMessage::ProgressInitScanSource);
     let preparing = localizer.format(UiMessage::ProgressInitBuildCandidate);
     let updating = localizer.format(UiMessage::ProgressInitConvergeDatabase);
     let publishing = localizer.format(UiMessage::ProgressInitPublish);
-    TerminalProgress::stderr(mode, move |phase| match phase {
+    TerminalProgress::stderr(move |phase| match phase {
         InitProgressPhase::CheckingProject => checking.clone(),
         InitProgressPhase::ScanningSource => scanning.clone(),
         InitProgressPhase::PreparingCandidate => preparing.clone(),
@@ -303,10 +300,7 @@ fn init_terminal_progress(
     })
 }
 
-fn extract_terminal_progress(
-    mode: ProgressMode,
-    locale: UiLocale,
-) -> TerminalProgress<ExtractProgressPhase> {
+fn extract_terminal_progress(locale: UiLocale) -> TerminalProgress<ExtractProgressPhase> {
     let localizer = UiLocalizer::new(locale);
     let builtin = localizer.format(UiMessage::ProgressExtractOwner { owner: "Builtin" });
     let builtin_documents = localizer.format(UiMessage::ProgressExtractDocuments);
@@ -316,7 +310,7 @@ fn extract_terminal_progress(
     let rules_documents = localizer.format(UiMessage::ProgressExtractDocuments);
     let rules_matches = localizer.format(UiMessage::ProgressExtractRules);
     let rules_commit = localizer.format(UiMessage::ProgressExtractCommit);
-    TerminalProgress::stderr(mode, move |phase| match phase {
+    TerminalProgress::stderr(move |phase| match phase {
         ExtractProgressPhase::Builtin => builtin.clone(),
         ExtractProgressPhase::BuiltinDocuments => builtin_documents.clone(),
         ExtractProgressPhase::BuiltinWorkUnits => builtin_work_units.clone(),
@@ -328,33 +322,24 @@ fn extract_terminal_progress(
     })
 }
 
-fn translate_terminal_progress(
-    mode: ProgressMode,
-    locale: UiLocale,
-) -> TerminalProgress<TranslateProgressPhase> {
+fn translate_terminal_progress(locale: UiLocale) -> TerminalProgress<TranslateProgressPhase> {
     let localizer = UiLocalizer::new(locale);
     let planning = localizer.format(UiMessage::ProgressTranslatePlanning);
     let confirmed = localizer.format(UiMessage::ProgressTranslateConfirmed);
     let no_work = localizer.format(UiMessage::ProgressTranslateNoWork);
-    TerminalProgress::stderr(mode, move |phase| match phase {
+    TerminalProgress::stderr(move |phase| match phase {
         TranslateProgressPhase::Planning => planning.clone(),
         TranslateProgressPhase::ConfirmedTasks => confirmed.clone(),
         TranslateProgressPhase::NoWork => no_work.clone(),
     })
 }
 
-fn project_lua_terminal_progress(
-    mode: ProgressMode,
-    locale: UiLocale,
-) -> TerminalProgress<ProjectLuaProgressPhase> {
+fn project_lua_terminal_progress(locale: UiLocale) -> TerminalProgress<ProjectLuaProgressPhase> {
     let running = UiLocalizer::new(locale).format(UiMessage::ProgressProjectLua);
-    TerminalProgress::stderr(mode, move |_| running.clone())
+    TerminalProgress::stderr(move |_| running.clone())
 }
 
-fn write_back_terminal_progress(
-    mode: ProgressMode,
-    locale: UiLocale,
-) -> TerminalProgress<WriteBackProgressPhase> {
+fn write_back_terminal_progress(locale: UiLocale) -> TerminalProgress<WriteBackProgressPhase> {
     let localizer = UiLocalizer::new(locale);
     let reading = localizer.format(UiMessage::ProgressWriteBackReadAssets);
     let planning = localizer.format(UiMessage::ProgressWriteBackPlanning);
@@ -362,7 +347,7 @@ fn write_back_terminal_progress(
     let preparing = planning.clone();
     let validating = localizer.format(UiMessage::ProgressWriteBackValidateCandidate);
     let publishing = localizer.format(UiMessage::ProgressWriteBackPublish);
-    TerminalProgress::stderr(mode, move |phase| match phase {
+    TerminalProgress::stderr(move |phase| match phase {
         WriteBackProgressPhase::ReadingAssets => reading.clone(),
         WriteBackProgressPhase::PlanningTranslations => planning.clone(),
         WriteBackProgressPhase::RewritingDocuments => rewriting.clone(),
@@ -870,20 +855,14 @@ mod command_root_guard_tests {
 pub(crate) struct ProductionRpgMakerCommandRunner {
     layout: RpgMakerLayout,
     locale: UiLocale,
-    progress_mode: ProgressMode,
     panic_boundary: CommandPanicBoundary,
 }
 
 impl ProductionRpgMakerCommandRunner {
-    pub(crate) fn new(
-        layout: RpgMakerLayout,
-        locale: UiLocale,
-        progress_mode: ProgressMode,
-    ) -> Self {
+    pub(crate) fn new(layout: RpgMakerLayout, locale: UiLocale) -> Self {
         Self {
             layout,
             locale,
-            progress_mode,
             panic_boundary: CommandPanicBoundary::default(),
         }
     }
@@ -927,7 +906,7 @@ impl ProductionRpgMakerCommandRunner {
         termination_signals: &mut TerminationSignals,
     ) -> ProductionCommandRunReport {
         let performance = Arc::new(RunPerformanceCounters::default());
-        let progress = project_lua_terminal_progress(self.progress_mode, self.locale);
+        let progress = project_lua_terminal_progress(self.locale);
         let cancellation = CooperativeCancellation::default();
         let lua_cancellation = ProjectLuaCancellation::default();
         let projects_root = command.common().projects_root().to_path_buf();
@@ -1288,7 +1267,7 @@ impl ProductionRpgMakerCommandRunner {
         termination_signals: &mut TerminationSignals,
     ) -> ProductionCommandRunReport {
         let performance = Arc::new(RunPerformanceCounters::default());
-        let progress = init_terminal_progress(self.progress_mode, self.locale);
+        let progress = init_terminal_progress(self.locale);
         let progress_observer =
             ProductionProgressObserver::without_project_log(progress.observer(), init_phase_code);
         let cancellation = CooperativeCancellation::default();
@@ -1652,7 +1631,7 @@ impl ProductionRpgMakerCommandRunner {
         termination_signals: &mut TerminationSignals,
     ) -> ProductionCommandRunReport {
         let performance = Arc::new(RunPerformanceCounters::default());
-        let progress = extract_terminal_progress(self.progress_mode, self.locale);
+        let progress = extract_terminal_progress(self.locale);
         let cancellation = CooperativeCancellation::default();
         let projects_root = command.common().projects_root().to_path_buf();
         let sqlite_configuration = command.common().sqlite().clone();
@@ -2104,7 +2083,7 @@ impl ProductionRpgMakerCommandRunner {
         termination_signals: &mut TerminationSignals,
     ) -> ProductionCommandRunReport {
         let performance = Arc::new(RunPerformanceCounters::default());
-        let progress = translate_terminal_progress(self.progress_mode, self.locale);
+        let progress = translate_terminal_progress(self.locale);
         let explicit_profile = command.resolved_profile_id().map(str::to_owned);
         let cancellation = CooperativeCancellation::default();
         let projects_root = command.common().projects_root().to_path_buf();
@@ -2512,7 +2491,7 @@ impl ProductionRpgMakerCommandRunner {
         termination_signals: &mut TerminationSignals,
     ) -> ProductionCommandRunReport {
         let performance = Arc::new(RunPerformanceCounters::default());
-        let progress = write_back_terminal_progress(self.progress_mode, self.locale);
+        let progress = write_back_terminal_progress(self.locale);
         let cancellation = CooperativeCancellation::default();
         let projects_root = command.common().projects_root().to_path_buf();
         let sqlite_configuration = command.common().sqlite().clone();
@@ -3519,7 +3498,7 @@ mod progress_lifecycle_tests {
         TerminalProgress<InitProgressPhase>,
         ProductionProgressObserver<InitProgressPhase>,
     ) {
-        let terminal = TerminalProgress::stderr(ProgressMode::Off, |_| String::new());
+        let terminal = TerminalProgress::with_writer(false, io::sink(), |_| String::new());
         let observer =
             ProductionProgressObserver::without_project_log(terminal.observer(), init_phase_code);
         (terminal, observer)
@@ -3588,7 +3567,7 @@ mod progress_lifecycle_tests {
 
     #[test]
     fn nested_extract_progress_does_not_restart_the_owner_phase() {
-        let terminal = TerminalProgress::stderr(ProgressMode::Off, |_| String::new());
+        let terminal = TerminalProgress::with_writer(false, io::sink(), |_| String::new());
         let observer = ProductionProgressObserver::without_project_log(
             terminal.observer(),
             extract_phase_code,
@@ -3636,7 +3615,7 @@ mod progress_lifecycle_tests {
     fn successful_business_finish_leaves_active_phase_for_log_contract_validation() {
         let temporary = tempfile::tempdir().expect("临时目录应可建立");
         let project_log = active_project_log(temporary.path());
-        let terminal = TerminalProgress::stderr(ProgressMode::Off, |_| String::new());
+        let terminal = TerminalProgress::with_writer(false, io::sink(), |_| String::new());
         let observer =
             ProductionProgressObserver::new(terminal.observer(), &project_log, init_phase_code);
         observer.observe(ProgressSnapshot::indeterminate(
@@ -3674,7 +3653,7 @@ mod progress_lifecycle_tests {
     fn planning_completed_only_finishes_the_planning_phase() {
         let temporary = tempfile::tempdir().expect("临时目录应可建立");
         let project_log = active_project_log(temporary.path());
-        let terminal = TerminalProgress::stderr(ProgressMode::Off, |_| String::new());
+        let terminal = TerminalProgress::with_writer(false, io::sink(), |_| String::new());
         let observer = ProductionProgressObserver::new(
             terminal.observer(),
             &project_log,
@@ -7447,16 +7426,13 @@ mod init_entry_recovery_tests {
         write_minimal_mz_game(&game_root);
 
         let mut signals = TerminationSignals::new();
-        let first = ProductionRpgMakerCommandRunner::new(
-            RpgMakerLayout::MZ,
-            UiLocale::SimplifiedChinese,
-            ProgressMode::Off,
-        )
-        .run_init(
-            init_command(&projects_root, Some(game_root.clone()), true),
-            &mut signals,
-        )
-        .await;
+        let first =
+            ProductionRpgMakerCommandRunner::new(RpgMakerLayout::MZ, UiLocale::SimplifiedChinese)
+                .run_init(
+                    init_command(&projects_root, Some(game_root.clone()), true),
+                    &mut signals,
+                )
+                .await;
         finish_successful_report(first);
 
         let workspace = projects_root.join("mz/entry-recovery");
@@ -7511,13 +7487,10 @@ mod init_entry_recovery_tests {
         fs::remove_dir_all(&workspace).expect("测试应可移除已发布目标以模拟中断现场");
 
         let mut signals = TerminationSignals::new();
-        let resumed = ProductionRpgMakerCommandRunner::new(
-            RpgMakerLayout::MZ,
-            UiLocale::SimplifiedChinese,
-            ProgressMode::Off,
-        )
-        .run_init(init_command(&projects_root, None, false), &mut signals)
-        .await;
+        let resumed =
+            ProductionRpgMakerCommandRunner::new(RpgMakerLayout::MZ, UiLocale::SimplifiedChinese)
+                .run_init(init_command(&projects_root, None, false), &mut signals)
+                .await;
         finish_successful_report(resumed);
 
         assert!(workspace.join("project.db").is_file());

@@ -1,6 +1,5 @@
 app-about = Traduire des jeux et du texte structuré avec un état de projet réutilisable
 cli-ui-language-help = Langue de l’aide, des diagnostics, de la progression, des résultats et des journaux : ar, zh-Hans, zh-Hant, en, fr, ru, es, ja, ko ou vi
-cli-progress-help = Mode de progression en direct : auto, plain ou off
 cli-mz-about = Traduire un jeu RPG Maker MZ
 cli-mv-about = Traduire un jeu RPG Maker MV
 cli-generic-about = Traduire du texte JSONL structuré
@@ -34,7 +33,6 @@ cli-print-help = Afficher l’aide
 cli-print-version = Afficher la version
 cli-blank-value = La valeur ne peut pas être vide.
 cli-invalid-positive-integer = La valeur doit être un entier positif.
-cli-invalid-progress = Le mode de progression { $value } n’est pas pris en charge ; utilisez auto, plain ou off.
 cli-invalid-ui-language-argument = --ui-language contient une balise de langue invalide : { $value }.
 cli-unsupported-ui-language-argument = --ui-language demande une langue non prise en charge : { $value }.
 cli-invalid-ui-language-environment = ATT_UI_LANGUAGE contient une balise de langue invalide : { $value }.

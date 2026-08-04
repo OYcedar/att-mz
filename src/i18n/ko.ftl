@@ -1,6 +1,5 @@
 app-about = 재사용 가능한 프로젝트 상태로 게임과 구조화된 텍스트를 번역합니다
 cli-ui-language-help = 도움말, 진단, 진행률, 결과 및 프로젝트 로그의 언어: ar, zh-Hans, zh-Hant, en, fr, ru, es, ja, ko 또는 vi
-cli-progress-help = 실시간 진행률 모드: auto, plain 또는 off
 cli-mz-about = RPG Maker MZ 게임 번역
 cli-mv-about = RPG Maker MV 게임 번역
 cli-generic-about = 규정된 JSONL 텍스트 번역
@@ -34,7 +33,6 @@ cli-print-help = 도움말 출력
 cli-print-version = 버전 출력
 cli-blank-value = 값은 비워 둘 수 없습니다.
 cli-invalid-positive-integer = 값은 양의 정수여야 합니다.
-cli-invalid-progress = 지원하지 않는 진행률 모드 { $value }입니다. auto, plain 또는 off를 사용하세요.
 cli-invalid-ui-language-argument = --ui-language에 잘못된 언어 태그가 있습니다: { $value }.
 cli-unsupported-ui-language-argument = --ui-language가 지원하지 않는 언어를 요청했습니다: { $value }.
 cli-invalid-ui-language-environment = ATT_UI_LANGUAGE에 잘못된 언어 태그가 있습니다: { $value }.

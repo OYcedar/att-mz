@@ -15,7 +15,32 @@ const MISSING_CAPTURE_API_KEY: &str = "PRIVATE_MISSING_CAPTURE_API_KEY";
 const MISSING_CAPTURE_SOURCE: &str = "秘密本文あ甲触发缺组乙";
 
 #[test]
-fn generic_progress_modes_and_jsonl_diagnostic_are_observable() {
+fn removed_progress_argument_is_rejected_by_the_process_cli() {
+    let output = Command::new(env!("CARGO_BIN_EXE_att"))
+        .args([
+            "--ui-language",
+            "en",
+            "--progress",
+            "off",
+            "generic",
+            "extract",
+            "--name",
+            "demo",
+        ])
+        .output()
+        .expect("att.exe 应可执行");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).expect("CLI 错误必须是 UTF-8");
+    assert!(
+        stderr.contains("Unexpected argument") && stderr.contains("--progress"),
+        "已删除的进度参数必须作为未知参数报告：{stderr}"
+    );
+}
+
+#[test]
+fn generic_non_tty_progress_is_silent_and_jsonl_diagnostic_is_observable() {
     let temporary = tempfile::tempdir().expect("应可建立 Generic 进程测试目录");
     let root = temporary.path();
     let input = root.join("input");
@@ -95,7 +120,6 @@ target_task_user_message_characters = 10000
 
     let init = run_att(
         root,
-        "plain",
         &[
             "generic",
             "init",
@@ -110,17 +134,16 @@ target_task_user_message_characters = 10000
         ],
     );
     assert_success("Generic Init", &init);
-    assert_stderr_contains(&init, "Initializing the Generic project");
+    assert!(init.stderr.is_empty(), "非 TTY Init 不得输出实时进度");
 
-    let extract = run_att(root, "plain", &["generic", "extract", "--name", PROJECT]);
+    let extract = run_att(root, &["generic", "extract", "--name", PROJECT]);
     assert_success("Generic Extract", &extract);
-    assert_stderr_contains(&extract, "Scanning Generic JSONL input");
+    assert!(extract.stderr.is_empty(), "非 TTY Extract 不得输出实时进度");
 
     let lua_script = root.join("noop.lua");
     fs::write(&lua_script, "return\n").expect("应可写入 Lua 脚本");
     let lua = run_att(
         root,
-        "plain",
         &[
             "generic",
             "lua",
@@ -130,22 +153,13 @@ target_task_user_message_characters = 10000
         ],
     );
     assert_success("Generic Lua", &lua);
-    assert_stderr_contains(&lua, "Running the project Lua program");
+    assert!(lua.stderr.is_empty(), "非 TTY Lua 不得输出实时进度");
 
-    let write_back = run_att(root, "plain", &["generic", "write-back", "--name", PROJECT]);
+    let write_back = run_att(root, &["generic", "write-back", "--name", PROJECT]);
     assert_success("Generic WriteBack", &write_back);
-    assert_stderr_contains(&write_back, "Planning document rewrites");
-    assert_stderr_contains(&write_back, "Publishing output");
-    let write_back_progress = String::from_utf8_lossy(&write_back.stderr);
-    let preparing = write_back_progress
-        .find("Planning document rewrites")
-        .expect("WriteBack 必须先报告候选准备");
-    let publishing = write_back_progress
-        .find("Publishing output")
-        .expect("WriteBack 必须在进入目录发布前报告发布阶段");
     assert!(
-        preparing < publishing,
-        "WriteBack 必须先准备和复查候选，再报告发布：{write_back_progress}"
+        write_back.stderr.is_empty(),
+        "非 TTY WriteBack 不得输出实时进度"
     );
 
     let empty_input = root.join("empty-input");
@@ -155,7 +169,6 @@ target_task_user_message_characters = 10000
         "空 Generic Init",
         &run_att(
             root,
-            "off",
             &[
                 "generic",
                 "init",
@@ -172,20 +185,17 @@ target_task_user_message_characters = 10000
     );
     assert_success(
         "空 Generic Extract",
-        &run_att(
-            root,
-            "off",
-            &["generic", "extract", "--name", no_work_project],
-        ),
+        &run_att(root, &["generic", "extract", "--name", no_work_project]),
     );
     let translate = run_att(
         root,
-        "plain",
         &["generic", "translate", "--name", no_work_project, "local"],
     );
     assert_success("无请求 Generic Translate", &translate);
-    assert_stderr_contains(&translate, "Planning translation tasks");
-    assert_stderr_contains(&translate, "No model request is needed");
+    assert!(
+        translate.stderr.is_empty(),
+        "非 TTY Translate 不得输出实时进度"
+    );
     assert!(
         !distribution
             .join("projects/generic")
@@ -198,11 +208,7 @@ target_task_user_message_characters = 10000
     let workspace = distribution.join("projects/generic").join(PROJECT);
     fs::write(workspace.join("task-records"), b"not-a-directory")
         .expect("普通文件应可稳定触发 Generic 任务记录写入失败");
-    let degraded_translate = run_att(
-        root,
-        "off",
-        &["generic", "translate", "--name", PROJECT, "local"],
-    );
+    let degraded_translate = run_att(root, &["generic", "translate", "--name", PROJECT, "local"]);
     assert_success("任务记录降级 Generic Translate", &degraded_translate);
     let degraded_stderr =
         String::from_utf8(degraded_translate.stderr).expect("stderr 必须是 UTF-8");
@@ -241,15 +247,13 @@ target_task_user_message_characters = 10000
         "Generic 任务记录故障必须写入同一 RunId 的 Translate JSONL"
     );
 
-    for mode in ["auto", "off"] {
-        let output = run_att(root, mode, &["generic", "extract", "--name", PROJECT]);
-        assert_success("静默 Generic Extract", &output);
-        assert!(
-            output.stderr.is_empty(),
-            "{mode} 在非 TTY 或显式关闭时不得输出实时进度：{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    let output = run_att(root, &["generic", "extract", "--name", PROJECT]);
+    assert_success("静默 Generic Extract", &output);
+    assert!(
+        output.stderr.is_empty(),
+        "非 TTY 不得输出实时进度：{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let nested = input.join("nested");
     fs::create_dir(&nested).expect("应可建立嵌套输入目录");
@@ -261,7 +265,7 @@ target_task_user_message_characters = 10000
         ),
     )
     .expect("应可写入含未知字段的 JSONL");
-    let invalid = run_att(root, "off", &["generic", "extract", "--name", PROJECT]);
+    let invalid = run_att(root, &["generic", "extract", "--name", PROJECT]);
     assert_eq!(invalid.status.code(), Some(1));
     let stderr = String::from_utf8(invalid.stderr).expect("stderr 必须是 UTF-8");
     assert!(
@@ -340,7 +344,6 @@ fn generic_missing_text_capture_reports_exact_leaf_without_model_request_or_stat
         "MissingTextCapture Generic Init",
         &run_att(
             root,
-            "off",
             &[
                 "generic",
                 "init",
@@ -359,7 +362,6 @@ fn generic_missing_text_capture_reports_exact_leaf_without_model_request_or_stat
         "MissingTextCapture Generic Extract",
         &run_att(
             root,
-            "off",
             &["generic", "extract", "--name", MISSING_CAPTURE_PROJECT],
         ),
     );
@@ -376,7 +378,6 @@ fn generic_missing_text_capture_reports_exact_leaf_without_model_request_or_stat
         .expect("临时 Placeholder 路径应是 Unicode");
     let translate = run_att(
         root,
-        "off",
         &[
             "generic",
             "translate",
@@ -686,10 +687,10 @@ fn project_log_paths(directory: &Path) -> BTreeSet<PathBuf> {
         .collect()
 }
 
-fn run_att(root: &Path, progress: &str, arguments: &[&str]) -> Output {
+fn run_att(root: &Path, arguments: &[&str]) -> Output {
     Command::new(stage_att_executable(root))
         .current_dir(root)
-        .args(["--ui-language", "en", "--progress", progress])
+        .args(["--ui-language", "en"])
         .args(arguments)
         .output()
         .expect("att.exe 应可执行")
@@ -724,13 +725,5 @@ fn assert_success(stage: &str, output: &Output) {
         "{stage} 应成功\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-fn assert_stderr_contains(output: &Output, expected: &str) {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains(expected),
-        "stderr 必须包含 {expected:?}：{stderr}"
     );
 }

@@ -2064,7 +2064,7 @@ fn run_att(root: &Path, arguments: Vec<OsString>) -> Output {
     let mut command = Command::new(stage_att_executable(root));
     command
         .current_dir(root)
-        .args(["--ui-language", "zh-Hans", "--progress", "off"])
+        .args(["--ui-language", "zh-Hans"])
         .args(arguments);
     command.output().expect("att.exe 应可执行")
 }

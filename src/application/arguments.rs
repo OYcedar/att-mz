@@ -7,9 +7,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use clap::error::{ContextKind, ErrorKind};
-use clap::{
-    Arg, ArgAction, Args, Command, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum,
-};
+use clap::{Arg, ArgAction, Args, Command, CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::i18n::{
     ResolvedUiLocale, UiLocaleInputSource, UiLocalizer, UiMessage,
@@ -22,7 +20,6 @@ use crate::rpg_maker::MaxFullwidthChars;
 /// 已完成解析的 ATT 进程参数。
 #[derive(Debug)]
 pub(crate) struct AttArguments {
-    pub(crate) progress: ProgressArgument,
     pub(crate) product: ProductCommand,
 }
 
@@ -90,10 +87,9 @@ impl AttArguments {
         })?;
         let RawAttArguments {
             ui_language: _,
-            progress,
             product,
         } = raw;
-        Ok((Self { progress, product }, resolved))
+        Ok((Self { product }, resolved))
     }
 
     #[cfg(test)]
@@ -105,10 +101,9 @@ impl AttArguments {
         let raw = RawAttArguments::try_parse_from(arguments)?;
         let RawAttArguments {
             ui_language: _,
-            progress,
             product,
         } = raw;
-        Ok(Self { progress, product })
+        Ok(Self { product })
     }
 
     #[cfg(test)]
@@ -206,24 +201,8 @@ struct RawAttArguments {
     #[arg(long, global = true, value_name = "LANG", value_parser = parse_non_blank)]
     ui_language: Option<String>,
 
-    /// 实时进度的呈现方式。
-    #[arg(long, global = true, value_enum, default_value_t = ProgressArgument::Auto)]
-    progress: ProgressArgument,
-
     #[command(subcommand)]
     product: ProductCommand,
-}
-
-/// 用户选择的实时进度呈现策略。
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
-pub(crate) enum ProgressArgument {
-    /// 仅当 stderr 是交互终端时呈现单行动态进度。
-    #[default]
-    Auto,
-    /// 输出适合 CI 与重定向保存的稀疏纯文本阶段行。
-    Plain,
-    /// 关闭实时进度；最终结果与错误仍会输出。
-    Off,
 }
 
 /// 统一产品入口当前支持的命令域。
@@ -648,7 +627,6 @@ fn command_about(name: &str) -> UiMessage<'static> {
 fn argument_help(identifier: &str) -> Option<UiMessage<'static>> {
     match identifier {
         "ui_language" => Some(UiMessage::CliUiLanguageHelp),
-        "progress" => Some(UiMessage::CliProgressHelp),
         "name" => Some(UiMessage::CliProjectNameHelp),
         "path" => Some(UiMessage::CliInitPathHelp),
         "source_language" => Some(UiMessage::CliSourceLanguageHelp),
@@ -681,8 +659,6 @@ fn localize_clap_error(error: &clap::Error, localizer: &UiLocalizer) -> String {
         ErrorKind::InvalidValue | ErrorKind::ValueValidation => {
             if value.trim().is_empty() {
                 localizer.format(UiMessage::CliBlankValue)
-            } else if argument.contains("--progress") || argument.contains("progress") {
-                localizer.format(UiMessage::CliInvalidProgress { value: &value })
             } else if argument.contains("fullwidth") {
                 localizer.format(UiMessage::CliInvalidPositiveInteger)
             } else if argument.is_empty() {
@@ -1065,13 +1041,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_global_ui_language_and_progress_mode() {
+    fn parses_global_ui_language_without_progress_choice() {
         let (parsed, resolved) = AttArguments::try_parse_localized_from([
             "att",
             "--ui-language",
             "zh-Hant",
-            "--progress",
-            "plain",
             "mz",
             "write-back",
             "--name",
@@ -1079,7 +1053,12 @@ mod tests {
         ])
         .expect("全局界面选项应可解析");
         assert_eq!(resolved.locale(), UiLocale::TraditionalChinese);
-        assert_eq!(parsed.progress, ProgressArgument::Plain);
+        assert!(matches!(
+            parsed.product,
+            ProductCommand::Mz {
+                command: MzCommand::WriteBack(_)
+            }
+        ));
     }
 
     #[test]
@@ -1096,6 +1075,7 @@ mod tests {
             assert_eq!(root_error.kind(), ErrorKind::DisplayHelp);
             assert_eq!(root_error.exit_code(), 0);
             assert!(!root_error.use_stderr());
+            assert!(!root_error.output().contains("--progress"));
             for expected in [
                 localizer.format(UiMessage::AppAbout),
                 localizer.format(UiMessage::CliUsageHeading),
@@ -1120,6 +1100,7 @@ mod tests {
                 "--help",
             ])
             .expect_err("子命令 Help 应作为正常提前退出返回");
+            assert!(!init_error.output().contains("--progress"));
             for expected in [
                 localizer.format(UiMessage::CliInitAbout),
                 localizer.format(UiMessage::CliUsageHeading),
@@ -1153,7 +1134,7 @@ mod tests {
     }
 
     #[test]
-    fn localized_parser_translates_clap_validation_and_usage() {
+    fn removed_progress_argument_is_a_localized_unknown_argument() {
         let error = AttArguments::try_parse_localized_from([
             "att",
             "--ui-language",
@@ -1165,15 +1146,17 @@ mod tests {
             "--name",
             "demo",
         ])
-        .expect_err("非法 progress 应被拒绝");
+        .expect_err("已删除的 progress 参数必须被拒绝");
         let localizer = UiLocalizer::new(UiLocale::French);
-        assert_eq!(error.kind(), ErrorKind::InvalidValue);
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
         assert_eq!(error.exit_code(), 2);
         assert!(error.use_stderr());
         assert!(
             error
                 .output()
-                .contains(&localizer.format(UiMessage::CliInvalidProgress { value: "fast" }))
+                .contains(&localizer.format(UiMessage::CliUnexpectedArgument {
+                    value: "--progress",
+                }))
         );
         assert!(
             error

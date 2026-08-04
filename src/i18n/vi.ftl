@@ -1,6 +1,5 @@
 app-about = Dịch trò chơi và văn bản có cấu trúc với trạng thái dự án có thể tái sử dụng
 cli-ui-language-help = Ngôn ngữ cho trợ giúp, chẩn đoán, tiến độ, kết quả và nhật ký dự án: ar, zh-Hans, zh-Hant, en, fr, ru, es, ja, ko hoặc vi
-cli-progress-help = Chế độ tiến độ trực tiếp: auto, plain hoặc off
 cli-mz-about = Dịch trò chơi RPG Maker MZ
 cli-mv-about = Dịch trò chơi RPG Maker MV
 cli-generic-about = Dịch văn bản JSONL có cấu trúc
@@ -34,7 +33,6 @@ cli-print-help = In trợ giúp
 cli-print-version = In phiên bản
 cli-blank-value = Giá trị không được để trống.
 cli-invalid-positive-integer = Giá trị phải là số nguyên dương.
-cli-invalid-progress = Không hỗ trợ chế độ tiến độ { $value }; hãy dùng auto, plain hoặc off.
 cli-invalid-ui-language-argument = --ui-language chứa thẻ ngôn ngữ không hợp lệ: { $value }.
 cli-unsupported-ui-language-argument = --ui-language yêu cầu ngôn ngữ không được hỗ trợ: { $value }.
 cli-invalid-ui-language-environment = ATT_UI_LANGUAGE chứa thẻ ngôn ngữ không hợp lệ: { $value }.

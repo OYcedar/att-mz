@@ -3,7 +3,7 @@
 ## 1. 统一入口
 
 ```text
-att [--ui-language LANG] [--progress auto|plain|off] ENGINE COMMAND ...
+att [--ui-language LANG] ENGINE COMMAND ...
 ```
 
 `ENGINE` 取 `mv`、`mz` 或 `generic`。Help 与 Version 开箱即用；其余命令读取实际运行的
@@ -39,8 +39,12 @@ Extract、Translate 和 WriteBack 不接受 `--lua`。独立 Lua 不接受 `--pr
 
 ## 2. UI 与进度
 
-`--progress` 默认为 `auto`。UI 语言可由 `--ui-language` 或 `ATT_UI_LANGUAGE` 指定，
-选择优先级为：
+实时进度没有 CLI 或配置选项。stderr 连接交互终端时，ATT 固定使用 20 格单行 ASCII
+进度条并显示当前阶段和 `已完成/总量`；尚无真实总量时显示旋转符号和当前阶段。进度条在
+同一行刷新，完成后清除，再输出最终业务结果。stderr 被重定向或运行于非交互环境时不输出
+实时进度。
+
+UI 语言可由 `--ui-language` 或 `ATT_UI_LANGUAGE` 指定，选择优先级为：
 
 ```text
 --ui-language > ATT_UI_LANGUAGE > Windows 用户首选 UI 语言 > en
@@ -93,7 +97,7 @@ Ctrl-C 请求合作取消：
 
 ## 5. 输出与退出码
 
-stdout 呈现进度和最终业务结果，警告、降级和错误走 stderr。项目命令建立 RunId 后，
+stdout 呈现最终业务结果，实时进度、警告、降级和错误走 stderr。项目命令建立 RunId 后，
 终端摘要、项目日志和可选模型任务记录共用同一个 RunId。
 
 Partial、Unavailable、跳过项、人工布局、取消后已经生效的状态和任务记录写入或收尾故障都

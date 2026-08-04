@@ -1,6 +1,5 @@
 app-about = ترجمة الألعاب والنصوص المنظّمة باستخدام حالة مشروع قابلة لإعادة الاستخدام
 cli-ui-language-help = لغة المساعدة والتشخيص والتقدم والنتائج وسجلات المشروع: ar وzh-Hans وzh-Hant وen وfr وru وes وja وko وvi
-cli-progress-help = نمط التقدم المباشر: auto أو plain أو off
 cli-mz-about = ترجمة لعبة RPG Maker MZ
 cli-mv-about = ترجمة لعبة RPG Maker MV
 cli-generic-about = ترجمة نص JSONL منظّم
@@ -34,7 +33,6 @@ cli-print-help = عرض المساعدة
 cli-print-version = عرض الإصدار
 cli-blank-value = لا يجوز أن تكون القيمة فارغة.
 cli-invalid-positive-integer = يجب أن تكون القيمة عددًا صحيحًا موجبًا.
-cli-invalid-progress = نمط التقدم { $value } غير مدعوم؛ استخدم auto أو plain أو off.
 cli-invalid-ui-language-argument = يحتوي --ui-language على وسم لغة غير صالح: { $value }.
 cli-unsupported-ui-language-argument = يطلب --ui-language لغة غير مدعومة: { $value }.
 cli-invalid-ui-language-environment = يحتوي ATT_UI_LANGUAGE على وسم لغة غير صالح: { $value }.

@@ -1,6 +1,5 @@
 app-about = Translate games and structured text with reusable project state
 cli-ui-language-help = Language for help, diagnostics, progress, results, and project logs: ar, zh-Hans, zh-Hant, en, fr, ru, es, ja, ko, or vi
-cli-progress-help = Live progress mode: auto, plain, or off
 cli-mz-about = Translate an RPG Maker MZ game
 cli-mv-about = Translate an RPG Maker MV game
 cli-generic-about = Translate structured JSONL text
@@ -34,7 +33,6 @@ cli-print-help = Print help
 cli-print-version = Print version
 cli-blank-value = The value must not be blank.
 cli-invalid-positive-integer = The value must be a positive integer.
-cli-invalid-progress = Unsupported progress mode { $value }; use auto, plain, or off.
 cli-invalid-ui-language-argument = --ui-language contains an invalid language tag: { $value }.
 cli-unsupported-ui-language-argument = --ui-language requests an unsupported language: { $value }.
 cli-invalid-ui-language-environment = ATT_UI_LANGUAGE contains an invalid language tag: { $value }.
