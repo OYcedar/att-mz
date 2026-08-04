@@ -1,7 +1,7 @@
 //! 终端实时进度的共享契约与渲染根适配器。
 //!
 //! 业务切片拥有阶段枚举，并只发布绝对快照；本模块不解释业务阶段。动态终端渲染在
-//! 后台线程执行；中间观察只尝试替换一个有界的最新快照，最终确认快照通过异步渲染
+//! 后台线程执行；中间观察只替换一个有界的最新快照，最终确认快照通过异步渲染
 //! 通道交接。线程、通道和终端 I/O 故障会记入统一健康快照，并由显式收尾结果返回给进程边界。
 
 use std::fmt;
@@ -9,7 +9,7 @@ use std::io::{self, IsTerminal, Write};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
@@ -435,13 +435,9 @@ impl<P> LatestSnapshot<P> {
         }
     }
 
-    fn try_replace(&self, snapshot: ProgressSnapshot<P>) {
+    fn replace(&self, snapshot: ProgressSnapshot<P>) {
         let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
-        let mut pending = match self.pending.try_lock() {
-            Ok(pending) => pending,
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => return,
-        };
+        let mut pending = lock_after_poison(&self.pending);
         let should_replace = pending
             .as_ref()
             .is_none_or(|current| sequence > current.sequence);
@@ -451,11 +447,7 @@ impl<P> LatestSnapshot<P> {
     }
 
     fn take(&self) -> Option<ProgressSnapshot<P>> {
-        let mut pending = match self.pending.try_lock() {
-            Ok(pending) => pending,
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => return None,
-        };
+        let mut pending = lock_after_poison(&self.pending);
         pending.take().map(|pending| pending.snapshot)
     }
 }
@@ -523,7 +515,7 @@ where
                     ));
             }
         } else {
-            dispatch.latest.try_replace(snapshot);
+            dispatch.latest.replace(snapshot);
         }
         dispatch.worker_thread.unpark();
     }
@@ -1807,6 +1799,100 @@ mod tests {
     }
 
     #[test]
+    fn first_phase_snapshot_survives_latest_slot_contention_and_precedes_finalizing_status() {
+        let writer = SharedWriter::default();
+        let output = writer.clone();
+        let (renderer_start, renderer_start_receiver) = mpsc::channel();
+        let progress = TerminalProgress::with_writer_and_spawner(
+            ProgressMode::Plain,
+            false,
+            writer,
+            phase_label,
+            move |renderer| {
+                Ok(thread::spawn(move || {
+                    renderer_start_receiver
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("测试应允许渲染线程开始");
+                    renderer();
+                }))
+            },
+        );
+        let observer = progress.observer();
+        let latest = Arc::clone(
+            &observer
+                .dispatch
+                .as_ref()
+                .expect("plain 模式必须启动进度渲染器")
+                .latest,
+        );
+        let pending_guard = lock_after_poison(&latest.pending);
+
+        let publisher = thread::spawn(move || {
+            observer.observe(ProgressSnapshot::indeterminate(Phase::Planning));
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while latest.next_sequence.load(Ordering::Relaxed) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "发布线程应在超时前进入 latest slot"
+            );
+            thread::yield_now();
+        }
+        drop(pending_guard);
+        publisher.join().expect("发布线程不应 panic");
+
+        renderer_start.send(()).expect("测试渲染线程不应关闭");
+        progress.finalizing("正在收尾").expect("状态应呈现");
+        progress.finish().expect("收尾应成功");
+
+        let text = output.text();
+        let planning = text.find("规划").expect("锁竞争不能丢失首个阶段快照");
+        let finalizing = text.find("正在收尾").expect("必须呈现收尾阶段");
+        assert!(
+            planning < finalizing,
+            "首个阶段快照必须先于收尾阶段：{text:?}"
+        );
+    }
+
+    #[test]
+    fn latest_snapshot_take_waits_for_slot_contention() {
+        let latest = Arc::new(LatestSnapshot::new());
+        let mut pending_guard = lock_after_poison(&latest.pending);
+        *pending_guard = Some(PendingSnapshot {
+            sequence: 0,
+            snapshot: ProgressSnapshot::indeterminate(Phase::Planning),
+        });
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (taken_sender, taken_receiver) = mpsc::channel();
+        let reader = Arc::clone(&latest);
+
+        let reader_thread = thread::spawn(move || {
+            started_sender.send(()).expect("测试协调 channel 不应关闭");
+            taken_sender
+                .send(reader.take())
+                .expect("测试结果 channel 不应关闭");
+        });
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("读取线程应在超时前开始");
+        assert!(
+            matches!(
+                taken_receiver.recv_timeout(Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "读取端不得在 latest slot 竞争时把待处理快照当作空槽"
+        );
+
+        drop(pending_guard);
+        let snapshot = taken_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("释放 latest slot 后应取得快照")
+            .expect("锁竞争不能丢失待处理快照");
+        assert_eq!(snapshot.phase, Phase::Planning);
+        reader_thread.join().expect("读取线程不应 panic");
+    }
+
+    #[test]
     fn completed_snapshot_survives_latest_slot_contention() {
         let writer = SharedWriter::default();
         let output = writer.clone();
@@ -1834,8 +1920,8 @@ mod tests {
             .expect("发布最终快照不得等待最新值槽的互斥锁");
         publisher.join().expect("发布线程不应 panic");
 
-        progress.finalizing("正在保存运行方案").expect("状态应呈现");
         drop(pending_guard);
+        progress.finalizing("正在保存运行方案").expect("状态应呈现");
         progress.finish().expect("收尾应成功");
 
         let text = output.text();
