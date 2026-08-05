@@ -3870,7 +3870,7 @@ mod tests {
     }
 
     #[test]
-    fn thinking_mode_requires_exact_non_blank_wrapper_after_json_repair() {
+    fn thinking_mode_requires_exact_non_blank_wrapper_after_json_envelope_handling() {
         let mode = TranslationResponseMode::new(true, false);
         for value in [
             "{}",
@@ -3922,7 +3922,7 @@ mod tests {
     }
 
     #[test]
-    fn response_parser_repairs_supported_syntax_and_rejects_ambiguity_or_shape() {
+    fn response_parser_accepts_supported_envelopes_repairs_syntax_and_rejects_invalidity() {
         let mode = TranslationResponseMode::new(false, false);
         for value in [
             "说明：{}",
@@ -3931,8 +3931,9 @@ mod tests {
             "{// comment\n}",
             "```json\n{}\n```",
         ] {
-            parse_model_output_batch(value, mode)
-                .unwrap_or_else(|error| panic!("支持的 JSON 修复必须成功：{value:?}: {error:?}"));
+            parse_model_output_batch(value, mode).unwrap_or_else(|error| {
+                panic!("支持的响应外层或 JSON 修复必须成功：{value:?}: {error:?}")
+            });
         }
 
         for value in ["{}\n{}", "{\"0\":[\"截断", "[]"] {

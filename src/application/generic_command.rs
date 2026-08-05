@@ -6810,8 +6810,12 @@ mod tests {
     }
 
     fn compact_json(message: &str) -> String {
+        let json = message
+            .strip_prefix("```json\n")
+            .and_then(|value| value.strip_suffix("\n```"))
+            .expect("模型 user message 必须是单一 JSON 围栏");
         serde_json::to_string(
-            &serde_json::from_str::<serde_json::Value>(message)
+            &serde_json::from_str::<serde_json::Value>(json)
                 .expect("模型 user message 必须是有效 JSON"),
         )
         .expect("模型 user message 应该可以重新序列化")

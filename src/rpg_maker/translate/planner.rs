@@ -1693,7 +1693,7 @@ fn materialize_task_block(
         "AssignedTaskBlock 不得包含超出完整块的 Unit ID 槽"
     );
 
-    let user_json = render_user_json_with_cancellation(
+    let user_message = render_user_message_with_cancellation(
         &rendered_groups,
         terminology,
         &selected_terms,
@@ -1738,7 +1738,7 @@ fn materialize_task_block(
     Ok(Some(UnindexedTask {
         messages: vec![
             ChatMessage::new(ChatMessageRole::System, system_markdown),
-            ChatMessage::new(ChatMessageRole::User, user_json),
+            ChatMessage::new(ChatMessageRole::User, user_message),
         ],
         expected_outputs,
     }))
@@ -1946,12 +1946,12 @@ impl TerminologyPromptIndex {
 }
 
 #[cfg(test)]
-fn render_user_json(
+fn render_user_message(
     groups: &[RenderedGroup],
     terminology: &TerminologyPromptIndex,
     selected_terms: &BTreeSet<usize>,
 ) -> String {
-    match render_user_json_with_cancellation(
+    match render_user_message_with_cancellation(
         groups,
         terminology,
         selected_terms,
@@ -1970,7 +1970,7 @@ fn render_user_json(
     }
 }
 
-fn render_user_json_with_cancellation(
+fn render_user_message_with_cancellation(
     groups: &[RenderedGroup],
     terminology: &TerminologyPromptIndex,
     selected_terms: &BTreeSet<usize>,
@@ -2971,7 +2971,15 @@ mod tests {
     }
 
     fn user_message_json(task: &RpgMakerExecutableTask) -> serde_json::Value {
-        serde_json::from_str(user_message(task)).expect("RPG Maker user message 必须是 JSON")
+        parse_user_message_json(user_message(task))
+    }
+
+    fn parse_user_message_json(message: &str) -> serde_json::Value {
+        let json = message
+            .strip_prefix("```json\n")
+            .and_then(|value| value.strip_suffix("\n```"))
+            .expect("RPG Maker user message 必须是单一 JSON 围栏");
+        serde_json::from_str(json).expect("RPG Maker user message 围栏内部必须是 JSON")
     }
 
     fn project() -> OpenedProject {
@@ -4042,7 +4050,7 @@ pattern = '\A<Help:(?<text>.*?)>\z'
         );
         let user = tasks[0].messages()[1].content();
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(user).expect("user message 必须是 JSON"),
+            parse_user_message_json(user),
             serde_json::json!({
                 "groups": [
                     {
@@ -5850,9 +5858,8 @@ pattern = '保護対象'
         let prompt = TerminologyPromptIndex::new(&terminology);
         let selected = [4_095, 1, 2_048].into_iter().collect::<BTreeSet<_>>();
 
-        let rendered = render_user_json(&[], &prompt, &selected);
-        let value: serde_json::Value =
-            serde_json::from_str(&rendered).expect("术语 user message 必须是 JSON");
+        let rendered = render_user_message(&[], &prompt, &selected);
+        let value = parse_user_message_json(&rendered);
         let terms = value["terminology"]
             .as_array()
             .expect("命中的术语必须形成数组");
