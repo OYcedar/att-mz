@@ -1590,6 +1590,129 @@ fn generic_lua_syntax_failure_is_logged_and_reported_before_project_open() {
 }
 
 #[test]
+fn mv_lua_noop_ignores_placeholder_planning_failure_without_current() {
+    let temporary = tempfile::tempdir().expect("应可建立 MV Lua 规划失败回归测试目录");
+    let root = temporary.path();
+    let game = root.join("mv-game");
+    write_minimal_mv_game(&game);
+    fs::write(
+        game.join("www/data/Items.json"),
+        serde_json::to_vec(&json!([
+            null,
+            {
+                "id": 1,
+                "name": "",
+                "description": "回復 {hero}"
+            }
+        ]))
+        .expect("含重叠 Placeholder 的 MV Items 夹具应可序列化"),
+    )
+    .expect("含重叠 Placeholder 的 MV Items 夹具应可写入");
+    write_configuration(root, "http://127.0.0.1:9/v1/chat/completions");
+
+    assert_success(
+        "MV Lua 规划失败回归 Init",
+        &run_att(root, init_arguments("mv", &game)),
+    );
+    assert_success(
+        "MV Lua 规划失败回归 Extract",
+        &run_att(
+            root,
+            arguments(&["mv", "extract", "--name", PROJECT, "--builtin"]),
+        ),
+    );
+
+    let database = distribution_root(root)
+        .join("projects/mv")
+        .join(PROJECT)
+        .join("project.db");
+    let overlapping_rules = serde_json::to_string(&json!([
+        { "scopes": ["database_entry"], "pattern": r"\{hero\}" },
+        { "scopes": ["database_entry"], "pattern": "hero" }
+    ]))
+    .expect("重叠 Placeholder 资源应可序列化");
+    assert_eq!(
+        Connection::open(&database)
+            .expect("MV 项目数据库应可打开")
+            .execute(
+                "UPDATE rpg_maker_translation_resource
+                 SET canonical_json = ?1
+                 WHERE resource_kind = 'placeholder_rules'",
+                [&overlapping_rules],
+            )
+            .expect("应可安装只影响未译 Unit 的重叠 Placeholder"),
+        1
+    );
+
+    let script = root.join("noop-mv.lua");
+    fs::write(&script, "return\n").expect("MV 空 Lua 脚本应可写入");
+    let mut lua_arguments = arguments(&["mv", "lua", "--name", PROJECT]);
+    lua_arguments.push(script.as_os_str().to_owned());
+    assert_success(
+        "实际 att.exe 不应让无 Current Unit 的规划失败阻断 MV Lua",
+        &run_att(root, lua_arguments),
+    );
+
+    let connection = Connection::open(&database).expect("MV 项目数据库应可重新打开");
+    let (owner, group_location, unit_role): (String, String, String) = connection
+        .query_row(
+            "SELECT unit.owner, text_group.group_location, unit.unit_role
+             FROM rpg_maker_text_unit AS unit
+             JOIN rpg_maker_text_group AS text_group
+               ON text_group.owner = unit.owner
+              AND text_group.group_id = unit.group_id
+             WHERE unit.source_content_json LIKE '%{hero}%'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("应定位含重叠 Placeholder 的 MV Unit");
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE rpg_maker_text_unit
+                 SET translation_content_json = ?1, translation_state = ?2
+                 WHERE owner = ?3
+                   AND group_id = (
+                       SELECT group_id FROM rpg_maker_text_group
+                       WHERE owner = ?3 AND group_location = ?4
+                   )
+                   AND unit_role = ?5",
+                (
+                    serde_json::to_string("测试译文").expect("测试译文应可编码"),
+                    vec![0xa5_u8; 32],
+                    &owner,
+                    &group_location,
+                    &unit_role,
+                ),
+            )
+            .expect("应建立会触发捕获诊断的 Current"),
+        1
+    );
+    drop(connection);
+
+    let mut failing_arguments = arguments(&["mv", "lua", "--name", PROJECT]);
+    failing_arguments.push(script.into_os_string());
+    let failure = run_att(root, failing_arguments);
+    assert_eq!(failure.status.code(), Some(1));
+    let stderr = String::from_utf8(failure.stderr).expect("MV Lua 失败诊断必须是 UTF-8");
+    for expected in [
+        "lua.host_call".to_owned(),
+        "engine=mv".to_owned(),
+        "translation.placeholder.overlapping_matches".to_owned(),
+        "owner=builtin".to_owned(),
+        format!("group_location={group_location}"),
+        format!("unit_role={unit_role}"),
+        "first_rule_number=1".to_owned(),
+        "second_rule_number=2".to_owned(),
+    ] {
+        assert!(
+            stderr.contains(&expected),
+            "MV Lua 捕获失败必须保留 {expected:?}：{stderr}"
+        );
+    }
+}
+
+#[test]
 fn mv_lua_clear_trusts_unchanged_current_with_additional_custom_placeholder_bytes() {
     let temporary = tempfile::tempdir().expect("应可建立 MV Lua 全量清理端到端测试目录");
     let root = temporary.path();

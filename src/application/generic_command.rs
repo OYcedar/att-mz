@@ -95,8 +95,9 @@ use crate::project_lease::{
     ProjectCommandLeaseError, ProjectCommandLeaseProvider, ProjectCommandLeaseService,
 };
 use crate::project_lua::{
-    ProjectLuaCancellation, ProjectLuaFailure, ProjectLuaProgram, ProjectLuaProject,
-    ProjectLuaRunError, ProjectLuaRunRequest, compile_project_lua_program_with_cancellation,
+    ProjectLuaCancellation, ProjectLuaEngine, ProjectLuaFailure, ProjectLuaProgram,
+    ProjectLuaProject, ProjectLuaRunError, ProjectLuaRunRequest,
+    compile_project_lua_program_with_cancellation,
     fingerprint_project_lua_program_with_cancellation, generic_project_lua_adapter,
     run_project_lua,
 };
@@ -1101,7 +1102,7 @@ impl ProductionGenericCommandRunner {
             let lua_project_name = output_name.as_str().to_owned();
             let lua_adapter = generic_project_lua_adapter(project, operation_cancellation.clone());
             let request = ProjectLuaRunRequest::new(
-                ProjectLuaProject::new(lua_project_name, GENERIC_ENGINE_NAME),
+                ProjectLuaProject::new(lua_project_name, ProjectLuaEngine::Generic),
                 program,
                 lua_adapter,
             )

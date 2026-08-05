@@ -317,6 +317,16 @@ fn control_sequence_length(input: &str) -> Option<usize> {
         return Some(1 + command_length + 1 + closing_offset + 1);
     }
 
+    if command_length == 1 && first.eq_ignore_ascii_case(&'n') {
+        let name_box = after_command.strip_prefix('<')?;
+        let closing_offset = name_box.find('>')?;
+        let contents = &name_box[..closing_offset];
+        if contents.chars().any(char::is_control) {
+            return None;
+        }
+        return Some(1 + command_length + 1 + closing_offset + 1);
+    }
+
     if command_length == 1 && first.eq_ignore_ascii_case(&'g') {
         let boundary = after_command.chars().next();
         if boundary.is_none_or(|character| !character.is_ascii_alphanumeric() && character != '[') {
@@ -1006,6 +1016,32 @@ mod tests {
     }
 
     #[test]
+    fn lower_and_uppercase_name_boxes_do_not_make_fitting_bodies_manual() {
+        let request = request(
+            2,
+            vec![
+                segment(1, "原一", Some(r"\n<Alice>甲乙")),
+                segment(2, "原二", Some(r"\N<鲍勃>丙丁")),
+            ],
+        );
+
+        let applied = applied(&request);
+
+        assert_eq!(line_texts(&applied.segments()[0]), [r"\n<Alice>甲乙"][..]);
+        assert_eq!(line_texts(&applied.segments()[1]), [r"\N<鲍勃>丙丁"][..]);
+        assert_eq!(applied.inserted_line_breaks(), 0);
+    }
+
+    #[test]
+    fn name_box_accepts_nested_actor_name_control_and_preserves_bracket_control() {
+        let nested = scan_line(r"\n<\n[145]>甲").expect("姓名框中的角色名控制符应保持完整");
+        let standalone = scan_line(r"\n[145]甲").expect("既有方括号控制符应继续可扫描");
+
+        assert_eq!(line_width(&nested), 2);
+        assert_eq!(line_width(&standalone), 2);
+    }
+
+    #[test]
     fn indexed_wrap_search_matches_the_reference_selection_semantics() {
         const FRAGMENTS: &[&str] = &[
             "甲", "乙", "A", "，", "。", " ", "  ", "(", ")", "「", "」", "（", "）", "…",
@@ -1074,6 +1110,21 @@ mod tests {
         for text in [r"甲\broken乙", r"甲\C[1乙", "甲\\", "甲⟦ATT_X_0001⟧乙"] {
             assert_manual(&request(20, vec![segment(1, "原文", Some(text))]));
         }
+    }
+
+    #[test]
+    fn malformed_name_boxes_make_the_whole_unit_manual() {
+        for text in [r"\n<Alice", "\\n<Ali\tce>甲", "\\N<鲍\r勃>乙"] {
+            assert_manual(&request(20, vec![segment(1, "原文", Some(text))]));
+        }
+    }
+
+    #[test]
+    fn name_box_does_not_hide_a_genuinely_overwidth_body() {
+        assert_manual(&request(
+            2,
+            vec![segment(1, "原文", Some(r"\n<Alice>甲乙丙"))],
+        ));
     }
 
     #[test]

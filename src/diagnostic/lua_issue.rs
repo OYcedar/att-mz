@@ -2,22 +2,24 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::DiagnosticStage;
 use super::model::DiagnosticResolution;
 use super::safe_value::{SafeIdentifier, SafePath};
+use super::{DiagnosticStage, PlaceholderIssue};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum LuaEngine {
     Generic,
-    RpgMaker,
+    Mv,
+    Mz,
 }
 
 impl LuaEngine {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Generic => "generic",
-            Self::RpgMaker => "rpg_maker",
+            Self::Mv => "mv",
+            Self::Mz => "mz",
         }
     }
 }
@@ -211,6 +213,8 @@ pub(crate) enum LuaProblem {
         violation: LuaValueViolation,
         field: Option<SafeIdentifier>,
         locator: Option<LuaLocator>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        placeholder: Option<PlaceholderIssue>,
     },
     DatabasePrerequisite {
         engine: Option<LuaEngine>,
@@ -293,6 +297,10 @@ impl LuaIssue {
             LuaProblem::ContextCreation { .. } | LuaProblem::WorkerPanicked => {
                 DiagnosticResolution::ReportBug
             }
+            LuaProblem::HostCall {
+                placeholder: Some(PlaceholderIssue::WorkerStart { .. }),
+                ..
+            } => DiagnosticResolution::Retry,
             LuaProblem::Compilation { .. }
             | LuaProblem::ScriptExecution { .. }
             | LuaProblem::HostCall { .. }
@@ -309,9 +317,14 @@ impl LuaIssue {
             LuaProblem::Cancelled => "lock_cancelled",
             LuaProblem::ContextCreation { .. } | LuaProblem::WorkerPanicked => "internal_invariant",
             LuaProblem::Compilation { .. } => "lua_compilation_failed",
-            LuaProblem::ScriptExecution { .. } | LuaProblem::HostCall { .. } => {
-                "lua_execution_failed"
-            }
+            LuaProblem::ScriptExecution { .. } => "lua_execution_failed",
+            LuaProblem::HostCall {
+                placeholder: Some(problem),
+                ..
+            } => problem.summary_code(),
+            LuaProblem::HostCall {
+                placeholder: None, ..
+            } => "lua_execution_failed",
             LuaProblem::DatabasePrerequisite { .. } | LuaProblem::Validation { .. } => {
                 "state_mismatch"
             }
@@ -356,6 +369,7 @@ impl LuaIssue {
                 violation,
                 field,
                 locator,
+                placeholder,
             } => {
                 facts.push(("engine", engine.as_str().to_owned()));
                 facts.push(("violation", violation.as_str().to_owned()));
@@ -395,6 +409,17 @@ impl LuaIssue {
                             }
                         }
                     }
+                }
+                if let Some(problem) = placeholder {
+                    facts.push(("placeholder_problem", problem.code().to_owned()));
+                    facts.extend(problem.facts().into_iter().map(|(name, value)| {
+                        let name = if name == "operation" {
+                            "placeholder_operation"
+                        } else {
+                            name
+                        };
+                        (name, value)
+                    }));
                 }
             }
             LuaProblem::DatabasePrerequisite { engine, violation } => {
@@ -499,6 +524,7 @@ mod tests {
                 group_id: Some(SafeIdentifier::from_validated("group-7")),
                 unit_id: Some(SafeIdentifier::from_validated("unit-3")),
             }),
+            placeholder: None,
         });
 
         assert_eq!(
@@ -518,14 +544,14 @@ mod tests {
     #[test]
     fn prerequisite_and_validation_facts_keep_specific_problem() {
         let prerequisite = LuaIssue::new(LuaProblem::DatabasePrerequisite {
-            engine: Some(LuaEngine::RpgMaker),
+            engine: Some(LuaEngine::Mz),
             violation: LuaValueViolation::StateMismatch,
         });
         assert_eq!(
             prerequisite.facts(),
             vec![
                 ("operation", "validate_prerequisites".to_owned()),
-                ("engine", "rpg_maker".to_owned()),
+                ("engine", "mz".to_owned()),
                 ("violation", "state_mismatch".to_owned()),
             ]
         );

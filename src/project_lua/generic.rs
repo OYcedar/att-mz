@@ -20,10 +20,8 @@ use crate::generic::{
     validated_manual_translation_state_with_compiled_rules_for_connection_with_cancellation,
 };
 use crate::language::{LanguageText, LanguageTextSegment};
-#[cfg(test)]
-use crate::translation::placeholder::PlaceholderWorkerOperation;
 use crate::translation::placeholder::{
-    PlaceholderProtectionError, PlaceholderRuleCompilationError,
+    PlaceholderProtectionError, PlaceholderRuleCompilationError, PlaceholderWorkerOperation,
 };
 use crate::translation::planning_resource::CompiledTerminology;
 
@@ -818,16 +816,37 @@ fn generic_text_eq_with_cancellation(
 fn generic_placeholder_error(error: GenericPlaceholderError) -> ProjectLuaCallError {
     match error {
         GenericPlaceholderError::Compilation(PlaceholderRuleCompilationError::StartWorker {
-            operation: _,
+            operation,
             source,
-        })
-        | GenericPlaceholderError::Protection(PlaceholderProtectionError::StartWorker {
-            operation: _,
+        }) => generic_placeholder_worker_error(
+            operation,
             source,
-        }) => ProjectLuaCallError::worker_spawn(source)
-            .with_engine(crate::diagnostic::LuaEngine::Generic),
+            crate::diagnostic::LuaValueViolation::StateMismatch,
+        ),
+        GenericPlaceholderError::Protection(PlaceholderProtectionError::StartWorker {
+            operation,
+            source,
+        }) => generic_placeholder_worker_error(
+            operation,
+            source,
+            crate::diagnostic::LuaValueViolation::InvalidTranslation,
+        ),
         _ => generic_call_violation(crate::diagnostic::LuaValueViolation::InvalidTranslation),
     }
+}
+
+fn generic_placeholder_worker_error(
+    operation: PlaceholderWorkerOperation,
+    source: std::io::Error,
+    violation: crate::diagnostic::LuaValueViolation,
+) -> ProjectLuaCallError {
+    let placeholder = crate::diagnostic::PlaceholderIssue::WorkerStart {
+        operation: operation.diagnostic_operation(),
+        io_kind: source.kind().into(),
+        raw_os_code: source.raw_os_error(),
+    };
+    ProjectLuaCallError::placeholder_worker_spawn(source, violation, placeholder)
+        .with_engine(crate::diagnostic::LuaEngine::Generic)
 }
 
 fn sqlite_text_with_cancellation(
@@ -1102,8 +1121,8 @@ mod tests {
 
     use super::*;
     use crate::project_lua::{
-        ProjectLuaFailure, ProjectLuaProgram, ProjectLuaProject, ProjectLuaRunError,
-        ProjectLuaRunRequest, run_project_lua,
+        ProjectLuaEngine, ProjectLuaFailure, ProjectLuaProgram, ProjectLuaProject,
+        ProjectLuaRunError, ProjectLuaRunRequest, run_project_lua,
     };
 
     #[test]
@@ -1205,7 +1224,7 @@ mod tests {
         run_project_lua(
             connection,
             ProjectLuaRunRequest::new(
-                ProjectLuaProject::new("game", "generic"),
+                ProjectLuaProject::new("game", ProjectLuaEngine::Generic),
                 ProjectLuaProgram::new("generic.lua", source.as_bytes(), Vec::new()),
                 generic_project_lua_adapter(expected_project, CooperativeCancellation::default()),
             ),
@@ -1773,7 +1792,7 @@ ctx.translation.set(
         let error = run_project_lua(
             connection,
             ProjectLuaRunRequest::new(
-                ProjectLuaProject::new("game", "generic"),
+                ProjectLuaProject::new("game", ProjectLuaEngine::Generic),
                 ProjectLuaProgram::new(
                     "generic.lua",
                     r#"ctx.db.execute("CREATE TABLE lua_marker (value TEXT)")"#.as_bytes(),

@@ -75,6 +75,16 @@ description: 使用 ATT 规划、建立、继续、诊断、审校、修订、�
 4. 根据新事实继续当前阶段、返回最早失效阶段、进入修订、转入恢复或开始验收。
 5. 文档已有项目内办法且处于上述操作范围时直接执行，不把执行选择重新丢给用户。
 
+Translate 为 Partial 或 Unavailable 时，从 `task.finished.payload.outcome.diagnostic` 跟到同一
+RunId 的 `diagnostic.translation_task` occurrence。Unit scope 中的 `owner`、
+`group_location` 与 `role` 可直接定位 MV/MZ Unit；task scope 本来没有唯一 Unit，结合任务
+记录与当前 Lua 审查判断，不使用临时 ID 或重复原文猜位置。
+
+英语项目需要允许专名、按键名、协议词或单个字母原样保留时，读取语言规格并配置
+`allowed_terms`；
+它只免除译后 `source_residual`，不改变译前判断和临时 ID 分配。只有确实应从译前判断中排除
+的内容才使用 `ignored_terms`，不能混用两者。
+
 重跑命令、改配置、重建项目、重新 Extract、Lua 和人工或 agent 补译都不是万能步骤。
 只有当前原因对应的文档允许时才采用。改 Endpoint、Model、parameters 或凭据，覆盖游戏
 原件，写入外部系统，或执行用户未要求的破坏性操作，都不属于默认范围。只有确实缺少
