@@ -145,8 +145,12 @@ RPG Maker 汇总保存 decision、location、protocol、request exhaustion 与 r
 - `outcome_unknown`
 
 后三种结果必须引用 `diagnostic.publication` occurrence。Generic 汇总保存 files、translated
-units 和 retained source units；RPG Maker 汇总保存 translated/original/auto-wrapped
-units、插入换行、全角缩进与 manual-layout units。
+units、retained source units，以及符号修复尝试 Unit、实际修复 Unit、内部跳过 Unit 和替换
+符号数；RPG Maker 汇总保存 translated/original/auto-wrapped units、插入换行、全角缩进、
+manual-layout units 和同样四项符号修复统计。
+
+符号修复的内部跳过只进入上述汇总，不为每个 Unit 写警告或正文。数据库、Placeholder、
+候选验证和发布等真实错误仍按各自诊断契约记录，不能并入内部跳过统计。
 
 `run.finished.payload.result` 只允许：
 

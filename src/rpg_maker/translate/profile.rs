@@ -318,7 +318,6 @@ mod tests {
     fn resolved_resources_share_the_exact_prompt_and_language_module() {
         let module: Arc<dyn LanguageModule> = Arc::new(JapaneseLanguageModule::new(
             JapaneseResidualPolicy::new(non_zero(1), Vec::new()).expect("测试日文策略合法"),
-            None,
         ));
         let prompt = RpgMakerSystemPrompt::new(
             language_pair(),

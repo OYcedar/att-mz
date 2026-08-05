@@ -1180,7 +1180,6 @@ mod tests {
         let language_analysis = JapaneseLanguageModule::new(
             JapaneseResidualPolicy::new(NonZeroUsize::MIN, Vec::new())
                 .expect("测试日语残留策略应合法"),
-            None,
         )
         .analyze_source(&LanguageText::natural("姫"));
         ExpectedTranslationOutput::new(

@@ -28,7 +28,7 @@ pub(crate) use generic_issue::{
     GenericResourceKind, GenericResponseDestinationProblem, GenericResponseTextProblem,
     GenericResponseValueProblem, GenericTaskResponseJsonCategory, GenericTaskResponseProblem,
     GenericTaskUnavailableReason, GenericTextViolation, GenericTranslationPreparationProblem,
-    GenericWriteBackSnapshotProblem,
+    GenericWriteBackSnapshotProblem, GenericWriteBackTextSide, GenericWriteBackUnitProblem,
 };
 pub(crate) use issue::{
     ConfigurationIssue, DiagnosticIssue, GenericUnitLocator, IoFailure, Pcre2Failure,
@@ -302,10 +302,6 @@ pub(crate) enum ConfigurationValueRule {
     LanguagePolicyTermBlank,
     LanguagePolicyTermSurroundingWhitespace,
     LanguagePolicyTermDuplicate,
-    QuoteRepairCandidatesEmpty,
-    QuoteRepairDelimiterInvalid,
-    QuoteRepairPairDuplicate,
-    QuoteRepairDelimiterAmbiguous,
     LanguageIdBlank,
     LanguageIdSurroundingWhitespace,
     LanguageIdUsesUnderscore,
@@ -347,10 +343,6 @@ impl ConfigurationValueRule {
                 "language_policy_term_surrounding_whitespace"
             }
             Self::LanguagePolicyTermDuplicate => "language_policy_term_duplicate",
-            Self::QuoteRepairCandidatesEmpty => "quote_repair_candidates_empty",
-            Self::QuoteRepairDelimiterInvalid => "quote_repair_delimiter_invalid",
-            Self::QuoteRepairPairDuplicate => "quote_repair_pair_duplicate",
-            Self::QuoteRepairDelimiterAmbiguous => "quote_repair_delimiter_ambiguous",
             Self::LanguageIdBlank => "language_id_blank",
             Self::LanguageIdSurroundingWhitespace => "language_id_surrounding_whitespace",
             Self::LanguageIdUsesUnderscore => "language_id_uses_underscore",
@@ -438,7 +430,6 @@ pub(crate) enum ConfigurationTomlValueKind {
     StringOrBoolean,
     StringArray,
     IntegerArray,
-    StringPairArray,
     Table,
     TableArray,
 }
@@ -452,7 +443,6 @@ impl ConfigurationTomlValueKind {
             Self::StringOrBoolean => "string_or_boolean",
             Self::StringArray => "string_array",
             Self::IntegerArray => "integer_array",
-            Self::StringPairArray => "string_pair_array",
             Self::Table => "table",
             Self::TableArray => "table_array",
         }

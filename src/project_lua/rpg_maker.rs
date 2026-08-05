@@ -3594,6 +3594,7 @@ fn validate_assets(
         }
         cancellation.ensure_running()?;
         let validated = RpgMakerWriteBackGroup::from_recipes(
+            group.owner,
             group.kind,
             group.location.clone(),
             write_back_units,
@@ -3870,6 +3871,7 @@ mod tests {
         )];
         let recipes_json = RpgMakerProjectionCodec::encode_recipes(&recipes).expect("应编码配方");
         let group = RpgMakerWriteBackGroup::from_recipes(
+            RpgMakerAssetOwner::Builtin,
             TextGroupKind::DatabaseEntry,
             location,
             vec![RpgMakerWriteBackUnit::new(role, source_content, None).expect("应建立写回 Unit")],
@@ -4034,6 +4036,7 @@ mod tests {
         )];
         let recipes_json = RpgMakerProjectionCodec::encode_recipes(&recipes).expect("应编码配方");
         let write_back_group = RpgMakerWriteBackGroup::from_recipes(
+            RpgMakerAssetOwner::Builtin,
             TextGroupKind::DatabaseEntry,
             logical_group_location,
             vec![

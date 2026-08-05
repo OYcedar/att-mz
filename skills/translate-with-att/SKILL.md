@@ -75,6 +75,10 @@ description: 使用 ATT 规划、建立、继续、诊断、审校、修订、�
 4. 根据新事实继续当前阶段、返回最早失效阶段、进入修订、转入恢复或开始验收。
 5. 文档已有项目内办法且处于上述操作范围时直接执行，不把执行选择重新丢给用户。
 
+WriteBack 会对 Generic、MV 和 MZ 自动执行全局译文符号修复，不需要也不接受语言专用
+引号配置。判断输出差异时读取对应 WriteBack 与语言规格；修复器内部无法安全判断只会
+保留原译文，不能用这一行为解释或忽略数据库、Placeholder、布局、候选验证和发布错误。
+
 Translate 为 Partial 或 Unavailable 时，从 `task.finished.payload.outcome.diagnostic` 跟到同一
 RunId 的 `diagnostic.translation_task` occurrence。Unit scope 中的 `owner`、
 `group_location` 与 `role` 可直接定位 MV/MZ Unit；task scope 本来没有唯一 Unit，结合任务

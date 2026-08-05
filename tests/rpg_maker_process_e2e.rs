@@ -23,6 +23,7 @@ const MV_SPEAKER: &str = "アリス";
 const MV_BODY: &str = "こんにちは、世界！";
 const MV_SPEAKER_TRANSLATION: &str = "爱丽丝";
 const MV_BODY_TRANSLATION: &str = "你好，世界！";
+const MV_BODY_WRITE_BACK: &str = "你好、世界！";
 const RULES_SHORT_SOURCE: &str = "ポーション";
 const RULES_SHORT_TRANSLATION: &str = "治疗药水";
 const RULES_LONG_SOURCE: &str = "高級ポーション";
@@ -297,6 +298,280 @@ fn same_named_mv_mz_and_generic_projects_remain_isolated_across_real_processes()
     assert_eq!(
         original_mz[1]["description"], SOURCE_TEXT,
         "WriteBack 不得修改外部游戏目录"
+    );
+}
+
+#[test]
+fn rpg_maker_write_back_repairs_symbols_for_mv_and_mz_without_language_configuration() {
+    for (engine, game_directory, source_language, configuration) in [
+        ("mz", "mz-game", "en", ""),
+        (
+            "mz",
+            "mz-game",
+            "ja",
+            "[prompts]\nthinking_output = false\nsource_echo = false\n",
+        ),
+        ("mv", "mv-game", "en", ""),
+        (
+            "mv",
+            "mv-game",
+            "ja",
+            "[prompts]\nthinking_output = false\nsource_echo = false\n",
+        ),
+    ] {
+        let temporary = tempfile::tempdir().expect("应可建立 RPG Maker 符号修复进程测试目录");
+        let root = temporary.path();
+        let game = root.join(game_directory);
+        if engine == "mv" {
+            write_minimal_mv_game(&game);
+        } else {
+            write_minimal_mz_game(&game);
+        }
+
+        let data = if engine == "mv" {
+            game.join("www/data")
+        } else {
+            game.join("data")
+        };
+        fs::write(
+            data.join("Items.json"),
+            serde_json::to_vec(&json!([
+                null,
+                {
+                    "id": 1,
+                    "name": "",
+                    "description": "General, Misc, Audio, Toggle"
+                }
+            ]))
+            .expect("Categories Items 夹具应可序列化"),
+        )
+        .expect("Categories Items 夹具应可写入");
+        if engine == "mv" {
+            fs::write(
+                data.join("Map001.json"),
+                serde_json::to_vec(&json!({ "displayName": "", "events": [null] }))
+                    .expect("无文本 MV Map 夹具应可序列化"),
+            )
+            .expect("无文本 MV Map 夹具应可写入");
+        }
+
+        let distribution = distribution_root(root);
+        fs::create_dir_all(&distribution).expect("应可建立 RPG Maker 符号修复发行目录");
+        fs::write(distribution.join("config.toml"), configuration)
+            .expect("RPG Maker 符号修复配置应可写入");
+
+        let mut init = init_arguments(engine, &game);
+        let source_language_position = init
+            .iter()
+            .position(|value| value == "--source-language")
+            .expect("Init 参数必须包含源语言");
+        init[source_language_position + 1] = source_language.into();
+        assert_success(&format!("{engine} 符号修复 Init"), &run_att(root, init));
+        assert_success(
+            &format!("{engine} 符号修复 Extract"),
+            &run_att(
+                root,
+                arguments(&[engine, "extract", "--name", PROJECT, "--builtin"]),
+            ),
+        );
+
+        let workspace = distribution.join("projects").join(engine).join(PROJECT);
+        let connection =
+            Connection::open(workspace.join("project.db")).expect("项目数据库应可打开");
+        let source_content_json =
+            serde_json::to_string("General, Misc, Audio, Toggle").expect("Categories 原文应可编码");
+        let (owner, group_location, unit_role): (String, String, String) = connection
+            .query_row(
+                "SELECT unit.owner, text_group.group_location, unit.unit_role
+                 FROM rpg_maker_text_unit AS unit
+                 JOIN rpg_maker_text_group AS text_group
+                   ON text_group.owner = unit.owner
+                  AND text_group.group_id = unit.group_id
+                 WHERE unit.source_content_json = ?1",
+                [&source_content_json],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("应定位 Categories Unit");
+        drop(connection);
+
+        let script = root.join(format!("set-{engine}-categories.lua"));
+        fs::write(
+            &script,
+            format!(
+                "ctx.translation.set(\n  {{ owner = [==[{owner}]==], group_location = [==[{group_location}]==], unit_role = [==[{unit_role}]==] }},\n  [==[常规、杂项、声音、开关]==]\n)\n"
+            ),
+        )
+        .expect("Categories Lua 脚本应可写入");
+        let mut lua_arguments = arguments(&[engine, "lua", "--name", PROJECT]);
+        lua_arguments.push(script.into_os_string());
+        assert_success(
+            &format!("{engine} 符号修复 Lua"),
+            &run_att(root, lua_arguments),
+        );
+
+        let logs = workspace.join("logs");
+        let logs_before = fs::read_dir(&logs)
+            .expect("WriteBack 前项目日志目录应可读取")
+            .map(|entry| entry.expect("WriteBack 前项目日志项应可读取").path())
+            .collect::<Vec<_>>();
+        let write_back = run_att(root, arguments(&[engine, "write-back", "--name", PROJECT]));
+        assert_success(&format!("{engine} 符号修复 WriteBack"), &write_back);
+        assert!(
+            write_back.stderr.is_empty(),
+            "非 TTY WriteBack 不得输出实时进度：{}",
+            String::from_utf8_lossy(&write_back.stderr)
+        );
+        let stdout = String::from_utf8(write_back.stdout).expect("WriteBack stdout 必须是 UTF-8");
+        let plain_stdout = stdout.replace(['\u{2068}', '\u{2069}'], "");
+        assert!(
+            plain_stdout
+                .contains("符号修复：尝试 1 个单元，实际修复 1 个，内部跳过 0 个，替换 3 个符号"),
+            "CLI 必须报告四项符号修复统计：{stdout}"
+        );
+
+        let output = if engine == "mv" {
+            workspace.join("write_back/www/data/Items.json")
+        } else {
+            workspace.join("write_back/data/Items.json")
+        };
+        assert_eq!(
+            read_items(&output)[1]["description"],
+            "常规,杂项,声音,开关",
+            "WriteBack 只能替换确定标点，不得补入原文空格"
+        );
+
+        let new_logs = fs::read_dir(&logs)
+            .expect("WriteBack 后项目日志目录应可读取")
+            .map(|entry| entry.expect("WriteBack 后项目日志项应可读取").path())
+            .filter(|path| !logs_before.contains(path))
+            .collect::<Vec<_>>();
+        assert_eq!(new_logs.len(), 1, "一次 WriteBack 只能新增一份项目日志");
+        let publication = read_project_log_records(&new_logs[0])
+            .into_iter()
+            .find(|record| record["code"] == "publication.finished")
+            .expect("成功 WriteBack 必须记录 publication.finished");
+        assert_eq!(publication["payload"]["result"]["kind"], "published");
+        assert_eq!(
+            publication["payload"]["result"]["summary"]["engine"],
+            "rpg_maker"
+        );
+        let summary = &publication["payload"]["result"]["summary"]["summary"];
+        assert_eq!(summary["symbol_repair_attempted_units"], 1);
+        assert_eq!(summary["symbol_repair_repaired_units"], 1);
+        assert_eq!(summary["symbol_repair_skipped_units"], 0);
+        assert_eq!(summary["symbol_repair_replacements"], 3);
+    }
+}
+
+#[test]
+fn mz_write_back_rejects_current_with_placeholder_added_after_translation() {
+    let temporary = tempfile::tempdir().expect("应可建立 MZ Placeholder 重新验收测试目录");
+    let root = temporary.path();
+    let game = root.join("mz-game");
+    write_minimal_mz_game(&game);
+    fs::write(
+        game.join("data/Items.json"),
+        serde_json::to_vec(&json!([
+            null,
+            {
+                "id": 1,
+                "name": "",
+                "description": "General, Misc"
+            }
+        ]))
+        .expect("Placeholder 重新验收 Items 应可序列化"),
+    )
+    .expect("Placeholder 重新验收 Items 应可写入");
+    let distribution = distribution_root(root);
+    fs::create_dir_all(&distribution).expect("应可建立 MZ Placeholder 重新验收发行目录");
+    fs::write(distribution.join("config.toml"), "").expect("MZ Placeholder 重新验收空配置应可写入");
+
+    assert_success(
+        "MZ Placeholder 重新验收 Init",
+        &run_att(root, init_arguments("mz", &game)),
+    );
+    assert_success(
+        "MZ Placeholder 重新验收 Extract",
+        &run_att(
+            root,
+            arguments(&["mz", "extract", "--name", PROJECT, "--builtin"]),
+        ),
+    );
+
+    let workspace = distribution.join("projects/mz").join(PROJECT);
+    let database = workspace.join("project.db");
+    let connection = Connection::open(&database).expect("MZ 项目数据库应可打开");
+    let source_content_json = serde_json::to_string("General, Misc").expect("测试原文应可编码");
+    let (owner, group_location, unit_role): (String, String, String) = connection
+        .query_row(
+            "SELECT unit.owner, text_group.group_location, unit.unit_role
+             FROM rpg_maker_text_unit AS unit
+             JOIN rpg_maker_text_group AS text_group
+               ON text_group.owner = unit.owner
+              AND text_group.group_id = unit.group_id
+             WHERE unit.source_content_json = ?1",
+            [&source_content_json],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("应定位 Placeholder 重新验收 Unit");
+    drop(connection);
+
+    let script = root.join("set-placeholder-current.lua");
+    fs::write(
+        &script,
+        format!(
+            "ctx.translation.set(\n  {{ owner = [==[{owner}]==], group_location = [==[{group_location}]==], unit_role = [==[{unit_role}]==] }},\n  [==[[常规、杂项]]==]\n)\n"
+        ),
+    )
+    .expect("新增 Placeholder 的 Current Lua 应可写入");
+    let mut lua_arguments = arguments(&["mz", "lua", "--name", PROJECT]);
+    lua_arguments.push(script.into_os_string());
+    assert_success("MZ 建立规则变化前的 Current", &run_att(root, lua_arguments));
+
+    let placeholder_rules = serde_json::to_string(&json!([{
+        "scopes": ["database_entry"],
+        "pattern": r"\[[^]]+\]"
+    }]))
+    .expect("项目 Placeholder 规则应可编码");
+    assert_eq!(
+        Connection::open(&database)
+            .expect("MZ 项目数据库应可重新打开")
+            .execute(
+                "UPDATE rpg_maker_translation_resource
+                 SET canonical_json = ?1
+                 WHERE resource_kind = 'placeholder_rules'",
+                [&placeholder_rules],
+            )
+            .expect("应可更新项目 Placeholder 快照"),
+        1
+    );
+
+    let write_back = run_att(root, arguments(&["mz", "write-back", "--name", PROJECT]));
+    assert_eq!(write_back.status.code(), Some(1));
+    let stdout = String::from_utf8(write_back.stdout).expect("WriteBack stdout 必须是 UTF-8");
+    assert!(
+        !stdout.contains("符号修复"),
+        "Placeholder 验收失败不得伪报符号修复汇总：{stdout}"
+    );
+    let stderr = String::from_utf8(write_back.stderr).expect("WriteBack stderr 必须是 UTF-8");
+    for expected in [
+        "translation.placeholder.changed_segment_count",
+        "owner=builtin",
+        "group_kind=database_entry",
+        "role=scalar:description",
+        "rule_source=project_snapshot",
+        "expected=0",
+        "actual=1",
+        "状态未改变",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "WriteBack Placeholder 失败必须保留 {expected:?}：{stderr}"
+        );
+    }
+    assert!(
+        !workspace.join("write_back/data/Items.json").exists(),
+        "Placeholder 验收失败不得生成目标 Items.json"
     );
 }
 
@@ -1065,7 +1340,7 @@ fn mv_dialogue_crosses_extract_translate_and_write_back_processes() {
     assert_eq!(commands[1]["code"], 401);
     assert_eq!(
         commands[1]["parameters"][0],
-        format!(r"\n<{MV_SPEAKER_TRANSLATION}>{MV_BODY_TRANSLATION}")
+        format!(r"\n<{MV_SPEAKER_TRANSLATION}>{MV_BODY_WRITE_BACK}")
     );
     assert_eq!(commands[2]["code"], 0);
     assert_eq!(
@@ -2228,7 +2503,6 @@ type = "japanese"
 id = "ja"
 minimum_kana_characters = 1
 allowed_terms = []
-quote_repair_pairs = [["“", "”"], ["‘", "’"]]
 
 [translation]
 

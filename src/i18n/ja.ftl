@@ -104,6 +104,7 @@ result-generic-extract-unchanged = Generic 入力に変更なし: { $files } フ
 result-generic-extract-updated = Generic 入力を更新: { $files } ファイル、{ $groups } グループ、{ $units } 単位。訳文 { $preserved } 件を保持し、{ $cleared } 件を消去
 result-generic-translate-summary = Generic 翻訳: タスク { $total }、完全 { $complete }、部分 { $partial }、利用不可 { $unavailable }。クリア { $cleared }、再利用 { $reused }、受理 { $accepted }、書き込み { $written }、競合 { $conflicted }、応答問題 { $problems }
 result-generic-write-back-summary = Generic 書き戻し: 訳文 { $translated } 単位、原文保持 { $original } 単位
+result-symbol-repair-summary = 記号修復: { $attempted } 単位を確認、{ $repaired } 単位を修復、内部スキップ { $skipped } 単位、{ $replacements } 記号を置換
 result-cancelled = 安全な終了処理後にコマンドをキャンセルしました。
 result-plan-saved = 成功した実行プランを保存しました。
 log-run-started = コマンド { $command } を開始しました。
@@ -292,10 +293,6 @@ diagnostic-configuration-rule-value = { $code ->
     [language_policy_term_blank] 言語ポリシー用語を空白にできません
     [language_policy_term_surrounding_whitespace] 言語ポリシー用語の前後に空白を含められません
     [language_policy_term_duplicate] 言語ポリシー用語を重複させられません
-    [quote_repair_candidates_empty] 引用符修復候補リストを空にできません
-    [quote_repair_delimiter_invalid] 引用符修復の区切り文字に英数字、空白、制御文字は使用できません
-    [quote_repair_pair_duplicate] 引用符修復ペアを重複させられません
-    [quote_repair_delimiter_ambiguous] 引用符修復の区切り文字は 1 つのペアだけに属する必要があります
     [language_id_blank] 言語 ID を空白にできません
     [language_id_surrounding_whitespace] 言語 ID の前後に空白を含められません
     [language_id_uses_underscore] 言語 ID のサブタグ間にはハイフンを使用してください

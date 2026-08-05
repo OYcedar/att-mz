@@ -20,7 +20,6 @@ type = "japanese"
 id = "ja"
 minimum_kana_characters = 1
 allowed_terms = []
-quote_repair_pairs = [["“", "”"], ["‘", "’"]]
 ```
 
 - 日语译前判断只要 NaturalText 含有平假名、片假名或支持范围内的汉字，就会请求翻译；
@@ -29,8 +28,6 @@ quote_repair_pairs = [["“", "”"], ["‘", "’"]]
 - `minimum_kana_characters` 是译后残留检查的正整数阈值，不是译前准入条件。它检查
   `allowed_terms` 之外连续出现的假名；目标译文中的汉字不按日语残留处理；
 - `allowed_terms` 列出允许保留在目标文本中的源语片段；
-- `quote_repair_pairs` 是成对的单字符开引号与闭引号，供 WriteBack 在写入候选前按源文
-  引号拓扑规范化译文；Translate 不因引号样式或开闭方向差异拒绝合格译文；
 - 未在当前语言类型中声明的字段严格拒绝。
 
 英语配置例如：
@@ -65,6 +62,21 @@ allowed_terms = ["Page Up", "Page Down"]
 Translate 启动时先校验全部语言定义，再按项目的源语言 ID 精确选择模块；找不到
 匹配定义时，会在发出任何模型请求之前失败。
 
-WriteBack 只读取当前项目源语言对应的 `id`、`type` 和 `quote_repair_pairs`。日文配置存在
-候选引号对时，WriteBack 会在 Generic、MV 和 MZ 的候选构建阶段共用同一规范化器；无法
-唯一确认源文拓扑、译文数量或布局时保持译文原样，不阻断发布。
+## 写回符号修复
+
+Generic、MV 和 MZ 的 WriteBack 永久使用同一套、与源语言无关的译文符号修复。原文是
+符号模板：修复器只把译文中已经存在、并且能够唯一对应到原文位置的符号替换成原文实际
+字符，不插入、删除或移动任何字符，也不改变译文空白。译文新增符号保留，原文存在但译文
+缺失的符号不补。
+
+候选包括全部 ASCII punctuation、Unicode `P*` 标点，以及 NFKC 后成为单个 ASCII
+punctuation 的全角或兼容字符，因此全角 `＋`、`＝` 属于候选；除此之外，非 ASCII emoji、
+货币符号和数学符号不参与。只有语义相同的符号族才能对应，普通 `/` 与 `\`、省略号与句点
+等不同含义的符号不得互换；单词内部的撇号不按引号开闭关系处理。
+
+Placeholder、RPG Maker 控制符和 Rules Literal 形成 opaque 段，正文匹配不读取或改写其
+字节；引号和括号的结构可以跨 opaque 边界继续判断，但原文与译文的 opaque 边界结构无法
+可靠对应时，整个 Unit 保留原译文。普通多解只保留相应译文字符，其他能够确定的位置仍可
+修复；资源分配或修复不变量无法成立时也保留整个 Unit 并继续 WriteBack。符号修复本身不把
+合格译文变成错误，也不隐藏数据库、Placeholder、候选验证或发布的真实失败。用户取消会
+中止修复规划并沿用 WriteBack 的取消语义，不记为内部跳过。

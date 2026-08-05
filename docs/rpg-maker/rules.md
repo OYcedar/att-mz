@@ -606,17 +606,21 @@ Builtin 匹配严格使用 ASCII 字母和 `[0-9]`；命令名接受 ASCII 大�
 |---|:---:|:---:|
 | `\V[n]`、`\N[n]`、`\P[n]`、`\C[n]`、`\I[n]` | 保护 | 保护 |
 | `\PX[n]`、`\PY[n]`、`\FS[n]` | 不内建 | 保护 |
+| `\n<...>`、`\N<...>` 姓名框 | 保护 | 保护 |
 | `\G` | 保护 | 保护 |
 | `\\`、`\{`、`\}`、`\$`、`\.`、`\|`、`\!`、`\>`、`\<`、`\^` | 保护 | 保护 |
 
 `n` 必须由一个或多个 ASCII 数字组成。插件扩展——包括 MV 插件自行实现的 PX/PY/FS——
 请用自定义 Placeholder Rule 明确保护。
+姓名框必须包含闭合 `>`，框内不得出现 Unicode 控制字符；框内可以包含 `\n[145]` 等
+方括号控制语法。ATT 不把其他裸尖括号文本推断成姓名框。
 表中的 `\<`、`\>` 都带着实际的反斜杠；裸 `<`、`>` 不是 Builtin Placeholder，外形再像
 插件协议也不会被推断成占位符。
 
-MV 行为依据 RPG Maker MV 的
+方括号和单字符控制符依据 RPG Maker MV 的
 [官方 `Window_Base` 核心脚本](https://raw.githubusercontent.com/rpgtkoolmv/corescript/master/js/rpg_windows/Window_Base.js)
-固化；ATT 只内建该脚本中自己实际消费的上述控制符，不把插件新增控制符推断成 Builtin。
+固化；姓名框则是 ATT 的固定文本协议，同时供 Placeholder 保护和 WriteBack 布局识别使用。
+除此之外，ATT 不把插件新增控制符推断成 Builtin。
 
 ### 6.9 匹配、NaturalText 与重叠
 

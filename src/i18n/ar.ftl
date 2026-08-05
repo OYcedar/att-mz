@@ -111,6 +111,7 @@ result-generic-extract-unchanged = لم تتغير مدخلات Generic: ‏{ $f
 result-generic-extract-updated = حُدثت مدخلات Generic: ‏{ $files } ملفًا و{ $groups } مجموعة و{ $units } وحدة؛ حُفظت { $preserved } ترجمة ومُسحت { $cleared }
 result-generic-translate-summary = ترجمة Generic: ‏{ $total } مهمة؛ مكتملة { $complete }، جزئية { $partial }، غير متاحة { $unavailable }؛ مُسحت { $cleared }، وأُعيد استخدام { $reused }، وقُبل { $accepted }، وكُتب { $written }، والتعارضات { $conflicted }، ومشكلات الاستجابة { $problems }
 result-generic-write-back-summary = كتابة Generic: ‏{ $translated } وحدة مترجمة مع الاحتفاظ بـ { $original } وحدة مصدر
+result-symbol-repair-summary = إصلاح الرموز: فُحصت { $attempted } وحدة، وأُصلحت { $repaired }، وتُخطيت داخليًا { $skipped }، واستُبدل { $replacements } رمزًا
 result-cancelled = أُلغي الأمر بعد إنهاء آمن.
 result-plan-saved = حُفظت خطة التشغيل الناجحة.
 log-run-started = بدأ الأمر { $command }.
@@ -306,10 +307,6 @@ diagnostic-configuration-rule-value = { $code ->
     [language_policy_term_blank] يجب ألا يكون مصطلح سياسة اللغة فارغًا
     [language_policy_term_surrounding_whitespace] يجب ألا يحتوي مصطلح سياسة اللغة على مسافات طرفية
     [language_policy_term_duplicate] يجب ألا يتكرر مصطلح سياسة اللغة
-    [quote_repair_candidates_empty] يجب ألا تكون قائمة مرشحي إصلاح علامات الاقتباس فارغة
-    [quote_repair_delimiter_invalid] يجب ألا يكون فاصل إصلاح علامات الاقتباس حرفًا أبجديًا رقميًا أو مسافة أو حرف تحكم
-    [quote_repair_pair_duplicate] يجب ألا يتكرر زوج إصلاح علامات الاقتباس
-    [quote_repair_delimiter_ambiguous] يجب أن ينتمي فاصل إصلاح علامات الاقتباس إلى زوج واحد فقط
     [language_id_blank] يجب ألا يكون معرّف اللغة فارغًا
     [language_id_surrounding_whitespace] يجب ألا يحتوي معرّف اللغة على مسافات طرفية
     [language_id_uses_underscore] يجب أن يستخدم معرّف اللغة الشرطات بين الوسوم الفرعية

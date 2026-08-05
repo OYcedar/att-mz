@@ -5,6 +5,7 @@ pub(crate) mod placeholder_projection;
 pub(crate) mod placeholder_token;
 pub(crate) mod planning_resource;
 pub(crate) mod profile;
+pub(crate) mod symbol_repair;
 pub(crate) mod task_planning;
 pub(crate) mod task_record;
 pub(crate) mod user_message;

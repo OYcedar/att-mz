@@ -64,6 +64,14 @@ pub struct RpgMakerWriteBackSummary {
     pub inserted_fullwidth_indents: usize,
     /// 保守布局无法安全处理、需要人工换行的文本单元数。
     pub manual_layout_units: usize,
+    /// 已尝试执行全局符号修复的译文单元数。
+    pub symbol_repair_attempted_units: usize,
+    /// 至少替换了一个符号的译文单元数。
+    pub symbol_repair_repaired_units: usize,
+    /// 因符号匹配或修复算法内部无法安全完成而保留原译文的单元数。
+    pub symbol_repair_skipped_units: usize,
+    /// 全局符号修复实际替换的字符总数。
+    pub symbol_repair_replacements: usize,
 }
 
 /// 写回命令正常完成后交还给 CLI 的结果。

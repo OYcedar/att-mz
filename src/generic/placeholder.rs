@@ -89,9 +89,20 @@ impl GenericPlaceholderService {
         compiled: &GenericCompiledPlaceholderRules,
         ensure_running: impl FnMut() -> Result<(), E>,
     ) -> Result<Result<GenericProtectedText, GenericPlaceholderError>, E> {
+        self.protect_compiled_text_with_cancellation(kind, original, compiled, ensure_running)
+            .map(|result| result.map_err(GenericPlaceholderError::Protection))
+    }
+
+    /// 使用已经编译的规则保护文本，只暴露此阶段实际可能产生的匹配错误。
+    pub(crate) fn protect_compiled_text_with_cancellation<E>(
+        &self,
+        kind: &str,
+        original: &str,
+        compiled: &GenericCompiledPlaceholderRules,
+        ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Result<GenericProtectedText, PlaceholderProtectionError>, E> {
         self.common
             .protect_with_cancellation(kind, original, &[], compiled, None, ensure_running)
-            .map(|result| result.map_err(GenericPlaceholderError::Protection))
     }
 
     #[cfg(test)]
@@ -317,10 +328,39 @@ pub(crate) fn validate_translation_placeholders_and_binding_with_cancellation<E>
         Ok(candidate) => candidate,
         Err(error) => return Ok(Err(error)),
     };
+    validate_protected_translation_placeholders_with_cancellation(
+        &source,
+        &candidate,
+        ensure_running,
+    )
+}
+
+/// 比较已经完成保护的原文和译文，避免 WriteBack 为符号修复重复执行 Placeholder 匹配。
+pub(crate) fn validate_protected_translation_placeholders_with_cancellation<E>(
+    source: &GenericProtectedText,
+    candidate: &GenericProtectedText,
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<Result<Sha256Fingerprint, GenericPlaceholderError>, E> {
+    if !protected_translation_placeholder_binding_matches_with_cancellation(
+        source,
+        candidate,
+        &mut ensure_running,
+    )? {
+        return Ok(Err(GenericPlaceholderError::ManualTranslationMismatch));
+    }
+    ensure_running()?;
+    Ok(Ok(source.binding_fingerprint()))
+}
+
+pub(crate) fn protected_translation_placeholder_binding_matches_with_cancellation<E>(
+    source: &GenericProtectedText,
+    candidate: &GenericProtectedText,
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
     ensure_running()?;
     if source.placeholders().len() != candidate.placeholders().len() {
         ensure_running()?;
-        return Ok(Err(GenericPlaceholderError::ManualTranslationMismatch));
+        return Ok(false);
     }
     for (source, candidate) in source.placeholders().iter().zip(candidate.placeholders()) {
         ensure_running()?;
@@ -329,11 +369,11 @@ pub(crate) fn validate_translation_placeholders_and_binding_with_cancellation<E>
             candidate,
             &mut ensure_running,
         )? {
-            return Ok(Err(GenericPlaceholderError::ManualTranslationMismatch));
+            return Ok(false);
         }
     }
     ensure_running()?;
-    Ok(Ok(source.binding_fingerprint()))
+    Ok(true)
 }
 
 fn applied_placeholder_identity_equal_with_cancellation<E>(

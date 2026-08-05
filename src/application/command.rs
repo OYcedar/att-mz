@@ -2632,10 +2632,6 @@ impl ProductionRpgMakerCommandRunner {
             write_back_phase_code,
         );
         let directory_publisher = file_system.directory_publisher(command.publisher().clone());
-        let text_normalizer = command
-            .rpg_maker()
-            .text_normalizers()
-            .resolve(opened_project.source_language());
         let opener = PreopenedProject::new(opened_project);
         let asset_reader = RpgMakerWriteBackAssetReadingService::new(sqlite.clone(), cpu.clone());
         let document_reader = RpgMakerProjectDocumentReadingService::new(
@@ -2652,11 +2648,7 @@ impl ProductionRpgMakerCommandRunner {
             rewriter,
             cpu.clone(),
             cancellation.clone(),
-        );
-        let write_back = match text_normalizer {
-            Some(normalizer) => write_back.with_text_normalizer(normalizer),
-            None => write_back,
-        }
+        )
         .with_progress(progress_observer.clone());
         let publisher = RpgMakerWriteBackPublishingService::new(directory_publisher.clone());
         let business_log = ProductionBusinessLog::from_active(&project_log);
@@ -4502,6 +4494,22 @@ impl WriteBackLog for ProductionBusinessLog {
                                 summary.manual_layout_units,
                                 "人工布局单元数",
                             ),
+                            symbol_repair_attempted_units: usize_to_u64(
+                                summary.symbol_repair_attempted_units,
+                                "符号修复尝试单元数",
+                            ),
+                            symbol_repair_repaired_units: usize_to_u64(
+                                summary.symbol_repair_repaired_units,
+                                "符号修复实际单元数",
+                            ),
+                            symbol_repair_skipped_units: usize_to_u64(
+                                summary.symbol_repair_skipped_units,
+                                "符号修复内部跳过单元数",
+                            ),
+                            symbol_repair_replacements: usize_to_u64(
+                                summary.symbol_repair_replacements,
+                                "符号修复替换字符数",
+                            ),
                         }),
                     },
                 });
@@ -5961,6 +5969,10 @@ where
                 let report = write_back_planning_compute_report(&source);
                 ReportedFailure::new(report, source)
             }
+            RpgMakerWriteBackServiceError::InvalidPlaceholder(source) => {
+                let report = source.diagnostic_report();
+                ReportedFailure::new(report, source)
+            }
             RpgMakerWriteBackServiceError::InvalidPlan(source) => {
                 let report = source.diagnostic_report();
                 ReportedFailure::new(report, source)
@@ -6791,6 +6803,28 @@ impl CommandResultRenderer {
                         manual: usize_to_u64(
                             output.summary.manual_layout_units,
                             "人工布局 Unit 数",
+                        ),
+                    })
+                )?;
+                writeln!(
+                    stdout,
+                    "{}",
+                    localizer.format(UiMessage::ResultSymbolRepairSummary {
+                        attempted: usize_to_u64(
+                            output.summary.symbol_repair_attempted_units,
+                            "符号修复尝试 Unit 数",
+                        ),
+                        repaired: usize_to_u64(
+                            output.summary.symbol_repair_repaired_units,
+                            "符号修复实际 Unit 数",
+                        ),
+                        skipped: usize_to_u64(
+                            output.summary.symbol_repair_skipped_units,
+                            "符号修复内部跳过 Unit 数",
+                        ),
+                        replacements: usize_to_u64(
+                            output.summary.symbol_repair_replacements,
+                            "符号修复替换符号数",
                         ),
                     })
                 )?;

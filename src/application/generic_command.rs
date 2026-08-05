@@ -44,8 +44,9 @@ use crate::diagnostic::{
     GenericLanguageProjectionProblem, GenericPlaceholderMultisetProblem, GenericProblem,
     GenericResponseDestinationProblem, GenericTaskResponseJsonCategory, GenericTaskResponseProblem,
     GenericTaskUnavailableReason, GenericTranslationPreparationProblem,
-    GenericUnitLocator as DiagnosticGenericUnitLocator, IoFailure, Pcre2Failure, Pcre2FailureKind,
-    PlaceholderIssue, PlaceholderMatchRangeViolation as DiagnosticMatchRangeViolation,
+    GenericUnitLocator as DiagnosticGenericUnitLocator, GenericWriteBackTextSide,
+    GenericWriteBackUnitProblem, IoFailure, Pcre2Failure, Pcre2FailureKind, PlaceholderIssue,
+    PlaceholderMatchRangeViolation as DiagnosticMatchRangeViolation,
     PlaceholderRuleOrigin as DiagnosticPlaceholderRuleOrigin,
     PlaceholderRuleSource as DiagnosticPlaceholderRuleSource,
     PlaceholderWorkerOperation as DiagnosticPlaceholderWorkerOperation, PublicationIssue,
@@ -315,6 +316,10 @@ pub(crate) enum GenericCommandOutput {
         output_root: PathBuf,
         translated_units: usize,
         retained_source_units: usize,
+        symbol_repair_attempted_units: usize,
+        symbol_repair_repaired_units: usize,
+        symbol_repair_skipped_units: usize,
+        symbol_repair_replacements: usize,
     },
     Lua {
         project: ProjectName,
@@ -1756,7 +1761,6 @@ impl ProductionGenericCommandRunner {
         let operation_cancellation = cancellation.clone();
         let operation_publication_gate = publication_gate.clone();
         let output_name = project_name.clone();
-        let operation_text_normalizers = command.text_normalizers().clone();
         let operation_project_log = generic_project_log_handle(&project_log);
         let operation_publication_occurrence = Arc::clone(&publication_occurrence);
         let operation = async move {
@@ -1780,8 +1784,6 @@ impl ProductionGenericCommandRunner {
             )
             .await?;
             let project = snapshot.project().clone();
-            let text_normalizer =
-                operation_text_normalizers.resolve(project.language_pair().source());
             let terminology = current_resources.terminology();
             let placeholder_rules = current_resources.placeholder_rules();
 
@@ -1811,7 +1813,7 @@ impl ProductionGenericCommandRunner {
                 })
                 .await
                 .map_err(generic_cpu_execution_failure)?
-                .map_err(generic_preparation_failure)?;
+                .map_err(generic_write_back_preparation_failure)?;
             let automatic_resources = if has_automatic_translation {
                 match project.last_profile_id().map(str::to_owned) {
                     Some(profile_id) => {
@@ -1863,7 +1865,7 @@ impl ProductionGenericCommandRunner {
                                 })
                                 .await
                                 .map_err(generic_cpu_execution_failure)?
-                                .map_err(generic_preparation_failure)?,
+                                .map_err(generic_write_back_preparation_failure)?,
                         )
                     }
                     None => None,
@@ -1874,6 +1876,7 @@ impl ProductionGenericCommandRunner {
             let current_snapshot = snapshot;
             let current_terms = Arc::clone(&terminology);
             let current_rules = placeholder_rules.clone();
+            let write_back_rules = placeholder_rules;
             let current_cancellation = operation_cancellation.clone();
             let (current_snapshot, current_translations) = operation_cpu
                 .execute(move || {
@@ -1888,7 +1891,7 @@ impl ProductionGenericCommandRunner {
                 })
                 .await
                 .map_err(generic_cpu_execution_failure)?
-                .map_err(generic_preparation_failure)?;
+                .map_err(generic_write_back_preparation_failure)?;
             ensure_generic_operation_running(&operation_cancellation)?;
             let candidate_cancellation = operation_cancellation.clone();
             let (write_back_project, candidate) = operation_cpu
@@ -1898,7 +1901,7 @@ impl ProductionGenericCommandRunner {
                         &current_snapshot,
                         &live,
                         &current_translations,
-                        text_normalizer.as_deref(),
+                        &write_back_rules,
                         &candidate_cancellation,
                     )
                     .map(|candidate| (project, candidate))
@@ -2459,23 +2462,37 @@ fn generic_translation_resource_report(
 }
 
 fn generic_preparation_failure(source: GenericPreparationError) -> GenericCommandError {
+    generic_preparation_failure_at(GenericDiagnosticStage::Translate, source)
+}
+
+fn generic_write_back_preparation_failure(source: GenericPreparationError) -> GenericCommandError {
+    generic_preparation_failure_at(GenericDiagnosticStage::WriteBack, source)
+}
+
+fn generic_preparation_failure_at(
+    stage: GenericDiagnosticStage,
+    source: GenericPreparationError,
+) -> GenericCommandError {
     if source.is_cancelled() {
         GenericCommandError::Cancelled
     } else {
-        let report = generic_preparation_report(&source);
+        let report = generic_preparation_report_at(&source, stage);
         GenericCommandError::reported(source, report)
     }
 }
 
-fn generic_preparation_report(source: &GenericPreparationError) -> DiagnosticReport {
-    if let Some(report) = generic_placeholder_protection_report(source) {
+fn generic_preparation_report_at(
+    source: &GenericPreparationError,
+    stage: GenericDiagnosticStage,
+) -> DiagnosticReport {
+    if let Some(report) = generic_placeholder_protection_report(source, stage) {
         return report;
     }
     let preparation = |unit, problem| {
         DiagnosticReport::new(
             StateEffect::Unchanged,
             Diagnostic::generic(GenericIssue::project(
-                GenericDiagnosticStage::Translate,
+                stage,
                 GenericProblem::TranslationPreparation { unit, problem },
             )),
         )
@@ -2546,6 +2563,23 @@ fn generic_preparation_report(source: &GenericPreparationError) -> DiagnosticRep
         },
         GenericPreparationError::PlaceholderProtection { .. } => {
             unreachable!("带定位的 Placeholder 失败已在函数入口处理")
+        }
+        GenericPreparationError::LanguageProjection { locator, source }
+            if stage == GenericDiagnosticStage::WriteBack =>
+        {
+            DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::generic(GenericIssue::project(
+                    GenericDiagnosticStage::WriteBack,
+                    GenericProblem::WriteBackUnit {
+                        unit: diagnostic_generic_unit_locator(locator),
+                        problem: GenericWriteBackUnitProblem::LanguageProjection {
+                            side: GenericWriteBackTextSide::Source,
+                            problem: generic_language_projection_problem(source),
+                        },
+                    },
+                )),
+            )
         }
         GenericPreparationError::LanguageProjection { locator, source } => preparation(
             Some(diagnostic_generic_unit_locator(locator)),
@@ -2762,6 +2796,7 @@ const fn generic_task_planning_problem(
 
 fn generic_placeholder_protection_report(
     source: &GenericPreparationError,
+    stage: GenericDiagnosticStage,
 ) -> Option<DiagnosticReport> {
     let GenericPreparationError::PlaceholderProtection {
         rule_source,
@@ -2786,6 +2821,21 @@ fn generic_placeholder_protection_report(
         Some(&locator.role),
     );
     let problem = placeholder_protection_issue(source);
+    if stage == GenericDiagnosticStage::WriteBack {
+        return Some(DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::generic(GenericIssue::project(
+                GenericDiagnosticStage::WriteBack,
+                GenericProblem::WriteBackUnit {
+                    unit,
+                    problem: GenericWriteBackUnitProblem::PlaceholderProtection {
+                        side: GenericWriteBackTextSide::Source,
+                        problem,
+                    },
+                },
+            )),
+        ));
+    }
     Some(DiagnosticReport::new(
         StateEffect::Unchanged,
         Diagnostic::translation(TranslationIssue::Placeholder {
@@ -6062,6 +6112,10 @@ async fn publish_generic_write_back(
     let workspace_root = project.workspace_root().to_path_buf();
     let translated_units = candidate.translated_units();
     let retained_source_units = candidate.retained_source_units();
+    let symbol_repair_attempted_units = candidate.symbol_repair_attempted_units();
+    let symbol_repair_repaired_units = candidate.symbol_repair_repaired_units();
+    let symbol_repair_skipped_units = candidate.symbol_repair_skipped_units();
+    let symbol_repair_replacements = candidate.symbol_repair_replacement_count();
     let files = candidate.files().len();
     let scratch_candidate = candidate;
     let scratch_workspace = workspace_root.clone();
@@ -6203,6 +6257,10 @@ async fn publish_generic_write_back(
                     files: generic_count(files),
                     translated_units: generic_count(translated_units),
                     retained_source_units: generic_count(retained_source_units),
+                    symbol_repair_attempted_units: generic_count(symbol_repair_attempted_units),
+                    symbol_repair_repaired_units: generic_count(symbol_repair_repaired_units),
+                    symbol_repair_skipped_units: generic_count(symbol_repair_skipped_units),
+                    symbol_repair_replacements: generic_count(symbol_repair_replacements),
                 }),
             },
         });
@@ -6212,6 +6270,10 @@ async fn publish_generic_write_back(
         output_root: target_root,
         translated_units,
         retained_source_units,
+        symbol_repair_attempted_units,
+        symbol_repair_repaired_units,
+        symbol_repair_skipped_units,
+        symbol_repair_replacements,
     })
 }
 
@@ -6732,8 +6794,7 @@ mod tests {
         manual_translation_state_fingerprint,
     };
     use crate::language::{
-        JapaneseLanguageModule, JapaneseQuoteRepairPolicy, JapaneseResidualPolicy, LanguageId,
-        LanguageModule, QuotePair,
+        JapaneseLanguageModule, JapaneseResidualPolicy, LanguageId, LanguageModule,
     };
     use crate::storage::file_system::{DirectoryPublishError, StagingCleanupFailure};
     use crate::translation::planning_resource::{TerminologyEntry, compile_terminology};
@@ -6919,15 +6980,6 @@ mod tests {
         {
             self.inner.find_source_residual(analysis, translation)
         }
-
-        fn plan_translation_repair(
-            &self,
-            analysis: &LanguageAnalysis,
-            translation: &LanguageText,
-        ) -> Result<crate::language::LanguageRepairPlan, crate::language::LanguageModuleError>
-        {
-            self.inner.plan_translation_repair(analysis, translation)
-        }
     }
 
     #[test]
@@ -7044,7 +7096,6 @@ mod tests {
             inner: JapaneseLanguageModule::new(
                 JapaneseResidualPolicy::new(NonZeroUsize::MIN, Vec::new())
                     .expect("日文残留策略应该合法"),
-                None,
             ),
             started: Mutex::new(Some(started_sender)),
             release: Arc::clone(&release),
@@ -7141,7 +7192,6 @@ mod tests {
         let language_module: Arc<dyn LanguageModule> = Arc::new(JapaneseLanguageModule::new(
             JapaneseResidualPolicy::new(NonZeroUsize::MIN, Vec::new())
                 .expect("日文残留策略应该合法"),
-            None,
         ));
 
         for expected_rule_source in [
@@ -7167,8 +7217,9 @@ mod tests {
                 Ok(_) => panic!("最早的缺少 text 捕获应该阻止规划"),
             };
 
-            let report = generic_placeholder_protection_report(&error)
-                .expect("Placeholder 叶子失败必须直接投影为结构化报告");
+            let report =
+                generic_placeholder_protection_report(&error, GenericDiagnosticStage::Translate)
+                    .expect("Placeholder 叶子失败必须直接投影为结构化报告");
             let wire = serde_json::to_value(&report).expect("诊断报告必须可序列化");
             assert_eq!(
                 wire["primary"]["code"],
@@ -7204,6 +7255,32 @@ mod tests {
                     "end": "甲触发缺组".len(),
                 })
             );
+            if expected_rule_source == GenericPlaceholderRuleSource::ProjectSnapshot {
+                let report = generic_placeholder_protection_report(
+                    &error,
+                    GenericDiagnosticStage::WriteBack,
+                )
+                .expect("WriteBack Placeholder 失败必须保留 Unit 定位");
+                let wire = serde_json::to_value(report).expect("诊断报告必须可序列化");
+                assert_eq!(
+                    wire["primary"]["code"],
+                    "generic.write_back.placeholder.missing_text_capture"
+                );
+                assert_eq!(wire["primary"]["stage"], "write_back");
+                assert_eq!(wire["primary"]["resolution"], "fix_placeholder_rules");
+                assert_eq!(
+                    wire["primary"]["issue"]["details"]["operation"],
+                    "build_write_back_candidate"
+                );
+                assert_eq!(
+                    wire["primary"]["issue"]["details"]["problem"]["unit"]["role"],
+                    "dialogue"
+                );
+                assert_eq!(
+                    wire["primary"]["issue"]["details"]["problem"]["problem"]["side"],
+                    "source"
+                );
+            }
 
             match error {
                 GenericPreparationError::PlaceholderProtection {
@@ -8066,7 +8143,6 @@ mod tests {
                 Vec::new(),
             )
             .expect("日文残留策略应该合法"),
-            None,
         ));
         let prepared = prepare_generic_translation(
             &snapshot,
@@ -8190,10 +8266,6 @@ mod tests {
         let language_module: Arc<dyn LanguageModule> = Arc::new(JapaneseLanguageModule::new(
             JapaneseResidualPolicy::new(NonZeroUsize::MIN, Vec::new())
                 .expect("日文残留策略应该合法"),
-            Some(
-                JapaneseQuoteRepairPolicy::new(vec![QuotePair::new('“', '”')])
-                    .expect("日文引号修复策略应该合法"),
-            ),
         ));
         let terminology = Arc::new(CompiledTerminology::empty());
         let prepared = prepare_generic_translation(
@@ -8298,7 +8370,6 @@ mod tests {
         let language_module: Arc<dyn LanguageModule> = Arc::new(JapaneseLanguageModule::new(
             JapaneseResidualPolicy::new(NonZeroUsize::MIN, Vec::new())
                 .expect("日文残留策略应该合法"),
-            None,
         ));
         let target = NonZeroUsize::new(260).expect("常量应该非零");
         let prepared = prepare_generic_translation(
@@ -8443,6 +8514,114 @@ mod tests {
             build_write_back_candidate(&stored, &live, &current).expect("Partial 应允许写回");
         assert_eq!(candidate.translated_units(), 1);
         assert_eq!(candidate.retained_source_units(), 1);
+    }
+
+    #[test]
+    fn write_back_current_rejects_translation_that_no_longer_preserves_placeholders() {
+        let temporary = tempfile::tempdir().expect("应该可建立临时目录");
+        let source_root = temporary.path().join("source");
+        fs::create_dir_all(&source_root).expect("应该可建立输入目录");
+        fs::write(
+            source_root.join("scene.jsonl"),
+            concat!(
+                r#"{"id":"group","kind":"dialogue","units":["#,
+                r#"{"id":"unit","text":"Open [A]."}]}"#,
+                "\n"
+            ),
+        )
+        .expect("应该可写入 Generic 输入");
+        let (store, _) = GenericProjectStore::initialize(GenericInitRequest {
+            project_name: "current-placeholder-test".parse().expect("项目名应该合法"),
+            workspace_root: temporary.path().join("project"),
+            source_root: Some(source_root),
+            source_language: Some(LanguageId::parse("en").expect("源语言应该合法")),
+            target_language: Some(LanguageId::parse("zh-Hans").expect("目标语言应该合法")),
+        })
+        .expect("Generic 项目应该可初始化");
+        store.extract().expect("Generic 输入应该可提取");
+        let snapshot = store.load_snapshot().expect("应该可读取 Generic 快照");
+        let group = &snapshot.files()[0].groups()[0];
+        let unit = &group.units()[0];
+        let rules = GenericPlaceholderService::default()
+            .compile(vec![GenericPlaceholderRuleDefinition::new(
+                Some(vec!["dialogue".to_owned()]),
+                r"\[[^]]+\]",
+            )])
+            .expect("Placeholder 规则应该合法");
+        let binding = GenericPlaceholderService::default()
+            .protect(group.kind(), unit.source_text(), &rules)
+            .expect("原文应该可保护")
+            .binding_fingerprint();
+        let state = manual_translation_state_fingerprint(
+            snapshot.project().language_pair(),
+            &GenericUnitKey::new(group.id().to_owned(), unit.id().to_owned()),
+            unit.source_text(),
+            group.context_fingerprint(),
+            binding,
+        );
+        store
+            .commit_translations(
+                snapshot
+                    .project()
+                    .extracted_raw_fingerprint()
+                    .expect("Extract 应保存原始指纹"),
+                &[crate::generic::TranslationWrite {
+                    group_id: group.id().to_owned(),
+                    unit_id: unit.id().to_owned(),
+                    expected_source_text: unit.source_text().to_owned(),
+                    expected_group_context: group.context_fingerprint(),
+                    translation: "打开 [B]。".to_owned(),
+                    origin: crate::generic::TranslationOrigin::Manual,
+                    state_fingerprint: state,
+                    expected_translation: None,
+                }],
+            )
+            .expect("测试应可建立状态匹配但 Placeholder 已不匹配的译文");
+        let (stored, live) = store
+            .ensure_input_current()
+            .expect("应该可重新读取当前 Generic 输入");
+        let current = collect_generic_current_translations(
+            &stored,
+            &CompiledTerminology::empty(),
+            &rules,
+            None,
+            &CooperativeCancellation::default(),
+        )
+        .expect("Current 收集只判断状态，候选构建负责验收译文 Placeholder");
+        let error = build_write_back_candidate_with_cancellation(
+            &stored,
+            &live,
+            &current,
+            &rules,
+            &CooperativeCancellation::default(),
+        )
+        .expect_err("当前 Placeholder 不匹配必须阻止 WriteBack 候选");
+        let wire = serde_json::to_value(error.diagnostic_report(StateEffect::Unchanged))
+            .expect("WriteBack 诊断必须可序列化");
+
+        assert_eq!(
+            wire["primary"]["code"],
+            "generic.write_back.placeholder.binding_mismatch"
+        );
+        assert_eq!(wire["primary"]["stage"], "write_back");
+        assert_eq!(
+            wire["primary"]["issue"]["details"]["operation"],
+            "build_write_back_candidate"
+        );
+        assert_eq!(wire["primary"]["resolution"], "fix_input");
+        assert_eq!(
+            wire["primary"]["issue"]["details"]["problem"]["unit"],
+            serde_json::json!({
+                "relative_path": "scene.jsonl",
+                "group_id": "group",
+                "unit_id": "unit",
+                "role": "dialogue",
+            })
+        );
+        assert_eq!(
+            wire["primary"]["issue"]["details"]["problem"]["problem"]["side"],
+            "translation"
+        );
     }
 
     #[test]
@@ -8743,7 +8922,6 @@ mod tests {
         let language_module: Arc<dyn LanguageModule> = Arc::new(JapaneseLanguageModule::new(
             JapaneseResidualPolicy::new(NonZeroUsize::MIN, Vec::new())
                 .expect("日文残留策略应该合法"),
-            None,
         ));
         let resources = AutomaticStateResources {
             prompt: fingerprint(81),
@@ -8888,7 +9066,6 @@ mod tests {
         let language_module = JapaneseLanguageModule::new(
             JapaneseResidualPolicy::new(NonZeroUsize::MIN, Vec::new())
                 .expect("日文残留策略应该合法"),
-            None,
         );
         let key = GenericUnitKey::new("group".to_owned(), "unit".to_owned());
         let mut facts = GenericUnitMap::new();

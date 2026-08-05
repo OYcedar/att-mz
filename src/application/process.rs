@@ -631,6 +631,10 @@ fn render_generic_output(
             output_root,
             translated_units,
             retained_source_units,
+            symbol_repair_attempted_units,
+            symbol_repair_repaired_units,
+            symbol_repair_skipped_units,
+            symbol_repair_replacements,
         } => {
             writeln!(
                 stdout,
@@ -652,6 +656,16 @@ fn render_generic_output(
                 localizer.format(UiMessage::ResultGenericWriteBackSummary {
                     translated: count(translated_units),
                     original: count(retained_source_units),
+                })
+            )?;
+            writeln!(
+                stdout,
+                "{}",
+                localizer.format(UiMessage::ResultSymbolRepairSummary {
+                    attempted: count(symbol_repair_attempted_units),
+                    repaired: count(symbol_repair_repaired_units),
+                    skipped: count(symbol_repair_skipped_units),
+                    replacements: count(symbol_repair_replacements),
                 })
             )
         }

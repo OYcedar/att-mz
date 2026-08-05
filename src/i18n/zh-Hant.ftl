@@ -104,6 +104,7 @@ result-generic-extract-unchanged = Generic 輸入未變更：{ $files } 個檔�
 result-generic-extract-updated = Generic 輸入已更新：{ $files } 個檔案，{ $groups } 個群組，{ $units } 個單元；保留 { $preserved } 條譯文，清除 { $cleared } 條
 result-generic-translate-summary = Generic 翻譯：工作 { $total }，完整 { $complete }，部分 { $partial }，無法使用 { $unavailable }；清除 { $cleared }，重用 { $reused }，接受 { $accepted }，寫入 { $written }，衝突 { $conflicted }，回應問題 { $problems }
 result-generic-write-back-summary = Generic 寫回：套用譯文 { $translated } 個單元，保留原文 { $original } 個單元
+result-symbol-repair-summary = 符號修復：嘗試 { $attempted } 個單元，實際修復 { $repaired } 個，內部略過 { $skipped } 個，替換 { $replacements } 個符號
 result-cancelled = 命令已在安全收尾後取消。
 result-plan-saved = 已儲存本次成功執行方案。
 log-run-started = 命令 { $command } 已開始。
@@ -292,10 +293,6 @@ diagnostic-configuration-rule-value = { $code ->
     [language_policy_term_blank] 語言原則詞彙不能為空白
     [language_policy_term_surrounding_whitespace] 語言原則詞彙不能包含前後空白
     [language_policy_term_duplicate] 語言原則詞彙不能重複
-    [quote_repair_candidates_empty] 引號修復候選清單不能為空
-    [quote_repair_delimiter_invalid] 引號修復分隔符號不能是英數字元、空白或控制字元
-    [quote_repair_pair_duplicate] 引號修復配對不能重複
-    [quote_repair_delimiter_ambiguous] 引號修復分隔符號必須只屬於一個配對
     [language_id_blank] 語言 ID 不能為空白
     [language_id_surrounding_whitespace] 語言 ID 不能包含前後空白
     [language_id_uses_underscore] 語言 ID 的子標籤間必須使用連字號
