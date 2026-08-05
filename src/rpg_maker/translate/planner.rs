@@ -1060,7 +1060,7 @@ fn planning_failure_reason(
     }
 }
 
-fn placeholder_protection_planning_failure(
+pub(crate) fn placeholder_protection_planning_failure(
     source: PlaceholderProtectionError,
 ) -> TranslationPlaceholderProtectionFailure {
     match source {
@@ -1126,7 +1126,7 @@ fn placeholder_protection_planning_failure(
     }
 }
 
-fn placeholder_projection_planning_failure(
+pub(crate) fn placeholder_projection_planning_failure(
     source: LanguageTextProjectionError,
 ) -> TranslationPlaceholderProjectionFailure {
     match source {
@@ -2932,7 +2932,6 @@ mod tests {
                 Vec::new(),
             )
             .expect("测试日文残留策略应该有效"),
-            None,
         ));
         let pair = LanguagePair::new(
             LanguageId::parse(source_language).expect("测试源语言应合法"),

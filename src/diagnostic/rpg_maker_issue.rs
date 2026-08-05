@@ -3771,6 +3771,11 @@ pub(crate) enum RpgMakerWriteBackAssetSnapshotViolation {
         expected: SafeIdentifier,
         actual: SafeIdentifier,
     },
+    PlaceholderRuleRowCount {
+        expected: usize,
+        actual: usize,
+    },
+    BlankPlaceholderRules,
     InvalidSemanticOrderKey {
         column: SafeIdentifier,
         violation: RpgMakerSemanticOrderKeyViolation,
@@ -4087,6 +4092,8 @@ impl RpgMakerWriteBackAssetSnapshotViolation {
             Self::WrongQueryResultSetCount { .. } => "wrong_query_result_set_count",
             Self::WrongColumnCount { .. } => "wrong_column_count",
             Self::WrongColumnType { .. } => "wrong_column_type",
+            Self::PlaceholderRuleRowCount { .. } => "placeholder_rule_row_count",
+            Self::BlankPlaceholderRules => "blank_placeholder_rules",
             Self::InvalidSemanticOrderKey { .. } => "invalid_semantic_order_key",
             Self::UnknownOwner => "unknown_owner",
             Self::DuplicateOwner { .. } => "duplicate_owner",
@@ -4112,6 +4119,12 @@ impl RpgMakerWriteBackAssetSnapshotViolation {
             }
             "wrong_column_count" => "rpg_maker.write_back.asset_snapshot.wrong_column_count",
             "wrong_column_type" => "rpg_maker.write_back.asset_snapshot.wrong_column_type",
+            "placeholder_rule_row_count" => {
+                "rpg_maker.write_back.asset_snapshot.placeholder_rule_row_count"
+            }
+            "blank_placeholder_rules" => {
+                "rpg_maker.write_back.asset_snapshot.blank_placeholder_rules"
+            }
             "invalid_semantic_order_key" => {
                 "rpg_maker.write_back.asset_snapshot.invalid_semantic_order_key"
             }
@@ -4215,6 +4228,10 @@ impl RpgMakerWriteBackAssetSnapshotViolation {
                 facts.push(("expected", expected.to_string()));
                 facts.push(("actual", actual.to_string()));
             }
+            Self::PlaceholderRuleRowCount { expected, actual } => {
+                facts.push(("expected", expected.to_string()));
+                facts.push(("actual", actual.to_string()));
+            }
             Self::InvalidSemanticOrderKey { column, violation } => {
                 facts.push(("column", column.to_string()));
                 facts.push(("semantic_order_failure", violation.as_str().to_owned()));
@@ -4290,7 +4307,10 @@ impl RpgMakerWriteBackAssetSnapshotViolation {
             Self::InvalidModel { violation } => {
                 facts.push(("model_violation", violation.code_suffix().to_owned()));
             }
-            Self::UnknownOwner | Self::UnknownGroupKind | Self::UnknownMutationAccess => {}
+            Self::UnknownOwner
+            | Self::UnknownGroupKind
+            | Self::UnknownMutationAccess
+            | Self::BlankPlaceholderRules => {}
         }
         facts
     }
@@ -6154,6 +6174,7 @@ pub(crate) enum RpgMakerProblem {
         problem: PlaceholderIssue,
     },
     PlaceholderProjection {
+        rule_source: PlaceholderRuleSource,
         unit: RpgMakerUnitLocator,
         problem: RpgMakerPlaceholderProjectionProblem,
     },
@@ -6344,12 +6365,46 @@ impl RpgMakerIssue {
 
     #[cfg(test)]
     pub(crate) const fn placeholder_projection(
+        rule_source: PlaceholderRuleSource,
         unit: RpgMakerUnitLocator,
         problem: RpgMakerPlaceholderProjectionProblem,
     ) -> Self {
         Self {
             stage: RpgMakerDiagnosticStage::TranslatePlanning,
-            problem: RpgMakerProblem::PlaceholderProjection { unit, problem },
+            problem: RpgMakerProblem::PlaceholderProjection {
+                rule_source,
+                unit,
+                problem,
+            },
+        }
+    }
+
+    pub(crate) const fn write_back_placeholder_planning(
+        rule_source: PlaceholderRuleSource,
+        unit: RpgMakerUnitLocator,
+        problem: PlaceholderIssue,
+    ) -> Self {
+        Self {
+            stage: RpgMakerDiagnosticStage::WriteBackDocument,
+            problem: RpgMakerProblem::PlaceholderPlanning {
+                rule_source,
+                unit,
+                problem,
+            },
+        }
+    }
+
+    pub(crate) const fn write_back_placeholder_projection(
+        unit: RpgMakerUnitLocator,
+        problem: RpgMakerPlaceholderProjectionProblem,
+    ) -> Self {
+        Self {
+            stage: RpgMakerDiagnosticStage::WriteBackDocument,
+            problem: RpgMakerProblem::PlaceholderProjection {
+                rule_source: PlaceholderRuleSource::ProjectSnapshot,
+                unit,
+                problem,
+            },
         }
     }
 
@@ -6562,7 +6617,13 @@ impl RpgMakerIssue {
             RpgMakerProblem::PlaceholderPlanning { .. } => {
                 DiagnosticResolution::FixPlaceholderRules
             }
-            RpgMakerProblem::PlaceholderProjection { .. } => DiagnosticResolution::ReportBug,
+            RpgMakerProblem::PlaceholderProjection { .. } => {
+                if matches!(self.stage, RpgMakerDiagnosticStage::WriteBackDocument) {
+                    DiagnosticResolution::FixInput
+                } else {
+                    DiagnosticResolution::ReportBug
+                }
+            }
             RpgMakerProblem::ResponseProcessing { problem, .. } => match problem {
                 RpgMakerResponseProcessingProblem::Cancelled
                 | RpgMakerResponseProcessingProblem::Compute { .. } => DiagnosticResolution::Retry,
@@ -6763,7 +6824,21 @@ impl RpgMakerIssue {
                 facts.extend(problem.facts());
                 facts
             }
-            RpgMakerProblem::PlaceholderProjection { problem, .. } => problem.facts(),
+            RpgMakerProblem::PlaceholderProjection {
+                rule_source,
+                problem,
+                ..
+            } => {
+                let mut facts = vec![(
+                    "rule_source",
+                    match rule_source {
+                        PlaceholderRuleSource::ExternalFile { path } => path.to_string(),
+                        PlaceholderRuleSource::ProjectSnapshot => "project_snapshot".to_owned(),
+                    },
+                )];
+                facts.extend(problem.facts());
+                facts
+            }
             RpgMakerProblem::ResponseProcessing { scope, problem } => {
                 let mut facts = vec![("task_index", scope.task_index().to_string())];
                 facts.extend(problem.facts());
@@ -6919,6 +6994,7 @@ mod tests {
     #[test]
     fn planning_projection_is_an_internal_projection_failure() {
         let issue = RpgMakerIssue::placeholder_projection(
+            PlaceholderRuleSource::ProjectSnapshot,
             RpgMakerUnitLocator::new(
                 RpgMakerDiagnosticOwner::Rules,
                 RpgMakerDiagnosticGroupKind::EventDialogue,

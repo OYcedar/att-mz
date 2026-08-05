@@ -109,6 +109,7 @@ result-generic-extract-unchanged = Входные данные Generic не из
 result-generic-extract-updated = Входные данные Generic обновлены: файлов — { $files }, групп — { $groups }, единиц — { $units }; переводов сохранено — { $preserved }, очищено — { $cleared }
 result-generic-translate-summary = Перевод Generic: { $total } задач; завершено { $complete }, частично { $partial }, недоступно { $unavailable }; очищено { $cleared }, повторно использовано { $reused }, принято { $accepted }, записано { $written }, конфликтов { $conflicted }, проблем ответа { $problems }
 result-generic-write-back-summary = Запись Generic: { $translated } переведённых единиц, { $original } исходных сохранено
+result-symbol-repair-summary = Исправление символов: проверено { $attempted } единиц, исправлено { $repaired }, внутренне пропущено { $skipped }, заменено символов { $replacements }
 result-cancelled = Команда отменена после безопасного завершения.
 result-plan-saved = Успешный план запуска сохранён.
 log-run-started = Команда { $command } запущена.
@@ -302,10 +303,6 @@ diagnostic-configuration-rule-value = { $code ->
     [language_policy_term_blank] Термин языковой политики не должен быть пустым
     [language_policy_term_surrounding_whitespace] Термин языковой политики не должен содержать пробелы по краям
     [language_policy_term_duplicate] Термин языковой политики не должен повторяться
-    [quote_repair_candidates_empty] Список вариантов исправления кавычек не должен быть пустым
-    [quote_repair_delimiter_invalid] Разделитель исправления кавычек не должен быть буквой, цифрой, пробелом или управляющим символом
-    [quote_repair_pair_duplicate] Пара исправления кавычек не должна повторяться
-    [quote_repair_delimiter_ambiguous] Разделитель исправления кавычек должен принадлежать ровно одной паре
     [language_id_blank] Идентификатор языка не должен быть пустым
     [language_id_surrounding_whitespace] Идентификатор языка не должен содержать пробелы по краям
     [language_id_uses_underscore] Идентификатор языка должен разделять подтеги дефисами

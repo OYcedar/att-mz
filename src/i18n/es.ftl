@@ -107,6 +107,7 @@ result-generic-extract-unchanged = Entrada Generic sin cambios: { $files } archi
 result-generic-extract-updated = Entrada Generic actualizada: { $files } archivos, { $groups } grupos, { $units } unidades; { $preserved } traducciones conservadas y { $cleared } borradas
 result-generic-translate-summary = Traducción Generic: { $total } tareas; { $complete } completas, { $partial } parciales, { $unavailable } no disponibles; { $cleared } borradas, { $reused } reutilizadas, { $accepted } aceptadas, { $written } escritas, { $conflicted } conflictos, { $problems } problemas de respuesta
 result-generic-write-back-summary = Escritura Generic: { $translated } unidades traducidas, { $original } unidades de origen conservadas
+result-symbol-repair-summary = Reparación de símbolos: { $attempted } unidades examinadas, { $repaired } reparadas, { $skipped } omitidas internamente y { $replacements } símbolos sustituidos
 result-cancelled = El comando se canceló tras finalizar de forma segura.
 result-plan-saved = Se guardó el plan de ejecución correcto.
 log-run-started = El comando { $command } comenzó.
@@ -298,10 +299,6 @@ diagnostic-configuration-rule-value = { $code ->
     [language_policy_term_blank] El término de política lingüística no puede estar vacío
     [language_policy_term_surrounding_whitespace] El término de política lingüística no puede tener espacios al principio o al final
     [language_policy_term_duplicate] El término de política lingüística no puede estar duplicado
-    [quote_repair_candidates_empty] La lista de candidatos de reparación de comillas no puede estar vacía
-    [quote_repair_delimiter_invalid] El delimitador de reparación de comillas no puede ser alfanumérico, espacio ni carácter de control
-    [quote_repair_pair_duplicate] El par de reparación de comillas no puede estar duplicado
-    [quote_repair_delimiter_ambiguous] El delimitador de reparación de comillas debe pertenecer exactamente a un par
     [language_id_blank] El identificador de idioma no puede estar vacío
     [language_id_surrounding_whitespace] El identificador de idioma no puede tener espacios al principio o al final
     [language_id_uses_underscore] El identificador de idioma debe separar las subetiquetas con guiones

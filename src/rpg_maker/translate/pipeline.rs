@@ -911,6 +911,14 @@ impl TranslationPlanningFailure {
             }
             TranslationPlanningFailureReason::PlaceholderProjection { failure } => {
                 crate::diagnostic::RpgMakerIssue::placeholder_projection(
+                    match &self.rule_source {
+                        TranslationPlaceholderRuleSource::ExternalFile(path) => {
+                            crate::diagnostic::PlaceholderRuleSource::external_file(path)
+                        }
+                        TranslationPlaceholderRuleSource::ProjectSnapshot => {
+                            crate::diagnostic::PlaceholderRuleSource::ProjectSnapshot
+                        }
+                    },
                     unit,
                     placeholder_projection_diagnostic(failure),
                 )
@@ -930,8 +938,7 @@ pub(super) fn rpg_maker_diagnostic_unit(
     )
 }
 
-#[cfg(test)]
-fn placeholder_protection_diagnostic(
+pub(crate) fn placeholder_protection_diagnostic(
     failure: &TranslationPlaceholderProtectionFailure,
 ) -> crate::diagnostic::PlaceholderIssue {
     use crate::diagnostic::{
@@ -1071,8 +1078,7 @@ fn placeholder_protection_diagnostic(
     }
 }
 
-#[cfg(test)]
-pub(super) fn placeholder_projection_diagnostic(
+pub(crate) fn placeholder_projection_diagnostic(
     failure: &TranslationPlaceholderProjectionFailure,
 ) -> crate::diagnostic::RpgMakerPlaceholderProjectionProblem {
     use crate::diagnostic::RpgMakerPlaceholderProjectionProblem as Problem;
@@ -5761,7 +5767,6 @@ mod tests {
                 Vec::new(),
             )
             .expect("测试日文残留策略应该有效"),
-            None,
         )
         .analyze_source(&LanguageText::natural("宝剑"))
     }

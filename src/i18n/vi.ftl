@@ -104,6 +104,7 @@ result-generic-extract-unchanged = Đầu vào Generic không đổi: { $files }
 result-generic-extract-updated = Đã cập nhật đầu vào Generic: { $files } tệp, { $groups } nhóm, { $units } đơn vị; giữ { $preserved } bản dịch và xóa { $cleared }
 result-generic-translate-summary = Dịch Generic: { $total } tác vụ; { $complete } hoàn tất, { $partial } một phần, { $unavailable } không khả dụng; xóa { $cleared }, dùng lại { $reused }, chấp nhận { $accepted }, ghi { $written }, xung đột { $conflicted }, lỗi phản hồi { $problems }
 result-generic-write-back-summary = Ghi lại Generic: { $translated } đơn vị dịch, giữ nguyên { $original } đơn vị nguồn
+result-symbol-repair-summary = Sửa ký hiệu: đã thử { $attempted } đơn vị, sửa { $repaired }, bỏ qua nội bộ { $skipped }, thay { $replacements } ký hiệu
 result-cancelled = Lệnh đã bị hủy sau khi hoàn tất an toàn.
 result-plan-saved = Kế hoạch chạy thành công đã được lưu.
 log-run-started = Lệnh { $command } đã bắt đầu.
@@ -292,10 +293,6 @@ diagnostic-configuration-rule-value = { $code ->
     [language_policy_term_blank] Thuật ngữ chính sách ngôn ngữ không được để trống
     [language_policy_term_surrounding_whitespace] Thuật ngữ chính sách ngôn ngữ không được có khoảng trắng ở hai đầu
     [language_policy_term_duplicate] Thuật ngữ chính sách ngôn ngữ không được trùng lặp
-    [quote_repair_candidates_empty] Danh sách ứng viên sửa dấu ngoặc kép không được để trống
-    [quote_repair_delimiter_invalid] Dấu phân cách sửa dấu ngoặc kép không được là chữ số, khoảng trắng hoặc ký tự điều khiển
-    [quote_repair_pair_duplicate] Cặp sửa dấu ngoặc kép không được trùng lặp
-    [quote_repair_delimiter_ambiguous] Dấu phân cách sửa dấu ngoặc kép phải thuộc đúng một cặp
     [language_id_blank] ID ngôn ngữ không được để trống
     [language_id_surrounding_whitespace] ID ngôn ngữ không được có khoảng trắng ở hai đầu
     [language_id_uses_underscore] ID ngôn ngữ phải dùng dấu gạch ngang giữa các thẻ con

@@ -107,6 +107,7 @@ result-generic-extract-unchanged = Generic input unchanged: { $files } files, { 
 result-generic-extract-updated = Generic input updated: { $files } files, { $groups } groups, { $units } units; preserved { $preserved } translations and cleared { $cleared }
 result-generic-translate-summary = Generic translation: { $total } tasks; { $complete } complete, { $partial } partial, { $unavailable } unavailable; cleared { $cleared }, reused { $reused }, accepted { $accepted }, wrote { $written }, conflicts { $conflicted }, response problems { $problems }
 result-generic-write-back-summary = Generic write-back: { $translated } translated units, { $original } source units retained
+result-symbol-repair-summary = Symbol repair: attempted { $attempted } units, repaired { $repaired }, skipped internally { $skipped }, replaced { $replacements } symbols
 result-cancelled = The command was cancelled after safe finalization.
 result-plan-saved = The successful run plan was saved.
 log-run-started = Command { $command } started.
@@ -298,10 +299,6 @@ diagnostic-configuration-rule-value = { $code ->
     [language_policy_term_blank] Language policy term must not be blank
     [language_policy_term_surrounding_whitespace] Language policy term must not contain surrounding whitespace
     [language_policy_term_duplicate] Language policy term must not be duplicated
-    [quote_repair_candidates_empty] Quote repair candidate list must not be empty
-    [quote_repair_delimiter_invalid] Quote repair delimiter must not be alphanumeric, whitespace, or control
-    [quote_repair_pair_duplicate] Quote repair pair must not be duplicated
-    [quote_repair_delimiter_ambiguous] Quote repair delimiter must belong to exactly one pair
     [language_id_blank] Language ID must not be blank
     [language_id_surrounding_whitespace] Language ID must not contain surrounding whitespace
     [language_id_uses_underscore] Language ID must use hyphens between subtags

@@ -3236,8 +3236,8 @@ mod tests {
     use crate::fingerprint::Sha256Fingerprint;
     use crate::language::{
         EnglishLanguageModule, EnglishResidualPolicy, EnglishTranslationDetectionPolicy,
-        JapaneseLanguageModule, JapaneseQuoteRepairPolicy, JapaneseResidualPolicy, LanguageId,
-        LanguageModule, LanguagePair, LanguageText, QuotePair,
+        JapaneseLanguageModule, JapaneseResidualPolicy, LanguageId, LanguageModule, LanguagePair,
+        LanguageText,
     };
     use crate::llm::{ChatMessage, ChatMessageRole};
     use crate::rpg_maker::asset::RpgMakerAssetOwner;
@@ -3485,13 +3485,6 @@ mod tests {
         Arc::new(JapaneseLanguageModule::new(
             JapaneseResidualPolicy::new(NonZeroUsize::new(2).expect("测试阈值非零"), Vec::new())
                 .expect("日文残留策略有效"),
-            Some(
-                JapaneseQuoteRepairPolicy::new(vec![
-                    QuotePair::new('“', '”'),
-                    QuotePair::new('‘', '’'),
-                ])
-                .expect("日文引号修复策略有效"),
-            ),
         ))
     }
 

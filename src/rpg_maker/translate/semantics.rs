@@ -111,7 +111,6 @@ impl ResolvedTranslationSemantics {
         let source_language = Arc::new(JapaneseLanguageModule::new(
             JapaneseResidualPolicy::new(NonZeroUsize::new(1).expect("常量非零"), Vec::new())
                 .expect("测试日文残留策略应有效"),
-            None,
         ));
         Self::new(
             RpgMakerEngine::Mz,
@@ -1089,7 +1088,6 @@ mod tests {
             .expect("测试占位符应可编译");
         let source_language = Arc::new(JapaneseLanguageModule::new(
             JapaneseResidualPolicy::new(NonZeroUsize::MIN, Vec::new()).expect("测试残留策略应有效"),
-            None,
         ));
         ResolvedTranslationSemantics::new(
             engine,

@@ -907,7 +907,6 @@ type = "japanese"
 id = "ja"
 minimum_kana_characters = 1
 allowed_terms = []
-quote_repair_pairs = [["“", "”"], ["‘", "’"]]
 
 [translation]
 record_translation_tasks = false
@@ -950,7 +949,6 @@ type = "japanese"
 id = "ja"
 minimum_kana_characters = 1
 allowed_terms = []
-quote_repair_pairs = [["“", "”"], ["‘", "’"]]
 
 [translation]
 record_translation_tasks = false

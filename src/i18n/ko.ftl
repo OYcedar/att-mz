@@ -104,6 +104,7 @@ result-generic-extract-unchanged = Generic 입력 변경 없음: 파일 { $files
 result-generic-extract-updated = Generic 입력 갱신: 파일 { $files }개, 그룹 { $groups }개, 단위 { $units }개; 번역 { $preserved }개 유지, { $cleared }개 삭제
 result-generic-translate-summary = Generic 번역: 작업 { $total }, 완료 { $complete }, 부분 { $partial }, 사용 불가 { $unavailable }; 초기화 { $cleared }, 재사용 { $reused }, 수락 { $accepted }, 기록 { $written }, 충돌 { $conflicted }, 응답 문제 { $problems }
 result-generic-write-back-summary = Generic 쓰기: 번역 { $translated }단위, 원문 유지 { $original }단위
+result-symbol-repair-summary = 기호 복구: { $attempted }개 단위 시도, { $repaired }개 복구, 내부 건너뜀 { $skipped }개, 기호 { $replacements }개 교체
 result-cancelled = 안전한 마무리 후 명령을 취소했습니다.
 result-plan-saved = 성공한 실행 계획을 저장했습니다.
 log-run-started = 명령 { $command }이 시작되었습니다.
@@ -292,10 +293,6 @@ diagnostic-configuration-rule-value = { $code ->
     [language_policy_term_blank] 언어 정책 용어는 비워 둘 수 없습니다
     [language_policy_term_surrounding_whitespace] 언어 정책 용어 앞뒤에 공백을 둘 수 없습니다
     [language_policy_term_duplicate] 언어 정책 용어는 중복될 수 없습니다
-    [quote_repair_candidates_empty] 따옴표 복구 후보 목록은 비워 둘 수 없습니다
-    [quote_repair_delimiter_invalid] 따옴표 복구 구분자는 영숫자, 공백 또는 제어 문자일 수 없습니다
-    [quote_repair_pair_duplicate] 따옴표 복구 쌍은 중복될 수 없습니다
-    [quote_repair_delimiter_ambiguous] 따옴표 복구 구분자는 정확히 하나의 쌍에 속해야 합니다
     [language_id_blank] 언어 ID는 비워 둘 수 없습니다
     [language_id_surrounding_whitespace] 언어 ID 앞뒤에 공백을 둘 수 없습니다
     [language_id_uses_underscore] 언어 ID의 하위 태그 사이에는 하이픈을 사용해야 합니다

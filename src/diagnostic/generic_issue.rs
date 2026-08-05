@@ -558,6 +558,149 @@ pub(crate) enum GenericWriteBackSnapshotProblem {
     },
 }
 
+/// Generic WriteBack 在单个 Unit 上处理的是原文还是当前译文。
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GenericWriteBackTextSide {
+    Source,
+    Translation,
+}
+
+impl GenericWriteBackTextSide {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Translation => "translation",
+        }
+    }
+}
+
+/// Generic WriteBack 构造候选时发现的 Unit 级失败。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
+pub(crate) enum GenericWriteBackUnitProblem {
+    PlaceholderProtection {
+        side: GenericWriteBackTextSide,
+        problem: PlaceholderIssue,
+    },
+    PlaceholderBindingMismatch {
+        side: GenericWriteBackTextSide,
+    },
+    LanguageProjection {
+        side: GenericWriteBackTextSide,
+        problem: GenericLanguageProjectionProblem,
+    },
+}
+
+impl GenericWriteBackUnitProblem {
+    const fn code(&self) -> &'static str {
+        match self {
+            Self::PlaceholderProtection { problem, .. } => match problem {
+                PlaceholderIssue::WorkerStart { .. } => {
+                    "generic.write_back.placeholder.worker_start"
+                }
+                PlaceholderIssue::PatternMatch { .. } => {
+                    "generic.write_back.placeholder.pattern_match"
+                }
+                PlaceholderIssue::EmptyMatch { .. } => "generic.write_back.placeholder.empty_match",
+                PlaceholderIssue::MissingTextCapture { .. } => {
+                    "generic.write_back.placeholder.missing_text_capture"
+                }
+                PlaceholderIssue::InvalidMatchRange { .. } => {
+                    "generic.write_back.placeholder.invalid_match_range"
+                }
+                PlaceholderIssue::OverlappingMatches { .. } => {
+                    "generic.write_back.placeholder.overlapping_matches"
+                }
+                PlaceholderIssue::CrossesLineBoundary { .. } => {
+                    "generic.write_back.placeholder.crosses_line_boundary"
+                }
+                PlaceholderIssue::ReservedTokenNamespace { .. } => {
+                    "generic.write_back.placeholder.reserved_token_namespace"
+                }
+            },
+            Self::PlaceholderBindingMismatch { .. } => {
+                "generic.write_back.placeholder.binding_mismatch"
+            }
+            Self::LanguageProjection { problem, .. } => match problem {
+                GenericLanguageProjectionProblem::TokenIndexConstruction => {
+                    "generic.write_back.language_projection.token_index_construction"
+                }
+                GenericLanguageProjectionProblem::EmptyToken => {
+                    "generic.write_back.language_projection.empty_token"
+                }
+                GenericLanguageProjectionProblem::MissingToken => {
+                    "generic.write_back.language_projection.missing_token"
+                }
+                GenericLanguageProjectionProblem::RepeatedToken => {
+                    "generic.write_back.language_projection.repeated_token"
+                }
+                GenericLanguageProjectionProblem::OverlappingToken => {
+                    "generic.write_back.language_projection.overlapping_token"
+                }
+                GenericLanguageProjectionProblem::ChangedTokenOrder { .. } => {
+                    "generic.write_back.language_projection.changed_token_order"
+                }
+                GenericLanguageProjectionProblem::ChangedSegmentCount { .. } => {
+                    "generic.write_back.language_projection.changed_segment_count"
+                }
+                GenericLanguageProjectionProblem::ChangedSegmentKind { .. } => {
+                    "generic.write_back.language_projection.changed_segment_kind"
+                }
+                GenericLanguageProjectionProblem::MissingOrderedToken { .. } => {
+                    "generic.write_back.language_projection.missing_ordered_token"
+                }
+                GenericLanguageProjectionProblem::UnusedOrderedToken => {
+                    "generic.write_back.language_projection.unused_ordered_token"
+                }
+            },
+        }
+    }
+
+    const fn resolution(&self) -> DiagnosticResolution {
+        match self {
+            Self::PlaceholderProtection {
+                problem: PlaceholderIssue::WorkerStart { .. },
+                ..
+            } => DiagnosticResolution::Retry,
+            Self::PlaceholderProtection { .. } => DiagnosticResolution::FixPlaceholderRules,
+            Self::PlaceholderBindingMismatch { .. } => DiagnosticResolution::FixInput,
+            Self::LanguageProjection { .. } => DiagnosticResolution::ReportBug,
+        }
+    }
+
+    const fn summary_code(&self) -> &'static str {
+        match self {
+            Self::PlaceholderProtection {
+                problem: PlaceholderIssue::WorkerStart { .. },
+                ..
+            } => "worker_spawn_failed",
+            Self::PlaceholderProtection { .. } | Self::PlaceholderBindingMismatch { .. } => {
+                "invalid_value"
+            }
+            Self::LanguageProjection { .. } => "internal_invariant",
+        }
+    }
+
+    fn facts(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::PlaceholderProtection { side, problem } => {
+                let mut facts = vec![("side", side.as_str().to_owned())];
+                facts.extend(problem.facts());
+                facts
+            }
+            Self::PlaceholderBindingMismatch { side } => {
+                vec![("side", side.as_str().to_owned())]
+            }
+            Self::LanguageProjection { side, problem } => {
+                let mut facts = vec![("side", side.as_str().to_owned())];
+                facts.extend(problem.facts());
+                facts
+            }
+        }
+    }
+}
+
 impl GenericWriteBackSnapshotProblem {
     const fn code(&self) -> &'static str {
         match self {
@@ -1375,6 +1518,10 @@ pub(crate) enum GenericProblem {
     WriteBackSnapshotMismatch {
         problem: GenericWriteBackSnapshotProblem,
     },
+    WriteBackUnit {
+        unit: GenericUnitLocator,
+        problem: GenericWriteBackUnitProblem,
+    },
     WriteBackMaterializedMismatch {
         path: SafePath,
         bytes_changed: bool,
@@ -1642,6 +1789,7 @@ impl GenericProblem {
             Self::WorkerStart { .. } => "generic.project.worker_start",
             Self::WriteBackSourceChanged => "generic.write_back.source_changed",
             Self::WriteBackSnapshotMismatch { problem } => problem.code(),
+            Self::WriteBackUnit { problem, .. } => problem.code(),
             Self::WriteBackMaterializedMismatch { .. } => {
                 "generic.write_back.materialized_mismatch"
             }
@@ -1708,6 +1856,7 @@ impl GenericProblem {
             Self::TranslationPreparation { .. } => DiagnosticResolution::ReportBug,
             Self::WorkerStart { .. } => DiagnosticResolution::ReportBug,
             Self::WriteBackSourceChanged => DiagnosticResolution::FixInput,
+            Self::WriteBackUnit { problem, .. } => problem.resolution(),
             Self::WriteBackSnapshotMismatch { .. } | Self::WriteBackMaterializedMismatch { .. } => {
                 DiagnosticResolution::CheckProjectState
             }
@@ -1755,6 +1904,7 @@ impl GenericProblem {
             Self::WriteBackSourceChanged | Self::WriteBackSnapshotMismatch { .. } => {
                 "state_mismatch"
             }
+            Self::WriteBackUnit { problem, .. } => problem.summary_code(),
             Self::WriteBackMaterializedMismatch { .. } => "write_back_candidate_invalid",
             Self::UnitNotFound { .. } => "not_found",
             Self::InvalidText { .. } => "invalid_value",
@@ -1840,6 +1990,7 @@ impl GenericProblem {
             Self::WorkerStart { operation, .. } => operation.to_string(),
             Self::WriteBackSourceChanged => "generic_input".to_owned(),
             Self::WriteBackSnapshotMismatch { problem } => problem.subject(),
+            Self::WriteBackUnit { unit, .. } => generic_unit_subject(unit),
             Self::WriteBackMaterializedMismatch { path, .. } => path.to_string(),
             Self::InputChangedDuringExtract => "generic_input".to_owned(),
             Self::ExtractRequired => "generic_extract".to_owned(),
@@ -2022,6 +2173,11 @@ impl GenericProblem {
             }
             Self::WriteBackSourceChanged => Vec::new(),
             Self::WriteBackSnapshotMismatch { problem } => problem.facts(),
+            Self::WriteBackUnit { unit, problem } => {
+                let mut facts = generic_unit_facts(unit);
+                facts.extend(problem.facts());
+                facts
+            }
             Self::WriteBackMaterializedMismatch {
                 path,
                 bytes_changed,
@@ -2214,6 +2370,7 @@ const fn expected_operation(problem: &GenericProblem) -> GenericOperation {
         GenericProblem::WriteBackSnapshotMismatch { .. } => {
             GenericOperation::BuildWriteBackCandidate
         }
+        GenericProblem::WriteBackUnit { .. } => GenericOperation::BuildWriteBackCandidate,
         GenericProblem::WriteBackMaterializedMismatch { .. } => {
             GenericOperation::MaterializeWriteBack
         }
@@ -2225,6 +2382,33 @@ const fn expected_operation(problem: &GenericProblem) -> GenericOperation {
         }
         GenericProblem::TranslationPreparation { .. } => GenericOperation::PrepareTranslation,
     }
+}
+
+fn generic_unit_subject(unit: &GenericUnitLocator) -> String {
+    let mut subject = unit.relative_path.to_string();
+    if let Some(group_id) = &unit.group_id {
+        subject.push(':');
+        subject.push_str(group_id.as_str());
+    }
+    if let Some(unit_id) = &unit.unit_id {
+        subject.push(':');
+        subject.push_str(unit_id.as_str());
+    }
+    subject
+}
+
+fn generic_unit_facts(unit: &GenericUnitLocator) -> Vec<(&'static str, String)> {
+    let mut facts = vec![("relative_path", unit.relative_path.to_string())];
+    if let Some(group_id) = &unit.group_id {
+        facts.push(("group_id", group_id.to_string()));
+    }
+    if let Some(unit_id) = &unit.unit_id {
+        facts.push(("unit_id", unit_id.to_string()));
+    }
+    if let Some(role) = &unit.role {
+        facts.push(("role", role.to_string()));
+    }
+    facts
 }
 
 fn location_facts(location: &GenericJsonlLocation) -> Vec<(&'static str, String)> {

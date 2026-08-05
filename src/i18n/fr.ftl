@@ -107,6 +107,7 @@ result-generic-extract-unchanged = Entrée Generic inchangée : { $files } fichi
 result-generic-extract-updated = Entrée Generic mise à jour : { $files } fichiers, { $groups } groupes, { $units } unités ; { $preserved } traductions conservées et { $cleared } effacées
 result-generic-translate-summary = Traduction Generic : { $total } tâches ; { $complete } complètes, { $partial } partielles, { $unavailable } indisponibles ; { $cleared } effacées, { $reused } réutilisées, { $accepted } acceptées, { $written } écrites, { $conflicted } conflits, { $problems } problèmes de réponse
 result-generic-write-back-summary = Réécriture Generic : { $translated } unités traduites, { $original } unités source conservées
+result-symbol-repair-summary = Réparation des symboles : { $attempted } unités examinées, { $repaired } réparées, { $skipped } ignorées en interne, { $replacements } symboles remplacés
 result-cancelled = La commande a été annulée après une finalisation sûre.
 result-plan-saved = Le plan d’exécution réussi a été enregistré.
 log-run-started = La commande { $command } a démarré.
@@ -298,10 +299,6 @@ diagnostic-configuration-rule-value = { $code ->
     [language_policy_term_blank] Le terme de politique linguistique ne doit pas être vide
     [language_policy_term_surrounding_whitespace] Le terme de politique linguistique ne doit pas contenir d’espaces en début ou fin
     [language_policy_term_duplicate] Le terme de politique linguistique ne doit pas être dupliqué
-    [quote_repair_candidates_empty] La liste des candidats de réparation des guillemets ne doit pas être vide
-    [quote_repair_delimiter_invalid] Le délimiteur de réparation des guillemets ne doit être ni alphanumérique, ni un espace, ni un caractère de contrôle
-    [quote_repair_pair_duplicate] La paire de réparation des guillemets ne doit pas être dupliquée
-    [quote_repair_delimiter_ambiguous] Le délimiteur de réparation des guillemets doit appartenir à une seule paire
     [language_id_blank] L’identifiant de langue ne doit pas être vide
     [language_id_surrounding_whitespace] L’identifiant de langue ne doit pas contenir d’espaces en début ou fin
     [language_id_uses_underscore] L’identifiant de langue doit séparer les sous-étiquettes par des tirets

@@ -26,12 +26,20 @@ ATT 从冻结来源建立完整内容树，并按 recipe 把 Current 译文写�
 未译或非 Current Unit 保留冻结原文。Partial 项目同样可以生成候选，结果会明确报告
 保留原文的数量。
 
-### 写回前文本规范化
+### 写回前符号修复
 
-WriteBack 在布局和文档改写前按项目源语言读取 `[[languages]]` 中的写回规范化配置。
-日文 `quote_repair_pairs` 只用于按源文已经确认的引号拓扑修复译文中的混合或整体写反
-引号；源文不完整、译文数量不一致、拓扑改变或无法唯一判断时保留原译文。该步骤属于
-候选构建，不是 Translate 验收，不会因为引号样式差异阻断合格译文。
+WriteBack 在布局和文档改写前执行与源语言无关的全局译文符号修复。修复器使用原文符号
+作为模板，只替换译文中能够唯一对应的现有符号；不插入、删除或移动字符，译文空白、
+Placeholder、内建控制符和 Rules Literal 逐字保留。引号和括号按开闭及嵌套关系判断，
+可以只修复一对符号中损坏的一端。局部多解不妨碍其他确定位置继续修复；修复器内部无法
+安全完成时保留该 Unit 原译文并继续构建候选。该步骤不是 Translate 验收，也不隐藏后续
+布局、候选验证或发布错误。用户取消不计为内部跳过，仍按 WriteBack 的现有取消终态结束。
+发布汇总报告尝试、实际修复、内部跳过的 Unit 数和替换符号数。
+
+符号修复前，WriteBack 使用 `project_snapshot` 中的当前 Placeholder 规则和对应引擎内建
+控制符重新验收每项 Current 译文。原文或译文无法完成 Placeholder 保护、语言投影，或两者
+实际 Placeholder 绑定的数量、顺序、种类、原片段不一致时，WriteBack 以完整 Unit locator
+和结构化 Placeholder 诊断失败，不发布候选，也不把该错误计入符号修复内部跳过。
 
 布局器无法安全自动断行时，WriteBack 保留该译文的显式硬换行并继续构建候选，不把它
 伪报成已经自动布局。成功结果中的 `manual_layout_units` 与结构化人工布局诊断逐项对应。
@@ -95,9 +103,10 @@ WriteBack 在布局和文档改写前按项目源语言读取 `[[languages]]` �
 
 每次命令写 `publication.started` 和唯一 `publication.finished`。成功时
 `payload.result.kind = "published"`，其 RPG Maker 汇总保存 translated/original/
-auto-wrapped units、插入换行、全角缩进和 manual-layout units；失败时 result 为
-`not_published`、`recovery_required` 或 `outcome_unknown`，并引用同一
-`diagnostic.publication` occurrence。
+auto-wrapped units、插入换行、全角缩进、manual-layout units，以及符号修复尝试 Unit、
+实际修复 Unit、内部跳过 Unit 和替换符号数；失败时 result 为 `not_published`、
+`recovery_required` 或 `outcome_unknown`，并引用同一 `diagnostic.publication`
+occurrence。
 
 恢复判断不能只看 `run.finished`。从 `publication.finished` 取得 occurrence ID，再读取该
 原子诊断的 `report.effect`、`primary` 和递归 `related`。目录发布 issue 直接保存

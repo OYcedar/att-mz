@@ -666,6 +666,12 @@ pub(crate) enum UiMessage<'a> {
         translated: u64,
         original: u64,
     },
+    ResultSymbolRepairSummary {
+        attempted: u64,
+        repaired: u64,
+        skipped: u64,
+        replacements: u64,
+    },
     ResultCancelled,
     ResultPlanSaved,
     LogRunStarted {
@@ -987,6 +993,7 @@ impl UiMessage<'_> {
             Self::ResultOutputDirectory { .. } => "result-output-directory",
             Self::ResultWriteBackSummary { .. } => "result-write-back-summary",
             Self::ResultGenericWriteBackSummary { .. } => "result-generic-write-back-summary",
+            Self::ResultSymbolRepairSummary { .. } => "result-symbol-repair-summary",
             Self::ResultCancelled => "result-cancelled",
             Self::ResultPlanSaved => "result-plan-saved",
             Self::LogRunStarted { .. } => "log-run-started",
@@ -1215,6 +1222,17 @@ impl UiMessage<'_> {
             } => {
                 set_number(&mut arguments, "translated", translated);
                 set_number(&mut arguments, "original", original);
+            }
+            Self::ResultSymbolRepairSummary {
+                attempted,
+                repaired,
+                skipped,
+                replacements,
+            } => {
+                set_number(&mut arguments, "attempted", attempted);
+                set_number(&mut arguments, "repaired", repaired);
+                set_number(&mut arguments, "skipped", skipped);
+                set_number(&mut arguments, "replacements", replacements);
             }
             Self::LogRunStarted { command }
             | Self::LogRunSucceeded { command }
@@ -2231,6 +2249,12 @@ mod tests {
             UiMessage::ResultGenericWriteBackSummary {
                 translated: 1,
                 original: 2,
+            },
+            UiMessage::ResultSymbolRepairSummary {
+                attempted: 1,
+                repaired: 2,
+                skipped: 3,
+                replacements: 4,
             },
             UiMessage::ResultCancelled,
             UiMessage::ResultPlanSaved,

@@ -1,4 +1,4 @@
-//! 跨游戏引擎共享的语言分析、源文残留检查与写回文本规范化。
+//! 跨游戏引擎共享的语言分析、源文残留检查与文本修复原语。
 //!
 //! 本模块只理解自然语言文本和不透明边界，不依赖游戏引擎位置、数据库、CLI、
 //! 占位符协议、LLM 或运行时根能力。
@@ -321,38 +321,61 @@ impl LanguageText {
         plan: &LanguageRepairPlan,
         mut ensure_running: impl FnMut() -> Result<(), E>,
     ) -> Result<Result<Self, LanguageRepairApplicationError>, E> {
-        let mut segments = Vec::with_capacity(self.segments.len());
+        let mut segments = Vec::new();
+        if segments.try_reserve_exact(self.segments.len()).is_err() {
+            return Ok(Err(LanguageRepairApplicationError::ResourceExhausted));
+        }
         for segment in &self.segments {
             ensure_running()?;
             segments.push(match segment {
-                LanguageTextSegment::NaturalText(text) => LanguageTextSegment::NaturalText(
-                    clone_language_text_with_cancellation(text, &mut ensure_running)?,
-                ),
+                LanguageTextSegment::NaturalText(text) => {
+                    let mut cloned = String::new();
+                    if cloned.try_reserve_exact(text.len()).is_err() {
+                        return Ok(Err(LanguageRepairApplicationError::ResourceExhausted));
+                    }
+                    append_language_text_with_cancellation(&mut cloned, text, &mut ensure_running)?;
+                    LanguageTextSegment::NaturalText(cloned)
+                }
                 LanguageTextSegment::OpaqueBoundary => LanguageTextSegment::OpaqueBoundary,
             });
         }
-        let mut by_segment = BTreeMap::<usize, Vec<&LanguageCharacterReplacement>>::new();
+        let mut replacements = Vec::new();
+        if replacements
+            .try_reserve_exact(plan.replacements().len())
+            .is_err()
+        {
+            return Ok(Err(LanguageRepairApplicationError::ResourceExhausted));
+        }
         for replacement in plan.replacements() {
             ensure_running()?;
-            by_segment
-                .entry(replacement.segment_index())
-                .or_default()
-                .push(replacement);
+            replacements.push(replacement);
+        }
+        if let Err(source) = stable_sort_language_replacements_with_cancellation(
+            &mut replacements,
+            &mut ensure_running,
+        )? {
+            return Ok(Err(source));
         }
 
-        for (segment_index, mut replacements) in by_segment {
+        let mut replacement_start = 0_usize;
+        while replacement_start < replacements.len() {
             ensure_running()?;
+            let segment_index = replacements[replacement_start].segment_index();
+            let mut replacement_end = replacement_start + 1;
+            while replacement_end < replacements.len()
+                && replacements[replacement_end].segment_index() == segment_index
+            {
+                ensure_running()?;
+                replacement_end += 1;
+            }
+            let segment_replacements = &replacements[replacement_start..replacement_end];
             let Some(LanguageTextSegment::NaturalText(text)) = segments.get_mut(segment_index)
             else {
                 return Ok(Err(LanguageRepairApplicationError::InvalidNaturalSegment {
                     segment_index,
                 }));
             };
-            stable_sort_language_replacements_with_cancellation(
-                &mut replacements,
-                &mut ensure_running,
-            )?;
-            for pair in replacements.windows(2) {
+            for pair in segment_replacements.windows(2) {
                 ensure_running()?;
                 if pair[0].byte_offset() == pair[1].byte_offset() {
                     return Ok(Err(LanguageRepairApplicationError::DuplicatePosition {
@@ -362,7 +385,7 @@ impl LanguageText {
                 }
             }
             let mut rebuilt_capacity = text.len();
-            for replacement in replacements.iter().rev() {
+            for replacement in segment_replacements.iter().rev() {
                 ensure_running()?;
                 let byte_offset = replacement.byte_offset();
                 if !text.is_char_boundary(byte_offset) {
@@ -387,16 +410,22 @@ impl LanguageText {
                         actual,
                     }));
                 }
-                rebuilt_capacity = rebuilt_capacity
+                let Some(capacity) = rebuilt_capacity
                     .checked_sub(actual.len_utf8())
                     .and_then(|length| length.checked_add(replacement.replacement().len_utf8()))
-                    .expect("语言修复结果长度必须能由 usize 表示");
+                else {
+                    return Ok(Err(LanguageRepairApplicationError::SizeOverflow));
+                };
+                rebuilt_capacity = capacity;
             }
 
             let original = std::mem::take(text);
-            let mut rebuilt = String::with_capacity(rebuilt_capacity);
+            let mut rebuilt = String::new();
+            if rebuilt.try_reserve_exact(rebuilt_capacity).is_err() {
+                return Ok(Err(LanguageRepairApplicationError::ResourceExhausted));
+            }
             let mut cursor = 0_usize;
-            for replacement in replacements {
+            for replacement in segment_replacements {
                 ensure_running()?;
                 let byte_offset = replacement.byte_offset();
                 append_language_text_with_cancellation(
@@ -409,7 +438,10 @@ impl LanguageText {
                     .next()
                     .expect("修复位置已经验证");
                 rebuilt.push(replacement.replacement());
-                cursor = byte_offset + actual.len_utf8();
+                let Some(next_cursor) = byte_offset.checked_add(actual.len_utf8()) else {
+                    return Ok(Err(LanguageRepairApplicationError::SizeOverflow));
+                };
+                cursor = next_cursor;
             }
             append_language_text_with_cancellation(
                 &mut rebuilt,
@@ -417,9 +449,10 @@ impl LanguageText {
                 &mut ensure_running,
             )?;
             *text = rebuilt;
+            replacement_start = replacement_end;
         }
-        let repaired = Self::new_with_cancellation(segments, ensure_running)?;
-        Ok(Ok(repaired))
+        ensure_running()?;
+        Ok(Ok(Self { segments }))
     }
 }
 
@@ -433,7 +466,12 @@ pub(crate) struct LanguageCharacterReplacement {
 }
 
 impl LanguageCharacterReplacement {
-    fn new(segment_index: usize, byte_offset: usize, expected: char, replacement: char) -> Self {
+    pub(crate) const fn new(
+        segment_index: usize,
+        byte_offset: usize,
+        expected: char,
+        replacement: char,
+    ) -> Self {
         Self {
             segment_index,
             byte_offset,
@@ -462,8 +500,11 @@ impl LanguageCharacterReplacement {
 fn stable_sort_language_replacements_with_cancellation<E>(
     replacements: &mut Vec<&LanguageCharacterReplacement>,
     ensure_running: &mut impl FnMut() -> Result<(), E>,
-) -> Result<(), E> {
-    let mut scratch = Vec::with_capacity(replacements.len());
+) -> Result<Result<(), LanguageRepairApplicationError>, E> {
+    let mut scratch = Vec::new();
+    if scratch.try_reserve_exact(replacements.len()).is_err() {
+        return Ok(Err(LanguageRepairApplicationError::ResourceExhausted));
+    }
     for replacement in replacements.iter().copied() {
         ensure_running()?;
         scratch.push(replacement);
@@ -482,7 +523,13 @@ fn stable_sort_language_replacements_with_cancellation<E>(
                 ensure_running()?;
                 let take_left = right == run_end
                     || (left < middle
-                        && replacements[left].byte_offset() <= replacements[right].byte_offset());
+                        && (
+                            replacements[left].segment_index(),
+                            replacements[left].byte_offset(),
+                        ) <= (
+                            replacements[right].segment_index(),
+                            replacements[right].byte_offset(),
+                        ));
                 scratch[output] = if take_left {
                     let replacement = replacements[left];
                     left += 1;
@@ -499,23 +546,25 @@ fn stable_sort_language_replacements_with_cancellation<E>(
         std::mem::swap(replacements, &mut scratch);
         width = run_width;
     }
-    ensure_running()
+    ensure_running()?;
+    Ok(Ok(()))
 }
 
-/// 可选阅读风格修复；空计划表示无需修改或无法唯一证明修改安全。
+/// 已验证的字符级修复计划；空计划表示无需修改或无法唯一证明修改安全。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LanguageRepairPlan {
     replacements: Vec<LanguageCharacterReplacement>,
 }
 
 impl LanguageRepairPlan {
+    #[cfg(test)]
     pub(crate) const fn unchanged() -> Self {
         Self {
             replacements: Vec::new(),
         }
     }
 
-    fn replacing(replacements: Vec<LanguageCharacterReplacement>) -> Self {
+    pub(crate) fn replacing(replacements: Vec<LanguageCharacterReplacement>) -> Self {
         Self { replacements }
     }
 
@@ -531,6 +580,8 @@ impl LanguageRepairPlan {
 /// 调用方提交了无法安全应用的修复计划。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum LanguageRepairApplicationError {
+    ResourceExhausted,
+    SizeOverflow,
     InvalidNaturalSegment {
         segment_index: usize,
     },
@@ -557,6 +608,8 @@ pub(crate) enum LanguageRepairApplicationError {
 impl fmt::Display for LanguageRepairApplicationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ResourceExhausted => formatter.write_str("语言修复所需内存无法分配"),
+            Self::SizeOverflow => formatter.write_str("语言修复结果长度超出 usize"),
             Self::InvalidNaturalSegment { segment_index } => {
                 write!(formatter, "修复位置指向非自然文本段 {segment_index}")
             }
@@ -675,13 +728,6 @@ pub(crate) trait LanguageModule: Send + Sync {
         translation: &LanguageText,
     ) -> Result<Option<LanguageResidual>, LanguageModuleError>;
 
-    #[cfg(test)]
-    fn plan_translation_repair(
-        &self,
-        analysis: &LanguageAnalysis,
-        translation: &LanguageText,
-    ) -> Result<LanguageRepairPlan, LanguageModuleError>;
-
     fn analyze_source_with_cancellation(
         &self,
         text: &LanguageText,
@@ -706,83 +752,6 @@ pub(crate) trait LanguageModule: Send + Sync {
         Ok(residual)
     }
 }
-
-/// WriteBack 在发布候选前执行的自然语言文本规范化。
-///
-/// 规范化只能在能够唯一证明修改安全时改变译文；无法判断时必须原样返回。
-pub(crate) trait LanguageTextNormalizer: Send + Sync {
-    fn normalize(&self, source: &str, translation: &str) -> String;
-
-    fn normalize_with_cancellation(
-        &self,
-        source: &str,
-        translation: &str,
-        ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
-    ) -> Result<String, LanguageOperationCancelled> {
-        ensure_running()?;
-        let normalized = self.normalize(source, translation);
-        ensure_running()?;
-        Ok(normalized)
-    }
-}
-
-/// 精确源语言 ID 到 WriteBack 文本规范化器的可选绑定集合。
-#[derive(Clone, Default)]
-pub(crate) struct LanguageTextNormalizerCatalog {
-    normalizers: BTreeMap<LanguageId, Arc<dyn LanguageTextNormalizer>>,
-}
-
-impl LanguageTextNormalizerCatalog {
-    pub(crate) fn new(
-        bindings: impl IntoIterator<Item = (LanguageId, Arc<dyn LanguageTextNormalizer>)>,
-    ) -> Result<Self, LanguageTextNormalizerCatalogBuildError> {
-        let mut normalizers = BTreeMap::new();
-        for (language_id, normalizer) in bindings {
-            if normalizers
-                .insert(language_id.clone(), normalizer)
-                .is_some()
-            {
-                return Err(
-                    LanguageTextNormalizerCatalogBuildError::DuplicateLanguageId { language_id },
-                );
-            }
-        }
-        Ok(Self { normalizers })
-    }
-
-    pub(crate) fn resolve(
-        &self,
-        language_id: &LanguageId,
-    ) -> Option<Arc<dyn LanguageTextNormalizer>> {
-        self.normalizers.get(language_id).cloned()
-    }
-}
-
-impl fmt::Debug for LanguageTextNormalizerCatalog {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("LanguageTextNormalizerCatalog")
-            .field("language_ids", &self.normalizers.keys().collect::<Vec<_>>())
-            .finish()
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum LanguageTextNormalizerCatalogBuildError {
-    DuplicateLanguageId { language_id: LanguageId },
-}
-
-impl fmt::Display for LanguageTextNormalizerCatalogBuildError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DuplicateLanguageId { language_id } => {
-                write!(formatter, "写回文本规范化器的源语言 ID 重复：{language_id}")
-            }
-        }
-    }
-}
-
-impl Error for LanguageTextNormalizerCatalogBuildError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LanguageOperationCancelled;
@@ -935,267 +904,15 @@ impl JapaneseResidualPolicy {
     }
 }
 
-/// 一个可以在译文中被识别的成对引号字符。
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct QuotePair {
-    opening: char,
-    closing: char,
-}
-
-impl QuotePair {
-    pub(crate) const fn new(opening: char, closing: char) -> Self {
-        Self { opening, closing }
-    }
-
-    const fn opening(self) -> char {
-        self.opening
-    }
-
-    const fn closing(self) -> char {
-        self.closing
-    }
-}
-
-const JAPANESE_QUOTE_PAIRS: [QuotePair; 2] =
-    [QuotePair::new('「', '」'), QuotePair::new('『', '』')];
-
-/// 日文引号安全修复所识别的外部候选对。
-#[derive(Clone, Debug)]
-pub(crate) struct JapaneseQuoteRepairPolicy {
-    candidate_pairs: Vec<QuotePair>,
-}
-
-impl JapaneseQuoteRepairPolicy {
-    pub(crate) fn new(
-        candidate_pairs: Vec<QuotePair>,
-    ) -> Result<Self, JapaneseQuoteRepairPolicyError> {
-        if candidate_pairs.is_empty() {
-            return Err(JapaneseQuoteRepairPolicyError::EmptyCandidatePairs);
-        }
-        let mut seen_pairs = BTreeSet::new();
-        let mut used_characters = BTreeMap::<char, QuotePair>::new();
-        for pair in JAPANESE_QUOTE_PAIRS
-            .into_iter()
-            .chain(candidate_pairs.iter().copied())
-        {
-            for character in [pair.opening(), pair.closing()] {
-                if character.is_alphanumeric()
-                    || character.is_whitespace()
-                    || character.is_control()
-                {
-                    return Err(JapaneseQuoteRepairPolicyError::InvalidDelimiterCharacter {
-                        character,
-                    });
-                }
-            }
-            if !seen_pairs.insert(pair) {
-                return Err(JapaneseQuoteRepairPolicyError::DuplicatePair { pair });
-            }
-            for character in [pair.opening(), pair.closing()] {
-                if let Some(existing) = used_characters.insert(character, pair)
-                    && existing != pair
-                {
-                    return Err(JapaneseQuoteRepairPolicyError::AmbiguousCharacter {
-                        character,
-                        first: existing,
-                        second: pair,
-                    });
-                }
-            }
-        }
-        Ok(Self { candidate_pairs })
-    }
-
-    fn all_pairs_with_cancellation<E>(
-        &self,
-        ensure_running: &mut impl FnMut() -> Result<(), E>,
-    ) -> Result<Vec<QuotePair>, E> {
-        let mut pairs = Vec::with_capacity(JAPANESE_QUOTE_PAIRS.len() + self.candidate_pairs.len());
-        for pair in JAPANESE_QUOTE_PAIRS
-            .into_iter()
-            .chain(self.candidate_pairs.iter().copied())
-        {
-            ensure_running()?;
-            pairs.push(pair);
-        }
-        ensure_running()?;
-        Ok(pairs)
-    }
-
-    fn contains_quote_character_with_cancellation<E>(
-        &self,
-        text: &str,
-        ensure_running: &mut impl FnMut() -> Result<(), E>,
-    ) -> Result<bool, E> {
-        for (index, character) in text.chars().enumerate() {
-            if index % 256 == 0 {
-                ensure_running()?;
-            }
-            if JAPANESE_QUOTE_PAIRS
-                .iter()
-                .chain(self.candidate_pairs.iter())
-                .any(|pair| pair.opening() == character || pair.closing() == character)
-            {
-                return Ok(true);
-            }
-        }
-        ensure_running()?;
-        Ok(false)
-    }
-}
-
-/// 依据日文原文已经确认的引号拓扑规范化写回译文。
-#[derive(Clone, Debug)]
-pub(crate) struct JapaneseQuoteNormalizer {
-    policy: JapaneseQuoteRepairPolicy,
-}
-
-impl JapaneseQuoteNormalizer {
-    pub(crate) const fn new(policy: JapaneseQuoteRepairPolicy) -> Self {
-        Self { policy }
-    }
-
-    fn normalize_with_check<E>(
-        &self,
-        source: &str,
-        translation: &str,
-        mut ensure_running: impl FnMut() -> Result<(), E>,
-    ) -> Result<String, E> {
-        ensure_running()?;
-        if !self
-            .policy
-            .contains_quote_character_with_cancellation(source, &mut ensure_running)?
-            && !self
-                .policy
-                .contains_quote_character_with_cancellation(translation, &mut ensure_running)?
-        {
-            return clone_language_text_with_cancellation(translation, &mut ensure_running);
-        }
-        let source = LanguageText::new_with_cancellation(
-            vec![LanguageTextSegment::NaturalText(
-                clone_language_text_with_cancellation(source, &mut ensure_running)?,
-            )],
-            &mut ensure_running,
-        )?;
-        let translation_text = LanguageText::new_with_cancellation(
-            vec![LanguageTextSegment::NaturalText(
-                clone_language_text_with_cancellation(translation, &mut ensure_running)?,
-            )],
-            &mut ensure_running,
-        )?;
-        let Some(source_nodes) =
-            parse_japanese_quote_nodes_with_cancellation(&source, &mut ensure_running)?
-        else {
-            return clone_language_text_with_cancellation(translation, &mut ensure_running);
-        };
-        let plan = plan_japanese_quote_repair_with_cancellation(
-            &self.policy,
-            &source_nodes,
-            &translation_text,
-            &mut ensure_running,
-        )?;
-        if plan.is_unchanged() {
-            return clone_language_text_with_cancellation(translation, &mut ensure_running);
-        }
-        let repaired =
-            match translation_text.apply_repair_with_cancellation(&plan, &mut ensure_running)? {
-                Ok(repaired) => repaired,
-                Err(_) => {
-                    return clone_language_text_with_cancellation(translation, &mut ensure_running);
-                }
-            };
-        match repaired.segments() {
-            [LanguageTextSegment::NaturalText(text)] => {
-                clone_language_text_with_cancellation(text, &mut ensure_running)
-            }
-            [] if translation.is_empty() => Ok(String::new()),
-            _ => clone_language_text_with_cancellation(translation, &mut ensure_running),
-        }
-    }
-}
-
-impl LanguageTextNormalizer for JapaneseQuoteNormalizer {
-    fn normalize(&self, source: &str, translation: &str) -> String {
-        match self.normalize_with_check(source, translation, || Ok::<_, Infallible>(())) {
-            Ok(normalized) => normalized,
-            Err(unreachable) => match unreachable {},
-        }
-    }
-
-    fn normalize_with_cancellation(
-        &self,
-        source: &str,
-        translation: &str,
-        ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
-    ) -> Result<String, LanguageOperationCancelled> {
-        self.normalize_with_check(source, translation, ensure_running)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum JapaneseQuoteRepairPolicyError {
-    EmptyCandidatePairs,
-    InvalidDelimiterCharacter {
-        character: char,
-    },
-    DuplicatePair {
-        pair: QuotePair,
-    },
-    AmbiguousCharacter {
-        character: char,
-        first: QuotePair,
-        second: QuotePair,
-    },
-}
-
-impl fmt::Display for JapaneseQuoteRepairPolicyError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyCandidatePairs => formatter.write_str("日文引号修复候选对不能为空"),
-            Self::InvalidDelimiterCharacter { character } => write!(
-                formatter,
-                "日文引号修复候选字符不能是字母、数字、空白或控制字符：{character:?}"
-            ),
-            Self::DuplicatePair { pair } => write!(
-                formatter,
-                "日文引号修复候选对重复：{:?}{:?}",
-                pair.opening(),
-                pair.closing()
-            ),
-            Self::AmbiguousCharacter {
-                character,
-                first,
-                second,
-            } => write!(
-                formatter,
-                "引号字符 {character:?} 同时属于 {:?}{:?} 和 {:?}{:?}",
-                first.opening(),
-                first.closing(),
-                second.opening(),
-                second.closing()
-            ),
-        }
-    }
-}
-
-impl Error for JapaneseQuoteRepairPolicyError {}
-
-/// 日文译前分析与译后修复实现。
+/// 日文译前分析与译后残留检查实现。
 #[derive(Clone, Debug)]
 pub(crate) struct JapaneseLanguageModule {
     residual_policy: JapaneseResidualPolicy,
-    quote_repair_policy: Option<JapaneseQuoteRepairPolicy>,
 }
 
 impl JapaneseLanguageModule {
-    pub(crate) fn new(
-        residual_policy: JapaneseResidualPolicy,
-        quote_repair_policy: Option<JapaneseQuoteRepairPolicy>,
-    ) -> Self {
-        Self {
-            residual_policy,
-            quote_repair_policy,
-        }
+    pub(crate) const fn new(residual_policy: JapaneseResidualPolicy) -> Self {
+        Self { residual_policy }
     }
 
     fn semantic_fingerprint_with_check<E>(
@@ -1215,21 +932,6 @@ impl JapaneseLanguageModule {
         for term in &self.residual_policy.allowed_terms {
             ensure_running()?;
             hasher.try_frame_chunks(2, term.as_bytes(), chunk_size, &mut ensure_running)?;
-        }
-        match &self.quote_repair_policy {
-            None => {
-                hasher.frame(3, &[0]);
-            }
-            Some(policy) => {
-                hasher.frame(3, &[1]);
-                for pair in &policy.candidate_pairs {
-                    ensure_running()?;
-                    let mut encoded = [0_u8; 8];
-                    encoded[..4].copy_from_slice(&u32::from(pair.opening()).to_be_bytes());
-                    encoded[4..].copy_from_slice(&u32::from(pair.closing()).to_be_bytes());
-                    hasher.frame(4, &encoded);
-                }
-            }
         }
         ensure_running()?;
         Ok(hasher.finish())
@@ -1256,12 +958,9 @@ impl JapaneseLanguageModule {
                 }
             }
         }
-        let quote_structure =
-            parse_japanese_quote_nodes_with_cancellation(text, &mut ensure_running)?;
         ensure_running()?;
         Ok(LanguageAnalysis::Japanese(JapaneseLanguageAnalysis {
             needs_translation,
-            quote_structure,
         }))
     }
 
@@ -1292,116 +991,11 @@ impl JapaneseLanguageModule {
         ensure_running()?;
         Ok(Ok(None))
     }
-
-    #[cfg(test)]
-    fn plan_translation_repair_with_check<E>(
-        &self,
-        analysis: &LanguageAnalysis,
-        translation: &LanguageText,
-        mut ensure_running: impl FnMut() -> Result<(), E>,
-    ) -> Result<Result<LanguageRepairPlan, LanguageModuleError>, E> {
-        ensure_running()?;
-        let LanguageAnalysis::Japanese(analysis) = analysis else {
-            return Ok(Err(LanguageModuleError::analysis_mismatch(
-                LanguageModuleKind::Japanese,
-                analysis,
-            )));
-        };
-        let (Some(policy), Some(source_nodes)) =
-            (&self.quote_repair_policy, &analysis.quote_structure)
-        else {
-            ensure_running()?;
-            return Ok(Ok(LanguageRepairPlan::unchanged()));
-        };
-        Ok(Ok(plan_japanese_quote_repair_with_cancellation(
-            policy,
-            source_nodes,
-            translation,
-            &mut ensure_running,
-        )?))
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct JapaneseLanguageAnalysis {
     needs_translation: bool,
-    quote_structure: Option<Vec<JapaneseQuoteNode>>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct JapaneseQuoteNode {
-    pair: QuotePair,
-    parent: Option<usize>,
-}
-
-fn parse_japanese_quote_nodes_with_cancellation<E>(
-    text: &LanguageText,
-    mut ensure_running: impl FnMut() -> Result<(), E>,
-) -> Result<Option<Vec<JapaneseQuoteNode>>, E> {
-    let Some(nodes) =
-        parse_quote_structure_with_cancellation(text, &JAPANESE_QUOTE_PAIRS, &mut ensure_running)?
-    else {
-        return Ok(None);
-    };
-    let mut structure = Vec::with_capacity(nodes.len());
-    for node in nodes {
-        ensure_running()?;
-        structure.push(JapaneseQuoteNode {
-            pair: node.pair,
-            parent: node.parent,
-        });
-    }
-    ensure_running()?;
-    Ok(Some(structure))
-}
-
-fn plan_japanese_quote_repair_with_cancellation<E>(
-    policy: &JapaneseQuoteRepairPolicy,
-    source_nodes: &[JapaneseQuoteNode],
-    translation: &LanguageText,
-    mut ensure_running: impl FnMut() -> Result<(), E>,
-) -> Result<LanguageRepairPlan, E> {
-    if source_nodes.is_empty() {
-        ensure_running()?;
-        return Ok(LanguageRepairPlan::unchanged());
-    }
-    let pairs = policy.all_pairs_with_cancellation(&mut ensure_running)?;
-    let Some(target_nodes) = match_quote_structure_with_cancellation(
-        translation,
-        &pairs,
-        source_nodes,
-        &mut ensure_running,
-    )?
-    else {
-        return Ok(LanguageRepairPlan::unchanged());
-    };
-
-    let mut replacements = Vec::new();
-    for (source, target) in source_nodes.iter().zip(target_nodes) {
-        ensure_running()?;
-        if target.opening_character != source.pair.opening() {
-            replacements.push(LanguageCharacterReplacement::new(
-                target.opening.segment_index,
-                target.opening.byte_offset,
-                target.opening_character,
-                source.pair.opening(),
-            ));
-        }
-        let closing_character = target
-            .closing_character
-            .expect("匹配引号节点必须拥有闭引号字符");
-        if closing_character != source.pair.closing() {
-            let closing = target.closing.expect("匹配引号节点必须拥有闭引号位置");
-            replacements.push(LanguageCharacterReplacement::new(
-                closing.segment_index,
-                closing.byte_offset,
-                closing_character,
-                source.pair.closing(),
-            ));
-        }
-    }
-    ensure_running()?;
-    Ok(LanguageRepairPlan::replacing(replacements))
 }
 
 impl LanguageModule for JapaneseLanguageModule {
@@ -1436,20 +1030,6 @@ impl LanguageModule for JapaneseLanguageModule {
             translation,
             || Ok::<_, Infallible>(()),
         ) {
-            Ok(result) => result,
-            Err(unreachable) => match unreachable {},
-        }
-    }
-
-    #[cfg(test)]
-    fn plan_translation_repair(
-        &self,
-        analysis: &LanguageAnalysis,
-        translation: &LanguageText,
-    ) -> Result<LanguageRepairPlan, LanguageModuleError> {
-        match self
-            .plan_translation_repair_with_check(analysis, translation, || Ok::<_, Infallible>(()))
-        {
             Ok(result) => result,
             Err(unreachable) => match unreachable {},
         }
@@ -1653,23 +1233,6 @@ impl EnglishLanguageModule {
         ensure_running()?;
         Ok(Ok(None))
     }
-
-    #[cfg(test)]
-    fn plan_translation_repair_with_check<E>(
-        &self,
-        analysis: &LanguageAnalysis,
-        mut ensure_running: impl FnMut() -> Result<(), E>,
-    ) -> Result<Result<LanguageRepairPlan, LanguageModuleError>, E> {
-        ensure_running()?;
-        let LanguageAnalysis::English(_) = analysis else {
-            return Ok(Err(LanguageModuleError::analysis_mismatch(
-                LanguageModuleKind::English,
-                analysis,
-            )));
-        };
-        ensure_running()?;
-        Ok(Ok(LanguageRepairPlan::unchanged()))
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1710,18 +1273,6 @@ impl LanguageModule for EnglishLanguageModule {
             translation,
             || Ok::<_, Infallible>(()),
         ) {
-            Ok(result) => result,
-            Err(unreachable) => match unreachable {},
-        }
-    }
-
-    #[cfg(test)]
-    fn plan_translation_repair(
-        &self,
-        analysis: &LanguageAnalysis,
-        _translation: &LanguageText,
-    ) -> Result<LanguageRepairPlan, LanguageModuleError> {
-        match self.plan_translation_repair_with_check(analysis, || Ok::<_, Infallible>(())) {
             Ok(result) => result,
             Err(unreachable) => match unreachable {},
         }
@@ -2117,286 +1668,6 @@ fn first_japanese_residual_with_cancellation<E>(
     }
 }
 
-#[derive(Clone, Copy)]
-struct LanguageCharacterPosition {
-    segment_index: usize,
-    byte_offset: usize,
-}
-
-struct ParsedQuoteNode {
-    pair: QuotePair,
-    parent: Option<usize>,
-}
-
-struct PendingQuoteNode {
-    pair: QuotePair,
-    parent: Option<usize>,
-    closed: bool,
-}
-
-struct MatchedQuoteNode {
-    parent: Option<usize>,
-    opening: LanguageCharacterPosition,
-    opening_character: char,
-    closing: Option<LanguageCharacterPosition>,
-    closing_character: Option<char>,
-}
-
-fn parse_quote_structure_with_cancellation<E>(
-    text: &LanguageText,
-    pairs: &[QuotePair],
-    mut ensure_running: impl FnMut() -> Result<(), E>,
-) -> Result<Option<Vec<ParsedQuoteNode>>, E> {
-    let Some(roles) = quote_roles_with_cancellation(pairs, &mut ensure_running)? else {
-        return Ok(None);
-    };
-
-    let mut nodes = Vec::<PendingQuoteNode>::new();
-    let mut stack = Vec::<usize>::new();
-    for segment in text.segments() {
-        ensure_running()?;
-        let LanguageTextSegment::NaturalText(text) = segment else {
-            continue;
-        };
-        let mut next_check = 0_usize;
-        for (byte_offset, character) in text.char_indices() {
-            ensure_language_text_progress(byte_offset, &mut next_check, &mut ensure_running)?;
-            let Some(&(pair_index, role)) = roles.get(&character) else {
-                continue;
-            };
-            let pair = pairs[pair_index];
-            let should_close = match role {
-                QuoteCharacterRole::Closing => true,
-                QuoteCharacterRole::Opening => false,
-                QuoteCharacterRole::Symmetric => stack
-                    .last()
-                    .is_some_and(|node_index| nodes[*node_index].pair == pair),
-            };
-            if should_close {
-                let Some(node_index) = stack.pop() else {
-                    return Ok(None);
-                };
-                if nodes[node_index].pair != pair {
-                    return Ok(None);
-                }
-                nodes[node_index].closed = true;
-            } else {
-                let node_index = nodes.len();
-                nodes.push(PendingQuoteNode {
-                    pair,
-                    parent: stack.last().copied(),
-                    closed: false,
-                });
-                stack.push(node_index);
-            }
-        }
-    }
-    if !stack.is_empty() {
-        return Ok(None);
-    }
-    let mut parsed = Vec::with_capacity(nodes.len());
-    for node in nodes {
-        ensure_running()?;
-        if !node.closed {
-            return Ok(None);
-        }
-        parsed.push(ParsedQuoteNode {
-            pair: node.pair,
-            parent: node.parent,
-        });
-    }
-    ensure_running()?;
-    Ok(Some(parsed))
-}
-
-/// 按源文已经确认的拓扑解释译文引号。
-///
-/// 对称引号没有先验开闭方向，因此不能先用贪心 toggle 固定一种结构。这里先由
-/// 源文拓扑生成唯一的开闭事件，再验证译文每个分隔符是否能够无冲突地承担对应
-/// 事件；只有完整且唯一对应时才产生修复位置。
-fn match_quote_structure_with_cancellation<E>(
-    text: &LanguageText,
-    pairs: &[QuotePair],
-    source_nodes: &[JapaneseQuoteNode],
-    mut ensure_running: impl FnMut() -> Result<(), E>,
-) -> Result<Option<Vec<MatchedQuoteNode>>, E> {
-    let Some(roles) = quote_roles_with_cancellation(pairs, &mut ensure_running)? else {
-        return Ok(None);
-    };
-    let Some(events) = quote_events_with_cancellation(source_nodes, &mut ensure_running)? else {
-        return Ok(None);
-    };
-    let mut occurrences = Vec::new();
-    for (segment_index, segment) in text.segments().iter().enumerate() {
-        ensure_running()?;
-        let LanguageTextSegment::NaturalText(text) = segment else {
-            continue;
-        };
-        let mut next_check = 0_usize;
-        for (byte_offset, character) in text.char_indices() {
-            ensure_language_text_progress(byte_offset, &mut next_check, &mut ensure_running)?;
-            let Some(&(_, role)) = roles.get(&character) else {
-                continue;
-            };
-            occurrences.push((
-                character,
-                role,
-                LanguageCharacterPosition {
-                    segment_index,
-                    byte_offset,
-                },
-            ));
-        }
-    }
-    if occurrences.len() != events.len() {
-        return Ok(None);
-    }
-    let allow_reversed_single_pair = source_nodes.len() == 1
-        && matches!(
-            occurrences.as_slice(),
-            [
-                (_, QuoteCharacterRole::Closing, _),
-                (_, QuoteCharacterRole::Opening, _)
-            ]
-        );
-
-    let mut matched = Vec::with_capacity(source_nodes.len());
-    for node in source_nodes {
-        ensure_running()?;
-        matched.push(MatchedQuoteNode {
-            parent: node.parent,
-            opening: LanguageCharacterPosition {
-                segment_index: usize::MAX,
-                byte_offset: usize::MAX,
-            },
-            opening_character: '\0',
-            closing: None,
-            closing_character: None,
-        });
-    }
-    for (event, (character, role, position)) in events.into_iter().zip(occurrences) {
-        ensure_running()?;
-        match event {
-            QuoteEvent::Open(node_index) => {
-                if !matches!(
-                    role,
-                    QuoteCharacterRole::Opening | QuoteCharacterRole::Symmetric
-                ) && !(allow_reversed_single_pair && matches!(role, QuoteCharacterRole::Closing))
-                {
-                    return Ok(None);
-                }
-                matched[node_index].opening = position;
-                matched[node_index].opening_character = character;
-            }
-            QuoteEvent::Close(node_index) => {
-                if !matches!(
-                    role,
-                    QuoteCharacterRole::Closing | QuoteCharacterRole::Symmetric
-                ) && !(allow_reversed_single_pair && matches!(role, QuoteCharacterRole::Opening))
-                {
-                    return Ok(None);
-                }
-                matched[node_index].closing = Some(position);
-                matched[node_index].closing_character = Some(character);
-            }
-        }
-    }
-
-    let mut parsed = Vec::with_capacity(matched.len());
-    for node in matched {
-        ensure_running()?;
-        let Some(closing) = node.closing else {
-            return Ok(None);
-        };
-        let Some(closing_character) = node.closing_character else {
-            return Ok(None);
-        };
-        parsed.push(MatchedQuoteNode {
-            parent: node.parent,
-            opening: node.opening,
-            opening_character: node.opening_character,
-            closing: Some(closing),
-            closing_character: Some(closing_character),
-        });
-    }
-    ensure_running()?;
-    Ok(Some(parsed))
-}
-
-#[derive(Clone, Copy)]
-enum QuoteEvent {
-    Open(usize),
-    Close(usize),
-}
-
-fn quote_events_with_cancellation<E>(
-    nodes: &[JapaneseQuoteNode],
-    mut ensure_running: impl FnMut() -> Result<(), E>,
-) -> Result<Option<Vec<QuoteEvent>>, E> {
-    let mut events = Vec::with_capacity(nodes.len().saturating_mul(2));
-    let mut stack = Vec::<usize>::new();
-    for (node_index, node) in nodes.iter().enumerate() {
-        ensure_running()?;
-        while stack.last().copied() != node.parent {
-            ensure_running()?;
-            let Some(parent) = stack.pop() else {
-                return Ok(None);
-            };
-            events.push(QuoteEvent::Close(parent));
-        }
-        if node.parent.is_some_and(|parent| parent >= node_index) {
-            return Ok(None);
-        }
-        events.push(QuoteEvent::Open(node_index));
-        stack.push(node_index);
-    }
-    while let Some(node_index) = stack.pop() {
-        ensure_running()?;
-        events.push(QuoteEvent::Close(node_index));
-    }
-    ensure_running()?;
-    Ok(Some(events))
-}
-
-fn quote_roles_with_cancellation<E>(
-    pairs: &[QuotePair],
-    mut ensure_running: impl FnMut() -> Result<(), E>,
-) -> Result<Option<QuoteRoles>, E> {
-    let mut roles = QuoteRoles::new();
-    for (pair_index, pair) in pairs.iter().copied().enumerate() {
-        ensure_running()?;
-        let opening_role = if pair.opening() == pair.closing() {
-            QuoteCharacterRole::Symmetric
-        } else {
-            QuoteCharacterRole::Opening
-        };
-        if roles
-            .insert(pair.opening(), (pair_index, opening_role))
-            .is_some()
-        {
-            return Ok(None);
-        }
-        if pair.opening() != pair.closing()
-            && roles
-                .insert(pair.closing(), (pair_index, QuoteCharacterRole::Closing))
-                .is_some()
-        {
-            return Ok(None);
-        }
-    }
-    ensure_running()?;
-    Ok(Some(roles))
-}
-
-#[derive(Clone, Copy)]
-enum QuoteCharacterRole {
-    Opening,
-    Closing,
-    Symmetric,
-}
-
-type QuoteRoles = BTreeMap<char, (usize, QuoteCharacterRole)>;
-
 #[derive(Clone)]
 struct EnglishWord {
     normalized: String,
@@ -2662,25 +1933,6 @@ mod tests {
         JapaneseLanguageModule::new(
             JapaneseResidualPolicy::new(non_zero(2), ["カタカナ名".to_owned()])
                 .expect("日文残留策略有效"),
-            Some(
-                JapaneseQuoteRepairPolicy::new(vec![
-                    QuotePair::new('“', '”'),
-                    QuotePair::new('‘', '’'),
-                    QuotePair::new('"', '"'),
-                ])
-                .expect("日文引号策略有效"),
-            ),
-        )
-    }
-
-    fn japanese_quote_normalizer() -> JapaneseQuoteNormalizer {
-        JapaneseQuoteNormalizer::new(
-            JapaneseQuoteRepairPolicy::new(vec![
-                QuotePair::new('“', '”'),
-                QuotePair::new('‘', '’'),
-                QuotePair::new('"', '"'),
-            ])
-            .expect("日文引号策略有效"),
         )
     }
 
@@ -2765,11 +2017,32 @@ mod tests {
     }
 
     #[test]
+    fn repair_application_orders_replacements_across_natural_segments() {
+        let text = LanguageText::new(vec![
+            LanguageTextSegment::NaturalText("甲、".to_owned()),
+            LanguageTextSegment::OpaqueBoundary,
+            LanguageTextSegment::NaturalText("乙。".to_owned()),
+        ]);
+        let plan = LanguageRepairPlan::replacing(vec![
+            LanguageCharacterReplacement::new(2, 3, '。', '.'),
+            LanguageCharacterReplacement::new(0, 3, '、', ','),
+        ]);
+
+        assert_eq!(
+            text.apply_repair(&plan).expect("跨段修复计划应有效"),
+            LanguageText::new(vec![
+                LanguageTextSegment::NaturalText("甲,".to_owned()),
+                LanguageTextSegment::OpaqueBoundary,
+                LanguageTextSegment::NaturalText("乙.".to_owned()),
+            ])
+        );
+    }
+
+    #[test]
     fn semantic_fingerprint_can_cancel_inside_a_long_policy_term() {
         let long_term = "カ".repeat(LANGUAGE_TEXT_CANCELLATION_CHECK_BYTES * 2);
         let module = JapaneseLanguageModule::new(
             JapaneseResidualPolicy::new(non_zero(2), [long_term]).expect("测试策略应有效"),
-            None,
         );
         let expected = module.semantic_fingerprint();
         let module: &dyn LanguageModule = &module;
@@ -2938,140 +2211,6 @@ mod tests {
     }
 
     #[test]
-    fn japanese_quote_repair_preserves_unique_nested_structure() {
-        let module = japanese_module();
-        let source = LanguageText::new(vec![
-            LanguageTextSegment::NaturalText("彼は「これは『".to_owned()),
-            LanguageTextSegment::OpaqueBoundary,
-            LanguageTextSegment::NaturalText("勇者』の剣だ」と言った。".to_owned()),
-        ]);
-        let analysis = module.analyze_source(&source);
-        let translated = LanguageText::new(vec![
-            LanguageTextSegment::NaturalText("他说：“这是‘".to_owned()),
-            LanguageTextSegment::OpaqueBoundary,
-            LanguageTextSegment::NaturalText("勇者’之剑。”".to_owned()),
-        ]);
-        let plan = module
-            .plan_translation_repair(&analysis, &translated)
-            .expect("分析类型一致");
-        let repaired = translated.apply_repair(&plan).expect("修复位置有效");
-        assert_eq!(
-            repaired,
-            LanguageText::new(vec![
-                LanguageTextSegment::NaturalText("他说：「这是『".to_owned()),
-                LanguageTextSegment::OpaqueBoundary,
-                LanguageTextSegment::NaturalText("勇者』之剑。」".to_owned()),
-            ])
-        );
-    }
-
-    #[test]
-    fn japanese_quote_ambiguity_is_an_unchanged_normal_result() {
-        let module = japanese_module();
-        let analysis = module.analyze_source(&LanguageText::natural("「勇者」"));
-        let translated = LanguageText::natural("“勇者”与“魔王”");
-        let plan = module
-            .plan_translation_repair(&analysis, &translated)
-            .expect("分析类型一致");
-        assert!(plan.is_unchanged());
-        assert_eq!(
-            translated.apply_repair(&plan).expect("空计划有效"),
-            translated
-        );
-    }
-
-    #[test]
-    fn symmetric_quotes_are_interpreted_by_the_unique_source_topology() {
-        let module = japanese_module();
-        let analysis = module.analyze_source(&LanguageText::natural("「これは『勇者』だ」"));
-        let translated = LanguageText::natural("\"This is \"the hero\".\"");
-
-        let repaired = translated
-            .apply_repair(
-                &module
-                    .plan_translation_repair(&analysis, &translated)
-                    .expect("分析类型一致"),
-            )
-            .expect("唯一源拓扑应产生安全修复");
-
-        assert_eq!(repaired, LanguageText::natural("「This is 『the hero』.」"));
-    }
-
-    #[test]
-    fn changed_quote_topology_is_left_unchanged() {
-        let module = japanese_module();
-        let analysis = module.analyze_source(&LanguageText::natural("「これは『勇者』だ」"));
-        let translated = LanguageText::natural("“勇者”与“魔王”");
-        let plan = module
-            .plan_translation_repair(&analysis, &translated)
-            .expect("分析类型一致");
-
-        assert!(plan.is_unchanged());
-    }
-
-    #[test]
-    fn write_back_normalizer_repairs_mixed_and_reversed_quote_delimiters() {
-        let normalizer = japanese_quote_normalizer();
-
-        assert_eq!(
-            normalizer.normalize(
-                "「せっかくだ。\n弟子を育てるのも悪くはないだろう」",
-                "「难得的机会。\n培养个弟子也不错吧。”",
-            ),
-            "「难得的机会。\n培养个弟子也不错吧。」"
-        );
-        assert_eq!(normalizer.normalize("「勇者」", "”勇者“"), "「勇者」");
-    }
-
-    #[test]
-    fn write_back_normalizer_does_not_force_changed_or_incomplete_topology() {
-        let normalizer = japanese_quote_normalizer();
-
-        assert_eq!(
-            normalizer.normalize("「これは『勇者』だ」", "“勇者”与“魔王”"),
-            "“勇者”与“魔王”"
-        );
-        assert_eq!(normalizer.normalize("「勇者", "“勇者”"), "“勇者”");
-    }
-
-    #[test]
-    fn sibling_correct_and_unpaired_quotes_follow_safe_repair_boundaries() {
-        let module = japanese_module();
-
-        let sibling_analysis = module.analyze_source(&LanguageText::natural("「勇者」「魔王」"));
-        let sibling_translation = LanguageText::natural("“Hero”“Demon King”");
-        let sibling_repaired = sibling_translation
-            .apply_repair(
-                &module
-                    .plan_translation_repair(&sibling_analysis, &sibling_translation)
-                    .expect("分析类型一致"),
-            )
-            .expect("同级拓扑应该可以安全修复");
-        assert_eq!(
-            sibling_repaired,
-            LanguageText::natural("「Hero」「Demon King」")
-        );
-
-        let correct = LanguageText::natural("「Hero」");
-        let correct_analysis = module.analyze_source(&LanguageText::natural("「勇者」"));
-        assert!(
-            module
-                .plan_translation_repair(&correct_analysis, &correct)
-                .expect("分析类型一致")
-                .is_unchanged()
-        );
-
-        let unpaired_analysis = module.analyze_source(&LanguageText::natural("「勇者"));
-        let candidate = LanguageText::natural("“Hero”");
-        assert!(
-            module
-                .plan_translation_repair(&unpaired_analysis, &candidate)
-                .expect("不配对属于正常的不修复")
-                .is_unchanged()
-        );
-    }
-
-    #[test]
     fn japanese_detection_covers_extended_han_without_counting_punctuation_as_kana() {
         let module = japanese_module();
         assert!(
@@ -3094,14 +2233,6 @@ mod tests {
                 .fragment(),
             "ゲーム"
         );
-    }
-
-    #[test]
-    fn quote_policy_rejects_characters_that_cannot_safely_be_delimiters() {
-        assert!(matches!(
-            JapaneseQuoteRepairPolicy::new(vec![QuotePair::new('a', 'b')]),
-            Err(JapaneseQuoteRepairPolicyError::InvalidDelimiterCharacter { .. })
-        ));
     }
 
     #[test]

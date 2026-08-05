@@ -1,6 +1,7 @@
 //! 从 RPG Maker 文本资产表建立写回快照。
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
@@ -13,10 +14,12 @@ use crate::diagnostic::{
     RpgMakerWriteBackAssetComputeOperation, RpgMakerWriteBackAssetProblem,
     RpgMakerWriteBackAssetSnapshotViolation, RpgMakerWriteBackModelViolation, SafeIdentifier,
     SqliteDiagnosticContext, SqliteDiagnosticStage, SqliteOperation, SqliteTransactionState,
-    StateEffect,
+    StateEffect, TranslationIssue, TranslationJsonFailureKind, TranslationPlanningResourceKind,
+    TranslationPlanningResourceOrigin, TranslationPlanningResourceProblem,
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::json_diagnostic::JsonErrorCategory;
+use crate::rpg_maker::RpgMakerEngine;
 use crate::rpg_maker::asset::{RpgMakerAssetOwner, RpgMakerTextSnapshotFingerprintBuilder};
 use crate::rpg_maker::asset_storage::{
     OwnerPartitionedSqliteRow, RPG_MAKER_ASSET_OWNER_ORDER as RPG_MAKER_WRITE_BACK_OWNER_ORDER,
@@ -45,6 +48,10 @@ use crate::rpg_maker::semantic_order::{
     RpgMakerSemanticOrderKey, RpgMakerSemanticOrderKeyDecodeError,
 };
 use crate::rpg_maker::text::{RpgMakerLocation, TextGroupKind};
+use crate::rpg_maker::translate::placeholder::{
+    Pcre2PlaceholderConstructionError, Pcre2PlaceholderService, PlaceholderRuleCompilationError,
+    PlaceholderRuleDefinition,
+};
 use crate::runtime::cpu::CpuExecutorUnavailable;
 use crate::runtime::sqlite::SqliteRuntimeError;
 use crate::storage::sqlite::{
@@ -53,11 +60,15 @@ use crate::storage::sqlite::{
 
 use super::planner::{
     RpgMakerWriteBackAssetReader, RpgMakerWriteBackGroup, RpgMakerWriteBackSnapshot,
-    RpgMakerWriteBackSnapshotError, RpgMakerWriteBackUnit,
+    RpgMakerWriteBackSnapshotError, RpgMakerWriteBackSymbolRepairContext, RpgMakerWriteBackUnit,
 };
 
 const RPG_MAKER_WRITE_BACK_QUERY_RESULT_COUNT: usize =
-    1 + RPG_MAKER_WRITE_BACK_OWNER_ORDER.len() * 3;
+    2 + RPG_MAKER_WRITE_BACK_OWNER_ORDER.len() * 3;
+
+const READ_PLACEHOLDER_RULES: &str = r#"SELECT canonical_json
+FROM rpg_maker_translation_resource
+WHERE resource_kind = 'placeholder_rules'"#;
 
 fn read_rpg_maker_write_back_owner_states() -> String {
     format!(
@@ -115,6 +126,10 @@ fn rpg_maker_write_back_snapshot_queries() -> Vec<SqliteQuery> {
         SqliteQuery::new(read_rpg_maker_write_back_owner_states(), Vec::new())
             .with_id("write_back.owner_states"),
     );
+    queries.push(
+        SqliteQuery::new(READ_PLACEHOLDER_RULES, Vec::new())
+            .with_id("write_back.placeholder_rules"),
+    );
     for (kind, statement) in [
         ("groups", read_rpg_maker_write_back_owner_groups()),
         ("units", read_rpg_maker_write_back_owner_units()),
@@ -148,6 +163,11 @@ fn unpack_snapshot_query_results(
     }
     let mut query_results = query_results.into_iter();
     let owners = query_results.next().expect("已验证快照查询结果数量");
+    let placeholder_rules = decode_placeholder_rules_rows(
+        query_results
+            .next()
+            .expect("已验证 Placeholder 查询结果存在"),
+    )?;
     let mut next_owner_partitions = || {
         merge_owner_partitions([
             query_results.next().expect("已验证 Builtin 查询结果存在"),
@@ -160,10 +180,67 @@ fn unpack_snapshot_query_results(
     debug_assert!(query_results.next().is_none());
     Ok(SnapshotRows {
         owners,
+        placeholder_rules,
         groups,
         units,
         claims,
     })
+}
+
+fn decode_placeholder_rules_rows(
+    rows: Vec<SqliteRow>,
+) -> Result<String, InvalidRpgMakerWriteBackAssetSnapshot> {
+    let [row] = <[SqliteRow; 1]>::try_from(rows).map_err(|rows| {
+        InvalidRpgMakerWriteBackAssetSnapshot::PlaceholderRuleRowCount { actual: rows.len() }
+    })?;
+    let [value] = <[SqliteValue; 1]>::try_from(row.into_values()).map_err(|values| {
+        InvalidRpgMakerWriteBackAssetSnapshot::WrongColumnCount {
+            expected: 1,
+            actual: values.len(),
+        }
+    })?;
+    match value {
+        SqliteValue::Text(value) if !value.is_empty() => Ok(value),
+        SqliteValue::Text(_) => Err(InvalidRpgMakerWriteBackAssetSnapshot::BlankPlaceholderRules),
+        value => Err(InvalidRpgMakerWriteBackAssetSnapshot::WrongColumnType {
+            column: "canonical_json",
+            expected: "TEXT",
+            actual: value.kind_name(),
+        }),
+    }
+}
+
+fn build_symbol_repair_context(
+    engine: RpgMakerEngine,
+    placeholder_rules_json: String,
+) -> Result<RpgMakerWriteBackSymbolRepairContext, InvalidRpgMakerWriteBackAssetSnapshot> {
+    let placeholder_definitions: Vec<PlaceholderRuleDefinition> =
+        serde_json::from_str(&placeholder_rules_json)
+            .map_err(InvalidRpgMakerWriteBackAssetSnapshot::InvalidPlaceholderRulesJson)?;
+    let placeholder_service = match Pcre2PlaceholderService::new_with_cancellation(|| {
+        Ok::<_, Infallible>(())
+    }) {
+        Ok(Ok(service)) => service,
+        Ok(Err(source)) => {
+            return Err(InvalidRpgMakerWriteBackAssetSnapshot::InvalidBuiltinPlaceholder(source));
+        }
+        Err(unreachable) => match unreachable {},
+    };
+    let placeholder_rules = match placeholder_service
+        .compile_custom_with_cancellation(placeholder_definitions, || Ok::<_, Infallible>(()))
+    {
+        Ok(Ok(rules)) => rules,
+        Ok(Err(source)) => {
+            return Err(InvalidRpgMakerWriteBackAssetSnapshot::InvalidPlaceholderRules(source));
+        }
+        Err(unreachable) => match unreachable {},
+    };
+    Ok(RpgMakerWriteBackSymbolRepairContext::new(
+        engine,
+        placeholder_service,
+        placeholder_rules,
+        placeholder_rules_json,
+    ))
 }
 
 /// 先验证 active owner 与资产指纹，再用受控 CPU 解码建立写回快照。
@@ -196,6 +273,7 @@ where
     + use<Q, C> {
         let database_path = project.database_path().to_path_buf();
         let current_source = project.source_snapshot_fingerprint();
+        let engine = project.layout().rpg_maker_layout().engine();
         let dialogue_definition = project.mv_dialogue_definition().clone();
         let sqlite = Arc::clone(&self.sqlite);
         let cpu = Arc::clone(&self.cpu);
@@ -257,9 +335,12 @@ where
                 )?;
 
             let owner_states = prepared.owner_states;
+            let placeholder_rules_json = prepared.placeholder_rules;
             cpu.execute(move || {
+                let symbol_repair = build_symbol_repair_context(engine, placeholder_rules_json)?;
                 let decoded = decoded_records.into_iter().collect::<Result<Vec<_>, _>>()?;
                 assemble_snapshot(owner_states, decoded, &dialogue_definition_json)
+                    .map(|snapshot| snapshot.with_symbol_repair(symbol_repair))
             })
             .await
             .map_err(
@@ -420,18 +501,55 @@ impl RpgMakerWriteBackAssetReadingError<SqliteRuntimeError, CpuExecutorUnavailab
             Self::InvalidSnapshot {
                 database_path,
                 source,
-            } => write_back_asset_report(
-                database_path,
-                RpgMakerWriteBackAssetProblem::InvalidSnapshot {
-                    violation: source.diagnostic_violation(),
-                },
-            ),
+            } => match source {
+                InvalidRpgMakerWriteBackAssetSnapshot::InvalidPlaceholderRulesJson(source) => {
+                    DiagnosticReport::new(
+                        StateEffect::Unchanged,
+                        Diagnostic::translation(TranslationIssue::PlanningResource {
+                            resource: TranslationPlanningResourceKind::PlaceholderRules,
+                            origin: TranslationPlanningResourceOrigin::ProjectSnapshot,
+                            problem: TranslationPlanningResourceProblem::InvalidSnapshotJson {
+                                category: translation_json_failure(source),
+                                line: source.line(),
+                                column: source.column(),
+                            },
+                        }),
+                    )
+                }
+                InvalidRpgMakerWriteBackAssetSnapshot::InvalidBuiltinPlaceholder(source) => {
+                    source.diagnostic_report()
+                }
+                InvalidRpgMakerWriteBackAssetSnapshot::InvalidPlaceholderRules(source) => {
+                    DiagnosticReport::new(
+                        StateEffect::Unchanged,
+                        Diagnostic::translation(TranslationIssue::PlaceholderCompilation {
+                            origin: TranslationPlanningResourceOrigin::ProjectSnapshot,
+                            problem: source.diagnostic_problem(),
+                        }),
+                    )
+                }
+                _ => write_back_asset_report(
+                    database_path,
+                    RpgMakerWriteBackAssetProblem::InvalidSnapshot {
+                        violation: source.diagnostic_violation(),
+                    },
+                ),
+            },
         }
     }
 
     pub(crate) fn into_reported_failure(self) -> ReportedFailure {
         let report = self.diagnostic_report();
         ReportedFailure::new(report, self)
+    }
+}
+
+fn translation_json_failure(source: &serde_json::Error) -> TranslationJsonFailureKind {
+    match source.classify() {
+        serde_json::error::Category::Io => TranslationJsonFailureKind::Io,
+        serde_json::error::Category::Syntax => TranslationJsonFailureKind::Syntax,
+        serde_json::error::Category::Data => TranslationJsonFailureKind::Data,
+        serde_json::error::Category::Eof => TranslationJsonFailureKind::Eof,
     }
 }
 
@@ -502,6 +620,13 @@ pub(crate) enum InvalidRpgMakerWriteBackAssetSnapshot {
         expected: &'static str,
         actual: &'static str,
     },
+    PlaceholderRuleRowCount {
+        actual: usize,
+    },
+    BlankPlaceholderRules,
+    InvalidPlaceholderRulesJson(serde_json::Error),
+    InvalidBuiltinPlaceholder(Pcre2PlaceholderConstructionError),
+    InvalidPlaceholderRules(PlaceholderRuleCompilationError),
     InvalidSemanticOrderKey {
         column: &'static str,
         source: RpgMakerSemanticOrderKeyDecodeError,
@@ -602,6 +727,20 @@ impl InvalidRpgMakerWriteBackAssetSnapshot {
                 expected: SafeIdentifier::from_validated(*expected),
                 actual: SafeIdentifier::from_validated(*actual),
             },
+            Self::PlaceholderRuleRowCount { actual } => {
+                RpgMakerWriteBackAssetSnapshotViolation::PlaceholderRuleRowCount {
+                    expected: 1,
+                    actual: *actual,
+                }
+            }
+            Self::BlankPlaceholderRules => {
+                RpgMakerWriteBackAssetSnapshotViolation::BlankPlaceholderRules
+            }
+            Self::InvalidPlaceholderRulesJson(_)
+            | Self::InvalidBuiltinPlaceholder(_)
+            | Self::InvalidPlaceholderRules(_) => {
+                unreachable!("Placeholder 解析或编译错误由原始语义所有者建立诊断")
+            }
             Self::InvalidSemanticOrderKey { column, source } => {
                 RpgMakerWriteBackAssetSnapshotViolation::InvalidSemanticOrderKey {
                     column: SafeIdentifier::from_validated(*column),
@@ -941,6 +1080,21 @@ impl fmt::Display for InvalidRpgMakerWriteBackAssetSnapshot {
                 expected,
                 actual,
             } => write!(formatter, "列 {column} 应为 {expected}，实际为 {actual}"),
+            Self::PlaceholderRuleRowCount { actual } => write!(
+                formatter,
+                "写回快照应包含一行当前 Placeholder 规则，实际为 {actual} 行"
+            ),
+            Self::BlankPlaceholderRules => formatter.write_str("当前 Placeholder 规则资源不能为空"),
+            Self::InvalidPlaceholderRulesJson(source) => {
+                write!(
+                    formatter,
+                    "当前 Placeholder 规则资源不是合法 JSON：{source}"
+                )
+            }
+            Self::InvalidBuiltinPlaceholder(source) => source.fmt(formatter),
+            Self::InvalidPlaceholderRules(source) => {
+                write!(formatter, "当前 Placeholder 规则无效：{source}")
+            }
             Self::InvalidSemanticOrderKey { column, source } => {
                 write!(formatter, "列 {column} 不是规范语义顺序键：{source}")
             }
@@ -1061,6 +1215,9 @@ impl Error for InvalidRpgMakerWriteBackAssetSnapshot {
             Self::InvalidUnitContent { source, .. } => Some(source),
             Self::InvalidModel(source) => Some(source),
             Self::InvalidDialogueDefinition(source) => Some(source.as_ref()),
+            Self::InvalidPlaceholderRulesJson(source) => Some(source),
+            Self::InvalidBuiltinPlaceholder(source) => Some(source),
+            Self::InvalidPlaceholderRules(source) => Some(source),
             _ => None,
         }
     }
@@ -1073,6 +1230,7 @@ struct OwnerState {
 
 struct SnapshotRows {
     owners: Vec<SqliteRow>,
+    placeholder_rules: String,
     groups: Vec<OwnerPartitionedSqliteRow>,
     units: Vec<OwnerPartitionedSqliteRow>,
     claims: Vec<OwnerPartitionedSqliteRow>,
@@ -1087,6 +1245,7 @@ enum SnapshotAssetRow {
 struct PreparedRows {
     stale_owners: Vec<RpgMakerAssetOwner>,
     owner_states: HashMap<RpgMakerAssetOwner, OwnerState>,
+    placeholder_rules: String,
     records: Vec<SnapshotAssetRow>,
 }
 
@@ -1141,6 +1300,7 @@ fn prepare_rows(
     Ok(PreparedRows {
         stale_owners,
         owner_states,
+        placeholder_rules: rows.placeholder_rules,
         records,
     })
 }
@@ -1503,6 +1663,7 @@ fn assemble_snapshot(
         let semantic_order_key = group.semantic_order_key;
         let owner = group.owner;
         let group = RpgMakerWriteBackGroup::from_recipes(
+            owner,
             group.kind,
             group.location,
             group.units,
@@ -1862,6 +2023,44 @@ mod tests {
     use rusqlite::params_from_iter;
 
     #[test]
+    fn write_back_placeholder_rules_are_strictly_parsed_and_compiled() {
+        assert!(matches!(
+            build_symbol_repair_context(RpgMakerEngine::Mz, "{not-json".to_owned()),
+            Err(InvalidRpgMakerWriteBackAssetSnapshot::InvalidPlaceholderRulesJson(_))
+        ));
+        assert!(matches!(
+            build_symbol_repair_context(RpgMakerEngine::Mv, r#"[{"pattern":"("}]"#.to_owned(),),
+            Err(InvalidRpgMakerWriteBackAssetSnapshot::InvalidPlaceholderRules(_))
+        ));
+        build_symbol_repair_context(
+            RpgMakerEngine::Mz,
+            r#"[{"scopes":["event_dialogue"],"pattern":"<msg>(?<text>.*?)</msg>"}]"#.to_owned(),
+        )
+        .expect("当前规范 Placeholder 快照应可建立写回修复上下文");
+    }
+
+    #[test]
+    fn write_back_placeholder_resource_requires_one_nonblank_text_row() {
+        assert!(matches!(
+            decode_placeholder_rules_rows(Vec::new()),
+            Err(InvalidRpgMakerWriteBackAssetSnapshot::PlaceholderRuleRowCount { actual: 0 })
+        ));
+        assert!(matches!(
+            decode_placeholder_rules_rows(vec![SqliteRow::new(vec![SqliteValue::Text(
+                String::new(),
+            )])]),
+            Err(InvalidRpgMakerWriteBackAssetSnapshot::BlankPlaceholderRules)
+        ));
+        assert_eq!(
+            decode_placeholder_rules_rows(vec![SqliteRow::new(vec![SqliteValue::Text(
+                "[]".to_owned(),
+            )])])
+            .expect("单行当前规则应可读取"),
+            "[]"
+        );
+    }
+
+    #[test]
     fn write_back_snapshot_model_variants_keep_typed_facts_on_cli_and_jsonl() {
         let source = RpgMakerSource::data(StandardDataFile::Items);
         let group_location =
@@ -2189,6 +2388,7 @@ mod tests {
     fn snapshot_rows(owners: Vec<SqliteRow>) -> SnapshotRows {
         SnapshotRows {
             owners,
+            placeholder_rules: "[]".to_owned(),
             groups: Vec::new(),
             units: Vec::new(),
             claims: Vec::new(),
@@ -2326,6 +2526,7 @@ mod tests {
         units.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
         SnapshotRows {
             owners: vec![owner_row([1; 32], *fingerprint.as_bytes())],
+            placeholder_rules: "[]".to_owned(),
             groups: groups.into_iter().map(|(_, row)| row).collect(),
             units: units.into_iter().map(|(_, _, row)| row).collect(),
             claims,
@@ -2454,13 +2655,17 @@ mod tests {
 
         let queries = rpg_maker_write_back_snapshot_queries();
         assert_eq!(queries.len(), RPG_MAKER_WRITE_BACK_QUERY_RESULT_COUNT);
-        let (owner_query, partition_queries) = queries
+        let (owner_query, remaining_queries) = queries
             .split_first()
             .expect("写回快照查询至少包含 owner 状态");
         assert!(
             owner_query.statement().contains("CASE owner"),
             "至多两行的 owner 状态查询必须恢复 Builtin、Rules 规范顺序"
         );
+        let (placeholder_query, partition_queries) = remaining_queries
+            .split_first()
+            .expect("写回快照查询必须包含当前 Placeholder 规则");
+        assert_eq!(placeholder_query.statement(), READ_PLACEHOLDER_RULES);
         assert!(
             partition_queries
                 .iter()
@@ -2509,6 +2714,7 @@ mod tests {
         };
         let rows = SnapshotRows {
             owners: Vec::new(),
+            placeholder_rules: "[]".to_owned(),
             groups: vec![make_row("group-0", 4), make_row("group-1", 4)],
             units: vec![make_row("unit-0", 6), make_row("unit-1", 6)],
             claims: vec![make_row("claim-0", 3)],

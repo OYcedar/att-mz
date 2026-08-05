@@ -34,11 +34,8 @@ use crate::diagnostic::{
 };
 use crate::language::{
     EnglishLanguageModule, EnglishResidualPolicy, EnglishTranslationDetectionPolicy,
-    JapaneseLanguageModule, JapaneseQuoteNormalizer, JapaneseQuoteRepairPolicy,
-    JapaneseQuoteRepairPolicyError, JapaneseResidualPolicy, LanguageId, LanguageIdError,
-    LanguageModule, LanguageModuleCatalog, LanguageModuleCatalogBuildError,
-    LanguagePolicyConfigurationError, LanguageTextNormalizer, LanguageTextNormalizerCatalog,
-    QuotePair,
+    JapaneseLanguageModule, JapaneseResidualPolicy, LanguageId, LanguageIdError, LanguageModule,
+    LanguageModuleCatalog, LanguageModuleCatalogBuildError, LanguagePolicyConfigurationError,
 };
 use crate::project_name::ProjectName;
 use crate::rpg_maker::RpgMakerLayout;
@@ -360,7 +357,7 @@ impl ConfiguredRpgMakerCommand {
                 Ok(Self::Translate(Box::new(configured)))
             }
             RpgMakerCommandArguments::WriteBack(arguments) => {
-                let raw: RawWriteBackSelection = parse_selected(
+                let _: RawWriteBackSelection = parse_selected(
                     source,
                     configuration_path,
                     toml_index.as_ref(),
@@ -372,8 +369,7 @@ impl ConfiguredRpgMakerCommand {
                     layout.engine().storage_name(),
                 );
                 let WriteBackArguments { project } = arguments;
-                let rpg_maker = WriteBackConfiguration::build(raw.languages)
-                    .map_err(ConfigurationLoadError::InvalidValue)?;
+                let rpg_maker = WriteBackConfiguration::build();
                 Ok(Self::WriteBack(ConfiguredWriteBackCommand {
                     project_name: project.name,
                     common,
@@ -492,7 +488,7 @@ impl ConfiguredGenericCommand {
                 Ok(Self::Translate(Box::new(configured)))
             }
             GenericCommand::WriteBack(project) => {
-                let raw: RawWriteBackSelection = parse_selected(
+                let _: RawWriteBackSelection = parse_selected(
                     source,
                     configuration_path,
                     toml_index.as_ref(),
@@ -506,8 +502,6 @@ impl ConfiguredGenericCommand {
                     common,
                     cpu: build_cpu_configuration(),
                     publisher,
-                    text_normalizers: build_language_text_normalizers(raw.languages)
-                        .map_err(ConfigurationLoadError::InvalidValue)?,
                     source: Arc::new(DeferredConfigurationSource::new(
                         configuration_path,
                         source,
@@ -539,7 +533,6 @@ pub(crate) struct ConfiguredGenericWriteBackCommand {
     common: CommonCommandConfiguration,
     cpu: CpuExecutorConfig,
     publisher: DirectoryPublisherConfig,
-    text_normalizers: LanguageTextNormalizerCatalog,
     source: Arc<DeferredConfigurationSource>,
 }
 
@@ -558,10 +551,6 @@ impl ConfiguredGenericWriteBackCommand {
 
     pub(crate) const fn publisher(&self) -> &DirectoryPublisherConfig {
         &self.publisher
-    }
-
-    pub(crate) const fn text_normalizers(&self) -> &LanguageTextNormalizerCatalog {
-        &self.text_normalizers
     }
 
     pub(crate) fn resolve_translation(
@@ -1095,25 +1084,17 @@ impl TranslateConfiguration {
 
 pub(crate) struct WriteBackConfiguration {
     document: RpgMakerDocumentReadingConfig,
-    text_normalizers: LanguageTextNormalizerCatalog,
 }
 
 impl WriteBackConfiguration {
-    fn build(
-        raw_languages: Vec<RawWriteBackLanguageConfiguration>,
-    ) -> Result<Self, ConfigurationValueError> {
-        Ok(Self {
+    fn build() -> Self {
+        Self {
             document: build_document_configuration(),
-            text_normalizers: build_language_text_normalizers(raw_languages)?,
-        })
+        }
     }
 
     pub(crate) const fn document(&self) -> RpgMakerDocumentReadingConfig {
         self.document
-    }
-
-    pub(crate) const fn text_normalizers(&self) -> &LanguageTextNormalizerCatalog {
-        &self.text_normalizers
     }
 }
 
@@ -1155,7 +1136,6 @@ fn build_language_modules(
                 id,
                 minimum_kana_characters,
                 allowed_terms,
-                quote_repair_pairs,
             } => {
                 let residual = JapaneseResidualPolicy::new(
                     non_zero_usize(
@@ -1165,21 +1145,7 @@ fn build_language_modules(
                     allowed_terms,
                 )
                 .map_err(|source| invalid(field.as_str(), language_policy_rule(&source)))?;
-                let quote_repair = (!quote_repair_pairs.is_empty())
-                    .then(|| {
-                        JapaneseQuoteRepairPolicy::new(
-                            quote_repair_pairs
-                                .into_iter()
-                                .map(|[opening, closing]| QuotePair::new(opening, closing))
-                                .collect(),
-                        )
-                    })
-                    .transpose()
-                    .map_err(|source| invalid(field.as_str(), quote_repair_rule(&source)))?;
-                (
-                    id,
-                    Arc::new(JapaneseLanguageModule::new(residual, quote_repair)),
-                )
+                (id, Arc::new(JapaneseLanguageModule::new(residual)))
             }
             RawLanguageConfiguration::English {
                 id,
@@ -1236,55 +1202,6 @@ fn build_language_modules(
     Ok(catalog)
 }
 
-fn build_language_text_normalizers(
-    raw_languages: Vec<RawWriteBackLanguageConfiguration>,
-) -> Result<LanguageTextNormalizerCatalog, ConfigurationValueError> {
-    let mut bindings = Vec::<(LanguageId, Arc<dyn LanguageTextNormalizer>)>::new();
-    let mut language_ids = BTreeSet::new();
-    for (index, raw) in raw_languages.into_iter().enumerate() {
-        let field = format!("languages[{index}]");
-        let (id, normalizer): (String, Option<Arc<dyn LanguageTextNormalizer>>) = match raw {
-            RawWriteBackLanguageConfiguration::Japanese {
-                id,
-                quote_repair_pairs,
-                _other: _,
-            } => {
-                let normalizer = (!quote_repair_pairs.is_empty())
-                    .then(|| {
-                        JapaneseQuoteRepairPolicy::new(
-                            quote_repair_pairs
-                                .into_iter()
-                                .map(|[opening, closing]| QuotePair::new(opening, closing))
-                                .collect(),
-                        )
-                    })
-                    .transpose()
-                    .map_err(|source| invalid(field.as_str(), quote_repair_rule(&source)))?
-                    .map(|policy| {
-                        Arc::new(JapaneseQuoteNormalizer::new(policy))
-                            as Arc<dyn LanguageTextNormalizer>
-                    });
-                (id, normalizer)
-            }
-            RawWriteBackLanguageConfiguration::English { id, _other: _ } => (id, None),
-        };
-        let id = LanguageId::parse(&id)
-            .map_err(|source| invalid(format!("{field}.id").as_str(), language_id_rule(&source)))?;
-        if !language_ids.insert(id.as_str().to_owned()) {
-            return Err(invalid(
-                field.as_str(),
-                ConfigurationValueRule::LanguageIdDuplicate,
-            ));
-        }
-        if let Some(normalizer) = normalizer {
-            bindings.push((id, normalizer));
-        }
-    }
-
-    LanguageTextNormalizerCatalog::new(bindings)
-        .map_err(|_| invalid("languages", ConfigurationValueRule::LanguageIdDuplicate))
-}
-
 const fn language_policy_rule(source: &LanguagePolicyConfigurationError) -> ConfigurationValueRule {
     match source {
         LanguagePolicyConfigurationError::BlankTerm => {
@@ -1295,23 +1212,6 @@ const fn language_policy_rule(source: &LanguagePolicyConfigurationError) -> Conf
         }
         LanguagePolicyConfigurationError::DuplicateTerm { .. } => {
             ConfigurationValueRule::LanguagePolicyTermDuplicate
-        }
-    }
-}
-
-const fn quote_repair_rule(source: &JapaneseQuoteRepairPolicyError) -> ConfigurationValueRule {
-    match source {
-        JapaneseQuoteRepairPolicyError::EmptyCandidatePairs => {
-            ConfigurationValueRule::QuoteRepairCandidatesEmpty
-        }
-        JapaneseQuoteRepairPolicyError::InvalidDelimiterCharacter { .. } => {
-            ConfigurationValueRule::QuoteRepairDelimiterInvalid
-        }
-        JapaneseQuoteRepairPolicyError::DuplicatePair { .. } => {
-            ConfigurationValueRule::QuoteRepairPairDuplicate
-        }
-        JapaneseQuoteRepairPolicyError::AmbiguousCharacter { .. } => {
-            ConfigurationValueRule::QuoteRepairDelimiterAmbiguous
         }
     }
 }
@@ -2174,16 +2074,6 @@ impl IndexedValueShape {
             ConfigurationTomlValueKind::IntegerArray => {
                 self.array_items_match(|item| item.matches(ConfigurationTomlValueKind::Integer))
             }
-            ConfigurationTomlValueKind::StringPairArray => self.array_items_match(|item| {
-                matches!(
-                    item,
-                    Self::Array { items, .. }
-                        if items.len() == 2
-                            && items
-                                .iter()
-                                .all(|part| part.matches(ConfigurationTomlValueKind::String))
-                )
-            }),
             ConfigurationTomlValueKind::Table => {
                 matches!(self, Self::InlineTable { .. })
             }
@@ -2677,13 +2567,9 @@ impl ConfigurationFieldContract {
         "minimum_copied_letter_count",
         "allowed_terms",
         "ignored_terms",
-        "quote_repair_pairs",
     ];
-    const JAPANESE_REQUIRED_FIELDS: &'static [&'static str] = &[
-        "minimum_kana_characters",
-        "allowed_terms",
-        "quote_repair_pairs",
-    ];
+    const JAPANESE_REQUIRED_FIELDS: &'static [&'static str] =
+        &["minimum_kana_characters", "allowed_terms"];
     const ENGLISH_REQUIRED_FIELDS: &'static [&'static str] = &[
         "minimum_word_count",
         "minimum_letter_count",
@@ -2838,9 +2724,6 @@ impl ConfigurationFieldContract {
                     && matches!(field.as_str(), "allowed_terms" | "ignored_terms") =>
             {
                 ConfigurationTomlValueKind::StringArray
-            }
-            [languages, pairs] if languages == "languages" && pairs == "quote_repair_pairs" => {
-                ConfigurationTomlValueKind::StringPairArray
             }
             [translation, record]
                 if translation == "translation" && record == "record_translation_tasks" =>
@@ -4065,27 +3948,10 @@ struct RawWriteBackSelection {
     _llm: Option<IgnoredAny>,
     #[serde(default, rename = "prompts")]
     _prompts: Option<IgnoredAny>,
-    #[serde(default)]
-    languages: Vec<RawWriteBackLanguageConfiguration>,
+    #[serde(default, rename = "languages")]
+    _languages: Option<IgnoredAny>,
     #[serde(default, rename = "translation")]
     _translation: Option<IgnoredAny>,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum RawWriteBackLanguageConfiguration {
-    Japanese {
-        id: String,
-        #[serde(default)]
-        quote_repair_pairs: Vec<[char; 2]>,
-        #[serde(flatten)]
-        _other: HashMap<String, IgnoredAny>,
-    },
-    English {
-        id: String,
-        #[serde(flatten)]
-        _other: HashMap<String, IgnoredAny>,
-    },
 }
 
 #[derive(Deserialize)]
@@ -4122,7 +3988,6 @@ enum RawLanguageConfiguration {
         id: String,
         minimum_kana_characters: u64,
         allowed_terms: Vec<String>,
-        quote_repair_pairs: Vec<[char; 2]>,
     },
     English {
         id: String,
@@ -4201,23 +4066,6 @@ mod tests {
         ] {
             load_configuration(&path, command).expect("仓库示例必须满足每个命令的当前契约");
         }
-    }
-
-    #[test]
-    fn write_back_builds_the_shared_quote_normalizer_from_language_configuration() {
-        let directory = TestDirectory::new();
-        let path = directory.write("config.toml", include_str!("../../config.example.toml"));
-        let ConfiguredRpgMakerCommand::WriteBack(configured) =
-            load_configuration(&path, write_back_command()).expect("示例 WriteBack 配置应合法")
-        else {
-            panic!("应建立 RPG Maker WriteBack 配置");
-        };
-        let normalizer = configured
-            .rpg_maker()
-            .text_normalizers()
-            .resolve(&LanguageId::parse("ja").expect("测试语言应合法"))
-            .expect("日文 WriteBack 应建立规范化器");
-        assert_eq!(normalizer.normalize("「原文」", "「译文”"), "「译文」");
     }
 
     #[test]
@@ -4906,7 +4754,7 @@ id = "unused"
         assert!(load_configuration(&path, translate_command("primary")).is_err());
 
         let duplicate_language = format!(
-            "{}\n[[languages]]\ntype = \"japanese\"\nid = \"JA\"\nminimum_kana_characters = 1\nallowed_terms = []\nquote_repair_pairs = []\n",
+            "{}\n[[languages]]\ntype = \"japanese\"\nid = \"JA\"\nminimum_kana_characters = 1\nallowed_terms = []\n",
             include_str!("../../config.example.toml")
         );
         let path = directory.write("duplicate-language.toml", &duplicate_language);
@@ -5054,37 +4902,27 @@ id = "unused"
     }
 
     #[test]
-    fn string_pair_array_shape_requires_exact_pairs() {
-        const SENTINEL: &str = "PAIR_SHAPE_VALUE_SENTINEL";
+    fn removed_quote_repair_configuration_is_rejected() {
         let directory = TestDirectory::new();
         let example = include_str!("../../config.example.toml");
-        let original = "quote_repair_pairs = [[\"“\", \"”\"], [\"‘\", \"’\"]]";
-
-        for (name, replacement) in [
-            ("one", format!("quote_repair_pairs = [[\"{SENTINEL}\"]]")),
-            (
-                "three",
-                format!("quote_repair_pairs = [[\"a\", \"b\", \"{SENTINEL}\"]]"),
-            ),
-        ] {
-            let source = example.replacen(original, &replacement, 1);
-            let path = directory.write(format!("pair-shape-{name}.toml").as_str(), &source);
-            let error = match load_configuration(&path, translate_command("primary")) {
-                Ok(_) => panic!("一项必须恰好包含两个字符串：{name}"),
-                Err(error) => error,
-            };
-            assert!(matches!(
-                &error,
-                ConfigurationLoadError::InvalidToml {
-                    resource,
-                    failure: ConfigurationTomlFailureKind::TypeMismatch {
-                        expected: ConfigurationTomlValueKind::StringPairArray,
-                    },
-                    ..
-                } if resource == "languages.quote_repair_pairs"
-            ));
-            assert!(!format!("{error:?}\n{error}").contains(SENTINEL));
-        }
+        let source = example.replacen(
+            "allowed_terms = []",
+            "allowed_terms = []\nquote_repair_pairs = [[\"“\", \"”\"]]",
+            1,
+        );
+        let path = directory.write("removed-quote-repair.toml", &source);
+        let error = match load_configuration(&path, translate_command("primary")) {
+            Ok(_) => panic!("旧的日文引号修复字段必须按未知字段拒绝"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ConfigurationLoadError::InvalidToml {
+                ref resource,
+                failure: ConfigurationTomlFailureKind::UnknownField,
+                ..
+            } if resource == "languages.quote_repair_pairs"
+        ));
     }
 
     #[test]

@@ -8,17 +8,28 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
 use crate::diagnostic::{
-    Diagnostic, DiagnosticReport, GenericDiagnosticStage, GenericIssue, GenericProblem,
-    GenericWriteBackSnapshotProblem, SafeIdentifier, SafePath, StateEffect,
+    Diagnostic, DiagnosticReport, GenericDiagnosticStage, GenericIssue,
+    GenericLanguageProjectionProblem, GenericProblem, GenericUnitLocator,
+    GenericWriteBackSnapshotProblem, GenericWriteBackTextSide, GenericWriteBackUnitProblem,
+    SafeIdentifier, SafePath, StateEffect,
 };
 use crate::execution::CooperativeCancellation;
-use crate::language::{LanguageOperationCancelled, LanguageTextNormalizer};
+use crate::language::{LanguageText, LanguageTextSegment};
+use crate::translation::placeholder::PlaceholderProtectionError;
+use crate::translation::placeholder_projection::LanguageTextProjectionError;
+use crate::translation::symbol_repair::{
+    TranslationSymbolRepairOutcome, TranslationSymbolRepairer,
+};
 
 #[cfg(test)]
 use super::jsonl::parse_file;
 use super::jsonl::{
     GenericFile, GenericInputSnapshot, GenericJsonlError, parse_file_with_cancellation,
     serialize_groups_with_cancellation,
+};
+use super::placeholder::{
+    GenericCompiledPlaceholderRules, GenericPlaceholderService,
+    protected_translation_placeholder_binding_matches_with_cancellation,
 };
 use super::project::GenericStoredSnapshot;
 #[cfg(test)]
@@ -47,6 +58,10 @@ pub(crate) struct GenericWriteBackCandidate {
     files: Vec<GenericWriteBackFile>,
     translated_units: usize,
     retained_source_units: usize,
+    symbol_repair_attempted_units: usize,
+    symbol_repair_repaired_units: usize,
+    symbol_repair_skipped_units: usize,
+    symbol_repair_replacement_count: usize,
 }
 
 impl GenericWriteBackCandidate {
@@ -61,6 +76,39 @@ impl GenericWriteBackCandidate {
     pub(crate) const fn retained_source_units(&self) -> usize {
         self.retained_source_units
     }
+
+    pub(crate) const fn symbol_repair_attempted_units(&self) -> usize {
+        self.symbol_repair_attempted_units
+    }
+
+    pub(crate) const fn symbol_repair_repaired_units(&self) -> usize {
+        self.symbol_repair_repaired_units
+    }
+
+    pub(crate) const fn symbol_repair_skipped_units(&self) -> usize {
+        self.symbol_repair_skipped_units
+    }
+
+    pub(crate) const fn symbol_repair_replacement_count(&self) -> usize {
+        self.symbol_repair_replacement_count
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SymbolRepairStatistics {
+    attempted_units: usize,
+    repaired_units: usize,
+    skipped_units: usize,
+    replacements: usize,
+}
+
+impl SymbolRepairStatistics {
+    fn add_assign(&mut self, other: Self) {
+        self.attempted_units += other.attempted_units;
+        self.repaired_units += other.repaired_units;
+        self.skipped_units += other.skipped_units;
+        self.replacements += other.replacements;
+    }
 }
 
 /// 候选无法证明只修改了 Unit text。
@@ -68,6 +116,19 @@ impl GenericWriteBackCandidate {
 pub(crate) enum GenericWriteBackError {
     SourceChanged,
     SnapshotMismatch(GenericWriteBackSnapshotProblem),
+    PlaceholderProtection {
+        unit: GenericUnitLocator,
+        side: GenericWriteBackTextSide,
+        source: PlaceholderProtectionError,
+    },
+    PlaceholderBindingMismatch {
+        unit: GenericUnitLocator,
+    },
+    LanguageProjection {
+        unit: GenericUnitLocator,
+        side: GenericWriteBackTextSide,
+        source: LanguageTextProjectionError,
+    },
     MaterializedMismatch {
         path: PathBuf,
         bytes_changed: bool,
@@ -83,6 +144,11 @@ impl fmt::Display for GenericWriteBackError {
             Self::SnapshotMismatch(problem) => {
                 write!(formatter, "Generic 数据库快照与当前输入不一致：{problem:?}")
             }
+            Self::PlaceholderProtection { source, .. } => source.fmt(formatter),
+            Self::PlaceholderBindingMismatch { .. } => {
+                formatter.write_str("当前译文没有完整保留原文实际命中的 Placeholder")
+            }
+            Self::LanguageProjection { source, .. } => source.fmt(formatter),
             Self::MaterializedMismatch {
                 path,
                 bytes_changed,
@@ -101,9 +167,12 @@ impl Error for GenericWriteBackError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Jsonl(source) => Some(source),
-            Self::SourceChanged | Self::SnapshotMismatch(_) | Self::MaterializedMismatch { .. } => {
-                None
-            }
+            Self::PlaceholderProtection { source, .. } => Some(source),
+            Self::LanguageProjection { source, .. } => Some(source),
+            Self::SourceChanged
+            | Self::SnapshotMismatch(_)
+            | Self::PlaceholderBindingMismatch { .. }
+            | Self::MaterializedMismatch { .. } => None,
         }
     }
 }
@@ -125,6 +194,41 @@ impl GenericWriteBackError {
                     problem: problem.clone(),
                 },
             )),
+            Self::PlaceholderProtection { unit, side, source } => {
+                Diagnostic::generic(GenericIssue::project(
+                    GenericDiagnosticStage::WriteBack,
+                    GenericProblem::WriteBackUnit {
+                        unit: unit.clone(),
+                        problem: GenericWriteBackUnitProblem::PlaceholderProtection {
+                            side: *side,
+                            problem: source.diagnostic_issue(),
+                        },
+                    },
+                ))
+            }
+            Self::PlaceholderBindingMismatch { unit } => {
+                Diagnostic::generic(GenericIssue::project(
+                    GenericDiagnosticStage::WriteBack,
+                    GenericProblem::WriteBackUnit {
+                        unit: unit.clone(),
+                        problem: GenericWriteBackUnitProblem::PlaceholderBindingMismatch {
+                            side: GenericWriteBackTextSide::Translation,
+                        },
+                    },
+                ))
+            }
+            Self::LanguageProjection { unit, side, source } => {
+                Diagnostic::generic(GenericIssue::project(
+                    GenericDiagnosticStage::WriteBack,
+                    GenericProblem::WriteBackUnit {
+                        unit: unit.clone(),
+                        problem: GenericWriteBackUnitProblem::LanguageProjection {
+                            side: *side,
+                            problem: generic_language_projection_problem(source),
+                        },
+                    },
+                ))
+            }
             Self::MaterializedMismatch {
                 path,
                 bytes_changed,
@@ -149,6 +253,50 @@ impl From<GenericJsonlError> for GenericWriteBackError {
     }
 }
 
+const fn generic_language_projection_problem(
+    source: &LanguageTextProjectionError,
+) -> GenericLanguageProjectionProblem {
+    match source {
+        LanguageTextProjectionError::TokenIndexConstruction => {
+            GenericLanguageProjectionProblem::TokenIndexConstruction
+        }
+        LanguageTextProjectionError::EmptyToken => GenericLanguageProjectionProblem::EmptyToken,
+        LanguageTextProjectionError::MissingToken { .. } => {
+            GenericLanguageProjectionProblem::MissingToken
+        }
+        LanguageTextProjectionError::RepeatedToken { .. } => {
+            GenericLanguageProjectionProblem::RepeatedToken
+        }
+        LanguageTextProjectionError::OverlappingToken { .. } => {
+            GenericLanguageProjectionProblem::OverlappingToken
+        }
+        LanguageTextProjectionError::ChangedTokenOrder { position, .. } => {
+            GenericLanguageProjectionProblem::ChangedTokenOrder {
+                position: *position,
+            }
+        }
+        LanguageTextProjectionError::ChangedSegmentCount { expected, actual } => {
+            GenericLanguageProjectionProblem::ChangedSegmentCount {
+                expected: *expected,
+                actual: *actual,
+            }
+        }
+        LanguageTextProjectionError::ChangedSegmentKind { segment_index } => {
+            GenericLanguageProjectionProblem::ChangedSegmentKind {
+                segment_index: *segment_index,
+            }
+        }
+        LanguageTextProjectionError::MissingOrderedToken { segment_index } => {
+            GenericLanguageProjectionProblem::MissingOrderedToken {
+                segment_index: *segment_index,
+            }
+        }
+        LanguageTextProjectionError::UnusedOrderedToken => {
+            GenericLanguageProjectionProblem::UnusedOrderedToken
+        }
+    }
+}
+
 /// 以当前外部 JSONL 为结构来源，只把数据库中的当前译文写入 `text`。
 #[cfg(test)]
 pub(crate) fn build_write_back_candidate(
@@ -156,11 +304,14 @@ pub(crate) fn build_write_back_candidate(
     live: &GenericInputSnapshot,
     current_translations: &GenericUnitMap<String>,
 ) -> Result<GenericWriteBackCandidate, GenericWriteBackError> {
+    let placeholder_rules = GenericPlaceholderService::default()
+        .compile(Vec::new())
+        .expect("空 Generic Placeholder 规则必须有效");
     build_write_back_candidate_with_cancellation(
         stored,
         live,
         current_translations,
-        None,
+        &placeholder_rules,
         &CooperativeCancellation::default(),
     )
 }
@@ -170,7 +321,7 @@ pub(crate) fn build_write_back_candidate_with_cancellation(
     stored: &GenericStoredSnapshot,
     live: &GenericInputSnapshot,
     current_translations: &GenericUnitMap<String>,
-    text_normalizer: Option<&dyn LanguageTextNormalizer>,
+    placeholder_rules: &GenericCompiledPlaceholderRules,
     cancellation: &CooperativeCancellation,
 ) -> Result<GenericWriteBackCandidate, GenericWriteBackError> {
     ensure_write_back_running(cancellation)?;
@@ -195,7 +346,7 @@ pub(crate) fn build_write_back_candidate_with_cancellation(
                 stored_file,
                 live_file,
                 current_translations,
-                text_normalizer,
+                placeholder_rules,
                 cancellation,
             )
         })
@@ -203,6 +354,7 @@ pub(crate) fn build_write_back_candidate_with_cancellation(
 
     let mut translated_units = 0;
     let mut retained_source_units = 0;
+    let mut symbol_repair = SymbolRepairStatistics::default();
     let mut files = Vec::with_capacity(live.files().len());
     // Rayon 的 indexed collect 保留文件顺序；这里再按自然顺序取出结果，
     // 因而多个文件同时失败时仍返回自然顺序最早的错误。
@@ -211,6 +363,7 @@ pub(crate) fn build_write_back_candidate_with_cancellation(
         let built = result?;
         translated_units += built.translated_units;
         retained_source_units += built.retained_source_units;
+        symbol_repair.add_assign(built.symbol_repair);
         files.push(built.file);
     }
     ensure_write_back_running(cancellation)?;
@@ -219,6 +372,10 @@ pub(crate) fn build_write_back_candidate_with_cancellation(
         files,
         translated_units,
         retained_source_units,
+        symbol_repair_attempted_units: symbol_repair.attempted_units,
+        symbol_repair_repaired_units: symbol_repair.repaired_units,
+        symbol_repair_skipped_units: symbol_repair.skipped_units,
+        symbol_repair_replacement_count: symbol_repair.replacements,
     })
 }
 
@@ -226,13 +383,14 @@ struct BuiltWriteBackFile {
     file: GenericWriteBackFile,
     translated_units: usize,
     retained_source_units: usize,
+    symbol_repair: SymbolRepairStatistics,
 }
 
 fn build_write_back_file(
     stored_file: &super::project::GenericStoredFile,
     live_file: &GenericFile,
     translations: &GenericUnitMap<String>,
-    text_normalizer: Option<&dyn LanguageTextNormalizer>,
+    placeholder_rules: &GenericCompiledPlaceholderRules,
     cancellation: &CooperativeCancellation,
 ) -> Result<BuiltWriteBackFile, GenericWriteBackError> {
     ensure_write_back_running(cancellation)?;
@@ -256,6 +414,7 @@ fn build_write_back_file(
 
     let mut translated_units = 0;
     let mut retained_source_units = 0;
+    let mut symbol_repair = SymbolRepairStatistics::default();
     let mut output_groups = Vec::with_capacity(live_file.groups().len());
     for (group_ordinal, (stored_group, live_group)) in stored_file
         .groups()
@@ -281,17 +440,21 @@ fn build_write_back_file(
             let text = if let Some(translation) = translation {
                 ensure_write_back_text_running(translation, cancellation)?;
                 translated_units += 1;
-                match text_normalizer {
-                    Some(normalizer) => Cow::Owned(
-                        normalizer
-                            .normalize_with_cancellation(unit.text(), translation, &mut || {
-                                ensure_write_back_running(cancellation)
-                                    .map_err(|_| LanguageOperationCancelled)
-                            })
-                            .map_err(|LanguageOperationCancelled| GenericJsonlError::Cancelled)?,
-                    ),
-                    None => Cow::Borrowed(translation.as_str()),
-                }
+                let context = GenericWriteBackUnitContext {
+                    relative_path: live_file.relative_path(),
+                    group_id: live_group.id(),
+                    unit_id: unit.id(),
+                    kind: live_group.kind(),
+                };
+                let repaired = repair_translation_symbols(
+                    &context,
+                    unit.text(),
+                    translation,
+                    placeholder_rules,
+                    cancellation,
+                )?;
+                symbol_repair.add_assign(repaired.statistics);
+                repaired.text
             } else {
                 retained_source_units += 1;
                 Cow::Borrowed(unit.text())
@@ -303,18 +466,214 @@ fn build_write_back_file(
     }
 
     let bytes = serialize_groups_with_cancellation(&output_groups, cancellation)?;
-    let validated = validate_round_trip(
-        live_file,
-        bytes,
-        translations,
-        text_normalizer,
-        cancellation,
-    )?;
+    let validated = validate_round_trip(live_file, bytes, &output_groups, cancellation)?;
     Ok(BuiltWriteBackFile {
         file: GenericWriteBackFile { validated },
         translated_units,
         retained_source_units,
+        symbol_repair,
     })
+}
+
+struct RepairedTranslation<'translation> {
+    text: Cow<'translation, str>,
+    statistics: SymbolRepairStatistics,
+}
+
+struct GenericWriteBackUnitContext<'unit> {
+    relative_path: &'unit Path,
+    group_id: &'unit str,
+    unit_id: &'unit str,
+    kind: &'unit str,
+}
+
+impl GenericWriteBackUnitContext<'_> {
+    fn diagnostic_locator(&self) -> GenericUnitLocator {
+        GenericUnitLocator::new(
+            self.relative_path,
+            self.group_id,
+            self.unit_id,
+            Some(self.kind),
+        )
+    }
+}
+
+fn repair_translation_symbols<'translation>(
+    context: &GenericWriteBackUnitContext<'_>,
+    source: &str,
+    translation: &'translation str,
+    placeholder_rules: &GenericCompiledPlaceholderRules,
+    cancellation: &CooperativeCancellation,
+) -> Result<RepairedTranslation<'translation>, GenericWriteBackError> {
+    let mut statistics = SymbolRepairStatistics {
+        attempted_units: 1,
+        ..SymbolRepairStatistics::default()
+    };
+    let service = GenericPlaceholderService::default();
+    let unit_locator = || context.diagnostic_locator();
+    let source_view = match service.protect_compiled_text_with_cancellation(
+        context.kind,
+        source,
+        placeholder_rules,
+        || ensure_write_back_running(cancellation),
+    )? {
+        Ok(source) => source,
+        Err(source) => {
+            return Err(GenericWriteBackError::PlaceholderProtection {
+                unit: unit_locator(),
+                side: GenericWriteBackTextSide::Source,
+                source,
+            });
+        }
+    };
+    let translation_view = match service.protect_compiled_text_with_cancellation(
+        context.kind,
+        translation,
+        placeholder_rules,
+        || ensure_write_back_running(cancellation),
+    )? {
+        Ok(translation) => translation,
+        Err(source) => {
+            return Err(GenericWriteBackError::PlaceholderProtection {
+                unit: unit_locator(),
+                side: GenericWriteBackTextSide::Translation,
+                source,
+            });
+        }
+    };
+    if !protected_translation_placeholder_binding_matches_with_cancellation(
+        &source_view,
+        &translation_view,
+        || ensure_write_back_running(cancellation),
+    )? {
+        return Err(GenericWriteBackError::PlaceholderBindingMismatch {
+            unit: unit_locator(),
+        });
+    }
+    let source = match source_view
+        .language_text_with_cancellation(|| ensure_write_back_running(cancellation))?
+    {
+        Ok(source) => source,
+        Err(source) => {
+            return Err(GenericWriteBackError::LanguageProjection {
+                unit: unit_locator(),
+                side: GenericWriteBackTextSide::Source,
+                source,
+            });
+        }
+    };
+    let translation_text = match translation_view
+        .language_text_with_cancellation(|| ensure_write_back_running(cancellation))?
+    {
+        Ok(translation) => translation,
+        Err(source) => {
+            return Err(GenericWriteBackError::LanguageProjection {
+                unit: unit_locator(),
+                side: GenericWriteBackTextSide::Translation,
+                source,
+            });
+        }
+    };
+
+    let (plan, replacement_count) = match TranslationSymbolRepairer::plan_repair_with_cancellation(
+        &source,
+        &translation_text,
+        || ensure_write_back_running(cancellation),
+    )? {
+        TranslationSymbolRepairOutcome::Unchanged => {
+            return Ok(RepairedTranslation {
+                text: Cow::Borrowed(translation),
+                statistics,
+            });
+        }
+        TranslationSymbolRepairOutcome::Repaired {
+            plan,
+            replacement_count,
+        } => (plan, replacement_count),
+        TranslationSymbolRepairOutcome::Skipped { .. } => {
+            return Ok(skipped_symbol_repair(translation, statistics));
+        }
+    };
+    let repaired = match translation_text
+        .apply_repair_with_cancellation(&plan, || ensure_write_back_running(cancellation))?
+    {
+        Ok(repaired) => repaired,
+        Err(_) => return Ok(skipped_symbol_repair(translation, statistics)),
+    };
+    let Some(rebuilt) = rebuild_protected_translation(&translation_view, &repaired, cancellation)?
+    else {
+        return Ok(skipped_symbol_repair(translation, statistics));
+    };
+    statistics.repaired_units = 1;
+    statistics.replacements = replacement_count;
+    Ok(RepairedTranslation {
+        text: Cow::Owned(rebuilt),
+        statistics,
+    })
+}
+
+fn skipped_symbol_repair<'translation>(
+    translation: &'translation str,
+    mut statistics: SymbolRepairStatistics,
+) -> RepairedTranslation<'translation> {
+    statistics.skipped_units = 1;
+    RepairedTranslation {
+        text: Cow::Borrowed(translation),
+        statistics,
+    }
+}
+
+fn rebuild_protected_translation(
+    protected: &super::placeholder::GenericProtectedText,
+    repaired: &LanguageText,
+    cancellation: &CooperativeCancellation,
+) -> Result<Option<String>, GenericWriteBackError> {
+    let mut placeholders = protected.placeholders().iter();
+    let mut output_length = 0_usize;
+    for segment in repaired.segments() {
+        ensure_write_back_running(cancellation)?;
+        let text = match segment {
+            LanguageTextSegment::NaturalText(text) => text.as_str(),
+            LanguageTextSegment::OpaqueBoundary => {
+                let Some(placeholder) = placeholders.next() else {
+                    return Ok(None);
+                };
+                placeholder.original()
+            }
+        };
+        let Some(next_length) = output_length.checked_add(text.len()) else {
+            return Ok(None);
+        };
+        output_length = next_length;
+    }
+    ensure_write_back_running(cancellation)?;
+    if placeholders.next().is_some() {
+        return Ok(None);
+    }
+
+    let mut output = String::new();
+    if output.try_reserve_exact(output_length).is_err() {
+        return Ok(None);
+    }
+    let mut placeholders = protected.placeholders().iter();
+    for segment in repaired.segments() {
+        ensure_write_back_running(cancellation)?;
+        let text = match segment {
+            LanguageTextSegment::NaturalText(text) => text.as_str(),
+            LanguageTextSegment::OpaqueBoundary => {
+                let Some(placeholder) = placeholders.next() else {
+                    return Ok(None);
+                };
+                placeholder.original()
+            }
+        };
+        append_write_back_text(&mut output, text, cancellation)?;
+    }
+    ensure_write_back_running(cancellation)?;
+    if placeholders.next().is_some() {
+        return Ok(None);
+    }
+    Ok(Some(output))
 }
 
 fn validate_group_shape(
@@ -365,8 +724,7 @@ fn validate_group_shape(
 fn validate_round_trip(
     source: &GenericFile,
     candidate_bytes: Vec<u8>,
-    translations: &GenericUnitMap<String>,
-    text_normalizer: Option<&dyn LanguageTextNormalizer>,
+    expected_groups: &[super::jsonl::GenericGroup],
     cancellation: &CooperativeCancellation,
 ) -> Result<GenericFile, GenericWriteBackError> {
     let candidate = parse_file_with_cancellation(
@@ -383,8 +741,12 @@ fn validate_round_trip(
             },
         ));
     }
-    for (group_ordinal, (original_group, candidate_group)) in
-        source.groups().iter().zip(candidate.groups()).enumerate()
+    for (group_ordinal, ((original_group, expected_group), candidate_group)) in source
+        .groups()
+        .iter()
+        .zip(expected_groups)
+        .zip(candidate.groups())
+        .enumerate()
     {
         ensure_write_back_running(cancellation)?;
         if !text_equal_with_cancellation(original_group.id(), candidate_group.id(), cancellation)?
@@ -403,9 +765,10 @@ fn validate_round_trip(
                 },
             ));
         }
-        for (unit_ordinal, (original, candidate)) in original_group
+        for (unit_ordinal, ((original, expected), candidate)) in original_group
             .units()
             .iter()
+            .zip(expected_group.units())
             .zip(candidate_group.units())
             .enumerate()
         {
@@ -422,30 +785,7 @@ fn validate_round_trip(
                     },
                 ));
             }
-            let translation = translations.get_parts_with_cancellation(
-                original_group.id(),
-                original.id(),
-                || ensure_write_back_running(cancellation),
-            )?;
-            let expected = match translation {
-                Some(translation) => match text_normalizer {
-                    Some(normalizer) => Cow::Owned(
-                        normalizer
-                            .normalize_with_cancellation(
-                                original.text(),
-                                translation.as_str(),
-                                &mut || {
-                                    ensure_write_back_running(cancellation)
-                                        .map_err(|_| LanguageOperationCancelled)
-                                },
-                            )
-                            .map_err(|LanguageOperationCancelled| GenericJsonlError::Cancelled)?,
-                    ),
-                    None => Cow::Borrowed(translation.as_str()),
-                },
-                None => Cow::Borrowed(original.text()),
-            };
-            if !text_equal_with_cancellation(candidate.text(), &expected, cancellation)? {
+            if !text_equal_with_cancellation(candidate.text(), expected.text(), cancellation)? {
                 return Err(GenericWriteBackError::SnapshotMismatch(
                     GenericWriteBackSnapshotProblem::RoundTripUnitText {
                         relative_path: SafePath::new(source.relative_path()),
@@ -524,6 +864,16 @@ fn ensure_write_back_text_running(
     ensure_write_back_running(cancellation)
 }
 
+fn append_write_back_text(
+    output: &mut String,
+    text: &str,
+    cancellation: &CooperativeCancellation,
+) -> Result<(), GenericWriteBackError> {
+    ensure_write_back_text_running(text, cancellation)?;
+    output.push_str(text);
+    ensure_write_back_running(cancellation)
+}
+
 fn bytes_equal_with_cancellation(
     left: &[u8],
     right: &[u8],
@@ -593,12 +943,11 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::fingerprint::Sha256Fingerprint;
+    use crate::generic::placeholder::GenericPlaceholderRuleDefinition;
     use crate::generic::project::{
         GenericInitRequest, GenericProjectStore, TranslationOrigin, TranslationWrite,
     };
-    use crate::language::{
-        JapaneseQuoteNormalizer, JapaneseQuoteRepairPolicy, LanguageId, QuotePair,
-    };
+    use crate::language::LanguageId;
 
     use super::*;
 
@@ -659,6 +1008,10 @@ mod tests {
         let candidate = build_write_back_candidate(&stored, &live, &current_translations).unwrap();
         assert_eq!(candidate.translated_units(), 1);
         assert_eq!(candidate.retained_source_units(), 1);
+        assert_eq!(candidate.symbol_repair_attempted_units(), 1);
+        assert_eq!(candidate.symbol_repair_repaired_units(), 0);
+        assert_eq!(candidate.symbol_repair_skipped_units(), 0);
+        assert_eq!(candidate.symbol_repair_replacement_count(), 0);
         assert_eq!(candidate.files().len(), 2);
         assert_eq!(
             candidate
@@ -689,20 +1042,20 @@ mod tests {
     }
 
     #[test]
-    fn candidate_normalizes_quotes_only_during_write_back() {
+    fn candidate_repairs_categories_punctuation_without_copying_source_spaces() {
         let temp = tempdir().unwrap();
         let source_root = temp.path().join("source");
         fs::create_dir(&source_root).unwrap();
         fs::write(
             source_root.join("scene.jsonl"),
-            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"「原文」\"}]}\n",
+            "{\"id\":\"g\",\"kind\":\"settings\",\"units\":[{\"id\":\"u\",\"text\":\"General, Misc, Audio, Toggle\"}]}\n",
         )
         .unwrap();
         let (store, _) = GenericProjectStore::initialize(GenericInitRequest {
-            project_name: "quote-write-back".parse().unwrap(),
+            project_name: "symbol-write-back".parse().unwrap(),
             workspace_root: temp.path().join("project"),
             source_root: Some(source_root),
-            source_language: Some(LanguageId::parse("ja").unwrap()),
+            source_language: Some(LanguageId::parse("en").unwrap()),
             target_language: Some(LanguageId::parse("zh-Hans").unwrap()),
         })
         .unwrap();
@@ -712,27 +1065,194 @@ mod tests {
         translations
             .insert_with_cancellation(
                 GenericUnitKey::new("g".to_owned(), "u".to_owned()),
-                "「译文”".to_owned(),
+                "常规、杂项、声音、开关".to_owned(),
                 || Ok::<_, std::convert::Infallible>(()),
             )
             .unwrap_or_else(|never| match never {});
-        let normalizer = JapaneseQuoteNormalizer::new(
-            JapaneseQuoteRepairPolicy::new(vec![QuotePair::new('“', '”')]).unwrap(),
-        );
+        let placeholder_rules = GenericPlaceholderService::default()
+            .compile(Vec::new())
+            .expect("空 Placeholder 规则必须有效");
 
         let candidate = build_write_back_candidate_with_cancellation(
             &stored,
             &live,
             &translations,
-            Some(&normalizer),
+            &placeholder_rules,
             &CooperativeCancellation::default(),
         )
         .unwrap();
 
         assert_eq!(
             std::str::from_utf8(candidate.files()[0].bytes()).unwrap(),
-            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"「译文」\"}]}\n"
+            "{\"id\":\"g\",\"kind\":\"settings\",\"units\":[{\"id\":\"u\",\"text\":\"常规,杂项,声音,开关\"}]}\n"
         );
+        assert_eq!(candidate.symbol_repair_attempted_units(), 1);
+        assert_eq!(candidate.symbol_repair_repaired_units(), 1);
+        assert_eq!(candidate.symbol_repair_skipped_units(), 0);
+        assert_eq!(candidate.symbol_repair_replacement_count(), 3);
+    }
+
+    #[test]
+    fn candidate_repairs_only_natural_text_around_opaque_placeholders() {
+        let temp = tempdir().unwrap();
+        let source_root = temp.path().join("source");
+        fs::create_dir(&source_root).unwrap();
+        fs::write(
+            source_root.join("scene.jsonl"),
+            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"Open [A,B], now.\"}]}\n",
+        )
+        .unwrap();
+        let (store, _) = GenericProjectStore::initialize(GenericInitRequest {
+            project_name: "opaque-symbol-write-back".parse().unwrap(),
+            workspace_root: temp.path().join("project"),
+            source_root: Some(source_root),
+            source_language: Some(LanguageId::parse("en").unwrap()),
+            target_language: Some(LanguageId::parse("zh-Hans").unwrap()),
+        })
+        .unwrap();
+        store.extract().unwrap();
+        let (stored, live) = store.ensure_input_current().unwrap();
+        let mut translations = GenericUnitMap::new();
+        translations
+            .insert_with_cancellation(
+                GenericUnitKey::new("g".to_owned(), "u".to_owned()),
+                "打开 [A,B]、现在。".to_owned(),
+                || Ok::<_, std::convert::Infallible>(()),
+            )
+            .unwrap_or_else(|never| match never {});
+        let placeholder_rules = GenericPlaceholderService::default()
+            .compile(vec![GenericPlaceholderRuleDefinition::new(
+                Some(vec!["dialogue".to_owned()]),
+                r"\[[^]]+\]",
+            )])
+            .expect("对话 Placeholder 规则必须有效");
+
+        let candidate = build_write_back_candidate_with_cancellation(
+            &stored,
+            &live,
+            &translations,
+            &placeholder_rules,
+            &CooperativeCancellation::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::str::from_utf8(candidate.files()[0].bytes()).unwrap(),
+            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"打开 [A,B],现在.\"}]}\n"
+        );
+        assert_eq!(candidate.symbol_repair_attempted_units(), 1);
+        assert_eq!(candidate.symbol_repair_repaired_units(), 1);
+        assert_eq!(candidate.symbol_repair_skipped_units(), 0);
+        assert_eq!(candidate.symbol_repair_replacement_count(), 2);
+    }
+
+    #[test]
+    fn candidate_repairs_natural_text_without_changing_placeholder_wrappers() {
+        let temp = tempdir().unwrap();
+        let source_root = temp.path().join("source");
+        fs::create_dir(&source_root).unwrap();
+        fs::write(
+            source_root.join("scene.jsonl"),
+            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"<msg>General, Misc</msg>\"}]}\n",
+        )
+        .unwrap();
+        let (store, _) = GenericProjectStore::initialize(GenericInitRequest {
+            project_name: "wrapper-symbol-write-back".parse().unwrap(),
+            workspace_root: temp.path().join("project"),
+            source_root: Some(source_root),
+            source_language: Some(LanguageId::parse("en").unwrap()),
+            target_language: Some(LanguageId::parse("zh-Hans").unwrap()),
+        })
+        .unwrap();
+        store.extract().unwrap();
+        let (stored, live) = store.ensure_input_current().unwrap();
+        let mut translations = GenericUnitMap::new();
+        translations
+            .insert_with_cancellation(
+                GenericUnitKey::new("g".to_owned(), "u".to_owned()),
+                "<msg>常规、杂项</msg>".to_owned(),
+                || Ok::<_, std::convert::Infallible>(()),
+            )
+            .unwrap_or_else(|never| match never {});
+        let placeholder_rules = GenericPlaceholderService::default()
+            .compile(vec![GenericPlaceholderRuleDefinition::new(
+                Some(vec!["dialogue".to_owned()]),
+                r"<msg>(?<text>.*?)</msg>",
+            )])
+            .expect("wrapper Placeholder 规则必须有效");
+
+        let candidate = build_write_back_candidate_with_cancellation(
+            &stored,
+            &live,
+            &translations,
+            &placeholder_rules,
+            &CooperativeCancellation::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::str::from_utf8(candidate.files()[0].bytes()).unwrap(),
+            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"<msg>常规,杂项</msg>\"}]}\n"
+        );
+        assert_eq!(candidate.symbol_repair_attempted_units(), 1);
+        assert_eq!(candidate.symbol_repair_repaired_units(), 1);
+        assert_eq!(candidate.symbol_repair_skipped_units(), 0);
+        assert_eq!(candidate.symbol_repair_replacement_count(), 1);
+    }
+
+    #[test]
+    fn candidate_rejects_translation_when_placeholder_binding_does_not_match() {
+        let temp = tempdir().unwrap();
+        let source_root = temp.path().join("source");
+        fs::create_dir(&source_root).unwrap();
+        fs::write(
+            source_root.join("scene.jsonl"),
+            "{\"id\":\"g\",\"kind\":\"settings\",\"units\":[{\"id\":\"u\",\"text\":\"General, Misc\"}]}\n",
+        )
+        .unwrap();
+        let (store, _) = GenericProjectStore::initialize(GenericInitRequest {
+            project_name: "skipped-symbol-write-back".parse().unwrap(),
+            workspace_root: temp.path().join("project"),
+            source_root: Some(source_root),
+            source_language: Some(LanguageId::parse("en").unwrap()),
+            target_language: Some(LanguageId::parse("zh-Hans").unwrap()),
+        })
+        .unwrap();
+        store.extract().unwrap();
+        let (stored, live) = store.ensure_input_current().unwrap();
+        let mut translations = GenericUnitMap::new();
+        translations
+            .insert_with_cancellation(
+                GenericUnitKey::new("g".to_owned(), "u".to_owned()),
+                "[常规、杂项]".to_owned(),
+                || Ok::<_, std::convert::Infallible>(()),
+            )
+            .unwrap_or_else(|never| match never {});
+        let placeholder_rules = GenericPlaceholderService::default()
+            .compile(vec![GenericPlaceholderRuleDefinition::new(
+                Some(vec!["settings".to_owned()]),
+                r"\[[^]]+\]",
+            )])
+            .expect("设置 Placeholder 规则必须有效");
+
+        let error = build_write_back_candidate_with_cancellation(
+            &stored,
+            &live,
+            &translations,
+            &placeholder_rules,
+            &CooperativeCancellation::default(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            GenericWriteBackError::PlaceholderBindingMismatch {
+                unit,
+            } if unit.relative_path.to_string() == "scene.jsonl"
+                && unit.group_id.as_ref().is_some_and(|value| value.to_string() == "g")
+                && unit.unit_id.as_ref().is_some_and(|value| value.to_string() == "u")
+                && unit.role.as_ref().is_some_and(|value| value.to_string() == "settings")
+        ));
     }
 
     #[test]

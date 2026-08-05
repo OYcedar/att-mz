@@ -13,9 +13,9 @@ pub(crate) use crate::translation::placeholder::{
     PlaceholderRuleCompilationError, PlaceholderRuleDefinition, ProtectedText,
 };
 
-const MV_BUILTIN_CONTROL_PATTERN: &str = r"\\(?:[VvNnPpCcIi]\[[0-9]+\]|[Gg]|[\\{}$.|!><^])";
-const MZ_BUILTIN_CONTROL_PATTERN: &str =
-    r"\\(?:(?:[VvNnPpCcIi]|[Pp][Xx]|[Pp][Yy]|[Ff][Ss])\[[0-9]+\]|[Gg]|[\\{}$.|!><^])";
+const MV_BUILTIN_CONTROL_PATTERN: &str =
+    r"\\(?:[Nn]<[^\x00-\x1F\x7F-\x9F>]*>|[VvNnPpCcIi]\[[0-9]+\]|[Gg]|[\\{}$.|!><^])";
+const MZ_BUILTIN_CONTROL_PATTERN: &str = r"\\(?:[Nn]<[^\x00-\x1F\x7F-\x9F>]*>|(?:[VvNnPpCcIi]|[Pp][Xx]|[Pp][Yy]|[Ff][Ss])\[[0-9]+\]|[Gg]|[\\{}$.|!><^])";
 const BUILTIN_SEMANTIC_LABEL: &str = "RPG_MAKER_CONTROL";
 
 /// RPG Maker 的封闭 scope 与 MV/MZ 内置控制符入口。
@@ -194,5 +194,43 @@ mod tests {
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings[0].origin(), PlaceholderRuleOrigin::BuiltIn);
         assert_eq!(bindings[0].segment(), PlaceholderSegment::Whole);
+    }
+
+    #[test]
+    fn name_box_controls_are_builtin_and_require_a_closed_safe_body() {
+        let service = Pcre2PlaceholderService::new().unwrap();
+        let custom = service.compile_custom(Vec::new()).unwrap();
+        let protected = service
+            .protect(
+                RpgMakerEngine::Mv,
+                TextGroupKind::EventDialogue,
+                r"\n<\n[145]>Hello",
+                &custom,
+            )
+            .unwrap();
+        let (_, bindings) = protected.into_parts();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].original(), r"\n<\n[145]>");
+        assert_eq!(bindings[0].origin(), PlaceholderRuleOrigin::BuiltIn);
+
+        let unclosed = service
+            .protect(
+                RpgMakerEngine::Mz,
+                TextGroupKind::EventDialogue,
+                r"\n<Actor Hello",
+                &custom,
+            )
+            .unwrap();
+        assert!(unclosed.placeholders().is_empty());
+
+        let control_in_body = service
+            .protect(
+                RpgMakerEngine::Mv,
+                TextGroupKind::EventDialogue,
+                "\\n<A\u{0085}lice>Hello",
+                &custom,
+            )
+            .unwrap();
+        assert!(control_in_body.placeholders().is_empty());
     }
 }
