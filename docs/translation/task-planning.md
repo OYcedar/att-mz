@@ -1,6 +1,6 @@
 # TaskBlock 规划现行规格
 
-MV、MZ 和 Generic 共用同一套 TaskBlock 装箱、临时 ID、JSON 消息和公共响应规则。
+MV、MZ 和 Generic 共用同一套 TaskBlock 装箱、临时 ID、JSON user message 和公共响应规则。
 引擎仍各自负责 Current、语言、Placeholder、术语、去重、引擎特有验收和提交。
 
 ## 1. Extract 先建立文本层次
@@ -52,8 +52,9 @@ Unit 显示原文还是目标译文，以及哪些无 ID 块不进入执行流�
 ## 3. 稳定字符目标
 
 `target_task_user_message_characters` 是稳定源文投影的装箱目标，不是最终 user message 的
-硬上限。稳定投影只使用 Group 类型、Unit 角色、完整原文和固定 JSON 消息结构；它不使用
-实际临时 ID，也不根据本轮是否需要模型输出来增删 Unit。
+硬上限。稳定投影只使用 Group 类型、Unit 角色、完整原文和紧凑 JSON object 结构；固定
+`json` Markdown 围栏、两空格缩进、实际临时 ID 和本轮模型责任都不参与计数，也不根据
+本轮是否需要模型输出来增删 Unit。
 
 Group 不拆分，TaskBlock 不跨 Semantic Scope。当前块加入下一个完整 Group 后超过目标时，
 就在该 Group 前结束当前块；单个 Group 自身超过目标时独占一块。术语、目标译文、
@@ -65,8 +66,8 @@ Placeholder token 和数字 ID 会让最终消息长度发生变化，但不会�
 ## 4. 临时 ID 与无 ID 块
 
 每个完整块按 Unit 自然顺序分配临时 ID。只有本轮模型代表获得 ID；编号在每个含 ID 的块
-内从 `0` 连续开始。其余 Unit 在 JSON user message 中省略 `id` 和 `type`，只提供语境，
-不要求模型输出。
+内从 `0` 连续开始。其余 Unit 在 `json` Markdown 围栏内的 JSON user message 中省略
+`id` 和 `type`，只提供语境，不要求模型输出。
 
 完整块没有任何 ID 时，本轮不发送它。过滤只是只读视图：不能把过滤后相邻的块重新合并，
 也不能把其中的 Group 移到其他块。TaskBlock 不持久化；每次 Translate 都从权威 Extract

@@ -33,6 +33,8 @@ message 是实际请求，必须保留该稳定 TaskBlock 的全部 Group 和 Un
 
 `Raw Assistant` 使用能够包住正文的动态 Markdown fence，只执行现行敏感信息闭集要求的
 精确替换。它不是 HTTP body、Header、供应商完整响应，也不能称为未经处理的字节副本。
+Assistant 使用合法 `json` 围栏时，围栏只是响应外层，不属于 JSON 修复；严格解析成功且
+思考关闭时，它不会仅因存在围栏而增加 `Raw Assistant` 或修复记录。
 响应经过 JSON 修复时，任务记录在解析结果之后增加 `JSON Repairs` 表格，按发生顺序保存
 稳定修复 kind 及其相对于完整原始 Assistant 的一基行、列，不保存被删除、插入或替换的
 正文片段。此时即使思考关闭，也显示 `Raw Assistant`；严格解析成功且思考关闭的响应仍不

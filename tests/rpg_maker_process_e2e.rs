@@ -252,6 +252,7 @@ fn same_named_mv_mz_and_generic_projects_remain_isolated_across_real_processes()
     assert!(task_record.contains("## Assistant"));
     assert!(task_record.contains("## Raw Assistant"));
     assert!(task_record.contains("\"translations\""));
+    assert!(!task_record.contains("## JSON Repairs"));
     assert!(task_record.contains("## 最终结果"));
     assert!(
         !String::from_utf8_lossy(&translate.stdout).contains(THINKING_SENTINEL)
@@ -2606,13 +2607,17 @@ fn expected_generic_user_message(units: &[(&str, Option<usize>)]) -> Value {
 }
 
 fn parse_user_message(message: &str) -> Value {
-    serde_json::from_str(message).expect("模型 user message 必须是稳定 JSON")
+    let json = message
+        .strip_prefix("```json\n")
+        .and_then(|value| value.strip_suffix("\n```"))
+        .expect("模型 user message 必须是单一 JSON 围栏");
+    serde_json::from_str(json).expect("模型 user message 围栏内部必须是稳定 JSON")
 }
 
 fn assert_pretty_translation_user_message(message: &str) {
-    assert!(message.starts_with("{\n  \""));
+    assert!(message.starts_with("```json\n{\n  \""));
     assert!(message.contains("\n  \"groups\": ["));
-    assert!(message.ends_with("\n}"));
+    assert!(message.ends_with("\n}\n```"));
 }
 
 fn user_message_texts(message: &Value) -> Vec<&str> {
@@ -3055,11 +3060,12 @@ fn serve_provider_spy(
 
 fn serve_one_response(listener: TcpListener, model_output: Value) -> Result<Value, String> {
     let (mut stream, request) = accept_request(listener)?;
-    let content = serde_json::to_string(&json!({
+    let json = serde_json::to_string(&json!({
         "think": THINKING_SENTINEL,
         "translations": model_output
     }))
     .map_err(|error| error.to_string())?;
+    let content = format!("```json\n{json}\n```");
     write_chat_response(&mut stream, &content)?;
     Ok(request)
 }

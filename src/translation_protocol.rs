@@ -440,7 +440,10 @@ pub(crate) fn parse_translation_response_with_cancellation<E>(
     mut ensure_running: impl FnMut() -> Result<(), E>,
 ) -> Result<Result<ParsedTranslationResponse, TranslationTaskResponseParseError>, E> {
     ensure_running()?;
-    let value = LocatedModelResponse::new(value);
+    let value = unwrap_translation_response_json_fence_with_cancellation(
+        LocatedModelResponse::new(value),
+        &mut ensure_running,
+    )?;
     let strict_error = match deserialize_translation_response_wire_with_cancellation(
         value.value,
         response_mode,
@@ -513,6 +516,116 @@ pub(crate) fn parse_translation_response_with_cancellation<E>(
         root_original_offset,
         &mut ensure_running,
     )
+}
+
+/// 识别正文中唯一的规范 `json` Markdown 围栏，并把后续解析范围收窄到围栏内部。
+///
+/// 围栏只是模型协议允许的外层表示，不属于 JSON 修复。其他标签、围栏外正文、缺少结束
+/// 围栏或多个代码块仍交给严格解析和保守修复决定结果。
+fn unwrap_translation_response_json_fence_with_cancellation<'a, E>(
+    response: LocatedModelResponse<'a>,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<LocatedModelResponse<'a>, E> {
+    const OPENING: &[u8] = b"```json";
+    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
+
+    let bytes = response.value.as_bytes();
+    let opening_start = skip_json_whitespace_with_cancellation(bytes, 0, ensure_running)?;
+    if !bytes
+        .get(opening_start..)
+        .is_some_and(|tail| tail.starts_with(OPENING))
+    {
+        return Ok(response);
+    }
+
+    let mut cursor = opening_start + OPENING.len();
+    let mut opening_whitespace = 0_usize;
+    while bytes
+        .get(cursor)
+        .is_some_and(|byte| matches!(*byte, b' ' | b'\t'))
+    {
+        cursor += 1;
+        opening_whitespace += 1;
+        if opening_whitespace.is_multiple_of(CANCELLATION_CHECK_BYTES) {
+            ensure_running()?;
+        }
+    }
+    let content_start = match bytes.get(cursor) {
+        Some(b'\n') => cursor + 1,
+        Some(b'\r') if bytes.get(cursor + 1) == Some(&b'\n') => cursor + 2,
+        _ => return Ok(response),
+    };
+
+    let mut line_start = content_start;
+    let mut scanned = 0_usize;
+    loop {
+        let mut line_end = line_start;
+        while bytes.get(line_end).is_some_and(|byte| *byte != b'\n') {
+            line_end += 1;
+            scanned += 1;
+            if scanned.is_multiple_of(CANCELLATION_CHECK_BYTES) {
+                ensure_running()?;
+            }
+        }
+        let next_line_start = if line_end < bytes.len() {
+            line_end + 1
+        } else {
+            line_end
+        };
+        if is_translation_response_json_fence_closing_line(
+            &bytes[line_start..line_end],
+            ensure_running,
+        )? {
+            let trailing =
+                skip_json_whitespace_with_cancellation(bytes, next_line_start, ensure_running)?;
+            if trailing == bytes.len() {
+                return Ok(response.subslice(content_start, line_start));
+            }
+            return Ok(response);
+        }
+        if line_end == bytes.len() {
+            break;
+        }
+        line_start = next_line_start;
+    }
+    ensure_running()?;
+    Ok(response)
+}
+
+fn is_translation_response_json_fence_closing_line<E>(
+    line: &[u8],
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
+
+    let mut start = 0_usize;
+    let mut end = line.len();
+    if line.ends_with(b"\r") {
+        end -= 1;
+    }
+    while line
+        .get(start)
+        .is_some_and(|byte| matches!(*byte, b' ' | b'\t'))
+    {
+        start += 1;
+        if start.is_multiple_of(CANCELLATION_CHECK_BYTES) {
+            ensure_running()?;
+        }
+    }
+    let mut scanned = 0_usize;
+    while end > start
+        && line
+            .get(end - 1)
+            .is_some_and(|byte| matches!(*byte, b' ' | b'\t'))
+    {
+        end -= 1;
+        scanned += 1;
+        if scanned.is_multiple_of(CANCELLATION_CHECK_BYTES) {
+            ensure_running()?;
+        }
+    }
+    ensure_running()?;
+    Ok(&line[start..end] == b"```")
 }
 
 fn deserialize_translation_response_wire_with_cancellation<E>(
@@ -1185,6 +1298,16 @@ impl<'a> LocatedModelResponse<'a> {
         }
     }
 
+    fn subslice(self, local_start: usize, local_end: usize) -> Self {
+        debug_assert!(local_start <= local_end);
+        debug_assert!(local_end <= self.value.len());
+        Self {
+            raw: self.raw,
+            value: &self.value[local_start..local_end],
+            start: self.start + local_start,
+        }
+    }
+
     fn location_at_with_cancellation<E>(
         self,
         local_byte_offset: usize,
@@ -1599,12 +1722,37 @@ mod tests {
         assert!(error.column().get() >= 35);
 
         let fenced = parse_translation_response(
+            "\r\n```json \r\n{\"0\":[\"ok\"]}\r\n```  \r\n",
+            mode(false, false),
+        )
+        .expect("规范 JSON 围栏应作为合法响应外层");
+        assert_eq!(fenced.entries()[0].raw_value().get(), r#"["ok"]"#);
+        assert!(fenced.repairs().is_empty());
+
+        let repaired_inside_fence =
+            parse_translation_response("```json\n{'0':['ok']}\n```", mode(false, false))
+                .expect("规范围栏内部仍应使用保守 JSON 修复");
+        assert!(
+            repaired_inside_fence
+                .repairs()
+                .iter()
+                .any(|repair| repair.kind() == RepairKind::NormalizedQuote)
+        );
+        assert!(
+            repaired_inside_fence
+                .repairs()
+                .iter()
+                .all(|repair| repair.kind() != RepairKind::RemovedMarkdownFence)
+        );
+        assert_eq!(repaired_inside_fence.repairs()[0].line().get(), 2);
+
+        let repaired_fence = parse_translation_response(
             "\u{2003}\r\n```json\r\n{\"0\":[\"ok\"]}\r\n```\r\n",
             mode(false, false),
         )
-        .expect("单一 Markdown 围栏应由协议边界修复");
-        assert_eq!(fenced.entries()[0].raw_value().get(), r#"["ok"]"#);
-        let fence_repairs = fenced
+        .expect("非 JSON 空白包围的围栏仍应由保守修复处理");
+        assert_eq!(repaired_fence.entries()[0].raw_value().get(), r#"["ok"]"#);
+        let fence_repairs = repaired_fence
             .repairs()
             .iter()
             .filter(|repair| repair.kind() == RepairKind::RemovedMarkdownFence)
@@ -1618,6 +1766,19 @@ mod tests {
             (2, 1)
         );
         assert_eq!(fence_repairs[0].kind_code(), "removed_markdown_fence");
+
+        let multiple_fences = parse_translation_response(
+            "```json\n{\"0\":[\"first\"]}\n```\n```json\n{\"1\":[\"second\"]}\n```",
+            mode(false, false),
+        )
+        .expect_err("多个 JSON 围栏必须保持为歧义响应");
+        assert_eq!(
+            multiple_fences.kind(),
+            TranslationTaskResponseParseErrorKind::JsonRepair {
+                category: TranslationTaskResponseJsonErrorCategory::Syntax,
+                repair: RepairErrorKind::MultipleJsonCandidates,
+            }
+        );
 
         let quoted = parse_translation_response(r#"{"0":["type: "free""]}"#, mode(false, false))
             .expect("无歧义的内部双引号应被转义");
@@ -1687,6 +1848,22 @@ mod tests {
 
     #[test]
     fn cancellable_parser_stops_during_json_repair() {
+        let response = format!("{{'0':['{}']}}", "译".repeat(512 * 1024));
+        let polls = Cell::new(0_usize);
+
+        let parsed =
+            parse_translation_response_with_cancellation(&response, mode(false, false), || {
+                let next = polls.get() + 1;
+                polls.set(next);
+                if next >= 12 { Err("cancelled") } else { Ok(()) }
+            });
+
+        assert!(matches!(parsed, Err("cancelled")));
+        assert_eq!(polls.get(), 12);
+    }
+
+    #[test]
+    fn cancellable_parser_stops_while_locating_long_json_fence() {
         let response = format!("```json\n{{\"0\":[\"{}\"]}}\n```", "译".repeat(512 * 1024));
         let polls = Cell::new(0_usize);
 

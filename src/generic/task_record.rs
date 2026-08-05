@@ -595,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn non_thinking_fenced_json_records_repairs_and_safe_text_raw_assistant() {
+    fn non_thinking_noncanonical_fenced_json_records_repairs_and_safe_text_raw_assistant() {
         const API_KEY: &str = "quote\"slash\\value";
         let encoded_api_key = serde_json::to_string(API_KEY).expect("API key 应可编码为 JSON");
         let encoded_fragment = &encoded_api_key[1..encoded_api_key.len() - 1];
@@ -604,7 +604,7 @@ mod tests {
         );
         let parsed =
             parse_translation_response(&raw_assistant, TranslationResponseMode::new(false, false))
-                .expect("非 thinking 的单一 Markdown 围栏应可保守修复");
+                .expect("非 thinking 的非规范围栏应可保守修复");
         let record =
             GenericTaskResponseRecord::parsed_with_cancellation(raw_assistant, parsed, || {
                 Ok::<_, Infallible>(())
@@ -637,11 +637,11 @@ mod tests {
     }
 
     #[test]
-    fn non_thinking_strict_json_keeps_existing_record_shape() {
-        let raw_assistant = r#"{"0":["严格响应"]}"#.to_owned();
+    fn non_thinking_canonical_fence_keeps_existing_record_shape() {
+        let raw_assistant = "```json\n{\"0\":[\"严格响应\"]}\n```".to_owned();
         let parsed =
             parse_translation_response(&raw_assistant, TranslationResponseMode::new(false, false))
-                .expect("严格 JSON 应直接解析");
+                .expect("规范围栏应直接解析内部 JSON");
         let record =
             GenericTaskResponseRecord::parsed_with_cancellation(raw_assistant, parsed, || {
                 Ok::<_, Infallible>(())
@@ -661,7 +661,7 @@ mod tests {
             &client,
             &record,
         )
-        .expect("严格非 thinking 响应应该可渲染");
+        .expect("规范围栏的非 thinking 响应应该可渲染");
 
         assert!(output.contains("## Assistant\n\n### ID 0\n\n严格响应"));
         assert!(!output.contains("## JSON Repairs"));

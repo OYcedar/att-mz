@@ -148,7 +148,7 @@ impl fmt::Display for TranslationUserMessageCancelled {
 
 impl std::error::Error for TranslationUserMessageCancelled {}
 
-/// 把受信 TaskBlock 投影成两空格缩进的 JSON wire，并在任意长度正文复制期间观察取消。
+/// 把受信 TaskBlock 投影成单一 `json` 围栏内的两空格缩进 JSON，并在任意长度正文复制期间观察取消。
 pub(crate) fn render_translation_user_message(
     message: &TranslationUserMessage<'_>,
     cancellation: &CooperativeCancellation,
@@ -157,6 +157,7 @@ pub(crate) fn render_translation_user_message(
         return Err(TranslationUserMessageCancelled);
     }
     let mut output = Vec::new();
+    output.extend_from_slice(b"```json\n");
     let (result, cancelled) = {
         let mut writer = CancellableJsonWriter {
             output: &mut output,
@@ -170,6 +171,7 @@ pub(crate) fn render_translation_user_message(
         return Err(TranslationUserMessageCancelled);
     }
     result.expect("向内存写入受信 user message JSON 只能因合作式取消失败");
+    output.extend_from_slice(b"\n```");
     Ok(String::from_utf8(output).expect("serde_json 只能生成 UTF-8"))
 }
 
@@ -303,7 +305,8 @@ mod tests {
 
         assert_eq!(
             render_translation_user_message(&message, &cancellation).unwrap(),
-            r#"{
+            r#"```json
+{
   "terminology": [
     {
       "source": "魔王",
@@ -333,7 +336,8 @@ mod tests {
       ]
     }
   ]
-}"#
+}
+```"#
         );
     }
 
@@ -348,7 +352,8 @@ mod tests {
         );
         assert_eq!(
             render_translation_user_message(&message, &CooperativeCancellation::default()).unwrap(),
-            r#"{
+            r#"```json
+{
   "groups": [
     {
       "kind": "name",
@@ -361,7 +366,8 @@ mod tests {
       ]
     }
   ]
-}"#
+}
+```"#
         );
     }
 
