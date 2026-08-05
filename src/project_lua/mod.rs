@@ -138,6 +138,7 @@ pub(crate) struct ProjectLuaCallError {
     operation: Option<LuaOperation>,
     field: Option<crate::diagnostic::SafeIdentifier>,
     locator: Option<LuaLocator>,
+    placeholder: Option<crate::diagnostic::PlaceholderIssue>,
 }
 
 #[derive(Clone, Debug)]
@@ -151,6 +152,7 @@ pub(crate) enum ProjectLuaCallIssue {
     WorkerSpawn {
         failure: IoFailure,
         source: Arc<std::io::Error>,
+        violation: Option<LuaValueViolation>,
     },
 }
 
@@ -162,9 +164,18 @@ impl PartialEq for ProjectLuaCallIssue {
             (Self::Sqlite { failure: left, .. }, Self::Sqlite { failure: right, .. }) => {
                 left == right
             }
-            (Self::WorkerSpawn { failure: left, .. }, Self::WorkerSpawn { failure: right, .. }) => {
-                left == right
-            }
+            (
+                Self::WorkerSpawn {
+                    failure: left,
+                    violation: left_violation,
+                    ..
+                },
+                Self::WorkerSpawn {
+                    failure: right,
+                    violation: right_violation,
+                    ..
+                },
+            ) => left == right && left_violation == right_violation,
             _ => false,
         }
     }
@@ -180,6 +191,7 @@ impl ProjectLuaCallError {
             operation: None,
             field: None,
             locator: None,
+            placeholder: None,
         }
     }
 
@@ -190,6 +202,7 @@ impl ProjectLuaCallError {
             operation: None,
             field: None,
             locator: None,
+            placeholder: None,
         }
     }
 
@@ -203,6 +216,7 @@ impl ProjectLuaCallError {
             operation: None,
             field: None,
             locator: None,
+            placeholder: None,
         }
     }
 
@@ -211,11 +225,32 @@ impl ProjectLuaCallError {
             issue: ProjectLuaCallIssue::WorkerSpawn {
                 failure: IoFailure::from_error(&source),
                 source: Arc::new(source),
+                violation: None,
             },
             engine: None,
             operation: None,
             field: None,
             locator: None,
+            placeholder: None,
+        }
+    }
+
+    pub(crate) fn placeholder_worker_spawn(
+        source: std::io::Error,
+        violation: LuaValueViolation,
+        placeholder: crate::diagnostic::PlaceholderIssue,
+    ) -> Self {
+        Self {
+            issue: ProjectLuaCallIssue::WorkerSpawn {
+                failure: IoFailure::from_error(&source),
+                source: Arc::new(source),
+                violation: Some(violation),
+            },
+            engine: None,
+            operation: None,
+            field: None,
+            locator: None,
+            placeholder: Some(placeholder),
         }
     }
 
@@ -254,6 +289,14 @@ impl ProjectLuaCallError {
 
     pub(crate) fn with_operation(mut self, operation: LuaOperation) -> Self {
         self.operation = Some(operation);
+        self
+    }
+
+    pub(crate) fn with_placeholder(
+        mut self,
+        placeholder: crate::diagnostic::PlaceholderIssue,
+    ) -> Self {
+        self.placeholder = Some(placeholder);
         self
     }
 
@@ -471,17 +514,51 @@ impl ProjectLuaPrintSink for IgnoreProjectLuaPrint {
 }
 
 /// Lua 可见的项目事实。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectLuaEngine {
+    Generic,
+    Mv,
+    Mz,
+}
+
+impl ProjectLuaEngine {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Generic => "generic",
+            Self::Mv => "mv",
+            Self::Mz => "mz",
+        }
+    }
+
+    const fn diagnostic(self) -> LuaEngine {
+        match self {
+            Self::Generic => LuaEngine::Generic,
+            Self::Mv => LuaEngine::Mv,
+            Self::Mz => LuaEngine::Mz,
+        }
+    }
+}
+
+impl From<crate::rpg_maker::RpgMakerEngine> for ProjectLuaEngine {
+    fn from(value: crate::rpg_maker::RpgMakerEngine) -> Self {
+        match value {
+            crate::rpg_maker::RpgMakerEngine::Mv => Self::Mv,
+            crate::rpg_maker::RpgMakerEngine::Mz => Self::Mz,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProjectLuaProject {
     name: String,
-    engine: String,
+    engine: ProjectLuaEngine,
 }
 
 impl ProjectLuaProject {
-    pub(crate) fn new(name: impl Into<String>, engine: impl Into<String>) -> Self {
+    pub(crate) fn new(name: impl Into<String>, engine: ProjectLuaEngine) -> Self {
         Self {
             name: name.into(),
-            engine: engine.into(),
+            engine,
         }
     }
 
@@ -489,8 +566,12 @@ impl ProjectLuaProject {
         &self.name
     }
 
-    pub(crate) fn engine(&self) -> &str {
-        &self.engine
+    pub(crate) const fn engine(&self) -> &'static str {
+        self.engine.as_str()
+    }
+
+    const fn diagnostic_engine(&self) -> LuaEngine {
+        self.engine.diagnostic()
     }
 }
 
@@ -1124,14 +1205,36 @@ fn failure_report(
                     },
                 )),
             ),
-            ProjectLuaCallIssue::WorkerSpawn { failure, .. } => DiagnosticReport::new(
-                effect,
-                Diagnostic::runtime(RuntimeIssue::Io {
-                    component: RuntimeComponent::CpuExecutor,
-                    operation: RuntimeOperation::StartWorker,
-                    failure: failure.clone(),
-                }),
-            ),
+            ProjectLuaCallIssue::WorkerSpawn {
+                failure, violation, ..
+            } => match (
+                violation,
+                source.engine,
+                source.operation,
+                source.placeholder.clone(),
+            ) {
+                (Some(violation), Some(engine), Some(operation), Some(placeholder)) => {
+                    DiagnosticReport::new(
+                        effect,
+                        Diagnostic::lua(LuaIssue::new(LuaProblem::HostCall {
+                            engine,
+                            operation,
+                            violation: *violation,
+                            field: source.field.clone(),
+                            locator: source.locator.clone(),
+                            placeholder: Some(placeholder),
+                        })),
+                    )
+                }
+                _ => DiagnosticReport::new(
+                    effect,
+                    Diagnostic::runtime(RuntimeIssue::Io {
+                        component: RuntimeComponent::CpuExecutor,
+                        operation: RuntimeOperation::StartWorker,
+                        failure: failure.clone(),
+                    }),
+                ),
+            },
             ProjectLuaCallIssue::Cancelled => DiagnosticReport::new(
                 effect,
                 Diagnostic::lua(LuaIssue::new(LuaProblem::Cancelled)),
@@ -1145,6 +1248,7 @@ fn failure_report(
                         violation: *violation,
                         field: source.field.clone(),
                         locator: source.locator.clone(),
+                        placeholder: source.placeholder.clone(),
                     })),
                 ),
                 _ => DiagnosticReport::new(
@@ -1247,10 +1351,7 @@ const fn validation_problem(failure: ProjectLuaValidationFailure) -> LuaValidati
 }
 
 fn project_lua_engine(project: &ProjectLuaProject) -> crate::diagnostic::LuaEngine {
-    match project.engine() {
-        "rpg_maker" => crate::diagnostic::LuaEngine::RpgMaker,
-        _ => crate::diagnostic::LuaEngine::Generic,
-    }
+    project.diagnostic_engine()
 }
 
 impl ProjectLuaSqliteOperation {

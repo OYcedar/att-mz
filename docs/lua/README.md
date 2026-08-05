@@ -233,12 +233,20 @@ Unit 分类为：
 
 ### 4.3 从任务失败回到稳定 locator
 
-模型任务记录中的数字 ID 只在一次请求内有效，消息也不携带数据库 locator。不要把临时
-ID、任务序号或一段重复原文直接当成 Unit 身份。用审查导出的完整自然顺序、Group 语境和
-源内容定位候选，再使用导出的精确 locator。
+模型任务记录中的数字 ID 只在一次请求内有效，不能直接充当数据库 locator。先从该次
+`task.finished.payload.outcome.diagnostic` 取得 occurrence ID，再在同一 RunId 的项目日志中
+读取对应 `diagnostic.translation_task` occurrence：
 
-当前产品没有持久化“逐失败原因 → 精确 locator”的通用关系；在重复原文或证据歧义时，
-必须检查完整 Group 并逐项确认，不能靠文本相等猜一个位置。
+- issue 的 task-response `scope.kind = "unit"` 时，`scope.unit` 已保存 MV/MZ 的 `owner`、
+  `group_location` 与 `role`。这三项就是失败 Unit 的稳定 locator 原值；仍应结合任务记录和
+  完整 Group 语境确认要写入的译文，但不需要按重复原文猜位置；
+- `scope.kind = "task"` 时，失败发生在整个响应、HTTP 或任务边界，本来就没有唯一失败
+  Unit。此时结合任务记录中的本次输入、当前数据库审查和仍未 Current 的 Unit 逐项判断，
+  不能把任务序号、临时 ID 或任意一段原文伪装成 locator。
+
+诊断 occurrence 与任务记录都是定位证据，不是数据库权威。最终写入仍使用审查导出的精确
+locator；Generic 继续使用 `group_id + unit_id`，MV/MZ 继续使用
+`owner + group_location + unit_role`。
 
 ### 4.4 生成并执行修订脚本
 
@@ -281,6 +289,18 @@ Lua 没有模型、语言分析、Placeholder 投影、文件输出或实际游�
 - `pcall` 捕获普通错误后可以继续，但最终数据库验证始终执行；
 - VM instruction hook、SQLite progress 与 busy 机制共同响应取消；
 - COMMIT 开始后 ATT 等待 SQLite 的实际结果；无法确认时报告 `outcome_unknown`。
+
+MV/MZ 的事务基线和最终验证只要求实际存在译文或译文状态的 Unit 继续满足当前语义。一个
+Unit 的 `translation_content_json` 与 `translation_state` 都为 null 时，它自己的
+Placeholder 等局部规划错误不会阻断无关 Lua、`clear` 或其他精确修订；`ctx.translation.set`
+仍会当场校验目标 Unit，脚本前后继续存活的 manual/automatic 译文也必须保持形状、
+Placeholder、Group 语境和相应状态有效。失败诊断保存精确 `mv`/`mz` 引擎、Unit locator 与
+具体 Placeholder 问题，不再退化为 `engine = generic`、无 locator 的普通
+`state_mismatch`。
+
+Generic 仍遵守其 Translate 的全项目规划契约：任一 Unit 的 Placeholder 等规划错误会在
+所有 Task 前使 Translate 失败，因此 Generic Lua 的事务前置和最终验证也保持同一要求，
+不能用 MV/MZ 的 null Unit 规则绕过。
 
 项目租约覆盖打开数据库、事务、验证、提交或回滚及最终结果。普通日志失败不改变数据库
 结果，但会使依赖日志输出的审查导出缺少完整证据。

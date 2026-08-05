@@ -230,6 +230,13 @@ Complete 只说明当前项目本轮 Translate 的目标明确完成。进入全
 规定的传输与 HTTP 情况执行有限重试；操作者再次运行 Translate 是另一项决定，不是内部
 重试的自动延长。
 
+从 `task.finished.payload.outcome.diagnostic` 取得 occurrence ID，并在同一 RunId 中读取
+对应的 `diagnostic.translation_task`。若 task-response issue 的 `scope.kind = "unit"`，
+`scope.unit` 已包含失败 Unit 的 `owner`、`group_location` 和 `role`；MV/MZ 可直接把这些
+原值用于 Lua locator，并结合任务记录检查该 Unit 的请求语境和模型输出。若
+`scope.kind = "task"`，失败属于整个请求、HTTP 或响应根，没有唯一 Unit；必须结合任务记录
+和当前数据库审查确定受影响范围，不能拿任务序号、临时 ID 或重复原文猜 locator。
+
 暂时性服务故障可以在原因消失后用同一项目和资源继续。Fatal HTTP、认证、额度、Endpoint、
 Model 或参数问题不能靠重跑或擅自换配置解决。只有任务明确要求继续模型路径时，才为需要
 改变的配置取得用户给出的精确新值；若目标是完成或修复翻译，当前 Unit、完整语境、语言、

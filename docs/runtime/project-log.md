@@ -105,6 +105,11 @@ Rules command 的非字符串跳过与 WriteBack 人工布局要求都是相应 
 Translate 汇总的 `failed`。没有开始的任务不伪造 `task.finished`，只计入 Translate 汇总的
 `not_started`。
 
+task-response issue 的 scope 同时表达失败范围。`kind = "unit"` 时，MV/MZ 的
+`scope.unit` 保存 `owner`、`group_location` 与 `role`，Generic 保存自己的稳定 Unit 身份；
+消费者可以从 `task.finished.payload.outcome.diagnostic` 跟到 occurrence 后直接取得这些原值。
+`kind = "task"` 表示请求、HTTP 或响应根整体失败，本来没有唯一 Unit，不能补造 locator。
+
 每次 Translate 命令恰好写一条 Required `translation.finished`，结果为：
 
 - `not_started`

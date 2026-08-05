@@ -67,11 +67,23 @@ id = "ja"
 minimum_kana_characters = 1
 allowed_terms = []
 quote_repair_pairs = [["“", "”"], ["‘", "’"]]
+
+[[languages]]
+type = "english"
+id = "en"
+minimum_word_count = 1
+minimum_letter_count = 2
+ignored_terms = []
+minimum_copied_word_count = 2
+minimum_copied_letter_count = 4
+allowed_terms = ["Page Up", "Page Down"]
 ```
 
 每种语言类型只接受自己声明的字段。Translate 校验全部定义，再精确选择项目源语言
 模块；WriteBack 另外读取同一语言表中的 `id`、`type` 和 `quote_repair_pairs`，建立写回
-文本规范化器，不消费 Prompt、残留阈值或模型 Profile。完整语义见[语言规格](../translation/language.md)。
+文本规范化器，不消费 Prompt、残留阈值或模型 Profile。英语的 `ignored_terms` 只改变译前
+准入；`allowed_terms` 只允许译文保留已经确认的英文项，不改变译前判断或临时 ID 分配。
+完整语义见[语言规格](../translation/language.md)。
 
 ## 4. LLM Client
 

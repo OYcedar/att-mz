@@ -13,9 +13,9 @@ use crate::fingerprint::Sha256Fingerprint;
 
 use super::{
     ProjectLuaCallError, ProjectLuaCancellation, ProjectLuaCompilationFailure,
-    ProjectLuaDatabasePrerequisiteError, ProjectLuaEngineAdapter, ProjectLuaFailure,
-    ProjectLuaPrintSink, ProjectLuaProgram, ProjectLuaProject, ProjectLuaRunError,
-    ProjectLuaRunRequest, ProjectLuaSchemaObjectKind, ProjectLuaScriptFailure,
+    ProjectLuaDatabasePrerequisiteError, ProjectLuaEngine, ProjectLuaEngineAdapter,
+    ProjectLuaFailure, ProjectLuaPrintSink, ProjectLuaProgram, ProjectLuaProject,
+    ProjectLuaRunError, ProjectLuaRunRequest, ProjectLuaSchemaObjectKind, ProjectLuaScriptFailure,
     ProjectLuaSqliteError, ProjectLuaSqliteOperation, ProjectLuaValidationFailure, ProjectLuaValue,
     compile_project_lua_program, compile_project_lua_program_with_cancellation,
     fingerprint_project_lua_program_with_cancellation, rollback, run_project_lua,
@@ -76,6 +76,46 @@ fn incomplete_external_locator_identifiers_do_not_panic_or_enter_diagnostic_wire
     assert!(!wire.contains("group\\u0001"));
     assert!(!wire.contains("unit\\u0002"));
     assert!(!wire.contains("data/dialogue.jsonl"));
+}
+
+#[test]
+fn placeholder_worker_failure_keeps_lua_context_and_retry_resolution() {
+    let source = std::io::Error::from_raw_os_error(8);
+    let placeholder = crate::diagnostic::PlaceholderIssue::WorkerStart {
+        operation: crate::diagnostic::PlaceholderWorkerOperation::MatchText,
+        io_kind: source.kind().into(),
+        raw_os_code: source.raw_os_error(),
+    };
+    let error = ProjectLuaCallError::placeholder_worker_spawn(
+        source,
+        crate::diagnostic::LuaValueViolation::StateMismatch,
+        placeholder,
+    )
+    .with_engine(crate::diagnostic::LuaEngine::Mv)
+    .with_operation(crate::diagnostic::LuaOperation::ValidatePrerequisites)
+    .with_rpg_maker_locator("builtin", "map/1/dialogue/0", "dialogue_body");
+    let report = ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(error))
+        .diagnostic_report(std::path::Path::new("project.db"));
+    let value = serde_json::to_value(&report).expect("Placeholder worker 诊断应可序列化");
+
+    assert_eq!(value["primary"]["code"], "lua.host_call");
+    assert_eq!(value["primary"]["resolution"], "retry");
+    assert_eq!(
+        value["primary"]["issue"]["details"]["problem"]["engine"],
+        "mv"
+    );
+    assert_eq!(
+        value["primary"]["issue"]["details"]["problem"]["locator"]["group_location"],
+        "map/1/dialogue/0"
+    );
+    assert_eq!(
+        value["primary"]["issue"]["details"]["problem"]["placeholder"]["operation"],
+        "match_text"
+    );
+    assert_eq!(
+        value["primary"]["issue"]["details"]["problem"]["placeholder"]["raw_os_code"],
+        8
+    );
 }
 
 #[test]
@@ -355,7 +395,7 @@ fn database() -> Connection {
 
 fn request(source: &str, adapter: Arc<dyn ProjectLuaEngineAdapter>) -> ProjectLuaRunRequest {
     ProjectLuaRunRequest::new(
-        ProjectLuaProject::new("test-project", "generic"),
+        ProjectLuaProject::new("test-project", ProjectLuaEngine::Generic),
         ProjectLuaProgram::new("test.lua", source.as_bytes(), vec!["one".to_owned()]),
         adapter,
     )
@@ -1485,7 +1525,7 @@ fn execution_second_compile_observes_cross_thread_cancellation() {
         let result = run_project_lua(
             database(),
             ProjectLuaRunRequest::new(
-                ProjectLuaProject::new("test-project", "generic"),
+                ProjectLuaProject::new("test-project", ProjectLuaEngine::Generic),
                 program,
                 Arc::new(TestAdapter::default()),
             )
@@ -1511,7 +1551,7 @@ fn execution_second_compile_observes_cross_thread_cancellation() {
 #[test]
 fn invalid_utf8_script_is_rejected_before_transaction() {
     let request = ProjectLuaRunRequest::new(
-        ProjectLuaProject::new("test-project", "generic"),
+        ProjectLuaProject::new("test-project", ProjectLuaEngine::Generic),
         ProjectLuaProgram::new("invalid.lua", vec![0xff], Vec::new()),
         Arc::new(TestAdapter::default()),
     );

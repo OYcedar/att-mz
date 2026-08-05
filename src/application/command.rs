@@ -1169,7 +1169,7 @@ impl ProductionRpgMakerCommandRunner {
         ));
         let execution_database_path = database_path.clone();
         let request = ProjectLuaRunRequest::new(
-            ProjectLuaProject::new(project_name.as_str(), self.layout.engine().storage_name()),
+            ProjectLuaProject::new(project_name.as_str(), self.layout.engine().into()),
             program,
             rpg_maker_project_lua_adapter(self.layout.engine(), lua_cancellation.clone()),
         )
