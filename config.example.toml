@@ -1,43 +1,86 @@
+# ATT 每次运行都会读取 att.exe 同目录下的 config.toml。
+# 示例中的 API 地址、密钥和模型名称必须替换为实际值。
+# 未声明的字段、重复字段和错误类型会使使用该配置的命令失败。
+# 除特别说明外，所有以 _ms 结尾的时间值都使用毫秒。
+
 [prompts]
+# true 表示要求模型返回可读的翻译判断；false 表示省略这部分内容。
 thinking_output = true
+# true 表示要求模型在每项结果中同时返回本次原文；false 表示省略原文字段。
 source_echo = false
 
+# primary 是这个模型服务配置的 ID，翻译方案通过该 ID 使用它。
 [llm.clients.primary]
+# OpenAI-compatible Chat Completions 接口地址。
 url = "https://api.example.com/v1/chat/completions"
+# API key 会按原样读取，不会展开环境变量或 ${...}。
 api_key = "replace-with-api-key"
+# 发给模型服务的模型 ID。
 model = "replace-with-model-id"
+# 这个模型服务同时进行的 HTTP 请求数上限。
 max_concurrent_requests = 8
+# 建立网络连接允许等待的最长时间。
 connect_timeout_ms = 15000
+# 两次连续读取响应数据之间允许等待的最长时间。
 read_timeout_ms = 120000
+# 一次完整 HTTP 请求允许占用的最长时间，不包括本地等待请求许可的时间。
 request_timeout_ms = 120000
+# false 表示不使用代理；使用代理时改成不含账号和密码的 URL 字符串。
 proxy = false
+# 需要额外信任的 PEM 证书文件。相对路径从 att.exe 所在目录开始计算。
 additional_pem_files = []
+# 可重试错误发生后，各次重试前依次等待的时间；数组长度就是最多重试次数。
 retry_delays_ms = [500, 1500, 5000]
+# 接受服务端 Retry-After 指定等待时间的最大值。
 max_retry_after_ms = 30000
+# 合并到请求正文中的额外 JSON object，不能包含 model、messages 或 stream。
+# 当前示例关闭供应商自己的 thinking；接口不支持该字段时改成 {}。
 parameters = '''
 {"thinking": {"type": "disabled"}}
 '''
 
+# 可选：模型服务限制每分钟请求数时，取消下面配置的注释并填写实际限制。
+# [llm.clients.primary.rate_limit]
+# 长时间运行时每分钟允许开始的请求数。
+# requests_per_minute = 60
+# 短时间内允许立即开始的最大请求数。
+# burst = 8
+
+# 日语源文判断和译文残留检查。
 [[languages]]
 type = "japanese"
+# 项目 Init 时使用的语言 ID。
 id = "ja"
+# 译文中连续出现至少这么多个假名时，报告日语残留；allowed_terms 中的内容除外。
 minimum_kana_characters = 1
+# 已确认可以原样保留在译文中的日语片段。
 allowed_terms = []
 
+# 英语源文判断和译文残留检查。
 [[languages]]
 type = "english"
+# 项目 Init 时使用的语言 ID。
 id = "en"
+# 同一连续英文片段必须同时达到下面两个值，原文才会进入翻译。
 minimum_word_count = 1
 minimum_letter_count = 2
+# 判断原文是否需要翻译前排除的英文片段。不要用它表示译文中允许保留的词。
 ignored_terms = []
+# 译文从同一条原文复制的连续英文片段同时达到下面两个值时，报告英文残留。
 minimum_copied_word_count = 2
 minimum_copied_letter_count = 4
+# 已确认可以原样保留在译文中的英文片段，例如专名、按键名或协议字段。
 allowed_terms = []
 
 [translation]
+# true 表示为每个实际发给模型的任务保存可读 Markdown 记录；省略时也是 true。
 record_translation_tasks = true
 
+# primary 是翻译方案 ID，也是 Translate 命令选择这个方案时使用的名称。
 [[translation.profiles]]
 id = "primary"
+# 使用上面 ID 为 primary 的模型服务配置。
 llm_client = "primary"
+# 用于确定每个模型任务大小的字符目标，按完整原文及其分组结构计算。
+# 完整分组不会拆开，JSON 围栏、缩进、术语和已有译文不计入，因此这不是最终 user message 的长度上限。
 target_task_user_message_characters = 5090
