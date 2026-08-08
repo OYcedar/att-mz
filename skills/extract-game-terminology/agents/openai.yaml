@@ -1,4 +1,0 @@
-interface:
-  display_name: "制作游戏术语表"
-  short_description: "使用 Formic 分片发现并验证候选，再统一审校汇总"
-  default_prompt: "使用 $extract-game-terminology 整理完整游戏文本，制定并校验 Formic 计划，完成所有单元后统一纠错、去重并导出术语表。"
