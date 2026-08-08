@@ -27,7 +27,7 @@ use crate::diagnostic::{
     RuntimePanicBoundary, StateEffect, render_diagnostic_report,
 };
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
-use crate::manual::render_manual_command_error;
+use crate::manual::{render_manual_command_error, render_manual_command_summary};
 
 enum ProductCommandRunReport {
     RpgMaker(ProductionCommandRunReport),
@@ -494,7 +494,7 @@ fn render_generic_command_result(
                 render_generic_project_log_warning_if_present(localizer, warning.as_ref(), stderr)
                     .is_err();
             let diagnostic_failed = if let Some(manual) = error.manual_error() {
-                render_manual_command_error(manual, stderr).is_err()
+                render_manual_command_error(manual, localizer, stderr).is_err()
             } else {
                 let diagnostic = generic_command_error_report(&error);
                 writeln!(
@@ -674,21 +674,9 @@ fn render_generic_output(
                 })
             )
         }
-        GenericCommandOutput::Manual { summary } => match summary {
-            crate::manual::ManualCommandSummary::Exported { entries, file } => {
-                writeln!(stdout, "已导出 {entries} 条：{}", file.display())
-            }
-            crate::manual::ManualCommandSummary::Checked { report } => writeln!(
-                stdout,
-                "有效 {}，未填写 {}，错误 0",
-                report.valid, report.unfilled
-            ),
-            crate::manual::ManualCommandSummary::Applied { report, applied } => writeln!(
-                stdout,
-                "已应用 {applied}，未填写 {}，错误 0",
-                report.unfilled
-            ),
-        },
+        GenericCommandOutput::Manual { summary } => {
+            render_manual_command_summary(&summary, localizer, stdout)
+        }
         GenericCommandOutput::Lua { project, .. } => writeln!(
             stdout,
             "{}",
@@ -1443,14 +1431,13 @@ mod tests {
         let plain = stderr.replace(['\u{2068}', '\u{2069}'], "");
         assert!(stderr.contains("llm.clients.primary.max_concurrent_requests"));
         assert!(stderr.contains('\u{2068}') && stderr.contains('\u{2069}'));
-        assert!(plain.contains("Reason: The value violates the required contract"));
+        assert!(
+            plain.contains(
+                "Reason: Value exceeds runtime maximum (actual=2000000, maximum=1000000)"
+            )
+        );
         assert!(plain.contains("Action: Correct the named configuration field and retry"));
-        for forbidden in [
-            "configuration.invalid_value",
-            "actual=",
-            "maximum=",
-            "C:\\ATT\\att.toml",
-        ] {
+        for forbidden in ["configuration.invalid_value", "C:\\ATT\\att.toml"] {
             assert!(!plain.contains(forbidden));
         }
     }

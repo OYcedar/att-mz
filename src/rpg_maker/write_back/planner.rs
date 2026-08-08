@@ -278,67 +278,21 @@ fn repair_unit_translation_symbols_with_allocation(
             }
         }
         (TextUnitContent::Lines(source), TextUnitContent::Lines(translation))
-            if matches!(unit.role, TextUnitRole::Choices) =>
+            if matches!(
+                unit.role,
+                TextUnitRole::Choices | TextUnitRole::ScrollingText
+            ) =>
         {
-            let mut repaired_lines =
-                match clone_symbol_repair_lines(translation, cancellation, allocation) {
-                    OperationCompletion::Completed(Some(lines)) => lines,
-                    OperationCompletion::Completed(None) => {
-                        return Ok(OperationCompletion::Completed(skipped_symbol_repair(
-                            statistics,
-                        )));
-                    }
-                    OperationCompletion::Cancelled => return Ok(OperationCompletion::Cancelled),
-                };
-            let mut replacements = 0_usize;
-            for ((source, translation), repaired) in
-                source.iter().zip(translation).zip(&mut repaired_lines)
-            {
-                if cancellation.is_requested() {
-                    return Ok(OperationCompletion::Cancelled);
-                }
-                match repair_text_symbols_with_cancellation(
-                    source,
-                    translation,
-                    kind,
-                    context,
-                    false,
-                    cancellation,
-                    allocation,
-                )? {
-                    OperationCompletion::Cancelled => {
-                        return Ok(OperationCompletion::Cancelled);
-                    }
-                    OperationCompletion::Completed(RepairedText::Unchanged) => {}
-                    OperationCompletion::Completed(RepairedText::Repaired {
-                        text,
-                        replacements: line_replacements,
-                    }) => {
-                        *repaired = text;
-                        let Some(total) = replacements.checked_add(line_replacements) else {
-                            return Ok(OperationCompletion::Completed(skipped_symbol_repair(
-                                statistics,
-                            )));
-                        };
-                        replacements = total;
-                    }
-                    OperationCompletion::Completed(RepairedText::RepairedLines { .. }) => {
-                        unreachable!("单行符号修复不能返回行序列")
-                    }
-                    OperationCompletion::Completed(RepairedText::Skipped) => {
-                        return Ok(OperationCompletion::Completed(skipped_symbol_repair(
-                            statistics,
-                        )));
-                    }
-                }
-            }
-            if replacements == 0 {
-                RepairedText::Unchanged
-            } else {
-                RepairedText::RepairedLines {
-                    lines: repaired_lines,
-                    replacements,
-                }
+            match repair_aligned_line_symbols_with_cancellation(
+                source,
+                translation,
+                kind,
+                context,
+                cancellation,
+                allocation,
+            )? {
+                OperationCompletion::Completed(repaired) => repaired,
+                OperationCompletion::Cancelled => return Ok(OperationCompletion::Cancelled),
             }
         }
         (TextUnitContent::Lines(source), TextUnitContent::Lines(translation)) => {
@@ -569,6 +523,140 @@ fn repair_text_symbols_with_cancellation(
         text,
         replacements,
     }))
+}
+
+fn repair_aligned_line_symbols_with_cancellation(
+    source_lines: &[String],
+    translation_lines: &[String],
+    kind: TextGroupKind,
+    context: &RpgMakerWriteBackSymbolRepairContext,
+    cancellation: &CooperativeCancellation,
+    allocation: SymbolRepairAllocation,
+) -> Result<OperationCompletion<RepairedText>, TranslationPlanningFailureReason> {
+    let source_text = match join_symbol_repair_lines(source_lines, cancellation, allocation) {
+        OperationCompletion::Completed(Some(text)) => text,
+        OperationCompletion::Completed(None) => {
+            return Ok(OperationCompletion::Completed(RepairedText::Skipped));
+        }
+        OperationCompletion::Cancelled => return Ok(OperationCompletion::Cancelled),
+    };
+    let translation_text =
+        match join_symbol_repair_lines(translation_lines, cancellation, allocation) {
+            OperationCompletion::Completed(Some(text)) => text,
+            OperationCompletion::Completed(None) => {
+                return Ok(OperationCompletion::Completed(RepairedText::Skipped));
+            }
+            OperationCompletion::Cancelled => return Ok(OperationCompletion::Cancelled),
+        };
+    let source_boundaries = match line_separator_offsets(&source_text, cancellation, allocation) {
+        OperationCompletion::Completed(Some(offsets)) => offsets,
+        OperationCompletion::Completed(None) => {
+            return Ok(OperationCompletion::Completed(RepairedText::Skipped));
+        }
+        OperationCompletion::Cancelled => return Ok(OperationCompletion::Cancelled),
+    };
+    let translation_boundaries =
+        match line_separator_offsets(&translation_text, cancellation, allocation) {
+            OperationCompletion::Completed(Some(offsets)) => offsets,
+            OperationCompletion::Completed(None) => {
+                return Ok(OperationCompletion::Completed(RepairedText::Skipped));
+            }
+            OperationCompletion::Cancelled => return Ok(OperationCompletion::Cancelled),
+        };
+    let source = match context
+        .placeholder_service
+        .protect_with_line_boundaries_with_cancellation(
+            context.engine,
+            kind,
+            &source_text,
+            &source_boundaries,
+            &context.placeholder_rules,
+            || ensure_symbol_repair_running(cancellation),
+        ) {
+        Ok(Ok(source)) => source,
+        Ok(Err(source)) => {
+            return Err(TranslationPlanningFailureReason::PlaceholderProtection {
+                failure: placeholder_protection_planning_failure(source),
+            });
+        }
+        Err(()) => return Ok(OperationCompletion::Cancelled),
+    };
+    let translation = match context
+        .placeholder_service
+        .protect_with_line_boundaries_with_cancellation(
+            context.engine,
+            kind,
+            &translation_text,
+            &translation_boundaries,
+            &context.placeholder_rules,
+            || ensure_symbol_repair_running(cancellation),
+        ) {
+        Ok(Ok(translation)) => translation,
+        Ok(Err(source)) => {
+            return Err(TranslationPlanningFailureReason::PlaceholderProtection {
+                failure: placeholder_protection_planning_failure(source),
+            });
+        }
+        Err(()) => return Ok(OperationCompletion::Cancelled),
+    };
+    validate_placeholder_bindings(source.placeholders(), translation.placeholders())
+        .map_err(|failure| TranslationPlanningFailureReason::PlaceholderProjection { failure })?;
+    let mut repaired_lines =
+        match clone_symbol_repair_lines(translation_lines, cancellation, allocation) {
+            OperationCompletion::Completed(Some(lines)) => lines,
+            OperationCompletion::Completed(None) => {
+                return Ok(OperationCompletion::Completed(RepairedText::Skipped));
+            }
+            OperationCompletion::Cancelled => return Ok(OperationCompletion::Cancelled),
+        };
+    let mut replacements = 0_usize;
+    for ((source_line, translation_line), repaired_line) in source_lines
+        .iter()
+        .zip(translation_lines)
+        .zip(&mut repaired_lines)
+    {
+        if cancellation.is_requested() {
+            return Ok(OperationCompletion::Cancelled);
+        }
+        match repair_text_symbols_with_cancellation(
+            source_line,
+            translation_line,
+            kind,
+            context,
+            false,
+            cancellation,
+            allocation,
+        )? {
+            OperationCompletion::Completed(RepairedText::Unchanged) => {}
+            OperationCompletion::Completed(RepairedText::Repaired {
+                text,
+                replacements: line_replacements,
+            }) => {
+                *repaired_line = text;
+                let Some(total) = replacements.checked_add(line_replacements) else {
+                    return Ok(OperationCompletion::Completed(RepairedText::Skipped));
+                };
+                replacements = total;
+            }
+            OperationCompletion::Completed(RepairedText::Skipped) => {
+                return Ok(OperationCompletion::Completed(RepairedText::Skipped));
+            }
+            OperationCompletion::Completed(RepairedText::RepairedLines { .. }) => {
+                unreachable!("单行符号修复不能返回行序列")
+            }
+            OperationCompletion::Cancelled => return Ok(OperationCompletion::Cancelled),
+        }
+    }
+    if replacements == 0 {
+        Ok(OperationCompletion::Completed(RepairedText::Unchanged))
+    } else {
+        Ok(OperationCompletion::Completed(
+            RepairedText::RepairedLines {
+                lines: repaired_lines,
+                replacements,
+            },
+        ))
+    }
 }
 
 fn ensure_symbol_repair_running(cancellation: &CooperativeCancellation) -> Result<(), ()> {
@@ -926,7 +1014,7 @@ fn validate_aligned_content(
     {
         let source_is_blank = source.trim().is_empty();
         if (source_is_blank && !translated.is_empty())
-            || (!source_is_blank && translated.trim().is_empty())
+            || (!unit.manual && !source_is_blank && translated.trim().is_empty())
         {
             return Err(RpgMakerWriteBackSnapshotError::AlignedBlankLineMismatch {
                 role: unit.role.clone(),
@@ -3955,6 +4043,89 @@ mod tests {
             ]))
         );
         assert_eq!(dialogue_statistics.replacements, 2);
+
+        let mut scrolling = RpgMakerWriteBackUnit::new(
+            TextUnitRole::ScrollingText,
+            TextUnitContent::Lines(vec!["A,".to_owned(), "B".to_owned()]),
+            Some(TextUnitContent::Lines(vec![
+                "甲".to_owned(),
+                "乙、".to_owned(),
+            ])),
+        )
+        .expect("测试滚动文本单元应有效");
+        let scrolling_statistics = repair_unit_translation_symbols(
+            &mut scrolling,
+            TextGroupKind::EventScrollingText,
+            &context,
+        )
+        .expect("滚动文本 Current 的 Placeholder 应有效");
+        assert_eq!(
+            scrolling.translation_content,
+            Some(TextUnitContent::Lines(vec![
+                "甲".to_owned(),
+                "乙、".to_owned(),
+            ]))
+        );
+        assert_eq!(scrolling_statistics.replacements, 0);
+    }
+
+    #[test]
+    fn symbol_repair_validates_cross_line_choice_placeholders_before_item_repair() {
+        let context = symbol_repair_context(vec![PlaceholderRuleDefinition::new(
+            Some(vec!["event_choices".to_owned()]),
+            r"(?s)<msg>(?<text>.*?)</msg>",
+        )]);
+        let mut choices = RpgMakerWriteBackUnit::new(
+            TextUnitRole::Choices,
+            TextUnitContent::Lines(vec!["A,".to_owned(), "B.".to_owned()]),
+            Some(TextUnitContent::Lines(vec![
+                "<msg>甲、".to_owned(),
+                "乙。</msg>".to_owned(),
+            ])),
+        )
+        .expect("测试选项单元应有效");
+
+        let failure =
+            repair_unit_translation_symbols(&mut choices, TextGroupKind::EventChoices, &context)
+                .expect_err("译文新增跨槽 Placeholder 必须明确失败");
+
+        assert!(matches!(
+            failure,
+            TranslationPlanningFailureReason::PlaceholderProjection {
+                failure: TranslationPlaceholderProjectionFailure::ChangedSegmentCount {
+                    expected: 0,
+                    actual: 2,
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn symbol_repair_rejects_a_placeholder_moved_to_another_choice_slot() {
+        let context = symbol_repair_context(Vec::new());
+        let mut choices = RpgMakerWriteBackUnit::new(
+            TextUnitRole::Choices,
+            TextUnitContent::Lines(vec!["\\V[1] A,".to_owned(), "B.".to_owned()]),
+            Some(TextUnitContent::Lines(vec![
+                "甲，".to_owned(),
+                "\\V[1]乙。".to_owned(),
+            ])),
+        )
+        .expect("测试选项单元应有效");
+
+        let failure =
+            repair_unit_translation_symbols(&mut choices, TextGroupKind::EventChoices, &context)
+                .expect_err("Placeholder 不得移动到另一个选项槽位");
+
+        assert!(matches!(
+            failure,
+            TranslationPlanningFailureReason::PlaceholderProjection {
+                failure: TranslationPlaceholderProjectionFailure::ChangedSegmentCount {
+                    expected: 1,
+                    actual: 0,
+                }
+            }
+        ));
     }
 
     #[test]
@@ -5009,6 +5180,50 @@ mod tests {
             ),
             Err(RpgMakerWriteBackSnapshotError::AlignedBlankLineMismatch { line_index: 1, .. })
         ));
+
+        let group_location = location(43, None);
+        let targets = [location(44, Some(0)), location(45, Some(0))];
+        let mut recipes = targets
+            .iter()
+            .cloned()
+            .map(|target| {
+                TextProjectionRecipe::Direct(
+                    DirectTextRecipe::new(
+                        target,
+                        "erase me",
+                        vec![DirectTextPart::LineSlot {
+                            role: TextUnitRole::Choices,
+                            source_line_index: 0,
+                        }],
+                    )
+                    .expect("测试配方应合法"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let claim = TextProjectionRecipe::Claim(
+            MutationClaim::event_block(group_location.clone(), targets.into_iter().collect())
+                .expect("测试选项 Claim 应合法"),
+        );
+        recipes.push(claim);
+        let mutation_locks = recipe_locks(TextGroupKind::EventChoices, &group_location, &recipes);
+        let manual_group = RpgMakerWriteBackGroup::new(
+            TextGroupKind::EventChoices,
+            group_location,
+            vec![
+                RpgMakerWriteBackUnit::new_manual(
+                    TextUnitRole::Choices,
+                    TextUnitContent::Lines(vec!["erase me".to_owned()]),
+                    TextUnitContent::Lines(vec![String::new()]),
+                )
+                .expect("人工译文明确填写的空字符串应能建立单元"),
+            ],
+            recipes,
+            mutation_locks,
+        );
+        assert!(
+            manual_group.is_ok(),
+            "人工译文应能把非空源槽替换为空字符串：{manual_group:?}"
+        );
     }
 
     #[test]

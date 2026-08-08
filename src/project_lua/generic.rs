@@ -7,9 +7,9 @@ use rusqlite::Connection;
 
 use crate::language::LanguageModuleCatalog;
 use crate::manual::{
-    ManualDatabaseError, ManualDetachedTranslation, ManualProjectSnapshot, ManualTranslationEntry,
-    ManualTranslationLocator, apply_generic_manual_translations, clear_generic_manual_translation,
-    load_generic_manual_snapshot, validate_manual_set,
+    ManualClearLocatorError, ManualDatabaseError, ManualDetachedTranslation, ManualProjectSnapshot,
+    ManualTranslationEntry, ManualTranslationLocator, apply_generic_manual_translations,
+    clear_generic_manual_translation, load_generic_manual_snapshot, validate_manual_set,
 };
 use crate::translation::planning_resource::TerminologyEntry;
 
@@ -88,8 +88,9 @@ impl ProjectLuaEngineAdapter for GenericProjectLuaAdapter {
         connection: &Connection,
         id: String,
         translation: Vec<String>,
+        cancellation: &super::ProjectLuaCancellation,
     ) -> Result<u64, ProjectLuaCallError> {
-        with_savepoint(connection, || {
+        with_savepoint(connection, cancellation, || {
             let snapshot = self.snapshot(connection)?;
             if snapshot.index.get(&id).is_none() {
                 return Err(unknown_unit());
@@ -106,10 +107,13 @@ impl ProjectLuaEngineAdapter for GenericProjectLuaAdapter {
         &self,
         connection: &Connection,
         id: String,
+        cancellation: &super::ProjectLuaCancellation,
     ) -> Result<u64, ProjectLuaCallError> {
-        with_savepoint(connection, || {
+        with_savepoint(connection, cancellation, || {
             let snapshot = self.snapshot(connection)?;
-            let locator = resolve_clear_locator(&snapshot, &id)?;
+            let locator = snapshot
+                .clear_locator(&id)
+                .map_err(map_clear_locator_error)?;
             clear_generic_manual_translation(connection, locator).map_err(map_manual_error)
         })
     }
@@ -219,24 +223,11 @@ fn filter_records(
         .collect())
 }
 
-fn resolve_clear_locator<'a>(
-    snapshot: &'a ManualProjectSnapshot,
-    id: &str,
-) -> Result<&'a ManualTranslationLocator, ProjectLuaCallError> {
-    if let Some(entry) = snapshot.index.get(id) {
-        return Ok(&entry.locator);
+fn map_clear_locator_error(error: ManualClearLocatorError) -> ProjectLuaCallError {
+    match error {
+        ManualClearLocatorError::NotFound => unknown_unit(),
+        ManualClearLocatorError::Ambiguous => invalid_table(),
     }
-    let mut matches = snapshot
-        .detached
-        .iter()
-        .filter(|entry| entry.snapshot.id == id);
-    let Some(entry) = matches.next() else {
-        return Err(unknown_unit());
-    };
-    if matches.next().is_some() {
-        return Err(invalid_table());
-    }
-    Ok(&entry.locator)
 }
 
 fn parse_terminology(
@@ -255,13 +246,20 @@ fn parse_terminology(
 
 fn with_savepoint<T>(
     connection: &Connection,
+    cancellation: &super::ProjectLuaCancellation,
     operation: impl FnOnce() -> Result<T, ProjectLuaCallError>,
 ) -> Result<T, ProjectLuaCallError> {
+    cancellation.ensure_running()?;
     connection
         .execute_batch("SAVEPOINT att_translation_api")
         .map_err(sqlite_error)?;
     match operation() {
         Ok(value) => {
+            if let Err(error) = cancellation.ensure_running() {
+                let _ = connection
+                    .execute_batch("ROLLBACK TO att_translation_api; RELEASE att_translation_api");
+                return Err(error);
+            }
             connection
                 .execute_batch("RELEASE att_translation_api")
                 .map_err(sqlite_error)?;
@@ -277,6 +275,7 @@ fn with_savepoint<T>(
 
 fn map_manual_error(error: ManualDatabaseError) -> ProjectLuaCallError {
     match error {
+        ManualDatabaseError::Cancelled => ProjectLuaCallError::cancelled(),
         ManualDatabaseError::Sqlite(error) => sqlite_error(error),
         ManualDatabaseError::InvalidProject(_) | ManualDatabaseError::Index(_) => invalid_project(),
     }
@@ -306,4 +305,37 @@ fn invalid_table() -> ProjectLuaCallError {
 fn invalid_project() -> ProjectLuaCallError {
     ProjectLuaCallError::violation(crate::diagnostic::LuaValueViolation::StateMismatch)
         .with_engine(crate::diagnostic::LuaEngine::Generic)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_before_savepoint_release_rolls_back_the_translation_change() {
+        let connection = Connection::open_in_memory().expect("应建立测试数据库");
+        connection
+            .execute_batch("CREATE TABLE changed(value INTEGER NOT NULL);")
+            .expect("应建立测试表");
+        let cancellation = super::super::ProjectLuaCancellation::default();
+        let operation_cancellation = cancellation.clone();
+
+        let failure = with_savepoint(&connection, &cancellation, || {
+            connection
+                .execute("INSERT INTO changed(value) VALUES (1)", [])
+                .map_err(sqlite_error)?;
+            operation_cancellation.cancel();
+            Ok(())
+        })
+        .expect_err("取消到达后不得释放保存点");
+
+        assert_eq!(failure.kind(), "cancelled");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM changed", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("应读取回滚结果"),
+            0
+        );
+    }
 }

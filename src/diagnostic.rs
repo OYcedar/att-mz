@@ -386,7 +386,7 @@ impl ConfigurationValueRule {
         self.render_localized(&UiLocalizer::new(UiLocale::English))
     }
 
-    fn render_localized(&self, localizer: &UiLocalizer) -> String {
+    pub(crate) fn render_localized(&self, localizer: &UiLocalizer) -> String {
         let (line, column, actual, maximum) = self.fluent_facts();
         localizer.format(UiMessage::DiagnosticConfigurationRuleValue {
             code: self.as_str(),

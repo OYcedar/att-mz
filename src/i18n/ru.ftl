@@ -298,6 +298,29 @@ diagnostic-configuration-rule-value = { $code ->
     [referenced_client_not_found] Указанный клиент LLM не существует
    *[other] __ATT_FALLBACK__
 }
+diagnostic-http-status = Статус HTTP { $status }
+diagnostic-retry-after = Retry-After: { $seconds } с
+diagnostic-provider-code = Код провайдера: { $code }
+diagnostic-provider-type = Тип провайдера: { $kind }
+diagnostic-provider-message = Сообщение провайдера: { $message }
+diagnostic-json-position = строка { $line }, столбец { $column }
+diagnostic-placeholder-rule-file = Правило Placeholder { $number } в { $path }
+diagnostic-placeholder-rule-project = Правило Placeholder { $number } текущего проекта
+manual-exported = Экспортировано записей: { $entries }; файл: { $path }
+manual-checked = Допустимых: { $valid }, незаполненных: { $unfilled }, ошибок: { $errors }
+manual-applied = Применено: { $applied }, незаполненных: { $unfilled }, ошибок: { $errors }
+manual-issue = { $object }: { $reason }; { $help }.
+manual-value = { $code ->
+    [invalid_source_line] элемент source { $line } содержит перевод строки или NUL
+    [invalid_translation_line] элемент translation { $line } содержит перевод строки или NUL
+    [fixed_length] для перевода fixed требуется элементов: { $expected }; получено: { $actual }
+    [fixed_blank_slot] элемент { $line } перевода fixed должен оставаться пустым
+    [rerun_export] Снова выполните manual export
+    [rerun_export_without_controls] Снова выполните manual export и не добавляйте переводы строк или NUL в элементы массива
+    [rerun_export_then_fill] Снова выполните manual export, затем заполните перевод
+    [keep_exported_type] Сохраните type, записанный командой manual export
+   *[other] __ATT_FALLBACK__
+}
 task-record-title = Задача перевода { $ordinal } · { $state }
 task-record-state-label = { $state ->
     [complete] Завершена

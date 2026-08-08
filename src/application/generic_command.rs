@@ -1045,8 +1045,15 @@ impl ProductionGenericCommandRunner {
                 .await
                 .map_err(generic_project_lease_failure)?;
             ensure_generic_operation_running(&operation_cancellation)?;
+            let blocking_cancellation = operation_cancellation.clone();
             let summary = tokio::task::spawn_blocking(move || {
-                execute_generic_manual_command(&database_path, operation, &file, &language_modules)
+                execute_generic_manual_command(
+                    &database_path,
+                    operation,
+                    &file,
+                    &language_modules,
+                    &blocking_cancellation,
+                )
             })
             .await
             .map_err(|source| generic_blocking_join_failure(source, StateEffect::Unchanged))?
@@ -2448,6 +2455,9 @@ fn generic_project_lease_failure(
 }
 
 fn generic_manual_failure(source: ManualCommandError) -> GenericCommandError {
+    if source.is_cancelled() {
+        return GenericCommandError::Cancelled;
+    }
     GenericCommandError::reported(
         source,
         DiagnosticReport::new(
@@ -5775,21 +5785,38 @@ fn configure_generic_task_records(
     if !requested {
         return ConfiguredTranslationTaskRecordSink::disabled();
     }
-    let (run_id, performance, project_log_handle) = {
+    let prepared = {
         let project_log = project_log
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(project_log) = project_log.as_ref() else {
             return ConfiguredTranslationTaskRecordSink::disabled();
         };
-        let Some(run_id) = project_log.run_id() else {
-            return ConfiguredTranslationTaskRecordSink::disabled();
-        };
-        (
-            run_id.to_owned(),
-            Arc::clone(project_log.performance()),
-            project_log.handle().clone(),
+        project_log.run_id().map_or_else(
+            || {
+                Err((
+                    project_log.handle().clone(),
+                    project_log.run_id_failure().cloned(),
+                ))
+            },
+            |run_id| {
+                Ok((
+                    run_id.to_owned(),
+                    Arc::clone(project_log.performance()),
+                    project_log.handle().clone(),
+                ))
+            },
         )
+    };
+    let (run_id, performance, project_log_handle) = match prepared {
+        Ok(prepared) => prepared,
+        Err((project_log_handle, Some(report))) => {
+            project_log_handle.record_task_record_diagnostic(report);
+            return ConfiguredTranslationTaskRecordSink::disabled();
+        }
+        Err((_project_log_handle, None)) => {
+            return ConfiguredTranslationTaskRecordSink::disabled();
+        }
     };
     match SystemFileSystem::new_with_performance(file_system_configuration.clone(), performance) {
         Ok(file_system) => ConfiguredTranslationTaskRecordSink::Markdown(Box::new(

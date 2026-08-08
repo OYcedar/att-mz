@@ -288,6 +288,29 @@ diagnostic-configuration-rule-value = { $code ->
     [referenced_client_not_found] 참조된 LLM 클라이언트가 없습니다
    *[other] __ATT_FALLBACK__
 }
+diagnostic-http-status = HTTP 상태 { $status }
+diagnostic-retry-after = Retry-After: { $seconds }초
+diagnostic-provider-code = 공급자 code: { $code }
+diagnostic-provider-type = 공급자 type: { $kind }
+diagnostic-provider-message = 공급자 메시지: { $message }
+diagnostic-json-position = { $line }행 { $column }열
+diagnostic-placeholder-rule-file = { $path }의 Placeholder 규칙 { $number }
+diagnostic-placeholder-rule-project = 현재 프로젝트의 Placeholder 규칙 { $number }
+manual-exported = { $entries }개 항목을 { $path }에 내보냈습니다
+manual-checked = 유효 { $valid }, 미입력 { $unfilled }, 오류 { $errors }
+manual-applied = 적용 { $applied }, 미입력 { $unfilled }, 오류 { $errors }
+manual-issue = { $object }: { $reason }; { $help }.
+manual-value = { $code ->
+    [invalid_source_line] source의 { $line }번째 항목에 줄바꿈 또는 NUL이 있습니다
+    [invalid_translation_line] translation의 { $line }번째 항목에 줄바꿈 또는 NUL이 있습니다
+    [fixed_length] fixed 번역은 { $expected }개 항목이 필요하지만 { $actual }개입니다
+    [fixed_blank_slot] fixed 번역의 { $line }번째 항목은 비워 두어야 합니다
+    [rerun_export] manual export를 다시 실행하세요
+    [rerun_export_without_controls] manual export를 다시 실행하고 배열 항목에 줄바꿈이나 NUL을 넣지 마세요
+    [rerun_export_then_fill] manual export를 다시 실행한 뒤 번역을 입력하세요
+    [keep_exported_type] manual export가 기록한 type을 유지하세요
+   *[other] __ATT_FALLBACK__
+}
 task-record-title = 번역 작업 { $ordinal } · { $state }
 task-record-state-label = { $state ->
     [complete] 완료

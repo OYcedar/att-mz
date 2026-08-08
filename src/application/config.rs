@@ -707,6 +707,11 @@ impl CommonCommandConfiguration {
     pub(crate) const fn sqlite(&self) -> &RusqliteStorageConfiguration {
         &self.sqlite
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(projects_root: &Path) -> Self {
+        Self::build(projects_root)
+    }
 }
 
 pub(crate) struct ConfiguredInitCommand {

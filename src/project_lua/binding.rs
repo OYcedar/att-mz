@@ -669,7 +669,7 @@ fn build_translation_table(
                 .map_err(|error| host_error("binding", error, LuaOperation::SetTranslation))
                 .and_then(|(id, translation)| {
                     set_adapter
-                        .set_translation(&connection, id, translation)
+                        .set_translation(&connection, id, translation, &set_cancellation)
                         .map_err(|error| {
                             host_error("translation", error, LuaOperation::SetTranslation)
                         })
@@ -692,9 +692,11 @@ fn build_translation_table(
             let result = parse_text(id, "id", &clear_cancellation)
                 .map_err(|error| host_error("binding", error, LuaOperation::ClearTranslation))
                 .and_then(|id| {
-                    adapter.clear_translation(&connection, id).map_err(|error| {
-                        host_error("translation", error, LuaOperation::ClearTranslation)
-                    })
+                    adapter
+                        .clear_translation(&connection, id, &clear_cancellation)
+                        .map_err(|error| {
+                            host_error("translation", error, LuaOperation::ClearTranslation)
+                        })
                 });
             let output = match result {
                 Ok(_changed) => host_result_to_lua(lua, Ok(()), |_lua, ()| Ok(Value::Nil)),

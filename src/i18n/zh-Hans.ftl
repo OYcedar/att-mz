@@ -288,6 +288,29 @@ diagnostic-configuration-rule-value = { $code ->
     [referenced_client_not_found] 引用的 LLM Client 不存在
    *[other] __ATT_FALLBACK__
 }
+diagnostic-http-status = HTTP 状态 { $status }
+diagnostic-retry-after = Retry-After：{ $seconds } 秒
+diagnostic-provider-code = 服务方 code：{ $code }
+diagnostic-provider-type = 服务方 type：{ $kind }
+diagnostic-provider-message = 服务方消息：{ $message }
+diagnostic-json-position = 第 { $line } 行，第 { $column } 列
+diagnostic-placeholder-rule-file = { $path } 中的 Placeholder 规则 { $number }
+diagnostic-placeholder-rule-project = 当前项目的 Placeholder 规则 { $number }
+manual-exported = 已导出 { $entries } 条：{ $path }
+manual-checked = 有效 { $valid }，未填写 { $unfilled }，错误 { $errors }
+manual-applied = 已应用 { $applied }，未填写 { $unfilled }，错误 { $errors }
+manual-issue = { $object }：{ $reason }；{ $help }。
+manual-value = { $code ->
+    [invalid_source_line] source 第 { $line } 项包含换行或 NUL
+    [invalid_translation_line] translation 第 { $line } 项包含换行或 NUL
+    [fixed_length] fixed 译文需要 { $expected } 项，当前为 { $actual } 项
+    [fixed_blank_slot] fixed 译文第 { $line } 项必须保留空槽
+    [rerun_export] 重新运行 manual export
+    [rerun_export_without_controls] 重新运行 manual export，不要把换行或 NUL 写进数组项
+    [rerun_export_then_fill] 重新运行 manual export 后再填写译文
+    [keep_exported_type] 保留 manual export 生成的 type
+   *[other] __ATT_FALLBACK__
+}
 task-record-title = 翻译任务 { $ordinal } · { $state }
 task-record-state-label = { $state ->
     [complete] 完成

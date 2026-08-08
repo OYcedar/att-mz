@@ -369,6 +369,7 @@ impl ProjectLuaPrintSink for ProjectLogLuaPrintSink {
 
 pub(crate) struct ActiveProjectLog {
     run_id: Option<String>,
+    run_id_failure: Option<DiagnosticReport>,
     runtime: Option<ProjectLogRuntime>,
     handle: ProjectLogHandle,
     warning_presenter: Option<ProjectLogWarningPresenter>,
@@ -382,6 +383,10 @@ pub(crate) struct ActiveProjectLog {
 impl ActiveProjectLog {
     pub(crate) fn run_id(&self) -> Option<&str> {
         self.run_id.as_deref()
+    }
+
+    pub(crate) fn run_id_failure(&self) -> Option<&DiagnosticReport> {
+        self.run_id_failure.as_ref()
     }
 
     pub(crate) fn handle(&self) -> &ProjectLogHandle {
@@ -565,18 +570,17 @@ pub(crate) fn start_command_log(input: CommandLogStart<'_>) -> ActiveProjectLog 
         Ok(context) => context,
         Err(_) => {
             let (warnings, warning_presenter) = create_warning_state(locale, None);
-            warnings.record(
-                WarningCategory::ProjectLog,
-                DiagnosticReport::new(
-                    StateEffect::Unchanged,
-                    Diagnostic::observability(ObservabilityIssue::contract(
-                        ObservabilityComponent::ProjectLog,
-                        ObservabilityContractViolation::InvalidContextIdentifier,
-                    )),
-                ),
+            let report = DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::observability(ObservabilityIssue::contract(
+                    ObservabilityComponent::ProjectLog,
+                    ObservabilityContractViolation::InvalidContextIdentifier,
+                )),
             );
+            warnings.record(WarningCategory::ProjectLog, report.clone());
             return ActiveProjectLog {
                 run_id: None,
+                run_id_failure: Some(report),
                 runtime: None,
                 handle: ProjectLogHandle {
                     logger: None,
@@ -596,19 +600,18 @@ pub(crate) fn start_command_log(input: CommandLogStart<'_>) -> ActiveProjectLog 
         Ok(reserved) => reserved,
         Err(source) => {
             let (warnings, warning_presenter) = create_warning_state(locale, None);
-            warnings.record(
-                WarningCategory::ProjectLog,
-                DiagnosticReport::new(
-                    StateEffect::Unchanged,
-                    Diagnostic::observability(ObservabilityIssue::create(
-                        ObservabilityComponent::ProjectLog,
-                        SafePath::new(&logs_root),
-                        &source,
-                    )),
-                ),
+            let report = DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::observability(ObservabilityIssue::create(
+                    ObservabilityComponent::ProjectLog,
+                    SafePath::new(&logs_root),
+                    &source,
+                )),
             );
+            warnings.record(WarningCategory::ProjectLog, report.clone());
             return ActiveProjectLog {
                 run_id: None,
+                run_id_failure: Some(report),
                 runtime: None,
                 handle: ProjectLogHandle {
                     logger: None,
@@ -648,6 +651,7 @@ pub(crate) fn start_command_log(input: CommandLogStart<'_>) -> ActiveProjectLog 
             warnings.record(WarningCategory::ProjectLog, error.into_report());
             return ActiveProjectLog {
                 run_id: Some(run_id_text),
+                run_id_failure: None,
                 runtime: None,
                 handle: ProjectLogHandle {
                     logger: None,
@@ -673,6 +677,7 @@ pub(crate) fn start_command_log(input: CommandLogStart<'_>) -> ActiveProjectLog 
     });
     ActiveProjectLog {
         run_id: Some(run_id_text),
+        run_id_failure: None,
         runtime: Some(runtime),
         handle: ProjectLogHandle {
             logger: Some(logger),
@@ -719,4 +724,42 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    #[test]
+    fn failed_run_id_reservation_is_also_reported_when_task_records_were_requested() {
+        let temporary = tempfile::tempdir().expect("应建立测试目录");
+        let common = CommonCommandConfiguration::for_test(temporary.path());
+        let workspace = temporary.path().join("generic/demo");
+        fs::create_dir_all(&workspace).expect("应建立项目工作区");
+        fs::write(workspace.join("logs"), b"not-a-directory").expect("应建立日志保留故障现场");
+        let active = start_command_log(CommandLogStart {
+            common: &common,
+            locale: UiLocale::English,
+            engine: ProjectLogEngine::Generic,
+            project: "demo",
+            command: ProjectLogCommand::Translate,
+            performance: Arc::new(RunPerformanceCounters::default()),
+        });
+
+        assert!(active.run_id().is_none());
+        let failure = active
+            .run_id_failure()
+            .cloned()
+            .expect("日志保留失败必须保留可呈现诊断");
+        active.handle().record_task_record_diagnostic(failure);
+
+        let warning = active
+            .pending_succeeded()
+            .finish()
+            .expect("日志与任务记录故障必须进入最终警告");
+        assert_eq!(warning.project_log.len(), 1);
+        assert_eq!(warning.task_records.len(), 1);
+    }
 }

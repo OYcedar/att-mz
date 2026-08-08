@@ -294,6 +294,29 @@ diagnostic-configuration-rule-value = { $code ->
     [referenced_client_not_found] Referenced LLM client does not exist
    *[other] __ATT_FALLBACK__
 }
+diagnostic-http-status = HTTP status { $status }
+diagnostic-retry-after = Retry-After: { $seconds } seconds
+diagnostic-provider-code = Provider code: { $code }
+diagnostic-provider-type = Provider type: { $kind }
+diagnostic-provider-message = Provider message: { $message }
+diagnostic-json-position = line { $line }, column { $column }
+diagnostic-placeholder-rule-file = Placeholder rule { $number } in { $path }
+diagnostic-placeholder-rule-project = Placeholder rule { $number } in the current project
+manual-exported = Exported { $entries } entries to { $path }
+manual-checked = Valid { $valid }, unfilled { $unfilled }, errors { $errors }
+manual-applied = Applied { $applied }, unfilled { $unfilled }, errors { $errors }
+manual-issue = { $object }: { $reason }; { $help }.
+manual-value = { $code ->
+    [invalid_source_line] source item { $line } contains a line break or NUL
+    [invalid_translation_line] translation item { $line } contains a line break or NUL
+    [fixed_length] fixed translation requires { $expected } items; found { $actual }
+    [fixed_blank_slot] fixed translation item { $line } must remain blank
+    [rerun_export] Rerun manual export
+    [rerun_export_without_controls] Rerun manual export and do not put line breaks or NUL in array items
+    [rerun_export_then_fill] Rerun manual export, then fill in the translation
+    [keep_exported_type] Keep the type written by manual export
+   *[other] __ATT_FALLBACK__
+}
 task-record-title = Translation task { $ordinal } · { $state }
 task-record-state-label = { $state ->
     [complete] Complete

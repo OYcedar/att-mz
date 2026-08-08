@@ -48,6 +48,7 @@ impl ProjectLuaEngineAdapter for TestAdapter {
         _connection: &Connection,
         id: String,
         translation: Vec<String>,
+        _cancellation: &super::ProjectLuaCancellation,
     ) -> Result<u64, ProjectLuaCallError> {
         self.sets.lock().unwrap().push((id, translation));
         Ok(1)
@@ -57,6 +58,7 @@ impl ProjectLuaEngineAdapter for TestAdapter {
         &self,
         _connection: &Connection,
         id: String,
+        _cancellation: &super::ProjectLuaCancellation,
     ) -> Result<u64, ProjectLuaCallError> {
         self.clears.lock().unwrap().push(id);
         Ok(1)

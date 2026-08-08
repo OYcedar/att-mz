@@ -288,6 +288,29 @@ diagnostic-configuration-rule-value = { $code ->
     [referenced_client_not_found] 参照された LLM クライアントが存在しません
    *[other] __ATT_FALLBACK__
 }
+diagnostic-http-status = HTTP ステータス { $status }
+diagnostic-retry-after = Retry-After：{ $seconds } 秒
+diagnostic-provider-code = プロバイダー code：{ $code }
+diagnostic-provider-type = プロバイダー type：{ $kind }
+diagnostic-provider-message = プロバイダーのメッセージ：{ $message }
+diagnostic-json-position = { $line } 行、{ $column } 列
+diagnostic-placeholder-rule-file = { $path } の Placeholder ルール { $number }
+diagnostic-placeholder-rule-project = 現在のプロジェクトの Placeholder ルール { $number }
+manual-exported = { $entries } 件を { $path } にエクスポートしました
+manual-checked = 有効 { $valid }、未入力 { $unfilled }、エラー { $errors }
+manual-applied = 適用 { $applied }、未入力 { $unfilled }、エラー { $errors }
+manual-issue = { $object }：{ $reason }。{ $help }。
+manual-value = { $code ->
+    [invalid_source_line] source の { $line } 番目に改行または NUL が含まれています
+    [invalid_translation_line] translation の { $line } 番目に改行または NUL が含まれています
+    [fixed_length] fixed 訳には { $expected } 項必要ですが、{ $actual } 項あります
+    [fixed_blank_slot] fixed 訳の { $line } 番目は空のままにしてください
+    [rerun_export] manual export を再実行してください
+    [rerun_export_without_controls] manual export を再実行し、配列項目に改行や NUL を入れないでください
+    [rerun_export_then_fill] manual export を再実行してから訳文を入力してください
+    [keep_exported_type] manual export が出力した type を保持してください
+   *[other] __ATT_FALLBACK__
+}
 task-record-title = 翻訳タスク { $ordinal } · { $state }
 task-record-state-label = { $state ->
     [complete] 完了
