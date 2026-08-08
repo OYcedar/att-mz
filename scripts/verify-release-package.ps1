@@ -4,7 +4,7 @@
 
 .DESCRIPTION
 检查发行资源、目录边界、空项目目录、Markdown 相对链接、PE 动态依赖，以及从仓库外
-运行 Version、Generic Init、Extract 和零工作量 Translate 的真实结果。
+运行 ATT、Formic 和最小翻译路径的真实结果。
 
 .PARAMETER ExpectedVersion
 不带 v 前缀的三段版本号，例如 1.0.0。
@@ -158,6 +158,7 @@ function Test-AllowedSystemDependency {
             'crypt32.dll',
             'kernel32.dll',
             'ntdll.dll',
+            'oleaut32.dll',
             'secur32.dll',
             'userenv.dll',
             'ws2_32.dll'
@@ -198,6 +199,7 @@ function Assert-MarkdownLinks {
         Get-ChildItem -LiteralPath (Join-Path $distributionRoot 'docs') -Recurse -File -Filter '*.md'
         Get-ChildItem -LiteralPath (Join-Path $distributionRoot 'skills') -Recurse -File -Filter '*.md'
         Get-ChildItem -LiteralPath (Join-Path $distributionRoot 'licenses') -Recurse -File -Filter '*.md'
+        Get-ChildItem -LiteralPath (Join-Path $distributionRoot 'tools') -Recurse -File -Filter '*.md'
     )
 
     foreach ($file in $markdownFiles) {
@@ -250,7 +252,7 @@ foreach ($requiredFile in @('att.exe', 'config.example.toml', 'config.toml', 'LI
         throw "发行文件缺失：$path"
     }
 }
-foreach ($requiredDirectory in @('docs', 'licenses', 'projects', 'prompts', 'skills')) {
+foreach ($requiredDirectory in @('docs', 'licenses', 'projects', 'prompts', 'skills', 'tools')) {
     $path = Join-Path $distributionRoot $requiredDirectory
     if (-not (Test-Path -LiteralPath $path -PathType Container)) {
         throw "发行目录缺失：$path"
@@ -270,7 +272,8 @@ foreach ($name in @(
         'licenses',
         'projects',
         'prompts',
-        'skills'
+        'skills',
+        'tools'
     )) {
     [void]$allowedTopLevel.Add($name)
 }
@@ -295,6 +298,27 @@ if ($unexpectedDependencies.Count -gt 0) {
     throw "att.exe 含有未声明的非系统动态依赖：$($unexpectedDependencies -join ', ')"
 }
 
+$formicDirectory = Join-Path $distributionRoot 'tools\formic'
+$toolItems = @(Get-ChildItem -LiteralPath (Join-Path $distributionRoot 'tools') -Force)
+if ($toolItems.Count -ne 1 -or $toolItems[0].Name -cne 'formic' -or
+    -not $toolItems[0].PSIsContainer) {
+    throw '发行 tools 目录必须只包含 formic 子目录。'
+}
+$formicExecutable = Join-Path $formicDirectory 'formic.exe'
+$formicDependencies = Get-PeDependencies -Executable $formicExecutable
+$unexpectedFormicDependencies = @(
+    $formicDependencies | Where-Object {
+        $_ -cne 'VCRUNTIME140.dll' -and -not (Test-AllowedSystemDependency $_)
+    }
+)
+if ($unexpectedFormicDependencies.Count -gt 0) {
+    throw "formic.exe 含有未声明的非系统动态依赖：$($unexpectedFormicDependencies -join ', ')"
+}
+if ($formicDependencies -notcontains 'VCRUNTIME140.dll' -or
+    -not (Test-Path -LiteralPath (Join-Path $formicDirectory 'VCRUNTIME140.dll') -PathType Leaf)) {
+    throw 'formic.exe 所需的 VCRUNTIME140.dll 未随包提供。'
+}
+
 Assert-MarkdownLinks
 
 $temporaryRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\', '/')
@@ -314,6 +338,12 @@ try {
         Copy-Item -LiteralPath $item.FullName -Destination $smokeRoot -Recurse -Force
     }
     $smokeExecutable = Join-Path $smokeRoot 'att.exe'
+
+    $formicHelp = Invoke-CapturedProcess `
+        -FilePath (Join-Path $smokeRoot 'tools\formic\formic.exe') `
+        -Arguments @('--help') `
+        -WorkingDirectory (Join-Path $smokeRoot 'tools\formic')
+    Assert-SuccessfulCommand -Name '仓库外 Formic Help' -Result $formicHelp
 
     $version = Invoke-CapturedProcess -FilePath $smokeExecutable -Arguments @('--version') `
         -WorkingDirectory $smokeCwd

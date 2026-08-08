@@ -45,6 +45,7 @@ description: 使用 ATT 规划、建立、继续、诊断、审校、Manual 补�
 | MV/MZ 范围判断、项目分配或 Extract | `docs/rpg-maker/extraction.md` 与 `docs/rpg-maker/rules.md` |
 | Generic 项目或当前阶段 | `docs/generic/README.md` 与当前阶段规格 |
 | Generic 范围判断、JSONL 制作或 Extract | `docs/generic/jsonl.md` 与 `docs/generic/extraction.md` |
+| 从完整游戏原文制作、补做或重做术语表 | `skills/extract-game-terminology/SKILL.md` |
 | 语言、术语、Placeholder、TaskBlock、Prompt 或模型任务记录 | `docs/translation/README.md` 与对应专题规格 |
 | CLI、配置或发行资源 | `docs/runtime/cli.md`、`docs/runtime/configuration.md`、`docs/runtime/distribution.md` 中适用的规格 |
 | HTTP、超时、重试、代理、限速或模型服务 | `docs/runtime/chat-completions.md` |

@@ -3,9 +3,9 @@
 把仓库中的使用者资源同步到 dist，或只检查两边是否一致。
 
 .DESCRIPTION
-管理 README.md、LICENSE、config.example.toml、第三方许可证目录、docs、prompts 和 skills。
-config.toml 是使用者的活动配置：已有文件保持原字节不变，缺失时才从 config.example.toml
-初始化。
+管理 README.md、LICENSE、config.example.toml、第三方许可证目录、docs、prompts、skills
+和随包 Formic。ATT 与 Formic 的 config.toml 都是使用者的活动配置：已有文件保持原字节
+不变，缺失时才从各自的 config.example.toml 初始化。
 不修改 att.exe。
 
 .PARAMETER Check
@@ -15,8 +15,8 @@ config.toml 是使用者的活动配置：已有文件保持原字节不变，�
 可选的发行根；省略时使用仓库固定的 dist。供公开发行验证在干净暂存目录中复用。
 
 .PARAMETER RequireDefaultConfig
-要求 ATT 活动配置和无密钥发行模板完全一致。公开发行检查使用此开关；普通本地同步和检查
-不使用。
+要求 ATT 与 Formic 的活动配置和无密钥发行模板完全一致。公开发行检查使用此开关；普通
+本地同步和检查不使用。
 #>
 [CmdletBinding()]
 param(
@@ -57,6 +57,17 @@ $fileMappings = @(
 
 $defaultConfigSource = Join-Path $repositoryRoot 'config.example.toml'
 $activeConfigDestination = Join-Path $distributionRoot 'config.toml'
+$formicSource = Join-Path $repositoryRoot 'tools\formic'
+$formicDestination = Join-Path $distributionRoot 'tools\formic'
+$formicDefaultConfigSource = Join-Path $formicSource 'config.example.toml'
+$formicActiveConfigDestination = Join-Path $formicDestination 'config.toml'
+$formicFileMappings = @(
+    'config.example.toml',
+    'FORMIC-SOURCE.md',
+    'formic.exe',
+    'LICENSE',
+    'VCRUNTIME140.dll'
+)
 
 $directoryMappings = @(
     [pscustomobject]@{
@@ -191,6 +202,39 @@ function Test-SynchronizedResources {
         $failures.Add("公开发行的 ATT 活动配置必须与发行模板完全一致：$activeConfigDestination")
     }
 
+    if (-not (Test-Path -LiteralPath $formicDestination -PathType Container)) {
+        $failures.Add("Formic 发行目录缺失：$formicDestination")
+    }
+    else {
+        $expectedFormicFiles = @($formicFileMappings + 'config.toml') | Sort-Object
+        $actualFormicItems = @(Get-ChildItem -LiteralPath $formicDestination -Force)
+        $actualFormicFiles = @($actualFormicItems | Where-Object { -not $_.PSIsContainer } |
+                ForEach-Object Name | Sort-Object)
+        if ($actualFormicItems.Count -ne $actualFormicFiles.Count -or
+            ($expectedFormicFiles -join "`n") -cne ($actualFormicFiles -join "`n")) {
+            $failures.Add("Formic 发行目录文件集合不正确：$formicDestination")
+        }
+        foreach ($name in $formicFileMappings) {
+            $source = Join-Path $formicSource $name
+            $destination = Join-Path $formicDestination $name
+            if (-not (Test-Path -LiteralPath $destination -PathType Leaf)) {
+                $failures.Add("Formic 发行文件缺失：$destination")
+            }
+            elseif ((Get-FileDigest -Path $source) -ne (Get-FileDigest -Path $destination)) {
+                $failures.Add("Formic 发行文件与源码不同：$destination")
+            }
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $formicActiveConfigDestination -PathType Leaf)) {
+        $failures.Add("Formic 活动配置缺失或不是普通文件：$formicActiveConfigDestination")
+    }
+    elseif ($RequireDefaultConfig -and
+        (Get-FileDigest -Path $formicDefaultConfigSource) -ne
+        (Get-FileDigest -Path $formicActiveConfigDestination)) {
+        $failures.Add("公开发行的 Formic 活动配置必须与发行模板完全一致：$formicActiveConfigDestination")
+    }
+
     foreach ($mapping in $directoryMappings) {
         if (-not (Test-Path -LiteralPath $mapping.Destination -PathType Container)) {
             $failures.Add("发行目录缺失：$($mapping.Destination)")
@@ -236,6 +280,8 @@ function Test-SynchronizedResources {
 Assert-NoReparsePoint -Path $repositoryRoot
 Assert-NoReparsePoint -Path $distributionRoot -Recurse
 Assert-PlaceholderApiKey -Path $defaultConfigSource -Description 'ATT 发行配置模板'
+Assert-NoReparsePoint -Path $formicSource -Recurse
+Assert-PlaceholderApiKey -Path $formicDefaultConfigSource -Description 'Formic 发行配置模板'
 foreach ($mapping in $fileMappings) {
     Assert-NoReparsePoint -Path $mapping.Source
 }
@@ -258,6 +304,13 @@ if (Test-Path -LiteralPath $stagingRoot) {
 
 try {
     New-Item -ItemType Directory -Path $stagingRoot | Out-Null
+
+    $stagedFormic = Join-Path $stagingRoot 'formic'
+    New-Item -ItemType Directory -Path $stagedFormic | Out-Null
+    foreach ($name in $formicFileMappings) {
+        Copy-Item -LiteralPath (Join-Path $formicSource $name) `
+            -Destination (Join-Path $stagedFormic $name)
+    }
 
     foreach ($mapping in $fileMappings) {
         $staged = Join-Path $stagingRoot ([System.IO.Path]::GetFileName($mapping.Destination))
@@ -289,6 +342,22 @@ try {
     }
     elseif (-not (Test-Path -LiteralPath $activeConfigDestination -PathType Leaf)) {
         throw "ATT 活动配置不是普通文件：$activeConfigDestination"
+    }
+
+    Assert-DistributionChild -Path $formicDestination
+    if (-not (Test-Path -LiteralPath $formicDestination -PathType Container)) {
+        New-Item -ItemType Directory -Path $formicDestination | Out-Null
+    }
+    foreach ($name in $formicFileMappings) {
+        Copy-Item -LiteralPath (Join-Path $stagedFormic $name) `
+            -Destination (Join-Path $formicDestination $name) -Force
+    }
+    if (-not (Test-Path -LiteralPath $formicActiveConfigDestination)) {
+        Copy-Item -LiteralPath (Join-Path $stagedFormic 'config.example.toml') `
+            -Destination $formicActiveConfigDestination
+    }
+    elseif (-not (Test-Path -LiteralPath $formicActiveConfigDestination -PathType Leaf)) {
+        throw "Formic 活动配置不是普通文件：$formicActiveConfigDestination"
     }
     foreach ($mapping in $directoryMappings) {
         Assert-DistributionChild -Path $mapping.Destination

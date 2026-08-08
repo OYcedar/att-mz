@@ -8,6 +8,7 @@ MV、MZ 和 Generic 各自拥有项目状态与流程，同时复用语义相同
 | 当前问题 | 必读规格 |
 | --- | --- |
 | 源语言、目标语言、源语判断、残留或安全修复 | [语言](language.md) |
+| 从完整游戏原文制作术语表 | [游戏术语表制作 Skill](../../skills/extract-game-terminology/SKILL.md) → [术语](terminology.md) |
 | ATT 术语文件的格式、匹配、保存或失效 | [术语](terminology.md) |
 | 不可改写内容、token、捕获、恢复或重叠 | [Placeholder](placeholders.md)；MV/MZ 同时读 [Rules](../rpg-maker/rules.md) |
 | Unit、Group、Semantic Scope、稳定装箱或临时 ID | [TaskBlock 规划](task-planning.md) |
