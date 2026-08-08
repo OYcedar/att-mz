@@ -3,9 +3,9 @@
 把仓库中的使用者资源同步到 dist，或只检查两边是否一致。
 
 .DESCRIPTION
-管理 README.md、LICENSE、config.example.toml、第三方许可证目录、docs、prompts、skills 和
-固定的 Formic 工具。config.toml 是使用者的活动配置：已有文件保持原字节不变，缺失时才从
-config.example.toml 初始化。
+管理 README.md、LICENSE、config.example.toml、第三方许可证目录、docs、prompts 和 skills。
+config.toml 是使用者的活动配置：已有文件保持原字节不变，缺失时才从 config.example.toml
+初始化。
 不修改 att.exe。
 
 .PARAMETER Check
@@ -14,19 +14,15 @@ config.example.toml 初始化。
 .PARAMETER TargetRoot
 可选的发行根；省略时使用仓库固定的 dist。供公开发行验证在干净暂存目录中复用。
 
-.PARAMETER VCRuntimePath
-普通同步 Formic 时可选的 VCRUNTIME140.dll 来源；省略时使用 Windows System32。
-
 .PARAMETER RequireDefaultConfig
-要求 ATT 与 Formic 的活动配置和无密钥发行模板完全一致。公开发行检查使用此开关；普通
-本地同步和检查不使用。
+要求 ATT 活动配置和无密钥发行模板完全一致。公开发行检查使用此开关；普通本地同步和检查
+不使用。
 #>
 [CmdletBinding()]
 param(
     [switch]$Check,
     [switch]$RequireDefaultConfig,
-    [string]$TargetRoot,
-    [string]$VCRuntimePath
+    [string]$TargetRoot
 )
 
 Set-StrictMode -Version Latest
@@ -249,8 +245,6 @@ foreach ($mapping in $directoryMappings) {
 
 if ($Check) {
     Test-SynchronizedResources
-    & (Join-Path $PSScriptRoot 'sync-formic-tool.ps1') -Check `
-        -RequireDefaultConfig:$RequireDefaultConfig -TargetRoot $distributionRoot
     Write-Output '发行资源与源码一致。'
     return
 }
@@ -315,12 +309,4 @@ finally {
 }
 
 Test-SynchronizedResources
-$formicSyncArguments = @{
-    TargetRoot = $distributionRoot
-    RequireDefaultConfig = $RequireDefaultConfig
-}
-if (-not [string]::IsNullOrWhiteSpace($VCRuntimePath)) {
-    $formicSyncArguments.VCRuntimePath = $VCRuntimePath
-}
-& (Join-Path $PSScriptRoot 'sync-formic-tool.ps1') @formicSyncArguments
 Write-Output '发行资源已同步，并通过逐文件 SHA-256 检查。'

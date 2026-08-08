@@ -12,7 +12,6 @@
 | 当前任务 | 阅读顺序 |
 | --- | --- |
 | 调查新游戏、选择项目、建立完整翻译任务 | [翻译项目指南](guides/translation-project.md) → 对应引擎入口 → 当前阶段规格 |
-| 从完整游戏语料制作、补全或重做术语表 | [Formic 术语表指南](guides/formic-terminology.md) → [游戏术语表制作 Skill](../skills/extract-game-terminology/SKILL.md) → [术语规格](translation/terminology.md) |
 | 继续旧任务且当前状态明确 | 唯一任务清单 → [翻译项目指南](guides/translation-project.md)的当前阶段 → 对应规格 |
 | 不知道旧任务停在哪里 | 唯一任务清单 → [诊断与恢复指南](guides/diagnosis-and-recovery.md) → 权威状态所属规格 |
 | 命令出现失败、Partial、Unavailable、取消、警告或结果未知 | [诊断与恢复指南](guides/diagnosis-and-recovery.md) → 当前阶段规格 → 相关公共或运行时规格 |
@@ -51,7 +50,7 @@ Builtin → Rules → Generic 的选择顺序。具体来源、路径、捕获�
 | 发行与 CLI | — | — | [运行时入口](runtime/README.md)、[CLI](runtime/cli.md)、[配置](runtime/configuration.md)、[发行物](runtime/distribution.md) |
 | Init | [MV/MZ Init](rpg-maker/init.md)、[目录发布](runtime/directory-publishing.md) | [Generic Init](generic/init.md) | [SQLite](runtime/sqlite.md) |
 | Extract | [MV/MZ Extract](rpg-maker/extraction.md)、[Rules](rpg-maker/rules.md) | [Generic Extract](generic/extraction.md)、[JSONL](generic/jsonl.md) | [语言](translation/language.md)、[SQLite](runtime/sqlite.md) |
-| Translate 准备 | [MV/MZ Translate](rpg-maker/translation.md) | [Generic Translate](generic/translation.md) | [公共翻译入口](translation/README.md)；需要制作术语表时读 [Formic 术语表指南](guides/formic-terminology.md) |
+| Translate 准备 | [MV/MZ Translate](rpg-maker/translation.md) | [Generic Translate](generic/translation.md) | [公共翻译入口](translation/README.md) |
 | 模型请求与结果 | 对应 Translate 规格 | 对应 Translate 规格 | [TaskBlock](translation/task-planning.md)、[Prompt](translation/prompts.md)、[HTTP](runtime/chat-completions.md)、[任务记录](translation/task-records.md) |
 | 人工或 agent 查询与修订 | [Manual](manual/README.md) | [Manual](manual/README.md) | [Lua](lua/README.md)、[SQLite](runtime/sqlite.md)、[验收指南](guides/acceptance.md) |
 | WriteBack | [MV/MZ WriteBack](rpg-maker/write-back.md) | [Generic WriteBack](generic/write-back.md) | [目录发布](runtime/directory-publishing.md) |
@@ -81,7 +80,6 @@ Builtin → Rules → Generic 的选择顺序。具体来源、路径、捕获�
 ### 工作指南
 
 - [翻译项目指南](guides/translation-project.md)
-- [Formic 术语表指南](guides/formic-terminology.md)
 - [诊断与恢复指南](guides/diagnosis-and-recovery.md)
 - [全量验收指南](guides/acceptance.md)
 - [任务材料规范](guides/task-artifacts.md)

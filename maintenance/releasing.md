@@ -11,23 +11,15 @@
    `.github/RELEASE_NOTES.md`；四处必须描述同一个当前版本。
 3. 确认根 `LICENSE`、Cargo SPDX、README、发行包与 GitHub 仓库描述和 topics 表达同一
    ATT 产品范围与许可。依赖变化时使用当前 `about.toml` 与 `about.hbs` 重新生成
-   `licenses/THIRD-PARTY-LICENSES.html`。Formic 固定依赖发生变化时，使用
-   `about-formic.toml` 与 `about-formic.hbs` 重新生成
-   `licenses/FORMIC-THIRD-PARTY-LICENSES.html`；两份报告都保留在 `licenses/`。
-4. 确认 `tools/formic/release.json` 仍固定 Formic v0.1.0、提交
-   `8636e4145589c0bfc798c80560917eb26285d228` 和已经审查的 ZIP、EXE 摘要。普通资源同步
-   可以从该固定 URL 下载 Formic；`-Check` 必须只检查本地目标，不得联网。确认构建环境能
-   提供经过有效签名检查的 x64 `VCRUNTIME140.dll`，并能为实际文件生成 `runtime.json`。
-5. 检查根 `config.example.toml` 和 `tools/formic/config.example.toml`：二者必须采用当前
-   已验证的高吞吐默认，不得继承上游示例、调试或临时失败规避值，也不得包含真实密钥、
-   token 或私有连接信息。普通更新必须逐字节保留两个已有活动 `config.toml`，只在文件缺失
-   时从模板初始化；公开发行检查则在干净暂存目录确认两个活动配置分别与模板完全相同且不含
-   真实凭据。
-6. 检查 `git status` 和差异，只提交本次发布范围；不得把本机 `dist/`、Formic 作业输入与
-   输出、项目状态、密钥、构建目录或临时文件纳入提交。
-7. 在本机执行能够运行的格式、Clippy、测试与完整 Release 检查。检查必须覆盖 Formic 固定
-   摘要、`formic.exe --help` 启动、PE 依赖、Microsoft Runtime 的架构与签名，以及包内许可
-   和相对链接。正式制品仍由 GitHub Actions 从干净 checkout 重新构建，本机制品不得上传。
+   `licenses/THIRD-PARTY-LICENSES.html`；第三方许可继续保留在 `licenses/`。
+4. 检查根 `config.example.toml`：它必须采用当前已验证的高吞吐默认，不得包含调试或临时
+   失败规避值、真实密钥、token 或私有连接信息。普通更新必须逐字节保留已有活动
+   `config.toml`，只在文件缺失时从模板初始化；公开发行检查则在干净暂存目录确认活动配置
+   与模板完全相同且不含真实凭据。
+5. 检查 `git status` 和差异，只提交本次发布范围；不得把本机 `dist/`、项目状态、密钥、
+   构建目录或临时文件纳入提交。
+6. 在本机执行能够运行的格式、Clippy、测试与完整 Release 检查。正式制品仍由 GitHub
+   Actions 从干净 checkout 重新构建，本机制品不得上传。
 
 ## 2. 主分支与标签
 
@@ -88,22 +80,16 @@ do {
 gh run watch $run.databaseId --exit-status
 ```
 
-工作流必须确认标签提交等于远端 `main`，构建静态 `Release`，从固定 URL 下载并校验
-Formic v0.1.0，从构建环境携带经过签名检查的 x64 `VCRUNTIME140.dll` 与对应
-`runtime.json`，从托管模板首次创建两个无凭据活动配置，同步其余已审查资源，使用最高级别
-Deflate 打包并直接创建 Release。格式、Clippy、测试、第三方许可生成和完整发行检查在标签前
-完成，不在发包时重复运行。发布完成后检查：
+工作流必须确认标签提交等于远端 `main`，构建静态 `Release`，从托管模板首次创建无凭据
+活动配置，同步其余已审查资源，使用最高级别 Deflate 打包并直接创建 Release。格式、Clippy、
+测试、第三方许可生成和完整发行检查在标签前完成，不在发包时重复运行。发布完成后检查：
 
 - Release 名称、标签、正文与当前版本一致；
 - `att-v1.0.0-windows-x64.zip` 和 `SHA256SUMS.txt` 都存在；
 - GitHub 显示的附件 SHA-256 与校验文件一致；
 - 下载并解压后的 `att.exe --version`、根 `LICENSE`、文档、Skill 和第三方许可完整；
-- 根目录和 `tools/formic/` 中的 `config.example.toml` 都存在；两个活动 `config.toml`
-  分别与对应模板完全相同，且不含真实 API key、token 或其他凭据；
-- `tools/formic/` 精确包含发行物规格规定的九个文件，`release.json` 中的固定摘要与
-  `formic.exe` 一致，`formic.exe --help` 能启动，`VCRUNTIME140.dll` 与 `runtime.json`
-  一致；
-- 压缩包不含 Formic 游戏语料、计划、任务说明副本、结果、缓存或 worker 档案；
+- 根目录的 `config.example.toml` 存在；活动 `config.toml` 与模板完全相同，且不含真实
+  API key、token 或其他凭据；
 - GitHub 仓库描述、topics 和许可证识别没有残留旧产品或旧许可。
 
 ## 4. 分支清理与失败恢复
@@ -114,6 +100,3 @@ Deflate 打包并直接创建 Release。格式、Clippy、测试、第三方许�
 
 构建或打包失败时不创建 Release。`gh release create` 失败但已建立 Release 时，workflow 立即删除
 该 Release，但保留已有版本标签，供维护者判断是重跑相同提交，还是按第 2 节撤销尚未公开的标签并修复。
-固定 Formic 资产无法下载、摘要不符、`formic.exe` 无法启动，或构建环境中的
-`VCRUNTIME140.dll` 架构、签名与记录不符时，同样停止本次发布；不得临时改用 `latest`、其他
-Formic 安装或未经记录的 Runtime 文件。
