@@ -4,8 +4,9 @@
 
 .DESCRIPTION
 普通同步读取仓库 tools/formic/release.json，下载并验证固定 ZIP，只安装清单明确允许的
-上游文件，再加入 ATT 的包内说明、无密钥配置和 Microsoft Visual C++ Runtime。
--Check 不访问网络，只检查发行目录中的精确文件集合、摘要、配置、运行库元数据和签名。
+上游文件，再加入 ATT 的包内说明、高吞吐配置模板和 Microsoft Visual C++ Runtime。已有
+config.toml 保持原字节不变，缺失时才从模板初始化。-Check 不访问网络，只检查发行目录中的
+精确文件集合、摘要、配置文件边界、运行库元数据和签名。
 
 .PARAMETER Check
 只检查已有安装，不下载或修改文件。
@@ -15,10 +16,15 @@
 
 .PARAMETER VCRuntimePath
 普通同步时可选的 VCRUNTIME140.dll 来源；省略时使用 Windows System32 中的同名文件。
+
+.PARAMETER RequireDefaultConfig
+要求活动 config.toml 与无密钥发行模板完全一致。公开发行检查使用此开关；普通本地同步和
+检查不使用。
 #>
 [CmdletBinding()]
 param(
     [switch]$Check,
+    [switch]$RequireDefaultConfig,
     [string]$TargetRoot,
     [string]$VCRuntimePath
 )
@@ -42,8 +48,8 @@ $distributionRoot = (Resolve-Path -LiteralPath $distributionRoot).Path
 $sourceRoot = Join-Path $repositoryRoot 'tools\formic'
 $releaseManifestPath = Join-Path $sourceRoot 'release.json'
 $formicRoot = Join-Path $distributionRoot 'tools\formic'
-$supportFileNames = @('README.md', 'FORMIC-SOURCE.md', 'release.json')
-$includedUpstreamNames = @('formic.exe', 'config.example.toml', 'LICENSE')
+$supportFileNames = @('config.example.toml', 'README.md', 'FORMIC-SOURCE.md', 'release.json')
+$includedUpstreamNames = @('formic.exe', 'LICENSE')
 $expectedInstalledNames = @(
     'formic.exe',
     'config.example.toml',
@@ -524,7 +530,8 @@ function Assert-InstalledFormic {
         [Parameter(Mandatory)]
         [string]$Root,
         [Parameter(Mandatory)]
-        [pscustomobject]$Manifest
+        [pscustomobject]$Manifest,
+        [switch]$RequireDefaultConfig
     )
 
     if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
@@ -550,10 +557,17 @@ function Assert-InstalledFormic {
     }
 
     $exampleConfig = Join-Path $Root 'config.example.toml'
+    Assert-EmptyApiKey -Path $exampleConfig
     $activeConfig = Join-Path $Root 'config.toml'
-    Assert-SameFile -Source $exampleConfig -Destination $activeConfig `
-        -Description 'Formic 无密钥 config.toml'
-    Assert-EmptyApiKey -Path $activeConfig
+    if (-not (Test-Path -LiteralPath $activeConfig -PathType Leaf)) {
+        throw "Formic 活动配置缺失或不是普通文件：$activeConfig"
+    }
+    Assert-NoReparsePoint -Path $activeConfig
+    if ($RequireDefaultConfig) {
+        Assert-SameFile -Source $exampleConfig -Destination $activeConfig `
+            -Description '公开发行的 Formic config.toml'
+        Assert-EmptyApiKey -Path $activeConfig
+    }
 
     Assert-RuntimeRecord -RuntimePath (Join-Path $Root 'VCRUNTIME140.dll') `
         -RecordPath (Join-Path $Root 'runtime.json')
@@ -568,10 +582,12 @@ foreach ($supportFileName in $supportFileNames) {
         throw "Formic 支持文件缺失：$supportPath"
     }
 }
+Assert-EmptyApiKey -Path (Join-Path $sourceRoot 'config.example.toml')
 
 $releaseManifest = Get-ReleaseManifest
 if ($Check) {
-    Assert-InstalledFormic -Root $formicRoot -Manifest $releaseManifest
+    Assert-InstalledFormic -Root $formicRoot -Manifest $releaseManifest `
+        -RequireDefaultConfig:$RequireDefaultConfig
     Write-Output 'Formic 工具与固定 Release、包内支持文件和运行库记录一致。'
     return
 }
@@ -591,6 +607,37 @@ if (-not (Test-Path -LiteralPath $runtimeSource -PathType Leaf)) {
 }
 $runtimeSource = (Resolve-Path -LiteralPath $runtimeSource).Path
 $null = Get-ValidatedRuntimeMetadata -Path $runtimeSource
+
+$existingActiveConfig = Join-Path $formicRoot 'config.toml'
+$formicRootExists = Test-Path -LiteralPath $formicRoot
+if ($formicRootExists -and -not (Test-Path -LiteralPath $formicRoot -PathType Container)) {
+    throw "Formic 工具路径不是目录：$formicRoot"
+}
+if ($formicRootExists) {
+    Assert-NoReparsePoint -Path $formicRoot -Recurse
+    $existingItems = @(Get-ChildItem -LiteralPath $formicRoot -Force)
+    $unexpectedItems = @(
+        $existingItems | Where-Object {
+            $_.PSIsContainer -or $expectedInstalledNames -cnotcontains $_.Name
+        }
+    )
+    if ($unexpectedItems.Count -gt 0) {
+        throw "Formic 工具目录包含无法由同步脚本安全替换的内容：$($unexpectedItems.FullName -join ', ')"
+    }
+}
+$preserveActiveConfig = Test-Path -LiteralPath $existingActiveConfig
+if ($preserveActiveConfig -and
+    -not (Test-Path -LiteralPath $existingActiveConfig -PathType Leaf)) {
+    throw "Formic 活动配置不是普通文件：$existingActiveConfig"
+}
+if ($preserveActiveConfig) {
+    Assert-NoReparsePoint -Path $existingActiveConfig
+    if ($RequireDefaultConfig) {
+        Assert-SameFile -Source (Join-Path $sourceRoot 'config.example.toml') `
+            -Destination $existingActiveConfig -Description '公开发行的 Formic config.toml'
+        Assert-EmptyApiKey -Path $existingActiveConfig
+    }
+}
 
 $stagingRoot = Join-Path $distributionRoot '.formic-tool-sync'
 Assert-TargetChild -Path $stagingRoot
@@ -622,9 +669,9 @@ try {
         Copy-Item -LiteralPath (Join-Path $sourceRoot $supportFileName) `
             -Destination (Join-Path $stagedFormicRoot $supportFileName)
     }
+    $stagedActiveConfig = Join-Path $stagedFormicRoot 'config.toml'
     Copy-Item -LiteralPath (Join-Path $stagedFormicRoot 'config.example.toml') `
-        -Destination (Join-Path $stagedFormicRoot 'config.toml')
-    Assert-EmptyApiKey -Path (Join-Path $stagedFormicRoot 'config.toml')
+        -Destination $stagedActiveConfig
 
     $stagedRuntime = Join-Path $stagedFormicRoot 'VCRUNTIME140.dll'
     Copy-Item -LiteralPath $runtimeSource -Destination $stagedRuntime
@@ -632,7 +679,8 @@ try {
     $runtimeMetadata | ConvertTo-Json | Set-Content `
         -LiteralPath (Join-Path $stagedFormicRoot 'runtime.json') -Encoding utf8NoBOM
 
-    Assert-InstalledFormic -Root $stagedFormicRoot -Manifest $releaseManifest
+    Assert-InstalledFormic -Root $stagedFormicRoot -Manifest $releaseManifest `
+        -RequireDefaultConfig:$RequireDefaultConfig
 
     $toolsRoot = Join-Path $distributionRoot 'tools'
     Assert-TargetChild -Path $toolsRoot
@@ -644,9 +692,83 @@ try {
     }
     Assert-NoReparsePoint -Path $toolsRoot
 
-    Remove-TargetTree -Path $formicRoot
-    Move-Item -LiteralPath $stagedFormicRoot -Destination $formicRoot
-    Assert-InstalledFormic -Root $formicRoot -Manifest $releaseManifest
+    if (-not $formicRootExists) {
+        Move-Item -LiteralPath $stagedFormicRoot -Destination $formicRoot
+    }
+    else {
+        $staticFileNames = @(
+            $expectedInstalledNames | Where-Object { $_ -cne 'config.toml' }
+        )
+        $staticBackupRoot = Join-Path $stagingRoot 'previous-static'
+        New-Item -ItemType Directory -Path $staticBackupRoot | Out-Null
+        $backedUpNames = [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::Ordinal
+        )
+        foreach ($fileName in $staticFileNames) {
+            $currentFile = Join-Path $formicRoot $fileName
+            if (Test-Path -LiteralPath $currentFile -PathType Leaf) {
+                Copy-Item -LiteralPath $currentFile `
+                    -Destination (Join-Path $staticBackupRoot $fileName)
+                [void]$backedUpNames.Add($fileName)
+            }
+        }
+
+        $createdActiveConfig = $false
+        try {
+            foreach ($fileName in $staticFileNames) {
+                Copy-Item -LiteralPath (Join-Path $stagedFormicRoot $fileName) `
+                    -Destination (Join-Path $formicRoot $fileName) -Force
+            }
+            if (-not $preserveActiveConfig) {
+                $createdActiveConfig = $true
+                Copy-Item -LiteralPath $stagedActiveConfig -Destination $existingActiveConfig
+            }
+            Assert-InstalledFormic -Root $formicRoot -Manifest $releaseManifest `
+                -RequireDefaultConfig:$RequireDefaultConfig
+        }
+        catch {
+            $updateError = $_
+            $restoreFailures = [System.Collections.Generic.List[string]]::new()
+            foreach ($fileName in $staticFileNames) {
+                $currentFile = Join-Path $formicRoot $fileName
+                try {
+                    if ($backedUpNames.Contains($fileName)) {
+                        Copy-Item -LiteralPath (Join-Path $staticBackupRoot $fileName) `
+                            -Destination $currentFile -Force
+                    }
+                    elseif (Test-Path -LiteralPath $currentFile -PathType Leaf) {
+                        Assert-TargetChild -Path $currentFile
+                        Remove-Item -LiteralPath $currentFile -Force
+                    }
+                }
+                catch {
+                    $restoreFailures.Add("$fileName：$($_.Exception.Message)")
+                }
+            }
+            if ($createdActiveConfig) {
+                try {
+                    if (Test-Path -LiteralPath $existingActiveConfig) {
+                        Assert-TargetChild -Path $existingActiveConfig
+                        Remove-Item -LiteralPath $existingActiveConfig -Force
+                    }
+                }
+                catch {
+                    $restoreFailures.Add("config.toml：$($_.Exception.Message)")
+                }
+            }
+            if ($restoreFailures.Count -gt 0) {
+                throw (
+                    "Formic 静态文件更新失败，恢复旧文件时也发生错误：" +
+                    "$($updateError.Exception.Message)`n$($restoreFailures -join "`n")"
+                )
+            }
+            throw $updateError
+        }
+    }
+    if (-not $formicRootExists) {
+        Assert-InstalledFormic -Root $formicRoot -Manifest $releaseManifest `
+            -RequireDefaultConfig:$RequireDefaultConfig
+    }
 }
 finally {
     if (Test-Path -LiteralPath $stagingRoot) {
@@ -654,4 +776,4 @@ finally {
     }
 }
 
-Write-Output 'Formic 工具已从固定 Release 同步，并通过文件、配置和运行库检查。'
+Write-Output 'Formic 工具已从固定 Release 同步；活动配置已保留或首次创建，并通过文件与运行库检查。'

@@ -90,7 +90,7 @@ jobs:
           New-Item -ItemType Directory -Path 'dist', 'dist\projects', 'release-artifacts' | Out-Null
           Copy-Item -LiteralPath 'target\x86_64-pc-windows-msvc\release\att.exe' `
             -Destination 'dist\att.exe'
-          & .\scripts\sync-dist-resources.ps1
+          & .\scripts\sync-dist-resources.ps1 -RequireDefaultConfig
 
           $actualVersion = (& .\dist\att.exe --version).Trim()
           if ($LASTEXITCODE -ne 0 -or $actualVersion -cne "att $env:RELEASE_VERSION") {

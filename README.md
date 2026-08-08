@@ -33,7 +33,9 @@ ATT 不替代游戏调查和最终验收。非标准插件数据、图片文字�
 
 从 [GitHub Releases](https://github.com/yexi-by/att/releases/latest) 下载 Windows x64
 发行包和 `SHA256SUMS.txt`，核对 SHA-256 后完整解压到可写目录。不要只复制 `att.exe`，
-运行时还需要同目录的配置、文档、Prompt、Skill 和工具。
+运行时还需要同目录的配置、文档、Prompt、Skill 和工具。更新已有安装时，不要把新 ZIP 直接
+解压覆盖旧目录；先解压到新目录，再把旧目录根部和 `tools/formic/` 中已经填写的两份
+`config.toml` 复制到新目录的对应位置。仓库资源同步脚本会自动执行同样的保留规则。
 
 打开 `config.toml`，填写模型服务：
 
@@ -44,10 +46,14 @@ api_key = "replace-with-api-key"
 model = "replace-with-model-id"
 ```
 
+`config.example.toml` 保存当前不含真实凭据的发行默认，供查看新字段和新默认；它不是已有活动配置
+的替代品。服务明确限制上下文、输出、并发或请求频率时，再按实际限制降低相应配置。
+
 需要从完整游戏语料制作术语表时，再按
 [Formic 术语表指南](docs/guides/formic-terminology.md)配置 `tools/formic/config.toml` 和所需
 环境变量。Formic 使用独立的模型配置，不读取 ATT 的 `config.toml`，也不复用当前 Agent
-会话。
+会话；同目录的 `config.example.toml` 只提供当前不含真实凭据的默认，更新工具时不会覆盖已经填写的
+活动配置。
 
 ### 2. 把翻译目标交给 Agent
 

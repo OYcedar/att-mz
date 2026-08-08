@@ -18,7 +18,7 @@
     "config.example.toml": {
       "size": 1994,
       "sha256": "31e8719397a388fbbe4c60d25ce91bcc048a6c92dbfd336b34a01027a3b62455",
-      "include": true
+      "include": false
     },
     "README.md": {
       "size": 2765,

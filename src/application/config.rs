@@ -4186,9 +4186,8 @@ mod tests {
     use crate::rpg_maker::RpgMakerEngine;
 
     const EXAMPLE_TASK_RECORDING: &str = "record_translation_tasks = true";
-    const EXAMPLE_TARGET_CHARACTERS: &str = "target_task_user_message_characters = 5090";
-    const EXAMPLE_CLIENT_PARAMETERS: &str =
-        "parameters = '''\n{\"thinking\": {\"type\": \"disabled\"}}\n'''";
+    const EXAMPLE_TARGET_CHARACTERS: &str = "target_task_user_message_characters = 24000";
+    const EXAMPLE_CLIENT_PARAMETERS: &str = "parameters = '''\n{}\n'''";
 
     #[test]
     fn repository_example_is_valid_for_every_command() {
@@ -4721,11 +4720,11 @@ id = "unused"
             ),
             (
                 "client-retry-delays",
-                source.replacen("retry_delays_ms = [500, 1500, 5000]\n", "", 1),
+                source.replacen("retry_delays_ms = []\n", "", 1),
             ),
             (
                 "client-max-retry-after",
-                source.replacen("max_retry_after_ms = 30000\n", "", 1),
+                source.replacen("max_retry_after_ms = 1000\n", "", 1),
             ),
         ];
 
@@ -4812,7 +4811,7 @@ id = "unused"
             (
                 "type",
                 source.replacen(
-                    "max_concurrent_requests = 8",
+                    "max_concurrent_requests = 16",
                     "max_concurrent_requests = \"TYPE_VALUE_SENTINEL\"",
                     1,
                 ),
