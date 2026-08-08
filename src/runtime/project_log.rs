@@ -1079,7 +1079,10 @@ impl DiagnosticScope {
     }
 }
 
-/// 一个问题及其相关失败作为单条 JSONL 事件写入，避免并发事件插入其内部。
+/// 一个可读问题对应一条 JSONL 诊断事件。
+///
+/// 同一报告树的主问题与相关失败由 logger 在同一把生产者锁内连续入队，既不会丢失
+/// 相关失败，也不会让其他生产者的事件插入这组诊断内部。
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DiagnosticOccurrence {
@@ -2656,7 +2659,7 @@ fn project_log_contract_report(violation: ObservabilityContractViolation) -> Dia
 
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedTerminalDiagnostic {
-    occurrence: DiagnosticOccurrence,
+    occurrences: Vec<DiagnosticOccurrence>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2686,9 +2689,28 @@ impl PrepareTerminalDiagnosticError {
 impl std::error::Error for PrepareTerminalDiagnosticError {}
 
 impl PreparedTerminalDiagnostic {
-    pub(crate) const fn id(&self) -> DiagnosticOccurrenceId {
-        self.occurrence.id()
+    pub(crate) fn id(&self) -> DiagnosticOccurrenceId {
+        self.occurrences
+            .first()
+            .expect("终端诊断至少包含主问题")
+            .id()
     }
+}
+
+fn flatten_diagnostic_report(report: &DiagnosticReport) -> Vec<DiagnosticReport> {
+    fn visit(report: &DiagnosticReport, flattened: &mut Vec<DiagnosticReport>) {
+        flattened.push(DiagnosticReport::new(
+            report.effect(),
+            report.primary().clone(),
+        ));
+        for related in report.related() {
+            visit(related.report(), flattened);
+        }
+    }
+
+    let mut flattened = Vec::new();
+    visit(report, &mut flattened);
+    flattened
 }
 
 struct LoggerInner {
@@ -2808,29 +2830,38 @@ impl ProjectLogger {
         if state.finalized || state.terminal_preparing {
             return Err(EmitError::Closed);
         }
-        let id = self
-            .inner
-            .allocate_occurrence()
-            .map_err(|_| EmitError::OccurrenceIdExhausted)?;
-        let occurrence = DiagnosticOccurrence { id, scope, report };
-        state.occurrences.insert(
-            id,
-            OccurrenceRegistration {
-                state: OccurrenceState::Emitted,
-                scope,
-            },
-        );
-        match self
-            .inner
-            .enqueue_locked(&state, ProjectLogEvent::Diagnostic { occurrence })
-        {
-            Ok(EmitDisposition::Accepted) => Ok(id),
-            Ok(_) => unreachable!("诊断始终是必要事件"),
-            Err(error) => {
-                state.occurrences.remove(&id);
-                Err(error)
+        let reports = flatten_diagnostic_report(&report);
+        let mut occurrences = Vec::with_capacity(reports.len());
+        for report in reports {
+            let id = self
+                .inner
+                .allocate_occurrence()
+                .map_err(|_| EmitError::OccurrenceIdExhausted)?;
+            occurrences.push(DiagnosticOccurrence { id, scope, report });
+        }
+        let primary = occurrences.first().expect("诊断报告至少包含主问题").id();
+        for occurrence in occurrences {
+            let id = occurrence.id();
+            state.occurrences.insert(
+                id,
+                OccurrenceRegistration {
+                    state: OccurrenceState::Emitted,
+                    scope,
+                },
+            );
+            match self
+                .inner
+                .enqueue_locked(&state, ProjectLogEvent::Diagnostic { occurrence })
+            {
+                Ok(EmitDisposition::Accepted) => {}
+                Ok(_) => unreachable!("诊断始终是必要事件"),
+                Err(error) => {
+                    state.occurrences.remove(&id);
+                    return Err(error);
+                }
             }
         }
+        Ok(primary)
     }
 
     /// 终端诊断先取得 ID，随后由 runtime 在 performance 之后、run.finished 之前写入。
@@ -2843,22 +2874,28 @@ impl ProjectLogger {
         if state.finalized {
             return Err(PrepareTerminalDiagnosticError::Closed);
         }
-        let id = self
-            .inner
-            .allocate_occurrence()
-            .map_err(|_| PrepareTerminalDiagnosticError::OccurrenceIdExhausted)?;
+        let reports = flatten_diagnostic_report(&report);
+        let mut occurrences = Vec::with_capacity(reports.len());
+        for report in reports {
+            let id = self
+                .inner
+                .allocate_occurrence()
+                .map_err(|_| PrepareTerminalDiagnosticError::OccurrenceIdExhausted)?;
+            occurrences.push(DiagnosticOccurrence { id, scope, report });
+        }
         // 只有成功取得 occurrence ID 后才封闭普通事件。否则 Drop 无法收尾时，
         // 仍可显式关闭 sender，不会因一个半完成状态永久等待 writer。
         state.terminal_preparing = true;
-        let occurrence = DiagnosticOccurrence { id, scope, report };
-        state.occurrences.insert(
-            id,
-            OccurrenceRegistration {
-                state: OccurrenceState::PreparedTerminal,
-                scope,
-            },
-        );
-        Ok(PreparedTerminalDiagnostic { occurrence })
+        for occurrence in &occurrences {
+            state.occurrences.insert(
+                occurrence.id(),
+                OccurrenceRegistration {
+                    state: OccurrenceState::PreparedTerminal,
+                    scope,
+                },
+            );
+        }
+        Ok(PreparedTerminalDiagnostic { occurrences })
     }
 
     pub(crate) fn health(&self) -> ProjectLogHealthSnapshot {
@@ -3182,13 +3219,14 @@ impl ProjectLogRuntime {
         }
         let mut terminal_diagnostics = terminal_diagnostics
             .into_iter()
-            .map(|prepared| {
-                let id = prepared.id();
+            .flat_map(|prepared| prepared.occurrences)
+            .map(|occurrence| {
+                let id = occurrence.id();
                 match state.occurrences.get(&id) {
                     Some(OccurrenceRegistration {
                         state: OccurrenceState::PreparedTerminal,
                         ..
-                    }) => Ok(prepared.occurrence),
+                    }) => Ok(occurrence),
                     _ => Err(FinishError::InvalidTerminalDiagnostic(id)),
                 }
             })
@@ -3682,6 +3720,76 @@ mod tests {
             diagnostic_report(StateEffect::OutcomeUnknown),
         )
         .expect("测试 runtime 必须启动")
+    }
+
+    #[test]
+    fn related_diagnostics_are_written_as_adjacent_readable_events() {
+        let bytes = SharedBytes::default();
+        let runtime = runtime_with_components(
+            ProjectLogCommand::Lua,
+            Box::new(bytes.clone()),
+            Box::new(JsonProjectLogRecordEncoder),
+        );
+        let logger = runtime.logger();
+        let report = diagnostic_report(StateEffect::Unchanged).with_related(
+            RelatedFailureRelation::Cleanup,
+            diagnostic_report(StateEffect::Unchanged),
+        );
+        let primary = logger
+            .record_diagnostic(DiagnosticScope::Run, report)
+            .expect("报告树中的全部诊断都应连续入队");
+
+        runtime
+            .finish(
+                RunFinished::Failed {
+                    diagnostic: primary,
+                },
+                Vec::new(),
+            )
+            .expect("运行应正常收尾");
+
+        let records = bytes.records();
+        let diagnostic_positions = records
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| (record["event"] == "diagnostic.run").then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostic_positions.len(), 2);
+        assert_eq!(diagnostic_positions[1], diagnostic_positions[0] + 1);
+    }
+
+    #[test]
+    fn related_terminal_diagnostics_are_written_before_run_finished() {
+        let bytes = SharedBytes::default();
+        let runtime = runtime_with_components(
+            ProjectLogCommand::Lua,
+            Box::new(bytes.clone()),
+            Box::new(JsonProjectLogRecordEncoder),
+        );
+        let report = diagnostic_report(StateEffect::Unchanged).with_related(
+            RelatedFailureRelation::Cleanup,
+            diagnostic_report(StateEffect::Unchanged),
+        );
+        let prepared = runtime
+            .logger()
+            .prepare_terminal_diagnostic(DiagnosticScope::Run, report)
+            .expect("报告树中的全部终端诊断都应取得 ID");
+        let primary = prepared.id();
+
+        runtime
+            .finish(
+                RunFinished::Failed {
+                    diagnostic: primary,
+                },
+                vec![prepared],
+            )
+            .expect("运行应正常收尾");
+
+        let records = bytes.records();
+        let tail = &records[records.len() - 3..];
+        assert_eq!(tail[0]["event"], "diagnostic.run");
+        assert_eq!(tail[1]["event"], "diagnostic.run");
+        assert_eq!(tail[2]["event"], "run.finished");
     }
 
     #[test]

@@ -302,6 +302,29 @@ diagnostic-configuration-rule-value = { $code ->
     [referenced_client_not_found] عميل LLM المشار إليه غير موجود
    *[other] __ATT_FALLBACK__
 }
+diagnostic-http-status = حالة HTTP ‏{ $status }
+diagnostic-retry-after = Retry-After: ‏{ $seconds } ثانية
+diagnostic-provider-code = رمز المزوّد: { $code }
+diagnostic-provider-type = نوع المزوّد: { $kind }
+diagnostic-provider-message = رسالة المزوّد: { $message }
+diagnostic-json-position = السطر { $line }، العمود { $column }
+diagnostic-placeholder-rule-file = قاعدة Placeholder رقم { $number } في { $path }
+diagnostic-placeholder-rule-project = قاعدة Placeholder رقم { $number } في المشروع الحالي
+manual-exported = تم تصدير { $entries } إدخالات إلى { $path }
+manual-checked = صالح { $valid }، غير مملوء { $unfilled }، أخطاء { $errors }
+manual-applied = طُبّق { $applied }، غير مملوء { $unfilled }، أخطاء { $errors }
+manual-issue = { $object }: { $reason }؛ { $help }.
+manual-value = { $code ->
+    [invalid_source_line] يحتوي عنصر source رقم { $line } على سطر جديد أو NUL
+    [invalid_translation_line] يحتوي عنصر translation رقم { $line } على سطر جديد أو NUL
+    [fixed_length] تتطلب ترجمة fixed عدد { $expected } من العناصر؛ الموجود { $actual }
+    [fixed_blank_slot] يجب أن يبقى عنصر ترجمة fixed رقم { $line } فارغًا
+    [rerun_export] أعد تشغيل manual export
+    [rerun_export_without_controls] أعد تشغيل manual export ولا تضع أسطرًا جديدة أو NUL في عناصر المصفوفة
+    [rerun_export_then_fill] أعد تشغيل manual export ثم املأ الترجمة
+    [keep_exported_type] احتفظ بقيمة type التي كتبها manual export
+   *[other] __ATT_FALLBACK__
+}
 task-record-title = مهمة الترجمة { $ordinal } · { $state }
 task-record-state-label = { $state ->
     [complete] مكتملة

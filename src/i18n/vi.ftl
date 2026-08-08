@@ -288,6 +288,29 @@ diagnostic-configuration-rule-value = { $code ->
     [referenced_client_not_found] Máy khách LLM được tham chiếu không tồn tại
    *[other] __ATT_FALLBACK__
 }
+diagnostic-http-status = Trạng thái HTTP { $status }
+diagnostic-retry-after = Retry-After: { $seconds } giây
+diagnostic-provider-code = Mã nhà cung cấp: { $code }
+diagnostic-provider-type = Loại nhà cung cấp: { $kind }
+diagnostic-provider-message = Thông báo nhà cung cấp: { $message }
+diagnostic-json-position = dòng { $line }, cột { $column }
+diagnostic-placeholder-rule-file = Quy tắc Placeholder { $number } trong { $path }
+diagnostic-placeholder-rule-project = Quy tắc Placeholder { $number } của dự án hiện tại
+manual-exported = Đã xuất { $entries } mục vào { $path }
+manual-checked = Hợp lệ { $valid }, chưa điền { $unfilled }, lỗi { $errors }
+manual-applied = Đã áp dụng { $applied }, chưa điền { $unfilled }, lỗi { $errors }
+manual-issue = { $object }: { $reason }; { $help }.
+manual-value = { $code ->
+    [invalid_source_line] mục source { $line } chứa ký tự xuống dòng hoặc NUL
+    [invalid_translation_line] mục translation { $line } chứa ký tự xuống dòng hoặc NUL
+    [fixed_length] bản dịch fixed cần { $expected } mục; hiện có { $actual }
+    [fixed_blank_slot] mục { $line } của bản dịch fixed phải để trống
+    [rerun_export] Chạy lại manual export
+    [rerun_export_without_controls] Chạy lại manual export và không đặt ký tự xuống dòng hoặc NUL trong các mục mảng
+    [rerun_export_then_fill] Chạy lại manual export rồi điền bản dịch
+    [keep_exported_type] Giữ nguyên type do manual export ghi ra
+   *[other] __ATT_FALLBACK__
+}
 task-record-title = Tác vụ dịch { $ordinal } · { $state }
 task-record-state-label = { $state ->
     [complete] Hoàn tất

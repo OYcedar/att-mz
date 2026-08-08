@@ -294,6 +294,29 @@ diagnostic-configuration-rule-value = { $code ->
     [referenced_client_not_found] El cliente LLM indicado no existe
    *[other] __ATT_FALLBACK__
 }
+diagnostic-http-status = Estado HTTP { $status }
+diagnostic-retry-after = Retry-After: { $seconds } segundos
+diagnostic-provider-code = Código del proveedor: { $code }
+diagnostic-provider-type = Tipo del proveedor: { $kind }
+diagnostic-provider-message = Mensaje del proveedor: { $message }
+diagnostic-json-position = línea { $line }, columna { $column }
+diagnostic-placeholder-rule-file = Regla Placeholder { $number } en { $path }
+diagnostic-placeholder-rule-project = Regla Placeholder { $number } del proyecto actual
+manual-exported = Se exportaron { $entries } entradas a { $path }
+manual-checked = Válidas { $valid }, sin completar { $unfilled }, errores { $errors }
+manual-applied = Aplicadas { $applied }, sin completar { $unfilled }, errores { $errors }
+manual-issue = { $object }: { $reason }; { $help }.
+manual-value = { $code ->
+    [invalid_source_line] el elemento source { $line } contiene un salto de línea o NUL
+    [invalid_translation_line] el elemento translation { $line } contiene un salto de línea o NUL
+    [fixed_length] la traducción fixed requiere { $expected } elementos; hay { $actual }
+    [fixed_blank_slot] el elemento { $line } de la traducción fixed debe quedar vacío
+    [rerun_export] Vuelve a ejecutar manual export
+    [rerun_export_without_controls] Vuelve a ejecutar manual export y no incluyas saltos de línea ni NUL en los elementos de la matriz
+    [rerun_export_then_fill] Vuelve a ejecutar manual export y después completa la traducción
+    [keep_exported_type] Conserva el type escrito por manual export
+   *[other] __ATT_FALLBACK__
+}
 task-record-title = Tarea de traducción { $ordinal } · { $state }
 task-record-state-label = { $state ->
     [complete] Completada

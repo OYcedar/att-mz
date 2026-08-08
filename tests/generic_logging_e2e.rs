@@ -409,10 +409,10 @@ fn generic_fixed_http_503_is_unavailable_and_preserves_the_structured_status() {
         diagnostic["payload"],
         serde_json::json!({
             "object": format!("http://127.0.0.1:{endpoint_port}"),
-            "reason": "The external service rejected the request",
+            "reason": "The external service rejected the request (HTTP status 503; Provider code: service_unavailable; Provider type: server_error; Provider message: temporarily unavailable)",
             "help": "Check the model service response and account limits",
         }),
-        "HTTP 503 只应保留可读对象、原因和修改方法：{log}"
+        "HTTP 503 必须保留可读对象、状态和安全的服务端原因：{log}"
     );
     assert_log_has_only_readable_diagnostics(&log, &records);
 

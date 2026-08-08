@@ -7,8 +7,8 @@ use rusqlite::Connection;
 
 use crate::language::LanguageModuleCatalog;
 use crate::manual::{
-    ManualDatabaseError, ManualDetachedTranslation, ManualProjectSnapshot, ManualTranslationEntry,
-    ManualTranslationLocator, apply_rpg_maker_manual_translations,
+    ManualClearLocatorError, ManualDatabaseError, ManualDetachedTranslation, ManualProjectSnapshot,
+    ManualTranslationEntry, ManualTranslationLocator, apply_rpg_maker_manual_translations,
     clear_rpg_maker_manual_translation, load_rpg_maker_manual_snapshot, validate_manual_set,
 };
 use crate::rpg_maker::RpgMakerEngine;
@@ -116,8 +116,9 @@ impl ProjectLuaEngineAdapter for RpgMakerProjectLuaAdapter {
         connection: &Connection,
         id: String,
         translation: Vec<String>,
+        cancellation: &super::ProjectLuaCancellation,
     ) -> Result<u64, ProjectLuaCallError> {
-        with_savepoint(connection, self.engine, || {
+        with_savepoint(connection, self.engine, cancellation, || {
             let snapshot = self.snapshot(connection)?;
             if snapshot.index.get(&id).is_none() {
                 return Err(unknown_unit(self.engine));
@@ -134,10 +135,13 @@ impl ProjectLuaEngineAdapter for RpgMakerProjectLuaAdapter {
         &self,
         connection: &Connection,
         id: String,
+        cancellation: &super::ProjectLuaCancellation,
     ) -> Result<u64, ProjectLuaCallError> {
-        with_savepoint(connection, self.engine, || {
+        with_savepoint(connection, self.engine, cancellation, || {
             let snapshot = self.snapshot(connection)?;
-            let locator = resolve_clear_locator(&snapshot, &id, self.engine)?;
+            let locator = snapshot
+                .clear_locator(&id)
+                .map_err(|error| map_clear_locator_error(error, self.engine))?;
             clear_rpg_maker_manual_translation(connection, locator)
                 .map_err(|error| map_manual_error(error, self.engine))
         })
@@ -250,25 +254,14 @@ fn filter_records(
         .collect())
 }
 
-fn resolve_clear_locator<'a>(
-    snapshot: &'a ManualProjectSnapshot,
-    id: &str,
+fn map_clear_locator_error(
+    error: ManualClearLocatorError,
     engine: RpgMakerEngine,
-) -> Result<&'a ManualTranslationLocator, ProjectLuaCallError> {
-    if let Some(entry) = snapshot.index.get(id) {
-        return Ok(&entry.locator);
+) -> ProjectLuaCallError {
+    match error {
+        ManualClearLocatorError::NotFound => unknown_unit(engine),
+        ManualClearLocatorError::Ambiguous => invalid_table(engine),
     }
-    let mut matches = snapshot
-        .detached
-        .iter()
-        .filter(|entry| entry.snapshot.id == id);
-    let Some(entry) = matches.next() else {
-        return Err(unknown_unit(engine));
-    };
-    if matches.next().is_some() {
-        return Err(invalid_table(engine));
-    }
-    Ok(&entry.locator)
 }
 
 fn parse_terminology(
@@ -289,13 +282,20 @@ fn parse_terminology(
 fn with_savepoint<T>(
     connection: &Connection,
     engine: RpgMakerEngine,
+    cancellation: &super::ProjectLuaCancellation,
     operation: impl FnOnce() -> Result<T, ProjectLuaCallError>,
 ) -> Result<T, ProjectLuaCallError> {
+    cancellation.ensure_running()?;
     connection
         .execute_batch("SAVEPOINT att_translation_api")
         .map_err(|error| sqlite_error(error, engine))?;
     match operation() {
         Ok(value) => {
+            if let Err(error) = cancellation.ensure_running() {
+                let _ = connection
+                    .execute_batch("ROLLBACK TO att_translation_api; RELEASE att_translation_api");
+                return Err(error);
+            }
             connection
                 .execute_batch("RELEASE att_translation_api")
                 .map_err(|error| sqlite_error(error, engine))?;
@@ -311,6 +311,7 @@ fn with_savepoint<T>(
 
 fn map_manual_error(error: ManualDatabaseError, engine: RpgMakerEngine) -> ProjectLuaCallError {
     match error {
+        ManualDatabaseError::Cancelled => ProjectLuaCallError::cancelled(),
         ManualDatabaseError::Sqlite(error) => sqlite_error(error, engine),
         ManualDatabaseError::InvalidProject(_) | ManualDatabaseError::Index(_) => {
             invalid_project(engine)

@@ -1247,9 +1247,13 @@ mod tests {
             .iter()
             .filter(|record| record["event"] == "diagnostic.task_record")
             .collect::<Vec<_>>();
-        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics.len(), 2, "主故障和关联的未写入故障都必须记录");
         public_diagnostic(&records, "diagnostic.task_record");
-        assert!(diagnostics[0]["payload"].get("report").is_none());
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic["payload"].get("report").is_none())
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

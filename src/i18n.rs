@@ -517,6 +517,57 @@ pub(crate) enum UiMessage<'a> {
         actual: u64,
         maximum: u64,
     },
+    DiagnosticHttpStatus {
+        status: u64,
+    },
+    DiagnosticRetryAfter {
+        seconds: u64,
+    },
+    DiagnosticProviderCode {
+        code: &'a str,
+    },
+    DiagnosticProviderType {
+        kind: &'a str,
+    },
+    DiagnosticProviderMessage {
+        message: &'a str,
+    },
+    DiagnosticJsonPosition {
+        line: u64,
+        column: u64,
+    },
+    DiagnosticPlaceholderRuleFile {
+        number: u64,
+        path: &'a str,
+    },
+    DiagnosticPlaceholderRuleProject {
+        number: u64,
+    },
+    ManualExported {
+        entries: u64,
+        path: &'a str,
+    },
+    ManualChecked {
+        valid: u64,
+        unfilled: u64,
+        errors: u64,
+    },
+    ManualApplied {
+        applied: u64,
+        unfilled: u64,
+        errors: u64,
+    },
+    ManualIssue {
+        object: &'a str,
+        reason: &'a str,
+        help: &'a str,
+    },
+    ManualValue {
+        code: &'a str,
+        line: u64,
+        expected: u64,
+        actual: u64,
+    },
     ErrorNoExecutableExtractOwner,
     PlanSourceExplicit,
     PlanSourceProjectState,
@@ -898,6 +949,19 @@ impl UiMessage<'_> {
             Self::DiagnosticResolutionValue { .. } => "diagnostic-resolution-value",
             Self::DiagnosticFailureValue { .. } => "diagnostic-failure-value",
             Self::DiagnosticConfigurationRuleValue { .. } => "diagnostic-configuration-rule-value",
+            Self::DiagnosticHttpStatus { .. } => "diagnostic-http-status",
+            Self::DiagnosticRetryAfter { .. } => "diagnostic-retry-after",
+            Self::DiagnosticProviderCode { .. } => "diagnostic-provider-code",
+            Self::DiagnosticProviderType { .. } => "diagnostic-provider-type",
+            Self::DiagnosticProviderMessage { .. } => "diagnostic-provider-message",
+            Self::DiagnosticJsonPosition { .. } => "diagnostic-json-position",
+            Self::DiagnosticPlaceholderRuleFile { .. } => "diagnostic-placeholder-rule-file",
+            Self::DiagnosticPlaceholderRuleProject { .. } => "diagnostic-placeholder-rule-project",
+            Self::ManualExported { .. } => "manual-exported",
+            Self::ManualChecked { .. } => "manual-checked",
+            Self::ManualApplied { .. } => "manual-applied",
+            Self::ManualIssue { .. } => "manual-issue",
+            Self::ManualValue { .. } => "manual-value",
             Self::ErrorNoExecutableExtractOwner => "error-no-executable-extract-owner",
             Self::PlanSourceExplicit => "plan-source-explicit",
             Self::PlanSourceProjectState => "plan-source-project-state",
@@ -1372,6 +1436,70 @@ impl UiMessage<'_> {
                 set_number(&mut arguments, "column", column);
                 set_number(&mut arguments, "actual", actual);
                 set_number(&mut arguments, "maximum", maximum);
+            }
+            Self::DiagnosticHttpStatus { status } => {
+                set_number(&mut arguments, "status", status);
+            }
+            Self::DiagnosticRetryAfter { seconds } => {
+                set_number(&mut arguments, "seconds", seconds);
+            }
+            Self::DiagnosticProviderCode { code } => set_text(&mut arguments, "code", code),
+            Self::DiagnosticProviderType { kind } => set_text(&mut arguments, "kind", kind),
+            Self::DiagnosticProviderMessage { message } => {
+                set_text(&mut arguments, "message", message);
+            }
+            Self::DiagnosticJsonPosition { line, column } => {
+                set_number(&mut arguments, "line", line);
+                set_number(&mut arguments, "column", column);
+            }
+            Self::DiagnosticPlaceholderRuleFile { number, path } => {
+                set_number(&mut arguments, "number", number);
+                set_text(&mut arguments, "path", path);
+            }
+            Self::DiagnosticPlaceholderRuleProject { number } => {
+                set_number(&mut arguments, "number", number);
+            }
+            Self::ManualExported { entries, path } => {
+                set_number(&mut arguments, "entries", entries);
+                set_text(&mut arguments, "path", path);
+            }
+            Self::ManualChecked {
+                valid,
+                unfilled,
+                errors,
+            } => {
+                set_number(&mut arguments, "valid", valid);
+                set_number(&mut arguments, "unfilled", unfilled);
+                set_number(&mut arguments, "errors", errors);
+            }
+            Self::ManualApplied {
+                applied,
+                unfilled,
+                errors,
+            } => {
+                set_number(&mut arguments, "applied", applied);
+                set_number(&mut arguments, "unfilled", unfilled);
+                set_number(&mut arguments, "errors", errors);
+            }
+            Self::ManualIssue {
+                object,
+                reason,
+                help,
+            } => {
+                set_text(&mut arguments, "object", object);
+                set_text(&mut arguments, "reason", reason);
+                set_text(&mut arguments, "help", help);
+            }
+            Self::ManualValue {
+                code,
+                line,
+                expected,
+                actual,
+            } => {
+                set_text(&mut arguments, "code", code);
+                set_number(&mut arguments, "line", line);
+                set_number(&mut arguments, "expected", expected);
+                set_number(&mut arguments, "actual", actual);
             }
             Self::AppAbout
             | Self::CliUiLanguageHelp
@@ -1968,6 +2096,44 @@ mod tests {
                 column: 0,
                 actual: 0,
                 maximum: 0,
+            },
+            UiMessage::DiagnosticHttpStatus { status: 429 },
+            UiMessage::DiagnosticRetryAfter { seconds: 30 },
+            UiMessage::DiagnosticProviderCode { code: "rate_limit" },
+            UiMessage::DiagnosticProviderType { kind: "request" },
+            UiMessage::DiagnosticProviderMessage {
+                message: "try later",
+            },
+            UiMessage::DiagnosticJsonPosition { line: 1, column: 2 },
+            UiMessage::DiagnosticPlaceholderRuleFile {
+                number: 3,
+                path: "placeholders.toml",
+            },
+            UiMessage::DiagnosticPlaceholderRuleProject { number: 3 },
+            UiMessage::ManualExported {
+                entries: 2,
+                path: "manual.toml",
+            },
+            UiMessage::ManualChecked {
+                valid: 1,
+                unfilled: 2,
+                errors: 3,
+            },
+            UiMessage::ManualApplied {
+                applied: 1,
+                unfilled: 2,
+                errors: 3,
+            },
+            UiMessage::ManualIssue {
+                object: "Skills.json:1:name",
+                reason: "invalid value",
+                help: "fix input",
+            },
+            UiMessage::ManualValue {
+                code: "fixed_length",
+                line: 1,
+                expected: 2,
+                actual: 1,
             },
             UiMessage::ErrorNoExecutableExtractOwner,
             UiMessage::PlanSourceExplicit,

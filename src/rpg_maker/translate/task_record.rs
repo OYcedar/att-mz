@@ -1431,7 +1431,7 @@ raw
                 r#"
 原因："#,
                 "\u{2068}",
-                r#"外部服务拒绝了请求"#,
+                r#"外部服务拒绝了请求 (HTTP 状态 503; 服务方 code：busy; 服务方 type：service_error)"#,
                 "\u{2069}",
                 r#"
 处理办法："#,
@@ -1991,7 +1991,7 @@ raw
     }
 
     #[test]
-    fn http_provider_fields_are_not_written_to_attempt_records() {
+    fn safe_http_provider_fields_are_written_to_attempt_records() {
         const API_KEY: &str = "task-record-secret";
         let message = format!("before {API_KEY} after");
         let diagnostic = test_http_status_report(
@@ -2024,14 +2024,14 @@ raw
 
         assert!(!markdown.contains(API_KEY));
         assert!(markdown.contains("外部服务拒绝了请求"));
-        for forbidden in [
-            "provider_code",
-            "provider_type",
-            "provider_message",
+        for expected in [
             "bad_request",
             "invalid_request_error",
             "before [REDACTED API KEY] after",
         ] {
+            assert!(markdown.contains(expected), "缺少 {expected:?}");
+        }
+        for forbidden in ["provider_code", "provider_type", "provider_message"] {
             assert!(!markdown.contains(forbidden));
         }
     }

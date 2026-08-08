@@ -8,7 +8,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::i18n::{UiLocalizer, UiMessage};
 
-use super::{DiagnosticIssue, DiagnosticStage};
+use super::{
+    ConfigurationIssue, DiagnosticIssue, DiagnosticStage, HttpIssue, PlaceholderIssue,
+    PlaceholderRuleSource, TranslationIssue,
+};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -419,17 +422,120 @@ fn render_diagnostic_fields_for(
     let summary = localizer.format(UiMessage::DiagnosticFailureValue {
         code: issue.summary_code(),
     });
-    let system_message = issue
-        .facts()
-        .into_iter()
-        .find_map(|(name, value)| (name == "system_message").then_some(value))
-        .and_then(|value| readable_system_message(&value));
+    let reason = render_diagnostic_reason(issue, summary, localizer);
     RenderedDiagnosticFields {
         object: issue.subject(),
-        reason: system_message.map_or(summary.clone(), |detail| format!("{summary} ({detail})")),
+        reason,
         help: localizer.format(UiMessage::DiagnosticResolutionValue {
             code: diagnostic.resolution().as_str(),
         }),
+    }
+}
+
+fn render_diagnostic_reason(
+    issue: &DiagnosticIssue,
+    summary: String,
+    localizer: &UiLocalizer,
+) -> String {
+    if let DiagnosticIssue::Configuration(ConfigurationIssue::InvalidValue { rule, .. }) = issue {
+        return rule.render_localized(localizer);
+    }
+
+    let mut details = Vec::new();
+    match issue {
+        DiagnosticIssue::Translation(TranslationIssue::Placeholder {
+            rule_source,
+            problem,
+            ..
+        }) => {
+            if let Some(rule_number) = placeholder_rule_number(problem)
+                && let Ok(number) = u64::try_from(rule_number)
+            {
+                details.push(match rule_source {
+                    PlaceholderRuleSource::ExternalFile { path } => {
+                        localizer.format(UiMessage::DiagnosticPlaceholderRuleFile {
+                            number,
+                            path: &path.to_string(),
+                        })
+                    }
+                    PlaceholderRuleSource::ProjectSnapshot => {
+                        localizer.format(UiMessage::DiagnosticPlaceholderRuleProject { number })
+                    }
+                });
+            }
+        }
+        DiagnosticIssue::Http(HttpIssue::Status {
+            status,
+            retry_after_seconds,
+            provider_code,
+            provider_type,
+            provider_message,
+            ..
+        }) => {
+            details.push(localizer.format(UiMessage::DiagnosticHttpStatus {
+                status: u64::from(*status),
+            }));
+            if let Some(seconds) = retry_after_seconds {
+                details
+                    .push(localizer.format(UiMessage::DiagnosticRetryAfter { seconds: *seconds }));
+            }
+            if let Some(code) = provider_code {
+                details.push(localizer.format(UiMessage::DiagnosticProviderCode {
+                    code: &code.to_string(),
+                }));
+            }
+            if let Some(kind) = provider_type {
+                details.push(localizer.format(UiMessage::DiagnosticProviderType {
+                    kind: &kind.to_string(),
+                }));
+            }
+            if let Some(message) = provider_message {
+                details.push(localizer.format(UiMessage::DiagnosticProviderMessage {
+                    message: &message.to_string(),
+                }));
+            }
+        }
+        DiagnosticIssue::Http(
+            HttpIssue::RequestSerialization { line, column, .. }
+            | HttpIssue::ResponseJson { line, column, .. },
+        ) => {
+            if let (Ok(line), Ok(column)) = (u64::try_from(*line), u64::try_from(*column)) {
+                details.push(localizer.format(UiMessage::DiagnosticJsonPosition { line, column }));
+            }
+        }
+        _ => {}
+    }
+
+    if let Some(system_message) = issue
+        .facts()
+        .into_iter()
+        .find_map(|(name, value)| (name == "system_message").then_some(value))
+        .and_then(|value| readable_system_message(&value))
+    {
+        details.push(system_message);
+    }
+    if details.is_empty() {
+        summary
+    } else {
+        format!("{summary} ({})", details.join("; "))
+    }
+}
+
+fn placeholder_rule_number(problem: &PlaceholderIssue) -> Option<usize> {
+    match problem {
+        PlaceholderIssue::PatternMatch { rule_number, .. }
+        | PlaceholderIssue::EmptyMatch { rule_number, .. }
+        | PlaceholderIssue::CrossesLineBoundary { rule_number, .. } => *rule_number,
+        PlaceholderIssue::MissingTextCapture { rule_number, .. }
+        | PlaceholderIssue::InvalidMatchRange { rule_number, .. } => Some(*rule_number),
+        PlaceholderIssue::OverlappingMatches {
+            first_rule_number,
+            second_rule_number,
+            ..
+        } => first_rule_number.or(*second_rule_number),
+        PlaceholderIssue::WorkerStart { .. } | PlaceholderIssue::ReservedTokenNamespace { .. } => {
+            None
+        }
     }
 }
 
@@ -449,7 +555,8 @@ fn readable_system_message(value: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::diagnostic::{
-        ByteRange, GenericUnitLocator, PlaceholderIssue, PlaceholderRuleSource, TranslationIssue,
+        ByteRange, ConfigurationValueRule, GenericUnitLocator, HttpEndpoint, HttpScheme,
+        PlaceholderIssue, PlaceholderRuleSource, SafeIdentifier, SafeText, TranslationIssue,
     };
 
     fn missing_capture() -> Diagnostic {
@@ -539,5 +646,75 @@ mod tests {
                 ["group_id"],
             serde_json::Value::Null
         );
+    }
+
+    #[test]
+    fn configuration_value_reason_keeps_the_specific_localized_rule() {
+        let report = DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::configuration(ConfigurationIssue::InvalidValue {
+                path: None,
+                field: SafeIdentifier::new("llm.clients.primary.max_concurrent_requests")
+                    .expect("测试字段必须安全"),
+                rule: ConfigurationValueRule::RuntimeMaximumExceeded {
+                    actual: 2_000_000,
+                    maximum: 1_000_000,
+                },
+            }),
+        );
+
+        let fields =
+            render_diagnostic_fields(&report, &UiLocalizer::new(crate::i18n::UiLocale::English));
+
+        assert_eq!(
+            fields.reason.replace(['\u{2068}', '\u{2069}'], ""),
+            "Value exceeds runtime maximum (actual=2000000, maximum=1000000)"
+        );
+    }
+
+    #[test]
+    fn http_reason_keeps_the_safe_provider_response_projection() {
+        let report = DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::http(HttpIssue::Status {
+                endpoint: HttpEndpoint::new(HttpScheme::Https, "api.example.test", None),
+                status: 429,
+                retry_after_seconds: Some(12),
+                provider_code: Some(SafeIdentifier::new("rate_limit").expect("测试 code 必须安全")),
+                provider_type: Some(SafeIdentifier::new("requests").expect("测试 type 必须安全")),
+                provider_message: Some(SafeText::new("Please retry later")),
+                response_read_failure: None,
+            }),
+        );
+
+        let fields =
+            render_diagnostic_fields(&report, &UiLocalizer::new(crate::i18n::UiLocale::English));
+        let reason = fields.reason.replace(['\u{2068}', '\u{2069}'], "");
+
+        for expected in [
+            "HTTP status 429",
+            "Retry-After: 12 seconds",
+            "Provider code:",
+            "rate_limit",
+            "Provider type:",
+            "requests",
+            "Provider message:",
+            "Please retry later",
+        ] {
+            assert!(reason.contains(expected), "缺少 {expected:?}");
+        }
+    }
+
+    #[test]
+    fn placeholder_reason_keeps_the_natural_rule_number() {
+        let report = DiagnosticReport::new(StateEffect::Unchanged, missing_capture());
+
+        let fields =
+            render_diagnostic_fields(&report, &UiLocalizer::new(crate::i18n::UiLocale::English));
+        let reason = fields.reason.replace(['\u{2068}', '\u{2069}'], "");
+
+        assert!(reason.contains("Placeholder rule 2"));
+        assert!(reason.contains("D:/rules.toml"));
+        assert!(!reason.contains("4..12"), "不得公开编码位置");
     }
 }

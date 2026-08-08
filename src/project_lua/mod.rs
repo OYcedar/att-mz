@@ -274,12 +274,14 @@ pub(crate) trait ProjectLuaEngineAdapter: Send + Sync + 'static {
         connection: &Connection,
         id: String,
         translation: Vec<String>,
+        cancellation: &ProjectLuaCancellation,
     ) -> Result<u64, ProjectLuaCallError>;
 
     fn clear_translation(
         &self,
         connection: &Connection,
         id: String,
+        cancellation: &ProjectLuaCancellation,
     ) -> Result<u64, ProjectLuaCallError>;
 
     fn list_terminology(
@@ -482,6 +484,14 @@ impl ProjectLuaCancellation {
 
     pub(crate) fn is_cancelled(&self) -> bool {
         self.state.requested.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn ensure_running(&self) -> Result<(), ProjectLuaCallError> {
+        if self.is_cancelled() {
+            Err(ProjectLuaCallError::cancelled())
+        } else {
+            Ok(())
+        }
     }
 
     fn register_interrupt(&self, interrupt: InterruptHandle) -> Result<(), ProjectLuaFailure> {

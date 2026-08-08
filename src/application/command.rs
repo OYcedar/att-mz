@@ -49,7 +49,7 @@ use crate::i18n::{UiLocale, UiLocalizer, UiMessage, project_log_value_source_lab
 use crate::language::LanguageModuleCatalogError;
 use crate::manual::{
     ManualCommandError, ManualCommandSummary, execute_rpg_maker_manual_command,
-    render_manual_command_error,
+    render_manual_command_error, render_manual_command_summary,
 };
 use crate::progress::{
     ProgressAmount, ProgressObserver, ProgressSnapshot, TerminalProgress, TerminalProgressFailures,
@@ -955,6 +955,7 @@ impl ProductionRpgMakerCommandRunner {
                 if operation_cancellation.is_requested() {
                     return Ok(OperationCompletion::Cancelled);
                 }
+                let blocking_cancellation = operation_cancellation.clone();
                 let summary = tokio::task::spawn_blocking(move || {
                     execute_rpg_maker_manual_command(
                         &database_path,
@@ -962,11 +963,18 @@ impl ProductionRpgMakerCommandRunner {
                         operation,
                         &file,
                         &language_modules,
+                        &blocking_cancellation,
                     )
                 })
                 .await
-                .map_err(ProductionCommandError::manual_worker)?
-                .map_err(ProductionCommandError::manual)?;
+                .map_err(ProductionCommandError::manual_worker)?;
+                let summary = match summary {
+                    Ok(summary) => summary,
+                    Err(source) if source.is_cancelled() => {
+                        return Ok(OperationCompletion::Cancelled);
+                    }
+                    Err(source) => return Err(ProductionCommandError::manual(source)),
+                };
                 Ok(OperationCompletion::Completed(
                     RpgMakerCommandOutput::Manual { summary },
                 ))
@@ -2393,43 +2401,46 @@ impl ProductionRpgMakerCommandRunner {
         let opener = PreopenedProject::new(opened_project);
         let business_log =
             ProductionBusinessLog::for_translation(&project_log, progress_observer.clone());
-        let (task_records, record_translation_tasks) = if let (true, Some(run_id)) =
-            (command.record_translation_tasks(), project_log.run_id())
-        {
-            match SystemFileSystem::new_with_performance(
-                file_system_configuration,
-                Arc::clone(&performance),
-            ) {
-                Ok(observation_file_system) => (
-                    ConfiguredTranslationTaskRecordSink::Markdown(Box::new(
-                        MarkdownTranslationTaskRecordSink::new(
-                            project_workspace
-                                .workspace_root()
-                                .join("task-records")
-                                .join(run_id),
-                            run_id.to_owned(),
-                            command.translation().client().record_metadata(),
-                            self.locale,
-                            cpu.clone(),
-                            observation_file_system,
-                            project_log.handle().clone(),
+        let (task_records, record_translation_tasks) =
+            if command.record_translation_tasks() {
+                if let Some(run_id) = project_log.run_id() {
+                    match SystemFileSystem::new_with_performance(
+                        file_system_configuration,
+                        Arc::clone(&performance),
+                    ) {
+                        Ok(observation_file_system) => (
+                            ConfiguredTranslationTaskRecordSink::Markdown(Box::new(
+                                MarkdownTranslationTaskRecordSink::new(
+                                    project_workspace
+                                        .workspace_root()
+                                        .join("task-records")
+                                        .join(run_id),
+                                    run_id.to_owned(),
+                                    command.translation().client().record_metadata(),
+                                    self.locale,
+                                    cpu.clone(),
+                                    observation_file_system,
+                                    project_log.handle().clone(),
+                                ),
+                            )),
+                            true,
                         ),
-                    )),
-                    true,
-                ),
-                Err(error) => {
-                    project_log
-                        .handle()
-                        .record_task_record_diagnostic(DiagnosticReport::new(
-                            StateEffect::Unchanged,
-                            error.diagnostic(),
-                        ));
+                        Err(error) => {
+                            project_log.handle().record_task_record_diagnostic(
+                                DiagnosticReport::new(StateEffect::Unchanged, error.diagnostic()),
+                            );
+                            (ConfiguredTranslationTaskRecordSink::disabled(), false)
+                        }
+                    }
+                } else {
+                    if let Some(report) = project_log.run_id_failure().cloned() {
+                        project_log.handle().record_task_record_diagnostic(report);
+                    }
                     (ConfiguredTranslationTaskRecordSink::disabled(), false)
                 }
-            }
-        } else {
-            (ConfiguredTranslationTaskRecordSink::disabled(), false)
-        };
+            } else {
+                (ConfiguredTranslationTaskRecordSink::disabled(), false)
+            };
         let builder = ProductionSelectedTranslationExecutionBuilder {
             configuration: command.translation(),
             file_system: file_system.clone(),
@@ -6830,21 +6841,9 @@ impl CommandResultRenderer {
                 }
                 Ok(())
             }
-            RpgMakerCommandOutput::Manual { summary } => match summary {
-                ManualCommandSummary::Exported { entries, file } => {
-                    writeln!(stdout, "已导出 {entries} 条：{}", file.display())
-                }
-                ManualCommandSummary::Checked { report } => writeln!(
-                    stdout,
-                    "有效 {}，未填写 {}，错误 0",
-                    report.valid, report.unfilled
-                ),
-                ManualCommandSummary::Applied { report, applied } => writeln!(
-                    stdout,
-                    "已应用 {applied}，未填写 {}，错误 0",
-                    report.unfilled
-                ),
-            },
+            RpgMakerCommandOutput::Manual { summary } => {
+                render_manual_command_summary(summary, localizer, stdout)
+            }
             RpgMakerCommandOutput::Lua { project } => writeln!(
                 stdout,
                 "{}",
@@ -6917,7 +6916,7 @@ impl CommandResultRenderer {
     ) -> io::Result<()> {
         if let Some(error) = command_error {
             if let Some(manual) = error.manual_error() {
-                render_manual_command_error(manual, stderr)?;
+                render_manual_command_error(manual, localizer, stderr)?;
             } else {
                 writeln!(
                     stderr,
