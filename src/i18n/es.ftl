@@ -314,6 +314,7 @@ manual-value = { $code ->
     [rerun_export] Vuelve a ejecutar manual export
     [rerun_export_without_controls] Vuelve a ejecutar manual export y no incluyas saltos de línea ni NUL en los elementos de la matriz
     [rerun_export_then_fill] Vuelve a ejecutar manual export y después completa la traducción
+    [resolve_temporary_then_rerun_export] Corrige la ruta temporal fija mostrada, elimina cualquier objeto residual y vuelve a ejecutar manual export
     [keep_exported_type] Conserva el type escrito por manual export
    *[other] __ATT_FALLBACK__
 }

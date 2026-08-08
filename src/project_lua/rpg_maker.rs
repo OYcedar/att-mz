@@ -20,7 +20,7 @@ use crate::translation::planning_resource::TerminologyEntry;
 use super::{
     ProjectLuaCallError, ProjectLuaEngineAdapter, ProjectLuaOutdatedTranslation,
     ProjectLuaTerminologyEntry, ProjectLuaTranslationContext, ProjectLuaTranslationFilter,
-    ProjectLuaTranslationRecord, ProjectLuaTranslationStatus,
+    ProjectLuaTranslationRecord, ProjectLuaTranslationStatus, rollback_translation_api_savepoint,
 };
 
 pub(crate) fn rpg_maker_project_lua_adapter(
@@ -296,20 +296,22 @@ fn with_savepoint<T>(
     match operation() {
         Ok(value) => {
             if let Err(error) = cancellation.ensure_running() {
-                let _ = connection
-                    .execute_batch("ROLLBACK TO att_translation_api; RELEASE att_translation_api");
-                return Err(error);
+                return Err(rollback_translation_api_savepoint(
+                    connection,
+                    lua_engine(engine),
+                    error,
+                ));
             }
             connection
                 .execute_batch("RELEASE att_translation_api")
                 .map_err(|error| sqlite_error(error, engine))?;
             Ok(value)
         }
-        Err(error) => {
-            let _ = connection
-                .execute_batch("ROLLBACK TO att_translation_api; RELEASE att_translation_api");
-            Err(error)
-        }
+        Err(error) => Err(rollback_translation_api_savepoint(
+            connection,
+            lua_engine(engine),
+            error,
+        )),
     }
 }
 
@@ -354,4 +356,35 @@ fn invalid_table(engine: RpgMakerEngine) -> ProjectLuaCallError {
 fn invalid_project(engine: RpgMakerEngine) -> ProjectLuaCallError {
     ProjectLuaCallError::violation(crate::diagnostic::LuaValueViolation::StateMismatch)
         .with_engine(lua_engine(engine))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rollback_cleanup_failure_is_not_a_clean_primary_failure() {
+        let connection = Connection::open_in_memory().expect("应建立测试数据库");
+        let cancellation = super::super::ProjectLuaCancellation::default();
+
+        let failure = with_savepoint(&connection, RpgMakerEngine::Mv, &cancellation, || {
+            connection
+                .execute_batch("RELEASE att_translation_api")
+                .expect("应移除保存点以注入 ROLLBACK TO 失败");
+            Err::<(), _>(
+                ProjectLuaCallError::cancelled()
+                    .with_engine(lua_engine(RpgMakerEngine::Mv))
+                    .with_operation(crate::diagnostic::LuaOperation::SetTranslation),
+            )
+        })
+        .expect_err("ROLLBACK TO 失败必须和主错误一并返回");
+
+        assert_eq!(failure.kind(), "cleanup_failed");
+        assert!(!failure.is_cancelled());
+        assert_eq!(failure.cleanup_failures.len(), 1);
+        assert!(matches!(
+            &failure.cleanup_failures[0].issue,
+            super::super::ProjectLuaCallIssue::Sqlite { .. }
+        ));
+    }
 }

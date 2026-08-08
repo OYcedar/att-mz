@@ -2466,26 +2466,31 @@ impl ProductionRpgMakerCommandRunner {
             TranslateProgressPhase::Planning,
         ));
         let safe_stopping = progress_safe_stopping(self.locale);
-        let mut execution = drive_command(
-            service.execute(input),
-            termination_signals,
-            || {
-                cancellation.request();
-                cpu.cancel_waits();
-                file_system.cancel_waits();
-                sqlite.cancel_waits();
-                llm.cancel_waits();
-            },
-            || {
-                defer_terminal_progress_status(progress.safe_stopping(safe_stopping));
-                let (confirmed, total) = progress_observer.confirmed_amount();
-                project_log
-                    .handle()
-                    .emit(ProjectLogEvent::CancellationRequested { confirmed, total });
-            },
-        )
-        .await
-        .map(|result| result.map_err(map_translate_error));
+        let translation_execution = async {
+            drive_command(
+                service.execute(input),
+                termination_signals,
+                || {
+                    cancellation.request();
+                    cpu.cancel_waits();
+                    file_system.cancel_waits();
+                    sqlite.cancel_waits();
+                    llm.cancel_waits();
+                },
+                || {
+                    defer_terminal_progress_status(progress.safe_stopping(safe_stopping));
+                    let (confirmed, total) = progress_observer.confirmed_amount();
+                    project_log
+                        .handle()
+                        .emit(ProjectLogEvent::CancellationRequested { confirmed, total });
+                },
+            )
+            .await
+            .map(|result| result.map_err(map_translate_error))
+        };
+        let mut execution =
+            catch_translate_execution_panic(self.panic_boundary.clone(), translation_execution)
+                .await;
         business_log.emit_retry_summary();
         let no_model_work = matches!(
             &execution,
@@ -3027,6 +3032,39 @@ async fn catch_command_panic(
             drop(payload);
             ProductionCommandRunReport::panicked(panic_boundary.panic_error())
         }
+    }
+}
+
+async fn catch_translate_execution_panic<T>(
+    panic_boundary: CommandPanicBoundary,
+    future: impl Future<Output = DrivenCommand<Result<OperationCompletion<T>, ProductionCommandError>>>,
+) -> DrivenCommand<Result<OperationCompletion<T>, ProductionCommandError>> {
+    match AssertUnwindSafe(future).catch_unwind().await {
+        Ok(execution) => execution,
+        Err(payload) => {
+            // 与进程外层边界相同，panic payload 可能包含正文或外部响应，不能读取。
+            drop(payload);
+            DrivenCommand::Finished(Err(panic_boundary.panic_error()))
+        }
+    }
+}
+
+#[cfg(test)]
+mod translate_panic_boundary_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn inner_translate_panic_becomes_a_driven_command_error() {
+        let execution: DrivenCommand<Result<OperationCompletion<()>, ProductionCommandError>> =
+            catch_translate_execution_panic(CommandPanicBoundary::default(), async {
+                panic!("测试 Translate 内层 panic")
+            })
+            .await;
+
+        assert!(matches!(
+            execution,
+            DrivenCommand::Finished(Err(ProductionCommandError::Internal(_)))
+        ));
     }
 }
 
@@ -4811,6 +4849,60 @@ mod prompt_template_tests {
         );
         assert_eq!(response_mode, mode);
     }
+
+    #[test]
+    fn post_await_cancellation_does_not_overwrite_an_already_formed_build_error() {
+        let cancellation = CooperativeCancellation::default();
+        cancellation.request();
+        let failure = ProductionTranslationExecutionBuildError::prompt_template(
+            PromptResourceComponent::System,
+            Path::new("C:/att/prompts/translation/system.md"),
+            PromptTemplateError::VariablesNotAllowed,
+        );
+
+        let error = complete_translation_execution_build_step::<()>(Err(failure), &cancellation)
+            .expect_err("已经形成的 Prompt 错误必须先于后到取消返回");
+
+        assert!(!error.is_cancelled());
+        let cancelled = complete_translation_execution_build_step(Ok(()), &cancellation)
+            .expect_err("成功步骤之后观察到取消时应返回类型化取消");
+        assert!(cancelled.is_cancelled());
+    }
+
+    #[test]
+    fn production_build_error_classifies_only_typed_cancellation_leaves() {
+        let path = PathBuf::from("C:/att/prompts/translation/system.md");
+        let cancelled = ProductionTranslationExecutionBuildError::prompt_resource(
+            PromptResourceComponent::System,
+            &path,
+            PromptResourceLoadError::Read(ReadFileError::Io {
+                path: path.clone(),
+                source: SystemFileSystemError::Cancelled {
+                    operation: "read_file",
+                    path: path.clone(),
+                },
+            }),
+        );
+        assert!(cancelled.is_cancelled());
+
+        let ordinary_io = ProductionTranslationExecutionBuildError::prompt_resource(
+            PromptResourceComponent::System,
+            &path,
+            PromptResourceLoadError::Read(ReadFileError::Io {
+                path: path.clone(),
+                source: SystemFileSystemError::Io {
+                    operation: "read_file",
+                    path: path.clone(),
+                    source: io::Error::other("disk failure"),
+                },
+            }),
+        );
+        assert!(!ordinary_io.is_cancelled());
+        assert!(
+            ProductionTranslationExecutionBuildError::prompt_cpu(CpuTaskExecutionError::Cancelled)
+                .is_cancelled()
+        );
+    }
 }
 
 struct ProductionSelectedTranslationExecutionBuilder<'a> {
@@ -4851,48 +4943,57 @@ async fn build_production_translation_profile(
     let example_path = prompt_paths.example().to_path_buf();
     ensure_translation_execution_build_running(cancellation)?;
     let system_template = read_unparsed_prompt_resource(file_system, &system_path).await;
-    ensure_translation_execution_build_running(cancellation)?;
-    let system_template = system_template.map_err(|source| {
-        ProductionTranslationExecutionBuildError::prompt_resource(
-            PromptResourceComponent::System,
-            &system_path,
-            source,
-        )
-    })?;
+    let system_template = complete_translation_execution_build_step(
+        system_template.map_err(|source| {
+            ProductionTranslationExecutionBuildError::prompt_resource(
+                PromptResourceComponent::System,
+                &system_path,
+                source,
+            )
+        }),
+        cancellation,
+    )?;
     let thinking = if let Some(path) = thinking_path.as_deref() {
         ensure_translation_execution_build_running(cancellation)?;
         let thinking = read_unparsed_prompt_resource(file_system, path).await;
-        ensure_translation_execution_build_running(cancellation)?;
-        Some(thinking.map_err(|source| {
-            ProductionTranslationExecutionBuildError::prompt_resource(
-                PromptResourceComponent::Thinking,
-                path,
-                source,
-            )
-        })?)
+        Some(complete_translation_execution_build_step(
+            thinking.map_err(|source| {
+                ProductionTranslationExecutionBuildError::prompt_resource(
+                    PromptResourceComponent::Thinking,
+                    path,
+                    source,
+                )
+            }),
+            cancellation,
+        )?)
     } else {
         None
     };
     ensure_translation_execution_build_running(cancellation)?;
-    let rules = read_unparsed_prompt_resource(file_system, &rules_path)
-        .await
-        .map_err(|source| {
-            ProductionTranslationExecutionBuildError::prompt_resource(
-                PromptResourceComponent::Rules,
-                &rules_path,
-                source,
-            )
-        })?;
-    ensure_translation_execution_build_running(cancellation)?;
-    let example = read_unparsed_prompt_resource(file_system, &example_path)
-        .await
-        .map_err(|source| {
-            ProductionTranslationExecutionBuildError::prompt_resource(
-                PromptResourceComponent::Example,
-                &example_path,
-                source,
-            )
-        })?;
+    let rules = complete_translation_execution_build_step(
+        read_unparsed_prompt_resource(file_system, &rules_path)
+            .await
+            .map_err(|source| {
+                ProductionTranslationExecutionBuildError::prompt_resource(
+                    PromptResourceComponent::Rules,
+                    &rules_path,
+                    source,
+                )
+            }),
+        cancellation,
+    )?;
+    let example = complete_translation_execution_build_step(
+        read_unparsed_prompt_resource(file_system, &example_path)
+            .await
+            .map_err(|source| {
+                ProductionTranslationExecutionBuildError::prompt_resource(
+                    PromptResourceComponent::Example,
+                    &example_path,
+                    source,
+                )
+            }),
+        cancellation,
+    )?;
 
     let prompt_language_pair = language_pair.clone();
     let prompt_cancellation = cancellation.clone();
@@ -4958,7 +5059,6 @@ async fn build_production_translation_profile(
             .map_err(RpgMakerPromptPreparationError::SystemPrompt)
         })
         .await;
-    ensure_translation_execution_build_running(cancellation)?;
     let system_prompt = system_prompt
         .map_err(ProductionTranslationExecutionBuildError::prompt_cpu)?
         .map_err(|source| match source {
@@ -5034,8 +5134,8 @@ async fn build_production_translation_profile(
                     source,
                 )
             }
-        })?;
-    ensure_translation_execution_build_running(cancellation)?;
+        });
+    let system_prompt = complete_translation_execution_build_step(system_prompt, cancellation)?;
     let source_language = configuration
         .language_modules()
         .resolve(language_pair.source())
@@ -5064,6 +5164,10 @@ impl SelectedTranslationExecutionBuilder for ProductionSelectedTranslationExecut
     type Translation = ProductionRpgMakerTranslation;
     type Error = ProductionTranslationExecutionBuildError;
 
+    fn is_cancelled_error(error: &Self::Error) -> bool {
+        error.is_cancelled()
+    }
+
     async fn build(
         &self,
         project: &crate::rpg_maker::project::OpenedProject,
@@ -5090,11 +5194,12 @@ impl SelectedTranslationExecutionBuilder for ProductionSelectedTranslationExecut
                 })
             })
             .await;
-        ensure_translation_execution_build_running(&self.cancellation)?;
         let placeholders = placeholders
             .map_err(ProductionTranslationExecutionBuildError::placeholder_cpu)?
             .map_err(|_cancelled| ProductionTranslationExecutionBuildError::cancelled())?
-            .map_err(ProductionTranslationExecutionBuildError::builtin_placeholder_compile)?;
+            .map_err(ProductionTranslationExecutionBuildError::builtin_placeholder_compile);
+        let placeholders =
+            complete_translation_execution_build_step(placeholders, &self.cancellation)?;
         let asset_reader =
             RpgMakerTranslationAssetReadingService::new(self.sqlite.clone(), self.cpu.clone());
         let resources = TranslationPlanningResourceReadingService::new(
@@ -5158,8 +5263,18 @@ fn ensure_translation_execution_build_running(
     }
 }
 
+fn complete_translation_execution_build_step<T>(
+    result: Result<T, ProductionTranslationExecutionBuildError>,
+    cancellation: &CooperativeCancellation,
+) -> Result<T, ProductionTranslationExecutionBuildError> {
+    let value = result?;
+    ensure_translation_execution_build_running(cancellation)?;
+    Ok(value)
+}
+
 struct ProductionTranslationExecutionBuildError {
     class: TranslationExecutionBuildFailureClass,
+    cancelled: bool,
     diagnostic: Box<DiagnosticReport>,
     source: BoxedError,
 }
@@ -5179,7 +5294,9 @@ impl ProductionTranslationExecutionBuildError {
                 operation: RuntimeOperation::ExecuteTask,
             }),
         );
-        Self::new(TranslationExecutionBuildCancelled, diagnostic)
+        let mut error = Self::new(TranslationExecutionBuildCancelled, diagnostic);
+        error.cancelled = true;
+        error
     }
 
     fn prompt_cpu(source: CpuTaskExecutionError<CpuExecutorUnavailable>) -> Self {
@@ -5194,6 +5311,7 @@ impl ProductionTranslationExecutionBuildError {
         operation: &'static str,
         source: CpuTaskExecutionError<CpuExecutorUnavailable>,
     ) -> Self {
+        let cancelled = matches!(&source, CpuTaskExecutionError::Cancelled);
         let operation = match operation {
             "prepare_rpg_maker_prompt" => RuntimeOperation::PrepareRpgMakerPrompt,
             "compile_rpg_maker_builtin_placeholders" => {
@@ -5203,7 +5321,9 @@ impl ProductionTranslationExecutionBuildError {
         };
         let diagnostic =
             DiagnosticReport::new(StateEffect::Unchanged, source.diagnostic_for(operation));
-        Self::new(source, diagnostic)
+        let mut error = Self::new(source, diagnostic);
+        error.cancelled = cancelled;
+        error
     }
 
     fn prompt_resource(
@@ -5212,8 +5332,17 @@ impl ProductionTranslationExecutionBuildError {
         source: PromptResourceLoadError,
     ) -> Self {
         let _ = (component, path);
+        let cancelled = matches!(
+            &source,
+            PromptResourceLoadError::Read(ReadFileError::Io {
+                source: SystemFileSystemError::Cancelled { .. },
+                ..
+            })
+        );
         let diagnostic = source.diagnostic_report();
-        Self::new(source, diagnostic)
+        let mut error = Self::new(source, diagnostic);
+        error.cancelled = cancelled;
+        error
     }
 
     fn prompt_template(
@@ -5282,6 +5411,7 @@ impl ProductionTranslationExecutionBuildError {
         };
         Self {
             class,
+            cancelled: false,
             diagnostic: Box::new(diagnostic),
             source: Box::new(source),
         }
@@ -5290,6 +5420,10 @@ impl ProductionTranslationExecutionBuildError {
     const fn diagnostic(&self) -> &DiagnosticReport {
         &self.diagnostic
     }
+
+    const fn is_cancelled(&self) -> bool {
+        self.cancelled
+    }
 }
 
 impl fmt::Debug for ProductionTranslationExecutionBuildError {
@@ -5297,6 +5431,7 @@ impl fmt::Debug for ProductionTranslationExecutionBuildError {
         formatter
             .debug_struct("ProductionTranslationExecutionBuildError")
             .field("class", &self.class)
+            .field("cancelled", &self.cancelled)
             .field("diagnostic", &self.diagnostic)
             .field("source", &self.source)
             .finish()

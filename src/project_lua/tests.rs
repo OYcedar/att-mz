@@ -3,10 +3,11 @@ use std::sync::{Arc, Mutex};
 use rusqlite::Connection;
 
 use super::{
-    ProjectLuaCallError, ProjectLuaEngine, ProjectLuaEngineAdapter, ProjectLuaOutdatedTranslation,
-    ProjectLuaProgram, ProjectLuaProject, ProjectLuaRunError, ProjectLuaRunRequest,
-    ProjectLuaTerminologyEntry, ProjectLuaTranslationContext, ProjectLuaTranslationFilter,
-    ProjectLuaTranslationRecord, ProjectLuaTranslationStatus, run_project_lua,
+    ProjectLuaCallError, ProjectLuaEngine, ProjectLuaEngineAdapter, ProjectLuaFailure,
+    ProjectLuaOutdatedTranslation, ProjectLuaProgram, ProjectLuaProject, ProjectLuaRunError,
+    ProjectLuaRunRequest, ProjectLuaTerminologyEntry, ProjectLuaTranslationContext,
+    ProjectLuaTranslationFilter, ProjectLuaTranslationRecord, ProjectLuaTranslationStatus,
+    run_project_lua,
 };
 
 #[derive(Default)]
@@ -15,6 +16,7 @@ struct TestAdapter {
     contexts: Mutex<Vec<Vec<String>>>,
     sets: Mutex<Vec<(String, Vec<String>)>>,
     clears: Mutex<Vec<String>>,
+    cancel_and_fail_set: bool,
 }
 
 impl ProjectLuaEngineAdapter for TestAdapter {
@@ -48,8 +50,16 @@ impl ProjectLuaEngineAdapter for TestAdapter {
         _connection: &Connection,
         id: String,
         translation: Vec<String>,
-        _cancellation: &super::ProjectLuaCancellation,
+        cancellation: &super::ProjectLuaCancellation,
     ) -> Result<u64, ProjectLuaCallError> {
+        if self.cancel_and_fail_set {
+            cancellation.cancel();
+            return Err(ProjectLuaCallError::violation(
+                crate::diagnostic::LuaValueViolation::UnknownUnit,
+            )
+            .with_engine(crate::diagnostic::LuaEngine::Generic)
+            .with_field("id"));
+        }
         self.sets.lock().unwrap().push((id, translation));
         Ok(1)
     }
@@ -290,4 +300,52 @@ assert(not extension)
         request(source, Arc::new(TestAdapter::default())),
     )
     .unwrap();
+}
+
+#[test]
+fn real_host_error_survives_late_cancellation_and_pcall() {
+    let adapter = Arc::new(TestAdapter {
+        cancel_and_fail_set: true,
+        ..TestAdapter::default()
+    });
+    let source = r#"
+local ok, failure = pcall(ctx.translation.set, "missing", { "译文" })
+assert(not ok)
+assert(failure.kind == "unit_not_found")
+error(failure, 0)
+"#;
+
+    let error = run_project_lua(
+        Connection::open_in_memory().unwrap(),
+        request(source, adapter),
+    )
+    .expect_err("真实 Host 错误不能被同时到达的取消覆盖");
+
+    match error {
+        ProjectLuaRunError::Failed(ProjectLuaFailure::Host(error)) => {
+            assert_eq!(error.kind(), "unit_not_found");
+        }
+        other => panic!("应保留 Host 错误，实际为 {other:?}"),
+    }
+}
+
+#[test]
+fn sqlite_interrupt_is_a_typed_cancellation() {
+    let failure =
+        ProjectLuaFailure::Host(ProjectLuaCallError::sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
+            None,
+        )))
+        .into_typed_cancellation();
+
+    assert_eq!(failure, ProjectLuaFailure::Cancelled);
+}
+
+#[test]
+fn ordinary_sqlite_error_is_not_a_typed_cancellation() {
+    let failure =
+        ProjectLuaFailure::Host(ProjectLuaCallError::sqlite(rusqlite::Error::InvalidQuery))
+            .into_typed_cancellation();
+
+    assert!(matches!(failure, ProjectLuaFailure::Host(_)));
 }

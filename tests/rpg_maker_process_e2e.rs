@@ -1329,6 +1329,170 @@ fn generic_source_placeholder_failure_sends_no_incomplete_task_block() {
 }
 
 #[test]
+fn mv_source_placeholder_failure_fails_before_database_and_model_side_effects() {
+    let temporary = tempfile::tempdir().expect("应可建立 MV Placeholder 失败测试目录");
+    let root = temporary.path();
+    let game = root.join("mv-placeholder-failure-game");
+    write_minimal_mv_game(&game);
+    fs::write(
+        game.join("www/data/Items.json"),
+        serde_json::to_vec(&json!([
+            null,
+            {"id": 1, "name": "春の薬", "description": "春の便りです"},
+            {"id": 2, "name": "夏の薬", "description": "夏の便りです \\n[123]"},
+            {"id": 3, "name": "秋の薬", "description": "秋の便りです"}
+        ]))
+        .expect("MV Placeholder 失败 Items 应可序列化"),
+    )
+    .expect("MV Placeholder 失败 Items 应可写入");
+    let placeholders = root.join("overlapping-mv-placeholders.toml");
+    fs::write(
+        &placeholders,
+        concat!(
+            "[[rule]]\n",
+            "scopes = [\"database_entry\"]\n",
+            "pattern = '\\\\n\\[[0-9]+\\]'\n",
+        ),
+    )
+    .expect("MV 重叠 Placeholder 规则应可写入");
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("本地模型服务端口应可绑定");
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().expect("本地模型地址应可读取")
+    );
+    write_configuration(root, &endpoint);
+    write_rpg_maker_prompt(root);
+    let (stop_sender, stop_receiver) = mpsc::channel();
+    let provider = thread::spawn(move || serve_provider_spy(listener, stop_receiver));
+
+    assert_success(
+        "MV Placeholder 失败 Init",
+        &run_att(root, init_arguments("mv", &game)),
+    );
+    assert_success(
+        "MV Placeholder 失败 Extract",
+        &run_att(
+            root,
+            arguments(&["mv", "extract", "--name", PROJECT, "--builtin"]),
+        ),
+    );
+
+    let workspace = distribution_root(root).join("projects/mv").join(PROJECT);
+    let database = workspace.join("project.db");
+    let database_before = fs::read(&database).expect("Translate 前项目数据库应可读取");
+    let logs = workspace.join("logs");
+    let logs_before = fs::read_dir(&logs)
+        .expect("Translate 前日志目录应可读取")
+        .map(|entry| entry.expect("Translate 前日志项应可读取").path())
+        .collect::<Vec<_>>();
+
+    let mut translate = arguments(&[
+        "mv",
+        "translate",
+        "--name",
+        PROJECT,
+        "local",
+        "--placeholders",
+    ]);
+    translate.push(placeholders.as_os_str().to_owned());
+    let output = run_att(root, translate);
+    stop_sender
+        .send(())
+        .expect("MV Placeholder 失败后应可停止 Provider spy");
+    let requests = provider
+        .join()
+        .expect("MV Placeholder Provider spy 不得 panic")
+        .expect("MV Placeholder Provider spy 必须正常结束");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        requests.is_empty(),
+        "任一 RPG Maker Unit 准备失败时不得发送其他完整块：{requests:?}"
+    );
+    assert_eq!(
+        fs::read(&database).expect("Translate 后项目数据库应可读取"),
+        database_before,
+        "规划失败前后 project.db 字节必须完全不变"
+    );
+    assert!(
+        !workspace.join("task-records").exists(),
+        "零模型请求的 RPG Maker 规划失败不得建立任务记录"
+    );
+
+    let new_logs = fs::read_dir(&logs)
+        .expect("Translate 后日志目录应可读取")
+        .map(|entry| entry.expect("Translate 后日志项应可读取").path())
+        .filter(|path| !logs_before.contains(path))
+        .collect::<Vec<_>>();
+    assert_eq!(new_logs.len(), 1, "一次 Translate 只能新增一份项目日志");
+    let records = read_project_log_records(&new_logs[0]);
+    let diagnostics = records
+        .iter()
+        .filter(|record| record["event"] == "diagnostic.run_plan")
+        .collect::<Vec<_>>();
+    assert_eq!(diagnostics.len(), 1, "规划失败必须产生唯一 RunPlan 诊断");
+    let payload = diagnostics[0]["payload"]
+        .as_object()
+        .expect("RunPlan 诊断 payload 必须是对象");
+    assert_eq!(payload.len(), 3);
+    for field in ["object", "reason", "help"] {
+        assert!(
+            payload[field]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "公开诊断 {field} 必须是非空可读文本"
+        );
+    }
+    let object = payload["object"]
+        .as_str()
+        .expect("规划诊断 object 必须是可读文本");
+    for expected in [
+        "Items.json",
+        "role=scalar:description",
+        "overlapping-mv-placeholders.toml",
+        "builtin",
+        "custom rule 1",
+    ] {
+        assert!(
+            object.contains(expected),
+            "规划诊断 object 缺少 {expected:?}：{object}"
+        );
+    }
+    for forbidden in ["group_id", "unit_id", "first_range", "second_range", "byte"] {
+        assert!(
+            !object.contains(forbidden),
+            "规划诊断 object 不得显示内部字段 {forbidden:?}：{object}"
+        );
+    }
+    assert!(
+        payload["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("重叠")),
+        "规划诊断 reason 必须说明规则重叠：{payload:?}"
+    );
+    assert!(
+        records
+            .iter()
+            .all(|record| record["event"] != "task.started")
+    );
+
+    let translation_finished = records
+        .iter()
+        .filter(|record| record["event"] == "translation.finished")
+        .collect::<Vec<_>>();
+    assert_eq!(translation_finished.len(), 1);
+    let result = &translation_finished[0]["payload"]["result"];
+    assert_eq!(result["kind"], "failed");
+    let tasks = &result["tasks"];
+    assert_eq!(tasks["started"], 0);
+    for field in ["complete", "partial", "unavailable", "failed", "cancelled"] {
+        assert_eq!(tasks[field], 0, "规划失败前不得开始任何任务");
+    }
+    assert_eq!(tasks["planned"], tasks["not_started"]);
+}
+
+#[test]
 fn task_record_write_failure_warns_once_without_changing_translate_success() {
     let temporary = tempfile::tempdir().expect("应可建立任务记录降级测试目录");
     let root = temporary.path();

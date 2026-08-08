@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     ByteRange, DiagnosticResolution, DiagnosticStage, FileSystemOrdinalKeyPhase, IoFailure,
-    Pcre2Failure, PlaceholderIssue, PlaceholderRuleSource, SafeIdentifier, SafePath, SafeText,
-    SqliteTransactionState,
+    Pcre2Failure, PlaceholderIssue, PlaceholderRuleOrigin, PlaceholderRuleSource, SafeIdentifier,
+    SafePath, SafeText, SqliteTransactionState,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -162,6 +162,20 @@ impl RpgMakerDiagnosticSource {
             } => format!("plugin_parameter:{plugin_index}:{plugin_name}:{parameter_name}"),
         }
     }
+
+    fn natural_location(&self) -> String {
+        match self {
+            Self::Data { file } | Self::DataFile { file } => file.to_string(),
+            Self::Map { map_id } => format!("Map{map_id:03}.json"),
+            Self::PluginParameter {
+                plugin_index,
+                plugin_name,
+                parameter_name,
+            } => format!(
+                "plugins.js:plugin[{plugin_index}]({plugin_name}):parameter[{parameter_name}]"
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -224,6 +238,27 @@ impl RpgMakerDiagnosticLocation {
             .map(RpgMakerDiagnosticLocationStep::fact_value)
             .collect::<Vec<_>>()
             .join("/")
+    }
+
+    fn natural_location(&self) -> String {
+        let mut location = self.source.natural_location();
+        for step in &self.steps {
+            match step {
+                RpgMakerDiagnosticLocationStep::ObjectKey { key } => {
+                    location.push(':');
+                    location.push_str(&key.to_string());
+                }
+                RpgMakerDiagnosticLocationStep::ArrayIndex { index } => {
+                    location.push('[');
+                    location.push_str(&index.to_string());
+                    location.push(']');
+                }
+                RpgMakerDiagnosticLocationStep::DecodeJsonString => {
+                    location.push_str(":decoded_json");
+                }
+            }
+        }
+        location
     }
 }
 
@@ -292,6 +327,92 @@ impl RpgMakerUnitLocator {
             ("role", self.role.fact_value()),
         ]
     }
+
+    fn placeholder_subject(
+        &self,
+        rule_source: &PlaceholderRuleSource,
+        rules: Option<String>,
+    ) -> String {
+        let mut details = vec![
+            format!("group={}", self.group_kind.as_str()),
+            format!("role={}", self.role.fact_value()),
+            format!(
+                "Placeholder={}",
+                match rule_source {
+                    PlaceholderRuleSource::ExternalFile { path } => path.to_string(),
+                    PlaceholderRuleSource::ProjectSnapshot => "project snapshot".to_owned(),
+                }
+            ),
+        ];
+        if let Some(rules) = rules {
+            details.push(format!("rules={rules}"));
+        }
+        format!(
+            "{} ({})",
+            self.group_location.natural_location(),
+            details.join("; ")
+        )
+    }
+}
+
+fn placeholder_rule_label(
+    origin: Option<PlaceholderRuleOrigin>,
+    rule_number: Option<usize>,
+) -> Option<String> {
+    match (origin, rule_number) {
+        (Some(PlaceholderRuleOrigin::Builtin), _) => Some("builtin".to_owned()),
+        (Some(PlaceholderRuleOrigin::Custom), Some(rule_number)) => {
+            Some(format!("custom rule {rule_number}"))
+        }
+        (Some(PlaceholderRuleOrigin::Custom), None) => Some("custom rule".to_owned()),
+        (None, Some(rule_number)) => Some(format!("rule {rule_number}")),
+        (None, None) => None,
+    }
+}
+
+fn placeholder_problem_rules(problem: &PlaceholderIssue) -> Option<String> {
+    let rules: Vec<String> = match problem {
+        PlaceholderIssue::PatternMatch {
+            rule_origin,
+            rule_number,
+            ..
+        } => placeholder_rule_label(*rule_origin, *rule_number)
+            .into_iter()
+            .collect(),
+        PlaceholderIssue::EmptyMatch {
+            rule_origin,
+            rule_number,
+            ..
+        }
+        | PlaceholderIssue::CrossesLineBoundary {
+            rule_origin,
+            rule_number,
+            ..
+        } => placeholder_rule_label(Some(*rule_origin), *rule_number)
+            .into_iter()
+            .collect(),
+        PlaceholderIssue::MissingTextCapture { rule_number, .. }
+        | PlaceholderIssue::InvalidMatchRange { rule_number, .. } => {
+            vec![format!("custom rule {rule_number}")]
+        }
+        PlaceholderIssue::OverlappingMatches {
+            first_origin,
+            first_rule_number,
+            second_origin,
+            second_rule_number,
+            ..
+        } => [
+            placeholder_rule_label(Some(*first_origin), *first_rule_number),
+            placeholder_rule_label(Some(*second_origin), *second_rule_number),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+        PlaceholderIssue::WorkerStart { .. } | PlaceholderIssue::ReservedTokenNamespace { .. } => {
+            Vec::new()
+        }
+    };
+    (!rules.is_empty()).then(|| rules.join(" + "))
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -6340,7 +6461,6 @@ impl RpgMakerIssue {
         }
     }
 
-    #[cfg(test)]
     pub(crate) const fn placeholder_planning(
         rule_source: PlaceholderRuleSource,
         unit: RpgMakerUnitLocator,
@@ -6356,7 +6476,6 @@ impl RpgMakerIssue {
         }
     }
 
-    #[cfg(test)]
     pub(crate) const fn placeholder_projection(
         rule_source: PlaceholderRuleSource,
         unit: RpgMakerUnitLocator,
@@ -6709,10 +6828,14 @@ impl RpgMakerIssue {
                 }
             },
             RpgMakerProblem::Extraction { problem } => problem.subject(),
-            RpgMakerProblem::PlaceholderPlanning { unit, .. }
-            | RpgMakerProblem::PlaceholderProjection { unit, .. } => {
-                format!("{}:{}", unit.owner.as_str(), unit.group_kind.as_str())
-            }
+            RpgMakerProblem::PlaceholderPlanning {
+                rule_source,
+                unit,
+                problem,
+            } => unit.placeholder_subject(rule_source, placeholder_problem_rules(problem)),
+            RpgMakerProblem::PlaceholderProjection {
+                rule_source, unit, ..
+            } => unit.placeholder_subject(rule_source, None),
             RpgMakerProblem::ResponseProcessing { scope, .. }
             | RpgMakerProblem::TaskResponse { scope, .. } => scope.subject(),
             RpgMakerProblem::ResultStore { problem } => problem.subject(),
@@ -6982,6 +7105,69 @@ mod tests {
         assert!(facts.contains(&("source", "data:Actors.json".to_owned())));
         assert!(facts.contains(&("location_steps", "key:name".to_owned())));
         assert!(facts.contains(&("role", "scalar:name".to_owned())));
+        let subject = issue.subject();
+        for expected in [
+            "Actors.json:name",
+            "role=scalar:name",
+            "Placeholder=project snapshot",
+            "custom rule 7",
+        ] {
+            assert!(
+                subject.contains(expected),
+                "object 缺少 {expected:?}：{subject}"
+            );
+        }
+        assert!(
+            !subject.contains("4..12"),
+            "object 不得显示字节范围：{subject}"
+        );
+    }
+
+    #[test]
+    fn overlapping_placeholder_subject_names_unit_source_file_and_both_natural_rules() {
+        let issue = RpgMakerIssue::placeholder_planning(
+            PlaceholderRuleSource::external_file("C:/input/placeholders.toml"),
+            RpgMakerUnitLocator::new(
+                RpgMakerDiagnosticOwner::Builtin,
+                RpgMakerDiagnosticGroupKind::DatabaseEntry,
+                RpgMakerDiagnosticLocation::new(
+                    RpgMakerDiagnosticSource::data("Items.json"),
+                    vec![
+                        RpgMakerDiagnosticLocationStep::array_index(2),
+                        RpgMakerDiagnosticLocationStep::object_key("description"),
+                    ],
+                ),
+                RpgMakerDiagnosticRole::scalar("description"),
+            ),
+            PlaceholderIssue::OverlappingMatches {
+                first_origin: PlaceholderRuleOrigin::Builtin,
+                first_rule_number: None,
+                first_range: ByteRange::new(7, 14).expect("有效范围"),
+                second_origin: PlaceholderRuleOrigin::Custom,
+                second_rule_number: Some(1),
+                second_range: ByteRange::new(7, 14).expect("有效范围"),
+            },
+        );
+
+        let subject = issue.subject();
+        for expected in [
+            "Items.json[2]:description",
+            "role=scalar:description",
+            "C:/input/placeholders.toml",
+            "builtin",
+            "custom rule 1",
+        ] {
+            assert!(
+                subject.contains(expected),
+                "object 缺少 {expected:?}：{subject}"
+            );
+        }
+        for forbidden in ["7..14", "first_range", "second_range"] {
+            assert!(
+                !subject.contains(forbidden),
+                "object 不得显示内部范围 {forbidden:?}：{subject}"
+            );
+        }
     }
 
     #[test]
@@ -7006,6 +7192,17 @@ mod tests {
         assert_eq!(issue.resolution(), DiagnosticResolution::ReportBug);
         assert!(issue.facts().contains(&("expected", "2".to_owned())));
         assert!(issue.facts().contains(&("actual", "1".to_owned())));
+        let subject = issue.subject();
+        for expected in [
+            "Map002.json[7]",
+            "role=dialogue_body",
+            "Placeholder=project snapshot",
+        ] {
+            assert!(
+                subject.contains(expected),
+                "object 缺少 {expected:?}：{subject}"
+            );
+        }
     }
 
     #[test]

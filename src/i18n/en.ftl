@@ -314,6 +314,7 @@ manual-value = { $code ->
     [rerun_export] Rerun manual export
     [rerun_export_without_controls] Rerun manual export and do not put line breaks or NUL in array items
     [rerun_export_then_fill] Rerun manual export, then fill in the translation
+    [resolve_temporary_then_rerun_export] Resolve the displayed fixed temporary path, remove any leftover object there, then rerun manual export
     [keep_exported_type] Keep the type written by manual export
    *[other] __ATT_FALLBACK__
 }

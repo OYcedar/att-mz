@@ -46,6 +46,7 @@ pub(crate) struct ProjectLuaCallError {
     engine: Option<LuaEngine>,
     operation: Option<LuaOperation>,
     field: Option<crate::diagnostic::SafeIdentifier>,
+    cleanup_failures: Vec<ProjectLuaCallError>,
 }
 
 #[derive(Clone, Debug)]
@@ -80,6 +81,7 @@ impl ProjectLuaCallError {
             engine: None,
             operation: None,
             field: None,
+            cleanup_failures: Vec::new(),
         }
     }
 
@@ -89,6 +91,7 @@ impl ProjectLuaCallError {
             engine: None,
             operation: None,
             field: None,
+            cleanup_failures: Vec::new(),
         }
     }
 
@@ -101,7 +104,13 @@ impl ProjectLuaCallError {
             engine: None,
             operation: None,
             field: None,
+            cleanup_failures: Vec::new(),
         }
+    }
+
+    fn with_cleanup_failure(mut self, cleanup: ProjectLuaCallError) -> Self {
+        self.cleanup_failures.push(cleanup);
+        self
     }
 
     pub(crate) fn with_field(mut self, field: impl AsRef<str>) -> Self {
@@ -119,7 +128,24 @@ impl ProjectLuaCallError {
         self
     }
 
-    pub(crate) const fn kind(&self) -> &'static str {
+    fn primary_is_cancelled(&self) -> bool {
+        match &self.issue {
+            ProjectLuaCallIssue::Cancelled => true,
+            ProjectLuaCallIssue::Sqlite { source, .. } => {
+                source.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted)
+            }
+            ProjectLuaCallIssue::Violation(_) => false,
+        }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cleanup_failures.is_empty() && self.primary_is_cancelled()
+    }
+
+    pub(crate) fn kind(&self) -> &'static str {
+        if !self.cleanup_failures.is_empty() {
+            return "cleanup_failed";
+        }
         match self.issue {
             ProjectLuaCallIssue::Cancelled => "cancelled",
             ProjectLuaCallIssue::Violation(LuaValueViolation::UnknownUnit) => "unit_not_found",
@@ -132,11 +158,15 @@ impl ProjectLuaCallError {
                 "transaction_open"
             }
             ProjectLuaCallIssue::Violation(_) => "invalid_value",
+            ProjectLuaCallIssue::Sqlite { .. } if self.primary_is_cancelled() => "cancelled",
             ProjectLuaCallIssue::Sqlite { .. } => "sqlite",
         }
     }
 
-    pub(crate) const fn message(&self) -> &'static str {
+    pub(crate) fn message(&self) -> &'static str {
+        if !self.cleanup_failures.is_empty() {
+            return "Lua 调用失败，且保存点清理失败";
+        }
         match self.issue {
             ProjectLuaCallIssue::Cancelled => "Lua 调用已取消",
             ProjectLuaCallIssue::Violation(LuaValueViolation::UnknownUnit) => "目标 Unit 不存在",
@@ -151,6 +181,7 @@ impl ProjectLuaCallError {
                 "Lua 脚本结束时仍有未关闭事务"
             }
             ProjectLuaCallIssue::Violation(_) => "Lua 参数或项目状态无效",
+            ProjectLuaCallIssue::Sqlite { .. } if self.primary_is_cancelled() => "Lua 调用已取消",
             ProjectLuaCallIssue::Sqlite { .. } => "SQLite 调用失败",
         }
     }
@@ -580,6 +611,10 @@ impl ProjectLuaSqliteError {
             source: Arc::new(source),
         }
     }
+
+    fn is_cancelled(&self) -> bool {
+        self.source.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted)
+    }
 }
 
 impl fmt::Display for ProjectLuaSqliteError {
@@ -674,6 +709,14 @@ impl Error for ProjectLuaFailure {
 }
 
 impl ProjectLuaFailure {
+    fn into_typed_cancellation(self) -> Self {
+        match &self {
+            Self::Host(source) if source.is_cancelled() => Self::Cancelled,
+            Self::Database(source) if source.is_cancelled() => Self::Cancelled,
+            _ => self,
+        }
+    }
+
     /// 脚本预检尚未建立写事务；数据库类错误仍使用调用方提供的真实项目路径。
     pub(crate) fn preflight_diagnostic_report(
         &self,
@@ -810,53 +853,71 @@ fn failure_report(
                 problem: script_problem(*failure),
             })),
         ),
-        ProjectLuaFailure::Host(source) => match &source.issue {
-            ProjectLuaCallIssue::Sqlite { failure, .. } => DiagnosticReport::new(
-                effect,
-                Diagnostic::sqlite(SqliteIssue::new(
-                    SqliteDiagnosticContext::new(
-                        SqliteDiagnosticStage::Lua,
-                        source
-                            .operation
-                            .map_or(SqliteOperation::Execute, lua_sqlite_operation),
-                        transaction,
-                    ),
-                    SqliteProblem::Driver {
-                        database: SafePath::new(database_path),
-                        query_id: None,
-                        query_ordinal: None,
-                        failure: failure.clone(),
-                    },
-                )),
-            ),
-            ProjectLuaCallIssue::Cancelled => DiagnosticReport::new(
-                effect,
-                Diagnostic::lua(LuaIssue::new(LuaProblem::Cancelled)),
-            ),
-            ProjectLuaCallIssue::Violation(violation) => match (source.engine, source.operation) {
-                (Some(engine), Some(operation)) => DiagnosticReport::new(
-                    effect,
-                    Diagnostic::lua(LuaIssue::new(LuaProblem::HostCall {
-                        engine,
-                        operation,
-                        violation: *violation,
-                        field: source.field.clone(),
-                        placeholder: None,
-                    })),
-                ),
-                _ => DiagnosticReport::new(
-                    effect,
-                    Diagnostic::lua(LuaIssue::new(LuaProblem::ContextCreation {
-                        problem: LuaContextProblem::ContextTable,
-                    })),
-                ),
-            },
-        },
+        ProjectLuaFailure::Host(source) => {
+            host_failure_report(source, database_path, effect, transaction)
+        }
         ProjectLuaFailure::Panicked => DiagnosticReport::new(
             effect,
             Diagnostic::lua(LuaIssue::new(LuaProblem::WorkerPanicked)),
         ),
     }
+}
+
+fn host_failure_report(
+    source: &ProjectLuaCallError,
+    database_path: &std::path::Path,
+    effect: StateEffect,
+    transaction: SqliteTransactionState,
+) -> DiagnosticReport {
+    let mut report = match &source.issue {
+        ProjectLuaCallIssue::Sqlite { failure, .. } => DiagnosticReport::new(
+            effect,
+            Diagnostic::sqlite(SqliteIssue::new(
+                SqliteDiagnosticContext::new(
+                    SqliteDiagnosticStage::Lua,
+                    source
+                        .operation
+                        .map_or(SqliteOperation::Execute, lua_sqlite_operation),
+                    transaction,
+                ),
+                SqliteProblem::Driver {
+                    database: SafePath::new(database_path),
+                    query_id: None,
+                    query_ordinal: None,
+                    failure: failure.clone(),
+                },
+            )),
+        ),
+        ProjectLuaCallIssue::Cancelled => DiagnosticReport::new(
+            effect,
+            Diagnostic::lua(LuaIssue::new(LuaProblem::Cancelled)),
+        ),
+        ProjectLuaCallIssue::Violation(violation) => match (source.engine, source.operation) {
+            (Some(engine), Some(operation)) => DiagnosticReport::new(
+                effect,
+                Diagnostic::lua(LuaIssue::new(LuaProblem::HostCall {
+                    engine,
+                    operation,
+                    violation: *violation,
+                    field: source.field.clone(),
+                    placeholder: None,
+                })),
+            ),
+            _ => DiagnosticReport::new(
+                effect,
+                Diagnostic::lua(LuaIssue::new(LuaProblem::ContextCreation {
+                    problem: LuaContextProblem::ContextTable,
+                })),
+            ),
+        },
+    };
+    for cleanup in &source.cleanup_failures {
+        report = report.with_related(
+            RelatedFailureRelation::Cleanup,
+            host_failure_report(cleanup, database_path, effect, transaction),
+        );
+    }
+    report
 }
 
 fn sqlite_report(
@@ -958,6 +1019,28 @@ const fn lua_sqlite_operation(operation: LuaOperation) -> SqliteOperation {
     }
 }
 
+fn rollback_translation_api_savepoint(
+    connection: &Connection,
+    engine: LuaEngine,
+    failure: ProjectLuaCallError,
+) -> ProjectLuaCallError {
+    if let Err(source) = connection.execute_batch("ROLLBACK TO att_translation_api") {
+        return failure.with_cleanup_failure(
+            ProjectLuaCallError::sqlite(source)
+                .with_engine(engine)
+                .with_operation(LuaOperation::RollbackTransaction),
+        );
+    }
+    if let Err(source) = connection.execute_batch("RELEASE att_translation_api") {
+        return failure.with_cleanup_failure(
+            ProjectLuaCallError::sqlite(source)
+                .with_engine(engine)
+                .with_operation(LuaOperation::RollbackTransaction),
+        );
+    }
+    failure
+}
+
 /// 在调用方已经打开的项目数据库上运行脚本。
 ///
 /// 调用方应在进入本函数前取得项目排他租约，并在阻塞 worker 中调用。连接被本函数
@@ -971,7 +1054,7 @@ pub(crate) fn run_project_lua(
     }
 
     let prepared = prepare_lua(connection, &request, LUA_CANCEL_CHECK_INSTRUCTIONS)
-        .map_err(ProjectLuaRunError::NotStarted)?;
+        .map_err(|failure| ProjectLuaRunError::NotStarted(failure.into_typed_cancellation()))?;
     execute_prepared(prepared, request)
 }
 
@@ -984,17 +1067,18 @@ fn execute_prepared(
         function,
         connection,
         script_identity,
+        hook_cancelled,
     } = prepared;
 
     request
         .cancellation
         .register_interrupt(connection.borrow().get_interrupt_handle())
-        .map_err(ProjectLuaRunError::NotStarted)?;
+        .map_err(|failure| ProjectLuaRunError::NotStarted(failure.into_typed_cancellation()))?;
     let _sqlite_cancellation_guard =
         install_sqlite_cancellation(Rc::clone(&connection), request.cancellation.clone()).map_err(
             |failure| {
                 request.cancellation.unregister_interrupt();
-                ProjectLuaRunError::NotStarted(failure)
+                ProjectLuaRunError::NotStarted(failure.into_typed_cancellation())
             },
         )?;
 
@@ -1015,17 +1099,13 @@ fn execute_prepared(
             function,
             &script_identity,
             project_lua_engine(&request.project),
-            &request.cancellation,
+            &hook_cancelled,
         )
     }));
     let failure = match execution {
         Ok(Ok(())) if request.cancellation.is_cancelled() => Some(ProjectLuaFailure::Cancelled),
         Ok(Ok(())) => None,
-        Ok(Err(failure)) => Some(if request.cancellation.is_cancelled() {
-            ProjectLuaFailure::Cancelled
-        } else {
-            failure
-        }),
+        Ok(Err(failure)) => Some(failure),
         Err(_) => Some(ProjectLuaFailure::Panicked),
     };
     if let Some(failure) = failure {
@@ -1068,7 +1148,7 @@ fn rollback_after_failure(
     let _ = disable_script_authorizer(&connection.borrow());
     disable_sqlite_cancellation(&connection.borrow());
     cancellation.unregister_interrupt();
-    rollback(connection, failure)
+    rollback(connection, failure.into_typed_cancellation())
 }
 
 fn rollback(

@@ -534,6 +534,249 @@ fn generic_fixed_http_503_is_unavailable_and_preserves_the_structured_status() {
 }
 
 #[test]
+fn generic_fatal_http_error_fails_and_stops_unscheduled_tasks() {
+    let temporary = tempfile::tempdir().expect("应可建立 HTTP 400 进程测试目录");
+    let root = temporary.path();
+    let input = root.join("input");
+    fs::create_dir(&input).expect("应可建立 Generic 输入目录");
+    fs::write(
+        input.join("first.jsonl"),
+        "{\"id\":\"first\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"line\",\"text\":\"こんにちは\"}]}\n",
+    )
+    .expect("应可写入第一个 Generic TaskBlock");
+    fs::write(
+        input.join("second.jsonl"),
+        "{\"id\":\"second\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"line\",\"text\":\"さようなら\"}]}\n",
+    )
+    .expect("应可写入第二个 Generic TaskBlock");
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("本地 HTTP 400 服务应可绑定");
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().expect("HTTP 400 服务地址应可读取")
+    );
+    let server = thread::spawn(move || serve_single_http_400(listener));
+    let distribution = write_distribution(root, &http_configuration(&endpoint, 1));
+    let project = "generic-http-400-fatal";
+    assert_success(
+        "HTTP 400 Generic Init",
+        &run_att(
+            root,
+            &[
+                "generic",
+                "init",
+                "--name",
+                project,
+                "--path",
+                input.to_str().expect("临时路径应是 Unicode"),
+                "--source-language",
+                "ja",
+                "--target-language",
+                "zh-Hans",
+            ],
+        ),
+    );
+    assert_success(
+        "HTTP 400 Generic Extract",
+        &run_att(root, &["generic", "extract", "--name", project]),
+    );
+
+    let logs_root = distribution
+        .join("projects/generic")
+        .join(project)
+        .join("logs");
+    let before = jsonl_files(&logs_root);
+    let translate = run_att(root, &["generic", "translate", "--name", project, "local"]);
+    assert_eq!(
+        translate.status.code(),
+        Some(1),
+        "Fatal HTTP 400 必须使 Generic Translate 失败：{}",
+        String::from_utf8_lossy(&translate.stderr)
+    );
+    server
+        .join()
+        .expect("HTTP 400 服务线程不得 panic")
+        .expect("Fatal 后不得再发送下一项任务");
+
+    let logs = jsonl_files(&logs_root)
+        .into_iter()
+        .filter(|path| !before.contains(path))
+        .collect::<Vec<_>>();
+    assert_eq!(logs.len(), 1, "Fatal Translate 必须新建一份运行日志");
+    let (log, records) = read_jsonl_records(&logs[0]);
+    assert_log_has_only_readable_diagnostics(&log, &records);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["event"] == "task.started")
+            .count(),
+        1,
+        "串行执行的首个 Fatal 必须阻止后续任务开始：{log}"
+    );
+    let task_finished = records
+        .iter()
+        .find(|record| record["event"] == "task.finished")
+        .expect("Fatal 任务必须有终态");
+    assert_eq!(task_finished["payload"]["outcome"]["kind"], "failed");
+
+    let translation = records
+        .iter()
+        .filter(|record| record["event"] == "translation.finished")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        translation.len(),
+        1,
+        "Translate 必须只有一个翻译终态：{log}"
+    );
+    let result = &translation[0]["payload"]["result"];
+    assert_eq!(result["kind"], "failed");
+    assert_eq!(
+        result["tasks"],
+        serde_json::json!({
+            "planned": 2,
+            "started": 1,
+            "complete": 0,
+            "partial": 0,
+            "unavailable": 0,
+            "failed": 1,
+            "cancelled": 0,
+            "not_started": 1,
+        })
+    );
+    assert_eq!(result["summary"]["engine"], "generic");
+    assert_eq!(
+        records.last().expect("Fatal 日志不得为空")["payload"]["result"],
+        serde_json::json!({"kind": "failed"})
+    );
+}
+
+#[test]
+fn generic_failure_after_resource_commit_keeps_saved_plan_and_summary() {
+    let temporary = tempfile::tempdir().expect("应可建立资源提交后失败测试目录");
+    let root = temporary.path();
+    let input = root.join("input");
+    fs::create_dir(&input).expect("应可建立 Generic 输入目录");
+    fs::write(
+        input.join("story.jsonl"),
+        "{\"id\":\"story\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"line\",\"text\":\"こんにちは\"}]}\n",
+    )
+    .expect("应可写入 Generic JSONL");
+    let placeholders = root.join("placeholders.toml");
+    fs::write(&placeholders, "[[rule]]\npattern = 'NEVER_MATCH'\n")
+        .expect("应可写入变更后的 Placeholder 规则");
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("Provider spy 应可绑定");
+    listener
+        .set_nonblocking(true)
+        .expect("Provider spy 应可设为非阻塞");
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().expect("Provider spy 地址应可读取")
+    );
+    let missing_pem = root
+        .join("missing.pem")
+        .to_string_lossy()
+        .replace('\\', "\\\\");
+    let configuration = http_configuration(&endpoint, 10_000).replace(
+        "additional_pem_files = []",
+        &format!("additional_pem_files = [\"{missing_pem}\"]"),
+    );
+    let distribution = write_distribution(root, &configuration);
+    let project = "generic-saved-resource-before-failure";
+    assert_success(
+        "资源失败 Generic Init",
+        &run_att(
+            root,
+            &[
+                "generic",
+                "init",
+                "--name",
+                project,
+                "--path",
+                input.to_str().expect("临时路径应是 Unicode"),
+                "--source-language",
+                "ja",
+                "--target-language",
+                "zh-Hans",
+            ],
+        ),
+    );
+    assert_success(
+        "资源失败 Generic Extract",
+        &run_att(root, &["generic", "extract", "--name", project]),
+    );
+    let workspace = distribution.join("projects/generic").join(project);
+    let database = workspace.join("project.db");
+    let database_before = fs::read(&database).expect("Translate 前数据库应可读取");
+    let logs_root = workspace.join("logs");
+    let before = jsonl_files(&logs_root);
+
+    let translate = run_att(
+        root,
+        &[
+            "generic",
+            "translate",
+            "--name",
+            project,
+            "local",
+            "--placeholders",
+            placeholders.to_str().expect("Placeholder 路径应是 Unicode"),
+        ],
+    );
+    assert_eq!(
+        translate.status.code(),
+        Some(1),
+        "资源已经提交后，缺失 PEM 仍必须明确失败"
+    );
+    assert_ne!(
+        fs::read(&database).expect("失败后数据库应可读取"),
+        database_before,
+        "Placeholder 资源提交不得被后续 PEM 失败伪报为未保存"
+    );
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+        "PEM 准备失败前不得发送模型请求"
+    );
+
+    let logs = jsonl_files(&logs_root)
+        .into_iter()
+        .filter(|path| !before.contains(path))
+        .collect::<Vec<_>>();
+    assert_eq!(logs.len(), 1, "失败 Translate 必须新建一份运行日志");
+    let (log, records) = read_jsonl_records(&logs[0]);
+    let finalized = records
+        .iter()
+        .find(|record| record["event"] == "run_plan.finalized")
+        .expect("已提交资源必须有 run plan 终态");
+    assert_eq!(
+        finalized["payload"]["result"],
+        serde_json::json!({
+            "kind": "saved",
+            "transaction": "committed",
+            "run_continues": false,
+        }),
+        "后续失败不得把已提交资源写成 not_saved：{log}"
+    );
+    let translation = records
+        .iter()
+        .find(|record| record["event"] == "translation.finished")
+        .expect("失败 Translate 必须有翻译终态");
+    assert_eq!(translation["payload"]["result"]["kind"], "failed");
+    assert_eq!(
+        translation["payload"]["result"]["summary"]["engine"], "generic",
+        "后续失败不得丢失已经建立的 Generic summary：{log}"
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["event"] == "translation.finished")
+            .count(),
+        1,
+        "失败 Translate 必须只有一个翻译终态：{log}"
+    );
+}
+
+#[test]
 #[allow(clippy::permissions_set_readonly_false)]
 fn generic_write_back_reports_recovery_required_after_publish_cleanup_failure() {
     let temporary = tempfile::tempdir().expect("应可建立发布收尾失败进程测试目录");
@@ -836,9 +1079,20 @@ fn generic_cancellation_finishes_started_tasks_and_counts_unstarted_tasks() {
     );
     let result = &translation_finished[0]["payload"]["result"];
     assert_eq!(result["kind"], "cancelled");
-    assert!(
-        result["summary"].is_null(),
-        "取消终态不得伪造业务汇总：{log}"
+    assert_eq!(
+        result["summary"],
+        serde_json::json!({
+            "engine": "generic",
+            "summary": {
+                "cleared_units": 0,
+                "reused_units": 0,
+                "accepted_units": 0,
+                "written_units": 0,
+                "conflicted_units": 0,
+                "response_problems": 0,
+            },
+        }),
+        "取消终态必须保存已确认的全零 Generic 业务汇总：{log}"
     );
     let tasks = &result["tasks"];
     let planned = tasks["planned"].as_u64().expect("planned 必须是 u64");
@@ -1000,6 +1254,38 @@ fn serve_http_503(listener: TcpListener) -> Result<(), String> {
     stream
         .flush()
         .map_err(|error| format!("刷新 HTTP 503 响应失败：{error}"))
+}
+
+fn serve_single_http_400(listener: TcpListener) -> Result<(), String> {
+    let (mut stream, _) = listener
+        .accept()
+        .map_err(|error| format!("接受 HTTP 400 请求失败：{error}"))?;
+    read_http_request(&mut stream)?;
+    let body = r#"{"error":{"code":"bad_request","type":"invalid_request_error","message":"invalid request"}}"#;
+    write!(
+        stream,
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .map_err(|error| format!("写入 HTTP 400 响应失败：{error}"))?;
+    stream
+        .flush()
+        .map_err(|error| format!("刷新 HTTP 400 响应失败：{error}"))?;
+    drop(stream);
+
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("设置 HTTP 400 listener 非阻塞失败：{error}"))?;
+    for _ in 0..20 {
+        match listener.accept() {
+            Ok(_) => return Err("Fatal 后仍发送了后续模型任务".to_owned()),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => return Err(format!("检查后续 HTTP 请求失败：{error}")),
+        }
+    }
+    Ok(())
 }
 
 fn serve_until_client_disconnect(

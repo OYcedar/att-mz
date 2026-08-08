@@ -2660,6 +2660,7 @@ fn project_log_contract_report(violation: ObservabilityContractViolation) -> Dia
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedTerminalDiagnostic {
     occurrences: Vec<DiagnosticOccurrence>,
+    report: DiagnosticReport,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2694,6 +2695,10 @@ impl PreparedTerminalDiagnostic {
             .first()
             .expect("终端诊断至少包含主问题")
             .id()
+    }
+
+    pub(crate) fn report(&self) -> &DiagnosticReport {
+        &self.report
     }
 }
 
@@ -2895,7 +2900,10 @@ impl ProjectLogger {
                 },
             );
         }
-        Ok(PreparedTerminalDiagnostic { occurrences })
+        Ok(PreparedTerminalDiagnostic {
+            occurrences,
+            report,
+        })
     }
 
     pub(crate) fn health(&self) -> ProjectLogHealthSnapshot {

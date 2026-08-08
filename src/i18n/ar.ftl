@@ -322,6 +322,7 @@ manual-value = { $code ->
     [rerun_export] أعد تشغيل manual export
     [rerun_export_without_controls] أعد تشغيل manual export ولا تضع أسطرًا جديدة أو NUL في عناصر المصفوفة
     [rerun_export_then_fill] أعد تشغيل manual export ثم املأ الترجمة
+    [resolve_temporary_then_rerun_export] عالج المسار المؤقت الثابت المعروض، واحذف أي عنصر متبقٍ فيه، ثم أعد تشغيل manual export
     [keep_exported_type] احتفظ بقيمة type التي كتبها manual export
    *[other] __ATT_FALLBACK__
 }

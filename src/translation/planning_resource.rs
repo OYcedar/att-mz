@@ -835,6 +835,7 @@ struct CancellableSliceReader<'a, C: ?Sized> {
     source: &'a [u8],
     offset: usize,
     cancellation: &'a C,
+    cancelled: bool,
 }
 
 impl<'a, C: PlanningResourceCancellation + ?Sized> CancellableSliceReader<'a, C> {
@@ -843,6 +844,7 @@ impl<'a, C: PlanningResourceCancellation + ?Sized> CancellableSliceReader<'a, C>
             source,
             offset: 0,
             cancellation,
+            cancelled: false,
         }
     }
 }
@@ -852,6 +854,7 @@ impl<C: PlanningResourceCancellation + ?Sized> Read for CancellableSliceReader<'
         if self.cancellation.is_cancelled() {
             // `Read` 调用方会自动重试 `Interrupted`；取消必须返回不可重试错误，
             // 否则 serde_json 会在同一个读取点永久循环。
+            self.cancelled = true;
             return Err(io::Error::other("翻译资源解析已取消"));
         }
         if self.offset == self.source.len() || buffer.is_empty() {
@@ -969,10 +972,13 @@ fn parse_terminology_snapshot_with_cancellation(
     let source = CancellableSliceReader::new(json.as_bytes(), cancellation);
     let mut reader = BufReader::with_capacity(PLANNING_RESOURCE_CANCEL_CHECK_BYTES, source);
     let result = serde_json::from_reader(&mut reader);
-    if cancellation.is_cancelled() {
-        Err(TerminologyDefinitionError::Cancelled)
-    } else {
-        result.map_err(TerminologyDefinitionError::InvalidSnapshot)
+    if reader.get_ref().cancelled {
+        return Err(TerminologyDefinitionError::Cancelled);
+    }
+    match result {
+        Ok(_entries) if cancellation.is_cancelled() => Err(TerminologyDefinitionError::Cancelled),
+        Ok(entries) => Ok(entries),
+        Err(source) => Err(TerminologyDefinitionError::InvalidSnapshot(source)),
     }
 }
 
@@ -1016,10 +1022,15 @@ fn parse_placeholder_snapshot_with_cancellation(
     let source = CancellableSliceReader::new(json.as_bytes(), cancellation);
     let mut reader = BufReader::with_capacity(PLANNING_RESOURCE_CANCEL_CHECK_BYTES, source);
     let result = serde_json::from_reader(&mut reader);
-    if cancellation.is_cancelled() {
-        Err(PlaceholderDefinitionError::Cancelled)
-    } else {
-        result.map_err(PlaceholderDefinitionError::InvalidSnapshot)
+    if reader.get_ref().cancelled {
+        return Err(PlaceholderDefinitionError::Cancelled);
+    }
+    match result {
+        Ok(_definitions) if cancellation.is_cancelled() => {
+            Err(PlaceholderDefinitionError::Cancelled)
+        }
+        Ok(definitions) => Ok(definitions),
+        Err(source) => Err(PlaceholderDefinitionError::InvalidSnapshot(source)),
     }
 }
 
@@ -2102,6 +2113,23 @@ mod tests {
         assert!(matches!(
             parse_terminology_snapshot_with_cancellation(&json, &|| cancellation.is_cancelled()),
             Err(TerminologyDefinitionError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn invalid_snapshots_are_not_reclassified_by_a_later_cancellation_poll() {
+        let terminology_cancellation = CancelAtPoll::new(1);
+        assert!(matches!(
+            parse_terminology_snapshot_with_cancellation("not-json", &|| terminology_cancellation
+                .is_cancelled()),
+            Err(TerminologyDefinitionError::InvalidSnapshot(_))
+        ));
+
+        let placeholder_cancellation = CancelAtPoll::new(1);
+        assert!(matches!(
+            parse_placeholder_snapshot_with_cancellation("not-json", &|| placeholder_cancellation
+                .is_cancelled()),
+            Err(PlaceholderDefinitionError::InvalidSnapshot(_))
         ));
     }
 

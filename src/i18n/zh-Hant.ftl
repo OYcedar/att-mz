@@ -308,6 +308,7 @@ manual-value = { $code ->
     [rerun_export] 重新執行 manual export
     [rerun_export_without_controls] 重新執行 manual export，不要把換行或 NUL 寫進陣列項目
     [rerun_export_then_fill] 重新執行 manual export 後再填寫譯文
+    [resolve_temporary_then_rerun_export] 處理顯示的固定暫存路徑；如有遺留物件，請將其移除，然後重新執行 manual export
     [keep_exported_type] 保留 manual export 產生的 type
    *[other] __ATT_FALLBACK__
 }
