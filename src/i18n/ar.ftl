@@ -7,7 +7,11 @@ cli-init-about = تهيئة مشروع ترجمة مسمى أو تحديثه
 cli-extract-about = مزامنة النص المصدر من مدخل المشروع الحالي
 cli-translate-about = ترجمة النص المستخرج باستخدام Profile صريح أو محفوظ
 cli-write-back-about = كتابة الترجمات الحالية إلى مخرجات المشروع
-cli-project-lua-about = تشغيل Lua ذري لقاعدة البيانات مرة واحدة داخل المشروع
+cli-manual-about = إدارة الترجمات اليدوية في ملف TOML قابل للتحرير
+cli-manual-export-about = تصدير العناصر التي تحتاج حاليًا إلى ترجمة يدوية
+cli-manual-check-about = فحص ملف TOML للترجمات اليدوية دون تعديل المشروع
+cli-manual-apply-about = تطبيق الترجمات اليدوية المكتملة والصحيحة
+cli-project-lua-about = تشغيل برنامج Lua نصي على قاعدة بيانات المشروع
 cli-project-name-help = اسم المشروع الثابت
 cli-init-path-help = دليل جذر الإدخال؛ يمكن للمشروع الموجود إعادة استخدام آخر مسار ناجح
 cli-source-language-help = معرّف لغة المصدر
@@ -21,8 +25,9 @@ cli-dialogue-rules-help = استبدال إسقاط أسماء حوار MV ال�
 cli-profile-help = معرّف Profile للترجمة؛ يؤدي حذفه إلى إعادة استخدام آخر Profile ناجح
 cli-terms-help = استبدال مورد مصطلحات المشروع
 cli-placeholders-help = استبدال مورد Placeholder للمشروع
-cli-project-lua-script-help = برنامج Lua ذري لقاعدة البيانات يُشغّل مرة واحدة
+cli-project-lua-script-help = برنامج Lua النصي المطلوب تشغيله على قاعدة بيانات المشروع
 cli-project-lua-arguments-help = وسيطة UTF-8 تمرر إلى Lua arg[1..] بعد --
+cli-manual-file-help = ملف TOML للترجمات اليدوية
 cli-usage-heading = الاستخدام:
 cli-commands-heading = الأوامر:
 cli-options-heading = الخيارات:
@@ -120,9 +125,7 @@ log-run-failed = فشل الأمر { $command }.
 log-run-outcome-unknown = انتهى الأمر { $command } لكن النتيجة النهائية غير معروفة؛ اتبع مواقع الاسترداد الواردة في الخطأ.
 log-run-cancelled = أُلغي الأمر { $command }.
 log-performance-counters = عدادات الأداء: محاولات التحكم في معاملات SQLite‏ { $sqlite_control_attempted_total }؛ بدء التحقق الكامل من شجرة المرشح { $candidate_validation_started }، واكتماله { $candidate_validation_completed }.
-log-lua-script = برنامج Lua النصي { $identity } ‏(SHA-256 { $fingerprint }).
 log-lua-print = Lua: { $message }
-log-lua-summary = إحصاءات Lua: استدعاءات قاعدة البيانات { $database_calls }، والصفوف المعدلة { $changed_rows }، واستدعاءات الترجمة { $translation_calls }، وأسطر print‏ { $printed_lines }.
 log-plan-resolved = حُلّت خطة الأمر { $command } من { $source }.
 log-phase-started = بدأت المرحلة: { $phase }.
 log-retry-summary = { $count ->
@@ -178,51 +181,10 @@ log-task-outcome-value = { $outcome ->
     [cancelled] ملغاة
    *[other] انتهت دون نتيجة معروفة
 }
-diagnostic-title = خطأ [{ $code }]
-diagnostic-stage = المرحلة: { $stage }
 diagnostic-location = الموقع: { $subject }
 diagnostic-explanation = السبب: { $reason }
-diagnostic-effect = التأثير: { $impact }
 diagnostic-resolution = الإجراء: { $action }
 diagnostic-related = الخطأ المرتبط { $index }:
-diagnostic-relation-value = { $code ->
-    [cleanup] التنظيف
-    [rollback] التراجع
-    [discard] التخلص
-    [finalization] الإنهاء
-    [shutdown] الإغلاق
-    [observability] الرصد
-   *[other] { $code }
-}
-diagnostic-stage-value = { $code ->
-    [process_startup] بدء العملية
-    [process_output] إخراج العملية
-    [configuration] تحميل الإعدادات
-    [command_preparation] إعداد الأمر
-    [project_opening] فتح المشروع
-    [init] التهيئة
-    [extract] الاستخراج
-    [translate] الترجمة
-    [write_back] إعادة الكتابة
-    [lua] تنفيذ Lua للمشروع
-    [model_request] طلب النموذج
-    [run_plan_finalization] إنهاء خطة التشغيل
-    [publication] النشر
-    [shutdown] الإغلاق
-    [logging] سجل المشروع
-    [runtime] وقت التشغيل
-   *[other] __ATT_FALLBACK__
-}
-diagnostic-effect-value = { $code ->
-    [unchanged] لم تتغير الحالة
-    [progress_preserved] حُفظ التقدم الصالح
-    [applied] طُبقت الحالة
-    [applied_run_plan_not_saved] طُبقت الحالة، لكن لم تُحفظ خطة التشغيل
-    [applied_finalization_failed] طُبقت الحالة، لكن لم يكتمل الإنهاء
-    [recovery_required] يلزم الاسترداد قبل الوثوق بالحالة
-    [outcome_unknown] الحالة النهائية غير معروفة
-   *[other] __ATT_FALLBACK__
-}
 diagnostic-resolution-value = { $code ->
     [fix_configuration] صحح حقل الإعدادات المحدد ثم أعد المحاولة
     [fix_input] صحح الإدخال المحدد ثم أعد المحاولة
@@ -234,7 +196,7 @@ diagnostic-resolution-value = { $code ->
     [check_model_service] تحقق من استجابة خدمة النموذج وحدود الحساب
     [preserve_recovery_artifacts] لا تحذف عناصر الاسترداد المدرجة؛ استرد المخرجات قبل إعادة المحاولة
     [retry] أعد محاولة العملية
-    [report_bug] أبلغ عن عيب ATT هذا مع رمز الخطأ ومسار السجل
+    [report_bug] أبلغ عن عيب ATT هذا واشرح العملية التي كنت تنفذها
    *[other] __ATT_FALLBACK__
 }
 diagnostic-failure-value = { $code ->
@@ -373,16 +335,13 @@ task-record-parse-error = خطأ في التحليل: { $kind ->
 task-record-attempt-succeeded = المحاولة { $number }: نجحت؛ finish reason { $finish_reason }
 task-record-attempt-token-usage = ؛ الرموز `{ $prompt } / { $completion } / { $total }`
 task-record-attempt-duration = ؛ المدة `{ $duration }`
-task-record-attempt-request-id = ؛ request ID { $request_id }
-task-record-attempt-response-id = ؛ response ID { $response_id }
-task-record-attempt-retryable = المحاولة { $number }: فشل طلب قابل للإعادة؛ التشخيص `{ $code }`؛ المدة `{ $duration }`
+task-record-attempt-retryable = المحاولة { $number }: فشل طلب قابل للإعادة؛ المدة `{ $duration }`
 task-record-attempt-retry-after = ؛ Retry-After `{ $duration }`
 task-record-attempt-wait-retry = ؛ إعادة المحاولة بعد `{ $duration }`
 task-record-attempt-wait-completed = ؛ اكتمل الانتظار لمدة `{ $duration }`؛ لم تبدأ المحاولة التالية
 task-record-attempt-wait-cancelled = ؛ كان الانتظار المخطط `{ $duration }`؛ أُلغي أثناء الانتظار
-task-record-attempt-failed = المحاولة { $number }: فشل معالجة الطلب أو الاستجابة؛ التشخيص `{ $code }`؛ المدة `{ $duration }`
+task-record-attempt-failed = المحاولة { $number }: فشل معالجة الطلب أو الاستجابة؛ المدة `{ $duration }`
 task-record-attempt-cancelled = المحاولة { $number }: أُلغيت؛ المدة `{ $duration }`
-task-record-structured-reason = السبب: { $reason }
 task-record-final-status = الحالة: { $state ->
     [complete] مكتملة والتثبيت مؤكّد
     [partial] مكتملة جزئيًا والتثبيت مؤكّد
@@ -398,6 +357,6 @@ task-record-final-status = الحالة: { $state ->
 }
 task-record-accepted-written = المقبول: { $accepted } عناصر، كُتبت في { $written } مواضع فعلية
 task-record-accepted-outcome-unknown = تم التحقق من { $accepted } عناصر؛ تعذّر تأكيد نتيجة تثبيت قاعدة البيانات
-task-record-task-diagnostic = تشخيص المهمة: `{ $code }`؛ السبب { $reason }
+task-record-task-diagnostic = تشخيص المهمة
 task-record-duration-seconds = { $value } ثانية
 task-record-duration-milliseconds = { $value } مللي ثانية

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 验证当前 dist 是否可以作为公开 Windows x64 发行物。
 
@@ -296,11 +296,17 @@ if ($unexpectedDependencies.Count -gt 0) {
 Assert-MarkdownLinks
 
 $temporaryRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\', '/')
-$smokeRoot = Join-Path $temporaryRoot ('att-release-smoke-' + [System.Guid]::NewGuid().ToString('N'))
-$smokeCwd = Join-Path $temporaryRoot ('att-release-cwd-' + [System.Guid]::NewGuid().ToString('N'))
-$smokeInput = Join-Path $temporaryRoot ('att-release-input-' + [System.Guid]::NewGuid().ToString('N'))
-$cleanupPaths = @($smokeRoot, $smokeCwd, $smokeInput)
+$smokeWorkspace = Join-Path $temporaryRoot "att-release-check-$ExpectedVersion"
+$smokeRoot = Join-Path $smokeWorkspace 'distribution'
+$smokeCwd = Join-Path $smokeWorkspace 'cwd'
+$smokeInput = Join-Path $smokeWorkspace 'input'
+
+if (Test-Path -LiteralPath $smokeWorkspace) {
+    throw "发行检查无法开始：临时目录已存在：$smokeWorkspace。确认没有检查正在运行后删除该目录。"
+}
+
 try {
+    New-Item -ItemType Directory -Path $smokeWorkspace | Out-Null
     New-Item -ItemType Directory -Path $smokeRoot, $smokeCwd, $smokeInput | Out-Null
     foreach ($item in Get-ChildItem -LiteralPath $distributionRoot -Force) {
         Copy-Item -LiteralPath $item.FullName -Destination $smokeRoot -Recurse -Force
@@ -331,15 +337,13 @@ try {
 }
 finally {
     $prefix = $temporaryRoot + [System.IO.Path]::DirectorySeparatorChar
-    foreach ($path in $cleanupPaths) {
-        $candidate = [System.IO.Path]::GetFullPath($path)
-        if (-not $candidate.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-            throw "拒绝清理临时目录之外的路径：$candidate"
-        }
-        if (Test-Path -LiteralPath $candidate) {
-            Assert-NoReparsePoint -Path $candidate -Recurse
-            Remove-Item -LiteralPath $candidate -Recurse -Force
-        }
+    $candidate = [System.IO.Path]::GetFullPath($smokeWorkspace)
+    if (-not $candidate.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "拒绝清理临时目录之外的路径：$candidate"
+    }
+    if (Test-Path -LiteralPath $candidate) {
+        Assert-NoReparsePoint -Path $candidate -Recurse
+        Remove-Item -LiteralPath $candidate -Recurse -Force
     }
 }
 

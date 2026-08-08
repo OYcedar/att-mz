@@ -7,7 +7,11 @@ cli-init-about = Инициализировать или обновить име
 cli-extract-about = Синхронизировать исходный текст из текущего входа проекта
 cli-translate-about = Перевести извлечённый текст с явным или сохранённым Profile
 cli-write-back-about = Записать текущие переводы в выходной каталог проекта
-cli-project-lua-about = Однократно выполнить атомарный Lua для базы данных проекта
+cli-manual-about = Управлять ручными переводами в редактируемом TOML-файле
+cli-manual-export-about = Экспортировать строки, которым нужен ручной перевод
+cli-manual-check-about = Проверить TOML с ручными переводами без изменения проекта
+cli-manual-apply-about = Применить заполненные и корректные ручные переводы
+cli-project-lua-about = Выполнить Lua-скрипт над базой данных проекта
 cli-project-name-help = Стабильное имя проекта
 cli-init-path-help = Корневой входной каталог; существующий проект может повторно использовать последний успешный путь
 cli-source-language-help = ID исходного языка
@@ -21,8 +25,9 @@ cli-dialogue-rules-help = Заменить проекцию имён диало�
 cli-profile-help = ID Profile перевода; при отсутствии используется последний успешный Profile
 cli-terms-help = Заменить терминологический ресурс проекта
 cli-placeholders-help = Заменить ресурс Placeholder проекта
-cli-project-lua-script-help = Атомарная программа Lua для базы данных, выполняемая один раз
+cli-project-lua-script-help = Lua-скрипт для выполнения над базой данных проекта
 cli-project-lua-arguments-help = Аргумент UTF-8 для Lua arg[1..] после --
+cli-manual-file-help = TOML-файл с ручными переводами
 cli-usage-heading = Использование:
 cli-commands-heading = Команды:
 cli-options-heading = Параметры:
@@ -118,9 +123,7 @@ log-run-failed = Команда { $command } завершилась ошибко
 log-run-outcome-unknown = Команда { $command } завершилась, но итоговое состояние неизвестно; используйте пути восстановления из ошибки.
 log-run-cancelled = Команда { $command } отменена.
 log-performance-counters = Счётчики производительности: попыток управления транзакциями SQLite — { $sqlite_control_attempted_total }; полных проверок дерева-кандидата начато — { $candidate_validation_started }, завершено — { $candidate_validation_completed }.
-log-lua-script = Сценарий Lua { $identity } (SHA-256 { $fingerprint }).
 log-lua-print = Lua: { $message }
-log-lua-summary = Статистика Lua: вызовов базы данных — { $database_calls }, изменено строк — { $changed_rows }, вызовов перевода — { $translation_calls }, строк print — { $printed_lines }.
 log-plan-resolved = План команды { $command } получен из { $source }.
 log-phase-started = Этап начат: { $phase }.
 log-retry-summary = { $count ->
@@ -174,51 +177,10 @@ log-task-outcome-value = { $outcome ->
     [cancelled] отменена
    *[other] завершилась без распознанного результата
 }
-diagnostic-title = Ошибка [{ $code }]
-diagnostic-stage = Этап: { $stage }
 diagnostic-location = Место: { $subject }
 diagnostic-explanation = Причина: { $reason }
-diagnostic-effect = Последствия: { $impact }
 diagnostic-resolution = Действие: { $action }
 diagnostic-related = Связанная ошибка { $index }:
-diagnostic-relation-value = { $code ->
-    [cleanup] очистка
-    [rollback] откат
-    [discard] удаление
-    [finalization] завершение
-    [shutdown] остановка
-    [observability] наблюдаемость
-   *[other] { $code }
-}
-diagnostic-stage-value = { $code ->
-    [process_startup] Запуск процесса
-    [process_output] Вывод процесса
-    [configuration] Загрузка конфигурации
-    [command_preparation] Подготовка команды
-    [project_opening] Открытие проекта
-    [init] Инициализация
-    [extract] Извлечение
-    [translate] Перевод
-    [write_back] Обратная запись
-    [lua] Выполнение Lua проекта
-    [model_request] Запрос к модели
-    [run_plan_finalization] Завершение плана запуска
-    [publication] Публикация
-    [shutdown] Завершение работы
-    [logging] Журнал проекта
-    [runtime] Среда выполнения
-   *[other] __ATT_FALLBACK__
-}
-diagnostic-effect-value = { $code ->
-    [unchanged] Состояние не изменилось
-    [progress_preserved] Допустимый прогресс сохранён
-    [applied] Состояние применено
-    [applied_run_plan_not_saved] Состояние применено, но план запуска не сохранён
-    [applied_finalization_failed] Состояние применено, но завершение не выполнено
-    [recovery_required] Прежде чем доверять состоянию, требуется восстановление
-    [outcome_unknown] Итоговое состояние неизвестно
-   *[other] __ATT_FALLBACK__
-}
 diagnostic-resolution-value = { $code ->
     [fix_configuration] Исправьте указанный параметр конфигурации и повторите попытку
     [fix_input] Исправьте указанные входные данные и повторите попытку
@@ -230,7 +192,7 @@ diagnostic-resolution-value = { $code ->
     [check_model_service] Проверьте ответ службы модели и ограничения учётной записи
     [preserve_recovery_artifacts] Не удаляйте указанные артефакты восстановления; восстановите вывод перед повторной попыткой
     [retry] Повторите операцию
-    [report_bug] Сообщите об этой ошибке ATT, указав код ошибки и путь к журналу
+    [report_bug] Сообщите об этой ошибке ATT и опишите выполнявшуюся операцию
    *[other] __ATT_FALLBACK__
 }
 diagnostic-failure-value = { $code ->
@@ -369,16 +331,13 @@ task-record-parse-error = Ошибка разбора: { $kind ->
 task-record-attempt-succeeded = Попытка { $number }: успешно; finish reason { $finish_reason }
 task-record-attempt-token-usage = ; токены `{ $prompt } / { $completion } / { $total }`
 task-record-attempt-duration = ; длительность `{ $duration }`
-task-record-attempt-request-id = ; request ID { $request_id }
-task-record-attempt-response-id = ; response ID { $response_id }
-task-record-attempt-retryable = Попытка { $number }: повторяемая ошибка запроса; диагностика `{ $code }`; длительность `{ $duration }`
+task-record-attempt-retryable = Попытка { $number }: повторяемая ошибка запроса; длительность `{ $duration }`
 task-record-attempt-retry-after = ; Retry-After `{ $duration }`
 task-record-attempt-wait-retry = ; повтор через `{ $duration }`
 task-record-attempt-wait-completed = ; ожидание `{ $duration }` завершено; следующая попытка не началась
 task-record-attempt-wait-cancelled = ; запланировано ожидание `{ $duration }`; отменено во время ожидания
-task-record-attempt-failed = Попытка { $number }: ошибка обработки запроса или ответа; диагностика `{ $code }`; длительность `{ $duration }`
+task-record-attempt-failed = Попытка { $number }: ошибка обработки запроса или ответа; длительность `{ $duration }`
 task-record-attempt-cancelled = Попытка { $number }: отменена; длительность `{ $duration }`
-task-record-structured-reason = Причина: { $reason }
 task-record-final-status = Состояние: { $state ->
     [complete] завершена, фиксация подтверждена
     [partial] частично завершена, фиксация подтверждена
@@ -394,6 +353,6 @@ task-record-final-status = Состояние: { $state ->
 }
 task-record-accepted-written = Принято: { $accepted } элементов, записано в { $written } фактических позиций
 task-record-accepted-outcome-unknown = Проверено: { $accepted } элементов; результат фиксации базы данных невозможно подтвердить
-task-record-task-diagnostic = Диагностика задачи: `{ $code }`; причина { $reason }
+task-record-task-diagnostic = Диагностика задачи
 task-record-duration-seconds = { $value } с
 task-record-duration-milliseconds = { $value } мс

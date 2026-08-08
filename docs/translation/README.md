@@ -15,7 +15,7 @@ MV、MZ 和 Generic 各自拥有项目状态与流程，同时复用语义相同
 | 请求、响应、Thinking、Raw Assistant 或逐 ID 诊断 | [模型任务记录](task-records.md) |
 | HTTP、超时、限速或运行时有限重试 | [Chat Completions](../runtime/chat-completions.md) |
 | Current、Partial、Unavailable 或引擎状态 | 对应 [MV/MZ Translate](../rpg-maker/translation.md)或 [Generic Translate](../generic/translation.md) |
-| 人工或 agent 补译、定点修订 | [Lua](../lua/README.md)与[全量验收指南](../guides/acceptance.md) |
+| 人工或 agent 补译、定点修订 | [Manual TOML](../manual/README.md)；需要批量上下文或特殊数据库操作时再读 [Lua](../lua/README.md) |
 
 术语内容的发现、筛选和定译不由 ATT 文件格式决定。需要从实际游戏制作术语表时，使用
 [通用游戏术语表制作 Skill](../../skills/extract-game-terminology/SKILL.md)，再按 ATT
@@ -23,4 +23,5 @@ MV、MZ 和 Generic 各自拥有项目状态与流程，同时复用语义相同
 
 处理失败、不完整结果或重复无进展时，先走
 [诊断与恢复指南](../guides/diagnosis-and-recovery.md#64-translate)，不能从某一种错误推导
-通用重试、换模型或 Lua 方案。
+通用重试、换模型或修改全局规则的方案。少量剩余条目优先使用 Manual TOML；只有需要
+复杂筛选、批量变换、诊断或特殊数据库修改时才直接使用 Lua。

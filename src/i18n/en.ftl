@@ -7,7 +7,11 @@ cli-init-about = Initialize or update a named translation project
 cli-extract-about = Synchronize source text from the project's current input
 cli-translate-about = Translate extracted text with an explicit or saved profile
 cli-write-back-about = Write current translations to the project's output
-cli-project-lua-about = Run one atomic database Lua program in a project
+cli-manual-about = Manage manual translations with an editable TOML file
+cli-manual-export-about = Export entries that currently need manual translation
+cli-manual-check-about = Check a manual translation TOML file without changing the project
+cli-manual-apply-about = Apply filled and valid manual translations
+cli-project-lua-about = Run a Lua script against the project database
 cli-project-name-help = Stable project name
 cli-init-path-help = Input root directory; an existing project can reuse its last successful path
 cli-source-language-help = Source language ID
@@ -21,8 +25,9 @@ cli-dialogue-rules-help = Replace the MV dialogue-name projection used with Buil
 cli-profile-help = Translation profile ID; omit it to reuse the last successful profile
 cli-terms-help = Replace the project's terminology resource
 cli-placeholders-help = Replace the project's placeholder resource
-cli-project-lua-script-help = Atomic database Lua program to run once
+cli-project-lua-script-help = Lua script to run against the project database
 cli-project-lua-arguments-help = UTF-8 argument passed to Lua arg[1..] after --
+cli-manual-file-help = Manual translation TOML file
 cli-usage-heading = Usage:
 cli-commands-heading = Commands:
 cli-options-heading = Options:
@@ -116,9 +121,7 @@ log-run-failed = Command { $command } failed.
 log-run-outcome-unknown = Command { $command } ended with an unknown final outcome; follow the recovery locations in the error.
 log-run-cancelled = Command { $command } was cancelled.
 log-performance-counters = Performance counters: SQLite transaction-control attempts { $sqlite_control_attempted_total }; full candidate-tree validations started { $candidate_validation_started }, completed { $candidate_validation_completed }.
-log-lua-script = Lua script { $identity } (SHA-256 { $fingerprint }).
 log-lua-print = Lua: { $message }
-log-lua-summary = Lua activity: database calls { $database_calls }, changed rows { $changed_rows }, translation calls { $translation_calls }, printed lines { $printed_lines }.
 log-plan-resolved = Command { $command } resolved its plan from { $source }.
 log-phase-started = Phase started: { $phase }.
 log-retry-summary = { $count ->
@@ -170,51 +173,10 @@ log-task-outcome-value = { $outcome ->
     [cancelled] cancelled
    *[other] ended without a recognized result
 }
-diagnostic-title = Error [{ $code }]
-diagnostic-stage = Stage: { $stage }
 diagnostic-location = Location: { $subject }
 diagnostic-explanation = Reason: { $reason }
-diagnostic-effect = Impact: { $impact }
 diagnostic-resolution = Action: { $action }
 diagnostic-related = Related error { $index }:
-diagnostic-relation-value = { $code ->
-    [cleanup] cleanup
-    [rollback] rollback
-    [discard] discard
-    [finalization] finalization
-    [shutdown] shutdown
-    [observability] observability
-   *[other] { $code }
-}
-diagnostic-stage-value = { $code ->
-    [process_startup] Process startup
-    [process_output] Process output
-    [configuration] Configuration loading
-    [command_preparation] Command preparation
-    [project_opening] Project opening
-    [init] Initialization
-    [extract] Extraction
-    [translate] Translation
-    [write_back] Write-back
-    [lua] Project Lua execution
-    [model_request] Model request
-    [run_plan_finalization] Run-plan finalization
-    [publication] Publication
-    [shutdown] Shutdown
-    [logging] Project logging
-    [runtime] Runtime
-   *[other] __ATT_FALLBACK__
-}
-diagnostic-effect-value = { $code ->
-    [unchanged] State was not changed
-    [progress_preserved] Valid progress was preserved
-    [applied] State was applied
-    [applied_run_plan_not_saved] State was applied, but the run plan was not saved
-    [applied_finalization_failed] State was applied, but finalization did not complete
-    [recovery_required] Recovery is required before the state can be trusted
-    [outcome_unknown] The final state is unknown
-   *[other] __ATT_FALLBACK__
-}
 diagnostic-resolution-value = { $code ->
     [fix_configuration] Correct the named configuration field and retry
     [fix_input] Correct the named input and retry
@@ -226,7 +188,7 @@ diagnostic-resolution-value = { $code ->
     [check_model_service] Check the model service response and account limits
     [preserve_recovery_artifacts] Do not delete the listed recovery artifacts; recover the output before retrying
     [retry] Retry the operation
-    [report_bug] Report this ATT defect with the error code and log path
+    [report_bug] Report this ATT defect and describe what you were doing
    *[other] __ATT_FALLBACK__
 }
 diagnostic-failure-value = { $code ->
@@ -365,16 +327,13 @@ task-record-parse-error = Parse error: { $kind ->
 task-record-attempt-succeeded = Attempt { $number }: succeeded; finish reason { $finish_reason }
 task-record-attempt-token-usage = ; tokens `{ $prompt } / { $completion } / { $total }`
 task-record-attempt-duration = ; duration `{ $duration }`
-task-record-attempt-request-id = ; request ID { $request_id }
-task-record-attempt-response-id = ; response ID { $response_id }
-task-record-attempt-retryable = Attempt { $number }: retryable request failure; diagnostic `{ $code }`; duration `{ $duration }`
+task-record-attempt-retryable = Attempt { $number }: retryable request failure; duration `{ $duration }`
 task-record-attempt-retry-after = ; Retry-After `{ $duration }`
 task-record-attempt-wait-retry = ; retrying after `{ $duration }`
 task-record-attempt-wait-completed = ; wait of `{ $duration }` completed; the next attempt did not start
 task-record-attempt-wait-cancelled = ; planned wait `{ $duration }`; cancelled while waiting
-task-record-attempt-failed = Attempt { $number }: request or response processing failed; diagnostic `{ $code }`; duration `{ $duration }`
+task-record-attempt-failed = Attempt { $number }: request or response processing failed; duration `{ $duration }`
 task-record-attempt-cancelled = Attempt { $number }: cancelled; duration `{ $duration }`
-task-record-structured-reason = Reason: { $reason }
 task-record-final-status = Status: { $state ->
     [complete] complete and commit confirmed
     [partial] partially complete and commit confirmed
@@ -390,6 +349,6 @@ task-record-final-status = Status: { $state ->
 }
 task-record-accepted-written = Accepted: { $accepted } items; written to { $written } actual locations
 task-record-accepted-outcome-unknown = Validated: { $accepted } items; database commit outcome cannot be confirmed
-task-record-task-diagnostic = Task diagnostic: `{ $code }`; reason { $reason }
+task-record-task-diagnostic = Task diagnostic
 task-record-duration-seconds = { $value } seconds
 task-record-duration-milliseconds = { $value } ms

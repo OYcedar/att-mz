@@ -100,6 +100,7 @@ pub(crate) struct RpgMakerWriteBackUnit {
     role: TextUnitRole,
     source_content: TextUnitContent,
     translation_content: Option<TextUnitContent>,
+    manual: bool,
 }
 
 impl RpgMakerWriteBackUnit {
@@ -108,13 +109,30 @@ impl RpgMakerWriteBackUnit {
         source_content: TextUnitContent,
         translation_content: Option<TextUnitContent>,
     ) -> Result<Self, RpgMakerWriteBackSnapshotError> {
+        Self::new_with_origin(role, source_content, translation_content, false)
+    }
+
+    pub(crate) fn new_manual(
+        role: TextUnitRole,
+        source_content: TextUnitContent,
+        translation_content: TextUnitContent,
+    ) -> Result<Self, RpgMakerWriteBackSnapshotError> {
+        Self::new_with_origin(role, source_content, Some(translation_content), true)
+    }
+
+    fn new_with_origin(
+        role: TextUnitRole,
+        source_content: TextUnitContent,
+        translation_content: Option<TextUnitContent>,
+        manual: bool,
+    ) -> Result<Self, RpgMakerWriteBackSnapshotError> {
         validate_content_presence(&role, &source_content, "原文")?;
         if source_content.is_blank() {
             return Err(RpgMakerWriteBackSnapshotError::BlankSourceContent { role: role.clone() });
         }
         if let Some(translation) = &translation_content {
             validate_content_presence(&role, translation, "译文")?;
-            if translation.is_blank() {
+            if !manual && translation.is_blank() {
                 return Err(RpgMakerWriteBackSnapshotError::BlankTranslationContent {
                     role: role.clone(),
                 });
@@ -124,6 +142,7 @@ impl RpgMakerWriteBackUnit {
             role,
             source_content,
             translation_content,
+            manual,
         })
     }
 
@@ -227,6 +246,11 @@ fn repair_unit_translation_symbols_with_allocation(
 ) -> Result<OperationCompletion<SymbolRepairStatistics>, TranslationPlanningFailureReason> {
     if cancellation.is_requested() {
         return Ok(OperationCompletion::Cancelled);
+    }
+    if unit.manual {
+        return Ok(OperationCompletion::Completed(
+            SymbolRepairStatistics::default(),
+        ));
     }
     let Some(translation) = unit.translation_content.as_ref() else {
         return Ok(OperationCompletion::Completed(

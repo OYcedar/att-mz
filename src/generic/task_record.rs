@@ -364,18 +364,10 @@ fn render_generic_task_record(
         )
     );
     for diagnostic in &document.state.diagnostics {
-        let code = diagnostic.primary().code();
-        let reason = markdown_inline_code(code);
         let _ = writeln!(
             output,
             "- {}",
-            task_record_text(
-                &localizer,
-                UiMessage::TaskRecordTaskDiagnostic {
-                    code,
-                    reason: &reason,
-                }
-            )
+            task_record_text(&localizer, UiMessage::TaskRecordTaskDiagnostic)
         );
         let rendered = redactor.redact(&render_diagnostic_report(diagnostic, &localizer));
         output.push_str(&markdown_fence(&rendered, "text"));

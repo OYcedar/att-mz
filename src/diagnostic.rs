@@ -40,12 +40,12 @@ pub(crate) use issue::{
     TranslationPlanningWorkerOperation, TranslationTaskPlanningProblem,
 };
 pub(crate) use lua_issue::{
-    LuaCompilationProblem, LuaCompilerCategory, LuaContextProblem, LuaEngine, LuaIssue, LuaLocator,
-    LuaOperation, LuaProblem, LuaScriptProblem, LuaValidationProblem, LuaValueViolation,
+    LuaCompilationProblem, LuaCompilerCategory, LuaContextProblem, LuaEngine, LuaIssue,
+    LuaOperation, LuaProblem, LuaScriptProblem, LuaValueViolation,
 };
 pub(crate) use model::{
     Diagnostic, DiagnosticReport, DiagnosticResolution, RelatedFailureRelation, ReportedFailure,
-    StateEffect, render_diagnostic_report,
+    StateEffect, render_diagnostic_fields, render_diagnostic_report,
 };
 pub(crate) use observability_issue::{
     ObservabilityComponent, ObservabilityContractViolation, ObservabilityEventCode,
@@ -137,28 +137,6 @@ pub(crate) enum DiagnosticStage {
     Runtime,
 }
 
-impl DiagnosticStage {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::ProcessStartup => "process_startup",
-            Self::ProcessOutput => "process_output",
-            Self::Configuration => "configuration",
-            Self::CommandPreparation => "command_preparation",
-            Self::ProjectOpening => "project_opening",
-            Self::Init => "init",
-            Self::Extract => "extract",
-            Self::Translate => "translate",
-            Self::WriteBack => "write_back",
-            Self::Lua => "lua",
-            Self::ModelRequest => "model_request",
-            Self::RunPlanFinalization => "run_plan_finalization",
-            Self::Publication => "publication",
-            Self::Shutdown => "shutdown",
-            Self::Logging => "logging",
-            Self::Runtime => "runtime",
-        }
-    }
-}
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SafeIoKind {

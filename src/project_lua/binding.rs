@@ -1,12 +1,10 @@
 use std::cell::{Cell, RefCell};
-use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::num::NonZeroU32;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use mlua::thread::ThreadStatus;
 use mlua::{
@@ -19,7 +17,9 @@ use rusqlite::{Connection, params_from_iter};
 use super::{
     PROJECT_LUA_SOURCE_CHUNK_BYTES, ProjectLuaCallError, ProjectLuaCancellation,
     ProjectLuaCompilationFailure, ProjectLuaEngineAdapter, ProjectLuaFailure, ProjectLuaPrintSink,
-    ProjectLuaProgram, ProjectLuaRunRequest, ProjectLuaScriptFailure, ProjectLuaValue,
+    ProjectLuaProgram, ProjectLuaRunRequest, ProjectLuaScriptFailure, ProjectLuaTerminologyEntry,
+    ProjectLuaTranslationContext, ProjectLuaTranslationFilter, ProjectLuaTranslationRecord,
+    ProjectLuaTranslationStatus,
 };
 use crate::diagnostic::{LuaCompilerCategory, LuaOperation};
 
@@ -27,103 +27,7 @@ pub(super) struct PreparedProjectLua {
     pub(super) lua: Lua,
     pub(super) function: Function,
     pub(super) connection: Rc<RefCell<Connection>>,
-    pub(super) metrics: Arc<BindingMetrics>,
-    pub(super) transaction_guard: Rc<BindingTransactionGuard>,
     pub(super) script_identity: String,
-}
-
-#[derive(Debug, Default)]
-pub(super) struct BindingMetrics {
-    database_calls: AtomicU64,
-    changed_rows: AtomicU64,
-    translation_calls: AtomicU64,
-    printed_lines: AtomicU64,
-}
-
-impl BindingMetrics {
-    pub(super) fn database_calls(&self) -> u64 {
-        self.database_calls.load(Ordering::Relaxed)
-    }
-
-    pub(super) fn changed_rows(&self) -> u64 {
-        self.changed_rows.load(Ordering::Relaxed)
-    }
-
-    pub(super) fn translation_calls(&self) -> u64 {
-        self.translation_calls.load(Ordering::Relaxed)
-    }
-
-    pub(super) fn printed_lines(&self) -> u64 {
-        self.printed_lines.load(Ordering::Relaxed)
-    }
-
-    fn record_database_call(&self) {
-        self.database_calls
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                Some(value.saturating_add(1))
-            })
-            .expect("计数更新闭包始终返回新值");
-    }
-
-    fn record_changed_rows(&self, rows: u64) {
-        self.changed_rows
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                Some(value.saturating_add(rows))
-            })
-            .expect("计数更新闭包始终返回新值");
-    }
-
-    fn record_translation_call(&self) {
-        self.translation_calls
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                Some(value.saturating_add(1))
-            })
-            .expect("计数更新闭包始终返回新值");
-    }
-
-    fn record_printed_line(&self) {
-        self.printed_lines
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                Some(value.saturating_add(1))
-            })
-            .expect("计数更新闭包始终返回新值");
-    }
-}
-
-/// 记录脚本是否让 ATT 建立的外层事务提前结束。
-///
-/// SQLite 的 `OR ROLLBACK` 和触发器 `RAISE(ROLLBACK)` 可以在一条普通 statement
-/// 内结束外层事务。Lua 可以用 `pcall` 捕获 statement 错误，因此每个数据库入口都必须
-/// 共用这一状态；一旦事务丢失，后续入口不得在 autocommit 模式下继续写入。
-#[derive(Debug, Default)]
-pub(super) struct BindingTransactionGuard {
-    lost: Cell<bool>,
-}
-
-impl BindingTransactionGuard {
-    pub(super) fn is_lost(&self) -> bool {
-        self.lost.get()
-    }
-
-    fn call<T>(
-        &self,
-        connection: &Connection,
-        operation: LuaOperation,
-        call: impl FnOnce(&Connection) -> Result<T, LuaHostCallError>,
-    ) -> Result<T, LuaHostCallError> {
-        if self.lost.get() || connection.is_autocommit() {
-            self.lost.set(true);
-            return Err(transaction_lost_error(operation));
-        }
-
-        let result = call(connection);
-        if connection.is_autocommit() {
-            self.lost.set(true);
-            Err(transaction_lost_error(operation))
-        } else {
-            result
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -176,35 +80,20 @@ pub(super) fn prepare_lua(
     let function = compile_program(&lua, &request.program, &request.cancellation)?;
 
     let connection = Rc::new(RefCell::new(connection));
-    let metrics = Arc::clone(&request.metrics);
-    let transaction_guard = Rc::new(BindingTransactionGuard::default());
-    let context = build_context(
-        &lua,
-        request,
-        Rc::clone(&connection),
-        Arc::clone(&metrics),
-        Rc::clone(&transaction_guard),
-    )
-    .map_err(|_| ProjectLuaFailure::Context(super::ProjectLuaContextFailure::ContextTable))?;
+    let context = build_context(&lua, request, Rc::clone(&connection))
+        .map_err(|_| ProjectLuaFailure::Context(super::ProjectLuaContextFailure::ContextTable))?;
     lua.globals()
         .set("ctx", context)
         .map_err(|_| ProjectLuaFailure::Context(super::ProjectLuaContextFailure::PublishContext))?;
     install_arguments(&lua, request)
         .map_err(|_| ProjectLuaFailure::Context(super::ProjectLuaContextFailure::Arguments))?;
-    install_print(
-        &lua,
-        Arc::clone(&request.print_sink),
-        Arc::clone(&metrics),
-        cancellation,
-    )
-    .map_err(|_| ProjectLuaFailure::Context(super::ProjectLuaContextFailure::PrintBinding))?;
+    install_print(&lua, Arc::clone(&request.print_sink), cancellation)
+        .map_err(|_| ProjectLuaFailure::Context(super::ProjectLuaContextFailure::PrintBinding))?;
 
     Ok(PreparedProjectLua {
         lua,
         function,
         connection,
-        metrics,
-        transaction_guard,
         script_identity: request.program.identity().to_owned(),
     })
 }
@@ -523,8 +412,6 @@ fn build_context(
     lua: &Lua,
     request: &ProjectLuaRunRequest,
     connection: Rc<RefCell<Connection>>,
-    metrics: Arc<BindingMetrics>,
-    transaction_guard: Rc<BindingTransactionGuard>,
 ) -> mlua::Result<Table> {
     let context = lua.create_table()?;
     context.set(
@@ -537,22 +424,23 @@ fn build_context(
 
     context.set(
         "db",
-        build_database_table(
-            lua,
-            Rc::clone(&connection),
-            Arc::clone(&metrics),
-            Rc::clone(&transaction_guard),
-            request.cancellation.clone(),
-        )?,
+        build_database_table(lua, Rc::clone(&connection), request.cancellation.clone())?,
     )?;
     context.set(
         "translation",
         build_translation_table(
             lua,
+            Rc::clone(&connection),
+            Arc::clone(&request.adapter),
+            request.cancellation.clone(),
+        )?,
+    )?;
+    context.set(
+        "terminology",
+        build_terminology_table(
+            lua,
             connection,
             Arc::clone(&request.adapter),
-            metrics,
-            transaction_guard,
             request.cancellation.clone(),
         )?,
     )?;
@@ -562,11 +450,9 @@ fn build_context(
 fn install_print(
     lua: &Lua,
     sink: Arc<dyn ProjectLuaPrintSink>,
-    metrics: Arc<BindingMetrics>,
     cancellation: ProjectLuaCancellation,
 ) -> mlua::Result<()> {
     let native = lua.create_function(move |lua, bytes: mlua::LuaString| {
-        metrics.record_printed_line();
         ensure_lua_not_cancelled(&cancellation)?;
         let result = sink
             .print(bytes.as_bytes().as_ref())
@@ -601,42 +487,31 @@ end
 fn build_database_table(
     lua: &Lua,
     connection: Rc<RefCell<Connection>>,
-    metrics: Arc<BindingMetrics>,
-    transaction_guard: Rc<BindingTransactionGuard>,
     cancellation: ProjectLuaCancellation,
 ) -> mlua::Result<Table> {
     let native = lua.create_table()?;
     let null = lua.create_userdata(LuaSqliteNull)?;
 
     let query_connection = Rc::clone(&connection);
-    let query_metrics = Arc::clone(&metrics);
-    let query_transaction_guard = Rc::clone(&transaction_guard);
     let query_cancellation = cancellation.clone();
     native.set(
         "query",
         lua.create_function(move |lua, (statement, parameters): (Value, Value)| {
-            query_metrics.record_database_call();
             ensure_lua_not_cancelled(&query_cancellation)?;
             let connection = query_connection.borrow();
-            let result = query_transaction_guard.call(
-                &connection,
-                LuaOperation::QueryDatabase,
-                |connection| {
-                    parse_sql_call(statement, parameters, &query_cancellation)
-                        .map_err(|error| host_error("binding", error, LuaOperation::QueryDatabase))
-                        .and_then(|(statement, parameters)| {
-                            query_database(connection, &statement, &parameters, &query_cancellation)
-                                .map_err(|error| match error {
-                                    DatabaseQueryError::Sqlite(error) => {
-                                        sqlite_host_error(LuaOperation::QueryDatabase, error)
-                                    }
-                                    DatabaseQueryError::Binding(error) => {
-                                        host_error("binding", error, LuaOperation::QueryDatabase)
-                                    }
-                                })
+            let result = parse_sql_call(statement, parameters, &query_cancellation)
+                .map_err(|error| host_error("binding", error, LuaOperation::QueryDatabase))
+                .and_then(|(statement, parameters)| {
+                    query_database(&connection, &statement, &parameters, &query_cancellation)
+                        .map_err(|error| match error {
+                            DatabaseQueryError::Sqlite(error) => {
+                                sqlite_host_error(LuaOperation::QueryDatabase, error)
+                            }
+                            DatabaseQueryError::Binding(error) => {
+                                host_error("binding", error, LuaOperation::QueryDatabase)
+                            }
                         })
-                },
-            );
+                });
             let output = host_result_to_lua(lua, result, |lua, rows| {
                 rows_to_lua(lua, rows, &query_cancellation)
             });
@@ -645,40 +520,27 @@ fn build_database_table(
         })?,
     )?;
 
-    let execute_metrics = Arc::clone(&metrics);
-    let execute_transaction_guard = transaction_guard;
     let execute_cancellation = cancellation.clone();
     native.set(
         "execute",
         lua.create_function(move |lua, (statement, parameters): (Value, Value)| {
-            execute_metrics.record_database_call();
             ensure_lua_not_cancelled(&execute_cancellation)?;
             let connection = connection.borrow();
-            let result = execute_transaction_guard.call(
-                &connection,
-                LuaOperation::QueryDatabase,
-                |connection| {
-                    parse_sql_call(statement, parameters, &execute_cancellation)
-                        .map_err(|error| host_error("binding", error, LuaOperation::QueryDatabase))
-                        .and_then(|(statement, parameters)| {
-                            ensure_project_lua_call_running(&execute_cancellation).map_err(
-                                |error| host_error("binding", error, LuaOperation::QueryDatabase),
-                            )?;
-                            execute_database(connection, &statement, &parameters).map_err(|error| {
-                                sqlite_host_error(LuaOperation::QueryDatabase, error)
-                            })
-                        })
-                },
-            );
+            let result = parse_sql_call(statement, parameters, &execute_cancellation)
+                .map_err(|error| host_error("binding", error, LuaOperation::QueryDatabase))
+                .and_then(|(statement, parameters)| {
+                    ensure_project_lua_call_running(&execute_cancellation).map_err(|error| {
+                        host_error("binding", error, LuaOperation::QueryDatabase)
+                    })?;
+                    execute_database(&connection, &statement, &parameters)
+                        .map_err(|error| sqlite_host_error(LuaOperation::QueryDatabase, error))
+                });
             let output = match result {
-                Ok(changed) => {
-                    execute_metrics.record_changed_rows(changed);
-                    host_result_to_lua(lua, Ok(changed), |_lua, changed| {
-                        i64::try_from(changed)
-                            .map(Value::Integer)
-                            .map_err(|_| mlua::Error::runtime("SQLite 受影响行数超出 Lua integer"))
-                    })
-                }
+                Ok(changed) => host_result_to_lua(lua, Ok(changed), |_lua, changed| {
+                    i64::try_from(changed)
+                        .map(Value::Integer)
+                        .map_err(|_| mlua::Error::runtime("SQLite 受影响行数超出 Lua integer"))
+                }),
                 Err(error) => {
                     host_result_to_lua::<u64, _>(lua, Err(error), |_lua, _changed| Ok(Value::Nil))
                 }
@@ -737,47 +599,83 @@ fn build_translation_table(
     lua: &Lua,
     connection: Rc<RefCell<Connection>>,
     adapter: Arc<dyn ProjectLuaEngineAdapter>,
-    metrics: Arc<BindingMetrics>,
-    transaction_guard: Rc<BindingTransactionGuard>,
     cancellation: ProjectLuaCancellation,
 ) -> mlua::Result<Table> {
     let native = lua.create_table()?;
 
+    let list_adapter = Arc::clone(&adapter);
+    let list_connection = Rc::clone(&connection);
+    let list_cancellation = cancellation.clone();
+    native.set(
+        "list",
+        lua.create_function(move |lua, filter: Value| {
+            ensure_lua_not_cancelled(&list_cancellation)?;
+            let connection = list_connection.borrow();
+            let result = parse_translation_filter(filter, &list_cancellation)
+                .map_err(|error| host_error("binding", error, LuaOperation::QueryDatabase))
+                .and_then(|filter| {
+                    list_adapter
+                        .list_translations(&connection, filter)
+                        .map_err(|error| {
+                            host_error("translation", error, LuaOperation::QueryDatabase)
+                        })
+                });
+            let output = host_result_to_lua(lua, result, |lua, records| {
+                translation_records_to_lua(lua, records, &list_cancellation)
+            });
+            ensure_lua_not_cancelled(&list_cancellation)?;
+            output
+        })?,
+    )?;
+
+    let context_adapter = Arc::clone(&adapter);
+    let context_connection = Rc::clone(&connection);
+    let context_cancellation = cancellation.clone();
+    native.set(
+        "context",
+        lua.create_function(move |lua, ids: Value| {
+            ensure_lua_not_cancelled(&context_cancellation)?;
+            let connection = context_connection.borrow();
+            let result = parse_text_array(ids, "ids", &context_cancellation)
+                .map_err(|error| host_error("binding", error, LuaOperation::QueryDatabase))
+                .and_then(|ids| {
+                    context_adapter
+                        .translation_context(&connection, ids)
+                        .map_err(|error| {
+                            host_error("translation", error, LuaOperation::QueryDatabase)
+                        })
+                });
+            let output = host_result_to_lua(lua, result, |lua, contexts| {
+                translation_contexts_to_lua(lua, contexts, &context_cancellation)
+            });
+            ensure_lua_not_cancelled(&context_cancellation)?;
+            output
+        })?,
+    )?;
+
     let set_adapter = Arc::clone(&adapter);
     let set_connection = Rc::clone(&connection);
-    let set_metrics = Arc::clone(&metrics);
-    let set_transaction_guard = Rc::clone(&transaction_guard);
     let set_cancellation = cancellation.clone();
     native.set(
         "set",
-        lua.create_function(move |lua, (locator, translation): (Value, Value)| {
-            set_metrics.record_translation_call();
+        lua.create_function(move |lua, (id, translation): (Value, Value)| {
             ensure_lua_not_cancelled(&set_cancellation)?;
             let connection = set_connection.borrow();
-            let result = set_transaction_guard.call(
-                &connection,
-                LuaOperation::SetTranslation,
-                |connection| {
-                    lua_to_project_value(locator, &set_cancellation)
-                        .and_then(|locator| {
-                            lua_to_project_value(translation, &set_cancellation)
-                                .map(|translation| (locator, translation))
+            let result = parse_text(id, "id", &set_cancellation)
+                .and_then(|id| {
+                    parse_text_array(translation, "translation", &set_cancellation)
+                        .map(|translation| (id, translation))
+                })
+                .map_err(|error| host_error("binding", error, LuaOperation::SetTranslation))
+                .and_then(|(id, translation)| {
+                    set_adapter
+                        .set_translation(&connection, id, translation)
+                        .map_err(|error| {
+                            host_error("translation", error, LuaOperation::SetTranslation)
                         })
-                        .map_err(|error| host_error("binding", error, LuaOperation::SetTranslation))
-                        .and_then(|(locator, translation)| {
-                            set_adapter
-                                .set_translation(connection, locator, translation)
-                                .map_err(|error| {
-                                    host_error("translation", error, LuaOperation::SetTranslation)
-                                })
-                        })
-                },
-            );
+                });
             let output = match result {
-                Ok(changed) => {
-                    set_metrics.record_changed_rows(changed);
-                    host_result_to_lua(lua, Ok(()), |_lua, ()| Ok(Value::Nil))
-                }
+                Ok(_changed) => host_result_to_lua(lua, Ok(()), |_lua, ()| Ok(Value::Nil)),
                 Err(error) => host_result_to_lua(lua, Err(error), |_lua, ()| Ok(Value::Nil)),
             };
             ensure_lua_not_cancelled(&set_cancellation)?;
@@ -785,37 +683,21 @@ fn build_translation_table(
         })?,
     )?;
 
-    let clear_metrics = metrics;
-    let clear_transaction_guard = transaction_guard;
     let clear_cancellation = cancellation;
     native.set(
         "clear",
-        lua.create_function(move |lua, locator: Value| {
-            clear_metrics.record_translation_call();
+        lua.create_function(move |lua, id: Value| {
             ensure_lua_not_cancelled(&clear_cancellation)?;
             let connection = connection.borrow();
-            let result = clear_transaction_guard.call(
-                &connection,
-                LuaOperation::ClearTranslation,
-                |connection| {
-                    lua_to_project_value(locator, &clear_cancellation)
-                        .map_err(|error| {
-                            host_error("binding", error, LuaOperation::ClearTranslation)
-                        })
-                        .and_then(|locator| {
-                            adapter
-                                .clear_translation(connection, locator)
-                                .map_err(|error| {
-                                    host_error("translation", error, LuaOperation::ClearTranslation)
-                                })
-                        })
-                },
-            );
+            let result = parse_text(id, "id", &clear_cancellation)
+                .map_err(|error| host_error("binding", error, LuaOperation::ClearTranslation))
+                .and_then(|id| {
+                    adapter.clear_translation(&connection, id).map_err(|error| {
+                        host_error("translation", error, LuaOperation::ClearTranslation)
+                    })
+                });
             let output = match result {
-                Ok(changed) => {
-                    clear_metrics.record_changed_rows(changed);
-                    host_result_to_lua(lua, Ok(()), |_lua, ()| Ok(Value::Nil))
-                }
+                Ok(_changed) => host_result_to_lua(lua, Ok(()), |_lua, ()| Ok(Value::Nil)),
                 Err(error) => host_result_to_lua(lua, Err(error), |_lua, ()| Ok(Value::Nil)),
             };
             ensure_lua_not_cancelled(&clear_cancellation)?;
@@ -823,7 +705,227 @@ fn build_translation_table(
         })?,
     )?;
 
-    checked_function_table(lua, native, &["set", "clear"])
+    checked_function_table(lua, native, &["list", "context", "set", "clear"])
+}
+
+fn build_terminology_table(
+    lua: &Lua,
+    connection: Rc<RefCell<Connection>>,
+    adapter: Arc<dyn ProjectLuaEngineAdapter>,
+    cancellation: ProjectLuaCancellation,
+) -> mlua::Result<Table> {
+    let native = lua.create_table()?;
+    native.set(
+        "list",
+        lua.create_function(move |lua, (): ()| {
+            ensure_lua_not_cancelled(&cancellation)?;
+            let connection = connection.borrow();
+            let result = adapter
+                .list_terminology(&connection)
+                .map_err(|error| host_error("terminology", error, LuaOperation::QueryDatabase));
+            let output = host_result_to_lua(lua, result, |lua, entries| {
+                terminology_entries_to_lua(lua, entries, &cancellation)
+            });
+            ensure_lua_not_cancelled(&cancellation)?;
+            output
+        })?,
+    )?;
+    checked_function_table(lua, native, &["list"])
+}
+
+fn parse_translation_filter(
+    value: Value,
+    cancellation: &ProjectLuaCancellation,
+) -> Result<ProjectLuaTranslationFilter, ProjectLuaCallError> {
+    ensure_project_lua_call_running(cancellation)?;
+    let Value::Table(table) = value else {
+        return match value {
+            Value::Nil => Ok(ProjectLuaTranslationFilter::default()),
+            _ => Err(ProjectLuaCallError::violation(
+                crate::diagnostic::LuaValueViolation::UnexpectedType,
+            )
+            .with_field("filter")),
+        };
+    };
+    let mut status = None;
+    let mut ids = None;
+    for pair in table.pairs::<Value, Value>() {
+        ensure_project_lua_call_running(cancellation)?;
+        let (key, value) = pair.map_err(|_| {
+            ProjectLuaCallError::violation(crate::diagnostic::LuaValueViolation::InvalidTable)
+                .with_field("filter")
+        })?;
+        let Value::String(key) = key else {
+            return Err(ProjectLuaCallError::violation(
+                crate::diagnostic::LuaValueViolation::InvalidTable,
+            )
+            .with_field("filter"));
+        };
+        let key = strict_text(&key, "filter 字段", cancellation)?;
+        match key.as_str() {
+            "status" if status.is_none() => {
+                let value = parse_text(value, "status", cancellation)?;
+                status = Some(ProjectLuaTranslationStatus::parse(&value).ok_or_else(|| {
+                    ProjectLuaCallError::violation(
+                        crate::diagnostic::LuaValueViolation::UnexpectedType,
+                    )
+                    .with_field("status")
+                })?);
+            }
+            "ids" if ids.is_none() => {
+                ids = Some(parse_text_array(value, "ids", cancellation)?);
+            }
+            _ => {
+                return Err(ProjectLuaCallError::violation(
+                    crate::diagnostic::LuaValueViolation::InvalidTable,
+                )
+                .with_field("filter"));
+            }
+        }
+    }
+    Ok(ProjectLuaTranslationFilter { status, ids })
+}
+
+fn parse_text(
+    value: Value,
+    field: &'static str,
+    cancellation: &ProjectLuaCancellation,
+) -> Result<String, ProjectLuaCallError> {
+    let Value::String(value) = value else {
+        return Err(ProjectLuaCallError::violation(
+            crate::diagnostic::LuaValueViolation::UnexpectedType,
+        )
+        .with_field(field));
+    };
+    strict_text(&value, field, cancellation).map_err(|error| error.with_field(field))
+}
+
+fn parse_text_array(
+    value: Value,
+    field: &'static str,
+    cancellation: &ProjectLuaCancellation,
+) -> Result<Vec<String>, ProjectLuaCallError> {
+    let Value::Table(table) = value else {
+        return Err(ProjectLuaCallError::violation(
+            crate::diagnostic::LuaValueViolation::UnexpectedType,
+        )
+        .with_field(field));
+    };
+    let values =
+        dense_table_values(table, cancellation).map_err(|error| error.with_field(field))?;
+    let mut result = Vec::with_capacity(values.len());
+    for value in values {
+        ensure_project_lua_call_running(cancellation)?;
+        result.push(parse_text(value, field, cancellation)?);
+    }
+    Ok(result)
+}
+
+fn translation_records_to_lua(
+    lua: &Lua,
+    records: Vec<ProjectLuaTranslationRecord>,
+    cancellation: &ProjectLuaCancellation,
+) -> mlua::Result<Value> {
+    let result = lua.create_table_with_capacity(records.len(), 0)?;
+    for (index, record) in records.into_iter().enumerate() {
+        ensure_lua_not_cancelled(cancellation)?;
+        result.raw_set(
+            index + 1,
+            translation_record_to_lua(lua, record, cancellation)?,
+        )?;
+    }
+    Ok(Value::Table(result))
+}
+
+fn translation_record_to_lua(
+    lua: &Lua,
+    record: ProjectLuaTranslationRecord,
+    cancellation: &ProjectLuaCancellation,
+) -> mlua::Result<Table> {
+    ensure_lua_not_cancelled(cancellation)?;
+    let table = lua.create_table()?;
+    table.set("id", record.id)?;
+    table.set("type", record.kind)?;
+    table.set(
+        "source",
+        text_array_to_lua(lua, record.source, cancellation)?,
+    )?;
+    if let Some(translation) = record.translation {
+        table.set(
+            "translation",
+            text_array_to_lua(lua, translation, cancellation)?,
+        )?;
+    }
+    table.set("status", record.status.as_str())?;
+    if let Some(origin) = record.origin {
+        table.set("origin", origin)?;
+    }
+    if let Some(outdated) = record.outdated_manual {
+        let snapshot = lua.create_table()?;
+        snapshot.set("id", outdated.id)?;
+        snapshot.set("type", outdated.kind)?;
+        snapshot.set(
+            "source",
+            text_array_to_lua(lua, outdated.source, cancellation)?,
+        )?;
+        snapshot.set(
+            "translation",
+            text_array_to_lua(lua, outdated.translation, cancellation)?,
+        )?;
+        table.set("outdated_manual", snapshot)?;
+    }
+    Ok(table)
+}
+
+fn translation_contexts_to_lua(
+    lua: &Lua,
+    contexts: Vec<ProjectLuaTranslationContext>,
+    cancellation: &ProjectLuaCancellation,
+) -> mlua::Result<Value> {
+    let result = lua.create_table_with_capacity(contexts.len(), 0)?;
+    for (index, context) in contexts.into_iter().enumerate() {
+        ensure_lua_not_cancelled(cancellation)?;
+        let table = lua.create_table()?;
+        table.set("id", context.id)?;
+        if let Some(speaker) = context.speaker {
+            table.set("speaker", speaker)?;
+        }
+        table.set(
+            "translations",
+            translation_records_to_lua(lua, context.translations, cancellation)?,
+        )?;
+        result.raw_set(index + 1, table)?;
+    }
+    Ok(Value::Table(result))
+}
+
+fn terminology_entries_to_lua(
+    lua: &Lua,
+    entries: Vec<ProjectLuaTerminologyEntry>,
+    cancellation: &ProjectLuaCancellation,
+) -> mlua::Result<Value> {
+    let result = lua.create_table_with_capacity(entries.len(), 0)?;
+    for (index, entry) in entries.into_iter().enumerate() {
+        ensure_lua_not_cancelled(cancellation)?;
+        let table = lua.create_table()?;
+        table.set("term", entry.term)?;
+        table.set("translation", entry.translation)?;
+        result.raw_set(index + 1, table)?;
+    }
+    Ok(Value::Table(result))
+}
+
+fn text_array_to_lua(
+    lua: &Lua,
+    values: Vec<String>,
+    cancellation: &ProjectLuaCancellation,
+) -> mlua::Result<Table> {
+    let result = lua.create_table_with_capacity(values.len(), 0)?;
+    for (index, value) in values.into_iter().enumerate() {
+        ensure_lua_not_cancelled(cancellation)?;
+        result.raw_set(index + 1, value)?;
+    }
+    Ok(result)
 }
 
 fn checked_function_table(lua: &Lua, native: Table, names: &[&str]) -> mlua::Result<Table> {
@@ -938,7 +1040,7 @@ fn query_database(
     ensure_project_lua_call_running(cancellation)?;
     let mut statement = connection.prepare(sql)?;
     ensure_project_lua_call_running(cancellation)?;
-    if !statement.readonly() || statement.column_count() == 0 {
+    if statement.column_count() == 0 {
         return Err(DatabaseQueryError::Sqlite(rusqlite::Error::InvalidQuery));
     }
     let column_count = statement.column_count();
@@ -1096,327 +1198,6 @@ fn dense_table_values(
     }
     ensure_project_lua_call_running(cancellation)?;
     Ok(values)
-}
-
-fn lua_to_project_value(
-    value: Value,
-    cancellation: &ProjectLuaCancellation,
-) -> Result<ProjectLuaValue, ProjectLuaCallError> {
-    let mut checkpoint = || {};
-    lua_to_project_value_with_checkpoint(value, cancellation, &mut checkpoint)
-}
-
-struct ProjectTableConversionFrame {
-    identity: *const c_void,
-    pairs: std::vec::IntoIter<(Value, Value)>,
-    pending_key: Option<Value>,
-    integer_fields: BTreeMap<usize, ProjectLuaValue>,
-    string_fields: Vec<(String, ProjectLuaValue)>,
-}
-
-fn lua_to_project_value_with_checkpoint(
-    value: Value,
-    cancellation: &ProjectLuaCancellation,
-    checkpoint: &mut impl FnMut(),
-) -> Result<ProjectLuaValue, ProjectLuaCallError> {
-    let mut active_tables = HashSet::new();
-    let mut frames = Vec::<ProjectTableConversionFrame>::new();
-    let mut next_value = Some(value);
-    let mut completed_value = None;
-
-    loop {
-        project_value_conversion_checkpoint(cancellation, checkpoint)?;
-
-        if let Some(value) = next_value.take() {
-            match value {
-                Value::Nil => completed_value = Some(ProjectLuaValue::Nil),
-                Value::Boolean(value) => {
-                    completed_value = Some(ProjectLuaValue::Boolean(value));
-                }
-                Value::Integer(value) => {
-                    completed_value = Some(ProjectLuaValue::Integer(value));
-                }
-                Value::Number(value) if value.is_finite() => {
-                    completed_value = Some(ProjectLuaValue::Real(value));
-                }
-                Value::Number(_) => {
-                    return Err(ProjectLuaCallError::violation(
-                        crate::diagnostic::LuaValueViolation::InvalidTranslation,
-                    ));
-                }
-                Value::String(value) => {
-                    completed_value = Some(ProjectLuaValue::Text(strict_text(
-                        &value,
-                        "translation 字符串",
-                        cancellation,
-                    )?));
-                }
-                Value::UserData(value) if value.is::<LuaSqliteNull>() => {
-                    completed_value = Some(ProjectLuaValue::Nil);
-                }
-                Value::UserData(value) if value.is::<LuaBlob>() => {
-                    let value = value.borrow::<LuaBlob>().map_err(|_| {
-                        ProjectLuaCallError::violation(
-                            crate::diagnostic::LuaValueViolation::InvalidBlob,
-                        )
-                    })?;
-                    completed_value = Some(ProjectLuaValue::Blob(clone_bytes_with_cancellation(
-                        &value.bytes,
-                        cancellation,
-                    )?));
-                }
-                Value::Table(table) => {
-                    let identity = table.to_pointer();
-                    if !active_tables.insert(identity) {
-                        return Err(ProjectLuaCallError::violation(
-                            crate::diagnostic::LuaValueViolation::CyclicTable,
-                        ));
-                    }
-                    let pairs =
-                        collect_project_table_pairs(table, cancellation, checkpoint)?.into_iter();
-                    frames.push(ProjectTableConversionFrame {
-                        identity,
-                        pairs,
-                        pending_key: None,
-                        integer_fields: BTreeMap::new(),
-                        string_fields: Vec::new(),
-                    });
-                }
-                _ => {
-                    return Err(ProjectLuaCallError::violation(
-                        crate::diagnostic::LuaValueViolation::UnexpectedType,
-                    ));
-                }
-            }
-            continue;
-        }
-
-        if let Some(value) = completed_value.take() {
-            let Some(frame) = frames.last_mut() else {
-                project_value_conversion_checkpoint(cancellation, checkpoint)?;
-                return Ok(value);
-            };
-            let key = frame
-                .pending_key
-                .take()
-                .expect("子值完成时父 table 必须保存对应键");
-            insert_project_table_field(frame, key, value, cancellation, checkpoint)?;
-            continue;
-        }
-
-        let frame = frames.last_mut().expect("未完成转换时必须存在 table frame");
-        if let Some((key, value)) = frame.pairs.next() {
-            frame.pending_key = Some(key);
-            next_value = Some(value);
-            continue;
-        }
-
-        let frame = frames.pop().expect("刚确认存在 table frame");
-        active_tables.remove(&frame.identity);
-        completed_value = Some(finish_project_table(frame, cancellation, checkpoint)?);
-    }
-}
-
-fn collect_project_table_pairs(
-    table: Table,
-    cancellation: &ProjectLuaCancellation,
-    checkpoint: &mut impl FnMut(),
-) -> Result<Vec<(Value, Value)>, ProjectLuaCallError> {
-    let mut pairs = Vec::new();
-    for pair in table.pairs::<Value, Value>() {
-        project_value_conversion_checkpoint(cancellation, checkpoint)?;
-        pairs.push(pair.map_err(|_| {
-            ProjectLuaCallError::violation(crate::diagnostic::LuaValueViolation::InvalidTranslation)
-        })?);
-    }
-    project_value_conversion_checkpoint(cancellation, checkpoint)?;
-    Ok(pairs)
-}
-
-fn insert_project_table_field(
-    frame: &mut ProjectTableConversionFrame,
-    key: Value,
-    value: ProjectLuaValue,
-    cancellation: &ProjectLuaCancellation,
-    checkpoint: &mut impl FnMut(),
-) -> Result<(), ProjectLuaCallError> {
-    project_value_conversion_checkpoint(cancellation, checkpoint)?;
-    match key {
-        Value::Integer(index) => {
-            let index = usize::try_from(index)
-                .ok()
-                .filter(|index| *index > 0)
-                .ok_or_else(|| {
-                    ProjectLuaCallError::violation(
-                        crate::diagnostic::LuaValueViolation::InvalidArrayIndex,
-                    )
-                })?;
-            if frame.integer_fields.insert(index, value).is_some() {
-                return Err(ProjectLuaCallError::violation(
-                    crate::diagnostic::LuaValueViolation::InvalidTranslation,
-                ));
-            }
-        }
-        Value::String(key) => {
-            let key = strict_text(&key, "translation 字段名", cancellation)?;
-            frame.string_fields.push((key, value));
-        }
-        _ => {
-            return Err(ProjectLuaCallError::violation(
-                crate::diagnostic::LuaValueViolation::InvalidTable,
-            ));
-        }
-    }
-    project_value_conversion_checkpoint(cancellation, checkpoint)
-}
-
-fn finish_project_table(
-    frame: ProjectTableConversionFrame,
-    cancellation: &ProjectLuaCancellation,
-    checkpoint: &mut impl FnMut(),
-) -> Result<ProjectLuaValue, ProjectLuaCallError> {
-    let string_fields = sort_project_object_fields(frame.string_fields, cancellation, checkpoint)?;
-    if !frame.integer_fields.is_empty() && !string_fields.is_empty() {
-        return Err(ProjectLuaCallError::violation(
-            crate::diagnostic::LuaValueViolation::InvalidTranslation,
-        ));
-    }
-    if !string_fields.is_empty() || frame.integer_fields.is_empty() {
-        return Ok(ProjectLuaValue::Object(string_fields));
-    }
-
-    let mut values = Vec::with_capacity(frame.integer_fields.len());
-    for (offset, (index, value)) in frame.integer_fields.into_iter().enumerate() {
-        project_value_conversion_checkpoint(cancellation, checkpoint)?;
-        if index != offset + 1 {
-            return Err(ProjectLuaCallError::violation(
-                crate::diagnostic::LuaValueViolation::SparseArray,
-            ));
-        }
-        values.push(value);
-    }
-    project_value_conversion_checkpoint(cancellation, checkpoint)?;
-    Ok(ProjectLuaValue::Array(values))
-}
-
-fn sort_project_object_fields(
-    fields: Vec<(String, ProjectLuaValue)>,
-    cancellation: &ProjectLuaCancellation,
-    checkpoint: &mut impl FnMut(),
-) -> Result<Vec<(String, ProjectLuaValue)>, ProjectLuaCallError> {
-    if fields.len() < 2 {
-        return Ok(fields);
-    }
-
-    let mut order = Vec::with_capacity(fields.len());
-    for index in 0..fields.len() {
-        project_value_conversion_checkpoint(cancellation, checkpoint)?;
-        order.push(index);
-    }
-    let mut scratch = Vec::with_capacity(fields.len());
-    let mut width = 1_usize;
-    while width < order.len() {
-        scratch.clear();
-        let mut start = 0;
-        while start < order.len() {
-            project_value_conversion_checkpoint(cancellation, checkpoint)?;
-            let middle = start.saturating_add(width).min(order.len());
-            let end = start
-                .saturating_add(width.saturating_mul(2))
-                .min(order.len());
-            let mut left = start;
-            let mut right = middle;
-            while left < middle && right < end {
-                project_value_conversion_checkpoint(cancellation, checkpoint)?;
-                let ordering = compare_project_field_names(
-                    &fields[order[left]].0,
-                    &fields[order[right]].0,
-                    cancellation,
-                    checkpoint,
-                )?;
-                if ordering == CmpOrdering::Greater {
-                    scratch.push(order[right]);
-                    right += 1;
-                } else {
-                    scratch.push(order[left]);
-                    left += 1;
-                }
-            }
-            while left < middle {
-                project_value_conversion_checkpoint(cancellation, checkpoint)?;
-                scratch.push(order[left]);
-                left += 1;
-            }
-            while right < end {
-                project_value_conversion_checkpoint(cancellation, checkpoint)?;
-                scratch.push(order[right]);
-                right += 1;
-            }
-            start = end;
-        }
-        std::mem::swap(&mut order, &mut scratch);
-        width = width.checked_mul(2).unwrap_or(order.len());
-    }
-
-    for adjacent in order.windows(2) {
-        project_value_conversion_checkpoint(cancellation, checkpoint)?;
-        if compare_project_field_names(
-            &fields[adjacent[0]].0,
-            &fields[adjacent[1]].0,
-            cancellation,
-            checkpoint,
-        )? == CmpOrdering::Equal
-        {
-            return Err(ProjectLuaCallError::violation(
-                crate::diagnostic::LuaValueViolation::InvalidTranslation,
-            ));
-        }
-    }
-
-    let mut slots = Vec::with_capacity(fields.len());
-    for field in fields {
-        project_value_conversion_checkpoint(cancellation, checkpoint)?;
-        slots.push(Some(field));
-    }
-    let mut sorted = Vec::with_capacity(slots.len());
-    for index in order {
-        project_value_conversion_checkpoint(cancellation, checkpoint)?;
-        sorted.push(slots[index].take().expect("排序索引必须唯一且有效"));
-    }
-    project_value_conversion_checkpoint(cancellation, checkpoint)?;
-    Ok(sorted)
-}
-
-fn compare_project_field_names(
-    left: &str,
-    right: &str,
-    cancellation: &ProjectLuaCancellation,
-    checkpoint: &mut impl FnMut(),
-) -> Result<CmpOrdering, ProjectLuaCallError> {
-    let shared_len = left.len().min(right.len());
-    let mut start = 0;
-    while start < shared_len {
-        project_value_conversion_checkpoint(cancellation, checkpoint)?;
-        let end = start
-            .saturating_add(PROJECT_LUA_SOURCE_CHUNK_BYTES.get())
-            .min(shared_len);
-        let ordering = left.as_bytes()[start..end].cmp(&right.as_bytes()[start..end]);
-        if ordering != CmpOrdering::Equal {
-            return Ok(ordering);
-        }
-        start = end;
-    }
-    project_value_conversion_checkpoint(cancellation, checkpoint)?;
-    Ok(left.len().cmp(&right.len()))
-}
-
-fn project_value_conversion_checkpoint(
-    cancellation: &ProjectLuaCancellation,
-    checkpoint: &mut impl FnMut(),
-) -> Result<(), ProjectLuaCallError> {
-    ensure_project_lua_call_running(cancellation)?;
-    checkpoint();
-    ensure_project_lua_call_running(cancellation)
 }
 
 fn ensure_project_lua_call_running(
@@ -1618,15 +1399,6 @@ fn host_error(
     }
 }
 
-fn transaction_lost_error(operation: LuaOperation) -> LuaHostCallError {
-    LuaHostCallError {
-        domain: "database",
-        operation,
-        error: ProjectLuaCallError::violation(crate::diagnostic::LuaValueViolation::StateMismatch)
-            .with_operation(operation),
-    }
-}
-
 fn sqlite_host_error(operation: LuaOperation, error: rusqlite::Error) -> LuaHostCallError {
     LuaHostCallError {
         domain: "sqlite",
@@ -1714,20 +1486,15 @@ pub(super) fn execute(
 mod tests {
     use super::*;
 
-    const DEEP_PROJECT_VALUE_TABLE_DEPTH: usize = 5_000;
-
     #[test]
-    fn cancelled_host_entry_is_still_counted() {
+    fn cancelled_host_entry_returns_an_error() {
         let lua = Lua::new();
         let cancellation = ProjectLuaCancellation::default();
-        let metrics = Arc::new(BindingMetrics::default());
         let database = build_database_table(
             &lua,
             Rc::new(RefCell::new(
                 Connection::open_in_memory().expect("应建立测试数据库"),
             )),
-            Arc::clone(&metrics),
-            Rc::new(BindingTransactionGuard::default()),
             cancellation.clone(),
         )
         .expect("应建立数据库 Host table");
@@ -1737,12 +1504,10 @@ mod tests {
         query
             .call::<Value>(("SELECT 1", Value::Nil))
             .expect_err("进入 Host 后观察到取消必须返回失败");
-        assert_eq!(metrics.database_calls(), 1);
-        assert_eq!(metrics.changed_rows(), 0);
     }
 
     #[test]
-    fn changed_rows_are_counted_before_post_execute_cancellation() {
+    fn completed_update_is_visible_before_post_execute_cancellation() {
         let lua = Lua::new();
         let cancellation = ProjectLuaCancellation::default();
         let cancel_from_authorizer = cancellation.clone();
@@ -1763,15 +1528,8 @@ mod tests {
             }))
             .expect("应安装取消测试 authorizer");
         let connection = Rc::new(RefCell::new(connection));
-        let metrics = Arc::new(BindingMetrics::default());
-        let database = build_database_table(
-            &lua,
-            Rc::clone(&connection),
-            Arc::clone(&metrics),
-            Rc::new(BindingTransactionGuard::default()),
-            cancellation,
-        )
-        .expect("应建立数据库 Host table");
+        let database = build_database_table(&lua, Rc::clone(&connection), cancellation)
+            .expect("应建立数据库 Host table");
 
         let execute: Function = database.get("execute").expect("应取得 execute Host");
         execute
@@ -1780,8 +1538,6 @@ mod tests {
                 Value::Nil,
             ))
             .expect_err("SQLite 已返回 changed rows 后的取消必须终止脚本");
-        assert_eq!(metrics.database_calls(), 1);
-        assert_eq!(metrics.changed_rows(), 1);
         let translation: String = connection
             .borrow()
             .query_row(
@@ -1791,170 +1547,5 @@ mod tests {
             )
             .expect("事务内应能看到已经发生的更新");
         assert_eq!(translation, "changed");
-    }
-
-    fn deeply_nested_lua_array(lua: &Lua) -> Value {
-        let mut value = Value::Integer(7);
-        for _ in 0..DEEP_PROJECT_VALUE_TABLE_DEPTH {
-            let table = lua.create_table().expect("应建立深层 Lua table");
-            table.raw_set(1, value).expect("应写入深层 Lua table");
-            value = Value::Table(table);
-        }
-        value
-    }
-
-    #[test]
-    fn deeply_nested_table_converts_and_drops_without_using_rust_recursion() {
-        let lua = Lua::new();
-        let cancellation = ProjectLuaCancellation::default();
-        let mut checkpoints = 0_usize;
-        let mut checkpoint = || checkpoints += 1;
-        let converted = lua_to_project_value_with_checkpoint(
-            deeply_nested_lua_array(&lua),
-            &cancellation,
-            &mut checkpoint,
-        )
-        .expect("合法深层 table 应转换成功");
-
-        let mut current = &converted;
-        for _ in 0..DEEP_PROJECT_VALUE_TABLE_DEPTH {
-            let ProjectLuaValue::Array(values) = current else {
-                panic!("深层 table 的每一层都应转换成数组");
-            };
-            assert_eq!(values.len(), 1);
-            current = &values[0];
-        }
-        assert!(matches!(current, ProjectLuaValue::Integer(7)));
-        assert!(checkpoints > DEEP_PROJECT_VALUE_TABLE_DEPTH);
-        drop(converted);
-    }
-
-    #[test]
-    fn deeply_nested_partial_value_drops_safely_on_cancellation_and_error() {
-        let lua = Lua::new();
-        let probe_cancellation = ProjectLuaCancellation::default();
-        let mut total_checkpoints = 0_usize;
-        {
-            let mut probe = || total_checkpoints += 1;
-            drop(
-                lua_to_project_value_with_checkpoint(
-                    deeply_nested_lua_array(&lua),
-                    &probe_cancellation,
-                    &mut probe,
-                )
-                .expect("探测转换应成功"),
-            );
-        }
-
-        let cancellation = ProjectLuaCancellation::default();
-        let cancel_from_checkpoint = cancellation.clone();
-        let cancel_at = total_checkpoints.saturating_mul(3) / 4;
-        let mut observed = 0_usize;
-        let cancelled = {
-            let mut checkpoint = || {
-                observed += 1;
-                if observed == cancel_at {
-                    cancel_from_checkpoint.cancel();
-                }
-            };
-            match lua_to_project_value_with_checkpoint(
-                deeply_nested_lua_array(&lua),
-                &cancellation,
-                &mut checkpoint,
-            ) {
-                Err(error) => error,
-                Ok(_) => panic!("深层 table 转换应观察取消"),
-            }
-        };
-        assert_eq!(cancelled.kind(), "cancelled");
-        assert_eq!(observed, cancel_at);
-
-        let invalid_root = lua.create_table().expect("应建立错误根 table");
-        invalid_root
-            .raw_set(true, deeply_nested_lua_array(&lua))
-            .expect("应写入错误根 table");
-        let invalid = match lua_to_project_value(
-            Value::Table(invalid_root),
-            &ProjectLuaCancellation::default(),
-        ) {
-            Err(error) => error,
-            Ok(_) => panic!("非整数、非字符串键应被拒绝"),
-        };
-        assert_eq!(invalid.kind(), "invalid_table");
-    }
-
-    #[test]
-    fn table_conversion_rejects_cycles_but_allows_shared_subtables() {
-        let lua = Lua::new();
-        let cancellation = ProjectLuaCancellation::default();
-
-        let self_cycle = lua.create_table().expect("应建立自循环 table");
-        self_cycle
-            .raw_set(1, self_cycle.clone())
-            .expect("应写入自循环");
-        let self_error = match lua_to_project_value(Value::Table(self_cycle), &cancellation) {
-            Err(error) => error,
-            Ok(_) => panic!("自循环 table 必须被拒绝"),
-        };
-        assert_eq!(self_error.kind(), "cyclic_table");
-
-        let first = lua.create_table().expect("应建立互循环 table");
-        let second = lua.create_table().expect("应建立互循环 table");
-        first.raw_set(1, second.clone()).expect("应写入互循环");
-        second.raw_set(1, first.clone()).expect("应写入互循环");
-        let mutual_error = match lua_to_project_value(Value::Table(first), &cancellation) {
-            Err(error) => error,
-            Ok(_) => panic!("互循环 table 必须被拒绝"),
-        };
-        assert_eq!(mutual_error.kind(), "cyclic_table");
-
-        let child = lua.create_table().expect("应建立共享子 table");
-        child.raw_set(1, 7).expect("应写入共享子 table");
-        let root = lua.create_table().expect("应建立 DAG 根 table");
-        root.raw_set("left", child.clone())
-            .expect("应写入第一个共享引用");
-        root.raw_set("right", child).expect("应写入第二个共享引用");
-        let converted = lua_to_project_value(Value::Table(root), &cancellation)
-            .expect("没有回边的共享子 table 应允许转换");
-        let ProjectLuaValue::Object(fields) = &converted else {
-            panic!("DAG 根 table 应转换为 object");
-        };
-        assert_eq!(fields.len(), 2);
-        assert_eq!(fields[0].0, "left");
-        assert_eq!(fields[1].0, "right");
-        for (_, value) in fields {
-            let ProjectLuaValue::Array(values) = value else {
-                panic!("共享子 table 的每次引用都应独立转换");
-            };
-            assert!(matches!(values.as_slice(), [ProjectLuaValue::Integer(7)]));
-        }
-    }
-
-    #[test]
-    fn long_common_prefix_object_key_sort_observes_cancellation() {
-        let prefix = "x".repeat(PROJECT_LUA_SOURCE_CHUNK_BYTES.get() * 3);
-        let fields = vec![
-            (format!("{prefix}b"), ProjectLuaValue::Integer(2)),
-            (format!("{prefix}a"), ProjectLuaValue::Integer(1)),
-        ];
-        let cancellation = ProjectLuaCancellation::default();
-        let cancel_from_checkpoint = cancellation.clone();
-        let mut observed = 0_usize;
-        let result = {
-            let mut checkpoint = || {
-                observed += 1;
-                if observed == 5 {
-                    cancel_from_checkpoint.cancel();
-                }
-            };
-            sort_project_object_fields(fields, &cancellation, &mut checkpoint)
-        };
-
-        let error = match result {
-            Err(error) => error,
-            Ok(_) => panic!("长公共前缀字段排序必须观察取消"),
-        };
-        assert_eq!(error.kind(), "cancelled");
-        assert_eq!(observed, 5);
     }
 }

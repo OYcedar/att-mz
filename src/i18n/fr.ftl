@@ -7,7 +7,11 @@ cli-init-about = Initialiser ou mettre à jour un projet de traduction nommé
 cli-extract-about = Synchroniser le texte source depuis l’entrée actuelle du projet
 cli-translate-about = Traduire le texte extrait avec un Profile explicite ou enregistré
 cli-write-back-about = Écrire les traductions actuelles dans la sortie du projet
-cli-project-lua-about = Exécuter une fois un Lua atomique de base de données dans le projet
+cli-manual-about = Gérer les traductions manuelles dans un fichier TOML modifiable
+cli-manual-export-about = Exporter les entrées qui nécessitent une traduction manuelle
+cli-manual-check-about = Vérifier un fichier TOML de traductions sans modifier le projet
+cli-manual-apply-about = Appliquer les traductions manuelles remplies et valides
+cli-project-lua-about = Exécuter un script Lua sur la base de données du projet
 cli-project-name-help = Nom stable du projet
 cli-init-path-help = Répertoire racine d’entrée ; un projet existant peut réutiliser le dernier chemin réussi
 cli-source-language-help = ID de langue source
@@ -21,8 +25,9 @@ cli-dialogue-rules-help = Remplacer la projection des noms de dialogue MV utilis
 cli-profile-help = ID du Profile de traduction ; l’omettre réutilise le dernier Profile réussi
 cli-terms-help = Remplacer la ressource terminologique du projet
 cli-placeholders-help = Remplacer la ressource Placeholder du projet
-cli-project-lua-script-help = Programme Lua atomique de base de données à exécuter une fois
+cli-project-lua-script-help = Script Lua à exécuter sur la base de données du projet
 cli-project-lua-arguments-help = Argument UTF-8 transmis à Lua arg[1..] après --
+cli-manual-file-help = Fichier TOML de traductions manuelles
 cli-usage-heading = Utilisation :
 cli-commands-heading = Commandes :
 cli-options-heading = Options :
@@ -116,9 +121,7 @@ log-run-failed = La commande { $command } a échoué.
 log-run-outcome-unknown = La commande { $command } s’est terminée avec un résultat final inconnu ; suivez les emplacements de récupération indiqués dans l’erreur.
 log-run-cancelled = La commande { $command } a été annulée.
 log-performance-counters = Compteurs de performances : { $sqlite_control_attempted_total } tentatives de contrôle de transaction SQLite ; validations complètes de l’arborescence candidate démarrées { $candidate_validation_started }, terminées { $candidate_validation_completed }.
-log-lua-script = Script Lua { $identity } (SHA-256 { $fingerprint }).
 log-lua-print = Lua : { $message }
-log-lua-summary = Activité Lua : { $database_calls } appels à la base, { $changed_rows } lignes modifiées, { $translation_calls } appels de traduction et { $printed_lines } lignes affichées.
 log-plan-resolved = Le plan de { $command } provient de { $source }.
 log-phase-started = Phase démarrée : { $phase }.
 log-retry-summary = { $count ->
@@ -170,51 +173,10 @@ log-task-outcome-value = { $outcome ->
     [cancelled] annulée
    *[other] terminée sans résultat reconnu
 }
-diagnostic-title = Erreur [{ $code }]
-diagnostic-stage = Étape : { $stage }
 diagnostic-location = Emplacement : { $subject }
 diagnostic-explanation = Cause : { $reason }
-diagnostic-effect = Impact : { $impact }
 diagnostic-resolution = Action : { $action }
 diagnostic-related = Erreur associée { $index } :
-diagnostic-relation-value = { $code ->
-    [cleanup] nettoyage
-    [rollback] retour arrière
-    [discard] abandon
-    [finalization] finalisation
-    [shutdown] arrêt
-    [observability] observabilité
-   *[other] { $code }
-}
-diagnostic-stage-value = { $code ->
-    [process_startup] Démarrage du processus
-    [process_output] Sortie du processus
-    [configuration] Chargement de la configuration
-    [command_preparation] Préparation de la commande
-    [project_opening] Ouverture du projet
-    [init] Initialisation
-    [extract] Extraction
-    [translate] Traduction
-    [write_back] Réécriture
-    [lua] Exécution Lua du projet
-    [model_request] Requête au modèle
-    [run_plan_finalization] Finalisation du plan d’exécution
-    [publication] Publication
-    [shutdown] Arrêt
-    [logging] Journal du projet
-    [runtime] Exécution
-   *[other] __ATT_FALLBACK__
-}
-diagnostic-effect-value = { $code ->
-    [unchanged] L’état n’a pas été modifié
-    [progress_preserved] La progression valide a été conservée
-    [applied] L’état a été appliqué
-    [applied_run_plan_not_saved] L’état a été appliqué, mais le plan d’exécution n’a pas été enregistré
-    [applied_finalization_failed] L’état a été appliqué, mais la finalisation n’a pas abouti
-    [recovery_required] Une récupération est requise avant de pouvoir faire confiance à l’état
-    [outcome_unknown] L’état final est inconnu
-   *[other] __ATT_FALLBACK__
-}
 diagnostic-resolution-value = { $code ->
     [fix_configuration] Corrigez le champ de configuration indiqué, puis réessayez
     [fix_input] Corrigez l’entrée indiquée, puis réessayez
@@ -226,7 +188,7 @@ diagnostic-resolution-value = { $code ->
     [check_model_service] Vérifiez la réponse du service de modèle et les limites du compte
     [preserve_recovery_artifacts] Ne supprimez pas les artefacts de récupération indiqués ; récupérez la sortie avant de réessayer
     [retry] Réessayez l’opération
-    [report_bug] Signalez ce défaut ATT avec le code d’erreur et le chemin du journal
+    [report_bug] Signalez ce défaut ATT et décrivez l’opération en cours
    *[other] __ATT_FALLBACK__
 }
 diagnostic-failure-value = { $code ->
@@ -365,16 +327,13 @@ task-record-parse-error = Erreur d’analyse : { $kind ->
 task-record-attempt-succeeded = Tentative { $number } : réussie ; finish reason { $finish_reason }
 task-record-attempt-token-usage = ; tokens `{ $prompt } / { $completion } / { $total }`
 task-record-attempt-duration = ; durée `{ $duration }`
-task-record-attempt-request-id = ; request ID { $request_id }
-task-record-attempt-response-id = ; response ID { $response_id }
-task-record-attempt-retryable = Tentative { $number } : échec réessayable ; diagnostic `{ $code }` ; durée `{ $duration }`
+task-record-attempt-retryable = Tentative { $number } : échec réessayable ; durée `{ $duration }`
 task-record-attempt-retry-after = ; Retry-After `{ $duration }`
 task-record-attempt-wait-retry = ; nouvelle tentative après `{ $duration }`
 task-record-attempt-wait-completed = ; attente de `{ $duration }` terminée ; tentative suivante non démarrée
 task-record-attempt-wait-cancelled = ; attente prévue de `{ $duration }` ; annulation pendant l’attente
-task-record-attempt-failed = Tentative { $number } : échec de traitement de la requête ou réponse ; diagnostic `{ $code }` ; durée `{ $duration }`
+task-record-attempt-failed = Tentative { $number } : échec de traitement de la requête ou réponse ; durée `{ $duration }`
 task-record-attempt-cancelled = Tentative { $number } : annulée ; durée `{ $duration }`
-task-record-structured-reason = Motif : { $reason }
 task-record-final-status = État : { $state ->
     [complete] terminée, commit confirmé
     [partial] partiellement terminée, commit confirmé
@@ -390,6 +349,6 @@ task-record-final-status = État : { $state ->
 }
 task-record-accepted-written = Acceptées : { $accepted } entrées, écrites à { $written } emplacements réels
 task-record-accepted-outcome-unknown = Validées : { $accepted } entrées ; résultat du commit de base de données impossible à confirmer
-task-record-task-diagnostic = Diagnostic de tâche : `{ $code }` ; motif { $reason }
+task-record-task-diagnostic = Diagnostic de tâche
 task-record-duration-seconds = { $value } secondes
 task-record-duration-milliseconds = { $value } ms

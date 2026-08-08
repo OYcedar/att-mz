@@ -23,9 +23,11 @@ Extract 同时建立供 Translate 使用的稳定文本层次：一个 JSONL 文
 文件中的每行是一个 Group，`units` 数组中的每项是一个 Unit。文件、Group 和 Unit 的自然
 顺序来自当前 JSONL 规格；Current、译文和后续模型任务不参与这次整理。
 
-## 2. 修改后的状态
+## 2. 自动译文状态
 
-| 外部变化 | 结果 |
+下表只描述 `generic_unit` 中的自动译文：
+
+| 外部变化 | 自动译文结果 |
 |---|---|
 | JSON 空白、字段书写顺序或等价转义变化 | 保留译文 |
 | Group 在文件内移动到其他行、文件改名或移到其他 JSONL | 保留译文 |
@@ -37,12 +39,26 @@ Extract 同时建立供 Translate 使用的稳定文本层次：一个 JSONL 文
 | 新增 Group | 新 Group 未翻译 |
 | 新增 Unit | Unit 数量改变，因此该 Group 全部未翻译 |
 
-ATT 只清除实际受影响的 Group 状态，其他文件或 Group 的 Current 译文原样保留。
+ATT 只清除实际受影响的 Group 自动状态，其他文件或 Group 的自动译文原样保留。
+
+## 3. 人工译文状态
+
+Extract 不删除 `generic_manual_translation`。人工记录按当前位置重新判断：
+
+- Group 在同一文件内换行、Unit 调整顺序或同组其他 Unit 改变，不影响目标 Unit 的人工译文；
+- 文件改名或移动、Group ID 或 Unit ID 改变、kind 改变、目标正文形状或原文改变，使该人工
+  记录成为过期；
+- 删除当前位置时，旧原文和人工译文继续保存在人工表中；
+- 以后同一内部位置、文件、kind、正文形状和原文重新匹配时，记录可以再次成为当前；
+- 术语、Prompt、Profile、Client、语言判断和 Placeholder 配置不参与这个判断。
+
+过期人工记录不参与 WriteBack，也不阻止后续自动 Translate。高级 Lua 的
+`ctx.translation.list({ status = "outdated" })` 可以查看保存的旧快照。
 
 成功提交后，数据库保存的内容是当前文件位置、Group、Unit、译文状态和输入指纹；源文件
 副本、去重族、代表项、译文历史和 kind 注册表不在其中。
 
-## 3. 后续命令
+## 4. 后续命令
 
 Translate 与 WriteBack 启动时重新计算外部输入指纹。指纹与最近成功 Extract 不同时，
 命令在修改项目或输出之前停止，并明确要求重新 Extract；同步始终由 Extract 显式完成。

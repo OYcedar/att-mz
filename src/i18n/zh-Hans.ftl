@@ -7,7 +7,11 @@ cli-init-about = 初始化或更新一个命名翻译项目
 cli-extract-about = 从项目当前输入同步原文
 cli-translate-about = 使用显式或已保存的 Profile 翻译已提取原文
 cli-write-back-about = 将当前译文写入项目输出
-cli-project-lua-about = 在项目中一次性运行原子数据库 Lua
+cli-manual-about = 使用可编辑 TOML 管理人工译文
+cli-manual-export-about = 导出当前需要人工补译的条目
+cli-manual-check-about = 只读检查人工译文 TOML
+cli-manual-apply-about = 应用已填写且有效的人工译文
+cli-project-lua-about = 对项目数据库运行 Lua 脚本
 cli-project-name-help = 稳定项目名称
 cli-init-path-help = 输入根目录；已有项目可复用上次成功路径
 cli-source-language-help = 原文语言 ID
@@ -21,8 +25,9 @@ cli-dialogue-rules-help = 替换与 Builtin 配合使用的 MV 对话姓名投�
 cli-profile-help = 翻译 Profile ID；省略时复用上次成功 Profile
 cli-terms-help = 替换项目术语资源
 cli-placeholders-help = 替换项目 Placeholder 资源
-cli-project-lua-script-help = 本次一次性运行的原子数据库 Lua 程序
+cli-project-lua-script-help = 要对项目数据库运行的 Lua 脚本
 cli-project-lua-arguments-help = 在 -- 后传给 Lua arg[1..] 的 UTF-8 参数
+cli-manual-file-help = 人工译文 TOML 文件
 cli-usage-heading = 用法：
 cli-commands-heading = 命令：
 cli-options-heading = 选项：
@@ -113,9 +118,7 @@ log-run-failed = 命令 { $command } 失败。
 log-run-outcome-unknown = 命令 { $command } 结束，但最终结果未知；请按错误中的恢复位置处理。
 log-run-cancelled = 命令 { $command } 已取消。
 log-performance-counters = 性能计数：SQLite 事务控制尝试 { $sqlite_control_attempted_total } 次；完整候选树校验开始 { $candidate_validation_started } 次，完成 { $candidate_validation_completed } 次。
-log-lua-script = Lua 脚本 { $identity }（SHA-256 { $fingerprint }）。
 log-lua-print = Lua：{ $message }
-log-lua-summary = Lua 统计：数据库调用 { $database_calls } 次，修改行 { $changed_rows } 行，译文调用 { $translation_calls } 次，print { $printed_lines } 行。
 log-plan-resolved = 命令 { $command } 的方案来自{ $source }。
 log-phase-started = 阶段开始：{ $phase }。
 log-retry-summary = 共执行 { $count } 次重试。
@@ -164,51 +167,10 @@ log-task-outcome-value = { $outcome ->
     [cancelled] 已取消
    *[other] 结果无法识别
 }
-diagnostic-title = 错误 [{ $code }]
-diagnostic-stage = 阶段：{ $stage }
 diagnostic-location = 位置：{ $subject }
 diagnostic-explanation = 原因：{ $reason }
-diagnostic-effect = 影响：{ $impact }
 diagnostic-resolution = 处理办法：{ $action }
 diagnostic-related = 相关错误 { $index }：
-diagnostic-relation-value = { $code ->
-    [cleanup] 清理
-    [rollback] 回滚
-    [discard] 丢弃
-    [finalization] 收尾
-    [shutdown] 关闭
-    [observability] 可观测性
-   *[other] { $code }
-}
-diagnostic-stage-value = { $code ->
-    [process_startup] 进程启动
-    [process_output] 进程输出
-    [configuration] 配置加载
-    [command_preparation] 命令准备
-    [project_opening] 项目打开
-    [init] 初始化
-    [extract] 提取
-    [translate] 翻译
-    [write_back] 写回
-    [lua] 项目 Lua 执行
-    [model_request] 模型请求
-    [run_plan_finalization] 运行方案收尾
-    [publication] 发布
-    [shutdown] 关闭
-    [logging] 项目日志
-    [runtime] 运行时
-   *[other] __ATT_FALLBACK__
-}
-diagnostic-effect-value = { $code ->
-    [unchanged] 状态未改变
-    [progress_preserved] 已保留有效进度
-    [applied] 状态已生效
-    [applied_run_plan_not_saved] 状态已生效，但运行方案未保存
-    [applied_finalization_failed] 状态已生效，但收尾未完成
-    [recovery_required] 必须先恢复，才能信任当前状态
-    [outcome_unknown] 最终状态未知
-   *[other] __ATT_FALLBACK__
-}
 diagnostic-resolution-value = { $code ->
     [fix_configuration] 修正指出的配置字段后重试
     [fix_input] 修正指出的输入后重试
@@ -220,7 +182,7 @@ diagnostic-resolution-value = { $code ->
     [check_model_service] 检查模型服务响应和账户配额
     [preserve_recovery_artifacts] 不要删除列出的恢复产物；先恢复输出，再重试
     [retry] 重试该操作
-    [report_bug] 携带错误码和日志路径报告 ATT 缺陷
+    [report_bug] 报告此 ATT 缺陷，并说明当时执行的操作
    *[other] __ATT_FALLBACK__
 }
 diagnostic-failure-value = { $code ->
@@ -359,16 +321,13 @@ task-record-parse-error = 解析错误：{ $kind ->
 task-record-attempt-succeeded = 尝试 { $number }：成功；finish reason { $finish_reason }
 task-record-attempt-token-usage = ；token `{ $prompt } / { $completion } / { $total }`
 task-record-attempt-duration = ；耗时 `{ $duration }`
-task-record-attempt-request-id = ；request ID { $request_id }
-task-record-attempt-response-id = ；response ID { $response_id }
-task-record-attempt-retryable = 尝试 { $number }：可重试请求失败；诊断 `{ $code }`；耗时 `{ $duration }`
+task-record-attempt-retryable = 尝试 { $number }：可重试请求失败；耗时 `{ $duration }`
 task-record-attempt-retry-after = ；Retry-After `{ $duration }`
 task-record-attempt-wait-retry = ；等待 `{ $duration }` 后重试
 task-record-attempt-wait-completed = ；等待 `{ $duration }` 已完成，下一次尝试未开始
 task-record-attempt-wait-cancelled = ；计划等待 `{ $duration }`，等待期间取消
-task-record-attempt-failed = 尝试 { $number }：请求或响应处理失败；诊断 `{ $code }`；耗时 `{ $duration }`
+task-record-attempt-failed = 尝试 { $number }：请求或响应处理失败；耗时 `{ $duration }`
 task-record-attempt-cancelled = 尝试 { $number }：已取消；耗时 `{ $duration }`
-task-record-structured-reason = 原因：{ $reason }
 task-record-final-status = 状态：{ $state ->
     [complete] 完成，已确认提交
     [partial] 部分完成，已确认提交
@@ -384,6 +343,6 @@ task-record-final-status = 状态：{ $state ->
 }
 task-record-accepted-written = 已接受：{ $accepted } 项，写入 { $written } 个实际位置
 task-record-accepted-outcome-unknown = 已验收：{ $accepted } 项；数据库提交终态无法确认
-task-record-task-diagnostic = 任务诊断：`{ $code }`；原因 { $reason }
+task-record-task-diagnostic = 任务诊断
 task-record-duration-seconds = { $value } 秒
 task-record-duration-milliseconds = { $value } 毫秒

@@ -65,13 +65,10 @@ use super::placeholder::{
     Pcre2PlaceholderService, PlaceholderProtectionError, PlaceholderRuleCompilationError,
 };
 use super::profile::{ResolvedRpgMakerTranslationResources, RpgMakerTranslationProfile};
-#[cfg(test)]
-use super::semantics::manual_translation_state_fingerprint;
 use super::semantics::{
-    GroupContextFingerprintError, ManualTranslationStateError, PreparedTranslationStatus,
-    ResolvedTranslationSemanticError, ResolvedTranslationSemantics,
+    GroupContextFingerprintError, PreparedTranslationStatus, ResolvedTranslationSemanticError,
+    ResolvedTranslationSemantics,
     group_context_fingerprint_with_cancellation as shared_group_context_fingerprint_with_cancellation,
-    manual_translation_state_fingerprint_with_cancellation,
 };
 use crate::translation::planning_resource::{
     CompiledTerminology, TranslationPlanningResourceReader, TranslationPlanningResourceReadingError,
@@ -652,6 +649,7 @@ pub(super) struct PreparedAsset {
     semantic_order_key: RpgMakerSemanticOrderKey,
     translation: Option<TextUnitContent>,
     translation_state: Option<Sha256Fingerprint>,
+    manual: bool,
 }
 
 #[cfg(test)]
@@ -703,13 +701,14 @@ fn prepare_corpus_with_cancellation(
             for asset in source_assets {
                 ensure_planner_cpu_running(cancellation)
                     .map_err(|()| PrepareCorpusFailure::Cancelled)?;
-                let (identity, semantic_order_key, translation, translation_state) =
+                let (identity, semantic_order_key, translation, translation_state, manual) =
                     asset.into_parts();
                 assets.push(PreparedAsset {
                     identity,
                     semantic_order_key,
                     translation,
                     translation_state,
+                    manual,
                 });
             }
             groups.push(PreparedGroup {
@@ -885,7 +884,9 @@ fn preprocess_scope(
                 Ok(Ok(prepared)) => prepared,
                 Ok(Err(source)) => {
                     let reason = planning_failure_reason(source);
-                    if let Some(translation) = asset.translation {
+                    if !asset.manual
+                        && let Some(translation) = asset.translation
+                    {
                         invalidations.push(TranslationInvalidation::new(
                             asset.identity.clone(),
                             translation,
@@ -944,28 +945,9 @@ fn preprocess_scope(
             )
             .map_err(|()| ScopePreprocessingFailure::Cancelled)?
             .map_err(ScopePreprocessingFailure::Invalid)?;
-            let manual_state = manual_translation_state_fingerprint_with_cancellation(
-                semantics.engine(),
-                semantics.language_pair(),
-                group_context,
-                &asset.identity,
-                &placeholders,
-                || ensure_planner_cpu_running(cancellation),
-            )
-            .map_err(|()| ScopePreprocessingFailure::Cancelled)?
-            .map_err(|source| {
-                ScopePreprocessingFailure::Invalid(match source {
-                    ManualTranslationStateError::EncodeLocation(source) => {
-                        ScopePreprocessingError::StateLocation(source)
-                    }
-                    ManualTranslationStateError::EncodeRole(source) => {
-                        ScopePreprocessingError::StateRole(source)
-                    }
-                })
-            })?;
             let not_applicable = prepared.status() != PreparedTranslationStatus::Active;
             let current = asset.translation.as_ref().is_some_and(|translation| {
-                asset.translation_state == Some(manual_state)
+                asset.manual
                     || (!not_applicable
                         && asset.translation_state == Some(state_context.finish(translation)))
             });
@@ -1312,6 +1294,7 @@ pub(crate) fn translation_state_context(
             semantic_order_key: RpgMakerSemanticOrderKey::new(Vec::new(), 0),
             translation: None,
             translation_state: None,
+            manual: false,
         }],
     };
     let group_context = match group_context_fingerprint_with_cancellation(
@@ -1811,7 +1794,6 @@ struct ExpectedBase {
     state_context: TranslationStateContext,
 }
 
-#[cfg(test)]
 pub(crate) fn expected_line_shape(identity: &TranslationUnitIdentity) -> ExpectedLineShape {
     match expected_line_shape_with_cancellation(identity, &CooperativeCancellation::default()) {
         Ok(shape) => shape,
@@ -2772,6 +2754,7 @@ mod tests {
                             .then(|| TextUnitContent::Value("译文一".to_owned())),
                         translation_state: with_translation
                             .then(|| Sha256Fingerprint::from_bytes([1; 32])),
+                        manual: false,
                     },
                     PreparedAsset {
                         identity: identity(2, second_source, second_context),
@@ -2780,6 +2763,7 @@ mod tests {
                             .then(|| TextUnitContent::Value("译文二".to_owned())),
                         translation_state: with_translation
                             .then(|| Sha256Fingerprint::from_bytes([2; 32])),
+                        manual: false,
                     },
                 ],
             }
@@ -3037,7 +3021,6 @@ mod tests {
         object_index: usize,
         original: &str,
         translation: &str,
-        placeholder_definitions: Vec<super::super::placeholder::PlaceholderRuleDefinition>,
     ) -> RpgMakerTranslationGroup {
         let natural_index = u64::try_from(object_index).expect("测试对象索引必须可转成 u64");
         let group_location =
@@ -3052,37 +3035,15 @@ mod tests {
         );
         let group_order = RpgMakerSemanticOrderKey::new(vec![natural_index], 0);
         let unit_order = RpgMakerSemanticOrderKey::new(vec![natural_index], 1);
-        let semantics =
-            ResolvedTranslationSemantics::for_test_with_placeholders(placeholder_definitions);
-        let prepared = semantics
-            .prepare_content(identity.kind(), identity.source_content())
-            .expect("人工 Current 测试原文应可准备");
-        let group_context = shared_group_context_fingerprint_with_cancellation(
-            TextGroupKind::DatabaseEntry,
-            &group_order,
-            std::iter::once((&unit_order, &identity)),
-            || Ok::<_, Infallible>(()),
-        )
-        .expect("人工 Current 测试 Group 指纹不能取消")
-        .expect("人工 Current 测试 Group 指纹应可建立");
-        let translation_state = manual_translation_state_fingerprint(
-            semantics.engine(),
-            semantics.language_pair(),
-            group_context,
-            &identity,
-            prepared.placeholders(),
-        )
-        .expect("人工 Current 测试状态应可建立");
-
         RpgMakerTranslationGroup::with_semantic_order_key(
             TextGroupKind::DatabaseEntry,
             group_location,
             group_order,
-            vec![RpgMakerTranslationAsset::with_semantic_order_key(
+            vec![RpgMakerTranslationAsset::with_manual_semantic_order_key(
                 identity,
                 unit_order,
-                Some(TextUnitContent::Value(translation.to_owned())),
-                Some(translation_state),
+                TextUnitContent::Value(translation.to_owned()),
+                Sha256Fingerprint::from_bytes([0x71; 32]),
             )],
         )
     }
@@ -3136,6 +3097,7 @@ mod tests {
                     semantic_order_key: asset.semantic_order_key().clone(),
                     translation: None,
                     translation_state: None,
+                    manual: false,
                 })
                 .collect(),
         };
@@ -3173,27 +3135,8 @@ mod tests {
                 TextUnitContent::Value(original.to_owned()),
                 "{}",
             );
-            let prepared = semantics
-                .prepare_content(identity.kind(), identity.source_content())
-                .expect("测试原文应可准备");
             let group_order = RpgMakerSemanticOrderKey::new(vec![1], 0);
             let unit_order = RpgMakerSemanticOrderKey::new(vec![1], 0);
-            let group_context = shared_group_context_fingerprint_with_cancellation(
-                TextGroupKind::DatabaseEntry,
-                &group_order,
-                std::iter::once((&unit_order, &identity)),
-                || Ok::<_, Infallible>(()),
-            )
-            .expect("测试 Group 指纹不能取消")
-            .expect("测试 Group 指纹应可建立");
-            let state = manual_translation_state_fingerprint(
-                semantics.engine(),
-                semantics.language_pair(),
-                group_context,
-                &identity,
-                prepared.placeholders(),
-            )
-            .expect("人工状态应可建立");
             let scope = PreparedScope {
                 key: RpgMakerSemanticScopeKey::StandardDatabase(StandardDataFile::Actors),
                 groups: vec![PreparedGroup {
@@ -3203,7 +3146,8 @@ mod tests {
                         identity,
                         semantic_order_key: unit_order,
                         translation: Some(TextUnitContent::Value("人工译文".to_owned())),
-                        translation_state: Some(state),
+                        translation_state: Some(Sha256Fingerprint::from_bytes([0x72; 32])),
+                        manual: true,
                     }],
                 }],
             };
@@ -3221,7 +3165,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_current_tracks_sibling_source_but_ignores_sibling_translation() {
+    fn manual_current_ignores_sibling_source_and_translation() {
         let semantics = Arc::new(ResolvedTranslationSemantics::for_test());
         let group_location = RpgMakerLocation::value(
             RpgMakerSource::map(1),
@@ -3255,26 +3199,7 @@ mod tests {
         let group_order = RpgMakerSemanticOrderKey::new(vec![1, 1, 0], 0);
         let speaker_order = RpgMakerSemanticOrderKey::new(vec![1, 1, 0], 1);
         let body_order = RpgMakerSemanticOrderKey::new(vec![1, 1, 0], 2);
-        let original_body = body("こんにちは");
-        let group_context = shared_group_context_fingerprint_with_cancellation(
-            TextGroupKind::EventDialogue,
-            &group_order,
-            [(&speaker_order, &speaker), (&body_order, &original_body)].into_iter(),
-            || Ok::<_, Infallible>(()),
-        )
-        .expect("测试 Group 指纹不能取消")
-        .expect("测试 Group 指纹应可建立");
-        let prepared_speaker = semantics
-            .prepare_content(speaker.kind(), speaker.source_content())
-            .expect("测试说话者应可准备");
-        let speaker_state = manual_translation_state_fingerprint(
-            semantics.engine(),
-            semantics.language_pair(),
-            group_context,
-            &speaker,
-            prepared_speaker.placeholders(),
-        )
-        .expect("人工状态应可建立");
+        let speaker_state = Sha256Fingerprint::from_bytes([0x73; 32]);
         let scope = |body_source: &str, body_translation: Option<&str>| PreparedScope {
             key: RpgMakerSemanticScopeKey::Map(
                 crate::rpg_maker::text::MapId::new(1).expect("测试 Map ID 应有效"),
@@ -3288,6 +3213,7 @@ mod tests {
                         semantic_order_key: speaker_order.clone(),
                         translation: Some(TextUnitContent::Value("老师".to_owned())),
                         translation_state: Some(speaker_state),
+                        manual: true,
                     },
                     PreparedAsset {
                         identity: body(body_source),
@@ -3296,6 +3222,7 @@ mod tests {
                             .map(|value| TextUnitContent::Value(value.to_owned())),
                         translation_state: body_translation
                             .map(|_| Sha256Fingerprint::from_bytes([0x91; 32])),
+                        manual: false,
                     },
                 ],
             }],
@@ -3322,12 +3249,14 @@ mod tests {
         )
         .expect("兄弟原文变化应可预处理");
         assert!(
-            !source_changed.scope.groups[0].units[0]
+            source_changed.scope.groups[0].units[0]
                 .as_ref()
                 .expect("说话者应完成准备")
                 .current,
-            "跨 owner 兄弟 Unit 的原文变化必须使人工译文失去 Current"
+            "兄弟 Unit 的原文变化不能使人工译文失去 Current"
         );
+        assert_eq!(source_changed.invalidated, 0);
+        assert!(source_changed.invalidations.is_empty());
     }
 
     #[test]
@@ -3409,6 +3338,7 @@ mod tests {
                         semantic_order_key: speaker_order.clone(),
                         translation: Some(speaker_translation.clone()),
                         translation_state: Some(speaker_state),
+                        manual: false,
                     },
                     PreparedAsset {
                         identity: body(body_source),
@@ -3417,6 +3347,7 @@ mod tests {
                             .map(|value| TextUnitContent::Value(value.to_owned())),
                         translation_state: body_translation
                             .map(|_| Sha256Fingerprint::from_bytes([0x91; 32])),
+                        manual: false,
                     },
                 ],
             }],
@@ -4554,20 +4485,10 @@ pattern = '保護対象'
             ImmediateCpu,
         );
         let source = RpgMakerSource::data(StandardDataFile::Items);
-        let non_source = manual_current_group(
-            source.clone(),
-            1,
-            "12345 {hero}",
-            "人工数字语境 {hero}",
-            definitions.clone(),
-        );
-        let fully_protected = manual_current_group(
-            source.clone(),
-            2,
-            "保護対象",
-            "完整保护语境 保護対象",
-            definitions,
-        );
+        let non_source =
+            manual_current_group(source.clone(), 1, "12345 {hero}", "人工数字语境 {hero}");
+        let fully_protected =
+            manual_current_group(source.clone(), 2, "保護対象", "完整保护语境 保護対象");
         let active = group(source, 3, "翻訳対象", None, Vec::new());
 
         let (_, preparation, tasks) = planner

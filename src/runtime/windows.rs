@@ -15,11 +15,7 @@ use std::thread;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, HANDLE};
-use windows_sys::Win32::Security::Cryptography::{
-    BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
-};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_CASE_SENSITIVE_INFO,
     FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
@@ -68,10 +64,6 @@ pub(crate) enum WindowsFsError {
     FileIdentityChanged {
         path: PathBuf,
     },
-    Cryptography {
-        operation: &'static str,
-        status: i32,
-    },
 }
 
 impl WindowsFsError {
@@ -103,10 +95,6 @@ impl WindowsFsError {
             },
             Self::FileIdentityChanged { path } => FileSystemProblem::IdentityChanged {
                 path: SafePath::new(path),
-            },
-            Self::Cryptography { status, .. } => FileSystemProblem::WindowsStatus {
-                operation: context.operation(),
-                status: *status,
             },
         };
         Diagnostic::file_system(FileSystemIssue::new(context, problem))
@@ -152,9 +140,6 @@ impl fmt::Display for WindowsFsError {
                     path.display()
                 )
             }
-            Self::Cryptography { operation, status } => {
-                write!(formatter, "{operation} 失败（NTSTATUS {status:#010x}）")
-            }
         }
     }
 }
@@ -169,30 +154,9 @@ impl std::error::Error for WindowsFsError {
             | Self::CaseSensitiveDirectory { .. }
             | Self::LockCancelled { .. }
             | Self::RenameTargetExists { .. }
-            | Self::FileIdentityChanged { .. }
-            | Self::Cryptography { .. } => None,
+            | Self::FileIdentityChanged { .. } => None,
         }
     }
-}
-
-/// 使用 Windows 系统首选 CSPRNG 生成可失败的 UUID v4。
-pub(crate) fn secure_uuid_v4(operation: &'static str) -> Result<Uuid, WindowsFsError> {
-    let mut bytes = [0_u8; 16];
-    // SAFETY: 系统首选 RNG 不需要算法句柄，缓冲区在调用期间有效且长度准确。
-    let status = unsafe {
-        BCryptGenRandom(
-            ptr::null_mut(),
-            bytes.as_mut_ptr(),
-            bytes.len() as u32,
-            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-        )
-    };
-    if status != 0 {
-        return Err(WindowsFsError::Cryptography { operation, status });
-    }
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    Ok(Uuid::from_bytes(bytes))
 }
 
 fn io_error(operation: &'static str, path: &Path, source: io::Error) -> WindowsFsError {
@@ -266,15 +230,6 @@ impl FileIdentity {
             volume_serial_number,
             file_id,
         }
-    }
-
-    pub(crate) fn stable_hex(&self) -> String {
-        let mut value = format!("{:016x}", self.volume_serial_number);
-        for byte in self.file_id {
-            use std::fmt::Write as _;
-            write!(&mut value, "{byte:02x}").expect("写入 String 不会失败");
-        }
-        value
     }
 
     pub(crate) fn of(file: &File, path: &Path) -> Result<Self, WindowsFsError> {
@@ -747,10 +702,6 @@ impl ExclusiveFileLock {
             }
             thread::sleep(Duration::from_millis(5));
         }
-    }
-
-    pub(crate) fn identity(&self, path: &Path) -> Result<FileIdentity, WindowsFsError> {
-        FileIdentity::of(&self.file, path)
     }
 }
 

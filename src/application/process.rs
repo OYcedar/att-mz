@@ -27,6 +27,7 @@ use crate::diagnostic::{
     RuntimePanicBoundary, StateEffect, render_diagnostic_report,
 };
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
+use crate::manual::render_manual_command_error;
 
 enum ProductCommandRunReport {
     RpgMaker(ProductionCommandRunReport),
@@ -492,13 +493,17 @@ fn render_generic_command_result(
             let warning_failed =
                 render_generic_project_log_warning_if_present(localizer, warning.as_ref(), stderr)
                     .is_err();
-            let diagnostic = generic_command_error_report(&error);
-            let diagnostic_failed = writeln!(
-                stderr,
-                "{}",
-                render_diagnostic_report(&diagnostic, localizer)
-            )
-            .is_err();
+            let diagnostic_failed = if let Some(manual) = error.manual_error() {
+                render_manual_command_error(manual, stderr).is_err()
+            } else {
+                let diagnostic = generic_command_error_report(&error);
+                writeln!(
+                    stderr,
+                    "{}",
+                    render_diagnostic_report(&diagnostic, localizer)
+                )
+                .is_err()
+            };
             let shutdown_failed =
                 render_generic_shutdown_errors(shutdown_errors, localizer, stderr).is_err();
             if warning_failed || diagnostic_failed || shutdown_failed {
@@ -669,6 +674,21 @@ fn render_generic_output(
                 })
             )
         }
+        GenericCommandOutput::Manual { summary } => match summary {
+            crate::manual::ManualCommandSummary::Exported { entries, file } => {
+                writeln!(stdout, "已导出 {entries} 条：{}", file.display())
+            }
+            crate::manual::ManualCommandSummary::Checked { report } => writeln!(
+                stdout,
+                "有效 {}，未填写 {}，错误 0",
+                report.valid, report.unfilled
+            ),
+            crate::manual::ManualCommandSummary::Applied { report, applied } => writeln!(
+                stdout,
+                "已应用 {applied}，未填写 {}，错误 0",
+                report.unfilled
+            ),
+        },
         GenericCommandOutput::Lua { project, .. } => writeln!(
             stdout,
             "{}",
@@ -1052,7 +1072,9 @@ mod tests {
         assert!(
             String::from_utf8(stderr.bytes)
                 .expect("stderr 应为 UTF-8")
-                .contains("runtime.worker_panicked")
+                .contains(&localizer.format(UiMessage::DiagnosticFailureValue {
+                    code: "worker_panicked",
+                }))
         );
         let order = order
             .lock()
@@ -1125,10 +1147,14 @@ mod tests {
         let stderr = String::from_utf8(stderr).expect("stderr 应为 UTF-8");
         let plain = stderr.replace(['\u{2068}', '\u{2069}'], "");
         let stdout_position = stderr
-            .find("runtime.stdout_write")
+            .find(&localizer.format(UiMessage::DiagnosticFailureValue {
+                code: "operation_failed",
+            }))
             .expect("stdout 写入失败必须成为主错误");
         let shutdown_position = stderr
-            .find("runtime.worker_panicked")
+            .find(&localizer.format(UiMessage::DiagnosticFailureValue {
+                code: "worker_panicked",
+            }))
             .expect("shutdown 失败必须继续呈现");
         assert!(
             stdout_position < shutdown_position,
@@ -1196,9 +1222,10 @@ mod tests {
         assert_eq!(exit, ExitCode::FAILURE);
         let stderr = String::from_utf8(stderr).expect("panic 诊断应为 UTF-8");
         let plain = stderr.replace(['\u{2068}', '\u{2069}'], "");
-        assert!(plain.contains("runtime.result_presentation_panicked"));
+        assert!(plain.contains("内部不变量被破坏"));
         assert!(plain.contains(&project_workspace.to_string_lossy().to_string()));
-        assert!(plain.contains(&log_path.to_string_lossy().to_string()));
+        assert!(!plain.contains(&log_path.to_string_lossy().to_string()));
+        assert!(!plain.contains("runtime.result_presentation_panicked"));
         assert!(!stderr.contains(PANIC_BODY));
     }
 
@@ -1326,7 +1353,7 @@ mod tests {
     }
 
     #[test]
-    fn configuration_errors_render_the_typed_safe_reason_without_using_display() {
+    fn configuration_errors_render_only_object_reason_and_help() {
         let localizer = UiLocalizer::new(crate::i18n::UiLocale::SimplifiedChinese);
         let mut stderr = Vec::new();
         let exit = render_configuration_load_error(
@@ -1344,13 +1371,18 @@ mod tests {
         assert_eq!(exit, ExitCode::FAILURE);
         let stderr = String::from_utf8(stderr).expect("诊断应为 UTF-8");
         let plain = stderr.replace(['\u{2068}', '\u{2069}'], "");
-        assert!(plain.starts_with("错误 [configuration.invalid_toml]"));
-        assert!(stderr.contains("settings.toml"));
-        assert!(plain.contains("line=3"));
-        assert!(plain.contains("column=7"));
-        assert!(stderr.contains("llm.clients.primary"));
-        assert!(plain.contains("toml_failure=type_mismatch"));
-        assert!(plain.contains("expected=table"));
+        assert!(plain.contains("位置：settings.toml"));
+        assert!(plain.contains("原因：值的语法无效"));
+        assert!(plain.contains("处理办法：修正指出的配置字段后重试"));
+        for forbidden in [
+            "configuration.invalid_toml",
+            "line=",
+            "column=",
+            "toml_failure=",
+            "expected=",
+        ] {
+            assert!(!plain.contains(forbidden));
+        }
     }
 
     #[test]
@@ -1365,8 +1397,8 @@ mod tests {
         let selected_stderr =
             String::from_utf8(selected_stderr).expect("已选 locale 诊断应为 UTF-8");
         assert!(
-            selected_stderr.contains(&selected.format(UiMessage::DiagnosticTitle {
-                code: "runtime.process_panicked",
+            selected_stderr.contains(&selected.format(UiMessage::DiagnosticFailureValue {
+                code: "internal_invariant",
             }))
         );
         assert!(!selected_stderr.contains(PANIC_BODY));
@@ -1381,8 +1413,8 @@ mod tests {
         assert_eq!(startup_exit, ExitCode::FAILURE);
         let startup_stderr = String::from_utf8(startup_stderr).expect("解析前诊断应为 UTF-8");
         assert!(
-            startup_stderr.contains(&english.format(UiMessage::DiagnosticTitle {
-                code: "runtime.process_panicked",
+            startup_stderr.contains(&english.format(UiMessage::DiagnosticFailureValue {
+                code: "internal_invariant",
             }))
         );
     }
@@ -1409,12 +1441,18 @@ mod tests {
         assert_eq!(exit, ExitCode::FAILURE);
         let stderr = String::from_utf8(stderr).expect("诊断应为 UTF-8");
         let plain = stderr.replace(['\u{2068}', '\u{2069}'], "");
-        assert!(plain.starts_with("Error [configuration.invalid_value]"));
         assert!(stderr.contains("llm.clients.primary.max_concurrent_requests"));
-        assert!(stderr.contains("C:\\ATT\\att.toml"));
         assert!(stderr.contains('\u{2068}') && stderr.contains('\u{2069}'));
-        assert!(stderr.contains("actual=2000000"));
-        assert!(stderr.contains("maximum=1000000"));
+        assert!(plain.contains("Reason: The value violates the required contract"));
+        assert!(plain.contains("Action: Correct the named configuration field and retry"));
+        for forbidden in [
+            "configuration.invalid_value",
+            "actual=",
+            "maximum=",
+            "C:\\ATT\\att.toml",
+        ] {
+            assert!(!plain.contains(forbidden));
+        }
     }
 
     #[test]
@@ -1446,7 +1484,7 @@ mod tests {
     }
 
     #[test]
-    fn log_degradation_renders_the_safe_operation_path_and_os_code() {
+    fn log_degradation_renders_readable_paths_without_internal_codes() {
         let localizer = UiLocalizer::new(crate::i18n::UiLocale::SimplifiedChinese);
         let source = io::Error::from_raw_os_error(5);
         let task_record = DiagnosticReport::new(
@@ -1499,10 +1537,18 @@ mod tests {
         let task_record_banner = localizer.format(UiMessage::NoticeTaskRecordsDegraded);
         assert_eq!(stderr.matches(project_log_banner.as_str()).count(), 1);
         assert_eq!(stderr.matches(task_record_banner.as_str()).count(), 1);
-        assert!(stderr.contains("observability.project_log.write"));
         assert!(stderr.contains("C:\\project\\logs\\run.jsonl"));
         assert!(stderr.contains("C:\\project\\task-records\\run\\task-000001.md"));
         assert!(stderr.contains("C:\\project\\task-records\\run\\.task-000001.tmp"));
-        assert!(stderr.contains("raw_os_code=5"));
+        assert!(stderr.contains("操作失败"));
+        for forbidden in [
+            "observability.project_log.write",
+            "raw_os_code=",
+            "io_kind=",
+            "operation=",
+            "component=",
+        ] {
+            assert!(!stderr.contains(forbidden));
+        }
     }
 }

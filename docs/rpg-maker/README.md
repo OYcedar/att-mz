@@ -41,9 +41,12 @@ Builtin 和 Rules 可以在同一项目中搭配使用，只要两者声明的�
 - [Extract](extraction.md)：执行 Builtin 与 Rules；
 - [Rules](rules.md)：制作 MV 姓名投影、Extract Rules 与 RPG Maker Placeholder；
 - [Translate](translation.md)：准备语境、全局去重、模型验收和 Current；
+- [Manual](../manual/README.md)：导出、检查并应用仍需人工处理的 TOML 条目；
 - [WriteBack](write-back.md)：从冻结来源构建并发布候选。
 
 独立 [Lua](../lua/README.md) 只操作项目数据库：它不进入上述阶段，也不接触游戏文件。
+普通人工补译使用 Manual TOML；Lua 用于一次批量读取上下文、复杂筛选、批量变换、诊断
+或特殊数据库修改。
 
 完整任务顺序见[翻译项目指南](../guides/translation-project.md)，失败或不完整结果见
 [诊断与恢复指南](../guides/diagnosis-and-recovery.md)，遗漏、补译、输出和实际加载见

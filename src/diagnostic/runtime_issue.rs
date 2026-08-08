@@ -155,6 +155,7 @@ pub(crate) enum RuntimeCommand {
     Rules,
     Translate,
     WriteBack,
+    Manual,
     Lua,
 }
 
@@ -167,6 +168,7 @@ impl RuntimeCommand {
             Self::Rules => "rules",
             Self::Translate => "translate",
             Self::WriteBack => "write_back",
+            Self::Manual => "manual",
             Self::Lua => "lua",
         }
     }
@@ -177,6 +179,7 @@ impl RuntimeCommand {
             Self::Extract | Self::Builtin | Self::Rules => DiagnosticStage::Extract,
             Self::Translate => DiagnosticStage::Translate,
             Self::WriteBack => DiagnosticStage::WriteBack,
+            Self::Manual => DiagnosticStage::Runtime,
             Self::Lua => DiagnosticStage::Lua,
         }
     }
@@ -594,7 +597,7 @@ impl RuntimeIssue {
                 operation: RuntimeOperation::StartWorker,
                 ..
             } => "worker_spawn_failed",
-            Self::Io { .. } => "external_service_unavailable",
+            Self::Io { failure, .. } => failure.summary_code(),
             Self::ResourceLimit { .. } => "invalid_value",
             Self::InvalidConfiguration { .. } => "invalid_value",
             Self::Cancelled { .. } => "lock_cancelled",
@@ -923,10 +926,6 @@ impl FileSystemDiagnosticContext {
     ) -> Self {
         Self { stage, operation }
     }
-
-    pub(crate) const fn operation(self) -> FileSystemOperation {
-        self.operation
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -993,12 +992,6 @@ pub(crate) enum FileSystemJournalViolation {
         line: u64,
         column: u64,
     },
-    InvalidOperationId {
-        frame_index: u64,
-    },
-    NonCanonicalOperationId {
-        frame_index: u64,
-    },
     FrameIdentityMismatch {
         frame_index: u64,
     },
@@ -1010,9 +1003,6 @@ pub(crate) enum FileSystemJournalViolation {
         expected: SafeIdentifier,
         actual: SafeIdentifier,
     },
-    InvalidArtifactFileName,
-    ArtifactIdentityMismatch,
-    ArtifactNamesMismatch,
 }
 
 impl FileSystemJournalViolation {
@@ -1023,14 +1013,9 @@ impl FileSystemJournalViolation {
             Self::NotRegularFile => "not_regular_file",
             Self::CrcMismatch { .. } => "crc_mismatch",
             Self::InvalidJson { .. } => "invalid_json",
-            Self::InvalidOperationId { .. } => "invalid_operation_id",
-            Self::NonCanonicalOperationId { .. } => "noncanonical_operation_id",
             Self::FrameIdentityMismatch { .. } => "frame_identity_mismatch",
             Self::ExtraFrame { .. } => "extra_frame",
             Self::PhaseOrder { .. } => "phase_order",
-            Self::InvalidArtifactFileName => "invalid_artifact_file_name",
-            Self::ArtifactIdentityMismatch => "artifact_identity_mismatch",
-            Self::ArtifactNamesMismatch => "artifact_names_mismatch",
         }
     }
 
@@ -1051,8 +1036,6 @@ impl FileSystemJournalViolation {
                 facts.push(("maximum", maximum.to_string()));
             }
             Self::CrcMismatch { frame_index }
-            | Self::InvalidOperationId { frame_index }
-            | Self::NonCanonicalOperationId { frame_index }
             | Self::FrameIdentityMismatch { frame_index }
             | Self::ExtraFrame { frame_index } => {
                 facts.push(("frame_index", frame_index.to_string()));
@@ -1077,10 +1060,7 @@ impl FileSystemJournalViolation {
                 facts.push(("expected_phase", expected.to_string()));
                 facts.push(("actual_phase", actual.to_string()));
             }
-            Self::NotRegularFile
-            | Self::InvalidArtifactFileName
-            | Self::ArtifactIdentityMismatch
-            | Self::ArtifactNamesMismatch => {}
+            Self::NotRegularFile => {}
         }
         facts
     }
@@ -1285,7 +1265,7 @@ impl FileSystemProblem {
         match self {
             Self::NotFound { .. } => "not_found",
             Self::NotDirectory { .. } | Self::NotFile { .. } => "invalid_path",
-            Self::Io { .. } => "external_service_unavailable",
+            Self::Io { failure, .. } => failure.summary_code(),
             Self::InvalidPath { .. } => "invalid_path",
             Self::HardLink { .. }
             | Self::CaseCollision { .. }
@@ -1309,7 +1289,7 @@ impl FileSystemProblem {
             Self::RecoveryCleanupFailed { .. } => "finalization_failed",
             Self::OutcomeUnknown { .. } => "transaction_outcome_unknown",
             Self::OrdinalKeyTooLarge { .. } => "resource_limit_exceeded",
-            Self::OrdinalKeyIo { .. } => "external_service_unavailable",
+            Self::OrdinalKeyIo { failure, .. } => failure.summary_code(),
         }
     }
 
@@ -1973,7 +1953,7 @@ impl SqliteProblem {
             Self::RootInvalidValue => "invalid_value",
             Self::RootInternalInvariant => "internal_invariant",
             Self::RootBackupIncomplete => "backup_incomplete",
-            Self::Io { .. } => "external_service_unavailable",
+            Self::Io { failure, .. } => failure.summary_code(),
             Self::Driver { .. } => "invalid_value",
             Self::Cancelled { .. } => "lock_cancelled",
             Self::ExecutorClosed { .. } => "executor_closed",

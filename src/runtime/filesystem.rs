@@ -5,7 +5,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Component, Path, PathBuf};
@@ -25,7 +25,6 @@ use async_channel::{Receiver, Sender};
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
-use uuid::Uuid;
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
@@ -62,11 +61,14 @@ use super::windows::{
     create_directories_without_reparse, delete_empty_directory_if_identity,
     delete_regular_file_if_identity, number_of_links, open_directory,
     open_read_write_file_without_reparse, pin_directory_without_reparse, pin_path_without_reparse,
-    pin_regular_file_for_snapshot_read, rename_without_replace_if_identity, secure_uuid_v4,
+    pin_regular_file_for_snapshot_read, rename_without_replace_if_identity,
     validate_local_case_insensitive_ntfs_directory,
 };
 
-const RESERVED_PREFIX: &str = ".directory-publish-";
+const PUBLICATION_DIRECTORY_NAME: &str = ".directory-publish";
+const PUBLICATION_STAGE_NAME: &str = "stage";
+const PUBLICATION_BACKUP_NAME: &str = "backup";
+const PUBLICATION_JOURNAL_NAME: &str = "journal";
 const OBSERVATION_CREATE_OPERATION: &str = "建立可观测性临时文件";
 const OBSERVATION_WRITE_OPERATION: &str = "写入可观测性临时文件";
 const OBSERVATION_FLUSH_OPERATION: &str = "flush 可观测性临时文件";
@@ -1298,7 +1300,6 @@ fn remove_directory_tree_if_identity(
 
 pub(crate) struct SystemStagingState {
     publisher_identity: Arc<()>,
-    operation_id: Uuid,
     parent_root: PathBuf,
     parent_identity: FileIdentity,
     stage_identity: FileIdentity,
@@ -1434,11 +1435,8 @@ fn write_new_terminal_observation_file_sync(
         })?;
     let pinned_parent = create_directories_without_reparse(parent)?;
     let resolved_path = pinned_parent.resolved_path().join(file_name);
-    let temporary_id = secure_uuid_v4("生成可观测性临时文件名")?;
     let mut temporary_name = OsString::from(".");
     temporary_name.push(file_name);
-    temporary_name.push(".");
-    temporary_name.push(temporary_id.as_hyphenated().to_string());
     temporary_name.push(".tmp");
     let temporary_path = pinned_parent.resolved_path().join(temporary_name);
 
@@ -2145,8 +2143,7 @@ fn recover_directory_target_sync(
     let target_root = parent_root.join(target_name);
     let lock_path = target_lock_path(&publisher_config.lock_directory, &target_root)?;
     let target_lock = ExclusiveFileLock::acquire(&lock_path, cancellation)?;
-    let target_artifact_key = target_lock.identity(&lock_path)?.stable_hex();
-    let outcome = recover_target(&target_root, &target_artifact_key, publisher_config)?;
+    let outcome = recover_target(&target_root)?;
     drop(target_lock);
     drop(parent_handle);
     Ok(outcome)
@@ -3279,6 +3276,39 @@ fn hash_frame_prefix(hasher: &mut Sha256, tag: u8, length: u64) {
     hasher.update(length.to_be_bytes());
 }
 
+fn publication_workspace_root(parent_root: &Path, target_name: &OsStr) -> PathBuf {
+    parent_root
+        .join(PUBLICATION_DIRECTORY_NAME)
+        .join(target_name)
+}
+
+fn ensure_publication_workspace(workspace_root: &Path) -> Result<(), SystemFileSystemError> {
+    let publication_root = workspace_root
+        .parent()
+        .expect("目录发布工作目录必有公共父目录");
+    ensure_plain_directory(publication_root, "建立目录发布根目录")?;
+    ensure_plain_directory(workspace_root, "建立目标目录发布工作目录")
+}
+
+fn ensure_plain_directory(
+    path: &Path,
+    operation: &'static str,
+) -> Result<(), SystemFileSystemError> {
+    match fs::create_dir(path) {
+        Ok(()) => {}
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(source) => return Err(io_error(operation, path, source)),
+    }
+    let pinned = pin_directory_without_reparse(path)?;
+    if !pinned.metadata()?.is_dir() {
+        return Err(SystemFileSystemError::InvalidPath {
+            path: path.to_path_buf(),
+            violation: FileSystemPathViolation::UnexpectedObject,
+        });
+    }
+    Ok(())
+}
+
 fn prepare_directory_sync(
     request: DirectoryStageRequest,
     publisher_config: DirectoryPublisherConfig,
@@ -3316,14 +3346,13 @@ fn prepare_directory_sync(
         let target_root = parent_root.join(target_name);
         let lock_path = target_lock_path(&publisher_config.lock_directory, &target_root)?;
         let target_lock = ExclusiveFileLock::acquire(&lock_path, cancellation)?;
-        let target_artifact_key = target_lock.identity(&lock_path)?.stable_hex();
-        let _ = recover_target(&target_root, &target_artifact_key, &publisher_config)?;
+        let _ = recover_target(&target_root)?;
 
-        let operation_id = secure_uuid_v4("生成目录发布操作 ID")?;
-        let stem = format!("{RESERVED_PREFIX}{target_artifact_key}-{operation_id}");
-        let stage_root = parent_root.join(format!("{stem}.stage"));
-        let backup_path = parent_root.join(format!("{stem}.backup"));
-        let journal_path = parent_root.join(format!("{stem}.journal"));
+        let workspace_root = publication_workspace_root(&parent_root, target_name);
+        ensure_publication_workspace(&workspace_root)?;
+        let stage_root = workspace_root.join(PUBLICATION_STAGE_NAME);
+        let backup_path = workspace_root.join(PUBLICATION_BACKUP_NAME);
+        let journal_path = workspace_root.join(PUBLICATION_JOURNAL_NAME);
         fs::create_dir(&stage_root)
             .map_err(|source| io_error("建立目录候选", &stage_root, source))?;
         let stage_handle = open_directory(&stage_root, true).map_err(|source| {
@@ -3374,7 +3403,6 @@ fn prepare_directory_sync(
             request.publish_intent(),
             SystemStagingState {
                 publisher_identity,
-                operation_id,
                 parent_root,
                 parent_identity,
                 stage_identity,
@@ -4424,7 +4452,7 @@ fn validate_windows_name(name: &OsStr, full_path: &Path) -> Result<(), SystemFil
             && (wide_eq_ascii_ignore_case(&base[..3], "COM")
                 || wide_eq_ascii_ignore_case(&base[..3], "LPT"))
             && matches!(base[3], unit if unit >= u16::from(b'1') && unit <= u16::from(b'9')));
-    if reserved_device || wide_starts_with_ascii_ignore_case(&wide, RESERVED_PREFIX) {
+    if reserved_device || wide_eq_ascii_ignore_case(&wide, PUBLICATION_DIRECTORY_NAME) {
         return Err(SystemFileSystemError::InvalidPath {
             path: full_path.to_path_buf(),
             violation: FileSystemPathViolation::ReservedWindowsName,
@@ -4452,7 +4480,14 @@ fn target_lock_path(
     target_root: &Path,
 ) -> Result<PathBuf, SystemFileSystemError> {
     let lock_directory = trusted_lock_directory(configured_lock_directory)?;
-    stable_lock_path(&lock_directory, target_root.as_os_str())
+    let target_name =
+        target_root
+            .file_name()
+            .ok_or_else(|| SystemFileSystemError::InvalidPath {
+                path: target_root.to_path_buf(),
+                violation: FileSystemPathViolation::MissingFileName,
+            })?;
+    stable_lock_path(&lock_directory, target_name)
 }
 
 fn trusted_lock_directory(path: &Path) -> Result<PathBuf, SystemFileSystemError> {
@@ -4485,21 +4520,8 @@ fn stable_lock_path(
     lock_directory: &Path,
     identity: &OsStr,
 ) -> Result<PathBuf, SystemFileSystemError> {
-    let key = windows_ordinal_case_key(identity, Path::new(identity))?;
-    let mut hasher = Sha256::new();
-    hasher.update(b"exclusive-file-lease");
-    hasher.update((key.units().len() as u64).to_le_bytes());
-    for unit in key.units() {
-        hasher.update(unit.to_le_bytes());
-    }
-    let digest = hasher.finalize();
-    let mut file_name = String::with_capacity(digest.len() * 2 + 5);
-    use std::fmt::Write as _;
-    for byte in digest {
-        write!(&mut file_name, "{byte:02x}").expect("写入 String 不会失败");
-    }
-    file_name.push_str(".lock");
-    Ok(lock_directory.join(file_name))
+    validate_windows_name(identity, Path::new(identity))?;
+    Ok(lock_directory.join(identity))
 }
 
 fn windows_ordinal_case_key(
@@ -4536,10 +4558,7 @@ enum JournalPhase {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct JournalRecord {
-    operation_id: String,
     target_name: Vec<u16>,
-    stage_name: Vec<u16>,
-    backup_name: Vec<u16>,
     original_identity: FileIdentity,
     candidate_identity: FileIdentity,
     phase: JournalPhase,
@@ -4679,29 +4698,8 @@ fn read_journal(path: &Path) -> Result<Vec<JournalRecord>, SystemFileSystemError
                 },
             }
         })?;
-        let parsed_operation = Uuid::parse_str(&record.operation_id).map_err(|_| {
-            SystemFileSystemError::JournalCorrupt {
-                path: path.to_path_buf(),
-                violation: FileSystemJournalViolation::InvalidOperationId {
-                    frame_index: journal_usize_to_u64(records.len() + 1),
-                },
-            }
-        })?;
-        if parsed_operation.get_version_num() != 4
-            || parsed_operation.to_string() != record.operation_id
-        {
-            return Err(SystemFileSystemError::JournalCorrupt {
-                path: path.to_path_buf(),
-                violation: FileSystemJournalViolation::NonCanonicalOperationId {
-                    frame_index: journal_usize_to_u64(records.len() + 1),
-                },
-            });
-        }
         if let Some(first) = records.first()
-            && (first.operation_id != record.operation_id
-                || first.target_name != record.target_name
-                || first.stage_name != record.stage_name
-                || first.backup_name != record.backup_name
+            && (first.target_name != record.target_name
                 || first.original_identity != record.original_identity
                 || first.candidate_identity != record.candidate_identity)
         {
@@ -4961,21 +4959,9 @@ fn publish_replace(
     };
     drop(target_handle);
     let mut record = JournalRecord {
-        operation_id: state.operation_id.to_string(),
         target_name: target_root
             .file_name()
             .expect("受信目标必有名称")
-            .encode_wide()
-            .collect(),
-        stage_name: stage_root
-            .file_name()
-            .expect("受信候选必有名称")
-            .encode_wide()
-            .collect(),
-        backup_name: state
-            .backup_path
-            .file_name()
-            .expect("受信备份必有名称")
             .encode_wide()
             .collect(),
         original_identity,
@@ -5395,29 +5381,22 @@ fn recovery_outcome_unknown(
     }
 }
 
-fn recover_target(
-    target_root: &Path,
-    target_artifact_key: &str,
-    _config: &DirectoryPublisherConfig,
-) -> Result<DirectoryRecoveryOutcome, SystemFileSystemError> {
+fn recover_target(target_root: &Path) -> Result<DirectoryRecoveryOutcome, SystemFileSystemError> {
     let parent = target_root.parent().expect("受信发布目标必有父目录");
-    let prefix = format!("{RESERVED_PREFIX}{target_artifact_key}-");
-    let artifacts = scan_recovery_artifacts(target_root, parent, &prefix, &[])?;
-    let mut remaining = artifacts.clone();
+    let target_name = target_root.file_name().expect("受信发布目标必有名称");
+    let workspace_root = publication_workspace_root(parent, target_name);
+    let artifacts = scan_recovery_artifacts(target_root, &workspace_root, &[])?;
+    validate_recovery_artifact_names(target_root, &workspace_root, &artifacts)?;
     let mut changed = false;
-    let journals = artifacts
-        .iter()
-        .filter(|path| path.extension() == Some(OsStr::new("journal")))
-        .cloned()
-        .collect::<Vec<_>>();
-    for journal in journals {
-        recover_journal(target_root, &journal, &remaining)?;
-        remaining.retain(|path| path.file_stem() != journal.file_stem());
+    let journal = workspace_root.join(PUBLICATION_JOURNAL_NAME);
+    if artifacts.contains(&journal) {
+        recover_journal(target_root, &journal, &artifacts)?;
         changed = true;
     }
 
     // journal 恢复完成后重新列举；错误只报告这次确实观察到、仍未处理的路径。
-    let scanned_residuals = scan_recovery_artifacts(target_root, parent, &prefix, &remaining)?;
+    let scanned_residuals = scan_recovery_artifacts(target_root, &workspace_root, &artifacts)?;
+    validate_recovery_artifact_names(target_root, &workspace_root, &scanned_residuals)?;
     let mut residuals = Vec::new();
     let mut metadata = Vec::new();
     for (index, artifact) in scanned_residuals.iter().enumerate() {
@@ -5443,7 +5422,7 @@ fn recover_target(
                 violation: FileSystemRecoveryViolation::ArtifactReparsePoint,
             });
         }
-        if artifact.extension() != Some(OsStr::new("stage")) {
+        if artifact.file_name() != Some(OsStr::new(PUBLICATION_STAGE_NAME)) {
             return Err(SystemFileSystemError::OutcomeUnknown {
                 target_root: target_root.to_path_buf(),
                 artifacts: residuals.clone(),
@@ -5478,16 +5457,41 @@ fn recover_target(
 
 fn scan_recovery_artifacts(
     target_root: &Path,
-    parent: &Path,
-    prefix: &str,
+    workspace_root: &Path,
     last_known: &[PathBuf],
 ) -> Result<Vec<PathBuf>, SystemFileSystemError> {
+    match fs::symlink_metadata(workspace_root) {
+        Ok(metadata) => {
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(SystemFileSystemError::OutcomeUnknown {
+                    target_root: target_root.to_path_buf(),
+                    artifacts: vec![workspace_root.to_path_buf()],
+                    violation: FileSystemRecoveryViolation::ArtifactReparsePoint,
+                });
+            }
+            if !metadata.is_dir() {
+                return Err(SystemFileSystemError::OutcomeUnknown {
+                    target_root: target_root.to_path_buf(),
+                    artifacts: vec![workspace_root.to_path_buf()],
+                    violation: FileSystemRecoveryViolation::UnexpectedResidualArtifact,
+                });
+            }
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(recovery_outcome_unknown(
+                target_root,
+                last_known.to_vec(),
+                io_error("读取目录发布工作目录", workspace_root, source),
+            ));
+        }
+    }
     let mut artifacts = Vec::new();
-    let entries = fs::read_dir(parent).map_err(|source| {
+    let entries = fs::read_dir(workspace_root).map_err(|source| {
         recovery_outcome_unknown(
             target_root,
             last_known.to_vec(),
-            io_error("列举目录恢复产物", parent, source),
+            io_error("列举目录恢复产物", workspace_root, source),
         )
     })?;
     for entry in entries {
@@ -5495,21 +5499,34 @@ fn scan_recovery_artifacts(
             recovery_outcome_unknown(
                 target_root,
                 merge_recovery_artifacts(last_known, &artifacts),
-                io_error("读取目录恢复产物", parent, source),
+                io_error("读取目录恢复产物", workspace_root, source),
             )
         })?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if name.starts_with(prefix)
-            && (name.ends_with(".journal") || name.ends_with(".stage") || name.ends_with(".backup"))
-        {
-            artifacts.push(entry.path());
-        }
+        artifacts.push(entry.path());
     }
     artifacts.sort();
     Ok(artifacts)
+}
+
+fn validate_recovery_artifact_names(
+    target_root: &Path,
+    workspace_root: &Path,
+    artifacts: &[PathBuf],
+) -> Result<(), SystemFileSystemError> {
+    let expected = [
+        workspace_root.join(PUBLICATION_STAGE_NAME),
+        workspace_root.join(PUBLICATION_BACKUP_NAME),
+        workspace_root.join(PUBLICATION_JOURNAL_NAME),
+    ];
+    if artifacts.iter().all(|path| expected.contains(path)) {
+        Ok(())
+    } else {
+        Err(SystemFileSystemError::OutcomeUnknown {
+            target_root: target_root.to_path_buf(),
+            artifacts: artifacts.to_vec(),
+            violation: FileSystemRecoveryViolation::UnexpectedResidualArtifact,
+        })
+    }
 }
 
 fn merge_recovery_artifacts(left: &[PathBuf], right: &[PathBuf]) -> Vec<PathBuf> {
@@ -5523,12 +5540,11 @@ fn merge_recovery_artifacts(left: &[PathBuf], right: &[PathBuf]) -> Vec<PathBuf>
 
 fn pending_operation_artifacts(
     observed_artifacts: &[PathBuf],
-    journal: &Path,
+    _journal: &Path,
     current_operation: impl IntoIterator<Item = PathBuf>,
 ) -> Vec<PathBuf> {
     observed_artifacts
         .iter()
-        .filter(|path| path.file_stem() != journal.file_stem())
         .cloned()
         .chain(current_operation)
         .collect::<BTreeSet<_>>()
@@ -5541,7 +5557,7 @@ fn recover_journal(
     journal: &Path,
     observed_artifacts: &[PathBuf],
 ) -> Result<(), SystemFileSystemError> {
-    let parent = target_root.parent().expect("受信发布目标必有父目录");
+    let workspace_root = journal.parent().expect("受信 journal 必有工作目录");
     let records = match read_journal(journal) {
         Ok(records) => records,
         Err(SystemFileSystemError::JournalCorrupt { path, violation }) => {
@@ -5592,39 +5608,8 @@ fn recover_journal(
             violation: FileSystemRecoveryViolation::TargetNameMismatch,
         });
     }
-    let journal_stem = journal.file_stem().and_then(OsStr::to_str).ok_or_else(|| {
-        SystemFileSystemError::RecoveryJournalCorrupt {
-            path: journal.to_path_buf(),
-            artifacts: observed_artifacts.to_vec(),
-            violation: FileSystemJournalViolation::InvalidArtifactFileName,
-        }
-    })?;
-    let operation_suffix = format!("-{}", record.operation_id);
-    let artifact_key = journal_stem
-        .strip_prefix(RESERVED_PREFIX)
-        .and_then(|value| value.strip_suffix(&operation_suffix))
-        .filter(|value| value.len() == 48 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .ok_or_else(|| SystemFileSystemError::RecoveryJournalCorrupt {
-            path: journal.to_path_buf(),
-            artifacts: observed_artifacts.to_vec(),
-            violation: FileSystemJournalViolation::ArtifactIdentityMismatch,
-        })?;
-    let expected_stem = format!("{RESERVED_PREFIX}{artifact_key}{operation_suffix}");
-    let expected_stage_name = format!("{expected_stem}.stage")
-        .encode_utf16()
-        .collect::<Vec<_>>();
-    let expected_backup_name = format!("{expected_stem}.backup")
-        .encode_utf16()
-        .collect::<Vec<_>>();
-    if record.stage_name != expected_stage_name || record.backup_name != expected_backup_name {
-        return Err(SystemFileSystemError::RecoveryJournalCorrupt {
-            path: journal.to_path_buf(),
-            artifacts: observed_artifacts.to_vec(),
-            violation: FileSystemJournalViolation::ArtifactNamesMismatch,
-        });
-    }
-    let stage = parent.join(OsString::from_wide(&record.stage_name));
-    let backup = parent.join(OsString::from_wide(&record.backup_name));
+    let stage = workspace_root.join(PUBLICATION_STAGE_NAME);
+    let backup = workspace_root.join(PUBLICATION_BACKUP_NAME);
     let target_identity = identity_at(target_root).map_err(|source| {
         recovery_outcome_unknown(target_root, observed_artifacts.to_vec(), source)
     })?;
@@ -5837,6 +5822,8 @@ fn remove_matching_directory(
 
 #[cfg(test)]
 mod tests {
+    use std::os::windows::ffi::OsStringExt;
+
     use super::*;
 
     fn init_recovery_report(error: &SystemFileSystemError) -> DiagnosticReport {
@@ -5893,7 +5880,7 @@ mod tests {
     #[test]
     fn production_discard_error_projects_publication_and_file_system_facts() {
         let error = DirectoryDiscardError::new(
-            PathBuf::from("D:/output/.directory-publish-game.stage"),
+            PathBuf::from("D:/output/.directory-publish/game/stage"),
             Box::new(SystemFileSystemError::Closed),
         );
         let value =
@@ -5903,7 +5890,7 @@ mod tests {
         assert_eq!(value["primary"]["code"], "publication.discard_failed");
         assert_eq!(
             value["primary"]["issue"]["details"]["problem"]["candidate_root"],
-            "D:/output/.directory-publish-game.stage"
+            "D:/output/.directory-publish/game/stage"
         );
         assert_eq!(
             value["primary"]["issue"]["details"]["problem"]["cause"]["diagnostic"]["issue"]["family"],
@@ -5926,25 +5913,20 @@ mod tests {
         }
     }
 
-    fn single_managed_artifact(parent: &Path, extension: &str) -> PathBuf {
-        let matches = fs::read_dir(parent)
-            .expect("应该可列举测试恢复产物")
-            .map(|entry| entry.expect("应该可读取测试恢复目录项").path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(OsStr::to_str)
-                    .is_some_and(|name| name.starts_with(RESERVED_PREFIX))
-                    && path.extension() == Some(OsStr::new(extension))
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(matches.len(), 1, "测试现场应只有一个 {extension} 产物");
-        matches.into_iter().next().expect("已经确认唯一产物")
+    fn single_managed_artifact(target: &Path, name: &str) -> PathBuf {
+        let workspace = publication_workspace_root(
+            target.parent().expect("测试目标必有父目录"),
+            target.file_name().expect("测试目标必有名称"),
+        );
+        let artifact = workspace.join(name);
+        assert!(artifact.exists(), "测试现场应存在 {name} 产物");
+        artifact
     }
 
     #[test]
     fn nested_outcome_unknown_promotes_terminal_effect() {
         let target = PathBuf::from("C:/projects/game");
-        let artifact = PathBuf::from("C:/projects/.directory-publish-test.stage");
+        let artifact = PathBuf::from("C:/projects/.directory-publish/test/stage");
 
         for (error, expected) in [
             (
@@ -6417,53 +6399,25 @@ mod tests {
             "nul.txt",
             "file:ads",
             "trailing.",
-            ".directory-publish-x",
+            ".directory-publish",
         ] {
             assert!(validate_windows_name(OsStr::new(name), Path::new(name)).is_err());
         }
         validate_windows_name(OsStr::new("剧情 数据.json"), Path::new("剧情 数据.json"))
             .expect("Unicode 普通名称应该合法");
 
-        for units in [
-            [
-                u16::from(b'N'),
-                u16::from(b'U'),
-                u16::from(b'L'),
-                u16::from(b'.'),
-                0xd800,
-            ]
-            .as_slice(),
-            [
-                u16::from(b'.'),
-                u16::from(b'd'),
-                u16::from(b'i'),
-                u16::from(b'r'),
-                u16::from(b'e'),
-                u16::from(b'c'),
-                u16::from(b't'),
-                u16::from(b'o'),
-                u16::from(b'r'),
-                u16::from(b'y'),
-                u16::from(b'-'),
-                u16::from(b'p'),
-                u16::from(b'u'),
-                u16::from(b'b'),
-                u16::from(b'l'),
-                u16::from(b'i'),
-                u16::from(b's'),
-                u16::from(b'h'),
-                u16::from(b'-'),
-                u16::from(b'x'),
-                0xdc00,
-            ]
-            .as_slice(),
-        ] {
-            let name = OsString::from_wide(units);
-            assert!(
-                validate_windows_name(&name, Path::new(&name)).is_err(),
-                "孤立 surrogate 不得绕过设备名或发布保留命名空间"
-            );
-        }
+        let units = [
+            u16::from(b'N'),
+            u16::from(b'U'),
+            u16::from(b'L'),
+            u16::from(b'.'),
+            0xd800,
+        ];
+        let name = OsString::from_wide(&units);
+        assert!(
+            validate_windows_name(&name, Path::new(&name)).is_err(),
+            "孤立 surrogate 不得绕过设备名或发布保留命名空间"
+        );
     }
 
     #[test]
@@ -6485,14 +6439,10 @@ mod tests {
 
     #[test]
     fn journal_ignores_only_the_final_incomplete_frame() {
-        let root = std::env::temp_dir().join(format!("journal-test-{}", Uuid::new_v4()));
-        fs::create_dir(&root).expect("测试目录应该可创建");
-        let path = root.join("state.journal");
+        let temporary = tempfile::tempdir().expect("测试目录应该可创建");
+        let path = temporary.path().join("journal");
         let record = JournalRecord {
-            operation_id: Uuid::new_v4().to_string(),
             target_name: "target".encode_utf16().collect(),
-            stage_name: "stage".encode_utf16().collect(),
-            backup_name: "backup".encode_utf16().collect(),
             original_identity: FileIdentity::from_parts(1, [2; 16]),
             candidate_identity: FileIdentity::from_parts(1, [3; 16]),
             phase: JournalPhase::OriginalMoveIntent,
@@ -6506,7 +6456,6 @@ mod tests {
             .expect("应该可写入截断帧");
         let records = read_journal(&path).expect("最终不完整帧应该回退");
         assert_eq!(records.len(), 1);
-        fs::remove_dir_all(root).expect("测试目录应该可清理");
     }
 
     #[test]
@@ -6761,7 +6710,7 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("应该可读取目录发布锁项");
         assert_eq!(lock_files.len(), 1);
-        assert_eq!(lock_files[0].path().extension(), Some(OsStr::new("lock")));
+        assert_eq!(lock_files[0].file_name(), OsStr::new("target"));
         assert!(!target.parent().unwrap().join("locks").exists());
 
         root.discard(staged).await.expect("应该可丢弃候选");
@@ -8170,10 +8119,11 @@ mod tests {
     fn corrupt_recovery_journal_reports_the_complete_observed_inventory() {
         let temporary = tempfile::tempdir().expect("应该可创建临时目录");
         let target = temporary.path().join("target");
-        let stem = ".directory-publish-test-operation";
-        let journal = temporary.path().join(format!("{stem}.journal"));
-        let stage = temporary.path().join(format!("{stem}.stage"));
-        let backup = temporary.path().join(format!("{stem}.backup"));
+        let workspace = publication_workspace_root(temporary.path(), OsStr::new("target"));
+        fs::create_dir_all(&workspace).expect("应该可创建目标恢复目录");
+        let journal = workspace.join(PUBLICATION_JOURNAL_NAME);
+        let stage = workspace.join(PUBLICATION_STAGE_NAME);
+        let backup = workspace.join(PUBLICATION_BACKUP_NAME);
         fs::create_dir(&stage).expect("应该可创建候选恢复产物");
         fs::create_dir(&backup).expect("应该可创建备份恢复产物");
         let payload = b"{}";
@@ -8681,7 +8631,7 @@ mod tests {
                 .expect("应该可等待故障子进程");
             assert!(!status.success(), "故障点 {phase} 必须终止子进程");
 
-            let changed = single_managed_artifact(temporary.path(), extension);
+            let changed = single_managed_artifact(&target, extension);
             fs::remove_dir_all(&changed).expect("应该可移除原受管目录");
             fs::create_dir(&changed).expect("应该可建立不同身份的占位目录");
 

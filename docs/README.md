@@ -15,7 +15,7 @@
 | 继续旧任务且当前状态明确 | 唯一任务清单 → [翻译项目指南](guides/translation-project.md)的当前阶段 → 对应规格 |
 | 不知道旧任务停在哪里 | 唯一任务清单 → [诊断与恢复指南](guides/diagnosis-and-recovery.md) → 权威状态所属规格 |
 | 命令出现失败、Partial、Unavailable、取消、警告或结果未知 | [诊断与恢复指南](guides/diagnosis-and-recovery.md) → 当前阶段规格 → 相关公共或运行时规格 |
-| 调查遗漏、审校质量、人工或 agent 补译、定点修订 | [全量验收指南](guides/acceptance.md) → 问题所属规格；要修改数据库时再读 [Lua](lua/README.md) |
+| 调查遗漏、审校质量、人工或 agent 补译、定点修订 | [全量验收指南](guides/acceptance.md) → [Manual](manual/README.md)；需要批量上下文或复杂数据库操作时再读 [Lua](lua/README.md) |
 | WriteBack、外部转换、部署或最终交付 | [全量验收指南](guides/acceptance.md) → 对应 WriteBack 规格 → [目录发布](runtime/directory-publishing.md) |
 | 发行包缺文件、配置或 Prompt 来源不明 | [发行物规格](runtime/distribution.md)与[配置规格](runtime/configuration.md)；解决前不执行项目命令 |
 | 长期、跨会话或多人任务 | [任务材料规范](guides/task-artifacts.md)；确需新清单时再读[任务清单模板](guides/task-list-template.md) |
@@ -52,7 +52,7 @@ Builtin → Rules → Generic 的选择顺序。具体来源、路径、捕获�
 | Extract | [MV/MZ Extract](rpg-maker/extraction.md)、[Rules](rpg-maker/rules.md) | [Generic Extract](generic/extraction.md)、[JSONL](generic/jsonl.md) | [语言](translation/language.md)、[SQLite](runtime/sqlite.md) |
 | Translate 准备 | [MV/MZ Translate](rpg-maker/translation.md) | [Generic Translate](generic/translation.md) | [公共翻译入口](translation/README.md) |
 | 模型请求与结果 | 对应 Translate 规格 | 对应 Translate 规格 | [TaskBlock](translation/task-planning.md)、[Prompt](translation/prompts.md)、[HTTP](runtime/chat-completions.md)、[任务记录](translation/task-records.md) |
-| 人工或 agent 查询与修订 | [Lua](lua/README.md) | [Lua](lua/README.md) | [SQLite](runtime/sqlite.md)、[验收指南](guides/acceptance.md) |
+| 人工或 agent 查询与修订 | [Manual](manual/README.md) | [Manual](manual/README.md) | [Lua](lua/README.md)、[SQLite](runtime/sqlite.md)、[验收指南](guides/acceptance.md) |
 | WriteBack | [MV/MZ WriteBack](rpg-maker/write-back.md) | [Generic WriteBack](generic/write-back.md) | [目录发布](runtime/directory-publishing.md) |
 | 验收与交付 | [全量验收指南](guides/acceptance.md) | [全量验收指南](guides/acceptance.md) | 实际外部转换和消费者说明 |
 
@@ -105,6 +105,7 @@ Builtin → Rules → Generic 的选择顺序。具体来源、路径、捕获�
 
 ### 公共翻译能力
 
+- [Manual TOML 人工补译](manual/README.md)
 - [公共翻译入口](translation/README.md)
 - [语言](translation/language.md)
 - [术语](translation/terminology.md)

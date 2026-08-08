@@ -25,11 +25,9 @@ Extract 的执行者是 Builtin 与 Rules 两类能力，Lua 不在其中。
 各 owner 的提交彼此独立：Builtin 成功而后续 Rules 失败时，Builtin 的新结果落库，
 旧 Rules 快照保持。
 
-`run_plan.resolved` 使用类型化 Extract selection 保存 Builtin/Rules 选择；最终
-`run_plan.finalized` 保存数据库路径、事务状态、运行是否继续和必要的诊断 occurrence ID，
-不使用自由字符串列表。owner 失败时，`diagnostic.extract` occurrence 保留具体 owner、来源、
-位置、稳定 code 和 `report.effect`；已提交 owner 使用 `progress_preserved`，不能被后续失败
-误报成整个 Extract 未发生。
+`run_plan.resolved` 保存本次 Builtin/Rules 选择；`run_plan.finalized` 保存运行方案是否成功写入
+以及命令是否继续。某个 owner 失败时，可读诊断说明对象、来源、直接原因和修改方法；已经
+提交的 owner 进度继续保留，不能被后续失败误报成整个 Extract 未发生。
 
 ## 2. 资产与身份
 
@@ -42,14 +40,18 @@ Extract 先按引擎结构建立明确的 `Semantic Scope → Group → Unit`。
 - 固定逐项数组；
 - 可自由断行数组。
 
-Unit 身份是 `owner + group_location + unit_role`，排序字段不参与身份。Builtin 与 Rules
-都保存可从冻结来源重新验证的写回 recipe。
+内部身份由来源位置和 Unit 角色确定，排序字段不参与身份。Builtin 与 Rules 都保存可从
+冻结来源重新验证的写回 recipe。内部位置和顺序键不会进入 CLI、Manual、日志或高级 Lua。
 
-Group 和 Unit 的顺序使用同一种规范语义顺序键。键由物理路径的零个或多个 `u64` 段和
-一个 `fragment` 组成；物理路径来自 JSON 对象插入顺序、数组位置、事件位置或插件位置，
-`fragment` 区分同一物理节点内的角色或捕获槽。数据库 BLOB 对每个路径段写入 `0x01`
-和大端 `u64`，最后写入 `0x00` 和 fragment 的大端 `u64`。该 BLOB 的字典序必须与语义
-顺序完全相同，非法编码会被拒绝。
+对人使用的 ID 由当前项目索引生成，例如：
+
+```text
+Skills.json:798:name
+Map023.json:event17:page1:dialogue42
+```
+
+Rules 路径显示解码后的字段名和自然编号，JSON 解码步骤不单独显示；含空格或标点的字段名
+使用 JSON 引号式方括号。程序按完整可读 ID 查当前索引，不解析字符串反推数据库位置。
 
 Builtin 与 Rules 命中相同 kind 和 group location 时属于同一个 Group，读取时按完整顺序
 合并，同时保留每个 Unit 的 owner。Group 顺序键不一致、kind 冲突、重复角色或不同对象
@@ -119,16 +121,20 @@ Rules 的字段、来源、路径、捕获、顺序和错误范围由[规则规�
 
 owner 成功提交时：
 
-- 身份和源语境仍相同的 Unit 继承译文与状态；
-- 原文、形状、Group 语境或写回关系改变的 Unit 清除旧译文；
-- 删除的 Unit 与状态一并删除；
+- 身份和源语境仍相同的 Unit 继承自动译文与状态；
+- 原文、形状、Group 语境或写回关系改变的 Unit 清除旧自动译文；
+- 删除的 Unit 与自动状态一并删除；
 - 新 Unit 为未翻译。
+
+Extract 不删除 `rpg_maker_manual_translation`。位置不存在，或 Group kind、Unit 角色、写回
+recipe、正文形状或原文改变时，人工记录成为过期，但旧原文和译文继续保留。上下文、相邻
+文本、语言、术语、Placeholder 配置、Prompt、Profile 和 Client 不参与人工失效。条件重新
+匹配时，记录可以再次成为当前。
 
 Extract 只负责提取，全程不发出模型请求。成功结果必须包含 owner、Group、Unit、冲突
 摘要和来源指纹，供 Translate 与 WriteBack 重新检查。
 
-Rules command 省略 path 后跳过非字符串参数时，每个聚合事实形成
-`diagnostic.extract` Warn occurrence，具体 RpgMaker issue 保存 rule number、source file、
-command code、parameter、actual type 和 skipped count，resolution 为 `fix_input`。警告不保存
-原始参数值或逐命令位置，也不改变成功提交和退出码。Extract 的 phase 只有明确成功后才写
-`phase.completed`；失败或取消写 `phase.stopped` 并引用诊断，不得在失败路径出现完成事件。
+Rules command 省略 path 后跳过非字符串参数时，可读警告说明规则文件、自然规则号、事件
+命令、参数位置、实际类型、跳过数量和修改方法，不保存原始参数值或内部位置。警告不改变
+成功提交和退出码。Extract 只有明确成功后才写 `phase.completed`；失败或取消写
+`phase.stopped`，不得在失败路径出现完成事件。

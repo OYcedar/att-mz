@@ -23,7 +23,11 @@ Group、JSONL 文件与来源结构之间的边界遵守
 1. [Init](init.md) 绑定外部 JSONL 根和语言对；
 2. [Extract](extraction.md) 读取当前 JSONL 并更新项目状态；
 3. [Translate](translation.md) 处理当前未译内容；
-4. [WriteBack](write-back.md) 生成译后 JSONL。
+4. [Manual](../manual/README.md) 导出、检查并应用仍需人工处理的 TOML 条目；
+5. [WriteBack](write-back.md) 生成译后 JSONL。
+
+普通人工补译使用 Manual TOML。需要一次批量读取上下文、复杂筛选、批量变换、诊断或
+特殊数据库修改时，使用 [Lua](../lua/README.md)。
 
 [JSONL 示例](examples/sample.jsonl)、
 [Generic Placeholder 示例](examples/placeholders.toml)和

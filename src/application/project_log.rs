@@ -11,15 +11,12 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread::{self, JoinHandle};
 
 use crate::diagnostic::{
-    Diagnostic, DiagnosticReport, FileSystemDiagnosticContext, FileSystemDiagnosticStage,
-    FileSystemOperation, ObservabilityComponent, ObservabilityContractViolation,
+    Diagnostic, DiagnosticReport, ObservabilityComponent, ObservabilityContractViolation,
     ObservabilityIssue, RuntimeCommand, RuntimeEngine, RuntimeIssue, SafePath, StateEffect,
     render_diagnostic_report,
 };
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
-use crate::project_lua::{
-    ProjectLuaCallError, ProjectLuaPrintSink, ProjectLuaRunMetrics, ProjectLuaRunReport,
-};
+use crate::project_lua::{ProjectLuaCallError, ProjectLuaPrintSink};
 use crate::runtime::performance::RunPerformanceCounters;
 use crate::runtime::project_log::{
     DiagnosticOccurrenceId, DiagnosticScope, EmitDisposition, PreparedTerminalDiagnostic,
@@ -27,7 +24,7 @@ use crate::runtime::project_log::{
     ProjectLogHealthCursor, ProjectLogHealthSnapshot, ProjectLogRuntime, ProjectLogger,
     RunFinished, TranslationTaskCounters,
 };
-use crate::runtime::run_id::generate_run_id;
+use crate::runtime::run_id::reserve_run_log;
 use crate::translation::task_record::TaskRecordDiagnosticRecorder;
 
 use super::config::CommonCommandConfiguration;
@@ -370,57 +367,6 @@ impl ProjectLuaPrintSink for ProjectLogLuaPrintSink {
     }
 }
 
-pub(crate) struct ProjectLuaSummaryGuard {
-    handle: ProjectLogHandle,
-    metrics: Option<ProjectLuaRunMetrics>,
-    emitted: bool,
-}
-
-impl ProjectLuaSummaryGuard {
-    pub(crate) fn new(project_log: &ActiveProjectLog) -> Self {
-        Self {
-            handle: project_log.handle.clone(),
-            metrics: None,
-            emitted: false,
-        }
-    }
-
-    pub(crate) fn track(&mut self, metrics: ProjectLuaRunMetrics) {
-        self.metrics = Some(metrics);
-    }
-
-    pub(crate) fn emit(&mut self, report: ProjectLuaRunReport) {
-        if self.emitted {
-            return;
-        }
-        emit_project_lua_summary(&self.handle, report);
-        self.emitted = true;
-    }
-}
-
-impl Drop for ProjectLuaSummaryGuard {
-    fn drop(&mut self) {
-        if self.emitted {
-            return;
-        }
-        let report = self
-            .metrics
-            .as_ref()
-            .map_or_else(ProjectLuaRunReport::default, ProjectLuaRunMetrics::report);
-        emit_project_lua_summary(&self.handle, report);
-        self.emitted = true;
-    }
-}
-
-fn emit_project_lua_summary(handle: &ProjectLogHandle, report: ProjectLuaRunReport) {
-    handle.emit(ProjectLogEvent::LuaSummary {
-        database_calls: report.database_calls(),
-        changed_rows: report.changed_rows(),
-        translation_calls: report.translation_calls(),
-        printed_lines: report.printed_lines(),
-    });
-}
-
 pub(crate) struct ActiveProjectLog {
     run_id: Option<String>,
     runtime: Option<ProjectLogRuntime>,
@@ -615,19 +561,49 @@ pub(crate) fn start_command_log(input: CommandLogStart<'_>) -> ActiveProjectLog 
         .projects_root()
         .join(engine_storage_name(engine))
         .join(project);
+    let context = match ProjectLogContext::new(locale, engine, project, command) {
+        Ok(context) => context,
+        Err(_) => {
+            let (warnings, warning_presenter) = create_warning_state(locale, None);
+            warnings.record(
+                WarningCategory::ProjectLog,
+                DiagnosticReport::new(
+                    StateEffect::Unchanged,
+                    Diagnostic::observability(ObservabilityIssue::contract(
+                        ObservabilityComponent::ProjectLog,
+                        ObservabilityContractViolation::InvalidContextIdentifier,
+                    )),
+                ),
+            );
+            return ActiveProjectLog {
+                run_id: None,
+                runtime: None,
+                handle: ProjectLogHandle {
+                    logger: None,
+                    warnings,
+                },
+                warning_presenter,
+                performance,
+                log_path: None,
+                engine,
+                command,
+                project_workspace,
+            };
+        }
+    };
     let logs_root = project_workspace.join("logs");
-
-    let run_id = match generate_run_id() {
-        Ok(run_id) => run_id,
+    let (run_id, log_path, reserved_file) = match reserve_run_log(&project_workspace) {
+        Ok(reserved) => reserved,
         Err(source) => {
             let (warnings, warning_presenter) = create_warning_state(locale, None);
             warnings.record(
                 WarningCategory::ProjectLog,
                 DiagnosticReport::new(
                     StateEffect::Unchanged,
-                    source.diagnostic(FileSystemDiagnosticContext::new(
-                        FileSystemDiagnosticStage::ProcessStartup,
-                        FileSystemOperation::Cryptography,
+                    Diagnostic::observability(ObservabilityIssue::create(
+                        ObservabilityComponent::ProjectLog,
+                        SafePath::new(&logs_root),
+                        &source,
                     )),
                 ),
             );
@@ -648,66 +624,7 @@ pub(crate) fn start_command_log(input: CommandLogStart<'_>) -> ActiveProjectLog 
         }
     };
     let run_id_text = run_id.to_string();
-    let log_path = logs_root.join(format!("{run_id_text}.jsonl"));
     let (warnings, warning_presenter) = create_warning_state(locale, Some(log_path.clone()));
-
-    let context = match ProjectLogContext::new(locale, engine, project, command) {
-        Ok(context) => context,
-        Err(_) => {
-            warnings.record(
-                WarningCategory::ProjectLog,
-                DiagnosticReport::new(
-                    StateEffect::Unchanged,
-                    Diagnostic::observability(ObservabilityIssue::contract(
-                        ObservabilityComponent::ProjectLog,
-                        ObservabilityContractViolation::InvalidContextIdentifier,
-                    )),
-                ),
-            );
-            return ActiveProjectLog {
-                run_id: Some(run_id_text),
-                runtime: None,
-                handle: ProjectLogHandle {
-                    logger: None,
-                    warnings,
-                },
-                warning_presenter,
-                performance,
-                log_path: Some(log_path),
-                engine,
-                command,
-                project_workspace,
-            };
-        }
-    };
-
-    if let Err(source) = std::fs::create_dir_all(&logs_root) {
-        warnings.record(
-            WarningCategory::ProjectLog,
-            DiagnosticReport::new(
-                StateEffect::Unchanged,
-                Diagnostic::observability(ObservabilityIssue::create(
-                    ObservabilityComponent::ProjectLog,
-                    SafePath::new(&logs_root),
-                    &source,
-                )),
-            ),
-        );
-        return ActiveProjectLog {
-            run_id: Some(run_id_text),
-            runtime: None,
-            handle: ProjectLogHandle {
-                logger: None,
-                warnings,
-            },
-            warning_presenter,
-            performance,
-            log_path: Some(log_path),
-            engine,
-            command,
-            project_workspace,
-        };
-    }
 
     let drop_report = DiagnosticReport::new(
         StateEffect::OutcomeUnknown,
@@ -718,8 +635,9 @@ pub(crate) fn start_command_log(input: CommandLogStart<'_>) -> ActiveProjectLog 
             log_path: Some(SafePath::new(&log_path)),
         }),
     );
-    let runtime = match ProjectLogRuntime::start_file(
+    let runtime = match ProjectLogRuntime::start_reserved_file(
         &log_path,
+        reserved_file,
         context,
         run_id,
         Arc::clone(&performance),

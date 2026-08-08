@@ -1,3 +1,5 @@
+ctx.db.execute("BEGIN IMMEDIATE")
+
 ctx.db.execute([[
   CREATE TABLE IF NOT EXISTS lua_notes (
     key  TEXT PRIMARY KEY,
@@ -13,3 +15,5 @@ ctx.db.execute(
   "ON CONFLICT(key) DO UPDATE SET note = excluded.note",
   { key, note }
 )
+
+ctx.db.execute("COMMIT")

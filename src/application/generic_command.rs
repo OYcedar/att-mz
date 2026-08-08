@@ -24,11 +24,11 @@ use time::OffsetDateTime;
 use super::command::TerminationSignals;
 use super::config::{
     ConfigurationLoadError, ConfiguredGenericCommand, ConfiguredGenericWriteBackCommand,
-    ConfiguredProjectLuaCommand, ConfiguredTranslateCommand,
+    ConfiguredManualCommand, ConfiguredProjectLuaCommand, ConfiguredTranslateCommand,
 };
 use super::project_log::{
     ActiveProjectLog, CommandLogStart, PendingProjectLog, ProjectLogHandle, ProjectLogLuaPrintSink,
-    ProjectLuaSummaryGuard, start_command_log,
+    start_command_log,
 };
 use super::translation_prompt::{
     PromptResourceLoadError, PromptTemplateError,
@@ -66,14 +66,14 @@ use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::generic::build_write_back_candidate;
 use crate::generic::{
     AutomaticStateResources, CancellableTextMap, CommitTranslationsOutcome, ExtractOutcome,
-    GenericCompiledPlaceholderRules, GenericInitRequest, GenericPlaceholderService,
-    GenericPlanningError, GenericPlanningUnitLocator, GenericProject, GenericProjectError,
-    GenericProjectStore, GenericProtectedText, GenericStoredSnapshot, GenericTaskRecordDocument,
-    GenericTaskRecordState, GenericTaskResponseRecord, GenericUnitKey, GenericUnitMap,
-    GenericWriteBackCandidate, GenericWriteBackError, PlannedTask, PlanningUnit, ResponseProblem,
-    TranslationAcceptance, TranslationPlan, TranslationWrite, ValidatedReuse,
-    accept_parsed_response_with_cancellation, build_write_back_candidate_with_cancellation,
-    current_translation_for_stored_with_cancellation,
+    GenericCompiledPlaceholderRules, GenericCurrentTranslation, GenericInitRequest,
+    GenericPlaceholderService, GenericPlanningError, GenericPlanningUnitLocator, GenericProject,
+    GenericProjectError, GenericProjectStore, GenericProtectedText, GenericStoredSnapshot,
+    GenericTaskRecordDocument, GenericTaskRecordState, GenericTaskResponseRecord, GenericUnitKey,
+    GenericUnitMap, GenericWriteBackCandidate, GenericWriteBackError, PlannedTask, PlanningUnit,
+    ResponseProblem, TranslationAcceptance, TranslationOrigin, TranslationPlan, TranslationWrite,
+    ValidatedReuse, accept_parsed_response_with_cancellation,
+    build_write_back_candidate_with_cancellation, current_translation_for_stored_with_cancellation,
     ensure_input_fingerprints_current_with_cancellation,
     plan_translation_with_validator_and_cancellation,
     terminology_hit_fingerprint_with_cancellation,
@@ -87,6 +87,7 @@ use crate::language::{
 use crate::llm::{
     ChatMessage, ChatMessageRole, LlmClientConcurrency, LlmClientSemanticIdentity, LlmFinishReason,
 };
+use crate::manual::{ManualCommandError, ManualCommandSummary, execute_generic_manual_command};
 #[cfg(not(test))]
 use crate::progress::ProgressObserver;
 use crate::progress::{
@@ -98,8 +99,7 @@ use crate::project_lease::{
 use crate::project_lua::{
     ProjectLuaCancellation, ProjectLuaEngine, ProjectLuaFailure, ProjectLuaProgram,
     ProjectLuaProject, ProjectLuaRunError, ProjectLuaRunRequest,
-    compile_project_lua_program_with_cancellation,
-    fingerprint_project_lua_program_with_cancellation, generic_project_lua_adapter,
+    compile_project_lua_program_with_cancellation, generic_project_lua_adapter_for_name,
     run_project_lua,
 };
 use crate::project_name::ProjectName;
@@ -159,7 +159,7 @@ use crate::translation_protocol::{
 };
 
 const GENERIC_ENGINE_NAME: &str = "generic";
-const WRITE_BACK_SCRATCH_PREFIX: &str = ".generic-write-back-";
+const WRITE_BACK_SCRATCH_NAME: &str = ".write_back.tmp";
 const WRITE_BACK_PUBLICATION_CANCELLABLE: u8 = 0;
 const WRITE_BACK_PUBLICATION_CANCELLED: u8 = 1;
 const WRITE_BACK_PUBLICATION_STARTED: u8 = 2;
@@ -320,6 +320,9 @@ pub(crate) enum GenericCommandOutput {
         symbol_repair_repaired_units: usize,
         symbol_repair_skipped_units: usize,
         symbol_repair_replacements: usize,
+    },
+    Manual {
+        summary: ManualCommandSummary,
     },
     Lua {
         project: ProjectName,
@@ -545,6 +548,25 @@ impl Error for GenericCommandError {
     }
 }
 
+impl GenericCommandError {
+    pub(crate) fn manual_error(&self) -> Option<&ManualCommandError> {
+        match self {
+            Self::Operation { failure } => {
+                failure.source_error().downcast_ref::<ManualCommandError>()
+            }
+            Self::Signal {
+                operation: Some(operation),
+                ..
+            }
+            | Self::PublishDiscard { operation, .. } => operation.manual_error(),
+            Self::Cancelled
+            | Self::Signal {
+                operation: None, ..
+            } => None,
+        }
+    }
+}
+
 pub(crate) fn generic_command_error_report(error: &GenericCommandError) -> DiagnosticReport {
     match error {
         GenericCommandError::Cancelled => DiagnosticReport::new(
@@ -693,6 +715,11 @@ fn generic_command_panic_context(command: &ConfiguredGenericCommand) -> GenericC
         ),
         ConfiguredGenericCommand::WriteBack(command) => (
             crate::diagnostic::RuntimeCommand::WriteBack,
+            command.common().projects_root(),
+            command.project_name().as_str(),
+        ),
+        ConfiguredGenericCommand::Manual(command) => (
+            crate::diagnostic::RuntimeCommand::Manual,
             command.common().projects_root(),
             command.project_name().as_str(),
         ),
@@ -971,10 +998,75 @@ impl ProductionGenericCommandRunner {
             ConfiguredGenericCommand::WriteBack(command) => {
                 self.run_write_back(command, termination_signals).await
             }
+            ConfiguredGenericCommand::Manual(command) => {
+                self.run_manual(command, termination_signals).await
+            }
             ConfiguredGenericCommand::Lua(command) => {
                 self.run_lua(command, termination_signals).await
             }
         }
+    }
+
+    async fn run_manual(
+        self,
+        command: ConfiguredManualCommand,
+        termination_signals: &mut TerminationSignals,
+    ) -> GenericCommandRunReport {
+        let performance = Arc::new(RunPerformanceCounters::default());
+        let file_system =
+            match start_file_system(command.common().filesystem().clone(), performance) {
+                Ok(file_system) => file_system,
+                Err(source) => {
+                    return GenericCommandRunReport::failed(generic_file_system_build_failure(
+                        source,
+                    ));
+                }
+            };
+        let cancellation = CooperativeCancellation::default();
+        let progress = generic_terminal_progress(self.locale);
+        let project_log = generic_project_log_slot();
+        let project = command.project_name().clone();
+        let database_path =
+            generic_workspace(command.common().projects_root(), &project).join("project.db");
+        let operation = command.operation();
+        let file = command.file().to_path_buf();
+        let language_modules = command.language_modules().clone();
+        let lease_provider = ProjectCommandLeaseService::new(
+            command.common().projects_root().to_path_buf(),
+            GENERIC_ENGINE_NAME,
+            file_system.clone(),
+        );
+        let operation_project = project.clone();
+        let operation_cancellation = cancellation.clone();
+        let operation = async move {
+            ensure_generic_operation_running(&operation_cancellation)?;
+            let _lease = lease_provider
+                .acquire(&operation_project)
+                .await
+                .map_err(generic_project_lease_failure)?;
+            ensure_generic_operation_running(&operation_cancellation)?;
+            let summary = tokio::task::spawn_blocking(move || {
+                execute_generic_manual_command(&database_path, operation, &file, &language_modules)
+            })
+            .await
+            .map_err(|source| generic_blocking_join_failure(source, StateEffect::Unchanged))?
+            .map_err(generic_manual_failure)?;
+            Ok(GenericCommandOutput::Manual { summary })
+        };
+        let cancellation_file_system = file_system.clone();
+        drive_and_shutdown(
+            operation,
+            termination_signals,
+            move || {
+                cancellation.request();
+                cancellation_file_system.cancel_waits();
+            },
+            file_system,
+            Vec::new(),
+            project_log,
+            progress,
+        )
+        .await
     }
 
     async fn run_lua(
@@ -984,6 +1076,7 @@ impl ProductionGenericCommandRunner {
     ) -> GenericCommandRunReport {
         let performance = Arc::new(RunPerformanceCounters::default());
         let project_name = command.project_name().clone();
+        let language_modules = command.language_modules().clone();
         let project_log = generic_project_log_slot();
         install_generic_project_log(
             &project_log,
@@ -996,16 +1089,6 @@ impl ProductionGenericCommandRunner {
                 performance: Arc::clone(&performance),
             }),
         );
-        let mut lua_summary = {
-            let project_log = project_log
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            ProjectLuaSummaryGuard::new(
-                project_log
-                    .as_ref()
-                    .expect("Generic Lua 必须在建立摘要守卫前建立项目日志"),
-            )
-        };
         let file_system_configuration = command.common().filesystem().clone();
         let file_system =
             match start_file_system(file_system_configuration, Arc::clone(&performance)) {
@@ -1038,15 +1121,13 @@ impl ProductionGenericCommandRunner {
         let operation_cancellation = cancellation.clone();
         let cancellation_file_system = file_system.clone();
         let output_name = project_name.clone();
-        let (print_sink, preflight_log) = {
+        let print_sink = {
             let project_log = project_log
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            project_log.as_ref().map_or((None, None), |project_log| {
-                (
-                    Some(Arc::new(ProjectLogLuaPrintSink::from_active(project_log))),
-                    Some(project_log.handle().clone()),
-                )
+            project_log.as_ref().map(|project_log| {
+                Arc::new(ProjectLogLuaPrintSink::from_active(project_log))
+                    as Arc<dyn crate::project_lua::ProjectLuaPrintSink>
             })
         };
         let operation = async move {
@@ -1063,16 +1144,6 @@ impl ProductionGenericCommandRunner {
             let preflight_cancellation = operation_lua_cancellation.clone();
             let preparation = tokio::task::spawn_blocking(move || {
                 let program = ProjectLuaProgram::new(identity, source, arguments);
-                let fingerprint = fingerprint_project_lua_program_with_cancellation(
-                    &program,
-                    &preflight_cancellation,
-                )?;
-                if let Some(preflight_log) = preflight_log {
-                    preflight_log.emit(
-                        ProjectLogEvent::lua_script(program.identity(), fingerprint.hex())
-                            .expect("Lua 程序指纹必须保持非空且不含控制字符"),
-                    );
-                }
                 compile_project_lua_program_with_cancellation(&program, &preflight_cancellation)?;
                 Ok::<_, ProjectLuaFailure>(program)
             })
@@ -1095,17 +1166,10 @@ impl ProductionGenericCommandRunner {
                 .await
                 .map_err(generic_project_lease_failure)?;
             ensure_generic_operation_running(&operation_cancellation)?;
-            let project_database_path = store.database_path().to_path_buf();
-            let project = run_project_blocking(
-                GenericDiagnosticStage::ProjectOpening,
-                StateEffect::Unchanged,
-                project_database_path,
-                move || store.open(),
-            )
-            .await?;
-            let database_path = project.database_path().to_path_buf();
+            let database_path = store.database_path().to_path_buf();
             let lua_project_name = output_name.as_str().to_owned();
-            let lua_adapter = generic_project_lua_adapter(project, operation_cancellation.clone());
+            let lua_adapter =
+                generic_project_lua_adapter_for_name(lua_project_name.clone(), language_modules);
             let request = ProjectLuaRunRequest::new(
                 ProjectLuaProject::new(lua_project_name, ProjectLuaEngine::Generic),
                 program,
@@ -1116,8 +1180,6 @@ impl ProductionGenericCommandRunner {
                 Some(print_sink) => request.with_print_sink(print_sink),
                 None => request,
             };
-            let lua_metrics = request.metrics();
-            lua_summary.track(lua_metrics.clone());
             operation_progress.observe(ProgressSnapshot::indeterminate(
                 GenericProgressPhase::RunningLua,
             ));
@@ -1135,8 +1197,6 @@ impl ProductionGenericCommandRunner {
                 run_project_lua(connection, request).map_err(GenericLuaExecutionError::Run)
             })
             .await;
-            let report = lua_metrics.report();
-            lua_summary.emit(report);
             let execution = execution.map_err(|source| {
                 generic_blocking_join_failure(source, StateEffect::OutcomeUnknown)
             })?;
@@ -1988,6 +2048,7 @@ impl GenericLuaExecutionError {
             self,
             Self::Run(
                 ProjectLuaRunError::NotStarted(ProjectLuaFailure::Cancelled)
+                    | ProjectLuaRunError::Failed(ProjectLuaFailure::Cancelled)
                     | ProjectLuaRunError::RolledBack(ProjectLuaFailure::Cancelled)
             )
         )
@@ -2284,6 +2345,8 @@ struct GenericUnitLocator {
     group_id: String,
     unit_id: String,
     role: String,
+    line: usize,
+    unit: usize,
 }
 
 impl fmt::Display for GenericPreparationError {
@@ -2313,21 +2376,13 @@ impl Error for GenericPreparationError {
 fn generic_placeholder_protection_failure(
     source: crate::generic::GenericPlaceholderError,
     rule_source: &GenericPlaceholderRuleSource,
-    relative_path: &Path,
-    group_id: &str,
-    unit_id: &str,
-    role: &str,
+    locator: &GenericUnitLocator,
 ) -> GenericPreparationError {
     match source {
         crate::generic::GenericPlaceholderError::Protection(source) => {
             GenericPreparationError::PlaceholderProtection {
                 rule_source: rule_source.clone(),
-                locator: GenericUnitLocator {
-                    relative_path: relative_path.to_path_buf(),
-                    group_id: group_id.to_owned(),
-                    unit_id: unit_id.to_owned(),
-                    role: role.to_owned(),
-                },
+                locator: locator.clone(),
                 source,
             }
         }
@@ -2390,6 +2445,18 @@ fn generic_project_lease_failure(
             GenericCommandError::reported(source, report)
         }
     }
+}
+
+fn generic_manual_failure(source: ManualCommandError) -> GenericCommandError {
+    GenericCommandError::reported(
+        source,
+        DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::runtime(RuntimeIssue::InvalidConfiguration {
+                component: RuntimeComponent::Process,
+            }),
+        ),
+    )
 }
 
 fn system_file_system_error_is_cancelled(source: &SystemFileSystemError) -> bool {
@@ -2598,6 +2665,7 @@ fn diagnostic_generic_unit_locator(locator: &GenericUnitLocator) -> DiagnosticGe
         &locator.unit_id,
         Some(&locator.role),
     )
+    .with_natural_position(locator.line, locator.unit)
 }
 
 const fn generic_language_projection_problem(
@@ -2756,17 +2824,22 @@ fn generic_planning_fact_report(
     locator: &GenericPlanningUnitLocator,
     problem: GenericTranslationPreparationProblem,
 ) -> DiagnosticReport {
+    let unit = DiagnosticGenericUnitLocator::new(
+        locator.relative_path(),
+        locator.group_id(),
+        locator.unit_id(),
+        Some(locator.role()),
+    );
+    let unit = match locator.natural_position() {
+        Some((line, unit_ordinal)) => unit.with_natural_position(line, unit_ordinal),
+        None => unit,
+    };
     DiagnosticReport::new(
         StateEffect::Unchanged,
         Diagnostic::generic(GenericIssue::project(
             GenericDiagnosticStage::Translate,
             GenericProblem::TranslationPreparation {
-                unit: Some(DiagnosticGenericUnitLocator::new(
-                    locator.relative_path(),
-                    locator.group_id(),
-                    locator.unit_id(),
-                    Some(locator.role()),
-                )),
+                unit: Some(unit),
                 problem,
             },
         )),
@@ -2819,7 +2892,8 @@ fn generic_placeholder_protection_report(
         &locator.group_id,
         &locator.unit_id,
         Some(&locator.role),
-    );
+    )
+    .with_natural_position(locator.line, locator.unit);
     let problem = placeholder_protection_issue(source);
     if stage == GenericDiagnosticStage::WriteBack {
         return Some(DiagnosticReport::new(
@@ -3016,19 +3090,27 @@ fn prepare_generic_translation(
     let mut groups = Vec::new();
     for file in snapshot.files() {
         ensure_generic_cpu_running(cancellation)?;
-        for group in file.groups() {
+        for (group_ordinal, group) in file.groups().iter().enumerate() {
             ensure_generic_cpu_running(cancellation)?;
-            groups.push((file.relative_path(), group));
+            groups.push((file.relative_path(), group_ordinal, group));
         }
     }
     let prepared_groups = groups
         .par_iter()
-        .map(|(relative_path, group)| {
+        .map(|(relative_path, group_ordinal, group)| {
             ensure_generic_cpu_running(cancellation)?;
             let service = GenericPlaceholderService::default();
             let mut prepared_units = Vec::with_capacity(group.units().len());
-            for unit in group.units() {
+            for (unit_ordinal, unit) in group.units().iter().enumerate() {
                 ensure_generic_cpu_running(cancellation)?;
+                let locator = GenericUnitLocator {
+                    relative_path: relative_path.to_path_buf(),
+                    group_id: group.id().to_owned(),
+                    unit_id: unit.id().to_owned(),
+                    role: group.kind().to_owned(),
+                    line: group_ordinal + 1,
+                    unit: unit_ordinal + 1,
+                };
                 let protected = service
                     .protect_with_cancellation(
                         group.kind(),
@@ -3040,21 +3122,13 @@ fn prepare_generic_translation(
                         generic_placeholder_protection_failure(
                             source,
                             placeholder_rule_source,
-                            relative_path,
-                            group.id(),
-                            unit.id(),
-                            group.kind(),
+                            &locator,
                         )
                     })?;
                 let language_text = protected
                     .language_text_with_cancellation(|| ensure_generic_cpu_running(cancellation))?
                     .map_err(|source| GenericPreparationError::LanguageProjection {
-                        locator: GenericUnitLocator {
-                            relative_path: relative_path.to_path_buf(),
-                            group_id: group.id().to_owned(),
-                            unit_id: unit.id().to_owned(),
-                            role: group.kind().to_owned(),
-                        },
+                        locator,
                         source,
                     })?;
                 let analysis = source_language
@@ -3189,24 +3263,57 @@ fn collect_generic_current_translations(
     placeholder_rules: &GenericCompiledPlaceholderRules,
     automatic_resources: Option<AutomaticStateResources>,
     cancellation: &CooperativeCancellation,
-) -> Result<GenericUnitMap<String>, GenericPreparationError> {
+) -> Result<GenericUnitMap<GenericCurrentTranslation>, GenericPreparationError> {
     ensure_generic_cpu_running(cancellation)?;
     let mut groups = Vec::new();
     for file in snapshot.files() {
         ensure_generic_cpu_running(cancellation)?;
-        for group in file.groups() {
+        for (group_ordinal, group) in file.groups().iter().enumerate() {
             ensure_generic_cpu_running(cancellation)?;
-            groups.push((file.relative_path(), group));
+            groups.push((file.relative_path(), group_ordinal, group));
         }
     }
     let prepared_groups = groups
         .par_iter()
-        .map(|(relative_path, group)| {
+        .map(|(relative_path, group_ordinal, group)| {
             ensure_generic_cpu_running(cancellation)?;
+            let has_automatic = group.units().iter().any(|unit| {
+                unit.translation()
+                    .is_some_and(|translation| translation.origin() == TranslationOrigin::Automatic)
+            });
+            if !has_automatic {
+                let mut current = Vec::new();
+                for unit in group.units() {
+                    if let Some(translation) = unit
+                        .translation()
+                        .filter(|translation| translation.origin() == TranslationOrigin::Manual)
+                    {
+                        current.push((
+                            GenericUnitKey::new(
+                                clone_generic_cpu_text(group.id(), cancellation)?,
+                                clone_generic_cpu_text(unit.id(), cancellation)?,
+                            ),
+                            GenericCurrentTranslation::new(
+                                clone_generic_cpu_text(translation.translation(), cancellation)?,
+                                true,
+                            ),
+                        ));
+                    }
+                }
+                return Ok::<_, GenericPreparationError>(current);
+            }
             let service = GenericPlaceholderService::default();
             let mut protected_units = Vec::with_capacity(group.units().len());
-            for unit in group.units() {
+            for (unit_ordinal, unit) in group.units().iter().enumerate() {
                 ensure_generic_cpu_running(cancellation)?;
+                let locator = GenericUnitLocator {
+                    relative_path: relative_path.to_path_buf(),
+                    group_id: group.id().to_owned(),
+                    unit_id: unit.id().to_owned(),
+                    role: group.kind().to_owned(),
+                    line: group_ordinal + 1,
+                    unit: unit_ordinal + 1,
+                };
                 let protected = service
                     .protect_with_cancellation(
                         group.kind(),
@@ -3218,21 +3325,13 @@ fn collect_generic_current_translations(
                         generic_placeholder_protection_failure(
                             source,
                             &GenericPlaceholderRuleSource::ProjectSnapshot,
-                            relative_path,
-                            group.id(),
-                            unit.id(),
-                            group.kind(),
+                            &locator,
                         )
                     })?;
                 let language_text = protected
                     .language_text_with_cancellation(|| ensure_generic_cpu_running(cancellation))?
                     .map_err(|source| GenericPreparationError::LanguageProjection {
-                        locator: GenericUnitLocator {
-                            relative_path: relative_path.to_path_buf(),
-                            group_id: group.id().to_owned(),
-                            unit_id: unit.id().to_owned(),
-                            role: group.kind().to_owned(),
-                        },
+                        locator,
                         source,
                     })?;
                 ensure_generic_cpu_running(cancellation)?;
@@ -3279,7 +3378,11 @@ fn collect_generic_current_translations(
                             clone_generic_cpu_text(group.id(), cancellation)?,
                             clone_generic_cpu_text(unit.id(), cancellation)?,
                         ),
-                        translation,
+                        GenericCurrentTranslation::new(
+                            translation,
+                            unit.translation()
+                                .is_some_and(|stored| stored.origin() == TranslationOrigin::Manual),
+                        ),
                     ));
                 }
             }
@@ -6423,10 +6526,7 @@ fn materialize_write_back_source_with(
     if cancellation.is_requested() {
         return Err(GenericScratchError::Cancelled);
     }
-    let scratch_root = workspace_root.join(format!(
-        "{WRITE_BACK_SCRATCH_PREFIX}{}",
-        uuid::Uuid::new_v4()
-    ));
+    let scratch_root = workspace_root.join(WRITE_BACK_SCRATCH_NAME);
     fs::create_dir(&scratch_root).map_err(|source| GenericScratchError::Io {
         operation: FileSystemOperation::Create,
         path: scratch_root.clone(),
@@ -6631,7 +6731,7 @@ fn cleanup_write_back_source(
     let valid_name = scratch_root
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with(WRITE_BACK_SCRATCH_PREFIX));
+        .is_some_and(|name| name == WRITE_BACK_SCRATCH_NAME);
     if !valid_parent || !valid_name {
         return Err(GenericScratchError::UnsafeCleanupTarget {
             workspace_root: workspace_root.to_path_buf(),
@@ -6791,7 +6891,6 @@ mod tests {
     use crate::diagnostic::DiagnosticStage;
     use crate::generic::{
         GenericPlaceholderRuleDefinition, automatic_translation_state_fingerprint,
-        manual_translation_state_fingerprint,
     };
     use crate::language::{
         JapaneseLanguageModule, JapaneseResidualPolicy, LanguageId, LanguageModule,
@@ -6803,6 +6902,52 @@ mod tests {
 
     fn fingerprint(byte: u8) -> Sha256Fingerprint {
         Sha256Fingerprint::from_bytes([byte; 32])
+    }
+
+    struct TestManualTranslation<'a> {
+        id: &'a str,
+        relative_path: &'a str,
+        group_id: &'a str,
+        unit_id: &'a str,
+        kind: &'a str,
+        source: &'a str,
+        translation: &'a str,
+    }
+
+    fn apply_test_manual_translation(
+        store: &GenericProjectStore,
+        entry: TestManualTranslation<'_>,
+    ) {
+        let source = entry
+            .source
+            .split('\n')
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let translation = entry
+            .translation
+            .split('\n')
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let write = crate::manual::ValidatedManualTranslation {
+            id: entry.id.to_owned(),
+            kind: crate::manual::ManualTranslationType::Free,
+            source: source.clone(),
+            translation,
+            locator: crate::manual::ManualTranslationLocator::Generic {
+                group_id: entry.group_id.to_owned(),
+                unit_id: entry.unit_id.to_owned(),
+            },
+            applicability: crate::manual::generic_manual_applicability(
+                entry.group_id,
+                entry.unit_id,
+                entry.relative_path,
+                entry.kind,
+                &source,
+            ),
+        };
+        let connection = Connection::open(store.database_path()).expect("应该可打开测试项目数据库");
+        crate::manual::apply_generic_manual_translations(&connection, &[write])
+            .expect("应该可保存独立人工译文");
     }
 
     fn task_id(value: usize) -> TaskId {
@@ -6915,6 +7060,8 @@ mod tests {
                 "group_id": "group-a",
                 "unit_id": "unit-a",
                 "role": "dialogue",
+                "line": null,
+                "unit": null,
             })
         );
     }
@@ -7653,7 +7800,7 @@ mod tests {
 
         let workspace_root = temporary.path().join("project");
         fs::create_dir(&workspace_root).expect("应该可建立项目工作区");
-        let scratch_root = workspace_root.join(".generic-write-back-cancelled");
+        let scratch_root = workspace_root.join(WRITE_BACK_SCRATCH_NAME);
         fs::create_dir(&scratch_root).expect("应该可建立待清理 scratch");
         fs::write(scratch_root.join("residual"), b"candidate").expect("应该可建立 scratch 内容");
         let cancellation = CooperativeCancellation::default();
@@ -7721,7 +7868,7 @@ mod tests {
         for (source, expected_effect) in [
             (
                 SystemFileSystemError::JournalCorrupt {
-                    path: PathBuf::from(".directory-publish-test.journal"),
+                    path: PathBuf::from(".directory-publish/write_back/journal"),
                     violation: crate::diagnostic::FileSystemJournalViolation::NotRegularFile,
                 },
                 StateEffect::RecoveryRequired,
@@ -7729,7 +7876,7 @@ mod tests {
             (
                 SystemFileSystemError::OutcomeUnknown {
                     target_root: PathBuf::from("write_back"),
-                    artifacts: vec![PathBuf::from(".directory-publish-test.journal")],
+                    artifacts: vec![PathBuf::from(".directory-publish/write_back/journal")],
                     violation: crate::diagnostic::FileSystemRecoveryViolation::ObservationFailed,
                 },
                 StateEffect::OutcomeUnknown,
@@ -7755,7 +7902,7 @@ mod tests {
         let source = DirectoryPublishError::TargetAlreadyExists {
             target_root: PathBuf::from("write_back"),
             cleanup_failure: Some(StagingCleanupFailure::new(
-                PathBuf::from(".directory-publish-test.stage"),
+                PathBuf::from(".directory-publish/write_back/stage"),
                 Box::new(SystemFileSystemError::Closed),
             )),
         };
@@ -7802,7 +7949,7 @@ mod tests {
 
     #[test]
     fn cancelled_scratch_cleanup_failure_keeps_primary_and_recovery_path() {
-        let scratch_root = PathBuf::from("project/.generic-write-back-test");
+        let scratch_root = PathBuf::from("project/.write_back.tmp");
         let error = generic_scratch_command_error(GenericScratchError::CleanupAfterFailure {
             operation: Box::new(GenericScratchError::Cancelled),
             cleanup: Box::new(GenericScratchError::Io {
@@ -7837,7 +7984,7 @@ mod tests {
 
     #[test]
     fn failed_scratch_materialization_cleanup_keeps_primary_and_recovery_path() {
-        let scratch_root = PathBuf::from("project/.generic-write-back-test");
+        let scratch_root = PathBuf::from("project/.write_back.tmp");
         let source_file = scratch_root.join("dialogue.jsonl");
         let error = generic_scratch_command_error(GenericScratchError::CleanupAfterFailure {
             operation: Box::new(GenericScratchError::Io {
@@ -7903,7 +8050,7 @@ mod tests {
 
     #[test]
     fn directory_discard_preserves_typed_io_failure_as_related_diagnostic() {
-        let stage_root = PathBuf::from("project/.directory-publish-test.stage");
+        let stage_root = PathBuf::from("project/.directory-publish/write_back/stage");
         let source = DirectoryDiscardError::new(
             stage_root.clone(),
             Box::new(SystemFileSystemError::Io {
@@ -8123,7 +8270,6 @@ mod tests {
                         expected_source_text: current_unit.source_text().to_owned(),
                         expected_group_context: current_group.context_fingerprint(),
                         translation: "已有上下文 {hero}".to_owned(),
-                        origin: crate::generic::TranslationOrigin::Automatic,
                         state_fingerprint: current_state,
                         expected_translation: None,
                     },
@@ -8133,7 +8279,6 @@ mod tests {
                         expected_source_text: invalid_current_unit.source_text().to_owned(),
                         expected_group_context: invalid_current_group.context_fingerprint(),
                         translation: "损坏的已有译文".to_owned(),
-                        origin: crate::generic::TranslationOrigin::Automatic,
                         state_fingerprint: invalid_current_state,
                         expected_translation: None,
                     },
@@ -8234,38 +8379,18 @@ mod tests {
             .expect("Placeholder 规则应该合法");
         let current_group = &snapshot.files()[0].groups()[0];
         let current_unit = &current_group.units()[0];
-        let current_protected = GenericPlaceholderService::default()
-            .protect(
-                current_group.kind(),
-                current_unit.source_text(),
-                &placeholder_rules,
-            )
-            .expect("Current 原文应该可保护");
-        let current_state = manual_translation_state_fingerprint(
-            snapshot.project().language_pair(),
-            &GenericUnitKey::new(current_group.id().to_owned(), current_unit.id().to_owned()),
-            current_unit.source_text(),
-            current_group.context_fingerprint(),
-            current_protected.binding_fingerprint(),
+        apply_test_manual_translation(
+            &store,
+            TestManualTranslation {
+                id: "scene.jsonl:line1:unit1:text",
+                relative_path: "scene.jsonl",
+                group_id: current_group.id(),
+                unit_id: current_unit.id(),
+                kind: current_group.kind(),
+                source: current_unit.source_text(),
+                translation: "“你好 {name}”",
+            },
         );
-        store
-            .commit_translations(
-                snapshot
-                    .project()
-                    .extracted_raw_fingerprint()
-                    .expect("Extract 应保存原始指纹"),
-                &[crate::generic::TranslationWrite {
-                    group_id: current_group.id().to_owned(),
-                    unit_id: current_unit.id().to_owned(),
-                    expected_source_text: current_unit.source_text().to_owned(),
-                    expected_group_context: current_group.context_fingerprint(),
-                    translation: "“你好 {name}”".to_owned(),
-                    origin: crate::generic::TranslationOrigin::Manual,
-                    state_fingerprint: current_state,
-                    expected_translation: None,
-                }],
-            )
-            .expect("应该可保存 Current 译文");
         let snapshot = store.load_snapshot().expect("应该可重读 Generic 快照");
         let language_module: Arc<dyn LanguageModule> = Arc::new(JapaneseLanguageModule::new(
             JapaneseResidualPolicy::new(NonZeroUsize::MIN, Vec::new())
@@ -8446,16 +8571,17 @@ mod tests {
             .compile(Vec::new())
             .expect("空 Placeholder 规则应该合法");
         let manual = &group.units()[0];
-        let binding = GenericPlaceholderService::default()
-            .protect(group.kind(), manual.source_text(), &rules)
-            .expect("原文应该可保护")
-            .binding_fingerprint();
-        let manual_state = manual_translation_state_fingerprint(
-            snapshot.project().language_pair(),
-            &GenericUnitKey::new(group.id().to_owned(), manual.id().to_owned()),
-            manual.source_text(),
-            group.context_fingerprint(),
-            binding,
+        apply_test_manual_translation(
+            &store,
+            TestManualTranslation {
+                id: "scene.jsonl:line1:unit1:text",
+                relative_path: "scene.jsonl",
+                group_id: group.id(),
+                unit_id: manual.id(),
+                kind: group.kind(),
+                source: manual.source_text(),
+                translation: "人工译文",
+            },
         );
         let automatic = &group.units()[1];
         store
@@ -8464,28 +8590,15 @@ mod tests {
                     .project()
                     .extracted_raw_fingerprint()
                     .expect("Extract 应保存原始指纹"),
-                &[
-                    crate::generic::TranslationWrite {
-                        group_id: group.id().to_owned(),
-                        unit_id: manual.id().to_owned(),
-                        expected_source_text: manual.source_text().to_owned(),
-                        expected_group_context: group.context_fingerprint(),
-                        translation: "人工译文".to_owned(),
-                        origin: crate::generic::TranslationOrigin::Manual,
-                        state_fingerprint: manual_state,
-                        expected_translation: None,
-                    },
-                    crate::generic::TranslationWrite {
-                        group_id: group.id().to_owned(),
-                        unit_id: automatic.id().to_owned(),
-                        expected_source_text: automatic.source_text().to_owned(),
-                        expected_group_context: group.context_fingerprint(),
-                        translation: "无法证明语义的自动译文".to_owned(),
-                        origin: crate::generic::TranslationOrigin::Automatic,
-                        state_fingerprint: fingerprint(70),
-                        expected_translation: None,
-                    },
-                ],
+                &[crate::generic::TranslationWrite {
+                    group_id: group.id().to_owned(),
+                    unit_id: automatic.id().to_owned(),
+                    expected_source_text: automatic.source_text().to_owned(),
+                    expected_group_context: group.context_fingerprint(),
+                    translation: "无法证明语义的自动译文".to_owned(),
+                    state_fingerprint: fingerprint(70),
+                    expected_translation: None,
+                }],
             )
             .expect("应该可保存测试译文");
         let (stored, live) = store.ensure_input_current().expect("输入应该仍为 Current");
@@ -8503,7 +8616,7 @@ mod tests {
             current
                 .get_with_cancellation(&manual_key, || { Ok::<_, std::convert::Infallible>(()) })
                 .unwrap_or_else(|never| match never {})
-                .map(String::as_str),
+                .map(GenericCurrentTranslation::text),
             Some("人工译文")
         );
         let automatic_key = GenericUnitKey::new("group".to_owned(), "automatic".to_owned());
@@ -8521,7 +8634,7 @@ mod tests {
     }
 
     #[test]
-    fn write_back_current_rejects_translation_that_no_longer_preserves_placeholders() {
+    fn write_back_keeps_manual_translation_when_placeholder_rules_change() {
         let temporary = tempfile::tempdir().expect("应该可建立临时目录");
         let source_root = temporary.path().join("source");
         fs::create_dir_all(&source_root).expect("应该可建立输入目录");
@@ -8552,35 +8665,18 @@ mod tests {
                 r"\[[^]]+\]",
             )])
             .expect("Placeholder 规则应该合法");
-        let binding = GenericPlaceholderService::default()
-            .protect(group.kind(), unit.source_text(), &rules)
-            .expect("原文应该可保护")
-            .binding_fingerprint();
-        let state = manual_translation_state_fingerprint(
-            snapshot.project().language_pair(),
-            &GenericUnitKey::new(group.id().to_owned(), unit.id().to_owned()),
-            unit.source_text(),
-            group.context_fingerprint(),
-            binding,
+        apply_test_manual_translation(
+            &store,
+            TestManualTranslation {
+                id: "scene.jsonl:line1:unit1:text",
+                relative_path: "scene.jsonl",
+                group_id: group.id(),
+                unit_id: unit.id(),
+                kind: group.kind(),
+                source: unit.source_text(),
+                translation: "打开 [B]。",
+            },
         );
-        store
-            .commit_translations(
-                snapshot
-                    .project()
-                    .extracted_raw_fingerprint()
-                    .expect("Extract 应保存原始指纹"),
-                &[crate::generic::TranslationWrite {
-                    group_id: group.id().to_owned(),
-                    unit_id: unit.id().to_owned(),
-                    expected_source_text: unit.source_text().to_owned(),
-                    expected_group_context: group.context_fingerprint(),
-                    translation: "打开 [B]。".to_owned(),
-                    origin: crate::generic::TranslationOrigin::Manual,
-                    state_fingerprint: state,
-                    expected_translation: None,
-                }],
-            )
-            .expect("测试应可建立状态匹配但 Placeholder 已不匹配的译文");
         let (stored, live) = store
             .ensure_input_current()
             .expect("应该可重新读取当前 Generic 输入");
@@ -8591,40 +8687,27 @@ mod tests {
             None,
             &CooperativeCancellation::default(),
         )
-        .expect("Current 收集只判断状态，候选构建负责验收译文 Placeholder");
-        let error = build_write_back_candidate_with_cancellation(
+        .expect("Placeholder 规则变化不能使人工译文失效");
+        let key = GenericUnitKey::new("group".to_owned(), "unit".to_owned());
+        let manual = current
+            .get_with_cancellation(&key, || Ok::<_, std::convert::Infallible>(()))
+            .unwrap_or_else(|never| match never {})
+            .expect("人工译文应该仍为 Current");
+        assert!(manual.is_manual());
+        let candidate = build_write_back_candidate_with_cancellation(
             &stored,
             &live,
             &current,
             &rules,
             &CooperativeCancellation::default(),
         )
-        .expect_err("当前 Placeholder 不匹配必须阻止 WriteBack 候选");
-        let wire = serde_json::to_value(error.diagnostic_report(StateEffect::Unchanged))
-            .expect("WriteBack 诊断必须可序列化");
-
-        assert_eq!(
-            wire["primary"]["code"],
-            "generic.write_back.placeholder.binding_mismatch"
-        );
-        assert_eq!(wire["primary"]["stage"], "write_back");
-        assert_eq!(
-            wire["primary"]["issue"]["details"]["operation"],
-            "build_write_back_candidate"
-        );
-        assert_eq!(wire["primary"]["resolution"], "fix_input");
-        assert_eq!(
-            wire["primary"]["issue"]["details"]["problem"]["unit"],
-            serde_json::json!({
-                "relative_path": "scene.jsonl",
-                "group_id": "group",
-                "unit_id": "unit",
-                "role": "dialogue",
-            })
-        );
-        assert_eq!(
-            wire["primary"]["issue"]["details"]["problem"]["problem"]["side"],
-            "translation"
+        .expect("WriteBack 应采用已经应用的人工译文");
+        assert_eq!(candidate.translated_units(), 1);
+        assert_eq!(candidate.retained_source_units(), 0);
+        assert!(
+            std::str::from_utf8(candidate.files()[0].bytes())
+                .expect("候选应该是 UTF-8")
+                .contains("打开 [B]。")
         );
     }
 
@@ -8689,10 +8772,7 @@ mod tests {
             fs::read_dir(&workspace_root)
                 .expect("应该可列举项目工作区")
                 .filter_map(Result::ok)
-                .all(|entry| !entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(WRITE_BACK_SCRATCH_PREFIX)),
+                .all(|entry| entry.file_name().to_string_lossy() != WRITE_BACK_SCRATCH_NAME),
             "校验失败后不应残留 Generic 写回暂存目录"
         );
 
@@ -8713,10 +8793,7 @@ mod tests {
             fs::read_dir(&workspace_root)
                 .expect("应该可列举项目工作区")
                 .filter_map(Result::ok)
-                .all(|entry| !entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(WRITE_BACK_SCRATCH_PREFIX)),
+                .all(|entry| entry.file_name().to_string_lossy() != WRITE_BACK_SCRATCH_NAME),
             "取消后不应残留 Generic 写回暂存目录"
         );
     }
@@ -8803,10 +8880,7 @@ mod tests {
             fs::read_dir(&workspace_root)
                 .expect("应该可列举项目工作区")
                 .filter_map(Result::ok)
-                .all(|entry| !entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(WRITE_BACK_SCRATCH_PREFIX)),
+                .all(|entry| entry.file_name().to_string_lossy() != WRITE_BACK_SCRATCH_NAME),
             "发布前复查失败后不应残留 Generic 写回暂存目录"
         );
         file_system
@@ -8878,10 +8952,7 @@ mod tests {
             fs::read_dir(&workspace_root)
                 .expect("应该可列举项目工作区")
                 .filter_map(Result::ok)
-                .all(|entry| !entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(WRITE_BACK_SCRATCH_PREFIX)),
+                .all(|entry| entry.file_name().to_string_lossy() != WRITE_BACK_SCRATCH_NAME),
             "发布请求建立失败后不应残留 Generic 写回暂存目录"
         );
         file_system
@@ -8996,31 +9067,18 @@ mod tests {
             .protect(source_group.kind(), source_unit.source_text(), &rules)
             .expect("源文没有命中 Placeholder");
         assert!(protected.placeholders().is_empty());
-        let state = manual_translation_state_fingerprint(
-            snapshot.project().language_pair(),
-            &GenericUnitKey::new(source_group.id().to_owned(), source_unit.id().to_owned()),
-            source_unit.source_text(),
-            source_group.context_fingerprint(),
-            protected.binding_fingerprint(),
+        apply_test_manual_translation(
+            &store,
+            TestManualTranslation {
+                id: "scene.jsonl:line1:unit1:text",
+                relative_path: "scene.jsonl",
+                group_id: source_group.id(),
+                unit_id: source_unit.id(),
+                kind: source_group.kind(),
+                source: source_unit.source_text(),
+                translation: "你好 {invented}",
+            },
         );
-        store
-            .commit_translations(
-                snapshot
-                    .project()
-                    .extracted_raw_fingerprint()
-                    .expect("Extract 应保存原始指纹"),
-                &[crate::generic::TranslationWrite {
-                    group_id: source_group.id().to_owned(),
-                    unit_id: source_unit.id().to_owned(),
-                    expected_source_text: source_unit.source_text().to_owned(),
-                    expected_group_context: source_group.context_fingerprint(),
-                    translation: "你好 {invented}".to_owned(),
-                    origin: crate::generic::TranslationOrigin::Manual,
-                    state_fingerprint: state,
-                    expected_translation: None,
-                }],
-            )
-            .expect("应该可保存 dialogue Current");
         let snapshot = store.load_snapshot().expect("应该可重读 Generic 快照");
         let prepared = prepare_generic_translation(
             &snapshot,

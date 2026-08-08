@@ -379,7 +379,7 @@ fn task_record_file_system_report(
             )
         }
         SystemFileSystemError::Windows(source) => {
-            let (path, failure) = task_record_windows_failure(source, fallback_path, redactor);
+            let (path, failure) = task_record_windows_failure(source, redactor);
             task_record_write_report(path, failure, operation)
         }
         SystemFileSystemError::WindowsOrdinalCaseKey { path, source } => {
@@ -440,7 +440,6 @@ fn task_record_file_system_report(
 
 fn task_record_windows_failure(
     source: &WindowsFsError,
-    fallback_path: &Path,
     redactor: &ApiKeyRedactor,
 ) -> (SafePath, ObservabilityWriteFailure) {
     match source {
@@ -485,10 +484,6 @@ fn task_record_windows_failure(
         WindowsFsError::FileIdentityChanged { path } => (
             redacted_safe_path(path, redactor),
             ObservabilityWriteFailure::IdentityChanged,
-        ),
-        WindowsFsError::Cryptography { status, .. } => (
-            redacted_safe_path(fallback_path, redactor),
-            ObservabilityWriteFailure::WindowsStatus { status: *status },
         ),
     }
 }
@@ -577,9 +572,8 @@ pub(crate) fn render_task_record_attempt(
     match &attempt.outcome {
         LlmRequestAttemptOutcome::Succeeded {
             finish_reason,
-            provider_request_id,
-            provider_response_id,
             usage,
+            ..
         } => {
             let finish_reason =
                 markdown_inline_code(&api_key_redactor.redact(&finish_reason.to_string()));
@@ -610,24 +604,6 @@ pub(crate) fn render_task_record_attempt(
                     duration: &duration,
                 },
             ));
-            if let Some(request_id) = provider_request_id {
-                let request_id = markdown_inline_code(&api_key_redactor.redact(request_id));
-                output.push_str(&task_record_text(
-                    localizer,
-                    UiMessage::TaskRecordAttemptRequestId {
-                        request_id: &request_id,
-                    },
-                ));
-            }
-            if let Some(response_id) = provider_response_id {
-                let response_id = markdown_inline_code(&api_key_redactor.redact(response_id));
-                output.push_str(&task_record_text(
-                    localizer,
-                    UiMessage::TaskRecordAttemptResponseId {
-                        response_id: &response_id,
-                    },
-                ));
-            }
             output.push('\n');
         }
         LlmRequestAttemptOutcome::Retryable {
@@ -642,7 +618,6 @@ pub(crate) fn render_task_record_attempt(
                     localizer,
                     UiMessage::TaskRecordAttemptRetryable {
                         number: number as u64,
-                        code: diagnostic.primary().code(),
                         duration: &duration,
                     }
                 )
@@ -699,7 +674,6 @@ pub(crate) fn render_task_record_attempt(
                     localizer,
                     UiMessage::TaskRecordAttemptFailed {
                         number: number as u64,
-                        code: diagnostic.primary().code(),
                         duration: &duration,
                     }
                 )
@@ -729,17 +703,8 @@ fn render_diagnostic_reason(
     api_key_redactor: &ApiKeyRedactor,
     diagnostic: &DiagnosticReport,
 ) {
-    let reason = markdown_inline_code(
-        &api_key_redactor.redact(&render_diagnostic_report(diagnostic, localizer)),
-    );
-    let _ = writeln!(
-        output,
-        "  - {}",
-        task_record_text(
-            localizer,
-            UiMessage::TaskRecordStructuredReason { reason: &reason }
-        )
-    );
+    let reason = api_key_redactor.redact(&render_diagnostic_report(diagnostic, localizer));
+    output.push_str(&markdown_fence(&reason, "text"));
 }
 
 pub(crate) fn markdown_heading_id(id: &str) -> String {
@@ -905,7 +870,6 @@ mod tests {
     use secrecy::SecretString;
     use serde_json::Map;
     use tempfile::tempdir;
-    use uuid::Uuid;
 
     use super::*;
     use crate::observability::RunId;
@@ -1000,7 +964,7 @@ mod tests {
         );
         let runtime = ProjectLogRuntime::start(
             context,
-            RunId::from_uuid(Uuid::new_v4()),
+            RunId::for_test(1),
             bytes.clone(),
             Arc::new(RunPerformanceCounters::default()),
             drop_report,
@@ -1018,6 +982,29 @@ mod tests {
             .finish(RunFinished::Succeeded, Vec::new())
             .expect("测试项目日志必须正常结束");
         bytes.records()
+    }
+
+    fn public_diagnostic<'a>(
+        records: &'a [serde_json::Value],
+        event: &str,
+    ) -> &'a serde_json::Value {
+        let diagnostic = records
+            .iter()
+            .find(|record| record["event"] == event)
+            .expect("预期的公开诊断必须存在");
+        let payload = diagnostic["payload"]
+            .as_object()
+            .expect("公开诊断 payload 必须是对象");
+        assert_eq!(payload.len(), 3);
+        for field in ["object", "reason", "help"] {
+            assert!(
+                payload[field]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty()),
+                "公开诊断 {field} 必须是非空文本"
+            );
+        }
+        diagnostic
     }
 
     struct ThreadRecordingArtifact {
@@ -1227,7 +1214,7 @@ mod tests {
         assert!(
             records
                 .iter()
-                .all(|record| record["code"] != "diagnostic.task_record")
+                .all(|record| record["event"] != "diagnostic.task_record")
         );
     }
 
@@ -1258,18 +1245,15 @@ mod tests {
         let records = finish_project_log(log_runtime, &log_bytes);
         let diagnostics = records
             .iter()
-            .filter(|record| record["code"] == "diagnostic.task_record")
+            .filter(|record| record["event"] == "diagnostic.task_record")
             .collect::<Vec<_>>();
         assert_eq!(diagnostics.len(), 1);
-        assert_eq!(
-            diagnostics[0]["payload"]["report"]["primary"]["code"],
-            "observability.task_record.worker"
-        );
-        assert_eq!(diagnostics[0]["payload"]["report"]["effect"], "unchanged");
+        public_diagnostic(&records, "diagnostic.task_record");
+        assert!(diagnostics[0]["payload"].get("report").is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn serialization_failure_preserves_json_category_and_position() {
+    async fn serialization_failure_is_reported_without_internal_json_details() {
         let temporary = tempdir().expect("应建立临时目录");
         let record_directory = temporary.path().join("task-records");
         std::fs::create_dir_all(&record_directory).expect("应建立任务记录目录");
@@ -1293,35 +1277,18 @@ mod tests {
         assert!(!record_directory.join("task-000001.md").exists());
         cpu.shutdown().expect("测试 CPU 根应可关闭");
         let records = finish_project_log(log_runtime, &log_bytes);
-        let diagnostic = records
-            .iter()
-            .find(|record| record["code"] == "diagnostic.task_record")
-            .expect("序列化故障必须形成 TaskRecord occurrence");
-        assert_eq!(
-            diagnostic["payload"]["report"]["primary"]["code"],
-            "observability.task_record.serialize"
-        );
-        let problem = &diagnostic["payload"]["report"]["primary"]["issue"]["details"]["problem"];
-        assert_eq!(problem["category"], "eof");
-        assert_eq!(problem["line"], 1);
-        assert_eq!(problem["column"], 1);
+        let diagnostic = public_diagnostic(&records, "diagnostic.task_record");
+        let payload = serde_json::to_string(&diagnostic["payload"]).expect("诊断必须可序列化");
+        for internal in ["report", "category", "line", "column"] {
+            assert!(!payload.contains(internal));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn flush_and_sync_failures_use_distinct_typed_codes_and_preserve_cleanup() {
-        for (name, fault, code, with_cleanup_failure) in [
-            (
-                "flush",
-                TestObservationFaultPoint::BeforeFlush,
-                "observability.task_record.flush",
-                true,
-            ),
-            (
-                "sync",
-                TestObservationFaultPoint::BeforeSync,
-                "observability.task_record.sync",
-                false,
-            ),
+    async fn flush_and_sync_failures_have_readable_public_diagnostics() {
+        for (name, fault, with_cleanup_failure) in [
+            ("flush", TestObservationFaultPoint::BeforeFlush, true),
+            ("sync", TestObservationFaultPoint::BeforeSync, false),
         ] {
             let temporary = tempdir().expect("应建立临时目录");
             let record_directory = temporary.path().join("task-records");
@@ -1355,22 +1322,8 @@ mod tests {
             assert!(!target.exists(), "写入故障不得暴露最终任务记录");
             cpu.shutdown().expect("测试 CPU 根应可关闭");
             let records = finish_project_log(log_runtime, &log_bytes);
-            let diagnostic = records
-                .iter()
-                .find(|record| record["code"] == "diagnostic.task_record")
-                .expect("flush/sync 故障必须形成 TaskRecord occurrence");
-            assert_eq!(diagnostic["payload"]["report"]["primary"]["code"], code);
-            let related = diagnostic["payload"]["report"]["related"]
-                .as_array()
-                .expect("related 必须是数组");
-            assert_eq!(related.len(), usize::from(with_cleanup_failure));
-            if with_cleanup_failure {
-                assert_eq!(related[0]["relation"], "cleanup");
-                assert_eq!(
-                    related[0]["report"]["primary"]["code"],
-                    "observability.task_record.cleanup"
-                );
-            }
+            let diagnostic = public_diagnostic(&records, "diagnostic.task_record");
+            assert!(diagnostic["payload"].get("related").is_none());
         }
     }
 
@@ -1406,21 +1359,10 @@ mod tests {
         );
         cpu.shutdown().expect("测试 CPU 根应可关闭");
         let records = finish_project_log(log_runtime, &log_bytes);
-        let diagnostic = records
-            .iter()
-            .find(|record| record["code"] == "diagnostic.task_record")
-            .expect("无覆盖冲突必须形成 TaskRecord occurrence");
-        assert_eq!(
-            diagnostic["payload"]["report"]["primary"]["code"],
-            "observability.task_record.write"
-        );
-        assert_eq!(
-            diagnostic["payload"]["report"]["primary"]["issue"]["details"]["problem"]["failure"]["kind"],
-            "target_exists"
-        );
+        public_diagnostic(&records, "diagnostic.task_record");
         let serialized = serde_json::to_string(&records).expect("日志记录必须可序列化");
         assert!(!serialized.contains("unused-key"));
-        assert!(serialized.contains("[REDACTED API KEY]"));
+        assert!(!serialized.contains("target_exists"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1459,7 +1401,7 @@ mod tests {
         assert!(
             records
                 .iter()
-                .all(|record| record["code"] != "diagnostic.task_record")
+                .all(|record| record["event"] != "diagnostic.task_record")
         );
     }
 
@@ -1530,7 +1472,7 @@ mod tests {
         assert!(
             records
                 .iter()
-                .all(|record| record["code"] != "diagnostic.task_record")
+                .all(|record| record["event"] != "diagnostic.task_record")
         );
     }
 }

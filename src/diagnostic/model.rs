@@ -23,18 +23,6 @@ pub(crate) enum StateEffect {
 }
 
 impl StateEffect {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Unchanged => "unchanged",
-            Self::ProgressPreserved => "progress_preserved",
-            Self::Applied => "applied",
-            Self::AppliedRunPlanNotSaved => "applied_run_plan_not_saved",
-            Self::AppliedFinalizationFailed => "applied_finalization_failed",
-            Self::RecoveryRequired => "recovery_required",
-            Self::OutcomeUnknown => "outcome_unknown",
-        }
-    }
-
     const fn rank(self) -> u8 {
         match self {
             Self::Unchanged => 0,
@@ -99,19 +87,6 @@ pub(crate) enum RelatedFailureRelation {
     Finalization,
     Shutdown,
     Observability,
-}
-
-impl RelatedFailureRelation {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Cleanup => "cleanup",
-            Self::Rollback => "rollback",
-            Self::Discard => "discard",
-            Self::Finalization => "finalization",
-            Self::Shutdown => "shutdown",
-            Self::Observability => "observability",
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -390,46 +365,17 @@ impl RelatedDiagnosticReport {
     }
 }
 
-fn render_diagnostic_with_effect(
-    diagnostic: &Diagnostic,
-    effect: StateEffect,
-    localizer: &UiLocalizer,
-) -> String {
-    let issue = diagnostic.issue();
-    let stage = localizer.format(UiMessage::DiagnosticStageValue {
-        code: diagnostic.stage().as_str(),
-    });
-    let subject = issue.subject();
-    let summary = localizer.format(UiMessage::DiagnosticFailureValue {
-        code: issue.summary_code(),
-    });
-    let facts = issue
-        .facts()
-        .into_iter()
-        .map(|(name, value)| format!("{name}={value}"))
-        .collect::<Vec<_>>()
-        .join("; ");
-    let reason = if facts.is_empty() {
-        summary
-    } else {
-        format!("{summary}; {facts}")
-    };
-    let effect = localizer.format(UiMessage::DiagnosticEffectValue {
-        code: effect.as_str(),
-    });
-    let resolution = localizer.format(UiMessage::DiagnosticResolutionValue {
-        code: diagnostic.resolution().as_str(),
-    });
+fn render_diagnostic(diagnostic: &Diagnostic, localizer: &UiLocalizer) -> String {
+    let fields = render_diagnostic_fields_for(diagnostic, localizer);
     [
-        localizer.format(UiMessage::DiagnosticTitle {
-            code: diagnostic.code(),
+        localizer.format(UiMessage::DiagnosticLocation {
+            subject: &fields.object,
         }),
-        localizer.format(UiMessage::DiagnosticStage { stage: &stage }),
-        localizer.format(UiMessage::DiagnosticLocation { subject: &subject }),
-        localizer.format(UiMessage::DiagnosticExplanation { reason: &reason }),
-        localizer.format(UiMessage::DiagnosticEffect { impact: &effect }),
+        localizer.format(UiMessage::DiagnosticExplanation {
+            reason: &fields.reason,
+        }),
         localizer.format(UiMessage::DiagnosticResolution {
-            action: &resolution,
+            action: &fields.help,
         }),
     ]
     .join("\n")
@@ -440,25 +386,63 @@ pub(crate) fn render_diagnostic_report(
     report: &DiagnosticReport,
     localizer: &UiLocalizer,
 ) -> String {
-    let mut blocks = vec![render_diagnostic_with_effect(
-        report.primary(),
-        report.effect(),
-        localizer,
-    )];
-    for (index, related) in report.related().iter().enumerate() {
-        let relation = localizer.format(UiMessage::DiagnosticRelationValue {
-            code: related.relation().as_str(),
-        });
-        blocks.push(format!(
-            "{} ({relation})\n{}",
-            localizer.format(UiMessage::DiagnosticRelated {
-                // Rust 当前支持目标的 usize 不宽于 u64；此转换不会丢失实际计数。
-                index: index as u64 + 1,
-            }),
-            render_diagnostic_report(related.report(), localizer)
-        ));
+    let mut blocks = vec![render_diagnostic(report.primary(), localizer)];
+    for related in report.related() {
+        blocks.push(render_diagnostic_report(related.report(), localizer));
     }
-    blocks.join("\n")
+    blocks.join("\n\n")
+}
+
+/// 面向项目日志的最小诊断正文。
+///
+/// 项目日志不承担调试协议或恢复状态的传递职责，只告诉读者哪个对象出了什么问题以及
+/// 应该怎么处理。SQLite 查询编号、供应商请求标识、指纹对比和递归内部状态不会进入
+/// 这些字段。
+pub(crate) struct RenderedDiagnosticFields {
+    pub(crate) object: String,
+    pub(crate) reason: String,
+    pub(crate) help: String,
+}
+
+pub(crate) fn render_diagnostic_fields(
+    report: &DiagnosticReport,
+    localizer: &UiLocalizer,
+) -> RenderedDiagnosticFields {
+    render_diagnostic_fields_for(report.primary(), localizer)
+}
+
+fn render_diagnostic_fields_for(
+    diagnostic: &Diagnostic,
+    localizer: &UiLocalizer,
+) -> RenderedDiagnosticFields {
+    let issue = diagnostic.issue();
+    let summary = localizer.format(UiMessage::DiagnosticFailureValue {
+        code: issue.summary_code(),
+    });
+    let system_message = issue
+        .facts()
+        .into_iter()
+        .find_map(|(name, value)| (name == "system_message").then_some(value))
+        .and_then(|value| readable_system_message(&value));
+    RenderedDiagnosticFields {
+        object: issue.subject(),
+        reason: system_message.map_or(summary.clone(), |detail| format!("{summary} ({detail})")),
+        help: localizer.format(UiMessage::DiagnosticResolutionValue {
+            code: diagnostic.resolution().as_str(),
+        }),
+    }
+}
+
+fn readable_system_message(value: &str) -> Option<String> {
+    let mut message = value.trim();
+    if let Some(prefix) = message.strip_suffix(')')
+        && let Some((text, code)) = prefix.rsplit_once(" (os error ")
+        && !code.is_empty()
+        && code.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        message = text.trim_end();
+    }
+    (!message.is_empty()).then(|| message.to_owned())
 }
 
 #[cfg(test)]

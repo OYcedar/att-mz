@@ -7,7 +7,11 @@ cli-init-about = 名前付き翻訳プロジェクトを初期化または更新
 cli-extract-about = プロジェクトの現在の入力から原文を同期します
 cli-translate-about = 明示または保存済み Profile で抽出済み原文を翻訳します
 cli-write-back-about = 現在の訳文をプロジェクトの出力へ書き込みます
-cli-project-lua-about = プロジェクトで原子的なデータベース Lua を一度実行します
+cli-manual-about = 編集可能な TOML で手動翻訳を管理します
+cli-manual-export-about = 現在手動翻訳が必要な項目を出力します
+cli-manual-check-about = プロジェクトを変更せず手動翻訳 TOML を検査します
+cli-manual-apply-about = 入力済みで有効な手動翻訳を適用します
+cli-project-lua-about = プロジェクトデータベースに対して Lua スクリプトを実行します
 cli-project-name-help = 安定したプロジェクト名
 cli-init-path-help = 入力ルートディレクトリ。既存プロジェクトでは前回成功時のパスを再利用できます
 cli-source-language-help = 原文の言語 ID
@@ -21,8 +25,9 @@ cli-dialogue-rules-help = Builtin と併用する MV 会話名投影を置換し
 cli-profile-help = 翻訳 Profile ID。省略すると前回成功した Profile を再利用します
 cli-terms-help = プロジェクトの用語リソースを置換します
 cli-placeholders-help = プロジェクトの Placeholder リソースを置換します
-cli-project-lua-script-help = 一度だけ実行する原子的なデータベース Lua プログラム
+cli-project-lua-script-help = プロジェクトデータベースに対して実行する Lua スクリプト
 cli-project-lua-arguments-help = -- の後で Lua arg[1..] に渡す UTF-8 引数
+cli-manual-file-help = 手動翻訳 TOML ファイル
 cli-usage-heading = 使用法:
 cli-commands-heading = コマンド:
 cli-options-heading = オプション:
@@ -113,9 +118,7 @@ log-run-failed = コマンド { $command } に失敗しました。
 log-run-outcome-unknown = コマンド { $command } は終了しましたが、最終結果は不明です。エラーに示された復旧場所を確認してください。
 log-run-cancelled = コマンド { $command } をキャンセルしました。
 log-performance-counters = パフォーマンスカウンター：SQLite トランザクション制御の試行 { $sqlite_control_attempted_total } 回、候補ツリー全体の検証開始 { $candidate_validation_started } 回、完了 { $candidate_validation_completed } 回。
-log-lua-script = Lua スクリプト { $identity }（SHA-256 { $fingerprint }）。
 log-lua-print = Lua：{ $message }
-log-lua-summary = Lua 実行統計：データベース呼び出し { $database_calls } 回、変更行 { $changed_rows } 行、翻訳呼び出し { $translation_calls } 回、print { $printed_lines } 行。
 log-plan-resolved = コマンド { $command } のプラン元: { $source }。
 log-phase-started = フェーズ開始: { $phase }。
 log-retry-summary = { $count } 回再試行しました。
@@ -164,51 +167,10 @@ log-task-outcome-value = { $outcome ->
     [cancelled] キャンセル
    *[other] 不明な結果で終了
 }
-diagnostic-title = エラー [{ $code }]
-diagnostic-stage = 段階：{ $stage }
 diagnostic-location = 場所：{ $subject }
 diagnostic-explanation = 原因：{ $reason }
-diagnostic-effect = 影響：{ $impact }
 diagnostic-resolution = 対処：{ $action }
 diagnostic-related = 関連エラー { $index }：
-diagnostic-relation-value = { $code ->
-    [cleanup] クリーンアップ
-    [rollback] ロールバック
-    [discard] 破棄
-    [finalization] 終了処理
-    [shutdown] シャットダウン
-    [observability] 可観測性
-   *[other] { $code }
-}
-diagnostic-stage-value = { $code ->
-    [process_startup] プロセス起動
-    [process_output] プロセス出力
-    [configuration] 設定の読み込み
-    [command_preparation] コマンドの準備
-    [project_opening] プロジェクトを開く処理
-    [init] 初期化
-    [extract] 抽出
-    [translate] 翻訳
-    [write_back] 書き戻し
-    [lua] プロジェクト Lua 実行
-    [model_request] モデルへのリクエスト
-    [run_plan_finalization] 実行プランの確定
-    [publication] 公開
-    [shutdown] 終了処理
-    [logging] プロジェクトログ
-    [runtime] ランタイム
-   *[other] __ATT_FALLBACK__
-}
-diagnostic-effect-value = { $code ->
-    [unchanged] 状態は変更されていません
-    [progress_preserved] 有効な進捗は保存されました
-    [applied] 状態は適用されました
-    [applied_run_plan_not_saved] 状態は適用されましたが、実行プランは保存されませんでした
-    [applied_finalization_failed] 状態は適用されましたが、確定処理は完了しませんでした
-    [recovery_required] 状態を信頼する前に復旧が必要です
-    [outcome_unknown] 最終状態は不明です
-   *[other] __ATT_FALLBACK__
-}
 diagnostic-resolution-value = { $code ->
     [fix_configuration] 指定された設定項目を修正して再試行してください
     [fix_input] 指定された入力を修正して再試行してください
@@ -220,7 +182,7 @@ diagnostic-resolution-value = { $code ->
     [check_model_service] モデルサービスの応答とアカウント制限を確認してください
     [preserve_recovery_artifacts] 記載された復旧用ファイルを削除せず、出力を復旧してから再試行してください
     [retry] 操作を再試行してください
-    [report_bug] エラーコードとログパスを添えて ATT の不具合を報告してください
+    [report_bug] ATT の不具合を報告し、そのとき行っていた操作を説明してください
    *[other] __ATT_FALLBACK__
 }
 diagnostic-failure-value = { $code ->
@@ -359,16 +321,13 @@ task-record-parse-error = 解析エラー：{ $kind ->
 task-record-attempt-succeeded = 試行 { $number }：成功；finish reason { $finish_reason }
 task-record-attempt-token-usage = ；token `{ $prompt } / { $completion } / { $total }`
 task-record-attempt-duration = ；所要時間 `{ $duration }`
-task-record-attempt-request-id = ；request ID { $request_id }
-task-record-attempt-response-id = ；response ID { $response_id }
-task-record-attempt-retryable = 試行 { $number }：再試行可能なリクエスト失敗；診断 `{ $code }`；所要時間 `{ $duration }`
+task-record-attempt-retryable = 試行 { $number }：再試行可能なリクエスト失敗；所要時間 `{ $duration }`
 task-record-attempt-retry-after = ；Retry-After `{ $duration }`
 task-record-attempt-wait-retry = ；`{ $duration }` 後に再試行
 task-record-attempt-wait-completed = ；`{ $duration }` の待機は完了しましたが、次の試行は開始されませんでした
 task-record-attempt-wait-cancelled = ；`{ $duration }` の待機中にキャンセル
-task-record-attempt-failed = 試行 { $number }：リクエストまたはレスポンス処理失敗；診断 `{ $code }`；所要時間 `{ $duration }`
+task-record-attempt-failed = 試行 { $number }：リクエストまたはレスポンス処理失敗；所要時間 `{ $duration }`
 task-record-attempt-cancelled = 試行 { $number }：キャンセル済み；所要時間 `{ $duration }`
-task-record-structured-reason = 理由：{ $reason }
 task-record-final-status = 状態：{ $state ->
     [complete] 完了、コミット確認済み
     [partial] 一部完了、コミット確認済み
@@ -384,6 +343,6 @@ task-record-final-status = 状態：{ $state ->
 }
 task-record-accepted-written = 受理：{ $accepted } 項目、実位置 { $written } 箇所へ書き込み
 task-record-accepted-outcome-unknown = 検収済み：{ $accepted } 項目；データベースのコミット結果を確認できません
-task-record-task-diagnostic = タスク診断：`{ $code }`；理由 { $reason }
+task-record-task-diagnostic = タスク診断
 task-record-duration-seconds = { $value } 秒
 task-record-duration-milliseconds = { $value } ミリ秒

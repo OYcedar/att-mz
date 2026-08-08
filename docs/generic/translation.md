@@ -11,14 +11,18 @@ Profile；项目还没有保存值时显式提供即可。术语和 Placeholder 
 Translate 首先确认外部 JSONL 与最近成功 Extract 一致，然后按完整文件、Group 和 Unit 建立
 稳定 TaskBlock，再准备、去重、分配临时 ID、请求模型、逐 ID 验收并保存有效结果。
 
-## 1. Unit 与 Current
+## 1. Unit 与当前译文
 
 每个 Unit 独立拥有译文和状态。空白、没有源语内容或完全受 Placeholder 保护的 text 直接
 保留，不请求模型；其 Group 被发送时，它们仍按原样参与语境。
 
-自动译文的 Current 状态绑定当前源文、Group 语境、语言、实际术语、实际 Placeholder、
-Prompt 和 Client 语义。人工 Lua 译文的绑定更少：术语、Prompt、Profile 和 Client 的变化
-对它没有影响；源文、Group 语境、语言或实际 Placeholder 变化仍会使它失效。
+自动译文状态绑定当前源文、Group 语境、语言、实际术语、实际 Placeholder、Prompt、
+Profile 和 Client 语义。当前人工译文来自独立人工表，优先于自动译文；Translate 跳过它，
+模型提交也不能覆盖它。
+
+人工译文只在对应逻辑 Unit、所属文件、Group kind、正文形状或原文变化时过期。上下文、
+相邻文本、语言、术语、Placeholder 配置、Prompt、Profile 和 Client 变化不影响已经应用的
+人工译文。
 
 ## 2. 全局去重
 
@@ -30,9 +34,10 @@ Prompt 和 Client 语义。人工 Lua 译文的绑定更少：术语、Prompt、
 - 已经有多种不同 Current：全部保留；存在未译成员时，从未译成员重新选择代表；
 - 已有 Current 始终优先，任何传播都会跳过它们。
 
-去重的作用是减少请求；相同原文需要不同译文时，多种译文可以共存。已定位 Unit 的
-同文异译、质量修订，或由人工或 agent 补译，都使用[原子数据库 Lua](../lua/README.md)精确提交，
-不改写全局去重规则。
+去重的作用是减少请求；相同原文需要不同译文时，多种译文可以共存。已定位 Unit 的同文
+异译、质量修订或少量补译，优先使用 [Manual TOML](../manual/README.md) 精确提交，不改写
+全局去重、Placeholder 或语言规则。复杂筛选、计算生成或批量变换再使用
+[Lua](../lua/README.md)。
 
 ## 3. TaskBlock
 
@@ -92,9 +97,9 @@ Prompt 明确规定，ATT 依靠这条契约确定译文语言，不做短文本
 保留。
 
 每个实际开始的 Task 写 `task.finished`：Complete、Partial、Unavailable、Failed、
-NotCommittedAfterEarlierFailure 或 Cancelled。Partial、Unavailable 与 Failed 引用保存具体问题的
-`diagnostic.translation_task` occurrence。NotCommittedAfterEarlierFailure 只表示该 Task 已有
-可提交结果但未因前序失败而写入，并复用前序失败 occurrence，不把它重投影为当前 Task 的错误。
+NotCommittedAfterEarlierFailure 或 Cancelled。Partial、Unavailable 与 Failed 同时写可读任务
+诊断。NotCommittedAfterEarlierFailure 只表示该 Task 已有可提交结果，但因为更早任务失败而
+没有写入；它不伪造当前 Task 的新错误。
 每次命令恰好写一条 `translation.finished`：
 NotStarted、NoWork、Complete、Incomplete、Failed 或 Cancelled。含 Partial 或 Unavailable
 任务但业务结果明确时，Translate 结果是 Incomplete，退出码仍为 `0`；项目是否全部译完以
@@ -103,11 +108,11 @@ NotStarted、NoWork、Complete、Incomplete、Failed 或 Cancelled。含 Partial
 `translation.finished` 固定保存 planned、started、complete、partial、unavailable、failed、
 cancelled 与 not_started Task 计数，并保存 Generic 专用的 cleared/reused/accepted/written/
 conflicted units 与 response problems。它取代按 Task 与 Unit 含义混合的通用 Partial 汇总。
-Placeholder 等规划错误发生在任何 Task 或模型请求之前时，结果为 Failed，具体
-`diagnostic.run_plan` occurrence 保留规则来源、规则号和完整 Generic Unit locator；数据库
+Placeholder 等规划错误发生在任何 Task 或模型请求之前时，结果为 Failed；可读诊断保留
+规则文件、自然规则号、类似 `story.jsonl:line3:unit2:text` 的位置、原因和修改方法，数据库
 保持不变。
 
 Partial 会保留合法 ID 和已确认前序进度；再次运行只给仍需模型的 Unit 分配临时 ID，并
-继续提供稳定 TaskBlock 的完整语境。是否继续同一 Translate、修正资源，还是由人工或 agent
-修订，要按[诊断与恢复指南](../guides/diagnosis-and-recovery.md#64-translate)根据具体原因与
-实际进展判断。
+继续提供稳定 TaskBlock 的完整语境。是否继续同一 Translate、修正系统性资源问题，还是用
+Manual 完成少量局部补译，要按
+[诊断与恢复指南](../guides/diagnosis-and-recovery.md#64-translate)根据具体原因与实际进展判断。

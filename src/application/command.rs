@@ -16,7 +16,7 @@ use rusqlite::{Connection, OpenFlags};
 
 use super::project_log::{
     ActiveProjectLog, CommandLogStart, PendingProjectLog, ProjectLogHandle, ProjectLogLuaPrintSink,
-    ProjectLuaSummaryGuard, start_command_log,
+    start_command_log,
 };
 use super::translation_prompt::{
     PromptResourceLoadError, PromptTemplateError,
@@ -31,8 +31,8 @@ use super::translation_prompt::{
 };
 use crate::application::config::{
     ConfigurationLoadError, ConfiguredExtractCommand, ConfiguredInitCommand,
-    ConfiguredProjectLuaCommand, ConfiguredRpgMakerCommand, ConfiguredTranslateCommand,
-    ConfiguredWriteBackCommand, TranslateConfiguration,
+    ConfiguredManualCommand, ConfiguredProjectLuaCommand, ConfiguredRpgMakerCommand,
+    ConfiguredTranslateCommand, ConfiguredWriteBackCommand, TranslateConfiguration,
 };
 use crate::diagnostic::{
     BoxedError, Diagnostic, DiagnosticReport, DiagnosticStage, IoFailure, PromptProblem,
@@ -47,6 +47,10 @@ use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage, project_log_value_source_label};
 use crate::language::LanguageModuleCatalogError;
+use crate::manual::{
+    ManualCommandError, ManualCommandSummary, execute_rpg_maker_manual_command,
+    render_manual_command_error,
+};
 use crate::progress::{
     ProgressAmount, ProgressObserver, ProgressSnapshot, TerminalProgress, TerminalProgressFailures,
     TerminalProgressObserver,
@@ -56,11 +60,9 @@ use crate::project_lease::{
     ProjectCommandLeaseProvider, ProjectCommandLeaseService,
 };
 use crate::project_lua::{
-    ProjectLuaCancellation, ProjectLuaDatabasePrerequisiteError, ProjectLuaFailure,
-    ProjectLuaProgram, ProjectLuaProject, ProjectLuaRunError, ProjectLuaRunRequest,
-    compile_project_lua_program_with_cancellation,
-    fingerprint_project_lua_program_with_cancellation, rpg_maker_project_lua_adapter,
-    run_project_lua,
+    ProjectLuaCancellation, ProjectLuaFailure, ProjectLuaProgram, ProjectLuaProject,
+    ProjectLuaRunError, ProjectLuaRunRequest, compile_project_lua_program_with_cancellation,
+    rpg_maker_project_lua_adapter, run_project_lua,
 };
 use crate::rpg_maker::RpgMakerLayout;
 use crate::rpg_maker::dialogue::{
@@ -278,6 +280,9 @@ pub(crate) enum RpgMakerCommandOutput {
     },
     WriteBack {
         output: WriteBackOutput,
+    },
+    Manual {
+        summary: ManualCommandSummary,
     },
     Lua {
         project: crate::project_name::ProjectName,
@@ -891,6 +896,9 @@ impl ProductionRpgMakerCommandRunner {
                 ConfiguredRpgMakerCommand::WriteBack(command) => {
                     self.run_write_back(command, termination_signals).await
                 }
+                ConfiguredRpgMakerCommand::Manual(command) => {
+                    self.run_manual(command, termination_signals).await
+                }
                 ConfiguredRpgMakerCommand::Lua(command) => {
                     self.run_atomic_project_lua(command, termination_signals)
                         .await
@@ -898,6 +906,82 @@ impl ProductionRpgMakerCommandRunner {
             }
         })
         .await
+    }
+
+    async fn run_manual(
+        self,
+        command: ConfiguredManualCommand,
+        termination_signals: &mut TerminationSignals,
+    ) -> ProductionCommandRunReport {
+        let performance = Arc::new(RunPerformanceCounters::default());
+        let cancellation = CooperativeCancellation::default();
+        let roots = match ProductionCommandRootGuard::start_init(
+            command.common().filesystem().clone(),
+            command.common().sqlite().clone(),
+            performance,
+        )
+        .await
+        {
+            Ok(roots) => roots,
+            Err(failure) => return failure.into_report(),
+        };
+        let file_system = roots.file_system().clone();
+        let sqlite = roots.sqlite().clone();
+        let project = command.project_name().clone();
+        let database_path = ProjectWorkspaceLayout::for_project(
+            command.common().projects_root(),
+            self.layout,
+            &project,
+        )
+        .database_path()
+        .to_path_buf();
+        let operation = command.operation();
+        let file = command.file().to_path_buf();
+        let language_modules = command.language_modules().clone();
+        let lease_provider = ProjectCommandLeaseService::new(
+            command.common().projects_root().to_path_buf(),
+            self.layout.engine().storage_name(),
+            file_system.clone(),
+        );
+        let engine = self.layout.engine();
+        let operation_project = project.clone();
+        let operation_cancellation = cancellation.clone();
+        let execution = drive_command(
+            async move {
+                let _lease = lease_provider
+                    .acquire(&operation_project)
+                    .await
+                    .map_err(ProductionCommandError::project_lease)?;
+                if operation_cancellation.is_requested() {
+                    return Ok(OperationCompletion::Cancelled);
+                }
+                let summary = tokio::task::spawn_blocking(move || {
+                    execute_rpg_maker_manual_command(
+                        &database_path,
+                        engine,
+                        operation,
+                        &file,
+                        &language_modules,
+                    )
+                })
+                .await
+                .map_err(ProductionCommandError::manual_worker)?
+                .map_err(ProductionCommandError::manual)?;
+                Ok(OperationCompletion::Completed(
+                    RpgMakerCommandOutput::Manual { summary },
+                ))
+            },
+            termination_signals,
+            || {
+                cancellation.request();
+                file_system.cancel_waits();
+                sqlite.cancel_waits();
+            },
+            || {},
+        )
+        .await;
+        let shutdown = roots.shutdown().await;
+        ProductionCommandRunReport::from_completion_with_project_log(execution, shutdown, None)
     }
 
     async fn run_atomic_project_lua(
@@ -924,6 +1008,7 @@ impl ProductionRpgMakerCommandRunner {
         let file_system = roots.file_system().clone();
         let sqlite = roots.sqlite().clone();
         let project_name = command.project_name().clone();
+        let language_modules = command.language_modules().clone();
         let database_path =
             ProjectWorkspaceLayout::for_project(&projects_root, self.layout, &project_name)
                 .database_path()
@@ -989,8 +1074,7 @@ impl ProductionRpgMakerCommandRunner {
             }
         };
 
-        let script_path = script.resolved_path().to_path_buf();
-        let script_identity = script_path.to_string_lossy().into_owned();
+        let script_identity = script.resolved_path().to_string_lossy().into_owned();
         let script_source = script.into_bytes();
         let project_log = start_command_log(CommandLogStart {
             common: command.common(),
@@ -1000,25 +1084,14 @@ impl ProductionRpgMakerCommandRunner {
             command: ProjectLogCommand::Lua,
             performance,
         });
-        let mut lua_summary = ProjectLuaSummaryGuard::new(&project_log);
-
         let program_arguments = command.arguments().to_vec();
         let preflight_cancellation = lua_cancellation.clone();
-        let preflight_log = project_log.handle().clone();
         let preflight_database_path = database_path.clone();
         let preparation = drive_command(
             async move {
                 let result = tokio::task::spawn_blocking(move || {
                     let program =
                         ProjectLuaProgram::new(script_identity, script_source, program_arguments);
-                    let fingerprint = fingerprint_project_lua_program_with_cancellation(
-                        &program,
-                        &preflight_cancellation,
-                    )?;
-                    if let Ok(event) = ProjectLogEvent::lua_script(&script_path, fingerprint.hex())
-                    {
-                        preflight_log.emit(event);
-                    }
                     compile_project_lua_program_with_cancellation(
                         &program,
                         &preflight_cancellation,
@@ -1171,12 +1244,10 @@ impl ProductionRpgMakerCommandRunner {
         let request = ProjectLuaRunRequest::new(
             ProjectLuaProject::new(project_name.as_str(), self.layout.engine().into()),
             program,
-            rpg_maker_project_lua_adapter(self.layout.engine(), lua_cancellation.clone()),
+            rpg_maker_project_lua_adapter(self.layout.engine(), language_modules),
         )
         .with_cancellation(lua_cancellation.clone())
         .with_print_sink(Arc::new(ProjectLogLuaPrintSink::from_active(&project_log)));
-        let lua_metrics = request.metrics();
-        lua_summary.track(lua_metrics.clone());
         let execution = drive_command(
             async move {
                 let result = tokio::task::spawn_blocking(move || {
@@ -1198,12 +1269,9 @@ impl ProductionRpgMakerCommandRunner {
                 .await
                 .map_err(ProductionCommandError::project_lua_worker)?;
                 match result {
-                    Ok(report) => Ok(OperationCompletion::Completed((
-                        RpgMakerCommandOutput::Lua {
-                            project: project_name,
-                        },
-                        report,
-                    ))),
+                    Ok(_) => Ok(OperationCompletion::Completed(RpgMakerCommandOutput::Lua {
+                        project: project_name,
+                    })),
                     Err(ProjectLuaExecutionError::Run { source: error, .. })
                         if project_lua_run_was_cancelled(&error) =>
                     {
@@ -1235,11 +1303,6 @@ impl ProductionRpgMakerCommandRunner {
             progress_observer.complete_phase(ProjectLuaProgressPhase::Running);
         }
         finish_progress_business_state(&progress_observer, &execution);
-        let report = lua_metrics.report();
-        lua_summary.emit(report);
-        let execution = execution.map(|result| {
-            result.map(|completion| map_completion(completion, |(output, _report)| output))
-        });
         let shutdown = finish_terminal_progress(progress, roots.shutdown().await);
         let terminal_diagnostic = record_failed_phase(
             &progress_observer,
@@ -3234,6 +3297,11 @@ fn command_panic_context(
             command.common(),
             command.project_name().as_str(),
         ),
+        ConfiguredRpgMakerCommand::Manual(command) => (
+            crate::diagnostic::RuntimeCommand::Manual,
+            command.common(),
+            command.project_name().as_str(),
+        ),
         ConfiguredRpgMakerCommand::Lua(command) => (
             crate::diagnostic::RuntimeCommand::Lua,
             command.common(),
@@ -4280,6 +4348,7 @@ fn project_lua_run_was_cancelled(error: &ProjectLuaRunError) -> bool {
     matches!(
         error,
         ProjectLuaRunError::NotStarted(ProjectLuaFailure::Cancelled)
+            | ProjectLuaRunError::Failed(ProjectLuaFailure::Cancelled)
             | ProjectLuaRunError::RolledBack(ProjectLuaFailure::Cancelled)
     )
 }
@@ -6070,6 +6139,16 @@ impl ProductionCommandError {
         ReportedFailure::new(diagnostic, source)
     }
 
+    fn manual(source: ManualCommandError) -> Self {
+        let report = DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::runtime(RuntimeIssue::InvalidConfiguration {
+                component: RuntimeComponent::Process,
+            }),
+        );
+        Self::ConfigurationOrInput(Box::new(ReportedFailure::new(report, source)))
+    }
+
     pub(crate) fn stdout_write(source: io::Error) -> Self {
         let report = DiagnosticReport::new(
             StateEffect::AppliedFinalizationFailed,
@@ -6279,16 +6358,20 @@ impl ProductionCommandError {
         Self::Internal(Box::new(ReportedFailure::new(report, source)))
     }
 
+    fn manual_worker(source: tokio::task::JoinError) -> Self {
+        let report = DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::runtime(RuntimeIssue::WorkerPanicked {
+                component: RuntimeComponent::CpuExecutor,
+                operation: RuntimeOperation::ExecuteTask,
+            }),
+        );
+        Self::Internal(Box::new(ReportedFailure::new(report, source)))
+    }
+
     fn project_lua_preflight(source: ProjectLuaFailure, database_path: &Path) -> Self {
         let class = match &source {
-            ProjectLuaFailure::DatabasePrerequisite(
-                ProjectLuaDatabasePrerequisiteError::InvalidProjectState { .. }
-                | ProjectLuaDatabasePrerequisiteError::Sqlite(_),
-            )
-            | ProjectLuaFailure::Database(_)
-            | ProjectLuaFailure::Validation { .. } => 0_u8,
             ProjectLuaFailure::Context(_) | ProjectLuaFailure::Panicked => 1,
-            ProjectLuaFailure::Host(error) if error.is_worker_spawn() => 1,
             _ => 2,
         };
         let report = source.preflight_diagnostic_report(database_path);
@@ -6323,22 +6406,12 @@ impl ProductionCommandError {
             ),
             ProjectLuaExecutionError::Run { path, source } => {
                 let class = match source {
-                    ProjectLuaRunError::RollbackOutcomeUnknown { .. }
-                    | ProjectLuaRunError::CommitOutcomeUnknown(_) => 1,
+                    ProjectLuaRunError::RollbackOutcomeUnknown { .. } => 1,
                     ProjectLuaRunError::NotStarted(failure)
+                    | ProjectLuaRunError::Failed(failure)
                     | ProjectLuaRunError::RolledBack(failure) => match failure {
-                        ProjectLuaFailure::DatabasePrerequisite(
-                            ProjectLuaDatabasePrerequisiteError::InvalidProjectState { .. }
-                            | ProjectLuaDatabasePrerequisiteError::Sqlite(_),
-                        )
-                        | ProjectLuaFailure::Database(_)
-                        | ProjectLuaFailure::Validation { .. }
-                        | ProjectLuaFailure::Cancelled
-                        | ProjectLuaFailure::DatabasePrerequisite(
-                            ProjectLuaDatabasePrerequisiteError::Cancelled,
-                        ) => 0,
+                        ProjectLuaFailure::Database(_) | ProjectLuaFailure::Cancelled => 0,
                         ProjectLuaFailure::Context(_) | ProjectLuaFailure::Panicked => 3,
-                        ProjectLuaFailure::Host(error) if error.is_worker_spawn() => 3,
                         _ => 2,
                     },
                 };
@@ -6405,101 +6478,16 @@ impl ProductionCommandError {
         }
     }
 
+    pub(crate) fn manual_error(&self) -> Option<&ManualCommandError> {
+        self.failure_report()
+            .source_error()
+            .downcast_ref::<ManualCommandError>()
+    }
+
     fn was_cancelled_wait(&self) -> bool {
         let report = self.failure_report();
         report.report().related().is_empty()
             && report.report().primary().issue().summary_code() == "lock_cancelled"
-    }
-}
-
-#[cfg(test)]
-mod project_lua_diagnostic_tests {
-    use super::*;
-    use crate::project_lua::ProjectLuaSqliteError;
-
-    fn primary(error: &ProductionCommandError) -> &Diagnostic {
-        error.failure_report().report().primary()
-    }
-
-    #[test]
-    fn database_prerequisite_state_is_project_state_in_preflight_and_execution() {
-        let failure = ProjectLuaFailure::DatabasePrerequisite(
-            ProjectLuaDatabasePrerequisiteError::InvalidProjectState {
-                engine: crate::diagnostic::LuaEngine::Generic,
-                violation: crate::diagnostic::LuaValueViolation::StateMismatch,
-            },
-        );
-        let database_path = Path::new("project.db");
-        let errors = [
-            ProductionCommandError::project_lua_preflight(failure.clone(), database_path),
-            ProductionCommandError::project_lua_execution(ProjectLuaExecutionError::Run {
-                path: database_path.to_path_buf(),
-                source: ProjectLuaRunError::RolledBack(failure),
-            }),
-        ];
-
-        for error in &errors {
-            assert!(matches!(error, ProductionCommandError::ProjectState(_)));
-            let diagnostic = primary(error);
-            assert_eq!(diagnostic.code(), "lua.database_prerequisite");
-            assert_eq!(
-                diagnostic.resolution(),
-                crate::diagnostic::DiagnosticResolution::CheckProjectState
-            );
-            let serialized = serde_json::to_value(diagnostic).expect("诊断应可序列化");
-            assert_eq!(
-                serialized["issue"]["details"]["problem"]["engine"],
-                "generic"
-            );
-            assert_eq!(
-                serialized["issue"]["details"]["problem"]["violation"],
-                "state_mismatch"
-            );
-        }
-    }
-
-    #[test]
-    fn sqlite_prerequisite_uses_structured_codes_without_driver_message() {
-        let connection = Connection::open_in_memory().expect("应建立错误来源数据库");
-        connection
-            .execute_batch(
-                "CREATE TABLE sensitive_driver_message (value TEXT UNIQUE);
-                 INSERT INTO sensitive_driver_message VALUES ('secret-value');",
-            )
-            .expect("应建立唯一约束");
-        let source = connection
-            .execute(
-                "INSERT INTO sensitive_driver_message VALUES ('secret-value')",
-                [],
-            )
-            .expect_err("重复值应产生扩展 SQLite code");
-        assert!(source.to_string().contains("sensitive_driver_message"));
-        let sqlite = ProjectLuaSqliteError::new(
-            crate::project_lua::ProjectLuaSqliteOperation::ReadCurrentAttSchema,
-            source,
-        );
-        let failure = ProjectLuaFailure::DatabasePrerequisite(
-            ProjectLuaDatabasePrerequisiteError::Sqlite(sqlite),
-        );
-        let database_path = Path::new("project.db");
-        let errors = [
-            ProductionCommandError::project_lua_preflight(failure.clone(), database_path),
-            ProductionCommandError::project_lua_execution(ProjectLuaExecutionError::Run {
-                path: database_path.to_path_buf(),
-                source: ProjectLuaRunError::RolledBack(failure),
-            }),
-        ];
-
-        for error in &errors {
-            assert!(matches!(error, ProductionCommandError::ProjectState(_)));
-            let diagnostic = primary(error);
-            assert_eq!(diagnostic.code(), "sqlite.driver");
-            let serialized = serde_json::to_string(diagnostic).expect("公开诊断应可序列化");
-            assert!(serialized.contains("\"primary_code\":19"));
-            assert!(serialized.contains("\"extended_code\":2067"));
-            assert!(!serialized.contains("sensitive_driver_message"));
-            assert!(!serialized.contains("secret-value"));
-        }
     }
 }
 
@@ -6842,6 +6830,21 @@ impl CommandResultRenderer {
                 }
                 Ok(())
             }
+            RpgMakerCommandOutput::Manual { summary } => match summary {
+                ManualCommandSummary::Exported { entries, file } => {
+                    writeln!(stdout, "已导出 {entries} 条：{}", file.display())
+                }
+                ManualCommandSummary::Checked { report } => writeln!(
+                    stdout,
+                    "有效 {}，未填写 {}，错误 0",
+                    report.valid, report.unfilled
+                ),
+                ManualCommandSummary::Applied { report, applied } => writeln!(
+                    stdout,
+                    "已应用 {applied}，未填写 {}，错误 0",
+                    report.unfilled
+                ),
+            },
             RpgMakerCommandOutput::Lua { project } => writeln!(
                 stdout,
                 "{}",
@@ -6913,11 +6916,15 @@ impl CommandResultRenderer {
         stderr: &mut dyn Write,
     ) -> io::Result<()> {
         if let Some(error) = command_error {
-            writeln!(
-                stderr,
-                "{}",
-                render_diagnostic_report(error.failure_report().report(), localizer)
-            )?;
+            if let Some(manual) = error.manual_error() {
+                render_manual_command_error(manual, stderr)?;
+            } else {
+                writeln!(
+                    stderr,
+                    "{}",
+                    render_diagnostic_report(error.failure_report().report(), localizer)
+                )?;
+            }
         }
         if let Some(shutdown) = shutdown_error {
             let related_offset = command_error.map(|error| {
@@ -7141,7 +7148,7 @@ mod command_result_renderer_tests {
         for (source, expected) in [
             (
                 SystemFileSystemError::JournalCorrupt {
-                    path: PathBuf::from("C:/project/.directory-publish-test.journal"),
+                    path: PathBuf::from("C:/project/.directory-publish/workspace/journal"),
                     violation: crate::diagnostic::FileSystemJournalViolation::CrcMismatch {
                         frame_index: 1,
                     },
@@ -7151,7 +7158,9 @@ mod command_result_renderer_tests {
             (
                 SystemFileSystemError::OutcomeUnknown {
                     target_root: PathBuf::from("C:/project/workspace"),
-                    artifacts: vec![PathBuf::from("C:/project/.directory-publish-test.journal")],
+                    artifacts: vec![PathBuf::from(
+                        "C:/project/.directory-publish/workspace/journal",
+                    )],
                     violation:
                         crate::diagnostic::FileSystemRecoveryViolation::TargetIdentityUnknown,
                 },
@@ -7184,7 +7193,7 @@ mod command_result_renderer_tests {
         for (source, expected) in [
             (
                 SystemFileSystemError::JournalCorrupt {
-                    path: PathBuf::from("C:/project/.directory-publish-test.journal"),
+                    path: PathBuf::from("C:/project/.directory-publish/workspace/journal"),
                     violation: crate::diagnostic::FileSystemJournalViolation::CrcMismatch {
                         frame_index: 1,
                     },
@@ -7194,7 +7203,9 @@ mod command_result_renderer_tests {
             (
                 SystemFileSystemError::OutcomeUnknown {
                     target_root: PathBuf::from("C:/project/workspace"),
-                    artifacts: vec![PathBuf::from("C:/project/.directory-publish-test.journal")],
+                    artifacts: vec![PathBuf::from(
+                        "C:/project/.directory-publish/workspace/journal",
+                    )],
                     violation:
                         crate::diagnostic::FileSystemRecoveryViolation::TargetIdentityUnknown,
                 },
@@ -7528,17 +7539,17 @@ mod init_entry_recovery_tests {
         finish_successful_report(resumed);
 
         assert!(workspace.join("project.db").is_file());
-        assert!(
-            fs::read_dir(workspace.parent().expect("工作区应有父目录"))
-                .expect("引擎项目根应可读取")
-                .all(|entry| {
-                    let name = entry
-                        .expect("引擎项目目录项应可读取")
-                        .file_name()
-                        .to_string_lossy()
-                        .into_owned();
-                    !name.starts_with(".directory-publish-")
-                })
+        let publication_workspace = workspace
+            .parent()
+            .expect("工作区应有父目录")
+            .join(".directory-publish")
+            .join(workspace.file_name().expect("工作区应有名称"));
+        assert_eq!(
+            fs::read_dir(publication_workspace)
+                .expect("目标目录发布工作目录应可读取")
+                .count(),
+            0,
+            "恢复后不得留下 stage、backup 或 journal"
         );
     }
 }

@@ -76,10 +76,9 @@ MV/MZ 内容必须按[翻译项目指南](translation-project.md#31-mvmz-必须�
 
 ## 5. 全部 Unit 与翻译状态
 
-ATT 当前没有独立 `status` 命令。需要完整枚举 Unit、当前译文和精确 locator 时，使用
-[Lua 的审查流程](../lua/README.md#4-完整审查与人工或-agent-修订)；它会从当前数据库读取
-完整 Group 语境。Lua 会取得写租约；完成或修复翻译的任务已包含这项项目内操作，只读
-调查除外。
+ATT 当前没有独立 `status` 命令。需要完整枚举当前 Unit、有效译文、来源和过期人工快照时，
+使用高级 `ctx.translation.list()`；需要 Group 语境时，把全部待查可读 ID 合并到一次
+`ctx.translation.context(ids)`。普通验收不读取 raw schema，也不使用内部位置字段。
 
 数据库中译文非空也不能单独证明它对本次预期 Prompt、Profile、Client、术语和 Placeholder
 仍是 Current。要验证自动状态，必须用本次预期资源执行 Translate 的准备与状态重判；
@@ -97,7 +96,7 @@ Placeholder 和来源语境分类：
 - 无法判断，需要补充真实消费者证据。
 
 完成验收要求没有未解释候选，也没有未处理的 Partial、Unavailable、失败任务或并发变化。
-任务记录中的临时数字 ID 不能代替数据库 locator。
+任务记录中的临时数字 ID 不能代替 Manual 或高级 Lua 的可读 ID。
 
 ## 6. 人工或 agent 补译与精确修订
 
@@ -111,16 +110,20 @@ Placeholder 和来源语境分类：
 
 处理顺序：
 
-1. 读取 [Lua 规格](../lua/README.md)和当前引擎 Translate、语言、术语、Placeholder 规格。
-2. 用 Lua 查询当前数据库，取得精确 locator、同一 Group 的全部 Unit、源内容、语境和现有
-   译文；不要从旧任务临时 ID 猜 locator。
-3. 人工或 agent 在完整语境中生成目标译文，并检查术语、角色、控制符、形状和源语残留。
-4. 使用 `ctx.translation.set` 提交精确 Unit；不用直接 SQL 伪造新语义状态。
-5. 命令明确提交后，重新查询全部受影响 Group；事务结果未知时立即停止写入。
-6. 对修改范围重新执行本指南第 5 至第 9 节。
+1. 读取 [Manual 规格](../manual/README.md)和当前引擎 Translate、语言、术语、Placeholder
+   规格，运行 `manual export`。
+2. 读取项目术语；含义明确的条目直接补译。
+3. 收集全部含义不明的可读 ID，在一次 Lua 脚本中调用 `ctx.translation.context(ids)`，不要
+   为每条译文分别启动 Lua，也不要从旧任务临时 ID 猜位置。
+4. 在完整语境中填写 TOML，检查术语、角色、控制符、形状和源语残留。
+5. 运行 `manual check`；只修正语法、原文、type、数组形状、空槽、控制码和 Placeholder
+   错误。
+6. check 通过后运行 `manual apply`，再重新检查全部受影响 Group。
+7. 对修改范围重新执行本指南第 5 至第 9 节。
 
-Lua 会检查数据库不变量、形状和 Placeholder，但不会替代语言、术语、文风、语境和实际
-加载验收。agent 执行的补译与人工补译使用同一套责任和证据要求。
+Manual 不检查语言质量、术语、文风、语境或源语残留，这些仍由验收承担。复杂筛选、计算
+生成或批量变换可以使用 Lua 高级 API；Raw `ctx.db` 能绕过全部保护并破坏数据库，不是普通
+补译步骤。agent 执行的补译与人工补译使用同一套责任和证据要求。
 
 ## 7. 译文质量与全量静态检查
 
@@ -148,8 +151,8 @@ Lua 会检查数据库不变量、形状和 Placeholder，但不会替代语言�
 - 未声明位置没有变化；
 - 所有保留原文逐项有解释；
 - 输出能被对应生产解析器完整读取；
-- 每条人工布局诊断已经按 `group_location + role` 定位，并检查完整显示请求的译文、保留
-  原文、控制序列与硬换行；宽度或断点问题已经用 Lua 精确修订并复验，无效语法已返回相应
+- 每条人工布局诊断已经按可读 ID 定位，并检查完整显示请求的译文、保留原文、控制序列与
+  硬换行；宽度或断点问题已经用 Manual 精确修订并复验，无效语法已返回相应
   阶段修正；游戏有效但布局器无法理解的语法已经逐项记录，保留预期诊断，并在全部相关
   实际场景中确认显示正确；
 - 发布终态明确，没有未处理的 candidate、backup、journal 或结果未知。
@@ -183,7 +186,7 @@ WriteBack 成功不表示 Translate 完成；Partial 输出可能合法保留源
 | --- | --- |
 | 来源、项目归属、Rules、JSONL 分组或稳定身份 | Extract 及其后全部验收 |
 | 语言、术语、Placeholder、Prompt、Profile 或 Client | Translate 状态重判、全部译文与下游验收 |
-| Lua 或其他译文修订 | 受影响 Group、全量语言/Placeholder/质量扫描、WriteBack 与实际加载 |
+| Manual、Lua 或其他译文修订 | 受影响 Group、全量语言/Placeholder/质量扫描、WriteBack 与实际加载 |
 | WriteBack recipe、布局或外部转换 | 完整输出、残留、转换和实际消费者验收 |
 | 部署方式或消费者版本 | 全部实际消费与组合检查 |
 | SQLite 或发布状态不明 | 先诊断与恢复，状态明确前不继续验收 |
@@ -193,7 +196,7 @@ WriteBack 成功不表示 Translate 完成；Partial 输出可能合法保留源
 完成记录至少包含：
 
 - 每个项目的实际发行、输入、资源和最终权威状态；
-- Init、Extract、Translate、Lua 和 WriteBack 的相关 RunId；
+- Init、Extract、Translate、Lua 和 WriteBack 的相关 RunId，以及使用过的 Manual TOML；
 - 全量来源台账与跨项目所有权结果；
 - Unit 候选分类、自动翻译范围以及人工或 agent 修订范围；
 - 全量源语残留、结构、Placeholder 和输出差异检查的范围、数量与结果；

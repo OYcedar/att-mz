@@ -53,13 +53,13 @@ TODO 使用稳定编号，例如 `EX-01`、`TR-03`、`WB-02`。完成前先写�
 任务材料使用：
 
 ```text
-<TODO-ID>-<purpose>-<YYYYMMDD-HHMMSS>[-<RunId-or-sha256-short>].<ext>
+<TODO-ID>-<purpose>-<YYYYMMDD-HHMMSS>[-<RunId>].<ext>
 ```
 
 已被完成 TODO 引用的文件保持原样：不覆盖、不改名、不删除。证据至少记录：
 
 - 绝对路径或 ATT RunId；
-- 文件 SHA-256，或数据库查询的项目身份与观察时间；
+- 文件的自然名称、绝对路径和观察时间，或数据库查询的项目身份与观察时间；
 - 使用的输入、配置、Prompt 或 Lua；
 - 它证明的具体事实；
 - 它属于权威项目状态、ATT 诊断还是人工 QA。
@@ -72,11 +72,12 @@ TODO 使用稳定编号，例如 `EX-01`、`TR-03`、`WB-02`。完成前先写�
 
 ## 4. 配置和翻译资源
 
-- 配置记录实际命令 cwd、固定的 `<att-dir>/config.toml` 绝对路径与 SHA-256，不复制凭据。
-- Rules、术语和 Placeholder 保存本轮采用输入的逐字副本与 SHA-256。
+- 配置记录实际命令 cwd 和固定的 `<att-dir>/config.toml` 绝对路径，不复制凭据。
+- Rules、术语和 Placeholder 保存本轮采用输入的逐字副本。
 - Prompt 修改可能影响多个项目，修改前检查全部使用者和授权。
-- Lua 每次记录脚本绝对路径、SHA-256、参数、ATT 结果和提交后权威状态。
-- Generic 还要记录外部 JSONL 根、Extract 输入指纹、外部转换工具的身份，以及来源路径到
+- Manual 记录 TOML 绝对路径、`check` 与 `apply` 结果，以及提交后权威状态。
+- Lua 特殊修改记录脚本绝对路径、参数、ATT 结果和提交后权威状态。
+- Generic 还要记录外部 JSONL 根、Extract 输入状态、外部转换工具的身份，以及来源路径到
   JSONL 相对文件、Group、Unit 和写回位置的映射规则。分组发生变化时，同时记录依据和
   影响范围。
 

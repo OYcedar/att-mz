@@ -140,7 +140,6 @@ enum StreamingTerminologyMatcher {
 }
 
 impl CompiledTerminology {
-    #[cfg(test)]
     pub(crate) fn empty() -> Self {
         Self {
             entries: Vec::new(),

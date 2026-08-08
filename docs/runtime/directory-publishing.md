@@ -2,116 +2,107 @@
 
 ## 1. 安全文件树
 
-为了守住安全边界，ATT 拒绝 reparse point、硬链接、Windows 大小写等价冲突、路径
-逃逸和读取期间对象身份变化；除此之外不设人为上限，文件字节、目录项、深度、树
-总字节和恢复产物数量都不受限制。
+ATT 拒绝 reparse point、硬链接、Windows 大小写等价冲突、路径逃逸和读取期间对象身份
+变化；除此之外不设置文件字节、目录项、深度、树总字节或恢复产物数量上限。
 
-Windows 等价名称按 ordinal ignore-case 的 UTF-16 code unit 判断，Unicode 规范化
-和兼容折叠都不参与。每个逻辑路径独占一个物理普通文件：链接数不等于 1 时直接
-拒绝，树外别名因此无法绕过指纹，树内也不会有多个路径共享同一份修改。
+Windows 等价名称按 ordinal ignore-case 的 UTF-16 code unit 判断，Unicode 规范化和兼容
+折叠不参与。每个逻辑路径独占一个物理普通文件，链接数必须为 1。MV/MZ 来源冻结、Generic
+输入一致读取和全部发布候选都建立在这些约束上。
 
-MV/MZ 来源冻结、Generic 输入一致读取和所有发布候选都建立在这些事实上。ATT 总是
-读取完整文件；失败时报告真实的 OS 操作、路径和错误码，而不是看着 metadata 大小
-提前拒绝。
-
-独立文件并行处理，完成顺序不影响自然 ordinal 和主错误选择。目录遍历使用堆上
-工作栈，再深的合法目录树也不会变成 Rust 栈溢出。
+ATT 总是读取完整文件。失败时公开输出只说明操作对象、直接原因和修改方法，不输出内部
+文件身份、指纹或编码路径。独立文件可以并行处理，完成顺序不改变自然顺序和主错误选择。
 
 ## 2. 租约与发布锁
 
 项目租约位于：
 
 ```text
-<att-dir>/projects/.att-locks/projects/<engine>/
+<att-dir>/projects/.att-locks/projects/<engine>/<project-name>
 ```
 
 目录发布锁位于：
 
 ```text
-<att-dir>/projects/.att-locks/directory-publish/<engine>/
+<att-dir>/projects/.att-locks/directory-publish/<engine>/<target-name>
 ```
 
-锁竞争时持续等待并随时响应取消；ATT 不设任意截止时间，也不设本地队列容量。
-锁身份采用稳定 Windows 名称摘要。
+项目名和目标名直接使用已经校验的自然名称，不使用 hash 或 UUID。锁竞争时等待并响应取消；
+ATT 不设置任意截止时间或本地队列总量上限。
 
-## 3. 候选
+## 3. 候选目录
 
-候选请求包含目标、`CreateNew | ReplaceExisting`、来源映射、引擎生成的 overlay
-和空目录。发布目标根必须是经过校验的绝对路径；来源映射、overlay 和空目录在候选内的
-目标必须是安全相对路径。来源与候选物理隔离。
+候选请求包含目标、`CreateNew | ReplaceExisting`、来源映射、引擎生成的 overlay 和空目录。
+发布目标必须是经过校验的绝对路径；候选内目标必须是安全相对路径。来源、候选和目标物理
+隔离。
 
-ATT 先建立带自然 ordinal 的 manifest，再并行复制未修改文件或写入最终字节；单个
-文档内部需要保持顺序的结构修改仍串行。候选在发布前不可见，失败或取消时整树丢弃。
+ATT 先建立自然顺序 manifest，再并行复制未修改文件或写入最终字节。MV/MZ 候选完成 recipe
+修改后执行 RPG Maker 全量验证；Generic 候选完成 text 替换后使用生产 JSONL 解析器重新
+读取，并再次检查外部输入。Lua 和 Manual 不参与目录候选。
 
-MV/MZ 候选完成 recipe 修改后执行 RPG Maker 全量验证。Generic 候选完成 text 替换
-后使用生产 JSONL 解析器重新读取，并再次检查外部输入指纹。Lua 走自己的通道，
-不参与目录候选。
+候选在发布前不可见。失败或取消发生在目录交换前时，ATT 清理候选；清理本身失败时保留
+准确自然路径并报告，不用随机名称隐藏现场。
 
-## 4. 一次发布与恢复
+## 4. 工作目录名称
 
-完整候选只验证一次，覆盖普通对象、Windows 等价名称、reparse、硬链接、物理身份
-和引擎领域结构。成功后只执行一次 journal 与目录交换。
+每个目标只使用一组固定工作路径：
 
-`CreateNew` 只发布到不存在的目标；`ReplaceExisting` 使用同卷 journal、backup 和
-稳定 file ID 完成可恢复交换。提交前失败，目标保持原样；已经生效但收尾失败、
-需要恢复或结果为 `outcome_unknown` 时，ATT 分别报告准确影响和恢复路径。
+```text
+<parent>/.directory-publish/<target-name>/stage
+<parent>/.directory-publish/<target-name>/backup
+<parent>/.directory-publish/<target-name>/journal
+```
 
-候选一经交付发布器，publish 或 discard 必然运行到明确终态。取消只拦下新工作；
-已经进入目录交换的操作会继续完成，不会停在中间状态。
+`stage` 保存候选，`backup` 保存替换期间的旧目标，`journal` 保存恢复所需事实。目标锁保证
+同一目标不会同时使用这组路径。名称不包含 UUID、hash 或随机后缀。
 
-恢复只枚举目标父目录的直接子项名称；仅读取或处理名称匹配当前目标受管前缀的
-stage、backup 和 journal，不递归读取或删除无关内容。恢复依据来自 journal 而非项目
-日志；主失败和候选清理失败都会保留。
+Generic Init 的数据库临时文件使用：
 
-每次 MV/MZ Init 都会在从 `project.db` 复用省略的游戏路径、读取现存工作区、继承设置或
-判断 `Unchanged` 之前，对同一目标取得发布锁并恢复；任一 WriteBack 则在建立新候选之前
-完成同一动作。ATT 扫描该目标父目录中
-属于它的 `.directory-publish-*.(stage|backup|journal)` 受管产物，并按 journal 自动恢复或
-清理。`prepare` 在锁内还会再次检查，防止恢复后到候选建立前状态变化：
+```text
+<project>/.project.db.init.tmp
+```
 
-- `DiagnosticReport.effect = "applied_finalization_failed"` 且具体 Publication issue 为
-  `published_finalization_failed` 时，`output_root` 与 `residual_path` 证明新输出已经发布、只有
-  收尾失败。`publication.finished.payload.result.kind` 为 `recovery_required`，并引用同一
-  `diagnostic.publication` occurrence。保留现场，先消除其嵌套 backend diagnostic 指出的
-  占用、权限或身份变化，再用同一项目、同一目标和当前预期输入执行一次相应命令；MV/MZ
-  Init 会先清理残留再读取现存项目，WriteBack 会先清理残留再建立新候选；
-- `DiagnosticReport.effect = "recovery_required"` 时，具体 Publication 或 FileSystem issue
-  必须同时给出 `output_root` 或 `target_root`，以及属于同一目标的
-  `recovery_artifacts`。只有这些路径是可匹配的 backup/journal 或可清理 stage，并且主报告
-  及递归 related report 都没有 `filesystem.journal_corrupt`、目标与已知旧目录均缺失或缺少
-  必要 backup，才先修正类型化 backend diagnostic 指出的文件系统原因，再用同一项目、
-  同一目标和相同输入执行一次相应 MV/MZ Init 或 WriteBack；
-- 文件系统 I/O 问题读取 `filesystem.io` issue 中的 `context.operation`、
-  `problem.failure.kind` 与 `problem.failure.raw_os_code`；其他问题按稳定 `code` 和封闭
-  `problem.kind` 分流，不解析本地化 `message`；
-- 自动恢复本身报告 `filesystem.journal_corrupt`、目标与已知旧目录均缺失、缺少必要
-  backup，或一次恢复后仍得到 `effect = "recovery_required"` 时，现行接口无法修复；保留
-  新 occurrence 中的完整 report 和全部 `recovery_artifacts`，不继续重跑，也不手工删除、
-  改名或移动；
-- `effect = "outcome_unknown"` 或 `publication.finished.payload.result.kind =
-  "outcome_unknown"` 表示目标内容或身份无法确认，禁止用重跑试探，也不能自行处理目录。
+独立文件原子写入统一使用 `.<target-file-name>.tmp`。发生错误且自动清理失败时，诊断显示
+这个自然路径。
 
-当前 CLI 没有独立的 `recover` 或 `status` 子命令，也没有公开的 journal 解码与人工交换
-步骤。满足上述条件时，同目标命令就是现行自动恢复入口；`outcome_unknown` 无法通过它安全确认时，
-应报告当前公开能力限制。本节不处理 Generic 项目工作区中的 `.project.db.init-*.tmp`、
-它的 `-journal` / `-wal` / `-shm` SQLite sidecar，或 `.generic-write-back-*`；它们的处理
-见对应 Generic Init、WriteBack 和诊断指南。
+## 5. 一次发布
 
-## 5. MV/MZ Init 发布阶段的 OS 5
+完整候选只验证一次，覆盖普通对象、Windows 等价名称、reparse、硬链接、物理身份和引擎
+领域结构。成功后只执行一次 journal 与目录交换。
 
-只在 MV/MZ Init 诊断同时包含以下事实时，把这次失败当作一次可重试的目录发布失败：
+`CreateNew` 只发布到不存在的目标。`ReplaceExisting` 在同卷内使用 journal 和 backup 完成
+可恢复交换：
 
-- code 为 `filesystem.io`，stage 为 `publication`；
-- FileSystem issue 的 `context.operation = "rename"`，`problem.failure.kind =
-  "permission_denied"`，`problem.failure.raw_os_code = 5`；不解析本地化展示文本；
-- `DiagnosticReport.effect = "unchanged"`；
-- `<att-dir>/projects/<engine>/<name>` 不存在，且诊断没有 `recovery_required` 或
-  `outcome_unknown`。
+- 交换前失败，目标保持原样；
+- 新目标已经可见但收尾失败，ATT 明确说明输出已发布并指出残留路径；
+- 已知需要恢复时，ATT 保留 stage、backup 或 journal，并说明下一步；
+- 是否生效确实无法确认时，ATT 报告结果未知，不宣称成功或已经回滚。
 
-满足全部条件后，不修改 `projects/` 中的任何文件或目录，直接用原来的 `att.exe`、
-`--name`、`--path`、语言和三个宽度参数重跑一次 Init。不要借此更换配置、游戏路径或
-项目名。
+候选一经交付发布器，publish 或 discard 必须运行到明确终态。取消只阻止新工作；已经进入
+目录交换的操作会继续取得明确结果。
 
-第二次成功时，以新项目的 `project.db` 和发布终态为准；第二次仍报普通错误或目标已存在
-时停止这条 OS 5 重试分支。出现符合第 4 节条件的 `recovery_required` 时使用同目标 MV/MZ Init 的自动恢复
-入口；出现 `outcome_unknown` 时停止写入。两者都不能手工删除、移动或编辑项目目录。
+## 6. 自动恢复
+
+恢复只处理同一目标的固定工作目录，不扫描或删除无关文件。恢复权威是 journal，不是项目
+日志。每次 MV/MZ Init 在读取或复用项目目录前、每次 WriteBack 在建立新候选前，都会在同一
+目标锁内先执行恢复。
+
+使用者按诊断中的对象、原因和修改方法处理：
+
+- 只有 backup 或 journal 清理失败，而新输出已经发布：解除占用或权限问题后，重新运行同一
+  项目、同一目标的命令；下一次准备先清理残留；
+- 目标交换尚未完成，但 journal 和所需 backup 完整：修正文件系统原因后，重新运行同一目标
+  命令；ATT 先恢复旧目标或确认新目标，再开始新候选；
+- journal 损坏、目标与已知旧目录都缺失、必要 backup 缺失，或一次恢复后仍不能取得明确
+  状态：保留全部路径并停止，不手工删除、改名或移动；
+- 结果未知：禁止用重跑试探，保持项目、输入、目标和工作目录不变并报告当前能力限制。
+
+当前 CLI 没有独立 `recover` 或 `status` 子命令，也不公开 journal 解码和人工目录交换步骤。
+满足可自动恢复条件时，同目标 Init 或 WriteBack 就是恢复入口。
+
+## 7. 权限失败
+
+如果新建 MV/MZ 项目时，目标尚不存在，而移动候选目录因权限或占用失败，项目状态没有改变，
+可以在解除占用或修正权限后，用完全相同的项目名、游戏路径、语言和布局参数重跑一次 Init。
+
+第二次仍失败、目标已经出现、存在恢复工作目录，或 ATT 报告结果未知时，停止普通重试并按
+上一节处理。不要为了绕过权限问题更换项目名、手工移动候选或删除恢复目录。

@@ -9,10 +9,28 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use rusqlite::Connection;
+
 const PROJECT: &str = "generic-observable";
 const MISSING_CAPTURE_PROJECT: &str = "generic-missing-text-capture";
 const MISSING_CAPTURE_API_KEY: &str = "PRIVATE_MISSING_CAPTURE_API_KEY";
 const MISSING_CAPTURE_SOURCE: &str = "秘密本文あ甲触发缺组乙";
+const LUA_LANGUAGE_CONFIGURATION: &str = r#"[[languages]]
+type = "japanese"
+id = "ja"
+minimum_kana_characters = 1
+allowed_terms = []
+
+[[languages]]
+type = "english"
+id = "en"
+minimum_word_count = 1
+minimum_letter_count = 2
+ignored_terms = []
+minimum_copied_word_count = 2
+minimum_copied_letter_count = 4
+allowed_terms = []
+"#;
 
 #[test]
 fn removed_progress_argument_is_rejected_by_the_process_cli() {
@@ -37,6 +55,281 @@ fn removed_progress_argument_is_rejected_by_the_process_cli() {
         stderr.contains("Unexpected argument") && stderr.contains("--progress"),
         "已删除的进度参数必须作为未知参数报告：{stderr}"
     );
+}
+
+#[test]
+fn manual_export_check_and_apply_work_for_generic() {
+    let temporary = tempfile::tempdir().expect("应可建立 Generic Manual 测试目录");
+    let root = temporary.path();
+    let input = root.join("input");
+    fs::create_dir(&input).expect("应可建立 Generic Manual 输入目录");
+    let source_file = input.join("story.jsonl");
+    fs::write(
+        &source_file,
+        concat!(
+            r#"{"id":"story","kind":"dialogue","units":["#,
+            r#"{"id":"body","text":"こんにちは\n世界"},"#,
+            r#"{"id":"name","text":"名前"},"#,
+            r#"{"id":"english","text":"Already done"},"#,
+            r#"{"id":"blank","text":"   "}]}"#,
+            "\n"
+        ),
+    )
+    .expect("应可写入 Generic Manual 输入");
+    let distribution = distribution_root(root);
+    fs::create_dir_all(&distribution).expect("应可建立 Generic Manual 发行目录");
+    fs::write(distribution.join("config.toml"), LUA_LANGUAGE_CONFIGURATION)
+        .expect("应可写入 Generic Manual 配置");
+
+    assert_success(
+        "Generic Manual Init",
+        &run_att(
+            root,
+            &[
+                "generic",
+                "init",
+                "--name",
+                PROJECT,
+                "--path",
+                input.to_str().expect("临时输入路径应是 Unicode"),
+                "--source-language",
+                "ja",
+                "--target-language",
+                "zh-Hans",
+            ],
+        ),
+    );
+    assert_success(
+        "Generic Manual Extract",
+        &run_att(root, &["generic", "extract", "--name", PROJECT]),
+    );
+
+    let manual = root.join("generic-manual.toml");
+    assert_success(
+        "Generic Manual export",
+        &run_att(
+            root,
+            &[
+                "generic",
+                "manual",
+                "export",
+                "--name",
+                PROJECT,
+                manual.to_str().expect("Manual 路径应是 Unicode"),
+            ],
+        ),
+    );
+    let document = read_manual_toml(&manual);
+    let entries = document["translation"]
+        .as_array()
+        .expect("Manual translation 必须是数组");
+    assert_eq!(entries.len(), 2, "只应导出真正需要翻译的日文条目");
+    let body = find_manual_entry(entries, "story.jsonl:line1:unit1:text");
+    assert_eq!(body["type"].as_str(), Some("free"));
+    assert_eq!(
+        body["source"].as_array().expect("body source 必须是数组"),
+        &[
+            toml::Value::String("こんにちは".to_owned()),
+            toml::Value::String("世界".to_owned()),
+        ]
+    );
+    let name = find_manual_entry(entries, "story.jsonl:line1:unit2:text");
+    assert_eq!(name["type"].as_str(), Some("free"));
+    for entry in entries {
+        let table = entry.as_table().expect("Manual 条目必须是 table");
+        assert_eq!(table.len(), 4);
+        assert!(
+            table
+                .keys()
+                .all(|key| { matches!(key.as_str(), "id" | "type" | "source" | "translation") })
+        );
+    }
+
+    assert_success(
+        "Generic Manual check 未填写",
+        &run_att(
+            root,
+            &[
+                "generic",
+                "manual",
+                "check",
+                "--name",
+                PROJECT,
+                manual.to_str().expect("Manual 路径应是 Unicode"),
+            ],
+        ),
+    );
+    set_manual_toml_field(
+        &manual,
+        "story.jsonl:line1:unit1:text",
+        "translation",
+        toml::Value::Array(vec![toml::Value::String("合并后的译文".to_owned())]),
+    );
+    assert_success(
+        "Generic Manual apply 单项",
+        &run_att(
+            root,
+            &[
+                "generic",
+                "manual",
+                "apply",
+                "--name",
+                PROJECT,
+                manual.to_str().expect("Manual 路径应是 Unicode"),
+            ],
+        ),
+    );
+
+    let workspace = distribution.join("projects/generic").join(PROJECT);
+    let database = workspace.join("project.db");
+    let connection = Connection::open(&database).expect("Generic Manual 数据库应可打开");
+    let count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM generic_manual_translation",
+            [],
+            |row| row.get(0),
+        )
+        .expect("Generic 人工译文数量应可读取");
+    assert_eq!(count, 1);
+    drop(connection);
+
+    set_manual_toml_field(
+        &manual,
+        "story.jsonl:line1:unit2:text",
+        "translation",
+        toml::Value::Array(vec![toml::Value::String("名称".to_owned())]),
+    );
+    set_manual_toml_field(
+        &manual,
+        "story.jsonl:line1:unit1:text",
+        "source",
+        toml::Value::Array(vec![toml::Value::String("错误原文".to_owned())]),
+    );
+    let invalid = run_att(
+        root,
+        &[
+            "generic",
+            "manual",
+            "apply",
+            "--name",
+            PROJECT,
+            manual.to_str().expect("Manual 路径应是 Unicode"),
+        ],
+    );
+    assert_eq!(invalid.status.code(), Some(1));
+    let stderr = String::from_utf8(invalid.stderr).expect("Manual 错误必须是 UTF-8");
+    assert!(stderr.contains("story.jsonl:line1:unit1:text") && stderr.contains("manual export"));
+    assert!(!stderr.contains("group_id") && !stderr.contains("unit_id"));
+    let connection = Connection::open(&database).expect("失败后 Generic 数据库应可打开");
+    let count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM generic_manual_translation",
+            [],
+            |row| row.get(0),
+        )
+        .expect("失败后 Generic 人工译文数量应可读取");
+    assert_eq!(count, 1, "混合有效与无效条目必须原子失败");
+    drop(connection);
+
+    set_manual_toml_field(
+        &manual,
+        "story.jsonl:line1:unit1:text",
+        "source",
+        toml::Value::Array(vec![
+            toml::Value::String("こんにちは".to_owned()),
+            toml::Value::String("世界".to_owned()),
+        ]),
+    );
+    assert_success(
+        "Generic Manual apply 全部",
+        &run_att(
+            root,
+            &[
+                "generic",
+                "manual",
+                "apply",
+                "--name",
+                PROJECT,
+                manual.to_str().expect("Manual 路径应是 Unicode"),
+            ],
+        ),
+    );
+    assert_success(
+        "Generic Manual WriteBack",
+        &run_att(root, &["generic", "write-back", "--name", PROJECT]),
+    );
+    let output = workspace.join("write_back/story.jsonl");
+    let written = read_single_jsonl_group(&output);
+    assert_eq!(written["units"][0]["text"], "合并后的译文");
+    assert_eq!(written["units"][1]["text"], "名称");
+    assert_eq!(written["units"][2]["text"], "Already done");
+    assert_eq!(written["units"][3]["text"], "   ");
+
+    fs::write(
+        &source_file,
+        concat!(
+            r#"{"id":"story","kind":"dialogue","units":["#,
+            r#"{"id":"body","text":"新しい\n本文"},"#,
+            r#"{"id":"name","text":"名前"},"#,
+            r#"{"id":"english","text":"Already done"},"#,
+            r#"{"id":"blank","text":"   "}]}"#,
+            "\n"
+        ),
+    )
+    .expect("变化后的 Generic Manual 输入应可写入");
+    assert_success(
+        "Generic Manual 原文变化后 Extract",
+        &run_att(root, &["generic", "extract", "--name", PROJECT]),
+    );
+    let after_change_manual = root.join("generic-after-change.toml");
+    assert_success(
+        "Generic Manual 原文变化后 export",
+        &run_att(
+            root,
+            &[
+                "generic",
+                "manual",
+                "export",
+                "--name",
+                PROJECT,
+                after_change_manual
+                    .to_str()
+                    .expect("变化后 Manual 路径应是 Unicode"),
+            ],
+        ),
+    );
+    let after_change = read_manual_toml(&after_change_manual);
+    let after_change_entries = after_change["translation"]
+        .as_array()
+        .expect("变化后 Manual translation 必须是数组");
+    assert_eq!(after_change_entries.len(), 1);
+    find_manual_entry(after_change_entries, "story.jsonl:line1:unit1:text");
+    assert_success(
+        "Generic Manual 原文变化后 WriteBack",
+        &run_att(root, &["generic", "write-back", "--name", PROJECT]),
+    );
+    let written = read_single_jsonl_group(&output);
+    assert_eq!(written["units"][0]["text"], "新しい\n本文");
+    assert_eq!(written["units"][1]["text"], "名称");
+    let connection = Connection::open(&database).expect("过期 Generic 人工译文数据库应可打开");
+    let count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM generic_manual_translation",
+            [],
+            |row| row.get(0),
+        )
+        .expect("过期 Generic 人工译文数量应可读取");
+    assert_eq!(count, 2, "过期人工译文必须保留，不能静默删除");
+    let (source, translation): (String, String) = connection
+        .query_row(
+            "SELECT source_json, translation_json FROM generic_manual_translation
+             WHERE group_id = 'story' AND unit_id = 'body'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("过期人工译文快照应可读取");
+    assert_eq!(source, r#"["こんにちは","世界"]"#);
+    assert_eq!(translation, r#"["合并后的译文"]"#);
 }
 
 #[test]
@@ -233,7 +526,7 @@ target_task_user_message_characters = 10000
         {
             let record: serde_json::Value =
                 serde_json::from_str(line).expect("Generic 项目日志行应为 JSON");
-            if record["code"] == "diagnostic.task_record" {
+            if record["event"] == "diagnostic.task_record" {
                 assert_eq!(record["run_id"], expected_run_id);
                 assert_eq!(record["context"]["command"], "translate");
                 assert_eq!(record["level"], "warn");
@@ -272,19 +565,28 @@ target_task_user_message_characters = 10000
         "诊断必须指出损坏文件：{stderr}"
     );
     assert!(
-        stderr.contains("line=1") || stderr.contains(":1"),
+        stderr.contains("nested/bad.jsonl:line1"),
         "诊断必须指出损坏行号：{stderr}"
     );
     assert!(
-        stderr.contains("generic.jsonl.invalid_json") && stderr.contains("operation=parse_jsonl"),
-        "诊断必须使用 Generic JSONL 的稳定错误码和操作：{stderr}"
+        stderr.contains("The value has invalid syntax"),
+        "诊断必须说明直接原因：{stderr}"
     );
     assert!(
-        stderr.contains("json_category=data")
-            && stderr.contains("json_line=1")
-            && stderr.contains("json_column="),
-        "诊断必须保留类型化 JSON 类别和解析坐标：{stderr}"
+        stderr.contains("Correct the named input and retry"),
+        "诊断必须说明修改方法：{stderr}"
     );
+    for internal in [
+        "generic.jsonl",
+        "operation=",
+        "json_category=",
+        "json_column=",
+    ] {
+        assert!(
+            !stderr.contains(internal),
+            "公开诊断不得显示内部字段 {internal:?}：{stderr}"
+        );
+    }
     assert!(
         !stderr.contains(SENTINEL),
         "公开诊断不得包含原始 JSON 字段或 serde 自由文本：{stderr}"
@@ -296,7 +598,7 @@ target_task_user_message_characters = 10000
 }
 
 #[test]
-fn generic_write_back_repairs_symbols_for_english_and_japanese_without_language_configuration() {
+fn generic_write_back_preserves_manual_symbols_for_english_and_japanese() {
     let temporary = tempfile::tempdir().expect("应可建立 Generic 符号修复进程测试目录");
     let root = temporary.path();
     let input = root.join("input");
@@ -308,15 +610,16 @@ fn generic_write_back_repairs_symbols_for_english_and_japanese_without_language_
     .expect("应可写入 Generic 符号修复输入");
 
     let distribution = distribution_root(root);
-    fs::create_dir_all(&distribution).expect("应可建立空配置发行目录");
-    fs::write(distribution.join("config.toml"), "").expect("WriteBack 固定行为测试应可写入空配置");
+    fs::create_dir_all(&distribution).expect("应可建立测试发行目录");
+    fs::write(distribution.join("config.toml"), LUA_LANGUAGE_CONFIGURATION)
+        .expect("Lua 高级 API 语言配置应可写入");
     let script = root.join("set-categories.lua");
     fs::write(
         &script,
         concat!(
             "ctx.translation.set(\n",
-            "  { group_id = \"settings\", unit_id = \"categories\" },\n",
-            "  \"常规、杂项、声音、开关\"\n",
+            "  \"settings.jsonl:line1:unit1:text\",\n",
+            "  { \"常规、杂项、声音、开关\" }\n",
             ")\n",
         ),
     )
@@ -375,15 +678,15 @@ fn generic_write_back_repairs_symbols_for_english_and_japanese_without_language_
         let plain_stdout = stdout.replace(['\u{2068}', '\u{2069}'], "");
         assert!(
             plain_stdout.contains(
-                "Symbol repair: attempted 1 units, repaired 1, skipped internally 0, replaced 3 symbols"
+                "Symbol repair: attempted 0 units, repaired 0, skipped internally 0, replaced 0 symbols"
             ),
-            "CLI 必须报告四项符号修复统计：{stdout}"
+            "人工译文不得进入自动符号修复：{stdout}"
         );
         assert_eq!(
             fs::read_to_string(workspace.join("write_back/settings.jsonl"))
                 .expect("Generic 符号修复输出应可读取"),
-            "{\"id\":\"settings\",\"kind\":\"settings\",\"units\":[{\"id\":\"categories\",\"text\":\"常规,杂项,声音,开关\"}]}\n",
-            "WriteBack 只能替换确定标点，不得补入原文空格"
+            "{\"id\":\"settings\",\"kind\":\"settings\",\"units\":[{\"id\":\"categories\",\"text\":\"常规、杂项、声音、开关\"}]}\n",
+            "WriteBack 必须原样采用人工译文"
         );
 
         let new_logs = project_log_paths(&workspace.join("logs"))
@@ -397,7 +700,7 @@ fn generic_write_back_repairs_symbols_for_english_and_japanese_without_language_
             .map(|line| {
                 serde_json::from_str::<serde_json::Value>(line).expect("项目日志行必须是 JSON")
             })
-            .find(|record| record["code"] == "publication.finished")
+            .find(|record| record["event"] == "publication.finished")
             .expect("成功 WriteBack 必须记录 publication.finished");
         assert_eq!(publication["payload"]["result"]["kind"], "published");
         assert_eq!(
@@ -408,15 +711,109 @@ fn generic_write_back_repairs_symbols_for_english_and_japanese_without_language_
                     "files": 1,
                     "translated_units": 1,
                     "retained_source_units": 0,
-                    "symbol_repair_attempted_units": 1,
-                    "symbol_repair_repaired_units": 1,
+                    "symbol_repair_attempted_units": 0,
+                    "symbol_repair_repaired_units": 0,
                     "symbol_repair_skipped_units": 0,
-                    "symbol_repair_replacements": 3,
+                    "symbol_repair_replacements": 0,
                 },
             }),
             "项目日志必须保存同一组四项符号修复统计"
         );
     }
+}
+
+#[test]
+fn generic_lua_can_reopen_project_database_after_att_schema_is_destroyed() {
+    let temporary = tempfile::tempdir().expect("应可建立 Generic Lua 破坏性测试目录");
+    let root = temporary.path();
+    let input = root.join("input");
+    fs::create_dir(&input).expect("应可建立 Generic Lua 输入目录");
+    fs::write(
+        input.join("story.jsonl"),
+        "{\"id\":\"story\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"line\",\"text\":\"原文\"}]}\n",
+    )
+    .expect("应可写入 Generic Lua 输入");
+
+    let distribution = distribution_root(root);
+    fs::create_dir_all(&distribution).expect("应可建立测试发行目录");
+    fs::write(distribution.join("config.toml"), LUA_LANGUAGE_CONFIGURATION)
+        .expect("Lua 高级 API 语言配置应可写入");
+    let project = "generic-lua-destroyed-schema";
+    assert_success(
+        "Generic Lua 破坏性测试 Init",
+        &run_att(
+            root,
+            &[
+                "generic",
+                "init",
+                "--name",
+                project,
+                "--path",
+                input.to_str().expect("临时输入路径应是 Unicode"),
+                "--source-language",
+                "ja",
+                "--target-language",
+                "zh-Hans",
+            ],
+        ),
+    );
+    assert_success(
+        "Generic Lua 破坏性测试 Extract",
+        &run_att(root, &["generic", "extract", "--name", project]),
+    );
+
+    let destroy = root.join("destroy.lua");
+    fs::write(&destroy, "ctx.db.execute(\"DROP TABLE generic_unit\")\n")
+        .expect("应可写入破坏 schema 的 Lua");
+    assert_success(
+        "Generic Lua 删除 ATT 表",
+        &run_att(
+            root,
+            &[
+                "generic",
+                "lua",
+                "--name",
+                project,
+                destroy.to_str().expect("临时脚本路径应是 Unicode"),
+            ],
+        ),
+    );
+
+    let reopen = root.join("reopen.lua");
+    fs::write(
+        &reopen,
+        concat!(
+            "local missing = ctx.db.query(\"SELECT count(*) FROM sqlite_schema ",
+            "WHERE type = 'table' AND name = 'generic_unit'\")\n",
+            "assert(missing[1][1] == 0)\n",
+            "ctx.db.execute(\"CREATE TABLE lua_after_damage(value TEXT)\")\n",
+            "ctx.db.execute(\"INSERT INTO lua_after_damage VALUES ('kept')\")\n",
+        ),
+    )
+    .expect("应可写入重开数据库的 Lua");
+    assert_success(
+        "Generic Lua 破坏后重开 project.db",
+        &run_att(
+            root,
+            &[
+                "generic",
+                "lua",
+                "--name",
+                project,
+                reopen.to_str().expect("临时脚本路径应是 Unicode"),
+            ],
+        ),
+    );
+
+    let database = distribution
+        .join("projects/generic")
+        .join(project)
+        .join("project.db");
+    let marker: String = Connection::open(database)
+        .expect("应可直接打开被破坏的 project.db")
+        .query_row("SELECT value FROM lua_after_damage", [], |row| row.get(0))
+        .expect("第二次 Lua 应已写入标记");
+    assert_eq!(marker, "kept");
 }
 
 #[test]
@@ -541,28 +938,29 @@ fn generic_missing_text_capture_reports_exact_leaf_without_model_request_or_stat
         "零模型请求的规划失败不得建立任务记录"
     );
 
-    let match_text = "触发缺组";
-    let match_start = MISSING_CAPTURE_SOURCE
-        .find(match_text)
-        .expect("测试源文必须包含 Placeholder 完整匹配");
-    let match_end = match_start + match_text.len();
     let stderr = String::from_utf8(translate.stderr).expect("诊断 stderr 必须是 UTF-8");
     for expected in [
-        "translation.placeholder.missing_text_capture".to_owned(),
-        "Translation".to_owned(),
-        placeholders.display().to_string(),
-        "relative_path=story.jsonl".to_owned(),
-        "group_id=scene".to_owned(),
-        "unit_id=broken-unit".to_owned(),
-        "role=dialogue".to_owned(),
-        "rule_number=1".to_owned(),
-        format!("match_range={match_start}..{match_end}"),
-        "State was not changed".to_owned(),
+        "story.jsonl:line1:unit1:text".to_owned(),
+        "The required named text capture did not participate in the match".to_owned(),
         "Correct the indicated Placeholder rule and retry".to_owned(),
     ] {
         assert!(
             stderr.contains(&expected),
             "stderr 必须保留 MissingTextCapture 事实 {expected:?}：{stderr}"
+        );
+    }
+    for internal in [
+        "translation.placeholder",
+        "relative_path=",
+        "group_id=",
+        "unit_id=",
+        "role=",
+        "rule_number=",
+        "match_range=",
+    ] {
+        assert!(
+            !stderr.contains(internal),
+            "公开诊断不得显示内部字段 {internal:?}：{stderr}"
         );
     }
     for private in [MISSING_CAPTURE_SOURCE, MISSING_CAPTURE_API_KEY] {
@@ -608,7 +1006,7 @@ fn generic_missing_text_capture_reports_exact_leaf_without_model_request_or_stat
                 "sequence",
                 "run_id",
                 "level",
-                "code",
+                "event",
                 "context",
                 "payload",
                 "message",
@@ -623,84 +1021,68 @@ fn generic_missing_text_capture_reports_exact_leaf_without_model_request_or_stat
 
     let diagnostic_records = records
         .iter()
-        .filter(|record| record["code"] == "diagnostic.run_plan")
+        .filter(|record| record["event"] == "diagnostic.run_plan")
         .collect::<Vec<_>>();
     assert_eq!(
         diagnostic_records.len(),
         1,
-        "MissingTextCapture 必须形成一条原子 RunPlan occurrence：{log_text}"
+        "MissingTextCapture 必须形成一条 RunPlan 诊断：{log_text}"
     );
-    let occurrence = &diagnostic_records[0]["payload"];
+    let diagnostic = &diagnostic_records[0]["payload"];
     assert_eq!(diagnostic_records[0]["level"], "error");
-    assert!(
-        occurrence["id"].as_u64().is_some(),
-        "occurrence ID 必须是 RunId 内单调编号：{occurrence}"
-    );
-    assert_eq!(occurrence["scope"], "run_plan");
-    assert_eq!(occurrence["report"]["effect"], "unchanged");
+    let diagnostic_fields = diagnostic.as_object().expect("公开诊断 payload 必须是对象");
     assert_eq!(
-        occurrence["report"]["primary"]["code"],
-        "translation.placeholder.missing_text_capture"
+        diagnostic_fields
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["object", "reason", "help"])
     );
-    assert_eq!(occurrence["report"]["primary"]["stage"], "translate");
-    assert_eq!(
-        occurrence["report"]["primary"]["resolution"],
-        "fix_placeholder_rules"
-    );
-    assert_eq!(occurrence["report"]["related"], serde_json::json!([]));
-    let issue = &occurrence["report"]["primary"]["issue"];
-    assert_eq!(issue["family"], "translation");
-    assert_eq!(issue["details"]["kind"], "placeholder");
-    assert_eq!(
-        issue["details"]["rule_source"],
-        serde_json::json!({
-            "kind": "external_file",
-            "path": placeholders.display().to_string(),
-        })
-    );
-    assert_eq!(
-        issue["details"]["unit"],
-        serde_json::json!({
-            "relative_path": "story.jsonl",
-            "group_id": "scene",
-            "unit_id": "broken-unit",
-            "role": "dialogue",
-        })
-    );
-    assert_eq!(
-        issue["details"]["problem"],
-        serde_json::json!({
-            "kind": "missing_text_capture",
-            "rule_number": 1,
-            "match_range": {
-                "start": match_start,
-                "end": match_end,
-            },
-        })
-    );
+    for field in ["object", "reason", "help"] {
+        assert!(
+            diagnostic[field]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "诊断 {field} 必须是非空可读文本：{diagnostic}"
+        );
+    }
+    let diagnostic_text = serde_json::to_string(diagnostic).expect("诊断必须可序列化");
+    for internal in [
+        "occurrence",
+        "report",
+        "effect",
+        "stage",
+        "issue",
+        "resolution",
+        "group_id",
+        "unit_id",
+        "match_range",
+    ] {
+        assert!(!diagnostic_text.contains(internal));
+    }
 
     assert!(
         records
             .iter()
-            .all(|record| record["code"] != "task.started"),
+            .all(|record| record["event"] != "task.started"),
         "规划失败不得声明模型 Task 已开始：{log_text}"
     );
     assert!(
         records
             .iter()
-            .all(|record| record["code"] != "retry.summary"),
+            .all(|record| record["event"] != "retry.summary"),
         "零模型请求不得产生 Retry 汇总：{log_text}"
     );
     assert!(
         records.iter().all(|record| {
-            record["code"] != "phase.completed" || record["payload"]["phase"] != "planning"
+            record["event"] != "phase.completed" || record["payload"]["phase"] != "planning"
         }),
         "失败的 planning phase 不得伪造 completed：{log_text}"
     );
     let stopped = records
         .iter()
         .filter(|record| {
-            record["code"] == "phase.stopped" && record["payload"]["phase"] == "planning"
+            record["event"] == "phase.stopped" && record["payload"]["phase"] == "planning"
         })
         .collect::<Vec<_>>();
     assert_eq!(
@@ -708,13 +1090,10 @@ fn generic_missing_text_capture_reports_exact_leaf_without_model_request_or_stat
         1,
         "失败 planning 必须恰好停止一次：{log_text}"
     );
-    assert_eq!(
-        stopped[0]["payload"]["outcome"]["diagnostic"],
-        occurrence["id"]
-    );
+    assert!(stopped[0]["payload"]["outcome"].get("diagnostic").is_none());
     let translation_finished = records
         .iter()
-        .filter(|record| record["code"] == "translation.finished")
+        .filter(|record| record["event"] == "translation.finished")
         .collect::<Vec<_>>();
     assert_eq!(
         translation_finished.len(),
@@ -725,9 +1104,10 @@ fn generic_missing_text_capture_reports_exact_leaf_without_model_request_or_stat
         translation_finished[0]["payload"]["result"]["kind"],
         "failed"
     );
-    assert_eq!(
-        translation_finished[0]["payload"]["result"]["diagnostic"],
-        occurrence["id"]
+    assert!(
+        translation_finished[0]["payload"]["result"]
+            .get("diagnostic")
+            .is_none()
     );
 }
 
@@ -807,6 +1187,47 @@ fn project_log_paths(directory: &Path) -> BTreeSet<PathBuf> {
                 .is_some_and(|extension| extension == "jsonl")
         })
         .collect()
+}
+
+fn read_manual_toml(path: &Path) -> toml::Value {
+    toml::from_str(&fs::read_to_string(path).expect("Manual TOML 应可读取"))
+        .expect("Manual TOML 应可解析")
+}
+
+fn find_manual_entry<'a>(entries: &'a [toml::Value], id: &str) -> &'a toml::Value {
+    entries
+        .iter()
+        .find(|entry| entry["id"].as_str() == Some(id))
+        .unwrap_or_else(|| panic!("Manual 应包含 {id}"))
+}
+
+fn set_manual_toml_field(path: &Path, id: &str, field: &str, value: toml::Value) {
+    let mut document = read_manual_toml(path);
+    let entries = document["translation"]
+        .as_array_mut()
+        .expect("Manual translation 必须是数组");
+    let entry = entries
+        .iter_mut()
+        .find(|entry| entry["id"].as_str() == Some(id))
+        .unwrap_or_else(|| panic!("Manual 应包含 {id}"));
+    entry
+        .as_table_mut()
+        .expect("Manual 条目必须是 table")
+        .insert(field.to_owned(), value);
+    fs::write(
+        path,
+        toml::to_string_pretty(&document).expect("Manual TOML 应可编码"),
+    )
+    .expect("Manual TOML 应可写入");
+}
+
+fn read_single_jsonl_group(path: &Path) -> serde_json::Value {
+    let text = fs::read_to_string(path).expect("Generic WriteBack JSONL 应可读取");
+    let mut lines = text.lines();
+    let value = serde_json::from_str(lines.next().expect("Generic JSONL 应包含一行"))
+        .expect("Generic JSONL 行应可解析");
+    assert!(lines.next().is_none(), "Generic JSONL 应只包含一行");
+    value
 }
 
 fn run_att(root: &Path, arguments: &[&str]) -> Output {

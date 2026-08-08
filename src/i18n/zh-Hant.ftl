@@ -7,7 +7,11 @@ cli-init-about = 初始化或更新一個命名翻譯專案
 cli-extract-about = 從專案目前輸入同步原文
 cli-translate-about = 使用明確或已儲存的 Profile 翻譯已擷取原文
 cli-write-back-about = 將目前譯文寫入專案輸出
-cli-project-lua-about = 在專案中一次性執行原子資料庫 Lua
+cli-manual-about = 使用可編輯 TOML 管理人工譯文
+cli-manual-export-about = 匯出目前需要人工補譯的項目
+cli-manual-check-about = 唯讀檢查人工譯文 TOML
+cli-manual-apply-about = 套用已填寫且有效的人工譯文
+cli-project-lua-about = 對專案資料庫執行 Lua 指令碼
 cli-project-name-help = 穩定專案名稱
 cli-init-path-help = 輸入根目錄；既有專案可重用上次成功路徑
 cli-source-language-help = 原文語言 ID
@@ -21,8 +25,9 @@ cli-dialogue-rules-help = 取代與 Builtin 搭配使用的 MV 對話姓名投�
 cli-profile-help = 翻譯 Profile ID；省略時重用上次成功 Profile
 cli-terms-help = 取代專案術語資源
 cli-placeholders-help = 取代專案 Placeholder 資源
-cli-project-lua-script-help = 本次一次性執行的原子資料庫 Lua 程式
+cli-project-lua-script-help = 要對專案資料庫執行的 Lua 指令碼
 cli-project-lua-arguments-help = 在 -- 後傳給 Lua arg[1..] 的 UTF-8 參數
+cli-manual-file-help = 人工譯文 TOML 檔案
 cli-usage-heading = 用法：
 cli-commands-heading = 命令：
 cli-options-heading = 選項：
@@ -113,9 +118,7 @@ log-run-failed = 命令 { $command } 失敗。
 log-run-outcome-unknown = 命令 { $command } 已結束，但最終結果未知；請依錯誤中的復原位置處理。
 log-run-cancelled = 命令 { $command } 已取消。
 log-performance-counters = 效能計數：SQLite 事務控制嘗試 { $sqlite_control_attempted_total } 次；完整候選樹驗證開始 { $candidate_validation_started } 次，完成 { $candidate_validation_completed } 次。
-log-lua-script = Lua 指令碼 { $identity }（SHA-256 { $fingerprint }）。
 log-lua-print = Lua：{ $message }
-log-lua-summary = Lua 統計：資料庫呼叫 { $database_calls } 次，修改 { $changed_rows } 列，譯文呼叫 { $translation_calls } 次，print { $printed_lines } 列。
 log-plan-resolved = 命令 { $command } 的方案來自{ $source }。
 log-phase-started = 階段開始：{ $phase }。
 log-retry-summary = 共執行 { $count } 次重試。
@@ -164,51 +167,10 @@ log-task-outcome-value = { $outcome ->
     [cancelled] 已取消
    *[other] 結果無法辨識
 }
-diagnostic-title = 錯誤 [{ $code }]
-diagnostic-stage = 階段：{ $stage }
 diagnostic-location = 位置：{ $subject }
 diagnostic-explanation = 原因：{ $reason }
-diagnostic-effect = 影響：{ $impact }
 diagnostic-resolution = 處理方式：{ $action }
 diagnostic-related = 相關錯誤 { $index }：
-diagnostic-relation-value = { $code ->
-    [cleanup] 清理
-    [rollback] 回滾
-    [discard] 丟棄
-    [finalization] 收尾
-    [shutdown] 關閉
-    [observability] 可觀測性
-   *[other] { $code }
-}
-diagnostic-stage-value = { $code ->
-    [process_startup] 處理程序啟動
-    [process_output] 處理程序輸出
-    [configuration] 設定載入
-    [command_preparation] 指令準備
-    [project_opening] 開啟專案
-    [init] 初始化
-    [extract] 擷取
-    [translate] 翻譯
-    [write_back] 寫回
-    [lua] 專案 Lua 執行
-    [model_request] 模型請求
-    [run_plan_finalization] 執行計畫收尾
-    [publication] 發佈
-    [shutdown] 關閉
-    [logging] 專案記錄
-    [runtime] 執行階段
-   *[other] __ATT_FALLBACK__
-}
-diagnostic-effect-value = { $code ->
-    [unchanged] 狀態未變更
-    [progress_preserved] 已保留有效進度
-    [applied] 狀態已套用
-    [applied_run_plan_not_saved] 狀態已套用，但執行計畫未儲存
-    [applied_finalization_failed] 狀態已套用，但收尾未完成
-    [recovery_required] 必須先復原，才能信任目前狀態
-    [outcome_unknown] 最終狀態未知
-   *[other] __ATT_FALLBACK__
-}
 diagnostic-resolution-value = { $code ->
     [fix_configuration] 修正指出的設定欄位後重試
     [fix_input] 修正指出的輸入後重試
@@ -220,7 +182,7 @@ diagnostic-resolution-value = { $code ->
     [check_model_service] 檢查模型服務回應與帳戶配額
     [preserve_recovery_artifacts] 請勿刪除列出的復原產物；先復原輸出，再重試
     [retry] 重試此作業
-    [report_bug] 附上錯誤碼與記錄路徑，回報此 ATT 缺陷
+    [report_bug] 回報此 ATT 缺陷，並說明當時執行的操作
    *[other] __ATT_FALLBACK__
 }
 diagnostic-failure-value = { $code ->
@@ -359,16 +321,13 @@ task-record-parse-error = 解析錯誤：{ $kind ->
 task-record-attempt-succeeded = 嘗試 { $number }：成功；finish reason { $finish_reason }
 task-record-attempt-token-usage = ；token `{ $prompt } / { $completion } / { $total }`
 task-record-attempt-duration = ；耗時 `{ $duration }`
-task-record-attempt-request-id = ；request ID { $request_id }
-task-record-attempt-response-id = ；response ID { $response_id }
-task-record-attempt-retryable = 嘗試 { $number }：可重試請求失敗；診斷 `{ $code }`；耗時 `{ $duration }`
+task-record-attempt-retryable = 嘗試 { $number }：可重試請求失敗；耗時 `{ $duration }`
 task-record-attempt-retry-after = ；Retry-After `{ $duration }`
 task-record-attempt-wait-retry = ；等待 `{ $duration }` 後重試
 task-record-attempt-wait-completed = ；等待 `{ $duration }` 已完成，下一次嘗試未開始
 task-record-attempt-wait-cancelled = ；計畫等待 `{ $duration }`，等待期間取消
-task-record-attempt-failed = 嘗試 { $number }：請求或回應處理失敗；診斷 `{ $code }`；耗時 `{ $duration }`
+task-record-attempt-failed = 嘗試 { $number }：請求或回應處理失敗；耗時 `{ $duration }`
 task-record-attempt-cancelled = 嘗試 { $number }：已取消；耗時 `{ $duration }`
-task-record-structured-reason = 原因：{ $reason }
 task-record-final-status = 狀態：{ $state ->
     [complete] 完成，已確認提交
     [partial] 部分完成，已確認提交
@@ -384,6 +343,6 @@ task-record-final-status = 狀態：{ $state ->
 }
 task-record-accepted-written = 已接受：{ $accepted } 項，寫入 { $written } 個實際位置
 task-record-accepted-outcome-unknown = 已驗收：{ $accepted } 項；無法確認資料庫提交終態
-task-record-task-diagnostic = 任務診斷：`{ $code }`；原因 { $reason }
+task-record-task-diagnostic = 任務診斷
 task-record-duration-seconds = { $value } 秒
 task-record-duration-milliseconds = { $value } 毫秒

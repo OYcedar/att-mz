@@ -52,6 +52,7 @@ impl WindowsOrdinalCaseKey {
         Ok(Self(output))
     }
 
+    #[cfg(test)]
     pub(crate) fn units(&self) -> &[u16] {
         &self.0
     }

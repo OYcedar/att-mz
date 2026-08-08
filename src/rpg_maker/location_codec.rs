@@ -110,6 +110,23 @@ impl RpgMakerProjectionCodec {
         }
         Ok(recipes)
     }
+
+    /// 为一个逻辑角色编码会影响其写回位置和物理形状的配方结构。
+    ///
+    /// 配方中的原始正文由 Unit 原文单独参与人工译文状态；这里排除它，避免同组其他
+    /// Unit 的原文变化错误地使当前人工译文过期。冻结结构和当前角色实际使用的配方
+    /// 仍会进入结果，因此物理位置、控制结构或行槽变化会使状态失效。
+    pub(crate) fn encode_role_recipe_shape(
+        value: &str,
+        role: &TextUnitRole,
+    ) -> Result<String, RpgMakerProjectionCodecError> {
+        let recipes = Self::decode_recipes(value)?;
+        let stored = recipes
+            .iter()
+            .filter_map(|recipe| StoredRoleRecipeShape::from_recipe(recipe, role))
+            .collect::<Vec<_>>();
+        serde_json::to_string(&stored).map_err(RpgMakerProjectionCodecError::Encode)
+    }
 }
 
 /// RPG Maker 位置编解码失败。
@@ -626,6 +643,64 @@ enum StoredRecipe {
     ),
     #[serde(rename = "c")]
     Claim(StoredMutationClaim),
+}
+
+#[derive(Serialize)]
+enum StoredRoleRecipeShape {
+    #[serde(rename = "d")]
+    Direct(
+        StoredLocation,
+        StoredMutationClaim,
+        Vec<StoredDirectTextPart>,
+    ),
+    #[serde(rename = "l")]
+    Dialogue(
+        StoredLocation,
+        Option<StoredLocation>,
+        Vec<StoredDialogueLineShape>,
+    ),
+    #[serde(rename = "c")]
+    Claim(StoredMutationClaim),
+}
+
+impl StoredRoleRecipeShape {
+    fn from_recipe(recipe: &TextProjectionRecipe, role: &TextUnitRole) -> Option<Self> {
+        let referenced_roles = recipe.referenced_roles();
+        if !referenced_roles.is_empty() && !referenced_roles.contains(role) {
+            return None;
+        }
+        Some(match recipe {
+            TextProjectionRecipe::Direct(recipe) => Self::Direct(
+                StoredLocation::from(recipe.target()),
+                StoredMutationClaim::from(recipe.mutation_claim()),
+                recipe.parts().iter().map(Into::into).collect(),
+            ),
+            TextProjectionRecipe::Dialogue(recipe) => Self::Dialogue(
+                StoredLocation::from(recipe.group_location()),
+                recipe
+                    .direct_speaker()
+                    .map(|speaker| StoredLocation::from(speaker.physical_location())),
+                recipe
+                    .lines()
+                    .iter()
+                    .map(StoredDialogueLineShape::from)
+                    .collect(),
+            ),
+            TextProjectionRecipe::Claim(claim) => Self::Claim(StoredMutationClaim::from(claim)),
+        })
+    }
+}
+
+#[derive(Serialize)]
+struct StoredDialogueLineShape(StoredLocation, Vec<StoredDialogueLinePart>);
+
+impl From<&DialogueLineRecipe> for StoredDialogueLineShape {
+    fn from(line: &DialogueLineRecipe) -> Self {
+        Self(
+            StoredLocation::from(line.physical_location()),
+            line.parts().iter().map(Into::into).collect(),
+        )
+    }
 }
 
 impl From<&TextProjectionRecipe> for StoredRecipe {

@@ -7,7 +7,11 @@ cli-init-about = 이름이 지정된 번역 프로젝트 초기화 또는 업데
 cli-extract-about = 프로젝트의 현재 입력에서 원문 동기화
 cli-translate-about = 명시적 또는 저장된 Profile로 추출된 원문 번역
 cli-write-back-about = 현재 번역을 프로젝트 출력에 쓰기
-cli-project-lua-about = 프로젝트에서 원자적 데이터베이스 Lua를 한 번 실행
+cli-manual-about = 편집 가능한 TOML 파일로 수동 번역 관리
+cli-manual-export-about = 현재 수동 번역이 필요한 항목 내보내기
+cli-manual-check-about = 프로젝트를 변경하지 않고 수동 번역 TOML 검사
+cli-manual-apply-about = 입력 완료된 유효한 수동 번역 적용
+cli-project-lua-about = 프로젝트 데이터베이스에서 Lua 스크립트 실행
 cli-project-name-help = 안정적인 프로젝트 이름
 cli-init-path-help = 입력 루트 디렉터리. 기존 프로젝트는 마지막 성공 경로를 재사용할 수 있습니다
 cli-source-language-help = 원문 언어 ID
@@ -21,8 +25,9 @@ cli-dialogue-rules-help = Builtin과 함께 쓰는 MV 대화 이름 투영 교�
 cli-profile-help = 번역 Profile ID. 생략하면 마지막 성공 Profile을 재사용합니다
 cli-terms-help = 프로젝트 용어 리소스 교체
 cli-placeholders-help = 프로젝트 Placeholder 리소스 교체
-cli-project-lua-script-help = 한 번 실행할 원자적 데이터베이스 Lua 프로그램
+cli-project-lua-script-help = 프로젝트 데이터베이스에서 실행할 Lua 스크립트
 cli-project-lua-arguments-help = -- 뒤에서 Lua arg[1..]에 전달할 UTF-8 인수
+cli-manual-file-help = 수동 번역 TOML 파일
 cli-usage-heading = 사용법:
 cli-commands-heading = 명령:
 cli-options-heading = 옵션:
@@ -113,9 +118,7 @@ log-run-failed = 명령 { $command }이 실패했습니다.
 log-run-outcome-unknown = 명령 { $command }이 종료되었지만 최종 결과를 알 수 없습니다. 오류에 표시된 복구 위치를 따르십시오.
 log-run-cancelled = 명령 { $command }이 취소되었습니다.
 log-performance-counters = 성능 카운터: SQLite 트랜잭션 제어 시도 { $sqlite_control_attempted_total }회, 전체 후보 트리 검증 시작 { $candidate_validation_started }회, 완료 { $candidate_validation_completed }회.
-log-lua-script = Lua 스크립트 { $identity }(SHA-256 { $fingerprint }).
 log-lua-print = Lua: { $message }
-log-lua-summary = Lua 실행 통계: 데이터베이스 호출 { $database_calls }회, 변경 행 { $changed_rows }개, 번역 호출 { $translation_calls }회, print { $printed_lines }줄.
 log-plan-resolved = 명령 { $command }의 계획 출처: { $source }.
 log-phase-started = 단계 시작: { $phase }.
 log-retry-summary = { $count }회 재시도했습니다.
@@ -164,51 +167,10 @@ log-task-outcome-value = { $outcome ->
     [cancelled] 취소됨
    *[other] 알 수 없는 결과로 종료
 }
-diagnostic-title = 오류 [{ $code }]
-diagnostic-stage = 단계: { $stage }
 diagnostic-location = 위치: { $subject }
 diagnostic-explanation = 원인: { $reason }
-diagnostic-effect = 영향: { $impact }
 diagnostic-resolution = 조치: { $action }
 diagnostic-related = 관련 오류 { $index }:
-diagnostic-relation-value = { $code ->
-    [cleanup] 정리
-    [rollback] 롤백
-    [discard] 폐기
-    [finalization] 마무리
-    [shutdown] 종료
-    [observability] 관측성
-   *[other] { $code }
-}
-diagnostic-stage-value = { $code ->
-    [process_startup] 프로세스 시작
-    [process_output] 프로세스 출력
-    [configuration] 구성 불러오기
-    [command_preparation] 명령 준비
-    [project_opening] 프로젝트 열기
-    [init] 초기화
-    [extract] 추출
-    [translate] 번역
-    [write_back] 쓰기 반영
-    [lua] 프로젝트 Lua 실행
-    [model_request] 모델 요청
-    [run_plan_finalization] 실행 계획 마무리
-    [publication] 게시
-    [shutdown] 종료
-    [logging] 프로젝트 로그
-    [runtime] 런타임
-   *[other] __ATT_FALLBACK__
-}
-diagnostic-effect-value = { $code ->
-    [unchanged] 상태가 변경되지 않았습니다
-    [progress_preserved] 유효한 진행 상황을 보존했습니다
-    [applied] 상태를 적용했습니다
-    [applied_run_plan_not_saved] 상태는 적용되었지만 실행 계획은 저장되지 않았습니다
-    [applied_finalization_failed] 상태는 적용되었지만 마무리가 완료되지 않았습니다
-    [recovery_required] 상태를 신뢰하기 전에 복구가 필요합니다
-    [outcome_unknown] 최종 상태를 알 수 없습니다
-   *[other] __ATT_FALLBACK__
-}
 diagnostic-resolution-value = { $code ->
     [fix_configuration] 표시된 구성 필드를 수정한 후 다시 시도하세요
     [fix_input] 표시된 입력을 수정한 후 다시 시도하세요
@@ -220,7 +182,7 @@ diagnostic-resolution-value = { $code ->
     [check_model_service] 모델 서비스 응답과 계정 한도를 확인하세요
     [preserve_recovery_artifacts] 나열된 복구 산출물을 삭제하지 말고, 출력을 복구한 후 다시 시도하세요
     [retry] 작업을 다시 시도하세요
-    [report_bug] 오류 코드와 로그 경로를 포함하여 ATT 결함을 보고하세요
+    [report_bug] ATT 결함을 보고하고 당시 수행하던 작업을 설명하세요
    *[other] __ATT_FALLBACK__
 }
 diagnostic-failure-value = { $code ->
@@ -359,16 +321,13 @@ task-record-parse-error = 구문 분석 오류: { $kind ->
 task-record-attempt-succeeded = 시도 { $number }: 성공; finish reason { $finish_reason }
 task-record-attempt-token-usage = ; token `{ $prompt } / { $completion } / { $total }`
 task-record-attempt-duration = ; 소요 시간 `{ $duration }`
-task-record-attempt-request-id = ; request ID { $request_id }
-task-record-attempt-response-id = ; response ID { $response_id }
-task-record-attempt-retryable = 시도 { $number }: 재시도 가능한 요청 실패; 진단 `{ $code }`; 소요 시간 `{ $duration }`
+task-record-attempt-retryable = 시도 { $number }: 재시도 가능한 요청 실패; 소요 시간 `{ $duration }`
 task-record-attempt-retry-after = ; Retry-After `{ $duration }`
 task-record-attempt-wait-retry = ; `{ $duration }` 후 재시도
 task-record-attempt-wait-completed = ; `{ $duration }` 대기는 완료되었지만 다음 시도는 시작되지 않음
 task-record-attempt-wait-cancelled = ; `{ $duration }` 대기 중 취소됨
-task-record-attempt-failed = 시도 { $number }: 요청 또는 응답 처리 실패; 진단 `{ $code }`; 소요 시간 `{ $duration }`
+task-record-attempt-failed = 시도 { $number }: 요청 또는 응답 처리 실패; 소요 시간 `{ $duration }`
 task-record-attempt-cancelled = 시도 { $number }: 취소됨; 소요 시간 `{ $duration }`
-task-record-structured-reason = 원인: { $reason }
 task-record-final-status = 상태: { $state ->
     [complete] 완료, 커밋 확인됨
     [partial] 부분 완료, 커밋 확인됨
@@ -384,6 +343,6 @@ task-record-final-status = 상태: { $state ->
 }
 task-record-accepted-written = 수락: { $accepted }개 항목, 실제 위치 { $written }곳에 기록
 task-record-accepted-outcome-unknown = 검수 완료: { $accepted }개 항목; 데이터베이스 커밋 결과를 확인할 수 없음
-task-record-task-diagnostic = 작업 진단: `{ $code }`; 원인 { $reason }
+task-record-task-diagnostic = 작업 진단
 task-record-duration-seconds = { $value }초
 task-record-duration-milliseconds = { $value }밀리초
