@@ -343,8 +343,6 @@ pub(crate) struct ProjectWorkspaceLayout {
     source_data: PathBuf,
     source_js: PathBuf,
     write_back_root: PathBuf,
-    write_back_data: PathBuf,
-    write_back_js: PathBuf,
 }
 
 impl ProjectWorkspaceLayout {
@@ -372,8 +370,6 @@ impl ProjectWorkspaceLayout {
         let source_data = workspace_root.join(rpg_maker_layout.source_data_relative());
         let source_js = workspace_root.join(rpg_maker_layout.source_js_relative());
         let write_back_root = workspace_root.join("write_back");
-        let write_back_data = workspace_root.join(rpg_maker_layout.write_back_data_relative());
-        let write_back_js = workspace_root.join(rpg_maker_layout.write_back_js_relative());
 
         Self {
             rpg_maker_layout,
@@ -383,8 +379,6 @@ impl ProjectWorkspaceLayout {
             source_data,
             source_js,
             write_back_root,
-            write_back_data,
-            write_back_js,
         }
     }
 

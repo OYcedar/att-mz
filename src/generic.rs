@@ -21,9 +21,7 @@ pub(crate) use project::{
     GenericProjectError, GenericProjectStore, GenericStoredSnapshot, TranslationOrigin,
     TranslationWrite, ensure_input_fingerprints_current_with_cancellation,
 };
-pub(crate) use task_record::{
-    GenericTaskRecordDocument, GenericTaskRecordState, GenericTaskResponseRecord,
-};
+pub(crate) use task_record::{GenericTaskRecordDocument, GenericTaskRecordState};
 pub(crate) use translate::{
     AutomaticStateResources, GenericPlanningError, GenericPlanningUnitLocator, GenericUnitKey,
     GenericUnitMap, PlannedTask, PlanningUnit, ResponseProblem, TranslationAcceptance,

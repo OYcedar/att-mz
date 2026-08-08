@@ -317,45 +317,8 @@ manual-value = { $code ->
     [keep_exported_type] Conserva el type escrito por manual export
    *[other] __ATT_FALLBACK__
 }
-task-record-title = Tarea de traducción { $ordinal } · { $state }
-task-record-state-label = { $state ->
-    [complete] Completada
-    [partial] Parcialmente completada
-    [unavailable] No disponible
-    [execution_failed] Error de ejecución
-    [commit_preparation_failed] Error al preparar el commit
-    [commit_not_applied] Commit no aplicado
-    [commit_outcome_unknown] Resultado del commit desconocido
-    [not_committed_after_earlier_failure] Sin commit tras un error anterior
-    [invalid_result] Secuencia de resultados de Executor no válida
-    [cancelled] Cancelada
-   *[other] { $state }
-}
-task-record-summary-with-written = `Tarea { $ordinal }/{ $total }` · `{ $attempts } intentos` · `Aceptadas { $accepted }/{ $expected }` · `Escritas en { $written } ubicaciones`
-task-record-summary-without-written = `Tarea { $ordinal }/{ $total }` · `{ $attempts } intentos` · `Aceptadas { $accepted }/{ $expected }`
-task-record-run-id-label = ID de ejecución:
-task-record-started-at-label = Inicio:
-task-record-duration-label = Duración total:
-task-record-endpoint-label = Endpoint:
-task-record-model-label = Modelo:
-task-record-custom-parameters-heading = Parámetros personalizados
-task-record-attempts-heading = Intentos de solicitud
+task-record-title = Tarea de traducción
 task-record-final-result-heading = Resultado final
-task-record-no-request = No se generó una solicitud de modelo lista para enviar.
-task-record-parse-error = Error de análisis: { $kind ->
-    [thinking_empty] el contenido del razonamiento está vacío, línea { $line }, columna { $column }
-   *[json] JSON de respuesta del modelo no válido (categoría `{ $category }`), línea { $line }, columna { $column }
-}
-task-record-attempt-succeeded = Intento { $number }: correcto; finish reason { $finish_reason }
-task-record-attempt-token-usage = ; tokens `{ $prompt } / { $completion } / { $total }`
-task-record-attempt-duration = ; duración `{ $duration }`
-task-record-attempt-retryable = Intento { $number }: error reintentable; duración `{ $duration }`
-task-record-attempt-retry-after = ; Retry-After `{ $duration }`
-task-record-attempt-wait-retry = ; reintento tras `{ $duration }`
-task-record-attempt-wait-completed = ; espera de `{ $duration }` completada; el siguiente intento no comenzó
-task-record-attempt-wait-cancelled = ; espera prevista de `{ $duration }`; cancelado durante la espera
-task-record-attempt-failed = Intento { $number }: error al procesar la solicitud o respuesta; duración `{ $duration }`
-task-record-attempt-cancelled = Intento { $number }: cancelado; duración `{ $duration }`
 task-record-final-status = Estado: { $state ->
     [complete] completada y commit confirmado
     [partial] parcialmente completada y commit confirmado
@@ -372,5 +335,3 @@ task-record-final-status = Estado: { $state ->
 task-record-accepted-written = Aceptadas: { $accepted } entradas, escritas en { $written } ubicaciones reales
 task-record-accepted-outcome-unknown = Validadas: { $accepted } entradas; no se puede confirmar el resultado del commit de la base de datos
 task-record-task-diagnostic = Diagnóstico de tarea
-task-record-duration-seconds = { $value } segundos
-task-record-duration-milliseconds = { $value } ms

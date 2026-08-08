@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
-use serde_json::{Map, Value};
+#[cfg(test)]
+use serde_json::Value;
 #[cfg(test)]
 use url::{Url, form_urlencoded};
 
@@ -70,60 +71,18 @@ impl fmt::Display for LlmFinishReason {
     }
 }
 
-/// 根适配器能够提供时返回的统一 token 用量。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct LlmUsage {
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    total_tokens: u64,
-}
-
-impl LlmUsage {
-    pub(crate) const fn new(prompt_tokens: u64, completion_tokens: u64, total_tokens: u64) -> Self {
-        Self {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens,
-        }
-    }
-
-    pub(crate) const fn prompt_tokens(self) -> u64 {
-        self.prompt_tokens
-    }
-
-    pub(crate) const fn completion_tokens(self) -> u64 {
-        self.completion_tokens
-    }
-
-    pub(crate) const fn total_tokens(self) -> u64 {
-        self.total_tokens
-    }
-}
-
 /// 一次模型请求的未清洗统一响应。
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct LlmResponse {
     content: Arc<String>,
     finish_reason: LlmFinishReason,
-    provider_request_id: Option<String>,
-    provider_response_id: Option<String>,
-    usage: Option<LlmUsage>,
 }
 
 impl LlmResponse {
-    pub(crate) fn new(
-        content: impl Into<String>,
-        finish_reason: LlmFinishReason,
-        provider_request_id: Option<String>,
-        provider_response_id: Option<String>,
-        usage: Option<LlmUsage>,
-    ) -> Self {
+    pub(crate) fn new(content: impl Into<String>, finish_reason: LlmFinishReason) -> Self {
         Self {
             content: Arc::new(content.into()),
             finish_reason,
-            provider_request_id,
-            provider_response_id,
-            usage,
         }
     }
 
@@ -137,18 +96,6 @@ impl LlmResponse {
 
     pub(crate) fn finish_reason(&self) -> &LlmFinishReason {
         &self.finish_reason
-    }
-
-    pub(crate) fn provider_request_id(&self) -> Option<&str> {
-        self.provider_request_id.as_deref()
-    }
-
-    pub(crate) fn provider_response_id(&self) -> Option<&str> {
-        self.provider_response_id.as_deref()
-    }
-
-    pub(crate) const fn usage(&self) -> Option<LlmUsage> {
-        self.usage
     }
 
     pub(crate) fn into_content_and_finish_reason(self) -> (String, LlmFinishReason) {
@@ -287,28 +234,12 @@ impl ApiKeyRedactor {
         serde_json::to_string(value).map(|serialized| self.redact_serialized_json(&serialized))
     }
 
-    pub(crate) fn redact_json_pretty<T>(&self, value: &T) -> Result<String, serde_json::Error>
-    where
-        T: Serialize + ?Sized,
-    {
-        serde_json::to_string_pretty(value)
-            .map(|serialized| self.redact_serialized_json(&serialized))
-    }
-
     /// 替换普通正文中的 API key，并识别 JSON string 内的转义表示。
     ///
     /// 无效或尚未解析的 Assistant 必须原样保留结构，不能先反序列化再整体重写；
     /// 因此这里只替换 key 对应的原始字节，闭合与未闭合 string 的其余内容都逐字保留。
     pub(crate) fn redact_text_with_json_strings(&self, value: &str) -> String {
         self.redact_json_string_tokens(value, false)
-    }
-
-    /// 替换已经确认合法的 JSON string token，不改写数字、布尔值或 null。
-    ///
-    /// 与结构化序列化路径不同，这个入口保留调用方提供的字段顺序、重复键、数值表示和
-    /// 字符串转义，因此只允许用于已经由协议边界确认合法的完整 JSON。
-    pub(crate) fn redact_valid_json(&self, value: &str) -> String {
-        self.redact_serialized_json(value)
     }
 
     /// 替换 RPG Maker User message 中 API key 的原文和 Markdown 转义表示。
@@ -867,82 +798,6 @@ impl fmt::Debug for ApiKeyRedactor {
     }
 }
 
-/// 当前实际所选 LLM Client 交给高级任务记录的稳定展示事实。
-///
-/// 这里不包含 HTTP Header，也不把请求正文反向解析成 Client 配置。API key 只保留在
-/// 专用替换器中，字段本身永远不会进入任务文档。
-#[derive(Clone)]
-pub(crate) struct LlmClientRecordMetadata {
-    endpoint: Arc<str>,
-    model: Arc<str>,
-    parameters: Arc<Map<String, Value>>,
-    api_key_redactor: Arc<ApiKeyRedactor>,
-}
-
-impl LlmClientRecordMetadata {
-    #[cfg(test)]
-    pub(crate) fn new(
-        endpoint: String,
-        model: String,
-        parameters: Map<String, Value>,
-        api_key_redactor: ApiKeyRedactor,
-    ) -> Self {
-        Self::from_shared(
-            endpoint,
-            Arc::from(model),
-            Arc::new(parameters),
-            Arc::new(api_key_redactor),
-        )
-    }
-
-    pub(crate) fn from_shared(
-        endpoint: String,
-        model: Arc<str>,
-        parameters: Arc<Map<String, Value>>,
-        api_key_redactor: Arc<ApiKeyRedactor>,
-    ) -> Self {
-        let endpoint = api_key_redactor.redact_url(&endpoint);
-        let model = api_key_redactor.redact(&model);
-        Self {
-            endpoint: Arc::from(endpoint),
-            model: Arc::from(model),
-            parameters,
-            api_key_redactor,
-        }
-    }
-
-    pub(crate) fn endpoint(&self) -> &str {
-        &self.endpoint
-    }
-
-    pub(crate) fn model(&self) -> &str {
-        &self.model
-    }
-
-    pub(crate) fn parameters(&self) -> &Map<String, Value> {
-        self.parameters.as_ref()
-    }
-
-    pub(crate) fn api_key_redactor(&self) -> &ApiKeyRedactor {
-        self.api_key_redactor.as_ref()
-    }
-}
-
-impl fmt::Debug for LlmClientRecordMetadata {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let parameters = self
-            .api_key_redactor
-            .redact_json(self.parameters.as_ref())
-            .expect("受信 LLM Client 参数必须能够序列化");
-        formatter
-            .debug_struct("LlmClientRecordMetadata")
-            .field("endpoint", &self.endpoint)
-            .field("model", &self.model)
-            .field("parameters", &parameters)
-            .finish_non_exhaustive()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -950,7 +805,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn api_key_redactor_covers_json_escaping_url_encoding_and_metadata_debug() {
+    fn api_key_redactor_covers_json_escaping_and_url_encoding() {
         const API_KEY: &str = "quote\"slash\\value";
         let redactor = ApiKeyRedactor::new(SecretString::from(API_KEY));
         let structured = json!({
@@ -960,7 +815,7 @@ mod tests {
             ],
         });
         let json = redactor
-            .redact_json_pretty(&structured)
+            .redact_json(&structured)
             .expect("测试 JSON 应可序列化");
         let escaped_api_key = serde_json::to_string(API_KEY).expect("API key 应可序列化");
         let escaped_api_key = &escaped_api_key[1..escaped_api_key.len() - 1];
@@ -983,18 +838,8 @@ mod tests {
         assert!(!endpoint.contains(&form_encoded_value(API_KEY)));
         assert!(endpoint.contains(&format!("before-{}-after", ApiKeyRedactor::REPLACEMENT)));
 
-        let metadata = LlmClientRecordMetadata::new(
-            endpoint,
-            format!("model-{API_KEY}"),
-            structured.as_object().expect("测试参数必须是对象").clone(),
-            redactor,
-        );
-        let debug = format!("{metadata:?}");
+        let debug = format!("{redactor:?}");
         assert!(!debug.contains(API_KEY));
-        assert!(!debug.contains(escaped_api_key));
-        assert!(debug.contains(ApiKeyRedactor::REPLACEMENT));
-        assert!(debug.contains("before-"));
-        assert!(debug.contains("-after"));
     }
 
     #[test]

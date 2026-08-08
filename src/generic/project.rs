@@ -114,7 +114,6 @@ const CREATE_INITIAL_SCHEMA_SQL: &str = "CREATE TABLE generic_project (
                  group_id TEXT NOT NULL CHECK (length(CAST(group_id AS BLOB)) > 0),
                  unit_id TEXT NOT NULL CHECK (length(CAST(unit_id AS BLOB)) > 0),
                  readable_id TEXT NOT NULL CHECK (length(readable_id) > 0),
-                 translation_type TEXT NOT NULL CHECK (translation_type = 'free'),
                  source_json TEXT NOT NULL CHECK (
                      json_valid(source_json) AND json_type(source_json) = 'array'
                  ),

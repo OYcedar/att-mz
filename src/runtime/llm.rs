@@ -22,9 +22,8 @@ use crate::diagnostic::{
 };
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::llm::{
-    ApiKeyRedactor, ChatMessage, ChatMessageRole, LlmClientConcurrency, LlmClientRecordMetadata,
-    LlmClientSemanticIdentity, LlmFinishReason, LlmRequestError, LlmRequestExecutor,
-    LlmRequestFailure, LlmResponse, LlmUsage,
+    ApiKeyRedactor, ChatMessage, ChatMessageRole, LlmClientConcurrency, LlmClientSemanticIdentity,
+    LlmFinishReason, LlmRequestError, LlmRequestExecutor, LlmRequestFailure, LlmResponse,
 };
 use crate::user_text::sanitize_user_text;
 
@@ -37,7 +36,7 @@ pub(crate) struct OpenAiChatCompletionClient {
     max_concurrent_requests: NonZeroUsize,
     request_timeout: Duration,
     parameters: Arc<Map<String, Value>>,
-    record_metadata: LlmClientRecordMetadata,
+    api_key_redactor: Arc<ApiKeyRedactor>,
     rate_limiter: Option<Arc<DefaultDirectRateLimiter>>,
 }
 
@@ -61,12 +60,7 @@ impl OpenAiChatCompletionClient {
         let parameters = Arc::new(parameters);
         let semantic_fingerprint =
             chat_completions_semantic_fingerprint(&url, model.as_ref(), parameters.as_ref());
-        let record_metadata = LlmClientRecordMetadata::from_shared(
-            url.to_string(),
-            Arc::clone(&model),
-            Arc::clone(&parameters),
-            Arc::new(ApiKeyRedactor::new(api_key.clone())),
-        );
+        let api_key_redactor = Arc::new(ApiKeyRedactor::new(api_key.clone()));
         Self {
             url,
             api_key,
@@ -75,7 +69,7 @@ impl OpenAiChatCompletionClient {
             max_concurrent_requests,
             request_timeout,
             parameters,
-            record_metadata,
+            api_key_redactor,
             rate_limiter,
         }
     }
@@ -90,8 +84,8 @@ impl OpenAiChatCompletionClient {
         &self.api_key
     }
 
-    pub(crate) fn record_metadata(&self) -> LlmClientRecordMetadata {
-        self.record_metadata.clone()
+    pub(crate) fn api_key_redactor(&self) -> Arc<ApiKeyRedactor> {
+        Arc::clone(&self.api_key_redactor)
     }
 }
 
@@ -616,11 +610,6 @@ impl OpenAiChatCompletionExecutor {
             return result;
         }
 
-        let provider_request_id = response
-            .headers()
-            .get("x-request-id")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
         let response_body = match response.bytes().await {
             Ok(body) => body,
             Err(source) => {
@@ -634,7 +623,7 @@ impl OpenAiChatCompletionExecutor {
         };
         drop(active_permit);
         drop(job);
-        parse_success_response(&response_body, provider_request_id)
+        parse_success_response(&response_body)
     }
 }
 
@@ -1101,7 +1090,6 @@ fn parse_retry_after(value: Option<&reqwest::header::HeaderValue>) -> Option<Dur
 
 fn parse_success_response(
     body: &[u8],
-    provider_request_id: Option<String>,
 ) -> Result<LlmResponse, LlmRequestError<OpenAiChatCompletionError>> {
     let wire: Value = serde_json::from_slice(body).map_err(|source| {
         LlmRequestError::Fatal(OpenAiChatCompletionError::ParseResponse(source))
@@ -1155,30 +1143,13 @@ fn parse_success_response(
         "content_filter" => LlmFinishReason::ContentFilter,
         other => LlmFinishReason::Other(other.to_owned()),
     };
-    let provider_response_id = object.get("id").and_then(Value::as_str).map(str::to_owned);
-    let usage = object.get("usage").and_then(parse_usage);
-    Ok(LlmResponse::new(
-        content,
-        finish_reason,
-        provider_request_id,
-        provider_response_id,
-        usage,
-    ))
+    Ok(LlmResponse::new(content, finish_reason))
 }
 
 fn invalid_response(
     violation: HttpEnvelopeViolation,
 ) -> LlmRequestError<OpenAiChatCompletionError> {
     LlmRequestError::Fatal(OpenAiChatCompletionError::InvalidResponseWire { violation })
-}
-
-fn parse_usage(value: &Value) -> Option<LlmUsage> {
-    let usage = value.as_object()?;
-    Some(LlmUsage::new(
-        usage.get("prompt_tokens")?.as_u64()?,
-        usage.get("completion_tokens")?.as_u64()?,
-        usage.get("total_tokens")?.as_u64()?,
-    ))
 }
 
 struct LlmLifecycle {
@@ -1690,7 +1661,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_wire_keeps_request_and_response_id_distinct() {
+    fn successful_wire_ignores_optional_provider_metadata() {
         let response = parse_success_response(
             br#"{
                 "id":"chatcmpl-response",
@@ -1703,39 +1674,28 @@ mod tests {
                 "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5},
                 "provider_extension":true
             }"#,
-            Some("http-request".to_owned()),
         )
         .expect("合法响应应通过");
 
-        assert_eq!(response.provider_request_id(), Some("http-request"));
-        assert_eq!(response.provider_response_id(), Some("chatcmpl-response"));
-        assert_eq!(response.usage(), Some(LlmUsage::new(3, 2, 5)));
+        assert_eq!(response.content(), "[]");
+        assert_eq!(response.finish_reason(), &LlmFinishReason::Stop);
     }
 
     #[test]
     fn optional_response_metadata_never_invalidates_core_response() {
-        for (metadata, expected_id, expected_usage) in [
-            ("", None, None),
-            (r#", "id": null, "usage": null"#, None, None),
-            (r#", "id": 7, "usage": true"#, None, None),
-            (
-                r#", "id": "", "usage": {"prompt_tokens":1,"completion_tokens":2}"#,
-                Some(""),
-                None,
-            ),
-            (
-                r#", "id": "response", "usage": {"prompt_tokens":1,"completion_tokens":2,"total_tokens":3.5}"#,
-                Some("response"),
-                None,
-            ),
+        for metadata in [
+            "",
+            r#", "id": null, "usage": null"#,
+            r#", "id": 7, "usage": true"#,
+            r#", "id": "", "usage": {"prompt_tokens":1,"completion_tokens":2}"#,
+            r#", "id": "response", "usage": {"prompt_tokens":1,"completion_tokens":2,"total_tokens":3.5}"#,
         ] {
             let body = format!(
                 r#"{{"choices":[{{"index":0,"message":{{"content":"[]"}},"finish_reason":"stop"}}]{metadata}}}"#
             );
-            let response = parse_success_response(body.as_bytes(), None)
-                .expect("可选元数据异常不应否定核心响应");
-            assert_eq!(response.provider_response_id(), expected_id);
-            assert_eq!(response.usage(), expected_usage);
+            let response =
+                parse_success_response(body.as_bytes()).expect("可选元数据异常不应否定核心响应");
+            assert_eq!(response.content(), "[]");
         }
     }
 
@@ -1751,7 +1711,6 @@ mod tests {
                     {"index":2,"finish_reason":null}
                 ]
             }"#,
-            None,
         )
         .expect("只应验收唯一 index 0 choice 的必要字段");
 
@@ -1774,7 +1733,7 @@ mod tests {
             br#"{"choices":[{"index":0,"message":{"content":"[]"},"finish_reason":null}]}"#.as_slice(),
         ] {
             assert!(matches!(
-                parse_success_response(body, None),
+                parse_success_response(body),
                 Err(LlmRequestError::Fatal(
                     OpenAiChatCompletionError::InvalidResponseWire { .. }
                 ))
@@ -1972,7 +1931,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_server_observes_exact_request_and_ids_stay_distinct() {
+    async fn local_server_observes_exact_request_and_ignores_provider_metadata() {
         let server = spawn_test_server(
             vec![success_response("response-body", "request-header", "[]")],
             false,
@@ -1990,9 +1949,7 @@ mod tests {
             )
             .await
             .expect("本地响应应成功");
-        assert_eq!(response.provider_request_id(), Some("request-header"));
-        assert_eq!(response.provider_response_id(), Some("response-body"));
-        assert_eq!(response.usage(), Some(LlmUsage::new(4, 2, 6)));
+        assert_eq!(response.content(), "[]");
 
         let request = server
             .requests
@@ -2039,8 +1996,6 @@ mod tests {
                 .request(&client, &[])
                 .await
                 .expect("Content-Type 与请求 ID 不是核心响应字段");
-            assert_eq!(response.provider_request_id(), None);
-            assert_eq!(response.provider_response_id(), None);
             assert_eq!(response.content(), "[]");
         }
 

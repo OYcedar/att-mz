@@ -1437,13 +1437,6 @@ pub(crate) enum RpgMakerModelNonStopFinishReason {
 }
 
 impl RpgMakerModelNonStopFinishReason {
-    #[cfg(test)]
-    pub(crate) fn provider_specific(value: impl AsRef<str>) -> Self {
-        Self::ProviderSpecific {
-            value: SafeText::new(value),
-        }
-    }
-
     pub(crate) fn as_str(&self) -> &str {
         match self {
             Self::Length => "length",

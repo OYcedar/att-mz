@@ -7,9 +7,10 @@ use rusqlite::Connection;
 
 use crate::language::LanguageModuleCatalog;
 use crate::manual::{
-    ManualClearLocatorError, ManualDatabaseError, ManualDetachedTranslation, ManualProjectSnapshot,
-    ManualTranslationEntry, ManualTranslationLocator, apply_generic_manual_translations,
-    clear_generic_manual_translation, load_generic_manual_snapshot, validate_manual_set,
+    ManualClearLocatorError, ManualDatabaseError, ManualDetachedTranslation,
+    ManualProjectLuaSnapshot, ManualTranslationEntry, ManualTranslationLocator,
+    apply_generic_manual_translations, clear_generic_manual_translation,
+    load_generic_manual_lua_snapshot, validate_manual_set,
 };
 use crate::translation::planning_resource::TerminologyEntry;
 
@@ -38,6 +39,7 @@ impl ProjectLuaEngineAdapter for GenericProjectLuaAdapter {
     ) -> Result<Vec<ProjectLuaTranslationRecord>, ProjectLuaCallError> {
         let snapshot = self.snapshot(connection)?;
         let mut records = snapshot
+            .current
             .index
             .entries()
             .iter()
@@ -55,11 +57,12 @@ impl ProjectLuaEngineAdapter for GenericProjectLuaAdapter {
         let snapshot = self.snapshot(connection)?;
         let mut result = Vec::with_capacity(ids.len());
         for id in ids {
-            let requested = snapshot.index.get(&id).ok_or_else(unknown_unit)?;
+            let requested = snapshot.current.index.get(&id).ok_or_else(unknown_unit)?;
             let ManualTranslationLocator::Generic { group_id, .. } = &requested.locator else {
                 return Err(invalid_project());
             };
             let translations = snapshot
+                .current
                 .index
                 .entries()
                 .iter()
@@ -92,10 +95,10 @@ impl ProjectLuaEngineAdapter for GenericProjectLuaAdapter {
     ) -> Result<u64, ProjectLuaCallError> {
         with_savepoint(connection, cancellation, || {
             let snapshot = self.snapshot(connection)?;
-            if snapshot.index.get(&id).is_none() {
+            if snapshot.current.index.get(&id).is_none() {
                 return Err(unknown_unit());
             }
-            let write = validate_manual_set(&snapshot, &id, translation)
+            let write = validate_manual_set(&snapshot.current, &id, translation)
                 .map_err(|_| invalid_translation())?;
             apply_generic_manual_translations(connection, &[write])
                 .map(|changed| changed as u64)
@@ -137,8 +140,9 @@ impl GenericProjectLuaAdapter {
     fn snapshot(
         &self,
         connection: &Connection,
-    ) -> Result<ManualProjectSnapshot, ProjectLuaCallError> {
-        load_generic_manual_snapshot(connection, &self.language_modules).map_err(map_manual_error)
+    ) -> Result<ManualProjectLuaSnapshot, ProjectLuaCallError> {
+        load_generic_manual_lua_snapshot(connection, &self.language_modules)
+            .map_err(map_manual_error)
     }
 }
 

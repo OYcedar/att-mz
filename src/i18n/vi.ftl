@@ -311,45 +311,8 @@ manual-value = { $code ->
     [keep_exported_type] Giữ nguyên type do manual export ghi ra
    *[other] __ATT_FALLBACK__
 }
-task-record-title = Tác vụ dịch { $ordinal } · { $state }
-task-record-state-label = { $state ->
-    [complete] Hoàn tất
-    [partial] Hoàn tất một phần
-    [unavailable] Không khả dụng
-    [execution_failed] Thực thi thất bại
-    [commit_preparation_failed] Chuẩn bị commit thất bại
-    [commit_not_applied] Commit chưa được áp dụng
-    [commit_outcome_unknown] Không rõ kết quả commit
-    [not_committed_after_earlier_failure] Chưa commit do lỗi trước đó
-    [invalid_result] Chuỗi kết quả Executor không hợp lệ
-    [cancelled] Đã hủy
-   *[other] { $state }
-}
-task-record-summary-with-written = `Tác vụ { $ordinal }/{ $total }` · `{ $attempts } lần thử` · `Đã nhận { $accepted }/{ $expected }` · `Ghi vào { $written } vị trí`
-task-record-summary-without-written = `Tác vụ { $ordinal }/{ $total }` · `{ $attempts } lần thử` · `Đã nhận { $accepted }/{ $expected }`
-task-record-run-id-label = ID lượt chạy:
-task-record-started-at-label = Bắt đầu:
-task-record-duration-label = Tổng thời gian:
-task-record-endpoint-label = Endpoint:
-task-record-model-label = Mô hình:
-task-record-custom-parameters-heading = Tham số tùy chỉnh
-task-record-attempts-heading = Các lần gửi yêu cầu
+task-record-title = Tác vụ dịch
 task-record-final-result-heading = Kết quả cuối
-task-record-no-request = Không tạo được yêu cầu mô hình sẵn sàng để gửi.
-task-record-parse-error = Lỗi phân tích: { $kind ->
-    [thinking_empty] nội dung suy luận trống, dòng { $line }, cột { $column }
-   *[json] JSON phản hồi của mô hình không hợp lệ (loại `{ $category }`), dòng { $line }, cột { $column }
-}
-task-record-attempt-succeeded = Lần thử { $number }: thành công; finish reason { $finish_reason }
-task-record-attempt-token-usage = ; token `{ $prompt } / { $completion } / { $total }`
-task-record-attempt-duration = ; thời gian `{ $duration }`
-task-record-attempt-retryable = Lần thử { $number }: yêu cầu lỗi có thể thử lại; thời gian `{ $duration }`
-task-record-attempt-retry-after = ; Retry-After `{ $duration }`
-task-record-attempt-wait-retry = ; thử lại sau `{ $duration }`
-task-record-attempt-wait-completed = ; đã chờ xong `{ $duration }`; lần thử tiếp theo chưa bắt đầu
-task-record-attempt-wait-cancelled = ; dự kiến chờ `{ $duration }`; đã hủy trong lúc chờ
-task-record-attempt-failed = Lần thử { $number }: xử lý yêu cầu hoặc phản hồi thất bại; thời gian `{ $duration }`
-task-record-attempt-cancelled = Lần thử { $number }: đã hủy; thời gian `{ $duration }`
 task-record-final-status = Trạng thái: { $state ->
     [complete] hoàn tất, đã xác nhận commit
     [partial] hoàn tất một phần, đã xác nhận commit
@@ -366,5 +329,3 @@ task-record-final-status = Trạng thái: { $state ->
 task-record-accepted-written = Đã nhận: { $accepted } mục, ghi vào { $written } vị trí thực tế
 task-record-accepted-outcome-unknown = Đã kiểm tra: { $accepted } mục; không thể xác nhận kết quả commit cơ sở dữ liệu
 task-record-task-diagnostic = Chẩn đoán tác vụ
-task-record-duration-seconds = { $value } giây
-task-record-duration-milliseconds = { $value } mili giây

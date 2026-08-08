@@ -1234,7 +1234,7 @@ mod tests {
 
         stdout.clear();
         let exit = run_from(["att", "unknown"], &mut stdout, &mut stderr);
-        assert_eq!(exit, ExitCode::from(2));
+        assert_eq!(exit, ExitCode::FAILURE);
         assert!(!stderr.is_empty());
 
         stdout.clear();

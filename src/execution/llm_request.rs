@@ -6,12 +6,11 @@
 
 use std::future::Future;
 use std::num::NonZeroUsize;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::diagnostic::{DiagnosticReport, StateEffect};
 use crate::llm::{
-    ChatMessage, LlmFinishReason, LlmRequestError, LlmRequestExecutor, LlmRequestFailure,
-    LlmResponse, LlmUsage,
+    ChatMessage, LlmRequestError, LlmRequestExecutor, LlmRequestFailure, LlmResponse,
 };
 
 use super::CooperativeCancellation;
@@ -37,123 +36,15 @@ impl<'a> LlmRequestRetryPolicy<'a> {
     }
 }
 
-/// 一次逻辑请求尝试的结构化旁路证据。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct LlmRequestAttemptRecord {
-    pub(crate) attempt: NonZeroUsize,
-    pub(crate) duration: Duration,
-    pub(crate) outcome: LlmRequestAttemptOutcome,
-}
-
-impl LlmRequestAttemptRecord {
-    pub(crate) fn succeeded(
-        attempt: NonZeroUsize,
-        duration: Duration,
-        response: &LlmResponse,
-    ) -> Self {
-        Self {
-            attempt,
-            duration,
-            outcome: LlmRequestAttemptOutcome::Succeeded {
-                finish_reason: response.finish_reason().clone(),
-                provider_request_id: response.provider_request_id().map(str::to_owned),
-                provider_response_id: response.provider_response_id().map(str::to_owned),
-                usage: response.usage(),
-            },
-        }
-    }
-
-    pub(crate) fn retryable(
-        attempt: NonZeroUsize,
-        duration: Duration,
-        diagnostic: DiagnosticReport,
-        retry_after: Option<Duration>,
-        retry_wait: Option<LlmRequestRetryWaitRecord>,
-    ) -> Self {
-        Self {
-            attempt,
-            duration,
-            outcome: LlmRequestAttemptOutcome::Retryable {
-                diagnostic,
-                retry_after,
-                retry_wait,
-            },
-        }
-    }
-
-    fn mark_retry_started(&mut self) {
-        let outcome = std::mem::replace(&mut self.outcome, LlmRequestAttemptOutcome::Cancelled);
-        self.outcome = match outcome {
-            LlmRequestAttemptOutcome::Retryable {
-                diagnostic,
-                retry_after,
-                retry_wait: Some(LlmRequestRetryWaitRecord::CompletedBeforeNextAttempt { duration }),
-            } => LlmRequestAttemptOutcome::Retryable {
-                diagnostic,
-                retry_after,
-                retry_wait: Some(LlmRequestRetryWaitRecord::Retried { duration }),
-            },
-            outcome => outcome,
-        };
-    }
-
-    pub(crate) fn failed(
-        attempt: NonZeroUsize,
-        duration: Duration,
-        diagnostic: DiagnosticReport,
-    ) -> Self {
-        Self {
-            attempt,
-            duration,
-            outcome: LlmRequestAttemptOutcome::Failed { diagnostic },
-        }
-    }
-
-    pub(crate) fn cancelled(attempt: NonZeroUsize, duration: Duration) -> Self {
-        Self {
-            attempt,
-            duration,
-            outcome: LlmRequestAttemptOutcome::Cancelled,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum LlmRequestAttemptOutcome {
-    Succeeded {
-        finish_reason: LlmFinishReason,
-        provider_request_id: Option<String>,
-        provider_response_id: Option<String>,
-        usage: Option<LlmUsage>,
-    },
-    Retryable {
-        diagnostic: DiagnosticReport,
-        retry_after: Option<Duration>,
-        retry_wait: Option<LlmRequestRetryWaitRecord>,
-    },
-    Failed {
-        diagnostic: DiagnosticReport,
-    },
-    Cancelled,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum LlmRequestRetryWaitRecord {
-    Retried { duration: Duration },
-    CompletedBeforeNextAttempt { duration: Duration },
-    CancelledWhileWaiting { planned_duration: Duration },
-}
-
-/// 请求状态机建立的 attempt 计数与可选详细证据。
+/// 请求状态机建立的实际 attempt 计数。
 #[derive(Debug)]
 pub(crate) struct LlmRequestAttemptEvidence {
     attempt_count: usize,
-    attempts: Vec<LlmRequestAttemptRecord>,
 }
 
 impl LlmRequestAttemptEvidence {
-    pub(crate) fn into_parts(self) -> (usize, Vec<LlmRequestAttemptRecord>) {
-        (self.attempt_count, self.attempts)
+    pub(crate) const fn attempt_count(&self) -> usize {
+        self.attempt_count
     }
 }
 
@@ -198,45 +89,21 @@ impl<E> LlmRequestExecution<E> {
 }
 
 struct AttemptEvidenceBuilder {
-    recording: bool,
     attempt_count: usize,
-    attempts: Vec<LlmRequestAttemptRecord>,
 }
 
 impl AttemptEvidenceBuilder {
-    fn new(recording: bool) -> Self {
-        Self {
-            recording,
-            attempt_count: 0,
-            attempts: Vec::new(),
-        }
+    const fn new() -> Self {
+        Self { attempt_count: 0 }
     }
 
-    fn begin_attempt(&mut self, attempt: NonZeroUsize) -> Option<Instant> {
+    fn begin_attempt(&mut self, attempt: NonZeroUsize) {
         self.attempt_count = self.attempt_count.max(attempt.get());
-        self.recording.then(Instant::now)
-    }
-
-    fn record(&mut self, build: impl FnOnce() -> LlmRequestAttemptRecord) {
-        if self.recording {
-            self.attempts.push(build());
-        }
-    }
-
-    fn push(&mut self, record: Option<LlmRequestAttemptRecord>) {
-        if let Some(record) = record {
-            self.attempts.push(record);
-        }
-    }
-
-    fn duration(started: Option<Instant>) -> Duration {
-        started.map_or(Duration::ZERO, |started| started.elapsed())
     }
 
     fn finish(self) -> LlmRequestAttemptEvidence {
         LlmRequestAttemptEvidence {
             attempt_count: self.attempt_count,
-            attempts: self.attempts,
         }
     }
 }
@@ -259,23 +126,13 @@ pub(crate) async fn execute_llm_request_with_retry<L, D>(
     policy: LlmRequestRetryPolicy<'_>,
     delay: &D,
     cancellation: &CooperativeCancellation,
-    record_evidence: bool,
 ) -> LlmRequestExecution<L::Error>
 where
     L: LlmRequestExecutor,
     D: AsyncDelay,
 {
-    execute_llm_request_with_retry_inner(
-        llm,
-        client,
-        messages,
-        policy,
-        delay,
-        cancellation,
-        record_evidence,
-        || {},
-    )
-    .await
+    execute_llm_request_with_retry_inner(llm, client, messages, policy, delay, cancellation, || {})
+        .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -286,7 +143,6 @@ async fn execute_llm_request_with_retry_inner<L, D, H>(
     policy: LlmRequestRetryPolicy<'_>,
     delay: &D,
     cancellation: &CooperativeCancellation,
-    record_evidence: bool,
     after_completed_wait_check: H,
 ) -> LlmRequestExecution<L::Error>
 where
@@ -294,37 +150,19 @@ where
     D: AsyncDelay,
     H: Fn(),
 {
-    let mut evidence = AttemptEvidenceBuilder::new(record_evidence);
+    let mut evidence = AttemptEvidenceBuilder::new();
     let mut attempt = NonZeroUsize::MIN;
     let mut retry_delays = policy.retry_delays.iter().copied();
-    let mut completed_retry_wait = None;
 
     loop {
         if cancellation.is_requested() {
-            if completed_retry_wait.is_some() {
-                evidence.push(completed_retry_wait.take());
-            } else {
-                let _ = evidence.begin_attempt(attempt);
-                evidence.record(|| LlmRequestAttemptRecord::cancelled(attempt, Duration::ZERO));
-            }
+            evidence.begin_attempt(attempt);
             return finish(LlmRequestExecutionOutcome::Cancelled { attempt }, evidence);
         }
-        if let Some(mut completed_retry_wait) = completed_retry_wait.take() {
-            completed_retry_wait.mark_retry_started();
-            evidence.push(Some(completed_retry_wait));
-            attempt = attempt.saturating_add(1);
-        }
 
-        let attempt_started = evidence.begin_attempt(attempt);
+        evidence.begin_attempt(attempt);
         match llm.request(client, messages).await {
             Ok(response) => {
-                evidence.record(|| {
-                    LlmRequestAttemptRecord::succeeded(
-                        attempt,
-                        AttemptEvidenceBuilder::duration(attempt_started),
-                        &response,
-                    )
-                });
                 return finish(
                     LlmRequestExecutionOutcome::Response { response, attempt },
                     evidence,
@@ -333,12 +171,6 @@ where
             Err(LlmRequestError::Fatal(source)) => {
                 let cancelled = cancellation.is_requested() && source.is_cancelled_wait();
                 if cancelled {
-                    evidence.record(|| {
-                        LlmRequestAttemptRecord::cancelled(
-                            attempt,
-                            AttemptEvidenceBuilder::duration(attempt_started),
-                        )
-                    });
                     return finish(LlmRequestExecutionOutcome::Cancelled { attempt }, evidence);
                 }
                 let diagnostic = {
@@ -347,13 +179,6 @@ where
                         llm.request_diagnostic(client, &source, None),
                     )
                 };
-                evidence.record(|| {
-                    LlmRequestAttemptRecord::failed(
-                        attempt,
-                        AttemptEvidenceBuilder::duration(attempt_started),
-                        diagnostic.clone(),
-                    )
-                });
                 return finish(
                     LlmRequestExecutionOutcome::Fatal {
                         attempt,
@@ -368,12 +193,6 @@ where
                 retry_after,
             }) => {
                 if cancellation.is_requested() && source.is_cancelled_wait() {
-                    evidence.record(|| {
-                        LlmRequestAttemptRecord::cancelled(
-                            attempt,
-                            AttemptEvidenceBuilder::duration(attempt_started),
-                        )
-                    });
                     return finish(LlmRequestExecutionOutcome::Cancelled { attempt }, evidence);
                 }
 
@@ -384,15 +203,6 @@ where
                 if let Some(retry_after) = retry_after
                     && retry_after > policy.max_retry_after
                 {
-                    evidence.record(|| {
-                        LlmRequestAttemptRecord::retryable(
-                            attempt,
-                            AttemptEvidenceBuilder::duration(attempt_started),
-                            diagnostic.clone(),
-                            Some(retry_after),
-                            None,
-                        )
-                    });
                     return finish(
                         LlmRequestExecutionOutcome::RetryAfterExceedsMaximum {
                             attempt,
@@ -405,15 +215,6 @@ where
                 }
 
                 let Some(configured_delay) = retry_delays.next() else {
-                    evidence.record(|| {
-                        LlmRequestAttemptRecord::retryable(
-                            attempt,
-                            AttemptEvidenceBuilder::duration(attempt_started),
-                            diagnostic.clone(),
-                            retry_after,
-                            None,
-                        )
-                    });
                     return finish(
                         LlmRequestExecutionOutcome::RetryBudgetExhausted {
                             attempt,
@@ -424,8 +225,6 @@ where
                 };
 
                 let retry_delay = configured_delay.max(retry_after.unwrap_or_default());
-                let attempt_duration = AttemptEvidenceBuilder::duration(attempt_started);
-                let mut diagnostic = Some(diagnostic);
                 let waiting = delay.wait(retry_delay);
                 tokio::pin!(waiting);
                 let cancelled = cancellation.cancelled();
@@ -433,43 +232,23 @@ where
                 tokio::select! {
                     biased;
                     () = &mut cancelled => {
-                        evidence.record(|| {
-                            LlmRequestAttemptRecord::retryable(
-                                attempt,
-                                attempt_duration,
-                                diagnostic.take().expect("可重试诊断必须只移动一次"),
-                                retry_after,
-                                Some(LlmRequestRetryWaitRecord::CancelledWhileWaiting {
-                                    planned_duration: retry_delay,
-                                }),
-                            )
-                        });
                         return finish(
                             LlmRequestExecutionOutcome::Cancelled { attempt },
                             evidence,
                         );
                     }
-                    () = &mut waiting => {
-                        completed_retry_wait = record_evidence.then(|| {
-                            LlmRequestAttemptRecord::retryable(
-                                attempt,
-                                attempt_duration,
-                                diagnostic.take().expect("可重试诊断必须只移动一次"),
-                                retry_after,
-                                Some(LlmRequestRetryWaitRecord::CompletedBeforeNextAttempt {
-                                    duration: retry_delay,
-                                }),
-                            )
-                        });
-                    }
+                    () = &mut waiting => {}
                 }
                 if cancellation.is_requested() {
-                    evidence.push(completed_retry_wait.take());
                     return finish(LlmRequestExecutionOutcome::Cancelled { attempt }, evidence);
                 }
                 // 这条同步观察只供竞态测试在“等待已完成、下一请求尚未准入”的
                 // 精确边界注入取消；生产调用传入零成本空闭包。
                 after_completed_wait_check();
+                if cancellation.is_requested() {
+                    return finish(LlmRequestExecutionOutcome::Cancelled { attempt }, evidence);
+                }
+                attempt = attempt.saturating_add(1);
             }
         }
     }
@@ -483,7 +262,7 @@ mod tests {
     use std::sync::{Arc, Barrier, Mutex};
 
     use crate::diagnostic::{Diagnostic, RuntimeComponent, RuntimeIssue, RuntimeOperation};
-    use crate::llm::LlmRequestFailure;
+    use crate::llm::{LlmFinishReason, LlmRequestFailure};
 
     use super::*;
 
@@ -574,13 +353,7 @@ mod tests {
         let llm = FakeLlm {
             responses: Arc::new(Mutex::new(VecDeque::from([
                 retryable(),
-                Ok(LlmResponse::new(
-                    "{}",
-                    LlmFinishReason::Stop,
-                    None,
-                    None,
-                    None,
-                )),
+                Ok(LlmResponse::new("{}", LlmFinishReason::Stop)),
             ]))),
             calls: Arc::clone(&calls),
         };
@@ -594,11 +367,9 @@ mod tests {
                 cancellation: cancellation.clone(),
             },
             &cancellation,
-            true,
         )
         .await;
         let (outcome, evidence) = execution.into_parts();
-        let (attempt_count, attempts) = evidence.into_parts();
 
         assert!(matches!(
             outcome,
@@ -606,15 +377,11 @@ mod tests {
                 if attempt == NonZeroUsize::MIN
         ));
         assert_eq!(*calls.lock().expect("请求计数锁不应中毒"), 1);
-        assert_eq!(attempt_count, 1, "未开始的下一请求不得虚增 attempt");
-        assert_eq!(attempts.len(), 1);
-        assert!(matches!(
-            attempts[0].outcome,
-            LlmRequestAttemptOutcome::Retryable {
-                retry_wait: Some(LlmRequestRetryWaitRecord::CompletedBeforeNextAttempt { .. }),
-                ..
-            }
-        ));
+        assert_eq!(
+            evidence.attempt_count(),
+            1,
+            "未开始的下一请求不得虚增 attempt"
+        );
     }
 
     #[tokio::test]
@@ -624,13 +391,7 @@ mod tests {
         let llm = FakeLlm {
             responses: Arc::new(Mutex::new(VecDeque::from([
                 retryable(),
-                Ok(LlmResponse::new(
-                    "{}",
-                    LlmFinishReason::Stop,
-                    None,
-                    None,
-                    None,
-                )),
+                Ok(LlmResponse::new("{}", LlmFinishReason::Stop)),
             ]))),
             calls: Arc::clone(&calls),
         };
@@ -651,7 +412,6 @@ mod tests {
             LlmRequestRetryPolicy::new(&[Duration::ZERO], Duration::from_secs(1)),
             &ImmediateDelay,
             &cancellation,
-            true,
             move || {
                 observed_boundary.wait();
                 while !observed_cancellation.is_requested() {
@@ -662,7 +422,6 @@ mod tests {
         .await;
         canceller.join().expect("取消线程不应 panic");
         let (outcome, evidence) = execution.into_parts();
-        let (attempt_count, attempts) = evidence.into_parts();
 
         assert!(matches!(
             outcome,
@@ -670,15 +429,7 @@ mod tests {
                 if attempt == NonZeroUsize::MIN
         ));
         assert_eq!(*calls.lock().expect("请求计数锁不应中毒"), 1);
-        assert_eq!(attempt_count, 1);
-        assert_eq!(attempts.len(), 1);
-        assert!(matches!(
-            attempts[0].outcome,
-            LlmRequestAttemptOutcome::Retryable {
-                retry_wait: Some(LlmRequestRetryWaitRecord::CompletedBeforeNextAttempt { .. }),
-                ..
-            }
-        ));
+        assert_eq!(evidence.attempt_count(), 1);
     }
 
     #[tokio::test]
@@ -687,13 +438,7 @@ mod tests {
         let llm = FakeLlm {
             responses: Arc::new(Mutex::new(VecDeque::from([
                 retryable(),
-                Ok(LlmResponse::new(
-                    "{}",
-                    LlmFinishReason::Stop,
-                    None,
-                    None,
-                    None,
-                )),
+                Ok(LlmResponse::new("{}", LlmFinishReason::Stop)),
             ]))),
             calls: Arc::clone(&calls),
         };
@@ -706,11 +451,9 @@ mod tests {
             LlmRequestRetryPolicy::new(&[Duration::ZERO], Duration::from_secs(1)),
             &ImmediateDelay,
             &cancellation,
-            true,
         )
         .await;
         let (outcome, evidence) = execution.into_parts();
-        let (attempt_count, attempts) = evidence.into_parts();
 
         assert!(matches!(
             outcome,
@@ -718,18 +461,6 @@ mod tests {
                 if attempt.get() == 2
         ));
         assert_eq!(*calls.lock().expect("请求计数锁不应中毒"), 2);
-        assert_eq!(attempt_count, 2);
-        assert_eq!(attempts.len(), 2);
-        assert!(matches!(
-            attempts[0].outcome,
-            LlmRequestAttemptOutcome::Retryable {
-                retry_wait: Some(LlmRequestRetryWaitRecord::Retried { .. }),
-                ..
-            }
-        ));
-        assert!(matches!(
-            attempts[1].outcome,
-            LlmRequestAttemptOutcome::Succeeded { .. }
-        ));
+        assert_eq!(evidence.attempt_count(), 2);
     }
 }

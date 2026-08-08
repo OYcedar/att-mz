@@ -88,17 +88,15 @@ Thinking、Assistant、Provider 正文和普通用户内容都按普通内容处
 再删除终端控制和双向控制字符并收敛为单行；没有可见内容时省略。这是运行根职责、
 稳定 schema、控制字符和输出体积的边界，与敏感性分类无关。
 
-翻译任务记录使用实际选中的 Endpoint、Model、parameters 和最终消息，并在所有
-可读字段中递归应用同一个闭集替换器。Endpoint query、自定义参数键和值、System、
-User、输入历史 Assistant、Thinking、输出 Assistant、Provider 标识和任务诊断中
-的每个精确匹配片段都替换为：
+翻译任务记录只保存实际 User message、原始 Assistant 和最终任务结果，并在这些正文与
+诊断中应用同一个闭集替换器。每个精确匹配片段都替换为：
 
 ```text
 [REDACTED API KEY]
 ```
 
-替换器只碰命中的闭集值：所在字段、段落和相邻正文保持原样，替换标记本身也不再
-处理。配置中的 API key 字段从不进入任务记录；任务记录也不采集 Header、Provider
-外层信封或非 200 原始 body，只保留上述标准错误字段投影。`Authorization` 是一个字段
-和一种认证方案，不是另一类敏感信息；诊断需要说明认证事实时，保留字段名和方案就
-够了。任务记录的其余格式契约见[模型任务记录现行规格](../translation/task-records.md)。
+替换器只碰命中的闭集值：所在字段、段落和相邻正文保持原样，替换标记本身也不再处理。
+配置、Endpoint、Model、parameters、Header、Provider 外层信封和非 200 原始 body 不进入
+任务记录。`Authorization` 是一个字段和一种认证方案，不是另一类敏感信息；诊断需要说明
+认证事实时，保留字段名和方案就够了。任务记录的其余格式契约见
+[模型任务记录现行规格](../translation/task-records.md)。

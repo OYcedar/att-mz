@@ -11,6 +11,10 @@ att mv|mz|generic manual apply --name NAME FILE.toml
 
 `FILE.toml` 是必需位置参数。三个引擎使用相同格式和检查语义。
 
+三个命令都要求发行目录中的固定 `config.toml` 存在且 TOML 语法有效。只有 `export` 读取
+其中的语言模块，用于判断哪些当前原文需要翻译；`check` 和 `apply` 不读取或校验语言模块，
+也不重新做语言分析。
+
 ## 1. 文件格式
 
 文件只包含 `[[translation]]`。每项必须且只能包含以下字段：
@@ -54,7 +58,9 @@ translation = ["译文可以按照中文需要重新分行。"]
 
 ## 3. check
 
-`manual check` 只读取 TOML 和当前数据库快照。它检查：
+`manual check` 只读取 TOML 和仍有当前可读 ID 的数据库条目。已经失去当前位置的人工记录
+与本次文件无关，不参与 `check` 或 `apply`；它们仍由数据库保存，并可通过 Lua 高级接口
+检查或清除。`check` 检查：
 
 - TOML 语法和字段闭集；
 - ID 是否重复并仍指向当前条目；

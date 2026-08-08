@@ -325,45 +325,8 @@ manual-value = { $code ->
     [keep_exported_type] احتفظ بقيمة type التي كتبها manual export
    *[other] __ATT_FALLBACK__
 }
-task-record-title = مهمة الترجمة { $ordinal } · { $state }
-task-record-state-label = { $state ->
-    [complete] مكتملة
-    [partial] مكتملة جزئيًا
-    [unavailable] غير متاحة
-    [execution_failed] فشل التنفيذ
-    [commit_preparation_failed] فشل إعداد التثبيت
-    [commit_not_applied] لم يُطبَّق التثبيت
-    [commit_outcome_unknown] نتيجة التثبيت غير معروفة
-    [not_committed_after_earlier_failure] لم تُثبَّت بعد فشل سابق
-    [invalid_result] تسلسل نتائج Executor غير صالح
-    [cancelled] ملغاة
-   *[other] { $state }
-}
-task-record-summary-with-written = `المهمة { $ordinal }/{ $total }` · `{ $attempts } محاولات` · `مقبول { $accepted }/{ $expected }` · `كُتب في { $written } مواضع`
-task-record-summary-without-written = `المهمة { $ordinal }/{ $total }` · `{ $attempts } محاولات` · `مقبول { $accepted }/{ $expected }`
-task-record-run-id-label = معرّف التشغيل:
-task-record-started-at-label = وقت البدء:
-task-record-duration-label = المدة الإجمالية:
-task-record-endpoint-label = نقطة النهاية:
-task-record-model-label = النموذج:
-task-record-custom-parameters-heading = المعلمات المخصصة
-task-record-attempts-heading = محاولات الطلب
+task-record-title = مهمة الترجمة
 task-record-final-result-heading = النتيجة النهائية
-task-record-no-request = لم يتكوّن طلب نموذج جاهز للإرسال.
-task-record-parse-error = خطأ في التحليل: { $kind ->
-    [thinking_empty] محتوى التفكير فارغ، السطر { $line }، العمود { $column }
-   *[json] JSON استجابة النموذج غير صالح (الفئة `{ $category }`)، السطر { $line }، العمود { $column }
-}
-task-record-attempt-succeeded = المحاولة { $number }: نجحت؛ finish reason { $finish_reason }
-task-record-attempt-token-usage = ؛ الرموز `{ $prompt } / { $completion } / { $total }`
-task-record-attempt-duration = ؛ المدة `{ $duration }`
-task-record-attempt-retryable = المحاولة { $number }: فشل طلب قابل للإعادة؛ المدة `{ $duration }`
-task-record-attempt-retry-after = ؛ Retry-After `{ $duration }`
-task-record-attempt-wait-retry = ؛ إعادة المحاولة بعد `{ $duration }`
-task-record-attempt-wait-completed = ؛ اكتمل الانتظار لمدة `{ $duration }`؛ لم تبدأ المحاولة التالية
-task-record-attempt-wait-cancelled = ؛ كان الانتظار المخطط `{ $duration }`؛ أُلغي أثناء الانتظار
-task-record-attempt-failed = المحاولة { $number }: فشل معالجة الطلب أو الاستجابة؛ المدة `{ $duration }`
-task-record-attempt-cancelled = المحاولة { $number }: أُلغيت؛ المدة `{ $duration }`
 task-record-final-status = الحالة: { $state ->
     [complete] مكتملة والتثبيت مؤكّد
     [partial] مكتملة جزئيًا والتثبيت مؤكّد
@@ -380,5 +343,3 @@ task-record-final-status = الحالة: { $state ->
 task-record-accepted-written = المقبول: { $accepted } عناصر، كُتبت في { $written } مواضع فعلية
 task-record-accepted-outcome-unknown = تم التحقق من { $accepted } عناصر؛ تعذّر تأكيد نتيجة تثبيت قاعدة البيانات
 task-record-task-diagnostic = تشخيص المهمة
-task-record-duration-seconds = { $value } ثانية
-task-record-duration-milliseconds = { $value } مللي ثانية

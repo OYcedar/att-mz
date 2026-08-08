@@ -1445,7 +1445,6 @@ mod tests {
     use rusqlite::{Connection, params};
 
     use super::*;
-    use crate::rpg_maker::translate::executor::FinalLlmResponseMetadata;
     use crate::rpg_maker::translate::pipeline::{
         AcceptedTranslationDecision, NonEmptyTaskItems, RpgMakerTranslationTaskIndex,
         TranslationInvalidation, TranslationOwnerSnapshot, TranslationPatch,
@@ -1844,12 +1843,6 @@ mod tests {
                     NonZeroUsize::MIN,
                     Vec::new(),
                 ),
-                final_response: FinalLlmResponseMetadata::new(
-                    None,
-                    None,
-                    crate::diagnostic::RpgMakerModelFinishReason::Stop,
-                    None,
-                ),
                 accepted: NonEmptyTaskItems::new(
                     AcceptedTranslationDecision::new(
                         task_id(0),
@@ -1890,12 +1883,6 @@ mod tests {
                 RpgMakerTranslationTaskIndex::new(0),
                 NonZeroUsize::MIN,
                 Vec::new(),
-            ),
-            final_response: FinalLlmResponseMetadata::new(
-                None,
-                None,
-                crate::diagnostic::RpgMakerModelFinishReason::Stop,
-                None,
             ),
             accepted: NonEmptyTaskItems::new(
                 AcceptedTranslationDecision::new(
@@ -2745,12 +2732,6 @@ mod tests {
                 RpgMakerTranslationTaskIndex::new(0),
                 NonZeroUsize::MIN,
                 Vec::new(),
-            ),
-            final_response: FinalLlmResponseMetadata::new(
-                None,
-                None,
-                crate::diagnostic::RpgMakerModelFinishReason::Stop,
-                None,
             ),
             accepted: NonEmptyTaskItems::new(first, decisions.collect()),
         })

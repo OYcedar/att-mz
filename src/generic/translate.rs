@@ -683,6 +683,7 @@ impl PlannedTask {
         &self.terminology_indices
     }
 
+    #[cfg(test)]
     pub(crate) fn expected_output_ids(&self) -> impl Iterator<Item = TaskId> + '_ {
         self.outputs.keys().copied()
     }

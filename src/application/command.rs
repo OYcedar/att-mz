@@ -937,7 +937,7 @@ impl ProductionRpgMakerCommandRunner {
         .to_path_buf();
         let operation = command.operation();
         let file = command.file().to_path_buf();
-        let language_modules = command.language_modules().clone();
+        let language_modules = command.language_modules().cloned();
         let lease_provider = ProjectCommandLeaseService::new(
             command.common().projects_root().to_path_buf(),
             self.layout.engine().storage_name(),
@@ -962,7 +962,7 @@ impl ProductionRpgMakerCommandRunner {
                         engine,
                         operation,
                         &file,
-                        &language_modules,
+                        language_modules.as_ref(),
                         &blocking_cancellation,
                     )
                 })
@@ -2415,8 +2415,7 @@ impl ProductionRpgMakerCommandRunner {
                                         .workspace_root()
                                         .join("task-records")
                                         .join(run_id),
-                                    run_id.to_owned(),
-                                    command.translation().client().record_metadata(),
+                                    command.translation().client().api_key_redactor(),
                                     self.locale,
                                     cpu.clone(),
                                     observation_file_system,

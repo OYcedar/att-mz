@@ -11,10 +11,9 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use aho_corasick::{Anchored, MatchKind, automaton::Automaton, nfa::noncontiguous::NFA};
-use time::OffsetDateTime;
 
 #[cfg(test)]
 use crate::diagnostic::RpgMakerModelNonStopFinishReason;
@@ -41,7 +40,6 @@ use crate::language::{
 use crate::llm::LlmRequestError;
 use crate::llm::{
     LlmClientConcurrency, LlmFinishReason, LlmRequestExecutor, LlmRequestFailure, LlmResponse,
-    LlmUsage,
 };
 use crate::rpg_maker::model::TextUnitContent;
 use crate::runtime::cpu::CpuExecutorUnavailable;
@@ -53,7 +51,7 @@ use crate::translation::placeholder_token;
 use crate::translation::task_planning::TaskId;
 use crate::translation_protocol::{
     DecodedJsonStringArray, DecodedSourceEchoFieldsError, DecodedSourceEchoValue,
-    DecodedTranslationAssistantValue, TranslationResponseMode, TranslationResponseRepair,
+    DecodedTranslationAssistantValue, TranslationResponseMode, TranslationTaskResponseParseError,
     parse_translation_response_with_cancellation,
 };
 
@@ -68,94 +66,10 @@ use super::pipeline::{
 };
 use super::profile::{ResolvedRpgMakerTranslationResources, RpgMakerTranslationProfile};
 use super::task_record::{
-    TranslationAssistantValueError, TranslationTaskAttemptRecord, TranslationTaskExecution,
-    TranslationTaskExecutionEvidence, TranslationTaskExecutionFailure,
-    TranslationTaskResponseParseError, TranslationTaskResponseRecord,
+    TranslationAssistantValueError, TranslationTaskExecution, TranslationTaskExecutionEvidence,
+    TranslationTaskExecutionFailure, TranslationTaskResponseRecord,
 };
 const RESPONSE_PROCESSING_CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
-
-/// 一次最终成功 HTTP 响应中可安全进入任务结果与持久日志的元数据。
-///
-/// `provider_request_id` 来自响应头 `x-request-id`，`provider_response_id`
-/// 来自 Chat Completions 正文 `id`。供应商可以省略两者，且两者语义不同，
-/// 不能相互补位。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct FinalLlmResponseMetadata {
-    provider_request_id: Option<String>,
-    provider_response_id: Option<String>,
-    finish_reason: RpgMakerModelFinishReason,
-    usage: Option<LlmUsage>,
-}
-
-impl FinalLlmResponseMetadata {
-    pub(crate) fn new(
-        provider_request_id: Option<String>,
-        provider_response_id: Option<String>,
-        finish_reason: RpgMakerModelFinishReason,
-        usage: Option<LlmUsage>,
-    ) -> Self {
-        Self {
-            provider_request_id,
-            provider_response_id,
-            finish_reason,
-            usage,
-        }
-    }
-
-    fn from_response_with_cancellation<E>(
-        response: &LlmResponse,
-        ensure_running: &mut impl FnMut() -> Result<(), E>,
-    ) -> Result<Self, E> {
-        let provider_request_id = match response.provider_request_id() {
-            Some(value) => Some(clone_response_processing_text_with_cancellation(
-                value,
-                ensure_running,
-            )?),
-            None => None,
-        };
-        let provider_response_id = match response.provider_response_id() {
-            Some(value) => Some(clone_response_processing_text_with_cancellation(
-                value,
-                ensure_running,
-            )?),
-            None => None,
-        };
-        let finish_reason = match response.finish_reason() {
-            LlmFinishReason::Stop => RpgMakerModelFinishReason::Stop,
-            LlmFinishReason::Length => RpgMakerModelFinishReason::Length,
-            LlmFinishReason::ContentFilter => RpgMakerModelFinishReason::ContentFilter,
-            LlmFinishReason::Other(value) => RpgMakerModelFinishReason::provider_specific(
-                clone_response_processing_text_with_cancellation(value, ensure_running)?,
-            ),
-        };
-        ensure_running()?;
-        Ok(Self::new(
-            provider_request_id,
-            provider_response_id,
-            finish_reason,
-            response.usage(),
-        ))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn provider_request_id(&self) -> Option<&str> {
-        self.provider_request_id.as_deref()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn provider_response_id(&self) -> Option<&str> {
-        self.provider_response_id.as_deref()
-    }
-
-    pub(crate) fn finish_reason(&self) -> &RpgMakerModelFinishReason {
-        &self.finish_reason
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn usage(&self) -> Option<LlmUsage> {
-        self.usage
-    }
-}
 
 /// Executor 从受信 RPG Maker Profile 消费的最小配置面。
 pub(crate) trait TranslationTaskExecutionProfile:
@@ -450,7 +364,7 @@ where
                         task_index: task.index(),
                     },
                 },
-                TranslationTaskResponseRecord::unprocessed(raw_assistant),
+                TranslationTaskResponseRecord::new(raw_assistant),
             ));
         };
         let input = ResponseProcessingInput {
@@ -470,7 +384,7 @@ where
         {
             Err(source) => Err(RecordedTranslationTaskResponseFailure::new(
                 TranslationTaskResponseProcessingError::ScheduleCompute(source),
-                TranslationTaskResponseRecord::unprocessed(raw_assistant),
+                TranslationTaskResponseRecord::new(raw_assistant),
             )),
             Ok(Err(failure)) => {
                 let (source, response) = failure.into_parts();
@@ -834,44 +748,28 @@ fn cancelled_response_processing_failure(
 ) -> TranslationResponseTechnicalFailure {
     TranslationResponseTechnicalFailure::new(
         TranslationResponseTechnicalError::Cancelled,
-        raw_assistant.map(TranslationTaskResponseRecord::unprocessed),
+        raw_assistant.map(TranslationTaskResponseRecord::new),
     )
 }
 
 struct TranslationTaskEvidenceBuilder {
-    started_at: Option<OffsetDateTime>,
-    task_started: Option<Instant>,
     attempt_count: usize,
-    attempts: Vec<TranslationTaskAttemptRecord>,
 }
 
 impl TranslationTaskEvidenceBuilder {
-    fn new(recording: bool) -> Self {
-        Self {
-            started_at: recording.then(OffsetDateTime::now_utc),
-            task_started: recording.then(Instant::now),
-            attempt_count: 0,
-            attempts: Vec::new(),
-        }
+    const fn new() -> Self {
+        Self { attempt_count: 0 }
     }
 
     fn absorb_request_evidence(&mut self, evidence: LlmRequestAttemptEvidence) {
-        let (attempt_count, attempts) = evidence.into_parts();
-        self.attempt_count = self.attempt_count.max(attempt_count);
-        self.attempts.extend(attempts);
+        self.attempt_count = self.attempt_count.max(evidence.attempt_count());
     }
 
     fn finish(
         self,
         response: Option<TranslationTaskResponseRecord>,
     ) -> TranslationTaskExecutionEvidence {
-        TranslationTaskExecutionEvidence::from_execution(
-            self.started_at,
-            self.task_started,
-            self.attempt_count,
-            self.attempts,
-            response,
-        )
+        TranslationTaskExecutionEvidence::from_execution(self.attempt_count, response)
     }
 }
 
@@ -926,7 +824,7 @@ where
         profile: &Self::Profile,
         task: &RpgMakerExecutableTask,
     ) -> Result<TranslationTaskExecution, TranslationTaskExecutionFailure<Self::Error>> {
-        let mut evidence = TranslationTaskEvidenceBuilder::new(self.record_task_response);
+        let mut evidence = TranslationTaskEvidenceBuilder::new();
         if task.expected_outputs().is_empty() {
             let invariant = TranslationInternalInvariant::ExpectedOutputsEmpty {
                 task_index: task.index(),
@@ -956,7 +854,6 @@ where
             ),
             &self.delay,
             &self.cancellation,
-            self.record_task_response,
         )
         .await;
         let (request_outcome, request_evidence) = request_execution.into_parts();
@@ -1139,7 +1036,6 @@ fn unavailable_after_request_failure(
 ) -> TranslationTaskOutcome {
     TranslationTaskOutcome::Unavailable {
         context: TranslationTaskOutcomeContext::new(task.index(), attempts, Vec::new()),
-        final_response: None,
         reason,
         unresolved: non_empty_known(
             unresolved_all(
@@ -1225,17 +1121,21 @@ fn process_response(
     let mut ensure_running = || ensure_response_processing_running(cancellation);
     let language_module = resources.source_language();
 
-    let final_response = match FinalLlmResponseMetadata::from_response_with_cancellation(
-        response,
-        &mut ensure_running,
-    ) {
-        Ok(final_response) => final_response,
-        Err(ResponseProcessingCancelled) => {
-            return Err(cancelled_response_processing_failure(raw_assistant));
+    let finish_reason = match response.finish_reason() {
+        LlmFinishReason::Stop => RpgMakerModelFinishReason::Stop,
+        LlmFinishReason::Length => RpgMakerModelFinishReason::Length,
+        LlmFinishReason::ContentFilter => RpgMakerModelFinishReason::ContentFilter,
+        LlmFinishReason::Other(value) => {
+            match clone_response_processing_text_with_cancellation(value, &mut ensure_running) {
+                Ok(value) => RpgMakerModelFinishReason::provider_specific(value),
+                Err(ResponseProcessingCancelled) => {
+                    return Err(cancelled_response_processing_failure(raw_assistant));
+                }
+            }
         }
     };
     let mut diagnostics = Vec::new();
-    if let Some(reason) = final_response.finish_reason().non_stop() {
+    if let Some(reason) = finish_reason.non_stop() {
         diagnostics.push(TranslationProtocolDiagnostic::NonStopFinish { reason });
     }
 
@@ -1250,7 +1150,7 @@ fn process_response(
         }
     };
     let (parsed, response_record) = match parsed {
-        Ok(ParsedModelOutputBatch { outputs, repairs }) => match raw_assistant {
+        Ok(ParsedModelOutputBatch { outputs }) => match raw_assistant {
             Some(raw_assistant) => {
                 let mut acceptance_outputs = Vec::with_capacity(outputs.len());
                 for output in outputs {
@@ -1267,8 +1167,7 @@ fn process_response(
                         translation,
                     });
                 }
-                let record =
-                    TranslationTaskResponseRecord::parsed_with_repairs(raw_assistant, repairs);
+                let record = TranslationTaskResponseRecord::new(raw_assistant);
                 (Ok(acceptance_outputs), Some(record))
             }
             None => {
@@ -1291,9 +1190,7 @@ fn process_response(
             }
         },
         Err(parse_error) => {
-            let record = raw_assistant.map(|raw_assistant| {
-                TranslationTaskResponseRecord::invalid(raw_assistant, parse_error)
-            });
+            let record = raw_assistant.map(TranslationTaskResponseRecord::new);
             (Err(parse_error), record)
         }
     };
@@ -1353,7 +1250,6 @@ fn process_response(
                     input.attempt,
                     diagnostics,
                 ),
-                final_response: Some(final_response),
                 reason: TranslationTaskUnavailableReason::ModelResponseUnusable,
                 unresolved: non_empty_known(unresolved, "Executor 已确认任务含有预期输出"),
             };
@@ -1524,7 +1420,6 @@ fn process_response(
                 input.attempt,
                 diagnostics,
             ),
-            final_response,
             accepted: non_empty_known(accepted, "所有预期输出已验收"),
         }
     } else if accepted.is_empty() {
@@ -1534,7 +1429,6 @@ fn process_response(
                 input.attempt,
                 diagnostics,
             ),
-            final_response: Some(final_response),
             reason: TranslationTaskUnavailableReason::AllOutputsRejected,
             unresolved: non_empty_known(unresolved, "没有输出通过验收"),
         }
@@ -1545,7 +1439,6 @@ fn process_response(
                 input.attempt,
                 diagnostics,
             ),
-            final_response,
             accepted: non_empty_known(accepted, "部分输出已验收"),
             unresolved: non_empty_known(unresolved, "部分输出未完成"),
         }
@@ -1730,8 +1623,6 @@ fn accept_translation_lines_candidate_at_with_cancellation(
 
 #[derive(Debug)]
 struct ParsedModelOutput {
-    #[cfg(test)]
-    id: String,
     canonical_id: Option<TaskId>,
     translation: Result<Vec<String>, TranslationAssistantValueError>,
 }
@@ -1899,24 +1790,20 @@ fn parse_model_response_with_cancellation<E>(
         Ok(parsed) => parsed,
         Err(source) => return Ok(Err(source)),
     };
-    let (_, entries, repairs) = parsed.into_parts();
+    let entries = parsed.into_entries();
     let mut outputs = Vec::with_capacity(entries.len());
     for entry in entries {
         ensure_running()?;
         let decoded = entry.decode_translation_value_with_cancellation(&mut ensure_running)?;
         let translation = translation_lines_from_decoded_value(decoded);
-        let (id, _, canonical_id) = entry.into_parts();
-        #[cfg(not(test))]
-        let _ = id;
+        let (_, canonical_id) = entry.into_parts();
         outputs.push(ParsedModelOutput {
-            #[cfg(test)]
-            id,
             canonical_id,
             translation,
         });
     }
     ensure_running()?;
-    Ok(Ok(ParsedModelOutputBatch { outputs, repairs }))
+    Ok(Ok(ParsedModelOutputBatch { outputs }))
 }
 
 fn translation_lines_from_decoded_value(
@@ -1980,7 +1867,6 @@ fn translation_lines_from_array(
 #[derive(Debug)]
 struct ParsedModelOutputBatch {
     outputs: Vec<ParsedModelOutput>,
-    repairs: Vec<TranslationResponseRepair>,
 }
 
 #[cfg(test)]
@@ -3778,9 +3664,6 @@ mod tests {
                 LlmResponse::new(
                     r#"{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                     LlmFinishReason::Stop,
-                    None,
-                    None,
-                    None,
                 ),
                 1,
             )
@@ -3818,7 +3701,7 @@ mod tests {
         for (mode, value) in cases {
             let outputs = parse_model_output_batch(value, mode).expect("当前模式响应应合法");
             assert_eq!(outputs.len(), 1);
-            assert_eq!(outputs[0].id, "0");
+            assert_eq!(outputs[0].canonical_id, Some(task_id(0)));
             assert!(matches!(
                 &outputs[0].translation,
                 Ok(lines) if lines == &["甲".to_owned(), "乙".to_owned()]
@@ -3907,8 +3790,8 @@ mod tests {
         .expect("零和无前导零的 ASCII 十进制键应合法");
 
         assert_eq!(outputs.len(), 2);
-        assert_eq!(outputs[0].id, "0");
-        assert_eq!(outputs[1].id, "1");
+        assert_eq!(outputs[0].canonical_id, Some(task_id(0)));
+        assert_eq!(outputs[1].canonical_id, Some(task_id(1)));
         assert_eq!(parse_model_output_id("0"), Some(task_id(0)));
         assert_eq!(parse_model_output_id("1"), Some(task_id(1)));
         for invalid in ["", "00", "01", "-1", "1.5", "true"] {
@@ -4006,11 +3889,7 @@ mod tests {
             let content = serde_json::to_string(&serde_json::json!({"0": &expected_lines}))
                 .expect("测试响应应可序列化");
             let outcome = processor
-                .process(
-                    &task,
-                    LlmResponse::new(content, LlmFinishReason::Stop, None, None, None),
-                    1,
-                )
+                .process(&task, LlmResponse::new(content, LlmFinishReason::Stop), 1)
                 .await
                 .expect("自由断行应按一个语义单元验收");
 
@@ -4080,11 +3959,7 @@ mod tests {
             r#"{"0":["","   "],"1":["爱丽丝"]}"#,
         ] {
             let outcome = processor
-                .process(
-                    &task,
-                    LlmResponse::new(response, LlmFinishReason::Stop, None, None, None),
-                    1,
-                )
+                .process(&task, LlmResponse::new(response, LlmFinishReason::Stop), 1)
                 .await
                 .expect("自由断行的空集合应成为单 ID 正常拒绝");
 
@@ -4117,9 +3992,6 @@ mod tests {
                 LlmResponse::new(
                     r#"{"0":["炎之剑。","装备后可提升攻击力。"]}"#,
                     LlmFinishReason::Stop,
-                    None,
-                    None,
-                    None,
                 ),
                 1,
             )
@@ -4144,13 +4016,7 @@ mod tests {
         let outcome = processor
             .process(
                 &task,
-                LlmResponse::new(
-                    r#"{"0":["是／否"]}"#,
-                    LlmFinishReason::Stop,
-                    None,
-                    None,
-                    None,
-                ),
+                LlmResponse::new(r#"{"0":["是／否"]}"#, LlmFinishReason::Stop),
                 1,
             )
             .await
@@ -4172,13 +4038,7 @@ mod tests {
         let outcome = processor
             .process(
                 &speaker_task(),
-                LlmResponse::new(
-                    r#"{"0":["爱丽","丝"]}"#,
-                    LlmFinishReason::Stop,
-                    None,
-                    None,
-                    None,
-                ),
+                LlmResponse::new(r#"{"0":["爱丽","丝"]}"#, LlmFinishReason::Stop),
                 1,
             )
             .await
@@ -4206,13 +4066,7 @@ mod tests {
         let accepted = processor
             .process(
                 &task,
-                LlmResponse::new(
-                    r#"{"0":["制作人员","","爱丽丝"]}"#,
-                    LlmFinishReason::Stop,
-                    None,
-                    None,
-                    None,
-                ),
+                LlmResponse::new(r#"{"0":["制作人员","","爱丽丝"]}"#, LlmFinishReason::Stop),
                 1,
             )
             .await
@@ -4232,11 +4086,7 @@ mod tests {
             r#"{"0":["","","爱丽丝"]}"#,
         ] {
             let rejected = processor
-                .process(
-                    &task,
-                    LlmResponse::new(lines, LlmFinishReason::Stop, None, None, None),
-                    1,
-                )
+                .process(&task, LlmResponse::new(lines, LlmFinishReason::Stop), 1)
                 .await
                 .expect("空槽不对齐应成为当前 ID 的正常拒绝");
             assert!(matches!(
@@ -4290,9 +4140,6 @@ mod tests {
                 LlmResponse::new(
                     r#"{"0":["和他交谈","取消⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                     LlmFinishReason::Stop,
-                    None,
-                    None,
-                    None,
                 ),
                 1,
             )
@@ -4360,13 +4207,7 @@ mod tests {
         let result = processor
             .process(
                 &task_with_language_pair("ja", "zh-Hans", 1),
-                LlmResponse::new(
-                    r#"{"0":["炎之剑\\N[1]！"]}"#,
-                    LlmFinishReason::Stop,
-                    Some("request-1".to_owned()),
-                    Some("response-1".to_owned()),
-                    Some(LlmUsage::new(10, 5, 15)),
-                ),
+                LlmResponse::new(r#"{"0":["炎之剑\\N[1]！"]}"#, LlmFinishReason::Stop),
                 1,
             )
             .await
@@ -4375,12 +4216,6 @@ mod tests {
         assert_eq!(result.task_index(), RpgMakerTranslationTaskIndex::new(2));
         assert!(matches!(&result, TranslationTaskOutcome::Complete { .. }));
         assert_eq!(result.attempts().get(), 1);
-        assert_eq!(result.provider_request_id(), Some("request-1"));
-        assert_eq!(result.provider_response_id(), Some("response-1"));
-        assert_eq!(
-            result.final_response_usage(),
-            Some(LlmUsage::new(10, 5, 15))
-        );
         assert_eq!(
             result.accepted()[0].translation(),
             &TextUnitContent::Value("炎之剑\\N[1]！".to_owned())
@@ -4401,22 +4236,13 @@ mod tests {
         let result = processor
             .process(
                 &task_with_language_pair("ja", "zh-Hans", 1),
-                LlmResponse::new(
-                    r#"{"0":["炎之剑\\N[1]！"]}"#,
-                    LlmFinishReason::Stop,
-                    None,
-                    None,
-                    None,
-                ),
+                LlmResponse::new(r#"{"0":["炎之剑\\N[1]！"]}"#, LlmFinishReason::Stop),
                 1,
             )
             .await
             .expect("供应商元数据缺失不应否定模型正文");
 
         assert!(matches!(&result, TranslationTaskOutcome::Complete { .. }));
-        assert_eq!(result.provider_request_id(), None);
-        assert_eq!(result.provider_response_id(), None);
-        assert_eq!(result.final_response_usage(), None);
     }
 
     fn state_context(byte: u8) -> TranslationStateContext {
@@ -4434,9 +4260,6 @@ mod tests {
                 LlmResponse::new(
                     r#"{"0":["炎\uFEFF之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                     LlmFinishReason::Stop,
-                    None,
-                    Some("response-bom".to_owned()),
-                    None,
                 ),
                 1,
             )
@@ -4453,9 +4276,6 @@ mod tests {
                 LlmResponse::new(
                     r#"{"0":["  ⟦ATT_ACTOR_NAME_WHOLE_0000⟧  "]}"#,
                     LlmFinishReason::Stop,
-                    None,
-                    Some("response-natural".to_owned()),
-                    None,
                 ),
                 1,
             )
@@ -4478,13 +4298,7 @@ mod tests {
             let result = processor
                 .process(
                     &speaker_task(),
-                    LlmResponse::new(
-                        content,
-                        LlmFinishReason::Stop,
-                        None,
-                        Some("response-invalid-speaker".to_owned()),
-                        None,
-                    ),
+                    LlmResponse::new(content, LlmFinishReason::Stop),
                     1,
                 )
                 .await
@@ -4519,9 +4333,6 @@ mod tests {
                 LlmResponse::new(
                     r#"{"0":["<Help:炎之剑>装备后攻击力上升。"]}"#,
                     LlmFinishReason::Stop,
-                    None,
-                    Some("response-plain-value".to_owned()),
-                    None,
                 ),
                 1,
             )
@@ -4847,9 +4658,6 @@ mod tests {
                         "1":["乙⟦ATT_ACTOR_NAME_WHOLE_0000⟧⟦ATT_UNKNOWN_WHOLE_9999⟧"]
                     }"#,
                     LlmFinishReason::Stop,
-                    None,
-                    Some("response-unknown-token".to_owned()),
-                    None,
                 ),
                 1,
             )
@@ -4946,9 +4754,6 @@ mod tests {
                         "99":["未知"]
                     }"#,
                     LlmFinishReason::Length,
-                    Some("request-partial".to_owned()),
-                    Some("response-partial".to_owned()),
-                    None,
                 ),
                 2,
             )
@@ -5015,9 +4820,6 @@ mod tests {
                         "99":["未知 ID"]
                     }"#,
                     LlmFinishReason::Stop,
-                    None,
-                    Some("response-schema".to_owned()),
-                    None,
                 ),
                 1,
             )
@@ -5057,13 +4859,7 @@ mod tests {
         let outcome = processor
             .process(
                 &task_with_output_count(2),
-                LlmResponse::new(
-                    raw_assistant,
-                    LlmFinishReason::Stop,
-                    None,
-                    Some("response-deep-partial".to_owned()),
-                    None,
-                ),
+                LlmResponse::new(raw_assistant, LlmFinishReason::Stop),
                 1,
             )
             .await
@@ -5090,13 +4886,7 @@ mod tests {
         let invalid_json = processor
             .process(
                 &task(),
-                LlmResponse::new(
-                    "not-json",
-                    LlmFinishReason::Stop,
-                    None,
-                    Some("response-invalid-json".to_owned()),
-                    None,
-                ),
+                LlmResponse::new("not-json", LlmFinishReason::Stop),
                 1,
             )
             .await
@@ -5120,13 +4910,7 @@ mod tests {
         let all_rejected = processor
             .process(
                 &task(),
-                LlmResponse::new(
-                    r#"{"0":[""]}"#,
-                    LlmFinishReason::Stop,
-                    None,
-                    Some("response-rejected".to_owned()),
-                    None,
-                ),
+                LlmResponse::new(r#"{"0":[""]}"#, LlmFinishReason::Stop),
                 1,
             )
             .await
@@ -5157,13 +4941,7 @@ mod tests {
         let complete = processor
             .process(
                 &task(),
-                LlmResponse::new(
-                    r#"{"think":"确认语境、敬语、token 与单行结构。","translations":{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}}"#,
-                    LlmFinishReason::Stop,
-                    None,
-                    Some("response-thinking-complete".to_owned()),
-                    None,
-                ),
+                LlmResponse::new(r#"{"think":"确认语境、敬语、token 与单行结构。","translations":{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}}"#, LlmFinishReason::Stop),
                 1,
             )
             .await
@@ -5173,13 +4951,7 @@ mod tests {
         let partial = processor
             .process(
                 &task_with_output_count(2),
-                LlmResponse::new(
-                    r#"{"think":"两个 ID 均已逐项分析，但第二项未能产出。","translations":{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}}"#,
-                    LlmFinishReason::Stop,
-                    None,
-                    Some("response-thinking-partial".to_owned()),
-                    None,
-                ),
+                LlmResponse::new(r#"{"think":"两个 ID 均已逐项分析，但第二项未能产出。","translations":{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}}"#, LlmFinishReason::Stop),
                 1,
             )
             .await
@@ -5194,13 +4966,7 @@ mod tests {
         let all_rejected = processor
             .process(
                 &task(),
-                LlmResponse::new(
-                    r#"{"think":"已分析该 ID，但最终数组留下了不合法的空槽。","translations":{"0":[""]}}"#,
-                    LlmFinishReason::Stop,
-                    None,
-                    Some("response-thinking-rejected".to_owned()),
-                    None,
-                ),
+                LlmResponse::new(r#"{"think":"已分析该 ID，但最终数组留下了不合法的空槽。","translations":{"0":[""]}}"#, LlmFinishReason::Stop),
                 1,
             )
             .await
@@ -5219,9 +4985,6 @@ mod tests {
                 LlmResponse::new(
                     r#"{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                     LlmFinishReason::Stop,
-                    None,
-                    Some("response-thinking-missing".to_owned()),
-                    None,
                 ),
                 1,
             )
@@ -5245,13 +5008,7 @@ mod tests {
         let outcome = processor
             .process(
                 &task(),
-                LlmResponse::new(
-                    r#"{"0":{"source":["与请求完全不同"],"translation":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}}"#,
-                    LlmFinishReason::Stop,
-                    None,
-                    None,
-                    None,
-                ),
+                LlmResponse::new(r#"{"0":{"source":["与请求完全不同"],"translation":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}}"#, LlmFinishReason::Stop),
                 1,
             )
             .await
@@ -5271,15 +5028,9 @@ mod tests {
         let complete = processor
             .process(
                 &task(),
-                LlmResponse::new(
-                    format!(
+                LlmResponse::new(format!(
                         "{{\"think\":\"{THINKING_SENTINEL}\",\"translations\":{{\"0\":[\"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧\"]}}}}"
-                    ),
-                    LlmFinishReason::Stop,
-                    None,
-                    None,
-                    None,
-                ),
+                    ), LlmFinishReason::Stop),
                 1,
             )
             .await
@@ -5292,9 +5043,6 @@ mod tests {
                 LlmResponse::new(
                     format!("{{\"think\":\"{THINKING_SENTINEL}\",\"translations\":not-json}}"),
                     LlmFinishReason::Stop,
-                    None,
-                    None,
-                    None,
                 ),
                 1,
             )
@@ -5329,13 +5077,7 @@ mod tests {
         let outcome = processor
             .process(
                 &task(),
-                LlmResponse::new(
-                    r#"{"think":"不应出现。","translations":{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}}"#,
-                    LlmFinishReason::Stop,
-                    None,
-                    None,
-                    None,
-                ),
+                LlmResponse::new(r#"{"think":"不应出现。","translations":{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}}"#, LlmFinishReason::Stop),
                 1,
             )
             .await
@@ -5355,17 +5097,7 @@ mod tests {
         let processor =
             TranslationTaskResponseProcessingService::new(UnavailableCpu, translation_resources());
         let error = processor
-            .process(
-                &task(),
-                LlmResponse::new(
-                    "{}",
-                    LlmFinishReason::Stop,
-                    None,
-                    Some("response-cpu".to_owned()),
-                    None,
-                ),
-                1,
-            )
+            .process(&task(), LlmResponse::new("{}", LlmFinishReason::Stop), 1)
             .await
             .expect_err("CPU 根不可用必须传播");
 
@@ -5387,9 +5119,6 @@ mod tests {
                 LlmResponse::new(
                     r#"{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                     LlmFinishReason::Stop,
-                    None,
-                    Some("response-language".to_owned()),
-                    None,
                 ),
                 1,
             )
@@ -5408,9 +5137,6 @@ mod tests {
                     LlmResponse::new(
                         r#"{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                         LlmFinishReason::Stop,
-                        None,
-                        Some("response-mismatch".to_owned()),
-                        None,
                     ),
                     1,
                 )
@@ -5426,13 +5152,7 @@ mod tests {
         let invariant_error = processor
             .process(
                 &task_with_output_count(0),
-                LlmResponse::new(
-                    "{}",
-                    LlmFinishReason::Stop,
-                    None,
-                    Some("response-invariant".to_owned()),
-                    None,
-                ),
+                LlmResponse::new("{}", LlmFinishReason::Stop),
                 1,
             )
             .await
@@ -5561,9 +5281,6 @@ mod tests {
                     Ok(LlmResponse::new(
                         r#"{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                         LlmFinishReason::Stop,
-                        None,
-                        Some("response-retry".to_owned()),
-                        None,
                     )),
                 ]))),
                 messages: Arc::clone(&messages),
@@ -5596,9 +5313,6 @@ mod tests {
                 responses: Arc::new(Mutex::new(VecDeque::from([Ok(LlmResponse::new(
                     r#"{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                     LlmFinishReason::Stop,
-                    None,
-                    Some("response-without-record".to_owned()),
-                    None,
                 ))]))),
                 messages: Arc::new(Mutex::new(Vec::new())),
             },
@@ -5622,8 +5336,8 @@ mod tests {
 
         assert_eq!(evidence.attempt_count(), outcome.attempts().get());
         assert!(
-            !evidence.has_recorded_payload(),
-            "关闭记录时不得保留时钟、attempt 文档或原始 Assistant 旁路"
+            evidence.response().is_none(),
+            "关闭记录时不得保留原始 Assistant"
         );
     }
 
@@ -5642,9 +5356,6 @@ mod tests {
                     Ok(LlmResponse::new(
                         r#"{"0":["不应请求"]}"#,
                         LlmFinishReason::Stop,
-                        None,
-                        Some("response-unused".to_owned()),
-                        None,
                     )),
                 ]))),
                 messages: Arc::clone(&messages),
@@ -5684,10 +5395,7 @@ mod tests {
         ));
         assert!(cancelled);
         assert!(diagnostic.is_none());
-        assert!(
-            evidence.has_cancelled_retry_wait(),
-            "证据必须区分等待期间取消，不能声称已经等待后重试"
-        );
+        assert_eq!(evidence.attempt_count(), 1);
         assert_eq!(
             messages.lock().expect("消息锁不应中毒").len(),
             1,
@@ -5723,10 +5431,6 @@ mod tests {
         assert_eq!(evidence.attempt_count(), 1);
         assert!(diagnostic.is_none());
         assert!(cancelled);
-        assert!(
-            !evidence.has_cancelled_retry_wait(),
-            "等待 LLM 本地入场的取消不得伪装成 Retry-After 等待"
-        );
     }
 
     #[tokio::test]
@@ -5737,9 +5441,6 @@ mod tests {
                 responses: Arc::new(Mutex::new(VecDeque::from([Ok(LlmResponse::new(
                     r#"{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                     LlmFinishReason::Stop,
-                    None,
-                    Some("response-cancelled".to_owned()),
-                    None,
                 ))]))),
                 messages: Arc::new(Mutex::new(Vec::new())),
             },
@@ -5779,8 +5480,6 @@ mod tests {
             response.raw_assistant(),
             r#"{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#
         );
-        assert!(!response.is_strict_json());
-        assert!(response.parse_error().is_none());
         assert!(diagnostic.is_none());
         assert!(cancelled);
     }
@@ -5799,9 +5498,6 @@ mod tests {
                 responses: Arc::new(Mutex::new(VecDeque::from([Ok(LlmResponse::new(
                     raw_assistant.clone(),
                     LlmFinishReason::Stop,
-                    None,
-                    Some("response-active-cancelled".to_owned()),
-                    None,
                 ))]))),
                 messages: Arc::new(Mutex::new(Vec::new())),
             },
@@ -5852,9 +5548,6 @@ mod tests {
                 responses: Arc::new(Mutex::new(VecDeque::from([Ok(LlmResponse::new(
                     raw_assistant,
                     LlmFinishReason::Stop,
-                    None,
-                    Some("response-parsed-before-failure".to_owned()),
-                    None,
                 ))]))),
                 messages: Arc::new(Mutex::new(Vec::new())),
             },
@@ -5889,8 +5582,6 @@ mod tests {
             .response()
             .expect("解析成功后建立的响应投影必须随技术失败进入 Executor evidence");
         assert_eq!(response.raw_assistant(), raw_assistant);
-        assert!(response.is_strict_json());
-        assert!(response.parse_error().is_none());
     }
 
     #[tokio::test]
@@ -5905,19 +5596,10 @@ mod tests {
         >::new(
             FakeLlm {
                 responses: Arc::new(Mutex::new(VecDeque::from([
-                    Ok(LlmResponse::new(
-                        r#"{"0":123}"#,
-                        LlmFinishReason::Stop,
-                        None,
-                        Some("response-invalid-shape".to_owned()),
-                        None,
-                    )),
+                    Ok(LlmResponse::new(r#"{"0":123}"#, LlmFinishReason::Stop)),
                     Ok(LlmResponse::new(
                         r#"{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                         LlmFinishReason::Stop,
-                        None,
-                        Some("response-unused".to_owned()),
-                        None,
                     )),
                 ]))),
                 messages: Arc::clone(&messages),
@@ -5951,16 +5633,10 @@ mod tests {
             Ok(LlmResponse::new(
                 r#"{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                 LlmFinishReason::Stop,
-                None,
-                Some("response-missing-thinking".to_owned()),
-                None,
             )),
             Ok(LlmResponse::new(
                 r#"{"think":"该响应不应被消费。","translations":{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}}"#,
                 LlmFinishReason::Stop,
-                None,
-                Some("response-unused".to_owned()),
-                None,
             )),
         ])));
         let service = RpgMakerTranslationTaskExecutionService::<
@@ -6151,9 +5827,6 @@ mod tests {
                 responses: Arc::new(Mutex::new(VecDeque::from([Ok(LlmResponse::new(
                     r#"{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                     LlmFinishReason::Stop,
-                    None,
-                    Some("response-send".to_owned()),
-                    None,
                 ))]))),
                 messages: Arc::new(Mutex::new(Vec::new())),
             },

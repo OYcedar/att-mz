@@ -223,8 +223,6 @@ pub(crate) struct ValidatedManualTranslation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ManualCheckIssue {
     pub(crate) id: String,
-    pub(crate) reason: String,
-    pub(crate) help: String,
     problem: ManualCheckProblem,
 }
 
@@ -504,62 +502,7 @@ fn invalid_line(lines: &[String]) -> Option<usize> {
 }
 
 fn push_issue(report: &mut ManualCheckReport, id: String, problem: ManualCheckProblem) {
-    let (reason, help) = manual_check_problem_chinese(&problem);
-    report.errors.push(ManualCheckIssue {
-        id,
-        reason,
-        help,
-        problem,
-    });
-}
-
-fn manual_check_problem_chinese(problem: &ManualCheckProblem) -> (String, String) {
-    match problem {
-        ManualCheckProblem::DuplicateEntry => (
-            "同一位置在文件中出现了多次".to_owned(),
-            "只保留一条 translation".to_owned(),
-        ),
-        ManualCheckProblem::UnknownId => (
-            "当前项目中没有这个位置".to_owned(),
-            "重新运行 manual export".to_owned(),
-        ),
-        ManualCheckProblem::InvalidSourceLine { line } => (
-            format!("source 第 {line} 项包含换行或 NUL"),
-            "重新运行 manual export，不要把换行写进数组项".to_owned(),
-        ),
-        ManualCheckProblem::SourceChanged => (
-            "当前原文已经变化".to_owned(),
-            "重新运行 manual export 后再填写译文".to_owned(),
-        ),
-        ManualCheckProblem::TypeMismatch => (
-            "type 与当前位置的行数规则不一致".to_owned(),
-            "保留 manual export 生成的 type".to_owned(),
-        ),
-        ManualCheckProblem::InvalidTranslationLine { line } => (
-            format!("translation 第 {line} 项包含换行或 NUL"),
-            "用数组项表达分行，并删除控制字符".to_owned(),
-        ),
-        ManualCheckProblem::FixedLength { expected, actual } => (
-            format!("fixed 译文需要 {expected} 项，当前为 {actual} 项"),
-            "保持 translation 与 source 的数组长度一致".to_owned(),
-        ),
-        ManualCheckProblem::FixedBlankSlot { slot } => (
-            format!("fixed 译文第 {slot} 项必须保留空槽"),
-            "把对应 translation 数组项改为空字符串".to_owned(),
-        ),
-        ManualCheckProblem::PlaceholderMismatch => (
-            "译文没有保留原文中的控制码或 Placeholder".to_owned(),
-            "保留原文中的控制码和 Placeholder，并保持必要顺序".to_owned(),
-        ),
-        ManualCheckProblem::EmptyTranslation => (
-            "translation 尚未填写".to_owned(),
-            "提供至少一个字符串数组项".to_owned(),
-        ),
-        ManualCheckProblem::InvalidStructure => (
-            "人工译文没有通过结构检查".to_owned(),
-            "按当前位置的 type、空槽和 Placeholder 规则修改译文".to_owned(),
-        ),
-    }
+    report.errors.push(ManualCheckIssue { id, problem });
 }
 
 fn atomic_replace(
@@ -736,6 +679,11 @@ fn line_separator_offsets(lines: &[String]) -> Vec<usize> {
 pub(crate) struct ManualProjectSnapshot {
     pub(crate) index: ManualTranslationIndex,
     pub(crate) placeholders: ManualPlaceholderValidator,
+}
+
+/// Lua 高级接口额外读取已失去当前位置的人工译文。
+pub(crate) struct ManualProjectLuaSnapshot {
+    pub(crate) current: ManualProjectSnapshot,
     pub(crate) detached: Vec<ManualDetachedTranslation>,
 }
 
@@ -745,12 +693,12 @@ pub(crate) enum ManualClearLocatorError {
     Ambiguous,
 }
 
-impl ManualProjectSnapshot {
+impl ManualProjectLuaSnapshot {
     pub(crate) fn clear_locator(
         &self,
         id: &str,
     ) -> Result<&ManualTranslationLocator, ManualClearLocatorError> {
-        let current = self.index.get(id);
+        let current = self.current.index.get(id);
         let mut detached = self.detached.iter().filter(|entry| entry.snapshot.id == id);
         let first_detached = detached.next();
         if detached.next().is_some() || (current.is_some() && first_detached.is_some()) {
@@ -782,15 +730,20 @@ pub(crate) fn execute_generic_manual_command(
     database_path: &Path,
     operation: ManualOperation,
     file: &Path,
-    language_modules: &LanguageModuleCatalog,
+    language_modules: Option<&LanguageModuleCatalog>,
     cancellation: &CooperativeCancellation,
 ) -> Result<ManualCommandSummary, ManualCommandError> {
+    assert_eq!(
+        matches!(operation, ManualOperation::Export),
+        language_modules.is_some(),
+        "只有 Manual export 应获得语言模块"
+    );
     execute_manual_database_command(
         database_path,
         operation,
         file,
         cancellation,
-        |connection| load_generic_manual_snapshot(connection, language_modules),
+        |connection| load_generic_manual_command_snapshot(connection, language_modules),
         |connection, writes| {
             apply_generic_manual_translations_with_cancellation(connection, writes, cancellation)
         },
@@ -802,15 +755,20 @@ pub(crate) fn execute_rpg_maker_manual_command(
     engine: RpgMakerEngine,
     operation: ManualOperation,
     file: &Path,
-    language_modules: &LanguageModuleCatalog,
+    language_modules: Option<&LanguageModuleCatalog>,
     cancellation: &CooperativeCancellation,
 ) -> Result<ManualCommandSummary, ManualCommandError> {
+    assert_eq!(
+        matches!(operation, ManualOperation::Export),
+        language_modules.is_some(),
+        "只有 Manual export 应获得语言模块"
+    );
     execute_manual_database_command(
         database_path,
         operation,
         file,
         cancellation,
-        |connection| load_rpg_maker_manual_snapshot(connection, engine, language_modules),
+        |connection| load_rpg_maker_manual_command_snapshot(connection, engine, language_modules),
         |connection, writes| {
             apply_rpg_maker_manual_translations_with_cancellation(connection, writes, cancellation)
         },
@@ -1336,11 +1294,13 @@ fn resolve_source_language(
     })
 }
 
-pub(crate) fn load_generic_manual_snapshot(
+fn load_generic_manual_command_snapshot(
     connection: &Connection,
-    language_modules: &LanguageModuleCatalog,
+    language_modules: Option<&LanguageModuleCatalog>,
 ) -> Result<ManualProjectSnapshot, ManualDatabaseError> {
-    let source_language = load_generic_source_language(connection, language_modules)?;
+    let source_language = language_modules
+        .map(|modules| load_generic_source_language(connection, modules))
+        .transpose()?;
     let canonical_json: String = connection.query_row(
         "SELECT canonical_json FROM translation_resource WHERE resource_kind = 'placeholder_rules'",
         [],
@@ -1365,12 +1325,21 @@ pub(crate) fn load_generic_manual_snapshot(
                 ManualDatabaseError::InvalidProject("项目 Placeholder 规则无法编译".to_owned())
             })
         })?;
-    let entries = load_generic_entries(connection, &service, &compiled, source_language.as_ref())?;
-    let detached = load_detached_generic_manual_translations(connection)?;
+    let entries =
+        load_generic_entries(connection, &service, &compiled, source_language.as_deref())?;
     Ok(ManualProjectSnapshot {
         index: ManualTranslationIndex::new(entries)?,
         placeholders: ManualPlaceholderValidator::Generic { service, compiled },
-        detached,
+    })
+}
+
+pub(crate) fn load_generic_manual_lua_snapshot(
+    connection: &Connection,
+    language_modules: &LanguageModuleCatalog,
+) -> Result<ManualProjectLuaSnapshot, ManualDatabaseError> {
+    Ok(ManualProjectLuaSnapshot {
+        current: load_generic_manual_command_snapshot(connection, Some(language_modules))?,
+        detached: load_detached_generic_manual_translations(connection)?,
     })
 }
 
@@ -1378,13 +1347,12 @@ fn load_generic_entries(
     connection: &Connection,
     placeholder_service: &GenericPlaceholderService,
     placeholder_rules: &GenericCompiledPlaceholderRules,
-    source_language: &dyn LanguageModule,
+    source_language: Option<&dyn LanguageModule>,
 ) -> Result<Vec<ManualTranslationEntry>, ManualDatabaseError> {
     let mut statement = connection.prepare(
         "SELECT f.relative_path, g.group_id, g.ordinal, g.kind,
                 u.unit_id, u.ordinal, u.source_text, u.translation,
-                manual.readable_id, manual.translation_type,
-                manual.source_json, manual.translation_json,
+                manual.readable_id, manual.source_json, manual.translation_json,
                 manual.applicability_fingerprint
          FROM generic_file AS f
          JOIN generic_group AS g ON g.relative_path = f.relative_path
@@ -1405,12 +1373,11 @@ fn load_generic_entries(
         let unit: i64 = row.get(5)?;
         let source_text: String = row.get(6)?;
         let automatic: Option<String> = row.get(7)?;
-        let stored_manual = parse_stored_manual_translation(
+        let stored_manual = parse_stored_generic_manual_translation(
             row.get(8)?,
             row.get(9)?,
             row.get(10)?,
             row.get(11)?,
-            row.get(12)?,
         )?;
         let source = source_text
             .split('\n')
@@ -1440,14 +1407,19 @@ fn load_generic_entries(
         } else {
             (None, None)
         };
-        let active = generic_source_needs_translation(
-            &id,
-            &kind,
-            &source_text,
-            placeholder_service,
-            placeholder_rules,
-            source_language,
-        )?;
+        let active = source_language
+            .map(|source_language| {
+                generic_source_needs_translation(
+                    &id,
+                    &kind,
+                    &source_text,
+                    placeholder_service,
+                    placeholder_rules,
+                    source_language,
+                )
+            })
+            .transpose()?
+            .unwrap_or(false);
         entries.push(ManualTranslationEntry {
             id,
             kind: ManualTranslationType::Free,
@@ -1498,13 +1470,11 @@ fn generic_source_needs_translation(
             .needs_translation())
 }
 
-pub(crate) fn load_rpg_maker_manual_snapshot(
+fn load_rpg_maker_manual_command_snapshot(
     connection: &Connection,
     engine: RpgMakerEngine,
-    language_modules: &LanguageModuleCatalog,
+    language_modules: Option<&LanguageModuleCatalog>,
 ) -> Result<ManualProjectSnapshot, ManualDatabaseError> {
-    let (language_pair, source_language) =
-        load_rpg_maker_language_context(connection, language_modules)?;
     let canonical_json: String = connection.query_row(
         "SELECT canonical_json FROM rpg_maker_translation_resource WHERE resource_kind = 'placeholder_rules'",
         [],
@@ -1530,17 +1500,21 @@ pub(crate) fn load_rpg_maker_manual_snapshot(
                 ManualDatabaseError::InvalidProject("项目 Placeholder 规则无法编译".to_owned())
             })
         })?;
-    let semantics = ResolvedTranslationSemantics::new(
-        engine,
-        language_pair,
-        Arc::new(CompiledTerminology::empty()),
-        service.clone(),
-        compiled.clone(),
-        source_language,
-        Sha256Fingerprint::from_bytes([0; 32]),
-    );
-    let entries = load_rpg_maker_entries(connection, &semantics)?;
-    let detached = load_detached_rpg_maker_manual_translations(connection)?;
+    let semantics = language_modules
+        .map(|modules| load_rpg_maker_language_context(connection, modules))
+        .transpose()?
+        .map(|(language_pair, source_language)| {
+            ResolvedTranslationSemantics::new(
+                engine,
+                language_pair,
+                Arc::new(CompiledTerminology::empty()),
+                service.clone(),
+                compiled.clone(),
+                source_language,
+                Sha256Fingerprint::from_bytes([0; 32]),
+            )
+        });
+    let entries = load_rpg_maker_entries(connection, semantics.as_ref())?;
     Ok(ManualProjectSnapshot {
         index: ManualTranslationIndex::new(entries)?,
         placeholders: ManualPlaceholderValidator::RpgMaker {
@@ -1548,13 +1522,27 @@ pub(crate) fn load_rpg_maker_manual_snapshot(
             service,
             compiled,
         },
-        detached,
+    })
+}
+
+pub(crate) fn load_rpg_maker_manual_lua_snapshot(
+    connection: &Connection,
+    engine: RpgMakerEngine,
+    language_modules: &LanguageModuleCatalog,
+) -> Result<ManualProjectLuaSnapshot, ManualDatabaseError> {
+    Ok(ManualProjectLuaSnapshot {
+        current: load_rpg_maker_manual_command_snapshot(
+            connection,
+            engine,
+            Some(language_modules),
+        )?,
+        detached: load_detached_rpg_maker_manual_translations(connection)?,
     })
 }
 
 fn load_rpg_maker_entries(
     connection: &Connection,
-    semantics: &ResolvedTranslationSemantics,
+    semantics: Option<&ResolvedTranslationSemantics>,
 ) -> Result<Vec<ManualTranslationEntry>, ManualDatabaseError> {
     let mut statement = connection.prepare(
         "SELECT g.owner, g.group_location, g.group_kind, g.projection_recipe_json,
@@ -1701,18 +1689,24 @@ fn load_rpg_maker_entries(
         } else {
             (None, None)
         };
-        let prepared = semantics
-            .prepare_content_with_cancellation(kind, &content, || {
-                Ok::<_, std::convert::Infallible>(())
+        let active = semantics
+            .map(|semantics| {
+                semantics
+                    .prepare_content_with_cancellation(kind, &content, || {
+                        Ok::<_, std::convert::Infallible>(())
+                    })
+                    .map_err(|unreachable| match unreachable {})
+                    .and_then(|result| {
+                        result.map_err(|_| {
+                            ManualDatabaseError::InvalidProject(format!(
+                                "{id} 的原文无法按当前 Placeholder 规则读取"
+                            ))
+                        })
+                    })
+                    .map(|prepared| prepared.status() == PreparedTranslationStatus::Active)
             })
-            .map_err(|unreachable| match unreachable {})
-            .and_then(|result| {
-                result.map_err(|_| {
-                    ManualDatabaseError::InvalidProject(format!(
-                        "{id} 的原文无法按当前 Placeholder 规则读取"
-                    ))
-                })
-            })?;
+            .transpose()?
+            .unwrap_or(false);
         pending.push(PendingEntry {
             entry: ManualTranslationEntry {
                 id,
@@ -1724,8 +1718,7 @@ fn load_rpg_maker_entries(
                     unit_role: role_raw,
                 },
                 applicability,
-                needs_translation: current_translation.is_none()
-                    && prepared.status() == PreparedTranslationStatus::Active,
+                needs_translation: current_translation.is_none() && active,
                 placeholder_scope: kind_raw,
                 current_translation,
                 origin,
@@ -1779,6 +1772,18 @@ fn parse_stored_manual_translation(
     }))
 }
 
+fn parse_stored_generic_manual_translation(
+    id: Option<String>,
+    source_json: Option<String>,
+    translation_json: Option<String>,
+    applicability: Option<Vec<u8>>,
+) -> Result<Option<StoredManualTranslation>, ManualDatabaseError> {
+    let kind = id
+        .as_ref()
+        .map(|_| ManualTranslationType::Free.as_str().to_owned());
+    parse_stored_manual_translation(id, kind, source_json, translation_json, applicability)
+}
+
 fn manual_outdated_snapshot(manual: &StoredManualTranslation) -> ManualOutdatedTranslation {
     ManualOutdatedTranslation {
         id: manual.id.clone(),
@@ -1793,8 +1798,8 @@ fn load_detached_generic_manual_translations(
 ) -> Result<Vec<ManualDetachedTranslation>, ManualDatabaseError> {
     let mut statement = connection.prepare(
         "SELECT manual.group_id, manual.unit_id, manual.readable_id,
-                manual.translation_type, manual.source_json,
-                manual.translation_json, manual.applicability_fingerprint
+                manual.source_json, manual.translation_json,
+                manual.applicability_fingerprint
          FROM generic_manual_translation AS manual
          LEFT JOIN generic_unit AS unit
            ON unit.group_id = manual.group_id AND unit.unit_id = manual.unit_id
@@ -1806,12 +1811,11 @@ fn load_detached_generic_manual_translations(
     while let Some(row) = rows.next()? {
         let group_id: String = row.get(0)?;
         let unit_id: String = row.get(1)?;
-        let stored = parse_stored_manual_translation(
+        let stored = parse_stored_generic_manual_translation(
             row.get(2)?,
             row.get(3)?,
             row.get(4)?,
             row.get(5)?,
-            row.get(6)?,
         )?
         .ok_or_else(|| ManualDatabaseError::InvalidProject("人工译文记录不完整".to_owned()))?;
         detached.push(ManualDetachedTranslation {
@@ -1874,21 +1878,15 @@ pub(crate) fn validate_manual_set(
 ) -> Result<ValidatedManualTranslation, ManualCheckIssue> {
     if translation.is_empty() {
         let problem = ManualCheckProblem::EmptyTranslation;
-        let (reason, help) = manual_check_problem_chinese(&problem);
         return Err(ManualCheckIssue {
             id: id.to_owned(),
-            reason,
-            help,
             problem,
         });
     }
     let Some(current) = snapshot.index.get(id) else {
         let problem = ManualCheckProblem::UnknownId;
-        let (reason, help) = manual_check_problem_chinese(&problem);
         return Err(ManualCheckIssue {
             id: id.to_owned(),
-            reason,
-            help,
             problem,
         });
     };
@@ -1909,11 +1907,8 @@ pub(crate) fn validate_manual_set(
     }
     report.writes.pop().ok_or_else(|| {
         let problem = ManualCheckProblem::InvalidStructure;
-        let (reason, help) = manual_check_problem_chinese(&problem);
         ManualCheckIssue {
             id: id.to_owned(),
-            reason,
-            help,
             problem,
         }
     })
@@ -1944,12 +1939,11 @@ fn apply_generic_manual_translations_with_cancellation(
         };
         connection.execute(
             "INSERT INTO generic_manual_translation (
-                 group_id, unit_id, readable_id, translation_type,
+                 group_id, unit_id, readable_id,
                  source_json, translation_json, applicability_fingerprint
-             ) VALUES (?1, ?2, ?3, 'free', ?4, ?5, ?6)
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT (group_id, unit_id) DO UPDATE SET
                  readable_id = excluded.readable_id,
-                 translation_type = excluded.translation_type,
                  source_json = excluded.source_json,
                  translation_json = excluded.translation_json,
                  applicability_fingerprint = excluded.applicability_fingerprint",
@@ -2463,10 +2457,13 @@ mod tests {
         let report = check_manual_document(&path, &index, |_, _| Ok(())).unwrap();
         assert_eq!(report.errors.len(), 3);
         assert_eq!(report.errors[0].id, "Skills.json:798:name");
-        assert!(report.errors[0].reason.contains("换行或 NUL"));
-        assert!(report.errors[1].reason.contains("出现了多次"));
+        assert!(matches!(
+            report.errors[0].problem,
+            ManualCheckProblem::InvalidTranslationLine { line: 1 }
+        ));
+        assert_eq!(report.errors[1].problem, ManualCheckProblem::DuplicateEntry);
         assert_eq!(report.errors[2].id, "Unknown.json:1:name");
-        assert!(report.errors[2].reason.contains("没有这个位置"));
+        assert_eq!(report.errors[2].problem, ManualCheckProblem::UnknownId);
     }
 
     #[test]
@@ -2484,7 +2481,10 @@ mod tests {
         );
         let report = check_manual_document(&path, &index, |_, _| Ok(())).unwrap();
         assert_eq!(report.errors.len(), 1);
-        assert!(report.errors[0].reason.contains("source 第 1 项"));
+        assert!(matches!(
+            report.errors[0].problem,
+            ManualCheckProblem::InvalidSourceLine { line: 1 }
+        ));
 
         write_document(
             &path,
@@ -2495,8 +2495,10 @@ mod tests {
         })
         .unwrap();
         assert_eq!(report.errors.len(), 1);
-        assert!(report.errors[0].reason.contains("Placeholder"));
-        assert!(report.errors[0].help.contains("控制码"));
+        assert_eq!(
+            report.errors[0].problem,
+            ManualCheckProblem::PlaceholderMismatch
+        );
     }
 
     #[test]
@@ -2514,7 +2516,10 @@ mod tests {
         );
         let report = check_manual_document(&path, &fixed, |_, _| Ok(())).unwrap();
         assert_eq!(report.errors.len(), 1);
-        assert!(report.errors[0].reason.contains("空槽"));
+        assert!(matches!(
+            report.errors[0].problem,
+            ManualCheckProblem::FixedBlankSlot { slot: 2 }
+        ));
 
         let free = ManualTranslationIndex::new(vec![indexed_entry(
             ManualTranslationType::Free,
@@ -2589,7 +2594,6 @@ mod tests {
         let snapshot = ManualProjectSnapshot {
             index,
             placeholders: test_placeholder_validator(),
-            detached: Vec::new(),
         };
         let cancellation = CooperativeCancellation::default();
         cancellation.request();
@@ -2632,12 +2636,141 @@ mod tests {
     }
 
     #[test]
+    fn generic_manual_check_and_apply_ignore_invalid_detached_records() {
+        let directory = tempfile::tempdir().expect("应建立测试目录");
+        let database = directory.path().join("project.db");
+        let connection = Connection::open(&database).expect("应建立 Generic 测试数据库");
+        connection
+            .execute_batch(
+                "CREATE TABLE translation_resource (
+                     resource_kind TEXT PRIMARY KEY,
+                     canonical_json TEXT NOT NULL
+                 );
+                 INSERT INTO translation_resource VALUES ('placeholder_rules', '[]');
+                 CREATE TABLE generic_file (relative_path BLOB, ordinal INTEGER);
+                 CREATE TABLE generic_group (
+                     relative_path BLOB, group_id TEXT, ordinal INTEGER, kind TEXT
+                 );
+                 CREATE TABLE generic_unit (
+                     group_id TEXT, unit_id TEXT, ordinal INTEGER,
+                     source_text TEXT, translation TEXT
+                 );
+                 CREATE TABLE generic_manual_translation (
+                     group_id TEXT, unit_id TEXT, readable_id TEXT,
+                     source_json TEXT, translation_json TEXT,
+                     applicability_fingerprint BLOB
+                 );
+                 INSERT INTO generic_manual_translation VALUES (
+                     'detached', 'unit', 'detached-id',
+                     'invalid source', 'invalid translation', X'00'
+                 );",
+            )
+            .expect("应建立包含无效脱离记录的 Generic 数据库");
+        drop(connection);
+        let document = directory.path().join("manual.toml");
+        fs::write(&document, "").expect("应建立空 Manual 文件");
+        let cancellation = CooperativeCancellation::default();
+
+        let checked = execute_generic_manual_command(
+            &database,
+            ManualOperation::Check,
+            &document,
+            None,
+            &cancellation,
+        )
+        .expect("Manual check 不应读取脱离当前位置的记录");
+        assert!(matches!(checked, ManualCommandSummary::Checked { .. }));
+
+        let applied = execute_generic_manual_command(
+            &database,
+            ManualOperation::Apply,
+            &document,
+            None,
+            &cancellation,
+        )
+        .expect("Manual apply 不应读取脱离当前位置的记录");
+        assert!(matches!(
+            applied,
+            ManualCommandSummary::Applied { applied: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn rpg_maker_manual_check_and_apply_ignore_invalid_detached_records() {
+        let directory = tempfile::tempdir().expect("应建立测试目录");
+        let database = directory.path().join("project.db");
+        let connection = Connection::open(&database).expect("应建立 RPG Maker 测试数据库");
+        connection
+            .execute_batch(
+                "CREATE TABLE rpg_maker_translation_resource (
+                     resource_kind TEXT PRIMARY KEY,
+                     canonical_json TEXT NOT NULL
+                 );
+                 INSERT INTO rpg_maker_translation_resource VALUES (
+                     'placeholder_rules', '[]'
+                 );
+                 CREATE TABLE rpg_maker_text_group (
+                     owner TEXT, group_id TEXT, group_location TEXT,
+                     group_kind TEXT, projection_recipe_json TEXT,
+                     semantic_order_key BLOB
+                 );
+                 CREATE TABLE rpg_maker_text_unit (
+                     owner TEXT, group_id TEXT, unit_role TEXT,
+                     source_content_json TEXT, source_context_json TEXT,
+                     translation_content_json TEXT, semantic_order_key BLOB
+                 );
+                 CREATE TABLE rpg_maker_manual_translation (
+                     owner TEXT, group_location TEXT, unit_role TEXT,
+                     readable_id TEXT, translation_type TEXT,
+                     source_json TEXT, translation_json TEXT,
+                     applicability_fingerprint BLOB
+                 );
+                 INSERT INTO rpg_maker_manual_translation VALUES (
+                     'detached', 'location', 'role', 'detached-id', 'invalid',
+                     'invalid source', 'invalid translation', X'00'
+                 );",
+            )
+            .expect("应建立包含无效脱离记录的 RPG Maker 数据库");
+        drop(connection);
+        let document = directory.path().join("manual.toml");
+        fs::write(&document, "").expect("应建立空 Manual 文件");
+        let cancellation = CooperativeCancellation::default();
+
+        let checked = execute_rpg_maker_manual_command(
+            &database,
+            RpgMakerEngine::Mz,
+            ManualOperation::Check,
+            &document,
+            None,
+            &cancellation,
+        )
+        .expect("Manual check 不应读取脱离当前位置的记录");
+        assert!(matches!(checked, ManualCommandSummary::Checked { .. }));
+
+        let applied = execute_rpg_maker_manual_command(
+            &database,
+            RpgMakerEngine::Mz,
+            ManualOperation::Apply,
+            &document,
+            None,
+            &cancellation,
+        )
+        .expect("Manual apply 不应读取脱离当前位置的记录");
+        assert!(matches!(
+            applied,
+            ManualCommandSummary::Applied { applied: 0, .. }
+        ));
+    }
+
+    #[test]
     fn clear_locator_rejects_a_readable_id_shared_by_current_and_detached_entries() {
         let current = indexed_entry(ManualTranslationType::Fixed, &["current"]);
         let id = current.id.clone();
-        let snapshot = ManualProjectSnapshot {
-            index: ManualTranslationIndex::new(vec![current]).unwrap(),
-            placeholders: test_placeholder_validator(),
+        let snapshot = ManualProjectLuaSnapshot {
+            current: ManualProjectSnapshot {
+                index: ManualTranslationIndex::new(vec![current]).unwrap(),
+                placeholders: test_placeholder_validator(),
+            },
             detached: vec![ManualDetachedTranslation {
                 snapshot: ManualOutdatedTranslation {
                     id: id.clone(),
@@ -2679,12 +2812,9 @@ mod tests {
         assert!(!stdout.contains('\u{1b}'));
 
         let problem = ManualCheckProblem::UnknownId;
-        let (reason, help) = manual_check_problem_chinese(&problem);
         let error = ManualCommandError::InvalidEntries(ManualCheckReport {
             errors: vec![ManualCheckIssue {
                 id: "Skills.json:1:name\n\u{202e}\u{1b}[31mforged".to_owned(),
-                reason,
-                help,
                 problem,
             }],
             ..ManualCheckReport::default()
@@ -2715,7 +2845,6 @@ mod tests {
         let snapshot = ManualProjectSnapshot {
             index,
             placeholders: test_placeholder_validator(),
-            detached: Vec::new(),
         };
         let mut called = false;
         let result = apply_manual_snapshot(

@@ -311,45 +311,8 @@ manual-value = { $code ->
     [keep_exported_type] 保留 manual export 產生的 type
    *[other] __ATT_FALLBACK__
 }
-task-record-title = 翻譯任務 { $ordinal } · { $state }
-task-record-state-label = { $state ->
-    [complete] 完成
-    [partial] 部分完成
-    [unavailable] 不可用
-    [execution_failed] 執行失敗
-    [commit_preparation_failed] 提交準備失敗
-    [commit_not_applied] 提交未套用
-    [commit_outcome_unknown] 提交結果未知
-    [not_committed_after_earlier_failure] 因先前失敗未提交
-    [invalid_result] 執行結果序列無效
-    [cancelled] 已取消
-   *[other] { $state }
-}
-task-record-summary-with-written = `任務 { $ordinal }/{ $total }` · `嘗試 { $attempts } 次` · `驗收 { $accepted }/{ $expected }` · `寫入 { $written } 處`
-task-record-summary-without-written = `任務 { $ordinal }/{ $total }` · `嘗試 { $attempts } 次` · `驗收 { $accepted }/{ $expected }`
-task-record-run-id-label = Run ID：
-task-record-started-at-label = 開始時間：
-task-record-duration-label = 總耗時：
-task-record-endpoint-label = Endpoint：
-task-record-model-label = Model：
-task-record-custom-parameters-heading = 自訂參數
-task-record-attempts-heading = 請求過程
+task-record-title = 翻譯任務
 task-record-final-result-heading = 最終結果
-task-record-no-request = 沒有形成可傳送的模型請求。
-task-record-parse-error = 解析錯誤：{ $kind ->
-    [thinking_empty] 模型回應的思考內容為空，第 { $line } 行、第 { $column } 欄
-   *[json] 模型回應 JSON 無效（類別 `{ $category }`），第 { $line } 行、第 { $column } 欄
-}
-task-record-attempt-succeeded = 嘗試 { $number }：成功；finish reason { $finish_reason }
-task-record-attempt-token-usage = ；token `{ $prompt } / { $completion } / { $total }`
-task-record-attempt-duration = ；耗時 `{ $duration }`
-task-record-attempt-retryable = 嘗試 { $number }：可重試請求失敗；耗時 `{ $duration }`
-task-record-attempt-retry-after = ；Retry-After `{ $duration }`
-task-record-attempt-wait-retry = ；等待 `{ $duration }` 後重試
-task-record-attempt-wait-completed = ；等待 `{ $duration }` 已完成，下一次嘗試未開始
-task-record-attempt-wait-cancelled = ；計畫等待 `{ $duration }`，等待期間取消
-task-record-attempt-failed = 嘗試 { $number }：請求或回應處理失敗；耗時 `{ $duration }`
-task-record-attempt-cancelled = 嘗試 { $number }：已取消；耗時 `{ $duration }`
 task-record-final-status = 狀態：{ $state ->
     [complete] 完成，已確認提交
     [partial] 部分完成，已確認提交
@@ -366,5 +329,3 @@ task-record-final-status = 狀態：{ $state ->
 task-record-accepted-written = 已接受：{ $accepted } 項，寫入 { $written } 個實際位置
 task-record-accepted-outcome-unknown = 已驗收：{ $accepted } 項；無法確認資料庫提交終態
 task-record-task-diagnostic = 任務診斷
-task-record-duration-seconds = { $value } 秒
-task-record-duration-milliseconds = { $value } 毫秒

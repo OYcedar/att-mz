@@ -6,7 +6,6 @@ use super::DiagnosticStage;
 use super::issue::IoFailure;
 use super::model::DiagnosticResolution;
 use super::safe_value::SafePath;
-use crate::json_diagnostic::JsonErrorCategory;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -179,40 +178,6 @@ impl ObservabilityFailureCount {
 impl From<u64> for ObservabilityFailureCount {
     fn from(value: u64) -> Self {
         Self::exact(value)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ObservabilityJsonCategory {
-    Io,
-    Syntax,
-    Data,
-    Eof,
-    DuplicateObjectKey,
-}
-
-impl ObservabilityJsonCategory {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Io => "io",
-            Self::Syntax => "syntax",
-            Self::Data => "data",
-            Self::Eof => "eof",
-            Self::DuplicateObjectKey => "duplicate_object_key",
-        }
-    }
-}
-
-impl From<JsonErrorCategory> for ObservabilityJsonCategory {
-    fn from(value: JsonErrorCategory) -> Self {
-        match value {
-            JsonErrorCategory::Io => Self::Io,
-            JsonErrorCategory::Syntax => Self::Syntax,
-            JsonErrorCategory::Data => Self::Data,
-            JsonErrorCategory::Eof => Self::Eof,
-            JsonErrorCategory::DuplicateObjectKey => Self::DuplicateObjectKey,
-        }
     }
 }
 
@@ -482,9 +447,6 @@ pub(crate) enum ObservabilityProblem {
         path: Option<SafePath>,
         event: Option<ObservabilityEventCode>,
         count: ObservabilityFailureCount,
-        category: Option<ObservabilityJsonCategory>,
-        line: Option<usize>,
-        column: Option<usize>,
     },
     Write {
         path: Option<SafePath>,
@@ -691,27 +653,6 @@ impl ObservabilityIssue {
                 path,
                 event,
                 count: count.into(),
-                category: None,
-                line: None,
-                column: None,
-            },
-        }
-    }
-
-    pub(crate) fn serialize_json(
-        component: ObservabilityComponent,
-        path: SafePath,
-        source: &serde_json::Error,
-    ) -> Self {
-        Self {
-            component,
-            problem: ObservabilityProblem::Serialize {
-                path: Some(path),
-                event: None,
-                count: ObservabilityFailureCount::exact(1),
-                category: Some(JsonErrorCategory::from(source).into()),
-                line: Some(source.line()),
-                column: Some(source.column()),
             },
         }
     }
@@ -965,26 +906,10 @@ impl ObservabilityIssue {
                 facts.push(("path", path.to_string()));
                 push_write_failure_facts(&mut facts, failure);
             }
-            ObservabilityProblem::Serialize {
-                path,
-                event,
-                count,
-                category,
-                line,
-                column,
-            } => {
+            ObservabilityProblem::Serialize { path, event, count } => {
                 push_optional_path(&mut facts, path.as_ref());
                 push_optional_event(&mut facts, *event);
                 push_failure_count_facts(&mut facts, *count);
-                if let Some(category) = category {
-                    facts.push(("json_category", category.as_str().to_owned()));
-                }
-                if let Some(line) = line {
-                    facts.push(("line", line.to_string()));
-                }
-                if let Some(column) = column {
-                    facts.push(("column", column.to_string()));
-                }
             }
             ObservabilityProblem::Write {
                 path,
