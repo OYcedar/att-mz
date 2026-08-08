@@ -36,6 +36,26 @@ use super::project::GenericStoredSnapshot;
 use super::translate::GenericUnitKey;
 use super::translate::GenericUnitMap;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GenericCurrentTranslation {
+    text: String,
+    manual: bool,
+}
+
+impl GenericCurrentTranslation {
+    pub(crate) fn new(text: String, manual: bool) -> Self {
+        Self { text, manual }
+    }
+
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub(crate) const fn is_manual(&self) -> bool {
+        self.manual
+    }
+}
+
 /// 候选中的一个 JSONL 文件。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GenericWriteBackFile {
@@ -302,7 +322,7 @@ const fn generic_language_projection_problem(
 pub(crate) fn build_write_back_candidate(
     stored: &GenericStoredSnapshot,
     live: &GenericInputSnapshot,
-    current_translations: &GenericUnitMap<String>,
+    current_translations: &GenericUnitMap<GenericCurrentTranslation>,
 ) -> Result<GenericWriteBackCandidate, GenericWriteBackError> {
     let placeholder_rules = GenericPlaceholderService::default()
         .compile(Vec::new())
@@ -320,7 +340,7 @@ pub(crate) fn build_write_back_candidate(
 pub(crate) fn build_write_back_candidate_with_cancellation(
     stored: &GenericStoredSnapshot,
     live: &GenericInputSnapshot,
-    current_translations: &GenericUnitMap<String>,
+    current_translations: &GenericUnitMap<GenericCurrentTranslation>,
     placeholder_rules: &GenericCompiledPlaceholderRules,
     cancellation: &CooperativeCancellation,
 ) -> Result<GenericWriteBackCandidate, GenericWriteBackError> {
@@ -389,7 +409,7 @@ struct BuiltWriteBackFile {
 fn build_write_back_file(
     stored_file: &super::project::GenericStoredFile,
     live_file: &GenericFile,
-    translations: &GenericUnitMap<String>,
+    translations: &GenericUnitMap<GenericCurrentTranslation>,
     placeholder_rules: &GenericCompiledPlaceholderRules,
     cancellation: &CooperativeCancellation,
 ) -> Result<BuiltWriteBackFile, GenericWriteBackError> {
@@ -431,30 +451,36 @@ fn build_write_back_file(
             cancellation,
         )?;
         let mut output_units = Vec::with_capacity(live_group.units().len());
-        for unit in live_group.units() {
+        for (unit_ordinal, unit) in live_group.units().iter().enumerate() {
             ensure_write_back_text_running(unit.text(), cancellation)?;
             let translation =
                 translations.get_parts_with_cancellation(live_group.id(), unit.id(), || {
                     ensure_write_back_running(cancellation)
                 })?;
             let text = if let Some(translation) = translation {
-                ensure_write_back_text_running(translation, cancellation)?;
+                ensure_write_back_text_running(translation.text(), cancellation)?;
                 translated_units += 1;
-                let context = GenericWriteBackUnitContext {
-                    relative_path: live_file.relative_path(),
-                    group_id: live_group.id(),
-                    unit_id: unit.id(),
-                    kind: live_group.kind(),
-                };
-                let repaired = repair_translation_symbols(
-                    &context,
-                    unit.text(),
-                    translation,
-                    placeholder_rules,
-                    cancellation,
-                )?;
-                symbol_repair.add_assign(repaired.statistics);
-                repaired.text
+                if translation.is_manual() {
+                    Cow::Borrowed(translation.text())
+                } else {
+                    let context = GenericWriteBackUnitContext {
+                        relative_path: live_file.relative_path(),
+                        group_id: live_group.id(),
+                        unit_id: unit.id(),
+                        kind: live_group.kind(),
+                        line: group_ordinal + 1,
+                        unit: unit_ordinal + 1,
+                    };
+                    let repaired = repair_translation_symbols(
+                        &context,
+                        unit.text(),
+                        translation.text(),
+                        placeholder_rules,
+                        cancellation,
+                    )?;
+                    symbol_repair.add_assign(repaired.statistics);
+                    repaired.text
+                }
             } else {
                 retained_source_units += 1;
                 Cow::Borrowed(unit.text())
@@ -485,6 +511,8 @@ struct GenericWriteBackUnitContext<'unit> {
     group_id: &'unit str,
     unit_id: &'unit str,
     kind: &'unit str,
+    line: usize,
+    unit: usize,
 }
 
 impl GenericWriteBackUnitContext<'_> {
@@ -495,6 +523,7 @@ impl GenericWriteBackUnitContext<'_> {
             self.unit_id,
             Some(self.kind),
         )
+        .with_natural_position(self.line, self.unit)
     }
 }
 
@@ -944,9 +973,7 @@ mod tests {
 
     use crate::fingerprint::Sha256Fingerprint;
     use crate::generic::placeholder::GenericPlaceholderRuleDefinition;
-    use crate::generic::project::{
-        GenericInitRequest, GenericProjectStore, TranslationOrigin, TranslationWrite,
-    };
+    use crate::generic::project::{GenericInitRequest, GenericProjectStore, TranslationWrite};
     use crate::language::LanguageId;
 
     use super::*;
@@ -988,7 +1015,6 @@ mod tests {
                     expected_source_text: unit.source_text().to_owned(),
                     expected_group_context: group.context_fingerprint(),
                     translation: "译文\n第二行".to_owned(),
-                    origin: TranslationOrigin::Automatic,
                     state_fingerprint: Sha256Fingerprint::from_bytes([9; 32]),
                     expected_translation: None,
                 }],
@@ -1000,7 +1026,7 @@ mod tests {
         let previous = current_translations
             .insert_with_cancellation(
                 GenericUnitKey::new("g".to_owned(), "a".to_owned()),
-                "译文\n第二行".to_owned(),
+                GenericCurrentTranslation::new("译文\n第二行".to_owned(), false),
                 || Ok::<_, std::convert::Infallible>(()),
             )
             .unwrap_or_else(|never| match never {});
@@ -1065,7 +1091,7 @@ mod tests {
         translations
             .insert_with_cancellation(
                 GenericUnitKey::new("g".to_owned(), "u".to_owned()),
-                "常规、杂项、声音、开关".to_owned(),
+                GenericCurrentTranslation::new("常规、杂项、声音、开关".to_owned(), false),
                 || Ok::<_, std::convert::Infallible>(()),
             )
             .unwrap_or_else(|never| match never {});
@@ -1116,7 +1142,7 @@ mod tests {
         translations
             .insert_with_cancellation(
                 GenericUnitKey::new("g".to_owned(), "u".to_owned()),
-                "打开 [A,B]、现在。".to_owned(),
+                GenericCurrentTranslation::new("打开 [A,B]、现在。".to_owned(), false),
                 || Ok::<_, std::convert::Infallible>(()),
             )
             .unwrap_or_else(|never| match never {});
@@ -1170,7 +1196,7 @@ mod tests {
         translations
             .insert_with_cancellation(
                 GenericUnitKey::new("g".to_owned(), "u".to_owned()),
-                "<msg>常规、杂项</msg>".to_owned(),
+                GenericCurrentTranslation::new("<msg>常规、杂项</msg>".to_owned(), false),
                 || Ok::<_, std::convert::Infallible>(()),
             )
             .unwrap_or_else(|never| match never {});
@@ -1224,7 +1250,7 @@ mod tests {
         translations
             .insert_with_cancellation(
                 GenericUnitKey::new("g".to_owned(), "u".to_owned()),
-                "[常规、杂项]".to_owned(),
+                GenericCurrentTranslation::new("[常规、杂项]".to_owned(), false),
                 || Ok::<_, std::convert::Infallible>(()),
             )
             .unwrap_or_else(|never| match never {});

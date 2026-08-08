@@ -2734,7 +2734,7 @@ mod directory_stage_tests {
     fn published_residual_wire_keeps_output_residual_and_cleanup_relation() {
         let error = DirectoryPublishError::PublishedWithResiduals {
             target_root: PathBuf::from("D:/output/game"),
-            residual_path: PathBuf::from("D:/output/.directory-publish-game.backup"),
+            residual_path: PathBuf::from("D:/output/.directory-publish/game/backup"),
             source: TestError("must not enter wire"),
         };
 
@@ -2752,7 +2752,7 @@ mod directory_stage_tests {
                             "problem": {
                                 "kind": "published_finalization_failed",
                                 "output_root": "D:/output/game",
-                                "residual_path": "D:/output/.directory-publish-game.backup",
+                                "residual_path": "D:/output/.directory-publish/game/backup",
                                 "cause": {
                                     "diagnostic": {
                                         "code": "filesystem.executor_closed",
@@ -2788,7 +2788,7 @@ mod directory_stage_tests {
             target_root: PathBuf::from("D:/output/game"),
             source: TestError("publish failed"),
             cleanup_failure: Some(StagingCleanupFailure::new(
-                PathBuf::from("D:/output/.directory-publish-game.stage"),
+                PathBuf::from("D:/output/.directory-publish/game/stage"),
                 TestError("cleanup failed"),
             )),
         };
@@ -2808,7 +2808,7 @@ mod directory_stage_tests {
         );
         assert_eq!(
             value["related"][0]["report"]["primary"]["issue"]["details"]["problem"]["residual_path"],
-            "D:/output/.directory-publish-game.stage"
+            "D:/output/.directory-publish/game/stage"
         );
         assert_eq!(
             value["related"][0]["report"]["primary"]["issue"]["details"]["problem"]["cause"]["diagnostic"]

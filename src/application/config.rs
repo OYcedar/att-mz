@@ -25,8 +25,9 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use super::arguments::{
-    ExtractArguments, GenericCommand, GenericInitArguments, InitArguments, MvCommand, MzCommand,
-    ProductCommand, ProjectLuaArguments, TranslateArguments, WriteBackArguments,
+    ExtractArguments, GenericCommand, GenericInitArguments, InitArguments, ManualArguments,
+    ManualCommand, MvCommand, MzCommand, ProductCommand, ProjectLuaArguments, TranslateArguments,
+    WriteBackArguments,
 };
 
 use crate::diagnostic::{
@@ -37,6 +38,7 @@ use crate::language::{
     JapaneseLanguageModule, JapaneseResidualPolicy, LanguageId, LanguageIdError, LanguageModule,
     LanguageModuleCatalog, LanguageModuleCatalogBuildError, LanguagePolicyConfigurationError,
 };
+use crate::manual::ManualOperation;
 use crate::project_name::ProjectName;
 use crate::rpg_maker::RpgMakerLayout;
 use crate::rpg_maker::extract::document::RpgMakerDocumentReadingConfig;
@@ -225,6 +227,7 @@ fn normalize_mv_command(command: MvCommand) -> (RpgMakerCommandArguments, Option
         ),
         MvCommand::Translate(arguments) => (RpgMakerCommandArguments::Translate(arguments), None),
         MvCommand::WriteBack(arguments) => (RpgMakerCommandArguments::WriteBack(arguments), None),
+        MvCommand::Manual { command } => (RpgMakerCommandArguments::Manual(command), None),
         MvCommand::Lua(arguments) => (RpgMakerCommandArguments::Lua(arguments), None),
     }
 }
@@ -234,6 +237,7 @@ enum RpgMakerCommandArguments {
     Extract(ExtractArguments),
     Translate(TranslateArguments),
     WriteBack(WriteBackArguments),
+    Manual(ManualCommand),
     Lua(ProjectLuaArguments),
 }
 
@@ -244,6 +248,7 @@ impl From<MzCommand> for RpgMakerCommandArguments {
             MzCommand::Extract(arguments) => Self::Extract(arguments),
             MzCommand::Translate(arguments) => Self::Translate(arguments),
             MzCommand::WriteBack(arguments) => Self::WriteBack(arguments),
+            MzCommand::Manual { command } => Self::Manual(command),
             MzCommand::Lua(arguments) => Self::Lua(arguments),
         }
     }
@@ -255,6 +260,7 @@ pub(crate) enum ConfiguredRpgMakerCommand {
     Extract(ConfiguredExtractCommand),
     Translate(Box<ConfiguredTranslateCommand>),
     WriteBack(ConfiguredWriteBackCommand),
+    Manual(ConfiguredManualCommand),
     Lua(ConfiguredProjectLuaCommand),
 }
 
@@ -378,7 +384,30 @@ impl ConfiguredRpgMakerCommand {
                     rpg_maker,
                 }))
             }
+            RpgMakerCommandArguments::Manual(command) => {
+                let raw: RawManualSelection = parse_selected(
+                    source,
+                    configuration_path,
+                    toml_index.as_ref(),
+                    ConfigurationSelection::Languages,
+                )?;
+                let language_modules = build_language_modules(raw.languages)
+                    .map_err(ConfigurationLoadError::InvalidValue)?;
+                Ok(Self::Manual(ConfiguredManualCommand::new(
+                    command,
+                    common,
+                    language_modules,
+                )))
+            }
             RpgMakerCommandArguments::Lua(arguments) => {
+                let raw: RawManualSelection = parse_selected(
+                    source,
+                    configuration_path,
+                    toml_index.as_ref(),
+                    ConfigurationSelection::Languages,
+                )?;
+                let language_modules = build_language_modules(raw.languages)
+                    .map_err(ConfigurationLoadError::InvalidValue)?;
                 let ProjectLuaArguments {
                     project,
                     script,
@@ -389,6 +418,7 @@ impl ConfiguredRpgMakerCommand {
                     common,
                     script: ConfiguredProjectLuaScript::new(script),
                     arguments,
+                    language_modules,
                 }))
             }
         }
@@ -407,7 +437,59 @@ pub(crate) enum ConfiguredGenericCommand {
     },
     Translate(Box<ConfiguredTranslateCommand>),
     WriteBack(ConfiguredGenericWriteBackCommand),
+    Manual(ConfiguredManualCommand),
     Lua(ConfiguredProjectLuaCommand),
+}
+
+/// Manual 只读取当前语言模块，不构造模型、Prompt、术语或执行 Profile。
+pub(crate) struct ConfiguredManualCommand {
+    operation: ManualOperation,
+    project_name: ProjectName,
+    file: PathBuf,
+    common: CommonCommandConfiguration,
+    language_modules: LanguageModuleCatalog,
+}
+
+impl ConfiguredManualCommand {
+    fn new(
+        command: ManualCommand,
+        common: CommonCommandConfiguration,
+        language_modules: LanguageModuleCatalog,
+    ) -> Self {
+        let (operation, arguments) = match command {
+            ManualCommand::Export(arguments) => (ManualOperation::Export, arguments),
+            ManualCommand::Check(arguments) => (ManualOperation::Check, arguments),
+            ManualCommand::Apply(arguments) => (ManualOperation::Apply, arguments),
+        };
+        let ManualArguments { project, file } = arguments;
+        Self {
+            operation,
+            project_name: project.name,
+            file,
+            common,
+            language_modules,
+        }
+    }
+
+    pub(crate) const fn operation(&self) -> ManualOperation {
+        self.operation
+    }
+
+    pub(crate) const fn project_name(&self) -> &ProjectName {
+        &self.project_name
+    }
+
+    pub(crate) fn file(&self) -> &Path {
+        &self.file
+    }
+
+    pub(crate) const fn common(&self) -> &CommonCommandConfiguration {
+        &self.common
+    }
+
+    pub(crate) const fn language_modules(&self) -> &LanguageModuleCatalog {
+        &self.language_modules
+    }
 }
 
 impl ConfiguredGenericCommand {
@@ -509,7 +591,30 @@ impl ConfiguredGenericCommand {
                     )),
                 }))
             }
+            GenericCommand::Manual { command } => {
+                let raw: RawManualSelection = parse_selected(
+                    source,
+                    configuration_path,
+                    toml_index.as_ref(),
+                    ConfigurationSelection::Languages,
+                )?;
+                let language_modules = build_language_modules(raw.languages)
+                    .map_err(ConfigurationLoadError::InvalidValue)?;
+                Ok(Self::Manual(ConfiguredManualCommand::new(
+                    command,
+                    common,
+                    language_modules,
+                )))
+            }
             GenericCommand::Lua(arguments) => {
+                let raw: RawManualSelection = parse_selected(
+                    source,
+                    configuration_path,
+                    toml_index.as_ref(),
+                    ConfigurationSelection::Languages,
+                )?;
+                let language_modules = build_language_modules(raw.languages)
+                    .map_err(ConfigurationLoadError::InvalidValue)?;
                 let ProjectLuaArguments {
                     project,
                     script,
@@ -520,6 +625,7 @@ impl ConfiguredGenericCommand {
                     common,
                     script: ConfiguredProjectLuaScript::new(script),
                     arguments,
+                    language_modules,
                 }))
             }
         }
@@ -801,6 +907,7 @@ pub(crate) struct ConfiguredProjectLuaCommand {
     common: CommonCommandConfiguration,
     script: ConfiguredProjectLuaScript,
     arguments: Vec<String>,
+    language_modules: LanguageModuleCatalog,
 }
 
 impl ConfiguredProjectLuaCommand {
@@ -818,6 +925,10 @@ impl ConfiguredProjectLuaCommand {
 
     pub(crate) fn arguments(&self) -> &[String] {
         &self.arguments
+    }
+
+    pub(crate) const fn language_modules(&self) -> &LanguageModuleCatalog {
+        &self.language_modules
     }
 }
 
@@ -1986,6 +2097,7 @@ impl Error for ConfigurationValueError {}
 #[derive(Clone, Copy)]
 enum ConfigurationSelection {
     NoAdditionalFields,
+    Languages,
     Translate,
     SelectedProfile(usize),
 }
@@ -2258,6 +2370,7 @@ impl ConfigurationTomlIndex {
     ) -> Result<(), ConfigurationLoadError> {
         match selection {
             ConfigurationSelection::NoAdditionalFields => {}
+            ConfigurationSelection::Languages => self.validate_languages(source, path)?,
             ConfigurationSelection::Translate => self.validate_translate(source, path)?,
             ConfigurationSelection::SelectedProfile(occurrence) => {
                 for field in ConfigurationFieldContract::PROFILE_REQUIRED_FIELDS {
@@ -2315,6 +2428,30 @@ impl ConfigurationTomlIndex {
             )?;
         }
 
+        self.validate_languages(source, path)?;
+
+        let profile_tables = self.table_occurrences(&["translation", "profiles"]);
+        if profile_tables.is_empty() {
+            return Err(self.missing_field(
+                source,
+                path,
+                &["translation", "profiles"],
+                None,
+                ConfigurationTomlValueKind::TableArray,
+            ));
+        }
+        for occurrence in profile_tables {
+            self.require_contract_field(
+                source,
+                path,
+                &["translation", "profiles", "id"],
+                Some(occurrence),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn validate_languages(&self, source: &str, path: &Path) -> Result<(), ConfigurationLoadError> {
         let language_tables = self.table_occurrences(&["languages"]);
         if language_tables.is_empty() {
             return Err(self.missing_field(
@@ -2337,25 +2474,6 @@ impl ConfigurationTomlIndex {
                     Some(occurrence),
                 )?;
             }
-        }
-
-        let profile_tables = self.table_occurrences(&["translation", "profiles"]);
-        if profile_tables.is_empty() {
-            return Err(self.missing_field(
-                source,
-                path,
-                &["translation", "profiles"],
-                None,
-                ConfigurationTomlValueKind::TableArray,
-            ));
-        }
-        for occurrence in profile_tables {
-            self.require_contract_field(
-                source,
-                path,
-                &["translation", "profiles", "id"],
-                Some(occurrence),
-            )?;
         }
         Ok(())
     }
@@ -3211,7 +3329,10 @@ where
     T: serde::de::DeserializeOwned,
 {
     index.validate_selection(source, path, selection)?;
-    if matches!(selection, ConfigurationSelection::Translate) {
+    if matches!(
+        selection,
+        ConfigurationSelection::Languages | ConfigurationSelection::Translate
+    ) {
         let discriminators: RawLanguageDiscriminatorSelection =
             toml::from_str(source).map_err(|error| invalid_toml(path, source, index, &error))?;
         let language_types = discriminators
@@ -3950,6 +4071,18 @@ struct RawWriteBackSelection {
     _prompts: Option<IgnoredAny>,
     #[serde(default, rename = "languages")]
     _languages: Option<IgnoredAny>,
+    #[serde(default, rename = "translation")]
+    _translation: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawManualSelection {
+    languages: Vec<RawLanguageConfiguration>,
+    #[serde(default, rename = "llm")]
+    _llm: Option<IgnoredAny>,
+    #[serde(default, rename = "prompts")]
+    _prompts: Option<IgnoredAny>,
     #[serde(default, rename = "translation")]
     _translation: Option<IgnoredAny>,
 }
@@ -5171,35 +5304,21 @@ api_key = "{API_KEY}" "invalid"
         panic!("测试配置应包含 source_echo 布尔字段");
     }
 
-    struct TestDirectory {
-        root: PathBuf,
-    }
+    struct TestDirectory(tempfile::TempDir);
 
     impl TestDirectory {
         fn new() -> Self {
-            let root = std::env::temp_dir().join(format!(
-                "att-config-{}-{}",
-                std::process::id(),
-                uuid::Uuid::new_v4()
-            ));
-            fs::create_dir_all(&root).expect("应创建测试目录");
-            Self { root }
+            Self(tempfile::tempdir().expect("应创建测试目录"))
         }
 
         fn path(&self) -> &Path {
-            &self.root
+            self.0.path()
         }
 
         fn write(&self, name: &str, content: &str) -> PathBuf {
-            let path = self.root.join(name);
+            let path = self.0.path().join(name);
             fs::write(&path, content).expect("应写入测试配置");
             path
-        }
-    }
-
-    impl Drop for TestDirectory {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
         }
     }
 }

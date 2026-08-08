@@ -14,7 +14,6 @@ use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 const PROJECT: &str = "shared";
 const SOURCE_TEXT: &str = "薬草です";
@@ -51,12 +50,257 @@ fn help_exposes_mv_mz_and_generic_as_independent_command_domains() {
 
     for engine in ["mv", "mz", "generic"] {
         let help = run_information_command(temporary.path(), &[engine, "--help"]);
-        for command in ["init", "extract", "translate", "write-back", "lua"] {
+        for command in [
+            "init",
+            "extract",
+            "translate",
+            "write-back",
+            "manual",
+            "lua",
+        ] {
             assert!(
                 help.contains(command),
                 "{engine} 帮助必须列出 {command}：\n{help}"
             );
         }
+    }
+}
+
+#[test]
+fn manual_export_check_and_apply_work_for_mv_and_mz() {
+    for (engine, game_directory) in [("mv", "mv-manual-game"), ("mz", "mz-manual-game")] {
+        let temporary = tempfile::tempdir().expect("应可建立 RPG Maker Manual 测试目录");
+        let root = temporary.path();
+        let game = root.join(game_directory);
+        if engine == "mv" {
+            write_minimal_mv_game(&game);
+        } else {
+            write_minimal_mz_game(&game);
+        }
+        let data = if engine == "mv" {
+            game.join("www/data")
+        } else {
+            game.join("data")
+        };
+        fs::write(
+            data.join("Items.json"),
+            serde_json::to_vec(&json!([
+                null,
+                {
+                    "id": 1,
+                    "name": "回復薬",
+                    "description": "一行目\n二行目"
+                }
+            ]))
+            .expect("Manual Items 夹具应可序列化"),
+        )
+        .expect("Manual Items 夹具应可写入");
+        fs::write(
+            data.join("Map001.json"),
+            serde_json::to_vec(&json!({ "displayName": "", "events": [null] }))
+                .expect("Manual Map 夹具应可序列化"),
+        )
+        .expect("Manual Map 夹具应可写入");
+        write_configuration(root, "http://127.0.0.1:9/v1/chat/completions");
+
+        assert_success(
+            &format!("{engine} Manual Init"),
+            &run_att(root, init_arguments(engine, &game)),
+        );
+        assert_success(
+            &format!("{engine} Manual Extract"),
+            &run_att(
+                root,
+                arguments(&[engine, "extract", "--name", PROJECT, "--builtin"]),
+            ),
+        );
+
+        let manual = root.join(format!("{engine}-manual.toml"));
+        let mut export = arguments(&[engine, "manual", "export", "--name", PROJECT]);
+        export.push(manual.as_os_str().to_owned());
+        assert_success(&format!("{engine} Manual export"), &run_att(root, export));
+        let document = read_manual_toml(&manual);
+        let entries = document["translation"]
+            .as_array()
+            .expect("Manual translation 必须是数组");
+        assert_eq!(entries.len(), 2, "只应导出两个真正需要翻译的条目");
+        let name = find_manual_entry(entries, "Items.json:1:name");
+        assert_eq!(name["type"].as_str(), Some("fixed"));
+        assert_eq!(
+            name["source"].as_array().expect("name source 必须是数组"),
+            &[toml::Value::String("回復薬".to_owned())]
+        );
+        let description = find_manual_entry(entries, "Items.json:1:description");
+        assert_eq!(description["type"].as_str(), Some("free"));
+        assert_eq!(
+            description["source"]
+                .as_array()
+                .expect("description source 必须是数组"),
+            &[
+                toml::Value::String("一行目".to_owned()),
+                toml::Value::String("二行目".to_owned()),
+            ]
+        );
+        for entry in entries {
+            let table = entry.as_table().expect("Manual 条目必须是 table");
+            assert_eq!(table.len(), 4);
+            assert!(
+                table.keys().all(|key| {
+                    matches!(key.as_str(), "id" | "type" | "source" | "translation")
+                })
+            );
+        }
+
+        let mut check = arguments(&[engine, "manual", "check", "--name", PROJECT]);
+        check.push(manual.as_os_str().to_owned());
+        assert_success(
+            &format!("{engine} Manual check 未填写"),
+            &run_att(root, check),
+        );
+
+        set_manual_toml_field(
+            &manual,
+            "Items.json:1:name",
+            "translation",
+            toml::Value::Array(vec![toml::Value::String("恢复药".to_owned())]),
+        );
+        let mut check = arguments(&[engine, "manual", "check", "--name", PROJECT]);
+        check.push(manual.as_os_str().to_owned());
+        assert_success(
+            &format!("{engine} Manual check 混合条目"),
+            &run_att(root, check),
+        );
+        let mut apply = arguments(&[engine, "manual", "apply", "--name", PROJECT]);
+        apply.push(manual.as_os_str().to_owned());
+        assert_success(
+            &format!("{engine} Manual apply 单项"),
+            &run_att(root, apply),
+        );
+
+        let workspace = distribution_root(root)
+            .join("projects")
+            .join(engine)
+            .join(PROJECT);
+        let database = workspace.join("project.db");
+        let connection = Connection::open(&database).expect("Manual 项目数据库应可打开");
+        let count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM rpg_maker_manual_translation",
+                [],
+                |row| row.get(0),
+            )
+            .expect("人工译文数量应可读取");
+        assert_eq!(count, 1);
+        drop(connection);
+
+        set_manual_toml_field(
+            &manual,
+            "Items.json:1:description",
+            "translation",
+            toml::Value::Array(vec![toml::Value::String("合并说明".to_owned())]),
+        );
+        set_manual_toml_field(
+            &manual,
+            "Items.json:1:name",
+            "source",
+            toml::Value::Array(vec![toml::Value::String("错误原文".to_owned())]),
+        );
+        let mut invalid_apply = arguments(&[engine, "manual", "apply", "--name", PROJECT]);
+        invalid_apply.push(manual.as_os_str().to_owned());
+        let invalid = run_att(root, invalid_apply);
+        assert_eq!(invalid.status.code(), Some(1));
+        let stderr = String::from_utf8(invalid.stderr).expect("Manual 错误必须是 UTF-8");
+        assert!(stderr.contains("Items.json:1:name") && stderr.contains("重新运行 manual export"));
+        assert!(!stderr.contains("group_location") && !stderr.contains("unit_role"));
+        let connection = Connection::open(&database).expect("失败后项目数据库应可打开");
+        let count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM rpg_maker_manual_translation",
+                [],
+                |row| row.get(0),
+            )
+            .expect("失败后人工译文数量应可读取");
+        assert_eq!(count, 1, "混合有效与无效条目必须原子失败");
+        drop(connection);
+
+        set_manual_toml_field(
+            &manual,
+            "Items.json:1:name",
+            "source",
+            toml::Value::Array(vec![toml::Value::String("回復薬".to_owned())]),
+        );
+        let mut apply = arguments(&[engine, "manual", "apply", "--name", PROJECT]);
+        apply.push(manual.as_os_str().to_owned());
+        assert_success(
+            &format!("{engine} Manual apply 全部"),
+            &run_att(root, apply),
+        );
+        assert_success(
+            &format!("{engine} Manual WriteBack"),
+            &run_att(root, arguments(&[engine, "write-back", "--name", PROJECT])),
+        );
+        let output = if engine == "mv" {
+            workspace.join("write_back/www/data/Items.json")
+        } else {
+            workspace.join("write_back/data/Items.json")
+        };
+        let items = read_items(&output);
+        assert_eq!(items[1]["name"], "恢复药");
+        assert_eq!(items[1]["description"], "合并说明");
+
+        fs::write(
+            data.join("Items.json"),
+            serde_json::to_vec(&json!([
+                null,
+                {
+                    "id": 1,
+                    "name": "新しい薬",
+                    "description": "一行目\n二行目"
+                }
+            ]))
+            .expect("变化后的 Manual Items 应可序列化"),
+        )
+        .expect("变化后的 Manual Items 应可写入");
+        assert_success(
+            &format!("{engine} Manual 原文变化后 Init"),
+            &run_att(root, init_arguments(engine, &game)),
+        );
+        assert_success(
+            &format!("{engine} Manual 原文变化后 Extract"),
+            &run_att(
+                root,
+                arguments(&[engine, "extract", "--name", PROJECT, "--builtin"]),
+            ),
+        );
+        let after_change_manual = root.join(format!("{engine}-after-change.toml"));
+        let mut after_change_export = arguments(&[engine, "manual", "export", "--name", PROJECT]);
+        after_change_export.push(after_change_manual.as_os_str().to_owned());
+        assert_success(
+            &format!("{engine} Manual 原文变化后 export"),
+            &run_att(root, after_change_export),
+        );
+        let after_change = read_manual_toml(&after_change_manual);
+        let after_change_entries = after_change["translation"]
+            .as_array()
+            .expect("变化后 Manual translation 必须是数组");
+        assert_eq!(after_change_entries.len(), 1);
+        find_manual_entry(after_change_entries, "Items.json:1:name");
+        assert_success(
+            &format!("{engine} Manual 原文变化后 WriteBack"),
+            &run_att(root, arguments(&[engine, "write-back", "--name", PROJECT])),
+        );
+        let items = read_items(&output);
+        assert_eq!(items[1]["name"], "新しい薬");
+        assert_eq!(items[1]["description"], "合并说明");
+        let connection = Connection::open(&database).expect("过期人工译文数据库应可打开");
+        let count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM rpg_maker_manual_translation",
+                [],
+                |row| row.get(0),
+            )
+            .expect("过期人工译文数量应可读取");
+        assert_eq!(count, 2, "过期人工译文必须保留，不能静默删除");
     }
 }
 
@@ -303,22 +547,12 @@ fn same_named_mv_mz_and_generic_projects_remain_isolated_across_real_processes()
 }
 
 #[test]
-fn rpg_maker_write_back_repairs_symbols_for_mv_and_mz_without_language_configuration() {
-    for (engine, game_directory, source_language, configuration) in [
-        ("mz", "mz-game", "en", ""),
-        (
-            "mz",
-            "mz-game",
-            "ja",
-            "[prompts]\nthinking_output = false\nsource_echo = false\n",
-        ),
-        ("mv", "mv-game", "en", ""),
-        (
-            "mv",
-            "mv-game",
-            "ja",
-            "[prompts]\nthinking_output = false\nsource_echo = false\n",
-        ),
+fn rpg_maker_write_back_preserves_manual_symbols_for_mv_and_mz() {
+    for (engine, game_directory, source_language) in [
+        ("mz", "mz-game", "en"),
+        ("mz", "mz-game", "ja"),
+        ("mv", "mv-game", "en"),
+        ("mv", "mv-game", "ja"),
     ] {
         let temporary = tempfile::tempdir().expect("应可建立 RPG Maker 符号修复进程测试目录");
         let root = temporary.path();
@@ -356,10 +590,8 @@ fn rpg_maker_write_back_repairs_symbols_for_mv_and_mz_without_language_configura
             .expect("无文本 MV Map 夹具应可写入");
         }
 
+        write_configuration(root, "http://127.0.0.1:9/v1/chat/completions");
         let distribution = distribution_root(root);
-        fs::create_dir_all(&distribution).expect("应可建立 RPG Maker 符号修复发行目录");
-        fs::write(distribution.join("config.toml"), configuration)
-            .expect("RPG Maker 符号修复配置应可写入");
 
         let mut init = init_arguments(engine, &game);
         let source_language_position = init
@@ -377,30 +609,10 @@ fn rpg_maker_write_back_repairs_symbols_for_mv_and_mz_without_language_configura
         );
 
         let workspace = distribution.join("projects").join(engine).join(PROJECT);
-        let connection =
-            Connection::open(workspace.join("project.db")).expect("项目数据库应可打开");
-        let source_content_json =
-            serde_json::to_string("General, Misc, Audio, Toggle").expect("Categories 原文应可编码");
-        let (owner, group_location, unit_role): (String, String, String) = connection
-            .query_row(
-                "SELECT unit.owner, text_group.group_location, unit.unit_role
-                 FROM rpg_maker_text_unit AS unit
-                 JOIN rpg_maker_text_group AS text_group
-                   ON text_group.owner = unit.owner
-                  AND text_group.group_id = unit.group_id
-                 WHERE unit.source_content_json = ?1",
-                [&source_content_json],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .expect("应定位 Categories Unit");
-        drop(connection);
-
         let script = root.join(format!("set-{engine}-categories.lua"));
         fs::write(
             &script,
-            format!(
-                "ctx.translation.set(\n  {{ owner = [==[{owner}]==], group_location = [==[{group_location}]==], unit_role = [==[{unit_role}]==] }},\n  [==[常规、杂项、声音、开关]==]\n)\n"
-            ),
+            "ctx.translation.set(\"Items.json:1:description\", { \"常规、杂项、声音、开关\" })\n",
         )
         .expect("Categories Lua 脚本应可写入");
         let mut lua_arguments = arguments(&[engine, "lua", "--name", PROJECT]);
@@ -426,8 +638,8 @@ fn rpg_maker_write_back_repairs_symbols_for_mv_and_mz_without_language_configura
         let plain_stdout = stdout.replace(['\u{2068}', '\u{2069}'], "");
         assert!(
             plain_stdout
-                .contains("符号修复：尝试 1 个单元，实际修复 1 个，内部跳过 0 个，替换 3 个符号"),
-            "CLI 必须报告四项符号修复统计：{stdout}"
+                .contains("符号修复：尝试 0 个单元，实际修复 0 个，内部跳过 0 个，替换 0 个符号"),
+            "人工译文不得进入自动符号修复：{stdout}"
         );
 
         let output = if engine == "mv" {
@@ -437,8 +649,8 @@ fn rpg_maker_write_back_repairs_symbols_for_mv_and_mz_without_language_configura
         };
         assert_eq!(
             read_items(&output)[1]["description"],
-            "常规,杂项,声音,开关",
-            "WriteBack 只能替换确定标点，不得补入原文空格"
+            "常规、杂项、声音、开关",
+            "WriteBack 必须原样采用人工译文"
         );
 
         let new_logs = fs::read_dir(&logs)
@@ -449,7 +661,7 @@ fn rpg_maker_write_back_repairs_symbols_for_mv_and_mz_without_language_configura
         assert_eq!(new_logs.len(), 1, "一次 WriteBack 只能新增一份项目日志");
         let publication = read_project_log_records(&new_logs[0])
             .into_iter()
-            .find(|record| record["code"] == "publication.finished")
+            .find(|record| record["event"] == "publication.finished")
             .expect("成功 WriteBack 必须记录 publication.finished");
         assert_eq!(publication["payload"]["result"]["kind"], "published");
         assert_eq!(
@@ -457,15 +669,15 @@ fn rpg_maker_write_back_repairs_symbols_for_mv_and_mz_without_language_configura
             "rpg_maker"
         );
         let summary = &publication["payload"]["result"]["summary"]["summary"];
-        assert_eq!(summary["symbol_repair_attempted_units"], 1);
-        assert_eq!(summary["symbol_repair_repaired_units"], 1);
+        assert_eq!(summary["symbol_repair_attempted_units"], 0);
+        assert_eq!(summary["symbol_repair_repaired_units"], 0);
         assert_eq!(summary["symbol_repair_skipped_units"], 0);
-        assert_eq!(summary["symbol_repair_replacements"], 3);
+        assert_eq!(summary["symbol_repair_replacements"], 0);
     }
 }
 
 #[test]
-fn mz_write_back_rejects_current_with_placeholder_added_after_translation() {
+fn mz_manual_translation_survives_placeholder_configuration_changes() {
     let temporary = tempfile::tempdir().expect("应可建立 MZ Placeholder 重新验收测试目录");
     let root = temporary.path();
     let game = root.join("mz-game");
@@ -483,9 +695,8 @@ fn mz_write_back_rejects_current_with_placeholder_added_after_translation() {
         .expect("Placeholder 重新验收 Items 应可序列化"),
     )
     .expect("Placeholder 重新验收 Items 应可写入");
+    write_configuration(root, "http://127.0.0.1:9/v1/chat/completions");
     let distribution = distribution_root(root);
-    fs::create_dir_all(&distribution).expect("应可建立 MZ Placeholder 重新验收发行目录");
-    fs::write(distribution.join("config.toml"), "").expect("MZ Placeholder 重新验收空配置应可写入");
 
     assert_success(
         "MZ Placeholder 重新验收 Init",
@@ -501,28 +712,10 @@ fn mz_write_back_rejects_current_with_placeholder_added_after_translation() {
 
     let workspace = distribution.join("projects/mz").join(PROJECT);
     let database = workspace.join("project.db");
-    let connection = Connection::open(&database).expect("MZ 项目数据库应可打开");
-    let source_content_json = serde_json::to_string("General, Misc").expect("测试原文应可编码");
-    let (owner, group_location, unit_role): (String, String, String) = connection
-        .query_row(
-            "SELECT unit.owner, text_group.group_location, unit.unit_role
-             FROM rpg_maker_text_unit AS unit
-             JOIN rpg_maker_text_group AS text_group
-               ON text_group.owner = unit.owner
-              AND text_group.group_id = unit.group_id
-             WHERE unit.source_content_json = ?1",
-            [&source_content_json],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .expect("应定位 Placeholder 重新验收 Unit");
-    drop(connection);
-
     let script = root.join("set-placeholder-current.lua");
     fs::write(
         &script,
-        format!(
-            "ctx.translation.set(\n  {{ owner = [==[{owner}]==], group_location = [==[{group_location}]==], unit_role = [==[{unit_role}]==] }},\n  [==[[常规、杂项]]==]\n)\n"
-        ),
+        "ctx.translation.set(\"Items.json:1:description\", { \"[常规、杂项]\" })\n",
     )
     .expect("新增 Placeholder 的 Current Lua 应可写入");
     let mut lua_arguments = arguments(&["mz", "lua", "--name", PROJECT]);
@@ -548,31 +741,11 @@ fn mz_write_back_rejects_current_with_placeholder_added_after_translation() {
     );
 
     let write_back = run_att(root, arguments(&["mz", "write-back", "--name", PROJECT]));
-    assert_eq!(write_back.status.code(), Some(1));
-    let stdout = String::from_utf8(write_back.stdout).expect("WriteBack stdout 必须是 UTF-8");
-    assert!(
-        !stdout.contains("符号修复"),
-        "Placeholder 验收失败不得伪报符号修复汇总：{stdout}"
-    );
-    let stderr = String::from_utf8(write_back.stderr).expect("WriteBack stderr 必须是 UTF-8");
-    for expected in [
-        "translation.placeholder.changed_segment_count",
-        "owner=builtin",
-        "group_kind=database_entry",
-        "role=scalar:description",
-        "rule_source=project_snapshot",
-        "expected=0",
-        "actual=1",
-        "状态未改变",
-    ] {
-        assert!(
-            stderr.contains(expected),
-            "WriteBack Placeholder 失败必须保留 {expected:?}：{stderr}"
-        );
-    }
-    assert!(
-        !workspace.join("write_back/data/Items.json").exists(),
-        "Placeholder 验收失败不得生成目标 Items.json"
+    assert_success("MZ Placeholder 变化后 WriteBack", &write_back);
+    assert_eq!(
+        read_items(&workspace.join("write_back/data/Items.json"))[1]["description"],
+        "[常规、杂项]",
+        "Placeholder 配置变化不能使人工译文失效或改写正文"
     );
 }
 
@@ -825,50 +998,47 @@ fn mz_translate_keeps_applied_translation_when_run_plan_transaction_rolls_back()
     let translation_finished = records
         .iter()
         .position(|record| {
-            record["code"] == "translation.finished"
+            record["event"] == "translation.finished"
                 && record["payload"]["result"]["kind"] == "complete"
         })
         .expect("RunPlan 保存前必须先记录完整翻译业务终态");
     let run_plan_diagnostic = records
         .iter()
-        .position(|record| record["code"] == "diagnostic.run_plan")
-        .expect("RunPlan 回滚必须形成独立 occurrence");
-    let diagnostic = records[run_plan_diagnostic]["payload"]["id"]
-        .as_u64()
-        .expect("RunPlan occurrence ID 必须为正整数");
+        .position(|record| record["event"] == "diagnostic.run_plan")
+        .expect("RunPlan 回滚必须形成独立诊断");
     assert!(
         translation_finished < run_plan_diagnostic,
         "翻译业务终态必须先于 RunPlan 持久化失败"
     );
-    assert_eq!(
-        records[run_plan_diagnostic]["payload"]["report"]["effect"],
-        "applied_run_plan_not_saved"
-    );
-    assert_eq!(
-        records[run_plan_diagnostic]["payload"]["report"]["primary"]["stage"],
-        "run_plan_finalization"
-    );
-    assert_eq!(
-        records[run_plan_diagnostic]["payload"]["report"]["primary"]["issue"]["family"],
-        "sqlite"
-    );
+    let diagnostic = records[run_plan_diagnostic]["payload"]
+        .as_object()
+        .expect("RunPlan 诊断 payload 必须是对象");
+    assert_eq!(diagnostic.len(), 3);
+    for field in ["object", "reason", "help"] {
+        assert!(
+            diagnostic[field]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "RunPlan 诊断 {field} 必须是非空可读文本"
+        );
+    }
     let finalized = records
         .iter()
-        .find(|record| record["code"] == "run_plan.finalized")
+        .find(|record| record["event"] == "run_plan.finalized")
         .expect("RunPlan 回滚必须写入最终化事件");
     assert_eq!(finalized["payload"]["result"]["kind"], "not_saved");
     assert_eq!(finalized["payload"]["result"]["transaction"], "rolled_back");
     assert_eq!(finalized["payload"]["result"]["run_continues"], false);
-    assert_eq!(finalized["payload"]["result"]["diagnostic"], diagnostic);
+    assert!(finalized["payload"]["result"].get("diagnostic").is_none());
     assert!(
         records.iter().all(|record| {
-            !(record["code"] == "run_plan.finalized"
+            !(record["event"] == "run_plan.finalized"
                 && record["payload"]["result"]["kind"] == "saved")
         }),
         "回滚路径不得同时伪报 RunPlan 已保存"
     );
     let terminal = records.last().expect("运行日志必须有唯一终态");
-    assert_eq!(terminal["code"], "run.finished");
+    assert_eq!(terminal["event"], "run.finished");
     assert_eq!(terminal["payload"]["result"]["kind"], "failed");
 }
 
@@ -1121,20 +1291,28 @@ fn generic_source_placeholder_failure_sends_no_incomplete_task_block() {
     );
     let stderr = String::from_utf8(output.stderr).expect("Generic 失败诊断必须是 UTF-8");
     for expected in [
-        "translation.placeholder.overlapping_matches",
-        "relative_path=story.jsonl",
-        "group_id=scene",
-        "unit_id=broken",
-        "first_rule_number=1",
-        "second_rule_number=2",
-        "first_range=19..25",
-        "second_range=19..25",
-        "状态未改变",
+        "story.jsonl:line1:unit2:text",
+        "Rules 模式产生了相互重叠的文本捕获",
         "修正指出的 Placeholder 规则后重试",
     ] {
         assert!(
             stderr.contains(expected),
             "命令必须保留现有的规划失败语义 {expected:?}：{stderr}"
+        );
+    }
+    for internal in [
+        "translation.placeholder",
+        "relative_path=",
+        "group_id=",
+        "unit_id=",
+        "first_rule_number=",
+        "second_rule_number=",
+        "first_range=",
+        "second_range=",
+    ] {
+        assert!(
+            !stderr.contains(internal),
+            "公开诊断不得显示内部字段 {internal:?}：{stderr}"
         );
     }
 }
@@ -1205,7 +1383,7 @@ fn task_record_write_failure_warns_once_without_changing_translate_success() {
                 .map(|line| serde_json::from_str::<Value>(line).expect("日志行应为 JSON"))
                 .collect::<Vec<_>>()
         })
-        .filter(|record| record["code"] == "diagnostic.task_record")
+        .filter(|record| record["event"] == "diagnostic.task_record")
         .collect::<Vec<_>>();
     assert!(
         !task_record_failures.is_empty(),
@@ -1214,7 +1392,16 @@ fn task_record_write_failure_warns_once_without_changing_translate_success() {
     assert!(task_record_failures.iter().all(|record| {
         record["context"]["command"] == "translate"
             && record["level"] == "warn"
-            && record["payload"]["report"]["primary"]["stage"] == "logging"
+            && record["payload"]["object"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+            && record["payload"]["reason"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+            && record["payload"]["help"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+            && record["payload"].get("report").is_none()
     }));
 }
 
@@ -1613,8 +1800,8 @@ fn generic_reextract_preserves_moves_and_rejects_unextracted_changes() {
         &override_script,
         r#"assert(ctx.project.engine == "generic")
 ctx.translation.set(
-  { group_id = assert(arg[1]), unit_id = assert(arg[2]) },
-  assert(arg[3])
+  assert(arg[1]),
+  { assert(arg[2]), assert(arg[3]) }
 )
 "#,
     )
@@ -1622,7 +1809,7 @@ ctx.translation.set(
     let mut lua_arguments = arguments(&["generic", "lua", "--name", PROJECT]);
     lua_arguments.push(override_script.into_os_string());
     lua_arguments.push("--".into());
-    lua_arguments.extend(arguments(&["scene-1", "line-1", GENERIC_REVISION]));
+    lua_arguments.extend(arguments(&["story.jsonl:line1:unit1:text", "您好", "世界"]));
     assert_success("Generic Lua 精确修订", &run_att(root, lua_arguments));
     assert_success(
         "Generic 多种 Current 收敛",
@@ -1663,8 +1850,8 @@ ctx.translation.set(
     let moved_output = workspace.join("write_back/nested/moved.jsonl");
     assert_eq!(
         read_generic_texts(&moved_output),
-        vec![GENERIC_REVISION.to_owned(), GENERIC_TRANSLATION.to_owned()],
-        "只移动文件并改变等价 JSON 书写不得清除人工译文"
+        vec![GENERIC_SOURCE.to_owned(), GENERIC_TRANSLATION.to_owned()],
+        "所属文件变化后人工译文应保留为过期快照，WriteBack 不再使用"
     );
     assert!(
         !first_output.exists(),
@@ -1682,7 +1869,7 @@ ctx.translation.set(
     );
     assert_eq!(
         read_generic_texts(&moved_output),
-        vec![GENERIC_REVISION.to_owned(), GENERIC_TRANSLATION.to_owned()],
+        vec![GENERIC_SOURCE.to_owned(), GENERIC_TRANSLATION.to_owned()],
         "拒绝过期 WriteBack 时必须保留上次成功输出"
     );
 
@@ -1754,10 +1941,22 @@ fn generic_lua_syntax_failure_is_logged_and_reported_before_project_open() {
 
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8(output.stderr).expect("stderr 必须是 UTF-8");
-    assert!(
-        stderr.contains("lua.compilation") && !stderr.contains("near '='"),
-        "语法诊断必须显示稳定 Lua 编译代码，且不得泄露后端动态正文：{stderr}"
-    );
+    for expected in [
+        "compile_script",
+        "Lua 主程序编译失败",
+        "修正指出的输入后重试",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "Lua 语法诊断缺少 {expected:?}：{stderr}"
+        );
+    }
+    for internal in ["lua.compilation", "near '='"] {
+        assert!(
+            !stderr.contains(internal),
+            "Lua 语法诊断不得显示内部信息 {internal:?}：{stderr}"
+        );
+    }
 
     let logs = distribution_root(root)
         .join("projects/generic")
@@ -1778,42 +1977,29 @@ fn generic_lua_syntax_failure_is_logged_and_reported_before_project_open() {
         .map(|line| serde_json::from_str::<Value>(line).expect("项目日志行必须是 JSON"))
         .collect::<Vec<_>>();
     assert!(
-        records.iter().any(|record| record["code"] == "lua.script"),
-        "语法失败日志必须保存脚本身份和哈希"
+        records
+            .iter()
+            .all(|record| { record["event"] != "lua.script" && record["event"] != "lua.summary" }),
+        "Lua 日志不得保存脚本哈希或无实际作用的摘要"
     );
-    let summaries = records
-        .iter()
-        .filter(|record| record["code"] == "lua.summary")
-        .collect::<Vec<_>>();
-    assert_eq!(summaries.len(), 1, "语法失败必须且只能写入一条 Lua 摘要");
-    let summary = summaries[0];
-    for field in [
-        "database_calls",
-        "changed_rows",
-        "translation_calls",
-        "printed_lines",
-    ] {
-        assert_eq!(summary["payload"][field], 0, "{field} 必须明确记录为零");
-    }
     let failure = records
         .iter()
-        .find(|record| record["code"] == "diagnostic.run")
+        .find(|record| record["event"] == "diagnostic.run")
         .expect("语法失败日志必须保存主错误");
-    assert_eq!(
-        failure["payload"]["report"]["primary"]["code"],
-        "lua.compilation"
-    );
-    assert_eq!(
-        failure["payload"]["report"]["primary"]["issue"]["family"],
-        "lua"
-    );
-    assert_eq!(
-        failure["payload"]["report"]["primary"]["issue"]["details"]["problem"]["kind"],
-        "compilation"
-    );
+    let failure_payload = failure["payload"]
+        .as_object()
+        .expect("Lua 失败诊断 payload 必须是对象");
+    assert_eq!(failure_payload.len(), 3);
+    for field in ["object", "reason", "help"] {
+        assert!(
+            failure_payload[field]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+    }
     assert!(
         records.iter().any(|record| {
-            record["code"] == "run.finished" && record["payload"]["result"]["kind"] == "failed"
+            record["event"] == "run.finished" && record["payload"]["result"]["kind"] == "failed"
         }),
         "语法失败日志必须写入明确终态"
     );
@@ -1843,30 +2029,16 @@ fn generic_lua_syntax_failure_is_logged_and_reported_before_project_open() {
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("项目打开失败日志行必须是 JSON"))
         .collect::<Vec<_>>();
-    let project_open_summaries = project_open_records
-        .iter()
-        .filter(|record| record["code"] == "lua.summary")
-        .collect::<Vec<_>>();
-    assert_eq!(
-        project_open_summaries.len(),
-        1,
-        "预检成功但项目打开失败时必须且只能写入一条零调用摘要"
+    assert!(
+        project_open_records
+            .iter()
+            .all(|record| { record["event"] != "lua.script" && record["event"] != "lua.summary" }),
+        "项目打开失败也不得生成 Lua 脚本哈希或摘要"
     );
-    for field in [
-        "database_calls",
-        "changed_rows",
-        "translation_calls",
-        "printed_lines",
-    ] {
-        assert_eq!(
-            project_open_summaries[0]["payload"][field], 0,
-            "项目打开失败时 {field} 必须为零"
-        );
-    }
 }
 
 #[test]
-fn mv_lua_noop_ignores_placeholder_planning_failure_without_current() {
+fn mv_lua_noop_does_not_validate_or_repair_translation_business_state() {
     let temporary = tempfile::tempdir().expect("应可建立 MV Lua 规划失败回归测试目录");
     let root = temporary.path();
     let game = root.join("mv-game");
@@ -1966,30 +2138,33 @@ fn mv_lua_noop_ignores_placeholder_planning_failure_without_current() {
     );
     drop(connection);
 
-    let mut failing_arguments = arguments(&["mv", "lua", "--name", PROJECT]);
-    failing_arguments.push(script.into_os_string());
-    let failure = run_att(root, failing_arguments);
-    assert_eq!(failure.status.code(), Some(1));
-    let stderr = String::from_utf8(failure.stderr).expect("MV Lua 失败诊断必须是 UTF-8");
-    for expected in [
-        "lua.host_call".to_owned(),
-        "engine=mv".to_owned(),
-        "translation.placeholder.overlapping_matches".to_owned(),
-        "owner=builtin".to_owned(),
-        format!("group_location={group_location}"),
-        format!("unit_role={unit_role}"),
-        "first_rule_number=1".to_owned(),
-        "second_rule_number=2".to_owned(),
-    ] {
-        assert!(
-            stderr.contains(&expected),
-            "MV Lua 捕获失败必须保留 {expected:?}：{stderr}"
-        );
-    }
+    let mut second_arguments = arguments(&["mv", "lua", "--name", PROJECT]);
+    second_arguments.push(script.into_os_string());
+    assert_success(
+        "实际 att.exe 不得在脚本结束时验证或修复业务状态",
+        &run_att(root, second_arguments),
+    );
+    let connection = Connection::open(&database).expect("MV 项目数据库应可再次打开");
+    let persisted: (String, Vec<u8>) = connection
+        .query_row(
+            "SELECT translation_content_json, translation_state
+             FROM rpg_maker_text_unit
+             WHERE owner = ?1
+               AND group_id = (
+                   SELECT group_id FROM rpg_maker_text_group
+                   WHERE owner = ?1 AND group_location = ?2
+               )
+               AND unit_role = ?3",
+            (&owner, &group_location, &unit_role),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("Lua 不得删除或修复测试写入的乱码状态");
+    assert_eq!(persisted.0, serde_json::to_string("测试译文").unwrap());
+    assert_eq!(persisted.1, vec![0xa5_u8; 32]);
 }
 
 #[test]
-fn mv_lua_clear_trusts_unchanged_current_with_additional_custom_placeholder_bytes() {
+fn mv_lua_high_level_api_uses_readable_ids_and_raw_sql_can_bypass_it() {
     let temporary = tempfile::tempdir().expect("应可建立 MV Lua 全量清理端到端测试目录");
     let root = temporary.path();
     let game = root.join("mv-game");
@@ -2028,265 +2203,110 @@ fn mv_lua_clear_trusts_unchanged_current_with_additional_custom_placeholder_byte
 
     let workspace = distribution_root(root).join("projects/mv").join(PROJECT);
     let database = workspace.join("project.db");
-    let connection = Connection::open(&database).expect("MV 项目数据库应可打开");
-    let mut statement = connection
-        .prepare(
-            "SELECT unit.owner, text_group.group_location, unit.unit_role, unit.source_content_json
-             FROM rpg_maker_text_unit AS unit
-             JOIN rpg_maker_text_group AS text_group
-               ON text_group.owner = unit.owner
-              AND text_group.group_id = unit.group_id
-             ORDER BY unit.owner, text_group.group_location, unit.unit_role",
-        )
-        .expect("MV Unit locator 查询应可准备");
-    let placeholder_units = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })
-        .expect("MV Unit locator 查询应可执行")
-        .map(|row| row.expect("MV Unit locator 应可读取"))
-        .filter(|(_, _, _, source)| {
-            serde_json::from_str::<Value>(source)
-                .expect("MV Unit source 必须是规范 JSON")
-                .as_str()
-                .is_some_and(|source| source.matches('\n').count() == 1)
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        placeholder_units.len(),
-        2,
-        "测试夹具必须且只能提取两个含单个 LF 的标量 Unit"
-    );
-    let (corrupted_owner, corrupted_group_location, corrupted_unit_role, _) = &placeholder_units[1];
-    drop(statement);
-    let newline_placeholder = r#"[{"scopes":["database_entry"],"pattern":"\\n"}]"#;
-    assert_eq!(
-        connection
-            .execute(
-                "UPDATE rpg_maker_translation_resource
-                 SET canonical_json = ?1
-                 WHERE resource_kind = 'placeholder_rules'",
-                [newline_placeholder],
-            )
-            .expect("应可安装 LF Placeholder 资源"),
-        1
-    );
-    drop(connection);
+    let ids = ["Items.json:1:description", "Items.json:2:description"];
 
-    let set_script = root.join("set-custom-placeholder-current.lua");
-    let set_calls = placeholder_units
-        .iter()
-        .enumerate()
-        .map(|(index, (owner, group_location, unit_role, _))| {
-            let ordinal = index + 1;
-            format!(
-                "ctx.translation.set(\n  {{ owner = [==[{owner}]==], group_location = [==[{group_location}]==], unit_role = [==[{unit_role}]==] }},\n  [==[治疗{ordinal}一行\n治疗{ordinal}二行]==]\n)"
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    fs::write(&set_script, set_calls).expect("建立含 LF Placeholder Current 的 Lua 脚本应可写入");
+    let set_script = root.join("set-mv-translations.lua");
+    fs::write(
+        &set_script,
+        r#"local ids = {
+  "Items.json:1:description",
+  "Items.json:2:description",
+}
+local before = ctx.translation.list({ ids = ids })
+assert(#before == 2)
+ctx.translation.set(ids[1], { "治疗一行", "治疗二行" })
+ctx.translation.set(ids[2], { "魔法一行", "魔法二行" })
+local after = ctx.translation.list({ status = "translated", ids = ids })
+assert(#after == 2)
+assert(after[1].origin == "manual" and after[2].origin == "manual")
+local context = ctx.translation.context({ ids[2], ids[1] })
+assert(context[1].id == ids[2] and context[2].id == ids[1])
+assert(type(ctx.terminology.list()) == "table")
+"#,
+    )
+    .expect("MV Lua 高级 API 脚本应可写入");
     let mut set_arguments = arguments(&["mv", "lua", "--name", PROJECT]);
     set_arguments.push(set_script.into_os_string());
     assert_success(
-        "实际 att.exe 建立含 LF Placeholder Current",
+        "实际 att.exe 执行 MV Lua 高级 API",
         &run_att(root, set_arguments),
     );
 
-    let connection = Connection::open(&database).expect("建立 Current 后数据库应可重新打开");
-    let (valid_translation, state_before): (String, Vec<u8>) = connection
+    let connection = Connection::open(&database).expect("建立人工译文后数据库应可重新打开");
+    let manual_count: i64 = connection
         .query_row(
-            "SELECT translation_content_json, translation_state
-             FROM rpg_maker_text_unit
-             WHERE owner = ?1
-               AND group_id = (
-                   SELECT group_id FROM rpg_maker_text_group
-                   WHERE owner = ?1 AND group_location = ?2
-               )
-               AND unit_role = ?3",
-            (
-                corrupted_owner,
-                corrupted_group_location,
-                corrupted_unit_role,
-            ),
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            "SELECT count(*) FROM rpg_maker_manual_translation",
+            [],
+            |row| row.get(0),
         )
-        .expect("含 LF Placeholder Current 应可读取");
-    assert_eq!(
-        serde_json::from_str::<Value>(&valid_translation).expect("Current 译文必须是规范 JSON"),
-        json!("治疗2一行\n治疗2二行")
-    );
-    assert_eq!(state_before.len(), 32, "Current 必须保存完整翻译状态");
-
-    // Translate 允许在保留 Custom Placeholder token 后，让自然正文额外出现相同字节。
-    // 这里保留刚建立的合法 Current state，只把一处 LF 译文改成两处 LF，复现跨契约现场。
-    let translation_with_additional_lf =
-        serde_json::to_string("治疗2一行\n治疗2二行\n正文新增换行").expect("现场译文应可编码");
-    assert_eq!(
-        connection
-            .execute(
-                "UPDATE rpg_maker_text_unit
-                 SET translation_content_json = ?1
-                 WHERE owner = ?2
-                   AND group_id = (
-                       SELECT group_id FROM rpg_maker_text_group
-                       WHERE owner = ?2 AND group_location = ?3
-                   )
-                   AND unit_role = ?4",
-                (
-                    &translation_with_additional_lf,
-                    corrupted_owner,
-                    corrupted_group_location,
-                    corrupted_unit_role,
-                ),
-            )
-            .expect("应可安装含额外 Custom 原片段的 Current 译文"),
-        1
-    );
-    let (current_translation, state_after): (String, Vec<u8>) = connection
+        .expect("人工译文数量应可读取");
+    assert_eq!(manual_count, 2);
+    let automatic_count: i64 = connection
         .query_row(
-            "SELECT translation_content_json, translation_state
-             FROM rpg_maker_text_unit
-             WHERE owner = ?1
-               AND group_id = (
-                   SELECT group_id FROM rpg_maker_text_group
-                   WHERE owner = ?1 AND group_location = ?2
-               )
-               AND unit_role = ?3",
-            (
-                corrupted_owner,
-                corrupted_group_location,
-                corrupted_unit_role,
-            ),
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("含额外 Custom 原片段的 Current 应可读取");
-    assert_eq!(current_translation, translation_with_additional_lf);
-    assert_eq!(
-        state_after, state_before,
-        "现场夹具只能修订译文正文，必须保留原 Current 状态"
-    );
-    let current_before_selective_clear: i64 = connection
-        .query_row(
-            "SELECT count(*)
-             FROM rpg_maker_text_unit
+            "SELECT count(*) FROM rpg_maker_text_unit
              WHERE translation_content_json IS NOT NULL OR translation_state IS NOT NULL",
             [],
             |row| row.get(0),
         )
-        .expect("全量清理前 Current 数量应可读取");
-    assert_eq!(
-        current_before_selective_clear, 2,
-        "测试前必须同时存在一项含额外 Custom 原片段的 Current 和一项合法 Current"
-    );
+        .expect("自动译文数量应可读取");
+    assert_eq!(automatic_count, 0, "人工 set 必须清除同位置自动译文");
     drop(connection);
 
-    let (first_owner, first_group_location, first_unit_role, _) = &placeholder_units[0];
+    let damage_script = root.join("damage-mv-manual.lua");
+    fs::write(
+        &damage_script,
+        r#"ctx.db.execute([=[
+UPDATE rpg_maker_manual_translation
+SET translation_json = '["乱码一","乱码二","额外行"]'
+WHERE readable_id = 'Items.json:2:description'
+]=])
+"#,
+    )
+    .expect("MV raw SQL 破坏脚本应可写入");
+    let mut damage_arguments = arguments(&["mv", "lua", "--name", PROJECT]);
+    damage_arguments.push(damage_script.into_os_string());
+    assert_success("MV raw SQL 绕过高级 API", &run_att(root, damage_arguments));
+
     let selective_clear_script = root.join("clear-one-mv-translation.lua");
     fs::write(
         &selective_clear_script,
-        format!(
-            "ctx.translation.clear({{ owner = [==[{first_owner}]==], group_location = [==[{first_group_location}]==], unit_role = [==[{first_unit_role}]==] }})\n"
-        ),
+        format!("ctx.translation.clear(\"{}\")\n", ids[0]),
     )
     .expect("MV 单项清理 Lua 脚本应可写入");
     let mut selective_clear_arguments = arguments(&["mv", "lua", "--name", PROJECT]);
     selective_clear_arguments.push(selective_clear_script.into_os_string());
     assert_success(
-        "实际 att.exe 清除一项并保留未改现场 Current",
+        "实际 att.exe 清除一项人工译文",
         &run_att(root, selective_clear_arguments),
     );
 
     let connection = Connection::open(&database).expect("单项清理后数据库应可重新打开");
-    let first_current: (Option<String>, Option<Vec<u8>>) = connection
+    let (remaining_id, remaining_translation): (String, String) = connection
         .query_row(
-            "SELECT translation_content_json, translation_state
-             FROM rpg_maker_text_unit
-             WHERE owner = ?1
-               AND group_id = (
-                   SELECT group_id FROM rpg_maker_text_group
-                   WHERE owner = ?1 AND group_location = ?2
-               )
-               AND unit_role = ?3",
-            (first_owner, first_group_location, first_unit_role),
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("单项清理目标应可读取");
-    assert_eq!(first_current, (None, None), "指定 Current 必须清除");
-    let unchanged_current: (String, Vec<u8>) = connection
-        .query_row(
-            "SELECT translation_content_json, translation_state
-             FROM rpg_maker_text_unit
-             WHERE owner = ?1
-               AND group_id = (
-                   SELECT group_id FROM rpg_maker_text_group
-                   WHERE owner = ?1 AND group_location = ?2
-               )
-               AND unit_role = ?3",
-            (
-                corrupted_owner,
-                corrupted_group_location,
-                corrupted_unit_role,
-            ),
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("未改现场 Current 应继续存在");
-    assert_eq!(unchanged_current.0, translation_with_additional_lf);
-    assert_eq!(unchanged_current.1, state_before);
-    let expected: i64 = connection
-        .query_row(
-            "SELECT count(*)
-             FROM rpg_maker_text_unit
-             WHERE translation_content_json IS NOT NULL OR translation_state IS NOT NULL",
+            "SELECT readable_id, translation_json FROM rpg_maker_manual_translation",
             [],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .expect("全量清理前剩余 Current 数量应可读取");
-    assert_eq!(expected, 1, "单项清理后必须保留一项未改现场 Current");
+        .expect("未清理人工译文应继续存在");
+    assert_eq!(remaining_id, ids[1]);
+    assert_eq!(
+        serde_json::from_str::<Value>(&remaining_translation).expect("raw SQL 译文应为 JSON"),
+        json!(["乱码一", "乱码二", "额外行"])
+    );
     drop(connection);
 
     let clear_script = root.join("clear-all-mv-translations.lua");
     fs::write(
         &clear_script,
-        r#"local expected = assert(tonumber(arg[1]), "missing expected count")
-local rows = ctx.db.query([=[
-SELECT unit.owner, text_group.group_location, unit.unit_role
-FROM rpg_maker_text_unit AS unit
-JOIN rpg_maker_text_group AS text_group
-  ON text_group.owner = unit.owner
- AND text_group.group_id = unit.group_id
-WHERE unit.translation_content_json IS NOT NULL OR unit.translation_state IS NOT NULL
-ORDER BY unit.owner, text_group.group_location, unit.unit_role
-]=])
-assert(#rows == expected, "Current count changed before clear")
-print("selected Current", #rows)
-for _, row in ipairs(rows) do
-  ctx.translation.clear({
-    owner = row[1],
-    group_location = row[2],
-    unit_role = row[3]
-  })
+        r#"for _, translation in ipairs(ctx.translation.list({ status = "translated" })) do
+  if translation.origin == "manual" then
+    ctx.translation.clear(translation.id)
+  end
 end
-local remaining = ctx.db.query([=[
-SELECT count(*)
-FROM rpg_maker_text_unit
-WHERE translation_content_json IS NOT NULL OR translation_state IS NOT NULL
-]=])[1][1]
-assert(remaining == 0, "Current remained after clear")
-print("remaining Current", remaining)
+print("人工译文已清理")
 "#,
     )
     .expect("MV 全量清理 Lua 脚本应可写入");
-    let clear_script_sha256 =
-        Sha256::digest(fs::read(&clear_script).expect("MV 全量清理 Lua 脚本应可重新读取"))
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
 
     let logs = workspace.join("logs");
     let logs_before = fs::read_dir(&logs)
@@ -2295,8 +2315,6 @@ print("remaining Current", remaining)
         .collect::<Vec<_>>();
     let mut clear_arguments = arguments(&["mv", "lua", "--name", PROJECT]);
     clear_arguments.push(clear_script.into_os_string());
-    clear_arguments.push("--".into());
-    clear_arguments.push(expected.to_string().into());
     assert_success(
         "实际 att.exe 执行 ctx.translation.clear 全量清理",
         &run_att(root, clear_arguments),
@@ -2305,31 +2323,12 @@ print("remaining Current", remaining)
     let connection = Connection::open(&database).expect("全量清理后数据库应可重新打开");
     let remaining: i64 = connection
         .query_row(
-            "SELECT count(*)
-             FROM rpg_maker_text_unit
-             WHERE translation_content_json IS NOT NULL OR translation_state IS NOT NULL",
+            "SELECT count(*) FROM rpg_maker_manual_translation",
             [],
             |row| row.get(0),
         )
-        .expect("全量清理后 Current 数量应可读取");
-    assert_eq!(remaining, 0, "译文正文与翻译状态必须全部清空");
-    let quick_check: String = connection
-        .query_row("PRAGMA quick_check", [], |row| row.get(0))
-        .expect("SQLite quick_check 应可执行");
-    assert_eq!(quick_check, "ok", "清理后的数据库必须保持完整");
-    let mut foreign_keys = connection
-        .prepare("PRAGMA foreign_key_check")
-        .expect("SQLite foreign_key_check 应可准备");
-    assert!(
-        foreign_keys
-            .query([])
-            .expect("SQLite foreign_key_check 应可执行")
-            .next()
-            .expect("SQLite foreign_key_check 结果应可读取")
-            .is_none(),
-        "清理后的数据库不得存在外键错误"
-    );
-    drop(foreign_keys);
+        .expect("全量清理后人工译文数量应可读取");
+    assert_eq!(remaining, 0, "人工译文必须全部清空");
     drop(connection);
 
     let new_logs = fs::read_dir(&logs)
@@ -2338,66 +2337,56 @@ print("remaining Current", remaining)
         .filter(|path| !logs_before.contains(path))
         .collect::<Vec<_>>();
     assert_eq!(new_logs.len(), 1, "一次 Lua 命令只应新增一份项目日志");
-    let records = fs::read_to_string(&new_logs[0])
-        .expect("全量清理项目日志应可读取")
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).expect("项目日志行必须是 JSON"))
-        .collect::<Vec<_>>();
+    let records = read_project_log_records(&new_logs[0]);
     assert_eq!(
         records
             .iter()
-            .filter(|record| record["code"] == "lua.script")
+            .filter(|record| record["event"] == "lua.print")
             .count(),
         1,
-        "成功运行必须记录一次 Lua 脚本身份"
-    );
-    let script_record = records
-        .iter()
-        .find(|record| record["code"] == "lua.script")
-        .expect("成功运行必须保留 Lua 脚本记录");
-    assert_eq!(
-        script_record["payload"]["fingerprint"], clear_script_sha256,
-        "日志中的 SHA-256 必须等于脚本文件原始字节的普通 SHA-256"
-    );
-    assert_eq!(
-        records
-            .iter()
-            .filter(|record| record["code"] == "lua.print")
-            .count(),
-        2,
-        "脚本的两次 print 必须各写入一条日志"
-    );
-    let summaries = records
-        .iter()
-        .filter(|record| record["code"] == "lua.summary")
-        .collect::<Vec<_>>();
-    assert_eq!(summaries.len(), 1, "成功运行必须且只能记录一条 Lua 摘要");
-    let summary = summaries[0];
-    assert_eq!(summary["payload"]["database_calls"], 2);
-    assert_eq!(summary["payload"]["changed_rows"], expected);
-    assert_eq!(summary["payload"]["translation_calls"], expected);
-    assert_eq!(summary["payload"]["printed_lines"], 2);
-    let succeeded = records
-        .iter()
-        .position(|record| {
-            record["code"] == "run.finished" && record["payload"]["result"]["kind"] == "succeeded"
-        })
-        .expect("成功运行必须记录 succeeded 终态");
-    assert_eq!(
-        succeeded,
-        records.len() - 1,
-        "succeeded 必须是本次日志的最后一条记录"
+        "脚本 print 必须写入一条日志"
     );
     assert!(
-        records[..succeeded].iter().all(|record| {
-            !record["code"]
-                .as_str()
-                .is_some_and(|code| code.starts_with("diagnostic."))
-                && !(record["code"] == "run.finished"
-                    && record["payload"]["result"]["kind"] == "failed")
-        }),
-        "成功终态之前不得伪报失败"
+        records
+            .iter()
+            .all(|record| { record["event"] != "lua.script" && record["event"] != "lua.summary" }),
+        "Lua 日志不得保存脚本哈希或无实际作用的摘要"
     );
+}
+
+fn read_manual_toml(path: &Path) -> toml::Value {
+    toml::from_str(
+        &fs::read_to_string(path)
+            .unwrap_or_else(|error| panic!("{} 应可读取：{error}", path.display())),
+    )
+    .expect("Manual TOML 应可解析")
+}
+
+fn find_manual_entry<'a>(entries: &'a [toml::Value], id: &str) -> &'a toml::Value {
+    entries
+        .iter()
+        .find(|entry| entry["id"].as_str() == Some(id))
+        .unwrap_or_else(|| panic!("Manual TOML 应包含 {id}"))
+}
+
+fn set_manual_toml_field(path: &Path, id: &str, field: &str, value: toml::Value) {
+    let mut document = read_manual_toml(path);
+    let entries = document["translation"]
+        .as_array_mut()
+        .expect("Manual translation 必须是数组");
+    let entry = entries
+        .iter_mut()
+        .find(|entry| entry["id"].as_str() == Some(id))
+        .unwrap_or_else(|| panic!("Manual TOML 应包含 {id}"));
+    entry
+        .as_table_mut()
+        .expect("Manual 条目必须是 table")
+        .insert(field.to_owned(), value);
+    fs::write(
+        path,
+        toml::to_string_pretty(&document).expect("Manual TOML 应可重新编码"),
+    )
+    .expect("Manual TOML 应可更新");
 }
 
 fn run_information_command(root: &Path, arguments: &[&str]) -> String {
@@ -2503,6 +2492,16 @@ parameters = '''
 type = "japanese"
 id = "ja"
 minimum_kana_characters = 1
+allowed_terms = []
+
+[[languages]]
+type = "english"
+id = "en"
+minimum_word_count = 1
+minimum_letter_count = 2
+ignored_terms = []
+minimum_copied_word_count = 2
+minimum_copied_letter_count = 4
 allowed_terms = []
 
 [translation]

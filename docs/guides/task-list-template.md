@@ -20,10 +20,10 @@
 - 最后更新时间：<YYYY-MM-DD HH:mm:ss 时区>
 - 任务清单：<绝对路径>
 - 任务材料根：<绝对路径>
-- ATT 程序：<att.exe 绝对路径；--version；SHA-256>
+- ATT 程序：<att.exe 绝对路径；--version>
 - ATT 发行目录：<绝对路径>
 - 调用 cwd：<绝对路径>
-- 固定配置：<发行目录/config.toml；SHA-256>
+- 固定配置：<发行目录/config.toml>
 - 固定 Prompt：<发行目录/prompts/translation；资源身份>
 - 已完整读取文档：<发行目录内相对路径>
 
@@ -40,12 +40,12 @@
 ## 当前事实
 
 - 任务状态：<进行中 | 完成 | 停止>
-- 当前工作：<调查 | Init | Extract | Translate | Lua 修订 | WriteBack | 外部集成 | 验收 | 恢复>
+- 当前工作：<调查 | Init | Extract | Translate | Manual 补译 | Lua 特殊修改 | WriteBack | 外部集成 | 验收 | 恢复>
 - 活动 TODO：<稳定编号>
 - 进程终态：<succeeded | failed | cancelled | recovery_required | outcome_unknown | 尚未运行>
 - 阶段业务结果：<具体结果；没有则写“无”>
 - 状态影响：<未改变 | 前序已提交 | 完整提交 | 已发布 | 必须恢复 | 结果未知>
-- 最后权威状态：<数据库、输入指纹或发布终态；观察时间>
+- 最后权威状态：<数据库、当前输入状态或发布终态；观察时间>
 - 诊断证据：<RunId、项目日志、任务记录或终端输出>
 - 恢复现场：<路径；没有则写“无”>
 - 当前必读规格：<相对路径>
@@ -55,9 +55,10 @@
 ## 本次有效输入与资源
 
 - Init：<各项目来源、语言与布局选择>
-- Extract：<Builtin、Rules、JSONL 与指纹>
+- Extract：<Builtin、Rules、JSONL 与当前输入状态>
 - Translate：<各项目 Profile、Client、术语、Placeholder、Prompt>
-- Lua：<审查或修订脚本、参数与 SHA-256；没有则写“无”>
+- Manual：<TOML 路径、check 与 apply 结果；没有则写“无”>
+- Lua：<复杂筛选、批量变换、诊断或特殊修改脚本与参数；没有则写“无”>
 - WriteBack：<各项目输出、外部转换和部署方式>
 
 ## 调查与项目分配
@@ -79,7 +80,7 @@
 ## Translate 与人工或 agent 修订
 
 完成标准：全部 Unit 已按当前语言和 Placeholder 分类；没有未处理 Partial、Unavailable、
-失败或未解释空译文候选；自动与 Lua 修订均有当前证据。
+失败或未解释空译文候选；自动与人工译文均有当前证据。
 
 ## WriteBack 与外部集成
 

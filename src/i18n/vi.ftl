@@ -7,7 +7,11 @@ cli-init-about = Khởi tạo hoặc cập nhật dự án dịch có tên
 cli-extract-about = Đồng bộ văn bản nguồn từ đầu vào hiện tại của dự án
 cli-translate-about = Dịch văn bản đã trích xuất bằng Profile đã chỉ định hoặc đã lưu
 cli-write-back-about = Ghi bản dịch hiện tại vào đầu ra của dự án
-cli-project-lua-about = Chạy một lần Lua cơ sở dữ liệu nguyên tử trong dự án
+cli-manual-about = Quản lý bản dịch thủ công trong tệp TOML có thể chỉnh sửa
+cli-manual-export-about = Xuất các mục hiện cần dịch thủ công
+cli-manual-check-about = Kiểm tra TOML bản dịch thủ công mà không thay đổi dự án
+cli-manual-apply-about = Áp dụng các bản dịch thủ công đã điền và hợp lệ
+cli-project-lua-about = Chạy tập lệnh Lua trên cơ sở dữ liệu dự án
 cli-project-name-help = Tên dự án ổn định
 cli-init-path-help = Thư mục gốc đầu vào; dự án hiện có có thể dùng lại đường dẫn thành công gần nhất
 cli-source-language-help = ID ngôn ngữ nguồn
@@ -21,8 +25,9 @@ cli-dialogue-rules-help = Thay phép chiếu tên hội thoại MV dùng cùng B
 cli-profile-help = ID Profile dịch; bỏ qua để dùng lại Profile thành công gần nhất
 cli-terms-help = Thay tài nguyên thuật ngữ của dự án
 cli-placeholders-help = Thay tài nguyên Placeholder của dự án
-cli-project-lua-script-help = Chương trình Lua cơ sở dữ liệu nguyên tử chạy một lần
+cli-project-lua-script-help = Tập lệnh Lua sẽ chạy trên cơ sở dữ liệu dự án
 cli-project-lua-arguments-help = Đối số UTF-8 truyền cho Lua arg[1..] sau --
+cli-manual-file-help = Tệp TOML bản dịch thủ công
 cli-usage-heading = Cách dùng:
 cli-commands-heading = Lệnh:
 cli-options-heading = Tùy chọn:
@@ -113,9 +118,7 @@ log-run-failed = Lệnh { $command } thất bại.
 log-run-outcome-unknown = Lệnh { $command } đã kết thúc nhưng kết quả cuối cùng chưa xác định; hãy làm theo các vị trí khôi phục trong lỗi.
 log-run-cancelled = Lệnh { $command } đã bị hủy.
 log-performance-counters = Bộ đếm hiệu năng: số lần thử điều khiển giao dịch SQLite { $sqlite_control_attempted_total }; xác thực toàn bộ cây ứng viên đã bắt đầu { $candidate_validation_started }, đã hoàn tất { $candidate_validation_completed }.
-log-lua-script = Tập lệnh Lua { $identity } (SHA-256 { $fingerprint }).
 log-lua-print = Lua: { $message }
-log-lua-summary = Thống kê Lua: { $database_calls } lần gọi cơ sở dữ liệu, { $changed_rows } hàng thay đổi, { $translation_calls } lần gọi bản dịch và { $printed_lines } dòng print.
 log-plan-resolved = Lệnh { $command } lấy kế hoạch từ { $source }.
 log-phase-started = Bắt đầu giai đoạn: { $phase }.
 log-retry-summary = Đã thực hiện { $count } lần thử lại.
@@ -164,51 +167,10 @@ log-task-outcome-value = { $outcome ->
     [cancelled] đã hủy
    *[other] kết thúc với kết quả không xác định
 }
-diagnostic-title = Lỗi [{ $code }]
-diagnostic-stage = Giai đoạn: { $stage }
 diagnostic-location = Vị trí: { $subject }
 diagnostic-explanation = Nguyên nhân: { $reason }
-diagnostic-effect = Ảnh hưởng: { $impact }
 diagnostic-resolution = Cách xử lý: { $action }
 diagnostic-related = Lỗi liên quan { $index }:
-diagnostic-relation-value = { $code ->
-    [cleanup] dọn dẹp
-    [rollback] hoàn tác
-    [discard] loại bỏ
-    [finalization] hoàn tất
-    [shutdown] tắt
-    [observability] khả năng quan sát
-   *[other] { $code }
-}
-diagnostic-stage-value = { $code ->
-    [process_startup] Khởi động tiến trình
-    [process_output] Đầu ra tiến trình
-    [configuration] Nạp cấu hình
-    [command_preparation] Chuẩn bị lệnh
-    [project_opening] Mở dự án
-    [init] Khởi tạo
-    [extract] Trích xuất
-    [translate] Dịch
-    [write_back] Ghi ngược
-    [lua] Thực thi Lua dự án
-    [model_request] Yêu cầu mô hình
-    [run_plan_finalization] Hoàn tất kế hoạch chạy
-    [publication] Phát hành
-    [shutdown] Tắt
-    [logging] Nhật ký dự án
-    [runtime] Thời gian chạy
-   *[other] __ATT_FALLBACK__
-}
-diagnostic-effect-value = { $code ->
-    [unchanged] Trạng thái không thay đổi
-    [progress_preserved] Tiến độ hợp lệ đã được giữ lại
-    [applied] Trạng thái đã được áp dụng
-    [applied_run_plan_not_saved] Trạng thái đã được áp dụng nhưng kế hoạch chạy chưa được lưu
-    [applied_finalization_failed] Trạng thái đã được áp dụng nhưng bước hoàn tất chưa xong
-    [recovery_required] Cần khôi phục trước khi có thể tin cậy trạng thái
-    [outcome_unknown] Không rõ trạng thái cuối cùng
-   *[other] __ATT_FALLBACK__
-}
 diagnostic-resolution-value = { $code ->
     [fix_configuration] Sửa trường cấu hình được nêu rồi thử lại
     [fix_input] Sửa dữ liệu đầu vào được nêu rồi thử lại
@@ -220,7 +182,7 @@ diagnostic-resolution-value = { $code ->
     [check_model_service] Kiểm tra phản hồi của dịch vụ mô hình và giới hạn tài khoản
     [preserve_recovery_artifacts] Không xóa các tạo phẩm khôi phục được liệt kê; hãy khôi phục đầu ra trước khi thử lại
     [retry] Thử lại thao tác
-    [report_bug] Báo cáo lỗi ATT này kèm mã lỗi và đường dẫn nhật ký
+    [report_bug] Báo cáo lỗi ATT này và mô tả thao tác đang thực hiện
    *[other] __ATT_FALLBACK__
 }
 diagnostic-failure-value = { $code ->
@@ -359,16 +321,13 @@ task-record-parse-error = Lỗi phân tích: { $kind ->
 task-record-attempt-succeeded = Lần thử { $number }: thành công; finish reason { $finish_reason }
 task-record-attempt-token-usage = ; token `{ $prompt } / { $completion } / { $total }`
 task-record-attempt-duration = ; thời gian `{ $duration }`
-task-record-attempt-request-id = ; request ID { $request_id }
-task-record-attempt-response-id = ; response ID { $response_id }
-task-record-attempt-retryable = Lần thử { $number }: yêu cầu lỗi có thể thử lại; chẩn đoán `{ $code }`; thời gian `{ $duration }`
+task-record-attempt-retryable = Lần thử { $number }: yêu cầu lỗi có thể thử lại; thời gian `{ $duration }`
 task-record-attempt-retry-after = ; Retry-After `{ $duration }`
 task-record-attempt-wait-retry = ; thử lại sau `{ $duration }`
 task-record-attempt-wait-completed = ; đã chờ xong `{ $duration }`; lần thử tiếp theo chưa bắt đầu
 task-record-attempt-wait-cancelled = ; dự kiến chờ `{ $duration }`; đã hủy trong lúc chờ
-task-record-attempt-failed = Lần thử { $number }: xử lý yêu cầu hoặc phản hồi thất bại; chẩn đoán `{ $code }`; thời gian `{ $duration }`
+task-record-attempt-failed = Lần thử { $number }: xử lý yêu cầu hoặc phản hồi thất bại; thời gian `{ $duration }`
 task-record-attempt-cancelled = Lần thử { $number }: đã hủy; thời gian `{ $duration }`
-task-record-structured-reason = Lý do: { $reason }
 task-record-final-status = Trạng thái: { $state ->
     [complete] hoàn tất, đã xác nhận commit
     [partial] hoàn tất một phần, đã xác nhận commit
@@ -384,6 +343,6 @@ task-record-final-status = Trạng thái: { $state ->
 }
 task-record-accepted-written = Đã nhận: { $accepted } mục, ghi vào { $written } vị trí thực tế
 task-record-accepted-outcome-unknown = Đã kiểm tra: { $accepted } mục; không thể xác nhận kết quả commit cơ sở dữ liệu
-task-record-task-diagnostic = Chẩn đoán tác vụ: `{ $code }`; lý do { $reason }
+task-record-task-diagnostic = Chẩn đoán tác vụ
 task-record-duration-seconds = { $value } giây
 task-record-duration-milliseconds = { $value } mili giây

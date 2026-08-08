@@ -1,118 +1,136 @@
 # ATT SQLite 现行规格
 
-每个 MV、MZ 或 Generic 项目都使用自己工作区内的 `project.db`；引擎不同、项目名
-不同，表、译文和资源就各归各，互不共享。
+每个 MV、MZ 或 Generic 项目都使用自己工作区内的 `project.db`。引擎或项目名不同，项目
+事实、译文和资源互不共享。
 
-## 1. 项目数据库
+## 1. 当前数据库
 
-数据库保存当前产品实际需要的项目事实：
+数据库只保存当前产品实际使用的事实：
 
-- 项目身份、来源路径或来源指纹、语言；
-- Extract 后的 Group、Unit、顺序与写回关系；
-- Unit 译文和语义状态；
-- 当前术语、Placeholder 与最近 Profile；
-- MV/MZ 当前 Builtin/Rules 选择与必要的发布交接。
+- 项目名、来源位置或来源快照、语言和布局设置；
+- Extract 建立的 Group、Unit、自然顺序和写回关系；
+- 自动译文及其当前状态；
+- 独立保存的人工译文快照；
+- 当前术语、Placeholder 和最近成功 Profile；
+- MV/MZ 当前 Builtin/Rules 选择与写回所需资源。
 
-Generic 的项目库只存自己的工作；外部 JSONL 副本、去重族、代表项、译文历史和
-kind 注册表都留在外部。
+项目只接受当前代码声明的精确 schema。普通命令可以检查当前结构是否完整，但不识别业务
+schema 版本，不检测旧格式，不迁移，也不提供兼容 view、别名或双读双写。无效数据库只按
+当前项目损坏处理。
 
-项目只认严格的当前 schema；不符合当前 schema 的数据库按普通无效项目处理，运行时
-不做识别、迁移或兼容。
+Generic 不复制外部 JSONL。外部 JSONL、去重族、代表项和译文历史都不属于项目数据库。
+WriteBack 的符号修复也没有配置或持久状态，每次从当前原文、当前译文和 Placeholder 重新
+计算。
 
-WriteBack 的全局译文符号修复没有项目配置或持久状态，不在数据库保存语言专用符号表、
-修复开关或历史结果。每次 WriteBack 都从当前原文、当前译文和当前 Placeholder 规则重新
-计算能够确定的字符替换。
+## 2. 自动译文与人工译文
 
-## 2. 读取与写事务
+自动译文继续保存在当前 Unit 表中，并与自动状态一起出现或一起为空。自动状态绑定当前
+原文、完整 Group 语境、语言、实际术语、实际 Placeholder、Prompt、Profile 和 Client
+语义；具体失效范围由对应 Translate 规格决定。
 
-只读规划基于一致快照；写操作使用短事务、批量 statement 和准备语句，一批工作一起
-提交，而不是每个 Unit 各建一个持久事务。
+人工译文保存在无外键的引擎专用表中，不与自动译文共用正文槽。记录保存内部位置、最后
+一次可读 ID、`fixed|free`、原文数组、译文数组和内部适用性指纹。没有外键是有意设计：
+Extract 删除或重建当前位置时，旧人工正文仍可保留并供高级 Lua 查看。
 
-Extract 的同一 owner 或整个 Generic 同步原子提交。Translate 准备阶段原子处理失效
-和资源替换，各模型任务按自然顺序独立提交，有效前序进度因此得以保留。WriteBack
-只读数据库，输出发布交给目录发布协议。
+人工译文是否当前，只由对应位置和实际写回结构决定：
 
-写事务从开始、COMMIT、ROLLBACK 到无法确认结果，每一步都形成结构化诊断。`busy`
-等待期间随时响应取消；项目再忙也只是等待，不会被固定的本地队列容量拒之门外。
+- Generic：逻辑 Group/Unit、所属文件、Group kind、正文形状和原文；
+- RPG Maker：内部位置、Group kind、Unit 角色、写回 recipe、正文形状和原文。
 
-## 3. 译文状态
+上下文、相邻文本、语言、术语、Placeholder 配置、Prompt、Profile 和 Client 不参与人工
+译文失效。位置不存在，或上述实际结构与原文变化时，记录成为过期；正文不会被静默删除。
+以后条件重新匹配时，同一记录可以再次成为当前。
 
-目标译文正文与语义状态分开保存。模型任务提交使用 CAS 同时比较当前源事实、旧目标
-正文和旧状态，并发修订不会被悄悄覆盖。
+当前人工译文优先于自动译文。Manual apply 或 `ctx.translation.set` 写入人工记录时，只清除
+同一 Unit 的自动译文。Translate 跳过当前人工译文，模型结果提交也不能覆盖它。WriteBack
+按“当前人工译文、当前自动译文、原文”的顺序选择正文。过期人工译文不阻止后续自动
+Translate，也不参与 WriteBack。
 
-自动状态绑定语言、Prompt、Client、Group 语境、实际术语和 Placeholder。人工 Lua
-状态只绑定来源、Group 语境、语言、结构和实际 Placeholder。各引擎规格决定失效
-范围。
+## 3. 事务边界
 
-## 4. Lua 审查使用的当前表
+只读规划和 Manual export/check 使用一致的只读快照。普通写操作使用与业务原子范围一致的
+短事务和准备语句：
 
-当前发行版没有独立的项目状态或 Unit 导出命令。可信操作者可以通过
-[Lua](../lua/README.md)的只读 SQL 查看当前数据库；下面这些表和列是本发行版审查与精确
-locator 所需的权威位置。
+- Generic Extract 整体原子替换当前内容视图；
+- MV/MZ Extract 的每个 owner 独立提交；
+- Translate 准备阶段原子处理资源与自动状态，每个模型任务按自然顺序独立提交；
+- Manual apply 在一个写事务中重新检查整份 TOML，任一错误使修改为零；
+- WriteBack 只读项目数据库，输出提交由目录发布器负责。
 
-Generic：
+提交使用当前快照比较，避免并发命令静默覆盖新状态。SQLite busy 时等待并响应取消，不用
+固定本地容量拒绝合法工作。
 
-| 表 | 审查使用的列 |
+## 4. Raw Lua 可见的当前表
+
+本节只服务使用者主动选择的 `ctx.db` 低级接口。普通补译和高级 Lua 使用可读 ID，不要求
+理解以下内部键。
+
+Generic 主要表：
+
+| 表 | 当前职责 |
 | --- | --- |
-| `generic_file` | `relative_path`、`ordinal` |
-| `generic_group` | `group_id`、`relative_path`、`ordinal`、`kind` |
-| `generic_unit` | `group_id`、`unit_id`、`ordinal`、`source_text`、`translation`、`translation_origin`、`translation_state` |
+| `generic_project` | 项目、来源、语言、最近 Extract 与 Profile |
+| `generic_file` | 当前 JSONL 文件与自然顺序 |
+| `generic_group` | Group、文件、kind、顺序和上下文状态 |
+| `generic_unit` | Unit、原文、自动译文和自动状态 |
+| `generic_manual_translation` | 独立人工译文快照与内部适用性 |
+| `translation_resource` | 当前术语与 Placeholder |
 
-Generic 自然顺序是 file、group、unit ordinal；精确 locator 是 `group_id + unit_id`。
-`translation`、`translation_origin` 和 `translation_state` 要么全空，要么全有。
+`generic_unit` 的自动正文使用 `translation` 与 `translation_state`；人工正文只使用
+`generic_manual_translation`。
 
-MV/MZ：
+MV/MZ 主要表：
 
-| 表 | 审查使用的列 |
+| 表 | 当前职责 |
 | --- | --- |
-| `rpg_maker_text_group` | `owner`、`group_id`、`group_location`、`semantic_order_key`、`group_kind` |
-| `rpg_maker_text_unit` | `owner`、`group_id`、`unit_role`、`semantic_order_key`、`source_content_json`、`source_context_json`、`translation_content_json`、`translation_state` |
-| `rpg_maker_mutation_claim` | `owner`、`group_id`、`resource_key`、`access` |
+| `metadata` | 项目、语言、来源快照与布局设置 |
+| `rpg_maker_asset_owner_state` | Builtin/Rules 当前来源状态 |
+| `rpg_maker_project_definition` | 当前 MV/MZ 项目定义 |
+| `rpg_maker_translation_resource` | 当前术语与 Placeholder |
+| `rpg_maker_text_group` | 当前 Group、自然顺序、kind 与写回 recipe |
+| `rpg_maker_text_unit` | 当前 Unit、原文、上下文、自动译文和自动状态 |
+| `rpg_maker_manual_translation` | 独立人工译文快照与内部适用性 |
+| `rpg_maker_mutation_claim` | 写回修改范围 |
 
-`group_id` 是每个 owner 内从 1 开始分配的当前存储关联键，不是公开 locator。Unit 和
-Mutation Claim 不重复保存 `group_location`；查询它们时必须用 `owner + group_id` JOIN
-`rpg_maker_text_group`，再从 Group 取得 `group_location`。当前 schema 没有为旧列提供 view、
-别名或兼容读取。
+人工表没有外键。Raw SQL 可以直接读取或破坏这些表；ATT 不保证被修改后的数据库仍满足
+普通命令要求。当前 DDL 以源码为准，不建立另一个 schema 版本或迁移文档。
 
-MV/MZ 按 Group 与 Unit 的 `semantic_order_key` 排列；一个完整逻辑 Group 由 JOIN 后具有相同
-`group_location` 的全部 Unit 组成，可以同时包含 builtin 与 rules owner。owner 仍属于精确
-locator，后者是 `owner + group_location + unit_role`；`group_id` 不进入 locator。
-`group_location` 与 `unit_role` 是不透明编码，只能逐字使用。数据库不单独保存人工/自动 origin；
-`translation_state` 也是不透明指纹，不能由 SQL 自行解释。
+## 5. Lua 数据库连接
 
-两种引擎中，译文列为 NULL 只表示没有译文状态，不等于“应当翻译”。空白、没有源语
-NaturalText 或完全受保护的 Unit 也可以合法保持 NULL。真正的 `needs_translation`、自动
-译文是否适配本次 Prompt/Profile/Client，以及 RPG Maker Semantic Scope 与 TaskBlock，
-由 Translate 使用当前资源在运行时计算，不是上述表中的持久字段。
+Lua 命令在项目租约内打开同一个 `project.db`，连接从 autocommit 开始。脚本自行决定是否
+使用显式事务：
 
-因此 SQL 可以完整列出当前 Unit、译文与 locator，却不能单独代替 Translate 的状态判断，
-也不能把任务记录临时 ID 可靠映射成 locator。完整审查方法和导出完整性条件见
-[Lua 审查流程](../lua/README.md#4-完整审查与人工或-agent-修订)。
+```lua
+ctx.db.execute("BEGIN IMMEDIATE")
+ctx.db.execute("UPDATE ...")
+ctx.db.execute("COMMIT")
+```
 
-## 5. Lua 会话
+- autocommit statement 成功后立即保留；
+- 已显式 COMMIT 的修改不会因脚本稍后失败而撤销；
+- 失败、取消或 panic 只回滚当时仍打开的事务；
+- 正常结束时仍有事务未关闭，ATT 报错并回滚该事务；
+- raw API 不运行 schema 白名单、业务状态检查、`foreign_key_check`、`quick_check`、自动
+  修复或强制备份。
 
-独立 Lua 使用同一个项目数据库，外面包着一个 `BEGIN IMMEDIATE`；事务边界由 ATT
-掌握，脚本只管写逻辑。运行结束后 ATT 先验证 schema、metadata、领域不变量、
-`foreign_key_check` 与 `quick_check`，再提交或回滚。完整 API 与 SQL 限制见
-[原子数据库 Lua](../lua/README.md)。
+Generic Lua 直接打开 `project.db`，即使 ATT 表已经被删除也能再次运行。Raw API 可以执行
+DML、DDL、PRAGMA 和显式事务，可以关闭外键、制造孤儿关系、写乱码状态、删除数据或表。
+只继续拒绝 `ATTACH`、`DETACH`、`load_extension` 和一次调用中的第二条 statement。完整
+Lua 契约见 [项目数据库 Lua](../lua/README.md)。
 
-Lua 可以建立自己的私有表，ATT 不读取、迁移或解释它们。直接修改 ATT 表属于可信
-高级操作：可以做，但结果必须通过最终不变量检查。
+## 6. 公开诊断
 
-## 6. 诊断与日志
+SQLite 和事务错误在内部保留足够事实用于控制流，但进入 CLI、普通项目日志和任务记录前，
+只呈现：
 
-SQLite 出错时，`SqliteIssue.context` 保存 stage、operation 和 transaction；具体 problem
-保存数据库路径、query ID/ordinal、driver kind、primary/extended code、column index/name、
-SQL offset、参数数量或 changed rows 等当时确实存在的结构化数值。根数据库尚未解析路径时
-使用对应的 root problem，不伪造路径。SQL、参数、结果与游戏正文不进普通项目日志，也
-不保存 `rusqlite::Error::to_string()` 形成的小协议。
+```text
+object, reason, help
+```
 
-CLI 与 JSONL 消费同一份 `DiagnosticReport`。事务本身的主错误与 rollback、finalization、
-shutdown 等相关错误使用明确 relation 保存在同一原子 occurrence 内；report 的 `effect`
-说明状态未变、已经提交、收尾失败、需要恢复或结果未知。数据库的恢复和重放另有依据，
-项目日志不参与。
+对象使用项目数据库、自然路径或当前命令描述；原因说明实际失败；help 说明可以修改什么。
+公开输出不保存查询 ID、SQLite primary/extended code、原始数据库行、参数、SQL、内部事务
+阶段、数据库随机键或 expected/actual fingerprint。
 
-事务明确回滚时可以在修正根因后重新执行。诊断为 `outcome_unknown` 时，停止同一项目的
-Lua、Extract、Translate 和其他写入并保留数据库及 sidecar。当前 CLI 没有独立的只读
-`status` 或事务恢复命令；不能为了“观察”再运行会取得写事务的 Lua，也不能手工编辑库。
-现行公开接口无法确认的现场必须作为产品能力限制报告。
+事务明确回滚时，可以修正原因后重试。已经自动提交或显式提交的 Lua 修改不会被描述成
+回滚。提交或目录交换结果确实无法确认时，停止继续写入并保留现场；项目日志只是证据，
+不参与补写、回滚或恢复判断。

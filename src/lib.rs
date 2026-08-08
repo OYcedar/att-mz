@@ -14,6 +14,7 @@ mod json_diagnostic;
 mod language;
 mod llm;
 mod lossless_json;
+mod manual;
 mod observability;
 mod progress;
 mod project_lease;

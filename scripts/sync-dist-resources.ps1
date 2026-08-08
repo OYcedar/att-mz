@@ -210,10 +210,12 @@ if ($Check) {
     return
 }
 
-$stagingRoot = Join-Path $distributionRoot (
-    '.resource-sync-' + [System.Guid]::NewGuid().ToString('N')
-)
+$stagingRoot = Join-Path $distributionRoot '.resource-sync'
 Assert-DistributionChild -Path $stagingRoot
+
+if (Test-Path -LiteralPath $stagingRoot) {
+    throw "发行资源同步无法开始：临时目录已存在：$stagingRoot。确认没有同步正在运行后删除该目录。"
+}
 
 try {
     New-Item -ItemType Directory -Path $stagingRoot | Out-Null

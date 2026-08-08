@@ -2916,7 +2916,7 @@ mod tests {
                 },
                 "rpg_maker.write_back.rewrite.decode_nested_json",
                 &["\"category\":\"eof\"", "\"line\":1", "\"column\":"][..],
-                &["json_category=eof", "line=1", "column="][..],
+                "map:3:key:parameters",
             ),
             (
                 RpgMakerWriteBackDocumentRewriteFailure::EncodeNestedJson {
@@ -2933,7 +2933,7 @@ mod tests {
                     "\"line\":2",
                     "\"column\":9",
                 ][..],
-                &["json_category=duplicate_object_key", "line=2", "column=9"][..],
+                "map:3:key:parameters",
             ),
             (
                 RpgMakerWriteBackDocumentRewriteFailure::SerializeDocument {
@@ -2942,11 +2942,11 @@ mod tests {
                 },
                 "rpg_maker.write_back.rewrite.serialize_document",
                 &["\"kind\":\"serialize_document\"", "\"category\":\"eof\""][..],
-                &["json_category=eof", "line=1", "column="][..],
+                "data/Items.json",
             ),
         ];
 
-        for (source, expected_code, expected_json_facts, expected_cli_facts) in cases {
+        for (source, expected_code, expected_json_facts, expected_cli_object) in cases {
             let report = source.diagnostic_report();
             assert_eq!(report.primary().code(), expected_code);
             let json = serde_json::to_string(&report).expect("安全诊断应可序列化");
@@ -2960,8 +2960,15 @@ mod tests {
             for fact in expected_json_facts {
                 assert!(json.contains(fact), "JSONL 缺少 {fact}: {json}");
             }
-            for fact in expected_cli_facts {
-                assert!(cli.contains(fact), "CLI 缺少 {fact}: {cli}");
+            assert!(
+                cli.contains(expected_cli_object),
+                "CLI 缺少可读对象 {expected_cli_object}: {cli}"
+            );
+            for internal in ["json_category=", "line=", "column=", expected_code] {
+                assert!(
+                    !cli.contains(internal),
+                    "CLI 不得显示内部诊断字段 {internal}: {cli}"
+                );
             }
         }
     }

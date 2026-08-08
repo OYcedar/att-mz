@@ -14,19 +14,12 @@ mod write_back;
 pub(crate) use identity::CancellableTextMap;
 pub(crate) use placeholder::{
     GenericCompiledPlaceholderRules, GenericPlaceholderError, GenericPlaceholderService,
-    GenericProtectedText, validate_translation_placeholders_and_binding_with_cancellation,
-    validate_translation_placeholders_with_cancellation,
+    GenericProtectedText, validate_translation_placeholders_with_cancellation,
 };
 pub(crate) use project::{
-    CommitTranslationsOutcome, ExtractOutcome, GenericCompiledPlaceholderResource,
-    GenericCompiledTerminologyResource, GenericInitRequest, GenericProject, GenericProjectError,
-    GenericProjectStore, GenericStoredSnapshot, TranslationOrigin, TranslationWrite,
-    compiled_placeholder_resource_for_connection_with_cancellation,
-    compiled_terminology_resource_for_connection_with_cancellation,
-    ensure_input_fingerprints_current_with_cancellation,
-    validate_current_generic_schema_with_cancellation,
-    validate_project_connection_with_compiled_resources_and_cancellation,
-    validated_manual_translation_state_with_compiled_rules_for_connection_with_cancellation,
+    CommitTranslationsOutcome, ExtractOutcome, GenericInitRequest, GenericProject,
+    GenericProjectError, GenericProjectStore, GenericStoredSnapshot, TranslationOrigin,
+    TranslationWrite, ensure_input_fingerprints_current_with_cancellation,
 };
 pub(crate) use task_record::{
     GenericTaskRecordDocument, GenericTaskRecordState, GenericTaskResponseRecord,
@@ -40,17 +33,14 @@ pub(crate) use translate::{
     terminology_hit_fingerprint_with_cancellation,
 };
 pub(crate) use write_back::{
-    GenericWriteBackCandidate, GenericWriteBackError, build_write_back_candidate_with_cancellation,
+    GenericCurrentTranslation, GenericWriteBackCandidate, GenericWriteBackError,
+    build_write_back_candidate_with_cancellation,
     validate_materialized_write_back_file_with_cancellation,
 };
 
 #[cfg(test)]
 pub(crate) use placeholder::GenericPlaceholderRuleDefinition;
 #[cfg(test)]
-pub(crate) use project::manual_translation_state_for_connection;
-#[cfg(test)]
-pub(crate) use translate::{
-    automatic_translation_state_fingerprint, manual_translation_state_fingerprint,
-};
+pub(crate) use translate::automatic_translation_state_fingerprint;
 #[cfg(test)]
 pub(crate) use write_back::build_write_back_candidate;

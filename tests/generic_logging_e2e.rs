@@ -92,16 +92,22 @@ fn generic_unavailable_and_project_open_failures_are_persisted_without_task_reco
         1,
         "Unavailable Translate 必须建立恰好一份新运行日志"
     );
-    let unavailable_log =
-        fs::read_to_string(&unavailable_logs[0]).expect("Unavailable 运行日志必须可读取");
+    let (unavailable_log, unavailable_records) = read_jsonl_records(&unavailable_logs[0]);
     assert!(
-        unavailable_log.contains("\"code\":\"diagnostic.translation_task\"")
-            && unavailable_log.contains("\"code\":\"task.finished\"")
-            && unavailable_log.contains("\"kind\":\"unavailable\"")
-            && unavailable_log.contains("\"code\":\"translation.finished\"")
-            && unavailable_log.contains("\"kind\":\"incomplete\""),
+        unavailable_records
+            .iter()
+            .any(|record| record["event"] == "diagnostic.translation_task")
+            && unavailable_records
+                .iter()
+                .any(|record| record["event"] == "task.finished"
+                    && record["payload"]["outcome"]["kind"] == "unavailable")
+            && unavailable_records
+                .iter()
+                .any(|record| record["event"] == "translation.finished"
+                    && record["payload"]["result"]["kind"] == "incomplete"),
         "任务记录关闭时，Unavailable 的模型错误仍必须进入项目 JSONL：{unavailable_log}"
     );
+    assert_log_has_only_readable_diagnostics(&unavailable_log, &unavailable_records);
     assert!(
         !workspace.join("task-records").exists(),
         "显式关闭任务记录的测试不得依赖 Markdown 保存诊断"
@@ -124,18 +130,24 @@ fn generic_unavailable_and_project_open_failures_are_persisted_without_task_reco
         .filter(|path| !logs_before_failure.contains(path))
         .collect::<Vec<_>>();
     assert_eq!(new_logs.len(), 1, "项目打开失败必须建立恰好一份新运行日志");
-    let failure_log = fs::read_to_string(&new_logs[0]).expect("失败运行日志必须可读取");
+    let (failure_log, failure_records) = read_jsonl_records(&new_logs[0]);
+    let canonical_database = database
+        .canonicalize()
+        .expect("错误类型的项目数据库路径必须可规范化");
+    let readable_database = readable_windows_path(&canonical_database);
     assert!(
-        failure_log.contains("\"code\":\"diagnostic.extract\"")
-            && failure_log.contains("\"command\":\"extract\"")
-            && failure_log.contains("\"code\":\"filesystem.not_found\"")
-            && failure_log.contains("\"stage\":\"project_opening\""),
-        "项目打开失败必须把命令、阶段和结构化原因写入本次 JSONL：{failure_log}"
+        failure_records.iter().any(|record| {
+            record["event"] == "diagnostic.extract"
+                && record["context"]["command"] == "extract"
+                && record["payload"]["object"] == readable_database
+        }),
+        "项目打开失败必须把命令、对象和处理方法写入本次 JSONL：{failure_log}"
     );
+    assert_log_has_only_readable_diagnostics(&failure_log, &failure_records);
 }
 
 #[test]
-fn generic_extract_succeeds_when_project_log_cannot_be_created_and_reports_full_diagnostic() {
+fn generic_extract_succeeds_when_project_log_cannot_be_created_and_reports_readable_diagnostic() {
     let temporary = tempfile::tempdir().expect("应可建立项目日志建立失败进程测试目录");
     let root = temporary.path();
     let input = root.join("input");
@@ -193,27 +205,35 @@ fn generic_extract_succeeds_when_project_log_cannot_be_created_and_reports_full_
 
     let stderr = String::from_utf8(extract.stderr).expect("日志降级诊断必须是 UTF-8");
     let stderr = stderr.replace(['\u{2068}', '\u{2069}'], "");
+    let canonical_logs_root = logs_root
+        .canonicalize()
+        .expect("阻止日志建立的文件路径必须可规范化");
+    let expected_location = format!("Location: {}", readable_windows_path(&canonical_logs_root));
     for expected in [
         "Project logging is unavailable or degraded",
-        "project_log_path=",
-        "Error [observability.project_log.create]",
-        "Stage: Project logging",
-        "Location: project_log",
-        "component=project_log",
-        "operation=create",
-        "io_kind=already_exists",
-        "Impact: State was not changed",
+        expected_location.as_str(),
+        "Reason: The target object already exists",
         "Action: Check the path, filesystem state, and permissions",
     ] {
         assert!(
             stderr.contains(expected),
-            "日志建立失败必须保留完整诊断字段 {expected:?}：{stderr}"
+            "日志建立失败必须保留可读诊断字段 {expected:?}：{stderr}"
         );
     }
-    assert!(
-        stderr.contains(project) && stderr.contains("\\logs"),
-        "日志建立失败必须指出当前项目的具体日志路径：{stderr}"
-    );
+    for forbidden in [
+        "observability.project_log.create",
+        "Stage:",
+        "component=",
+        "operation=",
+        "io_kind=",
+        "raw_os_code=",
+        "Impact:",
+    ] {
+        assert!(
+            !stderr.contains(forbidden),
+            "日志建立失败不得公开内部字段 {forbidden:?}：{stderr}"
+        );
+    }
 }
 
 #[test]
@@ -361,7 +381,7 @@ fn generic_fixed_http_503_is_unavailable_and_preserves_the_structured_status() {
     let task_started = records
         .iter()
         .enumerate()
-        .filter(|(_, record)| record["code"] == "task.started")
+        .filter(|(_, record)| record["event"] == "task.started")
         .collect::<Vec<_>>();
     assert_eq!(
         task_started.len(),
@@ -376,7 +396,7 @@ fn generic_fixed_http_503_is_unavailable_and_preserves_the_structured_status() {
     let diagnostics = records
         .iter()
         .enumerate()
-        .filter(|(_, record)| record["code"] == "diagnostic.translation_task")
+        .filter(|(_, record)| record["event"] == "diagnostic.translation_task")
         .collect::<Vec<_>>();
     assert_eq!(
         diagnostics.len(),
@@ -385,46 +405,21 @@ fn generic_fixed_http_503_is_unavailable_and_preserves_the_structured_status() {
     );
     let diagnostic = diagnostics[0].1;
     assert_eq!(diagnostic["level"], "warn");
-    assert_eq!(diagnostic["payload"]["scope"], "translation_task");
     assert_eq!(
-        diagnostic["payload"]["report"],
+        diagnostic["payload"],
         serde_json::json!({
-            "effect": "progress_preserved",
-            "primary": {
-                "code": "http.status",
-                "stage": "model_request",
-                "issue": {
-                    "family": "http",
-                    "details": {
-                        "kind": "status",
-                        "endpoint": {
-                            "scheme": "http",
-                            "host": "127.0.0.1",
-                            "port": endpoint_port,
-                        },
-                        "status": 503,
-                        "retry_after_seconds": null,
-                        "provider_code": "service_unavailable",
-                        "provider_type": "server_error",
-                        "provider_message": "temporarily unavailable",
-                        "response_read_failure": null,
-                    },
-                },
-                "resolution": "check_model_service",
-            },
-            "related": [],
+            "object": format!("http://127.0.0.1:{endpoint_port}"),
+            "reason": "The external service rejected the request",
+            "help": "Check the model service response and account limits",
         }),
-        "HTTP 503 必须保留状态、Endpoint、供应商安全字段和已确认进度影响：{log}"
+        "HTTP 503 只应保留可读对象、原因和修改方法：{log}"
     );
-    let diagnostic_id = diagnostic["payload"]["id"]
-        .as_u64()
-        .expect("任务诊断 occurrence ID 必须是非零整数");
-    assert_ne!(diagnostic_id, 0, "任务诊断 occurrence ID 不得为零");
+    assert_log_has_only_readable_diagnostics(&log, &records);
 
     let task_finished = records
         .iter()
         .enumerate()
-        .filter(|(_, record)| record["code"] == "task.finished")
+        .filter(|(_, record)| record["event"] == "task.finished")
         .collect::<Vec<_>>();
     assert_eq!(
         task_finished.len(),
@@ -437,15 +432,15 @@ fn generic_fixed_http_503_is_unavailable_and_preserves_the_structured_status() {
         serde_json::json!({
             "task": {"ordinal": 1, "total": 1},
             "attempts": 1,
-            "outcome": {"kind": "unavailable", "diagnostic": diagnostic_id},
+            "outcome": {"kind": "unavailable"},
         }),
-        "task.finished 必须引用同一条 HTTP 503 occurrence：{log}"
+        "task.finished 只需说明当前任务结果：{log}"
     );
 
     let translation_finished = records
         .iter()
         .enumerate()
-        .filter(|(_, record)| record["code"] == "translation.finished")
+        .filter(|(_, record)| record["event"] == "translation.finished")
         .collect::<Vec<_>>();
     assert_eq!(
         translation_finished.len(),
@@ -497,7 +492,7 @@ fn generic_fixed_http_503_is_unavailable_and_preserves_the_structured_status() {
 
     let run_plan_finalized = records
         .iter()
-        .filter(|record| record["code"] == "run_plan.finalized")
+        .filter(|record| record["event"] == "run_plan.finalized")
         .collect::<Vec<_>>();
     assert_eq!(
         run_plan_finalized.len(),
@@ -517,7 +512,7 @@ fn generic_fixed_http_503_is_unavailable_and_preserves_the_structured_status() {
     let run_finished = records
         .iter()
         .enumerate()
-        .filter(|(_, record)| record["code"] == "run.finished")
+        .filter(|(_, record)| record["event"] == "run.finished")
         .collect::<Vec<_>>();
     assert_eq!(run_finished.len(), 1, "运行必须只有一个终态：{log}");
     assert_eq!(
@@ -620,61 +615,60 @@ fn generic_write_back_reports_recovery_required_after_publish_cleanup_failure() 
         .collect::<Vec<_>>();
     let diagnostic_records = records
         .iter()
-        .filter(|record| record["code"] == "diagnostic.publication")
+        .filter(|record| record["event"] == "diagnostic.publication")
         .collect::<Vec<_>>();
     assert_eq!(
         diagnostic_records.len(),
         1,
-        "发布收尾失败必须形成一条原子 Publication occurrence"
+        "发布收尾失败必须形成一条可读 Publication 诊断"
     );
     let diagnostic = diagnostic_records[0];
-    let occurrence = diagnostic["payload"]["id"]
-        .as_u64()
-        .expect("Publication occurrence ID 必须为正整数");
-    let report = &diagnostic["payload"]["report"];
-    assert_eq!(report["effect"], "applied_finalization_failed");
-    assert_eq!(report["primary"]["code"], "publication.finalization_failed");
-    assert_eq!(report["primary"]["stage"], "publication");
-    assert_eq!(report["primary"]["issue"]["family"], "publication");
-    let problem = &report["primary"]["issue"]["details"]["problem"];
-    assert_eq!(problem["kind"], "published_finalization_failed");
     let canonical_output_root = output_file
         .parent()
         .expect("输出文件必须拥有父目录")
         .canonicalize()
         .expect("已发布输出根必须可规范化");
     assert_eq!(
-        problem["output_root"],
+        diagnostic["payload"]["object"],
         canonical_output_root.to_string_lossy().as_ref()
     );
-    let residual = PathBuf::from(
-        problem["residual_path"]
-            .as_str()
-            .expect("发布收尾诊断必须保存残留路径"),
+    assert_eq!(
+        diagnostic["payload"]["reason"],
+        "The operation result exists but finalization failed"
     );
+    assert_eq!(
+        diagnostic["payload"]["help"],
+        "Do not delete the listed recovery artifacts; recover the output before retrying"
+    );
+    assert_log_has_only_readable_diagnostics(
+        &fs::read_to_string(&new_logs[0]).expect("发布日志必须可读取"),
+        &records,
+    );
+    let residual = workspace.join(".directory-publish/write_back/backup");
     assert!(residual.is_dir(), "诊断中的备份残留必须真实存在");
 
     let publication_finished = records
         .iter()
-        .find(|record| record["code"] == "publication.finished")
+        .find(|record| record["event"] == "publication.finished")
         .expect("发布收尾失败必须写入 Publication 终态");
     assert_eq!(
         publication_finished["payload"]["result"]["kind"],
         "recovery_required"
     );
-    assert_eq!(
-        publication_finished["payload"]["result"]["diagnostic"],
-        occurrence
+    assert!(
+        publication_finished["payload"]["result"]
+            .get("diagnostic")
+            .is_none()
     );
     let terminal = records.last().expect("运行日志必须有终态");
-    assert_eq!(terminal["code"], "run.finished");
+    assert_eq!(terminal["event"], "run.finished");
     assert_eq!(terminal["payload"]["result"]["kind"], "recovery_required");
-    assert_eq!(terminal["payload"]["result"]["diagnostic"], occurrence);
+    assert!(terminal["payload"]["result"].get("diagnostic").is_none());
     assert!(
         records.iter().all(|record| {
-            !(record["code"] == "publication.finished"
+            !(record["event"] == "publication.finished"
                 && record["payload"]["result"]["kind"] == "published")
-                && !(record["code"] == "run.finished"
+                && !(record["event"] == "run.finished"
                     && record["payload"]["result"]["kind"] == "succeeded")
         }),
         "发布收尾失败路径不得同时伪报发布或运行成功"
@@ -797,7 +791,7 @@ fn generic_cancellation_finishes_started_tasks_and_counts_unstarted_tasks() {
     assert_eq!(
         records
             .iter()
-            .filter(|record| record["code"] == "run.cancel_requested")
+            .filter(|record| record["event"] == "run.cancel_requested")
             .count(),
         1,
         "首个控制信号必须恰好记录一次取消请求：{log}"
@@ -805,11 +799,11 @@ fn generic_cancellation_finishes_started_tasks_and_counts_unstarted_tasks() {
 
     let started = records
         .iter()
-        .filter(|record| record["code"] == "task.started")
+        .filter(|record| record["event"] == "task.started")
         .collect::<Vec<_>>();
     let finished = records
         .iter()
-        .filter(|record| record["code"] == "task.finished")
+        .filter(|record| record["event"] == "task.finished")
         .collect::<Vec<_>>();
     assert_eq!(
         started.len(),
@@ -833,7 +827,7 @@ fn generic_cancellation_finishes_started_tasks_and_counts_unstarted_tasks() {
 
     let translation_finished = records
         .iter()
-        .filter(|record| record["code"] == "translation.finished")
+        .filter(|record| record["event"] == "translation.finished")
         .collect::<Vec<_>>();
     assert_eq!(
         translation_finished.len(),
@@ -870,7 +864,7 @@ fn generic_cancellation_finishes_started_tasks_and_counts_unstarted_tasks() {
             + tasks["cancelled"].as_u64().expect("cancelled 必须是 u64")
     );
     assert_eq!(
-        records.last().expect("取消日志不得为空")["code"],
+        records.last().expect("取消日志不得为空")["event"],
         "run.finished",
         "run.finished 必须是取消日志最后一条记录：{log}"
     );
@@ -1176,6 +1170,87 @@ fn read_jsonl_records(path: &Path) -> (String, Vec<serde_json::Value>) {
         .collect::<Vec<_>>();
     assert!(!records.is_empty(), "项目 JSONL 不得为空");
     (text, records)
+}
+
+fn assert_log_has_only_readable_diagnostics(log: &str, records: &[serde_json::Value]) {
+    let diagnostics = records
+        .iter()
+        .filter(|record| {
+            record["event"]
+                .as_str()
+                .is_some_and(|event| event.starts_with("diagnostic."))
+        })
+        .collect::<Vec<_>>();
+    assert!(!diagnostics.is_empty(), "样本必须包含诊断记录：{log}");
+    for diagnostic in diagnostics {
+        let payload = diagnostic["payload"]
+            .as_object()
+            .expect("诊断 payload 必须是对象");
+        let mut fields = payload.keys().map(String::as_str).collect::<Vec<_>>();
+        fields.sort_unstable();
+        assert_eq!(fields, ["help", "object", "reason"]);
+        for field in fields {
+            assert!(
+                payload[field]
+                    .as_str()
+                    .is_some_and(|value| !value.trim().is_empty()),
+                "诊断字段 {field} 必须是非空自然文本：{log}"
+            );
+        }
+    }
+    for forbidden in [
+        "\"occurrence\"",
+        "\"report\"",
+        "\"effect\"",
+        "\"stage\"",
+        "\"issue\"",
+        "\"resolution\"",
+        "\"query_id\"",
+        "\"request_id\"",
+        "expected_fingerprint",
+        "actual_fingerprint",
+        "provider_code",
+        "provider_type",
+        "provider_message",
+        "group_location",
+        "unit_role",
+    ] {
+        assert!(
+            !log.contains(forbidden),
+            "项目日志不得公开内部字段 {forbidden:?}：{log}"
+        );
+    }
+    assert_no_opaque_identifier(log);
+}
+
+fn assert_no_opaque_identifier(text: &str) {
+    let bytes = text.as_bytes();
+    assert!(
+        !bytes.windows(36).any(|candidate| {
+            candidate
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| match index {
+                    8 | 13 | 18 | 23 => *byte == b'-',
+                    _ => byte.is_ascii_hexdigit(),
+                })
+        }),
+        "用户可见日志不得包含 UUID：{text}"
+    );
+    assert!(
+        !bytes.windows(64).any(|candidate| {
+            candidate.iter().all(u8::is_ascii_hexdigit)
+                && candidate.first().is_some_and(|byte| !byte.is_ascii_digit())
+        }),
+        "用户可见日志不得包含 64 位十六进制标识：{text}"
+    );
+}
+
+fn readable_windows_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    text.strip_prefix(r"\\?\")
+        .unwrap_or(text.as_ref())
+        .to_owned()
 }
 
 fn assert_success(stage: &str, output: &Output) {

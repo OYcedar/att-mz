@@ -15,7 +15,8 @@ WriteBack 不使用 Lua。它只读取冻结来源、当前提取资产和译文
 
 ## 1. 候选构建
 
-ATT 从冻结来源建立完整内容树，并按 recipe 把 Current 译文写回对应 RPG Maker 值：
+ATT 从冻结来源建立完整内容树，并按 recipe 把当前译文写回对应 RPG Maker 值。人工译文
+优先于自动译文：
 
 - 普通字符串替换完整值；
 - 固定逐行或逐项内容保持规定的槽数和空槽；
@@ -28,27 +29,23 @@ ATT 从冻结来源建立完整内容树，并按 recipe 把 Current 译文写�
 
 ### 写回前符号修复
 
-WriteBack 在布局和文档改写前执行与源语言无关的全局译文符号修复。修复器使用原文符号
+WriteBack 在布局和文档改写前对自动译文执行与源语言无关的全局符号修复。修复器使用原文符号
 作为模板，只替换译文中能够唯一对应的现有符号；不插入、删除或移动字符，译文空白、
 Placeholder、内建控制符和 Rules Literal 逐字保留。引号和括号按开闭及嵌套关系判断，
 可以只修复一对符号中损坏的一端。局部多解不妨碍其他确定位置继续修复；修复器内部无法
 安全完成时保留该 Unit 原译文并继续构建候选。该步骤不是 Translate 验收，也不隐藏后续
 布局、候选验证或发布错误。用户取消不计为内部跳过，仍按 WriteBack 的现有取消终态结束。
-发布汇总报告尝试、实际修复、内部跳过的 Unit 数和替换符号数。
+发布汇总报告尝试、实际修复、内部跳过的 Unit 数和替换符号数。人工译文不经过符号修复。
 
-符号修复前，WriteBack 使用 `project_snapshot` 中的当前 Placeholder 规则和对应引擎内建
-控制符重新验收每项 Current 译文。原文或译文无法完成 Placeholder 保护、语言投影，或两者
-实际 Placeholder 绑定的数量、顺序、种类、原片段不一致时，WriteBack 以完整 Unit locator
-和结构化 Placeholder 诊断失败，不发布候选，也不把该错误计入符号修复内部跳过。
+对自动译文执行符号修复前，WriteBack 使用当前 Placeholder 规则和对应引擎内建控制符重新
+验收。原文或自动译文无法完成 Placeholder 保护、语言投影，或两者实际绑定不一致时，
+WriteBack 以可读 ID 说明对象、原因和修改方法，不发布候选，也不把该错误计入符号修复内部
+跳过。人工译文已经由 Manual apply 检查，不因 Placeholder 配置后来变化而重新判为无效。
 
 布局器无法安全自动断行时，WriteBack 保留该译文的显式硬换行并继续构建候选，不把它
 伪报成已经自动布局。成功结果中的 `manual_layout_units` 与结构化人工布局诊断逐项对应。
-每项诊断都包含：
-
-- 受影响逻辑单元的精确 `group_location`；
-- 每个逻辑单元的 `role`；
-- 显示区域 `region`；
-- 本次判断采用的 `max_fullwidth_chars`。
+每项诊断包含可读 ID、显示区域和本次采用的全角字符宽度，例如
+`Map023.json:event17:page1:dialogue42`。公开输出不要求理解内部位置或角色编码。
 
 布局宽度计算把 `\n<...>` 和 `\N<...>` 姓名框识别为零宽控制序列。姓名框必须包含闭合
 `>`，且其中不得出现控制字符；其中的 `\n[145]` 等方括号控制语法作为姓名框内容保留，
@@ -57,23 +54,21 @@ Placeholder、内建控制符和 Rules Literal 逐字保留。引号和括号按
 
 `Manual` 只表示布局器无法保证整个显示请求的阅读质量，不携带具体原因。它可能来自行
 过宽、没有安全断点、未知控制序列、保留的 Placeholder 前缀、控制字符，或同一请求中
-没有译文的原文段。处理每项诊断时，按 `group_location + role` 使用
-[Lua](../lua/README.md)取得唯一 locator、当前译文和完整 Group 形状，再检查该显示请求内
-的译文、保留原文、控制序列和已有硬换行：
+没有译文的原文段。处理每项诊断时，优先重新运行 Manual export，按相同可读 ID 找到当前
+译文；需要完整 Group 语境时，把全部待查 ID 合并到一次
+`ctx.translation.context(ids)`，再检查该显示请求内的译文、保留原文、控制序列和已有硬换行：
 
-- 原因只是行过宽或没有安全自动断点时，按 `region` 与 `max_fullwidth_chars` 加入显式硬
-  换行，用 `ctx.translation.set` 保持原来的字符串或字符串数组形状并提交；
+- 原因只是行过宽或没有安全自动断点时，按显示区域和宽度加入显式硬换行，在 TOML 中保持
+  `fixed` 的数组形状或按 `free` 自然分行，再运行 check/apply；
 - 无效 Placeholder、控制字符或译文语法返回相应 Translate 或修订步骤纠正；
 - 控制语法对游戏有效、但布局器无法理解，或问题来自必须保留的原文时，不破坏语法来追求
   零告警；记录判断，保留该诊断，并在隔离游戏副本的全部相关场景中确认实际显示正确。
 
-修订后重新 WriteBack。能够由显式硬换行解决的 locator 应不再告警；已经证明为游戏有效
+修订后重新 WriteBack。能够由显式硬换行解决的条目应不再告警；已经证明为游戏有效
 但布局器无法理解的内容可以继续告警，其完成证据是逐项记录和实际加载，不是告警消失。
 
-发布成功后，这些诊断逐项写入 stderr，并以 `diagnostic.write_back` Warn occurrence 写入
-当前 RunId 的 JSONL。每个 occurrence 的具体 RpgMaker issue 保存 `group_location`、`role`、
-`region` 和 `max_fullwidth_chars`，`resolution` 固定为 `adjust_manual_layout`；只有
-`publication.finished` 中的 `manual_layout_units` 总数不足以让操作者找到需要处理的位置。
+发布成功后，这些诊断逐项写入 stderr，并以 `diagnostic.write_back` 写入当前 RunId 的
+JSONL。payload 只保存对象、原因和修改方法；汇总中的 `manual_layout_units` 提供总数。
 人工布局本身不改变成功发布的业务结果；若警告无法呈现，按独立的进程呈现失败处理。
 
 ## 2. 完整验证
@@ -101,21 +96,14 @@ Placeholder、内建控制符和 Rules Literal 逐字保留。引号和括号按
 发布完成后按[全量验收指南](../guides/acceptance.md)检查全部输出差异、源语残留、人工布局、
 组合项目覆盖和实际加载；WriteBack 成功本身不是整个翻译任务的完成证明。
 
-每次命令写 `publication.started` 和唯一 `publication.finished`。成功时
-`payload.result.kind = "published"`，其 RPG Maker 汇总保存 translated/original/
+每次命令写 `publication.started` 和唯一 `publication.finished`。成功时 RPG Maker 汇总保存 translated/original/
 auto-wrapped units、插入换行、全角缩进、manual-layout units，以及符号修复尝试 Unit、
 实际修复 Unit、内部跳过 Unit 和替换符号数；失败时 result 为 `not_published`、
-`recovery_required` 或 `outcome_unknown`，并引用同一 `diagnostic.publication`
-occurrence。
+`recovery_required` 或 `outcome_unknown`。具体问题由同次可读 `diagnostic.publication`
+说明，不附内部诊断引用。
 
-恢复判断不能只看 `run.finished`。从 `publication.finished` 取得 occurrence ID，再读取该
-原子诊断的 `report.effect`、`primary` 和递归 `related`。目录发布 issue 直接保存
-`output_root`、`candidate_root`、`residual_path` 或 `recovery_artifacts`；嵌套 backend
-diagnostic 保存具体文件系统 code、operation、I/O kind 与 OS code。发布已经生效但收尾
-失败时，effect 为 `applied_finalization_failed`，运行终态也可能是 `failed`。保持项目、
-输入、目标和恢复产物不变，先按
-[目录发布规格第 4 节](../runtime/directory-publishing.md#4-一次发布与恢复)排除
-`filesystem.journal_corrupt`、目标与已知旧目录均缺失、缺少必要 backup 等不能自动修复的
-情况，并修正实际文件系统原因。只有符合自动恢复条件时，才执行一次同一项目、同一目标的
-WriteBack；下一次同目标发布准备会先按 journal 恢复。`outcome_unknown` 禁止重跑试探，
-两者不能互相替代。
+恢复路径固定为 `<parent>/.directory-publish/<target-name>/{stage,backup,journal}`。保持项目、
+输入、目标和这些路径不变，按[目录发布规格](../runtime/directory-publishing.md)处理诊断中的
+对象、原因和修改方法。发布已经生效但只剩清理失败时，修正占用或权限后重新运行同一目标
+WriteBack，下一次准备会先恢复。journal 损坏、必要 backup 缺失或结果未知时禁止重跑试探，
+也不手工移动或删除恢复目录。

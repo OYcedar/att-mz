@@ -12,13 +12,11 @@ use std::sync::{Arc, OnceLock};
 
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, DropBehavior, OpenFlags, Row, Transaction, params};
-use uuid::Uuid;
 
 use crate::diagnostic::{
     Diagnostic, DiagnosticReport, FileSystemDiagnosticContext, FileSystemDiagnosticStage,
     FileSystemIssue, FileSystemOperation, FileSystemProblem, GenericDiagnosticStage, GenericIssue,
-    GenericJsonErrorCategory, GenericLanguageProjectionProblem, GenericLanguageViolation,
-    GenericPlaceholderMultisetProblem, GenericProblem, GenericProjectDatabaseProblem,
+    GenericLanguageViolation, GenericProblem, GenericProjectDatabaseProblem,
     GenericProjectTranslationProblem, GenericResourceKind, IoFailure, RelatedFailureRelation,
     SafeIdentifier, SafePath, SqliteDiagnosticContext, SqliteDiagnosticStage, SqliteDriverFailure,
     SqliteIssue, SqliteOperation, SqliteProblem, SqliteTransactionState, StateEffect,
@@ -34,13 +32,9 @@ use crate::runtime::sqlite::{
     apply_att_sqlite_cancellable_read_write_policy, apply_att_sqlite_new_database_page_policy,
     suspend_att_sqlite_cancellation,
 };
-use crate::translation::placeholder::PlaceholderRestoreError;
 #[cfg(test)]
 use crate::translation::placeholder::{
-    PlaceholderProtectionError, PlaceholderRuleCompilationError, PlaceholderWorkerOperation,
-};
-use crate::translation::placeholder_projection::{
-    LanguageTextProjectionError, PlaceholderMultisetError,
+    PlaceholderRuleCompilationError, PlaceholderWorkerOperation,
 };
 use crate::translation::planning_resource::{
     CompiledTerminology, TerminologyDefinitionError, TerminologyEntry,
@@ -53,14 +47,8 @@ use super::jsonl::scan_input_tree;
 use super::jsonl::{GenericInputSnapshot, GenericJsonlError, scan_input_tree_with_cancellation};
 use super::placeholder::{
     GenericCompiledPlaceholderRules, GenericPlaceholderError, GenericPlaceholderService,
-    validate_translation_placeholders_and_binding_with_cancellation,
 };
-#[cfg(test)]
-use super::translate::GenericPlanningUnitLocator;
-use super::translate::{
-    GenericPlanningError, GenericUnitKey, GenericUnitMap,
-    manual_translation_state_fingerprint_with_cancellation,
-};
+use super::translate::{GenericPlanningError, GenericUnitKey, GenericUnitMap};
 
 const DATABASE_FILE_NAME: &str = "project.db";
 const FINGERPRINT_CANCELLATION_CHECK_BYTES: NonZeroUsize =
@@ -108,23 +96,37 @@ const CREATE_INITIAL_SCHEMA_SQL: &str = "CREATE TABLE generic_project (
                      instr(source_text, char(13)) = 0 AND instr(source_text, char(0)) = 0
                  ),
                  translation TEXT,
-                 translation_origin TEXT CHECK (
-                     translation_origin IS NULL OR translation_origin IN ('automatic', 'manual')
-                 ),
                  translation_state BLOB CHECK (
                      translation_state IS NULL OR length(translation_state) = 32
                  ),
                  PRIMARY KEY (group_id, unit_id),
                  UNIQUE (group_id, ordinal),
                  CHECK (
-                     (translation IS NULL AND translation_origin IS NULL AND translation_state IS NULL)
+                     (translation IS NULL AND translation_state IS NULL)
                      OR
                      (translation IS NOT NULL AND length(trim(translation)) > 0
                       AND instr(translation, char(13)) = 0
                       AND instr(translation, char(0)) = 0
-                      AND translation_origin IS NOT NULL
                       AND translation_state IS NOT NULL)
                  )
+             ) STRICT;
+             CREATE TABLE generic_manual_translation (
+                 group_id TEXT NOT NULL CHECK (length(CAST(group_id AS BLOB)) > 0),
+                 unit_id TEXT NOT NULL CHECK (length(CAST(unit_id AS BLOB)) > 0),
+                 readable_id TEXT NOT NULL CHECK (length(readable_id) > 0),
+                 translation_type TEXT NOT NULL CHECK (translation_type = 'free'),
+                 source_json TEXT NOT NULL CHECK (
+                     json_valid(source_json) AND json_type(source_json) = 'array'
+                 ),
+                 translation_json TEXT NOT NULL CHECK (
+                     json_valid(translation_json)
+                     AND json_type(translation_json) = 'array'
+                     AND json_array_length(translation_json) > 0
+                 ),
+                 applicability_fingerprint BLOB NOT NULL CHECK (
+                     length(applicability_fingerprint) = 32
+                 ),
+                 PRIMARY KEY (group_id, unit_id)
              ) STRICT;
              CREATE TABLE translation_resource (
                  resource_kind TEXT PRIMARY KEY CHECK (
@@ -142,6 +144,7 @@ const SELECT_GENERIC_ATT_SCHEMA: &str = "SELECT type, name, tbl_name, sql
           'generic_file',
           'generic_group',
           'generic_unit',
+          'generic_manual_translation',
           'translation_resource'
       )
     ORDER BY type, name";
@@ -152,10 +155,8 @@ const CREATE_PENDING_TRANSLATION_COMMIT_SQL: &str = "
         expected_source_text TEXT NOT NULL,
         expected_group_context BLOB NOT NULL,
         translation TEXT NOT NULL,
-        translation_origin TEXT NOT NULL,
         translation_state BLOB NOT NULL,
         expected_translation TEXT,
-        expected_translation_origin TEXT,
         expected_translation_state BLOB,
         PRIMARY KEY (group_id, unit_id)
     ) STRICT, WITHOUT ROWID
@@ -167,17 +168,14 @@ const INSERT_PENDING_TRANSLATION_COMMIT_SQL: &str = "
         expected_source_text,
         expected_group_context,
         translation,
-        translation_origin,
         translation_state,
         expected_translation,
-        expected_translation_origin,
         expected_translation_state
-    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
 ";
 const APPLY_PENDING_TRANSLATION_COMMIT_SQL: &str = "
     UPDATE main.generic_unit AS unit
     SET translation = pending.translation,
-        translation_origin = pending.translation_origin,
         translation_state = pending.translation_state
     FROM temp.pending_translation_commit AS pending
     JOIN main.generic_group AS group_record
@@ -190,13 +188,11 @@ const APPLY_PENDING_TRANSLATION_COMMIT_SQL: &str = "
           (
               pending.expected_translation IS NULL
               AND unit.translation IS NULL
-              AND unit.translation_origin IS NULL
               AND unit.translation_state IS NULL
           )
           OR
           (
               unit.translation = pending.expected_translation
-              AND unit.translation_origin = pending.expected_translation_origin
               AND unit.translation_state = pending.expected_translation_state
           )
       )
@@ -204,10 +200,14 @@ const APPLY_PENDING_TRANSLATION_COMMIT_SQL: &str = "
 ";
 const LOAD_UNITS_NATURAL_SQL: &str = "
     SELECT u.group_id, u.unit_id, u.ordinal, u.source_text,
-           u.translation, u.translation_origin, u.translation_state
+           u.translation, u.translation_state,
+           manual.translation_json, manual.applicability_fingerprint
     FROM main.generic_file AS f
     CROSS JOIN main.generic_group AS g
     CROSS JOIN main.generic_unit AS u
+    LEFT JOIN main.generic_manual_translation AS manual
+      ON manual.group_id = u.group_id
+     AND manual.unit_id = u.unit_id
     WHERE g.relative_path = f.relative_path
       AND u.group_id = g.group_id
     ORDER BY f.ordinal, g.ordinal, u.ordinal
@@ -251,21 +251,12 @@ impl TranslationResources {
 #[derive(Clone)]
 pub(crate) struct GenericCompiledPlaceholderResource {
     canonical_json: Arc<String>,
-    service: GenericPlaceholderService,
     compiled: GenericCompiledPlaceholderRules,
 }
 
 impl GenericCompiledPlaceholderResource {
     pub(crate) fn canonical_json(&self) -> &str {
         self.canonical_json.as_str()
-    }
-
-    pub(crate) const fn service(&self) -> GenericPlaceholderService {
-        self.service
-    }
-
-    pub(crate) fn compiled(&self) -> &GenericCompiledPlaceholderRules {
-        &self.compiled
     }
 }
 
@@ -289,10 +280,6 @@ pub(crate) struct GenericCompiledTerminologyResource {
 impl GenericCompiledTerminologyResource {
     pub(crate) fn canonical_json(&self) -> &str {
         self.canonical_json.as_str()
-    }
-
-    pub(crate) fn compiled(&self) -> &CompiledTerminology {
-        self.compiled.as_ref()
     }
 }
 
@@ -429,6 +416,10 @@ impl GenericStoredUnit {
     pub(crate) fn translation(&self) -> Option<&GenericStoredTranslation> {
         self.translation.as_ref()
     }
+
+    pub(crate) const fn ordinal(&self) -> usize {
+        self.ordinal
+    }
 }
 
 /// 持久化中的一个 Group。
@@ -456,6 +447,10 @@ impl GenericStoredGroup {
 
     pub(crate) fn units(&self) -> &[GenericStoredUnit] {
         &self.units
+    }
+
+    pub(crate) const fn ordinal(&self) -> usize {
+        self.ordinal
     }
 }
 
@@ -501,25 +496,6 @@ pub(crate) enum TranslationOrigin {
     Manual,
 }
 
-impl TranslationOrigin {
-    const fn storage_name(self) -> &'static str {
-        match self {
-            Self::Automatic => "automatic",
-            Self::Manual => "manual",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self, GenericProjectError> {
-        match value {
-            "automatic" => Ok(Self::Automatic),
-            "manual" => Ok(Self::Manual),
-            _ => Err(invalid_database(
-                GenericProjectDatabaseProblem::UnknownTranslationOrigin,
-            )),
-        }
-    }
-}
-
 /// 一个经过上游验收、准备原子提交的 Unit 译文。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TranslationWrite {
@@ -528,7 +504,6 @@ pub(crate) struct TranslationWrite {
     pub(crate) expected_source_text: String,
     pub(crate) expected_group_context: Sha256Fingerprint,
     pub(crate) translation: String,
-    pub(crate) origin: TranslationOrigin,
     pub(crate) state_fingerprint: Sha256Fingerprint,
     pub(crate) expected_translation: Option<GenericStoredTranslation>,
 }
@@ -769,7 +744,7 @@ impl GenericProjectStore {
         )?;
         let candidate_path = self
             .workspace_root
-            .join(format!(".{DATABASE_FILE_NAME}.init-{}.tmp", Uuid::new_v4()));
+            .join(format!(".{DATABASE_FILE_NAME}.init.tmp"));
         fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1048,13 +1023,12 @@ impl GenericProjectStore {
                         })?;
                     for write in writes {
                         self.ensure_not_cancelled()?;
-                        let (expected_translation, expected_origin, expected_state) = write
+                        let (expected_translation, expected_state) = write
                             .expected_translation
                             .as_ref()
-                            .map_or((None, None, None), |translation| {
+                            .map_or((None, None), |translation| {
                                 (
                                     Some(translation.translation.as_str()),
-                                    Some(translation.origin.storage_name()),
                                     Some(translation.state_fingerprint.as_bytes().as_slice()),
                                 )
                             });
@@ -1065,10 +1039,8 @@ impl GenericProjectStore {
                                 write.expected_source_text,
                                 write.expected_group_context.as_bytes().as_slice(),
                                 write.translation,
-                                write.origin.storage_name(),
                                 write.state_fingerprint.as_bytes().as_slice(),
                                 expected_translation,
-                                expected_origin,
                                 expected_state,
                             ])
                             .map_err(|source| GenericProjectError::Sqlite {
@@ -1317,7 +1289,6 @@ impl GenericProjectStore {
                         .prepare_cached(
                             "UPDATE generic_unit
                              SET translation = NULL,
-                                 translation_origin = NULL,
                                  translation_state = NULL
                              WHERE group_id = ?1 AND unit_id = ?2
                                AND source_text = ?3
@@ -1326,8 +1297,7 @@ impl GenericProjectStore {
                                    WHERE group_id = ?1 AND context_fingerprint = ?4
                                )
                                AND translation = ?5
-                               AND translation_origin = ?6
-                               AND translation_state = ?7",
+                               AND translation_state = ?6",
                         )
                         .map_err(|source| GenericProjectError::Sqlite {
                             operation: "准备清除失效 Generic 译文",
@@ -1342,7 +1312,6 @@ impl GenericProjectStore {
                                 invalidation.expected_source_text,
                                 invalidation.expected_group_context.as_bytes().as_slice(),
                                 invalidation.expected_translation.translation,
-                                invalidation.expected_translation.origin.storage_name(),
                                 invalidation
                                     .expected_translation
                                     .state_fingerprint
@@ -1815,10 +1784,6 @@ pub(crate) enum GenericProjectError {
     },
     BlankProfileId,
     InvalidResource(GenericProjectResourceError),
-    UnitNotFound {
-        group_id: String,
-        unit_id: String,
-    },
 }
 
 impl fmt::Display for GenericProjectError {
@@ -1925,9 +1890,6 @@ impl fmt::Display for GenericProjectError {
             ),
             Self::BlankProfileId => formatter.write_str("Generic Profile ID 不能为空白"),
             Self::InvalidResource(source) => write!(formatter, "Generic 翻译资源无效：{source}"),
-            Self::UnitNotFound { group_id, unit_id } => {
-                write!(formatter, "Generic Unit 不存在：{group_id:?}/{unit_id:?}")
-            }
         }
     }
 }
@@ -1975,8 +1937,7 @@ impl Error for GenericProjectError {
             | Self::InvalidTranslation { source: None, .. }
             | Self::DuplicateTranslationWrite { .. }
             | Self::DuplicateTranslationClear { .. }
-            | Self::BlankProfileId
-            | Self::UnitNotFound { .. } => None,
+            | Self::BlankProfileId => None,
         }
     }
 }
@@ -2165,10 +2126,6 @@ impl GenericProjectError {
             }
             Self::BlankProfileId => generic(GenericProblem::BlankProfileId),
             Self::InvalidResource(source) => generic_project_resource_report(source, stage, effect),
-            Self::UnitNotFound { group_id, unit_id } => generic(GenericProblem::UnitNotFound {
-                group_id: project_safe_identifier(group_id, "group_id"),
-                unit_id: project_safe_identifier(unit_id, "unit_id"),
-            }),
         }
     }
 }
@@ -2185,16 +2142,6 @@ fn invalid_database(problem: GenericProjectDatabaseProblem) -> GenericProjectErr
     GenericProjectError::InvalidDatabase {
         problem,
         source: None,
-    }
-}
-
-fn invalid_database_with_source(
-    problem: GenericProjectDatabaseProblem,
-    source: GenericPlanningError,
-) -> GenericProjectError {
-    GenericProjectError::InvalidDatabase {
-        problem,
-        source: Some(Box::new(source)),
     }
 }
 
@@ -2396,8 +2343,7 @@ impl GenericProjectError {
             | Self::DuplicateTranslationWrite { .. }
             | Self::DuplicateTranslationClear { .. }
             | Self::BlankProfileId
-            | Self::InvalidResource(_)
-            | Self::UnitNotFound { .. } => false,
+            | Self::InvalidResource(_) => false,
         }
     }
 }
@@ -2519,129 +2465,6 @@ struct ReconciledSnapshot {
     files: Vec<GenericStoredFile>,
     preserved_translations: usize,
     cleared_translations: usize,
-}
-
-/// 在 Lua 已打开的同一项目事务内，从当前项目资源重建人工译文状态。
-#[cfg(test)]
-pub(crate) fn manual_translation_state_for_connection(
-    connection: &Connection,
-    group_id: &str,
-    unit_id: &str,
-) -> Result<Sha256Fingerprint, GenericProjectError> {
-    manual_translation_state_for_connection_with_cancellation(
-        connection,
-        group_id,
-        unit_id,
-        &CooperativeCancellation::default(),
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn manual_translation_state_for_connection_with_cancellation(
-    connection: &Connection,
-    group_id: &str,
-    unit_id: &str,
-    cancellation: &CooperativeCancellation,
-) -> Result<Sha256Fingerprint, GenericProjectError> {
-    let facts = load_manual_translation_state_facts(connection, group_id, unit_id, cancellation)?;
-    let placeholder = compiled_placeholder_resource_for_connection_with_cancellation(
-        connection,
-        None,
-        cancellation,
-    )?;
-    ensure_generic_operation_not_cancelled(cancellation)?;
-    let binding = placeholder
-        .service()
-        .protect(&facts.kind, &facts.source_text, placeholder.compiled())
-        .map_err(placeholder_resource_error)?
-        .binding_fingerprint();
-    ensure_generic_operation_not_cancelled(cancellation)?;
-    manual_translation_state_from_facts(&facts, group_id, unit_id, binding, cancellation)
-}
-
-pub(crate) fn validated_manual_translation_state_with_compiled_rules_for_connection_with_cancellation(
-    connection: &Connection,
-    group_id: &str,
-    unit_id: &str,
-    translation: &str,
-    service: &GenericPlaceholderService,
-    compiled: &GenericCompiledPlaceholderRules,
-    cancellation: &CooperativeCancellation,
-) -> Result<Sha256Fingerprint, GenericProjectError> {
-    let facts = load_manual_translation_state_facts(connection, group_id, unit_id, cancellation)?;
-    let binding = validate_translation_placeholders_and_binding_with_cancellation(
-        service,
-        compiled,
-        &facts.kind,
-        &facts.source_text,
-        translation,
-        || ensure_generic_operation_not_cancelled(cancellation),
-    )?
-    .map_err(|source| manual_translation_placeholder_error(group_id, unit_id, source))?;
-    manual_translation_state_from_facts(&facts, group_id, unit_id, binding, cancellation)
-}
-
-struct ManualTranslationStateFacts {
-    language_pair: LanguagePair,
-    kind: String,
-    context: Sha256Fingerprint,
-    source_text: String,
-}
-
-fn load_manual_translation_state_facts(
-    connection: &Connection,
-    group_id: &str,
-    unit_id: &str,
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
-) -> Result<ManualTranslationStateFacts, GenericProjectError> {
-    const OPERATION: &str = "读取 Generic Lua 人工译文状态事实";
-
-    cancellation.ensure_running()?;
-    let mut statement = connection
-        .prepare(
-            "SELECT generic_project.source_language, generic_project.target_language,
-                    generic_group.kind, generic_group.context_fingerprint,
-                    generic_unit.source_text
-             FROM main.generic_unit AS generic_unit
-             JOIN main.generic_group AS generic_group USING (group_id)
-             JOIN main.generic_project AS generic_project
-               ON generic_project.singleton = 1
-             WHERE generic_unit.group_id = ?1 AND generic_unit.unit_id = ?2",
-        )
-        .map_err(|source| cancellable_sqlite_error(OPERATION, source, cancellation))?;
-    let mut rows = statement
-        .query(params![group_id, unit_id])
-        .map_err(|source| cancellable_sqlite_error(OPERATION, source, cancellation))?;
-    let Some(row) = rows
-        .next()
-        .map_err(|source| cancellable_sqlite_error(OPERATION, source, cancellation))?
-    else {
-        return Err(GenericProjectError::UnitNotFound {
-            group_id: clone_text_with_cancellation(group_id, cancellation)?,
-            unit_id: clone_text_with_cancellation(unit_id, cancellation)?,
-        });
-    };
-    let source_language =
-        clone_sqlite_text_column_with_cancellation(row, 0, OPERATION, cancellation)?;
-    let target_language =
-        clone_sqlite_text_column_with_cancellation(row, 1, OPERATION, cancellation)?;
-    let kind = clone_sqlite_text_column_with_cancellation(row, 2, OPERATION, cancellation)?;
-    let context = clone_sqlite_blob_column_with_cancellation(row, 3, OPERATION, cancellation)?;
-    let source_text = clone_sqlite_text_column_with_cancellation(row, 4, OPERATION, cancellation)?;
-    drop(rows);
-    drop(statement);
-    cancellation.ensure_running()?;
-    let language_pair = LanguagePair::new(
-        LanguageId::parse(&source_language)?,
-        LanguageId::parse(&target_language)?,
-    );
-    cancellation.ensure_running()?;
-    Ok(ManualTranslationStateFacts {
-        language_pair,
-        kind,
-        context: read_fingerprint(context, "context_fingerprint")?,
-        source_text,
-    })
 }
 
 fn clone_sqlite_text_column_with_cancellation(
@@ -2858,37 +2681,6 @@ fn invalid_sqlite_utf8_error(
         column: index,
         valid_up_to,
         error_len,
-    })
-}
-
-fn manual_translation_state_from_facts(
-    facts: &ManualTranslationStateFacts,
-    group_id: &str,
-    unit_id: &str,
-    binding: Sha256Fingerprint,
-    cancellation: &CooperativeCancellation,
-) -> Result<Sha256Fingerprint, GenericProjectError> {
-    let key = GenericUnitKey::new(
-        clone_text_with_cancellation(group_id, cancellation)?,
-        clone_text_with_cancellation(unit_id, cancellation)?,
-    );
-    manual_translation_state_fingerprint_with_cancellation(
-        &facts.language_pair,
-        &key,
-        &facts.source_text,
-        facts.context,
-        binding,
-        cancellation,
-    )
-    .map_err(|source| {
-        if source.is_cancelled() {
-            GenericProjectError::Cancelled
-        } else {
-            invalid_database_with_source(
-                GenericProjectDatabaseProblem::ManualTranslationStateFailure,
-                source,
-            )
-        }
     })
 }
 
@@ -3310,9 +3102,9 @@ fn replace_snapshot(
         let mut unit_statement = transaction
             .prepare_cached(
                 "INSERT INTO generic_unit (
-                             group_id, unit_id, ordinal, source_text,
-                             translation, translation_origin, translation_state
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                         group_id, unit_id, ordinal, source_text,
+                             translation, translation_state
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )
             .map_err(|source| GenericProjectError::Sqlite {
                 operation: "写入 Generic Unit",
@@ -3344,13 +3136,12 @@ fn replace_snapshot(
                     })?;
                 for unit in &group.units {
                     ensure_generic_operation_not_cancelled(cancellation)?;
-                    let (translation, origin, state) =
+                    let (translation, state) =
                         unit.translation
                             .as_ref()
-                            .map_or((None, None, None), |translation| {
+                            .map_or((None, None), |translation| {
                                 (
                                     Some(translation.translation.as_str()),
-                                    Some(translation.origin.storage_name()),
                                     Some(translation.state_fingerprint.as_bytes().as_slice()),
                                 )
                             });
@@ -3361,7 +3152,6 @@ fn replace_snapshot(
                             to_i64(unit.ordinal)?,
                             unit.source_text,
                             translation,
-                            origin,
                             state
                         ])
                         .map_err(|source| GenericProjectError::Sqlite {
@@ -3416,50 +3206,6 @@ fn load_translation_resources_rows_with_cancellation(
             cancellation,
         )?,
     })
-}
-
-pub(crate) fn compiled_placeholder_resource_for_connection_with_cancellation(
-    connection: &Connection,
-    cached: Option<&GenericCompiledPlaceholderResource>,
-    cancellation: &CooperativeCancellation,
-) -> Result<GenericCompiledPlaceholderResource, GenericProjectError> {
-    let canonical_json = load_translation_resource_row_with_cancellation(
-        connection,
-        PLACEHOLDER_RULES_RESOURCE,
-        cancellation,
-    )?;
-    if let Some(cached) = cached
-        && bytes_equal_with_cancellation(
-            cached.canonical_json().as_bytes(),
-            canonical_json.as_bytes(),
-            cancellation,
-        )?
-    {
-        return Ok(cached.clone());
-    }
-    compile_placeholder_resource_with_cancellation(canonical_json, cancellation)
-}
-
-pub(crate) fn compiled_terminology_resource_for_connection_with_cancellation(
-    connection: &Connection,
-    cached: Option<&GenericCompiledTerminologyResource>,
-    cancellation: &CooperativeCancellation,
-) -> Result<GenericCompiledTerminologyResource, GenericProjectError> {
-    let canonical_json = load_translation_resource_row_with_cancellation(
-        connection,
-        TERMINOLOGY_RESOURCE,
-        cancellation,
-    )?;
-    if let Some(cached) = cached
-        && bytes_equal_with_cancellation(
-            cached.canonical_json().as_bytes(),
-            canonical_json.as_bytes(),
-            cancellation,
-        )?
-    {
-        return Ok(cached.clone());
-    }
-    compile_terminology_resource_with_cancellation(canonical_json, cancellation)
 }
 
 fn load_translation_resource_row_with_cancellation(
@@ -3666,23 +3412,17 @@ fn load_snapshot_rows(
             "解码 Generic Unit",
             cancellation,
         )?;
-        let origin = clone_optional_sqlite_text_column_with_cancellation(
+        let state = clone_optional_sqlite_blob_column_with_cancellation(
             row,
             5,
             "解码 Generic Unit",
             cancellation,
         )?;
-        let state = clone_optional_sqlite_blob_column_with_cancellation(
-            row,
-            6,
-            "解码 Generic Unit",
-            cancellation,
-        )?;
-        let translation = match (translation, origin, state) {
-            (None, None, None) => None,
-            (Some(translation), Some(origin), Some(state)) => Some(GenericStoredTranslation {
+        let automatic_translation = match (translation, state) {
+            (None, None) => None,
+            (Some(translation), Some(state)) => Some(GenericStoredTranslation {
                 translation,
-                origin: TranslationOrigin::parse(&origin)?,
+                origin: TranslationOrigin::Automatic,
                 state_fingerprint: read_fingerprint(state, "translation_state")?,
             }),
             _ => {
@@ -3694,6 +3434,18 @@ fn load_snapshot_rows(
                 ));
             }
         };
+        let manual_translation_json = clone_optional_sqlite_text_column_with_cancellation(
+            row,
+            6,
+            "解码 Generic 人工译文",
+            cancellation,
+        )?;
+        let manual_state = clone_optional_sqlite_blob_column_with_cancellation(
+            row,
+            7,
+            "解码 Generic 人工译文",
+            cancellation,
+        )?;
         cancellation.ensure_running()?;
         let Some(&(file_index, group_index)) =
             group_indexes.get_with_cancellation(&group_id, || cancellation.ensure_running())?
@@ -3705,6 +3457,59 @@ fn load_snapshot_rows(
                 },
             ));
         };
+        let group = &files[file_index].groups[group_index];
+        let source_lines = source_text
+            .split('\n')
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let readable_path = files[file_index]
+            .relative_path
+            .to_string_lossy()
+            .replace('\\', "/");
+        let expected_manual_state = crate::manual::generic_manual_applicability(
+            &group_id,
+            &unit_id,
+            &readable_path,
+            group.kind(),
+            &source_lines,
+        );
+        let manual_translation = match (manual_translation_json, manual_state) {
+            (None, None) => None,
+            (Some(translation_json), Some(state)) => {
+                let state = read_fingerprint(state, "applicability_fingerprint")?;
+                if state != expected_manual_state {
+                    None
+                } else {
+                    let lines =
+                        serde_json::from_str::<Vec<String>>(&translation_json).map_err(|_| {
+                            invalid_database(
+                                GenericProjectDatabaseProblem::ManualTranslationStateFailure,
+                            )
+                        })?;
+                    if lines.is_empty()
+                        || lines.iter().any(|line| {
+                            line.chars()
+                                .any(|character| matches!(character, '\r' | '\n' | '\0'))
+                        })
+                    {
+                        return Err(invalid_database(
+                            GenericProjectDatabaseProblem::ManualTranslationStateFailure,
+                        ));
+                    }
+                    Some(GenericStoredTranslation {
+                        translation: lines.join("\n"),
+                        origin: TranslationOrigin::Manual,
+                        state_fingerprint: expected_manual_state,
+                    })
+                }
+            }
+            _ => {
+                return Err(invalid_database(
+                    GenericProjectDatabaseProblem::ManualTranslationStateFailure,
+                ));
+            }
+        };
+        let translation = manual_translation.or(automatic_translation);
         files[file_index].groups[group_index]
             .units
             .push(GenericStoredUnit {
@@ -4087,97 +3892,6 @@ fn validate_schema_with_compiled_resources(
     }
     ensure_generic_operation_not_cancelled(cancellation)?;
     Ok(compiled_resources)
-}
-
-pub(crate) fn validate_project_connection_with_compiled_resources_and_cancellation(
-    connection: &Connection,
-    expected: &GenericProject,
-    terminology: &GenericCompiledTerminologyResource,
-    placeholder: &GenericCompiledPlaceholderResource,
-    cancellation: &CooperativeCancellation,
-) -> Result<(), GenericProjectError> {
-    validate_project_connection_with_compiled_resources(
-        connection,
-        expected,
-        Some((terminology, placeholder)),
-        cancellation,
-    )
-}
-
-fn validate_project_connection_with_compiled_resources(
-    connection: &Connection,
-    expected: &GenericProject,
-    compiled_resources: Option<(
-        &GenericCompiledTerminologyResource,
-        &GenericCompiledPlaceholderResource,
-    )>,
-    cancellation: &CooperativeCancellation,
-) -> Result<(), GenericProjectError> {
-    ensure_generic_operation_not_cancelled(cancellation)?;
-    validate_schema_with_compiled_resources(connection, compiled_resources, cancellation)?;
-    ensure_generic_operation_not_cancelled(cancellation)?;
-    let store = GenericProjectStore::for_workspace_with_cancellation(
-        expected.workspace_root.clone(),
-        cancellation.clone(),
-    );
-    let actual = store.read_project_with_connection(connection)?;
-    ensure_generic_operation_not_cancelled(cancellation)?;
-    if actual.project_name != expected.project_name {
-        return Err(invalid_database(
-            GenericProjectDatabaseProblem::LuaChangedProjectName,
-        ));
-    }
-    if actual.source_root != expected.source_root {
-        return Err(invalid_database(
-            GenericProjectDatabaseProblem::LuaChangedSourceRoot,
-        ));
-    }
-    if actual.language_pair != expected.language_pair {
-        return Err(invalid_database(
-            GenericProjectDatabaseProblem::LuaChangedLanguagePair,
-        ));
-    }
-    if actual.extracted_raw_fingerprint != expected.extracted_raw_fingerprint
-        || actual.extracted_asset_fingerprint != expected.extracted_asset_fingerprint
-    {
-        return Err(invalid_database(
-            GenericProjectDatabaseProblem::LuaChangedExtractFingerprint,
-        ));
-    }
-    validate_source_write_back_separation(&actual.source_root, &actual.workspace_root)?;
-
-    let Some(expected_raw_fingerprint) = expected.extracted_raw_fingerprint else {
-        let asset_count: i64 = connection
-            .query_row(
-                "SELECT
-                     (SELECT count(*) FROM main.generic_file)
-                   + (SELECT count(*) FROM main.generic_group)
-                   + (SELECT count(*) FROM main.generic_unit)",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|source| {
-                cancellable_sqlite_error("检查未 Extract 的 Generic 资产", source, cancellation)
-            })?;
-        if asset_count != 0 {
-            return Err(invalid_database(
-                GenericProjectDatabaseProblem::UnextractedProjectHasAssets { count: asset_count },
-            ));
-        }
-        ensure_generic_operation_not_cancelled(cancellation)?;
-        return Ok(());
-    };
-
-    let live = scan_input_tree_with_cancellation(expected.source_root(), cancellation)?;
-    if live.raw_fingerprint() != expected_raw_fingerprint
-        || Some(live.asset_fingerprint()) != expected.extracted_asset_fingerprint
-    {
-        return Err(GenericProjectError::InputChangedDuringExtract);
-    }
-    ensure_generic_operation_not_cancelled(cancellation)?;
-    let stored = load_snapshot_rows(connection, &actual, cancellation)?;
-    ensure_generic_operation_not_cancelled(cancellation)?;
-    validate_stored_assets_match_live(&stored, &live, Some(cancellation))
 }
 
 fn clear_extracted_assets(transaction: &Transaction<'_>) -> Result<(), GenericProjectError> {
@@ -4685,124 +4399,12 @@ fn compile_placeholder_resource_with_cancellation(
     cancellation.ensure_running()?;
     Ok(GenericCompiledPlaceholderResource {
         canonical_json: Arc::new(canonical_json),
-        service,
         compiled,
     })
 }
 
 fn placeholder_resource_error(source: GenericPlaceholderError) -> GenericProjectError {
     GenericProjectError::InvalidResource(GenericProjectResourceError::Placeholder(source))
-}
-
-fn manual_translation_placeholder_error(
-    group_id: &str,
-    unit_id: &str,
-    source: GenericPlaceholderError,
-) -> GenericProjectError {
-    let problem = generic_project_translation_problem(&source);
-    GenericProjectError::InvalidTranslation {
-        group_id: Some(group_id.to_owned()),
-        unit_id: Some(unit_id.to_owned()),
-        problem,
-        source: Some(Box::new(source)),
-    }
-}
-
-fn generic_project_translation_problem(
-    source: &GenericPlaceholderError,
-) -> GenericProjectTranslationProblem {
-    match source {
-        GenericPlaceholderError::InvalidResourceSnapshot(source) => {
-            GenericProjectTranslationProblem::InvalidPlaceholderSnapshot {
-                category: GenericJsonErrorCategory::from(
-                    crate::json_diagnostic::JsonErrorCategory::from(source),
-                ),
-                line: source.line(),
-                column: source.column(),
-            }
-        }
-        GenericPlaceholderError::Compilation(source) => {
-            GenericProjectTranslationProblem::PlaceholderCompilation {
-                problem: source.diagnostic_problem(),
-            }
-        }
-        GenericPlaceholderError::Protection(source) => {
-            GenericProjectTranslationProblem::PlaceholderProtection {
-                problem: source.diagnostic_issue(),
-            }
-        }
-        GenericPlaceholderError::Restore(PlaceholderRestoreError::Projection(source)) => {
-            GenericProjectTranslationProblem::PlaceholderRestoreProjection {
-                problem: generic_project_language_projection_problem(source),
-            }
-        }
-        GenericPlaceholderError::Restore(PlaceholderRestoreError::Multiset(source)) => {
-            GenericProjectTranslationProblem::PlaceholderRestoreMultiset {
-                problem: generic_project_placeholder_multiset_problem(source),
-            }
-        }
-        GenericPlaceholderError::ManualTranslationMismatch => {
-            GenericProjectTranslationProblem::PlaceholderBindingMismatch
-        }
-    }
-}
-
-const fn generic_project_language_projection_problem(
-    source: &LanguageTextProjectionError,
-) -> GenericLanguageProjectionProblem {
-    match source {
-        LanguageTextProjectionError::TokenIndexConstruction => {
-            GenericLanguageProjectionProblem::TokenIndexConstruction
-        }
-        LanguageTextProjectionError::EmptyToken => GenericLanguageProjectionProblem::EmptyToken,
-        LanguageTextProjectionError::MissingToken { .. } => {
-            GenericLanguageProjectionProblem::MissingToken
-        }
-        LanguageTextProjectionError::RepeatedToken { .. } => {
-            GenericLanguageProjectionProblem::RepeatedToken
-        }
-        LanguageTextProjectionError::OverlappingToken { .. } => {
-            GenericLanguageProjectionProblem::OverlappingToken
-        }
-        LanguageTextProjectionError::ChangedTokenOrder { position, .. } => {
-            GenericLanguageProjectionProblem::ChangedTokenOrder {
-                position: *position,
-            }
-        }
-        LanguageTextProjectionError::ChangedSegmentCount { expected, actual } => {
-            GenericLanguageProjectionProblem::ChangedSegmentCount {
-                expected: *expected,
-                actual: *actual,
-            }
-        }
-        LanguageTextProjectionError::ChangedSegmentKind { segment_index } => {
-            GenericLanguageProjectionProblem::ChangedSegmentKind {
-                segment_index: *segment_index,
-            }
-        }
-        LanguageTextProjectionError::MissingOrderedToken { segment_index } => {
-            GenericLanguageProjectionProblem::MissingOrderedToken {
-                segment_index: *segment_index,
-            }
-        }
-        LanguageTextProjectionError::UnusedOrderedToken => {
-            GenericLanguageProjectionProblem::UnusedOrderedToken
-        }
-    }
-}
-
-const fn generic_project_placeholder_multiset_problem(
-    source: &PlaceholderMultisetError,
-) -> GenericPlaceholderMultisetProblem {
-    match source {
-        PlaceholderMultisetError::Mismatch { .. } => GenericPlaceholderMultisetProblem::Mismatch,
-        PlaceholderMultisetError::Unexpected { .. } => {
-            GenericPlaceholderMultisetProblem::Unexpected
-        }
-        PlaceholderMultisetError::OrderMismatch { .. } => {
-            GenericPlaceholderMultisetProblem::OrderMismatch
-        }
-    }
 }
 
 fn bytes_equal_with_cancellation(
@@ -5091,30 +4693,6 @@ mod tests {
                 )),
                 "translation.placeholder.compilation.worker_start",
             ),
-            (
-                manual_translation_placeholder_error(
-                    "group-a",
-                    "unit-a",
-                    GenericPlaceholderError::Compilation(
-                        PlaceholderRuleCompilationError::StartWorker {
-                            operation: PlaceholderWorkerOperation::CompileCustomRules,
-                            source: io::Error::from_raw_os_error(8),
-                        },
-                    ),
-                ),
-                "translation.placeholder.compilation.worker_start",
-            ),
-            (
-                manual_translation_placeholder_error(
-                    "group-a",
-                    "unit-a",
-                    GenericPlaceholderError::Protection(PlaceholderProtectionError::StartWorker {
-                        operation: PlaceholderWorkerOperation::MatchText,
-                        source: io::Error::from_raw_os_error(8),
-                    }),
-                ),
-                "translation.placeholder.worker_start",
-            ),
         ];
 
         for (error, expected_code) in errors {
@@ -5327,74 +4905,6 @@ mod tests {
             wire["primary"]["issue"]["details"]["problem"]["problem"]["column"],
             0
         );
-    }
-
-    #[test]
-    fn invalid_database_source_is_only_available_through_error_source() {
-        let sentinel = "sensitive-source-locator";
-        let error = invalid_database_with_source(
-            GenericProjectDatabaseProblem::ManualTranslationStateFailure,
-            GenericPlanningError::Missing(GenericPlanningUnitLocator::new(
-                "private.jsonl",
-                sentinel,
-                "unit",
-                "dialogue",
-            )),
-        );
-
-        assert!(std::error::Error::source(&error).is_some());
-        let wire = serde_json::to_string(&error.diagnostic_report(
-            GenericDiagnosticStage::Translate,
-            Path::new("project.db"),
-            StateEffect::Unchanged,
-        ))
-        .expect("数据库诊断必须可序列化");
-        assert!(wire.contains("generic.project.database.manual_translation_state"));
-        assert!(!wire.contains(sentinel));
-    }
-
-    #[test]
-    fn manual_state_fact_loading_cancels_while_cloning_a_large_sqlite_field() {
-        let connection = Connection::open_in_memory().unwrap();
-        connection.execute_batch(CREATE_INITIAL_SCHEMA_SQL).unwrap();
-        let large_source_language = "x".repeat(RESOURCE_CANCELLATION_CHECK_BYTES * 3);
-        connection
-            .execute(
-                "INSERT INTO generic_project (
-                     singleton, project_name, source_root, source_language, target_language
-                 ) VALUES (1, 'game', x'0100', ?1, 'zh-Hans')",
-                [&large_source_language],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO generic_file (relative_path, ordinal)
-                 VALUES (x'0200', 0)",
-                [],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO generic_group (
-                     group_id, relative_path, ordinal, kind, context_fingerprint
-                 ) VALUES ('g', x'0200', 0, 'k', zeroblob(32))",
-                [],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO generic_unit (group_id, unit_id, ordinal, source_text)
-                 VALUES ('g', 'u', 0, 'source')",
-                [],
-            )
-            .unwrap();
-        let cancellation = CancelResourceAt::new(3);
-
-        assert!(matches!(
-            load_manual_translation_state_facts(&connection, "g", "u", &cancellation),
-            Err(GenericProjectError::Cancelled)
-        ));
-        assert_eq!(cancellation.polls.get(), 3);
     }
 
     fn init(workspace: &Path, source: &Path) -> GenericProjectStore {
@@ -5709,11 +5219,7 @@ mod tests {
         assert_eq!(project.source_root(), source.canonicalize().unwrap());
         assert!(workspace.join(DATABASE_FILE_NAME).is_file());
         assert!(fs::read_dir(&workspace).unwrap().all(|entry| {
-            !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".project.db.init-")
+            entry.unwrap().file_name().to_string_lossy() != ".project.db.init.tmp"
         }));
     }
 
@@ -5807,11 +5313,7 @@ mod tests {
             );
             assert!(
                 fs::read_dir(&workspace).unwrap().all(|entry| {
-                    !entry
-                        .unwrap()
-                        .file_name()
-                        .to_string_lossy()
-                        .starts_with(".project.db.init-")
+                    entry.unwrap().file_name().to_string_lossy() != ".project.db.init.tmp"
                 }),
                 "拒绝遗留 sidecar 后不得留下候选数据库"
             );
@@ -6152,7 +5654,6 @@ mod tests {
                 expected_source_text: unit.source_text().to_owned(),
                 expected_group_context: group.context_fingerprint(),
                 translation: format!("译{}", unit.source_text()),
-                origin: TranslationOrigin::Automatic,
                 state_fingerprint: Sha256Fingerprint::from_bytes([7; 32]),
                 expected_translation: None,
             })
@@ -6385,7 +5886,6 @@ mod tests {
             expected_source_text: unit.source_text().to_owned(),
             expected_group_context: group.context_fingerprint(),
             translation: "译文".to_owned(),
-            origin: TranslationOrigin::Automatic,
             state_fingerprint: Sha256Fingerprint::from_bytes([42; 32]),
             expected_translation: None,
         };
@@ -6444,7 +5944,6 @@ mod tests {
                 expected_source_text: unit.source_text().to_owned(),
                 expected_group_context: group.context_fingerprint(),
                 translation: format!("译文-{}", unit.id()),
-                origin: TranslationOrigin::Automatic,
                 state_fingerprint: state,
                 expected_translation: None,
             })
@@ -6480,7 +5979,6 @@ mod tests {
             expected_source_text: group.units()[0].source_text().to_owned(),
             expected_group_context: group.context_fingerprint(),
             translation: "人工并发修改后的新正文".to_owned(),
-            origin: TranslationOrigin::Automatic,
             state_fingerprint: Sha256Fingerprint::from_bytes([43; 32]),
             expected_translation: Some(previous),
         };
@@ -6553,7 +6051,6 @@ mod tests {
                         expected_source_text: unit.source_text().to_owned(),
                         expected_group_context: group.context_fingerprint(),
                         translation: "译文".to_owned(),
-                        origin: TranslationOrigin::Automatic,
                         state_fingerprint: Sha256Fingerprint::from_bytes([31; 32]),
                         expected_translation: None,
                     }],
@@ -7075,7 +6572,6 @@ mod tests {
                 expected_source_text: unit.source_text().to_owned(),
                 expected_group_context: group.context_fingerprint(),
                 translation: format!("译文-{}", unit.id()),
-                origin: TranslationOrigin::Automatic,
                 state_fingerprint: Sha256Fingerprint::from_bytes([8; 32]),
                 expected_translation: None,
             })
@@ -7186,7 +6682,6 @@ mod tests {
                     expected_source_text: unit.source_text().to_owned(),
                     expected_group_context: group.context_fingerprint(),
                     translation: previous.translation.clone(),
-                    origin: previous.origin,
                     state_fingerprint: previous.state_fingerprint,
                     expected_translation: None,
                 }],

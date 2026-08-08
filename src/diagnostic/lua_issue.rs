@@ -30,13 +30,9 @@ pub(crate) enum LuaOperation {
     CreateContext,
     CompileScript,
     ExecuteScript,
-    ValidatePrerequisites,
     SetTranslation,
     ClearTranslation,
     QueryDatabase,
-    ValidateDatabase,
-    BeginTransaction,
-    CommitTransaction,
     RollbackTransaction,
     InstallAuthorizer,
     RemoveAuthorizer,
@@ -48,13 +44,9 @@ impl LuaOperation {
             Self::CreateContext => "create_context",
             Self::CompileScript => "compile_script",
             Self::ExecuteScript => "execute_script",
-            Self::ValidatePrerequisites => "validate_prerequisites",
             Self::SetTranslation => "set_translation",
             Self::ClearTranslation => "clear_translation",
             Self::QueryDatabase => "query_database",
-            Self::ValidateDatabase => "validate_database",
-            Self::BeginTransaction => "begin_transaction",
-            Self::CommitTransaction => "commit_transaction",
             Self::RollbackTransaction => "rollback_transaction",
             Self::InstallAuthorizer => "install_authorizer",
             Self::RemoveAuthorizer => "remove_authorizer",
@@ -73,7 +65,6 @@ pub(crate) enum LuaValueViolation {
     SparseArray,
     InvalidUtf8,
     InvalidBlob,
-    InvalidLocator,
     InvalidTranslation,
     UnknownUnit,
     StateMismatch,
@@ -91,22 +82,12 @@ impl LuaValueViolation {
             Self::SparseArray => "sparse_array",
             Self::InvalidUtf8 => "invalid_utf8",
             Self::InvalidBlob => "invalid_blob",
-            Self::InvalidLocator => "invalid_locator",
             Self::InvalidTranslation => "invalid_translation",
             Self::UnknownUnit => "unknown_unit",
             Self::StateMismatch => "state_mismatch",
             Self::TransactionLost => "transaction_lost",
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum LuaTransactionState {
-    NotStarted,
-    RolledBack,
-    RollbackOutcomeUnknown,
-    CommitOutcomeUnknown,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -153,31 +134,6 @@ pub(crate) enum LuaScriptProblem {
     Backend { category: LuaCompilerCategory },
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum LuaValidationProblem {
-    AdapterState,
-    ProtectedSchemaChanged,
-    TemporarySchemaObject,
-    ForeignKey,
-    QuickCheck,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, tag = "engine", rename_all = "snake_case")]
-pub(crate) enum LuaLocator {
-    Generic {
-        relative_path: Option<SafePath>,
-        group_id: Option<SafeIdentifier>,
-        unit_id: Option<SafeIdentifier>,
-    },
-    RpgMaker {
-        owner: Option<SafeIdentifier>,
-        group_location: Option<SafeIdentifier>,
-        unit_role: Option<SafeIdentifier>,
-    },
-}
-
 impl LuaCompilerCategory {
     const fn as_str(self) -> &'static str {
         match self {
@@ -212,23 +168,10 @@ pub(crate) enum LuaProblem {
         operation: LuaOperation,
         violation: LuaValueViolation,
         field: Option<SafeIdentifier>,
-        locator: Option<LuaLocator>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         placeholder: Option<PlaceholderIssue>,
     },
-    DatabasePrerequisite {
-        engine: Option<LuaEngine>,
-        violation: LuaValueViolation,
-    },
-    Validation {
-        engine: LuaEngine,
-        problem: LuaValidationProblem,
-    },
     WorkerPanicked,
-    TransactionFinalization {
-        database_path: SafePath,
-        state: LuaTransactionState,
-    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -252,15 +195,6 @@ impl LuaIssue {
             }
             LuaProblem::Compilation { .. } => LuaOperation::CompileScript,
             LuaProblem::HostCall { operation, .. } => operation,
-            LuaProblem::DatabasePrerequisite { .. } => LuaOperation::ValidatePrerequisites,
-            LuaProblem::Validation { .. } => LuaOperation::ValidateDatabase,
-            LuaProblem::TransactionFinalization { state, .. } => match state {
-                LuaTransactionState::NotStarted => LuaOperation::BeginTransaction,
-                LuaTransactionState::RolledBack | LuaTransactionState::RollbackOutcomeUnknown => {
-                    LuaOperation::RollbackTransaction
-                }
-                LuaTransactionState::CommitOutcomeUnknown => LuaOperation::CommitTransaction,
-            },
         }
     }
 
@@ -275,19 +209,7 @@ impl LuaIssue {
             LuaProblem::Compilation { .. } => "lua.compilation",
             LuaProblem::ScriptExecution { .. } => "lua.script_execution",
             LuaProblem::HostCall { .. } => "lua.host_call",
-            LuaProblem::DatabasePrerequisite { .. } => "lua.database_prerequisite",
-            LuaProblem::Validation { .. } => "lua.validation",
             LuaProblem::WorkerPanicked => "lua.worker_panicked",
-            LuaProblem::TransactionFinalization { state, .. } => match state {
-                LuaTransactionState::NotStarted => "lua.transaction.not_started",
-                LuaTransactionState::RolledBack => "lua.transaction.rolled_back",
-                LuaTransactionState::RollbackOutcomeUnknown => {
-                    "lua.transaction.rollback_outcome_unknown"
-                }
-                LuaTransactionState::CommitOutcomeUnknown => {
-                    "lua.transaction.commit_outcome_unknown"
-                }
-            },
         }
     }
 
@@ -303,12 +225,7 @@ impl LuaIssue {
             } => DiagnosticResolution::Retry,
             LuaProblem::Compilation { .. }
             | LuaProblem::ScriptExecution { .. }
-            | LuaProblem::HostCall { .. }
-            | LuaProblem::Validation { .. } => DiagnosticResolution::FixInput,
-            LuaProblem::DatabasePrerequisite { .. } => DiagnosticResolution::CheckProjectState,
-            LuaProblem::TransactionFinalization { .. } => {
-                DiagnosticResolution::PreserveRecoveryArtifacts
-            }
+            | LuaProblem::HostCall { .. } => DiagnosticResolution::FixInput,
         }
     }
 
@@ -325,10 +242,6 @@ impl LuaIssue {
             LuaProblem::HostCall {
                 placeholder: None, ..
             } => "lua_execution_failed",
-            LuaProblem::DatabasePrerequisite { .. } | LuaProblem::Validation { .. } => {
-                "state_mismatch"
-            }
-            LuaProblem::TransactionFinalization { .. } => "transaction_outcome_unknown",
         }
     }
 
@@ -368,47 +281,12 @@ impl LuaIssue {
                 operation: _,
                 violation,
                 field,
-                locator,
                 placeholder,
             } => {
                 facts.push(("engine", engine.as_str().to_owned()));
                 facts.push(("violation", violation.as_str().to_owned()));
                 if let Some(field) = field {
                     facts.push(("field", field.to_string()));
-                }
-                if let Some(locator) = locator {
-                    match locator {
-                        LuaLocator::Generic {
-                            relative_path,
-                            group_id,
-                            unit_id,
-                        } => {
-                            if let Some(relative_path) = relative_path {
-                                facts.push(("relative_path", relative_path.to_string()));
-                            }
-                            if let Some(group_id) = group_id {
-                                facts.push(("group_id", group_id.to_string()));
-                            }
-                            if let Some(unit_id) = unit_id {
-                                facts.push(("unit_id", unit_id.to_string()));
-                            }
-                        }
-                        LuaLocator::RpgMaker {
-                            owner,
-                            group_location,
-                            unit_role,
-                        } => {
-                            if let Some(owner) = owner {
-                                facts.push(("owner", owner.to_string()));
-                            }
-                            if let Some(group_location) = group_location {
-                                facts.push(("group_location", group_location.to_string()));
-                            }
-                            if let Some(unit_role) = unit_role {
-                                facts.push(("unit_role", unit_role.to_string()));
-                            }
-                        }
-                    }
                 }
                 if let Some(problem) = placeholder {
                     facts.push(("placeholder_problem", problem.code().to_owned()));
@@ -422,35 +300,10 @@ impl LuaIssue {
                     }));
                 }
             }
-            LuaProblem::DatabasePrerequisite { engine, violation } => {
-                if let Some(engine) = engine {
-                    facts.push(("engine", engine.as_str().to_owned()));
-                }
-                facts.push(("violation", violation.as_str().to_owned()));
-            }
-            LuaProblem::Validation { engine, problem } => {
-                facts.push(("engine", engine.as_str().to_owned()));
-                facts.push((
-                    "validation_problem",
-                    validation_problem_name(*problem).to_owned(),
-                ));
-            }
             LuaProblem::ContextCreation { problem } => {
                 facts.push(("context_problem", context_problem_name(*problem).to_owned()));
             }
             _ => {}
-        }
-        if let LuaProblem::TransactionFinalization {
-            database_path,
-            state,
-            ..
-        } = &self.problem
-        {
-            facts.push(("database_path", database_path.to_string()));
-            facts.push((
-                "transaction_state",
-                transaction_state_name(*state).to_owned(),
-            ));
         }
         facts
     }
@@ -489,41 +342,17 @@ const fn script_problem_name(problem: LuaScriptProblem) -> &'static str {
     }
 }
 
-const fn validation_problem_name(problem: LuaValidationProblem) -> &'static str {
-    match problem {
-        LuaValidationProblem::AdapterState => "adapter_state",
-        LuaValidationProblem::ProtectedSchemaChanged => "protected_schema_changed",
-        LuaValidationProblem::TemporarySchemaObject => "temporary_schema_object",
-        LuaValidationProblem::ForeignKey => "foreign_key",
-        LuaValidationProblem::QuickCheck => "quick_check",
-    }
-}
-
-const fn transaction_state_name(state: LuaTransactionState) -> &'static str {
-    match state {
-        LuaTransactionState::NotStarted => "not_started",
-        LuaTransactionState::RolledBack => "rolled_back",
-        LuaTransactionState::RollbackOutcomeUnknown => "rollback_outcome_unknown",
-        LuaTransactionState::CommitOutcomeUnknown => "commit_outcome_unknown",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn host_call_facts_keep_generic_engine_operation_field_and_locator() {
+    fn host_call_facts_keep_generic_engine_operation_and_field() {
         let issue = LuaIssue::new(LuaProblem::HostCall {
             engine: LuaEngine::Generic,
             operation: LuaOperation::SetTranslation,
             violation: LuaValueViolation::InvalidTranslation,
             field: Some(SafeIdentifier::from_validated("translation")),
-            locator: Some(LuaLocator::Generic {
-                relative_path: Some(SafePath::new("data/dialogue.jsonl")),
-                group_id: Some(SafeIdentifier::from_validated("group-7")),
-                unit_id: Some(SafeIdentifier::from_validated("unit-3")),
-            }),
             placeholder: None,
         });
 
@@ -534,38 +363,6 @@ mod tests {
                 ("engine", "generic".to_owned()),
                 ("violation", "invalid_translation".to_owned()),
                 ("field", "translation".to_owned()),
-                ("relative_path", "data/dialogue.jsonl".to_owned()),
-                ("group_id", "group-7".to_owned()),
-                ("unit_id", "unit-3".to_owned()),
-            ]
-        );
-    }
-
-    #[test]
-    fn prerequisite_and_validation_facts_keep_specific_problem() {
-        let prerequisite = LuaIssue::new(LuaProblem::DatabasePrerequisite {
-            engine: Some(LuaEngine::Mz),
-            violation: LuaValueViolation::StateMismatch,
-        });
-        assert_eq!(
-            prerequisite.facts(),
-            vec![
-                ("operation", "validate_prerequisites".to_owned()),
-                ("engine", "mz".to_owned()),
-                ("violation", "state_mismatch".to_owned()),
-            ]
-        );
-
-        let validation = LuaIssue::new(LuaProblem::Validation {
-            engine: LuaEngine::Generic,
-            problem: LuaValidationProblem::AdapterState,
-        });
-        assert_eq!(
-            validation.facts(),
-            vec![
-                ("operation", "validate_database".to_owned()),
-                ("engine", "generic".to_owned()),
-                ("validation_problem", "adapter_state".to_owned()),
             ]
         );
     }

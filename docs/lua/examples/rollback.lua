@@ -1,3 +1,5 @@
+ctx.db.execute("BEGIN IMMEDIATE")
+
 ctx.db.execute([[
   CREATE TABLE IF NOT EXISTS lua_rollback_example (
     value TEXT NOT NULL
@@ -9,4 +11,4 @@ ctx.db.execute(
   { "该行不会提交" }
 )
 
-error("演示未捕获错误会回滚整个脚本")
+error("演示未捕获错误只回滚当前仍打开的事务")

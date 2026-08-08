@@ -970,18 +970,10 @@ fn render_final_result(
         .iter()
         .chain(document.state.diagnostic())
     {
-        let code = diagnostic.primary().code();
-        let reason = markdown_inline_code(code);
         let _ = writeln!(
             output,
             "- {}",
-            task_record_text(
-                localizer,
-                UiMessage::TaskRecordTaskDiagnostic {
-                    code,
-                    reason: &reason,
-                }
-            )
+            task_record_text(localizer, UiMessage::TaskRecordTaskDiagnostic)
         );
         let rendered = api_key_redactor.redact(&render_diagnostic_report(diagnostic, localizer));
         output.push_str(&markdown_fence(&rendered, "text"));
@@ -1356,7 +1348,7 @@ mod tests {
         let mut parameters = Map::new();
         parameters.insert("temperature".to_owned(), json!(0.2));
         let markdown = render_task_record(
-            "run-1",
+            "run-000001",
             &client(
                 "https://example.test/v1/chat/completions",
                 "model-a",
@@ -1375,7 +1367,7 @@ mod tests {
 
 `任务 1/3` · `尝试 1 次` · `验收 0/0` · `写入 0 处`
 
-- Run ID：`run-1`
+- Run ID：`run-000001`
 - 开始时间：`1970-01-01T00:00:00.000Z`
 - 总耗时：`12 毫秒`
 - Endpoint：`https://example.test/v1/chat/completions`
@@ -1430,18 +1422,8 @@ raw
 ## 最终结果
 
 - 状态：执行失败，未提交
-- 任务诊断：`http.status`；原因 `http.status`
+- 任务诊断
 ```text
-错误 ["#,
-                "\u{2068}",
-                r#"http.status"#,
-                "\u{2069}",
-                r#"]
-阶段："#,
-                "\u{2068}",
-                r#"模型请求"#,
-                "\u{2069}",
-                r#"
 位置："#,
                 "\u{2068}",
                 r#"https://example.test"#,
@@ -1449,12 +1431,7 @@ raw
                 r#"
 原因："#,
                 "\u{2068}",
-                r#"外部服务拒绝了请求; endpoint=https://example.test; status=503; provider_code=busy; provider_type=service_error"#,
-                "\u{2069}",
-                r#"
-影响："#,
-                "\u{2068}",
-                r#"已保留有效进度"#,
+                r#"外部服务拒绝了请求"#,
                 "\u{2069}",
                 r#"
 处理办法："#,
@@ -1646,7 +1623,8 @@ raw
         );
         assert!(markdown.contains("```json\n{\"raw\":true}\n```"));
         assert!(markdown.contains("- 状态：部分完成，已确认提交"));
-        assert!(markdown.contains("http.status"));
+        assert!(markdown.contains("外部服务拒绝了请求"));
+        assert!(!markdown.contains("http.status"));
         assert!(!markdown.contains("协议诊断："));
         assert!(!markdown.contains("## Assistant\n\n```json"));
     }
@@ -1715,7 +1693,8 @@ raw
         )
         .expect("任务记录应直接渲染流水线传入的结构化诊断");
 
-        assert!(markdown.contains("http.status"));
+        assert!(markdown.contains("The external service rejected the request"));
+        assert!(!markdown.contains("http.status"));
         assert!(!markdown.contains("Translation array item"));
     }
 
@@ -1791,7 +1770,8 @@ raw
             "解析错误只应在原始 Assistant 上方出现一次"
         );
         assert!(markdown.contains("- 状态：不可用，项目未改变"));
-        assert!(markdown.contains("http.status"));
+        assert!(markdown.contains("外部服务拒绝了请求"));
+        assert!(!markdown.contains("http.status"));
         assert!(!markdown.contains("- 不可用原因："));
         assert!(!markdown.contains("- 协议诊断："));
     }
@@ -2002,7 +1982,8 @@ raw
             !markdown.contains("等待 `1.000 秒` 后重试"),
             "等待期间取消时不得声称等待完成或已经重试"
         );
-        assert!(markdown.contains("http.transport.timeout"));
+        assert!(markdown.contains("收到有效响应前 HTTP 传输失败"));
+        assert!(!markdown.contains("http.transport.timeout"));
         assert!(
             !markdown.contains(r#"{"kind":"failure""#),
             "任务记录必须渲染可读诊断，不能显示旧 reason 的 JSON 外壳"
@@ -2010,7 +1991,7 @@ raw
     }
 
     #[test]
-    fn http_provider_message_is_visible_in_attempt_record_and_redacted_again() {
+    fn http_provider_fields_are_not_written_to_attempt_records() {
         const API_KEY: &str = "task-record-secret";
         let message = format!("before {API_KEY} after");
         let diagnostic = test_http_status_report(
@@ -2042,9 +2023,17 @@ raw
         .expect("任务记录应可渲染");
 
         assert!(!markdown.contains(API_KEY));
-        assert!(markdown.contains("provider_code=bad_request"));
-        assert!(markdown.contains("provider_type=invalid_request_error"));
-        assert!(markdown.contains("provider_message=before [REDACTED API KEY] after"));
+        assert!(markdown.contains("外部服务拒绝了请求"));
+        for forbidden in [
+            "provider_code",
+            "provider_type",
+            "provider_message",
+            "bad_request",
+            "invalid_request_error",
+            "before [REDACTED API KEY] after",
+        ] {
+            assert!(!markdown.contains(forbidden));
+        }
     }
 
     #[test]
@@ -2337,7 +2326,8 @@ raw
 
         assert!(!markdown.contains(KEY));
         assert!(!markdown.contains(NEIGHBOR));
-        assert!(markdown.contains("http.status"));
+        assert!(markdown.contains("外部服务拒绝了请求"));
+        assert!(!markdown.contains("http.status"));
     }
 
     #[test]

@@ -49,13 +49,14 @@ Placeholder 绑定建立安全表示时才显示目标文本，否则显示保�
 任一 Unit 的原文无法完成保护或语言投影时，ATT 不会删除它后发送残缺 Group。包含该
 Unit 的完整 TaskBlock 不发送，并按相应引擎的规划失败语义报告。
 
-Placeholder 叶子问题使用稳定 code 区分 worker 启动、PCRE2 匹配、空匹配、缺少 `text`
-捕获、无效范围、重叠、跨文本单元边界和保留 token namespace。诊断保留规则来源
-（外部文件路径或 `project_snapshot`）、实际规则号、可证明的 UTF-8 字节范围，以及完整
-引擎 locator：Generic 使用 relative path、group ID、unit ID 和 role；RPG Maker 使用
-owner、group location 与 role。具体 issue 唯一决定 `resolution = fix_placeholder_rules`；
-诊断不保存游戏正文。规划因此失败时不发模型请求，数据库保持不变，并由
-`translation.finished` 的 failed 结果引用同一 occurrence。
+Placeholder 问题会区分 worker 启动、PCRE2 匹配、空匹配、缺少 `text` 捕获、无效范围、
+重叠、跨文本单元边界和保留 token namespace。公开诊断只保留规则文件或当前项目规则、
+自然规则号、可读条目位置、直接原因和修改方法，不输出编码位置、数据库键、内部状态或
+游戏正文。规划因此失败时不发模型请求，数据库保持不变，`translation.finished` 明确记录
+本次 Translate 失败。
 
 `translate --placeholders FILE` 在模型请求之前完整解析并原子替换当前项目规则。省略参数
 时复用当前规则；`rule = []` 显式清空。解析失败时项目保持不变，也不发出请求。
+
+Manual check/apply 使用检查时的当前 Placeholder 验证新译文。已经应用的人工译文不会仅因
+Placeholder 配置后来变化而过期；人工译文只在对应原文或实际写回结构变化时过期。

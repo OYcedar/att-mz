@@ -4154,27 +4154,15 @@ mod tests {
         );
     }
 
-    struct TestDirectory(PathBuf);
+    struct TestDirectory(tempfile::TempDir);
 
     impl TestDirectory {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "att-rusqlite-{}-{}",
-                std::process::id(),
-                uuid::Uuid::new_v4()
-            ));
-            fs::create_dir(&path).expect("测试目录应可创建");
-            Self(path)
+            Self(tempfile::tempdir().expect("测试目录应可创建"))
         }
 
         fn database(&self, name: &str) -> PathBuf {
-            self.0.join(name)
-        }
-    }
-
-    impl Drop for TestDirectory {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            self.0.path().join(name)
         }
     }
 

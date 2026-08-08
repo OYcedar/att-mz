@@ -6,7 +6,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(test)]
+use std::fs::OpenOptions;
 use std::io::{self, BufWriter, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
@@ -17,14 +19,13 @@ use std::thread::{self, JoinHandle};
 use async_channel::{Receiver, Sender};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use uuid::Uuid;
 
 use crate::diagnostic::{
-    Diagnostic, DiagnosticReport, InvalidSafeIdentifier, IoFailure, ObservabilityComponent,
+    Diagnostic, DiagnosticReport, IoFailure, ObservabilityComponent,
     ObservabilityContractViolation, ObservabilityEventCode, ObservabilityFailureCount,
     ObservabilityIssue, ObservabilityProjectLogPhase, ObservabilityRenderTarget,
     ObservabilityWriteFailure, RelatedFailureRelation, ReportedFailure, SafeIdentifier, SafeIoKind,
-    SafePath, SafeText, StateEffect, render_diagnostic_report,
+    SafePath, SafeText, StateEffect, render_diagnostic_fields,
 };
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
 use crate::observability::RunId;
@@ -78,12 +79,8 @@ pub(crate) enum ProjectLogCode {
     PublicationStarted,
     #[serde(rename = "publication.finished")]
     PublicationFinished,
-    #[serde(rename = "lua.script")]
-    LuaScript,
     #[serde(rename = "lua.print")]
     LuaPrint,
-    #[serde(rename = "lua.summary")]
-    LuaSummary,
     #[serde(rename = "diagnostic.run")]
     RunDiagnostic,
     #[serde(rename = "diagnostic.run_plan")]
@@ -124,9 +121,7 @@ impl ProjectLogCode {
             Self::RetrySummary => "retry.summary",
             Self::PublicationStarted => "publication.started",
             Self::PublicationFinished => "publication.finished",
-            Self::LuaScript => "lua.script",
             Self::LuaPrint => "lua.print",
-            Self::LuaSummary => "lua.summary",
             Self::RunDiagnostic => "diagnostic.run",
             Self::RunPlanDiagnostic => "diagnostic.run_plan",
             Self::TranslationTaskDiagnostic => "diagnostic.translation_task",
@@ -158,9 +153,7 @@ impl From<ProjectLogCode> for ObservabilityEventCode {
             ProjectLogCode::RetrySummary => Self::RetrySummary,
             ProjectLogCode::PublicationStarted => Self::PublicationStarted,
             ProjectLogCode::PublicationFinished => Self::PublicationFinished,
-            ProjectLogCode::LuaScript => Self::LuaScript,
             ProjectLogCode::LuaPrint => Self::LuaPrint,
-            ProjectLogCode::LuaSummary => Self::LuaSummary,
             ProjectLogCode::RunDiagnostic => Self::RunDiagnostic,
             ProjectLogCode::RunPlanDiagnostic => Self::RunPlanDiagnostic,
             ProjectLogCode::TranslationTaskDiagnostic => Self::TranslationTaskDiagnostic,
@@ -405,7 +398,10 @@ pub(crate) enum ProjectLogAmount {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub(crate) enum PhaseStopOutcome {
-    Failed { diagnostic: DiagnosticOccurrenceId },
+    Failed {
+        #[serde(skip_serializing)]
+        diagnostic: DiagnosticOccurrenceId,
+    },
     Cancelled,
 }
 
@@ -550,16 +546,19 @@ pub(crate) enum RunPlanFinalization {
     NotSaved {
         transaction: RunPlanTransactionState,
         run_continues: bool,
+        #[serde(skip_serializing)]
         diagnostic: DiagnosticOccurrenceId,
     },
     SavedFinalizationFailed {
         transaction: RunPlanTransactionState,
         run_continues: bool,
+        #[serde(skip_serializing)]
         diagnostic: DiagnosticOccurrenceId,
     },
     OutcomeUnknown {
         transaction: RunPlanTransactionState,
         run_continues: bool,
+        #[serde(skip_serializing)]
         diagnostic: DiagnosticOccurrenceId,
     },
 }
@@ -648,18 +647,22 @@ impl<'de> Deserialize<'de> for TaskPosition {
 pub(crate) enum TaskFinishedOutcome {
     Complete,
     Partial {
+        #[serde(skip_serializing)]
         diagnostic: DiagnosticOccurrenceId,
     },
     Unavailable {
+        #[serde(skip_serializing)]
         diagnostic: DiagnosticOccurrenceId,
     },
     Failed {
+        #[serde(skip_serializing)]
         diagnostic: DiagnosticOccurrenceId,
     },
     /// 此任务已得到可提交结果，但前序任务失败后编排器没有再应用它。
     ///
     /// 复用前序失败 occurrence，避免把别的任务的失败重新投影为当前 Task 的错误。
     NotCommittedAfterEarlierFailure {
+        #[serde(skip_serializing)]
         diagnostic: DiagnosticOccurrenceId,
     },
     Cancelled,
@@ -870,6 +873,7 @@ pub(crate) enum TranslationFinished {
     Failed {
         tasks: TranslationTaskCounters,
         summary: Option<TranslationEngineSummary>,
+        #[serde(skip_serializing)]
         diagnostic: DiagnosticOccurrenceId,
     },
     Cancelled {
@@ -940,10 +944,21 @@ pub(crate) enum PublicationSummary {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub(crate) enum PublicationFinished {
-    Published { summary: PublicationSummary },
-    NotPublished { diagnostic: DiagnosticOccurrenceId },
-    RecoveryRequired { diagnostic: DiagnosticOccurrenceId },
-    OutcomeUnknown { diagnostic: DiagnosticOccurrenceId },
+    Published {
+        summary: PublicationSummary,
+    },
+    NotPublished {
+        #[serde(skip_serializing)]
+        diagnostic: DiagnosticOccurrenceId,
+    },
+    RecoveryRequired {
+        #[serde(skip_serializing)]
+        diagnostic: DiagnosticOccurrenceId,
+    },
+    OutcomeUnknown {
+        #[serde(skip_serializing)]
+        diagnostic: DiagnosticOccurrenceId,
+    },
 }
 
 impl PublicationFinished {
@@ -962,9 +977,18 @@ impl PublicationFinished {
 pub(crate) enum RunFinished {
     Succeeded,
     Cancelled,
-    Failed { diagnostic: DiagnosticOccurrenceId },
-    RecoveryRequired { diagnostic: DiagnosticOccurrenceId },
-    OutcomeUnknown { diagnostic: DiagnosticOccurrenceId },
+    Failed {
+        #[serde(skip_serializing)]
+        diagnostic: DiagnosticOccurrenceId,
+    },
+    RecoveryRequired {
+        #[serde(skip_serializing)]
+        diagnostic: DiagnosticOccurrenceId,
+    },
+    OutcomeUnknown {
+        #[serde(skip_serializing)]
+        diagnostic: DiagnosticOccurrenceId,
+    },
 }
 
 impl RunFinished {
@@ -1126,18 +1150,8 @@ pub(crate) enum ProjectLogEvent {
     PublicationFinished {
         result: PublicationFinished,
     },
-    LuaScript {
-        identity: SafePath,
-        fingerprint: SafeIdentifier,
-    },
     LuaPrint {
         message: SafeText,
-    },
-    LuaSummary {
-        database_calls: u64,
-        changed_rows: u64,
-        translation_calls: u64,
-        printed_lines: u64,
     },
     Diagnostic {
         occurrence: DiagnosticOccurrence,
@@ -1178,17 +1192,6 @@ impl ProjectLogEvent {
         }
     }
 
-    /// 建立 Lua 脚本解析事件。脚本身份是已经解析的路径；指纹仍是非空公开标识符。
-    pub(crate) fn lua_script(
-        identity: impl AsRef<Path>,
-        fingerprint: impl AsRef<str>,
-    ) -> Result<Self, InvalidSafeIdentifier> {
-        Ok(Self::LuaScript {
-            identity: SafePath::new(identity),
-            fingerprint: SafeIdentifier::new(fingerprint)?,
-        })
-    }
-
     pub(crate) const fn code(&self) -> ProjectLogCode {
         match self {
             Self::RunStarted => ProjectLogCode::RunStarted,
@@ -1204,9 +1207,7 @@ impl ProjectLogEvent {
             Self::RetrySummary { .. } => ProjectLogCode::RetrySummary,
             Self::PublicationStarted { .. } => ProjectLogCode::PublicationStarted,
             Self::PublicationFinished { .. } => ProjectLogCode::PublicationFinished,
-            Self::LuaScript { .. } => ProjectLogCode::LuaScript,
             Self::LuaPrint { .. } => ProjectLogCode::LuaPrint,
-            Self::LuaSummary { .. } => ProjectLogCode::LuaSummary,
             Self::Diagnostic { occurrence } => occurrence.scope().code(),
             Self::ProjectLogDegraded { .. } => ProjectLogCode::ProjectLogDegraded,
             Self::PerformanceCounters { .. } => ProjectLogCode::PerformanceCounters,
@@ -1237,8 +1238,6 @@ impl ProjectLogEvent {
             | Self::PublicationFinished {
                 result: PublicationFinished::Published { .. },
             }
-            | Self::LuaScript { .. }
-            | Self::LuaSummary { .. }
             | Self::PerformanceCounters { .. }
             | Self::RunFinished {
                 result: RunFinished::Succeeded | RunFinished::Cancelled,
@@ -1301,8 +1300,6 @@ impl ProjectLogEvent {
             | Self::TranslationFinished { .. }
             | Self::PublicationStarted { .. }
             | Self::PublicationFinished { .. }
-            | Self::LuaScript { .. }
-            | Self::LuaSummary { .. }
             | Self::Diagnostic { .. }
             | Self::ProjectLogDegraded { .. }
             | Self::PerformanceCounters { .. }
@@ -1426,26 +1423,8 @@ impl ProjectLogEvent {
                     .expect("受支持平台的 usize 必须可表示为 u64");
                 localizer.format(UiMessage::LogProjectLogDegraded { failure_kinds })
             }
-            Self::LuaScript {
-                identity,
-                fingerprint,
-            } => localizer.format(UiMessage::LogLuaScript {
-                identity: identity.as_str(),
-                fingerprint: fingerprint.as_str(),
-            }),
             Self::LuaPrint { message } => localizer.format(UiMessage::LogLuaPrint {
                 message: message.as_str(),
-            }),
-            Self::LuaSummary {
-                database_calls,
-                changed_rows,
-                translation_calls,
-                printed_lines,
-            } => localizer.format(UiMessage::LogLuaSummary {
-                database_calls: *database_calls,
-                changed_rows: *changed_rows,
-                translation_calls: *translation_calls,
-                printed_lines: *printed_lines,
             }),
             Self::PerformanceCounters { snapshot } => {
                 localizer.format(UiMessage::LogPerformanceCounters {
@@ -1455,7 +1434,8 @@ impl ProjectLogEvent {
                 })
             }
             Self::Diagnostic { occurrence } => {
-                render_diagnostic_report(occurrence.report(), localizer)
+                let rendered = render_diagnostic_fields(occurrence.report(), localizer);
+                format!("{}: {} {}", rendered.object, rendered.reason, rendered.help)
             }
         }
     }
@@ -1753,36 +1733,6 @@ impl ProjectLogRecord {
             payload,
         })
     }
-
-    fn validate(self) -> Result<Self, &'static str> {
-        if self.sequence == 0 {
-            return Err("sequence 必须大于零");
-        }
-        let parsed = Uuid::parse_str(&self.run_id).map_err(|_| "run_id 不是 UUID")?;
-        if parsed.to_string() != self.run_id {
-            return Err("run_id 必须使用规范 UUID 文本");
-        }
-        let parsed_timestamp = OffsetDateTime::parse(&self.timestamp, &Rfc3339)
-            .map_err(|_| "timestamp 不是 RFC3339 时间")?;
-        let canonical_timestamp = parsed_timestamp
-            .format(&Rfc3339)
-            .map_err(|_| "timestamp 无法规范化")?;
-        if canonical_timestamp != self.timestamp {
-            return Err("timestamp 必须使用规范 RFC3339 文本");
-        }
-        if self.level != self.payload.level() {
-            return Err("level 与 payload 不一致");
-        }
-        if self.code != self.payload.code() {
-            return Err("code 与 payload 不一致");
-        }
-        // JSONL 读取不在 writer 热路径中；仅在此处为校验临时建立 localizer。
-        let localizer = UiLocalizer::new(self.context.locale().ui_locale());
-        if self.message != self.payload.message(&self.context, &localizer) {
-            return Err("message 与 payload 不一致");
-        }
-        Ok(self)
-    }
 }
 
 #[derive(Serialize)]
@@ -1792,7 +1742,7 @@ struct ProjectLogRecordRef<'a> {
     sequence: u64,
     run_id: &'a str,
     level: ProjectLogLevel,
-    code: ProjectLogCode,
+    event: ProjectLogCode,
     context: &'a ProjectLogContext,
     payload: ProjectLogPayloadRef<'a>,
     message: &'a str,
@@ -1843,22 +1793,16 @@ enum ProjectLogPayloadRef<'a> {
     PublicationFinished {
         result: &'a PublicationFinished,
     },
-    LuaScript {
-        identity: &'a SafePath,
-        fingerprint: &'a SafeIdentifier,
-    },
     LuaPrint {
         message: &'a SafeText,
     },
-    LuaSummary {
-        database_calls: &'a u64,
-        changed_rows: &'a u64,
-        translation_calls: &'a u64,
-        printed_lines: &'a u64,
+    Diagnostic {
+        object: SafeText,
+        reason: SafeText,
+        help: SafeText,
     },
-    Diagnostic(&'a DiagnosticOccurrence),
     ProjectLogDegraded {
-        health: &'a ProjectLogHealthSnapshot,
+        issues: u64,
     },
     PerformanceCounters {
         snapshot: &'a RunPerformanceSnapshot,
@@ -1868,8 +1812,8 @@ enum ProjectLogPayloadRef<'a> {
     },
 }
 
-impl<'a> From<&'a ProjectLogEvent> for ProjectLogPayloadRef<'a> {
-    fn from(event: &'a ProjectLogEvent) -> Self {
+impl<'a> ProjectLogPayloadRef<'a> {
+    fn from_event(event: &'a ProjectLogEvent, locale: ProjectLogLocale) -> Self {
         match event {
             ProjectLogEvent::RunStarted => Self::RunStarted {},
             ProjectLogEvent::CancellationRequested { confirmed, total } => {
@@ -1910,27 +1854,20 @@ impl<'a> From<&'a ProjectLogEvent> for ProjectLogPayloadRef<'a> {
                 Self::PublicationStarted { output_root }
             }
             ProjectLogEvent::PublicationFinished { result } => Self::PublicationFinished { result },
-            ProjectLogEvent::LuaScript {
-                identity,
-                fingerprint,
-            } => Self::LuaScript {
-                identity,
-                fingerprint,
-            },
             ProjectLogEvent::LuaPrint { message } => Self::LuaPrint { message },
-            ProjectLogEvent::LuaSummary {
-                database_calls,
-                changed_rows,
-                translation_calls,
-                printed_lines,
-            } => Self::LuaSummary {
-                database_calls,
-                changed_rows,
-                translation_calls,
-                printed_lines,
+            ProjectLogEvent::Diagnostic { occurrence } => {
+                let localizer = UiLocalizer::new(locale.ui_locale());
+                let rendered = render_diagnostic_fields(occurrence.report(), &localizer);
+                Self::Diagnostic {
+                    object: SafeText::new(rendered.object),
+                    reason: SafeText::new(rendered.reason),
+                    help: SafeText::new(rendered.help),
+                }
+            }
+            ProjectLogEvent::ProjectLogDegraded { health } => Self::ProjectLogDegraded {
+                issues: u64::try_from(health.failures.len())
+                    .expect("受支持平台的 usize 必须可表示为 u64"),
             },
-            ProjectLogEvent::Diagnostic { occurrence } => Self::Diagnostic(occurrence),
-            ProjectLogEvent::ProjectLogDegraded { health } => Self::ProjectLogDegraded { health },
             ProjectLogEvent::PerformanceCounters { snapshot } => {
                 Self::PerformanceCounters { snapshot }
             }
@@ -1949,225 +1886,12 @@ impl Serialize for ProjectLogRecord {
             sequence: self.sequence,
             run_id: &self.run_id,
             level: self.level,
-            code: self.code,
+            event: self.code,
             context: &self.context,
-            payload: ProjectLogPayloadRef::from(&self.payload),
+            payload: ProjectLogPayloadRef::from_event(&self.payload, self.context.locale()),
             message: &self.message,
         }
         .serialize(serializer)
-    }
-}
-
-/// JSONL payload 的封闭读取模型。每个结构变体都拒绝未知字段；code 只负责在这些
-/// 已解析类型之间选择合法事件，不能再把任意对象和字符串事件名拼成领域事件。
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, untagged)]
-enum ProjectLogPayloadWire {
-    RunStarted {},
-    CancellationRequested {
-        confirmed: u64,
-        total: Option<u64>,
-    },
-    PhaseProgress {
-        phase: ProjectLogPhase,
-        amount: ProjectLogAmount,
-    },
-    PhaseStopped {
-        phase: ProjectLogPhase,
-        outcome: PhaseStopOutcome,
-    },
-    RunPlanResolved {
-        plan: ResolvedRunPlan,
-    },
-    RunPlanFinalized {
-        database: SafePath,
-        result: RunPlanFinalization,
-    },
-    TaskStarted {
-        task: TaskPosition,
-    },
-    TaskFinished {
-        task: TaskPosition,
-        attempts: u64,
-        outcome: TaskFinishedOutcome,
-    },
-    TranslationFinished {
-        result: TranslationFinished,
-    },
-    RetrySummary {
-        attempted: u64,
-        recovered: u64,
-        exhausted: u64,
-    },
-    PublicationStarted {
-        output_root: SafePath,
-    },
-    PublicationFinished {
-        result: PublicationFinished,
-    },
-    LuaScript {
-        identity: SafePath,
-        fingerprint: SafeIdentifier,
-    },
-    LuaPrint {
-        message: SafeText,
-    },
-    LuaSummary {
-        database_calls: u64,
-        changed_rows: u64,
-        translation_calls: u64,
-        printed_lines: u64,
-    },
-    Diagnostic(DiagnosticOccurrence),
-    ProjectLogDegraded {
-        health: ProjectLogHealthSnapshot,
-    },
-    PerformanceCounters {
-        snapshot: RunPerformanceSnapshot,
-    },
-    RunFinished {
-        result: RunFinished,
-    },
-}
-
-impl ProjectLogPayloadWire {
-    fn into_event(self, code: ProjectLogCode) -> Result<ProjectLogEvent, &'static str> {
-        let event = match (code, self) {
-            (ProjectLogCode::RunStarted, Self::RunStarted {}) => ProjectLogEvent::RunStarted,
-            (
-                ProjectLogCode::CancellationRequested,
-                Self::CancellationRequested { confirmed, total },
-            ) => ProjectLogEvent::CancellationRequested { confirmed, total },
-            (ProjectLogCode::PhaseStarted, Self::PhaseProgress { phase, amount }) => {
-                ProjectLogEvent::PhaseStarted { phase, amount }
-            }
-            (ProjectLogCode::PhaseCompleted, Self::PhaseProgress { phase, amount }) => {
-                ProjectLogEvent::PhaseCompleted { phase, amount }
-            }
-            (ProjectLogCode::PhaseStopped, Self::PhaseStopped { phase, outcome }) => {
-                ProjectLogEvent::PhaseStopped { phase, outcome }
-            }
-            (ProjectLogCode::RunPlanResolved, Self::RunPlanResolved { plan }) => {
-                ProjectLogEvent::RunPlanResolved { plan }
-            }
-            (ProjectLogCode::RunPlanFinalized, Self::RunPlanFinalized { database, result }) => {
-                ProjectLogEvent::RunPlanFinalized { database, result }
-            }
-            (ProjectLogCode::TaskStarted, Self::TaskStarted { task }) => {
-                ProjectLogEvent::TaskStarted { task }
-            }
-            (
-                ProjectLogCode::TaskFinished,
-                Self::TaskFinished {
-                    task,
-                    attempts,
-                    outcome,
-                },
-            ) => ProjectLogEvent::TaskFinished {
-                task,
-                attempts,
-                outcome,
-            },
-            (ProjectLogCode::TranslationFinished, Self::TranslationFinished { result }) => {
-                ProjectLogEvent::TranslationFinished { result }
-            }
-            (
-                ProjectLogCode::RetrySummary,
-                Self::RetrySummary {
-                    attempted,
-                    recovered,
-                    exhausted,
-                },
-            ) => ProjectLogEvent::RetrySummary {
-                attempted,
-                recovered,
-                exhausted,
-            },
-            (ProjectLogCode::PublicationStarted, Self::PublicationStarted { output_root }) => {
-                ProjectLogEvent::PublicationStarted { output_root }
-            }
-            (ProjectLogCode::PublicationFinished, Self::PublicationFinished { result }) => {
-                ProjectLogEvent::PublicationFinished { result }
-            }
-            (
-                ProjectLogCode::LuaScript,
-                Self::LuaScript {
-                    identity,
-                    fingerprint,
-                },
-            ) => ProjectLogEvent::LuaScript {
-                identity,
-                fingerprint,
-            },
-            (ProjectLogCode::LuaPrint, Self::LuaPrint { message }) => {
-                ProjectLogEvent::LuaPrint { message }
-            }
-            (
-                ProjectLogCode::LuaSummary,
-                Self::LuaSummary {
-                    database_calls,
-                    changed_rows,
-                    translation_calls,
-                    printed_lines,
-                },
-            ) => ProjectLogEvent::LuaSummary {
-                database_calls,
-                changed_rows,
-                translation_calls,
-                printed_lines,
-            },
-            (code, Self::Diagnostic(occurrence)) if occurrence.scope().code() == code => {
-                ProjectLogEvent::Diagnostic { occurrence }
-            }
-            (ProjectLogCode::ProjectLogDegraded, Self::ProjectLogDegraded { health }) => {
-                ProjectLogEvent::ProjectLogDegraded { health }
-            }
-            (ProjectLogCode::PerformanceCounters, Self::PerformanceCounters { snapshot }) => {
-                ProjectLogEvent::PerformanceCounters { snapshot }
-            }
-            (ProjectLogCode::RunFinished, Self::RunFinished { result }) => {
-                ProjectLogEvent::RunFinished { result }
-            }
-            _ => return Err("code 与 payload 类型不一致"),
-        };
-        Ok(event)
-    }
-}
-
-impl<'de> Deserialize<'de> for ProjectLogRecord {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Wire {
-            timestamp: String,
-            sequence: u64,
-            run_id: String,
-            level: ProjectLogLevel,
-            code: ProjectLogCode,
-            context: ProjectLogContext,
-            payload: ProjectLogPayloadWire,
-            message: String,
-        }
-        let wire = Wire::deserialize(deserializer)?;
-        let payload = wire
-            .payload
-            .into_event(wire.code)
-            .map_err(de::Error::custom)?;
-        Self {
-            timestamp: wire.timestamp,
-            sequence: wire.sequence,
-            run_id: wire.run_id,
-            level: wire.level,
-            code: wire.code,
-            context: wire.context,
-            payload,
-            message: wire.message,
-        }
-        .validate()
-        .map_err(de::Error::custom)
     }
 }
 
@@ -2210,12 +1934,17 @@ struct FileProjectLogSink {
 }
 
 impl FileProjectLogSink {
+    #[cfg(test)]
     fn create_new(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new().write(true).create_new(true).open(path)?;
-        Ok(Self {
+        Ok(Self::from_reserved(path, file))
+    }
+
+    fn from_reserved(path: &Path, file: File) -> Self {
+        Self {
             path: SafePath::new(path),
             writer: BufWriter::with_capacity(FILE_BUFFER_BYTES, file),
-        })
+        }
     }
 }
 
@@ -2601,9 +2330,7 @@ impl ProducerState {
                     });
                 }
             }
-            ProjectLogEvent::LuaScript { .. }
-            | ProjectLogEvent::LuaPrint { .. }
-            | ProjectLogEvent::LuaSummary { .. } => {}
+            ProjectLogEvent::LuaPrint { .. } => {}
         }
         Ok(EmitDisposition::Accepted)
     }
@@ -3223,6 +2950,44 @@ pub(crate) struct ProjectLogRuntime {
 }
 
 impl ProjectLogRuntime {
+    pub(crate) fn start_reserved_file(
+        path: &Path,
+        file: File,
+        context: ProjectLogContext,
+        run_id: RunId,
+        performance: Arc<RunPerformanceCounters>,
+        drop_report: DiagnosticReport,
+    ) -> Result<Self, ReportedFailure> {
+        let safe_path = SafePath::new(path);
+        let sink = FileProjectLogSink::from_reserved(path, file);
+        Self::start(context, run_id, sink, performance, drop_report).map_err(|source| {
+            let report = DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::observability(ObservabilityIssue::worker_start(
+                    ObservabilityComponent::ProjectLog,
+                    &source.source,
+                )),
+            );
+            let mut failure = ReportedFailure::new(report, source);
+            if let Err(cleanup) = std::fs::remove_file(path) {
+                let cleanup_report = DiagnosticReport::new(
+                    StateEffect::Unchanged,
+                    Diagnostic::observability(ObservabilityIssue::cleanup(
+                        ObservabilityComponent::ProjectLog,
+                        safe_path,
+                        &cleanup,
+                    )),
+                );
+                failure = failure.with_related(
+                    RelatedFailureRelation::Cleanup,
+                    ReportedFailure::new(cleanup_report, cleanup),
+                );
+            }
+            failure
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn start_file(
         path: &Path,
         context: ProjectLogContext,
@@ -3863,9 +3628,7 @@ mod tests {
     }
 
     fn run_id() -> RunId {
-        RunId::from_uuid(
-            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").expect("测试 UUID 必须有效"),
-        )
+        RunId::for_test(1)
     }
 
     fn context(command: ProjectLogCommand) -> ProjectLogContext {
@@ -3938,7 +3701,7 @@ mod tests {
         assert_eq!(
             text,
             concat!(
-                r#"{"timestamp":"1970-01-01T00:00:00Z","sequence":1,"run_id":"550e8400-e29b-41d4-a716-446655440000","level":"info","code":"run.started","context":{"locale":"en","engine":"generic","project":"project-a","command":"extract"},"payload":{},"message":"Command "#,
+                r#"{"timestamp":"1970-01-01T00:00:00Z","sequence":1,"run_id":"run-000001","level":"info","event":"run.started","context":{"locale":"en","engine":"generic","project":"project-a","command":"extract"},"payload":{},"message":"Command "#,
                 "\u{2068}extract\u{2069}",
                 r#" started."}"#,
             ),
@@ -3957,33 +3720,17 @@ mod tests {
                 "sequence",
                 "run_id",
                 "level",
-                "code",
+                "event",
                 "context",
                 "payload",
                 "message",
             ]
         );
         assert_eq!(value["payload"], serde_json::json!({}));
-        let decoded: ProjectLogRecord = serde_json::from_str(&text).expect("合法记录必须可读取");
-        assert_eq!(decoded, record);
-
-        let mut invalid = value;
-        invalid["level"] = serde_json::json!("error");
-        assert!(serde_json::from_value::<ProjectLogRecord>(invalid).is_err());
-
-        let mut invalid_timestamp: serde_json::Value =
-            serde_json::from_str(&text).expect("测试 JSON 必须有效");
-        invalid_timestamp["timestamp"] = serde_json::json!("not-a-timestamp");
-        assert!(serde_json::from_value::<ProjectLogRecord>(invalid_timestamp).is_err());
-
-        let mut noncanonical_timestamp: serde_json::Value =
-            serde_json::from_str(&text).expect("测试 JSON 必须有效");
-        noncanonical_timestamp["timestamp"] = serde_json::json!("1970-01-01T00:00:00+00:00");
-        assert!(serde_json::from_value::<ProjectLogRecord>(noncanonical_timestamp).is_err());
     }
 
     #[test]
-    fn diagnostic_payload_is_the_occurrence_itself() {
+    fn diagnostic_payload_contains_only_readable_guidance() {
         let occurrence = DiagnosticOccurrence {
             id: DiagnosticOccurrenceId::new(1).expect("非零 ID"),
             scope: DiagnosticScope::RunPlan,
@@ -4001,78 +3748,35 @@ mod tests {
         )
         .expect("诊断记录必须可建");
         let value = serde_json::to_value(&record).expect("诊断记录必须可序列化");
-        assert_eq!(value["code"], "diagnostic.run_plan");
-        assert_eq!(value["payload"]["id"], 1);
-        assert_eq!(value["payload"]["scope"], "run_plan");
-        assert!(value["payload"].get("occurrence").is_none());
-        assert!(value["payload"].get("kind").is_none());
-        let mut unknown_payload = value.clone();
-        unknown_payload["payload"]["unexpected"] = serde_json::json!(true);
-        assert!(serde_json::from_value::<ProjectLogRecord>(unknown_payload).is_err());
-        let mut mismatched_scope = value.clone();
-        mismatched_scope["code"] = serde_json::json!("diagnostic.run");
-        assert!(serde_json::from_value::<ProjectLogRecord>(mismatched_scope).is_err());
-        let decoded: ProjectLogRecord =
-            serde_json::from_value(value).expect("诊断记录必须严格往返");
-        assert_eq!(decoded, record);
-    }
-
-    #[test]
-    fn wire_rejects_unknown_context_and_payload_fields() {
-        let context = context(ProjectLogCommand::Extract);
-        let localizer = UiLocalizer::new(context.locale().ui_locale());
-        let record = ProjectLogRecord::new(
-            OffsetDateTime::UNIX_EPOCH,
-            1,
-            &run_id().to_string(),
-            &context,
-            &localizer,
-            ProjectLogEvent::RunStarted,
-        )
-        .expect("测试记录必须可建");
-        let mut unknown_payload = serde_json::to_value(&record).expect("记录必须可序列化");
-        unknown_payload["payload"]["unexpected"] = serde_json::json!(true);
-        assert!(serde_json::from_value::<ProjectLogRecord>(unknown_payload).is_err());
-
-        let mut unknown_context = serde_json::to_value(&record).expect("记录必须可序列化");
-        unknown_context["context"]["profile"] = serde_json::json!("forbidden");
-        assert!(serde_json::from_value::<ProjectLogRecord>(unknown_context).is_err());
-
-        let mut unknown_record = serde_json::to_value(&record).expect("记录必须可序列化");
-        unknown_record["unexpected"] = serde_json::json!(true);
-        assert!(serde_json::from_value::<ProjectLogRecord>(unknown_record).is_err());
-
-        let phase = ProjectLogRecord::new(
-            OffsetDateTime::UNIX_EPOCH,
-            1,
-            &run_id().to_string(),
-            &context,
-            &localizer,
-            ProjectLogEvent::PhaseStarted {
-                phase: ProjectLogPhase::ScanSource,
-                amount: ProjectLogAmount::Determinate {
-                    completed: 2,
-                    total: 5,
-                },
-            },
-        )
-        .expect("阶段记录必须可建");
-        let mut unknown_typed_payload = serde_json::to_value(&phase).expect("阶段记录必须可序列化");
-        unknown_typed_payload["payload"]["unexpected"] = serde_json::json!(true);
-        assert!(serde_json::from_value::<ProjectLogRecord>(unknown_typed_payload).is_err());
-
-        let mut unknown_nested_payload =
-            serde_json::to_value(&phase).expect("阶段记录必须可序列化");
-        unknown_nested_payload["payload"]["amount"]["unexpected"] = serde_json::json!(true);
-        assert!(serde_json::from_value::<ProjectLogRecord>(unknown_nested_payload).is_err());
-
-        let mut legacy_event_kind = serde_json::to_value(&phase).expect("阶段记录必须可序列化");
-        legacy_event_kind["payload"]["kind"] = serde_json::json!("phase_started");
-        assert!(serde_json::from_value::<ProjectLogRecord>(legacy_event_kind).is_err());
-
-        let mut mismatched_code = serde_json::to_value(&phase).expect("阶段记录必须可序列化");
-        mismatched_code["code"] = serde_json::json!("task.started");
-        assert!(serde_json::from_value::<ProjectLogRecord>(mismatched_code).is_err());
+        assert_eq!(value["event"], "diagnostic.run_plan");
+        let payload = value["payload"]
+            .as_object()
+            .expect("诊断 payload 必须是对象");
+        assert_eq!(
+            payload.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["object", "reason", "help"]
+        );
+        for field in ["object", "reason", "help"] {
+            assert!(
+                payload[field]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty()),
+                "诊断 {field} 必须是非空可读文本"
+            );
+        }
+        let serialized = serde_json::to_string(&value).expect("诊断记录必须可序列化");
+        for forbidden in [
+            "occurrence",
+            "report",
+            "effect",
+            "stage",
+            "issue",
+            "resolution",
+            "expected_fingerprint",
+            "actual_fingerprint",
+        ] {
+            assert!(!serialized.contains(forbidden));
+        }
     }
 
     #[test]
@@ -4466,11 +4170,11 @@ mod tests {
         assert_eq!(
             records
                 .iter()
-                .filter(|record| record["code"] == "run.cancel_requested")
+                .filter(|record| record["event"] == "run.cancel_requested")
                 .count(),
             1
         );
-        assert_eq!(records.last().expect("必须有终态")["code"], "run.finished");
+        assert_eq!(records.last().expect("必须有终态")["event"], "run.finished");
     }
 
     #[test]
@@ -4544,13 +4248,13 @@ mod tests {
         assert_eq!(
             records
                 .iter()
-                .filter(|record| record["code"] == "translation.finished")
+                .filter(|record| record["event"] == "translation.finished")
                 .count(),
             1
         );
         let finished = records
             .iter()
-            .find(|record| record["code"] == "translation.finished")
+            .find(|record| record["event"] == "translation.finished")
             .expect("必须有翻译终态");
         assert_eq!(finished["level"], "warn");
         assert_eq!(finished["payload"]["result"]["tasks"]["not_started"], 0);
@@ -4611,14 +4315,19 @@ mod tests {
         let task_records = bytes
             .records()
             .into_iter()
-            .filter(|record| record["code"] == "task.finished")
+            .filter(|record| record["event"] == "task.finished")
             .collect::<Vec<_>>();
         assert_eq!(task_records.len(), 2);
         assert_eq!(
             task_records[1]["payload"]["outcome"]["kind"],
             "not_committed_after_earlier_failure"
         );
-        assert_eq!(task_records[1]["payload"]["outcome"]["diagnostic"], 1);
+        assert!(
+            task_records[1]["payload"]["outcome"]
+                .get("diagnostic")
+                .is_none(),
+            "终态只说明结果，不公开内部诊断关联"
+        );
     }
 
     #[test]
@@ -4659,12 +4368,12 @@ mod tests {
         let records = bytes.records();
         let diagnostic_record = records
             .iter()
-            .find(|record| record["code"] == "diagnostic.run_plan")
+            .find(|record| record["event"] == "diagnostic.run_plan")
             .expect("必须有运行计划诊断");
         assert_eq!(diagnostic_record["level"], "error");
         let translation = records
             .iter()
-            .find(|record| record["code"] == "translation.finished")
+            .find(|record| record["event"] == "translation.finished")
             .expect("必须有翻译终态");
         assert_eq!(translation["payload"]["result"]["kind"], "failed");
         assert_eq!(translation["payload"]["result"]["tasks"]["not_started"], 3);
@@ -4818,11 +4527,9 @@ mod tests {
             EmitDisposition::BestEffortDropped
         );
         logger
-            .emit(ProjectLogEvent::LuaSummary {
-                database_calls: 0,
-                changed_rows: 0,
-                translation_calls: 0,
-                printed_lines: 0,
+            .emit(ProjectLogEvent::CancellationRequested {
+                confirmed: 0,
+                total: None,
             })
             .expect("必要事件不能被压力丢弃");
         sink.release();
@@ -4872,7 +4579,7 @@ mod tests {
         assert!(
             sink.records()
                 .iter()
-                .any(|record| record["code"] == "lua.summary")
+                .any(|record| record["event"] == "run.cancel_requested")
         );
     }
 
@@ -4919,11 +4626,9 @@ mod tests {
         );
         runtime
             .logger()
-            .emit(ProjectLogEvent::LuaSummary {
-                database_calls: 0,
-                changed_rows: 0,
-                translation_calls: 0,
-                printed_lines: 0,
+            .emit(ProjectLogEvent::CancellationRequested {
+                confirmed: 0,
+                total: None,
             })
             .expect("必要事件必须入队");
         let shutdown = runtime
@@ -4932,7 +4637,7 @@ mod tests {
         assert_eq!(
             shutdown.health.count(&ProjectLogFailureKey::Serialize {
                 path: None,
-                code: ProjectLogCode::LuaSummary,
+                code: ProjectLogCode::CancellationRequested,
             }),
             1
         );
@@ -4940,9 +4645,9 @@ mod tests {
         assert!(
             records
                 .iter()
-                .any(|record| record["code"] == "observability.project_log_degraded")
+                .any(|record| record["event"] == "observability.project_log_degraded")
         );
-        assert_eq!(records.last().expect("必须有终态")["code"], "run.finished");
+        assert_eq!(records.last().expect("必须有终态")["event"], "run.finished");
     }
 
     #[derive(Clone)]
@@ -5003,11 +4708,9 @@ mod tests {
         );
         runtime
             .logger()
-            .emit(ProjectLogEvent::LuaSummary {
-                database_calls: 0,
-                changed_rows: 0,
-                translation_calls: 0,
-                printed_lines: 0,
+            .emit(ProjectLogEvent::CancellationRequested {
+                confirmed: 0,
+                total: None,
             })
             .expect("必要事件必须入队");
         let shutdown = runtime
@@ -5016,7 +4719,7 @@ mod tests {
         assert_eq!(
             shutdown.health.count(&ProjectLogFailureKey::Write {
                 path: None,
-                code: ProjectLogCode::LuaSummary,
+                code: ProjectLogCode::CancellationRequested,
                 io_kind: SafeIoKind::PermissionDenied,
                 raw_os_code: Some(5),
             }),
@@ -5050,11 +4753,9 @@ mod tests {
         sink.wait_until_blocked();
         let logger = runtime.logger();
         logger
-            .emit(ProjectLogEvent::LuaSummary {
-                database_calls: 0,
-                changed_rows: 0,
-                translation_calls: 0,
-                printed_lines: 0,
+            .emit(ProjectLogEvent::CancellationRequested {
+                confirmed: 0,
+                total: None,
             })
             .expect("触发首个 write 失败的必要事件必须入队");
         for _ in 0..32 {
@@ -5077,7 +4778,7 @@ mod tests {
         sink.release();
         let write_failure = ProjectLogFailureKey::Write {
             path: None,
-            code: ProjectLogCode::LuaSummary,
+            code: ProjectLogCode::CancellationRequested,
             io_kind: SafeIoKind::PermissionDenied,
             raw_os_code: Some(5),
         };
@@ -5174,7 +4875,7 @@ mod tests {
         let records = bytes.records();
         let codes = records
             .iter()
-            .map(|record| record["code"].as_str().expect("code 必须是字符串"))
+            .map(|record| record["event"].as_str().expect("event 必须是字符串"))
             .collect::<Vec<_>>();
         assert_eq!(
             codes,
@@ -5203,7 +4904,7 @@ mod tests {
         }
         let records = bytes.records();
         assert_eq!(
-            records.last().expect("Drop 必须写终态")["code"],
+            records.last().expect("Drop 必须写终态")["event"],
             "run.finished"
         );
         assert_eq!(
@@ -5242,31 +4943,21 @@ mod tests {
 
         let records = bytes.records();
         let terminal = records.last().expect("Drop 必须尽力写出终态");
-        assert_eq!(terminal["code"], "run.finished");
+        assert_eq!(terminal["event"], "run.finished");
         assert_eq!(terminal["payload"]["result"]["kind"], "outcome_unknown");
         let diagnostic = records
             .iter()
-            .find(|record| record["code"] == "diagnostic.run")
+            .find(|record| record["event"] == "diagnostic.run")
             .expect("finish 合同错误必须成为终态诊断");
-        assert_eq!(
-            diagnostic["payload"]["report"]["primary"]["code"],
-            "observability.project_log.contract"
+        let expected = render_diagnostic_fields(
+            &FinishError::ActivePhase.diagnostic_report(),
+            &UiLocalizer::new(UiLocale::English),
         );
-        assert_eq!(
-            diagnostic["payload"]["report"]["primary"]["issue"]["details"]["problem"],
-            serde_json::json!({
-                "operation": "contract",
-                "violation": { "kind": "active_phase" }
-            })
-        );
-        assert!(
-            records.iter().all(|record| {
-                record["payload"]
-                    .pointer("/report/primary/code")
-                    .is_none_or(|code| code != "runtime.command_panicked")
-            }),
-            "finish 失败后不能把预登记的 panic Drop 诊断写入日志"
-        );
+        assert_eq!(diagnostic["payload"]["object"], expected.object);
+        assert_eq!(diagnostic["payload"]["reason"], expected.reason);
+        assert_eq!(diagnostic["payload"]["help"], expected.help);
+        let serialized = serde_json::to_string(&records).expect("日志必须可序列化");
+        assert!(!serialized.contains("runtime.command_panicked"));
     }
 
     struct PanicEncoder;
@@ -5296,18 +4987,16 @@ mod tests {
             1
         );
         assert_eq!(
-            logger.emit(ProjectLogEvent::LuaSummary {
-                database_calls: 0,
-                changed_rows: 0,
-                translation_calls: 0,
-                printed_lines: 0,
+            logger.emit(ProjectLogEvent::CancellationRequested {
+                confirmed: 0,
+                total: None,
             }),
             Err(EmitError::Closed)
         );
         drop(runtime);
         assert!(
             logger.health().count(&ProjectLogFailureKey::ChannelClosed {
-                code: Some(ProjectLogCode::LuaSummary),
+                code: Some(ProjectLogCode::CancellationRequested),
             }) >= 1
         );
         assert!(

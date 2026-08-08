@@ -1,4 +1,4 @@
 interface:
   display_name: "ATT 翻译任务"
-  short_description: "按现行文档规划、执行、恢复、修订和验收 ATT 游戏翻译"
-  default_prompt: "使用 $translate-with-att，先按实际发行版文档确定当前状态和必读规格，再完成这个 ATT 翻译任务。"
+  short_description: "按现行文档使用 Manual、Lua 和各阶段命令完成 ATT 游戏翻译"
+  default_prompt: "使用 $translate-with-att，先按实际发行版文档确定当前状态；少量补译优先使用 Manual TOML，需要上下文时一次批量调用 Lua，再完成 WriteBack 和验收。"

@@ -456,17 +456,16 @@ command 或多个参数拼成一个脚本块，也不解析 JavaScript 语法。
 JSON 解码、最终 string、捕获、重建或物理 Claim 不成立，整个 Rules owner 候选失败，
 旧 Rules 快照保持不变。路径缺 key/越界只是该展开分支无产出，但最终仍需满足每条规则
 至少产出一个单元。成功时 CLI 的提取摘要仍写 stdout；每类非字符串跳过警告各写一行
-stderr，退出码仍为 0。每个聚合警告同时写为 `diagnostic.extract` occurrence，类型化 issue
-保存 `rule_number`、`source_file`、`command_code`、`parameter`、`actual_type` 与
-`skipped_count`，resolution 为 `fix_input`。警告按上述聚合键稳定排序，不包含原始参数值或
-逐命令位置。
+stderr，退出码仍为 0。每个聚合警告同时写入 `diagnostic.extract`，只说明规则文件、自然
+规则号、命令、参数位置、实际类型、跳过数量和修改方法。警告按上述事实稳定排序，不包含
+原始参数值、编码位置或内部状态。
 
 ## 5. 语义范围、自然顺序与 Mutation Claim
 
-Builtin 和 Rules 都把来源的物理位置转换成同一种语义顺序键。翻译读取器先按语义范围和
-顺序键整理资产，再合并 `kind + group_location` 相同的 Group；owner 只保留 Unit 的来源
-责任，不再作为 `Builtin → Rules` 排序补充。两个 owner 对同一 Group 给出不同 Group
-顺序键、同一 Group 出现重复角色，或者不同对象得到相同顺序键时，读取明确失败。
+Builtin 和 Rules 都把来源的物理位置转换成同一种语义顺序。翻译读取器先按语义范围和
+自然顺序整理资产，再合并指向同一逻辑位置且 kind 相同的 Group。来源类型不作为
+`Builtin → Rules` 排序补充。两个来源对同一 Group 给出不同顺序、同一 Group 出现重复角色，
+或者不同对象占用同一顺序时，读取明确失败。
 
 语义范围由来源本身决定：普通数据库文件、System、每张 Map、每个 CommonEvent、每个
 Troop 和每个启用插件各自形成范围。TaskBlock 不跨语义范围。范围内的自然顺序来自 JSON
@@ -486,28 +485,18 @@ Rules 的跨来源顺序是稳定契约，与 OS 目录枚举顺序无关：
 同一规则；同一最终 string 的多个捕获按捕获起始字节。规则在 TOML 中的编号只用于诊断和
 逐条执行，不改变最终顺序。
 
-顺序键以规范 BLOB 保存：每个物理路径段为 `0x01 + u64 大端`，结尾为
-`0x00 + fragment u64 大端`。数据库 BLOB 字典序必须与内存类型顺序完全一致；截断、未知
-标记、终止段后的尾部字节和非规范值都作为当前 schema 的普通无效数据处理。
-
-顺序进入资产快照和完整 Group 语境指纹，但不进入 owner、location、role 组成的主身份。
-持久化时，每个 owner 按当前 Group 自然顺序分配从 1 开始的整数 `group_id`；Unit 和
-Mutation Claim 只用 `owner + group_id` 关联 Group，`group_location` 仍由 Group 唯一保存。
-这个整数只是当前 schema 的内部关联键，不进入领域 locator、资产指纹，也不绑定 TaskBlock
-邻居、译文、临时 ID 或任务历史。并发可以改变完成时间，不能改变语义范围、Group/Unit
-顺序、`group_id` 分配、稳定装箱或提交顺序。
+顺序进入资产快照和完整 Group 语境状态，但不充当对人使用的位置。持久化可以使用内部
+顺序键和关联键，CLI、Manual、日志和高级 Lua 只显示源文件、自然编号和字段组成的可读 ID。
+并发可以改变完成时间，不能改变语义范围、Group/Unit 自然顺序、稳定装箱或提交顺序。
 
 提取方不直接书写 `MutationClaim`。ATT 从完整 Value 和事件块 recipe 派生资源锁：
 `Intent` 表示将穿过资源，`Exclusive` 表示拥有该精确可变 Value。
 同一资源只有 `Intent + Intent` 可以共存；存在任一 `Exclusive` 就冲突。验证在组内、
 owner 内、跨 owner Store 和 WriteBack 发布前使用同一规则。
 
-完整逻辑 Claim 由 group kind、location 和 recipe 决定并进入 owner 指纹。项目表
-`rpg_maker_mutation_claim` 不是这份完整清单，而是跨 owner 冲突摘要：每个
-`(owner, resource)` 至多一行；唯一 Exclusive 原样保留，共享 resource 的多个合法 Intent
-只保留自然顺序最早的 group 代表。表内代表通过 `owner + group_id` 指回 Group；需要领域
-位置时必须 JOIN Group 取得 `group_location`。WriteBack 会从 recipe 重建完整集合并严格
-验证该摘要，因此摘要不会放宽本节任何冲突规则。
+完整逻辑 Claim 由 Group kind、来源位置和 recipe 决定。项目数据库只保存 WriteBack 所需的
+冲突摘要，WriteBack 会从 recipe 重建完整集合并严格验证，因此持久摘要不会放宽本节任何
+冲突规则。Raw Lua 可以直接查看当前表结构；普通工作流不要求使用这些内部关联定位对象。
 
 | 两个声明的关系 | 结果 |
 |---|---|

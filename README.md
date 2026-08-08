@@ -110,7 +110,16 @@ init ──▶ extract ──▶ translate ──▶ write-back
 3. `translate`：调用模型翻译，按 Ctrl-C 受控取消后可重新执行同一条命令继续；
 4. `write-back`：在项目文件夹里生成翻译后的游戏文件，供你检查。
 
-需要逐条查看或修改译文时，ATT 提供 Lua 脚本入口，适合人工或 Agent 精确修订。
+少量未完成译文优先使用 Manual TOML：
+
+```text
+.\att.exe mv manual export --name mygame manual.toml
+.\att.exe mv manual check --name mygame manual.toml
+.\att.exe mv manual apply --name mygame manual.toml
+```
+
+需要批量读取上下文、复杂筛选或程序化修改时，再使用 Lua。Lua 同时提供便利的翻译 API 和
+可以直接执行任意数据库修改的原始 SQLite API。
 
 ## ❓ 遇到问题
 

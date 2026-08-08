@@ -6126,6 +6126,14 @@ ORDER BY name"#,
                 );
                 CREATE INDEX rpg_maker_text_unit_owner_group_order_idx
                     ON rpg_maker_text_unit(owner, group_id, semantic_order_key);
+                CREATE TABLE rpg_maker_manual_translation (
+                    owner TEXT NOT NULL,
+                    group_location TEXT NOT NULL,
+                    unit_role TEXT NOT NULL,
+                    translation_json TEXT,
+                    applicability_fingerprint BLOB,
+                    PRIMARY KEY (owner, group_location, unit_role)
+                );
                 CREATE TABLE rpg_maker_mutation_claim (
                     owner TEXT NOT NULL,
                     group_id INTEGER NOT NULL CHECK (group_id > 0),

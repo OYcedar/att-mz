@@ -8,19 +8,24 @@ att mz translate --name NAME [PROFILE_ID] \
   [--terms TERMINOLOGY_TOML] [--placeholders PLACEHOLDER_TOML]
 ```
 
-Translate 不使用 Lua。Profile 来自公共 `[translation].profiles`；省略时复用项目最近
-一次成功保存的 Profile。术语和 Placeholder 分别保存在当前 MV/MZ 项目。
+Translate 本身不运行 Lua。Profile 来自公共 `[translation].profiles`；省略时复用项目最近
+一次成功保存的 Profile。术语和 Placeholder 分别保存在当前 MV/MZ 项目。少量局部补译使用
+[Manual TOML](../manual/README.md)，不属于 Translate。
 
-## 1. 准备与 Current
+## 1. 准备与当前译文
 
 ATT 从项目数据库读取 Extract 已经明确整理的 Semantic Scope、Group、Unit 和冻结来源
 指纹，先按完整原文建立稳定 TaskBlock，再应用语言模块、实际术语命中、RPG Maker
 Placeholder 与内置控制符，为每个 Unit 判定去向：Current、需要模型、可以复用，或不能
 处理。
 
-自动译文状态绑定当前原文、完整 Group 语境、语言、实际术语、实际 Placeholder、Prompt
-和 Client 语义。目标译文正文与语义状态分开保存，因此独立 Lua 修改已有译文后仍可
-保持 Current；模型提交的 CAS 仍同时比较旧译文和状态。
+自动译文状态绑定当前原文、完整 Group 语境、语言、实际术语、实际 Placeholder、Prompt、
+Profile 和 Client 语义。当前人工译文来自独立人工表，优先于自动译文；Translate 跳过它，
+模型提交也不能覆盖它。
+
+人工译文只在内部位置、Group kind、Unit 角色、写回 recipe、正文形状或原文变化时过期。
+上下文、相邻文本、语言、术语、Placeholder 配置、Prompt、Profile 和 Client 变化不影响
+已经应用的人工译文。
 
 ## 2. 全局去重
 
@@ -33,8 +38,8 @@ Placeholder 与内置控制符，为每个 Unit 判定去向：Current、需要�
 - 已有 Current 永远不被覆盖。
 
 去重族、代表项和传播关系只在本次 Translate 运行中计算，不写入数据库。已定位 Unit 的
-同文异译、质量修订，或由人工或 agent 补译，都使用[原子数据库 Lua](../lua/README.md)的精确
-locator 与人工状态；Lua 不参与本次自动去重。
+同文异译、质量修订或少量补译优先使用 [Manual TOML](../manual/README.md) 和可读 ID；复杂
+筛选、计算生成或批量变换再使用 [Lua](../lua/README.md)。两者都不参与本次自动去重。
 
 ## 3. TaskBlock 与模型形状
 
@@ -72,24 +77,24 @@ Partial 后重试重新判断 ID，但不重新装箱。原块中的已完成 Un
 公共保守 JSON 修复都无法建立响应，或整个响应根结构无效时，该任务不提交。
 
 任务之间可以并发执行，确认和提交仍按自然顺序进行。已确认的前序进度落库后，后续
-失败或取消都不会把它带走。提交时重新检查来源、owner、Unit、译文和语义状态，发现
-并发变化则不覆盖新状态。
+失败或取消都不会把它带走。提交时重新检查当前来源、Unit、译文和语义状态，发现并发变化
+或当前人工译文时，不覆盖新状态。
 
 每个实际开始的 Task 写 `task.finished`：Complete、Partial、Unavailable、Failed、
-NotCommittedAfterEarlierFailure 或 Cancelled；Partial、Unavailable 与 Failed 引用相应
-`diagnostic.translation_task` occurrence。NotCommittedAfterEarlierFailure 仅表示已有可提交结果
-但因前序失败没有写入，并复用前序失败 occurrence。每次命令恰好写
+NotCommittedAfterEarlierFailure 或 Cancelled；Partial、Unavailable 与 Failed 同时写可读任务
+诊断。NotCommittedAfterEarlierFailure 仅表示已有可提交结果，但因更早任务失败没有写入，
+不伪造当前 Task 的新错误。每次命令恰好写
 一条 `translation.finished`：NotStarted、NoWork、Complete、Incomplete、Failed 或
 Cancelled。含 Partial 或 Unavailable 任务但业务结果明确时，Translate 结果是 Incomplete，
 退出码仍为 `0`；完整翻译目标尚未达成。
 
 `translation.finished` 固定保存完整 Task 计数，并保存 RPG Maker 专用的 accepted decisions、
 written/remaining locations、remaining decisions、protocol diagnostics、recoverable request
-exhaustions 和 reconciliation 计数。Placeholder 等规划错误在任何模型请求前形成带完整
-owner、group location 和 role 的 `diagnostic.run_plan` occurrence；结果为 Failed，数据库
-保持不变。
+exhaustions 和 reconciliation 计数。Placeholder 等规划错误在任何模型请求前形成可读
+`diagnostic.run_plan`，保存类似 `Map023.json:event17:page1:dialogue42` 的位置、规则文件、
+自然规则号、原因和修改方法；结果为 Failed，数据库保持不变。
 
 Partial 会保留合法 ID 和已确认前序进度；再次运行会重新判断剩余 ID 而不改变稳定装箱。
-是否继续同一 Translate、修正资源，还是由人工或 agent 修订，要按
+是否继续同一 Translate、修正系统性资源问题，还是用 Manual 完成少量局部补译，要按
 [诊断与恢复指南](../guides/diagnosis-and-recovery.md#64-translate)根据具体原因与实际进展判断，
 不能把任一选择当成所有失败的固定做法。

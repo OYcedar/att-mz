@@ -1,314 +1,226 @@
 # ATT 诊断与恢复指南
 
-这份指南用于继续旧任务，或处理失败、Partial、Unavailable、取消、警告、恢复现场和
-结果未知。它负责把观察到的事实交给正确规格，并选出安全的下一步；具体状态与操作仍以
-对应现行规格为准。
+本指南用于命令失败、Partial、Unavailable、取消、警告、需要恢复或结果未知时选择下一步。
+具体产品行为仍以对应现行规格为准。
 
 ## 1. 不先重跑，先确定发生了什么
 
-先收集并记录：
+先收集当前命令直接产生的事实：
 
-- 实际 `att.exe`、发行目录、版本、SHA-256 和调用 cwd；
-- 引擎、项目、命令、参数与 RunId；
-- 退出码、终端完整诊断和 `run.finished` 终态；
-- 当前阶段的业务结果、警告、状态影响与恢复位置；
-- 当前项目日志和可用的模型任务记录；
-- 输入、配置、Prompt、Rules、术语、Placeholder 或 Lua 的身份；
-- ATT 管理的项目数据库、输出和发布现场是否仍在原位。
+1. stdout 的业务摘要；
+2. stderr 的对象、原因和修改方法；
+3. 存在时读取 `<project>/logs/run-000001.jsonl` 中同次运行的事件；
+4. Translate 实际发过模型请求时，读取
+   `<project>/task-records/run-000001/task-000001.md`；
+5. 检查项目数据库和输出目录是否存在、是否仍能由对应普通命令读取。
 
-项目日志和任务记录是诊断证据，不是提交、译文或发布的权威。日志缺失不证明操作没有
-发生；目录存在不证明发布成功；退出码 `0` 也不证明整个翻译已经完成。
+Manual export/check/apply 不建立项目日志；它们的 stdout/stderr 就是本次权威结果。不要因为
+没有新 RunId 把 Manual 误判为没有执行。
 
-当前 CLI 没有独立的 `status` 命令。需要完整检查 Unit 与译文时，按 [Lua 规格](../lua/README.md)
-使用当前数据库查询入口；Lua 是可写命令，即使脚本只查询也会取得写租约。完成或修复翻译
-的任务已包含这项项目内操作；只读调查未获写入授权时，只能报告现有诊断能够证明的事实，
-不能把日志推断成数据库状态。
+不要先删除数据库、任务记录、目录发布工作区或临时文件，也不要用重跑试探结果未知的
+提交。项目日志和任务记录只是证据，不是数据库或目录恢复权威。
 
 ## 2. 用三个维度分类
 
-每次问题同时记录三个维度，不能只写“失败”或“没翻完”。
-
 ### 2.1 进程终态
 
-- `succeeded`
-- `failed`
-- `cancelled`
-- `recovery_required`
-- `outcome_unknown`
-
-终态定义见 [CLI](../runtime/cli.md)与[项目日志](../runtime/project-log.md)。
+- 成功：命令取得明确结果；Translate 可以是明确的 Incomplete；
+- 失败：命令没有完成目标，但状态影响可判断；
+- 取消：合作取消已经完成收尾；
+- 需要恢复：状态明确，但存在必须保留或由同目标命令处理的恢复现场；
+- 结果未知：是否生效无法确认，不能继续写入或重跑试探。
 
 ### 2.2 当前阶段的业务结果
 
-例如 Init 是否建立项目、Extract 哪些 owner 提交、Translate 的 `translation.finished` 是
-Complete、Incomplete 还是其他终态、各 Task 是 Partial 或 Unavailable、Lua 事务是否提交、
-WriteBack 是否发布及是否要求人工布局。
+区分 Init、Extract、Translate、Manual、Lua 和 WriteBack。相同的“失败”在不同阶段有不同
+权威状态和重试入口。
 
 ### 2.3 状态影响
 
-- `unchanged`：状态未改变；
-- `progress_preserved`：前序进度已提交；
-- `applied`：本次操作已经生效；
-- `applied_run_plan_not_saved`：业务已经生效，但 RunPlan 未保存；
-- `applied_finalization_failed`：业务已经生效，但收尾失败；
-- `recovery_required`：状态明确且必须保留或处理恢复现场；
-- `outcome_unknown`：是否生效无法确认。
+确认本次是否：
 
-只有这三个维度都明确，才能决定继续、修正后重做、人工或 agent 修订、处理恢复现场，
-还是停止写入。
+- 没有修改项目；
+- 保留了已经确认的前序进度；
+- 应用了本次修改；
+- 已发布输出但清理失败；
+- 留下需要恢复的数据库事务或目录；
+- 无法确认是否生效。
+
+公开诊断不再提供内部 effect 或事务字段袋。根据普通文字、当前数据库、输出目录和对应
+规格判断，不从错误 code 或实现阶段猜测。
 
 ## 3. 通用处理顺序
 
-1. 读取 occurrence 的 `scope` 和 `report`；检查 `effect`、主诊断的 `code`、`stage`、具体
-   `issue`、类型化 `resolution`，以及递归 `related`。
-2. 完整读取拥有该事实的阶段规格，以及诊断涉及的公共或运行时规格。
-3. 从规格指定的权威位置重新观察当前状态；不要解析自由文本猜测。
-4. 确定最早失效的事实和项目内可用操作。
-5. 授权足够时执行该操作，随后重新观察；需要新的外部值或授权时才询问用户。
-6. 权威状态重新明确后，返回[翻译项目指南](translation-project.md)的相应阶段。
+1. 读对象、原因和修改方法；
+2. 打开当前阶段规格；
+3. 确认数据库或输出是否已经变化；
+4. 判断是输入问题、当前项目状态、外部服务、文件系统、数据库、日志还是呈现故障；
+5. 只修改直接原因；
+6. 只有状态明确允许时才重跑；
+7. 重跑后重新检查业务摘要和实际产物。
 
-禁止手工编辑 ATT 数据库，或删除、移动 ATT 管理的项目、candidate、stage、backup、
-journal、日志和任务记录。只有 [Lua](../lua/README.md) 明确提供的事务入口可以修改数据库。
+错误只给自然对象时，不要回到 raw SQLite 猜内部位置。翻译条目使用 Manual 或高级 Lua 的
+可读 ID；数据库结构调查只有在任务明确需要低级操作时才使用 `ctx.db`。
 
 ## 4. 按进程终态判断
 
-### 4.1 `succeeded`
+### 4.1 成功
 
-这只说明本次命令产生了明确业务结果。继续读取本阶段结果：Translate 仍可能是 Partial 或
-Unavailable，Extract 可能带警告，WriteBack 可能保留原文或要求人工布局。处理完这些事实
-后才能进入下一阶段。
+成功只表示本命令得到明确结果。Translate Incomplete、WriteBack 保留原文和人工布局警告都
+可能退出 `0`，仍需按业务摘要和验收指南继续处理。
 
-### 4.2 `failed`
+### 4.2 失败
 
-读取主错误、相关错误和状态影响。明确回滚或未改变时，修正具体原因后可按阶段规格重做；
-若已有 Translate 前序提交、发布已生效，或日志、任务记录、终端呈现失败，则先确认已经
-生效的部分，不能把
-整个运行当作未发生。
+按诊断修改输入、配置、规则、文件权限或项目状态。确认没有需要恢复或结果未知后，才重跑
+同一命令。不要为了一个局部译文问题修改全局规则并触发大规模 Translate。
 
-`run.finished` 只汇总进程结果并引用主 occurrence。只要该 occurrence 的主 report 或任一
-递归 related report 的 `effect = "recovery_required"`，即使 `run.finished` 是 `failed`，
-仍必须按第 4.4 节处理具体 issue 中列出的全部恢复产物；不能只按进程终态选择恢复办法。
+### 4.3 取消
 
-### 4.3 `cancelled`
+Translate 已确认的前序译文保留；尚未开始的模型任务不产生记录。Lua 只回滚取消时仍打开的
+事务，之前的 autocommit 或显式 COMMIT 保留。重新运行前先读取当前项目状态，不假设“整个
+命令都已回滚”。
 
-取消会停止新工作，但已经进入提交或发布边界的操作会完成到明确结果。Translate 已确认
-的前序进度会保留，已经形成的模型任务记录会完成收尾。重新执行前先按项目日志和数据库
-确认本次留下的状态，再只处理剩余工作。
+### 4.4 需要恢复
 
-### 4.4 `recovery_required`
+目录发布工作区固定为：
 
-业务状态已经明确，但诊断列出的现场必须保留。若这是目录发布恢复，读取
-[目录发布规格](../runtime/directory-publishing.md)。从 `publication.finished` 引用的
-`diagnostic.publication` occurrence 读取完整 report；Publication issue 直接保存
-`output_root`、`candidate_root`、`residual_path` 或 `recovery_artifacts`，嵌套 backend
-diagnostic 保存具体文件系统问题。只有恢复产物是该目标受管的
-`.directory-publish-*.(stage|backup|journal)`，且与同一 `output_root` 匹配时，才保持项目、
-目标、输入和恢复产物不变并继续判断。
+```text
+<parent>/.directory-publish/<target-name>/stage
+<parent>/.directory-publish/<target-name>/backup
+<parent>/.directory-publish/<target-name>/journal
+```
 
-`recovery_artifacts` 列出与同一操作匹配的 backup/journal 或可清理 stage，且主 report 与
-全部 related report 都没有 `filesystem.journal_corrupt`、目标与已知旧目录均缺失或缺少
-必要 backup 时，先修正实际文件系统问题，再执行一次相应 MV/MZ Init 或 WriteBack；MV/MZ
-Init 会在从 `project.db` 复用省略的游戏路径、读取项目状态和继承设置之前恢复，WriteBack
-会在建立新候选之前恢复。I/O 问题读取 `filesystem.io` issue 的
-`context.operation`、`problem.failure.kind` 和 `problem.failure.raw_os_code`；其他问题按
-稳定 code 与封闭 `problem.kind` 分流。
+保持项目、输入、目标和这些路径不变。先解除诊断指出的占用、权限或磁盘问题，再运行同一
+项目、同一目标的 Init 或 WriteBack；命令会在建立新候选前先恢复。
 
-自动恢复本身报告 `filesystem.journal_corrupt`、目标与已知旧目录均缺失、缺少必要
-backup，或一次恢复后仍得到 `effect = "recovery_required"` 时，现行接口没有修复入口。
-保留新的完整 occurrence 和具体 issue 中的全部路径，停止重跑；不自行删除、改名或移动。
+journal 损坏、目标与已知旧目录都缺失、必要 backup 缺失，或一次恢复后仍无法取得明确状态
+时，停止自动重试。不要手工删除、改名或移动工作目录。
 
-SQLite 恢复仍只按 [SQLite 规格](../runtime/sqlite.md)处理，不能把目录恢复方法套到数据库。
-Generic 初始数据库候选和 WriteBack scratch 也不属于目录发布器，分别按第 6.2、6.6 节
-处理。当前发行没有通用 `recover` 或 `status` 子命令；不得只看到进程终态就套用一种办法。
-一次运行的主诊断和相关诊断可以列出多种恢复路径，必须逐项分类并全部处理；一种路径已经
-恢复，不能证明同一运行的其他残留也已恢复。
+### 4.5 结果未知
 
-### 4.5 `outcome_unknown`
-
-这表示提交、目录交换或进程异常后无法证明操作是否生效。立即停止同一项目或目标上的
-重跑和写入，保留数据库、sidecar、候选、backup、journal 与日志。只允许进行不会改变
-现场的观察；无法通过现行公开接口确认时，按上一节报告能力缺口。
+停止同一项目的后续写入和重跑，保留数据库、SQLite sidecar、输出目标、目录发布工作区、
+日志与任务记录。当前普通 CLI 没有通用 status 或人工提交恢复命令；报告已经确认的事实和
+当前能力限制。
 
 ### 4.6 日志、任务记录或终端呈现失败
 
-这些失败不会自动改写已经确定的业务结果。根据仍可用的数据库、目录发布终态和终端诊断
-单独确认业务是否生效。不得因为任务记录缺失而重发模型请求，也不得因为进程返回 `1` 就
-假定数据库没有提交。
+日志和任务记录故障不改变已经确定的业务结果。先读取数据库或输出确认实际结果，再修正
+路径、权限或磁盘问题。警告或终态本身无法呈现时，进程返回 `1`；不能据此推断业务修改未
+发生。
 
 ## 5. 按失败来源选择处理办法
 
-| 失败来源 | 必读规格 | 项目内处理方向 |
+| 失败来源 | 先读 | 处理原则 |
 | --- | --- | --- |
-| 发行资源、配置或 Prompt 缺失 | [发行物](../runtime/distribution.md)、[配置](../runtime/configuration.md) | 停止项目操作；恢复同一发行包的完整资源，不从其他安装拼接 |
-| 输入、Rules、JSONL 或翻译资源无效 | 对应格式与阶段规格 | 修正实际输入，回到最早读取它的阶段 |
-| HTTP 传输、限速或超时 | [Chat Completions](../runtime/chat-completions.md) | 先区分运行时有限重试是否已经耗尽；只有适用的暂时性原因才再次运行 Translate |
-| Endpoint、Model、凭据、额度或 parameters | [配置](../runtime/configuration.md)、[Chat Completions](../runtime/chat-completions.md) | 不为试探而擅自换值；任务必须继续模型路径时才取得用户给出的精确新值，否则可按 Translate 分支转入 agent Lua 修订 |
-| 模型 JSON、ID、形状、Placeholder 或语言验收 | [Prompt](../translation/prompts.md)、对应 Translate、[任务记录](../translation/task-records.md) | 保留已提交项；判断应重跑、修正资源，还是由人工或 agent 修订 |
-| SQLite、事务、租约或 sidecar | [SQLite](../runtime/sqlite.md) | 明确回滚后修正原因再做；结果未知时停止写入 |
-| 候选、暂存、目录交换或恢复文件 | 当前 Init/WriteBack 规格与本指南第 4.4、6.6 节；恢复路径属于 `.directory-publish-*` 时再读[目录发布](../runtime/directory-publishing.md) | 遍历主诊断与相关诊断，按 operation 和每条恢复路径分别处理；不得把一种恢复办法套给全部现场 |
-| 译文遗漏或质量问题 | [全量验收](acceptance.md)、[Lua](../lua/README.md) | 先定位责任阶段，再自动重做或由人工或 agent 原子修订 |
+| CLI 或配置 | [CLI](../runtime/cli.md)、[配置](../runtime/configuration.md) | 修正显式输入，不猜默认值 |
+| Manual TOML | [Manual](../manual/README.md) | 按可读 ID 修正语法、原文、type、形状、空槽或 Placeholder |
+| Placeholder | [Placeholder](../translation/placeholders.md) | 只有系统性规则错误才修改全局规则 |
+| 术语或语言 | [术语](../translation/terminology.md)、[语言](../translation/language.md) | 区分结构错误与翻译质量问题 |
+| 模型请求 | [Chat Completions](../runtime/chat-completions.md)、[任务记录](../translation/task-records.md) | 保留已确认进度，按请求事实判断重试 |
+| SQLite | [SQLite](../runtime/sqlite.md) | 普通命令只接受当前 schema；raw Lua 修改自行承担结果 |
+| 目录发布 | [目录发布](../runtime/directory-publishing.md) | journal 是恢复权威，不用日志重放 |
+| 日志或任务记录 | [项目日志](../runtime/project-log.md)、[任务记录](../translation/task-records.md) | 作为证据故障处理，不改写业务结果 |
 
 ## 6. 按阶段处理
 
 ### 6.1 启动、配置与发行
 
-Help 与 Version 之外的命令使用实际 `att.exe` 同目录的固定发行资源。若二进制、配置、
-Prompt、文档、Skill 或许可集合不完整，按[发行物规格](../runtime/distribution.md)修复发行包；
-项目和任务材料不能充当发行资源。
-
-配置解析、语言、Profile 或 Client 选择错误按[配置规格](../runtime/configuration.md)处理。
-当前任务确需修改外部选择时，必须先取得用户给出的精确新值；不能为试探而擅自更换。
+Help 和 Version 不需要配置。其他命令从 `att.exe` 同目录读取固定资源。缺少配置、Prompt、
+语言模块或发行文件时，先修复发行根，不建立项目状态。发行包完整性只通过
+`SHA256SUMS.txt` 校验，checksum 不作为对象名称或普通日志字段。
 
 ### 6.2 Init
 
-完整读取对应 [MV/MZ Init](../rpg-maker/init.md)或 [Generic Init](../generic/init.md)，再按诊断
-区分输入检查、旧项目保持与数据库事务；MV/MZ Init 还要处理目录发布，Generic Init 则处理
-初始数据库候选。
+Generic 首次 Init 使用 `<project>/.project.db.init.tmp`，失败时会尝试清理候选和 SQLite
+sidecar。清理失败时保留准确路径，先解除占用并确认内容，再按诊断处理。
 
-MV、MZ 或 Generic 项目的当前 schema 无效时，现行产品都不迁移或覆盖原项目；在同一发行
-下使用新的项目名重新 Init，再从当前真实来源执行 Extract。MV/MZ 从游戏根重新建立冻结
-来源，Generic 从外部 JSONL 根重建；旧译文不会自动复制，是否保留必须在项目外审查后按
-当前项目能力重新翻译或精确修订。
-
-若结构化 operation 是 `cleanup_generic_initial_database_candidate`，恢复路径是 Generic
-工作区内的 `.project.db.init-*.tmp` 或它的 `-journal` / `-wal` / `-shm` SQLite sidecar。
-ATT 没有清理这类残留的公开入口，也不会在下一次 Init 自动处理它。保留旧路径并报告能力
-限制；使用新项目名重新 Init + Extract 可以继续翻译，但旧残留只有在操作者核实诊断路径
-并明确授权外部删除后才能处理，不能把它算作已恢复。
-
-只有[目录发布规格的 MV/MZ Init OS 5](../runtime/directory-publishing.md#5-mvmz-init-发布阶段的-os-5)
-全部条件同时成立时，才允许用完全相同的命令重试一次。其他 OS 5、目标已存在、
-`recovery_required` 或 `outcome_unknown` 都不能套用这一分支。
+MV/MZ Init 使用目录发布器建立来源与数据库。交换前失败保持旧项目；已发布但清理失败或
+需要恢复时，按 4.4 节运行同目标 Init。项目数据库不符合当前 schema 时只按当前数据库损坏
+处理，不识别版本、不迁移、不兼容读取。
 
 ### 6.3 Extract
 
-MV/MZ 分别确认 Builtin、Rules 与 MV dialogue owner。每个 owner 独立提交，因此一个 owner
-失败不代表另一个 owner 没有更新；按 [Extract](../rpg-maker/extraction.md)检查当前保存的
-owner 和资源。Rules 非字符串跳过警告是成功结果的一部分，必须按
-[Rules](../rpg-maker/rules.md)逐类解释，不能当作失败，也不能忽略。
+Generic Extract 整体原子提交；输入在读取期间改变时数据库不变，重新稳定输入后再运行。
+MV/MZ 每个 owner 独立提交，后续 owner 失败不撤销已经成功的前序 owner。
 
-Generic 按 [JSONL](../generic/jsonl.md)和 [Extract](../generic/extraction.md)处理语法、重复身份、
-来源变化与事务错误。任何来源、分组、身份、自然顺序或写回映射改变，都从 Extract 重新
-建立当前状态。
-
-如果调查发现某批 MV/MZ 文本原先被直接分配给 Generic，必须先重新核对 Builtin 与 Rules
-能力；能由 Rules 完整表达的内容应回到 MV/MZ 项目，而不是继续维护无必要的外部 JSONL。
+Extract 不删除人工译文表。原文或实际结构变化会让对应人工记录过期，旧正文仍由高级 Lua
+可见；无关人工译文保持当前。不要用 raw SQL 删除过期记录来伪装成功 Extract。
 
 ### 6.4 Translate
 
-完整读取对应引擎 Translate、[Prompt](../translation/prompts.md)、
-[任务记录](../translation/task-records.md)、[项目日志](../runtime/project-log.md)和实际失败
-涉及的资源或 HTTP 规格。
-
 #### Complete
 
-Complete 只说明当前项目本轮 Translate 的目标明确完成。进入全量验收，仍要检查项目范围、
-人工状态、输出和实际消费者。
+确认任务汇总、当前数据库和需要时的任务记录，再进入 WriteBack。Complete 不替代最终输出
+验收。
 
 #### Partial
 
-合法 ID 已经保存，失败项留给后续处理。先读取当前 RunId 的 `task.finished`、它引用的
-`diagnostic.translation_task` occurrence、唯一 `translation.finished` 与可用任务记录。
-`translation.finished.payload.result.kind` 应为 `incomplete`，其中保存完整任务计数和引擎
-专用汇总；按具体 issue 和 `resolution` 分类：
+先看哪些 Task 和条目仍未完成：
 
-- 暂时性外部失败或模型偶发输出，且再次运行有合理进展预期：使用同一项目、Profile 和
-  资源再次 Translate；Current 保留，ATT 重新为仍需模型的 Unit 分配临时 ID，并保留完整
-  TaskBlock 语境。
-- Rules、JSONL、语言、术语、Placeholder、Prompt 或配置事实错误：先修正根因，再按对应
-  规格让 Translate 重新判断状态。
-- 重复运行没有新增提交，或同一确定性验收错误持续出现：停止无效模型请求；按
-  [Lua](../lua/README.md)枚举当前候选和完整 Group 语境，由人工或 agent 翻译并使用
-  `ctx.translation.set` 精确提交，再全量复验。
+- 外部服务短暂失败、响应截断或可重试请求耗尽：保留已确认前序进度，状态明确时重跑同一
+  Translate；
+- Placeholder、Prompt 或语言规则存在可复现的系统性错误：修正规则后重跑；
+- 只剩少量局部条目或同文异译：使用 Manual TOML；
+- 含义不明：把全部待查可读 ID 合并到一次 `ctx.translation.context(ids)`，同时读取
+  `ctx.terminology.list()`，不要逐条启动 Lua；
+- 无法确认正确译文：停止并报告缺少的上下文或领域事实。
 
-任务记录中的数字 ID 只属于一次请求，不是数据库 locator。不得把临时 ID 写进 Lua，
-也不得只拿失败原文脱离 Group 语境补译。
+Manual 流程固定为 export、填写、check、apply。check 只检查结构与 Placeholder，不检查残留
+英文、译文等于原文、术语偏好或翻译质量。
 
 #### Unavailable
 
-先看每个任务的结构化原因。运行时只对 [Chat Completions](../runtime/chat-completions.md)
-规定的传输与 HTTP 情况执行有限重试；操作者再次运行 Translate 是另一项决定，不是内部
-重试的自动延长。
-
-从 `task.finished.payload.outcome.diagnostic` 取得 occurrence ID，并在同一 RunId 中读取
-对应的 `diagnostic.translation_task`。若 task-response issue 的 `scope.kind = "unit"`，
-`scope.unit` 已包含失败 Unit 的 `owner`、`group_location` 和 `role`；MV/MZ 可直接把这些
-原值用于 Lua locator，并结合任务记录检查该 Unit 的请求语境和模型输出。若
-`scope.kind = "task"`，失败属于整个请求、HTTP 或响应根，没有唯一 Unit；必须结合任务记录
-和当前数据库审查确定受影响范围，不能拿任务序号、临时 ID 或重复原文猜 locator。
-
-暂时性服务故障可以在原因消失后用同一项目和资源继续。Fatal HTTP、认证、额度、Endpoint、
-Model 或参数问题不能靠重跑或擅自换配置解决。只有任务明确要求继续模型路径时，才为需要
-改变的配置取得用户给出的精确新值；若目标是完成或修复翻译，当前 Unit、完整语境、语言、
-术语和 Placeholder 已足以让 agent 负责译文，则直接使用上一节的 Lua agent 修订路径，
-不因缺少新的 Endpoint、Model 或凭据而停下。确定性模型响应反复无进展时也使用该路径，
-不无限请求同一模型。只有缺少会改变译文结果的真实材料时才询问用户。
+Unavailable 表示模型没有给出可接受结果，但命令终态明确。根据任务记录判断是否值得重跑；
+少量剩余项优先 Manual。不要只为绕过一个条目修改 ignored terms、Placeholder 或语言规则。
 
 #### 整体无效响应与逐 ID 失败
 
-响应根或 JSON 无效时，该任务不提交；根有效时合法 ID 可以单独保存，其余形成 Partial。
-诊断时同时查看 System、User、可用 Thinking、Raw Assistant 和逐 ID 原因，但这些记录
-不是数据库权威。根据是否有新增提交和失败是否暂时，选择继续 Translate、修正资源，
-还是由人工或 agent 修订。
+整体根结构无效时该 Task 不提交；逐 ID 问题只拒绝对应项，其他合法项可以形成 Partial 并
+保存。任务记录中的数字 ID 每次请求重新分配，不能传给 Manual 或 Lua。
 
 #### 取消、并发与提交状态
 
-取消或后续任务失败不会撤销已确认的前序提交。CAS 或并发变化不会覆盖新状态。重新执行前
-先确认当前数据库候选，不按旧任务记录重放已完成译文。
+任务可以并发执行，但按自然顺序确认和提交。取消或后续失败不撤销已经确认的前序进度。
+当前人工译文出现时，模型结果不能覆盖它。
 
-### 6.5 Lua
+### 6.5 Manual 与 Lua
 
-按 [Lua 规格](../lua/README.md)区分编译前失败、脚本或 SQL 失败、最终校验失败、取消、
-明确提交与结果未知。明确回滚后可修正脚本重做；提交后重新查询受影响 Unit；
-`outcome_unknown` 时停止所有写入。
+普通人工补译使用 Manual。TOML 不携带上下文，必要时用高级 Lua 一次批量读取。高级
+`translation.set/clear` 与 Manual 共用结构和 Placeholder 检查。
+
+Raw `ctx.db` 从 autocommit 开始，可以执行 DML、DDL、PRAGMA 和显式事务，也可以故意删除表、
+制造孤儿关系或写乱码状态。ATT 不做 schema 或业务保护。失败和取消只回滚当时仍打开的
+事务；已经自动提交或显式提交的修改保留。只有任务明确需要低级数据库操作时才使用它。
 
 ### 6.6 WriteBack 与目录发布
 
-按对应 WriteBack 和[目录发布规格](../runtime/directory-publishing.md)区分：
+WriteBack 可以在 Partial 项目上运行，未译条目保留原文。人工译文优先于自动译文；人工
+译文不因 Placeholder 配置后来变化而过期，也不经过自动符号修复。
 
-- 候选建立或验证失败：上一次成功输出保持；修正根因后重新生成；
-- Partial 项目写回：未译内容可能保留当前原文，不能因此宣称翻译完成；
-- 人工布局警告：按诊断中的 `group_location + role` 用 Lua 取得唯一 locator、当前译文和
-  完整 Group 形状，并检查该显示请求内的译文、保留原文、控制序列和硬换行。只有原因是
-  行过宽或没有安全自动断点时，才按 `region` 与 `max_fullwidth_chars` 加入显式硬换行，用
-  `ctx.translation.set` 保持字符串或字符串数组形状并提交；若是无效 Placeholder、控制字符
-  或译文语法则返回相应阶段修正。游戏有效但布局器无法理解的控制语法可以保留，必须记录
-  原因，并在所有相关实际场景中确认显示正确；这种情况重新 WriteBack 后仍有警告是预期
-  结果，不能靠反复加换行消除；
-- `report.effect = "applied_finalization_failed"` 且 Publication issue 给出 `output_root` 与
-  `residual_path`：新输出已发布；先修正嵌套 backend diagnostic 中的清理失败，再按第 4.4
-  节条件执行一次同目标命令。`publication.finished.payload.result.kind =
-  "recovery_required"` 并引用同一 occurrence；Generic 与 RPG Maker 都使用该契约；
-- 主 report 或 related report 的 `effect = "recovery_required"`：保留 issue 中列出的
-  `.directory-publish-*` 现场，按第 4.4 节的稳定 code、类型化问题与产物组合分流；只有符合
-  自动恢复条件时才执行一次同目标、同输入命令；
-- Generic occurrence 的 `related` 中存在 `relation = "cleanup"` 时，遍历每个 FileSystem
-  issue 的精确 path：`.directory-publish-*` 仍按第 4.4 节条件分流；项目内
-  `.generic-write-back-*` 没有清理旧残留的公开入口。两类路径可以在同一运行同时存在，
-  必须分别处理。对后者再按相关主诊断判断输出是否发布。
-  主状态明确未发布时，修正原失败后可以重新 WriteBack，但只会建立新 scratch，不会清除
-  旧路径；旧残留必须报告，得到操作者对精确路径的外部删除授权前不能算作已恢复；
-- `outcome_unknown`：禁止重复发布，先确认实际目标状态；
-- Generic 输入与最近 Extract 不一致：返回 Generic Extract。
+人工布局警告使用可读 ID。重新 Manual export，按 ID 调整硬换行；需要 Group 语境时批量
+调用 Lua context。修订后重新 WriteBack 并在隔离副本中检查实际显示。
+
+候选验证失败或目录交换前取消时，上一次输出保持。发布已经开始后按 4.4 和 4.5 区分可恢复
+与结果未知。不要依据路径名猜恢复动作，固定工作目录仍以 journal 为权威。
 
 ### 6.7 SQLite 与可观测性
 
-数据库拥有项目、Unit 与译文状态；目录 journal 拥有发布恢复事实；项目日志和模型任务
-记录只保存诊断证据。各自的读取者和失败语义见 [SQLite](../runtime/sqlite.md)、
-[目录发布](../runtime/directory-publishing.md)、[项目日志](../runtime/project-log.md)和
-[任务记录](../translation/task-records.md)。任何一种记录都不能替代其他权威来源。
+普通命令发现当前 schema 不完整时停止，不迁移或兼容。公开诊断不显示 SQLite 查询、code、
+数据库行或内部指纹。Raw Lua 破坏数据库后，普通命令失败是预期结果；Generic Lua 仍可直接
+打开 `project.db` 继续调查。
+
+日志和任务记录缺失不证明请求或提交没有发生。以数据库、输出目录和对应事务或 journal
+为准。
 
 ## 7. 从质量问题返回正确阶段
 
-| 观察到的问题 | 最早责任位置 |
-| --- | --- |
-| 漏提、重复项目所有权、Rules 本可覆盖却误用 Generic | 来源调查与项目分配 |
-| Group、语境、自然顺序、稳定 ID 或写回映射错误 | Extract 或外部 JSONL 转换 |
-| 语言、术语、Placeholder、Prompt 或模型要求错误 | Translate 准备 |
-| 个别译文错误、同文异译或剩余候选可直接补译 | Lua 人工或 agent 修订 |
-| 控制符、形状、候选结构或布局错误 | Translate 验收或 WriteBack |
-| Generic 反向转换错误 | 外部转换 |
-| 游戏没有读取交付文件 | 部署与实际消费者 |
+- 漏提文本：回到 Extract、Rules 或 Generic JSONL；
+- 模型协议、术语或语言系统性错误：回到 Translate 资源；
+- 少量错译、漏译、同文异译或需要硬换行：Manual；
+- 批量上下文、复杂筛选、计算生成或特殊修改：Lua 高级 API；
+- 明确需要绕过全部保护：Raw Lua，并承担数据库可能完全损坏的结果；
+- 输出结构或发布问题：WriteBack 与目录发布；
+- 实际游戏没有采用输出：外部部署与消费者检查。
 
-修复后从最早失效位置重新执行全部下游检查。权威状态明确、恢复现场已按规格处理、下一
-阶段输入仍有效时，才返回正常流程。
+无法证明是系统性规则缺陷时，不通过修改全局规则触发大规模重译。完成局部 Manual 补译，
+或停止并报告无法确认的事实。

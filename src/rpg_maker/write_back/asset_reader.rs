@@ -92,12 +92,20 @@ fn read_rpg_maker_write_back_owner_groups() -> String {
 fn read_rpg_maker_write_back_owner_units() -> String {
     format!(
         "SELECT\n    text_group.group_location,\n    \
-         {RPG_MAKER_TEXT_UNIT_CONTENT_PROJECTION}\n\
+         {RPG_MAKER_TEXT_UNIT_CONTENT_PROJECTION},\n    \
+         text_group.group_kind,\n    \
+         text_group.projection_recipe_json,\n    \
+         manual.translation_json,\n    \
+         manual.applicability_fingerprint\n\
          FROM rpg_maker_text_group AS text_group\n\
          CROSS JOIN rpg_maker_text_unit AS unit\n  \
                     INDEXED BY rpg_maker_text_unit_owner_group_order_idx\n  \
            ON unit.owner = text_group.owner\n \
           AND text_group.group_id = unit.group_id\n\
+         LEFT JOIN rpg_maker_manual_translation AS manual\n  \
+           ON manual.owner = text_group.owner\n \
+          AND manual.group_location = text_group.group_location\n \
+          AND manual.unit_role = unit.unit_role\n\
          WHERE text_group.owner = ?\n\
          ORDER BY text_group.semantic_order_key,\n         \
           unit.semantic_order_key"
@@ -1327,6 +1335,7 @@ enum DecodedRecord {
         source_content_json: String,
         source_context_json: String,
         translation_content: Option<TextUnitContent>,
+        manual: bool,
     },
     Claim {
         owner: RpgMakerAssetOwner,
@@ -1377,10 +1386,24 @@ fn decode_group(
 fn decode_unit(
     OwnerPartitionedSqliteRow { owner, row }: OwnerPartitionedSqliteRow,
 ) -> Result<DecodedRecord, InvalidRpgMakerWriteBackAssetSnapshot> {
-    let mut row = RpgMakerAssetStorageRowDecoder::new(row, 6).map_err(map_storage_row_error)?;
+    let mut row = RpgMakerAssetStorageRowDecoder::new(row, 10).map_err(map_storage_row_error)?;
     let storage = RpgMakerTextUnitStorageRow::decode(&mut row).map_err(map_storage_row_error)?;
-    let translation_content = storage
+    let automatic_translation = storage
         .decode_translation_content()
+        .map_err(map_storage_row_error)?;
+    let group_kind_raw = row
+        .required_text("group_kind")
+        .map_err(map_storage_row_error)?;
+    let kind = TextGroupKind::from_storage_name(&group_kind_raw)
+        .ok_or(InvalidRpgMakerWriteBackAssetSnapshot::UnknownGroupKind)?;
+    let projection_recipe_json = row
+        .required_text("projection_recipe_json")
+        .map_err(map_storage_row_error)?;
+    let manual_translation_json = row
+        .optional_text("manual.translation_json")
+        .map_err(map_storage_row_error)?;
+    let manual_state = row
+        .optional_blob("manual.applicability_fingerprint")
         .map_err(map_storage_row_error)?;
     let RpgMakerTextUnitStorageRow {
         group_location_raw,
@@ -1393,6 +1416,72 @@ fn decode_unit(
         source_context_json,
         ..
     } = storage;
+    let identity = crate::rpg_maker::translate::pipeline::TranslationUnitIdentity::new(
+        owner,
+        kind,
+        group_location.clone(),
+        role.clone(),
+        source_content.clone(),
+        source_context_json.clone(),
+    );
+    let manual_type = crate::manual::rpg_maker_manual_type(&identity);
+    let source_lines = crate::manual::rpg_maker_manual_source_lines(&source_content);
+    let recipe_shape =
+        RpgMakerProjectionCodec::encode_role_recipe_shape(&projection_recipe_json, &role)
+            .map_err(InvalidRpgMakerWriteBackAssetSnapshot::InvalidProjection)?;
+    let expected_manual_state = crate::manual::rpg_maker_manual_applicability(
+        owner.storage_name(),
+        &group_location_raw,
+        &group_kind_raw,
+        &role_raw,
+        &recipe_shape,
+        manual_type,
+        &source_lines,
+    );
+    let manual_translation = match (manual_translation_json, manual_state) {
+        (None, None) => None,
+        (Some(translation_json), Some(state)) => {
+            let state =
+                crate::fingerprint::Sha256Fingerprint::from_slice(&state).map_err(|error| {
+                    InvalidRpgMakerWriteBackAssetSnapshot::InvalidFingerprintLength {
+                        owner,
+                        column: "manual.applicability_fingerprint",
+                        actual: error.actual(),
+                    }
+                })?;
+            if state != expected_manual_state {
+                None
+            } else {
+                let lines =
+                    serde_json::from_str::<Vec<String>>(&translation_json).map_err(|source| {
+                        InvalidRpgMakerWriteBackAssetSnapshot::InvalidUnitContent {
+                            column: "manual.translation_json",
+                            source,
+                        }
+                    })?;
+                if lines.is_empty() {
+                    return Err(InvalidRpgMakerWriteBackAssetSnapshot::InvalidModel(
+                        RpgMakerWriteBackSnapshotError::BlankTranslationContent {
+                            role: role.clone(),
+                        },
+                    ));
+                }
+                Some(crate::manual::rpg_maker_manual_translation_content(
+                    &source_content,
+                    lines,
+                ))
+            }
+        }
+        _ => {
+            return Err(InvalidRpgMakerWriteBackAssetSnapshot::WrongColumnType {
+                column: "manual_translation",
+                expected: "完整人工译文",
+                actual: "不完整人工译文",
+            });
+        }
+    };
+    let manual = manual_translation.is_some();
+    let translation_content = manual_translation.or(automatic_translation);
     Ok(DecodedRecord::Unit {
         owner,
         group_location_raw,
@@ -1404,6 +1493,7 @@ fn decode_unit(
         source_content_json,
         source_context_json,
         translation_content,
+        manual,
     })
 }
 
@@ -1590,6 +1680,7 @@ fn assemble_snapshot(
                 source_content_json,
                 source_context_json,
                 translation_content,
+                manual,
             } => {
                 fingerprint_accumulators
                     .get_mut(&owner)
@@ -1622,10 +1713,17 @@ fn assemble_snapshot(
                         },
                     );
                 }
-                group.units.push(
+                let unit = if manual {
+                    RpgMakerWriteBackUnit::new_manual(
+                        role,
+                        source_content,
+                        translation_content.expect("当前人工译文必须包含正文"),
+                    )
+                } else {
                     RpgMakerWriteBackUnit::new(role, source_content, translation_content)
-                        .map_err(InvalidRpgMakerWriteBackAssetSnapshot::InvalidModel)?,
-                );
+                }
+                .map_err(InvalidRpgMakerWriteBackAssetSnapshot::InvalidModel)?;
+                group.units.push(unit);
             }
             DecodedRecord::Claim {
                 owner,
@@ -2470,6 +2568,10 @@ mod tests {
                     SqliteValue::Text(source_content_json.clone()),
                     SqliteValue::Text("{}".to_owned()),
                     SqliteValue::Null,
+                    SqliteValue::Text("database_entry".to_owned()),
+                    SqliteValue::Text(recipes_raw.clone()),
+                    SqliteValue::Null,
+                    SqliteValue::Null,
                 ]),
             ));
             fingerprint_rows.groups.push((
@@ -2575,9 +2677,17 @@ mod tests {
                     source_content_json TEXT NOT NULL,
                     source_context_json TEXT NOT NULL,
                     translation_content_json TEXT,
-                    translation_state TEXT NOT NULL,
+                    translation_state BLOB,
                     PRIMARY KEY (owner, group_id, unit_role),
                     UNIQUE (owner, semantic_order_key)
+                );
+                CREATE TABLE rpg_maker_manual_translation (
+                    owner TEXT NOT NULL,
+                    group_location TEXT NOT NULL,
+                    unit_role TEXT NOT NULL,
+                    translation_json TEXT,
+                    applicability_fingerprint BLOB,
+                    PRIMARY KEY (owner, group_location, unit_role)
                 );
                 CREATE INDEX rpg_maker_text_unit_owner_group_order_idx
                     ON rpg_maker_text_unit(owner, group_id, semantic_order_key);
@@ -2595,8 +2705,8 @@ mod tests {
                 INSERT INTO rpg_maker_asset_owner_state VALUES ('builtin', zeroblob(32), zeroblob(32));
                 INSERT INTO rpg_maker_text_group VALUES ('builtin', 2, 'group-b', X'010000000000000001000000000000000000', 'map', '[]');
                 INSERT INTO rpg_maker_text_group VALUES ('builtin', 1, 'group-a', X'010000000000000000000000000000000000', 'map', '[]');
-                INSERT INTO rpg_maker_text_unit VALUES ('builtin', 2, 'role-z', X'010000000000000001000000000000000000', '"z"', '{}', NULL, 'untranslated');
-                INSERT INTO rpg_maker_text_unit VALUES ('builtin', 1, 'role-y', X'010000000000000000000000000000000000', '"y"', '{}', NULL, 'untranslated');
+                INSERT INTO rpg_maker_text_unit VALUES ('builtin', 2, 'role-z', X'010000000000000001000000000000000000', '"z"', '{}', NULL, NULL);
+                INSERT INTO rpg_maker_text_unit VALUES ('builtin', 1, 'role-y', X'010000000000000000000000000000000000', '"y"', '{}', NULL, NULL);
                 INSERT INTO rpg_maker_mutation_claim VALUES ('builtin', 1, 'resource-z', 'exclusive');
                 INSERT INTO rpg_maker_mutation_claim VALUES ('builtin', 2, 'resource-a', 'intent');
                 "#,
@@ -2770,6 +2880,10 @@ mod tests {
             SqliteValue::Text(source_content_json),
             SqliteValue::Text(context),
             SqliteValue::Text(translation_content_json),
+            SqliteValue::Text("database_entry".to_owned()),
+            SqliteValue::Text("[]".to_owned()),
+            SqliteValue::Null,
+            SqliteValue::Null,
         ]);
 
         let DecodedRecord::Unit {

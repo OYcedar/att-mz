@@ -243,7 +243,13 @@ pub(crate) enum MzCommand {
     /// 把已验收译文写回游戏。
     #[command(name = "write-back")]
     WriteBack(WriteBackArguments),
-    /// 在项目上下文中执行一次可信 Lua 程序。
+    /// 导出、检查或应用人工译文。
+    #[command(name = "manual")]
+    Manual {
+        #[command(subcommand)]
+        command: ManualCommand,
+    },
+    /// 对项目数据库运行 Lua 脚本。
     #[command(name = "lua")]
     Lua(ProjectLuaArguments),
 }
@@ -303,7 +309,13 @@ pub(crate) enum MvCommand {
     /// 把已验收译文写回游戏。
     #[command(name = "write-back")]
     WriteBack(WriteBackArguments),
-    /// 在项目上下文中执行一次可信 Lua 程序。
+    /// 导出、检查或应用人工译文。
+    #[command(name = "manual")]
+    Manual {
+        #[command(subcommand)]
+        command: ManualCommand,
+    },
+    /// 对项目数据库运行 Lua 脚本。
     #[command(name = "lua")]
     Lua(ProjectLuaArguments),
 }
@@ -323,9 +335,38 @@ pub(crate) enum GenericCommand {
     /// 把当前译文写入项目输出目录。
     #[command(name = "write-back")]
     WriteBack(ProjectArguments),
-    /// 在项目数据库的一次事务中执行 Lua。
+    /// 导出、检查或应用人工译文。
+    #[command(name = "manual")]
+    Manual {
+        #[command(subcommand)]
+        command: ManualCommand,
+    },
+    /// 对项目数据库运行 Lua 脚本。
     #[command(name = "lua")]
     Lua(ProjectLuaArguments),
+}
+
+/// 三种引擎共享的人工补译命令。
+#[derive(Debug, Subcommand)]
+pub(crate) enum ManualCommand {
+    /// 导出当前需要人工处理的条目。
+    #[command(name = "export")]
+    Export(ManualArguments),
+    /// 只读检查人工译文文件。
+    #[command(name = "check")]
+    Check(ManualArguments),
+    /// 原子应用已填写且有效的人工译文。
+    #[command(name = "apply")]
+    Apply(ManualArguments),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ManualArguments {
+    #[command(flatten)]
+    pub(crate) project: ProjectArguments,
+    /// 人工译文 TOML 文件。
+    #[arg(value_name = "FILE_TOML", value_parser = parse_non_blank_path)]
+    pub(crate) file: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -424,7 +465,7 @@ pub(crate) struct WriteBackArguments {
 pub(crate) struct ProjectLuaArguments {
     #[command(flatten)]
     pub(crate) project: ProjectArguments,
-    /// 本次执行的原子数据库 Lua 程序。
+    /// 要对项目数据库运行的 Lua 脚本。
     #[arg(value_name = "SCRIPT_LUA", value_parser = parse_non_blank_path)]
     pub(crate) script: PathBuf,
     /// `--` 后原样传给 Lua 全局 `arg[1..]` 的 UTF-8 参数。
@@ -502,7 +543,7 @@ fn localize_command_tree(
         .disable_help_subcommand(true)
         .disable_version_flag(true);
 
-    const ARGUMENT_IDENTIFIERS: [&str; 17] = [
+    const ARGUMENT_IDENTIFIERS: [&str; 18] = [
         "ui_language",
         "progress",
         "name",
@@ -520,6 +561,7 @@ fn localize_command_tree(
         "placeholders",
         "script",
         "arguments",
+        "file",
     ];
     for identifier in ARGUMENT_IDENTIFIERS {
         let Some(takes_values) = command
@@ -573,11 +615,14 @@ fn localized_usage_syntax(
     let options = localizer.format(UiMessage::CliOptionsMetavar);
     let nested_command = localizer.format(UiMessage::CliCommandMetavar);
     let syntax = match command_name {
-        "att" | "mz" | "mv" | "generic" => {
+        "att" | "mz" | "mv" | "generic" | "manual" => {
             format!("{command_path} [{options}] <{nested_command}>")
         }
         "translate" => format!("{command_path} --name <NAME> [PROFILE_ID] [{options}]"),
         "lua" => format!("{command_path} --name <NAME> [{options}] <SCRIPT_LUA> [-- <ARG>...]"),
+        "export" | "check" | "apply" => {
+            format!("{command_path} --name <NAME> <FILE_TOML> [{options}]")
+        }
         "init" | "extract" | "write-back" => {
             format!("{command_path} --name <NAME> [{options}]")
         }
@@ -619,6 +664,10 @@ fn command_about(name: &str) -> UiMessage<'static> {
         "extract" => UiMessage::CliExtractAbout,
         "translate" => UiMessage::CliTranslateAbout,
         "write-back" => UiMessage::CliWriteBackAbout,
+        "manual" => UiMessage::CliManualAbout,
+        "export" => UiMessage::CliManualExportAbout,
+        "check" => UiMessage::CliManualCheckAbout,
+        "apply" => UiMessage::CliManualApplyAbout,
         "lua" => UiMessage::CliProjectLuaAbout,
         _ => UiMessage::AppAbout,
     }
@@ -642,6 +691,7 @@ fn argument_help(identifier: &str) -> Option<UiMessage<'static>> {
         "placeholders" => Some(UiMessage::CliPlaceholdersHelp),
         "script" => Some(UiMessage::CliProjectLuaScriptHelp),
         "arguments" => Some(UiMessage::CliProjectLuaArgumentsHelp),
+        "file" => Some(UiMessage::CliManualFileHelp),
         _ => None,
     }
 }

@@ -424,6 +424,10 @@ pub(crate) enum UiMessage<'a> {
     CliExtractAbout,
     CliTranslateAbout,
     CliWriteBackAbout,
+    CliManualAbout,
+    CliManualExportAbout,
+    CliManualCheckAbout,
+    CliManualApplyAbout,
     CliProjectLuaAbout,
     CliProjectNameHelp,
     CliInitPathHelp,
@@ -440,6 +444,7 @@ pub(crate) enum UiMessage<'a> {
     CliPlaceholdersHelp,
     CliProjectLuaScriptHelp,
     CliProjectLuaArgumentsHelp,
+    CliManualFileHelp,
     CliUsageHeading,
     CliCommandsHeading,
     CliOptionsHeading,
@@ -487,35 +492,17 @@ pub(crate) enum UiMessage<'a> {
     },
     CliInvalidUtf8,
     CliParseFailure,
-    DiagnosticTitle {
-        code: &'a str,
-    },
-    DiagnosticStage {
-        stage: &'a str,
-    },
     DiagnosticLocation {
         subject: &'a str,
     },
     DiagnosticExplanation {
         reason: &'a str,
     },
-    DiagnosticEffect {
-        impact: &'a str,
-    },
     DiagnosticResolution {
         action: &'a str,
     },
     DiagnosticRelated {
         index: u64,
-    },
-    DiagnosticRelationValue {
-        code: &'a str,
-    },
-    DiagnosticStageValue {
-        code: &'a str,
-    },
-    DiagnosticEffectValue {
-        code: &'a str,
     },
     DiagnosticResolutionValue {
         code: &'a str,
@@ -697,18 +684,8 @@ pub(crate) enum UiMessage<'a> {
         candidate_validation_started: u64,
         candidate_validation_completed: u64,
     },
-    LogLuaScript {
-        identity: &'a str,
-        fingerprint: &'a str,
-    },
     LogLuaPrint {
         message: &'a str,
-    },
-    LogLuaSummary {
-        database_calls: u64,
-        changed_rows: u64,
-        translation_calls: u64,
-        printed_lines: u64,
     },
     LogPlanResolved {
         command: &'a str,
@@ -810,15 +787,8 @@ pub(crate) enum UiMessage<'a> {
     TaskRecordAttemptDuration {
         duration: &'a str,
     },
-    TaskRecordAttemptRequestId {
-        request_id: &'a str,
-    },
-    TaskRecordAttemptResponseId {
-        response_id: &'a str,
-    },
     TaskRecordAttemptRetryable {
         number: u64,
-        code: &'a str,
         duration: &'a str,
     },
     TaskRecordAttemptRetryAfter {
@@ -835,15 +805,11 @@ pub(crate) enum UiMessage<'a> {
     },
     TaskRecordAttemptFailed {
         number: u64,
-        code: &'a str,
         duration: &'a str,
     },
     TaskRecordAttemptCancelled {
         number: u64,
         duration: &'a str,
-    },
-    TaskRecordStructuredReason {
-        reason: &'a str,
     },
     TaskRecordFinalStatus {
         state: &'a str,
@@ -855,10 +821,7 @@ pub(crate) enum UiMessage<'a> {
     TaskRecordAcceptedOutcomeUnknown {
         accepted: u64,
     },
-    TaskRecordTaskDiagnostic {
-        code: &'a str,
-        reason: &'a str,
-    },
+    TaskRecordTaskDiagnostic,
     TaskRecordDurationSeconds {
         value: &'a str,
     },
@@ -879,6 +842,10 @@ impl UiMessage<'_> {
             Self::CliExtractAbout => "cli-extract-about",
             Self::CliTranslateAbout => "cli-translate-about",
             Self::CliWriteBackAbout => "cli-write-back-about",
+            Self::CliManualAbout => "cli-manual-about",
+            Self::CliManualExportAbout => "cli-manual-export-about",
+            Self::CliManualCheckAbout => "cli-manual-check-about",
+            Self::CliManualApplyAbout => "cli-manual-apply-about",
             Self::CliProjectLuaAbout => "cli-project-lua-about",
             Self::CliProjectNameHelp => "cli-project-name-help",
             Self::CliInitPathHelp => "cli-init-path-help",
@@ -895,6 +862,7 @@ impl UiMessage<'_> {
             Self::CliPlaceholdersHelp => "cli-placeholders-help",
             Self::CliProjectLuaScriptHelp => "cli-project-lua-script-help",
             Self::CliProjectLuaArgumentsHelp => "cli-project-lua-arguments-help",
+            Self::CliManualFileHelp => "cli-manual-file-help",
             Self::CliUsageHeading => "cli-usage-heading",
             Self::CliCommandsHeading => "cli-commands-heading",
             Self::CliOptionsHeading => "cli-options-heading",
@@ -923,16 +891,10 @@ impl UiMessage<'_> {
             Self::CliWrongNumberOfValues { .. } => "cli-wrong-number-of-values",
             Self::CliInvalidUtf8 => "cli-invalid-utf8",
             Self::CliParseFailure => "cli-parse-failure",
-            Self::DiagnosticTitle { .. } => "diagnostic-title",
-            Self::DiagnosticStage { .. } => "diagnostic-stage",
             Self::DiagnosticLocation { .. } => "diagnostic-location",
             Self::DiagnosticExplanation { .. } => "diagnostic-explanation",
-            Self::DiagnosticEffect { .. } => "diagnostic-effect",
             Self::DiagnosticResolution { .. } => "diagnostic-resolution",
             Self::DiagnosticRelated { .. } => "diagnostic-related",
-            Self::DiagnosticRelationValue { .. } => "diagnostic-relation-value",
-            Self::DiagnosticStageValue { .. } => "diagnostic-stage-value",
-            Self::DiagnosticEffectValue { .. } => "diagnostic-effect-value",
             Self::DiagnosticResolutionValue { .. } => "diagnostic-resolution-value",
             Self::DiagnosticFailureValue { .. } => "diagnostic-failure-value",
             Self::DiagnosticConfigurationRuleValue { .. } => "diagnostic-configuration-rule-value",
@@ -1003,9 +965,7 @@ impl UiMessage<'_> {
             Self::LogRunCancelled { .. } => "log-run-cancelled",
             Self::LogRunRecoveryRequired { .. } => "log-run-recovery-required",
             Self::LogPerformanceCounters { .. } => "log-performance-counters",
-            Self::LogLuaScript { .. } => "log-lua-script",
             Self::LogLuaPrint { .. } => "log-lua-print",
-            Self::LogLuaSummary { .. } => "log-lua-summary",
             Self::LogPlanResolved { .. } => "log-plan-resolved",
             Self::LogPhaseStarted { .. } => "log-phase-started",
             Self::LogPhaseCompleted { .. } => "log-phase-completed",
@@ -1041,8 +1001,6 @@ impl UiMessage<'_> {
             Self::TaskRecordAttemptSucceeded { .. } => "task-record-attempt-succeeded",
             Self::TaskRecordAttemptTokenUsage { .. } => "task-record-attempt-token-usage",
             Self::TaskRecordAttemptDuration { .. } => "task-record-attempt-duration",
-            Self::TaskRecordAttemptRequestId { .. } => "task-record-attempt-request-id",
-            Self::TaskRecordAttemptResponseId { .. } => "task-record-attempt-response-id",
             Self::TaskRecordAttemptRetryable { .. } => "task-record-attempt-retryable",
             Self::TaskRecordAttemptRetryAfter { .. } => "task-record-attempt-retry-after",
             Self::TaskRecordAttemptWaitRetry { .. } => "task-record-attempt-wait-retry",
@@ -1050,11 +1008,10 @@ impl UiMessage<'_> {
             Self::TaskRecordAttemptWaitCancelled { .. } => "task-record-attempt-wait-cancelled",
             Self::TaskRecordAttemptFailed { .. } => "task-record-attempt-failed",
             Self::TaskRecordAttemptCancelled { .. } => "task-record-attempt-cancelled",
-            Self::TaskRecordStructuredReason { .. } => "task-record-structured-reason",
             Self::TaskRecordFinalStatus { .. } => "task-record-final-status",
             Self::TaskRecordAcceptedWritten { .. } => "task-record-accepted-written",
             Self::TaskRecordAcceptedOutcomeUnknown { .. } => "task-record-accepted-outcome-unknown",
-            Self::TaskRecordTaskDiagnostic { .. } => "task-record-task-diagnostic",
+            Self::TaskRecordTaskDiagnostic => "task-record-task-diagnostic",
             Self::TaskRecordDurationSeconds { .. } => "task-record-duration-seconds",
             Self::TaskRecordDurationMilliseconds { .. } => "task-record-duration-milliseconds",
         }
@@ -1263,25 +1220,7 @@ impl UiMessage<'_> {
                     candidate_validation_completed,
                 );
             }
-            Self::LogLuaScript {
-                identity,
-                fingerprint,
-            } => {
-                set_text(&mut arguments, "identity", identity);
-                set_text(&mut arguments, "fingerprint", fingerprint);
-            }
             Self::LogLuaPrint { message } => set_text(&mut arguments, "message", message),
-            Self::LogLuaSummary {
-                database_calls,
-                changed_rows,
-                translation_calls,
-                printed_lines,
-            } => {
-                set_number(&mut arguments, "database_calls", database_calls);
-                set_number(&mut arguments, "changed_rows", changed_rows);
-                set_number(&mut arguments, "translation_calls", translation_calls);
-                set_number(&mut arguments, "printed_lines", printed_lines);
-            }
             Self::LogPlanResolved { command, source } => {
                 set_text(&mut arguments, "command", command);
                 set_text(&mut arguments, "source", source);
@@ -1385,24 +1324,9 @@ impl UiMessage<'_> {
             Self::TaskRecordAttemptDuration { duration } => {
                 set_text(&mut arguments, "duration", duration);
             }
-            Self::TaskRecordAttemptRequestId { request_id } => {
-                set_text(&mut arguments, "request_id", request_id);
-            }
-            Self::TaskRecordAttemptResponseId { response_id } => {
-                set_text(&mut arguments, "response_id", response_id);
-            }
-            Self::TaskRecordAttemptRetryable {
-                number,
-                code,
-                duration,
-            }
-            | Self::TaskRecordAttemptFailed {
-                number,
-                code,
-                duration,
-            } => {
+            Self::TaskRecordAttemptRetryable { number, duration }
+            | Self::TaskRecordAttemptFailed { number, duration } => {
                 set_number(&mut arguments, "number", number);
-                set_text(&mut arguments, "code", code);
                 set_text(&mut arguments, "duration", duration);
             }
             Self::TaskRecordAttemptRetryAfter { duration }
@@ -1415,9 +1339,6 @@ impl UiMessage<'_> {
                 set_number(&mut arguments, "number", number);
                 set_text(&mut arguments, "duration", duration);
             }
-            Self::TaskRecordStructuredReason { reason } => {
-                set_text(&mut arguments, "reason", reason);
-            }
             Self::TaskRecordAcceptedWritten { accepted, written } => {
                 set_number(&mut arguments, "accepted", accepted);
                 set_number(&mut arguments, "written", written);
@@ -1425,28 +1346,18 @@ impl UiMessage<'_> {
             Self::TaskRecordAcceptedOutcomeUnknown { accepted } => {
                 set_number(&mut arguments, "accepted", accepted);
             }
-            Self::TaskRecordTaskDiagnostic { code, reason } => {
-                set_text(&mut arguments, "code", code);
-                set_text(&mut arguments, "reason", reason);
-            }
+            Self::TaskRecordTaskDiagnostic => {}
             Self::TaskRecordDurationSeconds { value } => {
                 set_text(&mut arguments, "value", value);
             }
             Self::TaskRecordDurationMilliseconds { value } => {
                 set_text(&mut arguments, "value", value);
             }
-            Self::DiagnosticTitle { code } => set_text(&mut arguments, "code", code),
-            Self::DiagnosticStage { stage } => set_text(&mut arguments, "stage", stage),
             Self::DiagnosticLocation { subject } => set_text(&mut arguments, "subject", subject),
             Self::DiagnosticExplanation { reason } => set_text(&mut arguments, "reason", reason),
-            Self::DiagnosticEffect { impact } => set_text(&mut arguments, "impact", impact),
             Self::DiagnosticResolution { action } => set_text(&mut arguments, "action", action),
             Self::DiagnosticRelated { index } => set_number(&mut arguments, "index", index),
-            Self::DiagnosticStageValue { code }
-            | Self::DiagnosticRelationValue { code }
-            | Self::DiagnosticEffectValue { code }
-            | Self::DiagnosticResolutionValue { code }
-            | Self::DiagnosticFailureValue { code } => {
+            Self::DiagnosticResolutionValue { code } | Self::DiagnosticFailureValue { code } => {
                 set_text(&mut arguments, "code", code);
             }
             Self::DiagnosticConfigurationRuleValue {
@@ -1471,6 +1382,10 @@ impl UiMessage<'_> {
             | Self::CliExtractAbout
             | Self::CliTranslateAbout
             | Self::CliWriteBackAbout
+            | Self::CliManualAbout
+            | Self::CliManualExportAbout
+            | Self::CliManualCheckAbout
+            | Self::CliManualApplyAbout
             | Self::CliProjectLuaAbout
             | Self::CliProjectNameHelp
             | Self::CliInitPathHelp
@@ -1487,6 +1402,7 @@ impl UiMessage<'_> {
             | Self::CliPlaceholdersHelp
             | Self::CliProjectLuaScriptHelp
             | Self::CliProjectLuaArgumentsHelp
+            | Self::CliManualFileHelp
             | Self::CliUsageHeading
             | Self::CliCommandsHeading
             | Self::CliOptionsHeading
@@ -1736,51 +1652,7 @@ mod tests {
     }
 
     #[test]
-    fn process_output_stage_formats_with_the_same_parameters_in_every_locale() {
-        for locale in UiLocale::ALL {
-            let expected = match locale {
-                UiLocale::Arabic => "إخراج العملية",
-                UiLocale::SimplifiedChinese => "进程输出",
-                UiLocale::TraditionalChinese => "處理程序輸出",
-                UiLocale::English => "Process output",
-                UiLocale::French => "Sortie du processus",
-                UiLocale::Russian => "Вывод процесса",
-                UiLocale::Spanish => "Salida del proceso",
-                UiLocale::Japanese => "プロセス出力",
-                UiLocale::Korean => "프로세스 출력",
-                UiLocale::Vietnamese => "Đầu ra tiến trình",
-            };
-            let rendered = UiLocalizer::new(locale).format(UiMessage::DiagnosticStageValue {
-                code: "process_output",
-            });
-            assert_eq!(
-                without_fluent_isolation(&rendered),
-                expected,
-                "{locale} 的 process_output 阶段标签不正确"
-            );
-        }
-    }
-
-    #[test]
-    fn current_diagnostic_stages_and_summaries_render_in_every_locale() {
-        const STAGES: &[&str] = &[
-            "process_startup",
-            "process_output",
-            "configuration",
-            "command_preparation",
-            "project_opening",
-            "init",
-            "extract",
-            "translate",
-            "write_back",
-            "lua",
-            "model_request",
-            "run_plan_finalization",
-            "publication",
-            "shutdown",
-            "logging",
-            "runtime",
-        ];
+    fn current_diagnostic_summaries_render_in_every_locale() {
         const SUMMARIES: &[&str] = &[
             "already_exists",
             "backup_incomplete",
@@ -1849,13 +1721,6 @@ mod tests {
 
         for locale in UiLocale::ALL {
             let localizer = UiLocalizer::new(locale);
-            for code in STAGES {
-                let rendered = localizer.format(UiMessage::DiagnosticStageValue { code });
-                assert!(
-                    !rendered.contains("__ATT_FALLBACK__"),
-                    "{locale} 缺少诊断阶段 {code}"
-                );
-            }
             for code in SUMMARIES {
                 let rendered = localizer.format(UiMessage::DiagnosticFailureValue { code });
                 assert!(
@@ -1867,24 +1732,9 @@ mod tests {
     }
 
     #[test]
-    fn current_diagnostic_effects_and_resolutions_render_in_every_locale() {
+    fn current_diagnostic_resolutions_render_in_every_locale() {
         for locale in UiLocale::ALL {
             let localizer = UiLocalizer::new(locale);
-            for code in [
-                "unchanged",
-                "progress_preserved",
-                "applied",
-                "applied_run_plan_not_saved",
-                "applied_finalization_failed",
-                "recovery_required",
-                "outcome_unknown",
-            ] {
-                let rendered = localizer.format(UiMessage::DiagnosticEffectValue { code });
-                assert!(
-                    !rendered.contains("__ATT_FALLBACK__"),
-                    "{locale} 缺少诊断状态影响 {code}"
-                );
-            }
             for code in [
                 "fix_configuration",
                 "fix_input",
@@ -1902,20 +1752,6 @@ mod tests {
                 assert!(
                     !rendered.contains("__ATT_FALLBACK__"),
                     "{locale} 缺少诊断处理办法 {code}"
-                );
-            }
-            for code in [
-                "cleanup",
-                "rollback",
-                "discard",
-                "finalization",
-                "shutdown",
-                "observability",
-            ] {
-                let rendered = localizer.format(UiMessage::DiagnosticRelationValue { code });
-                assert!(
-                    !rendered.contains("__ATT_FALLBACK__"),
-                    "{locale} 缺少相关诊断关系 {code}"
                 );
             }
         }
@@ -2062,6 +1898,10 @@ mod tests {
             UiMessage::CliExtractAbout,
             UiMessage::CliTranslateAbout,
             UiMessage::CliWriteBackAbout,
+            UiMessage::CliManualAbout,
+            UiMessage::CliManualExportAbout,
+            UiMessage::CliManualCheckAbout,
+            UiMessage::CliManualApplyAbout,
             UiMessage::CliProjectLuaAbout,
             UiMessage::CliProjectNameHelp,
             UiMessage::CliInitPathHelp,
@@ -2078,6 +1918,7 @@ mod tests {
             UiMessage::CliPlaceholdersHelp,
             UiMessage::CliProjectLuaScriptHelp,
             UiMessage::CliProjectLuaArgumentsHelp,
+            UiMessage::CliManualFileHelp,
             UiMessage::CliUsageHeading,
             UiMessage::CliCommandsHeading,
             UiMessage::CliOptionsHeading,
@@ -2109,26 +1950,16 @@ mod tests {
             UiMessage::CliWrongNumberOfValues { argument: "--path" },
             UiMessage::CliInvalidUtf8,
             UiMessage::CliParseFailure,
-            UiMessage::DiagnosticTitle {
-                code: "project.state",
-            },
-            UiMessage::DiagnosticStage { stage: "extract" },
             UiMessage::DiagnosticLocation {
                 subject: "project demo",
             },
             UiMessage::DiagnosticExplanation {
                 reason: "state mismatch",
             },
-            UiMessage::DiagnosticEffect {
-                impact: "unchanged",
-            },
             UiMessage::DiagnosticResolution {
                 action: "check project state",
             },
             UiMessage::DiagnosticRelated { index: 1 },
-            UiMessage::DiagnosticRelationValue { code: "cleanup" },
-            UiMessage::DiagnosticStageValue { code: "extract" },
-            UiMessage::DiagnosticEffectValue { code: "unchanged" },
             UiMessage::DiagnosticResolutionValue { code: "retry" },
             UiMessage::DiagnosticFailureValue { code: "not_found" },
             UiMessage::DiagnosticConfigurationRuleValue {
@@ -2269,17 +2100,7 @@ mod tests {
                 candidate_validation_started: 11,
                 candidate_validation_completed: 13,
             },
-            UiMessage::LogLuaScript {
-                identity: "script.lua",
-                fingerprint: "0123456789abcdef",
-            },
             UiMessage::LogLuaPrint { message: "message" },
-            UiMessage::LogLuaSummary {
-                database_calls: 1,
-                changed_rows: 2,
-                translation_calls: 3,
-                printed_lines: 4,
-            },
             UiMessage::LogPlanResolved {
                 command: "extract",
                 source: "explicit",
@@ -2357,15 +2178,8 @@ mod tests {
                 total: 3,
             },
             UiMessage::TaskRecordAttemptDuration { duration: "12 ms" },
-            UiMessage::TaskRecordAttemptRequestId {
-                request_id: "request",
-            },
-            UiMessage::TaskRecordAttemptResponseId {
-                response_id: "response",
-            },
             UiMessage::TaskRecordAttemptRetryable {
                 number: 1,
-                code: "model.request",
                 duration: "12 ms",
             },
             UiMessage::TaskRecordAttemptRetryAfter { duration: "12 ms" },
@@ -2374,24 +2188,19 @@ mod tests {
             UiMessage::TaskRecordAttemptWaitCancelled { duration: "12 ms" },
             UiMessage::TaskRecordAttemptFailed {
                 number: 1,
-                code: "model.request",
                 duration: "12 ms",
             },
             UiMessage::TaskRecordAttemptCancelled {
                 number: 1,
                 duration: "12 ms",
             },
-            UiMessage::TaskRecordStructuredReason { reason: "{}" },
             UiMessage::TaskRecordFinalStatus { state: "complete" },
             UiMessage::TaskRecordAcceptedWritten {
                 accepted: 4,
                 written: 6,
             },
             UiMessage::TaskRecordAcceptedOutcomeUnknown { accepted: 4 },
-            UiMessage::TaskRecordTaskDiagnostic {
-                code: "model.request",
-                reason: "{}",
-            },
+            UiMessage::TaskRecordTaskDiagnostic,
             UiMessage::TaskRecordDurationSeconds { value: "1.250" },
             UiMessage::TaskRecordDurationMilliseconds { value: "12" },
         ]

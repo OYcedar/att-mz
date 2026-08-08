@@ -74,6 +74,7 @@ const CREATE_RPG_MAKER_ASSET_OWNER_STATE_TABLE: &str = r#"CREATE TABLE rpg_maker
 
 pub(crate) const RPG_MAKER_TEXT_GROUP_TABLE_NAME: &str = "rpg_maker_text_group";
 pub(crate) const RPG_MAKER_TEXT_UNIT_TABLE_NAME: &str = "rpg_maker_text_unit";
+pub(crate) const RPG_MAKER_MANUAL_TRANSLATION_TABLE_NAME: &str = "rpg_maker_manual_translation";
 pub(crate) const RPG_MAKER_MUTATION_CLAIM_TABLE_NAME: &str = "rpg_maker_mutation_claim";
 
 const CREATE_RPG_MAKER_TEXT_GROUP_TABLE: &str = r#"CREATE TABLE rpg_maker_text_group (
@@ -135,6 +136,27 @@ const CREATE_RPG_MAKER_TEXT_UNIT_TABLE: &str = r#"CREATE TABLE rpg_maker_text_un
             AND length(translation_state) = 32
         )
     )
+)"#;
+
+const CREATE_RPG_MAKER_MANUAL_TRANSLATION_TABLE: &str = r#"CREATE TABLE rpg_maker_manual_translation (
+    owner                       TEXT NOT NULL CHECK (owner IN ('builtin', 'rules')),
+    group_location              TEXT NOT NULL CHECK (length(group_location) > 0),
+    unit_role                   TEXT NOT NULL CHECK (length(unit_role) > 0),
+    readable_id                 TEXT NOT NULL CHECK (length(readable_id) > 0),
+    translation_type            TEXT NOT NULL CHECK (translation_type IN ('fixed', 'free')),
+    source_json                 TEXT NOT NULL CHECK (
+        json_valid(source_json) AND json_type(source_json) = 'array'
+    ),
+    translation_json            TEXT NOT NULL CHECK (
+        json_valid(translation_json)
+        AND json_type(translation_json) = 'array'
+        AND json_array_length(translation_json) > 0
+    ),
+    applicability_fingerprint   BLOB NOT NULL CHECK (
+        typeof(applicability_fingerprint) = 'blob'
+        AND length(applicability_fingerprint) = 32
+    ),
+    PRIMARY KEY (owner, group_location, unit_role)
 )"#;
 
 pub(crate) const CREATE_RPG_MAKER_TEXT_UNIT_OWNER_GROUP_ORDER_INDEX: &str = "CREATE INDEX rpg_maker_text_unit_owner_group_order_idx ON rpg_maker_text_unit(owner, group_id, semantic_order_key)";
@@ -230,6 +252,7 @@ WHERE sql IS NOT NULL
       'rpg_maker_asset_owner_state',
       'rpg_maker_text_group',
       'rpg_maker_text_unit',
+      'rpg_maker_manual_translation',
       'rpg_maker_mutation_claim',
       'rpg_maker_translation_resource',
       'rpg_maker_project_definition'
@@ -847,30 +870,6 @@ fn max_fullwidth_chars_integer(
     })
 }
 
-/// 用项目数据库读取器的同一规则校验直接 SQLite 连接返回的显示宽度。
-///
-/// Lua 适配器在事务提交前持有 `rusqlite` 行，必须保留 SQLite 实际存储类型，
-/// 不能通过 `get::<i64>` 把 REAL 或 TEXT 隐式转换成看似合法的整数。
-pub(crate) fn max_fullwidth_chars_from_rusqlite_value(
-    value: rusqlite::types::ValueRef<'_>,
-    column: &'static str,
-) -> Result<MaxFullwidthChars, InvalidProjectMetadata> {
-    let value = match value {
-        rusqlite::types::ValueRef::Integer(value) => {
-            return max_fullwidth_chars_integer(value, column);
-        }
-        rusqlite::types::ValueRef::Null => "NULL",
-        rusqlite::types::ValueRef::Real(_) => "REAL",
-        rusqlite::types::ValueRef::Text(_) => "TEXT",
-        rusqlite::types::ValueRef::Blob(_) => "BLOB",
-    };
-    Err(InvalidProjectMetadata::WrongColumnType {
-        column,
-        expected: "INTEGER",
-        actual: value,
-    })
-}
-
 /// 项目数据库读取失败，并保留目标路径和底层原因。
 #[derive(Debug)]
 pub(crate) enum ProjectDatabaseReadError<E> {
@@ -1358,34 +1357,6 @@ pub(crate) enum InvalidCurrentProjectDatabase {
     Integrity(InvalidProjectDatabaseIntegrity),
 }
 
-/// 直接连接无法证明 RPG Maker 数据库采用当前唯一 ATT schema。
-#[derive(Debug)]
-pub(crate) enum CurrentAttSchemaValidationError {
-    Cancelled,
-    Read(rusqlite::Error),
-    Invalid(InvalidCurrentProjectDatabase),
-}
-
-impl fmt::Display for CurrentAttSchemaValidationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Cancelled => formatter.write_str("当前 ATT schema 校验已取消"),
-            Self::Read(source) => write!(formatter, "读取当前 ATT schema 失败：{source}"),
-            Self::Invalid(reason) => reason.fmt(formatter),
-        }
-    }
-}
-
-impl Error for CurrentAttSchemaValidationError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Cancelled => None,
-            Self::Read(source) => Some(source),
-            Self::Invalid(reason) => Some(reason),
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProjectDatabaseValueKind {
     Null,
@@ -1462,6 +1433,7 @@ pub(crate) enum AttSchemaObject {
     RpgMakerAssetOwnerState,
     RpgMakerTextGroup,
     RpgMakerTextUnit,
+    RpgMakerManualTranslation,
     RpgMakerTextUnitOwnerGroupOrderIndex,
     RpgMakerMutationClaim,
     RpgMakerTranslationResource,
@@ -1481,6 +1453,7 @@ impl AttSchemaObject {
             Self::RpgMakerAssetOwnerState => "table:rpg_maker_asset_owner_state",
             Self::RpgMakerTextGroup => "table:rpg_maker_text_group",
             Self::RpgMakerTextUnit => "table:rpg_maker_text_unit",
+            Self::RpgMakerManualTranslation => "table:rpg_maker_manual_translation",
             Self::RpgMakerTextUnitOwnerGroupOrderIndex => {
                 "index:rpg_maker_text_unit_owner_group_order_idx"
             }
@@ -2094,6 +2067,12 @@ fn expected_att_schema() -> Vec<(&'static str, &'static str, &'static str, &'sta
             CREATE_RPG_MAKER_TEXT_UNIT_TABLE,
         ),
         (
+            "table",
+            RPG_MAKER_MANUAL_TRANSLATION_TABLE_NAME,
+            RPG_MAKER_MANUAL_TRANSLATION_TABLE_NAME,
+            CREATE_RPG_MAKER_MANUAL_TRANSLATION_TABLE,
+        ),
+        (
             "index",
             "rpg_maker_text_unit_owner_group_order_idx",
             RPG_MAKER_TEXT_UNIT_TABLE_NAME,
@@ -2296,162 +2275,6 @@ fn schema_text_eq(
     Ok(true)
 }
 
-/// 在调用方已经打开的连接上校验当前唯一 RPG Maker ATT schema。
-///
-/// 查询只选择 ATT 管理的对象，因此脚本私有表、索引和触发器不属于本契约。
-#[cfg(test)]
-pub(crate) fn validate_current_att_schema(
-    connection: &rusqlite::Connection,
-) -> Result<(), CurrentAttSchemaValidationError> {
-    validate_current_att_schema_with_cancellation(connection, || false)
-}
-
-pub(crate) fn validate_current_att_schema_with_cancellation(
-    connection: &rusqlite::Connection,
-    mut is_cancelled: impl FnMut() -> bool,
-) -> Result<(), CurrentAttSchemaValidationError> {
-    if is_cancelled() {
-        return Err(CurrentAttSchemaValidationError::Cancelled);
-    }
-    let mut statement = connection
-        .prepare(SELECT_ATT_SCHEMA)
-        .map_err(|source| current_att_schema_read_error(source, &mut is_cancelled))?;
-    if is_cancelled() {
-        return Err(CurrentAttSchemaValidationError::Cancelled);
-    }
-    let mut query = statement
-        .query([])
-        .map_err(|source| current_att_schema_read_error(source, &mut is_cancelled))?;
-    let mut rows = Vec::new();
-    loop {
-        if is_cancelled() {
-            return Err(CurrentAttSchemaValidationError::Cancelled);
-        }
-        let Some(row) = query
-            .next()
-            .map_err(|source| current_att_schema_read_error(source, &mut is_cancelled))?
-        else {
-            break;
-        };
-        rows.push(SqliteRow::new(vec![
-            SqliteValue::Text(clone_current_att_schema_text(
-                row,
-                0,
-                "type",
-                &mut is_cancelled,
-            )?),
-            SqliteValue::Text(clone_current_att_schema_text(
-                row,
-                1,
-                "name",
-                &mut is_cancelled,
-            )?),
-            SqliteValue::Text(clone_current_att_schema_text(
-                row,
-                2,
-                "tbl_name",
-                &mut is_cancelled,
-            )?),
-            SqliteValue::Text(clone_current_att_schema_text(
-                row,
-                3,
-                "sql",
-                &mut is_cancelled,
-            )?),
-        ]));
-    }
-    drop(query);
-    drop(statement);
-    match validate_att_schema_with_check(rows, &mut is_cancelled) {
-        Ok(()) => Ok(()),
-        Err(AttSchemaCheckError::Cancelled) => Err(CurrentAttSchemaValidationError::Cancelled),
-        Err(AttSchemaCheckError::Invalid(source)) => {
-            Err(CurrentAttSchemaValidationError::Invalid(source))
-        }
-    }
-}
-
-fn clone_current_att_schema_text(
-    row: &rusqlite::Row<'_>,
-    index: usize,
-    column: &'static str,
-    is_cancelled: &mut impl FnMut() -> bool,
-) -> Result<String, CurrentAttSchemaValidationError> {
-    if is_cancelled() {
-        return Err(CurrentAttSchemaValidationError::Cancelled);
-    }
-    let bytes = match row
-        .get_ref(index)
-        .map_err(|source| current_att_schema_read_error(source, is_cancelled))?
-    {
-        rusqlite::types::ValueRef::Text(bytes) => bytes,
-        value => {
-            let source =
-                rusqlite::Error::InvalidColumnType(index, column.to_owned(), value.data_type());
-            return Err(current_att_schema_read_error(source, is_cancelled));
-        }
-    };
-    let mut text = String::with_capacity(bytes.len());
-    let mut pending = Vec::with_capacity(64 * 1024 + 3);
-    for chunk in bytes.chunks(64 * 1024) {
-        if is_cancelled() {
-            return Err(CurrentAttSchemaValidationError::Cancelled);
-        }
-        pending.extend_from_slice(chunk);
-        match std::str::from_utf8(&pending) {
-            Ok(valid) => {
-                text.push_str(valid);
-                pending.clear();
-            }
-            Err(source) if source.error_len().is_none() => {
-                let valid_up_to = source.valid_up_to();
-                let valid = std::str::from_utf8(&pending[..valid_up_to])
-                    .expect("Utf8Error::valid_up_to 指向有效 UTF-8 前缀");
-                text.push_str(valid);
-                pending.copy_within(valid_up_to.., 0);
-                pending.truncate(pending.len() - valid_up_to);
-            }
-            Err(source) => {
-                let source = rusqlite::Error::FromSqlConversionFailure(
-                    index,
-                    rusqlite::types::Type::Text,
-                    Box::new(source),
-                );
-                return Err(current_att_schema_read_error(source, is_cancelled));
-            }
-        }
-    }
-    if !pending.is_empty() {
-        let source = std::str::from_utf8(&pending).expect_err("pending 只保留不完整 UTF-8 后缀");
-        let source = rusqlite::Error::FromSqlConversionFailure(
-            index,
-            rusqlite::types::Type::Text,
-            Box::new(source),
-        );
-        return Err(current_att_schema_read_error(source, is_cancelled));
-    }
-    if is_cancelled() {
-        Err(CurrentAttSchemaValidationError::Cancelled)
-    } else {
-        Ok(text)
-    }
-}
-
-fn current_att_schema_read_error(
-    source: rusqlite::Error,
-    is_cancelled: &mut impl FnMut() -> bool,
-) -> CurrentAttSchemaValidationError {
-    if matches!(
-        source.sqlite_error_code(),
-        Some(rusqlite::ErrorCode::OperationInterrupted)
-    ) || is_cancelled()
-    {
-        CurrentAttSchemaValidationError::Cancelled
-    } else {
-        CurrentAttSchemaValidationError::Read(source)
-    }
-}
-
 fn schema_text(
     value: SqliteValue,
     field: ProjectDatabaseField,
@@ -2478,6 +2301,9 @@ fn att_schema_object(kind: &str, name: &str) -> Option<AttSchemaObject> {
         ("table", "rpg_maker_asset_owner_state") => Some(AttSchemaObject::RpgMakerAssetOwnerState),
         ("table", RPG_MAKER_TEXT_GROUP_TABLE_NAME) => Some(AttSchemaObject::RpgMakerTextGroup),
         ("table", RPG_MAKER_TEXT_UNIT_TABLE_NAME) => Some(AttSchemaObject::RpgMakerTextUnit),
+        ("table", RPG_MAKER_MANUAL_TRANSLATION_TABLE_NAME) => {
+            Some(AttSchemaObject::RpgMakerManualTranslation)
+        }
         ("index", "rpg_maker_text_unit_owner_group_order_idx") => {
             Some(AttSchemaObject::RpgMakerTextUnitOwnerGroupOrderIndex)
         }
@@ -3652,6 +3478,7 @@ fn project_database_commands(project: &NewProject) -> Vec<SqliteCommand> {
         CREATE_RPG_MAKER_ASSET_OWNER_STATE_TABLE,
         CREATE_RPG_MAKER_TEXT_GROUP_TABLE,
         CREATE_RPG_MAKER_TEXT_UNIT_TABLE,
+        CREATE_RPG_MAKER_MANUAL_TRANSLATION_TABLE,
         CREATE_RPG_MAKER_TEXT_UNIT_OWNER_GROUP_ORDER_INDEX,
         CREATE_RPG_MAKER_MUTATION_CLAIM_TABLE,
         CREATE_RPG_MAKER_MUTATION_CLAIM_OWNER_RESOURCE_INDEX,
@@ -3855,7 +3682,7 @@ mod tests {
     #[test]
     fn creation_plan_contains_the_complete_current_rpg_maker_schema_and_resources() {
         let commands = project_database_commands(&project());
-        assert_eq!(commands.len(), 18);
+        assert_eq!(commands.len(), 19);
         let statements = commands
             .iter()
             .map(SqliteCommand::statement)
@@ -3878,6 +3705,7 @@ mod tests {
                 "rpg_maker_asset_owner_state",
                 "rpg_maker_text_group",
                 "rpg_maker_text_unit",
+                "rpg_maker_manual_translation",
                 "rpg_maker_text_unit_owner_group_order_idx",
                 "rpg_maker_mutation_claim",
                 "rpg_maker_translation_resource",
@@ -3963,23 +3791,5 @@ mod tests {
             })
         );
         assert_eq!(wire["related"], serde_json::json!([]));
-    }
-
-    #[test]
-    fn current_schema_matches_the_protected_att_objects_and_allows_private_tables() {
-        let connection = rusqlite::Connection::open_in_memory().expect("应可打开内存数据库");
-        connection
-            .pragma_update(None, "foreign_keys", true)
-            .expect("应可启用外键");
-        for (_, _, _, sql) in expected_att_schema() {
-            connection
-                .execute_batch(sql)
-                .unwrap_or_else(|error| panic!("当前 schema 应可执行：{error}"));
-        }
-        connection
-            .execute_batch("CREATE TABLE script_private_state (value TEXT)")
-            .expect("脚本私有表应可建立");
-
-        validate_current_att_schema(&connection).expect("生产 DDL 应与当前唯一 schema 一致");
     }
 }

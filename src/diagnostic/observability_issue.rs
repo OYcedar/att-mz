@@ -90,12 +90,8 @@ pub(crate) enum ObservabilityEventCode {
     PublicationStarted,
     #[serde(rename = "publication.finished")]
     PublicationFinished,
-    #[serde(rename = "lua.script")]
-    LuaScript,
     #[serde(rename = "lua.print")]
     LuaPrint,
-    #[serde(rename = "lua.summary")]
-    LuaSummary,
     #[serde(rename = "diagnostic.run")]
     RunDiagnostic,
     #[serde(rename = "diagnostic.run_plan")]
@@ -458,9 +454,7 @@ impl ObservabilityEventCode {
             Self::RetrySummary => "retry.summary",
             Self::PublicationStarted => "publication.started",
             Self::PublicationFinished => "publication.finished",
-            Self::LuaScript => "lua.script",
             Self::LuaPrint => "lua.print",
-            Self::LuaSummary => "lua.summary",
             Self::RunDiagnostic => "diagnostic.run",
             Self::RunPlanDiagnostic => "diagnostic.run_plan",
             Self::TranslationTaskDiagnostic => "diagnostic.translation_task",
@@ -903,10 +897,19 @@ impl ObservabilityIssue {
                 ObservabilityProblem::Write { failure, .. } => failure.summary_code(),
                 _ => unreachable!(),
             },
-            ObservabilityOperation::Create
-            | ObservabilityOperation::Flush
-            | ObservabilityOperation::Sync
-            | ObservabilityOperation::Cleanup => "external_service_unavailable",
+            ObservabilityOperation::Create => match &self.problem {
+                ObservabilityProblem::Create { failure, .. } => failure.summary_code(),
+                _ => unreachable!(),
+            },
+            ObservabilityOperation::Flush | ObservabilityOperation::Sync => match &self.problem {
+                ObservabilityProblem::Flush { failure, .. }
+                | ObservabilityProblem::Sync { failure, .. } => failure.summary_code(),
+                _ => unreachable!(),
+            },
+            ObservabilityOperation::Cleanup => match &self.problem {
+                ObservabilityProblem::Cleanup { failure, .. } => failure.summary_code(),
+                _ => unreachable!(),
+            },
             ObservabilityOperation::Serialize => "request_serialization_failed",
             ObservabilityOperation::Channel => "worker_channel_closed",
             ObservabilityOperation::Backpressure => "resource_limit",
@@ -931,7 +934,21 @@ impl ObservabilityIssue {
     }
 
     pub(crate) fn subject(&self) -> String {
-        self.component.as_str().to_owned()
+        match &self.problem {
+            ObservabilityProblem::Create { path, .. }
+            | ObservabilityProblem::Cleanup { path, .. } => path.to_string(),
+            ObservabilityProblem::Serialize { path, .. }
+            | ObservabilityProblem::Write { path, .. }
+            | ObservabilityProblem::Flush { path, .. }
+            | ObservabilityProblem::Sync { path, .. } => path
+                .as_ref()
+                .map_or_else(|| self.component.as_str().to_owned(), ToString::to_string),
+            ObservabilityProblem::Channel { .. }
+            | ObservabilityProblem::Backpressure { .. }
+            | ObservabilityProblem::Worker { .. }
+            | ObservabilityProblem::Render { .. }
+            | ObservabilityProblem::Contract { .. } => self.component.as_str().to_owned(),
+        }
     }
 
     pub(crate) fn facts(&self) -> Vec<(&'static str, String)> {
@@ -1161,9 +1178,8 @@ fn push_write_failure_facts(
 impl ObservabilityWriteFailure {
     const fn summary_code(&self) -> &'static str {
         match self {
-            Self::Io { .. } | Self::WindowsStatus { .. } | Self::NotPersisted => {
-                "external_service_unavailable"
-            }
+            Self::Io { failure } => failure.summary_code(),
+            Self::WindowsStatus { .. } | Self::NotPersisted => "operation_failed",
             Self::TargetExists => "target_already_exists",
             Self::Path {
                 failure: ObservabilityPathFailure::ReparsePoint,

@@ -224,6 +224,7 @@ pub(crate) struct RpgMakerTranslationAsset {
     semantic_order_key: RpgMakerSemanticOrderKey,
     translation: Option<TextUnitContent>,
     translation_state: Option<Sha256Fingerprint>,
+    manual: bool,
 }
 
 impl RpgMakerTranslationAsset {
@@ -238,6 +239,7 @@ impl RpgMakerTranslationAsset {
             semantic_order_key: RpgMakerSemanticOrderKey::new(Vec::new(), 0),
             translation,
             translation_state,
+            manual: false,
         }
     }
 
@@ -252,6 +254,22 @@ impl RpgMakerTranslationAsset {
             semantic_order_key,
             translation,
             translation_state,
+            manual: false,
+        }
+    }
+
+    pub(crate) fn with_manual_semantic_order_key(
+        identity: TranslationUnitIdentity,
+        semantic_order_key: RpgMakerSemanticOrderKey,
+        translation: TextUnitContent,
+        translation_state: Sha256Fingerprint,
+    ) -> Self {
+        Self {
+            identity,
+            semantic_order_key,
+            translation: Some(translation),
+            translation_state: Some(translation_state),
+            manual: true,
         }
     }
 
@@ -271,12 +289,14 @@ impl RpgMakerTranslationAsset {
         RpgMakerSemanticOrderKey,
         Option<TextUnitContent>,
         Option<Sha256Fingerprint>,
+        bool,
     ) {
         (
             self.identity,
             self.semantic_order_key,
             self.translation,
             self.translation_state,
+            self.manual,
         )
     }
 }

@@ -124,7 +124,6 @@ pub(crate) enum GenericResourceKind {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub(crate) enum GenericProjectDatabaseProblem {
-    UnknownTranslationOrigin,
     UnexpectedCommittedUnit {
         group_id: Option<SafeIdentifier>,
         unit_id: Option<SafeIdentifier>,
@@ -185,10 +184,6 @@ pub(crate) enum GenericProjectDatabaseProblem {
         table: SafeIdentifier,
     },
     QuickCheckFailed,
-    LuaChangedProjectName,
-    LuaChangedSourceRoot,
-    LuaChangedLanguagePair,
-    LuaChangedExtractFingerprint,
     UnextractedProjectHasAssets {
         count: i64,
     },
@@ -216,7 +211,6 @@ pub(crate) enum GenericProjectDatabaseProblem {
 impl GenericProjectDatabaseProblem {
     fn code(&self) -> &'static str {
         match self {
-            Self::UnknownTranslationOrigin => "generic.project.database.translation_origin",
             Self::UnexpectedCommittedUnit { .. } => {
                 "generic.project.database.unexpected_committed_unit"
             }
@@ -255,12 +249,6 @@ impl GenericProjectDatabaseProblem {
             }
             Self::ForeignKeyViolation { .. } => "generic.project.database.foreign_key_violation",
             Self::QuickCheckFailed => "generic.project.database.quick_check_failed",
-            Self::LuaChangedProjectName => "generic.project.database.lua_changed_project_name",
-            Self::LuaChangedSourceRoot => "generic.project.database.lua_changed_source_root",
-            Self::LuaChangedLanguagePair => "generic.project.database.lua_changed_language_pair",
-            Self::LuaChangedExtractFingerprint => {
-                "generic.project.database.lua_changed_extract_fingerprint"
-            }
             Self::UnextractedProjectHasAssets { .. } => {
                 "generic.project.database.unextracted_assets"
             }
@@ -416,16 +404,11 @@ impl GenericProjectDatabaseProblem {
                 ("valid_up_to", valid_up_to.to_string()),
                 ("error_len", optional_number(*error_len)),
             ],
-            Self::UnknownTranslationOrigin
-            | Self::InvalidProjectName
+            Self::InvalidProjectName
             | Self::MissingProjectRow
             | Self::ManualTranslationStateFailure
             | Self::CompiledTranslationResourcesMismatch
-            | Self::QuickCheckFailed
-            | Self::LuaChangedProjectName
-            | Self::LuaChangedSourceRoot
-            | Self::LuaChangedLanguagePair
-            | Self::LuaChangedExtractFingerprint => Vec::new(),
+            | Self::QuickCheckFailed => Vec::new(),
         }
     }
 }
@@ -1935,7 +1918,11 @@ impl GenericProblem {
             Self::ProjectCancelled => "generic_project".to_owned(),
             Self::InvalidUtf8 { path, .. } => path.to_string(),
             Self::BlankJsonlLine { location } | Self::InvalidJson { location, .. } => {
-                location.path.to_string()
+                format!(
+                    "{}:line{}",
+                    readable_generic_path(&location.path),
+                    location.line
+                )
             }
             Self::BlankField { location, field } => location
                 .as_ref()
@@ -2385,16 +2372,11 @@ const fn expected_operation(problem: &GenericProblem) -> GenericOperation {
 }
 
 fn generic_unit_subject(unit: &GenericUnitLocator) -> String {
-    let mut subject = unit.relative_path.to_string();
-    if let Some(group_id) = &unit.group_id {
-        subject.push(':');
-        subject.push_str(group_id.as_str());
-    }
-    if let Some(unit_id) = &unit.unit_id {
-        subject.push(':');
-        subject.push_str(unit_id.as_str());
-    }
-    subject
+    unit.readable_id()
+}
+
+fn readable_generic_path(path: &SafePath) -> String {
+    path.to_string().replace('\\', "/")
 }
 
 fn generic_unit_facts(unit: &GenericUnitLocator) -> Vec<(&'static str, String)> {

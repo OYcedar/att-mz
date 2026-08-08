@@ -7,8 +7,8 @@ att [--ui-language LANG] ENGINE COMMAND ...
 ```
 
 `ENGINE` 取 `mv`、`mz` 或 `generic`。Help 与 Version 开箱即用；其余命令读取实际运行的
-`att.exe` 同目录下固定的 `config.toml`，并要求显式给出引擎、命令和项目名。CLI 不提供
-配置路径参数。
+`att.exe` 同目录下固定 `config.toml`，并要求显式给出引擎、命令和项目名。CLI 不提供配置
+路径参数。
 
 当前命令：
 
@@ -30,12 +30,17 @@ att generic extract --name NAME
 att mv|mz|generic translate --name NAME [PROFILE_ID]
   [--terms TERMS_TOML] [--placeholders PLACEHOLDERS_TOML]
 
+att mv|mz|generic manual export --name NAME FILE.toml
+att mv|mz|generic manual check  --name NAME FILE.toml
+att mv|mz|generic manual apply  --name NAME FILE.toml
+
 att mv|mz|generic write-back --name NAME
 
-att mv|mz|generic lua --name NAME SCRIPT_LUA [-- ARG...]
+att mv|mz|generic lua --name NAME SCRIPT.lua [-- ARG...]
 ```
 
-Extract、Translate 和 WriteBack 不接受 `--lua`。独立 Lua 不接受 `--profile`。
+Extract、Translate 和 WriteBack 不接受 `--lua`。Manual 不接受筛选、兼容格式或模型参数。
+独立 Lua 不接受 `--profile`。
 
 ## 2. UI 与进度
 
@@ -56,12 +61,12 @@ UI 语言可由 `--ui-language` 或 `ATT_UI_LANGUAGE` 指定，选择优先级�
 ar  zh-Hans  zh-Hant  en  fr  ru  es  ja  ko  vi
 ```
 
-区域变体按主语言归并，中文按简繁区域区分。显式非法值按输入错误处理；自动检测
-匹配不上时回退英语。Prompt 固定使用中文指令并根据项目语言对渲染源语言和目标语言，
-不跟随 UI 语言变化。
+区域变体按主语言归并，中文按简繁区域区分。显式非法值按输入错误处理；自动检测匹配不上
+时回退英语。Prompt 固定使用中文指令并根据项目语言对渲染源语言和目标语言，不跟随 UI
+语言变化。
 
-路径、ID 和动态文本进入终端与日志前，会先移除终端转义、换行伪装和双向控制字符。
-十个 locale 各自提供完整界面文本，英文 Debug 文本不会拿来凑数。
+路径、可读 ID 和动态文本进入终端与日志前，会先移除终端转义、换行伪装和双向控制字符。
+普通 CLI 不显示 hash、UUID、数据库随机键、编码位置或供应商请求 ID。
 
 ## 3. 保存状态与省略参数
 
@@ -71,55 +76,82 @@ ar  zh-Hans  zh-Hant  en  fr  ru  es  ja  ko  vi
 - MV/MZ 首次 Init 还必须提供三个正数全角布局宽度；再次 Init 分项复用；
 - MV/MZ 首次 Extract 必须选择 owner；以后省略全部选项时复用完整 owner 集合；
 - Translate 省略 Profile 时复用最近成功 Profile；省略术语或 Placeholder 时复用项目资源；
-- Generic Extract 没有外部文件参数，始终读取项目绑定的当前 JSONL 根；
+- Generic Extract 始终读取项目绑定的当前 JSONL 根；
+- Manual 每次读取显式 TOML；
 - WriteBack 没有运行方案；
-- Lua 每次读取本次显式脚本。
+- Lua 每次读取显式脚本。
 
-从状态读取、业务执行、必要收尾到最终保存，项目租约全程在场，两条并发命令拼不出
-一份不存在的选择。
+从状态读取、业务执行、必要收尾到最终保存，项目租约全程在场，两条并发命令不能拼出一份
+不存在的选择。
 
-## 4. 启动和资源
+## 4. 启动、取消与资源
 
-程序按命令的实际需要建立配置、项目、Prompt、Client、CPU、文件系统与 SQLite 能力：
-不发模型请求的命令不构造 HTTP Client，不运行 Lua 的命令不构造 Lua VM。
+程序只按命令的实际需要建立配置、项目、Prompt、Client、文件系统、SQLite 和 Lua 能力。
+Manual、Lua、Init、Extract 与 WriteBack 不构造模型 Client；Manual check/apply 和 Lua 高级
+译文 API 也不会请求模型。
 
-文件解析与相互独立的工作默认并行；要求确定顺序的结果仍按自然顺序合并和提交。
-处理窗口装满时上游原地等待——项目再大也只是多等一会儿，不会变成容量错误。
+文件解析与相互独立的工作默认并行；要求确定顺序的结果仍按自然顺序合并和提交。处理窗口
+装满时上游等待，不把合法项目总量变成容量错误。
 
 Ctrl-C 请求合作取消：
 
 - 不再开始新的模型请求或文件任务；
-- 等待已经进入提交或发布边界的操作得到明确结果；
-- 回滚未提交的 Lua 事务；
+- 等待已经进入提交或目录交换边界的操作得到明确结果；
 - 保存已经确认的 Translate 前序进度；
 - 完成已经形成请求、响应或明确终态的模型任务记录；
+- Lua 只回滚取消时仍打开的事务，之前的 autocommit 或显式 COMMIT 保留；
 - 以退出码 `130` 结束。
 
-## 5. 输出与退出码
+## 5. Manual 输出
 
-stdout 呈现最终业务结果，实时进度、警告、降级和错误走 stderr。项目命令建立 RunId 后，
-终端摘要、项目日志和可选模型任务记录共用同一个 RunId。
+Manual 的完整格式和检查规则见 [Manual TOML 规格](../manual/README.md)。CLI 摘要只报告：
 
-Partial、Unavailable、跳过项、人工布局、取消后已经生效的状态和任务记录写入或收尾故障都
-必须有结构化诊断。当前项目 JSONL 仍可写时，这些事实进入同一 RunId；项目日志无法建立
-或继续写入时，stderr 显示同一份安全 `DiagnosticReport`：`effect`、主诊断的稳定 code、
-stage、类型化 issue 和 resolution，以及带明确 relation 的相关报告。CLI 不从 `Display`、
-本地化阶段名或拼接字符串反推这些事实。日志队列丢弃普通事件时，警告同时报告实际丢失
-数量和日志路径，不能只显示笼统的降级横幅。
+- export：导出条目数和目标文件；
+- check：有效、未填写和错误数量；
+- apply：已应用、未填写和错误数量。
 
-项目日志中的独立问题以原子 `diagnostic.*` occurrence 保存；`phase.stopped`、
-`task.finished`、`run_plan.finalized`、`translation.finished`、`publication.finished` 与
-`run.finished` 只引用 occurrence ID，不复制一份泛化错误。Partial 与 Unavailable 的完整
-Task 计数和引擎汇总由唯一 `translation.finished` 保存。
+检查错误逐项显示可读 `id`、原因和修改方法。未填写项不是错误，因此 check 在只有未填写项
+时仍退出 `0`。apply 发现任一错误时不修改数据库并退出 `1`。
+
+## 6. 运行文件
+
+Init、Extract、Translate、WriteBack 和 Lua 建立自然序号 RunId；Manual 只输出自己的检查摘要，
+不建立项目日志。RunId 形式为：
+
+```text
+run-000001
+run-000002
+```
+
+同次运行的文件使用相同 RunId：
+
+```text
+<project>/logs/run-000001.jsonl
+<project>/task-records/run-000001/task-000001.md
+```
+
+ATT 在项目租约内扫描既有日志和任务记录，并用原子创建保留下一个编号。冲突时递增，不用
+UUID、hash 或额外计数数据库。
+
+## 7. 输出与退出码
+
+stdout 呈现最终业务结果，实时进度、警告、降级和错误走 stderr。错误只说明对象、直接原因
+和修改方法，不倾倒内部阶段、状态字段袋、数据库行、SQLite code、查询文本、供应商请求 ID
+或指纹差异。
+
+项目日志仍可写时，警告和错误以同样的可读三字段保存；日志无法建立或继续写入时，stderr
+直接显示这三项。Partial、Unavailable、人工布局、取消后已经生效的状态和任务记录故障都
+必须可见，但不重复输出无实际作用的确认或内部诊断。
 
 项目日志或任务记录故障本身不改变已经确定的业务结果和项目状态。用于呈现警告、错误、
 成功结果或取消终态的 stdout/stderr 写入、flush、后台线程或 channel 失败时，进程不能
 假装已经告知使用者，必须返回 `1`。
 
-- `0`：命令得到明确成功结果，包括已明确的 Partial 或 Unavailable；
-- `1`：输入、运行、提交、发布或呈现失败；
+- `0`：命令得到明确成功结果，包括已明确的 Partial、Unavailable，以及只有未填写项的
+  `manual check`；
+- `1`：输入、检查、运行、提交、发布或呈现失败；
 - `130`：受控取消。
 
-状态已经明确但必须保留或处理恢复现场时，ATT 显示 `recovery_required`、`report.effect`、
-具体 issue 中的恢复路径事实和类型化 resolution。只有提交、发布或进程异常使最终状态确实无法确认时才显示
-`outcome_unknown`；两种终态都不能伪造成成功或回滚。
+状态已经明确但必须保留或处理恢复现场时，ATT 显示实际对象、原因、修改方法和自然恢复
+路径。只有提交、发布或进程异常使最终状态确实无法确认时，才报告结果未知；两者都不能
+伪造成成功或已经回滚。

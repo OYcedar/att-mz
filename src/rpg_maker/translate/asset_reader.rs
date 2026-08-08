@@ -27,8 +27,10 @@ use crate::rpg_maker::asset_storage::{
     rpg_maker_asset_owner_order as owner_order, sort_owner_state_rows,
 };
 #[cfg(test)]
-use crate::rpg_maker::location_codec::{RpgMakerLocationCodec, RpgMakerProjectionCodec};
-use crate::rpg_maker::location_codec::{RpgMakerLocationCodecError, RpgMakerProjectionCodecError};
+use crate::rpg_maker::location_codec::RpgMakerLocationCodec;
+use crate::rpg_maker::location_codec::{
+    RpgMakerLocationCodecError, RpgMakerProjectionCodec, RpgMakerProjectionCodecError,
+};
 use crate::rpg_maker::model::{
     TextUnitContent, TextUnitContentStructureError, TextUnitContentView, TextUnitRole,
     validate_text_unit_content_structure,
@@ -85,12 +87,19 @@ fn read_translation_owner_units() -> String {
          text_group.group_kind,\n    \
          text_group.semantic_order_key,\n    \
          {RPG_MAKER_TEXT_UNIT_CONTENT_PROJECTION},\n    \
-         unit.translation_state\n\
+         unit.translation_state,\n    \
+         text_group.projection_recipe_json,\n    \
+         manual.translation_json,\n    \
+         manual.applicability_fingerprint\n\
          FROM rpg_maker_text_group AS text_group\n\
          CROSS JOIN rpg_maker_text_unit AS unit\n  \
                     INDEXED BY rpg_maker_text_unit_owner_group_order_idx\n  \
            ON unit.owner = text_group.owner\n \
           AND unit.group_id = text_group.group_id\n\
+         LEFT JOIN rpg_maker_manual_translation AS manual\n  \
+           ON manual.owner = text_group.owner\n \
+          AND manual.group_location = text_group.group_location\n \
+          AND manual.unit_role = unit.unit_role\n\
          WHERE text_group.owner = ?\n\
          ORDER BY text_group.semantic_order_key,\n         \
           unit.semantic_order_key"
@@ -1297,6 +1306,7 @@ struct DecodedUnit {
     source_context_json: String,
     translation: Option<TextUnitContent>,
     translation_state: Option<Sha256Fingerprint>,
+    manual: bool,
 }
 
 fn decode_unit(
@@ -1308,7 +1318,7 @@ fn decode_unit(
             owner,
         ));
     }
-    let mut row = RpgMakerAssetStorageRowDecoder::new(row, 9).map_err(map_storage_row_error)?;
+    let mut row = RpgMakerAssetStorageRowDecoder::new(row, 12).map_err(map_storage_row_error)?;
     let location =
         RpgMakerTextUnitLocationStorageRow::decode(&mut row).map_err(map_storage_row_error)?;
     let group_kind_raw = row
@@ -1353,7 +1363,7 @@ fn decode_unit(
     let translation_state = row
         .optional_blob("translation_state")
         .map_err(map_storage_row_error)?;
-    let translation_state = match (translation.as_ref(), translation_state) {
+    let automatic_translation_state = match (translation.as_ref(), translation_state) {
         (None, None) => None,
         (Some(_), Some(bytes)) => Some(Sha256Fingerprint::from_slice(&bytes).map_err(|error| {
             InvalidRpgMakerTranslationAssetSnapshot::InvalidTranslationStateLength {
@@ -1362,14 +1372,78 @@ fn decode_unit(
         })?),
         _ => return Err(InvalidRpgMakerTranslationAssetSnapshot::InvalidTranslationStatePair),
     };
+    let projection_recipe_json = row
+        .required_text("projection_recipe_json")
+        .map_err(map_storage_row_error)?;
+    let manual_translation_json = row
+        .optional_text("manual.translation_json")
+        .map_err(map_storage_row_error)?;
+    let manual_state = row
+        .optional_blob("manual.applicability_fingerprint")
+        .map_err(map_storage_row_error)?;
     let RpgMakerTextUnitStorageRow {
+        group_location_raw,
         group_location,
+        role_raw,
         role,
         semantic_order_key,
         source_content,
         source_context_json,
         ..
     } = storage;
+    let identity = TranslationUnitIdentity::new(
+        owner,
+        kind,
+        group_location.clone(),
+        role.clone(),
+        source_content.clone(),
+        source_context_json.clone(),
+    );
+    let manual_type = crate::manual::rpg_maker_manual_type(&identity);
+    let source_lines = crate::manual::rpg_maker_manual_source_lines(&source_content);
+    let recipe_shape =
+        RpgMakerProjectionCodec::encode_role_recipe_shape(&projection_recipe_json, &role)
+            .map_err(InvalidRpgMakerTranslationAssetSnapshot::InvalidRole)?;
+    let expected_manual_state = crate::manual::rpg_maker_manual_applicability(
+        owner.storage_name(),
+        &group_location_raw,
+        kind.storage_name(),
+        &role_raw,
+        &recipe_shape,
+        manual_type,
+        &source_lines,
+    );
+    let manual_translation = match (manual_translation_json, manual_state) {
+        (None, None) => None,
+        (Some(translation_json), Some(state)) => {
+            let state = Sha256Fingerprint::from_slice(&state).map_err(|error| {
+                InvalidRpgMakerTranslationAssetSnapshot::InvalidTranslationStateLength {
+                    actual: error.actual(),
+                }
+            })?;
+            if state != expected_manual_state {
+                None
+            } else {
+                let lines = serde_json::from_str::<Vec<String>>(&translation_json)
+                    .map_err(InvalidRpgMakerTranslationAssetSnapshot::InvalidTranslationContent)?;
+                if lines.is_empty() {
+                    return Err(InvalidRpgMakerTranslationAssetSnapshot::BlankTranslationContent);
+                }
+                let content =
+                    crate::manual::rpg_maker_manual_translation_content(&source_content, lines);
+                validate_persisted_translation_content(kind, &role, &content)?;
+                validate_persisted_alignment(&role, &source_content, Some(&content))?;
+                Some(content)
+            }
+        }
+        _ => return Err(InvalidRpgMakerTranslationAssetSnapshot::InvalidTranslationStatePair),
+    };
+    let manual = manual_translation.is_some();
+    let (translation, translation_state) = if let Some(translation) = manual_translation {
+        (Some(translation), Some(expected_manual_state))
+    } else {
+        (translation, automatic_translation_state)
+    };
     Ok(DecodedUnit {
         owner,
         kind,
@@ -1381,6 +1455,7 @@ fn decode_unit(
         source_context_json,
         translation,
         translation_state,
+        manual,
     })
 }
 
@@ -1631,14 +1706,23 @@ fn assemble_corpus(
             unit.source_content,
             unit.source_context_json,
         );
-        group
-            .assets
-            .push(RpgMakerTranslationAsset::with_semantic_order_key(
+        let asset = if unit.manual {
+            RpgMakerTranslationAsset::with_manual_semantic_order_key(
+                identity,
+                unit.semantic_order_key,
+                unit.translation.expect("当前人工译文必须包含正文"),
+                unit.translation_state
+                    .expect("当前人工译文必须包含结构指纹"),
+            )
+        } else {
+            RpgMakerTranslationAsset::with_semantic_order_key(
                 identity,
                 unit.semantic_order_key,
                 unit.translation,
                 unit.translation_state,
-            ));
+            )
+        };
+        group.assets.push(asset);
     }
 
     if let Some(group) = groups.iter().find(|group| group.assets.is_empty()) {
@@ -2004,6 +2088,7 @@ mod tests {
                     source_context_json: "{}".to_owned(),
                     translation: None,
                     translation_state: None,
+                    manual: false,
                 }
             })
             .collect::<Vec<_>>();
@@ -2112,6 +2197,7 @@ mod tests {
             source_context_json: "{}".to_owned(),
             translation: None,
             translation_state: None,
+            manual: false,
         }
     }
 
@@ -2388,6 +2474,7 @@ mod tests {
                     group_location TEXT NOT NULL,
                     semantic_order_key BLOB NOT NULL,
                     group_kind TEXT NOT NULL,
+                    projection_recipe_json TEXT NOT NULL DEFAULT '[]',
                     PRIMARY KEY (owner, group_id),
                     UNIQUE (owner, group_location),
                     UNIQUE (owner, semantic_order_key)
@@ -2406,6 +2493,14 @@ mod tests {
                 );
                 CREATE INDEX rpg_maker_text_unit_owner_group_order_idx
                     ON rpg_maker_text_unit(owner, group_id, semantic_order_key);
+                CREATE TABLE rpg_maker_manual_translation (
+                    owner TEXT NOT NULL,
+                    group_location TEXT NOT NULL,
+                    unit_role TEXT NOT NULL,
+                    translation_json TEXT,
+                    applicability_fingerprint BLOB,
+                    PRIMARY KEY (owner, group_location, unit_role)
+                );
 
                 INSERT INTO metadata VALUES (zeroblob(32));
                 INSERT INTO rpg_maker_asset_owner_state VALUES
@@ -2415,9 +2510,9 @@ mod tests {
                     ('terminology', '[]'),
                     ('placeholder_rules', '[]');
                 INSERT INTO rpg_maker_text_group VALUES
-                    ('builtin', 2, 'group-b', X'010000000000000001000000000000000000', 'map'),
-                    ('builtin', 1, 'group-a', X'010000000000000000000000000000000000', 'map'),
-                    ('rules', 1, 'group-r', X'010000000000000000000000000000000000', 'map');
+                    ('builtin', 2, 'group-b', X'010000000000000001000000000000000000', 'map', '[]'),
+                    ('builtin', 1, 'group-a', X'010000000000000000000000000000000000', 'map', '[]'),
+                    ('rules', 1, 'group-r', X'010000000000000000000000000000000000', 'map', '[]');
                 INSERT INTO rpg_maker_text_unit VALUES
                     ('builtin', 2, 'role-z', X'010000000000000001000000000000000000', '"z"', '{}', NULL, NULL),
                     ('builtin', 1, 'role-y', X'010000000000000000000000000000000000', '"y"', '{}', NULL, NULL);
@@ -2765,6 +2860,9 @@ mod tests {
             text(context),
             SqliteValue::Null,
             SqliteValue::Null,
+            text("[]"),
+            SqliteValue::Null,
+            SqliteValue::Null,
         ])
     }
 
@@ -2791,6 +2889,9 @@ mod tests {
             ),
             text(source_content_json),
             text(context),
+            SqliteValue::Null,
+            SqliteValue::Null,
+            text("[]"),
             SqliteValue::Null,
             SqliteValue::Null,
         ])

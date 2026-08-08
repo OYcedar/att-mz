@@ -2463,9 +2463,17 @@ mod tests {
         assert!(!serialized.contains(SENTINEL));
 
         let rendered = render_diagnostic_report(&report, &UiLocalizer::new(UiLocale::English));
-        assert!(rendered.contains("json_category=data"));
-        assert!(rendered.contains("line=1"));
-        assert!(rendered.contains("json_column="));
+        assert!(rendered.contains("nested/bad.jsonl:line1"));
+        for internal in [
+            "json_category=",
+            "json_column=",
+            "generic.jsonl.invalid_json",
+        ] {
+            assert!(
+                !rendered.contains(internal),
+                "CLI 不得显示内部诊断字段 {internal:?}：{rendered}"
+            );
+        }
         assert!(!rendered.contains(SENTINEL));
     }
 }

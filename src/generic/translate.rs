@@ -67,6 +67,8 @@ pub(crate) struct GenericPlanningUnitLocator {
     group_id: String,
     unit_id: String,
     role: String,
+    line: Option<usize>,
+    unit: Option<usize>,
 }
 
 impl GenericPlanningUnitLocator {
@@ -81,7 +83,15 @@ impl GenericPlanningUnitLocator {
             group_id: group_id.into(),
             unit_id: unit_id.into(),
             role: role.into(),
+            line: None,
+            unit: None,
         }
+    }
+
+    pub(crate) fn with_natural_position(mut self, line: usize, unit: usize) -> Self {
+        self.line = Some(line);
+        self.unit = Some(unit);
+        self
     }
 
     pub(crate) fn relative_path(&self) -> &Path {
@@ -98,6 +108,13 @@ impl GenericPlanningUnitLocator {
 
     pub(crate) fn role(&self) -> &str {
         &self.role
+    }
+
+    pub(crate) const fn natural_position(&self) -> Option<(usize, usize)> {
+        match (self.line, self.unit) {
+            (Some(line), Some(unit)) => Some((line, unit)),
+            _ => None,
+        }
     }
 }
 
@@ -410,7 +427,8 @@ impl PlanningUnit {
                 clone_translation_text(group.id(), cancellation)?,
                 clone_translation_text(unit.id(), cancellation)?,
                 clone_translation_text(group.kind(), cancellation)?,
-            ),
+            )
+            .with_natural_position(group.ordinal() + 1, unit.ordinal() + 1),
             key,
             protected_text: clone_translation_text(protected.text(), cancellation)?,
             placeholder_binding_fingerprint,
@@ -477,33 +495,29 @@ pub(crate) fn current_translation_for_stored_with_cancellation(
     let Some(translation) = unit.translation() else {
         return Ok(None);
     };
+    if translation.origin() == TranslationOrigin::Manual {
+        return Ok(Some(clone_translation_text(
+            translation.translation(),
+            cancellation,
+        )?));
+    }
     let key = GenericUnitKey::new(
         clone_translation_text(group.id(), cancellation)?,
         clone_translation_text(unit.id(), cancellation)?,
     );
-    let expected = match translation.origin() {
-        TranslationOrigin::Automatic => automatic_resources
-            .map(|resources| {
-                automatic_translation_state_fingerprint_with_cancellation(
-                    project.language_pair(),
-                    &key,
-                    unit.source_text(),
-                    group.context_fingerprint(),
-                    placeholder_binding_fingerprint,
-                    resources,
-                    cancellation,
-                )
-            })
-            .transpose()?,
-        TranslationOrigin::Manual => Some(manual_translation_state_fingerprint_with_cancellation(
-            project.language_pair(),
-            &key,
-            unit.source_text(),
-            group.context_fingerprint(),
-            placeholder_binding_fingerprint,
-            cancellation,
-        )?),
-    };
+    let expected = automatic_resources
+        .map(|resources| {
+            automatic_translation_state_fingerprint_with_cancellation(
+                project.language_pair(),
+                &key,
+                unit.source_text(),
+                group.context_fingerprint(),
+                placeholder_binding_fingerprint,
+                resources,
+                cancellation,
+            )
+        })
+        .transpose()?;
     if expected == Some(translation.state_fingerprint()) {
         Ok(Some(clone_translation_text(
             translation.translation(),
@@ -596,7 +610,6 @@ impl PlannedReuse {
             expected_source_text: self.expected_source_text,
             expected_group_context: self.expected_group_context,
             translation: self.translation,
-            origin: TranslationOrigin::Automatic,
             state_fingerprint: self.expected_state_fingerprint,
             expected_translation: self.expected_previous,
         }
@@ -972,7 +985,8 @@ pub(crate) fn plan_translation_with_validator_and_cancellation(
                         clone_planning_text_with_cancellation(group.id(), &is_cancelled)?,
                         clone_planning_text_with_cancellation(unit.id(), &is_cancelled)?,
                         clone_planning_text_with_cancellation(group.kind(), &is_cancelled)?,
-                    ),
+                    )
+                    .with_natural_position(group.ordinal() + 1, unit.ordinal() + 1),
                     source_text: unit.source_text(),
                     group_context: group.context_fingerprint(),
                 });
@@ -1568,7 +1582,6 @@ impl AcceptedTranslation {
             expected_source_text: self.expected_source_text,
             expected_group_context: self.expected_group_context,
             translation: self.translation,
-            origin: TranslationOrigin::Automatic,
             state_fingerprint: self.expected_state_fingerprint,
             expected_translation: self.expected_previous,
         }
@@ -1815,12 +1828,16 @@ fn response_output_id(output_id: TaskId) -> u64 {
 fn diagnostic_response_locator(
     locator: &GenericPlanningUnitLocator,
 ) -> DiagnosticGenericUnitLocator {
-    DiagnosticGenericUnitLocator::new(
+    let diagnostic = DiagnosticGenericUnitLocator::new(
         locator.relative_path(),
         locator.group_id(),
         locator.unit_id(),
         Some(locator.role()),
-    )
+    );
+    match locator.natural_position() {
+        Some((line, unit)) => diagnostic.with_natural_position(line, unit),
+        None => diagnostic,
+    }
 }
 
 fn generic_translation_candidate(
@@ -2006,49 +2023,6 @@ fn automatic_translation_state_fingerprint_with_cancellation(
         .frame(21, resources.client_semantics.as_bytes())
         .frame(22, resources.language_module.as_bytes())
         .frame(23, resources.terminology_hits.as_bytes());
-    ensure_translation_not_cancelled(cancellation)?;
-    Ok(hasher.finish())
-}
-
-/// 建立人工译文状态；Prompt、Profile、Client 和术语变化不会使它失效。
-#[cfg(test)]
-pub(crate) fn manual_translation_state_fingerprint(
-    language_pair: &LanguagePair,
-    key: &GenericUnitKey,
-    source_text: &str,
-    group_context: Sha256Fingerprint,
-    placeholder_binding: Sha256Fingerprint,
-) -> Sha256Fingerprint {
-    let mut hasher = Sha256FramedHasher::new(b"att.generic.translation-state.manual");
-    frame_unit_semantics(
-        &mut hasher,
-        language_pair,
-        key,
-        source_text,
-        group_context,
-        placeholder_binding,
-    );
-    hasher.finish()
-}
-
-pub(crate) fn manual_translation_state_fingerprint_with_cancellation(
-    language_pair: &LanguagePair,
-    key: &GenericUnitKey,
-    source_text: &str,
-    group_context: Sha256Fingerprint,
-    placeholder_binding: Sha256Fingerprint,
-    cancellation: &CooperativeCancellation,
-) -> Result<Sha256Fingerprint, GenericPlanningError> {
-    let mut hasher = Sha256FramedHasher::new(b"att.generic.translation-state.manual");
-    frame_unit_semantics_with_cancellation(
-        &mut hasher,
-        language_pair,
-        key,
-        source_text,
-        group_context,
-        placeholder_binding,
-        cancellation,
-    )?;
     ensure_translation_not_cancelled(cancellation)?;
     Ok(hasher.finish())
 }
@@ -2877,18 +2851,11 @@ mod tests {
         });
         assert!(stale.current_translation().is_none());
 
-        let manual_state = manual_translation_state_fingerprint(
-            project.language_pair(),
-            &key,
-            original.source_text(),
-            group.context_fingerprint(),
-            binding,
-        );
         let manual = GenericStoredUnit {
             translation: Some(GenericStoredTranslation {
                 translation: "人工修订".to_owned(),
                 origin: TranslationOrigin::Manual,
-                state_fingerprint: manual_state,
+                state_fingerprint: fingerprint(27),
             }),
             ..original.clone()
         };
@@ -3077,7 +3044,8 @@ mod tests {
                         "g3",
                         "u1",
                         Some("dialogue"),
-                    ),
+                    )
+                    .with_natural_position(1, 1),
                     problem: GenericResponseDestinationProblem::ValidatorRejected,
                 })
         );
@@ -3122,7 +3090,8 @@ mod tests {
                         "g1",
                         "u1",
                         Some("dialogue"),
-                    ),
+                    )
+                    .with_natural_position(1, 1),
                     problem: GenericResponseDestinationProblem::ValidatorRejected,
                 },
                 ResponseProblem::InvalidDestination {
@@ -3132,7 +3101,8 @@ mod tests {
                         "g3",
                         "u1",
                         Some("dialogue"),
-                    ),
+                    )
+                    .with_natural_position(1, 1),
                     problem: GenericResponseDestinationProblem::ValidatorRejected,
                 },
             ],

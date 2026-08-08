@@ -1,5 +1,7 @@
 //! 各语义所有者建立的封闭诊断问题。
 
+use std::num::NonZeroUsize;
+
 use serde::{Deserialize, Serialize};
 
 use super::model::DiagnosticResolution;
@@ -30,6 +32,14 @@ impl IoFailure {
             raw_os_code,
             system_message: raw_os_code
                 .map(|code| SafeText::new(std::io::Error::from_raw_os_error(code).to_string())),
+        }
+    }
+
+    pub(crate) const fn summary_code(&self) -> &'static str {
+        match self.kind {
+            super::SafeIoKind::NotFound => "not_found",
+            super::SafeIoKind::AlreadyExists => "already_exists",
+            _ => "operation_failed",
         }
     }
 
@@ -119,12 +129,7 @@ impl ConfigurationIssue {
 
     pub(crate) const fn summary_code(&self) -> &'static str {
         match self {
-            Self::Open { failure, .. } | Self::Read { failure, .. }
-                if matches!(failure.kind, super::SafeIoKind::NotFound) =>
-            {
-                "not_found"
-            }
-            Self::Open { .. } | Self::Read { .. } => "external_service_unavailable",
+            Self::Open { failure, .. } | Self::Read { failure, .. } => failure.summary_code(),
             Self::NotFile { .. } => "invalid_path",
             Self::InvalidUtf8 { .. } => "invalid_encoding",
             Self::InvalidToml { .. } => "invalid_syntax",
@@ -226,6 +231,8 @@ pub(crate) struct GenericUnitLocator {
     pub(crate) group_id: Option<SafeIdentifier>,
     pub(crate) unit_id: Option<SafeIdentifier>,
     pub(crate) role: Option<SafeIdentifier>,
+    pub(crate) line: Option<NonZeroUsize>,
+    pub(crate) unit: Option<NonZeroUsize>,
 }
 
 impl GenericUnitLocator {
@@ -240,6 +247,22 @@ impl GenericUnitLocator {
             group_id: SafeIdentifier::new(group_id).ok(),
             unit_id: SafeIdentifier::new(unit_id).ok(),
             role: role.and_then(|value| SafeIdentifier::new(value).ok()),
+            line: None,
+            unit: None,
+        }
+    }
+
+    pub(crate) fn with_natural_position(mut self, line: usize, unit: usize) -> Self {
+        self.line = NonZeroUsize::new(line);
+        self.unit = NonZeroUsize::new(unit);
+        self
+    }
+
+    pub(crate) fn readable_id(&self) -> String {
+        let path = self.relative_path.to_string().replace('\\', "/");
+        match (self.line, self.unit) {
+            (Some(line), Some(unit)) => format!("{path}:line{line}:unit{unit}:text"),
+            _ => path,
         }
     }
 }
@@ -1086,18 +1109,7 @@ impl TranslationIssue {
 
     pub(crate) fn subject(&self) -> String {
         match self {
-            Self::Placeholder { unit, .. } => {
-                let mut subject = unit.relative_path.to_string();
-                if let Some(group_id) = &unit.group_id {
-                    subject.push(':');
-                    subject.push_str(group_id.as_str());
-                }
-                if let Some(unit_id) = &unit.unit_id {
-                    subject.push(':');
-                    subject.push_str(unit_id.as_str());
-                }
-                subject
-            }
+            Self::Placeholder { unit, .. } => unit.readable_id(),
             Self::Prompt { path, .. } => path.to_string(),
             Self::BuiltinPlaceholderCompile { .. } => "builtin_placeholder_rules".to_owned(),
             Self::LanguageModuleUnavailable {
