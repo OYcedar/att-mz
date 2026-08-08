@@ -308,6 +308,7 @@ manual-value = { $code ->
     [rerun_export] Chạy lại manual export
     [rerun_export_without_controls] Chạy lại manual export và không đặt ký tự xuống dòng hoặc NUL trong các mục mảng
     [rerun_export_then_fill] Chạy lại manual export rồi điền bản dịch
+    [resolve_temporary_then_rerun_export] Xử lý đường dẫn tạm thời cố định được hiển thị, xóa mọi đối tượng còn sót lại rồi chạy lại manual export
     [keep_exported_type] Giữ nguyên type do manual export ghi ra
    *[other] __ATT_FALLBACK__
 }

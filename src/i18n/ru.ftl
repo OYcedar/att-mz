@@ -318,6 +318,7 @@ manual-value = { $code ->
     [rerun_export] Снова выполните manual export
     [rerun_export_without_controls] Снова выполните manual export и не добавляйте переводы строк или NUL в элементы массива
     [rerun_export_then_fill] Снова выполните manual export, затем заполните перевод
+    [resolve_temporary_then_rerun_export] Исправьте указанный фиксированный временный путь, удалите оставшийся объект и снова выполните manual export
     [keep_exported_type] Сохраните type, записанный командой manual export
    *[other] __ATT_FALLBACK__
 }

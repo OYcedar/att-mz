@@ -167,10 +167,13 @@ pub(crate) fn render_translation_user_message(
         let result = serde_json::to_writer_pretty(&mut writer, message);
         (result, writer.cancelled)
     };
-    if cancelled || cancellation.is_requested() {
+    if cancelled {
         return Err(TranslationUserMessageCancelled);
     }
     result.expect("向内存写入受信 user message JSON 只能因合作式取消失败");
+    if cancellation.is_requested() {
+        return Err(TranslationUserMessageCancelled);
+    }
     output.extend_from_slice(b"\n```");
     Ok(String::from_utf8(output).expect("serde_json 只能生成 UTF-8"))
 }
@@ -194,13 +197,16 @@ pub(crate) fn measure_translation_user_group(
         overflowed: false,
     };
     let result = serde_json::to_writer(&mut counter, group);
-    if counter.cancelled || cancellation.is_requested() {
+    if counter.cancelled {
         return Err(TranslationUserMessageCancelled);
     }
     if counter.overflowed {
         return Ok(None);
     }
     result.expect("计数受信 user message JSON 只能因合作式取消失败");
+    if cancellation.is_requested() {
+        return Err(TranslationUserMessageCancelled);
+    }
     let Some(first) = "{\"groups\":["
         .len()
         .checked_add(counter.characters)

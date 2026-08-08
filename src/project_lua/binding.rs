@@ -5,6 +5,7 @@ use std::num::NonZeroU32;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use mlua::thread::ThreadStatus;
 use mlua::{
@@ -28,6 +29,7 @@ pub(super) struct PreparedProjectLua {
     pub(super) function: Function,
     pub(super) connection: Rc<RefCell<Connection>>,
     pub(super) script_identity: String,
+    pub(super) hook_cancelled: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -53,12 +55,15 @@ pub(super) fn prepare_lua(
         ProjectLuaFailure::Context(super::ProjectLuaContextFailure::CancellationGuard)
     })?;
     let hook_cancellation = cancellation.clone();
+    let hook_cancelled = Arc::new(AtomicBool::new(false));
+    let hook_cancelled_observer = Arc::clone(&hook_cancelled);
     lua.set_global_hook(
         HookTriggers::new().every_nth_instruction(cancel_check_instruction_interval.get()),
         move |lua, _debug| {
             if !hook_cancellation.is_cancelled() {
                 return Ok(VmState::Continue);
             }
+            hook_cancelled_observer.store(true, Ordering::Release);
 
             let is_yieldable = lua.exec_raw_lua(|lua| {
                 // SAFETY: 这里只读取 mlua 在 hook 期间设置的当前 coroutine 状态，
@@ -95,6 +100,7 @@ pub(super) fn prepare_lua(
         function,
         connection,
         script_identity: request.program.identity().to_owned(),
+        hook_cancelled,
     })
 }
 
@@ -123,10 +129,15 @@ fn install_cancellation_guards(
 ) -> mlua::Result<()> {
     let checkpoint =
         lua.create_function(move |_lua, ()| ensure_lua_not_cancelled(&cancellation))?;
+    let is_cancellation =
+        lua.create_function(|_lua, value: Value| Ok(lua_value_is_cancellation(&value)))?;
+    let raise_cancellation = lua.create_function(|_lua, (): ()| {
+        Err::<(), _>(mlua::Error::external(ProjectLuaCancellationTrap))
+    })?;
     let installer: Function = lua
         .load(
             r#"
-return function(checkpoint)
+return function(checkpoint, is_cancellation, raise_cancellation)
   local pack = table.pack
   local unpack = table.unpack
   local raise = error
@@ -136,21 +147,29 @@ return function(checkpoint)
   local original_resume = coroutine.resume
   local original_yield = coroutine.yield
 
+  local function rethrow_cancellation(results)
+    if not results[1] and is_cancellation(results[2]) then
+      raise_cancellation()
+    end
+  end
+
   pcall = function(...)
     checkpoint()
     local results = pack(original_pcall(...))
-    checkpoint()
+    rethrow_cancellation(results)
+    if results[1] then checkpoint() end
     return unpack(results, 1, results.n)
   end
 
   xpcall = function(call, handler, ...)
     checkpoint()
     local function guarded_handler(value)
-      checkpoint()
+      if is_cancellation(value) then return value end
       return handler(value)
     end
     local results = pack(original_xpcall(call, guarded_handler, ...))
-    checkpoint()
+    rethrow_cancellation(results)
+    if results[1] then checkpoint() end
     return unpack(results, 1, results.n)
   end
 
@@ -164,7 +183,8 @@ return function(checkpoint)
   coroutine.resume = function(...)
     checkpoint()
     local results = pack(original_resume(...))
-    checkpoint()
+    rethrow_cancellation(results)
+    if results[1] then checkpoint() end
     return unpack(results, 1, results.n)
   end
 
@@ -182,8 +202,8 @@ return function(checkpoint)
     return function(...)
       checkpoint()
       local results = pack(original_resume(thread, ...))
-      checkpoint()
       if not results[1] then raise(results[2], 0) end
+      checkpoint()
       return unpack(results, 2, results.n)
     end
   end
@@ -191,7 +211,17 @@ end
 "#,
         )
         .eval()?;
-    installer.call(checkpoint)
+    installer.call((checkpoint, is_cancellation, raise_cancellation))
+}
+
+fn lua_value_is_cancellation(value: &Value) -> bool {
+    match value {
+        Value::Error(error) => error.downcast_ref::<ProjectLuaCancellationTrap>().is_some(),
+        Value::UserData(userdata) => userdata
+            .borrow::<LuaHostCallError>()
+            .is_ok_and(|error| error.error.is_cancelled()),
+        _ => false,
+    }
 }
 
 fn ensure_lua_not_cancelled(cancellation: &ProjectLuaCancellation) -> mlua::Result<()> {
@@ -274,16 +304,36 @@ fn compile_program(
             }
         })
     };
-    if reader.cancelled || cancellation.is_cancelled() {
-        return Err(ProjectLuaFailure::Cancelled);
+    complete_compilation(
+        result,
+        program,
+        load_status.get(),
+        reader.cancelled,
+        cancellation,
+    )
+}
+
+fn complete_compilation(
+    result: mlua::Result<Function>,
+    program: &ProjectLuaProgram,
+    load_status: c_int,
+    reader_cancelled: bool,
+    cancellation: &ProjectLuaCancellation,
+) -> Result<Function, ProjectLuaFailure> {
+    match result {
+        Err(_) if reader_cancelled => Err(ProjectLuaFailure::Cancelled),
+        Err(error) => Err(ProjectLuaFailure::Compile {
+            script_identity: program.identity().to_owned(),
+            failure: ProjectLuaCompilationFailure::Backend {
+                category: classify_lua_compilation_error(load_status, &error),
+                line: lua_compilation_line(load_status, &error),
+            },
+        }),
+        Ok(_) if reader_cancelled || cancellation.is_cancelled() => {
+            Err(ProjectLuaFailure::Cancelled)
+        }
+        Ok(function) => Ok(function),
     }
-    result.map_err(|error| ProjectLuaFailure::Compile {
-        script_identity: program.identity().to_owned(),
-        failure: ProjectLuaCompilationFailure::Backend {
-            category: classify_lua_compilation_error(load_status.get(), &error),
-            line: lua_compilation_line(load_status.get(), &error),
-        },
-    })
 }
 
 fn validate_lua_source_utf8(
@@ -316,11 +366,12 @@ fn validate_lua_source_utf8(
             }
         }
     }
-    if cancellation.is_cancelled() {
-        return Err(ProjectLuaFailure::Cancelled);
-    }
     if pending.is_empty() {
-        Ok(())
+        if cancellation.is_cancelled() {
+            Err(ProjectLuaFailure::Cancelled)
+        } else {
+            Ok(())
+        }
     } else {
         Err(ProjectLuaFailure::Compile {
             script_identity: program.identity().to_owned(),
@@ -457,8 +508,7 @@ fn install_print(
         let result = sink
             .print(bytes.as_bytes().as_ref())
             .map_err(|error| host_error("log", error, LuaOperation::ExecuteScript));
-        ensure_lua_not_cancelled(&cancellation)?;
-        host_result_to_lua(lua, result, |_lua, ()| Ok(Value::Nil))
+        host_result_to_lua(lua, result, |_lua, ()| Ok(Value::Nil), &cancellation)
     })?;
     let factory: Function = lua
         .load(
@@ -512,11 +562,12 @@ fn build_database_table(
                             }
                         })
                 });
-            let output = host_result_to_lua(lua, result, |lua, rows| {
-                rows_to_lua(lua, rows, &query_cancellation)
-            });
-            ensure_lua_not_cancelled(&query_cancellation)?;
-            output
+            host_result_to_lua(
+                lua,
+                result,
+                |lua, rows| rows_to_lua(lua, rows, &query_cancellation),
+                &query_cancellation,
+            )
         })?,
     )?;
 
@@ -535,18 +586,24 @@ fn build_database_table(
                     execute_database(&connection, &statement, &parameters)
                         .map_err(|error| sqlite_host_error(LuaOperation::QueryDatabase, error))
                 });
-            let output = match result {
-                Ok(changed) => host_result_to_lua(lua, Ok(changed), |_lua, changed| {
-                    i64::try_from(changed)
-                        .map(Value::Integer)
-                        .map_err(|_| mlua::Error::runtime("SQLite 受影响行数超出 Lua integer"))
-                }),
-                Err(error) => {
-                    host_result_to_lua::<u64, _>(lua, Err(error), |_lua, _changed| Ok(Value::Nil))
-                }
-            };
-            ensure_lua_not_cancelled(&execute_cancellation)?;
-            output
+            match result {
+                Ok(changed) => host_result_to_lua(
+                    lua,
+                    Ok(changed),
+                    |_lua, changed| {
+                        i64::try_from(changed)
+                            .map(Value::Integer)
+                            .map_err(|_| mlua::Error::runtime("SQLite 受影响行数超出 Lua integer"))
+                    },
+                    &execute_cancellation,
+                ),
+                Err(error) => host_result_to_lua::<u64, _>(
+                    lua,
+                    Err(error),
+                    |_lua, _changed| Ok(Value::Nil),
+                    &execute_cancellation,
+                ),
+            }
         })?,
     )?;
 
@@ -560,15 +617,18 @@ fn build_database_table(
             }
             _ => Err(LuaHostCallError::binding(LuaOperation::QueryDatabase)),
         };
-        let output = host_result_to_lua(lua, result, |lua, bytes| {
-            lua.create_userdata(LuaBlob {
-                bytes,
-                cancellation: blob_cancellation.clone(),
-            })
-            .map(Value::UserData)
-        });
-        ensure_lua_not_cancelled(&blob_cancellation)?;
-        output
+        host_result_to_lua(
+            lua,
+            result,
+            |lua, bytes| {
+                lua.create_userdata(LuaBlob {
+                    bytes,
+                    cancellation: blob_cancellation.clone(),
+                })
+                .map(Value::UserData)
+            },
+            &blob_cancellation,
+        )
     })?;
 
     let factory: Function = lua
@@ -620,11 +680,12 @@ fn build_translation_table(
                             host_error("translation", error, LuaOperation::QueryDatabase)
                         })
                 });
-            let output = host_result_to_lua(lua, result, |lua, records| {
-                translation_records_to_lua(lua, records, &list_cancellation)
-            });
-            ensure_lua_not_cancelled(&list_cancellation)?;
-            output
+            host_result_to_lua(
+                lua,
+                result,
+                |lua, records| translation_records_to_lua(lua, records, &list_cancellation),
+                &list_cancellation,
+            )
         })?,
     )?;
 
@@ -645,11 +706,12 @@ fn build_translation_table(
                             host_error("translation", error, LuaOperation::QueryDatabase)
                         })
                 });
-            let output = host_result_to_lua(lua, result, |lua, contexts| {
-                translation_contexts_to_lua(lua, contexts, &context_cancellation)
-            });
-            ensure_lua_not_cancelled(&context_cancellation)?;
-            output
+            host_result_to_lua(
+                lua,
+                result,
+                |lua, contexts| translation_contexts_to_lua(lua, contexts, &context_cancellation),
+                &context_cancellation,
+            )
         })?,
     )?;
 
@@ -674,12 +736,17 @@ fn build_translation_table(
                             host_error("translation", error, LuaOperation::SetTranslation)
                         })
                 });
-            let output = match result {
-                Ok(_changed) => host_result_to_lua(lua, Ok(()), |_lua, ()| Ok(Value::Nil)),
-                Err(error) => host_result_to_lua(lua, Err(error), |_lua, ()| Ok(Value::Nil)),
-            };
-            ensure_lua_not_cancelled(&set_cancellation)?;
-            output
+            match result {
+                Ok(_changed) => {
+                    host_result_to_lua(lua, Ok(()), |_lua, ()| Ok(Value::Nil), &set_cancellation)
+                }
+                Err(error) => host_result_to_lua(
+                    lua,
+                    Err(error),
+                    |_lua, ()| Ok(Value::Nil),
+                    &set_cancellation,
+                ),
+            }
         })?,
     )?;
 
@@ -698,12 +765,17 @@ fn build_translation_table(
                             host_error("translation", error, LuaOperation::ClearTranslation)
                         })
                 });
-            let output = match result {
-                Ok(_changed) => host_result_to_lua(lua, Ok(()), |_lua, ()| Ok(Value::Nil)),
-                Err(error) => host_result_to_lua(lua, Err(error), |_lua, ()| Ok(Value::Nil)),
-            };
-            ensure_lua_not_cancelled(&clear_cancellation)?;
-            output
+            match result {
+                Ok(_changed) => {
+                    host_result_to_lua(lua, Ok(()), |_lua, ()| Ok(Value::Nil), &clear_cancellation)
+                }
+                Err(error) => host_result_to_lua(
+                    lua,
+                    Err(error),
+                    |_lua, ()| Ok(Value::Nil),
+                    &clear_cancellation,
+                ),
+            }
         })?,
     )?;
 
@@ -725,11 +797,12 @@ fn build_terminology_table(
             let result = adapter
                 .list_terminology(&connection)
                 .map_err(|error| host_error("terminology", error, LuaOperation::QueryDatabase));
-            let output = host_result_to_lua(lua, result, |lua, entries| {
-                terminology_entries_to_lua(lua, entries, &cancellation)
-            });
-            ensure_lua_not_cancelled(&cancellation)?;
-            output
+            host_result_to_lua(
+                lua,
+                result,
+                |lua, entries| terminology_entries_to_lua(lua, entries, &cancellation),
+                &cancellation,
+            )
         })?,
     )?;
     checked_function_table(lua, native, &["list"])
@@ -1010,9 +1083,9 @@ fn lua_to_sqlite_value(
         _ => Err(ProjectLuaCallError::violation(
             crate::diagnostic::LuaValueViolation::UnexpectedType,
         )),
-    };
+    }?;
     ensure_project_lua_call_running(cancellation)?;
-    converted
+    Ok(converted)
 }
 
 #[derive(Debug)]
@@ -1110,24 +1183,20 @@ fn rows_to_lua(
     cancellation: &ProjectLuaCancellation,
 ) -> mlua::Result<Value> {
     ensure_lua_not_cancelled(cancellation)?;
-    let result = lua.create_table_with_capacity(rows.len(), 0);
+    let result = lua.create_table_with_capacity(rows.len(), 0)?;
     ensure_lua_not_cancelled(cancellation)?;
-    let result = result?;
     for (row_index, row) in rows.into_iter().enumerate() {
         ensure_lua_not_cancelled(cancellation)?;
-        let values = lua.create_table_with_capacity(row.len(), 0);
+        let values = lua.create_table_with_capacity(row.len(), 0)?;
         ensure_lua_not_cancelled(cancellation)?;
-        let values = values?;
         for (column_index, value) in row.into_iter().enumerate() {
             ensure_lua_not_cancelled(cancellation)?;
             let value = sqlite_to_lua_value(lua, value, cancellation)?;
-            let set_result = values.raw_set(column_index + 1, value);
+            values.raw_set(column_index + 1, value)?;
             ensure_lua_not_cancelled(cancellation)?;
-            set_result?;
         }
-        let set_result = result.raw_set(row_index + 1, values);
+        result.raw_set(row_index + 1, values)?;
         ensure_lua_not_cancelled(cancellation)?;
-        set_result?;
     }
     ensure_lua_not_cancelled(cancellation)?;
     Ok(Value::Table(result))
@@ -1153,9 +1222,9 @@ fn sqlite_to_lua_value(
                 cancellation: cancellation.clone(),
             })
             .map(Value::UserData),
-    };
+    }?;
     ensure_lua_not_cancelled(cancellation)?;
-    converted
+    Ok(converted)
 }
 
 fn dense_table_values(
@@ -1320,9 +1389,9 @@ impl UserData for LuaBlob {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("bytes", |lua, this, ()| {
             ensure_lua_not_cancelled(&this.cancellation)?;
-            let value = lua.create_string(&this.bytes);
+            let value = lua.create_string(&this.bytes)?;
             ensure_lua_not_cancelled(&this.cancellation)?;
-            value
+            Ok(value)
         });
         methods.add_meta_method(MetaMethod::Eq, |_lua, this, other: AnyUserData| {
             ensure_lua_not_cancelled(&this.cancellation)?;
@@ -1413,20 +1482,17 @@ fn host_result_to_lua<T, F>(
     lua: &Lua,
     result: Result<T, LuaHostCallError>,
     success: F,
+    cancellation: &ProjectLuaCancellation,
 ) -> mlua::Result<MultiValue>
 where
     F: FnOnce(&Lua, T) -> mlua::Result<Value>,
 {
     match result {
-        Ok(value) => match success(lua, value) {
-            Ok(value) => Ok(MultiValue::from_vec(vec![Value::Boolean(true), value])),
-            Err(_error) => Ok(MultiValue::from_vec(vec![
-                Value::Boolean(false),
-                Value::UserData(
-                    lua.create_userdata(LuaHostCallError::binding(LuaOperation::ExecuteScript))?,
-                ),
-            ])),
-        },
+        Ok(value) => {
+            let value = success(lua, value)?;
+            ensure_lua_not_cancelled(cancellation)?;
+            Ok(MultiValue::from_vec(vec![Value::Boolean(true), value]))
+        }
         Err(error) => Ok(MultiValue::from_vec(vec![
             Value::Boolean(false),
             Value::UserData(lua.create_userdata(error)?),
@@ -1439,7 +1505,7 @@ pub(super) fn execute(
     function: Function,
     script_identity: &str,
     engine: crate::diagnostic::LuaEngine,
-    cancellation: &ProjectLuaCancellation,
+    hook_cancelled: &AtomicBool,
 ) -> Result<(), ProjectLuaFailure> {
     let runner: Function = lua
         .load(
@@ -1451,31 +1517,40 @@ pub(super) fn execute(
         .create_thread(runner)
         .map_err(|_| ProjectLuaFailure::Context(super::ProjectLuaContextFailure::ThreadCreation))?;
     let result = thread.resume::<(bool, Value)>(function);
-    if cancellation.is_cancelled() {
-        return Err(ProjectLuaFailure::Cancelled);
-    }
     if thread.status() == ThreadStatus::Resumable {
+        if hook_cancelled.load(Ordering::Acquire) {
+            return Err(ProjectLuaFailure::Cancelled);
+        }
         return Err(ProjectLuaFailure::Script {
             script_identity: script_identity.to_owned(),
             failure: ProjectLuaScriptFailure::Yielded,
         });
     }
-    let (succeeded, error) = result.map_err(|error| ProjectLuaFailure::Script {
-        script_identity: script_identity.to_owned(),
-        failure: ProjectLuaScriptFailure::Backend(classify_mlua_error(&error)),
-    })?;
+    let (succeeded, error) = match result {
+        Err(error) if error.downcast_ref::<ProjectLuaCancellationTrap>().is_some() => {
+            return Err(ProjectLuaFailure::Cancelled);
+        }
+        Err(error) => {
+            return Err(ProjectLuaFailure::Script {
+                script_identity: script_identity.to_owned(),
+                failure: ProjectLuaScriptFailure::Backend(classify_mlua_error(&error)),
+            });
+        }
+        Ok(result) => result,
+    };
     if succeeded {
         return Ok(());
+    }
+    if lua_value_is_cancellation(&error) {
+        return Err(ProjectLuaFailure::Cancelled);
     }
     if let Value::UserData(userdata) = &error
         && let Ok(error) = userdata.borrow::<LuaHostCallError>()
     {
-        if cancellation.is_cancelled() {
-            return Err(ProjectLuaFailure::Cancelled);
-        }
-        return Err(ProjectLuaFailure::Host(
-            error.error.clone().with_engine(engine),
-        ));
+        return Err(
+            ProjectLuaFailure::Host(error.error.clone().with_engine(engine))
+                .into_typed_cancellation(),
+        );
     }
     drop(error);
     Err(ProjectLuaFailure::Script {
@@ -1487,6 +1562,76 @@ pub(super) fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compilation_error_precedes_late_cancellation() {
+        let program = ProjectLuaProgram::new("broken.lua", b"local =".as_slice(), Vec::new());
+        let cancellation = ProjectLuaCancellation::default();
+        cancellation.cancel();
+        let failure = complete_compilation(
+            Err(mlua::Error::SyntaxError {
+                message: "syntax error".to_owned(),
+                incomplete_input: false,
+            }),
+            &program,
+            mlua::ffi::LUA_ERRSYNTAX,
+            false,
+            &cancellation,
+        )
+        .expect_err("编译器已经返回语法错误时不得改写为取消");
+
+        assert!(matches!(
+            failure,
+            ProjectLuaFailure::Compile {
+                failure: ProjectLuaCompilationFailure::Backend {
+                    category: LuaCompilerCategory::Syntax,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn pcall_cannot_swallow_typed_host_cancellation() {
+        let lua = Lua::new();
+        let cancellation = ProjectLuaCancellation::default();
+        install_cancellation_guards(&lua, cancellation.clone()).expect("应安装取消保护函数");
+        let host_cancellation = cancellation.clone();
+        let native = lua
+            .create_function(move |lua, (): ()| {
+                host_result_to_lua::<(), _>(
+                    lua,
+                    Err(host_error(
+                        "translation",
+                        ProjectLuaCallError::cancelled(),
+                        LuaOperation::SetTranslation,
+                    )),
+                    |_lua, ()| Ok(Value::Nil),
+                    &host_cancellation,
+                )
+            })
+            .expect("应建立测试 Host");
+        let checked = checked_host_function(&lua, native).expect("应建立检查包装");
+        lua.globals()
+            .set("cancelled_call", checked)
+            .expect("应发布测试 Host");
+        let function = lua
+            .load("local ok = pcall(cancelled_call); assert(not ok)")
+            .into_function()
+            .expect("应编译测试脚本");
+
+        let failure = execute(
+            &lua,
+            function,
+            "cancel.lua",
+            crate::diagnostic::LuaEngine::Generic,
+            &AtomicBool::new(false),
+        )
+        .expect_err("pcall 不得吞掉类型化取消");
+
+        assert_eq!(failure, ProjectLuaFailure::Cancelled);
+    }
 
     #[test]
     fn cancelled_host_entry_returns_an_error() {

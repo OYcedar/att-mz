@@ -735,7 +735,6 @@ impl TranslationPlanPreparationCounts {
 pub(crate) struct TranslationPlanPreparation {
     invalidations: Vec<TranslationInvalidation>,
     reuses: Vec<TranslationReuse>,
-    planning_failures: Vec<TranslationPlanningFailure>,
     terminology_json: String,
     placeholder_rules_json: String,
     retained: usize,
@@ -755,7 +754,7 @@ impl TranslationPlanPreparation {
         invalidated: usize,
         not_applicable: usize,
     ) -> Self {
-        Self::with_baseline_and_planning_failures(
+        Self::with_baseline(
             invalidations,
             reuses,
             terminology_json,
@@ -767,23 +766,20 @@ impl TranslationPlanPreparation {
                 "[]".to_owned(),
                 "[]".to_owned(),
             ),
-            Vec::new(),
         )
     }
 
-    pub(crate) fn with_baseline_and_planning_failures(
+    pub(crate) fn with_baseline(
         invalidations: Vec<TranslationInvalidation>,
         reuses: Vec<TranslationReuse>,
         terminology_json: String,
         placeholder_rules_json: String,
         counts: TranslationPlanPreparationCounts,
         snapshot_baseline: TranslationSnapshotBaseline,
-        planning_failures: Vec<TranslationPlanningFailure>,
     ) -> Self {
         Self {
             invalidations,
             reuses,
-            planning_failures,
             terminology_json,
             placeholder_rules_json,
             retained: counts.retained,
@@ -801,19 +797,6 @@ impl TranslationPlanPreparation {
     #[cfg(test)]
     pub(crate) fn reuses(&self) -> &[TranslationReuse] {
         &self.reuses
-    }
-
-    pub(crate) fn planning_failures(&self) -> &[TranslationPlanningFailure] {
-        &self.planning_failures
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_test_planning_failures(
-        mut self,
-        planning_failures: Vec<TranslationPlanningFailure>,
-    ) -> Self {
-        self.planning_failures = planning_failures;
-        self
     }
 
     pub(crate) const fn retained(&self) -> usize {
@@ -902,7 +885,6 @@ impl TranslationPlanningFailure {
     /// 将规划器掌握的叶子原因和完整 RPG Maker Unit 身份一次性投影为公开诊断。
     ///
     /// 规则来源由 Planner 在解析本次资源时保存；调用方不得再从展示文本猜测来源。
-    #[cfg(test)]
     pub(crate) fn diagnostic_report(&self) -> crate::diagnostic::DiagnosticReport {
         crate::diagnostic::DiagnosticReport::new(
             crate::diagnostic::StateEffect::Unchanged,
@@ -910,7 +892,6 @@ impl TranslationPlanningFailure {
         )
     }
 
-    #[cfg(test)]
     fn diagnostic_issue(&self) -> crate::diagnostic::RpgMakerIssue {
         let unit = rpg_maker_diagnostic_unit(&self.identity);
         match &self.reason {
@@ -945,6 +926,14 @@ impl TranslationPlanningFailure {
         }
     }
 }
+
+impl fmt::Display for TranslationPlanningFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RPG Maker Unit 无法完成 Placeholder 或语言投影准备")
+    }
+}
+
+impl Error for TranslationPlanningFailure {}
 
 pub(super) fn rpg_maker_diagnostic_unit(
     identity: &TranslationUnitIdentity,
@@ -2647,11 +2636,6 @@ impl RpgMakerTranslationRunReport {
         self.protocol_diagnostics += outcome.diagnostics().len();
     }
 
-    pub(crate) fn record_planning_failures(&mut self, failures: &[TranslationPlanningFailure]) {
-        self.unresolved_decisions += failures.len();
-        self.unresolved_locations += failures.len();
-    }
-
     pub(crate) const fn total_tasks(&self) -> usize {
         self.total_tasks
     }
@@ -2734,6 +2718,11 @@ pub(crate) trait RpgMakerTranslationAssetReader: Send + Sync {
 pub(crate) trait RpgMakerTranslationTaskPlanner: Send + Sync {
     type Profile: RpgMakerTranslationExecutionProfile;
     type Error: Error + Send + Sync + 'static;
+
+    /// 只根据 Planner 返回的类型化错误判断这次失败是否就是合作取消。
+    ///
+    /// 调用方不能再读取共享取消标志覆盖一个已经形成的真实规划错误。
+    fn is_cancelled_error(error: &Self::Error) -> bool;
 
     fn plan(
         &self,
@@ -3300,41 +3289,25 @@ where
                     evidence,
                     failure,
                 },
-            ) => match disposition {
-                OrderedFinalizationDisposition::CancelledNoApply => {
-                    self.record_not_applied(
-                        task,
-                        outcome,
-                        evidence,
-                        TranslationTaskRecordFinalStateKind::Cancelled,
-                    );
-                    drop(failure);
-                    Ok(())
-                }
-                OrderedFinalizationDisposition::AfterEarlierFailureNoApply => {
-                    self.record_not_applied(
-                        task,
-                        outcome,
-                        evidence,
-                        TranslationTaskRecordFinalStateKind::EarlierFailure,
-                    );
-                    drop(failure);
-                    Ok(())
-                }
-                OrderedFinalizationDisposition::Apply => self.record_commit_failure(
-                    task,
-                    outcome,
-                    evidence,
-                    TranslationTaskCommitPhase::Preparation,
-                    failure,
-                ),
-            },
+            ) => self.record_commit_failure(
+                task,
+                outcome,
+                evidence,
+                TranslationTaskCommitPhase::Preparation,
+                failure,
+            ),
             OrderedTaskResult::Prepared(prepared) => {
                 let PreparedTranslationTask {
                     outcome,
                     evidence,
                     prepared_commit,
                 } = prepared;
+                // Unavailable 等没有任何已验收译文的结果不需要提交。它们已经形成自己的
+                // 业务终态，不能仅因同时收到取消或更早任务失败而伪装成“未提交”。
+                if prepared_commit.is_none() {
+                    self.record_success(task, outcome, evidence, report);
+                    return Ok(());
+                }
                 match disposition {
                     OrderedFinalizationDisposition::CancelledNoApply => {
                         self.record_not_applied(
@@ -3634,7 +3607,7 @@ where
                 .await
             {
                 Ok(plan) => plan,
-                Err(_) if self.cancellation.is_requested() => {
+                Err(source) if P::is_cancelled_error(&source) => {
                     return Ok(OperationCompletion::Cancelled);
                 }
                 Err(source) => {
@@ -3645,20 +3618,17 @@ where
                 return Ok(OperationCompletion::Cancelled);
             }
             let (_semantics, preparation, tasks) = plan.into_parts();
-            let planning_failures = preparation.planning_failures().to_vec();
-            let mut report = RpgMakerTranslationRunReport::with_reconciliation(
+            let report = RpgMakerTranslationRunReport::with_reconciliation(
                 tasks.len(),
                 preparation.retained(),
                 preparation.invalidated(),
                 preparation.not_applicable(),
                 preparation.reused(),
             );
-            report.record_planning_failures(&planning_failures);
-
             self.event_log
                 .emit(RpgMakerTranslationLogEvent::PlanningCompleted {
                     total_tasks: tasks.len(),
-                    unresolved_units: planning_failures.len(),
+                    unresolved_units: 0,
                 });
 
             self.result_store
@@ -4067,7 +4037,6 @@ mod tests {
         Read,
         Plan,
         Prepare,
-        LogPlanningFailure,
         LogTaskStarted(usize),
         Execute(usize),
         Complete(usize),
@@ -4190,6 +4159,10 @@ mod tests {
     impl RpgMakerTranslationTaskPlanner for FakePlanner {
         type Profile = FakeProfile;
         type Error = FakeError;
+
+        fn is_cancelled_error(error: &Self::Error) -> bool {
+            error.0 == "cancelled"
+        }
 
         async fn plan(
             &self,
@@ -4463,13 +4436,7 @@ mod tests {
                         }
                     }
                 }
-                RpgMakerTranslationLogEvent::PlanningCompleted {
-                    unresolved_units, ..
-                } => {
-                    if *unresolved_units > 0 {
-                        record(&self.events, Event::LogPlanningFailure);
-                    }
-                }
+                RpgMakerTranslationLogEvent::PlanningCompleted { .. } => {}
             }
             self.records
                 .lock()
@@ -4666,70 +4633,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_requested_during_failed_planning_is_not_reported_as_a_planner_failure() {
+    async fn cancellation_flag_does_not_overwrite_a_real_planner_failure() {
         let mut harness = harness(0, Vec::new(), false, true, false, None, None);
         harness.service.task_planner.cancel_on_plan = Some(harness.cancellation.clone());
 
-        let completion = harness
+        let error = harness
             .service
             .run(&project(), &profile(1), input())
             .await
-            .expect("取消后的规划错误应转换成正常取消结果");
+            .expect_err("共享取消标志不得覆盖 Planner 同时返回的真实错误");
 
-        assert!(matches!(completion, OperationCompletion::Cancelled));
+        assert!(matches!(
+            error,
+            RpgMakerTranslationServiceError::PlanTasks(FakeError("plan"))
+        ));
         assert_eq!(events(&harness.events), vec![Event::Read, Event::Plan]);
     }
 
     #[tokio::test]
-    async fn planning_unresolved_is_committed_observed_and_counted_without_blocking_good_tasks() {
-        let preparation = TranslationPlanPreparation::new(
-            Vec::new(),
-            Vec::new(),
-            r#"[{"term":"勇者"}]"#.to_owned(),
-            r#"[{"pattern":"<BAD>"}]"#.to_owned(),
-            0,
-            1,
-            0,
-        )
-        .with_test_planning_failures(vec![TranslationPlanningFailure::new(
-            translation_identity_at(99, "description"),
-            TranslationPlanningFailureReason::PlaceholderProtection {
-                failure: TranslationPlaceholderProtectionFailure::ReservedTokenNamespace {
-                    start_byte: 2,
-                    end_byte: 9,
-                },
-            },
-        )]);
-        let harness =
-            harness_with_preparation(1, vec![1], false, false, false, None, None, preparation);
+    async fn planner_failure_stops_before_database_preparation_and_model_tasks() {
+        let harness = harness(1, vec![1], false, true, false, None, None);
 
-        let report = expect_completed(
-            harness
-                .service
-                .run(&project(), &profile(1), input())
-                .await
-                .expect("规划期未解决是正常部分结果"),
-        );
+        let error = harness
+            .service
+            .run(&project(), &profile(1), input())
+            .await
+            .expect_err("Planner 失败必须中止整次 Translate");
 
-        assert_eq!(report.complete_tasks(), 1);
-        assert_eq!(report.unresolved_decisions(), 1);
-        assert_eq!(report.unresolved_locations(), 1);
-        assert_eq!(report.invalidated(), 1);
-        assert!(events(&harness.events).contains(&Event::LogPlanningFailure));
-        let preparations = harness.preparations.lock().expect("准备记录锁不应中毒");
-        assert_eq!(preparations.len(), 1);
-        assert_eq!(preparations[0].planning_failures().len(), 1);
-        let records = harness.log_records.lock().expect("日志记录锁不应中毒");
         assert!(matches!(
-            records.as_slice(),
-            [
-                RpgMakerTranslationLogEvent::PlanningCompleted {
-                    unresolved_units: 1,
-                    ..
-                },
-                ..
-            ]
+            error,
+            RpgMakerTranslationServiceError::PlanTasks(FakeError("plan"))
         ));
+        assert_eq!(events(&harness.events), vec![Event::Read, Event::Plan]);
+        assert!(
+            harness
+                .preparations
+                .lock()
+                .expect("准备记录锁不应中毒")
+                .is_empty()
+        );
+        assert!(
+            harness
+                .task_records
+                .lock()
+                .expect("任务记录锁不应中毒")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -4946,7 +4895,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn earlier_commit_failure_wins_over_a_later_out_of_order_preparation_failure() {
+    async fn earlier_commit_failure_stays_primary_but_later_preparation_failure_is_preserved() {
         let mut harness = harness(4, vec![1; 4], false, false, false, None, Some(0));
         let gate = Arc::new(Semaphore::new(0));
         harness.service.result_store.block_commit_preparation_at = Some((0, Arc::clone(&gate)));
@@ -4979,8 +4928,15 @@ mod tests {
         ));
         let final_events = events(&harness.events);
         assert!(final_events.contains(&Event::LogCommitFailure(0)));
-        assert!(final_events.contains(&Event::LogNotCommitted(1)));
-        assert!(!final_events.contains(&Event::LogCommitFailure(1)));
+        assert!(final_events.contains(&Event::LogCommitFailure(1)));
+        assert!(!final_events.contains(&Event::LogNotCommitted(1)));
+        assert!(
+            harness
+                .task_records
+                .lock()
+                .expect("任务记录锁不应中毒")
+                .contains(&(1, RecordedTaskState::CommitPreparationFailed))
+        );
     }
 
     #[tokio::test]
@@ -5221,6 +5177,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_does_not_hide_a_commit_preparation_failure() {
+        let mut harness = harness(1, vec![1], false, false, false, None, None);
+        harness.service.task_executor.cancel_on_start = Some((0, harness.cancellation.clone()));
+        harness.service.result_store.fail_commit_preparation_at = Arc::new(vec![0]);
+
+        let error = harness
+            .service
+            .run(&project(), &profile(1), input())
+            .await
+            .expect_err("已经形成的提交准备失败不得被同时发生的取消覆盖");
+
+        assert!(matches!(
+            error,
+            RpgMakerTranslationServiceError::CommitTask {
+                task_index,
+                source: FakeError("prepare-commit"),
+                ..
+            } if task_index == RpgMakerTranslationTaskIndex::new(0)
+        ));
+        assert!(events(&harness.events).contains(&Event::LogCommitFailure(0)));
+        assert_eq!(
+            *harness.task_records.lock().expect("任务记录锁不应中毒"),
+            vec![(0, RecordedTaskState::CommitPreparationFailed)]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_keeps_an_unavailable_task_as_unavailable() {
+        let mut harness = harness_with_behavior(
+            1,
+            vec![1],
+            false,
+            false,
+            false,
+            None,
+            None,
+            empty_preparation(),
+            vec![FakeOutcomeKind::Unavailable],
+        );
+        harness.service.task_executor.cancel_on_start = Some((0, harness.cancellation.clone()));
+
+        let completion = harness
+            .service
+            .run(&project(), &profile(1), input())
+            .await
+            .expect("Unavailable 任务本身没有待提交结果");
+
+        assert_eq!(completion, OperationCompletion::Cancelled);
+        assert_eq!(logged_tasks(&events(&harness.events)), vec![0]);
+        assert_eq!(
+            *harness.task_records.lock().expect("任务记录锁不应中毒"),
+            vec![(0, RecordedTaskState::UnavailableNoChanges)]
+        );
+    }
+
+    #[tokio::test]
     async fn executor_failure_preserves_only_the_committed_prefix() {
         let harness = harness(4, vec![4, 1, 1, 1], false, false, false, Some(1), None);
 
@@ -5257,6 +5269,47 @@ mod tests {
                 (3, RecordedTaskState::NotCommittedAfterEarlierFailure),
             ],
             "执行失败后，所有已启动任务仍必须各自收敛为唯一终态"
+        );
+    }
+
+    #[tokio::test]
+    async fn earlier_failure_keeps_a_later_unavailable_task_as_unavailable() {
+        let harness = harness_with_behavior(
+            3,
+            vec![1; 3],
+            false,
+            false,
+            false,
+            Some(0),
+            None,
+            empty_preparation(),
+            vec![
+                FakeOutcomeKind::Complete,
+                FakeOutcomeKind::Unavailable,
+                FakeOutcomeKind::Complete,
+            ],
+        );
+
+        let error = harness
+            .service
+            .run(&project(), &profile(3), input())
+            .await
+            .expect_err("首项执行失败必须成为 Translate 主错误");
+        assert!(matches!(
+            error,
+            RpgMakerTranslationServiceError::ExecuteTask {
+                task_index,
+                source: FakeError("execute"),
+                ..
+            } if task_index == RpgMakerTranslationTaskIndex::new(0)
+        ));
+        assert_eq!(
+            *harness.task_records.lock().expect("任务记录锁不应中毒"),
+            vec![
+                (0, RecordedTaskState::ExecutionFailedNoChanges),
+                (1, RecordedTaskState::UnavailableNoChanges),
+                (2, RecordedTaskState::NotCommittedAfterEarlierFailure),
+            ]
         );
     }
 

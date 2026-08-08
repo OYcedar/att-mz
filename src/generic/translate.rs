@@ -944,30 +944,36 @@ pub(crate) fn plan_translation_with_cancellation(
         snapshot,
         planning_units,
         target_task_characters,
-        |key, candidate| Ok(reuse_validator(key, candidate).map(ValidatedReuse::same_text)),
+        |key, candidate| {
+            Ok::<_, GenericPlanningError>(
+                reuse_validator(key, candidate).map(ValidatedReuse::same_text),
+            )
+        },
         cancellation,
     )
 }
 
 /// 与 [`plan_translation_with_cancellation`] 相同，并允许复用验收自身传播取消。
-pub(crate) fn plan_translation_with_validator_and_cancellation(
+pub(crate) fn plan_translation_with_validator_and_cancellation<E>(
     snapshot: &GenericStoredSnapshot,
     planning_units: &[PlanningUnit],
     target_task_characters: NonZeroUsize,
     reuse_validator: impl Fn(
         &GenericUnitKey,
         &str,
-    ) -> Result<
-        Result<ValidatedReuse, GenericResponseDestinationProblem>,
-        GenericPlanningError,
-    >,
+    )
+        -> Result<Result<ValidatedReuse, GenericResponseDestinationProblem>, E>,
     cancellation: &CooperativeCancellation,
-) -> Result<TranslationPlan, GenericPlanningError> {
+) -> Result<TranslationPlan, E>
+where
+    E: From<GenericPlanningError>,
+{
     let is_cancelled = || cancellation.is_requested();
     ensure_planning_not_cancelled(&is_cancelled)?;
     let (task_layout, scope_file_indices) = generic_task_planning_layout(snapshot, &is_cancelled)?;
     let complete_task_plan =
-        pack_complete_task_blocks(&task_layout, target_task_characters, cancellation)?;
+        pack_complete_task_blocks(&task_layout, target_task_characters, cancellation)
+            .map_err(GenericPlanningError::from)?;
     let mut natural_units = Vec::with_capacity(task_layout.total_units());
     for file in snapshot.files() {
         ensure_planning_not_cancelled(&is_cancelled)?;
@@ -1083,9 +1089,9 @@ pub(crate) fn plan_translation_with_validator_and_cancellation(
                 continue;
             };
             let Some(context) = fact.input.current_context.as_ref() else {
-                return Err(GenericPlanningError::MissingCurrentContext(
-                    fact.locator.clone(),
-                ));
+                return Err(
+                    GenericPlanningError::MissingCurrentContext(fact.locator.clone()).into(),
+                );
             };
             if first_reuse_candidate.is_none() {
                 first_reuse_candidate = context.reuse_candidate();
@@ -1107,9 +1113,9 @@ pub(crate) fn plan_translation_with_validator_and_cancellation(
             let fact = &facts[*unit_index];
             if fact.input.current_translation.is_some() {
                 let Some(context) = fact.input.current_context.as_ref() else {
-                    return Err(GenericPlanningError::MissingCurrentContext(
-                        fact.locator.clone(),
-                    ));
+                    return Err(
+                        GenericPlanningError::MissingCurrentContext(fact.locator.clone()).into(),
+                    );
                 };
                 let previous = known_targets.insert_with_cancellation(
                     clone_planning_key_with_cancellation(&fact.key, &is_cancelled)?,
@@ -1284,7 +1290,8 @@ pub(crate) fn plan_translation_with_validator_and_cancellation(
     }
 
     debug_assert_eq!(responsibilities.len(), task_layout.total_units());
-    let assigned_task_plan = assign_task_ids(complete_task_plan, &responsibilities, cancellation)?;
+    let assigned_task_plan = assign_task_ids(complete_task_plan, &responsibilities, cancellation)
+        .map_err(GenericPlanningError::from)?;
 
     let mut tasks = Vec::new();
     for block in assigned_task_plan.blocks_with_task_ids() {
@@ -1680,25 +1687,27 @@ pub(crate) fn accept_parsed_response(
     accept_parsed_response_with_cancellation(
         task,
         parsed,
-        |output_id, key, candidate| Ok(validator(output_id, key, candidate)),
+        |output_id, key, candidate| {
+            Ok::<_, GenericPlanningError>(validator(output_id, key, candidate))
+        },
         || false,
     )
     .expect("不取消的受信响应验收必须完成")
 }
 
-pub(crate) fn accept_parsed_response_with_cancellation(
+pub(crate) fn accept_parsed_response_with_cancellation<E>(
     task: PlannedTask,
     parsed: &ParsedTranslationResponse,
     mut validator: impl FnMut(
         TaskId,
         &GenericUnitKey,
         &str,
-    ) -> Result<
-        Result<String, GenericResponseDestinationProblem>,
-        GenericPlanningError,
-    >,
+    ) -> Result<Result<String, GenericResponseDestinationProblem>, E>,
     is_cancelled: impl Fn() -> bool,
-) -> Result<TranslationAcceptance, GenericPlanningError> {
+) -> Result<TranslationAcceptance, E>
+where
+    E: From<GenericPlanningError>,
+{
     ensure_planning_not_cancelled(&is_cancelled)?;
     let entries = parsed.entries();
     let mut canonical_counts = HashMap::new();
@@ -2701,9 +2710,11 @@ mod tests {
             NonZeroUsize::MAX,
             |key, candidate| {
                 if key.group_id() == "g3" {
-                    Ok(Err(GenericResponseDestinationProblem::ValidatorRejected))
+                    Ok::<_, GenericPlanningError>(Err(
+                        GenericResponseDestinationProblem::ValidatorRejected,
+                    ))
                 } else {
-                    Ok(Ok(ValidatedReuse::new(
+                    Ok::<_, GenericPlanningError>(Ok(ValidatedReuse::new(
                         format!("{candidate}-已验收"),
                         format!("<{candidate}-已验收>"),
                     )))

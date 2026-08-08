@@ -778,9 +778,8 @@ impl GenericProjectStore {
             Ok(()) => Ok(()),
             Err(original) => match cleanup_initial_database_candidate(&candidate_path) {
                 Ok(()) => Err(original),
-                Err((path, cleanup)) => Err(GenericProjectError::InitialCandidateCleanup {
+                Err(cleanup) => Err(GenericProjectError::InitialCandidateCleanup {
                     original: Box::new(original),
-                    path,
                     cleanup,
                 }),
             },
@@ -1752,8 +1751,7 @@ pub(crate) enum GenericProjectError {
     },
     InitialCandidateCleanup {
         original: Box<GenericProjectError>,
-        path: PathBuf,
-        cleanup: io::Error,
+        cleanup: Vec<(PathBuf, io::Error)>,
     },
     InvalidDatabase {
         problem: GenericProjectDatabaseProblem,
@@ -1844,15 +1842,17 @@ impl fmt::Display for GenericProjectError {
                 }
                 write!(formatter, "；终态确认失败：{finalization}")
             }
-            Self::InitialCandidateCleanup {
-                original,
-                path,
-                cleanup,
-            } => write!(
-                formatter,
-                "{original}；清理初始数据库候选失败：{}（{cleanup}）",
-                path.display()
-            ),
+            Self::InitialCandidateCleanup { original, cleanup } => {
+                write!(formatter, "{original}")?;
+                for (path, source) in cleanup {
+                    write!(
+                        formatter,
+                        "；清理初始数据库候选失败：{}（{source}）",
+                        path.display()
+                    )?;
+                }
+                Ok(())
+            }
             Self::InvalidDatabase { problem, .. } => {
                 write!(formatter, "Generic 项目数据库无效：{problem:?}")
             }
@@ -2062,24 +2062,24 @@ impl GenericProjectError {
                         .with_related(RelatedFailureRelation::Finalization, finalization)
                 })
             }
-            Self::InitialCandidateCleanup {
-                original,
-                path,
-                cleanup,
-            } => original
-                .diagnostic_report(stage, database, effect)
-                .with_related(
-                    RelatedFailureRelation::Cleanup,
-                    file_system_project_report(
-                        stage,
-                        FileSystemOperation::Remove,
-                        FileSystemProblem::Io {
-                            path: SafePath::new(path),
-                            failure: IoFailure::from_error(cleanup),
-                        },
-                        StateEffect::RecoveryRequired,
-                    ),
-                ),
+            Self::InitialCandidateCleanup { original, cleanup } => {
+                let mut report = original.diagnostic_report(stage, database, effect);
+                for (path, source) in cleanup {
+                    report = report.with_related(
+                        RelatedFailureRelation::Cleanup,
+                        file_system_project_report(
+                            stage,
+                            FileSystemOperation::Remove,
+                            FileSystemProblem::Io {
+                                path: SafePath::new(path),
+                                failure: IoFailure::from_error(source),
+                            },
+                            StateEffect::RecoveryRequired,
+                        ),
+                    );
+                }
+                report
+            }
             Self::InvalidDatabase { problem, .. } => {
                 generic(GenericProblem::InvalidProjectDatabase {
                     problem: problem.clone(),
@@ -2364,9 +2364,9 @@ fn sqlite_error_is_interrupted(source: &rusqlite::Error) -> bool {
 fn cancellable_sqlite_error(
     operation: &'static str,
     source: rusqlite::Error,
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    _cancellation: &(impl GenericOperationCancellation + ?Sized),
 ) -> GenericProjectError {
-    if cancellation.is_requested() || sqlite_error_is_interrupted(&source) {
+    if sqlite_error_is_interrupted(&source) {
         GenericProjectError::Cancelled
     } else {
         GenericProjectError::Sqlite { operation, source }
@@ -4116,24 +4116,26 @@ fn sqlite_sidecar_path(database_path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(sidecar)
 }
 
-fn cleanup_initial_database_candidate(candidate_path: &Path) -> Result<(), (PathBuf, io::Error)> {
+fn cleanup_initial_database_candidate(
+    candidate_path: &Path,
+) -> Result<(), Vec<(PathBuf, io::Error)>> {
     let mut paths = vec![candidate_path.to_path_buf()];
     for suffix in SQLITE_SIDECAR_SUFFIXES {
         paths.push(sqlite_sidecar_path(candidate_path, suffix));
     }
 
-    let mut first_failure = None;
+    let mut failures = Vec::new();
     for path in paths {
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-            Err(source) if first_failure.is_none() => first_failure = Some((path, source)),
-            Err(_) => {}
+            Err(source) => failures.push((path, source)),
         }
     }
-    match first_failure {
-        Some(failure) => Err(failure),
-        None => Ok(()),
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures)
     }
 }
 
@@ -4152,16 +4154,11 @@ fn validate_translation(translation: &str) -> Result<(), GenericProjectTranslati
 
 trait GenericOperationCancellation {
     fn ensure_running(&self) -> Result<(), GenericProjectError>;
-    fn is_requested(&self) -> bool;
 }
 
 impl GenericOperationCancellation for CooperativeCancellation {
     fn ensure_running(&self) -> Result<(), GenericProjectError> {
         ensure_generic_operation_not_cancelled(self)
-    }
-
-    fn is_requested(&self) -> bool {
-        CooperativeCancellation::is_requested(self)
     }
 }
 
@@ -4559,14 +4556,10 @@ mod tests {
                 Ok(())
             }
         }
-
-        fn is_requested(&self) -> bool {
-            self.polls.get() >= self.cancel_at
-        }
     }
 
     #[test]
-    fn cancellable_sqlite_errors_keep_cancellation_semantics() {
+    fn cancellable_sqlite_errors_use_the_actual_sqlite_failure() {
         let running = CooperativeCancellation::default();
         let interrupted = rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
@@ -4581,7 +4574,10 @@ mod tests {
         requested.request();
         assert!(matches!(
             cancellable_sqlite_error("测试查询", rusqlite::Error::QueryReturnedNoRows, &requested,),
-            GenericProjectError::Cancelled
+            GenericProjectError::Sqlite {
+                operation: "测试查询",
+                source: rusqlite::Error::QueryReturnedNoRows,
+            }
         ));
 
         assert!(matches!(
@@ -4591,6 +4587,44 @@ mod tests {
                 source: rusqlite::Error::QueryReturnedNoRows,
             }
         ));
+    }
+
+    #[test]
+    fn initial_candidate_cleanup_preserves_every_failed_path() {
+        let directory = tempdir().unwrap();
+        let candidate = directory.path().join(".project.db.init.tmp");
+        let sidecar = sqlite_sidecar_path(&candidate, SQLITE_SIDECAR_SUFFIXES[0]);
+        fs::create_dir(&candidate).unwrap();
+        fs::create_dir(&sidecar).unwrap();
+
+        let cleanup = cleanup_initial_database_candidate(&candidate)
+            .expect_err("目录不能当作候选数据库文件删除");
+        assert_eq!(cleanup.len(), 2);
+        assert_eq!(cleanup[0].0, candidate);
+        assert_eq!(cleanup[1].0, sidecar);
+
+        let error = GenericProjectError::InitialCandidateCleanup {
+            original: Box::new(GenericProjectError::Io {
+                operation: FileSystemOperation::Create,
+                path: directory.path().join("project.db"),
+                source: io::Error::other("建立初始数据库失败"),
+            }),
+            cleanup,
+        };
+        let displayed = error.to_string();
+        assert!(displayed.contains(".project.db.init.tmp"));
+        assert!(displayed.contains(".project.db.init.tmp-journal"));
+
+        let diagnostic = error.diagnostic_report(
+            GenericDiagnosticStage::Init,
+            Path::new("project.db"),
+            StateEffect::Unchanged,
+        );
+        assert_eq!(diagnostic.related().len(), 2);
+        for related in diagnostic.related() {
+            assert_eq!(related.relation(), RelatedFailureRelation::Cleanup);
+            assert_eq!(related.report().effect(), StateEffect::RecoveryRequired);
+        }
     }
 
     fn language(value: &str) -> LanguageId {

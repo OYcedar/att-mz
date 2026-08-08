@@ -308,6 +308,7 @@ manual-value = { $code ->
     [rerun_export] 重新运行 manual export
     [rerun_export_without_controls] 重新运行 manual export，不要把换行或 NUL 写进数组项
     [rerun_export_then_fill] 重新运行 manual export 后再填写译文
+    [resolve_temporary_then_rerun_export] 处理显示的固定临时路径；如有遗留对象，将其移除，然后重新运行 manual export
     [keep_exported_type] 保留 manual export 生成的 type
    *[other] __ATT_FALLBACK__
 }

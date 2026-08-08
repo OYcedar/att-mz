@@ -308,6 +308,7 @@ manual-value = { $code ->
     [rerun_export] manual export を再実行してください
     [rerun_export_without_controls] manual export を再実行し、配列項目に改行や NUL を入れないでください
     [rerun_export_then_fill] manual export を再実行してから訳文を入力してください
+    [resolve_temporary_then_rerun_export] 表示された固定一時パスを確認し、残っているオブジェクトがあれば削除してから manual export を再実行してください
     [keep_exported_type] manual export が出力した type を保持してください
    *[other] __ATT_FALLBACK__
 }

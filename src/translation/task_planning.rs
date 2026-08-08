@@ -151,6 +151,7 @@ pub(crate) struct CompleteTaskPlan {
 }
 
 impl CompleteTaskPlan {
+    #[cfg(test)]
     pub(crate) fn blocks(&self) -> &[TaskBlockLayout] {
         &self.blocks
     }

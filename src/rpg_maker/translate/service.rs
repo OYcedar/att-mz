@@ -14,11 +14,17 @@ use crate::rpg_maker::project::{ExistingProjectOpener, OpenedProject};
 pub(crate) type SelectedTranslationExecutionBuildResult<C, T, E> =
     Result<SelectedTranslationExecution<C, T>, E>;
 
+type ClassifiedSelectedTranslationExecution<C, T, E> =
+    Result<OperationCompletion<SelectedTranslationExecution<C, T>>, E>;
+
 /// 打开项目后一次性建立当前语言对实际需要的翻译执行切片。
 pub(crate) trait SelectedTranslationExecutionBuilder: Send + Sync {
     type Client: Send + Sync + 'static;
     type Translation: RpgMakerTranslation<Profile = Arc<RpgMakerTranslationProfile<Self::Client>>>;
     type Error: Error + Send + Sync + 'static;
+
+    /// 只根据构建器返回的类型化错误判断是否为合作取消。
+    fn is_cancelled_error(error: &Self::Error) -> bool;
 
     fn build(
         &self,
@@ -119,11 +125,8 @@ where
             return Ok(OperationCompletion::Cancelled);
         }
 
-        let execution = classify_execution_build(
-            self.execution_builder.build(&project).await,
-            &self.cancellation,
-        )
-        .map_err(TranslateServiceError::BuildExecution)?;
+        let execution = classify_execution_build::<B>(self.execution_builder.build(&project).await)
+            .map_err(TranslateServiceError::BuildExecution)?;
         let OperationCompletion::Completed(execution) = execution else {
             return Ok(OperationCompletion::Cancelled);
         };
@@ -165,13 +168,15 @@ where
     }
 }
 
-fn classify_execution_build<T, E>(
-    result: Result<T, E>,
-    cancellation: &CooperativeCancellation,
-) -> Result<OperationCompletion<T>, E> {
+fn classify_execution_build<B>(
+    result: Result<SelectedTranslationExecution<B::Client, B::Translation>, B::Error>,
+) -> ClassifiedSelectedTranslationExecution<B::Client, B::Translation, B::Error>
+where
+    B: SelectedTranslationExecutionBuilder,
+{
     match result {
         Ok(execution) => Ok(OperationCompletion::Completed(execution)),
-        Err(_) if cancellation.is_requested() => Ok(OperationCompletion::Cancelled),
+        Err(source) if B::is_cancelled_error(&source) => Ok(OperationCompletion::Cancelled),
         Err(source) => Err(source),
     }
 }
@@ -295,6 +300,37 @@ mod tests {
         cancellation: CooperativeCancellation,
     }
 
+    #[derive(Debug)]
+    struct TypedCancellationError;
+
+    impl fmt::Display for TypedCancellationError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("typed cancellation")
+        }
+    }
+
+    impl Error for TypedCancellationError {}
+
+    struct TypedCancellingBuilder;
+
+    impl SelectedTranslationExecutionBuilder for TypedCancellingBuilder {
+        type Client = ();
+        type Translation = UnusedTranslation;
+        type Error = TypedCancellationError;
+
+        fn is_cancelled_error(_error: &Self::Error) -> bool {
+            true
+        }
+
+        async fn build(
+            &self,
+            _project: &OpenedProject,
+        ) -> SelectedTranslationExecutionBuildResult<Self::Client, Self::Translation, Self::Error>
+        {
+            Err(TypedCancellationError)
+        }
+    }
+
     struct CompletedAfterCancellationTranslation {
         cancellation: CooperativeCancellation,
     }
@@ -325,6 +361,10 @@ mod tests {
         type Translation = CompletedAfterCancellationTranslation;
         type Error = FakeError;
 
+        fn is_cancelled_error(_error: &Self::Error) -> bool {
+            false
+        }
+
         async fn build(
             &self,
             _project: &OpenedProject,
@@ -352,6 +392,10 @@ mod tests {
         type Translation = UnusedTranslation;
         type Error = FakeError;
 
+        fn is_cancelled_error(_error: &Self::Error) -> bool {
+            false
+        }
+
         async fn build(
             &self,
             _project: &OpenedProject,
@@ -363,7 +407,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn builder_error_after_shared_cancellation_is_a_normal_cancelled_result() {
+    async fn shared_cancellation_flag_does_not_overwrite_a_real_builder_error() {
         let cancellation = CooperativeCancellation::default();
         let name = "cancelled-build"
             .parse::<ProjectName>()
@@ -381,6 +425,41 @@ mod tests {
             CancellingBuilder {
                 cancellation: cancellation.clone(),
             },
+            FakeLeaseProvider,
+            cancellation,
+        );
+
+        let result = service
+            .execute(TranslateInput {
+                name,
+                terminology_path: None,
+                placeholder_rules_path: None,
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(TranslateServiceError::BuildExecution(FakeError))
+        ));
+    }
+
+    #[tokio::test]
+    async fn typed_builder_cancellation_is_a_normal_cancelled_result() {
+        let cancellation = CooperativeCancellation::default();
+        let name = "typed-cancelled-build"
+            .parse::<ProjectName>()
+            .expect("测试项目名应合法");
+        let project = OpenedProject::new(
+            name.clone(),
+            PathBuf::from("C:/att-test/workspace"),
+            PathBuf::from("C:/att-test/workspace/project.db"),
+            "ja".to_owned(),
+            "zh-Hans".to_owned(),
+            test_layout_profile(),
+        );
+        let service = TranslateService::new(
+            FakeProjectOpener { project },
+            TypedCancellingBuilder,
             FakeLeaseProvider,
             cancellation,
         );

@@ -308,6 +308,7 @@ manual-value = { $code ->
     [rerun_export] manual export를 다시 실행하세요
     [rerun_export_without_controls] manual export를 다시 실행하고 배열 항목에 줄바꿈이나 NUL을 넣지 마세요
     [rerun_export_then_fill] manual export를 다시 실행한 뒤 번역을 입력하세요
+    [resolve_temporary_then_rerun_export] 표시된 고정 임시 경로를 확인하고 남은 객체가 있으면 제거한 다음 manual export를 다시 실행하세요
     [keep_exported_type] manual export가 기록한 type을 유지하세요
    *[other] __ATT_FALLBACK__
 }

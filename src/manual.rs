@@ -11,6 +11,7 @@ use std::sync::Arc;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
+use crate::diagnostic::IoFailure;
 use crate::execution::CooperativeCancellation;
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::generic::{
@@ -36,6 +37,7 @@ use crate::rpg_maker::translate::semantics::{
     PreparedTranslationStatus, ResolvedTranslationSemantics,
 };
 use crate::translation::planning_resource::CompiledTerminology;
+use crate::user_text::sanitize_user_text;
 
 const MANUAL_SQLITE_CANCELLATION_CHECK_OPERATIONS: i32 = 1_000;
 
@@ -274,6 +276,11 @@ pub(crate) enum ManualDocumentError {
         path: PathBuf,
         source: io::Error,
     },
+    TemporaryCleanup {
+        operation: Box<ManualDocumentError>,
+        temporary: PathBuf,
+        cleanup: io::Error,
+    },
 }
 
 impl fmt::Display for ManualDocumentError {
@@ -289,6 +296,15 @@ impl fmt::Display for ManualDocumentError {
             }
             Self::Encode(_) => formatter.write_str("无法生成人工译文 TOML"),
             Self::Write { path, .. } => write!(formatter, "无法写入 {}", path.display()),
+            Self::TemporaryCleanup {
+                operation,
+                temporary,
+                cleanup,
+            } => write!(
+                formatter,
+                "{operation}；清理人工译文临时文件 {} 失败：{cleanup}",
+                temporary.display()
+            ),
         }
     }
 }
@@ -299,6 +315,7 @@ impl Error for ManualDocumentError {
             Self::Read { source, .. } | Self::Write { source, .. } => Some(source),
             Self::InvalidToml { source, .. } => Some(source),
             Self::Encode(source) => Some(source),
+            Self::TemporaryCleanup { operation, .. } => Some(operation.as_ref()),
             Self::Cancelled | Self::InvalidUtf8 { .. } => None,
         }
     }
@@ -542,10 +559,27 @@ fn atomic_replace(
             source,
         })
     })();
-    if write.is_err() && owns_temporary {
-        let _ = fs::remove_file(&temporary);
+    match write {
+        Err(operation) if owns_temporary => {
+            Err(cleanup_manual_temporary_after_failure(temporary, operation))
+        }
+        result => result,
     }
-    write
+}
+
+fn cleanup_manual_temporary_after_failure(
+    temporary: PathBuf,
+    operation: ManualDocumentError,
+) -> ManualDocumentError {
+    match fs::remove_file(&temporary) {
+        Ok(()) => operation,
+        Err(cleanup) if cleanup.kind() == io::ErrorKind::NotFound => operation,
+        Err(cleanup) => ManualDocumentError::TemporaryCleanup {
+            operation: Box::new(operation),
+            temporary,
+            cleanup,
+        },
+    }
 }
 
 #[cfg(windows)]
@@ -937,9 +971,16 @@ impl ManualCommandError {
 
 fn manual_command_database_error(
     source: ManualDatabaseError,
-    cancellation: &CooperativeCancellation,
+    _cancellation: &CooperativeCancellation,
 ) -> ManualCommandError {
-    if cancellation.is_requested() || matches!(source, ManualDatabaseError::Cancelled) {
+    let cancelled = matches!(&source, ManualDatabaseError::Cancelled)
+        || matches!(
+            &source,
+            ManualDatabaseError::Sqlite(source)
+                if source.sqlite_error_code()
+                    == Some(rusqlite::ErrorCode::OperationInterrupted)
+        );
+    if cancelled {
         ManualCommandError::Cancelled
     } else {
         ManualCommandError::Database(source)
@@ -1014,13 +1055,10 @@ pub(crate) fn render_manual_command_error(
                 localizer.format(UiMessage::ManualChecked {
                     valid: 0,
                     unfilled: 0,
-                    errors: 1,
+                    errors: manual_count(manual_document_issue_count(source)),
                 })
             )?;
-            let (object, reason_code, help_code) = manual_document_issue(source);
-            let reason = render_manual_value(localizer, reason_code, 0, 0, 0);
-            let help = render_manual_value(localizer, help_code, 0, 0, 0);
-            render_manual_issue(&object, &reason, &help, localizer, stderr)
+            render_manual_document_issues(source, localizer, stderr)
         }
         ManualCommandError::Database(source) => {
             writeln!(
@@ -1038,6 +1076,73 @@ pub(crate) fn render_manual_command_error(
             render_manual_issue("project.db", &reason, &help, localizer, stderr)
         }
     }
+}
+
+fn manual_document_issue_count(source: &ManualDocumentError) -> usize {
+    match source {
+        ManualDocumentError::TemporaryCleanup { operation, .. } => {
+            manual_document_issue_count(operation).saturating_add(1)
+        }
+        ManualDocumentError::Cancelled
+        | ManualDocumentError::Read { .. }
+        | ManualDocumentError::InvalidUtf8 { .. }
+        | ManualDocumentError::InvalidToml { .. }
+        | ManualDocumentError::Encode(_)
+        | ManualDocumentError::Write { .. } => 1,
+    }
+}
+
+fn render_manual_document_issues(
+    source: &ManualDocumentError,
+    localizer: &UiLocalizer,
+    stderr: &mut dyn Write,
+) -> io::Result<()> {
+    if let ManualDocumentError::TemporaryCleanup {
+        operation,
+        temporary,
+        cleanup,
+    } = source
+    {
+        render_manual_document_issues(operation, localizer, stderr)?;
+        let reason = manual_temporary_cleanup_reason(cleanup, localizer);
+        let help = render_manual_value(localizer, "resolve_temporary_then_rerun_export", 0, 0, 0);
+        return render_manual_issue(
+            &temporary.display().to_string(),
+            &reason,
+            &help,
+            localizer,
+            stderr,
+        );
+    }
+
+    let (object, reason_code, help_code) = manual_document_issue(source);
+    let reason = render_manual_value(localizer, reason_code, 0, 0, 0);
+    let help = render_manual_value(localizer, help_code, 0, 0, 0);
+    render_manual_issue(&object, &reason, &help, localizer, stderr)
+}
+
+fn manual_temporary_cleanup_reason(cleanup: &io::Error, localizer: &UiLocalizer) -> String {
+    let failure = IoFailure::from_error(cleanup);
+    let summary = localizer.format(UiMessage::DiagnosticFailureValue {
+        code: failure.summary_code(),
+    });
+    let Some(message) = manual_cleanup_system_message(cleanup) else {
+        return summary;
+    };
+    format!("{summary} ({message})")
+}
+
+fn manual_cleanup_system_message(cleanup: &io::Error) -> Option<String> {
+    let sanitized = sanitize_user_text(&cleanup.to_string());
+    let mut message = sanitized.trim();
+    if let Some(prefix) = message.strip_suffix(')')
+        && let Some((text, code)) = prefix.rsplit_once(" (os error ")
+        && !code.is_empty()
+        && code.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        message = text.trim_end();
+    }
+    (!message.is_empty()).then(|| message.to_owned())
 }
 
 fn render_manual_issue(
@@ -1128,6 +1233,7 @@ fn render_manual_value(
         | "rerun_export"
         | "rerun_export_without_controls"
         | "rerun_export_then_fill"
+        | "resolve_temporary_then_rerun_export"
         | "keep_exported_type" => localizer.format(UiMessage::ManualValue {
             code,
             line,
@@ -1196,6 +1302,7 @@ fn manual_document_issue(source: &ManualDocumentError) -> (String, &'static str,
             "document_write",
             "check_write_access",
         ),
+        ManualDocumentError::TemporaryCleanup { operation, .. } => manual_document_issue(operation),
     }
 }
 
@@ -2579,6 +2686,68 @@ mod tests {
     }
 
     #[test]
+    fn export_preserves_the_primary_failure_when_temporary_cleanup_also_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let temporary = directory.path().join(".manual.toml.tmp");
+        fs::create_dir(&temporary).unwrap();
+
+        let source = cleanup_manual_temporary_after_failure(
+            temporary.clone(),
+            ManualDocumentError::Cancelled,
+        );
+
+        let localizer = UiLocalizer::new(crate::i18n::UiLocale::SimplifiedChinese);
+        let expected_cleanup_reason = match &source {
+            ManualDocumentError::TemporaryCleanup {
+                operation,
+                temporary: actual,
+                cleanup,
+            } => {
+                assert!(matches!(operation.as_ref(), ManualDocumentError::Cancelled));
+                assert_eq!(actual, &temporary);
+                manual_temporary_cleanup_reason(cleanup, &localizer)
+            }
+            other => panic!("应保留主取消与临时文件清理失败，实际为 {other:?}"),
+        };
+        let generic_cleanup_reason = localizer.format(UiMessage::DiagnosticFailureValue {
+            code: "operation_failed",
+        });
+        assert!(expected_cleanup_reason.starts_with(&generic_cleanup_reason));
+        assert_ne!(expected_cleanup_reason, generic_cleanup_reason);
+
+        let error = ManualCommandError::from_document(source);
+        assert!(!error.is_cancelled(), "清理失败不得报告为干净取消");
+        let mut stderr = Vec::new();
+        render_manual_command_error(&error, &localizer, &mut stderr).unwrap();
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.contains(".manual.toml.tmp"));
+        assert!(
+            stderr.contains(
+                &localizer.format(UiMessage::DiagnosticFailureValue { code: "cancelled" })
+            )
+        );
+        assert!(stderr.contains(&expected_cleanup_reason));
+        assert!(stderr.contains(&render_manual_value(
+            &localizer,
+            "resolve_temporary_then_rerun_export",
+            0,
+            0,
+            0,
+        )));
+    }
+
+    #[test]
+    fn missing_temporary_after_failure_counts_as_successful_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let temporary = directory.path().join(".manual.toml.tmp");
+
+        let source =
+            cleanup_manual_temporary_after_failure(temporary, ManualDocumentError::Cancelled);
+
+        assert!(matches!(source, ManualDocumentError::Cancelled));
+    }
+
+    #[test]
     fn requested_cancellation_stops_apply_before_the_callback() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("manual.toml");
@@ -2629,9 +2798,28 @@ mod tests {
             source.sqlite_error_code(),
             Some(rusqlite::ErrorCode::OperationInterrupted)
         );
+        let running = CooperativeCancellation::default();
         assert!(matches!(
-            manual_command_database_error(ManualDatabaseError::Sqlite(source), &cancellation),
+            manual_command_database_error(ManualDatabaseError::Sqlite(source), &running),
             ManualCommandError::Cancelled
+        ));
+    }
+
+    #[test]
+    fn requested_cancellation_does_not_hide_an_unrelated_database_failure() {
+        let cancellation = CooperativeCancellation::default();
+        cancellation.request();
+
+        let error = manual_command_database_error(
+            ManualDatabaseError::Sqlite(rusqlite::Error::QueryReturnedNoRows),
+            &cancellation,
+        );
+
+        assert!(matches!(
+            error,
+            ManualCommandError::Database(ManualDatabaseError::Sqlite(
+                rusqlite::Error::QueryReturnedNoRows
+            ))
         ));
     }
 

@@ -17,7 +17,7 @@ use crate::translation::planning_resource::TerminologyEntry;
 use super::{
     ProjectLuaCallError, ProjectLuaEngineAdapter, ProjectLuaOutdatedTranslation,
     ProjectLuaTerminologyEntry, ProjectLuaTranslationContext, ProjectLuaTranslationFilter,
-    ProjectLuaTranslationRecord, ProjectLuaTranslationStatus,
+    ProjectLuaTranslationRecord, ProjectLuaTranslationStatus, rollback_translation_api_savepoint,
 };
 
 pub(crate) fn generic_project_lua_adapter_for_name(
@@ -260,20 +260,22 @@ fn with_savepoint<T>(
     match operation() {
         Ok(value) => {
             if let Err(error) = cancellation.ensure_running() {
-                let _ = connection
-                    .execute_batch("ROLLBACK TO att_translation_api; RELEASE att_translation_api");
-                return Err(error);
+                return Err(rollback_translation_api_savepoint(
+                    connection,
+                    crate::diagnostic::LuaEngine::Generic,
+                    error,
+                ));
             }
             connection
                 .execute_batch("RELEASE att_translation_api")
                 .map_err(sqlite_error)?;
             Ok(value)
         }
-        Err(error) => {
-            let _ = connection
-                .execute_batch("ROLLBACK TO att_translation_api; RELEASE att_translation_api");
-            Err(error)
-        }
+        Err(error) => Err(rollback_translation_api_savepoint(
+            connection,
+            crate::diagnostic::LuaEngine::Generic,
+            error,
+        )),
     }
 }
 
@@ -340,6 +342,61 @@ mod tests {
                     .get::<_, i64>(0))
                 .expect("应读取回滚结果"),
             0
+        );
+    }
+
+    #[test]
+    fn release_cleanup_failure_preserves_primary_error_and_related_diagnostic() {
+        let connection = Connection::open_in_memory().expect("应建立测试数据库");
+        connection
+            .authorizer(Some(|context: rusqlite::hooks::AuthContext<'_>| {
+                if matches!(
+                    context.action,
+                    rusqlite::hooks::AuthAction::Savepoint {
+                        operation: rusqlite::hooks::TransactionOperation::Release,
+                        savepoint_name: "att_translation_api",
+                    }
+                ) {
+                    rusqlite::hooks::Authorization::Deny
+                } else {
+                    rusqlite::hooks::Authorization::Allow
+                }
+            }))
+            .expect("应安装 RELEASE 故障注入");
+        let cancellation = super::super::ProjectLuaCancellation::default();
+
+        let failure = with_savepoint(&connection, &cancellation, || {
+            Err::<(), _>(
+                invalid_translation()
+                    .with_operation(crate::diagnostic::LuaOperation::SetTranslation),
+            )
+        })
+        .expect_err("主错误后的 RELEASE 失败必须一并返回");
+
+        assert_eq!(failure.kind(), "cleanup_failed");
+        assert_eq!(failure.message(), "Lua 调用失败，且保存点清理失败");
+        assert_eq!(failure.cleanup_failures.len(), 1);
+        assert!(matches!(
+            &failure.issue,
+            super::super::ProjectLuaCallIssue::Violation(
+                crate::diagnostic::LuaValueViolation::InvalidTranslation
+            )
+        ));
+        let report = super::super::host_failure_report(
+            &failure,
+            std::path::Path::new("project.db"),
+            crate::diagnostic::StateEffect::ProgressPreserved,
+            crate::diagnostic::SqliteTransactionState::Active,
+        );
+        assert_eq!(report.primary().code(), "lua.host_call");
+        assert_eq!(report.related().len(), 1);
+        assert_eq!(
+            report.related()[0].relation(),
+            crate::diagnostic::RelatedFailureRelation::Cleanup
+        );
+        assert_eq!(
+            report.related()[0].report().primary().code(),
+            "sqlite.driver"
         );
     }
 }

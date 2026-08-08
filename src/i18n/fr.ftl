@@ -314,6 +314,7 @@ manual-value = { $code ->
     [rerun_export] Relancez manual export
     [rerun_export_without_controls] Relancez manual export sans ajouter de saut de ligne ni NUL dans les éléments du tableau
     [rerun_export_then_fill] Relancez manual export, puis renseignez la traduction
+    [resolve_temporary_then_rerun_export] Corrigez le chemin temporaire fixe affiché, supprimez tout objet résiduel, puis relancez manual export
     [keep_exported_type] Conservez le type écrit par manual export
    *[other] __ATT_FALLBACK__
 }
