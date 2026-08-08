@@ -18,6 +18,7 @@ ATT 因此把两类职责分开：程序负责可重复执行的数据处理和�
 
 - 从 RPG Maker 数据库、地图事件和明确指定的插件参数中提取可翻译文本；
 - 通过 Generic JSONL 接收其他引擎或自定义工具整理出的文本；
+- 使用随包 Formic 从完整游戏语料分片发现术语候选，再由 Agent 统一纠错、去重和定译；
 - 按语境组织任务、消除重复，并调用兼容 OpenAI Chat Completions 的模型服务；
 - 保护控制符和 Placeholder，统一应用术语表，并检查不允许的源语言残留；
 - 持久保存翻译进度，中断后从已确认的结果继续；
@@ -32,7 +33,7 @@ ATT 不替代游戏调查和最终验收。非标准插件数据、图片文字�
 
 从 [GitHub Releases](https://github.com/yexi-by/att/releases/latest) 下载 Windows x64
 发行包和 `SHA256SUMS.txt`，核对 SHA-256 后完整解压到可写目录。不要只复制 `att.exe`，
-运行时还需要同目录的配置、文档、Prompt 和 Skill。
+运行时还需要同目录的配置、文档、Prompt、Skill 和工具。
 
 打开 `config.toml`，填写模型服务：
 
@@ -42,6 +43,11 @@ url = "https://api.example.com/v1/chat/completions"
 api_key = "replace-with-api-key"
 model = "replace-with-model-id"
 ```
+
+需要从完整游戏语料制作术语表时，再按
+[Formic 术语表指南](docs/guides/formic-terminology.md)配置 `tools/formic/config.toml` 和所需
+环境变量。Formic 使用独立的模型配置，不读取 ATT 的 `config.toml`，也不复用当前 Agent
+会话。
 
 ### 2. 把翻译目标交给 Agent
 
@@ -55,9 +61,12 @@ model = "replace-with-model-id"
 <目标语言>。
 
 先调查真实文本范围，再建立项目；根据游戏实际数据制作 Rules、对话姓名规则、Placeholder
-和术语表，不要猜测未确认的字段或协议。使用 ATT 的正式流程完成提取、翻译、写回和验收，
-不要修改原游戏目录。遇到无法由现行文档和生产命令确认的情况时停止，并说明具体对象、原因
-和需要我决定的事项。最后报告译后目录、验收结果和仍未覆盖的内容。
+和术语表。制作术语表时读取
+<ATT目录>\skills\extract-game-terminology\SKILL.md，用随包 Formic 从完整语料分片发现候选，
+全部单元完成后再统一纠错、去重和导出。不要猜测未确认的字段或协议。使用 ATT 的正式流程
+完成提取、翻译、写回和验收，不要修改原游戏目录。遇到无法由现行文档和生产命令确认的情况
+时停止，并说明具体对象、原因和需要我决定的事项。最后报告译后目录、验收结果和仍未覆盖的
+内容。
 ```
 
 ### 3. 检查结果
