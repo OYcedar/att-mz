@@ -336,7 +336,6 @@ task-record-custom-parameters-heading = 自訂參數
 task-record-attempts-heading = 請求過程
 task-record-final-result-heading = 最終結果
 task-record-no-request = 沒有形成可傳送的模型請求。
-task-record-empty-assistant = 模型傳回了空物件。
 task-record-parse-error = 解析錯誤：{ $kind ->
     [thinking_empty] 模型回應的思考內容為空，第 { $line } 行、第 { $column } 欄
    *[json] 模型回應 JSON 無效（類別 `{ $category }`），第 { $line } 行、第 { $column } 欄

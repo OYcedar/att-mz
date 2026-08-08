@@ -26,7 +26,7 @@ use crate::runtime::filesystem::{
     SystemFileSystem, SystemFileSystemError, TerminalObservationOperation,
 };
 use crate::runtime::windows::WindowsFsError;
-use crate::translation_protocol::TranslationResponseRepair;
+use crate::translation_protocol::{TranslationResponseRepair, translation_response_json_body};
 use crate::windows_path::WindowsOrdinalCaseKeyError;
 
 pub(crate) trait TaskRecordDiagnosticRecorder: Send + Sync {
@@ -707,18 +707,6 @@ fn render_diagnostic_reason(
     output.push_str(&markdown_fence(&reason, "text"));
 }
 
-pub(crate) fn markdown_heading_id(id: &str) -> String {
-    if !id.is_empty()
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-    {
-        id.to_owned()
-    } else {
-        markdown_inline_code(id)
-    }
-}
-
 pub(crate) fn markdown_inline_code(value: &str) -> String {
     let encoded;
     let value = if value.chars().any(char::is_control)
@@ -765,34 +753,107 @@ pub(crate) fn markdown_fence(content: &str, language: &str) -> String {
     output
 }
 
-/// 把 Chat Completions 的 `message.content` 投影成可安全嵌入任务记录的证据。
+/// 把 Chat Completions 的 `message.content` 投影成任务记录中唯一的 Assistant 正文。
 ///
-/// 这里只执行现行敏感信息规则要求的文本与 JSON 字符串替换，并动态选择 Markdown
-/// 围栏长度；调用方不能把结果解释为供应商响应或未经修改的字节副本。
-pub(crate) fn render_raw_assistant(
+/// 严格合法的响应按现行模型协议移除外层 `json` 围栏，再只规范化 JSON 空白；字段
+/// 顺序、重复键、数值表示、字符串转义和值保持不变。修复过、无效或尚未处理的响应
+/// 作为普通文本保存，避免围栏暗示正文自身是合法 JSON。
+pub(crate) fn render_readable_assistant(
     raw_assistant: &str,
+    strict_json: bool,
     api_key_redactor: &ApiKeyRedactor,
 ) -> String {
-    render_raw_assistant_with_language(raw_assistant, api_key_redactor, "json")
+    let body = if strict_json {
+        translation_response_json_body(raw_assistant)
+    } else {
+        raw_assistant
+    };
+    if strict_json {
+        let redacted = api_key_redactor.redact_valid_json(body);
+        markdown_fence(&pretty_json_preserving_tokens(&redacted), "json")
+    } else {
+        let redacted = api_key_redactor.redact_text_with_json_strings(body);
+        markdown_fence(&redacted, "text")
+    }
 }
 
-/// 把经过 JSON 修复的原始 Assistant 作为普通文本保存，避免围栏暗示正文自身是合法 JSON。
-pub(crate) fn render_repaired_raw_assistant(
-    raw_assistant: &str,
-    api_key_redactor: &ApiKeyRedactor,
-) -> String {
-    render_raw_assistant_with_language(raw_assistant, api_key_redactor, "text")
+/// 只重排已经由模型协议证明合法的 JSON 空白，不建立会丢失重复键或原始数值的值树。
+fn pretty_json_preserving_tokens(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut expanded_containers = Vec::new();
+    let mut depth = 0_usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut index = 0_usize;
+
+    while let Some(&byte) = bytes.get(index) {
+        if in_string {
+            output.push(byte);
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+
+        match byte {
+            b'"' => {
+                in_string = true;
+                output.push(byte);
+            }
+            b'{' | b'[' => {
+                output.push(byte);
+                let closing = if byte == b'{' { b'}' } else { b']' };
+                let mut next = index + 1;
+                while bytes
+                    .get(next)
+                    .is_some_and(|byte| matches!(*byte, b' ' | b'\t' | b'\r' | b'\n'))
+                {
+                    next += 1;
+                }
+                let expanded = bytes.get(next) != Some(&closing);
+                expanded_containers.push(expanded);
+                if expanded {
+                    depth += 1;
+                    output.push(b'\n');
+                    push_json_indent(&mut output, depth);
+                }
+            }
+            b'}' | b']' => {
+                if expanded_containers.pop().unwrap_or(false) {
+                    depth = depth.saturating_sub(1);
+                    output.push(b'\n');
+                    push_json_indent(&mut output, depth);
+                }
+                output.push(byte);
+            }
+            b',' => {
+                output.push(byte);
+                output.push(b'\n');
+                push_json_indent(&mut output, depth);
+            }
+            b':' => {
+                output.extend_from_slice(b": ");
+            }
+            b' ' | b'\t' | b'\r' | b'\n' => {}
+            _ => output.push(byte),
+        }
+        index += 1;
+    }
+
+    String::from_utf8(output).expect("合法 JSON 的空白重排必须保持 UTF-8")
 }
 
-fn render_raw_assistant_with_language(
-    raw_assistant: &str,
-    api_key_redactor: &ApiKeyRedactor,
-    language: &str,
-) -> String {
-    markdown_fence(
-        &api_key_redactor.redact_text_with_json_strings(raw_assistant),
-        language,
-    )
+fn push_json_indent(output: &mut Vec<u8>, depth: usize) {
+    output.reserve(depth.saturating_mul(2));
+    for _ in 0..depth {
+        output.extend_from_slice(b"  ");
+    }
 }
 
 /// 渲染两个引擎共同使用的 JSON 修复事实，不复制 Assistant 正文。
@@ -890,6 +951,76 @@ mod tests {
             Map::new(),
             ApiKeyRedactor::new(SecretString::from("unused-key")),
         )
+    }
+
+    #[test]
+    fn strict_assistant_json_is_pretty_without_losing_duplicate_keys_or_tokens() {
+        const API_KEY: &str = "quote\"slash\\value";
+        let encoded_key = serde_json::to_string(API_KEY).expect("API key 应可编码为 JSON");
+        let encoded_fragment = &encoded_key[1..encoded_key.len() - 1];
+        let raw = format!(
+            " \n```json\n{{\"0\":[\"before-{encoded_fragment}-after\"],\"0\":[],\"number\":1e+02,\"escaped\":\"\\u4e2d\"}}\n```\n"
+        );
+        let redactor = ApiKeyRedactor::new(SecretString::from(API_KEY));
+
+        let rendered = render_readable_assistant(&raw, true, &redactor);
+
+        assert_eq!(
+            rendered,
+            concat!(
+                "```json\n",
+                "{\n",
+                "  \"0\": [\n",
+                "    \"before-[REDACTED API KEY]-after\"\n",
+                "  ],\n",
+                "  \"0\": [],\n",
+                "  \"number\": 1e+02,\n",
+                "  \"escaped\": \"\\u4e2d\"\n",
+                "}\n",
+                "```\n",
+            )
+        );
+    }
+
+    #[test]
+    fn repaired_or_unprocessed_assistant_keeps_its_text_shell_and_dynamic_fence() {
+        const API_KEY: &str = "quote\"slash\\value";
+        let encoded_key = serde_json::to_string(API_KEY).expect("API key 应可编码为 JSON");
+        let encoded_fragment = &encoded_key[1..encoded_key.len() - 1];
+        let raw = format!("prefix ``` {{\"value\":\"{encoded_fragment}\"}} trailing {{");
+        let redactor = ApiKeyRedactor::new(SecretString::from(API_KEY));
+
+        let rendered = render_readable_assistant(&raw, false, &redactor);
+
+        assert_eq!(
+            rendered,
+            "````text\nprefix ``` {\"value\":\"[REDACTED API KEY]\"} trailing {\n````\n"
+        );
+    }
+
+    #[test]
+    fn strict_assistant_redaction_never_rewrites_non_string_json_scalars() {
+        let redactor = ApiKeyRedactor::new(SecretString::from("1"));
+
+        let rendered = render_readable_assistant(
+            r#"{"string":"1","number":1,"exponent":1e10,"boolean":true}"#,
+            true,
+            &redactor,
+        );
+
+        assert_eq!(
+            rendered,
+            concat!(
+                "```json\n",
+                "{\n",
+                "  \"string\": \"[REDACTED API KEY]\",\n",
+                "  \"number\": 1,\n",
+                "  \"exponent\": 1e10,\n",
+                "  \"boolean\": true\n",
+                "}\n",
+                "```\n",
+            )
+        );
     }
 
     fn cpu(worker_threads: usize) -> RayonCpuExecutor {

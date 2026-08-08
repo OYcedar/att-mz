@@ -350,7 +350,6 @@ task-record-custom-parameters-heading = المعلمات المخصصة
 task-record-attempts-heading = محاولات الطلب
 task-record-final-result-heading = النتيجة النهائية
 task-record-no-request = لم يتكوّن طلب نموذج جاهز للإرسال.
-task-record-empty-assistant = أعاد النموذج كائنًا فارغًا.
 task-record-parse-error = خطأ في التحليل: { $kind ->
     [thinking_empty] محتوى التفكير فارغ، السطر { $line }، العمود { $column }
    *[json] JSON استجابة النموذج غير صالح (الفئة `{ $category }`)، السطر { $line }، العمود { $column }

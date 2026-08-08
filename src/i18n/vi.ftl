@@ -336,7 +336,6 @@ task-record-custom-parameters-heading = Tham số tùy chỉnh
 task-record-attempts-heading = Các lần gửi yêu cầu
 task-record-final-result-heading = Kết quả cuối
 task-record-no-request = Không tạo được yêu cầu mô hình sẵn sàng để gửi.
-task-record-empty-assistant = Mô hình trả về một đối tượng rỗng.
 task-record-parse-error = Lỗi phân tích: { $kind ->
     [thinking_empty] nội dung suy luận trống, dòng { $line }, cột { $column }
    *[json] JSON phản hồi của mô hình không hợp lệ (loại `{ $category }`), dòng { $line }, cột { $column }

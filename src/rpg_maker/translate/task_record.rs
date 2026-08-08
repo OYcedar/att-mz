@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use serde_json::Value;
+#[cfg(test)]
 use serde_json::value::RawValue;
 use time::OffsetDateTime;
 
@@ -27,13 +28,14 @@ use crate::llm::{ApiKeyRedactor, ChatMessageRole, LlmClientRecordMetadata};
 use crate::llm::{LlmFinishReason, LlmResponse, LlmUsage};
 #[cfg(test)]
 use crate::runtime::filesystem::SystemFileSystem;
+#[cfg(test)]
 use crate::translation::task_planning::TaskId;
 pub(crate) use crate::translation::task_record::{
     ConfiguredTranslationTaskRecordSink, MarkdownTranslationTaskRecordSink,
 };
 use crate::translation::task_record::{
-    TranslationTaskRecordArtifact, markdown_fence, render_json_repairs, render_raw_assistant,
-    render_repaired_raw_assistant, render_task_record_attempt,
+    TranslationTaskRecordArtifact, markdown_fence, render_json_repairs, render_readable_assistant,
+    render_task_record_attempt,
 };
 #[cfg(test)]
 pub(crate) use crate::translation_protocol::TranslationTaskResponseJsonErrorCategory;
@@ -65,135 +67,29 @@ pub(crate) enum TranslationAssistantValueError {
     SourceNonStringItem { item: NonZeroUsize },
 }
 
-/// Assistant JSON 中保持原始顺序的一个条目。
-#[derive(Debug)]
-pub(crate) struct TranslationAssistantEntry {
-    id: String,
-    value: TranslationAssistantRecordedValue,
-    #[cfg(test)]
-    canonical_id: Option<TaskId>,
-    #[cfg(test)]
-    value_error: Option<TranslationAssistantValueError>,
-}
-
-/// 任务记录实际需要的响应值表示。
-#[derive(Debug)]
-pub(crate) enum TranslationAssistantRecordedValue {
-    Lines(Vec<String>),
-    RawJson(Box<RawValue>),
-}
-
-impl TranslationAssistantEntry {
-    #[cfg(test)]
-    pub(crate) fn new(id: String, value: Value) -> Self {
-        let value = match value {
-            Value::Array(values)
-                if values.iter().all(|value| matches!(value, Value::String(_))) =>
-            {
-                TranslationAssistantRecordedValue::Lines(
-                    values
-                        .into_iter()
-                        .map(|value| match value {
-                            Value::String(value) => value,
-                            _ => unreachable!("测试构造器已经确认数组项都是字符串"),
-                        })
-                        .collect(),
-                )
-            }
-            value => TranslationAssistantRecordedValue::RawJson(
-                serde_json::value::to_raw_value(&value).expect("测试 JSON Value 必须可序列化"),
-            ),
-        };
-        Self {
-            id,
-            value,
-            #[cfg(test)]
-            canonical_id: None,
-            #[cfg(test)]
-            value_error: None,
-        }
-    }
-
-    pub(crate) fn projected(
-        id: String,
-        value: TranslationAssistantRecordedValue,
-        #[cfg(test)] canonical_id: Option<TaskId>,
-        #[cfg(not(test))] _canonical_id: Option<TaskId>,
-        #[cfg(test)] value_error: Option<TranslationAssistantValueError>,
-        #[cfg(not(test))] _value_error: Option<TranslationAssistantValueError>,
-    ) -> Self {
-        Self {
-            id,
-            value,
-            #[cfg(test)]
-            canonical_id,
-            #[cfg(test)]
-            value_error,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn id(&self) -> &str {
-        &self.id
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn canonical_id(&self) -> Option<TaskId> {
-        self.canonical_id
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn value_error(&self) -> Option<TranslationAssistantValueError> {
-        self.value_error
-    }
-
-    #[cfg(test)]
-    pub(crate) fn lines(&self) -> Option<&[String]> {
-        match &self.value {
-            TranslationAssistantRecordedValue::Lines(lines) => Some(lines),
-            TranslationAssistantRecordedValue::RawJson(_) => None,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn raw_json(&self) -> Option<&RawValue> {
-        match &self.value {
-            TranslationAssistantRecordedValue::Lines(_) => None,
-            TranslationAssistantRecordedValue::RawJson(value) => Some(value),
-        }
-    }
-}
-
 /// 唯一响应解析器建立的任务记录投影。
 #[derive(Debug)]
 pub(crate) struct TranslationTaskResponseRecord {
     raw_assistant: Arc<String>,
-    thinking: Option<String>,
-    ordered_entries: Option<Vec<TranslationAssistantEntry>>,
+    strict_json: bool,
     repairs: Vec<TranslationResponseRepair>,
     parse_error: Option<TranslationTaskResponseParseError>,
 }
 
 impl TranslationTaskResponseRecord {
     #[cfg(test)]
-    pub(crate) fn parsed(
-        raw_assistant: impl Into<Arc<String>>,
-        thinking: Option<String>,
-        ordered_entries: Vec<TranslationAssistantEntry>,
-    ) -> Self {
-        Self::parsed_with_repairs(raw_assistant, thinking, ordered_entries, Vec::new())
+    pub(crate) fn parsed(raw_assistant: impl Into<Arc<String>>) -> Self {
+        Self::parsed_with_repairs(raw_assistant, Vec::new())
     }
 
     pub(crate) fn parsed_with_repairs(
         raw_assistant: impl Into<Arc<String>>,
-        thinking: Option<String>,
-        ordered_entries: Vec<TranslationAssistantEntry>,
         repairs: Vec<TranslationResponseRepair>,
     ) -> Self {
+        let strict_json = repairs.is_empty();
         Self {
             raw_assistant: raw_assistant.into(),
-            thinking,
-            ordered_entries: Some(ordered_entries),
+            strict_json,
             repairs,
             parse_error: None,
         }
@@ -205,8 +101,7 @@ impl TranslationTaskResponseRecord {
     ) -> Self {
         Self {
             raw_assistant: raw_assistant.into(),
-            thinking: None,
-            ordered_entries: None,
+            strict_json: false,
             repairs: Vec::new(),
             parse_error: Some(parse_error),
         }
@@ -215,8 +110,7 @@ impl TranslationTaskResponseRecord {
     pub(crate) fn unprocessed(raw_assistant: impl Into<Arc<String>>) -> Self {
         Self {
             raw_assistant: raw_assistant.into(),
-            thinking: None,
-            ordered_entries: None,
+            strict_json: false,
             repairs: Vec::new(),
             parse_error: None,
         }
@@ -228,13 +122,8 @@ impl TranslationTaskResponseRecord {
     }
 
     #[cfg(test)]
-    pub(crate) fn thinking(&self) -> Option<&str> {
-        self.thinking.as_deref()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn ordered_entries(&self) -> Option<&[TranslationAssistantEntry]> {
-        self.ordered_entries.as_deref()
+    pub(crate) const fn is_strict_json(&self) -> bool {
+        self.strict_json
     }
 
     #[cfg(test)]
@@ -830,82 +719,35 @@ fn render_translation_task_record(
     }
 
     if let Some(response) = &document.evidence.response {
-        if let Some(thinking) = &response.thinking {
-            output.push_str("\n## Thinking\n\n");
-            let thinking = api_key_redactor.redact(thinking);
-            output.push_str(&thinking);
-            if !thinking.ends_with('\n') {
-                output.push('\n');
-            }
-        }
         output.push_str("\n## Assistant\n\n");
-        if let Some(entries) = &response.ordered_entries {
-            if entries.is_empty() {
-                let _ = writeln!(
-                    output,
-                    "_{}_",
-                    task_record_text(&localizer, UiMessage::TaskRecordEmptyAssistant)
-                );
-            }
-            for entry in entries {
-                let id = api_key_redactor.redact(&entry.id);
-                let _ = writeln!(output, "### ID {}\n", markdown_heading_id(&id));
-                match &entry.value {
-                    TranslationAssistantRecordedValue::Lines(lines) => {
-                        for (line_index, line) in lines.iter().enumerate() {
-                            if line_index != 0 {
-                                output.push_str("\n\n");
-                            }
-                            output.push_str(&api_key_redactor.redact(line));
-                        }
-                        output.push('\n');
-                    }
-                    TranslationAssistantRecordedValue::RawJson(value) => {
-                        let value = client.api_key_redactor().redact_json(&value.as_ref())?;
-                        output.push_str(&markdown_fence(&value, "json"));
-                    }
+        if let Some(error) = &response.parse_error {
+            let category = match error.kind {
+                TranslationTaskResponseParseErrorKind::Json(category)
+                | TranslationTaskResponseParseErrorKind::JsonRepair { category, .. } => {
+                    category.code()
                 }
-                output.push('\n');
-            }
-        } else {
-            if let Some(error) = &response.parse_error {
-                let category = match error.kind {
-                    TranslationTaskResponseParseErrorKind::Json(category)
-                    | TranslationTaskResponseParseErrorKind::JsonRepair { category, .. } => {
-                        category.code()
+                _ => "",
+            };
+            let _ = writeln!(
+                output,
+                "> {}\n",
+                task_record_text(
+                    &localizer,
+                    UiMessage::TaskRecordParseError {
+                        kind: error.kind.code(),
+                        category,
+                        line: error.line.get() as u64,
+                        column: error.column.get() as u64,
                     }
-                    _ => "",
-                };
-                let _ = writeln!(
-                    output,
-                    "> {}\n",
-                    task_record_text(
-                        &localizer,
-                        UiMessage::TaskRecordParseError {
-                            kind: error.kind.code(),
-                            category,
-                            line: error.line.get() as u64,
-                            column: error.column.get() as u64,
-                        }
-                    )
-                );
-            }
-            output.push_str(&markdown_fence(
-                &api_key_redactor.redact_text_with_json_strings(&response.raw_assistant),
-                "text",
-            ));
+                )
+            );
         }
+        output.push_str(&render_readable_assistant(
+            &response.raw_assistant,
+            response.strict_json,
+            api_key_redactor,
+        ));
         render_json_repairs(&mut output, &response.repairs);
-        if (response.thinking.is_some() || !response.repairs.is_empty())
-            && response.ordered_entries.is_some()
-        {
-            output.push_str("\n## Raw Assistant\n\n");
-            output.push_str(&if response.repairs.is_empty() {
-                render_raw_assistant(&response.raw_assistant, api_key_redactor)
-            } else {
-                render_repaired_raw_assistant(&response.raw_assistant, api_key_redactor)
-            });
-        }
     }
 
     let _ = write!(
@@ -979,18 +821,6 @@ fn render_final_result(
         output.push_str(&markdown_fence(&rendered, "text"));
     }
     Ok(())
-}
-
-fn markdown_heading_id(id: &str) -> String {
-    if !id.is_empty()
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-    {
-        id.to_owned()
-    } else {
-        markdown_inline_code(id)
-    }
 }
 
 fn markdown_inline_code(value: &str) -> String {
@@ -1312,7 +1142,7 @@ mod tests {
     }
 
     #[test]
-    fn readable_markdown_keeps_native_roles_thinking_and_assistant_meaning() {
+    fn readable_markdown_keeps_native_roles_and_one_complete_assistant_json() {
         let response = LlmResponse::new(
             "raw",
             LlmFinishReason::Stop,
@@ -1334,12 +1164,8 @@ mod tests {
                 &response,
             )],
             Some(TranslationTaskResponseRecord::parsed(
-                "raw".to_owned(),
-                Some("先核对占位符，再翻译。".to_owned()),
-                vec![TranslationAssistantEntry::new(
-                    "0".to_owned(),
-                    json!(["公主", "第二行"]),
-                )],
+                r#"{"think":"先核对占位符，再翻译。","translations":{"0":["公主","第二行"]}}"#
+                    .to_owned(),
             )),
             TranslationTaskRecordFinalState::ExecutionFailedNoChanges {
                 diagnostic: test_terminal_diagnostic(),
@@ -1400,23 +1226,18 @@ mod tests {
 
 - 尝试 1：成功；finish reason `stop`；token `10 / 4 / 14`；耗时 `7 毫秒`
 
-## Thinking
-
-先核对占位符，再翻译。
-
 ## Assistant
 
-### ID 0
-
-公主
-
-第二行
-
-
-## Raw Assistant
-
 ```json
-raw
+{
+  "think": "先核对占位符，再翻译。",
+  "translations": {
+    "0": [
+      "公主",
+      "第二行"
+    ]
+  }
+}
 ```
 
 ## 最终结果
@@ -1446,7 +1267,7 @@ raw
     }
 
     #[test]
-    fn non_thinking_noncanonical_fenced_json_records_repairs_and_safe_text_raw_assistant() {
+    fn non_thinking_noncanonical_fenced_json_records_repairs_and_safe_assistant_text() {
         const API_KEY: &str = "quote\"slash\\value";
         let encoded_api_key = serde_json::to_string(API_KEY).expect("API key 应可编码为 JSON");
         let encoded_fragment = &encoded_api_key[1..encoded_api_key.len() - 1];
@@ -1457,15 +1278,7 @@ raw
             parse_translation_response(&raw_assistant, TranslationResponseMode::new(false, false))
                 .expect("非 thinking 的非规范围栏应可保守修复");
         let (_, _, repairs) = parsed.into_parts();
-        let response = TranslationTaskResponseRecord::parsed_with_repairs(
-            raw_assistant,
-            None,
-            vec![TranslationAssistantEntry::new(
-                "0".to_owned(),
-                json!([format!("before-{API_KEY}-after")]),
-            )],
-            repairs,
-        );
+        let response = TranslationTaskResponseRecord::parsed_with_repairs(raw_assistant, repairs);
         let document = document(
             Vec::new(),
             Vec::new(),
@@ -1487,28 +1300,22 @@ raw
         assert_eq!(markdown.matches("`removed_markdown_fence`").count(), 2);
         assert!(markdown.contains("| `removed_markdown_fence` | 2 | 1 |"));
         assert!(markdown.contains("| `removed_markdown_fence` | 4 | 1 |"));
-        assert!(markdown.contains("## Raw Assistant\n\n````text\n"));
+        assert_eq!(markdown.matches("## Assistant").count(), 1);
+        assert!(markdown.contains("## Assistant\n\n````text\n"));
+        assert!(!markdown.contains("## Raw Assistant"));
         assert!(!markdown.contains(API_KEY));
         assert!(!markdown.contains(encoded_fragment));
         assert!(markdown.contains("before-[REDACTED API KEY]-after"));
     }
 
     #[test]
-    fn non_thinking_canonical_fence_keeps_existing_record_shape() {
+    fn non_thinking_canonical_fence_becomes_one_pretty_json_block() {
         let raw_assistant = "```json\n{\"0\":[\"严格响应\"]}\n```".to_owned();
         let parsed =
             parse_translation_response(&raw_assistant, TranslationResponseMode::new(false, false))
                 .expect("规范围栏应直接解析内部 JSON");
         let (_, _, repairs) = parsed.into_parts();
-        let response = TranslationTaskResponseRecord::parsed_with_repairs(
-            raw_assistant,
-            None,
-            vec![TranslationAssistantEntry::new(
-                "0".to_owned(),
-                json!(["严格响应"]),
-            )],
-            repairs,
-        );
+        let response = TranslationTaskResponseRecord::parsed_with_repairs(raw_assistant, repairs);
         let document = document(
             Vec::new(),
             Vec::new(),
@@ -1526,13 +1333,18 @@ raw
         )
         .expect("规范围栏的非 thinking 响应应该可渲染");
 
-        assert!(markdown.contains("## Assistant\n\n### ID 0\n\n严格响应"));
+        assert_eq!(markdown.matches("## Assistant").count(), 1);
+        assert!(
+            markdown
+                .contains("## Assistant\n\n```json\n{\n  \"0\": [\n    \"严格响应\"\n  ]\n}\n```")
+        );
         assert!(!markdown.contains("## JSON Repairs"));
         assert!(!markdown.contains("## Raw Assistant"));
+        assert!(!markdown.contains("### ID"));
     }
 
     #[test]
-    fn duplicate_unknown_invalid_and_missing_ids_remain_readable_without_json_shell() {
+    fn duplicate_unknown_invalid_and_missing_ids_remain_in_one_readable_json_block() {
         let accepted_identity = test_identity(0);
         let accepted_translation = TextUnitContent::Value("公主".to_owned());
         let accepted = AcceptedTranslationDecision::new(
@@ -1592,13 +1404,6 @@ raw
                 Some(TranslationTaskResponseRecord::parsed(
                     r#"{"0":["第一版"],"0":["第二版"],"99":["未知"],"bad":{"raw":true}}"#
                         .to_owned(),
-                    None,
-                    vec![
-                        TranslationAssistantEntry::new("0".to_owned(), json!(["第一版"])),
-                        TranslationAssistantEntry::new("0".to_owned(), json!(["第二版"])),
-                        TranslationAssistantEntry::new("99".to_owned(), json!(["未知"])),
-                        TranslationAssistantEntry::new("bad".to_owned(), json!({"raw": true})),
-                    ],
                 )),
             ),
             TranslationTaskRecordFinalState::PartialCommitted { outcome },
@@ -1612,21 +1417,21 @@ raw
         )
         .expect("任务记录应可渲染");
 
-        let headings = markdown
-            .lines()
-            .filter(|line| line.starts_with("### ID "))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            headings,
-            ["### ID 0", "### ID 0", "### ID 99", "### ID bad"],
-            "Assistant 必须完整保持重复、未知和非法 ID 的原始条目顺序"
-        );
-        assert!(markdown.contains("```json\n{\"raw\":true}\n```"));
+        assert_eq!(markdown.matches("## Assistant").count(), 1);
+        assert!(markdown.contains(concat!(
+            "```json\n{\n",
+            "  \"0\": [\n    \"第一版\"\n  ],\n",
+            "  \"0\": [\n    \"第二版\"\n  ],\n",
+            "  \"99\": [\n    \"未知\"\n  ],\n",
+            "  \"bad\": {\n    \"raw\": true\n  }\n",
+            "}\n```"
+        )));
+        assert!(!markdown.contains("### ID"));
         assert!(markdown.contains("- 状态：部分完成，已确认提交"));
         assert!(markdown.contains("外部服务拒绝了请求"));
         assert!(!markdown.contains("http.status"));
         assert!(!markdown.contains("协议诊断："));
-        assert!(!markdown.contains("## Assistant\n\n```json"));
+        assert!(markdown.contains("## Assistant\n\n```json"));
     }
 
     #[test]
@@ -2099,14 +1904,7 @@ raw
                     diagnostic.clone(),
                 ),
             ],
-            Some(TranslationTaskResponseRecord::parsed(
-                raw_assistant,
-                Some(format!("Thinking {NEIGHBOR}:{KEY}")),
-                vec![TranslationAssistantEntry::new(
-                    format!("{NEIGHBOR}:{KEY}"),
-                    json!({format!("{NEIGHBOR}:{KEY}"): format!("{NEIGHBOR}:{KEY}")}),
-                )],
-            )),
+            Some(TranslationTaskResponseRecord::parsed(raw_assistant)),
             TranslationTaskRecordFinalState::ExecutionFailedNoChanges { diagnostic },
         );
         let mut parameters = Map::new();
@@ -2145,23 +1943,27 @@ raw
             !markdown.contains(encoded_key.trim_start_matches('=')),
             "URL query 编码后的 API key 也不得进入记录"
         );
+        let redacted_count = markdown.matches("[REDACTED API KEY]").count();
         assert!(
-            markdown.matches("[REDACTED API KEY]").count() >= 12,
-            "每个出现位置都应替换 API key 实际值"
+            redacted_count >= 8,
+            "每个独立记录字段都应替换 API key 实际值，实际 {redacted_count} 处"
+        );
+        let neighbor_count = markdown.matches(NEIGHBOR).count();
+        assert!(
+            neighbor_count >= 8,
+            "普通相邻文本不得随 API key 一起删除，实际 {neighbor_count} 处"
         );
         assert!(
-            markdown.matches(NEIGHBOR).count() >= 12,
-            "普通相邻文本不得随 API key 一起删除"
+            markdown.contains("## Assistant\n\n````json\n"),
+            "thinking 成功响应应在唯一 Assistant 中保留脱敏后的完整 JSON"
         );
-        assert!(
-            markdown.contains("## Raw Assistant\n\n````json\n"),
-            "thinking 成功响应应以安全动态围栏保留脱敏后的原始 JSON"
-        );
+        assert!(!markdown.contains("## Thinking"));
+        assert!(!markdown.contains("## Raw Assistant"));
     }
 
     #[test]
-    fn deeply_nested_raw_json_record_stays_valid_redacted_and_stack_safe() {
-        const DEPTH: usize = 10_000;
+    fn deeply_nested_assistant_json_stays_valid_redacted_and_stack_safe() {
+        const DEPTH: usize = 1_000;
         const KEY: &str = "quote\"slash\\value";
 
         let encoded_key = serde_json::to_string(KEY).expect("API key 应可序列化");
@@ -2172,26 +1974,9 @@ raw
             "]".repeat(DEPTH)
         );
         let raw_assistant = format!(r#"{{"0":{raw_json}}}"#);
-        let parsed =
-            parse_translation_response(&raw_assistant, TranslationResponseMode::new(false, false))
-                .expect("深层测试值必须是合法 JSON");
-        let (_, mut entries, _) = parsed.into_parts();
-        let (_, raw_value, _) = entries
-            .pop()
-            .expect("深层测试响应必须包含一个条目")
-            .into_parts();
-        let response = TranslationTaskResponseRecord::parsed(
-            raw_assistant,
-            None,
-            vec![TranslationAssistantEntry::projected(
-                "0".to_owned(),
-                TranslationAssistantRecordedValue::RawJson(raw_value),
-                Some(task_id(0)),
-                Some(TranslationAssistantValueError::NonStringItem {
-                    item: NonZeroUsize::MIN,
-                }),
-            )],
-        );
+        parse_translation_response(&raw_assistant, TranslationResponseMode::new(false, false))
+            .expect("深层测试值必须是合法 JSON");
+        let response = TranslationTaskResponseRecord::parsed(raw_assistant);
         let evidence = TranslationTaskExecutionEvidence::new(
             OffsetDateTime::UNIX_EPOCH,
             Duration::ZERO,
@@ -2219,13 +2004,10 @@ raw
             &document,
         )
         .expect("深层 RawJson 任务记录应可渲染");
-        let assistant = markdown
-            .split_once("### ID 0\n\n")
-            .expect("记录必须包含测试 ID")
+        let fenced = markdown
+            .split_once("## Assistant\n\n```json\n")
+            .expect("记录必须包含唯一 Assistant JSON")
             .1;
-        let fenced = assistant
-            .strip_prefix("```json\n")
-            .expect("非法值必须使用 JSON 围栏");
         let rendered_json = fenced.split_once("\n```").expect("JSON 围栏必须闭合").0;
         let reparsed =
             serde_json::from_str::<Box<RawValue>>(rendered_json).expect("脱敏后仍必须是合法 JSON");

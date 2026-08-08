@@ -491,10 +491,10 @@ fn same_named_mv_mz_and_generic_projects_remain_isolated_across_real_processes()
     );
     let task_record = read_single_task_record_sharing_log_run_id(&mz_workspace);
     assert!(task_record.contains("# 翻译任务 000001 · 完成"));
-    assert!(task_record.contains("## Thinking"));
     assert!(task_record.contains(THINKING_SENTINEL));
-    assert!(task_record.contains("## Assistant"));
-    assert!(task_record.contains("## Raw Assistant"));
+    assert_eq!(task_record.matches("## Assistant").count(), 1);
+    assert!(!task_record.contains("## Thinking"));
+    assert!(!task_record.contains("## Raw Assistant"));
     assert!(task_record.contains("\"translations\""));
     assert!(!task_record.contains("## JSON Repairs"));
     assert!(task_record.contains("## 最终结果"));
@@ -827,8 +827,9 @@ fn mz_partial_retry_reuses_the_complete_task_block_across_real_processes() {
             .1
             .contains("# 翻译任务 000001 · 部分完成")
     );
-    assert!(first_task_records[0].1.contains("## Thinking"));
-    assert!(first_task_records[0].1.contains("## Raw Assistant"));
+    assert_eq!(first_task_records[0].1.matches("## Assistant").count(), 1);
+    assert!(!first_task_records[0].1.contains("## Thinking"));
+    assert!(!first_task_records[0].1.contains("## Raw Assistant"));
     assert!(first_task_records[0].1.contains("\"translations\""));
     let first_run_id = first_task_records[0].0.clone();
 
@@ -1120,8 +1121,9 @@ fn generic_partial_retry_reuses_the_complete_task_block_across_real_processes() 
             .1
             .contains("# 翻译任务 000001 · 部分完成")
     );
-    assert!(first_task_records[0].1.contains("## Thinking"));
-    assert!(first_task_records[0].1.contains("## Raw Assistant"));
+    assert_eq!(first_task_records[0].1.matches("## Assistant").count(), 1);
+    assert!(!first_task_records[0].1.contains("## Thinking"));
+    assert!(!first_task_records[0].1.contains("## Raw Assistant"));
     assert!(first_task_records[0].1.contains("\"translations\""));
     let first_run_id = first_task_records[0].0.clone();
 
@@ -1771,7 +1773,9 @@ fn generic_reextract_preserves_moves_and_rejects_unextracted_changes() {
     let task_record = read_single_task_record_sharing_log_run_id(&workspace);
     assert!(task_record.contains("# 翻译任务 000001 · 完成"));
     assert!(task_record.contains(THINKING_SENTINEL));
-    assert!(task_record.contains("## Raw Assistant"));
+    assert_eq!(task_record.matches("## Assistant").count(), 1);
+    assert!(!task_record.contains("## Thinking"));
+    assert!(!task_record.contains("## Raw Assistant"));
     assert_success(
         "Generic WriteBack",
         &run_att(

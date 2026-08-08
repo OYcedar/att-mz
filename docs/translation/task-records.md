@@ -16,7 +16,7 @@
 
 - 引擎、任务自然序号、尝试次数和最终结果；
 - 模型实际使用的 system 与 user message；
-- 请求过程、可读 Thinking、逐临时 ID 译文和可用的 assistant 输出；
+- 请求过程和模型实际返回的完整 Assistant；
 - 每次失败尝试的安全说明，包括可用的 HTTP 阶段、状态和经过处理的供应商错误消息；
 - 每个临时 ID 的验收结果；
 - 已提交数量和 Partial、Unavailable 或失败原因。
@@ -28,20 +28,20 @@
 Partial 后再次运行时，已接受项以无 ID 的安全目标译文出现，待处理项在原块内重新从 `0`
 编号。ATT 不只记录或发送孤立的失败原文。
 
-## 2. Thinking、Raw Assistant 与 JSON 修复
+## 2. Assistant 与 JSON 修复
 
-`thinking_output = true` 时，模型已经返回 `message.content` 的任务记录同时包含：
+模型已经返回 `message.content` 时，任务记录只建立一个 `Assistant` 区块，不再把同一响应
+重复渲染成 `Thinking`、逐临时 ID 译文和 `Raw Assistant`。响应是现行模型协议认可的严格
+JSON 时，ATT 移除协议允许的外层 `json` Markdown fence，以两空格缩进放入一个 `json`
+代码块。这个投影只规范化 JSON 空白并执行现行敏感信息闭集要求的精确替换；除该替换外，
+字段顺序、重复键、数值表示、字符串转义和值保持不变，因此 `think`、原文回显和全部 ID
+仍能直接阅读和核对。
 
-- `Thinking`：从有效响应投影出的可读翻译判断；
-- 按临时 ID 展开的译文和验收说明；
-- `Raw Assistant`：模型本次实际返回的 `message.content`。
-
-`Raw Assistant` 使用能够包住正文的动态 Markdown fence，并执行现行敏感信息闭集要求的
-精确替换。它不是 HTTP body、Header 或供应商完整响应，也不称为未经处理的字节副本。
-
-响应经过公共保守 JSON 修复时，记录在解析结果后增加 `JSON Repairs` 表格，按发生顺序
-保存修复种类及相对于完整原始 Assistant 的一基行、列，不保存被删除、插入或替换的正文
-片段。严格解析成功且思考关闭时，不额外增加 Raw Assistant 或修复记录。
+响应经过公共保守 JSON 修复、整体无效或尚未完成解析时，`Assistant` 使用能够包住正文的
+动态 `text` fence 保存经过敏感信息替换的完整原文，不把修复后的内容伪装成模型原始输出。
+存在解析错误时先给出错误类别和一基行、列；存在 JSON 修复时，在 Assistant 后增加
+`JSON Repairs` 表格，按发生顺序保存修复种类及相对于完整原始 Assistant 的一基行、列，
+不保存被删除、插入或替换的正文片段。
 
 JSON 修复成功只是解析事实，不是 Warn、Partial 或错误，不改变任务终态、提交和退出码。
 修复后的重复、非法、未知、缺少、Placeholder 或其他逐 ID 问题继续使用正常验收。
@@ -69,7 +69,7 @@ JSON 修复成功只是解析事实，不是 Warn、Partial 或错误，不改�
 敏感值。它不保存非 2xx 原始 body；供应商标准错误消息经过闭集替换并清理为单行文本后，
 才进入尝试原因。
 
-任务记录是诊断证据，不是权威业务状态。Raw Assistant 缺失只表示证据不足，不授权重新
+任务记录是诊断证据，不是权威业务状态。Assistant 缺失只表示证据不足，不授权重新
 请求、重放、验收或提交译文。完整任务计数和引擎汇总仍由同次项目日志中的
 `translation.finished` 保存，不以 Markdown 是否写入成功为条件。
 

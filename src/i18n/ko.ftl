@@ -336,7 +336,6 @@ task-record-custom-parameters-heading = 사용자 지정 매개변수
 task-record-attempts-heading = 요청 과정
 task-record-final-result-heading = 최종 결과
 task-record-no-request = 전송 가능한 모델 요청이 만들어지지 않았습니다.
-task-record-empty-assistant = 모델이 빈 객체를 반환했습니다.
 task-record-parse-error = 구문 분석 오류: { $kind ->
     [thinking_empty] 사고 내용이 비어 있습니다({ $line }행 { $column }열)
    *[json] 모델 응답 JSON이 올바르지 않습니다(범주 `{ $category }`, { $line }행 { $column }열)

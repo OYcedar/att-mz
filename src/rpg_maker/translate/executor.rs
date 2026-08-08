@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aho_corasick::{Anchored, MatchKind, automaton::Automaton, nfa::noncontiguous::NFA};
-use serde_json::value::RawValue;
 use time::OffsetDateTime;
 
 #[cfg(test)]
@@ -69,10 +68,9 @@ use super::pipeline::{
 };
 use super::profile::{ResolvedRpgMakerTranslationResources, RpgMakerTranslationProfile};
 use super::task_record::{
-    TranslationAssistantEntry, TranslationAssistantRecordedValue, TranslationAssistantValueError,
-    TranslationTaskAttemptRecord, TranslationTaskExecution, TranslationTaskExecutionEvidence,
-    TranslationTaskExecutionFailure, TranslationTaskResponseParseError,
-    TranslationTaskResponseRecord,
+    TranslationAssistantValueError, TranslationTaskAttemptRecord, TranslationTaskExecution,
+    TranslationTaskExecutionEvidence, TranslationTaskExecutionFailure,
+    TranslationTaskResponseParseError, TranslationTaskResponseRecord,
 };
 const RESPONSE_PROCESSING_CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
 
@@ -1252,63 +1250,25 @@ fn process_response(
         }
     };
     let (parsed, response_record) = match parsed {
-        Ok(ParsedModelOutputBatch {
-            thinking,
-            outputs,
-            repairs,
-        }) => match raw_assistant {
+        Ok(ParsedModelOutputBatch { outputs, repairs }) => match raw_assistant {
             Some(raw_assistant) => {
-                let mut entries = Vec::with_capacity(outputs.len());
                 let mut acceptance_outputs = Vec::with_capacity(outputs.len());
                 for output in outputs {
                     if let Err(ResponseProcessingCancelled) = ensure_running() {
                         return Err(cancelled_response_processing_failure(Some(raw_assistant)));
                     }
                     let ParsedModelOutput {
-                        id,
-                        value,
                         canonical_id,
                         translation,
+                        ..
                     } = output;
-                    let value_error = translation.as_ref().err().copied();
-                    let recorded_value = match &translation {
-                        Ok(lines) => {
-                            let mut recorded_lines = Vec::with_capacity(lines.len());
-                            for line in lines {
-                                let line = match clone_response_processing_text_with_cancellation(
-                                    line,
-                                    &mut ensure_running,
-                                ) {
-                                    Ok(line) => line,
-                                    Err(ResponseProcessingCancelled) => {
-                                        return Err(cancelled_response_processing_failure(Some(
-                                            raw_assistant,
-                                        )));
-                                    }
-                                };
-                                recorded_lines.push(line);
-                            }
-                            TranslationAssistantRecordedValue::Lines(recorded_lines)
-                        }
-                        Err(_) => TranslationAssistantRecordedValue::RawJson(value),
-                    };
-                    entries.push(TranslationAssistantEntry::projected(
-                        id,
-                        recorded_value,
-                        canonical_id,
-                        value_error,
-                    ));
                     acceptance_outputs.push(ModelOutputForAcceptance {
                         canonical_id,
                         translation,
                     });
                 }
-                let record = TranslationTaskResponseRecord::parsed_with_repairs(
-                    raw_assistant,
-                    thinking,
-                    entries,
-                    repairs,
-                );
+                let record =
+                    TranslationTaskResponseRecord::parsed_with_repairs(raw_assistant, repairs);
                 (Ok(acceptance_outputs), Some(record))
             }
             None => {
@@ -1770,8 +1730,8 @@ fn accept_translation_lines_candidate_at_with_cancellation(
 
 #[derive(Debug)]
 struct ParsedModelOutput {
+    #[cfg(test)]
     id: String,
-    value: Box<RawValue>,
     canonical_id: Option<TaskId>,
     translation: Result<Vec<String>, TranslationAssistantValueError>,
 }
@@ -1939,26 +1899,24 @@ fn parse_model_response_with_cancellation<E>(
         Ok(parsed) => parsed,
         Err(source) => return Ok(Err(source)),
     };
-    let (thinking, entries, repairs) = parsed.into_parts();
+    let (_, entries, repairs) = parsed.into_parts();
     let mut outputs = Vec::with_capacity(entries.len());
     for entry in entries {
         ensure_running()?;
         let decoded = entry.decode_translation_value_with_cancellation(&mut ensure_running)?;
         let translation = translation_lines_from_decoded_value(decoded);
-        let (id, value, canonical_id) = entry.into_parts();
+        let (id, _, canonical_id) = entry.into_parts();
+        #[cfg(not(test))]
+        let _ = id;
         outputs.push(ParsedModelOutput {
+            #[cfg(test)]
             id,
-            value,
             canonical_id,
             translation,
         });
     }
     ensure_running()?;
-    Ok(Ok(ParsedModelOutputBatch {
-        thinking,
-        outputs,
-        repairs,
-    }))
+    Ok(Ok(ParsedModelOutputBatch { outputs, repairs }))
 }
 
 fn translation_lines_from_decoded_value(
@@ -2021,7 +1979,6 @@ fn translation_lines_from_array(
 
 #[derive(Debug)]
 struct ParsedModelOutputBatch {
-    thinking: Option<String>,
     outputs: Vec<ParsedModelOutput>,
     repairs: Vec<TranslationResponseRepair>,
 }
@@ -5822,8 +5779,7 @@ mod tests {
             response.raw_assistant(),
             r#"{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#
         );
-        assert!(response.thinking().is_none());
-        assert!(response.ordered_entries().is_none());
+        assert!(!response.is_strict_json());
         assert!(response.parse_error().is_none());
         assert!(diagnostic.is_none());
         assert!(cancelled);
@@ -5889,7 +5845,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn executor_keeps_parsed_thinking_record_when_later_validation_fails() {
+    async fn executor_keeps_complete_parsed_assistant_when_later_validation_fails() {
         let raw_assistant = r#"{"think":"已建立解析证据。","translations":{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}}"#;
         let service = RpgMakerTranslationTaskExecutionService::<_, _, _, _>::new(
             FakeLlm {
@@ -5933,21 +5889,8 @@ mod tests {
             .response()
             .expect("解析成功后建立的响应投影必须随技术失败进入 Executor evidence");
         assert_eq!(response.raw_assistant(), raw_assistant);
-        assert_eq!(response.thinking(), Some("已建立解析证据。"));
+        assert!(response.is_strict_json());
         assert!(response.parse_error().is_none());
-        let entries = response
-            .ordered_entries()
-            .expect("合法响应必须保留有序条目");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].id(), "0");
-        assert_eq!(entries[0].canonical_id(), Some(task_id(0)));
-        assert_eq!(entries[0].value_error(), None);
-        assert_eq!(
-            entries[0].lines(),
-            Some(["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧".to_owned()].as_slice()),
-            "解析成功后的合法行正文必须保持原样"
-        );
-        assert!(entries[0].raw_json().is_none());
     }
 
     #[tokio::test]

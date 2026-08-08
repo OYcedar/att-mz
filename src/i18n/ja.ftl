@@ -336,7 +336,6 @@ task-record-custom-parameters-heading = カスタムパラメーター
 task-record-attempts-heading = リクエスト経過
 task-record-final-result-heading = 最終結果
 task-record-no-request = 送信可能なモデルリクエストは作成されませんでした。
-task-record-empty-assistant = モデルは空のオブジェクトを返しました。
 task-record-parse-error = 解析エラー：{ $kind ->
     [thinking_empty] 思考内容が空です（{ $line } 行 { $column } 列）
    *[json] モデル応答の JSON が無効です（カテゴリ `{ $category }`、{ $line } 行 { $column } 列）

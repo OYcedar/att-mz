@@ -342,7 +342,6 @@ task-record-custom-parameters-heading = Paramètres personnalisés
 task-record-attempts-heading = Tentatives de requête
 task-record-final-result-heading = Résultat final
 task-record-no-request = Aucune requête de modèle prête à être envoyée.
-task-record-empty-assistant = Le modèle a renvoyé un objet vide.
 task-record-parse-error = Erreur d’analyse : { $kind ->
     [thinking_empty] le contenu du raisonnement est vide, ligne { $line }, colonne { $column }
    *[json] JSON de réponse du modèle invalide (catégorie `{ $category }`), ligne { $line }, colonne { $column }

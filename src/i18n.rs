@@ -819,7 +819,6 @@ pub(crate) enum UiMessage<'a> {
     TaskRecordAttemptsHeading,
     TaskRecordFinalResultHeading,
     TaskRecordNoRequest,
-    TaskRecordEmptyAssistant,
     TaskRecordParseError {
         kind: &'a str,
         category: &'a str,
@@ -1060,7 +1059,6 @@ impl UiMessage<'_> {
             Self::TaskRecordAttemptsHeading => "task-record-attempts-heading",
             Self::TaskRecordFinalResultHeading => "task-record-final-result-heading",
             Self::TaskRecordNoRequest => "task-record-no-request",
-            Self::TaskRecordEmptyAssistant => "task-record-empty-assistant",
             Self::TaskRecordParseError { .. } => "task-record-parse-error",
             Self::TaskRecordAttemptSucceeded { .. } => "task-record-attempt-succeeded",
             Self::TaskRecordAttemptTokenUsage { .. } => "task-record-attempt-token-usage",
@@ -1590,8 +1588,7 @@ impl UiMessage<'_> {
             | Self::TaskRecordCustomParametersHeading
             | Self::TaskRecordAttemptsHeading
             | Self::TaskRecordFinalResultHeading
-            | Self::TaskRecordNoRequest
-            | Self::TaskRecordEmptyAssistant => {}
+            | Self::TaskRecordNoRequest => {}
         }
         arguments
     }
@@ -2327,7 +2324,6 @@ mod tests {
             UiMessage::TaskRecordAttemptsHeading,
             UiMessage::TaskRecordFinalResultHeading,
             UiMessage::TaskRecordNoRequest,
-            UiMessage::TaskRecordEmptyAssistant,
             UiMessage::TaskRecordParseError {
                 kind: "json",
                 category: "syntax",
