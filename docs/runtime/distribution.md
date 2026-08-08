@@ -18,6 +18,7 @@
 <att-dir>/docs/
 <att-dir>/skills/
 <att-dir>/licenses/
+<att-dir>/tools/formic/
 ```
 
 程序固定从该目录读取 `config.toml`，并使用同目录下的 `projects/` 和 `prompts/`；
@@ -29,8 +30,9 @@ Init 前不存在，由 ATT 在实际需要时建立。游戏、JSONL、Rules、
 和文档。缺少本次任务需要的包内资源时，应报告发行缺口，不能从源码仓库、其他安装或
 任务目录拼接替代内容。
 
-`config.example.toml` 是 ATT 当前发行默认的托管模板。`config.toml` 是 ATT 实际读取的
-活动配置：干净发行包首次由模板创建，使用者填写后属于本地状态。
+根 `config.example.toml` 和 `tools/formic/config.example.toml` 是托管模板；各自的
+`config.toml` 是实际读取的活动配置。干净发行包首次从模板创建活动配置，使用者填写后
+属于本地状态，普通资源更新不能覆盖。
 
 ## 2. 完整发行集合
 
@@ -47,12 +49,13 @@ Init 前不存在，由 ATT 在实际需要时建立。游戏、JSONL、Rules、
 | `docs/` | 与仓库 `docs/` 的完整文件集合和内容完全相同 |
 | `prompts/` | 与仓库 `prompts/` 的完整文件集合和内容完全相同 |
 | `skills/` | 与仓库 `skills/` 的完整文件集合和内容完全相同 |
-| `licenses/` | 与仓库 `licenses/` 的完整文件集合和内容完全相同，包含随包第三方组件所需的许可声明；`THIRD-PARTY-LICENSES.html` 由当前 Cargo.lock 的 Windows x64 Release 依赖生成 |
+| `licenses/` | 与仓库 `licenses/` 的完整文件集合和内容完全相同；`THIRD-PARTY-LICENSES.html` 对应 ATT 依赖，`FORMIC-THIRD-PARTY-LICENSES.html` 对应随包 Formic v0.1.0 依赖 |
+| `tools/formic/` | Formic v0.1.0 Windows x64：`formic.exe`、同目录运行库、许可与来源说明、配置模板和首次创建后保留的活动配置 |
 | `projects/` | 运行期项目工作区；不属于仓库资源同步集合，已有项目内容不能被发行资源同步覆盖或删除 |
 
-`docs/`、`prompts/`、`skills/`、`licenses/` 和根 `config.example.toml` 都是发行托管
-资源，必须与当前仓库权威来源一致。活动 `config.toml` 只在干净发行根中要求与模板完全
-相同；普通更新遇到已有活动配置时必须逐字节保留，不能把它的内容差异当作资源
+`docs/`、`prompts/`、`skills/`、`licenses/`、两个配置模板和 Formic 的静态文件都是发行
+托管资源，必须与当前仓库权威来源一致。两份活动 `config.toml` 只在干净发行根中要求与
+各自模板完全相同；普通更新遇到已有活动配置时必须逐字节保留，不能把它的内容差异当作资源
 不同。目录内多出源码中已不存在的托管文件、缺少托管文件或任一托管文件内容不同，才表示
 发行资源不一致。
 
@@ -65,7 +68,7 @@ Init 前不存在，由 ATT 在实际需要时建立。游戏、JSONL、Rules、
 发行包只保留当前版本。仓库的 `docs/` 作为完整集合发布，其中包含产品规格和使用者或执行者
 完成发行内任务所需的指南。只供源码维护使用的资料放在该同步集合之外。`AGENTS.md`、
 `maintenance/`、源码、测试、构建目录与缓存、历史版本文件都不进入发行包。根
-`config.example.toml` 是允许且必须存在的托管模板。
+两个 `config.example.toml` 是允许且必须存在的托管模板。
 当前同步脚本会直接拒绝发行根下的 `AGENTS.md`、`maintenance/`、`src/`、`tests/` 和
 `target/`；其他禁止内容仍须在完整发行检查中确认，不能因为脚本未逐项列出而保留。
 
@@ -76,6 +79,8 @@ Init 前不存在，由 ATT 在实际需要时建立。游戏、JSONL、Rules、
 - `README.md`、`LICENSE`、`config.example.toml` → `dist/` 下的同名文件；
 - `dist/config.toml` 不存在时，从根 `config.example.toml` 首次创建；已经存在时逐字节保留；
 - `licenses/`、`docs/`、`prompts/`、`skills/` → `dist/` 下的同名目录。
+- `tools/formic/` 中的程序、运行库、许可、来源说明和配置模板 → 发行包同名目录；活动
+  `config.toml` 缺失时从模板创建，已经存在时逐字节保留。
 
 普通执行同步这些资源；`-Check` 只比较映射后的文件集合和逐文件 SHA-256，并检查脚本明确
 列出的开发材料。普通检查只要求活动配置存在，不把它与模板作摘要比较；公开发行检查才要求
@@ -88,10 +93,10 @@ Init 前不存在，由 ATT 在实际需要时建立。游戏、JSONL、Rules、
 完整发行检查因此同时承担以下责任：
 
 1. 确认 `att.exe` 是当前目标平台的 `Release` 构建结果，并能从发行根启动；
-2. 根据实际程序依赖确认所有必需的非系统运行库和许可声明已经随包提供；
+2. 确认 `formic.exe --help` 能从随包目录启动，并且需要的运行库和许可已经随包提供；
 3. 执行资源同步检查，确认映射文件没有缺失、陈旧副本或内容差异；
-4. 确认托管配置模板采用已经验证的高吞吐默认且不含秘密；检查干净公开发行时，还必须确认
-   活动配置逐字节等于模板，并且不含真实 API key、token 等凭据；
+4. 确认两个托管配置模板采用已经验证的高吞吐默认且不含秘密；检查干净公开发行时，还必须
+   确认两份活动配置逐字节等于各自模板，并且不含真实 API key、token 等凭据；
 5. 检查包内相对链接全部有效，并确认禁止内容没有进入发行包；
 6. 从源码仓库之外调用实际发行程序，确认 ATT 的固定配置、项目和 Prompt 路径只依赖发行根。
 
@@ -106,7 +111,7 @@ Init 前不存在，由 ATT 在实际需要时建立。游戏、JSONL、Rules、
 标签建立前完成格式、Clippy、测试、第三方许可重生成、PE 依赖和本规格第 4 节完整检查。
 
 Release workflow 不重复这些检查；它只使用锁定工具链和依赖构建静态 `att.exe`，从空的
-`dist/` 同步托管资源并首次创建活动配置，再确认活动配置与模板完全相同且不含真实凭据，
+`dist/` 同步托管资源并首次创建两份活动配置，再确认活动配置与各自模板完全相同且不含真实凭据，
 校验 `att.exe --version`、打包并发布。`projects/` 作为空目录进入压缩包。
 
 正式附件固定为 `att-vMAJOR.MINOR.PATCH-windows-x64.zip` 和 `SHA256SUMS.txt`。ZIP 使用

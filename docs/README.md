@@ -12,6 +12,7 @@
 | 当前任务 | 阅读顺序 |
 | --- | --- |
 | 调查新游戏、选择项目、建立完整翻译任务 | [翻译项目指南](guides/translation-project.md) → 对应引擎入口 → 当前阶段规格 |
+| 从完整游戏原文制作术语表 | [游戏术语表制作 Skill](../skills/extract-game-terminology/SKILL.md) → [术语规格](translation/terminology.md) |
 | 继续旧任务且当前状态明确 | 唯一任务清单 → [翻译项目指南](guides/translation-project.md)的当前阶段 → 对应规格 |
 | 不知道旧任务停在哪里 | 唯一任务清单 → [诊断与恢复指南](guides/diagnosis-and-recovery.md) → 权威状态所属规格 |
 | 命令出现失败、Partial、Unavailable、取消、警告或结果未知 | [诊断与恢复指南](guides/diagnosis-and-recovery.md) → 当前阶段规格 → 相关公共或运行时规格 |
