@@ -1,0 +1,68 @@
+[[rule]]
+plugin = "MAT_LoadComSim"
+path = "loadtext"
+
+[[rule]]
+plugin = "ManoUZ_MessageLogOption"
+path = "optionText"
+
+[[rule]]
+plugin = "ManoUZ_MessageLogOption"
+path = "logLimitBasicText"
+
+[[rule]]
+plugin = "ManoUZ_MessageLogOption"
+path = "logLimitBasicHelp"
+
+[[rule]]
+plugin = "ManoUZ_MessageLogOption"
+path = 'logLimitBasicItemList[].text'
+
+[[rule]]
+plugin = "ManoUZ_MessageLogOption"
+path = 'autoWaitTimeItemList[].text'
+
+[[rule]]
+plugin = "AlchemySystem"
+path = "MenuAlchemyText"
+
+[[rule]]
+plugin = "AlchemySystem"
+path = "NeedMaterialText"
+
+[[rule]]
+plugin = "AlchemySystem"
+path = "NeedPriceText"
+
+[[rule]]
+plugin = "AlchemySystem"
+path = "TargetItemText"
+
+[[rule]]
+plugin = "AlchemySystem"
+path = "NoteParseErrorMessage"
+
+[[rule]]
+plugin = "PersistentStateViewer"
+path = "CurrentTitle"
+
+[[rule]]
+plugin = "PersistentStateViewer"
+path = "HistoryTitle"
+
+# GlossaryInfo 是 JSON array，数组项仍是 JSON object string。
+[[rule]]
+plugin = "SceneGlossary"
+path = 'GlossaryInfo[].CommandName'
+
+[[rule]]
+plugin = "SceneGlossary"
+path = 'GlossaryInfo[].GlossaryHelp'
+
+[[rule]]
+plugin = "SceneGlossary"
+path = 'GlossaryInfo[].CategoryHelp'
+
+[[rule]]
+plugin = "SceneGlossary"
+path = 'GlossaryInfo[].CompleteMessage'

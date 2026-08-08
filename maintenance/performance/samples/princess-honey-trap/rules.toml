@@ -1,0 +1,34 @@
+[[rule]]
+plugin = "SimpleVoice"
+path = '["オプション名称"]'
+
+# 这两个参数是再次编码的 JSON string，额外解码后才是显示正文。
+[[rule]]
+plugin = "Mano_InputConfig"
+path = "GamepadIsNotConnected"
+decode_json = true
+
+[[rule]]
+plugin = "Mano_InputConfig"
+path = "needButtonDetouch"
+decode_json = true
+
+[[rule]]
+plugin = "Mano_InputConfig"
+path = "textApply"
+
+[[rule]]
+plugin = "Mano_InputConfig"
+path = "textDefault"
+
+[[rule]]
+plugin = "Mano_InputConfig"
+path = "commandName"
+
+[[rule]]
+plugin = "Mano_InputConfig"
+path = "keyconfigCommandName"
+
+[[rule]]
+plugin = "SealActorCommand"
+path = "disableSign"

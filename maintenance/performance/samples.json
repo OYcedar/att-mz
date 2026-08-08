@@ -1,0 +1,53 @@
+{
+  "samples": [
+    {
+      "id": "boku-to-succubus",
+      "display_name": "ぼくとサキュバス",
+      "kind": "rpg_maker",
+      "engine": "mz",
+      "test_set_path": "mz/ぼくとサキュバス",
+      "source_language": "ja",
+      "purpose": "高文本量和大型 CommonEvents 主样本",
+      "rules": "samples/boku-to-succubus/rules.toml",
+      "terms": "samples/boku-to-succubus/terms.toml",
+      "placeholders": "samples/boku-to-succubus/placeholders.toml"
+    },
+    {
+      "id": "succubus-academia",
+      "display_name": "サキュバスアカデミア-v1_2_0+Append-v1_0_1+MOD",
+      "kind": "rpg_maker",
+      "engine": "mv",
+      "test_set_path": "mv/サキュバスアカデミア-v1_2_0+Append-v1_0_1+MOD",
+      "source_language": "ja",
+      "purpose": "高插件量、追加内容和 MOD 组合样本",
+      "rules": "samples/succubus-academia/rules.toml",
+      "dialogue_rules": "samples/succubus-academia/dialogue-rules.toml",
+      "terms": "samples/succubus-academia/terms.toml",
+      "placeholders": "samples/succubus-academia/placeholders.toml"
+    },
+    {
+      "id": "princess-honey-trap",
+      "display_name": "プリンセス・ハニートラップ",
+      "kind": "rpg_maker",
+      "engine": "mv",
+      "test_set_path": "mv/プリンセス・ハニートラップ",
+      "source_language": "ja",
+      "purpose": "中等规模 MV、姓名投影和嵌套插件参数样本",
+      "rules": "samples/princess-honey-trap/rules.toml",
+      "dialogue_rules": "samples/princess-honey-trap/dialogue-rules.toml",
+      "terms": "samples/princess-honey-trap/terms.toml",
+      "placeholders": "samples/princess-honey-trap/placeholders.toml"
+    },
+    {
+      "id": "succubus-academia-generic",
+      "display_name": "サキュバスアカデミア自定义脚本结构",
+      "kind": "generic",
+      "engine": "generic",
+      "source_language": "ja",
+      "purpose": "插件源码中角色资料与行动定义的 Generic 负载",
+      "fixture": "samples/succubus-academia-generic/input",
+      "terms": "samples/succubus-academia-generic/terms.toml",
+      "placeholders": "samples/succubus-academia-generic/placeholders.toml"
+    }
+  ]
+}

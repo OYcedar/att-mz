@@ -1,0 +1,3 @@
+[[rule]]
+scopes = ["battle_action"]
+pattern = '_(?:HERO|ME|YOU)_'

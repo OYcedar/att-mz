@@ -1,0 +1,9 @@
+[[rule]]
+scopes = ["plugin_parameter"]
+pattern = '%[1-9][0-9]*'
+
+[[rule]]
+pattern = '(?i)\\(?:iin|in|sin|sn|ain|win|ce|ow|an)\[[^\x5D\r\n]+\]'
+
+[[rule]]
+pattern = '(?i)\\d\b'
