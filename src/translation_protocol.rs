@@ -3,7 +3,6 @@
 //! 本模块不理解游戏引擎、持久化身份、Placeholder 或语言验收。调用方只消费一次解析
 //! 建立的有序条目，并在自己的语义边界逐 ID 验收。
 
-#[cfg(test)]
 use std::convert::Infallible;
 use std::fmt;
 use std::io::{self, BufReader, Read};
@@ -516,6 +515,20 @@ pub(crate) fn parse_translation_response_with_cancellation<E>(
         root_original_offset,
         &mut ensure_running,
     )
+}
+
+/// 返回 Assistant 中现行模型协议认可的 JSON 正文。
+///
+/// 任务记录需要重新排版严格合法的 JSON，但不能复制模型协议对外层 Markdown 围栏的
+/// 识别规则。非规范围栏和围栏外正文保持原样，由调用方按普通文本呈现。
+pub(crate) fn translation_response_json_body(value: &str) -> &str {
+    match unwrap_translation_response_json_fence_with_cancellation(
+        LocatedModelResponse::new(value),
+        &mut || Ok::<_, Infallible>(()),
+    ) {
+        Ok(value) => value.value,
+        Err(unreachable) => match unreachable {},
+    }
 }
 
 /// 识别正文中唯一的规范 `json` Markdown 围栏，并把后续解析范围收窄到围栏内部。

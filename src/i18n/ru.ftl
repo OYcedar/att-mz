@@ -346,7 +346,6 @@ task-record-custom-parameters-heading = Пользовательские пар�
 task-record-attempts-heading = Попытки запроса
 task-record-final-result-heading = Итоговый результат
 task-record-no-request = Не сформирован запрос к модели, готовый к отправке.
-task-record-empty-assistant = Модель вернула пустой объект.
 task-record-parse-error = Ошибка разбора: { $kind ->
     [thinking_empty] содержимое рассуждения пусто, строка { $line }, столбец { $column }
    *[json] недопустимый JSON ответа модели (категория `{ $category }`), строка { $line }, столбец { $column }

@@ -303,6 +303,14 @@ impl ApiKeyRedactor {
         self.redact_json_string_tokens(value, false)
     }
 
+    /// 替换已经确认合法的 JSON string token，不改写数字、布尔值或 null。
+    ///
+    /// 与结构化序列化路径不同，这个入口保留调用方提供的字段顺序、重复键、数值表示和
+    /// 字符串转义，因此只允许用于已经由协议边界确认合法的完整 JSON。
+    pub(crate) fn redact_valid_json(&self, value: &str) -> String {
+        self.redact_serialized_json(value)
+    }
+
     /// 替换 RPG Maker User message 中 API key 的原文和 Markdown 转义表示。
     ///
     /// RPG Maker Prompt 会在每个 ASCII 标点前插入反斜杠。任务记录接收的是已经渲染

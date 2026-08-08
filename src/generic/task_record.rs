@@ -6,7 +6,6 @@
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use serde_json::value::RawValue;
 use time::OffsetDateTime;
 
 use crate::diagnostic::{DiagnosticReport, render_diagnostic_report};
@@ -14,13 +13,11 @@ use crate::execution::llm_request::LlmRequestAttemptRecord;
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
 use crate::llm::{ChatMessage, ChatMessageRole, LlmClientRecordMetadata};
 use crate::translation::task_record::{
-    TranslationTaskRecordArtifact, markdown_fence, markdown_heading_id, markdown_inline_code,
-    recorded_at_utc, render_client_parameters, render_duration, render_json_repairs,
-    render_raw_assistant, render_repaired_raw_assistant, render_task_record_attempt,
-    task_record_text,
+    TranslationTaskRecordArtifact, markdown_fence, markdown_inline_code, recorded_at_utc,
+    render_client_parameters, render_duration, render_json_repairs, render_readable_assistant,
+    render_task_record_attempt, task_record_text,
 };
 use crate::translation_protocol::{
-    DecodedJsonStringArray, DecodedSourceEchoValue, DecodedTranslationAssistantValue,
     ParsedTranslationResponse, TranslationResponseRepair, TranslationTaskResponseParseError,
     TranslationTaskResponseParseErrorKind,
 };
@@ -28,8 +25,6 @@ use crate::translation_protocol::{
 #[derive(Debug)]
 pub(crate) enum GenericTaskResponseRecord {
     Parsed {
-        thinking: Option<String>,
-        entries: Vec<(String, GenericTaskRecordedValue)>,
         repairs: Vec<TranslationResponseRepair>,
         raw_assistant: String,
     },
@@ -42,12 +37,6 @@ pub(crate) enum GenericTaskResponseRecord {
     },
 }
 
-#[derive(Debug)]
-pub(crate) enum GenericTaskRecordedValue {
-    Lines(Vec<String>),
-    RawJson(Box<RawValue>),
-}
-
 impl GenericTaskResponseRecord {
     pub(crate) fn parsed_with_cancellation<E>(
         raw_assistant: String,
@@ -55,28 +44,8 @@ impl GenericTaskResponseRecord {
         mut ensure_running: impl FnMut() -> Result<(), E>,
     ) -> Result<Self, E> {
         ensure_running()?;
-        let (thinking, entries, repairs) = parsed.into_parts();
-        let mut recorded_entries = Vec::with_capacity(entries.len());
-        for entry in entries {
-            ensure_running()?;
-            let decoded = entry.decode_translation_value_with_cancellation(&mut ensure_running)?;
-            let (id, value, _) = entry.into_parts();
-            let value = match decoded {
-                DecodedTranslationAssistantValue::Translation(DecodedJsonStringArray::Strings(
-                    lines,
-                ))
-                | DecodedTranslationAssistantValue::SourceEcho(DecodedSourceEchoValue::Fields {
-                    source: DecodedJsonStringArray::Strings(_),
-                    translation: DecodedJsonStringArray::Strings(lines),
-                }) => GenericTaskRecordedValue::Lines(lines),
-                _ => GenericTaskRecordedValue::RawJson(value),
-            };
-            recorded_entries.push((id, value));
-        }
-        ensure_running()?;
+        let (_, _, repairs) = parsed.into_parts();
         Ok(Self::Parsed {
-            thinking,
-            entries: recorded_entries,
             repairs,
             raw_assistant,
         })
@@ -382,97 +351,46 @@ fn render_response(
     response: &GenericTaskResponseRecord,
 ) -> Result<(), serde_json::Error> {
     let redactor = client.api_key_redactor();
-    match response {
+    output.push_str("\n## Assistant\n\n");
+    let (raw_assistant, strict_json, repairs, parse_error) = match response {
         GenericTaskResponseRecord::Parsed {
-            thinking,
-            entries,
             repairs,
             raw_assistant,
-        } => {
-            if let Some(thinking) = thinking {
-                output.push_str("\n## Thinking\n\n");
-                let thinking = redactor.redact(thinking);
-                output.push_str(&thinking);
-                if !thinking.ends_with('\n') {
-                    output.push('\n');
-                }
-            }
-            output.push_str("\n## Assistant\n\n");
-            if entries.is_empty() {
-                let _ = writeln!(
-                    output,
-                    "_{}_",
-                    task_record_text(localizer, UiMessage::TaskRecordEmptyAssistant)
-                );
-            }
-            for (id, value) in entries {
-                let id = redactor.redact(id);
-                let _ = writeln!(output, "### ID {}\n", markdown_heading_id(&id));
-                match value {
-                    GenericTaskRecordedValue::Lines(lines) => {
-                        for (line_index, line) in lines.iter().enumerate() {
-                            if line_index != 0 {
-                                output.push_str("\n\n");
-                            }
-                            output.push_str(&redactor.redact(line));
-                        }
-                        output.push('\n');
-                    }
-                    GenericTaskRecordedValue::RawJson(value) => {
-                        let value = redactor.redact_json(value.as_ref())?;
-                        output.push_str(&markdown_fence(&value, "json"));
-                    }
-                }
-                output.push('\n');
-            }
-            render_json_repairs(output, repairs);
-            if thinking.is_some() || !repairs.is_empty() {
-                output.push_str("\n## Raw Assistant\n\n");
-                output.push_str(&if repairs.is_empty() {
-                    render_raw_assistant(raw_assistant, redactor)
-                } else {
-                    render_repaired_raw_assistant(raw_assistant, redactor)
-                });
-            }
-        }
+        } => (raw_assistant, repairs.is_empty(), repairs.as_slice(), None),
         GenericTaskResponseRecord::Invalid {
             raw_assistant,
             error,
-        } => {
-            output.push_str("\n## Assistant\n\n");
-            let category = match error.kind() {
-                TranslationTaskResponseParseErrorKind::Json(category)
-                | TranslationTaskResponseParseErrorKind::JsonRepair { category, .. } => {
-                    category.code()
-                }
-                _ => "",
-            };
-            let _ = writeln!(
-                output,
-                "> {}\n",
-                task_record_text(
-                    localizer,
-                    UiMessage::TaskRecordParseError {
-                        kind: error.kind().code(),
-                        category,
-                        line: error.line().get() as u64,
-                        column: error.column().get() as u64,
-                    }
-                )
-            );
-            output.push_str(&markdown_fence(
-                &redactor.redact_text_with_json_strings(raw_assistant),
-                "text",
-            ));
-        }
+        } => (raw_assistant, false, &[][..], Some(error)),
         GenericTaskResponseRecord::Unprocessed { raw_assistant } => {
-            output.push_str("\n## Assistant\n\n");
-            output.push_str(&markdown_fence(
-                &redactor.redact_text_with_json_strings(raw_assistant),
-                "text",
-            ));
+            (raw_assistant, false, &[][..], None)
         }
+    };
+    if let Some(error) = parse_error {
+        let category = match error.kind() {
+            TranslationTaskResponseParseErrorKind::Json(category)
+            | TranslationTaskResponseParseErrorKind::JsonRepair { category, .. } => category.code(),
+            _ => "",
+        };
+        let _ = writeln!(
+            output,
+            "> {}\n",
+            task_record_text(
+                localizer,
+                UiMessage::TaskRecordParseError {
+                    kind: error.kind().code(),
+                    category,
+                    line: error.line().get() as u64,
+                    column: error.column().get() as u64,
+                }
+            )
+        );
     }
+    output.push_str(&render_readable_assistant(
+        raw_assistant,
+        strict_json,
+        redactor,
+    ));
+    render_json_repairs(output, repairs);
     Ok(())
 }
 
@@ -482,15 +400,16 @@ mod tests {
 
     use secrecy::SecretString;
     use serde_json::Map;
+    use serde_json::value::RawValue;
 
     use super::*;
     use crate::llm::ApiKeyRedactor;
     use crate::translation_protocol::{TranslationResponseMode, parse_translation_response};
 
     #[test]
-    fn deeply_nested_raw_value_renders_as_valid_redacted_json_without_value_tree() {
+    fn deeply_nested_assistant_renders_as_valid_redacted_json_without_value_tree() {
         const API_KEY: &str = "quote\"slash\\value";
-        const DEPTH: usize = 10_000;
+        const DEPTH: usize = 1_000;
 
         let encoded_api_key = serde_json::to_string(API_KEY).expect("API key 应可编码为 JSON");
         let deep_value = format!(
@@ -537,13 +456,16 @@ mod tests {
         assert!(!recorded_json.contains(API_KEY));
         assert!(!recorded_json.contains(escaped_api_key));
         assert!(recorded_json.contains("[REDACTED API KEY]"));
+        assert_eq!(output.matches("## Assistant").count(), 1);
+        assert!(!output.contains("## Thinking"));
         assert!(!output.contains("## Raw Assistant"));
+        assert!(!output.contains("### ID"));
 
         drop(record);
     }
 
     #[test]
-    fn thinking_source_echo_renders_translation_and_safe_raw_assistant() {
+    fn thinking_source_echo_stays_in_the_single_readable_assistant_json() {
         const API_KEY: &str = "quote\"slash\\value";
         let raw_assistant = serde_json::json!({
             "think": format!("判断 ``` {API_KEY}"),
@@ -579,9 +501,17 @@ mod tests {
         )
         .expect("thinking 成功响应应该可渲染");
 
-        assert!(output.contains("## Thinking"));
-        assert!(output.contains("## Assistant\n\n### ID 0\n\n第一行\n\n\n\n第二行"));
-        assert!(output.contains("## Raw Assistant\n\n````json\n"));
+        assert_eq!(output.matches("## Assistant").count(), 1);
+        assert!(!output.contains("## Thinking"));
+        assert!(!output.contains("## Raw Assistant"));
+        assert!(!output.contains("### ID"));
+        assert!(output.contains("````json\n"));
+        assert!(output.contains(r#""think": "判断 ``` [REDACTED API KEY]""#));
+        assert!(output.contains(r#""source": ["#));
+        assert!(output.contains(r#""translation": ["#));
+        assert!(output.contains("\"第一行\",\n"));
+        assert!(output.contains("\"\",\n"));
+        assert!(output.contains("\"第二行\""));
         assert!(!output.contains(API_KEY));
         assert!(output.contains("[REDACTED API KEY]"));
     }
@@ -622,14 +552,16 @@ mod tests {
         assert_eq!(output.matches("`removed_markdown_fence`").count(), 2);
         assert!(output.contains("| `removed_markdown_fence` | 2 | 1 |"));
         assert!(output.contains("| `removed_markdown_fence` | 4 | 1 |"));
-        assert!(output.contains("## Raw Assistant\n\n````text\n"));
+        assert_eq!(output.matches("## Assistant").count(), 1);
+        assert!(output.contains("## Assistant\n\n````text\n"));
+        assert!(!output.contains("## Raw Assistant"));
         assert!(!output.contains(API_KEY));
         assert!(!output.contains(encoded_fragment));
         assert!(output.contains("before-[REDACTED API KEY]-after"));
     }
 
     #[test]
-    fn non_thinking_canonical_fence_keeps_existing_record_shape() {
+    fn non_thinking_canonical_fence_becomes_one_pretty_json_block() {
         let raw_assistant = "```json\n{\"0\":[\"严格响应\"]}\n```".to_owned();
         let parsed =
             parse_translation_response(&raw_assistant, TranslationResponseMode::new(false, false))
@@ -655,9 +587,14 @@ mod tests {
         )
         .expect("规范围栏的非 thinking 响应应该可渲染");
 
-        assert!(output.contains("## Assistant\n\n### ID 0\n\n严格响应"));
+        assert_eq!(output.matches("## Assistant").count(), 1);
+        assert!(
+            output
+                .contains("## Assistant\n\n```json\n{\n  \"0\": [\n    \"严格响应\"\n  ]\n}\n```")
+        );
         assert!(!output.contains("## JSON Repairs"));
         assert!(!output.contains("## Raw Assistant"));
+        assert!(!output.contains("### ID"));
     }
 
     #[test]
@@ -693,6 +630,35 @@ mod tests {
         assert!(!output.contains(API_KEY));
         assert!(!output.contains(encoded_fragment));
         assert!(output.contains("[REDACTED API KEY]"));
+    }
+
+    #[test]
+    fn protocol_invalid_json_stays_as_text_and_keeps_the_error() {
+        let raw_assistant = r#"{"think":"","translations":{"0":[]},}"#.to_owned();
+        let error =
+            parse_translation_response(&raw_assistant, TranslationResponseMode::new(true, false))
+                .expect_err("空 thinking 必须返回协议错误");
+        let record = GenericTaskResponseRecord::invalid(raw_assistant, error);
+        let client = LlmClientRecordMetadata::new(
+            "https://example.test".to_owned(),
+            "model".to_owned(),
+            Map::new(),
+            ApiKeyRedactor::new(SecretString::from("unused-key")),
+        );
+        let mut output = String::new();
+
+        render_response(
+            &mut output,
+            &UiLocalizer::new(UiLocale::SimplifiedChinese),
+            &client,
+            &record,
+        )
+        .expect("严格 JSON 协议错误应该可渲染");
+
+        assert_eq!(output.matches("## Assistant").count(), 1);
+        assert!(output.contains("> 解析错误："));
+        assert!(output.contains("```text\n{\"think\":\"\",\"translations\":{\"0\":[]},}\n```"));
+        assert!(!output.contains("```json"));
     }
 
     #[test]

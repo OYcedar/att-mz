@@ -342,7 +342,6 @@ task-record-custom-parameters-heading = Custom parameters
 task-record-attempts-heading = Request attempts
 task-record-final-result-heading = Final result
 task-record-no-request = No model request was ready to send.
-task-record-empty-assistant = The model returned an empty object.
 task-record-parse-error = Parse error: { $kind ->
     [thinking_empty] the thinking content is empty at line { $line }, column { $column }
    *[json] invalid model response JSON (category `{ $category }`) at line { $line }, column { $column }
