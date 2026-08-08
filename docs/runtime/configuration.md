@@ -85,32 +85,39 @@ ID 分配。完整语义见[语言规格](../translation/language.md)。
 
 ## 4. LLM Client
 
+下面是发行模板采用的高吞吐配置。模型服务确有更低并发、限速、代理、证书或超时限制时，
+操作者按该服务的实际限制调整对应字段；这些外部限制不改变 ATT 的翻译验收和持久化语义。
+
 ```toml
 [llm.clients.primary]
 url = "https://api.example.com/v1/chat/completions"
 api_key = "replace-with-api-key"
 model = "replace-with-model-id"
-max_concurrent_requests = 8
-connect_timeout_ms = 15000
+max_concurrent_requests = 16
+connect_timeout_ms = 5000
 read_timeout_ms = 120000
 request_timeout_ms = 120000
 proxy = false
 additional_pem_files = []
-retry_delays_ms = [500, 1500, 5000]
-max_retry_after_ms = 30000
+retry_delays_ms = []
+max_retry_after_ms = 1000
 parameters = '''
 {}
 '''
-
-[llm.clients.primary.rate_limit]
-requests_per_minute = 60
-burst = 8
 ```
 
 `rate_limit` 整表可省略；一旦给出，两个值都必须为正。`proxy` 取 `false` 或一个
 不含凭据的 URL。`parameters` 是严格 JSON object，顶层留给 ATT 的 `model`、
 `messages`、`stream` 三个键不出现在这里。`api_key` 按字面读取，ATT 不展开环境
 变量。
+
+发行模板不启用 `rate_limit`。只有模型服务确实规定 RPM 时才增加：
+
+```toml
+[llm.clients.primary.rate_limit]
+requests_per_minute = 60
+burst = 8
+```
 
 超时、重试、代理、PEM 和 rate limit 描述的是外部服务约束，所以进入配置；内部
 worker、TaskBlock 数量、SQLite 策略和文件总量由执行代码决定，不出现在配置里。

@@ -13,5 +13,6 @@ Formic 按 `AGPL-3.0-only` 提供，许可正文随 `formic.exe` 放在同一目
 固定提交链接提供与二进制对应的完整源代码；依赖许可汇总位于发行包
 `licenses/FORMIC-THIRD-PARTY-LICENSES.html`。
 
-上游 ZIP 中的 README 引用了未随该 ZIP 提供的文档，因此 ATT 使用本目录的包内说明代替；
-`formic.exe`、`config.example.toml` 和 `LICENSE` 保持上游原件。
+上游 ZIP 中的 README 引用了未随该 ZIP 提供的文档，因此 ATT 使用本目录的包内说明代替。
+`formic.exe` 和 `LICENSE` 保持上游原件；上游配置示例仍按固定摘要验证，但发行包中的
+`config.example.toml` 和首次安装生成的 `config.toml` 使用 ATT 的高吞吐无密钥模板。

@@ -3,8 +3,9 @@
 把仓库中的使用者资源同步到 dist，或只检查两边是否一致。
 
 .DESCRIPTION
-管理 README.md、LICENSE、config.example.toml -> config.toml、第三方许可证目录、docs、
-prompts、skills 和固定的 Formic 工具。
+管理 README.md、LICENSE、config.example.toml、第三方许可证目录、docs、prompts、skills 和
+固定的 Formic 工具。config.toml 是使用者的活动配置：已有文件保持原字节不变，缺失时才从
+config.example.toml 初始化。
 不修改 att.exe。
 
 .PARAMETER Check
@@ -15,10 +16,15 @@ prompts、skills 和固定的 Formic 工具。
 
 .PARAMETER VCRuntimePath
 普通同步 Formic 时可选的 VCRUNTIME140.dll 来源；省略时使用 Windows System32。
+
+.PARAMETER RequireDefaultConfig
+要求 ATT 与 Formic 的活动配置和无密钥发行模板完全一致。公开发行检查使用此开关；普通
+本地同步和检查不使用。
 #>
 [CmdletBinding()]
 param(
     [switch]$Check,
+    [switch]$RequireDefaultConfig,
     [string]$TargetRoot,
     [string]$VCRuntimePath
 )
@@ -49,9 +55,12 @@ $fileMappings = @(
     },
     [pscustomobject]@{
         Source = Join-Path $repositoryRoot 'config.example.toml'
-        Destination = Join-Path $distributionRoot 'config.toml'
+        Destination = Join-Path $distributionRoot 'config.example.toml'
     }
 )
+
+$defaultConfigSource = Join-Path $repositoryRoot 'config.example.toml'
+$activeConfigDestination = Join-Path $distributionRoot 'config.toml'
 
 $directoryMappings = @(
     [pscustomobject]@{
@@ -140,6 +149,27 @@ function Get-DirectoryDigestMap {
     return $result
 }
 
+function Assert-PlaceholderApiKey {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+        [Parameter(Mandatory)]
+        [string]$Description
+    )
+
+    $content = Get-Content -Raw -LiteralPath $Path
+    $assignments = @(
+        $content -split '\r?\n' |
+            Where-Object { $_ -match '^[ \t]*api_key[ \t]*=' }
+    )
+    if (
+        $assignments.Count -ne 1 -or
+        $assignments[0] -cnotmatch '^[ \t]*api_key[ \t]*=[ \t]*"replace-with-api-key"[ \t]*(?:#.*)?$'
+    ) {
+        throw "$Description 必须恰好包含一个固定占位 api_key：$Path"
+    }
+}
+
 function Test-SynchronizedResources {
     $failures = [System.Collections.Generic.List[string]]::new()
 
@@ -154,6 +184,15 @@ function Test-SynchronizedResources {
                 "发行文件与源码不同：$($mapping.Source) -> $($mapping.Destination)"
             )
         }
+    }
+
+    if (-not (Test-Path -LiteralPath $activeConfigDestination -PathType Leaf)) {
+        $failures.Add("ATT 活动配置缺失或不是普通文件：$activeConfigDestination")
+    }
+    elseif ($RequireDefaultConfig -and
+        (Get-FileDigest -Path $defaultConfigSource) -ne
+        (Get-FileDigest -Path $activeConfigDestination)) {
+        $failures.Add("公开发行的 ATT 活动配置必须与发行模板完全一致：$activeConfigDestination")
     }
 
     foreach ($mapping in $directoryMappings) {
@@ -183,7 +222,6 @@ function Test-SynchronizedResources {
     foreach ($forbidden in @(
             'AGENTS.md',
             'maintenance',
-            'config.example.toml',
             'src',
             'tests',
             'target'
@@ -201,6 +239,7 @@ function Test-SynchronizedResources {
 
 Assert-NoReparsePoint -Path $repositoryRoot
 Assert-NoReparsePoint -Path $distributionRoot -Recurse
+Assert-PlaceholderApiKey -Path $defaultConfigSource -Description 'ATT 发行配置模板'
 foreach ($mapping in $fileMappings) {
     Assert-NoReparsePoint -Path $mapping.Source
 }
@@ -210,7 +249,8 @@ foreach ($mapping in $directoryMappings) {
 
 if ($Check) {
     Test-SynchronizedResources
-    & (Join-Path $PSScriptRoot 'sync-formic-tool.ps1') -Check -TargetRoot $distributionRoot
+    & (Join-Path $PSScriptRoot 'sync-formic-tool.ps1') -Check `
+        -RequireDefaultConfig:$RequireDefaultConfig -TargetRoot $distributionRoot
     Write-Output '发行资源与源码一致。'
     return
 }
@@ -249,6 +289,13 @@ try {
         $staged = Join-Path $stagingRoot ([System.IO.Path]::GetFileName($mapping.Destination))
         Copy-Item -LiteralPath $staged -Destination $mapping.Destination -Force
     }
+    if (-not (Test-Path -LiteralPath $activeConfigDestination)) {
+        Copy-Item -LiteralPath (Join-Path $stagingRoot 'config.example.toml') `
+            -Destination $activeConfigDestination
+    }
+    elseif (-not (Test-Path -LiteralPath $activeConfigDestination -PathType Leaf)) {
+        throw "ATT 活动配置不是普通文件：$activeConfigDestination"
+    }
     foreach ($mapping in $directoryMappings) {
         Assert-DistributionChild -Path $mapping.Destination
         if (Test-Path -LiteralPath $mapping.Destination) {
@@ -270,6 +317,7 @@ finally {
 Test-SynchronizedResources
 $formicSyncArguments = @{
     TargetRoot = $distributionRoot
+    RequireDefaultConfig = $RequireDefaultConfig
 }
 if (-not [string]::IsNullOrWhiteSpace($VCRuntimePath)) {
     $formicSyncArguments.VCRuntimePath = $VCRuntimePath

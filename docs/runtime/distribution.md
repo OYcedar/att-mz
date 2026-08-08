@@ -10,6 +10,7 @@
 ```text
 <att-dir>/att.exe
 <att-dir>/config.toml
+<att-dir>/config.example.toml
 <att-dir>/LICENSE
 <att-dir>/projects/<mv|mz|generic>/<project-name>/
 <att-dir>/prompts/
@@ -29,8 +30,10 @@ Init 前不存在，由 ATT 在实际需要时建立。游戏、JSONL、Rules、
 和文档。缺少本次任务需要的包内资源时，应报告发行缺口，不能从源码仓库、其他安装或
 任务目录拼接替代内容。
 
-`tools/formic/` 是随包术语候选抓取工具的固定目录。Formic 使用该目录自己的
-`config.toml`，不读取 ATT 根 `config.toml`；调用它的 Skill 必须按
+`config.example.toml` 是 ATT 当前发行默认的托管模板。`config.toml` 是 ATT 实际读取的
+活动配置：干净发行包首次由模板创建，使用者填写后属于本地状态。`tools/formic/` 是随包
+术语候选抓取工具的固定目录；其中的 `config.example.toml` 是 Formic 的托管模板，
+`config.toml` 是 Formic 的本地活动配置。Formic 不读取 ATT 根 `config.toml`；调用它的 Skill 必须按
 [Formic 术语表指南](../guides/formic-terminology.md)把作业输入和输出放在发行根之外。
 
 ## 2. 完整发行集合
@@ -41,7 +44,8 @@ Init 前不存在，由 ATT 在实际需要时建立。游戏、JSONL、Rules、
 |---|---|
 | `att.exe` | 目标 Windows x64 平台的 ATT `Release` 构建结果 |
 | 非系统运行依赖 | 当前 `Release` 制品实际需要且受支持 Windows 环境不保证提供的运行库，放在程序可直接加载的位置；精确集合以当前制品的依赖检查为准 |
-| `config.toml` | 与仓库 `config.example.toml` 内容完全相同，只在发行包中改用程序直接读取的名称 |
+| `config.example.toml` | 与仓库根同名文件内容完全相同，是 ATT 当前不含真实凭据、高吞吐发行默认的托管模板 |
+| `config.toml` | 干净公开发行中与根 `config.example.toml` 内容完全相同；首次配置后属于本地使用者状态，普通资源更新不得覆盖 |
 | `LICENSE` | 与仓库根 `LICENSE` 完全相同，是 ATT 自有代码和文档的 `AGPL-3.0-only` 许可正文 |
 | `README.md` | 与仓库根 `README.md` 完全相同 |
 | `docs/` | 与仓库 `docs/` 的完整文件集合和内容完全相同 |
@@ -51,8 +55,11 @@ Init 前不存在，由 ATT 在实际需要时建立。游戏、JSONL、Rules、
 | `licenses/` | 与仓库 `licenses/` 的完整文件集合和内容完全相同，包含随包第三方组件所需的许可声明；`THIRD-PARTY-LICENSES.html` 由 ATT 当前 Cargo.lock 的 Windows x64 Release 依赖生成，`FORMIC-THIRD-PARTY-LICENSES.html` 由 Formic v0.1.0 的对应依赖生成 |
 | `projects/` | 运行期项目工作区；不属于仓库资源同步集合，已有项目内容不能被发行资源同步覆盖或删除 |
 
-`docs/`、`prompts/`、`skills/` 和 `licenses/` 都按整个目录发布。目录内多出源码中已不存在
-的旧文件、缺少源码文件或任一文件内容不同，都表示发行资源不一致。
+`docs/`、`prompts/`、`skills/`、`licenses/` 和两个 `config.example.toml` 都是发行托管
+资源，必须与当前仓库权威来源一致。两个活动 `config.toml` 只在干净发行根中要求与各自
+模板完全相同；普通更新遇到已有活动配置时必须逐字节保留，不能把它的内容差异当作资源
+不同。目录内多出源码中已不存在的托管文件、缺少托管文件或任一托管文件内容不同，才表示
+发行资源不一致。
 
 Formic 固定使用 tag `v0.1.0` 和提交
 `8636e4145589c0bfc798c80560917eb26285d228`。官方 Windows ZIP 固定 URL 是
@@ -72,11 +79,10 @@ SHA-256 是
 
 发行包只保留当前版本。仓库的 `docs/` 作为完整集合发布，其中包含产品规格和使用者或执行者
 完成发行内任务所需的指南。只供源码维护使用的资料放在该同步集合之外。`AGENTS.md`、
-`maintenance/`、根 `config.example.toml`、源码、测试、构建目录与缓存、历史版本文件都不
-进入发行包。`tools/formic/config.example.toml` 是固定工具资源，不属于这里禁止的根配置。
-当前同步脚本会直接拒绝发行根下的 `AGENTS.md`、`maintenance/`、`config.example.toml`、
-`src/`、`tests/` 和 `target/`；其他禁止内容仍须在完整发行检查中确认，不能因为脚本未逐项
-列出而保留。
+`maintenance/`、源码、测试、构建目录与缓存、历史版本文件都不进入发行包。根
+`config.example.toml` 和 `tools/formic/config.example.toml` 是允许且必须存在的托管模板。
+当前同步脚本会直接拒绝发行根下的 `AGENTS.md`、`maintenance/`、`src/`、`tests/` 和
+`target/`；其他禁止内容仍须在完整发行检查中确认，不能因为脚本未逐项列出而保留。
 
 Formic 的游戏语料、作业计划、任务说明副本、单元结果、最终术语工作记录、缓存和 worker
 运行档案都是用户任务数据，不属于发行资源。它们不得出现在 `tools/formic/`、`skills/` 或
@@ -86,21 +92,22 @@ Formic 的游戏语料、作业计划、任务说明副本、单元结果、最�
 
 仓库脚本 `scripts/sync-dist-resources.ps1` 负责以下资源映射：
 
-- `README.md`、`LICENSE` → `dist/` 下的同名文件；
-- `config.example.toml` → `dist/config.toml`；
+- `README.md`、`LICENSE`、`config.example.toml` → `dist/` 下的同名文件；
+- `dist/config.toml` 不存在时，从根 `config.example.toml` 首次创建；已经存在时逐字节保留；
 - `licenses/`、`docs/`、`prompts/`、`skills/` → `dist/` 下的同名目录。
-- 仓库 `tools/formic/` 的包内说明与固定发布记录，以及 Formic v0.1.0 官方 ZIP 中经过摘要
-  校验的 `formic.exe`、`config.example.toml` 和 `LICENSE` → `dist/tools/formic/`；其中
-  `config.example.toml` 另复制为 Formic 实际读取的 `config.toml`；
+- 仓库 `tools/formic/` 的包内说明、固定发布记录和托管 `config.example.toml`，以及 Formic
+  v0.1.0 官方 ZIP 中经过摘要校验的 `formic.exe` 和 `LICENSE` → `dist/tools/formic/`；
+- `dist/tools/formic/config.toml` 不存在时，从同目录 `config.example.toml` 首次创建；已经
+  存在时逐字节保留，不因更新 Formic 目录中的其他文件而删除或替换；
 - 当前 Visual Studio 构建环境中经过 x64 PE 与 Authenticode 签名检查的
   `VCRUNTIME140.dll` → `dist/tools/formic/`，并生成只描述这个实际文件的 `runtime.json`。
 
 普通执行只从固定 Formic Release URL 联网下载资产，不查询最新版本；下载后先确认
 `release.json` 规定的大小、ZIP SHA-256、精确文件集合和文件 SHA-256，再写入目标目录。
-`-Check` 不访问网络，只根据仓库中的固定发布记录、目标目录现有文件和 `runtime.json`
-检查九个 Formic 文件、其他映射文件的集合与逐文件 SHA-256，并检查脚本明确列出的六项
-开发材料。该脚本不修改或证明 `att.exe` 和 `projects/` 的状态，也不代替包内链接与独立
-运行检查。
+第三方 ZIP 中的示例配置不是 ATT 的发行默认，不能覆盖托管模板或活动配置。`-Check` 不访问
+网络，只根据仓库中的固定发布记录、托管模板、目标目录现有文件和 `runtime.json` 检查
+Formic 程序与其他托管资源；普通检查只要求活动配置存在且不把它与模板作摘要比较。该脚本
+不修改或证明 `att.exe` 和 `projects/` 的状态，也不代替包内链接与独立运行检查。
 
 脚本默认操作仓库 `dist/`；公开发行验证可以用 `-TargetRoot` 指向新建的干净暂存目录。
 无论目标在哪里，脚本都只从当前仓库权威资源读取，并拒绝操作目标根之外的路径。
@@ -116,8 +123,10 @@ Formic 的游戏语料、作业计划、任务说明副本、单元结果、最�
 4. 确认 ATT、Formic、Formic Rust 依赖和 Microsoft Runtime 的许可正文或声明都已随包
    提供，并与实际制品相符；
 5. 执行资源同步检查，确认映射文件没有缺失、陈旧副本或内容差异；
-6. 检查包内相对链接全部有效，并确认 Formic 作业数据及其他禁止内容没有进入发行包；
-7. 从源码仓库之外调用实际发行程序，确认 ATT 的固定配置、项目和 Prompt 路径只依赖发行
+6. 确认两个托管模板采用已经验证的高吞吐默认且不含秘密；检查干净公开发行时，还必须确认
+   ATT 与 Formic 的活动配置分别逐字节等于各自模板，并且不含真实 API key、token 等凭据；
+7. 检查包内相对链接全部有效，并确认 Formic 作业数据及其他禁止内容没有进入发行包；
+8. 从源码仓库之外调用实际发行程序，确认 ATT 的固定配置、项目和 Prompt 路径只依赖发行
    根，并确认 Formic 只读取 `tools/formic/config.toml`。
 
 只有上述程序、依赖、资源、链接和独立运行检查共同通过，才能把 `dist/` 视为完整发行物。
@@ -133,10 +142,10 @@ Formic 的游戏语料、作业计划、任务说明副本、单元结果、最�
 发行期间不得改为其他资产。
 
 Release workflow 不重复这些检查；它只使用锁定工具链和依赖构建静态 `att.exe`，从空的
-`dist/` 执行普通资源同步：从固定 URL 下载并校验 Formic，从当前 Visual Studio 构建环境
-取得经过签名检查的 x64 `VCRUNTIME140.dll`，生成 `runtime.json`，再校验
-`att.exe --version`、打包并发布。`projects/` 作为空目录进入压缩包；Formic 输入、计划、
-结果和 worker 档案不得进入压缩包。
+`dist/` 同步托管资源并首次创建两个活动配置：从固定 URL 下载并校验 Formic，从当前
+Visual Studio 构建环境取得经过签名检查的 x64 `VCRUNTIME140.dll`，生成 `runtime.json`，
+再确认两个活动配置分别与模板完全相同且不含真实凭据，校验 `att.exe --version`、打包并发布。
+`projects/` 作为空目录进入压缩包；Formic 输入、计划、结果和 worker 档案不得进入压缩包。
 
 正式附件固定为 `att-vMAJOR.MINOR.PATCH-windows-x64.zip` 和 `SHA256SUMS.txt`。ZIP 使用
 兼容 Windows 常用解压工具的标准 Deflate，并采用可用工具的最高压缩级别。同一 job 完成构建、

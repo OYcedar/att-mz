@@ -317,9 +317,10 @@ if (-not (Test-Path -LiteralPath $distributionRoot -PathType Container)) {
 }
 Assert-NoReparsePoint -Path $distributionRoot -Recurse
 
-& (Join-Path $PSScriptRoot 'sync-dist-resources.ps1') -Check -TargetRoot $distributionRoot
+& (Join-Path $PSScriptRoot 'sync-dist-resources.ps1') -Check -RequireDefaultConfig `
+    -TargetRoot $distributionRoot
 
-foreach ($requiredFile in @('att.exe', 'config.toml', 'LICENSE', 'README.md')) {
+foreach ($requiredFile in @('att.exe', 'config.example.toml', 'config.toml', 'LICENSE', 'README.md')) {
     $path = Join-Path $distributionRoot $requiredFile
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "发行文件缺失：$path"
@@ -337,6 +338,7 @@ $allowedTopLevel = [System.Collections.Generic.HashSet[string]]::new(
 )
 foreach ($name in @(
         'att.exe',
+        'config.example.toml',
         'config.toml',
         'LICENSE',
         'README.md',
