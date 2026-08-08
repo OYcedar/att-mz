@@ -1,0 +1,46 @@
+# 物品获得与失去提示。%1 由同目录 Placeholder 文件保护。
+[[rule]]
+plugin = "TinyGetInfoWnd"
+path = "textGainItem"
+
+[[rule]]
+plugin = "TinyGetInfoWnd"
+path = "textLoseItem"
+
+# 图鉴菜单与完成率提示。
+[[rule]]
+plugin = "SceneGlossary"
+path = "CommandName"
+
+[[rule]]
+plugin = "SceneGlossary"
+path = "CommandName2"
+
+[[rule]]
+plugin = "SceneGlossary"
+path = "CommandName3"
+
+[[rule]]
+plugin = "SceneGlossary"
+path = "CompleteMessage"
+
+# 参数值是 JSON array，其中每一项又是 JSON object string。
+[[rule]]
+plugin = "CustomizeConfigItem"
+path = '["スイッチ項目"][].Name'
+
+[[rule]]
+plugin = "SupponShopStock"
+path = '["Label of stock Number"]'
+
+[[rule]]
+plugin = "SupponShopStock"
+path = '["Label of sold out"]'
+
+[[rule]]
+plugin = "CustomizeErrorScreen"
+path = '["メインメッセージ"]'
+
+[[rule]]
+plugin = "FilterController"
+path = '["enabledAll-Text"]'

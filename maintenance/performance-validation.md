@@ -13,6 +13,11 @@
 全部性能计时使用 Release/MSVC 构建的实际可执行文件。在 Git 忽略的 `tmp/` 下建立
 独立测试工作区，并保存测量脚本、原始记录和报告。
 
+仓库的正式入口是 [`scripts/measure-performance.ps1`](../scripts/measure-performance.ps1)，
+代表样本、样本专用 Rules、术语表、Placeholder 和本地 Provider 见
+[`maintenance/performance/README.md`](performance/README.md)。脚本实现本指南规定的成对
+顺序、预算检查、正确性核对和证据记录；修改脚本或样本后，先按该说明重新验证测试套件。
+
 开始正式比较前冻结并记录证据身份：CPU 与逻辑核心数、内存、存储介质、Windows 版本，
 Rust 工具链、可执行文件绝对路径与 `--version`、源码提交或工作区差异、配置与 Profile，
 以及每个真实样本的名称和稳定内容身份。缺少这些信息时，结果只能说明本次未标定环境，

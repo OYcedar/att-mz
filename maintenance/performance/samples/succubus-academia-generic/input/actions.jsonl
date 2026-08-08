@@ -1,0 +1,3 @@
+{"id":"alma-elma-action-intro","kind":"battle_action","units":[{"id":"name","text":"サキュバスアーツ"},{"id":"narration","text":"アルマエルマは風をまとい、演習場へ歩み出た。"},{"id":"dialogue","text":"_HERO_、準備はいい？"}]}
+{"id":"alma-elma-action-result","kind":"battle_action","units":[{"id":"name","text":"疾風"},{"id":"narration","text":"鋭い風が標的の周囲を駆け抜けた。"},{"id":"dialogue","text":"これが_ME_の得意な風術よ。"}]}
+{"id":"alma-elma-action-finish","kind":"battle_action","units":[{"id":"name","text":"サキュバスアーツ"},{"id":"narration","text":"演習の終了を告げる鐘が鳴った。"},{"id":"dialogue","text":"_YOU_もよく頑張ったわ。"}]}
