@@ -128,7 +128,7 @@ impl LocalizedCliError {
     pub(crate) const fn exit_code(&self) -> u8 {
         match self.kind {
             ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => 0,
-            _ => 2,
+            _ => 1,
         }
     }
 
@@ -1199,7 +1199,7 @@ mod tests {
         .expect_err("已删除的 progress 参数必须被拒绝");
         let localizer = UiLocalizer::new(UiLocale::French);
         assert_eq!(error.kind(), ErrorKind::UnknownArgument);
-        assert_eq!(error.exit_code(), 2);
+        assert_eq!(error.exit_code(), 1);
         assert!(error.use_stderr());
         assert!(
             error
@@ -1277,7 +1277,7 @@ mod tests {
             AttArguments::try_parse_localized_from(["att", "--ui-language=de-DE", "--help"])
                 .expect_err("不支持的显式 locale 必须优先于 Help 报错");
         assert_eq!(error.kind(), ErrorKind::ValueValidation);
-        assert_eq!(error.exit_code(), 2);
+        assert_eq!(error.exit_code(), 1);
         assert!(UiLocale::ALL.into_iter().any(|locale| {
             error.output().contains(
                 &UiLocalizer::new(locale)

@@ -321,45 +321,8 @@ manual-value = { $code ->
     [keep_exported_type] Сохраните type, записанный командой manual export
    *[other] __ATT_FALLBACK__
 }
-task-record-title = Задача перевода { $ordinal } · { $state }
-task-record-state-label = { $state ->
-    [complete] Завершена
-    [partial] Частично завершена
-    [unavailable] Недоступна
-    [execution_failed] Ошибка выполнения
-    [commit_preparation_failed] Ошибка подготовки фиксации
-    [commit_not_applied] Фиксация не применена
-    [commit_outcome_unknown] Результат фиксации неизвестен
-    [not_committed_after_earlier_failure] Не зафиксирована после предыдущей ошибки
-    [invalid_result] Недопустимая последовательность результатов Executor
-    [cancelled] Отменена
-   *[other] { $state }
-}
-task-record-summary-with-written = `Задача { $ordinal }/{ $total }` · `Попыток: { $attempts }` · `Принято { $accepted }/{ $expected }` · `Записано в { $written } позиций`
-task-record-summary-without-written = `Задача { $ordinal }/{ $total }` · `Попыток: { $attempts }` · `Принято { $accepted }/{ $expected }`
-task-record-run-id-label = ID запуска:
-task-record-started-at-label = Начало:
-task-record-duration-label = Общая длительность:
-task-record-endpoint-label = Endpoint:
-task-record-model-label = Модель:
-task-record-custom-parameters-heading = Пользовательские параметры
-task-record-attempts-heading = Попытки запроса
+task-record-title = Задача перевода
 task-record-final-result-heading = Итоговый результат
-task-record-no-request = Не сформирован запрос к модели, готовый к отправке.
-task-record-parse-error = Ошибка разбора: { $kind ->
-    [thinking_empty] содержимое рассуждения пусто, строка { $line }, столбец { $column }
-   *[json] недопустимый JSON ответа модели (категория `{ $category }`), строка { $line }, столбец { $column }
-}
-task-record-attempt-succeeded = Попытка { $number }: успешно; finish reason { $finish_reason }
-task-record-attempt-token-usage = ; токены `{ $prompt } / { $completion } / { $total }`
-task-record-attempt-duration = ; длительность `{ $duration }`
-task-record-attempt-retryable = Попытка { $number }: повторяемая ошибка запроса; длительность `{ $duration }`
-task-record-attempt-retry-after = ; Retry-After `{ $duration }`
-task-record-attempt-wait-retry = ; повтор через `{ $duration }`
-task-record-attempt-wait-completed = ; ожидание `{ $duration }` завершено; следующая попытка не началась
-task-record-attempt-wait-cancelled = ; запланировано ожидание `{ $duration }`; отменено во время ожидания
-task-record-attempt-failed = Попытка { $number }: ошибка обработки запроса или ответа; длительность `{ $duration }`
-task-record-attempt-cancelled = Попытка { $number }: отменена; длительность `{ $duration }`
 task-record-final-status = Состояние: { $state ->
     [complete] завершена, фиксация подтверждена
     [partial] частично завершена, фиксация подтверждена
@@ -376,5 +339,3 @@ task-record-final-status = Состояние: { $state ->
 task-record-accepted-written = Принято: { $accepted } элементов, записано в { $written } фактических позиций
 task-record-accepted-outcome-unknown = Проверено: { $accepted } элементов; результат фиксации базы данных невозможно подтвердить
 task-record-task-diagnostic = Диагностика задачи
-task-record-duration-seconds = { $value } с
-task-record-duration-milliseconds = { $value } мс

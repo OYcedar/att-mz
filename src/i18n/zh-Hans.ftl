@@ -311,45 +311,8 @@ manual-value = { $code ->
     [keep_exported_type] 保留 manual export 生成的 type
    *[other] __ATT_FALLBACK__
 }
-task-record-title = 翻译任务 { $ordinal } · { $state }
-task-record-state-label = { $state ->
-    [complete] 完成
-    [partial] 部分完成
-    [unavailable] 不可用
-    [execution_failed] 执行失败
-    [commit_preparation_failed] 提交准备失败
-    [commit_not_applied] 提交未应用
-    [commit_outcome_unknown] 提交结果未知
-    [not_committed_after_earlier_failure] 因前序失败未提交
-    [invalid_result] 执行结果序列无效
-    [cancelled] 已取消
-   *[other] { $state }
-}
-task-record-summary-with-written = `任务 { $ordinal }/{ $total }` · `尝试 { $attempts } 次` · `验收 { $accepted }/{ $expected }` · `写入 { $written } 处`
-task-record-summary-without-written = `任务 { $ordinal }/{ $total }` · `尝试 { $attempts } 次` · `验收 { $accepted }/{ $expected }`
-task-record-run-id-label = Run ID：
-task-record-started-at-label = 开始时间：
-task-record-duration-label = 总耗时：
-task-record-endpoint-label = Endpoint：
-task-record-model-label = Model：
-task-record-custom-parameters-heading = 自定义参数
-task-record-attempts-heading = 请求过程
+task-record-title = 翻译任务
 task-record-final-result-heading = 最终结果
-task-record-no-request = 没有形成可发送的模型请求。
-task-record-parse-error = 解析错误：{ $kind ->
-    [thinking_empty] 模型响应的思考内容为空，第 { $line } 行、第 { $column } 列
-   *[json] 模型响应 JSON 无效（类别 `{ $category }`），第 { $line } 行、第 { $column } 列
-}
-task-record-attempt-succeeded = 尝试 { $number }：成功；finish reason { $finish_reason }
-task-record-attempt-token-usage = ；token `{ $prompt } / { $completion } / { $total }`
-task-record-attempt-duration = ；耗时 `{ $duration }`
-task-record-attempt-retryable = 尝试 { $number }：可重试请求失败；耗时 `{ $duration }`
-task-record-attempt-retry-after = ；Retry-After `{ $duration }`
-task-record-attempt-wait-retry = ；等待 `{ $duration }` 后重试
-task-record-attempt-wait-completed = ；等待 `{ $duration }` 已完成，下一次尝试未开始
-task-record-attempt-wait-cancelled = ；计划等待 `{ $duration }`，等待期间取消
-task-record-attempt-failed = 尝试 { $number }：请求或响应处理失败；耗时 `{ $duration }`
-task-record-attempt-cancelled = 尝试 { $number }：已取消；耗时 `{ $duration }`
 task-record-final-status = 状态：{ $state ->
     [complete] 完成，已确认提交
     [partial] 部分完成，已确认提交
@@ -366,5 +329,3 @@ task-record-final-status = 状态：{ $state ->
 task-record-accepted-written = 已接受：{ $accepted } 项，写入 { $written } 个实际位置
 task-record-accepted-outcome-unknown = 已验收：{ $accepted } 项；数据库提交终态无法确认
 task-record-task-diagnostic = 任务诊断
-task-record-duration-seconds = { $value } 秒
-task-record-duration-milliseconds = { $value } 毫秒

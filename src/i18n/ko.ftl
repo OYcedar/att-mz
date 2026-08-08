@@ -311,45 +311,8 @@ manual-value = { $code ->
     [keep_exported_type] manual export가 기록한 type을 유지하세요
    *[other] __ATT_FALLBACK__
 }
-task-record-title = 번역 작업 { $ordinal } · { $state }
-task-record-state-label = { $state ->
-    [complete] 완료
-    [partial] 부분 완료
-    [unavailable] 사용 불가
-    [execution_failed] 실행 실패
-    [commit_preparation_failed] 커밋 준비 실패
-    [commit_not_applied] 커밋 미적용
-    [commit_outcome_unknown] 커밋 결과 알 수 없음
-    [not_committed_after_earlier_failure] 이전 실패로 미커밋
-    [invalid_result] 잘못된 Executor 결과 순서
-    [cancelled] 취소됨
-   *[other] { $state }
-}
-task-record-summary-with-written = `작업 { $ordinal }/{ $total }` · `시도 { $attempts }회` · `검수 { $accepted }/{ $expected }` · `{ $written }곳에 기록`
-task-record-summary-without-written = `작업 { $ordinal }/{ $total }` · `시도 { $attempts }회` · `검수 { $accepted }/{ $expected }`
-task-record-run-id-label = Run ID:
-task-record-started-at-label = 시작 시간:
-task-record-duration-label = 총 소요 시간:
-task-record-endpoint-label = Endpoint:
-task-record-model-label = Model:
-task-record-custom-parameters-heading = 사용자 지정 매개변수
-task-record-attempts-heading = 요청 과정
+task-record-title = 번역 작업
 task-record-final-result-heading = 최종 결과
-task-record-no-request = 전송 가능한 모델 요청이 만들어지지 않았습니다.
-task-record-parse-error = 구문 분석 오류: { $kind ->
-    [thinking_empty] 사고 내용이 비어 있습니다({ $line }행 { $column }열)
-   *[json] 모델 응답 JSON이 올바르지 않습니다(범주 `{ $category }`, { $line }행 { $column }열)
-}
-task-record-attempt-succeeded = 시도 { $number }: 성공; finish reason { $finish_reason }
-task-record-attempt-token-usage = ; token `{ $prompt } / { $completion } / { $total }`
-task-record-attempt-duration = ; 소요 시간 `{ $duration }`
-task-record-attempt-retryable = 시도 { $number }: 재시도 가능한 요청 실패; 소요 시간 `{ $duration }`
-task-record-attempt-retry-after = ; Retry-After `{ $duration }`
-task-record-attempt-wait-retry = ; `{ $duration }` 후 재시도
-task-record-attempt-wait-completed = ; `{ $duration }` 대기는 완료되었지만 다음 시도는 시작되지 않음
-task-record-attempt-wait-cancelled = ; `{ $duration }` 대기 중 취소됨
-task-record-attempt-failed = 시도 { $number }: 요청 또는 응답 처리 실패; 소요 시간 `{ $duration }`
-task-record-attempt-cancelled = 시도 { $number }: 취소됨; 소요 시간 `{ $duration }`
 task-record-final-status = 상태: { $state ->
     [complete] 완료, 커밋 확인됨
     [partial] 부분 완료, 커밋 확인됨
@@ -366,5 +329,3 @@ task-record-final-status = 상태: { $state ->
 task-record-accepted-written = 수락: { $accepted }개 항목, 실제 위치 { $written }곳에 기록
 task-record-accepted-outcome-unknown = 검수 완료: { $accepted }개 항목; 데이터베이스 커밋 결과를 확인할 수 없음
 task-record-task-diagnostic = 작업 진단
-task-record-duration-seconds = { $value }초
-task-record-duration-milliseconds = { $value }밀리초

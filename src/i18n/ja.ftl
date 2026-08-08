@@ -311,45 +311,8 @@ manual-value = { $code ->
     [keep_exported_type] manual export が出力した type を保持してください
    *[other] __ATT_FALLBACK__
 }
-task-record-title = 翻訳タスク { $ordinal } · { $state }
-task-record-state-label = { $state ->
-    [complete] 完了
-    [partial] 一部完了
-    [unavailable] 利用不可
-    [execution_failed] 実行失敗
-    [commit_preparation_failed] コミット準備失敗
-    [commit_not_applied] コミット未適用
-    [commit_outcome_unknown] コミット結果不明
-    [not_committed_after_earlier_failure] 先行失敗により未コミット
-    [invalid_result] Executor 結果列が無効
-    [cancelled] キャンセル済み
-   *[other] { $state }
-}
-task-record-summary-with-written = `タスク { $ordinal }/{ $total }` · `試行 { $attempts } 回` · `検収 { $accepted }/{ $expected }` · `書き込み { $written } 箇所`
-task-record-summary-without-written = `タスク { $ordinal }/{ $total }` · `試行 { $attempts } 回` · `検収 { $accepted }/{ $expected }`
-task-record-run-id-label = Run ID：
-task-record-started-at-label = 開始時刻：
-task-record-duration-label = 合計時間：
-task-record-endpoint-label = Endpoint：
-task-record-model-label = Model：
-task-record-custom-parameters-heading = カスタムパラメーター
-task-record-attempts-heading = リクエスト経過
+task-record-title = 翻訳タスク
 task-record-final-result-heading = 最終結果
-task-record-no-request = 送信可能なモデルリクエストは作成されませんでした。
-task-record-parse-error = 解析エラー：{ $kind ->
-    [thinking_empty] 思考内容が空です（{ $line } 行 { $column } 列）
-   *[json] モデル応答の JSON が無効です（カテゴリ `{ $category }`、{ $line } 行 { $column } 列）
-}
-task-record-attempt-succeeded = 試行 { $number }：成功；finish reason { $finish_reason }
-task-record-attempt-token-usage = ；token `{ $prompt } / { $completion } / { $total }`
-task-record-attempt-duration = ；所要時間 `{ $duration }`
-task-record-attempt-retryable = 試行 { $number }：再試行可能なリクエスト失敗；所要時間 `{ $duration }`
-task-record-attempt-retry-after = ；Retry-After `{ $duration }`
-task-record-attempt-wait-retry = ；`{ $duration }` 後に再試行
-task-record-attempt-wait-completed = ；`{ $duration }` の待機は完了しましたが、次の試行は開始されませんでした
-task-record-attempt-wait-cancelled = ；`{ $duration }` の待機中にキャンセル
-task-record-attempt-failed = 試行 { $number }：リクエストまたはレスポンス処理失敗；所要時間 `{ $duration }`
-task-record-attempt-cancelled = 試行 { $number }：キャンセル済み；所要時間 `{ $duration }`
 task-record-final-status = 状態：{ $state ->
     [complete] 完了、コミット確認済み
     [partial] 一部完了、コミット確認済み
@@ -366,5 +329,3 @@ task-record-final-status = 状態：{ $state ->
 task-record-accepted-written = 受理：{ $accepted } 項目、実位置 { $written } 箇所へ書き込み
 task-record-accepted-outcome-unknown = 検収済み：{ $accepted } 項目；データベースのコミット結果を確認できません
 task-record-task-diagnostic = タスク診断
-task-record-duration-seconds = { $value } 秒
-task-record-duration-milliseconds = { $value } ミリ秒

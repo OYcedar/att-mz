@@ -28,8 +28,6 @@ use crate::execution::ordered::{
 use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::language::{LanguageAnalysis, LanguagePair};
-#[cfg(test)]
-use crate::llm::LlmUsage;
 use crate::llm::{ChatMessage, LlmClientConcurrency};
 use crate::rpg_maker::asset::RpgMakerAssetOwner;
 use crate::rpg_maker::model::{LogicalTextLocation, TextUnitContent, TextUnitRole};
@@ -45,16 +43,17 @@ use crate::translation::placeholder_projection::{
     LanguageTextProjectionError, PlaceholderBindingIndex, PlaceholderMultisetError,
 };
 use crate::translation::task_planning::TaskId;
-use crate::translation_protocol::TranslationTaskResponseJsonErrorCategory;
+use crate::translation_protocol::{
+    TranslationTaskResponseJsonErrorCategory, TranslationTaskResponseParseError,
+    TranslationTaskResponseParseErrorKind,
+};
 
-use super::executor::FinalLlmResponseMetadata;
 use super::profile::RpgMakerTranslationProfile as ConfiguredRpgMakerTranslationProfile;
 use super::task_record::{
     NoOpTranslationTaskRecordSink, TranslationAssistantValueError, TranslationTaskCommitFailure,
     TranslationTaskCommitFailureImpact, TranslationTaskCommitPhase, TranslationTaskExecution,
     TranslationTaskExecutionEvidence, TranslationTaskExecutionFailure,
     TranslationTaskRecordDocument, TranslationTaskRecordFinalState, TranslationTaskRecordSink,
-    TranslationTaskResponseParseError, TranslationTaskResponseParseErrorKind,
 };
 
 /// 模型响应返回后仍要执行验收、传播准备和顺序提交；这些本地完成项可以在内存中
@@ -2231,18 +2230,15 @@ impl TranslationTaskOutcomeContext {
 pub(crate) enum TranslationTaskOutcome {
     Complete {
         context: TranslationTaskOutcomeContext,
-        final_response: FinalLlmResponseMetadata,
         accepted: NonEmptyTaskItems<AcceptedTranslationDecision>,
     },
     Partial {
         context: TranslationTaskOutcomeContext,
-        final_response: FinalLlmResponseMetadata,
         accepted: NonEmptyTaskItems<AcceptedTranslationDecision>,
         unresolved: NonEmptyTaskItems<UnresolvedTranslationUnit>,
     },
     Unavailable {
         context: TranslationTaskOutcomeContext,
-        final_response: Option<FinalLlmResponseMetadata>,
         reason: TranslationTaskUnavailableReason,
         unresolved: NonEmptyTaskItems<UnresolvedTranslationUnit>,
     },
@@ -2271,34 +2267,6 @@ impl TranslationTaskOutcome {
             | Self::Partial { context, .. }
             | Self::Unavailable { context, .. } => context.attempts,
         }
-    }
-
-    #[cfg(test)]
-    fn final_response(&self) -> Option<&FinalLlmResponseMetadata> {
-        match self {
-            Self::Complete { final_response, .. } | Self::Partial { final_response, .. } => {
-                Some(final_response)
-            }
-            Self::Unavailable { final_response, .. } => final_response.as_ref(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn provider_request_id(&self) -> Option<&str> {
-        self.final_response()
-            .and_then(FinalLlmResponseMetadata::provider_request_id)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn provider_response_id(&self) -> Option<&str> {
-        self.final_response()
-            .and_then(FinalLlmResponseMetadata::provider_response_id)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn final_response_usage(&self) -> Option<LlmUsage> {
-        self.final_response()
-            .and_then(FinalLlmResponseMetadata::usage)
     }
 
     pub(crate) fn accepted(&self) -> &[AcceptedTranslationDecision] {
@@ -3257,7 +3225,6 @@ where
                     });
                 self.service.record_task(|| {
                     TranslationTaskRecordDocument::new(
-                        self.total_tasks,
                         task,
                         evidence,
                         TranslationTaskRecordFinalState::ExecutionFailedNoChanges {
@@ -3285,7 +3252,6 @@ where
                     });
                 self.service.record_task(|| {
                     TranslationTaskRecordDocument::new(
-                        self.total_tasks,
                         task,
                         evidence,
                         TranslationTaskRecordFinalState::CancelledNoChanges { outcome: None },
@@ -3314,7 +3280,6 @@ where
                     });
                 self.service.record_task(|| {
                     TranslationTaskRecordDocument::new(
-                        self.total_tasks,
                         task,
                         evidence,
                         TranslationTaskRecordFinalState::InvalidResultNoChanges {
@@ -3508,9 +3473,8 @@ where
                 }
             }
         };
-        self.service.record_task(|| {
-            TranslationTaskRecordDocument::new(self.total_tasks, task, evidence, state)
-        });
+        self.service
+            .record_task(|| TranslationTaskRecordDocument::new(task, evidence, state));
     }
 
     fn record_commit_failure(
@@ -3549,9 +3513,8 @@ where
                 }
             }
         };
-        self.service.record_task(|| {
-            TranslationTaskRecordDocument::new(self.total_tasks, task, evidence, state)
-        });
+        self.service
+            .record_task(|| TranslationTaskRecordDocument::new(task, evidence, state));
         Err(TranslationTaskPipelineError::CommitTask {
             task_index,
             source,
@@ -3620,7 +3583,7 @@ where
             }
         };
         self.service.record_task(|| {
-            TranslationTaskRecordDocument::new(self.total_tasks, task, evidence, state)
+            TranslationTaskRecordDocument::new(task, evidence, state)
                 .with_outcome_diagnostics(diagnostics)
         });
     }
@@ -5830,12 +5793,6 @@ mod tests {
                     NonZeroUsize::MIN,
                     Vec::new(),
                 ),
-                final_response: FinalLlmResponseMetadata::new(
-                    Some(format!("request-{}", task_index.get())),
-                    Some(format!("response-{}", task_index.get())),
-                    crate::diagnostic::RpgMakerModelFinishReason::Stop,
-                    None,
-                ),
                 accepted: test_non_empty(expected.iter().map(patch).collect()),
             },
             FakeOutcomeKind::Partial => TranslationTaskOutcome::Partial {
@@ -5846,12 +5803,6 @@ mod tests {
                         item_index: 3,
                         id: task_id(99),
                     }],
-                ),
-                final_response: FinalLlmResponseMetadata::new(
-                    Some(format!("request-{}", task_index.get())),
-                    Some(format!("response-{}", task_index.get())),
-                    crate::diagnostic::RpgMakerModelFinishReason::Stop,
-                    None,
                 ),
                 accepted: test_non_empty(vec![patch(&expected[0])]),
                 unresolved: test_non_empty(vec![unresolved(
@@ -5873,12 +5824,6 @@ mod tests {
                         ),
                     }],
                 ),
-                final_response: Some(FinalLlmResponseMetadata::new(
-                    Some(format!("request-{}", task_index.get())),
-                    Some(format!("response-{}", task_index.get())),
-                    crate::diagnostic::RpgMakerModelFinishReason::Length,
-                    None,
-                )),
                 reason: TranslationTaskUnavailableReason::ModelResponseUnusable,
                 unresolved: test_non_empty(
                     expected
@@ -5895,7 +5840,6 @@ mod tests {
                     NonZeroUsize::new(3).expect("测试尝试数必须非零"),
                     Vec::new(),
                 ),
-                final_response: None,
                 reason: TranslationTaskUnavailableReason::RecoverableRequestExhausted {
                     diagnostic: test_retry_exhausted_report(),
                 },

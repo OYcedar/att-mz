@@ -77,7 +77,8 @@ Generic 主要表：
 | `translation_resource` | 当前术语与 Placeholder |
 
 `generic_unit` 的自动正文使用 `translation` 与 `translation_state`；人工正文只使用
-`generic_manual_translation`。
+`generic_manual_translation`。Generic 人工条目始终是 `free`，人工表不重复保存
+`translation_type`；Manual 和 Lua 在读取时直接使用这一固定含义。
 
 MV/MZ 主要表：
 
@@ -93,7 +94,9 @@ MV/MZ 主要表：
 | `rpg_maker_mutation_claim` | 写回修改范围 |
 
 人工表没有外键。Raw SQL 可以直接读取或破坏这些表；ATT 不保证被修改后的数据库仍满足
-普通命令要求。当前 DDL 以源码为准，不建立另一个 schema 版本或迁移文档。
+普通命令要求。RPG Maker 人工表保留 `translation_type`，因为失去当前位置后仍需区分
+`fixed` 与 `free`，无法再从当前 Unit 推导。当前 DDL 以源码为准，不建立另一个 schema
+版本或迁移文档。
 
 ## 5. Lua 数据库连接
 

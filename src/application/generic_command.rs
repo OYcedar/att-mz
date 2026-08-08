@@ -13,13 +13,12 @@ use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures_util::stream::FuturesOrdered;
 use futures_util::{FutureExt, StreamExt};
 use rayon::prelude::*;
 use rusqlite::Connection;
-use time::OffsetDateTime;
 
 use super::command::TerminationSignals;
 use super::config::{
@@ -69,11 +68,11 @@ use crate::generic::{
     GenericCompiledPlaceholderRules, GenericCurrentTranslation, GenericInitRequest,
     GenericPlaceholderService, GenericPlanningError, GenericPlanningUnitLocator, GenericProject,
     GenericProjectError, GenericProjectStore, GenericProtectedText, GenericStoredSnapshot,
-    GenericTaskRecordDocument, GenericTaskRecordState, GenericTaskResponseRecord, GenericUnitKey,
-    GenericUnitMap, GenericWriteBackCandidate, GenericWriteBackError, PlannedTask, PlanningUnit,
-    ResponseProblem, TranslationAcceptance, TranslationOrigin, TranslationPlan, TranslationWrite,
-    ValidatedReuse, accept_parsed_response_with_cancellation,
-    build_write_back_candidate_with_cancellation, current_translation_for_stored_with_cancellation,
+    GenericTaskRecordDocument, GenericTaskRecordState, GenericUnitKey, GenericUnitMap,
+    GenericWriteBackCandidate, GenericWriteBackError, PlannedTask, PlanningUnit, ResponseProblem,
+    TranslationAcceptance, TranslationOrigin, TranslationPlan, TranslationWrite, ValidatedReuse,
+    accept_parsed_response_with_cancellation, build_write_back_candidate_with_cancellation,
+    current_translation_for_stored_with_cancellation,
     ensure_input_fingerprints_current_with_cancellation,
     plan_translation_with_validator_and_cancellation,
     terminology_hit_fingerprint_with_cancellation,
@@ -1030,7 +1029,7 @@ impl ProductionGenericCommandRunner {
             generic_workspace(command.common().projects_root(), &project).join("project.db");
         let operation = command.operation();
         let file = command.file().to_path_buf();
-        let language_modules = command.language_modules().clone();
+        let language_modules = command.language_modules().cloned();
         let lease_provider = ProjectCommandLeaseService::new(
             command.common().projects_root().to_path_buf(),
             GENERIC_ENGINE_NAME,
@@ -1051,7 +1050,7 @@ impl ProductionGenericCommandRunner {
                     &database_path,
                     operation,
                     &file,
-                    &language_modules,
+                    language_modules.as_ref(),
                     &blocking_cancellation,
                 )
             })
@@ -1644,23 +1643,11 @@ impl ProductionGenericCommandRunner {
                 *operation_llm_holder
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(llm.clone());
-                let metadata_client = Arc::clone(configuration.client());
-                let metadata_cancellation = operation_cancellation.clone();
-                let client_metadata = operation_cpu
-                    .execute(move || {
-                        ensure_generic_cpu_running(&metadata_cancellation)?;
-                        let metadata = metadata_client.record_metadata();
-                        ensure_generic_cpu_running(&metadata_cancellation)?;
-                        Ok::<_, GenericPreparationError>(metadata)
-                    })
-                    .await
-                    .map_err(generic_cpu_execution_failure)?
-                    .map_err(generic_preparation_failure)?;
                 let task_records = configure_generic_task_records(
                     command.record_translation_tasks(),
                     &operation_project_log,
                     &file_system_configuration,
-                    client_metadata,
+                    configuration.client().api_key_redactor(),
                     locale,
                     operation_cpu.clone(),
                     project.workspace_root(),
@@ -3895,40 +3882,22 @@ struct GenericTaskSummary {
 }
 
 struct GenericTaskRecordDraft {
-    total_tasks: usize,
     task_index: usize,
-    messages: Vec<ChatMessage>,
-    expected_outputs: usize,
-    started_at: OffsetDateTime,
-    duration: Duration,
-    attempt_count: usize,
-    attempts: Vec<crate::execution::llm_request::LlmRequestAttemptRecord>,
-    response: Option<GenericTaskResponseRecord>,
+    user_message: String,
+    raw_assistant: Option<String>,
 }
 
 struct GenericTaskRecordInFlight {
-    total_tasks: usize,
     task_index: usize,
-    messages: Vec<ChatMessage>,
-    expected_outputs: usize,
-    started_at: OffsetDateTime,
-    started: Instant,
-    attempt_count: usize,
-    attempts: Vec<crate::execution::llm_request::LlmRequestAttemptRecord>,
+    user_message: String,
 }
 
 impl GenericTaskRecordInFlight {
-    fn finish(self, response: Option<GenericTaskResponseRecord>) -> GenericTaskRecordDraft {
+    fn finish(self, raw_assistant: Option<String>) -> GenericTaskRecordDraft {
         GenericTaskRecordDraft {
-            total_tasks: self.total_tasks,
             task_index: self.task_index,
-            messages: self.messages,
-            expected_outputs: self.expected_outputs,
-            started_at: self.started_at,
-            duration: self.started.elapsed(),
-            attempt_count: self.attempt_count,
-            attempts: self.attempts,
-            response,
+            user_message: self.user_message,
+            raw_assistant,
         }
     }
 }
@@ -3936,15 +3905,9 @@ impl GenericTaskRecordInFlight {
 impl GenericTaskRecordDraft {
     fn finish(self, state: GenericTaskRecordState) -> GenericTaskRecordDocument {
         GenericTaskRecordDocument::new(
-            self.total_tasks,
             self.task_index,
-            self.messages,
-            self.expected_outputs,
-            self.started_at,
-            self.duration,
-            self.attempt_count,
-            self.attempts,
-            self.response,
+            self.user_message,
+            self.raw_assistant,
             state,
         )
     }
@@ -4012,7 +3975,7 @@ async fn execute_owned_generic_task(
     let render_terminology = Arc::clone(&context.terminology);
     let render_system_prompt = Arc::clone(&context.system_prompt);
     let render_cancellation = context.cancellation.clone();
-    let (task, expected_outputs, system_prompt, user_message) = context
+    let (task, system_prompt, user_message) = context
         .cpu
         .execute(move || {
             let user_message = render_generic_user_message_with_cancellation(
@@ -4021,14 +3984,9 @@ async fn execute_owned_generic_task(
                 &render_cancellation,
             )
             .map_err(GenericPreparationError::Planning)?;
-            let mut expected_outputs = 0_usize;
-            for _ in task.expected_output_ids() {
-                ensure_generic_cpu_running(&render_cancellation)?;
-                expected_outputs += 1;
-            }
             let system_prompt =
                 clone_generic_cpu_text(render_system_prompt.as_str(), &render_cancellation)?;
-            Ok::<_, GenericPreparationError>((task, expected_outputs, system_prompt, user_message))
+            Ok::<_, GenericPreparationError>((task, system_prompt, user_message))
         })
         .await
         .map_err(generic_cpu_execution_failure)?
@@ -4043,7 +4001,6 @@ async fn execute_owned_generic_task(
         context.total_tasks,
         task_index,
         task,
-        expected_outputs,
         user_message,
         Arc::clone(&context.facts),
         context.placeholder_rules.clone(),
@@ -4388,7 +4345,6 @@ async fn execute_generic_task(
     total_tasks: usize,
     task_index: usize,
     task: PlannedTask,
-    expected_outputs: usize,
     user_message: String,
     facts: Arc<GenericUnitMap<GenericValidationFact>>,
     placeholder_rules: GenericCompiledPlaceholderRules,
@@ -4403,11 +4359,11 @@ async fn execute_generic_task(
     cancellation: CooperativeCancellation,
     record_evidence: bool,
 ) -> Result<GenericPreparedTask, GenericCommandError> {
+    let recorded_user_message = record_evidence.then(|| user_message.clone());
     let messages = [
         ChatMessage::new(ChatMessageRole::System, system_prompt),
         ChatMessage::new(ChatMessageRole::User, user_message),
     ];
-    let record_started = record_evidence.then(|| (OffsetDateTime::now_utc(), Instant::now()));
     let execution = execute_llm_request_with_retry(
         llm,
         client,
@@ -4415,22 +4371,13 @@ async fn execute_generic_task(
         LlmRequestRetryPolicy::new(retry_delays, max_retry_after),
         &TokioDelay,
         &cancellation,
-        record_evidence,
     )
     .await;
-    let record_messages =
-        record_evidence.then(|| messages.into_iter().collect::<Vec<ChatMessage>>());
     let (outcome, evidence) = execution.into_parts();
-    let (attempt_count, attempts) = evidence.into_parts();
-    let record = record_started.map(|(started_at, started)| GenericTaskRecordInFlight {
-        total_tasks,
+    let attempt_count = evidence.attempt_count();
+    let record = recorded_user_message.map(|user_message| GenericTaskRecordInFlight {
         task_index,
-        messages: record_messages.expect("启用记录时必须保留模型消息"),
-        expected_outputs,
-        started_at,
-        started,
-        attempt_count,
-        attempts,
+        user_message,
     });
     let response_cancellation = cancellation.clone();
     let processing = cpu
@@ -4440,6 +4387,9 @@ async fn execute_generic_task(
             let outcome = match outcome {
                 LlmRequestExecutionOutcome::Response { response, .. } => {
                     let (content, finish_reason) = response.into_content_and_finish_reason();
+                    if record_evidence {
+                        response_record = Some(content.clone());
+                    }
                     ensure_generic_response_processing_running(&response_cancellation)?;
                     if matches!(finish_reason, LlmFinishReason::Stop) {
                         match parse_translation_response_with_cancellation(
@@ -4480,18 +4430,6 @@ async fn execute_generic_task(
                                     )?;
                                     writes.push(accepted.into_write());
                                 }
-                                if record_evidence {
-                                    response_record =
-                                        Some(GenericTaskResponseRecord::parsed_with_cancellation(
-                                            content,
-                                            parsed,
-                                            || {
-                                                ensure_generic_response_processing_running(
-                                                    &response_cancellation,
-                                                )
-                                            },
-                                        )?);
-                                }
                                 GenericPreparedTaskOutcome::Accepted {
                                     writes,
                                     diagnostics,
@@ -4508,17 +4446,10 @@ async fn execute_generic_task(
                                     total_tasks,
                                     error,
                                 );
-                                if record_evidence {
-                                    response_record =
-                                        Some(GenericTaskResponseRecord::invalid(content, error));
-                                }
                                 GenericPreparedTaskOutcome::Unavailable { diagnostic }
                             }
                         }
                     } else {
-                        if record_evidence {
-                            response_record = Some(GenericTaskResponseRecord::unprocessed(content));
-                        }
                         GenericPreparedTaskOutcome::Unavailable {
                             diagnostic: generic_task_response_diagnostic(
                                 task_index,
@@ -5777,7 +5708,7 @@ fn configure_generic_task_records(
     requested: bool,
     project_log: &GenericProjectLogSlot,
     file_system_configuration: &crate::runtime::filesystem::SystemFileSystemConfig,
-    client: crate::llm::LlmClientRecordMetadata,
+    redactor: Arc<crate::llm::ApiKeyRedactor>,
     locale: UiLocale,
     cpu: RayonCpuExecutor,
     project_workspace: &Path,
@@ -5822,8 +5753,7 @@ fn configure_generic_task_records(
         Ok(file_system) => ConfiguredTranslationTaskRecordSink::Markdown(Box::new(
             MarkdownTranslationTaskRecordSink::new(
                 project_workspace.join("task-records").join(&run_id),
-                run_id,
-                client,
+                redactor,
                 locale,
                 cpu,
                 file_system,
@@ -7098,14 +7028,8 @@ mod tests {
         let prepared = cancelled_generic_prepared_task(
             1,
             Some(GenericTaskRecordInFlight {
-                total_tasks: 3,
                 task_index: 1,
-                messages: vec![ChatMessage::new(ChatMessageRole::User, "request")],
-                expected_outputs: 2,
-                started_at: OffsetDateTime::now_utc(),
-                started: Instant::now(),
-                attempt_count: 1,
-                attempts: Vec::new(),
+                user_message: "request".to_owned(),
             }),
             1,
         );
@@ -7116,10 +7040,9 @@ mod tests {
             GenericPreparedTaskOutcome::Cancelled
         ));
         let record = prepared.record.expect("请求开始后的取消必须保留可提交记录");
-        assert_eq!(record.total_tasks, 3);
         assert_eq!(record.task_index, 1);
-        assert_eq!(record.attempt_count, 1);
-        assert!(record.response.is_none());
+        assert_eq!(record.user_message, "request");
+        assert!(record.raw_assistant.is_none());
     }
 
     struct BlockingLanguageModule {

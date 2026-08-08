@@ -13,7 +13,7 @@ MV、MZ 和 Generic 各自拥有项目状态与流程，同时复用语义相同
 | 不可改写内容、token、捕获、恢复或重叠 | [Placeholder](placeholders.md)；MV/MZ 同时读 [Rules](../rpg-maker/rules.md) |
 | Unit、Group、Semantic Scope、稳定装箱或临时 ID | [TaskBlock 规划](task-planning.md) |
 | System/User、响应 JSON、ID、形状或逐项验收 | [Prompt 与模型协议](prompts.md) |
-| 请求、Assistant 响应、JSON 修复或逐 ID 诊断 | [模型任务记录](task-records.md) |
+| 实际请求、原始 Assistant 或最终任务结果 | [模型任务记录](task-records.md) |
 | HTTP、超时、限速或运行时有限重试 | [Chat Completions](../runtime/chat-completions.md) |
 | Current、Partial、Unavailable 或引擎状态 | 对应 [MV/MZ Translate](../rpg-maker/translation.md)或 [Generic Translate](../generic/translation.md) |
 | 人工或 agent 补译、定点修订 | [Manual TOML](../manual/README.md)；需要批量上下文或特殊数据库操作时再读 [Lua](../lua/README.md) |

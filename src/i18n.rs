@@ -788,79 +788,8 @@ pub(crate) enum UiMessage<'a> {
     LogTaskOutcomeValue {
         outcome: &'a str,
     },
-    TaskRecordTitle {
-        ordinal: &'a str,
-        state: &'a str,
-    },
-    TaskRecordStateLabel {
-        state: &'a str,
-    },
-    TaskRecordSummaryWithWritten {
-        ordinal: u64,
-        total: u64,
-        attempts: u64,
-        accepted: u64,
-        expected: u64,
-        written: u64,
-    },
-    TaskRecordSummaryWithoutWritten {
-        ordinal: u64,
-        total: u64,
-        attempts: u64,
-        accepted: u64,
-        expected: u64,
-    },
-    TaskRecordRunIdLabel,
-    TaskRecordStartedAtLabel,
-    TaskRecordDurationLabel,
-    TaskRecordEndpointLabel,
-    TaskRecordModelLabel,
-    TaskRecordCustomParametersHeading,
-    TaskRecordAttemptsHeading,
+    TaskRecordTitle,
     TaskRecordFinalResultHeading,
-    TaskRecordNoRequest,
-    TaskRecordParseError {
-        kind: &'a str,
-        category: &'a str,
-        line: u64,
-        column: u64,
-    },
-    TaskRecordAttemptSucceeded {
-        number: u64,
-        finish_reason: &'a str,
-    },
-    TaskRecordAttemptTokenUsage {
-        prompt: u64,
-        completion: u64,
-        total: u64,
-    },
-    TaskRecordAttemptDuration {
-        duration: &'a str,
-    },
-    TaskRecordAttemptRetryable {
-        number: u64,
-        duration: &'a str,
-    },
-    TaskRecordAttemptRetryAfter {
-        duration: &'a str,
-    },
-    TaskRecordAttemptWaitRetry {
-        duration: &'a str,
-    },
-    TaskRecordAttemptWaitCompleted {
-        duration: &'a str,
-    },
-    TaskRecordAttemptWaitCancelled {
-        duration: &'a str,
-    },
-    TaskRecordAttemptFailed {
-        number: u64,
-        duration: &'a str,
-    },
-    TaskRecordAttemptCancelled {
-        number: u64,
-        duration: &'a str,
-    },
     TaskRecordFinalStatus {
         state: &'a str,
     },
@@ -872,12 +801,6 @@ pub(crate) enum UiMessage<'a> {
         accepted: u64,
     },
     TaskRecordTaskDiagnostic,
-    TaskRecordDurationSeconds {
-        value: &'a str,
-    },
-    TaskRecordDurationMilliseconds {
-        value: &'a str,
-    },
 }
 
 impl UiMessage<'_> {
@@ -1046,36 +969,12 @@ impl UiMessage<'_> {
             Self::LogTranslationTaskStarted { .. } => "log-translation-task-started",
             Self::LogTranslationTaskFinished { .. } => "log-translation-task-finished",
             Self::LogTaskOutcomeValue { .. } => "log-task-outcome-value",
-            Self::TaskRecordTitle { .. } => "task-record-title",
-            Self::TaskRecordStateLabel { .. } => "task-record-state-label",
-            Self::TaskRecordSummaryWithWritten { .. } => "task-record-summary-with-written",
-            Self::TaskRecordSummaryWithoutWritten { .. } => "task-record-summary-without-written",
-            Self::TaskRecordRunIdLabel => "task-record-run-id-label",
-            Self::TaskRecordStartedAtLabel => "task-record-started-at-label",
-            Self::TaskRecordDurationLabel => "task-record-duration-label",
-            Self::TaskRecordEndpointLabel => "task-record-endpoint-label",
-            Self::TaskRecordModelLabel => "task-record-model-label",
-            Self::TaskRecordCustomParametersHeading => "task-record-custom-parameters-heading",
-            Self::TaskRecordAttemptsHeading => "task-record-attempts-heading",
+            Self::TaskRecordTitle => "task-record-title",
             Self::TaskRecordFinalResultHeading => "task-record-final-result-heading",
-            Self::TaskRecordNoRequest => "task-record-no-request",
-            Self::TaskRecordParseError { .. } => "task-record-parse-error",
-            Self::TaskRecordAttemptSucceeded { .. } => "task-record-attempt-succeeded",
-            Self::TaskRecordAttemptTokenUsage { .. } => "task-record-attempt-token-usage",
-            Self::TaskRecordAttemptDuration { .. } => "task-record-attempt-duration",
-            Self::TaskRecordAttemptRetryable { .. } => "task-record-attempt-retryable",
-            Self::TaskRecordAttemptRetryAfter { .. } => "task-record-attempt-retry-after",
-            Self::TaskRecordAttemptWaitRetry { .. } => "task-record-attempt-wait-retry",
-            Self::TaskRecordAttemptWaitCompleted { .. } => "task-record-attempt-wait-completed",
-            Self::TaskRecordAttemptWaitCancelled { .. } => "task-record-attempt-wait-cancelled",
-            Self::TaskRecordAttemptFailed { .. } => "task-record-attempt-failed",
-            Self::TaskRecordAttemptCancelled { .. } => "task-record-attempt-cancelled",
             Self::TaskRecordFinalStatus { .. } => "task-record-final-status",
             Self::TaskRecordAcceptedWritten { .. } => "task-record-accepted-written",
             Self::TaskRecordAcceptedOutcomeUnknown { .. } => "task-record-accepted-outcome-unknown",
             Self::TaskRecordTaskDiagnostic => "task-record-task-diagnostic",
-            Self::TaskRecordDurationSeconds { .. } => "task-record-duration-seconds",
-            Self::TaskRecordDurationMilliseconds { .. } => "task-record-duration-milliseconds",
         }
     }
 
@@ -1321,85 +1220,8 @@ impl UiMessage<'_> {
             Self::LogTaskOutcomeValue { outcome } => {
                 set_text(&mut arguments, "outcome", outcome);
             }
-            Self::TaskRecordTitle { ordinal, state } => {
-                set_text(&mut arguments, "ordinal", ordinal);
+            Self::TaskRecordFinalStatus { state } => {
                 set_text(&mut arguments, "state", state);
-            }
-            Self::TaskRecordStateLabel { state } | Self::TaskRecordFinalStatus { state } => {
-                set_text(&mut arguments, "state", state);
-            }
-            Self::TaskRecordSummaryWithWritten {
-                ordinal,
-                total,
-                attempts,
-                accepted,
-                expected,
-                written,
-            } => {
-                set_number(&mut arguments, "ordinal", ordinal);
-                set_number(&mut arguments, "total", total);
-                set_number(&mut arguments, "attempts", attempts);
-                set_number(&mut arguments, "accepted", accepted);
-                set_number(&mut arguments, "expected", expected);
-                set_number(&mut arguments, "written", written);
-            }
-            Self::TaskRecordSummaryWithoutWritten {
-                ordinal,
-                total,
-                attempts,
-                accepted,
-                expected,
-            } => {
-                set_number(&mut arguments, "ordinal", ordinal);
-                set_number(&mut arguments, "total", total);
-                set_number(&mut arguments, "attempts", attempts);
-                set_number(&mut arguments, "accepted", accepted);
-                set_number(&mut arguments, "expected", expected);
-            }
-            Self::TaskRecordParseError {
-                kind,
-                category,
-                line,
-                column,
-            } => {
-                set_text(&mut arguments, "kind", kind);
-                set_text(&mut arguments, "category", category);
-                set_number(&mut arguments, "line", line);
-                set_number(&mut arguments, "column", column);
-            }
-            Self::TaskRecordAttemptSucceeded {
-                number,
-                finish_reason,
-            } => {
-                set_number(&mut arguments, "number", number);
-                set_text(&mut arguments, "finish_reason", finish_reason);
-            }
-            Self::TaskRecordAttemptTokenUsage {
-                prompt,
-                completion,
-                total,
-            } => {
-                set_number(&mut arguments, "prompt", prompt);
-                set_number(&mut arguments, "completion", completion);
-                set_number(&mut arguments, "total", total);
-            }
-            Self::TaskRecordAttemptDuration { duration } => {
-                set_text(&mut arguments, "duration", duration);
-            }
-            Self::TaskRecordAttemptRetryable { number, duration }
-            | Self::TaskRecordAttemptFailed { number, duration } => {
-                set_number(&mut arguments, "number", number);
-                set_text(&mut arguments, "duration", duration);
-            }
-            Self::TaskRecordAttemptRetryAfter { duration }
-            | Self::TaskRecordAttemptWaitRetry { duration }
-            | Self::TaskRecordAttemptWaitCompleted { duration }
-            | Self::TaskRecordAttemptWaitCancelled { duration } => {
-                set_text(&mut arguments, "duration", duration);
-            }
-            Self::TaskRecordAttemptCancelled { number, duration } => {
-                set_number(&mut arguments, "number", number);
-                set_text(&mut arguments, "duration", duration);
             }
             Self::TaskRecordAcceptedWritten { accepted, written } => {
                 set_number(&mut arguments, "accepted", accepted);
@@ -1409,12 +1231,6 @@ impl UiMessage<'_> {
                 set_number(&mut arguments, "accepted", accepted);
             }
             Self::TaskRecordTaskDiagnostic => {}
-            Self::TaskRecordDurationSeconds { value } => {
-                set_text(&mut arguments, "value", value);
-            }
-            Self::TaskRecordDurationMilliseconds { value } => {
-                set_text(&mut arguments, "value", value);
-            }
             Self::DiagnosticLocation { subject } => set_text(&mut arguments, "subject", subject),
             Self::DiagnosticExplanation { reason } => set_text(&mut arguments, "reason", reason),
             Self::DiagnosticResolution { action } => set_text(&mut arguments, "action", action),
@@ -1580,15 +1396,8 @@ impl UiMessage<'_> {
             | Self::ResultInitUpdated
             | Self::ResultCancelled
             | Self::ResultPlanSaved
-            | Self::TaskRecordRunIdLabel
-            | Self::TaskRecordStartedAtLabel
-            | Self::TaskRecordDurationLabel
-            | Self::TaskRecordEndpointLabel
-            | Self::TaskRecordModelLabel
-            | Self::TaskRecordCustomParametersHeading
-            | Self::TaskRecordAttemptsHeading
-            | Self::TaskRecordFinalResultHeading
-            | Self::TaskRecordNoRequest => {}
+            | Self::TaskRecordTitle
+            | Self::TaskRecordFinalResultHeading => {}
         }
         arguments
     }
@@ -2295,67 +2104,8 @@ mod tests {
             UiMessage::LogTaskOutcomeValue {
                 outcome: "complete",
             },
-            UiMessage::TaskRecordTitle {
-                ordinal: "000001",
-                state: "complete",
-            },
-            UiMessage::TaskRecordStateLabel { state: "complete" },
-            UiMessage::TaskRecordSummaryWithWritten {
-                ordinal: 1,
-                total: 3,
-                attempts: 2,
-                accepted: 4,
-                expected: 5,
-                written: 6,
-            },
-            UiMessage::TaskRecordSummaryWithoutWritten {
-                ordinal: 1,
-                total: 3,
-                attempts: 2,
-                accepted: 4,
-                expected: 5,
-            },
-            UiMessage::TaskRecordRunIdLabel,
-            UiMessage::TaskRecordStartedAtLabel,
-            UiMessage::TaskRecordDurationLabel,
-            UiMessage::TaskRecordEndpointLabel,
-            UiMessage::TaskRecordModelLabel,
-            UiMessage::TaskRecordCustomParametersHeading,
-            UiMessage::TaskRecordAttemptsHeading,
+            UiMessage::TaskRecordTitle,
             UiMessage::TaskRecordFinalResultHeading,
-            UiMessage::TaskRecordNoRequest,
-            UiMessage::TaskRecordParseError {
-                kind: "json",
-                category: "syntax",
-                line: 1,
-                column: 2,
-            },
-            UiMessage::TaskRecordAttemptSucceeded {
-                number: 1,
-                finish_reason: "stop",
-            },
-            UiMessage::TaskRecordAttemptTokenUsage {
-                prompt: 1,
-                completion: 2,
-                total: 3,
-            },
-            UiMessage::TaskRecordAttemptDuration { duration: "12 ms" },
-            UiMessage::TaskRecordAttemptRetryable {
-                number: 1,
-                duration: "12 ms",
-            },
-            UiMessage::TaskRecordAttemptRetryAfter { duration: "12 ms" },
-            UiMessage::TaskRecordAttemptWaitRetry { duration: "12 ms" },
-            UiMessage::TaskRecordAttemptWaitCompleted { duration: "12 ms" },
-            UiMessage::TaskRecordAttemptWaitCancelled { duration: "12 ms" },
-            UiMessage::TaskRecordAttemptFailed {
-                number: 1,
-                duration: "12 ms",
-            },
-            UiMessage::TaskRecordAttemptCancelled {
-                number: 1,
-                duration: "12 ms",
-            },
             UiMessage::TaskRecordFinalStatus { state: "complete" },
             UiMessage::TaskRecordAcceptedWritten {
                 accepted: 4,
@@ -2363,8 +2113,6 @@ mod tests {
             },
             UiMessage::TaskRecordAcceptedOutcomeUnknown { accepted: 4 },
             UiMessage::TaskRecordTaskDiagnostic,
-            UiMessage::TaskRecordDurationSeconds { value: "1.250" },
-            UiMessage::TaskRecordDurationMilliseconds { value: "12" },
         ]
     }
 }

@@ -48,7 +48,7 @@ fn removed_progress_argument_is_rejected_by_the_process_cli() {
         .output()
         .expect("att.exe 应可执行");
 
-    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8(output.stderr).expect("CLI 错误必须是 UTF-8");
     assert!(

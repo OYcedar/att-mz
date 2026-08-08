@@ -279,19 +279,7 @@ pub(crate) struct RelatedDiagnosticReport {
 /// 原始 Rust 错误与唯一安全公开报告的绑定。原始错误绝不参与 JSONL 或 CLI 呈现。
 pub(crate) struct ReportedFailure {
     report: DiagnosticReport,
-    sources: ReportedFailureSources,
-}
-
-struct ReportedFailureSources {
-    primary: super::BoxedError,
-    related: Vec<RelatedReportedFailureSources>,
-}
-
-struct RelatedReportedFailureSources {
-    #[allow(dead_code)]
-    relation: RelatedFailureRelation,
-    #[allow(dead_code)]
-    sources: Box<ReportedFailureSources>,
+    source: super::BoxedError,
 }
 
 impl ReportedFailure {
@@ -301,20 +289,13 @@ impl ReportedFailure {
     ) -> Self {
         Self {
             report,
-            sources: ReportedFailureSources {
-                primary: Box::new(source),
-                related: Vec::new(),
-            },
+            source: Box::new(source),
         }
     }
 
-    /// 同时保留安全报告树和对应的 Rust 原始错误树；相关错误不会被压平成正文。
+    /// 把相关错误的安全报告加入公开树；根错误仍作为 Error source。
     pub(crate) fn with_related(mut self, relation: RelatedFailureRelation, related: Self) -> Self {
         self.report = self.report.with_related(relation, related.report);
-        self.sources.related.push(RelatedReportedFailureSources {
-            relation,
-            sources: Box::new(related.sources),
-        });
         self
     }
 
@@ -333,7 +314,7 @@ impl ReportedFailure {
     }
 
     pub(crate) fn source_error(&self) -> &(dyn Error + 'static) {
-        self.sources.primary.as_ref()
+        self.source.as_ref()
     }
 }
 
@@ -354,7 +335,7 @@ impl fmt::Display for ReportedFailure {
 
 impl Error for ReportedFailure {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(self.sources.primary.as_ref())
+        Some(self.source.as_ref())
     }
 }
 

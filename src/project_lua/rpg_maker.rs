@@ -7,9 +7,10 @@ use rusqlite::Connection;
 
 use crate::language::LanguageModuleCatalog;
 use crate::manual::{
-    ManualClearLocatorError, ManualDatabaseError, ManualDetachedTranslation, ManualProjectSnapshot,
-    ManualTranslationEntry, ManualTranslationLocator, apply_rpg_maker_manual_translations,
-    clear_rpg_maker_manual_translation, load_rpg_maker_manual_snapshot, validate_manual_set,
+    ManualClearLocatorError, ManualDatabaseError, ManualDetachedTranslation,
+    ManualProjectLuaSnapshot, ManualTranslationEntry, ManualTranslationLocator,
+    apply_rpg_maker_manual_translations, clear_rpg_maker_manual_translation,
+    load_rpg_maker_manual_lua_snapshot, validate_manual_set,
 };
 use crate::rpg_maker::RpgMakerEngine;
 use crate::rpg_maker::location_codec::RpgMakerProjectionCodec;
@@ -45,6 +46,7 @@ impl ProjectLuaEngineAdapter for RpgMakerProjectLuaAdapter {
     ) -> Result<Vec<ProjectLuaTranslationRecord>, ProjectLuaCallError> {
         let snapshot = self.snapshot(connection)?;
         let mut records = snapshot
+            .current
             .index
             .entries()
             .iter()
@@ -63,6 +65,7 @@ impl ProjectLuaEngineAdapter for RpgMakerProjectLuaAdapter {
         let mut result = Vec::with_capacity(ids.len());
         for id in ids {
             let requested = snapshot
+                .current
                 .index
                 .get(&id)
                 .ok_or_else(|| unknown_unit(self.engine))?;
@@ -71,6 +74,7 @@ impl ProjectLuaEngineAdapter for RpgMakerProjectLuaAdapter {
                 return Err(invalid_project(self.engine));
             };
             let group = snapshot
+                .current
                 .index
                 .entries()
                 .iter()
@@ -120,10 +124,10 @@ impl ProjectLuaEngineAdapter for RpgMakerProjectLuaAdapter {
     ) -> Result<u64, ProjectLuaCallError> {
         with_savepoint(connection, self.engine, cancellation, || {
             let snapshot = self.snapshot(connection)?;
-            if snapshot.index.get(&id).is_none() {
+            if snapshot.current.index.get(&id).is_none() {
                 return Err(unknown_unit(self.engine));
             }
-            let write = validate_manual_set(&snapshot, &id, translation)
+            let write = validate_manual_set(&snapshot.current, &id, translation)
                 .map_err(|_| invalid_translation(self.engine))?;
             apply_rpg_maker_manual_translations(connection, &[write])
                 .map(|changed| changed as u64)
@@ -166,8 +170,8 @@ impl RpgMakerProjectLuaAdapter {
     fn snapshot(
         &self,
         connection: &Connection,
-    ) -> Result<ManualProjectSnapshot, ProjectLuaCallError> {
-        load_rpg_maker_manual_snapshot(connection, self.engine, &self.language_modules)
+    ) -> Result<ManualProjectLuaSnapshot, ProjectLuaCallError> {
+        load_rpg_maker_manual_lua_snapshot(connection, self.engine, &self.language_modules)
             .map_err(|error| map_manual_error(error, self.engine))
     }
 }

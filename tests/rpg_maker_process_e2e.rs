@@ -336,7 +336,7 @@ fn fixed_configuration_is_required_and_stage_commands_reject_lua_options() {
         ])
         .output()
         .expect("att.exe 应可执行");
-    assert_eq!(removed_argument.status.code(), Some(2));
+    assert_eq!(removed_argument.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&removed_argument.stderr).contains("--config"));
 
     for engine in ["mv", "mz", "generic"] {
@@ -490,11 +490,16 @@ fn same_named_mv_mz_and_generic_projects_remain_isolated_across_real_processes()
         "正式成功路径必须加载 Thinking Prompt"
     );
     let task_record = read_single_task_record_sharing_log_run_id(&mz_workspace);
-    assert!(task_record.contains("# 翻译任务 000001 · 完成"));
+    assert!(task_record.contains("# 翻译任务"));
+    assert!(task_record.contains("状态：完成，已确认提交"));
     assert!(task_record.contains(THINKING_SENTINEL));
     assert_eq!(task_record.matches("## Assistant").count(), 1);
+    assert!(task_record.contains("## User"));
+    assert!(!task_record.contains("## System"));
     assert!(!task_record.contains("## Thinking"));
     assert!(!task_record.contains("## Raw Assistant"));
+    assert!(!task_record.contains("Endpoint"));
+    assert!(!task_record.contains("Request attempts"));
     assert!(task_record.contains("\"translations\""));
     assert!(!task_record.contains("## JSON Repairs"));
     assert!(task_record.contains("## 最终结果"));
@@ -822,10 +827,11 @@ fn mz_partial_retry_reuses_the_complete_task_block_across_real_processes() {
         1,
         "首次 Partial 必须建立一份任务记录"
     );
+    assert!(first_task_records[0].1.contains("# 翻译任务"));
     assert!(
         first_task_records[0]
             .1
-            .contains("# 翻译任务 000001 · 部分完成")
+            .contains("状态：部分完成，已确认提交")
     );
     assert_eq!(first_task_records[0].1.matches("## Assistant").count(), 1);
     assert!(!first_task_records[0].1.contains("## Thinking"));
@@ -888,7 +894,8 @@ fn mz_partial_retry_reuses_the_complete_task_block_across_real_processes() {
         second_task_record.contains(second_user),
         "第二次 MZ 任务记录必须保存与实际请求相同的完整 TaskBlock"
     );
-    assert!(second_task_record.contains("# 翻译任务 000001 · 完成"));
+    assert!(second_task_record.contains("# 翻译任务"));
+    assert!(second_task_record.contains("状态：完成，已确认提交"));
     assert_eq!(
         read_owner_units(&database, "builtin"),
         PARTIAL_RETRY_SOURCES
@@ -1116,10 +1123,11 @@ fn generic_partial_retry_reuses_the_complete_task_block_across_real_processes() 
         1,
         "首次 Generic Partial 必须建立一份任务记录"
     );
+    assert!(first_task_records[0].1.contains("# 翻译任务"));
     assert!(
         first_task_records[0]
             .1
-            .contains("# 翻译任务 000001 · 部分完成")
+            .contains("状态：部分完成，已确认提交")
     );
     assert_eq!(first_task_records[0].1.matches("## Assistant").count(), 1);
     assert!(!first_task_records[0].1.contains("## Thinking"));
@@ -1187,7 +1195,8 @@ fn generic_partial_retry_reuses_the_complete_task_block_across_real_processes() 
         second_task_record.contains(second_user),
         "第二次 Generic 任务记录必须保存与实际请求相同的完整 TaskBlock"
     );
-    assert!(second_task_record.contains("# 翻译任务 000001 · 完成"));
+    assert!(second_task_record.contains("# 翻译任务"));
+    assert!(second_task_record.contains("状态：完成，已确认提交"));
     assert_eq!(
         read_generic_units(&database),
         PARTIAL_RETRY_SOURCES
@@ -1771,7 +1780,8 @@ fn generic_reextract_preserves_moves_and_rejects_unextracted_changes() {
         .join("projects/generic")
         .join(PROJECT);
     let task_record = read_single_task_record_sharing_log_run_id(&workspace);
-    assert!(task_record.contains("# 翻译任务 000001 · 完成"));
+    assert!(task_record.contains("# 翻译任务"));
+    assert!(task_record.contains("状态：完成，已确认提交"));
     assert!(task_record.contains(THINKING_SENTINEL));
     assert_eq!(task_record.matches("## Assistant").count(), 1);
     assert!(!task_record.contains("## Thinking"));

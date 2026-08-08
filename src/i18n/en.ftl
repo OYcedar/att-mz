@@ -317,45 +317,8 @@ manual-value = { $code ->
     [keep_exported_type] Keep the type written by manual export
    *[other] __ATT_FALLBACK__
 }
-task-record-title = Translation task { $ordinal } · { $state }
-task-record-state-label = { $state ->
-    [complete] Complete
-    [partial] Partially complete
-    [unavailable] Unavailable
-    [execution_failed] Execution failed
-    [commit_preparation_failed] Commit preparation failed
-    [commit_not_applied] Commit not applied
-    [commit_outcome_unknown] Commit outcome unknown
-    [not_committed_after_earlier_failure] Not committed after an earlier failure
-    [invalid_result] Invalid executor result sequence
-    [cancelled] Cancelled
-   *[other] { $state }
-}
-task-record-summary-with-written = `Task { $ordinal }/{ $total }` · `{ $attempts } attempts` · `Accepted { $accepted }/{ $expected }` · `Written to { $written } locations`
-task-record-summary-without-written = `Task { $ordinal }/{ $total }` · `{ $attempts } attempts` · `Accepted { $accepted }/{ $expected }`
-task-record-run-id-label = Run ID:
-task-record-started-at-label = Started at:
-task-record-duration-label = Total duration:
-task-record-endpoint-label = Endpoint:
-task-record-model-label = Model:
-task-record-custom-parameters-heading = Custom parameters
-task-record-attempts-heading = Request attempts
+task-record-title = Translation task
 task-record-final-result-heading = Final result
-task-record-no-request = No model request was ready to send.
-task-record-parse-error = Parse error: { $kind ->
-    [thinking_empty] the thinking content is empty at line { $line }, column { $column }
-   *[json] invalid model response JSON (category `{ $category }`) at line { $line }, column { $column }
-}
-task-record-attempt-succeeded = Attempt { $number }: succeeded; finish reason { $finish_reason }
-task-record-attempt-token-usage = ; tokens `{ $prompt } / { $completion } / { $total }`
-task-record-attempt-duration = ; duration `{ $duration }`
-task-record-attempt-retryable = Attempt { $number }: retryable request failure; duration `{ $duration }`
-task-record-attempt-retry-after = ; Retry-After `{ $duration }`
-task-record-attempt-wait-retry = ; retrying after `{ $duration }`
-task-record-attempt-wait-completed = ; wait of `{ $duration }` completed; the next attempt did not start
-task-record-attempt-wait-cancelled = ; planned wait `{ $duration }`; cancelled while waiting
-task-record-attempt-failed = Attempt { $number }: request or response processing failed; duration `{ $duration }`
-task-record-attempt-cancelled = Attempt { $number }: cancelled; duration `{ $duration }`
 task-record-final-status = Status: { $state ->
     [complete] complete and commit confirmed
     [partial] partially complete and commit confirmed
@@ -372,5 +335,3 @@ task-record-final-status = Status: { $state ->
 task-record-accepted-written = Accepted: { $accepted } items; written to { $written } actual locations
 task-record-accepted-outcome-unknown = Validated: { $accepted } items; database commit outcome cannot be confirmed
 task-record-task-diagnostic = Task diagnostic
-task-record-duration-seconds = { $value } seconds
-task-record-duration-milliseconds = { $value } ms

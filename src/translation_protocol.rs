@@ -3,13 +3,14 @@
 //! 本模块不理解游戏引擎、持久化身份、Placeholder 或语言验收。调用方只消费一次解析
 //! 建立的有序条目，并在自己的语义边界逐 ID 验收。
 
+#[cfg(test)]
 use std::convert::Infallible;
 use std::fmt;
 use std::io::{self, BufReader, Read};
 use std::num::NonZeroUsize;
 
 use att_json_repair::{
-    RepairError, RepairErrorKind, RepairKind, RepairOutput, RepairPolicy, repair_with_cancellation,
+    RepairError, RepairErrorKind, RepairOutput, RepairPolicy, repair_with_cancellation,
 };
 use serde::de::{DeserializeOwned, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -51,17 +52,6 @@ pub(crate) enum TranslationTaskResponseJsonErrorCategory {
     UnexpectedEof,
 }
 
-impl TranslationTaskResponseJsonErrorCategory {
-    pub(crate) const fn code(self) -> &'static str {
-        match self {
-            Self::Io => "io",
-            Self::Syntax => "syntax",
-            Self::Shape => "shape",
-            Self::UnexpectedEof => "unexpected_eof",
-        }
-    }
-}
-
 /// Assistant 响应无法按当前受信协议解析时的结构化类别。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TranslationTaskResponseParseErrorKind {
@@ -73,6 +63,7 @@ pub(crate) enum TranslationTaskResponseParseErrorKind {
     ThinkingEmpty,
 }
 
+#[cfg(test)]
 impl TranslationTaskResponseParseErrorKind {
     pub(crate) const fn code(self) -> &'static str {
         match self {
@@ -115,18 +106,12 @@ impl TranslationTaskResponseParseError {
 /// Assistant JSON 中保持原始顺序和重复项的一个条目。
 #[derive(Debug)]
 pub(crate) struct ParsedTranslationAssistantEntry {
-    id: String,
     value: Box<RawValue>,
     canonical_id: Option<TaskId>,
     source_echo: bool,
 }
 
 impl ParsedTranslationAssistantEntry {
-    #[cfg(test)]
-    pub(crate) fn id(&self) -> &str {
-        &self.id
-    }
-
     pub(crate) const fn canonical_id(&self) -> Option<TaskId> {
         self.canonical_id
     }
@@ -138,8 +123,8 @@ impl ParsedTranslationAssistantEntry {
 
     /// 按当前响应模式解码一个 ID 的译文值，并保留逐字段形状错误。
     ///
-    /// 原文回显只供人工或 agent 排查，不参与译文关联。这里验证它存在且为字符串数组，
-    /// 但不比较它和请求原文的内容。
+    /// 原文回显是配置明确选择的审阅输出，只供人工或 agent 排查，不参与译文关联。
+    /// 这里故意要求它存在且为字符串数组，但不比较它和请求原文的内容。
     pub(crate) fn decode_translation_value_with_cancellation<E>(
         &self,
         mut ensure_running: impl FnMut() -> Result<(), E>,
@@ -217,8 +202,8 @@ impl ParsedTranslationAssistantEntry {
         ))
     }
 
-    pub(crate) fn into_parts(self) -> (String, Box<RawValue>, Option<TaskId>) {
-        (self.id, self.value, self.canonical_id)
+    pub(crate) fn into_parts(self) -> (Box<RawValue>, Option<TaskId>) {
+        (self.value, self.canonical_id)
     }
 }
 
@@ -261,65 +246,16 @@ pub(crate) enum DecodedSourceEchoFieldsError {
 /// 唯一响应解析器建立的完整投影。
 #[derive(Debug)]
 pub(crate) struct ParsedTranslationResponse {
-    thinking: Option<String>,
     entries: Vec<ParsedTranslationAssistantEntry>,
-    repairs: Vec<TranslationResponseRepair>,
 }
 
 impl ParsedTranslationResponse {
-    #[cfg(test)]
-    pub(crate) fn thinking(&self) -> Option<&str> {
-        self.thinking.as_deref()
-    }
-
     pub(crate) fn entries(&self) -> &[ParsedTranslationAssistantEntry] {
         &self.entries
     }
 
-    #[cfg(test)]
-    pub(crate) fn repairs(&self) -> &[TranslationResponseRepair] {
-        &self.repairs
-    }
-
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        Option<String>,
-        Vec<ParsedTranslationAssistantEntry>,
-        Vec<TranslationResponseRepair>,
-    ) {
-        (self.thinking, self.entries, self.repairs)
-    }
-}
-
-/// 一项相对于完整原始 Assistant 正文的 JSON 格式修复。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct TranslationResponseRepair {
-    kind: RepairKind,
-    line: NonZeroUsize,
-    column: NonZeroUsize,
-}
-
-impl TranslationResponseRepair {
-    const fn new(kind: RepairKind, line: NonZeroUsize, column: NonZeroUsize) -> Self {
-        Self { kind, line, column }
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn kind(self) -> RepairKind {
-        self.kind
-    }
-
-    pub(crate) const fn kind_code(self) -> &'static str {
-        self.kind.code()
-    }
-
-    pub(crate) const fn line(self) -> NonZeroUsize {
-        self.line
-    }
-
-    pub(crate) const fn column(self) -> NonZeroUsize {
-        self.column
+    pub(crate) fn into_entries(self) -> Vec<ParsedTranslationAssistantEntry> {
+        self.entries
     }
 }
 
@@ -452,7 +388,6 @@ pub(crate) fn parse_translation_response_with_cancellation<E>(
             return finish_translation_response_with_cancellation(
                 wire,
                 response_mode,
-                Vec::new(),
                 value,
                 0,
                 &mut ensure_running,
@@ -487,8 +422,6 @@ pub(crate) fn parse_translation_response_with_cancellation<E>(
             )?));
         }
     };
-    let repairs =
-        translation_response_repairs_with_cancellation(value, &repaired, &mut ensure_running)?;
     let repaired_wire = match deserialize_translation_response_wire_with_cancellation(
         repaired.json(),
         response_mode,
@@ -510,25 +443,10 @@ pub(crate) fn parse_translation_response_with_cancellation<E>(
     finish_translation_response_with_cancellation(
         repaired_wire,
         response_mode,
-        repairs,
         value,
         root_original_offset,
         &mut ensure_running,
     )
-}
-
-/// 返回 Assistant 中现行模型协议认可的 JSON 正文。
-///
-/// 任务记录需要重新排版严格合法的 JSON，但不能复制模型协议对外层 Markdown 围栏的
-/// 识别规则。非规范围栏和围栏外正文保持原样，由调用方按普通文本呈现。
-pub(crate) fn translation_response_json_body(value: &str) -> &str {
-    match unwrap_translation_response_json_fence_with_cancellation(
-        LocatedModelResponse::new(value),
-        &mut || Ok::<_, Infallible>(()),
-    ) {
-        Ok(value) => value.value,
-        Err(unreachable) => match unreachable {},
-    }
 }
 
 /// 识别正文中唯一的规范 `json` Markdown 围栏，并把后续解析范围收窄到围栏内部。
@@ -664,13 +582,14 @@ fn deserialize_translation_response_wire_with_cancellation<E>(
 fn finish_translation_response_with_cancellation<E>(
     wire: TranslationResponseWire,
     response_mode: TranslationResponseMode,
-    repairs: Vec<TranslationResponseRepair>,
     source: LocatedModelResponse<'_>,
     root_original_offset: usize,
     ensure_running: &mut impl FnMut() -> Result<(), E>,
 ) -> Result<Result<ParsedTranslationResponse, TranslationTaskResponseParseError>, E> {
-    let (thinking, batch) = match wire {
+    let batch = match wire {
         TranslationResponseWire::Thinking(wrapper) => {
+            // thinking_output 是显式选择的响应契约：模型必须返回非空判断，但业务只消费
+            // 译文；需要审阅时由任务记录保留原始 Assistant，不在解析结果中重复持有。
             let Some(thinking) =
                 decode_owned_json_string_with_cancellation(wrapper.think.get(), ensure_running)?
             else {
@@ -689,9 +608,9 @@ fn finish_translation_response_with_cancellation<E>(
                     ensure_running,
                 )?));
             }
-            (Some(thinking), wrapper.translations)
+            wrapper.translations
         }
-        TranslationResponseWire::Plain(batch) => (None, batch),
+        TranslationResponseWire::Plain(batch) => batch,
     };
     let mut entries = Vec::with_capacity(batch.0.len());
     for output in batch.0 {
@@ -699,18 +618,12 @@ fn finish_translation_response_with_cancellation<E>(
         let canonical_id = parse_model_output_id_with_cancellation(&output.id, ensure_running)?;
         entries.push(ParsedTranslationAssistantEntry {
             canonical_id,
-            id: output.id,
             value: output.value,
             source_echo: response_mode.source_echo(),
         });
     }
     ensure_running()?;
-    debug_assert_eq!(thinking.is_some(), response_mode.thinking());
-    Ok(Ok(ParsedTranslationResponse {
-        thinking,
-        entries,
-        repairs,
-    }))
+    Ok(Ok(ParsedTranslationResponse { entries }))
 }
 
 fn translation_response_json_error_with_cancellation<E>(
@@ -799,77 +712,6 @@ fn translation_response_json_error_category(
         JsonErrorCategory::Data => TranslationTaskResponseJsonErrorCategory::Shape,
         JsonErrorCategory::Eof => TranslationTaskResponseJsonErrorCategory::UnexpectedEof,
     }
-}
-
-fn translation_response_repairs_with_cancellation<E>(
-    original: LocatedModelResponse<'_>,
-    repaired: &RepairOutput<'_>,
-    ensure_running: &mut impl FnMut() -> Result<(), E>,
-) -> Result<Vec<TranslationResponseRepair>, E> {
-    let mut absolute_offsets = Vec::with_capacity(repaired.repairs().len());
-    for repair in repaired.repairs() {
-        ensure_running()?;
-        absolute_offsets.push(
-            original
-                .start
-                .saturating_add(repair.original_range().start.min(original.value.len()))
-                .min(original.raw.len()),
-        );
-    }
-    let locations =
-        response_locations_with_cancellation(original.raw, &absolute_offsets, ensure_running)?;
-    ensure_running()?;
-    Ok(repaired
-        .repairs()
-        .iter()
-        .zip(locations)
-        .map(|(repair, (line, column))| TranslationResponseRepair::new(repair.kind(), line, column))
-        .collect())
-}
-
-fn response_locations_with_cancellation<E>(
-    raw: &str,
-    byte_offsets: &[usize],
-    ensure_running: &mut impl FnMut() -> Result<(), E>,
-) -> Result<Vec<(NonZeroUsize, NonZeroUsize)>, E> {
-    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
-    const ONE: NonZeroUsize = NonZeroUsize::new(1).expect("一是非零值");
-
-    ensure_running()?;
-    let mut locations = vec![(ONE, ONE); byte_offsets.len()];
-    let bytes = raw.as_bytes();
-    let mut cursor = 0_usize;
-    let mut line = 1_usize;
-    let mut line_start = 0_usize;
-    let mut bytes_until_check = CANCELLATION_CHECK_BYTES;
-    let mut previous_offset = 0_usize;
-    for (index, offset) in byte_offsets.iter().copied().enumerate() {
-        ensure_running()?;
-        let offset = offset.min(bytes.len());
-        debug_assert!(
-            offset >= previous_offset,
-            "JSON 修复必须按原始 Assistant 的字节顺序记录"
-        );
-        previous_offset = offset;
-        while cursor < offset {
-            if bytes[cursor] == b'\n' {
-                line += 1;
-                line_start = cursor + 1;
-            }
-            cursor += 1;
-            bytes_until_check -= 1;
-            if bytes_until_check == 0 {
-                ensure_running()?;
-                bytes_until_check = CANCELLATION_CHECK_BYTES;
-            }
-        }
-        locations[index] = (
-            NonZeroUsize::new(line).expect("一基行号不可能为零"),
-            NonZeroUsize::new(offset - line_start + 1).expect("一基列号不可能为零"),
-        );
-    }
-    ensure_running()?;
-    Ok(locations)
 }
 
 fn json_location_byte_offset_with_cancellation<E>(
@@ -1441,20 +1283,13 @@ mod tests {
         let entries = parsed
             .entries()
             .iter()
-            .map(|entry| (entry.id(), entry.canonical_id()))
+            .map(ParsedTranslationAssistantEntry::canonical_id)
             .collect::<Vec<_>>();
         assert_eq!(
             entries,
-            [
-                ("0", Some(TaskId::new(0))),
-                ("bad", None),
-                ("0", Some(TaskId::new(0))),
-                ("00", None),
-                ("01", None),
-            ]
+            [Some(TaskId::new(0)), None, Some(TaskId::new(0)), None, None,]
         );
-        assert!(entries[0].1.is_some(), "规范 ID 0 必须可表示");
-        assert!(parsed.repairs().is_empty(), "严格 JSON 不应建立修复记录");
+        assert!(entries[0].is_some(), "规范 ID 0 必须可表示");
     }
 
     #[test]
@@ -1488,7 +1323,6 @@ mod tests {
     fn parses_all_four_response_modes() {
         let plain = parse_translation_response(r#"{"0":["译文"]}"#, mode(false, false))
             .expect("plain 响应应解析");
-        assert_eq!(plain.thinking(), None);
         assert_eq!(
             plain.entries()[0]
                 .decode_translation_value_with_cancellation::<Infallible>(|| Ok(()))
@@ -1503,14 +1337,13 @@ mod tests {
             mode(true, false),
         )
         .expect("thinking 响应应解析");
-        assert_eq!(thinking.thinking(), Some("结合上下文判断语气"));
+        assert_eq!(thinking.entries().len(), 1);
 
         let echo = parse_translation_response(
             r#"{"0":{"source":["原文"],"translation":["译文"]}}"#,
             mode(false, true),
         )
         .expect("source echo 响应应解析");
-        assert_eq!(echo.thinking(), None);
         assert_eq!(
             echo.entries()[0]
                 .decode_translation_value_with_cancellation::<Infallible>(|| Ok(()))
@@ -1526,7 +1359,7 @@ mod tests {
             mode(true, true),
         )
         .expect("thinking + source echo 响应应解析");
-        assert_eq!(thinking_echo.thinking(), Some("判断"));
+        assert_eq!(thinking_echo.entries().len(), 1);
         assert_eq!(
             thinking_echo.entries()[0]
                 .decode_translation_value_with_cancellation::<Infallible>(|| Ok(()))
@@ -1708,22 +1541,17 @@ mod tests {
             parse_translation_response("\n{\"0\":[\"ok\"],\"1\":true}\n", mode(false, false))
                 .expect("值形状由逐 ID 验收");
         assert_eq!(parsed.entries()[1].raw_value().get(), "true");
-        assert!(parsed.repairs().is_empty());
 
         let bom = parse_translation_response("\u{feff}{\"0\":[\"ok\"]}", mode(false, false))
             .expect("BOM 应经过受控修复");
-        assert_eq!(bom.repairs().len(), 1);
-        assert_eq!(bom.repairs()[0].kind(), RepairKind::RemovedByteOrderMark);
+        assert_eq!(bom.entries()[0].raw_value().get(), r#"["ok"]"#);
 
         let unicode_whitespace =
             parse_translation_response("\u{2003}{\"0\":[\"ok\"]}\u{2003}", mode(false, false))
                 .expect("非 JSON 空白应经过受控修复");
-        assert_eq!(unicode_whitespace.repairs().len(), 2);
-        assert!(
-            unicode_whitespace
-                .repairs()
-                .iter()
-                .all(|repair| repair.kind() == RepairKind::NormalizedWhitespace)
+        assert_eq!(
+            unicode_whitespace.entries()[0].raw_value().get(),
+            r#"["ok"]"#
         );
 
         let error = parse_translation_response(
@@ -1740,24 +1568,18 @@ mod tests {
         )
         .expect("规范 JSON 围栏应作为合法响应外层");
         assert_eq!(fenced.entries()[0].raw_value().get(), r#"["ok"]"#);
-        assert!(fenced.repairs().is_empty());
 
         let repaired_inside_fence =
             parse_translation_response("```json\n{'0':['ok']}\n```", mode(false, false))
                 .expect("规范围栏内部仍应使用保守 JSON 修复");
-        assert!(
-            repaired_inside_fence
-                .repairs()
-                .iter()
-                .any(|repair| repair.kind() == RepairKind::NormalizedQuote)
+        assert_eq!(
+            repaired_inside_fence.entries()[0]
+                .decode_translation_value_with_cancellation::<Infallible>(|| Ok(()))
+                .expect("未取消"),
+            DecodedTranslationAssistantValue::Translation(DecodedJsonStringArray::Strings(vec![
+                "ok".to_owned(),
+            ]))
         );
-        assert!(
-            repaired_inside_fence
-                .repairs()
-                .iter()
-                .all(|repair| repair.kind() != RepairKind::RemovedMarkdownFence)
-        );
-        assert_eq!(repaired_inside_fence.repairs()[0].line().get(), 2);
 
         let repaired_fence = parse_translation_response(
             "\u{2003}\r\n```json\r\n{\"0\":[\"ok\"]}\r\n```\r\n",
@@ -1765,20 +1587,6 @@ mod tests {
         )
         .expect("非 JSON 空白包围的围栏仍应由保守修复处理");
         assert_eq!(repaired_fence.entries()[0].raw_value().get(), r#"["ok"]"#);
-        let fence_repairs = repaired_fence
-            .repairs()
-            .iter()
-            .filter(|repair| repair.kind() == RepairKind::RemovedMarkdownFence)
-            .collect::<Vec<_>>();
-        assert_eq!(fence_repairs.len(), 2);
-        assert_eq!(
-            (
-                fence_repairs[0].line().get(),
-                fence_repairs[0].column().get()
-            ),
-            (2, 1)
-        );
-        assert_eq!(fence_repairs[0].kind_code(), "removed_markdown_fence");
 
         let multiple_fences = parse_translation_response(
             "```json\n{\"0\":[\"first\"]}\n```\n```json\n{\"1\":[\"second\"]}\n```",
@@ -1795,12 +1603,6 @@ mod tests {
 
         let quoted = parse_translation_response(r#"{"0":["type: "free""]}"#, mode(false, false))
             .expect("无歧义的内部双引号应被转义");
-        assert!(
-            quoted
-                .repairs()
-                .iter()
-                .any(|repair| repair.kind() == RepairKind::EscapedInternalQuote)
-        );
         assert_eq!(
             quoted.entries()[0]
                 .decode_translation_value_with_cancellation::<Infallible>(|| Ok(()))

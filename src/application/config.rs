@@ -385,19 +385,13 @@ impl ConfiguredRpgMakerCommand {
                 }))
             }
             RpgMakerCommandArguments::Manual(command) => {
-                let raw: RawManualSelection = parse_selected(
-                    source,
+                Ok(Self::Manual(ConfiguredManualCommand::build(
                     configuration_path,
+                    source,
                     toml_index.as_ref(),
-                    ConfigurationSelection::Languages,
-                )?;
-                let language_modules = build_language_modules(raw.languages)
-                    .map_err(ConfigurationLoadError::InvalidValue)?;
-                Ok(Self::Manual(ConfiguredManualCommand::new(
                     command,
                     common,
-                    language_modules,
-                )))
+                )?))
             }
             RpgMakerCommandArguments::Lua(arguments) => {
                 let raw: RawManualSelection = parse_selected(
@@ -441,20 +435,50 @@ pub(crate) enum ConfiguredGenericCommand {
     Lua(ConfiguredProjectLuaCommand),
 }
 
-/// Manual 只读取当前语言模块，不构造模型、Prompt、术语或执行 Profile。
+/// Manual export 读取语言模块筛选待译项；check/apply 只校验结构。
 pub(crate) struct ConfiguredManualCommand {
     operation: ManualOperation,
     project_name: ProjectName,
     file: PathBuf,
     common: CommonCommandConfiguration,
-    language_modules: LanguageModuleCatalog,
+    language_modules: Option<LanguageModuleCatalog>,
 }
 
 impl ConfiguredManualCommand {
+    fn build(
+        configuration_path: &Path,
+        source: &str,
+        toml_index: &ConfigurationTomlIndex,
+        command: ManualCommand,
+        common: CommonCommandConfiguration,
+    ) -> Result<Self, ConfigurationLoadError> {
+        let language_modules = if matches!(&command, ManualCommand::Export(_)) {
+            let raw: RawManualSelection = parse_selected(
+                source,
+                configuration_path,
+                toml_index,
+                ConfigurationSelection::Languages,
+            )?;
+            Some(
+                build_language_modules(raw.languages)
+                    .map_err(ConfigurationLoadError::InvalidValue)?,
+            )
+        } else {
+            let _: RawInitSelection = parse_selected(
+                source,
+                configuration_path,
+                toml_index,
+                ConfigurationSelection::NoAdditionalFields,
+            )?;
+            None
+        };
+        Ok(Self::new(command, common, language_modules))
+    }
+
     fn new(
         command: ManualCommand,
         common: CommonCommandConfiguration,
-        language_modules: LanguageModuleCatalog,
+        language_modules: Option<LanguageModuleCatalog>,
     ) -> Self {
         let (operation, arguments) = match command {
             ManualCommand::Export(arguments) => (ManualOperation::Export, arguments),
@@ -487,8 +511,8 @@ impl ConfiguredManualCommand {
         &self.common
     }
 
-    pub(crate) const fn language_modules(&self) -> &LanguageModuleCatalog {
-        &self.language_modules
+    pub(crate) const fn language_modules(&self) -> Option<&LanguageModuleCatalog> {
+        self.language_modules.as_ref()
     }
 }
 
@@ -591,21 +615,13 @@ impl ConfiguredGenericCommand {
                     )),
                 }))
             }
-            GenericCommand::Manual { command } => {
-                let raw: RawManualSelection = parse_selected(
-                    source,
-                    configuration_path,
-                    toml_index.as_ref(),
-                    ConfigurationSelection::Languages,
-                )?;
-                let language_modules = build_language_modules(raw.languages)
-                    .map_err(ConfigurationLoadError::InvalidValue)?;
-                Ok(Self::Manual(ConfiguredManualCommand::new(
-                    command,
-                    common,
-                    language_modules,
-                )))
-            }
+            GenericCommand::Manual { command } => Ok(Self::Manual(ConfiguredManualCommand::build(
+                configuration_path,
+                source,
+                toml_index.as_ref(),
+                command,
+                common,
+            )?)),
             GenericCommand::Lua(arguments) => {
                 let raw: RawManualSelection = parse_selected(
                     source,
@@ -4199,10 +4215,31 @@ mod tests {
             extract_command(false),
             translate_command("primary"),
             write_back_command(),
+            manual_export_command(),
+            manual_check_command(),
+            manual_apply_command(),
             project_lua_command(),
         ] {
             load_configuration(&path, command).expect("仓库示例必须满足每个命令的当前契约");
         }
+    }
+
+    #[test]
+    fn manual_check_and_apply_do_not_parse_language_configuration() {
+        let directory = TestDirectory::new();
+        let source = include_str!("../../config.example.toml").replacen(
+            "minimum_kana_characters = 1",
+            "minimum_kana_characters = \"invalid\"",
+            1,
+        );
+        let path = directory.write("manual-unselected-languages.toml", &source);
+
+        load_configuration(&path, manual_check_command()).expect("Manual check 不应解释语言配置");
+        load_configuration(&path, manual_apply_command()).expect("Manual apply 不应解释语言配置");
+        assert!(
+            load_configuration(&path, manual_export_command()).is_err(),
+            "Manual export 必须继续校验用于筛选待译项的语言配置"
+        );
     }
 
     #[test]
@@ -5254,6 +5291,42 @@ api_key = "{API_KEY}" "invalid"
 
     fn write_back_command() -> MzCommand {
         parse_command(["att", "mz", "write-back", "--name", "demo"])
+    }
+
+    fn manual_export_command() -> MzCommand {
+        parse_command([
+            "att",
+            "mz",
+            "manual",
+            "export",
+            "--name",
+            "demo",
+            "manual.toml",
+        ])
+    }
+
+    fn manual_check_command() -> MzCommand {
+        parse_command([
+            "att",
+            "mz",
+            "manual",
+            "check",
+            "--name",
+            "demo",
+            "manual.toml",
+        ])
+    }
+
+    fn manual_apply_command() -> MzCommand {
+        parse_command([
+            "att",
+            "mz",
+            "manual",
+            "apply",
+            "--name",
+            "demo",
+            "manual.toml",
+        ])
     }
 
     fn project_lua_command() -> MzCommand {

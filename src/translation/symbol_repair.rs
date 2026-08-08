@@ -1,5 +1,6 @@
 //! 写回前依据原文模板修复译文中能够唯一对应的符号。
 
+#[cfg(test)]
 use std::convert::Infallible;
 
 use icu_properties::props::{
@@ -66,7 +67,7 @@ fn ensure_repair_running<E>(
 }
 
 impl TranslationSymbolRepairer {
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn plan_repair(
         source: &LanguageText,
         translation: &LanguageText,
