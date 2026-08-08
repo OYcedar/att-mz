@@ -3,8 +3,8 @@
 验证当前 dist 是否可以作为公开 Windows x64 发行物。
 
 .DESCRIPTION
-检查发行资源、目录边界、空项目目录、Markdown 相对链接、PE 动态依赖，以及从仓库外
-运行 Version、Generic Init、Extract 和零工作量 Translate 的真实结果。
+检查发行资源、目录边界、空项目目录、Markdown 相对链接、ATT 与 Formic 的 PE 动态依赖，
+以及从仓库外运行两个程序和 ATT 最小翻译路径的真实结果。
 
 .PARAMETER ExpectedVersion
 不带 v 前缀的三段版本号，例如 1.0.0。
@@ -139,6 +139,43 @@ function Get-PeDependencies {
     throw '完整发行检查需要 llvm-objdump 或 dumpbin。'
 }
 
+function Assert-X64Pe {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $stream = [System.IO.File]::Open(
+        $Path,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::Read
+    )
+    $reader = [System.IO.BinaryReader]::new($stream)
+    try {
+        if ($stream.Length -lt 64 -or $reader.ReadUInt16() -ne 0x5A4D) {
+            throw "不是有效的 PE 文件：$Path"
+        }
+        $stream.Position = 0x3C
+        $peOffset = $reader.ReadInt32()
+        if ($peOffset -lt 0 -or $peOffset -gt $stream.Length - 6) {
+            throw "PE header 位置无效：$Path"
+        }
+        $stream.Position = $peOffset
+        if ($reader.ReadUInt32() -ne 0x00004550) {
+            throw "PE signature 无效：$Path"
+        }
+        $machine = $reader.ReadUInt16()
+        if ($machine -ne 0x8664) {
+            throw ("发行程序不是 Windows x64 PE：{0}，machine=0x{1:X4}" -f $Path, $machine)
+        }
+    }
+    finally {
+        $reader.Dispose()
+        $stream.Dispose()
+    }
+}
+
 function Test-AllowedSystemDependency {
     param(
         [Parameter(Mandatory)]
@@ -158,6 +195,7 @@ function Test-AllowedSystemDependency {
             'crypt32.dll',
             'kernel32.dll',
             'ntdll.dll',
+            'oleaut32.dll',
             'secur32.dll',
             'userenv.dll',
             'ws2_32.dll'
@@ -165,6 +203,47 @@ function Test-AllowedSystemDependency {
         [void]$allowed.Add($systemDll)
     }
     $allowed.Contains($Name)
+}
+
+function Assert-PeDependencies {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name,
+        [Parameter(Mandatory)]
+        [string]$Executable,
+        [Parameter(Mandatory)]
+        [string]$LocalDirectory
+    )
+
+    $pending = [System.Collections.Generic.Stack[string]]::new()
+    $visited = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+    $failures = [System.Collections.Generic.List[string]]::new()
+    $pending.Push([System.IO.Path]::GetFullPath($Executable))
+
+    while ($pending.Count -gt 0) {
+        $current = $pending.Pop()
+        if (-not $visited.Add($current)) {
+            continue
+        }
+        Assert-X64Pe -Path $current
+        foreach ($dependency in Get-PeDependencies -Executable $current) {
+            if (Test-AllowedSystemDependency -Name $dependency) {
+                continue
+            }
+            $localDependency = Join-Path $LocalDirectory $dependency
+            if (-not (Test-Path -LiteralPath $localDependency -PathType Leaf)) {
+                $failures.Add("$([System.IO.Path]::GetFileName($current)) 缺少本地依赖 $dependency")
+                continue
+            }
+            $pending.Push([System.IO.Path]::GetFullPath($localDependency))
+        }
+    }
+
+    if ($failures.Count -gt 0) {
+        throw "$Name 含有未满足的非系统动态依赖：`n$($failures -join "`n")"
+    }
 }
 
 function Get-MarkdownRelativeTargets {
@@ -194,10 +273,7 @@ function Assert-MarkdownLinks {
     $prefix = $root + [System.IO.Path]::DirectorySeparatorChar
     $failures = [System.Collections.Generic.List[string]]::new()
     $markdownFiles = @(
-        Get-Item -LiteralPath (Join-Path $distributionRoot 'README.md')
-        Get-ChildItem -LiteralPath (Join-Path $distributionRoot 'docs') -Recurse -File -Filter '*.md'
-        Get-ChildItem -LiteralPath (Join-Path $distributionRoot 'skills') -Recurse -File -Filter '*.md'
-        Get-ChildItem -LiteralPath (Join-Path $distributionRoot 'licenses') -Recurse -File -Filter '*.md'
+        Get-ChildItem -LiteralPath $distributionRoot -Recurse -File -Filter '*.md'
     )
 
     foreach ($file in $markdownFiles) {
@@ -249,7 +325,7 @@ foreach ($requiredFile in @('att.exe', 'config.toml', 'LICENSE', 'README.md')) {
         throw "发行文件缺失：$path"
     }
 }
-foreach ($requiredDirectory in @('docs', 'licenses', 'projects', 'prompts', 'skills')) {
+foreach ($requiredDirectory in @('docs', 'licenses', 'projects', 'prompts', 'skills', 'tools')) {
     $path = Join-Path $distributionRoot $requiredDirectory
     if (-not (Test-Path -LiteralPath $path -PathType Container)) {
         throw "发行目录缺失：$path"
@@ -268,7 +344,8 @@ foreach ($name in @(
         'licenses',
         'projects',
         'prompts',
-        'skills'
+        'skills',
+        'tools'
     )) {
     [void]$allowedTopLevel.Add($name)
 }
@@ -287,11 +364,23 @@ if (Get-ChildItem -LiteralPath $distributionRoot -File -Filter '*.dll') {
 }
 
 $executable = Join-Path $distributionRoot 'att.exe'
-$dependencies = Get-PeDependencies -Executable $executable
-$unexpectedDependencies = @($dependencies | Where-Object { -not (Test-AllowedSystemDependency $_) })
-if ($unexpectedDependencies.Count -gt 0) {
-    throw "att.exe 含有未声明的非系统动态依赖：$($unexpectedDependencies -join ', ')"
+Assert-PeDependencies -Name 'att.exe' -Executable $executable -LocalDirectory $distributionRoot
+
+$formicDirectory = Join-Path $distributionRoot 'tools\formic'
+$toolsItems = @(Get-ChildItem -LiteralPath (Join-Path $distributionRoot 'tools') -Force)
+if (
+    $toolsItems.Count -ne 1 -or
+    $toolsItems[0].Name -cne 'formic' -or
+    -not $toolsItems[0].PSIsContainer
+) {
+    throw '发行 tools 目录必须只包含 formic 子目录。'
 }
+$formicExecutable = Join-Path $formicDirectory 'formic.exe'
+if (-not (Test-Path -LiteralPath $formicExecutable -PathType Leaf)) {
+    throw "Formic 程序缺失：$formicExecutable"
+}
+Assert-PeDependencies -Name 'formic.exe' -Executable $formicExecutable `
+    -LocalDirectory $formicDirectory
 
 Assert-MarkdownLinks
 
@@ -312,6 +401,12 @@ try {
         Copy-Item -LiteralPath $item.FullName -Destination $smokeRoot -Recurse -Force
     }
     $smokeExecutable = Join-Path $smokeRoot 'att.exe'
+
+    $formicHelp = Invoke-CapturedProcess `
+        -FilePath (Join-Path $smokeRoot 'tools\formic\formic.exe') `
+        -Arguments @('--help') `
+        -WorkingDirectory (Join-Path $smokeRoot 'tools\formic')
+    Assert-SuccessfulCommand -Name '仓库外 Formic Help' -Result $formicHelp
 
     $version = Invoke-CapturedProcess -FilePath $smokeExecutable -Arguments @('--version') `
         -WorkingDirectory $smokeCwd

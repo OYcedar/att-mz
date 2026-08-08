@@ -4,19 +4,23 @@
 
 .DESCRIPTION
 管理 README.md、LICENSE、config.example.toml -> config.toml、第三方许可证目录、docs、
-prompts 和 skills。
-不修改 att.exe 或运行库。
+prompts、skills 和固定的 Formic 工具。
+不修改 att.exe。
 
 .PARAMETER Check
 只比较文件集合和 SHA-256，不修改 dist。
 
 .PARAMETER TargetRoot
 可选的发行根；省略时使用仓库固定的 dist。供公开发行验证在干净暂存目录中复用。
+
+.PARAMETER VCRuntimePath
+普通同步 Formic 时可选的 VCRUNTIME140.dll 来源；省略时使用 Windows System32。
 #>
 [CmdletBinding()]
 param(
     [switch]$Check,
-    [string]$TargetRoot
+    [string]$TargetRoot,
+    [string]$VCRuntimePath
 )
 
 Set-StrictMode -Version Latest
@@ -206,6 +210,7 @@ foreach ($mapping in $directoryMappings) {
 
 if ($Check) {
     Test-SynchronizedResources
+    & (Join-Path $PSScriptRoot 'sync-formic-tool.ps1') -Check -TargetRoot $distributionRoot
     Write-Output '发行资源与源码一致。'
     return
 }
@@ -263,4 +268,11 @@ finally {
 }
 
 Test-SynchronizedResources
+$formicSyncArguments = @{
+    TargetRoot = $distributionRoot
+}
+if (-not [string]::IsNullOrWhiteSpace($VCRuntimePath)) {
+    $formicSyncArguments.VCRuntimePath = $VCRuntimePath
+}
+& (Join-Path $PSScriptRoot 'sync-formic-tool.ps1') @formicSyncArguments
 Write-Output '发行资源已同步，并通过逐文件 SHA-256 检查。'

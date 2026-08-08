@@ -1,0 +1,173 @@
+{
+  "type": "object",
+  "properties": {
+    "candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "term": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string"
+          },
+          "identity_or_definition": {
+            "type": "string"
+          },
+          "recommendation": {
+            "type": "string",
+            "enum": [
+              "include",
+              "exclude",
+              "needs_review"
+            ]
+          },
+          "fixed_form": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "anchors": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "line": {
+                  "type": "integer"
+                },
+                "quote": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "line",
+                "quote"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "variants": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "form": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "line": {
+                  "type": "integer"
+                },
+                "relation": {
+                  "type": "string",
+                  "enum": [
+                    "same_identity",
+                    "possible_same_identity"
+                  ]
+                }
+              },
+              "required": [
+                "form",
+                "path",
+                "line",
+                "relation"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "input_evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "line": {
+                  "type": "integer"
+                },
+                "quote": {
+                  "type": "string"
+                },
+                "relation": {
+                  "type": "string",
+                  "enum": [
+                    "support",
+                    "conflict"
+                  ]
+                },
+                "summary": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "line",
+                "quote",
+                "relation",
+                "summary"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "external_evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "locator": {
+                  "type": "string"
+                },
+                "source_kind": {
+                  "type": "string"
+                },
+                "relation": {
+                  "type": "string",
+                  "enum": [
+                    "support",
+                    "conflict"
+                  ]
+                },
+                "summary": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "locator",
+                "source_kind",
+                "relation",
+                "summary"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "term",
+          "category",
+          "identity_or_definition",
+          "recommendation",
+          "fixed_form",
+          "reason",
+          "anchors",
+          "variants",
+          "input_evidence",
+          "external_evidence"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "candidates"
+  ],
+  "additionalProperties": false
+}
