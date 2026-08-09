@@ -218,6 +218,7 @@ diagnostic-failure-value = { $code ->
     [invalid_syntax] 值的語法無效
     [invalid_encoding] 文字編碼無效
     [invalid_value] 值不符合必要契約
+    [empty_text_capture] text 擷取為空
     [rules_owner_disabled] 選擇的 Rules 檔案使用 rule = []；Rules 已停用，並已刪除其擷取資產
     [not_found] 必要物件不存在
     [state_mismatch] 已儲存的專案狀態不符合此作業需求

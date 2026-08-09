@@ -532,7 +532,11 @@ where
     ) -> Result<RulesSnapshotCandidate, ParallelRulesBuildError<C::Error>> {
         let plan = build_source_match_plan(definition.into_rules(), input);
         let (rule_count, work_units) = plan.into_parts();
-        let total = u64::try_from(work_units.len()).expect("Rules 来源工作单元数必须能用 u64 表达");
+        let source_work_units =
+            u64::try_from(work_units.len()).expect("Rules 来源工作单元数必须能用 u64 表达");
+        let total = source_work_units
+            .checked_add(1)
+            .expect("Rules 来源工作单元数加最终验收必须能用 u64 表达");
         progress.determinate(ExtractProgressPhase::RulesMatches, 0, total);
         let completed = self
             .cpu_executor
@@ -545,7 +549,8 @@ where
             .await
             .map_err(ParallelRulesBuildError::MatchCompute)?;
 
-        self.cpu_executor
+        let candidate = self
+            .cpu_executor
             .execute(move || {
                 let finished = finish_source_matches(rule_count, completed)
                     .map_err(ParallelRulesBuildError::Match)?;
@@ -557,7 +562,9 @@ where
                 })
             })
             .await
-            .map_err(ParallelRulesBuildError::FinalizeCompute)?
+            .map_err(ParallelRulesBuildError::FinalizeCompute)??;
+        progress.determinate(ExtractProgressPhase::RulesMatches, total, total);
+        Ok(candidate)
     }
 }
 
@@ -1526,8 +1533,8 @@ path = '[].name'
         assert_eq!(
             progress.snapshots(),
             [
-                ProgressSnapshot::determinate(ExtractProgressPhase::RulesMatches, 0, 1),
-                ProgressSnapshot::determinate(ExtractProgressPhase::RulesMatches, 1, 1),
+                ProgressSnapshot::determinate(ExtractProgressPhase::RulesMatches, 0, 2),
+                ProgressSnapshot::determinate(ExtractProgressPhase::RulesMatches, 1, 2),
             ]
         );
     }
@@ -1559,8 +1566,9 @@ parameter = 0
             Arc::clone(&state),
         );
 
+        let progress = RecordingProgress::default();
         let output = service
-            .replace(&project(), program, ExtractProgress::default())
+            .replace(&project(), program, ExtractProgress::new(progress.clone()))
             .await
             .expect("有效字符串应提交快照并返回跳过警告");
 
@@ -1576,6 +1584,16 @@ parameter = 0
                 actual_type: super::super::RulesCommandNonStringType::Number,
                 skipped_count: 2,
             }]
+        );
+        assert_eq!(
+            progress.snapshots(),
+            [
+                ProgressSnapshot::determinate(ExtractProgressPhase::RulesMatches, 0, 2),
+                ProgressSnapshot::determinate(ExtractProgressPhase::RulesMatches, 1, 2),
+                ProgressSnapshot::determinate(ExtractProgressPhase::RulesMatches, 2, 2),
+                ProgressSnapshot::indeterminate(ExtractProgressPhase::RulesCommit),
+                ProgressSnapshot::determinate(ExtractProgressPhase::RulesCommit, 1, 1),
+            ]
         );
     }
 

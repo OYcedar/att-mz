@@ -218,6 +218,7 @@ diagnostic-failure-value = { $code ->
     [invalid_syntax] 値の構文が無効です
     [invalid_encoding] テキストのエンコーディングが無効です
     [invalid_value] 値が必要な契約に違反しています
+    [empty_text_capture] text キャプチャが空です
     [rules_owner_disabled] 選択した Rules ファイルは rule = [] を使用しています。Rules は無効化され、抽出済みアセットは削除されました
     [not_found] 必要な対象が存在しません
     [state_mismatch] 保存されたプロジェクト状態がこの操作の要件を満たしていません

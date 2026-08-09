@@ -2513,7 +2513,11 @@ impl ProducerState {
         Ok(())
     }
 
-    fn validate_normal_finish(&self, context: &ProjectLogContext) -> Result<(), FinishError> {
+    fn validate_normal_finish(
+        &self,
+        context: &ProjectLogContext,
+        result: RunFinished,
+    ) -> Result<(), FinishError> {
         if self
             .phases
             .values()
@@ -2524,7 +2528,12 @@ impl ProducerState {
         if self.tasks_started.len() != self.task_outcomes.len() {
             return Err(FinishError::UnfinishedTasks);
         }
-        if self.run_plan_resolved && !self.run_plan_finalized {
+        // 运行方案只在业务成功后保存。失败或取消可以在已经解析方案、尚未开始保存时结束；
+        // 成功运行则必须保留唯一明确的保存终态。
+        if self.run_plan_resolved
+            && !self.run_plan_finalized
+            && matches!(result, RunFinished::Succeeded)
+        {
             return Err(FinishError::UnfinalizedRunPlan);
         }
         if context.command() == ProjectLogCommand::Translate && !self.translation_finished {
@@ -3416,7 +3425,7 @@ impl ProjectLogRuntime {
             return Err(FinishError::AlreadyFinished);
         }
         if !force {
-            state.validate_normal_finish(&self.logger.inner.context)?;
+            state.validate_normal_finish(&self.logger.inner.context, result)?;
         }
         let mut terminal_diagnostics = terminal_diagnostics
             .into_iter()
@@ -5329,6 +5338,63 @@ mod tests {
         assert_eq!(
             codes.iter().filter(|code| **code == "run.finished").count(),
             1
+        );
+    }
+
+    #[test]
+    fn failed_run_may_end_before_resolved_run_plan_is_saved() {
+        let bytes = SharedBytes::default();
+        let runtime = runtime_with_components(
+            ProjectLogCommand::Extract,
+            Box::new(bytes.clone()),
+            Box::new(JsonProjectLogRecordEncoder),
+        );
+        let logger = runtime.logger();
+        logger
+            .emit(ProjectLogEvent::RunPlanResolved {
+                plan: ResolvedRunPlan::generic_extract(RunPlanValueSource::Explicit),
+            })
+            .expect("运行方案解析事实必须入队");
+        let diagnostic = logger
+            .record_diagnostic(
+                DiagnosticScope::Run,
+                diagnostic_report(StateEffect::ProgressPreserved),
+            )
+            .expect("业务失败诊断必须入队");
+
+        runtime
+            .finish(RunFinished::Failed { diagnostic }, Vec::new())
+            .expect("业务失败前未保存运行方案仍是完整的已知终态");
+
+        let records = bytes.records();
+        assert!(
+            records
+                .iter()
+                .all(|record| record["event"] != "run_plan.finalized")
+        );
+        assert_eq!(
+            records.last().expect("失败运行必须有终态")["payload"]["result"]["kind"],
+            "failed"
+        );
+    }
+
+    #[test]
+    fn successful_run_still_requires_resolved_run_plan_to_be_saved() {
+        let runtime = runtime_with_components(
+            ProjectLogCommand::Extract,
+            Box::new(SharedBytes::default()),
+            Box::new(JsonProjectLogRecordEncoder),
+        );
+        runtime
+            .logger()
+            .emit(ProjectLogEvent::RunPlanResolved {
+                plan: ResolvedRunPlan::generic_extract(RunPlanValueSource::Explicit),
+            })
+            .expect("运行方案解析事实必须入队");
+
+        assert_eq!(
+            runtime.finish(RunFinished::Succeeded, Vec::new()),
+            Err(FinishError::UnfinalizedRunPlan)
         );
     }
 

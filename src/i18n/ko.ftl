@@ -218,6 +218,7 @@ diagnostic-failure-value = { $code ->
     [invalid_syntax] 값의 구문이 잘못되었습니다
     [invalid_encoding] 텍스트 인코딩이 잘못되었습니다
     [invalid_value] 값이 필수 계약을 위반합니다
+    [empty_text_capture] text 캡처가 비어 있습니다
     [rules_owner_disabled] 선택한 Rules 파일이 rule = []을 사용합니다. Rules가 비활성화되었고 추출된 자산이 삭제되었습니다
     [not_found] 필요한 객체가 없습니다
     [state_mismatch] 저장된 프로젝트 상태가 이 작업의 요구 사항을 충족하지 않습니다

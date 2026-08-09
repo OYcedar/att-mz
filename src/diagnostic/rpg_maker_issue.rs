@@ -1090,13 +1090,163 @@ impl RpgMakerRulesMatchProblem {
             Self::NoNonBlankMatch { .. } | Self::MissingTextCapture { .. } => {
                 "missing_required_value"
             }
+            Self::ZeroWidthMatch { .. } => "empty_text_capture",
             Self::DuplicateTarget { .. } => "conflicting_values",
             Self::InvalidMaterialization { .. } => "internal_invariant",
             Self::InvalidTarget { .. }
             | Self::PatternMatch { .. }
-            | Self::ZeroWidthMatch { .. }
             | Self::OverlappingMatch { .. }
             | Self::InvalidCaptureRange { .. } => "invalid_value",
+        }
+    }
+}
+
+fn rules_match_subject(
+    rules_path: &SafePath,
+    context: Option<&RpgMakerRulesMatchContext>,
+    problem: &RpgMakerRulesMatchProblem,
+) -> String {
+    let rule = rules_match_rule_label(problem);
+    match rules_match_target(context, problem) {
+        Some(target) => format!("{rules_path}:{rule} -> {target}"),
+        None => format!("{rules_path}:{rule}"),
+    }
+}
+
+fn rules_match_rule_label(problem: &RpgMakerRulesMatchProblem) -> String {
+    match problem {
+        RpgMakerRulesMatchProblem::DuplicateTarget {
+            first_rule,
+            second_rule,
+            ..
+        } => format!("Rules[{first_rule},{second_rule}]"),
+        RpgMakerRulesMatchProblem::NoNonBlankMatch { rule_number, .. }
+        | RpgMakerRulesMatchProblem::InvalidTarget { rule_number, .. }
+        | RpgMakerRulesMatchProblem::PatternMatch { rule_number, .. }
+        | RpgMakerRulesMatchProblem::ZeroWidthMatch { rule_number, .. }
+        | RpgMakerRulesMatchProblem::OverlappingMatch { rule_number, .. }
+        | RpgMakerRulesMatchProblem::MissingTextCapture { rule_number, .. }
+        | RpgMakerRulesMatchProblem::InvalidCaptureRange { rule_number, .. }
+        | RpgMakerRulesMatchProblem::InvalidMaterialization { rule_number, .. } => {
+            format!("Rules[{rule_number}]")
+        }
+    }
+}
+
+fn rules_match_target(
+    context: Option<&RpgMakerRulesMatchContext>,
+    problem: &RpgMakerRulesMatchProblem,
+) -> Option<String> {
+    let mut target = match problem {
+        RpgMakerRulesMatchProblem::DuplicateTarget { source, .. } => {
+            rules_match_source_target(source)
+        }
+        RpgMakerRulesMatchProblem::InvalidTarget {
+            reason:
+                RpgMakerRulesInvalidTarget::PluginFieldType {
+                    plugin_index,
+                    plugin_name,
+                    field,
+                    ..
+                },
+            ..
+        } if context.is_none() => format!(
+            "plugins.js:plugin[{plugin_index}]({plugin_name})[{}]",
+            serde_json::to_string(&field.to_string()).expect("安全字段名始终可以编码为 JSON")
+        ),
+        _ => rules_match_context_target(context?),
+    };
+    if let Some(steps) = rules_match_steps(problem) {
+        append_rules_match_steps(&mut target, steps);
+    }
+    Some(target)
+}
+
+fn rules_match_context_target(context: &RpgMakerRulesMatchContext) -> String {
+    match &context.source {
+        RpgMakerRulesDiagnosticSource::DataFile { file } => file.to_string(),
+        RpgMakerRulesDiagnosticSource::Plugin {
+            plugin_index,
+            plugin_name,
+        } => format!("plugins.js:plugin[{plugin_index}]({plugin_name})"),
+        RpgMakerRulesDiagnosticSource::Command {
+            file,
+            code,
+            parameter,
+        } => format!("{file}:command[{code}]:parameter[{parameter}]"),
+    }
+}
+
+fn rules_match_source_target(source: &RpgMakerRulesMatchSource) -> String {
+    match source {
+        RpgMakerRulesMatchSource::DataFile { file } => file.to_string(),
+        RpgMakerRulesMatchSource::PluginParameter {
+            plugin_index,
+            plugin_name,
+            parameter_name,
+        } => {
+            format!("plugins.js:plugin[{plugin_index}]({plugin_name}):parameter[{parameter_name}]")
+        }
+    }
+}
+
+fn rules_match_steps(problem: &RpgMakerRulesMatchProblem) -> Option<&[RpgMakerRulesValueStep]> {
+    match problem {
+        RpgMakerRulesMatchProblem::NoNonBlankMatch { .. } => None,
+        RpgMakerRulesMatchProblem::InvalidTarget { reason, .. } => {
+            rules_invalid_target_steps(reason)
+        }
+        RpgMakerRulesMatchProblem::PatternMatch { at, .. }
+        | RpgMakerRulesMatchProblem::ZeroWidthMatch { at, .. }
+        | RpgMakerRulesMatchProblem::OverlappingMatch { at, .. }
+        | RpgMakerRulesMatchProblem::MissingTextCapture { at, .. }
+        | RpgMakerRulesMatchProblem::InvalidCaptureRange { at, .. }
+        | RpgMakerRulesMatchProblem::DuplicateTarget { steps: at, .. } => Some(at),
+        RpgMakerRulesMatchProblem::InvalidMaterialization { reason, .. } => Some(match reason {
+            RpgMakerRulesMaterializationFailure::Projection { at, .. }
+            | RpgMakerRulesMaterializationFailure::UnitCount { at, .. }
+            | RpgMakerRulesMaterializationFailure::RoundTripMismatch { at } => at,
+        }),
+    }
+}
+
+fn rules_invalid_target_steps(
+    reason: &RpgMakerRulesInvalidTarget,
+) -> Option<&[RpgMakerRulesValueStep]> {
+    match reason {
+        RpgMakerRulesInvalidTarget::InvalidDataFileName { .. }
+        | RpgMakerRulesInvalidTarget::PluginFieldType { .. } => None,
+        RpgMakerRulesInvalidTarget::PluginPathMissingParameter { at }
+        | RpgMakerRulesInvalidTarget::PluginGroupMissingParameter { at }
+        | RpgMakerRulesInvalidTarget::PluginGroupCrossesParameters { at, .. }
+        | RpgMakerRulesInvalidTarget::NestedJsonDecode { at, .. }
+        | RpgMakerRulesInvalidTarget::ExpectedObject { at, .. }
+        | RpgMakerRulesInvalidTarget::ExpectedArray { at, .. }
+        | RpgMakerRulesInvalidTarget::CommandParametersType { at, .. }
+        | RpgMakerRulesInvalidTarget::CommandParameterMissing { at, .. }
+        | RpgMakerRulesInvalidTarget::DecodeJsonTargetType { at, .. }
+        | RpgMakerRulesInvalidTarget::FinalTargetType { at, .. } => Some(at),
+    }
+}
+
+fn append_rules_match_steps(target: &mut String, steps: &[RpgMakerRulesValueStep]) {
+    target.push('$');
+    for step in steps {
+        match step {
+            RpgMakerRulesValueStep::Key { key } => {
+                target.push('[');
+                target.push_str(
+                    &serde_json::to_string(&key.to_string())
+                        .expect("安全 Rules 路径键始终可以编码为 JSON"),
+                );
+                target.push(']');
+            }
+            RpgMakerRulesValueStep::Index { index } => {
+                target.push('[');
+                target.push_str(&index.to_string());
+                target.push(']');
+            }
+            RpgMakerRulesValueStep::DecodeJsonString => {}
         }
     }
 }
@@ -6820,7 +6970,11 @@ impl RpgMakerIssue {
         match &self.problem {
             RpgMakerProblem::Project { problem } => problem.subject(),
             RpgMakerProblem::RulesDefinition { rules_path, .. } => rules_path.to_string(),
-            RpgMakerProblem::RulesMatch { rules_path, .. } => rules_path.to_string(),
+            RpgMakerProblem::RulesMatch {
+                rules_path,
+                context,
+                problem,
+            } => rules_match_subject(rules_path, context.as_ref(), problem),
             RpgMakerProblem::RulesCommandNonString { fact } => format!(
                 "{} (Rules rule {}; command code={}; parameter={}; type={}; skipped={})",
                 fact.source_file,

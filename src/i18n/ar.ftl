@@ -225,6 +225,7 @@ diagnostic-failure-value = { $code ->
     [invalid_syntax] صياغة القيمة غير صالحة
     [invalid_encoding] ترميز النص غير صالح
     [invalid_value] القيمة تخالف العقد المطلوب
+    [empty_text_capture] التقاط text فارغ
     [rules_owner_disabled] يستخدم ملف Rules المحدد rule = []؛ عُطّل Rules وحُذفت أصوله المستخرجة
     [not_found] الكائن المطلوب غير موجود
     [state_mismatch] حالة المشروع المحفوظة لا تستوفي متطلبات هذه العملية
