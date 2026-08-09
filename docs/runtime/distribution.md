@@ -49,8 +49,8 @@ Init 前不存在，由 ATT 在实际需要时建立。游戏、JSONL、Rules、
 | `docs/` | 与仓库 `docs/` 的完整文件集合和内容完全相同 |
 | `prompts/` | 与仓库 `prompts/` 的完整文件集合和内容完全相同 |
 | `skills/` | 与仓库 `skills/` 的完整文件集合和内容完全相同 |
-| `licenses/` | 与仓库 `licenses/` 的完整文件集合和内容完全相同；`THIRD-PARTY-LICENSES.html` 对应 ATT 依赖，`FORMIC-THIRD-PARTY-LICENSES.html` 对应随包 Formic v0.1.0 依赖 |
-| `tools/formic/` | Formic v0.1.0 Windows x64：`formic.exe`、同目录运行库、许可与来源说明、配置模板和首次创建后保留的活动配置 |
+| `licenses/` | 与仓库 `licenses/` 的完整文件集合和内容完全相同；`THIRD-PARTY-LICENSES.html` 对应 ATT 依赖，`FORMIC-THIRD-PARTY-LICENSES.html` 对应随包 Formic v0.2.0 依赖 |
+| `tools/formic/` | Formic v0.2.0 Windows x64：`formic.exe`、同目录运行库、许可与来源说明、配置模板和首次创建后保留的活动配置 |
 | `projects/` | 运行期项目工作区；不属于仓库资源同步集合，已有项目内容不能被发行资源同步覆盖或删除 |
 
 `docs/`、`prompts/`、`skills/`、`licenses/`、两个配置模板和 Formic 的静态文件都是发行

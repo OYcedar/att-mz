@@ -1,27 +1,79 @@
-# ATT 随包 Formic 的高并发默认。填写 config.toml，或使用 FORMIC_LLM_* 环境变量覆盖。
+# ATT 随包 Formic v0.2.0 的当前高吞吐模板。复制为 config.toml 后填写；
+# 明文密钥不会进入 worker 运行档案，不要提交复制后含真实密钥的 config.toml。
+# 只有外部服务配额或实测资源边界要求时才降低资源值。
 url = "https://api.example.com/v1"
 api_key = "replace-with-api-key"
 model = "model-name"
-context_window_tokens = 200000
-max_output_tokens = 32000
+context_window_tokens = 131072
+# 仅当 FORMIC_LLM_PROTOCOL=anthropic 时取消下一行注释。Anthropic Messages
+# 要求 max_tokens；completions 和 responses 不允许配置或发送任何输出 token 参数。
+# anthropic_max_tokens = 16384
 
 [execution]
+# 单次 LLM 步骤最多尝试 5 次，包括可修正的结构错误；这不是 worker 总回合数限制。
 llm_attempts = 5
+# 只阻止连续完全相同且没有进展的调用；普通工具调用总数不受此值限制。
 identical_tool_call_limit = 16
-context_safety_tokens = 4096
+# 在声明的模型上下文中预留 2048 tokens，超出预算前自动压缩旧工具往返。
+context_safety_tokens = 2048
 
 [tools]
+# 内置工具单次最多返回 1 MiB；UTF-8 文本超出后带明确截断标记。
 max_result_bytes = 1048576
+# 内置工具最多同时执行 64 次，窗口满时排队，不拒绝合法任务。
 max_in_flight = 64
 
 [tools.search]
 enabled = true
 max_matches = 1000
 max_context_lines = 100
+# max_result_bytes 与 max_in_flight 可覆盖 [tools]。
 
 [tools.read]
 enabled = true
+# max_result_bytes 与 max_in_flight 可覆盖 [tools]。
 
 [cache]
 enabled = true
+# 作业内 input 搜索和读取结果使用 1 GiB 内存 LRU；MCP 和 output 工具不进入缓存。
 max_bytes = 1073741824
+
+# Streamable HTTP MCP 示例。默认暴露 tools/list 发现的全部工具；需要主动筛选时才写 enabled_tools。
+[mcp_servers.http_example]
+enabled = false
+url = "https://example.com/mcp"
+bearer_token = ""
+bearer_token_env = "EXAMPLE_TOKEN"
+headers = { "x-client" = "formic" }
+# header_env 的键是 HTTP header，值是本机环境变量名；环境变量值覆盖 headers。
+header_env = { "x-tenant" = "EXAMPLE_TENANT" }
+tool_aliases = {}
+session_scope = "job"
+max_in_flight = 64
+startup_timeout_sec = 60
+tool_timeout_sec = 600
+# 慢速 HTTP initialize 会受 startup_timeout_sec 限制；重连还受当前 tool_timeout_sec 限制。
+# 调用返回后底层 TCP 不保证立即关闭，见 Formic 当前使用说明。
+max_result_bytes = 1048576
+# 只重建后续调用使用的会话，不重放已经中断的调用。
+reconnect = true
+
+[mcp_servers.http_example.tool_limits.search]
+# 单工具只配置并发上限；解码前结果字节上限统一由 server 的 max_result_bytes 负责。
+max_in_flight = 32
+
+# stdio MCP 示例。command 与 url 互斥；命令不会经过 shell 拼接。
+[mcp_servers.stdio_example]
+enabled = false
+command = "mcp-server"
+args = ["--stdio"]
+env = { LOG_LEVEL = "warn" }
+# env_vars 的键是子进程环境变量，值是本机环境变量名；环境变量值覆盖 env。
+env_vars = { SERVICE_TOKEN = "EXAMPLE_TOKEN" }
+tool_aliases = {}
+session_scope = "job"
+max_in_flight = 64
+startup_timeout_sec = 60
+tool_timeout_sec = 600
+max_result_bytes = 1048576
+reconnect = true
