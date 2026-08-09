@@ -13,6 +13,9 @@ class JavaScriptLiteral:
     line: int
     kind: str
     dynamic_template: bool
+    start: int | None = None
+    end: int | None = None
+    quote: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,7 +283,15 @@ def scan_javascript(text: str) -> JavaScriptScan:
             value, end, closed = _quoted(text, index, character)
             if closed:
                 literals.append(
-                    JavaScriptLiteral(value=value, line=line, kind="string", dynamic_template=False)
+                    JavaScriptLiteral(
+                        value=value,
+                        line=line,
+                        kind="string",
+                        dynamic_template=False,
+                        start=start,
+                        end=end,
+                        quote=character,
+                    )
                 )
             else:
                 warnings.append({"line": line, "kind": "unterminated_string"})
@@ -320,6 +331,9 @@ def scan_javascript(text: str) -> JavaScriptScan:
                         line=literal.line + line_offset,
                         kind=literal.kind,
                         dynamic_template=literal.dynamic_template,
+                        start=(expression_start + literal.start if literal.start is not None else None),
+                        end=expression_start + literal.end if literal.end is not None else None,
+                        quote=literal.quote,
                     )
                     for literal in nested.literals
                 )

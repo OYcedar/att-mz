@@ -30,15 +30,17 @@ from att_toolbox.js import (
     scan_javascript,
     static_code_targets,
 )
+from att_toolbox.resources import resource_kind_for_suffix
 from att_toolbox.rpg import (
+    GameInfo,
     actual_path,
     discover_game,
     iter_string_leaves,
     plugin_script_path,
     read_plugins,
+    require_game_root,
 )
 
-_IMAGE_SUFFIXES = frozenset({".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp", ".rpgmvp", ".rpgmvm"})
 _DISPLAY_CALL = re.compile(
     r"\b(?:drawText(?:Ex)?|addCommand|setText|showText|Window_[A-Za-z0-9_]*|addChild|addWindow|createText)\b"
 )
@@ -53,17 +55,59 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _resolve_source(argument: Path, content_root: Path) -> Path:
-    candidate = argument if argument.is_absolute() else content_root / argument
-    source = ensure_inside(candidate, content_root, "文本来源")
-    if not source.is_file():
-        fail(str(argument), "指定来源不是存在的文件", "传入游戏内已存在的精确文件")
-    return source
+def _resolve_source(argument: Path, game: GameInfo, game_root: Path) -> Path:
+    if argument.is_absolute():
+        source = ensure_inside(argument, game_root, "文本来源")
+        if not source.is_file():
+            fail(str(argument), "指定来源不是存在的文件", "传入游戏根内已存在的精确文件")
+        return source
+
+    candidates: dict[Path, Path] = {}
+    for root in (game_root, game.content_root):
+        candidate = root / argument
+        if not candidate.exists():
+            continue
+        resolved = ensure_inside(candidate, game_root, "文本来源")
+        if resolved.is_file():
+            candidates[resolved] = candidate
+    if not candidates:
+        fail(str(argument), "指定来源不是游戏根内存在的文件", "传入 inventory 中的精确自然路径")
+    if len(candidates) > 1:
+        locations = ", ".join(
+            path.relative_to(game_root).as_posix()
+            for path in sorted(candidates, key=lambda item: item.as_posix().encode("utf-8"))
+        )
+        fail(
+            str(argument),
+            f"相对路径同时命中多个游戏文件：{locations}",
+            "改用相对游戏根的精确路径或绝对路径",
+        )
+    return next(iter(candidates))
 
 
 def _normalized_reference(value: str) -> str:
     normalized = value.replace("\\", "/")
     return normalized.removeprefix("./")
+
+
+def _literal_source_match(
+    value: str,
+    script: Path,
+    source: Path,
+    game_root: Path,
+    exact_values: set[str],
+) -> str | None:
+    normalized = _normalized_reference(value)
+    if normalized in exact_values:
+        return normalized
+    if not normalized or "\x00" in normalized:
+        return None
+    candidate = (script.parent / normalized).resolve(strict=False)
+    try:
+        candidate.relative_to(game_root)
+    except ValueError:
+        return None
+    return normalized if candidate == source else None
 
 
 def _display_references(code: str) -> list[dict[str, JsonValue]]:
@@ -121,18 +165,27 @@ def _has_uncertain_loader(item: dict[str, JsonValue]) -> bool:
 
 def _trace(args: argparse.Namespace) -> int:
     game = discover_game(args.game)
-    source = _resolve_source(args.source, game.content_root)
+    game_root = require_game_root(game)
+    source = _resolve_source(args.source, game, game_root)
     protect_outputs(
         [args.output],
         inputs=[source],
-        forbidden_roots=[game.supplied_root, game.content_root],
+        forbidden_roots=[game_root, game.content_root],
         replace=args.replace,
     )
-    relative = stable_relative(source, game.content_root)
+    relative = stable_relative(source, game_root)
+    content_relative = (
+        stable_relative(source, game.content_root) if source.is_relative_to(game.content_root) else None
+    )
     active = [plugin for plugin in read_plugins(game.content_root) if plugin.status]
     exact_values = {
         _normalized_reference(value)
-        for value in (relative, source.name, relative.removeprefix("data/"))
+        for value in (
+            relative,
+            content_relative,
+            source.name,
+            content_relative.removeprefix("data/") if content_relative is not None else None,
+        )
         if value
     }
     weak_values = {source.stem}
@@ -173,11 +226,18 @@ def _trace(args: argparse.Namespace) -> int:
             loader_edges: list[JsonValue] = []
             for literal in scan.literals:
                 normalized = _normalized_reference(literal.value)
-                if not literal.dynamic_template and normalized in exact_values:
+                matched = _literal_source_match(
+                    literal.value,
+                    script,
+                    source,
+                    game_root,
+                    exact_values,
+                )
+                if not literal.dynamic_template and matched is not None:
                     exact_references.append(
                         {
                             "line": literal.line,
-                            "matched": normalized,
+                            "matched": matched,
                             "literal_kind": literal.kind,
                             "display_relation": _display_relation(literal.line, displays, scopes),
                         }
@@ -233,8 +293,12 @@ def _trace(args: argparse.Namespace) -> int:
                     {
                         "plugin": plugin.name,
                         "active": True,
-                        "script": script_relative,
-                        "loader_chain": list(chain),
+                        "script": stable_relative(script, game_root),
+                        "loader_chain": [
+                            stable_relative(code_files[item], game_root)
+                            for item in chain
+                            if item in code_files
+                        ],
                         "loader_edges": loader_edges,
                         "source_is_active_plugin_script": source_is_direct,
                         "source_is_statically_loaded_code": source_is_loaded,
@@ -295,12 +359,15 @@ def _trace(args: argparse.Namespace) -> int:
         if uncertain_consumers
         else "not_found"
     )
+    resource_kind = resource_kind_for_suffix(source.suffix)
     result: dict[str, JsonValue] = {
         "engine": game.engine,
         "source": relative,
         "checks": {
             "inside_game_directory": True,
-            "non_image_file": source.suffix.lower() not in _IMAGE_SUFFIXES,
+            "non_image_file": resource_kind not in {"image", "encrypted"},
+            "resource_file": resource_kind is not None,
+            "resource_kind": resource_kind,
             "active_runtime_consumer": consumer_status,
             "player_display_call_in_consumer": "candidate" if display_consumers else "not_found",
             "player_display_call_in_source_code": "candidate" if source_code_displays else "not_found",

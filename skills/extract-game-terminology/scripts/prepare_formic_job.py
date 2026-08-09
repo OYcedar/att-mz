@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 from pathlib import Path
 
@@ -20,9 +19,14 @@ from att_skill_tools import (
     read_manual,
     run_cli,
 )
-from term_toolbox.grouping import build_formic_units, render_formic_unit
+from term_toolbox.grouping import (
+    FORMIC_TARGET_RENDERED_CHARACTERS,
+    build_formic_units,
+    formic_packing_evidence,
+    render_formic_scope,
+    render_formic_unit,
+)
 
-_INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _TASK = """\
 从当前剧情分片直接找出可能在翻译时写法不一致的游戏专有单个名词，只输出原文，一行一个。
 只摘录游戏文本中真实出现的内容。不要造词，不要拼接多个名词，不要输出短语、句子、普通词或译文。
@@ -41,33 +45,40 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _safe_name(value: str) -> str:
-    cleaned = _INVALID_FILENAME.sub("_", value).rstrip(" .")
-    return cleaned or "未分类来源"
-
-
 def _prepare(args: argparse.Namespace) -> int:
     entries = read_manual(args.manual)
     protect_outputs([args.output], inputs=[args.manual], replace=args.replace)
-    units = build_formic_units(entries)
+    target_characters = FORMIC_TARGET_RENDERED_CHARACTERS
+    units = build_formic_units(entries, target_characters=target_characters)
     files: dict[str, str] = {"task.md": _TASK}
     plan_lines: list[str] = []
     for unit_number, unit in enumerate(units, start=1):
-        base = _safe_name(unit.title)[:80].rstrip(" .") or "未分类来源"
-        name = f"{unit_number:06d}-{base}.md"
-        relative = f"input/{name}"
-        files[relative] = render_formic_unit(unit)
-        plan: dict[str, JsonValue] = {"unit": unit_number, "files": [name]}
+        scope_names: list[JsonValue] = []
+        for scope in unit.scopes:
+            relative = f"input/{scope.file_name}"
+            files[relative] = render_formic_scope(scope)
+            scope_names.append(scope.file_name)
+        plan: dict[str, JsonValue] = {"unit": unit_number, "files": scope_names}
         plan_lines.append(json.dumps(plan, ensure_ascii=False, separators=(",", ":")))
     files["plan.jsonl"] = "\n".join(plan_lines) + ("\n" if plan_lines else "")
-    atomic_write_directory(args.output, files, replace=args.replace)
     maximum_characters = max((unit.source_characters for unit in units), default=0)
     maximum_rendered = max((len(render_formic_unit(unit)) for unit in units), default=0)
+    evidence = formic_packing_evidence(units, target_characters=target_characters)
+    files["packing-evidence.json"] = json.dumps(evidence, ensure_ascii=False, indent=2) + "\n"
+    atomic_write_directory(args.output, files, replace=args.replace)
     print(
-        f"已把 {len(entries)} 个当前可翻译条目按公开自然范围建立 {len(units)} 个 Formic 单元；"
+        f"已把 {len(entries)} 个当前可翻译条目保留为 {evidence['scopes']} 个自然 Scope 文件，"
+        f"并建立 {len(units)} 个 Formic 单元；"
         f"最大单元原文 {maximum_characters} 字符、完整 Markdown {maximum_rendered} 字符："
         f"{display_path(args.output)}"
     )
+    if len(units) > 250:
+        print(
+            "装箱边界证据："
+            f"来源连续段 {evidence['source_runs']}，超大 Scope {evidence['oversized_scopes']}，"
+            f"实际分片总字符 {evidence['total_rendered_characters']}，"
+            f"目标 {evidence['target_rendered_characters']}。"
+        )
     print("下一步：在 Formic 目录使用 output/input、output/plan.jsonl 和 output/task.md 运行全部单元。")
     return 0
 
