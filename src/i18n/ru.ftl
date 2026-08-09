@@ -99,7 +99,7 @@ result-translate-status-value = { $status ->
     [incomplete] не полностью
    *[other] __ATT_FALLBACK__
 }
-result-translate-summary = Перевод: { $total } задач; завершено { $complete }, частично { $partial }, недоступно { $unavailable }; записано { $written } позиций, осталось { $remaining }
+result-translate-summary = Перевод: запланировано { $total } задач, начато { $started }, не начато { $not_started }; завершено { $complete }, частично { $partial }, недоступно { $unavailable }, с ошибкой { $failed }, отменено { $cancelled }; записано { $written } позиций, осталось { $remaining }
 result-translate-convergence = Сведение состояния: сохранено { $retained }, аннулировано { $invalidated }, неприменимо { $not_applicable }, переиспользовано { $reused }
 result-write-back-completed = Запись завершена: { $project }
 result-project-lua-completed = Выполнение Lua проекта завершено: { $project }
@@ -107,13 +107,21 @@ result-output-directory = Каталог вывода: { $path }
 result-write-back-summary = Запись: { $translated } переведённых единиц, { $original } исходных; автоперенос { $auto_wrapped }, добавлено переносов { $breaks } и полноширинных отступов { $indents }; ручная раскладка { $manual }
 result-generic-extract-unchanged = Входные данные Generic не изменились: файлов — { $files }, групп — { $groups }, единиц — { $units }
 result-generic-extract-updated = Входные данные Generic обновлены: файлов — { $files }, групп — { $groups }, единиц — { $units }; переводов сохранено — { $preserved }, очищено — { $cleared }
-result-generic-translate-summary = Перевод Generic: { $total } задач; завершено { $complete }, частично { $partial }, недоступно { $unavailable }; очищено { $cleared }, повторно использовано { $reused }, принято { $accepted }, записано { $written }, конфликтов { $conflicted }, проблем ответа { $problems }
+result-generic-translate-summary = Перевод Generic: запланировано { $total } задач, начато { $started }, не начато { $not_started }; завершено { $complete }, частично { $partial }, недоступно { $unavailable }, с ошибкой { $failed }, отменено { $cancelled }; запланировано Unit: { $planned_units }, осталось Unit: { $remaining_units }, очищено { $cleared }, повторно использовано { $reused }, принято { $accepted }, записано { $written }, конфликтов { $conflicted }, проблем ответа { $problems }
 result-generic-write-back-summary = Запись Generic: { $translated } переведённых единиц, { $original } исходных сохранено
 result-symbol-repair-summary = Исправление символов: проверено { $attempted } единиц, исправлено { $repaired }, внутренне пропущено { $skipped }, заменено символов { $replacements }
 result-run-log = Журнал запуска: { $path }
 translate-incomplete-object = Запуск Translate для проекта { $project }
-translate-incomplete-rpg-maker-reason = Частичных задач: { $partial }, недоступных: { $unavailable }, проблем протокола: { $protocol }, исчерпанных запросов: { $exhausted }; осталось решений: { $remaining_decisions }, мест: { $remaining_locations }
-translate-incomplete-generic-reason = Частичных задач: { $partial }, недоступных: { $unavailable }, конфликтов записи: { $conflicted }, проблем ответа: { $problems }
+translate-incomplete-rpg-maker-reason = Частичных задач: { $partial }, недоступных: { $unavailable }, не начато: { $not_started }, проблем протокола: { $protocol }, исчерпанных запросов: { $exhausted }; приём запросов {
+    $admission ->
+        [stopped] остановлен
+       *[open] продолжен
+    }; осталось решений: { $remaining_decisions }, мест: { $remaining_locations }
+translate-incomplete-generic-reason = Частичных задач: { $partial }, недоступных: { $unavailable }, не начато: { $not_started }, исчерпанных запросов: { $exhausted }; приём запросов {
+    $admission ->
+        [stopped] остановлен
+       *[open] продолжен
+    }; осталось Unit: { $remaining_units }, конфликтов записи: { $conflicted }, проблем ответа: { $problems }
 translate-incomplete-help = Изучите диагностику задач в журнале этого запуска, исправьте повторяемые проблемы и снова запустите Translate; для небольшого остатка используйте Manual
 result-cancelled = Команда отменена после безопасного завершения.
 result-plan-saved = Успешный план запуска сохранён.
@@ -252,6 +260,7 @@ diagnostic-failure-value = { $code ->
     [target_already_exists] Назначение уже существует
     [file_identity_changed] Идентификатор файла изменился во время операции
     [invalid_path] Путь не является допустимой целью этой операции
+    [not_regular_file] Существующий объект не является обычным файлом
     [wrong_publisher_instance] Токен публикации принадлежит другому экземпляру издателя
     [journal_corrupt] Журнал восстановления публикации недействителен или неполон
     [unexpected_artifact] Неожиданный артефакт файловой системы блокирует операцию
@@ -334,6 +343,7 @@ diagnostic-json-position = строка { $line }, столбец { $column }
 diagnostic-placeholder-rule-file = Правило Placeholder { $number } в { $path }
 diagnostic-placeholder-rule-project = Правило Placeholder { $number } текущего проекта
 manual-exported = Экспортировано записей: { $entries }; файл: { $path }
+manual-ownership-exported = Записи владения: { $path }
 manual-checked = Допустимых: { $valid }, незаполненных: { $unfilled }, ошибок: { $errors }
 manual-applied = Применено: { $applied }, незаполненных: { $unfilled }, ошибок: { $errors }
 manual-value = { $code ->
@@ -345,6 +355,7 @@ manual-value = { $code ->
     [rerun_export_without_controls] Снова выполните manual export и не добавляйте переводы строк или NUL в элементы массива
     [rerun_export_then_fill] Снова выполните manual export, затем заполните перевод
     [resolve_temporary_then_rerun_export] Исправьте указанный фиксированный временный путь, удалите оставшийся объект и снова выполните manual export
+    [resolve_published_backup_cleanup] Оба файла уже опубликованы; проверьте их и удалите указанный фиксированный файл backup
     [keep_exported_type] Сохраните type, записанный командой manual export
    *[other] __ATT_FALLBACK__
 }

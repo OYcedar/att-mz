@@ -28,7 +28,7 @@ use crate::execution::ordered::{
 use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::language::{LanguageAnalysis, LanguagePair};
-use crate::llm::{ChatMessage, LlmClientConcurrency};
+use crate::llm::{ChatMessage, LlmClientConcurrency, LlmServiceStatus};
 use crate::rpg_maker::asset::RpgMakerAssetOwner;
 use crate::rpg_maker::model::{LogicalTextLocation, TextUnitContent, TextUnitRole};
 use crate::rpg_maker::project::OpenedProject;
@@ -2067,7 +2067,6 @@ pub(crate) enum TranslationUnitRejectionReason {
 pub(crate) struct UnresolvedTranslationUnit {
     id: TaskId,
     unit: RpgMakerUnitLocator,
-    location_count: usize,
     reason: TranslationUnitRejectionReason,
 }
 
@@ -2075,15 +2074,9 @@ impl UnresolvedTranslationUnit {
     pub(crate) fn new(
         id: TaskId,
         unit: RpgMakerUnitLocator,
-        propagation_target_count: usize,
         reason: TranslationUnitRejectionReason,
     ) -> Self {
-        Self {
-            id,
-            unit,
-            location_count: 1 + propagation_target_count,
-            reason,
-        }
+        Self { id, unit, reason }
     }
 
     pub(crate) const fn id(&self) -> TaskId {
@@ -2102,16 +2095,8 @@ impl UnresolvedTranslationUnit {
         &self.reason
     }
 
-    pub(crate) const fn location_count(&self) -> usize {
-        self.location_count
-    }
-
     #[cfg(test)]
-    pub(crate) fn for_test(
-        id: TaskId,
-        propagation_target_count: usize,
-        reason: TranslationUnitRejectionReason,
-    ) -> Self {
+    pub(crate) fn for_test(id: TaskId, reason: TranslationUnitRejectionReason) -> Self {
         use crate::diagnostic::{
             RpgMakerDiagnosticGroupKind, RpgMakerDiagnosticLocation, RpgMakerDiagnosticOwner,
             RpgMakerDiagnosticRole, RpgMakerDiagnosticSource,
@@ -2128,7 +2113,6 @@ impl UnresolvedTranslationUnit {
                 ),
                 RpgMakerDiagnosticRole::scalar("description"),
             ),
-            propagation_target_count,
             reason,
         )
     }
@@ -2159,12 +2143,31 @@ pub(crate) enum TranslationTaskUnavailableReason {
     AllOutputsRejected,
     RecoverableRequestExhausted {
         diagnostic: DiagnosticReport,
+        service_status: LlmServiceStatus,
     },
     RetryAfterExceedsConfiguredMaximum {
         retry_after: Duration,
         maximum: Duration,
         diagnostic: DiagnosticReport,
+        service_status: LlmServiceStatus,
     },
+    RequestAdmissionStopped {
+        diagnostic: DiagnosticReport,
+        service_status: LlmServiceStatus,
+    },
+}
+
+impl TranslationTaskUnavailableReason {
+    fn stops_admission(&self) -> bool {
+        match self {
+            Self::RecoverableRequestExhausted { service_status, .. }
+            | Self::RetryAfterExceedsConfiguredMaximum { service_status, .. }
+            | Self::RequestAdmissionStopped { service_status, .. } => {
+                service_status.stops_admission_after_unavailable() || service_status.is_permanent()
+            }
+            Self::ModelResponseUnusable | Self::AllOutputsRejected => false,
+        }
+    }
 }
 
 /// 一个非空的任务决定集合。
@@ -2282,13 +2285,6 @@ impl TranslationTaskOutcome {
         self.accepted()
             .iter()
             .map(|decision| 1 + decision.propagation_targets().len())
-            .sum()
-    }
-
-    pub(crate) fn unresolved_location_count(&self) -> usize {
-        self.unresolved()
-            .iter()
-            .map(UnresolvedTranslationUnit::location_count)
             .sum()
     }
 }
@@ -2538,11 +2534,16 @@ fn task_outcome_diagnostics(
             reports
         }
         TranslationTaskOutcome::Unavailable { reason, .. } => match reason {
-            TranslationTaskUnavailableReason::RecoverableRequestExhausted { diagnostic }
+            TranslationTaskUnavailableReason::RecoverableRequestExhausted {
+                diagnostic, ..
+            }
             | TranslationTaskUnavailableReason::RetryAfterExceedsConfiguredMaximum {
                 diagnostic,
                 ..
-            } => vec![diagnostic.clone()],
+            }
+            | TranslationTaskUnavailableReason::RequestAdmissionStopped { diagnostic, .. } => {
+                vec![diagnostic.clone()]
+            }
             TranslationTaskUnavailableReason::ModelResponseUnusable => {
                 let reports = protocol_reports();
                 if reports.is_empty() {
@@ -2582,6 +2583,7 @@ pub(crate) struct RpgMakerTranslationRunReport {
     unresolved_locations: usize,
     protocol_diagnostics: usize,
     recoverable_request_exhaustions: usize,
+    request_admission_stopped: bool,
     retained: usize,
     invalidated: usize,
     not_applicable: usize,
@@ -2591,6 +2593,8 @@ pub(crate) struct RpgMakerTranslationRunReport {
 impl RpgMakerTranslationRunReport {
     pub(crate) const fn with_reconciliation(
         total_tasks: usize,
+        planned_decisions: usize,
+        planned_locations: usize,
         retained: usize,
         invalidated: usize,
         not_applicable: usize,
@@ -2603,10 +2607,11 @@ impl RpgMakerTranslationRunReport {
             unavailable_tasks: 0,
             accepted_decisions: 0,
             written_locations: 0,
-            unresolved_decisions: 0,
-            unresolved_locations: 0,
+            unresolved_decisions: planned_decisions,
+            unresolved_locations: planned_locations,
             protocol_diagnostics: 0,
             recoverable_request_exhaustions: 0,
+            request_admission_stopped: false,
             retained,
             invalidated,
             not_applicable,
@@ -2627,12 +2632,19 @@ impl RpgMakerTranslationRunReport {
                 ) {
                     self.recoverable_request_exhaustions += 1;
                 }
+                self.request_admission_stopped |= reason.stops_admission();
             }
         }
         self.accepted_decisions += outcome.accepted().len();
         self.written_locations += outcome.accepted_location_count();
-        self.unresolved_decisions += outcome.unresolved().len();
-        self.unresolved_locations += outcome.unresolved_location_count();
+        self.unresolved_decisions = self
+            .unresolved_decisions
+            .checked_sub(outcome.accepted().len())
+            .expect("已接受决策不得超过本次计划决策数");
+        self.unresolved_locations = self
+            .unresolved_locations
+            .checked_sub(outcome.accepted_location_count())
+            .expect("已写入位置不得超过本次计划位置数");
         self.protocol_diagnostics += outcome.diagnostics().len();
     }
 
@@ -2650,6 +2662,14 @@ impl RpgMakerTranslationRunReport {
 
     pub(crate) const fn unavailable_tasks(&self) -> usize {
         self.unavailable_tasks
+    }
+
+    pub(crate) const fn started_tasks(&self) -> usize {
+        self.complete_tasks + self.partial_tasks + self.unavailable_tasks
+    }
+
+    pub(crate) const fn not_started_tasks(&self) -> usize {
+        self.total_tasks.saturating_sub(self.started_tasks())
     }
 
     pub(crate) fn accepted_decisions(&self) -> usize {
@@ -2674,6 +2694,14 @@ impl RpgMakerTranslationRunReport {
 
     pub(crate) const fn recoverable_request_exhaustions(&self) -> usize {
         self.recoverable_request_exhaustions
+    }
+
+    pub(crate) const fn request_admission_stopped(&self) -> bool {
+        self.request_admission_stopped
+    }
+
+    fn mark_request_admission_stopped(&mut self) {
+        self.request_admission_stopped = true;
     }
 
     pub(crate) const fn retained(&self) -> usize {
@@ -2743,6 +2771,11 @@ pub(crate) trait RpgMakerTranslationTaskPlanner: Send + Sync {
 pub(crate) trait RpgMakerTranslationTaskExecutor: Send + Sync {
     type Profile: RpgMakerTranslationExecutionProfile;
     type Error: Error + Send + Sync + 'static;
+
+    /// 永久服务状态已经停止新请求时，是否仍应提交其他已准入任务的验收结果。
+    fn failure_preserves_admitted_results(_error: &Self::Error) -> bool {
+        false
+    }
 
     fn execute(
         &self,
@@ -2820,8 +2853,7 @@ pub(crate) trait RpgMakerTranslation: Send + Sync {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RpgMakerTranslationLogEvent {
     PlanningCompleted {
-        total_tasks: usize,
-        unresolved_units: usize,
+        report: RpgMakerTranslationRunReport,
     },
     TaskStarted {
         task_index: RpgMakerTranslationTaskIndex,
@@ -2832,6 +2864,7 @@ pub(crate) enum RpgMakerTranslationLogEvent {
         outcome: RpgMakerTranslationLogTaskOutcome,
         attempts: Option<NonZeroUsize>,
         retry_exhausted: bool,
+        report: RpgMakerTranslationRunReport,
     },
 }
 
@@ -2923,6 +2956,7 @@ enum TranslationTaskStageError<E, S> {
         source: E,
         evidence: TranslationTaskExecutionEvidence,
         diagnostic: DiagnosticReport,
+        preserve_admitted_results: bool,
     },
     Cancelled {
         source: E,
@@ -2946,6 +2980,7 @@ enum TranslationTaskPipelineError<E, S> {
         task_index: RpgMakerTranslationTaskIndex,
         source: E,
         diagnostic: DiagnosticReport,
+        preserve_admitted_results: bool,
     },
     CommitTask {
         task_index: RpgMakerTranslationTaskIndex,
@@ -3132,11 +3167,15 @@ where
                 source,
                 evidence,
                 diagnostic,
-            }) => Err(TranslationTaskStageError::Execution {
-                source,
-                evidence,
-                diagnostic,
-            }),
+            }) => {
+                let preserve_admitted_results = E::failure_preserves_admitted_results(&source);
+                Err(TranslationTaskStageError::Execution {
+                    source,
+                    evidence,
+                    diagnostic,
+                    preserve_admitted_results,
+                })
+            }
             Err(TranslationTaskExecutionFailure::Cancelled { source, evidence }) => {
                 Err(TranslationTaskStageError::Cancelled { source, evidence })
             }
@@ -3185,6 +3224,13 @@ where
         })
     }
 
+    fn executed_stops_admission(&self, _ordinal: usize, executed: &Self::Executed) -> bool {
+        matches!(
+            executed.outcome(),
+            TranslationTaskOutcome::Unavailable { reason, .. } if reason.stops_admission()
+        )
+    }
+
     async fn finalize(
         &self,
         _ordinal: usize,
@@ -3199,8 +3245,12 @@ where
                 source,
                 evidence,
                 diagnostic,
+                preserve_admitted_results,
             }) => {
                 let attempts = NonZeroUsize::new(evidence.attempt_count());
+                if preserve_admitted_results {
+                    report.mark_request_admission_stopped();
+                }
                 self.remember_failure_diagnostic(&diagnostic);
                 self.service
                     .event_log
@@ -3211,6 +3261,7 @@ where
                         },
                         attempts,
                         retry_exhausted: false,
+                        report: report.clone(),
                     });
                 self.service.record_task(|| {
                     TranslationTaskRecordDocument::new(
@@ -3225,6 +3276,7 @@ where
                     task_index: scheduled_task_index,
                     source,
                     diagnostic,
+                    preserve_admitted_results,
                 })
             }
             OrderedTaskResult::ExecutionFailed(TranslationTaskStageError::Cancelled {
@@ -3238,6 +3290,7 @@ where
                         outcome: RpgMakerTranslationLogTaskOutcome::Cancelled,
                         attempts: NonZeroUsize::new(evidence.attempt_count()),
                         retry_exhausted: false,
+                        report: report.clone(),
                     });
                 self.service.record_task(|| {
                     TranslationTaskRecordDocument::new(
@@ -3266,6 +3319,7 @@ where
                         },
                         attempts: Some(outcome.attempts()),
                         retry_exhausted: false,
+                        report: report.clone(),
                     });
                 self.service.record_task(|| {
                     TranslationTaskRecordDocument::new(
@@ -3295,6 +3349,7 @@ where
                 evidence,
                 TranslationTaskCommitPhase::Preparation,
                 failure,
+                report,
             ),
             OrderedTaskResult::Prepared(prepared) => {
                 let PreparedTranslationTask {
@@ -3315,6 +3370,7 @@ where
                             outcome,
                             evidence,
                             TranslationTaskRecordFinalStateKind::Cancelled,
+                            report,
                         );
                         Ok(())
                     }
@@ -3324,6 +3380,7 @@ where
                             outcome,
                             evidence,
                             TranslationTaskRecordFinalStateKind::EarlierFailure,
+                            report,
                         );
                         Ok(())
                     }
@@ -3341,6 +3398,7 @@ where
                                 evidence,
                                 TranslationTaskCommitPhase::Transaction,
                                 failure,
+                                report,
                             );
                         }
                         self.record_success(task, outcome, evidence, report);
@@ -3356,6 +3414,27 @@ where
                 )
             }
         }
+    }
+
+    fn prepared_stops_admission(&self, _ordinal: usize, prepared: &Self::Prepared) -> bool {
+        matches!(
+            prepared.outcome.as_ref(),
+            TranslationTaskOutcome::Unavailable { reason, .. } if reason.stops_admission()
+        )
+    }
+
+    fn finalization_failure_preserves_admitted_results(
+        &self,
+        _ordinal: usize,
+        error: &Self::Error,
+    ) -> bool {
+        matches!(
+            error,
+            TranslationTaskPipelineError::ExecuteTask {
+                preserve_admitted_results: true,
+                ..
+            }
+        )
     }
 
     fn admission_stopped(&self) {
@@ -3404,6 +3483,7 @@ where
         outcome: Arc<TranslationTaskOutcome>,
         evidence: TranslationTaskExecutionEvidence,
         kind: TranslationTaskRecordFinalStateKind,
+        report: &RpgMakerTranslationRunReport,
     ) {
         let task_index = task.index();
         let prior_failure = match kind {
@@ -3432,6 +3512,7 @@ where
                 outcome: observed_outcome,
                 attempts: Some(outcome.attempts()),
                 retry_exhausted: false,
+                report: report.clone(),
             });
         let state = match kind {
             TranslationTaskRecordFinalStateKind::Cancelled => {
@@ -3457,6 +3538,7 @@ where
         evidence: TranslationTaskExecutionEvidence,
         phase: TranslationTaskCommitPhase,
         failure: TranslationTaskCommitFailure<S::Error>,
+        report: &RpgMakerTranslationRunReport,
     ) -> Result<(), TranslationTaskPipelineError<E::Error, S::Error>> {
         let task_index = task.index();
         let (source, impact, diagnostic) = failure.into_parts();
@@ -3470,6 +3552,7 @@ where
                 },
                 attempts: Some(outcome.attempts()),
                 retry_exhausted: false,
+                report: report.clone(),
             });
         let state = match impact {
             TranslationTaskCommitFailureImpact::NotApplied => {
@@ -3537,6 +3620,7 @@ where
                 outcome: observed_outcome,
                 attempts: Some(outcome.attempts()),
                 retry_exhausted,
+                report: report.clone(),
             });
         let state = match outcome.as_ref() {
             TranslationTaskOutcome::Complete { .. } => {
@@ -3618,8 +3702,16 @@ where
                 return Ok(OperationCompletion::Cancelled);
             }
             let (_semantics, preparation, tasks) = plan.into_parts();
+            let planned_decisions = tasks.iter().map(|task| task.expected_outputs().len()).sum();
+            let planned_locations = tasks
+                .iter()
+                .flat_map(RpgMakerExecutableTask::expected_outputs)
+                .map(|output| 1 + output.propagation_targets().len())
+                .sum();
             let report = RpgMakerTranslationRunReport::with_reconciliation(
                 tasks.len(),
+                planned_decisions,
+                planned_locations,
                 preparation.retained(),
                 preparation.invalidated(),
                 preparation.not_applicable(),
@@ -3627,8 +3719,7 @@ where
             );
             self.event_log
                 .emit(RpgMakerTranslationLogEvent::PlanningCompleted {
-                    total_tasks: tasks.len(),
-                    unresolved_units: 0,
+                    report: report.clone(),
                 });
 
             self.result_store
@@ -3660,6 +3751,7 @@ where
                             task_index,
                             source,
                             diagnostic,
+                            ..
                         } => RpgMakerTranslationServiceError::ExecuteTask {
                             task_index,
                             source,
@@ -4056,6 +4148,7 @@ mod tests {
         Partial,
         Unavailable,
         RetryExhausted,
+        RateLimitExhausted,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5362,6 +5455,7 @@ mod tests {
                 outcome: RpgMakerTranslationLogTaskOutcome::CommitFailed { .. },
                 attempts: Some(_),
                 retry_exhausted: false,
+                ..
             } if *task_index == RpgMakerTranslationTaskIndex::new(1)
         )));
         assert_eq!(
@@ -5660,6 +5754,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rate_limit_exhaustion_stops_admission_before_slow_earlier_task_finishes() {
+        let mut harness = harness_with_behavior(
+            8,
+            vec![1; 8],
+            false,
+            false,
+            false,
+            None,
+            None,
+            empty_preparation(),
+            vec![
+                FakeOutcomeKind::Complete,
+                FakeOutcomeKind::RateLimitExhausted,
+                FakeOutcomeKind::Complete,
+                FakeOutcomeKind::Complete,
+                FakeOutcomeKind::Complete,
+                FakeOutcomeKind::Complete,
+                FakeOutcomeKind::Complete,
+                FakeOutcomeKind::Complete,
+            ],
+        );
+        let earlier_gate = Arc::new(Semaphore::new(0));
+        harness.service.task_executor.block_at = Some((0, Arc::clone(&earlier_gate)));
+
+        let project = project();
+        let profile = profile(2);
+        let run = harness.service.run(&project, &profile, input());
+        let release = async {
+            loop {
+                if harness
+                    .events
+                    .lock()
+                    .expect("测试事件记录锁不应中毒")
+                    .contains(&Event::Complete(1))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            earlier_gate.add_permits(1);
+        };
+        let (completion, ()) = tokio::join!(run, release);
+        let report = expect_completed(completion.expect("普通 429 耗尽应形成未完整结果"));
+
+        let executed = events(&harness.events)
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Execute(index) => Some(index),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(executed, vec![0, 1]);
+        assert_eq!(report.total_tasks(), 8);
+        assert_eq!(report.started_tasks(), 2);
+        assert_eq!(report.not_started_tasks(), 6);
+        assert_eq!(report.complete_tasks(), 1);
+        assert_eq!(report.unavailable_tasks(), 1);
+        assert_eq!(report.recoverable_request_exhaustions(), 1);
+        assert!(report.request_admission_stopped());
+        assert_eq!(report.unresolved_decisions(), 14);
+        assert_eq!(report.unresolved_locations(), 21);
+    }
+
+    #[tokio::test]
     async fn each_pre_execution_failure_stops_all_later_stages() {
         let cases = [
             (
@@ -5832,11 +5990,7 @@ mod tests {
             )
         };
         let unresolved = |output: &ExpectedTranslationOutput, reason| {
-            UnresolvedTranslationUnit::for_test(
-                output.id(),
-                output.propagation_targets().len(),
-                reason,
-            )
+            UnresolvedTranslationUnit::for_test(output.id(), reason)
         };
 
         match kind {
@@ -5895,6 +6049,24 @@ mod tests {
                 ),
                 reason: TranslationTaskUnavailableReason::RecoverableRequestExhausted {
                     diagnostic: test_retry_exhausted_report(),
+                    service_status: LlmServiceStatus::Other,
+                },
+                unresolved: test_non_empty(
+                    expected
+                        .iter()
+                        .map(|output| unresolved(output, TranslationUnitRejectionReason::Missing))
+                        .collect(),
+                ),
+            },
+            FakeOutcomeKind::RateLimitExhausted => TranslationTaskOutcome::Unavailable {
+                context: TranslationTaskOutcomeContext::new(
+                    task_index,
+                    NonZeroUsize::new(3).expect("测试尝试数必须非零"),
+                    Vec::new(),
+                ),
+                reason: TranslationTaskUnavailableReason::RecoverableRequestExhausted {
+                    diagnostic: test_retry_exhausted_report(),
+                    service_status: LlmServiceStatus::RateLimited,
                 },
                 unresolved: test_non_empty(
                     expected

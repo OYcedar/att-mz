@@ -28,6 +28,7 @@ pub(crate) struct ExtractedTextUnit {
     role: TextUnitRole,
     projection_location: RpgMakerLocation,
     semantic_order_key: RpgMakerSemanticOrderKey,
+    rule_number: Option<usize>,
     mutation_claim: MutationClaim,
     source_content: TextUnitContent,
 }
@@ -81,6 +82,7 @@ impl ExtractedTextUnit {
             role,
             projection_location,
             semantic_order_key,
+            rule_number: None,
             mutation_claim,
             source_content,
         })
@@ -111,6 +113,20 @@ impl ExtractedTextUnit {
 
     pub(crate) fn set_semantic_order_key(&mut self, semantic_order_key: RpgMakerSemanticOrderKey) {
         self.semantic_order_key = semantic_order_key;
+    }
+
+    /// 保存产生 Rules Unit 的 TOML 自然序号；Builtin Unit 始终保持为空。
+    pub(crate) fn set_rule_number(&mut self, rule_number: usize) {
+        assert!(rule_number > 0, "Rules 自然序号必须从 1 开始");
+        assert!(
+            self.rule_number.is_none(),
+            "Rules Unit 不能重复设置来源规则"
+        );
+        self.rule_number = Some(rule_number);
+    }
+
+    pub(crate) const fn rule_number(&self) -> Option<usize> {
+        self.rule_number
     }
 }
 

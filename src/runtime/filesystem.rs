@@ -34,7 +34,7 @@ use crate::diagnostic::{
     FileSystemIssue, FileSystemJournalViolation, FileSystemOperation, FileSystemOrdinalKeyPhase,
     FileSystemPathViolation, FileSystemProblem, FileSystemRecoveryViolation, IoFailure,
     PublicationBackendCause, PublicationStep, RelatedFailureRelation, RuntimeComponent,
-    RuntimeIssue, RuntimeOperation, SafeIdentifier, SafePath, StateEffect,
+    RuntimeIssue, RuntimeOperation, SafeIdentifier, SafePath, StateEffect, public_path,
 };
 use crate::fingerprint::Sha256Fingerprint;
 use crate::json_diagnostic::JsonErrorCategory;
@@ -955,11 +955,7 @@ impl From<WindowsFsError> for SystemFileSystemError {
 }
 
 fn display_paths(paths: &[PathBuf]) -> String {
-    paths
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join("、")
+    paths.iter().map(public_path).collect::<Vec<_>>().join("、")
 }
 
 fn io_error(operation: &'static str, path: &Path, source: io::Error) -> SystemFileSystemError {
@@ -5825,6 +5821,17 @@ mod tests {
     use std::os::windows::ffi::OsStringExt;
 
     use super::*;
+
+    #[test]
+    fn displayed_path_lists_remove_windows_verbatim_prefixes() {
+        assert_eq!(
+            display_paths(&[
+                PathBuf::from(r"\\?\C:\games\sample"),
+                PathBuf::from(r"\\?\UNC\server\share\sample"),
+            ]),
+            r"C:\games\sample、\\server\share\sample"
+        );
+    }
 
     fn init_recovery_report(error: &SystemFileSystemError) -> DiagnosticReport {
         error.diagnostic_report(

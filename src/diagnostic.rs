@@ -112,7 +112,9 @@ pub(crate) use runtime_issue::{
     SqliteIssue, SqliteOperation, SqliteProblem, SqliteTransactionState,
     TranslationTaskCounterInvariant,
 };
-pub(crate) use safe_value::{ByteRange, InvalidSafeIdentifier, SafeIdentifier, SafePath, SafeText};
+pub(crate) use safe_value::{
+    ByteRange, InvalidSafeIdentifier, SafeIdentifier, SafePath, SafeText, public_path,
+};
 
 pub(crate) type BoxedError = Box<dyn Error + Send + Sync + 'static>;
 

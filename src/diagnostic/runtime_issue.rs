@@ -630,7 +630,7 @@ impl RuntimeIssue {
             Self::Io { failure, .. } => failure.summary_code(),
             Self::ResourceLimit { .. } => "invalid_value",
             Self::InvalidConfiguration { .. } => "invalid_value",
-            Self::Cancelled { .. } => "lock_cancelled",
+            Self::Cancelled { .. } => "cancelled",
             Self::ExecutorClosed { .. } => "executor_closed",
             Self::StatePoisoned { .. } => "executor_state_poisoned",
             Self::WorkerPanicked { .. } => "worker_panicked",
@@ -1160,6 +1160,10 @@ pub(crate) enum FileSystemProblem {
         first_path: SafePath,
         second_path: SafePath,
     },
+    ConflictingOutputPaths {
+        first_path: SafePath,
+        second_path: SafePath,
+    },
     OutsideScope {
         root: SafePath,
         path: SafePath,
@@ -1202,6 +1206,10 @@ pub(crate) enum FileSystemProblem {
     CleanupFailed {
         path: SafePath,
     },
+    RecoveryArtifactIo {
+        path: SafePath,
+        failure: IoFailure,
+    },
     JournalCorrupt {
         path: SafePath,
         artifacts: Vec<SafePath>,
@@ -1243,6 +1251,7 @@ impl FileSystemProblem {
             Self::InvalidPath { .. } => "filesystem.invalid_path",
             Self::HardLink { .. } => "filesystem.hard_link",
             Self::CaseCollision { .. } => "filesystem.case_collision",
+            Self::ConflictingOutputPaths { .. } => "filesystem.conflicting_output_paths",
             Self::OutsideScope { .. } => "filesystem.outside_scope",
             Self::UnexpectedObject { .. } => "filesystem.unexpected_object",
             Self::ReparsePoint { .. } => "filesystem.reparse_point",
@@ -1258,6 +1267,7 @@ impl FileSystemProblem {
             Self::WrongPublisherInstance => "filesystem.wrong_publisher_instance",
             Self::RollbackFailed { .. } => "filesystem.rollback_failed",
             Self::CleanupFailed { .. } => "filesystem.cleanup_failed",
+            Self::RecoveryArtifactIo { .. } => "filesystem.recovery_artifact_io",
             Self::JournalCorrupt { .. } => "filesystem.journal_corrupt",
             Self::RecoveryRequired { .. } => "filesystem.recovery_required",
             Self::RecoveryCleanupFailed { .. } => "filesystem.recovery_cleanup_failed",
@@ -1280,6 +1290,7 @@ impl FileSystemProblem {
             | Self::TargetExists { .. } => DiagnosticResolution::CheckPathAndPermissions,
             Self::HardLink { .. }
             | Self::CaseCollision { .. }
+            | Self::ConflictingOutputPaths { .. }
             | Self::OutsideScope { .. }
             | Self::UnexpectedObject { .. } => DiagnosticResolution::FixInput,
             Self::Cancelled { .. } | Self::ExecutorClosed => DiagnosticResolution::Retry,
@@ -1288,8 +1299,14 @@ impl FileSystemProblem {
             | Self::OutcomeUnknown { .. }
             | Self::RollbackFailed { .. }
             | Self::CleanupFailed { .. }
+            | Self::RecoveryArtifactIo { .. }
             | Self::JournalCorrupt { .. }
             | Self::IdentityChanged { .. } => DiagnosticResolution::PreserveRecoveryArtifacts,
+            Self::InvalidPath {
+                violation:
+                    FileSystemPathViolation::MissingFileName | FileSystemPathViolation::NotRegularFile,
+                ..
+            } => DiagnosticResolution::FixInput,
             Self::InvalidPath { .. } | Self::WrongPublisherInstance | Self::WorkerPanicked => {
                 DiagnosticResolution::ReportBug
             }
@@ -1304,11 +1321,16 @@ impl FileSystemProblem {
             Self::NotFound { .. } => "not_found",
             Self::NotDirectory { .. } | Self::NotFile { .. } => "invalid_path",
             Self::Io { failure, .. } => failure.summary_code(),
+            Self::InvalidPath {
+                violation: FileSystemPathViolation::NotRegularFile,
+                ..
+            } => "not_regular_file",
             Self::InvalidPath { .. } => "invalid_path",
             Self::HardLink { .. }
             | Self::CaseCollision { .. }
             | Self::OutsideScope { .. }
             | Self::UnexpectedObject { .. } => "invalid_path",
+            Self::ConflictingOutputPaths { .. } => "conflicting_values",
             Self::ReparsePoint { .. } => "reparse_point_forbidden",
             Self::NonLocalVolume { .. } => "non_local_volume",
             Self::NonNtfsVolume { .. } => "non_ntfs_volume",
@@ -1322,6 +1344,7 @@ impl FileSystemProblem {
             Self::WrongPublisherInstance => "wrong_publisher_instance",
             Self::RollbackFailed { .. } => "rollback_failed",
             Self::CleanupFailed { .. } => "finalization_failed",
+            Self::RecoveryArtifactIo { failure, .. } => failure.summary_code(),
             Self::JournalCorrupt { .. } => "journal_corrupt",
             Self::RecoveryRequired { .. } => "write_back_recovery_required",
             Self::RecoveryCleanupFailed { .. } => "finalization_failed",
@@ -1350,10 +1373,15 @@ impl FileSystemProblem {
             | Self::IdentityChanged { path }
             | Self::RollbackFailed { path }
             | Self::CleanupFailed { path }
+            | Self::RecoveryArtifactIo { path, .. }
             | Self::JournalCorrupt { path, .. }
             | Self::OrdinalKeyTooLarge { path, .. }
             | Self::OrdinalKeyIo { path, .. } => path.to_string(),
             Self::CaseCollision { second_path, .. } => second_path.to_string(),
+            Self::ConflictingOutputPaths {
+                first_path,
+                second_path,
+            } => format!("{first_path}; {second_path}"),
             Self::RecoveryRequired { target_root, .. }
             | Self::RecoveryCleanupFailed { target_root, .. }
             | Self::OutcomeUnknown { target_root, .. } => target_root.to_string(),
@@ -1390,6 +1418,20 @@ impl FileSystemProblem {
             } => {
                 facts.push(("first_path", first_path.to_string()));
                 facts.push(("second_path", second_path.to_string()));
+            }
+            Self::ConflictingOutputPaths {
+                first_path,
+                second_path,
+            } => {
+                facts.push(("first_path", first_path.to_string()));
+                facts.push(("second_path", second_path.to_string()));
+            }
+            Self::RecoveryArtifactIo { path, failure } => {
+                facts.push(("path", path.to_string()));
+                facts.push(("io_kind", failure.kind.as_str().to_owned()));
+                if let Some(code) = failure.raw_os_code {
+                    facts.push(("raw_os_code", code.to_string()));
+                }
             }
             Self::OutsideScope { root, path } => {
                 facts.push(("root", root.to_string()));

@@ -2709,6 +2709,7 @@ mod tests {
                 INSERT INTO rpg_maker_text_unit VALUES ('builtin', 1, 'role-y', X'010000000000000000000000000000000000', '"y"', '{}', NULL, NULL);
                 INSERT INTO rpg_maker_mutation_claim VALUES ('builtin', 1, 'resource-z', 'exclusive');
                 INSERT INTO rpg_maker_mutation_claim VALUES ('builtin', 2, 'resource-a', 'intent');
+                ALTER TABLE rpg_maker_text_unit ADD COLUMN rule_number INTEGER;
                 "#,
             )
             .expect("测试快照表与行应可建立");

@@ -45,7 +45,8 @@ Extract 先按引擎结构建立明确的 `Semantic Scope → Group → Unit`。
 - 可自由断行数组。
 
 内部身份由来源位置和 Unit 角色确定，排序字段不参与身份。Builtin 与 Rules 都保存可从
-冻结来源重新验证的写回 recipe。内部位置和顺序键不会进入 CLI、Manual、日志或高级 Lua。
+冻结来源重新验证的写回 recipe。Rules Unit 还保存产生它的 TOML 自然规则序号，从 1 开始；
+Builtin Unit 没有规则序号。内部位置和顺序键不会进入 CLI、Manual、日志或高级 Lua。
 
 对人使用的 ID 由当前项目索引生成，例如：
 
@@ -117,6 +118,9 @@ Builtin 明确不读取插件参数、插件命令 `356/357`、`note`/`meta`、`
 位置，都不能单独作为选择 Generic 的依据；ATT 也不会仅凭内容可见性猜测字段语义。
 
 Rules 的字段、来源、路径、捕获、顺序和错误范围由[规则规格](rules.md)定义。
+
+MV/MZ `manual export --ownership` 在同一只读快照中把当前 Manual 条目映射为 Builtin 或
+Rules；Rules 行直接使用这里保存的自然规则序号，不根据可读 ID、路径前缀或相邻位置猜测。
 
 ## 4. 冲突、继承和提交
 

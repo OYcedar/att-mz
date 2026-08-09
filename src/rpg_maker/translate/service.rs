@@ -150,6 +150,8 @@ where
             profile_id: execution.profile.id().to_owned(),
             summary: TranslationSummary {
                 total_tasks: report.total_tasks(),
+                started_tasks: report.started_tasks(),
+                not_started_tasks: report.not_started_tasks(),
                 complete_tasks: report.complete_tasks(),
                 partial_tasks: report.partial_tasks(),
                 unavailable_tasks: report.unavailable_tasks(),
@@ -159,6 +161,7 @@ where
                 remaining_locations: report.unresolved_locations(),
                 protocol_diagnostics: report.protocol_diagnostics(),
                 recoverable_request_exhaustions: report.recoverable_request_exhaustions(),
+                request_admission_stopped: report.request_admission_stopped(),
                 retained: report.retained(),
                 invalidated: report.invalidated(),
                 not_applicable: report.not_applicable(),
@@ -347,7 +350,7 @@ mod tests {
         ) -> Result<OperationCompletion<RpgMakerTranslationRunReport>, Self::Error> {
             self.cancellation.request();
             Ok(OperationCompletion::Completed(
-                RpgMakerTranslationRunReport::with_reconciliation(1, 1, 0, 0, 0),
+                RpgMakerTranslationRunReport::with_reconciliation(1, 0, 0, 1, 0, 0, 0),
             ))
         }
     }

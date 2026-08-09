@@ -30,6 +30,8 @@ pub struct TranslateInput {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TranslationSummary {
     pub total_tasks: usize,
+    pub started_tasks: usize,
+    pub not_started_tasks: usize,
     pub complete_tasks: usize,
     pub partial_tasks: usize,
     pub unavailable_tasks: usize,
@@ -39,6 +41,7 @@ pub struct TranslationSummary {
     pub remaining_locations: usize,
     pub protocol_diagnostics: usize,
     pub recoverable_request_exhaustions: usize,
+    pub request_admission_stopped: bool,
     pub retained: usize,
     pub invalidated: usize,
     pub not_applicable: usize,
@@ -52,6 +55,7 @@ impl TranslationSummary {
     pub(crate) const fn is_incomplete(self) -> bool {
         self.partial_tasks > 0
             || self.unavailable_tasks > 0
+            || self.not_started_tasks > 0
             || self.remaining_decisions > 0
             || self.remaining_locations > 0
     }

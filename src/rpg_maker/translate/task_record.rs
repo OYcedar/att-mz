@@ -124,6 +124,10 @@ impl TranslationTaskExecution {
     pub(crate) fn into_parts(self) -> (TranslationTaskOutcome, TranslationTaskExecutionEvidence) {
         (self.outcome, self.evidence)
     }
+
+    pub(crate) fn outcome(&self) -> &TranslationTaskOutcome {
+        &self.outcome
+    }
 }
 
 /// Executor 技术失败及其已经建立的旁路证据。

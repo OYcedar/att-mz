@@ -819,6 +819,14 @@ where
     type Profile = P;
     type Error = RpgMakerTranslationTaskExecutionError<L::Error, R::Error>;
 
+    fn failure_preserves_admitted_results(error: &Self::Error) -> bool {
+        matches!(
+            error,
+            RpgMakerTranslationTaskExecutionError::FatalRequest { source, .. }
+                if source.service_status().is_permanent()
+        )
+    }
+
     async fn execute(
         &self,
         profile: &Self::Profile,
@@ -865,6 +873,7 @@ where
                 diagnostic,
                 retry_after,
                 maximum,
+                service_status,
             } => {
                 let outcome = unavailable_after_request_failure(
                     task,
@@ -873,6 +882,7 @@ where
                         retry_after,
                         maximum,
                         diagnostic,
+                        service_status,
                     },
                 );
                 return Ok(TranslationTaskExecution::new(
@@ -883,11 +893,15 @@ where
             LlmRequestExecutionOutcome::RetryBudgetExhausted {
                 attempt,
                 diagnostic,
+                service_status,
             } => {
                 let outcome = unavailable_after_request_failure(
                     task,
                     attempt,
-                    TranslationTaskUnavailableReason::RecoverableRequestExhausted { diagnostic },
+                    TranslationTaskUnavailableReason::RecoverableRequestExhausted {
+                        diagnostic,
+                        service_status,
+                    },
                 );
                 return Ok(TranslationTaskExecution::new(
                     outcome,
@@ -906,6 +920,24 @@ where
                     },
                     evidence.finish(None),
                     diagnostic,
+                ));
+            }
+            LlmRequestExecutionOutcome::AdmissionStopped {
+                attempt,
+                diagnostic,
+                service_status,
+            } => {
+                let outcome = unavailable_after_request_failure(
+                    task,
+                    attempt,
+                    TranslationTaskUnavailableReason::RequestAdmissionStopped {
+                        diagnostic,
+                        service_status,
+                    },
+                );
+                return Ok(TranslationTaskExecution::new(
+                    outcome,
+                    evidence.finish(None),
                 ));
             }
             LlmRequestExecutionOutcome::Cancelled { attempt } => {
@@ -1884,7 +1916,6 @@ fn unresolved_unit(
     UnresolvedTranslationUnit::new(
         expected.id(),
         rpg_maker_diagnostic_unit(expected.identity()),
-        expected.propagation_targets().len(),
         reason,
     )
 }
@@ -5750,7 +5781,9 @@ mod tests {
             let diagnostic = match &outcome {
                 TranslationTaskOutcome::Unavailable {
                     reason:
-                        TranslationTaskUnavailableReason::RecoverableRequestExhausted { diagnostic }
+                        TranslationTaskUnavailableReason::RecoverableRequestExhausted {
+                            diagnostic, ..
+                        }
                         | TranslationTaskUnavailableReason::RetryAfterExceedsConfiguredMaximum {
                             diagnostic,
                             ..

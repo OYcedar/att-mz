@@ -2635,6 +2635,7 @@ mod tests {
                     owner TEXT NOT NULL,
                     group_id INTEGER NOT NULL CHECK (group_id > 0),
                     unit_role TEXT NOT NULL,
+                    rule_number INTEGER,
                     source_content_json TEXT NOT NULL,
                     source_context_json TEXT NOT NULL,
                     translation_content_json TEXT,
@@ -2667,14 +2668,18 @@ mod tests {
             connection
                 .execute(
                     "INSERT INTO rpg_maker_text_unit (
-                        owner, group_id, unit_role, source_content_json,
+                        owner, group_id, unit_role, rule_number, source_content_json,
                         source_context_json, translation_content_json, translation_state
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         owner,
                         group_id,
                         RpgMakerProjectionCodec::encode_role(unit.identity.role())
                             .expect("单元角色应可编码"),
+                        match unit.identity.owner() {
+                            RpgMakerAssetOwner::Builtin => None,
+                            RpgMakerAssetOwner::Rules => Some(1_i64),
+                        },
                         &unit.source_content_json,
                         unit.source_context_json,
                         &unit.translation_content_json,

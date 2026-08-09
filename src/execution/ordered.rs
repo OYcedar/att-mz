@@ -10,7 +10,7 @@ use std::fmt;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use futures_util::future;
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -147,6 +147,14 @@ pub(crate) trait OrderedExecutionHandler<T>: Send + Sync {
         executed: Self::Executed,
     ) -> impl Future<Output = Result<Self::Prepared, Self::StageError>> + Send;
 
+    /// 一个已经成功执行、尚未进入准备队列的领域结果是否要求立即停止后续准入。
+    ///
+    /// 外部请求预算耗尽等事实已经在执行结果中确定时，必须在 worker 领取下一项工作
+    /// 之前关闭准入，不能等准备 lane 调度后再把后续门控拒绝伪装成已开始任务。
+    fn executed_stops_admission(&self, _ordinal: usize, _executed: &Self::Executed) -> bool {
+        false
+    }
+
     fn finalize(
         &self,
         ordinal: usize,
@@ -155,6 +163,26 @@ pub(crate) trait OrderedExecutionHandler<T>: Send + Sync {
         disposition: OrderedFinalizationDisposition,
         state: &mut Self::State,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// 一个已经成功执行和准备的领域结果是否要求停止后续工作准入。
+    ///
+    /// 该工作及此前已经准入的工作仍按普通成功结果自然序最终化；尚未准入的工作
+    /// 不建立伪造终态。默认没有这种正常停发语义。
+    fn prepared_stops_admission(&self, _ordinal: usize, _prepared: &Self::Prepared) -> bool {
+        false
+    }
+
+    /// 一个自然序最终化失败是否仍允许后续已经准入的结果执行领域副作用。
+    ///
+    /// 默认失败会阻止后续副作用。只有调用方已经用类型化事实确认“停止新准入，但保留
+    /// 已验收并发结果”时才能返回 true；最早失败仍作为流水线最终错误返回。
+    fn finalization_failure_preserves_admitted_results(
+        &self,
+        _ordinal: usize,
+        _error: &Self::Error,
+    ) -> bool {
+        false
+    }
 
     /// 准入首次从开放切换为停止时发出的同步观察。
     ///
@@ -241,6 +269,8 @@ where
         tasks.into_iter().enumerate().collect::<VecDeque<_>>(),
     ));
     let stop = Arc::new(AtomicBool::new(false));
+    let normal_stop = Arc::new(AtomicBool::new(false));
+    let admitted = Arc::new(AtomicUsize::new(0));
     let (execution_sender, mut execution_receiver) =
         tokio::sync::mpsc::unbounded_channel::<ExecutedTask<T, H::Executed, H::StageError>>();
     let (prepared_sender, mut prepared_receiver) =
@@ -249,13 +279,17 @@ where
     let execution_lane = {
         let pending_tasks = Arc::clone(&pending_tasks);
         let stop = Arc::clone(&stop);
+        let normal_stop = Arc::clone(&normal_stop);
         let in_flight_window = Arc::clone(&in_flight_window);
+        let admitted = Arc::clone(&admitted);
         async move {
             let mut workers = FuturesUnordered::new();
             for _ in 0..worker_count {
                 let pending_tasks = Arc::clone(&pending_tasks);
                 let stop = Arc::clone(&stop);
+                let normal_stop = Arc::clone(&normal_stop);
                 let in_flight_window = Arc::clone(&in_flight_window);
+                let admitted = Arc::clone(&admitted);
                 let execution_sender = execution_sender.clone();
                 workers.push(async move {
                     loop {
@@ -279,10 +313,16 @@ where
                         let Some((ordinal, task)) = pending else {
                             break;
                         };
+                        admitted.fetch_add(1, Ordering::AcqRel);
 
                         let result = handler.execute(ordinal, &task).await;
-                        if result.is_err() {
-                            stop_admission(stop.as_ref(), handler);
+                        match &result {
+                            Ok(executed) if handler.executed_stops_admission(ordinal, executed) => {
+                                normal_stop.store(true, Ordering::Release);
+                                stop_admission(stop.as_ref(), handler);
+                            }
+                            Err(_) => stop_admission(stop.as_ref(), handler),
+                            Ok(_) => {}
                         }
                         if execution_sender
                             .send(ExecutedTask {
@@ -305,6 +345,7 @@ where
 
     let preparation_lane = {
         let stop = Arc::clone(&stop);
+        let normal_stop = Arc::clone(&normal_stop);
         async move {
             let mut preparations = FuturesUnordered::new();
             let mut execution_closed = false;
@@ -325,6 +366,12 @@ where
                     prepared = preparations.next(), if !preparations.is_empty() => {
                         let prepared =
                             prepared.expect("非空的有序准备集合必须返回一个完成项");
+                        if let OrderedTaskResult::Prepared(value) = &prepared.result
+                            && handler.prepared_stops_admission(prepared.ordinal, value)
+                        {
+                            normal_stop.store(true, Ordering::Release);
+                            stop_admission(stop.as_ref(), handler);
+                        }
                         if !matches!(prepared.result, OrderedTaskResult::Prepared(_)) {
                             stop_admission(stop.as_ref(), handler);
                         }
@@ -340,12 +387,15 @@ where
 
     let finalization_lane = {
         let stop = Arc::clone(&stop);
+        let normal_stop = Arc::clone(&normal_stop);
+        let admitted = Arc::clone(&admitted);
         async move {
             let mut slots = std::iter::repeat_with(|| None)
                 .take(task_count)
                 .collect::<Vec<Option<PreparedTask<T, H::Prepared, H::StageError>>>>();
             let mut next_ordinal = 0usize;
             let mut primary_failure = None;
+            let mut block_later_apply = false;
             let mut state = state;
 
             while let Some(completion) = prepared_receiver.recv().await {
@@ -366,7 +416,7 @@ where
                     } = completion;
                     let disposition = if cancellation.is_requested() {
                         OrderedFinalizationDisposition::CancelledNoApply
-                    } else if primary_failure.is_some() {
+                    } else if block_later_apply {
                         OrderedFinalizationDisposition::AfterEarlierFailureNoApply
                     } else {
                         OrderedFinalizationDisposition::Apply
@@ -377,6 +427,8 @@ where
                         .await
                     {
                         stop_admission(stop.as_ref(), handler);
+                        block_later_apply |= !handler
+                            .finalization_failure_preserves_admitted_results(ordinal, &source);
                         if primary_failure.is_none() {
                             primary_failure =
                                 Some(OrderedExecutionError::Finalization { ordinal, source });
@@ -395,7 +447,17 @@ where
                     actual_ordinal: Some(next_ordinal + offset),
                 });
             }
-            if !cancellation.is_requested() && next_ordinal < task_count {
+            let admitted = admitted.load(Ordering::Acquire);
+            if !cancellation.is_requested() && next_ordinal < admitted {
+                return Err(OrderedExecutionError::IncompleteResultSequence {
+                    expected_ordinal: next_ordinal,
+                    actual_ordinal: None,
+                });
+            }
+            if !cancellation.is_requested()
+                && next_ordinal < task_count
+                && !normal_stop.load(Ordering::Acquire)
+            {
                 return Err(OrderedExecutionError::IncompleteResultSequence {
                     expected_ordinal: next_ordinal,
                     actual_ordinal: None,
@@ -435,6 +497,9 @@ mod tests {
         active: AtomicUsize,
         maximum_active: AtomicUsize,
         finalized: Mutex<Vec<(usize, OrderedFinalizationDisposition)>>,
+        stop_on_executed: Option<usize>,
+        stop_on_prepared: Option<usize>,
+        admission_stop_count: AtomicUsize,
     }
 
     impl OrderingHarness {
@@ -449,6 +514,9 @@ mod tests {
                 active: AtomicUsize::new(0),
                 maximum_active: AtomicUsize::new(0),
                 finalized: Mutex::new(Vec::new()),
+                stop_on_executed: None,
+                stop_on_prepared: None,
+                admission_stop_count: AtomicUsize::new(0),
             }
         }
     }
@@ -490,6 +558,10 @@ mod tests {
             Ok(executed)
         }
 
+        fn executed_stops_admission(&self, ordinal: usize, _executed: &Self::Executed) -> bool {
+            self.stop_on_executed == Some(ordinal)
+        }
+
         async fn finalize(
             &self,
             ordinal: usize,
@@ -511,6 +583,14 @@ mod tests {
                 .push((ordinal, disposition));
             *state += 1;
             Ok(())
+        }
+
+        fn prepared_stops_admission(&self, ordinal: usize, _prepared: &Self::Prepared) -> bool {
+            self.stop_on_prepared == Some(ordinal)
+        }
+
+        fn admission_stopped(&self) {
+            self.admission_stop_count.fetch_add(1, Ordering::AcqRel);
         }
     }
 
@@ -545,6 +625,83 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(harness.maximum_active.load(Ordering::Acquire) <= 2);
+    }
+
+    #[tokio::test]
+    async fn normal_stop_preserves_all_admitted_results_and_leaves_later_work_unstarted() {
+        let mut harness = OrderingHarness::new(12);
+        harness.stop_on_prepared = Some(0);
+        let cancellation = CooperativeCancellation::default();
+        let result = execute_ordered(
+            (0..12).collect(),
+            OrderedExecutionLimits::new(
+                NonZeroUsize::new(2).expect("测试执行宽度必须非零"),
+                NonZeroUsize::MIN,
+            ),
+            &cancellation,
+            &harness,
+            0,
+        )
+        .await
+        .expect("正常停发不应成为流水线错误");
+
+        assert_eq!(result, OperationCompletion::Completed(2));
+        assert_eq!(
+            *harness.finalized.lock().expect("测试最终化记录锁不应中毒"),
+            vec![
+                (0, OrderedFinalizationDisposition::Apply),
+                (1, OrderedFinalizationDisposition::Apply),
+            ]
+        );
+        assert_eq!(harness.admission_stop_count.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn execution_result_stops_admission_before_blocked_preparation_can_refill_window() {
+        let mut harness = OrderingHarness::new(12);
+        harness.stop_on_executed = Some(0);
+        harness.execution_gates[0] = Arc::new(Semaphore::new(0));
+        harness.execution_gates[1] = Arc::new(Semaphore::new(0));
+        harness.preparation_gates[0] = Arc::new(Semaphore::new(0));
+        let first_execution_gate = Arc::clone(&harness.execution_gates[0]);
+        let second_execution_gate = Arc::clone(&harness.execution_gates[1]);
+        let first_preparation_gate = Arc::clone(&harness.preparation_gates[0]);
+        let cancellation = CooperativeCancellation::default();
+        let run = execute_ordered(
+            (0..12).collect(),
+            OrderedExecutionLimits::new(
+                NonZeroUsize::new(2).expect("测试执行宽度必须非零"),
+                NonZeroUsize::MIN,
+            ),
+            &cancellation,
+            &harness,
+            0,
+        );
+        let release = async {
+            while harness.maximum_active.load(Ordering::Acquire) < 2 {
+                tokio::task::yield_now().await;
+            }
+            first_execution_gate.add_permits(1);
+            second_execution_gate.add_permits(1);
+            while harness.admission_stop_count.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+            first_preparation_gate.add_permits(1);
+        };
+        let (result, ()) = tokio::join!(run, release);
+
+        assert_eq!(
+            result.expect("执行结果触发的正常停发不应成为流水线错误"),
+            OperationCompletion::Completed(2)
+        );
+        assert_eq!(
+            *harness.finalized.lock().expect("测试最终化记录锁不应中毒"),
+            vec![
+                (0, OrderedFinalizationDisposition::Apply),
+                (1, OrderedFinalizationDisposition::Apply),
+            ]
+        );
+        assert_eq!(harness.admission_stop_count.load(Ordering::Acquire), 1);
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]

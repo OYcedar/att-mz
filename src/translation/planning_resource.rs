@@ -22,7 +22,7 @@ use crate::diagnostic::{
     Diagnostic, DiagnosticReport, FileSystemDiagnosticStage, IoFailure, RuntimeOperation,
     StateEffect, TerminologyField, TranslationIssue, TranslationJsonFailureKind,
     TranslationPlanningResourceKind, TranslationPlanningResourceOrigin,
-    TranslationPlanningResourceProblem, TranslationPlanningWorkerOperation,
+    TranslationPlanningResourceProblem, TranslationPlanningWorkerOperation, public_path,
 };
 use crate::execution::CooperativeCancellation;
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
@@ -1446,10 +1446,8 @@ where
 }
 
 fn resource_label(path: &Option<PathBuf>) -> String {
-    path.as_ref().map_or_else(
-        || "（项目当前快照）".to_owned(),
-        |path| path.display().to_string(),
-    )
+    path.as_ref()
+        .map_or_else(|| "（项目当前快照）".to_owned(), public_path)
 }
 
 impl<F, C> Error for TranslationPlanningResourceReadingError<F, C>
@@ -1820,6 +1818,18 @@ mod tests {
     use super::*;
     use crate::runtime::cpu::{CpuExecutorConfig, RayonCpuExecutor};
     use crate::runtime::filesystem::{SystemFileSystem, SystemFileSystemConfig};
+
+    #[test]
+    fn planning_resource_labels_remove_windows_verbatim_prefixes() {
+        assert_eq!(
+            resource_label(&Some(PathBuf::from(r"\\?\C:\rules\terms.toml"))),
+            r"C:\rules\terms.toml"
+        );
+        assert_eq!(
+            resource_label(&Some(PathBuf::from(r"\\?\UNC\server\share\terms.toml",))),
+            r"\\server\share\terms.toml"
+        );
+    }
 
     #[derive(Clone, Copy, Debug)]
     struct FakeError;

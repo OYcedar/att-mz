@@ -80,6 +80,12 @@ Partial 后重试重新判断 ID，但不重新装箱。原块中的已完成 Un
 失败或取消都不会把它带走。提交时重新检查当前来源、Unit、译文和语义状态，发现并发变化
 或当前人工译文时，不覆盖新状态。
 
+永久认证、授权、额度或账户错误一经类型化确认，就停止后续模型请求和 Task 准入，本次
+Translate 为 Failed 并退出 `1`。普通 429 的 `Retry-After` 由同一 Client 共享；等待超过配置
+上限或重试耗尽时，当前 Task 为 Unavailable，后续 Task 为 not_started，本次结果为
+Incomplete 并退出 `0`。普通网络、超时或 HTTP 500 重试耗尽只使当前 Task Unavailable，
+不会停止后续 Task。停止前已经活动且获得有效结果的 Task 仍按自然顺序验收和提交。
+
 每个实际开始的 Task 写 `task.finished`：Complete、Partial、Unavailable、Failed、
 NotCommittedAfterEarlierFailure 或 Cancelled；Partial、Unavailable 与 Failed 同时写可读任务
 诊断。NotCommittedAfterEarlierFailure 仅表示已有可提交结果，但因更早任务失败没有写入，
@@ -92,7 +98,11 @@ Partial、Unavailable、协议问题、可恢复请求耗尽、剩余决策和�
 
 `translation.finished` 固定保存完整 Task 计数，并保存 RPG Maker 专用的 accepted decisions、
 written/remaining locations、remaining decisions、protocol diagnostics、recoverable request
-exhaustions 和 reconciliation 计数。Placeholder 等规划错误在任何模型请求前形成可读
+exhaustions、request admission stopped 和 reconciliation 计数。Task 计数始终满足
+`planned = started + not_started`；remaining decisions 与 remaining locations 按实际提交
+递减，不把已准入、冲突或停发后的工作伪装成已完成。Failed 与 Cancelled 在已经形成计划和
+引擎汇总时，也把同一份计数和汇总写入 JSONL，并在 stderr 打印一次短汇总；规划前失败或
+提前取消不伪造引擎工作量。停止路径不补写 100%。Placeholder 等规划错误在任何模型请求前形成可读
 `diagnostic.run_plan`，保存类似 `Map023.json:event17:page1:dialogue42` 的位置、规则文件、
 自然规则号、原因和修改方法；结果为 Failed，数据库保持不变。
 

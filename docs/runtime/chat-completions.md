@@ -53,12 +53,31 @@ HTTP 200 后要求：
 
 Retryable 包含 DNS/连接/发送/读取/完整请求超时或中断，以及 HTTP 408、429、500、
 502、503、504。`Retry-After` 支持秒数和 HTTP-date，并受 Client `max_retry_after_ms`
-约束。Translate 按 Client `retry_delays_ms` 执行有限重试；本地等待不消耗重试次数。
+约束。Translate 按 Client `retry_delays_ms` 执行有限重试；本地等待不消耗重试次数。普通
+429 的 `Retry-After` 对同一 Client 的所有请求生效：等待结束前，其他 worker 也不能发出
+下一次请求。
+
 运行根把 HTTP 状态、供应商稳定 code/type、标准 `error.message`、`Retry-After` 和类型化
-失败事实交给调用方，让多次逻辑 attempt 能汇总到同一条任务记录。三个供应商字段彼此
+失败事实交给调用方，让多次逻辑 attempt 能汇总到同一条任务记录。服务状态只根据 HTTP
+状态和允许识别的供应商 code/type 分类，绝不解析 `error.message` 或其他错误正文猜测认证、
+额度或账户状态。三个供应商字段彼此
 独立：其中一个缺失或类型错误，不会抹掉另外两个合法字符串。只读取顶层
 `error` 对象，不猜测顶层 `message`、`detail`、`error_description` 或纯文本正文。
 原始 Header 和任意非 200 wire body 留在运行根内部。
+
+请求层和 Translate 调度层共享同一次运行的停止事实：
+
+- HTTP 401、403，或允许识别的永久额度、账户错误一经确认，就停止后续请求和 Task
+  准入；本次 Translate 为 Failed，退出码为 `1`；
+- 普通 429 等待超过 `max_retry_after_ms` 或重试耗尽时，当前 Task 为 Unavailable，并停止
+  后续请求和 Task 准入；Translate 为 Incomplete，退出码仍为 `0`；
+- DNS、连接、读取、超时、HTTP 500 等普通可重试问题耗尽时，只有当前 Task 为
+  Unavailable，后续 Task 仍可继续；
+- 停止事实确认前已经收到有效响应的在途 Task 仍按自然顺序验收和提交；已经准入但尚未
+  发出下一次 HTTP 的 worker 停止，不把它伪装成一次新模型调用。
+
+任务准入满足 `planned = started + not_started`。服务停止后没有开始的任务计入
+`not_started`；不得把请求门拒绝误计为一次已开始任务，也不得补造完成进度。
 
 Fatal 包含请求构造失败、TLS/证书问题、其他 HTTP 状态，以及不满足成功信封的 200
 响应。安全诊断会说明 HTTP 状态、`Retry-After`、供应商 code/type，以及标准信封中
@@ -73,6 +92,11 @@ Fatal 包含请求构造失败、TLS/证书问题、其他 HTTP 状态，以及�
 
 shutdown 关上入口：新请求不再开始，尚未进入 HTTP 的等待者被唤醒；已经在 HTTP
 中的请求继续走到明确终态。无论走哪条路径，活动许可都通过 RAII 如数归还。
+
+收到非 200 响应头后，运行根先暂停该 Client 的替补请求，再读取和分类正文。401、403
+可直接确认永久停止；其他非 200 在类型化分类完成前也不会释放替补准入。普通 500 分类
+完成后恢复准入；429 进入共享等待或停止；永久额度、账户错误关闭入口。这个决定门保证
+慢错误正文不会让实际调用数突破错误发生时已经活动的请求窗口。
 
 ## 6. 敏感信息闭集唯一权威
 

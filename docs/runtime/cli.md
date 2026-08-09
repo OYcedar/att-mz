@@ -30,7 +30,8 @@ att generic extract --name NAME
 att mv|mz|generic translate --name NAME [PROFILE_ID]
   [--terms TERMS_TOML] [--placeholders PLACEHOLDERS_TOML]
 
-att mv|mz|generic manual export --name NAME FILE.toml
+att mv|mz manual export --name NAME [--ownership OWNERSHIP.jsonl] FILE.toml
+att generic manual export --name NAME FILE.toml
 att mv|mz|generic manual check  --name NAME FILE.toml
 att mv|mz|generic manual apply  --name NAME FILE.toml
 
@@ -76,6 +77,7 @@ ar  zh-Hans  zh-Hant  en  fr  ru  es  ja  ko  vi
 语言变化。
 
 路径、可读 ID 和动态文本进入终端与日志前，会先移除终端转义、换行伪装和双向控制字符。
+Windows 路径统一显示自然盘符或 UNC 形式，不公开 `\\?\` 扩展路径前缀。
 普通 CLI 不显示 hash、UUID、数据库随机键、编码位置或供应商请求 ID。
 
 ## 3. 保存状态与省略参数
@@ -116,7 +118,7 @@ Ctrl-C 请求合作取消：
 
 Manual 的完整格式和检查规则见 [Manual TOML 规格](../manual/README.md)。CLI 摘要只报告：
 
-- export：导出条目数和目标文件；
+- export：导出条目数和目标文件；MV/MZ 同时提供 `--ownership` 时还报告所有权文件；
 - check：有效、未填写和错误数量；
 - apply：已应用、未填写和错误数量。
 
@@ -169,6 +171,13 @@ Partial、Unavailable、人工布局、取消后已经生效的状态和任务�
 Translate 的正常终态明确显示 `无需处理`、`完整` 或 `未完整`。Partial 或 Unavailable
 属于结果明确的未完整状态，继续退出 `0`；stderr 同时用一条汇总警告说明任务、协议、请求
 耗尽、冲突和剩余数量，逐任务详情保留在同次项目日志与任务记录中。
+
+Translate 失败或取消时，如果此前已经形成计划和引擎汇总，stderr 在错误或取消文案附近
+打印一次同源短汇总：planned、started、not_started、失败或取消 Task、剩余工作，以及请求
+准入是否已经停止。该汇总与项目 JSONL 使用同一份终态事实；不会逐 Task 刷新终端。规划前
+失败或提前取消不伪造引擎工作量，只保留零 Task 事实和主诊断。永久认证、授权、额度或账户错误使 Translate
+失败并退出 `1`。普通 429 等待过长或重试耗尽时，当前 Task 为 Unavailable，后续 Task 为
+not_started，Translate 显示未完整并退出 `0`；普通网络或 500 耗尽不会停止后续 Task。
 
 项目日志或任务记录故障本身不改变已经确定的业务结果和项目状态。用于呈现警告、错误、
 成功结果或取消终态的 stdout/stderr 写入、flush、后台线程或 channel 失败时，进程不能

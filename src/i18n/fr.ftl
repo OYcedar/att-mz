@@ -99,7 +99,7 @@ result-translate-status-value = { $status ->
     [incomplete] incomplet
    *[other] __ATT_FALLBACK__
 }
-result-translate-summary = Traduction : { $total } tâches ; { $complete } complètes, { $partial } partielles, { $unavailable } indisponibles ; { $written } emplacements écrits, { $remaining } restants
+result-translate-summary = Traduction : { $total } tâches prévues, { $started } commencées, { $not_started } non commencées ; { $complete } complètes, { $partial } partielles, { $unavailable } indisponibles, { $failed } échouées, { $cancelled } annulées ; { $written } emplacements écrits, { $remaining } restants
 result-translate-convergence = Convergence : { $retained } conservés, { $invalidated } invalidés, { $not_applicable } non applicables, { $reused } réutilisés
 result-write-back-completed = Réécriture terminée : { $project }
 result-project-lua-completed = Exécution Lua du projet terminée : { $project }
@@ -107,13 +107,21 @@ result-output-directory = Répertoire de sortie : { $path }
 result-write-back-summary = Réécriture : { $translated } unités traduites, { $original } unités source ; { $auto_wrapped } retours automatiques, { $breaks } sauts de ligne et { $indents } retraits pleine chasse ajoutés ; { $manual } mises en page manuelles
 result-generic-extract-unchanged = Entrée Generic inchangée : { $files } fichiers, { $groups } groupes, { $units } unités
 result-generic-extract-updated = Entrée Generic mise à jour : { $files } fichiers, { $groups } groupes, { $units } unités ; { $preserved } traductions conservées et { $cleared } effacées
-result-generic-translate-summary = Traduction Generic : { $total } tâches ; { $complete } complètes, { $partial } partielles, { $unavailable } indisponibles ; { $cleared } effacées, { $reused } réutilisées, { $accepted } acceptées, { $written } écrites, { $conflicted } conflits, { $problems } problèmes de réponse
+result-generic-translate-summary = Traduction Generic : { $total } tâches prévues, { $started } commencées, { $not_started } non commencées ; { $complete } complètes, { $partial } partielles, { $unavailable } indisponibles, { $failed } échouées, { $cancelled } annulées ; { $planned_units } unités prévues, { $remaining_units } restantes, { $cleared } effacées, { $reused } réutilisées, { $accepted } acceptées, { $written } écrites, { $conflicted } conflits, { $problems } problèmes de réponse
 result-generic-write-back-summary = Réécriture Generic : { $translated } unités traduites, { $original } unités source conservées
 result-symbol-repair-summary = Réparation des symboles : { $attempted } unités examinées, { $repaired } réparées, { $skipped } ignorées en interne, { $replacements } symboles remplacés
 result-run-log = Journal d’exécution : { $path }
 translate-incomplete-object = Exécution Translate du projet { $project }
-translate-incomplete-rpg-maker-reason = { $partial } tâches partielles, { $unavailable } indisponibles, { $protocol } problèmes de protocole et { $exhausted } requêtes épuisées ; il reste { $remaining_decisions } décisions et { $remaining_locations } emplacements
-translate-incomplete-generic-reason = { $partial } tâches partielles, { $unavailable } indisponibles, { $conflicted } conflits d’écriture et { $problems } problèmes de réponse
+translate-incomplete-rpg-maker-reason = { $partial } tâches partielles, { $unavailable } indisponibles, { $not_started } non commencées, { $protocol } problèmes de protocole et { $exhausted } requêtes épuisées ; l’admission des requêtes {
+    $admission ->
+        [stopped] a été arrêtée
+       *[open] est restée ouverte
+    } ; il reste { $remaining_decisions } décisions et { $remaining_locations } emplacements
+translate-incomplete-generic-reason = { $partial } tâches partielles, { $unavailable } indisponibles, { $not_started } non commencées, { $exhausted } requêtes épuisées ; l’admission des requêtes {
+    $admission ->
+        [stopped] a été arrêtée
+       *[open] est restée ouverte
+    } ; { $remaining_units } unités restantes, { $conflicted } conflits d’écriture et { $problems } problèmes de réponse
 translate-incomplete-help = Consultez les diagnostics des tâches dans ce journal, corrigez les problèmes reproductibles puis relancez Translate ; utilisez Manual pour un petit reliquat
 result-cancelled = La commande a été annulée après une finalisation sûre.
 result-plan-saved = Le plan d’exécution réussi a été enregistré.
@@ -250,6 +258,7 @@ diagnostic-failure-value = { $code ->
     [target_already_exists] La destination existe déjà
     [file_identity_changed] L’identité du fichier a changé pendant l’opération
     [invalid_path] Le chemin n’est pas une cible valide pour cette opération
+    [not_regular_file] La cible existante n’est pas un fichier normal
     [wrong_publisher_instance] Le jeton de publication appartient à une autre instance de publication
     [journal_corrupt] Le journal de récupération de publication est incorrect ou incomplet
     [unexpected_artifact] Un artefact inattendu du système de fichiers bloque l’opération
@@ -332,6 +341,7 @@ diagnostic-json-position = ligne { $line }, colonne { $column }
 diagnostic-placeholder-rule-file = Règle Placeholder { $number } dans { $path }
 diagnostic-placeholder-rule-project = Règle Placeholder { $number } du projet actuel
 manual-exported = { $entries } entrées exportées vers { $path }
+manual-ownership-exported = Registre de propriété : { $path }
 manual-checked = Valides { $valid }, non remplies { $unfilled }, erreurs { $errors }
 manual-applied = Appliquées { $applied }, non remplies { $unfilled }, erreurs { $errors }
 manual-value = { $code ->
@@ -343,6 +353,7 @@ manual-value = { $code ->
     [rerun_export_without_controls] Relancez manual export sans ajouter de saut de ligne ni NUL dans les éléments du tableau
     [rerun_export_then_fill] Relancez manual export, puis renseignez la traduction
     [resolve_temporary_then_rerun_export] Corrigez le chemin temporaire fixe affiché, supprimez tout objet résiduel, puis relancez manual export
+    [resolve_published_backup_cleanup] Les deux exports sont appliqués ; vérifiez-les, puis supprimez le fichier backup fixe affiché
     [keep_exported_type] Conservez le type écrit par manual export
    *[other] __ATT_FALLBACK__
 }

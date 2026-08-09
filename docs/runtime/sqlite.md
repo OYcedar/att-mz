@@ -89,7 +89,7 @@ MV/MZ 主要表：
 | `rpg_maker_project_definition` | 当前 MV/MZ 项目定义 |
 | `rpg_maker_translation_resource` | 当前术语与 Placeholder |
 | `rpg_maker_text_group` | 当前 Group、自然顺序、kind 与写回 recipe |
-| `rpg_maker_text_unit` | 当前 Unit、原文、上下文、自动译文和自动状态 |
+| `rpg_maker_text_unit` | 当前 Unit、owner、Rules 自然规则序号、原文、上下文、自动译文和自动状态 |
 | `rpg_maker_manual_translation` | 独立人工译文快照与内部适用性 |
 | `rpg_maker_mutation_claim` | 写回修改范围 |
 
@@ -97,6 +97,12 @@ MV/MZ 主要表：
 普通命令要求。RPG Maker 人工表保留 `translation_type`，因为失去当前位置后仍需区分
 `fixed` 与 `free`，无法再从当前 Unit 推导。当前 DDL 以源码为准，不建立另一个 schema
 版本或迁移文档。
+
+`rpg_maker_text_unit.rule_number` 保存 Extract Rules TOML 中从 1 开始的自然规则序号；
+Builtin Unit 必须为 `NULL`，Rules Unit 必须为正整数。这个事实供 MV/MZ Manual 所有权导出
+精确说明来源，不作为公开 ID，也不替代 Unit 的内部身份。新增该列后，旧结构的 MV/MZ
+项目不能在原工作区直接重跑 Init：先在 ATT 之外备份并移走或清理整个旧项目工作区，再用
+当前程序新建项目并执行 Init、Extract。ATT 不迁移或兼容旧项目数据库。
 
 ## 5. Lua 数据库连接
 

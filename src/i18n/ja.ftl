@@ -99,7 +99,7 @@ result-translate-status-value = { $status ->
     [incomplete] 未完了
    *[other] __ATT_FALLBACK__
 }
-result-translate-summary = 翻訳: タスク { $total }、完全 { $complete }、部分 { $partial }、利用不可 { $unavailable }。{ $written } 箇所を書き込み、残り { $remaining } 箇所
+result-translate-summary = 翻訳: 計画 { $total } タスク、開始 { $started }、未開始 { $not_started }、完全 { $complete }、部分 { $partial }、利用不可 { $unavailable }、失敗 { $failed }、取消 { $cancelled }。{ $written } 箇所を書き込み、残り { $remaining } 箇所
 result-translate-convergence = 状態収束: 保持 { $retained }、無効化 { $invalidated }、非該当 { $not_applicable }、再利用 { $reused }
 result-write-back-completed = 書き戻し完了: { $project }
 result-project-lua-completed = プロジェクト Lua 実行完了: { $project }
@@ -107,13 +107,21 @@ result-output-directory = 出力ディレクトリ: { $path }
 result-write-back-summary = 書き戻し: 訳文 { $translated } 単位、原文 { $original } 単位。自動折返し { $auto_wrapped }、改行追加 { $breaks }、全角インデント追加 { $indents }。手動配置 { $manual }
 result-generic-extract-unchanged = Generic 入力に変更なし: { $files } ファイル、{ $groups } グループ、{ $units } 単位
 result-generic-extract-updated = Generic 入力を更新: { $files } ファイル、{ $groups } グループ、{ $units } 単位。訳文 { $preserved } 件を保持し、{ $cleared } 件を消去
-result-generic-translate-summary = Generic 翻訳: タスク { $total }、完全 { $complete }、部分 { $partial }、利用不可 { $unavailable }。クリア { $cleared }、再利用 { $reused }、受理 { $accepted }、書き込み { $written }、競合 { $conflicted }、応答問題 { $problems }
+result-generic-translate-summary = Generic 翻訳: 計画 { $total } タスク、開始 { $started }、未開始 { $not_started }、完全 { $complete }、部分 { $partial }、利用不可 { $unavailable }、失敗 { $failed }、取消 { $cancelled }。計画 Unit { $planned_units }、残り Unit { $remaining_units }、クリア { $cleared }、再利用 { $reused }、受理 { $accepted }、書き込み { $written }、競合 { $conflicted }、応答問題 { $problems }
 result-generic-write-back-summary = Generic 書き戻し: 訳文 { $translated } 単位、原文保持 { $original } 単位
 result-symbol-repair-summary = 記号修復: { $attempted } 単位を確認、{ $repaired } 単位を修復、内部スキップ { $skipped } 単位、{ $replacements } 記号を置換
 result-run-log = 実行記録：{ $path }
 translate-incomplete-object = プロジェクト { $project } の今回の Translate
-translate-incomplete-rpg-maker-reason = 部分タスク { $partial }、利用不可タスク { $unavailable }、プロトコル問題 { $protocol }、要求枯渇 { $exhausted }。残りの判断 { $remaining_decisions }、残りの場所 { $remaining_locations }
-translate-incomplete-generic-reason = 部分タスク { $partial }、利用不可タスク { $unavailable }、書き込み競合 { $conflicted }、応答問題 { $problems }
+translate-incomplete-rpg-maker-reason = 部分タスク { $partial }、利用不可タスク { $unavailable }、未開始タスク { $not_started }、プロトコル問題 { $protocol }、要求枯渇 { $exhausted }。要求受付は{
+    $admission ->
+        [stopped] 停止
+       *[open] 継続
+    }。残りの判断 { $remaining_decisions }、残りの場所 { $remaining_locations }
+translate-incomplete-generic-reason = 部分タスク { $partial }、利用不可タスク { $unavailable }、未開始タスク { $not_started }、要求枯渇 { $exhausted }。要求受付は{
+    $admission ->
+        [stopped] 停止
+       *[open] 継続
+    }。残り Unit { $remaining_units }、書き込み競合 { $conflicted }、応答問題 { $problems }
 translate-incomplete-help = 今回の実行記録にあるタスク診断を確認し、再現する問題を修正して Translate を再実行してください。少量の残りには Manual を使用できます
 result-cancelled = 安全な終了処理後にコマンドをキャンセルしました。
 result-plan-saved = 成功した実行プランを保存しました。
@@ -247,6 +255,7 @@ diagnostic-failure-value = { $code ->
     [target_already_exists] 出力先がすでに存在します
     [file_identity_changed] 操作中にファイルの識別情報が変化しました
     [invalid_path] パスはこの操作の有効な対象ではありません
+    [not_regular_file] 既存の対象は通常のファイルではありません
     [wrong_publisher_instance] 公開トークンは別の公開器インスタンスに属しています
     [journal_corrupt] 公開復旧ジャーナルが無効または不完全です
     [unexpected_artifact] 予期しないファイルシステム成果物が操作を妨げています
@@ -329,6 +338,7 @@ diagnostic-json-position = { $line } 行、{ $column } 列
 diagnostic-placeholder-rule-file = { $path } の Placeholder ルール { $number }
 diagnostic-placeholder-rule-project = 現在のプロジェクトの Placeholder ルール { $number }
 manual-exported = { $entries } 件を { $path } にエクスポートしました
+manual-ownership-exported = 所有権レコード：{ $path }
 manual-checked = 有効 { $valid }、未入力 { $unfilled }、エラー { $errors }
 manual-applied = 適用 { $applied }、未入力 { $unfilled }、エラー { $errors }
 manual-value = { $code ->
@@ -340,6 +350,7 @@ manual-value = { $code ->
     [rerun_export_without_controls] manual export を再実行し、配列項目に改行や NUL を入れないでください
     [rerun_export_then_fill] manual export を再実行してから訳文を入力してください
     [resolve_temporary_then_rerun_export] 表示された固定一時パスを確認し、残っているオブジェクトがあれば削除してから manual export を再実行してください
+    [resolve_published_backup_cleanup] 2 つのエクスポートは適用済みです。出力を確認してから、表示された固定 backup ファイルを削除してください
     [keep_exported_type] manual export が出力した type を保持してください
    *[other] __ATT_FALLBACK__
 }

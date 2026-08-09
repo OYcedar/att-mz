@@ -17,13 +17,15 @@ use tokio::sync::{Semaphore, watch};
 use url::Url;
 
 use crate::diagnostic::{
-    Diagnostic, HttpEndpoint, HttpEnvelopeViolation, HttpIssue, HttpJsonCategory,
+    Diagnostic, DiagnosticReport, HttpEndpoint, HttpEnvelopeViolation, HttpIssue, HttpJsonCategory,
     HttpResponseReadFailure, HttpTransportKind, HttpTransportPhase, SafeIdentifier, SafeText,
+    StateEffect,
 };
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::llm::{
     ApiKeyRedactor, ChatMessage, ChatMessageRole, LlmClientConcurrency, LlmClientSemanticIdentity,
     LlmFinishReason, LlmRequestError, LlmRequestExecutor, LlmRequestFailure, LlmResponse,
+    LlmServiceStatus,
 };
 use crate::user_text::sanitize_user_text;
 
@@ -428,6 +430,7 @@ pub(crate) struct OpenAiExecutorConfiguration {
     max_active_requests: NonZeroUsize,
     connect_timeout: Duration,
     read_timeout: Duration,
+    max_retry_after: Duration,
     proxy: LlmProxyConfiguration,
     tls: LlmTlsConfiguration,
 }
@@ -438,12 +441,14 @@ impl OpenAiExecutorConfiguration {
         max_active_requests: NonZeroUsize,
         connect_timeout: Duration,
         read_timeout: Duration,
+        max_retry_after: Duration,
         proxy: LlmProxyConfiguration,
     ) -> Self {
         Self {
             max_active_requests,
             connect_timeout,
             read_timeout,
+            max_retry_after,
             proxy,
             tls: LlmTlsConfiguration::default(),
         }
@@ -528,7 +533,7 @@ impl OpenAiChatCompletionExecutor {
         Ok(Self {
             client,
             active_capacity: Arc::new(Semaphore::new(configuration.max_active_requests.get())),
-            lifecycle: Arc::new(LlmLifecycle::new()),
+            lifecycle: Arc::new(LlmLifecycle::new(configuration.max_retry_after)),
         })
     }
 
@@ -550,14 +555,14 @@ impl OpenAiChatCompletionExecutor {
     ) -> Result<LlmResponse, LlmRequestError<OpenAiChatCompletionError>> {
         let request_body = serialize_request(client, messages).map_err(LlmRequestError::Fatal)?;
 
-        let job = self
-            .lifecycle
-            .register()
-            .ok_or_else(|| LlmRequestError::Fatal(OpenAiChatCompletionError::ExecutorClosed))?;
+        let job = self.lifecycle.register()?;
 
         wait_for_rate(client, &self.lifecycle).await?;
+        self.lifecycle.wait_for_retry_gate().await?;
         let active_permit =
             wait_for_active(Arc::clone(&self.active_capacity), &self.lifecycle).await?;
+        // 等待活动许可期间可能刚收到新的 Retry-After；发送前必须再次观察共享门控。
+        self.lifecycle.wait_for_retry_gate().await?;
 
         let request = self
             .client
@@ -578,14 +583,46 @@ impl OpenAiChatCompletionExecutor {
         let status = response.status();
         let retry_after = parse_retry_after(response.headers().get(RETRY_AFTER));
         if status != StatusCode::OK {
+            let redactor = ApiKeyRedactor::new(client.api_key.clone());
+            let decision_held =
+                if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+                    let preliminary = OpenAiChatCompletionError::HttpStatus {
+                        status: status.as_u16(),
+                        provider_code: None,
+                        provider_type: None,
+                        provider_message: None,
+                        response_body_error: None,
+                        service_status: LlmServiceStatus::PermanentAuthorization,
+                    };
+                    let diagnostic = DiagnosticReport::new(
+                        StateEffect::ProgressPreserved,
+                        preliminary.diagnostic_for_endpoint(
+                            safe_http_endpoint_with_redactor(&client.url, &redactor),
+                            retry_after,
+                        ),
+                    );
+                    self.lifecycle
+                        .stop_for_service(LlmServiceStatus::PermanentAuthorization, diagnostic);
+                    false
+                } else {
+                    // provider code 可能把普通非 2xx 进一步确认为 quota/account 永久错误。
+                    // 在完整读取并分类响应前，不允许等待中的 worker 补位发送。
+                    self.lifecycle.hold_service_decision();
+                    true
+                };
             let provider_body = response.bytes().await;
-            drop(active_permit);
-            drop(job);
             let (provider_error, response_body_error) = match provider_body {
                 Ok(body) => (parse_provider_error(&body).unwrap_or_default(), None),
                 Err(source) => (ProviderErrorProjection::default(), Some(source)),
             };
-            let redactor = ApiKeyRedactor::new(client.api_key.clone());
+            let service_status = classify_service_status(
+                status,
+                provider_error.code.as_deref(),
+                provider_error.kind.as_deref(),
+            );
+            if service_status == LlmServiceStatus::RateLimited {
+                self.lifecycle.extend_retry_gate(retry_after);
+            }
             let provider_code = provider_error.code.map(|value| redactor.redact(&value));
             let provider_type = provider_error.kind.map(|value| redactor.redact(&value));
             let provider_message = provider_error.message.and_then(|value| {
@@ -598,8 +635,24 @@ impl OpenAiChatCompletionExecutor {
                 provider_type,
                 provider_message,
                 response_body_error,
+                service_status,
             };
-            let result = if is_retryable_status(status) {
+            if service_status.is_permanent() {
+                let diagnostic = DiagnosticReport::new(
+                    StateEffect::ProgressPreserved,
+                    error.diagnostic_for_endpoint(
+                        safe_http_endpoint_with_redactor(&client.url, &redactor),
+                        retry_after,
+                    ),
+                );
+                self.lifecycle.stop_for_service(service_status, diagnostic);
+            } else if service_status == LlmServiceStatus::RateLimited {
+                // 保持 header 阶段建立的决定门，直到请求状态机确认重试或耗尽。
+                debug_assert!(decision_held);
+            } else if decision_held {
+                self.lifecycle.resolve_service_decision();
+            }
+            let result = if is_retryable_status(status) && !service_status.is_permanent() {
                 Err(LlmRequestError::Retryable {
                     source: error,
                     retry_after,
@@ -607,6 +660,8 @@ impl OpenAiChatCompletionExecutor {
             } else {
                 Err(LlmRequestError::Fatal(error))
             };
+            drop(active_permit);
+            drop(job);
             return result;
         }
 
@@ -659,6 +714,17 @@ impl LlmRequestExecutor for OpenAiChatCompletionExecutor {
             retry_after,
         )
     }
+
+    fn stop_admission(&self, service_status: LlmServiceStatus, diagnostic: &DiagnosticReport) {
+        self.lifecycle
+            .stop_for_service(service_status, diagnostic.clone());
+    }
+
+    fn continue_after_retryable(&self, service_status: LlmServiceStatus) {
+        if service_status == LlmServiceStatus::RateLimited {
+            self.lifecycle.resolve_service_decision();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -676,6 +742,7 @@ pub(crate) enum OpenAiChatCompletionError {
         provider_type: Option<String>,
         provider_message: Option<String>,
         response_body_error: Option<reqwest::Error>,
+        service_status: LlmServiceStatus,
     },
     ParseResponse(serde_json::Error),
     InvalidResponseWire {
@@ -752,6 +819,7 @@ impl OpenAiChatCompletionError {
                 provider_type,
                 provider_message,
                 response_body_error,
+                ..
             } => HttpIssue::Status {
                 endpoint,
                 status: *status,
@@ -794,6 +862,13 @@ impl OpenAiChatCompletionError {
 impl LlmRequestFailure for OpenAiChatCompletionError {
     fn is_cancelled_wait(&self) -> bool {
         matches!(self, Self::WaitCancelled)
+    }
+
+    fn service_status(&self) -> LlmServiceStatus {
+        match self {
+            Self::HttpStatus { service_status, .. } => *service_status,
+            _ => LlmServiceStatus::Other,
+        }
     }
 }
 
@@ -877,17 +952,13 @@ async fn wait_for_rate(
     lifecycle: &LlmLifecycle,
 ) -> Result<(), LlmRequestError<OpenAiChatCompletionError>> {
     if !lifecycle.is_accepting() {
-        return Err(LlmRequestError::Fatal(
-            OpenAiChatCompletionError::WaitCancelled,
-        ));
+        return Err(lifecycle.stopped_wait_error());
     }
     let Some(rate_limiter) = &client.rate_limiter else {
         return if lifecycle.is_accepting() {
             Ok(())
         } else {
-            Err(LlmRequestError::Fatal(
-                OpenAiChatCompletionError::WaitCancelled,
-            ))
+            Err(lifecycle.stopped_wait_error())
         };
     };
     let stopped = lifecycle.wait_for_stop();
@@ -902,9 +973,7 @@ async fn wait_for_rate(
     if admitted && lifecycle.is_accepting() {
         Ok(())
     } else {
-        Err(LlmRequestError::Fatal(
-            OpenAiChatCompletionError::WaitCancelled,
-        ))
+        Err(lifecycle.stopped_wait_error())
     }
 }
 
@@ -913,9 +982,7 @@ async fn wait_for_active(
     lifecycle: &LlmLifecycle,
 ) -> Result<tokio::sync::OwnedSemaphorePermit, LlmRequestError<OpenAiChatCompletionError>> {
     if !lifecycle.is_accepting() {
-        return Err(LlmRequestError::Fatal(
-            OpenAiChatCompletionError::WaitCancelled,
-        ));
+        return Err(lifecycle.stopped_wait_error());
     }
     let stopped = lifecycle.wait_for_stop();
     tokio::pin!(stopped);
@@ -924,7 +991,7 @@ async fn wait_for_active(
     let permit = tokio::select! {
         biased;
         () = &mut stopped => {
-            return Err(LlmRequestError::Fatal(OpenAiChatCompletionError::WaitCancelled));
+            return Err(lifecycle.stopped_wait_error());
         }
         result = &mut permit => result
             .map_err(|_| LlmRequestError::Fatal(OpenAiChatCompletionError::ExecutorClosed)),
@@ -933,9 +1000,7 @@ async fn wait_for_active(
         Ok(permit)
     } else {
         drop(permit);
-        Err(LlmRequestError::Fatal(
-            OpenAiChatCompletionError::WaitCancelled,
-        ))
+        Err(lifecycle.stopped_wait_error())
     }
 }
 
@@ -1075,6 +1140,44 @@ fn is_retryable_status(status: StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
 }
 
+fn classify_service_status(
+    status: StatusCode,
+    provider_code: Option<&str>,
+    provider_type: Option<&str>,
+) -> LlmServiceStatus {
+    let identifiers = [provider_code, provider_type];
+    if identifiers.into_iter().flatten().any(|identifier| {
+        matches!(
+            identifier.to_ascii_lowercase().as_str(),
+            "insufficient_quota"
+                | "quota_exceeded"
+                | "billing_hard_limit_reached"
+                | "usage_limit_reached"
+        )
+    }) {
+        return LlmServiceStatus::PermanentQuota;
+    }
+    if identifiers.into_iter().flatten().any(|identifier| {
+        matches!(
+            identifier.to_ascii_lowercase().as_str(),
+            "account_deactivated"
+                | "account_disabled"
+                | "organization_deactivated"
+                | "organization_disabled"
+                | "billing_not_active"
+        )
+    }) {
+        return LlmServiceStatus::PermanentAccount;
+    }
+    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+        return LlmServiceStatus::PermanentAuthorization;
+    }
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return LlmServiceStatus::RateLimited;
+    }
+    LlmServiceStatus::Other
+}
+
 fn parse_retry_after(value: Option<&reqwest::header::HeaderValue>) -> Option<Duration> {
     let value = value?.to_str().ok()?.trim();
     if let Ok(seconds) = value.parse::<u64>() {
@@ -1157,21 +1260,41 @@ struct LlmLifecycle {
     state: Mutex<LlmLifecycleState>,
     stopping: watch::Sender<bool>,
     jobs: watch::Sender<usize>,
+    retry_gate: watch::Sender<Option<tokio::time::Instant>>,
+    service_decisions: watch::Sender<usize>,
+    max_retry_after: Duration,
 }
 
 struct LlmLifecycleState {
     jobs: usize,
+    service_stop: Option<LlmServiceAdmissionStop>,
+    pending_service_decisions: usize,
+}
+
+#[derive(Clone)]
+struct LlmServiceAdmissionStop {
+    service_status: LlmServiceStatus,
+    diagnostic: DiagnosticReport,
 }
 
 impl LlmLifecycle {
-    fn new() -> Self {
+    fn new(max_retry_after: Duration) -> Self {
         let (stopping, _) = watch::channel(false);
         let (jobs, _) = watch::channel(0);
+        let (retry_gate, _) = watch::channel(None);
+        let (service_decisions, _) = watch::channel(0);
         Self {
             accepting: AtomicBool::new(true),
-            state: Mutex::new(LlmLifecycleState { jobs: 0 }),
+            state: Mutex::new(LlmLifecycleState {
+                jobs: 0,
+                service_stop: None,
+                pending_service_decisions: 0,
+            }),
             stopping,
             jobs,
+            retry_gate,
+            service_decisions,
+            max_retry_after,
         }
     }
 
@@ -1179,14 +1302,22 @@ impl LlmLifecycle {
         self.accepting.load(Ordering::Acquire)
     }
 
-    fn register(self: &Arc<Self>) -> Option<LlmJobGuard> {
+    fn register(
+        self: &Arc<Self>,
+    ) -> Result<LlmJobGuard, LlmRequestError<OpenAiChatCompletionError>> {
         let mut state = self.state.lock().expect("LLM 生命周期锁不应中毒");
         if !self.is_accepting() {
-            return None;
+            return Err(state.service_stop.as_ref().map_or_else(
+                || LlmRequestError::Fatal(OpenAiChatCompletionError::ExecutorClosed),
+                |stopped| LlmRequestError::AdmissionStopped {
+                    service_status: stopped.service_status,
+                    diagnostic: stopped.diagnostic.clone(),
+                },
+            ));
         }
         state.jobs += 1;
         self.jobs.send_replace(state.jobs);
-        Some(LlmJobGuard {
+        Ok(LlmJobGuard {
             lifecycle: Arc::clone(self),
         })
     }
@@ -1195,6 +1326,119 @@ impl LlmLifecycle {
         let _state = self.state.lock().expect("LLM 生命周期锁不应中毒");
         self.accepting.store(false, Ordering::Release);
         self.stopping.send_replace(true);
+    }
+
+    fn stop_for_service(&self, service_status: LlmServiceStatus, diagnostic: DiagnosticReport) {
+        debug_assert!(
+            service_status.is_permanent() || service_status.stops_admission_after_unavailable(),
+            "只有明确要求停发的服务状态才能关闭请求准入"
+        );
+        let mut state = self.state.lock().expect("LLM 生命周期锁不应中毒");
+        let should_replace = state.service_stop.as_ref().is_none_or(|current| {
+            service_status.is_permanent() && !current.service_status.is_permanent()
+        });
+        if should_replace {
+            state.service_stop = Some(LlmServiceAdmissionStop {
+                service_status,
+                diagnostic,
+            });
+        }
+        self.accepting.store(false, Ordering::Release);
+        self.stopping.send_replace(true);
+    }
+
+    fn stopped_wait_error(&self) -> LlmRequestError<OpenAiChatCompletionError> {
+        let state = self.state.lock().expect("LLM 生命周期锁不应中毒");
+        state.service_stop.as_ref().map_or_else(
+            || LlmRequestError::Fatal(OpenAiChatCompletionError::WaitCancelled),
+            |stopped| LlmRequestError::AdmissionStopped {
+                service_status: stopped.service_status,
+                diagnostic: stopped.diagnostic.clone(),
+            },
+        )
+    }
+
+    fn hold_service_decision(&self) {
+        let mut state = self.state.lock().expect("LLM 生命周期锁不应中毒");
+        state.pending_service_decisions = state.pending_service_decisions.saturating_add(1);
+        self.service_decisions
+            .send_replace(state.pending_service_decisions);
+    }
+
+    fn resolve_service_decision(&self) {
+        let mut state = self.state.lock().expect("LLM 生命周期锁不应中毒");
+        state.pending_service_decisions = state
+            .pending_service_decisions
+            .checked_sub(1)
+            .expect("每个非成功响应必须且只能完成一次准入决定");
+        self.service_decisions
+            .send_replace(state.pending_service_decisions);
+    }
+
+    /// 只把配置允许等待的普通 429 Retry-After 分享给同一执行器的其他请求。
+    /// 超过上限的响应由请求状态机立即结束并触发业务停发，不能把在途任务挂到超长等待。
+    fn extend_retry_gate(&self, retry_after: Option<Duration>) {
+        let Some(retry_after) = retry_after.filter(|value| *value <= self.max_retry_after) else {
+            return;
+        };
+        let deadline = tokio::time::Instant::now() + retry_after;
+        self.retry_gate.send_if_modified(|current| {
+            if current.is_none_or(|current| current < deadline) {
+                *current = Some(deadline);
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    async fn wait_for_retry_gate(&self) -> Result<(), LlmRequestError<OpenAiChatCompletionError>> {
+        let mut retry_gate = self.retry_gate.subscribe();
+        let mut service_decisions = self.service_decisions.subscribe();
+        let mut stopping = self.stopping.subscribe();
+        loop {
+            if *stopping.borrow_and_update() {
+                return Err(self.stopped_wait_error());
+            }
+            if *service_decisions.borrow_and_update() != 0 {
+                tokio::select! {
+                    biased;
+                    changed = stopping.changed() => {
+                        if changed.is_err() || *stopping.borrow_and_update() {
+                            return Err(self.stopped_wait_error());
+                        }
+                    }
+                    changed = service_decisions.changed() => {
+                        if changed.is_err() {
+                            return Err(LlmRequestError::Fatal(
+                                OpenAiChatCompletionError::ExecutorClosed,
+                            ));
+                        }
+                    }
+                }
+                continue;
+            }
+            let Some(deadline) = *retry_gate.borrow_and_update() else {
+                return Ok(());
+            };
+            if deadline <= tokio::time::Instant::now() {
+                return Ok(());
+            }
+            tokio::select! {
+                biased;
+                changed = stopping.changed() => {
+                    if changed.is_err() || *stopping.borrow_and_update() {
+                        return Err(self.stopped_wait_error());
+                    }
+                }
+                changed = retry_gate.changed() => {
+                    if changed.is_err() {
+                        return Ok(());
+                    }
+                }
+                () = tokio::time::sleep_until(deadline) => return Ok(()),
+            }
+        }
     }
 
     async fn wait_until_idle(&self) {
@@ -1241,7 +1485,20 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
 
+    use crate::execution::CooperativeCancellation;
+    use crate::execution::llm_request::{
+        AsyncDelay, LlmRequestExecutionOutcome, LlmRequestRetryPolicy,
+        execute_llm_request_with_retry,
+    };
+
     use super::*;
+
+    #[derive(Clone, Copy)]
+    struct ImmediateDelay;
+
+    impl AsyncDelay for ImmediateDelay {
+        async fn wait(&self, _duration: Duration) {}
+    }
 
     #[test]
     fn http_status_leaf_uses_safe_endpoint_and_typed_provider_fields() {
@@ -1251,6 +1508,7 @@ mod tests {
             provider_type: Some("temporary".to_owned()),
             provider_message: Some("try_later".to_owned()),
             response_body_error: None,
+            service_status: LlmServiceStatus::Other,
         };
         let endpoint =
             Url::parse("https://api.example.test:8443/v1/chat/completions?api_key=must-not-leak")
@@ -1341,6 +1599,7 @@ mod tests {
             non_zero_usize(max_active_requests),
             Duration::from_secs(2),
             Duration::from_secs(2),
+            Duration::from_secs(60),
             LlmProxyConfiguration::Disabled,
         ))
         .expect("测试 LLM 根应构造成功")
@@ -1352,6 +1611,173 @@ mod tests {
         first_request_seen: mpsc::Receiver<()>,
         release_first: Option<mpsc::Sender<()>>,
         worker: thread::JoinHandle<()>,
+    }
+
+    struct ConcurrentDecisionServer {
+        endpoint: String,
+        initial_requests_seen: mpsc::Receiver<()>,
+        release_decision: mpsc::Sender<()>,
+        extra_request_seen: mpsc::Receiver<bool>,
+        worker: thread::JoinHandle<()>,
+    }
+
+    struct SlowBodyDecisionServer {
+        endpoint: String,
+        initial_requests_seen: mpsc::Receiver<()>,
+        release_responses: mpsc::Sender<()>,
+        extra_before_body: mpsc::Receiver<bool>,
+        extra_after_body: mpsc::Receiver<bool>,
+        worker: thread::JoinHandle<()>,
+    }
+
+    fn spawn_slow_quota_body_server() -> SlowBodyDecisionServer {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("测试监听应成功");
+        let address = listener.local_addr().expect("测试监听地址应可读");
+        let (seen_sender, initial_requests_seen) = mpsc::channel();
+        let (release_responses, release_receiver) = mpsc::channel();
+        let (before_sender, extra_before_body) = mpsc::channel();
+        let (after_sender, extra_after_body) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("llm-slow-quota-body-server".to_owned())
+            .spawn(move || {
+                let mut slow = None;
+                let mut fast = None;
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().expect("初始活动窗口请求应可接受");
+                    let request = read_http_request(&mut stream);
+                    let body = String::from_utf8_lossy(request_body(&request));
+                    if body.contains("slow-quota-body") {
+                        slow = Some(stream);
+                    } else if body.contains("fast-success") {
+                        fast = Some(stream);
+                    } else {
+                        panic!("初始活动窗口收到未识别的测试请求：{body}");
+                    }
+                }
+                seen_sender.send(()).expect("初始活动窗口应可通知");
+                release_receiver.recv().expect("测试响应应被释放");
+
+                let quota_body = r#"{"error":{"code":"insufficient_quota","type":"billing","message":"SECRET_BODY"}}"#;
+                let mut slow = slow.expect("应收到慢 quota 请求");
+                let headers = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    quota_body.len()
+                );
+                slow.write_all(headers.as_bytes()).expect("慢响应头应可写入");
+                slow.flush().expect("慢响应头应可刷新");
+
+                let mut fast = fast.expect("应收到快成功请求");
+                fast.write_all(&success_response("fast", "fast", "[]"))
+                    .expect("快成功响应应可写入");
+                fast.flush().expect("快成功响应应可刷新");
+                drop(fast);
+
+                listener.set_nonblocking(true).expect("监听应切换为非阻塞");
+                thread::sleep(Duration::from_millis(100));
+                let extra = match listener.accept() {
+                    Ok((_stream, _)) => true,
+                    Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => false,
+                    Err(source) => panic!("检查慢正文前额外请求失败：{source}"),
+                };
+                before_sender.send(extra).expect("慢正文前事实应可返回");
+
+                slow.write_all(quota_body.as_bytes()).expect("quota 正文应可写入");
+                slow.flush().expect("quota 正文应可刷新");
+                drop(slow);
+                thread::sleep(Duration::from_millis(100));
+                let extra = match listener.accept() {
+                    Ok((_stream, _)) => true,
+                    Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => false,
+                    Err(source) => panic!("检查慢正文后额外请求失败：{source}"),
+                };
+                after_sender.send(extra).expect("慢正文后事实应可返回");
+            })
+            .expect("慢 quota 正文测试服务器应创建成功");
+        SlowBodyDecisionServer {
+            endpoint: format!("http://{address}/v1/chat/completions"),
+            initial_requests_seen,
+            release_responses,
+            extra_before_body,
+            extra_after_body,
+            worker,
+        }
+    }
+
+    fn spawn_concurrent_decision_server(
+        slow_marker: &'static str,
+        decision_marker: &'static str,
+        decision_response: Vec<u8>,
+        slow_response: Vec<u8>,
+    ) -> ConcurrentDecisionServer {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("测试监听应成功");
+        let address = listener.local_addr().expect("测试监听地址应可读");
+        let (seen_sender, initial_requests_seen) = mpsc::channel();
+        let (release_decision, release_receiver) = mpsc::channel();
+        let (extra_sender, extra_request_seen) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("llm-concurrent-decision-server".to_owned())
+            .spawn(move || {
+                let mut initial = Vec::with_capacity(2);
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().expect("初始活动窗口请求应可接受");
+                    let request = read_http_request(&mut stream);
+                    initial.push((stream, request));
+                }
+                seen_sender.send(()).expect("初始活动窗口应可通知");
+                release_receiver.recv().expect("服务决定响应应被释放");
+
+                let mut slow = None;
+                let mut decision = None;
+                for (stream, request) in initial {
+                    let body = String::from_utf8_lossy(request_body(&request));
+                    if body.contains(slow_marker) {
+                        slow = Some(stream);
+                    } else if body.contains(decision_marker) {
+                        decision = Some(stream);
+                    } else {
+                        panic!("初始活动窗口收到未识别的测试请求：{body}");
+                    }
+                }
+                let mut decision = decision.expect("应收到服务决定请求");
+                decision
+                    .write_all(&decision_response)
+                    .expect("服务决定响应应可写入");
+                decision.flush().expect("服务决定响应应可刷新");
+                drop(decision);
+
+                thread::sleep(Duration::from_millis(50));
+                let mut slow = slow.expect("应收到慢成功请求");
+                slow.write_all(&slow_response).expect("慢成功响应应可写入");
+                slow.flush().expect("慢成功响应应可刷新");
+                drop(slow);
+
+                listener
+                    .set_nonblocking(true)
+                    .expect("测试监听应切换为非阻塞");
+                let deadline = std::time::Instant::now() + Duration::from_millis(150);
+                let mut extra = false;
+                while std::time::Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((_stream, _)) => {
+                            extra = true;
+                            break;
+                        }
+                        Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(source) => panic!("检查额外请求失败：{source}"),
+                    }
+                }
+                extra_sender.send(extra).expect("额外请求事实应可返回");
+            })
+            .expect("并发决定测试服务器应创建成功");
+        ConcurrentDecisionServer {
+            endpoint: format!("http://{address}/v1/chat/completions"),
+            initial_requests_seen,
+            release_decision,
+            extra_request_seen,
+            worker,
+        }
     }
 
     fn spawn_test_server(responses: Vec<Vec<u8>>, gate_first: bool) -> TestServer {
@@ -1799,6 +2225,7 @@ mod tests {
             provider_type: Some("rate_limit".to_owned()),
             provider_message: Some("request\r\nforged".to_owned()),
             response_body_error: None,
+            service_status: LlmServiceStatus::RateLimited,
         };
         let endpoint =
             Url::parse("https://api.example.test/v1/chat/completions").expect("测试 endpoint 合法");
@@ -1812,6 +2239,61 @@ mod tests {
         assert!(serialized.contains("\"provider_type\":\"rate_limit\""));
         assert!(serialized.contains("\"provider_code\":null"));
         assert!(serialized.contains("\"provider_message\":\"request forged\""));
+    }
+
+    #[test]
+    fn service_status_uses_only_http_status_and_structured_provider_identifiers() {
+        assert_eq!(
+            classify_service_status(
+                StatusCode::TOO_MANY_REQUESTS,
+                Some("insufficient_quota"),
+                None,
+            ),
+            LlmServiceStatus::PermanentQuota
+        );
+        assert_eq!(
+            classify_service_status(
+                StatusCode::TOO_MANY_REQUESTS,
+                Some("account_deactivated"),
+                None,
+            ),
+            LlmServiceStatus::PermanentAccount
+        );
+        assert_eq!(
+            classify_service_status(StatusCode::UNAUTHORIZED, None, None),
+            LlmServiceStatus::PermanentAuthorization
+        );
+        assert_eq!(
+            classify_service_status(StatusCode::TOO_MANY_REQUESTS, None, None),
+            LlmServiceStatus::RateLimited
+        );
+        assert_eq!(
+            classify_service_status(StatusCode::INTERNAL_SERVER_ERROR, None, None),
+            LlmServiceStatus::Other
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_429_retry_after_is_shared_without_accepting_an_overlong_wait() {
+        let lifecycle = LlmLifecycle::new(Duration::from_millis(100));
+        lifecycle.extend_retry_gate(Some(Duration::from_millis(40)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), lifecycle.wait_for_retry_gate())
+                .await
+                .is_err(),
+            "同一执行器的其他请求必须观察普通 429 的共享等待"
+        );
+        tokio::time::timeout(Duration::from_millis(100), lifecycle.wait_for_retry_gate())
+            .await
+            .expect("共享 Retry-After 到期后请求应继续")
+            .expect("共享 Retry-After 等待不应失败");
+
+        let overlong = LlmLifecycle::new(Duration::from_millis(10));
+        overlong.extend_retry_gate(Some(Duration::from_secs(1)));
+        tokio::time::timeout(Duration::from_millis(10), overlong.wait_for_retry_gate())
+            .await
+            .expect("超过配置上限的 Retry-After 不得挂起其他在途任务")
+            .expect("忽略超长共享等待不应失败");
     }
 
     #[tokio::test]
@@ -2111,9 +2593,375 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn permanent_service_failure_stops_waiting_http_requests_and_keeps_inflight_success() {
+        let server = spawn_concurrent_decision_server(
+            "slow-success",
+            "fast-permanent",
+            status_response(
+                "401 Unauthorized",
+                "Content-Type: application/json\r\n",
+                r#"{"error":{"code":"invalid_api_key","type":"authentication_error","message":"SECRET_BODY"}}"#,
+            ),
+            success_response("slow-response", "slow-request", "[]"),
+        );
+        let ConcurrentDecisionServer {
+            endpoint,
+            initial_requests_seen,
+            release_decision,
+            extra_request_seen,
+            worker,
+        } = server;
+        let client = Arc::new(client_with_rate(&endpoint, Map::new(), 60_000, 3));
+        let executor = executor(2);
+        let cancellation = CooperativeCancellation::default();
+
+        let slow_executor = executor.clone();
+        let slow_client = Arc::clone(&client);
+        let slow_cancellation = cancellation.clone();
+        let slow = tokio::spawn(async move {
+            execute_llm_request_with_retry(
+                &slow_executor,
+                slow_client.as_ref(),
+                &[ChatMessage::new(ChatMessageRole::User, "slow-success")],
+                LlmRequestRetryPolicy::new(&[], Duration::from_secs(1)),
+                &ImmediateDelay,
+                &slow_cancellation,
+            )
+            .await
+        });
+        let failure_executor = executor.clone();
+        let failure_client = Arc::clone(&client);
+        let failure_cancellation = cancellation.clone();
+        let failure = tokio::spawn(async move {
+            execute_llm_request_with_retry(
+                &failure_executor,
+                failure_client.as_ref(),
+                &[ChatMessage::new(ChatMessageRole::User, "fast-permanent")],
+                LlmRequestRetryPolicy::new(&[], Duration::from_secs(1)),
+                &ImmediateDelay,
+                &failure_cancellation,
+            )
+            .await
+        });
+        tokio::task::spawn_blocking(move || {
+            initial_requests_seen
+                .recv_timeout(Duration::from_secs(1))
+                .expect("两个初始活动请求应到达服务器");
+        })
+        .await
+        .expect("等待初始窗口不应 panic");
+
+        let waiting_executor = executor.clone();
+        let waiting_client = Arc::clone(&client);
+        let waiting_cancellation = cancellation.clone();
+        let waiting = tokio::spawn(async move {
+            execute_llm_request_with_retry(
+                &waiting_executor,
+                waiting_client.as_ref(),
+                &[ChatMessage::new(ChatMessageRole::User, "must-not-send")],
+                LlmRequestRetryPolicy::new(&[], Duration::from_secs(1)),
+                &ImmediateDelay,
+                &waiting_cancellation,
+            )
+            .await
+        });
+        release_decision.send(()).expect("永久错误响应应可释放");
+
+        let (slow_outcome, _) = slow.await.expect("慢成功任务不应 panic").into_parts();
+        let (failure_outcome, _) = failure.await.expect("永久错误任务不应 panic").into_parts();
+        let (waiting_outcome, _) = waiting.await.expect("等待任务不应 panic").into_parts();
+        assert!(matches!(
+            slow_outcome,
+            LlmRequestExecutionOutcome::Response { .. }
+        ));
+        assert!(matches!(
+            failure_outcome,
+            LlmRequestExecutionOutcome::Fatal { source, .. }
+                if source.service_status().is_permanent()
+        ));
+        assert!(matches!(
+            waiting_outcome,
+            LlmRequestExecutionOutcome::AdmissionStopped {
+                service_status: LlmServiceStatus::PermanentAuthorization,
+                ..
+            }
+        ));
+        assert!(
+            !extra_request_seen
+                .recv_timeout(Duration::from_secs(1))
+                .expect("额外请求事实应返回"),
+            "永久错误确认后不得再发送等待中的模型请求"
+        );
+
+        executor.shutdown().await;
+        worker.join().expect("并发决定测试服务器应正常退出");
+    }
+
+    #[tokio::test]
+    async fn slow_quota_body_blocks_replacement_request_before_permanent_classification() {
+        let SlowBodyDecisionServer {
+            endpoint,
+            initial_requests_seen,
+            release_responses,
+            extra_before_body,
+            extra_after_body,
+            worker,
+        } = spawn_slow_quota_body_server();
+        let client = Arc::new(client_with_rate(&endpoint, Map::new(), 60_000, 3));
+        let executor = executor(2);
+        let cancellation = CooperativeCancellation::default();
+
+        let slow_executor = executor.clone();
+        let slow_client = Arc::clone(&client);
+        let slow_cancellation = cancellation.clone();
+        let slow = tokio::spawn(async move {
+            execute_llm_request_with_retry(
+                &slow_executor,
+                slow_client.as_ref(),
+                &[ChatMessage::new(ChatMessageRole::User, "slow-quota-body")],
+                LlmRequestRetryPolicy::new(&[], Duration::from_secs(1)),
+                &ImmediateDelay,
+                &slow_cancellation,
+            )
+            .await
+        });
+        let fast_executor = executor.clone();
+        let fast_client = Arc::clone(&client);
+        let fast_cancellation = cancellation.clone();
+        let fast = tokio::spawn(async move {
+            execute_llm_request_with_retry(
+                &fast_executor,
+                fast_client.as_ref(),
+                &[ChatMessage::new(ChatMessageRole::User, "fast-success")],
+                LlmRequestRetryPolicy::new(&[], Duration::from_secs(1)),
+                &ImmediateDelay,
+                &fast_cancellation,
+            )
+            .await
+        });
+        tokio::task::spawn_blocking(move || {
+            initial_requests_seen
+                .recv_timeout(Duration::from_secs(1))
+                .expect("两个初始活动请求应到达服务器");
+        })
+        .await
+        .expect("等待初始窗口不应 panic");
+
+        let waiting_executor = executor.clone();
+        let waiting_client = Arc::clone(&client);
+        let waiting_cancellation = cancellation.clone();
+        let waiting = tokio::spawn(async move {
+            execute_llm_request_with_retry(
+                &waiting_executor,
+                waiting_client.as_ref(),
+                &[ChatMessage::new(ChatMessageRole::User, "must-not-send")],
+                LlmRequestRetryPolicy::new(&[], Duration::from_secs(1)),
+                &ImmediateDelay,
+                &waiting_cancellation,
+            )
+            .await
+        });
+        release_responses.send(()).expect("测试响应应可释放");
+
+        assert!(
+            !extra_before_body
+                .recv_timeout(Duration::from_secs(1))
+                .expect("慢正文前事实应返回"),
+            "非 2xx 正文尚未完成分类时不得让等待任务补位发送"
+        );
+        let (fast, _) = fast.await.expect("快成功任务不应 panic").into_parts();
+        let (slow, _) = slow.await.expect("quota 任务不应 panic").into_parts();
+        let (waiting, _) = waiting.await.expect("等待任务不应 panic").into_parts();
+        assert!(matches!(fast, LlmRequestExecutionOutcome::Response { .. }));
+        assert!(matches!(
+            slow,
+            LlmRequestExecutionOutcome::Fatal { source, .. }
+                if source.service_status() == LlmServiceStatus::PermanentQuota
+        ));
+        assert!(matches!(
+            waiting,
+            LlmRequestExecutionOutcome::AdmissionStopped {
+                service_status: LlmServiceStatus::PermanentQuota,
+                ..
+            }
+        ));
+        assert!(
+            !extra_after_body
+                .recv_timeout(Duration::from_secs(1))
+                .expect("慢正文后事实应返回"),
+            "永久 quota 分类后不得发送等待请求"
+        );
+
+        executor.shutdown().await;
+        worker.join().expect("慢 quota 正文测试服务器应正常退出");
+    }
+
+    #[tokio::test]
+    async fn exhausted_rate_limit_stops_waiting_http_requests_and_keeps_inflight_success() {
+        let server = spawn_concurrent_decision_server(
+            "slow-success",
+            "rate-limit",
+            status_response(
+                "429 Too Many Requests",
+                "Content-Type: application/json\r\n",
+                r#"{"error":{"code":"rate_limit_exceeded","type":"requests","message":"SECRET_BODY"}}"#,
+            ),
+            success_response("slow-response", "slow-request", "[]"),
+        );
+        let ConcurrentDecisionServer {
+            endpoint,
+            initial_requests_seen,
+            release_decision,
+            extra_request_seen,
+            worker,
+        } = server;
+        let client = Arc::new(client_with_rate(&endpoint, Map::new(), 60_000, 3));
+        let executor = executor(2);
+        let cancellation = CooperativeCancellation::default();
+
+        let slow_executor = executor.clone();
+        let slow_client = Arc::clone(&client);
+        let slow_cancellation = cancellation.clone();
+        let slow = tokio::spawn(async move {
+            execute_llm_request_with_retry(
+                &slow_executor,
+                slow_client.as_ref(),
+                &[ChatMessage::new(ChatMessageRole::User, "slow-success")],
+                LlmRequestRetryPolicy::new(&[], Duration::from_secs(1)),
+                &ImmediateDelay,
+                &slow_cancellation,
+            )
+            .await
+        });
+        let limited_executor = executor.clone();
+        let limited_client = Arc::clone(&client);
+        let limited_cancellation = cancellation.clone();
+        let limited = tokio::spawn(async move {
+            execute_llm_request_with_retry(
+                &limited_executor,
+                limited_client.as_ref(),
+                &[ChatMessage::new(ChatMessageRole::User, "rate-limit")],
+                LlmRequestRetryPolicy::new(&[], Duration::from_secs(1)),
+                &ImmediateDelay,
+                &limited_cancellation,
+            )
+            .await
+        });
+        tokio::task::spawn_blocking(move || {
+            initial_requests_seen
+                .recv_timeout(Duration::from_secs(1))
+                .expect("两个初始活动请求应到达服务器");
+        })
+        .await
+        .expect("等待初始窗口不应 panic");
+
+        let waiting_executor = executor.clone();
+        let waiting_client = Arc::clone(&client);
+        let waiting_cancellation = cancellation.clone();
+        let waiting = tokio::spawn(async move {
+            execute_llm_request_with_retry(
+                &waiting_executor,
+                waiting_client.as_ref(),
+                &[ChatMessage::new(ChatMessageRole::User, "must-not-send")],
+                LlmRequestRetryPolicy::new(&[], Duration::from_secs(1)),
+                &ImmediateDelay,
+                &waiting_cancellation,
+            )
+            .await
+        });
+        release_decision.send(()).expect("429 响应应可释放");
+
+        let (slow_outcome, _) = slow.await.expect("慢成功任务不应 panic").into_parts();
+        let (limited_outcome, _) = limited.await.expect("429 任务不应 panic").into_parts();
+        let (waiting_outcome, _) = waiting.await.expect("等待任务不应 panic").into_parts();
+        assert!(matches!(
+            slow_outcome,
+            LlmRequestExecutionOutcome::Response { .. }
+        ));
+        assert!(matches!(
+            limited_outcome,
+            LlmRequestExecutionOutcome::RetryBudgetExhausted {
+                service_status: LlmServiceStatus::RateLimited,
+                ..
+            }
+        ));
+        assert!(matches!(
+            waiting_outcome,
+            LlmRequestExecutionOutcome::AdmissionStopped {
+                service_status: LlmServiceStatus::RateLimited,
+                ..
+            }
+        ));
+        assert!(
+            !extra_request_seen
+                .recv_timeout(Duration::from_secs(1))
+                .expect("额外请求事实应返回"),
+            "429 重试耗尽后不得再发送等待中的模型请求"
+        );
+
+        executor.shutdown().await;
+        worker.join().expect("并发决定测试服务器应正常退出");
+    }
+
+    #[tokio::test]
+    async fn exhausted_server_error_does_not_stop_later_http_requests() {
+        let server = spawn_test_server(
+            vec![
+                status_response(
+                    "500 Internal Server Error",
+                    "Content-Type: application/json\r\n",
+                    r#"{"error":{"code":"server_error","type":"temporary"}}"#,
+                ),
+                success_response("later-response", "later-request", "[]"),
+            ],
+            false,
+        );
+        let client = client_with_rate(&server.endpoint, Map::new(), 60_000, 2);
+        let executor = executor(1);
+        let cancellation = CooperativeCancellation::default();
+
+        let first = execute_llm_request_with_retry(
+            &executor,
+            &client,
+            &[ChatMessage::new(ChatMessageRole::User, "server-error")],
+            LlmRequestRetryPolicy::new(&[], Duration::from_secs(1)),
+            &ImmediateDelay,
+            &cancellation,
+        )
+        .await;
+        let (first, _) = first.into_parts();
+        assert!(matches!(
+            first,
+            LlmRequestExecutionOutcome::RetryBudgetExhausted {
+                service_status: LlmServiceStatus::Other,
+                ..
+            }
+        ));
+
+        let later = execute_llm_request_with_retry(
+            &executor,
+            &client,
+            &[ChatMessage::new(ChatMessageRole::User, "later")],
+            LlmRequestRetryPolicy::new(&[], Duration::from_secs(1)),
+            &ImmediateDelay,
+            &cancellation,
+        )
+        .await;
+        assert!(matches!(
+            later.into_parts().0,
+            LlmRequestExecutionOutcome::Response { .. }
+        ));
+        assert!(server.requests.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(server.requests.recv_timeout(Duration::from_secs(1)).is_ok());
+
+        executor.shutdown().await;
+        server.worker.join().expect("测试服务器应正常退出");
+    }
+
+    #[tokio::test]
     async fn rate_and_active_waits_have_no_local_deadline() {
         let client = client_with_rate("http://127.0.0.1:1/v1/chat/completions", Map::new(), 60, 2);
-        let lifecycle = LlmLifecycle::new();
+        let lifecycle = LlmLifecycle::new(Duration::from_secs(60));
 
         wait_for_rate(&client, &lifecycle)
             .await
@@ -2234,7 +3082,7 @@ mod tests {
             6_000,
             1,
         ));
-        let lifecycle = Arc::new(LlmLifecycle::new());
+        let lifecycle = Arc::new(LlmLifecycle::new(Duration::from_secs(60)));
         wait_for_rate(client.as_ref(), lifecycle.as_ref())
             .await
             .expect("首个 burst 令牌应立即可用");
@@ -2262,7 +3110,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn stop_wins_and_releases_permit_when_active_admission_is_simultaneously_ready() {
-        let lifecycle = Arc::new(LlmLifecycle::new());
+        let lifecycle = Arc::new(LlmLifecycle::new(Duration::from_secs(60)));
         let capacity = Arc::new(Semaphore::new(0));
         let waiting_lifecycle = Arc::clone(&lifecycle);
         let waiting_capacity = Arc::clone(&capacity);
@@ -2452,7 +3300,7 @@ mod tests {
 
     #[tokio::test]
     async fn lifecycle_stop_and_idle_state_cannot_miss_a_notification() {
-        let lifecycle = Arc::new(LlmLifecycle::new());
+        let lifecycle = Arc::new(LlmLifecycle::new(Duration::from_secs(60)));
         let job = lifecycle.register().expect("停止前应可注册作业");
         lifecycle.stop_accepting();
 

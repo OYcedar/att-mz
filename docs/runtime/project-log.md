@@ -102,7 +102,16 @@ planned = started + not_started
 ```
 
 Generic 汇总保存 cleared、reused、accepted、written、conflicted Unit 与响应问题数；RPG
-Maker 汇总保存接受、写入、剩余、协议和协调结果。不同引擎不共用含义不同的字段。
+Maker 汇总保存接受、写入、剩余、协议和协调结果。Generic 另保存 planned_units 与
+remaining_units；RPG Maker 分别保存 remaining_decisions 与 remaining_locations。两者都
+保存 recoverable_request_exhaustions 和 request_admission_stopped。不同引擎不共用含义
+不同的字段。
+
+只要 Translate 已经形成计划事实，Complete、Incomplete、Failed 和 Cancelled 都保存当时
+的 Task 计数和引擎汇总。Failed 或 Cancelled 不得把已经开始、未开始、已写入和剩余工作
+清零；终端短汇总直接使用同一份事实。Generic 的 remaining_units 是计划交给模型的 Unit
+减去实际写入的 Unit，CAS 冲突不算写入；RPG Maker 的剩余决策和位置同样按实际提交递减。
+服务停发后没有开始的 Task 只计入 not_started。
 Placeholder 等规划错误发生在模型请求前时，日志写可读 `diagnostic.run_plan`，不得声明
 Task 已开始。
 

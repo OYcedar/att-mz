@@ -56,6 +56,11 @@ rule = []
 Extract Rules 的 `rule = []` 成功生效后，CLI 与项目日志使用同一份四字段诊断说明停用、
 资产删除和运行方案影响；它是退出码仍为 `0` 的成功警告，不是无效规则错误。
 
+每条非空 Extract Rule 的数组位置就是其从 1 开始的自然规则序号。规则物化出的每个 Unit
+都保存这个序号；重新 Extract 时按当前 TOML 重新建立，不从字段路径、匹配次序或旧数据库
+推断。`manual export --ownership` 只读取这项已保存事实，因此 Rules TOML 与外部规则清单
+可以用同一个自然序号逐条核对。
+
 ### 2.1 PCRE2 与三层转义
 
 三类规则的正则都使用 PCRE2，开启 UTF 与 UCP。写法上它和 JavaScript `RegExp` 不同：

@@ -10,6 +10,7 @@ use std::sync::{Arc, Once};
 
 use windows_sys::Win32::Globalization::{CP_UTF8, GetACP};
 
+use super::TranslationTerminalSummary;
 use super::arguments::AttArguments;
 use super::command::{
     CommandPanicBoundary, CommandResultRenderer, CommandRunResult, ProductionCommandError,
@@ -26,11 +27,13 @@ use super::generic_command::{
 use super::project_log::{PendingProjectLog, ProjectLogWarning};
 use crate::diagnostic::{
     Diagnostic, DiagnosticReport, IoFailure, RuntimeComponent, RuntimeIssue, RuntimeOperation,
-    RuntimePanicBoundary, StateEffect, render_diagnostic_report, render_state_effect_impact,
+    RuntimePanicBoundary, StateEffect, public_path, render_diagnostic_report,
+    render_state_effect_impact,
 };
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
 use crate::llm::ApiKeyRedactor;
 use crate::manual::{render_manual_command_error, render_manual_command_summary};
+use crate::runtime::project_log::TranslationEngineSummary;
 
 enum ProductCommandRunReport {
     RpgMaker(ProductionCommandRunReport),
@@ -240,12 +243,11 @@ impl RunLogPresentation {
         let Some(path) = self.path.as_deref() else {
             return Ok(());
         };
+        let path = public_path(path);
         writeln!(
             output,
             "{}",
-            localizer.format(UiMessage::ResultRunLog {
-                path: &path.to_string_lossy(),
-            })
+            localizer.format(UiMessage::ResultRunLog { path: &path })
         )?;
         self.written.set(true);
         Ok(())
@@ -635,10 +637,13 @@ fn run_after_cli_parsing(
             render_command_report_with_run_log(
                 report.result,
                 report.shutdown_error,
+                report.translation_summary,
                 pending_project_log,
-                &run_log,
-                had_presentation_failure,
-                localizer,
+                LoggedPresentationContext {
+                    run_log: &run_log,
+                    had_presentation_failure,
+                    localizer,
+                },
                 stdout,
                 stderr,
             )
@@ -669,25 +674,39 @@ fn render_command_report(
     render_command_report_with_run_log(
         result,
         shutdown_error,
+        None,
         pending_project_log,
-        &run_log,
-        had_presentation_failure,
-        localizer,
+        LoggedPresentationContext {
+            run_log: &run_log,
+            had_presentation_failure,
+            localizer,
+        },
         &mut stdout,
         &mut stderr,
     )
 }
 
+#[derive(Clone, Copy)]
+struct LoggedPresentationContext<'a> {
+    run_log: &'a RunLogPresentation,
+    had_presentation_failure: bool,
+    localizer: &'a UiLocalizer,
+}
+
 fn render_command_report_with_run_log(
     result: CommandRunResult,
     shutdown_error: Option<super::command::ShutdownFailures>,
+    translation_summary: Option<TranslationTerminalSummary>,
     pending_project_log: Option<PendingProjectLog>,
-    run_log: &RunLogPresentation,
-    had_presentation_failure: bool,
-    localizer: &UiLocalizer,
+    context: LoggedPresentationContext<'_>,
     stdout: &mut StreamPresentation<'_>,
     stderr: &mut StreamPresentation<'_>,
 ) -> ExitCode {
+    let LoggedPresentationContext {
+        run_log,
+        had_presentation_failure,
+        localizer,
+    } = context;
     match (result, shutdown_error) {
         (CommandRunResult::Succeeded(output), shutdown) => {
             if let Err(error) = CommandResultRenderer::render_success(&output, localizer, stdout) {
@@ -865,6 +884,15 @@ fn render_command_report_with_run_log(
                     &error,
                 ));
             }
+            if let Some(summary) = translation_summary
+                && let Err(error) = render_translation_terminal_summary(summary, localizer, stderr)
+            {
+                presentation_failures.push(process_output_failure_report(
+                    presentation_effect,
+                    RuntimeOperation::WriteStderr,
+                    &error,
+                ));
+            }
             if presentation_failures.is_empty() {
                 record_run_log_path(
                     run_log,
@@ -888,6 +916,15 @@ fn render_command_report_with_run_log(
         (CommandRunResult::Interrupted, None) => {
             let mut presentation_failures = Vec::new();
             if let Err(error) = writeln!(stderr, "{}", localizer.format(UiMessage::ResultCancelled))
+            {
+                presentation_failures.push(process_output_failure_report(
+                    StateEffect::ProgressPreserved,
+                    RuntimeOperation::WriteStderr,
+                    &error,
+                ));
+            }
+            if let Some(summary) = translation_summary
+                && let Err(error) = render_translation_terminal_summary(summary, localizer, stderr)
             {
                 presentation_failures.push(process_output_failure_report(
                     StateEffect::ProgressPreserved,
@@ -922,6 +959,15 @@ fn render_command_report_with_run_log(
         (CommandRunResult::Interrupted, Some(shutdown)) => {
             let mut presentation_failures = Vec::new();
             if let Err(error) = writeln!(stderr, "{}", localizer.format(UiMessage::ResultCancelled))
+            {
+                presentation_failures.push(process_output_failure_report(
+                    StateEffect::ProgressPreserved,
+                    RuntimeOperation::WriteStderr,
+                    &error,
+                ));
+            }
+            if let Some(summary) = translation_summary
+                && let Err(error) = render_translation_terminal_summary(summary, localizer, stderr)
             {
                 presentation_failures.push(process_output_failure_report(
                     StateEffect::ProgressPreserved,
@@ -1110,6 +1156,94 @@ fn process_output_failure_report_from_failure(
     )
 }
 
+fn render_translation_terminal_summary(
+    summary: TranslationTerminalSummary,
+    localizer: &UiLocalizer,
+    output: &mut dyn Write,
+) -> io::Result<()> {
+    let tasks = summary.tasks;
+    match summary.engine {
+        TranslationEngineSummary::RpgMaker(engine) => {
+            writeln!(
+                output,
+                "{}",
+                localizer.format(UiMessage::ResultTranslateSummary {
+                    total: tasks.planned,
+                    started: tasks.started,
+                    not_started: tasks.not_started,
+                    complete: tasks.complete,
+                    partial: tasks.partial,
+                    unavailable: tasks.unavailable,
+                    failed: tasks.failed,
+                    cancelled: tasks.cancelled,
+                    written: engine.written_locations,
+                    remaining: engine.remaining_locations,
+                })
+            )?;
+            writeln!(
+                output,
+                "{}",
+                localizer.format(UiMessage::TranslateIncompleteRpgMakerReason {
+                    partial: tasks.partial,
+                    unavailable: tasks.unavailable,
+                    protocol: engine.protocol_diagnostics,
+                    exhausted: engine.recoverable_request_exhaustions,
+                    admission: if engine.request_admission_stopped {
+                        "stopped"
+                    } else {
+                        "open"
+                    },
+                    not_started: tasks.not_started,
+                    remaining_decisions: engine.remaining_decisions,
+                    remaining_locations: engine.remaining_locations,
+                })
+            )
+        }
+        TranslationEngineSummary::Generic(engine) => {
+            writeln!(
+                output,
+                "{}",
+                localizer.format(UiMessage::ResultGenericTranslateSummary {
+                    total: tasks.planned,
+                    started: tasks.started,
+                    not_started: tasks.not_started,
+                    complete: tasks.complete,
+                    partial: tasks.partial,
+                    unavailable: tasks.unavailable,
+                    failed: tasks.failed,
+                    cancelled: tasks.cancelled,
+                    planned_units: engine.planned_units,
+                    remaining_units: engine.remaining_units,
+                    cleared: engine.cleared_units,
+                    reused: engine.reused_units,
+                    accepted: engine.accepted_units,
+                    written: engine.written_units,
+                    conflicted: engine.conflicted_units,
+                    problems: engine.response_problems,
+                })
+            )?;
+            writeln!(
+                output,
+                "{}",
+                localizer.format(UiMessage::TranslateIncompleteGenericReason {
+                    partial: tasks.partial,
+                    unavailable: tasks.unavailable,
+                    conflicted: engine.conflicted_units,
+                    problems: engine.response_problems,
+                    exhausted: engine.recoverable_request_exhaustions,
+                    admission: if engine.request_admission_stopped {
+                        "stopped"
+                    } else {
+                        "open"
+                    },
+                    not_started: tasks.not_started,
+                    remaining_units: engine.remaining_units,
+                })
+            )
+        }
+    }
+}
+
 fn render_generic_command_report(
     report: GenericCommandRunReport,
     localizer: &UiLocalizer,
@@ -1122,6 +1256,7 @@ fn render_generic_command_report(
         mut pending_project_log,
         panic_log_path,
         selected_api_key_redactor,
+        translation_summary,
     } = report;
     stdout.select_api_key_redactor(selected_api_key_redactor.clone());
     stderr.select_api_key_redactor(selected_api_key_redactor);
@@ -1151,10 +1286,13 @@ fn render_generic_command_report(
             render_generic_command_result_with_run_log(
                 result,
                 &shutdown_errors,
+                translation_summary,
                 pending_project_log,
-                &run_log,
-                had_presentation_failure,
-                localizer,
+                LoggedPresentationContext {
+                    run_log: &run_log,
+                    had_presentation_failure,
+                    localizer,
+                },
                 stdout,
                 stderr,
             )
@@ -1185,10 +1323,13 @@ fn render_generic_command_result(
     render_generic_command_result_with_run_log(
         result,
         shutdown_errors,
+        None,
         pending_project_log,
-        &run_log,
-        had_presentation_failure,
-        localizer,
+        LoggedPresentationContext {
+            run_log: &run_log,
+            had_presentation_failure,
+            localizer,
+        },
         &mut stdout,
         &mut stderr,
     )
@@ -1197,13 +1338,17 @@ fn render_generic_command_result(
 fn render_generic_command_result_with_run_log(
     result: GenericCommandRunResult,
     shutdown_errors: &[GenericShutdownError],
+    translation_summary: Option<TranslationTerminalSummary>,
     pending_project_log: Option<PendingProjectLog>,
-    run_log: &RunLogPresentation,
-    had_presentation_failure: bool,
-    localizer: &UiLocalizer,
+    context: LoggedPresentationContext<'_>,
     stdout: &mut StreamPresentation<'_>,
     stderr: &mut StreamPresentation<'_>,
 ) -> ExitCode {
+    let LoggedPresentationContext {
+        run_log,
+        had_presentation_failure,
+        localizer,
+    } = context;
     match result {
         GenericCommandRunResult::Succeeded(output) => {
             if let Err(source) = render_generic_output(&output, localizer, stdout) {
@@ -1378,6 +1523,15 @@ fn render_generic_command_result_with_run_log(
                     &source,
                 ));
             }
+            if let Some(summary) = translation_summary
+                && let Err(source) = render_translation_terminal_summary(summary, localizer, stderr)
+            {
+                presentation_failures.push(process_output_failure_report(
+                    presentation_effect,
+                    RuntimeOperation::WriteStderr,
+                    &source,
+                ));
+            }
             if presentation_failures.is_empty() {
                 record_run_log_path(
                     run_log,
@@ -1402,6 +1556,15 @@ fn render_generic_command_result_with_run_log(
             let mut presentation_failures = Vec::new();
             if let Err(source) =
                 writeln!(stderr, "{}", localizer.format(UiMessage::ResultCancelled))
+            {
+                presentation_failures.push(process_output_failure_report(
+                    StateEffect::ProgressPreserved,
+                    RuntimeOperation::WriteStderr,
+                    &source,
+                ));
+            }
+            if let Some(summary) = translation_summary
+                && let Err(source) = render_translation_terminal_summary(summary, localizer, stderr)
             {
                 presentation_failures.push(process_output_failure_report(
                     StateEffect::ProgressPreserved,
@@ -1546,9 +1709,15 @@ fn render_generic_output(
                 "{}",
                 localizer.format(UiMessage::ResultGenericTranslateSummary {
                     total: count(summary.total_tasks),
+                    started: count(summary.started_tasks),
+                    not_started: count(summary.not_started_tasks),
                     complete: count(summary.complete_tasks),
                     partial: count(summary.partial_tasks),
                     unavailable: count(summary.unavailable_tasks),
+                    failed: 0,
+                    cancelled: 0,
+                    planned_units: count(summary.planned_units),
+                    remaining_units: count(summary.remaining_units),
                     cleared: count(summary.cleared_units),
                     reused: count(summary.reused_units),
                     accepted: count(summary.accepted_units),
@@ -1576,6 +1745,7 @@ fn render_generic_output(
             symbol_repair_skipped_units,
             symbol_repair_replacements,
         } => {
+            let output_root = public_path(output_root);
             writeln!(
                 stdout,
                 "{}",
@@ -1586,9 +1756,7 @@ fn render_generic_output(
             writeln!(
                 stdout,
                 "{}",
-                localizer.format(UiMessage::ResultOutputDirectory {
-                    path: &output_root.to_string_lossy(),
-                })
+                localizer.format(UiMessage::ResultOutputDirectory { path: &output_root })
             )?;
             writeln!(
                 stdout,
@@ -1646,6 +1814,14 @@ fn render_generic_success_warnings(
         unavailable: count(summary.unavailable_tasks),
         conflicted: count(summary.conflicted_units),
         problems: count(summary.response_problems),
+        exhausted: count(summary.recoverable_request_exhaustions),
+        admission: if summary.request_admission_stopped {
+            "stopped"
+        } else {
+            "open"
+        },
+        not_started: count(summary.not_started_tasks),
+        remaining_units: count(summary.remaining_units),
     });
     let impact = render_state_effect_impact(StateEffect::ProgressPreserved, localizer);
     let help = localizer.format(UiMessage::TranslateIncompleteHelp);
@@ -1883,7 +2059,9 @@ mod tests {
     use crate::rpg_maker::translate::{TranslateOutput, TranslationSummary};
     use crate::runtime::performance::RunPerformanceCounters;
     use crate::runtime::project_log::{
-        ProjectLogCommand, ProjectLogEngine, RunPlanValueSource as ProjectLogValueSource,
+        GenericTranslationSummary as LoggedGenericTranslationSummary, ProjectLogCommand,
+        ProjectLogEngine, RpgMakerTranslationSummary as LoggedRpgMakerTranslationSummary,
+        RunPlanValueSource as ProjectLogValueSource, TranslationTaskCounters,
     };
 
     fn active_project_log(root: &Path, project: &str) -> (ActiveProjectLog, PathBuf) {
@@ -2248,6 +2426,7 @@ mod tests {
                 pending_project_log: None,
                 panic_log_path: Some(panic_path.clone()),
                 selected_api_key_redactor: None,
+                translation_summary: None,
             },
             &localizer,
             &mut StreamPresentation::new(ProcessStream::Stdout, &mut stdout),
@@ -2260,6 +2439,30 @@ mod tests {
             .replace(['\u{2068}', '\u{2069}'], "");
         assert_eq!(plain_stderr.matches("运行记录：").count(), 1);
         assert!(plain_stderr.contains(&panic_path.to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn run_log_presentation_removes_windows_verbatim_drive_and_unc_prefixes() {
+        let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
+        for (path, expected) in [
+            (
+                r"\\?\C:\project\logs\run-000001.jsonl",
+                r"C:\project\logs\run-000001.jsonl",
+            ),
+            (
+                r"\\?\UNC\server\share\logs\run-000001.jsonl",
+                r"\\server\share\logs\run-000001.jsonl",
+            ),
+        ] {
+            let presentation = RunLogPresentation::new(Some(PathBuf::from(path)));
+            let mut output = Vec::new();
+            presentation.write(&localizer, &mut output).unwrap();
+            let output = String::from_utf8(output)
+                .unwrap()
+                .replace(['\u{2068}', '\u{2069}'], "");
+            assert!(output.contains(expected));
+            assert!(!output.contains(r"\\?\"));
+        }
     }
 
     #[test]
@@ -2334,6 +2537,121 @@ mod tests {
     }
 
     #[test]
+    fn failed_and_cancelled_translate_reports_show_current_summary_on_stderr_for_both_engines() {
+        let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
+        let failed_tasks = TranslationTaskCounters::new(5, 3, 1, 0, 1, 1, 0, 2)
+            .expect("失败任务汇总必须满足恒等式");
+        let cancelled_tasks = TranslationTaskCounters::new(5, 2, 1, 0, 0, 0, 1, 3)
+            .expect("取消任务汇总必须满足恒等式");
+        let rpg = TranslationEngineSummary::RpgMaker(LoggedRpgMakerTranslationSummary {
+            accepted_decisions: 2,
+            written_locations: 3,
+            remaining_decisions: 6,
+            remaining_locations: 8,
+            protocol_diagnostics: 1,
+            recoverable_request_exhaustions: 1,
+            request_admission_stopped: true,
+            retained: 0,
+            invalidated: 0,
+            not_applicable: 0,
+            reused: 0,
+        });
+        let generic = TranslationEngineSummary::Generic(LoggedGenericTranslationSummary {
+            planned_units: 10,
+            remaining_units: 7,
+            cleared_units: 0,
+            reused_units: 0,
+            accepted_units: 3,
+            written_units: 3,
+            conflicted_units: 0,
+            response_problems: 1,
+            recoverable_request_exhaustions: 1,
+            request_admission_stopped: true,
+        });
+
+        for (tasks, engine, failed, expected_exit) in [
+            (failed_tasks, rpg, true, ExitCode::FAILURE),
+            (cancelled_tasks, rpg, false, ExitCode::from(130)),
+        ] {
+            let result = if failed {
+                CommandRunResult::Failed(ProductionCommandError::stdout_write(io::Error::other(
+                    "测试失败正文不得公开",
+                )))
+            } else {
+                CommandRunResult::Interrupted
+            };
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let exit = render_command_report_with_run_log(
+                result,
+                None,
+                Some(TranslationTerminalSummary { tasks, engine }),
+                None,
+                LoggedPresentationContext {
+                    run_log: &RunLogPresentation::new(None),
+                    had_presentation_failure: false,
+                    localizer: &localizer,
+                },
+                &mut StreamPresentation::new(ProcessStream::Stdout, &mut stdout),
+                &mut StreamPresentation::new(ProcessStream::Stderr, &mut stderr),
+            );
+            assert_eq!(exit, expected_exit);
+            assert!(stdout.is_empty());
+            let stderr = String::from_utf8(stderr)
+                .expect("stderr 应为 UTF-8")
+                .replace(['\u{2068}', '\u{2069}'], "");
+            assert!(stderr.contains("计划 5 个任务"), "实际 stderr：{stderr}");
+            assert!(stderr.contains(if failed { "已开始 3" } else { "已开始 2" }));
+            assert!(stderr.contains(if failed { "未开始 2" } else { "未开始 3" }));
+            assert!(stderr.contains("请求准入已停止"), "实际 stderr：{stderr}");
+            assert!(!stderr.contains("测试失败正文不得公开"));
+        }
+
+        for (tasks, failed, expected_exit) in [
+            (failed_tasks, true, ExitCode::FAILURE),
+            (cancelled_tasks, false, ExitCode::from(130)),
+        ] {
+            let result = if failed {
+                GenericCommandRunResult::Failed(GenericCommandError::Signal {
+                    source: io::Error::other("测试 Generic 失败正文不得公开"),
+                    operation: None,
+                    state_applied: false,
+                })
+            } else {
+                GenericCommandRunResult::Interrupted
+            };
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let exit = render_generic_command_result_with_run_log(
+                result,
+                &[],
+                Some(TranslationTerminalSummary {
+                    tasks,
+                    engine: generic,
+                }),
+                None,
+                LoggedPresentationContext {
+                    run_log: &RunLogPresentation::new(None),
+                    had_presentation_failure: false,
+                    localizer: &localizer,
+                },
+                &mut StreamPresentation::new(ProcessStream::Stdout, &mut stdout),
+                &mut StreamPresentation::new(ProcessStream::Stderr, &mut stderr),
+            );
+            assert_eq!(exit, expected_exit);
+            assert!(stdout.is_empty());
+            let stderr = String::from_utf8(stderr)
+                .expect("stderr 应为 UTF-8")
+                .replace(['\u{2068}', '\u{2069}'], "");
+            assert!(stderr.contains("计划 5 个任务"), "实际 stderr：{stderr}");
+            assert!(stderr.contains(if failed { "已开始 3" } else { "已开始 2" }));
+            assert!(stderr.contains(if failed { "未开始 2" } else { "未开始 3" }));
+            assert!(stderr.contains("请求准入已停止"), "实际 stderr：{stderr}");
+            assert!(!stderr.contains("测试 Generic 失败正文不得公开"));
+        }
+    }
+
+    #[test]
     fn rpg_translate_with_no_tasks_but_remaining_content_is_incomplete() {
         let output = RpgMakerCommandOutput::Translate {
             output: TranslateOutput {
@@ -2341,6 +2659,8 @@ mod tests {
                 profile_id: "default".to_owned(),
                 summary: TranslationSummary {
                     total_tasks: 0,
+                    started_tasks: 0,
+                    not_started_tasks: 0,
                     complete_tasks: 0,
                     partial_tasks: 0,
                     unavailable_tasks: 0,
@@ -2350,6 +2670,7 @@ mod tests {
                     remaining_locations: 2,
                     protocol_diagnostics: 0,
                     recoverable_request_exhaustions: 0,
+                    request_admission_stopped: false,
                     retained: 0,
                     invalidated: 0,
                     not_applicable: 0,
@@ -3104,10 +3425,13 @@ mod tests {
                     render_command_report_with_run_log(
                         CommandRunResult::Interrupted,
                         None,
+                        None,
                         pending,
-                        &run_log,
-                        false,
-                        &localizer,
+                        LoggedPresentationContext {
+                            run_log: &run_log,
+                            had_presentation_failure: false,
+                            localizer: &localizer,
+                        },
                         stdout,
                         stderr,
                     )

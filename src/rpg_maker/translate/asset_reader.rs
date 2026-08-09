@@ -2483,6 +2483,7 @@ mod tests {
                     owner TEXT NOT NULL,
                     group_id INTEGER NOT NULL CHECK (group_id > 0),
                     unit_role TEXT NOT NULL,
+                    rule_number INTEGER,
                     semantic_order_key BLOB NOT NULL,
                     source_content_json TEXT NOT NULL,
                     source_context_json TEXT NOT NULL,
@@ -2513,7 +2514,11 @@ mod tests {
                     ('builtin', 2, 'group-b', X'010000000000000001000000000000000000', 'map', '[]'),
                     ('builtin', 1, 'group-a', X'010000000000000000000000000000000000', 'map', '[]'),
                     ('rules', 1, 'group-r', X'010000000000000000000000000000000000', 'map', '[]');
-                INSERT INTO rpg_maker_text_unit VALUES
+                INSERT INTO rpg_maker_text_unit (
+                    owner, group_id, unit_role, semantic_order_key,
+                    source_content_json, source_context_json,
+                    translation_content_json, translation_state
+                ) VALUES
                     ('builtin', 2, 'role-z', X'010000000000000001000000000000000000', '"z"', '{}', NULL, NULL),
                     ('builtin', 1, 'role-y', X'010000000000000000000000000000000000', '"y"', '{}', NULL, NULL);
                 "#,

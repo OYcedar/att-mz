@@ -555,6 +555,9 @@ pub(crate) enum UiMessage<'a> {
         entries: u64,
         path: &'a str,
     },
+    ManualOwnershipExported {
+        path: &'a str,
+    },
     ManualChecked {
         valid: u64,
         unfilled: u64,
@@ -646,9 +649,13 @@ pub(crate) enum UiMessage<'a> {
     },
     ResultTranslateSummary {
         total: u64,
+        started: u64,
+        not_started: u64,
         complete: u64,
         partial: u64,
         unavailable: u64,
+        failed: u64,
+        cancelled: u64,
         written: u64,
         remaining: u64,
     },
@@ -660,9 +667,15 @@ pub(crate) enum UiMessage<'a> {
     },
     ResultGenericTranslateSummary {
         total: u64,
+        started: u64,
+        not_started: u64,
         complete: u64,
         partial: u64,
         unavailable: u64,
+        failed: u64,
+        cancelled: u64,
+        planned_units: u64,
+        remaining_units: u64,
         cleared: u64,
         reused: u64,
         accepted: u64,
@@ -708,6 +721,8 @@ pub(crate) enum UiMessage<'a> {
         unavailable: u64,
         protocol: u64,
         exhausted: u64,
+        admission: &'a str,
+        not_started: u64,
         remaining_decisions: u64,
         remaining_locations: u64,
     },
@@ -716,6 +731,10 @@ pub(crate) enum UiMessage<'a> {
         unavailable: u64,
         conflicted: u64,
         problems: u64,
+        exhausted: u64,
+        admission: &'a str,
+        not_started: u64,
+        remaining_units: u64,
     },
     TranslateIncompleteHelp,
     ResultCancelled,
@@ -889,6 +908,7 @@ impl UiMessage<'_> {
             Self::DiagnosticPlaceholderRuleFile { .. } => "diagnostic-placeholder-rule-file",
             Self::DiagnosticPlaceholderRuleProject { .. } => "diagnostic-placeholder-rule-project",
             Self::ManualExported { .. } => "manual-exported",
+            Self::ManualOwnershipExported { .. } => "manual-ownership-exported",
             Self::ManualChecked { .. } => "manual-checked",
             Self::ManualApplied { .. } => "manual-applied",
             Self::ManualValue { .. } => "manual-value",
@@ -1054,16 +1074,24 @@ impl UiMessage<'_> {
             }
             Self::ResultTranslateSummary {
                 total,
+                started,
+                not_started,
                 complete,
                 partial,
                 unavailable,
+                failed,
+                cancelled,
                 written,
                 remaining,
             } => {
                 set_number(&mut arguments, "total", total);
+                set_number(&mut arguments, "started", started);
+                set_number(&mut arguments, "not_started", not_started);
                 set_number(&mut arguments, "complete", complete);
                 set_number(&mut arguments, "partial", partial);
                 set_number(&mut arguments, "unavailable", unavailable);
+                set_number(&mut arguments, "failed", failed);
+                set_number(&mut arguments, "cancelled", cancelled);
                 set_number(&mut arguments, "written", written);
                 set_number(&mut arguments, "remaining", remaining);
             }
@@ -1080,9 +1108,15 @@ impl UiMessage<'_> {
             }
             Self::ResultGenericTranslateSummary {
                 total,
+                started,
+                not_started,
                 complete,
                 partial,
                 unavailable,
+                failed,
+                cancelled,
+                planned_units,
+                remaining_units,
                 cleared,
                 reused,
                 accepted,
@@ -1091,9 +1125,15 @@ impl UiMessage<'_> {
                 problems,
             } => {
                 set_number(&mut arguments, "total", total);
+                set_number(&mut arguments, "started", started);
+                set_number(&mut arguments, "not_started", not_started);
                 set_number(&mut arguments, "complete", complete);
                 set_number(&mut arguments, "partial", partial);
                 set_number(&mut arguments, "unavailable", unavailable);
+                set_number(&mut arguments, "failed", failed);
+                set_number(&mut arguments, "cancelled", cancelled);
+                set_number(&mut arguments, "planned_units", planned_units);
+                set_number(&mut arguments, "remaining_units", remaining_units);
                 set_number(&mut arguments, "cleared", cleared);
                 set_number(&mut arguments, "reused", reused);
                 set_number(&mut arguments, "accepted", accepted);
@@ -1262,6 +1302,9 @@ impl UiMessage<'_> {
                 set_number(&mut arguments, "entries", entries);
                 set_text(&mut arguments, "path", path);
             }
+            Self::ManualOwnershipExported { path } => {
+                set_text(&mut arguments, "path", path);
+            }
             Self::ManualChecked {
                 valid,
                 unfilled,
@@ -1304,6 +1347,8 @@ impl UiMessage<'_> {
                 unavailable,
                 protocol,
                 exhausted,
+                admission,
+                not_started,
                 remaining_decisions,
                 remaining_locations,
             } => {
@@ -1311,6 +1356,8 @@ impl UiMessage<'_> {
                 set_number(&mut arguments, "unavailable", unavailable);
                 set_number(&mut arguments, "protocol", protocol);
                 set_number(&mut arguments, "exhausted", exhausted);
+                set_text(&mut arguments, "admission", admission);
+                set_number(&mut arguments, "not_started", not_started);
                 set_number(&mut arguments, "remaining_decisions", remaining_decisions);
                 set_number(&mut arguments, "remaining_locations", remaining_locations);
             }
@@ -1319,11 +1366,19 @@ impl UiMessage<'_> {
                 unavailable,
                 conflicted,
                 problems,
+                exhausted,
+                admission,
+                not_started,
+                remaining_units,
             } => {
                 set_number(&mut arguments, "partial", partial);
                 set_number(&mut arguments, "unavailable", unavailable);
                 set_number(&mut arguments, "conflicted", conflicted);
                 set_number(&mut arguments, "problems", problems);
+                set_number(&mut arguments, "exhausted", exhausted);
+                set_text(&mut arguments, "admission", admission);
+                set_number(&mut arguments, "not_started", not_started);
+                set_number(&mut arguments, "remaining_units", remaining_units);
             }
             Self::AppAbout
             | Self::CliUiLanguageHelp
@@ -1628,6 +1683,7 @@ mod tests {
             "non_local_volume",
             "non_ntfs_volume",
             "not_found",
+            "not_regular_file",
             "operation_failed",
             "placeholder_projection_failed",
             "profile_not_found",
@@ -1944,6 +2000,9 @@ mod tests {
                 entries: 2,
                 path: "manual.toml",
             },
+            UiMessage::ManualOwnershipExported {
+                path: "ownership.jsonl",
+            },
             UiMessage::ManualChecked {
                 valid: 1,
                 unfilled: 2,
@@ -2017,9 +2076,13 @@ mod tests {
             UiMessage::ResultTranslateStatusValue { status: "complete" },
             UiMessage::ResultTranslateSummary {
                 total: 1,
+                started: 1,
+                not_started: 0,
                 complete: 1,
                 partial: 0,
                 unavailable: 0,
+                failed: 0,
+                cancelled: 0,
                 written: 2,
                 remaining: 0,
             },
@@ -2031,9 +2094,15 @@ mod tests {
             },
             UiMessage::ResultGenericTranslateSummary {
                 total: 1,
+                started: 1,
+                not_started: 0,
                 complete: 2,
                 partial: 3,
                 unavailable: 4,
+                failed: 0,
+                cancelled: 0,
+                planned_units: 11,
+                remaining_units: 12,
                 cleared: 5,
                 reused: 6,
                 accepted: 7,
@@ -2050,6 +2119,8 @@ mod tests {
                 unavailable: 2,
                 protocol: 3,
                 exhausted: 4,
+                admission: "stopped",
+                not_started: 0,
                 remaining_decisions: 5,
                 remaining_locations: 6,
             },
@@ -2058,6 +2129,10 @@ mod tests {
                 unavailable: 2,
                 conflicted: 3,
                 problems: 4,
+                exhausted: 5,
+                admission: "stopped",
+                not_started: 6,
+                remaining_units: 7,
             },
             UiMessage::TranslateIncompleteHelp,
             UiMessage::ResultWriteBackCompleted { project: "demo" },

@@ -26,8 +26,8 @@ use zeroize::Zeroizing;
 
 use super::arguments::{
     ExtractArguments, GenericCommand, GenericInitArguments, InitArguments, ManualArguments,
-    ManualCommand, MvCommand, MzCommand, ProductCommand, ProjectLuaArguments, TranslateArguments,
-    WriteBackArguments,
+    ManualCommand, MvCommand, MzCommand, ProductCommand, ProjectLuaArguments,
+    RpgMakerManualCommand, RpgMakerManualExportArguments, TranslateArguments, WriteBackArguments,
 };
 
 use crate::diagnostic::{
@@ -237,7 +237,7 @@ enum RpgMakerCommandArguments {
     Extract(ExtractArguments),
     Translate(TranslateArguments),
     WriteBack(WriteBackArguments),
-    Manual(ManualCommand),
+    Manual(RpgMakerManualCommand),
     Lua(ProjectLuaArguments),
 }
 
@@ -385,7 +385,7 @@ impl ConfiguredRpgMakerCommand {
                 }))
             }
             RpgMakerCommandArguments::Manual(command) => {
-                Ok(Self::Manual(ConfiguredManualCommand::build(
+                Ok(Self::Manual(ConfiguredManualCommand::build_rpg_maker(
                     configuration_path,
                     source,
                     toml_index.as_ref(),
@@ -440,6 +440,7 @@ pub(crate) struct ConfiguredManualCommand {
     operation: ManualOperation,
     project_name: ProjectName,
     file: PathBuf,
+    ownership_file: Option<PathBuf>,
     common: CommonCommandConfiguration,
     language_modules: Option<LanguageModuleCatalog>,
 }
@@ -475,6 +476,49 @@ impl ConfiguredManualCommand {
         Ok(Self::new(command, common, language_modules))
     }
 
+    fn build_rpg_maker(
+        configuration_path: &Path,
+        source: &str,
+        toml_index: &ConfigurationTomlIndex,
+        command: RpgMakerManualCommand,
+        common: CommonCommandConfiguration,
+    ) -> Result<Self, ConfigurationLoadError> {
+        let language_modules = if matches!(&command, RpgMakerManualCommand::Export(_)) {
+            let raw: RawManualSelection = parse_selected(
+                source,
+                configuration_path,
+                toml_index,
+                ConfigurationSelection::Languages,
+            )?;
+            Some(
+                build_language_modules(raw.languages)
+                    .map_err(ConfigurationLoadError::InvalidValue)?,
+            )
+        } else {
+            let _: RawInitSelection = parse_selected(
+                source,
+                configuration_path,
+                toml_index,
+                ConfigurationSelection::NoAdditionalFields,
+            )?;
+            None
+        };
+        let (operation, arguments, ownership_file) = match command {
+            RpgMakerManualCommand::Export(RpgMakerManualExportArguments { manual, ownership }) => {
+                (ManualOperation::Export, manual, ownership)
+            }
+            RpgMakerManualCommand::Check(arguments) => (ManualOperation::Check, arguments, None),
+            RpgMakerManualCommand::Apply(arguments) => (ManualOperation::Apply, arguments, None),
+        };
+        Ok(Self::from_parts(
+            operation,
+            arguments,
+            ownership_file,
+            common,
+            language_modules,
+        ))
+    }
+
     fn new(
         command: ManualCommand,
         common: CommonCommandConfiguration,
@@ -485,11 +529,22 @@ impl ConfiguredManualCommand {
             ManualCommand::Check(arguments) => (ManualOperation::Check, arguments),
             ManualCommand::Apply(arguments) => (ManualOperation::Apply, arguments),
         };
+        Self::from_parts(operation, arguments, None, common, language_modules)
+    }
+
+    fn from_parts(
+        operation: ManualOperation,
+        arguments: ManualArguments,
+        ownership_file: Option<PathBuf>,
+        common: CommonCommandConfiguration,
+        language_modules: Option<LanguageModuleCatalog>,
+    ) -> Self {
         let ManualArguments { project, file } = arguments;
         Self {
             operation,
             project_name: project.name,
             file,
+            ownership_file,
             common,
             language_modules,
         }
@@ -505,6 +560,10 @@ impl ConfiguredManualCommand {
 
     pub(crate) fn file(&self) -> &Path {
         &self.file
+    }
+
+    pub(crate) fn ownership_file(&self) -> Option<&Path> {
+        self.ownership_file.as_deref()
     }
 
     pub(crate) const fn common(&self) -> &CommonCommandConfiguration {
@@ -1571,6 +1630,7 @@ fn build_llm_client(
                 max_concurrent_requests,
                 connect_timeout,
                 read_timeout,
+                request.max_network_retry_after(),
                 proxy,
             ),
             additional_pem_files,

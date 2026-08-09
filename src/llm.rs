@@ -17,7 +17,7 @@ use serde_json::Value;
 #[cfg(test)]
 use url::{Url, form_urlencoded};
 
-use crate::diagnostic::Diagnostic;
+use crate::diagnostic::{Diagnostic, DiagnosticReport};
 use crate::fingerprint::Sha256Fingerprint;
 
 /// 发送给 LLM 的消息角色。
@@ -116,6 +116,11 @@ pub(crate) enum LlmRequestError<E> {
     },
     /// 认证、无效请求等继续重试无意义的失败。
     Fatal(E),
+    /// 同一运行已经确认必须停止后续模型请求；本工作没有再次调用供应商。
+    AdmissionStopped {
+        service_status: LlmServiceStatus,
+        diagnostic: DiagnosticReport,
+    },
 }
 
 impl<E> fmt::Display for LlmRequestError<E>
@@ -135,6 +140,9 @@ where
                 Ok(())
             }
             Self::Fatal(source) => write!(formatter, "LLM 请求不可恢复地失败：{source}"),
+            Self::AdmissionStopped { .. } => {
+                formatter.write_str("LLM 请求因同一运行已停止后续准入而未发送")
+            }
         }
     }
 }
@@ -146,6 +154,7 @@ where
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Retryable { source, .. } | Self::Fatal(source) => Some(source),
+            Self::AdmissionStopped { .. } => None,
         }
     }
 }
@@ -171,6 +180,12 @@ pub(crate) trait LlmRequestExecutor: Send + Sync {
         source: &Self::Error,
         retry_after: Option<Duration>,
     ) -> Diagnostic;
+
+    /// 用已经公开清理过的类型化事实停止同一执行器的后续请求。
+    fn stop_admission(&self, _service_status: LlmServiceStatus, _diagnostic: &DiagnosticReport) {}
+
+    /// 一个可重试响应已经由调用方确认仍可继续；解除根在响应与决定之间保持的发送门控。
+    fn continue_after_retryable(&self, _service_status: LlmServiceStatus) {}
 }
 
 /// 一个受信 LLM Client 对译文结果有影响的稳定语义身份。
@@ -190,6 +205,37 @@ pub(crate) trait LlmRequestFailure {
     /// 误归类为用户取消。
     fn is_cancelled_wait(&self) -> bool {
         false
+    }
+
+    /// 返回外部服务已经以结构化状态确认的失败类别。
+    ///
+    /// 该事实只来自 HTTP 状态和允许公开的 provider code/type；调用方不得解析
+    /// `Display` 或供应商 message 猜测是否应停止后续请求。
+    fn service_status(&self) -> LlmServiceStatus {
+        LlmServiceStatus::Other
+    }
+}
+
+/// 跨引擎共享的外部模型服务状态。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LlmServiceStatus {
+    Other,
+    RateLimited,
+    PermanentAuthorization,
+    PermanentQuota,
+    PermanentAccount,
+}
+
+impl LlmServiceStatus {
+    pub(crate) const fn stops_admission_after_unavailable(self) -> bool {
+        matches!(self, Self::RateLimited)
+    }
+
+    pub(crate) const fn is_permanent(self) -> bool {
+        matches!(
+            self,
+            Self::PermanentAuthorization | Self::PermanentQuota | Self::PermanentAccount
+        )
     }
 }
 

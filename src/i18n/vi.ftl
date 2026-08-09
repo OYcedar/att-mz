@@ -99,7 +99,7 @@ result-translate-status-value = { $status ->
     [incomplete] chưa đầy đủ
    *[other] __ATT_FALLBACK__
 }
-result-translate-summary = Dịch: { $total } tác vụ; { $complete } hoàn tất, { $partial } một phần, { $unavailable } không khả dụng; đã ghi { $written } vị trí, còn { $remaining }
+result-translate-summary = Dịch: { $total } tác vụ đã lên kế hoạch, { $started } đã bắt đầu, { $not_started } chưa bắt đầu; { $complete } hoàn tất, { $partial } một phần, { $unavailable } không khả dụng, { $failed } thất bại, { $cancelled } đã hủy; đã ghi { $written } vị trí, còn { $remaining }
 result-translate-convergence = Hội tụ trạng thái: giữ { $retained }, vô hiệu { $invalidated }, không áp dụng { $not_applicable }, tái dùng { $reused }
 result-write-back-completed = Ghi lại hoàn tất: { $project }
 result-project-lua-completed = Thực thi Lua dự án hoàn tất: { $project }
@@ -107,13 +107,21 @@ result-output-directory = Thư mục đầu ra: { $path }
 result-write-back-summary = Ghi lại: { $translated } đơn vị dịch, { $original } đơn vị nguồn; tự ngắt { $auto_wrapped }, thêm { $breaks } ngắt dòng và { $indents } thụt đầu dòng toàn chiều rộng; { $manual } cần bố cục thủ công
 result-generic-extract-unchanged = Đầu vào Generic không đổi: { $files } tệp, { $groups } nhóm, { $units } đơn vị
 result-generic-extract-updated = Đã cập nhật đầu vào Generic: { $files } tệp, { $groups } nhóm, { $units } đơn vị; giữ { $preserved } bản dịch và xóa { $cleared }
-result-generic-translate-summary = Dịch Generic: { $total } tác vụ; { $complete } hoàn tất, { $partial } một phần, { $unavailable } không khả dụng; xóa { $cleared }, dùng lại { $reused }, chấp nhận { $accepted }, ghi { $written }, xung đột { $conflicted }, lỗi phản hồi { $problems }
+result-generic-translate-summary = Dịch Generic: { $total } tác vụ đã lên kế hoạch, { $started } đã bắt đầu, { $not_started } chưa bắt đầu; { $complete } hoàn tất, { $partial } một phần, { $unavailable } không khả dụng, { $failed } thất bại, { $cancelled } đã hủy; { $planned_units } Unit đã lên kế hoạch, còn { $remaining_units } Unit, xóa { $cleared }, dùng lại { $reused }, chấp nhận { $accepted }, ghi { $written }, xung đột { $conflicted }, lỗi phản hồi { $problems }
 result-generic-write-back-summary = Ghi lại Generic: { $translated } đơn vị dịch, giữ nguyên { $original } đơn vị nguồn
 result-symbol-repair-summary = Sửa ký hiệu: đã thử { $attempted } đơn vị, sửa { $repaired }, bỏ qua nội bộ { $skipped }, thay { $replacements } ký hiệu
 result-run-log = Nhật ký lần chạy: { $path }
 translate-incomplete-object = Lần chạy Translate của dự án { $project }
-translate-incomplete-rpg-maker-reason = { $partial } tác vụ một phần, { $unavailable } tác vụ không khả dụng, { $protocol } lỗi giao thức và { $exhausted } yêu cầu đã cạn; còn { $remaining_decisions } quyết định và { $remaining_locations } vị trí
-translate-incomplete-generic-reason = { $partial } tác vụ một phần, { $unavailable } tác vụ không khả dụng, { $conflicted } xung đột ghi và { $problems } lỗi phản hồi
+translate-incomplete-rpg-maker-reason = { $partial } tác vụ một phần, { $unavailable } tác vụ không khả dụng, { $not_started } chưa bắt đầu, { $protocol } lỗi giao thức và { $exhausted } yêu cầu đã cạn; nhận yêu cầu {
+    $admission ->
+        [stopped] đã dừng
+       *[open] vẫn mở
+    }; còn { $remaining_decisions } quyết định và { $remaining_locations } vị trí
+translate-incomplete-generic-reason = { $partial } tác vụ một phần, { $unavailable } tác vụ không khả dụng, { $not_started } chưa bắt đầu, { $exhausted } yêu cầu đã cạn; nhận yêu cầu {
+    $admission ->
+        [stopped] đã dừng
+       *[open] vẫn mở
+    }; còn { $remaining_units } Unit, { $conflicted } xung đột ghi và { $problems } lỗi phản hồi
 translate-incomplete-help = Xem chẩn đoán tác vụ trong nhật ký lần chạy này, sửa lỗi có thể lặp lại rồi chạy Translate lần nữa; dùng Manual nếu chỉ còn ít nội dung
 result-cancelled = Lệnh đã bị hủy sau khi hoàn tất an toàn.
 result-plan-saved = Kế hoạch chạy thành công đã được lưu.
@@ -247,6 +255,7 @@ diagnostic-failure-value = { $code ->
     [target_already_exists] Đích đã tồn tại
     [file_identity_changed] Danh tính tệp đã thay đổi trong khi thao tác
     [invalid_path] Đường dẫn không phải đích hợp lệ cho thao tác này
+    [not_regular_file] Đích hiện có không phải là tệp thông thường
     [wrong_publisher_instance] Token phát hành thuộc về một phiên bản bộ phát hành khác
     [journal_corrupt] Nhật ký khôi phục phát hành không hợp lệ hoặc chưa hoàn chỉnh
     [unexpected_artifact] Tạo phẩm hệ thống tệp ngoài dự kiến đang chặn thao tác
@@ -329,6 +338,7 @@ diagnostic-json-position = dòng { $line }, cột { $column }
 diagnostic-placeholder-rule-file = Quy tắc Placeholder { $number } trong { $path }
 diagnostic-placeholder-rule-project = Quy tắc Placeholder { $number } của dự án hiện tại
 manual-exported = Đã xuất { $entries } mục vào { $path }
+manual-ownership-exported = Bản ghi quyền sở hữu: { $path }
 manual-checked = Hợp lệ { $valid }, chưa điền { $unfilled }, lỗi { $errors }
 manual-applied = Đã áp dụng { $applied }, chưa điền { $unfilled }, lỗi { $errors }
 manual-value = { $code ->
@@ -340,6 +350,7 @@ manual-value = { $code ->
     [rerun_export_without_controls] Chạy lại manual export và không đặt ký tự xuống dòng hoặc NUL trong các mục mảng
     [rerun_export_then_fill] Chạy lại manual export rồi điền bản dịch
     [resolve_temporary_then_rerun_export] Xử lý đường dẫn tạm thời cố định được hiển thị, xóa mọi đối tượng còn sót lại rồi chạy lại manual export
+    [resolve_published_backup_cleanup] Cả hai tệp xuất đã có hiệu lực; hãy kiểm tra rồi xóa tệp backup cố định được hiển thị
     [keep_exported_type] Giữ nguyên type do manual export ghi ra
    *[other] __ATT_FALLBACK__
 }

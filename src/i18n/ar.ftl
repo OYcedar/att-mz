@@ -99,7 +99,7 @@ result-translate-status-value = { $status ->
     [incomplete] غير مكتمل
    *[other] __ATT_FALLBACK__
 }
-result-translate-summary = الترجمة: { $total } مهمة؛ مكتملة { $complete }، جزئية { $partial }، غير متاحة { $unavailable }؛ كُتب { $written } موضعًا وتبقى { $remaining }
+result-translate-summary = الترجمة: خُطط لـ { $total } مهمة، وبدأت { $started }، ولم تبدأ { $not_started }؛ مكتملة { $complete }، جزئية { $partial }، غير متاحة { $unavailable }، فاشلة { $failed }، ملغاة { $cancelled }؛ كُتب { $written } موضعًا وتبقى { $remaining }
 result-translate-convergence = تقارب الحالة: أُبقي { $retained }، أُبطل { $invalidated }، غير منطبق { $not_applicable }، أُعيد استخدام { $reused }
 result-write-back-completed = اكتملت الكتابة: { $project }
 result-project-lua-completed = اكتمل تنفيذ Lua للمشروع: { $project }
@@ -107,13 +107,21 @@ result-output-directory = مجلد الإخراج: { $path }
 result-write-back-summary = الكتابة: { $translated } وحدة مترجمة و{ $original } وحدة مصدر؛ التفاف تلقائي { $auto_wrapped }، أضيف { $breaks } فاصل أسطر و{ $indents } إزاحة كاملة العرض؛ يحتاج { $manual } إلى تخطيط يدوي
 result-generic-extract-unchanged = لم تتغير مدخلات Generic: ‏{ $files } ملفًا و{ $groups } مجموعة و{ $units } وحدة
 result-generic-extract-updated = حُدثت مدخلات Generic: ‏{ $files } ملفًا و{ $groups } مجموعة و{ $units } وحدة؛ حُفظت { $preserved } ترجمة ومُسحت { $cleared }
-result-generic-translate-summary = ترجمة Generic: ‏{ $total } مهمة؛ مكتملة { $complete }، جزئية { $partial }، غير متاحة { $unavailable }؛ مُسحت { $cleared }، وأُعيد استخدام { $reused }، وقُبل { $accepted }، وكُتب { $written }، والتعارضات { $conflicted }، ومشكلات الاستجابة { $problems }
+result-generic-translate-summary = ترجمة Generic: خُطط لـ { $total } مهمة، وبدأت { $started }، ولم تبدأ { $not_started }؛ مكتملة { $complete }، جزئية { $partial }، غير متاحة { $unavailable }، فاشلة { $failed }، ملغاة { $cancelled }؛ وحدات مخططة { $planned_units }، ومتبقية { $remaining_units }، ومُسحت { $cleared }، وأُعيد استخدام { $reused }، وقُبل { $accepted }، وكُتب { $written }، والتعارضات { $conflicted }، ومشكلات الاستجابة { $problems }
 result-generic-write-back-summary = كتابة Generic: ‏{ $translated } وحدة مترجمة مع الاحتفاظ بـ { $original } وحدة مصدر
 result-symbol-repair-summary = إصلاح الرموز: فُحصت { $attempted } وحدة، وأُصلحت { $repaired }، وتُخطيت داخليًا { $skipped }، واستُبدل { $replacements } رمزًا
 result-run-log = سجل التشغيل: { $path }
 translate-incomplete-object = تشغيل Translate للمشروع { $project }
-translate-incomplete-rpg-maker-reason = مهام جزئية: { $partial }، وغير متاحة: { $unavailable }، ومشكلات بروتوكول: { $protocol }، وطلبات مستنفدة: { $exhausted }؛ تبقى { $remaining_decisions } قرارات و{ $remaining_locations } مواضع
-translate-incomplete-generic-reason = مهام جزئية: { $partial }، وغير متاحة: { $unavailable }، وتعارضات كتابة: { $conflicted }، ومشكلات استجابة: { $problems }
+translate-incomplete-rpg-maker-reason = مهام جزئية: { $partial }، وغير متاحة: { $unavailable }، ولم تبدأ: { $not_started }، ومشكلات بروتوكول: { $protocol }، وطلبات مستنفدة: { $exhausted }؛ قبول الطلبات {
+    $admission ->
+        [stopped] متوقف
+       *[open] مستمر
+    }؛ تبقى { $remaining_decisions } قرارات و{ $remaining_locations } مواضع
+translate-incomplete-generic-reason = مهام جزئية: { $partial }، وغير متاحة: { $unavailable }، ولم تبدأ: { $not_started }، وطلبات مستنفدة: { $exhausted }؛ قبول الطلبات {
+    $admission ->
+        [stopped] متوقف
+       *[open] مستمر
+    }؛ ووحدات متبقية: { $remaining_units }، وتعارضات كتابة: { $conflicted }، ومشكلات استجابة: { $problems }
 translate-incomplete-help = راجع تشخيصات المهام في سجل هذا التشغيل، وأصلح المشكلات القابلة للتكرار ثم شغّل Translate مجددًا؛ استخدم Manual للباقي القليل
 result-cancelled = أُلغي الأمر بعد إنهاء آمن.
 result-plan-saved = حُفظت خطة التشغيل الناجحة.
@@ -254,6 +262,7 @@ diagnostic-failure-value = { $code ->
     [target_already_exists] الوجهة موجودة بالفعل
     [file_identity_changed] تغيرت هوية الملف أثناء العملية
     [invalid_path] المسار ليس هدفًا صالحًا لهذه العملية
+    [not_regular_file] الهدف الموجود ليس ملفًا عاديًا
     [wrong_publisher_instance] رمز النشر يخص مثيل ناشر آخر
     [journal_corrupt] سجل استرداد النشر غير صالح أو غير مكتمل
     [unexpected_artifact] عنصر غير متوقع في نظام الملفات يمنع العملية
@@ -336,6 +345,7 @@ diagnostic-json-position = السطر { $line }، العمود { $column }
 diagnostic-placeholder-rule-file = قاعدة Placeholder رقم { $number } في { $path }
 diagnostic-placeholder-rule-project = قاعدة Placeholder رقم { $number } في المشروع الحالي
 manual-exported = تم تصدير { $entries } إدخالات إلى { $path }
+manual-ownership-exported = سجلات الملكية: { $path }
 manual-checked = صالح { $valid }، غير مملوء { $unfilled }، أخطاء { $errors }
 manual-applied = طُبّق { $applied }، غير مملوء { $unfilled }، أخطاء { $errors }
 manual-value = { $code ->
@@ -347,6 +357,7 @@ manual-value = { $code ->
     [rerun_export_without_controls] أعد تشغيل manual export ولا تضع أسطرًا جديدة أو NUL في عناصر المصفوفة
     [rerun_export_then_fill] أعد تشغيل manual export ثم املأ الترجمة
     [resolve_temporary_then_rerun_export] عالج المسار المؤقت الثابت المعروض، واحذف أي عنصر متبقٍ فيه، ثم أعد تشغيل manual export
+    [resolve_published_backup_cleanup] تم تطبيق ملفي التصدير؛ تحقّق منهما ثم احذف ملف backup الثابت المعروض
     [keep_exported_type] احتفظ بقيمة type التي كتبها manual export
    *[other] __ATT_FALLBACK__
 }
