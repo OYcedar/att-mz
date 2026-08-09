@@ -441,12 +441,30 @@ def _looks_like_encoded_json(value: str) -> bool:
                 return remainder[index + 1 :].lstrip().startswith(":")
         return False
     if stripped[0] == "[":
-        remainder = stripped[1:].lstrip()
-        return stripped[-1] == "]" and (
-            not remainder
-            or remainder[0] in {'"', "{", "[", "]", "-", "t", "f", "n", "N", "I"}
-            or remainder[0].isdigit()
-        )
+        try:
+            _, end = json.JSONDecoder().raw_decode(stripped)
+        except json.JSONDecodeError:
+            # 玩家文本常用一层或多层方括号作标签，例如
+            # ``[-Gallery-]``、``[13] ...`` 和 ``[[[Before Menu]]]``。
+            # 只有剥去数组起始括号后仍出现明确的 JSON 值起始符，才把
+            # 失败视为损坏的序列化数组；否则保留为普通文本。
+            remainder = stripped
+            while remainder.startswith("["):
+                remainder = remainder[1:].lstrip()
+            if not remainder:
+                return False
+            if remainder[0] in {'"', "{", "]"} or remainder[0].isdigit():
+                return True
+            if remainder[0] == "-" and len(remainder) > 1 and remainder[1].isdigit():
+                return True
+            for literal in ("true", "false", "null", "NaN", "Infinity", "-Infinity"):
+                if not remainder.startswith(literal):
+                    continue
+                following = remainder[len(literal) : len(literal) + 1]
+                return not following or following.isspace() or following in {",", "]", "}"}
+            return False
+        # 完整数组后若还有正文，它是玩家文本中的方括号片段，不是序列化数据。
+        return not stripped[end:].strip()
     return False
 
 

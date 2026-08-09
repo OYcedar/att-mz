@@ -1,12 +1,12 @@
 [[term]]
-term = "ミレア"
-translation = "米蕾娅"
+term = 'ミレア'
+translation = '米蕾娅'
 
 [[term]]
-term = "星読み"
-translation = "观星者"
-triggers = ["星読み", "星を読む者"]
+term = '星読み'
+translation = '观星者'
+triggers = ['星読み', '星を読む者']
 
 [[term]]
-term = "[蒼月団|北支部]"
-translation = "[苍月团|北支部]"
+term = '[蒼月団|北支部]'
+translation = '[苍月团|北支部]'

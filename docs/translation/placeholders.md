@@ -7,7 +7,7 @@ Placeholder 保护控制符、模板标记和其他不能由模型改写的片�
 pattern = '\\SE\[[^]]+\]'
 
 [[rule]]
-scopes = ["dialogue", "choice"]
+scopes = ['dialogue', 'choice']
 pattern = '<msg>(?<text>.*?)</msg>'
 ```
 

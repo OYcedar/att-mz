@@ -2,5 +2,5 @@
 pattern = '\\V\[[0-9]+\]'
 
 [[rule]]
-scopes = ["dialogue"]
+scopes = ['dialogue']
 pattern = '<name>(?<text>.*?)</name>'

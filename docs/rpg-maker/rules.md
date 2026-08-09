@@ -111,7 +111,7 @@ pattern = '\\SE\[[^]]+\]'
 pattern = '\A\\N<(?<speaker>[^>]*)>\z'
 ```
 
-未命名捕获随意使用，命名捕获则只有 `speaker` 一个位置。`pattern = ""` 会在编译边界
+未命名捕获随意使用，命名捕获则只有 `speaker` 一个位置。`pattern = ''` 会在编译边界
 作为空模式错误被拒绝——它不会变成一条到处零宽命中的规则。
 
 ```toml
@@ -205,7 +205,7 @@ Body    ：不由这一行建立
 
 ```toml
 [[rule]]
-file = "QuestEntries.json"
+file = 'QuestEntries.json'
 path = '[].title'
 decode_json = false
 pattern = '\A\[title\](?<text>.+)\z'
@@ -226,8 +226,8 @@ pattern = '\A\[title\](?<text>.+)\z'
 
 ```toml
 [[rule]]
-file = "Actors.json"
-plugin = "QuestWindow"
+file = 'Actors.json'
+plugin = 'QuestWindow'
 path = 'name'
 ```
 
@@ -327,7 +327,7 @@ Map 的规范文件名是 `Map` + 1～4,294,967,295 (`u32::MAX`) 的十进制 ID
 
 ```toml
 [[rule]]
-file = "Map000.json"
+file = 'Map000.json'
 path = 'displayName'
 ```
 
@@ -335,7 +335,7 @@ path = 'displayName'
 
 ```toml
 [[rule]]
-file = "data/QuestEntries.json"
+file = 'data/QuestEntries.json'
 path = 'title'
 ```
 
@@ -358,13 +358,13 @@ json-string   = JSON string token, including its double quotes ;
 
 ```toml
 [[rule]]
-file = "QuestEntries.json"
+file = 'QuestEntries.json'
 path = '[""]'
 ```
 
 ```toml
 [[rule]]
-file = "QuestEntries.json"
+file = 'QuestEntries.json'
 path = ''
 ```
 
@@ -382,7 +382,7 @@ string。
 
 ```toml
 [[rule]]
-file = "QuestEntries.json"
+file = 'QuestEntries.json'
 path = 'payload.entry.title'
 ```
 
@@ -418,7 +418,7 @@ path = 'payload.entry.title'
 
 ```toml
 [[rule]]
-file = "QuestEntries.json"
+file = 'QuestEntries.json'
 path = '[].line'
 pattern = '<t>(?<text>.*?)</t>'
 ```
@@ -522,11 +522,11 @@ owner 内、跨 owner Store 和 WriteBack 发布前使用同一规则。
 
 ```toml
 [[rule]]
-scopes = ["event_dialogue", "event_choices"]
+scopes = ['event_dialogue', 'event_choices']
 pattern = '\\SE\[[^]]+\]'
 
 [[rule]]
-scopes = ["plugin_parameter"]
+scopes = ['plugin_parameter']
 pattern = '<name>(?<text>.*?)</name>'
 ```
 
@@ -628,7 +628,7 @@ UTF-8 字符边界。自定义规则零命中合法。ATT 先求出每条规则�
 
 ```toml
 [[rule]]
-scopes = ["event_dialogue"]
+scopes = ['event_dialogue']
 pattern = '<msg>(?<text>.*?)</msg>'
 ```
 

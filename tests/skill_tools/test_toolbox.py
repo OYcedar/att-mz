@@ -155,7 +155,9 @@ def test_rpg_inventory_and_rule_tools(mv_game: Path, tmp_path: Path) -> None:
         ],
     )
     assert json.loads(dialogue.read_text(encoding="utf-8"))["recognized_prefix_blocks"] == 1
-    assert "(?<speaker>" in dialogue_rules.read_text(encoding="utf-8")
+    assert dialogue_rules.read_text(encoding="utf-8") == (
+        "[[rule]]\npattern = '\\A\\\\N<(?<speaker>[^>]*)>'\n"
+    )
 
     candidates = tmp_path / "extract-candidates.json"
     extract_decisions = tmp_path / "extract-decisions.json"
@@ -185,7 +187,22 @@ def test_rpg_inventory_and_rule_tools(mv_game: Path, tmp_path: Path) -> None:
     )
     candidate_data = json.loads(candidates.read_text(encoding="utf-8"))
     assert any(item["source"].get("plugin") == "QuestPlugin" for item in candidate_data["candidates"])
-    assert extract_rules.read_text(encoding="utf-8").count("[[rule]]") == 3
+    assert (
+        extract_rules.read_text(encoding="utf-8")
+        == """\
+[[rule]]
+file = 'QuestEntries.json'
+path = '[].title'
+
+[[rule]]
+plugin = 'QuestPlugin'
+path = 'entries[].title'
+
+[[rule]]
+code = 356
+parameter = 0
+"""
+    )
 
 
 def test_inventory_tracks_active_plugin_helper_code(mv_game: Path, tmp_path: Path) -> None:
@@ -278,7 +295,13 @@ translation = []
         ],
     )
     assert json.loads(placeholder_candidates.read_text(encoding="utf-8"))["custom_candidates"]
-    assert "event_dialogue" in placeholder_rules.read_text(encoding="utf-8")
+    assert (
+        placeholder_rules.read_text(encoding="utf-8")
+        == r"""[[rule]]
+scopes = ['event_dialogue']
+pattern = '\\TAG\[[^]\r\n]*\]'
+"""
+    )
 
     trace = tmp_path / "trace.json"
     run_script(
@@ -751,7 +774,7 @@ translation = []
         TERM_SCRIPTS / "write_terminology.py",
         ["--input", decisions, "--output", terminology],
     )
-    assert 'translation = "观星者"' in terminology.read_text(encoding="utf-8")
+    assert "translation = '观星者'" in terminology.read_text(encoding="utf-8")
 
     duplicate = run_script(
         TERM_SCRIPTS / "write_terminology.py",
@@ -849,6 +872,8 @@ def test_unicode_paths_empty_plugin_keys_and_toml_escaping(mv_game: Path, tmp_pa
     run_script(TERM_SCRIPTS / "write_terminology.py", ["--input", reviewed, "--output", terminology])
     parsed = tomllib.loads(terminology.read_text(encoding="utf-8"))
     assert parsed["term"][0] == {"term": term, "translation": translation}
+    assert f"term = '{term}'" in terminology.read_text(encoding="utf-8")
+    assert f"translation = '{translation}'" in terminology.read_text(encoding="utf-8")
 
     controlled = output_root / "控制字符.json"
     rejected_output = output_root / "不应建立.toml"
@@ -860,6 +885,24 @@ def test_unicode_paths_empty_plugin_keys_and_toml_escaping(mv_game: Path, tmp_pa
     )
     assert_four_field_error(control_error)
     assert not rejected_output.exists()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [r"\A\\N<(?<speaker>[^>]*)>", '星"\\读', "ordinary text"],
+)
+def test_toml_string_prefers_literal_strings(value: str) -> None:
+    rendered = att_common.toml_string(value)
+    assert rendered == f"'{value}'"
+    assert tomllib.loads(f"value = {rendered}\n")["value"] == value
+
+
+@pytest.mark.parametrize("value", ["O'Brien", "line\nbreak", "bad\x07value", "bad\x7fvalue", "'''"])
+def test_toml_string_uses_lossless_basic_string_when_literal_is_unsafe(value: str) -> None:
+    rendered = att_common.toml_string(value)
+    assert rendered.startswith('"') and rendered.endswith('"')
+    assert "\x7f" not in rendered
+    assert tomllib.loads(f"value = {rendered}\n")["value"] == value
 
 
 def test_formic_abnormal_candidates_and_missing_units(tmp_path: Path) -> None:
@@ -1100,6 +1143,37 @@ call() / maybe / flag;
     ]
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "[-Gallery-] [D]",
+        "[-LATECHANGE-]",
+        "[13] ... [Ignite]",
+        "[[[Before Menu]]]",
+        "[[[After Menu]]]\\[Adj]",
+        "[[[Quest Eval]]]",
+        "[[[Quest Update]]]",
+    ],
+)
+def test_bracketed_player_text_is_not_treated_as_nested_json(value: str) -> None:
+    leaves = list(iter_string_leaves(cast(att_common.JsonValue, value)))
+    assert [(leaf.path, leaf.value, leaf.decoded_layers) for leaf in leaves] == [((), value, 0)]
+
+
+def test_serialized_json_array_is_decoded() -> None:
+    value = '["Gallery", {"label": "Ignite"}]'
+    leaves = list(iter_string_leaves(cast(att_common.JsonValue, value)))
+    assert [(leaf.path, leaf.value, leaf.decoded_layers) for leaf in leaves] == [
+        ((0,), "Gallery", 1),
+        ((1, "label"), "Ignite", 1),
+    ]
+
+
+def test_damaged_serialized_json_array_fails_strictly() -> None:
+    with pytest.raises(att_common.ToolError, match="JSON 语法错误"):
+        list(iter_string_leaves(cast(att_common.JsonValue, '["Gallery",]')))
+
+
 def test_trace_keeps_dynamic_template_expression_evidence(mv_game: Path, tmp_path: Path) -> None:
     (mv_game / "js" / "plugins" / "QuestPlugin.js").write_text(
         'const shown = `${condition ? drawText("extra.txt") : ""}`;\n',
@@ -1276,6 +1350,99 @@ def test_nested_data_is_inventoried_but_not_flattened_into_rules(mv_game: Path, 
     assert {change["path"] for change in report_data["non_text_value_changes"]} == {
         "data/custom/Quest.json.price"
     }
+
+
+def test_noncanonical_invalid_data_json_remains_unresolved(mv_game: Path, tmp_path: Path) -> None:
+    source = mv_game / "data" / "Map001lighting.json"
+    source.write_text("0.5,0.6\n", encoding="utf-8")
+
+    inventory = tmp_path / "invalid-custom-inventory.json"
+    run_script(
+        TRANSLATE_SCRIPTS / "inspect_rpg_maker.py",
+        ["--game", mv_game, "--output", inventory],
+    )
+    inventory_data = json.loads(inventory.read_text(encoding="utf-8"))
+    inventory_fact = next(
+        fact for fact in inventory_data["data_candidates"] if fact["source"] == "data/Map001lighting.json"
+    )
+    assert inventory_fact["kind"] == "unparsed_data_json"
+    assert inventory_fact["candidate_string_count"] is None
+    assert inventory_fact["rules_supported"] is False
+    assert "外层内容无法按 JSON 解析" in inventory_fact["reason"]
+    assert any(fact["source"] == "data/Map001lighting.json" for fact in inventory_data["text_sources"])
+
+    rules = tmp_path / "invalid-custom-rules.json"
+    run_script(
+        TRANSLATE_SCRIPTS / "analyze_extract_rules.py",
+        ["--game", mv_game, "--output", rules],
+    )
+    rule_data = json.loads(rules.read_text(encoding="utf-8"))
+    unsupported = next(
+        fact for fact in rule_data["unsupported_sources"] if fact["source"] == "data/Map001lighting.json"
+    )
+    assert unsupported["kind"] == "unparsed_data_json"
+    assert unsupported["candidate_string_count"] is None
+    assert unsupported["candidate_paths"] == []
+    assert unsupported["rules_supported"] is False
+
+    manual = tmp_path / "invalid-custom-manual.toml"
+    decisions = tmp_path / "invalid-custom-decisions.json"
+    ownership = tmp_path / "invalid-custom-ownership.json"
+    manual.write_text("translation = []\n", encoding="utf-8")
+    write_json(decisions, {"sources": []})
+    run_script(
+        TRANSLATE_SCRIPTS / "audit_text_ownership.py",
+        [
+            "--inventory",
+            inventory,
+            "--manual",
+            manual,
+            "--decisions",
+            decisions,
+            "--output",
+            ownership,
+        ],
+        expected=1,
+    )
+    ownership_data = json.loads(ownership.read_text(encoding="utf-8"))
+    assert ownership_data["complete"] is False
+    assert "data/Map001lighting.json" in ownership_data["unresolved_sources"]
+
+
+@pytest.mark.parametrize("file_name", ["Actors.json", "Map001.json"])
+@pytest.mark.parametrize("script_name", ["inspect_rpg_maker.py", "analyze_extract_rules.py"])
+def test_standard_and_canonical_invalid_data_json_still_fail_strictly(
+    mv_game: Path,
+    tmp_path: Path,
+    script_name: str,
+    file_name: str,
+) -> None:
+    (mv_game / "data" / file_name).write_text("[{\n", encoding="utf-8")
+    output = tmp_path / f"{Path(script_name).stem}-invalid-{file_name}"
+    failed = run_script(
+        TRANSLATE_SCRIPTS / script_name,
+        ["--game", mv_game, "--output", output],
+        expected=1,
+    )
+    assert "JSON 语法错误" in failed.stderr
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("script_name", ["inspect_rpg_maker.py", "analyze_extract_rules.py"])
+def test_damaged_nested_json_in_custom_data_still_fails_strictly(
+    mv_game: Path,
+    tmp_path: Path,
+    script_name: str,
+) -> None:
+    write_json(mv_game / "data" / "Custom.json", {"payload": '["broken",]'})
+    output = tmp_path / f"{Path(script_name).stem}-invalid-nested.json"
+    failed = run_script(
+        TRANSLATE_SCRIPTS / script_name,
+        ["--game", mv_game, "--output", output],
+        expected=1,
+    )
+    assert "JSON 语法错误" in failed.stderr
+    assert not output.exists()
 
 
 @pytest.mark.parametrize(
