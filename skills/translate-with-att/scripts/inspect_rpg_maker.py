@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "_shared"))
 from att_skill_tools import (
     JsonValue,
     ToolArgumentParser,
+    ToolError,
     display_path,
     fail,
     protect_outputs,
@@ -105,9 +106,24 @@ def _builtin_count(path: Path, content_root: Path) -> int:
 def _custom_json_fact(
     path: Path, data_root: Path, content_root: Path, *, canonical_map: bool
 ) -> dict[str, JsonValue]:
-    root = load_data_json(path, content_root)
     top_level = path.parent == data_root.resolve(strict=True)
     standard = top_level and path.name in STANDARD_DATA_FILES
+    relative = path.relative_to(content_root).as_posix()
+    try:
+        root = load_data_json(path, content_root)
+    except ToolError as error:
+        if standard or canonical_map:
+            raise
+        return {
+            "path": relative,
+            "kind": "unparsed_data_json",
+            "candidate_string_count": None,
+            "builtin": False,
+            "rules_supported": False,
+            "reason": f"文件扩展名为 .json，但外层内容无法按 JSON 解析：{error.reason}",
+            "next_check": "确认实际文件格式和活动消费者，并在所有者审计中明确排除或调查其他唯一所有者",
+            "source": relative,
+        }
     if (top_level and path.name == "System.json") or canonical_map:
         if not isinstance(root, dict):
             fail(str(path), "标准 RPG Maker 数据根值不是 object", "修正损坏的标准 data JSON")
@@ -119,7 +135,6 @@ def _custom_json_fact(
         if not is_builtin_data_path(path.name if top_level else "", leaf.path, canonical_map=canonical_map)
         and looks_like_player_text(leaf.value)
     ]
-    relative = path.relative_to(content_root).as_posix()
     rules_supported = top_level and path.suffix == ".json"
     return {
         "path": relative,
@@ -401,7 +416,7 @@ def _inventory(args: argparse.Namespace) -> int:
 
     for fact in other_data:
         count = fact.get("candidate_string_count")
-        if isinstance(count, int) and count > 0:
+        if (isinstance(count, int) and count > 0) or fact.get("kind") == "unparsed_data_json":
             text_sources.append(
                 {
                     "source": str(fact["source"]),

@@ -25,13 +25,13 @@ ATT 从已经确定的术语要求开始，负责读取、校验、匹配、保�
 
 ```toml
 [[term]]
-term = "ミレア"
-translation = "米蕾娅"
+term = 'ミレア'
+translation = '米蕾娅'
 
 [[term]]
-term = "星読み"
-translation = "观星者"
-triggers = ["星読み", "星を読む者"]
+term = '星読み'
+translation = '观星者'
+triggers = ['星読み', '星を読む者']
 ```
 
 每项只允许：
@@ -49,8 +49,8 @@ triggers = ["星読み", "星を読む者"]
 
 ```toml
 [[term]]
-term = "ミレア"
-translation = "米蕾娅"
+term = 'ミレア'
+translation = '米蕾娅'
 triggers = []
 ```
 

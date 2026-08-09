@@ -1,11 +1,11 @@
 [[rule]]
-file = "QuestEntries.json"
+file = 'QuestEntries.json'
 path = '[].title'
 decode_json = false
 pattern = '\A(?<text>.+)\z'
 
 [[rule]]
-plugin = "QuestWindow"
+plugin = 'QuestWindow'
 path = 'entries[].title'
 
 [[rule]]

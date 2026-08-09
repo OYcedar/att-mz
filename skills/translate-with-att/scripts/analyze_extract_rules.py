@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "_shared"))
 from att_skill_tools import (
     JsonValue,
     ToolArgumentParser,
+    ToolError,
     display_path,
     fail,
     protect_outputs,
@@ -28,6 +29,7 @@ from att_skill_tools import (
 )
 from att_toolbox.rpg import (
     BUILTIN_EVENT_CODES,
+    STANDARD_DATA_FILES,
     actual_path,
     canonical_map_files,
     discover_game,
@@ -106,9 +108,27 @@ def _scan_file_candidates(
         (path for path in safe_walk_files(data_root) if path.suffix.lower() == ".json"),
         key=lambda item: item.relative_to(data_root).as_posix().encode("utf-8"),
     ):
-        root = load_data_json(file_path, content_root)
         relative = file_path.relative_to(content_root).as_posix()
-        rules_supported = file_path.parent == resolved_data and file_path.suffix == ".json"
+        top_level = file_path.parent == resolved_data
+        canonical_map = file_path in maps
+        try:
+            root = load_data_json(file_path, content_root)
+        except ToolError as error:
+            if canonical_map or (top_level and file_path.name in STANDARD_DATA_FILES):
+                raise
+            unsupported.append(
+                {
+                    "source": relative,
+                    "kind": "unparsed_data_json",
+                    "candidate_string_count": None,
+                    "candidate_paths": [],
+                    "rules_supported": False,
+                    "reason": f"文件扩展名为 .json，但外层内容无法按 JSON 解析：{error.reason}",
+                    "next_check": "确认实际文件格式和活动消费者，并在所有者审计中明确排除或调查其他唯一所有者",
+                }
+            )
+            continue
+        rules_supported = top_level and file_path.suffix == ".json"
         unsupported_paths: dict[str, int] = {}
         for leaf in iter_string_leaves(root):
             if is_builtin_data_path(

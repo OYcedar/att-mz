@@ -639,7 +639,12 @@ def atomic_write_directory(
 
 
 def toml_string(value: str) -> str:
-    return json.dumps(value, ensure_ascii=False)
+    # TOML 字面字符串不解释反斜杠，适合规则、Placeholder 和术语中的
+    # PCRE2、JSON path 与游戏控制符。含单引号或控制字符时退回 basic
+    # string，避免生成无法无损表示的字面字符串。
+    if "'" not in value and all(character >= " " and character != "\x7f" for character in value):
+        return f"'{value}'"
+    return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007F")
 
 
 def json_type(value: JsonValue) -> str:
