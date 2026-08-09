@@ -1773,6 +1773,7 @@ pub(crate) enum RpgMakerWriteBackLayoutRegion {
     HelpDescription,
 }
 
+#[cfg(test)]
 impl RpgMakerWriteBackLayoutRegion {
     pub(crate) const fn diagnostic_name(self) -> &'static str {
         match self {
@@ -2940,14 +2941,17 @@ impl ManualLayoutDiagnostic {
         Self::new(locations, region, max_fullwidth_chars)
     }
 
+    #[cfg(test)]
     pub(crate) fn locations(&self) -> &[LogicalTextLocation] {
         &self.locations
     }
 
+    #[cfg(test)]
     pub(crate) const fn region_name(&self) -> &'static str {
         self.region.diagnostic_name()
     }
 
+    #[cfg(test)]
     pub(crate) fn max_fullwidth_chars(&self) -> u32 {
         self.max_fullwidth_chars.get()
     }

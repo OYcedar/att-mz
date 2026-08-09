@@ -552,6 +552,59 @@ fn same_named_mv_mz_and_generic_projects_remain_isolated_across_real_processes()
 }
 
 #[test]
+fn rpg_maker_zero_task_translate_uses_confirmed_phase_without_a_fake_percentage() {
+    let temporary = tempfile::tempdir().expect("应可建立 RPG Maker 零任务测试目录");
+    let root = temporary.path();
+    let game = root.join("mz-empty-game");
+    write_minimal_mz_game(&game);
+    fs::write(game.join("data/Items.json"), b"[null]").expect("零任务 Items.json 应可写入");
+    write_rpg_maker_prompt(root);
+    write_configuration(root, "http://127.0.0.1:9/v1/chat/completions");
+
+    assert_success(
+        "MZ 零任务 Init",
+        &run_att(root, init_arguments("mz", &game)),
+    );
+    assert_success(
+        "MZ 零任务 Extract",
+        &run_att(
+            root,
+            arguments(&["mz", "extract", "--name", PROJECT, "--builtin"]),
+        ),
+    );
+    let translate = run_att(
+        root,
+        arguments(&["mz", "translate", "--name", PROJECT, "local"]),
+    );
+    assert_success("MZ 零任务 Translate", &translate);
+
+    assert_plain_progress_lines(
+        &translate.stderr,
+        &[
+            "正在规划翻译任务",
+            "已确认翻译任务: 无需处理",
+            "正在完成必要收尾",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&translate.stderr);
+    assert!(
+        !stderr.contains("0/0") && !stderr.contains("100%"),
+        "零任务不得显示 0/0 或伪造 100%：{stderr}"
+    );
+    assert!(
+        !stderr.contains("无需调用模型"),
+        "无需模型请求属于最终结果，不得作为进度阶段重复呈现：{stderr}"
+    );
+    let stdout = String::from_utf8(translate.stdout).expect("Translate stdout 必须是 UTF-8");
+    let plain_stdout = stdout.replace(['\u{2068}', '\u{2069}'], "");
+    assert!(
+        plain_stdout.contains("状态：无需处理")
+            && plain_stdout.contains("全部翻译单元均为最新状态，本次无需请求模型。"),
+        "最终结果应单独说明零任务且没有发送模型请求：{stdout}"
+    );
+}
+
+#[test]
 fn rpg_maker_write_back_preserves_manual_symbols_for_mv_and_mz() {
     for (engine, game_directory, source_language) in [
         ("mz", "mz-game", "en"),
@@ -634,10 +687,9 @@ fn rpg_maker_write_back_preserves_manual_symbols_for_mv_and_mz() {
             .collect::<Vec<_>>();
         let write_back = run_att(root, arguments(&[engine, "write-back", "--name", PROJECT]));
         assert_success(&format!("{engine} 符号修复 WriteBack"), &write_back);
-        assert!(
-            write_back.stderr.is_empty(),
-            "非 TTY WriteBack 不得输出实时进度：{}",
-            String::from_utf8_lossy(&write_back.stderr)
+        assert_plain_progress_lines(
+            &write_back.stderr,
+            &["正在读取已验收资产", "正在规划文档改写", "正在发布输出"],
         );
         let stdout = String::from_utf8(write_back.stdout).expect("WriteBack stdout 必须是 UTF-8");
         let plain_stdout = stdout.replace(['\u{2068}', '\u{2069}'], "");
@@ -1021,8 +1073,9 @@ fn mz_translate_keeps_applied_translation_when_run_plan_transaction_rolls_back()
     let diagnostic = records[run_plan_diagnostic]["payload"]
         .as_object()
         .expect("RunPlan 诊断 payload 必须是对象");
-    assert_eq!(diagnostic.len(), 3);
-    for field in ["object", "reason", "help"] {
+    assert_eq!(diagnostic.len(), 5);
+    assert_eq!(diagnostic["relation"], "primary");
+    for field in ["object", "reason", "impact", "help"] {
         assert!(
             diagnostic[field]
                 .as_str()
@@ -1435,8 +1488,9 @@ fn mv_source_placeholder_failure_fails_before_database_and_model_side_effects() 
     let payload = diagnostics[0]["payload"]
         .as_object()
         .expect("RunPlan 诊断 payload 必须是对象");
-    assert_eq!(payload.len(), 3);
-    for field in ["object", "reason", "help"] {
+    assert_eq!(payload.len(), 5);
+    assert_eq!(payload["relation"], "primary");
+    for field in ["object", "reason", "impact", "help"] {
         assert!(
             payload[field]
                 .as_str()
@@ -1537,14 +1591,29 @@ fn task_record_write_failure_warns_once_without_changing_translate_success() {
         "任务记录写入失败不得回滚已确认译文"
     );
     let stderr = String::from_utf8(translate.stderr).expect("stderr 必须是 UTF-8");
+    for expected in [
+        "警告：",
+        "task-records",
+        "原因：",
+        "所需对象不存在",
+        "影响：",
+        "业务状态没有修改",
+        "处理办法：",
+        "检查路径、文件系统状态和权限",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "任务记录四字段警告缺少 {expected:?}：{stderr}"
+        );
+    }
     assert_eq!(
-        stderr.matches("翻译任务记录不可用或已降级").count(),
+        stderr.matches("task-records").count(),
         1,
-        "任务记录故障必须恰好警告一次：{stderr}"
+        "任务记录故障必须恰好呈现一次自然路径：{stderr}"
     );
     assert!(
-        stderr.contains("task-records"),
-        "任务记录警告必须包含失败路径：{stderr}"
+        !stderr.contains("翻译任务记录不可用或已降级"),
+        "任务记录故障不得保留旧的一行模糊文案：{stderr}"
     );
     let task_record_failures = fs::read_dir(workspace.join("logs"))
         .expect("项目日志目录应存在")
@@ -1565,18 +1634,26 @@ fn task_record_write_failure_warns_once_without_changing_translate_success() {
         "任务记录故障必须写入 Translate 的同 RunId JSONL"
     );
     assert!(task_record_failures.iter().all(|record| {
+        let Some(payload) = record["payload"].as_object() else {
+            return false;
+        };
         record["context"]["command"] == "translate"
             && record["level"] == "warn"
-            && record["payload"]["object"]
+            && payload.len() == 5
+            && payload["relation"] == "primary"
+            && payload["object"]
                 .as_str()
                 .is_some_and(|value| !value.is_empty())
-            && record["payload"]["reason"]
+            && payload["reason"]
                 .as_str()
                 .is_some_and(|value| !value.is_empty())
-            && record["payload"]["help"]
+            && payload["impact"]
                 .as_str()
                 .is_some_and(|value| !value.is_empty())
-            && record["payload"].get("report").is_none()
+            && payload["help"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+            && payload.get("report").is_none()
     }));
 }
 
@@ -1839,15 +1916,81 @@ fn rules_owner_replaces_writes_back_and_disables_without_touching_builtin() {
     assert_eq!(output_items[1]["customLongName"], RULES_LONG_SOURCE);
 
     write_extract_rules(root, None);
+    let logs = workspace.join("logs");
+    let logs_before = fs::read_dir(&logs)
+        .expect("Rules 停用前日志目录应可读取")
+        .map(|entry| entry.expect("Rules 停用前日志项应可读取").path())
+        .collect::<Vec<_>>();
     let disabled = run_att(
         root,
         arguments(&["mz", "extract", "--name", PROJECT, "--rules", "rules.toml"]),
     );
     assert_success("Rules 显式停用", &disabled);
     let disabled_stdout = String::from_utf8_lossy(&disabled.stdout);
+    let disabled_stderr =
+        String::from_utf8_lossy(&disabled.stderr).replace(['\u{2068}', '\u{2069}'], "");
     assert!(
-        disabled_stdout.contains("已停用 owner") && disabled_stdout.contains("Rules"),
-        "显式空 Rules 必须向操作者说明该 owner 已停用：{disabled_stdout}"
+        !disabled_stdout.contains("已停用 owner")
+            && !disabled_stdout.contains("没有可执行的 Extract owner"),
+        "显式空 Rules 不得保留旧的一行模糊提示：{disabled_stdout}"
+    );
+    for expected in [
+        "警告：",
+        "对象：",
+        "rules.toml",
+        "原因：",
+        "rule = []",
+        "影响：业务结果已经生效，但本次运行方案没有保存",
+        "处理办法：如果这是预期结果，无需处理；否则在指出的文件中添加有效规则并重新运行 Extract",
+    ] {
+        assert!(
+            disabled_stderr.contains(expected),
+            "显式空 Rules 的四字段警告缺少 {expected:?}：{disabled_stderr}"
+        );
+    }
+    let new_logs = fs::read_dir(&logs)
+        .expect("Rules 停用后日志目录应可读取")
+        .map(|entry| entry.expect("Rules 停用后日志项应可读取").path())
+        .filter(|path| !logs_before.contains(path))
+        .collect::<Vec<_>>();
+    assert_eq!(new_logs.len(), 1, "Rules 停用只能新增一份项目日志");
+    let records = read_project_log_records(&new_logs[0]);
+    let diagnostics = records
+        .iter()
+        .filter(|record| record["event"] == "diagnostic.extract")
+        .collect::<Vec<_>>();
+    assert_eq!(diagnostics.len(), 1, "Rules 停用必须写一条 Extract 诊断");
+    let payload = diagnostics[0]["payload"]
+        .as_object()
+        .expect("Rules 停用诊断 payload 必须是对象");
+    assert_eq!(
+        payload
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["help", "impact", "object", "reason", "relation"]
+            .into_iter()
+            .collect(),
+        "Rules 停用诊断只能公开五个可读字段"
+    );
+    assert_eq!(payload["relation"], "primary");
+    assert!(
+        payload["object"]
+            .as_str()
+            .is_some_and(|value| value.contains("rules.toml"))
+    );
+    assert!(
+        payload["reason"]
+            .as_str()
+            .is_some_and(|value| value.contains("rule = []"))
+    );
+    assert_eq!(
+        payload["impact"],
+        "业务结果已经生效，但本次运行方案没有保存"
+    );
+    assert_eq!(
+        payload["help"],
+        "如果这是预期结果，无需处理；否则在指出的文件中添加有效规则并重新运行 Extract"
     );
     assert!(read_owner_units(&database, "rules").is_empty());
     assert_eq!(
@@ -2167,8 +2310,9 @@ fn generic_lua_syntax_failure_is_logged_and_reported_before_project_open() {
     let failure_payload = failure["payload"]
         .as_object()
         .expect("Lua 失败诊断 payload 必须是对象");
-    assert_eq!(failure_payload.len(), 3);
-    for field in ["object", "reason", "help"] {
+    assert_eq!(failure_payload.len(), 5);
+    assert_eq!(failure_payload["relation"], "primary");
+    for field in ["object", "reason", "impact", "help"] {
         assert!(
             failure_payload[field]
                 .as_str()
@@ -2642,6 +2786,29 @@ fn assert_success(stage: &str, output: &Output) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn assert_plain_progress_lines(stderr: &[u8], expected: &[&str]) {
+    let text = String::from_utf8_lossy(stderr);
+    assert!(!text.is_empty(), "进度 stderr 不得为空");
+    assert!(text.ends_with('\n'), "每条进度必须以普通换行结束：{text:?}");
+    assert!(!text.contains('\r'), "进度不得使用回车覆盖：{text:?}");
+    assert!(
+        !text.contains('\u{1b}'),
+        "进度不得包含 ANSI 控制符：{text:?}"
+    );
+    for dynamic_marker in ["[|]", "[/]", "[-]", "[\\]", "[#"] {
+        assert!(
+            !text.contains(dynamic_marker),
+            "进度不得包含 spinner 或进度条标记 {dynamic_marker:?}：{text:?}"
+        );
+    }
+    for expected_text in expected {
+        assert!(
+            text.contains(expected_text),
+            "进度 stderr 缺少 {expected_text:?}：{text}"
+        );
+    }
 }
 
 fn write_configuration(root: &Path, endpoint: &str) {

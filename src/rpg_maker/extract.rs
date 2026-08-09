@@ -59,7 +59,7 @@ pub struct ExtractInput {
 /// Extract 当前正在执行的 owner 或 owner 内部阶段。
 ///
 /// `Builtin` / `Rules` 只表达 owner 的 `i/N`；其余变体拥有
-/// 各自的真实分母或 spinner，避免用一个假全局百分比混合不同工作量。
+/// 各自使用真实分母；尚无分母时只报告阶段名，避免用一个假全局百分比混合不同工作量。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExtractProgressPhase {
     Builtin,
@@ -145,6 +145,7 @@ pub enum RulesCommandNonStringType {
     Object,
 }
 
+#[cfg(test)]
 impl RulesCommandNonStringType {
     pub const fn as_str(self) -> &'static str {
         match self {

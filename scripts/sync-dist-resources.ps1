@@ -164,7 +164,9 @@ function Assert-PlaceholderApiKey {
         [string]$Description
     )
 
-    $content = Get-Content -Raw -LiteralPath $Path
+    # Windows PowerShell 5.1 会用当前 ANSI 代码页读取无 BOM 的 UTF-8，
+    # 可能在校验前把下一行配置误并入乱码注释。
+    $content = Get-Content -Raw -Encoding UTF8 -LiteralPath $Path
     $assignments = @(
         $content -split '\r?\n' |
             Where-Object { $_ -match '^[ \t]*api_key[ \t]*=' }
@@ -174,6 +176,34 @@ function Assert-PlaceholderApiKey {
         $assignments[0] -cnotmatch '^[ \t]*api_key[ \t]*=[ \t]*"replace-with-api-key"[ \t]*(?:#.*)?$'
     ) {
         throw "$Description 必须恰好包含一个固定占位 api_key：$Path"
+    }
+}
+
+function Assert-SkillSourcesContainNoDevelopmentArtifacts {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Root
+    )
+
+    $forbidden = [System.Collections.Generic.List[string]]::new()
+    foreach ($item in Get-ChildItem -LiteralPath $Root -Recurse -Force) {
+        if ($item.PSIsContainer) {
+            if ($item.Name -in @('__pycache__', '.pytest_cache', '.ruff_cache', 'test', 'tests', 'fixtures')) {
+                $forbidden.Add($item.FullName)
+            }
+            continue
+        }
+        if (
+            $item.Extension -in @('.pyc', '.pyo') -or
+            $item.Name -in @('pyproject.toml', 'uv.lock') -or
+            $item.Name -like 'test_*.py' -or
+            $item.Name -like '*_test.py'
+        ) {
+            $forbidden.Add($item.FullName)
+        }
+    }
+    if ($forbidden.Count -gt 0) {
+        throw "Skill 包含不得进入发行物的测试或 Python 开发产物：`n$($forbidden -join "`n")"
     }
 }
 
@@ -282,6 +312,7 @@ Assert-NoReparsePoint -Path $distributionRoot -Recurse
 Assert-PlaceholderApiKey -Path $defaultConfigSource -Description 'ATT 发行配置模板'
 Assert-NoReparsePoint -Path $formicSource -Recurse
 Assert-PlaceholderApiKey -Path $formicDefaultConfigSource -Description 'Formic 发行配置模板'
+Assert-SkillSourcesContainNoDevelopmentArtifacts -Root (Join-Path $repositoryRoot 'skills')
 foreach ($mapping in $fileMappings) {
     Assert-NoReparsePoint -Path $mapping.Source
 }

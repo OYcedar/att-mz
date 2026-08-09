@@ -54,20 +54,13 @@ cli-argument-conflict = { $argument }은(는) 함께 제공된 다른 인수와 
 cli-wrong-number-of-values = { $argument }에 제공된 값의 개수가 올바르지 않습니다.
 cli-invalid-utf8 = 명령줄 인수가 올바른 Unicode가 아닙니다.
 cli-parse-failure = 명령줄을 해석할 수 없습니다.
-error-no-executable-extract-owner = 지운 뒤 실행 가능한 Extract owner가 없어 계획을 저장하지 않았습니다.
 plan-source-explicit = 명시적 입력
 plan-source-project-state = 프로젝트 상태
 plan-source-product-default = 제품 동작
 notice-init-reuse-path = 원본 경로가 없어 마지막 성공 경로를 재사용합니다: { $path }.
 notice-extract-reuse-owners = 추출 범위가 없어 마지막 성공 계획을 재사용합니다: { $owners }.
 notice-translate-reuse-profile = Profile이 없어 마지막 성공 Profile을 재사용합니다: { $profile }.
-notice-owner-disabled = owner { $owner }을 비활성화하고 이후 자동 계획에서 제거했습니다.
-warning-rules-command-non-string-skipped = 경고: Rules 규칙 { $rule_number }에서 문자열이 아닌 command 매개변수 { $skipped_count }개를 건너뛰었습니다(소스 { $source_file }, code={ $command_code }, parameter={ $parameter }, 유형 { $actual_type }).
-warning-manual-layout-required = 경고: { $locations }의 줄바꿈을 수동으로 확인해야 합니다(region={ $region }, max_fullwidth_chars={ $max_fullwidth_chars }).
 notice-no-model-request = 모든 번역 단위가 최신 상태여서 이번 실행에서는 모델 요청을 보내지 않았습니다.
-notice-manual-layout = { $count }개 단위의 줄바꿈을 수동으로 확인해야 합니다.
-notice-log-degraded = 프로젝트 로그를 사용할 수 없거나 성능이 저하되었습니다. 명령은 계속되며 종료 상태는 바뀌지 않습니다.
-notice-task-records-degraded = 번역 작업 기록을 사용할 수 없거나 성능이 저하되었습니다. 명령은 계속되며 종료 상태는 바뀌지 않습니다.
 progress-init-check-project = 프로젝트 상태 확인 중
 progress-init-scan-source = 게임 원본 검색 중
 progress-init-build-candidate = 프로젝트 후보 구성 중
@@ -83,7 +76,7 @@ progress-generic-init = Generic 프로젝트 초기화 중
 progress-generic-extract = Generic JSONL 입력 검색 중
 progress-translate-planning = 번역 작업 계획 중
 progress-translate-confirmed = 확인된 번역 작업
-progress-translate-no-work = 모델 요청이 필요하지 않음
+progress-no-work = 처리할 작업 없음
 progress-project-lua = 프로젝트 Lua 프로그램 실행 중
 progress-write-back-read-assets = 승인된 자산 읽는 중
 progress-write-back-planning = 문서 다시 쓰기 계획 중
@@ -98,7 +91,14 @@ result-init-unchanged = 프로젝트 상태: 변경 없음
 result-init-updated = 프로젝트 상태: 업데이트됨
 result-init-stale-owners = 다시 추출 필요: { $owners }
 result-extract-completed = 추출 완료: { $project }
-result-translate-completed = 번역 완료: { $project }(Profile: { $profile })
+result-translate-completed = 번역 실행 종료: { $project }(Profile: { $profile })
+result-translate-status = 상태: { $status }
+result-translate-status-value = { $status ->
+    [no_work] 처리할 작업 없음
+    [complete] 완료
+    [incomplete] 미완료
+   *[other] __ATT_FALLBACK__
+}
 result-translate-summary = 번역: 작업 { $total }, 완료 { $complete }, 부분 { $partial }, 사용 불가 { $unavailable }; { $written }개 위치 기록, { $remaining }개 남음
 result-translate-convergence = 상태 수렴: 유지 { $retained }, 무효화 { $invalidated }, 해당 없음 { $not_applicable }, 재사용 { $reused }
 result-write-back-completed = 쓰기 완료: { $project }
@@ -110,6 +110,11 @@ result-generic-extract-updated = Generic 입력 갱신: 파일 { $files }개, �
 result-generic-translate-summary = Generic 번역: 작업 { $total }, 완료 { $complete }, 부분 { $partial }, 사용 불가 { $unavailable }; 초기화 { $cleared }, 재사용 { $reused }, 수락 { $accepted }, 기록 { $written }, 충돌 { $conflicted }, 응답 문제 { $problems }
 result-generic-write-back-summary = Generic 쓰기: 번역 { $translated }단위, 원문 유지 { $original }단위
 result-symbol-repair-summary = 기호 복구: { $attempted }개 단위 시도, { $repaired }개 복구, 내부 건너뜀 { $skipped }개, 기호 { $replacements }개 교체
+result-run-log = 실행 기록: { $path }
+translate-incomplete-object = 프로젝트 { $project }의 이번 Translate
+translate-incomplete-rpg-maker-reason = 부분 작업 { $partial }개, 사용 불가 작업 { $unavailable }개, 프로토콜 문제 { $protocol }개, 요청 소진 { $exhausted }개, 남은 결정 { $remaining_decisions }개, 남은 위치 { $remaining_locations }개
+translate-incomplete-generic-reason = 부분 작업 { $partial }개, 사용 불가 작업 { $unavailable }개, 쓰기 충돌 { $conflicted }개, 응답 문제 { $problems }개
+translate-incomplete-help = 이번 실행 기록의 작업 진단을 확인하고 반복 가능한 문제를 수정한 뒤 Translate를 다시 실행하십시오. 남은 항목이 적으면 Manual을 사용할 수 있습니다
 result-cancelled = 안전한 마무리 후 명령을 취소했습니다.
 result-plan-saved = 성공한 실행 계획을 저장했습니다.
 log-run-started = 명령 { $command }이 시작되었습니다.
@@ -157,7 +162,6 @@ log-publication-finished = { $result ->
     [outcome_unknown] 게시의 최종 상태를 알 수 없습니다.
    *[other] 게시가 알 수 없는 결과로 중지되었습니다.
 }
-log-project-log-degraded = 프로젝트 로그에 문제가 발생하여 { $failure_kinds }개 장애 범주를 기록했습니다.
 log-task-outcome-value = { $outcome ->
     [complete] 완료
     [partial] 일부 완료
@@ -167,14 +171,36 @@ log-task-outcome-value = { $outcome ->
     [cancelled] 취소됨
    *[other] 알 수 없는 결과로 종료
 }
-diagnostic-location = 위치: { $subject }
+diagnostic-object = 대상: { $subject }
+diagnostic-error-heading = 오류:
+diagnostic-warning-heading = 경고:
 diagnostic-explanation = 원인: { $reason }
+diagnostic-impact = 영향: { $impact }
 diagnostic-resolution = 조치: { $action }
-diagnostic-related = 관련 오류 { $index }:
+diagnostic-related = { $relation ->
+    [cleanup] 정리 작업도 실패했습니다:
+    [rollback] 롤백도 실패했습니다:
+    [discard] 후보 폐기도 실패했습니다:
+    [finalization] 마무리 작업도 실패했습니다:
+    [shutdown] 종료 작업도 실패했습니다:
+    [observability] 결과 표시 또는 기록도 실패했습니다:
+   *[other] 관련 작업도 실패했습니다:
+}
+diagnostic-impact-value = { $effect ->
+    [unchanged] 업무 상태는 변경되지 않았습니다
+    [progress_preserved] 이전에 확인된 진행 상황은 보존되었으며 표시된 내용은 완료되지 않았습니다
+    [applied] 관련 업무 결과가 이미 적용되었습니다
+    [applied_run_plan_not_saved] 업무 결과는 적용되었지만 이번 실행 계획은 저장되지 않았습니다
+    [applied_finalization_failed] 업무 결과는 적용되었지만 필요한 마무리 작업이 완료되지 않았습니다
+    [recovery_required] 결과는 확인되었지만 표시된 복구 현장을 먼저 처리해야 합니다
+    [outcome_unknown] 이번 작업이 적용되었는지 확인할 수 없습니다. 조치에 따라 복구하기 전에 재시도하거나 현장을 삭제하지 마십시오
+   *[other] __ATT_FALLBACK__
+}
 diagnostic-resolution-value = { $code ->
     [fix_configuration] 표시된 구성 필드를 수정한 후 다시 시도하세요
     [fix_input] 표시된 입력을 수정한 후 다시 시도하세요
     [fix_placeholder_rules] 표시된 Placeholder 규칙을 수정한 후 다시 시도하세요
+    [review_disabled_rules] 의도한 결과라면 조치가 필요 없습니다. 아니라면 지정된 파일에 유효한 규칙을 추가하고 Extract를 다시 실행하세요
     [adjust_manual_layout] 표시된 위치와 표시 너비에 맞게 줄바꿈과 레이아웃을 수동으로 조정하세요
     [check_path_and_permissions] 경로, 파일 시스템 상태 및 권한을 확인하세요
     [check_project_state] 프로젝트 상태를 확인하고 수정한 후 다시 시도하세요
@@ -192,6 +218,7 @@ diagnostic-failure-value = { $code ->
     [invalid_syntax] 값의 구문이 잘못되었습니다
     [invalid_encoding] 텍스트 인코딩이 잘못되었습니다
     [invalid_value] 값이 필수 계약을 위반합니다
+    [rules_owner_disabled] 선택한 Rules 파일이 rule = []을 사용합니다. Rules가 비활성화되었고 추출된 자산이 삭제되었습니다
     [not_found] 필요한 객체가 없습니다
     [state_mismatch] 저장된 프로젝트 상태가 이 작업의 요구 사항을 충족하지 않습니다
     [unsupported_windows_code_page] Windows 코드 페이지가 UTF-8이 아닙니다
@@ -205,6 +232,10 @@ diagnostic-failure-value = { $code ->
     [concurrent_shutdown] 다른 호출자가 실행기를 종료하고 있습니다
     [executor_state_poisoned] 실행기 수명 주기 상태가 손상되었습니다
     [worker_spawn_failed] 운영 체제가 작업자 스레드를 만들 수 없습니다
+    [stdout_write_failed] 표준 출력에 쓰지 못했습니다
+    [stderr_write_failed] 표준 오류에 쓰지 못했습니다
+    [stdout_flush_failed] 표준 출력을 플러시하지 못했습니다
+    [stderr_flush_failed] 표준 오류를 플러시하지 못했습니다
     [worker_channel_closed] 마무리가 끝나기 전에 작업자 명령 채널이 닫혔습니다
     [worker_panicked] 작업자가 예기치 않게 종료되었습니다
     [reparse_point_forbidden] 경로에 신뢰할 수 없는 재분석 지점이 있습니다
@@ -299,7 +330,6 @@ diagnostic-placeholder-rule-project = 현재 프로젝트의 Placeholder 규칙 
 manual-exported = { $entries }개 항목을 { $path }에 내보냈습니다
 manual-checked = 유효 { $valid }, 미입력 { $unfilled }, 오류 { $errors }
 manual-applied = 적용 { $applied }, 미입력 { $unfilled }, 오류 { $errors }
-manual-issue = { $object }: { $reason }; { $help }.
 manual-value = { $code ->
     [invalid_source_line] source의 { $line }번째 항목에 줄바꿈 또는 NUL이 있습니다
     [invalid_translation_line] translation의 { $line }번째 항목에 줄바꿈 또는 NUL이 있습니다

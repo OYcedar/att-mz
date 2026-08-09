@@ -39,7 +39,7 @@ timestamp, sequence, run_id, level, event, context, payload, message
 - `publication.started`、`publication.finished`；
 - `lua.print`；
 - `diagnostic.*`；
-- `observability.project_log_degraded`、`performance.counters`。
+- `performance.counters`。
 
 普通事件只描述已经确认的事实。阶段实际完成后才能写 `phase.completed`；失败或取消使用
 `phase.stopped`。首个取消信号只写一次，最终结果只由唯一且最后的 `run.finished` 表达。
@@ -66,22 +66,26 @@ diagnostic.project_log
 
 ```json
 {
+  "relation": "primary",
   "object": "story.jsonl:line3:unit2:text",
   "reason": "译文没有保留原文中的 Placeholder",
+  "impact": "此前确认的进度仍然保留；指出的内容没有完成",
   "help": "保留原文中的控制码和 Placeholder，并保持必要顺序"
 }
 ```
 
-`object` 使用自然路径、可读 ID、项目数据库或命令对象；`reason` 说明直接原因；`help` 说明
-修改方法。三项都必须是非空、经过安全处理的单行文本。
+`relation` 取 `primary`、`cleanup`、`rollback`、`discard`、`finalization`、`shutdown` 或
+`observability`；`object` 使用自然路径、可读 ID、项目数据库或命令对象；`reason` 说明
+直接原因；`impact` 说明业务状态是否未改、进度保留、已经生效、需要恢复或结果未知；
+`help` 说明修改方法。五项都必须是非空、经过安全处理的单行文本。
 
-诊断 payload 不保存 `report`、`effect`、`stage`、`issue`、`resolution`、relation、内部状态
+诊断 payload 不保存 `report`、`effect`、`stage`、`issue`、`resolution`、内部状态
 code、数据库行、owner、group location、unit role、编码位置、SQLite 查询 ID/code、原始
 供应商请求 ID 或 expected/actual fingerprint。主错误与清理错误需要分别处理时，分别写成
-各自可读的问题，不把递归内部报告倾倒给使用者。
+各自可读的问题并保存实际 relation，不把递归内部报告倾倒给使用者。
 
 终态事件只保存本次操作的结果和必要汇总，不引用诊断 ID，也不复制一份泛化错误。使用者
-按同一 RunId 中相邻的 `diagnostic.*` 读取具体对象、原因和修改方法。
+按同一 RunId 中相邻的 `diagnostic.*` 读取具体关系、对象、原因、影响和处理办法。
 
 ## 4. Translate 与任务汇总
 
@@ -123,23 +127,32 @@ panic 在仍持有运行上下文的边界转换为安全诊断，不保存 pani
 
 ## 6. 写入、降级与关闭
 
-所有事件进入一个 FIFO 和单 writer。必要事件直接进入；高频进度事件使用固定在途窗口，
-压力满时只累计实际丢失数量，不阻塞业务线程，也不限制项目事件总量。
+所有事件进入一个 FIFO 和单 writer。必要事件直接进入；普通阶段和性能事件使用既有在途
+窗口，压力满时只累计实际丢失数量，不阻塞业务线程，也不限制项目事件总量。终端整数百分比
+只用于实时呈现，不逐行写入项目 JSONL；项目日志仍保存阶段开始、完成、停止和最终结果。
 
-日志建立、序列化、写入、flush、sync、channel 或 writer 故障分别累计。第一条 write 失败
-后停止继续建立 JSON，排空队列并统计未持久化事件。writer 健康时，正常关闭依次完成：
+日志建立、序列化、写入、flush、sync、channel 或 writer 故障分别累计。同一故障键只写一条
+`diagnostic.project_log`，累计次数进入该诊断的具体原因；不得另写只有故障种类或数量的模糊
+降级摘要。第一条 write 失败后停止继续建立 JSON，排空队列并统计未持久化事件；writer 已经
+不可用时，无法写入自身日志的故障仍通过同一类型化事实呈现到 stderr。writer 健康时，正常关闭
+依次完成：
 
 1. 关闭生产者并排空已接收事件；
-2. 写日志降级汇总；
+2. 按自然顺序逐项写日志故障诊断；
 3. 写性能计数；
 4. 写尚未持久化的终端诊断；
 5. 写唯一且最后的 `run.finished`；
 6. flush；
 7. sync。
 
-日志无法建立时不要求日志记录自身失败，stderr 必须显示对象、原因和修改方法。日志故障不
+日志无法建立时不要求日志记录自身失败，stderr 必须显示对象、原因、影响和处理办法。日志故障不
 改变业务结果、数据库状态或业务退出语义；只有警告或终态本身无法通过 stdout/stderr、
 worker 或 channel 呈现时，才成为独立进程呈现失败。
+
+最终业务正文与诊断的首次 stdout/stderr 写入和 flush 发生在项目日志关闭前；当时已经确认的
+呈现失败作为本次终态诊断保存。项目日志关闭后，只允许把尚未确认的完整正文、该失败诊断和
+最终日志警告作为一个批次向健康的相反流回退一次；回退本身失败不再重入日志收尾或派生无限
+诊断。
 
 ## 7. 模型任务记录
 

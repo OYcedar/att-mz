@@ -86,7 +86,9 @@ NotCommittedAfterEarlierFailure 或 Cancelled；Partial、Unavailable 与 Failed
 不伪造当前 Task 的新错误。每次命令恰好写
 一条 `translation.finished`：NotStarted、NoWork、Complete、Incomplete、Failed 或
 Cancelled。含 Partial 或 Unavailable 任务但业务结果明确时，Translate 结果是 Incomplete，
-退出码仍为 `0`；完整翻译目标尚未达成。
+退出码仍为 `0`；完整翻译目标尚未达成。CLI 明确显示 `状态：未完整`，并在 stderr 汇总
+Partial、Unavailable、协议问题、可恢复请求耗尽、剩余决策和剩余位置；逐任务详情保留在
+本次项目日志与任务记录。NoWork 和 Complete 分别显示 `无需处理` 与 `完整`。
 
 `translation.finished` 固定保存完整 Task 计数，并保存 RPG Maker 专用的 accepted decisions、
 written/remaining locations、remaining decisions、protocol diagnostics、recoverable request

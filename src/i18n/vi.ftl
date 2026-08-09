@@ -54,20 +54,13 @@ cli-argument-conflict = Không thể dùng { $argument } cùng các đối số 
 cli-wrong-number-of-values = Số lượng giá trị cho { $argument } không đúng.
 cli-invalid-utf8 = Một đối số dòng lệnh không phải Unicode hợp lệ.
 cli-parse-failure = Không thể phân tích dòng lệnh.
-error-no-executable-extract-owner = Sau khi xóa không còn owner Extract có thể chạy, vì vậy kế hoạch không được lưu.
 plan-source-explicit = đầu vào chỉ định
 plan-source-project-state = trạng thái dự án
 plan-source-product-default = hành vi sản phẩm
 notice-init-reuse-path = Không có đường dẫn nguồn; đang dùng lại đường dẫn thành công gần nhất: { $path }.
 notice-extract-reuse-owners = Không có phạm vi trích xuất; đang dùng lại kế hoạch thành công gần nhất: { $owners }.
 notice-translate-reuse-profile = Không có Profile; đang dùng lại Profile thành công gần nhất: { $profile }.
-notice-owner-disabled = Owner { $owner } đã bị tắt và xóa khỏi các kế hoạch tự động sau này.
-warning-rules-command-non-string-skipped = Cảnh báo: quy tắc Rules { $rule_number } đã bỏ qua { $skipped_count } tham số command không phải chuỗi (nguồn { $source_file }, code={ $command_code }, parameter={ $parameter }, kiểu { $actual_type }).
-warning-manual-layout-required = Cảnh báo: cần kiểm tra ngắt dòng thủ công tại { $locations } (region={ $region }, max_fullwidth_chars={ $max_fullwidth_chars }).
 notice-no-model-request = Mọi đơn vị dịch đều mới nhất; lần chạy này không cần gửi yêu cầu nào đến mô hình.
-notice-manual-layout = Có { $count } đơn vị cần kiểm tra ngắt dòng thủ công.
-notice-log-degraded = Nhật ký dự án không khả dụng hoặc suy giảm; lệnh vẫn tiếp tục và trạng thái thoát không đổi.
-notice-task-records-degraded = Bản ghi tác vụ dịch không khả dụng hoặc suy giảm; lệnh vẫn tiếp tục và trạng thái thoát không đổi.
 progress-init-check-project = Đang kiểm tra trạng thái dự án
 progress-init-scan-source = Đang quét nguồn trò chơi
 progress-init-build-candidate = Đang dựng ứng viên dự án
@@ -83,7 +76,7 @@ progress-generic-init = Đang khởi tạo dự án Generic
 progress-generic-extract = Đang quét đầu vào Generic JSONL
 progress-translate-planning = Đang lập kế hoạch tác vụ dịch
 progress-translate-confirmed = Tác vụ dịch đã xác nhận
-progress-translate-no-work = Không cần gọi mô hình
+progress-no-work = Không có nội dung cần xử lý
 progress-project-lua = Đang chạy chương trình Lua của dự án
 progress-write-back-read-assets = Đang đọc tài sản đã duyệt
 progress-write-back-planning = Đang lập kế hoạch viết lại tài liệu
@@ -98,7 +91,14 @@ result-init-unchanged = Trạng thái dự án: không đổi
 result-init-updated = Trạng thái dự án: đã cập nhật
 result-init-stale-owners = Cần trích xuất lại: { $owners }
 result-extract-completed = Trích xuất hoàn tất: { $project }
-result-translate-completed = Dịch hoàn tất: { $project } (Profile: { $profile })
+result-translate-completed = Lần chạy dịch đã kết thúc: { $project } (Profile: { $profile })
+result-translate-status = Trạng thái: { $status }
+result-translate-status-value = { $status ->
+    [no_work] không cần xử lý
+    [complete] đầy đủ
+    [incomplete] chưa đầy đủ
+   *[other] __ATT_FALLBACK__
+}
 result-translate-summary = Dịch: { $total } tác vụ; { $complete } hoàn tất, { $partial } một phần, { $unavailable } không khả dụng; đã ghi { $written } vị trí, còn { $remaining }
 result-translate-convergence = Hội tụ trạng thái: giữ { $retained }, vô hiệu { $invalidated }, không áp dụng { $not_applicable }, tái dùng { $reused }
 result-write-back-completed = Ghi lại hoàn tất: { $project }
@@ -110,6 +110,11 @@ result-generic-extract-updated = Đã cập nhật đầu vào Generic: { $files
 result-generic-translate-summary = Dịch Generic: { $total } tác vụ; { $complete } hoàn tất, { $partial } một phần, { $unavailable } không khả dụng; xóa { $cleared }, dùng lại { $reused }, chấp nhận { $accepted }, ghi { $written }, xung đột { $conflicted }, lỗi phản hồi { $problems }
 result-generic-write-back-summary = Ghi lại Generic: { $translated } đơn vị dịch, giữ nguyên { $original } đơn vị nguồn
 result-symbol-repair-summary = Sửa ký hiệu: đã thử { $attempted } đơn vị, sửa { $repaired }, bỏ qua nội bộ { $skipped }, thay { $replacements } ký hiệu
+result-run-log = Nhật ký lần chạy: { $path }
+translate-incomplete-object = Lần chạy Translate của dự án { $project }
+translate-incomplete-rpg-maker-reason = { $partial } tác vụ một phần, { $unavailable } tác vụ không khả dụng, { $protocol } lỗi giao thức và { $exhausted } yêu cầu đã cạn; còn { $remaining_decisions } quyết định và { $remaining_locations } vị trí
+translate-incomplete-generic-reason = { $partial } tác vụ một phần, { $unavailable } tác vụ không khả dụng, { $conflicted } xung đột ghi và { $problems } lỗi phản hồi
+translate-incomplete-help = Xem chẩn đoán tác vụ trong nhật ký lần chạy này, sửa lỗi có thể lặp lại rồi chạy Translate lần nữa; dùng Manual nếu chỉ còn ít nội dung
 result-cancelled = Lệnh đã bị hủy sau khi hoàn tất an toàn.
 result-plan-saved = Kế hoạch chạy thành công đã được lưu.
 log-run-started = Lệnh { $command } đã bắt đầu.
@@ -157,7 +162,6 @@ log-publication-finished = { $result ->
     [outcome_unknown] Chưa biết trạng thái cuối của việc xuất bản.
    *[other] Xuất bản dừng với kết quả không xác định.
 }
-log-project-log-degraded = Nhật ký dự án gặp sự cố; đã ghi nhận { $failure_kinds } nhóm lỗi.
 log-task-outcome-value = { $outcome ->
     [complete] hoàn tất
     [partial] hoàn tất một phần
@@ -167,14 +171,36 @@ log-task-outcome-value = { $outcome ->
     [cancelled] đã hủy
    *[other] kết thúc với kết quả không xác định
 }
-diagnostic-location = Vị trí: { $subject }
+diagnostic-object = Đối tượng: { $subject }
+diagnostic-error-heading = Lỗi:
+diagnostic-warning-heading = Cảnh báo:
 diagnostic-explanation = Nguyên nhân: { $reason }
+diagnostic-impact = Ảnh hưởng: { $impact }
 diagnostic-resolution = Cách xử lý: { $action }
-diagnostic-related = Lỗi liên quan { $index }:
+diagnostic-related = { $relation ->
+    [cleanup] Việc dọn dẹp cũng thất bại:
+    [rollback] Việc hoàn tác cũng thất bại:
+    [discard] Việc loại bỏ bản ứng viên cũng thất bại:
+    [finalization] Việc hoàn tất cũng thất bại:
+    [shutdown] Việc đóng cũng thất bại:
+    [observability] Việc hiển thị hoặc ghi kết quả cũng thất bại:
+   *[other] Một thao tác liên quan cũng thất bại:
+}
+diagnostic-impact-value = { $effect ->
+    [unchanged] Trạng thái nghiệp vụ không thay đổi
+    [progress_preserved] Tiến độ đã xác nhận trước đó được giữ lại; nội dung được chỉ ra chưa hoàn tất
+    [applied] Kết quả nghiệp vụ liên quan đã có hiệu lực
+    [applied_run_plan_not_saved] Kết quả nghiệp vụ đã có hiệu lực nhưng kế hoạch lần chạy này chưa được lưu
+    [applied_finalization_failed] Kết quả nghiệp vụ đã có hiệu lực nhưng bước hoàn tất bắt buộc chưa xong
+    [recovery_required] Kết quả đã rõ nhưng phải xử lý vị trí khôi phục được chỉ ra trước
+    [outcome_unknown] Không thể xác nhận thao tác đã có hiệu lực hay chưa; đừng thử lại hoặc xóa hiện trường khôi phục trước khi làm theo cách xử lý
+   *[other] __ATT_FALLBACK__
+}
 diagnostic-resolution-value = { $code ->
     [fix_configuration] Sửa trường cấu hình được nêu rồi thử lại
     [fix_input] Sửa dữ liệu đầu vào được nêu rồi thử lại
     [fix_placeholder_rules] Sửa quy tắc Placeholder được nêu rồi thử lại
+    [review_disabled_rules] Nếu đây là kết quả mong đợi thì không cần xử lý; nếu không, hãy thêm quy tắc hợp lệ vào tệp được chỉ ra rồi chạy lại Extract
     [adjust_manual_layout] Điều chỉnh thủ công ngắt dòng và bố cục tại các vị trí đã nêu theo chiều rộng hiển thị được chỉ định
     [check_path_and_permissions] Kiểm tra đường dẫn, trạng thái hệ thống tệp và quyền
     [check_project_state] Kiểm tra và sửa trạng thái dự án rồi thử lại
@@ -192,6 +218,7 @@ diagnostic-failure-value = { $code ->
     [invalid_syntax] Cú pháp của giá trị không hợp lệ
     [invalid_encoding] Mã hóa văn bản không hợp lệ
     [invalid_value] Giá trị vi phạm hợp đồng bắt buộc
+    [rules_owner_disabled] Tệp Rules đã chọn dùng rule = []; Rules đã bị tắt và các tài nguyên trích xuất của nó đã bị xóa
     [not_found] Đối tượng bắt buộc không tồn tại
     [state_mismatch] Trạng thái dự án đã lưu không đáp ứng thao tác này
     [unsupported_windows_code_page] Bảng mã Windows không phải UTF-8
@@ -205,6 +232,10 @@ diagnostic-failure-value = { $code ->
     [concurrent_shutdown] Một bên gọi khác đang đóng bộ thực thi
     [executor_state_poisoned] Trạng thái vòng đời của bộ thực thi đã bị hỏng
     [worker_spawn_failed] Hệ điều hành không thể tạo luồng worker
+    [stdout_write_failed] Không thể ghi vào đầu ra chuẩn
+    [stderr_write_failed] Không thể ghi vào đầu ra lỗi chuẩn
+    [stdout_flush_failed] Không thể xả đầu ra chuẩn
+    [stderr_flush_failed] Không thể xả đầu ra lỗi chuẩn
     [worker_channel_closed] Kênh lệnh worker đã đóng trước khi hoàn tất
     [worker_panicked] Một worker kết thúc ngoài dự kiến
     [reparse_point_forbidden] Đường dẫn chứa điểm phân tích lại không đáng tin cậy
@@ -299,7 +330,6 @@ diagnostic-placeholder-rule-project = Quy tắc Placeholder { $number } của d�
 manual-exported = Đã xuất { $entries } mục vào { $path }
 manual-checked = Hợp lệ { $valid }, chưa điền { $unfilled }, lỗi { $errors }
 manual-applied = Đã áp dụng { $applied }, chưa điền { $unfilled }, lỗi { $errors }
-manual-issue = { $object }: { $reason }; { $help }.
 manual-value = { $code ->
     [invalid_source_line] mục source { $line } chứa ký tự xuống dòng hoặc NUL
     [invalid_translation_line] mục translation { $line } chứa ký tự xuống dòng hoặc NUL

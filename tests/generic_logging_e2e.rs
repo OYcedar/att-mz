@@ -208,11 +208,12 @@ fn generic_extract_succeeds_when_project_log_cannot_be_created_and_reports_reada
     let canonical_logs_root = logs_root
         .canonicalize()
         .expect("阻止日志建立的文件路径必须可规范化");
-    let expected_location = format!("Location: {}", readable_windows_path(&canonical_logs_root));
+    let expected_location = format!("Object: {}", readable_windows_path(&canonical_logs_root));
     for expected in [
-        "Project logging is unavailable or degraded",
+        "Warning:",
         expected_location.as_str(),
         "Reason: The target object already exists",
+        "Impact: Business state was not changed",
         "Action: Check the path, filesystem state, and permissions",
     ] {
         assert!(
@@ -227,7 +228,7 @@ fn generic_extract_succeeds_when_project_log_cannot_be_created_and_reports_reada
         "operation=",
         "io_kind=",
         "raw_os_code=",
-        "Impact:",
+        "Project logging is unavailable or degraded",
     ] {
         assert!(
             !stderr.contains(forbidden),
@@ -408,8 +409,10 @@ fn generic_fixed_http_503_is_unavailable_and_preserves_the_structured_status() {
     assert_eq!(
         diagnostic["payload"],
         serde_json::json!({
+            "relation": "primary",
             "object": format!("http://127.0.0.1:{endpoint_port}"),
             "reason": "The external service rejected the request (HTTP status 503; Provider code: service_unavailable; Provider type: server_error; Provider message: temporarily unavailable)",
+            "impact": "Previously confirmed progress was preserved; the indicated content was not completed",
             "help": "Check the model service response and account limits",
         }),
         "HTTP 503 必须保留可读对象、状态和安全的服务端原因：{log}"
@@ -1474,7 +1477,7 @@ fn assert_log_has_only_readable_diagnostics(log: &str, records: &[serde_json::Va
             .expect("诊断 payload 必须是对象");
         let mut fields = payload.keys().map(String::as_str).collect::<Vec<_>>();
         fields.sort_unstable();
-        assert_eq!(fields, ["help", "object", "reason"]);
+        assert_eq!(fields, ["help", "impact", "object", "reason", "relation"]);
         for field in fields {
             assert!(
                 payload[field]

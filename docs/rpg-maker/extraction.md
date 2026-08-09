@@ -22,6 +22,10 @@ Extract 的执行者是 Builtin 与 Rules 两类能力，Lua 不在其中。
 - MV `rule = []` 的 dialogue rules 只清空姓名投影定义；
 - 清理后没有可执行 owner 时，保存方案为空，下次无参数 Extract 会明确失败。
 
+显式 `rule = []` 成功生效时，stdout 只保留 Extract 业务摘要；stderr 使用统一四字段警告
+说明规则文件、Rules 已停用、资产已删除，以及运行方案是否仍有可执行 owner。同一事实写入
+`diagnostic.extract`；不再另写一行 owner 停用或空方案提示。
+
 各 owner 的提交彼此独立：Builtin 成功而后续 Rules 失败时，Builtin 的新结果落库，
 旧 Rules 快照保持。
 

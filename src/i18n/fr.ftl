@@ -54,23 +54,13 @@ cli-argument-conflict = { $argument } ne peut pas être utilisé avec les autres
 cli-wrong-number-of-values = Le nombre de valeurs fourni pour { $argument } est incorrect.
 cli-invalid-utf8 = Un argument de ligne de commande n’est pas un Unicode valide.
 cli-parse-failure = La ligne de commande n’a pas pu être analysée.
-error-no-executable-extract-owner = Après l’effacement, aucun owner Extract n’est exécutable ; le plan n’a donc pas été enregistré.
 plan-source-explicit = entrée explicite
 plan-source-project-state = état du projet
 plan-source-product-default = comportement du produit
 notice-init-reuse-path = Aucun chemin source fourni ; réutilisation du dernier chemin réussi : { $path }.
 notice-extract-reuse-owners = Aucune portée d’extraction fournie ; réutilisation du dernier plan réussi : { $owners }.
 notice-translate-reuse-profile = Aucun Profile fourni ; réutilisation du dernier Profile réussi : { $profile }.
-notice-owner-disabled = L’owner { $owner } a été désactivé et retiré des futurs plans automatiques.
-warning-rules-command-non-string-skipped = Avertissement : la règle Rules { $rule_number } a ignoré { $skipped_count } paramètres command qui ne sont pas des chaînes (source { $source_file }, code={ $command_code }, parameter={ $parameter }, type={ $actual_type }).
-warning-manual-layout-required = Avertissement : vérifiez manuellement les sauts de ligne à { $locations } (region={ $region }, max_fullwidth_chars={ $max_fullwidth_chars }).
 notice-no-model-request = Toutes les unités de traduction sont à jour ; cette exécution n’a envoyé aucune requête au modèle.
-notice-manual-layout = { $count ->
-    [one] 1 unité nécessite une vérification manuelle des sauts de ligne.
-   *[other] { $count } unités nécessitent une vérification manuelle des sauts de ligne.
-}
-notice-log-degraded = La journalisation du projet est indisponible ou dégradée ; la commande continue et son code de sortie ne change pas.
-notice-task-records-degraded = Les enregistrements des tâches de traduction sont indisponibles ou dégradés ; la commande continue et son code de sortie ne change pas.
 progress-init-check-project = Vérification de l’état du projet
 progress-init-scan-source = Analyse de la source du jeu
 progress-init-build-candidate = Construction du projet candidat
@@ -86,7 +76,7 @@ progress-generic-init = Initialisation du projet Generic
 progress-generic-extract = Analyse de l’entrée JSONL Generic
 progress-translate-planning = Planification des tâches de traduction
 progress-translate-confirmed = Tâches de traduction confirmées
-progress-translate-no-work = Aucun appel au modèle nécessaire
+progress-no-work = Aucun traitement nécessaire
 progress-project-lua = Exécution du programme Lua du projet
 progress-write-back-read-assets = Lecture des ressources validées
 progress-write-back-planning = Planification de la réécriture des documents
@@ -101,7 +91,14 @@ result-init-unchanged = État du projet : inchangé
 result-init-updated = État du projet : mis à jour
 result-init-stale-owners = Nouvelle extraction requise : { $owners }
 result-extract-completed = Extraction terminée : { $project }
-result-translate-completed = Traduction terminée : { $project } (Profile : { $profile })
+result-translate-completed = Exécution de traduction terminée : { $project } (Profile : { $profile })
+result-translate-status = État : { $status }
+result-translate-status-value = { $status ->
+    [no_work] aucun traitement nécessaire
+    [complete] complet
+    [incomplete] incomplet
+   *[other] __ATT_FALLBACK__
+}
 result-translate-summary = Traduction : { $total } tâches ; { $complete } complètes, { $partial } partielles, { $unavailable } indisponibles ; { $written } emplacements écrits, { $remaining } restants
 result-translate-convergence = Convergence : { $retained } conservés, { $invalidated } invalidés, { $not_applicable } non applicables, { $reused } réutilisés
 result-write-back-completed = Réécriture terminée : { $project }
@@ -113,6 +110,11 @@ result-generic-extract-updated = Entrée Generic mise à jour : { $files } fichi
 result-generic-translate-summary = Traduction Generic : { $total } tâches ; { $complete } complètes, { $partial } partielles, { $unavailable } indisponibles ; { $cleared } effacées, { $reused } réutilisées, { $accepted } acceptées, { $written } écrites, { $conflicted } conflits, { $problems } problèmes de réponse
 result-generic-write-back-summary = Réécriture Generic : { $translated } unités traduites, { $original } unités source conservées
 result-symbol-repair-summary = Réparation des symboles : { $attempted } unités examinées, { $repaired } réparées, { $skipped } ignorées en interne, { $replacements } symboles remplacés
+result-run-log = Journal d’exécution : { $path }
+translate-incomplete-object = Exécution Translate du projet { $project }
+translate-incomplete-rpg-maker-reason = { $partial } tâches partielles, { $unavailable } indisponibles, { $protocol } problèmes de protocole et { $exhausted } requêtes épuisées ; il reste { $remaining_decisions } décisions et { $remaining_locations } emplacements
+translate-incomplete-generic-reason = { $partial } tâches partielles, { $unavailable } indisponibles, { $conflicted } conflits d’écriture et { $problems } problèmes de réponse
+translate-incomplete-help = Consultez les diagnostics des tâches dans ce journal, corrigez les problèmes reproductibles puis relancez Translate ; utilisez Manual pour un petit reliquat
 result-cancelled = La commande a été annulée après une finalisation sûre.
 result-plan-saved = Le plan d’exécution réussi a été enregistré.
 log-run-started = La commande { $command } a démarré.
@@ -163,7 +165,6 @@ log-publication-finished = { $result ->
     [outcome_unknown] L’état final de la publication est inconnu.
    *[other] La publication s’est arrêtée sans résultat reconnu.
 }
-log-project-log-degraded = Le journal du projet est dégradé ; { $failure_kinds } catégories d’échec ont été enregistrées.
 log-task-outcome-value = { $outcome ->
     [complete] terminée
     [partial] partiellement terminée
@@ -173,14 +174,36 @@ log-task-outcome-value = { $outcome ->
     [cancelled] annulée
    *[other] terminée sans résultat reconnu
 }
-diagnostic-location = Emplacement : { $subject }
+diagnostic-object = Objet : { $subject }
+diagnostic-error-heading = Erreur :
+diagnostic-warning-heading = Avertissement :
 diagnostic-explanation = Cause : { $reason }
+diagnostic-impact = Impact : { $impact }
 diagnostic-resolution = Action : { $action }
-diagnostic-related = Erreur associée { $index } :
+diagnostic-related = { $relation ->
+    [cleanup] Le nettoyage a également échoué :
+    [rollback] La restauration a également échoué :
+    [discard] La suppression du candidat a également échoué :
+    [finalization] La finalisation a également échoué :
+    [shutdown] L’arrêt a également échoué :
+    [observability] La présentation ou l’enregistrement du résultat a également échoué :
+   *[other] Une opération associée a également échoué :
+}
+diagnostic-impact-value = { $effect ->
+    [unchanged] L’état métier n’a pas été modifié
+    [progress_preserved] La progression précédemment confirmée est conservée ; le contenu indiqué n’est pas terminé
+    [applied] Le résultat métier associé a déjà pris effet
+    [applied_run_plan_not_saved] Le résultat métier a pris effet, mais le plan de cette exécution n’a pas été enregistré
+    [applied_finalization_failed] Le résultat métier a pris effet, mais la finalisation requise n’est pas terminée
+    [recovery_required] Le résultat est connu, mais le site de récupération indiqué doit d’abord être traité
+    [outcome_unknown] Impossible de confirmer si l’opération a pris effet ; ne réessayez pas et ne supprimez pas les éléments de récupération avant de suivre l’action indiquée
+   *[other] __ATT_FALLBACK__
+}
 diagnostic-resolution-value = { $code ->
     [fix_configuration] Corrigez le champ de configuration indiqué, puis réessayez
     [fix_input] Corrigez l’entrée indiquée, puis réessayez
     [fix_placeholder_rules] Corrigez la règle Placeholder indiquée, puis réessayez
+    [review_disabled_rules] Si ce résultat est attendu, aucune action n’est nécessaire ; sinon, ajoutez des règles valides au fichier indiqué et relancez Extract
     [adjust_manual_layout] Ajustez manuellement les retours à la ligne et la mise en page aux emplacements indiqués selon la largeur d’affichage donnée
     [check_path_and_permissions] Vérifiez le chemin, l’état du système de fichiers et les autorisations
     [check_project_state] Examinez et corrigez l’état du projet, puis réessayez
@@ -198,6 +221,7 @@ diagnostic-failure-value = { $code ->
     [invalid_syntax] La syntaxe de la valeur est incorrecte
     [invalid_encoding] L’encodage du texte est incorrect
     [invalid_value] La valeur ne respecte pas le contrat requis
+    [rules_owner_disabled] Le fichier Rules sélectionné utilise rule = [] ; Rules a été désactivé et ses ressources extraites ont été supprimées
     [not_found] L’objet requis n’existe pas
     [state_mismatch] L’état enregistré du projet ne satisfait pas cette opération
     [unsupported_windows_code_page] La page de codes Windows n’est pas UTF-8
@@ -211,6 +235,10 @@ diagnostic-failure-value = { $code ->
     [concurrent_shutdown] Un autre appelant arrête déjà l’exécuteur
     [executor_state_poisoned] L’état du cycle de vie de l’exécuteur est corrompu
     [worker_spawn_failed] Le système d’exploitation n’a pas pu créer le thread de travail
+    [stdout_write_failed] Impossible d’écrire sur la sortie standard
+    [stderr_write_failed] Impossible d’écrire sur la sortie d’erreur
+    [stdout_flush_failed] Impossible de vider la sortie standard
+    [stderr_flush_failed] Impossible de vider la sortie d’erreur
     [worker_channel_closed] Le canal de commandes du worker s’est fermé avant la fin de la finalisation
     [worker_panicked] Un worker s’est arrêté de façon inattendue
     [reparse_point_forbidden] Le chemin contient un point d’analyse secondaire non fiable
@@ -305,7 +333,6 @@ diagnostic-placeholder-rule-project = Règle Placeholder { $number } du projet a
 manual-exported = { $entries } entrées exportées vers { $path }
 manual-checked = Valides { $valid }, non remplies { $unfilled }, erreurs { $errors }
 manual-applied = Appliquées { $applied }, non remplies { $unfilled }, erreurs { $errors }
-manual-issue = { $object } : { $reason } ; { $help }.
 manual-value = { $code ->
     [invalid_source_line] l’élément source { $line } contient un saut de ligne ou NUL
     [invalid_translation_line] l’élément translation { $line } contient un saut de ligne ou NUL

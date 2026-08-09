@@ -83,6 +83,7 @@ use crate::language::{
     LanguageAnalysis, LanguageId, LanguageModule, LanguageModuleCatalogError,
     LanguageOperationCancelled, LanguageText, LanguageTextSegment,
 };
+use crate::llm::ApiKeyRedactor;
 use crate::llm::{
     ChatMessage, ChatMessageRole, LlmClientConcurrency, LlmClientSemanticIdentity, LlmFinishReason,
 };
@@ -214,7 +215,6 @@ enum GenericProgressPhase {
     Extracting,
     PlanningTranslation,
     ConfirmedTasks,
-    NoModelWork,
     RunningLua,
     PreparingWriteBack,
     PublishingWriteBack,
@@ -274,20 +274,22 @@ fn generic_terminal_progress(locale: UiLocale) -> GenericTerminalProgress {
     let extracting = localizer.format(UiMessage::ProgressGenericExtract);
     let planning = localizer.format(UiMessage::ProgressTranslatePlanning);
     let confirmed = localizer.format(UiMessage::ProgressTranslateConfirmed);
-    let no_work = localizer.format(UiMessage::ProgressTranslateNoWork);
     let lua = localizer.format(UiMessage::ProgressProjectLua);
     let preparing_write_back = localizer.format(UiMessage::ProgressWriteBackPlanning);
     let publishing_write_back = localizer.format(UiMessage::ProgressWriteBackPublish);
-    let terminal = TerminalProgress::stderr(move |phase| match phase {
-        GenericProgressPhase::Initializing => initializing.clone(),
-        GenericProgressPhase::Extracting => extracting.clone(),
-        GenericProgressPhase::PlanningTranslation => planning.clone(),
-        GenericProgressPhase::ConfirmedTasks => confirmed.clone(),
-        GenericProgressPhase::NoModelWork => no_work.clone(),
-        GenericProgressPhase::RunningLua => lua.clone(),
-        GenericProgressPhase::PreparingWriteBack => preparing_write_back.clone(),
-        GenericProgressPhase::PublishingWriteBack => publishing_write_back.clone(),
-    });
+    let no_progress_work = localizer.format(UiMessage::ProgressNoWork);
+    let terminal = TerminalProgress::stderr(
+        move |phase| match phase {
+            GenericProgressPhase::Initializing => initializing.clone(),
+            GenericProgressPhase::Extracting => extracting.clone(),
+            GenericProgressPhase::PlanningTranslation => planning.clone(),
+            GenericProgressPhase::ConfirmedTasks => confirmed.clone(),
+            GenericProgressPhase::RunningLua => lua.clone(),
+            GenericProgressPhase::PreparingWriteBack => preparing_write_back.clone(),
+            GenericProgressPhase::PublishingWriteBack => publishing_write_back.clone(),
+        },
+        no_progress_work,
+    );
     GenericTerminalProgress {
         terminal,
         safe_stopping: localizer.format(UiMessage::ProgressSafeStopping),
@@ -345,6 +347,16 @@ pub(crate) struct GenericTranslationSummary {
     pub(crate) response_problems: usize,
 }
 
+impl GenericTranslationSummary {
+    /// Task 协议问题和 Unit 写入冲突都表示项目仍有未完成内容。
+    pub(crate) const fn is_incomplete(self) -> bool {
+        self.partial_tasks > 0
+            || self.unavailable_tasks > 0
+            || self.conflicted_units > 0
+            || self.response_problems > 0
+    }
+}
+
 /// Generic 命令的进程级终态。
 pub(crate) enum GenericCommandRunResult {
     Succeeded(GenericCommandOutput),
@@ -357,6 +369,8 @@ pub(crate) struct GenericCommandRunReport {
     pub(crate) result: GenericCommandRunResult,
     pub(crate) shutdown_errors: Vec<GenericShutdownError>,
     pub(crate) pending_project_log: Option<PendingProjectLog>,
+    pub(crate) panic_log_path: Option<PathBuf>,
+    pub(crate) selected_api_key_redactor: Option<Arc<ApiKeyRedactor>>,
 }
 
 /// 一个运行根在业务 future 完成后关闭失败。
@@ -570,15 +584,7 @@ impl GenericCommandError {
             Self::Operation { failure } => {
                 failure.source_error().downcast_ref::<ManualCommandError>()
             }
-            Self::Signal {
-                operation: Some(operation),
-                ..
-            }
-            | Self::PublishDiscard { operation, .. } => operation.manual_error(),
-            Self::Cancelled
-            | Self::Signal {
-                operation: None, ..
-            } => None,
+            Self::Cancelled | Self::Signal { .. } | Self::PublishDiscard { .. } => None,
         }
     }
 }
@@ -696,6 +702,68 @@ fn generic_blocking_join_failure(
 struct GenericCommandPanicContext {
     command: crate::diagnostic::RuntimeCommand,
     project_workspace: PathBuf,
+    panic_log_path: Arc<Mutex<Option<PathBuf>>>,
+    selected_api_key_redactor: Arc<Mutex<Option<Arc<ApiKeyRedactor>>>>,
+}
+
+impl GenericCommandPanicContext {
+    fn new(command: crate::diagnostic::RuntimeCommand, project_workspace: PathBuf) -> Self {
+        Self {
+            command,
+            project_workspace,
+            panic_log_path: Arc::new(Mutex::new(None)),
+            selected_api_key_redactor: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn observe_project_log(&self, project_log: &ActiveProjectLog) {
+        let Some(path) = project_log.established_log_path().map(Path::to_path_buf) else {
+            return;
+        };
+        *self
+            .panic_log_path
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path);
+    }
+
+    fn observe_project_log_slot(&self, slot: &GenericProjectLogSlot) {
+        if let Some(project_log) = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            self.observe_project_log(project_log);
+        }
+    }
+
+    fn log_path(&self) -> Option<PathBuf> {
+        self.panic_log_path
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn observe_selected_api_key_redactor(&self, redactor: Arc<ApiKeyRedactor>) {
+        let mut selected = self
+            .selected_api_key_redactor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(current) = &*selected {
+            assert!(
+                Arc::ptr_eq(current, &redactor),
+                "一次 Generic Translate 运行不能改选另一个 API key 替换器"
+            );
+        } else {
+            *selected = Some(redactor);
+        }
+    }
+
+    fn selected_api_key_redactor(&self) -> Option<Arc<ApiKeyRedactor>> {
+        self.selected_api_key_redactor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 #[derive(Debug)]
@@ -709,12 +777,15 @@ impl fmt::Display for GenericApplicationScopePanicked {
 
 impl Error for GenericApplicationScopePanicked {}
 
-fn generic_command_panic_context(command: &ConfiguredGenericCommand) -> GenericCommandPanicContext {
-    let (command, projects_root, project_name) = match command {
+fn generic_command_panic_context(
+    configured: &ConfiguredGenericCommand,
+) -> GenericCommandPanicContext {
+    let (command, projects_root, project_name, selected_api_key_redactor) = match configured {
         ConfiguredGenericCommand::Init { arguments, common } => (
             crate::diagnostic::RuntimeCommand::Init,
             common.projects_root(),
             arguments.project.name.as_str(),
+            None,
         ),
         ConfiguredGenericCommand::Extract {
             project_name,
@@ -723,55 +794,69 @@ fn generic_command_panic_context(command: &ConfiguredGenericCommand) -> GenericC
             crate::diagnostic::RuntimeCommand::Extract,
             common.projects_root(),
             project_name.as_str(),
+            None,
         ),
-        ConfiguredGenericCommand::Translate(command) => (
-            crate::diagnostic::RuntimeCommand::Translate,
-            command.common().projects_root(),
-            command.project_name().as_str(),
-        ),
+        ConfiguredGenericCommand::Translate(command) => {
+            let redactor = command
+                .resolved_profile_id()
+                .map(|_| command.translation().client().api_key_redactor());
+            (
+                crate::diagnostic::RuntimeCommand::Translate,
+                command.common().projects_root(),
+                command.project_name().as_str(),
+                redactor,
+            )
+        }
         ConfiguredGenericCommand::WriteBack(command) => (
             crate::diagnostic::RuntimeCommand::WriteBack,
             command.common().projects_root(),
             command.project_name().as_str(),
+            None,
         ),
         ConfiguredGenericCommand::Manual(command) => (
             crate::diagnostic::RuntimeCommand::Manual,
             command.common().projects_root(),
             command.project_name().as_str(),
+            None,
         ),
         ConfiguredGenericCommand::Lua(command) => (
             crate::diagnostic::RuntimeCommand::Lua,
             command.common().projects_root(),
             command.project_name().as_str(),
+            None,
         ),
     };
-    GenericCommandPanicContext {
+    let context = GenericCommandPanicContext::new(
         command,
-        project_workspace: projects_root.join(GENERIC_ENGINE_NAME).join(project_name),
+        projects_root.join(GENERIC_ENGINE_NAME).join(project_name),
+    );
+    if let Some(redactor) = selected_api_key_redactor {
+        context.observe_selected_api_key_redactor(redactor);
     }
+    context
 }
 
-fn generic_command_panic_error(context: GenericCommandPanicContext) -> GenericCommandError {
+fn generic_command_panic_error(context: &GenericCommandPanicContext) -> GenericCommandError {
     let report = DiagnosticReport::new(
         StateEffect::OutcomeUnknown,
         Diagnostic::runtime(RuntimeIssue::CommandPanicked {
             engine: crate::diagnostic::RuntimeEngine::Generic,
             command: context.command,
-            project_workspace: SafePath::new(context.project_workspace),
-            log_path: None,
+            project_workspace: SafePath::new(&context.project_workspace),
+            log_path: context.log_path().map(SafePath::new),
         }),
     );
     GenericCommandError::reported(GenericApplicationScopePanicked, report)
 }
 
-fn generic_translate_panic_error(context: GenericCommandPanicContext) -> GenericCommandError {
+fn generic_translate_panic_error(context: &GenericCommandPanicContext) -> GenericCommandError {
     let report = DiagnosticReport::new(
         StateEffect::ProgressPreserved,
         Diagnostic::runtime(RuntimeIssue::CommandPanicked {
             engine: crate::diagnostic::RuntimeEngine::Generic,
             command: context.command,
-            project_workspace: SafePath::new(context.project_workspace),
-            log_path: None,
+            project_workspace: SafePath::new(&context.project_workspace),
+            log_path: context.log_path().map(SafePath::new),
         }),
     );
     GenericCommandError::reported(GenericApplicationScopePanicked, report)
@@ -781,32 +866,51 @@ async fn catch_generic_command_panic(
     context: GenericCommandPanicContext,
     future: impl Future<Output = GenericCommandRunReport>,
 ) -> GenericCommandRunReport {
-    match AssertUnwindSafe(future).catch_unwind().await {
+    let mut report = match AssertUnwindSafe(future).catch_unwind().await {
         Ok(report) => report,
         Err(payload) => {
             // panic payload 可能包含模型正文、Lua、SQL 或用户文本；只丢弃，绝不读取。
             drop(payload);
-            GenericCommandRunReport::failed(generic_command_panic_error(context))
+            let panic_log_path = context.log_path();
+            GenericCommandRunReport::panicked(generic_command_panic_error(&context), panic_log_path)
         }
-    }
+    };
+    report.selected_api_key_redactor = context.selected_api_key_redactor().or_else(|| {
+        report
+            .pending_project_log
+            .as_ref()
+            .and_then(PendingProjectLog::selected_api_key_redactor)
+    });
+    report
 }
 
 /// Generic 的生产命令执行器。
 pub(crate) struct ProductionGenericCommandRunner {
     locale: UiLocale,
+    panic_context: Option<GenericCommandPanicContext>,
 }
 
 impl ProductionGenericCommandRunner {
     pub(crate) const fn new(locale: UiLocale) -> Self {
-        Self { locale }
+        Self {
+            locale,
+            panic_context: None,
+        }
+    }
+
+    fn panic_context(&self) -> &GenericCommandPanicContext {
+        self.panic_context
+            .as_ref()
+            .expect("Generic 命令进入生产执行前必须建立 panic 上下文")
     }
 
     pub(crate) async fn run(
-        self,
+        mut self,
         command: ConfiguredGenericCommand,
         termination_signals: &mut TerminationSignals,
     ) -> GenericCommandRunReport {
         let panic_context = generic_command_panic_context(&command);
+        self.panic_context = Some(panic_context.clone());
         catch_generic_command_panic(
             panic_context,
             self.run_without_panic_boundary(command, termination_signals),
@@ -847,6 +951,7 @@ impl ProductionGenericCommandRunner {
                 let operation_cancellation = cancellation.clone();
                 let cancellation_file_system = file_system.clone();
                 let operation_project_log = Arc::clone(&project_log);
+                let operation_panic_context = self.panic_context().clone();
                 let locale = self.locale;
                 let operation = async move {
                     ensure_generic_operation_running(&operation_cancellation)?;
@@ -888,8 +993,10 @@ impl ProductionGenericCommandRunner {
                             project: project.project_name().as_str(),
                             command: ProjectLogCommand::Init,
                             performance,
+                            selected_api_key_redactor: None,
                         }),
                     );
+                    operation_panic_context.observe_project_log_slot(&operation_project_log);
                     if let Some(handle) = generic_project_log_handle(&operation_project_log) {
                         handle.emit(ProjectLogEvent::RunPlanResolved {
                             plan: ResolvedRunPlan::init(
@@ -936,6 +1043,7 @@ impl ProductionGenericCommandRunner {
                     ProjectLogCommand::Extract,
                     Arc::clone(&performance),
                 );
+                self.panic_context().observe_project_log_slot(&project_log);
                 let file_system = match start_file_system(
                     common.filesystem().clone(),
                     Arc::clone(&performance),
@@ -1123,8 +1231,10 @@ impl ProductionGenericCommandRunner {
                 project: project_name.as_str(),
                 command: ProjectLogCommand::Lua,
                 performance: Arc::clone(&performance),
+                selected_api_key_redactor: None,
             }),
         );
+        self.panic_context().observe_project_log_slot(&project_log);
         let file_system_configuration = command.common().filesystem().clone();
         let file_system =
             match start_file_system(file_system_configuration, Arc::clone(&performance)) {
@@ -1281,6 +1391,10 @@ impl ProductionGenericCommandRunner {
             ProjectLogCommand::Translate,
             Arc::clone(&performance),
         );
+        if let Some(redactor) = self.panic_context().selected_api_key_redactor() {
+            select_generic_project_log_api_key_redactor(&project_log, redactor);
+        }
+        self.panic_context().observe_project_log_slot(&project_log);
         let file_system_configuration = command.common().filesystem().clone();
         let file_system =
             match start_file_system(file_system_configuration.clone(), Arc::clone(&performance)) {
@@ -1327,10 +1441,7 @@ impl ProductionGenericCommandRunner {
         let operation_progress = progress.observer();
         let llm_holder = Arc::new(Mutex::new(None::<OpenAiChatCompletionExecutor>));
         let task_record_holder = Arc::new(Mutex::new(None::<ConfiguredTranslationTaskRecordSink>));
-        let operation_panic_context = GenericCommandPanicContext {
-            command: crate::diagnostic::RuntimeCommand::Translate,
-            project_workspace: generic_workspace(command.common().projects_root(), &project_name),
-        };
+        let operation_panic_context = self.panic_context().clone();
         let store = GenericProjectStore::for_workspace_with_cancellation(
             generic_workspace(command.common().projects_root(), &project_name),
             cancellation.clone(),
@@ -1349,6 +1460,7 @@ impl ProductionGenericCommandRunner {
         let locale = self.locale;
         let operation_project_log = Arc::clone(&project_log);
         let operation_translate_project_log = Arc::clone(&translate_project_log);
+        let selection_panic_context = operation_panic_context.clone();
         let operation = async move {
             ensure_generic_operation_running(&operation_cancellation)?;
             start_generic_translate_phase(
@@ -1390,6 +1502,13 @@ impl ProductionGenericCommandRunner {
                 .resolve_profile(&profile_id)
                 .map_err(GenericCommandError::configuration)?;
             let configuration = command.translation();
+            let selected_api_key_redactor = configuration.client().api_key_redactor();
+            selection_panic_context
+                .observe_selected_api_key_redactor(Arc::clone(&selected_api_key_redactor));
+            select_generic_project_log_api_key_redactor(
+                &operation_project_log,
+                selected_api_key_redactor,
+            );
             let source_language = configuration
                 .language_modules()
                 .resolve(project.language_pair().source())
@@ -1600,8 +1719,10 @@ impl ProductionGenericCommandRunner {
                 },
             );
             if tasks.is_empty() {
-                operation_progress.observe(ProgressSnapshot::indeterminate(
-                    GenericProgressPhase::NoModelWork,
+                operation_progress.observe(ProgressSnapshot::determinate(
+                    GenericProgressPhase::ConfirmedTasks,
+                    0,
+                    0,
                 ));
             } else {
                 start_generic_translate_phase(
@@ -1852,6 +1973,7 @@ impl ProductionGenericCommandRunner {
             ProjectLogCommand::WriteBack,
             Arc::clone(&performance),
         );
+        self.panic_context().observe_project_log_slot(&project_log);
         let file_system_configuration = command.common().filesystem().clone();
         let file_system =
             match start_file_system(file_system_configuration, Arc::clone(&performance)) {
@@ -5330,6 +5452,7 @@ fn start_existing_generic_project_log(
             project: project.as_str(),
             command,
             performance,
+            selected_api_key_redactor: None,
         }),
     );
 }
@@ -5356,6 +5479,19 @@ fn generic_project_log_handle(slot: &GenericProjectLogSlot) -> Option<ProjectLog
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()
         .map(|project_log| project_log.handle().clone())
+}
+
+fn select_generic_project_log_api_key_redactor(
+    slot: &GenericProjectLogSlot,
+    redactor: Arc<ApiKeyRedactor>,
+) {
+    if let Some(project_log) = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+    {
+        project_log.select_api_key_redactor(redactor);
+    }
 }
 
 /// 所有 Generic 命令经过同一条合作取消路径。此时不把尚未确认的工作伪造为完成量；
@@ -5703,18 +5839,18 @@ fn finish_generic_translate_success(
     );
     let engine_summary =
         TranslationEngineSummary::Generic(project_log_generic_translation_summary(summary));
-    let result = if tasks.planned == 0 {
+    let result = if summary.is_incomplete() {
+        TranslationFinished::Incomplete {
+            tasks,
+            summary: engine_summary,
+        }
+    } else if tasks.planned == 0 {
         TranslationFinished::NoWork {
             tasks,
             summary: engine_summary,
         }
-    } else if tasks.partial == 0 && tasks.unavailable == 0 {
-        TranslationFinished::Complete {
-            tasks,
-            summary: engine_summary,
-        }
     } else {
-        TranslationFinished::Incomplete {
+        TranslationFinished::Complete {
             tasks,
             summary: engine_summary,
         }
@@ -6195,7 +6331,7 @@ async fn drive_generic_translate_with_panic_boundary(
         Err(payload) => {
             // 业务正文可能进入 panic payload；引擎边界只保留安全、类型化诊断。
             drop(payload);
-            Driven::Finished(Err(generic_translate_panic_error(panic_context)))
+            Driven::Finished(Err(generic_translate_panic_error(&panic_context)))
         }
     }
 }
@@ -6307,6 +6443,18 @@ impl GenericCommandRunReport {
             result: GenericCommandRunResult::Failed(error),
             shutdown_errors: Vec::new(),
             pending_project_log: None,
+            panic_log_path: None,
+            selected_api_key_redactor: None,
+        }
+    }
+
+    fn panicked(error: GenericCommandError, panic_log_path: Option<PathBuf>) -> Self {
+        Self {
+            result: GenericCommandRunResult::Failed(error),
+            shutdown_errors: Vec::new(),
+            pending_project_log: None,
+            panic_log_path,
+            selected_api_key_redactor: None,
         }
     }
 
@@ -6400,6 +6548,8 @@ impl GenericCommandRunReport {
             result,
             shutdown_errors,
             pending_project_log,
+            panic_log_path: None,
+            selected_api_key_redactor: None,
         }
     }
 }
@@ -7112,6 +7262,54 @@ mod tests {
         Sha256Fingerprint::from_bytes([byte; 32])
     }
 
+    fn manual_read_failure() -> ManualCommandError {
+        ManualCommandError::Document(crate::manual::ManualDocumentError::Read {
+            path: PathBuf::from("C:/project/manual.toml"),
+            source: io::Error::new(io::ErrorKind::PermissionDenied, "测试读取失败"),
+        })
+    }
+
+    #[test]
+    fn only_direct_generic_manual_failure_uses_detailed_manual_renderer() {
+        let direct = generic_manual_failure(manual_read_failure());
+        assert!(direct.manual_error().is_some());
+
+        let signal = GenericCommandError::Signal {
+            source: io::Error::other("测试信号失败"),
+            operation: Some(Box::new(generic_manual_failure(manual_read_failure()))),
+            state_applied: false,
+        };
+        assert!(
+            signal.manual_error().is_none(),
+            "Signal 外层的类型化主错误和 related 不能被递归 Manual 呈现替换"
+        );
+        assert_eq!(generic_command_error_report(&signal).related().len(), 1);
+
+        let discard_report = DiagnosticReport::new(
+            StateEffect::RecoveryRequired,
+            Diagnostic::runtime(RuntimeIssue::WorkerPanicked {
+                component: RuntimeComponent::Process,
+                operation: RuntimeOperation::Shutdown,
+            }),
+        );
+        let discard =
+            GenericDiscardFailure::new(discard_report, io::Error::other("测试候选清理失败"));
+        let publish_discard = GenericCommandError::PublishDiscard {
+            operation: Box::new(generic_manual_failure(manual_read_failure())),
+            discard,
+        };
+        assert!(
+            publish_discard.manual_error().is_none(),
+            "Discard 外层必须保留类型化相关报告"
+        );
+        assert_eq!(
+            generic_command_error_report(&publish_discard)
+                .related()
+                .len(),
+            1
+        );
+    }
+
     struct TestManualTranslation<'a> {
         id: &'a str,
         relative_path: &'a str,
@@ -7201,14 +7399,25 @@ mod tests {
     #[tokio::test]
     async fn generic_panic_boundary_keeps_command_stage_and_workspace() {
         let workspace = PathBuf::from("projects/generic/panic-project");
-        let report = catch_generic_command_panic(
-            GenericCommandPanicContext {
-                command: crate::diagnostic::RuntimeCommand::Translate,
-                project_workspace: workspace.clone(),
-            },
-            async { panic!("不得读取的测试 panic payload") },
-        )
+        let context = GenericCommandPanicContext::new(
+            crate::diagnostic::RuntimeCommand::Translate,
+            workspace.clone(),
+        );
+        let redactor = Arc::new(ApiKeyRedactor::new(secrecy::SecretString::from(
+            "selected-secret",
+        )));
+        context.observe_selected_api_key_redactor(Arc::clone(&redactor));
+        let report = catch_generic_command_panic(context, async {
+            panic!("不得读取的测试 panic payload")
+        })
         .await;
+
+        assert!(
+            report
+                .selected_api_key_redactor
+                .as_ref()
+                .is_some_and(|selected| Arc::ptr_eq(selected, &redactor))
+        );
 
         let GenericCommandRunResult::Failed(GenericCommandError::Operation { failure }) =
             report.result
@@ -7226,6 +7435,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generic_command_panic_after_log_start_preserves_established_log_path() {
+        let temporary = tempfile::tempdir().expect("应建立 Generic panic 日志测试目录");
+        let common =
+            crate::application::config::CommonCommandConfiguration::for_test(temporary.path());
+        let project = "panic-log";
+        let workspace = temporary.path().join(GENERIC_ENGINE_NAME).join(project);
+        fs::create_dir_all(&workspace).expect("应建立 Generic 测试项目目录");
+        let active = start_command_log(CommandLogStart {
+            common: &common,
+            locale: UiLocale::SimplifiedChinese,
+            engine: ProjectLogEngine::Generic,
+            project,
+            command: ProjectLogCommand::Extract,
+            performance: Arc::new(RunPerformanceCounters::default()),
+            selected_api_key_redactor: None,
+        });
+        let expected = active
+            .established_log_path()
+            .expect("测试项目日志 runtime 应建立")
+            .to_path_buf();
+        let context =
+            GenericCommandPanicContext::new(crate::diagnostic::RuntimeCommand::Extract, workspace);
+        context.observe_project_log(&active);
+
+        let report = catch_generic_command_panic(context, async {
+            panic!("测试项目日志建立后的 Generic 命令 panic")
+        })
+        .await;
+
+        assert_eq!(report.panic_log_path.as_deref(), Some(expected.as_path()));
+        let GenericCommandRunResult::Failed(error) = report.result else {
+            panic!("Generic 命令 panic 必须报告失败");
+        };
+        let diagnostic = generic_command_error_report(&error);
+        let crate::diagnostic::DiagnosticIssue::Runtime(RuntimeIssue::CommandPanicked {
+            log_path: Some(log_path),
+            ..
+        }) = diagnostic.primary().issue()
+        else {
+            panic!("Generic 命令 panic 的类型化诊断必须保留已建立日志路径");
+        };
+        assert_eq!(log_path.as_str(), expected.to_string_lossy().as_ref());
+        let _ = active.pending_cancelled().finish();
+    }
+
+    #[tokio::test]
     async fn generic_translate_panic_boundary_keeps_engine_finalization_path() {
         let workspace = PathBuf::from("projects/generic/translate-panic");
         let mut termination_signals = TerminationSignals::new();
@@ -7239,10 +7494,10 @@ mod tests {
             },
             &mut termination_signals,
             || {},
-            GenericCommandPanicContext {
-                command: crate::diagnostic::RuntimeCommand::Translate,
-                project_workspace: workspace.clone(),
-            },
+            GenericCommandPanicContext::new(
+                crate::diagnostic::RuntimeCommand::Translate,
+                workspace.clone(),
+            ),
         )
         .await;
 
@@ -7276,6 +7531,7 @@ mod tests {
                 project,
                 command: ProjectLogCommand::Translate,
                 performance: Arc::new(RunPerformanceCounters::default()),
+                selected_api_key_redactor: None,
             }),
         );
         let state = generic_translate_project_log_state();
@@ -7325,12 +7581,11 @@ mod tests {
         tasks.started(0);
         tasks.started(1);
 
-        let driven = Driven::Finished(Err(generic_translate_panic_error(
-            GenericCommandPanicContext {
-                command: crate::diagnostic::RuntimeCommand::Translate,
-                project_workspace: workspace.clone(),
-            },
-        )));
+        let panic_context = GenericCommandPanicContext::new(
+            crate::diagnostic::RuntimeCommand::Translate,
+            workspace.clone(),
+        );
+        let driven = Driven::Finished(Err(generic_translate_panic_error(&panic_context)));
         let error = generic_translate_driven_error(&driven).expect("panic 必须形成失败");
         tasks.fail_in_flight_after_panic(generic_command_error_report(error));
         let occurrence = finish_generic_translate_project_log(&project_log, &state, &driven)

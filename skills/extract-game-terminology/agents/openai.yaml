@@ -1,4 +1,4 @@
 interface:
   display_name: "游戏术语表制作"
-  short_description: "用 Formic 抓取候选，再由 Agent 筛成 ATT 术语表"
-  default_prompt: "使用 $extract-game-terminology，从完整游戏可翻译原文制作精简的 ATT 术语表。"
+  short_description: "用随包工具和 Formic 从完整原文制作 ATT 术语表"
+  default_prompt: "使用 $extract-game-terminology，先用随 Skill 工具从最终 Manual 语料建立 Formic 作业，再核对全游戏出现次数并由 Agent 筛选定译，最后写成严格 ATT 术语表。"

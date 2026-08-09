@@ -8,10 +8,27 @@ description: 使用 ATT 随包 Formic 从完整游戏可翻译原文中并发抓
 最终只交付精简的 ATT 术语 TOML。Formic worker 只负责从自己的剧情分片里找候选；不要让
 worker 去重、统计、定译或生成结构化结果。
 
+先检查 Python 3.11+。可用时优先运行随 Skill 的完整程序；它们只使用标准库，不联网、
+不读 ATT SQLite，也不修改游戏或 Manual 输入。缺少 Python 时按本 Skill 手工完成，不自动安装。
+
 ## 1. 整理原文
 
-把游戏全部可翻译原文整理到同一个 `input` 目录。剧情正文使用一个或多个 UTF-8 Markdown
-文件；界面、物品说明等其他原文也可以放入该目录，供 worker 按需查阅。
+术语必须基于最终 Extract 后的完整当前可翻译原文，并在首次 Translate 前制作。先运行对应
+项目的 `manual export`，然后用：
+
+```powershell
+python <Skill目录>\scripts\prepare_formic_job.py --manual <Manual.toml绝对路径> --output <作业目录绝对路径>
+```
+
+程序按 Manual 可读 ID 的稳定自然范围建立 `input/*.md`、`plan.jsonl` 和 `task.md`。Map 按事件、
+CommonEvents 按公共事件、Generic 按自然 Group 整理；只有一个自然范围生成的完整 Markdown
+本身过大时，才在完整 Manual entry 边界分段。程序不会切开一项 entry 的原文，也不会按内部 ID
+分组。随包程序使用真实大语料验证过的约 24,000 个完整 Markdown 字符作为装箱目标；它用于避免
+普通单元过长，不是输入拒绝上限。单个 Manual entry 自身超过该目标时仍保持完整，并在 stdout
+报告真实最大单元。所有输出使用显式路径，默认拒绝覆盖；确认可替换时才传 `--replace`。
+
+没有 Python 时，把全部可翻译原文整理到同一个 `input` 目录。剧情正文使用一个或多个
+UTF-8 Markdown；界面、物品说明等其他原文也放入该目录供 worker 查阅。
 
 按章节、场景或连续剧情自然拆分正文。每个分片通常可以有几千字到一万多字，但不设固定
 字数：不要切成缺少语境的小片，也不要为了减少单元把明显过长的多段剧情硬塞在一起。
@@ -46,10 +63,21 @@ Set-Location <ATT目录>\tools\formic
 并发不得低于 60；能够承受时可以更高。模型服务不能支持 60 并发时停止并说明，不能私自
 降低。
 
-## 3. Agent 统一筛选
+## 3. 核对全游戏出现次数
 
-全部单元结束后，Agent 读取 `out` 根目录的数字编号 Markdown，不把 `workers` 运行档案当作
-候选。逐项直接检查完整游戏可翻译原文：
+全部单元结束后，优先运行：
+
+```powershell
+python <Skill目录>\scripts\review_formic_candidates.py --manual <Manual.toml绝对路径> --formic-out <out绝对路径> --output <candidates.json绝对路径>
+```
+
+程序只读 `out` 根的数字 Markdown，忽略 `workers`；它会删除找不到原文依据、只出现一次和
+完全重复的候选，并保存全语料出现次数与 Manual 可读位置。它不判断词性、专有性或译名。
+
+## 4. Agent 统一筛选
+
+全部单元结束后，Agent 先读取程序生成的候选 JSON；遇到需要判断语境的项目，再查看对应的
+数字编号 Markdown 和完整游戏可翻译原文，不把 `workers` 运行档案当作候选。逐项检查：
 
 1. 在全游戏可翻译原文中只出现一次的，删除。
 2. 不是一个游戏专有名词，或者包含多个名词、短语、句子的，删除。
@@ -58,5 +86,12 @@ Set-Location <ATT目录>\tools\formic
 5. 对剩余候选去重，只保留确实需要统一译法的最小集合。
 6. 为每项确定一个完全汉化的中文译名；译名仍夹带未处理的日文或其他源语言时，修正或删除。
 
-最后按 `docs/translation/terminology.md` 写入严格 TOML，每项只使用 `term` 和
-`translation`。不要另外生成候选数据库、证据表、评分、报告、schema 或验证流程。
+把最终选定项与完全汉化译名写成 `{"terms":[...]}` 审核 JSON，每项用 `term`、`translation`，
+确有多个原文触发形式时才加 `triggers`。然后运行：
+
+```powershell
+python <Skill目录>\scripts\write_terminology.py --input <reviewed.json绝对路径> --output <terminology.toml绝对路径>
+```
+
+程序检查空值、控制字符、重复 term 和冲突 trigger，并写严格 TOML。最终仍用 ATT 的
+`translate --terms` 生产边界解析和保存。不要另外生成候选数据库、评分或 schema。

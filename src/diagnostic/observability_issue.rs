@@ -107,8 +107,6 @@ pub(crate) enum ObservabilityEventCode {
     TaskRecordDiagnostic,
     #[serde(rename = "diagnostic.project_log")]
     ProjectLogDiagnostic,
-    #[serde(rename = "observability.project_log_degraded")]
-    ProjectLogDegraded,
     #[serde(rename = "performance.counters")]
     PerformanceCounters,
     #[serde(rename = "run.finished")]
@@ -428,7 +426,6 @@ impl ObservabilityEventCode {
             Self::PublicationDiagnostic => "diagnostic.publication",
             Self::TaskRecordDiagnostic => "diagnostic.task_record",
             Self::ProjectLogDiagnostic => "diagnostic.project_log",
-            Self::ProjectLogDegraded => "observability.project_log_degraded",
             Self::PerformanceCounters => "performance.counters",
             Self::RunFinished => "run.finished",
         }

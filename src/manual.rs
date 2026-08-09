@@ -11,7 +11,9 @@ use std::sync::Arc;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
-use crate::diagnostic::IoFailure;
+use crate::diagnostic::{
+    IoFailure, RelatedFailureRelation, StateEffect, render_state_effect_impact,
+};
 use crate::execution::CooperativeCancellation;
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::generic::{
@@ -1106,10 +1108,19 @@ fn render_manual_document_issues(
         render_manual_document_issues(operation, localizer, stderr)?;
         let reason = manual_temporary_cleanup_reason(cleanup, localizer);
         let help = render_manual_value(localizer, "resolve_temporary_then_rerun_export", 0, 0, 0);
-        return render_manual_issue(
+        writeln!(stderr)?;
+        writeln!(
+            stderr,
+            "{}",
+            localizer.format(UiMessage::DiagnosticRelated {
+                relation: RelatedFailureRelation::Cleanup.as_str(),
+            })
+        )?;
+        return render_manual_issue_body(
             &temporary.display().to_string(),
             &reason,
             &help,
+            StateEffect::RecoveryRequired,
             localizer,
             stderr,
         );
@@ -1155,11 +1166,46 @@ fn render_manual_issue(
     writeln!(
         output,
         "{}",
-        localizer.format(UiMessage::ManualIssue {
-            object,
-            reason,
-            help,
-        })
+        localizer.format(UiMessage::DiagnosticErrorHeading)
+    )?;
+    render_manual_issue_body(
+        object,
+        reason,
+        help,
+        StateEffect::Unchanged,
+        localizer,
+        output,
+    )
+}
+
+fn render_manual_issue_body(
+    object: &str,
+    reason: &str,
+    help: &str,
+    effect: StateEffect,
+    localizer: &UiLocalizer,
+    output: &mut dyn Write,
+) -> io::Result<()> {
+    let impact = render_state_effect_impact(effect, localizer);
+    writeln!(
+        output,
+        "{}",
+        localizer.format(UiMessage::DiagnosticObject { subject: object })
+    )?;
+    writeln!(
+        output,
+        "{}",
+        localizer.format(UiMessage::DiagnosticExplanation { reason })
+    )?;
+    writeln!(
+        output,
+        "{}",
+        localizer.format(UiMessage::DiagnosticImpact { impact: &impact })
+    )?;
+    writeln!(
+        output,
+        "{}",
+        localizer.format(UiMessage::DiagnosticResolution { action: help })
     )
 }
 
@@ -2721,6 +2767,18 @@ mod tests {
         render_manual_command_error(&error, &localizer, &mut stderr).unwrap();
         let stderr = String::from_utf8(stderr).unwrap();
         assert!(stderr.contains(".manual.toml.tmp"));
+        assert_eq!(
+            stderr
+                .matches(&localizer.format(UiMessage::DiagnosticErrorHeading))
+                .count(),
+            1,
+            "临时文件清理失败是主错误的相关 cleanup，不得再次显示主错误标题：{stderr}"
+        );
+        assert!(
+            stderr.contains(&localizer.format(UiMessage::DiagnosticRelated {
+                relation: RelatedFailureRelation::Cleanup.as_str(),
+            }))
+        );
         assert!(
             stderr.contains(
                 &localizer.format(UiMessage::DiagnosticFailureValue { code: "cancelled" })
@@ -2733,6 +2791,10 @@ mod tests {
             0,
             0,
             0,
+        )));
+        assert!(stderr.contains(&render_state_effect_impact(
+            StateEffect::RecoveryRequired,
+            &localizer,
         )));
     }
 
@@ -3012,7 +3074,12 @@ mod tests {
         let stderr = String::from_utf8(stderr).unwrap();
         assert!(stderr.contains("does not exist"));
         assert!(stderr.contains("Skills.json:1:name [31mforged"));
-        assert_eq!(stderr.lines().count(), 2);
+        assert!(stderr.contains(&localizer.format(UiMessage::DiagnosticErrorHeading)));
+        assert!(stderr.contains(&render_state_effect_impact(
+            StateEffect::Unchanged,
+            &localizer,
+        )));
+        assert_eq!(stderr.lines().count(), 6);
         assert!(!stderr.contains('\u{202e}'));
         assert!(!stderr.contains('\u{1b}'));
     }

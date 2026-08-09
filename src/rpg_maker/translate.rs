@@ -45,6 +45,18 @@ pub struct TranslationSummary {
     pub reused: usize,
 }
 
+impl TranslationSummary {
+    /// Task 协议问题或仍未解决的决策、位置都表示本次 Translate 尚未完整。
+    ///
+    /// `total_tasks == 0` 只说明没有发起模型任务，不能覆盖从项目状态观察到的剩余内容。
+    pub(crate) const fn is_incomplete(self) -> bool {
+        self.partial_tasks > 0
+            || self.unavailable_tasks > 0
+            || self.remaining_decisions > 0
+            || self.remaining_locations > 0
+    }
+}
+
 /// 翻译命令正常完成后交还给 CLI 的结果。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TranslateOutput {

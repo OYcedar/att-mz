@@ -60,12 +60,13 @@ pub(crate) enum RuntimeOperation {
     ReceiveTerminationSignal,
     WriteStdout,
     WriteStderr,
+    FlushStdout,
+    FlushStderr,
     Shutdown,
     StartTerminalProgressRenderer,
-    PublishTerminalProgressCompletion,
-    RenderTerminalProgressDynamicLine,
+    PublishTerminalProgressLine,
+    RenderTerminalProgressLine,
     RenderTerminalProgressStatus,
-    ClearTerminalProgressDynamicLine,
     RenderTerminalProgressFinalMessage,
     FinalizeTerminalProgress,
     ReportTerminalProgressSafeStop,
@@ -228,12 +229,13 @@ impl RuntimeOperation {
             Self::ReceiveTerminationSignal => "receive_termination_signal",
             Self::WriteStdout => "write_stdout",
             Self::WriteStderr => "write_stderr",
+            Self::FlushStdout => "flush_stdout",
+            Self::FlushStderr => "flush_stderr",
             Self::Shutdown => "shutdown",
             Self::StartTerminalProgressRenderer => "start_terminal_progress_renderer",
-            Self::PublishTerminalProgressCompletion => "publish_terminal_progress_completion",
-            Self::RenderTerminalProgressDynamicLine => "render_terminal_progress_dynamic_line",
+            Self::PublishTerminalProgressLine => "publish_terminal_progress_line",
+            Self::RenderTerminalProgressLine => "render_terminal_progress_line",
             Self::RenderTerminalProgressStatus => "render_terminal_progress_status",
-            Self::ClearTerminalProgressDynamicLine => "clear_terminal_progress_dynamic_line",
             Self::RenderTerminalProgressFinalMessage => "render_terminal_progress_final_message",
             Self::FinalizeTerminalProgress => "finalize_terminal_progress",
             Self::ReportTerminalProgressSafeStop => "report_terminal_progress_safe_stop",
@@ -331,7 +333,11 @@ impl RuntimeIssue {
             Self::InternalInvariant { stage, .. } => *stage,
             Self::TranslationTaskCountersInvalid { .. } => DiagnosticStage::Translate,
             Self::Io {
-                operation: RuntimeOperation::WriteStdout | RuntimeOperation::WriteStderr,
+                operation:
+                    RuntimeOperation::WriteStdout
+                    | RuntimeOperation::WriteStderr
+                    | RuntimeOperation::FlushStdout
+                    | RuntimeOperation::FlushStderr,
                 ..
             } => DiagnosticStage::ProcessOutput,
             Self::Io {
@@ -552,6 +558,14 @@ impl RuntimeIssue {
                 operation: RuntimeOperation::WriteStderr,
                 ..
             } => "runtime.stderr_write",
+            Self::Io {
+                operation: RuntimeOperation::FlushStdout,
+                ..
+            } => "runtime.stdout_flush",
+            Self::Io {
+                operation: RuntimeOperation::FlushStderr,
+                ..
+            } => "runtime.stderr_flush",
             Self::Io { .. } => "runtime.io",
             Self::ResourceLimit { .. } => "runtime.resource_limit",
             Self::InvalidConfiguration { .. } => "runtime.invalid_configuration",
@@ -597,6 +611,22 @@ impl RuntimeIssue {
                 operation: RuntimeOperation::StartWorker,
                 ..
             } => "worker_spawn_failed",
+            Self::Io {
+                operation: RuntimeOperation::WriteStdout,
+                ..
+            } => "stdout_write_failed",
+            Self::Io {
+                operation: RuntimeOperation::WriteStderr,
+                ..
+            } => "stderr_write_failed",
+            Self::Io {
+                operation: RuntimeOperation::FlushStdout,
+                ..
+            } => "stdout_flush_failed",
+            Self::Io {
+                operation: RuntimeOperation::FlushStderr,
+                ..
+            } => "stderr_flush_failed",
             Self::Io { failure, .. } => failure.summary_code(),
             Self::ResourceLimit { .. } => "invalid_value",
             Self::InvalidConfiguration { .. } => "invalid_value",
@@ -622,6 +652,14 @@ impl RuntimeIssue {
             } => project_workspace.to_string(),
             Self::InternalInvariant { component, .. } => component.as_str().to_owned(),
             Self::TranslationTaskCountersInvalid { .. } => "translation_task_results".to_owned(),
+            Self::Io {
+                operation: RuntimeOperation::WriteStdout | RuntimeOperation::FlushStdout,
+                ..
+            } => "stdout".to_owned(),
+            Self::Io {
+                operation: RuntimeOperation::WriteStderr | RuntimeOperation::FlushStderr,
+                ..
+            } => "stderr".to_owned(),
             Self::Io { component, .. }
             | Self::ResourceLimit { component, .. }
             | Self::InvalidConfiguration { component }
@@ -2432,6 +2470,71 @@ impl HttpIssue {
             Self::InvalidProxy | Self::InvalidCertificate | Self::ClientBuild => {}
         }
         facts
+    }
+}
+
+#[cfg(test)]
+mod runtime_operation_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_output_operations_use_current_names() {
+        for (operation, expected) in [
+            (RuntimeOperation::FlushStdout, "flush_stdout"),
+            (RuntimeOperation::FlushStderr, "flush_stderr"),
+            (
+                RuntimeOperation::PublishTerminalProgressLine,
+                "publish_terminal_progress_line",
+            ),
+            (
+                RuntimeOperation::RenderTerminalProgressLine,
+                "render_terminal_progress_line",
+            ),
+        ] {
+            assert_eq!(operation.as_str(), expected);
+            assert_eq!(
+                serde_json::to_value(operation).expect("进度操作必须可序列化"),
+                serde_json::json!(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_output_failures_keep_typed_stream_and_operation_facts() {
+        let failure = IoFailure::from_error(&std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "测试终端故障",
+        ));
+        for (operation, expected_subject, expected_summary) in [
+            (
+                RuntimeOperation::WriteStdout,
+                "stdout",
+                "stdout_write_failed",
+            ),
+            (
+                RuntimeOperation::FlushStdout,
+                "stdout",
+                "stdout_flush_failed",
+            ),
+            (
+                RuntimeOperation::WriteStderr,
+                "stderr",
+                "stderr_write_failed",
+            ),
+            (
+                RuntimeOperation::FlushStderr,
+                "stderr",
+                "stderr_flush_failed",
+            ),
+        ] {
+            let issue = RuntimeIssue::Io {
+                component: RuntimeComponent::Process,
+                operation,
+                failure: failure.clone(),
+            };
+            assert_eq!(issue.subject(), expected_subject);
+            assert_eq!(issue.summary_code(), expected_summary);
+        }
     }
 }
 

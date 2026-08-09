@@ -41,12 +41,13 @@ use crate::diagnostic::{
     RuntimeIssue, RuntimeOperation, RuntimePanicBoundary, SafeIdentifier, SafePath,
     SqliteDiagnosticContext, SqliteDiagnosticStage, SqliteDriverFailure, SqliteIssue,
     SqliteOperation, SqliteProblem, SqliteTransactionState, StateEffect, TranslationIssue,
-    render_diagnostic_report,
+    render_diagnostic_report, render_state_effect_impact,
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage, project_log_value_source_label};
 use crate::language::LanguageModuleCatalogError;
+use crate::llm::ApiKeyRedactor;
 use crate::manual::{
     ManualCommandError, ManualCommandSummary, execute_rpg_maker_manual_command,
     render_manual_command_error, render_manual_command_summary,
@@ -183,7 +184,6 @@ use crate::storage::file_system::{
 use crate::translation::planning_resource::TranslationPlanningResourceReadingService;
 use crate::translation::task_record::TaskRecordDiagnosticRecorder;
 use crate::translation_protocol::TranslationResponseMode;
-use crate::user_text::sanitize_user_text;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct TokioAsyncDelay;
@@ -193,7 +193,6 @@ struct TokioAsyncDelay;
 enum TranslateProgressPhase {
     Planning,
     ConfirmedTasks,
-    NoWork,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -271,7 +270,7 @@ pub(crate) enum RpgMakerCommandOutput {
         output: ExtractOutput,
         plan_source: ProjectLogValueSource,
         owners: Vec<String>,
-        disabled_owners: Vec<&'static str>,
+        run_plan_warnings: Vec<DiagnosticReport>,
         has_saved_plan: bool,
     },
     Translate {
@@ -296,13 +295,17 @@ fn init_terminal_progress(locale: UiLocale) -> TerminalProgress<InitProgressPhas
     let preparing = localizer.format(UiMessage::ProgressInitBuildCandidate);
     let updating = localizer.format(UiMessage::ProgressInitConvergeDatabase);
     let publishing = localizer.format(UiMessage::ProgressInitPublish);
-    TerminalProgress::stderr(move |phase| match phase {
-        InitProgressPhase::CheckingProject => checking.clone(),
-        InitProgressPhase::ScanningSource => scanning.clone(),
-        InitProgressPhase::PreparingCandidate => preparing.clone(),
-        InitProgressPhase::UpdatingDatabase => updating.clone(),
-        InitProgressPhase::Publishing => publishing.clone(),
-    })
+    let no_work = localizer.format(UiMessage::ProgressNoWork);
+    TerminalProgress::stderr(
+        move |phase| match phase {
+            InitProgressPhase::CheckingProject => checking.clone(),
+            InitProgressPhase::ScanningSource => scanning.clone(),
+            InitProgressPhase::PreparingCandidate => preparing.clone(),
+            InitProgressPhase::UpdatingDatabase => updating.clone(),
+            InitProgressPhase::Publishing => publishing.clone(),
+        },
+        no_work,
+    )
 }
 
 fn extract_terminal_progress(locale: UiLocale) -> TerminalProgress<ExtractProgressPhase> {
@@ -315,33 +318,41 @@ fn extract_terminal_progress(locale: UiLocale) -> TerminalProgress<ExtractProgre
     let rules_documents = localizer.format(UiMessage::ProgressExtractDocuments);
     let rules_matches = localizer.format(UiMessage::ProgressExtractRules);
     let rules_commit = localizer.format(UiMessage::ProgressExtractCommit);
-    TerminalProgress::stderr(move |phase| match phase {
-        ExtractProgressPhase::Builtin => builtin.clone(),
-        ExtractProgressPhase::BuiltinDocuments => builtin_documents.clone(),
-        ExtractProgressPhase::BuiltinWorkUnits => builtin_work_units.clone(),
-        ExtractProgressPhase::BuiltinCommit => builtin_commit.clone(),
-        ExtractProgressPhase::Rules => rules.clone(),
-        ExtractProgressPhase::RulesDocuments => rules_documents.clone(),
-        ExtractProgressPhase::RulesMatches => rules_matches.clone(),
-        ExtractProgressPhase::RulesCommit => rules_commit.clone(),
-    })
+    let no_work = localizer.format(UiMessage::ProgressNoWork);
+    TerminalProgress::stderr(
+        move |phase| match phase {
+            ExtractProgressPhase::Builtin => builtin.clone(),
+            ExtractProgressPhase::BuiltinDocuments => builtin_documents.clone(),
+            ExtractProgressPhase::BuiltinWorkUnits => builtin_work_units.clone(),
+            ExtractProgressPhase::BuiltinCommit => builtin_commit.clone(),
+            ExtractProgressPhase::Rules => rules.clone(),
+            ExtractProgressPhase::RulesDocuments => rules_documents.clone(),
+            ExtractProgressPhase::RulesMatches => rules_matches.clone(),
+            ExtractProgressPhase::RulesCommit => rules_commit.clone(),
+        },
+        no_work,
+    )
 }
 
 fn translate_terminal_progress(locale: UiLocale) -> TerminalProgress<TranslateProgressPhase> {
     let localizer = UiLocalizer::new(locale);
     let planning = localizer.format(UiMessage::ProgressTranslatePlanning);
     let confirmed = localizer.format(UiMessage::ProgressTranslateConfirmed);
-    let no_work = localizer.format(UiMessage::ProgressTranslateNoWork);
-    TerminalProgress::stderr(move |phase| match phase {
-        TranslateProgressPhase::Planning => planning.clone(),
-        TranslateProgressPhase::ConfirmedTasks => confirmed.clone(),
-        TranslateProgressPhase::NoWork => no_work.clone(),
-    })
+    let no_work = localizer.format(UiMessage::ProgressNoWork);
+    TerminalProgress::stderr(
+        move |phase| match phase {
+            TranslateProgressPhase::Planning => planning.clone(),
+            TranslateProgressPhase::ConfirmedTasks => confirmed.clone(),
+        },
+        no_work,
+    )
 }
 
 fn project_lua_terminal_progress(locale: UiLocale) -> TerminalProgress<ProjectLuaProgressPhase> {
-    let running = UiLocalizer::new(locale).format(UiMessage::ProgressProjectLua);
-    TerminalProgress::stderr(move |_| running.clone())
+    let localizer = UiLocalizer::new(locale);
+    let running = localizer.format(UiMessage::ProgressProjectLua);
+    let no_work = localizer.format(UiMessage::ProgressNoWork);
+    TerminalProgress::stderr(move |_| running.clone(), no_work)
 }
 
 fn write_back_terminal_progress(locale: UiLocale) -> TerminalProgress<WriteBackProgressPhase> {
@@ -352,14 +363,18 @@ fn write_back_terminal_progress(locale: UiLocale) -> TerminalProgress<WriteBackP
     let preparing = planning.clone();
     let validating = localizer.format(UiMessage::ProgressWriteBackValidateCandidate);
     let publishing = localizer.format(UiMessage::ProgressWriteBackPublish);
-    TerminalProgress::stderr(move |phase| match phase {
-        WriteBackProgressPhase::ReadingAssets => reading.clone(),
-        WriteBackProgressPhase::PlanningTranslations => planning.clone(),
-        WriteBackProgressPhase::RewritingDocuments => rewriting.clone(),
-        WriteBackProgressPhase::PreparingCandidate => preparing.clone(),
-        WriteBackProgressPhase::ValidatingCandidate => validating.clone(),
-        WriteBackProgressPhase::Publishing => publishing.clone(),
-    })
+    let no_work = localizer.format(UiMessage::ProgressNoWork);
+    TerminalProgress::stderr(
+        move |phase| match phase {
+            WriteBackProgressPhase::ReadingAssets => reading.clone(),
+            WriteBackProgressPhase::PlanningTranslations => planning.clone(),
+            WriteBackProgressPhase::RewritingDocuments => rewriting.clone(),
+            WriteBackProgressPhase::PreparingCandidate => preparing.clone(),
+            WriteBackProgressPhase::ValidatingCandidate => validating.clone(),
+            WriteBackProgressPhase::Publishing => publishing.clone(),
+        },
+        no_work,
+    )
 }
 
 fn progress_safe_stopping(locale: UiLocale) -> String {
@@ -401,12 +416,27 @@ pub(crate) struct CommandPanicBoundary {
 #[derive(Clone)]
 struct CommandPanicContext {
     report: DiagnosticReport,
+    command: Option<CommandPanicFacts>,
+    panic_log_path: Option<PathBuf>,
+    selected_api_key_redactor: Option<Arc<ApiKeyRedactor>>,
+}
+
+#[derive(Clone)]
+struct CommandPanicFacts {
+    engine: RuntimeEngine,
+    command: crate::diagnostic::RuntimeCommand,
+    project_workspace: PathBuf,
 }
 
 impl CommandPanicBoundary {
     pub(crate) fn from_report(report: DiagnosticReport) -> Self {
         Self {
-            state: Arc::new(Mutex::new(Some(CommandPanicContext { report }))),
+            state: Arc::new(Mutex::new(Some(CommandPanicContext {
+                report,
+                command: None,
+                panic_log_path: None,
+                selected_api_key_redactor: None,
+            }))),
         }
     }
 
@@ -416,20 +446,72 @@ impl CommandPanicBoundary {
         command: crate::diagnostic::RuntimeCommand,
         project_workspace: &Path,
     ) {
+        let facts = CommandPanicFacts {
+            engine,
+            command,
+            project_workspace: project_workspace.to_path_buf(),
+        };
         *self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(CommandPanicContext {
-            report: DiagnosticReport::new(
-                StateEffect::OutcomeUnknown,
-                Diagnostic::runtime(RuntimeIssue::CommandPanicked {
-                    engine,
-                    command,
-                    project_workspace: SafePath::new(project_workspace),
-                    log_path: None,
-                }),
-            ),
+            report: command_panic_report(&facts, None),
+            command: Some(facts),
+            panic_log_path: None,
+            selected_api_key_redactor: None,
         });
+    }
+
+    fn observe_selected_api_key_redactor(&self, redactor: Arc<ApiKeyRedactor>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(context) = state.as_mut() else {
+            return;
+        };
+        if let Some(current) = &context.selected_api_key_redactor {
+            assert!(
+                Arc::ptr_eq(current, &redactor),
+                "一次 Translate 运行不能改选另一个 API key 替换器"
+            );
+        } else {
+            context.selected_api_key_redactor = Some(redactor);
+        }
+    }
+
+    fn selected_api_key_redactor(&self) -> Option<Arc<ApiKeyRedactor>> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|context| context.selected_api_key_redactor.clone())
+    }
+
+    fn observe_project_log(&self, project_log: &ActiveProjectLog) {
+        let Some(path) = project_log.established_log_path().map(Path::to_path_buf) else {
+            return;
+        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(context) = state.as_mut() else {
+            return;
+        };
+        let Some(facts) = context.command.as_ref() else {
+            return;
+        };
+        context.report = command_panic_report(facts, Some(&path));
+        context.panic_log_path = Some(path);
+    }
+
+    fn panic_log_path(&self) -> Option<PathBuf> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|context| context.panic_log_path.clone())
     }
 
     pub(crate) fn panic_error(&self) -> ProductionCommandError {
@@ -445,12 +527,27 @@ impl CommandPanicBoundary {
                         boundary: RuntimePanicBoundary::AfterCliParsing,
                     }),
                 ),
+                command: None,
+                panic_log_path: None,
+                selected_api_key_redactor: None,
             });
         ProductionCommandError::Internal(Box::new(ReportedFailure::new(
             context.report,
             ApplicationScopePanicked,
         )))
     }
+}
+
+fn command_panic_report(facts: &CommandPanicFacts, log_path: Option<&Path>) -> DiagnosticReport {
+    DiagnosticReport::new(
+        StateEffect::OutcomeUnknown,
+        Diagnostic::runtime(RuntimeIssue::CommandPanicked {
+            engine: facts.engine,
+            command: facts.command,
+            project_workspace: SafePath::new(&facts.project_workspace),
+            log_path: log_path.map(SafePath::new),
+        }),
+    )
 }
 
 #[derive(Debug)]
@@ -881,6 +978,13 @@ impl ProductionRpgMakerCommandRunner {
             command_panic_context(self.layout, &command);
         self.panic_boundary
             .prepare(engine, command_name, &project_workspace);
+        if let ConfiguredRpgMakerCommand::Translate(command) = &command
+            && command.resolved_profile_id().is_some()
+        {
+            self.panic_boundary.observe_selected_api_key_redactor(
+                command.translation().client().api_key_redactor(),
+            );
+        }
         let panic_boundary = self.panic_boundary.clone();
         catch_command_panic(panic_boundary, async move {
             match command {
@@ -1091,7 +1195,9 @@ impl ProductionRpgMakerCommandRunner {
             project: project_name.as_str(),
             command: ProjectLogCommand::Lua,
             performance,
+            selected_api_key_redactor: None,
         });
+        self.panic_boundary.observe_project_log(&project_log);
         let program_arguments = command.arguments().to_vec();
         let preflight_cancellation = lua_cancellation.clone();
         let preflight_database_path = database_path.clone();
@@ -1216,6 +1322,8 @@ impl ProductionRpgMakerCommandRunner {
                     result: CommandRunResult::Interrupted,
                     shutdown_error: (!shutdown.is_empty()).then_some(shutdown),
                     pending_project_log: Some(pending),
+                    panic_log_path: None,
+                    selected_api_key_redactor: None,
                 };
             }
             DrivenCommand::SignalFailed { source, result } => {
@@ -1625,7 +1733,9 @@ impl ProductionRpgMakerCommandRunner {
             project: command.arguments.project.name.as_str(),
             command: ProjectLogCommand::Init,
             performance: Arc::clone(&performance),
+            selected_api_key_redactor: None,
         });
+        self.panic_boundary.observe_project_log(&project_log);
         project_log.handle().emit(ProjectLogEvent::RunPlanResolved {
             plan: ResolvedRunPlan::init(plan_source, &resolved_game_root),
         });
@@ -1880,7 +1990,9 @@ impl ProductionRpgMakerCommandRunner {
             project: command.project_name().as_str(),
             command: ProjectLogCommand::Extract,
             performance: Arc::clone(&performance),
+            selected_api_key_redactor: None,
         });
+        self.panic_boundary.observe_project_log(&project_log);
         let progress_observer =
             ProductionProgressObserver::new(progress.observer(), &project_log, extract_phase_code);
         let builtin_enabled = saved_extract.as_ref().map_or_else(
@@ -1991,16 +2103,24 @@ impl ProductionRpgMakerCommandRunner {
         let rules_enabled = rules_program
             .as_ref()
             .is_some_and(|program| !program.is_empty());
-        let disabled_owners = [command
-            .rpg_maker()
-            .rules()
-            .zip(rules_program.as_ref())
-            .filter(|(_, program)| program.is_empty())
-            .map(|_| "Rules")]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
         let has_saved_plan = builtin_enabled || rules_enabled;
+        let run_plan_warnings = rules_program
+            .as_ref()
+            .filter(|program| program.is_empty())
+            .map(|program| {
+                DiagnosticReport::new(
+                    if has_saved_plan {
+                        StateEffect::Applied
+                    } else {
+                        StateEffect::AppliedRunPlanNotSaved
+                    },
+                    Diagnostic::rpg_maker(RpgMakerIssue::rules_owner_disabled(
+                        program.diagnostic_path(),
+                    )),
+                )
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
         let presented_owners = [
             builtin_enabled.then_some(String::from("Builtin")),
             rules_enabled.then_some(String::from("Rules")),
@@ -2115,6 +2235,11 @@ impl ProductionRpgMakerCommandRunner {
                     .handle()
                     .record_diagnostic(DiagnosticScope::Extract, warning.diagnostic_report());
             }
+            for warning in &run_plan_warnings {
+                project_log
+                    .handle()
+                    .record_diagnostic(DiagnosticScope::Extract, warning.clone());
+            }
         }
         drop(project_lease_guard);
         let shutdown = finish_terminal_progress(progress, shutdown);
@@ -2138,7 +2263,7 @@ impl ProductionRpgMakerCommandRunner {
                         output,
                         plan_source,
                         owners: presented_owners,
-                        disabled_owners,
+                        run_plan_warnings,
                         has_saved_plan,
                     })
                 })
@@ -2341,6 +2466,8 @@ impl ProductionRpgMakerCommandRunner {
                 );
             }
         };
+        self.panic_boundary
+            .observe_selected_api_key_redactor(command.translation().client().api_key_redactor());
         let project_log = start_command_log(CommandLogStart {
             common: command.common(),
             locale: self.locale,
@@ -2348,7 +2475,9 @@ impl ProductionRpgMakerCommandRunner {
             project: command.project_name().as_str(),
             command: ProjectLogCommand::Translate,
             performance: Arc::clone(&performance),
+            selected_api_key_redactor: Some(command.translation().client().api_key_redactor()),
         });
+        self.panic_boundary.observe_project_log(&project_log);
         let progress_observer = ProductionProgressObserver::new(
             progress.observer(),
             &project_log,
@@ -2498,8 +2627,10 @@ impl ProductionRpgMakerCommandRunner {
                 if output.summary.total_tasks == 0
         );
         if no_model_work {
-            progress_observer.observe(ProgressSnapshot::indeterminate(
-                TranslateProgressPhase::NoWork,
+            progress_observer.observe(ProgressSnapshot::determinate(
+                TranslateProgressPhase::ConfirmedTasks,
+                0,
+                0,
             ));
         }
         finish_progress_business_state(&progress_observer, &execution);
@@ -2703,7 +2834,9 @@ impl ProductionRpgMakerCommandRunner {
             project: command.project_name().as_str(),
             command: ProjectLogCommand::WriteBack,
             performance: Arc::clone(&performance),
+            selected_api_key_redactor: None,
         });
+        self.panic_boundary.observe_project_log(&project_log);
         let progress_observer = ProductionProgressObserver::new(
             progress.observer(),
             &project_log,
@@ -3025,14 +3158,22 @@ async fn catch_command_panic(
         let guarded = AssertUnwindSafe(future).catch_unwind();
         guarded.await
     };
-    match result {
+    let mut report = match result {
         Ok(report) => report,
         Err(payload) => {
             // payload 可能含 Prompt、模型正文、Lua、SQL 或用户文本；只丢弃，绝不读取。
             drop(payload);
-            ProductionCommandRunReport::panicked(panic_boundary.panic_error())
+            let panic_log_path = panic_boundary.panic_log_path();
+            ProductionCommandRunReport::panicked(panic_boundary.panic_error(), panic_log_path)
         }
-    }
+    };
+    report.selected_api_key_redactor = panic_boundary.selected_api_key_redactor().or_else(|| {
+        report
+            .pending_project_log
+            .as_ref()
+            .and_then(PendingProjectLog::selected_api_key_redactor)
+    });
+    report
 }
 
 async fn catch_translate_execution_panic<T>(
@@ -3291,11 +3432,10 @@ const fn extract_phase_code(phase: ExtractProgressPhase) -> Option<ProjectLogPha
 }
 
 const fn translate_phase_code(phase: TranslateProgressPhase) -> Option<ProjectLogPhase> {
-    match phase {
-        TranslateProgressPhase::Planning => Some(ProjectLogPhase::Planning),
-        TranslateProgressPhase::ConfirmedTasks => Some(ProjectLogPhase::ConfirmedTasks),
-        TranslateProgressPhase::NoWork => None,
-    }
+    Some(match phase {
+        TranslateProgressPhase::Planning => ProjectLogPhase::Planning,
+        TranslateProgressPhase::ConfirmedTasks => ProjectLogPhase::ConfirmedTasks,
+    })
 }
 
 const fn project_lua_phase_code(_: ProjectLuaProgressPhase) -> Option<ProjectLogPhase> {
@@ -3599,14 +3739,78 @@ mod progress_lifecycle_tests {
             project: "phase-contract",
             command: ProjectLogCommand::Init,
             performance: Arc::new(RunPerformanceCounters::default()),
+            selected_api_key_redactor: None,
         })
+    }
+
+    #[tokio::test]
+    async fn command_panic_after_log_start_preserves_established_log_path() {
+        let temporary = tempfile::tempdir().expect("应建立 panic 日志测试目录");
+        let active = active_project_log(temporary.path());
+        let expected = active
+            .established_log_path()
+            .expect("测试项目日志 runtime 应建立")
+            .to_path_buf();
+        let boundary = CommandPanicBoundary::default();
+        boundary.prepare(
+            RuntimeEngine::RpgMakerMv,
+            crate::diagnostic::RuntimeCommand::Init,
+            &temporary.path().join("mv/phase-contract"),
+        );
+        let operation_boundary = boundary.clone();
+
+        let report = catch_command_panic(boundary, async move {
+            operation_boundary.observe_project_log(&active);
+            panic!("测试项目日志建立后的命令 panic");
+            #[allow(unreachable_code)]
+            ProductionCommandRunReport::failed_before_logging(ProductionCommandError::stderr_write(
+                io::Error::other("不可达"),
+            ))
+        })
+        .await;
+
+        assert_eq!(report.panic_log_path.as_deref(), Some(expected.as_path()));
+        let CommandRunResult::Failed(error) = report.result else {
+            panic!("命令 panic 必须报告失败");
+        };
+        let crate::diagnostic::DiagnosticIssue::Runtime(RuntimeIssue::CommandPanicked {
+            log_path: Some(log_path),
+            ..
+        }) = error.failure_report().report().primary().issue()
+        else {
+            panic!("命令 panic 的类型化诊断必须保留已建立日志路径");
+        };
+        assert_eq!(log_path.as_str(), expected.to_string_lossy().as_ref());
+    }
+
+    #[tokio::test]
+    async fn command_report_keeps_the_selected_translate_redactor_after_panic() {
+        let boundary = CommandPanicBoundary::default();
+        boundary.prepare(
+            RuntimeEngine::RpgMakerMv,
+            crate::diagnostic::RuntimeCommand::Translate,
+            Path::new("projects/mv/redactor-project"),
+        );
+        let redactor = Arc::new(ApiKeyRedactor::new(secrecy::SecretString::from(
+            "selected-secret",
+        )));
+        boundary.observe_selected_api_key_redactor(Arc::clone(&redactor));
+
+        let report = catch_command_panic(boundary, async { panic!("Translate panic") }).await;
+
+        assert!(
+            report
+                .selected_api_key_redactor
+                .as_ref()
+                .is_some_and(|selected| Arc::ptr_eq(selected, &redactor))
+        );
     }
 
     fn observer() -> (
         TerminalProgress<InitProgressPhase>,
         ProductionProgressObserver<InitProgressPhase>,
     ) {
-        let terminal = TerminalProgress::with_writer(false, io::sink(), |_| String::new());
+        let terminal = TerminalProgress::with_writer(io::sink(), |_| String::new());
         let observer =
             ProductionProgressObserver::without_project_log(terminal.observer(), init_phase_code);
         (terminal, observer)
@@ -3675,7 +3879,7 @@ mod progress_lifecycle_tests {
 
     #[test]
     fn nested_extract_progress_does_not_restart_the_owner_phase() {
-        let terminal = TerminalProgress::with_writer(false, io::sink(), |_| String::new());
+        let terminal = TerminalProgress::with_writer(io::sink(), |_| String::new());
         let observer = ProductionProgressObserver::without_project_log(
             terminal.observer(),
             extract_phase_code,
@@ -3723,7 +3927,7 @@ mod progress_lifecycle_tests {
     fn successful_business_finish_leaves_active_phase_for_log_contract_validation() {
         let temporary = tempfile::tempdir().expect("临时目录应可建立");
         let project_log = active_project_log(temporary.path());
-        let terminal = TerminalProgress::with_writer(false, io::sink(), |_| String::new());
+        let terminal = TerminalProgress::with_writer(io::sink(), |_| String::new());
         let observer =
             ProductionProgressObserver::new(terminal.observer(), &project_log, init_phase_code);
         observer.observe(ProgressSnapshot::indeterminate(
@@ -3761,7 +3965,7 @@ mod progress_lifecycle_tests {
     fn planning_completed_only_finishes_the_planning_phase() {
         let temporary = tempfile::tempdir().expect("临时目录应可建立");
         let project_log = active_project_log(temporary.path());
-        let terminal = TerminalProgress::with_writer(false, io::sink(), |_| String::new());
+        let terminal = TerminalProgress::with_writer(io::sink(), |_| String::new());
         let observer = ProductionProgressObserver::new(
             terminal.observer(),
             &project_log,
@@ -4235,16 +4439,12 @@ impl ProductionBusinessLog {
         };
         let result = if let Some(output) = completed {
             let summary = Self::translation_summary(output);
-            if output.summary.total_tasks == 0 {
-                TranslationFinished::NoWork { tasks, summary }
-            } else if output.summary.partial_tasks == 0
-                && output.summary.unavailable_tasks == 0
-                && output.summary.remaining_decisions == 0
-                && output.summary.remaining_locations == 0
-            {
-                TranslationFinished::Complete { tasks, summary }
-            } else {
+            if output.summary.is_incomplete() {
                 TranslationFinished::Incomplete { tasks, summary }
+            } else if output.summary.total_tasks == 0 {
+                TranslationFinished::NoWork { tasks, summary }
+            } else {
+                TranslationFinished::Complete { tasks, summary }
             }
         } else if matches!(
             execution,
@@ -5651,6 +5851,8 @@ pub(crate) struct ProductionCommandRunReport {
     pub(crate) result: CommandRunResult,
     pub(crate) shutdown_error: Option<ShutdownFailures>,
     pub(crate) pending_project_log: Option<PendingProjectLog>,
+    pub(crate) panic_log_path: Option<PathBuf>,
+    pub(crate) selected_api_key_redactor: Option<Arc<ApiKeyRedactor>>,
 }
 
 pub(crate) enum CommandRunResult {
@@ -5660,12 +5862,14 @@ pub(crate) enum CommandRunResult {
 }
 
 impl ProductionCommandRunReport {
-    fn panicked(error: ProductionCommandError) -> Self {
+    fn panicked(error: ProductionCommandError, panic_log_path: Option<PathBuf>) -> Self {
         Self {
             result: CommandRunResult::Failed(error),
             shutdown_error: None,
             // panic 展开时 ActiveProjectLog 的 runtime 已用独立终态槽完成项目日志。
             pending_project_log: None,
+            panic_log_path,
+            selected_api_key_redactor: None,
         }
     }
 
@@ -5674,6 +5878,8 @@ impl ProductionCommandRunReport {
             result: CommandRunResult::Failed(error),
             shutdown_error: None,
             pending_project_log: None,
+            panic_log_path: None,
+            selected_api_key_redactor: None,
         }
     }
 
@@ -5685,6 +5891,8 @@ impl ProductionCommandRunReport {
             result: CommandRunResult::Failed(error),
             shutdown_error: (!shutdown.is_empty()).then_some(shutdown),
             pending_project_log: None,
+            panic_log_path: None,
+            selected_api_key_redactor: None,
         }
     }
 
@@ -5693,6 +5901,8 @@ impl ProductionCommandRunReport {
             result: CommandRunResult::Interrupted,
             shutdown_error: (!shutdown.is_empty()).then_some(shutdown),
             pending_project_log: None,
+            panic_log_path: None,
+            selected_api_key_redactor: None,
         }
     }
 
@@ -5705,6 +5915,8 @@ impl ProductionCommandRunReport {
             result: CommandRunResult::Failed(error),
             shutdown_error: (!shutdown.is_empty()).then_some(shutdown),
             pending_project_log,
+            panic_log_path: None,
+            selected_api_key_redactor: None,
         }
     }
 
@@ -5723,17 +5935,23 @@ impl ProductionCommandRunReport {
                 result: CommandRunResult::Succeeded(output),
                 shutdown_error,
                 pending_project_log,
+                panic_log_path: None,
+                selected_api_key_redactor: None,
             },
             DrivenCommand::Finished(Ok(OperationCompletion::Cancelled))
             | DrivenCommand::Interrupted(Ok(OperationCompletion::Cancelled)) => Self {
                 result: CommandRunResult::Interrupted,
                 shutdown_error,
                 pending_project_log,
+                panic_log_path: None,
+                selected_api_key_redactor: None,
             },
             DrivenCommand::Finished(Err(error)) => Self {
                 result: CommandRunResult::Failed(error),
                 shutdown_error,
                 pending_project_log,
+                panic_log_path: None,
+                selected_api_key_redactor: None,
             },
             DrivenCommand::Interrupted(Err(error)) => Self {
                 result: if error.was_cancelled_wait() {
@@ -5743,6 +5961,8 @@ impl ProductionCommandRunReport {
                 },
                 shutdown_error,
                 pending_project_log,
+                panic_log_path: None,
+                selected_api_key_redactor: None,
             },
             DrivenCommand::SignalFailed { source, result } => {
                 let outcome = match result {
@@ -5758,6 +5978,8 @@ impl ProductionCommandRunReport {
                     )),
                     shutdown_error,
                     pending_project_log,
+                    panic_log_path: None,
+                    selected_api_key_redactor: None,
                 }
             }
         }
@@ -6624,9 +6846,15 @@ impl ProductionCommandError {
     }
 
     pub(crate) fn manual_error(&self) -> Option<&ManualCommandError> {
-        self.failure_report()
-            .source_error()
-            .downcast_ref::<ManualCommandError>()
+        let Self::ConfigurationOrInput(report) = self else {
+            return None;
+        };
+        report
+            .report()
+            .related()
+            .is_empty()
+            .then(|| report.source_error().downcast_ref::<ManualCommandError>())
+            .flatten()
     }
 
     fn was_cancelled_wait(&self) -> bool {
@@ -6806,7 +7034,7 @@ impl CommandResultRenderer {
                 output,
                 plan_source,
                 owners,
-                disabled_owners,
+                run_plan_warnings: _,
                 has_saved_plan,
             } => {
                 writeln!(
@@ -6825,21 +7053,10 @@ impl CommandResultRenderer {
                         })
                     )?;
                 }
-                for owner in disabled_owners {
-                    writeln!(
-                        stdout,
-                        "{}",
-                        localizer.format(UiMessage::NoticeOwnerDisabled { owner })
-                    )?;
-                }
                 if *has_saved_plan {
                     render_saved_plan_source(localizer, *plan_source, stdout)
                 } else {
-                    writeln!(
-                        stdout,
-                        "{}",
-                        localizer.format(UiMessage::ErrorNoExecutableExtractOwner)
-                    )
+                    Ok(())
                 }
             }
             RpgMakerCommandOutput::Translate {
@@ -6853,6 +7070,19 @@ impl CommandResultRenderer {
                         project: output.name.as_str(),
                         profile: &output.profile_id,
                     })
+                )?;
+                let status = if output.summary.is_incomplete() {
+                    "incomplete"
+                } else if output.summary.total_tasks == 0 {
+                    "no_work"
+                } else {
+                    "complete"
+                };
+                let status = localizer.format(UiMessage::ResultTranslateStatusValue { status });
+                writeln!(
+                    stdout,
+                    "{}",
+                    localizer.format(UiMessage::ResultTranslateStatus { status: &status })
                 )?;
                 writeln!(
                     stdout,
@@ -6961,18 +7191,6 @@ impl CommandResultRenderer {
                         ),
                     })
                 )?;
-                if output.summary.manual_layout_units > 0 {
-                    writeln!(
-                        stdout,
-                        "{}",
-                        localizer.format(UiMessage::NoticeManualLayout {
-                            count: usize_to_u64(
-                                output.summary.manual_layout_units,
-                                "人工布局 Unit 数",
-                            ),
-                        })
-                    )?;
-                }
                 Ok(())
             }
             RpgMakerCommandOutput::Manual { summary } => {
@@ -6994,46 +7212,46 @@ impl CommandResultRenderer {
         stderr: &mut dyn Write,
     ) -> io::Result<()> {
         match output {
-            RpgMakerCommandOutput::Extract { output, .. } => {
+            RpgMakerCommandOutput::Extract {
+                output,
+                run_plan_warnings,
+                ..
+            } => {
                 for warning in &output.rules_warnings {
-                    let source_file = sanitize_user_text(&warning.source_file);
-                    let command_code = warning.command_code.to_string();
                     writeln!(
                         stderr,
                         "{}",
-                        localizer.format(UiMessage::WarningRulesCommandNonStringSkipped {
-                            rule_number: usize_to_u64(warning.rule_number, "规则号"),
-                            source_file: &source_file,
-                            command_code: &command_code,
-                            parameter: usize_to_u64(warning.parameter, "参数索引"),
-                            actual_type: warning.actual_type.as_str(),
-                            skipped_count: warning.skipped_count,
-                        })
+                        localizer.format(UiMessage::DiagnosticWarningHeading)
+                    )?;
+                    writeln!(
+                        stderr,
+                        "{}",
+                        render_diagnostic_report(&warning.diagnostic_report(), localizer)
                     )?;
                 }
+                for warning in run_plan_warnings {
+                    writeln!(
+                        stderr,
+                        "{}",
+                        localizer.format(UiMessage::DiagnosticWarningHeading)
+                    )?;
+                    writeln!(stderr, "{}", render_diagnostic_report(warning, localizer))?;
+                }
+            }
+            RpgMakerCommandOutput::Translate { output, .. } if output.summary.is_incomplete() => {
+                render_rpg_maker_incomplete_warning(output, localizer, stderr)?;
             }
             RpgMakerCommandOutput::WriteBack { output } => {
                 for diagnostic in output.manual_layout_diagnostics() {
-                    let locations = diagnostic
-                        .locations()
-                        .iter()
-                        .map(|location| {
-                            format!(
-                                "{} ({})",
-                                sanitize_user_text(&location.group_location().to_string()),
-                                location.role_name()
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ");
                     writeln!(
                         stderr,
                         "{}",
-                        localizer.format(UiMessage::WarningManualLayoutRequired {
-                            locations: &locations,
-                            region: diagnostic.region_name(),
-                            max_fullwidth_chars: u64::from(diagnostic.max_fullwidth_chars()),
-                        })
+                        localizer.format(UiMessage::DiagnosticWarningHeading)
+                    )?;
+                    writeln!(
+                        stderr,
+                        "{}",
+                        render_diagnostic_report(&diagnostic.diagnostic_report(), localizer)
                     )?;
                 }
             }
@@ -7048,6 +7266,18 @@ impl CommandResultRenderer {
         localizer: &UiLocalizer,
         stderr: &mut dyn Write,
     ) -> io::Result<()> {
+        let command_renders_its_own_headings = command_error
+            .and_then(ProductionCommandError::manual_error)
+            .is_some();
+        if (command_error.is_some() && !command_renders_its_own_headings)
+            || (command_error.is_none() && shutdown_error.is_some())
+        {
+            writeln!(
+                stderr,
+                "{}",
+                localizer.format(UiMessage::DiagnosticErrorHeading)
+            )?;
+        }
         if let Some(error) = command_error {
             if let Some(manual) = error.manual_error() {
                 render_manual_command_error(manual, localizer, stderr)?;
@@ -7060,15 +7290,7 @@ impl CommandResultRenderer {
             }
         }
         if let Some(shutdown) = shutdown_error {
-            let related_offset = command_error.map(|error| {
-                error
-                    .failure_report()
-                    .report()
-                    .related()
-                    .len()
-                    .saturating_add(1)
-            });
-            render_shutdown_failures(shutdown, related_offset, localizer, stderr)?;
+            render_shutdown_failures(shutdown, command_error.is_some(), localizer, stderr)?;
         }
         Ok(())
     }
@@ -7078,24 +7300,83 @@ impl CommandResultRenderer {
         localizer: &UiLocalizer,
         stderr: &mut dyn Write,
     ) -> io::Result<()> {
-        render_shutdown_failures(shutdown_error, None, localizer, stderr)
+        writeln!(
+            stderr,
+            "{}",
+            localizer.format(UiMessage::DiagnosticErrorHeading)
+        )?;
+        render_shutdown_failures(shutdown_error, false, localizer, stderr)
     }
+
+    /// 进程结果呈现已经形成主错误时，把 shutdown 逐项呈现为相关错误。
+    pub(crate) fn render_related_shutdown_failures(
+        shutdown_error: &ShutdownFailures,
+        localizer: &UiLocalizer,
+        stderr: &mut dyn Write,
+    ) -> io::Result<()> {
+        render_shutdown_failures(shutdown_error, true, localizer, stderr)
+    }
+}
+
+fn render_rpg_maker_incomplete_warning(
+    output: &TranslateOutput,
+    localizer: &UiLocalizer,
+    stderr: &mut dyn Write,
+) -> io::Result<()> {
+    let object = localizer.format(UiMessage::TranslateIncompleteObject {
+        project: output.name.as_str(),
+    });
+    let reason = localizer.format(UiMessage::TranslateIncompleteRpgMakerReason {
+        partial: usize_to_u64(output.summary.partial_tasks, "部分任务数"),
+        unavailable: usize_to_u64(output.summary.unavailable_tasks, "不可用任务数"),
+        protocol: usize_to_u64(output.summary.protocol_diagnostics, "协议问题数"),
+        exhausted: usize_to_u64(output.summary.recoverable_request_exhaustions, "请求耗尽数"),
+        remaining_decisions: usize_to_u64(output.summary.remaining_decisions, "剩余决策数"),
+        remaining_locations: usize_to_u64(output.summary.remaining_locations, "剩余位置数"),
+    });
+    let impact = render_state_effect_impact(StateEffect::ProgressPreserved, localizer);
+    let help = localizer.format(UiMessage::TranslateIncompleteHelp);
+    writeln!(
+        stderr,
+        "{}",
+        localizer.format(UiMessage::DiagnosticWarningHeading)
+    )?;
+    writeln!(
+        stderr,
+        "{}",
+        localizer.format(UiMessage::DiagnosticObject { subject: &object })
+    )?;
+    writeln!(
+        stderr,
+        "{}",
+        localizer.format(UiMessage::DiagnosticExplanation { reason: &reason })
+    )?;
+    writeln!(
+        stderr,
+        "{}",
+        localizer.format(UiMessage::DiagnosticImpact { impact: &impact })
+    )?;
+    writeln!(
+        stderr,
+        "{}",
+        localizer.format(UiMessage::DiagnosticResolution { action: &help })
+    )
 }
 
 fn render_shutdown_failures(
     failures: &ShutdownFailures,
-    related_offset: Option<usize>,
+    follows_primary: bool,
     localizer: &UiLocalizer,
     stderr: &mut dyn Write,
 ) -> io::Result<()> {
     let mut diagnostics = failures.diagnostic_reports();
-    if let Some(offset) = related_offset {
-        for (index, diagnostic) in diagnostics.enumerate() {
+    if follows_primary {
+        for diagnostic in diagnostics {
             writeln!(
                 stderr,
                 "{}",
                 localizer.format(UiMessage::DiagnosticRelated {
-                    index: usize_to_u64(offset.saturating_add(index), "相关诊断序号"),
+                    relation: "shutdown",
                 })
             )?;
             writeln!(
@@ -7106,12 +7387,12 @@ fn render_shutdown_failures(
         }
     } else if let Some(primary) = diagnostics.next() {
         writeln!(stderr, "{}", render_diagnostic_report(primary, localizer))?;
-        for (index, diagnostic) in diagnostics.enumerate() {
+        for diagnostic in diagnostics {
             writeln!(
                 stderr,
                 "{}",
                 localizer.format(UiMessage::DiagnosticRelated {
-                    index: usize_to_u64(index.saturating_add(1), "相关诊断序号"),
+                    relation: "shutdown",
                 })
             )?;
             writeln!(
@@ -7247,6 +7528,49 @@ mod command_result_renderer_tests {
                 .related()
                 .iter()
                 .any(|related| report_tree_contains(related.report(), predicate))
+    }
+
+    fn manual_read_failure() -> ManualCommandError {
+        ManualCommandError::Document(crate::manual::ManualDocumentError::Read {
+            path: PathBuf::from("C:/project/manual.toml"),
+            source: io::Error::new(io::ErrorKind::PermissionDenied, "测试读取失败"),
+        })
+    }
+
+    #[test]
+    fn only_direct_manual_failure_uses_detailed_manual_renderer() {
+        let direct = ProductionCommandError::manual(manual_read_failure());
+        assert!(direct.manual_error().is_some());
+
+        let signal = ProductionCommandError::signal(
+            io::Error::other("测试信号失败"),
+            SignalOutcomeSource::CommandFailed(ProductionCommandError::manual(
+                manual_read_failure(),
+            )),
+        );
+        assert!(
+            signal.manual_error().is_none(),
+            "Signal 外层的类型化主错误和 related 不能被递归 Manual 呈现替换"
+        );
+        assert_eq!(signal.failure_report().report().related().len(), 1);
+        let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
+        let mut stderr = Vec::new();
+        CommandResultRenderer::render_failure(Some(&signal), None, &localizer, &mut stderr)
+            .expect("Signal 外层诊断应可呈现");
+        let stderr = String::from_utf8(stderr).expect("诊断必须是 UTF-8");
+        assert!(
+            stderr.contains(&localizer.format(UiMessage::DiagnosticRelated {
+                relation: RelatedFailureRelation::Shutdown.as_str(),
+            }))
+        );
+
+        let finalization = ProductionCommandError::manual(manual_read_failure())
+            .with_related_finalization_report(test_report(StateEffect::AppliedFinalizationFailed));
+        assert!(
+            finalization.manual_error().is_none(),
+            "Finalization 外层必须保留类型化相关报告"
+        );
+        assert_eq!(finalization.failure_report().report().related().len(), 1);
     }
 
     #[test]
@@ -7508,10 +7832,17 @@ mod command_result_renderer_tests {
 
         let stdout = String::from_utf8(stdout).expect("stdout 应为 UTF-8");
         let stderr = String::from_utf8(stderr).expect("stderr 应为 UTF-8");
+        let plain_stderr = stderr.replace(['\u{2068}', '\u{2069}'], "");
         assert!(!stdout.contains("Map007"), "精确位置只应进入警告");
-        assert!(stderr.contains("data/Map007.json"), "{stderr}");
-        assert!(stderr.contains("dialogue_body"), "{stderr}");
-        assert!(stderr.contains("28"), "{stderr}");
+        assert!(
+            plain_stderr.contains("对象：data/Map007.json:events[3]:dialogue_body"),
+            "{stderr}"
+        );
+        assert!(
+            plain_stderr.contains("region=dialogue_body; max_fullwidth_chars=28"),
+            "{stderr}"
+        );
+        assert!(!plain_stderr.contains("对象：rpg_maker_write_back_layout"));
     }
 }
 
