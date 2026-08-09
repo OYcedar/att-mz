@@ -14,6 +14,13 @@ import pytest
 from att_skill_tools import core as att_common
 from att_skill_tools import core as term_common
 from att_toolbox.js import scan_javascript
+from att_toolbox.resources import classify_resource_reference, is_resource_file_suffix
+from att_toolbox.roundtrip import (
+    PlainTextReplacement,
+    apply_reviewed_plain_text_lines,
+    plain_text_lines,
+    replace_reviewed_javascript_literal,
+)
 from att_toolbox.rpg import iter_string_leaves
 from term_toolbox import grouping as term_grouping
 
@@ -43,6 +50,15 @@ SCRIPT_ENTRIES = [
         )
     ),
 ]
+_GENERIC_EVIDENCE_FOR_TEST = (
+    "exact_location",
+    "active_runtime_consumer",
+    "player_visible_non_image_text",
+    "builtin_not_owner",
+    "rules_cannot_map_reversibly",
+    "extract_group_unit_write_back_mapping",
+    "unique_owner",
+)
 
 
 def run_script(
@@ -70,6 +86,51 @@ def write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
 
 
+def write_jsonl(path: Path, values: Sequence[object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(json.dumps(value, ensure_ascii=False) + "\n" for value in values),
+        encoding="utf-8",
+    )
+
+
+def write_formic_summary(
+    out_root: Path,
+    *,
+    planned: int,
+    already_completed: int = 0,
+    published: int,
+    failed: int = 0,
+    stopped: int = 0,
+    not_started: int = 0,
+) -> None:
+    run = out_root / "runs" / "run-000001"
+    run.mkdir(parents=True, exist_ok=True)
+    write_json(
+        run / "summary.json",
+        {
+            "planned": planned,
+            "already_completed": already_completed,
+            "started": published + failed + stopped,
+            "published": published,
+            "failed": failed,
+            "stopped": stopped,
+            "not_started": not_started,
+            "first_failed": 2 if failed else None,
+            "failed_samples": [2] if failed else [],
+            "first_stopped": None,
+            "stopped_samples": [],
+            "first_incomplete": 2 if failed else None,
+            "incomplete_samples": [2] if failed else [],
+            "failure_reasons": {"monthly_quota": failed} if failed else {},
+            "stop_reason": None,
+            "llm_calls": published + failed,
+            "llm_calls_with_provider_usage": published,
+            "llm_calls_without_provider_usage": failed,
+        },
+    )
+
+
 def assert_four_field_error(result: subprocess.CompletedProcess[str]) -> None:
     for field in ("错误：", "对象：", "原因：", "影响：", "处理办法："):
         assert field in result.stderr
@@ -83,6 +144,8 @@ def mv_game(tmp_path: Path) -> Path:
     data.mkdir(parents=True)
     plugins.mkdir(parents=True)
     (game / "js" / "rpg_core.js").write_text("// MV", encoding="utf-8")
+    (game / "Game.exe").write_bytes(b"")
+    write_json(game / "package.json", {})
     (game / "js" / "plugins.js").write_text(
         'var $plugins = [{"name":"QuestPlugin","status":true,"description":"",'
         '"parameters":{"entries":"[{\\"title\\":\\"Quest Name\\"}]"}}];',
@@ -162,6 +225,7 @@ def test_rpg_inventory_and_rule_tools(mv_game: Path, tmp_path: Path) -> None:
     candidates = tmp_path / "extract-candidates.json"
     extract_decisions = tmp_path / "extract-decisions.json"
     extract_rules = tmp_path / "extract.toml"
+    extract_manifest = tmp_path / "extract-manifest.json"
     write_json(
         extract_decisions,
         {
@@ -183,6 +247,10 @@ def test_rpg_inventory_and_rule_tools(mv_game: Path, tmp_path: Path) -> None:
             extract_decisions,
             "--rules-output",
             extract_rules,
+            "--manifest-output",
+            extract_manifest,
+            "--inventory",
+            inventory,
         ],
     )
     candidate_data = json.loads(candidates.read_text(encoding="utf-8"))
@@ -203,6 +271,193 @@ code = 356
 parameter = 0
 """
     )
+    assert json.loads(extract_manifest.read_text(encoding="utf-8")) == {
+        "rules": [
+            {
+                "rule_number": 1,
+                "source": "data/QuestEntries.json",
+                "rule": {"file": "QuestEntries.json", "path": "[].title"},
+            },
+            {
+                "rule_number": 2,
+                "source": "plugin:QuestPlugin:parameters",
+                "rule": {"plugin": "QuestPlugin", "path": "entries[].title"},
+            },
+            {
+                "rule_number": 3,
+                "source": "event-command:356:parameter:0",
+                "rule": {"code": 356, "parameter": 0},
+            },
+        ]
+    }
+
+
+def test_resource_reference_classification_keeps_natural_text_and_containers() -> None:
+    image = classify_resource_reference(("note",), "Hello.png")
+    sentence = classify_resource_reference(("note",), "Please open Hello.png now")
+    path_sentence = classify_resource_reference(("note",), "Please open img/pictures/Hello.png")
+    spaced_resource = classify_resource_reference(("note",), "img/pictures/Title Picture.png")
+    effect = classify_resource_reference(("effectName",), "Explosion")
+    effect_file = classify_resource_reference(("file",), "effects/Explosion.efkefc")
+    animation = classify_resource_reference(("animationName",), "Slash")
+    encrypted = classify_resource_reference(("file",), "img/pictures/Title.rpgmvp")
+
+    assert image is not None and (image.basis, image.resource_kind) == (
+        "whole_resource_path",
+        "image",
+    )
+    assert sentence is None
+    assert path_sentence is None
+    assert spaced_resource is not None and spaced_resource.resource_kind == "image"
+    assert effect is not None and effect.resource_kind == "other"
+    assert effect_file is not None and effect_file.resource_kind == "other"
+    assert animation is not None and animation.resource_kind == "image"
+    assert encrypted is not None and encrypted.resource_kind == "encrypted"
+    assert classify_resource_reference(("effectName",), "") is None
+    assert is_resource_file_suffix(".efkefc")
+    assert not any(is_resource_file_suffix(suffix) for suffix in (".txt", ".json", ".js"))
+
+
+def test_inventory_scans_install_root_and_excludes_resource_references(
+    mv_game: Path,
+    tmp_path: Path,
+) -> None:
+    install = tmp_path / "installed-game"
+    shutil.copytree(mv_game, install / "www")
+    (install / "patchnotes.txt").write_text("Visible patch notes candidate", encoding="utf-8")
+    (install / "www" / "js" / "plugins" / "QuestPlugin.js").write_text(
+        'window.drawText(require("../../../patchnotes.txt"), 0, 0);\n',
+        encoding="utf-8",
+    )
+    write_json(
+        install / "www" / "data" / "ResourceFacts.json",
+        {
+            "picture": "Hello.png",
+            "effectName": "Explosion",
+            "container": "story.txt",
+            "sentence": "Please open Hello.png now",
+            "emptyImage": "",
+        },
+    )
+
+    inventory = tmp_path / "installed-inventory.json"
+    run_script(
+        TRANSLATE_SCRIPTS / "inspect_rpg_maker.py",
+        ["--game", install, "--output", inventory],
+    )
+    result = json.loads(inventory.read_text(encoding="utf-8"))
+
+    assert result["game_root"] == str(install.resolve())
+    assert result["content_root"] == str((install / "www").resolve())
+    external_paths = {item["path"] for item in result["external_text_candidates"]}
+    assert {"patchnotes.txt", "www/extra.txt"} <= external_paths
+    facts = next(item for item in result["data_candidates"] if item["source"] == "data/ResourceFacts.json")
+    assert facts["candidate_string_count"] == 2
+    assert facts["resource_reference_count"] == 2
+    assert all("value" not in item for item in result["resource_references"])
+    assert {item["resource_kind"] for item in result["resource_references"]} >= {"image", "other"}
+    assert "allowed_terms" not in result
+
+    trace = tmp_path / "root-source-trace.json"
+    run_script(
+        TRANSLATE_SCRIPTS / "trace_runtime_text.py",
+        ["--game", install, "--source", "patchnotes.txt", "--output", trace],
+    )
+    trace_result = json.loads(trace.read_text(encoding="utf-8"))
+    assert trace_result["source"] == "patchnotes.txt"
+    assert trace_result["checks"]["active_runtime_consumer"] == "candidate"
+    assert trace_result["active_consumer_evidence"][0]["exact_static_path_references"]
+
+
+def test_inventory_records_bare_event_resource_parameters(mv_game: Path, tmp_path: Path) -> None:
+    map_path = mv_game / "data" / "Map001.json"
+    map_data = json.loads(map_path.read_text(encoding="utf-8"))
+    commands = map_data["events"][1]["pages"][0]["list"]
+    commands[0:0] = [
+        {"code": 231, "parameters": [1, "TitlePicture", 0, 0, 0, 0, 100, 100, 255, 0]},
+        {"code": 241, "parameters": [{"name": "OpeningTheme", "volume": 90, "pitch": 100}]},
+    ]
+    write_json(map_path, map_data)
+
+    inventory = tmp_path / "event-resource-inventory.json"
+    run_script(
+        TRANSLATE_SCRIPTS / "inspect_rpg_maker.py",
+        ["--game", mv_game, "--output", inventory],
+    )
+    references = json.loads(inventory.read_text(encoding="utf-8"))["resource_references"]
+    assert any(
+        item["source"] == "event-command:231:parameter:1"
+        and item["resource_kind"] == "image"
+        and item["basis"] == "event_resource_parameter"
+        for item in references
+    )
+    assert any(
+        item["source"] == "event-command:241:parameter:0"
+        and item["resource_kind"] == "audio"
+        and item["basis"] == "event_resource_parameter"
+        for item in references
+    )
+
+    rules = tmp_path / "event-resource-rules.json"
+    run_script(
+        TRANSLATE_SCRIPTS / "analyze_extract_rules.py",
+        ["--game", mv_game, "--output", rules],
+    )
+    candidates = json.loads(rules.read_text(encoding="utf-8"))["candidates"]
+    assert not any(
+        item["source"].get("code") in {231, 241}
+        and any(example in {"TitlePicture", "OpeningTheme"} for example in item["examples"])
+        for item in candidates
+    )
+
+
+def test_direct_standard_mv_www_recovers_install_root_and_rejects_unproven_content_root(
+    mv_game: Path,
+    tmp_path: Path,
+) -> None:
+    install = tmp_path / "direct-www-install"
+    shutil.copytree(mv_game, install / "www")
+    (install / "Game.exe").write_bytes(b"")
+    (install / "www" / "package.json").write_text("{}", encoding="utf-8")
+    (install / "patchnotes.txt").write_text("Visible patch notes candidate", encoding="utf-8")
+
+    inventory = tmp_path / "direct-www-inventory.json"
+    run_script(
+        TRANSLATE_SCRIPTS / "inspect_rpg_maker.py",
+        ["--game", install / "www", "--output", inventory],
+    )
+    result = json.loads(inventory.read_text(encoding="utf-8"))
+    assert result["game_root"] == str(install.resolve())
+    assert any(item["path"] == "patchnotes.txt" for item in result["external_text_candidates"])
+
+    trace = tmp_path / "direct-www-trace.json"
+    run_script(
+        TRANSLATE_SCRIPTS / "trace_runtime_text.py",
+        ["--game", install / "www", "--source", "patchnotes.txt", "--output", trace],
+    )
+    assert json.loads(trace.read_text(encoding="utf-8"))["source"] == "patchnotes.txt"
+
+    unproven = tmp_path / "unproven-content"
+    shutil.copytree(mv_game, unproven)
+    (unproven / "Game.exe").unlink()
+    (unproven / "package.json").unlink()
+    rejected_inventory = tmp_path / "unproven-inventory.json"
+    rejected = run_script(
+        TRANSLATE_SCRIPTS / "inspect_rpg_maker.py",
+        ["--game", unproven, "--output", rejected_inventory],
+        expected=1,
+    )
+    assert "无法完整调查游戏安装根" in rejected.stderr
+    assert not rejected_inventory.exists()
+
+    rejected_trace = tmp_path / "unproven-trace.json"
+    traced = run_script(
+        TRANSLATE_SCRIPTS / "trace_runtime_text.py",
+        ["--game", unproven, "--source", "extra.txt", "--output", rejected_trace],
+        expected=1,
+    )
+    assert "无法完整调查游戏安装根" in traced.stderr
+    assert not rejected_trace.exists()
 
 
 def test_inventory_tracks_active_plugin_helper_code(mv_game: Path, tmp_path: Path) -> None:
@@ -315,8 +570,12 @@ pattern = '\\TAG\[[^]\r\n]*\]'
     inventory = tmp_path / "audit-inventory.json"
     decisions = tmp_path / "ownership.json"
     report = tmp_path / "ownership-report.json"
-    audit_manual = tmp_path / "audit-manual.toml"
-    audit_manual.write_text("translation = []\n", encoding="utf-8")
+    audit_ownership = tmp_path / "audit-ownership.jsonl"
+    audit_ownership.write_text("", encoding="utf-8")
+    audit_rules = tmp_path / "audit-rules.toml"
+    audit_rules.write_text("rule = []\n", encoding="utf-8")
+    audit_manifest = tmp_path / "audit-rules-manifest.json"
+    write_json(audit_manifest, {"rules": []})
     write_json(
         inventory,
         {
@@ -351,8 +610,12 @@ pattern = '\\TAG\[[^]\r\n]*\]'
         [
             "--inventory",
             inventory,
-            "--manual",
-            audit_manual,
+            "--ownership",
+            audit_ownership,
+            "--rules",
+            audit_rules,
+            "--rules-manifest",
+            audit_manifest,
             "--decisions",
             decisions,
             "--output",
@@ -911,15 +1174,27 @@ translation = []
     assert (job / "task.md").is_file()
 
     formic_out = tmp_path / "formic-out"
-    formic_out.mkdir()
-    (formic_out / "1.md").write_text("星読み\n村\n", encoding="utf-8")
-    (formic_out / "2.md").write_text("- 星読み\n無\n", encoding="utf-8")
-    (formic_out / "workers").mkdir()
-    (formic_out / "workers" / "ignored.md").write_text("不应读取", encoding="utf-8")
+    results_root = formic_out / "results"
+    results_root.mkdir(parents=True)
+    (results_root / "1.md").write_text("星読み\n村\n", encoding="utf-8")
+    (results_root / "2.md").write_text("- 星読み\n無\n", encoding="utf-8")
+    workers = formic_out / "runs" / "run-000001" / "workers"
+    workers.mkdir(parents=True)
+    (workers / "1.md").write_text("不应读取", encoding="utf-8")
+    write_formic_summary(formic_out, planned=2, published=2)
     candidates = tmp_path / "terms-candidates.json"
     run_script(
         TERM_SCRIPTS / "review_formic_candidates.py",
-        ["--manual", manual, "--formic-out", formic_out, "--output", candidates],
+        [
+            "--manual",
+            manual,
+            "--plan",
+            job / "plan.jsonl",
+            "--formic-out",
+            formic_out,
+            "--output",
+            candidates,
+        ],
     )
     candidate_data = json.loads(candidates.read_text(encoding="utf-8"))
     assert [item["term"] for item in candidate_data["candidates"]] == ["星読み"]
@@ -982,6 +1257,12 @@ def test_cli_and_damaged_inputs_fail_without_outputs(mv_game: Path, tmp_path: Pa
     write_json(duplicate_rules, {"rules": [duplicate_rule, duplicate_rule]})
     candidate_output = tmp_path / "duplicate-candidates.json"
     rules_output = tmp_path / "duplicate-rules.toml"
+    manifest_output = tmp_path / "duplicate-manifest.json"
+    inventory_output = tmp_path / "duplicate-inventory.json"
+    run_script(
+        TRANSLATE_SCRIPTS / "inspect_rpg_maker.py",
+        ["--game", mv_game, "--output", inventory_output],
+    )
     invalid_review = run_script(
         TRANSLATE_SCRIPTS / "analyze_extract_rules.py",
         [
@@ -993,12 +1274,17 @@ def test_cli_and_damaged_inputs_fail_without_outputs(mv_game: Path, tmp_path: Pa
             duplicate_rules,
             "--rules-output",
             rules_output,
+            "--manifest-output",
+            manifest_output,
+            "--inventory",
+            inventory_output,
         ],
         expected=1,
     )
     assert_four_field_error(invalid_review)
     assert not candidate_output.exists()
     assert not rules_output.exists()
+    assert not manifest_output.exists()
 
 
 def test_unicode_paths_empty_plugin_keys_and_toml_escaping(mv_game: Path, tmp_path: Path) -> None:
@@ -1080,26 +1366,50 @@ translation = []
 """,
         encoding="utf-8",
     )
+    job = tmp_path / "formic-job"
+    run_script(TERM_SCRIPTS / "prepare_formic_job.py", ["--manual", manual, "--output", job])
     incomplete_out = tmp_path / "incomplete-out"
-    incomplete_out.mkdir()
-    (incomplete_out / "1.md").write_text("星読み\n", encoding="utf-8")
+    (incomplete_out / "results").mkdir(parents=True)
+    (incomplete_out / "results" / "1.md").write_text("星読み\n", encoding="utf-8")
+    write_formic_summary(incomplete_out, planned=2, published=1, failed=1)
     missing_report = tmp_path / "missing-report.json"
     missing = run_script(
         TERM_SCRIPTS / "review_formic_candidates.py",
-        ["--manual", manual, "--formic-out", incomplete_out, "--output", missing_report],
+        [
+            "--manual",
+            manual,
+            "--plan",
+            job / "plan.jsonl",
+            "--formic-out",
+            incomplete_out,
+            "--output",
+            missing_report,
+        ],
         expected=1,
     )
     assert_four_field_error(missing)
+    assert "缺失 1 个；首个 2；示例：2" in missing.stderr
+    assert "--resume" in missing.stderr
     assert not missing_report.exists()
 
     formic_out = tmp_path / "complete-out"
-    formic_out.mkdir()
-    (formic_out / "1.md").write_text("星読み\n星読み\n存在しない\n村\n", encoding="utf-8")
-    (formic_out / "2.md").write_text("- 星読み\n`星読み`\n無\n", encoding="utf-8")
+    (formic_out / "results").mkdir(parents=True)
+    (formic_out / "results" / "1.md").write_text("星読み\n星読み\n存在しない\n村\n", encoding="utf-8")
+    (formic_out / "results" / "2.md").write_text("- 星読み\n`星読み`\n无\n", encoding="utf-8")
+    write_formic_summary(formic_out, planned=2, published=2)
     report = tmp_path / "candidate-report.json"
     run_script(
         TERM_SCRIPTS / "review_formic_candidates.py",
-        ["--manual", manual, "--formic-out", formic_out, "--output", report],
+        [
+            "--manual",
+            manual,
+            "--plan",
+            job / "plan.jsonl",
+            "--formic-out",
+            formic_out,
+            "--output",
+            report,
+        ],
     )
     result = json.loads(report.read_text(encoding="utf-8"))
     assert [item["term"] for item in result["candidates"]] == ["星読み"]
@@ -1108,6 +1418,97 @@ translation = []
         "not_found_in_corpus",
         "single_occurrence",
     }
+
+
+@pytest.mark.parametrize("invalid_name", ["note.txt", "1.json", "unit.md", "0.md"])
+def test_formic_review_rejects_unknown_result_files(tmp_path: Path, invalid_name: str) -> None:
+    manual = tmp_path / "manual.toml"
+    manual.write_text(
+        """[[translation]]
+id = "Map001.json:event1:page1:dialogue1"
+type = "free"
+source = ["星読み"]
+translation = []
+""",
+        encoding="utf-8",
+    )
+    job = tmp_path / "job"
+    run_script(TERM_SCRIPTS / "prepare_formic_job.py", ["--manual", manual, "--output", job])
+    formic_out = tmp_path / "formic-out"
+    results = formic_out / "results"
+    results.mkdir(parents=True)
+    (results / "1.md").write_text("星読み\n", encoding="utf-8")
+    (results / "output-schema.json").write_text("{}", encoding="utf-8")
+    (results / invalid_name).write_text("unexpected", encoding="utf-8")
+    write_formic_summary(formic_out, planned=1, published=1)
+
+    rejected = run_script(
+        TERM_SCRIPTS / "review_formic_candidates.py",
+        [
+            "--manual",
+            manual,
+            "--plan",
+            job / "plan.jsonl",
+            "--formic-out",
+            formic_out,
+            "--output",
+            tmp_path / "report.json",
+        ],
+        expected=1,
+    )
+    assert_four_field_error(rejected)
+    assert "未知扩展" in rejected.stderr
+
+
+def test_formic_review_rejects_result_directories_and_invalid_summary(tmp_path: Path) -> None:
+    manual = tmp_path / "manual.toml"
+    manual.write_text(
+        """[[translation]]
+id = "Map001.json:event1:page1:dialogue1"
+type = "free"
+source = ["星読み"]
+translation = []
+""",
+        encoding="utf-8",
+    )
+    job = tmp_path / "job"
+    run_script(TERM_SCRIPTS / "prepare_formic_job.py", ["--manual", manual, "--output", job])
+    formic_out = tmp_path / "formic-out"
+    results = formic_out / "results"
+    results.mkdir(parents=True)
+    (results / "1.md").write_text("星読み\n", encoding="utf-8")
+    (results / "unexpected").mkdir()
+    write_formic_summary(formic_out, planned=1, published=1)
+    arguments = [
+        "--manual",
+        manual,
+        "--plan",
+        job / "plan.jsonl",
+        "--formic-out",
+        formic_out,
+        "--output",
+        tmp_path / "report.json",
+    ]
+
+    directory_error = run_script(TERM_SCRIPTS / "review_formic_candidates.py", arguments, expected=1)
+    assert_four_field_error(directory_error)
+    assert "results 包含目录" in directory_error.stderr
+
+    (results / "unexpected").rmdir()
+    summary = formic_out / "runs" / "run-000001" / "summary.json"
+    summary_data = json.loads(summary.read_text(encoding="utf-8"))
+    summary_data["already_completed"] = 1
+    write_json(summary, summary_data)
+    invariant_error = run_script(TERM_SCRIPTS / "review_formic_candidates.py", arguments, expected=1)
+    assert_four_field_error(invariant_error)
+    assert "planned = already_completed + started + not_started" in invariant_error.stderr
+
+    summary_data["already_completed"] = 0
+    summary_data["llm_calls_without_provider_usage"] = 1
+    write_json(summary, summary_data)
+    usage_error = run_script(TERM_SCRIPTS / "review_formic_candidates.py", arguments, expected=1)
+    assert_four_field_error(usage_error)
+    assert "llm_calls = llm_calls_with_provider_usage" in usage_error.stderr
 
 
 def test_atomic_file_failures_preserve_primary_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -1238,6 +1639,70 @@ def test_large_formic_grouping_and_single_pass_occurrence_scan() -> None:
     assert elapsed < 10.0
 
 
+def test_katalist_equivalent_scopes_pack_to_about_two_hundred_units() -> None:
+    entries = [
+        term_common.ManualEntry(
+            readable_id=f"Map{index // 33 + 1:03d}.json:event{index % 33 + 1}:page1:dialogue1",
+            translation_type="free",
+            source=("A" * 1_300,),
+            translation=(),
+        )
+        for index in range(3_308)
+    ]
+    units = term_grouping.build_formic_units(entries)
+
+    assert 180 <= len(units) <= 220
+    assert sum(len(unit.scopes) for unit in units) == 3_308
+    assert all(len(term_grouping.render_formic_unit(unit)) <= 24_000 for unit in units)
+    assert all(len({scope.source for scope in unit.scopes}) == 1 for unit in units)
+
+
+def test_formic_packing_evidence_uses_the_actual_target() -> None:
+    entries = [
+        term_common.ManualEntry(
+            readable_id=f"Map001.json:event{index}:page1:dialogue1",
+            translation_type="free",
+            source=("A" * 300,),
+            translation=(),
+        )
+        for index in range(1, 8)
+    ]
+    units = term_grouping.build_formic_units(entries, target_characters=1_000)
+    evidence = term_grouping.formic_packing_evidence(units, target_characters=1_000)
+
+    assert evidence["target_rendered_characters"] == 1_000
+    assert all(len(term_grouping.render_formic_unit(unit)) <= 1_000 for unit in units)
+
+
+def test_formic_high_unit_count_prints_boundary_evidence(tmp_path: Path) -> None:
+    manual = tmp_path / "many-sources.toml"
+    manual.write_text(
+        "\n".join(
+            f"""[[translation]]
+id = "Map{number:03d}.json:event1:page1:dialogue1"
+type = "free"
+source = ["Text {number}"]
+translation = []
+"""
+            for number in range(1, 252)
+        ),
+        encoding="utf-8",
+    )
+    job = tmp_path / "many-sources-job"
+    result = run_script(
+        TERM_SCRIPTS / "prepare_formic_job.py",
+        ["--manual", manual, "--output", job],
+    )
+
+    assert "装箱边界证据" in result.stdout
+    assert "来源连续段 251" in result.stdout
+    assert (job / "plan.jsonl").read_text(encoding="utf-8").count("\n") == 251
+    evidence = json.loads((job / "packing-evidence.json").read_text(encoding="utf-8"))
+    assert evidence["source_runs"] == 251
+    assert evidence["target_rendered_characters"] == 24_000
+    assert evidence["oversized_scope_details"] == []
+
+
 def test_formic_target_does_not_split_or_reject_one_oversized_entry() -> None:
     entry = term_common.ManualEntry(
         readable_id="Map001.json:event1:page1:dialogue1",
@@ -1249,6 +1714,17 @@ def test_formic_target_does_not_split_or_reject_one_oversized_entry() -> None:
     assert len(units) == 1
     assert units[0].entries == (entry,)
     assert len(term_grouping.render_formic_unit(units[0])) > 24_000
+    evidence = term_grouping.formic_packing_evidence(units, target_characters=24_000)
+    assert evidence["oversized_scopes"] == 1
+    assert evidence["oversized_scope_details"] == [
+        {
+            "unit": 1,
+            "scope": "Map001.json:event1",
+            "source": "Map001.json",
+            "file": "000001-Map001.json_event1.md",
+            "rendered_characters": len(term_grouping.render_formic_unit(units[0])),
+        }
+    ]
 
 
 def test_javascript_lexer_and_unbounded_nested_json() -> None:
@@ -1298,6 +1774,54 @@ call() / maybe / flag;
     assert [(leaf.value, leaf.decoded_layers) for leaf in ordinary_leaves] == [
         (value, 0) for value in ordinary_text
     ]
+
+
+def test_reviewed_roundtrip_helpers_replace_only_exact_approved_locations() -> None:
+    javascript = "const a = 'Menu';\nconst b = 'Menu';\n"
+    replaced = replace_reviewed_javascript_literal(
+        javascript,
+        line=2,
+        source="Menu",
+        translation="菜单's",
+        reviewed=True,
+    )
+    assert replaced.text == "const a = 'Menu';\nconst b = '菜单\\'s';\n"
+    with pytest.raises(att_common.ToolError):
+        replace_reviewed_javascript_literal(
+            javascript,
+            line=1,
+            source="Menu",
+            translation="菜单",
+            reviewed=False,
+        )
+    with pytest.raises(att_common.ToolError):
+        replace_reviewed_javascript_literal(
+            "draw('Menu', 'Menu');\n",
+            line=1,
+            source="Menu",
+            translation="菜单",
+            reviewed=True,
+        )
+
+    source = "Title\r\n\r\nBody\nTail"
+    assert [(line.line_number, line.text, line.ending) for line in plain_text_lines(source)] == [
+        (1, "Title", "\r\n"),
+        (2, "", "\r\n"),
+        (3, "Body", "\n"),
+        (4, "Tail", ""),
+    ]
+    result = apply_reviewed_plain_text_lines(
+        source,
+        [PlainTextReplacement(line_number=3, source="Body", translation="正文")],
+        reviewed=True,
+    )
+    assert result == "Title\r\n\r\n正文\nTail"
+    with pytest.raises(att_common.ToolError):
+        apply_reviewed_plain_text_lines(
+            source,
+            [PlainTextReplacement(line_number=3, source="Changed", translation="正文")],
+            reviewed=True,
+        )
 
 
 @pytest.mark.parametrize(
@@ -1542,18 +2066,26 @@ def test_noncanonical_invalid_data_json_remains_unresolved(mv_game: Path, tmp_pa
     assert unsupported["candidate_paths"] == []
     assert unsupported["rules_supported"] is False
 
-    manual = tmp_path / "invalid-custom-manual.toml"
+    ownership_export = tmp_path / "invalid-custom-ownership.jsonl"
+    current_rules = tmp_path / "invalid-custom-rules.toml"
+    rules_manifest = tmp_path / "invalid-custom-manifest.json"
     decisions = tmp_path / "invalid-custom-decisions.json"
     ownership = tmp_path / "invalid-custom-ownership.json"
-    manual.write_text("translation = []\n", encoding="utf-8")
+    ownership_export.write_text("", encoding="utf-8")
+    current_rules.write_text("rule = []\n", encoding="utf-8")
+    write_json(rules_manifest, {"rules": []})
     write_json(decisions, {"sources": []})
     run_script(
         TRANSLATE_SCRIPTS / "audit_text_ownership.py",
         [
             "--inventory",
             inventory,
-            "--manual",
-            manual,
+            "--ownership",
+            ownership_export,
+            "--rules",
+            current_rules,
+            "--rules-manifest",
+            rules_manifest,
             "--decisions",
             decisions,
             "--output",
@@ -2115,228 +2647,238 @@ def test_log_damage_and_diagnostic_schema_are_not_silenced(tmp_path: Path) -> No
     assert_four_field_error(duplicate_result)
 
 
-def test_ownership_uses_final_manual_and_rejects_blank_generic_evidence(tmp_path: Path) -> None:
+def test_ownership_uses_att_export_and_validates_current_rules(tmp_path: Path) -> None:
     inventory = tmp_path / "inventory.json"
-    manual = tmp_path / "manual.toml"
+    ownership = tmp_path / "ownership.jsonl"
+    rules = tmp_path / "rules.toml"
+    manifest = tmp_path / "rules-manifest.json"
     decisions = tmp_path / "decisions.json"
-    report = tmp_path / "ownership.json"
+    report = tmp_path / "ownership-report.json"
     write_json(
         inventory,
         {
             "text_sources": [
-                {"source": "data/Actors.json:builtin-fields", "kind": "builtin", "builtin": True},
-                {"source": "data/QuestData.json", "kind": "custom_data", "builtin": False},
+                {"source": "data/System.json:builtin-fields", "kind": "builtin", "builtin": True},
+                {"source": "data/CommonEvents.json:builtin-events", "kind": "builtin", "builtin": True},
+                {"source": "data/Troops.json:builtin-events", "kind": "builtin", "builtin": True},
+                {"source": "data/System.json", "kind": "custom_data", "builtin": False},
+                {"source": "data/CommonEvents.json", "kind": "custom_data", "builtin": False},
+                {"source": "data/Troops.json", "kind": "custom_data", "builtin": False},
+                {"source": "event-command:356:parameter:0", "kind": "event_command", "builtin": False},
             ]
         },
     )
-    manual.write_text(
-        """[[translation]]
-id = "Actors.json:1:name"
-type = "fixed"
-source = ["Hero"]
-translation = []
+    rule_definitions = [
+        {"file": "System.json", "path": "customTitle"},
+        {"file": "CommonEvents.json", "path": "[].customCaption"},
+        {"file": "Troops.json", "path": "[].customCaption"},
+        {"code": 356, "parameter": 0},
+    ]
+    rules.write_text(
+        """[[rule]]
+file = 'System.json'
+path = 'customTitle'
 
-[[translation]]
-id = "QuestData.json:quests:4:title"
-type = "fixed"
-source = ["Quest"]
-translation = []
+[[rule]]
+file = 'CommonEvents.json'
+path = '[].customCaption'
+
+[[rule]]
+file = 'Troops.json'
+path = '[].customCaption'
+
+[[rule]]
+code = 356
+parameter = 0
 """,
         encoding="utf-8",
+    )
+    write_json(
+        manifest,
+        {
+            "rules": [
+                {"rule_number": number, "source": source, "rule": rule}
+                for number, (source, rule) in enumerate(
+                    zip(
+                        (
+                            "data/System.json",
+                            "data/CommonEvents.json",
+                            "data/Troops.json",
+                            "event-command:356:parameter:0",
+                        ),
+                        rule_definitions,
+                        strict=True,
+                    ),
+                    start=1,
+                )
+            ]
+        },
+    )
+    write_jsonl(
+        ownership,
+        [
+            {"manual_id": "System.json:gameTitle", "owner": "builtin"},
+            {"manual_id": "CommonEvents.json:event1:dialogue1", "owner": "builtin"},
+            {"manual_id": "Troops.json:troop1:dialogue1", "owner": "builtin"},
+            {"manual_id": "System.json:customTitle", "owner": "rules", "rule_number": 1},
+            {"manual_id": "CommonEvents.json:1:customCaption", "owner": "rules", "rule_number": 2},
+            {"manual_id": "Troops.json:1:customCaption", "owner": "rules", "rule_number": 3},
+            {"manual_id": "Map001.json:event1:command3:text", "owner": "rules", "rule_number": 4},
+        ],
     )
     write_json(
         decisions,
         {
             "sources": [
-                {
-                    "source": "data/QuestData.json",
-                    "owner": "rules",
-                    "evidence": "最终 Extract Rules 命中该公开位置",
-                }
+                {"source": source, "owner": "rules", "evidence": "当前 ownership 导出命中"}
+                for source in (
+                    "data/System.json",
+                    "data/CommonEvents.json",
+                    "data/Troops.json",
+                    "event-command:356:parameter:0",
+                )
             ]
         },
     )
-    run_script(
-        TRANSLATE_SCRIPTS / "audit_text_ownership.py",
-        ["--inventory", inventory, "--manual", manual, "--decisions", decisions, "--output", report],
-    )
+    arguments = [
+        "--inventory",
+        inventory,
+        "--ownership",
+        ownership,
+        "--rules",
+        rules,
+        "--rules-manifest",
+        manifest,
+        "--decisions",
+        decisions,
+        "--output",
+        report,
+    ]
+    run_script(TRANSLATE_SCRIPTS / "audit_text_ownership.py", arguments)
     result = json.loads(report.read_text(encoding="utf-8"))
     assert result["complete"] is True
-    assert {row["source"]: row["extracted_entry_count"] for row in result["sources"]} == {
-        "data/Actors.json:builtin-fields": 1,
-        "data/QuestData.json": 1,
-    }
+    assert result["ownership_entry_count"] == 7
 
-    generic_inventory = tmp_path / "generic-conflict-inventory.json"
-    generic_manual = tmp_path / "generic-conflict-manual.toml"
-    generic_decisions = tmp_path / "generic-conflict-decisions.json"
-    generic_report = tmp_path / "generic-conflict-report.json"
-    write_json(
-        generic_inventory,
-        {"text_sources": [{"source": "story.jsonl", "kind": "external_file", "builtin": False}]},
+    rules.write_text(
+        rules.read_text(encoding="utf-8").replace("customTitle", "editedTitle"), encoding="utf-8"
     )
-    generic_manual.write_text(
-        """[[translation]]
-id = "story.jsonl:line1:unit1:text"
-type = "fixed"
-source = ["Story"]
-translation = []
-""",
-        encoding="utf-8",
-    )
-    write_json(
-        generic_decisions,
-        {
-            "sources": [
-                {
-                    "source": "story.jsonl",
-                    "owner": "generic",
-                    "manual_prefixes": ["story.jsonl:"],
-                    "evidence": {
-                        "exact_location": "story.jsonl",
-                        "active_runtime_consumer": "active loader",
-                        "player_visible_non_image_text": "visible text call",
-                        "builtin_not_owner": "not a Builtin source",
-                        "rules_cannot_map_reversibly": "not a Rules data source",
-                        "extract_group_unit_write_back_mapping": "mapping reviewed",
-                        "unique_owner": "Generic only",
-                    },
-                }
-            ]
-        },
-    )
-    generic_failed = run_script(
+    mismatch = run_script(
         TRANSLATE_SCRIPTS / "audit_text_ownership.py",
-        [
-            "--inventory",
-            generic_inventory,
-            "--manual",
-            generic_manual,
-            "--decisions",
-            generic_decisions,
-            "--output",
-            generic_report,
-        ],
+        [*arguments[:-1], tmp_path / "mismatch-report.json"],
         expected=1,
     )
-    assert_four_field_error(generic_failed)
-    generic_result = json.loads(generic_report.read_text(encoding="utf-8"))
-    assert generic_result["complete"] is False
-    assert generic_result["ownership_conflicts"][0]["owner"] == "generic"
+    assert "与当前 Rules TOML 不一致" in mismatch.stderr
 
-    unsupported_inventory = tmp_path / "unsupported-rules-inventory.json"
-    unsupported_manual = tmp_path / "unsupported-rules-manual.toml"
-    unsupported_decisions = tmp_path / "unsupported-rules-decisions.json"
-    unsupported_report = tmp_path / "unsupported-rules-report.json"
+
+def test_ownership_aggregates_duplicate_plugin_matches_and_rejects_manual_prefixes(tmp_path: Path) -> None:
+    inventory = tmp_path / "plugin-inventory.json"
+    ownership = tmp_path / "plugin-ownership.jsonl"
+    rules = tmp_path / "plugin-rules.toml"
+    manifest = tmp_path / "plugin-manifest.json"
+    decisions = tmp_path / "plugin-decisions.json"
+    report = tmp_path / "plugin-report.json"
+    source = "plugin:Duplicate:parameters"
+    rule = {"plugin": "Duplicate", "path": "caption"}
     write_json(
-        unsupported_inventory,
-        {
-            "text_sources": [
-                {
-                    "source": "data/custom/Quest.json",
-                    "kind": "nested_data_json",
-                    "builtin": False,
-                    "rules_supported": False,
-                }
-            ]
-        },
+        inventory,
+        {"text_sources": [{"source": source, "kind": "plugin_parameter", "builtin": False}]},
     )
-    unsupported_manual.write_text("translation = []\n", encoding="utf-8")
+    rules.write_text("[[rule]]\nplugin = 'Duplicate'\npath = 'caption'\n", encoding="utf-8")
+    write_json(manifest, {"rules": [{"rule_number": 1, "source": source, "rule": rule}]})
+    write_jsonl(
+        ownership,
+        [
+            {"manual_id": "plugins.js:plugin1:caption", "owner": "rules", "rule_number": 1},
+            {"manual_id": "plugins.js:plugin2:caption", "owner": "rules", "rule_number": 1},
+        ],
+    )
     write_json(
-        unsupported_decisions,
-        {
-            "sources": [
-                {
-                    "source": "data/custom/Quest.json",
-                    "owner": "rules",
-                    "evidence": "nested candidate reviewed",
-                    "zero_text_reason": "expected no current text",
-                }
-            ]
-        },
+        decisions,
+        {"sources": [{"source": source, "owner": "rules", "evidence": "两个活动同名插件都命中"}]},
     )
     run_script(
         TRANSLATE_SCRIPTS / "audit_text_ownership.py",
         [
             "--inventory",
-            unsupported_inventory,
-            "--manual",
-            unsupported_manual,
+            inventory,
+            "--ownership",
+            ownership,
+            "--rules",
+            rules,
+            "--rules-manifest",
+            manifest,
             "--decisions",
-            unsupported_decisions,
+            decisions,
             "--output",
-            unsupported_report,
+            report,
         ],
-        expected=1,
     )
-    unsupported_result = json.loads(unsupported_report.read_text(encoding="utf-8"))
-    assert unsupported_result["complete"] is False
-    assert unsupported_result["ownership_conflicts"][0]["owner"] == "rules"
+    assert json.loads(report.read_text(encoding="utf-8"))["sources"][0]["manual_entry_count"] == 2
 
-    blank_inventory = tmp_path / "blank-inventory.json"
-    blank_manual = tmp_path / "blank-manual.toml"
-    blank_decisions = tmp_path / "blank-decisions.json"
     write_json(
-        blank_inventory,
-        {"text_sources": [{"source": "story.jsonl", "kind": "external_file", "builtin": False}]},
-    )
-    blank_manual.write_text("translation = []\n", encoding="utf-8")
-    write_json(
-        blank_decisions,
+        decisions,
         {
             "sources": [
                 {
-                    "source": "story.jsonl",
-                    "owner": "generic",
-                    "evidence": {
-                        field: " "
-                        for field in (
-                            "exact_location",
-                            "active_runtime_consumer",
-                            "player_visible_non_image_text",
-                            "builtin_not_owner",
-                            "rules_cannot_map_reversibly",
-                            "extract_group_unit_write_back_mapping",
-                            "unique_owner",
-                        )
-                    },
+                    "source": source,
+                    "owner": "rules",
+                    "evidence": "命中",
+                    "manual_prefixes": ["plugins.js:"],
                 }
             ]
         },
     )
-    blank = run_script(
+    rejected = run_script(
         TRANSLATE_SCRIPTS / "audit_text_ownership.py",
         [
             "--inventory",
-            blank_inventory,
-            "--manual",
-            blank_manual,
+            inventory,
+            "--ownership",
+            ownership,
+            "--rules",
+            rules,
+            "--rules-manifest",
+            manifest,
             "--decisions",
-            blank_decisions,
+            decisions,
             "--output",
-            tmp_path / "blank-report.json",
+            tmp_path / "prefix-report.json",
         ],
         expected=1,
     )
-    assert_four_field_error(blank)
+    assert "manual_prefixes" in rejected.stderr
 
 
-def test_ownership_indexes_many_custom_data_sources(tmp_path: Path) -> None:
+def test_ownership_generic_evidence_and_large_rule_export(tmp_path: Path) -> None:
     source_count = 500
     entry_count = 2_000
     inventory = tmp_path / "large-inventory.json"
-    manual = tmp_path / "large-manual.toml"
+    ownership = tmp_path / "large-ownership.jsonl"
+    rules = tmp_path / "large-rules.toml"
+    manifest = tmp_path / "large-manifest.json"
     decisions = tmp_path / "large-decisions.json"
-    report = tmp_path / "large-ownership.json"
+    report = tmp_path / "large-report.json"
     sources = [f"data/Custom{number:04d}.json" for number in range(source_count)]
     write_json(
         inventory,
-        {
-            "text_sources": [
-                {"source": source, "kind": "custom_data", "builtin": False}
-                for source in sources
-            ]
-        },
+        {"text_sources": [{"source": source, "kind": "custom_data", "builtin": False} for source in sources]},
+    )
+    rule = {"file": "Custom0000.json", "path": "[].text"}
+    rules.write_text("[[rule]]\nfile = 'Custom0000.json'\npath = '[].text'\n", encoding="utf-8")
+    write_json(
+        manifest,
+        {"rules": [{"rule_number": 1, "source": sources[0], "rule": rule}]},
+    )
+    write_jsonl(
+        ownership,
+        [
+            {
+                "manual_id": f"Custom0000.json:rows:{number}:text",
+                "owner": "rules",
+                "rule_number": 1,
+            }
+            for number in range(entry_count)
+        ],
     )
     write_json(
         decisions,
@@ -2345,43 +2887,73 @@ def test_ownership_indexes_many_custom_data_sources(tmp_path: Path) -> None:
                 {
                     "source": source,
                     "owner": "rules" if number == 0 else "excluded",
-                    "evidence": "最终 Rules 命中" if number == 0 else "已确认没有玩家可见文字",
+                    "evidence": "当前 Rules 命中" if number == 0 else "确认没有玩家可见文字",
                 }
                 for number, source in enumerate(sources)
             ]
         },
     )
-    manual.write_text(
-        "\n".join(
-            f'''[[translation]]
-id = "Custom0000.json:rows:{number}:text"
-type = "fixed"
-source = ["Text {number}"]
-translation = []
-'''
-            for number in range(entry_count)
-        ),
-        encoding="utf-8",
-    )
-
     started = time.perf_counter()
     run_script(
         TRANSLATE_SCRIPTS / "audit_text_ownership.py",
-        ["--inventory", inventory, "--manual", manual, "--decisions", decisions, "--output", report],
+        [
+            "--inventory",
+            inventory,
+            "--ownership",
+            ownership,
+            "--rules",
+            rules,
+            "--rules-manifest",
+            manifest,
+            "--decisions",
+            decisions,
+            "--output",
+            report,
+        ],
     )
     elapsed = time.perf_counter() - started
-
     result = json.loads(report.read_text(encoding="utf-8"))
     assert result["complete"] is True
-    assert result["counts"] == {
-        "builtin": 0,
-        "rules": 1,
-        "generic": 0,
-        "excluded": source_count - 1,
-        "unresolved": 0,
-    }
-    assert result["sources"][0]["extracted_entry_count"] == entry_count
+    assert result["sources"][0]["manual_entry_count"] == entry_count
     assert elapsed < 10.0
+
+    generic_inventory = tmp_path / "generic-inventory.json"
+    generic_decisions = tmp_path / "generic-decisions.json"
+    write_json(
+        generic_inventory,
+        {"text_sources": [{"source": "story.jsonl", "kind": "external_file", "builtin": False}]},
+    )
+    write_json(
+        generic_decisions,
+        {
+            "sources": [
+                {
+                    "source": "story.jsonl",
+                    "owner": "generic",
+                    "evidence": {field: " " for field in _GENERIC_EVIDENCE_FOR_TEST},
+                }
+            ]
+        },
+    )
+    rejected = run_script(
+        TRANSLATE_SCRIPTS / "audit_text_ownership.py",
+        [
+            "--inventory",
+            generic_inventory,
+            "--ownership",
+            ownership,
+            "--rules",
+            rules,
+            "--rules-manifest",
+            manifest,
+            "--decisions",
+            generic_decisions,
+            "--output",
+            tmp_path / "generic-report.json",
+        ],
+        expected=1,
+    )
+    assert_four_field_error(rejected)
 
 
 def test_atomic_directory_rejects_windows_rooted_names(tmp_path: Path) -> None:

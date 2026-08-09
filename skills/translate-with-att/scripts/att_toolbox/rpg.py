@@ -61,6 +61,7 @@ _PLUGINS_ASSIGNMENT = re.compile(r"(?:\b(?:var|let|const)\s+)?\$plugins\s*=")
 class GameInfo:
     supplied_root: Path
     content_root: Path
+    game_root: Path | None
     engine: str
 
 
@@ -167,7 +168,45 @@ def discover_game(path: Path) -> GameInfo:
             "缺少 rpg_core.js 与 rmmz_core.js，无法确认 MV 或 MZ",
             "使用包含权威核心脚本的未损坏游戏内容根；不要用插件描述或参数猜测引擎",
         )
-    return GameInfo(supplied_root=supplied, content_root=content, engine=engine)
+    game_root: Path | None
+    if supplied != content:
+        # 使用者明确给出了包含内容根的安装根；它本身就是本次允许调查的范围。
+        game_root = supplied
+    elif (
+        content.name.casefold() == "www"
+        and (content.parent / "Game.exe").exists()
+        and (content / "package.json").exists()
+    ):
+        # 只有标准 Windows MV 的两个运行入口事实同时存在时，才把直接传入的 www
+        # 安全提升到父安装根。任意内容目录不能据此递归读取父目录。
+        parent = require_directory(content.parent, "MV 游戏安装根")
+        require_file_within(parent / "Game.exe", parent, "MV Game.exe")
+        require_file_within(content / "package.json", content, "MV package.json")
+        game_root = parent
+    elif (content / "Game.exe").exists() and (content / "package.json").exists():
+        require_file_within(content / "Game.exe", content, "游戏 Game.exe")
+        require_file_within(content / "package.json", content, "游戏 package.json")
+        game_root = content
+    else:
+        game_root = None
+    return GameInfo(
+        supplied_root=supplied,
+        content_root=content,
+        game_root=game_root,
+        engine=engine,
+    )
+
+
+def require_game_root(game: GameInfo) -> Path:
+    """返回已经由显式范围或标准运行入口确认的完整游戏根。"""
+
+    if game.game_root is None:
+        fail(
+            str(game.supplied_root),
+            "只确认了 RPG Maker 内容根，无法完整调查游戏安装根中的文本来源",
+            "传入包含该内容根的实际游戏安装根；标准 Windows MV 也可直接传入同时具有父级 Game.exe 和本目录 package.json 的 www",
+        )
+    return game.game_root
 
 
 def _extract_json_array(text: str, object_name: str) -> list[JsonValue]:

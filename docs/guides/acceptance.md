@@ -57,9 +57,15 @@ MV/MZ 内容必须按[翻译项目指南](translation-project.md#31-mvmz-必须�
 
 - Builtin 覆盖与排除符合 [Extract 规格](../rpg-maker/extraction.md)；
 - 每份 Rules 的真实来源、命中、路径、捕获、Group、自然顺序和写回 recipe 正确；
+- ownership 导出中的每个 Manual 条目都有唯一 owner；Rules 的自然 rule number 与审核时
+  保存的 manifest、当前 Rules TOML 和 inventory 来源逐条一致；
 - Rules 的所有跳过警告逐项有结论；
 - Builtin 与 Rules 没有 Mutation Claim 冲突、遗漏或重复归属；
 - 需要 Placeholder 保护的控制符和协议壳已经纳入当前资源。
+
+图片、音频、视频、字体、RPG Maker 加密资源和整值资源路径应当作为资源引用排除，而不是
+作为可翻译文本或 `allowed_terms` 接受。自然句中出现资源扩展名时仍按完整语境判断，不能
+用后缀过滤整句。
 
 ### Generic
 
