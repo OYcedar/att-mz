@@ -66,6 +66,12 @@ $formicFileMappings = @(
     'FORMIC-SOURCE.md',
     'formic.exe',
     'LICENSE',
+    'README.md'
+)
+$formicDirectoryMappings = @(
+    'docs'
+)
+$retiredFormicFiles = @(
     'VCRUNTIME140.dll'
 )
 
@@ -236,12 +242,12 @@ function Test-SynchronizedResources {
         $failures.Add("Formic 发行目录缺失：$formicDestination")
     }
     else {
-        $expectedFormicFiles = @($formicFileMappings + 'config.toml') | Sort-Object
+        $expectedFormicItems = @(
+            $formicFileMappings + $formicDirectoryMappings + 'config.toml'
+        ) | Sort-Object
         $actualFormicItems = @(Get-ChildItem -LiteralPath $formicDestination -Force)
-        $actualFormicFiles = @($actualFormicItems | Where-Object { -not $_.PSIsContainer } |
-                ForEach-Object Name | Sort-Object)
-        if ($actualFormicItems.Count -ne $actualFormicFiles.Count -or
-            ($expectedFormicFiles -join "`n") -cne ($actualFormicFiles -join "`n")) {
+        $actualFormicNames = @($actualFormicItems | ForEach-Object Name | Sort-Object)
+        if (($expectedFormicItems -join "`n") -cne ($actualFormicNames -join "`n")) {
             $failures.Add("Formic 发行目录文件集合不正确：$formicDestination")
         }
         foreach ($name in $formicFileMappings) {
@@ -252,6 +258,30 @@ function Test-SynchronizedResources {
             }
             elseif ((Get-FileDigest -Path $source) -ne (Get-FileDigest -Path $destination)) {
                 $failures.Add("Formic 发行文件与源码不同：$destination")
+            }
+        }
+        foreach ($name in $formicDirectoryMappings) {
+            $source = Join-Path $formicSource $name
+            $destination = Join-Path $formicDestination $name
+            if (-not (Test-Path -LiteralPath $destination -PathType Container)) {
+                $failures.Add("Formic 发行目录缺失：$destination")
+                continue
+            }
+
+            $sourceFiles = Get-DirectoryDigestMap -Root $source
+            $distributionFiles = Get-DirectoryDigestMap -Root $destination
+            $allRelativePaths = @($sourceFiles.Keys + $distributionFiles.Keys) |
+                Sort-Object -Unique
+            foreach ($relativePath in $allRelativePaths) {
+                if (-not $sourceFiles.ContainsKey($relativePath)) {
+                    $failures.Add("Formic 发行目录包含源码已不存在的文件：$destination\$relativePath")
+                }
+                elseif (-not $distributionFiles.ContainsKey($relativePath)) {
+                    $failures.Add("Formic 发行目录缺少文件：$destination\$relativePath")
+                }
+                elseif ($sourceFiles[$relativePath] -ne $distributionFiles[$relativePath]) {
+                    $failures.Add("Formic 发行文件与源码不同：$destination\$relativePath")
+                }
             }
         }
     }
@@ -342,6 +372,10 @@ try {
         Copy-Item -LiteralPath (Join-Path $formicSource $name) `
             -Destination (Join-Path $stagedFormic $name)
     }
+    foreach ($name in $formicDirectoryMappings) {
+        Copy-Item -LiteralPath (Join-Path $formicSource $name) `
+            -Destination $stagedFormic -Recurse -Force
+    }
 
     foreach ($mapping in $fileMappings) {
         $staged = Join-Path $stagingRoot ([System.IO.Path]::GetFileName($mapping.Destination))
@@ -379,9 +413,28 @@ try {
     if (-not (Test-Path -LiteralPath $formicDestination -PathType Container)) {
         New-Item -ItemType Directory -Path $formicDestination | Out-Null
     }
+    foreach ($name in $retiredFormicFiles) {
+        $retired = Join-Path $formicDestination $name
+        Assert-DistributionChild -Path $retired
+        if (Test-Path -LiteralPath $retired) {
+            if (-not (Test-Path -LiteralPath $retired -PathType Leaf)) {
+                throw "Formic 已停用发行文件不是普通文件：$retired"
+            }
+            Remove-Item -LiteralPath $retired -Force
+        }
+    }
     foreach ($name in $formicFileMappings) {
         Copy-Item -LiteralPath (Join-Path $stagedFormic $name) `
             -Destination (Join-Path $formicDestination $name) -Force
+    }
+    foreach ($name in $formicDirectoryMappings) {
+        $destination = Join-Path $formicDestination $name
+        Assert-DistributionChild -Path $destination
+        if (Test-Path -LiteralPath $destination) {
+            Assert-NoReparsePoint -Path $destination -Recurse
+            Remove-Item -LiteralPath $destination -Recurse -Force
+        }
+        Move-Item -LiteralPath (Join-Path $stagedFormic $name) -Destination $destination
     }
     if (-not (Test-Path -LiteralPath $formicActiveConfigDestination)) {
         Copy-Item -LiteralPath (Join-Path $stagedFormic 'config.example.toml') `
