@@ -1804,6 +1804,112 @@ fn mv_dialogue_crosses_extract_translate_and_write_back_processes() {
 }
 
 #[test]
+fn rules_failure_after_builtin_commit_keeps_known_failed_terminal_state() {
+    let temporary = tempfile::tempdir().expect("应可建立 Rules 失败回归测试目录");
+    let root = temporary.path();
+    let game = root.join("mz-game");
+    write_minimal_mz_game(&game);
+    let items_path = game.join("data/Items.json");
+    let mut items = read_items(&items_path);
+    items[1]["customShortName"] = json!(7);
+    fs::write(
+        &items_path,
+        serde_json::to_vec(&items).expect("无效 Rules 目标夹具应可序列化"),
+    )
+    .expect("无效 Rules 目标夹具应可写入");
+    write_extract_rules(root, Some("customShortName"));
+    write_configuration(root, "http://127.0.0.1:9/v1/chat/completions");
+
+    assert_success(
+        "Rules 失败回归项目 Init",
+        &run_att(root, init_arguments("mz", &game)),
+    );
+    let workspace = distribution_root(root).join("projects/mz").join(PROJECT);
+    let logs = workspace.join("logs");
+    let logs_before = fs::read_dir(&logs)
+        .expect("失败 Extract 前日志目录应可读取")
+        .map(|entry| entry.expect("失败 Extract 前日志项应可读取").path())
+        .collect::<Vec<_>>();
+
+    let extract = run_att(
+        root,
+        arguments(&[
+            "mz",
+            "extract",
+            "--name",
+            PROJECT,
+            "--builtin",
+            "--rules",
+            "rules.toml",
+        ]),
+    );
+
+    assert_eq!(extract.status.code(), Some(1));
+    assert_eq!(
+        read_owner_units(&workspace.join("project.db"), "builtin"),
+        vec![(json!(SOURCE_TEXT), None)],
+        "后续 Rules 失败必须保留已提交的 Builtin 结果"
+    );
+    let stderr = String::from_utf8(extract.stderr).expect("失败诊断必须是 UTF-8");
+    assert_eq!(
+        stderr.matches("错误：").count(),
+        1,
+        "主错误只能呈现一次：{stderr}"
+    );
+    assert!(
+        !stderr.contains("警告："),
+        "普通 Rules 失败不得追加日志合同警告：{stderr}"
+    );
+    assert!(
+        stderr.contains("此前确认的进度仍然保留；指出的内容没有完成"),
+        "Rules 失败必须保留 ProgressPreserved 语义：{stderr}"
+    );
+    for misleading in [
+        "project_log",
+        "已保存的项目状态不满足本次操作",
+        "最终结果未知",
+    ] {
+        assert!(
+            !stderr.contains(misleading),
+            "普通 Rules 失败不得显示误导性收尾诊断 {misleading:?}：{stderr}"
+        );
+    }
+
+    let new_logs = fs::read_dir(&logs)
+        .expect("失败 Extract 后日志目录应可读取")
+        .map(|entry| entry.expect("失败 Extract 后日志项应可读取").path())
+        .filter(|path| !logs_before.contains(path))
+        .collect::<Vec<_>>();
+    assert_eq!(new_logs.len(), 1, "一次失败 Extract 只能新增一份项目日志");
+    let records = read_project_log_records(&new_logs[0]);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["event"] == "diagnostic.run")
+            .count(),
+        1,
+        "Rules 主错误不得被日志合同错误重复或替换"
+    );
+    assert!(
+        records
+            .iter()
+            .all(|record| record["event"] != "run_plan.finalized"),
+        "业务失败前未执行运行方案保存，不得伪造最终化事件"
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["event"] == "run.finished")
+            .count(),
+        1,
+        "失败运行必须只有一个终态"
+    );
+    let terminal = records.last().expect("失败运行必须有终态");
+    assert_eq!(terminal["event"], "run.finished");
+    assert_eq!(terminal["payload"]["result"]["kind"], "failed");
+}
+
+#[test]
 fn rules_owner_replaces_writes_back_and_disables_without_touching_builtin() {
     let temporary = tempfile::tempdir().expect("应可建立 Rules 端到端测试目录");
     let root = temporary.path();

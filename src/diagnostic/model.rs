@@ -591,7 +591,9 @@ mod tests {
     use super::*;
     use crate::diagnostic::{
         ByteRange, ConfigurationValueRule, GenericUnitLocator, HttpEndpoint, HttpScheme,
-        PlaceholderIssue, PlaceholderRuleSource, SafeIdentifier, SafeText, TranslationIssue,
+        PlaceholderIssue, PlaceholderRuleSource, RpgMakerIssue, RpgMakerRulesDiagnosticSource,
+        RpgMakerRulesMatchContext, RpgMakerRulesMatchProblem, RpgMakerRulesValueStep,
+        SafeIdentifier, SafeText, TranslationIssue,
     };
 
     fn missing_capture() -> Diagnostic {
@@ -842,5 +844,39 @@ mod tests {
         assert!(reason.contains("Placeholder rule 2"));
         assert!(reason.contains("D:/rules.toml"));
         assert!(!reason.contains("4..12"), "不得公开编码位置");
+    }
+
+    #[test]
+    fn rules_zero_width_diagnostic_names_rule_target_and_direct_reason() {
+        let report = DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::rpg_maker(RpgMakerIssue::rules_match(
+                "rules.toml",
+                Some(RpgMakerRulesMatchContext::new(
+                    RpgMakerRulesDiagnosticSource::DataFile {
+                        file: SafeText::new("States.json"),
+                    },
+                    true,
+                )),
+                RpgMakerRulesMatchProblem::ZeroWidthMatch {
+                    rule_number: 3,
+                    at: vec![
+                        RpgMakerRulesValueStep::Index { index: 415 },
+                        RpgMakerRulesValueStep::key("note"),
+                    ],
+                    match_range: ByteRange::new(27, 27).expect("零宽范围仍是有效字节范围"),
+                },
+            )),
+        );
+
+        let fields =
+            render_diagnostic_fields(&report, &UiLocalizer::new(crate::i18n::UiLocale::English));
+
+        assert_eq!(
+            fields.object,
+            r#"rules.toml:Rules[3] -> States.json$[415]["note"]"#
+        );
+        assert_eq!(fields.reason, "The text capture is empty");
+        assert!(!fields.reason.contains("27"), "不得公开原文字节位置");
     }
 }

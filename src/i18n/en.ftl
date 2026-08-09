@@ -221,6 +221,7 @@ diagnostic-failure-value = { $code ->
     [invalid_syntax] The value has invalid syntax
     [invalid_encoding] The value has invalid text encoding
     [invalid_value] The value violates the required contract
+    [empty_text_capture] The text capture is empty
     [rules_owner_disabled] The selected Rules file uses rule = []; Rules was disabled and its extracted assets were removed
     [not_found] The required object does not exist
     [state_mismatch] The stored project state does not satisfy this operation

@@ -221,6 +221,7 @@ diagnostic-failure-value = { $code ->
     [invalid_syntax] La syntaxe de la valeur est incorrecte
     [invalid_encoding] L’encodage du texte est incorrect
     [invalid_value] La valeur ne respecte pas le contrat requis
+    [empty_text_capture] La capture text est vide
     [rules_owner_disabled] Le fichier Rules sélectionné utilise rule = [] ; Rules a été désactivé et ses ressources extraites ont été supprimées
     [not_found] L’objet requis n’existe pas
     [state_mismatch] L’état enregistré du projet ne satisfait pas cette opération

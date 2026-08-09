@@ -1602,6 +1602,7 @@ mod tests {
             "concurrent_shutdown",
             "conflicting_values",
             "duplicate_identifier",
+            "empty_text_capture",
             "executor_closed",
             "executor_state_poisoned",
             "external_service_rejected",

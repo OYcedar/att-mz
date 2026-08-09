@@ -218,6 +218,7 @@ diagnostic-failure-value = { $code ->
     [invalid_syntax] Cú pháp của giá trị không hợp lệ
     [invalid_encoding] Mã hóa văn bản không hợp lệ
     [invalid_value] Giá trị vi phạm hợp đồng bắt buộc
+    [empty_text_capture] Phần bắt text trống
     [rules_owner_disabled] Tệp Rules đã chọn dùng rule = []; Rules đã bị tắt và các tài nguyên trích xuất của nó đã bị xóa
     [not_found] Đối tượng bắt buộc không tồn tại
     [state_mismatch] Trạng thái dự án đã lưu không đáp ứng thao tác này

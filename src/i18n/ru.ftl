@@ -223,6 +223,7 @@ diagnostic-failure-value = { $code ->
     [invalid_syntax] Значение имеет недопустимый синтаксис
     [invalid_encoding] Недопустимая кодировка текста
     [invalid_value] Значение нарушает обязательный контракт
+    [empty_text_capture] Именованная группа text пуста
     [rules_owner_disabled] Выбранный файл Rules содержит rule = []; Rules отключён, а извлечённые им ресурсы удалены
     [not_found] Требуемый объект не существует
     [state_mismatch] Сохранённое состояние проекта не соответствует этой операции
