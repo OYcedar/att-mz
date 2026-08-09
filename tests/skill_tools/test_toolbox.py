@@ -689,6 +689,163 @@ def test_write_back_accepts_event_text_reflow_but_keeps_event_structure_strict(
     ]
 
 
+@pytest.mark.parametrize(
+    ("header_code", "body_code", "header_parameters"),
+    [
+        (101, 401, ["", 0, 0, 2]),
+        (105, 405, [2, False]),
+    ],
+)
+def test_write_back_advances_source_index_for_identical_event_body_templates(
+    mv_game: Path,
+    tmp_path: Path,
+    header_code: int,
+    body_code: int,
+    header_parameters: list[object],
+) -> None:
+    map_path = mv_game / "data" / "Map001.json"
+    map_data = json.loads(map_path.read_text(encoding="utf-8"))
+    map_data["events"][1]["pages"][0]["list"] = [
+        {"code": header_code, "indent": 0, "parameters": header_parameters},
+        {"code": body_code, "indent": 0, "parameters": ["First"]},
+        {"code": body_code, "indent": 0, "parameters": ["Second"]},
+        {"code": 0, "indent": 0, "parameters": []},
+    ]
+    write_json(map_path, map_data)
+    baseline = tmp_path / f"identical-template-{header_code}-baseline"
+    run_script(
+        TRANSLATE_SCRIPTS / "verify_write_back.py",
+        ["snapshot", "--game", mv_game, "--output", baseline],
+    )
+
+    output_game = tmp_path / f"identical-template-{header_code}-output"
+    shutil.copytree(mv_game, output_game)
+    output_map_path = output_game / "data" / "Map001.json"
+    output_map = json.loads(output_map_path.read_text(encoding="utf-8"))
+    output_map["events"][1]["pages"][0]["list"][1]["parameters"][0] = "译文"
+    write_json(output_map_path, output_map)
+
+    report = tmp_path / f"identical-template-{header_code}-report.json"
+    run_script(
+        TRANSLATE_SCRIPTS / "verify_write_back.py",
+        [
+            "verify",
+            "--game",
+            mv_game,
+            "--output-root",
+            output_game,
+            "--baseline",
+            baseline,
+            "--report",
+            report,
+        ],
+    )
+    result = json.loads(report.read_text(encoding="utf-8"))
+    assert result["string_values"]["translated_or_changed"] == 1
+    assert result["structural_differences"] == 0
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [Path("Map001lighting.json"), Path("custom") / "Quest.json"],
+    ids=["noncanonical-top-level", "nested"],
+)
+def test_write_back_accepts_identical_unparseable_nonstandard_data_and_rejects_changes(
+    mv_game: Path,
+    tmp_path: Path,
+    relative: Path,
+) -> None:
+    source = mv_game / "data" / relative
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("0.5,0.6\n", encoding="utf-8")
+    baseline = tmp_path / f"invalid-{relative.stem}-baseline"
+    run_script(
+        TRANSLATE_SCRIPTS / "verify_write_back.py",
+        ["snapshot", "--game", mv_game, "--output", baseline],
+    )
+
+    unchanged_output = tmp_path / f"invalid-{relative.stem}-unchanged"
+    shutil.copytree(mv_game, unchanged_output)
+    unchanged_report = tmp_path / f"invalid-{relative.stem}-unchanged-report.json"
+    run_script(
+        TRANSLATE_SCRIPTS / "verify_write_back.py",
+        [
+            "verify",
+            "--game",
+            mv_game,
+            "--output-root",
+            unchanged_output,
+            "--baseline",
+            baseline,
+            "--report",
+            unchanged_report,
+        ],
+    )
+    unchanged_result = json.loads(unchanged_report.read_text(encoding="utf-8"))
+    assert unchanged_result["output_json_valid"] is True
+    assert unchanged_result["invalid_output_json"] == []
+
+    changed_output = tmp_path / f"invalid-{relative.stem}-changed"
+    shutil.copytree(mv_game, changed_output)
+    changed_file = changed_output / "data" / relative
+    changed_file.write_text("0.7,0.8\n", encoding="utf-8")
+    changed_report = tmp_path / f"invalid-{relative.stem}-changed-report.json"
+    run_script(
+        TRANSLATE_SCRIPTS / "verify_write_back.py",
+        [
+            "verify",
+            "--game",
+            mv_game,
+            "--output-root",
+            changed_output,
+            "--baseline",
+            baseline,
+            "--report",
+            changed_report,
+        ],
+        expected=1,
+    )
+    changed_result = json.loads(changed_report.read_text(encoding="utf-8"))
+    assert changed_result["output_json_valid"] is False
+    assert changed_result["invalid_output_json"][0]["path"] == f"data/{relative.as_posix()}"
+    assert "字节不同" in changed_result["invalid_output_json"][0]["reason"]
+
+
+@pytest.mark.parametrize("file_name", ["Actors.json", "Map001.json"])
+def test_write_back_rejects_identical_unparseable_standard_or_canonical_data(
+    mv_game: Path,
+    tmp_path: Path,
+    file_name: str,
+) -> None:
+    (mv_game / "data" / file_name).write_text("[{\n", encoding="utf-8")
+    baseline = tmp_path / f"invalid-strict-{file_name}-baseline"
+    run_script(
+        TRANSLATE_SCRIPTS / "verify_write_back.py",
+        ["snapshot", "--game", mv_game, "--output", baseline],
+    )
+    output_game = tmp_path / f"invalid-strict-{file_name}-output"
+    shutil.copytree(mv_game, output_game)
+    report = tmp_path / f"invalid-strict-{file_name}-report.json"
+    run_script(
+        TRANSLATE_SCRIPTS / "verify_write_back.py",
+        [
+            "verify",
+            "--game",
+            mv_game,
+            "--output-root",
+            output_game,
+            "--baseline",
+            baseline,
+            "--report",
+            report,
+        ],
+        expected=1,
+    )
+    result = json.loads(report.read_text(encoding="utf-8"))
+    assert result["output_json_valid"] is False
+    assert result["invalid_output_json"][0]["path"] == f"data/{file_name}"
+
+
 def test_write_back_baseline_uses_natural_copies_and_detects_source_change(
     mv_game: Path, tmp_path: Path
 ) -> None:
@@ -2162,6 +2319,69 @@ translation = []
         expected=1,
     )
     assert_four_field_error(blank)
+
+
+def test_ownership_indexes_many_custom_data_sources(tmp_path: Path) -> None:
+    source_count = 500
+    entry_count = 2_000
+    inventory = tmp_path / "large-inventory.json"
+    manual = tmp_path / "large-manual.toml"
+    decisions = tmp_path / "large-decisions.json"
+    report = tmp_path / "large-ownership.json"
+    sources = [f"data/Custom{number:04d}.json" for number in range(source_count)]
+    write_json(
+        inventory,
+        {
+            "text_sources": [
+                {"source": source, "kind": "custom_data", "builtin": False}
+                for source in sources
+            ]
+        },
+    )
+    write_json(
+        decisions,
+        {
+            "sources": [
+                {
+                    "source": source,
+                    "owner": "rules" if number == 0 else "excluded",
+                    "evidence": "最终 Rules 命中" if number == 0 else "已确认没有玩家可见文字",
+                }
+                for number, source in enumerate(sources)
+            ]
+        },
+    )
+    manual.write_text(
+        "\n".join(
+            f'''[[translation]]
+id = "Custom0000.json:rows:{number}:text"
+type = "fixed"
+source = ["Text {number}"]
+translation = []
+'''
+            for number in range(entry_count)
+        ),
+        encoding="utf-8",
+    )
+
+    started = time.perf_counter()
+    run_script(
+        TRANSLATE_SCRIPTS / "audit_text_ownership.py",
+        ["--inventory", inventory, "--manual", manual, "--decisions", decisions, "--output", report],
+    )
+    elapsed = time.perf_counter() - started
+
+    result = json.loads(report.read_text(encoding="utf-8"))
+    assert result["complete"] is True
+    assert result["counts"] == {
+        "builtin": 0,
+        "rules": 1,
+        "generic": 0,
+        "excluded": source_count - 1,
+        "unresolved": 0,
+    }
+    assert result["sources"][0]["extracted_entry_count"] == entry_count
+    assert elapsed < 10.0
 
 
 def test_atomic_directory_rejects_windows_rooted_names(tmp_path: Path) -> None:

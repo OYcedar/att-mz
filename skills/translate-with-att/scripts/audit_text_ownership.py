@@ -152,14 +152,12 @@ def _decisions(path: Path, known_sources: set[str]) -> dict[str, dict[str, JsonV
 _DATA_SOURCE = re.compile(r"\Adata/(?P<file>[^/:]+\.json)(?::builtin-(?:fields|events))?\Z")
 
 
-def _automatic_match(source: str, readable_id: str, all_sources: set[str]) -> bool:
+def _automatic_match(source: str, readable_id: str, files_with_builtin_peer: set[str]) -> bool:
     match = _DATA_SOURCE.fullmatch(source)
     if match is not None:
         file_name = match.group("file")
         is_builtin = ":builtin-" in source
-        has_builtin_peer = any(
-            candidate.startswith(f"data/{file_name}:builtin-") for candidate in all_sources
-        )
+        has_builtin_peer = file_name in files_with_builtin_peer
         if not readable_id.startswith(f"{file_name}:"):
             return False
         if not is_builtin:
@@ -192,6 +190,55 @@ def _automatic_match(source: str, readable_id: str, all_sources: set[str]) -> bo
     return False
 
 
+class _PrefixNode:
+    __slots__ = ("children", "sources")
+
+    def __init__(self) -> None:
+        self.children: dict[str, _PrefixNode] = {}
+        self.sources: set[str] = set()
+
+
+class _ManualPrefixIndex:
+    """按字符索引人工前缀，避免每个 Manual 位置扫描全部来源和前缀。"""
+
+    def __init__(self, decisions: dict[str, dict[str, JsonValue]]) -> None:
+        self._root = _PrefixNode()
+        for source, decision in decisions.items():
+            raw_prefixes = decision.get("manual_prefixes")
+            if not isinstance(raw_prefixes, list):
+                continue
+            for prefix in cast(list[str], raw_prefixes):
+                node = self._root
+                for character in prefix:
+                    node = node.children.setdefault(character, _PrefixNode())
+                node.sources.add(source)
+
+    def matches(self, readable_id: str) -> set[str]:
+        matches: set[str] = set()
+        node = self._root
+        for character in readable_id:
+            child = node.children.get(character)
+            if child is None:
+                break
+            node = child
+            matches.update(node.sources)
+        return matches
+
+
+def _automatic_source_index(sources: set[str]) -> tuple[dict[str, list[str]], set[str]]:
+    by_file: dict[str, list[str]] = {}
+    files_with_builtin_peer: set[str] = set()
+    for source in sorted(sources):
+        match = _DATA_SOURCE.fullmatch(source)
+        if match is None:
+            continue
+        file_name = match.group("file")
+        by_file.setdefault(file_name, []).append(source)
+        if ":builtin-" in source:
+            files_with_builtin_peer.add(file_name)
+    return by_file, files_with_builtin_peer
+
+
 def _audit(args: argparse.Namespace) -> int:
     protect_outputs(
         [args.output],
@@ -205,18 +252,16 @@ def _audit(args: argparse.Namespace) -> int:
     unresolved_mapping: list[str] = []
     duplicate_locations: list[JsonValue] = []
     all_sources = set(sources)
+    automatic_sources, files_with_builtin_peer = _automatic_source_index(all_sources)
+    prefix_index = _ManualPrefixIndex(decisions)
     for entry in manual_entries:
-        claims: list[str] = []
-        for source in sorted(sources):
-            automatic = _automatic_match(source, entry.readable_id, all_sources)
-            prefixes: list[str] = []
-            decision = decisions.get(source)
-            if decision is not None:
-                raw_prefixes = decision.get("manual_prefixes")
-                if isinstance(raw_prefixes, list):
-                    prefixes.extend(cast(list[str], raw_prefixes))
-            if automatic or any(entry.readable_id.startswith(prefix) for prefix in prefixes):
-                claims.append(source)
+        claim_set = prefix_index.matches(entry.readable_id)
+        file_name, separator, _ = entry.readable_id.partition(":")
+        if separator:
+            for source in automatic_sources.get(file_name, []):
+                if _automatic_match(source, entry.readable_id, files_with_builtin_peer):
+                    claim_set.add(source)
+        claims = sorted(claim_set)
         if not claims:
             unresolved_mapping.append(entry.readable_id)
             continue
