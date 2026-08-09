@@ -27,7 +27,7 @@ from att_skill_tools import (
     safe_walk_files,
     write_json,
 )
-from att_toolbox.rpg import discover_game
+from att_toolbox.rpg import STANDARD_DATA_FILES, canonical_map_files, discover_game
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -232,13 +232,26 @@ def _match_event_body_templates(source: list[JsonValue], output: list[JsonValue]
     source_templates = [_event_body_template(command) for command in source]
     matched: list[JsonValue] = []
     source_index = 0
+    previous_source_index: int | None = None
     for output_command in output:
         output_template = _event_body_template(output_command)
+        if output_template is None:
+            return None
+        if source_index < len(source_templates) and source_templates[source_index] == output_template:
+            matched.append(source[source_index])
+            previous_source_index = source_index
+            source_index += 1
+            continue
+        if previous_source_index is not None and source_templates[previous_source_index] == output_template:
+            matched.append(source[previous_source_index])
+            continue
         while source_index < len(source_templates) and source_templates[source_index] != output_template:
             source_index += 1
-        if source_index == len(source_templates) or output_template is None:
+        if source_index == len(source_templates):
             return None
         matched.append(source[source_index])
+        previous_source_index = source_index
+        source_index += 1
     return matched
 
 
@@ -384,6 +397,8 @@ def _verify(args: argparse.Namespace) -> int:
     output_data = output_game.content_root / "data"
     source_json_files = [path for path in safe_walk_files(source_data) if path.suffix.lower() == ".json"]
     output_json_files = [path for path in safe_walk_files(output_data) if path.suffix.lower() == ".json"]
+    strict_source_json = set(canonical_map_files(source_data))
+    strict_source_json.update(source_data / name for name in STANDARD_DATA_FILES)
     invalid_json: list[JsonValue] = []
     missing_output: list[str] = []
     same_strings = changed_strings = structural_changes = 0
@@ -401,6 +416,25 @@ def _verify(args: argparse.Namespace) -> int:
         output_path = require_file_within(output_path, output_game.content_root, "WriteBack JSON")
         try:
             source_json = read_json(source_path, allowed_root=game.content_root)
+        except ToolError as source_error:
+            try:
+                read_json(output_path, allowed_root=output_game.content_root)
+            except ToolError as output_error:
+                if source_path not in strict_source_json:
+                    if _same_bytes(source_path, output_path):
+                        continue
+                    invalid_json.append(
+                        {
+                            "path": natural_path,
+                            "reason": "源与输出都无法解析为 JSON，且文件字节不同",
+                        }
+                    )
+                    continue
+                invalid_json.append({"path": natural_path, "reason": output_error.reason})
+                continue
+            invalid_json.append({"path": natural_path, "reason": source_error.reason})
+            continue
+        try:
             output_json = read_json(output_path, allowed_root=output_game.content_root)
         except ToolError as error:
             invalid_json.append({"path": natural_path, "reason": error.reason})
