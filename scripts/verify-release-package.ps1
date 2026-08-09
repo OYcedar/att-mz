@@ -307,16 +307,13 @@ if ($toolItems.Count -ne 1 -or $toolItems[0].Name -cne 'formic' -or
 $formicExecutable = Join-Path $formicDirectory 'formic.exe'
 $formicDependencies = Get-PeDependencies -Executable $formicExecutable
 $unexpectedFormicDependencies = @(
-    $formicDependencies | Where-Object {
-        $_ -cne 'VCRUNTIME140.dll' -and -not (Test-AllowedSystemDependency $_)
-    }
+    $formicDependencies | Where-Object { -not (Test-AllowedSystemDependency $_) }
 )
 if ($unexpectedFormicDependencies.Count -gt 0) {
     throw "formic.exe 含有未声明的非系统动态依赖：$($unexpectedFormicDependencies -join ', ')"
 }
-if ($formicDependencies -notcontains 'VCRUNTIME140.dll' -or
-    -not (Test-Path -LiteralPath (Join-Path $formicDirectory 'VCRUNTIME140.dll') -PathType Leaf)) {
-    throw 'formic.exe 所需的 VCRUNTIME140.dll 未随包提供。'
+if (Get-ChildItem -LiteralPath $formicDirectory -File -Filter '*.dll') {
+    throw '静态 Formic Release 不应携带 DLL。'
 }
 
 Assert-MarkdownLinks

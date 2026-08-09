@@ -49,11 +49,11 @@ Init 前不存在，由 ATT 在实际需要时建立。游戏、JSONL、Rules、
 | `docs/` | 与仓库 `docs/` 的完整文件集合和内容完全相同 |
 | `prompts/` | 与仓库 `prompts/` 的完整文件集合和内容完全相同 |
 | `skills/` | 与仓库 `skills/` 的完整文件集合和内容完全相同 |
-| `licenses/` | 与仓库 `licenses/` 的完整文件集合和内容完全相同；`THIRD-PARTY-LICENSES.html` 对应 ATT 依赖，`FORMIC-THIRD-PARTY-LICENSES.html` 对应随包 Formic v0.2.0 依赖 |
-| `tools/formic/` | Formic v0.2.0 Windows x64：`formic.exe`、同目录运行库、许可与来源说明、配置模板和首次创建后保留的活动配置 |
+| `licenses/` | 与仓库 `licenses/` 的完整文件集合和内容完全相同；`THIRD-PARTY-LICENSES.html` 对应 ATT 依赖，`FORMIC-THIRD-PARTY-LICENSES.html` 对应随包 Formic 依赖 |
+| `tools/formic/` | 当前 Formic Windows x64 静态 `Release`：`formic.exe`、许可与来源说明、配置模板、README、完整用户文档和首次创建后保留的活动配置；不得携带 DLL |
 | `projects/` | 运行期项目工作区；不属于仓库资源同步集合，已有项目内容不能被发行资源同步覆盖或删除 |
 
-`docs/`、`prompts/`、`skills/`、`licenses/`、两个配置模板和 Formic 的静态文件都是发行
+`docs/`、`prompts/`、`skills/`、`licenses/`、两个配置模板和 Formic 的程序与用户文档都是发行
 托管资源，必须与当前仓库权威来源一致。两份活动 `config.toml` 只在干净发行根中要求与
 各自模板完全相同；普通更新遇到已有活动配置时必须逐字节保留，不能把它的内容差异当作资源
 不同。目录内多出源码中已不存在的托管文件、缺少托管文件或任一托管文件内容不同，才表示
@@ -85,7 +85,7 @@ Skill 可以随包提供标准库 Python 辅助程序，用于加速调查和准
 - `README.md`、`LICENSE`、`config.example.toml` → `dist/` 下的同名文件；
 - `dist/config.toml` 不存在时，从根 `config.example.toml` 首次创建；已经存在时逐字节保留；
 - `licenses/`、`docs/`、`prompts/`、`skills/` → `dist/` 下的同名目录。
-- `tools/formic/` 中的程序、运行库、许可、来源说明和配置模板 → 发行包同名目录；活动
+- `tools/formic/` 中的程序、许可、来源说明、配置模板、README 和完整用户文档 → 发行包同名目录；活动
   `config.toml` 缺失时从模板创建，已经存在时逐字节保留。
 
 普通执行同步这些资源；`-Check` 只比较映射后的文件集合和逐文件 SHA-256，并检查脚本明确
@@ -99,7 +99,7 @@ Skill 可以随包提供标准库 Python 辅助程序，用于加速调查和准
 完整发行检查因此同时承担以下责任：
 
 1. 确认 `att.exe` 是当前目标平台的 `Release` 构建结果，并能从发行根启动；
-2. 确认 `formic.exe --help` 能从随包目录启动，并且需要的运行库和许可已经随包提供；
+2. 确认 `formic.exe --help` 能从随包目录启动、只依赖受支持 Windows 的系统 DLL，并且许可与用户文档已经随包提供；
 3. 执行资源同步检查，确认映射文件没有缺失、陈旧副本或内容差异；
 4. 确认两个托管配置模板采用已经验证的高吞吐默认且不含秘密；检查干净公开发行时，还必须
    确认两份活动配置逐字节等于各自模板，并且不含真实 API key、token 等凭据；
