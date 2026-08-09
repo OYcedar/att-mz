@@ -99,7 +99,7 @@ result-translate-status-value = { $status ->
     [incomplete] 미완료
    *[other] __ATT_FALLBACK__
 }
-result-translate-summary = 번역: 작업 { $total }, 완료 { $complete }, 부분 { $partial }, 사용 불가 { $unavailable }; { $written }개 위치 기록, { $remaining }개 남음
+result-translate-summary = 번역: 계획 작업 { $total }개, 시작 { $started }개, 미시작 { $not_started }개, 완료 { $complete }개, 부분 { $partial }개, 사용 불가 { $unavailable }개, 실패 { $failed }개, 취소 { $cancelled }개; { $written }개 위치 기록, { $remaining }개 남음
 result-translate-convergence = 상태 수렴: 유지 { $retained }, 무효화 { $invalidated }, 해당 없음 { $not_applicable }, 재사용 { $reused }
 result-write-back-completed = 쓰기 완료: { $project }
 result-project-lua-completed = 프로젝트 Lua 실행 완료: { $project }
@@ -107,13 +107,21 @@ result-output-directory = 출력 디렉터리: { $path }
 result-write-back-summary = 쓰기: 번역 { $translated }단위, 원문 { $original }단위; 자동 줄바꿈 { $auto_wrapped }, 줄바꿈 추가 { $breaks }, 전각 들여쓰기 추가 { $indents }; 수동 배치 { $manual }
 result-generic-extract-unchanged = Generic 입력 변경 없음: 파일 { $files }개, 그룹 { $groups }개, 단위 { $units }개
 result-generic-extract-updated = Generic 입력 갱신: 파일 { $files }개, 그룹 { $groups }개, 단위 { $units }개; 번역 { $preserved }개 유지, { $cleared }개 삭제
-result-generic-translate-summary = Generic 번역: 작업 { $total }, 완료 { $complete }, 부분 { $partial }, 사용 불가 { $unavailable }; 초기화 { $cleared }, 재사용 { $reused }, 수락 { $accepted }, 기록 { $written }, 충돌 { $conflicted }, 응답 문제 { $problems }
+result-generic-translate-summary = Generic 번역: 계획 작업 { $total }개, 시작 { $started }개, 미시작 { $not_started }개, 완료 { $complete }개, 부분 { $partial }개, 사용 불가 { $unavailable }개, 실패 { $failed }개, 취소 { $cancelled }개; 계획 Unit { $planned_units }개, 남은 Unit { $remaining_units }개, 초기화 { $cleared }, 재사용 { $reused }, 수락 { $accepted }, 기록 { $written }, 충돌 { $conflicted }, 응답 문제 { $problems }
 result-generic-write-back-summary = Generic 쓰기: 번역 { $translated }단위, 원문 유지 { $original }단위
 result-symbol-repair-summary = 기호 복구: { $attempted }개 단위 시도, { $repaired }개 복구, 내부 건너뜀 { $skipped }개, 기호 { $replacements }개 교체
 result-run-log = 실행 기록: { $path }
 translate-incomplete-object = 프로젝트 { $project }의 이번 Translate
-translate-incomplete-rpg-maker-reason = 부분 작업 { $partial }개, 사용 불가 작업 { $unavailable }개, 프로토콜 문제 { $protocol }개, 요청 소진 { $exhausted }개, 남은 결정 { $remaining_decisions }개, 남은 위치 { $remaining_locations }개
-translate-incomplete-generic-reason = 부분 작업 { $partial }개, 사용 불가 작업 { $unavailable }개, 쓰기 충돌 { $conflicted }개, 응답 문제 { $problems }개
+translate-incomplete-rpg-maker-reason = 부분 작업 { $partial }개, 사용 불가 작업 { $unavailable }개, 미시작 작업 { $not_started }개, 프로토콜 문제 { $protocol }개, 요청 소진 { $exhausted }개, 요청 접수 {
+    $admission ->
+        [stopped] 중지
+       *[open] 유지
+    }, 남은 결정 { $remaining_decisions }개, 남은 위치 { $remaining_locations }개
+translate-incomplete-generic-reason = 부분 작업 { $partial }개, 사용 불가 작업 { $unavailable }개, 미시작 작업 { $not_started }개, 요청 소진 { $exhausted }개, 요청 접수 {
+    $admission ->
+        [stopped] 중지
+       *[open] 유지
+    }, 남은 Unit { $remaining_units }개, 쓰기 충돌 { $conflicted }개, 응답 문제 { $problems }개
 translate-incomplete-help = 이번 실행 기록의 작업 진단을 확인하고 반복 가능한 문제를 수정한 뒤 Translate를 다시 실행하십시오. 남은 항목이 적으면 Manual을 사용할 수 있습니다
 result-cancelled = 안전한 마무리 후 명령을 취소했습니다.
 result-plan-saved = 성공한 실행 계획을 저장했습니다.
@@ -247,6 +255,7 @@ diagnostic-failure-value = { $code ->
     [target_already_exists] 대상이 이미 존재합니다
     [file_identity_changed] 작업 중 파일 ID가 변경되었습니다
     [invalid_path] 경로가 이 작업에 유효한 대상이 아닙니다
+    [not_regular_file] 기존 대상이 일반 파일이 아닙니다
     [wrong_publisher_instance] 게시 토큰이 다른 게시자 인스턴스에 속합니다
     [journal_corrupt] 게시 복구 저널이 잘못되었거나 불완전합니다
     [unexpected_artifact] 예기치 않은 파일 시스템 산출물이 작업을 막고 있습니다
@@ -329,6 +338,7 @@ diagnostic-json-position = { $line }행 { $column }열
 diagnostic-placeholder-rule-file = { $path }의 Placeholder 규칙 { $number }
 diagnostic-placeholder-rule-project = 현재 프로젝트의 Placeholder 규칙 { $number }
 manual-exported = { $entries }개 항목을 { $path }에 내보냈습니다
+manual-ownership-exported = 소유권 기록: { $path }
 manual-checked = 유효 { $valid }, 미입력 { $unfilled }, 오류 { $errors }
 manual-applied = 적용 { $applied }, 미입력 { $unfilled }, 오류 { $errors }
 manual-value = { $code ->
@@ -340,6 +350,7 @@ manual-value = { $code ->
     [rerun_export_without_controls] manual export를 다시 실행하고 배열 항목에 줄바꿈이나 NUL을 넣지 마세요
     [rerun_export_then_fill] manual export를 다시 실행한 뒤 번역을 입력하세요
     [resolve_temporary_then_rerun_export] 표시된 고정 임시 경로를 확인하고 남은 객체가 있으면 제거한 다음 manual export를 다시 실행하세요
+    [resolve_published_backup_cleanup] 두 내보내기가 적용되었습니다. 출력을 확인한 뒤 표시된 고정 backup 파일을 삭제하세요
     [keep_exported_type] manual export가 기록한 type을 유지하세요
    *[other] __ATT_FALLBACK__
 }

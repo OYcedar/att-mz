@@ -271,6 +271,10 @@ pub(super) struct MatchedRuleTarget {
 }
 
 impl MatchedRuleTarget {
+    pub(super) const fn rule_number(&self) -> usize {
+        self.rule_number
+    }
+
     pub(super) const fn kind(&self) -> TextGroupKind {
         self.kind
     }

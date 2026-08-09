@@ -1421,7 +1421,7 @@ mod tests {
         let progress = TerminalProgress::with_writer(writer, phase_label);
         let observer = progress.observer();
         let dispatch = Arc::clone(
-            &observer
+            observer
                 .dispatch
                 .as_ref()
                 .expect("所有输出环境必须启动进度 writer"),

@@ -468,12 +468,16 @@ fn generic_fixed_http_503_is_unavailable_and_preserves_the_structured_status() {
             "summary": {
                 "engine": "generic",
                 "summary": {
+                    "planned_units": 1,
+                    "remaining_units": 1,
                     "cleared_units": 0,
                     "reused_units": 0,
                     "accepted_units": 0,
                     "written_units": 0,
                     "conflicted_units": 0,
                     "response_problems": 0,
+                    "recoverable_request_exhaustions": 1,
+                    "request_admission_stopped": false,
                 },
             },
         }),
@@ -874,10 +878,11 @@ fn generic_write_back_reports_recovery_required_after_publish_cleanup_failure() 
         .expect("输出文件必须拥有父目录")
         .canonicalize()
         .expect("已发布输出根必须可规范化");
-    assert_eq!(
-        diagnostic["payload"]["object"],
-        canonical_output_root.to_string_lossy().as_ref()
-    );
+    let canonical_output_root = canonical_output_root.to_string_lossy();
+    let public_output_root = canonical_output_root
+        .strip_prefix(r"\\?\")
+        .unwrap_or(canonical_output_root.as_ref());
+    assert_eq!(diagnostic["payload"]["object"], public_output_root);
     assert_eq!(
         diagnostic["payload"]["reason"],
         "The operation result exists but finalization failed"
@@ -1027,6 +1032,20 @@ fn generic_cancellation_finishes_started_tasks_and_counts_unstarted_tasks() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let stderr = String::from_utf8_lossy(&output.stderr).replace(['\u{2068}', '\u{2069}'], "");
+    for expected in [
+        "command was cancelled",
+        "4 planned tasks",
+        "1 started",
+        "3 not started",
+        "1 cancelled",
+        "4 remaining units",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "取消终端摘要缺少 {expected:?}：\n{stderr}"
+        );
+    }
 
     let logs = jsonl_files(&logs_root)
         .into_iter()
@@ -1087,12 +1106,16 @@ fn generic_cancellation_finishes_started_tasks_and_counts_unstarted_tasks() {
         serde_json::json!({
             "engine": "generic",
             "summary": {
+                "planned_units": 4,
+                "remaining_units": 4,
                 "cleared_units": 0,
                 "reused_units": 0,
                 "accepted_units": 0,
                 "written_units": 0,
                 "conflicted_units": 0,
                 "response_problems": 0,
+                "recoverable_request_exhaustions": 0,
+                "request_admission_stopped": false,
             },
         }),
         "取消终态必须保存已确认的全零 Generic 业务汇总：{log}"

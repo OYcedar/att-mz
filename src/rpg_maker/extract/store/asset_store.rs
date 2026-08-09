@@ -191,6 +191,7 @@ const INSERT_UNIT_PREFIX: &str = r#"INSERT INTO rpg_maker_text_unit (
     owner,
     group_id,
     unit_role,
+    rule_number,
     semantic_order_key,
     source_content_json,
     source_context_json,
@@ -202,12 +203,13 @@ const INSERT_UNIT: &str = r#"INSERT INTO rpg_maker_text_unit (
     owner,
     group_id,
     unit_role,
+    rule_number,
     semantic_order_key,
     source_content_json,
     source_context_json,
     translation_content_json,
     translation_state
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#;
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#;
 
 const DEACTIVATE_OWNER: &str = "DELETE FROM rpg_maker_asset_owner_state WHERE owner = ?";
 
@@ -238,6 +240,7 @@ ORDER BY semantic_order_key"#;
 const READ_OWNER_UNITS: &str = r#"SELECT
     text_group.group_location,
     unit.unit_role,
+    unit.rule_number,
     unit.semantic_order_key,
     unit.source_content_json,
     unit.source_context_json,
@@ -1951,12 +1954,13 @@ impl EncodedSnapshot {
     fn inherit_translations(&mut self, previous_unit_rows: Vec<SqliteRow>) {
         let mut translations = HashMap::<u64, Vec<InheritedUnitTranslation>>::new();
         for row in previous_unit_rows {
-            let Ok(values) = <[SqliteValue; 7]>::try_from(row.into_values()) else {
+            let Ok(values) = <[SqliteValue; 8]>::try_from(row.into_values()) else {
                 continue;
             };
             let [
                 SqliteValue::Text(group_location),
                 SqliteValue::Text(unit_role),
+                _,
                 SqliteValue::Blob(_),
                 SqliteValue::Text(source_content_json),
                 SqliteValue::Text(source_context_json),
@@ -2088,6 +2092,7 @@ fn stored_unit_row_matches(row: Option<&SqliteRow>, expected: &EncodedUnit) -> b
         [
             SqliteValue::Text(group_location),
             SqliteValue::Text(unit_role),
+            rule_number,
             SqliteValue::Blob(semantic_order_key),
             SqliteValue::Text(source_content_json),
             SqliteValue::Text(source_context_json),
@@ -2095,11 +2100,22 @@ fn stored_unit_row_matches(row: Option<&SqliteRow>, expected: &EncodedUnit) -> b
             translation_state,
         ] if group_location == &expected.group_location
             && unit_role == &expected.unit_role
+            && sqlite_rule_number_matches(rule_number, expected.rule_number)
             && semantic_order_key == &expected.semantic_order_key_blob
             && source_content_json == &expected.source_content_json
             && source_context_json == &expected.source_context_json
             && stored_translation_pair_is_valid(translation_content_json, translation_state)
     )
+}
+
+fn sqlite_rule_number_matches(value: &SqliteValue, expected: Option<usize>) -> bool {
+    match (value, expected) {
+        (SqliteValue::Null, None) => true,
+        (SqliteValue::Integer(value), Some(expected)) => {
+            usize::try_from(*value).ok() == Some(expected)
+        }
+        _ => false,
+    }
 }
 
 fn stored_translation_pair_is_valid(content: &SqliteValue, state: &SqliteValue) -> bool {
@@ -2141,6 +2157,7 @@ struct EncodedUnit {
     group_id: i64,
     group_location: String,
     unit_role: String,
+    rule_number: Option<usize>,
     semantic_order_key_blob: Vec<u8>,
     source_content_json: String,
     source_context_json: String,
@@ -2280,6 +2297,7 @@ fn encode_batch(
                 group_location: group_location.clone(),
                 unit_role: RpgMakerProjectionCodec::encode_role(unit.role())
                     .map_err(EncodeAssetSnapshotError::Projection)?,
+                rule_number: unit.rule_number(),
                 semantic_order_key_blob,
                 source_content_json: serde_json::to_string(unit.source_content())
                     .map_err(EncodeAssetSnapshotError::SourceContent)?,
@@ -2520,7 +2538,7 @@ fn build_transaction_steps(
         .with_id("extract.mutation_claim_conflict"),
     ));
     if !units.is_empty() {
-        let mut parameter_values = Vec::with_capacity(units.len().saturating_mul(7));
+        let mut parameter_values = Vec::with_capacity(units.len().saturating_mul(8));
         for unit in units {
             let (translation_content_json, translation_state) = match unit.translation {
                 Some(translation) => (
@@ -2532,6 +2550,11 @@ fn build_transaction_steps(
             parameter_values.extend([
                 SqliteValue::Integer(unit.group_id),
                 text(unit.unit_role),
+                unit.rule_number.map_or(SqliteValue::Null, |value| {
+                    SqliteValue::Integer(
+                        i64::try_from(value).expect("Rules 自然序号必须可写入 SQLite INTEGER"),
+                    )
+                }),
                 SqliteValue::Blob(unit.semantic_order_key_blob),
                 text(unit.source_content_json),
                 text(unit.source_context_json),
@@ -2542,7 +2565,7 @@ fn build_transaction_steps(
         steps.push(SqliteTransactionStep::ExecuteMany(
             SqliteBatch::bulk_insert_flat(
                 INSERT_UNIT_PREFIX,
-                7,
+                8,
                 vec![text(owner.storage_name())],
                 parameter_values,
             ),
@@ -3319,7 +3342,7 @@ mod tests {
             SqliteValue::Blob(expected_group_blob)
         );
         assert_eq!(
-            blob_parameter(INSERT_UNIT, 2),
+            blob_parameter(INSERT_UNIT, 3),
             SqliteValue::Blob(expected_unit_blob)
         );
     }
@@ -3650,6 +3673,9 @@ mod tests {
         let previous = SqliteRow::new(vec![
             text(unit.group_location.clone()),
             text(unit.unit_role.clone()),
+            unit.rule_number.map_or(SqliteValue::Null, |value| {
+                SqliteValue::Integer(i64::try_from(value).expect("规则序号应可编码"))
+            }),
             SqliteValue::Blob(previous_semantic_order_key),
             text(unit.source_content_json.clone()),
             text(unit.source_context_json.clone()),
@@ -3714,7 +3740,7 @@ mod tests {
         for (statement, prefix, row_parameter_count) in [
             (INSERT_CLAIM, INSERT_CLAIM_PREFIX, 3),
             (INSERT_GROUP, INSERT_GROUP_PREFIX, 5),
-            (INSERT_UNIT, INSERT_UNIT_PREFIX, 7),
+            (INSERT_UNIT, INSERT_UNIT_PREFIX, 8),
         ] {
             let batch = plan
                 .steps()
@@ -3856,10 +3882,11 @@ mod tests {
 
         let unit_keys = batch(INSERT_UNIT)
             .parameter_rows()
-            .map(|row| match (&row[0], &row[1], &row[2]) {
+            .map(|row| match (&row[0], &row[1], &row[2], &row[3]) {
                 (
                     SqliteValue::Integer(group_id),
                     SqliteValue::Text(unit_role),
+                    SqliteValue::Null,
                     SqliteValue::Blob(semantic_order_key),
                 ) => (*group_id, semantic_order_key.clone(), unit_role.clone()),
                 _ => panic!("Unit 物理键应保持规范类型"),
@@ -4293,7 +4320,7 @@ mod tests {
         let mut connection = Connection::open_in_memory().expect("应创建内存数据库");
         create_current_schema(&connection);
         seed_snapshot(&connection, &old, r#""译文""#, &[0x44; 32]);
-        let previous_unit_rows = read_rows(&connection, READ_OWNER_UNITS, owner, 7);
+        let previous_unit_rows = read_rows(&connection, READ_OWNER_UNITS, owner, 8);
         execute_plan(
             &mut connection,
             build_transaction_plan(
@@ -4349,7 +4376,7 @@ mod tests {
         let mut connection = Connection::open_in_memory().expect("应创建内存数据库");
         create_current_schema(&connection);
         seed_snapshot(&connection, &old, r#""旧译文""#, &[0x44; 32]);
-        let previous_unit_rows = read_rows(&connection, READ_OWNER_UNITS, owner, 7);
+        let previous_unit_rows = read_rows(&connection, READ_OWNER_UNITS, owner, 8);
 
         execute_plan(
             &mut connection,
@@ -4967,8 +4994,8 @@ mod tests {
         .expect("快照应可合并");
         let mut stored = snapshot_rows(&encoded);
         let mut values = stored.units[0].values().to_vec();
-        values[5] = text(r#""已有译文""#);
-        values[6] = SqliteValue::Blob(vec![0x44; 32]);
+        values[6] = text(r#""已有译文""#);
+        values[7] = SqliteValue::Blob(vec![0x44; 32]);
         stored.units[0] = SqliteRow::new(values);
         *harness
             .sqlite
@@ -5014,8 +5041,8 @@ mod tests {
             .expect("替换事务应直接批量写 Unit");
         assert_eq!(unit_batch.shared_parameters(), [text("rules")]);
         let parameters = unit_batch.parameter_rows().next().expect("应写入一行 Unit");
-        assert_eq!(parameters[5], text(r#""已有译文""#));
-        assert_eq!(parameters[6], SqliteValue::Blob(vec![0x44; 32]));
+        assert_eq!(parameters[6], text(r#""已有译文""#));
+        assert_eq!(parameters[7], SqliteValue::Blob(vec![0x44; 32]));
     }
 
     #[tokio::test]
@@ -5270,15 +5297,13 @@ mod tests {
 
     #[test]
     fn narrow_snapshot_rows_require_exact_table_contents_and_types() {
+        let mut first = scalar_group(2, "description", "说明");
+        first.units_mut()[0].set_rule_number(1);
+        let mut second = scalar_group(1, "name", "名称");
+        second.units_mut()[0].set_rule_number(2);
         let snapshot = EncodedSnapshot::merge(
             RpgMakerAssetOwner::Rules,
-            vec![
-                encode_test_batch(vec![
-                    scalar_group(2, "description", "说明"),
-                    scalar_group(1, "name", "名称"),
-                ])
-                .expect("测试快照应可编码"),
-            ],
+            vec![encode_test_batch(vec![first, second]).expect("测试快照应可编码")],
             None,
         )
         .expect("测试快照应可合并");
@@ -5292,7 +5317,7 @@ mod tests {
             damaged.groups[0] = SqliteRow::new(values);
             assert!(!snapshot.matches_rows_ref(&damaged, &[0xa5; 32]));
         }
-        for column in 0..5 {
+        for column in 0..6 {
             let mut damaged = current.clone();
             let mut values = damaged.units[0].values().to_vec();
             values[column] = SqliteValue::Null;
@@ -5301,8 +5326,8 @@ mod tests {
         }
         let mut translated = current.clone();
         let mut values = translated.units[0].values().to_vec();
-        values[5] = text(r#""译文""#);
-        values[6] = SqliteValue::Blob(vec![0x44; 32]);
+        values[6] = text(r#""译文""#);
+        values[7] = SqliteValue::Blob(vec![0x44; 32]);
         translated.units[0] = SqliteRow::new(values);
         assert!(
             snapshot.matches_rows_ref(&translated, &[0xa5; 32]),
@@ -5310,7 +5335,7 @@ mod tests {
         );
         let mut damaged = translated;
         let mut values = damaged.units[0].values().to_vec();
-        values[6] = SqliteValue::Null;
+        values[7] = SqliteValue::Null;
         damaged.units[0] = SqliteRow::new(values);
         assert!(!snapshot.matches_rows_ref(&damaged, &[0xa5; 32]));
         for column in 0..3 {
@@ -5533,7 +5558,11 @@ mod tests {
         {
             let mut statement = transaction
                 .prepare(
-                    "INSERT INTO rpg_maker_text_unit VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL)",
+                    "INSERT INTO rpg_maker_text_unit (
+                        owner, group_id, unit_role, semantic_order_key,
+                        source_content_json, source_context_json,
+                        translation_content_json, translation_state
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL)",
                 )
                 .expect("大 Unit 写入语句应准备一次");
             for ordinal in 1..=total {
@@ -5908,6 +5937,9 @@ mod tests {
                 SqliteRow::new(vec![
                     text(unit.group_location.clone()),
                     text(unit.unit_role.clone()),
+                    unit.rule_number.map_or(SqliteValue::Null, |value| {
+                        SqliteValue::Integer(i64::try_from(value).expect("规则序号应可编码"))
+                    }),
                     SqliteValue::Blob(unit.semantic_order_key_blob.clone()),
                     text(unit.source_content_json.clone()),
                     text(unit.source_context_json.clone()),
@@ -5942,7 +5974,7 @@ mod tests {
         StoredSnapshotRows {
             owner_state: read_rows(connection, READ_OWNER_STATE, owner, 2),
             groups: read_rows(connection, READ_OWNER_GROUPS, owner, 5),
-            units: read_rows(connection, READ_OWNER_UNITS, owner, 7),
+            units: read_rows(connection, READ_OWNER_UNITS, owner, 8),
             claims: read_rows(connection, READ_OWNER_CLAIMS, owner, 3),
         }
     }
@@ -6114,6 +6146,7 @@ ORDER BY name"#,
                     owner TEXT NOT NULL,
                     group_id INTEGER NOT NULL CHECK (group_id > 0),
                     unit_role TEXT NOT NULL,
+                    rule_number INTEGER,
                     semantic_order_key BLOB NOT NULL,
                     source_content_json TEXT NOT NULL,
                     source_context_json TEXT NOT NULL,
@@ -6188,11 +6221,13 @@ ORDER BY name"#,
         for unit in &snapshot.units {
             connection
                 .execute(
-                    "INSERT INTO rpg_maker_text_unit VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    "INSERT INTO rpg_maker_text_unit VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     rusqlite::params![
                         snapshot.owner.storage_name(),
                         unit.group_id,
                         &unit.unit_role,
+                        unit.rule_number
+                            .map(|value| i64::try_from(value).expect("规则序号应可编码")),
                         &unit.semantic_order_key_blob,
                         &unit.source_content_json,
                         &unit.source_context_json,

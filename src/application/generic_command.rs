@@ -11,7 +11,7 @@ use std::future::Future;
 use std::io;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -20,6 +20,7 @@ use futures_util::{FutureExt, StreamExt};
 use rayon::prelude::*;
 use rusqlite::Connection;
 
+use super::TranslationTerminalSummary;
 use super::command::TerminationSignals;
 use super::config::{
     ConfigurationLoadError, ConfiguredGenericCommand, ConfiguredGenericWriteBackCommand,
@@ -86,6 +87,7 @@ use crate::language::{
 use crate::llm::ApiKeyRedactor;
 use crate::llm::{
     ChatMessage, ChatMessageRole, LlmClientConcurrency, LlmClientSemanticIdentity, LlmFinishReason,
+    LlmRequestFailure,
 };
 use crate::manual::{ManualCommandError, ManualCommandSummary, execute_generic_manual_command};
 #[cfg(not(test))]
@@ -336,15 +338,21 @@ pub(crate) enum GenericCommandOutput {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct GenericTranslationSummary {
     pub(crate) total_tasks: usize,
+    pub(crate) started_tasks: usize,
+    pub(crate) not_started_tasks: usize,
     pub(crate) complete_tasks: usize,
     pub(crate) partial_tasks: usize,
     pub(crate) unavailable_tasks: usize,
+    pub(crate) planned_units: usize,
+    pub(crate) remaining_units: usize,
     pub(crate) cleared_units: usize,
     pub(crate) reused_units: usize,
     pub(crate) accepted_units: usize,
     pub(crate) written_units: usize,
     pub(crate) conflicted_units: usize,
     pub(crate) response_problems: usize,
+    pub(crate) recoverable_request_exhaustions: usize,
+    pub(crate) request_admission_stopped: bool,
 }
 
 impl GenericTranslationSummary {
@@ -352,6 +360,8 @@ impl GenericTranslationSummary {
     pub(crate) const fn is_incomplete(self) -> bool {
         self.partial_tasks > 0
             || self.unavailable_tasks > 0
+            || self.not_started_tasks > 0
+            || self.remaining_units > 0
             || self.conflicted_units > 0
             || self.response_problems > 0
     }
@@ -371,6 +381,7 @@ pub(crate) struct GenericCommandRunReport {
     pub(crate) pending_project_log: Option<PendingProjectLog>,
     pub(crate) panic_log_path: Option<PathBuf>,
     pub(crate) selected_api_key_redactor: Option<Arc<ApiKeyRedactor>>,
+    pub(crate) translation_summary: Option<TranslationTerminalSummary>,
 }
 
 /// 一个运行根在业务 future 完成后关闭失败。
@@ -1699,8 +1710,11 @@ impl ProductionGenericCommandRunner {
                 .await
                 .map_err(generic_cpu_execution_failure)?
                 .map_err(generic_preparation_failure)?;
+            let planned_units = tasks.iter().map(PlannedTask::unit_count).sum();
             let mut summary = GenericTranslationSummary {
                 total_tasks: tasks.len(),
+                planned_units,
+                remaining_units: planned_units,
                 ..GenericTranslationSummary::default()
             };
             set_generic_translate_summary(&operation_translate_project_log, summary);
@@ -1854,7 +1868,7 @@ impl ProductionGenericCommandRunner {
                     &operation_translate_project_log,
                     ProjectLogPhase::ConfirmedTasks,
                     ProjectLogAmount::Determinate {
-                        completed: generic_count(summary.total_tasks),
+                        completed: generic_count(summary.started_tasks),
                         total: generic_count(summary.total_tasks),
                     },
                 );
@@ -1954,6 +1968,7 @@ impl ProductionGenericCommandRunner {
             take_generic_project_log(&project_log),
             terminal_occurrence,
         )
+        .with_translation_summary(generic_terminal_translation_summary(&translate_project_log))
     }
 
     async fn run_write_back(
@@ -2657,15 +2672,8 @@ fn generic_manual_failure(source: ManualCommandError) -> GenericCommandError {
     if source.is_cancelled() {
         return GenericCommandError::Cancelled;
     }
-    GenericCommandError::reported(
-        source,
-        DiagnosticReport::new(
-            StateEffect::Unchanged,
-            Diagnostic::runtime(RuntimeIssue::InvalidConfiguration {
-                component: RuntimeComponent::Process,
-            }),
-        ),
-    )
+    let report = source.diagnostic_report();
+    GenericCommandError::reported(source, report)
 }
 
 fn system_file_system_error_is_cancelled(source: &SystemFileSystemError) -> bool {
@@ -4146,6 +4154,8 @@ fn generic_count(value: usize) -> u64 {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct GenericTaskSummary {
+    started_tasks: usize,
+    not_started_tasks: usize,
     complete_tasks: usize,
     partial_tasks: usize,
     unavailable_tasks: usize,
@@ -4153,6 +4163,8 @@ struct GenericTaskSummary {
     written_units: usize,
     conflicted_units: usize,
     response_problems: usize,
+    recoverable_request_exhaustions: usize,
+    request_admission_stopped: bool,
 }
 
 struct GenericTaskRecordDraft {
@@ -4198,8 +4210,13 @@ enum GenericPreparedTaskOutcome {
     },
     Unavailable {
         diagnostic: DiagnosticReport,
+        request_exhausted: bool,
+        stop_admission: bool,
     },
-    Failed(GenericCommandError),
+    Failed {
+        error: GenericCommandError,
+        preserve_admitted_results: bool,
+    },
     Cancelled,
 }
 
@@ -4240,6 +4257,7 @@ struct GenericTaskRequestContext {
     cpu: RayonCpuExecutor,
     cancellation: CooperativeCancellation,
     record_evidence: bool,
+    admission_stopped: Arc<AtomicBool>,
 }
 
 async fn execute_owned_generic_task(
@@ -4290,6 +4308,7 @@ async fn execute_owned_generic_task(
         context.cpu.clone(),
         context.cancellation.clone(),
         context.record_evidence,
+        Arc::clone(&context.admission_stopped),
     )
     .await
 }
@@ -4348,6 +4367,7 @@ async fn execute_generic_tasks(
         cpu,
         cancellation: cancellation.clone(),
         record_evidence,
+        admission_stopped: Arc::new(AtomicBool::new(false)),
     };
     let mut remaining = tasks.into_iter().enumerate();
     let mut tasks = FuturesOrdered::new();
@@ -4365,6 +4385,8 @@ async fn execute_generic_tasks(
 
     let mut summary = GenericTaskSummary::default();
     let mut terminal_error = None;
+    let mut preserve_admitted_results_after_error = false;
+    let mut admission_stopped = false;
     while let Some((scheduled_task_index, prepared)) = tasks.next().await {
         let GenericPreparedTask {
             task_index,
@@ -4393,7 +4415,10 @@ async fn execute_generic_tasks(
                 continue;
             }
         };
-        if terminal_error.is_some() {
+        if terminal_error.is_some()
+            && !(preserve_admitted_results_after_error
+                && matches!(&outcome, GenericPreparedTaskOutcome::Accepted { .. }))
+        {
             let prior_was_cancelled = terminal_error
                 .as_ref()
                 .is_some_and(GenericCommandError::is_cancelled);
@@ -4420,7 +4445,7 @@ async fn execute_generic_tasks(
                     },
                     std::iter::empty(),
                 ),
-                GenericPreparedTaskOutcome::Failed(error) => project_log.finished(
+                GenericPreparedTaskOutcome::Failed { error, .. } => project_log.finished(
                     task_index,
                     attempt_count,
                     GenericTaskTerminal::Failed,
@@ -4434,7 +4459,7 @@ async fn execute_generic_tasks(
             if let Some(record) = record {
                 let state = match outcome {
                     GenericPreparedTaskOutcome::Cancelled => GenericTaskRecordState::cancelled(),
-                    GenericPreparedTaskOutcome::Unavailable { diagnostic } => {
+                    GenericPreparedTaskOutcome::Unavailable { diagnostic, .. } => {
                         GenericTaskRecordState::unavailable(diagnostic)
                     }
                     GenericPreparedTaskOutcome::Accepted { .. } => {
@@ -4444,7 +4469,7 @@ async fn execute_generic_tasks(
                             GenericTaskRecordState::not_committed_due_to_prior_failure()
                         }
                     }
-                    GenericPreparedTaskOutcome::Failed(ref error) => {
+                    GenericPreparedTaskOutcome::Failed { ref error, .. } => {
                         GenericTaskRecordState::failed(generic_task_execution_error_report(
                             error,
                             task_index,
@@ -4504,7 +4529,8 @@ async fn execute_generic_tasks(
                                 .submit(record.finish(GenericTaskRecordState::failed(report)));
                         }
                         cancellation.request();
-                        terminal_error = Some(error);
+                        preserve_admitted_results_after_error = false;
+                        terminal_error.get_or_insert(error);
                         continue;
                     }
                 };
@@ -4525,6 +4551,10 @@ async fn execute_generic_tasks(
                     stored.accepted_units += accepted_units;
                     stored.response_problems += response_problems;
                     stored.written_units += commit.committed;
+                    stored.remaining_units = stored
+                        .remaining_units
+                        .checked_sub(commit.committed)
+                        .expect("Generic 已写入模型 Unit 不得超过计划 Unit");
                     stored.conflicted_units += commit.conflicts.len();
                     if complete {
                         stored.complete_tasks += 1;
@@ -4561,7 +4591,11 @@ async fn execute_generic_tasks(
                     )));
                 }
             }
-            GenericPreparedTaskOutcome::Unavailable { diagnostic } => {
+            GenericPreparedTaskOutcome::Unavailable {
+                diagnostic,
+                request_exhausted,
+                stop_admission,
+            } => {
                 project_log.finished(
                     task_index,
                     attempt_count,
@@ -4573,11 +4607,19 @@ async fn execute_generic_tasks(
                         .submit(record.finish(GenericTaskRecordState::unavailable(diagnostic)));
                 }
                 summary.unavailable_tasks += 1;
+                summary.recoverable_request_exhaustions += usize::from(request_exhausted);
+                summary.request_admission_stopped |= stop_admission;
+                admission_stopped |= stop_admission;
                 update_generic_translate_summary(&translate_project_log, |stored| {
                     stored.unavailable_tasks += 1;
+                    stored.recoverable_request_exhaustions += usize::from(request_exhausted);
+                    stored.request_admission_stopped |= stop_admission;
                 });
             }
-            GenericPreparedTaskOutcome::Failed(error) => {
+            GenericPreparedTaskOutcome::Failed {
+                error,
+                preserve_admitted_results,
+            } => {
                 let diagnostic =
                     generic_task_execution_error_report(&error, task_index, total_tasks);
                 project_log.finished(
@@ -4589,7 +4631,16 @@ async fn execute_generic_tasks(
                 if let Some(record) = record {
                     task_records.submit(record.finish(GenericTaskRecordState::failed(diagnostic)));
                 }
-                cancellation.request();
+                if !preserve_admitted_results {
+                    cancellation.request();
+                } else {
+                    summary.request_admission_stopped = true;
+                    admission_stopped = true;
+                    update_generic_translate_summary(&translate_project_log, |stored| {
+                        stored.request_admission_stopped = true;
+                    });
+                }
+                preserve_admitted_results_after_error = preserve_admitted_results;
                 terminal_error = Some(error);
             }
             GenericPreparedTaskOutcome::Cancelled => {
@@ -4616,6 +4667,8 @@ async fn execute_generic_tasks(
             ));
         }
         if terminal_error.is_none()
+            && !admission_stopped
+            && !request_context.admission_stopped.load(Ordering::Acquire)
             && let Some((task_index, task)) = remaining.next()
         {
             project_log.started(task_index);
@@ -4628,7 +4681,12 @@ async fn execute_generic_tasks(
     }
     match terminal_error {
         Some(error) => Err(error),
-        None => Ok(summary),
+        None => {
+            summary.started_tasks =
+                summary.complete_tasks + summary.partial_tasks + summary.unavailable_tasks;
+            summary.not_started_tasks = total_tasks.saturating_sub(summary.started_tasks);
+            Ok(summary)
+        }
     }
 }
 
@@ -4651,6 +4709,7 @@ async fn execute_generic_task(
     cpu: RayonCpuExecutor,
     cancellation: CooperativeCancellation,
     record_evidence: bool,
+    admission_stopped: Arc<AtomicBool>,
 ) -> Result<GenericPreparedTask, GenericCommandError> {
     let recorded_user_message = record_evidence.then(|| user_message.clone());
     let messages = [
@@ -4667,6 +4726,19 @@ async fn execute_generic_task(
     )
     .await;
     let (outcome, evidence) = execution.into_parts();
+    let stops_admission = match &outcome {
+        LlmRequestExecutionOutcome::RetryAfterExceedsMaximum { service_status, .. }
+        | LlmRequestExecutionOutcome::RetryBudgetExhausted { service_status, .. } => {
+            service_status.stops_admission_after_unavailable()
+        }
+        LlmRequestExecutionOutcome::Fatal { source, .. } => source.service_status().is_permanent(),
+        LlmRequestExecutionOutcome::AdmissionStopped { .. } => true,
+        LlmRequestExecutionOutcome::Response { .. }
+        | LlmRequestExecutionOutcome::Cancelled { .. } => false,
+    };
+    if stops_admission {
+        admission_stopped.store(true, Ordering::Release);
+    }
     let attempt_count = evidence.attempt_count();
     let record = recorded_user_message.map(|user_message| GenericTaskRecordInFlight {
         task_index,
@@ -4740,7 +4812,11 @@ async fn execute_generic_task(
                                     total_tasks,
                                     error,
                                 );
-                                GenericPreparedTaskOutcome::Unavailable { diagnostic }
+                                GenericPreparedTaskOutcome::Unavailable {
+                                    diagnostic,
+                                    request_exhausted: false,
+                                    stop_admission: false,
+                                }
                             }
                         }
                     } else {
@@ -4750,20 +4826,45 @@ async fn execute_generic_task(
                                 total_tasks,
                                 GenericTaskResponseProblem::NonStopFinish,
                             ),
+                            request_exhausted: false,
+                            stop_admission: false,
                         }
                     }
                 }
-                LlmRequestExecutionOutcome::RetryAfterExceedsMaximum { diagnostic, .. } => {
-                    GenericPreparedTaskOutcome::Unavailable { diagnostic }
-                }
-                LlmRequestExecutionOutcome::RetryBudgetExhausted { diagnostic, .. } => {
-                    GenericPreparedTaskOutcome::Unavailable { diagnostic }
-                }
+                LlmRequestExecutionOutcome::RetryAfterExceedsMaximum {
+                    diagnostic,
+                    service_status,
+                    ..
+                } => GenericPreparedTaskOutcome::Unavailable {
+                    diagnostic,
+                    request_exhausted: true,
+                    stop_admission: service_status.stops_admission_after_unavailable(),
+                },
+                LlmRequestExecutionOutcome::RetryBudgetExhausted {
+                    diagnostic,
+                    service_status,
+                    ..
+                } => GenericPreparedTaskOutcome::Unavailable {
+                    diagnostic,
+                    request_exhausted: true,
+                    stop_admission: service_status.stops_admission_after_unavailable(),
+                },
                 LlmRequestExecutionOutcome::Fatal {
                     source, diagnostic, ..
-                } => GenericPreparedTaskOutcome::Failed(GenericCommandError::reported(
-                    source, diagnostic,
-                )),
+                } => {
+                    let preserve_admitted_results = source.service_status().is_permanent();
+                    GenericPreparedTaskOutcome::Failed {
+                        error: GenericCommandError::reported(source, diagnostic),
+                        preserve_admitted_results,
+                    }
+                }
+                LlmRequestExecutionOutcome::AdmissionStopped { diagnostic, .. } => {
+                    GenericPreparedTaskOutcome::Unavailable {
+                        diagnostic,
+                        request_exhausted: false,
+                        stop_admission: true,
+                    }
+                }
                 LlmRequestExecutionOutcome::Cancelled { .. } => {
                     GenericPreparedTaskOutcome::Cancelled
                 }
@@ -4783,7 +4884,10 @@ async fn execute_generic_task(
             let error = generic_cpu_execution_failure(source);
             return Ok(GenericPreparedTask {
                 task_index,
-                outcome: GenericPreparedTaskOutcome::Failed(error),
+                outcome: GenericPreparedTaskOutcome::Failed {
+                    error,
+                    preserve_admitted_results: false,
+                },
                 record: record.map(|record| record.finish(None)),
                 attempt_count,
             });
@@ -4799,7 +4903,10 @@ async fn execute_generic_task(
             let error = generic_preparation_failure(source);
             return Ok(GenericPreparedTask {
                 task_index,
-                outcome: GenericPreparedTaskOutcome::Failed(error),
+                outcome: GenericPreparedTaskOutcome::Failed {
+                    error,
+                    preserve_admitted_results: false,
+                },
                 record: record.map(|record| record.finish(None)),
                 attempt_count,
             });
@@ -5289,6 +5396,8 @@ fn should_remember_profile_separately(summary: &GenericTranslationSummary) -> bo
 }
 
 fn merge_task_summary(summary: &mut GenericTranslationSummary, tasks: GenericTaskSummary) {
+    summary.started_tasks += tasks.started_tasks;
+    summary.not_started_tasks += tasks.not_started_tasks;
     summary.complete_tasks += tasks.complete_tasks;
     summary.partial_tasks += tasks.partial_tasks;
     summary.unavailable_tasks += tasks.unavailable_tasks;
@@ -5296,6 +5405,12 @@ fn merge_task_summary(summary: &mut GenericTranslationSummary, tasks: GenericTas
     summary.written_units += tasks.written_units;
     summary.conflicted_units += tasks.conflicted_units;
     summary.response_problems += tasks.response_problems;
+    summary.remaining_units = summary
+        .remaining_units
+        .checked_sub(tasks.written_units)
+        .expect("Generic 已写入模型 Unit 不得超过计划 Unit");
+    summary.recoverable_request_exhaustions += tasks.recoverable_request_exhaustions;
+    summary.request_admission_stopped |= tasks.request_admission_stopped;
 }
 
 async fn load_additional_pem_roots(
@@ -5792,13 +5907,34 @@ fn project_log_generic_translation_summary(
     summary: GenericTranslationSummary,
 ) -> ProjectLogGenericTranslationSummary {
     ProjectLogGenericTranslationSummary {
+        planned_units: generic_count(summary.planned_units),
+        remaining_units: generic_count(summary.remaining_units),
         cleared_units: generic_count(summary.cleared_units),
         reused_units: generic_count(summary.reused_units),
         accepted_units: generic_count(summary.accepted_units),
         written_units: generic_count(summary.written_units),
         conflicted_units: generic_count(summary.conflicted_units),
         response_problems: generic_count(summary.response_problems),
+        recoverable_request_exhaustions: generic_count(summary.recoverable_request_exhaustions),
+        request_admission_stopped: summary.request_admission_stopped,
     }
+}
+
+fn generic_terminal_translation_summary(
+    state: &GenericTranslateProjectLogStateRef,
+) -> Option<TranslationTerminalSummary> {
+    let state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let summary = state.summary?;
+    let tasks = state.tasks.as_ref().map_or_else(
+        || TranslationTaskCounters::new(0, 0, 0, 0, 0, 0, 0, 0).expect("零任务汇总必须有效"),
+        GenericTaskProjectLog::counters,
+    );
+    Some(TranslationTerminalSummary {
+        tasks,
+        engine: TranslationEngineSummary::Generic(project_log_generic_translation_summary(summary)),
+    })
 }
 
 fn finish_generic_translate_success(
@@ -6445,6 +6581,7 @@ impl GenericCommandRunReport {
             pending_project_log: None,
             panic_log_path: None,
             selected_api_key_redactor: None,
+            translation_summary: None,
         }
     }
 
@@ -6455,6 +6592,7 @@ impl GenericCommandRunReport {
             pending_project_log: None,
             panic_log_path,
             selected_api_key_redactor: None,
+            translation_summary: None,
         }
     }
 
@@ -6550,7 +6688,13 @@ impl GenericCommandRunReport {
             pending_project_log,
             panic_log_path: None,
             selected_api_key_redactor: None,
+            translation_summary: None,
         }
+    }
+
+    fn with_translation_summary(mut self, summary: Option<TranslationTerminalSummary>) -> Self {
+        self.translation_summary = summary;
+        self
     }
 }
 
@@ -7308,6 +7452,32 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn generic_manual_publication_failure_keeps_recovery_effect_and_relation() {
+        let error = generic_manual_failure(ManualCommandError::Document(
+            crate::manual::ManualDocumentError::PairedPublicationRollback {
+                operation: Box::new(crate::manual::ManualDocumentError::Write {
+                    path: PathBuf::from("ownership.jsonl"),
+                    source: io::Error::other("主失败原文"),
+                }),
+                failures: vec![crate::manual::ManualPairIoFailure::for_test(
+                    PathBuf::from("manual.toml"),
+                    io::Error::new(io::ErrorKind::PermissionDenied, "恢复失败原文"),
+                )],
+            },
+        ));
+        let report = generic_command_error_report(&error);
+        assert_eq!(report.effect(), StateEffect::RecoveryRequired);
+        assert_eq!(report.related().len(), 1);
+        assert_eq!(
+            report.related()[0].relation(),
+            RelatedFailureRelation::Rollback
+        );
+        let serialized = serde_json::to_string(&report).expect("Generic Manual 诊断应可序列化");
+        assert!(!serialized.contains("主失败原文"));
+        assert!(!serialized.contains("恢复失败原文"));
     }
 
     struct TestManualTranslation<'a> {

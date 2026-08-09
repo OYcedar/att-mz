@@ -14,6 +14,7 @@ use std::time::Duration;
 use futures_util::FutureExt;
 use rusqlite::{Connection, OpenFlags};
 
+use super::TranslationTerminalSummary;
 use super::project_log::{
     ActiveProjectLog, CommandLogStart, PendingProjectLog, ProjectLogHandle, ProjectLogLuaPrintSink,
     start_command_log,
@@ -35,13 +36,13 @@ use crate::application::config::{
     ConfiguredTranslateCommand, ConfiguredWriteBackCommand, TranslateConfiguration,
 };
 use crate::diagnostic::{
-    BoxedError, Diagnostic, DiagnosticReport, DiagnosticStage, IoFailure, PromptProblem,
-    RelatedFailureRelation, ReportedFailure, RpgMakerDiagnosticStage, RpgMakerIssue,
+    BoxedError, Diagnostic, DiagnosticIssue, DiagnosticReport, DiagnosticStage, IoFailure,
+    PromptProblem, RelatedFailureRelation, ReportedFailure, RpgMakerDiagnosticStage, RpgMakerIssue,
     RpgMakerProjectProblem, RuntimeBoundaryOperation, RuntimeComponent, RuntimeEngine,
     RuntimeIssue, RuntimeOperation, RuntimePanicBoundary, SafeIdentifier, SafePath,
     SqliteDiagnosticContext, SqliteDiagnosticStage, SqliteDriverFailure, SqliteIssue,
     SqliteOperation, SqliteProblem, SqliteTransactionState, StateEffect, TranslationIssue,
-    render_diagnostic_report, render_state_effect_impact,
+    public_path, render_diagnostic_report, render_state_effect_impact,
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::execution::{CooperativeCancellation, OperationCompletion};
@@ -110,7 +111,7 @@ use crate::rpg_maker::translate::executor::{
 };
 use crate::rpg_maker::translate::pipeline::{
     RpgMakerTranslationLog, RpgMakerTranslationLogEvent, RpgMakerTranslationLogTaskOutcome,
-    RpgMakerTranslationService,
+    RpgMakerTranslationRunReport, RpgMakerTranslationService,
 };
 use crate::rpg_maker::translate::placeholder::{
     Pcre2PlaceholderConstructionError, Pcre2PlaceholderService,
@@ -1041,6 +1042,7 @@ impl ProductionRpgMakerCommandRunner {
         .to_path_buf();
         let operation = command.operation();
         let file = command.file().to_path_buf();
+        let ownership_file = command.ownership_file().map(Path::to_path_buf);
         let language_modules = command.language_modules().cloned();
         let lease_provider = ProjectCommandLeaseService::new(
             command.common().projects_root().to_path_buf(),
@@ -1066,6 +1068,7 @@ impl ProductionRpgMakerCommandRunner {
                         engine,
                         operation,
                         &file,
+                        ownership_file.as_deref(),
                         language_modules.as_ref(),
                         &blocking_cancellation,
                     )
@@ -1324,6 +1327,7 @@ impl ProductionRpgMakerCommandRunner {
                     pending_project_log: Some(pending),
                     panic_log_path: None,
                     selected_api_key_redactor: None,
+                    translation_summary: None,
                 };
             }
             DrivenCommand::SignalFailed { source, result } => {
@@ -2692,6 +2696,7 @@ impl ProductionRpgMakerCommandRunner {
             shutdown,
             Some(pending_project_log),
         )
+        .with_translation_summary(business_log.terminal_translation_summary())
     }
 
     async fn run_write_back(
@@ -3982,8 +3987,7 @@ mod progress_lifecycle_tests {
         RpgMakerTranslationLog::emit(
             &business_log,
             RpgMakerTranslationLogEvent::PlanningCompleted {
-                total_tasks: 0,
-                unresolved_units: 0,
+                report: RpgMakerTranslationRunReport::with_reconciliation(0, 0, 0, 0, 0, 0, 0),
             },
         );
 
@@ -4280,6 +4284,7 @@ struct ProductionBusinessLog {
     translation_retry_attempts: Arc<AtomicU64>,
     translation_retry_recovered: Arc<AtomicU64>,
     translation_retry_exhausted: Arc<AtomicU64>,
+    translation_summary: Arc<Mutex<Option<RpgMakerTranslationRunReport>>>,
     translation_progress: Option<ProductionProgressObserver<TranslateProgressPhase>>,
 }
 
@@ -4300,6 +4305,7 @@ impl ProductionBusinessLog {
             translation_retry_attempts: Arc::new(AtomicU64::new(0)),
             translation_retry_recovered: Arc::new(AtomicU64::new(0)),
             translation_retry_exhausted: Arc::new(AtomicU64::new(0)),
+            translation_summary: Arc::new(Mutex::new(None)),
             translation_progress: None,
         }
     }
@@ -4386,10 +4392,45 @@ impl ProductionBusinessLog {
                 summary.recoverable_request_exhaustions,
                 "可恢复请求耗尽数",
             ),
+            request_admission_stopped: summary.request_admission_stopped,
             retained: usize_to_u64(summary.retained, "保留决策数"),
             invalidated: usize_to_u64(summary.invalidated, "失效决策数"),
             not_applicable: usize_to_u64(summary.not_applicable, "不适用决策数"),
             reused: usize_to_u64(summary.reused, "复用决策数"),
+        })
+    }
+
+    fn translation_run_summary(summary: &RpgMakerTranslationRunReport) -> TranslationEngineSummary {
+        TranslationEngineSummary::RpgMaker(RpgMakerTranslationSummary {
+            accepted_decisions: usize_to_u64(summary.accepted_decisions(), "已接受决策数"),
+            written_locations: usize_to_u64(summary.written_locations(), "已写入位置数"),
+            remaining_decisions: usize_to_u64(summary.unresolved_decisions(), "剩余决策数"),
+            remaining_locations: usize_to_u64(summary.unresolved_locations(), "剩余位置数"),
+            protocol_diagnostics: usize_to_u64(summary.protocol_diagnostics(), "协议诊断数"),
+            recoverable_request_exhaustions: usize_to_u64(
+                summary.recoverable_request_exhaustions(),
+                "可恢复请求耗尽数",
+            ),
+            request_admission_stopped: summary.request_admission_stopped(),
+            retained: usize_to_u64(summary.retained(), "保留决策数"),
+            invalidated: usize_to_u64(summary.invalidated(), "失效决策数"),
+            not_applicable: usize_to_u64(summary.not_applicable(), "不适用决策数"),
+            reused: usize_to_u64(summary.reused(), "复用决策数"),
+        })
+    }
+
+    fn current_translation_summary(&self) -> Option<TranslationEngineSummary> {
+        self.translation_summary
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(Self::translation_run_summary)
+    }
+
+    fn terminal_translation_summary(&self) -> Option<TranslationTerminalSummary> {
+        Some(TranslationTerminalSummary {
+            tasks: self.translation_counters().ok()?,
+            engine: self.current_translation_summary()?,
         })
     }
 
@@ -4414,7 +4455,7 @@ impl ProductionBusinessLog {
                     self.handle.emit(ProjectLogEvent::TranslationFinished {
                         result: TranslationFinished::Failed {
                             tasks,
-                            summary: None,
+                            summary: self.current_translation_summary(),
                             diagnostic,
                         },
                     });
@@ -4457,7 +4498,7 @@ impl ProductionBusinessLog {
         ) {
             TranslationFinished::Cancelled {
                 tasks,
-                summary: None,
+                summary: self.current_translation_summary(),
             }
         } else {
             let error = match execution {
@@ -4493,7 +4534,7 @@ impl ProductionBusinessLog {
             self.handle.emit(ProjectLogEvent::TranslationFinished {
                 result: TranslationFinished::Failed {
                     tasks,
-                    summary: None,
+                    summary: self.current_translation_summary(),
                     diagnostic,
                 },
             });
@@ -4604,11 +4645,16 @@ fn project_lua_run_was_cancelled(error: &ProjectLuaRunError) -> bool {
 impl RpgMakerTranslationLog for ProductionBusinessLog {
     fn emit(&self, event: RpgMakerTranslationLogEvent) {
         match event {
-            RpgMakerTranslationLogEvent::PlanningCompleted { total_tasks, .. } => {
+            RpgMakerTranslationLogEvent::PlanningCompleted { report } => {
+                let total_tasks = report.total_tasks();
                 self.translation_total.store(
                     u64::try_from(total_tasks).expect("当前目标平台的任务总数必须能用 u64 表达"),
                     Ordering::Release,
                 );
+                *self
+                    .translation_summary
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(report);
                 if let Some(progress) = &self.translation_progress {
                     progress.complete_phase(TranslateProgressPhase::Planning);
                 }
@@ -4641,6 +4687,7 @@ impl RpgMakerTranslationLog for ProductionBusinessLog {
                 outcome,
                 attempts,
                 retry_exhausted,
+                report,
             } => {
                 let total = self.translation_total.load(Ordering::Acquire);
                 let ordinal = u64::try_from(task_index.get())
@@ -4758,6 +4805,10 @@ impl RpgMakerTranslationLog for ProductionBusinessLog {
                         ));
                     }
                 }
+                *self
+                    .translation_summary
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(report);
             }
         }
     }
@@ -5853,6 +5904,7 @@ pub(crate) struct ProductionCommandRunReport {
     pub(crate) pending_project_log: Option<PendingProjectLog>,
     pub(crate) panic_log_path: Option<PathBuf>,
     pub(crate) selected_api_key_redactor: Option<Arc<ApiKeyRedactor>>,
+    pub(crate) translation_summary: Option<TranslationTerminalSummary>,
 }
 
 pub(crate) enum CommandRunResult {
@@ -5870,6 +5922,7 @@ impl ProductionCommandRunReport {
             pending_project_log: None,
             panic_log_path,
             selected_api_key_redactor: None,
+            translation_summary: None,
         }
     }
 
@@ -5880,6 +5933,7 @@ impl ProductionCommandRunReport {
             pending_project_log: None,
             panic_log_path: None,
             selected_api_key_redactor: None,
+            translation_summary: None,
         }
     }
 
@@ -5893,6 +5947,7 @@ impl ProductionCommandRunReport {
             pending_project_log: None,
             panic_log_path: None,
             selected_api_key_redactor: None,
+            translation_summary: None,
         }
     }
 
@@ -5903,6 +5958,7 @@ impl ProductionCommandRunReport {
             pending_project_log: None,
             panic_log_path: None,
             selected_api_key_redactor: None,
+            translation_summary: None,
         }
     }
 
@@ -5917,6 +5973,7 @@ impl ProductionCommandRunReport {
             pending_project_log,
             panic_log_path: None,
             selected_api_key_redactor: None,
+            translation_summary: None,
         }
     }
 
@@ -5937,6 +5994,7 @@ impl ProductionCommandRunReport {
                 pending_project_log,
                 panic_log_path: None,
                 selected_api_key_redactor: None,
+                translation_summary: None,
             },
             DrivenCommand::Finished(Ok(OperationCompletion::Cancelled))
             | DrivenCommand::Interrupted(Ok(OperationCompletion::Cancelled)) => Self {
@@ -5945,6 +6003,7 @@ impl ProductionCommandRunReport {
                 pending_project_log,
                 panic_log_path: None,
                 selected_api_key_redactor: None,
+                translation_summary: None,
             },
             DrivenCommand::Finished(Err(error)) => Self {
                 result: CommandRunResult::Failed(error),
@@ -5952,6 +6011,7 @@ impl ProductionCommandRunReport {
                 pending_project_log,
                 panic_log_path: None,
                 selected_api_key_redactor: None,
+                translation_summary: None,
             },
             DrivenCommand::Interrupted(Err(error)) => Self {
                 result: if error.was_cancelled_wait() {
@@ -5963,6 +6023,7 @@ impl ProductionCommandRunReport {
                 pending_project_log,
                 panic_log_path: None,
                 selected_api_key_redactor: None,
+                translation_summary: None,
             },
             DrivenCommand::SignalFailed { source, result } => {
                 let outcome = match result {
@@ -5980,9 +6041,15 @@ impl ProductionCommandRunReport {
                     pending_project_log,
                     panic_log_path: None,
                     selected_api_key_redactor: None,
+                    translation_summary: None,
                 }
             }
         }
+    }
+
+    fn with_translation_summary(mut self, summary: Option<TranslationTerminalSummary>) -> Self {
+        self.translation_summary = summary;
+        self
     }
 }
 
@@ -6507,13 +6574,19 @@ impl ProductionCommandError {
     }
 
     fn manual(source: ManualCommandError) -> Self {
-        let report = DiagnosticReport::new(
-            StateEffect::Unchanged,
-            Diagnostic::runtime(RuntimeIssue::InvalidConfiguration {
-                component: RuntimeComponent::Process,
-            }),
-        );
-        Self::ConfigurationOrInput(Box::new(ReportedFailure::new(report, source)))
+        let report = source.diagnostic_report();
+        let failure = Box::new(ReportedFailure::new(report.clone(), source));
+        match report.effect() {
+            StateEffect::Unchanged => Self::ConfigurationOrInput(failure),
+            StateEffect::ProgressPreserved => Self::ProjectState(failure),
+            StateEffect::Applied => Self::StateAppliedButFinalizationFailed(failure),
+            StateEffect::AppliedRunPlanNotSaved => Self::ResultAppliedButRunPlanNotSaved(failure),
+            StateEffect::AppliedFinalizationFailed => {
+                Self::StateAppliedButFinalizationFailed(failure)
+            }
+            StateEffect::RecoveryRequired => Self::RecoveryRequired(failure),
+            StateEffect::OutcomeUnknown => Self::OutcomeUnknown(failure),
+        }
     }
 
     pub(crate) fn stdout_write(source: io::Error) -> Self {
@@ -6860,7 +6933,10 @@ impl ProductionCommandError {
     fn was_cancelled_wait(&self) -> bool {
         let report = self.failure_report();
         report.report().related().is_empty()
-            && report.report().primary().issue().summary_code() == "lock_cancelled"
+            && matches!(
+                report.report().primary().issue(),
+                DiagnosticIssue::Runtime(RuntimeIssue::Cancelled { .. })
+            )
     }
 }
 
@@ -7020,12 +7096,11 @@ impl CommandResultRenderer {
                     }
                 };
                 if let Some(path) = reused_path {
+                    let path = public_path(path);
                     writeln!(
                         stdout,
                         "{}",
-                        localizer.format(UiMessage::NoticeInitReusePath {
-                            path: &path.to_string_lossy(),
-                        })
+                        localizer.format(UiMessage::NoticeInitReusePath { path: &path })
                     )?;
                 }
                 render_saved_plan_source(localizer, *plan_source, stdout)
@@ -7089,12 +7164,19 @@ impl CommandResultRenderer {
                     "{}",
                     localizer.format(UiMessage::ResultTranslateSummary {
                         total: usize_to_u64(output.summary.total_tasks, "任务总数"),
+                        started: usize_to_u64(output.summary.started_tasks, "已开始任务数"),
+                        not_started: usize_to_u64(
+                            output.summary.not_started_tasks,
+                            "未开始任务数",
+                        ),
                         complete: usize_to_u64(output.summary.complete_tasks, "完整任务数"),
                         partial: usize_to_u64(output.summary.partial_tasks, "部分任务数"),
                         unavailable: usize_to_u64(
                             output.summary.unavailable_tasks,
                             "不可用任务数",
                         ),
+                        failed: 0,
+                        cancelled: 0,
                         written: usize_to_u64(output.summary.written_locations, "已写位置数"),
                         remaining: usize_to_u64(
                             output.summary.remaining_locations,
@@ -7134,6 +7216,7 @@ impl CommandResultRenderer {
                 render_saved_plan_source(localizer, *profile_source, stdout)
             }
             RpgMakerCommandOutput::WriteBack { output } => {
+                let output_root = public_path(&output.output_root);
                 writeln!(
                     stdout,
                     "{}",
@@ -7144,9 +7227,7 @@ impl CommandResultRenderer {
                 writeln!(
                     stdout,
                     "{}",
-                    localizer.format(UiMessage::ResultOutputDirectory {
-                        path: &output.output_root.to_string_lossy(),
-                    })
+                    localizer.format(UiMessage::ResultOutputDirectory { path: &output_root })
                 )?;
                 writeln!(
                     stdout,
@@ -7331,6 +7412,12 @@ fn render_rpg_maker_incomplete_warning(
         unavailable: usize_to_u64(output.summary.unavailable_tasks, "不可用任务数"),
         protocol: usize_to_u64(output.summary.protocol_diagnostics, "协议问题数"),
         exhausted: usize_to_u64(output.summary.recoverable_request_exhaustions, "请求耗尽数"),
+        admission: if output.summary.request_admission_stopped {
+            "stopped"
+        } else {
+            "open"
+        },
+        not_started: usize_to_u64(output.summary.not_started_tasks, "未开始任务数"),
         remaining_decisions: usize_to_u64(output.summary.remaining_decisions, "剩余决策数"),
         remaining_locations: usize_to_u64(output.summary.remaining_locations, "剩余位置数"),
     });
@@ -7571,6 +7658,55 @@ mod command_result_renderer_tests {
             "Finalization 外层必须保留类型化相关报告"
         );
         assert_eq!(finalization.failure_report().report().related().len(), 1);
+    }
+
+    #[test]
+    fn manual_publication_recovery_and_finalization_keep_typed_effects_in_command_report() {
+        let rollback = ProductionCommandError::manual(ManualCommandError::Document(
+            crate::manual::ManualDocumentError::PairedPublicationRollback {
+                operation: Box::new(crate::manual::ManualDocumentError::Write {
+                    path: PathBuf::from("ownership.jsonl"),
+                    source: io::Error::other("主失败原文"),
+                }),
+                failures: vec![crate::manual::ManualPairIoFailure::for_test(
+                    PathBuf::from("manual.toml"),
+                    io::Error::new(io::ErrorKind::PermissionDenied, "恢复失败原文"),
+                )],
+            },
+        ));
+        assert!(matches!(
+            rollback,
+            ProductionCommandError::RecoveryRequired(_)
+        ));
+        assert_eq!(
+            rollback.failure_report().report().effect(),
+            StateEffect::RecoveryRequired
+        );
+        assert_eq!(
+            rollback.failure_report().report().related()[0].relation(),
+            RelatedFailureRelation::Rollback
+        );
+
+        let finalization = ProductionCommandError::manual(ManualCommandError::Document(
+            crate::manual::ManualDocumentError::PairedPublicationFinalization {
+                failures: vec![crate::manual::ManualPairIoFailure::for_test(
+                    PathBuf::from(".manual.toml.backup"),
+                    io::Error::new(io::ErrorKind::PermissionDenied, "清理失败原文"),
+                )],
+            },
+        ));
+        assert!(matches!(
+            finalization,
+            ProductionCommandError::StateAppliedButFinalizationFailed(_)
+        ));
+        assert_eq!(
+            finalization.failure_report().report().effect(),
+            StateEffect::AppliedFinalizationFailed
+        );
+        assert_eq!(
+            finalization.failure_report().report().related()[0].relation(),
+            RelatedFailureRelation::Cleanup
+        );
     }
 
     #[test]

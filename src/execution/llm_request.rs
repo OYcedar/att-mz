@@ -11,6 +11,7 @@ use std::time::Duration;
 use crate::diagnostic::{DiagnosticReport, StateEffect};
 use crate::llm::{
     ChatMessage, LlmRequestError, LlmRequestExecutor, LlmRequestFailure, LlmResponse,
+    LlmServiceStatus,
 };
 
 use super::CooperativeCancellation;
@@ -60,15 +61,22 @@ pub(crate) enum LlmRequestExecutionOutcome<E> {
         diagnostic: DiagnosticReport,
         retry_after: Duration,
         maximum: Duration,
+        service_status: LlmServiceStatus,
     },
     RetryBudgetExhausted {
         attempt: NonZeroUsize,
         diagnostic: DiagnosticReport,
+        service_status: LlmServiceStatus,
     },
     Fatal {
         attempt: NonZeroUsize,
         source: E,
         diagnostic: DiagnosticReport,
+    },
+    AdmissionStopped {
+        attempt: NonZeroUsize,
+        diagnostic: DiagnosticReport,
+        service_status: LlmServiceStatus,
     },
     Cancelled {
         attempt: NonZeroUsize,
@@ -179,11 +187,28 @@ where
                         llm.request_diagnostic(client, &source, None),
                     )
                 };
+                let service_status = source.service_status();
+                if service_status.is_permanent() {
+                    llm.stop_admission(service_status, &diagnostic);
+                }
                 return finish(
                     LlmRequestExecutionOutcome::Fatal {
                         attempt,
                         source,
                         diagnostic,
+                    },
+                    evidence,
+                );
+            }
+            Err(LlmRequestError::AdmissionStopped {
+                service_status,
+                diagnostic,
+            }) => {
+                return finish(
+                    LlmRequestExecutionOutcome::AdmissionStopped {
+                        attempt,
+                        diagnostic,
+                        service_status,
                     },
                     evidence,
                 );
@@ -200,30 +225,40 @@ where
                     StateEffect::ProgressPreserved,
                     llm.request_diagnostic(client, &source, retry_after),
                 );
+                let service_status = source.service_status();
                 if let Some(retry_after) = retry_after
                     && retry_after > policy.max_retry_after
                 {
+                    if service_status.stops_admission_after_unavailable() {
+                        llm.stop_admission(service_status, &diagnostic);
+                    }
                     return finish(
                         LlmRequestExecutionOutcome::RetryAfterExceedsMaximum {
                             attempt,
                             diagnostic,
                             retry_after,
                             maximum: policy.max_retry_after,
+                            service_status,
                         },
                         evidence,
                     );
                 }
 
                 let Some(configured_delay) = retry_delays.next() else {
+                    if service_status.stops_admission_after_unavailable() {
+                        llm.stop_admission(service_status, &diagnostic);
+                    }
                     return finish(
                         LlmRequestExecutionOutcome::RetryBudgetExhausted {
                             attempt,
                             diagnostic,
+                            service_status,
                         },
                         evidence,
                     );
                 };
 
+                llm.continue_after_retryable(service_status);
                 let retry_delay = configured_delay.max(retry_after.unwrap_or_default());
                 let waiting = delay.wait(retry_delay);
                 tokio::pin!(waiting);

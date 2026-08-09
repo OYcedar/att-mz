@@ -683,6 +683,11 @@ impl PlannedTask {
         &self.terminology_indices
     }
 
+    /// 本任务的全部实际 Generic Unit 数；同一模型 ID 的传播目标各自计入。
+    pub(crate) fn unit_count(&self) -> usize {
+        self.outputs.values().map(Vec::len).sum()
+    }
+
     #[cfg(test)]
     pub(crate) fn expected_output_ids(&self) -> impl Iterator<Item = TaskId> + '_ {
         self.outputs.keys().copied()

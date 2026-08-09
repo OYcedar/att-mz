@@ -107,6 +107,7 @@ const CREATE_RPG_MAKER_TEXT_UNIT_TABLE: &str = r#"CREATE TABLE rpg_maker_text_un
     owner                    TEXT NOT NULL CHECK (owner IN ('builtin', 'rules')),
     group_id                 INTEGER NOT NULL CHECK (group_id > 0),
     unit_role                TEXT NOT NULL CHECK (length(unit_role) > 0),
+    rule_number              INTEGER,
     semantic_order_key       BLOB NOT NULL CHECK (
         typeof(semantic_order_key) = 'blob'
         AND length(semantic_order_key) >= 9
@@ -126,6 +127,10 @@ const CREATE_RPG_MAKER_TEXT_UNIT_TABLE: &str = r#"CREATE TABLE rpg_maker_text_un
     UNIQUE (owner, semantic_order_key),
     FOREIGN KEY (owner, group_id)
         REFERENCES rpg_maker_text_group(owner, group_id) ON DELETE CASCADE,
+    CHECK (
+        (owner = 'builtin' AND rule_number IS NULL)
+        OR (owner = 'rules' AND typeof(rule_number) = 'integer' AND rule_number > 0)
+    ),
     CHECK (
         (translation_content_json IS NULL AND translation_state IS NULL)
         OR (

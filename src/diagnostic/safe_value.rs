@@ -1,5 +1,6 @@
 //! 进入公开诊断前已经完成清理和不变量校验的动态值。
 
+use std::borrow::Cow;
 use std::fmt;
 use std::path::Path;
 
@@ -50,11 +51,27 @@ pub(crate) struct SafePath(String);
 
 impl SafePath {
     pub(crate) fn new(path: impl AsRef<Path>) -> Self {
-        Self(sanitize_user_text(&path.as_ref().to_string_lossy()))
+        Self(public_path(path))
     }
 
     pub(crate) fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// 把内部路径转换成唯一的公开文本；Windows verbatim 前缀只用于系统调用。
+pub(crate) fn public_path(path: impl AsRef<Path>) -> String {
+    let path = path.as_ref().to_string_lossy();
+    sanitize_user_text(readable_windows_path(&path).as_ref())
+}
+
+fn readable_windows_path(path: &str) -> Cow<'_, str> {
+    if let Some(path) = path.strip_prefix(r"\\?\UNC\") {
+        Cow::Owned(format!(r"\\{path}"))
+    } else if let Some(path) = path.strip_prefix(r"\\?\") {
+        Cow::Borrowed(path)
+    } else {
+        Cow::Borrowed(path)
     }
 }
 
@@ -217,6 +234,22 @@ mod tests {
     fn safe_identifier_rejects_blank_after_sanitizing() {
         assert!(SafeIdentifier::new("\r\n").is_err());
         assert!(SafeIdentifier::new("safe\r\nforged").is_err());
+    }
+
+    #[test]
+    fn safe_path_removes_windows_verbatim_prefixes_from_public_paths() {
+        assert_eq!(
+            SafePath::new(r"\\?\C:\games\sample").as_str(),
+            r"C:\games\sample"
+        );
+        assert_eq!(
+            SafePath::new(r"\\?\UNC\server\share\sample").as_str(),
+            r"\\server\share\sample"
+        );
+        assert_eq!(
+            SafePath::new(r"C:\games\sample").as_str(),
+            r"C:\games\sample"
+        );
     }
 
     #[test]

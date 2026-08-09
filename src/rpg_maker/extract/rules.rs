@@ -747,6 +747,7 @@ fn snapshot_from_targets(
                     TextUnitContent::Value(unit.source_text().to_owned()),
                 )?;
                 extracted.set_semantic_order_key(semantic_order_key);
+                extracted.set_rule_number(target.rule_number());
                 Ok(extracted)
             })
             .collect::<Result<Vec<_>, _>>()?;

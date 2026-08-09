@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::diagnostic::{
     Diagnostic, DiagnosticReport, PublicationBackendCause, PublicationIssue, PublicationProblem,
-    PublicationStep, RelatedFailureRelation, SafePath, StateEffect,
+    PublicationStep, RelatedFailureRelation, SafePath, StateEffect, public_path,
 };
 use crate::fingerprint::Sha256Fingerprint;
 
@@ -1930,11 +1930,7 @@ fn display_paths(paths: &[PathBuf]) -> String {
     if paths.is_empty() {
         return "无已知路径".to_owned();
     }
-    paths
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join("、")
+    paths.iter().map(public_path).collect::<Vec<_>>().join("、")
 }
 
 /// 主动丢弃目录候选时的清理失败。
@@ -2047,6 +2043,17 @@ pub(crate) trait RecoverableDirectoryPublisher: Send + Sync {
 mod directory_stage_tests {
     use super::*;
     use std::convert::Infallible;
+
+    #[test]
+    fn displayed_path_lists_remove_windows_verbatim_prefixes() {
+        assert_eq!(
+            display_paths(&[
+                PathBuf::from(r"\\?\C:\games\sample"),
+                PathBuf::from(r"\\?\UNC\server\share\sample"),
+            ]),
+            r"C:\games\sample、\\server\share\sample"
+        );
+    }
 
     fn mapping(source: &str, target: &str) -> DirectorySourceMapping {
         DirectorySourceMapping::new(PathBuf::from(source), PathBuf::from(target))

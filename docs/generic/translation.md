@@ -96,6 +96,12 @@ Prompt 明确规定，ATT 依靠这条契约确定译文语言，不做短文本
 任务并发执行，并始终按自然顺序确认和提交；取消或后续失败时，已经确认的前序进度原样
 保留。
 
+永久认证、授权、额度或账户错误一经类型化确认，就停止后续模型请求和 Task 准入，本次
+Translate 为 Failed 并退出 `1`。普通 429 的共享 `Retry-After` 等待超过配置上限或重试耗尽
+时，当前 Task 为 Unavailable，后续 Task 为 not_started，本次结果为 Incomplete 并退出
+`0`。普通网络、超时或 HTTP 500 重试耗尽只使当前 Task Unavailable，不停止后续 Task。
+停止前已经活动且获得有效结果的 Task 仍按自然顺序验收和提交。
+
 每个实际开始的 Task 写 `task.finished`：Complete、Partial、Unavailable、Failed、
 NotCommittedAfterEarlierFailure 或 Cancelled。Partial、Unavailable 与 Failed 同时写可读任务
 诊断。NotCommittedAfterEarlierFailure 只表示该 Task 已有可提交结果，但因为更早任务失败而
@@ -109,7 +115,12 @@ Complete 分别显示 `无需处理` 与 `完整`。
 
 `translation.finished` 固定保存 planned、started、complete、partial、unavailable、failed、
 cancelled 与 not_started Task 计数，并保存 Generic 专用的 cleared/reused/accepted/written/
-conflicted units 与 response problems。它取代按 Task 与 Unit 含义混合的通用 Partial 汇总。
+conflicted units、response problems、planned_units、remaining_units、recoverable request
+exhaustions 与 request admission stopped。Task 计数始终满足
+`planned = started + not_started`；remaining_units 等于计划交给模型的 Unit 减去实际写入
+的 Unit，CAS 冲突不算写入。Failed 与 Cancelled 在已经形成计划和引擎汇总时，也把同一份
+计数和汇总写入 JSONL，并在 stderr 打印一次短汇总；规划前失败或提前取消不伪造引擎
+工作量。停止路径不补写 100%。它取代按 Task 与 Unit 含义混合的通用 Partial 汇总。
 Placeholder 等规划错误发生在任何 Task 或模型请求之前时，结果为 Failed；可读诊断保留
 规则文件、自然规则号、类似 `story.jsonl:line3:unit2:text` 的位置、原因和修改方法，数据库
 保持不变。

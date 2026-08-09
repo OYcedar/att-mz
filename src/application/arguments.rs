@@ -257,7 +257,7 @@ pub(crate) enum MzCommand {
     #[command(name = "manual")]
     Manual {
         #[command(subcommand)]
-        command: ManualCommand,
+        command: RpgMakerManualCommand,
     },
     /// 对项目数据库运行 Lua 脚本。
     #[command(name = "lua")]
@@ -323,7 +323,7 @@ pub(crate) enum MvCommand {
     #[command(name = "manual")]
     Manual {
         #[command(subcommand)]
-        command: ManualCommand,
+        command: RpgMakerManualCommand,
     },
     /// 对项目数据库运行 Lua 脚本。
     #[command(name = "lua")]
@@ -368,6 +368,29 @@ pub(crate) enum ManualCommand {
     /// 原子应用已填写且有效的人工译文。
     #[command(name = "apply")]
     Apply(ManualArguments),
+}
+
+/// RPG Maker 人工补译命令；导出可以同时发布精确所有权 JSONL。
+#[derive(Debug, Subcommand)]
+pub(crate) enum RpgMakerManualCommand {
+    /// 导出当前需要人工处理的条目及其可选所有权清单。
+    #[command(name = "export")]
+    Export(RpgMakerManualExportArguments),
+    /// 只读检查人工译文文件。
+    #[command(name = "check")]
+    Check(ManualArguments),
+    /// 原子应用已填写且有效的人工译文。
+    #[command(name = "apply")]
+    Apply(ManualArguments),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct RpgMakerManualExportArguments {
+    #[command(flatten)]
+    pub(crate) manual: ManualArguments,
+    /// 与 TOML 成对发布的文字所有权 JSONL。
+    #[arg(long, value_name = "FILE_JSONL", value_parser = parse_non_blank_path)]
+    pub(crate) ownership: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]

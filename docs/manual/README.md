@@ -4,7 +4,8 @@ Manual 是 MV、MZ 和 Generic 普通人工补译的统一入口。它只处理�
 编辑的 UTF-8 TOML，不请求模型，不修改 Prompt、术语、语言规则或 Placeholder 配置。
 
 ```text
-att mv|mz|generic manual export --name NAME FILE.toml
+att mv|mz manual export --name NAME [--ownership OWNERSHIP.jsonl] FILE.toml
+att generic manual export --name NAME FILE.toml
 att mv|mz|generic manual check --name NAME FILE.toml
 att mv|mz|generic manual apply --name NAME FILE.toml
 ```
@@ -55,6 +56,30 @@ translation = ["译文可以按照中文需要重新分行。"]
 
 导出文件不包含上下文、内部状态、失败诊断、术语、hash 或数据库身份。没有待处理条目时
 写出空文件。
+
+MV/MZ 可以在 export 时同时提供 `--ownership OWNERSHIP.jsonl`。ATT 在同一只读数据库快照
+中生成 TOML 和所有权 JSONL；JSONL 严格按 Manual 自然顺序逐行对应，只含以下公开字段：
+
+```json
+{"manual_id":"Actors.json:1:name","owner":"builtin"}
+{"manual_id":"plugins.js:QuestWindow:Title","owner":"rules","rule_number":7}
+```
+
+`manual_id` 与 TOML 的 `id` 完全相同。Builtin 行只有 `manual_id`、`owner`；Rules 行另有从
+1 开始的 `rule_number`。文件不包含数据库 ID、编码位置、摘要或从路径前缀猜出的 owner。
+Generic 没有 Builtin/Rules 所有权，因此不接受 `--ownership`。
+
+两份输出使用同目录固定 `.tmp` 和 `.backup` 文件完成成对替换与补偿恢复；这不是文件系统
+提供的瞬时双文件原子 rename。发布前，ATT 先确认两个目标及各自临时、备份路径共六个对象
+互不指向同一自然或物理文件；已存在的目标必须是普通非 reparse 文件。两份旧输出可以正常
+一起替换。第二份发布失败时，两边都尽力恢复旧字节；恢复失败会保留自然恢复路径并报告
+RecoveryRequired。两份新输出已经发布、但备份清理失败时，结果报告
+AppliedFinalizationFailed；遗留 `.backup` 使下一次同目标 export 在任何新改动前明确要求先
+处理恢复现场。目录、reparse、特殊文件、同目标、交叉临时/备份身份或已有恢复现场都在移动
+任何目标前失败，不会被泛化成权限问题。
+
+单文件 export 和成对 export 都拒绝把目录或 reparse 对象当作可替换文件。公开诊断说明
+具体对象、类型化文件系统原因、状态影响和处理办法，不解析或公开原始操作系统错误正文。
 
 ## 3. check
 

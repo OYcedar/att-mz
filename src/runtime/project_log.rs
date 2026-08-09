@@ -816,12 +816,16 @@ impl<'de> Deserialize<'de> for TranslationTaskCounters {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GenericTranslationSummary {
+    pub(crate) planned_units: u64,
+    pub(crate) remaining_units: u64,
     pub(crate) cleared_units: u64,
     pub(crate) reused_units: u64,
     pub(crate) accepted_units: u64,
     pub(crate) written_units: u64,
     pub(crate) conflicted_units: u64,
     pub(crate) response_problems: u64,
+    pub(crate) recoverable_request_exhaustions: u64,
+    pub(crate) request_admission_stopped: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -833,6 +837,7 @@ pub(crate) struct RpgMakerTranslationSummary {
     pub(crate) remaining_locations: u64,
     pub(crate) protocol_diagnostics: u64,
     pub(crate) recoverable_request_exhaustions: u64,
+    pub(crate) request_admission_stopped: bool,
     pub(crate) retained: u64,
     pub(crate) invalidated: u64,
     pub(crate) not_applicable: u64,
@@ -3164,6 +3169,12 @@ pub(crate) struct ProjectLogRuntime {
     finished: bool,
 }
 
+struct ProjectLogRuntimeComponents {
+    sink: Box<dyn ProjectLogSink>,
+    encoder: Box<dyn ProjectLogRecordEncoder>,
+    clock: Arc<dyn ProjectLogClock>,
+}
+
 impl ProjectLogRuntime {
     pub(crate) fn start_reserved_file(
         path: &Path,
@@ -3288,9 +3299,11 @@ impl ProjectLogRuntime {
         Self::start_with_components(
             context,
             run_id,
-            Box::new(sink),
-            encoder,
-            Arc::new(SystemProjectLogClock),
+            ProjectLogRuntimeComponents {
+                sink: Box::new(sink),
+                encoder,
+                clock: Arc::new(SystemProjectLogClock),
+            },
             performance,
             api_key_redaction,
             drop_report,
@@ -3300,13 +3313,16 @@ impl ProjectLogRuntime {
     fn start_with_components(
         context: ProjectLogContext,
         run_id: RunId,
-        sink: Box<dyn ProjectLogSink>,
-        encoder: Box<dyn ProjectLogRecordEncoder>,
-        clock: Arc<dyn ProjectLogClock>,
+        components: ProjectLogRuntimeComponents,
         performance: Arc<RunPerformanceCounters>,
         api_key_redaction: Option<ApiKeyRedactionGate>,
         drop_report: DiagnosticReport,
     ) -> Result<Self, ProjectLogStartError> {
+        let ProjectLogRuntimeComponents {
+            sink,
+            encoder,
+            clock,
+        } = components;
         let (sender, receiver) = async_channel::unbounded();
         let health = Arc::new(ProjectLogHealth::default());
         let permits = Arc::new(BestEffortPermits::new());
@@ -3937,9 +3953,11 @@ mod tests {
         ProjectLogRuntime::start_with_components(
             context(command),
             run_id(),
-            sink,
-            encoder,
-            Arc::new(FixedClock),
+            ProjectLogRuntimeComponents {
+                sink,
+                encoder,
+                clock: Arc::new(FixedClock),
+            },
             Arc::new(RunPerformanceCounters::default()),
             None,
             diagnostic_report(StateEffect::OutcomeUnknown),
@@ -4624,11 +4642,15 @@ mod tests {
             tasks,
             summary: TranslationEngineSummary::Generic(GenericTranslationSummary {
                 cleared_units: 0,
+                planned_units: 1,
+                remaining_units: 1,
                 reused_units: 0,
                 accepted_units: 1,
                 written_units: 1,
                 conflicted_units: 0,
                 response_problems: 1,
+                recoverable_request_exhaustions: 0,
+                request_admission_stopped: false,
             }),
         };
         logger
@@ -5427,9 +5449,11 @@ mod tests {
         let runtime = ProjectLogRuntime::start_with_components(
             context(ProjectLogCommand::Extract),
             run_id(),
-            Box::new(bytes.clone()),
-            Box::new(JsonProjectLogRecordEncoder),
-            Arc::new(FixedClock),
+            ProjectLogRuntimeComponents {
+                sink: Box::new(bytes.clone()),
+                encoder: Box::new(JsonProjectLogRecordEncoder),
+                clock: Arc::new(FixedClock),
+            },
             Arc::new(RunPerformanceCounters::default()),
             None,
             command_panic_drop_report(),

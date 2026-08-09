@@ -99,7 +99,7 @@ result-translate-status-value = { $status ->
     [incomplete] incomplete
    *[other] __ATT_FALLBACK__
 }
-result-translate-summary = Translation: { $total } tasks; { $complete } complete, { $partial } partial, { $unavailable } unavailable; wrote { $written } locations, { $remaining } remaining
+result-translate-summary = Translation: { $total } planned tasks, { $started } started, { $not_started } not started; { $complete } complete, { $partial } partial, { $unavailable } unavailable, { $failed } failed, { $cancelled } cancelled; wrote { $written } locations, { $remaining } remaining
 result-translate-convergence = State convergence: { $retained } retained, { $invalidated } invalidated, { $not_applicable } not applicable, { $reused } reused
 result-write-back-completed = Write-back complete: { $project }
 result-project-lua-completed = Project Lua execution complete: { $project }
@@ -107,13 +107,21 @@ result-output-directory = Output directory: { $path }
 result-write-back-summary = Write-back: { $translated } translated units, { $original } source units; auto-wrapped { $auto_wrapped }, inserted { $breaks } line breaks and { $indents } full-width indents; { $manual } need manual layout
 result-generic-extract-unchanged = Generic input unchanged: { $files } files, { $groups } groups, { $units } units
 result-generic-extract-updated = Generic input updated: { $files } files, { $groups } groups, { $units } units; preserved { $preserved } translations and cleared { $cleared }
-result-generic-translate-summary = Generic translation: { $total } tasks; { $complete } complete, { $partial } partial, { $unavailable } unavailable; cleared { $cleared }, reused { $reused }, accepted { $accepted }, wrote { $written }, conflicts { $conflicted }, response problems { $problems }
+result-generic-translate-summary = Generic translation: { $total } planned tasks, { $started } started, { $not_started } not started; { $complete } complete, { $partial } partial, { $unavailable } unavailable, { $failed } failed, { $cancelled } cancelled; { $planned_units } planned units, { $remaining_units } remaining units, cleared { $cleared }, reused { $reused }, accepted { $accepted }, wrote { $written }, conflicts { $conflicted }, response problems { $problems }
 result-generic-write-back-summary = Generic write-back: { $translated } translated units, { $original } source units retained
 result-symbol-repair-summary = Symbol repair: attempted { $attempted } units, repaired { $repaired }, skipped internally { $skipped }, replaced { $replacements } symbols
 result-run-log = Run log: { $path }
 translate-incomplete-object = Translate run for project { $project }
-translate-incomplete-rpg-maker-reason = { $partial } partial tasks, { $unavailable } unavailable tasks, { $protocol } protocol problems, and { $exhausted } exhausted requests; { $remaining_decisions } decisions and { $remaining_locations } locations remain
-translate-incomplete-generic-reason = { $partial } partial tasks, { $unavailable } unavailable tasks, { $conflicted } write conflicts, and { $problems } response problems
+translate-incomplete-rpg-maker-reason = { $partial } partial tasks, { $unavailable } unavailable tasks, { $not_started } not started, { $protocol } protocol problems, and { $exhausted } exhausted requests; request admission {
+    $admission ->
+        [stopped] stopped
+       *[open] remained open
+    }; { $remaining_decisions } decisions and { $remaining_locations } locations remain
+translate-incomplete-generic-reason = { $partial } partial tasks, { $unavailable } unavailable tasks, { $not_started } not started, { $exhausted } exhausted requests; request admission {
+    $admission ->
+        [stopped] stopped
+       *[open] remained open
+    }; { $remaining_units } remaining units, { $conflicted } write conflicts, and { $problems } response problems
 translate-incomplete-help = Read the task diagnostics in this run log, fix repeatable problems, and run Translate again; use Manual for a small remainder
 result-cancelled = The command was cancelled after safe finalization.
 result-plan-saved = The successful run plan was saved.
@@ -250,6 +258,7 @@ diagnostic-failure-value = { $code ->
     [target_already_exists] The destination already exists
     [file_identity_changed] The file identity changed during the operation
     [invalid_path] The path is not a valid target for this operation
+    [not_regular_file] The existing target is not a regular file
     [wrong_publisher_instance] The publication token belongs to a different publisher instance
     [journal_corrupt] The publication recovery journal is invalid or incomplete
     [unexpected_artifact] An unexpected filesystem artifact blocks the operation
@@ -332,6 +341,7 @@ diagnostic-json-position = line { $line }, column { $column }
 diagnostic-placeholder-rule-file = Placeholder rule { $number } in { $path }
 diagnostic-placeholder-rule-project = Placeholder rule { $number } in the current project
 manual-exported = Exported { $entries } entries to { $path }
+manual-ownership-exported = Ownership records: { $path }
 manual-checked = Valid { $valid }, unfilled { $unfilled }, errors { $errors }
 manual-applied = Applied { $applied }, unfilled { $unfilled }, errors { $errors }
 manual-value = { $code ->
@@ -343,6 +353,7 @@ manual-value = { $code ->
     [rerun_export_without_controls] Rerun manual export and do not put line breaks or NUL in array items
     [rerun_export_then_fill] Rerun manual export, then fill in the translation
     [resolve_temporary_then_rerun_export] Resolve the displayed fixed temporary path, remove any leftover object there, then rerun manual export
+    [resolve_published_backup_cleanup] Both exports have been applied; verify them, then remove the displayed fixed backup file
     [keep_exported_type] Keep the type written by manual export
    *[other] __ATT_FALLBACK__
 }

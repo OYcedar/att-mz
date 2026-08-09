@@ -99,7 +99,7 @@ result-translate-status-value = { $status ->
     [incomplete] incompleta
    *[other] __ATT_FALLBACK__
 }
-result-translate-summary = Traducción: { $total } tareas; { $complete } completas, { $partial } parciales, { $unavailable } no disponibles; { $written } ubicaciones escritas, { $remaining } restantes
+result-translate-summary = Traducción: { $total } tareas planificadas, { $started } iniciadas, { $not_started } sin iniciar; { $complete } completas, { $partial } parciales, { $unavailable } no disponibles, { $failed } fallidas, { $cancelled } canceladas; { $written } ubicaciones escritas, { $remaining } restantes
 result-translate-convergence = Convergencia: { $retained } conservadas, { $invalidated } invalidadas, { $not_applicable } no aplicables, { $reused } reutilizadas
 result-write-back-completed = Escritura completa: { $project }
 result-project-lua-completed = Ejecución Lua del proyecto completada: { $project }
@@ -107,13 +107,21 @@ result-output-directory = Directorio de salida: { $path }
 result-write-back-summary = Escritura: { $translated } unidades traducidas, { $original } unidades de origen; { $auto_wrapped } ajustes automáticos, { $breaks } saltos y { $indents } sangrías de ancho completo añadidos; { $manual } diseños manuales
 result-generic-extract-unchanged = Entrada Generic sin cambios: { $files } archivos, { $groups } grupos, { $units } unidades
 result-generic-extract-updated = Entrada Generic actualizada: { $files } archivos, { $groups } grupos, { $units } unidades; { $preserved } traducciones conservadas y { $cleared } borradas
-result-generic-translate-summary = Traducción Generic: { $total } tareas; { $complete } completas, { $partial } parciales, { $unavailable } no disponibles; { $cleared } borradas, { $reused } reutilizadas, { $accepted } aceptadas, { $written } escritas, { $conflicted } conflictos, { $problems } problemas de respuesta
+result-generic-translate-summary = Traducción Generic: { $total } tareas planificadas, { $started } iniciadas, { $not_started } sin iniciar; { $complete } completas, { $partial } parciales, { $unavailable } no disponibles, { $failed } fallidas, { $cancelled } canceladas; { $planned_units } unidades planificadas, { $remaining_units } restantes, { $cleared } borradas, { $reused } reutilizadas, { $accepted } aceptadas, { $written } escritas, { $conflicted } conflictos, { $problems } problemas de respuesta
 result-generic-write-back-summary = Escritura Generic: { $translated } unidades traducidas, { $original } unidades de origen conservadas
 result-symbol-repair-summary = Reparación de símbolos: { $attempted } unidades examinadas, { $repaired } reparadas, { $skipped } omitidas internamente y { $replacements } símbolos sustituidos
 result-run-log = Registro de ejecución: { $path }
 translate-incomplete-object = Ejecución Translate del proyecto { $project }
-translate-incomplete-rpg-maker-reason = { $partial } tareas parciales, { $unavailable } no disponibles, { $protocol } problemas de protocolo y { $exhausted } solicitudes agotadas; quedan { $remaining_decisions } decisiones y { $remaining_locations } ubicaciones
-translate-incomplete-generic-reason = { $partial } tareas parciales, { $unavailable } no disponibles, { $conflicted } conflictos de escritura y { $problems } problemas de respuesta
+translate-incomplete-rpg-maker-reason = { $partial } tareas parciales, { $unavailable } no disponibles, { $not_started } sin iniciar, { $protocol } problemas de protocolo y { $exhausted } solicitudes agotadas; la admisión de solicitudes {
+    $admission ->
+        [stopped] se detuvo
+       *[open] siguió abierta
+    }; quedan { $remaining_decisions } decisiones y { $remaining_locations } ubicaciones
+translate-incomplete-generic-reason = { $partial } tareas parciales, { $unavailable } no disponibles, { $not_started } sin iniciar, { $exhausted } solicitudes agotadas; la admisión de solicitudes {
+    $admission ->
+        [stopped] se detuvo
+       *[open] siguió abierta
+    }; { $remaining_units } unidades restantes, { $conflicted } conflictos de escritura y { $problems } problemas de respuesta
 translate-incomplete-help = Consulte los diagnósticos de tareas de este registro, corrija los problemas reproducibles y vuelva a ejecutar Translate; use Manual para un resto pequeño
 result-cancelled = El comando se canceló tras finalizar de forma segura.
 result-plan-saved = Se guardó el plan de ejecución correcto.
@@ -250,6 +258,7 @@ diagnostic-failure-value = { $code ->
     [target_already_exists] El destino ya existe
     [file_identity_changed] La identidad del archivo cambió durante la operación
     [invalid_path] La ruta no es un destino válido para esta operación
+    [not_regular_file] El destino existente no es un archivo normal
     [wrong_publisher_instance] El token de publicación pertenece a otra instancia del publicador
     [journal_corrupt] El diario de recuperación de publicación no es válido o está incompleto
     [unexpected_artifact] Un artefacto inesperado del sistema de archivos bloquea la operación
@@ -332,6 +341,7 @@ diagnostic-json-position = línea { $line }, columna { $column }
 diagnostic-placeholder-rule-file = Regla Placeholder { $number } en { $path }
 diagnostic-placeholder-rule-project = Regla Placeholder { $number } del proyecto actual
 manual-exported = Se exportaron { $entries } entradas a { $path }
+manual-ownership-exported = Registros de propiedad: { $path }
 manual-checked = Válidas { $valid }, sin completar { $unfilled }, errores { $errors }
 manual-applied = Aplicadas { $applied }, sin completar { $unfilled }, errores { $errors }
 manual-value = { $code ->
@@ -343,6 +353,7 @@ manual-value = { $code ->
     [rerun_export_without_controls] Vuelve a ejecutar manual export y no incluyas saltos de línea ni NUL en los elementos de la matriz
     [rerun_export_then_fill] Vuelve a ejecutar manual export y después completa la traducción
     [resolve_temporary_then_rerun_export] Corrige la ruta temporal fija mostrada, elimina cualquier objeto residual y vuelve a ejecutar manual export
+    [resolve_published_backup_cleanup] Ambas exportaciones ya se aplicaron; verifícalas y elimina el archivo backup fijo mostrado
     [keep_exported_type] Conserva el type escrito por manual export
    *[other] __ATT_FALLBACK__
 }

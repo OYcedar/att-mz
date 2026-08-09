@@ -99,7 +99,7 @@ result-translate-status-value = { $status ->
     [incomplete] 未完整
    *[other] __ATT_FALLBACK__
 }
-result-translate-summary = 翻译：任务 { $total }，完整 { $complete }，部分 { $partial }，不可用 { $unavailable }；写入 { $written } 处，剩余 { $remaining } 处
+result-translate-summary = 翻译：计划 { $total } 个任务，已开始 { $started }，未开始 { $not_started }；完整 { $complete }，部分 { $partial }，不可用 { $unavailable }，失败 { $failed }，取消 { $cancelled }；写入 { $written } 处，剩余 { $remaining } 处
 result-translate-convergence = 状态收敛：保留 { $retained }，失效 { $invalidated }，不适用 { $not_applicable }，复用 { $reused }
 result-write-back-completed = 写回完成：{ $project }
 result-project-lua-completed = 项目 Lua 执行完成：{ $project }
@@ -107,13 +107,21 @@ result-output-directory = 输出目录：{ $path }
 result-write-back-summary = 写回：应用译文 { $translated } 个单元，保留原文 { $original } 个单元；自动换行 { $auto_wrapped } 段，新增换行 { $breaks } 处；续行全角缩进 { $indents } 处；需人工换行 { $manual } 段
 result-generic-extract-unchanged = Generic 输入未变化：{ $files } 个文件，{ $groups } 个组，{ $units } 个单元
 result-generic-extract-updated = Generic 输入已更新：{ $files } 个文件，{ $groups } 个组，{ $units } 个单元；保留 { $preserved } 条译文，清除 { $cleared } 条
-result-generic-translate-summary = Generic 翻译：任务 { $total }，完整 { $complete }，部分 { $partial }，不可用 { $unavailable }；清除 { $cleared }，复用 { $reused }，接受 { $accepted }，写入 { $written }，冲突 { $conflicted }，响应问题 { $problems }
+result-generic-translate-summary = Generic 翻译：计划 { $total } 个任务，已开始 { $started }，未开始 { $not_started }；完整 { $complete }，部分 { $partial }，不可用 { $unavailable }，失败 { $failed }，取消 { $cancelled }；计划 Unit { $planned_units }，剩余 Unit { $remaining_units }，清除 { $cleared }，复用 { $reused }，接受 { $accepted }，写入 { $written }，冲突 { $conflicted }，响应问题 { $problems }
 result-generic-write-back-summary = Generic 写回：应用译文 { $translated } 个单元，保留原文 { $original } 个单元
 result-symbol-repair-summary = 符号修复：尝试 { $attempted } 个单元，实际修复 { $repaired } 个，内部跳过 { $skipped } 个，替换 { $replacements } 个符号
 result-run-log = 运行记录：{ $path }
 translate-incomplete-object = 项目 { $project } 的本次 Translate
-translate-incomplete-rpg-maker-reason = 部分任务 { $partial }，不可用任务 { $unavailable }，协议问题 { $protocol }，请求耗尽 { $exhausted }；剩余决策 { $remaining_decisions }，剩余位置 { $remaining_locations }
-translate-incomplete-generic-reason = 部分任务 { $partial }，不可用任务 { $unavailable }，写入冲突 { $conflicted }，响应问题 { $problems }
+translate-incomplete-rpg-maker-reason = 部分任务 { $partial }，不可用任务 { $unavailable }，未开始任务 { $not_started }，协议问题 { $protocol }，请求耗尽 { $exhausted }；请求准入{
+    $admission ->
+        [stopped] 已停止
+       *[open] 未停止
+    }；剩余决策 { $remaining_decisions }，剩余位置 { $remaining_locations }
+translate-incomplete-generic-reason = 部分任务 { $partial }，不可用任务 { $unavailable }，未开始任务 { $not_started }，请求耗尽 { $exhausted }；请求准入{
+    $admission ->
+        [stopped] 已停止
+       *[open] 未停止
+    }；剩余 Unit { $remaining_units }，写入冲突 { $conflicted }，响应问题 { $problems }
 translate-incomplete-help = 查看本次运行记录中的具体任务诊断，修正可重复的问题后再次运行 Translate；少量剩余内容可使用 Manual
 result-cancelled = 命令已在安全收尾后取消。
 result-plan-saved = 已保存本次成功运行方案。
@@ -247,6 +255,7 @@ diagnostic-failure-value = { $code ->
     [target_already_exists] 目标已经存在
     [file_identity_changed] 操作期间文件物理身份发生变化
     [invalid_path] 路径不是该操作的有效目标
+    [not_regular_file] 现有目标不是普通文件
     [wrong_publisher_instance] 发布令牌属于另一个发布器实例
     [journal_corrupt] 发布恢复日志损坏或不完整
     [unexpected_artifact] 意外的文件系统产物阻塞了操作
@@ -329,6 +338,7 @@ diagnostic-json-position = 第 { $line } 行，第 { $column } 列
 diagnostic-placeholder-rule-file = { $path } 中的 Placeholder 规则 { $number }
 diagnostic-placeholder-rule-project = 当前项目的 Placeholder 规则 { $number }
 manual-exported = 已导出 { $entries } 条：{ $path }
+manual-ownership-exported = 所有权记录：{ $path }
 manual-checked = 有效 { $valid }，未填写 { $unfilled }，错误 { $errors }
 manual-applied = 已应用 { $applied }，未填写 { $unfilled }，错误 { $errors }
 manual-value = { $code ->
@@ -340,6 +350,7 @@ manual-value = { $code ->
     [rerun_export_without_controls] 重新运行 manual export，不要把换行或 NUL 写进数组项
     [rerun_export_then_fill] 重新运行 manual export 后再填写译文
     [resolve_temporary_then_rerun_export] 处理显示的固定临时路径；如有遗留对象，将其移除，然后重新运行 manual export
+    [resolve_published_backup_cleanup] 两份导出已经生效；确认输出后删除显示的固定 backup 文件
     [keep_exported_type] 保留 manual export 生成的 type
    *[other] __ATT_FALLBACK__
 }

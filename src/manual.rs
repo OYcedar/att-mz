@@ -12,7 +12,11 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use crate::diagnostic::{
-    IoFailure, RelatedFailureRelation, StateEffect, render_state_effect_impact,
+    Diagnostic, DiagnosticReport, FileSystemDiagnosticContext, FileSystemDiagnosticStage,
+    FileSystemIssue, FileSystemOperation, FileSystemPathViolation, FileSystemProblem,
+    FileSystemRecoveryViolation, IoFailure, RelatedFailureRelation, RuntimeComponent, RuntimeIssue,
+    SafePath, SafeText, StateEffect, public_path, render_diagnostic_report,
+    render_state_effect_impact,
 };
 use crate::execution::CooperativeCancellation;
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
@@ -38,8 +42,12 @@ use crate::rpg_maker::translate::planner::expected_line_shape;
 use crate::rpg_maker::translate::semantics::{
     PreparedTranslationStatus, ResolvedTranslationSemantics,
 };
+use crate::runtime::windows::{
+    FileIdentity, PinnedPath, WindowsFsError, pin_directory_without_reparse,
+    pin_path_without_reparse,
+};
 use crate::translation::planning_resource::CompiledTerminology;
-use crate::user_text::sanitize_user_text;
+use crate::windows_path::{WindowsOrdinalCaseKey, WindowsOrdinalCaseKeyError};
 
 const MANUAL_SQLITE_CANCELLATION_CHECK_OPERATIONS: i32 = 1_000;
 
@@ -132,12 +140,19 @@ pub(crate) struct ManualTranslationEntry {
     pub(crate) kind: ManualTranslationType,
     pub(crate) source: Vec<String>,
     pub(crate) locator: ManualTranslationLocator,
+    pub(crate) rpg_maker_owner: Option<ManualRpgMakerOwner>,
     pub(crate) applicability: Sha256Fingerprint,
     pub(crate) needs_translation: bool,
     pub(crate) placeholder_scope: String,
     pub(crate) current_translation: Option<Vec<String>>,
     pub(crate) origin: Option<ManualTranslationOrigin>,
     pub(crate) outdated_manual: Option<ManualOutdatedTranslation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManualRpgMakerOwner {
+    Builtin,
+    Rules { rule_number: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -214,6 +229,14 @@ struct ManualDocumentEntry {
     translation: Vec<String>,
 }
 
+#[derive(Serialize)]
+struct ManualOwnershipRecord<'a> {
+    manual_id: &'a str,
+    owner: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rule_number: Option<usize>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ValidatedManualTranslation {
     pub(crate) id: String,
@@ -278,26 +301,134 @@ pub(crate) enum ManualDocumentError {
         path: PathBuf,
         source: io::Error,
     },
+    OutputTarget {
+        problem: ManualOutputTargetProblem,
+    },
+    ExistingTemporary {
+        path: PathBuf,
+    },
+    ExistingBackup {
+        path: PathBuf,
+    },
     TemporaryCleanup {
         operation: Box<ManualDocumentError>,
         temporary: PathBuf,
         cleanup: io::Error,
     },
+    PairedPublicationRollback {
+        operation: Box<ManualDocumentError>,
+        failures: Vec<ManualPairIoFailure>,
+    },
+    PairedPublicationFinalization {
+        failures: Vec<ManualPairIoFailure>,
+    },
+}
+
+/// Manual 导出在建立输出目标身份时能够确认的闭集问题。
+///
+/// 这些事实不能退化成普通写入错误，否则 CLI 会把同一目标、目录或 reparse point
+/// 错误地解释为权限问题。
+#[derive(Debug)]
+pub(crate) enum ManualOutputTargetProblem {
+    SameTarget { first: PathBuf, second: PathBuf },
+    NotRegularFile { path: PathBuf },
+    MissingFileName { path: PathBuf },
+    ReparsePoint { path: PathBuf },
+    NonLocalVolume { path: PathBuf },
+    NonNtfsVolume { path: PathBuf, actual: String },
+    CaseSensitiveDirectory { path: PathBuf },
+    BindingCancelled { path: PathBuf },
+    TargetAlreadyExists { path: PathBuf },
+    IdentityChanged { path: PathBuf },
+    BindingIo { path: PathBuf, failure: IoFailure },
+}
+
+#[derive(Debug)]
+pub(crate) struct ManualPairIoFailure {
+    path: PathBuf,
+    source: io::Error,
+}
+
+#[cfg(test)]
+impl ManualPairIoFailure {
+    pub(crate) fn for_test(path: PathBuf, source: io::Error) -> Self {
+        Self { path, source }
+    }
+}
+
+impl ManualOutputTargetProblem {
+    fn object(&self) -> String {
+        match self {
+            Self::SameTarget { first, second } => {
+                format!("{}；{}", public_path(first), public_path(second))
+            }
+            Self::NotRegularFile { path }
+            | Self::MissingFileName { path }
+            | Self::ReparsePoint { path }
+            | Self::NonLocalVolume { path }
+            | Self::NonNtfsVolume { path, .. }
+            | Self::CaseSensitiveDirectory { path }
+            | Self::BindingCancelled { path }
+            | Self::TargetAlreadyExists { path }
+            | Self::IdentityChanged { path }
+            | Self::BindingIo { path, .. } => public_path(path),
+        }
+    }
+
+    const fn reason_code(&self) -> &'static str {
+        match self {
+            Self::SameTarget { .. } => "conflicting_values",
+            Self::NotRegularFile { .. } => "not_regular_file",
+            Self::MissingFileName { .. } => "invalid_path",
+            Self::ReparsePoint { .. } => "reparse_point_forbidden",
+            Self::NonLocalVolume { .. } => "non_local_volume",
+            Self::NonNtfsVolume { .. } => "non_ntfs_volume",
+            Self::CaseSensitiveDirectory { .. } => "case_sensitive_directory",
+            Self::BindingCancelled { .. } => "lock_cancelled",
+            Self::TargetAlreadyExists { .. } => "target_already_exists",
+            Self::IdentityChanged { .. } => "file_identity_changed",
+            Self::BindingIo { failure, .. } => failure.summary_code(),
+        }
+    }
+
+    const fn help_code(&self) -> &'static str {
+        match self {
+            Self::SameTarget { .. }
+            | Self::NotRegularFile { .. }
+            | Self::MissingFileName { .. }
+            | Self::ReparsePoint { .. }
+            | Self::NonLocalVolume { .. }
+            | Self::NonNtfsVolume { .. }
+            | Self::CaseSensitiveDirectory { .. } => "fix_input",
+            Self::BindingCancelled { .. } => "retry",
+            Self::TargetAlreadyExists { .. } | Self::IdentityChanged { .. } => "resolve_contention",
+            Self::BindingIo { .. } => "check_path_and_permissions",
+        }
+    }
 }
 
 impl fmt::Display for ManualDocumentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Cancelled => formatter.write_str("人工补译操作已取消"),
-            Self::Read { path, .. } => write!(formatter, "无法读取 {}", path.display()),
+            Self::Read { path, .. } => write!(formatter, "无法读取 {}", public_path(path)),
             Self::InvalidUtf8 { path } => {
-                write!(formatter, "{} 不是 UTF-8 TOML 文件", path.display())
+                write!(formatter, "{} 不是 UTF-8 TOML 文件", public_path(path))
             }
             Self::InvalidToml { path, .. } => {
-                write!(formatter, "{} 不是有效的人工译文 TOML", path.display())
+                write!(formatter, "{} 不是有效的人工译文 TOML", public_path(path))
             }
             Self::Encode(_) => formatter.write_str("无法生成人工译文 TOML"),
-            Self::Write { path, .. } => write!(formatter, "无法写入 {}", path.display()),
+            Self::Write { path, .. } => write!(formatter, "无法写入 {}", public_path(path)),
+            Self::OutputTarget { problem } => {
+                write!(formatter, "Manual 输出目标无效：{}", problem.object())
+            }
+            Self::ExistingTemporary { path } => {
+                write!(formatter, "固定临时文件已经存在：{}", public_path(path))
+            }
+            Self::ExistingBackup { path } => {
+                write!(formatter, "固定恢复文件已经存在：{}", public_path(path))
+            }
             Self::TemporaryCleanup {
                 operation,
                 temporary,
@@ -305,8 +436,23 @@ impl fmt::Display for ManualDocumentError {
             } => write!(
                 formatter,
                 "{operation}；清理人工译文临时文件 {} 失败：{cleanup}",
-                temporary.display()
+                public_path(temporary)
             ),
+            Self::PairedPublicationRollback {
+                operation,
+                failures,
+            } => write!(
+                formatter,
+                "{operation}；成对发布恢复有 {} 项失败",
+                failures.len()
+            ),
+            Self::PairedPublicationFinalization { failures } => {
+                write!(
+                    formatter,
+                    "成对发布已经生效，但有 {} 项收尾失败",
+                    failures.len()
+                )
+            }
         }
     }
 }
@@ -318,7 +464,15 @@ impl Error for ManualDocumentError {
             Self::InvalidToml { source, .. } => Some(source),
             Self::Encode(source) => Some(source),
             Self::TemporaryCleanup { operation, .. } => Some(operation.as_ref()),
-            Self::Cancelled | Self::InvalidUtf8 { .. } => None,
+            Self::PairedPublicationRollback { operation, .. } => Some(operation.as_ref()),
+            Self::PairedPublicationFinalization { failures } => failures
+                .first()
+                .map(|failure| &failure.source as &(dyn Error + 'static)),
+            Self::Cancelled
+            | Self::InvalidUtf8 { .. }
+            | Self::OutputTarget { .. }
+            | Self::ExistingTemporary { .. }
+            | Self::ExistingBackup { .. } => None,
         }
     }
 }
@@ -358,6 +512,70 @@ fn export_manual_document_with_cancellation(
     ensure_manual_document_running(cancellation)?;
     atomic_replace(path, encoded.as_bytes(), cancellation)?;
     Ok(count)
+}
+
+fn export_rpg_maker_manual_documents_with_cancellation(
+    path: &Path,
+    ownership_path: &Path,
+    index: &ManualTranslationIndex,
+    cancellation: &CooperativeCancellation,
+) -> Result<usize, ManualDocumentError> {
+    ensure_manual_document_running(cancellation)?;
+    let entries = index
+        .entries()
+        .iter()
+        .filter(|entry| entry.needs_translation)
+        .collect::<Vec<_>>();
+    let translation = entries
+        .iter()
+        .map(|entry| ManualDocumentEntry {
+            id: entry.id.clone(),
+            kind: entry.kind,
+            source: entry.source.clone(),
+            translation: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let encoded = if translation.is_empty() {
+        String::new()
+    } else {
+        toml::to_string_pretty(&ManualDocument { translation })
+            .map_err(ManualDocumentError::Encode)?
+    };
+    let mut ownership = String::new();
+    for entry in &entries {
+        let (owner, rule_number) = match entry.rpg_maker_owner {
+            Some(ManualRpgMakerOwner::Builtin) => ("builtin", None),
+            Some(ManualRpgMakerOwner::Rules { rule_number }) => ("rules", Some(rule_number)),
+            None => {
+                return Err(ManualDocumentError::Write {
+                    path: ownership_path.to_path_buf(),
+                    source: io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "RPG Maker Manual 条目缺少文字所有权",
+                    ),
+                });
+            }
+        };
+        let record = ManualOwnershipRecord {
+            manual_id: &entry.id,
+            owner,
+            rule_number,
+        };
+        ownership.push_str(
+            &serde_json::to_string(&record)
+                .expect("只包含字符串和正整数的 Manual 所有权记录必须可编码"),
+        );
+        ownership.push('\n');
+    }
+    ensure_manual_document_running(cancellation)?;
+    atomic_replace_pair(
+        path,
+        encoded.as_bytes(),
+        ownership_path,
+        ownership.as_bytes(),
+        cancellation,
+    )?;
+    Ok(entries.len())
 }
 
 #[cfg(test)]
@@ -529,8 +747,8 @@ fn atomic_replace(
     bytes: &[u8],
     cancellation: &CooperativeCancellation,
 ) -> Result<(), ManualDocumentError> {
-    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
-    let temporary = path.with_file_name(format!(".{file_name}.tmp"));
+    drop(bind_manual_output_target(path)?);
+    let temporary = manual_temporary_path(path);
     ensure_manual_document_running(cancellation)?;
     let mut owns_temporary = false;
     let write = (|| -> Result<(), ManualDocumentError> {
@@ -538,10 +756,7 @@ fn atomic_replace(
             .write(true)
             .create_new(true)
             .open(&temporary)
-            .map_err(|source| ManualDocumentError::Write {
-                path: path.to_path_buf(),
-                source,
-            })?;
+            .map_err(|source| manual_temporary_open_error(path, &temporary, source))?;
         owns_temporary = true;
         file.write_all(bytes)
             .map_err(|source| ManualDocumentError::Write {
@@ -567,6 +782,482 @@ fn atomic_replace(
         }
         result => result,
     }
+}
+
+fn atomic_replace_pair(
+    first_path: &Path,
+    first_bytes: &[u8],
+    second_path: &Path,
+    second_bytes: &[u8],
+    cancellation: &CooperativeCancellation,
+) -> Result<(), ManualDocumentError> {
+    ensure_distinct_manual_output_targets(first_path, second_path)?;
+    let first_backup = manual_backup_path(first_path);
+    let second_backup = manual_backup_path(second_path);
+    ensure_target_absent(&first_backup)?;
+    ensure_target_absent(&second_backup)?;
+    let first_temporary = stage_manual_file(first_path, first_bytes, cancellation)?;
+    let second_temporary = match stage_manual_file(second_path, second_bytes, cancellation) {
+        Ok(temporary) => temporary,
+        Err(operation) => {
+            return Err(cleanup_manual_temporary_after_failure(
+                first_temporary,
+                operation,
+            ));
+        }
+    };
+    let result = publish_staged_pair(
+        &first_temporary,
+        first_path,
+        &first_backup,
+        &second_temporary,
+        second_path,
+        &second_backup,
+        &SystemManualPairPublisher,
+    );
+    match result {
+        Ok(()) => Ok(()),
+        Err(operation) => {
+            let operation = if first_temporary.exists() {
+                cleanup_manual_temporary_after_failure(first_temporary, operation)
+            } else {
+                operation
+            };
+            if second_temporary.exists() {
+                Err(cleanup_manual_temporary_after_failure(
+                    second_temporary,
+                    operation,
+                ))
+            } else {
+                Err(operation)
+            }
+        }
+    }
+}
+
+enum ManualOutputTargetIdentity {
+    Existing(FileIdentity),
+    Planned(WindowsOrdinalCaseKey),
+}
+
+struct BoundManualOutputTarget {
+    identity: ManualOutputTargetIdentity,
+    _pinned: PinnedPath,
+}
+
+fn ensure_distinct_manual_output_targets(
+    first: &Path,
+    second: &Path,
+) -> Result<(), ManualDocumentError> {
+    let paths = [
+        first.to_path_buf(),
+        manual_temporary_path(first),
+        manual_backup_path(first),
+        second.to_path_buf(),
+        manual_temporary_path(second),
+        manual_backup_path(second),
+    ];
+    let bound = paths
+        .iter()
+        .map(|path| bind_manual_output_target(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    for left in 0..bound.len() {
+        for right in left + 1..bound.len() {
+            let same = match (&bound[left].identity, &bound[right].identity) {
+                (
+                    ManualOutputTargetIdentity::Existing(first),
+                    ManualOutputTargetIdentity::Existing(second),
+                ) => first == second,
+                (
+                    ManualOutputTargetIdentity::Planned(first),
+                    ManualOutputTargetIdentity::Planned(second),
+                ) => first == second,
+                _ => false,
+            };
+            if same {
+                return Err(ManualDocumentError::OutputTarget {
+                    problem: ManualOutputTargetProblem::SameTarget {
+                        first: paths[left].clone(),
+                        second: paths[right].clone(),
+                    },
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn bind_manual_output_target(path: &Path) -> Result<BoundManualOutputTarget, ManualDocumentError> {
+    match pin_path_without_reparse(path) {
+        Ok(pinned) => {
+            let metadata = pinned
+                .metadata()
+                .map_err(|source| manual_target_error(path, source))?;
+            if !metadata.is_file() {
+                return Err(ManualDocumentError::OutputTarget {
+                    problem: ManualOutputTargetProblem::NotRegularFile {
+                        path: path.to_path_buf(),
+                    },
+                });
+            }
+            let identity = FileIdentity::of(pinned.file(), path)
+                .map_err(|source| manual_target_error(path, source))?;
+            Ok(BoundManualOutputTarget {
+                identity: ManualOutputTargetIdentity::Existing(identity),
+                _pinned: pinned,
+            })
+        }
+        Err(WindowsFsError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let file_name = path
+                .file_name()
+                .ok_or_else(|| ManualDocumentError::OutputTarget {
+                    problem: ManualOutputTargetProblem::MissingFileName {
+                        path: path.to_path_buf(),
+                    },
+                })?;
+            let pinned = pin_directory_without_reparse(parent)
+                .map_err(|source| manual_target_error(path, source))?;
+            let resolved = pinned.resolved_path().join(file_name);
+            let key = WindowsOrdinalCaseKey::from_os_str(resolved.as_os_str())
+                .map_err(|source| manual_target_key_error(path, source))?;
+            Ok(BoundManualOutputTarget {
+                identity: ManualOutputTargetIdentity::Planned(key),
+                _pinned: pinned,
+            })
+        }
+        Err(source) => Err(manual_target_error(path, source)),
+    }
+}
+
+fn manual_target_error(path: &Path, source: WindowsFsError) -> ManualDocumentError {
+    let problem = match source {
+        WindowsFsError::Io { source, .. } => ManualOutputTargetProblem::BindingIo {
+            path: path.to_path_buf(),
+            failure: IoFailure::from_error(&source),
+        },
+        WindowsFsError::ReparsePoint { path } => ManualOutputTargetProblem::ReparsePoint { path },
+        WindowsFsError::NonLocalVolume { path } => {
+            ManualOutputTargetProblem::NonLocalVolume { path }
+        }
+        WindowsFsError::NonNtfsVolume { path, actual } => {
+            ManualOutputTargetProblem::NonNtfsVolume { path, actual }
+        }
+        WindowsFsError::CaseSensitiveDirectory { path } => {
+            ManualOutputTargetProblem::CaseSensitiveDirectory { path }
+        }
+        WindowsFsError::LockCancelled { path } => {
+            ManualOutputTargetProblem::BindingCancelled { path }
+        }
+        WindowsFsError::RenameTargetExists { path } => {
+            ManualOutputTargetProblem::TargetAlreadyExists { path }
+        }
+        WindowsFsError::FileIdentityChanged { path } => {
+            ManualOutputTargetProblem::IdentityChanged { path }
+        }
+    };
+    ManualDocumentError::OutputTarget { problem }
+}
+
+fn manual_target_key_error(path: &Path, source: WindowsOrdinalCaseKeyError) -> ManualDocumentError {
+    let problem = match source {
+        WindowsOrdinalCaseKeyError::InputTooLarge { .. } => {
+            ManualOutputTargetProblem::MissingFileName {
+                path: path.to_path_buf(),
+            }
+        }
+        WindowsOrdinalCaseKeyError::WindowsApi { source, .. } => {
+            ManualOutputTargetProblem::BindingIo {
+                path: path.to_path_buf(),
+                failure: IoFailure::from_error(&source),
+            }
+        }
+    };
+    ManualDocumentError::OutputTarget { problem }
+}
+
+fn manual_backup_path(path: &Path) -> PathBuf {
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    path.with_file_name(format!(".{file_name}.backup"))
+}
+
+fn manual_temporary_path(path: &Path) -> PathBuf {
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    path.with_file_name(format!(".{file_name}.tmp"))
+}
+
+fn ensure_target_absent(path: &Path) -> Result<(), ManualDocumentError> {
+    match fs::metadata(path) {
+        Ok(_) => Err(ManualDocumentError::ExistingBackup {
+            path: path.to_path_buf(),
+        }),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(ManualDocumentError::Write {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn stage_manual_file(
+    path: &Path,
+    bytes: &[u8],
+    cancellation: &CooperativeCancellation,
+) -> Result<PathBuf, ManualDocumentError> {
+    let temporary = manual_temporary_path(path);
+    ensure_manual_document_running(cancellation)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|source| manual_temporary_open_error(path, &temporary, source))?;
+    let result = (|| -> Result<(), ManualDocumentError> {
+        file.write_all(bytes)
+            .map_err(|source| ManualDocumentError::Write {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        ensure_manual_document_running(cancellation)?;
+        file.sync_all()
+            .map_err(|source| ManualDocumentError::Write {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        ensure_manual_document_running(cancellation)
+    })();
+    drop(file);
+    match result {
+        Ok(()) => Ok(temporary),
+        Err(operation) => Err(cleanup_manual_temporary_after_failure(temporary, operation)),
+    }
+}
+
+fn manual_temporary_open_error(
+    target: &Path,
+    temporary: &Path,
+    source: io::Error,
+) -> ManualDocumentError {
+    if source.kind() == io::ErrorKind::AlreadyExists {
+        ManualDocumentError::ExistingTemporary {
+            path: temporary.to_path_buf(),
+        }
+    } else {
+        ManualDocumentError::Write {
+            path: target.to_path_buf(),
+            source,
+        }
+    }
+}
+
+trait ManualPairPublisher {
+    fn exists(&self, path: &Path) -> io::Result<bool>;
+    fn backup_existing(&self, source: &Path, backup: &Path) -> io::Result<()>;
+    fn commit_new(&self, source: &Path, target: &Path) -> io::Result<()>;
+    fn remove_file(&self, path: &Path) -> io::Result<()>;
+    fn restore_backup(&self, backup: &Path, target: &Path) -> io::Result<()>;
+}
+
+struct SystemManualPairPublisher;
+
+impl ManualPairPublisher for SystemManualPairPublisher {
+    fn exists(&self, path: &Path) -> io::Result<bool> {
+        match fs::metadata(path) {
+            Ok(_) => Ok(true),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(source),
+        }
+    }
+
+    fn backup_existing(&self, source: &Path, backup: &Path) -> io::Result<()> {
+        rename_new_file(source, backup)
+    }
+
+    fn commit_new(&self, source: &Path, target: &Path) -> io::Result<()> {
+        rename_new_file(source, target)
+    }
+
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        fs::remove_file(path)
+    }
+
+    fn restore_backup(&self, backup: &Path, target: &Path) -> io::Result<()> {
+        rename_new_file(backup, target)
+    }
+}
+
+struct ManualPairTarget<'a> {
+    target: &'a Path,
+    backup: &'a Path,
+    had_original: bool,
+    published: bool,
+}
+
+impl<'a> ManualPairTarget<'a> {
+    const fn new(target: &'a Path, backup: &'a Path) -> Self {
+        Self {
+            target,
+            backup,
+            had_original: false,
+            published: false,
+        }
+    }
+}
+
+fn publish_staged_pair(
+    first_temporary: &Path,
+    first_target: &Path,
+    first_backup: &Path,
+    second_temporary: &Path,
+    second_target: &Path,
+    second_backup: &Path,
+    publisher: &impl ManualPairPublisher,
+) -> Result<(), ManualDocumentError> {
+    let mut first = ManualPairTarget::new(first_target, first_backup);
+    let mut second = ManualPairTarget::new(second_target, second_backup);
+    let operation = (|| -> Result<(), ManualDocumentError> {
+        backup_pair_target(&mut first, publisher)?;
+        backup_pair_target(&mut second, publisher)?;
+        publisher
+            .commit_new(first_temporary, first_target)
+            .map_err(|source| ManualDocumentError::Write {
+                path: first_target.to_path_buf(),
+                source,
+            })?;
+        first.published = true;
+        publisher
+            .commit_new(second_temporary, second_target)
+            .map_err(|source| ManualDocumentError::Write {
+                path: second_target.to_path_buf(),
+                source,
+            })?;
+        second.published = true;
+        Ok(())
+    })();
+    if let Err(operation) = operation {
+        return Err(restore_pair_after_failure(
+            operation,
+            &mut first,
+            &mut second,
+            publisher,
+        ));
+    }
+    let mut finalization_failures = Vec::new();
+    for target in [&first, &second] {
+        if target.had_original
+            && let Err(source) = publisher.remove_file(target.backup)
+        {
+            finalization_failures.push(ManualPairIoFailure {
+                path: target.backup.to_path_buf(),
+                source,
+            });
+        }
+    }
+    if !finalization_failures.is_empty() {
+        return Err(ManualDocumentError::PairedPublicationFinalization {
+            failures: finalization_failures,
+        });
+    }
+    Ok(())
+}
+
+fn backup_pair_target(
+    target: &mut ManualPairTarget<'_>,
+    publisher: &impl ManualPairPublisher,
+) -> Result<(), ManualDocumentError> {
+    let had_original =
+        publisher
+            .exists(target.target)
+            .map_err(|source| ManualDocumentError::Write {
+                path: target.target.to_path_buf(),
+                source,
+            })?;
+    if had_original {
+        publisher
+            .backup_existing(target.target, target.backup)
+            .map_err(|source| ManualDocumentError::Write {
+                path: target.target.to_path_buf(),
+                source,
+            })?;
+        target.had_original = true;
+    }
+    Ok(())
+}
+
+fn restore_pair_after_failure(
+    operation: ManualDocumentError,
+    first: &mut ManualPairTarget<'_>,
+    second: &mut ManualPairTarget<'_>,
+    publisher: &impl ManualPairPublisher,
+) -> ManualDocumentError {
+    let mut failures = Vec::new();
+    restore_pair_target(second, publisher, &mut failures);
+    restore_pair_target(first, publisher, &mut failures);
+    if failures.is_empty() {
+        operation
+    } else {
+        ManualDocumentError::PairedPublicationRollback {
+            operation: Box::new(operation),
+            failures,
+        }
+    }
+}
+
+fn restore_pair_target(
+    target: &mut ManualPairTarget<'_>,
+    publisher: &impl ManualPairPublisher,
+    failures: &mut Vec<ManualPairIoFailure>,
+) {
+    if target.published {
+        match publisher.remove_file(target.target) {
+            Ok(()) => target.published = false,
+            Err(source) => {
+                failures.push(ManualPairIoFailure {
+                    path: target.target.to_path_buf(),
+                    source,
+                });
+                return;
+            }
+        }
+    }
+    if target.had_original {
+        match publisher.restore_backup(target.backup, target.target) {
+            Ok(()) => target.had_original = false,
+            Err(source) => failures.push(ManualPairIoFailure {
+                path: target.target.to_path_buf(),
+                source,
+            }),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn rename_new_file(source: &Path, target: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let target = target
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let moved = unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+    if moved == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn rename_new_file(source: &Path, target: &Path) -> io::Result<()> {
+    fs::rename(source, target)
 }
 
 fn cleanup_manual_temporary_after_failure(
@@ -752,6 +1443,7 @@ pub(crate) enum ManualCommandSummary {
     Exported {
         entries: usize,
         file: PathBuf,
+        ownership_file: Option<PathBuf>,
     },
     Checked {
         report: ManualCheckReport,
@@ -778,6 +1470,7 @@ pub(crate) fn execute_generic_manual_command(
         database_path,
         operation,
         file,
+        None,
         cancellation,
         |connection| load_generic_manual_command_snapshot(connection, language_modules),
         |connection, writes| {
@@ -791,6 +1484,7 @@ pub(crate) fn execute_rpg_maker_manual_command(
     engine: RpgMakerEngine,
     operation: ManualOperation,
     file: &Path,
+    ownership_file: Option<&Path>,
     language_modules: Option<&LanguageModuleCatalog>,
     cancellation: &CooperativeCancellation,
 ) -> Result<ManualCommandSummary, ManualCommandError> {
@@ -803,6 +1497,7 @@ pub(crate) fn execute_rpg_maker_manual_command(
         database_path,
         operation,
         file,
+        ownership_file,
         cancellation,
         |connection| load_rpg_maker_manual_command_snapshot(connection, engine, language_modules),
         |connection, writes| {
@@ -815,6 +1510,7 @@ fn execute_manual_database_command(
     database_path: &Path,
     operation: ManualOperation,
     file: &Path,
+    ownership_file: Option<&Path>,
     cancellation: &CooperativeCancellation,
     mut load_snapshot: impl FnMut(&Connection) -> Result<ManualProjectSnapshot, ManualDatabaseError>,
     mut apply: impl FnMut(
@@ -840,7 +1536,7 @@ fn execute_manual_database_command(
                 .map_err(ManualDatabaseError::from)
                 .map_err(|source| manual_command_database_error(source, cancellation))?;
             ensure_manual_command_running(cancellation)?;
-            execute_manual_read_operation(operation, file, &snapshot, cancellation)
+            execute_manual_read_operation(operation, file, ownership_file, &snapshot, cancellation)
         }
         ManualOperation::Apply => {
             let mut connection = open_read_write(database_path, cancellation)
@@ -869,19 +1565,36 @@ fn execute_manual_database_command(
 fn execute_manual_read_operation(
     operation: ManualOperation,
     file: &Path,
+    ownership_file: Option<&Path>,
     snapshot: &ManualProjectSnapshot,
     cancellation: &CooperativeCancellation,
 ) -> Result<ManualCommandSummary, ManualCommandError> {
     match operation {
         ManualOperation::Export => {
-            export_manual_document_with_cancellation(file, &snapshot.index, cancellation)
+            let exported = match ownership_file {
+                Some(ownership_file) => export_rpg_maker_manual_documents_with_cancellation(
+                    file,
+                    ownership_file,
+                    &snapshot.index,
+                    cancellation,
+                ),
+                None => {
+                    export_manual_document_with_cancellation(file, &snapshot.index, cancellation)
+                }
+            };
+            exported
                 .map(|entries| ManualCommandSummary::Exported {
                     entries,
                     file: file.to_path_buf(),
+                    ownership_file: ownership_file.map(Path::to_path_buf),
                 })
                 .map_err(ManualCommandError::from_document)
         }
         ManualOperation::Check => {
+            assert!(
+                ownership_file.is_none(),
+                "Manual check 不得获得所有权输出路径"
+            );
             let report = check_manual_snapshot(file, snapshot, cancellation)?;
             if report.is_valid() {
                 Ok(ManualCommandSummary::Checked { report })
@@ -889,7 +1602,9 @@ fn execute_manual_read_operation(
                 Err(ManualCommandError::InvalidEntries(report))
             }
         }
-        ManualOperation::Apply => unreachable!("apply 必须在写事务中执行"),
+        ManualOperation::Apply => {
+            unreachable!("apply 必须在写事务中执行")
+        }
     }
 }
 
@@ -969,6 +1684,223 @@ impl ManualCommandError {
             Self::Document(source)
         }
     }
+
+    /// 为 CLI 与项目 JSONL 建立同一份安全、类型化 Manual 失败事实。
+    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
+        match self {
+            Self::Document(source) => manual_document_diagnostic_report(source),
+            Self::Cancelled => manual_fallback_diagnostic_report(StateEffect::ProgressPreserved),
+            Self::Database(_) | Self::InvalidEntries(_) => {
+                manual_fallback_diagnostic_report(StateEffect::Unchanged)
+            }
+        }
+    }
+}
+
+fn manual_fallback_diagnostic_report(effect: StateEffect) -> DiagnosticReport {
+    DiagnosticReport::new(
+        effect,
+        Diagnostic::runtime(RuntimeIssue::InvalidConfiguration {
+            component: RuntimeComponent::Process,
+        }),
+    )
+}
+
+fn manual_file_system_diagnostic(
+    operation: FileSystemOperation,
+    problem: FileSystemProblem,
+) -> Diagnostic {
+    Diagnostic::file_system(FileSystemIssue::new(
+        FileSystemDiagnosticContext::new(FileSystemDiagnosticStage::CommandPreparation, operation),
+        problem,
+    ))
+}
+
+fn manual_io_diagnostic(
+    path: &Path,
+    operation: FileSystemOperation,
+    source: &io::Error,
+) -> Diagnostic {
+    manual_file_system_diagnostic(
+        operation,
+        FileSystemProblem::Io {
+            path: SafePath::new(path),
+            failure: IoFailure::from_error(source),
+        },
+    )
+}
+
+fn manual_output_target_diagnostic(problem: &ManualOutputTargetProblem) -> Diagnostic {
+    let problem = match problem {
+        ManualOutputTargetProblem::SameTarget { first, second } => {
+            FileSystemProblem::ConflictingOutputPaths {
+                first_path: SafePath::new(first),
+                second_path: SafePath::new(second),
+            }
+        }
+        ManualOutputTargetProblem::NotRegularFile { path } => FileSystemProblem::InvalidPath {
+            path: SafePath::new(path),
+            violation: FileSystemPathViolation::NotRegularFile,
+        },
+        ManualOutputTargetProblem::MissingFileName { path } => FileSystemProblem::InvalidPath {
+            path: SafePath::new(path),
+            violation: FileSystemPathViolation::MissingFileName,
+        },
+        ManualOutputTargetProblem::ReparsePoint { path } => FileSystemProblem::ReparsePoint {
+            path: SafePath::new(path),
+        },
+        ManualOutputTargetProblem::NonLocalVolume { path } => FileSystemProblem::NonLocalVolume {
+            path: SafePath::new(path),
+        },
+        ManualOutputTargetProblem::NonNtfsVolume { path, actual } => {
+            FileSystemProblem::NonNtfsVolume {
+                path: SafePath::new(path),
+                actual: SafeText::new(actual),
+            }
+        }
+        ManualOutputTargetProblem::CaseSensitiveDirectory { path } => {
+            FileSystemProblem::CaseSensitiveDirectory {
+                path: SafePath::new(path),
+            }
+        }
+        ManualOutputTargetProblem::BindingCancelled { path } => FileSystemProblem::Cancelled {
+            path: SafePath::new(path),
+        },
+        ManualOutputTargetProblem::TargetAlreadyExists { path } => {
+            FileSystemProblem::TargetExists {
+                path: SafePath::new(path),
+            }
+        }
+        ManualOutputTargetProblem::IdentityChanged { path } => FileSystemProblem::IdentityChanged {
+            path: SafePath::new(path),
+        },
+        ManualOutputTargetProblem::BindingIo { path, failure } => FileSystemProblem::Io {
+            path: SafePath::new(path),
+            failure: failure.clone(),
+        },
+    };
+    manual_file_system_diagnostic(FileSystemOperation::Write, problem)
+}
+
+fn manual_recovery_artifact_diagnostic(path: &Path) -> Diagnostic {
+    manual_file_system_diagnostic(
+        FileSystemOperation::RecoverTarget,
+        FileSystemProblem::RecoveryRequired {
+            target_root: SafePath::new(path),
+            artifacts: vec![SafePath::new(path)],
+            violation: FileSystemRecoveryViolation::UnexpectedResidualArtifact,
+        },
+    )
+}
+
+fn manual_recovery_io_diagnostic(
+    path: &Path,
+    operation: FileSystemOperation,
+    source: &io::Error,
+) -> Diagnostic {
+    manual_file_system_diagnostic(
+        operation,
+        FileSystemProblem::RecoveryArtifactIo {
+            path: SafePath::new(path),
+            failure: IoFailure::from_error(source),
+        },
+    )
+}
+
+fn manual_document_diagnostic_report(source: &ManualDocumentError) -> DiagnosticReport {
+    match source {
+        ManualDocumentError::Cancelled => DiagnosticReport::new(
+            StateEffect::ProgressPreserved,
+            Diagnostic::runtime(RuntimeIssue::Cancelled {
+                component: RuntimeComponent::Process,
+                operation: crate::diagnostic::RuntimeOperation::ExecuteTask,
+            }),
+        ),
+        ManualDocumentError::Read { path, source } => DiagnosticReport::new(
+            StateEffect::Unchanged,
+            manual_io_diagnostic(path, FileSystemOperation::Read, source),
+        ),
+        ManualDocumentError::Write { path, source } => DiagnosticReport::new(
+            StateEffect::Unchanged,
+            manual_io_diagnostic(path, FileSystemOperation::Write, source),
+        ),
+        ManualDocumentError::OutputTarget { problem } => DiagnosticReport::new(
+            StateEffect::Unchanged,
+            manual_output_target_diagnostic(problem),
+        ),
+        ManualDocumentError::ExistingTemporary { path }
+        | ManualDocumentError::ExistingBackup { path } => DiagnosticReport::new(
+            StateEffect::RecoveryRequired,
+            manual_recovery_artifact_diagnostic(path),
+        ),
+        ManualDocumentError::TemporaryCleanup {
+            operation,
+            temporary,
+            cleanup,
+        } => manual_document_diagnostic_report(operation)
+            .with_effect(StateEffect::RecoveryRequired)
+            .with_related(
+                RelatedFailureRelation::Cleanup,
+                DiagnosticReport::new(
+                    StateEffect::RecoveryRequired,
+                    manual_recovery_io_diagnostic(temporary, FileSystemOperation::Remove, cleanup),
+                ),
+            ),
+        ManualDocumentError::PairedPublicationRollback {
+            operation,
+            failures,
+        } => failures.iter().fold(
+            manual_document_diagnostic_report(operation).with_effect(StateEffect::RecoveryRequired),
+            |report, failure| {
+                report.with_related(
+                    RelatedFailureRelation::Rollback,
+                    DiagnosticReport::new(
+                        StateEffect::RecoveryRequired,
+                        manual_recovery_io_diagnostic(
+                            &failure.path,
+                            FileSystemOperation::RecoverTarget,
+                            &failure.source,
+                        ),
+                    ),
+                )
+            },
+        ),
+        ManualDocumentError::PairedPublicationFinalization { failures } => {
+            let mut failures = failures.iter();
+            let Some(first) = failures.next() else {
+                return manual_fallback_diagnostic_report(StateEffect::AppliedFinalizationFailed);
+            };
+            std::iter::once(first).chain(failures).fold(
+                DiagnosticReport::new(
+                    StateEffect::AppliedFinalizationFailed,
+                    manual_file_system_diagnostic(
+                        FileSystemOperation::Remove,
+                        FileSystemProblem::CleanupFailed {
+                            path: SafePath::new(&first.path),
+                        },
+                    ),
+                ),
+                |report, failure| {
+                    report.with_related(
+                        RelatedFailureRelation::Cleanup,
+                        DiagnosticReport::new(
+                            StateEffect::AppliedFinalizationFailed,
+                            manual_recovery_io_diagnostic(
+                                &failure.path,
+                                FileSystemOperation::Remove,
+                                &failure.source,
+                            ),
+                        ),
+                    )
+                },
+            )
+        }
+        ManualDocumentError::InvalidUtf8 { .. }
+        | ManualDocumentError::InvalidToml { .. }
+        | ManualDocumentError::Encode(_) => {
+            manual_fallback_diagnostic_report(StateEffect::Unchanged)
+        }
+    }
 }
 
 fn manual_command_database_error(
@@ -1004,27 +1936,42 @@ pub(crate) fn render_manual_command_summary(
     localizer: &UiLocalizer,
     stdout: &mut dyn Write,
 ) -> io::Result<()> {
-    let message = match summary {
-        ManualCommandSummary::Exported { entries, file } => {
-            localizer.format(UiMessage::ManualExported {
+    let messages = match summary {
+        ManualCommandSummary::Exported {
+            entries,
+            file,
+            ownership_file,
+        } => {
+            let path = public_path(file);
+            let mut messages = vec![localizer.format(UiMessage::ManualExported {
                 entries: manual_count(*entries),
-                path: &file.to_string_lossy(),
-            })
+                path: &path,
+            })];
+            if let Some(ownership_file) = ownership_file {
+                let path = public_path(ownership_file);
+                messages.push(localizer.format(UiMessage::ManualOwnershipExported { path: &path }));
+            }
+            messages
         }
-        ManualCommandSummary::Checked { report } => localizer.format(UiMessage::ManualChecked {
-            valid: manual_count(report.valid),
-            unfilled: manual_count(report.unfilled),
-            errors: manual_count(report.errors.len()),
-        }),
+        ManualCommandSummary::Checked { report } => {
+            vec![localizer.format(UiMessage::ManualChecked {
+                valid: manual_count(report.valid),
+                unfilled: manual_count(report.unfilled),
+                errors: manual_count(report.errors.len()),
+            })]
+        }
         ManualCommandSummary::Applied { report, applied } => {
-            localizer.format(UiMessage::ManualApplied {
+            vec![localizer.format(UiMessage::ManualApplied {
                 applied: manual_count(*applied),
                 unfilled: manual_count(report.unfilled),
                 errors: manual_count(report.errors.len()),
-            })
+            })]
         }
     };
-    writeln!(stdout, "{message}")
+    for message in messages {
+        writeln!(stdout, "{message}")?;
+    }
+    Ok(())
 }
 
 pub(crate) fn render_manual_command_error(
@@ -1060,7 +2007,28 @@ pub(crate) fn render_manual_command_error(
                     errors: manual_count(manual_document_issue_count(source)),
                 })
             )?;
-            render_manual_document_issues(source, localizer, stderr)
+            if matches!(
+                source,
+                ManualDocumentError::OutputTarget { .. }
+                    | ManualDocumentError::ExistingTemporary { .. }
+                    | ManualDocumentError::ExistingBackup { .. }
+                    | ManualDocumentError::TemporaryCleanup { .. }
+                    | ManualDocumentError::PairedPublicationRollback { .. }
+                    | ManualDocumentError::PairedPublicationFinalization { .. }
+            ) {
+                writeln!(
+                    stderr,
+                    "{}",
+                    localizer.format(UiMessage::DiagnosticErrorHeading)
+                )?;
+                writeln!(
+                    stderr,
+                    "{}",
+                    render_diagnostic_report(&error.diagnostic_report(), localizer)
+                )
+            } else {
+                render_manual_document_issues(source, localizer, stderr)
+            }
         }
         ManualCommandError::Database(source) => {
             writeln!(
@@ -1085,17 +2053,34 @@ fn manual_document_issue_count(source: &ManualDocumentError) -> usize {
         ManualDocumentError::TemporaryCleanup { operation, .. } => {
             manual_document_issue_count(operation).saturating_add(1)
         }
+        ManualDocumentError::PairedPublicationRollback {
+            operation,
+            failures,
+        } => manual_document_issue_count(operation).saturating_add(failures.len()),
+        ManualDocumentError::PairedPublicationFinalization { failures } => failures.len().max(1),
         ManualDocumentError::Cancelled
         | ManualDocumentError::Read { .. }
         | ManualDocumentError::InvalidUtf8 { .. }
         | ManualDocumentError::InvalidToml { .. }
         | ManualDocumentError::Encode(_)
-        | ManualDocumentError::Write { .. } => 1,
+        | ManualDocumentError::Write { .. }
+        | ManualDocumentError::OutputTarget { .. }
+        | ManualDocumentError::ExistingTemporary { .. }
+        | ManualDocumentError::ExistingBackup { .. } => 1,
     }
 }
 
 fn render_manual_document_issues(
     source: &ManualDocumentError,
+    localizer: &UiLocalizer,
+    stderr: &mut dyn Write,
+) -> io::Result<()> {
+    render_manual_document_issues_with_effect(source, StateEffect::Unchanged, localizer, stderr)
+}
+
+fn render_manual_document_issues_with_effect(
+    source: &ManualDocumentError,
+    primary_effect: StateEffect,
     localizer: &UiLocalizer,
     stderr: &mut dyn Write,
 ) -> io::Result<()> {
@@ -1105,7 +2090,7 @@ fn render_manual_document_issues(
         cleanup,
     } = source
     {
-        render_manual_document_issues(operation, localizer, stderr)?;
+        render_manual_document_issues_with_effect(operation, primary_effect, localizer, stderr)?;
         let reason = manual_temporary_cleanup_reason(cleanup, localizer);
         let help = render_manual_value(localizer, "resolve_temporary_then_rerun_export", 0, 0, 0);
         writeln!(stderr)?;
@@ -1117,10 +2102,94 @@ fn render_manual_document_issues(
             })
         )?;
         return render_manual_issue_body(
-            &temporary.display().to_string(),
+            &public_path(temporary),
             &reason,
             &help,
             StateEffect::RecoveryRequired,
+            localizer,
+            stderr,
+        );
+    }
+    if let ManualDocumentError::PairedPublicationRollback {
+        operation,
+        failures,
+    } = source
+    {
+        render_manual_document_issues_with_effect(
+            operation,
+            StateEffect::RecoveryRequired,
+            localizer,
+            stderr,
+        )?;
+        let help = render_manual_value(localizer, "resolve_temporary_then_rerun_export", 0, 0, 0);
+        for failure in failures {
+            let reason = manual_temporary_cleanup_reason(&failure.source, localizer);
+            writeln!(stderr)?;
+            writeln!(
+                stderr,
+                "{}",
+                localizer.format(UiMessage::DiagnosticRelated {
+                    relation: RelatedFailureRelation::Rollback.as_str(),
+                })
+            )?;
+            render_manual_issue_body(
+                &public_path(&failure.path),
+                &reason,
+                &help,
+                StateEffect::RecoveryRequired,
+                localizer,
+                stderr,
+            )?;
+        }
+        return Ok(());
+    }
+    if let ManualDocumentError::PairedPublicationFinalization { failures } = source {
+        writeln!(
+            stderr,
+            "{}",
+            localizer.format(UiMessage::DiagnosticErrorHeading)
+        )?;
+        let help = render_manual_value(localizer, "resolve_published_backup_cleanup", 0, 0, 0);
+        for (index, failure) in failures.iter().enumerate() {
+            if index != 0 {
+                writeln!(stderr)?;
+                writeln!(
+                    stderr,
+                    "{}",
+                    localizer.format(UiMessage::DiagnosticRelated {
+                        relation: RelatedFailureRelation::Cleanup.as_str(),
+                    })
+                )?;
+            }
+            let reason = manual_temporary_cleanup_reason(&failure.source, localizer);
+            render_manual_issue_body(
+                &public_path(&failure.path),
+                &reason,
+                &help,
+                StateEffect::AppliedFinalizationFailed,
+                localizer,
+                stderr,
+            )?;
+        }
+        return Ok(());
+    }
+    if let ManualDocumentError::OutputTarget { problem } = source {
+        let reason = localizer.format(UiMessage::DiagnosticFailureValue {
+            code: problem.reason_code(),
+        });
+        let help = localizer.format(UiMessage::DiagnosticResolutionValue {
+            code: problem.help_code(),
+        });
+        writeln!(
+            stderr,
+            "{}",
+            localizer.format(UiMessage::DiagnosticErrorHeading)
+        )?;
+        return render_manual_issue_body(
+            &problem.object(),
+            &reason,
+            &help,
+            primary_effect,
             localizer,
             stderr,
         );
@@ -1129,31 +2198,30 @@ fn render_manual_document_issues(
     let (object, reason_code, help_code) = manual_document_issue(source);
     let reason = render_manual_value(localizer, reason_code, 0, 0, 0);
     let help = render_manual_value(localizer, help_code, 0, 0, 0);
-    render_manual_issue(&object, &reason, &help, localizer, stderr)
+    writeln!(
+        stderr,
+        "{}",
+        localizer.format(UiMessage::DiagnosticErrorHeading)
+    )?;
+    render_manual_issue_body(
+        &object,
+        &reason,
+        &help,
+        match source {
+            ManualDocumentError::ExistingTemporary { .. }
+            | ManualDocumentError::ExistingBackup { .. } => StateEffect::RecoveryRequired,
+            _ => primary_effect,
+        },
+        localizer,
+        stderr,
+    )
 }
 
 fn manual_temporary_cleanup_reason(cleanup: &io::Error, localizer: &UiLocalizer) -> String {
     let failure = IoFailure::from_error(cleanup);
-    let summary = localizer.format(UiMessage::DiagnosticFailureValue {
+    localizer.format(UiMessage::DiagnosticFailureValue {
         code: failure.summary_code(),
-    });
-    let Some(message) = manual_cleanup_system_message(cleanup) else {
-        return summary;
-    };
-    format!("{summary} ({message})")
-}
-
-fn manual_cleanup_system_message(cleanup: &io::Error) -> Option<String> {
-    let sanitized = sanitize_user_text(&cleanup.to_string());
-    let mut message = sanitized.trim();
-    if let Some(prefix) = message.strip_suffix(')')
-        && let Some((text, code)) = prefix.rsplit_once(" (os error ")
-        && !code.is_empty()
-        && code.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        message = text.trim_end();
-    }
-    (!message.is_empty()).then(|| message.to_owned())
+    })
 }
 
 fn render_manual_issue(
@@ -1280,6 +2348,7 @@ fn render_manual_value(
         | "rerun_export_without_controls"
         | "rerun_export_then_fill"
         | "resolve_temporary_then_rerun_export"
+        | "resolve_published_backup_cleanup"
         | "keep_exported_type" => localizer.format(UiMessage::ManualValue {
             code,
             line,
@@ -1294,6 +2363,7 @@ fn render_manual_value(
         "empty_translation" => failure("missing_required_value"),
         "cancelled" => failure("cancelled"),
         "document_read" | "document_write" | "database_access" => failure("operation_failed"),
+        "publication_artifact_exists" => failure("recovery_required"),
         "document_invalid_utf8" => failure("invalid_encoding"),
         "document_invalid_toml" => failure("invalid_syntax"),
         "document_encode" => failure("internal_invariant"),
@@ -1323,18 +2393,14 @@ fn manual_count(value: usize) -> u64 {
 fn manual_document_issue(source: &ManualDocumentError) -> (String, &'static str, &'static str) {
     match source {
         ManualDocumentError::Cancelled => ("Manual".to_owned(), "cancelled", "retry_if_needed"),
-        ManualDocumentError::Read { path, .. } => (
-            path.display().to_string(),
-            "document_read",
-            "check_read_access",
-        ),
-        ManualDocumentError::InvalidUtf8 { path } => (
-            path.display().to_string(),
-            "document_invalid_utf8",
-            "save_as_utf8",
-        ),
+        ManualDocumentError::Read { path, .. } => {
+            (public_path(path), "document_read", "check_read_access")
+        }
+        ManualDocumentError::InvalidUtf8 { path } => {
+            (public_path(path), "document_invalid_utf8", "save_as_utf8")
+        }
         ManualDocumentError::InvalidToml { path, .. } => (
-            path.display().to_string(),
+            public_path(path),
             "document_invalid_toml",
             "fix_toml_contract",
         ),
@@ -1343,12 +2409,31 @@ fn manual_document_issue(source: &ManualDocumentError) -> (String, &'static str,
             "document_encode",
             "retry_or_report",
         ),
-        ManualDocumentError::Write { path, .. } => (
-            path.display().to_string(),
-            "document_write",
-            "check_write_access",
+        ManualDocumentError::Write { path, .. } => {
+            (public_path(path), "document_write", "check_write_access")
+        }
+        ManualDocumentError::OutputTarget { .. } => {
+            unreachable!("输出目标问题由专用的类型化诊断分支呈现")
+        }
+        ManualDocumentError::ExistingTemporary { path } => (
+            public_path(path),
+            "publication_artifact_exists",
+            "resolve_temporary_then_rerun_export",
+        ),
+        ManualDocumentError::ExistingBackup { path } => (
+            public_path(path),
+            "publication_artifact_exists",
+            "resolve_published_backup_cleanup",
         ),
         ManualDocumentError::TemporaryCleanup { operation, .. } => manual_document_issue(operation),
+        ManualDocumentError::PairedPublicationRollback { operation, .. } => {
+            manual_document_issue(operation)
+        }
+        ManualDocumentError::PairedPublicationFinalization { .. } => (
+            "Manual export".to_owned(),
+            "document_write",
+            "resolve_published_backup_cleanup",
+        ),
     }
 }
 
@@ -1578,6 +2663,7 @@ fn load_generic_entries(
             kind: ManualTranslationType::Free,
             source,
             locator: ManualTranslationLocator::Generic { group_id, unit_id },
+            rpg_maker_owner: None,
             applicability,
             needs_translation: current_translation.is_none() && active,
             placeholder_scope: kind,
@@ -1703,7 +2789,8 @@ fn load_rpg_maker_entries(
                 u.source_context_json, u.translation_content_json,
                 u.semantic_order_key, manual.readable_id,
                 manual.translation_type, manual.source_json,
-                manual.translation_json, manual.applicability_fingerprint
+                manual.translation_json, manual.applicability_fingerprint,
+                u.rule_number
          FROM rpg_maker_text_group AS g
          JOIN rpg_maker_text_unit AS u
            ON u.owner = g.owner AND u.group_id = g.group_id
@@ -1743,9 +2830,32 @@ fn load_rpg_maker_entries(
             row.get(13)?,
             row.get(14)?,
         )?;
+        let rule_number: Option<i64> = row.get(15)?;
         let owner = RpgMakerAssetOwner::from_storage_name(&owner_raw).ok_or_else(|| {
             ManualDatabaseError::InvalidProject("人工译文所属来源无效".to_owned())
         })?;
+        let rpg_maker_owner = match (owner, rule_number) {
+            (RpgMakerAssetOwner::Builtin, None) => ManualRpgMakerOwner::Builtin,
+            (RpgMakerAssetOwner::Rules, Some(rule_number)) if rule_number > 0 => {
+                ManualRpgMakerOwner::Rules {
+                    rule_number: usize::try_from(rule_number).map_err(|_| {
+                        ManualDatabaseError::InvalidProject(
+                            "Rules Unit 的自然规则序号超出支持范围".to_owned(),
+                        )
+                    })?,
+                }
+            }
+            (RpgMakerAssetOwner::Builtin, Some(_)) => {
+                return Err(ManualDatabaseError::InvalidProject(
+                    "Builtin Unit 不得带有 Rules 自然规则序号".to_owned(),
+                ));
+            }
+            (RpgMakerAssetOwner::Rules, _) => {
+                return Err(ManualDatabaseError::InvalidProject(
+                    "Rules Unit 缺少正整数自然规则序号".to_owned(),
+                ));
+            }
+        };
         let group_location = RpgMakerLocationCodec::decode(&group_location_raw)
             .map_err(|_| ManualDatabaseError::InvalidProject("人工译文位置无效".to_owned()))?;
         let kind = TextGroupKind::from_storage_name(&kind_raw)
@@ -1870,6 +2980,7 @@ fn load_rpg_maker_entries(
                     group_location: group_location_raw,
                     unit_role: role_raw,
                 },
+                rpg_maker_owner: Some(rpg_maker_owner),
                 applicability,
                 needs_translation: current_translation.is_none() && active,
                 placeholder_scope: kind_raw,
@@ -2511,6 +3622,7 @@ fn decode_windows_path(_: &[u8]) -> Result<PathBuf, ManualDatabaseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     fn indexed_entry(kind: ManualTranslationType, source: &[&str]) -> ManualTranslationEntry {
         ManualTranslationEntry {
@@ -2522,6 +3634,7 @@ mod tests {
                 group_location: "location".to_owned(),
                 unit_role: "role".to_owned(),
             },
+            rpg_maker_owner: Some(ManualRpgMakerOwner::Builtin),
             applicability: Sha256Fingerprint::from_bytes([7; 32]),
             needs_translation: true,
             placeholder_scope: "database_entry".to_owned(),
@@ -2533,6 +3646,554 @@ mod tests {
 
     fn write_document(path: &Path, source: &str) {
         fs::write(path, source).expect("应写入 Manual TOML");
+    }
+
+    #[derive(Default)]
+    struct InjectedPairPublisher {
+        backups: Cell<usize>,
+        commits: Cell<usize>,
+        fail_second_backup: bool,
+        fail_second_commit: bool,
+        fail_published_removal: bool,
+        fail_backup_restore: bool,
+        fail_backup_cleanup: bool,
+    }
+
+    impl ManualPairPublisher for InjectedPairPublisher {
+        fn exists(&self, path: &Path) -> io::Result<bool> {
+            Ok(path.exists())
+        }
+
+        fn backup_existing(&self, source: &Path, backup: &Path) -> io::Result<()> {
+            let backup_index = self.backups.get() + 1;
+            self.backups.set(backup_index);
+            if self.fail_second_backup && backup_index == 2 {
+                Err(io::Error::other("injected second backup failure"))
+            } else {
+                fs::rename(source, backup)
+            }
+        }
+
+        fn commit_new(&self, source: &Path, target: &Path) -> io::Result<()> {
+            let commit = self.commits.get() + 1;
+            self.commits.set(commit);
+            if self.fail_second_commit && commit == 2 {
+                Err(io::Error::other("injected second commit failure"))
+            } else {
+                fs::rename(source, target)
+            }
+        }
+
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            let is_backup = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .starts_with('.');
+            if (self.fail_published_removal && !is_backup)
+                || (self.fail_backup_cleanup && is_backup)
+            {
+                Err(io::Error::other("injected rollback failure"))
+            } else {
+                fs::remove_file(path)
+            }
+        }
+
+        fn restore_backup(&self, backup: &Path, target: &Path) -> io::Result<()> {
+            if self.fail_backup_restore {
+                Err(io::Error::other("injected restore failure"))
+            } else {
+                fs::rename(backup, target)
+            }
+        }
+    }
+
+    #[test]
+    fn paired_publication_replaces_both_existing_files() {
+        let directory = tempfile::tempdir().expect("应建立成对替换测试目录");
+        let first_target = directory.path().join("manual.toml");
+        let second_target = directory.path().join("ownership.jsonl");
+        fs::write(&first_target, "old manual").expect("应建立旧 Manual");
+        fs::write(&second_target, "old ownership").expect("应建立旧所有权");
+
+        atomic_replace_pair(
+            &first_target,
+            b"new manual",
+            &second_target,
+            b"new ownership",
+            &CooperativeCancellation::default(),
+        )
+        .expect("已有两份输出应成对替换");
+
+        assert_eq!(fs::read_to_string(&first_target).unwrap(), "new manual");
+        assert_eq!(fs::read_to_string(&second_target).unwrap(), "new ownership");
+        assert!(!manual_backup_path(&first_target).exists());
+        assert!(!manual_backup_path(&second_target).exists());
+    }
+
+    #[test]
+    fn paired_publication_rejects_normalized_case_alias_before_staging() {
+        let directory = tempfile::tempdir().expect("应建立目标别名测试目录");
+        let nested = directory.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        let first = directory.path().join("manual.toml");
+        let second = nested.join("..").join("MANUAL.TOML");
+
+        let error = atomic_replace_pair(
+            &first,
+            b"manual",
+            &second,
+            b"ownership",
+            &CooperativeCancellation::default(),
+        )
+        .expect_err("规范化后相同的大小写别名必须在 staging 前拒绝");
+
+        assert!(matches!(
+            error,
+            ManualDocumentError::OutputTarget {
+                problem: ManualOutputTargetProblem::SameTarget { .. },
+            }
+        ));
+        assert!(!first.exists());
+        assert!(!directory.path().join(".manual.toml.tmp").exists());
+        assert!(!directory.path().join(".MANUAL.TOML.tmp").exists());
+    }
+
+    #[test]
+    fn paired_publication_rejects_two_existing_names_for_the_same_file_identity() {
+        let directory = tempfile::tempdir().expect("应建立物理目标别名测试目录");
+        let first = directory.path().join("manual.toml");
+        let second = directory.path().join("ownership.jsonl");
+        fs::write(&first, "old").unwrap();
+        fs::hard_link(&first, &second).expect("NTFS 测试目录应支持硬链接身份别名");
+
+        let error = atomic_replace_pair(
+            &first,
+            b"manual",
+            &second,
+            b"ownership",
+            &CooperativeCancellation::default(),
+        )
+        .expect_err("同一文件身份的两个名称必须在 staging 前拒绝");
+
+        assert!(matches!(
+            error,
+            ManualDocumentError::OutputTarget {
+                problem: ManualOutputTargetProblem::SameTarget { .. },
+            }
+        ));
+        assert_eq!(fs::read_to_string(&first).unwrap(), "old");
+        assert_eq!(fs::read_to_string(&second).unwrap(), "old");
+        assert!(!directory.path().join(".manual.toml.tmp").exists());
+        assert!(!directory.path().join(".ownership.jsonl.tmp").exists());
+    }
+
+    #[test]
+    fn paired_publication_rejects_targets_that_collide_with_fixed_artifacts() {
+        for suffix in ["backup", "tmp"] {
+            let directory = tempfile::tempdir().expect("应建立固定产物冲突测试目录");
+            let manual = directory.path().join("manual.toml");
+            fs::write(&manual, "old manual").unwrap();
+            let ownership = directory.path().join(format!(".manual.toml.{suffix}"));
+
+            let error = atomic_replace_pair(
+                &manual,
+                b"new manual",
+                &ownership,
+                b"new ownership",
+                &CooperativeCancellation::default(),
+            )
+            .expect_err("最终目标不得与另一输出的固定发布产物冲突");
+
+            assert!(matches!(
+                error,
+                ManualDocumentError::OutputTarget {
+                    problem: ManualOutputTargetProblem::SameTarget { .. },
+                }
+            ));
+            assert_eq!(fs::read_to_string(&manual).unwrap(), "old manual");
+            assert!(!ownership.exists());
+            assert!(!manual_temporary_path(&manual).exists());
+            assert!(!manual_backup_path(&manual).exists());
+            assert!(!manual_temporary_path(&ownership).exists());
+            assert!(!manual_backup_path(&ownership).exists());
+        }
+    }
+
+    #[test]
+    fn manual_exports_never_move_or_replace_an_existing_directory_target() {
+        let directory = tempfile::tempdir().expect("应建立目录目标测试根");
+        let directory_target = directory.path().join("manual.toml");
+        fs::create_dir(&directory_target).unwrap();
+        fs::write(directory_target.join("keep.txt"), "keep").unwrap();
+        let ownership = directory.path().join("ownership.jsonl");
+
+        let pair_error = atomic_replace_pair(
+            &directory_target,
+            b"manual",
+            &ownership,
+            b"ownership",
+            &CooperativeCancellation::default(),
+        )
+        .expect_err("目录目标必须在成对 staging 前拒绝");
+        assert!(matches!(
+            pair_error,
+            ManualDocumentError::OutputTarget {
+                problem: ManualOutputTargetProblem::NotRegularFile { .. },
+            }
+        ));
+        let single_error = atomic_replace(
+            &directory_target,
+            b"manual",
+            &CooperativeCancellation::default(),
+        )
+        .expect_err("目录目标必须在单文件 staging 前拒绝");
+        assert!(matches!(
+            single_error,
+            ManualDocumentError::OutputTarget {
+                problem: ManualOutputTargetProblem::NotRegularFile { .. },
+            }
+        ));
+        assert!(directory_target.is_dir());
+        assert_eq!(
+            fs::read_to_string(directory_target.join("keep.txt")).unwrap(),
+            "keep"
+        );
+        assert!(!ownership.exists());
+        assert!(!directory.path().join(".manual.toml.tmp").exists());
+        assert!(!directory.path().join(".manual.toml.backup").exists());
+        assert!(!directory.path().join(".ownership.jsonl.tmp").exists());
+        assert!(!directory.path().join(".ownership.jsonl.backup").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn manual_exports_reject_reparse_target_before_creating_publication_artifacts() {
+        let directory = tempfile::tempdir().expect("应建立 reparse 目标测试根");
+        let real = directory.path().join("real-manual.toml");
+        let link = directory.path().join("manual.toml");
+        let ownership = directory.path().join("ownership.jsonl");
+        fs::write(&real, "original").unwrap();
+        if let Err(source) = std::os::windows::fs::symlink_file(&real, &link) {
+            if source.kind() == io::ErrorKind::PermissionDenied
+                || source.raw_os_error() == Some(1314)
+            {
+                return;
+            }
+            panic!("应建立测试文件符号链接：{source}");
+        }
+
+        for error in [
+            atomic_replace_pair(
+                &link,
+                b"new manual",
+                &ownership,
+                b"ownership",
+                &CooperativeCancellation::default(),
+            )
+            .expect_err("成对导出必须拒绝 reparse 目标"),
+            atomic_replace(&link, b"new manual", &CooperativeCancellation::default())
+                .expect_err("单文件导出必须拒绝 reparse 目标"),
+        ] {
+            assert!(matches!(
+                error,
+                ManualDocumentError::OutputTarget {
+                    problem: ManualOutputTargetProblem::ReparsePoint { .. },
+                }
+            ));
+        }
+        assert_eq!(fs::read_to_string(&real).unwrap(), "original");
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!ownership.exists());
+        assert!(!manual_temporary_path(&link).exists());
+        assert!(!manual_backup_path(&link).exists());
+        assert!(!manual_temporary_path(&ownership).exists());
+        assert!(!manual_backup_path(&ownership).exists());
+    }
+
+    #[test]
+    fn output_target_diagnostics_keep_same_target_directory_and_reparse_facts() {
+        let localizer = UiLocalizer::new(crate::i18n::UiLocale::SimplifiedChinese);
+        let target = PathBuf::from(r"C:\game\manual.toml");
+        let cases = [
+            (
+                ManualOutputTargetProblem::SameTarget {
+                    first: target.clone(),
+                    second: target.clone(),
+                },
+                "提供的值互相冲突",
+            ),
+            (
+                ManualOutputTargetProblem::NotRegularFile {
+                    path: target.clone(),
+                },
+                "现有目标不是普通文件",
+            ),
+            (
+                ManualOutputTargetProblem::ReparsePoint {
+                    path: target.clone(),
+                },
+                "路径包含不能信任的重解析点",
+            ),
+        ];
+
+        for (problem, expected_reason) in cases {
+            let mut stderr = Vec::new();
+            render_manual_document_issues(
+                &ManualDocumentError::OutputTarget { problem },
+                &localizer,
+                &mut stderr,
+            )
+            .unwrap();
+            let stderr = String::from_utf8(stderr).unwrap();
+            assert!(stderr.contains(expected_reason));
+            assert!(stderr.contains("修正指出的输入后重试"));
+            assert!(!stderr.contains("权限"));
+            assert!(stderr.contains(&render_state_effect_impact(
+                StateEffect::Unchanged,
+                &localizer,
+            )));
+        }
+    }
+
+    #[test]
+    fn paired_publication_restores_old_files_when_second_commit_fails() {
+        let directory = tempfile::tempdir().expect("应建立成对发布测试目录");
+        let first_temporary = directory.path().join(".manual.toml.tmp");
+        let second_temporary = directory.path().join(".ownership.jsonl.tmp");
+        let first_target = directory.path().join("manual.toml");
+        let second_target = directory.path().join("ownership.jsonl");
+        let first_backup = manual_backup_path(&first_target);
+        let second_backup = manual_backup_path(&second_target);
+        fs::write(&first_target, "old manual").expect("应建立旧 Manual");
+        fs::write(&second_target, "old ownership").expect("应建立旧所有权");
+        fs::write(&first_temporary, "new manual").expect("应建立第一份临时文件");
+        fs::write(&second_temporary, "new ownership").expect("应建立第二份临时文件");
+
+        let error = publish_staged_pair(
+            &first_temporary,
+            &first_target,
+            &first_backup,
+            &second_temporary,
+            &second_target,
+            &second_backup,
+            &InjectedPairPublisher {
+                fail_second_commit: true,
+                ..InjectedPairPublisher::default()
+            },
+        )
+        .expect_err("第二份提交失败必须返回主错误");
+
+        assert!(matches!(error, ManualDocumentError::Write { path, .. } if path == second_target));
+        assert_eq!(fs::read_to_string(&first_target).unwrap(), "old manual");
+        assert_eq!(fs::read_to_string(&second_target).unwrap(), "old ownership");
+        assert!(!first_backup.exists(), "恢复后不得留下第一份 backup");
+        assert!(!second_backup.exists(), "恢复后不得留下第二份 backup");
+    }
+
+    #[test]
+    fn paired_publication_restores_first_file_when_second_backup_fails() {
+        let directory = tempfile::tempdir().expect("应建立备份失败测试目录");
+        let first_temporary = directory.path().join(".manual.toml.tmp");
+        let second_temporary = directory.path().join(".ownership.jsonl.tmp");
+        let first_target = directory.path().join("manual.toml");
+        let second_target = directory.path().join("ownership.jsonl");
+        let first_backup = manual_backup_path(&first_target);
+        let second_backup = manual_backup_path(&second_target);
+        fs::write(&first_target, "old manual").unwrap();
+        fs::write(&second_target, "old ownership").unwrap();
+        fs::write(&first_temporary, "new manual").unwrap();
+        fs::write(&second_temporary, "new ownership").unwrap();
+
+        let error = publish_staged_pair(
+            &first_temporary,
+            &first_target,
+            &first_backup,
+            &second_temporary,
+            &second_target,
+            &second_backup,
+            &InjectedPairPublisher {
+                fail_second_backup: true,
+                ..InjectedPairPublisher::default()
+            },
+        )
+        .expect_err("第二份备份失败必须恢复已备份的第一份");
+
+        assert!(matches!(error, ManualDocumentError::Write { path, .. } if path == second_target));
+        assert_eq!(fs::read_to_string(&first_target).unwrap(), "old manual");
+        assert_eq!(fs::read_to_string(&second_target).unwrap(), "old ownership");
+        assert!(!first_backup.exists());
+        assert!(!second_backup.exists());
+    }
+
+    #[test]
+    fn paired_publication_keeps_primary_and_rollback_failures_for_recovery() {
+        let directory = tempfile::tempdir().expect("应建立成对发布恢复测试目录");
+        let first_temporary = directory.path().join(".manual.toml.tmp");
+        let second_temporary = directory.path().join(".ownership.jsonl.tmp");
+        let first_target = directory.path().join("manual.toml");
+        let second_target = directory.path().join("ownership.jsonl");
+        let first_backup = manual_backup_path(&first_target);
+        let second_backup = manual_backup_path(&second_target);
+        fs::write(&first_target, "old manual").expect("应建立旧 Manual");
+        fs::write(&second_target, "old ownership").expect("应建立旧所有权");
+        fs::write(&first_temporary, "new manual").expect("应建立第一份临时文件");
+        fs::write(&second_temporary, "new ownership").expect("应建立第二份临时文件");
+
+        let error = publish_staged_pair(
+            &first_temporary,
+            &first_target,
+            &first_backup,
+            &second_temporary,
+            &second_target,
+            &second_backup,
+            &InjectedPairPublisher {
+                fail_second_commit: true,
+                fail_published_removal: true,
+                fail_backup_restore: true,
+                ..InjectedPairPublisher::default()
+            },
+        )
+        .expect_err("撤回失败必须保留可恢复错误");
+
+        assert!(matches!(
+            error,
+            ManualDocumentError::PairedPublicationRollback {
+                operation,
+                failures,
+            } if failures.len() == 2
+                && failures.iter().any(|failure| failure.path == first_target)
+                && failures.iter().any(|failure| failure.path == second_target)
+                && matches!(operation.as_ref(), ManualDocumentError::Write { path, .. } if path == &second_target)
+        ));
+        assert_eq!(fs::read_to_string(&first_target).unwrap(), "new manual");
+        assert_eq!(fs::read_to_string(&first_backup).unwrap(), "old manual");
+        assert!(!second_target.exists());
+        assert_eq!(fs::read_to_string(&second_backup).unwrap(), "old ownership");
+    }
+
+    #[test]
+    fn paired_publication_reports_applied_finalization_when_backup_cleanup_fails() {
+        let directory = tempfile::tempdir().expect("应建立收尾失败测试目录");
+        let first_temporary = directory.path().join(".manual.toml.tmp");
+        let second_temporary = directory.path().join(".ownership.jsonl.tmp");
+        let first_target = directory.path().join("manual.toml");
+        let second_target = directory.path().join("ownership.jsonl");
+        let first_backup = manual_backup_path(&first_target);
+        let second_backup = manual_backup_path(&second_target);
+        fs::write(&first_target, "old manual").unwrap();
+        fs::write(&second_target, "old ownership").unwrap();
+        fs::write(&first_temporary, "new manual").unwrap();
+        fs::write(&second_temporary, "new ownership").unwrap();
+
+        let error = publish_staged_pair(
+            &first_temporary,
+            &first_target,
+            &first_backup,
+            &second_temporary,
+            &second_target,
+            &second_backup,
+            &InjectedPairPublisher {
+                fail_backup_cleanup: true,
+                ..InjectedPairPublisher::default()
+            },
+        )
+        .expect_err("backup 清理失败必须报告已经生效但收尾失败");
+        assert!(matches!(
+            &error,
+            ManualDocumentError::PairedPublicationFinalization { failures }
+                if failures.len() == 2
+        ));
+        assert_eq!(fs::read_to_string(&first_target).unwrap(), "new manual");
+        assert_eq!(fs::read_to_string(&second_target).unwrap(), "new ownership");
+        assert_eq!(fs::read_to_string(&first_backup).unwrap(), "old manual");
+        assert_eq!(fs::read_to_string(&second_backup).unwrap(), "old ownership");
+
+        let error = ManualCommandError::from_document(error);
+        let localizer = UiLocalizer::new(crate::i18n::UiLocale::SimplifiedChinese);
+        let mut stderr = Vec::new();
+        render_manual_command_error(&error, &localizer, &mut stderr).unwrap();
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.contains(&render_state_effect_impact(
+            StateEffect::AppliedFinalizationFailed,
+            &localizer,
+        )));
+        assert!(!stderr.contains("injected rollback failure"));
+
+        let retry = atomic_replace_pair(
+            &first_target,
+            b"retry manual",
+            &second_target,
+            b"retry ownership",
+            &CooperativeCancellation::default(),
+        )
+        .expect_err("遗留 backup 必须在下一次 staging 前明确拒绝");
+        assert!(matches!(
+            &retry,
+            ManualDocumentError::ExistingBackup { path }
+                if path == &first_backup || path == &second_backup
+        ));
+        assert_eq!(fs::read_to_string(&first_target).unwrap(), "new manual");
+        assert_eq!(fs::read_to_string(&second_target).unwrap(), "new ownership");
+        let mut stderr = Vec::new();
+        render_manual_command_error(
+            &ManualCommandError::from_document(retry),
+            &localizer,
+            &mut stderr,
+        )
+        .unwrap();
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.contains(".backup"));
+        assert!(stderr.contains(&render_state_effect_impact(
+            StateEffect::RecoveryRequired,
+            &localizer,
+        )));
+    }
+
+    #[test]
+    fn rpg_maker_ownership_jsonl_follows_manual_order_and_has_only_public_fields() {
+        let directory = tempfile::tempdir().expect("应建立所有权导出测试目录");
+        let manual = directory.path().join("manual.toml");
+        let ownership = directory.path().join("ownership.jsonl");
+        let mut builtin = indexed_entry(ManualTranslationType::Fixed, &["Actor"]);
+        builtin.id = "Actors.json:1:name".to_owned();
+        let mut rules = indexed_entry(ManualTranslationType::Free, &["Quest"]);
+        rules.id = "plugins.js:Quest:Title".to_owned();
+        rules.rpg_maker_owner = Some(ManualRpgMakerOwner::Rules { rule_number: 7 });
+        let index = ManualTranslationIndex::new(vec![builtin, rules]).expect("测试 ID 必须唯一");
+
+        let count = export_rpg_maker_manual_documents_with_cancellation(
+            &manual,
+            &ownership,
+            &index,
+            &CooperativeCancellation::default(),
+        )
+        .expect("Manual 与所有权清单应成对导出");
+
+        assert_eq!(count, 2);
+        let document: ManualDocument =
+            toml::from_str(&fs::read_to_string(&manual).expect("Manual TOML 应可读取"))
+                .expect("Manual TOML 应可解析");
+        assert_eq!(
+            document
+                .translation
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["Actors.json:1:name", "plugins.js:Quest:Title"]
+        );
+        assert_eq!(
+            fs::read_to_string(&ownership).expect("所有权 JSONL 应可读取"),
+            concat!(
+                "{\"manual_id\":\"Actors.json:1:name\",\"owner\":\"builtin\"}\n",
+                "{\"manual_id\":\"plugins.js:Quest:Title\",\"owner\":\"rules\",\"rule_number\":7}\n",
+            )
+        );
     }
 
     #[test]
@@ -2723,12 +4384,25 @@ mod tests {
         let error = export_manual_document(&path, &index).unwrap_err();
 
         assert!(matches!(
-            error,
-            ManualDocumentError::Write { source, .. }
-                if source.kind() == io::ErrorKind::AlreadyExists
+            &error,
+            ManualDocumentError::ExistingTemporary { path } if path == &temporary
         ));
         assert_eq!(fs::read_to_string(temporary).unwrap(), "other writer");
         assert!(!path.exists());
+
+        let localizer = UiLocalizer::new(crate::i18n::UiLocale::SimplifiedChinese);
+        let mut stderr = Vec::new();
+        render_manual_command_error(
+            &ManualCommandError::from_document(error),
+            &localizer,
+            &mut stderr,
+        )
+        .unwrap();
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.contains(&render_state_effect_impact(
+            StateEffect::RecoveryRequired,
+            &localizer,
+        )));
     }
 
     #[test]
@@ -2758,8 +4432,7 @@ mod tests {
         let generic_cleanup_reason = localizer.format(UiMessage::DiagnosticFailureValue {
             code: "operation_failed",
         });
-        assert!(expected_cleanup_reason.starts_with(&generic_cleanup_reason));
-        assert_ne!(expected_cleanup_reason, generic_cleanup_reason);
+        assert_eq!(expected_cleanup_reason, generic_cleanup_reason);
 
         let error = ManualCommandError::from_document(source);
         assert!(!error.is_cancelled(), "清理失败不得报告为干净取消");
@@ -2785,13 +4458,56 @@ mod tests {
             )
         );
         assert!(stderr.contains(&expected_cleanup_reason));
-        assert!(stderr.contains(&render_manual_value(
+        assert!(
+            stderr.contains(&localizer.format(UiMessage::DiagnosticResolutionValue {
+                code: "preserve_recovery_artifacts",
+            }))
+        );
+        assert!(stderr.contains(&render_state_effect_impact(
+            StateEffect::RecoveryRequired,
             &localizer,
-            "resolve_temporary_then_rerun_export",
-            0,
-            0,
-            0,
         )));
+    }
+
+    #[test]
+    fn rollback_diagnostic_never_exposes_raw_io_error_text() {
+        let localizer = UiLocalizer::new(crate::i18n::UiLocale::SimplifiedChinese);
+        let source =
+            ManualCommandError::from_document(ManualDocumentError::PairedPublicationRollback {
+                operation: Box::new(ManualDocumentError::Write {
+                    path: PathBuf::from("ownership.jsonl"),
+                    source: io::Error::other("PRIMARY_SECRET_SYSTEM_TEXT"),
+                }),
+                failures: vec![ManualPairIoFailure {
+                    path: PathBuf::from("manual.toml"),
+                    source: io::Error::other("ROLLBACK_SECRET_SYSTEM_TEXT"),
+                }],
+            });
+        let report = source.diagnostic_report();
+        assert_eq!(report.effect(), StateEffect::RecoveryRequired);
+        assert_eq!(report.related().len(), 1);
+        assert_eq!(
+            report.related()[0].relation(),
+            RelatedFailureRelation::Rollback
+        );
+        assert_eq!(
+            report.related()[0].report().primary().code(),
+            "filesystem.recovery_artifact_io"
+        );
+        let serialized = serde_json::to_string(&report).expect("Manual rollback 诊断应可序列化");
+        assert!(!serialized.contains("PRIMARY_SECRET_SYSTEM_TEXT"));
+        assert!(!serialized.contains("ROLLBACK_SECRET_SYSTEM_TEXT"));
+        let mut stderr = Vec::new();
+        render_manual_command_error(&source, &localizer, &mut stderr).unwrap();
+        let stderr = String::from_utf8(stderr).unwrap();
+
+        assert!(!stderr.contains("PRIMARY_SECRET_SYSTEM_TEXT"));
+        assert!(!stderr.contains("ROLLBACK_SECRET_SYSTEM_TEXT"));
+        assert!(
+            stderr.contains(&localizer.format(UiMessage::DiagnosticRelated {
+                relation: RelatedFailureRelation::Rollback.as_str(),
+            }))
+        );
         assert!(stderr.contains(&render_state_effect_impact(
             StateEffect::RecoveryRequired,
             &localizer,
@@ -2966,6 +4682,7 @@ mod tests {
                  );
                  CREATE TABLE rpg_maker_text_unit (
                      owner TEXT, group_id TEXT, unit_role TEXT,
+                     rule_number INTEGER,
                      source_content_json TEXT, source_context_json TEXT,
                      translation_content_json TEXT, semantic_order_key BLOB
                  );
@@ -2992,6 +4709,7 @@ mod tests {
             ManualOperation::Check,
             &document,
             None,
+            None,
             &cancellation,
         )
         .expect("Manual check 不应读取脱离当前位置的记录");
@@ -3002,6 +4720,7 @@ mod tests {
             RpgMakerEngine::Mz,
             ManualOperation::Apply,
             &document,
+            None,
             None,
             &cancellation,
         )
@@ -3050,6 +4769,7 @@ mod tests {
             &ManualCommandSummary::Exported {
                 entries: 2,
                 file: PathBuf::from("C:\\Games\n\u{202e}demo\u{2068}\u{1b}[31m.toml"),
+                ownership_file: None,
             },
             &localizer,
             &mut stdout,
