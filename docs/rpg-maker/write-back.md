@@ -39,7 +39,7 @@ Placeholder、内建控制符和 Rules Literal 逐字保留。引号和括号按
 
 对自动译文执行符号修复前，WriteBack 使用当前 Placeholder 规则和对应引擎内建控制符重新
 验收。原文或自动译文无法完成 Placeholder 保护、语言投影，或两者实际绑定不一致时，
-WriteBack 以可读 ID 说明对象、原因和修改方法，不发布候选，也不把该错误计入符号修复内部
+WriteBack 以可读 ID 说明对象、原因、影响和处理办法，不发布候选，也不把该错误计入符号修复内部
 跳过。人工译文已经由 Manual apply 检查，不因 Placeholder 配置后来变化而重新判为无效。
 
 布局器无法安全自动断行时，WriteBack 保留该译文的显式硬换行并继续构建候选，不把它
@@ -68,7 +68,7 @@ WriteBack 以可读 ID 说明对象、原因和修改方法，不发布候选，
 但布局器无法理解的内容可以继续告警，其完成证据是逐项记录和实际加载，不是告警消失。
 
 发布成功后，这些诊断逐项写入 stderr，并以 `diagnostic.write_back` 写入当前 RunId 的
-JSONL。payload 只保存对象、原因和修改方法；汇总中的 `manual_layout_units` 提供总数。
+JSONL。payload 只保存关系、对象、原因、影响和处理办法；汇总中的 `manual_layout_units` 提供总数。
 人工布局本身不改变成功发布的业务结果；若警告无法呈现，按独立的进程呈现失败处理。
 
 ## 2. 完整验证
@@ -104,6 +104,6 @@ auto-wrapped units、插入换行、全角缩进、manual-layout units，以及�
 
 恢复路径固定为 `<parent>/.directory-publish/<target-name>/{stage,backup,journal}`。保持项目、
 输入、目标和这些路径不变，按[目录发布规格](../runtime/directory-publishing.md)处理诊断中的
-对象、原因和修改方法。发布已经生效但只剩清理失败时，修正占用或权限后重新运行同一目标
+对象、原因、影响和处理办法。发布已经生效但只剩清理失败时，修正占用或权限后重新运行同一目标
 WriteBack，下一次准备会先恢复。journal 损坏、必要 backup 缺失或结果未知时禁止重跑试探，
 也不手工移动或删除恢复目录。

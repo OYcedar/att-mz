@@ -1,0 +1,47 @@
+[project]
+name = "att-skill-tools"
+version = "0.1.0"
+description = "ATT 随包 Skill 工具的开发与验证环境"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.31.0",
+    "pytest>=8.4.0",
+    "ruff>=0.12.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests/skill_tools"]
+pythonpath = [
+    "skills/_shared",
+    "skills/translate-with-att/scripts",
+    "skills/extract-game-terminology/scripts",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 110
+
+[tool.ruff.lint]
+extend-select = ["B", "I", "SIM", "UP"]
+
+[tool.basedpyright]
+typeCheckingMode = "strict"
+pythonVersion = "3.11"
+include = [
+    "skills/_shared/att_skill_tools",
+    "skills/translate-with-att/scripts",
+    "skills/extract-game-terminology/scripts",
+    "tests/skill_tools",
+]
+exclude = ["**/__pycache__"]
+extraPaths = [
+    "skills/_shared",
+    "skills/translate-with-att/scripts",
+    "skills/extract-game-terminology/scripts",
+]

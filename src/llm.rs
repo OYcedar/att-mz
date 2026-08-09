@@ -7,7 +7,7 @@ use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
@@ -207,6 +207,102 @@ pub(crate) struct ApiKeyRedactor {
     api_key: SecretString,
 }
 
+/// Translate 在确认本次实际 Client 前暂缓公开文本，确认后统一使用同一替换器。
+///
+/// Generic 可以从项目状态取得 Profile，因此项目日志可能早于 Client 选择建立。这个门只
+/// 协调“尚未选择、已经选择、运行结束仍未选择”三种事实；非 Translate 不创建它。
+#[derive(Clone, Default)]
+pub(crate) struct ApiKeyRedactionGate {
+    state: Arc<(Mutex<ApiKeyRedactionState>, Condvar)>,
+}
+
+#[derive(Default)]
+enum ApiKeyRedactionState {
+    #[default]
+    Pending,
+    Selected(Arc<ApiKeyRedactor>),
+    NoSelection,
+}
+
+impl ApiKeyRedactionGate {
+    pub(crate) fn selected(redactor: Arc<ApiKeyRedactor>) -> Self {
+        Self {
+            state: Arc::new((
+                Mutex::new(ApiKeyRedactionState::Selected(redactor)),
+                Condvar::new(),
+            )),
+        }
+    }
+
+    /// 保存本次实际选中的 Client。重复报告同一个选择是幂等的；选择一旦确定便不能替换。
+    pub(crate) fn select(&self, redactor: Arc<ApiKeyRedactor>) {
+        let (state, ready) = self.state.as_ref();
+        let mut state = lock_redaction_state(state);
+        match &*state {
+            ApiKeyRedactionState::Pending => {
+                *state = ApiKeyRedactionState::Selected(redactor);
+                ready.notify_all();
+            }
+            ApiKeyRedactionState::Selected(current) => {
+                assert!(
+                    Arc::ptr_eq(current, &redactor),
+                    "一次 Translate 运行不能改选另一个 API key 替换器"
+                );
+            }
+            ApiKeyRedactionState::NoSelection => {
+                panic!("Translate 运行结束后不能再选择 API key 替换器");
+            }
+        }
+    }
+
+    /// 只在运行没有确认 Client 时解除等待，使早期失败仍能完整呈现。
+    pub(crate) fn finish_without_selection(&self) {
+        let (state, ready) = self.state.as_ref();
+        let mut state = lock_redaction_state(state);
+        if matches!(*state, ApiKeyRedactionState::Pending) {
+            *state = ApiKeyRedactionState::NoSelection;
+            ready.notify_all();
+        }
+    }
+
+    pub(crate) fn selected_redactor(&self) -> Option<Arc<ApiKeyRedactor>> {
+        let (state, _) = self.state.as_ref();
+        match &*lock_redaction_state(state) {
+            ApiKeyRedactionState::Selected(redactor) => Some(Arc::clone(redactor)),
+            ApiKeyRedactionState::Pending | ApiKeyRedactionState::NoSelection => None,
+        }
+    }
+
+    pub(crate) fn redact_after_selection(&self, value: &str) -> String {
+        self.wait_for_selection()
+            .map_or_else(|| value.to_owned(), |redactor| redactor.redact(value))
+    }
+
+    fn wait_for_selection(&self) -> Option<Arc<ApiKeyRedactor>> {
+        let (state, ready) = self.state.as_ref();
+        let mut state = lock_redaction_state(state);
+        loop {
+            match &*state {
+                ApiKeyRedactionState::Pending => {
+                    state = ready
+                        .wait(state)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                ApiKeyRedactionState::Selected(redactor) => return Some(Arc::clone(redactor)),
+                ApiKeyRedactionState::NoSelection => return None,
+            }
+        }
+    }
+}
+
+fn lock_redaction_state(
+    state: &Mutex<ApiKeyRedactionState>,
+) -> MutexGuard<'_, ApiKeyRedactionState> {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl ApiKeyRedactor {
     const REPLACEMENT: &'static str = "[REDACTED API KEY]";
 
@@ -325,6 +421,49 @@ impl ApiKeyRedactor {
 
     fn redact_serialized_json(&self, value: &str) -> String {
         self.redact_json_string_tokens(value, true)
+    }
+
+    /// 只替换已经序列化的封闭 schema 中 JSON value 的字符串内容。
+    ///
+    /// 项目日志的字段名由当前 schema 固定；即使使用者把一个很短的 API key 选成项目名，
+    /// 也不能因为替换命中 `event` 等固定 key 而破坏日志格式。该边界只处理 string
+    /// value，跳过后接冒号的 object key，并保持原字段顺序和其余字节不变。
+    #[cfg(test)]
+    pub(crate) fn redact_serialized_json_values(&self, value: &str) -> String {
+        let api_key = self.api_key.expose_secret();
+        if api_key.is_empty() {
+            return value.to_owned();
+        }
+        let bytes = value.as_bytes();
+        let mut replacements = Vec::new();
+        let mut index = 0usize;
+        while index < bytes.len() {
+            if bytes[index] == b'"' {
+                let decoded = decode_json_string(value, index + 1);
+                assert!(
+                    decoded.closed,
+                    "serde_json 必须只生成闭合的 JSON string token"
+                );
+                let mut next = decoded.next_index;
+                while bytes
+                    .get(next)
+                    .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+                {
+                    next += 1;
+                }
+                if bytes.get(next) != Some(&b':') {
+                    replacements.extend(decoded.api_key_source_ranges(api_key));
+                }
+                index = decoded.next_index;
+                continue;
+            }
+            index += value[index..]
+                .chars()
+                .next()
+                .expect("非空 UTF-8 后缀必须包含字符")
+                .len_utf8();
+        }
+        Self::replace_source_ranges(value, Self::merge_source_ranges(replacements))
     }
 
     fn redact_json_string_tokens(&self, value: &str, serialized_json: bool) -> String {
@@ -1015,6 +1154,43 @@ mod tests {
         assert_eq!(reparsed["exponent"], 1e10);
         assert_eq!(reparsed["boolean"], true);
         assert!(reparsed["nothing"].is_null());
+    }
+
+    #[test]
+    fn serialized_json_value_redaction_preserves_fixed_schema_keys() {
+        let redactor = ApiKeyRedactor::new(SecretString::from("event"));
+        let serialized = r#"{"event":"before-event-after","nested":{"fixed":"event"}}"#;
+
+        let redacted = redactor.redact_serialized_json_values(serialized);
+
+        assert_eq!(
+            redacted,
+            r#"{"event":"before-[REDACTED API KEY]-after","nested":{"fixed":"[REDACTED API KEY]"}}"#
+        );
+        let reparsed: Value = serde_json::from_str(&redacted).expect("替换后必须仍是合法 JSON");
+        assert_eq!(reparsed["event"], "before-[REDACTED API KEY]-after");
+    }
+
+    #[test]
+    fn deferred_redaction_waits_for_the_selected_client() {
+        let gate = ApiKeyRedactionGate::default();
+        let worker_gate = gate.clone();
+        let worker =
+            std::thread::spawn(move || worker_gate.redact_after_selection("project-demo-secret"));
+
+        gate.select(Arc::new(ApiKeyRedactor::new(SecretString::from("secret"))));
+        let redacted = worker.join().expect("延迟替换线程不应 panic");
+
+        assert_eq!(redacted, "project-demo-[REDACTED API KEY]");
+    }
+
+    #[test]
+    fn deferred_redaction_can_finish_before_a_client_is_selected() {
+        let gate = ApiKeyRedactionGate::default();
+        gate.finish_without_selection();
+
+        assert_eq!(gate.redact_after_selection("plain text"), "plain text");
+        assert!(gate.selected_redactor().is_none());
     }
 
     #[test]

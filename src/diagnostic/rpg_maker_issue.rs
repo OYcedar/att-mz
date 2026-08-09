@@ -260,6 +260,16 @@ impl RpgMakerDiagnosticLocation {
         }
         location
     }
+
+    fn natural_game_location(&self) -> String {
+        let location = self.natural_location();
+        match &self.source {
+            RpgMakerDiagnosticSource::Data { .. }
+            | RpgMakerDiagnosticSource::DataFile { .. }
+            | RpgMakerDiagnosticSource::Map { .. } => format!("data/{location}"),
+            RpgMakerDiagnosticSource::PluginParameter { .. } => location,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -900,6 +910,14 @@ impl RpgMakerLogicalUnitLocator {
             group_location,
             role,
         }
+    }
+
+    fn natural_id(&self) -> String {
+        format!(
+            "{}:{}",
+            self.group_location.natural_game_location(),
+            self.role.fact_value()
+        )
     }
 }
 
@@ -6262,6 +6280,9 @@ pub(crate) enum RpgMakerProblem {
     RulesCommandNonString {
         fact: RpgMakerRulesCommandNonStringFact,
     },
+    RulesOwnerDisabled {
+        rules_path: SafePath,
+    },
     BuiltinDocument {
         location: RpgMakerDiagnosticLocation,
         problem: RpgMakerBuiltinDocumentProblem,
@@ -6387,6 +6408,15 @@ impl RpgMakerIssue {
         Self {
             stage: RpgMakerDiagnosticStage::ExtractRules,
             problem: RpgMakerProblem::RulesCommandNonString { fact },
+        }
+    }
+
+    pub(crate) fn rules_owner_disabled(rules_path: impl AsRef<std::path::Path>) -> Self {
+        Self {
+            stage: RpgMakerDiagnosticStage::RulesDefinitionInput,
+            problem: RpgMakerProblem::RulesOwnerDisabled {
+                rules_path: SafePath::new(rules_path),
+            },
         }
     }
 
@@ -6624,6 +6654,7 @@ impl RpgMakerIssue {
             RpgMakerProblem::RulesCommandNonString { .. } => {
                 "rpg_maker.extract.rules.command_non_string_skipped"
             }
+            RpgMakerProblem::RulesOwnerDisabled { .. } => "rpg_maker.extract.rules.owner_disabled",
             RpgMakerProblem::BuiltinDocument { problem, .. } => problem.code(),
             RpgMakerProblem::DialogueDefinition { problem, .. } => problem.code(),
             RpgMakerProblem::DialogueProjection { problem } => problem.code(),
@@ -6699,6 +6730,7 @@ impl RpgMakerIssue {
                 _ => DiagnosticResolution::FixInput,
             },
             RpgMakerProblem::RulesCommandNonString { .. } => DiagnosticResolution::FixInput,
+            RpgMakerProblem::RulesOwnerDisabled { .. } => DiagnosticResolution::ReviewDisabledRules,
             RpgMakerProblem::BuiltinDocument { .. } => DiagnosticResolution::FixInput,
             RpgMakerProblem::DialogueDefinition {
                 origin, problem, ..
@@ -6764,6 +6796,7 @@ impl RpgMakerIssue {
             RpgMakerProblem::RulesDefinition { problem, .. } => problem.summary_code(),
             RpgMakerProblem::RulesMatch { problem, .. } => problem.summary_code(),
             RpgMakerProblem::RulesCommandNonString { .. } => "invalid_value",
+            RpgMakerProblem::RulesOwnerDisabled { .. } => "rules_owner_disabled",
             RpgMakerProblem::BuiltinDocument { problem, .. } => problem.summary_code(),
             RpgMakerProblem::DialogueDefinition { problem, .. } => problem.summary_code(),
             RpgMakerProblem::DialogueProjection { problem } => problem.summary_code(),
@@ -6788,7 +6821,16 @@ impl RpgMakerIssue {
             RpgMakerProblem::Project { problem } => problem.subject(),
             RpgMakerProblem::RulesDefinition { rules_path, .. } => rules_path.to_string(),
             RpgMakerProblem::RulesMatch { rules_path, .. } => rules_path.to_string(),
-            RpgMakerProblem::RulesCommandNonString { fact } => fact.source_file.to_string(),
+            RpgMakerProblem::RulesCommandNonString { fact } => format!(
+                "{} (Rules rule {}; command code={}; parameter={}; type={}; skipped={})",
+                fact.source_file,
+                fact.rule_number,
+                fact.command_code,
+                fact.parameter,
+                fact.actual_type.as_str(),
+                fact.skipped_count,
+            ),
+            RpgMakerProblem::RulesOwnerDisabled { rules_path } => rules_path.to_string(),
             RpgMakerProblem::BuiltinDocument { location, .. } => {
                 format!("{}:{}", location.source_fact(), location.steps_fact())
             }
@@ -6849,9 +6891,25 @@ impl RpgMakerIssue {
                 }
                 _ => "rpg_maker_translation_planning".to_owned(),
             },
-            RpgMakerProblem::ManualLayoutRequired { .. } => {
-                "rpg_maker_write_back_layout".to_owned()
-            }
+            RpgMakerProblem::ManualLayoutRequired { locations, .. } => locations
+                .iter()
+                .map(RpgMakerLogicalUnitLocator::natural_id)
+                .collect::<Vec<_>>()
+                .join(", "),
+        }
+    }
+
+    pub(crate) fn manual_layout_reason_detail(&self) -> Option<String> {
+        match &self.problem {
+            RpgMakerProblem::ManualLayoutRequired {
+                region,
+                max_fullwidth_chars,
+                ..
+            } => Some(format!(
+                "region={}; max_fullwidth_chars={max_fullwidth_chars}",
+                region.as_str()
+            )),
+            _ => None,
         }
     }
 
@@ -6887,6 +6945,9 @@ impl RpgMakerIssue {
                 ),
             ],
             RpgMakerProblem::RulesCommandNonString { fact } => fact.facts(),
+            RpgMakerProblem::RulesOwnerDisabled { rules_path } => {
+                vec![("rules_path", rules_path.to_string())]
+            }
             RpgMakerProblem::BuiltinDocument { location, problem } => vec![
                 ("source", location.source_fact()),
                 ("location_steps", location.steps_fact()),
@@ -7017,6 +7078,7 @@ impl RpgMakerIssue {
             | RpgMakerProblem::RulesDefinition { .. }
             | RpgMakerProblem::RulesMatch { .. }
             | RpgMakerProblem::RulesCommandNonString { .. }
+            | RpgMakerProblem::RulesOwnerDisabled { .. }
             | RpgMakerProblem::BuiltinDocument { .. }
             | RpgMakerProblem::DialogueDefinition { .. }
             | RpgMakerProblem::DialogueProjection { .. }

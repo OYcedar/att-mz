@@ -45,6 +45,18 @@ impl StateEffect {
             other
         }
     }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unchanged => "unchanged",
+            Self::ProgressPreserved => "progress_preserved",
+            Self::Applied => "applied",
+            Self::AppliedRunPlanNotSaved => "applied_run_plan_not_saved",
+            Self::AppliedFinalizationFailed => "applied_finalization_failed",
+            Self::RecoveryRequired => "recovery_required",
+            Self::OutcomeUnknown => "outcome_unknown",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -53,6 +65,7 @@ pub(crate) enum DiagnosticResolution {
     FixConfiguration,
     FixInput,
     FixPlaceholderRules,
+    ReviewDisabledRules,
     AdjustManualLayout,
     CheckPathAndPermissions,
     CheckProjectState,
@@ -69,6 +82,7 @@ impl DiagnosticResolution {
             Self::FixConfiguration => "fix_configuration",
             Self::FixInput => "fix_input",
             Self::FixPlaceholderRules => "fix_placeholder_rules",
+            Self::ReviewDisabledRules => "review_disabled_rules",
             Self::AdjustManualLayout => "adjust_manual_layout",
             Self::CheckPathAndPermissions => "check_path_and_permissions",
             Self::CheckProjectState => "check_project_state",
@@ -90,6 +104,19 @@ pub(crate) enum RelatedFailureRelation {
     Finalization,
     Shutdown,
     Observability,
+}
+
+impl RelatedFailureRelation {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cleanup => "cleanup",
+            Self::Rollback => "rollback",
+            Self::Discard => "discard",
+            Self::Finalization => "finalization",
+            Self::Shutdown => "shutdown",
+            Self::Observability => "observability",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -349,14 +376,17 @@ impl RelatedDiagnosticReport {
     }
 }
 
-fn render_diagnostic(diagnostic: &Diagnostic, localizer: &UiLocalizer) -> String {
-    let fields = render_diagnostic_fields_for(diagnostic, localizer);
+fn render_diagnostic(report: &DiagnosticReport, localizer: &UiLocalizer) -> String {
+    let fields = render_diagnostic_fields(report, localizer);
     [
-        localizer.format(UiMessage::DiagnosticLocation {
+        localizer.format(UiMessage::DiagnosticObject {
             subject: &fields.object,
         }),
         localizer.format(UiMessage::DiagnosticExplanation {
             reason: &fields.reason,
+        }),
+        localizer.format(UiMessage::DiagnosticImpact {
+            impact: &fields.impact,
         }),
         localizer.format(UiMessage::DiagnosticResolution {
             action: &fields.help,
@@ -370,9 +400,15 @@ pub(crate) fn render_diagnostic_report(
     report: &DiagnosticReport,
     localizer: &UiLocalizer,
 ) -> String {
-    let mut blocks = vec![render_diagnostic(report.primary(), localizer)];
+    let mut blocks = vec![render_diagnostic(report, localizer)];
     for related in report.related() {
-        blocks.push(render_diagnostic_report(related.report(), localizer));
+        blocks.push(format!(
+            "{}\n{}",
+            localizer.format(UiMessage::DiagnosticRelated {
+                relation: related.relation().as_str(),
+            }),
+            render_diagnostic_report(related.report(), localizer)
+        ));
     }
     blocks.join("\n\n")
 }
@@ -380,11 +416,12 @@ pub(crate) fn render_diagnostic_report(
 /// 面向项目日志的最小诊断正文。
 ///
 /// 项目日志不承担调试协议或恢复状态的传递职责，只告诉读者哪个对象出了什么问题以及
-/// 应该怎么处理。SQLite 查询编号、供应商请求标识、指纹对比和递归内部状态不会进入
-/// 这些字段。
+/// 对业务状态的影响以及应该怎么处理。SQLite 查询编号、供应商请求标识、指纹对比和
+/// 递归内部状态不会进入这些字段。
 pub(crate) struct RenderedDiagnosticFields {
     pub(crate) object: String,
     pub(crate) reason: String,
+    pub(crate) impact: String,
     pub(crate) help: String,
 }
 
@@ -392,11 +429,22 @@ pub(crate) fn render_diagnostic_fields(
     report: &DiagnosticReport,
     localizer: &UiLocalizer,
 ) -> RenderedDiagnosticFields {
-    render_diagnostic_fields_for(report.primary(), localizer)
+    render_diagnostic_fields_for(report.primary(), report.effect(), localizer)
+}
+
+/// 把类型化的业务状态影响转换为用户当前语言下的公开文本。
+///
+/// CLI 的诊断、Manual 的逐项错误和不完整结果警告必须共用这一入口，避免各自用裸字符串
+/// 或平行文案解释同一个 `StateEffect`。
+pub(crate) fn render_state_effect_impact(effect: StateEffect, localizer: &UiLocalizer) -> String {
+    localizer.format(UiMessage::DiagnosticImpactValue {
+        effect: effect.as_str(),
+    })
 }
 
 fn render_diagnostic_fields_for(
     diagnostic: &Diagnostic,
+    effect: StateEffect,
     localizer: &UiLocalizer,
 ) -> RenderedDiagnosticFields {
     let issue = diagnostic.issue();
@@ -407,6 +455,7 @@ fn render_diagnostic_fields_for(
     RenderedDiagnosticFields {
         object: issue.subject(),
         reason,
+        impact: render_state_effect_impact(effect, localizer),
         help: localizer.format(UiMessage::DiagnosticResolutionValue {
             code: diagnostic.resolution().as_str(),
         }),
@@ -482,6 +531,11 @@ fn render_diagnostic_reason(
         ) => {
             if let (Ok(line), Ok(column)) = (u64::try_from(*line), u64::try_from(*column)) {
                 details.push(localizer.format(UiMessage::DiagnosticJsonPosition { line, column }));
+            }
+        }
+        DiagnosticIssue::RpgMaker(issue) => {
+            if let Some(detail) = issue.manual_layout_reason_detail() {
+                details.push(detail);
             }
         }
         _ => {}
@@ -597,6 +651,97 @@ mod tests {
         );
         assert_eq!(report.effect(), StateEffect::OutcomeUnknown);
         assert_eq!(report.related().len(), 1);
+    }
+
+    #[test]
+    fn every_state_effect_has_a_distinct_readable_impact() {
+        for locale in crate::i18n::UiLocale::ALL {
+            let localizer = UiLocalizer::new(locale);
+            let mut impacts = std::collections::BTreeSet::new();
+
+            for effect in [
+                StateEffect::Unchanged,
+                StateEffect::ProgressPreserved,
+                StateEffect::Applied,
+                StateEffect::AppliedRunPlanNotSaved,
+                StateEffect::AppliedFinalizationFailed,
+                StateEffect::RecoveryRequired,
+                StateEffect::OutcomeUnknown,
+            ] {
+                let report = DiagnosticReport::new(effect, missing_capture());
+                let impact = render_diagnostic_fields(&report, &localizer).impact;
+                assert!(
+                    !impact.is_empty(),
+                    "{locale} 的 {effect:?} 必须有公开影响说明"
+                );
+                assert!(
+                    !impact.contains("__ATT_FALLBACK__"),
+                    "{locale} 的 {effect:?} 缺少本地化影响说明"
+                );
+                impacts.insert(impact);
+            }
+
+            assert_eq!(
+                impacts.len(),
+                7,
+                "{locale} 的七种状态影响不能合并成模糊的同一句话"
+            );
+        }
+    }
+
+    #[test]
+    fn related_reports_keep_their_natural_relation_headings() {
+        let relations = [
+            RelatedFailureRelation::Cleanup,
+            RelatedFailureRelation::Rollback,
+            RelatedFailureRelation::Discard,
+            RelatedFailureRelation::Finalization,
+            RelatedFailureRelation::Shutdown,
+            RelatedFailureRelation::Observability,
+        ];
+        for locale in crate::i18n::UiLocale::ALL {
+            let localizer = UiLocalizer::new(locale);
+            let headings = relations
+                .iter()
+                .map(|relation| {
+                    localizer.format(UiMessage::DiagnosticRelated {
+                        relation: relation.as_str(),
+                    })
+                })
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(headings.len(), relations.len());
+            assert!(
+                headings
+                    .iter()
+                    .all(|heading| !heading.contains("__ATT_FALLBACK__")),
+                "{locale} 缺少相关失败标题"
+            );
+        }
+
+        let mut report = DiagnosticReport::new(StateEffect::Unchanged, missing_capture());
+        for relation in relations {
+            report = report.with_related(
+                relation,
+                DiagnosticReport::new(StateEffect::Unchanged, missing_capture()),
+            );
+        }
+
+        let rendered =
+            render_diagnostic_report(&report, &UiLocalizer::new(crate::i18n::UiLocale::English));
+        assert!(!rendered.contains("__ATT_FALLBACK__"));
+        for relation in [
+            "cleanup",
+            "rollback",
+            "discard",
+            "finalization",
+            "shutdown",
+            "observability",
+        ] {
+            assert!(
+                !rendered.contains(&format!("{relation}:")),
+                "终端关系标题不能直接泄漏内部 relation code"
+            );
+        }
     }
 
     #[test]

@@ -6,7 +6,7 @@
 
 use std::io::{self, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread::{self, JoinHandle};
@@ -17,6 +17,7 @@ use crate::diagnostic::{
     SafePath, StateEffect, render_diagnostic_report,
 };
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
+use crate::llm::{ApiKeyRedactionGate, ApiKeyRedactor};
 use crate::project_lua::{ProjectLuaCallError, ProjectLuaPrintSink};
 use crate::runtime::performance::RunPerformanceCounters;
 use crate::runtime::project_log::{
@@ -32,7 +33,6 @@ use super::config::CommonCommandConfiguration;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ProjectLogWarning {
-    pub(crate) log_path: Option<PathBuf>,
     pub(crate) project_log: Vec<DiagnosticReport>,
     pub(crate) task_records: Vec<DiagnosticReport>,
     pub(crate) presentation_failures: Vec<DiagnosticReport>,
@@ -54,7 +54,7 @@ enum WarningCategory {
 
 struct ProjectLogWarningState {
     locale: UiLocale,
-    log_path: Option<PathBuf>,
+    api_key_redaction: Option<ApiKeyRedactionGate>,
     project_log: Mutex<Vec<DiagnosticReport>>,
     task_records: Mutex<Vec<DiagnosticReport>>,
     presentation_failures: Mutex<Vec<DiagnosticReport>>,
@@ -74,10 +74,10 @@ struct ProjectLogWarningPresenter {
 }
 
 impl ProjectLogWarningState {
-    fn new(locale: UiLocale, log_path: Option<PathBuf>) -> Self {
+    fn new(locale: UiLocale, api_key_redaction: Option<ApiKeyRedactionGate>) -> Self {
         Self {
             locale,
-            log_path,
+            api_key_redaction,
             project_log: Mutex::new(Vec::new()),
             task_records: Mutex::new(Vec::new()),
             presentation_failures: Mutex::new(Vec::new()),
@@ -134,14 +134,11 @@ impl ProjectLogWarningState {
 
     fn present(&self, category: WarningCategory, report: &DiagnosticReport) {
         let localizer = UiLocalizer::new(self.locale);
-        let banner = match category {
-            WarningCategory::ProjectLog => localizer.format(UiMessage::NoticeLogDegraded),
-            WarningCategory::TaskRecord => localizer.format(UiMessage::NoticeTaskRecordsDegraded),
-        };
-        let rendered = render_diagnostic_report(report, &localizer);
+        let heading = localizer.format(UiMessage::DiagnosticWarningHeading);
+        let rendered = self.render_warning_report(report, &localizer);
         let mut stderr = io::stderr().lock();
         let write_result = (|| -> io::Result<()> {
-            writeln!(stderr, "{banner}")?;
+            writeln!(stderr, "{heading}")?;
             writeln!(stderr, "{rendered}")
         })();
         let mut failed = false;
@@ -175,6 +172,14 @@ impl ProjectLogWarningState {
         }
     }
 
+    fn render_warning_report(&self, report: &DiagnosticReport, localizer: &UiLocalizer) -> String {
+        let rendered = render_diagnostic_report(report, localizer);
+        match &self.api_key_redaction {
+            Some(gate) => gate.redact_after_selection(&rendered),
+            None => rendered,
+        }
+    }
+
     fn record_presentation_failure(&self, report: DiagnosticReport) {
         lock_unpoisoned(&self.presentation_failures).push(report);
     }
@@ -191,16 +196,22 @@ impl ProjectLogWarningState {
         lock_unpoisoned(&self.presenter).take();
     }
 
-    fn warning(&self, health: &ProjectLogHealthSnapshot) -> Option<ProjectLogWarning> {
+    fn warning(
+        &self,
+        health: &ProjectLogHealthSnapshot,
+        presentation_failure_effect: StateEffect,
+    ) -> Option<ProjectLogWarning> {
         let mut cursor = lock_unpoisoned(&self.health_cursor);
         let fresh = cursor.consume(health);
         let mut project_log = lock_unpoisoned(&self.project_log).clone();
         project_log.extend(fresh.into_iter().map(|failure| failure.diagnostic_report()));
         let warning = ProjectLogWarning {
-            log_path: self.log_path.clone(),
             project_log,
             task_records: lock_unpoisoned(&self.task_records).clone(),
-            presentation_failures: lock_unpoisoned(&self.presentation_failures).clone(),
+            presentation_failures: lock_unpoisoned(&self.presentation_failures)
+                .iter()
+                .map(|report| report_with_effect(report, presentation_failure_effect))
+                .collect(),
         };
         (!warning.is_empty()).then_some(warning)
     }
@@ -278,12 +289,12 @@ impl Drop for ProjectLogWarningPresenter {
 
 fn create_warning_state(
     locale: UiLocale,
-    log_path: Option<PathBuf>,
+    api_key_redaction: Option<ApiKeyRedactionGate>,
 ) -> (
     Arc<ProjectLogWarningState>,
     Option<ProjectLogWarningPresenter>,
 ) {
-    let state = Arc::new(ProjectLogWarningState::new(locale, log_path));
+    let state = Arc::new(ProjectLogWarningState::new(locale, api_key_redaction));
     match ProjectLogWarningPresenter::start(&state) {
         Ok(presenter) => (state, Some(presenter)),
         Err(source) => {
@@ -335,10 +346,11 @@ impl ProjectLogHandle {
     pub(crate) fn prepare_terminal_diagnostic(
         &self,
         scope: DiagnosticScope,
+        root_relation: Option<RelatedFailureRelation>,
         report: DiagnosticReport,
     ) -> Option<PreparedTerminalDiagnostic> {
         let logger = self.logger.as_ref()?;
-        match logger.prepare_terminal_diagnostic(scope, report) {
+        match logger.prepare_terminal_diagnostic(scope, root_relation, report) {
             Ok(prepared) => Some(prepared),
             Err(error) => {
                 self.record_contract_failure(error.diagnostic_report());
@@ -428,6 +440,7 @@ pub(crate) struct ActiveProjectLog {
     runtime: Option<ProjectLogRuntime>,
     handle: ProjectLogHandle,
     warning_presenter: Option<ProjectLogWarningPresenter>,
+    api_key_redaction: Option<ApiKeyRedactionGate>,
     performance: Arc<RunPerformanceCounters>,
     log_path: Option<PathBuf>,
     engine: ProjectLogEngine,
@@ -452,19 +465,46 @@ impl ActiveProjectLog {
         &self.performance
     }
 
+    /// Generic 在读取项目运行方案后才确认 Profile；此前建立的日志继续等待这一选择。
+    pub(crate) fn select_api_key_redactor(&self, redactor: Arc<ApiKeyRedactor>) {
+        if let Some(gate) = &self.api_key_redaction {
+            gate.select(redactor);
+        }
+    }
+
+    pub(crate) fn selected_api_key_redactor(&self) -> Option<Arc<ApiKeyRedactor>> {
+        self.api_key_redaction
+            .as_ref()
+            .and_then(ApiKeyRedactionGate::selected_redactor)
+    }
+
+    /// 只有 writer runtime 已经建立时，这个自然路径才对应一份真实运行记录。
+    pub(crate) fn established_log_path(&self) -> Option<&Path> {
+        self.runtime.as_ref()?;
+        self.log_path.as_deref()
+    }
+
     pub(crate) fn pending_succeeded(self) -> PendingProjectLog {
-        PendingProjectLog::new(self, PendingRunFinished::Known(RunFinished::Succeeded))
+        PendingProjectLog::new(
+            self,
+            PendingRunFinished::Known(RunFinished::Succeeded),
+            StateEffect::AppliedFinalizationFailed,
+        )
     }
 
     pub(crate) fn pending_cancelled(self) -> PendingProjectLog {
-        PendingProjectLog::new(self, PendingRunFinished::Known(RunFinished::Cancelled))
+        PendingProjectLog::new(
+            self,
+            PendingRunFinished::Known(RunFinished::Cancelled),
+            StateEffect::ProgressPreserved,
+        )
     }
 
     pub(crate) fn pending_failure(self, report: DiagnosticReport) -> PendingProjectLog {
         let effect = report.effect();
         let prepared = self
             .handle
-            .prepare_terminal_diagnostic(DiagnosticScope::Run, report);
+            .prepare_terminal_diagnostic(DiagnosticScope::Run, None, report);
         let result = prepared.map_or(PendingRunFinished::Unavailable, |prepared| {
             let result = run_finished_from_effect(effect, prepared.id());
             PendingRunFinished::Prepared {
@@ -472,7 +512,7 @@ impl ActiveProjectLog {
                 diagnostics: vec![prepared],
             }
         });
-        PendingProjectLog::new(self, result)
+        PendingProjectLog::new(self, result, effect)
     }
 
     pub(crate) fn pending_failure_with_occurrence(
@@ -483,6 +523,7 @@ impl ActiveProjectLog {
         PendingProjectLog::new(
             self,
             PendingRunFinished::Known(run_finished_from_effect(effect, diagnostic)),
+            effect,
         )
     }
 
@@ -497,7 +538,16 @@ impl ActiveProjectLog {
         PendingProjectLog::new(
             self,
             PendingRunFinished::Known(RunFinished::RecoveryRequired { diagnostic }),
+            StateEffect::RecoveryRequired,
         )
+    }
+}
+
+impl Drop for ActiveProjectLog {
+    fn drop(&mut self) {
+        if let Some(gate) = &self.api_key_redaction {
+            gate.finish_without_selection();
+        }
     }
 }
 
@@ -513,16 +563,39 @@ enum PendingRunFinished {
 pub(crate) struct PendingProjectLog {
     active: ActiveProjectLog,
     finished: PendingRunFinished,
+    presentation_failure_effect: StateEffect,
     result_presentation_prepared: bool,
 }
 
 impl PendingProjectLog {
-    fn new(active: ActiveProjectLog, finished: PendingRunFinished) -> Self {
+    fn new(
+        active: ActiveProjectLog,
+        finished: PendingRunFinished,
+        presentation_failure_effect: StateEffect,
+    ) -> Self {
         Self {
             active,
             finished,
+            presentation_failure_effect,
             result_presentation_prepared: false,
         }
+    }
+
+    pub(crate) fn log_path(&self) -> Option<&std::path::Path> {
+        self.active.established_log_path()
+    }
+
+    pub(crate) fn selected_api_key_redactor(&self) -> Option<Arc<ApiKeyRedactor>> {
+        self.active.selected_api_key_redactor()
+    }
+
+    pub(crate) fn has_presentation_failure(&self) -> bool {
+        !self
+            .active
+            .handle
+            .warnings
+            .presentation_failures()
+            .is_empty()
     }
 
     pub(crate) fn finish(mut self) -> Option<ProjectLogWarning> {
@@ -553,7 +626,10 @@ impl PendingProjectLog {
             logger.clear_health_observer();
         }
         let health = self.active.handle.health();
-        self.active.handle.warnings.warning(&health)
+        self.active
+            .handle
+            .warnings
+            .warning(&health, self.presentation_failure_effect)
     }
 
     /// 在写最终业务结果前停止并排空后台 stderr presenter，同时保持项目日志可写。
@@ -562,6 +638,9 @@ impl PendingProjectLog {
         if self.result_presentation_prepared {
             return;
         }
+        if let Some(gate) = &self.active.api_key_redaction {
+            gate.finish_without_selection();
+        }
         if let Some(logger) = self.active.handle.logger.as_ref() {
             logger.clear_health_observer();
         }
@@ -569,7 +648,10 @@ impl PendingProjectLog {
             presenter.finish();
         }
         for report in self.active.handle.warnings.presentation_failures() {
-            self.append_terminal_report(report);
+            self.append_terminal_report(report_with_effect(
+                &report,
+                self.presentation_failure_effect,
+            ));
         }
         self.result_presentation_prepared = true;
     }
@@ -597,11 +679,21 @@ impl PendingProjectLog {
 
     fn append_terminal_report(&mut self, report: DiagnosticReport) {
         let effect = report.effect();
-        let Some(prepared) = self
-            .active
-            .handle
-            .prepare_terminal_diagnostic(DiagnosticScope::Run, report)
-        else {
+        let root_relation = match &self.finished {
+            PendingRunFinished::Known(RunFinished::Succeeded | RunFinished::Cancelled) => None,
+            PendingRunFinished::Known(
+                RunFinished::Failed { .. }
+                | RunFinished::RecoveryRequired { .. }
+                | RunFinished::OutcomeUnknown { .. },
+            )
+            | PendingRunFinished::Prepared { .. } => Some(RelatedFailureRelation::Observability),
+            PendingRunFinished::Unavailable => None,
+        };
+        let Some(prepared) = self.active.handle.prepare_terminal_diagnostic(
+            DiagnosticScope::Run,
+            root_relation,
+            report,
+        ) else {
             return;
         };
         let candidate = run_finished_from_effect(effect, prepared.id());
@@ -631,7 +723,7 @@ impl PendingProjectLog {
                 engine: runtime_engine(self.active.engine),
                 command: runtime_command(self.active.command),
                 project_workspace: SafePath::new(&self.active.project_workspace),
-                log_path: self.active.log_path.as_deref().map(SafePath::new),
+                log_path: self.active.established_log_path().map(SafePath::new),
             }),
         );
         let drop_report = match &self.finished {
@@ -654,6 +746,14 @@ impl PendingProjectLog {
         }
         report
     }
+}
+
+fn report_with_effect(report: &DiagnosticReport, effect: StateEffect) -> DiagnosticReport {
+    let mut adjusted = DiagnosticReport::new(effect, report.primary().clone());
+    for related in report.related() {
+        adjusted = adjusted.with_related(related.relation(), related.report().clone());
+    }
+    adjusted
 }
 
 fn stronger_run_finished(current: RunFinished, candidate: RunFinished) -> RunFinished {
@@ -695,6 +795,8 @@ pub(crate) struct CommandLogStart<'a> {
     pub(crate) project: &'a str,
     pub(crate) command: ProjectLogCommand,
     pub(crate) performance: Arc<RunPerformanceCounters>,
+    /// Translate 已解析 Profile 时直接提供；Generic 延迟 Profile 时暂为 `None`。
+    pub(crate) selected_api_key_redactor: Option<Arc<ApiKeyRedactor>>,
 }
 
 pub(crate) fn start_command_log(input: CommandLogStart<'_>) -> ActiveProjectLog {
@@ -705,7 +807,17 @@ pub(crate) fn start_command_log(input: CommandLogStart<'_>) -> ActiveProjectLog 
         project,
         command,
         performance,
+        selected_api_key_redactor,
     } = input;
+    assert!(
+        command == ProjectLogCommand::Translate || selected_api_key_redactor.is_none(),
+        "只有 Translate 项目日志可以接收所选 API key 替换器"
+    );
+    let api_key_redaction = (command == ProjectLogCommand::Translate).then(|| {
+        selected_api_key_redactor.map_or_else(ApiKeyRedactionGate::default, |redactor| {
+            ApiKeyRedactionGate::selected(redactor)
+        })
+    });
     let project_workspace = common
         .projects_root()
         .join(engine_storage_name(engine))
@@ -713,7 +825,8 @@ pub(crate) fn start_command_log(input: CommandLogStart<'_>) -> ActiveProjectLog 
     let context = match ProjectLogContext::new(locale, engine, project, command) {
         Ok(context) => context,
         Err(_) => {
-            let (warnings, warning_presenter) = create_warning_state(locale, None);
+            let (warnings, warning_presenter) =
+                create_warning_state(locale, api_key_redaction.clone());
             let report = DiagnosticReport::new(
                 StateEffect::Unchanged,
                 Diagnostic::observability(ObservabilityIssue::contract(
@@ -731,6 +844,7 @@ pub(crate) fn start_command_log(input: CommandLogStart<'_>) -> ActiveProjectLog 
                     warnings,
                 },
                 warning_presenter,
+                api_key_redaction,
                 performance,
                 log_path: None,
                 engine,
@@ -743,7 +857,8 @@ pub(crate) fn start_command_log(input: CommandLogStart<'_>) -> ActiveProjectLog 
     let (run_id, log_path, reserved_file) = match reserve_run_log(&project_workspace) {
         Ok(reserved) => reserved,
         Err(source) => {
-            let (warnings, warning_presenter) = create_warning_state(locale, None);
+            let (warnings, warning_presenter) =
+                create_warning_state(locale, api_key_redaction.clone());
             let report = DiagnosticReport::new(
                 StateEffect::Unchanged,
                 Diagnostic::observability(ObservabilityIssue::create(
@@ -762,6 +877,7 @@ pub(crate) fn start_command_log(input: CommandLogStart<'_>) -> ActiveProjectLog 
                     warnings,
                 },
                 warning_presenter,
+                api_key_redaction,
                 performance,
                 log_path: None,
                 engine,
@@ -771,7 +887,7 @@ pub(crate) fn start_command_log(input: CommandLogStart<'_>) -> ActiveProjectLog 
         }
     };
     let run_id_text = run_id.to_string();
-    let (warnings, warning_presenter) = create_warning_state(locale, Some(log_path.clone()));
+    let (warnings, warning_presenter) = create_warning_state(locale, api_key_redaction.clone());
 
     let drop_report = DiagnosticReport::new(
         StateEffect::OutcomeUnknown,
@@ -788,6 +904,7 @@ pub(crate) fn start_command_log(input: CommandLogStart<'_>) -> ActiveProjectLog 
         context,
         run_id,
         Arc::clone(&performance),
+        api_key_redaction.clone(),
         drop_report,
     ) {
         Ok(runtime) => runtime,
@@ -802,6 +919,7 @@ pub(crate) fn start_command_log(input: CommandLogStart<'_>) -> ActiveProjectLog 
                     warnings,
                 },
                 warning_presenter,
+                api_key_redaction,
                 performance,
                 log_path: Some(log_path),
                 engine,
@@ -824,6 +942,7 @@ pub(crate) fn start_command_log(input: CommandLogStart<'_>) -> ActiveProjectLog 
             warnings,
         },
         warning_presenter,
+        api_key_redaction,
         performance,
         log_path: Some(log_path),
         engine,
@@ -871,10 +990,15 @@ mod tests {
     use std::fs;
     use std::time::{Duration, Instant};
 
+    use secrecy::SecretString;
+
     use crate::diagnostic::{
         IoFailure, ObservabilityFailureCount, RuntimeComponent, RuntimeOperation,
     };
-    use crate::runtime::project_log::{ProjectLogFailureCount, ProjectLogFailureKey};
+    use crate::runtime::project_log::{
+        ProjectLogFailureCount, ProjectLogFailureKey, ResolvedRunPlan, RunPlanFinalization,
+        RunPlanTransactionState, RunPlanValueSource, TranslationFinished,
+    };
 
     use super::*;
 
@@ -889,6 +1013,7 @@ mod tests {
             project,
             command: ProjectLogCommand::Lua,
             performance: Arc::new(RunPerformanceCounters::default()),
+            selected_api_key_redactor: None,
         })
     }
 
@@ -912,6 +1037,253 @@ mod tests {
             .collect()
     }
 
+    fn contains_json_key(value: &serde_json::Value, expected: &str) -> bool {
+        match value {
+            serde_json::Value::Object(object) => {
+                object.contains_key(expected)
+                    || object
+                        .values()
+                        .any(|value| contains_json_key(value, expected))
+            }
+            serde_json::Value::Array(values) => values
+                .iter()
+                .any(|value| contains_json_key(value, expected)),
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_) => false,
+        }
+    }
+
+    fn diagnostic_with_path(path: &str) -> DiagnosticReport {
+        DiagnosticReport::new(
+            StateEffect::ProgressPreserved,
+            Diagnostic::runtime(RuntimeIssue::CommandPanicked {
+                engine: RuntimeEngine::Generic,
+                command: RuntimeCommand::Translate,
+                project_workspace: SafePath::new(path),
+                log_path: Some(SafePath::new(format!("{path}/logs/run-000001.jsonl"))),
+            }),
+        )
+    }
+
+    #[test]
+    fn selected_translate_key_is_removed_from_every_project_log_string_value() {
+        const API_KEY: &str = "selected-secret";
+        for (storage, engine) in [
+            ("generic", ProjectLogEngine::Generic),
+            ("mv", ProjectLogEngine::RpgMakerMv),
+        ] {
+            let temporary = tempfile::tempdir().expect("应建立替换测试目录");
+            let common = CommonCommandConfiguration::for_test(temporary.path());
+            let project = format!("project-{API_KEY}");
+            let workspace = temporary.path().join(storage).join(&project);
+            fs::create_dir_all(&workspace).expect("应建立项目工作区");
+            let redactor = Arc::new(ApiKeyRedactor::new(SecretString::from(API_KEY)));
+            let active = start_command_log(CommandLogStart {
+                common: &common,
+                locale: UiLocale::English,
+                engine,
+                project: &project,
+                command: ProjectLogCommand::Translate,
+                performance: Arc::new(RunPerformanceCounters::default()),
+                selected_api_key_redactor: (engine != ProjectLogEngine::Generic)
+                    .then(|| Arc::clone(&redactor)),
+            });
+            let log_path = active
+                .established_log_path()
+                .expect("Translate 项目日志必须建立")
+                .to_path_buf();
+            active.handle().emit(ProjectLogEvent::RunPlanResolved {
+                plan: ResolvedRunPlan::translate(
+                    RunPlanValueSource::Explicit,
+                    format!("profile-{API_KEY}"),
+                    Some(Path::new(&format!("D:/terms/{API_KEY}.toml"))),
+                    Some(Path::new(&format!("D:/placeholders/{API_KEY}.toml"))),
+                )
+                .expect("测试 Profile 必须有效"),
+            });
+            active.handle().emit(ProjectLogEvent::RunPlanFinalized {
+                database: SafePath::new(format!("D:/projects/{API_KEY}/project.db")),
+                result: RunPlanFinalization::Saved {
+                    transaction: RunPlanTransactionState::Committed,
+                    run_continues: true,
+                },
+            });
+            active.handle().emit(ProjectLogEvent::TranslationFinished {
+                result: TranslationFinished::NotStarted,
+            });
+            if engine == ProjectLogEngine::Generic {
+                active.select_api_key_redactor(redactor);
+            }
+            active
+                .pending_failure(diagnostic_with_path(&format!("D:/games/{API_KEY}")))
+                .finish();
+
+            let raw = fs::read_to_string(&log_path).expect("项目日志应可读取");
+            assert!(!raw.contains(API_KEY));
+            assert!(raw.contains("[REDACTED API KEY]"));
+            for record in read_records(&log_path) {
+                assert_eq!(
+                    record
+                        .as_object()
+                        .expect("项目日志必须是对象")
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                    [
+                        "timestamp",
+                        "sequence",
+                        "run_id",
+                        "level",
+                        "event",
+                        "context",
+                        "payload",
+                        "message",
+                    ]
+                );
+            }
+            let diagnostic = read_records(&log_path)
+                .into_iter()
+                .find(|record| record["event"] == "diagnostic.run")
+                .expect("失败运行必须有诊断");
+            assert_eq!(
+                diagnostic["payload"]
+                    .as_object()
+                    .expect("诊断 payload 必须是对象")
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                ["relation", "object", "reason", "impact", "help"]
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_project_log_discriminators_survive_short_api_key_redaction() {
+        for api_key in ["failed", "run", "event"] {
+            let temporary = tempfile::tempdir().expect("应建立固定字段测试目录");
+            let common = CommonCommandConfiguration::for_test(temporary.path());
+            let project = format!("project-{api_key}");
+            let workspace = temporary.path().join("generic").join(&project);
+            fs::create_dir_all(&workspace).expect("应建立项目工作区");
+            let active = start_command_log(CommandLogStart {
+                common: &common,
+                locale: UiLocale::English,
+                engine: ProjectLogEngine::Generic,
+                project: &project,
+                command: ProjectLogCommand::Translate,
+                performance: Arc::new(RunPerformanceCounters::default()),
+                selected_api_key_redactor: Some(Arc::new(ApiKeyRedactor::new(SecretString::from(
+                    api_key,
+                )))),
+            });
+            let log_path = active
+                .established_log_path()
+                .expect("Translate 项目日志必须建立")
+                .to_path_buf();
+            active.handle().emit(ProjectLogEvent::TranslationFinished {
+                result: TranslationFinished::NotStarted,
+            });
+            active
+                .pending_failure(diagnostic_with_path(&format!("D:/games/{api_key}")))
+                .finish();
+
+            let records = read_records(&log_path);
+            for record in &records {
+                assert!(
+                    !contains_json_key(&record["payload"], "diagnostic"),
+                    "公开 payload 不得包含内部诊断 occurrence"
+                );
+                serde_json::from_value::<crate::runtime::project_log::ProjectLogCode>(
+                    record["event"].clone(),
+                )
+                .expect("event 固定判别值必须仍符合当前类型");
+                serde_json::from_value::<crate::runtime::project_log::ProjectLogLevel>(
+                    record["level"].clone(),
+                )
+                .expect("level 固定判别值必须仍符合当前类型");
+                serde_json::from_value::<crate::runtime::project_log::ProjectLogContext>(
+                    record["context"].clone(),
+                )
+                .expect("context 固定判别值必须仍符合当前类型");
+                assert_eq!(record["context"]["project"], "project-[REDACTED API KEY]");
+            }
+            let diagnostic = records
+                .iter()
+                .find(|record| record["event"] == "diagnostic.run")
+                .expect("固定 diagnostic.run 判别值必须保留");
+            assert_eq!(diagnostic["payload"]["relation"], "primary");
+            for field in ["object", "reason", "impact", "help"] {
+                assert!(
+                    !diagnostic["payload"][field]
+                        .as_str()
+                        .expect("诊断动态字段必须是字符串")
+                        .contains(api_key)
+                );
+            }
+            let finished = records
+                .iter()
+                .find(|record| record["event"] == "run.finished")
+                .expect("固定 run.finished 判别值必须保留");
+            assert_eq!(finished["payload"]["result"]["kind"], "failed");
+            assert!(
+                finished
+                    .as_object()
+                    .expect("项目日志必须是对象")
+                    .contains_key("event")
+            );
+        }
+    }
+
+    #[test]
+    fn immediate_warning_rendering_uses_the_selected_translate_key() {
+        const API_KEY: &str = "warning-secret";
+        let gate = ApiKeyRedactionGate::selected(Arc::new(ApiKeyRedactor::new(
+            SecretString::from(API_KEY),
+        )));
+        let state = ProjectLogWarningState::new(UiLocale::English, Some(gate));
+
+        let rendered = state.render_warning_report(
+            &diagnostic_with_path(&format!("D:/games/{API_KEY}")),
+            &UiLocalizer::new(UiLocale::English),
+        );
+
+        assert!(!rendered.contains(API_KEY));
+        assert!(rendered.contains("[REDACTED API KEY]"));
+    }
+
+    #[test]
+    fn non_translate_project_log_has_no_selected_key_redactor() {
+        const TEXT: &str = "ordinary-secret";
+        let temporary = tempfile::tempdir().expect("应建立非 Translate 测试目录");
+        let common = CommonCommandConfiguration::for_test(temporary.path());
+        let workspace = temporary.path().join("generic").join("plain-log");
+        fs::create_dir_all(&workspace).expect("应建立项目工作区");
+        let active = start_command_log(CommandLogStart {
+            common: &common,
+            locale: UiLocale::English,
+            engine: ProjectLogEngine::Generic,
+            project: "plain-log",
+            command: ProjectLogCommand::Lua,
+            performance: Arc::new(RunPerformanceCounters::default()),
+            selected_api_key_redactor: None,
+        });
+        assert!(active.selected_api_key_redactor().is_none());
+        let log_path = active
+            .established_log_path()
+            .expect("Lua 项目日志必须建立")
+            .to_path_buf();
+        active.handle().emit(ProjectLogEvent::lua_print(TEXT));
+        active.pending_succeeded().finish();
+
+        assert!(
+            fs::read_to_string(log_path)
+                .expect("Lua 日志应可读取")
+                .contains(TEXT)
+        );
+    }
+
     #[test]
     fn failed_run_id_reservation_is_also_reported_when_task_records_were_requested() {
         let temporary = tempfile::tempdir().expect("应建立测试目录");
@@ -926,6 +1298,7 @@ mod tests {
             project: "demo",
             command: ProjectLogCommand::Translate,
             performance: Arc::new(RunPerformanceCounters::default()),
+            selected_api_key_redactor: None,
         });
 
         assert!(active.run_id().is_none());
@@ -941,6 +1314,33 @@ mod tests {
             .expect("日志与任务记录故障必须进入最终警告");
         assert_eq!(warning.project_log.len(), 1);
         assert_eq!(warning.task_records.len(), 1);
+    }
+
+    #[test]
+    fn reserved_path_without_writer_runtime_is_not_a_run_log() {
+        let temporary = tempfile::tempdir().expect("应建立测试目录");
+        let warnings = Arc::new(ProjectLogWarningState::new(UiLocale::English, None));
+        let active = ActiveProjectLog {
+            run_id: Some("run-000001".to_owned()),
+            run_id_failure: None,
+            runtime: None,
+            handle: ProjectLogHandle {
+                logger: None,
+                warnings,
+            },
+            warning_presenter: None,
+            api_key_redaction: None,
+            performance: Arc::new(RunPerformanceCounters::default()),
+            log_path: Some(temporary.path().join("logs/run-000001.jsonl")),
+            engine: ProjectLogEngine::Generic,
+            command: ProjectLogCommand::Lua,
+            project_workspace: temporary.path().to_path_buf(),
+        };
+
+        assert!(active.established_log_path().is_none());
+        let pending = active.pending_succeeded();
+        assert!(pending.log_path().is_none());
+        assert!(pending.finish().is_none());
     }
 
     #[test]
@@ -1056,7 +1456,7 @@ mod tests {
     }
 
     #[test]
-    fn presenter_failure_is_known_before_successful_run_is_finished() {
+    fn presenter_failure_uses_successful_run_state_before_finish() {
         let temporary = tempfile::tempdir().expect("应建立测试目录");
         let active = active_lua_log(temporary.path(), "presenter-failure");
         let log_path = active.log_path.clone().expect("项目日志必须建立");
@@ -1068,6 +1468,14 @@ mod tests {
 
         pending.prepare_for_result_presentation();
         assert!(pending.active.warning_presenter.is_none());
+        let PendingRunFinished::Prepared { diagnostics, .. } = &pending.finished else {
+            panic!("成功结果的呈现错误必须建立待写终态");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].report().effect(),
+            StateEffect::AppliedFinalizationFailed
+        );
         pending.finish();
 
         let records = read_records(&log_path);
@@ -1082,6 +1490,51 @@ mod tests {
             records.last().expect("项目日志必须有终态")["payload"]["result"]["kind"],
             "failed"
         );
+    }
+
+    #[test]
+    fn presenter_failure_uses_cancelled_and_failed_run_states() {
+        let temporary = tempfile::tempdir().expect("应建立测试目录");
+
+        let cancelled = active_lua_log(temporary.path(), "cancelled-presenter-effect");
+        cancelled
+            .handle
+            .warnings
+            .record_presentation_failure(process_io_report(RuntimeOperation::WriteStderr));
+        let mut cancelled = cancelled.pending_cancelled();
+        cancelled.prepare_for_result_presentation();
+        let PendingRunFinished::Prepared { diagnostics, .. } = &cancelled.finished else {
+            panic!("取消结果的呈现错误必须建立待写终态");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].report().effect(),
+            StateEffect::ProgressPreserved
+        );
+        cancelled.finish();
+
+        let failed = active_lua_log(temporary.path(), "failed-presenter-effect");
+        failed
+            .handle
+            .warnings
+            .record_presentation_failure(process_io_report(RuntimeOperation::WriteStderr));
+        let mut failed = failed.pending_failure(DiagnosticReport::new(
+            StateEffect::Unchanged,
+            process_io_report(RuntimeOperation::ExecuteTask)
+                .primary()
+                .clone(),
+        ));
+        failed.prepare_for_result_presentation();
+        let PendingRunFinished::Prepared { diagnostics, .. } = &failed.finished else {
+            panic!("失败结果必须保留待写诊断");
+        };
+        assert_eq!(diagnostics.len(), 2);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.report().effect() == StateEffect::Unchanged)
+        );
+        failed.finish();
     }
 
     #[test]
@@ -1103,7 +1556,7 @@ mod tests {
         state.close_presenter();
 
         assert!(
-            state.warning(&health).is_none(),
+            state.warning(&health, StateEffect::Unchanged).is_none(),
             "已经交给即时 presenter 的同一故障不得在终态重复"
         );
     }
@@ -1120,7 +1573,7 @@ mod tests {
 
         state.present_health_snapshot(&health);
         let warning = state
-            .warning(&health)
+            .warning(&health, StateEffect::Unchanged)
             .expect("未呈现的 writer 故障必须进入终态");
         assert_eq!(warning.project_log.len(), 1);
     }
@@ -1159,7 +1612,8 @@ mod tests {
 
         let warning_state = Arc::clone(&state);
         let warning_health = health.clone();
-        let warning = thread::spawn(move || warning_state.warning(&warning_health));
+        let warning =
+            thread::spawn(move || warning_state.warning(&warning_health, StateEffect::Unchanged));
         drop(project_guard);
         presenter.join().expect("即时路径不得 panic");
         let warning = warning

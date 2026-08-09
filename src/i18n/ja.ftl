@@ -54,20 +54,13 @@ cli-argument-conflict = { $argument } は指定済みのほかの引数と同時
 cli-wrong-number-of-values = { $argument } に指定された値の数が正しくありません。
 cli-invalid-utf8 = コマンドライン引数が有効な Unicode ではありません。
 cli-parse-failure = コマンドラインを解析できませんでした。
-error-no-executable-extract-owner = 消去後に実行可能な Extract owner がないため、プランは保存されませんでした。
 plan-source-explicit = 明示入力
 plan-source-project-state = プロジェクト状態
 plan-source-product-default = 製品動作
 notice-init-reuse-path = 元パスが指定されなかったため、前回成功したパスを再利用します: { $path }。
 notice-extract-reuse-owners = 抽出範囲が指定されなかったため、前回成功したプランを再利用します: { $owners }。
 notice-translate-reuse-profile = Profile が指定されなかったため、前回成功した Profile を再利用します: { $profile }。
-notice-owner-disabled = owner { $owner } を無効にし、今後の自動プランから削除しました。
-warning-rules-command-non-string-skipped = 警告：Rules ルール { $rule_number } は文字列ではない command パラメーターを { $skipped_count } 件スキップしました（ソース { $source_file }、code={ $command_code }、parameter={ $parameter }、型 { $actual_type }）。
-warning-manual-layout-required = 警告：{ $locations } の改行を手動で確認してください（region={ $region }、max_fullwidth_chars={ $max_fullwidth_chars }）。
 notice-no-model-request = すべての翻訳単位が最新のため、今回はモデルへのリクエストを行いませんでした。
-notice-manual-layout = { $count } 単位で改行の手動確認が必要です。
-notice-log-degraded = プロジェクトログを利用できないか劣化しています。コマンドは継続し、終了状態には影響しません。
-notice-task-records-degraded = 翻訳タスク記録を利用できないか劣化しています。コマンドは継続し、終了状態には影響しません。
 progress-init-check-project = プロジェクト状態を確認しています
 progress-init-scan-source = ゲームソースを走査しています
 progress-init-build-candidate = プロジェクト候補を構築しています
@@ -83,7 +76,7 @@ progress-generic-init = Generic プロジェクトを初期化しています
 progress-generic-extract = Generic JSONL 入力を走査しています
 progress-translate-planning = 翻訳タスクを計画しています
 progress-translate-confirmed = 確認済みの翻訳タスク
-progress-translate-no-work = モデル呼び出しは不要です
+progress-no-work = 処理は不要です
 progress-project-lua = プロジェクト Lua プログラムを実行しています
 progress-write-back-read-assets = 承認済み資産を読み込んでいます
 progress-write-back-planning = 文書書き換えを計画しています
@@ -98,7 +91,14 @@ result-init-unchanged = プロジェクト状態: 変更なし
 result-init-updated = プロジェクト状態: 更新済み
 result-init-stale-owners = 再抽出が必要です: { $owners }
 result-extract-completed = 抽出完了: { $project }
-result-translate-completed = 翻訳完了: { $project }（Profile: { $profile }）
+result-translate-completed = 翻訳処理終了: { $project }（Profile: { $profile }）
+result-translate-status = 状態：{ $status }
+result-translate-status-value = { $status ->
+    [no_work] 処理不要
+    [complete] 完了
+    [incomplete] 未完了
+   *[other] __ATT_FALLBACK__
+}
 result-translate-summary = 翻訳: タスク { $total }、完全 { $complete }、部分 { $partial }、利用不可 { $unavailable }。{ $written } 箇所を書き込み、残り { $remaining } 箇所
 result-translate-convergence = 状態収束: 保持 { $retained }、無効化 { $invalidated }、非該当 { $not_applicable }、再利用 { $reused }
 result-write-back-completed = 書き戻し完了: { $project }
@@ -110,6 +110,11 @@ result-generic-extract-updated = Generic 入力を更新: { $files } ファイ�
 result-generic-translate-summary = Generic 翻訳: タスク { $total }、完全 { $complete }、部分 { $partial }、利用不可 { $unavailable }。クリア { $cleared }、再利用 { $reused }、受理 { $accepted }、書き込み { $written }、競合 { $conflicted }、応答問題 { $problems }
 result-generic-write-back-summary = Generic 書き戻し: 訳文 { $translated } 単位、原文保持 { $original } 単位
 result-symbol-repair-summary = 記号修復: { $attempted } 単位を確認、{ $repaired } 単位を修復、内部スキップ { $skipped } 単位、{ $replacements } 記号を置換
+result-run-log = 実行記録：{ $path }
+translate-incomplete-object = プロジェクト { $project } の今回の Translate
+translate-incomplete-rpg-maker-reason = 部分タスク { $partial }、利用不可タスク { $unavailable }、プロトコル問題 { $protocol }、要求枯渇 { $exhausted }。残りの判断 { $remaining_decisions }、残りの場所 { $remaining_locations }
+translate-incomplete-generic-reason = 部分タスク { $partial }、利用不可タスク { $unavailable }、書き込み競合 { $conflicted }、応答問題 { $problems }
+translate-incomplete-help = 今回の実行記録にあるタスク診断を確認し、再現する問題を修正して Translate を再実行してください。少量の残りには Manual を使用できます
 result-cancelled = 安全な終了処理後にコマンドをキャンセルしました。
 result-plan-saved = 成功した実行プランを保存しました。
 log-run-started = コマンド { $command } を開始しました。
@@ -157,7 +162,6 @@ log-publication-finished = { $result ->
     [outcome_unknown] 公開の最終状態は不明です。
    *[other] 公開が不明な結果で停止しました。
 }
-log-project-log-degraded = プロジェクトログで障害が発生し、{ $failure_kinds } 種類の障害を記録しました。
 log-task-outcome-value = { $outcome ->
     [complete] 完了
     [partial] 一部完了
@@ -167,14 +171,36 @@ log-task-outcome-value = { $outcome ->
     [cancelled] キャンセル
    *[other] 不明な結果で終了
 }
-diagnostic-location = 場所：{ $subject }
+diagnostic-object = 対象：{ $subject }
+diagnostic-error-heading = エラー：
+diagnostic-warning-heading = 警告：
 diagnostic-explanation = 原因：{ $reason }
+diagnostic-impact = 影響：{ $impact }
 diagnostic-resolution = 対処：{ $action }
-diagnostic-related = 関連エラー { $index }：
+diagnostic-related = { $relation ->
+    [cleanup] 同時にクリーンアップにも失敗しました：
+    [rollback] 同時にロールバックにも失敗しました：
+    [discard] 同時に候補の破棄にも失敗しました：
+    [finalization] 同時に終了処理にも失敗しました：
+    [shutdown] 同時にシャットダウンにも失敗しました：
+    [observability] 同時に結果の表示または記録にも失敗しました：
+   *[other] 同時に関連処理にも失敗しました：
+}
+diagnostic-impact-value = { $effect ->
+    [unchanged] 業務状態は変更されていません
+    [progress_preserved] 以前に確認された進捗は保持されています。示された内容は完了していません
+    [applied] 関連する業務結果はすでに反映されています
+    [applied_run_plan_not_saved] 業務結果は反映されましたが、今回の実行プランは保存されていません
+    [applied_finalization_failed] 業務結果は反映されましたが、必要な終了処理が完了していません
+    [recovery_required] 結果は確定していますが、示された復旧現場を先に処理する必要があります
+    [outcome_unknown] この操作が反映されたか確認できません。対処に従う前に再試行したり復旧物を削除したりしないでください
+   *[other] __ATT_FALLBACK__
+}
 diagnostic-resolution-value = { $code ->
     [fix_configuration] 指定された設定項目を修正して再試行してください
     [fix_input] 指定された入力を修正して再試行してください
     [fix_placeholder_rules] 指定された Placeholder ルールを修正して再試行してください
+    [review_disabled_rules] これが意図した結果なら対応は不要です。そうでなければ、指定されたファイルに有効なルールを追加して Extract を再実行してください
     [adjust_manual_layout] 指定された位置と表示幅に合わせて改行とレイアウトを手動で調整してください
     [check_path_and_permissions] パス、ファイルシステムの状態、権限を確認してください
     [check_project_state] プロジェクトの状態を確認・修正して再試行してください
@@ -192,6 +218,7 @@ diagnostic-failure-value = { $code ->
     [invalid_syntax] 値の構文が無効です
     [invalid_encoding] テキストのエンコーディングが無効です
     [invalid_value] 値が必要な契約に違反しています
+    [rules_owner_disabled] 選択した Rules ファイルは rule = [] を使用しています。Rules は無効化され、抽出済みアセットは削除されました
     [not_found] 必要な対象が存在しません
     [state_mismatch] 保存されたプロジェクト状態がこの操作の要件を満たしていません
     [unsupported_windows_code_page] Windows のコードページが UTF-8 ではありません
@@ -205,6 +232,10 @@ diagnostic-failure-value = { $code ->
     [concurrent_shutdown] 別の呼び出し元が実行器を終了しています
     [executor_state_poisoned] 実行器のライフサイクル状態が破損しています
     [worker_spawn_failed] オペレーティングシステムがワーカースレッドを作成できませんでした
+    [stdout_write_failed] 標準出力に書き込めませんでした
+    [stderr_write_failed] 標準エラー出力に書き込めませんでした
+    [stdout_flush_failed] 標準出力をフラッシュできませんでした
+    [stderr_flush_failed] 標準エラー出力をフラッシュできませんでした
     [worker_channel_closed] 確定処理の完了前にワーカーのコマンドチャネルが閉じました
     [worker_panicked] ワーカーが予期せず終了しました
     [reparse_point_forbidden] パスに信頼できない再解析ポイントが含まれています
@@ -299,7 +330,6 @@ diagnostic-placeholder-rule-project = 現在のプロジェクトの Placeholder
 manual-exported = { $entries } 件を { $path } にエクスポートしました
 manual-checked = 有効 { $valid }、未入力 { $unfilled }、エラー { $errors }
 manual-applied = 適用 { $applied }、未入力 { $unfilled }、エラー { $errors }
-manual-issue = { $object }：{ $reason }。{ $help }。
 manual-value = { $code ->
     [invalid_source_line] source の { $line } 番目に改行または NUL が含まれています
     [invalid_translation_line] translation の { $line } 番目に改行または NUL が含まれています

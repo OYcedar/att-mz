@@ -45,7 +45,7 @@ pub(crate) use lua_issue::{
 };
 pub(crate) use model::{
     Diagnostic, DiagnosticReport, DiagnosticResolution, RelatedFailureRelation, ReportedFailure,
-    StateEffect, render_diagnostic_fields, render_diagnostic_report,
+    StateEffect, render_diagnostic_fields, render_diagnostic_report, render_state_effect_impact,
 };
 pub(crate) use observability_issue::{
     ObservabilityComponent, ObservabilityContractViolation, ObservabilityEventCode,

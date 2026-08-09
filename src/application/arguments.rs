@@ -117,6 +117,7 @@ impl AttArguments {
 pub(crate) struct LocalizedCliError {
     kind: ErrorKind,
     output: String,
+    locale: crate::i18n::UiLocale,
 }
 
 impl LocalizedCliError {
@@ -136,6 +137,10 @@ impl LocalizedCliError {
         self.exit_code() != 0
     }
 
+    pub(crate) const fn locale(&self) -> crate::i18n::UiLocale {
+        self.locale
+    }
+
     pub(crate) fn output(&self) -> &str {
         &self.output
     }
@@ -150,6 +155,7 @@ impl LocalizedCliError {
             return Self {
                 kind,
                 output: error.to_string(),
+                locale: localizer.locale(),
             };
         }
 
@@ -181,7 +187,11 @@ impl LocalizedCliError {
         output.push('\n');
         output.push_str(&localizer.format(UiMessage::CliTryHelp));
         output.push('\n');
-        Self { kind, output }
+        Self {
+            kind,
+            output,
+            locale: localizer.locale(),
+        }
     }
 }
 

@@ -54,25 +54,13 @@ cli-argument-conflict = { $argument } нельзя использовать с �
 cli-wrong-number-of-values = Для { $argument } указано неверное количество значений.
 cli-invalid-utf8 = Аргумент командной строки не является допустимым Unicode.
 cli-parse-failure = Не удалось разобрать командную строку.
-error-no-executable-extract-owner = После очистки не осталось исполняемых owner Extract, поэтому план не сохранён.
 plan-source-explicit = явный ввод
 plan-source-project-state = состояние проекта
 plan-source-product-default = поведение продукта
 notice-init-reuse-path = Исходный путь не указан; используется последний успешный путь: { $path }.
 notice-extract-reuse-owners = Область извлечения не указана; используется последний успешный план: { $owners }.
 notice-translate-reuse-profile = Profile не указан; используется последний успешный Profile: { $profile }.
-notice-owner-disabled = Owner { $owner } отключён и удалён из будущих автоматических планов.
-warning-rules-command-non-string-skipped = Предупреждение: правило Rules { $rule_number } пропустило нестроковые параметры command: { $skipped_count } (источник { $source_file }, code={ $command_code }, parameter={ $parameter }, тип { $actual_type }).
-warning-manual-layout-required = Предупреждение: проверьте переносы строк вручную для { $locations } (region={ $region }, max_fullwidth_chars={ $max_fullwidth_chars }).
 notice-no-model-request = Все единицы перевода актуальны; в этом запуске запрос к модели не требовался.
-notice-manual-layout = { $count ->
-    [one] 1 единица требует ручной проверки переноса строк.
-    [few] { $count } единицы требуют ручной проверки переноса строк.
-    [many] { $count } единиц требуют ручной проверки переноса строк.
-   *[other] { $count } единицы требуют ручной проверки переноса строк.
-}
-notice-log-degraded = Журнал проекта недоступен или работает с ошибками; команда продолжится, а код выхода не изменится.
-notice-task-records-degraded = Записи задач перевода недоступны или создаются с ошибками; команда продолжится, а код выхода не изменится.
 progress-init-check-project = Проверка состояния проекта
 progress-init-scan-source = Сканирование исходников игры
 progress-init-build-candidate = Построение кандидата проекта
@@ -88,7 +76,7 @@ progress-generic-init = Инициализация проекта Generic
 progress-generic-extract = Сканирование входных данных Generic JSONL
 progress-translate-planning = Планирование задач перевода
 progress-translate-confirmed = Подтверждено задач перевода
-progress-translate-no-work = Запрос к модели не нужен
+progress-no-work = Обработка не требуется
 progress-project-lua = Выполнение программы Lua проекта
 progress-write-back-read-assets = Чтение принятых ресурсов
 progress-write-back-planning = Планирование перезаписи документов
@@ -103,7 +91,14 @@ result-init-unchanged = Состояние проекта: без изменен
 result-init-updated = Состояние проекта: обновлён
 result-init-stale-owners = Требуется повторное извлечение: { $owners }
 result-extract-completed = Извлечение завершено: { $project }
-result-translate-completed = Перевод завершён: { $project } (Profile: { $profile })
+result-translate-completed = Запуск перевода завершён: { $project } (Profile: { $profile })
+result-translate-status = Состояние: { $status }
+result-translate-status-value = { $status ->
+    [no_work] обработка не требуется
+    [complete] полностью
+    [incomplete] не полностью
+   *[other] __ATT_FALLBACK__
+}
 result-translate-summary = Перевод: { $total } задач; завершено { $complete }, частично { $partial }, недоступно { $unavailable }; записано { $written } позиций, осталось { $remaining }
 result-translate-convergence = Сведение состояния: сохранено { $retained }, аннулировано { $invalidated }, неприменимо { $not_applicable }, переиспользовано { $reused }
 result-write-back-completed = Запись завершена: { $project }
@@ -115,6 +110,11 @@ result-generic-extract-updated = Входные данные Generic обнов�
 result-generic-translate-summary = Перевод Generic: { $total } задач; завершено { $complete }, частично { $partial }, недоступно { $unavailable }; очищено { $cleared }, повторно использовано { $reused }, принято { $accepted }, записано { $written }, конфликтов { $conflicted }, проблем ответа { $problems }
 result-generic-write-back-summary = Запись Generic: { $translated } переведённых единиц, { $original } исходных сохранено
 result-symbol-repair-summary = Исправление символов: проверено { $attempted } единиц, исправлено { $repaired }, внутренне пропущено { $skipped }, заменено символов { $replacements }
+result-run-log = Журнал запуска: { $path }
+translate-incomplete-object = Запуск Translate для проекта { $project }
+translate-incomplete-rpg-maker-reason = Частичных задач: { $partial }, недоступных: { $unavailable }, проблем протокола: { $protocol }, исчерпанных запросов: { $exhausted }; осталось решений: { $remaining_decisions }, мест: { $remaining_locations }
+translate-incomplete-generic-reason = Частичных задач: { $partial }, недоступных: { $unavailable }, конфликтов записи: { $conflicted }, проблем ответа: { $problems }
+translate-incomplete-help = Изучите диагностику задач в журнале этого запуска, исправьте повторяемые проблемы и снова запустите Translate; для небольшого остатка используйте Manual
 result-cancelled = Команда отменена после безопасного завершения.
 result-plan-saved = Успешный план запуска сохранён.
 log-run-started = Команда { $command } запущена.
@@ -167,7 +167,6 @@ log-publication-finished = { $result ->
     [outcome_unknown] Итоговое состояние публикации неизвестно.
    *[other] Публикация остановилась без распознанного результата.
 }
-log-project-log-degraded = Журнал проекта работает с ошибками; зарегистрировано категорий сбоев: { $failure_kinds }.
 log-task-outcome-value = { $outcome ->
     [complete] завершена
     [partial] завершена частично
@@ -177,14 +176,36 @@ log-task-outcome-value = { $outcome ->
     [cancelled] отменена
    *[other] завершилась без распознанного результата
 }
-diagnostic-location = Место: { $subject }
+diagnostic-object = Объект: { $subject }
+diagnostic-error-heading = Ошибка:
+diagnostic-warning-heading = Предупреждение:
 diagnostic-explanation = Причина: { $reason }
+diagnostic-impact = Влияние: { $impact }
 diagnostic-resolution = Действие: { $action }
-diagnostic-related = Связанная ошибка { $index }:
+diagnostic-related = { $relation ->
+    [cleanup] Также не удалось выполнить очистку:
+    [rollback] Также не удалось выполнить откат:
+    [discard] Также не удалось удалить кандидат:
+    [finalization] Также не удалось завершить обязательные действия:
+    [shutdown] Также не удалось выполнить остановку:
+    [observability] Также не удалось показать или записать результат:
+   *[other] Также произошёл сбой связанной операции:
+}
+diagnostic-impact-value = { $effect ->
+    [unchanged] Рабочее состояние не изменено
+    [progress_preserved] Ранее подтверждённый прогресс сохранён; указанное содержимое не завершено
+    [applied] Связанный рабочий результат уже применён
+    [applied_run_plan_not_saved] Рабочий результат применён, но план этого запуска не сохранён
+    [applied_finalization_failed] Рабочий результат применён, но обязательное завершение не выполнено
+    [recovery_required] Результат известен, но сначала нужно обработать указанное место восстановления
+    [outcome_unknown] Нельзя подтвердить, применена ли операция; до выполнения указанного действия не повторяйте её и не удаляйте материалы восстановления
+   *[other] __ATT_FALLBACK__
+}
 diagnostic-resolution-value = { $code ->
     [fix_configuration] Исправьте указанный параметр конфигурации и повторите попытку
     [fix_input] Исправьте указанные входные данные и повторите попытку
     [fix_placeholder_rules] Исправьте указанное правило Placeholder и повторите попытку
+    [review_disabled_rules] Если это ожидаемый результат, ничего делать не нужно; иначе добавьте допустимые правила в указанный файл и снова запустите Extract
     [adjust_manual_layout] Вручную скорректируйте переносы строк и компоновку в указанных местах с учётом заданной ширины отображения
     [check_path_and_permissions] Проверьте путь, состояние файловой системы и разрешения
     [check_project_state] Проверьте и исправьте состояние проекта, затем повторите попытку
@@ -202,6 +223,7 @@ diagnostic-failure-value = { $code ->
     [invalid_syntax] Значение имеет недопустимый синтаксис
     [invalid_encoding] Недопустимая кодировка текста
     [invalid_value] Значение нарушает обязательный контракт
+    [rules_owner_disabled] Выбранный файл Rules содержит rule = []; Rules отключён, а извлечённые им ресурсы удалены
     [not_found] Требуемый объект не существует
     [state_mismatch] Сохранённое состояние проекта не соответствует этой операции
     [unsupported_windows_code_page] Кодовая страница Windows не UTF-8
@@ -215,6 +237,10 @@ diagnostic-failure-value = { $code ->
     [concurrent_shutdown] Другой вызывающий уже завершает исполнитель
     [executor_state_poisoned] Состояние жизненного цикла исполнителя повреждено
     [worker_spawn_failed] Операционная система не смогла создать рабочий поток
+    [stdout_write_failed] Не удалось записать в стандартный вывод
+    [stderr_write_failed] Не удалось записать в стандартный поток ошибок
+    [stdout_flush_failed] Не удалось сбросить стандартный вывод
+    [stderr_flush_failed] Не удалось сбросить стандартный поток ошибок
     [worker_channel_closed] Канал команд рабочего потока закрылся до завершения финализации
     [worker_panicked] Рабочий поток неожиданно завершился
     [reparse_point_forbidden] Путь содержит недоверенную точку повторного анализа
@@ -309,7 +335,6 @@ diagnostic-placeholder-rule-project = Правило Placeholder { $number } т�
 manual-exported = Экспортировано записей: { $entries }; файл: { $path }
 manual-checked = Допустимых: { $valid }, незаполненных: { $unfilled }, ошибок: { $errors }
 manual-applied = Применено: { $applied }, незаполненных: { $unfilled }, ошибок: { $errors }
-manual-issue = { $object }: { $reason }; { $help }.
 manual-value = { $code ->
     [invalid_source_line] элемент source { $line } содержит перевод строки или NUL
     [invalid_translation_line] элемент translation { $line } содержит перевод строки или NUL

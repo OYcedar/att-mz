@@ -54,27 +54,13 @@ cli-argument-conflict = لا يمكن استخدام { $argument } مع الوس
 cli-wrong-number-of-values = تم توفير عدد غير صحيح من القيم لـ { $argument }.
 cli-invalid-utf8 = أحد وسائط سطر الأوامر ليس Unicode صالحًا.
 cli-parse-failure = تعذر تحليل سطر الأوامر.
-error-no-executable-extract-owner = لم يبقَ بعد المسح أي owner Extract قابل للتنفيذ، لذلك لم تُحفظ الخطة.
 plan-source-explicit = إدخال صريح
 plan-source-project-state = حالة المشروع
 plan-source-product-default = سلوك المنتج
 notice-init-reuse-path = لم يُقدّم مسار مصدر؛ سيُعاد استخدام آخر مسار ناجح: { $path }.
 notice-extract-reuse-owners = لم يُقدّم نطاق استخراج؛ ستُعاد استخدام آخر خطة ناجحة: { $owners }.
 notice-translate-reuse-profile = لم يُقدّم Profile؛ سيُعاد استخدام آخر Profile ناجح: { $profile }.
-notice-owner-disabled = عُطّل owner { $owner } وأزيل من الخطط التلقائية اللاحقة.
-warning-rules-command-non-string-skipped = تحذير: تخطّت قاعدة Rules رقم { $rule_number } عدد { $skipped_count } من معاملات command غير النصية (المصدر { $source_file }، code={ $command_code }، parameter={ $parameter }، النوع { $actual_type }).
-warning-manual-layout-required = تحذير: يلزم فحص فواصل الأسطر يدويًا في { $locations } (region={ $region }، max_fullwidth_chars={ $max_fullwidth_chars }).
 notice-no-model-request = كل وحدات الترجمة حديثة؛ لم تحتج هذه الجولة إلى إرسال طلب للنموذج.
-notice-manual-layout = { $count ->
-    [zero] لا توجد وحدات تحتاج إلى مراجعة يدوية لفواصل الأسطر.
-    [one] تحتاج وحدة واحدة إلى مراجعة يدوية لفواصل الأسطر.
-    [two] تحتاج وحدتان إلى مراجعة يدوية لفواصل الأسطر.
-    [few] تحتاج { $count } وحدات إلى مراجعة يدوية لفواصل الأسطر.
-    [many] تحتاج { $count } وحدة إلى مراجعة يدوية لفواصل الأسطر.
-   *[other] تحتاج { $count } وحدة إلى مراجعة يدوية لفواصل الأسطر.
-}
-notice-log-degraded = سجل المشروع غير متاح أو متدهور؛ سيستمر الأمر ولن تتغير حالة الخروج.
-notice-task-records-degraded = سجلات مهام الترجمة غير متاحة أو متدهورة؛ سيستمر الأمر ولن تتغير حالة الخروج.
 progress-init-check-project = جارٍ فحص حالة المشروع
 progress-init-scan-source = جارٍ فحص مصدر اللعبة
 progress-init-build-candidate = جارٍ بناء مرشح المشروع
@@ -90,7 +76,7 @@ progress-generic-init = جارٍ تهيئة مشروع Generic
 progress-generic-extract = جارٍ فحص إدخال Generic JSONL
 progress-translate-planning = جارٍ تخطيط مهام الترجمة
 progress-translate-confirmed = مهام الترجمة المؤكدة
-progress-translate-no-work = لا حاجة إلى طلب النموذج
+progress-no-work = لا يوجد عمل مطلوب
 progress-project-lua = جارٍ تشغيل برنامج Lua للمشروع
 progress-write-back-read-assets = جارٍ قراءة الأصول المقبولة
 progress-write-back-planning = جارٍ تخطيط إعادة كتابة المستندات
@@ -105,7 +91,14 @@ result-init-unchanged = حالة المشروع: بلا تغيير
 result-init-updated = حالة المشروع: حُدّث
 result-init-stale-owners = يلزم إعادة الاستخراج: { $owners }
 result-extract-completed = اكتمل الاستخراج: { $project }
-result-translate-completed = اكتملت الترجمة: { $project } (Profile: { $profile })
+result-translate-completed = انتهى تشغيل الترجمة: { $project } (Profile: { $profile })
+result-translate-status = الحالة: { $status }
+result-translate-status-value = { $status ->
+    [no_work] لا يوجد عمل
+    [complete] مكتمل
+    [incomplete] غير مكتمل
+   *[other] __ATT_FALLBACK__
+}
 result-translate-summary = الترجمة: { $total } مهمة؛ مكتملة { $complete }، جزئية { $partial }، غير متاحة { $unavailable }؛ كُتب { $written } موضعًا وتبقى { $remaining }
 result-translate-convergence = تقارب الحالة: أُبقي { $retained }، أُبطل { $invalidated }، غير منطبق { $not_applicable }، أُعيد استخدام { $reused }
 result-write-back-completed = اكتملت الكتابة: { $project }
@@ -117,6 +110,11 @@ result-generic-extract-updated = حُدثت مدخلات Generic: ‏{ $files } 
 result-generic-translate-summary = ترجمة Generic: ‏{ $total } مهمة؛ مكتملة { $complete }، جزئية { $partial }، غير متاحة { $unavailable }؛ مُسحت { $cleared }، وأُعيد استخدام { $reused }، وقُبل { $accepted }، وكُتب { $written }، والتعارضات { $conflicted }، ومشكلات الاستجابة { $problems }
 result-generic-write-back-summary = كتابة Generic: ‏{ $translated } وحدة مترجمة مع الاحتفاظ بـ { $original } وحدة مصدر
 result-symbol-repair-summary = إصلاح الرموز: فُحصت { $attempted } وحدة، وأُصلحت { $repaired }، وتُخطيت داخليًا { $skipped }، واستُبدل { $replacements } رمزًا
+result-run-log = سجل التشغيل: { $path }
+translate-incomplete-object = تشغيل Translate للمشروع { $project }
+translate-incomplete-rpg-maker-reason = مهام جزئية: { $partial }، وغير متاحة: { $unavailable }، ومشكلات بروتوكول: { $protocol }، وطلبات مستنفدة: { $exhausted }؛ تبقى { $remaining_decisions } قرارات و{ $remaining_locations } مواضع
+translate-incomplete-generic-reason = مهام جزئية: { $partial }، وغير متاحة: { $unavailable }، وتعارضات كتابة: { $conflicted }، ومشكلات استجابة: { $problems }
+translate-incomplete-help = راجع تشخيصات المهام في سجل هذا التشغيل، وأصلح المشكلات القابلة للتكرار ثم شغّل Translate مجددًا؛ استخدم Manual للباقي القليل
 result-cancelled = أُلغي الأمر بعد إنهاء آمن.
 result-plan-saved = حُفظت خطة التشغيل الناجحة.
 log-run-started = بدأ الأمر { $command }.
@@ -171,7 +169,6 @@ log-publication-finished = { $result ->
     [outcome_unknown] الحالة النهائية للنشر غير معروفة.
    *[other] توقف النشر دون نتيجة معروفة.
 }
-log-project-log-degraded = تعرض سجل المشروع لأعطال؛ سُجلت { $failure_kinds } فئات من الأعطال.
 log-task-outcome-value = { $outcome ->
     [complete] مكتملة
     [partial] مكتملة جزئيًا
@@ -181,14 +178,36 @@ log-task-outcome-value = { $outcome ->
     [cancelled] ملغاة
    *[other] انتهت دون نتيجة معروفة
 }
-diagnostic-location = الموقع: { $subject }
+diagnostic-object = الكائن: { $subject }
+diagnostic-error-heading = خطأ:
+diagnostic-warning-heading = تحذير:
 diagnostic-explanation = السبب: { $reason }
+diagnostic-impact = الأثر: { $impact }
 diagnostic-resolution = الإجراء: { $action }
-diagnostic-related = الخطأ المرتبط { $index }:
+diagnostic-related = { $relation ->
+    [cleanup] فشل التنظيف أيضًا:
+    [rollback] فشل التراجع أيضًا:
+    [discard] فشل التخلص من المرشح أيضًا:
+    [finalization] فشل الإنهاء أيضًا:
+    [shutdown] فشل الإغلاق أيضًا:
+    [observability] فشل عرض النتيجة أو تسجيلها أيضًا:
+   *[other] فشلت عملية مرتبطة أيضًا:
+}
+diagnostic-impact-value = { $effect ->
+    [unchanged] لم تتغير حالة العمل
+    [progress_preserved] حُفظ التقدم المؤكد سابقًا؛ ولم يكتمل المحتوى المشار إليه
+    [applied] أصبحت نتيجة العمل المرتبطة نافذة
+    [applied_run_plan_not_saved] أصبحت نتيجة العمل نافذة، لكن خطة هذا التشغيل لم تُحفظ
+    [applied_finalization_failed] أصبحت نتيجة العمل نافذة، لكن الإنهاء المطلوب لم يكتمل
+    [recovery_required] النتيجة معروفة، لكن يجب معالجة موضع الاسترداد المشار إليه أولًا
+    [outcome_unknown] لا يمكن تأكيد ما إذا أصبحت العملية نافذة؛ لا تُعد المحاولة ولا تحذف عناصر الاسترداد قبل اتباع الإجراء
+   *[other] __ATT_FALLBACK__
+}
 diagnostic-resolution-value = { $code ->
     [fix_configuration] صحح حقل الإعدادات المحدد ثم أعد المحاولة
     [fix_input] صحح الإدخال المحدد ثم أعد المحاولة
     [fix_placeholder_rules] صحح قاعدة Placeholder المحددة ثم أعد المحاولة
+    [review_disabled_rules] إذا كانت هذه النتيجة متوقعة فلا يلزم إجراء؛ وإلا فأضف قواعد صالحة إلى الملف المشار إليه ثم شغّل Extract مجددًا
     [adjust_manual_layout] اضبط فواصل الأسطر والتخطيط يدويا في المواقع المحددة وفقا لعرض الشاشة المذكور
     [check_path_and_permissions] تحقق من المسار وحالة نظام الملفات والأذونات
     [check_project_state] افحص حالة المشروع وصححها ثم أعد المحاولة
@@ -206,6 +225,7 @@ diagnostic-failure-value = { $code ->
     [invalid_syntax] صياغة القيمة غير صالحة
     [invalid_encoding] ترميز النص غير صالح
     [invalid_value] القيمة تخالف العقد المطلوب
+    [rules_owner_disabled] يستخدم ملف Rules المحدد rule = []؛ عُطّل Rules وحُذفت أصوله المستخرجة
     [not_found] الكائن المطلوب غير موجود
     [state_mismatch] حالة المشروع المحفوظة لا تستوفي متطلبات هذه العملية
     [unsupported_windows_code_page] صفحة الرموز في Windows ليست UTF-8
@@ -219,6 +239,10 @@ diagnostic-failure-value = { $code ->
     [concurrent_shutdown] مستدعٍ آخر يغلق المنفّذ بالفعل
     [executor_state_poisoned] حالة دورة حياة المنفّذ تالفة
     [worker_spawn_failed] تعذر على نظام التشغيل إنشاء خيط العامل
+    [stdout_write_failed] تعذرت الكتابة إلى الإخراج القياسي
+    [stderr_write_failed] تعذرت الكتابة إلى الخطأ القياسي
+    [stdout_flush_failed] تعذر تفريغ الإخراج القياسي
+    [stderr_flush_failed] تعذر تفريغ الخطأ القياسي
     [worker_channel_closed] أُغلقت قناة أوامر العامل قبل اكتمال الإنهاء
     [worker_panicked] انتهى عامل على نحو غير متوقع
     [reparse_point_forbidden] يحتوي المسار على نقطة إعادة تحليل لا يمكن الوثوق بها
@@ -313,7 +337,6 @@ diagnostic-placeholder-rule-project = قاعدة Placeholder رقم { $number } 
 manual-exported = تم تصدير { $entries } إدخالات إلى { $path }
 manual-checked = صالح { $valid }، غير مملوء { $unfilled }، أخطاء { $errors }
 manual-applied = طُبّق { $applied }، غير مملوء { $unfilled }، أخطاء { $errors }
-manual-issue = { $object }: { $reason }؛ { $help }.
 manual-value = { $code ->
     [invalid_source_line] يحتوي عنصر source رقم { $line } على سطر جديد أو NUL
     [invalid_translation_line] يحتوي عنصر translation رقم { $line } على سطر جديد أو NUL

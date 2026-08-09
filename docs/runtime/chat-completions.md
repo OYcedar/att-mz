@@ -65,7 +65,7 @@ Fatal 包含请求构造失败、TLS/证书问题、其他 HTTP 状态，以及�
 经过闭集替换和单行清理的 `error.message`。完整错误正文不落盘。
 
 内部错误区分 DNS、连接、发送、读取、TLS、timeout、HTTP status、响应 JSON 和成功信封
-错误。进入 CLI、项目日志和任务记录前，只呈现 Endpoint 对象、直接原因和修改方法；必要
+错误。进入 CLI、项目日志和任务记录前，只呈现 Endpoint 对象、直接原因、状态影响和处理办法；必要
 时附 HTTP 状态、Retry-After、供应商 code/type 或 JSON 行列。Endpoint 只公开 scheme、host
 和可选 port，不记录 path、query、凭据或供应商请求 ID，也不从后端正文解析内部状态。
 
@@ -83,7 +83,7 @@ Thinking、Assistant、Provider 正文和普通用户内容都按普通内容处
 
 运行根的 Debug、CLI 和普通 JSONL 用稳定摘要说话：Client ID、阶段、Endpoint
 对象、HTTP 状态、超时种类，以及经过处理的标准供应商错误字段都可以出现；公开诊断只用
-对象、原因和修改方法呈现；
+对象、原因、影响和处理办法呈现；
 闭集值与完整请求、原始响应、Header 不出现。`error.message` 先精确替换当前 API key，
 再删除终端控制和双向控制字符并收敛为单行；没有可见内容时省略。这是运行根职责、
 稳定 schema、控制字符和输出体积的边界，与敏感性分类无关。

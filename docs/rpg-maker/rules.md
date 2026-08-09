@@ -53,6 +53,9 @@ rule = []
 原样保留，半成品永远不会盖上去。阶段级的先后提交语义见[提取规格](extraction.md)和
 [翻译规格](translation.md)。
 
+Extract Rules 的 `rule = []` 成功生效后，CLI 与项目日志使用同一份四字段诊断说明停用、
+资产删除和运行方案影响；它是退出码仍为 `0` 的成功警告，不是无效规则错误。
+
 ### 2.1 PCRE2 与三层转义
 
 三类规则的正则都使用 PCRE2，开启 UTF 与 UCP。写法上它和 JavaScript `RegExp` 不同：

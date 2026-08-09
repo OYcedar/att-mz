@@ -213,7 +213,7 @@ impl LogicalTextLocation {
         &self.role
     }
 
-    /// 返回可直接写入结构化诊断的稳定角色名称。
+    #[cfg(test)]
     pub(crate) fn role_name(&self) -> String {
         match &self.role {
             TextUnitRole::Scalar(field) => format!("scalar:{}", field.as_str()),

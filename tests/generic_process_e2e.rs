@@ -333,7 +333,7 @@ fn manual_export_check_and_apply_work_for_generic() {
 }
 
 #[test]
-fn generic_non_tty_progress_is_silent_and_jsonl_diagnostic_is_observable() {
+fn generic_non_tty_progress_uses_plain_lines_and_jsonl_diagnostic_is_observable() {
     let temporary = tempfile::tempdir().expect("应可建立 Generic 进程测试目录");
     let root = temporary.path();
     let input = root.join("input");
@@ -426,11 +426,23 @@ target_task_user_message_characters = 10000
         ],
     );
     assert_success("Generic Init", &init);
-    assert!(init.stderr.is_empty(), "非 TTY Init 不得输出实时进度");
+    assert_plain_progress_lines(
+        &init.stderr,
+        &[
+            "Initializing the Generic project",
+            "Finalizing required resources",
+        ],
+    );
 
     let extract = run_att(root, &["generic", "extract", "--name", PROJECT]);
     assert_success("Generic Extract", &extract);
-    assert!(extract.stderr.is_empty(), "非 TTY Extract 不得输出实时进度");
+    assert_plain_progress_lines(
+        &extract.stderr,
+        &[
+            "Scanning Generic JSONL input",
+            "Finalizing required resources",
+        ],
+    );
 
     let lua_script = root.join("noop.lua");
     fs::write(&lua_script, "return\n").expect("应可写入 Lua 脚本");
@@ -445,13 +457,23 @@ target_task_user_message_characters = 10000
         ],
     );
     assert_success("Generic Lua", &lua);
-    assert!(lua.stderr.is_empty(), "非 TTY Lua 不得输出实时进度");
+    assert_plain_progress_lines(
+        &lua.stderr,
+        &[
+            "Running the project Lua program",
+            "Finalizing required resources",
+        ],
+    );
 
     let write_back = run_att(root, &["generic", "write-back", "--name", PROJECT]);
     assert_success("Generic WriteBack", &write_back);
-    assert!(
-        write_back.stderr.is_empty(),
-        "非 TTY WriteBack 不得输出实时进度"
+    assert_plain_progress_lines(
+        &write_back.stderr,
+        &[
+            "Planning document rewrites",
+            "Publishing output",
+            "Finalizing required resources",
+        ],
     );
 
     let empty_input = root.join("empty-input");
@@ -484,9 +506,29 @@ target_task_user_message_characters = 10000
         &["generic", "translate", "--name", no_work_project, "local"],
     );
     assert_success("无请求 Generic Translate", &translate);
+    let translate_stderr = assert_plain_progress_lines(
+        &translate.stderr,
+        &[
+            "Planning translation tasks",
+            "Confirmed translation tasks: No work is needed",
+            "Finalizing required resources",
+        ],
+    );
     assert!(
-        translate.stderr.is_empty(),
-        "非 TTY Translate 不得输出实时进度"
+        !translate_stderr.contains("No model request is needed"),
+        "无需模型请求属于最终结果，不得作为进度阶段重复呈现：{translate_stderr}"
+    );
+    let translate_stdout =
+        String::from_utf8(translate.stdout).expect("Translate stdout 必须是 UTF-8");
+    assert!(
+        translate_stdout.contains(
+            "All translation units are current; no model request was needed in this run."
+        ),
+        "最终结果仍应说明没有发送模型请求：{translate_stdout}"
+    );
+    assert!(
+        !translate_stderr.contains("0/0") && !translate_stderr.contains("100%"),
+        "零工作量不得显示 0/0 或伪造 100%：{translate_stderr}"
     );
     assert!(
         !distribution
@@ -504,12 +546,41 @@ target_task_user_message_characters = 10000
     assert_success("任务记录降级 Generic Translate", &degraded_translate);
     let degraded_stderr =
         String::from_utf8(degraded_translate.stderr).expect("stderr 必须是 UTF-8");
+    assert_plain_progress_text(
+        &degraded_stderr,
+        &[
+            "Planning translation tasks",
+            "Confirmed translation tasks",
+            "Finalizing required resources",
+        ],
+    );
+    assert!(
+        degraded_stderr.contains("0% (0/1)") && degraded_stderr.contains("100% (1/1)"),
+        "非 TTY Translate 必须打印真实观测到的整数百分比：{degraded_stderr}"
+    );
+    for expected in [
+        "Warning:",
+        "task-records",
+        "Reason:",
+        "The required object does not exist",
+        "Impact:",
+        "Business state was not changed",
+        "Action:",
+        "Check the path, filesystem state, and permissions",
+    ] {
+        assert!(
+            degraded_stderr.contains(expected),
+            "Generic 任务记录四字段警告缺少 {expected:?}：{degraded_stderr}"
+        );
+    }
     assert_eq!(
-        degraded_stderr
-            .matches("Translation task records are unavailable or degraded")
-            .count(),
+        degraded_stderr.matches("task-records").count(),
         1,
-        "Generic 任务记录故障必须恰好警告一次：{degraded_stderr}"
+        "Generic 任务记录故障必须恰好呈现一次自然路径：{degraded_stderr}"
+    );
+    assert!(
+        !degraded_stderr.contains("Translation task records are unavailable or degraded"),
+        "Generic 任务记录故障不得保留旧的一行模糊文案：{degraded_stderr}"
     );
     let mut observed_same_run_log = false;
     for entry in fs::read_dir(workspace.join("logs")).expect("Generic 项目日志目录应存在")
@@ -530,6 +601,19 @@ target_task_user_message_characters = 10000
                 assert_eq!(record["run_id"], expected_run_id);
                 assert_eq!(record["context"]["command"], "translate");
                 assert_eq!(record["level"], "warn");
+                let payload = record["payload"]
+                    .as_object()
+                    .expect("Generic 任务记录诊断 payload 必须是对象");
+                assert_eq!(payload.len(), 5);
+                assert_eq!(payload["relation"], "primary");
+                for field in ["object", "reason", "impact", "help"] {
+                    assert!(
+                        payload[field]
+                            .as_str()
+                            .is_some_and(|value| !value.is_empty()),
+                        "Generic 任务记录诊断 {field} 必须是非空可读文本"
+                    );
+                }
                 observed_same_run_log = true;
             }
         }
@@ -540,11 +624,13 @@ target_task_user_message_characters = 10000
     );
 
     let output = run_att(root, &["generic", "extract", "--name", PROJECT]);
-    assert_success("静默 Generic Extract", &output);
-    assert!(
-        output.stderr.is_empty(),
-        "非 TTY 不得输出实时进度：{}",
-        String::from_utf8_lossy(&output.stderr)
+    assert_success("非 TTY Generic Extract", &output);
+    assert_plain_progress_lines(
+        &output.stderr,
+        &[
+            "Scanning Generic JSONL input",
+            "Finalizing required resources",
+        ],
     );
 
     let nested = input.join("nested");
@@ -669,10 +755,13 @@ fn generic_write_back_preserves_manual_symbols_for_english_and_japanese() {
         let logs_before = project_log_paths(&workspace.join("logs"));
         let write_back = run_att(root, &["generic", "write-back", "--name", project]);
         assert_success("Generic 符号修复 WriteBack", &write_back);
-        assert!(
-            write_back.stderr.is_empty(),
-            "非 TTY WriteBack 不得输出实时进度：{}",
-            String::from_utf8_lossy(&write_back.stderr)
+        assert_plain_progress_lines(
+            &write_back.stderr,
+            &[
+                "Planning document rewrites",
+                "Publishing output",
+                "Finalizing required resources",
+            ],
         );
         let stdout = String::from_utf8(write_back.stdout).expect("WriteBack stdout 必须是 UTF-8");
         let plain_stdout = stdout.replace(['\u{2068}', '\u{2069}'], "");
@@ -1036,9 +1125,10 @@ fn generic_missing_text_capture_reports_exact_leaf_without_model_request_or_stat
             .keys()
             .map(String::as_str)
             .collect::<BTreeSet<_>>(),
-        BTreeSet::from(["object", "reason", "help"])
+        BTreeSet::from(["relation", "object", "reason", "impact", "help"])
     );
-    for field in ["object", "reason", "help"] {
+    assert_eq!(diagnostic["relation"], "primary");
+    for field in ["object", "reason", "impact", "help"] {
         assert!(
             diagnostic[field]
                 .as_str()
@@ -1269,4 +1359,32 @@ fn assert_success(stage: &str, output: &Output) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn assert_plain_progress_lines(stderr: &[u8], expected: &[&str]) -> String {
+    let text = String::from_utf8(stderr.to_vec()).expect("进度 stderr 必须是 UTF-8");
+    assert_plain_progress_text(&text, expected);
+    text
+}
+
+fn assert_plain_progress_text(text: &str, expected: &[&str]) {
+    assert!(!text.is_empty(), "进度 stderr 不得为空");
+    assert!(text.ends_with('\n'), "每条进度必须以普通换行结束：{text:?}");
+    assert!(!text.contains('\r'), "进度不得使用回车覆盖：{text:?}");
+    assert!(
+        !text.contains('\u{1b}'),
+        "进度不得包含 ANSI 控制符：{text:?}"
+    );
+    for dynamic_marker in ["[|]", "[/]", "[-]", "[\\]", "[#"] {
+        assert!(
+            !text.contains(dynamic_marker),
+            "进度不得包含 spinner 或进度条标记 {dynamic_marker:?}：{text:?}"
+        );
+    }
+    for expected_text in expected {
+        assert!(
+            text.contains(expected_text),
+            "进度 stderr 缺少 {expected_text:?}：{text}"
+        );
+    }
 }

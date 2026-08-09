@@ -28,6 +28,7 @@ use crate::diagnostic::{
     SafePath, SafeText, StateEffect, render_diagnostic_fields,
 };
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
+use crate::llm::ApiKeyRedactionGate;
 use crate::observability::RunId;
 
 use super::performance::{RunPerformanceCounters, RunPerformanceSnapshot};
@@ -97,8 +98,6 @@ pub(crate) enum ProjectLogCode {
     TaskRecordDiagnostic,
     #[serde(rename = "diagnostic.project_log")]
     ProjectLogDiagnostic,
-    #[serde(rename = "observability.project_log_degraded")]
-    ProjectLogDegraded,
     #[serde(rename = "performance.counters")]
     PerformanceCounters,
     #[serde(rename = "run.finished")]
@@ -130,7 +129,6 @@ impl ProjectLogCode {
             Self::PublicationDiagnostic => "diagnostic.publication",
             Self::TaskRecordDiagnostic => "diagnostic.task_record",
             Self::ProjectLogDiagnostic => "diagnostic.project_log",
-            Self::ProjectLogDegraded => "observability.project_log_degraded",
             Self::PerformanceCounters => "performance.counters",
             Self::RunFinished => "run.finished",
         }
@@ -162,7 +160,6 @@ impl From<ProjectLogCode> for ObservabilityEventCode {
             ProjectLogCode::PublicationDiagnostic => Self::PublicationDiagnostic,
             ProjectLogCode::TaskRecordDiagnostic => Self::TaskRecordDiagnostic,
             ProjectLogCode::ProjectLogDiagnostic => Self::ProjectLogDiagnostic,
-            ProjectLogCode::ProjectLogDegraded => Self::ProjectLogDegraded,
             ProjectLogCode::PerformanceCounters => Self::PerformanceCounters,
             ProjectLogCode::RunFinished => Self::RunFinished,
         }
@@ -1088,6 +1085,7 @@ impl DiagnosticScope {
 pub(crate) struct DiagnosticOccurrence {
     id: DiagnosticOccurrenceId,
     scope: DiagnosticScope,
+    relation: Option<RelatedFailureRelation>,
     report: DiagnosticReport,
 }
 
@@ -1098,6 +1096,17 @@ impl DiagnosticOccurrence {
 
     pub(crate) const fn scope(&self) -> DiagnosticScope {
         self.scope
+    }
+
+    pub(crate) const fn relation(&self) -> &'static str {
+        match self.relation {
+            None => "primary",
+            Some(relation) => relation.as_str(),
+        }
+    }
+
+    const fn related_relation(&self) -> Option<RelatedFailureRelation> {
+        self.relation
     }
 
     pub(crate) fn report(&self) -> &DiagnosticReport {
@@ -1159,8 +1168,8 @@ pub(crate) enum ProjectLogEvent {
     Diagnostic {
         occurrence: DiagnosticOccurrence,
     },
-    ProjectLogDegraded {
-        health: ProjectLogHealthSnapshot,
+    ProjectLogFailureDiagnostic {
+        failure: ProjectLogFailureCount,
     },
     PerformanceCounters {
         snapshot: RunPerformanceSnapshot,
@@ -1212,7 +1221,7 @@ impl ProjectLogEvent {
             Self::PublicationFinished { .. } => ProjectLogCode::PublicationFinished,
             Self::LuaPrint { .. } => ProjectLogCode::LuaPrint,
             Self::Diagnostic { occurrence } => occurrence.scope().code(),
-            Self::ProjectLogDegraded { .. } => ProjectLogCode::ProjectLogDegraded,
+            Self::ProjectLogFailureDiagnostic { .. } => ProjectLogCode::ProjectLogDiagnostic,
             Self::PerformanceCounters { .. } => ProjectLogCode::PerformanceCounters,
             Self::RunFinished { .. } => ProjectLogCode::RunFinished,
         }
@@ -1263,7 +1272,7 @@ impl ProjectLogEvent {
                     | TranslationFinished::Incomplete { .. }
                     | TranslationFinished::Cancelled { .. },
             }
-            | Self::ProjectLogDegraded { .. } => ProjectLogLevel::Warn,
+            | Self::ProjectLogFailureDiagnostic { .. } => ProjectLogLevel::Warn,
             Self::PhaseStopped {
                 outcome: PhaseStopOutcome::Failed { .. },
                 ..
@@ -1304,7 +1313,7 @@ impl ProjectLogEvent {
             | Self::PublicationStarted { .. }
             | Self::PublicationFinished { .. }
             | Self::Diagnostic { .. }
-            | Self::ProjectLogDegraded { .. }
+            | Self::ProjectLogFailureDiagnostic { .. }
             | Self::PerformanceCounters { .. }
             | Self::RunFinished { .. } => ProjectLogDelivery::Required,
         }
@@ -1421,10 +1430,26 @@ impl ProjectLogEvent {
                 };
                 localizer.format(UiMessage::LogPublicationFinished { result })
             }
-            Self::ProjectLogDegraded { health } => {
-                let failure_kinds = u64::try_from(health.failures.len())
-                    .expect("受支持平台的 usize 必须可表示为 u64");
-                localizer.format(UiMessage::LogProjectLogDegraded { failure_kinds })
+            Self::ProjectLogFailureDiagnostic { failure } => {
+                let rendered = render_diagnostic_fields(&failure.diagnostic_report(), localizer);
+                [
+                    localizer.format(UiMessage::DiagnosticRelated {
+                        relation: RelatedFailureRelation::Observability.as_str(),
+                    }),
+                    localizer.format(UiMessage::DiagnosticObject {
+                        subject: &rendered.object,
+                    }),
+                    localizer.format(UiMessage::DiagnosticExplanation {
+                        reason: &rendered.reason,
+                    }),
+                    localizer.format(UiMessage::DiagnosticImpact {
+                        impact: &rendered.impact,
+                    }),
+                    localizer.format(UiMessage::DiagnosticResolution {
+                        action: &rendered.help,
+                    }),
+                ]
+                .join(" ")
             }
             Self::LuaPrint { message } => localizer.format(UiMessage::LogLuaPrint {
                 message: message.as_str(),
@@ -1438,7 +1463,30 @@ impl ProjectLogEvent {
             }
             Self::Diagnostic { occurrence } => {
                 let rendered = render_diagnostic_fields(occurrence.report(), localizer);
-                format!("{}: {} {}", rendered.object, rendered.reason, rendered.help)
+                let message = [
+                    localizer.format(UiMessage::DiagnosticObject {
+                        subject: &rendered.object,
+                    }),
+                    localizer.format(UiMessage::DiagnosticExplanation {
+                        reason: &rendered.reason,
+                    }),
+                    localizer.format(UiMessage::DiagnosticImpact {
+                        impact: &rendered.impact,
+                    }),
+                    localizer.format(UiMessage::DiagnosticResolution {
+                        action: &rendered.help,
+                    }),
+                ]
+                .join(" ");
+                match occurrence.related_relation() {
+                    None => message,
+                    Some(relation) => format!(
+                        "{} {message}",
+                        localizer.format(UiMessage::DiagnosticRelated {
+                            relation: relation.as_str(),
+                        })
+                    ),
+                }
             }
         }
     }
@@ -1596,10 +1644,6 @@ pub(crate) struct ProjectLogHealthSnapshot {
 }
 
 impl ProjectLogHealthSnapshot {
-    pub(crate) fn is_healthy(&self) -> bool {
-        self.failures.is_empty()
-    }
-
     #[cfg(test)]
     fn count(&self, key: &ProjectLogFailureKey) -> u64 {
         self.failures
@@ -1800,12 +1844,11 @@ enum ProjectLogPayloadRef<'a> {
         message: &'a SafeText,
     },
     Diagnostic {
+        relation: &'static str,
         object: SafeText,
         reason: SafeText,
+        impact: SafeText,
         help: SafeText,
-    },
-    ProjectLogDegraded {
-        issues: u64,
     },
     PerformanceCounters {
         snapshot: &'a RunPerformanceSnapshot,
@@ -1862,15 +1905,24 @@ impl<'a> ProjectLogPayloadRef<'a> {
                 let localizer = UiLocalizer::new(locale.ui_locale());
                 let rendered = render_diagnostic_fields(occurrence.report(), &localizer);
                 Self::Diagnostic {
+                    relation: occurrence.relation(),
                     object: SafeText::new(rendered.object),
                     reason: SafeText::new(rendered.reason),
+                    impact: SafeText::new(rendered.impact),
                     help: SafeText::new(rendered.help),
                 }
             }
-            ProjectLogEvent::ProjectLogDegraded { health } => Self::ProjectLogDegraded {
-                issues: u64::try_from(health.failures.len())
-                    .expect("受支持平台的 usize 必须可表示为 u64"),
-            },
+            ProjectLogEvent::ProjectLogFailureDiagnostic { failure } => {
+                let localizer = UiLocalizer::new(locale.ui_locale());
+                let rendered = render_diagnostic_fields(&failure.diagnostic_report(), &localizer);
+                Self::Diagnostic {
+                    relation: RelatedFailureRelation::Observability.as_str(),
+                    object: SafeText::new(rendered.object),
+                    reason: SafeText::new(rendered.reason),
+                    impact: SafeText::new(rendered.impact),
+                    help: SafeText::new(rendered.help),
+                }
+            }
             ProjectLogEvent::PerformanceCounters { snapshot } => {
                 Self::PerformanceCounters { snapshot }
             }
@@ -1914,6 +1966,96 @@ impl ProjectLogRecordEncoder for JsonProjectLogRecordEncoder {
         bytes.push(b'\n');
         Ok(bytes)
     }
+}
+
+struct RedactingProjectLogRecordEncoder {
+    gate: ApiKeyRedactionGate,
+}
+
+impl ProjectLogRecordEncoder for RedactingProjectLogRecordEncoder {
+    fn encode(&mut self, record: &ProjectLogRecord) -> Result<Vec<u8>, RecordEncodeError> {
+        let mut value = serde_json::to_value(record).map_err(|_| RecordEncodeError)?;
+        redact_project_log_dynamic_values(&mut value, &record.payload, &self.gate)?;
+        let mut bytes = serde_json::to_vec(&value).map_err(|_| RecordEncodeError)?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+}
+
+/// 固定判别值也是 JSON string value，不能做整行字面替换；这里只列出当前 typed record
+/// 中来自使用者、文件系统或诊断投影的字符串。事件新增动态字段时必须在同一 match 补上。
+fn redact_project_log_dynamic_values(
+    value: &mut serde_json::Value,
+    event: &ProjectLogEvent,
+    gate: &ApiKeyRedactionGate,
+) -> Result<(), RecordEncodeError> {
+    redact_project_log_string(value, &["context", "project"], gate)?;
+    redact_project_log_string(value, &["message"], gate)?;
+    match event {
+        ProjectLogEvent::RunPlanResolved { plan } => match plan {
+            ResolvedRunPlan::Init { .. } => {
+                redact_project_log_string(value, &["payload", "plan", "game_root"], gate)?;
+            }
+            ResolvedRunPlan::Extract { .. } => {}
+            ResolvedRunPlan::Translate {
+                terminology,
+                placeholders,
+                ..
+            } => {
+                redact_project_log_string(value, &["payload", "plan", "profile"], gate)?;
+                if terminology.is_some() {
+                    redact_project_log_string(value, &["payload", "plan", "terminology"], gate)?;
+                }
+                if placeholders.is_some() {
+                    redact_project_log_string(value, &["payload", "plan", "placeholders"], gate)?;
+                }
+            }
+        },
+        ProjectLogEvent::RunPlanFinalized { .. } => {
+            redact_project_log_string(value, &["payload", "database"], gate)?;
+        }
+        ProjectLogEvent::PublicationStarted { .. } => {
+            redact_project_log_string(value, &["payload", "output_root"], gate)?;
+        }
+        ProjectLogEvent::LuaPrint { .. } => {
+            redact_project_log_string(value, &["payload", "message"], gate)?;
+        }
+        ProjectLogEvent::Diagnostic { .. }
+        | ProjectLogEvent::ProjectLogFailureDiagnostic { .. } => {
+            for field in ["object", "reason", "impact", "help"] {
+                redact_project_log_string(value, &["payload", field], gate)?;
+            }
+        }
+        ProjectLogEvent::RunStarted
+        | ProjectLogEvent::CancellationRequested { .. }
+        | ProjectLogEvent::PhaseStarted { .. }
+        | ProjectLogEvent::PhaseCompleted { .. }
+        | ProjectLogEvent::PhaseStopped { .. }
+        | ProjectLogEvent::TaskStarted { .. }
+        | ProjectLogEvent::TaskFinished { .. }
+        | ProjectLogEvent::TranslationFinished { .. }
+        | ProjectLogEvent::RetrySummary { .. }
+        | ProjectLogEvent::PublicationFinished { .. }
+        | ProjectLogEvent::PerformanceCounters { .. }
+        | ProjectLogEvent::RunFinished { .. } => {}
+    }
+    Ok(())
+}
+
+fn redact_project_log_string(
+    value: &mut serde_json::Value,
+    path: &[&str],
+    gate: &ApiKeyRedactionGate,
+) -> Result<(), RecordEncodeError> {
+    let mut current = value;
+    for segment in path {
+        current = current.get_mut(*segment).ok_or(RecordEncodeError)?;
+    }
+    let serde_json::Value::String(text) = current else {
+        return Err(RecordEncodeError);
+    };
+    *text = gate.redact_after_selection(text);
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2126,7 +2268,7 @@ impl ProducerState {
         }
         match event {
             ProjectLogEvent::RunStarted
-            | ProjectLogEvent::ProjectLogDegraded { .. }
+            | ProjectLogEvent::ProjectLogFailureDiagnostic { .. }
             | ProjectLogEvent::PerformanceCounters { .. }
             | ProjectLogEvent::RunFinished { .. }
             | ProjectLogEvent::Diagnostic { .. } => {
@@ -2702,19 +2844,26 @@ impl PreparedTerminalDiagnostic {
     }
 }
 
-fn flatten_diagnostic_report(report: &DiagnosticReport) -> Vec<DiagnosticReport> {
-    fn visit(report: &DiagnosticReport, flattened: &mut Vec<DiagnosticReport>) {
-        flattened.push(DiagnosticReport::new(
-            report.effect(),
-            report.primary().clone(),
+fn flatten_diagnostic_report(
+    report: &DiagnosticReport,
+    root_relation: Option<RelatedFailureRelation>,
+) -> Vec<(Option<RelatedFailureRelation>, DiagnosticReport)> {
+    fn visit(
+        relation: Option<RelatedFailureRelation>,
+        report: &DiagnosticReport,
+        flattened: &mut Vec<(Option<RelatedFailureRelation>, DiagnosticReport)>,
+    ) {
+        flattened.push((
+            relation,
+            DiagnosticReport::new(report.effect(), report.primary().clone()),
         ));
         for related in report.related() {
-            visit(related.report(), flattened);
+            visit(Some(related.relation()), related.report(), flattened);
         }
     }
 
     let mut flattened = Vec::new();
-    visit(report, &mut flattened);
+    visit(root_relation, report, &mut flattened);
     flattened
 }
 
@@ -2835,14 +2984,19 @@ impl ProjectLogger {
         if state.finalized || state.terminal_preparing {
             return Err(EmitError::Closed);
         }
-        let reports = flatten_diagnostic_report(&report);
+        let reports = flatten_diagnostic_report(&report, None);
         let mut occurrences = Vec::with_capacity(reports.len());
-        for report in reports {
+        for (relation, report) in reports {
             let id = self
                 .inner
                 .allocate_occurrence()
                 .map_err(|_| EmitError::OccurrenceIdExhausted)?;
-            occurrences.push(DiagnosticOccurrence { id, scope, report });
+            occurrences.push(DiagnosticOccurrence {
+                id,
+                scope,
+                relation,
+                report,
+            });
         }
         let primary = occurrences.first().expect("诊断报告至少包含主问题").id();
         for occurrence in occurrences {
@@ -2873,20 +3027,26 @@ impl ProjectLogger {
     pub(crate) fn prepare_terminal_diagnostic(
         &self,
         scope: DiagnosticScope,
+        root_relation: Option<RelatedFailureRelation>,
         report: DiagnosticReport,
     ) -> Result<PreparedTerminalDiagnostic, PrepareTerminalDiagnosticError> {
         let mut state = lock_unpoisoned(&self.inner.state);
         if state.finalized {
             return Err(PrepareTerminalDiagnosticError::Closed);
         }
-        let reports = flatten_diagnostic_report(&report);
+        let reports = flatten_diagnostic_report(&report, root_relation);
         let mut occurrences = Vec::with_capacity(reports.len());
-        for report in reports {
+        for (relation, report) in reports {
             let id = self
                 .inner
                 .allocate_occurrence()
                 .map_err(|_| PrepareTerminalDiagnosticError::OccurrenceIdExhausted)?;
-            occurrences.push(DiagnosticOccurrence { id, scope, report });
+            occurrences.push(DiagnosticOccurrence {
+                id,
+                scope,
+                relation,
+                report,
+            });
         }
         // 只有成功取得 occurrence ID 后才封闭普通事件。否则 Drop 无法收尾时，
         // 仍可显式关闭 sender，不会因一个半完成状态永久等待 writer。
@@ -2990,6 +3150,7 @@ pub(crate) struct ProjectLogRuntime {
     logger: ProjectLogger,
     worker: Option<JoinHandle<()>>,
     performance: Arc<RunPerformanceCounters>,
+    api_key_redaction: Option<ApiKeyRedactionGate>,
     drop_report: Option<DiagnosticReport>,
     finished: bool,
 }
@@ -3001,11 +3162,20 @@ impl ProjectLogRuntime {
         context: ProjectLogContext,
         run_id: RunId,
         performance: Arc<RunPerformanceCounters>,
+        api_key_redaction: Option<ApiKeyRedactionGate>,
         drop_report: DiagnosticReport,
     ) -> Result<Self, ReportedFailure> {
         let safe_path = SafePath::new(path);
         let sink = FileProjectLogSink::from_reserved(path, file);
-        Self::start(context, run_id, sink, performance, drop_report).map_err(|source| {
+        Self::start_with_redaction(
+            context,
+            run_id,
+            sink,
+            performance,
+            api_key_redaction,
+            drop_report,
+        )
+        .map_err(|source| {
             let report = DiagnosticReport::new(
                 StateEffect::Unchanged,
                 Diagnostic::observability(ObservabilityIssue::worker_start(
@@ -3080,6 +3250,7 @@ impl ProjectLogRuntime {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn start<S: ProjectLogSink>(
         context: ProjectLogContext,
         run_id: RunId,
@@ -3087,13 +3258,32 @@ impl ProjectLogRuntime {
         performance: Arc<RunPerformanceCounters>,
         drop_report: DiagnosticReport,
     ) -> Result<Self, ProjectLogStartError> {
+        Self::start_with_redaction(context, run_id, sink, performance, None, drop_report)
+    }
+
+    fn start_with_redaction<S: ProjectLogSink>(
+        context: ProjectLogContext,
+        run_id: RunId,
+        sink: S,
+        performance: Arc<RunPerformanceCounters>,
+        api_key_redaction: Option<ApiKeyRedactionGate>,
+        drop_report: DiagnosticReport,
+    ) -> Result<Self, ProjectLogStartError> {
+        let encoder: Box<dyn ProjectLogRecordEncoder> = api_key_redaction.as_ref().map_or_else(
+            || Box::new(JsonProjectLogRecordEncoder) as Box<dyn ProjectLogRecordEncoder>,
+            |gate| {
+                Box::new(RedactingProjectLogRecordEncoder { gate: gate.clone() })
+                    as Box<dyn ProjectLogRecordEncoder>
+            },
+        );
         Self::start_with_components(
             context,
             run_id,
             Box::new(sink),
-            Box::new(JsonProjectLogRecordEncoder),
+            encoder,
             Arc::new(SystemProjectLogClock),
             performance,
+            api_key_redaction,
             drop_report,
         )
     }
@@ -3105,6 +3295,7 @@ impl ProjectLogRuntime {
         encoder: Box<dyn ProjectLogRecordEncoder>,
         clock: Arc<dyn ProjectLogClock>,
         performance: Arc<RunPerformanceCounters>,
+        api_key_redaction: Option<ApiKeyRedactionGate>,
         drop_report: DiagnosticReport,
     ) -> Result<Self, ProjectLogStartError> {
         let (sender, receiver) = async_channel::unbounded();
@@ -3173,6 +3364,7 @@ impl ProjectLogRuntime {
             logger,
             worker: Some(worker),
             performance,
+            api_key_redaction,
             drop_report: Some(drop_report),
             finished: false,
         })
@@ -3193,6 +3385,7 @@ impl ProjectLogRuntime {
         result: RunFinished,
         terminal_diagnostics: Vec<PreparedTerminalDiagnostic>,
     ) -> Result<ProjectLogShutdown, FinishError> {
+        self.finish_redaction_selection();
         match self.finalize(result, terminal_diagnostics, false) {
             Ok(()) => {
                 self.finished = true;
@@ -3309,6 +3502,12 @@ impl ProjectLogRuntime {
             sender.close();
         }
     }
+
+    fn finish_redaction_selection(&self) {
+        if let Some(gate) = &self.api_key_redaction {
+            gate.finish_without_selection();
+        }
+    }
 }
 
 impl Drop for ProjectLogRuntime {
@@ -3316,10 +3515,11 @@ impl Drop for ProjectLogRuntime {
         if self.finished {
             return;
         }
+        self.finish_redaction_selection();
         if let Some(report) = self.drop_report.take()
-            && let Ok(prepared) = self
-                .logger
-                .prepare_terminal_diagnostic(DiagnosticScope::Run, report)
+            && let Ok(prepared) =
+                self.logger
+                    .prepare_terminal_diagnostic(DiagnosticScope::Run, None, report)
         {
             let result = RunFinished::OutcomeUnknown {
                 diagnostic: prepared.id(),
@@ -3570,11 +3770,14 @@ fn persist_terminal_event(
 
 fn record_unpersisted_finalize(request: FinalizeRequest, health: &ProjectLogHealth) {
     // writer 已经不可用时，这些原本由收尾序列生成的 Required 事件都必须留下
-    // NotPersisted 计数。WorkerPanicked 已在调用方先记录，因此 degraded 也属于
-    // 已无法持久化的终态证据。
-    health.record(ProjectLogFailureKey::NotPersisted {
-        code: ProjectLogCode::ProjectLogDegraded,
-    });
+    // NotPersisted 计数。每个既有故障键原本各产生一条 diagnostic.project_log；
+    // 快照必须先固定，避免把这里新增的 NotPersisted 本身递归计入。
+    let project_log_diagnostics = health.snapshot().failures.len();
+    for _ in 0..project_log_diagnostics {
+        health.record(ProjectLogFailureKey::NotPersisted {
+            code: ProjectLogCode::ProjectLogDiagnostic,
+        });
+    }
     health.record(ProjectLogFailureKey::NotPersisted {
         code: ProjectLogCode::PerformanceCounters,
     });
@@ -3597,10 +3800,14 @@ fn write_terminal_sequence(
 ) -> bool {
     // 生产者已关闭且 FIFO 已排空到 Finalize，此时健康快照包含全部普通事件故障。
     let degraded = health.snapshot();
-    let mut events = Vec::with_capacity(request.terminal_diagnostics.len() + 3);
-    if !degraded.is_healthy() {
-        events.push(ProjectLogEvent::ProjectLogDegraded { health: degraded });
-    }
+    let mut events =
+        Vec::with_capacity(degraded.failures.len() + request.terminal_diagnostics.len() + 2);
+    events.extend(
+        degraded
+            .failures
+            .into_iter()
+            .map(|failure| ProjectLogEvent::ProjectLogFailureDiagnostic { failure }),
+    );
     events.push(ProjectLogEvent::PerformanceCounters {
         snapshot: request.performance,
     });
@@ -3725,6 +3932,7 @@ mod tests {
             encoder,
             Arc::new(FixedClock),
             Arc::new(RunPerformanceCounters::default()),
+            None,
             diagnostic_report(StateEffect::OutcomeUnknown),
         )
         .expect("测试 runtime 必须启动")
@@ -3739,10 +3947,17 @@ mod tests {
             Box::new(JsonProjectLogRecordEncoder),
         );
         let logger = runtime.logger();
-        let report = diagnostic_report(StateEffect::Unchanged).with_related(
+        let mut report = diagnostic_report(StateEffect::Unchanged);
+        for relation in [
             RelatedFailureRelation::Cleanup,
-            diagnostic_report(StateEffect::Unchanged),
-        );
+            RelatedFailureRelation::Rollback,
+            RelatedFailureRelation::Discard,
+            RelatedFailureRelation::Finalization,
+            RelatedFailureRelation::Shutdown,
+            RelatedFailureRelation::Observability,
+        ] {
+            report = report.with_related(relation, diagnostic_report(StateEffect::Unchanged));
+        }
         let primary = logger
             .record_diagnostic(DiagnosticScope::Run, report)
             .expect("报告树中的全部诊断都应连续入队");
@@ -3762,8 +3977,49 @@ mod tests {
             .enumerate()
             .filter_map(|(index, record)| (record["event"] == "diagnostic.run").then_some(index))
             .collect::<Vec<_>>();
-        assert_eq!(diagnostic_positions.len(), 2);
-        assert_eq!(diagnostic_positions[1], diagnostic_positions[0] + 1);
+        assert_eq!(diagnostic_positions.len(), 7);
+        for positions in diagnostic_positions.windows(2) {
+            assert_eq!(positions[1], positions[0] + 1);
+        }
+        assert_eq!(
+            diagnostic_positions
+                .iter()
+                .map(|index| records[*index]["payload"]["relation"]
+                    .as_str()
+                    .expect("诊断 relation 必须是字符串"))
+                .collect::<Vec<_>>(),
+            [
+                "primary",
+                "cleanup",
+                "rollback",
+                "discard",
+                "finalization",
+                "shutdown",
+                "observability",
+            ]
+        );
+        let localizer = UiLocalizer::new(UiLocale::English);
+        for (index, relation) in [
+            RelatedFailureRelation::Cleanup,
+            RelatedFailureRelation::Rollback,
+            RelatedFailureRelation::Discard,
+            RelatedFailureRelation::Finalization,
+            RelatedFailureRelation::Shutdown,
+            RelatedFailureRelation::Observability,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let expected_heading = localizer.format(UiMessage::DiagnosticRelated {
+                relation: relation.as_str(),
+            });
+            assert!(
+                records[diagnostic_positions[index + 1]]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.starts_with(&expected_heading)),
+                "相关诊断 message 必须保留关系标题"
+            );
+        }
     }
 
     #[test]
@@ -3780,7 +4036,7 @@ mod tests {
         );
         let prepared = runtime
             .logger()
-            .prepare_terminal_diagnostic(DiagnosticScope::Run, report)
+            .prepare_terminal_diagnostic(DiagnosticScope::Run, None, report)
             .expect("报告树中的全部终端诊断都应取得 ID");
         let primary = prepared.id();
 
@@ -3850,6 +4106,7 @@ mod tests {
         let occurrence = DiagnosticOccurrence {
             id: DiagnosticOccurrenceId::new(1).expect("非零 ID"),
             scope: DiagnosticScope::RunPlan,
+            relation: None,
             report: diagnostic_report(StateEffect::Unchanged),
         };
         let context = context(ProjectLogCommand::Translate);
@@ -3870,9 +4127,10 @@ mod tests {
             .expect("诊断 payload 必须是对象");
         assert_eq!(
             payload.keys().map(String::as_str).collect::<Vec<_>>(),
-            ["object", "reason", "help"]
+            ["relation", "object", "reason", "impact", "help"]
         );
-        for field in ["object", "reason", "help"] {
+        assert_eq!(payload["relation"], "primary");
+        for field in ["object", "reason", "impact", "help"] {
             assert!(
                 payload[field]
                     .as_str()
@@ -3884,7 +4142,6 @@ mod tests {
         for forbidden in [
             "occurrence",
             "report",
-            "effect",
             "stage",
             "issue",
             "resolution",
@@ -3892,6 +4149,22 @@ mod tests {
             "actual_fingerprint",
         ] {
             assert!(!serialized.contains(forbidden));
+        }
+        assert!(!payload.contains_key("effect"));
+        let expected =
+            render_diagnostic_fields(&diagnostic_report(StateEffect::Unchanged), &localizer);
+        let message = value["message"]
+            .as_str()
+            .expect("诊断 message 必须是字符串");
+        let message = message.replace(['\u{2068}', '\u{2069}'], "");
+        for field in [
+            expected.object,
+            expected.reason,
+            expected.impact,
+            expected.help,
+        ] {
+            let field = field.replace(['\u{2068}', '\u{2069}'], "");
+            assert!(message.contains(&field), "诊断 message 与四字段必须同源");
         }
     }
 
@@ -3942,6 +4215,7 @@ mod tests {
         let occurrence = DiagnosticOccurrence {
             id: diagnostic,
             scope: DiagnosticScope::RunPlan,
+            relation: None,
             report: diagnostic_report(StateEffect::Unchanged),
         };
         assert_eq!(
@@ -4213,12 +4487,10 @@ mod tests {
                 ProjectLogEvent::PublicationFinished {
                     result: PublicationFinished::NotPublished { diagnostic },
                 },
-                ProjectLogEvent::ProjectLogDegraded {
-                    health: ProjectLogHealthSnapshot {
-                        failures: vec![ProjectLogFailureCount {
-                            failure: ProjectLogFailureKey::WorkerPanicked,
-                            count: ObservabilityFailureCount::exact(1),
-                        }],
+                ProjectLogEvent::ProjectLogFailureDiagnostic {
+                    failure: ProjectLogFailureCount {
+                        failure: ProjectLogFailureKey::WorkerPanicked,
+                        count: ObservabilityFailureCount::exact(1),
                     },
                 },
                 ProjectLogEvent::RunFinished {
@@ -4758,10 +5030,61 @@ mod tests {
             1
         );
         let records = bytes.records();
+        let project_log_diagnostics = records
+            .iter()
+            .filter(|record| record["event"] == "diagnostic.project_log")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            project_log_diagnostics.len(),
+            shutdown.health.failures.len(),
+            "每个不同的项目日志故障键必须各写一条诊断"
+        );
+        let diagnostic = project_log_diagnostics
+            .first()
+            .expect("序列化故障必须写成项目日志诊断");
+        assert_eq!(diagnostic["level"], "warn");
+        assert_eq!(diagnostic["payload"]["relation"], "observability");
+        assert_eq!(
+            diagnostic["payload"]
+                .as_object()
+                .expect("诊断 payload 必须是对象")
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            ["help", "impact", "object", "reason", "relation"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+        for field in ["object", "reason", "impact", "help"] {
+            assert!(
+                diagnostic["payload"][field]
+                    .as_str()
+                    .is_some_and(|value| !value.trim().is_empty()),
+                "项目日志诊断的 {field} 必须是非空文本"
+            );
+        }
+        assert_eq!(
+            project_log_diagnostics
+                .iter()
+                .map(|record| (
+                    record["payload"]["object"]
+                        .as_str()
+                        .expect("对象必须是文本"),
+                    record["payload"]["reason"]
+                        .as_str()
+                        .expect("原因必须是文本"),
+                ))
+                .collect::<BTreeSet<_>>()
+                .len(),
+            project_log_diagnostics.len(),
+            "同一项目日志故障不得重复写入"
+        );
         assert!(
             records
                 .iter()
-                .any(|record| record["event"] == "observability.project_log_degraded")
+                .all(|record| record["event"] != "observability.project_log_degraded"),
+            "不得保留只有 issues 数量的旧降级摘要"
         );
         assert_eq!(records.last().expect("必须有终态")["event"], "run.finished");
     }
@@ -4979,6 +5302,7 @@ mod tests {
             .logger()
             .prepare_terminal_diagnostic(
                 DiagnosticScope::Run,
+                None,
                 diagnostic_report(StateEffect::OutcomeUnknown),
             )
             .expect("必须能预备终端诊断");
@@ -5041,6 +5365,7 @@ mod tests {
             Box::new(JsonProjectLogRecordEncoder),
             Arc::new(FixedClock),
             Arc::new(RunPerformanceCounters::default()),
+            None,
             command_panic_drop_report(),
         )
         .expect("测试 runtime 必须启动");
@@ -5065,13 +5390,16 @@ mod tests {
             .iter()
             .find(|record| record["event"] == "diagnostic.run")
             .expect("finish 合同错误必须成为终态诊断");
-        let expected = render_diagnostic_fields(
-            &FinishError::ActivePhase.diagnostic_report(),
-            &UiLocalizer::new(UiLocale::English),
-        );
+        let expected_report = FinishError::ActivePhase
+            .diagnostic_report()
+            .with_effect(StateEffect::OutcomeUnknown);
+        let expected =
+            render_diagnostic_fields(&expected_report, &UiLocalizer::new(UiLocale::English));
         assert_eq!(diagnostic["payload"]["object"], expected.object);
         assert_eq!(diagnostic["payload"]["reason"], expected.reason);
+        assert_eq!(diagnostic["payload"]["impact"], expected.impact);
         assert_eq!(diagnostic["payload"]["help"], expected.help);
+        assert_eq!(diagnostic["payload"]["relation"], "primary");
         let serialized = serde_json::to_string(&records).expect("日志必须可序列化");
         assert!(!serialized.contains("runtime.command_panicked"));
     }

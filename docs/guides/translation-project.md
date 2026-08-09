@@ -50,8 +50,8 @@ Model、parameters 或凭据，覆盖游戏原件，写入外部系统，或执�
 1. **Builtin**：逐项核对 Extract 规格的精确覆盖矩阵。
 2. **Extract Rules**：Builtin 未覆盖时，继续核对 Rules 是否能从已知来源建立确定、
    可逆的读取与写回。
-3. **Generic**：只有前两者不能完整表达实际来源或关系时，才把该部分交给外部转换和
-   独立 Generic 项目。
+3. **Generic**：默认不建立。只有某个具体来源同时满足本节后述的运行时可见性、Rules
+   表达边界、外部往返和唯一所有权条件时，才把该来源交给外部转换和独立 Generic 项目。
 
 Extract Rules 当前能够处理的来源类别包括：
 
@@ -81,6 +81,19 @@ Rules 不能猜测可见性，也不能表达动态对象键枚举、条件筛�
 写入多个目标、插件 JavaScript 源码内任意静态字面量或规格未定义的路径行为。只有实际
 需求落在这些边界外，或无法形成确定且可逆的读取与写回时，才使用 Generic。最终判断以
 Rules 规格的完整字段、路径、冲突和失败条件为准。
+
+Generic 的启用单位是一个已经确认的具体来源，不是文件扩展名、目录或整类插件。该来源
+必须同时具备以下事实：
+
+- 位于游戏目录且不是图片文字，有精确自然位置；
+- 当前游戏实际加载对应消费者，并有证据证明游玩过程中会向玩家显示；
+- Builtin 没有覆盖，Rules 也无法完整、确定、可逆地读取和写回；
+- 外部转换已经确定提取、Group/Unit、稳定 ID、译后写回和来源变化处理；
+- 与 MV/MZ 和其他 Generic 项目没有重复所有权。
+
+只看到文件、源码引用、插件复杂度或疑似界面字符串，都不能作为启用依据。缺少任一事实时
+保持 Generic 关闭，并把来源记为明确排除或尚待调查；尚待调查的来源存在时不能宣称文本
+范围已经完整。一个来源通过时也只纳入该来源，不递归翻译整个 `.txt`、`.js` 或游戏目录。
 
 事件 command 也要按实际结构判断：Rules 可以处理单条 command 的指定参数与其中的确定
 捕获，但不会把相邻 `355/655` 或多条 command 合成一个 JavaScript 脚本块。需要跨命令理解
@@ -144,7 +157,10 @@ Init 失败、取消或项目数据库无效时，不进入 Extract。MV/MZ 目�
 
 ### MV/MZ Extract
 
-按位置清单选择 Builtin、MV dialogue rules 和 Extract Rules。执行后完整核对：
+按位置清单选择 Builtin、MV dialogue rules 和 Extract Rules。MV 必须先调查实际姓名框协议，
+并提供有效 dialogue rules 或明确的 `rule = []`；MZ 使用原生 Speaker，不制作 MV 姓名规则。
+Extract Rules 也必须在调查后提供有效规则或明确的 `rule = []`，不能以未传文件代替已经确认
+没有规则。执行后完整核对：
 
 - 每个声明来源由正确 owner 提取；
 - Group、Unit、上下文、自然顺序和写回 recipe 符合实际关系；
@@ -175,6 +191,11 @@ Init 失败、取消或项目数据库无效时，不进入 Extract。MV/MZ 目�
 - [Prompt 与模型协议](../translation/prompts.md)；
 - [模型任务记录](../translation/task-records.md)；
 - [配置](../runtime/configuration.md)与 [Chat Completions](../runtime/chat-completions.md)。
+
+最终 Extract 完成后、首次 Translate 前，先用 Manual export 取得本轮完整待译原文。调查
+控制符并提供有效 Placeholder 文件或明确的 `rule = []`；再从同一份稳定原文制作术语表，
+术语允许为空。姓名投影或 Extract Rules 改变后，旧 Manual 语料和据此生成的 Placeholder、
+术语候选全部失效，必须重新导出。
 
 术语内容的发现、筛选与定译和 ATT 术语文件接入是两件事。先确定实际术语要求，再按 ATT
 规格建立输入。修改共享 Prompt、Client 或配置前，先确认全部实际使用者与用户给出的新值。

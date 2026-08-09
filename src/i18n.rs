@@ -492,17 +492,25 @@ pub(crate) enum UiMessage<'a> {
     },
     CliInvalidUtf8,
     CliParseFailure,
-    DiagnosticLocation {
+    DiagnosticObject {
         subject: &'a str,
     },
+    DiagnosticErrorHeading,
+    DiagnosticWarningHeading,
     DiagnosticExplanation {
         reason: &'a str,
+    },
+    DiagnosticImpact {
+        impact: &'a str,
     },
     DiagnosticResolution {
         action: &'a str,
     },
     DiagnosticRelated {
-        index: u64,
+        relation: &'a str,
+    },
+    DiagnosticImpactValue {
+        effect: &'a str,
     },
     DiagnosticResolutionValue {
         code: &'a str,
@@ -557,18 +565,12 @@ pub(crate) enum UiMessage<'a> {
         unfilled: u64,
         errors: u64,
     },
-    ManualIssue {
-        object: &'a str,
-        reason: &'a str,
-        help: &'a str,
-    },
     ManualValue {
         code: &'a str,
         line: u64,
         expected: u64,
         actual: u64,
     },
-    ErrorNoExecutableExtractOwner,
     PlanSourceExplicit,
     PlanSourceProjectState,
     PlanSourceProductDefault,
@@ -581,28 +583,7 @@ pub(crate) enum UiMessage<'a> {
     NoticeTranslateReuseProfile {
         profile: &'a str,
     },
-    NoticeOwnerDisabled {
-        owner: &'a str,
-    },
-    WarningRulesCommandNonStringSkipped {
-        rule_number: u64,
-        source_file: &'a str,
-        command_code: &'a str,
-        parameter: u64,
-        actual_type: &'a str,
-        skipped_count: u64,
-    },
-    WarningManualLayoutRequired {
-        locations: &'a str,
-        region: &'a str,
-        max_fullwidth_chars: u64,
-    },
     NoticeNoModelRequest,
-    NoticeManualLayout {
-        count: u64,
-    },
-    NoticeLogDegraded,
-    NoticeTaskRecordsDegraded,
     ProgressInitCheckProject,
     ProgressInitScanSource,
     ProgressInitBuildCandidate,
@@ -620,7 +601,7 @@ pub(crate) enum UiMessage<'a> {
     ProgressGenericExtract,
     ProgressTranslatePlanning,
     ProgressTranslateConfirmed,
-    ProgressTranslateNoWork,
+    ProgressNoWork,
     ProgressProjectLua,
     ProgressWriteBackReadAssets,
     ProgressWriteBackPlanning,
@@ -656,6 +637,12 @@ pub(crate) enum UiMessage<'a> {
     ResultTranslateCompleted {
         project: &'a str,
         profile: &'a str,
+    },
+    ResultTranslateStatus {
+        status: &'a str,
+    },
+    ResultTranslateStatusValue {
+        status: &'a str,
     },
     ResultTranslateSummary {
         total: u64,
@@ -710,6 +697,27 @@ pub(crate) enum UiMessage<'a> {
         skipped: u64,
         replacements: u64,
     },
+    ResultRunLog {
+        path: &'a str,
+    },
+    TranslateIncompleteObject {
+        project: &'a str,
+    },
+    TranslateIncompleteRpgMakerReason {
+        partial: u64,
+        unavailable: u64,
+        protocol: u64,
+        exhausted: u64,
+        remaining_decisions: u64,
+        remaining_locations: u64,
+    },
+    TranslateIncompleteGenericReason {
+        partial: u64,
+        unavailable: u64,
+        conflicted: u64,
+        problems: u64,
+    },
+    TranslateIncompleteHelp,
     ResultCancelled,
     ResultPlanSaved,
     LogRunStarted {
@@ -770,9 +778,6 @@ pub(crate) enum UiMessage<'a> {
     },
     LogPublicationFinished {
         result: &'a str,
-    },
-    LogProjectLogDegraded {
-        failure_kinds: u64,
     },
     LogRetrySummary {
         count: u64,
@@ -864,10 +869,14 @@ impl UiMessage<'_> {
             Self::CliWrongNumberOfValues { .. } => "cli-wrong-number-of-values",
             Self::CliInvalidUtf8 => "cli-invalid-utf8",
             Self::CliParseFailure => "cli-parse-failure",
-            Self::DiagnosticLocation { .. } => "diagnostic-location",
+            Self::DiagnosticObject { .. } => "diagnostic-object",
+            Self::DiagnosticErrorHeading => "diagnostic-error-heading",
+            Self::DiagnosticWarningHeading => "diagnostic-warning-heading",
             Self::DiagnosticExplanation { .. } => "diagnostic-explanation",
+            Self::DiagnosticImpact { .. } => "diagnostic-impact",
             Self::DiagnosticResolution { .. } => "diagnostic-resolution",
             Self::DiagnosticRelated { .. } => "diagnostic-related",
+            Self::DiagnosticImpactValue { .. } => "diagnostic-impact-value",
             Self::DiagnosticResolutionValue { .. } => "diagnostic-resolution-value",
             Self::DiagnosticFailureValue { .. } => "diagnostic-failure-value",
             Self::DiagnosticConfigurationRuleValue { .. } => "diagnostic-configuration-rule-value",
@@ -882,24 +891,14 @@ impl UiMessage<'_> {
             Self::ManualExported { .. } => "manual-exported",
             Self::ManualChecked { .. } => "manual-checked",
             Self::ManualApplied { .. } => "manual-applied",
-            Self::ManualIssue { .. } => "manual-issue",
             Self::ManualValue { .. } => "manual-value",
-            Self::ErrorNoExecutableExtractOwner => "error-no-executable-extract-owner",
             Self::PlanSourceExplicit => "plan-source-explicit",
             Self::PlanSourceProjectState => "plan-source-project-state",
             Self::PlanSourceProductDefault => "plan-source-product-default",
             Self::NoticeInitReusePath { .. } => "notice-init-reuse-path",
             Self::NoticeExtractReuseOwners { .. } => "notice-extract-reuse-owners",
             Self::NoticeTranslateReuseProfile { .. } => "notice-translate-reuse-profile",
-            Self::NoticeOwnerDisabled { .. } => "notice-owner-disabled",
-            Self::WarningRulesCommandNonStringSkipped { .. } => {
-                "warning-rules-command-non-string-skipped"
-            }
-            Self::WarningManualLayoutRequired { .. } => "warning-manual-layout-required",
             Self::NoticeNoModelRequest => "notice-no-model-request",
-            Self::NoticeManualLayout { .. } => "notice-manual-layout",
-            Self::NoticeLogDegraded => "notice-log-degraded",
-            Self::NoticeTaskRecordsDegraded => "notice-task-records-degraded",
             Self::ProgressInitCheckProject => "progress-init-check-project",
             Self::ProgressInitScanSource => "progress-init-scan-source",
             Self::ProgressInitBuildCandidate => "progress-init-build-candidate",
@@ -915,7 +914,7 @@ impl UiMessage<'_> {
             Self::ProgressGenericExtract => "progress-generic-extract",
             Self::ProgressTranslatePlanning => "progress-translate-planning",
             Self::ProgressTranslateConfirmed => "progress-translate-confirmed",
-            Self::ProgressTranslateNoWork => "progress-translate-no-work",
+            Self::ProgressNoWork => "progress-no-work",
             Self::ProgressProjectLua => "progress-project-lua",
             Self::ProgressWriteBackReadAssets => "progress-write-back-read-assets",
             Self::ProgressWriteBackPlanning => "progress-write-back-planning",
@@ -933,6 +932,8 @@ impl UiMessage<'_> {
             Self::ResultGenericExtractUnchanged { .. } => "result-generic-extract-unchanged",
             Self::ResultGenericExtractUpdated { .. } => "result-generic-extract-updated",
             Self::ResultTranslateCompleted { .. } => "result-translate-completed",
+            Self::ResultTranslateStatus { .. } => "result-translate-status",
+            Self::ResultTranslateStatusValue { .. } => "result-translate-status-value",
             Self::ResultTranslateSummary { .. } => "result-translate-summary",
             Self::ResultTranslateConvergence { .. } => "result-translate-convergence",
             Self::ResultGenericTranslateSummary { .. } => "result-generic-translate-summary",
@@ -942,6 +943,13 @@ impl UiMessage<'_> {
             Self::ResultWriteBackSummary { .. } => "result-write-back-summary",
             Self::ResultGenericWriteBackSummary { .. } => "result-generic-write-back-summary",
             Self::ResultSymbolRepairSummary { .. } => "result-symbol-repair-summary",
+            Self::ResultRunLog { .. } => "result-run-log",
+            Self::TranslateIncompleteObject { .. } => "translate-incomplete-object",
+            Self::TranslateIncompleteRpgMakerReason { .. } => {
+                "translate-incomplete-rpg-maker-reason"
+            }
+            Self::TranslateIncompleteGenericReason { .. } => "translate-incomplete-generic-reason",
+            Self::TranslateIncompleteHelp => "translate-incomplete-help",
             Self::ResultCancelled => "result-cancelled",
             Self::ResultPlanSaved => "result-plan-saved",
             Self::LogRunStarted { .. } => "log-run-started",
@@ -964,7 +972,6 @@ impl UiMessage<'_> {
             Self::LogTranslationFinished { .. } => "log-translation-finished",
             Self::LogPublicationStarted { .. } => "log-publication-started",
             Self::LogPublicationFinished { .. } => "log-publication-finished",
-            Self::LogProjectLogDegraded { .. } => "log-project-log-degraded",
             Self::LogRetrySummary { .. } => "log-retry-summary",
             Self::LogTranslationTaskStarted { .. } => "log-translation-task-started",
             Self::LogTranslationTaskFinished { .. } => "log-translation-task-finished",
@@ -1007,32 +1014,7 @@ impl UiMessage<'_> {
             Self::NoticeExtractReuseOwners { owners } | Self::ResultInitStaleOwners { owners } => {
                 set_text(&mut arguments, "owners", owners);
             }
-            Self::NoticeOwnerDisabled { owner } => set_text(&mut arguments, "owner", owner),
-            Self::WarningRulesCommandNonStringSkipped {
-                rule_number,
-                source_file,
-                command_code,
-                parameter,
-                actual_type,
-                skipped_count,
-            } => {
-                set_number(&mut arguments, "rule_number", rule_number);
-                set_text(&mut arguments, "source_file", source_file);
-                set_text(&mut arguments, "command_code", command_code);
-                set_number(&mut arguments, "parameter", parameter);
-                set_text(&mut arguments, "actual_type", actual_type);
-                set_number(&mut arguments, "skipped_count", skipped_count);
-            }
-            Self::WarningManualLayoutRequired {
-                locations,
-                region,
-                max_fullwidth_chars,
-            } => {
-                set_text(&mut arguments, "locations", locations);
-                set_text(&mut arguments, "region", region);
-                set_number(&mut arguments, "max_fullwidth_chars", max_fullwidth_chars);
-            }
-            Self::NoticeManualLayout { count } | Self::LogRetrySummary { count } => {
+            Self::LogRetrySummary { count } => {
                 set_number(&mut arguments, "count", count);
             }
             Self::ProgressExtractOwner { owner } => {
@@ -1206,9 +1188,6 @@ impl UiMessage<'_> {
                 set_text(&mut arguments, "result", result);
             }
             Self::LogPublicationStarted { path } => set_text(&mut arguments, "path", path),
-            Self::LogProjectLogDegraded { failure_kinds } => {
-                set_number(&mut arguments, "failure_kinds", failure_kinds);
-            }
             Self::LogTranslationTaskStarted { index, total } => {
                 set_number(&mut arguments, "index", index);
                 set_number(&mut arguments, "total", total);
@@ -1231,10 +1210,16 @@ impl UiMessage<'_> {
                 set_number(&mut arguments, "accepted", accepted);
             }
             Self::TaskRecordTaskDiagnostic => {}
-            Self::DiagnosticLocation { subject } => set_text(&mut arguments, "subject", subject),
+            Self::DiagnosticObject { subject } => set_text(&mut arguments, "subject", subject),
             Self::DiagnosticExplanation { reason } => set_text(&mut arguments, "reason", reason),
+            Self::DiagnosticImpact { impact } => set_text(&mut arguments, "impact", impact),
             Self::DiagnosticResolution { action } => set_text(&mut arguments, "action", action),
-            Self::DiagnosticRelated { index } => set_number(&mut arguments, "index", index),
+            Self::DiagnosticRelated { relation } => {
+                set_text(&mut arguments, "relation", relation);
+            }
+            Self::DiagnosticImpactValue { effect } => {
+                set_text(&mut arguments, "effect", effect);
+            }
             Self::DiagnosticResolutionValue { code } | Self::DiagnosticFailureValue { code } => {
                 set_text(&mut arguments, "code", code);
             }
@@ -1295,15 +1280,6 @@ impl UiMessage<'_> {
                 set_number(&mut arguments, "unfilled", unfilled);
                 set_number(&mut arguments, "errors", errors);
             }
-            Self::ManualIssue {
-                object,
-                reason,
-                help,
-            } => {
-                set_text(&mut arguments, "object", object);
-                set_text(&mut arguments, "reason", reason);
-                set_text(&mut arguments, "help", help);
-            }
             Self::ManualValue {
                 code,
                 line,
@@ -1314,6 +1290,40 @@ impl UiMessage<'_> {
                 set_number(&mut arguments, "line", line);
                 set_number(&mut arguments, "expected", expected);
                 set_number(&mut arguments, "actual", actual);
+            }
+            Self::ResultTranslateStatus { status }
+            | Self::ResultTranslateStatusValue { status } => {
+                set_text(&mut arguments, "status", status);
+            }
+            Self::ResultRunLog { path } => set_text(&mut arguments, "path", path),
+            Self::TranslateIncompleteObject { project } => {
+                set_text(&mut arguments, "project", project);
+            }
+            Self::TranslateIncompleteRpgMakerReason {
+                partial,
+                unavailable,
+                protocol,
+                exhausted,
+                remaining_decisions,
+                remaining_locations,
+            } => {
+                set_number(&mut arguments, "partial", partial);
+                set_number(&mut arguments, "unavailable", unavailable);
+                set_number(&mut arguments, "protocol", protocol);
+                set_number(&mut arguments, "exhausted", exhausted);
+                set_number(&mut arguments, "remaining_decisions", remaining_decisions);
+                set_number(&mut arguments, "remaining_locations", remaining_locations);
+            }
+            Self::TranslateIncompleteGenericReason {
+                partial,
+                unavailable,
+                conflicted,
+                problems,
+            } => {
+                set_number(&mut arguments, "partial", partial);
+                set_number(&mut arguments, "unavailable", unavailable);
+                set_number(&mut arguments, "conflicted", conflicted);
+                set_number(&mut arguments, "problems", problems);
             }
             Self::AppAbout
             | Self::CliUiLanguageHelp
@@ -1361,13 +1371,12 @@ impl UiMessage<'_> {
             | Self::CliMissingSubcommand
             | Self::CliInvalidUtf8
             | Self::CliParseFailure
-            | Self::ErrorNoExecutableExtractOwner
+            | Self::DiagnosticErrorHeading
+            | Self::DiagnosticWarningHeading
             | Self::PlanSourceExplicit
             | Self::PlanSourceProjectState
             | Self::PlanSourceProductDefault
             | Self::NoticeNoModelRequest
-            | Self::NoticeLogDegraded
-            | Self::NoticeTaskRecordsDegraded
             | Self::ProgressInitCheckProject
             | Self::ProgressInitScanSource
             | Self::ProgressInitBuildCandidate
@@ -1382,7 +1391,7 @@ impl UiMessage<'_> {
             | Self::ProgressGenericExtract
             | Self::ProgressTranslatePlanning
             | Self::ProgressTranslateConfirmed
-            | Self::ProgressTranslateNoWork
+            | Self::ProgressNoWork
             | Self::ProgressProjectLua
             | Self::ProgressWriteBackReadAssets
             | Self::ProgressWriteBackPlanning
@@ -1396,6 +1405,7 @@ impl UiMessage<'_> {
             | Self::ResultInitUpdated
             | Self::ResultCancelled
             | Self::ResultPlanSaved
+            | Self::TranslateIncompleteHelp
             | Self::TaskRecordTitle
             | Self::TaskRecordFinalResultHeading => {}
         }
@@ -1423,7 +1433,6 @@ fn set_number(arguments: &mut FluentArgs<'static>, name: &'static str, value: u6
 
 /// 使用嵌入式 Fluent catalog 格式化用户可见消息。
 pub(crate) struct UiLocalizer {
-    #[cfg(test)]
     locale: UiLocale,
     selected: FluentBundle<FluentResource>,
     english_fallback: FluentBundle<FluentResource>,
@@ -1432,14 +1441,12 @@ pub(crate) struct UiLocalizer {
 impl UiLocalizer {
     pub(crate) fn new(locale: UiLocale) -> Self {
         Self {
-            #[cfg(test)]
             locale,
             selected: build_bundle(locale),
             english_fallback: build_bundle(UiLocale::English),
         }
     }
 
-    #[cfg(test)]
     pub(crate) const fn locale(&self) -> UiLocale {
         self.locale
     }
@@ -1631,6 +1638,7 @@ mod tests {
             "resource_limit_exceeded",
             "response_parsing_failed",
             "rollback_failed",
+            "rules_owner_disabled",
             "rules_invalid_capture_range",
             "rules_missing_text_capture",
             "rules_overlapping_capture",
@@ -1638,6 +1646,10 @@ mod tests {
             "rules_zero_width_match",
             "source_snapshot_mismatch",
             "state_mismatch",
+            "stderr_flush_failed",
+            "stderr_write_failed",
+            "stdout_flush_failed",
+            "stdout_write_failed",
             "target_already_exists",
             "transaction_outcome_unknown",
             "transaction_rolled_back",
@@ -1673,6 +1685,7 @@ mod tests {
                 "fix_configuration",
                 "fix_input",
                 "fix_placeholder_rules",
+                "review_disabled_rules",
                 "adjust_manual_layout",
                 "check_path_and_permissions",
                 "check_project_state",
@@ -1884,16 +1897,26 @@ mod tests {
             UiMessage::CliWrongNumberOfValues { argument: "--path" },
             UiMessage::CliInvalidUtf8,
             UiMessage::CliParseFailure,
-            UiMessage::DiagnosticLocation {
+            UiMessage::DiagnosticObject {
                 subject: "project demo",
             },
+            UiMessage::DiagnosticErrorHeading,
+            UiMessage::DiagnosticWarningHeading,
             UiMessage::DiagnosticExplanation {
                 reason: "state mismatch",
+            },
+            UiMessage::DiagnosticImpact {
+                impact: "state unchanged",
             },
             UiMessage::DiagnosticResolution {
                 action: "check project state",
             },
-            UiMessage::DiagnosticRelated { index: 1 },
+            UiMessage::DiagnosticRelated {
+                relation: "cleanup",
+            },
+            UiMessage::DiagnosticImpactValue {
+                effect: "unchanged",
+            },
             UiMessage::DiagnosticResolutionValue { code: "retry" },
             UiMessage::DiagnosticFailureValue { code: "not_found" },
             UiMessage::DiagnosticConfigurationRuleValue {
@@ -1930,42 +1953,19 @@ mod tests {
                 unfilled: 2,
                 errors: 3,
             },
-            UiMessage::ManualIssue {
-                object: "Skills.json:1:name",
-                reason: "invalid value",
-                help: "fix input",
-            },
             UiMessage::ManualValue {
                 code: "fixed_length",
                 line: 1,
                 expected: 2,
                 actual: 1,
             },
-            UiMessage::ErrorNoExecutableExtractOwner,
             UiMessage::PlanSourceExplicit,
             UiMessage::PlanSourceProjectState,
             UiMessage::PlanSourceProductDefault,
             UiMessage::NoticeInitReusePath { path: "path" },
             UiMessage::NoticeExtractReuseOwners { owners: "owners" },
             UiMessage::NoticeTranslateReuseProfile { profile: "profile" },
-            UiMessage::NoticeOwnerDisabled { owner: "owner" },
-            UiMessage::WarningRulesCommandNonStringSkipped {
-                rule_number: 3,
-                source_file: "Map001.json",
-                command_code: "355",
-                parameter: 0,
-                actual_type: "number",
-                skipped_count: 2,
-            },
-            UiMessage::WarningManualLayoutRequired {
-                locations: "Map001.json.events[1] (dialogue_body)",
-                region: "dialogue_body",
-                max_fullwidth_chars: 24,
-            },
             UiMessage::NoticeNoModelRequest,
-            UiMessage::NoticeManualLayout { count: 3 },
-            UiMessage::NoticeLogDegraded,
-            UiMessage::NoticeTaskRecordsDegraded,
             UiMessage::ProgressInitCheckProject,
             UiMessage::ProgressInitScanSource,
             UiMessage::ProgressInitBuildCandidate,
@@ -1981,7 +1981,7 @@ mod tests {
             UiMessage::ProgressGenericExtract,
             UiMessage::ProgressTranslatePlanning,
             UiMessage::ProgressTranslateConfirmed,
-            UiMessage::ProgressTranslateNoWork,
+            UiMessage::ProgressNoWork,
             UiMessage::ProgressProjectLua,
             UiMessage::ProgressWriteBackReadAssets,
             UiMessage::ProgressWriteBackPlanning,
@@ -2012,6 +2012,8 @@ mod tests {
                 project: "demo",
                 profile: "main",
             },
+            UiMessage::ResultTranslateStatus { status: "complete" },
+            UiMessage::ResultTranslateStatusValue { status: "complete" },
             UiMessage::ResultTranslateSummary {
                 total: 1,
                 complete: 1,
@@ -2038,6 +2040,25 @@ mod tests {
                 conflicted: 9,
                 problems: 10,
             },
+            UiMessage::ResultRunLog {
+                path: "logs/run-000001.jsonl",
+            },
+            UiMessage::TranslateIncompleteObject { project: "demo" },
+            UiMessage::TranslateIncompleteRpgMakerReason {
+                partial: 1,
+                unavailable: 2,
+                protocol: 3,
+                exhausted: 4,
+                remaining_decisions: 5,
+                remaining_locations: 6,
+            },
+            UiMessage::TranslateIncompleteGenericReason {
+                partial: 1,
+                unavailable: 2,
+                conflicted: 3,
+                problems: 4,
+            },
+            UiMessage::TranslateIncompleteHelp,
             UiMessage::ResultWriteBackCompleted { project: "demo" },
             UiMessage::ResultProjectLuaCompleted { project: "demo" },
             UiMessage::ResultOutputDirectory { path: "output" },
@@ -2094,7 +2115,6 @@ mod tests {
             UiMessage::LogPublicationFinished {
                 result: "published",
             },
-            UiMessage::LogProjectLogDegraded { failure_kinds: 2 },
             UiMessage::LogRetrySummary { count: 3 },
             UiMessage::LogTranslationTaskStarted { index: 1, total: 3 },
             UiMessage::LogTranslationTaskFinished {

@@ -103,7 +103,9 @@ NotCommittedAfterEarlierFailure 或 Cancelled。Partial、Unavailable 与 Failed
 每次命令恰好写一条 `translation.finished`：
 NotStarted、NoWork、Complete、Incomplete、Failed 或 Cancelled。含 Partial 或 Unavailable
 任务但业务结果明确时，Translate 结果是 Incomplete，退出码仍为 `0`；项目是否全部译完以
-该事件和数据库当前状态为准。
+该事件和数据库当前状态为准。CLI 明确显示 `状态：未完整`，并在 stderr 汇总 Partial、
+Unavailable、写入冲突和响应问题；逐任务详情保留在本次项目日志与任务记录。NoWork 和
+Complete 分别显示 `无需处理` 与 `完整`。
 
 `translation.finished` 固定保存 planned、started、complete、partial、unavailable、failed、
 cancelled 与 not_started Task 计数，并保存 Generic 专用的 cleared/reused/accepted/written/

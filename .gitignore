@@ -7,3 +7,8 @@
 写给自己和维护者看的哲学思想.md
 /dist/
 /.workbuddy/
+/.venv/
+/.pytest_cache/
+/.ruff_cache/
+**/__pycache__/
+*.py[cod]

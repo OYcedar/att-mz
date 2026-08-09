@@ -54,20 +54,13 @@ cli-argument-conflict = { $argument } 不能与当前其他参数同时使用。
 cli-wrong-number-of-values = { $argument } 的值数量不正确。
 cli-invalid-utf8 = 命令行参数不是有效 Unicode。
 cli-parse-failure = 无法解析命令行。
-error-no-executable-extract-owner = 清除后没有可执行的 Extract owner，因此未保存方案。
 plan-source-explicit = 显式输入
 plan-source-project-state = 项目状态
 plan-source-product-default = 产品行为
 notice-init-reuse-path = 未提供来源路径，已沿用上次成功路径：{ $path }。
 notice-extract-reuse-owners = 未提供提取范围，已沿用上次成功方案：{ $owners }。
 notice-translate-reuse-profile = 未提供 Profile，已沿用上次成功 Profile：{ $profile }。
-notice-owner-disabled = 已停用 owner { $owner }，并将其移出后续自动方案。
-warning-rules-command-non-string-skipped = 警告：Rules 规则 { $rule_number } 跳过了 { $skipped_count } 个非字符串 command 参数（来源 { $source_file }，code={ $command_code }，parameter={ $parameter }，类型 { $actual_type }）。
-warning-manual-layout-required = 警告：以下文本需要人工检查换行：{ $locations }（区域={ $region }，全角字符上限={ $max_fullwidth_chars }）。
 notice-no-model-request = 全部翻译单元均为最新状态，本次无需请求模型。
-notice-manual-layout = 有 { $count } 个单元需要人工检查换行。
-notice-log-degraded = 项目日志不可用或已降级；命令会继续，退出状态不受影响。
-notice-task-records-degraded = 翻译任务记录不可用或已降级；命令会继续，退出状态不受影响。
 progress-init-check-project = 正在检查项目状态
 progress-init-scan-source = 正在扫描游戏来源
 progress-init-build-candidate = 正在构建项目候选
@@ -83,7 +76,7 @@ progress-generic-init = 正在初始化 Generic 项目
 progress-generic-extract = 正在扫描 Generic JSONL 输入
 progress-translate-planning = 正在规划翻译任务
 progress-translate-confirmed = 已确认翻译任务
-progress-translate-no-work = 无需调用模型
+progress-no-work = 无需处理
 progress-project-lua = 正在运行项目 Lua 程序
 progress-write-back-read-assets = 正在读取已验收资产
 progress-write-back-planning = 正在规划文档改写
@@ -98,7 +91,14 @@ result-init-unchanged = 项目状态：无变化
 result-init-updated = 项目状态：已更新
 result-init-stale-owners = 需重新提取：{ $owners }
 result-extract-completed = 提取完成：{ $project }
-result-translate-completed = 翻译执行完成：{ $project }（Profile：{ $profile }）
+result-translate-completed = 翻译运行结束：{ $project }（Profile：{ $profile }）
+result-translate-status = 状态：{ $status }
+result-translate-status-value = { $status ->
+    [no_work] 无需处理
+    [complete] 完整
+    [incomplete] 未完整
+   *[other] __ATT_FALLBACK__
+}
 result-translate-summary = 翻译：任务 { $total }，完整 { $complete }，部分 { $partial }，不可用 { $unavailable }；写入 { $written } 处，剩余 { $remaining } 处
 result-translate-convergence = 状态收敛：保留 { $retained }，失效 { $invalidated }，不适用 { $not_applicable }，复用 { $reused }
 result-write-back-completed = 写回完成：{ $project }
@@ -110,6 +110,11 @@ result-generic-extract-updated = Generic 输入已更新：{ $files } 个文件�
 result-generic-translate-summary = Generic 翻译：任务 { $total }，完整 { $complete }，部分 { $partial }，不可用 { $unavailable }；清除 { $cleared }，复用 { $reused }，接受 { $accepted }，写入 { $written }，冲突 { $conflicted }，响应问题 { $problems }
 result-generic-write-back-summary = Generic 写回：应用译文 { $translated } 个单元，保留原文 { $original } 个单元
 result-symbol-repair-summary = 符号修复：尝试 { $attempted } 个单元，实际修复 { $repaired } 个，内部跳过 { $skipped } 个，替换 { $replacements } 个符号
+result-run-log = 运行记录：{ $path }
+translate-incomplete-object = 项目 { $project } 的本次 Translate
+translate-incomplete-rpg-maker-reason = 部分任务 { $partial }，不可用任务 { $unavailable }，协议问题 { $protocol }，请求耗尽 { $exhausted }；剩余决策 { $remaining_decisions }，剩余位置 { $remaining_locations }
+translate-incomplete-generic-reason = 部分任务 { $partial }，不可用任务 { $unavailable }，写入冲突 { $conflicted }，响应问题 { $problems }
+translate-incomplete-help = 查看本次运行记录中的具体任务诊断，修正可重复的问题后再次运行 Translate；少量剩余内容可使用 Manual
 result-cancelled = 命令已在安全收尾后取消。
 result-plan-saved = 已保存本次成功运行方案。
 log-run-started = 命令 { $command } 已开始。
@@ -157,7 +162,6 @@ log-publication-finished = { $result ->
     [outcome_unknown] 发布的最终状态未知。
    *[other] 发布已停止，结果无法识别。
 }
-log-project-log-degraded = 项目日志发生故障；已记录 { $failure_kinds } 类故障。
 log-task-outcome-value = { $outcome ->
     [complete] 完成
     [partial] 部分完成
@@ -167,14 +171,36 @@ log-task-outcome-value = { $outcome ->
     [cancelled] 已取消
    *[other] 结果无法识别
 }
-diagnostic-location = 位置：{ $subject }
+diagnostic-object = 对象：{ $subject }
+diagnostic-error-heading = 错误：
+diagnostic-warning-heading = 警告：
 diagnostic-explanation = 原因：{ $reason }
+diagnostic-impact = 影响：{ $impact }
 diagnostic-resolution = 处理办法：{ $action }
-diagnostic-related = 相关错误 { $index }：
+diagnostic-related = { $relation ->
+    [cleanup] 同时，清理失败：
+    [rollback] 同时，回滚失败：
+    [discard] 同时，丢弃候选失败：
+    [finalization] 同时，收尾失败：
+    [shutdown] 同时，关闭失败：
+    [observability] 同时，结果呈现或记录失败：
+   *[other] 同时，相关操作失败：
+}
+diagnostic-impact-value = { $effect ->
+    [unchanged] 业务状态没有修改
+    [progress_preserved] 此前确认的进度仍然保留；指出的内容没有完成
+    [applied] 相关业务结果已经生效
+    [applied_run_plan_not_saved] 业务结果已经生效，但本次运行方案没有保存
+    [applied_finalization_failed] 业务结果已经生效，但必要收尾没有完成
+    [recovery_required] 结果已经明确，但必须先处理指出的恢复现场
+    [outcome_unknown] 无法确认本次操作是否生效；按处理办法恢复前不要重试或删除现场
+   *[other] __ATT_FALLBACK__
+}
 diagnostic-resolution-value = { $code ->
     [fix_configuration] 修正指出的配置字段后重试
     [fix_input] 修正指出的输入后重试
     [fix_placeholder_rules] 修正指出的 Placeholder 规则后重试
+    [review_disabled_rules] 如果这是预期结果，无需处理；否则在指出的文件中添加有效规则并重新运行 Extract
     [adjust_manual_layout] 按指出的位置和显示宽度人工调整换行与布局
     [check_path_and_permissions] 检查路径、文件系统状态和权限
     [check_project_state] 检查并修正项目状态后重试
@@ -192,6 +218,7 @@ diagnostic-failure-value = { $code ->
     [invalid_syntax] 值的语法无效
     [invalid_encoding] 文本编码无效
     [invalid_value] 值不符合要求的契约
+    [rules_owner_disabled] 选择的 Rules 文件使用 rule = []；Rules 已停用，并已删除其提取资产
     [not_found] 所需对象不存在
     [state_mismatch] 已保存的项目状态不满足本次操作
     [unsupported_windows_code_page] Windows 代码页不是 UTF-8
@@ -205,6 +232,10 @@ diagnostic-failure-value = { $code ->
     [concurrent_shutdown] 另一个调用方正在关闭执行器
     [executor_state_poisoned] 执行器生命周期状态已经损坏
     [worker_spawn_failed] 操作系统无法创建工作线程
+    [stdout_write_failed] 无法写入标准输出
+    [stderr_write_failed] 无法写入标准错误
+    [stdout_flush_failed] 无法刷新标准输出
+    [stderr_flush_failed] 无法刷新标准错误
     [worker_channel_closed] 工作线程命令通道在收尾完成前关闭
     [worker_panicked] 工作线程异常终止
     [reparse_point_forbidden] 路径包含不能信任的重解析点
@@ -299,7 +330,6 @@ diagnostic-placeholder-rule-project = 当前项目的 Placeholder 规则 { $numb
 manual-exported = 已导出 { $entries } 条：{ $path }
 manual-checked = 有效 { $valid }，未填写 { $unfilled }，错误 { $errors }
 manual-applied = 已应用 { $applied }，未填写 { $unfilled }，错误 { $errors }
-manual-issue = { $object }：{ $reason }；{ $help }。
 manual-value = { $code ->
     [invalid_source_line] source 第 { $line } 项包含换行或 NUL
     [invalid_translation_line] translation 第 { $line } 项包含换行或 NUL

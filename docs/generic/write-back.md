@@ -35,7 +35,7 @@ Partial 项目允许写回。结果明确报告使用译文的 Unit 数与保留
 
 对自动译文执行符号修复前，WriteBack 使用项目快照中的当前 Placeholder 规则重新保护原文
 和译文。保护、绑定或语言投影失败时，命令以类似
-`story.jsonl:line3:unit2:text` 的可读位置说明对象、原因和修改方法，不发布候选，也不把真实
+`story.jsonl:line3:unit2:text` 的可读位置说明对象、原因、影响和处理办法，不发布候选，也不把真实
 Placeholder 错误计为内部跳过。
 
 ## 2. 验证与发布

@@ -127,10 +127,12 @@ SQLite 和事务错误在内部保留足够事实用于控制流，但进入 CLI
 只呈现：
 
 ```text
-object, reason, help
+relation, object, reason, impact, help
 ```
 
-对象使用项目数据库、自然路径或当前命令描述；原因说明实际失败；help 说明可以修改什么。
+relation 说明主错误或清理、回滚、丢弃、收尾、关闭、可观测性关系；对象使用项目数据库、
+自然路径或当前命令描述；原因说明实际失败；impact 说明对业务状态的影响；help 说明可以修改
+什么。
 公开输出不保存查询 ID、SQLite primary/extended code、原始数据库行、参数、SQL、内部事务
 阶段、数据库随机键或 expected/actual fingerprint。
 

@@ -1,10 +1,12 @@
 //! ATT 进程启动、Ctrl-C、shutdown 与退出码边界。
 
+use std::cell::Cell;
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Once;
+use std::sync::{Arc, Once};
 
 use windows_sys::Win32::Globalization::{CP_UTF8, GetACP};
 
@@ -24,14 +26,230 @@ use super::generic_command::{
 use super::project_log::{PendingProjectLog, ProjectLogWarning};
 use crate::diagnostic::{
     Diagnostic, DiagnosticReport, IoFailure, RuntimeComponent, RuntimeIssue, RuntimeOperation,
-    RuntimePanicBoundary, StateEffect, render_diagnostic_report,
+    RuntimePanicBoundary, StateEffect, render_diagnostic_report, render_state_effect_impact,
 };
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
+use crate::llm::ApiKeyRedactor;
 use crate::manual::{render_manual_command_error, render_manual_command_summary};
 
 enum ProductCommandRunReport {
     RpgMaker(ProductionCommandRunReport),
     Generic(GenericCommandRunReport),
+}
+
+enum ProcessOutputState {
+    NeedsFlush(ExitCode),
+    Flushed(ExitCode),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessStream {
+    Stdout,
+    Stderr,
+}
+
+impl ProcessStream {
+    const fn write_operation(self) -> RuntimeOperation {
+        match self {
+            Self::Stdout => RuntimeOperation::WriteStdout,
+            Self::Stderr => RuntimeOperation::WriteStderr,
+        }
+    }
+
+    const fn flush_operation(self) -> RuntimeOperation {
+        match self {
+            Self::Stdout => RuntimeOperation::FlushStdout,
+            Self::Stderr => RuntimeOperation::FlushStderr,
+        }
+    }
+}
+
+/// 保存一个进程输出流已经确认的呈现状态。
+///
+/// `unconfirmed` 保存自上次成功 flush 以来的全部逻辑正文。底层 write 成功只表示
+/// 字节进入了流的缓冲区；只有 flush 成功才能确认用户已经收到并清空这些字节。
+/// 首次 write 或 flush 失败后，后续逻辑输出只进入 `unconfirmed`，不再调用已经失败的
+/// 底层流。最终收尾可据此把完整正文与四字段诊断一次写到另一条仍可用的流。
+struct StreamPresentation<'a> {
+    stream: ProcessStream,
+    output: &'a mut dyn Write,
+    unconfirmed: Vec<u8>,
+    api_key_redactor: Option<Arc<ApiKeyRedactor>>,
+    write_failure: Option<IoFailure>,
+    flush_failure: Option<IoFailure>,
+    write_in_progress: bool,
+    flush_in_progress: bool,
+    flush_attempted: bool,
+}
+
+impl<'a> StreamPresentation<'a> {
+    fn new(stream: ProcessStream, output: &'a mut dyn Write) -> Self {
+        Self {
+            stream,
+            output,
+            unconfirmed: Vec::new(),
+            api_key_redactor: None,
+            write_failure: None,
+            flush_failure: None,
+            write_in_progress: false,
+            flush_in_progress: false,
+            flush_attempted: false,
+        }
+    }
+
+    fn is_unavailable(&self) -> bool {
+        self.write_failure.is_some()
+            || self.flush_failure.is_some()
+            || self.write_in_progress
+            || self.flush_in_progress
+    }
+
+    fn failure_reports(&self, effect: StateEffect) -> Vec<DiagnosticReport> {
+        let mut reports = Vec::new();
+        if let Some(failure) = self.write_failure.clone() {
+            reports.push(process_output_failure_report_from_failure(
+                effect,
+                self.stream.write_operation(),
+                failure,
+            ));
+        }
+        if let Some(failure) = self.flush_failure.clone() {
+            reports.push(process_output_failure_report_from_failure(
+                effect,
+                self.stream.flush_operation(),
+                failure,
+            ));
+        }
+        reports
+    }
+
+    fn unconfirmed(&self) -> &[u8] {
+        &self.unconfirmed
+    }
+
+    fn has_unconfirmed(&self) -> bool {
+        !self.unconfirmed.is_empty()
+    }
+
+    fn prepend_unconfirmed(&mut self, bytes: &[u8]) {
+        debug_assert!(!self.is_unavailable());
+        if bytes.is_empty() {
+            return;
+        }
+        let mut combined = Vec::with_capacity(bytes.len() + self.unconfirmed.len());
+        combined.extend_from_slice(bytes);
+        combined.extend_from_slice(&self.unconfirmed);
+        self.unconfirmed = combined;
+        // 成功 flush 过的健康流可以接收一批新的回退正文。
+        self.flush_attempted = false;
+    }
+
+    fn select_api_key_redactor(&mut self, redactor: Option<Arc<ApiKeyRedactor>>) {
+        if let Some(redactor) = redactor {
+            self.api_key_redactor = Some(redactor);
+        }
+    }
+
+    fn bytes_for_output(&self, bytes: &[u8]) -> Vec<u8> {
+        let text = String::from_utf8_lossy(bytes);
+        match self.api_key_redactor.as_ref() {
+            Some(redactor) => redactor.redact(&text).into_bytes(),
+            None => text.into_owned().into_bytes(),
+        }
+    }
+
+    /// 日常呈现和首次 flush 已结束后，只允许调用方执行一次有界后续写入。
+    fn write_follow_up(
+        &mut self,
+        bytes: &[u8],
+        effect: StateEffect,
+    ) -> Result<(), DiagnosticReport> {
+        debug_assert!(!self.is_unavailable());
+        self.write_all(bytes)
+            .expect("StreamPresentation 的逻辑 write 必须由自身吸收底层失败");
+        let _ = self.flush();
+        self.failure_reports(effect)
+            .into_iter()
+            .next()
+            .map_or(Ok(()), Err)
+    }
+}
+
+impl Write for StreamPresentation<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.unconfirmed.extend_from_slice(buffer);
+        // 成功 flush 后出现了新的逻辑正文，下一次 flush 是一个新的确认动作。
+        if !self.is_unavailable() {
+            self.flush_attempted = false;
+        }
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.flush_attempted {
+            return Ok(());
+        }
+        self.flush_attempted = true;
+        // 失败后的流不得再次碰触底层输出；完整未确认正文交给相反流。
+        if self.is_unavailable() {
+            return Ok(());
+        }
+        let bytes = self.bytes_for_output(&self.unconfirmed);
+        self.write_in_progress = true;
+        if let Err(source) = self.output.write_all(&bytes) {
+            self.write_in_progress = false;
+            self.write_failure = Some(IoFailure::from_error(&source));
+            return Ok(());
+        }
+        self.write_in_progress = false;
+        self.flush_in_progress = true;
+        match self.output.flush() {
+            Ok(()) => {
+                self.flush_in_progress = false;
+                self.unconfirmed.clear();
+                Ok(())
+            }
+            Err(source) => {
+                self.flush_in_progress = false;
+                self.flush_failure = Some(IoFailure::from_error(&source));
+                // 失败事实由调用方从状态读取；这里不让第一个流阻止第二个流 flush。
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct RunLogPresentation {
+    path: Option<PathBuf>,
+    written: Cell<bool>,
+}
+
+impl RunLogPresentation {
+    fn new(path: Option<PathBuf>) -> Self {
+        Self {
+            path,
+            written: Cell::new(false),
+        }
+    }
+
+    fn write(&self, localizer: &UiLocalizer, output: &mut dyn Write) -> io::Result<()> {
+        if self.written.get() {
+            return Ok(());
+        }
+        let Some(path) = self.path.as_deref() else {
+            return Ok(());
+        };
+        writeln!(
+            output,
+            "{}",
+            localizer.format(UiMessage::ResultRunLog {
+                path: &path.to_string_lossy(),
+            })
+        )?;
+        self.written.set(true);
+        Ok(())
+    }
 }
 
 /// 运行真实进程入口。
@@ -61,7 +279,13 @@ fn run_guarded() -> ExitCode {
         // run_from 不执行此检查，避免未嵌入 manifest 的 Rust 测试宿主受进程 ACP 影响。
         let localizer = UiLocalizer::new(UiLocale::English);
         let exit = render_diagnostic_report_fatal(&localizer, &diagnostic, &mut stderr);
-        return finalize_process_output(exit, &mut stdout, &mut stderr);
+        return finalize_raw_process_output(
+            exit,
+            StateEffect::Unchanged,
+            &localizer,
+            &mut stdout,
+            &mut stderr,
+        );
     }
     run_from(std::env::args_os(), &mut stdout, &mut stderr)
 }
@@ -87,10 +311,12 @@ fn windows_utf8_process_diagnostic_for(actual_code_page: u32) -> Option<Diagnost
 fn render_uncaught_panic() -> ExitCode {
     // UI locale 尚未由完整 Clap 解析确认时，现行 CLI 契约固定使用英语兜底。
     let localizer = UiLocalizer::new(UiLocale::English);
+    let mut stdout = io::stdout();
     let mut stderr = io::stderr();
     render_uncaught_panic_with(
         &localizer,
         RuntimePanicBoundary::ProcessStartup,
+        &mut stdout,
         &mut stderr,
     )
 }
@@ -98,13 +324,23 @@ fn render_uncaught_panic() -> ExitCode {
 fn render_uncaught_panic_with(
     localizer: &UiLocalizer,
     boundary: RuntimePanicBoundary,
+    stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> ExitCode {
+    let mut stdout = StreamPresentation::new(ProcessStream::Stdout, stdout);
+    let mut stderr = StreamPresentation::new(ProcessStream::Stderr, stderr);
     let diagnostic = DiagnosticReport::new(
         StateEffect::OutcomeUnknown,
         Diagnostic::runtime(RuntimeIssue::ProcessPanicked { boundary }),
     );
-    render_diagnostic_report_fatal(localizer, &diagnostic, stderr)
+    let exit = render_diagnostic_report_fatal(localizer, &diagnostic, &mut stderr);
+    finalize_process_output(
+        exit,
+        StateEffect::OutcomeUnknown,
+        localizer,
+        &mut stdout,
+        &mut stderr,
+    )
 }
 
 fn run_from<A, S>(args: A, stdout: &mut dyn Write, stderr: &mut dyn Write) -> ExitCode
@@ -112,58 +348,161 @@ where
     A: IntoIterator<Item = S>,
     S: Into<OsString> + Clone,
 {
+    let mut stdout = StreamPresentation::new(ProcessStream::Stdout, stdout);
+    let mut stderr = StreamPresentation::new(ProcessStream::Stderr, stderr);
     let (arguments, resolved_locale) = match AttArguments::try_parse_localized_from(args) {
         Ok(parsed) => parsed,
         Err(error) => {
-            let rendered = if error.use_stderr() {
-                write!(stderr, "{}", error.output())
-            } else {
-                write!(stdout, "{}", error.output())
-            };
-            let exit = if rendered.is_err() {
-                ExitCode::FAILURE
-            } else {
-                ExitCode::from(error.exit_code())
-            };
-            return finalize_process_output(exit, stdout, stderr);
+            let localizer = UiLocalizer::new(error.locale());
+            return catch_after_cli_parsing(
+                &localizer,
+                &mut stdout,
+                &mut stderr,
+                |stdout, stderr| {
+                    let rendered = if error.use_stderr() {
+                        write!(stderr, "{}", error.output())
+                    } else {
+                        write!(stdout, "{}", error.output())
+                    };
+                    let exit = if rendered.is_err() {
+                        ExitCode::FAILURE
+                    } else {
+                        ExitCode::from(error.exit_code())
+                    };
+                    finalize_process_output(
+                        exit,
+                        StateEffect::Unchanged,
+                        &localizer,
+                        stdout,
+                        stderr,
+                    )
+                },
+            );
         }
     };
     let locale = resolved_locale.locale();
     let localizer = UiLocalizer::new(locale);
-    catch_after_cli_parsing(&localizer, stderr, |stderr| {
-        let exit = run_after_cli_parsing(arguments, locale, &localizer, stdout, stderr);
-        // 已选定 locale 后的最终 flush 也属于 after-CLI 呈现边界；panic 不能退化成
-        // 英语的 ProcessStartup，Err 则必须把进程结果改为失败。
-        finalize_process_output(exit, stdout, stderr)
+    catch_after_cli_parsing(&localizer, &mut stdout, &mut stderr, |stdout, stderr| {
+        let state = run_after_cli_parsing(arguments, locale, &localizer, stdout, stderr);
+        finish_process_output_state(state, &localizer, stdout, stderr)
     })
+}
+
+fn finish_process_output_state(
+    state: ProcessOutputState,
+    localizer: &UiLocalizer,
+    stdout: &mut StreamPresentation<'_>,
+    stderr: &mut StreamPresentation<'_>,
+) -> ExitCode {
+    match state {
+        ProcessOutputState::NeedsFlush(exit) => {
+            // 尚未进入项目日志结果边界的输出在这里完成唯一一次 flush。
+            finalize_process_output(exit, StateEffect::Unchanged, localizer, stdout, stderr)
+        }
+        // 项目命令已经在日志关闭前完成唯一一次可诊断 flush，不能在日志关闭后重试。
+        ProcessOutputState::Flushed(exit) => exit,
+    }
 }
 
 fn finalize_process_output(
     exit: ExitCode,
+    effect: StateEffect,
+    localizer: &UiLocalizer,
+    stdout: &mut StreamPresentation<'_>,
+    stderr: &mut StreamPresentation<'_>,
+) -> ExitCode {
+    // 有正文的业务流先确认。它失败时，把完整正文和诊断放到尚未 flush 的相反流正文
+    // 之前；这样原业务结果仍先于相关错误，并且健康相反流只写一批。
+    let stdout_first = stdout.has_unconfirmed() || !stderr.has_unconfirmed();
+    if stdout_first {
+        let _ = stdout.flush();
+        if stdout.is_unavailable() && !stderr.is_unavailable() {
+            let payload = stream_failure_payload(stdout, effect, localizer);
+            stderr.prepend_unconfirmed(&payload);
+        }
+        let _ = stderr.flush();
+    } else {
+        let _ = stderr.flush();
+        if stderr.is_unavailable() && !stdout.is_unavailable() {
+            let payload = stream_failure_payload(stderr, effect, localizer);
+            stdout.prepend_unconfirmed(&payload);
+        }
+        let _ = stdout.flush();
+    }
+    if !stdout.is_unavailable() && !stderr.is_unavailable() {
+        return exit;
+    }
+
+    // 第二个流失败时，第一个流已经成功确认，只能做一次有界回退；第一个流失败的
+    // 内容已在第二个流首次 flush 前合并，不得在这里重复呈现。
+    match (
+        stdout_first,
+        stdout.is_unavailable(),
+        stderr.is_unavailable(),
+    ) {
+        (true, false, true) => {
+            let payload = stream_failure_payload(stderr, effect, localizer);
+            let _ = stdout.write_follow_up(&payload, effect);
+        }
+        (false, true, false) => {
+            let payload = stream_failure_payload(stdout, effect, localizer);
+            let _ = stderr.write_follow_up(&payload, effect);
+        }
+        _ => {}
+    }
+    ExitCode::FAILURE
+}
+
+fn finalize_raw_process_output(
+    exit: ExitCode,
+    effect: StateEffect,
+    localizer: &UiLocalizer,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> ExitCode {
-    // 两个流都必须尝试刷新，不能让第一个失败阻止另一个流完成收尾。
-    let stdout_flush = stdout.flush();
-    let stderr_flush = stderr.flush();
-    if stdout_flush.is_err() || stderr_flush.is_err() {
-        ExitCode::FAILURE
-    } else {
-        exit
+    let mut stdout = StreamPresentation::new(ProcessStream::Stdout, stdout);
+    let mut stderr = StreamPresentation::new(ProcessStream::Stderr, stderr);
+    finalize_process_output(exit, effect, localizer, &mut stdout, &mut stderr)
+}
+
+fn stream_failure_payload(
+    stream: &StreamPresentation<'_>,
+    effect: StateEffect,
+    localizer: &UiLocalizer,
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(stream.unconfirmed());
+    for report in stream.failure_reports(effect) {
+        render_primary_error(&report, localizer, &mut payload).expect("内存中的进程诊断必须可呈现");
     }
+    payload
 }
 
 fn catch_after_cli_parsing(
     localizer: &UiLocalizer,
-    stderr: &mut dyn Write,
-    operation: impl FnOnce(&mut dyn Write) -> ExitCode,
+    stdout: &mut StreamPresentation<'_>,
+    stderr: &mut StreamPresentation<'_>,
+    operation: impl FnOnce(&mut StreamPresentation<'_>, &mut StreamPresentation<'_>) -> ExitCode,
 ) -> ExitCode {
-    match catch_unwind(AssertUnwindSafe(|| operation(stderr))) {
+    match catch_unwind(AssertUnwindSafe(|| operation(stdout, stderr))) {
         Ok(exit_code) => exit_code,
         Err(payload) => {
             // 与命令 panic 边界一致，payload 只触发控制流，绝不读取或格式化。
             drop(payload);
-            render_uncaught_panic_with(localizer, RuntimePanicBoundary::AfterCliParsing, stderr)
+            let diagnostic = DiagnosticReport::new(
+                StateEffect::OutcomeUnknown,
+                Diagnostic::runtime(RuntimeIssue::ProcessPanicked {
+                    boundary: RuntimePanicBoundary::AfterCliParsing,
+                }),
+            );
+            let _ = render_primary_error(&diagnostic, localizer, stderr);
+            finalize_process_output(
+                ExitCode::FAILURE,
+                StateEffect::OutcomeUnknown,
+                localizer,
+                stdout,
+                stderr,
+            )
         }
     }
 }
@@ -172,16 +511,24 @@ fn run_after_cli_parsing(
     arguments: AttArguments,
     locale: UiLocale,
     localizer: &UiLocalizer,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-) -> ExitCode {
+    stdout: &mut StreamPresentation<'_>,
+    stderr: &mut StreamPresentation<'_>,
+) -> ProcessOutputState {
     let distribution = match DistributionLayout::from_current_executable() {
         Ok(distribution) => distribution,
-        Err(error) => return render_distribution_layout_error(localizer, &error, stderr),
+        Err(error) => {
+            return ProcessOutputState::NeedsFlush(render_distribution_layout_error(
+                localizer, &error, stderr,
+            ));
+        }
     };
     let configuration = match load_product_configuration(&distribution, arguments.product) {
         Ok(configuration) => configuration,
-        Err(error) => return render_configuration_load_error(localizer, &error, stderr),
+        Err(error) => {
+            return ProcessOutputState::NeedsFlush(render_configuration_load_error(
+                localizer, &error, stderr,
+            ));
+        }
     };
     let runtime_parallelism = match std::thread::available_parallelism() {
         Ok(parallelism) => parallelism,
@@ -194,7 +541,11 @@ fn run_after_cli_parsing(
                     failure: IoFailure::from_error(&error),
                 }),
             );
-            return render_diagnostic_report_fatal(localizer, &diagnostic, stderr);
+            return ProcessOutputState::NeedsFlush(render_diagnostic_report_fatal(
+                localizer,
+                &diagnostic,
+                stderr,
+            ));
         }
     };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -212,7 +563,11 @@ fn run_after_cli_parsing(
                     failure: IoFailure::from_error(&error),
                 }),
             );
-            return render_diagnostic_report_fatal(localizer, &diagnostic, stderr);
+            return ProcessOutputState::NeedsFlush(render_diagnostic_report_fatal(
+                localizer,
+                &diagnostic,
+                stderr,
+            ));
         }
     };
 
@@ -243,29 +598,55 @@ fn run_after_cli_parsing(
     let report = match report {
         ProductCommandRunReport::RpgMaker(report) => report,
         ProductCommandRunReport::Generic(report) => {
-            return render_generic_command_report(report, localizer, stdout, stderr);
+            return ProcessOutputState::Flushed(render_generic_command_report(
+                report, localizer, stdout, stderr,
+            ));
         }
     };
+    let selected_api_key_redactor = report.selected_api_key_redactor;
+    stdout.select_api_key_redactor(selected_api_key_redactor.clone());
+    stderr.select_api_key_redactor(selected_api_key_redactor);
+    let panic_log_path = report.panic_log_path;
     let mut pending_project_log = report.pending_project_log;
     if let Some(project_log) = pending_project_log.as_mut() {
         project_log.prepare_for_result_presentation();
     }
+    let had_presentation_failure = pending_project_log
+        .as_ref()
+        .is_some_and(PendingProjectLog::has_presentation_failure);
     let panic_boundary = pending_project_log
         .as_mut()
         .map(PendingProjectLog::arm_presentation_panic)
         .map(CommandPanicBoundary::from_report);
-    catch_logged_presentation(panic_boundary, localizer, stderr, |stderr| {
-        render_command_report(
-            report.result,
-            report.shutdown_error,
-            pending_project_log,
-            localizer,
-            stdout,
-            stderr,
-        )
-    })
+    let run_log = RunLogPresentation::new(
+        pending_project_log
+            .as_ref()
+            .and_then(PendingProjectLog::log_path)
+            .map(PathBuf::from)
+            .or(panic_log_path),
+    );
+    ProcessOutputState::Flushed(catch_logged_presentation(
+        panic_boundary,
+        &run_log,
+        localizer,
+        stdout,
+        stderr,
+        |stdout, stderr| {
+            render_command_report_with_run_log(
+                report.result,
+                report.shutdown_error,
+                pending_project_log,
+                &run_log,
+                had_presentation_failure,
+                localizer,
+                stdout,
+                stderr,
+            )
+        },
+    ))
 }
 
+#[cfg(test)]
 fn render_command_report(
     result: CommandRunResult,
     shutdown_error: Option<super::command::ShutdownFailures>,
@@ -273,6 +654,39 @@ fn render_command_report(
     localizer: &UiLocalizer,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
+) -> ExitCode {
+    let mut stdout = StreamPresentation::new(ProcessStream::Stdout, stdout);
+    let mut stderr = StreamPresentation::new(ProcessStream::Stderr, stderr);
+    let run_log = RunLogPresentation::new(
+        pending_project_log
+            .as_ref()
+            .and_then(PendingProjectLog::log_path)
+            .map(PathBuf::from),
+    );
+    let had_presentation_failure = pending_project_log
+        .as_ref()
+        .is_some_and(PendingProjectLog::has_presentation_failure);
+    render_command_report_with_run_log(
+        result,
+        shutdown_error,
+        pending_project_log,
+        &run_log,
+        had_presentation_failure,
+        localizer,
+        &mut stdout,
+        &mut stderr,
+    )
+}
+
+fn render_command_report_with_run_log(
+    result: CommandRunResult,
+    shutdown_error: Option<super::command::ShutdownFailures>,
+    pending_project_log: Option<PendingProjectLog>,
+    run_log: &RunLogPresentation,
+    had_presentation_failure: bool,
+    localizer: &UiLocalizer,
+    stdout: &mut StreamPresentation<'_>,
+    stderr: &mut StreamPresentation<'_>,
 ) -> ExitCode {
     match (result, shutdown_error) {
         (CommandRunResult::Succeeded(output), shutdown) => {
@@ -287,22 +701,29 @@ fn render_command_report(
                     stderr,
                 ) {
                     presentation_failures.push(process_output_failure_report(
+                        StateEffect::AppliedFinalizationFailed,
                         RuntimeOperation::WriteStderr,
                         &error,
                     ));
                 }
-                let (warning, _) = finish_project_log_after_presentation(
+                if presentation_failures.len() == 1 {
+                    record_run_log_path(
+                        run_log,
+                        localizer,
+                        stderr,
+                        StateEffect::AppliedFinalizationFailed,
+                        RuntimeOperation::WriteStderr,
+                        &mut presentation_failures,
+                    );
+                }
+                let _ = finish_project_log_after_presentation(
                     pending_project_log,
                     presentation_failures,
+                    StateEffect::AppliedFinalizationFailed,
+                    localizer,
                     stdout,
                     stderr,
                 );
-                let warning_failed =
-                    render_project_log_warning_if_present(localizer, warning.as_ref(), stderr)
-                        .is_err();
-                if warning_failed {
-                    return ExitCode::FAILURE;
-                }
                 ExitCode::FAILURE
             } else if let Err(error) =
                 CommandResultRenderer::render_success_warnings(&output, localizer, stderr)
@@ -317,24 +738,66 @@ fn render_command_report(
                     stderr,
                 ) {
                     presentation_failures.push(process_output_failure_report(
+                        StateEffect::AppliedFinalizationFailed,
                         RuntimeOperation::WriteStderr,
                         &error,
                     ));
                 }
-                let (warning, _) = finish_project_log_after_presentation(
+                if presentation_failures.len() == 1 {
+                    record_run_log_path(
+                        run_log,
+                        localizer,
+                        stderr,
+                        StateEffect::AppliedFinalizationFailed,
+                        RuntimeOperation::WriteStderr,
+                        &mut presentation_failures,
+                    );
+                }
+                let _ = finish_project_log_after_presentation(
                     pending_project_log,
                     presentation_failures,
+                    StateEffect::AppliedFinalizationFailed,
+                    localizer,
                     stdout,
                     stderr,
                 );
-                let warning_failed =
-                    render_project_log_warning_if_present(localizer, warning.as_ref(), stderr)
-                        .is_err();
-                if warning_failed {
-                    return ExitCode::FAILURE;
-                }
                 ExitCode::FAILURE
             } else {
+                // shutdown 已经失败时，先确认 stdout 的成功摘要。若 stdout 本身也无法
+                // 呈现，它必须成为主错误，shutdown 才能以真实的 related 关系随后呈现。
+                if let Some(shutdown) = shutdown.as_ref() {
+                    let _ = stdout.flush();
+                    if stdout.is_unavailable() {
+                        let mut presentation_failures =
+                            stdout.failure_reports(StateEffect::AppliedFinalizationFailed);
+                        if let Err(error) = CommandResultRenderer::render_related_shutdown_failures(
+                            shutdown, localizer, stderr,
+                        ) {
+                            presentation_failures.push(process_output_failure_report(
+                                StateEffect::AppliedFinalizationFailed,
+                                RuntimeOperation::WriteStderr,
+                                &error,
+                            ));
+                        }
+                        record_run_log_path(
+                            run_log,
+                            localizer,
+                            stderr,
+                            StateEffect::AppliedFinalizationFailed,
+                            RuntimeOperation::WriteStderr,
+                            &mut presentation_failures,
+                        );
+                        let _ = finish_project_log_after_presentation(
+                            pending_project_log,
+                            presentation_failures,
+                            StateEffect::AppliedFinalizationFailed,
+                            localizer,
+                            stdout,
+                            stderr,
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                }
                 let mut presentation_failures = Vec::new();
                 if let Some(shutdown) = shutdown.as_ref()
                     && let Err(error) = CommandResultRenderer::render_applied_finalization_failure(
@@ -342,24 +805,41 @@ fn render_command_report(
                     )
                 {
                     presentation_failures.push(process_output_failure_report(
+                        StateEffect::AppliedFinalizationFailed,
                         RuntimeOperation::WriteStderr,
                         &error,
                     ));
                 }
-                let (warning, had_presentation_failure) = finish_project_log_after_presentation(
+                if presentation_failures.is_empty() {
+                    if shutdown.is_some() || had_presentation_failure {
+                        record_run_log_path(
+                            run_log,
+                            localizer,
+                            stderr,
+                            StateEffect::AppliedFinalizationFailed,
+                            RuntimeOperation::WriteStderr,
+                            &mut presentation_failures,
+                        );
+                    } else {
+                        record_run_log_path(
+                            run_log,
+                            localizer,
+                            stdout,
+                            StateEffect::AppliedFinalizationFailed,
+                            RuntimeOperation::WriteStdout,
+                            &mut presentation_failures,
+                        );
+                    }
+                }
+                let had_presentation_failure = finish_project_log_after_presentation(
                     pending_project_log,
                     presentation_failures,
+                    StateEffect::AppliedFinalizationFailed,
+                    localizer,
                     stdout,
                     stderr,
                 );
-                let warning_presentation_failed = warning
-                    .as_ref()
-                    .is_some_and(|warning| !warning.presentation_failures.is_empty());
-                if render_project_log_warning_if_present(localizer, warning.as_ref(), stderr)
-                    .is_err()
-                    || warning_presentation_failed
-                    || had_presentation_failure
-                {
+                if had_presentation_failure {
                     return ExitCode::FAILURE;
                 }
                 if shutdown.is_some() {
@@ -371,6 +851,7 @@ fn render_command_report(
             }
         }
         (CommandRunResult::Failed(command_error), shutdown) => {
+            let presentation_effect = command_error.failure_report().report().effect();
             let mut presentation_failures = Vec::new();
             if let Err(error) = CommandResultRenderer::render_failure(
                 Some(&command_error),
@@ -379,21 +860,29 @@ fn render_command_report(
                 stderr,
             ) {
                 presentation_failures.push(process_output_failure_report(
+                    presentation_effect,
                     RuntimeOperation::WriteStderr,
                     &error,
                 ));
             }
-            let (warning, _) = finish_project_log_after_presentation(
+            if presentation_failures.is_empty() {
+                record_run_log_path(
+                    run_log,
+                    localizer,
+                    stderr,
+                    presentation_effect,
+                    RuntimeOperation::WriteStderr,
+                    &mut presentation_failures,
+                );
+            }
+            let _ = finish_project_log_after_presentation(
                 pending_project_log,
                 presentation_failures,
+                presentation_effect,
+                localizer,
                 stdout,
                 stderr,
             );
-            let warning_failed =
-                render_project_log_warning_if_present(localizer, warning.as_ref(), stderr).is_err();
-            if warning_failed {
-                return ExitCode::FAILURE;
-            }
             ExitCode::FAILURE
         }
         (CommandRunResult::Interrupted, None) => {
@@ -401,22 +890,30 @@ fn render_command_report(
             if let Err(error) = writeln!(stderr, "{}", localizer.format(UiMessage::ResultCancelled))
             {
                 presentation_failures.push(process_output_failure_report(
+                    StateEffect::ProgressPreserved,
                     RuntimeOperation::WriteStderr,
                     &error,
                 ));
             }
-            let (warning, cancellation_failed) = finish_project_log_after_presentation(
+            if presentation_failures.is_empty() {
+                record_run_log_path(
+                    run_log,
+                    localizer,
+                    stderr,
+                    StateEffect::ProgressPreserved,
+                    RuntimeOperation::WriteStderr,
+                    &mut presentation_failures,
+                );
+            }
+            let cancellation_failed = finish_project_log_after_presentation(
                 pending_project_log,
                 presentation_failures,
+                StateEffect::ProgressPreserved,
+                localizer,
                 stdout,
                 stderr,
             );
-            let warning_presentation_failed = warning
-                .as_ref()
-                .is_some_and(|warning| !warning.presentation_failures.is_empty());
-            let warning_result =
-                render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
-            if warning_result.is_err() || cancellation_failed || warning_presentation_failed {
+            if cancellation_failed {
                 ExitCode::FAILURE
             } else {
                 ExitCode::from(130)
@@ -427,6 +924,7 @@ fn render_command_report(
             if let Err(error) = writeln!(stderr, "{}", localizer.format(UiMessage::ResultCancelled))
             {
                 presentation_failures.push(process_output_failure_report(
+                    StateEffect::ProgressPreserved,
                     RuntimeOperation::WriteStderr,
                     &error,
                 ));
@@ -435,20 +933,31 @@ fn render_command_report(
                 CommandResultRenderer::render_failure(None, Some(&shutdown), localizer, stderr)
             {
                 presentation_failures.push(process_output_failure_report(
+                    StateEffect::ProgressPreserved,
                     RuntimeOperation::WriteStderr,
                     &error,
                 ));
             }
-            let (warning, presentation_failed) = finish_project_log_after_presentation(
+            if presentation_failures.is_empty() {
+                record_run_log_path(
+                    run_log,
+                    localizer,
+                    stderr,
+                    StateEffect::ProgressPreserved,
+                    RuntimeOperation::WriteStderr,
+                    &mut presentation_failures,
+                );
+            }
+            let presentation_failed = finish_project_log_after_presentation(
                 pending_project_log,
                 presentation_failures,
+                StateEffect::ProgressPreserved,
+                localizer,
                 stdout,
                 stderr,
             );
             // 取消事实与清理失败并列呈现，清理错误不吞掉“已取消”这一终态。
-            let warning_failed =
-                render_project_log_warning_if_present(localizer, warning.as_ref(), stderr).is_err();
-            if warning_failed || presentation_failed {
+            if presentation_failed {
                 return ExitCode::FAILURE;
             }
             ExitCode::FAILURE
@@ -456,25 +965,61 @@ fn render_command_report(
     }
 }
 
+fn record_run_log_path(
+    run_log: &RunLogPresentation,
+    localizer: &UiLocalizer,
+    output: &mut dyn Write,
+    effect: StateEffect,
+    operation: RuntimeOperation,
+    presentation_failures: &mut Vec<DiagnosticReport>,
+) {
+    if let Err(source) = run_log.write(localizer, output) {
+        presentation_failures.push(process_output_failure_report(effect, operation, &source));
+    }
+}
+
 fn finish_project_log_after_presentation(
     pending_project_log: Option<PendingProjectLog>,
     mut presentation_failures: Vec<DiagnosticReport>,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-) -> (Option<ProjectLogWarning>, bool) {
-    if let Err(source) = stdout.flush() {
-        presentation_failures.push(process_output_failure_report(
-            RuntimeOperation::WriteStdout,
-            &source,
-        ));
+    effect: StateEffect,
+    localizer: &UiLocalizer,
+    stdout: &mut StreamPresentation<'_>,
+    stderr: &mut StreamPresentation<'_>,
+) -> bool {
+    let stdout_first = stdout.has_unconfirmed() || !stderr.has_unconfirmed();
+    let mut stdout_relayed_before_stderr_flush = false;
+    let mut stderr_relayed_before_stdout_flush = false;
+    if stdout_first {
+        let _ = stdout.flush();
+        if stdout.is_unavailable() && !stderr.is_unavailable() {
+            let payload = stream_failure_payload(stdout, effect, localizer);
+            stderr.prepend_unconfirmed(&payload);
+            stdout_relayed_before_stderr_flush = true;
+        }
+        let _ = stderr.flush();
+    } else {
+        let _ = stderr.flush();
+        if stderr.is_unavailable() && !stdout.is_unavailable() {
+            let payload = stream_failure_payload(stderr, effect, localizer);
+            stdout.prepend_unconfirmed(&payload);
+            stderr_relayed_before_stdout_flush = true;
+        }
+        let _ = stdout.flush();
     }
-    if let Err(source) = stderr.flush() {
-        presentation_failures.push(process_output_failure_report(
-            RuntimeOperation::WriteStderr,
-            &source,
-        ));
+
+    let stdout_reports = stdout.failure_reports(effect);
+    let stderr_reports = stderr.failure_reports(effect);
+    for report in stdout_reports.iter().chain(&stderr_reports) {
+        if !presentation_failures.contains(report) {
+            presentation_failures.push(report.clone());
+        }
     }
-    let presentation_failed = !presentation_failures.is_empty();
+    let additional_reports = presentation_failures
+        .iter()
+        .filter(|report| !stdout_reports.contains(report) && !stderr_reports.contains(report))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut presentation_failed = !presentation_failures.is_empty();
     let warning = pending_project_log.and_then(|project_log| {
         if presentation_failures.is_empty() {
             project_log.finish()
@@ -482,19 +1027,85 @@ fn finish_project_log_after_presentation(
             project_log.finish_with_diagnostics(presentation_failures)
         }
     });
-    (warning, presentation_failed)
+    presentation_failed |= warning
+        .as_ref()
+        .is_some_and(|warning| !warning.presentation_failures.is_empty());
+
+    let mut warning_payload = Vec::new();
+    if let Some(warning) = warning.as_ref() {
+        render_project_log_warning(localizer, warning, &mut warning_payload)
+            .expect("内存中的项目日志警告必须可呈现");
+    }
+
+    let mut additional_payload = Vec::new();
+    for report in &additional_reports {
+        render_primary_error(report, localizer, &mut additional_payload)
+            .expect("内存中的进程诊断必须可呈现");
+    }
+
+    match (stdout.is_unavailable(), stderr.is_unavailable()) {
+        (true, false) => {
+            let mut follow_up = Vec::new();
+            if !stdout_relayed_before_stderr_flush {
+                follow_up.extend_from_slice(&stream_failure_payload(stdout, effect, localizer));
+            }
+            follow_up.extend_from_slice(&additional_payload);
+            follow_up.extend_from_slice(&warning_payload);
+            if !follow_up.is_empty() && stderr.write_follow_up(&follow_up, effect).is_err() {
+                presentation_failed = true;
+            }
+        }
+        (false, true) => {
+            let mut follow_up = Vec::new();
+            if !stderr_relayed_before_stdout_flush {
+                follow_up.extend_from_slice(&stream_failure_payload(stderr, effect, localizer));
+            }
+            follow_up.extend_from_slice(&additional_payload);
+            follow_up.extend_from_slice(&warning_payload);
+            if !follow_up.is_empty() && stdout.write_follow_up(&follow_up, effect).is_err() {
+                presentation_failed = true;
+            }
+        }
+        (false, false) => {
+            let mut follow_up = additional_payload;
+            follow_up.extend_from_slice(&warning_payload);
+            if !follow_up.is_empty()
+                && let Err(fallback_failure) = stderr.write_follow_up(&follow_up, effect)
+            {
+                presentation_failed = true;
+                let mut final_fallback = follow_up;
+                render_primary_error(&fallback_failure, localizer, &mut final_fallback)
+                    .expect("内存中的进程诊断必须可呈现");
+                if !stdout.is_unavailable() {
+                    let _ = stdout.write_follow_up(&final_fallback, effect);
+                }
+            }
+        }
+        (true, true) => {}
+    }
+
+    presentation_failed
 }
 
 fn process_output_failure_report(
+    effect: StateEffect,
     operation: RuntimeOperation,
     source: &io::Error,
 ) -> DiagnosticReport {
+    process_output_failure_report_from_failure(effect, operation, IoFailure::from_error(source))
+}
+
+fn process_output_failure_report_from_failure(
+    effect: StateEffect,
+    operation: RuntimeOperation,
+    failure: IoFailure,
+) -> DiagnosticReport {
     DiagnosticReport::new(
-        StateEffect::AppliedFinalizationFailed,
+        effect,
         Diagnostic::runtime(RuntimeIssue::Io {
             component: RuntimeComponent::Process,
             operation,
-            failure: IoFailure::from_error(source),
+            failure,
         }),
     )
 }
@@ -502,32 +1113,56 @@ fn process_output_failure_report(
 fn render_generic_command_report(
     report: GenericCommandRunReport,
     localizer: &UiLocalizer,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
+    stdout: &mut StreamPresentation<'_>,
+    stderr: &mut StreamPresentation<'_>,
 ) -> ExitCode {
     let GenericCommandRunReport {
         result,
         shutdown_errors,
         mut pending_project_log,
+        panic_log_path,
+        selected_api_key_redactor,
     } = report;
+    stdout.select_api_key_redactor(selected_api_key_redactor.clone());
+    stderr.select_api_key_redactor(selected_api_key_redactor);
     if let Some(project_log) = pending_project_log.as_mut() {
         project_log.prepare_for_result_presentation();
     }
+    let had_presentation_failure = pending_project_log
+        .as_ref()
+        .is_some_and(PendingProjectLog::has_presentation_failure);
     let panic_report = pending_project_log
         .as_mut()
         .map(PendingProjectLog::arm_presentation_panic);
-    catch_generic_logged_presentation(panic_report, localizer, stderr, |stderr| {
-        render_generic_command_result(
-            result,
-            &shutdown_errors,
-            pending_project_log,
-            localizer,
-            stdout,
-            stderr,
-        )
-    })
+    let run_log = RunLogPresentation::new(
+        pending_project_log
+            .as_ref()
+            .and_then(PendingProjectLog::log_path)
+            .map(PathBuf::from)
+            .or(panic_log_path),
+    );
+    catch_generic_logged_presentation(
+        panic_report,
+        &run_log,
+        localizer,
+        stdout,
+        stderr,
+        |stdout, stderr| {
+            render_generic_command_result_with_run_log(
+                result,
+                &shutdown_errors,
+                pending_project_log,
+                &run_log,
+                had_presentation_failure,
+                localizer,
+                stdout,
+                stderr,
+            )
+        },
+    )
 }
 
+#[cfg(test)]
 fn render_generic_command_result(
     result: GenericCommandRunResult,
     shutdown_errors: &[GenericShutdownError],
@@ -536,74 +1171,179 @@ fn render_generic_command_result(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> ExitCode {
+    let mut stdout = StreamPresentation::new(ProcessStream::Stdout, stdout);
+    let mut stderr = StreamPresentation::new(ProcessStream::Stderr, stderr);
+    let run_log = RunLogPresentation::new(
+        pending_project_log
+            .as_ref()
+            .and_then(PendingProjectLog::log_path)
+            .map(PathBuf::from),
+    );
+    let had_presentation_failure = pending_project_log
+        .as_ref()
+        .is_some_and(PendingProjectLog::has_presentation_failure);
+    render_generic_command_result_with_run_log(
+        result,
+        shutdown_errors,
+        pending_project_log,
+        &run_log,
+        had_presentation_failure,
+        localizer,
+        &mut stdout,
+        &mut stderr,
+    )
+}
+
+fn render_generic_command_result_with_run_log(
+    result: GenericCommandRunResult,
+    shutdown_errors: &[GenericShutdownError],
+    pending_project_log: Option<PendingProjectLog>,
+    run_log: &RunLogPresentation,
+    had_presentation_failure: bool,
+    localizer: &UiLocalizer,
+    stdout: &mut StreamPresentation<'_>,
+    stderr: &mut StreamPresentation<'_>,
+) -> ExitCode {
     match result {
         GenericCommandRunResult::Succeeded(output) => {
-            if let Err(source) = render_generic_output(output, localizer, stdout) {
-                let diagnostic =
-                    process_output_failure_report(RuntimeOperation::WriteStdout, &source);
+            if let Err(source) = render_generic_output(&output, localizer, stdout) {
+                let diagnostic = process_output_failure_report(
+                    StateEffect::AppliedFinalizationFailed,
+                    RuntimeOperation::WriteStdout,
+                    &source,
+                );
                 let mut presentation_failures = vec![diagnostic.clone()];
-                if let Err(source) = writeln!(
-                    stderr,
-                    "{}",
-                    render_diagnostic_report(&diagnostic, localizer)
-                ) {
+                if let Err(source) = render_primary_error(&diagnostic, localizer, stderr) {
                     presentation_failures.push(process_output_failure_report(
+                        StateEffect::AppliedFinalizationFailed,
                         RuntimeOperation::WriteStderr,
                         &source,
                     ));
                 }
                 if let Err(source) =
-                    render_generic_shutdown_errors(shutdown_errors, localizer, stderr)
+                    render_generic_shutdown_errors(shutdown_errors, true, localizer, stderr)
                 {
                     presentation_failures.push(process_output_failure_report(
+                        StateEffect::AppliedFinalizationFailed,
                         RuntimeOperation::WriteStderr,
                         &source,
                     ));
                 }
-                let (warning, _) = finish_project_log_after_presentation(
+                if presentation_failures.len() == 1 {
+                    record_run_log_path(
+                        run_log,
+                        localizer,
+                        stderr,
+                        StateEffect::AppliedFinalizationFailed,
+                        RuntimeOperation::WriteStderr,
+                        &mut presentation_failures,
+                    );
+                }
+                let _ = finish_project_log_after_presentation(
                     pending_project_log,
                     presentation_failures,
+                    StateEffect::AppliedFinalizationFailed,
+                    localizer,
                     stdout,
                     stderr,
                 );
-                let warning_failed = render_generic_project_log_warning_if_present(
-                    localizer,
-                    warning.as_ref(),
-                    stderr,
-                )
-                .is_err();
-                if warning_failed {
-                    return ExitCode::FAILURE;
+                ExitCode::FAILURE
+            } else if let Err(source) = render_generic_success_warnings(&output, localizer, stderr)
+            {
+                let diagnostic = process_output_failure_report(
+                    StateEffect::AppliedFinalizationFailed,
+                    RuntimeOperation::WriteStderr,
+                    &source,
+                );
+                let mut presentation_failures = vec![diagnostic.clone()];
+                if let Err(source) = render_primary_error(&diagnostic, localizer, stderr) {
+                    presentation_failures.push(process_output_failure_report(
+                        StateEffect::AppliedFinalizationFailed,
+                        RuntimeOperation::WriteStderr,
+                        &source,
+                    ));
                 }
+                if let Err(source) =
+                    render_generic_shutdown_errors(shutdown_errors, true, localizer, stderr)
+                {
+                    presentation_failures.push(process_output_failure_report(
+                        StateEffect::AppliedFinalizationFailed,
+                        RuntimeOperation::WriteStderr,
+                        &source,
+                    ));
+                }
+                if presentation_failures.len() == 1 {
+                    record_run_log_path(
+                        run_log,
+                        localizer,
+                        stderr,
+                        StateEffect::AppliedFinalizationFailed,
+                        RuntimeOperation::WriteStderr,
+                        &mut presentation_failures,
+                    );
+                }
+                let _ = finish_project_log_after_presentation(
+                    pending_project_log,
+                    presentation_failures,
+                    StateEffect::AppliedFinalizationFailed,
+                    localizer,
+                    stdout,
+                    stderr,
+                );
                 ExitCode::FAILURE
             } else {
                 let mut presentation_failures = Vec::new();
-                if let Err(source) =
-                    render_generic_shutdown_errors(shutdown_errors, localizer, stderr)
-                {
-                    presentation_failures.push(process_output_failure_report(
-                        RuntimeOperation::WriteStderr,
-                        &source,
-                    ));
+                if !shutdown_errors.is_empty() {
+                    if let Err(source) = writeln!(
+                        stderr,
+                        "{}",
+                        localizer.format(UiMessage::DiagnosticErrorHeading)
+                    ) {
+                        presentation_failures.push(process_output_failure_report(
+                            StateEffect::AppliedFinalizationFailed,
+                            RuntimeOperation::WriteStderr,
+                            &source,
+                        ));
+                    } else if let Err(source) =
+                        render_generic_shutdown_errors(shutdown_errors, false, localizer, stderr)
+                    {
+                        presentation_failures.push(process_output_failure_report(
+                            StateEffect::AppliedFinalizationFailed,
+                            RuntimeOperation::WriteStderr,
+                            &source,
+                        ));
+                    }
                 }
-                let (warning, had_presentation_failure) = finish_project_log_after_presentation(
+                if presentation_failures.is_empty()
+                    && (!shutdown_errors.is_empty() || had_presentation_failure)
+                {
+                    record_run_log_path(
+                        run_log,
+                        localizer,
+                        stderr,
+                        StateEffect::AppliedFinalizationFailed,
+                        RuntimeOperation::WriteStderr,
+                        &mut presentation_failures,
+                    );
+                } else if presentation_failures.is_empty() {
+                    record_run_log_path(
+                        run_log,
+                        localizer,
+                        stdout,
+                        StateEffect::AppliedFinalizationFailed,
+                        RuntimeOperation::WriteStdout,
+                        &mut presentation_failures,
+                    );
+                }
+                let had_presentation_failure = finish_project_log_after_presentation(
                     pending_project_log,
                     presentation_failures,
+                    StateEffect::AppliedFinalizationFailed,
+                    localizer,
                     stdout,
                     stderr,
                 );
-                let warning_presentation_failed = warning
-                    .as_ref()
-                    .is_some_and(|warning| !warning.presentation_failures.is_empty());
-                if render_generic_project_log_warning_if_present(
-                    localizer,
-                    warning.as_ref(),
-                    stderr,
-                )
-                .is_err()
-                    || warning_presentation_failed
-                    || had_presentation_failure
-                {
+                if had_presentation_failure {
                     return ExitCode::FAILURE;
                 }
                 if shutdown_errors.is_empty() {
@@ -614,42 +1354,48 @@ fn render_generic_command_result(
             }
         }
         GenericCommandRunResult::Failed(error) => {
+            let presentation_effect = generic_command_error_report(&error).effect();
             let mut presentation_failures = Vec::new();
             let diagnostic_result = if let Some(manual) = error.manual_error() {
                 render_manual_command_error(manual, localizer, stderr)
             } else {
                 let diagnostic = generic_command_error_report(&error);
-                writeln!(
-                    stderr,
-                    "{}",
-                    render_diagnostic_report(&diagnostic, localizer)
-                )
+                render_primary_error(&diagnostic, localizer, stderr)
             };
             if let Err(source) = diagnostic_result {
                 presentation_failures.push(process_output_failure_report(
+                    presentation_effect,
                     RuntimeOperation::WriteStderr,
                     &source,
                 ));
             }
-            if let Err(source) = render_generic_shutdown_errors(shutdown_errors, localizer, stderr)
+            if let Err(source) =
+                render_generic_shutdown_errors(shutdown_errors, true, localizer, stderr)
             {
                 presentation_failures.push(process_output_failure_report(
+                    presentation_effect,
                     RuntimeOperation::WriteStderr,
                     &source,
                 ));
             }
-            let (warning, _) = finish_project_log_after_presentation(
+            if presentation_failures.is_empty() {
+                record_run_log_path(
+                    run_log,
+                    localizer,
+                    stderr,
+                    presentation_effect,
+                    RuntimeOperation::WriteStderr,
+                    &mut presentation_failures,
+                );
+            }
+            let _ = finish_project_log_after_presentation(
                 pending_project_log,
                 presentation_failures,
+                presentation_effect,
+                localizer,
                 stdout,
                 stderr,
             );
-            let warning_failed =
-                render_generic_project_log_warning_if_present(localizer, warning.as_ref(), stderr)
-                    .is_err();
-            if warning_failed {
-                return ExitCode::FAILURE;
-            }
             ExitCode::FAILURE
         }
         GenericCommandRunResult::Interrupted => {
@@ -658,29 +1404,51 @@ fn render_generic_command_result(
                 writeln!(stderr, "{}", localizer.format(UiMessage::ResultCancelled))
             {
                 presentation_failures.push(process_output_failure_report(
+                    StateEffect::ProgressPreserved,
                     RuntimeOperation::WriteStderr,
                     &source,
                 ));
             }
-            if let Err(source) = render_generic_shutdown_errors(shutdown_errors, localizer, stderr)
-            {
-                presentation_failures.push(process_output_failure_report(
-                    RuntimeOperation::WriteStderr,
-                    &source,
-                ));
+            if !shutdown_errors.is_empty() {
+                if let Err(source) = writeln!(
+                    stderr,
+                    "{}",
+                    localizer.format(UiMessage::DiagnosticErrorHeading)
+                ) {
+                    presentation_failures.push(process_output_failure_report(
+                        StateEffect::ProgressPreserved,
+                        RuntimeOperation::WriteStderr,
+                        &source,
+                    ));
+                } else if let Err(source) =
+                    render_generic_shutdown_errors(shutdown_errors, false, localizer, stderr)
+                {
+                    presentation_failures.push(process_output_failure_report(
+                        StateEffect::ProgressPreserved,
+                        RuntimeOperation::WriteStderr,
+                        &source,
+                    ));
+                }
             }
-            let (warning, cancellation_failed) = finish_project_log_after_presentation(
+            if presentation_failures.is_empty() {
+                record_run_log_path(
+                    run_log,
+                    localizer,
+                    stderr,
+                    StateEffect::ProgressPreserved,
+                    RuntimeOperation::WriteStderr,
+                    &mut presentation_failures,
+                );
+            }
+            let cancellation_failed = finish_project_log_after_presentation(
                 pending_project_log,
                 presentation_failures,
+                StateEffect::ProgressPreserved,
+                localizer,
                 stdout,
                 stderr,
             );
-            let warning_presentation_failed = warning
-                .as_ref()
-                .is_some_and(|warning| !warning.presentation_failures.is_empty());
-            let warning_result =
-                render_generic_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
-            if warning_result.is_err() || cancellation_failed || warning_presentation_failed {
+            if cancellation_failed {
                 ExitCode::FAILURE
             } else if shutdown_errors.is_empty() {
                 ExitCode::from(130)
@@ -692,7 +1460,7 @@ fn render_generic_command_result(
 }
 
 fn render_generic_output(
-    output: GenericCommandOutput,
+    output: &GenericCommandOutput,
     localizer: &UiLocalizer,
     stdout: &mut dyn Write,
 ) -> io::Result<()> {
@@ -723,9 +1491,9 @@ fn render_generic_output(
                     stdout,
                     "{}",
                     localizer.format(UiMessage::ResultGenericExtractUnchanged {
-                        files: count(files),
-                        groups: count(groups),
-                        units: count(units),
+                        files: count(*files),
+                        groups: count(*groups),
+                        units: count(*units),
                     })
                 ),
                 crate::generic::ExtractOutcome::Updated {
@@ -738,11 +1506,11 @@ fn render_generic_output(
                     stdout,
                     "{}",
                     localizer.format(UiMessage::ResultGenericExtractUpdated {
-                        files: count(files),
-                        groups: count(groups),
-                        units: count(units),
-                        preserved: count(preserved_translations),
-                        cleared: count(cleared_translations),
+                        files: count(*files),
+                        groups: count(*groups),
+                        units: count(*units),
+                        preserved: count(*preserved_translations),
+                        cleared: count(*cleared_translations),
                     })
                 ),
             }
@@ -757,8 +1525,21 @@ fn render_generic_output(
                 "{}",
                 localizer.format(UiMessage::ResultTranslateCompleted {
                     project: project.as_str(),
-                    profile: &profile_id,
+                    profile: profile_id,
                 })
+            )?;
+            let status = if summary.is_incomplete() {
+                "incomplete"
+            } else if summary.total_tasks == 0 {
+                "no_work"
+            } else {
+                "complete"
+            };
+            let status = localizer.format(UiMessage::ResultTranslateStatusValue { status });
+            writeln!(
+                stdout,
+                "{}",
+                localizer.format(UiMessage::ResultTranslateStatus { status: &status })
             )?;
             writeln!(
                 stdout,
@@ -813,23 +1594,23 @@ fn render_generic_output(
                 stdout,
                 "{}",
                 localizer.format(UiMessage::ResultGenericWriteBackSummary {
-                    translated: count(translated_units),
-                    original: count(retained_source_units),
+                    translated: count(*translated_units),
+                    original: count(*retained_source_units),
                 })
             )?;
             writeln!(
                 stdout,
                 "{}",
                 localizer.format(UiMessage::ResultSymbolRepairSummary {
-                    attempted: count(symbol_repair_attempted_units),
-                    repaired: count(symbol_repair_repaired_units),
-                    skipped: count(symbol_repair_skipped_units),
-                    replacements: count(symbol_repair_replacements),
+                    attempted: count(*symbol_repair_attempted_units),
+                    repaired: count(*symbol_repair_repaired_units),
+                    skipped: count(*symbol_repair_skipped_units),
+                    replacements: count(*symbol_repair_replacements),
                 })
             )
         }
         GenericCommandOutput::Manual { summary } => {
-            render_manual_command_summary(&summary, localizer, stdout)
+            render_manual_command_summary(summary, localizer, stdout)
         }
         GenericCommandOutput::Lua { project, .. } => writeln!(
             stdout,
@@ -841,12 +1622,89 @@ fn render_generic_output(
     }
 }
 
-fn render_generic_shutdown_errors(
-    errors: &[GenericShutdownError],
+fn render_generic_success_warnings(
+    output: &GenericCommandOutput,
     localizer: &UiLocalizer,
     stderr: &mut dyn Write,
 ) -> io::Result<()> {
-    for error in errors {
+    let GenericCommandOutput::Translate {
+        project, summary, ..
+    } = output
+    else {
+        return Ok(());
+    };
+    if !summary.is_incomplete() {
+        return Ok(());
+    }
+    let count =
+        |value: usize| u64::try_from(value).expect("当前目标平台的结果计数必须能用 u64 表达");
+    let object = localizer.format(UiMessage::TranslateIncompleteObject {
+        project: project.as_str(),
+    });
+    let reason = localizer.format(UiMessage::TranslateIncompleteGenericReason {
+        partial: count(summary.partial_tasks),
+        unavailable: count(summary.unavailable_tasks),
+        conflicted: count(summary.conflicted_units),
+        problems: count(summary.response_problems),
+    });
+    let impact = render_state_effect_impact(StateEffect::ProgressPreserved, localizer);
+    let help = localizer.format(UiMessage::TranslateIncompleteHelp);
+    writeln!(
+        stderr,
+        "{}",
+        localizer.format(UiMessage::DiagnosticWarningHeading)
+    )?;
+    writeln!(
+        stderr,
+        "{}",
+        localizer.format(UiMessage::DiagnosticObject { subject: &object })
+    )?;
+    writeln!(
+        stderr,
+        "{}",
+        localizer.format(UiMessage::DiagnosticExplanation { reason: &reason })
+    )?;
+    writeln!(
+        stderr,
+        "{}",
+        localizer.format(UiMessage::DiagnosticImpact { impact: &impact })
+    )?;
+    writeln!(
+        stderr,
+        "{}",
+        localizer.format(UiMessage::DiagnosticResolution { action: &help })
+    )
+}
+
+fn render_primary_error(
+    report: &DiagnosticReport,
+    localizer: &UiLocalizer,
+    stderr: &mut dyn Write,
+) -> io::Result<()> {
+    writeln!(
+        stderr,
+        "{}",
+        localizer.format(UiMessage::DiagnosticErrorHeading)
+    )?;
+    writeln!(stderr, "{}", render_diagnostic_report(report, localizer))
+}
+
+fn render_generic_shutdown_errors(
+    errors: &[GenericShutdownError],
+    follows_primary: bool,
+    localizer: &UiLocalizer,
+    stderr: &mut dyn Write,
+) -> io::Result<()> {
+    for (index, error) in errors.iter().enumerate() {
+        if follows_primary || index > 0 {
+            writeln!(
+                stderr,
+                "{}",
+                localizer.format(UiMessage::DiagnosticRelated {
+                    relation: "shutdown",
+                })
+            )?;
+        }
         writeln!(
             stderr,
             "{}",
@@ -858,29 +1716,41 @@ fn render_generic_shutdown_errors(
 
 fn catch_generic_logged_presentation(
     panic_report: Option<DiagnosticReport>,
+    run_log: &RunLogPresentation,
     localizer: &UiLocalizer,
-    stderr: &mut dyn Write,
-    presentation: impl FnOnce(&mut dyn Write) -> ExitCode,
+    stdout: &mut StreamPresentation<'_>,
+    stderr: &mut StreamPresentation<'_>,
+    presentation: impl FnOnce(&mut StreamPresentation<'_>, &mut StreamPresentation<'_>) -> ExitCode,
 ) -> ExitCode {
-    match catch_unwind(AssertUnwindSafe(|| presentation(stderr))) {
+    match catch_unwind(AssertUnwindSafe(|| presentation(stdout, stderr))) {
         Ok(exit_code) => exit_code,
         Err(payload) => {
             let Some(report) = panic_report else {
                 std::panic::resume_unwind(payload);
             };
             drop(payload);
-            render_diagnostic_report_fatal(localizer, &report, stderr)
+            let _ = render_primary_error(&report, localizer, stderr);
+            let _ = run_log.write(localizer, stderr);
+            finalize_process_output(
+                ExitCode::FAILURE,
+                StateEffect::OutcomeUnknown,
+                localizer,
+                stdout,
+                stderr,
+            )
         }
     }
 }
 
 fn catch_logged_presentation(
     panic_boundary: Option<CommandPanicBoundary>,
+    run_log: &RunLogPresentation,
     localizer: &UiLocalizer,
-    stderr: &mut dyn Write,
-    presentation: impl FnOnce(&mut dyn Write) -> ExitCode,
+    stdout: &mut StreamPresentation<'_>,
+    stderr: &mut StreamPresentation<'_>,
+    presentation: impl FnOnce(&mut StreamPresentation<'_>, &mut StreamPresentation<'_>) -> ExitCode,
 ) -> ExitCode {
-    let result = catch_unwind(AssertUnwindSafe(|| presentation(stderr)));
+    let result = catch_unwind(AssertUnwindSafe(|| presentation(stdout, stderr)));
     match result {
         Ok(exit_code) => exit_code,
         Err(payload) => {
@@ -890,11 +1760,15 @@ fn catch_logged_presentation(
             // 与命令边界相同，payload 只负责触发控制流，绝不读取或格式化。
             drop(payload);
             let error = panic_boundary.panic_error();
-            if CommandResultRenderer::render_failure(Some(&error), None, localizer, stderr).is_err()
-            {
-                return ExitCode::FAILURE;
-            }
-            ExitCode::FAILURE
+            let _ = CommandResultRenderer::render_failure(Some(&error), None, localizer, stderr);
+            let _ = run_log.write(localizer, stderr);
+            finalize_process_output(
+                ExitCode::FAILURE,
+                StateEffect::OutcomeUnknown,
+                localizer,
+                stdout,
+                stderr,
+            )
         }
     }
 }
@@ -904,7 +1778,7 @@ fn render_diagnostic_report_fatal(
     report: &DiagnosticReport,
     stderr: &mut dyn Write,
 ) -> ExitCode {
-    if writeln!(stderr, "{}", render_diagnostic_report(report, localizer)).is_err() {
+    if render_primary_error(report, localizer, stderr).is_err() {
         return ExitCode::FAILURE;
     }
     ExitCode::FAILURE
@@ -915,33 +1789,34 @@ fn render_project_log_warning(
     warning: &ProjectLogWarning,
     stderr: &mut dyn Write,
 ) -> io::Result<()> {
-    // 日志降级后的诊断必须给出实际 JSONL 路径，调用者才能检查已保留的证据；路径
-    // 来自本地项目工作区，不从错误正文或外部响应拼接。
-    if let Some(path) = &warning.log_path {
-        writeln!(stderr, "project_log_path={}", path.display())?;
-    }
-    if !warning.project_log.is_empty() {
-        writeln!(stderr, "{}", localizer.format(UiMessage::NoticeLogDegraded))?;
-        for report in &warning.project_log {
-            writeln!(stderr, "{}", render_diagnostic_report(report, localizer))?;
-        }
-    }
-    if !warning.task_records.is_empty() {
+    for report in &warning.project_log {
         writeln!(
             stderr,
             "{}",
-            localizer.format(UiMessage::NoticeTaskRecordsDegraded)
+            localizer.format(UiMessage::DiagnosticWarningHeading)
         )?;
-        for report in &warning.task_records {
-            writeln!(stderr, "{}", render_diagnostic_report(report, localizer))?;
-        }
+        writeln!(stderr, "{}", render_diagnostic_report(report, localizer))?;
+    }
+    for report in &warning.task_records {
+        writeln!(
+            stderr,
+            "{}",
+            localizer.format(UiMessage::DiagnosticWarningHeading)
+        )?;
+        writeln!(stderr, "{}", render_diagnostic_report(report, localizer))?;
     }
     for report in &warning.presentation_failures {
+        writeln!(
+            stderr,
+            "{}",
+            localizer.format(UiMessage::DiagnosticErrorHeading)
+        )?;
         writeln!(stderr, "{}", render_diagnostic_report(report, localizer))?;
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn render_project_log_warning_if_present(
     localizer: &UiLocalizer,
     warning: Option<&ProjectLogWarning>,
@@ -951,14 +1826,6 @@ fn render_project_log_warning_if_present(
         render_project_log_warning(localizer, warning, stderr)?;
     }
     Ok(())
-}
-
-fn render_generic_project_log_warning_if_present(
-    localizer: &UiLocalizer,
-    warning: Option<&ProjectLogWarning>,
-    stderr: &mut dyn Write,
-) -> io::Result<()> {
-    render_project_log_warning_if_present(localizer, warning, stderr)
 }
 
 #[cfg(test)]
@@ -1002,21 +1869,24 @@ mod tests {
     use std::process::Command;
     use std::sync::{Arc, Mutex};
 
+    use secrecy::SecretString;
+
     use super::*;
     use crate::application::command::{RpgMakerCommandOutput, ShutdownFailures};
     use crate::application::config::CommonCommandConfiguration;
-    use crate::application::generic_command::GenericCommandError;
-    use crate::application::project_log::{CommandLogStart, start_command_log};
+    use crate::application::generic_command::{GenericCommandError, GenericTranslationSummary};
+    use crate::application::project_log::{ActiveProjectLog, CommandLogStart, start_command_log};
     use crate::diagnostic::DiagnosticStage;
     use crate::rpg_maker::extract::{
         ExtractOutput, RulesCommandNonStringType, RulesCommandNonStringWarning,
     };
+    use crate::rpg_maker::translate::{TranslateOutput, TranslationSummary};
     use crate::runtime::performance::RunPerformanceCounters;
     use crate::runtime::project_log::{
         ProjectLogCommand, ProjectLogEngine, RunPlanValueSource as ProjectLogValueSource,
     };
 
-    fn cancelled_project_log(root: &Path, project: &str) -> (PendingProjectLog, PathBuf) {
+    fn active_project_log(root: &Path, project: &str) -> (ActiveProjectLog, PathBuf) {
         let common = CommonCommandConfiguration::for_test(root);
         fs::create_dir_all(root.join("generic").join(project)).expect("应建立项目工作区");
         let active = start_command_log(CommandLogStart {
@@ -1026,6 +1896,7 @@ mod tests {
             project,
             command: ProjectLogCommand::Lua,
             performance: Arc::new(RunPerformanceCounters::default()),
+            selected_api_key_redactor: None,
         });
         let run_id = active.run_id().expect("项目日志必须取得 RunId").to_owned();
         let path = root
@@ -1033,6 +1904,11 @@ mod tests {
             .join(project)
             .join("logs")
             .join(format!("{run_id}.jsonl"));
+        (active, path)
+    }
+
+    fn cancelled_project_log(root: &Path, project: &str) -> (PendingProjectLog, PathBuf) {
+        let (active, path) = active_project_log(root, project);
         (active.pending_cancelled(), path)
     }
 
@@ -1041,22 +1917,7 @@ mod tests {
         project: &str,
         report: DiagnosticReport,
     ) -> (PendingProjectLog, PathBuf) {
-        let common = CommonCommandConfiguration::for_test(root);
-        fs::create_dir_all(root.join("generic").join(project)).expect("应建立项目工作区");
-        let active = start_command_log(CommandLogStart {
-            common: &common,
-            locale: UiLocale::SimplifiedChinese,
-            engine: ProjectLogEngine::Generic,
-            project,
-            command: ProjectLogCommand::Lua,
-            performance: Arc::new(RunPerformanceCounters::default()),
-        });
-        let run_id = active.run_id().expect("项目日志必须取得 RunId").to_owned();
-        let path = root
-            .join("generic")
-            .join(project)
-            .join("logs")
-            .join(format!("{run_id}.jsonl"));
+        let (active, path) = active_project_log(root, project);
         (active.pending_failure(report), path)
     }
 
@@ -1083,6 +1944,23 @@ mod tests {
             })
             .filter(|record| record["event"] == "diagnostic.run")
             .count()
+    }
+
+    fn run_diagnostic_relations(path: &Path) -> Vec<String> {
+        fs::read_to_string(path)
+            .expect("项目日志应可读取")
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).expect("项目日志每行都必须是 JSON")
+            })
+            .filter(|record| record["event"] == "diagnostic.run")
+            .map(|record| {
+                record["payload"]["relation"]
+                    .as_str()
+                    .expect("诊断 relation 必须是字符串")
+                    .to_owned()
+            })
+            .collect()
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1160,6 +2038,30 @@ mod tests {
         flush_attempts: usize,
     }
 
+    #[derive(Default)]
+    struct FlushCountingOutput {
+        bytes: Vec<u8>,
+        flush_attempts: usize,
+    }
+
+    #[derive(Default)]
+    struct SecondFlushFailingOutput {
+        bytes: Vec<u8>,
+        flush_attempts: usize,
+    }
+
+    impl Write for FlushCountingOutput {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flush_attempts += 1;
+            Ok(())
+        }
+    }
+
     impl Write for FlushFailingOutput {
         fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
             self.bytes.extend_from_slice(buffer);
@@ -1172,6 +2074,25 @@ mod tests {
                 io::ErrorKind::BrokenPipe,
                 "测试输出流最终刷新失败",
             ))
+        }
+    }
+
+    impl Write for SecondFlushFailingOutput {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flush_attempts += 1;
+            if self.flush_attempts == 2 {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "测试关闭项目日志后的最终 flush 失败",
+                ))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -1209,7 +2130,7 @@ mod tests {
             },
             plan_source: ProjectLogValueSource::Explicit,
             owners: vec!["Rules".to_owned()],
-            disabled_owners: Vec::new(),
+            run_plan_warnings: Vec::new(),
             has_saved_plan: true,
         };
         let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
@@ -1232,12 +2153,236 @@ mod tests {
         assert!(stdout.contains("提取完成"));
         assert!(stdout.contains("project"));
         assert!(!stdout.contains("非字符串"));
-        assert!(plain_stderr.contains("Rules 规则 2"));
+        assert!(plain_stderr.contains("Rules rule 2"));
         assert!(plain_stderr.contains("Map001.json"));
         assert!(plain_stderr.contains("code=355"));
         assert!(plain_stderr.contains("parameter=0"));
-        assert!(plain_stderr.contains("类型 number"));
-        assert!(plain_stderr.contains("3 个"));
+        assert!(plain_stderr.contains("type=number"));
+        assert!(plain_stderr.contains("skipped=3"));
+    }
+
+    #[test]
+    fn run_log_path_is_shown_once_on_the_stream_for_the_final_result() {
+        let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
+        let temporary = tempfile::tempdir().expect("应建立测试目录");
+
+        let (rpg_active, rpg_path) = active_project_log(temporary.path(), "rpg-success-log");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let rpg_exit = render_command_report(
+            CommandRunResult::Succeeded(RpgMakerCommandOutput::Lua {
+                project: "rpg-success-log".parse().expect("测试项目名应合法"),
+            }),
+            None,
+            Some(rpg_active.pending_succeeded()),
+            &localizer,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(rpg_exit, ExitCode::SUCCESS);
+        let plain_stdout = String::from_utf8(stdout)
+            .expect("stdout 应为 UTF-8")
+            .replace(['\u{2068}', '\u{2069}'], "");
+        assert_eq!(plain_stdout.matches("运行记录：").count(), 1);
+        assert!(plain_stdout.contains(&rpg_path.to_string_lossy().to_string()));
+        assert!(stderr.is_empty(), "成功运行的日志路径不得写入 stderr");
+
+        let generic_error = GenericCommandError::Signal {
+            source: io::Error::other("测试 Generic 业务失败"),
+            operation: None,
+            state_applied: false,
+        };
+        let generic_report = generic_command_error_report(&generic_error);
+        let (generic_active, generic_path) =
+            active_project_log(temporary.path(), "generic-failed-log");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let generic_exit = render_generic_command_result(
+            GenericCommandRunResult::Failed(generic_error),
+            &[],
+            Some(generic_active.pending_failure(generic_report)),
+            &localizer,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(generic_exit, ExitCode::FAILURE);
+        assert!(stdout.is_empty(), "失败运行的日志路径不得写入 stdout");
+        let plain_stderr = String::from_utf8(stderr)
+            .expect("stderr 应为 UTF-8")
+            .replace(['\u{2068}', '\u{2069}'], "");
+        assert_eq!(plain_stderr.matches("运行记录：").count(), 1);
+        assert!(plain_stderr.contains(&generic_path.to_string_lossy().to_string()));
+
+        let (cancelled, cancelled_path) =
+            cancelled_project_log(temporary.path(), "generic-cancelled-log");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let cancelled_exit = render_generic_command_result(
+            GenericCommandRunResult::Interrupted,
+            &[],
+            Some(cancelled),
+            &localizer,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(cancelled_exit, ExitCode::from(130));
+        assert!(stdout.is_empty(), "取消运行的日志路径不得写入 stdout");
+        let plain_stderr = String::from_utf8(stderr)
+            .expect("stderr 应为 UTF-8")
+            .replace(['\u{2068}', '\u{2069}'], "");
+        assert_eq!(plain_stderr.matches("运行记录：").count(), 1);
+        assert!(plain_stderr.contains(&cancelled_path.to_string_lossy().to_string()));
+
+        let panic_path = temporary.path().join("generic-panic/logs/run-000001.jsonl");
+        let panic_error = GenericCommandError::Signal {
+            source: io::Error::other("测试顶层业务 panic"),
+            operation: None,
+            state_applied: false,
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let panic_exit = render_generic_command_report(
+            GenericCommandRunReport {
+                result: GenericCommandRunResult::Failed(panic_error),
+                shutdown_errors: Vec::new(),
+                pending_project_log: None,
+                panic_log_path: Some(panic_path.clone()),
+                selected_api_key_redactor: None,
+            },
+            &localizer,
+            &mut StreamPresentation::new(ProcessStream::Stdout, &mut stdout),
+            &mut StreamPresentation::new(ProcessStream::Stderr, &mut stderr),
+        );
+        assert_eq!(panic_exit, ExitCode::FAILURE);
+        assert!(stdout.is_empty());
+        let plain_stderr = String::from_utf8(stderr)
+            .expect("stderr 应为 UTF-8")
+            .replace(['\u{2068}', '\u{2069}'], "");
+        assert_eq!(plain_stderr.matches("运行记录：").count(), 1);
+        assert!(plain_stderr.contains(&panic_path.to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn generic_translate_prints_no_work_complete_and_structured_incomplete_results() {
+        let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
+        let output = |summary| GenericCommandOutput::Translate {
+            project: "generic-status".parse().expect("测试项目名应合法"),
+            profile_id: "default".to_owned(),
+            summary,
+        };
+
+        for (summary, expected) in [
+            (GenericTranslationSummary::default(), "状态：无需处理"),
+            (
+                GenericTranslationSummary {
+                    total_tasks: 1,
+                    complete_tasks: 1,
+                    ..GenericTranslationSummary::default()
+                },
+                "状态：完整",
+            ),
+            (
+                GenericTranslationSummary {
+                    conflicted_units: 1,
+                    ..GenericTranslationSummary::default()
+                },
+                "状态：未完整",
+            ),
+        ] {
+            let mut stdout = Vec::new();
+            render_generic_output(&output(summary), &localizer, &mut stdout)
+                .expect("Generic Translate 结果应可呈现");
+            let stdout = String::from_utf8(stdout)
+                .expect("stdout 应为 UTF-8")
+                .replace(['\u{2068}', '\u{2069}'], "");
+            assert!(stdout.contains(expected), "实际输出：{stdout}");
+        }
+
+        let incomplete = output(GenericTranslationSummary {
+            total_tasks: 2,
+            complete_tasks: 1,
+            partial_tasks: 1,
+            unavailable_tasks: 0,
+            conflicted_units: 3,
+            response_problems: 4,
+            ..GenericTranslationSummary::default()
+        });
+        let mut stdout = Vec::new();
+        render_generic_output(&incomplete, &localizer, &mut stdout).expect("未完整结果应可呈现");
+        let stdout = String::from_utf8(stdout)
+            .expect("stdout 应为 UTF-8")
+            .replace(['\u{2068}', '\u{2069}'], "");
+        assert!(stdout.contains("状态：未完整"));
+
+        let mut stderr = Vec::new();
+        render_generic_success_warnings(&incomplete, &localizer, &mut stderr)
+            .expect("未完整警告应可呈现");
+        let stderr = String::from_utf8(stderr)
+            .expect("stderr 应为 UTF-8")
+            .replace(['\u{2068}', '\u{2069}'], "");
+        for expected in [
+            "警告：",
+            "对象：项目 generic-status 的本次 Translate",
+            "部分任务 1",
+            "写入冲突 3",
+            "响应问题 4",
+            "影响：",
+            "处理办法：",
+        ] {
+            assert!(stderr.contains(expected), "缺少 {expected:?}：{stderr}");
+        }
+    }
+
+    #[test]
+    fn rpg_translate_with_no_tasks_but_remaining_content_is_incomplete() {
+        let output = RpgMakerCommandOutput::Translate {
+            output: TranslateOutput {
+                name: "rpg-incomplete".parse().expect("测试项目名应合法"),
+                profile_id: "default".to_owned(),
+                summary: TranslationSummary {
+                    total_tasks: 0,
+                    complete_tasks: 0,
+                    partial_tasks: 0,
+                    unavailable_tasks: 0,
+                    accepted_decisions: 0,
+                    written_locations: 0,
+                    remaining_decisions: 1,
+                    remaining_locations: 2,
+                    protocol_diagnostics: 0,
+                    recoverable_request_exhaustions: 0,
+                    retained: 0,
+                    invalidated: 0,
+                    not_applicable: 0,
+                    reused: 0,
+                },
+            },
+            profile_source: ProjectLogValueSource::Explicit,
+        };
+        let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit = render_command_report(
+            CommandRunResult::Succeeded(output),
+            None,
+            None,
+            &localizer,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(exit, ExitCode::SUCCESS, "正常未完整结果仍使用成功退出码");
+        let stdout = String::from_utf8(stdout)
+            .expect("stdout 应为 UTF-8")
+            .replace(['\u{2068}', '\u{2069}'], "");
+        let stderr = String::from_utf8(stderr)
+            .expect("stderr 应为 UTF-8")
+            .replace(['\u{2068}', '\u{2069}'], "");
+        assert!(stdout.contains("状态：未完整"), "实际 stdout：{stdout}");
+        assert!(!stdout.contains("状态：无需处理"), "实际 stdout：{stdout}");
+        assert!(stderr.contains("警告："), "实际 stderr：{stderr}");
+        assert!(stderr.contains("剩余决策 1"), "实际 stderr：{stderr}");
+        assert!(stderr.contains("剩余位置 2"), "实际 stderr：{stderr}");
     }
 
     #[test]
@@ -1256,7 +2401,7 @@ mod tests {
             },
             plan_source: ProjectLogValueSource::Explicit,
             owners: vec!["Rules".to_owned()],
-            disabled_owners: Vec::new(),
+            run_plan_warnings: Vec::new(),
             has_saved_plan: true,
         };
         let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
@@ -1385,7 +2530,7 @@ mod tests {
         let plain = stderr.replace(['\u{2068}', '\u{2069}'], "");
         let stdout_position = stderr
             .find(&localizer.format(UiMessage::DiagnosticFailureValue {
-                code: "operation_failed",
+                code: "stdout_write_failed",
             }))
             .expect("stdout 写入失败必须成为主错误");
         let shutdown_position = stderr
@@ -1397,7 +2542,7 @@ mod tests {
             stdout_position < shutdown_position,
             "stdout 主错误必须先于 shutdown 相关错误"
         );
-        assert!(plain.contains("相关错误 1"));
+        assert!(plain.contains("同时，关闭失败"));
     }
 
     #[test]
@@ -1450,18 +2595,30 @@ mod tests {
         );
         let boundary = CommandPanicBoundary::from_report(report);
         let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
+        let run_log = RunLogPresentation::new(Some(log_path.clone()));
+        let mut stdout = Vec::new();
         let mut stderr = Vec::new();
+        let mut stdout_presentation = StreamPresentation::new(ProcessStream::Stdout, &mut stdout);
+        let mut stderr_presentation = StreamPresentation::new(ProcessStream::Stderr, &mut stderr);
 
-        let exit = catch_logged_presentation(Some(boundary), &localizer, &mut stderr, |_stderr| {
-            std::panic::panic_any(PANIC_BODY)
-        });
+        let exit = catch_logged_presentation(
+            Some(boundary),
+            &run_log,
+            &localizer,
+            &mut stdout_presentation,
+            &mut stderr_presentation,
+            |_stdout, _stderr| std::panic::panic_any(PANIC_BODY),
+        );
+        drop(stdout_presentation);
+        drop(stderr_presentation);
 
         assert_eq!(exit, ExitCode::FAILURE);
         let stderr = String::from_utf8(stderr).expect("panic 诊断应为 UTF-8");
         let plain = stderr.replace(['\u{2068}', '\u{2069}'], "");
         assert!(plain.contains("内部不变量被破坏"));
         assert!(plain.contains(&project_workspace.to_string_lossy().to_string()));
-        assert!(!plain.contains(&log_path.to_string_lossy().to_string()));
+        assert_eq!(plain.matches("运行记录：").count(), 1);
+        assert!(plain.contains(&log_path.to_string_lossy().to_string()));
         assert!(!plain.contains("runtime.result_presentation_panicked"));
         assert!(!stderr.contains(PANIC_BODY));
     }
@@ -1516,6 +2673,48 @@ mod tests {
         let version_exit = run_from(["att", "--version"], &mut stdout, &mut stderr);
         assert_eq!(version_exit, ExitCode::FAILURE);
         assert!(stdout.write_attempts > 0);
+
+        let mut stdout = FlushFailingOutput::default();
+        let mut stderr = FlushCountingOutput::default();
+        let help_flush_exit = run_from(["att", "--help"], &mut stdout, &mut stderr);
+        assert_eq!(help_flush_exit, ExitCode::FAILURE);
+        assert_eq!(
+            stdout.flush_attempts, 1,
+            "失败的 help stdout flush 不得重试"
+        );
+        let help_body = String::from_utf8(stdout.bytes)
+            .expect("原 help 正文应为 UTF-8")
+            .replace(['\u{2068}', '\u{2069}'], "");
+        let fallback = String::from_utf8(stderr.bytes)
+            .expect("help 回退应为 UTF-8")
+            .replace(['\u{2068}', '\u{2069}'], "");
+        assert!(
+            fallback.contains(&help_body),
+            "完整 help 正文必须转到 stderr"
+        );
+        assert!(fallback.contains("对象：stdout"));
+        assert!(fallback.contains("原因：无法刷新标准输出"));
+
+        let mut stdout = FlushCountingOutput::default();
+        let mut stderr = FlushFailingOutput::default();
+        let parse_flush_exit = run_from(["att", "unknown"], &mut stdout, &mut stderr);
+        assert_eq!(parse_flush_exit, ExitCode::FAILURE);
+        assert_eq!(
+            stderr.flush_attempts, 1,
+            "失败的 parse stderr flush 不得重试"
+        );
+        let parse_body = String::from_utf8(stderr.bytes)
+            .expect("原 parse error 应为 UTF-8")
+            .replace(['\u{2068}', '\u{2069}'], "");
+        let fallback = String::from_utf8(stdout.bytes)
+            .expect("parse error 回退应为 UTF-8")
+            .replace(['\u{2068}', '\u{2069}'], "");
+        assert!(
+            fallback.contains(&parse_body),
+            "完整 parse error 必须转到 stdout"
+        );
+        assert!(fallback.contains("对象：stderr"));
+        assert!(fallback.contains("原因：无法刷新标准错误"));
     }
 
     #[test]
@@ -1532,11 +2731,210 @@ mod tests {
     }
 
     #[test]
+    fn localized_parse_error_flush_panic_uses_after_parsing_boundary_and_selected_locale() {
+        let selected = UiLocalizer::new(UiLocale::Japanese);
+        let mut stdout = Vec::new();
+        let mut stderr = FlushPanickingOutput::default();
+
+        let exit = run_from(
+            ["att", "--ui-language", "ja", "unknown"],
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(exit, ExitCode::FAILURE);
+        assert_eq!(stderr.flush_attempts, 1, "panic 后不得重试坏流");
+        let original_error = String::from_utf8(stderr.bytes)
+            .expect("原 parse error 应为 UTF-8")
+            .replace(['\u{2068}', '\u{2069}'], "");
+        let fallback = String::from_utf8(stdout)
+            .expect("panic 回退应为 UTF-8")
+            .replace(['\u{2068}', '\u{2069}'], "");
+        assert!(
+            fallback.contains(&original_error),
+            "完整 parse error 必须转到 stdout"
+        );
+        assert!(
+            fallback.contains(&selected.format(UiMessage::DiagnosticFailureValue {
+                code: "internal_invariant",
+            }))
+        );
+        assert!(!fallback.contains("PROCESS_STARTUP"));
+    }
+
+    #[test]
+    fn successful_write_then_failed_flush_moves_complete_body_and_four_fields_once() {
+        const BODY: &str = "完整业务正文和运行记录：C:\\project\\logs\\run-000001.jsonl\n";
+        let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
+        let mut raw_stdout = FlushFailingOutput::default();
+        let mut raw_stderr = FlushCountingOutput::default();
+        let exit;
+        {
+            let mut stdout = StreamPresentation::new(ProcessStream::Stdout, &mut raw_stdout);
+            let mut stderr = StreamPresentation::new(ProcessStream::Stderr, &mut raw_stderr);
+            stdout
+                .write_all(BODY.as_bytes())
+                .expect("逻辑正文应先进入呈现缓冲");
+            exit = finalize_process_output(
+                ExitCode::SUCCESS,
+                StateEffect::Applied,
+                &localizer,
+                &mut stdout,
+                &mut stderr,
+            );
+        }
+
+        assert_eq!(exit, ExitCode::FAILURE);
+        assert_eq!(raw_stdout.flush_attempts, 1, "坏流不得重试 flush");
+        assert_eq!(raw_stdout.bytes, BODY.as_bytes(), "底层 write 必须已成功");
+        assert_eq!(
+            raw_stderr.flush_attempts, 1,
+            "健康相反流必须只写入并 flush 一批"
+        );
+        let fallback = String::from_utf8(raw_stderr.bytes)
+            .expect("回退输出应为 UTF-8")
+            .replace(['\u{2068}', '\u{2069}'], "");
+        assert_eq!(fallback.matches(BODY.trim_end()).count(), 1);
+        for expected in [
+            "错误：",
+            "对象：stdout",
+            "原因：无法刷新标准输出",
+            "影响：相关业务结果已经生效",
+            "处理办法：",
+        ] {
+            assert!(fallback.contains(expected), "缺少 {expected:?}：{fallback}");
+        }
+    }
+
+    #[test]
+    fn previously_flushed_opposite_stream_accepts_a_new_fallback_batch() {
+        const BODY: &str = "stderr 原始业务错误\n";
+        let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
+        let mut raw_stdout = FlushCountingOutput::default();
+        let mut raw_stderr = FlushFailingOutput::default();
+        let exit;
+        {
+            let mut stdout = StreamPresentation::new(ProcessStream::Stdout, &mut raw_stdout);
+            let mut stderr = StreamPresentation::new(ProcessStream::Stderr, &mut raw_stderr);
+            stdout.flush().expect("健康 stdout 的先前 flush 应成功");
+            stderr
+                .write_all(BODY.as_bytes())
+                .expect("stderr 业务正文应进入缓冲");
+            exit = finalize_process_output(
+                ExitCode::FAILURE,
+                StateEffect::Unchanged,
+                &localizer,
+                &mut stdout,
+                &mut stderr,
+            );
+        }
+
+        assert_eq!(exit, ExitCode::FAILURE);
+        assert_eq!(raw_stdout.flush_attempts, 2, "新回退批次必须再次 flush");
+        let fallback = String::from_utf8(raw_stdout.bytes)
+            .expect("回退输出应为 UTF-8")
+            .replace(['\u{2068}', '\u{2069}'], "");
+        assert_eq!(fallback.matches(BODY.trim_end()).count(), 1);
+        assert_eq!(fallback.matches("对象：stderr").count(), 1);
+    }
+
+    #[test]
+    fn api_key_split_across_writes_and_invalid_bytes_cannot_bypass_redaction() {
+        let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
+        let redactor = Arc::new(ApiKeyRedactor::new(SecretString::from("split-secret")));
+        let mut raw_stdout = FlushCountingOutput::default();
+        let mut raw_stderr = FlushCountingOutput::default();
+        {
+            let mut stdout = StreamPresentation::new(ProcessStream::Stdout, &mut raw_stdout);
+            let mut stderr = StreamPresentation::new(ProcessStream::Stderr, &mut raw_stderr);
+            stdout.select_api_key_redactor(Some(redactor.clone()));
+            stderr.select_api_key_redactor(Some(redactor));
+            stdout
+                .write_all(&[0xff])
+                .expect("无效 UTF-8 测试前缀应进入逻辑缓冲");
+            stdout
+                .write_all(b"endpoint=https://example.test/split-")
+                .expect("首段逻辑正文应进入缓冲");
+            stdout
+                .write_all(b"secret/v1")
+                .expect("第二段逻辑正文应进入缓冲");
+            stdout
+                .write_all(&[0xfe])
+                .expect("无效 UTF-8 测试后缀应进入逻辑缓冲");
+            let exit = finalize_process_output(
+                ExitCode::SUCCESS,
+                StateEffect::Applied,
+                &localizer,
+                &mut stdout,
+                &mut stderr,
+            );
+            assert_eq!(exit, ExitCode::SUCCESS);
+        }
+
+        let stdout = String::from_utf8(raw_stdout.bytes).expect("stdout 应为 UTF-8");
+        assert!(!stdout.contains("split-secret"));
+        assert!(stdout.contains("[REDACTED API KEY]"));
+        assert!(
+            stdout.contains('\u{fffd}'),
+            "无效字节必须以 UTF-8 replacement 呈现"
+        );
+    }
+
+    #[test]
+    fn project_result_is_not_flushed_again_after_its_log_has_closed() {
+        let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
+        let mut stdout = FlushCountingOutput::default();
+        let mut stderr = FlushCountingOutput::default();
+        let exit;
+        {
+            let mut stdout_presentation =
+                StreamPresentation::new(ProcessStream::Stdout, &mut stdout);
+            let mut stderr_presentation =
+                StreamPresentation::new(ProcessStream::Stderr, &mut stderr);
+            exit = finish_process_output_state(
+                ProcessOutputState::Flushed(ExitCode::SUCCESS),
+                &localizer,
+                &mut stdout_presentation,
+                &mut stderr_presentation,
+            );
+        }
+
+        assert_eq!(exit, ExitCode::SUCCESS);
+        assert_eq!(stdout.flush_attempts, 0);
+        assert_eq!(stderr.flush_attempts, 0);
+    }
+
+    #[test]
+    fn process_output_failure_keeps_context_effect_and_flush_operation() {
+        let source = io::Error::new(io::ErrorKind::BrokenPipe, "测试 flush 失败");
+        for (effect, operation, code) in [
+            (
+                StateEffect::AppliedFinalizationFailed,
+                RuntimeOperation::FlushStdout,
+                "runtime.stdout_flush",
+            ),
+            (
+                StateEffect::Unchanged,
+                RuntimeOperation::FlushStderr,
+                "runtime.stderr_flush",
+            ),
+            (
+                StateEffect::ProgressPreserved,
+                RuntimeOperation::WriteStderr,
+                "runtime.stderr_write",
+            ),
+        ] {
+            let report = process_output_failure_report(effect, operation, &source);
+            assert_eq!(report.effect(), effect);
+            assert_eq!(report.primary().code(), code);
+        }
+    }
+
+    #[test]
     fn project_log_warning_write_failure_is_returned() {
         let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
         let source = io::Error::from_raw_os_error(5);
         let warning = ProjectLogWarning {
-            log_path: Some("C:\\project\\logs\\run.jsonl".into()),
             project_log: vec![DiagnosticReport::new(
                 StateEffect::Unchanged,
                 Diagnostic::observability(crate::diagnostic::ObservabilityIssue::write(
@@ -1558,6 +2956,44 @@ mod tests {
 
         assert!(result.is_err());
         assert!(stderr.write_attempts > 0);
+    }
+
+    #[test]
+    fn post_close_diagnostic_flush_failure_is_shown_once_on_the_opposite_stream() {
+        let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
+        let report = process_output_failure_report_from_failure(
+            StateEffect::AppliedFinalizationFailed,
+            RuntimeOperation::StartWorker,
+            IoFailure::from_error(&io::Error::other("测试 worker 启动失败")),
+        );
+        let mut raw_stdout = FlushCountingOutput::default();
+        let mut raw_stderr = SecondFlushFailingOutput::default();
+        let failed;
+        {
+            let mut stdout = StreamPresentation::new(ProcessStream::Stdout, &mut raw_stdout);
+            let mut stderr = StreamPresentation::new(ProcessStream::Stderr, &mut raw_stderr);
+            failed = finish_project_log_after_presentation(
+                None,
+                vec![report],
+                StateEffect::AppliedFinalizationFailed,
+                &localizer,
+                &mut stdout,
+                &mut stderr,
+            );
+        }
+
+        assert!(failed);
+        assert_eq!(raw_stderr.flush_attempts, 2, "失败的最终 flush 不得重试");
+        assert_eq!(raw_stdout.flush_attempts, 2, "相反流只执行一次回退 flush");
+        let stdout = String::from_utf8(raw_stdout.bytes)
+            .expect("回退输出应为 UTF-8")
+            .replace(['\u{2068}', '\u{2069}'], "");
+        let worker_reason = localizer.format(UiMessage::DiagnosticFailureValue {
+            code: "worker_spawn_failed",
+        });
+        assert_eq!(stdout.matches(&format!("原因：{worker_reason}")).count(), 1);
+        assert_eq!(stdout.matches("原因：无法刷新标准错误").count(), 1);
+        assert_eq!(stdout.matches("对象：stderr").count(), 1);
     }
 
     #[test]
@@ -1615,6 +3051,7 @@ mod tests {
         assert_eq!(rpg_stderr.flush_attempts, 1);
         assert_eq!(run_finished_kind(&rpg_log_path), "failed");
         assert_eq!(run_diagnostic_count(&rpg_log_path), 1);
+        assert_eq!(run_diagnostic_relations(&rpg_log_path), ["primary"]);
 
         let (generic_log, generic_log_path) =
             cancelled_project_log(temporary.path(), "generic-cancel-flush");
@@ -1631,6 +3068,7 @@ mod tests {
         assert_eq!(generic_stderr.flush_attempts, 1);
         assert_eq!(run_finished_kind(&generic_log_path), "failed");
         assert_eq!(run_diagnostic_count(&generic_log_path), 1);
+        assert_eq!(run_diagnostic_relations(&generic_log_path), ["primary"]);
     }
 
     #[test]
@@ -1649,17 +3087,33 @@ mod tests {
             .map(CommandPanicBoundary::from_report);
         let mut stdout = Vec::new();
         let mut stderr = FlushPanickingOutput::default();
-
-        let exit = catch_logged_presentation(panic_boundary, &localizer, &mut stderr, |stderr| {
-            render_command_report(
-                CommandRunResult::Interrupted,
-                None,
-                pending,
+        let run_log = RunLogPresentation::new(Some(log_path.clone()));
+        let exit;
+        {
+            let mut stdout_presentation =
+                StreamPresentation::new(ProcessStream::Stdout, &mut stdout);
+            let mut stderr_presentation =
+                StreamPresentation::new(ProcessStream::Stderr, &mut stderr);
+            exit = catch_logged_presentation(
+                panic_boundary,
+                &run_log,
                 &localizer,
-                &mut stdout,
-                stderr,
-            )
-        });
+                &mut stdout_presentation,
+                &mut stderr_presentation,
+                |stdout, stderr| {
+                    render_command_report_with_run_log(
+                        CommandRunResult::Interrupted,
+                        None,
+                        pending,
+                        &run_log,
+                        false,
+                        &localizer,
+                        stdout,
+                        stderr,
+                    )
+                },
+            );
+        }
 
         assert_eq!(exit, ExitCode::FAILURE);
         assert_eq!(stderr.flush_attempts, 1);
@@ -1667,6 +3121,9 @@ mod tests {
             !stderr.bytes.is_empty(),
             "catch 必须继续呈现安全 panic 诊断"
         );
+        let stderr_text =
+            String::from_utf8_lossy(&stderr.bytes).replace(['\u{2068}', '\u{2069}'], "");
+        assert_eq!(stderr_text.matches("运行记录：").count(), 1);
         assert_eq!(run_finished_kind(&log_path), "outcome_unknown");
         assert_eq!(run_diagnostic_count(&log_path), 1);
     }
@@ -1702,6 +3159,11 @@ mod tests {
             2,
             "业务错误和最终 stderr 呈现错误都必须写入项目日志"
         );
+        assert_eq!(
+            run_diagnostic_relations(&rpg_log_path),
+            ["primary", "observability"],
+            "已有业务错误时，最终呈现错误只能是 observability related"
+        );
 
         let generic_error = GenericCommandError::Signal {
             source: io::Error::new(io::ErrorKind::BrokenPipe, "测试 signal 失败"),
@@ -1729,10 +3191,15 @@ mod tests {
             2,
             "Generic 业务错误和最终 stderr 呈现错误都必须写入项目日志"
         );
+        assert_eq!(
+            run_diagnostic_relations(&generic_log_path),
+            ["primary", "observability"],
+            "Generic 已有业务错误时，最终呈现错误只能是 observability related"
+        );
     }
 
     #[test]
-    fn configuration_errors_render_only_object_reason_and_help() {
+    fn configuration_errors_render_public_four_fields() {
         let localizer = UiLocalizer::new(crate::i18n::UiLocale::SimplifiedChinese);
         let mut stderr = Vec::new();
         let exit = render_configuration_load_error(
@@ -1750,8 +3217,9 @@ mod tests {
         assert_eq!(exit, ExitCode::FAILURE);
         let stderr = String::from_utf8(stderr).expect("诊断应为 UTF-8");
         let plain = stderr.replace(['\u{2068}', '\u{2069}'], "");
-        assert!(plain.contains("位置：settings.toml"));
+        assert!(plain.contains("对象：settings.toml"));
         assert!(plain.contains("原因：值的语法无效"));
+        assert!(plain.contains("影响：业务状态没有修改"));
         assert!(plain.contains("处理办法：修正指出的配置字段后重试"));
         for forbidden in [
             "configuration.invalid_toml",
@@ -1768,10 +3236,17 @@ mod tests {
     fn panic_fallback_uses_selected_locale_after_cli_parsing_and_english_before_it() {
         const PANIC_BODY: &str = "PROCESS_STARTUP_PANIC_BODY_SENTINEL";
         let selected = UiLocalizer::new(UiLocale::Japanese);
+        let mut selected_stdout = Vec::new();
         let mut selected_stderr = Vec::new();
-        let selected_exit = catch_after_cli_parsing(&selected, &mut selected_stderr, |_stderr| {
-            panic!("{PANIC_BODY}")
-        });
+        let selected_exit;
+        {
+            let mut stdout = StreamPresentation::new(ProcessStream::Stdout, &mut selected_stdout);
+            let mut stderr = StreamPresentation::new(ProcessStream::Stderr, &mut selected_stderr);
+            selected_exit =
+                catch_after_cli_parsing(&selected, &mut stdout, &mut stderr, |_stdout, _stderr| {
+                    panic!("{PANIC_BODY}")
+                });
+        }
         assert_eq!(selected_exit, ExitCode::FAILURE);
         let selected_stderr =
             String::from_utf8(selected_stderr).expect("已选 locale 诊断应为 UTF-8");
@@ -1784,9 +3259,21 @@ mod tests {
 
         let mut flush_stdout = FlushPanickingOutput::default();
         let mut flush_stderr = Vec::new();
-        let flush_exit = catch_after_cli_parsing(&selected, &mut flush_stderr, |stderr| {
-            finalize_process_output(ExitCode::SUCCESS, &mut flush_stdout, stderr)
-        });
+        let flush_exit;
+        {
+            let mut stdout = StreamPresentation::new(ProcessStream::Stdout, &mut flush_stdout);
+            let mut stderr = StreamPresentation::new(ProcessStream::Stderr, &mut flush_stderr);
+            flush_exit =
+                catch_after_cli_parsing(&selected, &mut stdout, &mut stderr, |stdout, stderr| {
+                    finalize_process_output(
+                        ExitCode::SUCCESS,
+                        StateEffect::Unchanged,
+                        &selected,
+                        stdout,
+                        stderr,
+                    )
+                });
+        }
         assert_eq!(flush_exit, ExitCode::FAILURE);
         assert_eq!(flush_stdout.flush_attempts, 1);
         let expected_flush_panic = render_diagnostic_report(
@@ -1806,10 +3293,12 @@ mod tests {
         );
 
         let english = UiLocalizer::new(UiLocale::English);
+        let mut startup_stdout = Vec::new();
         let mut startup_stderr = Vec::new();
         let startup_exit = render_uncaught_panic_with(
             &english,
             RuntimePanicBoundary::ProcessStartup,
+            &mut startup_stdout,
             &mut startup_stderr,
         );
         assert_eq!(startup_exit, ExitCode::FAILURE);
@@ -1914,7 +3403,6 @@ mod tests {
             ),
         );
         let warning = ProjectLogWarning {
-            log_path: Some("C:\\project\\logs\\run.jsonl".into()),
             project_log: vec![DiagnosticReport::new(
                 StateEffect::Unchanged,
                 Diagnostic::observability(crate::diagnostic::ObservabilityIssue::write(
@@ -1934,10 +3422,8 @@ mod tests {
 
         render_project_log_warning(&localizer, &warning, &mut stderr).expect("诊断应可写入");
         let stderr = String::from_utf8(stderr).expect("诊断应为 UTF-8");
-        let project_log_banner = localizer.format(UiMessage::NoticeLogDegraded);
-        let task_record_banner = localizer.format(UiMessage::NoticeTaskRecordsDegraded);
-        assert_eq!(stderr.matches(project_log_banner.as_str()).count(), 1);
-        assert_eq!(stderr.matches(task_record_banner.as_str()).count(), 1);
+        let warning_heading = localizer.format(UiMessage::DiagnosticWarningHeading);
+        assert_eq!(stderr.matches(warning_heading.as_str()).count(), 2);
         assert!(stderr.contains("C:\\project\\logs\\run.jsonl"));
         assert!(stderr.contains("C:\\project\\task-records\\run\\task-000001.md"));
         assert!(stderr.contains("C:\\project\\task-records\\run\\.task-000001.tmp"));

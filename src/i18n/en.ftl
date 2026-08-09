@@ -54,23 +54,13 @@ cli-argument-conflict = { $argument } cannot be used with the other provided arg
 cli-wrong-number-of-values = The wrong number of values was provided for { $argument }.
 cli-invalid-utf8 = A command-line argument is not valid Unicode.
 cli-parse-failure = The command line could not be parsed.
-error-no-executable-extract-owner = Clearing these owners leaves no executable Extract owner, so no plan was saved.
 plan-source-explicit = explicit input
 plan-source-project-state = project state
 plan-source-product-default = product behavior
 notice-init-reuse-path = No source path was provided; reusing the last successful path: { $path }.
 notice-extract-reuse-owners = No extraction scope was provided; reusing the last successful plan: { $owners }.
 notice-translate-reuse-profile = No profile was provided; reusing the last successful profile: { $profile }.
-notice-owner-disabled = Owner { $owner } was disabled and removed from future automatic plans.
-warning-rules-command-non-string-skipped = Warning: Rules rule { $rule_number } skipped { $skipped_count } non-string command parameters (source { $source_file }, code={ $command_code }, parameter={ $parameter }, type={ $actual_type }).
-warning-manual-layout-required = Warning: manual line-break review is required at { $locations } (region={ $region }, max_fullwidth_chars={ $max_fullwidth_chars }).
 notice-no-model-request = All translation units are current; no model request was needed in this run.
-notice-manual-layout = { $count ->
-    [one] 1 unit needs a manual line-break review.
-   *[other] { $count } units need a manual line-break review.
-}
-notice-log-degraded = Project logging is unavailable or degraded; the command will continue and its exit status is unchanged.
-notice-task-records-degraded = Translation task records are unavailable or degraded; the command will continue and its exit status is unchanged.
 progress-init-check-project = Checking project state
 progress-init-scan-source = Scanning the game source
 progress-init-build-candidate = Building the project candidate
@@ -86,7 +76,7 @@ progress-generic-init = Initializing the Generic project
 progress-generic-extract = Scanning Generic JSONL input
 progress-translate-planning = Planning translation tasks
 progress-translate-confirmed = Confirmed translation tasks
-progress-translate-no-work = No model request is needed
+progress-no-work = No work is needed
 progress-project-lua = Running the project Lua program
 progress-write-back-read-assets = Reading accepted assets
 progress-write-back-planning = Planning document rewrites
@@ -101,7 +91,14 @@ result-init-unchanged = Project state: unchanged
 result-init-updated = Project state: updated
 result-init-stale-owners = Re-extraction required: { $owners }
 result-extract-completed = Extraction complete: { $project }
-result-translate-completed = Translation complete: { $project } (Profile: { $profile })
+result-translate-completed = Translation run finished: { $project } (Profile: { $profile })
+result-translate-status = Status: { $status }
+result-translate-status-value = { $status ->
+    [no_work] no work
+    [complete] complete
+    [incomplete] incomplete
+   *[other] __ATT_FALLBACK__
+}
 result-translate-summary = Translation: { $total } tasks; { $complete } complete, { $partial } partial, { $unavailable } unavailable; wrote { $written } locations, { $remaining } remaining
 result-translate-convergence = State convergence: { $retained } retained, { $invalidated } invalidated, { $not_applicable } not applicable, { $reused } reused
 result-write-back-completed = Write-back complete: { $project }
@@ -113,6 +110,11 @@ result-generic-extract-updated = Generic input updated: { $files } files, { $gro
 result-generic-translate-summary = Generic translation: { $total } tasks; { $complete } complete, { $partial } partial, { $unavailable } unavailable; cleared { $cleared }, reused { $reused }, accepted { $accepted }, wrote { $written }, conflicts { $conflicted }, response problems { $problems }
 result-generic-write-back-summary = Generic write-back: { $translated } translated units, { $original } source units retained
 result-symbol-repair-summary = Symbol repair: attempted { $attempted } units, repaired { $repaired }, skipped internally { $skipped }, replaced { $replacements } symbols
+result-run-log = Run log: { $path }
+translate-incomplete-object = Translate run for project { $project }
+translate-incomplete-rpg-maker-reason = { $partial } partial tasks, { $unavailable } unavailable tasks, { $protocol } protocol problems, and { $exhausted } exhausted requests; { $remaining_decisions } decisions and { $remaining_locations } locations remain
+translate-incomplete-generic-reason = { $partial } partial tasks, { $unavailable } unavailable tasks, { $conflicted } write conflicts, and { $problems } response problems
+translate-incomplete-help = Read the task diagnostics in this run log, fix repeatable problems, and run Translate again; use Manual for a small remainder
 result-cancelled = The command was cancelled after safe finalization.
 result-plan-saved = The successful run plan was saved.
 log-run-started = Command { $command } started.
@@ -163,7 +165,6 @@ log-publication-finished = { $result ->
     [outcome_unknown] The final publication state is unknown.
    *[other] Publication stopped without a recognized result.
 }
-log-project-log-degraded = The project log degraded; { $failure_kinds } failure categories were recorded.
 log-task-outcome-value = { $outcome ->
     [complete] completed
     [partial] partially completed
@@ -173,14 +174,36 @@ log-task-outcome-value = { $outcome ->
     [cancelled] cancelled
    *[other] ended without a recognized result
 }
-diagnostic-location = Location: { $subject }
+diagnostic-object = Object: { $subject }
+diagnostic-error-heading = Error:
+diagnostic-warning-heading = Warning:
 diagnostic-explanation = Reason: { $reason }
+diagnostic-impact = Impact: { $impact }
 diagnostic-resolution = Action: { $action }
-diagnostic-related = Related error { $index }:
+diagnostic-related = { $relation ->
+    [cleanup] Cleanup also failed:
+    [rollback] Rollback also failed:
+    [discard] Discarding the candidate also failed:
+    [finalization] Finalization also failed:
+    [shutdown] Shutdown also failed:
+    [observability] Result presentation or recording also failed:
+   *[other] A related operation also failed:
+}
+diagnostic-impact-value = { $effect ->
+    [unchanged] Business state was not changed
+    [progress_preserved] Previously confirmed progress was preserved; the indicated content was not completed
+    [applied] The related business result has taken effect
+    [applied_run_plan_not_saved] The business result has taken effect, but this run plan was not saved
+    [applied_finalization_failed] The business result has taken effect, but required finalization did not complete
+    [recovery_required] The result is known, but the indicated recovery site must be handled first
+    [outcome_unknown] Whether this operation took effect cannot be confirmed; do not retry or remove recovery artifacts before following the action
+   *[other] __ATT_FALLBACK__
+}
 diagnostic-resolution-value = { $code ->
     [fix_configuration] Correct the named configuration field and retry
     [fix_input] Correct the named input and retry
     [fix_placeholder_rules] Correct the indicated Placeholder rule and retry
+    [review_disabled_rules] If this is expected, no action is needed; otherwise add valid rules to the indicated file and run Extract again
     [adjust_manual_layout] Manually adjust line breaks and layout at the indicated locations for the stated display width
     [check_path_and_permissions] Check the path, filesystem state, and permissions
     [check_project_state] Inspect the project state, correct it, and retry
@@ -198,6 +221,7 @@ diagnostic-failure-value = { $code ->
     [invalid_syntax] The value has invalid syntax
     [invalid_encoding] The value has invalid text encoding
     [invalid_value] The value violates the required contract
+    [rules_owner_disabled] The selected Rules file uses rule = []; Rules was disabled and its extracted assets were removed
     [not_found] The required object does not exist
     [state_mismatch] The stored project state does not satisfy this operation
     [unsupported_windows_code_page] The Windows code page is not UTF-8
@@ -211,6 +235,10 @@ diagnostic-failure-value = { $code ->
     [concurrent_shutdown] Another caller is already shutting down the executor
     [executor_state_poisoned] The executor lifecycle state is poisoned
     [worker_spawn_failed] The operating system could not create the worker thread
+    [stdout_write_failed] Standard output could not be written
+    [stderr_write_failed] Standard error could not be written
+    [stdout_flush_failed] Standard output could not be flushed
+    [stderr_flush_failed] Standard error could not be flushed
     [worker_channel_closed] The worker command channel closed before finalization completed
     [worker_panicked] A worker terminated unexpectedly
     [reparse_point_forbidden] The path contains a reparse point that cannot be trusted
@@ -305,7 +333,6 @@ diagnostic-placeholder-rule-project = Placeholder rule { $number } in the curren
 manual-exported = Exported { $entries } entries to { $path }
 manual-checked = Valid { $valid }, unfilled { $unfilled }, errors { $errors }
 manual-applied = Applied { $applied }, unfilled { $unfilled }, errors { $errors }
-manual-issue = { $object }: { $reason }; { $help }.
 manual-value = { $code ->
     [invalid_source_line] source item { $line } contains a line break or NUL
     [invalid_translation_line] translation item { $line } contains a line break or NUL
