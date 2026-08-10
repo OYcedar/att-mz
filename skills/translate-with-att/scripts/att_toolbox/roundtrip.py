@@ -112,14 +112,19 @@ def plain_text_lines(text: str) -> tuple[PlainTextLine, ...]:
     """按自然行列出纯文本，保留每行原始 CRLF/LF/CR 结尾。"""
 
     result: list[PlainTextLine] = []
-    for line_number, raw in enumerate(text.splitlines(keepends=True), start=1):
-        if raw.endswith("\r\n"):
-            content, ending = raw[:-2], "\r\n"
-        elif raw.endswith(("\r", "\n")):
-            content, ending = raw[:-1], raw[-1:]
-        else:
-            content, ending = raw, ""
-        result.append(PlainTextLine(line_number=line_number, text=content, ending=ending))
+    cursor = 0
+    line_number = 1
+    while cursor < len(text):
+        end = cursor
+        while end < len(text) and text[end] not in {"\r", "\n"}:
+            end += 1
+        if end == len(text):
+            result.append(PlainTextLine(line_number=line_number, text=text[cursor:end], ending=""))
+            break
+        ending = "\r\n" if text.startswith("\r\n", end) else text[end]
+        result.append(PlainTextLine(line_number=line_number, text=text[cursor:end], ending=ending))
+        cursor = end + len(ending)
+        line_number += 1
     return tuple(result)
 
 
