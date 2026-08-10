@@ -57,7 +57,7 @@
 - Init：<各项目来源与语言选择>
 - Extract：<Builtin、Rules、JSONL 与当前输入状态>
 - Translate：<各项目 Profile、Client、术语、Placeholder、Prompt>
-- Manual：<TOML 路径、check 与 apply 结果；没有则写“无”>
+- Manual：<TOML 路径、apply 结果，以及实际执行的 check 结果；没有则写“无”>
 - Lua：<复杂筛选、批量变换、诊断或特殊修改脚本与参数；没有则写“无”>
 - WriteBack：<各项目输出、外部转换和部署方式>
 

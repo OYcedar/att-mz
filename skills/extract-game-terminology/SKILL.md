@@ -5,20 +5,21 @@ description: 使用 ATT 随包 Formic 从最终 Manual 的完整游戏原文并�
 
 # 制作游戏术语表
 
-最终只交付审核后的 ATT 术语 TOML。唯一 Python 入口是 `terminology_job.py`；Formic 网络等待
-单独记录，不计 Agent 调查、审核和返工时间。
+最终只交付审核后的 ATT 术语 TOML。Formic 是从完整游戏语料并发找术语候选的外部工具；它的网络等待
+单独记录，不计 Agent 调查、审核和返工时间。本 Skill 的唯一 Python 入口是 `terminology_job.py`。
 
 ## 1. 建立作业
 
-输入必须是最终 Extract 后、首次 Translate 前用 `manual export --selection all` 得到的完整
-Manual。确认 Python 3.11+ 后运行：
+输入必须是所有权审计后固定的完整 Manual（ATT 可编辑译文 TOML）。它应在最终 Extract 后、首次
+Translate 前用 `manual export --selection all` 生成。确认 Python 3.11+ 后运行：
 
 ```powershell
 python <Skill>\scripts\terminology_job.py prepare --manual <final-manual.toml> --output <作业目录>
 ```
 
-程序生成 `input/`、`plan.jsonl`、`task.md` 和 `packing-evidence.json`。同一来源中相邻的小
-Scope 可以装入同一个 Formic unit；Scope 本身不拆，超大 Scope 单独成组。Agent 不手写或
+程序生成 `input/`、`plan.jsonl`、`task.md` 和 `packing-evidence.json`。Scope 是必须一起理解的自然语境范围；
+同一来源中相邻的小 Scope 可以装入同一个 Formic unit（一次独立外部任务）。Scope 本身不拆，超大 Scope
+单独成组。Agent 不手写或
 复制 unit 清单。
 
 资源名、资源路径、控制符、短语、句子和普通词都不是术语候选。候选必须是需要在全游戏
@@ -43,6 +44,9 @@ Scope 可以装入同一个 Formic unit；Scope 本身不拆，超大 Scope 单�
 ```
 
 不要删除 `OUT/results`，不要从 worker 档案拼接候选，也不要把旧 OUT 与新 plan 混用。
+立即启动 Formic 后，按 `translate-with-att` Skill 在网络等待期间做 Preflight、可选的只读字体调查和已结束
+日志汇总。`terminology_job.py` 只准备、核对和生成术语产物，不调用 ATT、Formic 或其他 Python 助手，不建立
+通用流程框架。
 
 ## 3. 核对候选
 
