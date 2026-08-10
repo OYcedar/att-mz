@@ -287,6 +287,50 @@ def test_survey_keeps_every_fact_and_builds_relation_groups(survey_game: Path, t
     assert (
         next(group for group in groups if group["group_id"] == category_group_id)["kind"] == "relation_group"
     )
+    members_path = tmp_path / "category-members.jsonl"
+    run_script(
+        SURVEY,
+        [
+            "members",
+            "--survey",
+            output,
+            "--group-id",
+            category_group_id,
+            "--output",
+            members_path,
+        ],
+    )
+    assert read_jsonl(members_path) == [
+        item
+        for item in locations
+        if item.get("classification") == "review" and item.get("review_group_id") == category_group_id
+    ]
+    run_script(
+        SURVEY,
+        [
+            "members",
+            "--survey",
+            output,
+            "--group-id",
+            category_group_id,
+            "--output",
+            members_path,
+        ],
+        expected=1,
+    )
+    run_script(
+        SURVEY,
+        [
+            "members",
+            "--survey",
+            output,
+            "--group-id",
+            "group-does-not-exist",
+            "--output",
+            tmp_path / "unknown-members.jsonl",
+        ],
+        expected=1,
+    )
     assert all(group["kind"] != "mv_dialogue_protocol" for group in groups)
     metrics = json.loads((output / "agent-work-metrics.json").read_text(encoding="utf-8"))
     baseline = json.loads((output / "source-baseline.json").read_text(encoding="utf-8"))
@@ -627,6 +671,61 @@ def test_finalize_rejects_a_new_source_that_was_not_in_the_scan(survey_game: Pat
         expected=1,
     )
     assert "来源选择范围与 scan 时不同" in result.stderr
+
+
+def test_audit_uses_the_frozen_survey_after_finalize(survey_game: Path, tmp_path: Path) -> None:
+    survey_root = tmp_path / "survey"
+    run_script(SURVEY, ["scan", "--game", survey_game, "--output", survey_root])
+    groups = read_jsonl(survey_root / "review-groups.jsonl")
+    decisions = tmp_path / "decisions.jsonl"
+    write_jsonl(decisions, _decisions_for(groups))
+    plan = tmp_path / "plan"
+    run_script(
+        SURVEY,
+        ["finalize", "--survey", survey_root, "--decisions", decisions, "--output", plan],
+    )
+    coverage = json.loads((plan / "coverage.json").read_text(encoding="utf-8"))
+    ownership = tmp_path / "ownership.jsonl"
+    write_jsonl(ownership, cast(list[object], coverage["expected_ownership"]))
+    (survey_game / "new-source.txt").write_text("New visible source", encoding="utf-8")
+
+    report = tmp_path / "audit.json"
+    run_script(
+        SURVEY,
+        [
+            "audit",
+            "--survey",
+            survey_root,
+            "--plan",
+            plan,
+            "--ownership",
+            ownership,
+            "--output",
+            report,
+        ],
+    )
+    assert json.loads(report.read_text(encoding="utf-8"))["complete"] is True
+
+    survey_summary_path = survey_root / "survey.json"
+    survey_summary = json.loads(survey_summary_path.read_text(encoding="utf-8"))
+    survey_summary["engine"] = "mz" if coverage["engine"] == "mv" else "mv"
+    write_json(survey_summary_path, survey_summary)
+    mismatch = run_script(
+        SURVEY,
+        [
+            "audit",
+            "--survey",
+            survey_root,
+            "--plan",
+            plan,
+            "--ownership",
+            ownership,
+            "--output",
+            tmp_path / "mismatched-audit.json",
+        ],
+        expected=1,
+    )
+    assert "survey 引擎与 finalize 计划不一致" in mismatch.stderr
 
 
 def test_review_grouping_keeps_map_locations_and_finalizes_actual_files(

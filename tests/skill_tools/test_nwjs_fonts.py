@@ -10,14 +10,14 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
 import pytest
 from att_skill_tools import ToolError, atomic_write_directory
-from att_toolbox import font_transaction
+from att_toolbox import font_references, font_transaction
 from att_toolbox.font_transaction import ByteMutation
 from att_toolbox.fonts import (
     FontPlan,
@@ -252,6 +252,25 @@ def test_font_graph_rewrites_proven_contexts_but_not_matching_body_text(font_gam
     assert any(item.reason == "unresolved_json_font_value" for item in plan.reviews)
     assert any(item.reason == "unresolved_javascript_font_value" for item in plan.reviews)
     assert any(item.reason == "unclassified_or_partial_font_context" for item in plan.reviews)
+
+
+def test_font_plan_enumerates_game_tree_once(font_game: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    original = font_references.safe_walk_files
+    calls = 0
+
+    def counted(root: Path) -> Iterator[Path]:
+        nonlocal calls
+        calls += 1
+        return original(root)
+
+    monkeypatch.setattr(font_references, "safe_walk_files", counted)
+    font_references.build_font_plan(
+        game_root=font_game.resolve(),
+        content_root=font_game.resolve(),
+        selected_font=FONT_ROOT / "NotoSansCJKsc-Regular.otf",
+    )
+
+    assert calls == 1
 
 
 def test_css_font_format_tracks_selected_ttf(font_game: Path) -> None:
