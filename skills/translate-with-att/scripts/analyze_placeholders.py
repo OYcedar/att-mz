@@ -45,8 +45,8 @@ _CUSTOM_FORMS: tuple[tuple[str, re.Pattern[str], str], ...] = (
     ("percent", re.compile(r"%[A-Za-z_][A-Za-z0-9_]*%"), r"%[A-Za-z_][A-Za-z0-9_]*%"),
     (
         "percent_number",
-        re.compile(r"%[0-9]+(?![A-Za-z0-9_])"),
-        r"%[0-9]+(?![A-Za-z0-9_])",
+        re.compile(r"%[0-9]+"),
+        r"%[0-9]+",
     ),
     ("angle_tag", re.compile(r"</?[A-Za-z][^>\r\n]*>"), r"</?[A-Za-z][^>\r\n]*>"),
 )

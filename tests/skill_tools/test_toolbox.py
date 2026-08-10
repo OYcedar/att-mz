@@ -625,7 +625,7 @@ pattern = '\\TAG\[[^]\r\n]*\]'
     assert json.loads(report.read_text(encoding="utf-8"))["complete"] is True
 
 
-def test_placeholder_numbered_percent_token_boundaries(tmp_path: Path) -> None:
+def test_placeholder_numbered_percent_token_allows_adjacent_text(tmp_path: Path) -> None:
     manual = tmp_path / "numbered-percent-manual.toml"
     manual.write_text(
         """\
@@ -638,7 +638,7 @@ translation = []
 [[translation]]
 id = "Map001.json:event1:page1:dialogue2"
 type = "free"
-source = ["50%", "%", "ordinary text", "%12suffix"]
+source = ["50%", "%", "ordinary text", "%1does...", "%2什么...", "%12suffix"]
 translation = []
 """,
         encoding="utf-8",
@@ -655,9 +655,10 @@ translation = []
         {
             "kind": "percent_number",
             "observed_form": "%1",
-            "suggested_pattern": r"%[0-9]+(?![A-Za-z0-9_])",
-            "occurrences": 3,
-            "locations": ["Map001.json:event1:page1:dialogue1"] * 3,
+            "suggested_pattern": r"%[0-9]+",
+            "occurrences": 6,
+            "locations": ["Map001.json:event1:page1:dialogue1"] * 3
+            + ["Map001.json:event1:page1:dialogue2"] * 3,
             "possible_builtin_overlap": False,
             "do_not_select_without_att_check": False,
             "semantics": "unconfirmed",
@@ -743,6 +744,7 @@ def test_log_summary_and_write_back_verification(mv_game: Path, tmp_path: Path) 
                             "remaining_locations": 1,
                             "protocol_diagnostics": 0,
                             "recoverable_request_exhaustions": 0,
+                            "request_admission_stopped": False,
                             "retained": 0,
                             "invalidated": 0,
                             "not_applicable": 0,
@@ -816,6 +818,174 @@ def test_log_summary_and_write_back_verification(mv_game: Path, tmp_path: Path) 
     report_data = json.loads(report.read_text(encoding="utf-8"))
     assert report_data["source_unchanged"] is True
     assert report_data["string_values"]["translated_or_changed"] == 1
+
+
+@pytest.mark.parametrize(
+    ("engine", "engine_summary", "obsolete_fields"),
+    [
+        (
+            "generic",
+            {
+                "planned_units": 1,
+                "remaining_units": 0,
+                "cleared_units": 0,
+                "reused_units": 0,
+                "accepted_units": 1,
+                "written_units": 1,
+                "conflicted_units": 0,
+                "response_problems": 0,
+                "recoverable_request_exhaustions": 0,
+                "request_admission_stopped": False,
+            },
+            (
+                "planned_units",
+                "remaining_units",
+                "recoverable_request_exhaustions",
+                "request_admission_stopped",
+            ),
+        ),
+        (
+            "rpg_maker",
+            {
+                "accepted_decisions": 1,
+                "written_locations": 1,
+                "remaining_decisions": 0,
+                "remaining_locations": 0,
+                "protocol_diagnostics": 0,
+                "recoverable_request_exhaustions": 0,
+                "request_admission_stopped": False,
+                "retained": 0,
+                "invalidated": 0,
+                "not_applicable": 0,
+                "reused": 0,
+            },
+            ("request_admission_stopped",),
+        ),
+    ],
+)
+def test_log_summary_requires_current_translate_schema_and_task_invariants(
+    tmp_path: Path,
+    engine: str,
+    engine_summary: dict[str, object],
+    obsolete_fields: tuple[str, ...],
+) -> None:
+    valid_tasks = {
+        "planned": 1,
+        "started": 1,
+        "complete": 1,
+        "partial": 0,
+        "unavailable": 0,
+        "failed": 0,
+        "cancelled": 0,
+        "not_started": 0,
+    }
+
+    def run_case(
+        name: str,
+        tasks: dict[str, int],
+        summary: dict[str, object],
+        *,
+        expected: int = 0,
+    ) -> Path:
+        log = tmp_path / f"{engine}-{name}.jsonl"
+        output = tmp_path / f"{engine}-{name}.json"
+        records: list[object] = [
+            {
+                "timestamp": "2026-08-09T00:00:00Z",
+                "sequence": 1,
+                "run_id": "run-000001",
+                "level": "info",
+                "event": "run.started",
+                "context": {
+                    "locale": "zh-Hans",
+                    "engine": engine,
+                    "project": "demo",
+                    "command": "translate",
+                },
+                "payload": {},
+                "message": "started",
+            },
+            {
+                "timestamp": "2026-08-09T00:00:01Z",
+                "sequence": 2,
+                "run_id": "run-000001",
+                "level": "info",
+                "event": "task.started",
+                "context": {},
+                "payload": {"task": {"ordinal": 1, "total": 1}},
+                "message": "task started",
+            },
+            {
+                "timestamp": "2026-08-09T00:00:02Z",
+                "sequence": 3,
+                "run_id": "run-000001",
+                "level": "info",
+                "event": "task.finished",
+                "context": {},
+                "payload": {
+                    "task": {"ordinal": 1, "total": 1},
+                    "attempts": 1,
+                    "outcome": {"kind": "complete"},
+                },
+                "message": "task finished",
+            },
+            {
+                "timestamp": "2026-08-09T00:00:03Z",
+                "sequence": 4,
+                "run_id": "run-000001",
+                "level": "info",
+                "event": "translation.finished",
+                "context": {},
+                "payload": {
+                    "result": {
+                        "kind": "complete",
+                        "tasks": tasks,
+                        "summary": {"engine": engine, "summary": summary},
+                    }
+                },
+                "message": "translation finished",
+            },
+            {
+                "timestamp": "2026-08-09T00:00:04Z",
+                "sequence": 5,
+                "run_id": "run-000001",
+                "level": "info",
+                "event": "run.finished",
+                "context": {},
+                "payload": {"result": {"kind": "succeeded"}},
+                "message": "finished",
+            },
+        ]
+        write_jsonl(log, records)
+        run_script(
+            TRANSLATE_SCRIPTS / "summarize_att_run.py",
+            ["--log", log, "--output", output],
+            expected=expected,
+        )
+        if expected != 0:
+            assert not output.exists()
+        return output
+
+    current_output = run_case("current", valid_tasks, engine_summary)
+    current = json.loads(current_output.read_text(encoding="utf-8"))
+    assert current["runs"][0]["translation_finished"]["summary"] == {
+        "engine": engine,
+        "summary": engine_summary,
+    }
+
+    obsolete_summary = dict(engine_summary)
+    for field in obsolete_fields:
+        obsolete_summary.pop(field)
+    run_case("obsolete", valid_tasks, obsolete_summary, expected=1)
+    run_case("unknown-field", valid_tasks, {**engine_summary, "ignored_field": 0}, expected=1)
+    run_case(
+        "non-boolean-admission",
+        valid_tasks,
+        {**engine_summary, "request_admission_stopped": 0},
+        expected=1,
+    )
+    run_case("invalid-started", {**valid_tasks, "started": 2}, engine_summary, expected=1)
+    run_case("invalid-planned", {**valid_tasks, "planned": 2}, engine_summary, expected=1)
 
 
 def test_write_back_accepts_event_text_reflow_but_keeps_event_structure_strict(
