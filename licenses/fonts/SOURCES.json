@@ -1,0 +1,54 @@
+{
+  "fonts": [
+    {
+      "alias": "noto-sans-sc",
+      "copyright": "© 2014-2021 Adobe (http://www.adobe.com/).",
+      "file": "skills/translate-with-att/assets/fonts/NotoSansCJKsc-Regular.otf",
+      "internal_family": "Noto Sans CJK SC",
+      "internal_version": "Version 2.004;hotconv 1.0.118;makeotfexe 2.5.65603",
+      "license": "licenses/fonts/Noto-CJK-OFL-1.1.txt",
+      "release": "https://github.com/notofonts/noto-cjk/releases/tag/Sans2.004",
+      "release_asset": "08_NotoSansCJKsc.zip",
+      "release_asset_sha256": "a927e56f53bd6c3b920bc139c0b94aa36c7d9ad0cf009b159437a1a003581140",
+      "release_asset_size": 94523633,
+      "source": "https://github.com/notofonts/noto-cjk/releases/download/Sans2.004/08_NotoSansCJKsc.zip",
+      "sha256": "2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b",
+      "size": 16437364,
+      "tag": "Sans2.004"
+    },
+    {
+      "alias": "noto-serif-sc",
+      "copyright": "© 2017-2024 Adobe (http://www.adobe.com/).",
+      "file": "skills/translate-with-att/assets/fonts/NotoSerifCJKsc-Regular.otf",
+      "internal_family": "Noto Serif CJK SC",
+      "internal_version": "Version 2.003;hotconv 1.1.1;makeotfexe 2.6.0",
+      "license": "licenses/fonts/Noto-CJK-OFL-1.1.txt",
+      "release": "https://github.com/notofonts/noto-cjk/releases/tag/Serif2.003",
+      "release_asset": "09_NotoSerifCJKsc.zip",
+      "release_asset_sha256": "4bcdbff95cedfb6a4c0640403f0de8b69480d869331c24c8eff91f7bb834df04",
+      "release_asset_size": 138631496,
+      "source": "https://github.com/notofonts/noto-cjk/releases/download/Serif2.003/09_NotoSerifCJKsc.zip",
+      "sha256": "2a2eae2628df83556c54018c41e20fa532c1b862c5256ae8b3f23feb918d12ca",
+      "size": 24543080,
+      "tag": "Serif2.003"
+    },
+    {
+      "alias": "lxgw-wenkai",
+      "copyright": "Copyright 2022-2026 LXGW; Copyright 2020 The Klee Project Authors",
+      "file": "skills/translate-with-att/assets/fonts/LXGWWenKaiGB-Regular.ttf",
+      "internal_family": "LXGW WenKai GB",
+      "internal_version": "Version 1.522; March 17, 2026",
+      "license": "licenses/fonts/LXGW-WenKai-GB-OFL-1.1.txt",
+      "release": "https://github.com/lxgw/LxgwWenKaiGB/releases/tag/v1.522",
+      "release_asset": "LXGWWenKaiGB-Regular.ttf",
+      "release_asset_sha256": "295568c131648062107543aa159c97dd49564be791136c2abf74cad83eba3f7f",
+      "release_asset_size": 25819540,
+      "source": "https://github.com/lxgw/LxgwWenKaiGB/releases/download/v1.522/LXGWWenKaiGB-Regular.ttf",
+      "sha256": "295568c131648062107543aa159c97dd49564be791136c2abf74cad83eba3f7f",
+      "size": 25819540,
+      "tag": "v1.522"
+    }
+  ],
+  "format": "official unmodified upstream font files",
+  "license": "SIL Open Font License 1.1"
+}
