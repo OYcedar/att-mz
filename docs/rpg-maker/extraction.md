@@ -119,8 +119,8 @@ Builtin 明确不读取插件参数、插件命令 `356/357`、`note`/`meta`、`
 
 Rules 的字段、来源、路径、捕获、顺序和错误范围由[规则规格](rules.md)定义。
 
-MV/MZ `manual export --ownership` 在同一只读快照中把当前 Manual 条目映射为 Builtin 或
-Rules；Rules 行直接使用这里保存的自然规则序号，不根据可读 ID、路径前缀或相邻位置猜测。
+MV/MZ `ownership export` 在一个只读快照中导出全部当前 Extract Unit 的 Builtin 或 Rules
+所有权；Rules 行直接使用这里保存的自然规则序号，不根据可读 ID、路径前缀或相邻位置猜测。
 
 ## 4. 冲突、继承和提交
 

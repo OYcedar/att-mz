@@ -1,6 +1,8 @@
 [[rule]]
+order = 'preserve'
 pattern = '\\V\[[0-9]+\]'
 
 [[rule]]
 scopes = ['dialogue']
+order = 'preserve'
 pattern = '<name>(?<text>.*?)</name>'

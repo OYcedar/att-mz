@@ -58,7 +58,7 @@ Extract Rules 的 `rule = []` 成功生效后，CLI 与项目日志使用同一�
 
 每条非空 Extract Rule 的数组位置就是其从 1 开始的自然规则序号。规则物化出的每个 Unit
 都保存这个序号；重新 Extract 时按当前 TOML 重新建立，不从字段路径、匹配次序或旧数据库
-推断。`manual export --ownership` 只读取这项已保存事实，因此 Rules TOML 与外部规则清单
+推断。`ownership export` 只读取这项已保存事实，因此 Rules TOML 与外部规则清单
 可以用同一个自然序号逐条核对。
 
 ### 2.1 PCRE2 与三层转义
@@ -520,7 +520,7 @@ owner 内、跨 owner Store 和 WriteBack 发布前使用同一规则。
 ## 6. RPG Maker Placeholder Rules
 
 本节建立在[公共 Placeholder 规格](../translation/placeholders.md)之上。严格 TOML、
-`pattern`、可选 `scopes`、`text` 捕获和 token 恢复都沿用那里的解释；下面只规定 MV/MZ
+`pattern`、可选 `scopes` 与 `ids`、`order`、`text` 捕获和 token 恢复都沿用那里的解释；下面只规定 MV/MZ
 能使用的 scope、Builtin 控制符与数组槽行为。
 
 ### 6.1 RPG Maker scope
@@ -528,10 +528,13 @@ owner 内、跨 owner Store 和 WriteBack 发布前使用同一规则。
 ```toml
 [[rule]]
 scopes = ['event_dialogue', 'event_choices']
+order = 'preserve'
 pattern = '\\SE\[[^]]+\]'
 
 [[rule]]
 scopes = ['plugin_parameter']
+ids = ['plugins.js:QuestWindow:Title']
+order = 'preserve'
 pattern = '<name>(?<text>.*?)</name>'
 ```
 
@@ -539,6 +542,8 @@ pattern = '<name>(?<text>.*?)</name>'
 |---|---|---|---|
 | `pattern` | string | 必填 | 非空 PCRE2；无命名捕获，或恰好一个 `text` |
 | `scopes` | string array | 可选；省略表示全部 scope | 显式数组必须非空、无重复、只含下表值 |
+| `ids` | string array | 可选；省略表示全部自然 ID | 显式数组必须非空、无重复且全部属于当前项目 |
+| `order` | string | 必填 | `preserve` 或 `reorder_within_slot`；wrapper 只能用 `preserve` |
 
 合法 scope 共八个：`database_entry`、`system`、`map`、`event_dialogue`、`event_choices`、
 `event_scrolling_text`、`event_command`、`plugin_parameter`；`all`、别名和父 scope 都不
@@ -550,20 +555,22 @@ pattern = '<name>(?<text>.*?)</name>'
 
 ### 6.2 类型、默认值与互斥
 
-`pattern` 是必填的非空 TOML string。`scopes` 省略表示全部八个精确 scope；显式提供时
-必须是非空 string array，不能重复，也不能写 `all`。模式要么没有命名捕获，要么恰好
+`pattern` 和 `order` 必填。`scopes` 省略表示全部八个精确 scope；`ids` 省略表示全部
+当前自然 ID；两者同时出现时取交集。显式数组必须非空且不能重复，scope 也不能写 `all`。
+模式要么没有命名捕获，要么恰好
 只有一个 `text`；其他命名捕获不允许。无 `text` 与有 `text` 是两种互斥投影形态，不会
 按匹配结果自动切换。
 
 ### 6.3 解析失败
 
-根/字段/类型错误、空模式、无效 PCRE2、非法命名捕获、空/重复/未知 scope，都会在读取
+根/字段/类型错误、空模式、无效 PCRE2、非法命名捕获、空/重复/未知 scope 或 ID，以及
+wrapper 使用 `reorder_within_slot`，都会在读取
 资源时拒绝整份自定义 Placeholder 定义。Builtin 控制符不来自该文件，因此清空自定义
 定义不会关闭 Builtin。PCRE2 及 TOML 转义见[第 2.1 节](#21-pcre2-与三层转义)。
 
 ### 6.4 针对来源执行失败
 
-定义成功后，规则只对 kind 与 scope 相符的 Unit 执行。这个 kind 来自 Builtin 或
+定义成功后，规则只对 kind、scope 与自然 ID 都相符的 Unit 执行。这个 kind 来自 Builtin 或
 Rules；owner、文件路径和 Rule 序号都不参与 scope 选择。单条自定义规则零命中是正常结果；一旦命中，完整匹配必须
 非零宽并位于 UTF-8 边界，`text` 必须参与、位于完整匹配内并落在 UTF-8 字符边界。
 实际保护跨度冲突、跨越 `Lines` 元素的语义槽边界、原文占用保留前缀 `⟦ATT_`，或最终
@@ -594,30 +601,34 @@ Unit 为最小诊断和状态单位，以完整 TaskBlock 为最小发送单位�
 NaturalText 与 Builtin 控制符共同物化的结果；测试时应同时覆盖命中 scope、不命中 scope、
 opaque 壳和壳内正文。
 
-### 6.8 MV/MZ Builtin 控制符矩阵
+### 6.8 内建控制符
 
-Builtin 匹配严格使用 ASCII 字母和 `[0-9]`；命令名接受 ASCII 大小写，不应用 Unicode
-大小写折叠。反斜杠和括号都是游戏文本的实际字符。
+MV/MZ 的标准控制语法和标准字段消费者是 ATT 的默认领域事实。开发时用于确认这些事实的
+官方 core、历史实现和真实样本不进入生产流程；项目运行时不扫描 core、不计算函数摘要，
+也不因活动插件覆写重新决定内建规则。实现根据项目引擎与 Unit 的标准物理来源直接应用下表。
 
-| 控制符 | MV | MZ |
-|---|:---:|:---:|
-| `\V[n]`、`\N[n]`、`\P[n]`、`\C[n]`、`\I[n]` | 保护 | 保护 |
-| `\PX[n]`、`\PY[n]`、`\FS[n]` | 不内建 | 保护 |
-| `\n<...>`、`\N<...>` 姓名框 | 保护 | 保护 |
-| `\G` | 保护 | 保护 |
-| `\\`、`\{`、`\}`、`\$`、`\.`、`\|`、`\!`、`\>`、`\<`、`\^` | 保护 | 保护 |
+这些语法不是脱离标准消费者的全局匹配表：
 
-`n` 必须由一个或多个 ASCII 数字组成。插件扩展——包括 MV 插件自行实现的 PX/PY/FS——
-请用自定义 Placeholder Rule 明确保护。
-姓名框必须包含闭合 `>`，框内不得出现 Unicode 控制字符；框内可以包含 `\n[145]` 等
-方括号控制语法。ATT 不把其他裸尖括号文本推断成姓名框。
-表中的 `\<`、`\>` 都带着实际的反斜杠；裸 `<`、`>` 不是 Builtin Placeholder，外形再像
-插件协议也不会被推断成占位符。
+| 语法族 | MV | MZ | 只有何种消费者成立时才保护 |
+|---|:---:|:---:|---|
+| `%[0-9]+` | 有 | 有 | 标准字段是 `String.prototype.format` 的格式字符串 |
+| `\\`、`\V[n]`、`\N[n]`、`\P[n]`、`\G` | 有 | 有 | 标准字段由扩展文字消费者处理 |
+| `\C[n]`、`\I[n]`、`\{`、`\}` | 有 | 有 | 标准字段由扩展文字消费者处理 |
+| `\PX[n]`、`\PY[n]`、`\FS[n]` | 无 | 有 | 标准 MZ 字段由扩展文字消费者处理 |
+| `\$`、`\.`、`\|`、`\!`、`\>`、`\<`、`\^` | 有 | 有 | 标准字段由 Message 消费者处理 |
+| U+000C | 有 | 有 | 标准字段由 Message 消费者处理 |
 
-方括号和单字符控制符依据 RPG Maker MV 的
-[官方 `Window_Base` 核心脚本](https://raw.githubusercontent.com/rpgtkoolmv/corescript/master/js/rpg_windows/Window_Base.js)
-固化；姓名框则是 ATT 的固定文本协议，同时供 Placeholder 保护和 WriteBack 布局识别使用。
-除此之外，ATT 不把插件新增控制符推断成 Builtin。
+`n` 只由 ASCII `[0-9]` 组成，命令名只按 MV/MZ 的 ASCII 大小写规则解释。插件新增控制语法
+或把某种语法用于非标准字段时，该外形只进入 Review；明确确认后使用 Custom Placeholder，
+不能把插件事实扩成所有 MV/MZ 项目的内建规则。
+
+同一槽内的 `%N` 可以按目标语言语序重排；身份、数量和槽位必须保持。其他内建控制符保持
+相对顺序。两类规则都不允许增加、删除或移动到另一槽。
+
+`\N<...>`、`\N1<...>`、`\NC<...>` 等 inline 姓名框不是 MV/MZ 通用内建语法。MZ 原生
+speaker 是事件命令 101 的独立字段；MV 没有原生姓名框。当前游戏确实使用 inline wrapper
+时，使用带精确 `ids` 和 `text` 捕获的 Custom Placeholder Rule 保护前后壳，姓名正文仍是
+NaturalText。裸 `<`、`>` 以及没有消费者证据的反斜杠形式同样只进入 Review。
 
 ### 6.9 匹配、NaturalText 与重叠
 
@@ -634,6 +645,7 @@ UTF-8 字符边界。自定义规则零命中合法。ATT 先求出每条规则�
 ```toml
 [[rule]]
 scopes = ['event_dialogue']
+order = 'preserve'
 pattern = '<msg>(?<text>.*?)</msg>'
 ```
 

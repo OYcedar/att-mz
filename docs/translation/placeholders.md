@@ -4,10 +4,13 @@ Placeholder 保护控制符、模板标记和其他不能由模型改写的片�
 
 ```toml
 [[rule]]
+order = 'preserve'
 pattern = '\\SE\[[^]]+\]'
 
 [[rule]]
 scopes = ['dialogue', 'choice']
+ids = ['Map023.json:event17:page1:dialogue42']
+order = 'preserve'
 pattern = '<msg>(?<text>.*?)</msg>'
 ```
 
@@ -20,6 +23,13 @@ pattern = '<msg>(?<text>.*?)</msg>'
 |---|---|
 | `pattern` | 非空、可编译的 PCRE2 表达式 |
 | `scopes` | 可省略的非空字符串数组；省略表示适用于全部 kind |
+| `ids` | 可省略的非空自然 Manual ID 数组；省略表示不按 ID 限定 |
+| `order` | `preserve` 或 `reorder_within_slot` |
+
+`scopes` 与 `ids` 同时出现时取交集。每个 `ids` 值必须是当前项目的完整自然 ID；未知、
+重复或空 ID 会在模型请求前使资源无效。`preserve` 要求命中片段保持相对顺序；
+`reorder_within_slot` 允许同一文本槽内重排，但仍要求片段身份和数量不变，也不得跨槽。
+带 `text` 的 wrapper 必须使用 `preserve`。
 
 没有 `text` 命名捕获时，完整匹配是不透明保护段。存在 `text` 捕获时，捕获本身仍是可
 翻译的 NaturalText，完整匹配中捕获前后的字节分别成为不透明 wrapper。一个规则最多有
@@ -58,5 +68,5 @@ Placeholder 问题会区分 worker 启动、PCRE2 匹配、空匹配、缺少 `t
 `translate --placeholders FILE` 在模型请求之前完整解析并原子替换当前项目规则。省略参数
 时复用当前规则；`rule = []` 显式清空。解析失败时项目保持不变，也不发出请求。
 
-Manual check/apply 使用检查时的当前 Placeholder 验证新译文。已经应用的人工译文不会仅因
-Placeholder 配置后来变化而过期；人工译文只在对应原文或实际写回结构变化时过期。
+Manual check/apply 使用检查时的当前 Placeholder 验证新译文。数据库重新读取当前人工或
+自动译文时也使用当前强契约；契约变化后正文不再合法，就保留正文并转入 Rejected。

@@ -2,7 +2,7 @@
 
 ```text
 att generic translate --name NAME [PROFILE_ID] \
-  [--terms TERMINOLOGY_TOML] [--placeholders PLACEHOLDER_TOML]
+  [--terms TERMINOLOGY_TOML] [--placeholders PLACEHOLDER_TOML] [--retry-rejected]
 ```
 
 显式 Profile 必须存在于公共 `[translation].profiles`。省略时复用项目最近一次成功保存的
@@ -88,11 +88,10 @@ Generic 使用公共的四种 JSON 响应模式。关闭思考与原文回显时
 规则见[Prompt 规格](../translation/prompts.md)；原文回显只检查字符串数组形状，不比较
 内容。
 
-每个 ID 独立执行 Placeholder 恢复、源语残留检查和安全修复。目标语言由项目语言对和
-Prompt 明确规定，ATT 依靠这条契约确定译文语言，不做短文本语言识别猜测。
-
-合法 ID 直接保存，其余 ID 形成 Partial。合法响应外层处理、严格解析和公共保守 JSON
-修复都无法建立响应，或整个响应根结构无效时，该任务不保存。
+每个 ID 按[译文候选验收规格](../translation/candidate-validation.md)独立检查。结构合法的
+候选立即保存；源语残留、术语、语义和布局只产生 Review，不拒绝候选。唯一绑定但违反强
+不变量的候选保存为 Rejected，默认后续 Translate 不重复请求；只有显式
+`--retry-rejected` 才重新请求。响应无法建立唯一 ID 映射时，相应 Unit 保持 pending。
 任务并发执行，并始终按自然顺序确认和提交；取消或后续失败时，已经确认的前序进度原样
 保留。
 
@@ -129,3 +128,6 @@ Partial 会保留合法 ID 和已确认前序进度；再次运行只给仍需�
 继续提供稳定 TaskBlock 的完整语境。是否继续同一 Translate、修正系统性资源问题，还是用
 Manual 完成少量局部补译，要按
 [诊断与恢复指南](../guides/diagnosis-and-recovery.md#64-translate)根据具体原因与实际进展判断。
+
+Translate 的 Complete 只表示计划内 Unit 都有结构合法的当前译文；译后 QA 另行报告
+`clean`、`needs_review` 或 `unverified`，不把质量风险伪装成 Translate 失败。

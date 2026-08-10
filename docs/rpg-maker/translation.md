@@ -2,10 +2,10 @@
 
 ```text
 att mv translate --name NAME [PROFILE_ID] \
-  [--terms TERMINOLOGY_TOML] [--placeholders PLACEHOLDER_TOML]
+  [--terms TERMINOLOGY_TOML] [--placeholders PLACEHOLDER_TOML] [--retry-rejected]
 
 att mz translate --name NAME [PROFILE_ID] \
-  [--terms TERMINOLOGY_TOML] [--placeholders PLACEHOLDER_TOML]
+  [--terms TERMINOLOGY_TOML] [--placeholders PLACEHOLDER_TOML] [--retry-rejected]
 ```
 
 Translate 本身不运行 Lua。Profile 来自公共 `[translation].profiles`；省略时复用项目最近
@@ -71,10 +71,10 @@ Partial 后重试重新判断 ID，但不重新装箱。原块中的已完成 Un
 
 ## 4. 验收、并发和结果
 
-每个 ID 独立检查 JSON 形状、strict/free 数组结构、Placeholder、源语残留，并执行语言模块能够
-证明安全的修复。译文语言以项目语言对和 Prompt 的明确要求为准，ATT 不做短文本语言
-识别式的猜测。合法 ID 可以提交，其他 ID 形成 Partial；合法响应外层处理、严格解析和
-公共保守 JSON 修复都无法建立响应，或整个响应根结构无效时，该任务不提交。
+每个 ID 按[译文候选验收规格](../translation/candidate-validation.md)独立检查。结构合法的
+候选立即保存；源语残留、术语、语义和布局只产生 Review，不拒绝候选。唯一绑定但违反强
+不变量的候选保存为 Rejected，默认后续 Translate 不重复请求；只有显式
+`--retry-rejected` 才重新请求。响应无法建立唯一 ID 映射时，相应 Unit 保持 pending。
 
 任务之间可以并发执行，确认和提交仍按自然顺序进行。已确认的前序进度落库后，后续
 失败或取消都不会把它带走。提交时重新检查当前来源、Unit、译文和语义状态，发现并发变化
@@ -110,3 +110,6 @@ Partial 会保留合法 ID 和已确认前序进度；再次运行会重新判�
 是否继续同一 Translate、修正系统性资源问题，还是用 Manual 完成少量局部补译，要按
 [诊断与恢复指南](../guides/diagnosis-and-recovery.md#64-translate)根据具体原因与实际进展判断，
 不能把任一选择当成所有失败的固定做法。
+
+Translate 的 Complete 只表示计划内 Unit 都有结构合法的当前译文；译后 QA 另行报告
+`clean`、`needs_review` 或 `unverified`，不把质量风险伪装成 Translate 失败。

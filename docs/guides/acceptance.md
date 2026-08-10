@@ -117,7 +117,8 @@ Placeholder 和来源语境分类：
 处理顺序：
 
 1. 读取 [Manual 规格](../manual/README.md)和当前引擎 Translate、语言、术语、Placeholder
-   规格，运行 `manual export`。
+   规格。译后 QA 已定位条目时，先运行 `translation_qa.py manual` 生成自然 ID JSONL，再用
+   `manual export --ids` 导出预填当前译文的 TOML；普通待译项使用默认 pending 导出。
 2. 读取项目术语；含义明确的条目直接补译。
 3. 收集全部含义不明的可读 ID，在一次 Lua 脚本中调用 `ctx.translation.context(ids)`，不要
    为每条译文分别启动 Lua，也不要从旧任务临时 ID 猜位置。
@@ -143,6 +144,11 @@ Manual 不检查语言质量、术语、文风、语境或源语残留，这些�
 - 目标语自然度、UI 长度和可读性；
 - 源语言残留、拒绝语、模型说明、JSON 痕迹和异常转义。
 
+标准流程使用 `translation_qa.py scan` 一次读取 `translation export`、survey、术语和可选
+WriteBack 预览或 NW.js 运行记录，生成按原因分类的问题清单和 `qa-summary.json`。状态只取
+`clean`、`needs_review` 或 `unverified`；问题数量不会使该工具非零退出，也不会把结构合法
+译文改成 Rejected。
+
 源语残留扫描必须覆盖数据库当前译文、全部 WriteBack 输出和外部转换后的最终文件。扫描
 命中逐项分类，不能因某些合法专名或协议片段存在就整体忽略。扫描无命中也不能替代语义
 审校。
@@ -157,10 +163,7 @@ Manual 不检查语言质量、术语、文风、语境或源语残留，这些�
 - 未声明位置没有变化；
 - 所有保留原文逐项有解释；
 - 输出能被对应生产解析器完整读取；
-- 每条人工布局诊断已经按可读 ID 定位，并检查完整显示请求的译文、保留原文、控制序列与
-  硬换行；宽度或断点问题已经用 Manual 精确修订并复验，无效语法已返回相应
-  阶段修正；游戏有效但布局器无法理解的语法已经逐项记录，保留预期诊断，并在全部相关
-  实际场景中确认显示正确；
+- 译后 QA 的布局、控制符、源语残留和未验证场景已经按自然 ID 处理或明确接受；
 - 发布终态明确，没有未处理的 candidate、backup、journal 或结果未知。
 
 WriteBack 成功不表示 Translate 完成；Partial 输出可能合法保留源文，但这种输出只有在任务
