@@ -39,7 +39,7 @@ from att_toolbox.rpg_control_codes import (
     is_structural_blank,
     unprotected_format_arguments,
 )
-from att_toolbox.survey import load_survey, verify_source_baseline
+from att_toolbox.survey import read_jsonl
 
 _CUSTOM_FORMS: tuple[tuple[str, re.Pattern[str], str], ...] = (
     (
@@ -116,7 +116,14 @@ def _input_baseline(manual: Path, survey_root: Path, coverage: Path) -> dict[str
     }
 
 
-def _verify_previous(output: Path, baseline: Mapping[str, JsonValue]) -> None:
+def _load_previous_scan(
+    output: Path,
+    baseline: Mapping[str, JsonValue],
+) -> tuple[
+    list[dict[str, JsonValue]],
+    list[dict[str, JsonValue]],
+    dict[str, JsonValue],
+]:
     root = require_directory(output, "已有 preflight 作业目录")
     previous = read_json_object(root / "preflight.json", "已有 preflight 报告", allowed_root=root)
     old = previous.get("input_baseline")
@@ -126,6 +133,30 @@ def _verify_previous(output: Path, baseline: Mapping[str, JsonValue]) -> None:
             "Manual、survey 或 coverage 与首次 preflight 不同",
             "删除旧决定，对当前 Extract 重新运行不带 --decisions 的 preflight",
         )
+    candidates = read_jsonl(root / "placeholder-candidates.jsonl", "首次 preflight 候选")
+    fixed_structure = read_jsonl(root / "fixed-structure.jsonl", "首次 preflight 固定结构")
+    artifact_sha256 = previous.get("scan_artifact_sha256")
+    facts: dict[str, JsonValue] = {}
+    for field in ("translation_entries", "fixed_structure_entries", "fixed_blank_slots"):
+        value = previous.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            fail(str(root), f"首次 preflight 报告缺少有效 {field}", "重新运行不带 --decisions 的 preflight")
+        facts[field] = value
+    if (
+        previous.get("candidates") != len(candidates)
+        or facts["fixed_structure_entries"] != len(fixed_structure)
+        or not isinstance(artifact_sha256, dict)
+    ):
+        fail(str(root), "首次 preflight 报告与明细不一致", "重新运行不带 --decisions 的 preflight")
+    for name in ("placeholder-candidates.jsonl", "fixed-structure.jsonl"):
+        expected_digest = artifact_sha256.get(name)
+        actual_digest = hashlib.sha256((root / name).read_bytes()).hexdigest()
+        if not isinstance(expected_digest, str) or expected_digest != actual_digest:
+            fail(str(root / name), "首次 preflight 明细已被改写", "重新运行不带 --decisions 的 preflight")
+    for number, candidate in enumerate(candidates, start=1):
+        if candidate.get("candidate_id") != f"candidate-{number:06d}":
+            fail(str(root), "首次 preflight 候选自然编号无效", "重新运行不带 --decisions 的 preflight")
+    return candidates, fixed_structure, facts
 
 
 def _read_decisions(path: Path) -> dict[str, dict[str, JsonValue]]:
@@ -712,12 +743,12 @@ def _run(args: argparse.Namespace) -> int:
     survey_root = require_directory(args.survey, "survey 作业目录")
     coverage_path = require_file(args.coverage, "coverage.json")
     decisions_path = cast(Path | None, args.decisions)
-    survey, _locations, _, source_baseline = load_survey(survey_root)
-    verify_source_baseline(survey, source_baseline)
+    survey = read_json_object(survey_root / "survey.json", "survey.json", allowed_root=survey_root)
     coverage = read_json_object(coverage_path, "coverage.json", allowed_root=coverage_path.parent)
     baseline = _input_baseline(manual_path, survey_root, coverage_path)
+    previous_scan = None
     if decisions_path is not None:
-        _verify_previous(args.output, baseline)
+        previous_scan = _load_previous_scan(args.output, baseline)
     protect_outputs(
         [args.output],
         inputs=[
@@ -730,20 +761,35 @@ def _run(args: argparse.Namespace) -> int:
     )
     entries = read_manual(manual_path)
     engine, owners, contexts = _coverage_context(entries, survey, coverage)
-    contexts_by_id = {cast(str, context["manual_id"]): context for context in contexts}
-    candidates, fixed_structure, facts = _scan(engine, entries, owners, contexts_by_id)
+    if previous_scan is None:
+        contexts_by_id = {cast(str, context["manual_id"]): context for context in contexts}
+        candidates, fixed_structure, facts = _scan(engine, entries, owners, contexts_by_id)
+    else:
+        candidates, fixed_structure, facts = previous_scan
+        if facts["translation_entries"] != len(entries):
+            fail(
+                str(args.output),
+                "首次 preflight 报告与当前 Manual 条目数不一致",
+                "重新运行不带 --decisions 的 preflight",
+            )
     decisions = _read_decisions(decisions_path) if decisions_path is not None else {}
     reviewed_rules, resolutions, unresolved = _apply_decisions(candidates, decisions)
     rules = reviewed_rules
     _verify_generated_rules(rules, entries)
     coverage_complete = coverage.get("complete") is True
     complete = coverage_complete and not unresolved
+    candidates_text = _json_lines(candidates)
+    fixed_structure_text = _json_lines(fixed_structure)
     report: dict[str, JsonValue] = {
         "complete": complete,
         "coverage_complete": coverage_complete,
         "input_baseline": baseline,
         **facts,
         "candidates": len(candidates),
+        "scan_artifact_sha256": {
+            "placeholder-candidates.jsonl": hashlib.sha256(candidates_text.encode("utf-8")).hexdigest(),
+            "fixed-structure.jsonl": hashlib.sha256(fixed_structure_text.encode("utf-8")).hexdigest(),
+        },
         "generated_rules": len(rules),
         "unresolved": unresolved,
         "resolutions": resolutions,
@@ -763,8 +809,8 @@ def _run(args: argparse.Namespace) -> int:
         args.output,
         {
             "preflight.json": _json_text(report),
-            "placeholder-candidates.jsonl": _json_lines(candidates),
-            "fixed-structure.jsonl": _json_lines(fixed_structure),
+            "placeholder-candidates.jsonl": candidates_text,
+            "fixed-structure.jsonl": fixed_structure_text,
             "placeholder-rules.toml": _rules_toml(rules),
             "agent-work-metrics.json": _json_text(metrics),
         },

@@ -201,3 +201,69 @@ def test_translation_qa_uses_exports_and_builds_revision_ids(tmp_path: Path) -> 
     )
     corrected = json.loads((corrected_scan / "qa-summary.json").read_text(encoding="utf-8"))
     assert corrected["qa_status"] == "clean"
+
+
+def test_static_qa_uses_frozen_survey_but_final_evidence_rechecks_the_game(tmp_path: Path) -> None:
+    rows = translation_rows(corrected=True)
+    translations = tmp_path / "translations.jsonl"
+    write_jsonl(translations, rows)
+    locations = [
+        {
+            "candidate_id": f"location-{number:06d}",
+            "source": "data/System.json",
+            "source_text": cast(list[str], row["source"])[0],
+            "classification": "builtin",
+            "expected_manual_id": row["manual_id"],
+            "roles": ["display"],
+            "control_contract": {"consumer": "extended_text"},
+        }
+        for number, row in enumerate(rows, start=1)
+    ]
+    survey = write_survey(tmp_path, locations)
+    (tmp_path / "game" / "data" / "System.json").write_text('{"changed":true}', encoding="utf-8")
+
+    run_script(
+        [
+            "scan",
+            "--translations",
+            translations,
+            "--survey",
+            survey,
+            "--output",
+            tmp_path / "static-qa",
+        ]
+    )
+    write_back = tmp_path / "write-back.json"
+    write_json(write_back, {"source_unchanged": True, "output_json_valid": True})
+    write_back_result = run_script(
+        [
+            "scan",
+            "--translations",
+            translations,
+            "--survey",
+            survey,
+            "--write-back-preview",
+            write_back,
+            "--output",
+            tmp_path / "write-back-qa",
+        ],
+        expected=1,
+    )
+    assert "来源字节与 scan 时不同" in write_back_result.stderr
+    runtime = tmp_path / "runtime.json"
+    write_json(runtime, {"qa_status": "clean"})
+    runtime_result = run_script(
+        [
+            "scan",
+            "--translations",
+            translations,
+            "--survey",
+            survey,
+            "--runtime-report",
+            runtime,
+            "--output",
+            tmp_path / "runtime-qa",
+        ],
+        expected=1,
+    )
+    assert "来源字节与 scan 时不同" in runtime_result.stderr

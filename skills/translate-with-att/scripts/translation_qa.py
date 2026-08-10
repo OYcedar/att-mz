@@ -446,7 +446,8 @@ def _scan(args: argparse.Namespace) -> int:
     )
     protect_outputs([args.output], inputs=inputs, replace=args.replace)
     survey, locations, _groups, baseline = load_survey(survey_root)
-    verify_source_baseline(survey, baseline)
+    if write_back_path is not None or runtime_path is not None:
+        verify_source_baseline(survey, baseline)
     rows = _read_translation_export(translations_path)
     generic_manifest = _generic_manifest(generic_manifest_path)
     owner_values: set[str | None] = set()

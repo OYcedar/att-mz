@@ -128,9 +128,9 @@ class _HtmlRegion:
     attributes: tuple[_HtmlAttribute, ...]
 
 
-def _asset_inventory(game_root: Path) -> tuple[FontAsset, ...]:
+def _asset_inventory(game_root: Path, files: Sequence[Path]) -> tuple[FontAsset, ...]:
     result: list[FontAsset] = []
-    for path in safe_walk_files(game_root):
+    for path in files:
         if path.suffix.casefold() not in FONT_SUFFIXES:
             continue
         body = path.read_bytes()
@@ -429,6 +429,7 @@ def _discover_aliases(
     *,
     game_root: Path,
     content_root: Path,
+    files: Sequence[Path],
     assets: Sequence[FontAsset],
     runtime_javascript: frozenset[Path],
 ) -> tuple[tuple[FontAlias, ...], dict[str, FontAsset], list[ReviewItem]]:
@@ -445,7 +446,7 @@ def _discover_aliases(
                     asset,
                 )
             )
-    for path in safe_walk_files(game_root):
+    for path in files:
         suffix = path.suffix.casefold()
         if suffix not in {".css", ".htm", ".html", ".js", ".mjs"}:
             continue
@@ -1659,7 +1660,7 @@ def build_font_plan(
             "使用未损坏的单字体 OTF/TTF",
         )
     files = tuple(safe_walk_files(game_root))
-    assets = _asset_inventory(game_root)
+    assets = _asset_inventory(game_root, files)
     runtime_javascript, runtime_reviews = _runtime_javascript_paths(
         game_root=game_root,
         content_root=content_root,
@@ -1668,6 +1669,7 @@ def build_font_plan(
     aliases, alias_mapping, alias_reviews = _discover_aliases(
         game_root=game_root,
         content_root=content_root,
+        files=files,
         assets=assets,
         runtime_javascript=runtime_javascript,
     )

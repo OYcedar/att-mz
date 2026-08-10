@@ -19,6 +19,7 @@ from att_skill_tools import (
     JsonValue,
     ToolArgumentParser,
     atomic_write_directory,
+    atomic_write_text,
     display_path,
     fail,
     protect_outputs,
@@ -60,6 +61,12 @@ def _parser() -> argparse.ArgumentParser:
     finalize.add_argument("--decisions", type=Path, required=True, help="逐行 JSON 审核决定")
     finalize.add_argument("--output", type=Path, required=True, help="计划输出目录")
     finalize.add_argument("--replace", action="store_true", help="替换已存在的计划目录")
+
+    members = subparsers.add_parser("members", help="导出一个关系组的完整位置明细")
+    members.add_argument("--survey", type=Path, required=True, help="scan 生成的 survey 作业目录")
+    members.add_argument("--group-id", required=True, help="review-groups.jsonl 中的自然 group_id")
+    members.add_argument("--output", type=Path, required=True, help="完整成员 JSONL")
+    members.add_argument("--replace", action="store_true", help="替换已存在的成员 JSONL")
 
     audit = subparsers.add_parser("audit", help="用 ATT 所有权导出逐位置核对当前 Extract")
     audit.add_argument("--survey", type=Path, required=True, help="scan 生成的 survey 作业目录")
@@ -213,6 +220,27 @@ def _decision_rows(
                 "删除组决定或全部成员决定中的一方",
             )
     return output
+
+
+def _members(args: argparse.Namespace) -> int:
+    survey_root = require_directory(args.survey, "survey 作业目录")
+    group_id = cast(str, args.group_id)
+    if not group_id.strip():
+        fail("--group-id", "group_id 不能为空", "使用 review-groups.jsonl 中的自然 group_id")
+    protect_outputs([args.output], inputs=[survey_root], replace=args.replace)
+    _survey, locations, groups, _baseline = load_survey(survey_root)
+    members_by_group = _group_members(groups, locations)
+    if group_id not in members_by_group:
+        fail("--group-id", f"关系组 {group_id} 不存在", "使用 review-groups.jsonl 中的自然 group_id")
+    members = [
+        location
+        for location in locations
+        if location.get("classification") == "review" and location.get("review_group_id") == group_id
+    ]
+    atomic_write_text(args.output, json_lines(members), replace=args.replace)
+    print(f"关系组 {group_id}：已导出 {len(members)} 个完整位置。")
+    print(f"成员文件：{display_path(args.output)}")
+    return 0
 
 
 def _non_blank(value: JsonValue) -> str | None:
@@ -846,9 +874,15 @@ def _audit(args: argparse.Namespace) -> int:
         inputs=[survey_root, plan_root, ownership_path],
         replace=args.replace,
     )
-    survey, _, _, baseline = load_survey(survey_root)
-    verify_source_baseline(survey, baseline)
+    survey = read_json_object(survey_root / "survey.json", "survey.json", allowed_root=survey_root)
     coverage = read_json_object(plan_root / "coverage.json", "coverage.json", allowed_root=plan_root)
+    survey_engine = survey.get("engine")
+    if survey_engine not in {"mv", "mz"} or coverage.get("engine") != survey_engine:
+        fail(
+            str(survey_root / "survey.json"),
+            "survey 引擎与 finalize 计划不一致",
+            "使用生成该计划的 survey 作业目录",
+        )
     manifest_root = read_json_object(
         plan_root / "rules-manifest.json", "rules-manifest.json", allowed_root=plan_root
     )
@@ -959,6 +993,8 @@ def _main(args: argparse.Namespace) -> int:
         return _scan(args)
     if args.command == "finalize":
         return _finalize(args)
+    if args.command == "members":
+        return _members(args)
     return _audit(args)
 
 

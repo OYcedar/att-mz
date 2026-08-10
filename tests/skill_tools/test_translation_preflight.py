@@ -343,6 +343,11 @@ def test_preflight_uses_survey_coverage_and_records_fixed_slots_without_decision
         "".join(json.dumps(value, ensure_ascii=False) + "\n" for value in decisions),
         encoding="utf-8",
     )
+    initial["extract_contexts"] = [{"manual_id": "stale-cached-context"}]
+    (output / "preflight.json").write_text(
+        json.dumps(initial, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     run_script(
         [
             "--manual",
@@ -360,6 +365,7 @@ def test_preflight_uses_survey_coverage_and_records_fixed_slots_without_decision
     )
     final = json.loads((output / "preflight.json").read_text(encoding="utf-8"))
     assert final["complete"] is True
+    assert all(context["manual_id"] != "stale-cached-context" for context in final["extract_contexts"])
     rules = (output / "placeholder-rules.toml").read_text(encoding="utf-8")
     assert "pattern = '" in rules
     assert "%[0-9]+" in rules
@@ -367,6 +373,33 @@ def test_preflight_uses_survey_coverage_and_records_fixed_slots_without_decision
     assert "ids = ['Map001.json:event1:page1:command1']" in rules
     assert r"\\V" not in rules
     assert all("pattern" not in decision for decision in decisions)
+
+    candidates[0]["form"] = "manually-changed"
+    (output / "placeholder-candidates.jsonl").write_text(
+        "".join(json.dumps(value, ensure_ascii=False) + "\n" for value in candidates),
+        encoding="utf-8",
+    )
+    altered = run_script(
+        [
+            "--manual",
+            manual,
+            "--survey",
+            survey,
+            "--coverage",
+            coverage,
+            "--output",
+            output,
+            "--decisions",
+            decisions_path,
+            "--replace",
+        ],
+        expected=1,
+    )
+    assert "首次 preflight 明细已被改写" in altered.stderr
+
+    run_script(
+        ["--manual", manual, "--survey", survey, "--coverage", coverage, "--output", output, "--replace"]
+    )
 
     write_manual(manual, suffix="\n")
     run_script(
@@ -384,6 +417,26 @@ def test_preflight_uses_survey_coverage_and_records_fixed_slots_without_decision
             "--replace",
         ],
         expected=1,
+    )
+
+
+def test_preflight_uses_frozen_survey_without_reading_the_game_again(tmp_path: Path) -> None:
+    manual = tmp_path / "manual.toml"
+    write_manual(manual)
+    survey, coverage = write_survey(tmp_path)
+    (tmp_path / "game" / "www" / "data" / "System.json").write_text('{"changed":true}', encoding="utf-8")
+
+    run_script(
+        [
+            "--manual",
+            manual,
+            "--survey",
+            survey,
+            "--coverage",
+            coverage,
+            "--output",
+            tmp_path / "preflight",
+        ]
     )
 
 
