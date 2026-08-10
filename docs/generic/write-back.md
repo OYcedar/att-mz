@@ -24,19 +24,9 @@ att generic write-back --name NAME
 
 Partial 项目允许写回。结果明确报告使用译文的 Unit 数与保留原文的 Unit 数。
 
-候选写入前对自动译文执行全局符号修复。修复器使用原文符号作为模板，只替换译文中能够唯一
-对应的现有符号；不插入、删除或移动字符，译文空白和 Placeholder 逐字保留。局部多解不
-妨碍其他确定位置继续修复；修复器内部无法安全完成时保留该 Unit 原译文并继续构建候选。
-用户取消不计为内部跳过，仍按 WriteBack 的现有取消终态结束。发布汇总同时报告尝试、
-实际修复、内部跳过的 Unit 数和替换符号数。
-
-人工译文不经过符号修复，也不因 Placeholder 配置后来变化而重新判为无效；Manual apply
-已经按应用当时的原文、结构和 Placeholder 完成检查。
-
-对自动译文执行符号修复前，WriteBack 使用项目快照中的当前 Placeholder 规则重新保护原文
-和译文。保护、绑定或语言投影失败时，命令以类似
-`story.jsonl:line3:unit2:text` 的可读位置说明对象、原因、影响和处理办法，不发布候选，也不把真实
-Placeholder 错误计为内部跳过。
+WriteBack 不修订正文。自动译文和人工译文在进入当前状态前已经通过同一个结构与
+Placeholder 验收；WriteBack 只重新确认当前来源和项目快照，并逐字物化数据库中的当前译文。
+语言、术语、符号风格和布局风险由译后 QA 报告，不在发布时静默改变。
 
 ## 2. 验证与发布
 
@@ -57,9 +47,7 @@ Extract。
 也不手工删除、改名或移动工作目录。
 
 Generic WriteBack 必须写 `publication.started` 和唯一 `publication.finished`。成功结果为
-`published`，汇总 `files`、`translated_units`、`retained_source_units`、
-`symbol_repair_attempted_units`、`symbol_repair_repaired_units`、
-`symbol_repair_skipped_units` 和 `symbol_repair_replacements`；失败结果为 `not_published`、
+`published`，汇总 `files`、`translated_units` 和 `retained_source_units`；失败结果为 `not_published`、
 `recovery_required` 或 `outcome_unknown`。具体问题由同次可读 `diagnostic.publication` 说明，
 不附内部诊断引用。
 

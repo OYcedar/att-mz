@@ -4,8 +4,8 @@ Manual 是 MV、MZ 和 Generic 普通人工补译的统一入口。它只处理�
 编辑的 UTF-8 TOML，不请求模型，不修改 Prompt、术语、语言规则或 Placeholder 配置。
 
 ```text
-att mv|mz manual export --name NAME [--ownership OWNERSHIP.jsonl] FILE.toml
-att generic manual export --name NAME FILE.toml
+att mv|mz|generic manual export --name NAME \
+  [--selection pending|rejected|all | --ids IDS.jsonl] FILE.toml
 att mv|mz|generic manual check --name NAME FILE.toml
 att mv|mz|generic manual apply --name NAME FILE.toml
 ```
@@ -41,45 +41,38 @@ translation = ["译文可以按照中文需要重新分行。"]
 - 数组元素不能包含 CR、LF 或 NUL，多行内容使用多个数组元素表达；
 - 未知字段、标量正文、重复 ID 和其他 TOML 结构均无效。
 
-`fixed` 必须保持数组长度和原文中的必要空槽。`free` 可以按目标语言需要改变数组长度。
-非空 `translation` 表示使用者明确填写；ATT 不判断它是否空白、是否等于原文、是否残留
-源语或是否符合术语和文风。
+`fixed` 必须保持数组长度和原文中的必要空槽。原文纯空白槽的译文必须是精确空字符串；
+原文非空槽不得译成空字符串或纯空白。`free` 可以按目标语言需要改变数组长度，但非空
+原文不得整体译成空白。ATT 不判断译义、源语残留、术语或文风。
 
 ## 2. export
 
-`manual export` 原子写入指定文件。默认只导出当前没有有效译文且确实需要翻译的条目：
+`manual export` 原子写入指定文件。默认 `--selection pending`，只导出当前没有有效译文、
+没有 Rejected 候选且确实需要翻译的条目。Rejected 表示候选确定违反结构契约，ATT 已保存
+候选以避免自动重复请求。
 
 - 不导出空白内容；
 - 不导出当前判断为非源语的内容；
 - 不导出完全由 Placeholder 保护的内容；
 - 不导出已有当前人工或自动译文的内容。
 
-导出文件不包含上下文、内部状态、失败诊断、术语、hash 或数据库身份。没有待处理条目时
-写出空文件。
+`--selection rejected` 只导出 Rejected。候选能表示为字符串数组时预填 `translation`；否则
+保留候选 JSON 和确定原因作为注释，`translation = []`，由使用者填写。`--selection all`
+导出全部当前条目并预填当前有效译文或可表示的 Rejected 候选。
 
-MV/MZ 可以在 export 时同时提供 `--ownership OWNERSHIP.jsonl`。ATT 在同一只读数据库快照
-中生成 TOML 和所有权 JSONL；JSONL 严格按 Manual 自然顺序逐行对应，只含以下公开字段：
+`--ids IDS.jsonl` 按文件中的自然 ID 导出，并预填当前有效译文或可表示的 Rejected 候选。
+每行必须且只能是：
 
 ```json
-{"manual_id":"Actors.json:1:name","owner":"builtin"}
-{"manual_id":"plugins.js:QuestWindow:Title","owner":"rules","rule_number":7}
+{"manual_id":"Actors.json:1:name"}
 ```
 
-`manual_id` 与 TOML 的 `id` 完全相同。Builtin 行只有 `manual_id`、`owner`；Rules 行另有从
-1 开始的 `rule_number`。文件不包含数据库 ID、编码位置、摘要或从路径前缀猜出的 owner。
-Generic 没有 Builtin/Rules 所有权，因此不接受 `--ownership`。
+重复、未知或带未知字段的 ID 会使导出失败。导出文件不包含上下文、术语、hash 或数据库
+身份；没有选中条目时写出空文件。输出目标必须是普通非 reparse 文件。
 
-两份输出使用同目录固定 `.tmp` 和 `.backup` 文件完成成对替换与补偿恢复；这不是文件系统
-提供的瞬时双文件原子 rename。发布前，ATT 先确认两个目标及各自临时、备份路径共六个对象
-互不指向同一自然或物理文件；已存在的目标必须是普通非 reparse 文件。两份旧输出可以正常
-一起替换。第二份发布失败时，两边都尽力恢复旧字节；恢复失败会保留自然恢复路径并报告
-RecoveryRequired。两份新输出已经发布、但备份清理失败时，结果报告
-AppliedFinalizationFailed；遗留 `.backup` 使下一次同目标 export 在任何新改动前明确要求先
-处理恢复现场。目录、reparse、特殊文件、同目标、交叉临时/备份身份或已有恢复现场都在移动
-任何目标前失败，不会被泛化成权限问题。
-
-单文件 export 和成对 export 都拒绝把目录或 reparse 对象当作可替换文件。公开诊断说明
-具体对象、类型化文件系统原因、状态影响和处理办法，不解析或公开原始操作系统错误正文。
+所有权不再依附 Manual。`att mv|mz ownership export` 导出全部 Extract Unit；
+`att mv|mz|generic translation export` 导出全部当前 Unit，格式见
+[CLI 规格](../runtime/cli.md#5-manual-输出)。
 
 ## 3. check
 
@@ -92,6 +85,7 @@ AppliedFinalizationFailed；遗留 `.backup` 使下一次同目标 export 在任
 - `source` 与当前原文是否逐项一致；
 - `type`、数组形状、固定行数和必要空槽；
 - 控制字符、RPG Maker 控制码和当前必要 Placeholder。
+- 原文非空槽或正文没有被译成空字符串或纯空白。
 
 它不检查翻译质量、源语残留、译文是否等于原文、术语、专名或模型能否接受。输出只列出
 有效、未填写和错误数量；每个错误说明可读 ID、原因和修改方法。未填写不是错误。
@@ -101,12 +95,10 @@ AppliedFinalizationFailed；遗留 `.backup` 使下一次同目标 export 在任
 `manual apply` 在一个数据库事务中执行与 `check` 相同的检查。存在任何错误时不修改任何
 条目；全部结构有效时，只应用非空 `translation`，未填写项跳过。
 
-人工译文优先于自动译文。应用人工译文只清除同一位置的自动译文，不触发模型请求、全局
-规则修改、重新翻译或无关译文失效。人工译文只在对应原文或实际写回结构变化时成为过期；
-过期正文继续保存在数据库中，但 WriteBack 不使用它。
-
-术语、Prompt、Profile、Client、语言判断、质量规则或 Placeholder 配置变化不会使已经应用
-的人工译文过期。
+人工译文优先于自动译文。应用人工译文会清除同一位置的自动译文和 Rejected 候选，不触发
+模型请求、全局规则修改、重新翻译或无关译文失效。原文、实际写回结构或强验收契约变化后，
+ATT 用统一候选验收重新检查当前人工正文；仍合法则保留，确定违反强不变量时正文与来源转入
+Rejected，WriteBack 不使用它。术语、文风、语言比例和布局等 Review 不会使人工译文失效。
 
 ## 5. 需要上下文时
 

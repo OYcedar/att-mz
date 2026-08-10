@@ -15,9 +15,6 @@ att [--ui-language LANG] ENGINE COMMAND ...
 ```text
 att mv|mz init --name NAME [--path GAME_ROOT]
   [--source-language LANG] [--target-language LANG]
-  [--dialogue-max-fullwidth-chars COUNT]
-  [--scrolling-text-max-fullwidth-chars COUNT]
-  [--help-description-max-fullwidth-chars COUNT]
 
 att generic init --name NAME [--path JSONL_ROOT]
   [--source-language LANG] [--target-language LANG]
@@ -29,9 +26,13 @@ att generic extract --name NAME
 
 att mv|mz|generic translate --name NAME [PROFILE_ID]
   [--terms TERMS_TOML] [--placeholders PLACEHOLDERS_TOML]
+  [--retry-rejected]
 
-att mv|mz manual export --name NAME [--ownership OWNERSHIP.jsonl] FILE.toml
-att generic manual export --name NAME FILE.toml
+att mv|mz ownership export --name NAME OWNERSHIP.jsonl
+att mv|mz|generic translation export --name NAME TRANSLATIONS.jsonl
+
+att mv|mz|generic manual export --name NAME
+  [--selection pending|rejected|all | --ids IDS.jsonl] FILE.toml
 att mv|mz|generic manual check  --name NAME FILE.toml
 att mv|mz|generic manual apply  --name NAME FILE.toml
 
@@ -40,8 +41,9 @@ att mv|mz|generic write-back --name NAME
 att mv|mz|generic lua --name NAME SCRIPT.lua [-- ARG...]
 ```
 
-Extract、Translate 和 WriteBack 不接受 `--lua`。Manual 不接受筛选、兼容格式或模型参数。
-独立 Lua 不接受 `--profile`。
+Extract、Translate 和 WriteBack 不接受 `--lua`。Manual 不接受兼容格式或模型参数；
+`manual export` 省略筛选时使用 `pending`，`--selection` 与 `--ids` 互斥。独立 Lua 不接受
+`--profile`。
 
 ## 2. UI 与进度
 
@@ -85,7 +87,7 @@ Windows 路径统一显示自然盘符或 UNC 形式，不公开 `\\?\` 扩展�
 省略可选参数时，ATT 只在以下明确说明的情形复用项目状态：
 
 - Generic 首次 Init 必须提供路径和语言；再次 Init 分项复用；
-- MV/MZ 首次 Init 还必须提供三个正数全角布局宽度；再次 Init 分项复用；
+- MV/MZ 首次 Init 必须提供游戏路径和语言；再次 Init 分项复用；
 - MV/MZ 首次 Extract 必须选择 owner；以后省略全部选项时复用完整 owner 集合；
 - Translate 省略 Profile 时复用最近成功 Profile；省略术语或 Placeholder 时复用项目资源；
 - Generic Extract 始终读取项目绑定的当前 JSONL 根；
@@ -118,12 +120,28 @@ Ctrl-C 请求合作取消：
 
 Manual 的完整格式和检查规则见 [Manual TOML 规格](../manual/README.md)。CLI 摘要只报告：
 
-- export：导出条目数和目标文件；MV/MZ 同时提供 `--ownership` 时还报告所有权文件；
+- export：导出条目数和目标文件；
 - check：有效、未填写和错误数量；
 - apply：已应用、未填写和错误数量。
 
 检查错误逐项显示可读 `id`、原因和修改方法。未填写项不是错误，因此 check 在只有未填写项
 时仍退出 `0`。apply 发现任一错误时不修改数据库并退出 `1`。
+
+`ownership export` 导出全部 RPG Maker Extract Unit 的自然所有权；`translation export`
+导出全部当前 Unit 的原文、译文和状态。两者都从一个只读快照原子写出 JSONL，不依附
+Manual 筛选。
+
+Ownership 每行只含自然 ID、owner，以及 Rules 条目的自然规则序号：
+
+```json
+{"manual_id":"Actors.json:1:name","owner":"builtin"}
+{"manual_id":"plugins.js:QuestWindow:Title","owner":"rules","rule_number":7}
+```
+
+Translation 每行含 `manual_id`、`source`、`translation`、`state`、`origin` 和 `type`；
+RPG Maker 另含 owner 和 Rules 的 `rule_number`。`state` 为 `pending`、`current` 或
+`rejected`，`origin` 为 `none`、`automatic` 或 `manual`。Rejected 的 `translation` 保留
+原候选 JSON；pending 为 `null`。输出不含数据库 ID、hash 或编码位置。
 
 ## 6. 运行文件
 
@@ -165,7 +183,7 @@ SQLite code、查询文本、供应商请求 ID 或指纹差异。
 
 项目日志仍可写时，警告和错误以同样的可读四字段保存；日志无法建立或继续写入时，stderr
 直接显示这四项。相关清理、回滚、候选丢弃、收尾、关闭和结果记录失败还要说明彼此关系。
-Partial、Unavailable、人工布局、取消后已经生效的状态和任务记录故障都必须可见，但不重复
+Partial、Unavailable、Review、取消后已经生效的状态和任务记录故障都必须可见，但不重复
 输出无实际作用的确认或内部诊断。
 
 Translate 的正常终态明确显示 `无需处理`、`完整` 或 `未完整`。Partial 或 Unavailable

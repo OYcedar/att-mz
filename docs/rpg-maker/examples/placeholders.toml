@@ -1,8 +1,10 @@
 [[rule]]
+order = 'preserve'
 pattern = '\\SE\[[^]]+\]'
 
 [[rule]]
 scopes = ['event_dialogue', 'event_choices']
+order = 'preserve'
 pattern = '<msg>(?<text>.*?)</msg>'
 
 [[rule]]
@@ -14,4 +16,5 @@ scopes = [
   'event_command',
   'plugin_parameter',
 ]
+order = 'preserve'
 pattern = '\{icon:[0-9]+\}'

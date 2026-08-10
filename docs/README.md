@@ -70,7 +70,7 @@ Builtin → Rules → Generic 的选择顺序。具体来源、路径、捕获�
 | `outcome_unknown` | [诊断与恢复指南](guides/diagnosis-and-recovery.md#45-outcome_unknown)；停止新的写入和重跑 |
 | Translate Complete、Partial 或 Unavailable | [诊断与恢复指南的 Translate 分支](guides/diagnosis-and-recovery.md#64-translate)与对应引擎 Translate 规格 |
 | Rules 跳过警告或 owner 部分提交 | [诊断与恢复指南的 Extract 分支](guides/diagnosis-and-recovery.md#63-extract)与 [Rules](rpg-maker/rules.md) |
-| WriteBack 人工布局、候选或发布问题 | [诊断与恢复指南的 WriteBack 分支](guides/diagnosis-and-recovery.md#66-writeback-与目录发布) |
+| 译后 QA、WriteBack 候选或发布问题 | [诊断与恢复指南的 WriteBack 分支](guides/diagnosis-and-recovery.md#66-writeback-与目录发布) |
 | 日志、任务记录或终端呈现失败 | [项目日志](runtime/project-log.md)与[诊断与恢复指南](guides/diagnosis-and-recovery.md#67-sqlite-与可观测性) |
 
 退出码 `0`、输出目录存在、日志写有成功、某次 Translate Complete 或某个项目完成，都不能

@@ -79,7 +79,7 @@ allowed_terms = ["Page Up", "Page Down"]
 ```
 
 每种语言类型只接受自己声明的字段。Translate 校验全部定义，再精确选择项目源语言
-模块；WriteBack 不读取语言配置，符号修复是固定的全局产品行为。英语的 `ignored_terms`
+模块；WriteBack 不读取语言配置，也不改写已经验收的译文。英语的 `ignored_terms`
 只改变译前准入；`allowed_terms` 只允许译文保留已经确认的英文项，不改变译前判断或临时
 ID 分配。完整语义见[语言规格](../translation/language.md)。
 

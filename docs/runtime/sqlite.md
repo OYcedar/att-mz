@@ -7,10 +7,11 @@
 
 数据库只保存当前产品实际使用的事实：
 
-- 项目名、来源位置或来源快照、语言和布局设置；
+- 项目名、来源位置或来源快照和语言；
 - Extract 建立的 Group、Unit、自然顺序和写回关系；
 - 自动译文及其当前状态；
 - 独立保存的人工译文快照；
+- 能唯一绑定自然 Unit、但违反强不变量的 Rejected 候选及原因；
 - 当前术语、Placeholder 和最近成功 Profile；
 - MV/MZ 当前 Builtin/Rules 选择与写回所需资源。
 
@@ -19,8 +20,6 @@ schema 版本，不检测旧格式，不迁移，也不提供兼容 view、别�
 当前项目损坏处理。
 
 Generic 不复制外部 JSONL。外部 JSONL、去重族、代表项和译文历史都不属于项目数据库。
-WriteBack 的符号修复也没有配置或持久状态，每次从当前原文、当前译文和 Placeholder 重新
-计算。
 
 ## 2. 自动译文与人工译文
 
@@ -42,9 +41,10 @@ Extract 删除或重建当前位置时，旧人工正文仍可保留并供高级
 以后条件重新匹配时，同一记录可以再次成为当前。
 
 当前人工译文优先于自动译文。Manual apply 或 `ctx.translation.set` 写入人工记录时，只清除
-同一 Unit 的自动译文。Translate 跳过当前人工译文，模型结果提交也不能覆盖它。WriteBack
-按“当前人工译文、当前自动译文、原文”的顺序选择正文。过期人工译文不阻止后续自动
-Translate，也不参与 WriteBack。
+同一 Unit 的自动译文和 Rejected 候选。Translate 跳过当前人工译文，模型结果提交也不能
+覆盖它。当前验收契约改变后，数据库重新读取发现既有人工或自动正文违反强不变量时，正文
+和原来源转入 Rejected，原 Current 在同一事务中失效。WriteBack 按“当前人工译文、当前
+自动译文、原文”的顺序选择正文；Rejected 不参与 WriteBack。
 
 ## 3. 事务边界
 
@@ -74,6 +74,7 @@ Generic 主要表：
 | `generic_group` | Group、文件、kind、顺序和上下文状态 |
 | `generic_unit` | Unit、原文、自动译文和自动状态 |
 | `generic_manual_translation` | 独立人工译文快照与内部适用性 |
+| `generic_rejected_translation` | 当前 Rejected 候选、来源、确定原因和验收状态 |
 | `translation_resource` | 当前术语与 Placeholder |
 
 `generic_unit` 的自动正文使用 `translation` 与 `translation_state`；人工正文只使用
@@ -84,13 +85,14 @@ MV/MZ 主要表：
 
 | 表 | 当前职责 |
 | --- | --- |
-| `metadata` | 项目、语言、来源快照与布局设置 |
+| `metadata` | 项目、语言与来源快照 |
 | `rpg_maker_asset_owner_state` | Builtin/Rules 当前来源状态 |
 | `rpg_maker_project_definition` | 当前 MV/MZ 项目定义 |
 | `rpg_maker_translation_resource` | 当前术语与 Placeholder |
 | `rpg_maker_text_group` | 当前 Group、自然顺序、kind 与写回 recipe |
 | `rpg_maker_text_unit` | 当前 Unit、owner、Rules 自然规则序号、原文、上下文、自动译文和自动状态 |
 | `rpg_maker_manual_translation` | 独立人工译文快照与内部适用性 |
+| `rpg_maker_rejected_translation` | 当前 Rejected 候选、来源、确定原因和验收状态 |
 | `rpg_maker_mutation_claim` | 写回修改范围 |
 
 人工表没有外键。Raw SQL 可以直接读取或破坏这些表；ATT 不保证被修改后的数据库仍满足

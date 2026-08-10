@@ -66,8 +66,8 @@ Manual export/check/apply 不建立项目日志；它们的 stdout/stderr 就是
 
 ### 4.1 成功
 
-成功只表示本命令得到明确结果。Translate Incomplete、WriteBack 保留原文和人工布局警告都
-可能退出 `0`，仍需按业务摘要和验收指南继续处理。
+成功只表示本命令得到明确结果。Translate Incomplete、WriteBack 保留原文，以及译后 QA 的
+`needs_review` 或 `unverified` 都可能退出 `0`，仍需按业务摘要和验收指南继续处理。
 
 ### 4.2 失败
 
@@ -194,11 +194,12 @@ Raw `ctx.db` 从 autocommit 开始，可以执行 DML、DDL、PRAGMA 和显式�
 
 ### 6.6 WriteBack 与目录发布
 
-WriteBack 可以在 Partial 项目上运行，未译条目保留原文。人工译文优先于自动译文；人工
-译文不因 Placeholder 配置后来变化而过期，也不经过自动符号修复。
+WriteBack 可以在 Partial 项目上运行，未译条目保留原文。人工译文优先于自动译文；当前
+人工译文和自动译文都必须满足当前 Placeholder 契约，WriteBack 逐字物化已验收的译文。
 
-人工布局警告使用可读 ID。重新 Manual export，按 ID 调整硬换行；需要 Group 语境时批量
-调用 Lua context。修订后重新 WriteBack 并在隔离副本中检查实际显示。
+布局问题由译后 QA 或实际界面观察报告。按可读 ID 导出修订 Manual，调整后再次运行 QA；
+需要 Group 语境时批量调用 Lua context。修订完成后重新 WriteBack，并在隔离副本中检查
+实际显示。
 
 候选验证失败或目录交换前取消时，上一次输出保持。发布已经开始后按 4.4 和 4.5 区分可恢复
 与结果未知。不要依据路径名猜恢复动作，固定工作目录仍以 journal 为权威。
