@@ -1,25 +1,20 @@
-#!/usr/bin/env python3
 """把最终 Extract 的 Manual TOML 整理为 Formic 自然来源单元。"""
 
 from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "_shared"))
 
 from att_skill_tools import (
     JsonValue,
-    ToolArgumentParser,
     atomic_write_directory,
     display_path,
     protect_outputs,
     read_manual,
-    run_cli,
 )
-from term_toolbox.grouping import (
+
+from .grouping import (
     FORMIC_TARGET_RENDERED_CHARACTERS,
     build_formic_units,
     formic_packing_evidence,
@@ -35,17 +30,17 @@ _TASK = """\
 """
 
 
-def _parser() -> argparse.ArgumentParser:
-    parser = ToolArgumentParser(description="一次建立 Formic input、plan.jsonl 和 task.md。")
+def configure_parser(parser: argparse.ArgumentParser) -> None:
+    """添加 prepare 子命令参数。"""
+
     parser.add_argument(
         "--manual", type=Path, required=True, help="首次 Translate 前的最终 Manual export TOML"
     )
     parser.add_argument("--output", type=Path, required=True, help="Formic 作业目录")
     parser.add_argument("--replace", action="store_true")
-    return parser
 
 
-def _prepare(args: argparse.Namespace) -> int:
+def prepare(args: argparse.Namespace) -> int:
     entries = read_manual(args.manual)
     protect_outputs([args.output], inputs=[args.manual], replace=args.replace)
     target_characters = FORMIC_TARGET_RENDERED_CHARACTERS
@@ -81,8 +76,3 @@ def _prepare(args: argparse.Namespace) -> int:
         )
     print("下一步：在 Formic 目录使用 output/input、output/plan.jsonl 和 output/task.md 运行全部单元。")
     return 0
-
-
-if __name__ == "__main__":
-    parsed = _parser().parse_args()
-    run_cli(lambda: _prepare(parsed))

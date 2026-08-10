@@ -88,6 +88,7 @@ class StringLeaf:
     path: tuple[str | int, ...]
     value: str
     decoded_layers: int
+    decode_positions: tuple[int, ...] = ()
 
 
 def looks_like_player_text(value: str) -> bool:
@@ -226,24 +227,22 @@ def _extract_json_array(text: str, object_name: str) -> list[JsonValue]:
     return raw
 
 
-def read_plugins(content_root: Path) -> list[PluginInfo]:
-    path = content_root / "js" / "plugins.js"
-    if not path.exists():
-        fail(str(path), "缺少 RPG Maker plugins.js", "恢复实际内容根中的完整插件配置后重试")
-    source = require_file_within(path, content_root, "plugins.js")
-    entries = _extract_json_array(source.read_text(encoding="utf-8-sig"), str(source))
+def parse_plugins(text: str, object_name: str) -> list[PluginInfo]:
+    """从已经读取的 plugins.js 正文严格建立插件清单。"""
+
+    entries = _extract_json_array(text, object_name)
     result: list[PluginInfo] = []
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
-            fail(str(path), f"插件数组第 {index + 1} 项不是 object", "修正 plugins.js 中的插件项")
+            fail(object_name, f"插件数组第 {index + 1} 项不是 object", "修正 plugins.js 中的插件项")
         name = entry.get("name")
         status = entry.get("status")
         description = entry.get("description", "")
         parameters = entry.get("parameters", {})
         if not isinstance(name, str) or not isinstance(status, bool):
-            fail(str(path), f"插件数组第 {index + 1} 项缺少有效 name/status", "修正该插件的名称和启用状态")
+            fail(object_name, f"插件数组第 {index + 1} 项缺少有效 name/status", "修正该插件的名称和启用状态")
         if not isinstance(description, str) or not isinstance(parameters, dict):
-            fail(str(path), f"插件 {name} 的 description/parameters 类型无效", "修正该插件配置")
+            fail(object_name, f"插件 {name} 的 description/parameters 类型无效", "修正该插件配置")
         typed_parameters: dict[str, JsonValue] = {}
         for key, value in parameters.items():
             typed_parameters[key] = value
@@ -259,21 +258,42 @@ def read_plugins(content_root: Path) -> list[PluginInfo]:
     return result
 
 
+def read_plugins(content_root: Path) -> list[PluginInfo]:
+    path = content_root / "js" / "plugins.js"
+    if not path.exists():
+        fail(str(path), "缺少 RPG Maker plugins.js", "恢复实际内容根中的完整插件配置后重试")
+    source = require_file_within(path, content_root, "plugins.js")
+    return parse_plugins(source.read_text(encoding="utf-8-sig"), str(source))
+
+
+def canonical_map_number(name: str) -> int | None:
+    """返回规范 Map 文件号；任意长十进制名称都不会先转机器整数。"""
+
+    match = _MAP_NAME.fullmatch(name)
+    if match is None:
+        return None
+    digits = match.group(1)
+    normalized = digits.lstrip("0")
+    maximum = "4294967295"
+    if (
+        not normalized
+        or len(normalized) > len(maximum)
+        or (len(normalized) == len(maximum) and normalized > maximum)
+    ):
+        return None
+    value = int(normalized)
+    expected = f"{value:03d}" if value < 1000 else normalized
+    return value if digits == expected else None
+
+
 def canonical_map_files(data_root: Path) -> list[Path]:
     result: list[tuple[int, Path]] = []
     resolved_data = require_directory(data_root, "data 目录")
     for path in safe_walk_files(resolved_data):
         if path.parent != resolved_data:
             continue
-        match = _MAP_NAME.fullmatch(path.name)
-        if match is None:
-            continue
-        digits = match.group(1)
-        value = int(digits)
-        if value < 1 or value > 4_294_967_295:
-            continue
-        expected = f"{value:03d}" if value < 1000 else str(value)
-        if digits != expected:
+        value = canonical_map_number(path.name)
+        if value is None:
             continue
         result.append((value, path))
     return [path for _, path in sorted(result)]
@@ -521,6 +541,7 @@ def iter_string_leaves(
     *,
     path: tuple[str | int, ...] = (),
     decoded_layers: int = 0,
+    decode_positions: tuple[int, ...] = (),
 ) -> Iterator[StringLeaf]:
     if isinstance(value, str):
         current = value
@@ -536,13 +557,24 @@ def iter_string_leaves(
             seen.add(current)
             decoded = _try_decode(current, actual_path(path) or "嵌套 JSON string")
             if decoded is None:
-                yield StringLeaf(path=path, value=current, decoded_layers=layers)
+                yield StringLeaf(
+                    path=path,
+                    value=current,
+                    decoded_layers=layers,
+                    decode_positions=decode_positions,
+                )
                 return
             layers += 1
+            decode_positions = (*decode_positions, len(path))
             if isinstance(decoded, str):
                 current = decoded
                 continue
-            yield from iter_string_leaves(decoded, path=path, decoded_layers=layers)
+            yield from iter_string_leaves(
+                decoded,
+                path=path,
+                decoded_layers=layers,
+                decode_positions=decode_positions,
+            )
             return
     elif isinstance(value, list):
         for index, item in enumerate(value):
@@ -551,6 +583,7 @@ def iter_string_leaves(
                     item,
                     path=(*path, index),
                     decoded_layers=decoded_layers,
+                    decode_positions=decode_positions,
                 )
     elif isinstance(value, dict):
         for key, item in value.items():
@@ -558,6 +591,7 @@ def iter_string_leaves(
                 item,
                 path=(*path, key),
                 decoded_layers=decoded_layers,
+                decode_positions=decode_positions,
             )
 
 

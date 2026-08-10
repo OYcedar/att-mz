@@ -1,36 +1,30 @@
-#!/usr/bin/env python3
 """把 Agent 审核的术语与译名写成严格 ATT TOML。"""
 
 from __future__ import annotations
 
 import argparse
-import sys
 import unicodedata
 from pathlib import Path
 from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "_shared"))
-
 from att_skill_tools import (
     JsonValue,
-    ToolArgumentParser,
     atomic_write_text,
     display_path,
     fail,
     protect_outputs,
     read_json_object,
-    run_cli,
     toml_string,
     validate_object_keys,
 )
 
 
-def _parser() -> argparse.ArgumentParser:
-    parser = ToolArgumentParser(description="验证术语、译名和 trigger 唯一性，再写 terminology.toml。")
+def configure_parser(parser: argparse.ArgumentParser) -> None:
+    """添加 finalize 子命令参数。"""
+
     parser.add_argument("--input", type=Path, required=True, help='Agent 审核 JSON：{"terms": [...]}')
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--replace", action="store_true")
-    return parser
 
 
 def _text(value: JsonValue, object_name: str, field: str, *, allow_line_feed: bool = False) -> str:
@@ -121,15 +115,10 @@ def _toml(terms: list[dict[str, JsonValue]]) -> str:
     return "\n\n".join(chunks) + "\n"
 
 
-def _write(args: argparse.Namespace) -> int:
+def finalize(args: argparse.Namespace) -> int:
     terms = _terms(args.input)
     protect_outputs([args.output], inputs=[args.input], replace=args.replace)
     atomic_write_text(args.output, _toml(terms), replace=args.replace)
     print(f"已写入 {len(terms)} 项 ATT 术语：{display_path(args.output)}")
     print("下一步：用 att mv|mz|generic translate --terms 交给生产解析、保存与命中验收。")
     return 0
-
-
-if __name__ == "__main__":
-    parsed = _parser().parse_args()
-    run_cli(lambda: _write(parsed))

@@ -1,19 +1,14 @@
-#!/usr/bin/env python3
 """按 Formic v2 完成记录核对术语候选的真实出现次数与位置。"""
 
 from __future__ import annotations
 
 import argparse
 import re
-import sys
 from pathlib import Path
 from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "_shared"))
-
 from att_skill_tools import (
     JsonValue,
-    ToolArgumentParser,
     display_path,
     fail,
     parse_json_text,
@@ -23,7 +18,6 @@ from att_skill_tools import (
     require_directory,
     require_file,
     require_list,
-    run_cli,
     safe_walk_files,
     scan_term_occurrences,
     validate_object_keys,
@@ -54,14 +48,16 @@ _SUMMARY_FIELDS = {
 }
 
 
-def _parser() -> argparse.ArgumentParser:
-    parser = ToolArgumentParser(description="只读 Formic v2 results 与最新 run summary，机械筛除无效候选。")
+def configure_parser(parser: argparse.ArgumentParser) -> None:
+    """添加 review 子命令参数。"""
+
     parser.add_argument("--manual", type=Path, required=True, help="与 Formic 作业一致的完整 Manual TOML")
-    parser.add_argument("--plan", type=Path, required=True, help="prepare_formic_job.py 生成的 plan.jsonl")
+    parser.add_argument(
+        "--plan", type=Path, required=True, help="terminology_job.py prepare 生成的 plan.jsonl"
+    )
     parser.add_argument("--formic-out", type=Path, required=True, help="Formic v2 OUT 根目录")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--replace", action="store_true")
-    return parser
 
 
 def _plan_units(path: Path) -> list[int]:
@@ -70,17 +66,17 @@ def _plan_units(path: Path) -> list[int]:
     seen: set[int] = set()
     for line_number, text in enumerate(source.read_text(encoding="utf-8-sig").splitlines(), start=1):
         if not text.strip():
-            fail(str(source), f"第 {line_number} 行为空", "重新运行 prepare_formic_job.py")
+            fail(str(source), f"第 {line_number} 行为空", "重新运行 terminology_job.py prepare")
         raw = parse_json_text(text, f"{source}:第 {line_number} 行")
         if not isinstance(raw, dict):
-            fail(str(source), f"第 {line_number} 行不是 JSON object", "重新运行 prepare_formic_job.py")
+            fail(str(source), f"第 {line_number} 行不是 JSON object", "重新运行 terminology_job.py prepare")
         allowed = {"unit", "files"} if "files" in raw else {"unit", "file", "start", "end"}
         validate_object_keys(raw, f"{source}:第 {line_number} 行", allowed)
         unit = raw.get("unit")
         if not isinstance(unit, int) or isinstance(unit, bool) or unit <= 0:
-            fail(str(source), f"第 {line_number} 行 unit 不是正整数", "重新运行 prepare_formic_job.py")
+            fail(str(source), f"第 {line_number} 行 unit 不是正整数", "重新运行 terminology_job.py prepare")
         if unit in seen:
-            fail(str(source), f"unit {unit} 重复", "重新运行 prepare_formic_job.py")
+            fail(str(source), f"unit {unit} 重复", "重新运行 terminology_job.py prepare")
         seen.add(unit)
         if "files" in raw:
             files = require_list(raw.get("files"), str(source), f"第 {line_number} 行 files")
@@ -196,7 +192,7 @@ def _latest_summary(out_root: Path, expected_count: int) -> tuple[str, dict[str,
     return latest.name, public_summary
 
 
-def _review(args: argparse.Namespace) -> int:
+def review(args: argparse.Namespace) -> int:
     entries = read_manual(args.manual)
     expected_units = _plan_units(args.plan)
     output_root = require_directory(args.formic_out, "Formic OUT 根目录")
@@ -272,8 +268,3 @@ def _review(args: argparse.Namespace) -> int:
     )
     print(f"待 Agent 统一审核：{display_path(args.output)}")
     return 0
-
-
-if __name__ == "__main__":
-    parsed = _parser().parse_args()
-    run_cli(lambda: _review(parsed))
