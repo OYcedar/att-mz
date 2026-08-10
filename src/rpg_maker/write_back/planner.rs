@@ -985,6 +985,7 @@ fn validate_content_structure(
 }
 
 fn validate_aligned_content(
+    group_location: &RpgMakerLocation,
     unit: &RpgMakerWriteBackUnit,
 ) -> Result<(), RpgMakerWriteBackSnapshotError> {
     if !matches!(
@@ -1017,6 +1018,7 @@ fn validate_aligned_content(
             || (!unit.manual && !source_is_blank && translated.trim().is_empty())
         {
             return Err(RpgMakerWriteBackSnapshotError::AlignedBlankLineMismatch {
+                group_location: Box::new(group_location.clone()),
                 role: unit.role.clone(),
                 line_index,
             });
@@ -1085,7 +1087,7 @@ impl RpgMakerWriteBackGroup {
             if let Some(translation) = &unit.translation_content {
                 validate_content_structure(kind, &unit.role, translation, "译文")?;
             }
-            validate_aligned_content(unit)?;
+            validate_aligned_content(&group_location, unit)?;
         }
         let mut seen_roles = BTreeSet::new();
         for unit in &units {
@@ -1568,6 +1570,7 @@ pub(crate) enum RpgMakerWriteBackSnapshotError {
         actual: usize,
     },
     AlignedBlankLineMismatch {
+        group_location: Box<RpgMakerLocation>,
         role: TextUnitRole,
         line_index: usize,
     },
@@ -1661,7 +1664,9 @@ impl fmt::Display for RpgMakerWriteBackSnapshotError {
                 formatter,
                 "严格对齐译文行数不一致：{role:?}，期待 {expected}，实际 {actual}"
             ),
-            Self::AlignedBlankLineMismatch { role, line_index } => write!(
+            Self::AlignedBlankLineMismatch {
+                role, line_index, ..
+            } => write!(
                 formatter,
                 "严格对齐译文第 {line_index} 行的空白状态与原文不一致：{role:?}"
             ),
@@ -5182,7 +5187,11 @@ mod tests {
                 TextUnitContent::Lines(vec!["是".to_owned(), "   ".to_owned()]),
                 TextUnitContent::Lines(vec!["はい".to_owned(), "填充".to_owned()]),
             ),
-            Err(RpgMakerWriteBackSnapshotError::AlignedBlankLineMismatch { line_index: 1, .. })
+            Err(RpgMakerWriteBackSnapshotError::AlignedBlankLineMismatch {
+                group_location,
+                role: TextUnitRole::Choices,
+                line_index: 1,
+            }) if *group_location == location(40, None)
         ));
 
         let group_location = location(43, None);

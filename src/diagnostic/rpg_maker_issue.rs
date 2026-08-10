@@ -3976,7 +3976,7 @@ pub(crate) enum RpgMakerWriteBackModelViolation {
         actual: usize,
     },
     AlignedBlankLineMismatch {
-        role: RpgMakerDiagnosticRole,
+        unit: RpgMakerLogicalUnitLocator,
         line_index: usize,
     },
     EmptyProjection {
@@ -7036,6 +7036,20 @@ impl RpgMakerIssue {
             | RpgMakerProblem::TaskResponse { scope, .. } => scope.subject(),
             RpgMakerProblem::ResultStore { problem } => problem.subject(),
             RpgMakerProblem::TranslationAsset { database_path, .. } => database_path.to_string(),
+            RpgMakerProblem::WriteBackAsset {
+                problem:
+                    RpgMakerWriteBackAssetProblem::InvalidSnapshot {
+                        violation:
+                            RpgMakerWriteBackAssetSnapshotViolation::InvalidModel {
+                                violation:
+                                    RpgMakerWriteBackModelViolation::AlignedBlankLineMismatch {
+                                        unit,
+                                        ..
+                                    },
+                            },
+                    },
+                ..
+            } => unit.natural_id(),
             RpgMakerProblem::WriteBackAsset { database_path, .. } => database_path.to_string(),
             RpgMakerProblem::WriteBackPlanning { .. } => "rpg_maker_write_back_plan".to_owned(),
             RpgMakerProblem::WriteBackDocumentRewrite { problem } => problem.subject(),
@@ -7261,7 +7275,9 @@ mod tests {
     use super::*;
     use crate::diagnostic::{
         ByteRange, Diagnostic, DiagnosticReport, PlaceholderIssue, StateEffect,
+        render_diagnostic_fields,
     };
+    use crate::i18n::{UiLocale, UiLocalizer};
 
     #[test]
     fn missing_text_capture_wire_keeps_complete_rpg_maker_locator() {
@@ -7537,6 +7553,43 @@ mod tests {
             value["primary"]["issue"]["details"]["problem"]["problem"]["location"]["source"]["map_id"],
             12
         );
+    }
+
+    #[test]
+    fn write_back_aligned_blank_line_mismatch_renders_logical_unit_as_object() {
+        let report = DiagnosticReport::new(
+            StateEffect::Unchanged,
+            Diagnostic::rpg_maker(RpgMakerIssue::write_back_asset(
+                "project.db",
+                RpgMakerWriteBackAssetProblem::InvalidSnapshot {
+                    violation: RpgMakerWriteBackAssetSnapshotViolation::InvalidModel {
+                        violation: RpgMakerWriteBackModelViolation::AlignedBlankLineMismatch {
+                            unit: RpgMakerLogicalUnitLocator::new(
+                                RpgMakerDiagnosticLocation::new(
+                                    RpgMakerDiagnosticSource::data("CommonEvents.json"),
+                                    vec![
+                                        RpgMakerDiagnosticLocationStep::array_index(66),
+                                        RpgMakerDiagnosticLocationStep::object_key("list"),
+                                        RpgMakerDiagnosticLocationStep::array_index(3),
+                                    ],
+                                ),
+                                RpgMakerDiagnosticRole::Choices,
+                            ),
+                            line_index: 0,
+                        },
+                    },
+                },
+            )),
+        );
+
+        let rendered =
+            render_diagnostic_fields(&report, &UiLocalizer::new(UiLocale::SimplifiedChinese));
+
+        assert_eq!(
+            rendered.object,
+            "data/CommonEvents.json[66]:list[3]:choices"
+        );
+        assert_ne!(rendered.object, "project.db");
     }
 
     #[test]

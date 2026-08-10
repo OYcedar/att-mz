@@ -10,12 +10,13 @@ use std::sync::Arc;
 use crate::diagnostic::{
     Diagnostic, DiagnosticReport, ReportedFailure, RpgMakerClaimSummaryMismatchDetails,
     RpgMakerClaimSummaryMismatchKind, RpgMakerComputeFailure, RpgMakerIssue,
-    RpgMakerJsonFailureKind, RpgMakerMutationAccess, RpgMakerSemanticOrderLevel,
-    RpgMakerWriteBackAssetComputeOperation, RpgMakerWriteBackAssetProblem,
-    RpgMakerWriteBackAssetSnapshotViolation, RpgMakerWriteBackModelViolation, SafeIdentifier,
-    SqliteDiagnosticContext, SqliteDiagnosticStage, SqliteOperation, SqliteTransactionState,
-    StateEffect, TranslationIssue, TranslationJsonFailureKind, TranslationPlanningResourceKind,
-    TranslationPlanningResourceOrigin, TranslationPlanningResourceProblem,
+    RpgMakerJsonFailureKind, RpgMakerLogicalUnitLocator, RpgMakerMutationAccess,
+    RpgMakerSemanticOrderLevel, RpgMakerWriteBackAssetComputeOperation,
+    RpgMakerWriteBackAssetProblem, RpgMakerWriteBackAssetSnapshotViolation,
+    RpgMakerWriteBackModelViolation, SafeIdentifier, SqliteDiagnosticContext,
+    SqliteDiagnosticStage, SqliteOperation, SqliteTransactionState, StateEffect, TranslationIssue,
+    TranslationJsonFailureKind, TranslationPlanningResourceKind, TranslationPlanningResourceOrigin,
+    TranslationPlanningResourceProblem,
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::json_diagnostic::JsonErrorCategory;
@@ -966,12 +967,17 @@ fn write_back_model_violation(
             expected: *expected,
             actual: *actual,
         },
-        RpgMakerWriteBackSnapshotError::AlignedBlankLineMismatch { role, line_index } => {
-            RpgMakerWriteBackModelViolation::AlignedBlankLineMismatch {
-                role: role.diagnostic_role(),
-                line_index: *line_index,
-            }
-        }
+        RpgMakerWriteBackSnapshotError::AlignedBlankLineMismatch {
+            group_location,
+            role,
+            line_index,
+        } => RpgMakerWriteBackModelViolation::AlignedBlankLineMismatch {
+            unit: RpgMakerLogicalUnitLocator::new(
+                group_location.diagnostic_location(),
+                role.diagnostic_role(),
+            ),
+            line_index: *line_index,
+        },
         RpgMakerWriteBackSnapshotError::EmptyProjection { group_location } => {
             RpgMakerWriteBackModelViolation::EmptyProjection {
                 group_location: group_location.diagnostic_location(),
@@ -2236,6 +2242,7 @@ mod tests {
             ),
             (
                 RpgMakerWriteBackSnapshotError::AlignedBlankLineMismatch {
+                    group_location: Box::new(group_location.clone()),
                     role: TextUnitRole::Choices,
                     line_index: 4,
                 },
@@ -2403,6 +2410,36 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn aligned_blank_line_violation_keeps_logical_unit_locator() {
+        let group_location = RpgMakerLocation::value(
+            RpgMakerSource::data(StandardDataFile::CommonEvents),
+            vec![
+                RpgMakerLocationStep::index(66),
+                RpgMakerLocationStep::key("list"),
+                RpgMakerLocationStep::index(3),
+            ],
+        );
+
+        let violation =
+            write_back_model_violation(&RpgMakerWriteBackSnapshotError::AlignedBlankLineMismatch {
+                group_location: Box::new(group_location.clone()),
+                role: TextUnitRole::Choices,
+                line_index: 0,
+            });
+
+        assert_eq!(
+            violation,
+            RpgMakerWriteBackModelViolation::AlignedBlankLineMismatch {
+                unit: RpgMakerLogicalUnitLocator::new(
+                    group_location.diagnostic_location(),
+                    TextUnitRole::Choices.diagnostic_role(),
+                ),
+                line_index: 0,
+            }
+        );
     }
 
     #[test]

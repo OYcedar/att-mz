@@ -689,11 +689,14 @@ fn check_document_with_cancellation(
                 );
                 continue;
             }
-            if let Some(slot) = current
-                .source
-                .iter()
-                .zip(&item.translation)
-                .position(|(source, translation)| source.is_empty() && !translation.is_empty())
+            if let Some(slot) =
+                current
+                    .source
+                    .iter()
+                    .zip(&item.translation)
+                    .position(|(source, translation)| {
+                        source.trim().is_empty() && !translation.is_empty()
+                    })
             {
                 push_issue(
                     &mut report,
@@ -4347,6 +4350,42 @@ mod tests {
         let report = check_manual_document(&path, &free, |_, _| Ok(())).unwrap();
         assert_eq!(report.valid, 1);
         assert!(report.is_valid());
+    }
+
+    #[test]
+    fn fixed_requires_blank_source_slots_to_have_exactly_empty_translations() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("manual.toml");
+        for blank_source in ["", " "] {
+            let fixed = ManualTranslationIndex::new(vec![indexed_entry(
+                ManualTranslationType::Fixed,
+                &["first", blank_source, "third"],
+            )])
+            .unwrap();
+            write_document(
+                &path,
+                &format!(
+                    "[[translation]]\nid = \"Skills.json:798:name\"\ntype = \"fixed\"\nsource = [\"first\", \"{blank_source}\", \"third\"]\ntranslation = [\"一\", \"错误\", \"三\"]\n"
+                ),
+            );
+
+            let report = check_manual_document(&path, &fixed, |_, _| Ok(())).unwrap();
+            assert_eq!(report.errors.len(), 1);
+            assert!(matches!(
+                report.errors[0].problem,
+                ManualCheckProblem::FixedBlankSlot { slot: 2 }
+            ));
+
+            write_document(
+                &path,
+                &format!(
+                    "[[translation]]\nid = \"Skills.json:798:name\"\ntype = \"fixed\"\nsource = [\"first\", \"{blank_source}\", \"third\"]\ntranslation = [\"一\", \"\", \"三\"]\n"
+                ),
+            );
+            let report = check_manual_document(&path, &fixed, |_, _| Ok(())).unwrap();
+            assert_eq!(report.valid, 1);
+            assert!(report.is_valid());
+        }
     }
 
     #[test]
