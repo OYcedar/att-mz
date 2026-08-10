@@ -187,6 +187,10 @@ manifest 和来源审核决定检查唯一所有者。manifest 必须与当前 T
 所有权审计（逐位置核对 ATT 实际提取所有者）完成后，把该 Manual 固定为本轮语料。后续如果改动
 Extract 或所有权，必须废弃已生成的 Placeholder 与术语作业，不能混用旧产物。
 
+每个关系组都必须有 `rules`、`generic`、`exclude` 或 `unresolved` 状态，但不要求把所有未知项都强行
+确认。运行观察被禁止、场景无法到达或静态证据不足时，保留精确未确认项并继续处理已确认范围；不要
+只为得到 `complete=true` 反复扫描或逐成员穷举大型关系组。
+
 精确覆盖、继承、owner 独立提交和失败范围见
 [MV/MZ Extract](../rpg-maker/extraction.md)与 [Rules](../rpg-maker/rules.md)。
 
@@ -265,8 +269,8 @@ Manual。填写前主动读取并参考项目术语表；条目含义不明确�
 
 编辑完成后默认直接 `manual apply`。Apply 会在单个数据库事务内执行与 `manual check` 相同的结构检查；
 发现任何错误时不修改任何条目。只在需要事先试检或单独诊断 TOML 时执行 `manual check`。静态 QA 发现的问题
-通常只集中修改一轮。Apply 成功后重新执行 Translation export 和静态 QA，确认本轮修改结果后才执行
-WriteBack。
+通常先集中修改一轮，但轮次不是完成条件。Apply 成功后重新执行 Translation export 和静态 QA，确认本轮
+修改结果后才执行 WriteBack；新证据或用户实机检查发现问题时可以再做第二轮。
 
 Lua 仍可程序化写入人工译文，也能直接执行任意数据库修改，但普通人工补译不以 Lua 为
 首选。只有复杂筛选、计算生成、批量变换、诊断或特殊修改更适合脚本时，才直接使用 Lua。
@@ -283,9 +287,9 @@ Generic 输出还必须由任务中已经确定的外部过程完整消费。组
 整合输出。候选验证、译后 QA、输入变化、发布恢复或结果未知转到
 [WriteBack 与目录发布诊断](diagnosis-and-recovery.md#66-writeback-与目录发布)。
 
-固定顺序是：静态 QA 后集中 Manual 一次，再 WriteBack，把输出部署到隔离副本并完成运行观察，
-最后用 Manual 后已经重新导出的 Translation export、WriteBack 验证报告和运行报告合并最终 QA。只有运行期
-报告出现静态 QA 无法看到的新事实时，才追加一轮 Manual、WriteBack 和受影响场景复查。
+固定顺序是：静态 QA 后集中 Manual，再 WriteBack，把输出部署到隔离副本并完成运行观察，
+最后用 Manual 后已经重新导出的 Translation export、WriteBack 验证报告和运行报告合并最终 QA。运行报告、
+用户实机检查或返修后新出现的事实可以触发下一轮；不得为了避免第二轮而在译前穷举无法确认的内容。
 
 ## 11. 继续旧任务
 

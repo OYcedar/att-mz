@@ -32,7 +32,8 @@ python <Skill>\scripts\rpg_maker_survey.py scan --game <完整游戏安装根> -
 
 调查后先处理未知运行消费者，即尚不知道哪个程序、插件或场景会读取该文本。必须在
 所有权决定前，用隔离副本上的 `inspect_nwjs_runtime.py observe` 确认实际消费；无法访问时保持
-`unresolved`，不得先分配所有者再补调查。
+`unresolved`，不得先分配所有者再补调查。用户禁止运行游戏、运行场景无法到达或静态证据不足时，
+直接保留 `unresolved`；不要只为消除未确认项反复扫描或逐个展开大型关系组。
 
 读取 `review-groups.jsonl`（按同一判断合并的紧凑关系组），在决定文件中只引用自然
 `group_id` 或 `candidate_id`：
@@ -41,7 +42,8 @@ python <Skill>\scripts\rpg_maker_survey.py scan --game <完整游戏安装根> -
 {"target":"group:group-000001","owner":"rules","reason":"..."}
 ```
 
-`owner` 只取 `rules`、`generic`、`exclude` 或 `unresolved`。拆组时只写成员决定。Generic
+`owner` 只取 `rules`、`generic`、`exclude` 或 `unresolved`。每组必须有一个状态，但不要求每组都能
+确认所有者。拆组时只写成员决定。Generic
 必须逐项写齐工具要求的七项证据；文件存在、疑似显示或源码出现引用都不够。
 只有需要拆组时才导出该组的完整成员，不打开整份 `locations.jsonl`：
 
@@ -56,7 +58,8 @@ python <Skill>\scripts\rpg_maker_survey.py members --survey <工作目录>\surve
 python <Skill>\scripts\rpg_maker_survey.py finalize --survey <工作目录>\survey --decisions <决定.jsonl> --output <工作目录>\plan
 ```
 
-`coverage.json` 的 `complete=false` 是正常的待审核结果，补齐决定后对同一来源重新 finalize。
+`coverage.json` 的 `complete=false` 是正常结果，表示仍有未确认范围，不是命令失败。能够取得新证据时可对
+同一来源重新 finalize；证据暂时不可得时，记录精确未确认项并继续处理已确认范围，不让少量未知项卡住整次翻译。
 完成的计划提供 `dialogue-rules.toml`、`rules.toml`、逐规则 manifest、Unit 投影和预期所有权。
 MV 姓名 wrapper 不因外形建立全局规则；未证明的 wrapper 由译前检查按精确自然 ID 审核。
 
@@ -97,7 +100,7 @@ ATT 的 MV/MZ 内建控制符由 ATT 默认规则负责。普通未知外形、�
 各 Python 助手只负责自己的调查、译前检查、术语、QA、运行观察、字体或日志输出；Agent 用显式产物
 安排顺序，不增加通用流水线框架，也不让助手互相调用。
 
-## Translate 与一次集中返修
+## Translate 与集中返修
 
 术语使用 `skills/extract-game-terminology/SKILL.md` 和其中唯一入口 `terminology_job.py`。
 资源文件名、资源路径、内部键和普通短语不进入术语，也不写入 `allowed_terms`。
@@ -125,8 +128,8 @@ att <mv或mz或generic> manual apply --name <项目名> <revision.toml>
 ```
 
 编辑 `revision.toml` 后默认直接 apply；apply 会在单个事务内执行与 check 相同的结构校验，失败时不修改
-任何条目。只在需要事先试检或单独诊断 TOML 时运行 `manual check`。通常集中修改一次，不重复调用
-模型修正已定位的 Review。
+任何条目。只在需要事先试检或单独诊断 TOML 时运行 `manual check`。通常先集中修改一轮，这是效率目标，
+不是完成条件；新证据或用户实机检查发现问题时可以再做第二轮，不重复调用模型修正已经定位的 Review。
 
 apply 成功后重新导出当前译文并再做一次静态 QA；确认本轮修改结果后才执行 WriteBack：
 
@@ -158,8 +161,8 @@ python <Skill>\scripts\manage_rpg_maker_fonts.py restore --game <隔离副本> -
 
 字体工具递归处理已确认的完整字体引用，不只修改 MV `gamefont.css` 或 MZ 的单个标准字段。
 完成 WriteBack、字体和 NW.js 观察后，使用 Manual 后已经重新导出的 `translation export`、WriteBack 验证报告和运行报告合并
-最终 QA。只有运行期报告出现静态 QA 无法看到的新事实时，才追加一轮 Manual、WriteBack 和受影响场景复查；
-不得因同一静态问题重复返工。
+最终 QA。运行报告、用户实机检查或返修后新出现的可观察事实可以触发下一轮 Manual、WriteBack 和受影响场景复查；
+不得为了避免第二轮而在译前穷举无法确认的内容，也不得因同一静态问题重复返工。
 
 ## 恢复与完成
 
