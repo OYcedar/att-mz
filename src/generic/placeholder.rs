@@ -1,5 +1,6 @@
 //! Generic 对公共 Placeholder 算法的任意 kind 精确 scope 适配。
 
+use std::collections::HashSet;
 #[cfg(test)]
 use std::convert::Infallible;
 use std::error::Error;
@@ -8,8 +9,8 @@ use std::io::{self, BufReader, Read};
 
 use crate::fingerprint::Sha256Fingerprint;
 use crate::translation::placeholder::{
-    AppliedPlaceholder, PlaceholderProtectionError, PlaceholderRestoreError,
-    PlaceholderRuleCompilationError, PlaceholderService,
+    PlaceholderProtectionError, PlaceholderRestoreError, PlaceholderRuleCompilationError,
+    PlaceholderService, placeholder_bindings_match_within_slot,
 };
 
 pub(crate) use crate::translation::placeholder::{
@@ -70,6 +71,32 @@ impl GenericPlaceholderService {
             .map(|result| result.map_err(GenericPlaceholderError::Compilation))
     }
 
+    pub(crate) fn compile_resource_with_cancellation<E>(
+        &self,
+        definitions: Vec<GenericPlaceholderRuleDefinition>,
+        ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Result<GenericCompiledPlaceholderRules, GenericPlaceholderError>, E> {
+        self.compile_with_cancellation(definitions, ensure_running)
+    }
+
+    /// 按当前项目完整 Extract Unit 自然 ID 集编译规则。执行 Translate、Manual 或
+    /// WriteBack 前必须使用这个入口；资源快照的无上下文语法检查不能代替它。
+    pub(crate) fn compile_for_ids_with_cancellation<E>(
+        &self,
+        definitions: Vec<GenericPlaceholderRuleDefinition>,
+        valid_ids: &HashSet<String>,
+        ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Result<GenericCompiledPlaceholderRules, GenericPlaceholderError>, E> {
+        self.common
+            .compile_custom_with_targets_and_cancellation(
+                definitions,
+                |scope| !scope.is_empty(),
+                |id| valid_ids.contains(id),
+                ensure_running,
+            )
+            .map(|result| result.map_err(GenericPlaceholderError::Compilation))
+    }
+
     #[cfg(test)]
     pub(crate) fn protect(
         &self,
@@ -82,6 +109,7 @@ impl GenericPlaceholderService {
             .map_err(GenericPlaceholderError::Protection)
     }
 
+    #[cfg(test)]
     pub(crate) fn protect_with_cancellation<E>(
         &self,
         kind: &str,
@@ -93,7 +121,26 @@ impl GenericPlaceholderService {
             .map(|result| result.map_err(GenericPlaceholderError::Protection))
     }
 
+    pub(crate) fn protect_target_with_cancellation<E>(
+        &self,
+        target_id: &str,
+        kind: &str,
+        original: &str,
+        compiled: &GenericCompiledPlaceholderRules,
+        ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Result<GenericProtectedText, GenericPlaceholderError>, E> {
+        self.protect_compiled_target_with_cancellation(
+            target_id,
+            kind,
+            original,
+            compiled,
+            ensure_running,
+        )
+        .map(|result| result.map_err(GenericPlaceholderError::Protection))
+    }
+
     /// 使用已经编译的规则保护文本，只暴露此阶段实际可能产生的匹配错误。
+    #[cfg(test)]
     pub(crate) fn protect_compiled_text_with_cancellation<E>(
         &self,
         kind: &str,
@@ -103,6 +150,26 @@ impl GenericPlaceholderService {
     ) -> Result<Result<GenericProtectedText, PlaceholderProtectionError>, E> {
         self.common
             .protect_with_cancellation(kind, original, &[], compiled, None, ensure_running)
+    }
+
+    pub(crate) fn protect_compiled_target_with_cancellation<E>(
+        &self,
+        target_id: &str,
+        kind: &str,
+        original: &str,
+        compiled: &GenericCompiledPlaceholderRules,
+        ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Result<GenericProtectedText, PlaceholderProtectionError>, E> {
+        self.common
+            .protect_with_target_and_builtins_with_cancellation(
+                kind,
+                Some(target_id),
+                original,
+                &[],
+                compiled,
+                &[],
+                ensure_running,
+            )
     }
 
     #[cfg(test)]
@@ -276,6 +343,7 @@ pub(crate) fn validate_manual_translation_and_binding_with_cancellation<E>(
     validate_translation_placeholders_and_binding_with_cancellation(
         &service,
         &compiled,
+        "test:line1:unit1:text",
         kind,
         source_text,
         translation,
@@ -286,6 +354,7 @@ pub(crate) fn validate_manual_translation_and_binding_with_cancellation<E>(
 pub(crate) fn validate_translation_placeholders_with_cancellation<E>(
     service: &GenericPlaceholderService,
     compiled: &GenericCompiledPlaceholderRules,
+    target_id: &str,
     kind: &str,
     source_text: &str,
     translation: &str,
@@ -294,6 +363,7 @@ pub(crate) fn validate_translation_placeholders_with_cancellation<E>(
     validate_translation_placeholders_and_binding_with_cancellation(
         service,
         compiled,
+        target_id,
         kind,
         source_text,
         translation,
@@ -305,12 +375,14 @@ pub(crate) fn validate_translation_placeholders_with_cancellation<E>(
 pub(crate) fn validate_translation_placeholders_and_binding_with_cancellation<E>(
     service: &GenericPlaceholderService,
     compiled: &GenericCompiledPlaceholderRules,
+    target_id: &str,
     kind: &str,
     source_text: &str,
     translation: &str,
     mut ensure_running: impl FnMut() -> Result<(), E>,
 ) -> Result<Result<Sha256Fingerprint, GenericPlaceholderError>, E> {
-    let source = match service.protect_with_cancellation(
+    let source = match service.protect_target_with_cancellation(
+        target_id,
         kind,
         source_text,
         compiled,
@@ -319,7 +391,8 @@ pub(crate) fn validate_translation_placeholders_and_binding_with_cancellation<E>
         Ok(source) => source,
         Err(error) => return Ok(Err(error)),
     };
-    let candidate = match service.protect_with_cancellation(
+    let candidate = match service.protect_target_with_cancellation(
+        target_id,
         kind,
         translation,
         compiled,
@@ -335,7 +408,7 @@ pub(crate) fn validate_translation_placeholders_and_binding_with_cancellation<E>
     )
 }
 
-/// 比较已经完成保护的原文和译文，避免 WriteBack 为符号修复重复执行 Placeholder 匹配。
+/// 比较已经完成保护的原文和译文，供 WriteBack 复验当前候选。
 pub(crate) fn validate_protected_translation_placeholders_with_cancellation<E>(
     source: &GenericProtectedText,
     candidate: &GenericProtectedText,
@@ -358,67 +431,10 @@ pub(crate) fn protected_translation_placeholder_binding_matches_with_cancellatio
     mut ensure_running: impl FnMut() -> Result<(), E>,
 ) -> Result<bool, E> {
     ensure_running()?;
-    if source.placeholders().len() != candidate.placeholders().len() {
-        ensure_running()?;
-        return Ok(false);
-    }
-    for (source, candidate) in source.placeholders().iter().zip(candidate.placeholders()) {
-        ensure_running()?;
-        if !applied_placeholder_identity_equal_with_cancellation(
-            source,
-            candidate,
-            &mut ensure_running,
-        )? {
-            return Ok(false);
-        }
-    }
+    let matches =
+        placeholder_bindings_match_within_slot(source.placeholders(), candidate.placeholders());
     ensure_running()?;
-    Ok(true)
-}
-
-fn applied_placeholder_identity_equal_with_cancellation<E>(
-    left: &AppliedPlaceholder,
-    right: &AppliedPlaceholder,
-    ensure_running: &mut impl FnMut() -> Result<(), E>,
-) -> Result<bool, E> {
-    if left.origin() != right.origin() || left.segment() != right.segment() {
-        ensure_running()?;
-        return Ok(false);
-    }
-    for (left, right) in [
-        (left.original(), right.original()),
-        (left.label(), right.label()),
-        (left.scope(), right.scope()),
-    ] {
-        if !generic_placeholder_text_equal_with_cancellation(left, right, ensure_running)? {
-            return Ok(false);
-        }
-    }
-    ensure_running()?;
-    Ok(true)
-}
-
-fn generic_placeholder_text_equal_with_cancellation<E>(
-    left: &str,
-    right: &str,
-    ensure_running: &mut impl FnMut() -> Result<(), E>,
-) -> Result<bool, E> {
-    if left.len() != right.len() {
-        ensure_running()?;
-        return Ok(false);
-    }
-    for (left, right) in left
-        .as_bytes()
-        .chunks(RESOURCE_CANCELLATION_CHECK_BYTES)
-        .zip(right.as_bytes().chunks(RESOURCE_CANCELLATION_CHECK_BYTES))
-    {
-        ensure_running()?;
-        if left != right {
-            return Ok(false);
-        }
-    }
-    ensure_running()?;
-    Ok(true)
+    Ok(matches)
 }
 
 /// Generic 适配边界为公共 Placeholder 失败补充资源阶段。
@@ -563,10 +579,14 @@ mod tests {
 
     #[test]
     fn binding_identity_depends_on_actual_matches_not_unused_rules() {
-        let first = placeholder_binding_fingerprint(r#"[{"pattern":"\\{[^}]+\\}"}]"#, "k", "plain")
-            .unwrap();
+        let first = placeholder_binding_fingerprint(
+            r#"[{"order":"preserve","pattern":"\\{[^}]+\\}"}]"#,
+            "k",
+            "plain",
+        )
+        .unwrap();
         let second = placeholder_binding_fingerprint(
-            r#"[{"pattern":"never"},{"pattern":"\\{[^}]+\\}"}]"#,
+            r#"[{"order":"preserve","pattern":"never"},{"order":"preserve","pattern":"\\{[^}]+\\}"}]"#,
             "k",
             "plain",
         )
@@ -576,7 +596,7 @@ mod tests {
 
     #[test]
     fn manual_translation_must_preserve_placeholder_order_and_identity() {
-        let resource = r#"[{"pattern":"\\{[^}]+\\}"}]"#;
+        let resource = r#"[{"order":"preserve","pattern":"\\{[^}]+\\}"}]"#;
         for translation in ["{target}收到{speaker}的问候", "{speaker}打招呼"] {
             assert!(matches!(
                 validate_manual_translation_placeholders(
@@ -624,7 +644,7 @@ mod tests {
     fn placeholder_json_parsing_polls_cancellation_between_chunks() {
         let service = GenericPlaceholderService::default();
         let canonical_json = format!(
-            r#"[{{"pattern":"{}"}}]"#,
+            r#"[{{"order":"preserve","pattern":"{}"}}]"#,
             "x".repeat(RESOURCE_CANCELLATION_CHECK_BYTES * 3)
         );
         let mut polls = 0_usize;

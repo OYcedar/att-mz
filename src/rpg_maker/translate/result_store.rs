@@ -39,6 +39,8 @@ use crate::storage::sqlite_transaction_session::{
     OpenSqliteTransactionSessionError, SqliteTransactionSessionFactory,
     SqliteTransactionSessionOperations,
 };
+use crate::translation::TranslationOrigin;
+use crate::translation::candidate_validation::ProvenInvariantViolation;
 
 use super::pipeline::{
     RpgMakerTranslationResultStore, TranslationPlanPreparation, TranslationSnapshotBaseline,
@@ -190,6 +192,11 @@ where
             .execute_ordered_map(work.units, encode_commit_unit)
             .await
             .map_err(RpgMakerTranslationResultStorageError::ScheduleEncoding)?;
+        let rejections = self
+            .cpu
+            .execute_ordered_map(work.rejections, encode_rejected_unit)
+            .await
+            .map_err(RpgMakerTranslationResultStorageError::ScheduleEncoding)?;
 
         self.cpu
             .execute(move || {
@@ -197,6 +204,7 @@ where
                     plan: finish_commit_plan(
                         decisions.into_iter().collect::<Result<Vec<_>, _>>()?,
                         units.into_iter().collect::<Result<Vec<_>, _>>()?,
+                        rejections.into_iter().collect::<Result<Vec<_>, _>>()?,
                     )?,
                 })
             })
@@ -772,6 +780,11 @@ enum PreparationUnitWork {
         identity: TranslationUnitIdentity,
         expected_translation: TextUnitContent,
         expected_translation_state: Sha256Fingerprint,
+        rejection: Option<(
+            ProvenInvariantViolation,
+            Sha256Fingerprint,
+            TranslationOrigin,
+        )>,
     },
     ReuseSeed {
         identity: TranslationUnitIdentity,
@@ -794,6 +807,7 @@ enum EncodedPreparationUnit {
         identity: EncodedIdentity,
         expected_translation: String,
         expected_translation_state: Sha256Fingerprint,
+        rejection: Option<EncodedRejectedUnit>,
     },
     ReuseSeed {
         identity: EncodedIdentity,
@@ -818,6 +832,7 @@ enum CommitUnitPosition {
 struct CommitPlanWork {
     decisions: Vec<CommitDecisionWork>,
     units: Vec<CommitUnitWork>,
+    rejections: Vec<CommitRejectedUnitWork>,
 }
 
 struct CommitDecisionWork {
@@ -831,6 +846,12 @@ struct CommitUnitWork {
     position: CommitUnitPosition,
 }
 
+struct CommitRejectedUnitWork {
+    outcome: Arc<TranslationTaskOutcome>,
+    unresolved_index: usize,
+    target_index: usize,
+}
+
 struct EncodedCommitDecision {
     decision_index: usize,
     translation: String,
@@ -840,6 +861,16 @@ struct EncodedCommitUnit {
     decision_index: usize,
     identity: EncodedIdentity,
     translation_state: Sha256Fingerprint,
+}
+
+struct EncodedRejectedUnit {
+    identity: EncodedIdentity,
+    readable_id: String,
+    origin: TranslationOrigin,
+    candidate_json: String,
+    translation_json: Option<String>,
+    violation_json: String,
+    planning_state: Sha256Fingerprint,
 }
 
 fn preparation_work(
@@ -863,12 +894,13 @@ fn preparation_work(
     let mut work = Vec::with_capacity(work_capacity);
 
     for invalidation in invalidations {
-        let (identity, expected_translation, expected_translation_state) =
+        let (identity, expected_translation, expected_translation_state, rejection) =
             invalidation.into_parts();
         work.push(PreparationUnitWork::Invalidation {
             identity,
             expected_translation,
             expected_translation_state,
+            rejection,
         });
     }
 
@@ -922,12 +954,28 @@ fn encode_preparation_unit(
             identity,
             expected_translation,
             expected_translation_state,
+            rejection,
         } => {
             ensure_nonblank(&expected_translation)?;
+            let encoded_identity = encode_identity(&identity)?;
+            let encoded_translation = encode_content(&expected_translation)?;
+            let rejection = rejection
+                .map(|(violation, planning_state, origin)| {
+                    encode_invalidated_rejection(
+                        &identity,
+                        encoded_identity.clone(),
+                        &expected_translation,
+                        violation,
+                        planning_state,
+                        origin,
+                    )
+                })
+                .transpose()?;
             Ok(EncodedPreparationUnit::Invalidation {
-                identity: encode_identity(&identity)?,
-                expected_translation: encode_content(&expected_translation)?,
+                identity: encoded_identity,
+                expected_translation: encoded_translation,
                 expected_translation_state,
+                rejection,
             })
         }
         PreparationUnitWork::ReuseSeed {
@@ -981,6 +1029,36 @@ fn encode_preparation_unit(
     }
 }
 
+fn encode_invalidated_rejection(
+    identity: &TranslationUnitIdentity,
+    encoded_identity: EncodedIdentity,
+    translation: &TextUnitContent,
+    violation: ProvenInvariantViolation,
+    planning_state: Sha256Fingerprint,
+    origin: TranslationOrigin,
+) -> Result<EncodedRejectedUnit, ResultStoragePlanError> {
+    let lines = match translation {
+        TextUnitContent::Value(value) => value.split('\n').map(str::to_owned).collect::<Vec<_>>(),
+        TextUnitContent::Lines(lines) => lines.clone(),
+    };
+    let translation_json =
+        serde_json::to_string(&lines).map_err(ResultStoragePlanError::Content)?;
+    Ok(EncodedRejectedUnit {
+        identity: encoded_identity,
+        readable_id: crate::manual::readable_rpg_maker_id(
+            identity.group_location(),
+            identity.kind(),
+            identity.role(),
+        ),
+        origin,
+        candidate_json: translation_json.clone(),
+        translation_json: Some(translation_json),
+        violation_json: serde_json::to_string(&violation)
+            .map_err(ResultStoragePlanError::Content)?,
+        planning_state,
+    })
+}
+
 fn finish_preparation_plan(
     units: Vec<EncodedPreparationUnit>,
     terminology_json: String,
@@ -991,6 +1069,8 @@ fn finish_preparation_plan(
     let mut seen = HashSet::with_capacity(units.len());
     let mut snapshot_parameter_sets = Vec::new();
     let mut clear_parameter_sets = Vec::new();
+    let mut clear_manual_parameter_sets = Vec::new();
+    let mut rejected_parameter_sets = Vec::new();
     let mut reuse_parameter_sets = Vec::new();
     for unit in units {
         match unit {
@@ -998,13 +1078,28 @@ fn finish_preparation_plan(
                 identity,
                 expected_translation,
                 expected_translation_state,
+                rejection,
             } => {
                 ensure_unique(&mut seen, &identity)?;
-                clear_parameter_sets.push(clear_translation_parameters(
-                    identity,
-                    expected_translation,
-                    expected_translation_state,
-                ));
+                let clears_manual = rejection
+                    .as_ref()
+                    .is_some_and(|rejection| rejection.origin == TranslationOrigin::Manual);
+                if clears_manual {
+                    clear_manual_parameter_sets.push(clear_manual_translation_parameters(
+                        &identity,
+                        &expected_translation,
+                        expected_translation_state,
+                    )?);
+                } else {
+                    clear_parameter_sets.push(clear_translation_parameters(
+                        identity,
+                        expected_translation,
+                        expected_translation_state,
+                    ));
+                }
+                if let Some(rejection) = rejection {
+                    rejected_parameter_sets.push(rejected_translation_parameters(rejection));
+                }
             }
             EncodedPreparationUnit::ReuseSeed {
                 identity,
@@ -1046,6 +1141,19 @@ fn finish_preparation_plan(
             SqliteBatch::new(CLEAR_TRANSLATION_FROM_SNAPSHOT, clear_parameter_sets),
         ));
     }
+    if !clear_manual_parameter_sets.is_empty() {
+        steps.push(SqliteTransactionStep::ExecuteManyExactlyOne(
+            SqliteBatch::new(
+                CLEAR_MANUAL_TRANSLATION_FROM_SNAPSHOT,
+                clear_manual_parameter_sets,
+            ),
+        ));
+    }
+    if !rejected_parameter_sets.is_empty() {
+        steps.push(SqliteTransactionStep::ExecuteManyExactlyOne(
+            SqliteBatch::new(UPSERT_REJECTED_TRANSLATION, rejected_parameter_sets),
+        ));
+    }
     if !reuse_parameter_sets.is_empty() {
         steps.push(SqliteTransactionStep::ExecuteManyExactlyOne(
             SqliteBatch::new(WRITE_TRANSLATION_FROM_SNAPSHOT, reuse_parameter_sets),
@@ -1059,7 +1167,13 @@ fn commit_work(
     outcome: Arc<TranslationTaskOutcome>,
 ) -> Result<CommitPlanWork, ResultStoragePlanError> {
     let decisions = outcome.accepted();
-    if decisions.is_empty() {
+    let rejected_count = outcome
+        .unresolved()
+        .iter()
+        .filter_map(|unit| unit.rejected_candidate())
+        .map(|candidate| candidate.targets().len())
+        .sum::<usize>();
+    if decisions.is_empty() && rejected_count == 0 {
         return Err(ResultStoragePlanError::EmptyTaskResult);
     }
     let location_count = decisions
@@ -1068,6 +1182,7 @@ fn commit_work(
         .sum();
     let mut decision_work = Vec::with_capacity(decisions.len());
     let mut unit_work = Vec::with_capacity(location_count);
+    let mut rejected_work = Vec::with_capacity(rejected_count);
     for (decision_index, decision) in decisions.iter().enumerate() {
         decision_work.push(CommitDecisionWork {
             outcome: Arc::clone(&outcome),
@@ -1086,9 +1201,22 @@ fn commit_work(
             });
         }
     }
+    for (unresolved_index, unresolved) in outcome.unresolved().iter().enumerate() {
+        let Some(candidate) = unresolved.rejected_candidate() else {
+            continue;
+        };
+        for target_index in 0..candidate.targets().len() {
+            rejected_work.push(CommitRejectedUnitWork {
+                outcome: Arc::clone(&outcome),
+                unresolved_index,
+                target_index,
+            });
+        }
+    }
     Ok(CommitPlanWork {
         decisions: decision_work,
         units: unit_work,
+        rejections: rejected_work,
     })
 }
 
@@ -1148,12 +1276,55 @@ fn encode_commit_unit(work: CommitUnitWork) -> Result<EncodedCommitUnit, ResultS
     })
 }
 
+fn encode_rejected_unit(
+    work: CommitRejectedUnitWork,
+) -> Result<EncodedRejectedUnit, ResultStoragePlanError> {
+    let unresolved = work
+        .outcome
+        .unresolved()
+        .get(work.unresolved_index)
+        .expect("Rejected 提交工作必须引用当前 unresolved Unit");
+    let candidate = unresolved
+        .rejected_candidate()
+        .expect("Rejected 提交工作必须引用硬拒绝候选");
+    let target = candidate
+        .targets()
+        .get(work.target_index)
+        .expect("Rejected 提交工作必须引用当前传播目标");
+    serde_json::from_str::<serde_json::Value>(candidate.candidate_json())
+        .map_err(ResultStoragePlanError::Content)?;
+    let translation_json = candidate
+        .translation()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(ResultStoragePlanError::Content)?;
+    let violation_json =
+        serde_json::to_string(candidate.violation()).map_err(ResultStoragePlanError::Content)?;
+    let identity = target.identity();
+    let readable_id = crate::manual::readable_rpg_maker_id(
+        identity.group_location(),
+        identity.kind(),
+        identity.role(),
+    );
+    Ok(EncodedRejectedUnit {
+        identity: encode_identity(identity)?,
+        readable_id,
+        origin: TranslationOrigin::Automatic,
+        candidate_json: candidate.candidate_json().to_owned(),
+        translation_json,
+        violation_json,
+        planning_state: target.planning_state(),
+    })
+}
+
 fn finish_commit_plan(
     decisions: Vec<EncodedCommitDecision>,
     units: Vec<EncodedCommitUnit>,
+    rejections: Vec<EncodedRejectedUnit>,
 ) -> Result<SqliteTransactionPlan, ResultStoragePlanError> {
     let mut seen = HashSet::with_capacity(units.len());
     let mut batches = Vec::with_capacity(decisions.len());
+    let mut rejected_clears = Vec::with_capacity(units.len());
     for (expected_index, decision) in decisions.into_iter().enumerate() {
         if decision.decision_index != expected_index {
             return Err(ResultStoragePlanError::InvalidCommitDecisionSequence);
@@ -1162,12 +1333,22 @@ fn finish_commit_plan(
     }
     for unit in units {
         ensure_unique(&mut seen, &unit.identity)?;
+        rejected_clears.push(rejected_key_parameters(&unit.identity));
         let decision = batches
             .get_mut(unit.decision_index)
             .ok_or(ResultStoragePlanError::InvalidCommitDecisionSequence)?;
         decision.1.push(commit_translation_parameters(unit));
     }
-    let mut steps = Vec::with_capacity(batches.len());
+    let mut rejected_writes = Vec::with_capacity(rejections.len());
+    for rejection in rejections {
+        ensure_unique(&mut seen, &rejection.identity)?;
+        rejected_writes.push(rejected_translation_parameters(rejection));
+    }
+    let mut steps = Vec::with_capacity(
+        batches.len()
+            + usize::from(!rejected_clears.is_empty())
+            + usize::from(!rejected_writes.is_empty()),
+    );
     for (translation, parameter_sets) in batches {
         if parameter_sets.is_empty() {
             return Err(ResultStoragePlanError::MissingCommitDecisionUnit);
@@ -1178,6 +1359,17 @@ fn finish_commit_plan(
                 vec![text(translation)],
                 parameter_sets,
             ),
+        ));
+    }
+    if !rejected_clears.is_empty() {
+        steps.push(SqliteTransactionStep::ExecuteMany(SqliteBatch::new(
+            DELETE_REJECTED_TRANSLATION,
+            rejected_clears,
+        )));
+    }
+    if !rejected_writes.is_empty() {
+        steps.push(SqliteTransactionStep::ExecuteManyExactlyOne(
+            SqliteBatch::new(UPSERT_REJECTED_TRANSLATION, rejected_writes),
         ));
     }
     Ok(SqliteTransactionPlan::new(steps))
@@ -1270,9 +1462,38 @@ const REQUIRE_SNAPSHOT: &str = "SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM rpg_mak
 
 const CLEAR_TRANSLATION_FROM_SNAPSHOT: &str = "UPDATE rpg_maker_text_unit SET translation_content_json = NULL, translation_state = NULL WHERE owner = ?1 AND group_id = (SELECT text_group.group_id FROM rpg_maker_text_group AS text_group WHERE text_group.owner = ?1 AND text_group.group_location = ?2) AND unit_role = ?3 AND source_content_json = ?4 AND source_context_json = ?5 AND translation_content_json = ?6 AND translation_state = ?7";
 
+const CLEAR_MANUAL_TRANSLATION_FROM_SNAPSHOT: &str = "DELETE FROM rpg_maker_manual_translation WHERE owner = ?1 AND group_location = ?2 AND unit_role = ?3 AND translation_json = ?4 AND applicability_fingerprint = ?5";
+
 const WRITE_TRANSLATION_FROM_SNAPSHOT: &str = "UPDATE rpg_maker_text_unit SET translation_content_json = ?1, translation_state = ?2 WHERE owner = ?3 AND group_id = (SELECT text_group.group_id FROM rpg_maker_text_group AS text_group WHERE text_group.owner = ?3 AND text_group.group_location = ?4) AND unit_role = ?5 AND source_content_json = ?6 AND source_context_json = ?7 AND (translation_content_json = ?8 OR (translation_content_json IS NULL AND ?8 IS NULL)) AND (translation_state = ?9 OR (translation_state IS NULL AND ?9 IS NULL))";
 
 const COMMIT_TRANSLATION: &str = "UPDATE rpg_maker_text_unit SET translation_content_json = ?1, translation_state = ?2 WHERE owner = ?3 AND group_id = (SELECT text_group.group_id FROM rpg_maker_text_group AS text_group WHERE text_group.owner = ?3 AND text_group.group_location = ?4) AND unit_role = ?5 AND source_content_json = ?6 AND source_context_json = ?7 AND translation_content_json IS NULL AND translation_state IS NULL";
+
+const DELETE_REJECTED_TRANSLATION: &str = "DELETE FROM rpg_maker_rejected_translation WHERE owner = ?1 AND group_id = (SELECT text_group.group_id FROM rpg_maker_text_group AS text_group WHERE text_group.owner = ?1 AND text_group.group_location = ?2) AND unit_role = ?3";
+
+const UPSERT_REJECTED_TRANSLATION: &str = r#"INSERT INTO rpg_maker_rejected_translation (
+    owner, group_id, unit_role, readable_id, origin, source_content_json,
+    source_context_json, candidate_json, translation_json, violation_json, planning_state
+)
+SELECT unit.owner, unit.group_id, unit.unit_role, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+FROM rpg_maker_text_unit AS unit
+JOIN rpg_maker_text_group AS text_group
+  ON text_group.owner = unit.owner AND text_group.group_id = unit.group_id
+WHERE unit.owner = ?9
+  AND text_group.group_location = ?10
+  AND unit.unit_role = ?11
+  AND unit.source_content_json = ?3
+  AND unit.source_context_json = ?4
+  AND unit.translation_content_json IS NULL
+  AND unit.translation_state IS NULL
+ON CONFLICT (owner, group_id, unit_role) DO UPDATE SET
+    readable_id = excluded.readable_id,
+    origin = excluded.origin,
+    source_content_json = excluded.source_content_json,
+    source_context_json = excluded.source_context_json,
+    candidate_json = excluded.candidate_json,
+    translation_json = excluded.translation_json,
+    violation_json = excluded.violation_json,
+    planning_state = excluded.planning_state"#;
 
 fn snapshot_parameters(
     identity: &EncodedIdentity,
@@ -1310,6 +1531,23 @@ fn clear_translation_parameters(
     ]
 }
 
+fn clear_manual_translation_parameters(
+    identity: &EncodedIdentity,
+    expected_translation: &str,
+    expected_translation_state: Sha256Fingerprint,
+) -> Result<Vec<SqliteValue>, ResultStoragePlanError> {
+    let content = serde_json::from_str::<TextUnitContent>(expected_translation)
+        .map_err(ResultStoragePlanError::Content)?;
+    let lines = crate::manual::rpg_maker_manual_source_lines(&content);
+    Ok(vec![
+        text(identity.owner),
+        text(identity.group_location.clone()),
+        text(identity.unit_role.clone()),
+        text(serde_json::to_string(&lines).map_err(ResultStoragePlanError::Content)?),
+        blob(expected_translation_state),
+    ])
+}
+
 fn write_translation_from_snapshot_parameters(
     identity: EncodedIdentity,
     translation: String,
@@ -1338,6 +1576,30 @@ fn commit_translation_parameters(unit: EncodedCommitUnit) -> Vec<SqliteValue> {
         text(unit.identity.unit_role),
         text(unit.identity.source_content_json),
         text(unit.identity.source_context_json),
+    ]
+}
+
+fn rejected_key_parameters(identity: &EncodedIdentity) -> Vec<SqliteValue> {
+    vec![
+        text(identity.owner),
+        text(identity.group_location.clone()),
+        text(identity.unit_role.clone()),
+    ]
+}
+
+fn rejected_translation_parameters(rejection: EncodedRejectedUnit) -> Vec<SqliteValue> {
+    vec![
+        text(rejection.readable_id),
+        text(rejection.origin.storage_name()),
+        text(rejection.identity.source_content_json),
+        text(rejection.identity.source_context_json),
+        text(rejection.candidate_json),
+        rejection.translation_json.map_or(SqliteValue::Null, text),
+        text(rejection.violation_json),
+        blob(rejection.planning_state),
+        text(rejection.identity.owner),
+        text(rejection.identity.group_location),
+        text(rejection.identity.unit_role),
     ]
 }
 
@@ -1911,7 +2173,7 @@ mod tests {
 
         let plans = plans.lock().expect("事务锁");
         let plan = &plans[0].1;
-        assert_eq!(plan.steps().len(), 1);
+        assert_eq!(plan.steps().len(), 2);
         let SqliteTransactionStep::ExecuteManyExactlyOne(update) = &plan.steps()[0] else {
             panic!("提交应以一条条件批量修改核对并写入逻辑单元");
         };
@@ -1950,6 +2212,11 @@ mod tests {
         );
         assert_eq!(parameters[4], SqliteValue::Text(r#""原文""#.to_owned()));
         assert_eq!(parameters[5], SqliteValue::Text("{}".to_owned()));
+        let SqliteTransactionStep::ExecuteMany(rejected_clear) = &plan.steps()[1] else {
+            panic!("合法自动译文必须在同一事务清除旧 Rejected 候选");
+        };
+        assert_eq!(rejected_clear.statement(), DELETE_REJECTED_TRANSLATION);
+        assert_eq!(rejected_clear.parameter_set_count(), 1);
     }
 
     #[test]
@@ -2157,8 +2424,9 @@ mod tests {
             .expect("全部传播目标身份应可并行编码");
         assert_eq!(encoding_count.get(), 1, "每个 decision 只能编码一次译文");
 
-        let plan = finish_commit_plan(decisions, units).expect("超大全族应形成原子提交计划");
-        assert_eq!(plan.steps().len(), 1);
+        let plan =
+            finish_commit_plan(decisions, units, Vec::new()).expect("超大全族应形成原子提交计划");
+        assert_eq!(plan.steps().len(), 2);
         let SqliteTransactionStep::ExecuteManyExactlyOne(batch) = &plan.steps()[0] else {
             panic!("一个 decision 应形成一个精确共享参数批次");
         };
@@ -2171,6 +2439,11 @@ mod tests {
         assert!(batch.parameter_rows().all(|parameters| {
             parameters.len() == 6 && !parameters.contains(&encoded_translation)
         }));
+        let SqliteTransactionStep::ExecuteMany(rejected_clear) = &plan.steps()[1] else {
+            panic!("全部传播目标必须批量清除旧 Rejected 候选");
+        };
+        assert_eq!(rejected_clear.statement(), DELETE_REJECTED_TRANSLATION);
+        assert_eq!(rejected_clear.parameter_set_count(), TARGETS + 1);
     }
 
     #[test]
@@ -2211,8 +2484,8 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("提交目标应可编码");
 
-        let plan = finish_commit_plan(decisions, units).expect("提交计划应可建立");
-        assert_eq!(plan.steps().len(), 2);
+        let plan = finish_commit_plan(decisions, units, Vec::new()).expect("提交计划应可建立");
+        assert_eq!(plan.steps().len(), 3);
         let SqliteTransactionStep::ExecuteManyExactlyOne(first) = &plan.steps()[0] else {
             panic!("第一条 decision 应形成第一批提交");
         };
@@ -2229,6 +2502,11 @@ mod tests {
         );
         assert_eq!(first.parameter_set_count(), 2);
         assert_eq!(second.parameter_set_count(), 1);
+        let SqliteTransactionStep::ExecuteMany(rejected_clear) = &plan.steps()[2] else {
+            panic!("合法译文提交后必须按自然 Unit 顺序清除旧 Rejected 候选");
+        };
+        assert_eq!(rejected_clear.statement(), DELETE_REJECTED_TRANSLATION);
+        assert_eq!(rejected_clear.parameter_set_count(), 3);
         let first_parameters = first.parameter_rows().collect::<Vec<_>>();
         assert_eq!(
             first_parameters[0][2],
@@ -2337,6 +2615,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preparation_moves_invalid_manual_translation_to_rejected_in_one_transaction() {
+        let sqlite = RecordingSqlite::default();
+        let plans = Arc::clone(&sqlite.plans);
+        let service = RpgMakerTranslationResultStorageService::new(sqlite, InlineCpu);
+        let identity = scalar_identity(1, "name", "原文", "{}");
+        let manual_state = Sha256Fingerprint::from_bytes([0x31; 32]);
+        let rejection_state = Sha256Fingerprint::from_bytes([0x32; 32]);
+        let preparation = TranslationPlanPreparation::new(
+            vec![TranslationInvalidation::rejected(
+                identity,
+                value("失效人工译文"),
+                manual_state,
+                ProvenInvariantViolation::PlaceholderMismatch,
+                rejection_state,
+                TranslationOrigin::Manual,
+            )],
+            Vec::new(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+            0,
+            1,
+            0,
+        );
+
+        service
+            .apply_preparation(&project(), preparation)
+            .await
+            .expect("失效人工译文应该可原子转入 Rejected");
+
+        let plans = plans.lock().expect("事务锁");
+        let steps = plans[0].1.steps();
+        assert!(matches!(steps[0], SqliteTransactionStep::RequireNoRows(_)));
+        let SqliteTransactionStep::ExecuteManyExactlyOne(clear_manual) = &steps[1] else {
+            panic!("人工 Current 必须先以 CAS 从人工译文表删除");
+        };
+        assert_eq!(
+            clear_manual.statement(),
+            CLEAR_MANUAL_TRANSLATION_FROM_SNAPSHOT
+        );
+        assert_eq!(clear_manual.parameter_set_count(), 1);
+        let SqliteTransactionStep::ExecuteManyExactlyOne(save_rejected) = &steps[2] else {
+            panic!("同一事务必须保存 Rejected 正文与来源");
+        };
+        assert_eq!(save_rejected.statement(), UPSERT_REJECTED_TRANSLATION);
+        let parameters = save_rejected
+            .parameter_rows()
+            .next()
+            .expect("Rejected 应包含一组参数");
+        assert_eq!(parameters[1], SqliteValue::Text("manual".to_owned()));
+        assert_eq!(
+            parameters[5],
+            SqliteValue::Text(r#"["失效人工译文"]"#.to_owned())
+        );
+        assert_eq!(parameters[7], SqliteValue::Blob(vec![0x32; 32]));
+    }
+
+    #[tokio::test]
     async fn preparation_without_writes_still_checks_the_complete_snapshot_baseline() {
         let sqlite = RecordingSqlite::default();
         let plans = Arc::clone(&sqlite.plans);
@@ -2391,7 +2726,8 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("重复单元本身应可编码");
 
-        let error = finish_commit_plan(decisions, encoded).expect_err("重复逻辑单元不得进入事务");
+        let error = finish_commit_plan(decisions, encoded, Vec::new())
+            .expect_err("重复逻辑单元不得进入事务");
         assert!(matches!(error, ResultStoragePlanError::DuplicateUnit));
     }
 
@@ -2640,6 +2976,20 @@ mod tests {
                     source_context_json TEXT NOT NULL,
                     translation_content_json TEXT,
                     translation_state BLOB
+                );
+                CREATE TABLE rpg_maker_rejected_translation (
+                    owner TEXT NOT NULL,
+                    group_id INTEGER NOT NULL,
+                    unit_role TEXT NOT NULL,
+                    readable_id TEXT NOT NULL,
+                    origin TEXT NOT NULL,
+                    source_content_json TEXT NOT NULL,
+                    source_context_json TEXT NOT NULL,
+                    candidate_json TEXT NOT NULL,
+                    translation_json TEXT,
+                    violation_json TEXT NOT NULL,
+                    planning_state BLOB NOT NULL,
+                    PRIMARY KEY (owner, group_id, unit_role)
                 );",
             )
             .expect("测试表应可创建");
@@ -2758,7 +3108,6 @@ mod tests {
             database_path,
             "ja".to_owned(),
             "zh-Hans".to_owned(),
-            crate::rpg_maker::project::test_layout_profile(),
         )
     }
 
@@ -2827,7 +3176,6 @@ mod tests {
             PathBuf::from("C:/projects/demo/project.db"),
             "ja".to_owned(),
             "zh-Hans".to_owned(),
-            crate::rpg_maker::project::test_layout_profile(),
         )
     }
 }

@@ -1740,10 +1740,6 @@ fn render_generic_output(
             output_root,
             translated_units,
             retained_source_units,
-            symbol_repair_attempted_units,
-            symbol_repair_repaired_units,
-            symbol_repair_skipped_units,
-            symbol_repair_replacements,
         } => {
             let output_root = public_path(output_root);
             writeln!(
@@ -1766,16 +1762,7 @@ fn render_generic_output(
                     original: count(*retained_source_units),
                 })
             )?;
-            writeln!(
-                stdout,
-                "{}",
-                localizer.format(UiMessage::ResultSymbolRepairSummary {
-                    attempted: count(*symbol_repair_attempted_units),
-                    repaired: count(*symbol_repair_repaired_units),
-                    skipped: count(*symbol_repair_skipped_units),
-                    replacements: count(*symbol_repair_replacements),
-                })
-            )
+            Ok(())
         }
         GenericCommandOutput::Manual { summary } => {
             render_manual_command_summary(summary, localizer, stdout)

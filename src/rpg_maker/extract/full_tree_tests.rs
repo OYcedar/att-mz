@@ -218,9 +218,6 @@ impl SqliteQueryExecutor for FakeSqliteQueryExecutor {
             SqliteValue::Text("ja".to_owned()),
             SqliteValue::Text("zh-Hans".to_owned()),
             SqliteValue::Blob(vec![0x5a; 32]),
-            SqliteValue::Integer(24),
-            SqliteValue::Integer(30),
-            SqliteValue::Integer(18),
             SqliteValue::Text(r#"{"rules":[]}"#.to_owned()),
         ])])
     }

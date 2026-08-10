@@ -7,7 +7,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::project::{ExistingProjectOpener, OpenedProject, RpgMakerWriteBackLayoutProfile};
+use super::project::{ExistingProjectOpener, OpenedProject};
 use crate::diagnostic::ReportedFailure;
 use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::progress::{NoopProgressObserver, ProgressObserver, ProgressSnapshot};
@@ -47,31 +47,12 @@ pub(crate) enum WriteBackProgressPhase {
 }
 
 /// 一轮 RPG Maker 写回的正常业务汇总。
-///
-/// `manual_layout_units` 大于零仍表示写回成功：相应数据库译文会保持原样写入，
-/// 调用方应把这些文本单元呈现为需要人工换行的诊断，而不是把它们升级为错误。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RpgMakerWriteBackSummary {
     /// 已应用数据库译文的语义单元数。
     pub translated_units: usize,
     /// 因数据库中没有译文而保留冻结原文的语义单元数。
     pub original_units: usize,
-    /// 成功应用自动换行的文本单元数。
-    pub auto_wrapped_units: usize,
-    /// 自动换行新增的换行符数。
-    pub inserted_line_breaks: usize,
-    /// 为续行新增的全角空格数。
-    pub inserted_fullwidth_indents: usize,
-    /// 保守布局无法安全处理、需要人工换行的文本单元数。
-    pub manual_layout_units: usize,
-    /// 已尝试执行全局符号修复的译文单元数。
-    pub symbol_repair_attempted_units: usize,
-    /// 至少替换了一个符号的译文单元数。
-    pub symbol_repair_repaired_units: usize,
-    /// 因符号匹配或修复算法内部无法安全完成而保留原译文的单元数。
-    pub symbol_repair_skipped_units: usize,
-    /// 全局符号修复实际替换的字符总数。
-    pub symbol_repair_replacements: usize,
 }
 
 /// 写回命令正常完成后交还给 CLI 的结果。
@@ -81,34 +62,6 @@ pub struct WriteBackOutput {
     /// 本轮已经发布、供后续封包消费的固定最新输出根目录。
     pub output_root: PathBuf,
     pub summary: RpgMakerWriteBackSummary,
-    manual_layout_diagnostics: Vec<planner::ManualLayoutDiagnostic>,
-}
-
-impl WriteBackOutput {
-    #[cfg(test)]
-    pub(crate) fn for_test(
-        name: ProjectName,
-        output_root: PathBuf,
-        summary: RpgMakerWriteBackSummary,
-        manual_layout_diagnostics: Vec<planner::ManualLayoutDiagnostic>,
-    ) -> Self {
-        assert_eq!(
-            summary.manual_layout_units,
-            manual_layout_diagnostics.len(),
-            "人工布局汇总必须与结构化诊断逐项对应"
-        );
-        Self {
-            name,
-            output_root,
-            summary,
-            manual_layout_diagnostics,
-        }
-    }
-
-    /// 返回每项需要人工换行的精确逻辑位置、显示区域和宽度限制。
-    pub(crate) fn manual_layout_diagnostics(&self) -> &[planner::ManualLayoutDiagnostic] {
-        &self.manual_layout_diagnostics
-    }
 }
 
 /// 完整候选已经成功发布后的固定输出身份。
@@ -196,12 +149,7 @@ impl<E> WriteBackPublishFailure<E> {
 
 /// 从项目数据库译文生成 RPG Maker 文件候选。
 ///
-/// 实现必须显式使用项目开启边界提供的三个区域行宽，并只对对话正文、滚动文本和
-/// 帮助/说明框应用布局。模型给出的语义换行始终作为人工硬边界保留；只有超过对应
-/// 区域行宽的语义行才参与兜底自动换行。每个文本先决定自动换行，再为自动续行以及
-/// 位于未闭合外层符号中的译文硬续行补全角空格。
-/// 布局无法安全处理某个完整文本时，必须撤销该文本的自动布局、原样写入数据库译文，
-/// 并在正常报告中累计人工项，而不是返回技术错误。
+/// 实现只校验当前项目快照并原样物化数据库中的译文，不在 WriteBack 中修改正文。
 pub(crate) trait RpgMakerWriteBack: Send + Sync {
     type Documents: Send + 'static;
     type Error: Error + Send + Sync + 'static;
@@ -209,7 +157,6 @@ pub(crate) trait RpgMakerWriteBack: Send + Sync {
     fn prepare(
         &self,
         project: &OpenedProject,
-        layout_profile: &RpgMakerWriteBackLayoutProfile,
     ) -> impl Future<
         Output = Result<
             OperationCompletion<planner::RpgMakerWriteBackPreparation<Self::Documents>>,
@@ -353,13 +300,13 @@ where
 
         let preparation = self
             .rpg_maker_write_back
-            .prepare(&project, project.layout_profile())
+            .prepare(&project)
             .await
             .map_err(WriteBackServiceError::Prepare)?;
         let OperationCompletion::Completed(preparation) = preparation else {
             return Ok(OperationCompletion::Cancelled);
         };
-        let (documents, summary, manual_layout_diagnostics) = preparation.into_parts();
+        let (documents, summary) = preparation.into_parts();
 
         if self.cancellation.is_requested() {
             return Ok(OperationCompletion::Cancelled);
@@ -461,7 +408,6 @@ where
             name: project.name().clone(),
             output_root,
             summary,
-            manual_layout_diagnostics,
         }))
     }
 }
@@ -568,9 +514,6 @@ mod tests {
     use super::*;
     use crate::progress::ProgressAmount;
     use crate::project_lease::{ProjectCommandLease, ProjectCommandLeaseProvider};
-    use crate::rpg_maker::model::{LogicalTextLocation, ScalarFieldKey, TextUnitRole};
-    use crate::rpg_maker::project::{MaxFullwidthChars, test_layout_profile};
-    use crate::rpg_maker::text::{RpgMakerLocation, RpgMakerSource, StandardDataFile};
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct FakeError;
@@ -646,7 +589,6 @@ mod tests {
     struct FakeWriteBack {
         events: Events,
         summary: RpgMakerWriteBackSummary,
-        manual_layout_diagnostics: Vec<planner::ManualLayoutDiagnostic>,
     }
 
     impl RpgMakerWriteBack for FakeWriteBack {
@@ -656,18 +598,13 @@ mod tests {
         async fn prepare(
             &self,
             _project: &OpenedProject,
-            _layout_profile: &RpgMakerWriteBackLayoutProfile,
         ) -> Result<
             OperationCompletion<planner::RpgMakerWriteBackPreparation<Self::Documents>>,
             Self::Error,
         > {
             record(&self.events, "prepare");
             Ok(OperationCompletion::Completed(
-                planner::RpgMakerWriteBackPreparation::new(
-                    (),
-                    self.summary,
-                    self.manual_layout_diagnostics.clone(),
-                ),
+                planner::RpgMakerWriteBackPreparation::new((), self.summary),
             ))
         }
     }
@@ -747,7 +684,6 @@ mod tests {
             PathBuf::from("C:/projects/demo/project.db"),
             "ja".to_owned(),
             "zh-Hans".to_owned(),
-            test_layout_profile(),
         )
     }
 
@@ -770,7 +706,6 @@ mod tests {
             FakeWriteBack {
                 events: Arc::clone(&events),
                 summary,
-                manual_layout_diagnostics: Vec::new(),
             },
             FakePublisher {
                 events: Arc::clone(&events),
@@ -888,50 +823,6 @@ mod tests {
                 ),
             ],
             "候选阶段必须各自形成 started -> completed，不能留下 active_phase"
-        );
-    }
-
-    #[tokio::test]
-    async fn completed_write_back_preserves_each_manual_layout_diagnostic() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let mut service = service(Arc::clone(&events), CooperativeCancellation::default());
-        service.rpg_maker_write_back.summary.manual_layout_units = 1;
-        service.rpg_maker_write_back.manual_layout_diagnostics.push(
-            planner::ManualLayoutDiagnostic::for_test(
-                vec![LogicalTextLocation::new(
-                    RpgMakerLocation::value(
-                        RpgMakerSource::data(StandardDataFile::Actors),
-                        Vec::new(),
-                    ),
-                    TextUnitRole::Scalar(
-                        ScalarFieldKey::new("description").expect("测试字段名应合法"),
-                    ),
-                )],
-                planner::RpgMakerWriteBackLayoutRegion::HelpDescription,
-                MaxFullwidthChars::new(18).expect("测试宽度应合法"),
-            ),
-        );
-
-        let completion = service
-            .execute(WriteBackInput {
-                name: "demo".parse().expect("项目名应合法"),
-            })
-            .await
-            .expect("带人工布局项的写回应成功");
-        let OperationCompletion::Completed(output) = completion else {
-            panic!("未取消的写回应完成")
-        };
-
-        let [diagnostic] = output.manual_layout_diagnostics() else {
-            panic!("每个人工布局项都必须交还给调用方")
-        };
-        assert_eq!(diagnostic.region_name(), "help_description");
-        assert_eq!(diagnostic.max_fullwidth_chars(), 18);
-        assert_eq!(diagnostic.locations().len(), 1);
-        assert_eq!(diagnostic.locations()[0].role_name(), "scalar:description");
-        assert_eq!(
-            diagnostic.locations()[0].group_location().to_string(),
-            "data/Actors.json"
         );
     }
 

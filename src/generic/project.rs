@@ -1,6 +1,6 @@
 //! Generic 项目的专用 SQLite 状态与重复 Extract。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
@@ -32,6 +32,8 @@ use crate::runtime::sqlite::{
     apply_att_sqlite_cancellable_read_write_policy, apply_att_sqlite_new_database_page_policy,
     suspend_att_sqlite_cancellation,
 };
+use crate::translation::TranslationOrigin;
+use crate::translation::candidate_validation::ProvenInvariantViolation;
 #[cfg(test)]
 use crate::translation::placeholder::{
     PlaceholderRuleCompilationError, PlaceholderWorkerOperation,
@@ -48,7 +50,9 @@ use super::jsonl::{GenericInputSnapshot, GenericJsonlError, scan_input_tree_with
 use super::placeholder::{
     GenericCompiledPlaceholderRules, GenericPlaceholderError, GenericPlaceholderService,
 };
-use super::translate::{GenericPlanningError, GenericUnitKey, GenericUnitMap};
+use super::translate::{
+    GenericPlanningError, GenericUnitKey, GenericUnitMap, readable_generic_unit_id,
+};
 
 const DATABASE_FILE_NAME: &str = "project.db";
 const FINGERPRINT_CANCELLATION_CHECK_BYTES: NonZeroUsize =
@@ -127,6 +131,27 @@ const CREATE_INITIAL_SCHEMA_SQL: &str = "CREATE TABLE generic_project (
                  ),
                  PRIMARY KEY (group_id, unit_id)
              ) STRICT;
+             CREATE TABLE generic_rejected_translation (
+                 group_id TEXT NOT NULL,
+                 unit_id TEXT NOT NULL,
+                 readable_id TEXT NOT NULL CHECK (length(readable_id) > 0),
+                 origin TEXT NOT NULL CHECK (origin IN ('automatic', 'manual')),
+                 source_json TEXT NOT NULL CHECK (
+                     json_valid(source_json)
+                     AND json_type(source_json) = 'array'
+                     AND json_array_length(source_json) > 0
+                 ),
+                 candidate_json TEXT NOT NULL CHECK (json_valid(candidate_json)),
+                 translation_shape TEXT NOT NULL CHECK (translation_shape = 'free'),
+                 group_context BLOB NOT NULL CHECK (length(group_context) = 32),
+                 violation_json TEXT NOT NULL CHECK (
+                     json_valid(violation_json) AND json_type(violation_json) = 'object'
+                 ),
+                 planning_state BLOB NOT NULL CHECK (length(planning_state) = 32),
+                 PRIMARY KEY (group_id, unit_id),
+                 FOREIGN KEY (group_id, unit_id)
+                     REFERENCES generic_unit(group_id, unit_id) ON DELETE CASCADE
+             ) STRICT;
              CREATE TABLE translation_resource (
                  resource_kind TEXT PRIMARY KEY CHECK (
                      resource_kind IN ('terminology', 'placeholder_rules')
@@ -144,6 +169,7 @@ const SELECT_GENERIC_ATT_SCHEMA: &str = "SELECT type, name, tbl_name, sql
           'generic_group',
           'generic_unit',
           'generic_manual_translation',
+          'generic_rejected_translation',
           'translation_resource'
       )
     ORDER BY type, name";
@@ -200,13 +226,19 @@ const APPLY_PENDING_TRANSLATION_COMMIT_SQL: &str = "
 const LOAD_UNITS_NATURAL_SQL: &str = "
     SELECT u.group_id, u.unit_id, u.ordinal, u.source_text,
            u.translation, u.translation_state,
-           manual.translation_json, manual.applicability_fingerprint
+           manual.translation_json, manual.applicability_fingerprint,
+           rejected.readable_id, rejected.origin, rejected.source_json,
+           rejected.candidate_json, rejected.translation_shape,
+           rejected.group_context, rejected.violation_json, rejected.planning_state
     FROM main.generic_file AS f
     CROSS JOIN main.generic_group AS g
     CROSS JOIN main.generic_unit AS u
     LEFT JOIN main.generic_manual_translation AS manual
       ON manual.group_id = u.group_id
      AND manual.unit_id = u.unit_id
+    LEFT JOIN main.generic_rejected_translation AS rejected
+      ON rejected.group_id = u.group_id
+     AND rejected.unit_id = u.unit_id
     WHERE g.relative_path = f.relative_path
       AND u.group_id = g.group_id
     ORDER BY f.ordinal, g.ordinal, u.ordinal
@@ -394,6 +426,38 @@ impl GenericStoredTranslation {
     }
 }
 
+/// 最近一次只因可证明不变量而未能入库的候选译文。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GenericStoredRejectedTranslation {
+    pub(super) readable_id: String,
+    pub(super) origin: TranslationOrigin,
+    pub(super) source: Vec<String>,
+    pub(super) candidate_json: String,
+    pub(super) translation: Option<Vec<String>>,
+    pub(super) group_context: Sha256Fingerprint,
+    pub(super) violation: ProvenInvariantViolation,
+    pub(super) planning_state: Sha256Fingerprint,
+}
+
+#[cfg(test)]
+impl GenericStoredRejectedTranslation {
+    pub(crate) fn translation(&self) -> Option<&[String]> {
+        self.translation.as_deref()
+    }
+
+    pub(crate) fn violation(&self) -> &ProvenInvariantViolation {
+        &self.violation
+    }
+
+    pub(crate) fn readable_id(&self) -> &str {
+        &self.readable_id
+    }
+
+    pub(crate) const fn origin(&self) -> TranslationOrigin {
+        self.origin
+    }
+}
+
 /// 持久化中的一个 Unit。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GenericStoredUnit {
@@ -401,6 +465,7 @@ pub(crate) struct GenericStoredUnit {
     pub(super) ordinal: usize,
     pub(super) source_text: String,
     pub(super) translation: Option<GenericStoredTranslation>,
+    pub(super) rejected: Option<GenericStoredRejectedTranslation>,
 }
 
 impl GenericStoredUnit {
@@ -414,6 +479,10 @@ impl GenericStoredUnit {
 
     pub(crate) fn translation(&self) -> Option<&GenericStoredTranslation> {
         self.translation.as_ref()
+    }
+
+    pub(crate) fn rejected(&self) -> Option<&GenericStoredRejectedTranslation> {
+        self.rejected.as_ref()
     }
 
     pub(crate) const fn ordinal(&self) -> usize {
@@ -468,6 +537,22 @@ impl GenericStoredSnapshot {
     pub(crate) fn files(&self) -> &[GenericStoredFile] {
         &self.files
     }
+
+    pub(crate) fn natural_unit_ids(&self) -> HashSet<String> {
+        let mut ids = HashSet::new();
+        for file in &self.files {
+            for (line, group) in file.groups.iter().enumerate() {
+                for (unit, _) in group.units.iter().enumerate() {
+                    ids.insert(readable_generic_unit_id(
+                        &file.relative_path,
+                        line + 1,
+                        unit + 1,
+                    ));
+                }
+            }
+        }
+        ids
+    }
 }
 
 /// 数据库中一个 JSONL 文件的位置及内容。
@@ -488,13 +573,6 @@ impl GenericStoredFile {
     }
 }
 
-/// 译文如何进入当前 Unit。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TranslationOrigin {
-    Automatic,
-    Manual,
-}
-
 /// 一个经过上游验收、准备原子提交的 Unit 译文。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TranslationWrite {
@@ -507,14 +585,33 @@ pub(crate) struct TranslationWrite {
     pub(crate) expected_translation: Option<GenericStoredTranslation>,
 }
 
+/// 一个已绑定到当前 Generic Unit、准备原子替换的硬拒绝候选。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RejectedTranslationWrite {
+    pub(crate) group_id: String,
+    pub(crate) unit_id: String,
+    pub(crate) readable_id: String,
+    pub(crate) origin: TranslationOrigin,
+    pub(crate) expected_source_text: String,
+    pub(crate) source: Vec<String>,
+    pub(crate) expected_group_context: Sha256Fingerprint,
+    pub(crate) candidate_json: String,
+    pub(crate) translation: Option<Vec<String>>,
+    pub(crate) violation: ProvenInvariantViolation,
+    pub(crate) planning_state: Sha256Fingerprint,
+}
+
 /// 一条已经由当前 Translate 语义确认失效、准备以 CAS 清除的旧译文。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TranslationClear {
     pub(crate) group_id: String,
     pub(crate) unit_id: String,
+    pub(crate) readable_id: String,
     pub(crate) expected_source_text: String,
     pub(crate) expected_group_context: Sha256Fingerprint,
     pub(crate) expected_translation: GenericStoredTranslation,
+    pub(crate) violation: Option<ProvenInvariantViolation>,
+    pub(crate) rejection_planning_state: Sha256Fingerprint,
 }
 
 /// Extract 对已有译文造成的可观察结果。
@@ -539,6 +636,23 @@ pub(crate) enum ExtractOutcome {
 pub(crate) struct CommitTranslationsOutcome {
     pub(crate) committed: usize,
     pub(crate) conflicts: Vec<(String, String)>,
+}
+
+/// 一次模型任务将有效译文和硬拒绝候选共同提交后的结果。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CommitTranslationResultsOutcome {
+    pub(crate) committed: usize,
+    pub(crate) rejected: usize,
+    pub(crate) conflicts: Vec<(String, String)>,
+}
+
+impl CommitTranslationResultsOutcome {
+    fn translations_only(self) -> CommitTranslationsOutcome {
+        CommitTranslationsOutcome {
+            committed: self.committed,
+            conflicts: self.conflicts,
+        }
+    }
 }
 
 /// Generic 项目数据库的直接领域入口。
@@ -925,8 +1039,10 @@ impl GenericProjectStore {
         self.finish_cancellable(self.commit_translations_inner(
             expected_raw_fingerprint,
             writes,
+            &[],
             None,
         ))
+        .map(CommitTranslationResultsOutcome::translations_only)
     }
 
     /// 提交自动翻译进展，并在至少一项写入成功时于同一事务记录所用 Profile。
@@ -943,6 +1059,28 @@ impl GenericProjectStore {
         self.finish_cancellable(self.commit_translations_inner(
             expected_raw_fingerprint,
             writes,
+            &[],
+            Some(profile_id),
+        ))
+        .map(CommitTranslationResultsOutcome::translations_only)
+    }
+
+    /// 原子保存同一模型任务中的有效译文与可证明硬拒绝。
+    pub(crate) fn commit_translation_results_for_profile(
+        &self,
+        expected_raw_fingerprint: Sha256Fingerprint,
+        writes: &[TranslationWrite],
+        rejections: &[RejectedTranslationWrite],
+        profile_id: &str,
+    ) -> Result<CommitTranslationResultsOutcome, GenericProjectError> {
+        self.ensure_not_cancelled()?;
+        if profile_id.is_empty() || profile_id.chars().all(char::is_whitespace) {
+            return Err(GenericProjectError::BlankProfileId);
+        }
+        self.finish_cancellable(self.commit_translations_inner(
+            expected_raw_fingerprint,
+            writes,
+            rejections,
             Some(profile_id),
         ))
     }
@@ -951,8 +1089,9 @@ impl GenericProjectStore {
         &self,
         expected_raw_fingerprint: Sha256Fingerprint,
         writes: &[TranslationWrite],
+        rejections: &[RejectedTranslationWrite],
         profile_id: Option<&str>,
-    ) -> Result<CommitTranslationsOutcome, GenericProjectError> {
+    ) -> Result<CommitTranslationResultsOutcome, GenericProjectError> {
         let mut write_indexes = GenericUnitMap::with_capacity(writes.len());
         for (index, write) in writes.iter().enumerate() {
             self.ensure_not_cancelled()?;
@@ -975,6 +1114,37 @@ impl GenericProjectStore {
                 return Err(GenericProjectError::DuplicateTranslationWrite {
                     group_id: clone_text_with_cancellation(&write.group_id, &self.cancellation)?,
                     unit_id: clone_text_with_cancellation(&write.unit_id, &self.cancellation)?,
+                });
+            }
+        }
+        let mut rejection_indexes = GenericUnitMap::with_capacity(rejections.len());
+        for (index, rejection) in rejections.iter().enumerate() {
+            self.ensure_not_cancelled()?;
+            if serde_json::from_str::<Box<serde_json::value::RawValue>>(&rejection.candidate_json)
+                .is_err()
+            {
+                return Err(GenericProjectError::InvalidTranslation {
+                    group_id: Some(rejection.group_id.clone()),
+                    unit_id: Some(rejection.unit_id.clone()),
+                    problem: GenericProjectTranslationProblem::Blank,
+                    source: None,
+                });
+            }
+            let key = GenericUnitKey::new(
+                clone_text_with_cancellation(&rejection.group_id, &self.cancellation)?,
+                clone_text_with_cancellation(&rejection.unit_id, &self.cancellation)?,
+            );
+            if write_indexes.contains_with_cancellation(&key, || self.ensure_not_cancelled())?
+                || rejection_indexes
+                    .insert_with_cancellation(key, index, || self.ensure_not_cancelled())?
+                    .is_some()
+            {
+                return Err(GenericProjectError::DuplicateTranslationWrite {
+                    group_id: clone_text_with_cancellation(
+                        &rejection.group_id,
+                        &self.cancellation,
+                    )?,
+                    unit_id: clone_text_with_cancellation(&rejection.unit_id, &self.cancellation)?,
                 });
             }
         }
@@ -1111,6 +1281,16 @@ impl GenericProjectStore {
                     self.ensure_not_cancelled()?;
                     if applied {
                         committed += 1;
+                        transaction
+                            .execute(
+                                "DELETE FROM generic_rejected_translation
+                                 WHERE group_id = ?1 AND unit_id = ?2",
+                                params![write.group_id, write.unit_id],
+                            )
+                            .map_err(|source| GenericProjectError::Sqlite {
+                                operation: "清除 Generic 已修复的被拒候选",
+                                source,
+                            })?;
                     } else {
                         conflicts.push((
                             clone_text_with_cancellation(&write.group_id, &self.cancellation)?,
@@ -1118,7 +1298,82 @@ impl GenericProjectStore {
                         ));
                     }
                 }
-                if committed > 0
+                let mut rejected = 0_usize;
+                for rejection in rejections {
+                    self.ensure_not_cancelled()?;
+                    let current: i64 = transaction
+                        .query_row(
+                            "SELECT count(*)
+                             FROM generic_unit AS unit
+                             JOIN generic_group AS group_record
+                               ON group_record.group_id = unit.group_id
+                             WHERE unit.group_id = ?1
+                               AND unit.unit_id = ?2
+                               AND unit.source_text = ?3
+                               AND group_record.context_fingerprint = ?4
+                               AND unit.translation IS NULL
+                               AND unit.translation_state IS NULL
+                               AND NOT EXISTS (
+                                   SELECT 1 FROM generic_manual_translation AS manual
+                                   WHERE manual.group_id = unit.group_id
+                                     AND manual.unit_id = unit.unit_id
+                               )",
+                            params![
+                                rejection.group_id,
+                                rejection.unit_id,
+                                rejection.expected_source_text,
+                                rejection.expected_group_context.as_bytes().as_slice(),
+                            ],
+                            |row| row.get(0),
+                        )
+                        .map_err(|source| GenericProjectError::Sqlite {
+                            operation: "确认 Generic 被拒候选仍属于当前 Unit",
+                            source,
+                        })?;
+                    if current != 1 {
+                        conflicts.push((
+                            clone_text_with_cancellation(&rejection.group_id, &self.cancellation)?,
+                            clone_text_with_cancellation(&rejection.unit_id, &self.cancellation)?,
+                        ));
+                        continue;
+                    }
+                    transaction
+                        .execute(
+                            "INSERT INTO generic_rejected_translation (
+                                 group_id, unit_id, readable_id, origin, source_json,
+                                 candidate_json, translation_shape, group_context,
+                                 violation_json, planning_state
+                             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'free', ?7, ?8, ?9)
+                             ON CONFLICT (group_id, unit_id) DO UPDATE SET
+                                 readable_id = excluded.readable_id,
+                                 origin = excluded.origin,
+                                 source_json = excluded.source_json,
+                                 candidate_json = excluded.candidate_json,
+                                 translation_shape = excluded.translation_shape,
+                                 group_context = excluded.group_context,
+                                 violation_json = excluded.violation_json,
+                                 planning_state = excluded.planning_state",
+                            params![
+                                rejection.group_id,
+                                rejection.unit_id,
+                                rejection.readable_id,
+                                rejection.origin.storage_name(),
+                                serde_json::to_string(&rejection.source)
+                                    .expect("Generic 被拒候选原文必须可以编码"),
+                                rejection.candidate_json,
+                                rejection.expected_group_context.as_bytes().as_slice(),
+                                serde_json::to_string(&rejection.violation)
+                                    .expect("Generic 被拒原因必须可以编码"),
+                                rejection.planning_state.as_bytes().as_slice(),
+                            ],
+                        )
+                        .map_err(|source| GenericProjectError::Sqlite {
+                            operation: "保存 Generic 被拒候选",
+                            source,
+                        })?;
+                    rejected += 1;
+                }
+                if (committed > 0 || rejected > 0)
                     && let Some(profile_id) = profile_id
                 {
                     transaction
@@ -1133,8 +1388,9 @@ impl GenericProjectStore {
                             source,
                         })?;
                 }
-                Ok(CommitTranslationsOutcome {
+                Ok(CommitTranslationResultsOutcome {
                     committed,
+                    rejected,
                     conflicts,
                 })
             },
@@ -1283,7 +1539,7 @@ impl GenericProjectStore {
                 let mut conflicts = Vec::new();
                 let mut committed = 0;
                 {
-                    let mut statement = transaction
+                    let mut clear_automatic = transaction
                         .prepare_cached(
                             "UPDATE generic_unit
                              SET translation = NULL,
@@ -1301,27 +1557,120 @@ impl GenericProjectStore {
                             operation: "准备清除失效 Generic 译文",
                             source,
                         })?;
+                    let mut clear_manual = transaction
+                        .prepare_cached(
+                            "DELETE FROM generic_manual_translation
+                             WHERE group_id = ?1 AND unit_id = ?2
+                               AND translation_json = ?3
+                               AND applicability_fingerprint = ?4
+                               AND EXISTS (
+                                   SELECT 1
+                                   FROM generic_unit AS unit
+                                   JOIN generic_group AS group_record
+                                     ON group_record.group_id = unit.group_id
+                                   WHERE unit.group_id = ?1 AND unit.unit_id = ?2
+                                     AND unit.source_text = ?5
+                                     AND group_record.context_fingerprint = ?6
+                               )",
+                        )
+                        .map_err(|source| GenericProjectError::Sqlite {
+                            operation: "准备清除失效 Generic 人工译文",
+                            source,
+                        })?;
+                    let mut save_rejected = transaction
+                        .prepare_cached(
+                            "INSERT INTO generic_rejected_translation (
+                                 group_id, unit_id, readable_id, origin, source_json,
+                                 candidate_json, translation_shape, group_context,
+                                 violation_json, planning_state
+                             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'free', ?7, ?8, ?9)
+                             ON CONFLICT (group_id, unit_id) DO UPDATE SET
+                                 readable_id = excluded.readable_id,
+                                 origin = excluded.origin,
+                                 source_json = excluded.source_json,
+                                 candidate_json = excluded.candidate_json,
+                                 translation_shape = excluded.translation_shape,
+                                 group_context = excluded.group_context,
+                                 violation_json = excluded.violation_json,
+                                 planning_state = excluded.planning_state",
+                        )
+                        .map_err(|source| GenericProjectError::Sqlite {
+                            operation: "准备保存失效 Generic 候选",
+                            source,
+                        })?;
                     for invalidation in invalidations {
                         self.ensure_not_cancelled()?;
-                        let changed = statement
-                            .execute(params![
-                                invalidation.group_id,
-                                invalidation.unit_id,
-                                invalidation.expected_source_text,
-                                invalidation.expected_group_context.as_bytes().as_slice(),
-                                invalidation.expected_translation.translation,
-                                invalidation
-                                    .expected_translation
-                                    .state_fingerprint
-                                    .as_bytes()
-                                    .as_slice(),
-                            ])
-                            .map_err(|source| GenericProjectError::Sqlite {
-                                operation: "清除失效 Generic 译文",
-                                source,
-                            })?;
+                        let expected_lines = invalidation
+                            .expected_translation
+                            .translation
+                            .split('\n')
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>();
+                        let expected_translation_json = serde_json::to_string(&expected_lines)
+                            .expect("Generic 当前译文字符串数组必须可以编码");
+                        let changed = match invalidation.expected_translation.origin {
+                            TranslationOrigin::Automatic => clear_automatic
+                                .execute(params![
+                                    invalidation.group_id,
+                                    invalidation.unit_id,
+                                    invalidation.expected_source_text,
+                                    invalidation.expected_group_context.as_bytes().as_slice(),
+                                    invalidation.expected_translation.translation,
+                                    invalidation
+                                        .expected_translation
+                                        .state_fingerprint
+                                        .as_bytes()
+                                        .as_slice(),
+                                ])
+                                .map_err(|source| GenericProjectError::Sqlite {
+                                    operation: "清除失效 Generic 自动译文",
+                                    source,
+                                })?,
+                            TranslationOrigin::Manual => clear_manual
+                                .execute(params![
+                                    invalidation.group_id,
+                                    invalidation.unit_id,
+                                    expected_translation_json,
+                                    invalidation
+                                        .expected_translation
+                                        .state_fingerprint
+                                        .as_bytes()
+                                        .as_slice(),
+                                    invalidation.expected_source_text,
+                                    invalidation.expected_group_context.as_bytes().as_slice(),
+                                ])
+                                .map_err(|source| GenericProjectError::Sqlite {
+                                    operation: "清除失效 Generic 人工译文",
+                                    source,
+                                })?,
+                        };
                         if changed == 1 {
                             committed += 1;
+                            if let Some(violation) = &invalidation.violation {
+                                let source = invalidation
+                                    .expected_source_text
+                                    .split('\n')
+                                    .map(str::to_owned)
+                                    .collect::<Vec<_>>();
+                                save_rejected
+                                    .execute(params![
+                                        invalidation.group_id,
+                                        invalidation.unit_id,
+                                        invalidation.readable_id,
+                                        invalidation.expected_translation.origin.storage_name(),
+                                        serde_json::to_string(&source)
+                                            .expect("Generic Rejected 原文必须可以编码"),
+                                        expected_translation_json,
+                                        invalidation.expected_group_context.as_bytes().as_slice(),
+                                        serde_json::to_string(violation)
+                                            .expect("Generic Rejected 原因必须可以编码"),
+                                        invalidation.rejection_planning_state.as_bytes().as_slice(),
+                                    ])
+                                    .map_err(|source| GenericProjectError::Sqlite {
+                                        operation: "保存失效 Generic 候选",
+                                        source,
+                                    })?;
+                            }
                         } else {
                             conflicts.push((
                                 clone_text_with_cancellation(
@@ -2752,6 +3101,30 @@ fn reconcile_snapshot(
                     }
                     _ => None,
                 };
+                let rejected = match previous_units.and_then(|units| units.get(unit_ordinal)) {
+                    Some(old)
+                        if bytes_equal_with_cancellation(
+                            old.id.as_bytes(),
+                            unit.id().as_bytes(),
+                            cancellation,
+                        )? && bytes_equal_with_cancellation(
+                            old.source_text.as_bytes(),
+                            unit.text().as_bytes(),
+                            cancellation,
+                        )? =>
+                    {
+                        old.rejected
+                            .as_ref()
+                            .map(|rejected| {
+                                clone_stored_rejected_translation_with_cancellation(
+                                    rejected,
+                                    cancellation,
+                                )
+                            })
+                            .transpose()?
+                    }
+                    _ => None,
+                };
                 if translation.is_some() {
                     preserved_translations += 1;
                 }
@@ -2760,6 +3133,7 @@ fn reconcile_snapshot(
                     ordinal: unit_ordinal,
                     source_text: clone_text_with_cancellation(unit.text(), cancellation)?,
                     translation,
+                    rejected,
                 });
             }
             groups.push(GenericStoredGroup {
@@ -2792,6 +3166,37 @@ fn clone_stored_translation_with_cancellation(
         translation: clone_text_with_cancellation(&translation.translation, cancellation)?,
         origin: translation.origin,
         state_fingerprint: translation.state_fingerprint,
+    })
+}
+
+fn clone_stored_rejected_translation_with_cancellation(
+    rejected: &GenericStoredRejectedTranslation,
+    cancellation: &CooperativeCancellation,
+) -> Result<GenericStoredRejectedTranslation, GenericProjectError> {
+    let mut source = Vec::with_capacity(rejected.source.len());
+    for line in &rejected.source {
+        source.push(clone_text_with_cancellation(line, cancellation)?);
+    }
+    let translation = rejected
+        .translation
+        .as_ref()
+        .map(|lines| {
+            let mut cloned = Vec::with_capacity(lines.len());
+            for line in lines {
+                cloned.push(clone_text_with_cancellation(line, cancellation)?);
+            }
+            Ok::<_, GenericProjectError>(cloned)
+        })
+        .transpose()?;
+    Ok(GenericStoredRejectedTranslation {
+        readable_id: clone_text_with_cancellation(&rejected.readable_id, cancellation)?,
+        origin: rejected.origin,
+        source,
+        candidate_json: clone_text_with_cancellation(&rejected.candidate_json, cancellation)?,
+        translation,
+        group_context: rejected.group_context,
+        violation: rejected.violation.clone(),
+        planning_state: rejected.planning_state,
     })
 }
 
@@ -3109,6 +3514,17 @@ fn replace_snapshot(
                 operation: "写入 Generic Unit",
                 source,
             })?;
+        let mut rejected_statement = transaction
+            .prepare_cached(
+                "INSERT INTO generic_rejected_translation (
+                     group_id, unit_id, readable_id, origin, source_json, candidate_json,
+                     translation_shape, group_context, violation_json, planning_state
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'free', ?7, ?8, ?9)",
+            )
+            .map_err(|source| GenericProjectError::Sqlite {
+                operation: "写入 Generic 被拒候选",
+                source,
+            })?;
 
         for file in files {
             ensure_generic_operation_not_cancelled(cancellation)?;
@@ -3157,6 +3573,26 @@ fn replace_snapshot(
                             operation: "写入 Generic Unit",
                             source,
                         })?;
+                    if let Some(rejected) = &unit.rejected {
+                        rejected_statement
+                            .execute(params![
+                                group.id,
+                                unit.id,
+                                rejected.readable_id,
+                                rejected.origin.storage_name(),
+                                serde_json::to_string(&rejected.source)
+                                    .expect("Generic 被拒候选原文必须可以编码"),
+                                rejected.candidate_json,
+                                rejected.group_context.as_bytes().as_slice(),
+                                serde_json::to_string(&rejected.violation)
+                                    .expect("Generic 被拒原因必须可以编码"),
+                                rejected.planning_state.as_bytes().as_slice(),
+                            ])
+                            .map_err(|source| GenericProjectError::Sqlite {
+                                operation: "写入 Generic 被拒候选",
+                                source,
+                            })?;
+                    }
                 }
             }
         }
@@ -3445,6 +3881,54 @@ fn load_snapshot_rows(
             "解码 Generic 人工译文",
             cancellation,
         )?;
+        let rejected_readable_id = clone_optional_sqlite_text_column_with_cancellation(
+            row,
+            8,
+            "解码 Generic 被拒候选",
+            cancellation,
+        )?;
+        let rejected_origin = clone_optional_sqlite_text_column_with_cancellation(
+            row,
+            9,
+            "解码 Generic 被拒候选",
+            cancellation,
+        )?;
+        let rejected_source_json = clone_optional_sqlite_text_column_with_cancellation(
+            row,
+            10,
+            "解码 Generic 被拒候选",
+            cancellation,
+        )?;
+        let rejected_candidate_json = clone_optional_sqlite_text_column_with_cancellation(
+            row,
+            11,
+            "解码 Generic 被拒候选",
+            cancellation,
+        )?;
+        let rejected_shape = clone_optional_sqlite_text_column_with_cancellation(
+            row,
+            12,
+            "解码 Generic 被拒候选",
+            cancellation,
+        )?;
+        let rejected_group_context = clone_optional_sqlite_blob_column_with_cancellation(
+            row,
+            13,
+            "解码 Generic 被拒候选",
+            cancellation,
+        )?;
+        let rejected_violation_json = clone_optional_sqlite_text_column_with_cancellation(
+            row,
+            14,
+            "解码 Generic 被拒候选",
+            cancellation,
+        )?;
+        let rejected_planning_state = clone_optional_sqlite_blob_column_with_cancellation(
+            row,
+            15,
+            "解码 Generic 被拒候选",
+            cancellation,
+        )?;
         cancellation.ensure_running()?;
         let Some(&(file_index, group_index)) =
             group_indexes.get_with_cancellation(&group_id, || cancellation.ensure_running())?
@@ -3509,6 +3993,62 @@ fn load_snapshot_rows(
             }
         };
         let translation = manual_translation.or(automatic_translation);
+        let rejected = match (
+            rejected_readable_id,
+            rejected_origin,
+            rejected_source_json,
+            rejected_candidate_json,
+            rejected_shape,
+            rejected_group_context,
+            rejected_violation_json,
+            rejected_planning_state,
+        ) {
+            (None, None, None, None, None, None, None, None) => None,
+            (
+                Some(readable_id),
+                Some(origin),
+                Some(source_json),
+                Some(candidate_json),
+                Some(shape),
+                Some(group_context),
+                Some(violation_json),
+                Some(planning_state),
+            ) if shape == "free" => {
+                let origin = TranslationOrigin::from_storage_name(&origin).ok_or_else(|| {
+                    invalid_database(GenericProjectDatabaseProblem::ManualTranslationStateFailure)
+                })?;
+                let source = serde_json::from_str::<Vec<String>>(&source_json).map_err(|_| {
+                    invalid_database(GenericProjectDatabaseProblem::ManualTranslationStateFailure)
+                })?;
+                let translation = serde_json::from_str::<Vec<String>>(&candidate_json)
+                    .ok()
+                    .filter(|translation| !translation.is_empty());
+                let violation = serde_json::from_str::<ProvenInvariantViolation>(&violation_json)
+                    .map_err(|_| {
+                    invalid_database(GenericProjectDatabaseProblem::ManualTranslationStateFailure)
+                })?;
+                if source.is_empty() {
+                    return Err(invalid_database(
+                        GenericProjectDatabaseProblem::ManualTranslationStateFailure,
+                    ));
+                }
+                Some(GenericStoredRejectedTranslation {
+                    readable_id,
+                    origin,
+                    source,
+                    candidate_json,
+                    translation,
+                    group_context: read_fingerprint(group_context, "group_context")?,
+                    violation,
+                    planning_state: read_fingerprint(planning_state, "planning_state")?,
+                })
+            }
+            _ => {
+                return Err(invalid_database(
+                    GenericProjectDatabaseProblem::ManualTranslationStateFailure,
+                ));
+            }
+        };
         files[file_index].groups[group_index]
             .units
             .push(GenericStoredUnit {
@@ -3516,6 +4056,7 @@ fn load_snapshot_rows(
                 ordinal: from_i64(unit_ordinal, "unit.ordinal")?,
                 source_text,
                 translation,
+                rejected,
             });
     }
     drop(unit_rows);
@@ -4658,7 +5199,7 @@ mod tests {
         assert_eq!(terminology_encode_cancellation.polls.get(), 4);
 
         let long_placeholder = format!(
-            r#"[{{"pattern":"{}"}}]"#,
+            r#"[{{"kind":"rule","definition":{{"order":"preserve","pattern":"{}"}}}}]"#,
             "x".repeat(RESOURCE_CANCELLATION_CHECK_BYTES * 3)
         );
         let placeholder_parse_cancellation = CancelResourceAt::new(3);
@@ -5949,6 +6490,99 @@ mod tests {
     }
 
     #[test]
+    fn rejected_candidate_round_trips_and_valid_translation_clears_it_atomically() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let workspace = temp.path().join("project");
+        write_source(
+            &source,
+            "{\"id\":\"g\",\"kind\":\"k\",\"units\":[{\"id\":\"u\",\"text\":\"原文\"}]}\n",
+        );
+        let store = init(&workspace, &source);
+        store.extract().unwrap();
+        let snapshot = store.load_snapshot().unwrap();
+        let group = &snapshot.files()[0].groups()[0];
+        let unit = &group.units()[0];
+        let state = Sha256Fingerprint::from_bytes([42; 32]);
+        let rejected = RejectedTranslationWrite {
+            group_id: group.id().to_owned(),
+            unit_id: unit.id().to_owned(),
+            readable_id: "input.jsonl:line1:unit1:text".to_owned(),
+            origin: TranslationOrigin::Automatic,
+            expected_source_text: unit.source_text().to_owned(),
+            source: vec![unit.source_text().to_owned()],
+            expected_group_context: group.context_fingerprint(),
+            candidate_json: "{\"wrong\":true}".to_owned(),
+            translation: None,
+            violation: ProvenInvariantViolation::InvalidCandidateShape,
+            planning_state: state,
+        };
+
+        let outcome = store
+            .commit_translation_results_for_profile(
+                snapshot.project().extracted_raw_fingerprint().unwrap(),
+                &[],
+                std::slice::from_ref(&rejected),
+                "primary",
+            )
+            .unwrap();
+        assert_eq!(outcome.rejected, 1);
+        let snapshot = store.load_snapshot().unwrap();
+        let stored = snapshot.files()[0].groups()[0].units()[0]
+            .rejected()
+            .expect("当前硬拒绝必须可以重读");
+        assert_eq!(stored.readable_id(), rejected.readable_id);
+        assert_eq!(stored.translation(), None);
+        assert_eq!(
+            stored.violation(),
+            &ProvenInvariantViolation::InvalidCandidateShape
+        );
+
+        let no_result = store
+            .commit_translation_results_for_profile(
+                snapshot.project().extracted_raw_fingerprint().unwrap(),
+                &[],
+                &[],
+                "primary",
+            )
+            .unwrap();
+        assert_eq!(no_result.committed, 0);
+        assert_eq!(no_result.rejected, 0);
+        let unchanged = store.load_snapshot().unwrap();
+        assert_eq!(
+            unchanged.files()[0].groups()[0].units()[0]
+                .rejected()
+                .expect("取消、Unavailable 或无法映射时不得请求前清除旧 Rejected")
+                .candidate_json,
+            rejected.candidate_json
+        );
+
+        let write = TranslationWrite {
+            group_id: rejected.group_id,
+            unit_id: rejected.unit_id,
+            expected_source_text: rejected.expected_source_text,
+            expected_group_context: rejected.expected_group_context,
+            translation: "译文".to_owned(),
+            state_fingerprint: state,
+            expected_translation: None,
+        };
+        let outcome = store
+            .commit_translation_results_for_profile(
+                snapshot.project().extracted_raw_fingerprint().unwrap(),
+                std::slice::from_ref(&write),
+                &[],
+                "primary",
+            )
+            .unwrap();
+        assert_eq!(outcome.committed, 1);
+        let snapshot = store.load_snapshot().unwrap();
+        let unit = &snapshot.files()[0].groups()[0].units()[0];
+        assert_eq!(unit.translation().unwrap().translation(), "译文");
+        assert!(unit.rejected().is_none());
+    }
+
+    #[test]
     fn batch_translation_commit_preserves_per_unit_cas_and_conflict_order() {
         let temp = tempdir().unwrap();
         let source = temp.path().join("source");
@@ -6729,9 +7363,12 @@ mod tests {
                 &[TranslationClear {
                     group_id: group.id().to_owned(),
                     unit_id: unit.id().to_owned(),
+                    readable_id: "source.jsonl:line1:unit1:text".to_owned(),
                     expected_source_text: unit.source_text().to_owned(),
                     expected_group_context: group.context_fingerprint(),
+                    rejection_planning_state: previous.state_fingerprint,
                     expected_translation: previous,
+                    violation: None,
                 }],
             )
             .expect("资源和失效译文应该可原子更新");
@@ -6749,5 +7386,89 @@ mod tests {
             .expect("应该可读取新资源");
         assert!(resources.terminology_json().contains("新术语"));
         assert_eq!(resources.placeholder_rules_json(), "[]");
+    }
+
+    #[test]
+    fn applying_new_resources_moves_invalid_manual_translation_to_rejected_atomically() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let workspace = temp.path().join("project");
+        write_source(
+            &source,
+            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"Open [A].\"}]}\n",
+        );
+        let store = init(&workspace, &source);
+        store.extract().expect("首次 Extract 应成功");
+        let snapshot = store.load_snapshot().expect("应该可读取首次快照");
+        let group = &snapshot.files()[0].groups()[0];
+        let unit = &group.units()[0];
+        let source_lines = vec![unit.source_text().to_owned()];
+        let applicability = crate::manual::generic_manual_applicability(
+            group.id(),
+            unit.id(),
+            "text.jsonl",
+            group.kind(),
+            &source_lines,
+        );
+        let connection = Connection::open(&store.database_path).expect("应该可打开项目数据库");
+        crate::manual::apply_generic_manual_translations(
+            &connection,
+            &[crate::manual::ValidatedManualTranslation {
+                id: "text.jsonl:line1:unit1:text".to_owned(),
+                kind: crate::manual::ManualTranslationType::Free,
+                source: source_lines,
+                translation: vec!["打开 [B]。".to_owned()],
+                locator: crate::manual::ManualTranslationLocator::Generic {
+                    group_id: group.id().to_owned(),
+                    unit_id: unit.id().to_owned(),
+                },
+                applicability,
+            }],
+        )
+        .expect("人工译文应该可保存");
+        drop(connection);
+
+        let snapshot = store.load_snapshot().expect("应该可读取人工译文");
+        let unit = &snapshot.files()[0].groups()[0].units()[0];
+        let previous = unit.translation().expect("人工译文应该是当前译文").clone();
+        assert_eq!(previous.origin(), TranslationOrigin::Manual);
+
+        let outcome = store
+            .apply_translation_resources(
+                snapshot.project().extracted_raw_fingerprint().unwrap(),
+                "[]",
+                "[]",
+                &[TranslationClear {
+                    group_id: group.id().to_owned(),
+                    unit_id: unit.id().to_owned(),
+                    readable_id: "text.jsonl:line1:unit1:text".to_owned(),
+                    expected_source_text: unit.source_text().to_owned(),
+                    expected_group_context: group.context_fingerprint(),
+                    expected_translation: previous,
+                    violation: Some(ProvenInvariantViolation::PlaceholderMismatch),
+                    rejection_planning_state: Sha256Fingerprint::from_bytes([8; 32]),
+                }],
+            )
+            .expect("资源和失效人工译文应该可原子更新");
+
+        assert_eq!(outcome.committed, 1);
+        assert!(outcome.conflicts.is_empty());
+        let snapshot = store.load_snapshot().expect("应该可读取失效后的项目状态");
+        let unit = &snapshot.files()[0].groups()[0].units()[0];
+        assert!(
+            unit.translation().is_none(),
+            "已转入 Rejected 的人工译文不得继续作为 Current"
+        );
+        let rejected = unit.rejected().expect("失效人工译文必须保存在 Rejected");
+        assert_eq!(rejected.origin(), TranslationOrigin::Manual);
+        assert_eq!(
+            rejected.translation(),
+            Some(["打开 [B]。".to_owned()].as_slice())
+        );
+        assert_eq!(
+            rejected.violation(),
+            &ProvenInvariantViolation::PlaceholderMismatch
+        );
     }
 }

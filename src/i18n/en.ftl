@@ -9,6 +9,8 @@ cli-translate-about = Translate extracted text with an explicit or saved profile
 cli-write-back-about = Write current translations to the project's output
 cli-manual-about = Manage manual translations with an editable TOML file
 cli-manual-export-about = Export entries that currently need manual translation
+cli-ownership-export-about = Export text ownership for every extracted RPG Maker unit
+cli-translation-export-about = Export source text, current translations, and state for every extracted unit
 cli-manual-check-about = Check a manual translation TOML file without changing the project
 cli-manual-apply-about = Apply filled and valid manual translations
 cli-project-lua-about = Run a Lua script against the project database
@@ -16,9 +18,6 @@ cli-project-name-help = Stable project name
 cli-init-path-help = Input root directory; an existing project can reuse its last successful path
 cli-source-language-help = Source language ID
 cli-target-language-help = Target language ID
-cli-dialogue-width-help = Maximum full-width characters per dialogue line
-cli-scrolling-width-help = Maximum full-width characters per scrolling-text line
-cli-help-width-help = Maximum full-width characters per help or description line
 cli-builtin-help = Use ATT's built-in RPG Maker text locations
 cli-rules-help = Replace the RPG Maker extraction rules with this TOML definition; an empty rule list disables them
 cli-dialogue-rules-help = Replace the MV dialogue-name projection used with Builtin
@@ -104,12 +103,11 @@ result-translate-convergence = State convergence: { $retained } retained, { $inv
 result-write-back-completed = Write-back complete: { $project }
 result-project-lua-completed = Project Lua execution complete: { $project }
 result-output-directory = Output directory: { $path }
-result-write-back-summary = Write-back: { $translated } translated units, { $original } source units; auto-wrapped { $auto_wrapped }, inserted { $breaks } line breaks and { $indents } full-width indents; { $manual } need manual layout
+result-write-back-summary = Write-back: { $translated } translated units, { $original } source units
 result-generic-extract-unchanged = Generic input unchanged: { $files } files, { $groups } groups, { $units } units
 result-generic-extract-updated = Generic input updated: { $files } files, { $groups } groups, { $units } units; preserved { $preserved } translations and cleared { $cleared }
 result-generic-translate-summary = Generic translation: { $total } planned tasks, { $started } started, { $not_started } not started; { $complete } complete, { $partial } partial, { $unavailable } unavailable, { $failed } failed, { $cancelled } cancelled; { $planned_units } planned units, { $remaining_units } remaining units, cleared { $cleared }, reused { $reused }, accepted { $accepted }, wrote { $written }, conflicts { $conflicted }, response problems { $problems }
 result-generic-write-back-summary = Generic write-back: { $translated } translated units, { $original } source units retained
-result-symbol-repair-summary = Symbol repair: attempted { $attempted } units, repaired { $repaired }, skipped internally { $skipped }, replaced { $replacements } symbols
 result-run-log = Run log: { $path }
 translate-incomplete-object = Translate run for project { $project }
 translate-incomplete-rpg-maker-reason = { $partial } partial tasks, { $unavailable } unavailable tasks, { $not_started } not started, { $protocol } protocol problems, and { $exhausted } exhausted requests; request admission {
@@ -212,7 +210,6 @@ diagnostic-resolution-value = { $code ->
     [fix_input] Correct the named input and retry
     [fix_placeholder_rules] Correct the indicated Placeholder rule and retry
     [review_disabled_rules] If this is expected, no action is needed; otherwise add valid rules to the indicated file and run Extract again
-    [adjust_manual_layout] Manually adjust line breaks and layout at the indicated locations for the stated display width
     [check_path_and_permissions] Check the path, filesystem state, and permissions
     [check_project_state] Inspect the project state, correct it, and retry
     [resolve_contention] Wait for the competing operation to finish, then retry
@@ -283,7 +280,6 @@ diagnostic-failure-value = { $code ->
     [duplicate_identifier] An identifier is duplicated
     [extraction_out_of_date] The stored extraction no longer matches the current source
     [invalid_content] The content violates the required contract
-    [manual_layout_required] Manual line-break or layout adjustment is required
     [operation_failed] The operation failed
     [placeholder_projection_failed] Placeholder projection did not preserve the required structure
     [profile_not_found] The selected translation Profile does not exist
@@ -341,7 +337,6 @@ diagnostic-json-position = line { $line }, column { $column }
 diagnostic-placeholder-rule-file = Placeholder rule { $number } in { $path }
 diagnostic-placeholder-rule-project = Placeholder rule { $number } in the current project
 manual-exported = Exported { $entries } entries to { $path }
-manual-ownership-exported = Ownership records: { $path }
 manual-checked = Valid { $valid }, unfilled { $unfilled }, errors { $errors }
 manual-applied = Applied { $applied }, unfilled { $unfilled }, errors { $errors }
 manual-value = { $code ->

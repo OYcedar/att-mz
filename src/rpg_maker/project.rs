@@ -28,10 +28,6 @@ use crate::storage::file_system::{
     DirectoryTreeRoot, ExistingDirectoryResolver, ResolveDirectoryError,
 };
 
-pub(crate) use crate::rpg_maker::project_database::{
-    MaxFullwidthChars, RpgMakerWriteBackLayoutProfile,
-};
-
 /// 已由项目开启边界建立、可供 RPG Maker 各用例直接信任的项目上下文。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct OpenedProject {
@@ -47,7 +43,6 @@ impl OpenedProject {
         database_path: PathBuf,
         source_language: String,
         target_language: String,
-        layout_profile: RpgMakerWriteBackLayoutProfile,
     ) -> Self {
         let language_pair = LanguagePair::new(
             LanguageId::parse(&source_language).expect("测试源语言应为有效规范标签"),
@@ -59,7 +54,6 @@ impl OpenedProject {
             database_path,
             RpgMakerLayout::MZ,
             language_pair,
-            layout_profile,
         ))
     }
 
@@ -106,10 +100,6 @@ impl OpenedProject {
 
     pub(crate) const fn source_snapshot_fingerprint(&self) -> SourceSnapshotFingerprint {
         self.record.source_snapshot_fingerprint()
-    }
-
-    pub(crate) fn layout_profile(&self) -> &RpgMakerWriteBackLayoutProfile {
-        self.record.layout_profile()
     }
 
     pub(crate) fn mv_dialogue_definition(&self) -> &MvDialogueDefinition {
@@ -298,15 +288,6 @@ impl
 }
 
 #[cfg(test)]
-pub(crate) fn test_layout_profile() -> RpgMakerWriteBackLayoutProfile {
-    RpgMakerWriteBackLayoutProfile::new(
-        MaxFullwidthChars::new(24).expect("测试对话宽度应该合法"),
-        MaxFullwidthChars::new(30).expect("测试滚动文本宽度应该合法"),
-        MaxFullwidthChars::new(18).expect("测试帮助说明宽度应该合法"),
-    )
-}
-
-#[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
@@ -474,16 +455,7 @@ mod tests {
                 LanguageId::parse("ja").expect("测试源语言应合法"),
                 LanguageId::parse("zh-Hans").expect("测试目标语言应合法"),
             ),
-            profile(),
         )
-    }
-
-    fn profile() -> RpgMakerWriteBackLayoutProfile {
-        RpgMakerWriteBackLayoutProfile::new(width(24), width(30), width(18))
-    }
-
-    fn width(value: u32) -> MaxFullwidthChars {
-        MaxFullwidthChars::new(value).expect("测试宽度应该是正整数")
     }
 
     fn succeeding_service() -> ExistingProjectOpeningService<
@@ -544,7 +516,6 @@ mod tests {
             opened.source_snapshot_fingerprint(),
             SourceSnapshotFingerprint::from_bytes([0xa5; 32])
         );
-        assert_eq!(opened.layout_profile(), &profile());
         assert_eq!(
             service
                 .record_reader

@@ -9,12 +9,17 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
 use crate::diagnostic::{
-    GenericResponseDestinationProblem, GenericResponseTextProblem, GenericResponseValueProblem,
-    GenericTaskResponseProblem, GenericUnitLocator as DiagnosticGenericUnitLocator,
+    GenericPlaceholderMultisetProblem, GenericResponseDestinationProblem,
+    GenericResponseTextProblem, GenericResponseValueProblem, GenericTaskResponseProblem,
+    GenericUnitLocator as DiagnosticGenericUnitLocator,
 };
 use crate::execution::CooperativeCancellation;
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::language::LanguagePair;
+use crate::translation::TranslationOrigin;
+use crate::translation::candidate_validation::{
+    ProvenInvariantViolation, ReviewFinding, validate_reflowed_candidate_text_with_cancellation,
+};
 use crate::translation::planning_resource::CompiledTerminology;
 use crate::translation::task_planning::{
     StableGroupCharacters, TaskId, TaskPlanningError, TaskPlanningGroupLayout, TaskPlanningLayout,
@@ -36,7 +41,7 @@ use super::identity::{
 use super::placeholder::GenericProtectedText;
 use super::project::{
     GenericProject, GenericStoredGroup, GenericStoredSnapshot, GenericStoredTranslation,
-    GenericStoredUnit, TranslationClear, TranslationOrigin, TranslationWrite,
+    GenericStoredUnit, RejectedTranslationWrite, TranslationClear, TranslationWrite,
 };
 
 /// 一个 Generic Unit 的项目全局稳定位置。
@@ -116,6 +121,13 @@ impl GenericPlanningUnitLocator {
             _ => None,
         }
     }
+}
+
+/// Generic 面向人的自然 Unit ID。所有导出、Placeholder 精确目标和 Rejected 状态共用
+/// 这一表达，不能从数据库随机身份反推。
+pub(crate) fn readable_generic_unit_id(relative_path: &Path, line: usize, unit: usize) -> String {
+    let readable_path = relative_path.to_string_lossy().replace('\\', "/");
+    format!("{readable_path}:line{line}:unit{unit}:text")
 }
 
 /// 以可取消的复合身份查找 Generic Unit。
@@ -279,29 +291,27 @@ pub(crate) struct PlanningUnit {
     expected_state_fingerprint: Sha256Fingerprint,
     expected_previous: Option<GenericStoredTranslation>,
     invalidated_previous: Option<GenericStoredTranslation>,
+    invalidation_violation: Option<ProvenInvariantViolation>,
+    current_rejected: bool,
+    retry_rejected: bool,
 }
 
-/// Current Unit 在完整 TaskBlock 中提供的安全语境。
-///
-/// 无法把目标译文按本 Unit 的 Placeholder 绑定安全保护时，源文仍可供模型理解相邻文本，
-/// 但它不是目标译文，不能成为全局复用的种子。
+/// Current Unit 在完整 TaskBlock 中提供的安全目标语境。
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum CurrentContext {
     SafeTarget(String),
-    ProtectedSourceFallback(String),
 }
 
 impl CurrentContext {
     fn text(&self) -> &str {
         match self {
-            Self::SafeTarget(text) | Self::ProtectedSourceFallback(text) => text,
+            Self::SafeTarget(text) => text,
         }
     }
 
     fn reuse_candidate(&self) -> Option<&str> {
         match self {
             Self::SafeTarget(text) => Some(text),
-            Self::ProtectedSourceFallback(_) => None,
         }
     }
 }
@@ -329,6 +339,7 @@ struct StoredPlanningUnitInput<'a> {
     terminology_indices: Vec<usize>,
     needs_translation: bool,
     resources: AutomaticStateResources,
+    retry_rejected: bool,
 }
 
 impl PlanningUnit {
@@ -357,6 +368,9 @@ impl PlanningUnit {
             expected_state_fingerprint,
             expected_previous: None,
             invalidated_previous: None,
+            invalidation_violation: None,
+            current_rejected: false,
+            retry_rejected: false,
         }
     }
 
@@ -372,6 +386,7 @@ impl PlanningUnit {
             input.terminology_indices,
             input.needs_translation,
             input.resources,
+            input.retry_rejected,
             &CooperativeCancellation::default(),
         )
         .expect("不取消的受信 PlanningUnit 必须可以建立")
@@ -387,6 +402,7 @@ impl PlanningUnit {
         terminology_indices: Vec<usize>,
         needs_translation: bool,
         resources: AutomaticStateResources,
+        retry_rejected: bool,
         cancellation: &CooperativeCancellation,
     ) -> Result<Self, GenericPlanningError> {
         ensure_translation_not_cancelled(cancellation)?;
@@ -416,6 +432,18 @@ impl PlanningUnit {
             .translation()
             .map(|translation| clone_stored_translation(translation, cancellation))
             .transpose()?;
+        let source_lines = unit.source_text().split('\n').collect::<Vec<_>>();
+        let current_rejected = current_translation.is_none()
+            && unit.rejected().is_some_and(|rejected| {
+                rejected.source.len() == source_lines.len()
+                    && rejected
+                        .source
+                        .iter()
+                        .zip(&source_lines)
+                        .all(|(stored, current)| stored == current)
+                    && rejected.group_context == group.context_fingerprint()
+                    && rejected.planning_state == automatic_state
+            });
         let (expected_previous, invalidated_previous) = if current_translation.is_some() {
             (previous, None)
         } else {
@@ -439,6 +467,9 @@ impl PlanningUnit {
             expected_state_fingerprint: automatic_state,
             expected_previous,
             invalidated_previous,
+            invalidation_violation: None,
+            current_rejected,
+            retry_rejected,
         })
     }
 
@@ -451,7 +482,16 @@ impl PlanningUnit {
     }
 
     pub(crate) fn needs_candidate(&self) -> bool {
-        self.needs_translation && self.current_translation.is_none()
+        self.needs_translation
+            && self.current_translation.is_none()
+            && (!self.current_rejected || self.retry_rejected)
+    }
+
+    pub(crate) const fn is_skipped_rejected(&self) -> bool {
+        self.needs_translation
+            && self.current_translation.is_none()
+            && self.current_rejected
+            && !self.retry_rejected
     }
 
     pub(crate) fn current_translation(&self) -> Option<&str> {
@@ -470,13 +510,17 @@ impl PlanningUnit {
         self.current_context = Some(CurrentContext::SafeTarget(context_text));
     }
 
-    /// 目标译文无法安全投影时，安装只供模型理解相邻语义的保护后源文。
-    pub(crate) fn install_current_source_fallback(&mut self, context_text: String) {
+    /// 把当前候选正文原样交给 Rejected，并使本轮默认不再请求同一 Unit。
+    pub(crate) fn reject_invalid_current(&mut self, violation: ProvenInvariantViolation) {
         assert!(
             self.current_translation.is_some(),
-            "只有 Current Unit 才能安装源文回退语境"
+            "只有 Current Unit 才能因强不变量失效"
         );
-        self.current_context = Some(CurrentContext::ProtectedSourceFallback(context_text));
+        self.current_translation = None;
+        self.current_context = None;
+        self.invalidated_previous = self.expected_previous.take();
+        self.invalidation_violation = Some(violation);
+        self.current_rejected = true;
     }
 }
 
@@ -532,9 +576,12 @@ pub(crate) fn current_translation_for_stored_with_cancellation(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PlannedInvalidation {
     key: GenericUnitKey,
+    readable_id: String,
     expected_source_text: String,
     expected_group_context: Sha256Fingerprint,
     expected_translation: GenericStoredTranslation,
+    violation: Option<ProvenInvariantViolation>,
+    rejection_planning_state: Sha256Fingerprint,
 }
 
 impl PlannedInvalidation {
@@ -542,9 +589,12 @@ impl PlannedInvalidation {
         TranslationClear {
             group_id: self.key.group_id,
             unit_id: self.key.unit_id,
+            readable_id: self.readable_id,
             expected_source_text: self.expected_source_text,
             expected_group_context: self.expected_group_context,
             expected_translation: self.expected_translation,
+            violation: self.violation,
+            rejection_planning_state: self.rejection_planning_state,
         }
     }
 }
@@ -655,6 +705,7 @@ struct PlannedDestination {
     key: GenericUnitKey,
     locator: GenericPlanningUnitLocator,
     expected_source_text: String,
+    expected_source: Vec<String>,
     expected_group_context: Sha256Fingerprint,
     expected_state_fingerprint: Sha256Fingerprint,
     expected_previous: Option<GenericStoredTranslation>,
@@ -700,6 +751,7 @@ pub(crate) struct TranslationPlan {
     invalidations: Vec<PlannedInvalidation>,
     reused: Vec<PlannedReuse>,
     tasks: Vec<PlannedTask>,
+    skipped_rejected: usize,
 }
 
 impl TranslationPlan {
@@ -724,8 +776,14 @@ impl TranslationPlan {
         Vec<PlannedInvalidation>,
         Vec<PlannedReuse>,
         Vec<PlannedTask>,
+        usize,
     ) {
-        (self.invalidations, self.reused, self.tasks)
+        (
+            self.invalidations,
+            self.reused,
+            self.tasks,
+            self.skipped_rejected,
+        )
     }
 }
 
@@ -1022,8 +1080,13 @@ where
     for fact in &facts {
         ensure_planning_not_cancelled(&is_cancelled)?;
         if let Some(expected_translation) = fact.input.invalidated_previous.as_ref() {
+            let (line, unit) = fact
+                .locator
+                .natural_position()
+                .expect("数据库自然快照中的 Generic Unit 必须有自然位置");
             invalidations.push(PlannedInvalidation {
                 key: clone_planning_key_with_cancellation(&fact.key, &is_cancelled)?,
+                readable_id: readable_generic_unit_id(fact.locator.relative_path(), line, unit),
                 expected_source_text: clone_planning_text_with_cancellation(
                     fact.source_text,
                     &is_cancelled,
@@ -1033,6 +1096,8 @@ where
                     expected_translation,
                     &is_cancelled,
                 )?,
+                violation: fact.input.invalidation_violation.clone(),
+                rejection_planning_state: fact.input.expected_state_fingerprint,
             });
         }
     }
@@ -1135,7 +1200,7 @@ where
         for unit_index in &family.members {
             ensure_planning_not_cancelled(&is_cancelled)?;
             let fact = &facts[*unit_index];
-            if fact.input.needs_translation && fact.input.current_translation.is_none() {
+            if fact.input.needs_candidate() {
                 unresolved.push(*unit_index);
             }
         }
@@ -1158,6 +1223,10 @@ where
                         key: clone_planning_key_with_cancellation(&fact.key, &is_cancelled)?,
                         locator: fact.locator.clone(),
                         expected_source_text: clone_planning_text_with_cancellation(
+                            fact.source_text,
+                            &is_cancelled,
+                        )?,
+                        expected_source: clone_planning_source_lines_with_cancellation(
                             fact.source_text,
                             &is_cancelled,
                         )?,
@@ -1196,6 +1265,10 @@ where
                     key: clone_planning_key_with_cancellation(&fact.key, &is_cancelled)?,
                     locator: fact.locator.clone(),
                     expected_source_text: clone_planning_text_with_cancellation(
+                        fact.source_text,
+                        &is_cancelled,
+                    )?,
+                    expected_source: clone_planning_source_lines_with_cancellation(
                         fact.source_text,
                         &is_cancelled,
                     )?,
@@ -1270,6 +1343,10 @@ where
                 key: clone_planning_key_with_cancellation(&fact.key, &is_cancelled)?,
                 locator: fact.locator.clone(),
                 expected_source_text: clone_planning_text_with_cancellation(
+                    fact.source_text,
+                    &is_cancelled,
+                )?,
+                expected_source: clone_planning_source_lines_with_cancellation(
                     fact.source_text,
                     &is_cancelled,
                 )?,
@@ -1373,6 +1450,10 @@ where
         invalidations,
         reused,
         tasks,
+        skipped_rejected: facts
+            .iter()
+            .filter(|fact| fact.input.is_skipped_rejected())
+            .count(),
     })
 }
 
@@ -1512,6 +1593,18 @@ fn clone_planning_text_with_cancellation(
     Ok(output)
 }
 
+fn clone_planning_source_lines_with_cancellation(
+    text: &str,
+    is_cancelled: &impl Fn() -> bool,
+) -> Result<Vec<String>, GenericPlanningError> {
+    let mut lines = Vec::new();
+    for line in text.split('\n') {
+        ensure_planning_not_cancelled(is_cancelled)?;
+        lines.push(clone_planning_text_with_cancellation(line, is_cancelled)?);
+    }
+    Ok(lines)
+}
+
 fn planning_text_equal_with_cancellation(
     left: &str,
     right: &str,
@@ -1587,6 +1680,54 @@ pub(crate) struct AcceptedTranslation {
     expected_previous: Option<GenericStoredTranslation>,
 }
 
+/// 一个已绑定到当前规划事实、只因硬不变量而未能入库的候选。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RejectedTranslation {
+    key: GenericUnitKey,
+    locator: GenericPlanningUnitLocator,
+    origin: TranslationOrigin,
+    candidate_json: String,
+    translation: Option<Vec<String>>,
+    expected_source_text: String,
+    source: Vec<String>,
+    expected_group_context: Sha256Fingerprint,
+    violation: ProvenInvariantViolation,
+    planning_state: Sha256Fingerprint,
+}
+
+impl RejectedTranslation {
+    pub(crate) fn into_write(self) -> RejectedTranslationWrite {
+        let readable_id = self.locator.natural_position().map_or_else(
+            || {
+                let readable_path = self
+                    .locator
+                    .relative_path()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                format!(
+                    "{readable_path}:{}:{}:text",
+                    self.key.group_id(),
+                    self.key.unit_id()
+                )
+            },
+            |(line, unit)| readable_generic_unit_id(self.locator.relative_path(), line, unit),
+        );
+        RejectedTranslationWrite {
+            group_id: self.key.group_id,
+            unit_id: self.key.unit_id,
+            readable_id,
+            origin: self.origin,
+            expected_source_text: self.expected_source_text,
+            source: self.source,
+            expected_group_context: self.expected_group_context,
+            candidate_json: self.candidate_json,
+            translation: self.translation,
+            violation: self.violation,
+            planning_state: self.planning_state,
+        }
+    }
+}
+
 impl AcceptedTranslation {
     pub(crate) fn into_write(self) -> TranslationWrite {
         TranslationWrite {
@@ -1604,11 +1745,47 @@ impl AcceptedTranslation {
 /// 可解析响应中单个 ID 的安全问题；日志与任务记录直接复用这一封闭类型。
 pub(crate) type ResponseProblem = GenericTaskResponseProblem;
 
+/// 一个有效 Generic 目标译文附带的非阻塞质量审核事实。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TranslationReview {
+    output_id: TaskId,
+    locator: GenericPlanningUnitLocator,
+    finding: ReviewFinding,
+}
+
+impl TranslationReview {
+    pub(crate) fn new(
+        output_id: TaskId,
+        locator: GenericPlanningUnitLocator,
+        finding: ReviewFinding,
+    ) -> Self {
+        Self {
+            output_id,
+            locator,
+            finding,
+        }
+    }
+
+    pub(crate) const fn output_id(&self) -> TaskId {
+        self.output_id
+    }
+
+    pub(crate) fn locator(&self) -> &GenericPlanningUnitLocator {
+        &self.locator
+    }
+
+    pub(crate) fn finding(&self) -> &ReviewFinding {
+        &self.finding
+    }
+}
+
 /// 一次响应的部分验收结果。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TranslationAcceptance {
     accepted: Vec<AcceptedTranslation>,
+    rejected: Vec<RejectedTranslation>,
     problems: Vec<ResponseProblem>,
+    reviews: Vec<TranslationReview>,
     accepted_output_count: usize,
 }
 
@@ -1616,6 +1793,11 @@ impl TranslationAcceptance {
     #[cfg(test)]
     pub(crate) fn accepted(&self) -> &[AcceptedTranslation] {
         &self.accepted
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rejected(&self) -> &[RejectedTranslation] {
+        &self.rejected
     }
 
     #[cfg(test)]
@@ -1628,8 +1810,19 @@ impl TranslationAcceptance {
         self.accepted_output_count
     }
 
-    pub(crate) fn into_parts(self) -> (Vec<AcceptedTranslation>, Vec<ResponseProblem>) {
-        (self.accepted, self.problems)
+    pub(crate) fn append_reviews(&mut self, reviews: &mut Vec<TranslationReview>) {
+        self.reviews.append(reviews);
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Vec<AcceptedTranslation>,
+        Vec<RejectedTranslation>,
+        Vec<ResponseProblem>,
+        Vec<TranslationReview>,
+    ) {
+        (self.accepted, self.rejected, self.problems, self.reviews)
     }
 }
 
@@ -1724,6 +1917,7 @@ where
     }
 
     let mut accepted = Vec::new();
+    let mut rejected = Vec::new();
     let mut problems = Vec::new();
     let mut accepted_output_count = 0;
     let mut observed = HashSet::new();
@@ -1761,6 +1955,21 @@ where
         let candidate = match generic_translation_candidate(decoded, &is_cancelled)? {
             Ok(candidate) => candidate,
             Err(problem) => {
+                let destinations = std::mem::take(
+                    outputs
+                        .get_mut(&output_id)
+                        .expect("已确认的模型输出必须仍属于当前 Generic 任务"),
+                );
+                let candidate_json =
+                    clone_planning_text_with_cancellation(entry.raw_value().get(), &is_cancelled)?;
+                for destination in destinations {
+                    rejected.push(rejected_generic_destination(
+                        destination,
+                        candidate_json.clone(),
+                        None,
+                        ProvenInvariantViolation::InvalidCandidateShape,
+                    ));
+                }
                 problems.push(ResponseProblem::InvalidValue {
                     output_id: response_output_id(output_id),
                     problem,
@@ -1768,25 +1977,43 @@ where
                 continue;
             }
         };
-        if let Err(problem) = validate_candidate_text_with_cancellation(&candidate, &is_cancelled)?
+        let destinations = std::mem::take(
+            outputs
+                .get_mut(&output_id)
+                .expect("已确认的模型输出必须仍属于当前 Generic 任务"),
+        );
+        if let Err(problem) =
+            validate_candidate_text_with_cancellation(&candidate.text, &is_cancelled)?
         {
+            let violation = generic_text_problem_violation(problem, &candidate.lines);
+            for destination in destinations {
+                rejected.push(rejected_generic_destination(
+                    destination,
+                    candidate.candidate_json.clone(),
+                    Some(candidate.lines.clone()),
+                    violation.clone(),
+                ));
+            }
             problems.push(ResponseProblem::InvalidTranslation {
                 output_id: response_output_id(output_id),
                 problem,
             });
             continue;
         }
-        let destinations = std::mem::take(
-            outputs
-                .get_mut(&output_id)
-                .expect("已确认的模型输出必须仍属于当前 Generic 任务"),
-        );
         let mut output_accepted = false;
         for destination in destinations {
             ensure_planning_not_cancelled(&is_cancelled)?;
-            let candidate = match validator(output_id, &destination.key, &candidate)? {
+            let validated_text = match validator(output_id, &destination.key, &candidate.text)? {
                 Ok(candidate) => candidate,
                 Err(problem) => {
+                    if let Some(violation) = generic_destination_violation(&problem) {
+                        rejected.push(rejected_generic_destination(
+                            destination.clone(),
+                            candidate.candidate_json.clone(),
+                            Some(candidate.lines.clone()),
+                            violation,
+                        ));
+                    }
                     problems.push(ResponseProblem::InvalidDestination {
                         output_id: response_output_id(output_id),
                         destination: diagnostic_response_locator(&destination.locator),
@@ -1797,8 +2024,19 @@ where
             };
             ensure_planning_not_cancelled(&is_cancelled)?;
             if let Err(problem) =
-                validate_candidate_text_with_cancellation(&candidate, &is_cancelled)?
+                validate_candidate_text_with_cancellation(&validated_text, &is_cancelled)?
             {
+                let rejected_lines = validated_text
+                    .split('\n')
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                rejected.push(rejected_generic_destination(
+                    destination.clone(),
+                    serde_json::to_string(&rejected_lines)
+                        .expect("Generic 候选字符串数组必须可以编码"),
+                    Some(rejected_lines.clone()),
+                    generic_text_problem_violation(problem, &rejected_lines),
+                ));
                 problems.push(ResponseProblem::InvalidDestination {
                     output_id: response_output_id(output_id),
                     destination: diagnostic_response_locator(&destination.locator),
@@ -1808,7 +2046,7 @@ where
             }
             accepted.push(AcceptedTranslation {
                 key: destination.key,
-                translation: candidate,
+                translation: validated_text,
                 expected_source_text: destination.expected_source_text,
                 expected_group_context: destination.expected_group_context,
                 expected_state_fingerprint: destination.expected_state_fingerprint,
@@ -1831,7 +2069,9 @@ where
     ensure_planning_not_cancelled(&is_cancelled)?;
     Ok(TranslationAcceptance {
         accepted,
+        rejected,
         problems,
+        reviews: Vec::new(),
         accepted_output_count,
     })
 }
@@ -1855,10 +2095,107 @@ fn diagnostic_response_locator(
     }
 }
 
+fn rejected_generic_destination(
+    destination: PlannedDestination,
+    candidate_json: String,
+    translation: Option<Vec<String>>,
+    violation: ProvenInvariantViolation,
+) -> RejectedTranslation {
+    RejectedTranslation {
+        key: destination.key,
+        locator: destination.locator,
+        origin: TranslationOrigin::Automatic,
+        candidate_json,
+        translation,
+        expected_source_text: destination.expected_source_text,
+        source: destination.expected_source,
+        expected_group_context: destination.expected_group_context,
+        violation,
+        planning_state: destination.expected_state_fingerprint,
+    }
+}
+
+fn generic_text_problem_violation(
+    problem: GenericResponseTextProblem,
+    translation: &[String],
+) -> ProvenInvariantViolation {
+    match problem {
+        GenericResponseTextProblem::Blank => ProvenInvariantViolation::BlankTranslation,
+        GenericResponseTextProblem::CarriageReturn => ProvenInvariantViolation::InvalidLineText {
+            line_index: translation
+                .iter()
+                .position(|line| line.contains('\r'))
+                .unwrap_or_default(),
+        },
+        GenericResponseTextProblem::Nul => ProvenInvariantViolation::InvalidLineText {
+            line_index: translation
+                .iter()
+                .position(|line| line.contains('\0'))
+                .unwrap_or_default(),
+        },
+        GenericResponseTextProblem::ByteOrderMark => {
+            ProvenInvariantViolation::ContainsByteOrderMark {
+                line_index: translation
+                    .iter()
+                    .position(|line| line.contains('\u{feff}'))
+                    .unwrap_or_default(),
+            }
+        }
+    }
+}
+
+fn generic_destination_violation(
+    problem: &GenericResponseDestinationProblem,
+) -> Option<ProvenInvariantViolation> {
+    match problem {
+        GenericResponseDestinationProblem::PlaceholderRestoreMultiset { problem } => {
+            Some(match problem {
+                GenericPlaceholderMultisetProblem::Unexpected => {
+                    ProvenInvariantViolation::UnexpectedPlaceholderToken
+                }
+                GenericPlaceholderMultisetProblem::Mismatch
+                | GenericPlaceholderMultisetProblem::OrderMismatch => {
+                    ProvenInvariantViolation::PlaceholderMismatch
+                }
+            })
+        }
+        GenericResponseDestinationProblem::PlaceholderProtection { .. }
+        | GenericResponseDestinationProblem::PlaceholderBindingMismatch => {
+            Some(ProvenInvariantViolation::PlaceholderMismatch)
+        }
+        GenericResponseDestinationProblem::PlaceholderRestoreProjection { .. }
+        | GenericResponseDestinationProblem::LanguageProjection { .. }
+        | GenericResponseDestinationProblem::PlaceholderBoundaryAdded
+        | GenericResponseDestinationProblem::PlaceholderBoundaryRemoved => {
+            Some(ProvenInvariantViolation::PlaceholderBoundaryChanged)
+        }
+        GenericResponseDestinationProblem::ReservedToken => {
+            Some(ProvenInvariantViolation::ReservedPlaceholderToken)
+        }
+        GenericResponseDestinationProblem::InvalidTranslation { problem } => {
+            Some(generic_text_problem_violation(*problem, &[]))
+        }
+        GenericResponseDestinationProblem::MissingPlanningFact
+        | GenericResponseDestinationProblem::ValidatorRejected
+        | GenericResponseDestinationProblem::InvalidPlaceholderSnapshot { .. }
+        | GenericResponseDestinationProblem::PlaceholderCompilation { .. }
+        | GenericResponseDestinationProblem::LanguageAnalysisMismatch
+        | GenericResponseDestinationProblem::RepairPlanningMismatch
+        | GenericResponseDestinationProblem::RepairApplication { .. } => None,
+    }
+}
+
+struct GenericTranslationCandidate {
+    lines: Vec<String>,
+    text: String,
+    candidate_json: String,
+}
+
 fn generic_translation_candidate(
     decoded: DecodedTranslationAssistantValue,
     is_cancelled: &impl Fn() -> bool,
-) -> Result<Result<String, GenericResponseValueProblem>, GenericPlanningError> {
+) -> Result<Result<GenericTranslationCandidate, GenericResponseValueProblem>, GenericPlanningError>
+{
     let translation = match decoded {
         DecodedTranslationAssistantValue::Translation(translation) => translation,
         DecodedTranslationAssistantValue::SourceEcho(DecodedSourceEchoValue::Fields {
@@ -1884,7 +2221,13 @@ fn generic_translation_candidate(
             return Ok(Err(response_string_array_shape_problem(invalid, false)));
         }
     };
-    join_translation_lines_with_cancellation(lines, is_cancelled).map(Ok)
+    let text = join_translation_lines_with_cancellation(&lines, is_cancelled)?;
+    let candidate_json = serde_json::to_string(&lines).expect("Generic 候选字符串数组必须可以编码");
+    Ok(Ok(GenericTranslationCandidate {
+        lines,
+        text,
+        candidate_json,
+    }))
 }
 
 fn validate_response_string_array_shape(
@@ -1939,7 +2282,7 @@ fn source_echo_fields_problem(error: DecodedSourceEchoFieldsError) -> GenericRes
 }
 
 fn join_translation_lines_with_cancellation(
-    lines: Vec<String>,
+    lines: &[String],
     is_cancelled: &impl Fn() -> bool,
 ) -> Result<String, GenericPlanningError> {
     let capacity = lines.iter().try_fold(0_usize, |capacity, line| {
@@ -1964,27 +2307,34 @@ fn validate_candidate_text_with_cancellation(
     candidate: &str,
     is_cancelled: &impl Fn() -> bool,
 ) -> Result<Result<(), GenericResponseTextProblem>, GenericPlanningError> {
-    const CANCELLATION_CHECK_CHARACTERS: usize = 16 * 1024;
-
-    let mut has_non_whitespace = false;
-    for (index, character) in candidate.chars().enumerate() {
-        if index.is_multiple_of(CANCELLATION_CHECK_CHARACTERS) {
-            ensure_planning_not_cancelled(is_cancelled)?;
-        }
-        if character == '\r' {
-            return Ok(Err(GenericResponseTextProblem::CarriageReturn));
-        }
-        if character == '\0' {
-            return Ok(Err(GenericResponseTextProblem::Nul));
-        }
-        has_non_whitespace |= !character.is_whitespace();
-    }
-    ensure_planning_not_cancelled(is_cancelled)?;
-    if has_non_whitespace {
-        Ok(Ok(()))
-    } else {
-        Ok(Err(GenericResponseTextProblem::Blank))
-    }
+    Ok(
+        validate_reflowed_candidate_text_with_cancellation(candidate, || {
+            ensure_planning_not_cancelled(is_cancelled)
+        })?
+        .map_err(|violation| match violation {
+            ProvenInvariantViolation::BlankTranslation => GenericResponseTextProblem::Blank,
+            ProvenInvariantViolation::InvalidLineText { .. } => {
+                if candidate.contains('\r') {
+                    GenericResponseTextProblem::CarriageReturn
+                } else {
+                    GenericResponseTextProblem::Nul
+                }
+            }
+            ProvenInvariantViolation::ContainsByteOrderMark { .. } => {
+                GenericResponseTextProblem::ByteOrderMark
+            }
+            ProvenInvariantViolation::LineCountMismatch { .. }
+            | ProvenInvariantViolation::FixedBlankSlotChanged { .. }
+            | ProvenInvariantViolation::FixedNonBlankSlotEmptied { .. }
+            | ProvenInvariantViolation::PlaceholderMismatch
+            | ProvenInvariantViolation::UnexpectedPlaceholderToken
+            | ProvenInvariantViolation::PlaceholderBoundaryChanged
+            | ProvenInvariantViolation::ReservedPlaceholderToken
+            | ProvenInvariantViolation::InvalidCandidateShape => {
+                unreachable!("自由文本校验不会产生固定槽或 Placeholder 违反项")
+            }
+        }),
+    )
 }
 
 /// 建立自动译文 Current 所需的完整语义状态。
@@ -2175,8 +2525,8 @@ mod tests {
 
     use super::*;
     use crate::generic::project::{
-        GenericProject, GenericStoredFile, GenericStoredGroup, GenericStoredSnapshot,
-        GenericStoredTranslation, GenericStoredUnit,
+        GenericProject, GenericStoredFile, GenericStoredGroup, GenericStoredRejectedTranslation,
+        GenericStoredSnapshot, GenericStoredTranslation, GenericStoredUnit,
     };
 
     fn fingerprint(value: u8) -> Sha256Fingerprint {
@@ -2263,6 +2613,7 @@ mod tests {
                                 origin: TranslationOrigin::Automatic,
                                 state_fingerprint: fingerprint(90),
                             }),
+                            rejected: None,
                         },
                     )
                     .collect(),
@@ -2357,6 +2708,7 @@ mod tests {
                                 )
                                 .to_string(),
                                 translation: None,
+                                rejected: None,
                             }],
                         }
                     })
@@ -2589,6 +2941,7 @@ mod tests {
                     origin: TranslationOrigin::Manual,
                     state_fingerprint: fingerprint(11),
                 }),
+                rejected: None,
             }],
         });
         let mut planning_units = planning(&snapshot);
@@ -2706,6 +3059,7 @@ mod tests {
                 ordinal: 0,
                 source_text: "同文".to_owned(),
                 translation: None,
+                rejected: None,
             }],
         });
 
@@ -2777,6 +3131,7 @@ mod tests {
                 ordinal: 0,
                 source_text: "同文".to_owned(),
                 translation: None,
+                rejected: None,
             }],
         });
 
@@ -2844,6 +3199,7 @@ mod tests {
             terminology_indices: Vec::new(),
             needs_translation: true,
             resources,
+            retry_rejected: false,
         });
         assert_eq!(
             current.current_translation(),
@@ -2865,6 +3221,7 @@ mod tests {
             terminology_indices: Vec::new(),
             needs_translation: true,
             resources: changed_resources,
+            retry_rejected: false,
         });
         assert!(stale.current_translation().is_none());
 
@@ -2885,8 +3242,88 @@ mod tests {
             terminology_indices: Vec::new(),
             needs_translation: true,
             resources: changed_resources,
+            retry_rejected: false,
         });
         assert_eq!(current.current_translation(), Some("人工修订"));
+    }
+
+    #[test]
+    fn current_rejected_is_skipped_by_default_and_retry_adds_it_to_pending() {
+        let mut snapshot = stored_snapshot();
+        snapshot.files.truncate(1);
+        snapshot.files[0].groups.truncate(1);
+        snapshot.files[0].groups[0].units.truncate(1);
+        let project = snapshot.project().clone();
+        let group = snapshot.files[0].groups[0].clone();
+        let original = group.units[0].clone();
+        let service = super::super::placeholder::GenericPlaceholderService::default();
+        let rules = service.compile(Vec::new()).unwrap();
+        let protected = service
+            .protect(group.kind(), original.source_text(), &rules)
+            .unwrap();
+        let resources = AutomaticStateResources {
+            prompt: fingerprint(51),
+            client_semantics: fingerprint(52),
+            language_module: fingerprint(53),
+            terminology_hits: fingerprint(54),
+        };
+        let key = GenericUnitKey::new(group.id().to_owned(), original.id().to_owned());
+        let state = automatic_translation_state_fingerprint(
+            project.language_pair(),
+            &key,
+            original.source_text(),
+            group.context_fingerprint(),
+            protected.binding_fingerprint(),
+            resources,
+        );
+        snapshot.files[0].groups[0].units[0].rejected = Some(GenericStoredRejectedTranslation {
+            readable_id: "a.jsonl:line1:unit1:text".to_owned(),
+            origin: TranslationOrigin::Automatic,
+            source: vec![original.source_text().to_owned()],
+            candidate_json: "true".to_owned(),
+            translation: None,
+            group_context: group.context_fingerprint(),
+            violation: ProvenInvariantViolation::InvalidCandidateShape,
+            planning_state: state,
+        });
+
+        let make_planning = |retry_rejected| {
+            PlanningUnit::from_stored(StoredPlanningUnitInput {
+                relative_path: Path::new("a.jsonl"),
+                project: &project,
+                group: &group,
+                unit: &snapshot.files[0].groups[0].units[0],
+                protected: &protected,
+                terminology_indices: Vec::new(),
+                needs_translation: true,
+                resources,
+                retry_rejected,
+            })
+        };
+        let default = make_planning(false);
+        assert!(!default.needs_candidate());
+        assert!(default.is_skipped_rejected());
+        let plan = plan_translation(&snapshot, &[default], |_, candidate| {
+            Ok(candidate.to_owned())
+        })
+        .unwrap();
+        assert!(plan.tasks().is_empty());
+        assert_eq!(plan.skipped_rejected, 1);
+
+        let retried = make_planning(true);
+        assert!(retried.needs_candidate());
+        let plan = plan_translation(&snapshot, &[retried], |_, candidate| {
+            Ok(candidate.to_owned())
+        })
+        .unwrap();
+        assert_eq!(
+            plan.tasks()
+                .iter()
+                .map(PlannedTask::unit_count)
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(plan.skipped_rejected, 0);
     }
 
     #[test]
@@ -2906,6 +3343,12 @@ mod tests {
         .expect("object 可解析");
 
         assert_eq!(acceptance.accepted().len(), 2, "同文族传播到两个 Unit");
+        assert_eq!(acceptance.rejected().len(), 1);
+        assert_eq!(acceptance.rejected()[0].candidate_json, "3");
+        assert_eq!(
+            acceptance.rejected()[0].violation,
+            ProvenInvariantViolation::InvalidCandidateShape
+        );
         assert!(acceptance.problems().iter().any(|problem| matches!(
             problem,
             ResponseProblem::InvalidValue { output_id, .. } if *output_id == 1
@@ -3142,6 +3585,10 @@ mod tests {
         )
         .expect("公共协议应保留重复项，交给逐 ID 验收");
         assert!(acceptance.accepted().is_empty());
+        assert!(
+            acceptance.rejected().is_empty(),
+            "重复或缺失 ID 无法唯一绑定当前 Unit，不得替换已有 Rejected"
+        );
         assert_eq!(
             acceptance.problems(),
             [

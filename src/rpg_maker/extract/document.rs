@@ -2149,7 +2149,6 @@ var $plugins =
             PathBuf::from("C:/projects/demo/project.db"),
             "ja".to_owned(),
             "zh-Hans".to_owned(),
-            crate::rpg_maker::project::test_layout_profile(),
         )
     }
 

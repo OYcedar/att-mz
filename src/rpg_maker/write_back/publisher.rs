@@ -993,7 +993,6 @@ mod tests {
             workspace_root.join("project.db"),
             "ja".to_owned(),
             "zh-Hans".to_owned(),
-            crate::rpg_maker::project::test_layout_profile(),
         )
     }
 

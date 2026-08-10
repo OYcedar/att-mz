@@ -9,6 +9,8 @@ cli-translate-about = ترجمة النص المستخرج باستخدام Prof
 cli-write-back-about = كتابة الترجمات الحالية إلى مخرجات المشروع
 cli-manual-about = إدارة الترجمات اليدوية في ملف TOML قابل للتحرير
 cli-manual-export-about = تصدير العناصر التي تحتاج حاليًا إلى ترجمة يدوية
+cli-ownership-export-about = تصدير ملكية النص لكل وحدة RPG Maker مستخرجة
+cli-translation-export-about = تصدير النص المصدر والترجمة الحالية والحالة لكل وحدة مستخرجة
 cli-manual-check-about = فحص ملف TOML للترجمات اليدوية دون تعديل المشروع
 cli-manual-apply-about = تطبيق الترجمات اليدوية المكتملة والصحيحة
 cli-project-lua-about = تشغيل برنامج Lua نصي على قاعدة بيانات المشروع
@@ -16,9 +18,6 @@ cli-project-name-help = اسم المشروع الثابت
 cli-init-path-help = دليل جذر الإدخال؛ يمكن للمشروع الموجود إعادة استخدام آخر مسار ناجح
 cli-source-language-help = معرّف لغة المصدر
 cli-target-language-help = معرّف اللغة الهدف
-cli-dialogue-width-help = الحد الأقصى للمحارف كاملة العرض في سطر الحوار
-cli-scrolling-width-help = الحد الأقصى للمحارف كاملة العرض في سطر النص المتمرر
-cli-help-width-help = الحد الأقصى للمحارف كاملة العرض في سطر المساعدة أو الوصف
 cli-builtin-help = استخدام مواضع نص RPG Maker المضمنة في ATT
 cli-rules-help = استبدال قواعد استخراج RPG Maker بتعريف TOML هذا؛ القائمة الفارغة تعطّل القواعد
 cli-dialogue-rules-help = استبدال إسقاط أسماء حوار MV المستخدم مع Builtin
@@ -104,12 +103,11 @@ result-translate-convergence = تقارب الحالة: أُبقي { $retained }
 result-write-back-completed = اكتملت الكتابة: { $project }
 result-project-lua-completed = اكتمل تنفيذ Lua للمشروع: { $project }
 result-output-directory = مجلد الإخراج: { $path }
-result-write-back-summary = الكتابة: { $translated } وحدة مترجمة و{ $original } وحدة مصدر؛ التفاف تلقائي { $auto_wrapped }، أضيف { $breaks } فاصل أسطر و{ $indents } إزاحة كاملة العرض؛ يحتاج { $manual } إلى تخطيط يدوي
+result-write-back-summary = الكتابة: { $translated } وحدة مترجمة و{ $original } وحدة مصدر
 result-generic-extract-unchanged = لم تتغير مدخلات Generic: ‏{ $files } ملفًا و{ $groups } مجموعة و{ $units } وحدة
 result-generic-extract-updated = حُدثت مدخلات Generic: ‏{ $files } ملفًا و{ $groups } مجموعة و{ $units } وحدة؛ حُفظت { $preserved } ترجمة ومُسحت { $cleared }
 result-generic-translate-summary = ترجمة Generic: خُطط لـ { $total } مهمة، وبدأت { $started }، ولم تبدأ { $not_started }؛ مكتملة { $complete }، جزئية { $partial }، غير متاحة { $unavailable }، فاشلة { $failed }، ملغاة { $cancelled }؛ وحدات مخططة { $planned_units }، ومتبقية { $remaining_units }، ومُسحت { $cleared }، وأُعيد استخدام { $reused }، وقُبل { $accepted }، وكُتب { $written }، والتعارضات { $conflicted }، ومشكلات الاستجابة { $problems }
 result-generic-write-back-summary = كتابة Generic: ‏{ $translated } وحدة مترجمة مع الاحتفاظ بـ { $original } وحدة مصدر
-result-symbol-repair-summary = إصلاح الرموز: فُحصت { $attempted } وحدة، وأُصلحت { $repaired }، وتُخطيت داخليًا { $skipped }، واستُبدل { $replacements } رمزًا
 result-run-log = سجل التشغيل: { $path }
 translate-incomplete-object = تشغيل Translate للمشروع { $project }
 translate-incomplete-rpg-maker-reason = مهام جزئية: { $partial }، وغير متاحة: { $unavailable }، ولم تبدأ: { $not_started }، ومشكلات بروتوكول: { $protocol }، وطلبات مستنفدة: { $exhausted }؛ قبول الطلبات {
@@ -216,7 +214,6 @@ diagnostic-resolution-value = { $code ->
     [fix_input] صحح الإدخال المحدد ثم أعد المحاولة
     [fix_placeholder_rules] صحح قاعدة Placeholder المحددة ثم أعد المحاولة
     [review_disabled_rules] إذا كانت هذه النتيجة متوقعة فلا يلزم إجراء؛ وإلا فأضف قواعد صالحة إلى الملف المشار إليه ثم شغّل Extract مجددًا
-    [adjust_manual_layout] اضبط فواصل الأسطر والتخطيط يدويا في المواقع المحددة وفقا لعرض الشاشة المذكور
     [check_path_and_permissions] تحقق من المسار وحالة نظام الملفات والأذونات
     [check_project_state] افحص حالة المشروع وصححها ثم أعد المحاولة
     [resolve_contention] انتظر انتهاء العملية المتعارضة ثم أعد المحاولة
@@ -287,7 +284,6 @@ diagnostic-failure-value = { $code ->
     [duplicate_identifier] يوجد معرّف مكرر
     [extraction_out_of_date] لم يعد الاستخراج المحفوظ يطابق المصدر الحالي
     [invalid_content] لا يتوافق المحتوى مع العقد المطلوب
-    [manual_layout_required] يلزم ضبط فواصل الأسطر أو التخطيط يدوياً
     [operation_failed] فشلت العملية
     [placeholder_projection_failed] لم يحافظ إسقاط Placeholder على البنية المطلوبة
     [profile_not_found] Profile الترجمة المحدد غير موجود
@@ -345,7 +341,6 @@ diagnostic-json-position = السطر { $line }، العمود { $column }
 diagnostic-placeholder-rule-file = قاعدة Placeholder رقم { $number } في { $path }
 diagnostic-placeholder-rule-project = قاعدة Placeholder رقم { $number } في المشروع الحالي
 manual-exported = تم تصدير { $entries } إدخالات إلى { $path }
-manual-ownership-exported = سجلات الملكية: { $path }
 manual-checked = صالح { $valid }، غير مملوء { $unfilled }، أخطاء { $errors }
 manual-applied = طُبّق { $applied }، غير مملوء { $unfilled }، أخطاء { $errors }
 manual-value = { $code ->

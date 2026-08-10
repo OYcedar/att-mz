@@ -6,6 +6,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::translation::candidate_validation::is_structural_blank;
+
 use super::text::{RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, TextGroupKind};
 use crate::diagnostic::{RpgMakerDiagnosticRole, RpgMakerProjectionModelViolation};
 
@@ -43,6 +45,12 @@ impl TextUnitRole {
             self,
             Self::DialogueBody | Self::Choices | Self::ScrollingText
         )
+    }
+
+    /// 只有选项和滚动文本的物理数组元素是必须分别保持的 Placeholder 槽位。
+    /// 对话正文允许重新断行，因此按完整 Unit 验证 Placeholder。
+    pub(crate) const fn preserves_placeholder_line_slots(&self) -> bool {
+        matches!(self, Self::Choices | Self::ScrollingText)
     }
 
     /// 角色与文本组语义的唯一匹配规则。
@@ -184,8 +192,8 @@ impl TextUnitContent {
 
     pub(crate) fn is_blank(&self) -> bool {
         match self {
-            Self::Value(value) => value.trim().is_empty(),
-            Self::Lines(lines) => lines.iter().all(|line| line.trim().is_empty()),
+            Self::Value(value) => is_structural_blank(value),
+            Self::Lines(lines) => lines.iter().all(|line| is_structural_blank(line)),
         }
     }
 }
@@ -211,17 +219,6 @@ impl LogicalTextLocation {
 
     pub(crate) fn role(&self) -> &TextUnitRole {
         &self.role
-    }
-
-    #[cfg(test)]
-    pub(crate) fn role_name(&self) -> String {
-        match &self.role {
-            TextUnitRole::Scalar(field) => format!("scalar:{}", field.as_str()),
-            TextUnitRole::DialogueSpeaker => "dialogue_speaker".to_owned(),
-            TextUnitRole::DialogueBody => "dialogue_body".to_owned(),
-            TextUnitRole::Choices => "choices".to_owned(),
-            TextUnitRole::ScrollingText => "scrolling_text".to_owned(),
-        }
     }
 }
 

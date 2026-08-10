@@ -669,8 +669,11 @@ fn generic_failure_after_resource_commit_keeps_saved_plan_and_summary() {
     )
     .expect("应可写入 Generic JSONL");
     let placeholders = root.join("placeholders.toml");
-    fs::write(&placeholders, "[[rule]]\npattern = 'NEVER_MATCH'\n")
-        .expect("应可写入变更后的 Placeholder 规则");
+    fs::write(
+        &placeholders,
+        "[[rule]]\norder = 'preserve'\npattern = 'NEVER_MATCH'\n",
+    )
+    .expect("应可写入变更后的 Placeholder 规则");
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("Provider spy 应可绑定");
     listener

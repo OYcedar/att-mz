@@ -54,10 +54,7 @@ const CREATE_METADATA_TABLE: &str = r#"CREATE TABLE metadata (
     source_snapshot_fingerprint         BLOB NOT NULL CHECK (
         typeof(source_snapshot_fingerprint) = 'blob'
         AND length(source_snapshot_fingerprint) = 32
-    ),
-    dialogue_max_fullwidth_chars        INTEGER NOT NULL CHECK (dialogue_max_fullwidth_chars > 0),
-    scrolling_text_max_fullwidth_chars  INTEGER NOT NULL CHECK (scrolling_text_max_fullwidth_chars > 0),
-    help_description_max_fullwidth_chars INTEGER NOT NULL CHECK (help_description_max_fullwidth_chars > 0)
+    )
 )"#;
 
 const CREATE_RPG_MAKER_ASSET_OWNER_STATE_TABLE: &str = r#"CREATE TABLE rpg_maker_asset_owner_state (
@@ -75,6 +72,7 @@ const CREATE_RPG_MAKER_ASSET_OWNER_STATE_TABLE: &str = r#"CREATE TABLE rpg_maker
 pub(crate) const RPG_MAKER_TEXT_GROUP_TABLE_NAME: &str = "rpg_maker_text_group";
 pub(crate) const RPG_MAKER_TEXT_UNIT_TABLE_NAME: &str = "rpg_maker_text_unit";
 pub(crate) const RPG_MAKER_MANUAL_TRANSLATION_TABLE_NAME: &str = "rpg_maker_manual_translation";
+pub(crate) const RPG_MAKER_REJECTED_TRANSLATION_TABLE_NAME: &str = "rpg_maker_rejected_translation";
 pub(crate) const RPG_MAKER_MUTATION_CLAIM_TABLE_NAME: &str = "rpg_maker_mutation_claim";
 
 const CREATE_RPG_MAKER_TEXT_GROUP_TABLE: &str = r#"CREATE TABLE rpg_maker_text_group (
@@ -164,6 +162,38 @@ const CREATE_RPG_MAKER_MANUAL_TRANSLATION_TABLE: &str = r#"CREATE TABLE rpg_make
     PRIMARY KEY (owner, group_location, unit_role)
 )"#;
 
+const CREATE_RPG_MAKER_REJECTED_TRANSLATION_TABLE: &str = r#"CREATE TABLE rpg_maker_rejected_translation (
+    owner                       TEXT NOT NULL CHECK (owner IN ('builtin', 'rules')),
+    group_id                    INTEGER NOT NULL CHECK (group_id > 0),
+    unit_role                   TEXT NOT NULL CHECK (length(unit_role) > 0),
+    readable_id                 TEXT NOT NULL CHECK (length(readable_id) > 0),
+    origin                      TEXT NOT NULL CHECK (origin IN ('automatic', 'manual')),
+    source_content_json         TEXT NOT NULL CHECK (
+        json_valid(source_content_json)
+        AND json_type(source_content_json) IN ('text', 'array')
+    ),
+    source_context_json         TEXT NOT NULL CHECK (
+        json_valid(source_context_json) AND json_type(source_context_json) = 'object'
+    ),
+    candidate_json              TEXT NOT NULL CHECK (json_valid(candidate_json)),
+    translation_json            TEXT CHECK (
+        translation_json IS NULL OR (
+            json_valid(translation_json)
+            AND json_type(translation_json) = 'array'
+            AND json_array_length(translation_json) > 0
+        )
+    ),
+    violation_json              TEXT NOT NULL CHECK (
+        json_valid(violation_json) AND json_type(violation_json) = 'object'
+    ),
+    planning_state              BLOB NOT NULL CHECK (
+        typeof(planning_state) = 'blob' AND length(planning_state) = 32
+    ),
+    PRIMARY KEY (owner, group_id, unit_role),
+    FOREIGN KEY (owner, group_id, unit_role)
+        REFERENCES rpg_maker_text_unit(owner, group_id, unit_role) ON DELETE CASCADE
+)"#;
+
 pub(crate) const CREATE_RPG_MAKER_TEXT_UNIT_OWNER_GROUP_ORDER_INDEX: &str = "CREATE INDEX rpg_maker_text_unit_owner_group_order_idx ON rpg_maker_text_unit(owner, group_id, semantic_order_key)";
 pub(crate) const DROP_RPG_MAKER_TEXT_UNIT_OWNER_GROUP_ORDER_INDEX: &str =
     "DROP INDEX rpg_maker_text_unit_owner_group_order_idx";
@@ -208,11 +238,8 @@ const INSERT_METADATA: &str = r#"INSERT INTO metadata (
     name,
     source_language,
     target_language,
-    source_snapshot_fingerprint,
-    dialogue_max_fullwidth_chars,
-    scrolling_text_max_fullwidth_chars,
-    help_description_max_fullwidth_chars
-) VALUES (?, ?, ?, ?, ?, ?, ?)"#;
+    source_snapshot_fingerprint
+) VALUES (?, ?, ?, ?)"#;
 const INSERT_RPG_MAKER_TRANSLATION_RESOURCE: &str = r#"INSERT INTO rpg_maker_translation_resource (
     resource_kind,
     canonical_json
@@ -225,19 +252,13 @@ const SELECT_METADATA: &str = r#"SELECT
     name,
     source_language,
     target_language,
-    source_snapshot_fingerprint,
-    dialogue_max_fullwidth_chars,
-    scrolling_text_max_fullwidth_chars,
-    help_description_max_fullwidth_chars
+    source_snapshot_fingerprint
 FROM metadata"#;
 const SELECT_PROJECT_RECORD: &str = r#"SELECT
     metadata.name,
     metadata.source_language,
     metadata.target_language,
     metadata.source_snapshot_fingerprint,
-    metadata.dialogue_max_fullwidth_chars,
-    metadata.scrolling_text_max_fullwidth_chars,
-    metadata.help_description_max_fullwidth_chars,
     definition.canonical_json
 FROM metadata
 JOIN rpg_maker_project_definition AS definition
@@ -258,6 +279,7 @@ WHERE sql IS NOT NULL
       'rpg_maker_text_group',
       'rpg_maker_text_unit',
       'rpg_maker_manual_translation',
+      'rpg_maker_rejected_translation',
       'rpg_maker_mutation_claim',
       'rpg_maker_translation_resource',
       'rpg_maker_project_definition'
@@ -285,11 +307,8 @@ const PROJECT_RECORD_QUERY_ID: &str = "project_database.project_record";
 const UPDATE_METADATA: &str = r#"UPDATE metadata
 SET source_language = ?1,
     target_language = ?2,
-    source_snapshot_fingerprint = ?3,
-    dialogue_max_fullwidth_chars = ?4,
-    scrolling_text_max_fullwidth_chars = ?5,
-    help_description_max_fullwidth_chars = ?6
-WHERE name = ?7"#;
+    source_snapshot_fingerprint = ?3
+WHERE name = ?4"#;
 const CLEAR_RPG_MAKER_TEXT_TRANSLATIONS: &str = "UPDATE rpg_maker_text_unit SET translation_content_json = NULL, translation_state = NULL WHERE translation_content_json IS NOT NULL OR translation_state IS NOT NULL";
 const RESET_TERMINOLOGY_RESOURCE: &str = r#"UPDATE rpg_maker_translation_resource
 SET canonical_json = '[]'
@@ -416,83 +435,6 @@ impl ProjectWorkspaceLayout {
     }
 }
 
-/// 一个游戏显示区域允许的每行最大全角字符数。
-///
-/// 零不能表达可用的显示宽度，因此只能通过受检构造建立该值。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MaxFullwidthChars(u32);
-
-impl MaxFullwidthChars {
-    /// 建立一个严格大于零的显示宽度。
-    pub fn new(value: u32) -> Result<Self, MaxFullwidthCharsError> {
-        if value == 0 {
-            Err(MaxFullwidthCharsError)
-        } else {
-            Ok(Self(value))
-        }
-    }
-
-    /// 返回每行最大全角字符数。
-    pub fn get(self) -> u32 {
-        self.0
-    }
-}
-
-impl TryFrom<u32> for MaxFullwidthChars {
-    type Error = MaxFullwidthCharsError;
-
-    fn try_from(value: u32) -> Result<Self, Self::Error> {
-        Self::new(value)
-    }
-}
-
-/// 每行最大全角字符数不是正整数。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MaxFullwidthCharsError;
-
-impl fmt::Display for MaxFullwidthCharsError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("每行最大全角字符数必须大于零")
-    }
-}
-
-impl Error for MaxFullwidthCharsError {}
-
-/// RPG Maker 写回所使用的三个显示区域宽度。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RpgMakerWriteBackLayoutProfile {
-    dialogue_body: MaxFullwidthChars,
-    scrolling_text: MaxFullwidthChars,
-    help_description: MaxFullwidthChars,
-}
-
-impl RpgMakerWriteBackLayoutProfile {
-    /// 汇集已经分别校验的显示区域宽度。
-    pub fn new(
-        dialogue_body: MaxFullwidthChars,
-        scrolling_text: MaxFullwidthChars,
-        help_description: MaxFullwidthChars,
-    ) -> Self {
-        Self {
-            dialogue_body,
-            scrolling_text,
-            help_description,
-        }
-    }
-
-    pub fn dialogue_body(&self) -> MaxFullwidthChars {
-        self.dialogue_body
-    }
-
-    pub fn scrolling_text(&self) -> MaxFullwidthChars {
-        self.scrolling_text
-    }
-
-    pub fn help_description(&self) -> MaxFullwidthChars {
-        self.help_description
-    }
-}
-
 /// 从项目数据库中读取的受信项目记录。
 ///
 /// 数据库定位、metadata 读取和记录完整性由读取器负责；消费方无需再次解释
@@ -503,7 +445,6 @@ pub(crate) struct StoredProjectRecord {
     layout: ProjectWorkspaceLayout,
     language_pair: LanguagePair,
     source_snapshot_fingerprint: SourceSnapshotFingerprint,
-    layout_profile: RpgMakerWriteBackLayoutProfile,
     mv_dialogue_definition: MvDialogueDefinition,
 }
 
@@ -516,7 +457,6 @@ impl StoredProjectRecord {
         database_path: PathBuf,
         rpg_maker_layout: RpgMakerLayout,
         language_pair: LanguagePair,
-        layout_profile: RpgMakerWriteBackLayoutProfile,
     ) -> Self {
         let layout = ProjectWorkspaceLayout::from_workspace_root(workspace_root, rpg_maker_layout);
         assert_eq!(
@@ -529,7 +469,6 @@ impl StoredProjectRecord {
             layout,
             language_pair,
             SourceSnapshotFingerprint::from_bytes([0xa5; 32]),
-            layout_profile,
             MvDialogueDefinition::empty(),
         )
     }
@@ -540,7 +479,6 @@ impl StoredProjectRecord {
         layout: ProjectWorkspaceLayout,
         language_pair: LanguagePair,
         source_snapshot_fingerprint: SourceSnapshotFingerprint,
-        layout_profile: RpgMakerWriteBackLayoutProfile,
         mv_dialogue_definition: MvDialogueDefinition,
     ) -> Self {
         Self {
@@ -548,7 +486,6 @@ impl StoredProjectRecord {
             layout,
             language_pair,
             source_snapshot_fingerprint,
-            layout_profile,
             mv_dialogue_definition,
         }
     }
@@ -588,10 +525,6 @@ impl StoredProjectRecord {
 
     pub(crate) const fn source_snapshot_fingerprint(&self) -> SourceSnapshotFingerprint {
         self.source_snapshot_fingerprint
-    }
-
-    pub(crate) fn layout_profile(&self) -> &RpgMakerWriteBackLayoutProfile {
-        &self.layout_profile
     }
 
     pub(crate) fn mv_dialogue_definition(&self) -> &MvDialogueDefinition {
@@ -680,17 +613,17 @@ fn record_from_rows<E>(
         });
     }
     let mut values = row.into_values();
-    if values.len() != 8 {
+    if values.len() != 5 {
         return Err(ProjectDatabaseReadError::InvalidMetadata {
             path: database_path,
             reason: InvalidProjectMetadata::WrongColumnCount {
-                expected: 8,
+                expected: 5,
                 actual: values.len(),
             },
         });
     }
     let definition_json = text_column(
-        values.pop().expect("已确认项目记录恰好有八列"),
+        values.pop().expect("已确认项目记录恰好有五列"),
         "mv_dialogue_rules",
     )
     .map_err(|reason| ProjectDatabaseReadError::InvalidMetadata {
@@ -717,7 +650,6 @@ fn record_from_rows<E>(
         layout,
         metadata.language_pair,
         metadata.source_snapshot_fingerprint,
-        metadata.layout_profile,
         mv_dialogue_definition,
     ))
 }
@@ -727,7 +659,6 @@ struct ProjectMetadataFacts {
     name: ProjectName,
     language_pair: LanguagePair,
     source_snapshot_fingerprint: SourceSnapshotFingerprint,
-    layout_profile: RpgMakerWriteBackLayoutProfile,
 }
 
 fn metadata_facts_from_rows(
@@ -742,37 +673,25 @@ fn metadata_facts_from_rows(
     }
 
     let values = row.into_values();
-    if values.len() != 7 {
+    if values.len() != 4 {
         return Err(InvalidProjectMetadata::WrongColumnCount {
-            expected: 7,
+            expected: 4,
             actual: values.len(),
         });
     }
 
     let mut values = values.into_iter();
-    let stored_name = text_column(values.next().expect("已确认 metadata 恰好有七列"), "name")?;
+    let stored_name = text_column(values.next().expect("已确认 metadata 恰好有四列"), "name")?;
     let source_language = language_id_column(
-        values.next().expect("已确认 metadata 恰好有七列"),
+        values.next().expect("已确认 metadata 恰好有四列"),
         "source_language",
     )?;
     let target_language = language_id_column(
-        values.next().expect("已确认 metadata 恰好有七列"),
+        values.next().expect("已确认 metadata 恰好有四列"),
         "target_language",
     )?;
     let source_snapshot_fingerprint =
-        source_snapshot_fingerprint_column(values.next().expect("已确认 metadata 恰好有七列"))?;
-    let dialogue_max_fullwidth_chars = max_fullwidth_chars_column(
-        values.next().expect("已确认 metadata 恰好有七列"),
-        "dialogue_max_fullwidth_chars",
-    )?;
-    let scrolling_text_max_fullwidth_chars = max_fullwidth_chars_column(
-        values.next().expect("已确认 metadata 恰好有七列"),
-        "scrolling_text_max_fullwidth_chars",
-    )?;
-    let help_description_max_fullwidth_chars = max_fullwidth_chars_column(
-        values.next().expect("已确认 metadata 恰好有七列"),
-        "help_description_max_fullwidth_chars",
-    )?;
+        source_snapshot_fingerprint_column(values.next().expect("已确认 metadata 恰好有四列"))?;
 
     let stored_name = stored_name
         .parse::<ProjectName>()
@@ -788,11 +707,6 @@ fn metadata_facts_from_rows(
         name: stored_name,
         language_pair: LanguagePair::new(source_language, target_language),
         source_snapshot_fingerprint,
-        layout_profile: RpgMakerWriteBackLayoutProfile::new(
-            dialogue_max_fullwidth_chars,
-            scrolling_text_max_fullwidth_chars,
-            help_description_max_fullwidth_chars,
-        ),
     })
 }
 
@@ -838,34 +752,6 @@ fn source_snapshot_fingerprint_column(
         InvalidProjectMetadata::InvalidSourceSnapshotFingerprintLength {
             actual: source.actual(),
         }
-    })
-}
-
-fn max_fullwidth_chars_column(
-    value: SqliteValue,
-    column: &'static str,
-) -> Result<MaxFullwidthChars, InvalidProjectMetadata> {
-    let SqliteValue::Integer(value) = value else {
-        return Err(InvalidProjectMetadata::WrongColumnType {
-            column,
-            expected: "INTEGER",
-            actual: value.kind_name(),
-        });
-    };
-    max_fullwidth_chars_integer(value, column)
-}
-
-fn max_fullwidth_chars_integer(
-    value: i64,
-    column: &'static str,
-) -> Result<MaxFullwidthChars, InvalidProjectMetadata> {
-    let value = u32::try_from(value).map_err(|_| InvalidProjectMetadata::InvalidLineWidth {
-        column,
-        actual: value,
-    })?;
-    MaxFullwidthChars::new(value).map_err(|_| InvalidProjectMetadata::InvalidLineWidth {
-        column,
-        actual: i64::from(value),
     })
 }
 
@@ -1018,10 +904,6 @@ pub(crate) enum InvalidProjectMetadata {
         stored: String,
         canonical: String,
     },
-    InvalidLineWidth {
-        column: &'static str,
-        actual: i64,
-    },
     InvalidSourceSnapshotFingerprintLength {
         actual: usize,
     },
@@ -1073,12 +955,6 @@ impl InvalidProjectMetadata {
                 stored: SafeText::new(stored),
                 canonical: SafeText::new(canonical),
             },
-            Self::InvalidLineWidth { column, actual } => {
-                RpgMakerProjectMetadataViolation::InvalidLineWidth {
-                    column: SafeIdentifier::from_validated(column),
-                    actual: *actual,
-                }
-            }
             Self::InvalidSourceSnapshotFingerprintLength { actual } => {
                 RpgMakerProjectMetadataViolation::InvalidSourceSnapshotFingerprintLength {
                     expected: 32,
@@ -1226,12 +1102,6 @@ impl fmt::Display for InvalidProjectMetadata {
                 formatter,
                 "字段 {column} 必须保存规范语言 ID，实际为 {stored:?}，规范形式为 {canonical:?}"
             ),
-            Self::InvalidLineWidth { column, actual } => {
-                write!(
-                    formatter,
-                    "{column} 必须是 u32 范围内的正整数，实际为 {actual}"
-                )
-            }
             Self::InvalidSourceSnapshotFingerprintLength { actual } => write!(
                 formatter,
                 "source_snapshot_fingerprint 必须是 32 字节 BLOB，实际为 {actual} 字节"
@@ -1282,7 +1152,6 @@ impl ProjectDatabaseState {
         name: ProjectName,
         language_pair: LanguagePair,
         source_snapshot_fingerprint: SourceSnapshotFingerprint,
-        layout_profile: RpgMakerWriteBackLayoutProfile,
         owners: Vec<(RpgMakerAssetOwner, SourceSnapshotFingerprint)>,
     ) -> Self {
         Self {
@@ -1290,7 +1159,6 @@ impl ProjectDatabaseState {
                 name,
                 language_pair,
                 source_snapshot_fingerprint,
-                layout_profile,
             },
             owners: owners
                 .into_iter()
@@ -1320,10 +1188,6 @@ impl ProjectDatabaseState {
 
     pub(crate) fn target_language(&self) -> &LanguageId {
         self.metadata.language_pair.target()
-    }
-
-    pub(crate) fn layout_profile(&self) -> &RpgMakerWriteBackLayoutProfile {
-        &self.metadata.layout_profile
     }
 
     pub(crate) const fn source_snapshot_fingerprint(&self) -> SourceSnapshotFingerprint {
@@ -2072,6 +1936,12 @@ fn expected_att_schema() -> Vec<(&'static str, &'static str, &'static str, &'sta
             CREATE_RPG_MAKER_MANUAL_TRANSLATION_TABLE,
         ),
         (
+            "table",
+            RPG_MAKER_REJECTED_TRANSLATION_TABLE_NAME,
+            RPG_MAKER_REJECTED_TRANSLATION_TABLE_NAME,
+            CREATE_RPG_MAKER_REJECTED_TRANSLATION_TABLE,
+        ),
+        (
             "index",
             "rpg_maker_text_unit_owner_group_order_idx",
             RPG_MAKER_TEXT_UNIT_TABLE_NAME,
@@ -2739,7 +2609,6 @@ pub(crate) struct NewProject {
     name: ProjectName,
     language_pair: LanguagePair,
     source_snapshot_fingerprint: SourceSnapshotFingerprint,
-    layout_profile: RpgMakerWriteBackLayoutProfile,
 }
 
 impl NewProject {
@@ -2748,13 +2617,11 @@ impl NewProject {
         name: ProjectName,
         language_pair: LanguagePair,
         source_snapshot_fingerprint: SourceSnapshotFingerprint,
-        layout_profile: RpgMakerWriteBackLayoutProfile,
     ) -> Self {
         Self {
             name,
             language_pair,
             source_snapshot_fingerprint,
-            layout_profile,
         }
     }
 
@@ -2772,10 +2639,6 @@ impl NewProject {
 
     pub(crate) const fn source_snapshot_fingerprint(&self) -> SourceSnapshotFingerprint {
         self.source_snapshot_fingerprint
-    }
-
-    pub(crate) fn layout_profile(&self) -> &RpgMakerWriteBackLayoutProfile {
-        &self.layout_profile
     }
 }
 
@@ -3219,9 +3082,6 @@ WHERE (SELECT COUNT(*) FROM metadata) <> 1
        AND source_language = ?2
        AND target_language = ?3
        AND source_snapshot_fingerprint = ?4
-       AND dialogue_max_fullwidth_chars = ?5
-       AND scrolling_text_max_fullwidth_chars = ?6
-       AND help_description_max_fullwidth_chars = ?7
    )"#,
         vec![
             SqliteValue::Text(state.metadata.name.as_str().to_owned()),
@@ -3234,15 +3094,6 @@ WHERE (SELECT COUNT(*) FROM metadata) <> 1
                     .as_bytes()
                     .to_vec(),
             ),
-            SqliteValue::Integer(i64::from(
-                state.metadata.layout_profile.dialogue_body().get(),
-            )),
-            SqliteValue::Integer(i64::from(
-                state.metadata.layout_profile.scrolling_text().get(),
-            )),
-            SqliteValue::Integer(i64::from(
-                state.metadata.layout_profile.help_description().get(),
-            )),
         ],
     ))
 }
@@ -3321,8 +3172,7 @@ where
 {
     let language_changed = current.metadata.language_pair != requested.language_pair;
     let changed = language_changed
-        || current.metadata.source_snapshot_fingerprint != requested.source_snapshot_fingerprint
-        || current.metadata.layout_profile != requested.layout_profile;
+        || current.metadata.source_snapshot_fingerprint != requested.source_snapshot_fingerprint;
     if !changed {
         return Ok(ProjectDatabaseReconciliation { state: current });
     }
@@ -3351,9 +3201,6 @@ where
             SqliteValue::Text(requested.language_pair.source().as_str().to_owned()),
             SqliteValue::Text(requested.language_pair.target().as_str().to_owned()),
             SqliteValue::Blob(requested.source_snapshot_fingerprint.as_bytes().to_vec()),
-            SqliteValue::Integer(i64::from(requested.layout_profile.dialogue_body().get())),
-            SqliteValue::Integer(i64::from(requested.layout_profile.scrolling_text().get())),
-            SqliteValue::Integer(i64::from(requested.layout_profile.help_description().get())),
             SqliteValue::Text(requested.name.as_str().to_owned()),
         ],
     )));
@@ -3398,7 +3245,6 @@ where
             name: requested.name,
             language_pair: requested.language_pair,
             source_snapshot_fingerprint: requested.source_snapshot_fingerprint,
-            layout_profile: requested.layout_profile,
         },
         owners: current.owners,
         terminology_json: if language_changed {
@@ -3478,6 +3324,7 @@ fn project_database_commands(project: &NewProject) -> Vec<SqliteCommand> {
         CREATE_RPG_MAKER_TEXT_GROUP_TABLE,
         CREATE_RPG_MAKER_TEXT_UNIT_TABLE,
         CREATE_RPG_MAKER_MANUAL_TRANSLATION_TABLE,
+        CREATE_RPG_MAKER_REJECTED_TRANSLATION_TABLE,
         CREATE_RPG_MAKER_TEXT_UNIT_OWNER_GROUP_ORDER_INDEX,
         CREATE_RPG_MAKER_MUTATION_CLAIM_TABLE,
         CREATE_RPG_MAKER_MUTATION_CLAIM_OWNER_RESOURCE_INDEX,
@@ -3495,9 +3342,6 @@ fn project_database_commands(project: &NewProject) -> Vec<SqliteCommand> {
             SqliteValue::Text(project.source_language().as_str().to_owned()),
             SqliteValue::Text(project.target_language().as_str().to_owned()),
             SqliteValue::Blob(project.source_snapshot_fingerprint().as_bytes().to_vec()),
-            SqliteValue::Integer(i64::from(project.layout_profile().dialogue_body().get())),
-            SqliteValue::Integer(i64::from(project.layout_profile().scrolling_text().get())),
-            SqliteValue::Integer(i64::from(project.layout_profile().help_description().get())),
         ],
     ));
     for resource_kind in [TERMINOLOGY_RESOURCE_KIND, PLACEHOLDER_RULES_RESOURCE_KIND] {
@@ -3637,17 +3481,11 @@ mod tests {
         )
     }
 
-    fn layout_profile() -> RpgMakerWriteBackLayoutProfile {
-        let width = |value| MaxFullwidthChars::new(value).expect("测试宽度应合法");
-        RpgMakerWriteBackLayoutProfile::new(width(24), width(30), width(18))
-    }
-
     fn project() -> NewProject {
         NewProject::new(
             "测试 游戏".parse().expect("项目名应合法"),
             language_pair("ja", "zh-Hans"),
             SourceSnapshotFingerprint::from_bytes([0x5a; 32]),
-            layout_profile(),
         )
     }
 
@@ -3681,7 +3519,7 @@ mod tests {
     #[test]
     fn creation_plan_contains_the_complete_current_rpg_maker_schema_and_resources() {
         let commands = project_database_commands(&project());
-        assert_eq!(commands.len(), 19);
+        assert_eq!(commands.len(), 20);
         let statements = commands
             .iter()
             .map(SqliteCommand::statement)
@@ -3705,6 +3543,7 @@ mod tests {
                 "rpg_maker_text_group",
                 "rpg_maker_text_unit",
                 "rpg_maker_manual_translation",
+                "rpg_maker_rejected_translation",
                 "rpg_maker_text_unit_owner_group_order_idx",
                 "rpg_maker_mutation_claim",
                 "rpg_maker_translation_resource",
@@ -3745,6 +3584,10 @@ mod tests {
         assert!(
             CREATE_RPG_MAKER_MUTATION_CLAIM_OWNER_RESOURCE_INDEX
                 .ends_with("(owner, resource_key, access, group_id)")
+        );
+        assert!(
+            CREATE_RPG_MAKER_REJECTED_TRANSLATION_TABLE
+                .contains("json_valid(violation_json) AND json_type(violation_json) = 'object'")
         );
     }
 

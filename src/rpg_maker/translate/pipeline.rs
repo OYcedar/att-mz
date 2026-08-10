@@ -4,6 +4,7 @@
 //! 并按计划顺序逐项提交。任务可以并发完成，但后续任务绝不能越过前序任务
 //! 写入数据库，因此失败时始终只保留一个确定的成功前缀。
 
+use std::collections::HashSet;
 #[cfg(test)]
 use std::convert::Infallible;
 use std::error::Error;
@@ -18,8 +19,8 @@ use crate::diagnostic::{
     Diagnostic, DiagnosticReport, RpgMakerIssue, RpgMakerModelNonStopFinishReason,
     RpgMakerResponseInvariantProblem, RpgMakerResponseProcessingProblem,
     RpgMakerResponseProcessingScope, RpgMakerTaskResponseJsonCategory, RpgMakerTaskResponseProblem,
-    RpgMakerTaskResponseUnitProblem, RpgMakerTaskResponseValueProblem, RpgMakerUnitLocator,
-    StateEffect,
+    RpgMakerTaskResponseReviewProblem, RpgMakerTaskResponseUnitProblem,
+    RpgMakerTaskResponseValueProblem, RpgMakerUnitLocator, StateEffect,
 };
 use crate::execution::ordered::{
     OrderedExecutionError, OrderedExecutionHandler, OrderedExecutionLimits,
@@ -35,6 +36,8 @@ use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::project_database::{AssetSnapshotFingerprint, SourceSnapshotFingerprint};
 use crate::rpg_maker::semantic_order::{RpgMakerSemanticOrderKey, RpgMakerSemanticScopeKey};
 use crate::rpg_maker::text::{RpgMakerLocation, TextGroupKind};
+use crate::translation::TranslationOrigin;
+use crate::translation::candidate_validation::{ProvenInvariantViolation, ReviewFinding};
 use crate::translation::placeholder::{
     PlaceholderMatchRangeViolation, PlaceholderMatchReference, PlaceholderPcre2ErrorKind,
     PlaceholderRuleReference, PlaceholderWorkerOperation,
@@ -77,6 +80,7 @@ const STANDARD_IN_FLIGHT_WINDOW_MULTIPLIER: NonZeroUsize =
 pub(crate) struct RpgMakerTranslationInput {
     terminology_path: Option<PathBuf>,
     placeholder_rules_path: Option<PathBuf>,
+    retry_rejected: bool,
 }
 
 impl RpgMakerTranslationInput {
@@ -87,12 +91,22 @@ impl RpgMakerTranslationInput {
         Self {
             terminology_path,
             placeholder_rules_path,
+            retry_rejected: false,
         }
     }
 
+    pub(crate) const fn with_retry_rejected(mut self, retry_rejected: bool) -> Self {
+        self.retry_rejected = retry_rejected;
+        self
+    }
+
     /// 交出两个外部资料路径，供 Planner 拥有其生命周期。
-    pub(crate) fn into_parts(self) -> (Option<PathBuf>, Option<PathBuf>) {
-        (self.terminology_path, self.placeholder_rules_path)
+    pub(crate) fn into_parts(self) -> (Option<PathBuf>, Option<PathBuf>, bool) {
+        (
+            self.terminology_path,
+            self.placeholder_rules_path,
+            self.retry_rejected,
+        )
     }
 }
 
@@ -190,6 +204,10 @@ impl TranslationUnitIdentity {
     pub(crate) fn source_context_json(&self) -> &str {
         &self.0.source_context_json
     }
+
+    pub(crate) fn readable_id(&self) -> String {
+        crate::manual::readable_rpg_maker_id(self.group_location(), self.kind(), self.role())
+    }
 }
 
 /// 一条已经实际影响某个译文的术语事实。
@@ -224,6 +242,57 @@ pub(crate) struct RpgMakerTranslationAsset {
     translation: Option<TextUnitContent>,
     translation_state: Option<Sha256Fingerprint>,
     manual: bool,
+    rejected: Option<RpgMakerStoredRejectedTranslation>,
+}
+
+/// 从当前项目快照读取、尚待 Planner 判断是否仍适用的硬拒绝候选。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RpgMakerStoredRejectedTranslation {
+    readable_id: String,
+    origin: TranslationOrigin,
+    source_content: TextUnitContent,
+    source_context_json: String,
+    candidate_json: String,
+    translation: Option<Vec<String>>,
+    violation: ProvenInvariantViolation,
+    planning_state: Sha256Fingerprint,
+}
+
+impl RpgMakerStoredRejectedTranslation {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        readable_id: String,
+        origin: TranslationOrigin,
+        source_content: TextUnitContent,
+        source_context_json: String,
+        candidate_json: String,
+        translation: Option<Vec<String>>,
+        violation: ProvenInvariantViolation,
+        planning_state: Sha256Fingerprint,
+    ) -> Self {
+        Self {
+            readable_id,
+            origin,
+            source_content,
+            source_context_json,
+            candidate_json,
+            translation,
+            violation,
+            planning_state,
+        }
+    }
+
+    pub(crate) fn source_content(&self) -> &TextUnitContent {
+        &self.source_content
+    }
+
+    pub(crate) fn source_context_json(&self) -> &str {
+        &self.source_context_json
+    }
+
+    pub(crate) const fn planning_state(&self) -> Sha256Fingerprint {
+        self.planning_state
+    }
 }
 
 impl RpgMakerTranslationAsset {
@@ -239,9 +308,11 @@ impl RpgMakerTranslationAsset {
             translation,
             translation_state,
             manual: false,
+            rejected: None,
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_semantic_order_key(
         identity: TranslationUnitIdentity,
         semantic_order_key: RpgMakerSemanticOrderKey,
@@ -254,6 +325,24 @@ impl RpgMakerTranslationAsset {
             translation,
             translation_state,
             manual: false,
+            rejected: None,
+        }
+    }
+
+    pub(crate) fn with_rejected_semantic_order_key(
+        identity: TranslationUnitIdentity,
+        semantic_order_key: RpgMakerSemanticOrderKey,
+        translation: Option<TextUnitContent>,
+        translation_state: Option<Sha256Fingerprint>,
+        rejected: Option<RpgMakerStoredRejectedTranslation>,
+    ) -> Self {
+        Self {
+            identity,
+            semantic_order_key,
+            translation,
+            translation_state,
+            manual: false,
+            rejected,
         }
     }
 
@@ -269,6 +358,7 @@ impl RpgMakerTranslationAsset {
             translation: Some(translation),
             translation_state: Some(translation_state),
             manual: true,
+            rejected: None,
         }
     }
 
@@ -289,6 +379,7 @@ impl RpgMakerTranslationAsset {
         Option<TextUnitContent>,
         Option<Sha256Fingerprint>,
         bool,
+        Option<RpgMakerStoredRejectedTranslation>,
     ) {
         (
             self.identity,
@@ -296,6 +387,7 @@ impl RpgMakerTranslationAsset {
             self.translation,
             self.translation_state,
             self.manual,
+            self.rejected,
         )
     }
 }
@@ -520,6 +612,15 @@ impl RpgMakerTranslationCorpus {
     pub(crate) fn into_parts(self) -> (Vec<RpgMakerTranslationScope>, TranslationSnapshotBaseline) {
         (self.scopes, self.baseline)
     }
+
+    pub(crate) fn natural_unit_ids(&self) -> HashSet<String> {
+        self.scopes
+            .iter()
+            .flat_map(|scope| &scope.groups)
+            .flat_map(|group| &group.assets)
+            .map(|asset| asset.identity.readable_id())
+            .collect()
+    }
 }
 
 /// 在任何 LLM 请求前必须完成的 RPG Maker 资产准备。
@@ -531,6 +632,14 @@ pub(crate) struct TranslationInvalidation {
     identity: TranslationUnitIdentity,
     expected_translation: TextUnitContent,
     expected_translation_state: Sha256Fingerprint,
+    rejected: Option<TranslationInvalidationRejection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TranslationInvalidationRejection {
+    violation: ProvenInvariantViolation,
+    planning_state: Sha256Fingerprint,
+    origin: TranslationOrigin,
 }
 
 /// 可以直接复用的一条现有译文快照。
@@ -680,6 +789,27 @@ impl TranslationInvalidation {
             identity,
             expected_translation,
             expected_translation_state,
+            rejected: None,
+        }
+    }
+
+    pub(crate) fn rejected(
+        identity: TranslationUnitIdentity,
+        expected_translation: TextUnitContent,
+        expected_translation_state: Sha256Fingerprint,
+        violation: ProvenInvariantViolation,
+        planning_state: Sha256Fingerprint,
+        origin: TranslationOrigin,
+    ) -> Self {
+        Self {
+            identity,
+            expected_translation,
+            expected_translation_state,
+            rejected: Some(TranslationInvalidationRejection {
+                violation,
+                planning_state,
+                origin,
+            }),
         }
     }
 
@@ -700,11 +830,22 @@ impl TranslationInvalidation {
 
     pub(crate) fn into_parts(
         self,
-    ) -> (TranslationUnitIdentity, TextUnitContent, Sha256Fingerprint) {
+    ) -> (
+        TranslationUnitIdentity,
+        TextUnitContent,
+        Sha256Fingerprint,
+        Option<(
+            ProvenInvariantViolation,
+            Sha256Fingerprint,
+            TranslationOrigin,
+        )>,
+    ) {
         (
             self.identity,
             self.expected_translation,
             self.expected_translation_state,
+            self.rejected
+                .map(|rejected| (rejected.violation, rejected.planning_state, rejected.origin)),
         )
     }
 }
@@ -715,14 +856,21 @@ pub(crate) struct TranslationPlanPreparationCounts {
     retained: usize,
     invalidated: usize,
     not_applicable: usize,
+    rejected: usize,
 }
 
 impl TranslationPlanPreparationCounts {
-    pub(crate) const fn new(retained: usize, invalidated: usize, not_applicable: usize) -> Self {
+    pub(crate) const fn new(
+        retained: usize,
+        invalidated: usize,
+        not_applicable: usize,
+        rejected: usize,
+    ) -> Self {
         Self {
             retained,
             invalidated,
             not_applicable,
+            rejected,
         }
     }
 }
@@ -740,6 +888,7 @@ pub(crate) struct TranslationPlanPreparation {
     retained: usize,
     invalidated: usize,
     not_applicable: usize,
+    rejected: usize,
     snapshot_baseline: TranslationSnapshotBaseline,
 }
 
@@ -759,7 +908,7 @@ impl TranslationPlanPreparation {
             reuses,
             terminology_json,
             placeholder_rules_json,
-            TranslationPlanPreparationCounts::new(retained, invalidated, not_applicable),
+            TranslationPlanPreparationCounts::new(retained, invalidated, not_applicable, 0),
             TranslationSnapshotBaseline::new(
                 SourceSnapshotFingerprint::from_bytes([0; 32]),
                 Vec::new(),
@@ -785,6 +934,7 @@ impl TranslationPlanPreparation {
             retained: counts.retained,
             invalidated: counts.invalidated,
             not_applicable: counts.not_applicable,
+            rejected: counts.rejected,
             snapshot_baseline,
         }
     }
@@ -809,6 +959,10 @@ impl TranslationPlanPreparation {
 
     pub(crate) const fn not_applicable(&self) -> usize {
         self.not_applicable
+    }
+
+    pub(crate) const fn rejected(&self) -> usize {
+        self.rejected
     }
 
     pub(crate) fn reused(&self) -> usize {
@@ -1309,6 +1463,7 @@ impl TranslationPropagationTarget {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TranslationVirtualReason {
     ExistingTranslation,
+    RejectedCandidate,
     NonSourceLanguage,
     FullyProtected,
     Duplicate {
@@ -1379,6 +1534,7 @@ impl From<&PlaceholderMultisetError> for PlaceholderMultisetErrorKind {
             PlaceholderMultisetError::Mismatch { .. } => Self::Mismatch,
             PlaceholderMultisetError::Unexpected { .. } => Self::Unexpected,
             PlaceholderMultisetError::OrderMismatch { .. } => Self::OrderMismatch,
+            PlaceholderMultisetError::WrapperTopologyChanged { .. } => Self::OrderMismatch,
         }
     }
 }
@@ -1866,14 +2022,32 @@ pub(crate) struct RpgMakerExecutableTask {
     language_pair: LanguagePair,
     messages: Vec<ChatMessage>,
     expected_outputs: Arc<[ExpectedTranslationOutput]>,
+    semantics: Arc<super::semantics::ResolvedTranslationSemantics>,
 }
 
 impl RpgMakerExecutableTask {
+    #[cfg(test)]
     pub(crate) fn new(
         index: RpgMakerTranslationTaskIndex,
         language_pair: LanguagePair,
         messages: Vec<ChatMessage>,
         expected_outputs: Vec<ExpectedTranslationOutput>,
+    ) -> Self {
+        Self::new_with_semantics(
+            index,
+            language_pair,
+            messages,
+            expected_outputs,
+            Arc::new(super::semantics::ResolvedTranslationSemantics::for_test()),
+        )
+    }
+
+    pub(crate) fn new_with_semantics(
+        index: RpgMakerTranslationTaskIndex,
+        language_pair: LanguagePair,
+        messages: Vec<ChatMessage>,
+        expected_outputs: Vec<ExpectedTranslationOutput>,
+        semantics: Arc<super::semantics::ResolvedTranslationSemantics>,
     ) -> Self {
         assert!(
             expected_outputs
@@ -1887,6 +2061,7 @@ impl RpgMakerExecutableTask {
             language_pair,
             messages,
             expected_outputs: expected_outputs.into(),
+            semantics,
         }
     }
 
@@ -1908,6 +2083,10 @@ impl RpgMakerExecutableTask {
 
     pub(crate) fn shared_expected_outputs(&self) -> Arc<[ExpectedTranslationOutput]> {
         Arc::clone(&self.expected_outputs)
+    }
+
+    pub(crate) fn shared_semantics(&self) -> Arc<super::semantics::ResolvedTranslationSemantics> {
+        Arc::clone(&self.semantics)
     }
 }
 
@@ -2025,6 +2204,75 @@ impl AcceptedTranslationDecision {
     }
 }
 
+/// 一个硬拒绝候选所绑定的当前 Unit 及该次规划语义状态。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RejectedTranslationTarget {
+    identity: TranslationUnitIdentity,
+    planning_state: Sha256Fingerprint,
+}
+
+impl RejectedTranslationTarget {
+    pub(crate) fn new(
+        identity: TranslationUnitIdentity,
+        planning_state: Sha256Fingerprint,
+    ) -> Self {
+        Self {
+            identity,
+            planning_state,
+        }
+    }
+
+    pub(crate) fn identity(&self) -> &TranslationUnitIdentity {
+        &self.identity
+    }
+
+    pub(crate) const fn planning_state(&self) -> Sha256Fingerprint {
+        self.planning_state
+    }
+}
+
+/// 已唯一绑定且只因可证明不变量而未能成为有效译文的精确候选。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RejectedTranslationCandidate {
+    candidate_json: String,
+    translation: Option<Vec<String>>,
+    violation: ProvenInvariantViolation,
+    targets: Vec<RejectedTranslationTarget>,
+}
+
+impl RejectedTranslationCandidate {
+    pub(crate) fn new(
+        candidate_json: String,
+        translation: Option<Vec<String>>,
+        violation: ProvenInvariantViolation,
+        targets: Vec<RejectedTranslationTarget>,
+    ) -> Self {
+        assert!(!targets.is_empty(), "硬拒绝候选必须绑定至少一个当前 Unit");
+        Self {
+            candidate_json,
+            translation,
+            violation,
+            targets,
+        }
+    }
+
+    pub(crate) fn candidate_json(&self) -> &str {
+        &self.candidate_json
+    }
+
+    pub(crate) fn translation(&self) -> Option<&[String]> {
+        self.translation.as_deref()
+    }
+
+    pub(crate) fn violation(&self) -> &ProvenInvariantViolation {
+        &self.violation
+    }
+
+    pub(crate) fn targets(&self) -> &[RejectedTranslationTarget] {
+        &self.targets
+    }
+}
+
 /// 一个预期 ID 没有形成可写译文的正常业务原因。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TranslationUnitRejectionReason {
@@ -2046,7 +2294,6 @@ pub(crate) enum TranslationUnitRejectionReason {
         expected_blank: bool,
     },
     BlankTranslation,
-    NoNaturalLanguageText,
     ContainsByteOrderMark,
     PlaceholderMismatch {
         token: String,
@@ -2057,9 +2304,6 @@ pub(crate) enum TranslationUnitRejectionReason {
     PlaceholderNormalizationAmbiguous {
         original: String,
     },
-    SourceResidual {
-        fragment: String,
-    },
 }
 
 /// 一个仍需在后续 CLI 运行中重新翻译的预期单元。
@@ -2068,6 +2312,7 @@ pub(crate) struct UnresolvedTranslationUnit {
     id: TaskId,
     unit: RpgMakerUnitLocator,
     reason: TranslationUnitRejectionReason,
+    rejected_candidate: Option<RejectedTranslationCandidate>,
 }
 
 impl UnresolvedTranslationUnit {
@@ -2076,7 +2321,26 @@ impl UnresolvedTranslationUnit {
         unit: RpgMakerUnitLocator,
         reason: TranslationUnitRejectionReason,
     ) -> Self {
-        Self { id, unit, reason }
+        Self {
+            id,
+            unit,
+            reason,
+            rejected_candidate: None,
+        }
+    }
+
+    pub(crate) fn with_rejected_candidate(
+        id: TaskId,
+        unit: RpgMakerUnitLocator,
+        reason: TranslationUnitRejectionReason,
+        rejected_candidate: RejectedTranslationCandidate,
+    ) -> Self {
+        Self {
+            id,
+            unit,
+            reason,
+            rejected_candidate: Some(rejected_candidate),
+        }
     }
 
     pub(crate) const fn id(&self) -> TaskId {
@@ -2093,6 +2357,10 @@ impl UnresolvedTranslationUnit {
 
     pub(crate) fn reason(&self) -> &TranslationUnitRejectionReason {
         &self.reason
+    }
+
+    pub(crate) fn rejected_candidate(&self) -> Option<&RejectedTranslationCandidate> {
+        self.rejected_candidate.as_ref()
     }
 
     #[cfg(test)]
@@ -2123,6 +2391,12 @@ impl UnresolvedTranslationUnit {
 pub(crate) enum TranslationProtocolDiagnostic {
     NonStopFinish {
         reason: RpgMakerModelNonStopFinishReason,
+        finding: ReviewFinding,
+    },
+    CandidateReview {
+        id: TaskId,
+        unit: RpgMakerUnitLocator,
+        finding: ReviewFinding,
     },
     InvalidResponse {
         error: TranslationTaskResponseParseError,
@@ -2281,6 +2555,13 @@ impl TranslationTaskOutcome {
         &self.context().diagnostics
     }
 
+    pub(crate) fn rejected_candidate_count(&self) -> usize {
+        self.unresolved()
+            .iter()
+            .filter(|unit| unit.rejected_candidate().is_some())
+            .count()
+    }
+
     pub(crate) fn accepted_location_count(&self) -> usize {
         self.accepted()
             .iter()
@@ -2435,9 +2716,6 @@ fn task_response_unit_problem(
         TranslationUnitRejectionReason::BlankTranslation => {
             RpgMakerTaskResponseUnitProblem::BlankTranslation
         }
-        TranslationUnitRejectionReason::NoNaturalLanguageText => {
-            RpgMakerTaskResponseUnitProblem::NoNaturalLanguageText
-        }
         TranslationUnitRejectionReason::ContainsByteOrderMark => {
             RpgMakerTaskResponseUnitProblem::ContainsByteOrderMark
         }
@@ -2450,9 +2728,6 @@ fn task_response_unit_problem(
         TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous { .. } => {
             RpgMakerTaskResponseUnitProblem::PlaceholderNormalizationAmbiguous
         }
-        TranslationUnitRejectionReason::SourceResidual { .. } => {
-            RpgMakerTaskResponseUnitProblem::SourceResidual
-        }
     })
 }
 
@@ -2460,31 +2735,49 @@ fn task_response_protocol_report(
     task_index: RpgMakerTranslationTaskIndex,
     diagnostic: &TranslationProtocolDiagnostic,
 ) -> DiagnosticReport {
-    let problem = match diagnostic {
-        TranslationProtocolDiagnostic::NonStopFinish { reason } => {
-            RpgMakerTaskResponseProblem::NonStopFinish {
-                reason: reason.clone(),
-            }
+    let (scope, problem) = match diagnostic {
+        TranslationProtocolDiagnostic::NonStopFinish { reason, finding } => {
+            debug_assert_eq!(finding, &ReviewFinding::NonStopFinish);
+            (
+                RpgMakerResponseProcessingScope::task(task_index.get()),
+                RpgMakerTaskResponseProblem::NonStopFinish {
+                    reason: reason.clone(),
+                },
+            )
         }
-        TranslationProtocolDiagnostic::InvalidResponse { error } => {
-            task_response_parse_problem(*error)
-        }
-        TranslationProtocolDiagnostic::InvalidId { item_index } => {
+        TranslationProtocolDiagnostic::CandidateReview { id, unit, finding } => (
+            RpgMakerResponseProcessingScope::unit(task_index.get(), unit.clone()),
+            RpgMakerTaskResponseProblem::UnitReview {
+                output_id: id.get(),
+                finding: match finding {
+                    ReviewFinding::SourceResidual => {
+                        RpgMakerTaskResponseReviewProblem::SourceResidual
+                    }
+                    ReviewFinding::NonStopFinish => {
+                        unreachable!("候选级 Review 不会产生 finish reason")
+                    }
+                },
+            },
+        ),
+        TranslationProtocolDiagnostic::InvalidResponse { error } => (
+            RpgMakerResponseProcessingScope::task(task_index.get()),
+            task_response_parse_problem(*error),
+        ),
+        TranslationProtocolDiagnostic::InvalidId { item_index } => (
+            RpgMakerResponseProcessingScope::task(task_index.get()),
             RpgMakerTaskResponseProblem::InvalidId {
                 item_index: *item_index,
-            }
-        }
-        TranslationProtocolDiagnostic::UnknownId { item_index, id } => {
+            },
+        ),
+        TranslationProtocolDiagnostic::UnknownId { item_index, id } => (
+            RpgMakerResponseProcessingScope::task(task_index.get()),
             RpgMakerTaskResponseProblem::UnknownId {
                 item_index: *item_index,
                 output_id: id.get(),
-            }
-        }
+            },
+        ),
     };
-    task_response_report(
-        RpgMakerResponseProcessingScope::task(task_index.get()),
-        problem,
-    )
+    task_response_report(scope, problem)
 }
 
 fn task_response_unit_report(
@@ -3198,25 +3491,26 @@ where
                 evidence,
             });
         }
-        let prepared_commit = if outcome.accepted().is_empty() {
-            None
-        } else {
-            match self
-                .service
-                .result_store
-                .prepare_commit(Arc::clone(&outcome))
-                .await
-            {
-                Ok(prepared) => Some(prepared),
-                Err(failure) => {
-                    return Err(TranslationTaskStageError::CommitPreparation {
-                        outcome,
-                        evidence,
-                        failure,
-                    });
+        let prepared_commit =
+            if outcome.accepted().is_empty() && outcome.rejected_candidate_count() == 0 {
+                None
+            } else {
+                match self
+                    .service
+                    .result_store
+                    .prepare_commit(Arc::clone(&outcome))
+                    .await
+                {
+                    Ok(prepared) => Some(prepared),
+                    Err(failure) => {
+                        return Err(TranslationTaskStageError::CommitPreparation {
+                            outcome,
+                            evidence,
+                            failure,
+                        });
+                    }
                 }
-            }
-        };
+            };
         Ok(PreparedTranslationTask {
             outcome,
             evidence,
@@ -3634,8 +3928,14 @@ where
                 }
             }
             TranslationTaskOutcome::Unavailable { .. } => {
-                TranslationTaskRecordFinalState::UnavailableNoChanges {
-                    outcome: Arc::clone(&outcome),
+                if outcome.rejected_candidate_count() == 0 {
+                    TranslationTaskRecordFinalState::UnavailableNoChanges {
+                        outcome: Arc::clone(&outcome),
+                    }
+                } else {
+                    TranslationTaskRecordFinalState::UnavailableRejectedCommitted {
+                        outcome: Arc::clone(&outcome),
+                    }
                 }
             }
         };
@@ -3702,12 +4002,18 @@ where
                 return Ok(OperationCompletion::Cancelled);
             }
             let (_semantics, preparation, tasks) = plan.into_parts();
-            let planned_decisions = tasks.iter().map(|task| task.expected_outputs().len()).sum();
+            let skipped_rejected = preparation.rejected();
+            let planned_decisions = tasks
+                .iter()
+                .map(|task| task.expected_outputs().len())
+                .sum::<usize>()
+                .saturating_add(skipped_rejected);
             let planned_locations = tasks
                 .iter()
                 .flat_map(RpgMakerExecutableTask::expected_outputs)
                 .map(|output| 1 + output.propagation_targets().len())
-                .sum();
+                .sum::<usize>()
+                .saturating_add(skipped_rejected);
             let report = RpgMakerTranslationRunReport::with_reconciliation(
                 tasks.len(),
                 planned_decisions,
@@ -4156,6 +4462,7 @@ mod tests {
         CompleteCommitted,
         PartialCommitted,
         UnavailableNoChanges,
+        UnavailableRejectedCommitted,
         ExecutionFailedNoChanges,
         CommitPreparationFailed,
         CommitNotApplied,
@@ -4180,6 +4487,9 @@ mod tests {
             }
             TranslationTaskRecordFinalState::UnavailableNoChanges { .. } => {
                 RecordedTaskState::UnavailableNoChanges
+            }
+            TranslationTaskRecordFinalState::UnavailableRejectedCommitted { .. } => {
+                RecordedTaskState::UnavailableRejectedCommitted
             }
             TranslationTaskRecordFinalState::ExecutionFailedNoChanges { .. } => {
                 RecordedTaskState::ExecutionFailedNoChanges
@@ -6126,7 +6436,6 @@ mod tests {
             PathBuf::from("C:/Projects/alice/project.db"),
             "ja".to_owned(),
             "zh-Hans".to_owned(),
-            crate::rpg_maker::project::test_layout_profile(),
         )
     }
 

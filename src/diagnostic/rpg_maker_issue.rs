@@ -876,24 +876,6 @@ impl RpgMakerRulesCommandNonStringFact {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum RpgMakerManualLayoutRegion {
-    DialogueBody,
-    ScrollingText,
-    HelpDescription,
-}
-
-impl RpgMakerManualLayoutRegion {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::DialogueBody => "dialogue_body",
-            Self::ScrollingText => "scrolling_text",
-            Self::HelpDescription => "help_description",
-        }
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RpgMakerLogicalUnitLocator {
@@ -1905,12 +1887,31 @@ pub(crate) enum RpgMakerTaskResponseUnitProblem {
         expected_blank: bool,
     },
     BlankTranslation,
-    NoNaturalLanguageText,
     ContainsByteOrderMark,
     PlaceholderMismatch,
     UnexpectedPlaceholderToken,
     PlaceholderNormalizationAmbiguous,
+}
+
+/// 合法候选已经保存、但需要后续质量审核的非阻塞事实。
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RpgMakerTaskResponseReviewProblem {
     SourceResidual,
+}
+
+impl RpgMakerTaskResponseReviewProblem {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::SourceResidual => "rpg_maker.translation.review.unit.source_residual",
+        }
+    }
+
+    const fn code_suffix(self) -> &'static str {
+        match self {
+            Self::SourceResidual => "source_residual",
+        }
+    }
 }
 
 impl RpgMakerTaskResponseUnitProblem {
@@ -1927,9 +1928,6 @@ impl RpgMakerTaskResponseUnitProblem {
                 "rpg_maker.translation.response.unit.blank_line_mismatch"
             }
             Self::BlankTranslation => "rpg_maker.translation.response.unit.blank_translation",
-            Self::NoNaturalLanguageText => {
-                "rpg_maker.translation.response.unit.no_natural_language_text"
-            }
             Self::ContainsByteOrderMark => {
                 "rpg_maker.translation.response.unit.contains_byte_order_mark"
             }
@@ -1940,7 +1938,6 @@ impl RpgMakerTaskResponseUnitProblem {
             Self::PlaceholderNormalizationAmbiguous => {
                 "rpg_maker.translation.response.unit.placeholder_normalization_ambiguous"
             }
-            Self::SourceResidual => "rpg_maker.translation.response.unit.source_residual",
         }
     }
 
@@ -1953,12 +1950,10 @@ impl RpgMakerTaskResponseUnitProblem {
             Self::InvalidLineText { .. } => "invalid_line_text",
             Self::BlankLineMismatch { .. } => "blank_line_mismatch",
             Self::BlankTranslation => "blank_translation",
-            Self::NoNaturalLanguageText => "no_natural_language_text",
             Self::ContainsByteOrderMark => "contains_byte_order_mark",
             Self::PlaceholderMismatch => "placeholder_mismatch",
             Self::UnexpectedPlaceholderToken => "unexpected_placeholder_token",
             Self::PlaceholderNormalizationAmbiguous => "placeholder_normalization_ambiguous",
-            Self::SourceResidual => "source_residual",
         }
     }
 
@@ -1983,12 +1978,10 @@ impl RpgMakerTaskResponseUnitProblem {
             Self::Missing
             | Self::Duplicate
             | Self::BlankTranslation
-            | Self::NoNaturalLanguageText
             | Self::ContainsByteOrderMark
             | Self::PlaceholderMismatch
             | Self::UnexpectedPlaceholderToken
-            | Self::PlaceholderNormalizationAmbiguous
-            | Self::SourceResidual => Vec::new(),
+            | Self::PlaceholderNormalizationAmbiguous => Vec::new(),
         }
     }
 }
@@ -2020,6 +2013,10 @@ pub(crate) enum RpgMakerTaskResponseProblem {
         output_id: usize,
         problem: RpgMakerTaskResponseUnitProblem,
     },
+    UnitReview {
+        output_id: usize,
+        finding: RpgMakerTaskResponseReviewProblem,
+    },
     ModelResponseUnusable,
     AllOutputsRejected,
     MissingPlannedOutput {
@@ -2036,6 +2033,7 @@ impl RpgMakerTaskResponseProblem {
             Self::InvalidId { .. } => "rpg_maker.translation.response.invalid_id",
             Self::UnknownId { .. } => "rpg_maker.translation.response.unknown_id",
             Self::UnitRejected { problem, .. } => problem.code(),
+            Self::UnitReview { finding, .. } => finding.code(),
             Self::ModelResponseUnusable => "rpg_maker.translation.response.model_response_unusable",
             Self::AllOutputsRejected => "rpg_maker.translation.response.all_outputs_rejected",
             Self::MissingPlannedOutput { .. } => {
@@ -2047,9 +2045,9 @@ impl RpgMakerTaskResponseProblem {
     const fn summary_code(&self) -> &'static str {
         match self {
             Self::InvalidJson { .. } => "response_parsing_failed",
+            Self::NonStopFinish { .. } | Self::UnitReview { .. } => "needs_review",
             Self::ModelResponseUnusable | Self::AllOutputsRejected => "invalid_response_contract",
             Self::ThinkingEmpty { .. }
-            | Self::NonStopFinish { .. }
             | Self::InvalidId { .. }
             | Self::UnknownId { .. }
             | Self::UnitRejected { .. }
@@ -2090,6 +2088,10 @@ impl RpgMakerTaskResponseProblem {
                 facts.extend(problem.facts());
                 facts
             }
+            Self::UnitReview { output_id, finding } => vec![
+                ("output_id", output_id.to_string()),
+                ("review", finding.code_suffix().to_owned()),
+            ],
             Self::MissingPlannedOutput { output_id } => {
                 vec![("output_id", output_id.to_string())]
             }
@@ -2111,6 +2113,9 @@ pub(crate) enum RpgMakerResponseProcessingProblem {
     },
     LanguageProjection {
         problem: RpgMakerResponseLanguageProjectionProblem,
+    },
+    PlaceholderProtection {
+        problem: PlaceholderIssue,
     },
     InternalInvariant {
         problem: RpgMakerResponseInvariantProblem,
@@ -2157,6 +2162,7 @@ impl RpgMakerResponseProcessingProblem {
                     "rpg_maker.translation.response.unused_ordered_token"
                 }
             },
+            Self::PlaceholderProtection { problem } => problem.code(),
             Self::InternalInvariant { problem } => match problem {
                 RpgMakerResponseInvariantProblem::ResponseAttemptZero => {
                     "rpg_maker.translation.response.attempt_zero"
@@ -2196,6 +2202,7 @@ impl RpgMakerResponseProcessingProblem {
             Self::LanguageModuleMismatch { .. }
             | Self::LanguageProjection { .. }
             | Self::InternalInvariant { .. } => "internal_invariant",
+            Self::PlaceholderProtection { problem } => problem.summary_code(),
         }
     }
 
@@ -2214,6 +2221,7 @@ impl RpgMakerResponseProcessingProblem {
                 ),
             ],
             Self::LanguageProjection { problem } => response_language_projection_facts(problem),
+            Self::PlaceholderProtection { problem } => problem.facts(),
             Self::InternalInvariant { problem } => response_invariant_facts(problem),
         }
     }
@@ -2382,9 +2390,6 @@ impl RpgMakerEngineKind {
 pub(crate) enum RpgMakerInitialSetting {
     SourceLanguage,
     TargetLanguage,
-    DialogueMaxFullwidthChars,
-    ScrollingTextMaxFullwidthChars,
-    HelpDescriptionMaxFullwidthChars,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2728,10 +2733,6 @@ pub(crate) enum RpgMakerProjectMetadataViolation {
         stored: SafeText,
         canonical: SafeText,
     },
-    InvalidLineWidth {
-        column: SafeIdentifier,
-        actual: i64,
-    },
     InvalidSourceSnapshotFingerprintLength {
         expected: u64,
         actual: u64,
@@ -2753,7 +2754,6 @@ impl RpgMakerProjectMetadataViolation {
             Self::NameMismatch { .. } => "rpg_maker.project.metadata.name_mismatch",
             Self::InvalidLanguage { .. } => "rpg_maker.project.metadata.invalid_language",
             Self::NonCanonicalLanguage { .. } => "rpg_maker.project.metadata.noncanonical_language",
-            Self::InvalidLineWidth { .. } => "rpg_maker.project.metadata.invalid_line_width",
             Self::InvalidSourceSnapshotFingerprintLength { .. } => {
                 "rpg_maker.project.metadata.invalid_source_snapshot_fingerprint_length"
             }
@@ -2773,7 +2773,6 @@ impl RpgMakerProjectMetadataViolation {
             Self::NameMismatch { .. } => "name_mismatch",
             Self::InvalidLanguage { .. } => "invalid_language",
             Self::NonCanonicalLanguage { .. } => "noncanonical_language",
-            Self::InvalidLineWidth { .. } => "invalid_line_width",
             Self::InvalidSourceSnapshotFingerprintLength { .. } => {
                 "invalid_source_snapshot_fingerprint_length"
             }
@@ -2813,10 +2812,6 @@ impl RpgMakerProjectMetadataViolation {
                 facts.push(("column", column.to_string()));
                 facts.push(("stored", stored.to_string()));
                 facts.push(("canonical", canonical.to_string()));
-            }
-            Self::InvalidLineWidth { column, actual } => {
-                facts.push(("column", column.to_string()));
-                facts.push(("actual", actual.to_string()));
             }
             Self::InvalidSourceSnapshotFingerprintLength { expected, actual } => {
                 facts.push(("expected", expected.to_string()));
@@ -4167,7 +4162,6 @@ pub(crate) enum RpgMakerWriteBackDialoguePlanViolation {
     SpeakerSlotMismatch,
     UnexpectedBodyTranslation,
     EmptyBodyLines,
-    NonContiguousBodySemanticIndexes,
 }
 
 impl RpgMakerWriteBackDialoguePlanViolation {
@@ -4176,7 +4170,6 @@ impl RpgMakerWriteBackDialoguePlanViolation {
             Self::SpeakerSlotMismatch => "speaker_slot_mismatch",
             Self::UnexpectedBodyTranslation => "unexpected_body_translation",
             Self::EmptyBodyLines => "empty_body_lines",
-            Self::NonContiguousBodySemanticIndexes => "non_contiguous_body_semantic_indexes",
         }
     }
 }
@@ -6182,9 +6175,6 @@ impl RpgMakerInitialSetting {
         match self {
             Self::SourceLanguage => "source_language",
             Self::TargetLanguage => "target_language",
-            Self::DialogueMaxFullwidthChars => "dialogue_max_fullwidth_chars",
-            Self::ScrollingTextMaxFullwidthChars => "scrolling_text_max_fullwidth_chars",
-            Self::HelpDescriptionMaxFullwidthChars => "help_description_max_fullwidth_chars",
         }
     }
 }
@@ -6492,11 +6482,6 @@ pub(crate) enum RpgMakerProblem {
     TranslationPlanning {
         problem: RpgMakerTranslationPlanningProblem,
     },
-    ManualLayoutRequired {
-        locations: Vec<RpgMakerLogicalUnitLocator>,
-        region: RpgMakerManualLayoutRegion,
-        max_fullwidth_chars: u32,
-    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -6776,22 +6761,6 @@ impl RpgMakerIssue {
         }
     }
 
-    pub(crate) fn manual_layout_required(
-        locations: Vec<RpgMakerLogicalUnitLocator>,
-        region: RpgMakerManualLayoutRegion,
-        max_fullwidth_chars: u32,
-    ) -> Self {
-        debug_assert!(!locations.is_empty());
-        Self {
-            stage: RpgMakerDiagnosticStage::WriteBackDocument,
-            problem: RpgMakerProblem::ManualLayoutRequired {
-                locations,
-                region,
-                max_fullwidth_chars,
-            },
-        }
-    }
-
     pub(crate) const fn stage(&self) -> DiagnosticStage {
         self.stage.diagnostic_stage()
     }
@@ -6851,9 +6820,6 @@ impl RpgMakerIssue {
             RpgMakerProblem::WriteBackPlanning { problem } => problem.code(),
             RpgMakerProblem::WriteBackDocumentRewrite { problem } => problem.code(),
             RpgMakerProblem::TranslationPlanning { problem } => problem.code(),
-            RpgMakerProblem::ManualLayoutRequired { .. } => {
-                "rpg_maker.write_back.manual_layout_required"
-            }
         }
     }
 
@@ -6921,6 +6887,9 @@ impl RpgMakerIssue {
             RpgMakerProblem::ResponseProcessing { problem, .. } => match problem {
                 RpgMakerResponseProcessingProblem::Cancelled
                 | RpgMakerResponseProcessingProblem::Compute { .. } => DiagnosticResolution::Retry,
+                RpgMakerResponseProcessingProblem::PlaceholderProtection { .. } => {
+                    DiagnosticResolution::FixPlaceholderRules
+                }
                 RpgMakerResponseProcessingProblem::LanguageModuleMismatch { .. }
                 | RpgMakerResponseProcessingProblem::LanguageProjection { .. }
                 | RpgMakerResponseProcessingProblem::InternalInvariant { .. } => {
@@ -6934,9 +6903,6 @@ impl RpgMakerIssue {
             RpgMakerProblem::WriteBackPlanning { problem } => problem.resolution(),
             RpgMakerProblem::WriteBackDocumentRewrite { problem } => problem.resolution(),
             RpgMakerProblem::TranslationPlanning { problem } => problem.resolution(),
-            RpgMakerProblem::ManualLayoutRequired { .. } => {
-                DiagnosticResolution::AdjustManualLayout
-            }
         }
     }
 
@@ -6962,7 +6928,6 @@ impl RpgMakerIssue {
             RpgMakerProblem::WriteBackPlanning { problem } => problem.summary_code(),
             RpgMakerProblem::WriteBackDocumentRewrite { problem } => problem.summary_code(),
             RpgMakerProblem::TranslationPlanning { problem } => problem.summary_code(),
-            RpgMakerProblem::ManualLayoutRequired { .. } => "manual_layout_required",
         }
     }
 
@@ -7059,25 +7024,6 @@ impl RpgMakerIssue {
                 }
                 _ => "rpg_maker_translation_planning".to_owned(),
             },
-            RpgMakerProblem::ManualLayoutRequired { locations, .. } => locations
-                .iter()
-                .map(RpgMakerLogicalUnitLocator::natural_id)
-                .collect::<Vec<_>>()
-                .join(", "),
-        }
-    }
-
-    pub(crate) fn manual_layout_reason_detail(&self) -> Option<String> {
-        match &self.problem {
-            RpgMakerProblem::ManualLayoutRequired {
-                region,
-                max_fullwidth_chars,
-                ..
-            } => Some(format!(
-                "region={}; max_fullwidth_chars={max_fullwidth_chars}",
-                region.as_str()
-            )),
-            _ => None,
         }
     }
 
@@ -7214,22 +7160,6 @@ impl RpgMakerIssue {
             RpgMakerProblem::WriteBackPlanning { problem } => problem.facts(),
             RpgMakerProblem::WriteBackDocumentRewrite { problem } => problem.facts(),
             RpgMakerProblem::TranslationPlanning { problem } => problem.facts(),
-            RpgMakerProblem::ManualLayoutRequired {
-                locations,
-                region,
-                max_fullwidth_chars,
-            } => {
-                let mut facts = vec![
-                    ("region", region.as_str().to_owned()),
-                    ("max_fullwidth_chars", max_fullwidth_chars.to_string()),
-                ];
-                for location in locations {
-                    facts.push(("source", location.group_location.source_fact()));
-                    facts.push(("group_location", location.group_location.steps_fact()));
-                    facts.push(("role", location.role.fact_value()));
-                }
-                facts
-            }
         };
         if let RpgMakerProblem::DialogueDefinition { problem, .. } = &self.problem {
             facts.extend(problem.facts());
@@ -7251,8 +7181,7 @@ impl RpgMakerIssue {
             | RpgMakerProblem::DialogueDefinition { .. }
             | RpgMakerProblem::DialogueProjection { .. }
             | RpgMakerProblem::Document { .. }
-            | RpgMakerProblem::Extraction { .. }
-            | RpgMakerProblem::ManualLayoutRequired { .. } => None,
+            | RpgMakerProblem::Extraction { .. } => None,
             RpgMakerProblem::ResultStore { .. } => None,
             RpgMakerProblem::TranslationAsset { .. } => None,
             RpgMakerProblem::WriteBackAsset { .. } => None,

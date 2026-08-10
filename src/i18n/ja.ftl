@@ -9,6 +9,8 @@ cli-translate-about = 明示または保存済み Profile で抽出済み原文�
 cli-write-back-about = 現在の訳文をプロジェクトの出力へ書き込みます
 cli-manual-about = 編集可能な TOML で手動翻訳を管理します
 cli-manual-export-about = 現在手動翻訳が必要な項目を出力します
+cli-ownership-export-about = 抽出したすべての RPG Maker ユニットのテキスト所有権を出力します
+cli-translation-export-about = 抽出したすべてのユニットの原文、現在の翻訳、状態を出力します
 cli-manual-check-about = プロジェクトを変更せず手動翻訳 TOML を検査します
 cli-manual-apply-about = 入力済みで有効な手動翻訳を適用します
 cli-project-lua-about = プロジェクトデータベースに対して Lua スクリプトを実行します
@@ -16,9 +18,6 @@ cli-project-name-help = 安定したプロジェクト名
 cli-init-path-help = 入力ルートディレクトリ。既存プロジェクトでは前回成功時のパスを再利用できます
 cli-source-language-help = 原文の言語 ID
 cli-target-language-help = 翻訳先の言語 ID
-cli-dialogue-width-help = 会話行あたりの最大全角文字数
-cli-scrolling-width-help = スクロールテキスト行あたりの最大全角文字数
-cli-help-width-help = ヘルプまたは説明行あたりの最大全角文字数
 cli-builtin-help = ATT 内蔵の RPG Maker テキスト位置を使用します
 cli-rules-help = RPG Maker 抽出ルールをこの TOML 定義で置換します。空のルール一覧で無効になります
 cli-dialogue-rules-help = Builtin と併用する MV 会話名投影を置換します
@@ -104,12 +103,11 @@ result-translate-convergence = 状態収束: 保持 { $retained }、無効化 { 
 result-write-back-completed = 書き戻し完了: { $project }
 result-project-lua-completed = プロジェクト Lua 実行完了: { $project }
 result-output-directory = 出力ディレクトリ: { $path }
-result-write-back-summary = 書き戻し: 訳文 { $translated } 単位、原文 { $original } 単位。自動折返し { $auto_wrapped }、改行追加 { $breaks }、全角インデント追加 { $indents }。手動配置 { $manual }
+result-write-back-summary = 書き戻し: 訳文 { $translated } 単位、原文 { $original } 単位
 result-generic-extract-unchanged = Generic 入力に変更なし: { $files } ファイル、{ $groups } グループ、{ $units } 単位
 result-generic-extract-updated = Generic 入力を更新: { $files } ファイル、{ $groups } グループ、{ $units } 単位。訳文 { $preserved } 件を保持し、{ $cleared } 件を消去
 result-generic-translate-summary = Generic 翻訳: 計画 { $total } タスク、開始 { $started }、未開始 { $not_started }、完全 { $complete }、部分 { $partial }、利用不可 { $unavailable }、失敗 { $failed }、取消 { $cancelled }。計画 Unit { $planned_units }、残り Unit { $remaining_units }、クリア { $cleared }、再利用 { $reused }、受理 { $accepted }、書き込み { $written }、競合 { $conflicted }、応答問題 { $problems }
 result-generic-write-back-summary = Generic 書き戻し: 訳文 { $translated } 単位、原文保持 { $original } 単位
-result-symbol-repair-summary = 記号修復: { $attempted } 単位を確認、{ $repaired } 単位を修復、内部スキップ { $skipped } 単位、{ $replacements } 記号を置換
 result-run-log = 実行記録：{ $path }
 translate-incomplete-object = プロジェクト { $project } の今回の Translate
 translate-incomplete-rpg-maker-reason = 部分タスク { $partial }、利用不可タスク { $unavailable }、未開始タスク { $not_started }、プロトコル問題 { $protocol }、要求枯渇 { $exhausted }。要求受付は{
@@ -209,7 +207,6 @@ diagnostic-resolution-value = { $code ->
     [fix_input] 指定された入力を修正して再試行してください
     [fix_placeholder_rules] 指定された Placeholder ルールを修正して再試行してください
     [review_disabled_rules] これが意図した結果なら対応は不要です。そうでなければ、指定されたファイルに有効なルールを追加して Extract を再実行してください
-    [adjust_manual_layout] 指定された位置と表示幅に合わせて改行とレイアウトを手動で調整してください
     [check_path_and_permissions] パス、ファイルシステムの状態、権限を確認してください
     [check_project_state] プロジェクトの状態を確認・修正して再試行してください
     [resolve_contention] 競合する操作の完了を待ってから再試行してください
@@ -280,7 +277,6 @@ diagnostic-failure-value = { $code ->
     [duplicate_identifier] 識別子が重複しています
     [extraction_out_of_date] 保存済みの抽出結果は現在のソースと一致しません
     [invalid_content] 内容が必須契約に違反しています
-    [manual_layout_required] 改行またはレイアウトの手動調整が必要です
     [operation_failed] 操作に失敗しました
     [placeholder_projection_failed] Placeholder の投影で必須構造が保持されませんでした
     [profile_not_found] 選択した翻訳 Profile は存在しません
@@ -338,7 +334,6 @@ diagnostic-json-position = { $line } 行、{ $column } 列
 diagnostic-placeholder-rule-file = { $path } の Placeholder ルール { $number }
 diagnostic-placeholder-rule-project = 現在のプロジェクトの Placeholder ルール { $number }
 manual-exported = { $entries } 件を { $path } にエクスポートしました
-manual-ownership-exported = 所有権レコード：{ $path }
 manual-checked = 有効 { $valid }、未入力 { $unfilled }、エラー { $errors }
 manual-applied = 適用 { $applied }、未入力 { $unfilled }、エラー { $errors }
 manual-value = { $code ->

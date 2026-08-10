@@ -1715,7 +1715,6 @@ parameter = 0
             PathBuf::from("C:/att/projects/rules-test/project.db"),
             "ja".to_owned(),
             "zh-Hans".to_owned(),
-            crate::rpg_maker::project::test_layout_profile(),
         )
     }
 

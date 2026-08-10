@@ -1,9 +1,5 @@
 //! 从 RPG Maker 文本资产规划并生成写回候选。
 
-pub(crate) mod layout;
-
-pub(crate) use layout::ConservativeRpgMakerWriteBackTextLayouter;
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
@@ -14,53 +10,49 @@ use std::sync::{Arc, Mutex};
 use super::{RpgMakerWriteBack, RpgMakerWriteBackSummary, WriteBackProgressPhase};
 use crate::diagnostic::{
     Diagnostic, DiagnosticReport, PlaceholderRuleSource, RpgMakerComputeFailure, RpgMakerIssue,
-    RpgMakerLogicalUnitLocator, RpgMakerManualLayoutRegion, RpgMakerUnitLocator,
-    RpgMakerWriteBackChoicesPlanViolation, RpgMakerWriteBackDialoguePlanViolation,
-    RpgMakerWriteBackMutationPlanViolation, RpgMakerWriteBackPlanningProblem, StateEffect,
+    RpgMakerUnitLocator, RpgMakerWriteBackChoicesPlanViolation,
+    RpgMakerWriteBackDialoguePlanViolation, RpgMakerWriteBackMutationPlanViolation,
+    RpgMakerWriteBackPlanningProblem, StateEffect,
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::execution::{CooperativeCancellation, OperationCompletion};
-use crate::language::{LanguageText, LanguageTextSegment};
 use crate::progress::{NoopProgressObserver, ProgressObserver, ProgressSnapshot};
 use crate::rpg_maker::RpgMakerEngine;
 use crate::rpg_maker::asset::RpgMakerAssetOwner;
 use crate::rpg_maker::model::{
-    DialogueLinePart, DialogueWriteRecipe, DirectTextPart, DirectTextRecipe, LogicalTextLocation,
-    MutationClaim, MutationClaimIndex, MutationClaimSet, MutationResourceLock,
-    TextProjectionRecipe, TextUnitContent, TextUnitContentStructureError, TextUnitContentView,
-    TextUnitRole, mutation_claims_for_group, validate_text_unit_content_structure,
+    DialogueLinePart, DialogueWriteRecipe, DirectTextPart, DirectTextRecipe, MutationClaim,
+    MutationClaimIndex, MutationClaimSet, MutationResourceLock, TextProjectionRecipe,
+    TextUnitContent, TextUnitContentStructureError, TextUnitContentView, TextUnitRole,
+    mutation_claims_for_group, validate_text_unit_content_structure,
 };
-use crate::rpg_maker::project::{MaxFullwidthChars, OpenedProject, RpgMakerWriteBackLayoutProfile};
-use crate::rpg_maker::text::{
-    RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, StandardDataFile, TextGroupKind,
-};
+use crate::rpg_maker::project::OpenedProject;
+use crate::rpg_maker::text::{RpgMakerLocation, TextGroupKind};
 use crate::rpg_maker::translate::pipeline::{
     AppliedPlaceholder, TranslationPlaceholderProjectionFailure, TranslationPlanningFailureReason,
     placeholder_projection_diagnostic, placeholder_protection_diagnostic,
 };
 use crate::rpg_maker::translate::placeholder::{
-    CompiledPlaceholderRules, Pcre2PlaceholderService, ProtectedText,
+    CompiledPlaceholderRules, Pcre2PlaceholderService, RpgMakerBuiltinPlaceholderProfile,
 };
-use crate::rpg_maker::translate::planner::{
-    placeholder_projection_planning_failure, placeholder_protection_planning_failure,
-};
+use crate::rpg_maker::translate::planner::placeholder_protection_planning_failure;
 use crate::runtime::cpu::CpuExecutorUnavailable;
-use crate::translation::symbol_repair::{
-    TranslationSymbolRepairOutcome, TranslationSymbolRepairer,
+use crate::translation::candidate_validation::{
+    CandidateTextShape, ProvenInvariantViolation, is_structural_blank, validate_candidate_text,
 };
+use crate::translation::placeholder::placeholder_bindings_match_within_slot;
 
 const MAX_PLANNING_PROGRESS_UPDATES: u64 = 1_024;
 
-/// 同一数据库读快照中解析、编译完成的写回符号修复资源。
+/// 同一数据库读快照中解析、编译完成的候选验收资源。
 #[derive(Clone)]
-pub(crate) struct RpgMakerWriteBackSymbolRepairContext {
+pub(crate) struct RpgMakerWriteBackCandidateValidationContext {
     engine: RpgMakerEngine,
     placeholder_service: Pcre2PlaceholderService,
     placeholder_rules: CompiledPlaceholderRules,
     placeholder_rules_json: String,
 }
 
-impl RpgMakerWriteBackSymbolRepairContext {
+impl RpgMakerWriteBackCandidateValidationContext {
     pub(crate) fn new(
         engine: RpgMakerEngine,
         placeholder_service: Pcre2PlaceholderService,
@@ -76,23 +68,23 @@ impl RpgMakerWriteBackSymbolRepairContext {
     }
 }
 
-impl fmt::Debug for RpgMakerWriteBackSymbolRepairContext {
+impl fmt::Debug for RpgMakerWriteBackCandidateValidationContext {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("RpgMakerWriteBackSymbolRepairContext")
+            .debug_struct("RpgMakerWriteBackCandidateValidationContext")
             .field("engine", &self.engine)
             .field("placeholder_rules", &self.placeholder_rules)
             .finish_non_exhaustive()
     }
 }
 
-impl PartialEq for RpgMakerWriteBackSymbolRepairContext {
+impl PartialEq for RpgMakerWriteBackCandidateValidationContext {
     fn eq(&self, other: &Self) -> bool {
         self.engine == other.engine && self.placeholder_rules_json == other.placeholder_rules_json
     }
 }
 
-impl Eq for RpgMakerWriteBackSymbolRepairContext {}
+impl Eq for RpgMakerWriteBackCandidateValidationContext {}
 
 /// 一个可独立拥有译文、验收并原子写回的语义文本单元。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -132,7 +124,7 @@ impl RpgMakerWriteBackUnit {
         }
         if let Some(translation) = &translation_content {
             validate_content_presence(&role, translation, "译文")?;
-            if !manual && translation.is_blank() {
+            if translation.is_blank() {
                 return Err(RpgMakerWriteBackSnapshotError::BlankTranslationContent {
                     role: role.clone(),
                 });
@@ -153,284 +145,115 @@ impl RpgMakerWriteBackUnit {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct SymbolRepairStatistics {
-    attempted_units: usize,
-    repaired_units: usize,
-    skipped_units: usize,
-    replacements: usize,
-}
-
-enum RepairedText {
-    Unchanged,
-    Repaired {
-        text: String,
-        replacements: usize,
-    },
-    RepairedLines {
-        lines: Vec<String>,
-        replacements: usize,
-    },
-    Skipped,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct SymbolRepairAllocation {
-    #[cfg(test)]
-    fail_reservations: bool,
-}
-
-impl SymbolRepairAllocation {
-    fn try_reserve_string(self, output: &mut String, additional: usize) -> bool {
-        #[cfg(test)]
-        if self.fail_reservations && additional != 0 {
-            return false;
-        }
-        output.try_reserve_exact(additional).is_ok()
-    }
-
-    fn try_reserve_vec<T>(self, output: &mut Vec<T>, additional: usize) -> bool {
-        #[cfg(test)]
-        if self.fail_reservations && additional != 0 {
-            return false;
-        }
-        output.try_reserve_exact(additional).is_ok()
-    }
-
-    #[cfg(test)]
-    const fn failing() -> Self {
-        Self {
-            fail_reservations: true,
-        }
-    }
-}
-
-#[cfg(test)]
-fn repair_unit_translation_symbols(
-    unit: &mut RpgMakerWriteBackUnit,
+fn validate_unit_translation_with_cancellation(
+    unit: &RpgMakerWriteBackUnit,
+    owner: RpgMakerAssetOwner,
     kind: TextGroupKind,
-    context: &RpgMakerWriteBackSymbolRepairContext,
-) -> Result<SymbolRepairStatistics, TranslationPlanningFailureReason> {
-    match repair_unit_translation_symbols_with_cancellation(
-        unit,
-        kind,
-        context,
-        &CooperativeCancellation::default(),
-    )? {
-        OperationCompletion::Completed(statistics) => Ok(statistics),
-        OperationCompletion::Cancelled => unreachable!("测试取消状态必须保持运行"),
-    }
-}
-
-fn repair_unit_translation_symbols_with_cancellation(
-    unit: &mut RpgMakerWriteBackUnit,
-    kind: TextGroupKind,
-    context: &RpgMakerWriteBackSymbolRepairContext,
+    group_location: &RpgMakerLocation,
+    context: &RpgMakerWriteBackCandidateValidationContext,
     cancellation: &CooperativeCancellation,
-) -> Result<OperationCompletion<SymbolRepairStatistics>, TranslationPlanningFailureReason> {
-    repair_unit_translation_symbols_with_allocation(
-        unit,
-        kind,
-        context,
-        cancellation,
-        SymbolRepairAllocation::default(),
-    )
-}
-
-fn repair_unit_translation_symbols_with_allocation(
-    unit: &mut RpgMakerWriteBackUnit,
-    kind: TextGroupKind,
-    context: &RpgMakerWriteBackSymbolRepairContext,
-    cancellation: &CooperativeCancellation,
-    allocation: SymbolRepairAllocation,
-) -> Result<OperationCompletion<SymbolRepairStatistics>, TranslationPlanningFailureReason> {
+) -> Result<OperationCompletion<()>, TranslationPlanningFailureReason> {
     if cancellation.is_requested() {
         return Ok(OperationCompletion::Cancelled);
     }
-    if unit.manual {
-        return Ok(OperationCompletion::Completed(
-            SymbolRepairStatistics::default(),
-        ));
-    }
     let Some(translation) = unit.translation_content.as_ref() else {
-        return Ok(OperationCompletion::Completed(
-            SymbolRepairStatistics::default(),
-        ));
+        return Ok(OperationCompletion::Completed(()));
     };
-    let mut statistics = SymbolRepairStatistics {
-        attempted_units: 1,
-        ..SymbolRepairStatistics::default()
-    };
-
-    let repaired = match (&unit.source_content, translation) {
+    let target_id = crate::manual::readable_rpg_maker_id(group_location, kind, &unit.role);
+    let profile = RpgMakerBuiltinPlaceholderProfile::for_location(
+        context.engine,
+        owner,
+        kind,
+        group_location,
+        &unit.role,
+    );
+    match (&unit.source_content, translation) {
         (TextUnitContent::Value(source), TextUnitContent::Value(translation)) => {
-            match repair_text_symbols_with_cancellation(
-                source,
-                translation,
-                kind,
-                context,
-                false,
-                cancellation,
-                allocation,
-            )? {
-                OperationCompletion::Completed(repaired) => repaired,
-                OperationCompletion::Cancelled => return Ok(OperationCompletion::Cancelled),
+            if matches!(
+                validate_text_placeholder_bindings(
+                    source,
+                    translation,
+                    kind,
+                    &target_id,
+                    profile,
+                    context,
+                    cancellation,
+                )?,
+                OperationCompletion::Cancelled
+            ) {
+                return Ok(OperationCompletion::Cancelled);
             }
         }
         (TextUnitContent::Lines(source), TextUnitContent::Lines(translation))
-            if matches!(
-                unit.role,
-                TextUnitRole::Choices | TextUnitRole::ScrollingText
-            ) =>
+            if unit.role.preserves_placeholder_line_slots() =>
         {
-            match repair_aligned_line_symbols_with_cancellation(
-                source,
-                translation,
-                kind,
-                context,
-                cancellation,
-                allocation,
-            )? {
-                OperationCompletion::Completed(repaired) => repaired,
-                OperationCompletion::Cancelled => return Ok(OperationCompletion::Cancelled),
+            for (source, translation) in source.iter().zip(translation) {
+                if cancellation.is_requested() {
+                    return Ok(OperationCompletion::Cancelled);
+                }
+                if matches!(
+                    validate_text_placeholder_bindings(
+                        source,
+                        translation,
+                        kind,
+                        &target_id,
+                        profile,
+                        context,
+                        cancellation,
+                    )?,
+                    OperationCompletion::Cancelled
+                ) {
+                    return Ok(OperationCompletion::Cancelled);
+                }
             }
         }
         (TextUnitContent::Lines(source), TextUnitContent::Lines(translation)) => {
-            let source = match join_symbol_repair_lines(source, cancellation, allocation) {
-                OperationCompletion::Completed(Some(text)) => text,
-                OperationCompletion::Completed(None) => {
-                    return Ok(OperationCompletion::Completed(skipped_symbol_repair(
-                        statistics,
-                    )));
-                }
-                OperationCompletion::Cancelled => return Ok(OperationCompletion::Cancelled),
-            };
-            let translation = match join_symbol_repair_lines(translation, cancellation, allocation)
-            {
-                OperationCompletion::Completed(Some(text)) => text,
-                OperationCompletion::Completed(None) => {
-                    return Ok(OperationCompletion::Completed(skipped_symbol_repair(
-                        statistics,
-                    )));
-                }
-                OperationCompletion::Cancelled => return Ok(OperationCompletion::Cancelled),
-            };
-            match repair_text_symbols_with_cancellation(
-                &source,
-                &translation,
-                kind,
-                context,
-                true,
-                cancellation,
-                allocation,
-            )? {
-                OperationCompletion::Completed(repaired) => repaired,
-                OperationCompletion::Cancelled => return Ok(OperationCompletion::Cancelled),
+            let source = source.join("\n");
+            let translation = translation.join("\n");
+            if matches!(
+                validate_text_placeholder_bindings(
+                    &source,
+                    &translation,
+                    kind,
+                    &target_id,
+                    profile,
+                    context,
+                    cancellation,
+                )?,
+                OperationCompletion::Cancelled
+            ) {
+                return Ok(OperationCompletion::Cancelled);
             }
         }
         _ => unreachable!("受信写回单元的原文与译文结构必须一致"),
-    };
-
-    if cancellation.is_requested() {
-        return Ok(OperationCompletion::Cancelled);
     }
-    Ok(OperationCompletion::Completed(match repaired {
-        RepairedText::Unchanged => statistics,
-        RepairedText::Skipped => skipped_symbol_repair(statistics),
-        RepairedText::Repaired { text, replacements } => {
-            let replacement = match &unit.translation_content {
-                Some(TextUnitContent::Value(_)) => TextUnitContent::Value(text),
-                Some(TextUnitContent::Lines(lines)) => {
-                    let repaired_lines = match split_symbol_repair_lines(
-                        &text,
-                        lines.len(),
-                        cancellation,
-                        allocation,
-                    ) {
-                        OperationCompletion::Completed(Some(lines)) => lines,
-                        OperationCompletion::Completed(None) => {
-                            return Ok(OperationCompletion::Completed(skipped_symbol_repair(
-                                statistics,
-                            )));
-                        }
-                        OperationCompletion::Cancelled => {
-                            return Ok(OperationCompletion::Cancelled);
-                        }
-                    };
-                    TextUnitContent::Lines(repaired_lines)
-                }
-                None => unreachable!("已确认写回单元存在译文"),
-            };
-            unit.translation_content = Some(replacement);
-            statistics.repaired_units = 1;
-            statistics.replacements = replacements;
-            statistics
-        }
-        RepairedText::RepairedLines {
-            lines,
-            replacements,
-        } => {
-            debug_assert!(matches!(
-                unit.translation_content,
-                Some(TextUnitContent::Lines(_))
-            ));
-            unit.translation_content = Some(TextUnitContent::Lines(lines));
-            statistics.repaired_units = 1;
-            statistics.replacements = replacements;
-            statistics
-        }
-    }))
+    Ok(OperationCompletion::Completed(()))
 }
 
-fn skipped_symbol_repair(mut statistics: SymbolRepairStatistics) -> SymbolRepairStatistics {
-    statistics.skipped_units = 1;
-    statistics
-}
-
-fn repair_text_symbols_with_cancellation(
+fn validate_text_placeholder_bindings(
     source: &str,
     translation: &str,
     kind: TextGroupKind,
-    context: &RpgMakerWriteBackSymbolRepairContext,
-    has_line_slot_boundaries: bool,
+    target_id: &str,
+    profile: RpgMakerBuiltinPlaceholderProfile,
+    context: &RpgMakerWriteBackCandidateValidationContext,
     cancellation: &CooperativeCancellation,
-    allocation: SymbolRepairAllocation,
-) -> Result<OperationCompletion<RepairedText>, TranslationPlanningFailureReason> {
-    if cancellation.is_requested() {
-        return Ok(OperationCompletion::Cancelled);
-    }
-    let source_line_boundaries = if has_line_slot_boundaries {
-        match line_separator_offsets(source, cancellation, allocation) {
-            OperationCompletion::Completed(Some(offsets)) => offsets,
-            OperationCompletion::Completed(None) => {
-                return Ok(OperationCompletion::Completed(RepairedText::Skipped));
-            }
-            OperationCompletion::Cancelled => return Ok(OperationCompletion::Cancelled),
-        }
-    } else {
-        Vec::new()
+) -> Result<OperationCompletion<()>, TranslationPlanningFailureReason> {
+    let protect = |text: &str| {
+        context
+            .placeholder_service
+            .protect_profile_with_cancellation(
+                context.engine,
+                kind,
+                target_id,
+                profile,
+                text,
+                &[],
+                &context.placeholder_rules,
+                || ensure_candidate_validation_running(cancellation),
+            )
     };
-    let translation_line_boundaries = if has_line_slot_boundaries {
-        match line_separator_offsets(translation, cancellation, allocation) {
-            OperationCompletion::Completed(Some(offsets)) => offsets,
-            OperationCompletion::Completed(None) => {
-                return Ok(OperationCompletion::Completed(RepairedText::Skipped));
-            }
-            OperationCompletion::Cancelled => return Ok(OperationCompletion::Cancelled),
-        }
-    } else {
-        Vec::new()
-    };
-    let source = match context
-        .placeholder_service
-        .protect_with_line_boundaries_with_cancellation(
-            context.engine,
-            kind,
-            source,
-            &source_line_boundaries,
-            &context.placeholder_rules,
-            || ensure_symbol_repair_running(cancellation),
-        ) {
+    let source = match protect(source) {
         Ok(Ok(source)) => source,
         Ok(Err(source)) => {
             return Err(TranslationPlanningFailureReason::PlaceholderProtection {
@@ -439,158 +262,7 @@ fn repair_text_symbols_with_cancellation(
         }
         Err(()) => return Ok(OperationCompletion::Cancelled),
     };
-    let translation_view = match context
-        .placeholder_service
-        .protect_with_line_boundaries_with_cancellation(
-            context.engine,
-            kind,
-            translation,
-            &translation_line_boundaries,
-            &context.placeholder_rules,
-            || ensure_symbol_repair_running(cancellation),
-        ) {
-        Ok(Ok(translation)) => translation,
-        Ok(Err(source)) => {
-            return Err(TranslationPlanningFailureReason::PlaceholderProtection {
-                failure: placeholder_protection_planning_failure(source),
-            });
-        }
-        Err(()) => return Ok(OperationCompletion::Cancelled),
-    };
-    validate_placeholder_bindings(source.placeholders(), translation_view.placeholders())
-        .map_err(|failure| TranslationPlanningFailureReason::PlaceholderProjection { failure })?;
-    let source = match source
-        .language_text_with_cancellation(|| ensure_symbol_repair_running(cancellation))
-    {
-        Ok(Ok(source)) => source,
-        Ok(Err(source)) => {
-            return Err(TranslationPlanningFailureReason::PlaceholderProjection {
-                failure: placeholder_projection_planning_failure(source),
-            });
-        }
-        Err(()) => return Ok(OperationCompletion::Cancelled),
-    };
-    let translation_text = match translation_view
-        .language_text_with_cancellation(|| ensure_symbol_repair_running(cancellation))
-    {
-        Ok(Ok(translation)) => translation,
-        Ok(Err(source)) => {
-            return Err(TranslationPlanningFailureReason::PlaceholderProjection {
-                failure: placeholder_projection_planning_failure(source),
-            });
-        }
-        Err(()) => return Ok(OperationCompletion::Cancelled),
-    };
-    let (plan, replacements) = match TranslationSymbolRepairer::plan_repair_with_cancellation(
-        &source,
-        &translation_text,
-        || ensure_symbol_repair_running(cancellation),
-    ) {
-        Ok(TranslationSymbolRepairOutcome::Unchanged) => {
-            return Ok(OperationCompletion::Completed(RepairedText::Unchanged));
-        }
-        Ok(TranslationSymbolRepairOutcome::Repaired {
-            plan,
-            replacement_count,
-        }) => (plan, replacement_count),
-        Ok(TranslationSymbolRepairOutcome::Skipped { .. }) => {
-            return Ok(OperationCompletion::Completed(RepairedText::Skipped));
-        }
-        Err(()) => return Ok(OperationCompletion::Cancelled),
-    };
-    let repaired = match translation_text
-        .apply_repair_with_cancellation(&plan, || ensure_symbol_repair_running(cancellation))
-    {
-        Ok(Ok(repaired)) => repaired,
-        Ok(Err(_)) => {
-            return Ok(OperationCompletion::Completed(RepairedText::Skipped));
-        }
-        Err(()) => return Ok(OperationCompletion::Cancelled),
-    };
-    let text =
-        match rebuild_protected_translation(&translation_view, &repaired, cancellation, allocation)
-        {
-            OperationCompletion::Completed(Some(text)) => text,
-            OperationCompletion::Completed(None) => {
-                return Ok(OperationCompletion::Completed(RepairedText::Skipped));
-            }
-            OperationCompletion::Cancelled => return Ok(OperationCompletion::Cancelled),
-        };
-    if cancellation.is_requested() {
-        return Ok(OperationCompletion::Cancelled);
-    }
-    Ok(OperationCompletion::Completed(RepairedText::Repaired {
-        text,
-        replacements,
-    }))
-}
-
-fn repair_aligned_line_symbols_with_cancellation(
-    source_lines: &[String],
-    translation_lines: &[String],
-    kind: TextGroupKind,
-    context: &RpgMakerWriteBackSymbolRepairContext,
-    cancellation: &CooperativeCancellation,
-    allocation: SymbolRepairAllocation,
-) -> Result<OperationCompletion<RepairedText>, TranslationPlanningFailureReason> {
-    let source_text = match join_symbol_repair_lines(source_lines, cancellation, allocation) {
-        OperationCompletion::Completed(Some(text)) => text,
-        OperationCompletion::Completed(None) => {
-            return Ok(OperationCompletion::Completed(RepairedText::Skipped));
-        }
-        OperationCompletion::Cancelled => return Ok(OperationCompletion::Cancelled),
-    };
-    let translation_text =
-        match join_symbol_repair_lines(translation_lines, cancellation, allocation) {
-            OperationCompletion::Completed(Some(text)) => text,
-            OperationCompletion::Completed(None) => {
-                return Ok(OperationCompletion::Completed(RepairedText::Skipped));
-            }
-            OperationCompletion::Cancelled => return Ok(OperationCompletion::Cancelled),
-        };
-    let source_boundaries = match line_separator_offsets(&source_text, cancellation, allocation) {
-        OperationCompletion::Completed(Some(offsets)) => offsets,
-        OperationCompletion::Completed(None) => {
-            return Ok(OperationCompletion::Completed(RepairedText::Skipped));
-        }
-        OperationCompletion::Cancelled => return Ok(OperationCompletion::Cancelled),
-    };
-    let translation_boundaries =
-        match line_separator_offsets(&translation_text, cancellation, allocation) {
-            OperationCompletion::Completed(Some(offsets)) => offsets,
-            OperationCompletion::Completed(None) => {
-                return Ok(OperationCompletion::Completed(RepairedText::Skipped));
-            }
-            OperationCompletion::Cancelled => return Ok(OperationCompletion::Cancelled),
-        };
-    let source = match context
-        .placeholder_service
-        .protect_with_line_boundaries_with_cancellation(
-            context.engine,
-            kind,
-            &source_text,
-            &source_boundaries,
-            &context.placeholder_rules,
-            || ensure_symbol_repair_running(cancellation),
-        ) {
-        Ok(Ok(source)) => source,
-        Ok(Err(source)) => {
-            return Err(TranslationPlanningFailureReason::PlaceholderProtection {
-                failure: placeholder_protection_planning_failure(source),
-            });
-        }
-        Err(()) => return Ok(OperationCompletion::Cancelled),
-    };
-    let translation = match context
-        .placeholder_service
-        .protect_with_line_boundaries_with_cancellation(
-            context.engine,
-            kind,
-            &translation_text,
-            &translation_boundaries,
-            &context.placeholder_rules,
-            || ensure_symbol_repair_running(cancellation),
-        ) {
+    let translation = match protect(translation) {
         Ok(Ok(translation)) => translation,
         Ok(Err(source)) => {
             return Err(TranslationPlanningFailureReason::PlaceholderProtection {
@@ -601,65 +273,10 @@ fn repair_aligned_line_symbols_with_cancellation(
     };
     validate_placeholder_bindings(source.placeholders(), translation.placeholders())
         .map_err(|failure| TranslationPlanningFailureReason::PlaceholderProjection { failure })?;
-    let mut repaired_lines =
-        match clone_symbol_repair_lines(translation_lines, cancellation, allocation) {
-            OperationCompletion::Completed(Some(lines)) => lines,
-            OperationCompletion::Completed(None) => {
-                return Ok(OperationCompletion::Completed(RepairedText::Skipped));
-            }
-            OperationCompletion::Cancelled => return Ok(OperationCompletion::Cancelled),
-        };
-    let mut replacements = 0_usize;
-    for ((source_line, translation_line), repaired_line) in source_lines
-        .iter()
-        .zip(translation_lines)
-        .zip(&mut repaired_lines)
-    {
-        if cancellation.is_requested() {
-            return Ok(OperationCompletion::Cancelled);
-        }
-        match repair_text_symbols_with_cancellation(
-            source_line,
-            translation_line,
-            kind,
-            context,
-            false,
-            cancellation,
-            allocation,
-        )? {
-            OperationCompletion::Completed(RepairedText::Unchanged) => {}
-            OperationCompletion::Completed(RepairedText::Repaired {
-                text,
-                replacements: line_replacements,
-            }) => {
-                *repaired_line = text;
-                let Some(total) = replacements.checked_add(line_replacements) else {
-                    return Ok(OperationCompletion::Completed(RepairedText::Skipped));
-                };
-                replacements = total;
-            }
-            OperationCompletion::Completed(RepairedText::Skipped) => {
-                return Ok(OperationCompletion::Completed(RepairedText::Skipped));
-            }
-            OperationCompletion::Completed(RepairedText::RepairedLines { .. }) => {
-                unreachable!("单行符号修复不能返回行序列")
-            }
-            OperationCompletion::Cancelled => return Ok(OperationCompletion::Cancelled),
-        }
-    }
-    if replacements == 0 {
-        Ok(OperationCompletion::Completed(RepairedText::Unchanged))
-    } else {
-        Ok(OperationCompletion::Completed(
-            RepairedText::RepairedLines {
-                lines: repaired_lines,
-                replacements,
-            },
-        ))
-    }
+    Ok(OperationCompletion::Completed(()))
 }
 
-fn ensure_symbol_repair_running(cancellation: &CooperativeCancellation) -> Result<(), ()> {
+fn ensure_candidate_validation_running(cancellation: &CooperativeCancellation) -> Result<(), ()> {
     if cancellation.is_requested() {
         Err(())
     } else {
@@ -671,274 +288,22 @@ fn validate_placeholder_bindings(
     expected: &[AppliedPlaceholder],
     actual: &[AppliedPlaceholder],
 ) -> Result<(), TranslationPlaceholderProjectionFailure> {
-    if expected.len() != actual.len() {
-        return Err(
-            TranslationPlaceholderProjectionFailure::ChangedSegmentCount {
-                expected: expected.len(),
-                actual: actual.len(),
-            },
-        );
+    if placeholder_bindings_match_within_slot(expected, actual) {
+        return Ok(());
     }
-    for (segment_index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
-        if expected == actual {
-            continue;
-        }
-        if expected.segment() != actual.segment() {
-            return Err(
-                TranslationPlaceholderProjectionFailure::ChangedSegmentKind { segment_index },
-            );
-        }
-        if expected.token() != actual.token() {
-            return Err(TranslationPlaceholderProjectionFailure::ChangedTokenOrder {
-                position: segment_index,
-                expected_token: expected.token().to_owned(),
-                actual_token: actual.token().to_owned(),
-            });
-        }
-        return Err(TranslationPlaceholderProjectionFailure::MissingOrderedToken { segment_index });
-    }
-    Ok(())
-}
-
-fn clone_symbol_repair_lines(
-    lines: &[String],
-    cancellation: &CooperativeCancellation,
-    allocation: SymbolRepairAllocation,
-) -> OperationCompletion<Option<Vec<String>>> {
-    if cancellation.is_requested() {
-        return OperationCompletion::Cancelled;
-    }
-    let mut cloned = Vec::new();
-    if !allocation.try_reserve_vec(&mut cloned, lines.len()) {
-        return OperationCompletion::Completed(None);
-    }
-    for line in lines {
-        if cancellation.is_requested() {
-            return OperationCompletion::Cancelled;
-        }
-        let mut cloned_line = String::new();
-        if !allocation.try_reserve_string(&mut cloned_line, line.len()) {
-            return OperationCompletion::Completed(None);
-        }
-        cloned_line.push_str(line);
-        cloned.push(cloned_line);
-    }
-    if cancellation.is_requested() {
-        OperationCompletion::Cancelled
-    } else {
-        OperationCompletion::Completed(Some(cloned))
-    }
-}
-
-fn join_symbol_repair_lines(
-    lines: &[String],
-    cancellation: &CooperativeCancellation,
-    allocation: SymbolRepairAllocation,
-) -> OperationCompletion<Option<String>> {
-    if cancellation.is_requested() {
-        return OperationCompletion::Cancelled;
-    }
-    let total = match checked_joined_symbol_repair_length(
-        lines.iter().map(String::len),
-        lines.len().saturating_sub(1),
-        cancellation,
-    ) {
-        OperationCompletion::Completed(Some(total)) => total,
-        OperationCompletion::Completed(None) => return OperationCompletion::Completed(None),
-        OperationCompletion::Cancelled => return OperationCompletion::Cancelled,
-    };
-    let mut joined = String::new();
-    if !allocation.try_reserve_string(&mut joined, total) {
-        return OperationCompletion::Completed(None);
-    }
-    for (index, line) in lines.iter().enumerate() {
-        if cancellation.is_requested() {
-            return OperationCompletion::Cancelled;
-        }
-        if index != 0 {
-            joined.push('\n');
-        }
-        joined.push_str(line);
-    }
-    if cancellation.is_requested() {
-        OperationCompletion::Cancelled
-    } else {
-        OperationCompletion::Completed(Some(joined))
-    }
-}
-
-fn checked_joined_symbol_repair_length(
-    lengths: impl IntoIterator<Item = usize>,
-    separator_bytes: usize,
-    cancellation: &CooperativeCancellation,
-) -> OperationCompletion<Option<usize>> {
-    let mut total = separator_bytes;
-    for length in lengths {
-        if cancellation.is_requested() {
-            return OperationCompletion::Cancelled;
-        }
-        let Some(next) = total.checked_add(length) else {
-            return OperationCompletion::Completed(None);
-        };
-        total = next;
-    }
-    if cancellation.is_requested() {
-        OperationCompletion::Cancelled
-    } else {
-        OperationCompletion::Completed(Some(total))
-    }
-}
-
-fn split_symbol_repair_lines(
-    text: &str,
-    expected_lines: usize,
-    cancellation: &CooperativeCancellation,
-    allocation: SymbolRepairAllocation,
-) -> OperationCompletion<Option<Vec<String>>> {
-    if cancellation.is_requested() {
-        return OperationCompletion::Cancelled;
-    }
-    let mut lines = Vec::new();
-    if !allocation.try_reserve_vec(&mut lines, expected_lines) {
-        return OperationCompletion::Completed(None);
-    }
-    for line in text.split('\n') {
-        if cancellation.is_requested() {
-            return OperationCompletion::Cancelled;
-        }
-        if lines.len() == expected_lines {
-            return OperationCompletion::Completed(None);
-        }
-        let mut owned = String::new();
-        if !allocation.try_reserve_string(&mut owned, line.len()) {
-            return OperationCompletion::Completed(None);
-        }
-        owned.push_str(line);
-        lines.push(owned);
-    }
-    if lines.len() != expected_lines {
-        return OperationCompletion::Completed(None);
-    }
-    if cancellation.is_requested() {
-        OperationCompletion::Cancelled
-    } else {
-        OperationCompletion::Completed(Some(lines))
-    }
-}
-
-fn line_separator_offsets(
-    text: &str,
-    cancellation: &CooperativeCancellation,
-    allocation: SymbolRepairAllocation,
-) -> OperationCompletion<Option<Vec<usize>>> {
-    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
-
-    let mut count = 0_usize;
-    for chunk in text.as_bytes().chunks(CANCELLATION_CHECK_BYTES) {
-        if cancellation.is_requested() {
-            return OperationCompletion::Cancelled;
-        }
-        let chunk_count = chunk.iter().filter(|byte| **byte == b'\n').count();
-        let Some(next) = count.checked_add(chunk_count) else {
-            return OperationCompletion::Completed(None);
-        };
-        count = next;
-    }
-    let mut offsets = Vec::new();
-    if !allocation.try_reserve_vec(&mut offsets, count) {
-        return OperationCompletion::Completed(None);
-    }
-    for (offset, _) in text.match_indices('\n') {
-        if cancellation.is_requested() {
-            return OperationCompletion::Cancelled;
-        }
-        offsets.push(offset);
-    }
-    if cancellation.is_requested() {
-        OperationCompletion::Cancelled
-    } else {
-        OperationCompletion::Completed(Some(offsets))
-    }
-}
-
-fn rebuild_protected_translation(
-    protected: &ProtectedText,
-    repaired: &LanguageText,
-    cancellation: &CooperativeCancellation,
-    allocation: SymbolRepairAllocation,
-) -> OperationCompletion<Option<String>> {
-    let mut placeholders = protected.placeholders().iter();
-    let mut total = 0_usize;
-    for segment in repaired.segments() {
-        if cancellation.is_requested() {
-            return OperationCompletion::Cancelled;
-        }
-        let text = match segment {
-            LanguageTextSegment::NaturalText(text) => text.as_str(),
-            LanguageTextSegment::OpaqueBoundary => {
-                let Some(placeholder) = placeholders.next() else {
-                    return OperationCompletion::Completed(None);
-                };
-                placeholder.original()
-            }
-        };
-        let Some(next) = total.checked_add(text.len()) else {
-            return OperationCompletion::Completed(None);
-        };
-        total = next;
-    }
-    if placeholders.next().is_some() {
-        return OperationCompletion::Completed(None);
-    }
-
-    let mut output = String::new();
-    if !allocation.try_reserve_string(&mut output, total) {
-        return OperationCompletion::Completed(None);
-    }
-    let mut placeholders = protected.placeholders().iter();
-    for segment in repaired.segments() {
-        if cancellation.is_requested() {
-            return OperationCompletion::Cancelled;
-        }
-        match segment {
-            LanguageTextSegment::NaturalText(text) => output.push_str(text),
-            LanguageTextSegment::OpaqueBoundary => {
-                let Some(placeholder) = placeholders.next() else {
-                    return OperationCompletion::Completed(None);
-                };
-                output.push_str(placeholder.original());
-            }
-        }
-    }
-    if placeholders.next().is_some() {
-        return OperationCompletion::Completed(None);
-    }
-    if cancellation.is_requested() {
-        OperationCompletion::Cancelled
-    } else {
-        OperationCompletion::Completed(Some(output))
-    }
+    Err(
+        TranslationPlaceholderProjectionFailure::ChangedSegmentCount {
+            expected: expected.len(),
+            actual: actual.len(),
+        },
+    )
 }
 
 fn aligned_replacement_lines(unit: &RpgMakerWriteBackUnit) -> Option<Vec<String>> {
-    let translated = unit.translation_content.as_ref()?.as_lines()?;
-    let source = unit
-        .source_content
+    unit.translation_content
+        .as_ref()?
         .as_lines()
-        .expect("严格对齐单元的原文必须是行序列");
-    Some(
-        source
-            .iter()
-            .zip(translated)
-            .map(|(source, translated)| {
-                if source.trim().is_empty() {
-                    source.clone()
-                } else {
-                    translated.clone()
-                }
-            })
-            .collect(),
-    )
+        .map(<[String]>::to_vec)
 }
 
 fn validate_content_presence(
@@ -988,10 +353,7 @@ fn validate_aligned_content(
     group_location: &RpgMakerLocation,
     unit: &RpgMakerWriteBackUnit,
 ) -> Result<(), RpgMakerWriteBackSnapshotError> {
-    if !matches!(
-        unit.role,
-        TextUnitRole::Choices | TextUnitRole::ScrollingText
-    ) {
+    if !unit.role.preserves_placeholder_line_slots() {
         return Ok(());
     }
     let Some(translation) = &unit.translation_content else {
@@ -1013,9 +375,9 @@ fn validate_aligned_content(
     }
     for (line_index, (source, translated)) in source_lines.iter().zip(translated_lines).enumerate()
     {
-        let source_is_blank = source.trim().is_empty();
+        let source_is_blank = is_structural_blank(source);
         if (source_is_blank && !translated.is_empty())
-            || (!unit.manual && !source_is_blank && translated.trim().is_empty())
+            || (!source_is_blank && is_structural_blank(translated))
         {
             return Err(RpgMakerWriteBackSnapshotError::AlignedBlankLineMismatch {
                 group_location: Box::new(group_location.clone()),
@@ -1025,6 +387,60 @@ fn validate_aligned_content(
         }
     }
     Ok(())
+}
+
+fn validate_candidate_content(
+    group_location: &RpgMakerLocation,
+    unit: &RpgMakerWriteBackUnit,
+) -> Result<(), RpgMakerWriteBackSnapshotError> {
+    let Some(translation) = &unit.translation_content else {
+        return Ok(());
+    };
+    let source = crate::manual::rpg_maker_manual_source_lines(&unit.source_content);
+    let candidate = crate::manual::rpg_maker_manual_source_lines(translation);
+    let shape = if unit.role.preserves_placeholder_line_slots() {
+        CandidateTextShape::Fixed
+    } else {
+        CandidateTextShape::Free
+    };
+    match validate_candidate_text(&source, &candidate, shape) {
+        Ok(()) => Ok(()),
+        Err(ProvenInvariantViolation::LineCountMismatch { expected, actual }) => {
+            Err(RpgMakerWriteBackSnapshotError::AlignedLineCountMismatch {
+                role: unit.role.clone(),
+                expected,
+                actual,
+            })
+        }
+        Err(
+            ProvenInvariantViolation::FixedBlankSlotChanged { line_index }
+            | ProvenInvariantViolation::FixedNonBlankSlotEmptied { line_index },
+        ) => Err(RpgMakerWriteBackSnapshotError::AlignedBlankLineMismatch {
+            group_location: Box::new(group_location.clone()),
+            role: unit.role.clone(),
+            line_index,
+        }),
+        Err(ProvenInvariantViolation::InvalidLineText { line_index })
+        | Err(ProvenInvariantViolation::ContainsByteOrderMark { line_index }) => {
+            Err(RpgMakerWriteBackSnapshotError::InvalidContentLine {
+                role: unit.role.clone(),
+                column: "译文",
+                line_index,
+            })
+        }
+        Err(ProvenInvariantViolation::BlankTranslation) => {
+            Err(RpgMakerWriteBackSnapshotError::BlankTranslationContent {
+                role: unit.role.clone(),
+            })
+        }
+        Err(
+            ProvenInvariantViolation::PlaceholderMismatch
+            | ProvenInvariantViolation::UnexpectedPlaceholderToken
+            | ProvenInvariantViolation::PlaceholderBoundaryChanged
+            | ProvenInvariantViolation::ReservedPlaceholderToken
+            | ProvenInvariantViolation::InvalidCandidateShape,
+        ) => unreachable!("纯文本候选校验不会产生 Placeholder 或响应结构违反项"),
+    }
 }
 
 /// 一组语义单元及其已经物化的物理写回配方。
@@ -1087,6 +503,7 @@ impl RpgMakerWriteBackGroup {
             if let Some(translation) = &unit.translation_content {
                 validate_content_structure(kind, &unit.role, translation, "译文")?;
             }
+            validate_candidate_content(&group_location, unit)?;
             validate_aligned_content(&group_location, unit)?;
         }
         let mut seen_roles = BTreeSet::new();
@@ -1498,7 +915,7 @@ fn validate_scrolling_projection(
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RpgMakerWriteBackSnapshot {
     groups: Vec<RpgMakerWriteBackGroup>,
-    symbol_repair: Option<RpgMakerWriteBackSymbolRepairContext>,
+    candidate_validation: Option<RpgMakerWriteBackCandidateValidationContext>,
 }
 
 impl RpgMakerWriteBackSnapshot {
@@ -1521,15 +938,15 @@ impl RpgMakerWriteBackSnapshot {
         }
         Ok(Self {
             groups,
-            symbol_repair: None,
+            candidate_validation: None,
         })
     }
 
-    pub(crate) fn with_symbol_repair(
+    pub(crate) fn with_candidate_validation(
         mut self,
-        context: RpgMakerWriteBackSymbolRepairContext,
+        context: RpgMakerWriteBackCandidateValidationContext,
     ) -> Self {
-        self.symbol_repair = Some(context);
+        self.candidate_validation = Some(context);
         self
     }
 
@@ -1537,9 +954,9 @@ impl RpgMakerWriteBackSnapshot {
         self,
     ) -> (
         Vec<RpgMakerWriteBackGroup>,
-        Option<RpgMakerWriteBackSymbolRepairContext>,
+        Option<RpgMakerWriteBackCandidateValidationContext>,
     ) {
-        (self.groups, self.symbol_repair)
+        (self.groups, self.candidate_validation)
     }
 }
 
@@ -1770,389 +1187,6 @@ pub(crate) trait RpgMakerWriteBackAssetReader: Send + Sync {
     ) -> impl Future<Output = Result<RpgMakerWriteBackSnapshot, Self::Error>> + Send + use<Self>;
 }
 
-/// 当前允许自动布局的 RPG Maker 显示区域。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RpgMakerWriteBackLayoutRegion {
-    DialogueBody,
-    ScrollingText,
-    HelpDescription,
-}
-
-#[cfg(test)]
-impl RpgMakerWriteBackLayoutRegion {
-    pub(crate) const fn diagnostic_name(self) -> &'static str {
-        match self {
-            Self::DialogueBody => "dialogue_body",
-            Self::ScrollingText => "scrolling_text",
-            Self::HelpDescription => "help_description",
-        }
-    }
-}
-
-/// 共享布局内核中的一个原文/当前文本对。
-///
-/// `replacement == None` 表示该项仍使用冻结原文：它参与跨项括号与缩进状态观察，
-/// 但布局结果不得修改它。调用方可以用 `Some` 提供已经确定的当前文本。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RpgMakerLayoutTextPair {
-    original_text: String,
-    replacement: Option<String>,
-}
-
-impl RpgMakerLayoutTextPair {
-    pub(crate) fn new(original_text: String, replacement: Option<String>) -> Self {
-        Self {
-            original_text,
-            replacement,
-        }
-    }
-
-    pub(crate) fn replacement(&self) -> Option<&str> {
-        self.replacement.as_deref()
-    }
-
-    fn effective_text(&self) -> &str {
-        self.replacement.as_deref().unwrap_or(&self.original_text)
-    }
-}
-
-/// 一个布局段当前写回内容的权威来源。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum RpgMakerWriteBackLayoutCandidate {
-    /// 数据库没有译文，必须保持冻结原命令或原字段不变。
-    FrozenOriginal,
-    /// 数据库明确存在译文，允许布局器调整显示行。
-    DatabaseTranslation(String),
-}
-
-/// 布局请求中一个仍与数据库语义单元保持对应关系的内容段。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RpgMakerWriteBackLayoutSegment {
-    logical_location: Option<LogicalTextLocation>,
-    exact_location: RpgMakerLocation,
-    original_text: String,
-    candidate: RpgMakerWriteBackLayoutCandidate,
-}
-
-impl RpgMakerWriteBackLayoutSegment {
-    fn from_unit_at(
-        group_location: &RpgMakerLocation,
-        unit: &RpgMakerWriteBackUnit,
-        exact_location: RpgMakerLocation,
-    ) -> Self {
-        let candidate = unit.translation_content.as_ref().map_or(
-            RpgMakerWriteBackLayoutCandidate::FrozenOriginal,
-            |content| RpgMakerWriteBackLayoutCandidate::DatabaseTranslation(content_text(content)),
-        );
-        Self {
-            logical_location: Some(LogicalTextLocation::new(
-                group_location.clone(),
-                unit.role.clone(),
-            )),
-            exact_location,
-            original_text: content_text(&unit.source_content),
-            candidate,
-        }
-    }
-
-    fn from_line_at(
-        group_location: &RpgMakerLocation,
-        role: TextUnitRole,
-        exact_location: RpgMakerLocation,
-        original_text: String,
-        translation: Option<String>,
-    ) -> Self {
-        Self {
-            logical_location: Some(LogicalTextLocation::new(group_location.clone(), role)),
-            exact_location,
-            original_text,
-            candidate: translation.map_or(
-                RpgMakerWriteBackLayoutCandidate::FrozenOriginal,
-                RpgMakerWriteBackLayoutCandidate::DatabaseTranslation,
-            ),
-        }
-    }
-
-    pub(crate) fn exact_location(&self) -> &RpgMakerLocation {
-        &self.exact_location
-    }
-
-    pub(crate) fn candidate(&self) -> &RpgMakerWriteBackLayoutCandidate {
-        &self.candidate
-    }
-
-    pub(crate) fn original_text(&self) -> &str {
-        &self.original_text
-    }
-}
-
-fn content_text(content: &TextUnitContent) -> String {
-    match content {
-        TextUnitContent::Value(value) => value.clone(),
-        TextUnitContent::Lines(lines) => lines.join("\n"),
-    }
-}
-
-/// RPG Maker 为一个完整布局单元建立的显式请求。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RpgMakerWriteBackLayoutRequest {
-    region: RpgMakerWriteBackLayoutRegion,
-    max_fullwidth_chars: MaxFullwidthChars,
-    segments: Vec<RpgMakerWriteBackLayoutSegment>,
-}
-
-impl RpgMakerWriteBackLayoutRequest {
-    pub(crate) fn new(
-        region: RpgMakerWriteBackLayoutRegion,
-        max_fullwidth_chars: MaxFullwidthChars,
-        segments: Vec<RpgMakerWriteBackLayoutSegment>,
-    ) -> Self {
-        debug_assert!(!segments.is_empty(), "布局单元必须包含至少一个文本段");
-        debug_assert!(
-            segments.iter().any(|segment| matches!(
-                segment.candidate,
-                RpgMakerWriteBackLayoutCandidate::DatabaseTranslation(_)
-            )),
-            "没有数据库译文的单元不应请求布局"
-        );
-        Self {
-            region,
-            max_fullwidth_chars,
-            segments,
-        }
-    }
-
-    pub(crate) const fn max_fullwidth_chars(&self) -> MaxFullwidthChars {
-        self.max_fullwidth_chars
-    }
-
-    pub(crate) fn segments(&self) -> &[RpgMakerWriteBackLayoutSegment] {
-        &self.segments
-    }
-}
-
-/// 布局器产生的一条最终显示行及其所属译文语义行。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RpgMakerWriteBackLaidOutLine {
-    text: String,
-    source_semantic_line_index: usize,
-}
-
-impl RpgMakerWriteBackLaidOutLine {
-    pub(crate) fn new(text: String, source_semantic_line_index: usize) -> Self {
-        Self {
-            text,
-            source_semantic_line_index,
-        }
-    }
-
-    pub(crate) fn text(&self) -> &str {
-        &self.text
-    }
-
-    pub(crate) const fn source_semantic_line_index(&self) -> usize {
-        self.source_semantic_line_index
-    }
-}
-
-/// 布局器为一个数据库译文单元产生的最终显示行。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RpgMakerWriteBackLaidOutSegment {
-    exact_location: RpgMakerLocation,
-    lines: Vec<RpgMakerWriteBackLaidOutLine>,
-}
-
-impl RpgMakerWriteBackLaidOutSegment {
-    pub(crate) fn new(
-        exact_location: RpgMakerLocation,
-        lines: Vec<RpgMakerWriteBackLaidOutLine>,
-    ) -> Result<Self, RpgMakerWriteBackAppliedLayoutError> {
-        if lines.is_empty() {
-            return Err(RpgMakerWriteBackAppliedLayoutError::EmptyReplacement {
-                exact_location: Box::new(exact_location),
-            });
-        }
-        if let Some(line_index) = lines.iter().position(|line| line.text.contains('\n')) {
-            return Err(RpgMakerWriteBackAppliedLayoutError::EmbeddedLineBreak {
-                exact_location: Box::new(exact_location),
-                line_index,
-            });
-        }
-        Ok(Self {
-            exact_location,
-            lines,
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn lines(&self) -> &[RpgMakerWriteBackLaidOutLine] {
-        &self.lines
-    }
-}
-
-/// 一次已经通过请求对应性校验的布局成功结果。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RpgMakerWriteBackAppliedLayout {
-    segments: Vec<RpgMakerWriteBackLaidOutSegment>,
-    inserted_line_breaks: usize,
-    inserted_fullwidth_indents: usize,
-}
-
-impl RpgMakerWriteBackAppliedLayout {
-    pub(crate) fn new(
-        request: &RpgMakerWriteBackLayoutRequest,
-        segments: Vec<RpgMakerWriteBackLaidOutSegment>,
-        inserted_line_breaks: usize,
-        inserted_fullwidth_indents: usize,
-    ) -> Result<Self, RpgMakerWriteBackAppliedLayoutError> {
-        let mut replacements = BTreeMap::new();
-        for segment in segments {
-            let location = segment.exact_location.clone();
-            if replacements.insert(location.clone(), segment).is_some() {
-                return Err(RpgMakerWriteBackAppliedLayoutError::DuplicateReplacement {
-                    exact_location: Box::new(location),
-                });
-            }
-        }
-
-        let mut ordered = Vec::new();
-        for request_segment in &request.segments {
-            match request_segment.candidate {
-                RpgMakerWriteBackLayoutCandidate::FrozenOriginal => {
-                    if replacements.contains_key(&request_segment.exact_location) {
-                        return Err(RpgMakerWriteBackAppliedLayoutError::ChangesFrozenOriginal {
-                            exact_location: Box::new(request_segment.exact_location.clone()),
-                        });
-                    }
-                }
-                RpgMakerWriteBackLayoutCandidate::DatabaseTranslation(_) => {
-                    let Some(segment) = replacements.remove(&request_segment.exact_location) else {
-                        return Err(RpgMakerWriteBackAppliedLayoutError::MissingReplacement {
-                            exact_location: Box::new(request_segment.exact_location.clone()),
-                        });
-                    };
-                    ordered.push(segment);
-                }
-            }
-        }
-        if let Some((exact_location, _)) = replacements.into_iter().next() {
-            return Err(RpgMakerWriteBackAppliedLayoutError::UnexpectedReplacement {
-                exact_location: Box::new(exact_location),
-            });
-        }
-
-        Ok(Self {
-            segments: ordered,
-            inserted_line_breaks,
-            inserted_fullwidth_indents,
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn segments(&self) -> &[RpgMakerWriteBackLaidOutSegment] {
-        &self.segments
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn inserted_line_breaks(&self) -> usize {
-        self.inserted_line_breaks
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn inserted_fullwidth_indents(&self) -> usize {
-        self.inserted_fullwidth_indents
-    }
-
-    fn into_parts(self) -> (Vec<RpgMakerWriteBackLaidOutSegment>, usize, usize) {
-        (
-            self.segments,
-            self.inserted_line_breaks,
-            self.inserted_fullwidth_indents,
-        )
-    }
-}
-
-/// 布局器在构造 Applied 结果时违反请求边界。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum RpgMakerWriteBackAppliedLayoutError {
-    EmptyReplacement {
-        exact_location: Box<RpgMakerLocation>,
-    },
-    EmbeddedLineBreak {
-        exact_location: Box<RpgMakerLocation>,
-        line_index: usize,
-    },
-    DuplicateReplacement {
-        exact_location: Box<RpgMakerLocation>,
-    },
-    ChangesFrozenOriginal {
-        exact_location: Box<RpgMakerLocation>,
-    },
-    MissingReplacement {
-        exact_location: Box<RpgMakerLocation>,
-    },
-    UnexpectedReplacement {
-        exact_location: Box<RpgMakerLocation>,
-    },
-}
-
-impl fmt::Display for RpgMakerWriteBackAppliedLayoutError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyReplacement { exact_location } => {
-                write!(formatter, "布局结果没有提供任何显示行：{exact_location}")
-            }
-            Self::EmbeddedLineBreak {
-                exact_location,
-                line_index,
-            } => write!(
-                formatter,
-                "布局结果第 {line_index} 个显示行仍包含真实换行：{exact_location}"
-            ),
-            Self::DuplicateReplacement { exact_location } => {
-                write!(formatter, "布局结果重复返回位置：{exact_location}")
-            }
-            Self::ChangesFrozenOriginal { exact_location } => {
-                write!(formatter, "布局结果试图修改缺译原文：{exact_location}")
-            }
-            Self::MissingReplacement { exact_location } => {
-                write!(formatter, "布局结果缺少数据库译文位置：{exact_location}")
-            }
-            Self::UnexpectedReplacement { exact_location } => {
-                write!(formatter, "布局结果包含请求外位置：{exact_location}")
-            }
-        }
-    }
-}
-
-impl Error for RpgMakerWriteBackAppliedLayoutError {}
-
-/// 保守布局的正常业务结果。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum RpgMakerWriteBackLayoutOutcome {
-    Applied(RpgMakerWriteBackAppliedLayout),
-    /// 无法保证阅读质量；调用方必须撤销整个单元的自动布局。
-    Manual,
-}
-
-/// 对一个完整 RPG Maker 显示单元执行保守布局。
-///
-/// 本能力是同步纯业务计算，并且必须遵守以下交接约束：
-///
-/// - 请求已经显式给出区域与该区域的行宽，不得自行读取或选择整个布局 Profile；
-/// - 数据库译文已有的真实换行是必须保留的硬边界，只对其中过宽的语义行新增自动换行；
-/// - 段边界就是数据库语义单元的来源边界：可以跨段观察括号和缩进状态，但不得把字符
-///   移动到其他段，也不得返回对 `FrozenOriginal` 的修改；
-/// - 必须先决定自动换行，再为符合规则的续行补全角空格；
-/// - `inserted_line_breaks` 与 `inserted_fullwidth_indents` 只统计本次自动新增内容，
-///   不包含数据库硬换行、原 401/405 边界或原文已有空格。
-///
-/// 控制符不明确、没有安全断点或无法完整遵守上述规则时，必须对整个请求返回
-/// `Manual`，不得升级为技术错误或强制切断文本。
-pub(crate) trait RpgMakerWriteBackTextLayouter: Send + Sync {
-    fn layout(&self, request: &RpgMakerWriteBackLayoutRequest) -> RpgMakerWriteBackLayoutOutcome;
-}
-
 /// 一次已经按物化直接配方完成渲染的单值替换。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SetTextMutation {
@@ -2233,7 +1267,7 @@ pub(crate) struct ReplaceDialogueMutation {
     mutation_claims: MutationClaimSet,
     source_speaker: Option<String>,
     speaker: Option<String>,
-    body_lines: Option<Vec<RpgMakerWriteBackLaidOutLine>>,
+    body_lines: Option<Vec<String>>,
 }
 
 impl ReplaceDialogueMutation {
@@ -2242,7 +1276,7 @@ impl ReplaceDialogueMutation {
         recipe: DialogueWriteRecipe,
         source_speaker: Option<String>,
         speaker: Option<String>,
-        body_lines: Option<Vec<RpgMakerWriteBackLaidOutLine>>,
+        body_lines: Option<Vec<String>>,
     ) -> Result<Self, RpgMakerWriteBackMutationPlanError> {
         let mutation_claims = mutation_claims_for_group(
             TextGroupKind::EventDialogue,
@@ -2262,7 +1296,7 @@ impl ReplaceDialogueMutation {
         mutation_claims: MutationClaimSet,
         source_speaker: Option<String>,
         speaker: Option<String>,
-        body_lines: Option<Vec<RpgMakerWriteBackLaidOutLine>>,
+        body_lines: Option<Vec<String>>,
     ) -> Result<Self, RpgMakerWriteBackMutationPlanError> {
         let referenced = TextProjectionRecipe::Dialogue(recipe.clone()).referenced_roles();
         let expects_speaker = referenced.contains(&TextUnitRole::DialogueSpeaker);
@@ -2284,26 +1318,6 @@ impl ReplaceDialogueMutation {
                 return Err(RpgMakerWriteBackMutationPlanError::InvalidDialogue {
                     group_location: Box::new(recipe.group_location().clone()),
                     violation: WriteBackDialoguePlanViolation::EmptyBodyLines,
-                });
-            }
-            let semantic_indexes = lines
-                .iter()
-                .map(RpgMakerWriteBackLaidOutLine::source_semantic_line_index)
-                .collect::<Vec<_>>();
-            if semantic_indexes.first() != Some(&0)
-                || semantic_indexes.windows(2).any(|pair| pair[0] > pair[1])
-                || semantic_indexes
-                    .iter()
-                    .copied()
-                    .collect::<BTreeSet<_>>()
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .any(|(expected, actual)| expected != actual)
-            {
-                return Err(RpgMakerWriteBackMutationPlanError::InvalidDialogue {
-                    group_location: Box::new(recipe.group_location().clone()),
-                    violation: WriteBackDialoguePlanViolation::NonContiguousBodySemanticIndexes,
                 });
             }
         }
@@ -2332,7 +1346,7 @@ impl ReplaceDialogueMutation {
         self.source_speaker.as_deref()
     }
 
-    pub(crate) fn body_lines(&self) -> Option<&[RpgMakerWriteBackLaidOutLine]> {
+    pub(crate) fn body_lines(&self) -> Option<&[String]> {
         self.body_lines.as_deref()
     }
 
@@ -2396,7 +1410,7 @@ impl ReplaceChoicesMutation {
         if source_lines
             .iter()
             .zip(&replacement_lines)
-            .any(|(source, replacement)| source.trim().is_empty() && source != replacement)
+            .any(|(source, replacement)| is_structural_blank(source) && source != replacement)
         {
             return Err(RpgMakerWriteBackMutationPlanError::InvalidChoices {
                 group_location: Box::new(group_location),
@@ -2645,7 +1659,6 @@ pub(crate) enum WriteBackDialoguePlanViolation {
     SpeakerSlotMismatch,
     UnexpectedBodyTranslation,
     EmptyBodyLines,
-    NonContiguousBodySemanticIndexes,
 }
 
 impl fmt::Display for WriteBackDialoguePlanViolation {
@@ -2654,7 +1667,6 @@ impl fmt::Display for WriteBackDialoguePlanViolation {
             Self::SpeakerSlotMismatch => "Speaker 槽与最终 Speaker 不一致",
             Self::UnexpectedBodyTranslation => "没有 Body 槽的对话不能提供 Body 译文",
             Self::EmptyBodyLines => "Body 没有产生显示行",
-            Self::NonContiguousBodySemanticIndexes => "Body 显示行的语义来源索引不连续",
         })
     }
 }
@@ -2833,9 +1845,6 @@ impl RpgMakerWriteBackMutationPlanError {
                     WriteBackDialoguePlanViolation::EmptyBodyLines => {
                         RpgMakerWriteBackDialoguePlanViolation::EmptyBodyLines
                     }
-                    WriteBackDialoguePlanViolation::NonContiguousBodySemanticIndexes => {
-                        RpgMakerWriteBackDialoguePlanViolation::NonContiguousBodySemanticIndexes
-                    }
                 },
             },
             Self::InvalidChoices {
@@ -2893,110 +1902,10 @@ pub(crate) trait RpgMakerWriteBackDocumentRewriter: Send + Sync {
     ) -> impl Future<Output = Result<Self::RewrittenDocuments, Self::Error>> + Send;
 }
 
-/// 一项需要人工调整布局、但没有阻止写回的结构化诊断。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ManualLayoutDiagnostic {
-    locations: Vec<LogicalTextLocation>,
-    region: RpgMakerWriteBackLayoutRegion,
-    max_fullwidth_chars: MaxFullwidthChars,
-}
-
-impl ManualLayoutDiagnostic {
-    fn from_request(request: &RpgMakerWriteBackLayoutRequest) -> Self {
-        let mut seen = BTreeSet::new();
-        let locations = request
-            .segments
-            .iter()
-            .filter_map(|segment| match segment.candidate {
-                RpgMakerWriteBackLayoutCandidate::FrozenOriginal => None,
-                RpgMakerWriteBackLayoutCandidate::DatabaseTranslation(_) => {
-                    let location = segment
-                        .logical_location
-                        .clone()
-                        .expect("数据库译文布局段必须属于逻辑单元");
-                    seen.insert(location.clone()).then_some(location)
-                }
-            })
-            .collect();
-        Self::new(locations, request.region, request.max_fullwidth_chars)
-    }
-
-    fn new(
-        locations: Vec<LogicalTextLocation>,
-        region: RpgMakerWriteBackLayoutRegion,
-        max_fullwidth_chars: MaxFullwidthChars,
-    ) -> Self {
-        assert!(
-            !locations.is_empty(),
-            "人工布局诊断必须关联至少一个逻辑单元"
-        );
-        Self {
-            locations,
-            region,
-            max_fullwidth_chars,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_test(
-        locations: Vec<LogicalTextLocation>,
-        region: RpgMakerWriteBackLayoutRegion,
-        max_fullwidth_chars: MaxFullwidthChars,
-    ) -> Self {
-        Self::new(locations, region, max_fullwidth_chars)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn locations(&self) -> &[LogicalTextLocation] {
-        &self.locations
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn region_name(&self) -> &'static str {
-        self.region.diagnostic_name()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn max_fullwidth_chars(&self) -> u32 {
-        self.max_fullwidth_chars.get()
-    }
-
-    pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
-        let locations = self
-            .locations
-            .iter()
-            .map(|location| {
-                RpgMakerLogicalUnitLocator::new(
-                    location.group_location().diagnostic_location(),
-                    location.role().diagnostic_role(),
-                )
-            })
-            .collect();
-        let region = match self.region {
-            RpgMakerWriteBackLayoutRegion::DialogueBody => RpgMakerManualLayoutRegion::DialogueBody,
-            RpgMakerWriteBackLayoutRegion::ScrollingText => {
-                RpgMakerManualLayoutRegion::ScrollingText
-            }
-            RpgMakerWriteBackLayoutRegion::HelpDescription => {
-                RpgMakerManualLayoutRegion::HelpDescription
-            }
-        };
-        DiagnosticReport::new(
-            StateEffect::Applied,
-            Diagnostic::rpg_maker(RpgMakerIssue::manual_layout_required(
-                locations,
-                region,
-                self.max_fullwidth_chars.get(),
-            )),
-        )
-    }
-}
-
 /// RPG Maker 阶段生成的文件候选和全部业务事实。
 pub(crate) struct RpgMakerWriteBackPreparation<D> {
     documents: D,
     summary: RpgMakerWriteBackSummary,
-    manual_layout_diagnostics: Vec<ManualLayoutDiagnostic>,
 }
 
 impl<D> fmt::Debug for RpgMakerWriteBackPreparation<D> {
@@ -3004,56 +1913,39 @@ impl<D> fmt::Debug for RpgMakerWriteBackPreparation<D> {
         formatter
             .debug_struct("RpgMakerWriteBackPreparation")
             .field("summary", &self.summary)
-            .field("manual_layout_diagnostics", &self.manual_layout_diagnostics)
             .field("documents", &"<owned documents>")
             .finish()
     }
 }
 
 impl<D> RpgMakerWriteBackPreparation<D> {
-    pub(crate) fn new(
-        documents: D,
-        summary: RpgMakerWriteBackSummary,
-        manual_layout_diagnostics: Vec<ManualLayoutDiagnostic>,
-    ) -> Self {
-        assert_eq!(
-            summary.manual_layout_units,
-            manual_layout_diagnostics.len(),
-            "人工布局计数必须由结构化诊断唯一建立"
-        );
-        Self {
-            documents,
-            summary,
-            manual_layout_diagnostics,
-        }
+    pub(crate) fn new(documents: D, summary: RpgMakerWriteBackSummary) -> Self {
+        Self { documents, summary }
     }
 
-    pub(crate) fn into_parts(self) -> (D, RpgMakerWriteBackSummary, Vec<ManualLayoutDiagnostic>) {
-        (self.documents, self.summary, self.manual_layout_diagnostics)
+    pub(crate) fn into_parts(self) -> (D, RpgMakerWriteBackSummary) {
+        (self.documents, self.summary)
     }
 }
 
-/// 使用资产读取、布局和文档改写能力准备 RPG Maker 写回候选。
-pub(crate) struct RpgMakerWriteBackService<R, L, D, C> {
+/// 使用资产读取和文档改写能力准备 RPG Maker 写回候选。
+pub(crate) struct RpgMakerWriteBackService<R, D, C> {
     asset_reader: R,
-    text_layouter: Arc<L>,
     document_rewriter: D,
     cpu: Arc<C>,
     cancellation: CooperativeCancellation,
     progress: Arc<dyn ProgressObserver<WriteBackProgressPhase>>,
 }
 
-impl<R, L, D, C> RpgMakerWriteBackService<R, L, D, C> {
+impl<R, D, C> RpgMakerWriteBackService<R, D, C> {
     pub(crate) fn new(
         asset_reader: R,
-        text_layouter: L,
         document_rewriter: D,
         cpu: C,
         cancellation: CooperativeCancellation,
     ) -> Self {
         Self {
             asset_reader,
-            text_layouter: Arc::new(text_layouter),
             document_rewriter,
             cpu: Arc::new(cpu),
             cancellation,
@@ -3071,10 +1963,9 @@ impl<R, L, D, C> RpgMakerWriteBackService<R, L, D, C> {
     }
 }
 
-impl<R, L, D, C> RpgMakerWriteBack for RpgMakerWriteBackService<R, L, D, C>
+impl<R, D, C> RpgMakerWriteBack for RpgMakerWriteBackService<R, D, C>
 where
     R: RpgMakerWriteBackAssetReader,
-    L: RpgMakerWriteBackTextLayouter + 'static,
     D: RpgMakerWriteBackDocumentRewriter,
     C: CpuTaskExecutor,
 {
@@ -3084,7 +1975,6 @@ where
     async fn prepare(
         &self,
         project: &OpenedProject,
-        layout_profile: &RpgMakerWriteBackLayoutProfile,
     ) -> Result<OperationCompletion<RpgMakerWriteBackPreparation<Self::Documents>>, Self::Error>
     {
         if self.cancellation.is_requested() {
@@ -3108,14 +1998,13 @@ where
         if self.cancellation.is_requested() {
             return Ok(OperationCompletion::Cancelled);
         }
-        let (groups, symbol_repair) = snapshot.into_parts();
+        let (groups, candidate_validation) = snapshot.into_parts();
         let total_groups = u64::try_from(groups.len()).expect("写回组数量必须可表示为 u64");
         self.progress.observe(ProgressSnapshot::determinate(
             WriteBackProgressPhase::PlanningTranslations,
             0,
             total_groups,
         ));
-        let profile = *layout_profile;
         let planning_progress = Arc::new(PlanningProgress::new(
             Arc::clone(&self.progress),
             total_groups,
@@ -3124,9 +2013,7 @@ where
             .into_iter()
             .map(|group| ProgressTrackedPlanningJob {
                 group,
-                profile,
-                layouter: Arc::clone(&self.text_layouter),
-                symbol_repair: symbol_repair.clone(),
+                candidate_validation: candidate_validation.clone(),
                 cancellation: self.cancellation.clone(),
                 progress: Arc::clone(&planning_progress),
             })
@@ -3167,11 +2054,7 @@ where
             return Ok(OperationCompletion::Cancelled);
         }
         Ok(OperationCompletion::Completed(
-            RpgMakerWriteBackPreparation::new(
-                rewritten,
-                planned.summary,
-                planned.manual_layout_diagnostics,
-            ),
+            RpgMakerWriteBackPreparation::new(rewritten, planned.summary),
         ))
     }
 }
@@ -3179,20 +2062,16 @@ where
 struct PlannedRpgMakerWriteBack {
     mutation_plan: RpgMakerWriteBackMutationPlan,
     summary: RpgMakerWriteBackSummary,
-    manual_layout_diagnostics: Vec<ManualLayoutDiagnostic>,
 }
 
 struct PlannedRpgMakerWriteBackGroup {
     mutations: Vec<RpgMakerWriteBackMutation>,
     summary: RpgMakerWriteBackSummary,
-    manual_layout_diagnostics: Vec<ManualLayoutDiagnostic>,
 }
 
-struct ProgressTrackedPlanningJob<L> {
+struct ProgressTrackedPlanningJob {
     group: RpgMakerWriteBackGroup,
-    profile: RpgMakerWriteBackLayoutProfile,
-    layouter: Arc<L>,
-    symbol_repair: Option<RpgMakerWriteBackSymbolRepairContext>,
+    candidate_validation: Option<RpgMakerWriteBackCandidateValidationContext>,
     cancellation: CooperativeCancellation,
     progress: Arc<PlanningProgress>,
 }
@@ -3243,20 +2122,15 @@ impl PlanningProgress {
     }
 }
 
-fn plan_rpg_maker_write_back_group_with_progress<L>(
-    job: ProgressTrackedPlanningJob<L>,
+fn plan_rpg_maker_write_back_group_with_progress(
+    job: ProgressTrackedPlanningJob,
 ) -> Result<
     OperationCompletion<PlannedRpgMakerWriteBackGroup>,
     RpgMakerWriteBackPlaceholderValidationError,
->
-where
-    L: RpgMakerWriteBackTextLayouter,
-{
+> {
     let planned = plan_rpg_maker_write_back_group(
         job.group,
-        &job.profile,
-        job.layouter.as_ref(),
-        job.symbol_repair.as_ref(),
+        job.candidate_validation.as_ref(),
         &job.cancellation,
     );
     if matches!(planned, Ok(OperationCompletion::Completed(_))) {
@@ -3268,24 +2142,17 @@ where
 struct GroupPlanningOutputs<'a> {
     mutations: &'a mut Vec<RpgMakerWriteBackMutation>,
     summary: &'a mut RpgMakerWriteBackSummary,
-    manual_layout_diagnostics: &'a mut Vec<ManualLayoutDiagnostic>,
 }
 
 #[cfg(test)]
-fn plan_rpg_maker_write_back(
-    snapshot: RpgMakerWriteBackSnapshot,
-    profile: &RpgMakerWriteBackLayoutProfile,
-    layouter: &impl RpgMakerWriteBackTextLayouter,
-) -> PlannedRpgMakerWriteBack {
-    let (groups, symbol_repair) = snapshot.into_parts();
+fn plan_rpg_maker_write_back(snapshot: RpgMakerWriteBackSnapshot) -> PlannedRpgMakerWriteBack {
+    let (groups, candidate_validation) = snapshot.into_parts();
     let groups = groups
         .into_iter()
         .map(|group| {
             match plan_rpg_maker_write_back_group(
                 group,
-                profile,
-                layouter,
-                symbol_repair.as_ref(),
+                candidate_validation.as_ref(),
                 &CooperativeCancellation::default(),
             )
             .expect("测试写回快照的 Current Placeholder 必须有效")
@@ -3300,9 +2167,7 @@ fn plan_rpg_maker_write_back(
 
 fn plan_rpg_maker_write_back_group(
     group: RpgMakerWriteBackGroup,
-    profile: &RpgMakerWriteBackLayoutProfile,
-    layouter: &impl RpgMakerWriteBackTextLayouter,
-    symbol_repair: Option<&RpgMakerWriteBackSymbolRepairContext>,
+    candidate_validation: Option<&RpgMakerWriteBackCandidateValidationContext>,
     cancellation: &CooperativeCancellation,
 ) -> Result<
     OperationCompletion<PlannedRpgMakerWriteBackGroup>,
@@ -3313,13 +2178,11 @@ fn plan_rpg_maker_write_back_group(
     }
     let mut mutations = Vec::new();
     let mut summary = RpgMakerWriteBackSummary::default();
-    let mut manual_layout_diagnostics = Vec::new();
 
     {
         let mut outputs = GroupPlanningOutputs {
             mutations: &mut mutations,
             summary: &mut summary,
-            manual_layout_diagnostics: &mut manual_layout_diagnostics,
         };
         for unit in &group.units {
             if cancellation.is_requested() {
@@ -3332,13 +2195,15 @@ fn plan_rpg_maker_write_back_group(
             }
         }
 
-        let (owner, kind, group_location, mut units, recipes, mutation_claims) = group.into_parts();
-        if let Some(symbol_repair) = symbol_repair {
-            for unit in &mut units {
-                let repaired = repair_unit_translation_symbols_with_cancellation(
+        let (owner, kind, group_location, units, recipes, mutation_claims) = group.into_parts();
+        if let Some(candidate_validation) = candidate_validation {
+            for unit in &units {
+                let validated = validate_unit_translation_with_cancellation(
                     unit,
+                    owner,
                     kind,
-                    symbol_repair,
+                    &group_location,
+                    candidate_validation,
                     cancellation,
                 )
                 .map_err(|reason| {
@@ -3350,35 +2215,23 @@ fn plan_rpg_maker_write_back_group(
                         reason,
                     )
                 })?;
-                let OperationCompletion::Completed(repaired) = repaired else {
+                let OperationCompletion::Completed(()) = validated else {
                     return Ok(OperationCompletion::Cancelled);
                 };
-                outputs.summary.symbol_repair_attempted_units += repaired.attempted_units;
-                outputs.summary.symbol_repair_repaired_units += repaired.repaired_units;
-                outputs.summary.symbol_repair_skipped_units += repaired.skipped_units;
-                outputs.summary.symbol_repair_replacements += repaired.replacements;
             }
         }
         if cancellation.is_requested() {
             return Ok(OperationCompletion::Cancelled);
         }
         match kind {
-            TextGroupKind::EventDialogue => plan_dialogue_group(
-                group_location,
-                units,
-                recipes,
-                mutation_claims,
-                profile.dialogue_body(),
-                layouter,
-                &mut outputs,
-            ),
+            TextGroupKind::EventDialogue => {
+                plan_dialogue_group(units, recipes, mutation_claims, &mut outputs)
+            }
             TextGroupKind::EventScrollingText => plan_scrolling_group(
                 group_location,
                 units,
                 recipes,
                 mutation_claims,
-                profile.scrolling_text(),
-                layouter,
                 &mut outputs,
             ),
             TextGroupKind::EventChoices => plan_choices_group(
@@ -3388,28 +2241,15 @@ fn plan_rpg_maker_write_back_group(
                 mutation_claims,
                 &mut outputs,
             ),
-            _ => plan_scalar_group(
-                kind,
-                group_location,
-                units,
-                recipes,
-                profile.help_description(),
-                layouter,
-                &mut outputs,
-            ),
+            _ => plan_scalar_group(units, recipes, &mut outputs),
         }
         if cancellation.is_requested() {
             return Ok(OperationCompletion::Cancelled);
         }
-        outputs.summary.manual_layout_units = outputs.manual_layout_diagnostics.len();
     }
 
     Ok(OperationCompletion::Completed(
-        PlannedRpgMakerWriteBackGroup {
-            mutations,
-            summary,
-            manual_layout_diagnostics,
-        },
+        PlannedRpgMakerWriteBackGroup { mutations, summary },
     ))
 }
 
@@ -3418,19 +2258,15 @@ fn assemble_planned_rpg_maker_write_back(
 ) -> Result<PlannedRpgMakerWriteBack, RpgMakerWriteBackMutationPlanError> {
     let mut mutations = Vec::new();
     let mut summary = RpgMakerWriteBackSummary::default();
-    let mut manual_layout_diagnostics = Vec::new();
     for group in groups {
         mutations.extend(group.mutations);
         merge_rpg_maker_write_back_summary(&mut summary, group.summary);
-        manual_layout_diagnostics.extend(group.manual_layout_diagnostics);
     }
-    summary.manual_layout_units = manual_layout_diagnostics.len();
 
     let mutation_plan = RpgMakerWriteBackMutationPlan::new(mutations)?;
     Ok(PlannedRpgMakerWriteBack {
         mutation_plan,
         summary,
-        manual_layout_diagnostics,
     })
 }
 
@@ -3440,22 +2276,12 @@ fn merge_rpg_maker_write_back_summary(
 ) {
     total.translated_units += group.translated_units;
     total.original_units += group.original_units;
-    total.auto_wrapped_units += group.auto_wrapped_units;
-    total.inserted_line_breaks += group.inserted_line_breaks;
-    total.inserted_fullwidth_indents += group.inserted_fullwidth_indents;
-    total.symbol_repair_attempted_units += group.symbol_repair_attempted_units;
-    total.symbol_repair_repaired_units += group.symbol_repair_repaired_units;
-    total.symbol_repair_skipped_units += group.symbol_repair_skipped_units;
-    total.symbol_repair_replacements += group.symbol_repair_replacements;
 }
 
 fn plan_dialogue_group(
-    group_location: RpgMakerLocation,
     units: Vec<RpgMakerWriteBackUnit>,
     mut recipes: Vec<TextProjectionRecipe>,
     mutation_claims: MutationClaimSet,
-    max_fullwidth_chars: MaxFullwidthChars,
-    layouter: &impl RpgMakerWriteBackTextLayouter,
     outputs: &mut GroupPlanningOutputs<'_>,
 ) {
     if !units.iter().any(|unit| unit.translation_content.is_some()) {
@@ -3484,28 +2310,9 @@ fn plan_dialogue_group(
             .expect("受信 Speaker 必须是单值")
             .to_owned()
     });
-    let body = units.get(&TextUnitRole::DialogueBody);
-    let body_lines = if body.is_some_and(|unit| unit.translation_content.is_some()) {
-        let body = body.expect("已经确认 Body 存在");
-        let exact_location =
-            dialogue_body_location(&recipe).expect("受信对话正文配方必须引用至少一个 BodyLine");
-        let request = RpgMakerWriteBackLayoutRequest::new(
-            RpgMakerWriteBackLayoutRegion::DialogueBody,
-            max_fullwidth_chars,
-            vec![RpgMakerWriteBackLayoutSegment::from_unit_at(
-                &group_location,
-                body,
-                exact_location.clone(),
-            )],
-        );
-        Some(
-            layout_replacements(&request, layouter, outputs)
-                .remove(&exact_location)
-                .expect("布局结果必须覆盖对话正文语义单元"),
-        )
-    } else {
-        None
-    };
+    let body_lines = units
+        .get(&TextUnitRole::DialogueBody)
+        .and_then(aligned_replacement_lines);
 
     let mutation = ReplaceDialogueMutation::new_with_claims(
         recipe,
@@ -3525,8 +2332,6 @@ fn plan_scrolling_group(
     units: Vec<RpgMakerWriteBackUnit>,
     recipes: Vec<TextProjectionRecipe>,
     mutation_claims: MutationClaimSet,
-    max_fullwidth_chars: MaxFullwidthChars,
-    layouter: &impl RpgMakerWriteBackTextLayouter,
     outputs: &mut GroupPlanningOutputs<'_>,
 ) {
     let [unit] = units.as_slice() else {
@@ -3535,10 +2340,6 @@ fn plan_scrolling_group(
     let Some(replacement_lines) = aligned_replacement_lines(unit) else {
         return;
     };
-    let source_lines = unit
-        .source_content
-        .as_lines()
-        .expect("受信滚动文本原文必须是行序列");
     let entries = recipes
         .iter()
         .map(|recipe| {
@@ -3558,32 +2359,10 @@ fn plan_scrolling_group(
         })
         .collect::<Vec<_>>();
 
-    let request = RpgMakerWriteBackLayoutRequest::new(
-        RpgMakerWriteBackLayoutRegion::ScrollingText,
-        max_fullwidth_chars,
-        entries
-            .iter()
-            .map(|(recipe, source_line_index)| {
-                RpgMakerWriteBackLayoutSegment::from_line_at(
-                    &group_location,
-                    TextUnitRole::ScrollingText,
-                    recipe.target().clone(),
-                    source_lines[*source_line_index].clone(),
-                    Some(replacement_lines[*source_line_index].clone()),
-                )
-            })
-            .collect(),
-    );
-    let replacements = layout_replacements(&request, layouter, outputs);
     let segments = entries
         .into_iter()
-        .map(|(recipe, _)| {
-            let lines = replacements
-                .get(recipe.target())
-                .expect("受信布局结果必须覆盖每个滚动文本语义行")
-                .iter()
-                .map(|line| line.text().to_owned())
-                .collect();
+        .map(|(recipe, source_line_index)| {
+            let lines = vec![replacement_lines[source_line_index].clone()];
             EventBodyMutationSegment::replace(
                 recipe.target().clone(),
                 recipe.expected_raw().to_owned(),
@@ -3638,12 +2417,8 @@ fn plan_choices_group(
 }
 
 fn plan_scalar_group(
-    kind: TextGroupKind,
-    group_location: RpgMakerLocation,
     units: Vec<RpgMakerWriteBackUnit>,
     recipes: Vec<TextProjectionRecipe>,
-    help_max_fullwidth_chars: MaxFullwidthChars,
-    layouter: &impl RpgMakerWriteBackTextLayouter,
     outputs: &mut GroupPlanningOutputs<'_>,
 ) {
     let units = units
@@ -3672,114 +2447,30 @@ fn plan_scalar_group(
             continue;
         }
 
-        let mut overrides = BTreeMap::new();
-        if roles.len() == 1 {
-            let role = roles[0];
-            let unit = units.get(role).expect("受信配方角色必须存在语义单元");
-            if unit.translation_content.is_some()
-                && is_canonical_help_description(kind, unit, &recipe)
-            {
-                let request = RpgMakerWriteBackLayoutRequest::new(
-                    RpgMakerWriteBackLayoutRegion::HelpDescription,
-                    help_max_fullwidth_chars,
-                    vec![RpgMakerWriteBackLayoutSegment::from_unit_at(
-                        &group_location,
-                        unit,
-                        recipe.target().clone(),
-                    )],
-                );
-                let replacement = layout_replacements(&request, layouter, outputs)
-                    .remove(recipe.target())
-                    .expect("帮助说明布局必须返回唯一译文单元")
-                    .iter()
-                    .map(RpgMakerWriteBackLaidOutLine::text)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                overrides.insert(role.clone(), replacement);
-            }
-        }
-
-        let replacement = render_direct_recipe(&recipe, &units, &overrides);
+        let replacement = render_direct_recipe(&recipe, &units);
         outputs.mutations.push(RpgMakerWriteBackMutation::SetText(
             SetTextMutation::from_recipe(&recipe, replacement),
         ));
     }
 }
 
-fn layout_replacements(
-    request: &RpgMakerWriteBackLayoutRequest,
-    layouter: &impl RpgMakerWriteBackTextLayouter,
-    outputs: &mut GroupPlanningOutputs<'_>,
-) -> BTreeMap<RpgMakerLocation, Vec<RpgMakerWriteBackLaidOutLine>> {
-    match layouter.layout(request) {
-        RpgMakerWriteBackLayoutOutcome::Applied(applied) => {
-            let (segments, inserted_line_breaks, inserted_fullwidth_indents) = applied.into_parts();
-            record_applied_layout(
-                outputs.summary,
-                inserted_line_breaks,
-                inserted_fullwidth_indents,
-            );
-            segments
-                .into_iter()
-                .map(|segment| (segment.exact_location, segment.lines))
-                .collect()
-        }
-        RpgMakerWriteBackLayoutOutcome::Manual => {
-            outputs
-                .manual_layout_diagnostics
-                .push(ManualLayoutDiagnostic::from_request(request));
-            request
-                .segments
-                .iter()
-                .filter_map(|segment| match &segment.candidate {
-                    RpgMakerWriteBackLayoutCandidate::FrozenOriginal => None,
-                    RpgMakerWriteBackLayoutCandidate::DatabaseTranslation(translation) => Some((
-                        segment.exact_location.clone(),
-                        split_hard_lines(translation)
-                            .into_iter()
-                            .enumerate()
-                            .map(|(source_semantic_line_index, text)| {
-                                RpgMakerWriteBackLaidOutLine::new(text, source_semantic_line_index)
-                            })
-                            .collect(),
-                    )),
-                })
-                .collect()
-        }
-    }
-}
-
-fn dialogue_body_location(recipe: &DialogueWriteRecipe) -> Option<RpgMakerLocation> {
-    recipe.lines().iter().find_map(|line| {
-        line.parts()
-            .iter()
-            .any(|part| matches!(part, DialogueLinePart::BodyLine { .. }))
-            .then(|| line.physical_location().clone())
-    })
-}
-
 fn render_direct_recipe(
     recipe: &DirectTextRecipe,
     units: &BTreeMap<TextUnitRole, RpgMakerWriteBackUnit>,
-    overrides: &BTreeMap<TextUnitRole, String>,
 ) -> String {
     let mut rendered = String::new();
     for part in recipe.parts() {
         match part {
             DirectTextPart::Literal(value) => rendered.push_str(value),
             DirectTextPart::TextSlot { role } => {
-                if let Some(value) = overrides.get(role) {
-                    rendered.push_str(value);
-                } else {
-                    rendered.push_str(
-                        units
-                            .get(role)
-                            .expect("受信直接配方角色必须存在语义单元")
-                            .effective_content()
-                            .as_value()
-                            .expect("TextSlot 必须引用单值内容"),
-                    );
-                }
+                rendered.push_str(
+                    units
+                        .get(role)
+                        .expect("受信直接配方角色必须存在语义单元")
+                        .effective_content()
+                        .as_value()
+                        .expect("TextSlot 必须引用单值内容"),
+                );
             }
             DirectTextPart::LineSlot {
                 role,
@@ -3796,55 +2487,6 @@ fn render_direct_recipe(
         }
     }
     rendered
-}
-
-fn record_applied_layout(
-    summary: &mut RpgMakerWriteBackSummary,
-    inserted_line_breaks: usize,
-    inserted_fullwidth_indents: usize,
-) {
-    if inserted_line_breaks > 0 {
-        summary.auto_wrapped_units += 1;
-    }
-    summary.inserted_line_breaks += inserted_line_breaks;
-    summary.inserted_fullwidth_indents += inserted_fullwidth_indents;
-}
-
-fn split_hard_lines(text: &str) -> Vec<String> {
-    text.split('\n').map(str::to_owned).collect()
-}
-
-fn is_canonical_help_description(
-    kind: TextGroupKind,
-    unit: &RpgMakerWriteBackUnit,
-    recipe: &DirectTextRecipe,
-) -> bool {
-    if kind != TextGroupKind::DatabaseEntry {
-        return false;
-    }
-    if !matches!(
-        &unit.role,
-        TextUnitRole::Scalar(field_name) if field_name.as_str() == "description"
-    ) {
-        return false;
-    }
-    let RpgMakerSource::Data(file) = recipe.target().source() else {
-        return false;
-    };
-    if !matches!(
-        file,
-        StandardDataFile::Skills
-            | StandardDataFile::Items
-            | StandardDataFile::Weapons
-            | StandardDataFile::Armors
-    ) {
-        return false;
-    }
-    matches!(
-        recipe.target().steps(),
-        [RpgMakerLocationStep::ArrayIndex(_), RpgMakerLocationStep::ObjectKey(field_name)]
-            if field_name == "description"
-    )
 }
 
 /// RPG Maker 在资产读取和文档改写边界上遇到的技术失败。
@@ -3926,8 +2568,7 @@ mod tests {
         DialogueLinePart, DialogueLineRecipe, DialogueWriteRecipe, DirectSpeakerTarget,
         ScalarFieldKey,
     };
-    use crate::rpg_maker::project::MaxFullwidthChars;
-    use crate::rpg_maker::translate::placeholder::PlaceholderRuleDefinition;
+    use crate::rpg_maker::text::{RpgMakerLocationStep, RpgMakerSource};
 
     #[derive(Clone, Default)]
     struct RecordingPlanningProgress(Arc<Mutex<Vec<ProgressSnapshot<WriteBackProgressPhase>>>>);
@@ -3939,469 +2580,6 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(snapshot);
         }
-    }
-
-    fn symbol_repair_context(
-        definitions: Vec<PlaceholderRuleDefinition>,
-    ) -> RpgMakerWriteBackSymbolRepairContext {
-        let placeholder_rules_json =
-            serde_json::to_string(&definitions).expect("测试 Placeholder 规则应可编码");
-        let placeholder_service =
-            Pcre2PlaceholderService::new().expect("内建 Placeholder 应可编译");
-        let placeholder_rules = placeholder_service
-            .compile_custom(definitions)
-            .expect("测试自定义 Placeholder 应可编译");
-        RpgMakerWriteBackSymbolRepairContext::new(
-            RpgMakerEngine::Mz,
-            placeholder_service,
-            placeholder_rules,
-            placeholder_rules_json,
-        )
-    }
-
-    #[test]
-    fn symbol_repair_fixes_categories_and_one_sided_quotes() {
-        let context = symbol_repair_context(Vec::new());
-        let mut categories = RpgMakerWriteBackUnit::new(
-            TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法")),
-            TextUnitContent::Value("General, Misc, Audio, Toggle".to_owned()),
-            Some(TextUnitContent::Value("常规、杂项、声音、开关".to_owned())),
-        )
-        .expect("测试单值单元应有效");
-        let categories_statistics = repair_unit_translation_symbols(
-            &mut categories,
-            TextGroupKind::DatabaseEntry,
-            &context,
-        )
-        .expect("Categories Current 的 Placeholder 应有效");
-
-        assert_eq!(
-            categories.translation_content,
-            Some(TextUnitContent::Value("常规,杂项,声音,开关".to_owned()))
-        );
-        assert_eq!(
-            categories_statistics,
-            SymbolRepairStatistics {
-                attempted_units: 1,
-                repaired_units: 1,
-                skipped_units: 0,
-                replacements: 3,
-            }
-        );
-
-        let mut quote = RpgMakerWriteBackUnit::new(
-            TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法")),
-            TextUnitContent::Value("「Open」".to_owned()),
-            Some(TextUnitContent::Value("“打开」".to_owned())),
-        )
-        .expect("测试引号单元应有效");
-        let quote_statistics =
-            repair_unit_translation_symbols(&mut quote, TextGroupKind::DatabaseEntry, &context)
-                .expect("引号 Current 的 Placeholder 应有效");
-
-        assert_eq!(
-            quote.translation_content,
-            Some(TextUnitContent::Value("「打开」".to_owned()))
-        );
-        assert_eq!(quote_statistics.replacements, 1);
-    }
-
-    #[test]
-    fn symbol_repair_uses_choice_items_and_joined_line_units_at_their_required_boundaries() {
-        let context = symbol_repair_context(Vec::new());
-        let mut choices = RpgMakerWriteBackUnit::new(
-            TextUnitRole::Choices,
-            TextUnitContent::Lines(vec!["A, B".to_owned(), "C.".to_owned()]),
-            Some(TextUnitContent::Lines(vec![
-                "甲、乙".to_owned(),
-                "丙。".to_owned(),
-            ])),
-        )
-        .expect("测试选项单元应有效");
-        let choices_statistics =
-            repair_unit_translation_symbols(&mut choices, TextGroupKind::EventChoices, &context)
-                .expect("选项 Current 的 Placeholder 应有效");
-        assert_eq!(
-            choices.translation_content,
-            Some(TextUnitContent::Lines(vec![
-                "甲,乙".to_owned(),
-                "丙.".to_owned(),
-            ]))
-        );
-        assert_eq!(choices_statistics.attempted_units, 1);
-        assert_eq!(choices_statistics.repaired_units, 1);
-        assert_eq!(choices_statistics.replacements, 2);
-
-        let mut dialogue = RpgMakerWriteBackUnit::new(
-            TextUnitRole::DialogueBody,
-            TextUnitContent::Lines(vec!["A,".to_owned(), "B.".to_owned()]),
-            Some(TextUnitContent::Lines(vec![
-                "甲、".to_owned(),
-                "乙。".to_owned(),
-            ])),
-        )
-        .expect("测试对话单元应有效");
-        let dialogue_statistics =
-            repair_unit_translation_symbols(&mut dialogue, TextGroupKind::EventDialogue, &context)
-                .expect("对话 Current 的 Placeholder 应有效");
-        assert_eq!(
-            dialogue.translation_content,
-            Some(TextUnitContent::Lines(vec![
-                "甲,".to_owned(),
-                "乙.".to_owned()
-            ]))
-        );
-        assert_eq!(dialogue_statistics.replacements, 2);
-
-        let mut scrolling = RpgMakerWriteBackUnit::new(
-            TextUnitRole::ScrollingText,
-            TextUnitContent::Lines(vec!["A,".to_owned(), "B".to_owned()]),
-            Some(TextUnitContent::Lines(vec![
-                "甲".to_owned(),
-                "乙、".to_owned(),
-            ])),
-        )
-        .expect("测试滚动文本单元应有效");
-        let scrolling_statistics = repair_unit_translation_symbols(
-            &mut scrolling,
-            TextGroupKind::EventScrollingText,
-            &context,
-        )
-        .expect("滚动文本 Current 的 Placeholder 应有效");
-        assert_eq!(
-            scrolling.translation_content,
-            Some(TextUnitContent::Lines(vec![
-                "甲".to_owned(),
-                "乙、".to_owned(),
-            ]))
-        );
-        assert_eq!(scrolling_statistics.replacements, 0);
-    }
-
-    #[test]
-    fn symbol_repair_validates_cross_line_choice_placeholders_before_item_repair() {
-        let context = symbol_repair_context(vec![PlaceholderRuleDefinition::new(
-            Some(vec!["event_choices".to_owned()]),
-            r"(?s)<msg>(?<text>.*?)</msg>",
-        )]);
-        let mut choices = RpgMakerWriteBackUnit::new(
-            TextUnitRole::Choices,
-            TextUnitContent::Lines(vec!["A,".to_owned(), "B.".to_owned()]),
-            Some(TextUnitContent::Lines(vec![
-                "<msg>甲、".to_owned(),
-                "乙。</msg>".to_owned(),
-            ])),
-        )
-        .expect("测试选项单元应有效");
-
-        let failure =
-            repair_unit_translation_symbols(&mut choices, TextGroupKind::EventChoices, &context)
-                .expect_err("译文新增跨槽 Placeholder 必须明确失败");
-
-        assert!(matches!(
-            failure,
-            TranslationPlanningFailureReason::PlaceholderProjection {
-                failure: TranslationPlaceholderProjectionFailure::ChangedSegmentCount {
-                    expected: 0,
-                    actual: 2,
-                }
-            }
-        ));
-    }
-
-    #[test]
-    fn symbol_repair_rejects_a_placeholder_moved_to_another_choice_slot() {
-        let context = symbol_repair_context(Vec::new());
-        let mut choices = RpgMakerWriteBackUnit::new(
-            TextUnitRole::Choices,
-            TextUnitContent::Lines(vec!["\\V[1] A,".to_owned(), "B.".to_owned()]),
-            Some(TextUnitContent::Lines(vec![
-                "甲，".to_owned(),
-                "\\V[1]乙。".to_owned(),
-            ])),
-        )
-        .expect("测试选项单元应有效");
-
-        let failure =
-            repair_unit_translation_symbols(&mut choices, TextGroupKind::EventChoices, &context)
-                .expect_err("Placeholder 不得移动到另一个选项槽位");
-
-        assert!(matches!(
-            failure,
-            TranslationPlanningFailureReason::PlaceholderProjection {
-                failure: TranslationPlaceholderProjectionFailure::ChangedSegmentCount {
-                    expected: 1,
-                    actual: 0,
-                }
-            }
-        ));
-    }
-
-    #[test]
-    fn symbol_repair_preserves_rpg_controls_custom_wrappers_and_recipe_literals() {
-        let context = symbol_repair_context(vec![PlaceholderRuleDefinition::new(
-            Some(vec!["event_dialogue".to_owned()]),
-            r"<msg>(?<text>.*?)</msg>",
-        )]);
-        let mut unit = RpgMakerWriteBackUnit::new(
-            TextUnitRole::DialogueBody,
-            TextUnitContent::Value(r"\N[1] <msg>Open \C[2], now.</msg> \n<Hero>".to_owned()),
-            Some(TextUnitContent::Value(
-                r"\N[1] <msg>打开 \C[2]、现在。</msg> \n<Hero>".to_owned(),
-            )),
-        )
-        .expect("测试控制符单元应有效");
-        let statistics =
-            repair_unit_translation_symbols(&mut unit, TextGroupKind::EventDialogue, &context)
-                .expect("控制符 Current 的 Placeholder 应有效");
-        assert_eq!(
-            unit.translation_content,
-            Some(TextUnitContent::Value(
-                r"\N[1] <msg>打开 \C[2],现在.</msg> \n<Hero>".to_owned(),
-            ))
-        );
-        assert_eq!(statistics.replacements, 2);
-
-        let multiline_context = symbol_repair_context(vec![PlaceholderRuleDefinition::new(
-            Some(vec!["event_dialogue".to_owned()]),
-            r"(?s)<raw>.*?</raw>",
-        )]);
-        let mut multiline_value = RpgMakerWriteBackUnit::new(
-            TextUnitRole::DialogueBody,
-            TextUnitContent::Value("A, <raw>fixed\nbytes</raw>, B.".to_owned()),
-            Some(TextUnitContent::Value(
-                "甲、<raw>fixed\nbytes</raw>、乙。".to_owned(),
-            )),
-        )
-        .expect("跨 LF 的 Value Placeholder 单元应有效");
-        let multiline_statistics = repair_unit_translation_symbols(
-            &mut multiline_value,
-            TextGroupKind::EventDialogue,
-            &multiline_context,
-        )
-        .expect("跨 LF Current 的 Placeholder 应有效");
-        assert_eq!(
-            multiline_value.translation_content,
-            Some(TextUnitContent::Value(
-                "甲,<raw>fixed\nbytes</raw>,乙.".to_owned(),
-            ))
-        );
-        assert_eq!(multiline_statistics.replacements, 3);
-
-        let role = TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法"));
-        let mut literal_unit = RpgMakerWriteBackUnit::new(
-            role.clone(),
-            TextUnitContent::Value("General, Misc".to_owned()),
-            Some(TextUnitContent::Value("常规、杂项".to_owned())),
-        )
-        .expect("测试 Literal 单元应有效");
-        repair_unit_translation_symbols(
-            &mut literal_unit,
-            TextGroupKind::DatabaseEntry,
-            &symbol_repair_context(Vec::new()),
-        )
-        .expect("Literal 测试 Current 的 Placeholder 应有效");
-        let units = BTreeMap::from([(role.clone(), literal_unit)]);
-        let recipe = DirectTextRecipe::new(
-            RpgMakerLocation::value(
-                RpgMakerSource::data(StandardDataFile::Items),
-                vec![
-                    RpgMakerLocationStep::index(1),
-                    RpgMakerLocationStep::key("name"),
-                ],
-            ),
-            "【General, Misc】、固定",
-            vec![
-                DirectTextPart::Literal("【".to_owned()),
-                DirectTextPart::TextSlot { role },
-                DirectTextPart::Literal("】、固定".to_owned()),
-            ],
-        )
-        .expect("测试直接配方应有效");
-
-        assert_eq!(
-            render_direct_recipe(&recipe, &units, &BTreeMap::new()),
-            "【常规,杂项】、固定"
-        );
-    }
-
-    #[test]
-    fn symbol_repair_rejects_a_current_with_new_placeholder_bindings() {
-        let context = symbol_repair_context(vec![PlaceholderRuleDefinition::new(
-            Some(vec!["database_entry".to_owned()]),
-            r"\[[^]]+\]",
-        )]);
-        let original_translation = "[常规、杂项]".to_owned();
-        let mut unit = RpgMakerWriteBackUnit::new(
-            TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法")),
-            TextUnitContent::Value("General, Misc".to_owned()),
-            Some(TextUnitContent::Value(original_translation.clone())),
-        )
-        .expect("测试 Current 单元应有效");
-
-        let failure =
-            repair_unit_translation_symbols(&mut unit, TextGroupKind::DatabaseEntry, &context)
-                .expect_err("新增 Placeholder 的 Current 必须明确失败");
-
-        assert_eq!(
-            unit.translation_content,
-            Some(TextUnitContent::Value(original_translation))
-        );
-        assert!(matches!(
-            failure,
-            TranslationPlanningFailureReason::PlaceholderProjection {
-                failure: TranslationPlaceholderProjectionFailure::ChangedSegmentCount {
-                    expected: 0,
-                    actual: 1,
-                }
-            }
-        ));
-    }
-
-    #[test]
-    fn symbol_repair_skips_value_when_rebuilt_text_cannot_be_allocated() {
-        let context = symbol_repair_context(Vec::new());
-        let original_translation = "甲、乙".to_owned();
-        let mut unit = RpgMakerWriteBackUnit::new(
-            TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法")),
-            TextUnitContent::Value("A, B".to_owned()),
-            Some(TextUnitContent::Value(original_translation.clone())),
-        )
-        .expect("测试单值单元应有效");
-
-        let completion = repair_unit_translation_symbols_with_allocation(
-            &mut unit,
-            TextGroupKind::DatabaseEntry,
-            &context,
-            &CooperativeCancellation::default(),
-            SymbolRepairAllocation::failing(),
-        )
-        .expect("分配失败应作为内部跳过处理");
-
-        assert_eq!(
-            completion,
-            OperationCompletion::Completed(SymbolRepairStatistics {
-                attempted_units: 1,
-                repaired_units: 0,
-                skipped_units: 1,
-                replacements: 0,
-            })
-        );
-        assert_eq!(
-            unit.translation_content,
-            Some(TextUnitContent::Value(original_translation))
-        );
-    }
-
-    #[test]
-    fn symbol_repair_skips_choices_when_line_cloning_cannot_be_allocated() {
-        let context = symbol_repair_context(Vec::new());
-        let original_translation = vec!["甲、乙".to_owned(), "丙。".to_owned()];
-        let mut unit = RpgMakerWriteBackUnit::new(
-            TextUnitRole::Choices,
-            TextUnitContent::Lines(vec!["A, B".to_owned(), "C.".to_owned()]),
-            Some(TextUnitContent::Lines(original_translation.clone())),
-        )
-        .expect("测试选项单元应有效");
-
-        let completion = repair_unit_translation_symbols_with_allocation(
-            &mut unit,
-            TextGroupKind::EventChoices,
-            &context,
-            &CooperativeCancellation::default(),
-            SymbolRepairAllocation::failing(),
-        )
-        .expect("分配失败应作为内部跳过处理");
-
-        assert_eq!(
-            completion,
-            OperationCompletion::Completed(SymbolRepairStatistics {
-                attempted_units: 1,
-                repaired_units: 0,
-                skipped_units: 1,
-                replacements: 0,
-            })
-        );
-        assert_eq!(
-            unit.translation_content,
-            Some(TextUnitContent::Lines(original_translation))
-        );
-    }
-
-    #[test]
-    fn symbol_repair_skips_joined_lines_when_join_cannot_be_allocated() {
-        let context = symbol_repair_context(Vec::new());
-        let original_translation = vec!["甲、".to_owned(), "乙。".to_owned()];
-        let mut unit = RpgMakerWriteBackUnit::new(
-            TextUnitRole::DialogueBody,
-            TextUnitContent::Lines(vec!["A,".to_owned(), "B.".to_owned()]),
-            Some(TextUnitContent::Lines(original_translation.clone())),
-        )
-        .expect("测试对话单元应有效");
-
-        let completion = repair_unit_translation_symbols_with_allocation(
-            &mut unit,
-            TextGroupKind::EventDialogue,
-            &context,
-            &CooperativeCancellation::default(),
-            SymbolRepairAllocation::failing(),
-        )
-        .expect("分配失败应作为内部跳过处理");
-
-        assert_eq!(
-            completion,
-            OperationCompletion::Completed(SymbolRepairStatistics {
-                attempted_units: 1,
-                repaired_units: 0,
-                skipped_units: 1,
-                replacements: 0,
-            })
-        );
-        assert_eq!(
-            unit.translation_content,
-            Some(TextUnitContent::Lines(original_translation))
-        );
-    }
-
-    #[test]
-    fn symbol_repair_reports_requested_cancellation_before_allocation_failure() {
-        let context = symbol_repair_context(Vec::new());
-        let original_translation = "甲、乙".to_owned();
-        let mut unit = RpgMakerWriteBackUnit::new(
-            TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法")),
-            TextUnitContent::Value("A, B".to_owned()),
-            Some(TextUnitContent::Value(original_translation.clone())),
-        )
-        .expect("测试单值单元应有效");
-        let cancellation = CooperativeCancellation::default();
-        cancellation.request();
-
-        let completion = repair_unit_translation_symbols_with_allocation(
-            &mut unit,
-            TextGroupKind::DatabaseEntry,
-            &context,
-            &cancellation,
-            SymbolRepairAllocation::failing(),
-        )
-        .expect("取消应作为正常终态返回");
-
-        assert_eq!(completion, OperationCompletion::Cancelled);
-        assert_eq!(
-            unit.translation_content,
-            Some(TextUnitContent::Value(original_translation))
-        );
-    }
-
-    #[test]
-    fn symbol_repair_joined_length_rejects_overflow() {
-        assert_eq!(
-            checked_joined_symbol_repair_length(
-                [usize::MAX, 1],
-                0,
-                &CooperativeCancellation::default(),
-            ),
-            OperationCompletion::Completed(None)
-        );
     }
 
     #[test]
@@ -4464,11 +2642,6 @@ mod tests {
             ]);
         }
         RpgMakerLocation::value(RpgMakerSource::map(1), steps)
-    }
-
-    fn profile() -> RpgMakerWriteBackLayoutProfile {
-        let width = MaxFullwidthChars::new(40).expect("测试行宽应合法");
-        RpgMakerWriteBackLayoutProfile::new(width, width, width)
     }
 
     fn recipe_locks(
@@ -4831,8 +3004,9 @@ mod tests {
                 RpgMakerWriteBackUnit::new(
                     TextUnitRole::DialogueBody,
                     TextUnitContent::Lines(vec!["Hello".to_owned()]),
-                    body_translation
-                        .map(|translation| TextUnitContent::Lines(split_hard_lines(translation))),
+                    body_translation.map(|translation| {
+                        TextUnitContent::Lines(translation.split('\n').map(str::to_owned).collect())
+                    }),
                 )
                 .expect("测试 Body 应合法"),
             ],
@@ -4847,97 +3021,13 @@ mod tests {
         speaker_translation: Option<&str>,
         body_translation: Option<&str>,
     ) -> Option<ReplaceDialogueMutation> {
-        let planned = plan_rpg_maker_write_back(
-            dialogue_snapshot(speaker_translation, body_translation),
-            &profile(),
-            &ConservativeRpgMakerWriteBackTextLayouter,
-        );
+        let planned =
+            plan_rpg_maker_write_back(dialogue_snapshot(speaker_translation, body_translation));
         match planned.mutation_plan.mutations().first() {
             None => None,
             Some(RpgMakerWriteBackMutation::ReplaceDialogue(mutation)) => Some(mutation.clone()),
             Some(other) => panic!("对话必须生成唯一块级 Mutation，实际为 {other:?}"),
         }
-    }
-
-    #[test]
-    fn manual_layout_diagnostic_identifies_affected_logical_units() {
-        let scalar_group = location(8, None);
-        let scalar_role =
-            TextUnitRole::Scalar(ScalarFieldKey::new("description").expect("测试字段键应合法"));
-        let scalar_unit = RpgMakerWriteBackUnit::new(
-            scalar_role.clone(),
-            TextUnitContent::Value("原说明".to_owned()),
-            Some(TextUnitContent::Value("很长的译文".to_owned())),
-        )
-        .expect("测试标量单元应合法");
-        let scalar_request = RpgMakerWriteBackLayoutRequest::new(
-            RpgMakerWriteBackLayoutRegion::HelpDescription,
-            MaxFullwidthChars::new(2).expect("测试行宽应合法"),
-            vec![RpgMakerWriteBackLayoutSegment::from_unit_at(
-                &scalar_group,
-                &scalar_unit,
-                location(8, Some(0)),
-            )],
-        );
-        let scalar_diagnostic = ManualLayoutDiagnostic::from_request(&scalar_request);
-        assert_eq!(
-            scalar_diagnostic.locations(),
-            &[LogicalTextLocation::new(scalar_group, scalar_role)]
-        );
-
-        let dialogue_group = location(10, None);
-        let body_role = TextUnitRole::DialogueBody;
-        let body = RpgMakerWriteBackUnit::new(
-            body_role.clone(),
-            TextUnitContent::Lines(vec!["原文一".to_owned(), "原文二".to_owned()]),
-            Some(TextUnitContent::Lines(vec![
-                "译文一".to_owned(),
-                "译文二".to_owned(),
-            ])),
-        )
-        .expect("对话正文单元应合法");
-        let dialogue_request = RpgMakerWriteBackLayoutRequest::new(
-            RpgMakerWriteBackLayoutRegion::DialogueBody,
-            MaxFullwidthChars::new(2).expect("测试行宽应合法"),
-            vec![RpgMakerWriteBackLayoutSegment::from_unit_at(
-                &dialogue_group,
-                &body,
-                location(11, Some(0)),
-            )],
-        );
-        let dialogue_diagnostic = ManualLayoutDiagnostic::from_request(&dialogue_request);
-        assert_eq!(
-            dialogue_diagnostic.locations(),
-            [LogicalTextLocation::new(dialogue_group, body_role)]
-        );
-
-        let scrolling_group = location(20, None);
-        let scrolling_role = TextUnitRole::ScrollingText;
-        let scrolling_request = RpgMakerWriteBackLayoutRequest::new(
-            RpgMakerWriteBackLayoutRegion::ScrollingText,
-            MaxFullwidthChars::new(2).expect("测试行宽应合法"),
-            vec![
-                RpgMakerWriteBackLayoutSegment::from_line_at(
-                    &scrolling_group,
-                    scrolling_role.clone(),
-                    location(21, Some(0)),
-                    "原文一".to_owned(),
-                    Some("译文一".to_owned()),
-                ),
-                RpgMakerWriteBackLayoutSegment::from_line_at(
-                    &scrolling_group,
-                    scrolling_role.clone(),
-                    location(22, Some(0)),
-                    "原文二".to_owned(),
-                    Some("译文二".to_owned()),
-                ),
-            ],
-        );
-        let scrolling_diagnostic = ManualLayoutDiagnostic::from_request(&scrolling_request);
-        assert_eq!(
-            scrolling_diagnostic.locations(),
-            [LogicalTextLocation::new(scrolling_group, scrolling_role)]
-        );
     }
 
     #[test]
@@ -4950,42 +3040,20 @@ mod tests {
 
         let body_only = dialogue_mutation(None, Some("你好")).expect("Body 译文应触发写回");
         assert_eq!(body_only.speaker(), Some("Alice"));
-        assert_eq!(
-            body_only.body_lines().map(|lines| lines
-                .iter()
-                .map(RpgMakerWriteBackLaidOutLine::text)
-                .collect::<Vec<_>>()),
-            Some(vec!["你好"])
-        );
+        assert_eq!(body_only.body_lines(), Some(["你好".to_owned()].as_slice()));
 
         let both = dialogue_mutation(Some("爱丽丝"), Some("你好")).expect("两类译文应触发写回");
         assert_eq!(both.speaker(), Some("爱丽丝"));
-        assert_eq!(
-            both.body_lines().map(|lines| lines
-                .iter()
-                .map(RpgMakerWriteBackLaidOutLine::text)
-                .collect::<Vec<_>>()),
-            Some(vec!["你好"])
-        );
+        assert_eq!(both.body_lines(), Some(["你好".to_owned()].as_slice()));
     }
 
     #[test]
-    fn dialogue_body_hard_line_breaks_preserve_semantic_line_provenance() {
+    fn dialogue_body_materializes_database_lines_exactly() {
         let mutation =
             dialogue_mutation(None, Some("第一行\n第二行")).expect("Body 译文应触发写回");
         assert_eq!(
-            mutation.body_lines().map(|lines| lines
-                .iter()
-                .map(RpgMakerWriteBackLaidOutLine::text)
-                .collect::<Vec<_>>()),
-            Some(vec!["第一行", "第二行"])
-        );
-        assert_eq!(
-            mutation.body_lines().map(|lines| lines
-                .iter()
-                .map(RpgMakerWriteBackLaidOutLine::source_semantic_line_index)
-                .collect::<Vec<_>>()),
-            Some(vec![0, 1])
+            mutation.body_lines(),
+            Some(["第一行".to_owned(), "第二行".to_owned()].as_slice())
         );
     }
 
@@ -5056,8 +3124,6 @@ mod tests {
 
         let planned = plan_rpg_maker_write_back(
             RpgMakerWriteBackSnapshot::new(vec![group]).expect("滚动快照应合法"),
-            &profile(),
-            &ConservativeRpgMakerWriteBackTextLayouter,
         );
         let [RpgMakerWriteBackMutation::ReplaceEventBody(mutation)] =
             planned.mutation_plan.mutations()
@@ -5066,7 +3132,7 @@ mod tests {
         };
         assert_eq!(mutation.segments().len(), 3);
         assert_eq!(mutation.segments()[0].replacement_lines(), &["译文"]);
-        assert_eq!(mutation.segments()[1].replacement_lines(), &["   "]);
+        assert_eq!(mutation.segments()[1].replacement_lines(), &[""]);
         assert_eq!(mutation.segments()[1].expected_original(), "   ");
         assert_eq!(mutation.segments()[2].replacement_lines(), &["第三行"]);
     }
@@ -5127,8 +3193,6 @@ mod tests {
 
         let planned = plan_rpg_maker_write_back(
             RpgMakerWriteBackSnapshot::new(vec![group]).expect("选项快照应合法"),
-            &profile(),
-            &ConservativeRpgMakerWriteBackTextLayouter,
         );
         let [RpgMakerWriteBackMutation::ReplaceChoices(mutation)] =
             planned.mutation_plan.mutations()
@@ -5219,24 +3283,17 @@ mod tests {
         );
         recipes.push(claim);
         let mutation_locks = recipe_locks(TextGroupKind::EventChoices, &group_location, &recipes);
-        let manual_group = RpgMakerWriteBackGroup::new(
-            TextGroupKind::EventChoices,
-            group_location,
-            vec![
-                RpgMakerWriteBackUnit::new_manual(
-                    TextUnitRole::Choices,
-                    TextUnitContent::Lines(vec!["erase me".to_owned()]),
-                    TextUnitContent::Lines(vec![String::new()]),
-                )
-                .expect("人工译文明确填写的空字符串应能建立单元"),
-            ],
-            recipes,
-            mutation_locks,
-        );
-        assert!(
-            manual_group.is_ok(),
-            "人工译文应能把非空源槽替换为空字符串：{manual_group:?}"
-        );
+        assert!(matches!(
+            RpgMakerWriteBackUnit::new_manual(
+                TextUnitRole::Choices,
+                TextUnitContent::Lines(vec!["erase me".to_owned()]),
+                TextUnitContent::Lines(vec![String::new()]),
+            ),
+            Err(RpgMakerWriteBackSnapshotError::BlankTranslationContent {
+                role: TextUnitRole::Choices,
+            })
+        ));
+        let _ = (recipes, mutation_locks);
     }
 
     #[test]
@@ -5326,8 +3383,6 @@ mod tests {
         .expect("直接组应合法");
         let planned = plan_rpg_maker_write_back(
             RpgMakerWriteBackSnapshot::new(vec![group]).expect("快照应合法"),
-            &profile(),
-            &ConservativeRpgMakerWriteBackTextLayouter,
         );
         let [RpgMakerWriteBackMutation::SetText(mutation)] = planned.mutation_plan.mutations()
         else {

@@ -19,6 +19,7 @@ use crate::rpg_maker::semantic_order::{
     RpgMakerSemanticOrderKey, RpgMakerSemanticOrderKeyEncodeError,
 };
 use crate::rpg_maker::text::TextGroupKind;
+use crate::translation::placeholder::placeholder_bindings_match_within_slot;
 use crate::translation::placeholder_projection::{
     LanguageTextProjectionError, project_protected_text_from_shared_with_cancellation,
     project_protected_text_with_cancellation,
@@ -33,6 +34,7 @@ use super::pipeline::{
 };
 use super::placeholder::{
     CompiledPlaceholderRules, Pcre2PlaceholderService, PlaceholderProtectionError,
+    RpgMakerBuiltinPlaceholderProfile,
 };
 use crate::translation::planning_resource::CompiledTerminology;
 
@@ -130,6 +132,109 @@ impl ResolvedTranslationSemantics {
         self.global_fingerprint
     }
 
+    /// 当前 Unit 的完整候选校验契约身份；源文零命中时也不同。
+    pub(crate) fn candidate_contract_fingerprint(
+        &self,
+        identity: &TranslationUnitIdentity,
+    ) -> Sha256Fingerprint {
+        let target_id = identity.readable_id();
+        let custom = self
+            .custom_placeholders
+            .applicable_contract_fingerprint(identity.kind().storage_name(), &target_id);
+        let mut hasher = Sha256FramedHasher::new(b"att.rpg-maker-candidate-contract");
+        hasher
+            .frame(1, self.engine.storage_name().as_bytes())
+            .frame(2, custom.as_bytes())
+            .frame(
+                3,
+                RpgMakerBuiltinPlaceholderProfile::for_identity(self.engine, identity)
+                    .fingerprint_name()
+                    .as_bytes(),
+            );
+        hasher.finish()
+    }
+
+    /// 对已经恢复成 RPG Maker 原始文本的候选重新应用当前 Unit 的完整 consumer 与
+    /// exact-id 自定义规则。源文没有命中控制符时也必须执行，这样候选新增控制符不会
+    /// 绕过模型 token 阶段。
+    pub(crate) fn candidate_placeholders_match_with_cancellation<E>(
+        &self,
+        identity: &TranslationUnitIdentity,
+        candidate: &TextUnitContent,
+        mut ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Result<bool, ResolvedTranslationSemanticError>, E> {
+        let target_id = identity.readable_id();
+        let kind = identity.kind();
+        let profile = RpgMakerBuiltinPlaceholderProfile::for_identity(self.engine, identity);
+        let mut validate_slot = |source: &str, candidate: &str| {
+            let source = match self.placeholder_service.protect_profile_with_cancellation(
+                self.engine,
+                kind,
+                &target_id,
+                profile,
+                source,
+                &[],
+                &self.custom_placeholders,
+                &mut ensure_running,
+            )? {
+                Ok(source) => source,
+                Err(source) => {
+                    return Ok(Err(ResolvedTranslationSemanticError::ProtectPlaceholder(
+                        source,
+                    )));
+                }
+            };
+            let candidate = match self.placeholder_service.protect_profile_with_cancellation(
+                self.engine,
+                kind,
+                &target_id,
+                profile,
+                candidate,
+                &[],
+                &self.custom_placeholders,
+                &mut ensure_running,
+            )? {
+                Ok(candidate) => candidate,
+                Err(source) => {
+                    return Ok(Err(ResolvedTranslationSemanticError::ProtectPlaceholder(
+                        source,
+                    )));
+                }
+            };
+            Ok(Ok(placeholder_bindings_match_within_slot(
+                source.placeholders(),
+                candidate.placeholders(),
+            )))
+        };
+        match (identity.source_content(), candidate) {
+            (TextUnitContent::Value(source), TextUnitContent::Value(candidate)) => {
+                validate_slot(source, candidate)
+            }
+            (TextUnitContent::Lines(source), TextUnitContent::Lines(candidate))
+                if identity.role().preserves_placeholder_line_slots()
+                    && source.len() == candidate.len() =>
+            {
+                for (source, candidate) in source.iter().zip(candidate) {
+                    match validate_slot(source, candidate)? {
+                        Ok(true) => {}
+                        result => return Ok(result),
+                    }
+                }
+                ensure_running()?;
+                Ok(Ok(true))
+            }
+            (TextUnitContent::Lines(source), TextUnitContent::Lines(candidate))
+                if !identity.role().preserves_placeholder_line_slots() =>
+            {
+                validate_slot(&source.join("\n"), &candidate.join("\n"))
+            }
+            _ => {
+                ensure_running()?;
+                Ok(Ok(false))
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn prepare(
         &self,
@@ -139,6 +244,8 @@ impl ResolvedTranslationSemantics {
         let facts = match prepare_translation_resource_text_with_cancellation(
             self.engine,
             kind,
+            "test",
+            test_profile(self.engine, kind),
             original,
             &[],
             self.terminology.as_ref(),
@@ -160,23 +267,34 @@ impl ResolvedTranslationSemantics {
         kind: TextGroupKind,
         content: &TextUnitContent,
     ) -> Result<PreparedTranslationText, ResolvedTranslationSemanticError> {
-        match self.prepare_content_with_cancellation(kind, content, || Ok::<_, Infallible>(())) {
-            Ok(result) => result,
+        match prepare_translation_resource_facts_for_contract_with_cancellation(
+            self.engine,
+            kind,
+            "test",
+            test_profile(self.engine, kind),
+            content,
+            self.terminology.as_ref(),
+            &self.placeholder_service,
+            &self.custom_placeholders,
+            || Ok::<_, Infallible>(()),
+        ) {
+            Ok(Ok(facts)) => self.finish_prepared_text(facts),
+            Ok(Err(source)) => Err(source),
             Err(unreachable) => match unreachable {},
         }
     }
 
     /// 保持生产译前语义，并在大文本复制、术语扫描和状态建立之间轮询取消。
-    pub(crate) fn prepare_content_with_cancellation<E>(
+    pub(crate) fn prepare_identity_content_with_cancellation<E>(
         &self,
-        kind: TextGroupKind,
+        identity: &TranslationUnitIdentity,
         content: &TextUnitContent,
         mut ensure_running: impl FnMut() -> Result<(), E>,
     ) -> Result<Result<PreparedTranslationText, ResolvedTranslationSemanticError>, E> {
         ensure_running()?;
         let facts = match prepare_translation_resource_facts_with_cancellation(
             self.engine,
-            kind,
+            identity,
             content,
             self.terminology.as_ref(),
             &self.placeholder_service,
@@ -224,6 +342,61 @@ impl ResolvedTranslationSemantics {
     }
 }
 
+#[cfg(test)]
+fn test_profile(engine: RpgMakerEngine, kind: TextGroupKind) -> RpgMakerBuiltinPlaceholderProfile {
+    use crate::rpg_maker::asset::RpgMakerAssetOwner;
+    use crate::rpg_maker::model::{ScalarFieldKey, TextUnitRole};
+    use crate::rpg_maker::text::{RpgMakerLocation, RpgMakerSource, StandardDataFile};
+
+    let (location, role) = match kind {
+        TextGroupKind::DatabaseEntry => (
+            RpgMakerLocation::value(
+                RpgMakerSource::data(StandardDataFile::Items),
+                vec![crate::rpg_maker::text::RpgMakerLocationStep::index(1)],
+            ),
+            TextUnitRole::Scalar(ScalarFieldKey::new("description").expect("测试 role 应合法")),
+        ),
+        TextGroupKind::System => (
+            RpgMakerLocation::value(RpgMakerSource::data(StandardDataFile::System), Vec::new()),
+            TextUnitRole::Scalar(ScalarFieldKey::new("gameTitle").expect("测试 role 应合法")),
+        ),
+        TextGroupKind::Map => (
+            RpgMakerLocation::value(RpgMakerSource::map(1), Vec::new()),
+            TextUnitRole::Scalar(ScalarFieldKey::new("displayName").expect("测试 role 应合法")),
+        ),
+        TextGroupKind::EventDialogue => (
+            RpgMakerLocation::value(RpgMakerSource::map(1), Vec::new()),
+            TextUnitRole::DialogueBody,
+        ),
+        TextGroupKind::EventChoices => (
+            RpgMakerLocation::value(RpgMakerSource::map(1), Vec::new()),
+            TextUnitRole::Choices,
+        ),
+        TextGroupKind::EventScrollingText => (
+            RpgMakerLocation::value(RpgMakerSource::map(1), Vec::new()),
+            TextUnitRole::ScrollingText,
+        ),
+        TextGroupKind::EventCommand => (
+            RpgMakerLocation::value(RpgMakerSource::map(1), Vec::new()),
+            TextUnitRole::Scalar(ScalarFieldKey::new("nickname").expect("测试 role 应合法")),
+        ),
+        TextGroupKind::PluginParameter => (
+            RpgMakerLocation::value(
+                RpgMakerSource::plugin_parameter(0, "Plugin", "Parameter"),
+                Vec::new(),
+            ),
+            TextUnitRole::Scalar(ScalarFieldKey::new("value").expect("测试 role 应合法")),
+        ),
+    };
+    RpgMakerBuiltinPlaceholderProfile::for_location(
+        engine,
+        RpgMakerAssetOwner::Builtin,
+        kind,
+        &location,
+        &role,
+    )
+}
+
 /// 已由当前编译后 Placeholder 与 Terminology 共同建立的 Unit 资源事实。
 ///
 /// 字段保持私有，调用方不能用原始 JSON 假装已经完成规则编译和实际命中计算。
@@ -241,7 +414,34 @@ pub(crate) struct TranslationResourceFacts {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_translation_resource_facts_with_cancellation<E>(
     engine: RpgMakerEngine,
+    identity: &TranslationUnitIdentity,
+    content: &TextUnitContent,
+    terminology: &CompiledTerminology,
+    placeholder_service: &Pcre2PlaceholderService,
+    custom_placeholders: &CompiledPlaceholderRules,
+    ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<Result<TranslationResourceFacts, ResolvedTranslationSemanticError>, E> {
+    let kind = identity.kind();
+    let target_id = identity.readable_id();
+    prepare_translation_resource_facts_for_contract_with_cancellation(
+        engine,
+        kind,
+        &target_id,
+        RpgMakerBuiltinPlaceholderProfile::for_identity(engine, identity),
+        content,
+        terminology,
+        placeholder_service,
+        custom_placeholders,
+        ensure_running,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_translation_resource_facts_for_contract_with_cancellation<E>(
+    engine: RpgMakerEngine,
     kind: TextGroupKind,
+    target_id: &str,
+    profile: RpgMakerBuiltinPlaceholderProfile,
     content: &TextUnitContent,
     terminology: &CompiledTerminology,
     placeholder_service: &Pcre2PlaceholderService,
@@ -253,6 +453,8 @@ pub(crate) fn prepare_translation_resource_facts_with_cancellation<E>(
         TextUnitContent::Value(original) => prepare_translation_resource_text_with_cancellation(
             engine,
             kind,
+            target_id,
+            profile,
             original,
             &[],
             terminology,
@@ -266,6 +468,8 @@ pub(crate) fn prepare_translation_resource_facts_with_cancellation<E>(
             prepare_translation_resource_text_with_cancellation(
                 engine,
                 kind,
+                target_id,
+                profile,
                 &original,
                 &line_separators,
                 terminology,
@@ -281,6 +485,8 @@ pub(crate) fn prepare_translation_resource_facts_with_cancellation<E>(
 fn prepare_translation_resource_text_with_cancellation<E>(
     engine: RpgMakerEngine,
     kind: TextGroupKind,
+    target_id: &str,
+    profile: RpgMakerBuiltinPlaceholderProfile,
     original: &str,
     line_separators: &[usize],
     terminology: &CompiledTerminology,
@@ -289,15 +495,16 @@ fn prepare_translation_resource_text_with_cancellation<E>(
     ensure_running: &mut impl FnMut() -> Result<(), E>,
 ) -> Result<Result<TranslationResourceFacts, ResolvedTranslationSemanticError>, E> {
     ensure_running()?;
-    let (model_text, placeholders) = match placeholder_service
-        .protect_with_line_boundaries_with_cancellation(
-            engine,
-            kind,
-            original,
-            line_separators,
-            custom_placeholders,
-            &mut *ensure_running,
-        )? {
+    let (model_text, placeholders) = match placeholder_service.protect_profile_with_cancellation(
+        engine,
+        kind,
+        target_id,
+        profile,
+        original,
+        line_separators,
+        custom_placeholders,
+        &mut *ensure_running,
+    )? {
         Ok(protected) => protected.into_parts(),
         Err(source) => {
             return Ok(Err(ResolvedTranslationSemanticError::ProtectPlaceholder(
@@ -643,13 +850,16 @@ fn clone_placeholder_with_cancellation<E>(
     placeholder: &AppliedPlaceholder,
     ensure_running: &mut impl FnMut() -> Result<(), E>,
 ) -> Result<AppliedPlaceholder, E> {
-    Ok(AppliedPlaceholder::new(
+    Ok(AppliedPlaceholder::new_with_contract_and_identity(
         clone_text_with_cancellation(placeholder.token(), ensure_running)?,
         clone_text_with_cancellation(placeholder.original(), ensure_running)?,
+        clone_text_with_cancellation(placeholder.semantic_identity(), ensure_running)?,
         placeholder.origin(),
         clone_text_with_cancellation(placeholder.label(), ensure_running)?,
         clone_text_with_cancellation(placeholder.scope(), ensure_running)?,
         placeholder.segment(),
+        placeholder.order_policy(),
+        placeholder.wrapper(),
     ))
 }
 

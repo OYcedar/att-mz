@@ -126,22 +126,10 @@ _GENERIC_PUBLICATION_FIELDS = {
     "files",
     "translated_units",
     "retained_source_units",
-    "symbol_repair_attempted_units",
-    "symbol_repair_repaired_units",
-    "symbol_repair_skipped_units",
-    "symbol_repair_replacements",
 }
 _RPG_MAKER_PUBLICATION_FIELDS = {
     "translated_units",
     "original_units",
-    "auto_wrapped_units",
-    "inserted_line_breaks",
-    "inserted_fullwidth_indents",
-    "manual_layout_units",
-    "symbol_repair_attempted_units",
-    "symbol_repair_repaired_units",
-    "symbol_repair_skipped_units",
-    "symbol_repair_replacements",
 }
 
 

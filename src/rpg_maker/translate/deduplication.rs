@@ -23,6 +23,7 @@ pub(crate) struct TranslationDeduplicationCandidate {
     identity: TranslationUnitIdentity,
     protected_text: String,
     applied_placeholders: Vec<AppliedPlaceholder>,
+    candidate_contract: Sha256Fingerprint,
     translation: Option<TextUnitContent>,
     translation_state: Option<Sha256Fingerprint>,
     state_context: TranslationStateContext,
@@ -34,6 +35,7 @@ impl TranslationDeduplicationCandidate {
         identity: TranslationUnitIdentity,
         protected_text: impl Into<String>,
         applied_placeholders: Vec<AppliedPlaceholder>,
+        candidate_contract: Sha256Fingerprint,
         translation: Option<TextUnitContent>,
         translation_state: Option<Sha256Fingerprint>,
         state_context: TranslationStateContext,
@@ -43,6 +45,7 @@ impl TranslationDeduplicationCandidate {
             identity,
             protected_text: protected_text.into(),
             applied_placeholders,
+            candidate_contract,
             translation,
             translation_state,
             state_context,
@@ -88,6 +91,7 @@ struct DeduplicationKey {
     source_content: TextUnitContent,
     protected_text: String,
     applied_placeholders: Vec<AppliedPlaceholder>,
+    candidate_contract: Sha256Fingerprint,
 }
 
 impl DeduplicationKey {
@@ -97,6 +101,7 @@ impl DeduplicationKey {
             source_content: candidate.identity.source_content().clone(),
             protected_text: candidate.protected_text.clone(),
             applied_placeholders: candidate.applied_placeholders.clone(),
+            candidate_contract: candidate.candidate_contract,
         }
     }
 }
@@ -468,6 +473,7 @@ mod tests {
             identity,
             protected_text,
             placeholders,
+            fingerprint(0),
             translation,
             translation_state,
             state_context,
@@ -549,6 +555,40 @@ mod tests {
                 }
             }
         );
+    }
+
+    #[test]
+    fn zero_match_candidate_contract_prevents_unsafe_propagation() {
+        let first = scalar_identity(StandardDataFile::Items, 1, "name", "same source");
+        let second = scalar_identity(StandardDataFile::Items, 2, "name", "same source");
+        let first = candidate(
+            first,
+            "same source",
+            Vec::new(),
+            None,
+            state_context(1),
+            false,
+        );
+        let mut second = candidate(
+            second,
+            "same source",
+            Vec::new(),
+            None,
+            state_context(2),
+            false,
+        );
+        second.candidate_contract = fingerprint(1);
+
+        let (outcomes, invalidations, reuses) =
+            deduplicate_translation_candidates(vec![first, second]).into_parts();
+        assert!(invalidations.is_empty());
+        assert!(reuses.is_empty());
+        assert!(outcomes.iter().all(|outcome| matches!(
+            outcome,
+            TranslationDeduplicationOutcome::Active {
+                propagation_targets
+            } if propagation_targets.is_empty()
+        )));
     }
 
     #[test]

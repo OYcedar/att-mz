@@ -684,16 +684,16 @@ target_task_user_message_characters = 10000
 }
 
 #[test]
-fn generic_write_back_preserves_manual_symbols_for_english_and_japanese() {
-    let temporary = tempfile::tempdir().expect("应可建立 Generic 符号修复进程测试目录");
+fn generic_write_back_materializes_manual_translation_exactly() {
+    let temporary = tempfile::tempdir().expect("应可建立 Generic 逐字写回进程测试目录");
     let root = temporary.path();
     let input = root.join("input");
-    fs::create_dir(&input).expect("应可建立 Generic 符号修复输入目录");
+    fs::create_dir(&input).expect("应可建立 Generic 逐字物化输入目录");
     fs::write(
         input.join("settings.jsonl"),
         "{\"id\":\"settings\",\"kind\":\"settings\",\"units\":[{\"id\":\"categories\",\"text\":\"General, Misc, Audio, Toggle\"}]}\n",
     )
-    .expect("应可写入 Generic 符号修复输入");
+    .expect("应可写入 Generic 逐字物化输入");
 
     let distribution = distribution_root(root);
     fs::create_dir_all(&distribution).expect("应可建立测试发行目录");
@@ -712,11 +712,11 @@ fn generic_write_back_preserves_manual_symbols_for_english_and_japanese() {
     .expect("应可写入 Generic 精确修订脚本");
 
     for (project, source_language) in [
-        ("generic-symbol-repair-en", "en"),
-        ("generic-symbol-repair-ja", "ja"),
+        ("generic-exact-materialization-en", "en"),
+        ("generic-exact-materialization-ja", "ja"),
     ] {
         assert_success(
-            "Generic 符号修复 Init",
+            "Generic 逐字物化 Init",
             &run_att(
                 root,
                 &[
@@ -734,11 +734,11 @@ fn generic_write_back_preserves_manual_symbols_for_english_and_japanese() {
             ),
         );
         assert_success(
-            "Generic 符号修复 Extract",
+            "Generic 逐字物化 Extract",
             &run_att(root, &["generic", "extract", "--name", project]),
         );
         assert_success(
-            "Generic 符号修复 Lua",
+            "Generic 逐字物化 Lua",
             &run_att(
                 root,
                 &[
@@ -754,7 +754,7 @@ fn generic_write_back_preserves_manual_symbols_for_english_and_japanese() {
         let workspace = distribution.join("projects/generic").join(project);
         let logs_before = project_log_paths(&workspace.join("logs"));
         let write_back = run_att(root, &["generic", "write-back", "--name", project]);
-        assert_success("Generic 符号修复 WriteBack", &write_back);
+        assert_success("Generic 逐字物化 WriteBack", &write_back);
         assert_plain_progress_lines(
             &write_back.stderr,
             &[
@@ -763,17 +763,9 @@ fn generic_write_back_preserves_manual_symbols_for_english_and_japanese() {
                 "Finalizing required resources",
             ],
         );
-        let stdout = String::from_utf8(write_back.stdout).expect("WriteBack stdout 必须是 UTF-8");
-        let plain_stdout = stdout.replace(['\u{2068}', '\u{2069}'], "");
-        assert!(
-            plain_stdout.contains(
-                "Symbol repair: attempted 0 units, repaired 0, skipped internally 0, replaced 0 symbols"
-            ),
-            "人工译文不得进入自动符号修复：{stdout}"
-        );
         assert_eq!(
             fs::read_to_string(workspace.join("write_back/settings.jsonl"))
-                .expect("Generic 符号修复输出应可读取"),
+                .expect("Generic 逐字物化输出应可读取"),
             "{\"id\":\"settings\",\"kind\":\"settings\",\"units\":[{\"id\":\"categories\",\"text\":\"常规、杂项、声音、开关\"}]}\n",
             "WriteBack 必须原样采用人工译文"
         );
@@ -800,13 +792,9 @@ fn generic_write_back_preserves_manual_symbols_for_english_and_japanese() {
                     "files": 1,
                     "translated_units": 1,
                     "retained_source_units": 0,
-                    "symbol_repair_attempted_units": 0,
-                    "symbol_repair_repaired_units": 0,
-                    "symbol_repair_skipped_units": 0,
-                    "symbol_repair_replacements": 0,
                 },
             }),
-            "项目日志必须保存同一组四项符号修复统计"
+            "项目日志只保存实际物化结果"
         );
     }
 }
@@ -933,6 +921,7 @@ fn generic_missing_text_capture_reports_exact_leaf_without_model_request_or_stat
         concat!(
             "[[rule]]\n",
             "scopes = [\"dialogue\"]\n",
+            "order = \"preserve\"\n",
             "pattern = '(?:(?<text>保留)|触发缺组)'\n",
         ),
     )

@@ -910,10 +910,6 @@ pub(crate) struct GenericPublicationSummary {
     pub(crate) files: u64,
     pub(crate) translated_units: u64,
     pub(crate) retained_source_units: u64,
-    pub(crate) symbol_repair_attempted_units: u64,
-    pub(crate) symbol_repair_repaired_units: u64,
-    pub(crate) symbol_repair_skipped_units: u64,
-    pub(crate) symbol_repair_replacements: u64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -921,14 +917,6 @@ pub(crate) struct GenericPublicationSummary {
 pub(crate) struct RpgMakerPublicationSummary {
     pub(crate) translated_units: u64,
     pub(crate) original_units: u64,
-    pub(crate) auto_wrapped_units: u64,
-    pub(crate) inserted_line_breaks: u64,
-    pub(crate) inserted_fullwidth_indents: u64,
-    pub(crate) manual_layout_units: u64,
-    pub(crate) symbol_repair_attempted_units: u64,
-    pub(crate) symbol_repair_repaired_units: u64,
-    pub(crate) symbol_repair_skipped_units: u64,
-    pub(crate) symbol_repair_replacements: u64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

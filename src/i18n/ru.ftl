@@ -9,6 +9,8 @@ cli-translate-about = Перевести извлечённый текст с я
 cli-write-back-about = Записать текущие переводы в выходной каталог проекта
 cli-manual-about = Управлять ручными переводами в редактируемом TOML-файле
 cli-manual-export-about = Экспортировать строки, которым нужен ручной перевод
+cli-ownership-export-about = Экспортировать владельца текста для каждой извлечённой единицы RPG Maker
+cli-translation-export-about = Экспортировать исходный текст, текущий перевод и состояние каждой извлечённой единицы
 cli-manual-check-about = Проверить TOML с ручными переводами без изменения проекта
 cli-manual-apply-about = Применить заполненные и корректные ручные переводы
 cli-project-lua-about = Выполнить Lua-скрипт над базой данных проекта
@@ -16,9 +18,6 @@ cli-project-name-help = Стабильное имя проекта
 cli-init-path-help = Корневой входной каталог; существующий проект может повторно использовать последний успешный путь
 cli-source-language-help = ID исходного языка
 cli-target-language-help = ID целевого языка
-cli-dialogue-width-help = Максимум полноширинных символов в строке диалога
-cli-scrolling-width-help = Максимум полноширинных символов в строке прокручиваемого текста
-cli-help-width-help = Максимум полноширинных символов в строке справки или описания
 cli-builtin-help = Использовать встроенные в ATT позиции текста RPG Maker
 cli-rules-help = Заменить правила извлечения RPG Maker этим TOML; пустой список отключает правила
 cli-dialogue-rules-help = Заменить проекцию имён диалога MV, используемую с Builtin
@@ -104,12 +103,11 @@ result-translate-convergence = Сведение состояния: сохран
 result-write-back-completed = Запись завершена: { $project }
 result-project-lua-completed = Выполнение Lua проекта завершено: { $project }
 result-output-directory = Каталог вывода: { $path }
-result-write-back-summary = Запись: { $translated } переведённых единиц, { $original } исходных; автоперенос { $auto_wrapped }, добавлено переносов { $breaks } и полноширинных отступов { $indents }; ручная раскладка { $manual }
+result-write-back-summary = Запись: { $translated } переведённых единиц, { $original } исходных
 result-generic-extract-unchanged = Входные данные Generic не изменились: файлов — { $files }, групп — { $groups }, единиц — { $units }
 result-generic-extract-updated = Входные данные Generic обновлены: файлов — { $files }, групп — { $groups }, единиц — { $units }; переводов сохранено — { $preserved }, очищено — { $cleared }
 result-generic-translate-summary = Перевод Generic: запланировано { $total } задач, начато { $started }, не начато { $not_started }; завершено { $complete }, частично { $partial }, недоступно { $unavailable }, с ошибкой { $failed }, отменено { $cancelled }; запланировано Unit: { $planned_units }, осталось Unit: { $remaining_units }, очищено { $cleared }, повторно использовано { $reused }, принято { $accepted }, записано { $written }, конфликтов { $conflicted }, проблем ответа { $problems }
 result-generic-write-back-summary = Запись Generic: { $translated } переведённых единиц, { $original } исходных сохранено
-result-symbol-repair-summary = Исправление символов: проверено { $attempted } единиц, исправлено { $repaired }, внутренне пропущено { $skipped }, заменено символов { $replacements }
 result-run-log = Журнал запуска: { $path }
 translate-incomplete-object = Запуск Translate для проекта { $project }
 translate-incomplete-rpg-maker-reason = Частичных задач: { $partial }, недоступных: { $unavailable }, не начато: { $not_started }, проблем протокола: { $protocol }, исчерпанных запросов: { $exhausted }; приём запросов {
@@ -214,7 +212,6 @@ diagnostic-resolution-value = { $code ->
     [fix_input] Исправьте указанные входные данные и повторите попытку
     [fix_placeholder_rules] Исправьте указанное правило Placeholder и повторите попытку
     [review_disabled_rules] Если это ожидаемый результат, ничего делать не нужно; иначе добавьте допустимые правила в указанный файл и снова запустите Extract
-    [adjust_manual_layout] Вручную скорректируйте переносы строк и компоновку в указанных местах с учётом заданной ширины отображения
     [check_path_and_permissions] Проверьте путь, состояние файловой системы и разрешения
     [check_project_state] Проверьте и исправьте состояние проекта, затем повторите попытку
     [resolve_contention] Дождитесь завершения конфликтующей операции и повторите попытку
@@ -285,7 +282,6 @@ diagnostic-failure-value = { $code ->
     [duplicate_identifier] Идентификатор повторяется
     [extraction_out_of_date] Сохранённые данные извлечения больше не соответствуют текущему источнику
     [invalid_content] Содержимое нарушает обязательный контракт
-    [manual_layout_required] Требуется вручную настроить переносы строк или макет
     [operation_failed] Операция завершилась ошибкой
     [placeholder_projection_failed] Проекция Placeholder не сохранила обязательную структуру
     [profile_not_found] Выбранный профиль перевода не существует
@@ -343,7 +339,6 @@ diagnostic-json-position = строка { $line }, столбец { $column }
 diagnostic-placeholder-rule-file = Правило Placeholder { $number } в { $path }
 diagnostic-placeholder-rule-project = Правило Placeholder { $number } текущего проекта
 manual-exported = Экспортировано записей: { $entries }; файл: { $path }
-manual-ownership-exported = Записи владения: { $path }
 manual-checked = Допустимых: { $valid }, незаполненных: { $unfilled }, ошибок: { $errors }
 manual-applied = Применено: { $applied }, незаполненных: { $unfilled }, ошибок: { $errors }
 manual-value = { $code ->

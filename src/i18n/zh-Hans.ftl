@@ -9,6 +9,8 @@ cli-translate-about = 使用显式或已保存的 Profile 翻译已提取原文
 cli-write-back-about = 将当前译文写入项目输出
 cli-manual-about = 使用可编辑 TOML 管理人工译文
 cli-manual-export-about = 导出当前需要人工补译的条目
+cli-ownership-export-about = 导出全部 RPG Maker 提取条目的文字所有权
+cli-translation-export-about = 导出全部提取条目的原文、当前译文和状态
 cli-manual-check-about = 只读检查人工译文 TOML
 cli-manual-apply-about = 应用已填写且有效的人工译文
 cli-project-lua-about = 对项目数据库运行 Lua 脚本
@@ -16,9 +18,6 @@ cli-project-name-help = 稳定项目名称
 cli-init-path-help = 输入根目录；已有项目可复用上次成功路径
 cli-source-language-help = 原文语言 ID
 cli-target-language-help = 译文目标语言 ID
-cli-dialogue-width-help = 对话正文每行允许的最大全角字符数
-cli-scrolling-width-help = 滚动文本每行允许的最大全角字符数
-cli-help-width-help = 帮助或说明框每行允许的最大全角字符数
 cli-builtin-help = 使用 ATT 内置的 RPG Maker 文本位置
 cli-rules-help = 用该 TOML 定义替换 RPG Maker 提取规则；空规则列表会停用规则
 cli-dialogue-rules-help = 替换与 Builtin 配合使用的 MV 对话姓名投影
@@ -104,12 +103,11 @@ result-translate-convergence = 状态收敛：保留 { $retained }，失效 { $i
 result-write-back-completed = 写回完成：{ $project }
 result-project-lua-completed = 项目 Lua 执行完成：{ $project }
 result-output-directory = 输出目录：{ $path }
-result-write-back-summary = 写回：应用译文 { $translated } 个单元，保留原文 { $original } 个单元；自动换行 { $auto_wrapped } 段，新增换行 { $breaks } 处；续行全角缩进 { $indents } 处；需人工换行 { $manual } 段
+result-write-back-summary = 写回：应用译文 { $translated } 个单元，保留原文 { $original } 个单元
 result-generic-extract-unchanged = Generic 输入未变化：{ $files } 个文件，{ $groups } 个组，{ $units } 个单元
 result-generic-extract-updated = Generic 输入已更新：{ $files } 个文件，{ $groups } 个组，{ $units } 个单元；保留 { $preserved } 条译文，清除 { $cleared } 条
 result-generic-translate-summary = Generic 翻译：计划 { $total } 个任务，已开始 { $started }，未开始 { $not_started }；完整 { $complete }，部分 { $partial }，不可用 { $unavailable }，失败 { $failed }，取消 { $cancelled }；计划 Unit { $planned_units }，剩余 Unit { $remaining_units }，清除 { $cleared }，复用 { $reused }，接受 { $accepted }，写入 { $written }，冲突 { $conflicted }，响应问题 { $problems }
 result-generic-write-back-summary = Generic 写回：应用译文 { $translated } 个单元，保留原文 { $original } 个单元
-result-symbol-repair-summary = 符号修复：尝试 { $attempted } 个单元，实际修复 { $repaired } 个，内部跳过 { $skipped } 个，替换 { $replacements } 个符号
 result-run-log = 运行记录：{ $path }
 translate-incomplete-object = 项目 { $project } 的本次 Translate
 translate-incomplete-rpg-maker-reason = 部分任务 { $partial }，不可用任务 { $unavailable }，未开始任务 { $not_started }，协议问题 { $protocol }，请求耗尽 { $exhausted }；请求准入{
@@ -209,7 +207,6 @@ diagnostic-resolution-value = { $code ->
     [fix_input] 修正指出的输入后重试
     [fix_placeholder_rules] 修正指出的 Placeholder 规则后重试
     [review_disabled_rules] 如果这是预期结果，无需处理；否则在指出的文件中添加有效规则并重新运行 Extract
-    [adjust_manual_layout] 按指出的位置和显示宽度人工调整换行与布局
     [check_path_and_permissions] 检查路径、文件系统状态和权限
     [check_project_state] 检查并修正项目状态后重试
     [resolve_contention] 等待冲突操作结束后重试
@@ -280,7 +277,6 @@ diagnostic-failure-value = { $code ->
     [duplicate_identifier] 标识符重复
     [extraction_out_of_date] 已保存的提取结果不再匹配当前源文件
     [invalid_content] 内容不符合必需契约
-    [manual_layout_required] 需要人工调整换行或布局
     [operation_failed] 操作失败
     [placeholder_projection_failed] Placeholder 投影未保留必需结构
     [profile_not_found] 所选翻译 Profile 不存在
@@ -338,7 +334,6 @@ diagnostic-json-position = 第 { $line } 行，第 { $column } 列
 diagnostic-placeholder-rule-file = { $path } 中的 Placeholder 规则 { $number }
 diagnostic-placeholder-rule-project = 当前项目的 Placeholder 规则 { $number }
 manual-exported = 已导出 { $entries } 条：{ $path }
-manual-ownership-exported = 所有权记录：{ $path }
 manual-checked = 有效 { $valid }，未填写 { $unfilled }，错误 { $errors }
 manual-applied = 已应用 { $applied }，未填写 { $unfilled }，错误 { $errors }
 manual-value = { $code ->

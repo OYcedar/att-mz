@@ -1876,7 +1876,7 @@ fn prepare_dialogue_replacement(
         })?;
         for (output_index, line) in lines.iter().enumerate() {
             let (_, line_recipe, command) = body_templates
-                .get(line.source_semantic_line_index())
+                .get(output_index)
                 .unwrap_or_else(|| body_templates.last().expect("已经确认正文模板至少有一项"));
             let mut text = String::new();
             if output_index == 0 {
@@ -1886,7 +1886,7 @@ fn prepare_dialogue_replacement(
                     line_recipe.physical_location(),
                 )?);
             }
-            text.push_str(line.text());
+            text.push_str(line);
             rebuilt_body.push(StackSafeJsonValue::new(rewrite_command(
                 command,
                 401,
@@ -2850,10 +2850,9 @@ mod tests {
         DialogueLinePart, DialogueLineRecipe, DialogueWriteRecipe, DirectSpeakerTarget,
         DirectTextPart, DirectTextRecipe, TextUnitRole,
     };
-    use crate::rpg_maker::project::test_layout_profile;
     use crate::rpg_maker::text::{MapId, StandardDataFile};
     use crate::rpg_maker::write_back::planner::{
-        EventBodyMutationSegment, RpgMakerWriteBackLaidOutLine, RpgMakerWriteBackMutation,
+        EventBodyMutationSegment, RpgMakerWriteBackMutation,
     };
 
     #[test]
@@ -3793,11 +3792,7 @@ mod tests {
             recipe,
             Some("莉莉".to_owned()),
             Some("莉莉译".to_owned()),
-            Some(vec![
-                RpgMakerWriteBackLaidOutLine::new("甲一".to_owned(), 0),
-                RpgMakerWriteBackLaidOutLine::new("甲二".to_owned(), 0),
-                RpgMakerWriteBackLaidOutLine::new("乙".to_owned(), 1),
-            ]),
+            Some(vec!["甲一".to_owned(), "甲二".to_owned(), "乙".to_owned()]),
         )
         .expect("对话测试计划应该合法");
         let plan = plan(vec![
@@ -3827,9 +3822,9 @@ mod tests {
         assert_eq!(list[1]["parameters"][0], "甲一");
         assert_eq!(list[2]["parameters"][0], "甲二");
         assert_eq!(list[1]["indent"], 1);
-        assert_eq!(list[2]["indent"], 1);
+        assert_eq!(list[2]["indent"], 2);
         assert_eq!(list[1]["lineUnknown"], "A");
-        assert_eq!(list[2]["lineUnknown"], "A");
+        assert_eq!(list[2]["lineUnknown"], "B");
         assert_eq!(list[3]["parameters"][0], "乙");
         assert_eq!(list[3]["indent"], 2);
         assert_eq!(list[3]["lineUnknown"], "B");
@@ -3966,16 +3961,7 @@ mod tests {
                 vec![(1, "A"), (2, "B"), (3, "C"), (3, "C")],
             ),
         ] {
-            let body_lines = texts
-                .iter()
-                .enumerate()
-                .map(|(source_semantic_line_index, text)| {
-                    RpgMakerWriteBackLaidOutLine::new(
-                        (*text).to_owned(),
-                        source_semantic_line_index,
-                    )
-                })
-                .collect();
+            let body_lines = texts.iter().map(|text| (*text).to_owned()).collect();
             let mutation =
                 ReplaceDialogueMutation::new(recipe.clone(), None, None, Some(body_lines))
                     .expect("自由断行正文应建立一个原子 Mutation");
@@ -4074,9 +4060,9 @@ mod tests {
             Some("Alice".to_owned()),
             Some("爱丽丝".to_owned()),
             Some(vec![
-                RpgMakerWriteBackLaidOutLine::new("第一行".to_owned(), 0),
-                RpgMakerWriteBackLaidOutLine::new("第二行".to_owned(), 0),
-                RpgMakerWriteBackLaidOutLine::new("尾行".to_owned(), 1),
+                "第一行".to_owned(),
+                "第二行".to_owned(),
+                "尾行".to_owned(),
             ]),
         )
         .expect("MV 对话 Mutation 应合法");
@@ -4113,7 +4099,7 @@ mod tests {
         assert_eq!(list[2]["parameters"][0], "第二行");
         assert_eq!(list[3]["parameters"][0], "尾行");
         assert_eq!(list[1]["lineUnknown"], "first");
-        assert_eq!(list[2]["lineUnknown"], "first");
+        assert_eq!(list[2]["lineUnknown"], "tail");
         assert_eq!(list[3]["lineUnknown"], "tail");
     }
 
@@ -4167,10 +4153,7 @@ mod tests {
                 recipe(),
                 Some("バニー淫魔".to_owned()),
                 Some("兔女郎魅魔".to_owned()),
-                Some(vec![RpgMakerWriteBackLaidOutLine::new(
-                    "译文".to_owned(),
-                    0,
-                )]),
+                Some(vec!["译文".to_owned()]),
             )
             .unwrap()
         };
@@ -4800,7 +4783,6 @@ mod tests {
             workspace_root().join("project.db"),
             "ja".to_owned(),
             "zh-Hans".to_owned(),
-            test_layout_profile(),
         )
     }
 }

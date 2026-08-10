@@ -9,6 +9,8 @@ cli-translate-about = 명시적 또는 저장된 Profile로 추출된 원문 번
 cli-write-back-about = 현재 번역을 프로젝트 출력에 쓰기
 cli-manual-about = 편집 가능한 TOML 파일로 수동 번역 관리
 cli-manual-export-about = 현재 수동 번역이 필요한 항목 내보내기
+cli-ownership-export-about = 추출된 모든 RPG Maker 단위의 텍스트 소유권 내보내기
+cli-translation-export-about = 추출된 모든 단위의 원문, 현재 번역 및 상태 내보내기
 cli-manual-check-about = 프로젝트를 변경하지 않고 수동 번역 TOML 검사
 cli-manual-apply-about = 입력 완료된 유효한 수동 번역 적용
 cli-project-lua-about = 프로젝트 데이터베이스에서 Lua 스크립트 실행
@@ -16,9 +18,6 @@ cli-project-name-help = 안정적인 프로젝트 이름
 cli-init-path-help = 입력 루트 디렉터리. 기존 프로젝트는 마지막 성공 경로를 재사용할 수 있습니다
 cli-source-language-help = 원문 언어 ID
 cli-target-language-help = 대상 언어 ID
-cli-dialogue-width-help = 대화 줄당 최대 전각 문자 수
-cli-scrolling-width-help = 스크롤 텍스트 줄당 최대 전각 문자 수
-cli-help-width-help = 도움말 또는 설명 줄당 최대 전각 문자 수
 cli-builtin-help = ATT 내장 RPG Maker 텍스트 위치 사용
 cli-rules-help = 이 TOML 정의로 RPG Maker 추출 규칙 교체. 빈 규칙 목록은 규칙을 비활성화합니다
 cli-dialogue-rules-help = Builtin과 함께 쓰는 MV 대화 이름 투영 교체
@@ -104,12 +103,11 @@ result-translate-convergence = 상태 수렴: 유지 { $retained }, 무효화 { 
 result-write-back-completed = 쓰기 완료: { $project }
 result-project-lua-completed = 프로젝트 Lua 실행 완료: { $project }
 result-output-directory = 출력 디렉터리: { $path }
-result-write-back-summary = 쓰기: 번역 { $translated }단위, 원문 { $original }단위; 자동 줄바꿈 { $auto_wrapped }, 줄바꿈 추가 { $breaks }, 전각 들여쓰기 추가 { $indents }; 수동 배치 { $manual }
+result-write-back-summary = 쓰기: 번역 { $translated }단위, 원문 { $original }단위
 result-generic-extract-unchanged = Generic 입력 변경 없음: 파일 { $files }개, 그룹 { $groups }개, 단위 { $units }개
 result-generic-extract-updated = Generic 입력 갱신: 파일 { $files }개, 그룹 { $groups }개, 단위 { $units }개; 번역 { $preserved }개 유지, { $cleared }개 삭제
 result-generic-translate-summary = Generic 번역: 계획 작업 { $total }개, 시작 { $started }개, 미시작 { $not_started }개, 완료 { $complete }개, 부분 { $partial }개, 사용 불가 { $unavailable }개, 실패 { $failed }개, 취소 { $cancelled }개; 계획 Unit { $planned_units }개, 남은 Unit { $remaining_units }개, 초기화 { $cleared }, 재사용 { $reused }, 수락 { $accepted }, 기록 { $written }, 충돌 { $conflicted }, 응답 문제 { $problems }
 result-generic-write-back-summary = Generic 쓰기: 번역 { $translated }단위, 원문 유지 { $original }단위
-result-symbol-repair-summary = 기호 복구: { $attempted }개 단위 시도, { $repaired }개 복구, 내부 건너뜀 { $skipped }개, 기호 { $replacements }개 교체
 result-run-log = 실행 기록: { $path }
 translate-incomplete-object = 프로젝트 { $project }의 이번 Translate
 translate-incomplete-rpg-maker-reason = 부분 작업 { $partial }개, 사용 불가 작업 { $unavailable }개, 미시작 작업 { $not_started }개, 프로토콜 문제 { $protocol }개, 요청 소진 { $exhausted }개, 요청 접수 {
@@ -209,7 +207,6 @@ diagnostic-resolution-value = { $code ->
     [fix_input] 표시된 입력을 수정한 후 다시 시도하세요
     [fix_placeholder_rules] 표시된 Placeholder 규칙을 수정한 후 다시 시도하세요
     [review_disabled_rules] 의도한 결과라면 조치가 필요 없습니다. 아니라면 지정된 파일에 유효한 규칙을 추가하고 Extract를 다시 실행하세요
-    [adjust_manual_layout] 표시된 위치와 표시 너비에 맞게 줄바꿈과 레이아웃을 수동으로 조정하세요
     [check_path_and_permissions] 경로, 파일 시스템 상태 및 권한을 확인하세요
     [check_project_state] 프로젝트 상태를 확인하고 수정한 후 다시 시도하세요
     [resolve_contention] 충돌하는 작업이 끝날 때까지 기다린 후 다시 시도하세요
@@ -280,7 +277,6 @@ diagnostic-failure-value = { $code ->
     [duplicate_identifier] 식별자가 중복되었습니다
     [extraction_out_of_date] 저장된 추출 결과가 현재 원본과 더 이상 일치하지 않습니다
     [invalid_content] 내용이 필수 계약을 위반합니다
-    [manual_layout_required] 줄 바꿈 또는 레이아웃을 수동으로 조정해야 합니다
     [operation_failed] 작업에 실패했습니다
     [placeholder_projection_failed] Placeholder 투영이 필수 구조를 보존하지 못했습니다
     [profile_not_found] 선택한 번역 Profile이 존재하지 않습니다
@@ -338,7 +334,6 @@ diagnostic-json-position = { $line }행 { $column }열
 diagnostic-placeholder-rule-file = { $path }의 Placeholder 규칙 { $number }
 diagnostic-placeholder-rule-project = 현재 프로젝트의 Placeholder 규칙 { $number }
 manual-exported = { $entries }개 항목을 { $path }에 내보냈습니다
-manual-ownership-exported = 소유권 기록: { $path }
 manual-checked = 유효 { $valid }, 미입력 { $unfilled }, 오류 { $errors }
 manual-applied = 적용 { $applied }, 미입력 { $unfilled }, 오류 { $errors }
 manual-value = { $code ->
