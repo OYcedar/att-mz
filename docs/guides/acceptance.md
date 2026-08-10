@@ -123,10 +123,9 @@ Placeholder 和来源语境分类：
 3. 收集全部含义不明的可读 ID，在一次 Lua 脚本中调用 `ctx.translation.context(ids)`，不要
    为每条译文分别启动 Lua，也不要从旧任务临时 ID 猜位置。
 4. 在完整语境中填写 TOML，检查术语、角色、控制符、形状和源语残留。
-5. 运行 `manual check`；只修正语法、原文、type、数组形状、空槽、控制码和 Placeholder
-   错误。
-6. check 通过后运行 `manual apply`，再重新检查全部受影响 Group。
-7. 对修改范围重新执行本指南第 5 至第 9 节。
+5. 默认直接运行 `manual apply`；apply 会在一个事务内执行与 `manual check` 相同的结构检查，
+   失败时不修改任何条目。需要事先试检或单独诊断 TOML 时才先运行 `manual check`。
+6. apply 成功后重新检查全部受影响 Group，并对修改范围重新执行本指南第 5 至第 9 节。
 
 Manual 不检查语言质量、术语、文风、语境或源语残留，这些仍由验收承担。复杂筛选、计算
 生成或批量变换可以使用 Lua 高级 API；Raw `ctx.db` 能绕过全部保护并破坏数据库，不是普通

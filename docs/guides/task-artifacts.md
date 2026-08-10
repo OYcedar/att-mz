@@ -75,7 +75,7 @@ TODO 使用稳定编号，例如 `EX-01`、`TR-03`、`WB-02`。完成前先写�
 - 配置记录实际命令 cwd 和固定的 `<att-dir>/config.toml` 绝对路径，不复制凭据。
 - Rules、术语和 Placeholder 保存本轮采用输入的逐字副本。
 - Prompt 修改可能影响多个项目，修改前检查全部使用者和授权。
-- Manual 记录 TOML 绝对路径、`check` 与 `apply` 结果，以及提交后权威状态。
+- Manual 记录 TOML 绝对路径、`apply` 结果和提交后权威状态；实际运行过 `check` 时再记录其结果。
 - Lua 特殊修改记录脚本绝对路径、参数、ATT 结果和提交后权威状态。
 - Generic 还要记录外部 JSONL 根、Extract 输入状态、外部转换工具的身份，以及来源路径到
   JSONL 相对文件、Group、Unit 和写回位置的映射规则。分组发生变化时，同时记录依据和

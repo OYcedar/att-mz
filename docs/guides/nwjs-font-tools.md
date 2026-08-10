@@ -55,7 +55,7 @@ python skills/translate-with-att/scripts/inspect_nwjs_runtime.py observe `
 - `noto-serif-sc`：Noto Serif CJK SC Regular 2.003；
 - `lxgw-wenkai`：LXGW WenKai GB Regular 1.522。
 
-先只读调查：
+需要在修改前比较字体或只读调查时运行 `inspect`：
 
 ```powershell
 python skills/translate-with-att/scripts/manage_rpg_maker_fonts.py inspect `
@@ -71,7 +71,7 @@ CSS 字体声明、已识别的加载 API、MV/MZ 标准字体字段，以及键
 普通正文或普通字符串即使整值恰好等于字体 family/stem 也不会自动修改；动态值、部分表达式和
 无法证明消费者的字体资产进入 Review。
 
-执行可逆替换：
+默认直接执行可逆替换：
 
 ```powershell
 python skills/translate-with-att/scripts/manage_rpg_maker_fonts.py apply `
@@ -82,7 +82,8 @@ python skills/translate-with-att/scripts/manage_rpg_maker_fonts.py apply `
   --output D:\review\font-apply.json
 ```
 
-`apply` 先建立包含每项替换前后完整字节和摘要的 `state`，再原子写入。选中字体缺少
+`apply` 每次都按当前游戏和字体输入重新扫描、生成计划并验证，不依赖之前的 `inspect` 结果。它先建立
+包含每项替换前后完整字节和摘要的 `state`，再原子写入。选中字体缺少
 `--coverage-text` 中的字符只会进入 Review，不会阻止安全的已证明引用替换。没有已证明引用、
 或所有引用已经指向选中字体时命令仍成功退出；报告用 `applied`、`no_op` 和 `qa_status`
 分别说明是否写入、是否无需写入和质量结论。

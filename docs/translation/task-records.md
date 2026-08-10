@@ -39,7 +39,7 @@ fence，只执行敏感信息替换，不解析后重新排版，也不另行展
 1. 运行对应项目的 `manual export`，取得当前可读 ID 和原文；
 2. 对含义不明的条目，把全部 ID 合并到一次 `ctx.translation.context(ids)`；
 3. 结合任务记录中的实际请求和 Assistant、当前术语及 Lua 返回的 Group 上下文填写 TOML；
-4. 运行 `manual check` 和 `manual apply`。
+4. 默认直接运行 `manual apply`；只在需要事先试检或单独诊断 TOML 时先运行 `manual check`。
 
 不要从重复原文、任务序号或任务记录文件名猜数据库位置。完整流程见
 [Manual](../manual/README.md)和[Lua](../lua/README.md)。

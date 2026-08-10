@@ -165,8 +165,8 @@ Extract 不删除人工译文表。原文或实际结构变化会让对应人工
   `ctx.terminology.list()`，不要逐条启动 Lua；
 - 无法确认正确译文：停止并报告缺少的上下文或领域事实。
 
-Manual 流程固定为 export、填写、check、apply。check 只检查结构与 Placeholder，不检查残留
-英文、译文等于原文、术语偏好或翻译质量。
+Manual 默认流程为 export、填写、apply。apply 已执行与 check 相同的结构和 Placeholder 检查；
+只在需要事先试检或单独诊断 TOML 时先运行 check。两者都不检查残留英文、译文等于原文、术语偏好或翻译质量。
 
 #### Unavailable
 
