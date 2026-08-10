@@ -11,23 +11,25 @@ mod task_record;
 mod translate;
 mod write_back;
 
+pub(crate) use crate::translation::TranslationOrigin;
 pub(crate) use identity::CancellableTextMap;
 pub(crate) use placeholder::{
     GenericCompiledPlaceholderRules, GenericPlaceholderError, GenericPlaceholderService,
     GenericProtectedText, validate_translation_placeholders_with_cancellation,
 };
 pub(crate) use project::{
-    CommitTranslationsOutcome, ExtractOutcome, GenericInitRequest, GenericProject,
-    GenericProjectError, GenericProjectStore, GenericStoredSnapshot, TranslationOrigin,
-    TranslationWrite, ensure_input_fingerprints_current_with_cancellation,
+    CommitTranslationResultsOutcome, CommitTranslationsOutcome, ExtractOutcome, GenericInitRequest,
+    GenericProject, GenericProjectError, GenericProjectStore, GenericStoredSnapshot,
+    RejectedTranslationWrite, TranslationWrite,
+    ensure_input_fingerprints_current_with_cancellation,
 };
 pub(crate) use task_record::{GenericTaskRecordDocument, GenericTaskRecordState};
 pub(crate) use translate::{
     AutomaticStateResources, GenericPlanningError, GenericPlanningUnitLocator, GenericUnitKey,
     GenericUnitMap, PlannedTask, PlanningUnit, ResponseProblem, TranslationAcceptance,
-    TranslationPlan, ValidatedReuse, accept_parsed_response_with_cancellation,
+    TranslationPlan, TranslationReview, ValidatedReuse, accept_parsed_response_with_cancellation,
     current_translation_for_stored_with_cancellation,
-    plan_translation_with_validator_and_cancellation,
+    plan_translation_with_validator_and_cancellation, readable_generic_unit_id,
     terminology_hit_fingerprint_with_cancellation,
 };
 pub(crate) use write_back::{

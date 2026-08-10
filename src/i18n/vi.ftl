@@ -9,6 +9,8 @@ cli-translate-about = Dịch văn bản đã trích xuất bằng Profile đã c
 cli-write-back-about = Ghi bản dịch hiện tại vào đầu ra của dự án
 cli-manual-about = Quản lý bản dịch thủ công trong tệp TOML có thể chỉnh sửa
 cli-manual-export-about = Xuất các mục hiện cần dịch thủ công
+cli-ownership-export-about = Xuất quyền sở hữu văn bản của mọi đơn vị RPG Maker đã trích xuất
+cli-translation-export-about = Xuất văn bản nguồn, bản dịch hiện tại và trạng thái của mọi đơn vị đã trích xuất
 cli-manual-check-about = Kiểm tra TOML bản dịch thủ công mà không thay đổi dự án
 cli-manual-apply-about = Áp dụng các bản dịch thủ công đã điền và hợp lệ
 cli-project-lua-about = Chạy tập lệnh Lua trên cơ sở dữ liệu dự án
@@ -16,9 +18,6 @@ cli-project-name-help = Tên dự án ổn định
 cli-init-path-help = Thư mục gốc đầu vào; dự án hiện có có thể dùng lại đường dẫn thành công gần nhất
 cli-source-language-help = ID ngôn ngữ nguồn
 cli-target-language-help = ID ngôn ngữ đích
-cli-dialogue-width-help = Số ký tự toàn chiều rộng tối đa trên mỗi dòng hội thoại
-cli-scrolling-width-help = Số ký tự toàn chiều rộng tối đa trên mỗi dòng văn bản cuộn
-cli-help-width-help = Số ký tự toàn chiều rộng tối đa trên mỗi dòng trợ giúp hoặc mô tả
 cli-builtin-help = Dùng các vị trí văn bản RPG Maker tích hợp của ATT
 cli-rules-help = Thay quy tắc trích xuất RPG Maker bằng định nghĩa TOML này; danh sách rỗng sẽ tắt quy tắc
 cli-dialogue-rules-help = Thay phép chiếu tên hội thoại MV dùng cùng Builtin
@@ -104,12 +103,11 @@ result-translate-convergence = Hội tụ trạng thái: giữ { $retained }, v�
 result-write-back-completed = Ghi lại hoàn tất: { $project }
 result-project-lua-completed = Thực thi Lua dự án hoàn tất: { $project }
 result-output-directory = Thư mục đầu ra: { $path }
-result-write-back-summary = Ghi lại: { $translated } đơn vị dịch, { $original } đơn vị nguồn; tự ngắt { $auto_wrapped }, thêm { $breaks } ngắt dòng và { $indents } thụt đầu dòng toàn chiều rộng; { $manual } cần bố cục thủ công
+result-write-back-summary = Ghi lại: { $translated } đơn vị dịch, { $original } đơn vị nguồn
 result-generic-extract-unchanged = Đầu vào Generic không đổi: { $files } tệp, { $groups } nhóm, { $units } đơn vị
 result-generic-extract-updated = Đã cập nhật đầu vào Generic: { $files } tệp, { $groups } nhóm, { $units } đơn vị; giữ { $preserved } bản dịch và xóa { $cleared }
 result-generic-translate-summary = Dịch Generic: { $total } tác vụ đã lên kế hoạch, { $started } đã bắt đầu, { $not_started } chưa bắt đầu; { $complete } hoàn tất, { $partial } một phần, { $unavailable } không khả dụng, { $failed } thất bại, { $cancelled } đã hủy; { $planned_units } Unit đã lên kế hoạch, còn { $remaining_units } Unit, xóa { $cleared }, dùng lại { $reused }, chấp nhận { $accepted }, ghi { $written }, xung đột { $conflicted }, lỗi phản hồi { $problems }
 result-generic-write-back-summary = Ghi lại Generic: { $translated } đơn vị dịch, giữ nguyên { $original } đơn vị nguồn
-result-symbol-repair-summary = Sửa ký hiệu: đã thử { $attempted } đơn vị, sửa { $repaired }, bỏ qua nội bộ { $skipped }, thay { $replacements } ký hiệu
 result-run-log = Nhật ký lần chạy: { $path }
 translate-incomplete-object = Lần chạy Translate của dự án { $project }
 translate-incomplete-rpg-maker-reason = { $partial } tác vụ một phần, { $unavailable } tác vụ không khả dụng, { $not_started } chưa bắt đầu, { $protocol } lỗi giao thức và { $exhausted } yêu cầu đã cạn; nhận yêu cầu {
@@ -209,7 +207,6 @@ diagnostic-resolution-value = { $code ->
     [fix_input] Sửa dữ liệu đầu vào được nêu rồi thử lại
     [fix_placeholder_rules] Sửa quy tắc Placeholder được nêu rồi thử lại
     [review_disabled_rules] Nếu đây là kết quả mong đợi thì không cần xử lý; nếu không, hãy thêm quy tắc hợp lệ vào tệp được chỉ ra rồi chạy lại Extract
-    [adjust_manual_layout] Điều chỉnh thủ công ngắt dòng và bố cục tại các vị trí đã nêu theo chiều rộng hiển thị được chỉ định
     [check_path_and_permissions] Kiểm tra đường dẫn, trạng thái hệ thống tệp và quyền
     [check_project_state] Kiểm tra và sửa trạng thái dự án rồi thử lại
     [resolve_contention] Chờ thao tác xung đột kết thúc rồi thử lại
@@ -280,7 +277,6 @@ diagnostic-failure-value = { $code ->
     [duplicate_identifier] Mã định danh bị trùng lặp
     [extraction_out_of_date] Bản trích xuất đã lưu không còn khớp với nguồn hiện tại
     [invalid_content] Nội dung vi phạm hợp đồng bắt buộc
-    [manual_layout_required] Cần điều chỉnh ngắt dòng hoặc bố cục theo cách thủ công
     [operation_failed] Thao tác thất bại
     [placeholder_projection_failed] Phép chiếu Placeholder không giữ nguyên cấu trúc bắt buộc
     [profile_not_found] Profile dịch đã chọn không tồn tại
@@ -338,7 +334,6 @@ diagnostic-json-position = dòng { $line }, cột { $column }
 diagnostic-placeholder-rule-file = Quy tắc Placeholder { $number } trong { $path }
 diagnostic-placeholder-rule-project = Quy tắc Placeholder { $number } của dự án hiện tại
 manual-exported = Đã xuất { $entries } mục vào { $path }
-manual-ownership-exported = Bản ghi quyền sở hữu: { $path }
 manual-checked = Hợp lệ { $valid }, chưa điền { $unfilled }, lỗi { $errors }
 manual-applied = Đã áp dụng { $applied }, chưa điền { $unfilled }, lỗi { $errors }
 manual-value = { $code ->

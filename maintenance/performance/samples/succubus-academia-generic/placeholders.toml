@@ -1,3 +1,4 @@
 [[rule]]
 scopes = ["battle_action"]
+order = "preserve"
 pattern = '_(?:HERO|ME|YOU)_'

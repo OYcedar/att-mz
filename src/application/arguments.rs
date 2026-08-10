@@ -7,7 +7,9 @@ use std::fmt;
 use std::path::PathBuf;
 
 use clap::error::{ContextKind, ErrorKind};
-use clap::{Arg, ArgAction, Args, Command, CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{
+    Arg, ArgAction, Args, Command, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum,
+};
 
 use crate::i18n::{
     ResolvedUiLocale, UiLocaleInputSource, UiLocalizer, UiMessage,
@@ -15,7 +17,6 @@ use crate::i18n::{
 };
 use crate::language::LanguageId;
 use crate::project_name::ProjectName;
-use crate::rpg_maker::MaxFullwidthChars;
 
 /// 已完成解析的 ATT 进程参数。
 #[derive(Debug)]
@@ -259,6 +260,18 @@ pub(crate) enum MzCommand {
         #[command(subcommand)]
         command: RpgMakerManualCommand,
     },
+    /// 导出当前文字所有权。
+    #[command(name = "ownership")]
+    Ownership {
+        #[command(subcommand)]
+        command: DataExportCommand,
+    },
+    /// 导出当前翻译状态和正文。
+    #[command(name = "translation")]
+    Translation {
+        #[command(subcommand)]
+        command: DataExportCommand,
+    },
     /// 对项目数据库运行 Lua 脚本。
     #[command(name = "lua")]
     Lua(ProjectLuaArguments),
@@ -325,6 +338,18 @@ pub(crate) enum MvCommand {
         #[command(subcommand)]
         command: RpgMakerManualCommand,
     },
+    /// 导出当前文字所有权。
+    #[command(name = "ownership")]
+    Ownership {
+        #[command(subcommand)]
+        command: DataExportCommand,
+    },
+    /// 导出当前翻译状态和正文。
+    #[command(name = "translation")]
+    Translation {
+        #[command(subcommand)]
+        command: DataExportCommand,
+    },
     /// 对项目数据库运行 Lua 脚本。
     #[command(name = "lua")]
     Lua(ProjectLuaArguments),
@@ -351,6 +376,12 @@ pub(crate) enum GenericCommand {
         #[command(subcommand)]
         command: ManualCommand,
     },
+    /// 导出当前翻译状态和正文。
+    #[command(name = "translation")]
+    Translation {
+        #[command(subcommand)]
+        command: DataExportCommand,
+    },
     /// 对项目数据库运行 Lua 脚本。
     #[command(name = "lua")]
     Lua(ProjectLuaArguments),
@@ -361,7 +392,7 @@ pub(crate) enum GenericCommand {
 pub(crate) enum ManualCommand {
     /// 导出当前需要人工处理的条目。
     #[command(name = "export")]
-    Export(ManualArguments),
+    Export(ManualExportArguments),
     /// 只读检查人工译文文件。
     #[command(name = "check")]
     Check(ManualArguments),
@@ -373,9 +404,9 @@ pub(crate) enum ManualCommand {
 /// RPG Maker 人工补译命令；导出可以同时发布精确所有权 JSONL。
 #[derive(Debug, Subcommand)]
 pub(crate) enum RpgMakerManualCommand {
-    /// 导出当前需要人工处理的条目及其可选所有权清单。
+    /// 导出当前需要人工处理的条目。
     #[command(name = "export")]
-    Export(RpgMakerManualExportArguments),
+    Export(ManualExportArguments),
     /// 只读检查人工译文文件。
     #[command(name = "check")]
     Check(ManualArguments),
@@ -384,13 +415,23 @@ pub(crate) enum RpgMakerManualCommand {
     Apply(ManualArguments),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum ManualSelectionArgument {
+    Pending,
+    Rejected,
+    All,
+}
+
 #[derive(Debug, Args)]
-pub(crate) struct RpgMakerManualExportArguments {
+pub(crate) struct ManualExportArguments {
     #[command(flatten)]
     pub(crate) manual: ManualArguments,
-    /// 与 TOML 成对发布的文字所有权 JSONL。
-    #[arg(long, value_name = "FILE_JSONL", value_parser = parse_non_blank_path)]
-    pub(crate) ownership: Option<PathBuf>,
+    /// 选择待译、已拒绝或全部当前条目；省略时选择待译条目。
+    #[arg(long, value_enum, conflicts_with = "ids")]
+    pub(crate) selection: Option<ManualSelectionArgument>,
+    /// 按严格 JSONL 中列出的自然 Manual ID 导出。
+    #[arg(long, value_name = "IDS_JSONL", value_parser = parse_non_blank_path)]
+    pub(crate) ids: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -400,6 +441,23 @@ pub(crate) struct ManualArguments {
     /// 人工译文 TOML 文件。
     #[arg(value_name = "FILE_TOML", value_parser = parse_non_blank_path)]
     pub(crate) file: PathBuf,
+}
+
+/// 单文件 JSONL 导出命令。
+#[derive(Debug, Subcommand)]
+pub(crate) enum DataExportCommand {
+    /// 从同一项目快照原子导出 JSONL。
+    #[command(name = "export")]
+    Export(DataExportArguments),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct DataExportArguments {
+    #[command(flatten)]
+    pub(crate) project: ProjectArguments,
+    /// JSONL 输出文件。
+    #[arg(value_name = "FILE_JSONL", value_parser = parse_non_blank_path)]
+    pub(crate) jsonl: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -430,15 +488,6 @@ pub(crate) struct InitArguments {
     /// 译文目标语言 ID。
     #[arg(long, value_name = "LANG", value_parser = parse_language_id)]
     pub(crate) target_language: Option<LanguageId>,
-    /// 对话正文每行允许的最大全角字符数。
-    #[arg(long, value_name = "COUNT", value_parser = parse_max_fullwidth_chars)]
-    pub(crate) dialogue_max_fullwidth_chars: Option<MaxFullwidthChars>,
-    /// 滚动文本每行允许的最大全角字符数。
-    #[arg(long, value_name = "COUNT", value_parser = parse_max_fullwidth_chars)]
-    pub(crate) scrolling_text_max_fullwidth_chars: Option<MaxFullwidthChars>,
-    /// 帮助或说明框每行允许的最大全角字符数。
-    #[arg(long, value_name = "COUNT", value_parser = parse_max_fullwidth_chars)]
-    pub(crate) help_description_max_fullwidth_chars: Option<MaxFullwidthChars>,
 }
 
 #[derive(Debug, Args)]
@@ -486,6 +535,9 @@ pub(crate) struct TranslateArguments {
     /// 用该 TOML 文件替换项目当前占位符规则；省略时复用已保存内容。
     #[arg(long, value_name = "PLACEHOLDERS_TOML", value_parser = parse_non_blank_path)]
     pub(crate) placeholders: Option<PathBuf>,
+    /// 除普通待翻译内容外，也重新请求当前仍被硬不变量拒绝的候选。
+    #[arg(long)]
+    pub(crate) retry_rejected: bool,
 }
 
 #[derive(Debug, Args)]
@@ -563,7 +615,7 @@ fn localize_command_tree(
     command_path: &str,
 ) -> Command {
     let command_name = command.get_name().to_owned();
-    let about = localizer.format(command_about(&command_name));
+    let about = localizer.format(command_about(command_path, &command_name));
     let help_template = localized_help_template(&command, localizer);
     let usage = localized_usage_syntax(command_path, &command_name, localizer);
 
@@ -576,16 +628,13 @@ fn localize_command_tree(
         .disable_help_subcommand(true)
         .disable_version_flag(true);
 
-    const ARGUMENT_IDENTIFIERS: [&str; 18] = [
+    const ARGUMENT_IDENTIFIERS: [&str; 15] = [
         "ui_language",
         "progress",
         "name",
         "path",
         "source_language",
         "target_language",
-        "dialogue_max_fullwidth_chars",
-        "scrolling_text_max_fullwidth_chars",
-        "help_description_max_fullwidth_chars",
         "builtin",
         "rules",
         "dialogue_rules",
@@ -648,11 +697,16 @@ fn localized_usage_syntax(
     let options = localizer.format(UiMessage::CliOptionsMetavar);
     let nested_command = localizer.format(UiMessage::CliCommandMetavar);
     let syntax = match command_name {
-        "att" | "mz" | "mv" | "generic" | "manual" => {
+        "att" | "mz" | "mv" | "generic" | "manual" | "ownership" | "translation" => {
             format!("{command_path} [{options}] <{nested_command}>")
         }
         "translate" => format!("{command_path} --name <NAME> [PROFILE_ID] [{options}]"),
         "lua" => format!("{command_path} --name <NAME> [{options}] <SCRIPT_LUA> [-- <ARG>...]"),
+        "export"
+            if command_path.contains(" ownership ") || command_path.contains(" translation ") =>
+        {
+            format!("{command_path} --name <NAME> <FILE_JSONL> [{options}]")
+        }
         "export" | "check" | "apply" => {
             format!("{command_path} --name <NAME> <FILE_TOML> [{options}]")
         }
@@ -687,7 +741,7 @@ fn localized_help_template(command: &Command, localizer: &UiLocalizer) -> String
     template
 }
 
-fn command_about(name: &str) -> UiMessage<'static> {
+fn command_about(command_path: &str, name: &str) -> UiMessage<'static> {
     match name {
         "att" => UiMessage::AppAbout,
         "mz" => UiMessage::CliMzAbout,
@@ -698,6 +752,10 @@ fn command_about(name: &str) -> UiMessage<'static> {
         "translate" => UiMessage::CliTranslateAbout,
         "write-back" => UiMessage::CliWriteBackAbout,
         "manual" => UiMessage::CliManualAbout,
+        "ownership" => UiMessage::CliOwnershipExportAbout,
+        "translation" => UiMessage::CliTranslationExportAbout,
+        "export" if command_path.contains(" ownership ") => UiMessage::CliOwnershipExportAbout,
+        "export" if command_path.contains(" translation ") => UiMessage::CliTranslationExportAbout,
         "export" => UiMessage::CliManualExportAbout,
         "check" => UiMessage::CliManualCheckAbout,
         "apply" => UiMessage::CliManualApplyAbout,
@@ -713,9 +771,6 @@ fn argument_help(identifier: &str) -> Option<UiMessage<'static>> {
         "path" => Some(UiMessage::CliInitPathHelp),
         "source_language" => Some(UiMessage::CliSourceLanguageHelp),
         "target_language" => Some(UiMessage::CliTargetLanguageHelp),
-        "dialogue_max_fullwidth_chars" => Some(UiMessage::CliDialogueWidthHelp),
-        "scrolling_text_max_fullwidth_chars" => Some(UiMessage::CliScrollingWidthHelp),
-        "help_description_max_fullwidth_chars" => Some(UiMessage::CliHelpWidthHelp),
         "builtin" => Some(UiMessage::CliBuiltinHelp),
         "rules" => Some(UiMessage::CliRulesHelp),
         "dialogue_rules" => Some(UiMessage::CliDialogueRulesHelp),
@@ -725,6 +780,7 @@ fn argument_help(identifier: &str) -> Option<UiMessage<'static>> {
         "script" => Some(UiMessage::CliProjectLuaScriptHelp),
         "arguments" => Some(UiMessage::CliProjectLuaArgumentsHelp),
         "file" => Some(UiMessage::CliManualFileHelp),
+        "jsonl" => Some(UiMessage::CliManualFileHelp),
         _ => None,
     }
 }
@@ -829,13 +885,6 @@ fn parse_non_blank_path(value: &str) -> Result<PathBuf, String> {
 
 fn parse_language_id(value: &str) -> Result<LanguageId, String> {
     LanguageId::parse(value).map_err(|error| error.to_string())
-}
-
-fn parse_max_fullwidth_chars(value: &str) -> Result<MaxFullwidthChars, String> {
-    let value = value
-        .parse::<u32>()
-        .map_err(|_| "每行最大全角字符数必须是正整数".to_owned())?;
-    MaxFullwidthChars::new(value).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -1094,16 +1143,13 @@ mod tests {
     fn init_accepts_only_project_and_game_path() {
         let parsed =
             AttArguments::try_parse_from(["att", "mz", "init", "--name", "demo", "--path", "game"])
-                .expect("后续 Init 应允许复用已经保存的语言和布局");
+                .expect("后续 Init 应允许复用已经保存的语言");
         let MzCommand::Init(arguments) = expect_mz(parsed.product) else {
             panic!("应解析为 Init 命令");
         };
         assert_eq!(arguments.path.as_deref(), Some(Path::new("game")));
         assert!(arguments.source_language.is_none());
         assert!(arguments.target_language.is_none());
-        assert!(arguments.dialogue_max_fullwidth_chars.is_none());
-        assert!(arguments.scrolling_text_max_fullwidth_chars.is_none());
-        assert!(arguments.help_description_max_fullwidth_chars.is_none());
     }
 
     #[test]
@@ -1199,6 +1245,38 @@ mod tests {
                     init_error.output()
                 );
             }
+
+            let ownership_export = AttArguments::try_parse_localized_from([
+                "att",
+                "mv",
+                "ownership",
+                "export",
+                "--ui-language",
+                locale.as_str(),
+                "--help",
+            ])
+            .expect_err("所有权导出 Help 应作为正常提前退出返回");
+            assert!(
+                ownership_export
+                    .output()
+                    .contains(&localizer.format(UiMessage::CliOwnershipExportAbout))
+            );
+
+            let translation_export = AttArguments::try_parse_localized_from([
+                "att",
+                "generic",
+                "translation",
+                "export",
+                "--ui-language",
+                locale.as_str(),
+                "--help",
+            ])
+            .expect_err("译文导出 Help 应作为正常提前退出返回");
+            assert!(
+                translation_export
+                    .output()
+                    .contains(&localizer.format(UiMessage::CliTranslationExportAbout))
+            );
         }
 
         let chinese =
@@ -1320,7 +1398,7 @@ mod tests {
     }
 
     #[test]
-    fn init_parses_each_explicit_override_independently() {
+    fn init_parses_each_explicit_language_override_independently() {
         let parsed = AttArguments::try_parse_from([
             "att",
             "mz",
@@ -1331,8 +1409,6 @@ mod tests {
             "game",
             "--source-language",
             "JA",
-            "--dialogue-max-fullwidth-chars",
-            "24",
         ])
         .expect("Init 覆盖值应可以逐项提供");
         let MzCommand::Init(arguments) = expect_mz(parsed.product) else {
@@ -1342,15 +1418,7 @@ mod tests {
             arguments.source_language.as_ref().map(LanguageId::as_str),
             Some("ja")
         );
-        assert_eq!(
-            arguments
-                .dialogue_max_fullwidth_chars
-                .map(MaxFullwidthChars::get),
-            Some(24)
-        );
         assert!(arguments.target_language.is_none());
-        assert!(arguments.scrolling_text_max_fullwidth_chars.is_none());
-        assert!(arguments.help_description_max_fullwidth_chars.is_none());
     }
 
     #[test]

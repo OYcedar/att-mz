@@ -32,6 +32,8 @@ use crate::rpg_maker::text::{RpgMakerSource, StandardDataFile, TextGroupKind};
 use crate::runtime::cpu::CpuExecutorUnavailable;
 use crate::runtime::filesystem::SystemFileSystemError;
 use crate::storage::file_system::ReadFileError;
+use crate::translation::TranslationOrigin;
+use crate::translation::candidate_validation::ProvenInvariantViolation;
 use crate::translation::placeholder_projection::LanguageTextProjectionError;
 use crate::translation::task_planning::{
     AssignedTaskBlock, StableGroupCharacters, TaskId, TaskPlanningError, TaskPlanningGroupLayout,
@@ -166,6 +168,7 @@ struct ResolvedCorpusSemantics {
     system_markdown: String,
     task_language_pair: LanguagePair,
     placeholder_rule_source: super::pipeline::TranslationPlaceholderRuleSource,
+    retry_rejected: bool,
 }
 
 impl<R, C, L> RpgMakerTranslationTaskPlanningService<R, C, L>
@@ -196,6 +199,7 @@ where
             );
         }
         let source_language = self.translation_resources.source_language();
+        let valid_placeholder_ids = corpus.natural_unit_ids();
         let (scopes, snapshot_baseline) = corpus.into_parts();
         let context_resources = Arc::clone(&self.translation_resources);
         let context_cancellation = self.cancellation.clone();
@@ -269,7 +273,7 @@ where
                 );
             }
         };
-        let (terminology_path, placeholder_rules_path) = input.into_parts();
+        let (terminology_path, placeholder_rules_path, retry_rejected) = input.into_parts();
         let placeholder_rule_source = placeholder_rules_path.as_ref().map_or(
             super::pipeline::TranslationPlaceholderRuleSource::ProjectSnapshot,
             |path| super::pipeline::TranslationPlaceholderRuleSource::ExternalFile(path.clone()),
@@ -292,10 +296,11 @@ where
         let custom_placeholders = self
             .cpu
             .execute(move || {
-                placeholder_service
-                    .compile_custom_with_cancellation(placeholder_definitions, || {
-                        ensure_planner_cpu_running(&placeholder_cancellation)
-                    })
+                placeholder_service.compile_custom_for_ids_with_cancellation(
+                    placeholder_definitions,
+                    &valid_placeholder_ids,
+                    || ensure_planner_cpu_running(&placeholder_cancellation),
+                )
             })
             .await
             .map_err(RpgMakerTranslationTaskPlanningError::CompilePlaceholdersCompute)?;
@@ -334,6 +339,7 @@ where
             system_markdown,
             task_language_pair,
             placeholder_rule_source,
+            retry_rejected,
         })
     }
 }
@@ -370,6 +376,7 @@ where
             system_markdown,
             task_language_pair,
             placeholder_rule_source,
+            retry_rejected,
         } = self
             .resolve_corpus_semantics(project, profile, corpus, input)
             .await?;
@@ -434,7 +441,12 @@ where
                 let scope_name = scope.key.clone();
                 (
                     scope_name,
-                    preprocess_scope(scope, Arc::clone(&scope_semantics), &scope_cancellation),
+                    preprocess_scope(
+                        scope,
+                        Arc::clone(&scope_semantics),
+                        retry_rejected,
+                        &scope_cancellation,
+                    ),
                 )
             })
             .await
@@ -491,6 +503,12 @@ where
                             .flat_map(|group| &group.units)
                             .filter(|unit| unit.invalidated && !unit.not_applicable)
                             .count();
+                        let rejected = scopes
+                            .iter()
+                            .flat_map(|scope| &scope.groups)
+                            .flat_map(|group| &group.units)
+                            .filter(|unit| unit.skipped_rejected)
+                            .count();
 
                         Ok::<_, GlobalPreparationFailure>((
                             scopes,
@@ -500,6 +518,7 @@ where
                                 retained,
                                 invalidated,
                                 not_applicable,
+                                rejected,
                             ),
                             complete_plan,
                         ))
@@ -622,6 +641,7 @@ where
             .map_err(RpgMakerTranslationTaskPlanningError::PlanScopesCompute)?;
 
         let finalization_cancellation = self.cancellation.clone();
+        let finalization_semantics = Arc::clone(&semantics);
         let tasks = self
             .cpu
             .execute(move || {
@@ -633,7 +653,11 @@ where
                         .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
                     let task = materialized?;
                     let index = RpgMakerTranslationTaskIndex::new(tasks.len());
-                    tasks.push(task.with_index(index, task_language_pair.clone()));
+                    tasks.push(task.with_index(
+                        index,
+                        task_language_pair.clone(),
+                        Arc::clone(&finalization_semantics),
+                    ));
                 }
                 ensure_planner_cpu_running(&finalization_cancellation)
                     .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
@@ -694,6 +718,7 @@ pub(super) struct PreparedAsset {
     translation: Option<TextUnitContent>,
     translation_state: Option<Sha256Fingerprint>,
     manual: bool,
+    rejected: Option<super::pipeline::RpgMakerStoredRejectedTranslation>,
 }
 
 #[cfg(test)]
@@ -745,14 +770,21 @@ fn prepare_corpus_with_cancellation(
             for asset in source_assets {
                 ensure_planner_cpu_running(cancellation)
                     .map_err(|()| PrepareCorpusFailure::Cancelled)?;
-                let (identity, semantic_order_key, translation, translation_state, manual) =
-                    asset.into_parts();
+                let (
+                    identity,
+                    semantic_order_key,
+                    translation,
+                    translation_state,
+                    manual,
+                    rejected,
+                ) = asset.into_parts();
                 assets.push(PreparedAsset {
                     identity,
                     semantic_order_key,
                     translation,
                     translation_state,
                     manual,
+                    rejected,
                 });
             }
             groups.push(PreparedGroup {
@@ -876,13 +908,16 @@ struct PreprocessedUnit {
     identity: TranslationUnitIdentity,
     protected_text: String,
     placeholders: Vec<super::pipeline::AppliedPlaceholder>,
+    candidate_contract: Sha256Fingerprint,
     language_analysis: LanguageAnalysis,
     translation: Option<TextUnitContent>,
     translation_state: Option<Sha256Fingerprint>,
     invalidated: bool,
+    invalidation_violation: Option<(ProvenInvariantViolation, TranslationOrigin)>,
     state_context: TranslationStateContext,
     current: bool,
     not_applicable: bool,
+    skipped_rejected: bool,
     responsibility: PreparedUnitResponsibility,
 }
 
@@ -900,6 +935,7 @@ enum PreparedUnitResponsibility {
 fn preprocess_scope(
     scope: PreparedScope,
     semantics: Arc<ResolvedTranslationSemantics>,
+    retry_rejected: bool,
     cancellation: &CooperativeCancellation,
 ) -> Result<PreprocessedScopeResult, ScopePreprocessingFailure> {
     ensure_planner_cpu_running(cancellation).map_err(|()| ScopePreprocessingFailure::Cancelled)?;
@@ -912,8 +948,8 @@ fn preprocess_scope(
         for asset in group.assets {
             ensure_planner_cpu_running(cancellation)
                 .map_err(|()| ScopePreprocessingFailure::Cancelled)?;
-            let prepared = match semantics.prepare_content_with_cancellation(
-                group.kind,
+            let prepared = match semantics.prepare_identity_content_with_cancellation(
+                &asset.identity,
                 asset.identity.source_content(),
                 || ensure_planner_cpu_running(cancellation),
             ) {
@@ -953,6 +989,7 @@ fn preprocess_scope(
         for (asset, prepared) in prepared_assets {
             let protected_text = prepared.model_text().to_owned();
             let placeholders = prepared.placeholders().to_vec();
+            let candidate_contract = semantics.candidate_contract_fingerprint(&asset.identity);
             let language_analysis = prepared.language_analysis().clone();
             let state_context = translation_state_context_with_cancellation(
                 semantics.global_fingerprint(),
@@ -966,36 +1003,87 @@ fn preprocess_scope(
             .map_err(|()| ScopePreprocessingFailure::Cancelled)?
             .map_err(ScopePreprocessingFailure::Invalid)?;
             let not_applicable = prepared.status() != PreparedTranslationStatus::Active;
-            let current = asset.translation.as_ref().is_some_and(|translation| {
-                asset.manual
-                    || (!not_applicable
-                        && asset.translation_state == Some(state_context.finish(translation)))
-            });
-            let invalidated = asset.translation.is_some() && !current;
-            let responsibility = match prepared.status() {
-                PreparedTranslationStatus::Active => {
-                    PreparedUnitResponsibility::AwaitingDeduplication
-                }
-                PreparedTranslationStatus::NonSourceLanguage => {
-                    PreparedUnitResponsibility::Virtual {
-                        reason: TranslationVirtualReason::NonSourceLanguage,
+            let candidate_contract_valid = match asset.translation.as_ref() {
+                Some(translation) => {
+                    match semantics.candidate_placeholders_match_with_cancellation(
+                        &asset.identity,
+                        translation,
+                        || ensure_planner_cpu_running(cancellation),
+                    ) {
+                        Ok(Ok(valid)) => valid,
+                        Ok(Err(source)) => {
+                            return Err(ScopePreprocessingFailure::UnitPreparation(
+                                TranslationPlanningFailure::new(
+                                    asset.identity,
+                                    planning_failure_reason(source),
+                                ),
+                            ));
+                        }
+                        Err(()) => return Err(ScopePreprocessingFailure::Cancelled),
                     }
                 }
-                PreparedTranslationStatus::FullyProtected => PreparedUnitResponsibility::Virtual {
-                    reason: TranslationVirtualReason::FullyProtected,
-                },
+                None => true,
+            };
+            let current_rejected = asset.translation.is_none()
+                && asset.rejected.as_ref().is_some_and(|rejected| {
+                    rejected.source_content() == asset.identity.source_content()
+                        && rejected.source_context_json() == asset.identity.source_context_json()
+                        && rejected.planning_state()
+                            == state_context.finish(asset.identity.source_content())
+                });
+            let skipped_rejected = current_rejected && !retry_rejected;
+            let current = asset.translation.as_ref().is_some_and(|translation| {
+                candidate_contract_valid
+                    && (asset.manual
+                        || (!not_applicable
+                            && asset.translation_state == Some(state_context.finish(translation))))
+            });
+            let invalidated = asset.translation.is_some() && !current;
+            let invalidation_violation = (asset.translation.is_some() && !candidate_contract_valid)
+                .then_some((
+                    ProvenInvariantViolation::PlaceholderMismatch,
+                    if asset.manual {
+                        TranslationOrigin::Manual
+                    } else {
+                        TranslationOrigin::Automatic
+                    },
+                ));
+            let skip_new_rejected = invalidation_violation.is_some() && !retry_rejected;
+            let responsibility = if skipped_rejected || skip_new_rejected {
+                PreparedUnitResponsibility::Virtual {
+                    reason: TranslationVirtualReason::RejectedCandidate,
+                }
+            } else {
+                match prepared.status() {
+                    PreparedTranslationStatus::Active => {
+                        PreparedUnitResponsibility::AwaitingDeduplication
+                    }
+                    PreparedTranslationStatus::NonSourceLanguage => {
+                        PreparedUnitResponsibility::Virtual {
+                            reason: TranslationVirtualReason::NonSourceLanguage,
+                        }
+                    }
+                    PreparedTranslationStatus::FullyProtected => {
+                        PreparedUnitResponsibility::Virtual {
+                            reason: TranslationVirtualReason::FullyProtected,
+                        }
+                    }
+                }
             };
             units.push(PreprocessedUnit {
                 identity: asset.identity,
                 protected_text,
                 placeholders,
+                candidate_contract,
                 language_analysis,
                 translation: asset.translation,
                 translation_state: asset.translation_state,
                 invalidated,
+                invalidation_violation,
                 state_context,
                 current,
                 not_applicable,
+                skipped_rejected: skipped_rejected || skip_new_rejected,
                 responsibility,
             });
         }
@@ -1312,6 +1400,7 @@ pub(crate) fn translation_state_context(
             translation: None,
             translation_state: None,
             manual: false,
+            rejected: None,
         }],
     };
     let group_context = match group_context_fingerprint_with_cancellation(
@@ -1484,25 +1573,28 @@ fn collect_deduplication_inputs(
                     unit.responsibility,
                     PreparedUnitResponsibility::AwaitingDeduplication
                 ) {
+                    if unit.invalidation_violation.is_some() {
+                        invalidations.push(unit_invalidation(unit));
+                    }
                     candidates.push(TranslationDeduplicationCandidate::new(
                         unit.identity.clone(),
                         unit.protected_text.clone(),
                         unit.placeholders.clone(),
-                        unit.translation.clone(),
-                        unit.translation_state,
+                        unit.candidate_contract,
+                        unit.invalidation_violation
+                            .is_none()
+                            .then(|| unit.translation.clone())
+                            .flatten(),
+                        unit.invalidation_violation
+                            .is_none()
+                            .then_some(unit.translation_state)
+                            .flatten(),
                         unit.state_context,
-                        unit.invalidated,
+                        unit.invalidated && unit.invalidation_violation.is_none(),
                     ));
                     positions.push((scope_index, group_index, unit_index));
                 } else if unit.invalidated {
-                    invalidations.push(TranslationInvalidation::new(
-                        unit.identity.clone(),
-                        unit.translation
-                            .clone()
-                            .expect("只有已有译文的单元才可能语义失效"),
-                        unit.translation_state
-                            .expect("已有译文必须同时具有 translation_state"),
-                    ));
+                    invalidations.push(unit_invalidation(unit));
                 }
                 global_unit_index += 1;
             }
@@ -1514,6 +1606,27 @@ fn collect_deduplication_inputs(
         "共享 Planner 的完整 Unit 数必须与预处理语料一致"
     );
     (candidates, positions, invalidations)
+}
+
+fn unit_invalidation(unit: &PreprocessedUnit) -> TranslationInvalidation {
+    let translation = unit
+        .translation
+        .clone()
+        .expect("只有已有译文的单元才可能语义失效");
+    let translation_state = unit
+        .translation_state
+        .expect("已有译文必须同时具有 translation_state");
+    match unit.invalidation_violation.clone() {
+        Some((violation, origin)) => TranslationInvalidation::rejected(
+            unit.identity.clone(),
+            translation,
+            translation_state,
+            violation,
+            unit.state_context.finish(unit.identity.source_content()),
+            origin,
+        ),
+        None => TranslationInvalidation::new(unit.identity.clone(), translation, translation_state),
+    }
 }
 
 fn apply_deduplication_outcomes(
@@ -1731,7 +1844,7 @@ fn context_model_text_with_cancellation(
         return Ok(unit.protected_text.clone());
     };
     let projected = semantics
-        .prepare_content_with_cancellation(unit.identity.kind(), target, || {
+        .prepare_identity_content_with_cancellation(&unit.identity, target, || {
             ensure_planner_cpu_running(cancellation)
         })
         .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
@@ -1989,8 +2102,15 @@ impl UnindexedTask {
         self,
         index: RpgMakerTranslationTaskIndex,
         language_pair: LanguagePair,
+        semantics: Arc<ResolvedTranslationSemantics>,
     ) -> RpgMakerExecutableTask {
-        RpgMakerExecutableTask::new(index, language_pair, self.messages, self.expected_outputs)
+        RpgMakerExecutableTask::new_with_semantics(
+            index,
+            language_pair,
+            self.messages,
+            self.expected_outputs,
+            semantics,
+        )
     }
 }
 
@@ -2834,6 +2954,7 @@ mod tests {
                         translation_state: with_translation
                             .then(|| Sha256Fingerprint::from_bytes([1; 32])),
                         manual: false,
+                        rejected: None,
                     },
                     PreparedAsset {
                         identity: identity(2, second_source, second_context),
@@ -2843,6 +2964,7 @@ mod tests {
                         translation_state: with_translation
                             .then(|| Sha256Fingerprint::from_bytes([2; 32])),
                         manual: false,
+                        rejected: None,
                     },
                 ],
             }
@@ -3056,7 +3178,6 @@ mod tests {
             PathBuf::from("C:/Projects/测试游戏/project.db"),
             source_language.to_owned(),
             target_language.to_owned(),
-            crate::rpg_maker::project::test_layout_profile(),
         )
     }
 
@@ -3139,7 +3260,7 @@ mod tests {
             .compile_custom(placeholder_definitions)
             .expect("测试自定义占位符应可编译");
         let (protected_text, bindings) = placeholders
-            .protect(RpgMakerEngine::Mz, identity.kind(), original, &custom)
+            .protect(RpgMakerEngine::Mz, identity, original, &custom)
             .expect("测试原文应可保护")
             .into_parts();
         let source_language = translation_resources().source_language();
@@ -3177,6 +3298,7 @@ mod tests {
                     translation: None,
                     translation_state: None,
                     manual: false,
+                    rejected: None,
                 })
                 .collect(),
         };
@@ -3227,12 +3349,14 @@ mod tests {
                         translation: Some(TextUnitContent::Value("人工译文".to_owned())),
                         translation_state: Some(Sha256Fingerprint::from_bytes([0x72; 32])),
                         manual: true,
+                        rejected: None,
                     }],
                 }],
             };
 
-            let result = preprocess_scope(scope, semantics, &CooperativeCancellation::default())
-                .expect("人工 Current 应可预处理");
+            let result =
+                preprocess_scope(scope, semantics, false, &CooperativeCancellation::default())
+                    .expect("人工 Current 应可预处理");
             let unit = &result.scope.groups[0].units[0];
             assert!(unit.current);
             assert!(!unit.invalidated);
@@ -3289,6 +3413,7 @@ mod tests {
                         translation: Some(TextUnitContent::Value("老师".to_owned())),
                         translation_state: Some(speaker_state),
                         manual: true,
+                        rejected: None,
                     },
                     PreparedAsset {
                         identity: body(body_source),
@@ -3298,6 +3423,7 @@ mod tests {
                         translation_state: body_translation
                             .map(|_| Sha256Fingerprint::from_bytes([0x91; 32])),
                         manual: false,
+                        rejected: None,
                     },
                 ],
             }],
@@ -3306,6 +3432,7 @@ mod tests {
         let translation_only = preprocess_scope(
             scope("こんにちは", Some("你好")),
             Arc::clone(&semantics),
+            false,
             &CooperativeCancellation::default(),
         )
         .expect("兄弟译文变化应可预处理");
@@ -3317,6 +3444,7 @@ mod tests {
         let source_changed = preprocess_scope(
             scope("こんばんは", None),
             semantics,
+            false,
             &CooperativeCancellation::default(),
         )
         .expect("兄弟原文变化应可预处理");
@@ -3406,6 +3534,7 @@ mod tests {
                         translation: Some(speaker_translation.clone()),
                         translation_state: Some(speaker_state),
                         manual: false,
+                        rejected: None,
                     },
                     PreparedAsset {
                         identity: body(body_source),
@@ -3415,6 +3544,7 @@ mod tests {
                         translation_state: body_translation
                             .map(|_| Sha256Fingerprint::from_bytes([0x91; 32])),
                         manual: false,
+                        rejected: None,
                     },
                 ],
             }],
@@ -3423,6 +3553,7 @@ mod tests {
             preprocess_scope(
                 scope,
                 Arc::clone(&semantics),
+                false,
                 &CooperativeCancellation::default(),
             )
             .expect("测试 Scope 应可预处理")
@@ -3667,7 +3798,7 @@ mod tests {
             RpgMakerSource::data(StandardDataFile::Items),
             1,
             r"\C[2]魔法剣",
-            Some("魔法剑"),
+            Some(r"\C[2]魔法剑"),
             vec![old_dependency.clone()],
         )]);
 
@@ -3685,7 +3816,7 @@ mod tests {
         assert_eq!(preparation.invalidations().len(), 1);
         assert_eq!(
             preparation.invalidations()[0].expected_translation(),
-            &TextUnitContent::Value("魔法剑".to_owned())
+            &TextUnitContent::Value(r"\C[2]魔法剑".to_owned())
         );
         assert_eq!(preparation.invalidated(), 1);
         assert_eq!(tasks.len(), 1);
@@ -3894,6 +4025,7 @@ mod tests {
                     br#"
 [[rule]]
 scopes = ["database_entry"]
+order = "preserve"
 pattern = '\A<Help:(?<text>.*?)>\z'
 "#
                     .to_vec(),
@@ -4145,12 +4277,7 @@ pattern = '\A<Help:(?<text>.*?)>\z'
             ],
         );
         let (protected_speaker, bindings) = placeholders
-            .protect(
-                RpgMakerEngine::Mz,
-                TextGroupKind::EventDialogue,
-                "アリス",
-                &custom,
-            )
+            .protect(RpgMakerEngine::Mz, &speaker, "アリス", &custom)
             .expect("说话人应可保护")
             .into_parts();
         let global = global_translation_semantics(
@@ -4239,6 +4366,7 @@ translation = "魔王（Demon King）"
                         r#"
 [[rule]]
 scopes = ["database_entry"]
+order = "preserve"
 pattern = '\{[^}]+\}'
 "#
                         .as_bytes()
@@ -4412,21 +4540,11 @@ translation = "Hero"
         let first_translation = TextUnitContent::Value("勇者译文".to_owned());
         let second_translation = TextUnitContent::Value("魔王译文".to_owned());
         let first_prepared = placeholders
-            .protect(
-                RpgMakerEngine::Mz,
-                TextGroupKind::DatabaseEntry,
-                "勇者です",
-                &custom,
-            )
+            .protect(RpgMakerEngine::Mz, &first_identity, "勇者です", &custom)
             .expect("第一项原文应可保护");
         let (first_protected, first_bindings) = first_prepared.into_parts();
         let second_prepared = placeholders
-            .protect(
-                RpgMakerEngine::Mz,
-                TextGroupKind::DatabaseEntry,
-                "魔王です",
-                &custom,
-            )
+            .protect(RpgMakerEngine::Mz, &second_identity, "魔王です", &custom)
             .expect("第二项原文应可保护");
         let (second_protected, second_bindings) = second_prepared.into_parts();
         let first_state = translation_state_context_for_group(
@@ -4495,10 +4613,12 @@ translation = "Hero"
         let placeholder_toml = r#"
 [[rule]]
 scopes = ["database_entry"]
+order = "preserve"
 pattern = '\{[^}]+\}'
 
 [[rule]]
 scopes = ["database_entry"]
+order = "preserve"
 pattern = '保護対象'
 "#;
         let definitions = vec![
@@ -4732,6 +4852,7 @@ pattern = '保護対象'
                     r#"
                         [[rule]]
                         scopes = ["database_entry"]
+                        order = "preserve"
                         pattern = '保護対象'
                     "#
                     .as_bytes()
@@ -4818,6 +4939,7 @@ pattern = '保護対象'
                         placeholder_path.clone(),
                         r#"
                             [[rule]]
+                            order = "preserve"
                             pattern = '<code:[^>]+>'
                         "#
                         .as_bytes()
@@ -5078,9 +5200,11 @@ pattern = '保護対象'
                     placeholder_path.clone(),
                     r#"
                         [[rule]]
+                        order = "preserve"
                         pattern = 'DOES_NOT_MATCH'
 
                         [[rule]]
+                        order = "preserve"
                         pattern = '<TOKEN>'
                     "#
                     .as_bytes()
@@ -5242,6 +5366,7 @@ pattern = '保護対象'
                     placeholder_path.clone(),
                     r#"
                         [[rule]]
+                        order = "preserve"
                         pattern = '(?:(?<text>保留)|欠落)'
                     "#
                     .as_bytes()
@@ -5319,6 +5444,7 @@ pattern = '保護対象'
                     placeholder_path.clone(),
                     r#"
                         [[rule]]
+                        order = "preserve"
                         pattern = '(?=欠落)'
                     "#
                     .as_bytes()
@@ -5371,9 +5497,11 @@ pattern = '保護対象'
                     placeholder_path.clone(),
                     br#"
                         [[rule]]
+                        order = "preserve"
                         pattern = '<BAD>'
 
                         [[rule]]
+                        order = "preserve"
                         pattern = 'BAD'
                     "#
                     .to_vec(),
@@ -5446,6 +5574,7 @@ pattern = '保護対象'
                     br#"
                         [[rule]]
                         scopes = ["event_choices"]
+                        order = "preserve"
                         pattern = '(?s)<opaque>.*?</opaque>'
                     "#
                     .to_vec(),
@@ -5514,9 +5643,11 @@ pattern = '保護対象'
                     placeholder_path.clone(),
                     br#"
                         [[rule]]
+                        order = "preserve"
                         pattern = '<BAD>'
 
                         [[rule]]
+                        order = "preserve"
                         pattern = 'BAD'
                     "#
                     .to_vec(),

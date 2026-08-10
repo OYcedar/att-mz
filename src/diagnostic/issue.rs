@@ -894,6 +894,18 @@ pub(crate) enum PlaceholderCompilationProblem {
     DuplicateScope {
         rule_number: usize,
     },
+    EmptyIds {
+        rule_number: usize,
+    },
+    InvalidId {
+        rule_number: usize,
+    },
+    UnknownId {
+        rule_number: usize,
+    },
+    DuplicateId {
+        rule_number: usize,
+    },
     EmptyPattern {
         rule_number: usize,
     },
@@ -905,6 +917,9 @@ pub(crate) enum PlaceholderCompilationProblem {
         rule_number: usize,
         actual_count: usize,
     },
+    ReorderedWrapper {
+        rule_number: usize,
+    },
 }
 
 impl PlaceholderCompilationProblem {
@@ -914,10 +929,17 @@ impl PlaceholderCompilationProblem {
             Self::EmptyScopes { .. } => "translation.placeholder.compilation.empty_scopes",
             Self::UnknownScope { .. } => "translation.placeholder.compilation.unknown_scope",
             Self::DuplicateScope { .. } => "translation.placeholder.compilation.duplicate_scope",
+            Self::EmptyIds { .. } => "translation.placeholder.compilation.empty_ids",
+            Self::InvalidId { .. } => "translation.placeholder.compilation.invalid_id",
+            Self::UnknownId { .. } => "translation.placeholder.compilation.unknown_id",
+            Self::DuplicateId { .. } => "translation.placeholder.compilation.duplicate_id",
             Self::EmptyPattern { .. } => "translation.placeholder.compilation.empty_pattern",
             Self::InvalidPattern { .. } => "translation.placeholder.compilation.invalid_pattern",
             Self::InvalidNamedCaptures { .. } => {
                 "translation.placeholder.compilation.invalid_named_captures"
+            }
+            Self::ReorderedWrapper { .. } => {
+                "translation.placeholder.compilation.reordered_wrapper"
             }
         }
     }
@@ -932,7 +954,12 @@ impl PlaceholderCompilationProblem {
             Self::EmptyScopes { rule_number }
             | Self::UnknownScope { rule_number }
             | Self::DuplicateScope { rule_number }
-            | Self::EmptyPattern { rule_number } => {
+            | Self::EmptyIds { rule_number }
+            | Self::InvalidId { rule_number }
+            | Self::UnknownId { rule_number }
+            | Self::DuplicateId { rule_number }
+            | Self::EmptyPattern { rule_number }
+            | Self::ReorderedWrapper { rule_number } => {
                 vec![("rule_number", rule_number.to_string())]
             }
             Self::InvalidPattern { rule_number, pcre2 } => vec![

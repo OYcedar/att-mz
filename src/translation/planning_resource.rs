@@ -1902,6 +1902,7 @@ mod tests {
                 br#"
                     [[rule]]
                     scopes = ["event_dialogue"]
+                    order = "preserve"
                     pattern = '\\SE\[[^]]+\]'
                 "#
                 .to_vec()
@@ -2481,7 +2482,10 @@ mod tests {
             "[[rule]]\npattern = 'x'\nextra = true",
             "[[rule]]\npattern = 'x'\npattern = 'y'",
         ] {
-            assert!(parse_placeholder_toml(invalid.as_bytes()).is_err());
+            assert!(
+                parse_placeholder_toml(invalid.as_bytes()).is_err(),
+                "{invalid:?}"
+            );
         }
     }
 
@@ -2544,7 +2548,7 @@ mod tests {
         );
         assert_eq!(
             resources.placeholder_rules_json,
-            r#"[{"scopes":["event_dialogue"],"pattern":"\\\\SE\\[[^]]+\\]"}]"#
+            r#"[{"scopes":["event_dialogue"],"order":"preserve","pattern":"\\\\SE\\[[^]]+\\]"}]"#
         );
     }
 

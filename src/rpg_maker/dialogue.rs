@@ -6,6 +6,8 @@ use std::fmt;
 use pcre2::bytes::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 
+use crate::translation::candidate_validation::is_structural_blank;
+
 use crate::diagnostic::{
     Diagnostic, DiagnosticReport, Pcre2Failure, Pcre2FailureKind, RpgMakerDiagnosticLocation,
     RpgMakerDiagnosticLocationStep, RpgMakerDiagnosticSource, RpgMakerDialogueDefinitionOrigin,
@@ -34,7 +36,7 @@ impl MvDialogueDefinition {
     }
 
     pub(crate) fn parse_toml(source: &str) -> Result<Self, MvDialogueDefinitionError> {
-        if source.trim().is_empty() {
+        if is_structural_blank(source) {
             return Err(MvDialogueDefinitionError::EmptyDocument);
         }
         if let Err(error) = toml::from_str::<toml::Value>(source) {
@@ -187,7 +189,7 @@ impl MvDialogueProjector {
             }
 
             let mut prefix_parts = projection.prefix_parts;
-            let body = if projection.body.trim().is_empty() && !prefix_parts.is_empty() {
+            let body = if is_structural_blank(&projection.body) && !prefix_parts.is_empty() {
                 push_literal(&mut prefix_parts, &projection.body);
                 None
             } else {
@@ -210,7 +212,7 @@ impl MvDialogueProjector {
         let has_body = pending_lines.iter().any(|line| {
             line.body
                 .as_deref()
-                .is_some_and(|body| !body.trim().is_empty())
+                .is_some_and(|body| !is_structural_blank(body))
         });
         let mut body_lines = Vec::new();
         let mut body_projection_location = None;
@@ -295,7 +297,7 @@ impl MvDialogueProjector {
         let non_blank_speakers = matches
             .iter()
             .map(|matched| matched.speaker.as_str())
-            .filter(|speaker| !speaker.trim().is_empty())
+            .filter(|speaker| !is_structural_blank(speaker))
             .collect::<Vec<_>>();
         let speaker = non_blank_speakers.first().map(|value| (*value).to_owned());
         if non_blank_speakers
@@ -314,7 +316,7 @@ impl MvDialogueProjector {
                 &mut parts,
                 &line.expected_raw[cursor..matched.speaker_start],
             );
-            if matched.speaker.trim().is_empty() {
+            if is_structural_blank(&matched.speaker) {
                 push_literal(
                     &mut parts,
                     &line.expected_raw[matched.speaker_start..matched.speaker_end],
@@ -378,7 +380,7 @@ fn collect_matches(
             });
         }
         let speaker_text = text[speaker.start()..speaker.end()].to_owned();
-        if !speaker_text.trim().is_empty() {
+        if !is_structural_blank(&speaker_text) {
             rule.non_blank_speaker_matches += 1;
         }
         matches.push(SpeakerMatch {

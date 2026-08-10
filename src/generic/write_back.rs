@@ -8,18 +8,15 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
 use crate::diagnostic::{
-    Diagnostic, DiagnosticReport, GenericDiagnosticStage, GenericIssue,
-    GenericLanguageProjectionProblem, GenericProblem, GenericUnitLocator,
-    GenericWriteBackSnapshotProblem, GenericWriteBackTextSide, GenericWriteBackUnitProblem,
-    SafeIdentifier, SafePath, StateEffect,
+    Diagnostic, DiagnosticReport, GenericDiagnosticStage, GenericIssue, GenericProblem,
+    GenericUnitLocator, GenericWriteBackSnapshotProblem, GenericWriteBackTextSide,
+    GenericWriteBackUnitProblem, SafeIdentifier, SafePath, StateEffect,
 };
 use crate::execution::CooperativeCancellation;
-use crate::language::{LanguageText, LanguageTextSegment};
-use crate::translation::placeholder::PlaceholderProtectionError;
-use crate::translation::placeholder_projection::LanguageTextProjectionError;
-use crate::translation::symbol_repair::{
-    TranslationSymbolRepairOutcome, TranslationSymbolRepairer,
+use crate::translation::candidate_validation::{
+    ProvenInvariantViolation, validate_reflowed_candidate_text_with_cancellation,
 };
+use crate::translation::placeholder::PlaceholderProtectionError;
 
 #[cfg(test)]
 use super::jsonl::parse_file;
@@ -50,10 +47,6 @@ impl GenericCurrentTranslation {
     pub(crate) fn text(&self) -> &str {
         &self.text
     }
-
-    pub(crate) const fn is_manual(&self) -> bool {
-        self.manual
-    }
 }
 
 /// 候选中的一个 JSONL 文件。
@@ -78,10 +71,6 @@ pub(crate) struct GenericWriteBackCandidate {
     files: Vec<GenericWriteBackFile>,
     translated_units: usize,
     retained_source_units: usize,
-    symbol_repair_attempted_units: usize,
-    symbol_repair_repaired_units: usize,
-    symbol_repair_skipped_units: usize,
-    symbol_repair_replacement_count: usize,
 }
 
 impl GenericWriteBackCandidate {
@@ -95,39 +84,6 @@ impl GenericWriteBackCandidate {
 
     pub(crate) const fn retained_source_units(&self) -> usize {
         self.retained_source_units
-    }
-
-    pub(crate) const fn symbol_repair_attempted_units(&self) -> usize {
-        self.symbol_repair_attempted_units
-    }
-
-    pub(crate) const fn symbol_repair_repaired_units(&self) -> usize {
-        self.symbol_repair_repaired_units
-    }
-
-    pub(crate) const fn symbol_repair_skipped_units(&self) -> usize {
-        self.symbol_repair_skipped_units
-    }
-
-    pub(crate) const fn symbol_repair_replacement_count(&self) -> usize {
-        self.symbol_repair_replacement_count
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct SymbolRepairStatistics {
-    attempted_units: usize,
-    repaired_units: usize,
-    skipped_units: usize,
-    replacements: usize,
-}
-
-impl SymbolRepairStatistics {
-    fn add_assign(&mut self, other: Self) {
-        self.attempted_units += other.attempted_units;
-        self.repaired_units += other.repaired_units;
-        self.skipped_units += other.skipped_units;
-        self.replacements += other.replacements;
     }
 }
 
@@ -144,10 +100,9 @@ pub(crate) enum GenericWriteBackError {
     PlaceholderBindingMismatch {
         unit: GenericUnitLocator,
     },
-    LanguageProjection {
+    CandidateViolation {
         unit: GenericUnitLocator,
-        side: GenericWriteBackTextSide,
-        source: LanguageTextProjectionError,
+        problem: ProvenInvariantViolation,
     },
     MaterializedMismatch {
         path: PathBuf,
@@ -168,7 +123,9 @@ impl fmt::Display for GenericWriteBackError {
             Self::PlaceholderBindingMismatch { .. } => {
                 formatter.write_str("当前译文没有完整保留原文实际命中的 Placeholder")
             }
-            Self::LanguageProjection { source, .. } => source.fmt(formatter),
+            Self::CandidateViolation { problem, .. } => {
+                write!(formatter, "当前译文违反强不变量：{problem:?}")
+            }
             Self::MaterializedMismatch {
                 path,
                 bytes_changed,
@@ -188,10 +145,10 @@ impl Error for GenericWriteBackError {
         match self {
             Self::Jsonl(source) => Some(source),
             Self::PlaceholderProtection { source, .. } => Some(source),
-            Self::LanguageProjection { source, .. } => Some(source),
             Self::SourceChanged
             | Self::SnapshotMismatch(_)
             | Self::PlaceholderBindingMismatch { .. }
+            | Self::CandidateViolation { .. }
             | Self::MaterializedMismatch { .. } => None,
         }
     }
@@ -237,14 +194,13 @@ impl GenericWriteBackError {
                     },
                 ))
             }
-            Self::LanguageProjection { unit, side, source } => {
+            Self::CandidateViolation { unit, problem } => {
                 Diagnostic::generic(GenericIssue::project(
                     GenericDiagnosticStage::WriteBack,
                     GenericProblem::WriteBackUnit {
                         unit: unit.clone(),
-                        problem: GenericWriteBackUnitProblem::LanguageProjection {
-                            side: *side,
-                            problem: generic_language_projection_problem(source),
+                        problem: GenericWriteBackUnitProblem::CandidateViolation {
+                            problem: problem.clone(),
                         },
                     },
                 ))
@@ -270,50 +226,6 @@ impl GenericWriteBackError {
 impl From<GenericJsonlError> for GenericWriteBackError {
     fn from(source: GenericJsonlError) -> Self {
         Self::Jsonl(source)
-    }
-}
-
-const fn generic_language_projection_problem(
-    source: &LanguageTextProjectionError,
-) -> GenericLanguageProjectionProblem {
-    match source {
-        LanguageTextProjectionError::TokenIndexConstruction => {
-            GenericLanguageProjectionProblem::TokenIndexConstruction
-        }
-        LanguageTextProjectionError::EmptyToken => GenericLanguageProjectionProblem::EmptyToken,
-        LanguageTextProjectionError::MissingToken { .. } => {
-            GenericLanguageProjectionProblem::MissingToken
-        }
-        LanguageTextProjectionError::RepeatedToken { .. } => {
-            GenericLanguageProjectionProblem::RepeatedToken
-        }
-        LanguageTextProjectionError::OverlappingToken { .. } => {
-            GenericLanguageProjectionProblem::OverlappingToken
-        }
-        LanguageTextProjectionError::ChangedTokenOrder { position, .. } => {
-            GenericLanguageProjectionProblem::ChangedTokenOrder {
-                position: *position,
-            }
-        }
-        LanguageTextProjectionError::ChangedSegmentCount { expected, actual } => {
-            GenericLanguageProjectionProblem::ChangedSegmentCount {
-                expected: *expected,
-                actual: *actual,
-            }
-        }
-        LanguageTextProjectionError::ChangedSegmentKind { segment_index } => {
-            GenericLanguageProjectionProblem::ChangedSegmentKind {
-                segment_index: *segment_index,
-            }
-        }
-        LanguageTextProjectionError::MissingOrderedToken { segment_index } => {
-            GenericLanguageProjectionProblem::MissingOrderedToken {
-                segment_index: *segment_index,
-            }
-        }
-        LanguageTextProjectionError::UnusedOrderedToken => {
-            GenericLanguageProjectionProblem::UnusedOrderedToken
-        }
     }
 }
 
@@ -374,7 +286,6 @@ pub(crate) fn build_write_back_candidate_with_cancellation(
 
     let mut translated_units = 0;
     let mut retained_source_units = 0;
-    let mut symbol_repair = SymbolRepairStatistics::default();
     let mut files = Vec::with_capacity(live.files().len());
     // Rayon 的 indexed collect 保留文件顺序；这里再按自然顺序取出结果，
     // 因而多个文件同时失败时仍返回自然顺序最早的错误。
@@ -383,7 +294,6 @@ pub(crate) fn build_write_back_candidate_with_cancellation(
         let built = result?;
         translated_units += built.translated_units;
         retained_source_units += built.retained_source_units;
-        symbol_repair.add_assign(built.symbol_repair);
         files.push(built.file);
     }
     ensure_write_back_running(cancellation)?;
@@ -392,10 +302,6 @@ pub(crate) fn build_write_back_candidate_with_cancellation(
         files,
         translated_units,
         retained_source_units,
-        symbol_repair_attempted_units: symbol_repair.attempted_units,
-        symbol_repair_repaired_units: symbol_repair.repaired_units,
-        symbol_repair_skipped_units: symbol_repair.skipped_units,
-        symbol_repair_replacement_count: symbol_repair.replacements,
     })
 }
 
@@ -403,7 +309,6 @@ struct BuiltWriteBackFile {
     file: GenericWriteBackFile,
     translated_units: usize,
     retained_source_units: usize,
-    symbol_repair: SymbolRepairStatistics,
 }
 
 fn build_write_back_file(
@@ -434,7 +339,6 @@ fn build_write_back_file(
 
     let mut translated_units = 0;
     let mut retained_source_units = 0;
-    let mut symbol_repair = SymbolRepairStatistics::default();
     let mut output_groups = Vec::with_capacity(live_file.groups().len());
     for (group_ordinal, (stored_group, live_group)) in stored_file
         .groups()
@@ -460,27 +364,22 @@ fn build_write_back_file(
             let text = if let Some(translation) = translation {
                 ensure_write_back_text_running(translation.text(), cancellation)?;
                 translated_units += 1;
-                if translation.is_manual() {
-                    Cow::Borrowed(translation.text())
-                } else {
-                    let context = GenericWriteBackUnitContext {
-                        relative_path: live_file.relative_path(),
-                        group_id: live_group.id(),
-                        unit_id: unit.id(),
-                        kind: live_group.kind(),
-                        line: group_ordinal + 1,
-                        unit: unit_ordinal + 1,
-                    };
-                    let repaired = repair_translation_symbols(
-                        &context,
-                        unit.text(),
-                        translation.text(),
-                        placeholder_rules,
-                        cancellation,
-                    )?;
-                    symbol_repair.add_assign(repaired.statistics);
-                    repaired.text
-                }
+                let context = GenericWriteBackUnitContext {
+                    relative_path: live_file.relative_path(),
+                    group_id: live_group.id(),
+                    unit_id: unit.id(),
+                    kind: live_group.kind(),
+                    line: group_ordinal + 1,
+                    unit: unit_ordinal + 1,
+                };
+                validate_translation_candidate(
+                    &context,
+                    unit.text(),
+                    translation.text(),
+                    placeholder_rules,
+                    cancellation,
+                )?;
+                Cow::Borrowed(translation.text())
             } else {
                 retained_source_units += 1;
                 Cow::Borrowed(unit.text())
@@ -497,13 +396,7 @@ fn build_write_back_file(
         file: GenericWriteBackFile { validated },
         translated_units,
         retained_source_units,
-        symbol_repair,
     })
-}
-
-struct RepairedTranslation<'translation> {
-    text: Cow<'translation, str>,
-    statistics: SymbolRepairStatistics,
 }
 
 struct GenericWriteBackUnitContext<'unit> {
@@ -525,22 +418,32 @@ impl GenericWriteBackUnitContext<'_> {
         )
         .with_natural_position(self.line, self.unit)
     }
+
+    fn readable_id(&self) -> String {
+        super::readable_generic_unit_id(self.relative_path, self.line, self.unit)
+    }
 }
 
-fn repair_translation_symbols<'translation>(
+fn validate_translation_candidate(
     context: &GenericWriteBackUnitContext<'_>,
     source: &str,
-    translation: &'translation str,
+    translation: &str,
     placeholder_rules: &GenericCompiledPlaceholderRules,
     cancellation: &CooperativeCancellation,
-) -> Result<RepairedTranslation<'translation>, GenericWriteBackError> {
-    let mut statistics = SymbolRepairStatistics {
-        attempted_units: 1,
-        ..SymbolRepairStatistics::default()
-    };
+) -> Result<(), GenericWriteBackError> {
+    if let Err(problem) = validate_reflowed_candidate_text_with_cancellation(translation, || {
+        ensure_write_back_running(cancellation)
+    })? {
+        return Err(GenericWriteBackError::CandidateViolation {
+            unit: context.diagnostic_locator(),
+            problem,
+        });
+    }
     let service = GenericPlaceholderService::default();
     let unit_locator = || context.diagnostic_locator();
-    let source_view = match service.protect_compiled_text_with_cancellation(
+    let target_id = context.readable_id();
+    let source_view = match service.protect_compiled_target_with_cancellation(
+        &target_id,
         context.kind,
         source,
         placeholder_rules,
@@ -555,7 +458,8 @@ fn repair_translation_symbols<'translation>(
             });
         }
     };
-    let translation_view = match service.protect_compiled_text_with_cancellation(
+    let translation_view = match service.protect_compiled_target_with_cancellation(
+        &target_id,
         context.kind,
         translation,
         placeholder_rules,
@@ -579,130 +483,7 @@ fn repair_translation_symbols<'translation>(
             unit: unit_locator(),
         });
     }
-    let source = match source_view
-        .language_text_with_cancellation(|| ensure_write_back_running(cancellation))?
-    {
-        Ok(source) => source,
-        Err(source) => {
-            return Err(GenericWriteBackError::LanguageProjection {
-                unit: unit_locator(),
-                side: GenericWriteBackTextSide::Source,
-                source,
-            });
-        }
-    };
-    let translation_text = match translation_view
-        .language_text_with_cancellation(|| ensure_write_back_running(cancellation))?
-    {
-        Ok(translation) => translation,
-        Err(source) => {
-            return Err(GenericWriteBackError::LanguageProjection {
-                unit: unit_locator(),
-                side: GenericWriteBackTextSide::Translation,
-                source,
-            });
-        }
-    };
-
-    let (plan, replacement_count) = match TranslationSymbolRepairer::plan_repair_with_cancellation(
-        &source,
-        &translation_text,
-        || ensure_write_back_running(cancellation),
-    )? {
-        TranslationSymbolRepairOutcome::Unchanged => {
-            return Ok(RepairedTranslation {
-                text: Cow::Borrowed(translation),
-                statistics,
-            });
-        }
-        TranslationSymbolRepairOutcome::Repaired {
-            plan,
-            replacement_count,
-        } => (plan, replacement_count),
-        TranslationSymbolRepairOutcome::Skipped { .. } => {
-            return Ok(skipped_symbol_repair(translation, statistics));
-        }
-    };
-    let repaired = match translation_text
-        .apply_repair_with_cancellation(&plan, || ensure_write_back_running(cancellation))?
-    {
-        Ok(repaired) => repaired,
-        Err(_) => return Ok(skipped_symbol_repair(translation, statistics)),
-    };
-    let Some(rebuilt) = rebuild_protected_translation(&translation_view, &repaired, cancellation)?
-    else {
-        return Ok(skipped_symbol_repair(translation, statistics));
-    };
-    statistics.repaired_units = 1;
-    statistics.replacements = replacement_count;
-    Ok(RepairedTranslation {
-        text: Cow::Owned(rebuilt),
-        statistics,
-    })
-}
-
-fn skipped_symbol_repair<'translation>(
-    translation: &'translation str,
-    mut statistics: SymbolRepairStatistics,
-) -> RepairedTranslation<'translation> {
-    statistics.skipped_units = 1;
-    RepairedTranslation {
-        text: Cow::Borrowed(translation),
-        statistics,
-    }
-}
-
-fn rebuild_protected_translation(
-    protected: &super::placeholder::GenericProtectedText,
-    repaired: &LanguageText,
-    cancellation: &CooperativeCancellation,
-) -> Result<Option<String>, GenericWriteBackError> {
-    let mut placeholders = protected.placeholders().iter();
-    let mut output_length = 0_usize;
-    for segment in repaired.segments() {
-        ensure_write_back_running(cancellation)?;
-        let text = match segment {
-            LanguageTextSegment::NaturalText(text) => text.as_str(),
-            LanguageTextSegment::OpaqueBoundary => {
-                let Some(placeholder) = placeholders.next() else {
-                    return Ok(None);
-                };
-                placeholder.original()
-            }
-        };
-        let Some(next_length) = output_length.checked_add(text.len()) else {
-            return Ok(None);
-        };
-        output_length = next_length;
-    }
-    ensure_write_back_running(cancellation)?;
-    if placeholders.next().is_some() {
-        return Ok(None);
-    }
-
-    let mut output = String::new();
-    if output.try_reserve_exact(output_length).is_err() {
-        return Ok(None);
-    }
-    let mut placeholders = protected.placeholders().iter();
-    for segment in repaired.segments() {
-        ensure_write_back_running(cancellation)?;
-        let text = match segment {
-            LanguageTextSegment::NaturalText(text) => text.as_str(),
-            LanguageTextSegment::OpaqueBoundary => {
-                let Some(placeholder) = placeholders.next() else {
-                    return Ok(None);
-                };
-                placeholder.original()
-            }
-        };
-        append_write_back_text(&mut output, text, cancellation)?;
-    }
-    ensure_write_back_running(cancellation)?;
-    if placeholders.next().is_some() {
-        return Ok(None);
-    }
-    Ok(Some(output))
+    Ok(())
 }
 
 fn validate_group_shape(
@@ -893,16 +674,6 @@ fn ensure_write_back_text_running(
     ensure_write_back_running(cancellation)
 }
 
-fn append_write_back_text(
-    output: &mut String,
-    text: &str,
-    cancellation: &CooperativeCancellation,
-) -> Result<(), GenericWriteBackError> {
-    ensure_write_back_text_running(text, cancellation)?;
-    output.push_str(text);
-    ensure_write_back_running(cancellation)
-}
-
 fn bytes_equal_with_cancellation(
     left: &[u8],
     right: &[u8],
@@ -1034,10 +805,6 @@ mod tests {
         let candidate = build_write_back_candidate(&stored, &live, &current_translations).unwrap();
         assert_eq!(candidate.translated_units(), 1);
         assert_eq!(candidate.retained_source_units(), 1);
-        assert_eq!(candidate.symbol_repair_attempted_units(), 1);
-        assert_eq!(candidate.symbol_repair_repaired_units(), 0);
-        assert_eq!(candidate.symbol_repair_skipped_units(), 0);
-        assert_eq!(candidate.symbol_repair_replacement_count(), 0);
         assert_eq!(candidate.files().len(), 2);
         assert_eq!(
             candidate
@@ -1068,7 +835,7 @@ mod tests {
     }
 
     #[test]
-    fn candidate_repairs_categories_punctuation_without_copying_source_spaces() {
+    fn candidate_materializes_categories_translation_without_rewriting_symbols() {
         let temp = tempdir().unwrap();
         let source_root = temp.path().join("source");
         fs::create_dir(&source_root).unwrap();
@@ -1110,16 +877,12 @@ mod tests {
 
         assert_eq!(
             std::str::from_utf8(candidate.files()[0].bytes()).unwrap(),
-            "{\"id\":\"g\",\"kind\":\"settings\",\"units\":[{\"id\":\"u\",\"text\":\"常规,杂项,声音,开关\"}]}\n"
+            "{\"id\":\"g\",\"kind\":\"settings\",\"units\":[{\"id\":\"u\",\"text\":\"常规、杂项、声音、开关\"}]}\n"
         );
-        assert_eq!(candidate.symbol_repair_attempted_units(), 1);
-        assert_eq!(candidate.symbol_repair_repaired_units(), 1);
-        assert_eq!(candidate.symbol_repair_skipped_units(), 0);
-        assert_eq!(candidate.symbol_repair_replacement_count(), 3);
     }
 
     #[test]
-    fn candidate_repairs_only_natural_text_around_opaque_placeholders() {
+    fn candidate_materializes_natural_text_around_opaque_placeholders_exactly() {
         let temp = tempdir().unwrap();
         let source_root = temp.path().join("source");
         fs::create_dir(&source_root).unwrap();
@@ -1164,16 +927,12 @@ mod tests {
 
         assert_eq!(
             std::str::from_utf8(candidate.files()[0].bytes()).unwrap(),
-            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"打开 [A,B],现在.\"}]}\n"
+            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"打开 [A,B]、现在。\"}]}\n"
         );
-        assert_eq!(candidate.symbol_repair_attempted_units(), 1);
-        assert_eq!(candidate.symbol_repair_repaired_units(), 1);
-        assert_eq!(candidate.symbol_repair_skipped_units(), 0);
-        assert_eq!(candidate.symbol_repair_replacement_count(), 2);
     }
 
     #[test]
-    fn candidate_repairs_natural_text_without_changing_placeholder_wrappers() {
+    fn candidate_materializes_wrapper_translation_exactly() {
         let temp = tempdir().unwrap();
         let source_root = temp.path().join("source");
         fs::create_dir(&source_root).unwrap();
@@ -1218,12 +977,8 @@ mod tests {
 
         assert_eq!(
             std::str::from_utf8(candidate.files()[0].bytes()).unwrap(),
-            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"<msg>常规,杂项</msg>\"}]}\n"
+            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"<msg>常规、杂项</msg>\"}]}\n"
         );
-        assert_eq!(candidate.symbol_repair_attempted_units(), 1);
-        assert_eq!(candidate.symbol_repair_repaired_units(), 1);
-        assert_eq!(candidate.symbol_repair_skipped_units(), 0);
-        assert_eq!(candidate.symbol_repair_replacement_count(), 1);
     }
 
     #[test]

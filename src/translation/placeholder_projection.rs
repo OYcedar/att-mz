@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 
-use super::placeholder::AppliedPlaceholder;
+use super::placeholder::{AppliedPlaceholder, PlaceholderWrapperCaptureShape};
 use super::placeholder_token;
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::language::{LanguageText, LanguageTextSegment};
@@ -424,8 +424,11 @@ impl PlaceholderBindingIndex {
             &mut ensure_running,
         )?;
         sort_and_merge_token_ranges_with_cancellation(&mut token_ranges, &mut ensure_running)?;
+        let structural_content_ranges =
+            structural_content_ranges_with_cancellation(text, &mut ensure_running)?;
 
         Ok(PlaceholderTextScan {
+            text_len: text.len(),
             empty_token_occurrences: if self.empty_token_index.is_some() {
                 projection_character_count_with_cancellation(text, &mut ensure_running)?
                     .saturating_add(1)
@@ -436,6 +439,7 @@ impl PlaceholderBindingIndex {
             token_occurrences,
             envelope_scan,
             token_ranges,
+            structural_content_ranges,
         })
     }
 
@@ -503,11 +507,30 @@ impl PlaceholderBindingIndex {
         mut ensure_running: impl FnMut() -> Result<(), E>,
     ) -> Result<Result<(), PlaceholderMultisetError>, E> {
         let mut expected = BTreeMap::<usize, usize>::new();
+        let mut wrappers = HashMap::new();
         for &binding_index in binding_indices {
             ensure_running()?;
             *expected
                 .entry(self.binding_token_indices[binding_index])
                 .or_default() += 1;
+            let binding = &self.placeholders[binding_index];
+            if let Some(wrapper) = binding.wrapper() {
+                let entry = wrappers.entry(wrapper.pair()).or_insert((
+                    None,
+                    None,
+                    wrapper.capture_shape(),
+                    binding_index,
+                ));
+                match binding.segment() {
+                    crate::translation::placeholder::PlaceholderSegment::Begin => {
+                        entry.0.get_or_insert(binding_index);
+                    }
+                    crate::translation::placeholder::PlaceholderSegment::End => {
+                        entry.1.get_or_insert(binding_index);
+                    }
+                    crate::translation::placeholder::PlaceholderSegment::Whole => {}
+                }
+            }
         }
         let actual =
             self.aggregate_token_occurrences_with_cancellation(scans, &mut ensure_running)?;
@@ -561,10 +584,23 @@ impl PlaceholderBindingIndex {
                 }
             }
         }
-        let mut expected_bindings = binding_indices.iter().copied();
+        let mut expected_bindings = binding_indices.iter().copied().filter(|binding_index| {
+            self.placeholders[*binding_index].order_policy()
+                == crate::translation::placeholder::PlaceholderOrderPolicy::Preserve
+        });
         for scan in scans {
             for &(_, _, actual_token_index) in &scan.token_occurrences {
                 ensure_running()?;
+                let preserves_order =
+                    self.token_binding_indices[actual_token_index]
+                        .iter()
+                        .any(|binding_index| {
+                            self.placeholders[*binding_index].order_policy()
+                                == crate::translation::placeholder::PlaceholderOrderPolicy::Preserve
+                        });
+                if !preserves_order {
+                    continue;
+                }
                 let Some(expected_binding_index) = expected_bindings.next() else {
                     return Ok(Err(PlaceholderMultisetError::Unexpected {
                         token: clone_projection_text_with_cancellation(
@@ -596,6 +632,27 @@ impl PlaceholderBindingIndex {
                     &mut ensure_running,
                 )?,
             }));
+        }
+        for (_, (begin_binding_index, end_binding_index, capture_shape, wrapper_binding_index)) in
+            wrappers
+        {
+            ensure_running()?;
+            let wrapper_binding = &self.placeholders[wrapper_binding_index];
+            let topology_valid = wrapper_topology_is_valid(
+                self,
+                scans,
+                begin_binding_index,
+                end_binding_index,
+                capture_shape,
+            );
+            if !topology_valid {
+                return Ok(Err(PlaceholderMultisetError::WrapperTopologyChanged {
+                    token: clone_projection_text_with_cancellation(
+                        wrapper_binding.token(),
+                        &mut ensure_running,
+                    )?,
+                }));
+            }
         }
         ensure_running()?;
         Ok(Ok(()))
@@ -668,19 +725,28 @@ impl PlaceholderBindingIndex {
             positioned.push((matched.first_start, matched.first_end, binding_index));
         }
         stable_sort_positioned_bindings_with_cancellation(&mut positioned, &mut ensure_running)?;
-        for (position, ((_, _, actual_binding_index), expected_binding_index)) in
-            positioned.iter().zip(binding_indices).enumerate()
+        let expected_preserved = binding_indices.iter().copied().filter(|binding_index| {
+            self.placeholders[*binding_index].order_policy()
+                == crate::translation::placeholder::PlaceholderOrderPolicy::Preserve
+        });
+        let actual_preserved = positioned.iter().filter_map(|(_, _, binding_index)| {
+            (self.placeholders[*binding_index].order_policy()
+                == crate::translation::placeholder::PlaceholderOrderPolicy::Preserve)
+                .then_some(*binding_index)
+        });
+        for (position, (actual_binding_index, expected_binding_index)) in
+            actual_preserved.zip(expected_preserved).enumerate()
         {
             ensure_running()?;
             if actual_binding_index != expected_binding_index {
                 return Ok(Err(LanguageTextProjectionError::ChangedTokenOrder {
                     position,
                     expected_token: clone_projection_text_with_cancellation(
-                        self.placeholders[*expected_binding_index].token(),
+                        self.placeholders[expected_binding_index].token(),
                         &mut ensure_running,
                     )?,
                     actual_token: clone_projection_text_with_cancellation(
-                        self.placeholders[*actual_binding_index].token(),
+                        self.placeholders[actual_binding_index].token(),
                         &mut ensure_running,
                     )?,
                 }));
@@ -865,17 +931,138 @@ impl PlaceholderBindingIndex {
     }
 }
 
+fn wrapper_capture_shape(
+    start: usize,
+    end: usize,
+    structural_content_ranges: &[(usize, usize)],
+) -> PlaceholderWrapperCaptureShape {
+    if start == end {
+        return PlaceholderWrapperCaptureShape::Empty;
+    }
+    if structural_content_ranges
+        .iter()
+        .any(|(content_start, content_end)| *content_end > start && *content_start < end)
+    {
+        PlaceholderWrapperCaptureShape::Content
+    } else {
+        PlaceholderWrapperCaptureShape::StructuralBlank
+    }
+}
+
+fn wrapper_topology_is_valid(
+    index: &PlaceholderBindingIndex,
+    scans: &[PlaceholderTextScan],
+    begin_binding_index: Option<usize>,
+    end_binding_index: Option<usize>,
+    expected_shape: PlaceholderWrapperCaptureShape,
+) -> bool {
+    let begin_token_index =
+        begin_binding_index.map(|binding_index| index.binding_token_indices[binding_index]);
+    let end_token_index =
+        end_binding_index.map(|binding_index| index.binding_token_indices[binding_index]);
+    for scan in scans {
+        let begin_match = begin_token_index.and_then(|token_index| scan.matches.get(&token_index));
+        let end_match = end_token_index.and_then(|token_index| scan.matches.get(&token_index));
+        match (
+            begin_binding_index,
+            end_binding_index,
+            begin_match,
+            end_match,
+        ) {
+            (Some(_), Some(_), Some(begin_match), Some(end_match)) => {
+                return begin_match.first_end <= end_match.first_start
+                    && wrapper_shape_matches(
+                        expected_shape,
+                        wrapper_capture_shape(
+                            begin_match.first_end,
+                            end_match.first_start,
+                            &scan.structural_content_ranges,
+                        ),
+                    );
+            }
+            (Some(_), None, Some(begin_match), None) => {
+                return wrapper_shape_matches(
+                    expected_shape,
+                    wrapper_capture_shape(
+                        begin_match.first_end,
+                        scan.text_len,
+                        &scan.structural_content_ranges,
+                    ),
+                );
+            }
+            (None, Some(_), None, Some(end_match)) => {
+                return wrapper_shape_matches(
+                    expected_shape,
+                    wrapper_capture_shape(
+                        0,
+                        end_match.first_start,
+                        &scan.structural_content_ranges,
+                    ),
+                );
+            }
+            (Some(_), Some(_), Some(_), None)
+            | (Some(_), Some(_), None, Some(_))
+            | (Some(_), None, None, None)
+            | (None, Some(_), None, None) => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn wrapper_shape_matches(
+    expected: PlaceholderWrapperCaptureShape,
+    actual: PlaceholderWrapperCaptureShape,
+) -> bool {
+    match expected {
+        PlaceholderWrapperCaptureShape::Empty => actual == PlaceholderWrapperCaptureShape::Empty,
+        PlaceholderWrapperCaptureShape::StructuralBlank => {
+            actual != PlaceholderWrapperCaptureShape::Content
+        }
+        PlaceholderWrapperCaptureShape::Content => {
+            actual == PlaceholderWrapperCaptureShape::Content
+        }
+    }
+}
+
+fn structural_content_ranges_with_cancellation<E>(
+    text: &str,
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<Vec<(usize, usize)>, E> {
+    let mut ranges = Vec::new();
+    let mut active_start = None;
+    for (start, character) in text.char_indices() {
+        ensure_running()?;
+        let end = start + character.len_utf8();
+        if character == '\u{000c}' || !character.is_whitespace() {
+            active_start.get_or_insert(start);
+        } else if let Some(content_start) = active_start.take() {
+            ranges.push((content_start, start));
+        }
+        if end == text.len()
+            && let Some(content_start) = active_start.take()
+        {
+            ranges.push((content_start, end));
+        }
+    }
+    ensure_running()?;
+    Ok(ranges)
+}
+
 fn clone_applied_placeholder_with_cancellation<E>(
     placeholder: &AppliedPlaceholder,
     ensure_running: &mut impl FnMut() -> Result<(), E>,
 ) -> Result<AppliedPlaceholder, E> {
-    Ok(AppliedPlaceholder::new(
+    Ok(AppliedPlaceholder::new_with_contract_and_identity(
         clone_projection_text_with_cancellation(placeholder.token(), ensure_running)?,
         clone_projection_text_with_cancellation(placeholder.original(), ensure_running)?,
+        clone_projection_text_with_cancellation(placeholder.semantic_identity(), ensure_running)?,
         placeholder.origin(),
         clone_projection_text_with_cancellation(placeholder.label(), ensure_running)?,
         clone_projection_text_with_cancellation(placeholder.scope(), ensure_running)?,
         placeholder.segment(),
+        placeholder.order_policy(),
+        placeholder.wrapper(),
     ))
 }
 
@@ -1207,11 +1394,13 @@ struct TokenMatches {
 }
 
 pub(crate) struct PlaceholderTextScan {
+    text_len: usize,
     empty_token_occurrences: usize,
     matches: HashMap<usize, TokenMatches>,
     token_occurrences: Vec<(usize, usize, usize)>,
     envelope_scan: EnvelopeScan,
     token_ranges: Vec<(usize, usize)>,
+    structural_content_ranges: Vec<(usize, usize)>,
 }
 
 impl PlaceholderTextScan {
@@ -1253,6 +1442,9 @@ pub(crate) enum PlaceholderMultisetError {
         expected_token: String,
         actual_token: String,
     },
+    WrapperTopologyChanged {
+        token: String,
+    },
 }
 
 impl fmt::Display for PlaceholderMultisetError {
@@ -1270,6 +1462,10 @@ impl fmt::Display for PlaceholderMultisetError {
             } => write!(
                 formatter,
                 "Placeholder token 顺序不一致：预期 {expected_token:?}，实际 {actual_token:?}"
+            ),
+            Self::WrapperTopologyChanged { token } => write!(
+                formatter,
+                "Placeholder wrapper 的可翻译文本离开了配对边界：{token:?}"
             ),
         }
     }

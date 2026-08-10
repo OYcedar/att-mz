@@ -137,8 +137,7 @@ use crate::rpg_maker::write_back::asset_reader::{
     RpgMakerWriteBackAssetReadingError, RpgMakerWriteBackAssetReadingService,
 };
 use crate::rpg_maker::write_back::planner::{
-    ConservativeRpgMakerWriteBackTextLayouter, RpgMakerWriteBackService,
-    RpgMakerWriteBackServiceError, write_back_planning_compute_report,
+    RpgMakerWriteBackService, RpgMakerWriteBackServiceError, write_back_planning_compute_report,
 };
 use crate::rpg_maker::write_back::publisher::RpgMakerWriteBackPublishingService;
 use crate::rpg_maker::write_back::rewriter::{
@@ -1004,6 +1003,10 @@ impl ProductionRpgMakerCommandRunner {
                 ConfiguredRpgMakerCommand::Manual(command) => {
                     self.run_manual(command, termination_signals).await
                 }
+                ConfiguredRpgMakerCommand::Ownership(command)
+                | ConfiguredRpgMakerCommand::Translation(command) => {
+                    self.run_manual(command, termination_signals).await
+                }
                 ConfiguredRpgMakerCommand::Lua(command) => {
                     self.run_atomic_project_lua(command, termination_signals)
                         .await
@@ -1042,7 +1045,7 @@ impl ProductionRpgMakerCommandRunner {
         .to_path_buf();
         let operation = command.operation();
         let file = command.file().to_path_buf();
-        let ownership_file = command.ownership_file().map(Path::to_path_buf);
+        let export_selection = command.export_selection().cloned();
         let language_modules = command.language_modules().cloned();
         let lease_provider = ProjectCommandLeaseService::new(
             command.common().projects_root().to_path_buf(),
@@ -1068,7 +1071,7 @@ impl ProductionRpgMakerCommandRunner {
                         engine,
                         operation,
                         &file,
-                        ownership_file.as_deref(),
+                        export_selection.as_ref(),
                         language_modules.as_ref(),
                         &blocking_cancellation,
                     )
@@ -1680,9 +1683,6 @@ impl ProductionRpgMakerCommandRunner {
             game_root: resolved_game_root.clone(),
             source_language: arguments.source_language.clone(),
             target_language: arguments.target_language.clone(),
-            dialogue_max_fullwidth_chars: arguments.dialogue_max_fullwidth_chars,
-            scrolling_text_max_fullwidth_chars: arguments.scrolling_text_max_fullwidth_chars,
-            help_description_max_fullwidth_chars: arguments.help_description_max_fullwidth_chars,
         };
 
         let safe_stopping = progress_safe_stopping(self.locale);
@@ -2594,6 +2594,7 @@ impl ProductionRpgMakerCommandRunner {
             name: command.project_name().clone(),
             terminology_path: command.terminology_path().map(Path::to_path_buf),
             placeholder_rules_path: command.placeholder_rules_path().map(Path::to_path_buf),
+            retry_rejected: command.retry_rejected(),
         };
         progress_observer.observe(ProgressSnapshot::indeterminate(
             TranslateProgressPhase::Planning,
@@ -2860,7 +2861,6 @@ impl ProductionRpgMakerCommandRunner {
             .with_progress(progress_observer.clone());
         let write_back = RpgMakerWriteBackService::new(
             asset_reader,
-            ConservativeRpgMakerWriteBackTextLayouter,
             rewriter,
             cpu.clone(),
             cancellation.clone(),
@@ -2900,7 +2900,6 @@ impl ProductionRpgMakerCommandRunner {
         )
         .await
         .map(|result| result.map_err(map_write_back_error));
-        emit_write_back_manual_layout_diagnostics(&execution, &project_log);
         finish_progress_business_state(&progress_observer, &execution);
         let shutdown = roots.shutdown().await;
         drop(project_lease_guard);
@@ -2937,26 +2936,6 @@ impl ProductionRpgMakerCommandRunner {
             shutdown,
             Some(pending_project_log),
         )
-    }
-}
-
-fn emit_write_back_manual_layout_diagnostics(
-    execution: &DrivenCommand<Result<OperationCompletion<WriteBackOutput>, ProductionCommandError>>,
-    project_log: &ActiveProjectLog,
-) {
-    let output = match execution {
-        DrivenCommand::Finished(Ok(OperationCompletion::Completed(output)))
-        | DrivenCommand::Interrupted(Ok(OperationCompletion::Completed(output)))
-        | DrivenCommand::SignalFailed {
-            result: Ok(OperationCompletion::Completed(output)),
-            ..
-        } => output,
-        _ => return,
-    };
-    for diagnostic in output.manual_layout_diagnostics() {
-        project_log
-            .handle()
-            .record_diagnostic(DiagnosticScope::WriteBack, diagnostic.diagnostic_report());
     }
 }
 
@@ -3495,6 +3474,12 @@ fn command_panic_context(
             command.common(),
             command.project_name().as_str(),
         ),
+        ConfiguredRpgMakerCommand::Ownership(command)
+        | ConfiguredRpgMakerCommand::Translation(command) => (
+            crate::diagnostic::RuntimeCommand::Manual,
+            command.common(),
+            command.project_name().as_str(),
+        ),
         ConfiguredRpgMakerCommand::Lua(command) => (
             crate::diagnostic::RuntimeCommand::Lua,
             command.common(),
@@ -3730,9 +3715,6 @@ mod progress_lifecycle_tests {
                 path: None,
                 source_language: None,
                 target_language: None,
-                dialogue_max_fullwidth_chars: None,
-                scrolling_text_max_fullwidth_chars: None,
-                help_description_max_fullwidth_chars: None,
             },
             projects_root,
             "mv",
@@ -4845,38 +4827,6 @@ impl WriteBackLog for ProductionBusinessLog {
                             original_units: usize_to_u64(
                                 summary.original_units,
                                 "保留原文写回单元数",
-                            ),
-                            auto_wrapped_units: usize_to_u64(
-                                summary.auto_wrapped_units,
-                                "自动换行单元数",
-                            ),
-                            inserted_line_breaks: usize_to_u64(
-                                summary.inserted_line_breaks,
-                                "新增换行数",
-                            ),
-                            inserted_fullwidth_indents: usize_to_u64(
-                                summary.inserted_fullwidth_indents,
-                                "新增全角缩进数",
-                            ),
-                            manual_layout_units: usize_to_u64(
-                                summary.manual_layout_units,
-                                "人工布局单元数",
-                            ),
-                            symbol_repair_attempted_units: usize_to_u64(
-                                summary.symbol_repair_attempted_units,
-                                "符号修复尝试单元数",
-                            ),
-                            symbol_repair_repaired_units: usize_to_u64(
-                                summary.symbol_repair_repaired_units,
-                                "符号修复实际单元数",
-                            ),
-                            symbol_repair_skipped_units: usize_to_u64(
-                                summary.symbol_repair_skipped_units,
-                                "符号修复内部跳过单元数",
-                            ),
-                            symbol_repair_replacements: usize_to_u64(
-                                summary.symbol_repair_replacements,
-                                "符号修复替换字符数",
                             ),
                         }),
                     },
@@ -7235,41 +7185,6 @@ impl CommandResultRenderer {
                     localizer.format(UiMessage::ResultWriteBackSummary {
                         translated: usize_to_u64(output.summary.translated_units, "已翻译 Unit 数"),
                         original: usize_to_u64(output.summary.original_units, "保留原文 Unit 数"),
-                        auto_wrapped: usize_to_u64(
-                            output.summary.auto_wrapped_units,
-                            "自动换行 Unit 数",
-                        ),
-                        breaks: usize_to_u64(output.summary.inserted_line_breaks, "插入换行数"),
-                        indents: usize_to_u64(
-                            output.summary.inserted_fullwidth_indents,
-                            "插入全角缩进数",
-                        ),
-                        manual: usize_to_u64(
-                            output.summary.manual_layout_units,
-                            "人工布局 Unit 数",
-                        ),
-                    })
-                )?;
-                writeln!(
-                    stdout,
-                    "{}",
-                    localizer.format(UiMessage::ResultSymbolRepairSummary {
-                        attempted: usize_to_u64(
-                            output.summary.symbol_repair_attempted_units,
-                            "符号修复尝试 Unit 数",
-                        ),
-                        repaired: usize_to_u64(
-                            output.summary.symbol_repair_repaired_units,
-                            "符号修复实际 Unit 数",
-                        ),
-                        skipped: usize_to_u64(
-                            output.summary.symbol_repair_skipped_units,
-                            "符号修复内部跳过 Unit 数",
-                        ),
-                        replacements: usize_to_u64(
-                            output.summary.symbol_repair_replacements,
-                            "符号修复替换符号数",
-                        ),
                     })
                 )?;
                 Ok(())
@@ -7321,20 +7236,6 @@ impl CommandResultRenderer {
             }
             RpgMakerCommandOutput::Translate { output, .. } if output.summary.is_incomplete() => {
                 render_rpg_maker_incomplete_warning(output, localizer, stderr)?;
-            }
-            RpgMakerCommandOutput::WriteBack { output } => {
-                for diagnostic in output.manual_layout_diagnostics() {
-                    writeln!(
-                        stderr,
-                        "{}",
-                        localizer.format(UiMessage::DiagnosticWarningHeading)
-                    )?;
-                    writeln!(
-                        stderr,
-                        "{}",
-                        render_diagnostic_report(&diagnostic.diagnostic_report(), localizer)
-                    )?;
-                }
             }
             _ => {}
         }
@@ -7520,14 +7421,6 @@ mod command_result_renderer_tests {
     use std::fmt;
 
     use super::*;
-    use crate::project_name::ProjectName;
-    use crate::rpg_maker::MaxFullwidthChars;
-    use crate::rpg_maker::model::{LogicalTextLocation, TextUnitRole};
-    use crate::rpg_maker::text::{RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource};
-    use crate::rpg_maker::write_back::RpgMakerWriteBackSummary;
-    use crate::rpg_maker::write_back::planner::{
-        ManualLayoutDiagnostic, RpgMakerWriteBackLayoutRegion,
-    };
 
     #[derive(Debug)]
     struct TestFailure;
@@ -7658,55 +7551,6 @@ mod command_result_renderer_tests {
             "Finalization 外层必须保留类型化相关报告"
         );
         assert_eq!(finalization.failure_report().report().related().len(), 1);
-    }
-
-    #[test]
-    fn manual_publication_recovery_and_finalization_keep_typed_effects_in_command_report() {
-        let rollback = ProductionCommandError::manual(ManualCommandError::Document(
-            crate::manual::ManualDocumentError::PairedPublicationRollback {
-                operation: Box::new(crate::manual::ManualDocumentError::Write {
-                    path: PathBuf::from("ownership.jsonl"),
-                    source: io::Error::other("主失败原文"),
-                }),
-                failures: vec![crate::manual::ManualPairIoFailure::for_test(
-                    PathBuf::from("manual.toml"),
-                    io::Error::new(io::ErrorKind::PermissionDenied, "恢复失败原文"),
-                )],
-            },
-        ));
-        assert!(matches!(
-            rollback,
-            ProductionCommandError::RecoveryRequired(_)
-        ));
-        assert_eq!(
-            rollback.failure_report().report().effect(),
-            StateEffect::RecoveryRequired
-        );
-        assert_eq!(
-            rollback.failure_report().report().related()[0].relation(),
-            RelatedFailureRelation::Rollback
-        );
-
-        let finalization = ProductionCommandError::manual(ManualCommandError::Document(
-            crate::manual::ManualDocumentError::PairedPublicationFinalization {
-                failures: vec![crate::manual::ManualPairIoFailure::for_test(
-                    PathBuf::from(".manual.toml.backup"),
-                    io::Error::new(io::ErrorKind::PermissionDenied, "清理失败原文"),
-                )],
-            },
-        ));
-        assert!(matches!(
-            finalization,
-            ProductionCommandError::StateAppliedButFinalizationFailed(_)
-        ));
-        assert_eq!(
-            finalization.failure_report().report().effect(),
-            StateEffect::AppliedFinalizationFailed
-        );
-        assert_eq!(
-            finalization.failure_report().report().related()[0].relation(),
-            RelatedFailureRelation::Cleanup
-        );
     }
 
     #[test]
@@ -7927,59 +7771,6 @@ mod command_result_renderer_tests {
                 && diagnostic.effect() == StateEffect::RecoveryRequired
         }));
     }
-
-    #[test]
-    fn write_back_manual_layout_warning_contains_precise_location_role_region_and_width() {
-        let location = LogicalTextLocation::new(
-            RpgMakerLocation::value(
-                RpgMakerSource::map(7),
-                vec![
-                    RpgMakerLocationStep::key("events"),
-                    RpgMakerLocationStep::index(3),
-                ],
-            ),
-            TextUnitRole::DialogueBody,
-        );
-        let output = RpgMakerCommandOutput::WriteBack {
-            output: WriteBackOutput::for_test(
-                "manual-layout"
-                    .parse::<ProjectName>()
-                    .expect("项目名应有效"),
-                PathBuf::from("C:/project/write_back"),
-                RpgMakerWriteBackSummary {
-                    manual_layout_units: 1,
-                    ..RpgMakerWriteBackSummary::default()
-                },
-                vec![ManualLayoutDiagnostic::for_test(
-                    vec![location],
-                    RpgMakerWriteBackLayoutRegion::DialogueBody,
-                    MaxFullwidthChars::new(28).expect("宽度应有效"),
-                )],
-            ),
-        };
-        let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-
-        CommandResultRenderer::render_success(&output, &localizer, &mut stdout)
-            .expect("成功摘要应可写入");
-        CommandResultRenderer::render_success_warnings(&output, &localizer, &mut stderr)
-            .expect("人工布局警告应可写入");
-
-        let stdout = String::from_utf8(stdout).expect("stdout 应为 UTF-8");
-        let stderr = String::from_utf8(stderr).expect("stderr 应为 UTF-8");
-        let plain_stderr = stderr.replace(['\u{2068}', '\u{2069}'], "");
-        assert!(!stdout.contains("Map007"), "精确位置只应进入警告");
-        assert!(
-            plain_stderr.contains("对象：data/Map007.json:events[3]:dialogue_body"),
-            "{stderr}"
-        );
-        assert!(
-            plain_stderr.contains("region=dialogue_body; max_fullwidth_chars=28"),
-            "{stderr}"
-        );
-        assert!(!plain_stderr.contains("对象：rpg_maker_write_back_layout"));
-    }
 }
 
 #[cfg(test)]
@@ -7989,7 +7780,6 @@ mod init_entry_recovery_tests {
     use super::*;
     use crate::application::arguments::{InitArguments, ProjectArguments};
     use crate::language::LanguageId;
-    use crate::rpg_maker::MaxFullwidthChars;
     use crate::runtime::filesystem::{
         DirectoryPublisherConfig, SystemFileSystemConfig, TestPublishFaultAction,
         TestPublishFaultPoint, register_test_publish_faults,
@@ -8004,8 +7794,6 @@ mod init_entry_recovery_tests {
         game_root: Option<PathBuf>,
         include_settings: bool,
     ) -> ConfiguredInitCommand {
-        let width =
-            include_settings.then(|| MaxFullwidthChars::new(20).expect("测试显示宽度应有效"));
         ConfiguredInitCommand::for_test(
             InitArguments {
                 project: ProjectArguments {
@@ -8016,9 +7804,6 @@ mod init_entry_recovery_tests {
                     .then(|| "ja".parse::<LanguageId>().expect("测试原文语言应有效")),
                 target_language: include_settings
                     .then(|| "zh-Hans".parse::<LanguageId>().expect("测试译文语言应有效")),
-                dialogue_max_fullwidth_chars: width,
-                scrolling_text_max_fullwidth_chars: width,
-                help_description_max_fullwidth_chars: width,
             },
             projects_root,
             "mz",

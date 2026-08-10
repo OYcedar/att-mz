@@ -426,6 +426,8 @@ pub(crate) enum UiMessage<'a> {
     CliWriteBackAbout,
     CliManualAbout,
     CliManualExportAbout,
+    CliOwnershipExportAbout,
+    CliTranslationExportAbout,
     CliManualCheckAbout,
     CliManualApplyAbout,
     CliProjectLuaAbout,
@@ -433,9 +435,6 @@ pub(crate) enum UiMessage<'a> {
     CliInitPathHelp,
     CliSourceLanguageHelp,
     CliTargetLanguageHelp,
-    CliDialogueWidthHelp,
-    CliScrollingWidthHelp,
-    CliHelpWidthHelp,
     CliBuiltinHelp,
     CliRulesHelp,
     CliDialogueRulesHelp,
@@ -553,9 +552,6 @@ pub(crate) enum UiMessage<'a> {
     },
     ManualExported {
         entries: u64,
-        path: &'a str,
-    },
-    ManualOwnershipExported {
         path: &'a str,
     },
     ManualChecked {
@@ -695,20 +691,10 @@ pub(crate) enum UiMessage<'a> {
     ResultWriteBackSummary {
         translated: u64,
         original: u64,
-        auto_wrapped: u64,
-        breaks: u64,
-        indents: u64,
-        manual: u64,
     },
     ResultGenericWriteBackSummary {
         translated: u64,
         original: u64,
-    },
-    ResultSymbolRepairSummary {
-        attempted: u64,
-        repaired: u64,
-        skipped: u64,
-        replacements: u64,
     },
     ResultRunLog {
         path: &'a str,
@@ -841,6 +827,8 @@ impl UiMessage<'_> {
             Self::CliWriteBackAbout => "cli-write-back-about",
             Self::CliManualAbout => "cli-manual-about",
             Self::CliManualExportAbout => "cli-manual-export-about",
+            Self::CliOwnershipExportAbout => "cli-ownership-export-about",
+            Self::CliTranslationExportAbout => "cli-translation-export-about",
             Self::CliManualCheckAbout => "cli-manual-check-about",
             Self::CliManualApplyAbout => "cli-manual-apply-about",
             Self::CliProjectLuaAbout => "cli-project-lua-about",
@@ -848,9 +836,6 @@ impl UiMessage<'_> {
             Self::CliInitPathHelp => "cli-init-path-help",
             Self::CliSourceLanguageHelp => "cli-source-language-help",
             Self::CliTargetLanguageHelp => "cli-target-language-help",
-            Self::CliDialogueWidthHelp => "cli-dialogue-width-help",
-            Self::CliScrollingWidthHelp => "cli-scrolling-width-help",
-            Self::CliHelpWidthHelp => "cli-help-width-help",
             Self::CliBuiltinHelp => "cli-builtin-help",
             Self::CliRulesHelp => "cli-rules-help",
             Self::CliDialogueRulesHelp => "cli-dialogue-rules-help",
@@ -908,7 +893,6 @@ impl UiMessage<'_> {
             Self::DiagnosticPlaceholderRuleFile { .. } => "diagnostic-placeholder-rule-file",
             Self::DiagnosticPlaceholderRuleProject { .. } => "diagnostic-placeholder-rule-project",
             Self::ManualExported { .. } => "manual-exported",
-            Self::ManualOwnershipExported { .. } => "manual-ownership-exported",
             Self::ManualChecked { .. } => "manual-checked",
             Self::ManualApplied { .. } => "manual-applied",
             Self::ManualValue { .. } => "manual-value",
@@ -962,7 +946,6 @@ impl UiMessage<'_> {
             Self::ResultOutputDirectory { .. } => "result-output-directory",
             Self::ResultWriteBackSummary { .. } => "result-write-back-summary",
             Self::ResultGenericWriteBackSummary { .. } => "result-generic-write-back-summary",
-            Self::ResultSymbolRepairSummary { .. } => "result-symbol-repair-summary",
             Self::ResultRunLog { .. } => "result-run-log",
             Self::TranslateIncompleteObject { .. } => "translate-incomplete-object",
             Self::TranslateIncompleteRpgMakerReason { .. } => {
@@ -1144,17 +1127,9 @@ impl UiMessage<'_> {
             Self::ResultWriteBackSummary {
                 translated,
                 original,
-                auto_wrapped,
-                breaks,
-                indents,
-                manual,
             } => {
                 set_number(&mut arguments, "translated", translated);
                 set_number(&mut arguments, "original", original);
-                set_number(&mut arguments, "auto_wrapped", auto_wrapped);
-                set_number(&mut arguments, "breaks", breaks);
-                set_number(&mut arguments, "indents", indents);
-                set_number(&mut arguments, "manual", manual);
             }
             Self::ResultGenericWriteBackSummary {
                 translated,
@@ -1162,17 +1137,6 @@ impl UiMessage<'_> {
             } => {
                 set_number(&mut arguments, "translated", translated);
                 set_number(&mut arguments, "original", original);
-            }
-            Self::ResultSymbolRepairSummary {
-                attempted,
-                repaired,
-                skipped,
-                replacements,
-            } => {
-                set_number(&mut arguments, "attempted", attempted);
-                set_number(&mut arguments, "repaired", repaired);
-                set_number(&mut arguments, "skipped", skipped);
-                set_number(&mut arguments, "replacements", replacements);
             }
             Self::LogRunStarted { command }
             | Self::LogRunSucceeded { command }
@@ -1302,9 +1266,6 @@ impl UiMessage<'_> {
                 set_number(&mut arguments, "entries", entries);
                 set_text(&mut arguments, "path", path);
             }
-            Self::ManualOwnershipExported { path } => {
-                set_text(&mut arguments, "path", path);
-            }
             Self::ManualChecked {
                 valid,
                 unfilled,
@@ -1391,6 +1352,8 @@ impl UiMessage<'_> {
             | Self::CliWriteBackAbout
             | Self::CliManualAbout
             | Self::CliManualExportAbout
+            | Self::CliOwnershipExportAbout
+            | Self::CliTranslationExportAbout
             | Self::CliManualCheckAbout
             | Self::CliManualApplyAbout
             | Self::CliProjectLuaAbout
@@ -1398,9 +1361,6 @@ impl UiMessage<'_> {
             | Self::CliInitPathHelp
             | Self::CliSourceLanguageHelp
             | Self::CliTargetLanguageHelp
-            | Self::CliDialogueWidthHelp
-            | Self::CliScrollingWidthHelp
-            | Self::CliHelpWidthHelp
             | Self::CliBuiltinHelp
             | Self::CliRulesHelp
             | Self::CliDialogueRulesHelp
@@ -1678,7 +1638,6 @@ mod tests {
             "lock_cancelled",
             "lua_compilation_failed",
             "lua_execution_failed",
-            "manual_layout_required",
             "missing_required_value",
             "non_local_volume",
             "non_ntfs_volume",
@@ -1743,7 +1702,6 @@ mod tests {
                 "fix_input",
                 "fix_placeholder_rules",
                 "review_disabled_rules",
-                "adjust_manual_layout",
                 "check_path_and_permissions",
                 "check_project_state",
                 "resolve_contention",
@@ -1904,6 +1862,8 @@ mod tests {
             UiMessage::CliWriteBackAbout,
             UiMessage::CliManualAbout,
             UiMessage::CliManualExportAbout,
+            UiMessage::CliOwnershipExportAbout,
+            UiMessage::CliTranslationExportAbout,
             UiMessage::CliManualCheckAbout,
             UiMessage::CliManualApplyAbout,
             UiMessage::CliProjectLuaAbout,
@@ -1911,9 +1871,6 @@ mod tests {
             UiMessage::CliInitPathHelp,
             UiMessage::CliSourceLanguageHelp,
             UiMessage::CliTargetLanguageHelp,
-            UiMessage::CliDialogueWidthHelp,
-            UiMessage::CliScrollingWidthHelp,
-            UiMessage::CliHelpWidthHelp,
             UiMessage::CliBuiltinHelp,
             UiMessage::CliRulesHelp,
             UiMessage::CliDialogueRulesHelp,
@@ -1999,9 +1956,6 @@ mod tests {
             UiMessage::ManualExported {
                 entries: 2,
                 path: "manual.toml",
-            },
-            UiMessage::ManualOwnershipExported {
-                path: "ownership.jsonl",
             },
             UiMessage::ManualChecked {
                 valid: 1,
@@ -2141,20 +2095,10 @@ mod tests {
             UiMessage::ResultWriteBackSummary {
                 translated: 1,
                 original: 2,
-                auto_wrapped: 3,
-                breaks: 4,
-                indents: 5,
-                manual: 6,
             },
             UiMessage::ResultGenericWriteBackSummary {
                 translated: 1,
                 original: 2,
-            },
-            UiMessage::ResultSymbolRepairSummary {
-                attempted: 1,
-                repaired: 2,
-                skipped: 3,
-                replacements: 4,
             },
             UiMessage::ResultCancelled,
             UiMessage::ResultPlanSaved,

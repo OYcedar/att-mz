@@ -227,6 +227,9 @@ pub(crate) enum TranslationTaskRecordFinalState {
     UnavailableNoChanges {
         outcome: Arc<TranslationTaskOutcome>,
     },
+    UnavailableRejectedCommitted {
+        outcome: Arc<TranslationTaskOutcome>,
+    },
     ExecutionFailedNoChanges {
         diagnostic: DiagnosticReport,
     },
@@ -261,7 +264,8 @@ impl TranslationTaskRecordFinalState {
             Self::PartialCommitted { outcome } => {
                 matches!(outcome.as_ref(), TranslationTaskOutcome::Partial { .. })
             }
-            Self::UnavailableNoChanges { outcome } => {
+            Self::UnavailableNoChanges { outcome }
+            | Self::UnavailableRejectedCommitted { outcome } => {
                 matches!(outcome.as_ref(), TranslationTaskOutcome::Unavailable { .. })
             }
             Self::ExecutionFailedNoChanges { .. }
@@ -278,6 +282,7 @@ impl TranslationTaskRecordFinalState {
             Self::CompleteCommitted { outcome }
             | Self::PartialCommitted { outcome }
             | Self::UnavailableNoChanges { outcome }
+            | Self::UnavailableRejectedCommitted { outcome }
             | Self::CommitNotApplied { outcome, .. }
             | Self::CommitOutcomeUnknown { outcome, .. }
             | Self::NotCommittedAfterEarlierFailure { outcome, .. }
@@ -292,6 +297,7 @@ impl TranslationTaskRecordFinalState {
             Self::CompleteCommitted { .. } => "complete",
             Self::PartialCommitted { .. } => "partial",
             Self::UnavailableNoChanges { .. } => "unavailable",
+            Self::UnavailableRejectedCommitted { .. } => "unavailable",
             Self::ExecutionFailedNoChanges { .. } => "execution_failed",
             Self::CommitNotApplied {
                 phase: TranslationTaskCommitPhase::Preparation,

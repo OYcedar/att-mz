@@ -43,6 +43,12 @@ use crate::llm::{
 };
 use crate::rpg_maker::model::TextUnitContent;
 use crate::runtime::cpu::CpuExecutorUnavailable;
+#[cfg(test)]
+use crate::translation::candidate_validation::is_structural_blank;
+use crate::translation::candidate_validation::{
+    CandidateTextShape, ProvenInvariantViolation, ReviewFinding, ValidatedCandidate,
+    validate_candidate_text_with_cancellation,
+};
 use crate::translation::placeholder_projection::{
     LanguageTextProjectionError, PlaceholderBindingIndex, PlaceholderMultisetError,
     PlaceholderTextScan,
@@ -58,12 +64,14 @@ use crate::translation_protocol::{
 use super::pipeline::rpg_maker_diagnostic_unit;
 use super::pipeline::{
     AcceptedTranslationDecision, AppliedPlaceholder, ExpectedLineShape, ExpectedTranslationOutput,
-    NonEmptyTaskItems, PlaceholderRuleOrigin, RpgMakerExecutableTask,
-    RpgMakerTranslationExecutionProfile, RpgMakerTranslationTaskExecutor,
-    RpgMakerTranslationTaskIndex, TranslationPatch, TranslationProtocolDiagnostic,
-    TranslationTaskOutcome, TranslationTaskOutcomeContext, TranslationTaskUnavailableReason,
-    TranslationUnitRejectionReason, UnresolvedTranslationUnit,
+    NonEmptyTaskItems, PlaceholderRuleOrigin, RejectedTranslationCandidate,
+    RejectedTranslationTarget, RpgMakerExecutableTask, RpgMakerTranslationExecutionProfile,
+    RpgMakerTranslationTaskExecutor, RpgMakerTranslationTaskIndex, TranslationPatch,
+    TranslationProtocolDiagnostic, TranslationTaskOutcome, TranslationTaskOutcomeContext,
+    TranslationTaskUnavailableReason, TranslationUnitIdentity, TranslationUnitRejectionReason,
+    UnresolvedTranslationUnit,
 };
+use super::placeholder::PlaceholderProtectionError;
 use super::profile::{ResolvedRpgMakerTranslationResources, RpgMakerTranslationProfile};
 use super::task_record::{
     TranslationAssistantValueError, TranslationTaskExecution, TranslationTaskExecutionEvidence,
@@ -313,6 +321,7 @@ where
             task_index: task.index(),
             language_pair: task.language_pair().clone(),
             expected_outputs: task.shared_expected_outputs(),
+            semantics: task.shared_semantics(),
             attempt,
         };
         let resources = Arc::clone(&self.resources);
@@ -371,6 +380,7 @@ where
             task_index: task.index(),
             language_pair: task.language_pair().clone(),
             expected_outputs: task.shared_expected_outputs(),
+            semantics: task.shared_semantics(),
             attempt,
         };
         let resources = Arc::clone(&self.resources);
@@ -429,6 +439,9 @@ fn map_response_processing_error<C>(
         TranslationResponseTechnicalError::LanguageProjection { unit_id, source } => {
             TranslationTaskResponseProcessingError::LanguageProjection { unit_id, source }
         }
+        TranslationResponseTechnicalError::PlaceholderProtection { unit_id, source } => {
+            TranslationTaskResponseProcessingError::PlaceholderProtection { unit_id, source }
+        }
         TranslationResponseTechnicalError::InternalInvariant { invariant } => {
             TranslationTaskResponseProcessingError::InternalInvariant { invariant }
         }
@@ -447,6 +460,10 @@ pub(crate) enum TranslationTaskResponseProcessingError<C> {
     LanguageProjection {
         unit_id: TaskId,
         source: LanguageTextProjectionError,
+    },
+    PlaceholderProtection {
+        unit_id: TaskId,
+        source: PlaceholderProtectionError,
     },
     InternalInvariant {
         invariant: TranslationInternalInvariant,
@@ -467,6 +484,9 @@ where
             Self::LanguageProjection { source, .. } => {
                 write!(formatter, "译后语言投影失败：{source}")
             }
+            Self::PlaceholderProtection { source, .. } => {
+                write!(formatter, "译后 Placeholder 保护失败：{source}")
+            }
             Self::InternalInvariant { invariant } => {
                 write!(formatter, "翻译任务内部不变量已破坏：{invariant}")
             }
@@ -484,6 +504,7 @@ where
             Self::ScheduleCompute(source) => Some(source),
             Self::LanguageModule { source, .. } => Some(source),
             Self::LanguageProjection { source, .. } => Some(source),
+            Self::PlaceholderProtection { source, .. } => Some(source),
             Self::InternalInvariant { .. } => None,
         }
     }
@@ -521,6 +542,12 @@ where
                 unit_scope(*unit_id),
                 RpgMakerResponseProcessingProblem::LanguageProjection {
                     problem: response_language_projection_problem(source),
+                },
+            ),
+            Self::PlaceholderProtection { unit_id, source } => (
+                unit_scope(*unit_id),
+                RpgMakerResponseProcessingProblem::PlaceholderProtection {
+                    problem: source.diagnostic_issue(),
                 },
             ),
             Self::InternalInvariant { invariant } => (
@@ -698,6 +725,10 @@ enum TranslationResponseTechnicalError {
     LanguageProjection {
         unit_id: TaskId,
         source: LanguageTextProjectionError,
+    },
+    PlaceholderProtection {
+        unit_id: TaskId,
+        source: PlaceholderProtectionError,
     },
     InternalInvariant {
         invariant: TranslationInternalInvariant,
@@ -1139,6 +1170,7 @@ struct ResponseProcessingInput {
     task_index: RpgMakerTranslationTaskIndex,
     language_pair: LanguagePair,
     expected_outputs: Arc<[ExpectedTranslationOutput]>,
+    semantics: Arc<super::semantics::ResolvedTranslationSemantics>,
     attempt: NonZeroUsize,
 }
 
@@ -1166,10 +1198,8 @@ fn process_response(
             }
         }
     };
+    let non_stop_finish = finish_reason.non_stop();
     let mut diagnostics = Vec::new();
-    if let Some(reason) = finish_reason.non_stop() {
-        diagnostics.push(TranslationProtocolDiagnostic::NonStopFinish { reason });
-    }
 
     let parsed = match parse_model_response_with_cancellation(
         response.content(),
@@ -1192,11 +1222,12 @@ fn process_response(
                     let ParsedModelOutput {
                         canonical_id,
                         translation,
-                        ..
+                        candidate_json,
                     } = output;
                     acceptance_outputs.push(ModelOutputForAcceptance {
                         canonical_id,
                         translation,
+                        candidate_json,
                     });
                 }
                 let record = TranslationTaskResponseRecord::new(raw_assistant);
@@ -1211,11 +1242,12 @@ fn process_response(
                     let ParsedModelOutput {
                         canonical_id,
                         translation,
-                        ..
+                        candidate_json,
                     } = output;
                     acceptance_outputs.push(ModelOutputForAcceptance {
                         canonical_id,
                         translation,
+                        candidate_json,
                     });
                 }
                 (Ok(acceptance_outputs), None)
@@ -1291,6 +1323,12 @@ fn process_response(
             ));
         }
     };
+    if let Some(reason) = non_stop_finish {
+        diagnostics.push(TranslationProtocolDiagnostic::NonStopFinish {
+            reason,
+            finding: ReviewFinding::NonStopFinish,
+        });
+    }
 
     let mut expected_by_id = BTreeMap::new();
     for output in input.expected_outputs.iter() {
@@ -1340,18 +1378,25 @@ fn process_response(
             ));
             continue;
         }
-        let translation_lines = match candidates.pop().expect("唯一候选必须存在") {
+        let candidate = candidates.pop().expect("唯一候选必须存在");
+        let candidate_json = candidate.candidate_json;
+        let translation_lines = match candidate.translation {
             Ok(lines) => lines,
             Err(problem) => {
-                unresolved.push(unresolved_unit(
+                let reason = TranslationUnitRejectionReason::InvalidShape { problem };
+                unresolved.push(unresolved_unit_with_rejected_candidate(
                     expected,
-                    TranslationUnitRejectionReason::InvalidShape { problem },
+                    candidate_json,
+                    None,
+                    reason,
                 ));
                 continue;
             }
         };
+        let candidate_translation = translation_lines.clone();
         let acceptance = match accept_translation_lines_candidate_at_with_cancellation(
             expected.identity(),
+            input.semantics.as_ref(),
             expected.protected_text(),
             expected.line_shape(),
             expected.applied_placeholders(),
@@ -1374,9 +1419,26 @@ fn process_response(
             }
         };
         let translation = match acceptance {
-            Ok(TranslationContentAcceptance::Accepted(translation)) => translation,
+            Ok(TranslationContentAcceptance::Accepted {
+                translation,
+                reviews,
+            }) => {
+                for finding in reviews {
+                    diagnostics.push(TranslationProtocolDiagnostic::CandidateReview {
+                        id: expected.id(),
+                        unit: rpg_maker_diagnostic_unit(expected.identity()),
+                        finding,
+                    });
+                }
+                translation
+            }
             Ok(TranslationContentAcceptance::Rejected(reason)) => {
-                unresolved.push(unresolved_unit(expected, reason));
+                unresolved.push(unresolved_unit_with_rejected_candidate(
+                    expected,
+                    candidate_json,
+                    Some(candidate_translation),
+                    reason,
+                ));
                 continue;
             }
             Err(TranslationCandidateTechnicalError::LanguageModule(source)) => {
@@ -1397,6 +1459,15 @@ fn process_response(
                     response_record,
                 ));
             }
+            Err(TranslationCandidateTechnicalError::PlaceholderProtection(source)) => {
+                return Err(TranslationResponseTechnicalFailure::new(
+                    TranslationResponseTechnicalError::PlaceholderProtection {
+                        unit_id: expected.id(),
+                        source,
+                    },
+                    response_record,
+                ));
+            }
             Err(TranslationCandidateTechnicalError::InternalInvariant { invariant }) => {
                 return Err(TranslationResponseTechnicalFailure::new(
                     TranslationResponseTechnicalError::InternalInvariant { invariant },
@@ -1404,19 +1475,113 @@ fn process_response(
                 ));
             }
         };
+        let mut validated_propagation_indices =
+            Vec::with_capacity(expected.propagation_targets().len());
+        for (index, identity) in expected.propagation_targets().iter().enumerate() {
+            let matches = match input
+                .semantics
+                .candidate_placeholders_match_with_cancellation(
+                    identity,
+                    &translation,
+                    &mut ensure_running,
+                ) {
+                Ok(matches) => matches,
+                Err(ResponseProcessingCancelled) => {
+                    return Err(TranslationResponseTechnicalFailure::new(
+                        TranslationResponseTechnicalError::Cancelled,
+                        response_record,
+                    ));
+                }
+            };
+            match matches {
+                Ok(true) => {}
+                Ok(false) => {
+                    unresolved.push(unresolved_propagation_target_with_rejected_candidate(
+                        expected,
+                        identity,
+                        expected.propagation_state_contexts()[index],
+                        candidate_json.clone(),
+                        Some(candidate_translation.clone()),
+                        TranslationUnitRejectionReason::PlaceholderMismatch {
+                            token: String::new(),
+                        },
+                    ));
+                    continue;
+                }
+                Err(super::semantics::ResolvedTranslationSemanticError::ProtectPlaceholder(
+                    source,
+                )) => {
+                    return Err(TranslationResponseTechnicalFailure::new(
+                        TranslationResponseTechnicalError::PlaceholderProtection {
+                            unit_id: expected.id(),
+                            source,
+                        },
+                        response_record,
+                    ));
+                }
+                Err(super::semantics::ResolvedTranslationSemanticError::ProjectLanguageText(
+                    source,
+                )) => {
+                    return Err(TranslationResponseTechnicalFailure::new(
+                        TranslationResponseTechnicalError::LanguageProjection {
+                            unit_id: expected.id(),
+                            source,
+                        },
+                        response_record,
+                    ));
+                }
+                #[cfg(test)]
+                Err(super::semantics::ResolvedTranslationSemanticError::AcceptCandidate(
+                    source,
+                )) => match source {
+                    TranslationCandidateTechnicalError::LanguageModule(source) => {
+                        return Err(TranslationResponseTechnicalFailure::new(
+                            TranslationResponseTechnicalError::LanguageModule {
+                                unit_id: expected.id(),
+                                source,
+                            },
+                            response_record,
+                        ));
+                    }
+                    TranslationCandidateTechnicalError::LanguageProjection(source) => {
+                        return Err(TranslationResponseTechnicalFailure::new(
+                            TranslationResponseTechnicalError::LanguageProjection {
+                                unit_id: expected.id(),
+                                source,
+                            },
+                            response_record,
+                        ));
+                    }
+                    TranslationCandidateTechnicalError::PlaceholderProtection(source) => {
+                        return Err(TranslationResponseTechnicalFailure::new(
+                            TranslationResponseTechnicalError::PlaceholderProtection {
+                                unit_id: expected.id(),
+                                source,
+                            },
+                            response_record,
+                        ));
+                    }
+                    TranslationCandidateTechnicalError::InternalInvariant { invariant } => {
+                        return Err(TranslationResponseTechnicalFailure::new(
+                            TranslationResponseTechnicalError::InternalInvariant { invariant },
+                            response_record,
+                        ));
+                    }
+                },
+            }
+            validated_propagation_indices.push(index);
+        }
         let translation_state = expected.state_context().finish(&translation);
-        let mut propagation_targets = Vec::with_capacity(expected.propagation_targets().len());
-        for (identity, state_context) in expected
-            .propagation_targets()
-            .iter()
-            .zip(expected.propagation_state_contexts().iter().copied())
-        {
+        let mut propagation_targets = Vec::with_capacity(validated_propagation_indices.len());
+        for index in validated_propagation_indices {
             if let Err(ResponseProcessingCancelled) = ensure_running() {
                 return Err(TranslationResponseTechnicalFailure::new(
                     TranslationResponseTechnicalError::Cancelled,
                     response_record,
                 ));
             }
+            let identity = &expected.propagation_targets()[index];
+            let state_context = expected.propagation_state_contexts()[index];
             propagation_targets.push(super::pipeline::TranslationPropagationTarget::new(
                 identity.clone(),
                 state_context,
@@ -1495,63 +1660,73 @@ fn validate_translation_lines_with_cancellation<E>(
     mut ensure_running: impl FnMut() -> Result<(), E>,
 ) -> Result<Result<(), TranslationUnitRejectionReason>, E> {
     ensure_running()?;
-    if let ExpectedLineShape::Aligned(expected) = shape
-        && lines.len() != expected.get()
-    {
-        return Ok(Err(TranslationUnitRejectionReason::LineCountMismatch {
-            expected: expected.get(),
-            actual: lines.len(),
-        }));
-    }
-    for (line_index, line) in lines.iter().enumerate() {
-        if response_text_contains_invalid_line_character_with_cancellation(
-            line,
-            &mut ensure_running,
-        )? {
-            return Ok(Err(TranslationUnitRejectionReason::InvalidLineText {
+    let source_lines = match identity.source_content() {
+        TextUnitContent::Value(value) => std::slice::from_ref(value),
+        TextUnitContent::Lines(lines) => lines.as_slice(),
+    };
+    let text_shape = match shape {
+        ExpectedLineShape::Reflow => CandidateTextShape::Free,
+        ExpectedLineShape::Aligned(_) => CandidateTextShape::Fixed,
+    };
+    Ok(validate_candidate_text_with_cancellation(
+        source_lines,
+        lines,
+        text_shape,
+        &mut ensure_running,
+    )?
+    .map_err(rpg_maker_text_violation))
+}
+
+fn rpg_maker_text_violation(violation: ProvenInvariantViolation) -> TranslationUnitRejectionReason {
+    match violation {
+        ProvenInvariantViolation::LineCountMismatch { expected, actual } => {
+            TranslationUnitRejectionReason::LineCountMismatch { expected, actual }
+        }
+        ProvenInvariantViolation::InvalidLineText { line_index } => {
+            TranslationUnitRejectionReason::InvalidLineText { line_index }
+        }
+        ProvenInvariantViolation::ContainsByteOrderMark { .. } => {
+            TranslationUnitRejectionReason::ContainsByteOrderMark
+        }
+        ProvenInvariantViolation::BlankTranslation => {
+            TranslationUnitRejectionReason::BlankTranslation
+        }
+        ProvenInvariantViolation::FixedBlankSlotChanged { line_index } => {
+            TranslationUnitRejectionReason::BlankLineMismatch {
                 line_index,
-            }));
+                expected_blank: true,
+            }
+        }
+        ProvenInvariantViolation::FixedNonBlankSlotEmptied { line_index } => {
+            TranslationUnitRejectionReason::BlankLineMismatch {
+                line_index,
+                expected_blank: false,
+            }
+        }
+        ProvenInvariantViolation::PlaceholderMismatch => {
+            TranslationUnitRejectionReason::PlaceholderMismatch {
+                token: String::new(),
+            }
+        }
+        ProvenInvariantViolation::UnexpectedPlaceholderToken => {
+            TranslationUnitRejectionReason::UnexpectedPlaceholderToken {
+                token: String::new(),
+            }
+        }
+        ProvenInvariantViolation::PlaceholderBoundaryChanged => {
+            TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous {
+                original: String::new(),
+            }
+        }
+        ProvenInvariantViolation::ReservedPlaceholderToken => {
+            TranslationUnitRejectionReason::UnexpectedPlaceholderToken {
+                token: String::new(),
+            }
+        }
+        ProvenInvariantViolation::InvalidCandidateShape => {
+            TranslationUnitRejectionReason::InvalidResponse
         }
     }
-    match shape {
-        ExpectedLineShape::Reflow => {
-            let mut blank = true;
-            for line in lines {
-                ensure_running()?;
-                if !response_text_is_whitespace_with_cancellation(line, &mut ensure_running)? {
-                    blank = false;
-                    break;
-                }
-            }
-            if blank {
-                return Ok(Err(TranslationUnitRejectionReason::BlankTranslation));
-            }
-        }
-        ExpectedLineShape::Aligned(_) => {
-            let source_lines = match identity.source_content() {
-                TextUnitContent::Value(value) => std::slice::from_ref(value),
-                TextUnitContent::Lines(lines) => lines.as_slice(),
-            };
-            for (line_index, (source, translation)) in source_lines.iter().zip(lines).enumerate() {
-                ensure_running()?;
-                let expected_blank =
-                    response_text_is_whitespace_with_cancellation(source, &mut ensure_running)?;
-                let mismatched = if expected_blank {
-                    !translation.is_empty()
-                } else {
-                    response_text_is_whitespace_with_cancellation(translation, &mut ensure_running)?
-                };
-                if mismatched {
-                    return Ok(Err(TranslationUnitRejectionReason::BlankLineMismatch {
-                        line_index,
-                        expected_blank,
-                    }));
-                }
-            }
-        }
-    }
-    ensure_running()?;
-    Ok(Ok(()))
 }
 
 fn translation_content_with_cancellation<E>(
@@ -1592,13 +1767,17 @@ fn translation_content_with_cancellation<E>(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TranslationContentAcceptance {
-    Accepted(TextUnitContent),
+    Accepted {
+        translation: TextUnitContent,
+        reviews: Vec<ReviewFinding>,
+    },
     Rejected(TranslationUnitRejectionReason),
 }
 
 #[allow(clippy::too_many_arguments)]
 fn accept_translation_lines_candidate_at_with_cancellation(
     identity: &super::pipeline::TranslationUnitIdentity,
+    semantics: &super::semantics::ResolvedTranslationSemantics,
     protected_text: &str,
     line_shape: ExpectedLineShape,
     placeholders: &[AppliedPlaceholder],
@@ -1633,9 +1812,47 @@ fn accept_translation_lines_candidate_at_with_cancellation(
         invariant_location,
         &mut ensure_running,
     )? {
-        Ok(lines) => Ok(Ok(TranslationContentAcceptance::Accepted(
-            translation_content_with_cancellation(identity, lines, &mut ensure_running)?,
-        ))),
+        Ok(lines) => {
+            let (lines, reviews) = lines.into_parts();
+            let translation =
+                translation_content_with_cancellation(identity, lines, &mut ensure_running)?;
+            match semantics.candidate_placeholders_match_with_cancellation(
+                identity,
+                &translation,
+                &mut ensure_running,
+            )? {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Ok(Ok(TranslationContentAcceptance::Rejected(
+                        TranslationUnitRejectionReason::PlaceholderMismatch {
+                            token: String::new(),
+                        },
+                    )));
+                }
+                Err(super::semantics::ResolvedTranslationSemanticError::ProtectPlaceholder(
+                    source,
+                )) => {
+                    return Ok(Err(
+                        TranslationCandidateTechnicalError::PlaceholderProtection(source),
+                    ));
+                }
+                Err(super::semantics::ResolvedTranslationSemanticError::ProjectLanguageText(
+                    source,
+                )) => {
+                    return Ok(Err(TranslationCandidateTechnicalError::LanguageProjection(
+                        source,
+                    )));
+                }
+                #[cfg(test)]
+                Err(super::semantics::ResolvedTranslationSemanticError::AcceptCandidate(
+                    source,
+                )) => return Ok(Err(source)),
+            }
+            Ok(Ok(TranslationContentAcceptance::Accepted {
+                translation,
+                reviews,
+            }))
+        }
         Err(TranslationCandidateValidationError::Rejected(reason)) => {
             Ok(Ok(TranslationContentAcceptance::Rejected(reason)))
         }
@@ -1657,15 +1874,23 @@ fn accept_translation_lines_candidate_at_with_cancellation(
 struct ParsedModelOutput {
     canonical_id: Option<TaskId>,
     translation: Result<Vec<String>, TranslationAssistantValueError>,
+    candidate_json: String,
 }
 
 #[derive(Debug)]
 struct ModelOutputForAcceptance {
     canonical_id: Option<TaskId>,
     translation: Result<Vec<String>, TranslationAssistantValueError>,
+    candidate_json: String,
 }
 
-type ModelOutputsById = BTreeMap<TaskId, Vec<Result<Vec<String>, TranslationAssistantValueError>>>;
+#[derive(Debug)]
+struct ModelCandidate {
+    translation: Result<Vec<String>, TranslationAssistantValueError>,
+    candidate_json: String,
+}
+
+type ModelOutputsById = BTreeMap<TaskId, Vec<ModelCandidate>>;
 
 fn append_response_processing_text_with_cancellation<E>(
     output: &mut String,
@@ -1694,42 +1919,6 @@ fn clone_response_processing_text_with_cancellation<E>(
     let mut cloned = String::with_capacity(text.len());
     append_response_processing_text_with_cancellation(&mut cloned, text, ensure_running)?;
     Ok(cloned)
-}
-
-fn response_text_contains_invalid_line_character_with_cancellation<E>(
-    text: &str,
-    ensure_running: &mut impl FnMut() -> Result<(), E>,
-) -> Result<bool, E> {
-    let mut next_check = 0_usize;
-    for (byte_offset, character) in text.char_indices() {
-        if byte_offset >= next_check {
-            ensure_running()?;
-            next_check = byte_offset.saturating_add(RESPONSE_PROCESSING_CANCELLATION_CHECK_BYTES);
-        }
-        if matches!(character, '\r' | '\n' | '\0') {
-            return Ok(true);
-        }
-    }
-    ensure_running()?;
-    Ok(false)
-}
-
-fn response_text_is_whitespace_with_cancellation<E>(
-    text: &str,
-    ensure_running: &mut impl FnMut() -> Result<(), E>,
-) -> Result<bool, E> {
-    let mut next_check = 0_usize;
-    for (byte_offset, character) in text.char_indices() {
-        if byte_offset >= next_check {
-            ensure_running()?;
-            next_check = byte_offset.saturating_add(RESPONSE_PROCESSING_CANCELLATION_CHECK_BYTES);
-        }
-        if !character.is_whitespace() {
-            return Ok(false);
-        }
-    }
-    ensure_running()?;
-    Ok(true)
 }
 
 fn contains_reserved_placeholder_prefix_with_cancellation<E>(
@@ -1779,7 +1968,10 @@ fn collect_model_outputs_with_cancellation<E>(
             diagnostics.push(TranslationProtocolDiagnostic::UnknownId { item_index, id });
             continue;
         }
-        by_id.entry(id).or_default().push(output.translation);
+        by_id.entry(id).or_default().push(ModelCandidate {
+            translation: output.translation,
+            candidate_json: output.candidate_json,
+        });
     }
     ensure_running()?;
     Ok(by_id)
@@ -1826,12 +2018,17 @@ fn parse_model_response_with_cancellation<E>(
     let mut outputs = Vec::with_capacity(entries.len());
     for entry in entries {
         ensure_running()?;
+        let candidate_json = clone_response_processing_text_with_cancellation(
+            entry.raw_value().get(),
+            &mut ensure_running,
+        )?;
         let decoded = entry.decode_translation_value_with_cancellation(&mut ensure_running)?;
         let translation = translation_lines_from_decoded_value(decoded);
         let (_, canonical_id) = entry.into_parts();
         outputs.push(ParsedModelOutput {
             canonical_id,
             translation,
+            candidate_json,
         });
     }
     ensure_running()?;
@@ -1920,6 +2117,121 @@ fn unresolved_unit(
     )
 }
 
+fn unresolved_unit_with_rejected_candidate(
+    expected: &ExpectedTranslationOutput,
+    candidate_json: String,
+    translation: Option<Vec<String>>,
+    reason: TranslationUnitRejectionReason,
+) -> UnresolvedTranslationUnit {
+    let violation = proven_violation(&reason, translation.as_deref())
+        .expect("唯一绑定候选的内容拒绝必须属于硬不变量闭集");
+    let mut targets = Vec::with_capacity(1 + expected.propagation_targets().len());
+    targets.push(RejectedTranslationTarget::new(
+        expected.identity().clone(),
+        expected
+            .state_context()
+            .finish(expected.identity().source_content()),
+    ));
+    for (identity, state_context) in expected
+        .propagation_targets()
+        .iter()
+        .zip(expected.propagation_state_contexts().iter().copied())
+    {
+        targets.push(RejectedTranslationTarget::new(
+            identity.clone(),
+            state_context.finish(identity.source_content()),
+        ));
+    }
+    UnresolvedTranslationUnit::with_rejected_candidate(
+        expected.id(),
+        rpg_maker_diagnostic_unit(expected.identity()),
+        reason,
+        RejectedTranslationCandidate::new(candidate_json, translation, violation, targets),
+    )
+}
+
+fn unresolved_propagation_target_with_rejected_candidate(
+    expected: &ExpectedTranslationOutput,
+    identity: &TranslationUnitIdentity,
+    state_context: super::pipeline::TranslationStateContext,
+    candidate_json: String,
+    translation: Option<Vec<String>>,
+    reason: TranslationUnitRejectionReason,
+) -> UnresolvedTranslationUnit {
+    let violation = proven_violation(&reason, translation.as_deref())
+        .expect("传播目标的候选内容拒绝必须属于硬不变量闭集");
+    UnresolvedTranslationUnit::with_rejected_candidate(
+        expected.id(),
+        rpg_maker_diagnostic_unit(identity),
+        reason,
+        RejectedTranslationCandidate::new(
+            candidate_json,
+            translation,
+            violation,
+            vec![RejectedTranslationTarget::new(
+                identity.clone(),
+                state_context.finish(identity.source_content()),
+            )],
+        ),
+    )
+}
+
+fn proven_violation(
+    reason: &TranslationUnitRejectionReason,
+    translation: Option<&[String]>,
+) -> Option<ProvenInvariantViolation> {
+    Some(match reason {
+        TranslationUnitRejectionReason::Missing
+        | TranslationUnitRejectionReason::Duplicate
+        | TranslationUnitRejectionReason::InvalidResponse => return None,
+        TranslationUnitRejectionReason::InvalidShape { .. } => {
+            ProvenInvariantViolation::InvalidCandidateShape
+        }
+        TranslationUnitRejectionReason::LineCountMismatch { expected, actual } => {
+            ProvenInvariantViolation::LineCountMismatch {
+                expected: *expected,
+                actual: *actual,
+            }
+        }
+        TranslationUnitRejectionReason::InvalidLineText { line_index } => {
+            ProvenInvariantViolation::InvalidLineText {
+                line_index: *line_index,
+            }
+        }
+        TranslationUnitRejectionReason::BlankLineMismatch {
+            line_index,
+            expected_blank: true,
+        } => ProvenInvariantViolation::FixedBlankSlotChanged {
+            line_index: *line_index,
+        },
+        TranslationUnitRejectionReason::BlankLineMismatch {
+            line_index,
+            expected_blank: false,
+        } => ProvenInvariantViolation::FixedNonBlankSlotEmptied {
+            line_index: *line_index,
+        },
+        TranslationUnitRejectionReason::BlankTranslation => {
+            ProvenInvariantViolation::BlankTranslation
+        }
+        TranslationUnitRejectionReason::ContainsByteOrderMark => {
+            ProvenInvariantViolation::ContainsByteOrderMark {
+                line_index: translation
+                    .and_then(|lines| lines.iter().position(|line| line.contains('\u{feff}')))
+                    .unwrap_or_default(),
+            }
+        }
+        TranslationUnitRejectionReason::PlaceholderMismatch { .. } => {
+            ProvenInvariantViolation::PlaceholderMismatch
+        }
+        TranslationUnitRejectionReason::UnexpectedPlaceholderToken { .. } => {
+            ProvenInvariantViolation::UnexpectedPlaceholderToken
+        }
+        TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous { .. } => {
+            ProvenInvariantViolation::PlaceholderBoundaryChanged
+        }
+    })
+}
+
 fn unresolved_all(
     expected_outputs: &[ExpectedTranslationOutput],
     reason: TranslationUnitRejectionReason,
@@ -1952,7 +2264,7 @@ fn validate_and_restore_translation_lines(
     placeholders: &[AppliedPlaceholder],
     language_analysis: &crate::language::LanguageAnalysis,
     language_module: &dyn LanguageModule,
-) -> Result<Vec<String>, TranslationCandidateValidationError> {
+) -> Result<ValidatedCandidate<Vec<String>>, TranslationCandidateValidationError> {
     let placeholder_bindings = PlaceholderBindingIndex::new(placeholders)
         .map_err(TranslationCandidateValidationError::LanguageProjection)?;
     match validate_and_restore_translation_lines_at_with_cancellation(
@@ -1988,7 +2300,10 @@ fn validate_and_restore_translation_lines_at_with_cancellation(
     contract: TranslationLinesValidationContract<'_>,
     invariant_location: TranslationCandidateInvariantLocation,
     mut ensure_running: impl FnMut() -> Result<(), ResponseProcessingCancelled>,
-) -> Result<Result<Vec<String>, TranslationCandidateValidationError>, ResponseProcessingCancelled> {
+) -> Result<
+    Result<ValidatedCandidate<Vec<String>>, TranslationCandidateValidationError>,
+    ResponseProcessingCancelled,
+> {
     let TranslationLinesValidationContract {
         protected_text,
         line_shape,
@@ -2136,16 +2451,7 @@ fn validate_and_restore_translation_lines_at_with_cancellation(
             Err(LanguageOperationCancelled) => return Err(ResponseProcessingCancelled),
         }
     };
-    if let Some(residual) = residual {
-        return Ok(Err(TranslationCandidateValidationError::Rejected(
-            TranslationUnitRejectionReason::SourceResidual {
-                fragment: clone_response_processing_text_with_cancellation(
-                    residual.fragment(),
-                    &mut ensure_running,
-                )?,
-            },
-        )));
-    }
+    let review = residual.is_some().then_some(ReviewFinding::SourceResidual);
     let mut restored = Vec::with_capacity(lines.len());
     let mut segment_offset = 0;
     for (line_index, projection) in line_projections.iter().enumerate() {
@@ -2230,7 +2536,10 @@ fn validate_and_restore_translation_lines_at_with_cancellation(
         }
     }
     ensure_running()?;
-    Ok(Ok(restored))
+    Ok(Ok(match review {
+        Some(finding) => ValidatedCandidate::with_review(restored, finding),
+        None => ValidatedCandidate::clean(restored),
+    }))
 }
 
 #[cfg(test)]
@@ -2239,7 +2548,7 @@ fn validate_and_restore_translation(
     placeholders: &[AppliedPlaceholder],
     language_analysis: &crate::language::LanguageAnalysis,
     language_module: &dyn LanguageModule,
-) -> Result<String, TranslationCandidateValidationError> {
+) -> Result<ValidatedCandidate<String>, TranslationCandidateValidationError> {
     validate_and_restore_translation_at(
         translation,
         placeholders,
@@ -2256,7 +2565,7 @@ fn validate_and_restore_translation_at(
     language_analysis: &crate::language::LanguageAnalysis,
     language_module: &dyn LanguageModule,
     invariant_location: TranslationCandidateInvariantLocation,
-) -> Result<String, TranslationCandidateValidationError> {
+) -> Result<ValidatedCandidate<String>, TranslationCandidateValidationError> {
     let placeholder_bindings = PlaceholderBindingIndex::new(placeholders)
         .map_err(TranslationCandidateValidationError::LanguageProjection)?;
     let initial_scan = placeholder_bindings.scan(&translation);
@@ -2294,16 +2603,11 @@ fn validate_and_restore_translation_at(
         .map_err(TranslationCandidateValidationError::LanguageProjection)?;
     let normalized = normalize_language_text(projected.language_text())
         .map_err(TranslationCandidateValidationError::Rejected)?;
-    if let Some(residual) = language_module
+    let review = language_module
         .find_source_residual(language_analysis, &normalized)
         .map_err(TranslationCandidateValidationError::LanguageModule)?
-    {
-        return Err(TranslationCandidateValidationError::Rejected(
-            TranslationUnitRejectionReason::SourceResidual {
-                fragment: residual.fragment().to_owned(),
-            },
-        ));
-    }
+        .is_some()
+        .then_some(ReviewFinding::SourceResidual);
     let restored = placeholder_bindings
         .rebuild_original(&projected, &normalized)
         .map_err(TranslationCandidateValidationError::LanguageProjection)?;
@@ -2314,7 +2618,10 @@ fn validate_and_restore_translation_at(
             },
         });
     }
-    Ok(restored)
+    Ok(match review {
+        Some(finding) => ValidatedCandidate::with_review(restored, finding),
+        None => ValidatedCandidate::clean(restored),
+    })
 }
 
 #[cfg(test)]
@@ -2324,7 +2631,7 @@ pub(super) fn accept_prepared_translation_candidate(
     language_analysis: &crate::language::LanguageAnalysis,
     language_module: &dyn LanguageModule,
 ) -> Result<super::semantics::PreparedTranslationAcceptance, TranslationCandidateTechnicalError> {
-    if translation.trim().is_empty() {
+    if is_structural_blank(&translation) {
         return Ok(super::semantics::PreparedTranslationAcceptance::Rejected(
             super::semantics::PreparedTranslationRejection::Candidate(
                 TranslationUnitRejectionReason::BlankTranslation,
@@ -2349,7 +2656,7 @@ pub(super) fn accept_prepared_translation_candidate(
         language_module,
     ) {
         Ok(translation) => Ok(super::semantics::PreparedTranslationAcceptance::Accepted(
-            translation,
+            translation.into_parts().0,
         )),
         Err(TranslationCandidateValidationError::Rejected(reason)) => {
             Ok(super::semantics::PreparedTranslationAcceptance::Rejected(
@@ -2372,6 +2679,7 @@ pub(super) fn accept_prepared_translation_candidate(
 pub(crate) enum TranslationCandidateTechnicalError {
     LanguageModule(LanguageModuleError),
     LanguageProjection(LanguageTextProjectionError),
+    PlaceholderProtection(PlaceholderProtectionError),
     InternalInvariant {
         invariant: TranslationInternalInvariant,
     },
@@ -2382,6 +2690,9 @@ impl fmt::Display for TranslationCandidateTechnicalError {
         match self {
             Self::LanguageModule(source) => write!(formatter, "语言模块失败：{source}"),
             Self::LanguageProjection(source) => write!(formatter, "语言投影失败：{source}"),
+            Self::PlaceholderProtection(source) => {
+                write!(formatter, "Placeholder 保护失败：{source}")
+            }
             Self::InternalInvariant { invariant } => {
                 write!(formatter, "翻译候选内部不变量已破坏：{invariant}")
             }
@@ -2394,6 +2705,7 @@ impl Error for TranslationCandidateTechnicalError {
         match self {
             Self::LanguageModule(source) => Some(source),
             Self::LanguageProjection(source) => Some(source),
+            Self::PlaceholderProtection(source) => Some(source),
             Self::InternalInvariant { .. } => None,
         }
     }
@@ -2419,11 +2731,7 @@ fn normalize_language_text(
             }
         }
     }
-    let normalized = LanguageText::new(segments);
-    if !normalized.has_non_whitespace_natural_text() {
-        return Err(TranslationUnitRejectionReason::NoNaturalLanguageText);
-    }
-    Ok(normalized)
+    Ok(LanguageText::new(segments))
 }
 
 fn normalize_language_text_with_cancellation<E>(
@@ -2479,19 +2787,6 @@ fn normalize_language_text_with_cancellation<E>(
         }
     }
     let normalized = LanguageText::new_with_cancellation(segments, &mut ensure_running)?;
-    let mut has_non_whitespace = false;
-    for segment in normalized.segments() {
-        ensure_running()?;
-        if let LanguageTextSegment::NaturalText(text) = segment
-            && !response_text_is_whitespace_with_cancellation(text, &mut ensure_running)?
-        {
-            has_non_whitespace = true;
-            break;
-        }
-    }
-    if !has_non_whitespace {
-        return Ok(Err(TranslationUnitRejectionReason::NoNaturalLanguageText));
-    }
     ensure_running()?;
     Ok(Ok(normalized))
 }
@@ -3078,6 +3373,9 @@ fn multiset_rejection(error: PlaceholderMultisetError) -> TranslationUnitRejecti
             TranslationUnitRejectionReason::PlaceholderMismatch {
                 token: actual_token,
             }
+        }
+        PlaceholderMultisetError::WrapperTopologyChanged { token } => {
+            TranslationUnitRejectionReason::PlaceholderMismatch { token }
         }
     }
 }
@@ -4301,7 +4599,7 @@ mod tests {
             TranslationUnitRejectionReason::ContainsByteOrderMark
         ));
 
-        let no_natural = processor
+        let opaque_only = processor
             .process(
                 &task(),
                 LlmResponse::new(
@@ -4311,10 +4609,10 @@ mod tests {
                 1,
             )
             .await
-            .expect("只有占位符和空白属于当前 ID 的正常拒绝");
+            .expect("只有占位符和符号仍可能是合法界面文本");
         assert!(matches!(
-            no_natural.unresolved()[0].reason(),
-            TranslationUnitRejectionReason::NoNaturalLanguageText
+            opaque_only,
+            TranslationTaskOutcome::Complete { .. }
         ));
     }
 
@@ -4671,7 +4969,9 @@ mod tests {
             &japanese_analysis(),
             module.as_ref(),
         )
-        .expect("自由断行只约束整个单元的占位符集合");
+        .expect("自由断行只约束整个单元的占位符集合")
+        .into_parts()
+        .0;
 
         assert_eq!(restored, ["第一行", "第二行\\N[1]"]);
     }
@@ -4759,7 +5059,9 @@ mod tests {
             &analysis,
             module.as_ref(),
         )
-        .expect("合格译文应保持原样，并恢复源 token 顺序");
+        .expect("合格译文应保持原样，并恢复源 token 顺序")
+        .into_parts()
+        .0;
 
         assert_eq!(
             restored,
@@ -4793,18 +5095,20 @@ mod tests {
 
         assert!(matches!(&result, TranslationTaskOutcome::Partial { .. }));
         assert_eq!(result.attempts().get(), 2);
-        assert_eq!(result.accepted().len(), 1);
-        assert_eq!(result.unresolved().len(), 5);
+        assert_eq!(result.accepted().len(), 2);
+        assert_eq!(result.unresolved().len(), 4);
         assert_eq!(result.unresolved()[0].id(), task_id(1));
         assert!(matches!(
             result.unresolved()[0].reason(),
             TranslationUnitRejectionReason::Duplicate
         ));
+        assert!(result.unresolved()[0].rejected_candidate().is_none());
         assert_eq!(result.unresolved()[1].id(), task_id(2));
         assert!(matches!(
             result.unresolved()[1].reason(),
             TranslationUnitRejectionReason::Missing
         ));
+        assert!(result.unresolved()[1].rejected_candidate().is_none());
         assert_eq!(result.unresolved()[2].id(), task_id(3));
         assert!(matches!(
             result.unresolved()[2].reason(),
@@ -4813,27 +5117,42 @@ mod tests {
                 expected_blank: false
             }
         ));
+        let blank = result.unresolved()[2]
+            .rejected_candidate()
+            .expect("唯一绑定的空译文必须保存为 Rejected");
+        assert_eq!(blank.candidate_json(), r#"[""]"#);
+        assert_eq!(blank.translation(), Some([String::new()].as_slice()));
+        assert_eq!(
+            blank.violation(),
+            &ProvenInvariantViolation::FixedNonBlankSlotEmptied { line_index: 0 }
+        );
         assert_eq!(result.unresolved()[3].id(), task_id(4));
         assert!(matches!(
             result.unresolved()[3].reason(),
             TranslationUnitRejectionReason::PlaceholderMismatch { .. }
         ));
-        assert_eq!(result.unresolved()[4].id(), task_id(5));
-        assert!(matches!(
-            result.unresolved()[4].reason(),
-            TranslationUnitRejectionReason::SourceResidual { .. }
-        ));
+        assert!(result.unresolved()[3].rejected_candidate().is_some());
+        assert_eq!(result.accepted()[1].id(), task_id(5));
         assert!(result.diagnostics().iter().any(|diagnostic| matches!(
             diagnostic,
             TranslationProtocolDiagnostic::NonStopFinish {
-                reason: RpgMakerModelNonStopFinishReason::Length
+                reason: RpgMakerModelNonStopFinishReason::Length,
+                ..
             }
         )));
         assert!(result.diagnostics().iter().any(|diagnostic| matches!(
             diagnostic,
             TranslationProtocolDiagnostic::UnknownId { id, .. } if *id == task_id(99)
         )));
-        assert_eq!(result.diagnostics().len(), 2);
+        assert!(result.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            TranslationProtocolDiagnostic::CandidateReview {
+                id,
+                finding: ReviewFinding::SourceResidual,
+                ..
+            } if *id == task_id(5)
+        )));
+        assert_eq!(result.diagnostics().len(), 3);
     }
 
     #[tokio::test]
@@ -4868,6 +5187,15 @@ mod tests {
                 problem: TranslationAssistantValueError::NonStringItem { item }
             } if *item == NonZeroUsize::MIN
         ));
+        let rejected = result.unresolved()[0]
+            .rejected_candidate()
+            .expect("唯一 ID 的非法值形状必须保存精确候选");
+        assert_eq!(rejected.candidate_json(), "[123]");
+        assert_eq!(rejected.translation(), None);
+        assert_eq!(
+            rejected.violation(),
+            &ProvenInvariantViolation::InvalidCandidateShape
+        );
         assert!(result.diagnostics().iter().any(|diagnostic| matches!(
             diagnostic,
             TranslationProtocolDiagnostic::InvalidId { .. }

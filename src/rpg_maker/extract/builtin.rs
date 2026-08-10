@@ -28,6 +28,7 @@ use crate::rpg_maker::semantic_order::{
     RpgMakerSemanticOrderKey, RpgMakerSemanticOrderProjectionError,
 };
 use crate::rpg_maker::text::MapId;
+use crate::translation::candidate_validation::is_structural_blank;
 
 use super::document::{
     DocumentReadProgress, RpgMakerDocumentId, RpgMakerDocumentSelection,
@@ -1488,7 +1489,7 @@ fn project_mz_dialogue(
         None => None,
         Some(value) => {
             let speaker = expect_string(value, &speaker_location)?;
-            if speaker.trim().is_empty() {
+            if is_structural_blank(speaker) {
                 None
             } else {
                 units.push(ExtractedTextUnit::projected(
@@ -1503,7 +1504,7 @@ fn project_mz_dialogue(
 
     let has_body = lines
         .iter()
-        .any(|line| !line.expected_raw().trim().is_empty());
+        .any(|line| !is_structural_blank(line.expected_raw()));
     let body_projection_location = lines.first().map(|line| line.physical_location().clone());
     let body_lines = has_body.then(|| {
         lines
@@ -1719,7 +1720,10 @@ fn begin_choices(
             expect_string(choice, &exact_location).map(str::to_owned)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if choice_texts.iter().all(|choice| choice.trim().is_empty()) {
+    if choice_texts
+        .iter()
+        .all(|choice| is_structural_blank(choice))
+    {
         return Ok(None);
     }
 
@@ -1783,7 +1787,7 @@ fn extract_scrolling_text(
         lines.push((exact_location, text.to_owned()));
         next_index += 1;
     }
-    if lines.iter().any(|(_, text)| !text.trim().is_empty()) {
+    if lines.iter().any(|(_, text)| !is_structural_blank(text)) {
         let source_lines = lines
             .iter()
             .map(|(_, text)| text.clone())
@@ -1905,7 +1909,7 @@ fn push_text_field(
     exact_location: RpgMakerLocation,
     original_text: &str,
 ) -> Result<(), SnapshotModelError> {
-    if original_text.trim().is_empty() {
+    if is_structural_blank(&original_text) {
         return Ok(());
     }
     fields.push(ExtractedTextUnit::new(
@@ -2815,7 +2819,6 @@ mod tests {
             "C:/att/示例项目/project.db".into(),
             "ja".to_owned(),
             "zh-Hans".to_owned(),
-            crate::rpg_maker::project::test_layout_profile(),
         )
     }
 

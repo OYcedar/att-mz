@@ -21,8 +21,6 @@ pub(crate) mod write_back;
 
 use std::path::{Path, PathBuf};
 
-pub(crate) use project::MaxFullwidthChars;
-
 /// 当前支持的 RPG Maker 引擎。
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum RpgMakerEngine {

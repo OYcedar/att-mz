@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::asset::RpgMakerAssetOwner;
-use super::project::{MaxFullwidthChars, RpgMakerWriteBackLayoutProfile};
 use crate::diagnostic::{
     Diagnostic, DiagnosticReport, FileSystemDiagnosticContext, FileSystemDiagnosticStage,
     FileSystemIssue, FileSystemOperation, FileSystemPathViolation, FileSystemProblem,
@@ -49,9 +48,6 @@ pub struct InitInput {
     pub game_root: PathBuf,
     pub source_language: Option<LanguageId>,
     pub target_language: Option<LanguageId>,
-    pub dialogue_max_fullwidth_chars: Option<MaxFullwidthChars>,
-    pub scrolling_text_max_fullwidth_chars: Option<MaxFullwidthChars>,
-    pub help_description_max_fullwidth_chars: Option<MaxFullwidthChars>,
 }
 
 /// Init 更新后可能需要重新提取的 RPG Maker 资产 owner。
@@ -93,9 +89,6 @@ pub(crate) struct ProjectWorkspaceConvergenceRequest {
     name: ProjectName,
     source_language: Option<LanguageId>,
     target_language: Option<LanguageId>,
-    dialogue_max_fullwidth_chars: Option<MaxFullwidthChars>,
-    scrolling_text_max_fullwidth_chars: Option<MaxFullwidthChars>,
-    help_description_max_fullwidth_chars: Option<MaxFullwidthChars>,
 }
 
 impl ProjectWorkspaceConvergenceRequest {
@@ -104,18 +97,12 @@ impl ProjectWorkspaceConvergenceRequest {
         name: ProjectName,
         source_language: Option<LanguageId>,
         target_language: Option<LanguageId>,
-        dialogue_max_fullwidth_chars: Option<MaxFullwidthChars>,
-        scrolling_text_max_fullwidth_chars: Option<MaxFullwidthChars>,
-        help_description_max_fullwidth_chars: Option<MaxFullwidthChars>,
     ) -> Self {
         Self {
             source_game_root,
             name,
             source_language,
             target_language,
-            dialogue_max_fullwidth_chars,
-            scrolling_text_max_fullwidth_chars,
-            help_description_max_fullwidth_chars,
         }
     }
 }
@@ -123,7 +110,6 @@ impl ProjectWorkspaceConvergenceRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ResolvedProjectSettings {
     language_pair: LanguagePair,
-    layout_profile: RpgMakerWriteBackLayoutProfile,
 }
 
 /// 首次建立项目时必须由用户明确给出的设置。
@@ -131,9 +117,6 @@ struct ResolvedProjectSettings {
 pub(crate) enum MissingInitialProjectSetting {
     SourceLanguage,
     TargetLanguage,
-    DialogueMaxFullwidthChars,
-    ScrollingTextMaxFullwidthChars,
-    HelpDescriptionMaxFullwidthChars,
 }
 
 impl MissingInitialProjectSetting {
@@ -141,9 +124,6 @@ impl MissingInitialProjectSetting {
         match self {
             Self::SourceLanguage => "--source-language",
             Self::TargetLanguage => "--target-language",
-            Self::DialogueMaxFullwidthChars => "--dialogue-max-fullwidth-chars",
-            Self::ScrollingTextMaxFullwidthChars => "--scrolling-text-max-fullwidth-chars",
-            Self::HelpDescriptionMaxFullwidthChars => "--help-description-max-fullwidth-chars",
         }
     }
 }
@@ -367,8 +347,7 @@ where
                 false
             };
             let workspace_complete = structure_matches && source_matches;
-            let settings_match = state.language_pair() == &settings.language_pair
-                && state.layout_profile() == &settings.layout_profile;
+            let settings_match = state.language_pair() == &settings.language_pair;
             if workspace_complete && settings_match {
                 let input_fingerprint = fingerprint_game_source(
                     &self.file_system,
@@ -487,12 +466,8 @@ where
                     .await);
                 }
             };
-        let requested_project = NewProject::new(
-            request.name,
-            settings.language_pair,
-            candidate_fingerprint,
-            settings.layout_profile,
-        );
+        let requested_project =
+            NewProject::new(request.name, settings.language_pair, candidate_fingerprint);
 
         self.observe(InitProgressPhase::UpdatingDatabase);
         if target_exists {
@@ -591,25 +566,6 @@ fn resolve_project_settings(
     if target_language.is_none() {
         missing.push(MissingInitialProjectSetting::TargetLanguage);
     }
-    let dialogue_body = request
-        .dialogue_max_fullwidth_chars
-        .or_else(|| current.map(|state| state.layout_profile().dialogue_body()));
-    if dialogue_body.is_none() {
-        missing.push(MissingInitialProjectSetting::DialogueMaxFullwidthChars);
-    }
-    let scrolling_text = request
-        .scrolling_text_max_fullwidth_chars
-        .or_else(|| current.map(|state| state.layout_profile().scrolling_text()));
-    if scrolling_text.is_none() {
-        missing.push(MissingInitialProjectSetting::ScrollingTextMaxFullwidthChars);
-    }
-    let help_description = request
-        .help_description_max_fullwidth_chars
-        .or_else(|| current.map(|state| state.layout_profile().help_description()));
-    if help_description.is_none() {
-        missing.push(MissingInitialProjectSetting::HelpDescriptionMaxFullwidthChars);
-    }
-
     if !missing.is_empty() {
         return Err(missing);
     }
@@ -618,11 +574,6 @@ fn resolve_project_settings(
         language_pair: LanguagePair::new(
             source_language.expect("已确认源语言存在"),
             target_language.expect("已确认目标语言存在"),
-        ),
-        layout_profile: RpgMakerWriteBackLayoutProfile::new(
-            dialogue_body.expect("已确认对话宽度存在"),
-            scrolling_text.expect("已确认滚动文本宽度存在"),
-            help_description.expect("已确认帮助描述宽度存在"),
         ),
     })
 }
@@ -1136,15 +1087,6 @@ const fn initial_setting(setting: MissingInitialProjectSetting) -> RpgMakerIniti
     match setting {
         MissingInitialProjectSetting::SourceLanguage => RpgMakerInitialSetting::SourceLanguage,
         MissingInitialProjectSetting::TargetLanguage => RpgMakerInitialSetting::TargetLanguage,
-        MissingInitialProjectSetting::DialogueMaxFullwidthChars => {
-            RpgMakerInitialSetting::DialogueMaxFullwidthChars
-        }
-        MissingInitialProjectSetting::ScrollingTextMaxFullwidthChars => {
-            RpgMakerInitialSetting::ScrollingTextMaxFullwidthChars
-        }
-        MissingInitialProjectSetting::HelpDescriptionMaxFullwidthChars => {
-            RpgMakerInitialSetting::HelpDescriptionMaxFullwidthChars
-        }
     }
 }
 
@@ -1579,9 +1521,6 @@ where
                 input.name,
                 input.source_language,
                 input.target_language,
-                input.dialogue_max_fullwidth_chars,
-                input.scrolling_text_max_fullwidth_chars,
-                input.help_description_max_fullwidth_chars,
             ))
             .await
             .map_err(InitServiceError::Workspace)?;
@@ -2370,16 +2309,8 @@ mod tests {
         }
     }
 
-    fn width(value: u32) -> super::super::project::MaxFullwidthChars {
-        super::super::project::MaxFullwidthChars::new(value).expect("宽度应合法")
-    }
-
     fn language_id(value: &str) -> LanguageId {
         LanguageId::parse(value).expect("测试语言 ID 应合法")
-    }
-
-    fn profile() -> RpgMakerWriteBackLayoutProfile {
-        RpgMakerWriteBackLayoutProfile::new(width(24), width(30), width(18))
     }
 
     fn fingerprint(value: u8) -> SourceSnapshotFingerprint {
@@ -2394,7 +2325,6 @@ mod tests {
             "game".parse().expect("项目名应合法"),
             LanguagePair::new(language_id("ja"), language_id("zh-Hans")),
             fingerprint(source_fingerprint),
-            profile(),
             owners,
         )
     }
@@ -2405,9 +2335,6 @@ mod tests {
             "game".parse().expect("项目名应合法"),
             Some(language_id("ja")),
             Some(language_id("zh-Hans")),
-            Some(profile().dialogue_body()),
-            Some(profile().scrolling_text()),
-            Some(profile().help_description()),
         )
     }
 
@@ -2415,9 +2342,6 @@ mod tests {
         ProjectWorkspaceConvergenceRequest::new(
             PathBuf::from("C:/games/source"),
             "game".parse().expect("项目名应合法"),
-            None,
-            None,
-            None,
             None,
             None,
         )
@@ -2548,9 +2472,6 @@ mod tests {
                 if missing == &vec![
                     MissingInitialProjectSetting::SourceLanguage,
                     MissingInitialProjectSetting::TargetLanguage,
-                    MissingInitialProjectSetting::DialogueMaxFullwidthChars,
-                    MissingInitialProjectSetting::ScrollingTextMaxFullwidthChars,
-                    MissingInitialProjectSetting::HelpDescriptionMaxFullwidthChars,
                 ]
         ));
         assert_eq!(observations.events(), vec!["workspace_root"]);
@@ -2844,7 +2765,6 @@ mod tests {
             "game".parse().expect("项目名应合法"),
             LanguagePair::new(language_id("ja"), language_id("zh-Hant")),
             fingerprint(0x33),
-            RpgMakerWriteBackLayoutProfile::new(width(40), width(30), width(18)),
             Vec::new(),
         );
         let (service, observations) = service(
@@ -2858,7 +2778,6 @@ mod tests {
         );
         let mut requested = omitted_settings_request();
         requested.target_language = Some(language_id("zh-Hant"));
-        requested.dialogue_max_fullwidth_chars = Some(width(40));
 
         let outcome = service
             .converge(requested)
@@ -2876,9 +2795,6 @@ mod tests {
         let requested = &reconciled[0].1;
         assert_eq!(requested.source_language().as_str(), "ja");
         assert_eq!(requested.target_language().as_str(), "zh-Hant");
-        assert_eq!(requested.layout_profile().dialogue_body(), width(40));
-        assert_eq!(requested.layout_profile().scrolling_text(), width(30));
-        assert_eq!(requested.layout_profile().help_description(), width(18));
     }
 
     #[tokio::test]
@@ -3757,9 +3673,6 @@ mod tests {
             game_root: PathBuf::from("./Game"),
             source_language: Some(language_id("JA")),
             target_language: Some(language_id("zh-hans")),
-            dialogue_max_fullwidth_chars: Some(profile().dialogue_body()),
-            scrolling_text_max_fullwidth_chars: Some(profile().scrolling_text()),
-            help_description_max_fullwidth_chars: Some(profile().help_description()),
         }
     }
 

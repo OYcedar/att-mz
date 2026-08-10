@@ -3,7 +3,7 @@
 //! 本模块不解释游戏引擎、kind 枚举或内置控制符。调用方负责校验 scope，并把需要的
 //! 内置 pattern 显式交给保护操作。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
@@ -164,16 +164,37 @@ impl From<pcre2::Error> for PlaceholderPcre2Failure {
 pub(crate) struct PlaceholderRuleDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
     scopes: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ids: Option<Vec<String>>,
+    order: PlaceholderOrderPolicy,
     pattern: String,
 }
 
+/// 规划资源快照中的闭集 Placeholder 条目。
+///
+/// 普通 PCRE2 规则仍由公共算法解释；RPG control 只在 RPG Maker 适配器中编译，
+/// Generic 必须在请求前拒绝后一种条目。
 impl PlaceholderRuleDefinition {
     #[cfg(test)]
     pub(crate) fn new(scopes: Option<Vec<String>>, pattern: impl Into<String>) -> Self {
         Self {
             scopes,
+            ids: None,
+            order: PlaceholderOrderPolicy::Preserve,
             pattern: pattern.into(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_ids(mut self, ids: Vec<String>) -> Self {
+        self.ids = Some(ids);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_order(mut self, order: PlaceholderOrderPolicy) -> Self {
+        self.order = order;
+        self
     }
 }
 
@@ -195,15 +216,20 @@ impl fmt::Debug for CompiledPlaceholderRules {
 #[derive(Clone)]
 struct CompiledPlaceholderRule {
     scopes: Option<Vec<String>>,
+    ids: Option<Vec<String>>,
     regex: Regex,
     rule_number: usize,
     has_text_capture: bool,
+    order_policy: PlaceholderOrderPolicy,
+    contract_fingerprint: Sha256Fingerprint,
 }
 
 struct ValidatedPlaceholderRule {
     scopes: Option<Vec<String>>,
+    ids: Option<Vec<String>>,
     pattern: String,
     rule_number: usize,
+    order_policy: PlaceholderOrderPolicy,
 }
 
 /// 由引擎适配器提供的一条已编译内置规则。
@@ -211,6 +237,55 @@ struct ValidatedPlaceholderRule {
 pub(crate) struct CompiledBuiltinPlaceholderRule {
     regex: Regex,
     semantic_label: &'static str,
+    order_policy: PlaceholderOrderPolicy,
+}
+
+/// 候选中一条 Placeholder 相对于同一逻辑槽内其他 Placeholder 的顺序契约。
+///
+/// 自定义 wrapper 和渲染控制符默认保持相对顺序。`String.format` 参数编号本来就用于
+/// 目标语言调整词序，因此只要求同一槽内身份和数量不变。
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PlaceholderOrderPolicy {
+    Preserve,
+    ReorderWithinSlot,
+}
+
+impl PlaceholderOrderPolicy {
+    const fn fingerprint_name(self) -> &'static str {
+        match self {
+            Self::Preserve => "preserve",
+            Self::ReorderWithinSlot => "reorder_within_slot",
+        }
+    }
+}
+
+impl CompiledPlaceholderRules {
+    /// 返回对当前自然 Unit 实际生效的完整自定义候选契约。
+    ///
+    /// 即使源文没有命中任何规则，pattern、精确 ID 和顺序策略仍决定候选能否新增某个
+    /// token，因此去重不能只使用源文中已经产生的绑定。
+    pub(crate) fn applicable_contract_fingerprint(
+        &self,
+        scope: &str,
+        target_id: &str,
+    ) -> Sha256Fingerprint {
+        let mut applicable = self
+            .rules
+            .iter()
+            .filter(|rule| {
+                rule_applies_to_scope(rule.scopes.as_deref(), scope)
+                    && rule_applies_to_id(rule.ids.as_deref(), Some(target_id))
+            })
+            .map(|rule| rule.contract_fingerprint)
+            .collect::<Vec<_>>();
+        applicable.sort_unstable();
+        let mut hasher = Sha256FramedHasher::new(b"att.placeholder-applicable-contract");
+        for fingerprint in applicable {
+            hasher.frame(1, fingerprint.as_bytes());
+        }
+        hasher.finish()
+    }
 }
 
 /// 无状态的公共 Placeholder 算法入口。
@@ -224,9 +299,23 @@ impl PlaceholderService {
         pattern: &str,
         semantic_label: &'static str,
     ) -> Result<CompiledBuiltinPlaceholderRule, Pcre2PlaceholderConstructionError> {
+        self.compile_builtin_with_order_policy(
+            pattern,
+            semantic_label,
+            PlaceholderOrderPolicy::Preserve,
+        )
+    }
+
+    pub(crate) fn compile_builtin_with_order_policy(
+        &self,
+        pattern: &str,
+        semantic_label: &'static str,
+        order_policy: PlaceholderOrderPolicy,
+    ) -> Result<CompiledBuiltinPlaceholderRule, Pcre2PlaceholderConstructionError> {
         Ok(CompiledBuiltinPlaceholderRule {
             regex: compile_regex(pattern).map_err(Pcre2PlaceholderConstructionError)?,
             semantic_label,
+            order_policy,
         })
     }
 
@@ -237,9 +326,12 @@ impl PlaceholderService {
         definitions: Vec<PlaceholderRuleDefinition>,
         valid_scope: impl FnMut(&str) -> bool,
     ) -> Result<CompiledPlaceholderRules, PlaceholderRuleCompilationError> {
-        match self
-            .compile_custom_with_cancellation(definitions, valid_scope, || Ok::<_, Infallible>(()))
-        {
+        match self.compile_custom_with_targets_and_cancellation(
+            definitions,
+            valid_scope,
+            |_| true,
+            || Ok::<_, Infallible>(()),
+        ) {
             Ok(result) => result,
             Err(unreachable) => match unreachable {},
         }
@@ -249,11 +341,31 @@ impl PlaceholderService {
     ///
     /// 所有 scope 和空 pattern 校验完成后，把整批已校验规则交给一个隔离 worker。
     /// PCRE2 没有取消回调；调用方取消时不等待当前纯计算结束，且每次调用最多遗留一个
-    /// 已经运行的有限 worker。
+    /// 已经运行的有限 worker。这个入口只用于尚未持有 Extract 快照的资源语法检查；
+    /// 真正执行翻译或 Manual 时必须改用带完整自然 ID 集的入口。
     pub(crate) fn compile_custom_with_cancellation<E>(
         &self,
         definitions: Vec<PlaceholderRuleDefinition>,
+        valid_scope: impl FnMut(&str) -> bool,
+        ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Result<CompiledPlaceholderRules, PlaceholderRuleCompilationError>, E> {
+        self.compile_custom_with_targets_and_cancellation(
+            definitions,
+            valid_scope,
+            |_| true,
+            ensure_running,
+        )
+    }
+
+    /// 编译带自然 Unit ID 目标的自定义规则。
+    ///
+    /// `valid_id` 必须代表当前项目完整 Extract Unit 集，而不是本轮 pending 子集。这样
+    /// 已完成 Unit 仍是合法目标，过期或拼错的 ID 会在任何请求前明确失败。
+    pub(crate) fn compile_custom_with_targets_and_cancellation<E>(
+        &self,
+        definitions: Vec<PlaceholderRuleDefinition>,
         mut valid_scope: impl FnMut(&str) -> bool,
+        mut valid_id: impl FnMut(&str) -> bool,
         mut ensure_running: impl FnMut() -> Result<(), E>,
     ) -> Result<Result<CompiledPlaceholderRules, PlaceholderRuleCompilationError>, E> {
         ensure_running()?;
@@ -265,6 +377,7 @@ impl PlaceholderService {
                 definition,
                 rule_number,
                 &mut valid_scope,
+                &mut valid_id,
                 &mut ensure_running,
             )? {
                 Ok(rule) => validated.push(Ok(rule)),
@@ -328,6 +441,7 @@ impl PlaceholderService {
     /// 用户自定义 PCRE2 以及长文本上的内置 PCRE2 匹配没有取消回调，因此每次保护最多
     /// 把一个纯匹配批次交给隔离 worker。内置规则来自程序固定的线性 pattern；不超过
     /// 一个取消检查窗口时继续内联，避免空规则和常见短文本为每项启动线程。
+    #[cfg(test)]
     pub(crate) fn protect_with_cancellation<E>(
         &self,
         scope: &str,
@@ -335,6 +449,51 @@ impl PlaceholderService {
         line_separator_offsets: &[usize],
         custom: &CompiledPlaceholderRules,
         builtin: Option<&CompiledBuiltinPlaceholderRule>,
+        ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Result<ProtectedText, PlaceholderProtectionError>, E> {
+        let builtins = builtin.into_iter().collect::<Vec<_>>();
+        self.protect_with_target_and_builtins_with_cancellation(
+            scope,
+            None,
+            original,
+            line_separator_offsets,
+            custom,
+            &builtins,
+            ensure_running,
+        )
+    }
+
+    /// 保护一个已经由引擎确认自然 ID 和 consumer 的精确 Unit。
+    pub(crate) fn protect_with_target_and_builtins_with_cancellation<E>(
+        &self,
+        scope: &str,
+        target_id: Option<&str>,
+        original: &str,
+        line_separator_offsets: &[usize],
+        custom: &CompiledPlaceholderRules,
+        builtins: &[&CompiledBuiltinPlaceholderRule],
+        ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Result<ProtectedText, PlaceholderProtectionError>, E> {
+        self.protect_with_target_and_matches_with_cancellation(
+            scope,
+            target_id,
+            original,
+            line_separator_offsets,
+            custom,
+            builtins,
+            ensure_running,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn protect_with_target_and_matches_with_cancellation<E>(
+        &self,
+        scope: &str,
+        target_id: Option<&str>,
+        original: &str,
+        line_separator_offsets: &[usize],
+        custom: &CompiledPlaceholderRules,
+        builtins: &[&CompiledBuiltinPlaceholderRule],
         mut ensure_running: impl FnMut() -> Result<(), E>,
     ) -> Result<Result<ProtectedText, PlaceholderProtectionError>, E> {
         ensure_running()?;
@@ -354,6 +513,10 @@ impl PlaceholderService {
                 rule.scopes.as_deref(),
                 scope,
                 &mut ensure_running,
+            )? && rule_applies_to_id_with_cancellation(
+                rule.ids.as_deref(),
+                target_id,
+                &mut ensure_running,
             )? {
                 has_applicable_custom_rule = true;
                 break;
@@ -362,7 +525,7 @@ impl PlaceholderService {
 
         let isolate_matching = should_isolate_placeholder_matching(
             original.len(),
-            builtin.is_some(),
+            !builtins.is_empty(),
             has_applicable_custom_rule,
         );
         let owned_matches = if isolate_matching {
@@ -372,17 +535,26 @@ impl PlaceholderService {
             } else {
                 String::new()
             };
-            let builtin = builtin.cloned();
+            let builtins = builtins
+                .iter()
+                .map(|builtin| (*builtin).clone())
+                .collect::<Vec<_>>();
             let custom_rules = Arc::clone(&custom.rules);
+            let worker_target_id = if has_applicable_custom_rule {
+                target_id.map(str::to_owned)
+            } else {
+                None
+            };
             match run_isolated_operation(
                 "att-placeholder-match",
                 move || {
                     collect_placeholder_matches(
-                        builtin.as_ref(),
+                        &builtins,
                         custom_rules.as_slice(),
                         has_applicable_custom_rule,
                         &original,
                         &worker_scope,
+                        worker_target_id.as_deref(),
                     )
                 },
                 &mut ensure_running,
@@ -403,15 +575,11 @@ impl PlaceholderService {
                 }
             }
         } else {
-            match builtin {
-                Some(builtin) => match collect_builtin_matches(builtin, original) {
-                    Ok(matches) => matches,
-                    Err(source) => return Ok(Err(source)),
-                },
-                None => Vec::new(),
+            match collect_builtin_matches(builtins, original) {
+                Ok(matches) => matches,
+                Err(source) => return Ok(Err(source)),
             }
         };
-
         let mut selected = Vec::with_capacity(owned_matches.len());
         for span in owned_matches {
             ensure_running()?;
@@ -437,6 +605,7 @@ impl PlaceholderService {
                 max_end_span = Some(index);
             }
         }
+        let wrapper_capture_shapes = wrapper_capture_shapes(original, &selected);
         let mut source_line_index = 0;
         for span in &selected {
             ensure_running()?;
@@ -479,16 +648,32 @@ impl PlaceholderService {
                 &mut ensure_running,
             )?;
             protected.push_str(&token);
-            placeholders.push(AppliedPlaceholder::new(
+            let original_fragment = clone_placeholder_text_with_cancellation(
+                &original[span.start..span.end],
+                &mut ensure_running,
+            )?;
+            let semantic_identity = match span.semantic_identity.as_deref() {
+                Some(identity) => {
+                    clone_placeholder_text_with_cancellation(identity, &mut ensure_running)?
+                }
+                None => original_fragment.clone(),
+            };
+            placeholders.push(AppliedPlaceholder::new_with_contract_and_identity(
                 token,
-                clone_placeholder_text_with_cancellation(
-                    &original[span.start..span.end],
-                    &mut ensure_running,
-                )?,
+                original_fragment,
+                semantic_identity,
                 span.origin,
                 clone_placeholder_text_with_cancellation(span.semantic_label, &mut ensure_running)?,
                 clone_placeholder_text_with_cancellation(span.scope, &mut ensure_running)?,
                 span.segment,
+                span.order_policy,
+                span.wrapper_pair.map(|pair| PlaceholderWrapperContract {
+                    pair,
+                    capture_shape: wrapper_capture_shapes
+                        .get(&pair)
+                        .copied()
+                        .unwrap_or(PlaceholderWrapperCaptureShape::Empty),
+                }),
             ));
             cursor = span.end;
         }
@@ -503,6 +688,31 @@ impl PlaceholderService {
             &mut ensure_running,
         )?))
     }
+}
+
+fn wrapper_capture_shapes(
+    original: &str,
+    selected: &[SelectedSpan<'_>],
+) -> HashMap<PlaceholderWrapperPair, PlaceholderWrapperCaptureShape> {
+    let mut contracts = HashMap::new();
+    for wrapper in selected {
+        let (Some(pair), Some((capture_start, capture_end))) =
+            (wrapper.wrapper_pair, wrapper.wrapper_capture)
+        else {
+            continue;
+        };
+        contracts.entry(pair).or_insert_with(|| {
+            let captured = &original[capture_start..capture_end];
+            if captured.is_empty() {
+                PlaceholderWrapperCaptureShape::Empty
+            } else if super::candidate_validation::is_structural_blank(captured) {
+                PlaceholderWrapperCaptureShape::StructuralBlank
+            } else {
+                PlaceholderWrapperCaptureShape::Content
+            }
+        });
+    }
+    contracts
 }
 
 fn compile_validated_placeholder_rules(
@@ -533,11 +743,21 @@ fn compile_validated_placeholder_rules(
                 });
             }
         };
+        if has_text_capture && definition.order_policy == PlaceholderOrderPolicy::ReorderWithinSlot
+        {
+            return Err(PlaceholderRuleCompilationError::ReorderedWrapper {
+                rule_number: definition.rule_number,
+            });
+        }
+        let contract_fingerprint = placeholder_rule_contract_fingerprint(&definition);
         rules.push(CompiledPlaceholderRule {
             scopes: definition.scopes,
+            ids: definition.ids,
             regex,
             rule_number: definition.rule_number,
             has_text_capture,
+            order_policy: definition.order_policy,
+            contract_fingerprint,
         });
     }
     Ok(CompiledPlaceholderRules {
@@ -545,10 +765,22 @@ fn compile_validated_placeholder_rules(
     })
 }
 
+fn placeholder_rule_contract_fingerprint(
+    definition: &ValidatedPlaceholderRule,
+) -> Sha256Fingerprint {
+    let mut hasher = Sha256FramedHasher::new(b"att.placeholder-rule-contract");
+    hasher
+        .frame(1, b"exact")
+        .frame(2, definition.order_policy.fingerprint_name().as_bytes())
+        .frame(3, definition.pattern.as_bytes());
+    hasher.finish()
+}
+
 fn validate_placeholder_rule_with_cancellation<E>(
     definition: PlaceholderRuleDefinition,
     rule_number: usize,
     valid_scope: &mut impl FnMut(&str) -> bool,
+    valid_id: &mut impl FnMut(&str) -> bool,
     ensure_running: &mut impl FnMut() -> Result<(), E>,
 ) -> Result<Result<ValidatedPlaceholderRule, PlaceholderRuleCompilationError>, E> {
     let scopes = match definition.scopes {
@@ -598,6 +830,39 @@ fn validate_placeholder_rule_with_cancellation<E>(
         }
         None => None,
     };
+    let ids = match definition.ids {
+        Some(ids) => {
+            if ids.is_empty() {
+                return Ok(Err(PlaceholderRuleCompilationError::EmptyIds {
+                    rule_number,
+                }));
+            }
+            let mut seen = HashSet::with_capacity(ids.len());
+            for id in &ids {
+                ensure_running()?;
+                if id.is_empty() || id.chars().any(char::is_control) {
+                    return Ok(Err(PlaceholderRuleCompilationError::InvalidId {
+                        rule_number,
+                        id: id.clone(),
+                    }));
+                }
+                if !seen.insert(id.as_str()) {
+                    return Ok(Err(PlaceholderRuleCompilationError::DuplicateId {
+                        rule_number,
+                        id: id.clone(),
+                    }));
+                }
+                if !valid_id(id) {
+                    return Ok(Err(PlaceholderRuleCompilationError::UnknownId {
+                        rule_number,
+                        id: id.clone(),
+                    }));
+                }
+            }
+            Some(ids)
+        }
+        None => None,
+    };
     if definition.pattern.is_empty() {
         return Ok(Err(PlaceholderRuleCompilationError::EmptyPattern {
             rule_number,
@@ -605,8 +870,10 @@ fn validate_placeholder_rule_with_cancellation<E>(
     }
     Ok(Ok(ValidatedPlaceholderRule {
         scopes,
+        ids,
         pattern: definition.pattern,
         rule_number,
+        order_policy: definition.order,
     }))
 }
 
@@ -704,6 +971,28 @@ fn rule_applies_to_scope_with_cancellation<E>(
     Ok(false)
 }
 
+fn rule_applies_to_id_with_cancellation<E>(
+    ids: Option<&[String]>,
+    target_id: Option<&str>,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    let Some(ids) = ids else {
+        ensure_running()?;
+        return Ok(true);
+    };
+    let Some(target_id) = target_id else {
+        ensure_running()?;
+        return Ok(false);
+    };
+    for candidate in ids {
+        if placeholder_text_equal_with_cancellation(candidate, target_id, ensure_running)? {
+            return Ok(true);
+        }
+    }
+    ensure_running()?;
+    Ok(false)
+}
+
 fn placeholder_text_equal_with_cancellation<E>(
     left: &str,
     right: &str,
@@ -761,19 +1050,19 @@ fn should_isolate_placeholder_matching(
 }
 
 fn collect_placeholder_matches(
-    builtin: Option<&CompiledBuiltinPlaceholderRule>,
+    builtins: &[CompiledBuiltinPlaceholderRule],
     custom_rules: &[CompiledPlaceholderRule],
     include_custom: bool,
     original: &str,
     scope: &str,
+    target_id: Option<&str>,
 ) -> Result<Vec<OwnedSelectedSpan>, PlaceholderProtectionError> {
-    let mut selected = match builtin {
-        Some(builtin) => collect_builtin_matches(builtin, original)?,
-        None => Vec::new(),
-    };
+    let mut selected = collect_builtin_matches(builtins, original)?;
     if include_custom {
         for rule in custom_rules {
-            if rule_applies_to_scope(rule.scopes.as_deref(), scope) {
+            if rule_applies_to_scope(rule.scopes.as_deref(), scope)
+                && rule_applies_to_id(rule.ids.as_deref(), target_id)
+            {
                 selected.extend(collect_custom_matches(rule, original)?);
             }
         }
@@ -782,32 +1071,39 @@ fn collect_placeholder_matches(
 }
 
 fn collect_builtin_matches(
-    builtin: &CompiledBuiltinPlaceholderRule,
+    builtins: &[impl std::borrow::Borrow<CompiledBuiltinPlaceholderRule>],
     original: &str,
 ) -> Result<Vec<OwnedSelectedSpan>, PlaceholderProtectionError> {
     let mut selected = Vec::new();
-    for matched in builtin.regex.find_iter(original.as_bytes()) {
-        let matched = matched.map_err(|source| PlaceholderProtectionError::Match {
-            rule: PlaceholderRuleReference::built_in(),
-            source: PlaceholderPcre2Failure::from(source),
-        })?;
-        if matched.start() == matched.end() {
-            return Err(PlaceholderProtectionError::EmptyMatch {
-                matched: PlaceholderMatchReference::new(
-                    PlaceholderRuleReference::built_in(),
-                    matched.start(),
-                    matched.end(),
-                ),
+    for builtin in builtins {
+        let builtin = builtin.borrow();
+        for matched in builtin.regex.find_iter(original.as_bytes()) {
+            let matched = matched.map_err(|source| PlaceholderProtectionError::Match {
+                rule: PlaceholderRuleReference::built_in(),
+                source: PlaceholderPcre2Failure::from(source),
+            })?;
+            if matched.start() == matched.end() {
+                return Err(PlaceholderProtectionError::EmptyMatch {
+                    matched: PlaceholderMatchReference::new(
+                        PlaceholderRuleReference::built_in(),
+                        matched.start(),
+                        matched.end(),
+                    ),
+                });
+            }
+            selected.push(OwnedSelectedSpan {
+                start: matched.start(),
+                end: matched.end(),
+                origin: PlaceholderRuleOrigin::BuiltIn,
+                semantic_label: builtin.semantic_label,
+                rule_number: None,
+                segment: PlaceholderSegment::Whole,
+                order_policy: builtin.order_policy,
+                wrapper_pair: None,
+                wrapper_capture: None,
+                semantic_identity: None,
             });
         }
-        selected.push(OwnedSelectedSpan {
-            start: matched.start(),
-            end: matched.end(),
-            origin: PlaceholderRuleOrigin::BuiltIn,
-            semantic_label: builtin.semantic_label,
-            rule_number: None,
-            segment: PlaceholderSegment::Whole,
-        });
     }
     Ok(selected)
 }
@@ -816,12 +1112,18 @@ fn rule_applies_to_scope(scopes: Option<&[String]>, scope: &str) -> bool {
     scopes.is_none_or(|scopes| scopes.iter().any(|candidate| candidate == scope))
 }
 
+fn rule_applies_to_id(ids: Option<&[String]>, target_id: Option<&str>) -> bool {
+    ids.is_none_or(|ids| {
+        target_id.is_some_and(|target_id| ids.iter().any(|candidate| candidate == target_id))
+    })
+}
+
 fn collect_custom_matches(
     rule: &CompiledPlaceholderRule,
     original: &str,
 ) -> Result<Vec<OwnedSelectedSpan>, PlaceholderProtectionError> {
     let mut result = Vec::new();
-    for captures in rule.regex.captures_iter(original.as_bytes()) {
+    for (match_index, captures) in rule.regex.captures_iter(original.as_bytes()).enumerate() {
         let rule_reference = PlaceholderRuleReference::custom(rule.rule_number);
         let captures = captures.map_err(|source| PlaceholderProtectionError::Match {
             rule: rule_reference,
@@ -873,6 +1175,8 @@ fn collect_custom_matches(
                 });
             }
             let mut protected = Vec::with_capacity(2);
+            let wrapper_pair = PlaceholderWrapperPair::new(rule.rule_number, match_index + 1);
+            let wrapper_capture = Some((capture.start(), capture.end()));
             if whole.start() < capture.start() {
                 protected.push(OwnedSelectedSpan {
                     start: whole.start(),
@@ -881,6 +1185,41 @@ fn collect_custom_matches(
                     semantic_label: CUSTOM_SEMANTIC_LABEL,
                     rule_number: Some(rule.rule_number),
                     segment: PlaceholderSegment::Begin,
+                    order_policy: PlaceholderOrderPolicy::Preserve,
+                    wrapper_pair: Some(wrapper_pair),
+                    wrapper_capture,
+                    semantic_identity: None,
+                });
+            }
+            if whole.start() < capture.start() && capture.end() == whole.end() {
+                // capture 位于完整匹配末尾时没有真实后壳；用恢复为空串的边界 token
+                // 精确标出 capture 终点，避免把匹配后的普通正文误算进 wrapper 子槽。
+                protected.push(OwnedSelectedSpan {
+                    start: capture.end(),
+                    end: capture.end(),
+                    origin: PlaceholderRuleOrigin::Custom,
+                    semantic_label: CUSTOM_SEMANTIC_LABEL,
+                    rule_number: Some(rule.rule_number),
+                    segment: PlaceholderSegment::End,
+                    order_policy: PlaceholderOrderPolicy::Preserve,
+                    wrapper_pair: Some(wrapper_pair),
+                    wrapper_capture,
+                    semantic_identity: None,
+                });
+            }
+            if capture.start() == whole.start() && capture.end() < whole.end() {
+                // capture 位于完整匹配开头时同理补一个恢复为空串的前边界。
+                protected.push(OwnedSelectedSpan {
+                    start: capture.start(),
+                    end: capture.start(),
+                    origin: PlaceholderRuleOrigin::Custom,
+                    semantic_label: CUSTOM_SEMANTIC_LABEL,
+                    rule_number: Some(rule.rule_number),
+                    segment: PlaceholderSegment::Begin,
+                    order_policy: PlaceholderOrderPolicy::Preserve,
+                    wrapper_pair: Some(wrapper_pair),
+                    wrapper_capture,
+                    semantic_identity: None,
                 });
             }
             if capture.end() < whole.end() {
@@ -891,6 +1230,10 @@ fn collect_custom_matches(
                     semantic_label: CUSTOM_SEMANTIC_LABEL,
                     rule_number: Some(rule.rule_number),
                     segment: PlaceholderSegment::End,
+                    order_policy: PlaceholderOrderPolicy::Preserve,
+                    wrapper_pair: Some(wrapper_pair),
+                    wrapper_capture,
+                    semantic_identity: None,
                 });
             }
             protected
@@ -902,6 +1245,10 @@ fn collect_custom_matches(
                 semantic_label: CUSTOM_SEMANTIC_LABEL,
                 rule_number: Some(rule.rule_number),
                 segment: PlaceholderSegment::Whole,
+                order_policy: rule.order_policy,
+                wrapper_pair: None,
+                wrapper_capture: None,
+                semantic_identity: None,
             }]
         };
         result.extend(protected);
@@ -958,6 +1305,10 @@ struct OwnedSelectedSpan {
     semantic_label: &'static str,
     rule_number: Option<usize>,
     segment: PlaceholderSegment,
+    order_policy: PlaceholderOrderPolicy,
+    wrapper_pair: Option<PlaceholderWrapperPair>,
+    wrapper_capture: Option<(usize, usize)>,
+    semantic_identity: Option<String>,
 }
 
 impl OwnedSelectedSpan {
@@ -970,6 +1321,10 @@ impl OwnedSelectedSpan {
             rule_number: self.rule_number,
             scope,
             segment: self.segment,
+            order_policy: self.order_policy,
+            wrapper_pair: self.wrapper_pair,
+            wrapper_capture: self.wrapper_capture,
+            semantic_identity: self.semantic_identity,
         }
     }
 }
@@ -982,6 +1337,10 @@ struct SelectedSpan<'a> {
     rule_number: Option<usize>,
     scope: &'a str,
     segment: PlaceholderSegment,
+    order_policy: PlaceholderOrderPolicy,
+    wrapper_pair: Option<PlaceholderWrapperPair>,
+    wrapper_capture: Option<(usize, usize)>,
+    semantic_identity: Option<String>,
 }
 
 fn stable_sort_selected_spans_with_cancellation<E>(
@@ -1247,6 +1606,59 @@ pub(crate) enum PlaceholderSegment {
     End,
 }
 
+/// 一次自定义 wrapper 匹配的自然配对身份。
+///
+/// 规则号区分规则，匹配号按同一规则在一个逻辑槽中的自然出现顺序编号。它只用于
+/// 验证捕获文本仍位于自己的 Begin/End 之间，不作为面向人的位置。
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct PlaceholderWrapperPair {
+    rule_number: usize,
+    match_number: usize,
+}
+
+impl PlaceholderWrapperPair {
+    const fn new(rule_number: usize, match_number: usize) -> Self {
+        Self {
+            rule_number,
+            match_number,
+        }
+    }
+}
+
+/// wrapper 配对以及源捕获中是否确实存在 NaturalText。
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct PlaceholderWrapperContract {
+    pair: PlaceholderWrapperPair,
+    capture_shape: PlaceholderWrapperCaptureShape,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum PlaceholderWrapperCaptureShape {
+    Empty,
+    StructuralBlank,
+    Content,
+}
+
+impl PlaceholderWrapperCaptureShape {
+    const fn fingerprint_name(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::StructuralBlank => "structural_blank",
+            Self::Content => "content",
+        }
+    }
+}
+
+impl PlaceholderWrapperContract {
+    pub(crate) const fn pair(self) -> PlaceholderWrapperPair {
+        self.pair
+    }
+
+    pub(crate) const fn capture_shape(self) -> PlaceholderWrapperCaptureShape {
+        self.capture_shape
+    }
+}
+
 impl PlaceholderSegment {
     pub(crate) const fn name(self) -> &'static str {
         match self {
@@ -1262,13 +1674,17 @@ impl PlaceholderSegment {
 pub(crate) struct AppliedPlaceholder {
     token: String,
     original: String,
+    semantic_identity: String,
     origin: PlaceholderRuleOrigin,
     label: String,
     scope: String,
     segment: PlaceholderSegment,
+    order_policy: PlaceholderOrderPolicy,
+    wrapper: Option<PlaceholderWrapperContract>,
 }
 
 impl AppliedPlaceholder {
+    #[cfg(test)]
     pub(crate) fn new(
         token: impl Into<String>,
         original: impl Into<String>,
@@ -1277,13 +1693,87 @@ impl AppliedPlaceholder {
         scope: impl Into<String>,
         segment: PlaceholderSegment,
     ) -> Self {
+        Self::new_with_order_policy(
+            token,
+            original,
+            origin,
+            label,
+            scope,
+            segment,
+            PlaceholderOrderPolicy::Preserve,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_order_policy(
+        token: impl Into<String>,
+        original: impl Into<String>,
+        origin: PlaceholderRuleOrigin,
+        label: impl Into<String>,
+        scope: impl Into<String>,
+        segment: PlaceholderSegment,
+        order_policy: PlaceholderOrderPolicy,
+    ) -> Self {
+        Self::new_with_contract(
+            token,
+            original,
+            origin,
+            label,
+            scope,
+            segment,
+            order_policy,
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_contract(
+        token: impl Into<String>,
+        original: impl Into<String>,
+        origin: PlaceholderRuleOrigin,
+        label: impl Into<String>,
+        scope: impl Into<String>,
+        segment: PlaceholderSegment,
+        order_policy: PlaceholderOrderPolicy,
+        wrapper: Option<PlaceholderWrapperContract>,
+    ) -> Self {
+        let original = original.into();
+        Self::new_with_contract_and_identity(
+            token,
+            original.clone(),
+            original,
+            origin,
+            label,
+            scope,
+            segment,
+            order_policy,
+            wrapper,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_contract_and_identity(
+        token: impl Into<String>,
+        original: impl Into<String>,
+        semantic_identity: impl Into<String>,
+        origin: PlaceholderRuleOrigin,
+        label: impl Into<String>,
+        scope: impl Into<String>,
+        segment: PlaceholderSegment,
+        order_policy: PlaceholderOrderPolicy,
+        wrapper: Option<PlaceholderWrapperContract>,
+    ) -> Self {
         Self {
             token: token.into(),
             original: original.into(),
+            semantic_identity: semantic_identity.into(),
             origin,
             label: label.into(),
             scope: scope.into(),
             segment,
+            order_policy,
+            wrapper,
         }
     }
 
@@ -1293,6 +1783,10 @@ impl AppliedPlaceholder {
 
     pub(crate) fn original(&self) -> &str {
         &self.original
+    }
+
+    pub(crate) fn semantic_identity(&self) -> &str {
+        &self.semantic_identity
     }
 
     pub(crate) const fn origin(&self) -> PlaceholderRuleOrigin {
@@ -1310,6 +1804,61 @@ impl AppliedPlaceholder {
     pub(crate) const fn segment(&self) -> PlaceholderSegment {
         self.segment
     }
+
+    pub(crate) const fn order_policy(&self) -> PlaceholderOrderPolicy {
+        self.order_policy
+    }
+
+    pub(crate) const fn wrapper(&self) -> Option<PlaceholderWrapperContract> {
+        self.wrapper
+    }
+}
+
+/// 比较同一逻辑槽的原文与候选 Placeholder 契约。
+///
+/// token 编号只服务本次保护过程，不属于跨两次扫描的身份。实际身份由来源、规则、原片段
+/// 和 wrapper 段共同决定；允许换序的 FormatArgument 只参与多重集比较，其余项仍保持
+/// 相对顺序。
+pub(crate) fn placeholder_bindings_match_within_slot(
+    source: &[AppliedPlaceholder],
+    candidate: &[AppliedPlaceholder],
+) -> bool {
+    if source.len() != candidate.len() {
+        return false;
+    }
+
+    let mut matched = vec![false; candidate.len()];
+    for expected in source {
+        let Some(index) = candidate.iter().enumerate().position(|(index, actual)| {
+            !matched[index] && placeholder_binding_identity_eq(expected, actual)
+        }) else {
+            return false;
+        };
+        matched[index] = true;
+    }
+
+    source
+        .iter()
+        .filter(|binding| binding.order_policy == PlaceholderOrderPolicy::Preserve)
+        .zip(
+            candidate
+                .iter()
+                .filter(|binding| binding.order_policy == PlaceholderOrderPolicy::Preserve),
+        )
+        .all(|(expected, actual)| placeholder_binding_identity_eq(expected, actual))
+}
+
+pub(crate) fn placeholder_binding_identity_eq(
+    left: &AppliedPlaceholder,
+    right: &AppliedPlaceholder,
+) -> bool {
+    left.semantic_identity == right.semantic_identity
+        && left.origin == right.origin
+        && left.label == right.label
+        && left.scope == right.scope
+        && left.segment == right.segment
+        && left.order_policy == right.order_policy
+        && left.wrapper == right.wrapper
 }
 
 /// 一次保护的完整可逆结果。
@@ -1440,8 +1989,22 @@ fn placeholder_binding_fingerprint_with_cancellation<E>(
     let chunk_size =
         NonZeroUsize::new(PLACEHOLDER_CANCELLATION_CHECK_BYTES).expect("检查块大小必须非零");
     let mut hasher = Sha256FramedHasher::new(b"att.placeholder-bindings");
+    let mut wrapper_ordinals = HashMap::new();
+    let mut next_wrapper_ordinal = 0_u64;
     for binding in bindings {
         ensure_running()?;
+        let wrapper = binding.wrapper();
+        let wrapper_ordinal = wrapper
+            .map(|contract| {
+                *wrapper_ordinals.entry(contract.pair()).or_insert_with(|| {
+                    let ordinal = next_wrapper_ordinal;
+                    next_wrapper_ordinal = next_wrapper_ordinal
+                        .checked_add(1)
+                        .expect("单个文本的 wrapper 数量必须可由 u64 表示");
+                    ordinal
+                })
+            })
+            .map(u64::to_be_bytes);
         hasher
             .try_frame_chunks(
                 1,
@@ -1452,6 +2015,12 @@ fn placeholder_binding_fingerprint_with_cancellation<E>(
             .try_frame_chunks(
                 2,
                 binding.original().as_bytes(),
+                chunk_size,
+                &mut ensure_running,
+            )?
+            .try_frame_chunks(
+                11,
+                binding.semantic_identity().as_bytes(),
                 chunk_size,
                 &mut ensure_running,
             )?
@@ -1472,7 +2041,35 @@ fn placeholder_binding_fingerprint_with_cancellation<E>(
                 binding.segment().name().as_bytes(),
                 chunk_size,
                 &mut ensure_running,
-            )?;
+            )?
+            .try_frame_chunks(
+                6,
+                binding.order_policy().fingerprint_name().as_bytes(),
+                chunk_size,
+                &mut ensure_running,
+            )?
+            .frame(
+                7,
+                if wrapper.is_some() {
+                    b"wrapper"
+                } else {
+                    b"none"
+                },
+            )
+            .frame(
+                8,
+                wrapper_ordinal
+                    .as_ref()
+                    .map_or(&[][..], |ordinal| ordinal.as_slice()),
+            )
+            .frame(
+                10,
+                wrapper
+                    .map(PlaceholderWrapperContract::capture_shape)
+                    .map(PlaceholderWrapperCaptureShape::fingerprint_name)
+                    .unwrap_or("none")
+                    .as_bytes(),
+            );
     }
     ensure_running()?;
     Ok(hasher.finish())
@@ -1569,6 +2166,21 @@ pub(crate) enum PlaceholderRuleCompilationError {
         rule_number: usize,
         scope: String,
     },
+    EmptyIds {
+        rule_number: usize,
+    },
+    InvalidId {
+        rule_number: usize,
+        id: String,
+    },
+    UnknownId {
+        rule_number: usize,
+        id: String,
+    },
+    DuplicateId {
+        rule_number: usize,
+        id: String,
+    },
     EmptyPattern {
         rule_number: usize,
     },
@@ -1579,6 +2191,9 @@ pub(crate) enum PlaceholderRuleCompilationError {
     InvalidNamedCaptures {
         rule_number: usize,
         captures: Vec<String>,
+    },
+    ReorderedWrapper {
+        rule_number: usize,
     },
 }
 
@@ -1605,6 +2220,21 @@ impl fmt::Display for PlaceholderRuleCompilationError {
             Self::DuplicateScope { rule_number, scope } => {
                 write!(formatter, "占位符规则 {rule_number} 重复作用域 {scope:?}")
             }
+            Self::EmptyIds { rule_number } => {
+                write!(formatter, "占位符规则 {rule_number} 的 ids 为空")
+            }
+            Self::InvalidId { rule_number, id } => {
+                write!(formatter, "占位符规则 {rule_number} 的自然 ID 无效：{id:?}")
+            }
+            Self::UnknownId { rule_number, id } => {
+                write!(
+                    formatter,
+                    "占位符规则 {rule_number} 指向当前项目不存在的 {id}"
+                )
+            }
+            Self::DuplicateId { rule_number, id } => {
+                write!(formatter, "占位符规则 {rule_number} 重复自然 ID {id}")
+            }
             Self::EmptyPattern { rule_number } => {
                 write!(formatter, "占位符规则 {rule_number} 的 pattern 不能为空")
             }
@@ -1621,6 +2251,10 @@ impl fmt::Display for PlaceholderRuleCompilationError {
             } => write!(
                 formatter,
                 "占位符规则 {rule_number} 只允许唯一的 text 命名捕获组，实际为 {captures:?}"
+            ),
+            Self::ReorderedWrapper { rule_number } => write!(
+                formatter,
+                "占位符规则 {rule_number} 含 text wrapper，order 必须为 preserve"
             ),
         }
     }
@@ -1655,6 +2289,18 @@ impl PlaceholderRuleCompilationError {
                     rule_number: *rule_number,
                 }
             }
+            Self::EmptyIds { rule_number } => PlaceholderCompilationProblem::EmptyIds {
+                rule_number: *rule_number,
+            },
+            Self::InvalidId { rule_number, .. } => PlaceholderCompilationProblem::InvalidId {
+                rule_number: *rule_number,
+            },
+            Self::UnknownId { rule_number, .. } => PlaceholderCompilationProblem::UnknownId {
+                rule_number: *rule_number,
+            },
+            Self::DuplicateId { rule_number, .. } => PlaceholderCompilationProblem::DuplicateId {
+                rule_number: *rule_number,
+            },
             Self::EmptyPattern { rule_number } => PlaceholderCompilationProblem::EmptyPattern {
                 rule_number: *rule_number,
             },
@@ -1672,6 +2318,11 @@ impl PlaceholderRuleCompilationError {
                 rule_number: *rule_number,
                 actual_count: captures.len(),
             },
+            Self::ReorderedWrapper { rule_number } => {
+                PlaceholderCompilationProblem::ReorderedWrapper {
+                    rule_number: *rule_number,
+                }
+            }
         }
     }
 }
@@ -1898,11 +2549,155 @@ mod tests {
             one_shot
                 .frame(1, binding.token().as_bytes())
                 .frame(2, binding.original().as_bytes())
+                .frame(11, binding.semantic_identity().as_bytes())
                 .frame(3, binding.label().as_bytes())
                 .frame(4, binding.scope().as_bytes())
-                .frame(5, binding.segment().name().as_bytes());
+                .frame(5, binding.segment().name().as_bytes())
+                .frame(6, b"preserve")
+                .frame(7, b"none")
+                .frame(8, &[])
+                .frame(10, b"none");
         }
         assert_eq!(actual.binding_fingerprint(), one_shot.finish());
+    }
+
+    #[test]
+    fn order_policy_changes_the_binding_state_even_for_the_same_source_fragment() {
+        let service = PlaceholderService;
+        let preserve = service
+            .compile_custom(
+                vec![PlaceholderRuleDefinition::new(None, r"%[0-9]+")],
+                |_| true,
+            )
+            .unwrap();
+        let reorder = service
+            .compile_custom(
+                vec![
+                    PlaceholderRuleDefinition::new(None, r"%[0-9]+")
+                        .with_order(PlaceholderOrderPolicy::ReorderWithinSlot),
+                ],
+                |_| true,
+            )
+            .unwrap();
+        let preserve = service
+            .protect("system", "%1", &[], &preserve, None)
+            .unwrap();
+        let reorder = service
+            .protect("system", "%1", &[], &reorder, None)
+            .unwrap();
+        assert_ne!(
+            preserve.binding_fingerprint(),
+            reorder.binding_fingerprint()
+        );
+    }
+
+    #[test]
+    fn applicable_contract_fingerprint_uses_only_the_selected_rule_semantics() {
+        let service = PlaceholderService;
+        let split = service
+            .compile_custom(
+                vec![
+                    PlaceholderRuleDefinition::new(None, r"\{name\}")
+                        .with_ids(vec!["a".to_owned()]),
+                    PlaceholderRuleDefinition::new(None, r"\{name\}")
+                        .with_ids(vec!["b".to_owned()]),
+                ],
+                |_| true,
+            )
+            .unwrap();
+        assert_eq!(
+            split.applicable_contract_fingerprint("dialogue", "a"),
+            split.applicable_contract_fingerprint("dialogue", "b")
+        );
+
+        let first = service
+            .compile_custom(
+                vec![
+                    PlaceholderRuleDefinition::new(None, r"\{name\}"),
+                    PlaceholderRuleDefinition::new(None, r"%[0-9]+")
+                        .with_order(PlaceholderOrderPolicy::ReorderWithinSlot),
+                ],
+                |_| true,
+            )
+            .unwrap();
+        let reversed = service
+            .compile_custom(
+                vec![
+                    PlaceholderRuleDefinition::new(None, r"%[0-9]+")
+                        .with_order(PlaceholderOrderPolicy::ReorderWithinSlot),
+                    PlaceholderRuleDefinition::new(None, r"\{name\}"),
+                ],
+                |_| true,
+            )
+            .unwrap();
+        assert_eq!(
+            first.applicable_contract_fingerprint("dialogue", "a"),
+            reversed.applicable_contract_fingerprint("dialogue", "a")
+        );
+
+        let no_longer_applies = service
+            .compile_custom(
+                vec![
+                    PlaceholderRuleDefinition::new(None, r"\{name\}")
+                        .with_ids(vec!["b".to_owned()]),
+                ],
+                |_| true,
+            )
+            .unwrap();
+        assert_ne!(
+            split.applicable_contract_fingerprint("dialogue", "a"),
+            no_longer_applies.applicable_contract_fingerprint("dialogue", "a")
+        );
+    }
+
+    #[test]
+    fn wrapper_binding_fingerprint_does_not_persist_rule_numbers() {
+        let service = PlaceholderService;
+        let only_wrapper = service
+            .compile_custom(
+                vec![PlaceholderRuleDefinition::new(None, r"<n>(?<text>.*?)</n>")],
+                |_| true,
+            )
+            .unwrap();
+        let wrapper_after_other_rule = service
+            .compile_custom(
+                vec![
+                    PlaceholderRuleDefinition::new(None, r"\{unused\}"),
+                    PlaceholderRuleDefinition::new(None, r"<n>(?<text>.*?)</n>"),
+                ],
+                |_| true,
+            )
+            .unwrap();
+        let first = service
+            .protect("dialogue", "<n>Alice</n>", &[], &only_wrapper, None)
+            .unwrap();
+        let second = service
+            .protect(
+                "dialogue",
+                "<n>Alice</n>",
+                &[],
+                &wrapper_after_other_rule,
+                None,
+            )
+            .unwrap();
+        assert_eq!(first.binding_fingerprint(), second.binding_fingerprint());
+    }
+
+    #[test]
+    fn wrapper_rules_cannot_request_independent_token_reordering() {
+        let error = PlaceholderService
+            .compile_custom(
+                vec![
+                    PlaceholderRuleDefinition::new(None, r"<n>(?<text>.*?)</n>")
+                        .with_order(PlaceholderOrderPolicy::ReorderWithinSlot),
+                ],
+                |_| true,
+            )
+            .expect_err("wrapper 的两个边界不能独立换序");
+        assert!(matches!(
+            error,
+            PlaceholderRuleCompilationError::ReorderedWrapper { rule_number: 1 }
+        ));
     }
 
     #[test]
@@ -2079,6 +2874,139 @@ mod tests {
         let rendered = error.to_string();
         assert!(!rendered.contains(sensitive_source));
         assert!(!rendered.contains("敏感"));
+    }
+
+    #[test]
+    fn wrapper_capture_must_remain_inside_its_original_boundaries() {
+        let service = PlaceholderService;
+        let custom = service
+            .compile_custom(
+                vec![PlaceholderRuleDefinition::new(None, r"\\N<(?<text>[^>]*)>")],
+                |_| true,
+            )
+            .expect("wrapper 规则应可编译");
+        let protected = service
+            .protect("dialogue", r"\N<Alice>Hello", &[], &custom, None)
+            .expect("wrapper 应可保护");
+        let begin = protected
+            .placeholders()
+            .iter()
+            .find(|binding| binding.segment() == PlaceholderSegment::Begin)
+            .expect("应有 Begin")
+            .token();
+        let end = protected
+            .placeholders()
+            .iter()
+            .find(|binding| binding.segment() == PlaceholderSegment::End)
+            .expect("应有 End")
+            .token();
+
+        assert_eq!(
+            protected
+                .restore(&format!("{begin}爱丽丝{end}你好"))
+                .expect("捕获译文仍在 wrapper 内应通过"),
+            r"\N<爱丽丝>你好"
+        );
+        assert!(matches!(
+            protected.restore(&format!("爱丽丝{begin}{end}你好")),
+            Err(PlaceholderRestoreError::Multiset(
+                PlaceholderMultisetError::WrapperTopologyChanged { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn single_sided_wrappers_keep_capture_on_the_bounded_side() {
+        let service = PlaceholderService;
+        for (pattern, source, valid, invalid) in [
+            (
+                r"<name>(?<text>[A-Za-z]+)",
+                "<name>Alice tail",
+                "BEGIN爱丽丝END tail",
+                "爱丽丝BEGINEND tail",
+            ),
+            (
+                r"(?<text>[A-Za-z]+)</name>",
+                "head Alice</name>",
+                "head BEGIN爱丽丝END",
+                "head 爱丽丝BEGINEND",
+            ),
+        ] {
+            let custom = service
+                .compile_custom(vec![PlaceholderRuleDefinition::new(None, pattern)], |_| {
+                    true
+                })
+                .expect("单侧 wrapper 规则应可编译");
+            let protected = service
+                .protect("dialogue", source, &[], &custom, None)
+                .expect("单侧 wrapper 应可保护");
+            let begin = protected
+                .placeholders()
+                .iter()
+                .find(|binding| binding.segment() == PlaceholderSegment::Begin)
+                .expect("应有 wrapper Begin 边界")
+                .token();
+            let end = protected
+                .placeholders()
+                .iter()
+                .find(|binding| binding.segment() == PlaceholderSegment::End)
+                .expect("应有 wrapper End 边界")
+                .token();
+            let valid = valid.replace("BEGIN", begin).replace("END", end);
+            let invalid = invalid.replace("BEGIN", begin).replace("END", end);
+            assert!(protected.restore(&valid).is_ok());
+            assert!(matches!(
+                protected.restore(&invalid),
+                Err(PlaceholderRestoreError::Multiset(
+                    PlaceholderMultisetError::WrapperTopologyChanged { .. }
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn wrapper_capture_shape_handles_empty_blank_and_nested_placeholder() {
+        let service = PlaceholderService;
+        let wrapper_rule = |pattern| {
+            service
+                .compile_custom(vec![PlaceholderRuleDefinition::new(None, pattern)], |_| {
+                    true
+                })
+                .expect("wrapper 规则应可编译")
+        };
+        for (source, inside, accepted) in [
+            ("<n></n>", "", true),
+            ("<n></n>", "文字", false),
+            ("<n> </n>", "", true),
+            ("<n> </n>", " ", true),
+            ("<n> </n>", "文字", false),
+        ] {
+            let protected = service
+                .protect(
+                    "dialogue",
+                    source,
+                    &[],
+                    &wrapper_rule(r"<n>(?<text>.*?)</n>"),
+                    None,
+                )
+                .expect("wrapper 应可保护");
+            let candidate = format!(
+                "{}{}{}",
+                protected.placeholders()[0].token(),
+                inside,
+                protected.placeholders()[1].token()
+            );
+            assert_eq!(protected.restore(&candidate).is_ok(), accepted);
+        }
+
+        let custom = wrapper_rule(r"<n>(?<text>.*?)</n>");
+        let builtin = service
+            .compile_builtin(r"\\[Nn]\[[0-9]+\]", "CONTROL")
+            .expect("测试内建规则应可编译");
+        let protected = service
+            .protect("dialogue", r"<n>\N[1]</n>", &[], &custom, Some(&builtin))
+            .expect("捕获仅含内建 token 也应可保护");
+        assert!(protected.restore(protected.text()).is_ok());
     }
 
     #[test]
@@ -2381,6 +3309,10 @@ mod tests {
                 rule_number: Some(1),
                 scope: marker,
                 segment: PlaceholderSegment::Whole,
+                order_policy: PlaceholderOrderPolicy::Preserve,
+                wrapper_pair: None,
+                wrapper_capture: None,
+                semantic_identity: None,
             }
         }
 

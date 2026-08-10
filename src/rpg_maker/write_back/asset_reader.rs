@@ -1,6 +1,6 @@
 //! 从 RPG Maker 文本资产表建立写回快照。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
@@ -51,17 +51,18 @@ use crate::rpg_maker::semantic_order::{
 use crate::rpg_maker::text::{RpgMakerLocation, TextGroupKind};
 use crate::rpg_maker::translate::placeholder::{
     Pcre2PlaceholderConstructionError, Pcre2PlaceholderService, PlaceholderRuleCompilationError,
-    PlaceholderRuleDefinition,
 };
 use crate::runtime::cpu::CpuExecutorUnavailable;
 use crate::runtime::sqlite::SqliteRuntimeError;
 use crate::storage::sqlite::{
     QueryExistingDatabaseError, SqliteQuery, SqliteQueryExecutor, SqliteRow, SqliteValue,
 };
+use crate::translation::placeholder::PlaceholderRuleDefinition;
 
 use super::planner::{
-    RpgMakerWriteBackAssetReader, RpgMakerWriteBackGroup, RpgMakerWriteBackSnapshot,
-    RpgMakerWriteBackSnapshotError, RpgMakerWriteBackSymbolRepairContext, RpgMakerWriteBackUnit,
+    RpgMakerWriteBackAssetReader, RpgMakerWriteBackCandidateValidationContext,
+    RpgMakerWriteBackGroup, RpgMakerWriteBackSnapshot, RpgMakerWriteBackSnapshotError,
+    RpgMakerWriteBackUnit,
 };
 
 const RPG_MAKER_WRITE_BACK_QUERY_RESULT_COUNT: usize =
@@ -219,10 +220,11 @@ fn decode_placeholder_rules_rows(
     }
 }
 
-fn build_symbol_repair_context(
+fn build_candidate_validation_context(
     engine: RpgMakerEngine,
     placeholder_rules_json: String,
-) -> Result<RpgMakerWriteBackSymbolRepairContext, InvalidRpgMakerWriteBackAssetSnapshot> {
+    valid_ids: &HashSet<String>,
+) -> Result<RpgMakerWriteBackCandidateValidationContext, InvalidRpgMakerWriteBackAssetSnapshot> {
     let placeholder_definitions: Vec<PlaceholderRuleDefinition> =
         serde_json::from_str(&placeholder_rules_json)
             .map_err(InvalidRpgMakerWriteBackAssetSnapshot::InvalidPlaceholderRulesJson)?;
@@ -235,16 +237,18 @@ fn build_symbol_repair_context(
         }
         Err(unreachable) => match unreachable {},
     };
-    let placeholder_rules = match placeholder_service
-        .compile_custom_with_cancellation(placeholder_definitions, || Ok::<_, Infallible>(()))
-    {
+    let placeholder_rules = match placeholder_service.compile_custom_for_ids_with_cancellation(
+        placeholder_definitions,
+        valid_ids,
+        || Ok::<_, Infallible>(()),
+    ) {
         Ok(Ok(rules)) => rules,
         Ok(Err(source)) => {
             return Err(InvalidRpgMakerWriteBackAssetSnapshot::InvalidPlaceholderRules(source));
         }
         Err(unreachable) => match unreachable {},
     };
-    Ok(RpgMakerWriteBackSymbolRepairContext::new(
+    Ok(RpgMakerWriteBackCandidateValidationContext::new(
         engine,
         placeholder_service,
         placeholder_rules,
@@ -346,10 +350,18 @@ where
             let owner_states = prepared.owner_states;
             let placeholder_rules_json = prepared.placeholder_rules;
             cpu.execute(move || {
-                let symbol_repair = build_symbol_repair_context(engine, placeholder_rules_json)?;
                 let decoded = decoded_records.into_iter().collect::<Result<Vec<_>, _>>()?;
+                let valid_ids = decoded
+                    .iter()
+                    .filter_map(|record| match record {
+                        DecodedRecord::Unit { readable_id, .. } => Some(readable_id.clone()),
+                        _ => None,
+                    })
+                    .collect::<HashSet<_>>();
+                let candidate_validation =
+                    build_candidate_validation_context(engine, placeholder_rules_json, &valid_ids)?;
                 assemble_snapshot(owner_states, decoded, &dialogue_definition_json)
-                    .map(|snapshot| snapshot.with_symbol_repair(symbol_repair))
+                    .map(|snapshot| snapshot.with_candidate_validation(candidate_validation))
             })
             .await
             .map_err(
@@ -1342,6 +1354,7 @@ enum DecodedRecord {
         source_context_json: String,
         translation_content: Option<TextUnitContent>,
         manual: bool,
+        readable_id: String,
     },
     Claim {
         owner: RpgMakerAssetOwner,
@@ -1430,6 +1443,7 @@ fn decode_unit(
         source_content.clone(),
         source_context_json.clone(),
     );
+    let readable_id = identity.readable_id();
     let manual_type = crate::manual::rpg_maker_manual_type(&identity);
     let source_lines = crate::manual::rpg_maker_manual_source_lines(&source_content);
     let recipe_shape =
@@ -1500,6 +1514,7 @@ fn decode_unit(
         source_context_json,
         translation_content,
         manual,
+        readable_id,
     })
 }
 
@@ -1687,6 +1702,7 @@ fn assemble_snapshot(
                 source_context_json,
                 translation_content,
                 manual,
+                readable_id: _,
             } => {
                 fingerprint_accumulators
                     .get_mut(&owner)
@@ -2128,17 +2144,23 @@ mod tests {
 
     #[test]
     fn write_back_placeholder_rules_are_strictly_parsed_and_compiled() {
+        let ids = HashSet::new();
         assert!(matches!(
-            build_symbol_repair_context(RpgMakerEngine::Mz, "{not-json".to_owned()),
+            build_candidate_validation_context(RpgMakerEngine::Mz, "{not-json".to_owned(), &ids),
             Err(InvalidRpgMakerWriteBackAssetSnapshot::InvalidPlaceholderRulesJson(_))
         ));
         assert!(matches!(
-            build_symbol_repair_context(RpgMakerEngine::Mv, r#"[{"pattern":"("}]"#.to_owned(),),
+            build_candidate_validation_context(
+                RpgMakerEngine::Mv,
+                r#"[{"order":"preserve","pattern":"("}]"#.to_owned(),
+                &ids,
+            ),
             Err(InvalidRpgMakerWriteBackAssetSnapshot::InvalidPlaceholderRules(_))
         ));
-        build_symbol_repair_context(
+        build_candidate_validation_context(
             RpgMakerEngine::Mz,
-            r#"[{"scopes":["event_dialogue"],"pattern":"<msg>(?<text>.*?)</msg>"}]"#.to_owned(),
+            r#"[{"scopes":["event_dialogue"],"order":"preserve","pattern":"<msg>(?<text>.*?)</msg>"}]"#.to_owned(),
+            &ids,
         )
         .expect("当前规范 Placeholder 快照应可建立写回修复上下文");
     }

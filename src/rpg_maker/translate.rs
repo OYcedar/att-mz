@@ -22,6 +22,8 @@ pub struct TranslateInput {
     pub terminology_path: Option<PathBuf>,
     /// 本次补充的占位符规则；`None` 不关闭 RPG Maker 内置保护规格。
     pub placeholder_rules_path: Option<PathBuf>,
+    /// 除普通待翻译内容外，也准入当前仍适用的硬拒绝候选。
+    pub retry_rejected: bool,
 }
 
 /// 一轮 RPG Maker 翻译的正常业务汇总。

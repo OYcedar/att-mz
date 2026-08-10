@@ -66,7 +66,6 @@ pub(crate) enum DiagnosticResolution {
     FixInput,
     FixPlaceholderRules,
     ReviewDisabledRules,
-    AdjustManualLayout,
     CheckPathAndPermissions,
     CheckProjectState,
     ResolveContention,
@@ -83,7 +82,6 @@ impl DiagnosticResolution {
             Self::FixInput => "fix_input",
             Self::FixPlaceholderRules => "fix_placeholder_rules",
             Self::ReviewDisabledRules => "review_disabled_rules",
-            Self::AdjustManualLayout => "adjust_manual_layout",
             Self::CheckPathAndPermissions => "check_path_and_permissions",
             Self::CheckProjectState => "check_project_state",
             Self::ResolveContention => "resolve_contention",
@@ -531,11 +529,6 @@ fn render_diagnostic_reason(
         ) => {
             if let (Ok(line), Ok(column)) = (u64::try_from(*line), u64::try_from(*column)) {
                 details.push(localizer.format(UiMessage::DiagnosticJsonPosition { line, column }));
-            }
-        }
-        DiagnosticIssue::RpgMaker(issue) => {
-            if let Some(detail) = issue.manual_layout_reason_detail() {
-                details.push(detail);
             }
         }
         _ => {}

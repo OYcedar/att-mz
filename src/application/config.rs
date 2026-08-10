@@ -25,9 +25,10 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use super::arguments::{
-    ExtractArguments, GenericCommand, GenericInitArguments, InitArguments, ManualArguments,
-    ManualCommand, MvCommand, MzCommand, ProductCommand, ProjectLuaArguments,
-    RpgMakerManualCommand, RpgMakerManualExportArguments, TranslateArguments, WriteBackArguments,
+    DataExportArguments, DataExportCommand, ExtractArguments, GenericCommand, GenericInitArguments,
+    InitArguments, ManualArguments, ManualCommand, ManualExportArguments, ManualSelectionArgument,
+    MvCommand, MzCommand, ProductCommand, ProjectLuaArguments, RpgMakerManualCommand,
+    TranslateArguments, WriteBackArguments,
 };
 
 use crate::diagnostic::{
@@ -38,7 +39,7 @@ use crate::language::{
     JapaneseLanguageModule, JapaneseResidualPolicy, LanguageId, LanguageIdError, LanguageModule,
     LanguageModuleCatalog, LanguageModuleCatalogBuildError, LanguagePolicyConfigurationError,
 };
-use crate::manual::ManualOperation;
+use crate::manual::{ManualExportSelection, ManualOperation};
 use crate::project_name::ProjectName;
 use crate::rpg_maker::RpgMakerLayout;
 use crate::rpg_maker::extract::document::RpgMakerDocumentReadingConfig;
@@ -228,6 +229,10 @@ fn normalize_mv_command(command: MvCommand) -> (RpgMakerCommandArguments, Option
         MvCommand::Translate(arguments) => (RpgMakerCommandArguments::Translate(arguments), None),
         MvCommand::WriteBack(arguments) => (RpgMakerCommandArguments::WriteBack(arguments), None),
         MvCommand::Manual { command } => (RpgMakerCommandArguments::Manual(command), None),
+        MvCommand::Ownership { command } => (RpgMakerCommandArguments::Ownership(command), None),
+        MvCommand::Translation { command } => {
+            (RpgMakerCommandArguments::Translation(command), None)
+        }
         MvCommand::Lua(arguments) => (RpgMakerCommandArguments::Lua(arguments), None),
     }
 }
@@ -238,6 +243,8 @@ enum RpgMakerCommandArguments {
     Translate(TranslateArguments),
     WriteBack(WriteBackArguments),
     Manual(RpgMakerManualCommand),
+    Ownership(DataExportCommand),
+    Translation(DataExportCommand),
     Lua(ProjectLuaArguments),
 }
 
@@ -249,6 +256,8 @@ impl From<MzCommand> for RpgMakerCommandArguments {
             MzCommand::Translate(arguments) => Self::Translate(arguments),
             MzCommand::WriteBack(arguments) => Self::WriteBack(arguments),
             MzCommand::Manual { command } => Self::Manual(command),
+            MzCommand::Ownership { command } => Self::Ownership(command),
+            MzCommand::Translation { command } => Self::Translation(command),
             MzCommand::Lua(arguments) => Self::Lua(arguments),
         }
     }
@@ -261,6 +270,8 @@ pub(crate) enum ConfiguredRpgMakerCommand {
     Translate(Box<ConfiguredTranslateCommand>),
     WriteBack(ConfiguredWriteBackCommand),
     Manual(ConfiguredManualCommand),
+    Ownership(ConfiguredManualCommand),
+    Translation(ConfiguredManualCommand),
     Lua(ConfiguredProjectLuaCommand),
 }
 
@@ -335,6 +346,7 @@ impl ConfiguredRpgMakerCommand {
                     profile_id,
                     terms,
                     placeholders,
+                    retry_rejected,
                 } = arguments;
                 let rpg_maker = PendingTranslateConfiguration::build(
                     distribution.prompts_root(),
@@ -351,6 +363,7 @@ impl ConfiguredRpgMakerCommand {
                     common,
                     cpu,
                     record_translation_tasks,
+                    retry_rejected,
                     profile: ConfiguredTranslateProfile::Deferred {
                         source: deferred_source,
                         configuration: rpg_maker,
@@ -393,6 +406,28 @@ impl ConfiguredRpgMakerCommand {
                     common,
                 )?))
             }
+            RpgMakerCommandArguments::Ownership(command) => {
+                Ok(Self::Ownership(ConfiguredManualCommand::build_data_export(
+                    configuration_path,
+                    source,
+                    toml_index.as_ref(),
+                    command,
+                    ManualOperation::OwnershipExport,
+                    common,
+                    false,
+                )?))
+            }
+            RpgMakerCommandArguments::Translation(command) => Ok(Self::Translation(
+                ConfiguredManualCommand::build_data_export(
+                    configuration_path,
+                    source,
+                    toml_index.as_ref(),
+                    command,
+                    ManualOperation::TranslationExport,
+                    common,
+                    false,
+                )?,
+            )),
             RpgMakerCommandArguments::Lua(arguments) => {
                 let raw: RawManualSelection = parse_selected(
                     source,
@@ -432,6 +467,7 @@ pub(crate) enum ConfiguredGenericCommand {
     Translate(Box<ConfiguredTranslateCommand>),
     WriteBack(ConfiguredGenericWriteBackCommand),
     Manual(ConfiguredManualCommand),
+    Translation(ConfiguredManualCommand),
     Lua(ConfiguredProjectLuaCommand),
 }
 
@@ -440,7 +476,7 @@ pub(crate) struct ConfiguredManualCommand {
     operation: ManualOperation,
     project_name: ProjectName,
     file: PathBuf,
-    ownership_file: Option<PathBuf>,
+    export_selection: Option<ManualExportSelection>,
     common: CommonCommandConfiguration,
     language_modules: Option<LanguageModuleCatalog>,
 }
@@ -503,9 +539,10 @@ impl ConfiguredManualCommand {
             )?;
             None
         };
-        let (operation, arguments, ownership_file) = match command {
-            RpgMakerManualCommand::Export(RpgMakerManualExportArguments { manual, ownership }) => {
-                (ManualOperation::Export, manual, ownership)
+        let (operation, arguments, export_selection) = match command {
+            RpgMakerManualCommand::Export(arguments) => {
+                let (manual, selection) = manual_export_parts(arguments);
+                (ManualOperation::Export, manual, Some(selection))
             }
             RpgMakerManualCommand::Check(arguments) => (ManualOperation::Check, arguments, None),
             RpgMakerManualCommand::Apply(arguments) => (ManualOperation::Apply, arguments, None),
@@ -513,7 +550,7 @@ impl ConfiguredManualCommand {
         Ok(Self::from_parts(
             operation,
             arguments,
-            ownership_file,
+            export_selection,
             common,
             language_modules,
         ))
@@ -524,18 +561,69 @@ impl ConfiguredManualCommand {
         common: CommonCommandConfiguration,
         language_modules: Option<LanguageModuleCatalog>,
     ) -> Self {
-        let (operation, arguments) = match command {
-            ManualCommand::Export(arguments) => (ManualOperation::Export, arguments),
-            ManualCommand::Check(arguments) => (ManualOperation::Check, arguments),
-            ManualCommand::Apply(arguments) => (ManualOperation::Apply, arguments),
+        let (operation, arguments, export_selection) = match command {
+            ManualCommand::Export(arguments) => {
+                let (manual, selection) = manual_export_parts(arguments);
+                (ManualOperation::Export, manual, Some(selection))
+            }
+            ManualCommand::Check(arguments) => (ManualOperation::Check, arguments, None),
+            ManualCommand::Apply(arguments) => (ManualOperation::Apply, arguments, None),
         };
-        Self::from_parts(operation, arguments, None, common, language_modules)
+        Self::from_parts(
+            operation,
+            arguments,
+            export_selection,
+            common,
+            language_modules,
+        )
+    }
+
+    fn build_data_export(
+        configuration_path: &Path,
+        source: &str,
+        toml_index: &ConfigurationTomlIndex,
+        command: DataExportCommand,
+        operation: ManualOperation,
+        common: CommonCommandConfiguration,
+        needs_languages: bool,
+    ) -> Result<Self, ConfigurationLoadError> {
+        let language_modules = if needs_languages {
+            let raw: RawManualSelection = parse_selected(
+                source,
+                configuration_path,
+                toml_index,
+                ConfigurationSelection::Languages,
+            )?;
+            Some(
+                build_language_modules(raw.languages)
+                    .map_err(ConfigurationLoadError::InvalidValue)?,
+            )
+        } else {
+            let _: RawInitSelection = parse_selected(
+                source,
+                configuration_path,
+                toml_index,
+                ConfigurationSelection::NoAdditionalFields,
+            )?;
+            None
+        };
+        let DataExportCommand::Export(DataExportArguments { project, jsonl }) = command;
+        Ok(Self::from_parts(
+            operation,
+            ManualArguments {
+                project,
+                file: jsonl,
+            },
+            None,
+            common,
+            language_modules,
+        ))
     }
 
     fn from_parts(
         operation: ManualOperation,
         arguments: ManualArguments,
-        ownership_file: Option<PathBuf>,
+        export_selection: Option<ManualExportSelection>,
         common: CommonCommandConfiguration,
         language_modules: Option<LanguageModuleCatalog>,
     ) -> Self {
@@ -544,7 +632,7 @@ impl ConfiguredManualCommand {
             operation,
             project_name: project.name,
             file,
-            ownership_file,
+            export_selection,
             common,
             language_modules,
         }
@@ -562,8 +650,8 @@ impl ConfiguredManualCommand {
         &self.file
     }
 
-    pub(crate) fn ownership_file(&self) -> Option<&Path> {
-        self.ownership_file.as_deref()
+    pub(crate) const fn export_selection(&self) -> Option<&ManualExportSelection> {
+        self.export_selection.as_ref()
     }
 
     pub(crate) const fn common(&self) -> &CommonCommandConfiguration {
@@ -573,6 +661,26 @@ impl ConfiguredManualCommand {
     pub(crate) const fn language_modules(&self) -> Option<&LanguageModuleCatalog> {
         self.language_modules.as_ref()
     }
+}
+
+fn manual_export_parts(
+    arguments: ManualExportArguments,
+) -> (ManualArguments, ManualExportSelection) {
+    let ManualExportArguments {
+        manual,
+        selection,
+        ids,
+    } = arguments;
+    let selection = if let Some(ids) = ids {
+        ManualExportSelection::Ids(ids)
+    } else {
+        match selection.unwrap_or(ManualSelectionArgument::Pending) {
+            ManualSelectionArgument::Pending => ManualExportSelection::Pending,
+            ManualSelectionArgument::Rejected => ManualExportSelection::Rejected,
+            ManualSelectionArgument::All => ManualExportSelection::All,
+        }
+    };
+    (manual, selection)
 }
 
 impl ConfiguredGenericCommand {
@@ -625,6 +733,7 @@ impl ConfiguredGenericCommand {
                     profile_id,
                     terms,
                     placeholders,
+                    retry_rejected,
                 } = arguments;
                 let translation = PendingTranslateConfiguration::build(
                     distribution.prompts_root(),
@@ -641,6 +750,7 @@ impl ConfiguredGenericCommand {
                     common,
                     cpu: build_cpu_configuration(),
                     record_translation_tasks,
+                    retry_rejected,
                     profile: ConfiguredTranslateProfile::Deferred {
                         source: deferred_source,
                         configuration: translation,
@@ -681,6 +791,17 @@ impl ConfiguredGenericCommand {
                 command,
                 common,
             )?)),
+            GenericCommand::Translation { command } => Ok(Self::Translation(
+                ConfiguredManualCommand::build_data_export(
+                    configuration_path,
+                    source,
+                    toml_index.as_ref(),
+                    command,
+                    ManualOperation::TranslationExport,
+                    common,
+                    false,
+                )?,
+            )),
             GenericCommand::Lua(arguments) => {
                 let raw: RawManualSelection = parse_selected(
                     source,
@@ -856,6 +977,7 @@ pub(crate) struct ConfiguredTranslateCommand {
     common: CommonCommandConfiguration,
     cpu: CpuExecutorConfig,
     record_translation_tasks: bool,
+    retry_rejected: bool,
     profile: ConfiguredTranslateProfile,
 }
 
@@ -896,6 +1018,10 @@ impl ConfiguredTranslateCommand {
         self.record_translation_tasks
     }
 
+    pub(crate) const fn retry_rejected(&self) -> bool {
+        self.retry_rejected
+    }
+
     /// 返回已经在命令行显式选择并于加载阶段完成校验的 Profile。
     ///
     /// `None` 表示调用方必须从项目运行方案取得 Profile，并调用
@@ -927,6 +1053,7 @@ impl ConfiguredTranslateCommand {
             common,
             cpu,
             record_translation_tasks,
+            retry_rejected,
             profile,
         } = self;
         let profile = match profile {
@@ -958,6 +1085,7 @@ impl ConfiguredTranslateCommand {
             common,
             cpu,
             record_translation_tasks,
+            retry_rejected,
             profile,
         })
     }

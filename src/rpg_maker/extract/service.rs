@@ -210,7 +210,7 @@ mod tests {
     use crate::project_name::ProjectName;
     use crate::rpg_maker::extract::builtin::BuiltInExtraction;
     use crate::rpg_maker::extract::rules::{RulesExtraction, RulesExtractionOutput, RulesProgram};
-    use crate::rpg_maker::project::{OpenedProject, test_layout_profile};
+    use crate::rpg_maker::project::OpenedProject;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct FakeError;
@@ -317,7 +317,6 @@ mod tests {
             PathBuf::from("C:/projects/demo/project.db"),
             "ja".to_owned(),
             "zh-Hans".to_owned(),
-            test_layout_profile(),
         );
         let progress = RecordingProgress::default();
         let rules = RulesProgram::from_toml(PathBuf::from("rules.toml"), b"rule = []".to_vec())

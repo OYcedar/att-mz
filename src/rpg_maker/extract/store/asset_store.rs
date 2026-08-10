@@ -2886,7 +2886,6 @@ mod tests {
         DirectTextPart, DirectTextRecipe, MutationClaim, ScalarFieldKey, TextProjectionRecipe,
         TextUnitContent, TextUnitRole,
     };
-    use crate::rpg_maker::project::test_layout_profile;
     use crate::rpg_maker::semantic_order::RpgMakerSemanticOrderKey;
     use crate::rpg_maker::text::{DataFileName, StandardDataFile};
     use crate::rpg_maker::translate::asset_reader::RpgMakerTranslationAssetReadingService;
@@ -4167,7 +4166,6 @@ mod tests {
             database_path.clone(),
             "ja".to_owned(),
             "zh-Hans".to_owned(),
-            test_layout_profile(),
         );
 
         let store = RpgMakerExtractionAssetStore::new(sqlite.clone(), cpu.clone());
@@ -4237,7 +4235,6 @@ mod tests {
             database_path,
             "ja".to_owned(),
             "zh-Hans".to_owned(),
-            test_layout_profile(),
         );
 
         let translation_reader =
@@ -5266,7 +5263,6 @@ mod tests {
             database_path,
             "ja".to_owned(),
             "zh-Hans".to_owned(),
-            test_layout_profile(),
         );
         let observer = Connection::open(project.database_path()).expect("应打开观察连接");
         let data_version_before: i64 = observer
@@ -5889,7 +5885,6 @@ mod tests {
             PathBuf::from("C:/projects/demo/project.db"),
             "ja".to_owned(),
             "zh-Hans".to_owned(),
-            test_layout_profile(),
         )
     }
 
@@ -6166,6 +6161,22 @@ ORDER BY name"#,
                     translation_json TEXT,
                     applicability_fingerprint BLOB,
                     PRIMARY KEY (owner, group_location, unit_role)
+                );
+                CREATE TABLE rpg_maker_rejected_translation (
+                    owner TEXT NOT NULL,
+                    group_id INTEGER NOT NULL CHECK (group_id > 0),
+                    unit_role TEXT NOT NULL,
+                    readable_id TEXT NOT NULL,
+                    origin TEXT NOT NULL,
+                    source_content_json TEXT NOT NULL,
+                    source_context_json TEXT NOT NULL,
+                    candidate_json TEXT NOT NULL,
+                    translation_json TEXT,
+                    violation_json TEXT NOT NULL,
+                    planning_state BLOB NOT NULL,
+                    PRIMARY KEY (owner, group_id, unit_role),
+                    FOREIGN KEY (owner, group_id, unit_role)
+                        REFERENCES rpg_maker_text_unit(owner, group_id, unit_role) ON DELETE CASCADE
                 );
                 CREATE TABLE rpg_maker_mutation_claim (
                     owner TEXT NOT NULL,

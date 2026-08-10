@@ -50,11 +50,13 @@ use crate::runtime::sqlite::SqliteRuntimeError;
 use crate::storage::sqlite::{
     QueryExistingDatabaseError, SqliteQuery, SqliteQueryExecutor, SqliteRow, SqliteValue,
 };
+use crate::translation::TranslationOrigin;
+use crate::translation::candidate_validation::{ProvenInvariantViolation, is_structural_blank};
 
 use super::pipeline::{
-    RpgMakerTranslationAsset, RpgMakerTranslationAssetReader, RpgMakerTranslationCorpus,
-    RpgMakerTranslationGroup, RpgMakerTranslationScope, TranslationOwnerSnapshot,
-    TranslationUnitIdentity,
+    RpgMakerStoredRejectedTranslation, RpgMakerTranslationAsset, RpgMakerTranslationAssetReader,
+    RpgMakerTranslationCorpus, RpgMakerTranslationGroup, RpgMakerTranslationScope,
+    TranslationOwnerSnapshot, TranslationUnitIdentity,
 };
 
 const READ_TRANSLATION_METADATA: &str = "SELECT source_snapshot_fingerprint FROM metadata";
@@ -90,7 +92,15 @@ fn read_translation_owner_units() -> String {
          unit.translation_state,\n    \
          text_group.projection_recipe_json,\n    \
          manual.translation_json,\n    \
-         manual.applicability_fingerprint\n\
+         manual.applicability_fingerprint,\n    \
+         rejected.readable_id,\n    \
+         rejected.origin,\n    \
+         rejected.source_content_json,\n    \
+         rejected.source_context_json,\n    \
+         rejected.candidate_json,\n    \
+         rejected.translation_json,\n    \
+         rejected.violation_json,\n    \
+         rejected.planning_state\n\
          FROM rpg_maker_text_group AS text_group\n\
          CROSS JOIN rpg_maker_text_unit AS unit\n  \
                     INDEXED BY rpg_maker_text_unit_owner_group_order_idx\n  \
@@ -100,6 +110,10 @@ fn read_translation_owner_units() -> String {
            ON manual.owner = text_group.owner\n \
           AND manual.group_location = text_group.group_location\n \
           AND manual.unit_role = unit.unit_role\n\
+         LEFT JOIN rpg_maker_rejected_translation AS rejected\n  \
+           ON rejected.owner = unit.owner\n \
+          AND rejected.group_id = unit.group_id\n \
+          AND rejected.unit_role = unit.unit_role\n\
          WHERE text_group.owner = ?\n\
          ORDER BY text_group.semantic_order_key,\n         \
           unit.semantic_order_key"
@@ -635,6 +649,21 @@ impl InvalidRpgMakerTranslationAssetSnapshot {
                     actual: *actual,
                 }
             }
+            Self::InvalidRejectedTranslation(source) | Self::InvalidRejectedViolation(source) => {
+                RpgMakerTranslationSnapshotViolation::InvalidTranslationContent {
+                    category: asset_json_failure(source),
+                    line: source.line(),
+                    column: source.column(),
+                }
+            }
+            Self::InvalidRejectedStatePair => {
+                RpgMakerTranslationSnapshotViolation::InvalidTranslationStatePair
+            }
+            Self::InvalidRejectedStateLength { actual } => {
+                RpgMakerTranslationSnapshotViolation::InvalidTranslationStateLength {
+                    actual: *actual,
+                }
+            }
             Self::DuplicateGroup {
                 owner,
                 group_location,
@@ -786,6 +815,12 @@ pub(crate) enum InvalidRpgMakerTranslationAssetSnapshot {
     InvalidTranslationStateLength {
         actual: usize,
     },
+    InvalidRejectedTranslation(serde_json::Error),
+    InvalidRejectedViolation(serde_json::Error),
+    InvalidRejectedStatePair,
+    InvalidRejectedStateLength {
+        actual: usize,
+    },
     DuplicateGroup {
         owner: RpgMakerAssetOwner,
         group_location: Box<RpgMakerLocation>,
@@ -924,6 +959,19 @@ impl fmt::Display for InvalidRpgMakerTranslationAssetSnapshot {
                 formatter,
                 "translation_state 必须是 32 字节 BLOB，实际为 {actual} 字节"
             ),
+            Self::InvalidRejectedTranslation(source) => {
+                write!(formatter, "Rejected 的字符串数组投影无效：{source}")
+            }
+            Self::InvalidRejectedViolation(source) => {
+                write!(formatter, "Rejected 的硬不变量原因无效：{source}")
+            }
+            Self::InvalidRejectedStatePair => {
+                formatter.write_str("Rejected 的持久字段必须同时存在或同时为空")
+            }
+            Self::InvalidRejectedStateLength { actual } => write!(
+                formatter,
+                "Rejected planning_state 必须是 32 字节 BLOB，实际为 {actual} 字节"
+            ),
             Self::DuplicateGroup {
                 owner,
                 group_location,
@@ -981,7 +1029,9 @@ impl Error for InvalidRpgMakerTranslationAssetSnapshot {
             Self::InvalidRole(source) => Some(source),
             Self::InvalidSourceContent(source)
             | Self::InvalidTranslationContent(source)
-            | Self::InvalidSourceContext(source) => Some(source),
+            | Self::InvalidSourceContext(source)
+            | Self::InvalidRejectedTranslation(source)
+            | Self::InvalidRejectedViolation(source) => Some(source),
             _ => None,
         }
     }
@@ -1307,6 +1357,7 @@ struct DecodedUnit {
     translation: Option<TextUnitContent>,
     translation_state: Option<Sha256Fingerprint>,
     manual: bool,
+    rejected: Option<RpgMakerStoredRejectedTranslation>,
 }
 
 fn decode_unit(
@@ -1318,7 +1369,7 @@ fn decode_unit(
             owner,
         ));
     }
-    let mut row = RpgMakerAssetStorageRowDecoder::new(row, 12).map_err(map_storage_row_error)?;
+    let mut row = RpgMakerAssetStorageRowDecoder::new(row, 20).map_err(map_storage_row_error)?;
     let location =
         RpgMakerTextUnitLocationStorageRow::decode(&mut row).map_err(map_storage_row_error)?;
     let group_kind_raw = row
@@ -1380,6 +1431,30 @@ fn decode_unit(
         .map_err(map_storage_row_error)?;
     let manual_state = row
         .optional_blob("manual.applicability_fingerprint")
+        .map_err(map_storage_row_error)?;
+    let rejected_readable_id = row
+        .optional_text("rejected.readable_id")
+        .map_err(map_storage_row_error)?;
+    let rejected_origin = row
+        .optional_text("rejected.origin")
+        .map_err(map_storage_row_error)?;
+    let rejected_source_content_json = row
+        .optional_text("rejected.source_content_json")
+        .map_err(map_storage_row_error)?;
+    let rejected_source_context_json = row
+        .optional_text("rejected.source_context_json")
+        .map_err(map_storage_row_error)?;
+    let rejected_candidate_json = row
+        .optional_text("rejected.candidate_json")
+        .map_err(map_storage_row_error)?;
+    let rejected_translation_json = row
+        .optional_text("rejected.translation_json")
+        .map_err(map_storage_row_error)?;
+    let rejected_violation_json = row
+        .optional_text("rejected.violation_json")
+        .map_err(map_storage_row_error)?;
+    let rejected_planning_state = row
+        .optional_blob("rejected.planning_state")
         .map_err(map_storage_row_error)?;
     let RpgMakerTextUnitStorageRow {
         group_location_raw,
@@ -1444,6 +1519,59 @@ fn decode_unit(
     } else {
         (translation, automatic_translation_state)
     };
+    let rejected = match (
+        rejected_readable_id,
+        rejected_origin,
+        rejected_source_content_json,
+        rejected_source_context_json,
+        rejected_candidate_json,
+        rejected_violation_json,
+        rejected_planning_state,
+    ) {
+        (None, None, None, None, None, None, None) if rejected_translation_json.is_none() => None,
+        (
+            Some(readable_id),
+            Some(origin),
+            Some(source_content_json),
+            Some(source_context_json),
+            Some(candidate_json),
+            Some(violation_json),
+            Some(planning_state),
+        ) => {
+            let origin = TranslationOrigin::from_storage_name(&origin)
+                .ok_or(InvalidRpgMakerTranslationAssetSnapshot::InvalidRejectedStatePair)?;
+            serde_json::from_str::<serde_json::Value>(&candidate_json)
+                .map_err(InvalidRpgMakerTranslationAssetSnapshot::InvalidRejectedTranslation)?;
+            let source_content = serde_json::from_str::<TextUnitContent>(&source_content_json)
+                .map_err(InvalidRpgMakerTranslationAssetSnapshot::InvalidSourceContent)?;
+            let translation = rejected_translation_json
+                .map(|json| {
+                    serde_json::from_str::<Vec<String>>(&json).map_err(
+                        InvalidRpgMakerTranslationAssetSnapshot::InvalidRejectedTranslation,
+                    )
+                })
+                .transpose()?;
+            let violation = serde_json::from_str::<ProvenInvariantViolation>(&violation_json)
+                .map_err(InvalidRpgMakerTranslationAssetSnapshot::InvalidRejectedViolation)?;
+            let planning_state =
+                Sha256Fingerprint::from_slice(&planning_state).map_err(|error| {
+                    InvalidRpgMakerTranslationAssetSnapshot::InvalidRejectedStateLength {
+                        actual: error.actual(),
+                    }
+                })?;
+            Some(RpgMakerStoredRejectedTranslation::new(
+                readable_id,
+                origin,
+                source_content,
+                source_context_json,
+                candidate_json,
+                translation,
+                violation,
+                planning_state,
+            ))
+        }
+        _ => return Err(InvalidRpgMakerTranslationAssetSnapshot::InvalidRejectedStatePair),
+    };
     Ok(DecodedUnit {
         owner,
         kind,
@@ -1456,6 +1584,7 @@ fn decode_unit(
         translation,
         translation_state,
         manual,
+        rejected,
     })
 }
 
@@ -1536,7 +1665,7 @@ fn validate_persisted_alignment(
                 .iter()
                 .zip(translation_lines)
                 .position(|(source, translation)| {
-                    source.trim().is_empty() != translation.trim().is_empty()
+                    is_structural_blank(source) != is_structural_blank(translation)
                 })
         {
             return Err(
@@ -1715,11 +1844,12 @@ fn assemble_corpus(
                     .expect("当前人工译文必须包含结构指纹"),
             )
         } else {
-            RpgMakerTranslationAsset::with_semantic_order_key(
+            RpgMakerTranslationAsset::with_rejected_semantic_order_key(
                 identity,
                 unit.semantic_order_key,
                 unit.translation,
                 unit.translation_state,
+                unit.rejected,
             )
         };
         group.assets.push(asset);
@@ -2089,6 +2219,7 @@ mod tests {
                     translation: None,
                     translation_state: None,
                     manual: false,
+                    rejected: None,
                 }
             })
             .collect::<Vec<_>>();
@@ -2198,6 +2329,7 @@ mod tests {
             translation: None,
             translation_state: None,
             manual: false,
+            rejected: None,
         }
     }
 
@@ -2494,14 +2626,28 @@ mod tests {
                 );
                 CREATE INDEX rpg_maker_text_unit_owner_group_order_idx
                     ON rpg_maker_text_unit(owner, group_id, semantic_order_key);
-                CREATE TABLE rpg_maker_manual_translation (
-                    owner TEXT NOT NULL,
-                    group_location TEXT NOT NULL,
-                    unit_role TEXT NOT NULL,
-                    translation_json TEXT,
-                    applicability_fingerprint BLOB,
-                    PRIMARY KEY (owner, group_location, unit_role)
-                );
+                 CREATE TABLE rpg_maker_manual_translation (
+                     owner TEXT NOT NULL,
+                     group_location TEXT NOT NULL,
+                     unit_role TEXT NOT NULL,
+                     translation_json TEXT,
+                     applicability_fingerprint BLOB,
+                     PRIMARY KEY (owner, group_location, unit_role)
+                 );
+                 CREATE TABLE rpg_maker_rejected_translation (
+                     owner TEXT NOT NULL,
+                     group_id INTEGER NOT NULL,
+                     unit_role TEXT NOT NULL,
+                     readable_id TEXT NOT NULL,
+                     origin TEXT NOT NULL,
+                     source_content_json TEXT NOT NULL,
+                     source_context_json TEXT NOT NULL,
+                     candidate_json TEXT NOT NULL,
+                     translation_json TEXT,
+                     violation_json TEXT NOT NULL,
+                     planning_state BLOB NOT NULL,
+                     PRIMARY KEY (owner, group_id, unit_role)
+                 );
 
                 INSERT INTO metadata VALUES (zeroblob(32));
                 INSERT INTO rpg_maker_asset_owner_state VALUES
@@ -2809,6 +2955,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn persisted_rejected_violation_must_be_a_structured_closed_value() {
+        let body_role = RpgMakerProjectionCodec::encode_role(&TextUnitRole::DialogueBody)
+            .expect("角色应可编码");
+        let mut values = unit_payload_row(
+            &dialogue_group(),
+            "event_dialogue",
+            &body_role,
+            r#"["正文"]"#,
+            "{}",
+        )
+        .into_values();
+        values[12] = text("Builtin/Map001/1");
+        values[13] = text("automatic");
+        values[14] = text(r#"["正文"]"#);
+        values[15] = text("{}");
+        values[16] = text(r#"["候选"]"#);
+        values[18] = text("[]");
+        values[19] = SqliteValue::Blob(vec![0x55; 32]);
+
+        let error = decode_unit(
+            OwnerSqliteRow {
+                owner: RpgMakerAssetOwner::Builtin,
+                row: SqliteRow::new(values),
+            },
+            active_builtin(),
+        )
+        .expect_err("数据库中的 Rejected 违反项必须是闭集结构对象");
+
+        assert!(matches!(
+            error,
+            InvalidRpgMakerTranslationAssetSnapshot::InvalidRejectedViolation(_)
+        ));
+    }
+
     fn snapshot_rows(group: &RpgMakerLocation, units: Vec<SqliteRow>) -> Vec<Vec<SqliteRow>> {
         vec![
             vec![SqliteRow::new(vec![SqliteValue::Blob(vec![0xa5; 32])])],
@@ -2868,6 +3049,14 @@ mod tests {
             text("[]"),
             SqliteValue::Null,
             SqliteValue::Null,
+            SqliteValue::Null,
+            SqliteValue::Null,
+            SqliteValue::Null,
+            SqliteValue::Null,
+            SqliteValue::Null,
+            SqliteValue::Null,
+            SqliteValue::Null,
+            SqliteValue::Null,
         ])
     }
 
@@ -2899,6 +3088,14 @@ mod tests {
             text("[]"),
             SqliteValue::Null,
             SqliteValue::Null,
+            SqliteValue::Null,
+            SqliteValue::Null,
+            SqliteValue::Null,
+            SqliteValue::Null,
+            SqliteValue::Null,
+            SqliteValue::Null,
+            SqliteValue::Null,
+            SqliteValue::Null,
         ])
     }
 
@@ -2921,7 +3118,6 @@ mod tests {
             PathBuf::from("C:/projects/demo/project.db"),
             "ja".to_owned(),
             "zh-Hans".to_owned(),
-            crate::rpg_maker::project::test_layout_profile(),
         )
     }
 

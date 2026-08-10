@@ -116,7 +116,6 @@ impl ParsedTranslationAssistantEntry {
         self.canonical_id
     }
 
-    #[cfg(test)]
     pub(crate) fn raw_value(&self) -> &RawValue {
         self.value.as_ref()
     }

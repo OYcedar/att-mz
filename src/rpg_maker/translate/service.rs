@@ -105,6 +105,7 @@ where
             name,
             terminology_path,
             placeholder_rules_path,
+            retry_rejected,
         } = input;
 
         let _lease = self
@@ -134,11 +135,14 @@ where
             return Ok(OperationCompletion::Cancelled);
         }
 
-        let report = Box::pin(execution.translation.run(
-            &project,
-            &execution.profile,
-            RpgMakerTranslationInput::new(terminology_path, placeholder_rules_path),
-        ))
+        let report = Box::pin(
+            execution.translation.run(
+                &project,
+                &execution.profile,
+                RpgMakerTranslationInput::new(terminology_path, placeholder_rules_path)
+                    .with_retry_rejected(retry_rejected),
+            ),
+        )
         .await
         .map_err(|source| TranslateServiceError::Translation { source })?;
         let OperationCompletion::Completed(report) = report else {
@@ -238,7 +242,6 @@ mod tests {
     use std::time::Duration;
 
     use crate::project_lease::{ProjectCommandLease, ProjectCommandLeaseProvider};
-    use crate::rpg_maker::project::test_layout_profile;
     use crate::rpg_maker::translate::pipeline::RpgMakerTranslationRunReport;
     use crate::rpg_maker::translate::profile::RpgMakerTranslationPlanningConfiguration;
     use crate::translation::profile::TranslationRequestConfiguration;
@@ -421,7 +424,6 @@ mod tests {
             PathBuf::from("C:/att-test/workspace/project.db"),
             "ja".to_owned(),
             "zh-Hans".to_owned(),
-            test_layout_profile(),
         );
         let service = TranslateService::new(
             FakeProjectOpener { project },
@@ -437,6 +439,7 @@ mod tests {
                 name,
                 terminology_path: None,
                 placeholder_rules_path: None,
+                retry_rejected: false,
             })
             .await;
 
@@ -458,7 +461,6 @@ mod tests {
             PathBuf::from("C:/att-test/workspace/project.db"),
             "ja".to_owned(),
             "zh-Hans".to_owned(),
-            test_layout_profile(),
         );
         let service = TranslateService::new(
             FakeProjectOpener { project },
@@ -472,6 +474,7 @@ mod tests {
                 name,
                 terminology_path: None,
                 placeholder_rules_path: None,
+                retry_rejected: false,
             })
             .await;
 
@@ -490,7 +493,6 @@ mod tests {
             PathBuf::from("C:/att-test/workspace/project.db"),
             "ja".to_owned(),
             "zh-Hans".to_owned(),
-            test_layout_profile(),
         );
         let service = TranslateService::new(
             FakeProjectOpener { project },
@@ -506,6 +508,7 @@ mod tests {
                 name,
                 terminology_path: None,
                 placeholder_rules_path: None,
+                retry_rejected: false,
             })
             .await
             .expect("翻译已完成后到达的取消不得改写结果");

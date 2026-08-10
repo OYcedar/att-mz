@@ -31,6 +31,7 @@ use crate::rpg_maker::text::{
     DataFileName, DataFileNameError, MapId, RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource,
     StandardDataFile, TextGroupKind,
 };
+use crate::translation::candidate_validation::is_structural_blank;
 
 use super::super::{RulesCommandNonStringType, RulesCommandNonStringWarning};
 #[cfg(test)]
@@ -2074,7 +2075,7 @@ fn materialize_target(
             captures.push((capture.start(), capture.end()));
         }
         materialize_captures(rule.rule_number(), text, captures, &steps)?
-    } else if text.trim().is_empty() {
+    } else if is_structural_blank(text) {
         (Vec::new(), Vec::new())
     } else {
         (
@@ -2162,7 +2163,7 @@ fn materialize_captures(
             });
         }
         previous_capture_end = end;
-        if text[start..end].trim().is_empty() {
+        if is_structural_blank(&text[start..end]) {
             continue;
         }
         if cursor < start {

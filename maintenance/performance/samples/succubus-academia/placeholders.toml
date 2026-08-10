@@ -1,32 +1,41 @@
 [[rule]]
 scopes = ["plugin_parameter"]
+order = "preserve"
 pattern = '%[1-9][0-9]*'
 
 [[rule]]
 scopes = ["plugin_parameter"]
+order = "preserve"
 pattern = '\\%'
 
 # 部分姓名、物品控制符把内建变量控制符作为参数，例如 \iw[\v[2]]。
 # 外层前后缀保持不透明，text 交给 ATT 的 MV 内建规则继续保护。
 [[rule]]
+order = "preserve"
 pattern = '(?i)(?<!\\)\\(?:ii|nn|nu|ia|w|ow|iw|nl)\[(?<text>\\v\[[0-9]+\])\]'
 
 [[rule]]
+order = "preserve"
 pattern = '(?i)(?<!\\)\\(?:ii|nn|nu|ia|w|ow|iw|nl)\[(?!\\v\[)[^\x5D\r\n]+\]'
 
 # 三处正文用 RPG Maker 的 \\ 转义保存自定义控制符。前两个反斜线由 MV 内建规则
 # 保护；本规则从控制符名称开始保护剩余部分，避免和内建跨度重叠。
 [[rule]]
+order = "preserve"
 pattern = '(?i)(?<=\\\\)(?:ii|nn|nu|ia|w|ow|iw|nl)\[(?<text>\\v\[[0-9]+\])\]'
 
 [[rule]]
+order = "preserve"
 pattern = '(?i)(?<=\\\\)(?:ii|nn|nu|ia|w|ow|iw|nl)\[(?!\\v\[)[^\x5D\r\n]+\]'
 
 [[rule]]
+order = "preserve"
 pattern = '(?i)\\fn<[^\x3E\r\n]+>'
 
 [[rule]]
+order = "preserve"
 pattern = '(?i)\\fs\[[0-9]+\]'
 
 [[rule]]
+order = "preserve"
 pattern = '(?i)\\(?:ws|wm|fi)\b'

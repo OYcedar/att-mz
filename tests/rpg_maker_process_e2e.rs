@@ -22,7 +22,6 @@ const MV_SPEAKER: &str = "アリス";
 const MV_BODY: &str = "こんにちは、世界！";
 const MV_SPEAKER_TRANSLATION: &str = "爱丽丝";
 const MV_BODY_TRANSLATION: &str = "你好，世界！";
-const MV_BODY_WRITE_BACK: &str = "你好、世界！";
 const RULES_SHORT_SOURCE: &str = "ポーション";
 const RULES_SHORT_TRANSLATION: &str = "治疗药水";
 const RULES_LONG_SOURCE: &str = "高級ポーション";
@@ -605,14 +604,14 @@ fn rpg_maker_zero_task_translate_uses_confirmed_phase_without_a_fake_percentage(
 }
 
 #[test]
-fn rpg_maker_write_back_preserves_manual_symbols_for_mv_and_mz() {
+fn rpg_maker_write_back_materializes_manual_translation_exactly() {
     for (engine, game_directory, source_language) in [
         ("mz", "mz-game", "en"),
         ("mz", "mz-game", "ja"),
         ("mv", "mv-game", "en"),
         ("mv", "mv-game", "ja"),
     ] {
-        let temporary = tempfile::tempdir().expect("应可建立 RPG Maker 符号修复进程测试目录");
+        let temporary = tempfile::tempdir().expect("应可建立 RPG Maker 逐字物化进程测试目录");
         let root = temporary.path();
         let game = root.join(game_directory);
         if engine == "mv" {
@@ -657,9 +656,9 @@ fn rpg_maker_write_back_preserves_manual_symbols_for_mv_and_mz() {
             .position(|value| value == "--source-language")
             .expect("Init 参数必须包含源语言");
         init[source_language_position + 1] = source_language.into();
-        assert_success(&format!("{engine} 符号修复 Init"), &run_att(root, init));
+        assert_success(&format!("{engine} 逐字物化 Init"), &run_att(root, init));
         assert_success(
-            &format!("{engine} 符号修复 Extract"),
+            &format!("{engine} 逐字物化 Extract"),
             &run_att(
                 root,
                 arguments(&[engine, "extract", "--name", PROJECT, "--builtin"]),
@@ -676,7 +675,7 @@ fn rpg_maker_write_back_preserves_manual_symbols_for_mv_and_mz() {
         let mut lua_arguments = arguments(&[engine, "lua", "--name", PROJECT]);
         lua_arguments.push(script.into_os_string());
         assert_success(
-            &format!("{engine} 符号修复 Lua"),
+            &format!("{engine} 逐字物化 Lua"),
             &run_att(root, lua_arguments),
         );
 
@@ -686,19 +685,11 @@ fn rpg_maker_write_back_preserves_manual_symbols_for_mv_and_mz() {
             .map(|entry| entry.expect("WriteBack 前项目日志项应可读取").path())
             .collect::<Vec<_>>();
         let write_back = run_att(root, arguments(&[engine, "write-back", "--name", PROJECT]));
-        assert_success(&format!("{engine} 符号修复 WriteBack"), &write_back);
+        assert_success(&format!("{engine} 逐字物化 WriteBack"), &write_back);
         assert_plain_progress_lines(
             &write_back.stderr,
             &["正在读取已验收资产", "正在规划文档改写", "正在发布输出"],
         );
-        let stdout = String::from_utf8(write_back.stdout).expect("WriteBack stdout 必须是 UTF-8");
-        let plain_stdout = stdout.replace(['\u{2068}', '\u{2069}'], "");
-        assert!(
-            plain_stdout
-                .contains("符号修复：尝试 0 个单元，实际修复 0 个，内部跳过 0 个，替换 0 个符号"),
-            "人工译文不得进入自动符号修复：{stdout}"
-        );
-
         let output = if engine == "mv" {
             workspace.join("write_back/www/data/Items.json")
         } else {
@@ -725,16 +716,19 @@ fn rpg_maker_write_back_preserves_manual_symbols_for_mv_and_mz() {
             publication["payload"]["result"]["summary"]["engine"],
             "rpg_maker"
         );
-        let summary = &publication["payload"]["result"]["summary"]["summary"];
-        assert_eq!(summary["symbol_repair_attempted_units"], 0);
-        assert_eq!(summary["symbol_repair_repaired_units"], 0);
-        assert_eq!(summary["symbol_repair_skipped_units"], 0);
-        assert_eq!(summary["symbol_repair_replacements"], 0);
+        assert_eq!(
+            publication["payload"]["result"]["summary"]["summary"],
+            serde_json::json!({
+                "translated_units": 1,
+                "original_units": 0,
+            }),
+            "项目日志只保存实际物化结果"
+        );
     }
 }
 
 #[test]
-fn mz_manual_translation_survives_placeholder_configuration_changes() {
+fn mz_write_back_rejects_manual_translation_invalidated_by_placeholder_changes() {
     let temporary = tempfile::tempdir().expect("应可建立 MZ Placeholder 重新验收测试目录");
     let root = temporary.path();
     let game = root.join("mz-game");
@@ -798,11 +792,15 @@ fn mz_manual_translation_survives_placeholder_configuration_changes() {
     );
 
     let write_back = run_att(root, arguments(&["mz", "write-back", "--name", PROJECT]));
-    assert_success("MZ Placeholder 变化后 WriteBack", &write_back);
-    assert_eq!(
-        read_items(&workspace.join("write_back/data/Items.json"))[1]["description"],
-        "[常规、杂项]",
-        "Placeholder 配置变化不能使人工译文失效或改写正文"
+    assert!(
+        !write_back.status.success(),
+        "Placeholder 契约变化后，失效的 Manual 译文不得继续作为 Current 写回\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&write_back.stdout),
+        String::from_utf8_lossy(&write_back.stderr)
+    );
+    assert!(
+        !workspace.join("write_back/data/Items.json").exists(),
+        "候选验收失败不得发布半成品"
     );
 }
 
@@ -1284,10 +1282,12 @@ fn generic_source_placeholder_failure_sends_no_incomplete_task_block() {
         concat!(
             "[[rule]]\n",
             "scopes = [\"dialogue\"]\n",
+            "order = \"preserve\"\n",
             "pattern = '\\{[^}]+\\}'\n",
             "\n",
             "[[rule]]\n",
             "scopes = [\"dialogue\"]\n",
+            "order = \"preserve\"\n",
             "pattern = '\\{hero\\}'\n",
         ),
     )
@@ -1404,6 +1404,7 @@ fn mv_source_placeholder_failure_fails_before_database_and_model_side_effects() 
         concat!(
             "[[rule]]\n",
             "scopes = [\"database_entry\"]\n",
+            "order = \"preserve\"\n",
             "pattern = '\\\\n\\[[0-9]+\\]'\n",
         ),
     )
@@ -1780,7 +1781,7 @@ fn mv_dialogue_crosses_extract_translate_and_write_back_processes() {
     assert_eq!(commands[1]["code"], 401);
     assert_eq!(
         commands[1]["parameters"][0],
-        format!(r"\n<{MV_SPEAKER_TRANSLATION}>{MV_BODY_WRITE_BACK}")
+        format!(r"\n<{MV_SPEAKER_TRANSLATION}>{MV_BODY_TRANSLATION}")
     );
     assert_eq!(commands[2]["code"], 0);
     assert_eq!(
@@ -2839,12 +2840,6 @@ fn init_arguments(engine: &str, game_root: &Path) -> Vec<OsString> {
         "ja",
         "--target-language",
         "zh-Hans",
-        "--dialogue-max-fullwidth-chars",
-        "20",
-        "--scrolling-text-max-fullwidth-chars",
-        "20",
-        "--help-description-max-fullwidth-chars",
-        "20",
     ]));
     values
 }

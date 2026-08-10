@@ -9,6 +9,8 @@ cli-translate-about = Traduire le texte extrait avec un Profile explicite ou enr
 cli-write-back-about = Écrire les traductions actuelles dans la sortie du projet
 cli-manual-about = Gérer les traductions manuelles dans un fichier TOML modifiable
 cli-manual-export-about = Exporter les entrées qui nécessitent une traduction manuelle
+cli-ownership-export-about = Exporter la propriété du texte de chaque unité RPG Maker extraite
+cli-translation-export-about = Exporter le texte source, la traduction actuelle et l’état de chaque unité extraite
 cli-manual-check-about = Vérifier un fichier TOML de traductions sans modifier le projet
 cli-manual-apply-about = Appliquer les traductions manuelles remplies et valides
 cli-project-lua-about = Exécuter un script Lua sur la base de données du projet
@@ -16,9 +18,6 @@ cli-project-name-help = Nom stable du projet
 cli-init-path-help = Répertoire racine d’entrée ; un projet existant peut réutiliser le dernier chemin réussi
 cli-source-language-help = ID de langue source
 cli-target-language-help = ID de langue cible
-cli-dialogue-width-help = Nombre maximal de caractères pleine chasse par ligne de dialogue
-cli-scrolling-width-help = Nombre maximal de caractères pleine chasse par ligne de texte défilant
-cli-help-width-help = Nombre maximal de caractères pleine chasse par ligne d’aide ou de description
 cli-builtin-help = Utiliser les emplacements de texte RPG Maker intégrés à ATT
 cli-rules-help = Remplacer les règles d’extraction RPG Maker par cette définition TOML ; une liste vide les désactive
 cli-dialogue-rules-help = Remplacer la projection des noms de dialogue MV utilisée avec Builtin
@@ -104,12 +103,11 @@ result-translate-convergence = Convergence : { $retained } conservés, { $invali
 result-write-back-completed = Réécriture terminée : { $project }
 result-project-lua-completed = Exécution Lua du projet terminée : { $project }
 result-output-directory = Répertoire de sortie : { $path }
-result-write-back-summary = Réécriture : { $translated } unités traduites, { $original } unités source ; { $auto_wrapped } retours automatiques, { $breaks } sauts de ligne et { $indents } retraits pleine chasse ajoutés ; { $manual } mises en page manuelles
+result-write-back-summary = Réécriture : { $translated } unités traduites, { $original } unités source
 result-generic-extract-unchanged = Entrée Generic inchangée : { $files } fichiers, { $groups } groupes, { $units } unités
 result-generic-extract-updated = Entrée Generic mise à jour : { $files } fichiers, { $groups } groupes, { $units } unités ; { $preserved } traductions conservées et { $cleared } effacées
 result-generic-translate-summary = Traduction Generic : { $total } tâches prévues, { $started } commencées, { $not_started } non commencées ; { $complete } complètes, { $partial } partielles, { $unavailable } indisponibles, { $failed } échouées, { $cancelled } annulées ; { $planned_units } unités prévues, { $remaining_units } restantes, { $cleared } effacées, { $reused } réutilisées, { $accepted } acceptées, { $written } écrites, { $conflicted } conflits, { $problems } problèmes de réponse
 result-generic-write-back-summary = Réécriture Generic : { $translated } unités traduites, { $original } unités source conservées
-result-symbol-repair-summary = Réparation des symboles : { $attempted } unités examinées, { $repaired } réparées, { $skipped } ignorées en interne, { $replacements } symboles remplacés
 result-run-log = Journal d’exécution : { $path }
 translate-incomplete-object = Exécution Translate du projet { $project }
 translate-incomplete-rpg-maker-reason = { $partial } tâches partielles, { $unavailable } indisponibles, { $not_started } non commencées, { $protocol } problèmes de protocole et { $exhausted } requêtes épuisées ; l’admission des requêtes {
@@ -212,7 +210,6 @@ diagnostic-resolution-value = { $code ->
     [fix_input] Corrigez l’entrée indiquée, puis réessayez
     [fix_placeholder_rules] Corrigez la règle Placeholder indiquée, puis réessayez
     [review_disabled_rules] Si ce résultat est attendu, aucune action n’est nécessaire ; sinon, ajoutez des règles valides au fichier indiqué et relancez Extract
-    [adjust_manual_layout] Ajustez manuellement les retours à la ligne et la mise en page aux emplacements indiqués selon la largeur d’affichage donnée
     [check_path_and_permissions] Vérifiez le chemin, l’état du système de fichiers et les autorisations
     [check_project_state] Examinez et corrigez l’état du projet, puis réessayez
     [resolve_contention] Attendez la fin de l’opération concurrente, puis réessayez
@@ -283,7 +280,6 @@ diagnostic-failure-value = { $code ->
     [duplicate_identifier] Un identifiant est dupliqué
     [extraction_out_of_date] L’extraction enregistrée ne correspond plus à la source actuelle
     [invalid_content] Le contenu ne respecte pas le contrat requis
-    [manual_layout_required] Un ajustement manuel des sauts de ligne ou de la mise en page est requis
     [operation_failed] L’opération a échoué
     [placeholder_projection_failed] La projection des Placeholder n’a pas conservé la structure requise
     [profile_not_found] Le Profile de traduction sélectionné n’existe pas
@@ -341,7 +337,6 @@ diagnostic-json-position = ligne { $line }, colonne { $column }
 diagnostic-placeholder-rule-file = Règle Placeholder { $number } dans { $path }
 diagnostic-placeholder-rule-project = Règle Placeholder { $number } du projet actuel
 manual-exported = { $entries } entrées exportées vers { $path }
-manual-ownership-exported = Registre de propriété : { $path }
 manual-checked = Valides { $valid }, non remplies { $unfilled }, erreurs { $errors }
 manual-applied = Appliquées { $applied }, non remplies { $unfilled }, erreurs { $errors }
 manual-value = { $code ->

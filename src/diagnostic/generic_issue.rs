@@ -11,6 +11,7 @@ use super::issue::{
 use super::model::DiagnosticResolution;
 use super::safe_value::{SafeIdentifier, SafePath};
 use crate::json_diagnostic::JsonErrorCategory;
+use crate::translation::candidate_validation::ProvenInvariantViolation;
 
 /// Generic 问题发生时已经确定的命令阶段。
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -562,6 +563,9 @@ impl GenericWriteBackTextSide {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub(crate) enum GenericWriteBackUnitProblem {
+    CandidateViolation {
+        problem: ProvenInvariantViolation,
+    },
     PlaceholderProtection {
         side: GenericWriteBackTextSide,
         problem: PlaceholderIssue,
@@ -578,6 +582,7 @@ pub(crate) enum GenericWriteBackUnitProblem {
 impl GenericWriteBackUnitProblem {
     const fn code(&self) -> &'static str {
         match self {
+            Self::CandidateViolation { .. } => "generic.write_back.candidate.invalid",
             Self::PlaceholderProtection { problem, .. } => match problem {
                 PlaceholderIssue::WorkerStart { .. } => {
                     "generic.write_back.placeholder.worker_start"
@@ -642,6 +647,7 @@ impl GenericWriteBackUnitProblem {
 
     const fn resolution(&self) -> DiagnosticResolution {
         match self {
+            Self::CandidateViolation { .. } => DiagnosticResolution::FixInput,
             Self::PlaceholderProtection {
                 problem: PlaceholderIssue::WorkerStart { .. },
                 ..
@@ -654,6 +660,7 @@ impl GenericWriteBackUnitProblem {
 
     const fn summary_code(&self) -> &'static str {
         match self {
+            Self::CandidateViolation { .. } => "invalid_value",
             Self::PlaceholderProtection {
                 problem: PlaceholderIssue::WorkerStart { .. },
                 ..
@@ -667,6 +674,10 @@ impl GenericWriteBackUnitProblem {
 
     fn facts(&self) -> Vec<(&'static str, String)> {
         match self {
+            Self::CandidateViolation { problem } => vec![(
+                "violation",
+                serde_json::to_string(problem).expect("闭集候选违反项必须可以编码"),
+            )],
             Self::PlaceholderProtection { side, problem } => {
                 let mut facts = vec![("side", side.as_str().to_owned())];
                 facts.extend(problem.facts());
@@ -929,6 +940,24 @@ pub(crate) enum GenericResponseTextProblem {
     Blank,
     CarriageReturn,
     Nul,
+    ByteOrderMark,
+}
+
+/// 已保存合法结果、但需要后续质量审核的非阻塞事实。
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GenericResponseReviewFinding {
+    SourceResidual,
+    NonStopFinish,
+}
+
+impl GenericResponseReviewFinding {
+    const fn code_suffix(self) -> &'static str {
+        match self {
+            Self::SourceResidual => "source_residual",
+            Self::NonStopFinish => "non_stop_finish",
+        }
+    }
 }
 
 impl GenericResponseTextProblem {
@@ -937,6 +966,7 @@ impl GenericResponseTextProblem {
             Self::Blank => "blank",
             Self::CarriageReturn => "carriage_return",
             Self::Nul => "nul",
+            Self::ByteOrderMark => "byte_order_mark",
         }
     }
 }
@@ -1021,7 +1051,6 @@ pub(crate) enum GenericResponseDestinationProblem {
         problem: GenericLanguageProjectionProblem,
     },
     LanguageAnalysisMismatch,
-    SourceResidual,
     RepairPlanningMismatch,
     RepairApplication {
         problem: GenericRepairApplicationProblem,
@@ -1047,7 +1076,6 @@ impl GenericResponseDestinationProblem {
             Self::PlaceholderBindingMismatch => "placeholder_binding_mismatch",
             Self::LanguageProjection { .. } => "language_projection",
             Self::LanguageAnalysisMismatch => "language_analysis_mismatch",
-            Self::SourceResidual => "source_residual",
             Self::RepairPlanningMismatch => "repair_planning_mismatch",
             Self::RepairApplication { .. } => "repair_application",
             Self::PlaceholderBoundaryAdded => "placeholder_boundary_added",
@@ -1114,6 +1142,14 @@ pub(crate) enum GenericTaskResponseProblem {
         column: NonZeroUsize,
     },
     NonStopFinish,
+    ResponseReview {
+        finding: GenericResponseReviewFinding,
+    },
+    DestinationReview {
+        output_id: u64,
+        destination: GenericUnitLocator,
+        finding: GenericResponseReviewFinding,
+    },
     CommitConflict {
         count: u64,
     },
@@ -1166,6 +1202,9 @@ impl GenericTaskResponseProblem {
                     "generic.translation.response.translation.carriage_return"
                 }
                 GenericResponseTextProblem::Nul => "generic.translation.response.translation.nul",
+                GenericResponseTextProblem::ByteOrderMark => {
+                    "generic.translation.response.translation.byte_order_mark"
+                }
             },
             Self::InvalidDestination { problem, .. } => match problem {
                 GenericResponseDestinationProblem::MissingPlanningFact => {
@@ -1198,9 +1237,6 @@ impl GenericTaskResponseProblem {
                 GenericResponseDestinationProblem::LanguageAnalysisMismatch => {
                     "generic.translation.response.destination.language_analysis_mismatch"
                 }
-                GenericResponseDestinationProblem::SourceResidual => {
-                    "generic.translation.response.destination.source_residual"
-                }
                 GenericResponseDestinationProblem::RepairPlanningMismatch => {
                     "generic.translation.response.destination.repair_planning_mismatch"
                 }
@@ -1227,12 +1263,31 @@ impl GenericTaskResponseProblem {
                         GenericResponseTextProblem::Nul => {
                             "generic.translation.response.destination.nul"
                         }
+                        GenericResponseTextProblem::ByteOrderMark => {
+                            "generic.translation.response.destination.byte_order_mark"
+                        }
                     }
                 }
             },
             Self::InvalidJson { .. } => "generic.translation.response.invalid_json",
             Self::ThinkingEmpty { .. } => "generic.translation.response.thinking_empty",
             Self::NonStopFinish => "generic.translation.response.non_stop_finish",
+            Self::ResponseReview { finding } => match finding {
+                GenericResponseReviewFinding::NonStopFinish => {
+                    "generic.translation.review.non_stop_finish"
+                }
+                GenericResponseReviewFinding::SourceResidual => {
+                    "generic.translation.review.source_residual"
+                }
+            },
+            Self::DestinationReview { finding, .. } => match finding {
+                GenericResponseReviewFinding::SourceResidual => {
+                    "generic.translation.review.destination.source_residual"
+                }
+                GenericResponseReviewFinding::NonStopFinish => {
+                    "generic.translation.review.destination.non_stop_finish"
+                }
+            },
             Self::CommitConflict { .. } => "generic.translation.commit_conflict",
         }
     }
@@ -1241,6 +1296,7 @@ impl GenericTaskResponseProblem {
         match self {
             Self::InvalidJson { .. } => "response_parsing_failed",
             Self::CommitConflict { .. } => "state_mismatch",
+            Self::ResponseReview { .. } | Self::DestinationReview { .. } => "needs_review",
             Self::InvalidId
             | Self::UnexpectedId { .. }
             | Self::DuplicateId { .. }
@@ -1256,6 +1312,36 @@ impl GenericTaskResponseProblem {
     fn facts(&self) -> Vec<(&'static str, String)> {
         match self {
             Self::InvalidId | Self::NonStopFinish => Vec::new(),
+            Self::ResponseReview { finding } => {
+                vec![("review", finding.code_suffix().to_owned())]
+            }
+            Self::DestinationReview {
+                output_id,
+                destination,
+                finding,
+            } => {
+                let mut facts = vec![
+                    ("output_id", output_id.to_string()),
+                    ("relative_path", destination.relative_path.to_string()),
+                    ("review", finding.code_suffix().to_owned()),
+                ];
+                if let Some(group_id) = &destination.group_id {
+                    facts.push(("group_id", group_id.to_string()));
+                }
+                if let Some(unit_id) = &destination.unit_id {
+                    facts.push(("unit_id", unit_id.to_string()));
+                }
+                if let Some(role) = &destination.role {
+                    facts.push(("role", role.to_string()));
+                }
+                if let Some(line) = destination.line {
+                    facts.push(("line", line.to_string()));
+                }
+                if let Some(unit) = destination.unit {
+                    facts.push(("unit", unit.to_string()));
+                }
+                facts
+            }
             Self::UnexpectedId { output_id }
             | Self::DuplicateId { output_id }
             | Self::MissingId { output_id } => {
