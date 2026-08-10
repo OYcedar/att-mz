@@ -69,12 +69,16 @@ _TASK_COUNTER_FIELDS = {
     "not_started",
 }
 _GENERIC_SUMMARY_FIELDS = {
+    "planned_units",
+    "remaining_units",
     "cleared_units",
     "reused_units",
     "accepted_units",
     "written_units",
     "conflicted_units",
     "response_problems",
+    "recoverable_request_exhaustions",
+    "request_admission_stopped",
 }
 _RPG_MAKER_SUMMARY_FIELDS = {
     "accepted_decisions",
@@ -83,6 +87,7 @@ _RPG_MAKER_SUMMARY_FIELDS = {
     "remaining_locations",
     "protocol_diagnostics",
     "recoverable_request_exhaustions",
+    "request_admission_stopped",
     "retained",
     "invalidated",
     "not_applicable",
@@ -309,8 +314,15 @@ def _translation_summary(value: JsonValue, object_name: str) -> None:
     else:
         fail(object_name, "engine 不是 generic 或 rpg_maker", "恢复 ATT 当前版本的项目日志")
     summary = _exact_object(wire["summary"], f"{object_name}.summary", fields)
-    for field in fields:
+    numeric_fields = fields - {"request_admission_stopped"}
+    for field in numeric_fields:
         _u64(summary[field], f"{object_name}.summary.{field}")
+    if not isinstance(summary["request_admission_stopped"], bool):
+        fail(
+            f"{object_name}.summary.request_admission_stopped",
+            "值不是 boolean",
+            "恢复 ATT 原始项目日志",
+        )
 
 
 def _translation_result(value: JsonValue, object_name: str) -> dict[str, JsonValue]:
