@@ -367,6 +367,8 @@ task-record-final-status = Estado: { $state ->
     [cancelled] cancelada; sin commit
    *[other] { $state }
 }
-task-record-accepted-written = Aceptadas: { $accepted } entradas, escritas en { $written } ubicaciones reales
-task-record-accepted-outcome-unknown = Validadas: { $accepted } entradas; no se puede confirmar el resultado del commit de la base de datos
+task-record-requested = Traducciones solicitadas: { $requested }
+task-record-accepted-written = Aceptadas: { $accepted } entradas (ID: { $ids }), escritas en { $written } ubicaciones reales
+task-record-accepted-outcome-unknown = Validadas: { $accepted } entradas (ID: { $ids }); no se puede confirmar el resultado del commit de la base de datos
+task-record-unaccepted = No aceptadas: { $unaccepted } entradas (ID: { $ids })
 task-record-task-diagnostic = Diagnóstico de tarea

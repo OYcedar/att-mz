@@ -364,6 +364,8 @@ task-record-final-status = Trạng thái: { $state ->
     [cancelled] đã hủy, chưa commit
    *[other] { $state }
 }
-task-record-accepted-written = Đã nhận: { $accepted } mục, ghi vào { $written } vị trí thực tế
-task-record-accepted-outcome-unknown = Đã kiểm tra: { $accepted } mục; không thể xác nhận kết quả commit cơ sở dữ liệu
+task-record-requested = Bản dịch được yêu cầu: { $requested }
+task-record-accepted-written = Đã nhận: { $accepted } mục (ID: { $ids }), ghi vào { $written } vị trí thực tế
+task-record-accepted-outcome-unknown = Đã kiểm tra: { $accepted } mục (ID: { $ids }); không thể xác nhận kết quả commit cơ sở dữ liệu
+task-record-unaccepted = Chưa được nhận: { $unaccepted } mục (ID: { $ids })
 task-record-task-diagnostic = Chẩn đoán tác vụ

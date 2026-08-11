@@ -364,6 +364,8 @@ task-record-final-status = 상태: { $state ->
     [cancelled] 취소됨, 미커밋
    *[other] { $state }
 }
-task-record-accepted-written = 수락: { $accepted }개 항목, 실제 위치 { $written }곳에 기록
-task-record-accepted-outcome-unknown = 검수 완료: { $accepted }개 항목; 데이터베이스 커밋 결과를 확인할 수 없음
+task-record-requested = 요청된 번역: { $requested }개
+task-record-accepted-written = 수락: { $accepted }개 항목(ID: { $ids }), 실제 위치 { $written }곳에 기록
+task-record-accepted-outcome-unknown = 검수 완료: { $accepted }개 항목(ID: { $ids }); 데이터베이스 커밋 결과를 확인할 수 없음
+task-record-unaccepted = 수락되지 않음: { $unaccepted }개 항목(ID: { $ids })
 task-record-task-diagnostic = 작업 진단

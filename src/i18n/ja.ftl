@@ -364,6 +364,8 @@ task-record-final-status = 状態：{ $state ->
     [cancelled] キャンセル済み、未コミット
    *[other] { $state }
 }
-task-record-accepted-written = 受理：{ $accepted } 項目、実位置 { $written } 箇所へ書き込み
-task-record-accepted-outcome-unknown = 検収済み：{ $accepted } 項目；データベースのコミット結果を確認できません
+task-record-requested = 要求された翻訳：{ $requested } 項目
+task-record-accepted-written = 受理：{ $accepted } 項目（ID：{ $ids }）、実位置 { $written } 箇所へ書き込み
+task-record-accepted-outcome-unknown = 検収済み：{ $accepted } 項目（ID：{ $ids }）；データベースのコミット結果を確認できません
+task-record-unaccepted = 未受理：{ $unaccepted } 項目（ID：{ $ids }）
 task-record-task-diagnostic = タスク診断

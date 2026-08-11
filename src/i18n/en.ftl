@@ -367,6 +367,8 @@ task-record-final-status = Status: { $state ->
     [cancelled] cancelled; not committed
    *[other] { $state }
 }
-task-record-accepted-written = Accepted: { $accepted } items; written to { $written } actual locations
-task-record-accepted-outcome-unknown = Validated: { $accepted } items; database commit outcome cannot be confirmed
+task-record-requested = Requested translations: { $requested }
+task-record-accepted-written = Accepted: { $accepted } items (IDs: { $ids }); written to { $written } actual locations
+task-record-accepted-outcome-unknown = Validated: { $accepted } items (IDs: { $ids }); database commit outcome cannot be confirmed
+task-record-unaccepted = Not accepted: { $unaccepted } items (IDs: { $ids })
 task-record-task-diagnostic = Task diagnostic

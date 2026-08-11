@@ -4304,12 +4304,14 @@ struct GenericTaskSummary {
 
 struct GenericTaskRecordDraft {
     task_index: usize,
+    requested_outputs: usize,
     user_message: String,
     raw_assistant: Option<String>,
 }
 
 struct GenericTaskRecordInFlight {
     task_index: usize,
+    requested_outputs: usize,
     user_message: String,
 }
 
@@ -4317,6 +4319,7 @@ impl GenericTaskRecordInFlight {
     fn finish(self, raw_assistant: Option<String>) -> GenericTaskRecordDraft {
         GenericTaskRecordDraft {
             task_index: self.task_index,
+            requested_outputs: self.requested_outputs,
             user_message: self.user_message,
             raw_assistant,
         }
@@ -4327,6 +4330,7 @@ impl GenericTaskRecordDraft {
     fn finish(self, state: GenericTaskRecordState) -> GenericTaskRecordDocument {
         GenericTaskRecordDocument::new(
             self.task_index,
+            self.requested_outputs,
             self.user_message,
             self.raw_assistant,
             state,
@@ -4342,7 +4346,7 @@ enum GenericPreparedTaskOutcome {
         accepted_units: usize,
         response_problems: usize,
         response_complete: bool,
-        accepted_outputs: usize,
+        accepted_output_ids: Vec<usize>,
     },
     Unavailable {
         diagnostic: DiagnosticReport,
@@ -4598,11 +4602,21 @@ async fn execute_generic_tasks(
                     GenericPreparedTaskOutcome::Unavailable { diagnostic, .. } => {
                         GenericTaskRecordState::unavailable(diagnostic)
                     }
-                    GenericPreparedTaskOutcome::Accepted { .. } => {
+                    GenericPreparedTaskOutcome::Accepted {
+                        accepted_output_ids,
+                        diagnostics,
+                        ..
+                    } => {
                         if prior_was_cancelled {
-                            GenericTaskRecordState::cancelled()
+                            GenericTaskRecordState::cancelled_after_acceptance(
+                                accepted_output_ids,
+                                diagnostics,
+                            )
                         } else {
-                            GenericTaskRecordState::not_committed_due_to_prior_failure()
+                            GenericTaskRecordState::not_committed_due_to_prior_failure(
+                                accepted_output_ids,
+                                diagnostics,
+                            )
                         }
                     }
                     GenericPreparedTaskOutcome::Failed { ref error, .. } => {
@@ -4625,7 +4639,7 @@ async fn execute_generic_tasks(
                 accepted_units,
                 response_problems,
                 response_complete,
-                accepted_outputs,
+                accepted_output_ids,
             } => {
                 let commit = if writes.is_empty() && rejections.is_empty() {
                     Ok(CommitTranslationResultsOutcome {
@@ -4664,8 +4678,13 @@ async fn execute_generic_tasks(
                             [report.clone()],
                         );
                         if let Some(record) = record {
-                            task_records
-                                .submit(record.finish(GenericTaskRecordState::failed(report)));
+                            diagnostics.push(report.clone());
+                            task_records.submit(record.finish(
+                                GenericTaskRecordState::failed_after_acceptance(
+                                    accepted_output_ids,
+                                    diagnostics,
+                                ),
+                            ));
                         }
                         cancellation.request();
                         preserve_admitted_results_after_error = false;
@@ -4724,7 +4743,7 @@ async fn execute_generic_tasks(
                 if let Some(record) = record {
                     task_records.submit(record.finish(GenericTaskRecordState::committed(
                         response_complete,
-                        accepted_outputs,
+                        accepted_output_ids,
                         commit.committed,
                         task_record_diagnostics,
                     )));
@@ -4850,6 +4869,7 @@ async fn execute_generic_task(
     record_evidence: bool,
     admission_stopped: Arc<AtomicBool>,
 ) -> Result<GenericPreparedTask, GenericCommandError> {
+    let requested_outputs = task.expected_output_count();
     let recorded_user_message = record_evidence.then(|| user_message.clone());
     let messages = [
         ChatMessage::new(ChatMessageRole::System, system_prompt),
@@ -4881,6 +4901,7 @@ async fn execute_generic_task(
     let attempt_count = evidence.attempt_count();
     let record = recorded_user_message.map(|user_message| GenericTaskRecordInFlight {
         task_index,
+        requested_outputs,
         user_message,
     });
     let response_cancellation = cancellation.clone();
@@ -4921,7 +4942,11 @@ async fn execute_generic_task(
                                 language_module.as_ref(),
                                 &response_cancellation,
                             )?;
-                            let accepted_outputs = acceptance.accepted_output_count();
+                            let accepted_output_ids = acceptance
+                                .accepted_output_ids()
+                                .iter()
+                                .map(|id| id.get())
+                                .collect();
                             let (accepted, rejected, problems, reviews) = acceptance.into_parts();
                             let accepted_units = accepted.len();
                             let response_problems = problems.len();
@@ -4967,7 +4992,7 @@ async fn execute_generic_task(
                                 accepted_units,
                                 response_problems,
                                 response_complete,
-                                accepted_outputs,
+                                accepted_output_ids,
                             }
                         }
                         Err(error) => {
@@ -8193,6 +8218,7 @@ mod tests {
             1,
             Some(GenericTaskRecordInFlight {
                 task_index: 1,
+                requested_outputs: 1,
                 user_message: "request".to_owned(),
             }),
             1,
@@ -8205,6 +8231,7 @@ mod tests {
         ));
         let record = prepared.record.expect("请求开始后的取消必须保留可提交记录");
         assert_eq!(record.task_index, 1);
+        assert_eq!(record.requested_outputs, 1);
         assert_eq!(record.user_message, "request");
         assert!(record.raw_assistant.is_none());
     }

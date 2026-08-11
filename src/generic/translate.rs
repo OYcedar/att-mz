@@ -739,6 +739,10 @@ impl PlannedTask {
         self.outputs.values().map(Vec::len).sum()
     }
 
+    pub(crate) fn expected_output_count(&self) -> usize {
+        self.outputs.len()
+    }
+
     #[cfg(test)]
     pub(crate) fn expected_output_ids(&self) -> impl Iterator<Item = TaskId> + '_ {
         self.outputs.keys().copied()
@@ -1786,7 +1790,7 @@ pub(crate) struct TranslationAcceptance {
     rejected: Vec<RejectedTranslation>,
     problems: Vec<ResponseProblem>,
     reviews: Vec<TranslationReview>,
-    accepted_output_count: usize,
+    accepted_output_ids: Vec<TaskId>,
 }
 
 impl TranslationAcceptance {
@@ -1806,8 +1810,12 @@ impl TranslationAcceptance {
     }
 
     /// 返回至少有一个目标 Unit 通过验收的模型输出数量。
-    pub(crate) const fn accepted_output_count(&self) -> usize {
-        self.accepted_output_count
+    pub(crate) fn accepted_output_count(&self) -> usize {
+        self.accepted_output_ids.len()
+    }
+
+    pub(crate) fn accepted_output_ids(&self) -> &[TaskId] {
+        &self.accepted_output_ids
     }
 
     pub(crate) fn append_reviews(&mut self, reviews: &mut Vec<TranslationReview>) {
@@ -1919,7 +1927,7 @@ where
     let mut accepted = Vec::new();
     let mut rejected = Vec::new();
     let mut problems = Vec::new();
-    let mut accepted_output_count = 0;
+    let mut accepted_output_ids = Vec::new();
     let mut observed = HashSet::new();
     let mut reported_duplicates = HashSet::new();
     let mut outputs = task.outputs;
@@ -2055,7 +2063,7 @@ where
             output_accepted = true;
         }
         if output_accepted {
-            accepted_output_count += 1;
+            accepted_output_ids.push(output_id);
         }
     }
     for output_id in outputs.keys() {
@@ -2072,7 +2080,7 @@ where
         rejected,
         problems,
         reviews: Vec::new(),
-        accepted_output_count,
+        accepted_output_ids,
     })
 }
 
