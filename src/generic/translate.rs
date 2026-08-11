@@ -1810,6 +1810,7 @@ impl TranslationAcceptance {
     }
 
     /// 返回至少有一个目标 Unit 通过验收的模型输出数量。
+    #[cfg(test)]
     pub(crate) fn accepted_output_count(&self) -> usize {
         self.accepted_output_ids.len()
     }

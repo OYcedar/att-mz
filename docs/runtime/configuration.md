@@ -10,6 +10,7 @@ CLI 不接受自定义配置路径，也不搜索当前工作目录、环境变�
 - `[llm]`
 - `[[languages]]`
 - `[translation]` 与 `[[translation.profiles]]`
+- `[write_back]`
 
 未知字段、重复 key、错误类型、空白 ID 和规范化后的重复 ID 都会被严格拒绝——启动
 时说清楚，胜过带着歧义往下走。配置只解析当前命令实际使用的子树。
@@ -79,11 +80,36 @@ allowed_terms = ["Page Up", "Page Down"]
 ```
 
 每种语言类型只接受自己声明的字段。Translate 校验全部定义，再精确选择项目源语言
-模块；WriteBack 不读取语言配置，也不改写已经验收的译文。英语的 `ignored_terms`
+模块。英语的 `ignored_terms`
 只改变译前准入；`allowed_terms` 只允许译文保留已经确认的英文项，不改变译前判断或临时
-ID 分配。完整语义见[语言规格](../translation/language.md)。
+ID 分配。WriteBack 不读取语言配置；它只按本规格的独立正文开关处理当前译文。完整语言
+语义见[语言规格](../translation/language.md)。
 
-## 4. LLM Client
+## 4. WriteBack 正文开关
+
+```toml
+[write_back]
+repair_punctuation = true
+complete_continuation_whitespace = true
+```
+
+两个字段都可省略并默认 `true`，也可以独立设置。整个 `[write_back]` 表省略时同样使用
+这两个正式默认。
+
+- `repair_punctuation` 只处理自动译文：开启后，将译文中已经存在、并能与原文唯一对应的
+  标点替换为原文实际字符；不插入、删除、移动标点，不复制原文空白，也不改 Placeholder、
+  RPG Maker 控制符或 Rules Literal。处理范围包括引号、括号、词内撇号、逗号、句号、
+  冒号、分号、问号、叹号、省略号、破折号类、正反斜杠及可唯一归入同类的 Unicode 标点；
+  歧义位置保持不变。人工译文始终跳过。关闭后不会因标点修复改变译文；独立开启的排版
+  或补空白仍可执行自己的修改；
+- `complete_continuation_whitespace` 对人工和自动译文都生效。开启后，为未闭合成对符号内
+  需要缩进的续行补一个 U+3000 全角空格，已有半角、全角或 NBSP 行首空白时不重复；
+  RPG Maker 控制符保留在空格之前。它不依赖排版规则，也不改变 Choice 固定空槽校验。
+
+规则驱动的自动断行不使用配置中的统一宽度。宽度与精确位置只由本次或项目已保存的
+[WriteBack 排版规则](../translation/write-back-layout-rules.md)决定。
+
+## 5. LLM Client
 
 下面是发行模板采用的高吞吐配置。模型服务确有更低并发、限速、代理、证书或超时限制时，
 操作者按该服务的实际限制调整对应字段；这些外部限制不改变 ATT 的翻译验收和持久化语义。
@@ -122,13 +148,13 @@ burst = 8
 超时、重试、代理、PEM 和 rate limit 描述的是外部服务约束，所以进入配置；内部
 worker、TaskBlock 数量、SQLite 策略和文件总量由执行代码决定，不出现在配置里。
 
-## 5. 路径与敏感信息
+## 6. 路径与敏感信息
 
 | 路径 | 相对基准 |
 |---|---|
 | `config.toml`、`projects/`、`prompts/` | 实际运行的 `att.exe` 所在目录 |
 | `additional_pem_files` | 实际运行的 `att.exe` 所在目录 |
-| CLI 的游戏、JSONL、Rules、术语、Placeholder 与 Lua 路径 | 进程当前工作目录 |
+| CLI 的游戏、JSONL、Rules、术语、Placeholder、WriteBack 排版规则与 Lua 路径 | 进程当前工作目录 |
 
 配置出错时，诊断会给出路径、字段、一基行列和具体原因；敏感值按
 [Chat Completions 规格](chat-completions.md#6-敏感信息闭集唯一权威)处理。

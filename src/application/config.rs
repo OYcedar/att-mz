@@ -376,21 +376,25 @@ impl ConfiguredRpgMakerCommand {
                 Ok(Self::Translate(Box::new(configured)))
             }
             RpgMakerCommandArguments::WriteBack(arguments) => {
-                let _: RawWriteBackSelection = parse_selected(
+                let raw: RawWriteBackSelection = parse_selected(
                     source,
                     configuration_path,
                     toml_index.as_ref(),
-                    ConfigurationSelection::NoAdditionalFields,
+                    ConfigurationSelection::WriteBack,
                 )?;
                 let cpu = build_cpu_configuration();
                 let publisher = build_directory_publisher_configuration(
                     common.projects_root(),
                     layout.engine().storage_name(),
                 );
-                let WriteBackArguments { project } = arguments;
-                let rpg_maker = WriteBackConfiguration::build();
+                let WriteBackArguments {
+                    project,
+                    layout_rules,
+                } = arguments;
+                let rpg_maker = WriteBackConfiguration::build(raw.write_back);
                 Ok(Self::WriteBack(ConfiguredWriteBackCommand {
                     project_name: project.name,
+                    layout_rules_path: layout_rules,
                     common,
                     cpu,
                     publisher,
@@ -762,17 +766,23 @@ impl ConfiguredGenericCommand {
                 };
                 Ok(Self::Translate(Box::new(configured)))
             }
-            GenericCommand::WriteBack(project) => {
-                let _: RawWriteBackSelection = parse_selected(
+            GenericCommand::WriteBack(arguments) => {
+                let raw: RawWriteBackSelection = parse_selected(
                     source,
                     configuration_path,
                     toml_index.as_ref(),
-                    ConfigurationSelection::NoAdditionalFields,
+                    ConfigurationSelection::WriteBack,
                 )?;
                 let publisher =
                     build_directory_publisher_configuration(common.projects_root(), "generic");
+                let WriteBackArguments {
+                    project,
+                    layout_rules,
+                } = arguments;
                 Ok(Self::WriteBack(ConfiguredGenericWriteBackCommand {
                     project_name: project.name,
+                    layout_rules_path: layout_rules,
+                    write_back: WriteBackTextConfiguration::from_raw(raw.write_back),
                     prompt_root: distribution.prompts_root().to_path_buf(),
                     common,
                     cpu: build_cpu_configuration(),
@@ -831,6 +841,8 @@ impl ConfiguredGenericCommand {
 /// Generic WriteBack 的基础配置；仅在存在自动译文时才解析翻译 Profile。
 pub(crate) struct ConfiguredGenericWriteBackCommand {
     project_name: ProjectName,
+    layout_rules_path: Option<PathBuf>,
+    write_back: WriteBackTextConfiguration,
     prompt_root: PathBuf,
     common: CommonCommandConfiguration,
     cpu: CpuExecutorConfig,
@@ -845,6 +857,14 @@ impl ConfiguredGenericWriteBackCommand {
 
     pub(crate) const fn project_name(&self) -> &ProjectName {
         &self.project_name
+    }
+
+    pub(crate) fn layout_rules_path(&self) -> Option<&Path> {
+        self.layout_rules_path.as_deref()
+    }
+
+    pub(crate) const fn write_back(&self) -> WriteBackTextConfiguration {
+        self.write_back
     }
 
     pub(crate) const fn cpu(&self) -> CpuExecutorConfig {
@@ -1142,6 +1162,7 @@ impl ConfiguredProjectLuaCommand {
 
 pub(crate) struct ConfiguredWriteBackCommand {
     project_name: ProjectName,
+    layout_rules_path: Option<PathBuf>,
     common: CommonCommandConfiguration,
     cpu: CpuExecutorConfig,
     publisher: DirectoryPublisherConfig,
@@ -1155,6 +1176,10 @@ impl ConfiguredWriteBackCommand {
 
     pub(crate) const fn project_name(&self) -> &ProjectName {
         &self.project_name
+    }
+
+    pub(crate) fn layout_rules_path(&self) -> Option<&Path> {
+        self.layout_rules_path.as_deref()
     }
 
     pub(crate) const fn cpu(&self) -> CpuExecutorConfig {
@@ -1401,19 +1426,48 @@ impl TranslateConfiguration {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WriteBackTextConfiguration {
+    repair_punctuation: bool,
+    complete_continuation_whitespace: bool,
+}
+
+impl WriteBackTextConfiguration {
+    const fn from_raw(raw: RawWriteBackConfiguration) -> Self {
+        Self {
+            repair_punctuation: raw.repair_punctuation,
+            complete_continuation_whitespace: raw.complete_continuation_whitespace,
+        }
+    }
+
+    pub(crate) const fn repair_punctuation(self) -> bool {
+        self.repair_punctuation
+    }
+
+    pub(crate) const fn complete_continuation_whitespace(self) -> bool {
+        self.complete_continuation_whitespace
+    }
+}
+
 pub(crate) struct WriteBackConfiguration {
     document: RpgMakerDocumentReadingConfig,
+    text: WriteBackTextConfiguration,
 }
 
 impl WriteBackConfiguration {
-    fn build() -> Self {
+    fn build(raw: RawWriteBackConfiguration) -> Self {
         Self {
             document: build_document_configuration(),
+            text: WriteBackTextConfiguration::from_raw(raw),
         }
     }
 
     pub(crate) const fn document(&self) -> RpgMakerDocumentReadingConfig {
         self.document
+    }
+
+    pub(crate) const fn text(&self) -> WriteBackTextConfiguration {
+        self.text
     }
 }
 
@@ -2308,6 +2362,7 @@ enum ConfigurationSelection {
     NoAdditionalFields,
     Languages,
     Translate,
+    WriteBack,
     SelectedProfile(usize),
 }
 
@@ -2581,6 +2636,7 @@ impl ConfigurationTomlIndex {
             ConfigurationSelection::NoAdditionalFields => {}
             ConfigurationSelection::Languages => self.validate_languages(source, path)?,
             ConfigurationSelection::Translate => self.validate_translate(source, path)?,
+            ConfigurationSelection::WriteBack => {}
             ConfigurationSelection::SelectedProfile(occurrence) => {
                 for field in ConfigurationFieldContract::PROFILE_REQUIRED_FIELDS {
                     self.require_contract_field(
@@ -2952,7 +3008,12 @@ impl ConfigurationFieldContract {
 
     fn table_kind(path: &[String]) -> Option<IndexedTableKind> {
         match path {
-            [first] if matches!(first.as_str(), "prompts" | "llm" | "translation") => {
+            [first]
+                if matches!(
+                    first.as_str(),
+                    "prompts" | "llm" | "translation" | "write_back"
+                ) =>
+            {
                 Some(IndexedTableKind::Table)
             }
             [llm, clients] if llm == "llm" && clients == "clients" => Some(IndexedTableKind::Table),
@@ -3054,6 +3115,15 @@ impl ConfigurationFieldContract {
             }
             [translation, record]
                 if translation == "translation" && record == "record_translation_tasks" =>
+            {
+                ConfigurationTomlValueKind::Boolean
+            }
+            [write_back, field]
+                if write_back == "write_back"
+                    && matches!(
+                        field.as_str(),
+                        "repair_punctuation" | "complete_continuation_whitespace"
+                    ) =>
             {
                 ConfigurationTomlValueKind::Boolean
             }
@@ -4231,6 +4301,8 @@ struct RawInitSelection {
     _languages: Option<IgnoredAny>,
     #[serde(default, rename = "translation")]
     _translation: Option<IgnoredAny>,
+    #[serde(default, rename = "write_back")]
+    _write_back: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -4244,6 +4316,8 @@ struct RawExtractSelection {
     _languages: Option<IgnoredAny>,
     #[serde(default, rename = "translation")]
     _translation: Option<IgnoredAny>,
+    #[serde(default, rename = "write_back")]
+    _write_back: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -4269,11 +4343,15 @@ struct RawTranslateSelection {
     translation: RawTranslationSelection,
     #[serde(default, rename = "llm")]
     _llm: Option<IgnoredAny>,
+    #[serde(default, rename = "write_back")]
+    _write_back: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawWriteBackSelection {
+    #[serde(default)]
+    write_back: RawWriteBackConfiguration,
     #[serde(default, rename = "llm")]
     _llm: Option<IgnoredAny>,
     #[serde(default, rename = "prompts")]
@@ -4282,6 +4360,28 @@ struct RawWriteBackSelection {
     _languages: Option<IgnoredAny>,
     #[serde(default, rename = "translation")]
     _translation: Option<IgnoredAny>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWriteBackConfiguration {
+    #[serde(default = "default_enabled")]
+    repair_punctuation: bool,
+    #[serde(default = "default_enabled")]
+    complete_continuation_whitespace: bool,
+}
+
+impl Default for RawWriteBackConfiguration {
+    fn default() -> Self {
+        Self {
+            repair_punctuation: true,
+            complete_continuation_whitespace: true,
+        }
+    }
+}
+
+const fn default_enabled() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -4294,6 +4394,8 @@ struct RawManualSelection {
     _prompts: Option<IgnoredAny>,
     #[serde(default, rename = "translation")]
     _translation: Option<IgnoredAny>,
+    #[serde(default, rename = "write_back")]
+    _write_back: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -4594,6 +4696,47 @@ mod tests {
         for command in [init_command(), extract_command(false), write_back_command()] {
             load_configuration(&path, command)
                 .expect("非 Translate 命令不应要求无现实消费的配置存在");
+        }
+    }
+
+    #[test]
+    fn write_back_text_switches_default_to_enabled_and_can_be_selected_independently() {
+        let directory = TestDirectory::new();
+        let default_path = directory.write("write-back-default.toml", minimal_init_configuration());
+        let ConfiguredRpgMakerCommand::WriteBack(defaults) =
+            load_configuration(&default_path, write_back_command())
+                .expect("省略 write_back 表时必须使用正式默认")
+        else {
+            panic!("必须建立 WriteBack 配置")
+        };
+        let defaults = defaults.rpg_maker().text();
+        assert!(defaults.repair_punctuation());
+        assert!(defaults.complete_continuation_whitespace());
+
+        for (name, repair_punctuation, complete_continuation_whitespace) in [
+            ("punctuation-only", true, false),
+            ("whitespace-only", false, true),
+            ("both-disabled", false, false),
+        ] {
+            let file_name = format!("write-back-{name}.toml");
+            let path = directory.write(
+                &file_name,
+                &format!(
+                    "[write_back]\nrepair_punctuation = {repair_punctuation}\ncomplete_continuation_whitespace = {complete_continuation_whitespace}\n"
+                ),
+            );
+            let ConfiguredRpgMakerCommand::WriteBack(configured) =
+                load_configuration(&path, write_back_command())
+                    .expect("两个 WriteBack 开关必须可以独立选择")
+            else {
+                panic!("必须建立 WriteBack 配置")
+            };
+            let configured = configured.rpg_maker().text();
+            assert_eq!(configured.repair_punctuation(), repair_punctuation);
+            assert_eq!(
+                configured.complete_continuation_whitespace(),
+                complete_continuation_whitespace
+            );
         }
     }
 

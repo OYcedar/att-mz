@@ -18,6 +18,7 @@ MV、MZ 和 Generic 各自拥有项目状态与流程，同时复用语义相同
 | HTTP、超时、限速或运行时有限重试 | [Chat Completions](../runtime/chat-completions.md) |
 | Current、Partial、Unavailable 或引擎状态 | 对应 [MV/MZ Translate](../rpg-maker/translation.md)或 [Generic Translate](../generic/translation.md) |
 | 人工或 agent 补译、定点修订 | [Manual TOML](../manual/README.md)；需要批量上下文或特殊数据库操作时再读 [Lua](../lua/README.md) |
+| WriteBack 精确断行、401/405 或字符串 LF | [WriteBack 排版规则](write-back-layout-rules.md)与对应引擎 WriteBack 规格 |
 
 术语内容的发现、筛选和定译不由 ATT 文件格式决定。ATT 只接收已经确认的术语要求，并按
 [术语规格](terminology.md)读取和应用。

@@ -195,9 +195,10 @@ Raw `ctx.db` 从 autocommit 开始，可以执行 DML、DDL、PRAGMA 和显式�
 ### 6.6 WriteBack 与目录发布
 
 WriteBack 可以在 Partial 项目上运行，未译条目保留原文。人工译文优先于自动译文；当前
-人工译文和自动译文都必须满足当前 Placeholder 契约，WriteBack 逐字物化已验收的译文。
+人工译文和自动译文都必须满足当前 Placeholder 契约。正文先按配置中的独立标点与补空白
+开关处理，再只对项目保存的规则命中位置断行；完整行为见对应 WriteBack 与排版规则规格。
 
-布局问题由译后 QA 或实际界面观察报告。按可读 ID 导出修订 Manual，调整后再次运行 QA；
+规则未覆盖、无法安全断行或仍需人工判断的布局问题由译后 QA 或实际界面观察报告。按可读 ID 导出修订 Manual，调整后再次运行 QA；
 需要 Group 语境时批量调用 Lua context。修订完成后重新 WriteBack，并在隔离副本中检查
 实际显示。
 

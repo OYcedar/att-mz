@@ -34,8 +34,8 @@ pub(crate) use translate::{
 };
 pub(crate) use write_back::{
     GenericCurrentTranslation, GenericWriteBackCandidate, GenericWriteBackError,
-    build_write_back_candidate_with_cancellation,
-    validate_materialized_write_back_file_with_cancellation,
+    GenericWriteBackTextOptions, build_write_back_candidate_with_cancellation,
+    compile_generic_layout_rules, validate_materialized_write_back_file_with_cancellation,
 };
 
 #[cfg(test)]

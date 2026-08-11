@@ -4053,6 +4053,11 @@ pub(crate) enum RpgMakerWriteBackAssetSnapshotViolation {
         actual: usize,
     },
     BlankPlaceholderRules,
+    LayoutRuleRowCount {
+        expected: usize,
+        actual: usize,
+    },
+    BlankLayoutRules,
     InvalidSemanticOrderKey {
         column: SafeIdentifier,
         violation: RpgMakerSemanticOrderKeyViolation,
@@ -4150,6 +4155,12 @@ pub(crate) enum RpgMakerWriteBackAssetProblem {
     InvalidSnapshot {
         violation: RpgMakerWriteBackAssetSnapshotViolation,
     },
+    InvalidLayoutRules {
+        path: Option<SafePath>,
+        rule_number: Option<usize>,
+        project_snapshot: bool,
+    },
+    LayoutRulesStateChanged,
     Compute {
         operation: RpgMakerWriteBackAssetComputeOperation,
         failure: RpgMakerComputeFailure,
@@ -4162,6 +4173,7 @@ pub(crate) enum RpgMakerWriteBackDialoguePlanViolation {
     SpeakerSlotMismatch,
     UnexpectedBodyTranslation,
     EmptyBodyLines,
+    BodySourceMapMismatch,
 }
 
 impl RpgMakerWriteBackDialoguePlanViolation {
@@ -4170,6 +4182,7 @@ impl RpgMakerWriteBackDialoguePlanViolation {
             Self::SpeakerSlotMismatch => "speaker_slot_mismatch",
             Self::UnexpectedBodyTranslation => "unexpected_body_translation",
             Self::EmptyBodyLines => "empty_body_lines",
+            Self::BodySourceMapMismatch => "body_source_map_mismatch",
         }
     }
 }
@@ -4369,6 +4382,8 @@ impl RpgMakerWriteBackAssetSnapshotViolation {
             Self::WrongColumnType { .. } => "wrong_column_type",
             Self::PlaceholderRuleRowCount { .. } => "placeholder_rule_row_count",
             Self::BlankPlaceholderRules => "blank_placeholder_rules",
+            Self::LayoutRuleRowCount { .. } => "layout_rule_row_count",
+            Self::BlankLayoutRules => "blank_layout_rules",
             Self::InvalidSemanticOrderKey { .. } => "invalid_semantic_order_key",
             Self::UnknownOwner => "unknown_owner",
             Self::DuplicateOwner { .. } => "duplicate_owner",
@@ -4400,6 +4415,8 @@ impl RpgMakerWriteBackAssetSnapshotViolation {
             "blank_placeholder_rules" => {
                 "rpg_maker.write_back.asset_snapshot.blank_placeholder_rules"
             }
+            "layout_rule_row_count" => "rpg_maker.write_back.asset_snapshot.layout_rule_row_count",
+            "blank_layout_rules" => "rpg_maker.write_back.asset_snapshot.blank_layout_rules",
             "invalid_semantic_order_key" => {
                 "rpg_maker.write_back.asset_snapshot.invalid_semantic_order_key"
             }
@@ -4507,6 +4524,10 @@ impl RpgMakerWriteBackAssetSnapshotViolation {
                 facts.push(("expected", expected.to_string()));
                 facts.push(("actual", actual.to_string()));
             }
+            Self::LayoutRuleRowCount { expected, actual } => {
+                facts.push(("expected", expected.to_string()));
+                facts.push(("actual", actual.to_string()));
+            }
             Self::InvalidSemanticOrderKey { column, violation } => {
                 facts.push(("column", column.to_string()));
                 facts.push(("semantic_order_failure", violation.as_str().to_owned()));
@@ -4585,7 +4606,8 @@ impl RpgMakerWriteBackAssetSnapshotViolation {
             Self::UnknownOwner
             | Self::UnknownGroupKind
             | Self::UnknownMutationAccess
-            | Self::BlankPlaceholderRules => {}
+            | Self::BlankPlaceholderRules
+            | Self::BlankLayoutRules => {}
         }
         facts
     }
@@ -4599,6 +4621,8 @@ impl RpgMakerWriteBackAssetProblem {
                 "rpg_maker.write_back.asset_snapshot.extraction_out_of_date"
             }
             Self::InvalidSnapshot { violation } => violation.code(),
+            Self::InvalidLayoutRules { .. } => "rpg_maker.write_back.layout_rules.invalid",
+            Self::LayoutRulesStateChanged => "rpg_maker.write_back.layout_rules.state_changed",
             Self::Compute {
                 operation: RpgMakerWriteBackAssetComputeOperation::Prepare,
                 ..
@@ -4619,6 +4643,15 @@ impl RpgMakerWriteBackAssetProblem {
             Self::DatabaseNotFound
             | Self::ExtractionOutOfDate { .. }
             | Self::InvalidSnapshot { .. } => DiagnosticResolution::CheckProjectState,
+            Self::InvalidLayoutRules {
+                project_snapshot: true,
+                ..
+            }
+            | Self::LayoutRulesStateChanged => DiagnosticResolution::CheckProjectState,
+            Self::InvalidLayoutRules {
+                project_snapshot: false,
+                ..
+            } => DiagnosticResolution::FixInput,
             Self::Compute {
                 failure: RpgMakerComputeFailure::Cancelled | RpgMakerComputeFailure::ExecutorClosed,
                 ..
@@ -4632,6 +4665,15 @@ impl RpgMakerWriteBackAssetProblem {
             Self::DatabaseNotFound => "not_found",
             Self::ExtractionOutOfDate { .. } => "extraction_out_of_date",
             Self::InvalidSnapshot { .. } => "invalid_value",
+            Self::InvalidLayoutRules {
+                project_snapshot: true,
+                ..
+            }
+            | Self::LayoutRulesStateChanged => "state_mismatch",
+            Self::InvalidLayoutRules {
+                project_snapshot: false,
+                ..
+            } => "invalid_value",
             Self::Compute {
                 failure: RpgMakerComputeFailure::Cancelled,
                 ..
@@ -4656,6 +4698,21 @@ impl RpgMakerWriteBackAssetProblem {
                     .join(","),
             )],
             Self::InvalidSnapshot { violation } => violation.facts(),
+            Self::InvalidLayoutRules {
+                path,
+                rule_number,
+                project_snapshot,
+            } => {
+                let mut facts = vec![("project_snapshot", project_snapshot.to_string())];
+                if let Some(path) = path {
+                    facts.push(("path", path.to_string()));
+                }
+                if let Some(rule_number) = rule_number {
+                    facts.push(("rule_number", rule_number.to_string()));
+                }
+                facts
+            }
+            Self::LayoutRulesStateChanged => Vec::new(),
             Self::Compute { operation, failure } => vec![
                 ("operation", operation.as_str().to_owned()),
                 ("compute_failure", failure.as_str().to_owned()),

@@ -29,6 +29,7 @@ use crate::storage::sqlite::{
     SqliteDatabaseCreator, SqliteQuery, SqliteQueryExecutor, SqliteRow, SqliteTransactionExecutor,
     SqliteTransactionPlan, SqliteTransactionStep, SqliteValue,
 };
+use crate::translation::layout_rules::LayoutRuleSet;
 
 use run_plan::{
     CREATE_EXTRACT_RULES_DEFINITION_TABLE, CREATE_EXTRACT_RUN_PLAN_TABLE,
@@ -218,10 +219,11 @@ pub(crate) const DROP_RPG_MAKER_MUTATION_CLAIM_OWNER_RESOURCE_INDEX: &str =
 pub(crate) const RPG_MAKER_TRANSLATION_RESOURCE_TABLE_NAME: &str = "rpg_maker_translation_resource";
 pub(crate) const TERMINOLOGY_RESOURCE_KIND: &str = "terminology";
 pub(crate) const PLACEHOLDER_RULES_RESOURCE_KIND: &str = "placeholder_rules";
+pub(crate) const WRITE_BACK_LAYOUT_RULES_RESOURCE_KIND: &str = "write_back_layout_rules";
 
 const CREATE_RPG_MAKER_TRANSLATION_RESOURCE_TABLE: &str = r#"CREATE TABLE rpg_maker_translation_resource (
     resource_kind  TEXT NOT NULL PRIMARY KEY CHECK (
-        resource_kind IN ('terminology', 'placeholder_rules')
+        resource_kind IN ('terminology', 'placeholder_rules', 'write_back_layout_rules')
     ),
     canonical_json TEXT NOT NULL CHECK (length(canonical_json) > 0)
 )"#;
@@ -1141,6 +1143,7 @@ pub(crate) struct ProjectDatabaseState {
     owners: Vec<ActiveOwnerState>,
     terminology_json: String,
     placeholder_rules_json: String,
+    write_back_layout_rules_json: String,
     mv_dialogue_rules_json: String,
     run_plans: ProjectRunPlans,
     schema_version: i64,
@@ -1172,6 +1175,7 @@ impl ProjectDatabaseState {
                 .collect(),
             terminology_json: "[]".to_owned(),
             placeholder_rules_json: "[]".to_owned(),
+            write_back_layout_rules_json: "[]".to_owned(),
             mv_dialogue_rules_json: r#"{"rules":[]}"#.to_owned(),
             run_plans: ProjectRunPlans::default(),
             schema_version: 13,
@@ -1389,6 +1393,7 @@ pub(crate) enum InvalidOwnerState {
 pub(crate) enum TranslationResourceKind {
     Terminology,
     PlaceholderRules,
+    WriteBackLayoutRules,
 }
 
 impl TranslationResourceKind {
@@ -1397,6 +1402,8 @@ impl TranslationResourceKind {
             Some(Self::Terminology)
         } else if value == PLACEHOLDER_RULES_RESOURCE_KIND {
             Some(Self::PlaceholderRules)
+        } else if value == WRITE_BACK_LAYOUT_RULES_RESOURCE_KIND {
+            Some(Self::WriteBackLayoutRules)
         } else {
             None
         }
@@ -1406,6 +1413,7 @@ impl TranslationResourceKind {
         match self {
             Self::Terminology => TERMINOLOGY_RESOURCE_KIND,
             Self::PlaceholderRules => PLACEHOLDER_RULES_RESOURCE_KIND,
+            Self::WriteBackLayoutRules => WRITE_BACK_LAYOUT_RULES_RESOURCE_KIND,
         }
     }
 }
@@ -1443,6 +1451,7 @@ pub(crate) enum InvalidTranslationResources {
     MissingResource {
         resource: TranslationResourceKind,
     },
+    InvalidLayoutRules,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1723,6 +1732,7 @@ impl fmt::Display for InvalidTranslationResources {
             Self::MissingResource { resource } => {
                 write!(formatter, "缺少资源 {}", resource.storage_name())
             }
+            Self::InvalidLayoutRules => formatter.write_str("项目保存的 WriteBack 排版规则无效"),
         }
     }
 }
@@ -2320,7 +2330,7 @@ fn decode_owner_states(
 
 fn decode_translation_resources(
     rows: Vec<SqliteRow>,
-) -> Result<(String, String), InvalidCurrentProjectDatabase> {
+) -> Result<(String, String, String), InvalidCurrentProjectDatabase> {
     let mut resources = BTreeMap::new();
     for row in rows {
         let values = row.into_values();
@@ -2367,10 +2377,10 @@ fn decode_translation_resources(
             ));
         }
     }
-    if resources.len() != 2 {
+    if resources.len() != 3 {
         return Err(InvalidCurrentProjectDatabase::TranslationResources(
             InvalidTranslationResources::WrongResourceCount {
-                expected: 2,
+                expected: 3,
                 actual: resources.len(),
             },
         ));
@@ -2389,7 +2399,19 @@ fn decode_translation_resources(
                 resource: TranslationResourceKind::PlaceholderRules,
             },
         ))?;
-    Ok((terminology, placeholders))
+    let layout_rules = resources
+        .remove(&TranslationResourceKind::WriteBackLayoutRules)
+        .ok_or(InvalidCurrentProjectDatabase::TranslationResources(
+            InvalidTranslationResources::MissingResource {
+                resource: TranslationResourceKind::WriteBackLayoutRules,
+            },
+        ))?;
+    LayoutRuleSet::from_canonical_json(&layout_rules).map_err(|_| {
+        InvalidCurrentProjectDatabase::TranslationResources(
+            InvalidTranslationResources::InvalidLayoutRules,
+        )
+    })?;
+    Ok((terminology, placeholders, layout_rules))
 }
 
 fn decode_project_definitions(
@@ -3026,7 +3048,7 @@ where
             reason,
         }
     })?;
-    let (terminology_json, placeholder_rules_json) =
+    let (terminology_json, placeholder_rules_json, write_back_layout_rules_json) =
         decode_translation_resources(translation_resource_rows).map_err(|reason| {
             ProjectDatabaseInspectionError::InvalidDatabase {
                 path: database_path.clone(),
@@ -3059,6 +3081,7 @@ where
         owners,
         terminology_json,
         placeholder_rules_json,
+        write_back_layout_rules_json,
         mv_dialogue_rules_json,
         run_plans,
         schema_version,
@@ -3132,7 +3155,7 @@ fn owner_state_cas(state: &ProjectDatabaseState) -> SqliteTransactionStep {
 fn translation_resources_cas(state: &ProjectDatabaseState) -> SqliteTransactionStep {
     SqliteTransactionStep::RequireNoRows(SqliteQuery::new(
         r#"SELECT 1
-WHERE (SELECT COUNT(*) FROM rpg_maker_translation_resource) <> 2
+WHERE (SELECT COUNT(*) FROM rpg_maker_translation_resource) <> 3
    OR NOT EXISTS (
      SELECT 1 FROM rpg_maker_translation_resource
      WHERE resource_kind = 'terminology' AND canonical_json = ?1
@@ -3140,10 +3163,15 @@ WHERE (SELECT COUNT(*) FROM rpg_maker_translation_resource) <> 2
    OR NOT EXISTS (
      SELECT 1 FROM rpg_maker_translation_resource
      WHERE resource_kind = 'placeholder_rules' AND canonical_json = ?2
+   )
+   OR NOT EXISTS (
+     SELECT 1 FROM rpg_maker_translation_resource
+     WHERE resource_kind = 'write_back_layout_rules' AND canonical_json = ?3
    )"#,
         vec![
             SqliteValue::Text(state.terminology_json.clone()),
             SqliteValue::Text(state.placeholder_rules_json.clone()),
+            SqliteValue::Text(state.write_back_layout_rules_json.clone()),
         ],
     ))
 }
@@ -3253,6 +3281,7 @@ where
             current.terminology_json
         },
         placeholder_rules_json: current.placeholder_rules_json,
+        write_back_layout_rules_json: current.write_back_layout_rules_json,
         mv_dialogue_rules_json: current.mv_dialogue_rules_json,
         run_plans: current.run_plans,
         schema_version: current.schema_version,
@@ -3344,7 +3373,11 @@ fn project_database_commands(project: &NewProject) -> Vec<SqliteCommand> {
             SqliteValue::Blob(project.source_snapshot_fingerprint().as_bytes().to_vec()),
         ],
     ));
-    for resource_kind in [TERMINOLOGY_RESOURCE_KIND, PLACEHOLDER_RULES_RESOURCE_KIND] {
+    for resource_kind in [
+        TERMINOLOGY_RESOURCE_KIND,
+        PLACEHOLDER_RULES_RESOURCE_KIND,
+        WRITE_BACK_LAYOUT_RULES_RESOURCE_KIND,
+    ] {
         commands.push(SqliteCommand::new(
             INSERT_RPG_MAKER_TRANSLATION_RESOURCE,
             vec![
@@ -3519,7 +3552,7 @@ mod tests {
     #[test]
     fn creation_plan_contains_the_complete_current_rpg_maker_schema_and_resources() {
         let commands = project_database_commands(&project());
-        assert_eq!(commands.len(), 20);
+        assert_eq!(commands.len(), 21);
         let statements = commands
             .iter()
             .map(SqliteCommand::statement)
@@ -3528,6 +3561,7 @@ mod tests {
 
         assert!(statements.contains("rpg_maker_text_group"));
         assert!(statements.contains("rpg_maker_translation_resource"));
+        assert!(statements.contains("'write_back_layout_rules'"));
         assert_eq!(
             expected_att_schema()
                 .iter()

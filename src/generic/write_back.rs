@@ -8,15 +8,25 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
 use crate::diagnostic::{
-    Diagnostic, DiagnosticReport, GenericDiagnosticStage, GenericIssue, GenericProblem,
-    GenericUnitLocator, GenericWriteBackSnapshotProblem, GenericWriteBackTextSide,
-    GenericWriteBackUnitProblem, SafeIdentifier, SafePath, StateEffect,
+    Diagnostic, DiagnosticReport, GenericDiagnosticStage, GenericIssue,
+    GenericLanguageProjectionProblem, GenericProblem, GenericUnitLocator,
+    GenericWriteBackSnapshotProblem, GenericWriteBackTextSide, GenericWriteBackUnitProblem,
+    SafeIdentifier, SafePath, StateEffect,
 };
 use crate::execution::CooperativeCancellation;
 use crate::translation::candidate_validation::{
     ProvenInvariantViolation, validate_reflowed_candidate_text_with_cancellation,
 };
-use crate::translation::placeholder::PlaceholderProtectionError;
+use crate::translation::layout_rules::{
+    LayoutMaterialization, LayoutRuleEngine, LayoutRuleSet, LayoutRuleTarget, LayoutRulesError,
+    compile_layout_rules,
+};
+use crate::translation::placeholder::{PlaceholderProtectionError, PlaceholderRestoreError};
+use crate::translation::placeholder_projection::LanguageTextProjectionError;
+use crate::translation::text_layout::{LayoutTextSyntax, layout_text};
+use crate::translation::write_back_text::{
+    PunctuationRepairError, PunctuationRepairOutcome, repair_punctuation_with_cancellation,
+};
 
 #[cfg(test)]
 use super::jsonl::parse_file;
@@ -29,7 +39,6 @@ use super::placeholder::{
     protected_translation_placeholder_binding_matches_with_cancellation,
 };
 use super::project::GenericStoredSnapshot;
-#[cfg(test)]
 use super::translate::GenericUnitKey;
 use super::translate::GenericUnitMap;
 
@@ -46,6 +55,10 @@ impl GenericCurrentTranslation {
 
     pub(crate) fn text(&self) -> &str {
         &self.text
+    }
+
+    pub(crate) const fn is_manual(&self) -> bool {
+        self.manual
     }
 }
 
@@ -100,6 +113,15 @@ pub(crate) enum GenericWriteBackError {
     PlaceholderBindingMismatch {
         unit: GenericUnitLocator,
     },
+    LanguageProjection {
+        unit: GenericUnitLocator,
+        side: GenericWriteBackTextSide,
+        source: LanguageTextProjectionError,
+    },
+    LayoutRestoration {
+        unit: GenericUnitLocator,
+        source: PlaceholderRestoreError,
+    },
     CandidateViolation {
         unit: GenericUnitLocator,
         problem: ProvenInvariantViolation,
@@ -123,6 +145,8 @@ impl fmt::Display for GenericWriteBackError {
             Self::PlaceholderBindingMismatch { .. } => {
                 formatter.write_str("当前译文没有完整保留原文实际命中的 Placeholder")
             }
+            Self::LanguageProjection { source, .. } => source.fmt(formatter),
+            Self::LayoutRestoration { source, .. } => source.fmt(formatter),
             Self::CandidateViolation { problem, .. } => {
                 write!(formatter, "当前译文违反强不变量：{problem:?}")
             }
@@ -145,6 +169,8 @@ impl Error for GenericWriteBackError {
         match self {
             Self::Jsonl(source) => Some(source),
             Self::PlaceholderProtection { source, .. } => Some(source),
+            Self::LanguageProjection { source, .. } => Some(source),
+            Self::LayoutRestoration { source, .. } => Some(source),
             Self::SourceChanged
             | Self::SnapshotMismatch(_)
             | Self::PlaceholderBindingMismatch { .. }
@@ -194,6 +220,25 @@ impl GenericWriteBackError {
                     },
                 ))
             }
+            Self::LanguageProjection { unit, side, source } => {
+                Diagnostic::generic(GenericIssue::project(
+                    GenericDiagnosticStage::WriteBack,
+                    GenericProblem::WriteBackUnit {
+                        unit: unit.clone(),
+                        problem: GenericWriteBackUnitProblem::LanguageProjection {
+                            side: *side,
+                            problem: generic_language_projection_problem(source),
+                        },
+                    },
+                ))
+            }
+            Self::LayoutRestoration { unit, .. } => Diagnostic::generic(GenericIssue::project(
+                GenericDiagnosticStage::WriteBack,
+                GenericProblem::WriteBackUnit {
+                    unit: unit.clone(),
+                    problem: GenericWriteBackUnitProblem::LayoutRestoration,
+                },
+            )),
             Self::CandidateViolation { unit, problem } => {
                 Diagnostic::generic(GenericIssue::project(
                     GenericDiagnosticStage::WriteBack,
@@ -223,13 +268,143 @@ impl GenericWriteBackError {
     }
 }
 
+/// 已按当前 Generic 输入完整匹配且确认不存在重叠的排版宽度。
+pub(crate) struct GenericCompiledLayoutRules {
+    widths: GenericUnitMap<u32>,
+}
+
+impl GenericCompiledLayoutRules {
+    fn width_with_cancellation<E>(
+        &self,
+        group_id: &str,
+        unit_id: &str,
+        ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Option<u32>, E> {
+        self.widths
+            .get_parts_with_cancellation(group_id, unit_id, ensure_running)
+            .map(|width| width.copied())
+    }
+}
+
+/// Generic WriteBack 的两个独立正文选择；聚合传递只用于避免相邻布尔参数被写反。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GenericWriteBackTextOptions {
+    repair_punctuation: bool,
+    complete_continuation_whitespace: bool,
+}
+
+impl GenericWriteBackTextOptions {
+    pub(crate) const fn new(
+        repair_punctuation: bool,
+        complete_continuation_whitespace: bool,
+    ) -> Self {
+        Self {
+            repair_punctuation,
+            complete_continuation_whitespace,
+        }
+    }
+}
+
+/// 规则总是针对当前完整输入编译；即使某个 Unit 暂无译文，也必须参与选择器校验。
+pub(crate) fn compile_generic_layout_rules(
+    live: &GenericInputSnapshot,
+    rules: &LayoutRuleSet,
+) -> Result<GenericCompiledLayoutRules, LayoutRulesError> {
+    let mut targets = Vec::with_capacity(live.unit_count());
+    let mut keys = Vec::with_capacity(live.unit_count());
+    for file in live.files() {
+        let source_file = file.relative_path().to_string_lossy().replace('\\', "/");
+        for (group_index, group) in file.groups().iter().enumerate() {
+            for (unit_index, unit) in group.units().iter().enumerate() {
+                targets.push(LayoutRuleTarget::new(
+                    group.kind(),
+                    super::readable_generic_unit_id(
+                        file.relative_path(),
+                        group_index + 1,
+                        unit_index + 1,
+                    ),
+                    source_file.clone(),
+                    None,
+                    None,
+                    None,
+                    Some(group.id().to_owned()),
+                    Some(unit.id().to_owned()),
+                    LayoutMaterialization::StringLf,
+                ));
+                keys.push(GenericUnitKey::new(
+                    group.id().to_owned(),
+                    unit.id().to_owned(),
+                ));
+            }
+        }
+    }
+    let compiled = compile_layout_rules(LayoutRuleEngine::Generic, rules, &targets)?;
+    let mut widths = GenericUnitMap::with_capacity(compiled.len());
+    for (key, width) in keys.into_iter().zip(compiled) {
+        let Some(width) = width else {
+            continue;
+        };
+        let previous =
+            widths.insert_with_cancellation(key, width, || Ok::<_, LayoutRulesError>(()))?;
+        debug_assert!(
+            previous.is_none(),
+            "Generic Unit 身份已经由输入格式保证唯一"
+        );
+    }
+    Ok(GenericCompiledLayoutRules { widths })
+}
+
+const fn generic_language_projection_problem(
+    source: &LanguageTextProjectionError,
+) -> GenericLanguageProjectionProblem {
+    match source {
+        LanguageTextProjectionError::TokenIndexConstruction => {
+            GenericLanguageProjectionProblem::TokenIndexConstruction
+        }
+        LanguageTextProjectionError::EmptyToken => GenericLanguageProjectionProblem::EmptyToken,
+        LanguageTextProjectionError::MissingToken { .. } => {
+            GenericLanguageProjectionProblem::MissingToken
+        }
+        LanguageTextProjectionError::RepeatedToken { .. } => {
+            GenericLanguageProjectionProblem::RepeatedToken
+        }
+        LanguageTextProjectionError::OverlappingToken { .. } => {
+            GenericLanguageProjectionProblem::OverlappingToken
+        }
+        LanguageTextProjectionError::ChangedTokenOrder { position, .. } => {
+            GenericLanguageProjectionProblem::ChangedTokenOrder {
+                position: *position,
+            }
+        }
+        LanguageTextProjectionError::ChangedSegmentCount { expected, actual } => {
+            GenericLanguageProjectionProblem::ChangedSegmentCount {
+                expected: *expected,
+                actual: *actual,
+            }
+        }
+        LanguageTextProjectionError::ChangedSegmentKind { segment_index } => {
+            GenericLanguageProjectionProblem::ChangedSegmentKind {
+                segment_index: *segment_index,
+            }
+        }
+        LanguageTextProjectionError::MissingOrderedToken { segment_index } => {
+            GenericLanguageProjectionProblem::MissingOrderedToken {
+                segment_index: *segment_index,
+            }
+        }
+        LanguageTextProjectionError::UnusedOrderedToken => {
+            GenericLanguageProjectionProblem::UnusedOrderedToken
+        }
+    }
+}
+
 impl From<GenericJsonlError> for GenericWriteBackError {
     fn from(source: GenericJsonlError) -> Self {
         Self::Jsonl(source)
     }
 }
 
-/// 以当前外部 JSONL 为结构来源，只把数据库中的当前译文写入 `text`。
+/// 以当前外部 JSONL 为结构来源，按 WriteBack 正文选项建立当前 `text`。
 #[cfg(test)]
 pub(crate) fn build_write_back_candidate(
     stored: &GenericStoredSnapshot,
@@ -239,11 +414,16 @@ pub(crate) fn build_write_back_candidate(
     let placeholder_rules = GenericPlaceholderService::default()
         .compile(Vec::new())
         .expect("空 Generic Placeholder 规则必须有效");
+    let layout_rules = LayoutRuleSet::from_canonical_json("[]")
+        .and_then(|rules| compile_generic_layout_rules(live, &rules))
+        .expect("空排版规则必须对任意 Generic 输入有效");
     build_write_back_candidate_with_cancellation(
         stored,
         live,
         current_translations,
         &placeholder_rules,
+        &layout_rules,
+        GenericWriteBackTextOptions::new(true, true),
         &CooperativeCancellation::default(),
     )
 }
@@ -254,6 +434,8 @@ pub(crate) fn build_write_back_candidate_with_cancellation(
     live: &GenericInputSnapshot,
     current_translations: &GenericUnitMap<GenericCurrentTranslation>,
     placeholder_rules: &GenericCompiledPlaceholderRules,
+    layout_rules: &GenericCompiledLayoutRules,
+    text_options: GenericWriteBackTextOptions,
     cancellation: &CooperativeCancellation,
 ) -> Result<GenericWriteBackCandidate, GenericWriteBackError> {
     ensure_write_back_running(cancellation)?;
@@ -279,6 +461,8 @@ pub(crate) fn build_write_back_candidate_with_cancellation(
                 live_file,
                 current_translations,
                 placeholder_rules,
+                layout_rules,
+                text_options,
                 cancellation,
             )
         })
@@ -316,6 +500,8 @@ fn build_write_back_file(
     live_file: &GenericFile,
     translations: &GenericUnitMap<GenericCurrentTranslation>,
     placeholder_rules: &GenericCompiledPlaceholderRules,
+    layout_rules: &GenericCompiledLayoutRules,
+    text_options: GenericWriteBackTextOptions,
     cancellation: &CooperativeCancellation,
 ) -> Result<BuiltWriteBackFile, GenericWriteBackError> {
     ensure_write_back_running(cancellation)?;
@@ -372,14 +558,87 @@ fn build_write_back_file(
                     line: group_ordinal + 1,
                     unit: unit_ordinal + 1,
                 };
-                validate_translation_candidate(
+                let validated = validate_translation_candidate(
                     &context,
                     unit.text(),
                     translation.text(),
                     placeholder_rules,
                     cancellation,
                 )?;
-                Cow::Borrowed(translation.text())
+                let punctuated = if text_options.repair_punctuation && !translation.is_manual() {
+                    match repair_punctuation_with_cancellation(
+                        &validated.source,
+                        &validated.translation,
+                        || ensure_write_back_running(cancellation),
+                    )? {
+                        Ok(PunctuationRepairOutcome::Repaired(text)) => Cow::Owned(text),
+                        Ok(
+                            PunctuationRepairOutcome::Unchanged | PunctuationRepairOutcome::Skipped,
+                        ) => Cow::Borrowed(translation.text()),
+                        Err(PunctuationRepairError::SourceProjection(source)) => {
+                            return Err(GenericWriteBackError::LanguageProjection {
+                                unit: context.diagnostic_locator(),
+                                side: GenericWriteBackTextSide::Source,
+                                source,
+                            });
+                        }
+                        Err(PunctuationRepairError::TranslationProjection(source)) => {
+                            return Err(GenericWriteBackError::LanguageProjection {
+                                unit: context.diagnostic_locator(),
+                                side: GenericWriteBackTextSide::Translation,
+                                source,
+                            });
+                        }
+                    }
+                } else {
+                    Cow::Borrowed(translation.text())
+                };
+                let max_width =
+                    layout_rules.width_with_cancellation(live_group.id(), unit.id(), || {
+                        ensure_write_back_running(cancellation)
+                    })?;
+                if max_width.is_some() || text_options.complete_continuation_whitespace {
+                    let layout_view = validate_translation_candidate(
+                        &context,
+                        unit.text(),
+                        punctuated.as_ref(),
+                        placeholder_rules,
+                        cancellation,
+                    )?;
+                    if let Some(layout) = layout_text(
+                        layout_view.translation.text(),
+                        max_width,
+                        text_options.complete_continuation_whitespace,
+                        LayoutTextSyntax::Plain,
+                    ) {
+                        let protected = layout.joined_text();
+                        let restored = match layout_view
+                            .translation
+                            .restore_with_cancellation(&protected, || {
+                                ensure_write_back_running(cancellation)
+                            })? {
+                            Ok(restored) => restored,
+                            Err(source) => {
+                                return Err(GenericWriteBackError::LayoutRestoration {
+                                    unit: context.diagnostic_locator(),
+                                    source,
+                                });
+                            }
+                        };
+                        validate_translation_candidate(
+                            &context,
+                            unit.text(),
+                            &restored,
+                            placeholder_rules,
+                            cancellation,
+                        )?;
+                        Cow::Owned(restored)
+                    } else {
+                        punctuated
+                    }
+                } else {
+                    punctuated
+                }
             } else {
                 retained_source_units += 1;
                 Cow::Borrowed(unit.text())
@@ -424,13 +683,18 @@ impl GenericWriteBackUnitContext<'_> {
     }
 }
 
+struct ValidatedGenericTranslation {
+    source: super::placeholder::GenericProtectedText,
+    translation: super::placeholder::GenericProtectedText,
+}
+
 fn validate_translation_candidate(
     context: &GenericWriteBackUnitContext<'_>,
     source: &str,
     translation: &str,
     placeholder_rules: &GenericCompiledPlaceholderRules,
     cancellation: &CooperativeCancellation,
-) -> Result<(), GenericWriteBackError> {
+) -> Result<ValidatedGenericTranslation, GenericWriteBackError> {
     if let Err(problem) = validate_reflowed_candidate_text_with_cancellation(translation, || {
         ensure_write_back_running(cancellation)
     })? {
@@ -483,7 +747,10 @@ fn validate_translation_candidate(
             unit: unit_locator(),
         });
     }
-    Ok(())
+    Ok(ValidatedGenericTranslation {
+        source: source_view,
+        translation: translation_view,
+    })
 }
 
 fn validate_group_shape(
@@ -749,6 +1016,11 @@ mod tests {
 
     use super::*;
 
+    fn empty_layout_rules(live: &GenericInputSnapshot) -> GenericCompiledLayoutRules {
+        let rules = LayoutRuleSet::from_canonical_json("[]").expect("空排版规则必须有效");
+        compile_generic_layout_rules(live, &rules).expect("空排版规则必须适用于任意 Generic 输入")
+    }
+
     #[test]
     fn candidate_changes_only_translated_text_and_keeps_empty_files() {
         let temp = tempdir().unwrap();
@@ -835,7 +1107,133 @@ mod tests {
     }
 
     #[test]
-    fn candidate_materializes_categories_translation_without_rewriting_symbols() {
+    fn generic_layout_inserts_lf_inside_unit_text_without_adding_jsonl_records() {
+        let temp = tempdir().unwrap();
+        let source_root = temp.path().join("source");
+        fs::create_dir(&source_root).unwrap();
+        fs::write(
+            source_root.join("scene.jsonl"),
+            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"原文\"}]}\n",
+        )
+        .unwrap();
+        let (store, _) = GenericProjectStore::initialize(GenericInitRequest {
+            project_name: "generic-layout".parse().unwrap(),
+            workspace_root: temp.path().join("project"),
+            source_root: Some(source_root),
+            source_language: Some(LanguageId::parse("ja").unwrap()),
+            target_language: Some(LanguageId::parse("zh-Hans").unwrap()),
+        })
+        .unwrap();
+        store.extract().unwrap();
+        let (stored, live) = store.ensure_input_current().unwrap();
+        let mut translations = GenericUnitMap::new();
+        translations
+            .insert_with_cancellation(
+                GenericUnitKey::new("g".to_owned(), "u".to_owned()),
+                GenericCurrentTranslation::new("「甲乙，丙丁」".to_owned(), false),
+                || Ok::<_, std::convert::Infallible>(()),
+            )
+            .unwrap_or_else(|never| match never {});
+        let placeholder_rules = GenericPlaceholderService::default()
+            .compile(Vec::new())
+            .expect("空 Placeholder 规则必须有效");
+        let rules = LayoutRuleSet::parse_toml(
+            b"[[rule]]\nmax_fullwidth_chars = 4\ngroup_ids = ['g']\nunit_ids = ['u']\n",
+        )
+        .expect("Generic 精确位置规则必须有效");
+        let layout_rules =
+            compile_generic_layout_rules(&live, &rules).expect("规则必须命中唯一 Generic Unit");
+
+        let candidate = build_write_back_candidate_with_cancellation(
+            &stored,
+            &live,
+            &translations,
+            &placeholder_rules,
+            &layout_rules,
+            GenericWriteBackTextOptions::new(false, true),
+            &CooperativeCancellation::default(),
+        )
+        .unwrap();
+        let output = std::str::from_utf8(candidate.files()[0].bytes()).unwrap();
+        assert_eq!(
+            output.lines().count(),
+            1,
+            "Generic 仍须保持一条物理 JSONL 记录"
+        );
+        assert_eq!(
+            output,
+            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"「甲乙，\\n　丙丁」\"}]}\n"
+        );
+    }
+
+    #[test]
+    fn generic_continuation_whitespace_switch_is_independent_of_layout_rules() {
+        let temp = tempdir().unwrap();
+        let source_root = temp.path().join("source");
+        fs::create_dir(&source_root).unwrap();
+        fs::write(
+            source_root.join("scene.jsonl"),
+            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"原文\"}]}\n",
+        )
+        .unwrap();
+        let (store, _) = GenericProjectStore::initialize(GenericInitRequest {
+            project_name: "generic-indent".parse().unwrap(),
+            workspace_root: temp.path().join("project"),
+            source_root: Some(source_root),
+            source_language: Some(LanguageId::parse("ja").unwrap()),
+            target_language: Some(LanguageId::parse("zh-Hans").unwrap()),
+        })
+        .unwrap();
+        store.extract().unwrap();
+        let (stored, live) = store.ensure_input_current().unwrap();
+        let mut translations = GenericUnitMap::new();
+        translations
+            .insert_with_cancellation(
+                GenericUnitKey::new("g".to_owned(), "u".to_owned()),
+                GenericCurrentTranslation::new("「甲\n乙」".to_owned(), false),
+                || Ok::<_, std::convert::Infallible>(()),
+            )
+            .unwrap_or_else(|never| match never {});
+        let placeholder_rules = GenericPlaceholderService::default()
+            .compile(Vec::new())
+            .expect("空 Placeholder 规则必须有效");
+        let layout_rules = empty_layout_rules(&live);
+
+        let unchanged = build_write_back_candidate_with_cancellation(
+            &stored,
+            &live,
+            &translations,
+            &placeholder_rules,
+            &layout_rules,
+            GenericWriteBackTextOptions::new(false, false),
+            &CooperativeCancellation::default(),
+        )
+        .unwrap();
+        assert!(
+            std::str::from_utf8(unchanged.files()[0].bytes())
+                .unwrap()
+                .contains("甲\\n乙")
+        );
+
+        let completed = build_write_back_candidate_with_cancellation(
+            &stored,
+            &live,
+            &translations,
+            &placeholder_rules,
+            &layout_rules,
+            GenericWriteBackTextOptions::new(false, true),
+            &CooperativeCancellation::default(),
+        )
+        .unwrap();
+        assert!(
+            std::str::from_utf8(completed.files()[0].bytes())
+                .unwrap()
+                .contains("甲\\n　乙")
+        );
+    }
+
+    #[test]
+    fn punctuation_repair_switch_controls_generic_write_back_text() {
         let temp = tempdir().unwrap();
         let source_root = temp.path().join("source");
         fs::create_dir(&source_root).unwrap();
@@ -865,19 +1263,37 @@ mod tests {
         let placeholder_rules = GenericPlaceholderService::default()
             .compile(Vec::new())
             .expect("空 Placeholder 规则必须有效");
+        let layout_rules = empty_layout_rules(&live);
 
-        let candidate = build_write_back_candidate_with_cancellation(
+        let unchanged = build_write_back_candidate_with_cancellation(
             &stored,
             &live,
             &translations,
             &placeholder_rules,
+            &layout_rules,
+            GenericWriteBackTextOptions::new(false, true),
             &CooperativeCancellation::default(),
         )
         .unwrap();
 
         assert_eq!(
-            std::str::from_utf8(candidate.files()[0].bytes()).unwrap(),
+            std::str::from_utf8(unchanged.files()[0].bytes()).unwrap(),
             "{\"id\":\"g\",\"kind\":\"settings\",\"units\":[{\"id\":\"u\",\"text\":\"常规、杂项、声音、开关\"}]}\n"
+        );
+
+        let repaired = build_write_back_candidate_with_cancellation(
+            &stored,
+            &live,
+            &translations,
+            &placeholder_rules,
+            &layout_rules,
+            GenericWriteBackTextOptions::new(true, true),
+            &CooperativeCancellation::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::str::from_utf8(repaired.files()[0].bytes()).unwrap(),
+            "{\"id\":\"g\",\"kind\":\"settings\",\"units\":[{\"id\":\"u\",\"text\":\"常规,杂项,声音,开关\"}]}\n"
         );
     }
 
@@ -915,19 +1331,22 @@ mod tests {
                 r"\[[^]]+\]",
             )])
             .expect("对话 Placeholder 规则必须有效");
+        let layout_rules = empty_layout_rules(&live);
 
         let candidate = build_write_back_candidate_with_cancellation(
             &stored,
             &live,
             &translations,
             &placeholder_rules,
+            &layout_rules,
+            GenericWriteBackTextOptions::new(true, true),
             &CooperativeCancellation::default(),
         )
         .unwrap();
 
         assert_eq!(
             std::str::from_utf8(candidate.files()[0].bytes()).unwrap(),
-            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"打开 [A,B]、现在。\"}]}\n"
+            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"打开 [A,B],现在.\"}]}\n"
         );
     }
 
@@ -965,19 +1384,22 @@ mod tests {
                 r"<msg>(?<text>.*?)</msg>",
             )])
             .expect("wrapper Placeholder 规则必须有效");
+        let layout_rules = empty_layout_rules(&live);
 
         let candidate = build_write_back_candidate_with_cancellation(
             &stored,
             &live,
             &translations,
             &placeholder_rules,
+            &layout_rules,
+            GenericWriteBackTextOptions::new(true, true),
             &CooperativeCancellation::default(),
         )
         .unwrap();
 
         assert_eq!(
             std::str::from_utf8(candidate.files()[0].bytes()).unwrap(),
-            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"<msg>常规、杂项</msg>\"}]}\n"
+            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"<msg>常规,杂项</msg>\"}]}\n"
         );
     }
 
@@ -1015,12 +1437,15 @@ mod tests {
                 r"\[[^]]+\]",
             )])
             .expect("设置 Placeholder 规则必须有效");
+        let layout_rules = empty_layout_rules(&live);
 
         let error = build_write_back_candidate_with_cancellation(
             &stored,
             &live,
             &translations,
             &placeholder_rules,
+            &layout_rules,
+            GenericWriteBackTextOptions::new(true, true),
             &CooperativeCancellation::default(),
         )
         .unwrap_err();

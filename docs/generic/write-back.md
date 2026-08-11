@@ -1,7 +1,7 @@
 # Generic WriteBack 现行规格
 
 ```text
-att generic write-back --name NAME
+att generic write-back --name NAME [--layout-rules FILE]
 ```
 
 输出固定为：
@@ -24,9 +24,15 @@ att generic write-back --name NAME
 
 Partial 项目允许写回。结果明确报告使用译文的 Unit 数与保留原文的 Unit 数。
 
-WriteBack 不修订正文。自动译文和人工译文在进入当前状态前已经通过同一个结构与
-Placeholder 验收；WriteBack 只重新确认当前来源和项目快照，并逐字物化数据库中的当前译文。
-语言、术语、符号风格和布局风险由译后 QA 报告，不在发布时静默改变。
+WriteBack 重新执行当前 Placeholder 与结构强校验；源语言残留仍只是一项 Review，不会拒绝
+候选。随后按[配置规格](../runtime/configuration.md#4-writeback-正文开关)执行独立标点修复和
+续行补空白，并按[WriteBack 排版规则](../translation/write-back-layout-rules.md)只处理明确
+命中的 Unit。
+
+Generic 排版只在 Unit `text` 内插入 LF，序列化后表现为 JSON 字符串中的 `\n`；不会新增
+Group、Unit 或物理 JSONL 记录。关闭标点修复时标点逐字采用数据库译文；开启时只处理自动
+译文中已经存在且唯一对应的标点，人工译文跳过。补空白不依赖排版规则。未命中规则或无法
+找到安全断点的正文保持排版前文本。语言、术语、措辞和其他布局风险仍由译后 QA 报告。
 
 ## 2. 验证与发布
 

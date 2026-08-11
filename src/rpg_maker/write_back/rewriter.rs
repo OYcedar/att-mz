@@ -1874,9 +1874,12 @@ fn prepare_dialogue_replacement(
                 WriteBackMutationViolation::TranslationWithoutBodyRecipe,
             )
         })?;
-        for (output_index, line) in lines.iter().enumerate() {
+        let sources = mutation
+            .body_line_sources()
+            .expect("受信 Body 译文必须携带同长度模板映射");
+        for (output_index, (line, source_line_index)) in lines.iter().zip(sources).enumerate() {
             let (_, line_recipe, command) = body_templates
-                .get(output_index)
+                .get(*source_line_index)
                 .unwrap_or_else(|| body_templates.last().expect("已经确认正文模板至少有一项"));
             let mut text = String::new();
             if output_index == 0 {

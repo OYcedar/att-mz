@@ -369,7 +369,7 @@ pub(crate) enum GenericCommand {
     Translate(TranslateArguments),
     /// 把当前译文写入项目输出目录。
     #[command(name = "write-back")]
-    WriteBack(ProjectArguments),
+    WriteBack(WriteBackArguments),
     /// 导出、检查或应用人工译文。
     #[command(name = "manual")]
     Manual {
@@ -544,6 +544,9 @@ pub(crate) struct TranslateArguments {
 pub(crate) struct WriteBackArguments {
     #[command(flatten)]
     pub(crate) project: ProjectArguments,
+    /// 校验并保存这份排版规则；省略时复用项目已经保存的规则。
+    #[arg(long, value_name = "LAYOUT_RULES_TOML", value_parser = parse_non_blank_path)]
+    pub(crate) layout_rules: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -945,6 +948,38 @@ mod tests {
         let parsed = AttArguments::try_parse_from(["att", "mz", "write-back", "--name", "demo"])
             .expect("配置位置由发行目录确定，不属于命令意图");
         assert!(matches!(expect_mz(parsed.product), MzCommand::WriteBack(_)));
+    }
+
+    #[test]
+    fn every_write_back_engine_preserves_the_selected_layout_rules_path() {
+        for engine in ["mv", "mz", "generic"] {
+            let parsed = AttArguments::try_parse_from([
+                "att",
+                engine,
+                "write-back",
+                "--name",
+                "demo",
+                "--layout-rules",
+                "rules/write-back-layout.toml",
+            ])
+            .expect("三种 WriteBack 都必须接受同一排版规则参数");
+            let arguments = match parsed.product {
+                ProductCommand::Mv {
+                    command: MvCommand::WriteBack(arguments),
+                }
+                | ProductCommand::Mz {
+                    command: MzCommand::WriteBack(arguments),
+                }
+                | ProductCommand::Generic {
+                    command: GenericCommand::WriteBack(arguments),
+                } => arguments,
+                _ => panic!("必须解析为 {engine} WriteBack"),
+            };
+            assert_eq!(
+                arguments.layout_rules.as_deref(),
+                Some(Path::new("rules/write-back-layout.toml"))
+            );
+        }
     }
 
     #[test]

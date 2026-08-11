@@ -182,6 +182,12 @@ python <Skill>\scripts\translation_qa.py scan --translations <工作目录>\tran
 集中 Manual apply 后执行 WriteBack，再把输出部署到可丢弃的隔离游戏副本。最终字体 apply、smoke
 （尝试标准场景的自动检查）和 observe（记录正常游玩中的实际绘制）只在该副本执行：
 
+只有已经确认具体位置和宽度时才编写 WriteBack 排版规则，并把采用的文件保存到
+`<任务根>\artifacts\rules\write-back-layout.toml`。首次采用时传
+`--layout-rules <该文件>`；校验成功后项目保存规范内容，后续省略参数即可复用。要明确清空时
+传入只含 `rule = []` 的文件。不得用一条统一宽度规则覆盖未经确认的全部文本；字段和
+401/405、字符串 LF 的物化边界以 `docs/translation/write-back-layout-rules.md` 为准。
+
 ```powershell
 python <Skill>\scripts\inspect_nwjs_runtime.py smoke --game <隔离副本> --output <任务根>\artifacts\qa\nwjs-smoke --confirm-isolated-copy
 python <Skill>\scripts\inspect_nwjs_runtime.py observe --game <隔离副本> --output <任务根>\artifacts\qa\nwjs-observe --confirm-isolated-copy

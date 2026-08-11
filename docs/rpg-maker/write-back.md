@@ -1,8 +1,8 @@
 # RPG Maker WriteBack 现行规格
 
 ```text
-att mv write-back --name NAME
-att mz write-back --name NAME
+att mv write-back --name NAME [--layout-rules FILE]
+att mz write-back --name NAME [--layout-rules FILE]
 ```
 
 WriteBack 不使用 Lua。它只读取冻结来源、当前提取资产和译文，在项目工作区生成：
@@ -16,7 +16,23 @@ WriteBack 不使用 Lua。它只读取冻结来源、当前提取资产和译文
 ## 1. 候选构建
 
 ATT 从冻结来源建立完整内容树，并按 recipe 把当前译文写回对应 RPG Maker 值。人工译文
-优先于自动译文：
+优先于自动译文。写回前先重新执行当前 Placeholder 和结构强校验；源语言残留仍只是一项
+Review，不会拒绝候选或阻止 WriteBack。
+
+正文处理顺序为：可选自动译文标点修复、规则命中的自动排版、独立续行补空白，再按 recipe
+物化。两个正文开关及正式默认见[配置规格](../runtime/configuration.md#4-writeback-正文开关)；
+排版文件、选择器、持久化和错误语义见
+[WriteBack 排版规则规格](../translation/write-back-layout-rules.md)。
+
+- 关闭标点修复时，标点逐字采用数据库译文；开启时也只替换已经存在且唯一对应的自动译文
+  标点，不增删字符或复制原文空白；人工译文不做标点修复；
+- 补空白与规则断行相互独立；即使没有排版规则，也会处理译文中已经存在的硬续行；
+- 未被排版规则命中的位置保持排版前文本；找不到安全断点时整项保持排版前文本；
+- 规则命中的事件对话正文通过增加 `401` 物理命令物化；滚动文字通过增加 `405` 物理命令
+  物化；完整单字符串标量字段只在字符串内部插入 LF；
+- Speaker、Choice、固定空槽和组合字符串字段不能排版，规则命中会在发布前失败。
+
+最终 recipe 物化仍遵守：
 
 - 普通字符串替换完整值；
 - 固定逐行或逐项内容保持规定的槽数和空槽；
@@ -27,11 +43,9 @@ ATT 从冻结来源建立完整内容树，并按 recipe 把当前译文写回�
 未译或非 Current Unit 保留冻结原文。Partial 项目同样可以生成候选，结果会明确报告
 保留原文的数量。
 
-WriteBack 不修订正文，也不根据窗口宽度自动断行。自动译文和人工译文在进入当前状态前
-已经通过同一个结构与 Placeholder 验收；WriteBack 只重新确认当前来源、owner、recipe 和
-项目快照，并逐字物化数据库中的当前译文。语言、术语、符号风格、布局和运行时显示风险由
-译后 QA 生成 Review；需要修订时按其自然 ID 使用 `manual export --ids`、check 和 apply，
-再重新 WriteBack。
+WriteBack 不使用 Init 中的统一宽度，也不扫描全部文本猜测可换行位置。语言、术语、措辞和
+未被规则处理的运行时显示风险仍由译后 QA 生成 Review；需要修订时按自然 ID 使用
+`manual export --ids`、check 和 apply，再重新 WriteBack。
 
 ## 2. 完整验证
 
@@ -43,8 +57,9 @@ WriteBack 不修订正文，也不根据窗口宽度自动断行。自动译文�
 - 全部 JSON、事件命令、数组形状和控制符有效；
 - 未声明位置与冻结来源逐字一致。
 
-候选必须重新解析，并证明改动只落在受管范围内。WriteBack 只搬运文本：不执行脚本，
-也没有发布后回调。
+候选必须重新解析，并证明改动只落在受管范围内。新增 `401/405` 时事件列表作为完整结构
+重建，并按每个输出行的原始母行复制 indent 和未知字段；不是在正向遍历数组时原地插入。
+WriteBack 不执行脚本，也没有发布后回调。
 
 ## 3. 一次发布
 

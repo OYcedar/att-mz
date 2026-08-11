@@ -135,6 +135,7 @@ use crate::rpg_maker::translate::task_record::{
 use crate::rpg_maker::write_back::WriteBackPublishFailureState;
 use crate::rpg_maker::write_back::asset_reader::{
     RpgMakerWriteBackAssetReadingError, RpgMakerWriteBackAssetReadingService,
+    RpgMakerWriteBackLayoutRulesInput,
 };
 use crate::rpg_maker::write_back::planner::{
     RpgMakerWriteBackService, RpgMakerWriteBackServiceError, write_back_planning_compute_report,
@@ -2850,7 +2851,30 @@ impl ProductionRpgMakerCommandRunner {
         );
         let directory_publisher = file_system.directory_publisher(command.publisher().clone());
         let opener = PreopenedProject::new(opened_project);
-        let asset_reader = RpgMakerWriteBackAssetReadingService::new(sqlite.clone(), cpu.clone());
+        let layout_rules_input = match command.layout_rules_path() {
+            Some(path) => match file_system.read_file(path.to_path_buf()).await {
+                Ok(file) => Some(RpgMakerWriteBackLayoutRulesInput::new(
+                    file.resolved_path().to_path_buf(),
+                    file.into_bytes(),
+                )),
+                Err(source) => {
+                    let diagnostic = source.command_preparation_diagnostic_report();
+                    let shutdown = roots.shutdown().await;
+                    drop(project_lease_guard);
+                    return observed_construction_failure(
+                        project_log,
+                        ProductionCommandError::ConfigurationOrInput(Box::new(
+                            ProductionCommandError::report_diagnostic(source, diagnostic),
+                        )),
+                        shutdown,
+                    )
+                    .await;
+                }
+            },
+            None => None,
+        };
+        let asset_reader = RpgMakerWriteBackAssetReadingService::new(sqlite.clone(), cpu.clone())
+            .with_layout_rules_input(layout_rules_input);
         let document_reader = RpgMakerProjectDocumentReadingService::new(
             file_system.clone(),
             file_system.clone(),
@@ -2864,6 +2888,13 @@ impl ProductionRpgMakerCommandRunner {
             rewriter,
             cpu.clone(),
             cancellation.clone(),
+        )
+        .with_text_options(
+            command.rpg_maker().text().repair_punctuation(),
+            command
+                .rpg_maker()
+                .text()
+                .complete_continuation_whitespace(),
         )
         .with_progress(progress_observer.clone());
         let publisher = RpgMakerWriteBackPublishingService::new(directory_publisher.clone());

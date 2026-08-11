@@ -1,4 +1,4 @@
-//! 跨游戏引擎共享的语言分析与源文残留检查。
+//! 跨游戏引擎共享的语言分析、源文残留检查与文本修复原语。
 //!
 //! 本模块只理解自然语言文本和不透明边界，不依赖游戏引擎位置、数据库、CLI、
 //! 占位符协议、LLM 或运行时根能力。
@@ -303,7 +303,343 @@ impl LanguageText {
             LanguageTextSegment::OpaqueBoundary => false,
         })
     }
+    /// 验证并应用语言模块给出的字符级修复。
+    #[cfg(test)]
+    pub(crate) fn apply_repair(
+        &self,
+        plan: &LanguageRepairPlan,
+    ) -> Result<Self, LanguageRepairApplicationError> {
+        match self.apply_repair_with_cancellation(plan, || Ok::<_, Infallible>(())) {
+            Ok(result) => result,
+            Err(unreachable) => match unreachable {},
+        }
+    }
+
+    pub(crate) fn apply_repair_with_cancellation<E>(
+        &self,
+        plan: &LanguageRepairPlan,
+        mut ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Result<Self, LanguageRepairApplicationError>, E> {
+        let mut segments = Vec::new();
+        if segments.try_reserve_exact(self.segments.len()).is_err() {
+            return Ok(Err(LanguageRepairApplicationError::ResourceExhausted));
+        }
+        for segment in &self.segments {
+            ensure_running()?;
+            segments.push(match segment {
+                LanguageTextSegment::NaturalText(text) => {
+                    let mut cloned = String::new();
+                    if cloned.try_reserve_exact(text.len()).is_err() {
+                        return Ok(Err(LanguageRepairApplicationError::ResourceExhausted));
+                    }
+                    append_language_text_with_cancellation(&mut cloned, text, &mut ensure_running)?;
+                    LanguageTextSegment::NaturalText(cloned)
+                }
+                LanguageTextSegment::OpaqueBoundary => LanguageTextSegment::OpaqueBoundary,
+            });
+        }
+        let mut replacements = Vec::new();
+        if replacements
+            .try_reserve_exact(plan.replacements().len())
+            .is_err()
+        {
+            return Ok(Err(LanguageRepairApplicationError::ResourceExhausted));
+        }
+        for replacement in plan.replacements() {
+            ensure_running()?;
+            replacements.push(replacement);
+        }
+        if let Err(source) = stable_sort_language_replacements_with_cancellation(
+            &mut replacements,
+            &mut ensure_running,
+        )? {
+            return Ok(Err(source));
+        }
+
+        let mut replacement_start = 0_usize;
+        while replacement_start < replacements.len() {
+            ensure_running()?;
+            let segment_index = replacements[replacement_start].segment_index();
+            let mut replacement_end = replacement_start + 1;
+            while replacement_end < replacements.len()
+                && replacements[replacement_end].segment_index() == segment_index
+            {
+                ensure_running()?;
+                replacement_end += 1;
+            }
+            let segment_replacements = &replacements[replacement_start..replacement_end];
+            let Some(LanguageTextSegment::NaturalText(text)) = segments.get_mut(segment_index)
+            else {
+                return Ok(Err(LanguageRepairApplicationError::InvalidNaturalSegment {
+                    segment_index,
+                }));
+            };
+            for pair in segment_replacements.windows(2) {
+                ensure_running()?;
+                if pair[0].byte_offset() == pair[1].byte_offset() {
+                    return Ok(Err(LanguageRepairApplicationError::DuplicatePosition {
+                        segment_index,
+                        byte_offset: pair[0].byte_offset(),
+                    }));
+                }
+            }
+            let mut rebuilt_capacity = text.len();
+            for replacement in segment_replacements.iter().rev() {
+                ensure_running()?;
+                let byte_offset = replacement.byte_offset();
+                if !text.is_char_boundary(byte_offset) {
+                    return Ok(Err(
+                        LanguageRepairApplicationError::InvalidCharacterBoundary {
+                            segment_index,
+                            byte_offset,
+                        },
+                    ));
+                }
+                let Some(actual) = text[byte_offset..].chars().next() else {
+                    return Ok(Err(LanguageRepairApplicationError::MissingCharacter {
+                        segment_index,
+                        byte_offset,
+                    }));
+                };
+                if actual != replacement.expected() {
+                    return Ok(Err(LanguageRepairApplicationError::UnexpectedCharacter {
+                        segment_index,
+                        byte_offset,
+                        expected: replacement.expected(),
+                        actual,
+                    }));
+                }
+                let Some(capacity) = rebuilt_capacity
+                    .checked_sub(actual.len_utf8())
+                    .and_then(|length| length.checked_add(replacement.replacement().len_utf8()))
+                else {
+                    return Ok(Err(LanguageRepairApplicationError::SizeOverflow));
+                };
+                rebuilt_capacity = capacity;
+            }
+
+            let original = std::mem::take(text);
+            let mut rebuilt = String::new();
+            if rebuilt.try_reserve_exact(rebuilt_capacity).is_err() {
+                return Ok(Err(LanguageRepairApplicationError::ResourceExhausted));
+            }
+            let mut cursor = 0_usize;
+            for replacement in segment_replacements {
+                ensure_running()?;
+                let byte_offset = replacement.byte_offset();
+                append_language_text_with_cancellation(
+                    &mut rebuilt,
+                    &original[cursor..byte_offset],
+                    &mut ensure_running,
+                )?;
+                let actual = original[byte_offset..]
+                    .chars()
+                    .next()
+                    .expect("修复位置已经验证");
+                rebuilt.push(replacement.replacement());
+                let Some(next_cursor) = byte_offset.checked_add(actual.len_utf8()) else {
+                    return Ok(Err(LanguageRepairApplicationError::SizeOverflow));
+                };
+                cursor = next_cursor;
+            }
+            append_language_text_with_cancellation(
+                &mut rebuilt,
+                &original[cursor..],
+                &mut ensure_running,
+            )?;
+            *text = rebuilt;
+            replacement_start = replacement_end;
+        }
+        ensure_running()?;
+        Ok(Ok(Self { segments }))
+    }
 }
+
+/// 自然文本中的一个字符替换位置。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LanguageCharacterReplacement {
+    segment_index: usize,
+    byte_offset: usize,
+    expected: char,
+    replacement: char,
+}
+
+impl LanguageCharacterReplacement {
+    pub(crate) const fn new(
+        segment_index: usize,
+        byte_offset: usize,
+        expected: char,
+        replacement: char,
+    ) -> Self {
+        Self {
+            segment_index,
+            byte_offset,
+            expected,
+            replacement,
+        }
+    }
+
+    pub(crate) const fn segment_index(&self) -> usize {
+        self.segment_index
+    }
+
+    pub(crate) const fn byte_offset(&self) -> usize {
+        self.byte_offset
+    }
+
+    pub(crate) const fn expected(&self) -> char {
+        self.expected
+    }
+
+    pub(crate) const fn replacement(&self) -> char {
+        self.replacement
+    }
+}
+
+fn stable_sort_language_replacements_with_cancellation<E>(
+    replacements: &mut Vec<&LanguageCharacterReplacement>,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<Result<(), LanguageRepairApplicationError>, E> {
+    let mut scratch = Vec::new();
+    if scratch.try_reserve_exact(replacements.len()).is_err() {
+        return Ok(Err(LanguageRepairApplicationError::ResourceExhausted));
+    }
+    for replacement in replacements.iter().copied() {
+        ensure_running()?;
+        scratch.push(replacement);
+    }
+    let mut width = 1_usize;
+    while width < replacements.len() {
+        let run_width = width.saturating_mul(2);
+        let mut run_start = 0_usize;
+        while run_start < replacements.len() {
+            let middle = run_start.saturating_add(width).min(replacements.len());
+            let run_end = run_start.saturating_add(run_width).min(replacements.len());
+            let mut left = run_start;
+            let mut right = middle;
+            let mut output = run_start;
+            while output < run_end {
+                ensure_running()?;
+                let take_left = right == run_end
+                    || (left < middle
+                        && (
+                            replacements[left].segment_index(),
+                            replacements[left].byte_offset(),
+                        ) <= (
+                            replacements[right].segment_index(),
+                            replacements[right].byte_offset(),
+                        ));
+                scratch[output] = if take_left {
+                    let replacement = replacements[left];
+                    left += 1;
+                    replacement
+                } else {
+                    let replacement = replacements[right];
+                    right += 1;
+                    replacement
+                };
+                output += 1;
+            }
+            run_start = run_end;
+        }
+        std::mem::swap(replacements, &mut scratch);
+        width = run_width;
+    }
+    ensure_running()?;
+    Ok(Ok(()))
+}
+
+/// 已验证的字符级修复计划；空计划表示无需修改或无法唯一证明修改安全。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LanguageRepairPlan {
+    replacements: Vec<LanguageCharacterReplacement>,
+}
+
+impl LanguageRepairPlan {
+    pub(crate) fn replacing(replacements: Vec<LanguageCharacterReplacement>) -> Self {
+        Self { replacements }
+    }
+
+    pub(crate) fn replacements(&self) -> &[LanguageCharacterReplacement] {
+        &self.replacements
+    }
+
+    pub(crate) fn is_unchanged(&self) -> bool {
+        self.replacements.is_empty()
+    }
+}
+
+/// 调用方提交了无法安全应用的修复计划。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LanguageRepairApplicationError {
+    ResourceExhausted,
+    SizeOverflow,
+    InvalidNaturalSegment {
+        segment_index: usize,
+    },
+    DuplicatePosition {
+        segment_index: usize,
+        byte_offset: usize,
+    },
+    InvalidCharacterBoundary {
+        segment_index: usize,
+        byte_offset: usize,
+    },
+    MissingCharacter {
+        segment_index: usize,
+        byte_offset: usize,
+    },
+    UnexpectedCharacter {
+        segment_index: usize,
+        byte_offset: usize,
+        expected: char,
+        actual: char,
+    },
+}
+
+impl fmt::Display for LanguageRepairApplicationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ResourceExhausted => formatter.write_str("语言修复所需内存无法分配"),
+            Self::SizeOverflow => formatter.write_str("语言修复结果长度超出 usize"),
+            Self::InvalidNaturalSegment { segment_index } => {
+                write!(formatter, "修复位置指向非自然文本段 {segment_index}")
+            }
+            Self::DuplicatePosition {
+                segment_index,
+                byte_offset,
+            } => write!(
+                formatter,
+                "自然文本段 {segment_index} 的字节 {byte_offset} 存在重复修复"
+            ),
+            Self::InvalidCharacterBoundary {
+                segment_index,
+                byte_offset,
+            } => write!(
+                formatter,
+                "自然文本段 {segment_index} 的字节 {byte_offset} 不是字符边界"
+            ),
+            Self::MissingCharacter {
+                segment_index,
+                byte_offset,
+            } => write!(
+                formatter,
+                "自然文本段 {segment_index} 的字节 {byte_offset} 没有字符"
+            ),
+            Self::UnexpectedCharacter {
+                segment_index,
+                byte_offset,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "自然文本段 {segment_index} 的字节 {byte_offset} 预期 {expected:?}，实际为 {actual:?}"
+            ),
+        }
+    }
+}
+
+impl Error for LanguageRepairApplicationError {}
 
 /// 一段足以说明译文仍残留源语言的真实连续文本。
 #[derive(Clone, Debug, Eq, PartialEq)]

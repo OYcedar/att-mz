@@ -62,5 +62,6 @@ allowed_terms = ["Page Up", "Page Down"]
 Translate 启动时先校验全部语言定义，再按项目的源语言 ID 精确选择模块；找不到
 匹配定义时，会在发出任何模型请求之前失败。
 
-语言模块的译后判断只产生 Review，并由译后 QA 汇总。WriteBack 不执行语言分析或符号修订，
-也不会在发布时静默改变数据库中的译文。
+语言模块的译后判断只产生 Review，并由译后 QA 汇总。WriteBack 不执行语言分析；源语言残留
+不会因此阻断发布。WriteBack 的可选标点修复只比较原文与译文的标点拓扑，是独立的正文
+处理，不把语言 Review 改成 Rejected。

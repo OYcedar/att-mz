@@ -4,6 +4,12 @@
 # 未声明的字段、重复字段和错误类型会使使用该配置的命令失败。
 # 除特别说明外，所有以 _ms 结尾的时间值都使用毫秒。
 
+[write_back]
+# true 表示 WriteBack 会替换自动译文中已经存在且能与原文唯一对应的标点；不增删标点或空白。
+repair_punctuation = true
+# true 表示 WriteBack 会为未闭合成对符号内需要缩进的续行补一个全角空格。
+complete_continuation_whitespace = true
+
 [prompts]
 # true 表示要求模型返回可读的翻译判断；false 表示省略这部分内容。
 thinking_output = true
