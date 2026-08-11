@@ -4879,7 +4879,10 @@ fn publish_create_new(
                 cleanup_failure,
             })
         }
-        Err(WindowsFsError::FileIdentityChanged { .. }) => {
+        Err(
+            WindowsFsError::FileIdentityChanged { .. }
+            | WindowsFsError::RenameTargetUnconfirmed { .. },
+        ) => {
             state.cleanup.disarm();
             Err(DirectoryPublishError::OutcomeUnknown {
                 target_root,
@@ -4999,7 +5002,11 @@ fn publish_replace(
     if let Err(source) =
         rename_without_replace_if_identity(&target_root, &state.backup_path, original_identity)
     {
-        if matches!(source, WindowsFsError::FileIdentityChanged { .. }) {
+        if matches!(
+            source,
+            WindowsFsError::FileIdentityChanged { .. }
+                | WindowsFsError::RenameTargetUnconfirmed { .. }
+        ) {
             state.cleanup.disarm();
             return Err(DirectoryPublishError::OutcomeUnknown {
                 target_root: target_root.clone(),
@@ -5053,7 +5060,11 @@ fn publish_replace(
     if let Err(source) =
         rename_without_replace_if_identity(&stage_root, &target_root, state.stage_identity)
     {
-        let preserve_unknown_stage = matches!(source, WindowsFsError::FileIdentityChanged { .. });
+        let preserve_unknown_stage = matches!(
+            source,
+            WindowsFsError::FileIdentityChanged { .. }
+                | WindowsFsError::RenameTargetUnconfirmed { .. }
+        );
         let source = if preserve_unknown_stage {
             SystemFileSystemError::InvalidStagedIdentity {
                 path: stage_root.clone(),
