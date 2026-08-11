@@ -58,7 +58,11 @@ def _parser() -> argparse.ArgumentParser:
 
     finalize = subparsers.add_parser("finalize", help="消费审核决定并生成规则、manifest 与覆盖计划")
     finalize.add_argument("--survey", type=Path, required=True, help="scan 生成的 survey 作业目录")
-    finalize.add_argument("--decisions", type=Path, required=True, help="逐行 JSON 审核决定")
+    finalize.add_argument(
+        "--decisions",
+        type=Path,
+        help="逐行 JSON 审核决定；省略时使用 survey/ownership-decisions.jsonl",
+    )
     finalize.add_argument("--output", type=Path, required=True, help="计划输出目录")
     finalize.add_argument("--replace", action="store_true", help="替换已存在的计划目录")
 
@@ -81,6 +85,18 @@ def _json_text(value: JsonValue) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2) + "\n"
 
 
+def _ownership_decision_template(
+    groups: Sequence[Mapping[str, JsonValue]],
+) -> list[dict[str, JsonValue]]:
+    rows: list[dict[str, JsonValue]] = []
+    for group in groups:
+        group_id = group.get("group_id")
+        if not isinstance(group_id, str) or not group_id:
+            fail("review-groups.jsonl", "关系组缺少自然 group_id", "使用当前工具重新执行 scan")
+        rows.append({"target": f"group:{group_id}", "owner": "unresolved"})
+    return rows
+
+
 def _scan(args: argparse.Namespace) -> int:
     # scan_game 会自行确认真实内容根；这里先保护显式游戏根，避免输出写进来源树。
     game_root = require_directory(args.game, "游戏目录")
@@ -88,12 +104,14 @@ def _scan(args: argparse.Namespace) -> int:
     bundle = scan_game(game_root)
     locations_text = json_lines(bundle.locations)
     groups_text = json_lines(bundle.review_groups)
+    decisions_text = json_lines(_ownership_decision_template(bundle.review_groups))
     metrics_raw = bundle.summary.get("agent_work_metrics")
     metrics = dict(metrics_raw) if isinstance(metrics_raw, dict) else {}
     metrics.update(
         {
             "locations_jsonl_bytes": len(locations_text.encode("utf-8")),
             "review_groups_jsonl_bytes": len(groups_text.encode("utf-8")),
+            "ownership_decisions_jsonl_bytes": len(decisions_text.encode("utf-8")),
             "local_commands_required_before_extract": 2,
         }
     )
@@ -105,6 +123,7 @@ def _scan(args: argparse.Namespace) -> int:
             "survey.json": _json_text(survey),
             "locations.jsonl": locations_text,
             "review-groups.jsonl": groups_text,
+            "ownership-decisions.jsonl": decisions_text,
             "source-baseline.json": _json_text(bundle.source_baseline),
             "agent-work-metrics.json": _json_text(metrics),
         },
@@ -116,6 +135,7 @@ def _scan(args: argparse.Namespace) -> int:
         f"可决定关系组 {survey['review_groups']} 个。"
     )
     print(f"调查目录：{display_path(args.output)}")
+    print("所有权决定模板：ownership-decisions.jsonl（默认 unresolved，只修改已经确认的组）")
     return 0
 
 
@@ -564,7 +584,11 @@ def _project_rule_units(
 def _finalize(args: argparse.Namespace) -> int:
     started = time.perf_counter()
     survey_root = require_directory(args.survey, "survey 作业目录")
-    decisions_path = require_file(args.decisions, "审核决定 JSONL")
+    decisions_argument = cast(Path | None, args.decisions)
+    decisions_path = require_file(
+        decisions_argument if decisions_argument is not None else survey_root / "ownership-decisions.jsonl",
+        "审核决定 JSONL",
+    )
     protect_outputs(
         [args.output],
         inputs=[survey_root, decisions_path],

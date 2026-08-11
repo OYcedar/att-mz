@@ -52,6 +52,7 @@ _EXPORT_FIELDS = {
     "owner",
     "rule_number",
 }
+_REVIEW_EXAMPLE_LIMIT = 5
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -68,6 +69,12 @@ def _parser() -> argparse.ArgumentParser:
     scan.add_argument("--replace", action="store_true")
     manual = subparsers.add_parser("manual", help="只输出供 att manual export --ids 使用的自然 ID JSONL")
     manual.add_argument("--scan", type=Path, required=True, help="scan 生成的 QA 作业目录")
+    manual.add_argument(
+        "--review-group",
+        action="append",
+        default=[],
+        help="加入一个已审核的 review-groups.jsonl 组；可重复",
+    )
     manual.add_argument("--output", type=Path, required=True, help="自然 ID JSONL")
     manual.add_argument("--replace", action="store_true")
     return parser
@@ -79,6 +86,57 @@ def _json_text(value: JsonValue) -> str:
 
 def _json_lines(values: Sequence[Mapping[str, JsonValue]]) -> str:
     return "".join(json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n" for value in values)
+
+
+def _read_jsonl_objects(path: Path, description: str) -> list[dict[str, JsonValue]]:
+    source = require_file(path, description)
+    rows: list[dict[str, JsonValue]] = []
+    for line_number, line in enumerate(source.read_text(encoding="utf-8-sig").splitlines(), start=1):
+        if not line.strip():
+            fail(str(source), f"第 {line_number} 行为空", f"重新运行 {description}")
+        raw = parse_json_text(line, f"{source} 第 {line_number} 行")
+        if not isinstance(raw, dict):
+            fail(str(source), f"第 {line_number} 行不是 object", f"重新运行 {description}")
+        rows.append(dict(raw))
+    return rows
+
+
+def _group_heuristic_findings(
+    findings: Sequence[dict[str, JsonValue]],
+) -> list[dict[str, JsonValue]]:
+    grouped: dict[str, list[dict[str, JsonValue]]] = {}
+    for finding in findings:
+        if finding.get("analysis_status") != "heuristic_review":
+            continue
+        kind = finding.get("kind")
+        if not isinstance(kind, str):
+            fail("QA findings", "启发式 finding 缺少 kind", "重新运行 translation_qa.py scan")
+        grouped.setdefault(kind, []).append(finding)
+
+    output: list[dict[str, JsonValue]] = []
+    for number, (kind, members) in enumerate(grouped.items(), start=1):
+        group_id = f"review-{number:06d}"
+        for member in members:
+            member["review_group_id"] = group_id
+        manual_ids = {
+            cast(str, member["manual_id"]) for member in members if isinstance(member.get("manual_id"), str)
+        }
+        candidate_ids = {
+            cast(str, member["candidate_id"])
+            for member in members
+            if isinstance(member.get("candidate_id"), str)
+        }
+        output.append(
+            {
+                "review_group_id": group_id,
+                "kind": kind,
+                "findings": len(members),
+                "manual_ids": len(manual_ids),
+                "candidate_ids": len(candidate_ids),
+                "examples": [dict(member) for member in members[:_REVIEW_EXAMPLE_LIMIT]],
+            }
+        )
+    return output
 
 
 def _file_fact(path: Path, description: str) -> dict[str, JsonValue]:
@@ -488,17 +546,23 @@ def _scan(args: argparse.Namespace) -> int:
     unverified.extend(runtime_unverified)
     for number, finding in enumerate(findings, start=1):
         finding["finding_id"] = f"finding-{number:06d}"
-    actionable_ids = {
-        cast(str, finding["manual_id"]) for finding in findings if isinstance(finding.get("manual_id"), str)
+    review_groups = _group_heuristic_findings(findings)
+    confirmed_ids = {
+        cast(str, finding["manual_id"])
+        for finding in findings
+        if finding.get("analysis_status") == "confirmed_fact" and isinstance(finding.get("manual_id"), str)
     }
-    revision_ids = [cast(str, row["manual_id"]) for row in rows if row["manual_id"] in actionable_ids]
+    revision_ids = [cast(str, row["manual_id"]) for row in rows if row["manual_id"] in confirmed_ids]
     status = "needs_review" if findings else "unverified" if unverified else "clean"
     counts = Counter(cast(str, finding["kind"]) for finding in findings)
+    heuristic_findings = sum(finding.get("analysis_status") == "heuristic_review" for finding in findings)
     summary: dict[str, JsonValue] = {
         "qa_status": status,
         "translation_export": _file_fact(translations_path, "ATT Translation export JSONL"),
         "translations": len(rows),
         "findings": len(findings),
+        "heuristic_findings": heuristic_findings,
+        "review_groups": len(review_groups),
         "counts": dict(sorted(counts.items())),
         "revision_ids": revision_ids,
         "unverified": unverified,
@@ -508,6 +572,7 @@ def _scan(args: argparse.Namespace) -> int:
         "translation_entries_scanned": len(rows),
         "survey_locations_checked": len(locations),
         "revision_ids": len(revision_ids),
+        "review_groups": len(review_groups),
         "local_command_elapsed_ms": round((time.perf_counter() - started) * 1000),
         "external_request_wait_ms": 0,
     }
@@ -516,11 +581,15 @@ def _scan(args: argparse.Namespace) -> int:
         {
             "qa-summary.json": _json_text(summary),
             "findings.jsonl": _json_lines(findings),
+            "review-groups.jsonl": _json_lines(review_groups),
             "agent-work-metrics.json": _json_text(metrics),
         },
         replace=args.replace,
     )
-    print(f"译后 QA：{status}；发现 {len(findings)} 项，建议集中修订 {len(revision_ids)} 个自然 Unit。")
+    print(
+        f"译后 QA：{status}；确定问题涉及 {len(revision_ids)} 个自然 Unit，"
+        f"{heuristic_findings} 项启发式结果已压缩为 {len(review_groups)} 个 Review 组。"
+    )
     print(f"QA 目录：{display_path(args.output)}")
     return 0
 
@@ -546,7 +615,32 @@ def _manual(args: argparse.Namespace) -> int:
     if current["bytes"] != bytes_value or current["sha256"] != digest_value:
         fail(path_value, "Translation export 在 QA 后发生变化", "重新运行 translation_qa.py scan")
     protect_outputs([args.output], inputs=[scan_root, Path(path_value)], replace=args.replace)
-    rows = [{"manual_id": cast(str, value)} for value in revision_ids]
+    selected_groups = cast(list[str], args.review_group)
+    if len(selected_groups) != len(set(selected_groups)) or any(not value for value in selected_groups):
+        fail("--review-group", "Review 组为空或重复", "每个 review_group_id 只传一次")
+    requested_ids = {cast(str, value) for value in revision_ids}
+    if selected_groups:
+        group_rows = _read_jsonl_objects(scan_root / "review-groups.jsonl", "translation_qa.py scan")
+        available_groups = {
+            cast(str, row["review_group_id"])
+            for row in group_rows
+            if isinstance(row.get("review_group_id"), str)
+        }
+        unknown = sorted(set(selected_groups) - available_groups)
+        if unknown:
+            fail("--review-group", f"Review 组 {unknown[0]} 不存在", "使用当前 review-groups.jsonl 中的 ID")
+        for finding in _read_jsonl_objects(scan_root / "findings.jsonl", "translation_qa.py scan"):
+            if finding.get("review_group_id") not in selected_groups:
+                continue
+            manual_id = finding.get("manual_id")
+            if isinstance(manual_id, str):
+                requested_ids.add(manual_id)
+    translation_rows = _read_translation_export(Path(path_value))
+    rows = [
+        {"manual_id": cast(str, row["manual_id"])}
+        for row in translation_rows
+        if row["manual_id"] in requested_ids
+    ]
     atomic_write_text(args.output, _json_lines(rows), replace=args.replace)
     print(f"已输出 {len(rows)} 个自然 ID：{display_path(args.output)}")
     print("下一步：把该文件交给 att mv|mz|generic manual export --ids，取得数据库当前译文的预填 Manual。")

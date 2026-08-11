@@ -116,7 +116,7 @@ def translation_rows(*, corrected: bool) -> list[dict[str, object]]:
     ]
 
 
-def test_translation_qa_uses_exports_and_builds_revision_ids(tmp_path: Path) -> None:
+def test_translation_qa_groups_heuristics_and_only_expands_selected_reviews(tmp_path: Path) -> None:
     translations = tmp_path / "translations.jsonl"
     rows = translation_rows(corrected=False)
     write_jsonl(translations, rows)
@@ -174,9 +174,25 @@ def test_translation_qa_uses_exports_and_builds_revision_ids(tmp_path: Path) -> 
     assert report["counts"]["layout_risk"] >= 1
     assert report["counts"]["source_residual"] >= 2
     assert report["counts"]["terminology_mismatch"] == 1
+    review_groups = [
+        json.loads(line) for line in (scan / "review-groups.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(review_groups) == report["review_groups"]
+    assert report["heuristic_findings"] > len(review_groups)
+    assert all(len(group["examples"]) <= 5 for group in review_groups)
+
+    confirmed_ids = tmp_path / "confirmed-ids.jsonl"
+    run_script(["manual", "--scan", scan, "--output", confirmed_ids])
+    revision_ids = [
+        json.loads(line)["manual_id"] for line in confirmed_ids.read_text(encoding="utf-8").splitlines()
+    ]
+    assert revision_ids == [rows[2]["manual_id"]]
 
     ids = tmp_path / "revision-ids.jsonl"
-    run_script(["manual", "--scan", scan, "--output", ids])
+    selected_groups = [
+        item for group in review_groups for item in ("--review-group", group["review_group_id"])
+    ]
+    run_script(["manual", "--scan", scan, *selected_groups, "--output", ids])
     revision_ids = [json.loads(line)["manual_id"] for line in ids.read_text(encoding="utf-8").splitlines()]
     assert revision_ids == [row["manual_id"] for row in rows]
 

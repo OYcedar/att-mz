@@ -36,6 +36,14 @@ description: 使用 ATT 调查、建立、继续、诊断、修订、写回和�
 不要删除、重建或修改已有 ATT 项目材料来“重新开始”。恢复必须依据当前数据库、日志、
 Manual、审核材料和发行文档的现有事实。
 
+长期或跨会话任务先按 `docs/guides/task-artifacts.md` 建立一个以游戏自然名、版本、范围和
+目标语言命名的任务根。本文中的 `<工作目录>` 指该任务根内的 `artifacts/work/`；已经采用的
+决定放 `artifacts/decisions/`，实际使用的规则放 `artifacts/rules/`，最终 QA 证据放
+`artifacts/qa/`。
+本游戏专用且需要保留的辅助脚本放 `artifacts/scripts/`，一次性临时脚本放
+`artifacts/scratch/`。禁止把任务脚本、过程文件或临时规则写入 Skill 目录；只有经过同类
+任务验证并决定长期维护的通用工具，才能另行修改 Skill。
+
 ## 一次调查并确定所有者
 
 先确认 Python 3.11+。Survey 是对本次游戏来源的一次性调查。程序默认拒绝覆盖；
@@ -50,28 +58,37 @@ python <Skill>\scripts\rpg_maker_survey.py scan --game <完整游戏安装根> -
 `unresolved`，不得先分配所有者再补调查。用户禁止运行游戏、运行场景无法到达或静态证据不足时，
 直接保留 `unresolved`；不要只为消除未确认项反复扫描或逐个展开大型关系组。
 
-读取 `review-groups.jsonl`（按同一判断合并的紧凑关系组），在决定文件中只引用自然
-`group_id` 或 `candidate_id`：
+`scan` 同时生成 `ownership-decisions.jsonl`：每个关系组只有一行，默认状态是
+`unresolved`。把它复制到 `artifacts/decisions/ownership.jsonl`，只修改已经取得证据的组；
+不要在聊天消息、补丁或临时脚本中重新生成全量决定。决定文件只引用自然 `group_id` 或
+`candidate_id`：
+
+```powershell
+Copy-Item <工作目录>\survey\ownership-decisions.jsonl <任务根>\artifacts\decisions\ownership.jsonl
+```
 
 ```json
 {"target":"group:group-000001","owner":"rules","reason":"..."}
 ```
 
-`owner` 只取 `rules`、`generic`、`exclude` 或 `unresolved`。每组必须有一个状态，但不要求每组都能
-确认所有者。拆组时只写成员决定。Generic
+`owner` 只取 `rules`、`generic`、`exclude` 或 `unresolved`。工具已经为每组生成状态，不要求每组都能
+确认所有者。拆组时删除该组的默认行，只写确实需要不同决定的成员。Generic
 必须逐项写齐工具要求的七项证据；文件存在、疑似显示或源码出现引用都不够。
 只有需要拆组时才导出该组的完整成员，不打开整份 `locations.jsonl`：
 
 ```powershell
-python <Skill>\scripts\rpg_maker_survey.py members --survey <工作目录>\survey --group-id <group_id> --output <组成员.jsonl>
+python <Skill>\scripts\rpg_maker_survey.py members --survey <工作目录>\survey --group-id <group_id> --output <工作目录>\survey-members\<group_id>.jsonl
 ```
 
 游戏路径和语言已固定，且 Init 的来源复制不会与当前磁盘任务争用时，可在 Agent 审核关系组时
 并行执行 Init；否则按顺序执行。Extract 必须等待两者都完成。
 
 ```powershell
-python <Skill>\scripts\rpg_maker_survey.py finalize --survey <工作目录>\survey --decisions <决定.jsonl> --output <工作目录>\plan
+python <Skill>\scripts\rpg_maker_survey.py finalize --survey <工作目录>\survey --decisions <任务根>\artifacts\decisions\ownership.jsonl --output <工作目录>\plan
 ```
+
+把本轮实际用于 Extract 的 `dialogue-rules.toml` 和 `rules.toml` 从计划目录复制到
+`<任务根>\artifacts\rules\`；ATT 命令只引用这份已采用副本，不从聊天或临时目录取规则。
 
 `coverage.json` 的 `complete=false` 是正常结果，表示仍有未确认范围，不是命令失败。能够取得新证据时可对
 同一来源重新 finalize；证据暂时不可得时，记录精确未确认项并继续处理已确认范围，不让少量未知项卡住整次翻译。
@@ -81,6 +98,9 @@ MV 姓名 wrapper 不因外形建立全局规则；未证明的 wrapper 由译�
 已批准 Generic 来源的 ATT 输入在 `plan/generic/input/`，精确来源映射在
 `plan/generic/manifest.json`。它们只覆盖已经审核的位置。随包工具不会把 Generic 译文写回
 游戏；必须使用任务中已确认的外部消费过程，并在隔离副本中验证。
+建立或复核 Generic JSONL 时，能够独立理解和写回的重复记录必须分别成为 Group；不能因为
+同属一个文件、数组或补丁日志就合并成一个超长 Group。ATT 只能在 Group 之间组合模型任务，
+错误分组应在 Translate 前修正，不用重试或临时分片补救。
 
 ## Extract、所有权和译前准备
 
@@ -88,9 +108,9 @@ MV 姓名 wrapper 不因外形建立全局规则；未证明的 wrapper 由译�
 本轮完整 Manual：
 
 ```powershell
-att <mv或mz> ownership export --name <项目名> <ownership.jsonl>
-att <mv或mz> manual export --name <项目名> --selection all <final-manual.toml>
-python <Skill>\scripts\rpg_maker_survey.py audit --survey <工作目录>\survey --plan <工作目录>\plan --ownership <ownership.jsonl> --output <ownership-audit.json>
+att <mv或mz> ownership export --name <项目名> <工作目录>\ownership.jsonl
+att <mv或mz> manual export --name <项目名> --selection all <工作目录>\final-manual.toml
+python <Skill>\scripts\rpg_maker_survey.py audit --survey <工作目录>\survey --plan <工作目录>\plan --ownership <工作目录>\ownership.jsonl --output <任务根>\artifacts\qa\ownership-audit.json
 ```
 
 `audit` 的问题不阻止 Translate，但 `complete=false` 时不能宣称来源覆盖完整。不要从 Manual
@@ -106,8 +126,8 @@ ID 前缀猜 owner，也不要读取 SQLite 猜映射。
 - 用 `summarize_att_run.py` 汇总已经结束的 ATT 日志，不读取仍在写入的日志。
 
 ```powershell
-python <Skill>\scripts\translation_preflight.py --manual <final-manual.toml> --survey <工作目录>\survey --coverage <工作目录>\plan\coverage.json --output <工作目录>\preflight
-python <Skill>\scripts\translation_preflight.py --manual <final-manual.toml> --survey <工作目录>\survey --coverage <工作目录>\plan\coverage.json --decisions <placeholder-decisions.jsonl> --output <工作目录>\preflight --replace
+python <Skill>\scripts\translation_preflight.py --manual <工作目录>\final-manual.toml --survey <工作目录>\survey --coverage <工作目录>\plan\coverage.json --output <工作目录>\preflight
+python <Skill>\scripts\translation_preflight.py --manual <工作目录>\final-manual.toml --survey <工作目录>\survey --coverage <工作目录>\plan\coverage.json --decisions <任务根>\artifacts\decisions\placeholder.jsonl --output <工作目录>\preflight --replace
 ```
 
 ATT 的 MV/MZ 内建控制符由 ATT 默认规则负责。普通未知外形、语义、术语、语言比例和布局只
@@ -126,20 +146,24 @@ ATT 的 MV/MZ 内建控制符由 ATT 默认规则负责。普通未知外形、�
 按现行 Translate 规格运行后导出全部当前状态，再做一次静态 QA（不启动游戏的译后检查）：
 
 ```powershell
-att <mv或mz或generic> translation export --name <项目名> <translations.jsonl>
-python <Skill>\scripts\translation_qa.py scan --translations <translations.jsonl> --survey <工作目录>\survey --terminology <terminology.toml> --output <工作目录>\qa
+att <mv或mz或generic> translation export --name <项目名> <工作目录>\translations.jsonl
+python <Skill>\scripts\translation_qa.py scan --translations <工作目录>\translations.jsonl --survey <工作目录>\survey --terminology <任务根>\artifacts\rules\terminology.toml --output <工作目录>\qa
 ```
 
 Generic 项目另传 `--generic-manifest <工作目录>\plan\generic\manifest.json`。首次静态 QA 不传 WriteBack 和
 NW.js 报告；它们只在最终合并 QA 时传入。`qa_status` 只取 `clean`、`needs_review`、
 `unverified`；发现多少 Review 都不会拒绝已有结构合法译文。
 
+先读 `qa/review-groups.jsonl` 的分类、数量和少量样例，不默认打开完整
+`qa/findings.jsonl`。需要核对某组时只读取带该 `review_group_id` 的明细；确定问题由
+`manual` 自动加入，启发式 Review 只有在实际审核并选中后才进入 Manual。
+
 需要集中返修时只输出自然 ID，再让 ATT 从当前数据库预填 Manual：
 
 ```powershell
-python <Skill>\scripts\translation_qa.py manual --scan <工作目录>\qa --output <revision-ids.jsonl>
-att <mv或mz或generic> manual export --name <项目名> --ids <revision-ids.jsonl> <revision.toml>
-att <mv或mz或generic> manual apply --name <项目名> <revision.toml>
+python <Skill>\scripts\translation_qa.py manual --scan <工作目录>\qa [--review-group review-000001] --output <任务根>\artifacts\decisions\revision-ids.jsonl
+att <mv或mz或generic> manual export --name <项目名> --ids <任务根>\artifacts\decisions\revision-ids.jsonl <任务根>\artifacts\decisions\revision.toml
+att <mv或mz或generic> manual apply --name <项目名> <任务根>\artifacts\decisions\revision.toml
 ```
 
 编辑 `revision.toml` 后默认直接 apply；apply 会在单个事务内执行与 check 相同的结构校验，失败时不修改
@@ -149,8 +173,8 @@ att <mv或mz或generic> manual apply --name <项目名> <revision.toml>
 apply 成功后重新导出当前译文并再做一次静态 QA；确认本轮修改结果后才执行 WriteBack：
 
 ```powershell
-att <mv或mz或generic> translation export --name <项目名> <translations-after-manual.jsonl>
-python <Skill>\scripts\translation_qa.py scan --translations <translations-after-manual.jsonl> --survey <工作目录>\survey --terminology <terminology.toml> --output <工作目录>\qa-after-manual
+att <mv或mz或generic> translation export --name <项目名> <工作目录>\translations-after-manual.jsonl
+python <Skill>\scripts\translation_qa.py scan --translations <工作目录>\translations-after-manual.jsonl --survey <工作目录>\survey --terminology <任务根>\artifacts\rules\terminology.toml --output <工作目录>\qa-after-manual
 ```
 
 ## WriteBack、最终运行观察和 QA
@@ -159,8 +183,8 @@ python <Skill>\scripts\translation_qa.py scan --translations <translations-after
 （尝试标准场景的自动检查）和 observe（记录正常游玩中的实际绘制）只在该副本执行：
 
 ```powershell
-python <Skill>\scripts\inspect_nwjs_runtime.py smoke --game <隔离副本> --output <报告目录> --confirm-isolated-copy
-python <Skill>\scripts\inspect_nwjs_runtime.py observe --game <隔离副本> --output <报告目录> --confirm-isolated-copy
+python <Skill>\scripts\inspect_nwjs_runtime.py smoke --game <隔离副本> --output <任务根>\artifacts\qa\nwjs-smoke --confirm-isolated-copy
+python <Skill>\scripts\inspect_nwjs_runtime.py observe --game <隔离副本> --output <任务根>\artifacts\qa\nwjs-observe --confirm-isolated-copy
 ```
 
 单个场景无法安全进入时记为 `unsupported` 并继续；未访问场景是 `unverified`。窗口宽度、
@@ -170,8 +194,8 @@ python <Skill>\scripts\inspect_nwjs_runtime.py observe --game <隔离副本> --o
 只在需要修改前比较或只读调查时先 inspect。每次修改都有事务记录，可按记录 restore：
 
 ```powershell
-python <Skill>\scripts\manage_rpg_maker_fonts.py apply --game <隔离副本> --font noto-sans-sc --state <字体状态目录> --output <应用.json>
-python <Skill>\scripts\manage_rpg_maker_fonts.py restore --game <隔离副本> --state <字体状态目录> --output <恢复.json>
+python <Skill>\scripts\manage_rpg_maker_fonts.py apply --game <隔离副本> --font noto-sans-sc --state <工作目录>\font-state --output <任务根>\artifacts\qa\font-apply.json
+python <Skill>\scripts\manage_rpg_maker_fonts.py restore --game <隔离副本> --state <工作目录>\font-state --output <任务根>\artifacts\qa\font-restore.json
 ```
 
 字体工具递归处理已确认的完整字体引用，不只修改 MV `gamefont.css` 或 MZ 的单个标准字段。
