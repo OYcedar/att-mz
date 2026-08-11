@@ -364,6 +364,8 @@ task-record-final-status = 狀態：{ $state ->
     [cancelled] 已取消，未提交
    *[other] { $state }
 }
-task-record-accepted-written = 已接受：{ $accepted } 項，寫入 { $written } 個實際位置
-task-record-accepted-outcome-unknown = 已驗收：{ $accepted } 項；無法確認資料庫提交終態
+task-record-requested = 要求譯文：{ $requested } 項
+task-record-accepted-written = 已接受：{ $accepted } 項（ID：{ $ids }），寫入 { $written } 個實際位置
+task-record-accepted-outcome-unknown = 已驗收：{ $accepted } 項（ID：{ $ids }）；無法確認資料庫提交終態
+task-record-unaccepted = 未接受：{ $unaccepted } 項（ID：{ $ids }）
 task-record-task-diagnostic = 任務診斷

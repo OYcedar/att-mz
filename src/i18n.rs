@@ -803,12 +803,21 @@ pub(crate) enum UiMessage<'a> {
     TaskRecordFinalStatus {
         state: &'a str,
     },
+    TaskRecordRequested {
+        requested: u64,
+    },
     TaskRecordAcceptedWritten {
         accepted: u64,
         written: u64,
+        ids: &'a str,
     },
     TaskRecordAcceptedOutcomeUnknown {
         accepted: u64,
+        ids: &'a str,
+    },
+    TaskRecordUnaccepted {
+        unaccepted: u64,
+        ids: &'a str,
     },
     TaskRecordTaskDiagnostic,
 }
@@ -982,8 +991,10 @@ impl UiMessage<'_> {
             Self::TaskRecordTitle => "task-record-title",
             Self::TaskRecordFinalResultHeading => "task-record-final-result-heading",
             Self::TaskRecordFinalStatus { .. } => "task-record-final-status",
+            Self::TaskRecordRequested { .. } => "task-record-requested",
             Self::TaskRecordAcceptedWritten { .. } => "task-record-accepted-written",
             Self::TaskRecordAcceptedOutcomeUnknown { .. } => "task-record-accepted-outcome-unknown",
+            Self::TaskRecordUnaccepted { .. } => "task-record-unaccepted",
             Self::TaskRecordTaskDiagnostic => "task-record-task-diagnostic",
         }
     }
@@ -1206,12 +1217,25 @@ impl UiMessage<'_> {
             Self::TaskRecordFinalStatus { state } => {
                 set_text(&mut arguments, "state", state);
             }
-            Self::TaskRecordAcceptedWritten { accepted, written } => {
+            Self::TaskRecordRequested { requested } => {
+                set_number(&mut arguments, "requested", requested);
+            }
+            Self::TaskRecordAcceptedWritten {
+                accepted,
+                written,
+                ids,
+            } => {
                 set_number(&mut arguments, "accepted", accepted);
                 set_number(&mut arguments, "written", written);
+                set_text(&mut arguments, "ids", ids);
             }
-            Self::TaskRecordAcceptedOutcomeUnknown { accepted } => {
+            Self::TaskRecordAcceptedOutcomeUnknown { accepted, ids } => {
                 set_number(&mut arguments, "accepted", accepted);
+                set_text(&mut arguments, "ids", ids);
+            }
+            Self::TaskRecordUnaccepted { unaccepted, ids } => {
+                set_number(&mut arguments, "unaccepted", unaccepted);
+                set_text(&mut arguments, "ids", ids);
             }
             Self::TaskRecordTaskDiagnostic => {}
             Self::DiagnosticObject { subject } => set_text(&mut arguments, "subject", subject),
@@ -2147,11 +2171,20 @@ mod tests {
             UiMessage::TaskRecordTitle,
             UiMessage::TaskRecordFinalResultHeading,
             UiMessage::TaskRecordFinalStatus { state: "complete" },
+            UiMessage::TaskRecordRequested { requested: 5 },
             UiMessage::TaskRecordAcceptedWritten {
                 accepted: 4,
                 written: 6,
+                ids: "0, 1, 2, 3",
             },
-            UiMessage::TaskRecordAcceptedOutcomeUnknown { accepted: 4 },
+            UiMessage::TaskRecordAcceptedOutcomeUnknown {
+                accepted: 4,
+                ids: "0, 1, 2, 3",
+            },
+            UiMessage::TaskRecordUnaccepted {
+                unaccepted: 1,
+                ids: "4",
+            },
             UiMessage::TaskRecordTaskDiagnostic,
         ]
     }

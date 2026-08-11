@@ -371,6 +371,8 @@ task-record-final-status = الحالة: { $state ->
     [cancelled] ملغاة؛ لم تُثبَّت
    *[other] { $state }
 }
-task-record-accepted-written = المقبول: { $accepted } عناصر، كُتبت في { $written } مواضع فعلية
-task-record-accepted-outcome-unknown = تم التحقق من { $accepted } عناصر؛ تعذّر تأكيد نتيجة تثبيت قاعدة البيانات
+task-record-requested = الترجمات المطلوبة: { $requested }
+task-record-accepted-written = المقبول: { $accepted } عناصر (المعرّفات: { $ids })، كُتبت في { $written } مواضع فعلية
+task-record-accepted-outcome-unknown = تم التحقق من { $accepted } عناصر (المعرّفات: { $ids })؛ تعذّر تأكيد نتيجة تثبيت قاعدة البيانات
+task-record-unaccepted = غير المقبول: { $unaccepted } عناصر (المعرّفات: { $ids })
 task-record-task-diagnostic = تشخيص المهمة

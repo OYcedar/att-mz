@@ -369,6 +369,8 @@ task-record-final-status = Состояние: { $state ->
     [cancelled] отменена, без фиксации
    *[other] { $state }
 }
-task-record-accepted-written = Принято: { $accepted } элементов, записано в { $written } фактических позиций
-task-record-accepted-outcome-unknown = Проверено: { $accepted } элементов; результат фиксации базы данных невозможно подтвердить
+task-record-requested = Запрошено переводов: { $requested }
+task-record-accepted-written = Принято: { $accepted } элементов (ID: { $ids }), записано в { $written } фактических позиций
+task-record-accepted-outcome-unknown = Проверено: { $accepted } элементов (ID: { $ids }); результат фиксации базы данных невозможно подтвердить
+task-record-unaccepted = Не принято: { $unaccepted } элементов (ID: { $ids })
 task-record-task-diagnostic = Диагностика задачи

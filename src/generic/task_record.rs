@@ -9,13 +9,14 @@ use crate::diagnostic::{DiagnosticReport, render_diagnostic_report};
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
 use crate::llm::ApiKeyRedactor;
 use crate::translation::task_record::{
-    TranslationTaskRecordArtifact, markdown_fence, task_record_text,
+    TranslationTaskRecordArtifact, TranslationTaskRecordOutputSummary, markdown_fence,
+    markdown_json_fence, task_record_output_ids, task_record_text,
 };
 
 #[derive(Clone, Debug)]
 pub(crate) struct GenericTaskRecordState {
     code: &'static str,
-    accepted: usize,
+    accepted_ids: Vec<usize>,
     written: usize,
     diagnostics: Vec<DiagnosticReport>,
 }
@@ -23,7 +24,7 @@ pub(crate) struct GenericTaskRecordState {
 impl GenericTaskRecordState {
     pub(crate) fn committed(
         complete: bool,
-        accepted: usize,
+        accepted_ids: Vec<usize>,
         written: usize,
         diagnostics: Vec<DiagnosticReport>,
     ) -> Self {
@@ -33,7 +34,7 @@ impl GenericTaskRecordState {
             } else {
                 "partial"
             },
-            accepted,
+            accepted_ids,
             written,
             diagnostics,
         }
@@ -42,7 +43,7 @@ impl GenericTaskRecordState {
     pub(crate) fn unavailable(diagnostic: DiagnosticReport) -> Self {
         Self {
             code: "unavailable",
-            accepted: 0,
+            accepted_ids: Vec::new(),
             written: 0,
             diagnostics: vec![diagnostic],
         }
@@ -51,33 +52,61 @@ impl GenericTaskRecordState {
     pub(crate) fn cancelled() -> Self {
         Self {
             code: "cancelled",
-            accepted: 0,
+            accepted_ids: Vec::new(),
             written: 0,
             diagnostics: Vec::new(),
         }
     }
 
-    pub(crate) fn not_committed_due_to_prior_failure() -> Self {
+    pub(crate) fn cancelled_after_acceptance(
+        accepted_ids: Vec<usize>,
+        diagnostics: Vec<DiagnosticReport>,
+    ) -> Self {
+        Self {
+            code: "cancelled",
+            accepted_ids,
+            written: 0,
+            diagnostics,
+        }
+    }
+
+    pub(crate) fn not_committed_due_to_prior_failure(
+        accepted_ids: Vec<usize>,
+        diagnostics: Vec<DiagnosticReport>,
+    ) -> Self {
         Self {
             code: "not_committed",
-            accepted: 0,
+            accepted_ids,
             written: 0,
-            diagnostics: Vec::new(),
+            diagnostics,
         }
     }
 
     pub(crate) fn failed(diagnostic: DiagnosticReport) -> Self {
         Self {
             code: "execution_failed",
-            accepted: 0,
+            accepted_ids: Vec::new(),
             written: 0,
             diagnostics: vec![diagnostic],
+        }
+    }
+
+    pub(crate) fn failed_after_acceptance(
+        accepted_ids: Vec<usize>,
+        diagnostics: Vec<DiagnosticReport>,
+    ) -> Self {
+        Self {
+            code: "execution_failed",
+            accepted_ids,
+            written: 0,
+            diagnostics,
         }
     }
 }
 
 pub(crate) struct GenericTaskRecordDocument {
     task_index: usize,
+    requested_outputs: usize,
     user_message: String,
     raw_assistant: Option<String>,
     state: GenericTaskRecordState,
@@ -86,12 +115,14 @@ pub(crate) struct GenericTaskRecordDocument {
 impl GenericTaskRecordDocument {
     pub(crate) fn new(
         task_index: usize,
+        requested_outputs: usize,
         user_message: String,
         raw_assistant: Option<String>,
         state: GenericTaskRecordState,
     ) -> Self {
         Self {
             task_index,
+            requested_outputs,
             user_message,
             raw_assistant,
             state,
@@ -116,26 +147,16 @@ fn render_generic_task_record(
 ) -> String {
     let localizer = UiLocalizer::new(locale);
     let mut output = format!(
-        "# {}\n\n## User\n\n",
-        task_record_text(&localizer, UiMessage::TaskRecordTitle)
-    );
-    let user = redactor.redact_text_with_json_strings(&document.user_message);
-    output.push_str(&user);
-    if !user.ends_with('\n') {
-        output.push('\n');
-    }
-
-    if let Some(raw_assistant) = &document.raw_assistant {
-        output.push_str("\n## Assistant\n\n");
-        let assistant = redactor.redact_text_with_json_strings(raw_assistant);
-        output.push_str(&markdown_fence(&assistant, "text"));
-    }
-
-    let _ = write!(
-        output,
-        "\n## {}\n\n",
+        "# {}\n\n## {}\n\n",
+        task_record_text(&localizer, UiMessage::TaskRecordTitle),
         task_record_text(&localizer, UiMessage::TaskRecordFinalResultHeading)
     );
+    let summary = TranslationTaskRecordOutputSummary::new(
+        document.requested_outputs,
+        document.state.accepted_ids.iter().copied(),
+    );
+    let accepted_ids = task_record_output_ids(summary.accepted());
+    let unaccepted_ids = task_record_output_ids(summary.unaccepted());
     let _ = writeln!(
         output,
         "- {}",
@@ -151,9 +172,31 @@ fn render_generic_task_record(
         "- {}",
         task_record_text(
             &localizer,
+            UiMessage::TaskRecordRequested {
+                requested: summary.requested() as u64,
+            }
+        )
+    );
+    let _ = writeln!(
+        output,
+        "- {}",
+        task_record_text(
+            &localizer,
             UiMessage::TaskRecordAcceptedWritten {
-                accepted: document.state.accepted as u64,
+                accepted: summary.accepted().len() as u64,
                 written: document.state.written as u64,
+                ids: &accepted_ids,
+            }
+        )
+    );
+    let _ = writeln!(
+        output,
+        "- {}",
+        task_record_text(
+            &localizer,
+            UiMessage::TaskRecordUnaccepted {
+                unaccepted: summary.unaccepted().len() as u64,
+                ids: &unaccepted_ids,
             }
         )
     );
@@ -165,6 +208,19 @@ fn render_generic_task_record(
         );
         let rendered = redactor.redact(&render_diagnostic_report(diagnostic, &localizer));
         output.push_str(&markdown_fence(&rendered, "text"));
+    }
+
+    output.push_str("\n## User\n\n");
+    let user = redactor.redact_text_with_json_strings(&document.user_message);
+    output.push_str(&user);
+    if !user.ends_with('\n') {
+        output.push('\n');
+    }
+
+    if let Some(raw_assistant) = &document.raw_assistant {
+        output.push_str("\n## Assistant\n\n");
+        let assistant = redactor.redact_text_with_json_strings(raw_assistant);
+        output.push_str(&markdown_json_fence(&assistant));
     }
     output
 }
@@ -179,9 +235,10 @@ mod tests {
     fn record_keeps_only_user_assistant_and_final_result() {
         let document = GenericTaskRecordDocument::new(
             0,
+            1,
             r#"{"units":[{"text":"原文"}]}"#.to_owned(),
             Some(r#"{"translations":{"0":["译文"]}}"#.to_owned()),
-            GenericTaskRecordState::committed(true, 1, 1, Vec::new()),
+            GenericTaskRecordState::committed(true, vec![0], 1, Vec::new()),
         );
         let rendered = document.render(
             &ApiKeyRedactor::new(SecretString::from("secret")),
@@ -192,6 +249,14 @@ mod tests {
         assert!(rendered.contains("## Assistant"));
         assert!(rendered.contains("# 翻译任务"));
         assert!(rendered.contains("## 最终结果"));
+        assert!(rendered.contains("要求译文：1 项"));
+        assert!(rendered.contains("已接受：1 项（ID：0）"));
+        assert!(rendered.contains("未接受：0 项（ID：—）"));
+        assert!(rendered.contains("## Assistant\n\n```json\n"));
+        assert!(
+            rendered.find("## 最终结果").expect("应包含最终结果")
+                < rendered.find("## User").expect("应包含 User")
+        );
         assert!(!rendered.contains("## System"));
         assert!(!rendered.contains("Attempts"));
         assert!(!rendered.contains("RunId"));
@@ -202,9 +267,10 @@ mod tests {
     fn record_redacts_user_and_raw_assistant() {
         let document = GenericTaskRecordDocument::new(
             0,
+            1,
             r#"{"text":"secret"}"#.to_owned(),
             Some(r#"{"translation":"secret"}"#.to_owned()),
-            GenericTaskRecordState::committed(true, 1, 1, Vec::new()),
+            GenericTaskRecordState::committed(true, vec![0], 1, Vec::new()),
         );
         let rendered = document.render(
             &ApiKeyRedactor::new(SecretString::from("secret")),

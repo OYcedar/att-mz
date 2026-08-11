@@ -539,6 +539,79 @@ pub(crate) fn markdown_fence(content: &str, language: &str) -> String {
     output
 }
 
+/// 使用 JSON 高亮呈现原始 Assistant 正文。
+///
+/// 模型已经返回规范围栏时，只移除这一层围栏，再由本模块建立能够安全包住正文的
+/// `json` 围栏；裸 JSON 和无效响应也不会作为 Markdown 结构直接注入任务记录。
+pub(crate) fn markdown_json_fence(content: &str) -> String {
+    let body = canonical_json_fence_body(content).unwrap_or(content);
+    markdown_fence(body, "json")
+}
+
+fn canonical_json_fence_body(content: &str) -> Option<&str> {
+    let trimmed = content.trim();
+    let body = trimmed
+        .strip_prefix("```json\r\n")
+        .or_else(|| trimmed.strip_prefix("```json\n"))?;
+    body.strip_suffix("\r\n```")
+        .or_else(|| body.strip_suffix("\n```"))
+}
+
+/// 任务记录中一个连续临时 ID 集合的验收摘要。
+pub(crate) struct TranslationTaskRecordOutputSummary {
+    requested: usize,
+    accepted: Vec<usize>,
+    unaccepted: Vec<usize>,
+}
+
+impl TranslationTaskRecordOutputSummary {
+    pub(crate) fn new(requested: usize, accepted: impl IntoIterator<Item = usize>) -> Self {
+        assert!(requested > 0, "实际模型任务必须要求至少一项译文");
+        let mut accepted_flags = vec![false; requested];
+        for id in accepted {
+            assert!(id < requested, "已接受的临时 ID 必须属于当前任务");
+            assert!(!accepted_flags[id], "已接受的临时 ID 不得重复");
+            accepted_flags[id] = true;
+        }
+        let mut accepted = Vec::new();
+        let mut unaccepted = Vec::new();
+        for (id, is_accepted) in accepted_flags.into_iter().enumerate() {
+            if is_accepted {
+                accepted.push(id);
+            } else {
+                unaccepted.push(id);
+            }
+        }
+        Self {
+            requested,
+            accepted,
+            unaccepted,
+        }
+    }
+
+    pub(crate) const fn requested(&self) -> usize {
+        self.requested
+    }
+
+    pub(crate) fn accepted(&self) -> &[usize] {
+        &self.accepted
+    }
+
+    pub(crate) fn unaccepted(&self) -> &[usize] {
+        &self.unaccepted
+    }
+}
+
+pub(crate) fn task_record_output_ids(ids: &[usize]) -> String {
+    if ids.is_empty() {
+        return "—".to_owned();
+    }
+    ids.iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// 任务文档只向 Fluent 传入稳定事实，并移除终端输出使用的方向隔离符。
 pub(crate) fn task_record_text(localizer: &UiLocalizer, message: UiMessage<'_>) -> String {
     localizer
@@ -558,5 +631,23 @@ mod tests {
 
         assert!(rendered.starts_with("````text\n"));
         assert!(rendered.ends_with("````\n"));
+    }
+
+    #[test]
+    fn json_fence_removes_the_models_canonical_outer_fence() {
+        let rendered = markdown_json_fence("```json\n{\"0\":[\"译文\"]}\n```");
+
+        assert_eq!(rendered, "```json\n{\"0\":[\"译文\"]}\n```\n");
+    }
+
+    #[test]
+    fn output_summary_lists_accepted_and_unaccepted_ids_in_natural_order() {
+        let summary = TranslationTaskRecordOutputSummary::new(4, [3, 0, 2]);
+
+        assert_eq!(summary.requested(), 4);
+        assert_eq!(summary.accepted(), &[0, 2, 3]);
+        assert_eq!(summary.unaccepted(), &[1]);
+        assert_eq!(task_record_output_ids(summary.accepted()), "0, 2, 3");
+        assert_eq!(task_record_output_ids(&[]), "—");
     }
 }

@@ -2185,7 +2185,6 @@ impl AcceptedTranslationDecision {
         Self { id, patch }
     }
 
-    #[cfg(test)]
     pub(crate) const fn id(&self) -> TaskId {
         self.id
     }

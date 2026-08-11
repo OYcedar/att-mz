@@ -364,6 +364,8 @@ task-record-final-status = 状态：{ $state ->
     [cancelled] 已取消，未提交
    *[other] { $state }
 }
-task-record-accepted-written = 已接受：{ $accepted } 项，写入 { $written } 个实际位置
-task-record-accepted-outcome-unknown = 已验收：{ $accepted } 项；数据库提交终态无法确认
+task-record-requested = 要求译文：{ $requested } 项
+task-record-accepted-written = 已接受：{ $accepted } 项（ID：{ $ids }），写入 { $written } 个实际位置
+task-record-accepted-outcome-unknown = 已验收：{ $accepted } 项（ID：{ $ids }）；数据库提交终态无法确认
+task-record-unaccepted = 未接受：{ $unaccepted } 项（ID：{ $ids }）
 task-record-task-diagnostic = 任务诊断

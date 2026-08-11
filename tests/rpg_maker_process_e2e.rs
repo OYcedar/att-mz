@@ -491,6 +491,9 @@ fn same_named_mv_mz_and_generic_projects_remain_isolated_across_real_processes()
     let task_record = read_single_task_record_sharing_log_run_id(&mz_workspace);
     assert!(task_record.contains("# 翻译任务"));
     assert!(task_record.contains("状态：完成，已确认提交"));
+    assert!(task_record.contains("要求译文：1 项"));
+    assert!(task_record.contains("已接受：1 项（ID：0），写入 1 个实际位置"));
+    assert!(task_record.contains("未接受：0 项（ID：—）"));
     assert!(task_record.contains(THINKING_SENTINEL));
     assert_eq!(task_record.matches("## Assistant").count(), 1);
     assert!(task_record.contains("## User"));
@@ -500,8 +503,15 @@ fn same_named_mv_mz_and_generic_projects_remain_isolated_across_real_processes()
     assert!(!task_record.contains("Endpoint"));
     assert!(!task_record.contains("Request attempts"));
     assert!(task_record.contains("\"translations\""));
+    assert!(task_record.contains("## Assistant\n\n```json\n"));
+    assert!(!task_record.contains("````text"));
     assert!(!task_record.contains("## JSON Repairs"));
     assert!(task_record.contains("## 最终结果"));
+    assert!(
+        task_record.find("## 最终结果").expect("应包含最终结果")
+            < task_record.find("## User").expect("应包含 User"),
+        "最终结果必须位于 User 与 Assistant 之前"
+    );
     assert!(
         !String::from_utf8_lossy(&translate.stdout).contains(THINKING_SENTINEL)
             && !String::from_utf8_lossy(&translate.stderr).contains(THINKING_SENTINEL),
@@ -883,6 +893,14 @@ fn mz_partial_retry_reuses_the_complete_task_block_across_real_processes() {
             .1
             .contains("状态：部分完成，已确认提交")
     );
+    assert!(first_task_records[0].1.contains("要求译文：4 项"));
+    assert!(
+        first_task_records[0]
+            .1
+            .contains("已接受：3 项（ID：0, 2, 3），写入 3 个实际位置")
+    );
+    assert!(first_task_records[0].1.contains("未接受：1 项（ID：1）"));
+    assert!(first_task_records[0].1.contains("任务诊断"));
     assert_eq!(first_task_records[0].1.matches("## Assistant").count(), 1);
     assert!(!first_task_records[0].1.contains("## Thinking"));
     assert!(!first_task_records[0].1.contains("## Raw Assistant"));
@@ -2196,8 +2214,16 @@ fn generic_reextract_preserves_moves_and_rejects_unextracted_changes() {
     let task_record = read_single_task_record_sharing_log_run_id(&workspace);
     assert!(task_record.contains("# 翻译任务"));
     assert!(task_record.contains("状态：完成，已确认提交"));
+    assert!(task_record.contains("要求译文：1 项"));
+    assert!(task_record.contains("已接受：1 项（ID：0），写入 2 个实际位置"));
+    assert!(task_record.contains("未接受：0 项（ID：—）"));
     assert!(task_record.contains(THINKING_SENTINEL));
     assert_eq!(task_record.matches("## Assistant").count(), 1);
+    assert!(task_record.contains("## Assistant\n\n```json\n"));
+    assert!(
+        task_record.find("## 最终结果").expect("应包含最终结果")
+            < task_record.find("## User").expect("应包含 User")
+    );
     assert!(!task_record.contains("## Thinking"));
     assert!(!task_record.contains("## Raw Assistant"));
     assert_success(

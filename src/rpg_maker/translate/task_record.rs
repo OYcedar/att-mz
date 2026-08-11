@@ -15,7 +15,8 @@ pub(crate) use crate::translation::task_record::{
     ConfiguredTranslationTaskRecordSink, MarkdownTranslationTaskRecordSink,
 };
 use crate::translation::task_record::{
-    TranslationTaskRecordArtifact, markdown_fence, task_record_text,
+    TranslationTaskRecordArtifact, TranslationTaskRecordOutputSummary, markdown_fence,
+    markdown_json_fence, task_record_output_ids, task_record_text,
 };
 
 use super::pipeline::{
@@ -339,6 +340,7 @@ impl TranslationTaskRecordFinalState {
 /// 最终化线交给记录 sink 的完整不可变文档。
 pub(crate) struct TranslationTaskRecordDocument {
     task_index: RpgMakerTranslationTaskIndex,
+    requested_outputs: usize,
     user_message: String,
     raw_assistant: Option<Arc<String>>,
     state: TranslationTaskRecordFinalState,
@@ -358,6 +360,7 @@ impl TranslationTaskRecordDocument {
             state.outcome_kind_matches_state(),
             "任务记录的完成、部分完成或不可用终态必须与权威 Outcome 种类一致"
         );
+        let requested_outputs = task.expected_outputs().len();
         let user_message = task
             .messages()
             .iter()
@@ -367,6 +370,7 @@ impl TranslationTaskRecordDocument {
             .to_owned();
         Self {
             task_index: task.index(),
+            requested_outputs,
             user_message,
             raw_assistant: evidence.into_raw_assistant(),
             state,
@@ -446,9 +450,13 @@ fn render_translation_task_record(
 ) -> String {
     let localizer = UiLocalizer::new(locale);
     let mut output = format!(
-        "# {}\n\n## User\n\n",
-        task_record_text(&localizer, UiMessage::TaskRecordTitle)
+        "# {}\n\n## {}\n\n",
+        task_record_text(&localizer, UiMessage::TaskRecordTitle),
+        task_record_text(&localizer, UiMessage::TaskRecordFinalResultHeading)
     );
+    render_final_result(&mut output, &localizer, api_key_redactor, document);
+
+    output.push_str("\n## User\n\n");
     let user = api_key_redactor
         .redact_text_with_markdown_ascii_punctuation_escaped(&document.user_message);
     output.push_str(&user);
@@ -459,15 +467,8 @@ fn render_translation_task_record(
     if let Some(raw_assistant) = &document.raw_assistant {
         output.push_str("\n## Assistant\n\n");
         let assistant = api_key_redactor.redact_text_with_json_strings(raw_assistant);
-        output.push_str(&markdown_fence(&assistant, "text"));
+        output.push_str(&markdown_json_fence(&assistant));
     }
-
-    let _ = write!(
-        output,
-        "\n## {}\n\n",
-        task_record_text(&localizer, UiMessage::TaskRecordFinalResultHeading)
-    );
-    render_final_result(&mut output, &localizer, api_key_redactor, document);
     output
 }
 
@@ -477,6 +478,17 @@ fn render_final_result(
     api_key_redactor: &ApiKeyRedactor,
     document: &TranslationTaskRecordDocument,
 ) {
+    let accepted = document
+        .state
+        .outcome()
+        .map(TranslationTaskOutcome::accepted)
+        .unwrap_or_default();
+    let summary = TranslationTaskRecordOutputSummary::new(
+        document.requested_outputs,
+        accepted.iter().map(|decision| decision.id().get()),
+    );
+    let accepted_ids = task_record_output_ids(summary.accepted());
+    let unaccepted_ids = task_record_output_ids(summary.unaccepted());
     let _ = writeln!(
         output,
         "- {}",
@@ -484,6 +496,17 @@ fn render_final_result(
             localizer,
             UiMessage::TaskRecordFinalStatus {
                 state: document.state.code(),
+            }
+        )
+    );
+
+    let _ = writeln!(
+        output,
+        "- {}",
+        task_record_text(
+            localizer,
+            UiMessage::TaskRecordRequested {
+                requested: summary.requested() as u64,
             }
         )
     );
@@ -500,6 +523,7 @@ fn render_final_result(
                         UiMessage::TaskRecordAcceptedWritten {
                             accepted: outcome.accepted().len() as u64,
                             written: written as u64,
+                            ids: &accepted_ids,
                         }
                     )
                 );
@@ -512,12 +536,37 @@ fn render_final_result(
                         localizer,
                         UiMessage::TaskRecordAcceptedOutcomeUnknown {
                             accepted: outcome.accepted().len() as u64,
+                            ids: &accepted_ids,
                         }
                     )
                 );
             }
         }
+    } else {
+        let _ = writeln!(
+            output,
+            "- {}",
+            task_record_text(
+                localizer,
+                UiMessage::TaskRecordAcceptedWritten {
+                    accepted: 0,
+                    written: 0,
+                    ids: &accepted_ids,
+                }
+            )
+        );
     }
+    let _ = writeln!(
+        output,
+        "- {}",
+        task_record_text(
+            localizer,
+            UiMessage::TaskRecordUnaccepted {
+                unaccepted: summary.unaccepted().len() as u64,
+                ids: &unaccepted_ids,
+            }
+        )
+    );
     for diagnostic in document
         .outcome_diagnostics
         .iter()
