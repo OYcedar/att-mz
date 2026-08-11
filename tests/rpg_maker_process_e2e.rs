@@ -22,6 +22,7 @@ const MV_SPEAKER: &str = "アリス";
 const MV_BODY: &str = "こんにちは、世界！";
 const MV_SPEAKER_TRANSLATION: &str = "爱丽丝";
 const MV_BODY_TRANSLATION: &str = "你好，世界！";
+const MV_BODY_WRITE_BACK: &str = "你好、世界！";
 const RULES_SHORT_SOURCE: &str = "ポーション";
 const RULES_SHORT_TRANSLATION: &str = "治疗药水";
 const RULES_LONG_SOURCE: &str = "高級ポーション";
@@ -1799,7 +1800,7 @@ fn mv_dialogue_crosses_extract_translate_and_write_back_processes() {
     assert_eq!(commands[1]["code"], 401);
     assert_eq!(
         commands[1]["parameters"][0],
-        format!(r"\n<{MV_SPEAKER_TRANSLATION}>{MV_BODY_TRANSLATION}")
+        format!(r"\n<{MV_SPEAKER_TRANSLATION}>{MV_BODY_WRITE_BACK}")
     );
     assert_eq!(commands[2]["code"], 0);
     assert_eq!(

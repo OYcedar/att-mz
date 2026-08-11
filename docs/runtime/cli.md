@@ -36,7 +36,7 @@ att mv|mz|generic manual export --name NAME
 att mv|mz|generic manual check  --name NAME FILE.toml
 att mv|mz|generic manual apply  --name NAME FILE.toml
 
-att mv|mz|generic write-back --name NAME
+att mv|mz|generic write-back --name NAME [--layout-rules LAYOUT_RULES_TOML]
 
 att mv|mz|generic lua --name NAME SCRIPT.lua [-- ARG...]
 ```
@@ -92,8 +92,13 @@ Windows 路径统一显示自然盘符或 UNC 形式，不公开 `\\?\` 扩展�
 - Translate 省略 Profile 时复用最近成功 Profile；省略术语或 Placeholder 时复用项目资源；
 - Generic Extract 始终读取项目绑定的当前 JSONL 根；
 - Manual 每次读取显式 TOML；
-- WriteBack 没有运行方案；
+- WriteBack 提供 `--layout-rules FILE` 时，完整校验并保存规则内容后用于本次写回；省略时
+  复用项目已经保存的规则；`rule = []` 清空规则；
 - Lua 每次读取显式脚本。
+
+排版规则保存的是规范内容而不是文件路径。新文件无效时本次 WriteBack 失败，旧规则保持；
+尚未保存规则的项目省略参数时不自动排版。完整格式见
+[WriteBack 排版规则规格](../translation/write-back-layout-rules.md)。
 
 从状态读取、业务执行、必要收尾到最终保存，项目租约全程在场，两条并发命令不能拼出一份
 不存在的选择。

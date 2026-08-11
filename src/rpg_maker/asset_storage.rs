@@ -228,6 +228,21 @@ impl RpgMakerAssetStorageRowDecoder {
         }
     }
 
+    pub(crate) fn optional_integer(
+        &mut self,
+        column: &'static str,
+    ) -> Result<Option<i64>, RpgMakerAssetStorageRowError> {
+        match self.next() {
+            SqliteValue::Null => Ok(None),
+            SqliteValue::Integer(value) => Ok(Some(value)),
+            actual => Err(RpgMakerAssetStorageRowError::WrongColumnType {
+                column,
+                expected: "INTEGER 或 NULL",
+                actual: actual.kind_name(),
+            }),
+        }
+    }
+
     fn next(&mut self) -> SqliteValue {
         self.values
             .next()

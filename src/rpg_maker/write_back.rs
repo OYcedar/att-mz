@@ -149,7 +149,7 @@ impl<E> WriteBackPublishFailure<E> {
 
 /// 从项目数据库译文生成 RPG Maker 文件候选。
 ///
-/// 实现只校验当前项目快照并原样物化数据库中的译文，不在 WriteBack 中修改正文。
+/// 实现校验当前项目快照，再按正文开关与项目排版规则建立候选。
 pub(crate) trait RpgMakerWriteBack: Send + Sync {
     type Documents: Send + 'static;
     type Error: Error + Send + Sync + 'static;

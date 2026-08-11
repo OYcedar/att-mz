@@ -71,10 +71,11 @@ use crate::generic::{
     GenericCurrentTranslation, GenericInitRequest, GenericPlaceholderService, GenericPlanningError,
     GenericPlanningUnitLocator, GenericProject, GenericProjectError, GenericProjectStore,
     GenericProtectedText, GenericStoredSnapshot, GenericTaskRecordDocument, GenericTaskRecordState,
-    GenericUnitKey, GenericUnitMap, GenericWriteBackCandidate, GenericWriteBackError, PlannedTask,
-    PlanningUnit, RejectedTranslationWrite, ResponseProblem, TranslationAcceptance,
-    TranslationOrigin, TranslationPlan, TranslationReview, TranslationWrite, ValidatedReuse,
-    accept_parsed_response_with_cancellation, build_write_back_candidate_with_cancellation,
+    GenericUnitKey, GenericUnitMap, GenericWriteBackCandidate, GenericWriteBackError,
+    GenericWriteBackTextOptions, PlannedTask, PlanningUnit, RejectedTranslationWrite,
+    ResponseProblem, TranslationAcceptance, TranslationOrigin, TranslationPlan, TranslationReview,
+    TranslationWrite, ValidatedReuse, accept_parsed_response_with_cancellation,
+    build_write_back_candidate_with_cancellation, compile_generic_layout_rules,
     current_translation_for_stored_with_cancellation,
     ensure_input_fingerprints_current_with_cancellation,
     plan_translation_with_validator_and_cancellation,
@@ -133,6 +134,7 @@ use crate::translation::candidate_validation::{
     ProvenInvariantViolation, ReviewFinding, ValidatedCandidate,
     validate_reflowed_candidate_text_with_cancellation,
 };
+use crate::translation::layout_rules::{LayoutRuleSet, LayoutRulesError};
 use crate::translation::placeholder::{
     PlaceholderMatchRangeViolation, PlaceholderPcre2ErrorKind, PlaceholderProtectionError,
     PlaceholderRestoreError, PlaceholderRuleOrigin, PlaceholderWorkerOperation,
@@ -2091,6 +2093,10 @@ impl ProductionGenericCommandRunner {
         let output_name = project_name.clone();
         let operation_project_log = generic_project_log_handle(&project_log);
         let operation_publication_occurrence = Arc::clone(&publication_occurrence);
+        let repair_punctuation = command.write_back().repair_punctuation();
+        let complete_continuation_whitespace =
+            command.write_back().complete_continuation_whitespace();
+        let layout_rules_path = command.layout_rules_path().map(Path::to_path_buf);
         let operation = async move {
             ensure_generic_operation_running(&operation_cancellation)?;
             operation_progress.observe(ProgressSnapshot::indeterminate(
@@ -2111,6 +2117,70 @@ impl ProductionGenericCommandRunner {
                 move || initial_store.load_current_translation_state(),
             )
             .await?;
+            let (layout_rules, external_layout_rules_path) =
+                if let Some(requested_path) = layout_rules_path {
+                    let file = operation_file_system
+                        .read_file(requested_path)
+                        .await
+                        .map_err(|source| {
+                            generic_read_file_failure(source, FileSystemDiagnosticStage::WriteBack)
+                        })?;
+                    let resolved_path = file.resolved_path().to_path_buf();
+                    let bytes = file.into_bytes();
+                    let parse_path = resolved_path.clone();
+                    let rules = operation_cpu
+                        .execute(move || LayoutRuleSet::parse_toml(&bytes))
+                        .await
+                        .map_err(generic_cpu_execution_failure)?
+                        .map_err(|source| {
+                            generic_layout_rules_failure(source, Some(parse_path), false)
+                        })?;
+                    (rules, Some(resolved_path))
+                } else {
+                    let layout_store = store.clone();
+                    let database_path = store.database_path().to_path_buf();
+                    let rules = run_project_blocking(
+                        GenericDiagnosticStage::WriteBack,
+                        StateEffect::Unchanged,
+                        database_path,
+                        move || layout_store.load_write_back_layout_rules(),
+                    )
+                    .await?;
+                    (rules, None)
+                };
+            let compile_rules = layout_rules.clone();
+            let compile_path = external_layout_rules_path.clone();
+            let (live, compiled_layout_rules) = operation_cpu
+                .execute(move || {
+                    compile_generic_layout_rules(&live, &compile_rules)
+                        .map(|compiled| (live, compiled))
+                })
+                .await
+                .map_err(generic_cpu_execution_failure)?
+                .map_err(|source| {
+                    generic_layout_rules_failure(
+                        source,
+                        compile_path,
+                        external_layout_rules_path.is_none(),
+                    )
+                })?;
+            if external_layout_rules_path.is_some() {
+                let expected_raw_fingerprint = live.raw_fingerprint();
+                let save_store = store.clone();
+                let database_path = store.database_path().to_path_buf();
+                run_project_blocking(
+                    GenericDiagnosticStage::WriteBack,
+                    StateEffect::Unchanged,
+                    database_path,
+                    move || {
+                        save_store.replace_write_back_layout_rules(
+                            expected_raw_fingerprint,
+                            &layout_rules,
+                        )
+                    },
+                )
+                .await?;
+            }
             let project = snapshot.project().clone();
             let terminology = current_resources.terminology();
             let valid_placeholder_ids = snapshot.natural_unit_ids();
@@ -2232,6 +2302,7 @@ impl ProductionGenericCommandRunner {
             let current_terms = Arc::clone(&terminology);
             let current_rules = placeholder_rules.clone();
             let write_back_rules = placeholder_rules;
+            let write_back_layout_rules = compiled_layout_rules;
             let current_cancellation = operation_cancellation.clone();
             let (current_snapshot, current_translations) = operation_cpu
                 .execute(move || {
@@ -2257,6 +2328,11 @@ impl ProductionGenericCommandRunner {
                         &live,
                         &current_translations,
                         &write_back_rules,
+                        &write_back_layout_rules,
+                        GenericWriteBackTextOptions::new(
+                            repair_punctuation,
+                            complete_continuation_whitespace,
+                        ),
                         &candidate_cancellation,
                     )
                     .map(|candidate| (project, candidate))
@@ -2838,6 +2914,57 @@ fn generic_preparation_failure(source: GenericPreparationError) -> GenericComman
 
 fn generic_write_back_preparation_failure(source: GenericPreparationError) -> GenericCommandError {
     generic_preparation_failure_at(GenericDiagnosticStage::WriteBack, source)
+}
+
+#[derive(Debug)]
+struct GenericLayoutRulesFailure {
+    path: Option<PathBuf>,
+    project_snapshot: bool,
+    source: LayoutRulesError,
+}
+
+impl fmt::Display for GenericLayoutRulesFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.path {
+            Some(path) => write!(
+                formatter,
+                "排版规则无效 {}：{}",
+                path.display(),
+                self.source
+            ),
+            None => write!(formatter, "项目保存的排版规则无效：{}", self.source),
+        }
+    }
+}
+
+impl Error for GenericLayoutRulesFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn generic_layout_rules_failure(
+    source: LayoutRulesError,
+    path: Option<PathBuf>,
+    project_snapshot: bool,
+) -> GenericCommandError {
+    let failure = GenericLayoutRulesFailure {
+        path,
+        project_snapshot,
+        source,
+    };
+    let report = DiagnosticReport::new(
+        StateEffect::Unchanged,
+        Diagnostic::generic(GenericIssue::project(
+            GenericDiagnosticStage::WriteBack,
+            GenericProblem::WriteBackLayoutRules {
+                path: failure.path.as_ref().map(SafePath::new),
+                rule_number: failure.source.rule_number(),
+                project_snapshot: failure.project_snapshot,
+            },
+        )),
+    );
+    GenericCommandError::reported(failure, report)
 }
 
 fn generic_preparation_failure_at(
@@ -9856,11 +9983,18 @@ mod tests {
             .get_with_cancellation(&key, || Ok::<_, std::convert::Infallible>(()))
             .unwrap_or_else(|never| match never {})
             .expect("人工译文应该仍为 Current");
+        let layout_rules = compile_generic_layout_rules(
+            &live,
+            &LayoutRuleSet::from_canonical_json("[]").expect("空排版规则必须有效"),
+        )
+        .expect("空排版规则必须适用于任意 Generic 输入");
         let error = build_write_back_candidate_with_cancellation(
             &stored,
             &live,
             &current,
             &rules,
+            &layout_rules,
+            GenericWriteBackTextOptions::new(true, true),
             &CooperativeCancellation::default(),
         );
         assert!(

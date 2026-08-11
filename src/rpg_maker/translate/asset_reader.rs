@@ -63,6 +63,7 @@ const READ_TRANSLATION_METADATA: &str = "SELECT source_snapshot_fingerprint FROM
 
 const READ_TRANSLATION_RESOURCES: &str = r#"SELECT resource_kind, canonical_json
 FROM rpg_maker_translation_resource
+WHERE resource_kind IN ('terminology', 'placeholder_rules')
 ORDER BY resource_kind"#;
 
 const TRANSLATION_SNAPSHOT_QUERY_RESULT_COUNT: usize = 3 + TRANSLATION_OWNER_ORDER.len() * 2;

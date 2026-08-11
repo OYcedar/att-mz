@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::diagnostic::{
@@ -13,7 +13,7 @@ use crate::diagnostic::{
     RpgMakerJsonFailureKind, RpgMakerLogicalUnitLocator, RpgMakerMutationAccess,
     RpgMakerSemanticOrderLevel, RpgMakerWriteBackAssetComputeOperation,
     RpgMakerWriteBackAssetProblem, RpgMakerWriteBackAssetSnapshotViolation,
-    RpgMakerWriteBackModelViolation, SafeIdentifier, SqliteDiagnosticContext,
+    RpgMakerWriteBackModelViolation, SafeIdentifier, SafePath, SqliteDiagnosticContext,
     SqliteDiagnosticStage, SqliteOperation, SqliteTransactionState, StateEffect, TranslationIssue,
     TranslationJsonFailureKind, TranslationPlanningResourceKind, TranslationPlanningResourceOrigin,
     TranslationPlanningResourceProblem,
@@ -44,6 +44,7 @@ use crate::rpg_maker::mutation_claim_summary::{
     EncodedMutationClaim, MutationClaimSummaryError, collision_summary, sort_logical_claims,
 };
 use crate::rpg_maker::project::OpenedProject;
+use crate::rpg_maker::project_database::WRITE_BACK_LAYOUT_RULES_RESOURCE_KIND;
 use crate::rpg_maker::project_database::{AssetSnapshotFingerprint, SourceSnapshotFingerprint};
 use crate::rpg_maker::semantic_order::{
     RpgMakerSemanticOrderKey, RpgMakerSemanticOrderKeyDecodeError,
@@ -55,8 +56,11 @@ use crate::rpg_maker::translate::placeholder::{
 use crate::runtime::cpu::CpuExecutorUnavailable;
 use crate::runtime::sqlite::SqliteRuntimeError;
 use crate::storage::sqlite::{
-    QueryExistingDatabaseError, SqliteQuery, SqliteQueryExecutor, SqliteRow, SqliteValue,
+    ExecuteTransactionError, QueryExistingDatabaseError, SqliteCommand, SqliteQuery,
+    SqliteQueryExecutor, SqliteRow, SqliteTransactionExecutor, SqliteTransactionPlan,
+    SqliteTransactionStep, SqliteValue,
 };
+use crate::translation::layout_rules::{LayoutRuleSet, LayoutRulesError};
 use crate::translation::placeholder::PlaceholderRuleDefinition;
 
 use super::planner::{
@@ -66,11 +70,15 @@ use super::planner::{
 };
 
 const RPG_MAKER_WRITE_BACK_QUERY_RESULT_COUNT: usize =
-    2 + RPG_MAKER_WRITE_BACK_OWNER_ORDER.len() * 3;
+    3 + RPG_MAKER_WRITE_BACK_OWNER_ORDER.len() * 3;
 
 const READ_PLACEHOLDER_RULES: &str = r#"SELECT canonical_json
 FROM rpg_maker_translation_resource
 WHERE resource_kind = 'placeholder_rules'"#;
+
+const READ_LAYOUT_RULES: &str = r#"SELECT canonical_json
+FROM rpg_maker_translation_resource
+WHERE resource_kind = 'write_back_layout_rules'"#;
 
 fn read_rpg_maker_write_back_owner_states() -> String {
     format!(
@@ -95,6 +103,7 @@ fn read_rpg_maker_write_back_owner_units() -> String {
     format!(
         "SELECT\n    text_group.group_location,\n    \
          {RPG_MAKER_TEXT_UNIT_CONTENT_PROJECTION},\n    \
+         unit.rule_number,\n    \
          text_group.group_kind,\n    \
          text_group.projection_recipe_json,\n    \
          manual.translation_json,\n    \
@@ -140,6 +149,8 @@ fn rpg_maker_write_back_snapshot_queries() -> Vec<SqliteQuery> {
         SqliteQuery::new(READ_PLACEHOLDER_RULES, Vec::new())
             .with_id("write_back.placeholder_rules"),
     );
+    queries
+        .push(SqliteQuery::new(READ_LAYOUT_RULES, Vec::new()).with_id("write_back.layout_rules"));
     for (kind, statement) in [
         ("groups", read_rpg_maker_write_back_owner_groups()),
         ("units", read_rpg_maker_write_back_owner_units()),
@@ -178,6 +189,8 @@ fn unpack_snapshot_query_results(
             .next()
             .expect("已验证 Placeholder 查询结果存在"),
     )?;
+    let layout_rules =
+        decode_layout_rules_rows(query_results.next().expect("已验证排版规则查询结果存在"))?;
     let mut next_owner_partitions = || {
         merge_owner_partitions([
             query_results.next().expect("已验证 Builtin 查询结果存在"),
@@ -191,10 +204,34 @@ fn unpack_snapshot_query_results(
     Ok(SnapshotRows {
         owners,
         placeholder_rules,
+        layout_rules,
         groups,
         units,
         claims,
     })
+}
+
+fn decode_layout_rules_rows(
+    rows: Vec<SqliteRow>,
+) -> Result<String, InvalidRpgMakerWriteBackAssetSnapshot> {
+    let [row] = <[SqliteRow; 1]>::try_from(rows).map_err(|rows| {
+        InvalidRpgMakerWriteBackAssetSnapshot::LayoutRuleRowCount { actual: rows.len() }
+    })?;
+    let [value] = <[SqliteValue; 1]>::try_from(row.into_values()).map_err(|values| {
+        InvalidRpgMakerWriteBackAssetSnapshot::WrongColumnCount {
+            expected: 1,
+            actual: values.len(),
+        }
+    })?;
+    match value {
+        SqliteValue::Text(value) if !value.is_empty() => Ok(value),
+        SqliteValue::Text(_) => Err(InvalidRpgMakerWriteBackAssetSnapshot::BlankLayoutRules),
+        value => Err(InvalidRpgMakerWriteBackAssetSnapshot::WrongColumnType {
+            column: "canonical_json",
+            expected: "TEXT",
+            actual: value.kind_name(),
+        }),
+    }
 }
 
 fn decode_placeholder_rules_rows(
@@ -260,6 +297,20 @@ fn build_candidate_validation_context(
 pub(crate) struct RpgMakerWriteBackAssetReadingService<Q, C> {
     sqlite: Arc<Q>,
     cpu: Arc<C>,
+    layout_rules_input: Option<RpgMakerWriteBackLayoutRulesInput>,
+}
+
+/// 本次命令显式提供的排版规则原文件；只有完整解析和项目目标校验成功后才会保存。
+#[derive(Clone, Debug)]
+pub(crate) struct RpgMakerWriteBackLayoutRulesInput {
+    path: PathBuf,
+    bytes: Vec<u8>,
+}
+
+impl RpgMakerWriteBackLayoutRulesInput {
+    pub(crate) fn new(path: PathBuf, bytes: Vec<u8>) -> Self {
+        Self { path, bytes }
+    }
 }
 
 impl<Q, C> RpgMakerWriteBackAssetReadingService<Q, C> {
@@ -267,16 +318,29 @@ impl<Q, C> RpgMakerWriteBackAssetReadingService<Q, C> {
         Self {
             sqlite: Arc::new(sqlite),
             cpu: Arc::new(cpu),
+            layout_rules_input: None,
         }
+    }
+
+    pub(crate) fn with_layout_rules_input(
+        mut self,
+        input: Option<RpgMakerWriteBackLayoutRulesInput>,
+    ) -> Self {
+        self.layout_rules_input = input;
+        self
     }
 }
 
 impl<Q, C> RpgMakerWriteBackAssetReader for RpgMakerWriteBackAssetReadingService<Q, C>
 where
-    Q: SqliteQueryExecutor,
+    Q: SqliteQueryExecutor + SqliteTransactionExecutor,
     C: CpuTaskExecutor,
 {
-    type Error = RpgMakerWriteBackAssetReadingError<Q::Error, C::Error>;
+    type Error = RpgMakerWriteBackAssetReadingError<
+        <Q as SqliteQueryExecutor>::Error,
+        C::Error,
+        <Q as SqliteTransactionExecutor>::Error,
+    >;
 
     fn read(
         &self,
@@ -290,6 +354,7 @@ where
         let dialogue_definition = project.mv_dialogue_definition().clone();
         let sqlite = Arc::clone(&self.sqlite);
         let cpu = Arc::clone(&self.cpu);
+        let layout_rules_input = self.layout_rules_input.clone();
 
         async move {
             let dialogue_definition_json =
@@ -349,39 +414,141 @@ where
 
             let owner_states = prepared.owner_states;
             let placeholder_rules_json = prepared.placeholder_rules;
-            cpu.execute(move || {
-                let decoded = decoded_records.into_iter().collect::<Result<Vec<_>, _>>()?;
-                let valid_ids = decoded
-                    .iter()
-                    .filter_map(|record| match record {
-                        DecodedRecord::Unit { readable_id, .. } => Some(readable_id.clone()),
-                        _ => None,
+            let saved_layout_rules_json = prepared.layout_rules;
+            let assembled = cpu
+                .execute(move || {
+                    let decoded = decoded_records.into_iter().collect::<Result<Vec<_>, _>>()?;
+                    let valid_ids = decoded
+                        .iter()
+                        .filter_map(|record| match record {
+                            DecodedRecord::Unit { readable_id, .. } => Some(readable_id.clone()),
+                            _ => None,
+                        })
+                        .collect::<HashSet<_>>();
+                    let candidate_validation = build_candidate_validation_context(
+                        engine,
+                        placeholder_rules_json,
+                        &valid_ids,
+                    )?;
+                    let (layout_rules, replacement, layout_rules_path, project_snapshot) =
+                        match layout_rules_input {
+                            Some(input) => {
+                                let input_path = input.path;
+                                let rules =
+                                    LayoutRuleSet::parse_toml(&input.bytes).map_err(|source| {
+                                        InvalidRpgMakerWriteBackAssetSnapshot::InvalidLayoutRules {
+                                            path: Some(input_path.clone()),
+                                            project_snapshot: false,
+                                            source,
+                                        }
+                                    })?;
+                                let replacement = Some((
+                                    saved_layout_rules_json.clone(),
+                                    rules.canonical_json().to_owned(),
+                                ));
+                                (rules, replacement, Some(input_path), false)
+                            }
+                            None => (
+                                LayoutRuleSet::from_canonical_json(&saved_layout_rules_json)
+                                    .map_err(|source| {
+                                        InvalidRpgMakerWriteBackAssetSnapshot::InvalidLayoutRules {
+                                            path: None,
+                                            project_snapshot: true,
+                                            source,
+                                        }
+                                    })?,
+                                None,
+                                None,
+                                true,
+                            ),
+                        };
+                    let mut snapshot =
+                        assemble_snapshot(owner_states, decoded, &dialogue_definition_json)?
+                            .with_candidate_validation(candidate_validation);
+                    snapshot
+                        .apply_layout_rules(&layout_rules)
+                        .map_err(|source| {
+                            InvalidRpgMakerWriteBackAssetSnapshot::InvalidLayoutRules {
+                                path: layout_rules_path,
+                                project_snapshot,
+                                source,
+                            }
+                        })?;
+                    Ok(PreparedWriteBackSnapshot {
+                        snapshot,
+                        layout_rules_replacement: replacement,
                     })
-                    .collect::<HashSet<_>>();
-                let candidate_validation =
-                    build_candidate_validation_context(engine, placeholder_rules_json, &valid_ids)?;
-                assemble_snapshot(owner_states, decoded, &dialogue_definition_json)
-                    .map(|snapshot| snapshot.with_candidate_validation(candidate_validation))
-            })
-            .await
-            .map_err(
-                |source| RpgMakerWriteBackAssetReadingError::ScheduleAssembly {
-                    database_path: database_path.clone(),
-                    source,
-                },
-            )?
-            .map_err(
-                |source| RpgMakerWriteBackAssetReadingError::InvalidSnapshot {
-                    database_path,
-                    source,
-                },
-            )
+                })
+                .await
+                .map_err(
+                    |source| RpgMakerWriteBackAssetReadingError::ScheduleAssembly {
+                        database_path: database_path.clone(),
+                        source,
+                    },
+                )?
+                .map_err(
+                    |source| RpgMakerWriteBackAssetReadingError::InvalidSnapshot {
+                        database_path: database_path.clone(),
+                        source,
+                    },
+                )?;
+            if let Some((expected, replacement)) = assembled.layout_rules_replacement {
+                sqlite
+                    .execute_transaction(
+                        database_path.clone(),
+                        replace_layout_rules_transaction(current_source, expected, replacement),
+                    )
+                    .await
+                    .map_err(
+                        |source| RpgMakerWriteBackAssetReadingError::PersistLayoutRules {
+                            database_path: database_path.clone(),
+                            source,
+                        },
+                    )?;
+            }
+            Ok(assembled.snapshot)
         }
     }
 }
 
+struct PreparedWriteBackSnapshot {
+    snapshot: RpgMakerWriteBackSnapshot,
+    layout_rules_replacement: Option<(String, String)>,
+}
+
+fn replace_layout_rules_transaction(
+    source_snapshot: SourceSnapshotFingerprint,
+    expected: String,
+    replacement: String,
+) -> SqliteTransactionPlan {
+    SqliteTransactionPlan::new(vec![
+        SqliteTransactionStep::RequireNoRows(SqliteQuery::new(
+            "SELECT 1
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM metadata WHERE source_snapshot_fingerprint = ?1
+             ) OR NOT EXISTS (
+                 SELECT 1 FROM rpg_maker_translation_resource
+                 WHERE resource_kind = ?2 AND canonical_json = ?3
+             )",
+            vec![
+                SqliteValue::Blob(source_snapshot.as_bytes().to_vec()),
+                SqliteValue::Text(WRITE_BACK_LAYOUT_RULES_RESOURCE_KIND.to_owned()),
+                SqliteValue::Text(expected),
+            ],
+        )),
+        SqliteTransactionStep::Execute(SqliteCommand::new(
+            "UPDATE rpg_maker_translation_resource
+             SET canonical_json = ?1 WHERE resource_kind = ?2",
+            vec![
+                SqliteValue::Text(replacement),
+                SqliteValue::Text(WRITE_BACK_LAYOUT_RULES_RESOURCE_KIND.to_owned()),
+            ],
+        )),
+    ])
+}
+
 #[derive(Debug)]
-pub(crate) enum RpgMakerWriteBackAssetReadingError<Q, C> {
+pub(crate) enum RpgMakerWriteBackAssetReadingError<Q, C, T = Q> {
     DatabaseNotFound {
         database_path: PathBuf,
     },
@@ -409,9 +576,15 @@ pub(crate) enum RpgMakerWriteBackAssetReadingError<Q, C> {
         database_path: PathBuf,
         source: InvalidRpgMakerWriteBackAssetSnapshot,
     },
+    PersistLayoutRules {
+        database_path: PathBuf,
+        source: ExecuteTransactionError<T>,
+    },
 }
 
-impl<Q: fmt::Display, C: fmt::Display> fmt::Display for RpgMakerWriteBackAssetReadingError<Q, C> {
+impl<Q: fmt::Display, C: fmt::Display, T: fmt::Display> fmt::Display
+    for RpgMakerWriteBackAssetReadingError<Q, C, T>
+{
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DatabaseNotFound { database_path } => {
@@ -446,11 +619,16 @@ impl<Q: fmt::Display, C: fmt::Display> fmt::Display for RpgMakerWriteBackAssetRe
             Self::InvalidSnapshot { source, .. } => {
                 write!(formatter, "RPG Maker 写回资产损坏：{source}")
             }
+            Self::PersistLayoutRules { source, .. } => {
+                write!(formatter, "保存 RPG Maker WriteBack 排版规则失败：{source}")
+            }
         }
     }
 }
 
-impl<Q: Error + 'static, C: Error + 'static> Error for RpgMakerWriteBackAssetReadingError<Q, C> {
+impl<Q: Error + 'static, C: Error + 'static, T: Error + 'static> Error
+    for RpgMakerWriteBackAssetReadingError<Q, C, T>
+{
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Query { source, .. } => Some(source),
@@ -458,6 +636,7 @@ impl<Q: Error + 'static, C: Error + 'static> Error for RpgMakerWriteBackAssetRea
             | Self::ScheduleDecode { source, .. }
             | Self::ScheduleAssembly { source, .. } => Some(source),
             Self::InvalidSnapshot { source, .. } => Some(source),
+            Self::PersistLayoutRules { source, .. } => Some(source),
             Self::DatabaseNotFound { .. } | Self::ExtractionOutOfDate { .. } => None,
         }
     }
@@ -549,6 +728,18 @@ impl RpgMakerWriteBackAssetReadingError<SqliteRuntimeError, CpuExecutorUnavailab
                         }),
                     )
                 }
+                InvalidRpgMakerWriteBackAssetSnapshot::InvalidLayoutRules {
+                    path,
+                    project_snapshot,
+                    source,
+                } => write_back_asset_report(
+                    database_path,
+                    RpgMakerWriteBackAssetProblem::InvalidLayoutRules {
+                        path: path.as_ref().map(SafePath::new),
+                        rule_number: source.rule_number(),
+                        project_snapshot: *project_snapshot,
+                    },
+                ),
                 _ => write_back_asset_report(
                     database_path,
                     RpgMakerWriteBackAssetProblem::InvalidSnapshot {
@@ -556,12 +747,61 @@ impl RpgMakerWriteBackAssetReadingError<SqliteRuntimeError, CpuExecutorUnavailab
                     },
                 ),
             },
+            Self::PersistLayoutRules {
+                database_path,
+                source,
+            } => persist_layout_rules_report(database_path, source),
         }
     }
 
     pub(crate) fn into_reported_failure(self) -> ReportedFailure {
         let report = self.diagnostic_report();
         ReportedFailure::new(report, self)
+    }
+}
+
+fn persist_layout_rules_report(
+    database_path: &Path,
+    source: &ExecuteTransactionError<SqliteRuntimeError>,
+) -> DiagnosticReport {
+    match source {
+        ExecuteTransactionError::NotFound => write_back_asset_report(
+            database_path,
+            RpgMakerWriteBackAssetProblem::DatabaseNotFound,
+        ),
+        ExecuteTransactionError::RequirementFailed
+        | ExecuteTransactionError::RequirementFailedWithRow { .. } => write_back_asset_report(
+            database_path,
+            RpgMakerWriteBackAssetProblem::LayoutRulesStateChanged,
+        ),
+        ExecuteTransactionError::RequirementFailedWithRowOutcomeUnknown { source, .. } => source
+            .diagnostic_report(
+                database_path,
+                SqliteDiagnosticContext::new(
+                    SqliteDiagnosticStage::WriteBack,
+                    SqliteOperation::Transaction,
+                    SqliteTransactionState::OutcomeUnknown,
+                ),
+                StateEffect::RecoveryRequired,
+            ),
+        ExecuteTransactionError::NotCommitted(source) => source.diagnostic_report(
+            database_path,
+            SqliteDiagnosticContext::new(
+                SqliteDiagnosticStage::WriteBack,
+                SqliteOperation::Transaction,
+                SqliteTransactionState::RolledBack,
+            ),
+            StateEffect::Unchanged,
+        ),
+        ExecuteTransactionError::OutcomeUnknown(source) => source.diagnostic_report(
+            database_path,
+            SqliteDiagnosticContext::new(
+                SqliteDiagnosticStage::WriteBack,
+                SqliteOperation::Transaction,
+                SqliteTransactionState::OutcomeUnknown,
+            ),
+            StateEffect::RecoveryRequired,
+        ),
     }
 }
 
@@ -645,6 +885,15 @@ pub(crate) enum InvalidRpgMakerWriteBackAssetSnapshot {
         actual: usize,
     },
     BlankPlaceholderRules,
+    LayoutRuleRowCount {
+        actual: usize,
+    },
+    BlankLayoutRules,
+    InvalidLayoutRules {
+        path: Option<PathBuf>,
+        project_snapshot: bool,
+        source: LayoutRulesError,
+    },
     InvalidPlaceholderRulesJson(serde_json::Error),
     InvalidBuiltinPlaceholder(Pcre2PlaceholderConstructionError),
     InvalidPlaceholderRules(PlaceholderRuleCompilationError),
@@ -757,10 +1006,20 @@ impl InvalidRpgMakerWriteBackAssetSnapshot {
             Self::BlankPlaceholderRules => {
                 RpgMakerWriteBackAssetSnapshotViolation::BlankPlaceholderRules
             }
+            Self::LayoutRuleRowCount { actual } => {
+                RpgMakerWriteBackAssetSnapshotViolation::LayoutRuleRowCount {
+                    expected: 1,
+                    actual: *actual,
+                }
+            }
+            Self::BlankLayoutRules => RpgMakerWriteBackAssetSnapshotViolation::BlankLayoutRules,
             Self::InvalidPlaceholderRulesJson(_)
             | Self::InvalidBuiltinPlaceholder(_)
             | Self::InvalidPlaceholderRules(_) => {
                 unreachable!("Placeholder 解析或编译错误由原始语义所有者建立诊断")
+            }
+            Self::InvalidLayoutRules { .. } => {
+                unreachable!("排版规则错误由规则语义所有者建立诊断")
             }
             Self::InvalidSemanticOrderKey { column, source } => {
                 RpgMakerWriteBackAssetSnapshotViolation::InvalidSemanticOrderKey {
@@ -1111,6 +1370,12 @@ impl fmt::Display for InvalidRpgMakerWriteBackAssetSnapshot {
                 "写回快照应包含一行当前 Placeholder 规则，实际为 {actual} 行"
             ),
             Self::BlankPlaceholderRules => formatter.write_str("当前 Placeholder 规则资源不能为空"),
+            Self::LayoutRuleRowCount { actual } => write!(
+                formatter,
+                "写回快照应包含一行当前排版规则，实际为 {actual} 行"
+            ),
+            Self::BlankLayoutRules => formatter.write_str("当前排版规则资源不能为空"),
+            Self::InvalidLayoutRules { source, .. } => source.fmt(formatter),
             Self::InvalidPlaceholderRulesJson(source) => {
                 write!(
                     formatter,
@@ -1244,6 +1509,7 @@ impl Error for InvalidRpgMakerWriteBackAssetSnapshot {
             Self::InvalidPlaceholderRulesJson(source) => Some(source),
             Self::InvalidBuiltinPlaceholder(source) => Some(source),
             Self::InvalidPlaceholderRules(source) => Some(source),
+            Self::InvalidLayoutRules { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -1257,6 +1523,7 @@ struct OwnerState {
 struct SnapshotRows {
     owners: Vec<SqliteRow>,
     placeholder_rules: String,
+    layout_rules: String,
     groups: Vec<OwnerPartitionedSqliteRow>,
     units: Vec<OwnerPartitionedSqliteRow>,
     claims: Vec<OwnerPartitionedSqliteRow>,
@@ -1272,6 +1539,7 @@ struct PreparedRows {
     stale_owners: Vec<RpgMakerAssetOwner>,
     owner_states: HashMap<RpgMakerAssetOwner, OwnerState>,
     placeholder_rules: String,
+    layout_rules: String,
     records: Vec<SnapshotAssetRow>,
 }
 
@@ -1327,6 +1595,7 @@ fn prepare_rows(
         stale_owners,
         owner_states,
         placeholder_rules: rows.placeholder_rules,
+        layout_rules: rows.layout_rules,
         records,
     })
 }
@@ -1355,6 +1624,7 @@ enum DecodedRecord {
         translation_content: Option<TextUnitContent>,
         manual: bool,
         readable_id: String,
+        rule_number: Option<usize>,
     },
     Claim {
         owner: RpgMakerAssetOwner,
@@ -1405,11 +1675,27 @@ fn decode_group(
 fn decode_unit(
     OwnerPartitionedSqliteRow { owner, row }: OwnerPartitionedSqliteRow,
 ) -> Result<DecodedRecord, InvalidRpgMakerWriteBackAssetSnapshot> {
-    let mut row = RpgMakerAssetStorageRowDecoder::new(row, 10).map_err(map_storage_row_error)?;
+    let mut row = RpgMakerAssetStorageRowDecoder::new(row, 11).map_err(map_storage_row_error)?;
     let storage = RpgMakerTextUnitStorageRow::decode(&mut row).map_err(map_storage_row_error)?;
     let automatic_translation = storage
         .decode_translation_content()
         .map_err(map_storage_row_error)?;
+    let rule_number = row
+        .optional_integer("rule_number")
+        .map_err(map_storage_row_error)?;
+    let rule_number = match (owner, rule_number) {
+        (RpgMakerAssetOwner::Builtin, None) => None,
+        (RpgMakerAssetOwner::Rules, Some(value)) if value > 0 => {
+            Some(usize::try_from(value).expect("正 i64 规则编号必须可表示为 usize"))
+        }
+        _ => {
+            return Err(InvalidRpgMakerWriteBackAssetSnapshot::WrongColumnType {
+                column: "rule_number",
+                expected: "与 owner 一致的正整数或 NULL",
+                actual: "不一致的规则编号",
+            });
+        }
+    };
     let group_kind_raw = row
         .required_text("group_kind")
         .map_err(map_storage_row_error)?;
@@ -1515,6 +1801,7 @@ fn decode_unit(
         translation_content,
         manual,
         readable_id,
+        rule_number,
     })
 }
 
@@ -1703,6 +1990,7 @@ fn assemble_snapshot(
                 translation_content,
                 manual,
                 readable_id: _,
+                rule_number,
             } => {
                 fingerprint_accumulators
                     .get_mut(&owner)
@@ -1745,7 +2033,7 @@ fn assemble_snapshot(
                     RpgMakerWriteBackUnit::new(role, source_content, translation_content)
                 }
                 .map_err(InvalidRpgMakerWriteBackAssetSnapshot::InvalidModel)?;
-                group.units.push(unit);
+                group.units.push(unit.with_rule_number(rule_number));
             }
             DecodedRecord::Claim {
                 owner,
@@ -2116,10 +2404,10 @@ fn map_storage_row_error(
     }
 }
 
-fn map_query_error<Q, C>(
+fn map_query_error<Q, C, T>(
     database_path: PathBuf,
     error: QueryExistingDatabaseError<Q>,
-) -> RpgMakerWriteBackAssetReadingError<Q, C> {
+) -> RpgMakerWriteBackAssetReadingError<Q, C, T> {
     match error {
         QueryExistingDatabaseError::NotFound => {
             RpgMakerWriteBackAssetReadingError::DatabaseNotFound { database_path }
@@ -2141,6 +2429,45 @@ mod tests {
     use crate::rpg_maker::model::{DirectTextPart, DirectTextRecipe, ScalarFieldKey};
     use crate::rpg_maker::text::{RpgMakerLocationStep, RpgMakerSource, StandardDataFile};
     use rusqlite::params_from_iter;
+
+    #[test]
+    fn replacing_saved_layout_rules_is_atomic_and_checks_the_snapshot_it_was_validated_against() {
+        let source = SourceSnapshotFingerprint::from_bytes([7; 32]);
+        let plan = replace_layout_rules_transaction(
+            source,
+            "old-canonical-rules".to_owned(),
+            "new-canonical-rules".to_owned(),
+        );
+
+        assert_eq!(plan.steps().len(), 2);
+        let SqliteTransactionStep::RequireNoRows(requirement) = &plan.steps()[0] else {
+            panic!("第一步必须确认来源快照和旧规则均未变化")
+        };
+        assert!(
+            requirement
+                .statement()
+                .contains("source_snapshot_fingerprint = ?1")
+        );
+        assert_eq!(
+            requirement.parameters(),
+            [
+                SqliteValue::Blob([7; 32].to_vec()),
+                SqliteValue::Text(WRITE_BACK_LAYOUT_RULES_RESOURCE_KIND.to_owned()),
+                SqliteValue::Text("old-canonical-rules".to_owned()),
+            ]
+        );
+
+        let SqliteTransactionStep::Execute(replacement) = &plan.steps()[1] else {
+            panic!("第二步必须在同一事务中完整替换规则内容")
+        };
+        assert_eq!(
+            replacement.parameters(),
+            [
+                SqliteValue::Text("new-canonical-rules".to_owned()),
+                SqliteValue::Text(WRITE_BACK_LAYOUT_RULES_RESOURCE_KIND.to_owned()),
+            ]
+        );
+    }
 
     #[test]
     fn write_back_placeholder_rules_are_strictly_parsed_and_compiled() {
@@ -2546,6 +2873,7 @@ mod tests {
         SnapshotRows {
             owners,
             placeholder_rules: "[]".to_owned(),
+            layout_rules: "[]".to_owned(),
             groups: Vec::new(),
             units: Vec::new(),
             claims: Vec::new(),
@@ -2627,6 +2955,7 @@ mod tests {
                     SqliteValue::Text(source_content_json.clone()),
                     SqliteValue::Text("{}".to_owned()),
                     SqliteValue::Null,
+                    SqliteValue::Null,
                     SqliteValue::Text("database_entry".to_owned()),
                     SqliteValue::Text(recipes_raw.clone()),
                     SqliteValue::Null,
@@ -2688,6 +3017,7 @@ mod tests {
         SnapshotRows {
             owners: vec![owner_row([1; 32], *fingerprint.as_bytes())],
             placeholder_rules: "[]".to_owned(),
+            layout_rules: "[]".to_owned(),
             groups: groups.into_iter().map(|(_, row)| row).collect(),
             units: units.into_iter().map(|(_, _, row)| row).collect(),
             claims,
@@ -2759,6 +3089,10 @@ mod tests {
                 );
                 CREATE INDEX rpg_maker_mutation_claim_owner_resource_idx
                     ON rpg_maker_mutation_claim(owner, resource_key, access, group_id);
+                CREATE TABLE rpg_maker_translation_resource (
+                    resource_kind TEXT PRIMARY KEY,
+                    canonical_json TEXT NOT NULL
+                );
 
                 INSERT INTO rpg_maker_asset_owner_state VALUES ('rules', zeroblob(32), zeroblob(32));
                 INSERT INTO rpg_maker_asset_owner_state VALUES ('builtin', zeroblob(32), zeroblob(32));
@@ -2768,6 +3102,8 @@ mod tests {
                 INSERT INTO rpg_maker_text_unit VALUES ('builtin', 1, 'role-y', X'010000000000000000000000000000000000', '"y"', '{}', NULL, NULL);
                 INSERT INTO rpg_maker_mutation_claim VALUES ('builtin', 1, 'resource-z', 'exclusive');
                 INSERT INTO rpg_maker_mutation_claim VALUES ('builtin', 2, 'resource-a', 'intent');
+                INSERT INTO rpg_maker_translation_resource VALUES ('placeholder_rules', '[]');
+                INSERT INTO rpg_maker_translation_resource VALUES ('write_back_layout_rules', '[]');
                 ALTER TABLE rpg_maker_text_unit ADD COLUMN rule_number INTEGER;
                 "#,
             )
@@ -2836,6 +3172,10 @@ mod tests {
             .split_first()
             .expect("写回快照查询必须包含当前 Placeholder 规则");
         assert_eq!(placeholder_query.statement(), READ_PLACEHOLDER_RULES);
+        let (layout_query, partition_queries) = partition_queries
+            .split_first()
+            .expect("写回快照查询必须包含已保存的排版规则");
+        assert_eq!(layout_query.statement(), READ_LAYOUT_RULES);
         assert!(
             partition_queries
                 .iter()
@@ -2885,6 +3225,7 @@ mod tests {
         let rows = SnapshotRows {
             owners: Vec::new(),
             placeholder_rules: "[]".to_owned(),
+            layout_rules: "[]".to_owned(),
             groups: vec![make_row("group-0", 4), make_row("group-1", 4)],
             units: vec![make_row("unit-0", 6), make_row("unit-1", 6)],
             claims: vec![make_row("claim-0", 3)],
@@ -2940,6 +3281,7 @@ mod tests {
             SqliteValue::Text(source_content_json),
             SqliteValue::Text(context),
             SqliteValue::Text(translation_content_json),
+            SqliteValue::Null,
             SqliteValue::Text("database_entry".to_owned()),
             SqliteValue::Text("[]".to_owned()),
             SqliteValue::Null,

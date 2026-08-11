@@ -1452,7 +1452,7 @@ fn require_snapshot_baseline(baseline: &TranslationSnapshotBaseline) -> SqliteTr
 
     SqliteTransactionStep::RequireNoRows(SqliteQuery::new(
         format!(
-            "SELECT 1 WHERE (SELECT COUNT(*) FROM metadata) <> 1 OR NOT EXISTS (SELECT 1 FROM metadata WHERE source_snapshot_fingerprint = ?) OR {owner_condition} OR (SELECT COUNT(*) FROM rpg_maker_translation_resource) <> 2 OR NOT EXISTS (SELECT 1 FROM rpg_maker_translation_resource WHERE resource_kind = ? AND canonical_json = ?) OR NOT EXISTS (SELECT 1 FROM rpg_maker_translation_resource WHERE resource_kind = ? AND canonical_json = ?)"
+            "SELECT 1 WHERE (SELECT COUNT(*) FROM metadata) <> 1 OR NOT EXISTS (SELECT 1 FROM metadata WHERE source_snapshot_fingerprint = ?) OR {owner_condition} OR (SELECT COUNT(*) FROM rpg_maker_translation_resource) <> 3 OR NOT EXISTS (SELECT 1 FROM rpg_maker_translation_resource WHERE resource_kind = ? AND canonical_json = ?) OR NOT EXISTS (SELECT 1 FROM rpg_maker_translation_resource WHERE resource_kind = ? AND canonical_json = ?)"
         ),
         parameters,
     ))

@@ -577,6 +577,7 @@ pub(crate) enum GenericWriteBackUnitProblem {
         side: GenericWriteBackTextSide,
         problem: GenericLanguageProjectionProblem,
     },
+    LayoutRestoration,
 }
 
 impl GenericWriteBackUnitProblem {
@@ -642,6 +643,7 @@ impl GenericWriteBackUnitProblem {
                     "generic.write_back.language_projection.unused_ordered_token"
                 }
             },
+            Self::LayoutRestoration => "generic.write_back.layout_restoration",
         }
     }
 
@@ -655,6 +657,7 @@ impl GenericWriteBackUnitProblem {
             Self::PlaceholderProtection { .. } => DiagnosticResolution::FixPlaceholderRules,
             Self::PlaceholderBindingMismatch { .. } => DiagnosticResolution::FixInput,
             Self::LanguageProjection { .. } => DiagnosticResolution::ReportBug,
+            Self::LayoutRestoration => DiagnosticResolution::ReportBug,
         }
     }
 
@@ -669,6 +672,7 @@ impl GenericWriteBackUnitProblem {
                 "invalid_value"
             }
             Self::LanguageProjection { .. } => "internal_invariant",
+            Self::LayoutRestoration => "internal_invariant",
         }
     }
 
@@ -691,6 +695,7 @@ impl GenericWriteBackUnitProblem {
                 facts.extend(problem.facts());
                 facts
             }
+            Self::LayoutRestoration => Vec::new(),
         }
     }
 }
@@ -1596,6 +1601,11 @@ pub(crate) enum GenericProblem {
         bytes_changed: bool,
         structure_changed: bool,
     },
+    WriteBackLayoutRules {
+        path: Option<SafePath>,
+        rule_number: Option<usize>,
+        project_snapshot: bool,
+    },
     InputChangedDuringExtract,
     ExtractRequired,
     TranslationSnapshotChanged,
@@ -1862,6 +1872,7 @@ impl GenericProblem {
             Self::WriteBackMaterializedMismatch { .. } => {
                 "generic.write_back.materialized_mismatch"
             }
+            Self::WriteBackLayoutRules { .. } => "generic.write_back.layout_rules.invalid",
             Self::InputChangedDuringExtract => "generic.project.input_changed_during_extract",
             Self::ExtractRequired => "generic.project.extract_required",
             Self::TranslationSnapshotChanged => "generic.project.translation_snapshot_changed",
@@ -1929,6 +1940,14 @@ impl GenericProblem {
             Self::WriteBackSnapshotMismatch { .. } | Self::WriteBackMaterializedMismatch { .. } => {
                 DiagnosticResolution::CheckProjectState
             }
+            Self::WriteBackLayoutRules {
+                project_snapshot: true,
+                ..
+            } => DiagnosticResolution::CheckProjectState,
+            Self::WriteBackLayoutRules {
+                project_snapshot: false,
+                ..
+            } => DiagnosticResolution::FixInput,
         }
     }
 
@@ -1975,6 +1994,14 @@ impl GenericProblem {
             }
             Self::WriteBackUnit { problem, .. } => problem.summary_code(),
             Self::WriteBackMaterializedMismatch { .. } => "write_back_candidate_invalid",
+            Self::WriteBackLayoutRules {
+                project_snapshot: true,
+                ..
+            } => "state_mismatch",
+            Self::WriteBackLayoutRules {
+                project_snapshot: false,
+                ..
+            } => "invalid_value",
             Self::UnitNotFound { .. } => "not_found",
             Self::InvalidText { .. } => "invalid_value",
             Self::TaskResponse { problem, .. } => problem.summary_code(),
@@ -2065,6 +2092,9 @@ impl GenericProblem {
             Self::WriteBackSnapshotMismatch { problem } => problem.subject(),
             Self::WriteBackUnit { unit, .. } => generic_unit_subject(unit),
             Self::WriteBackMaterializedMismatch { path, .. } => path.to_string(),
+            Self::WriteBackLayoutRules { path, .. } => path
+                .as_ref()
+                .map_or_else(|| "write_back_layout_rules".to_owned(), ToString::to_string),
             Self::InputChangedDuringExtract => "generic_input".to_owned(),
             Self::ExtractRequired => "generic_extract".to_owned(),
             Self::TranslationSnapshotChanged => "generic_translation_snapshot".to_owned(),
@@ -2260,6 +2290,20 @@ impl GenericProblem {
                 ("bytes_changed", bytes_changed.to_string()),
                 ("structure_changed", structure_changed.to_string()),
             ],
+            Self::WriteBackLayoutRules {
+                path,
+                rule_number,
+                project_snapshot,
+            } => {
+                let mut facts = vec![("project_snapshot", project_snapshot.to_string())];
+                if let Some(path) = path {
+                    facts.push(("path", path.to_string()));
+                }
+                if let Some(rule_number) = rule_number {
+                    facts.push(("rule_number", rule_number.to_string()));
+                }
+                facts
+            }
             Self::InputChangedDuringExtract
             | Self::ExtractRequired
             | Self::TranslationSnapshotChanged
@@ -2444,6 +2488,7 @@ const fn expected_operation(problem: &GenericProblem) -> GenericOperation {
             GenericOperation::BuildWriteBackCandidate
         }
         GenericProblem::WriteBackUnit { .. } => GenericOperation::BuildWriteBackCandidate,
+        GenericProblem::WriteBackLayoutRules { .. } => GenericOperation::BuildWriteBackCandidate,
         GenericProblem::WriteBackMaterializedMismatch { .. } => {
             GenericOperation::MaterializeWriteBack
         }

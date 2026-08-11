@@ -34,6 +34,7 @@ use crate::runtime::sqlite::{
 };
 use crate::translation::TranslationOrigin;
 use crate::translation::candidate_validation::ProvenInvariantViolation;
+use crate::translation::layout_rules::{LayoutRuleSet, LayoutRulesError};
 #[cfg(test)]
 use crate::translation::placeholder::{
     PlaceholderRuleCompilationError, PlaceholderWorkerOperation,
@@ -61,6 +62,7 @@ const RESOURCE_CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
 const SQLITE_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
 const TERMINOLOGY_RESOURCE: &str = "terminology";
 const PLACEHOLDER_RULES_RESOURCE: &str = "placeholder_rules";
+const LAYOUT_RULES_RESOURCE: &str = "write_back_layout_rules";
 const CREATE_INITIAL_SCHEMA_SQL: &str = "CREATE TABLE generic_project (
                  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                  project_name TEXT NOT NULL CHECK (length(project_name) > 0),
@@ -154,12 +156,13 @@ const CREATE_INITIAL_SCHEMA_SQL: &str = "CREATE TABLE generic_project (
              ) STRICT;
              CREATE TABLE translation_resource (
                  resource_kind TEXT PRIMARY KEY CHECK (
-                     resource_kind IN ('terminology', 'placeholder_rules')
+                     resource_kind IN ('terminology', 'placeholder_rules', 'write_back_layout_rules')
                  ),
                  canonical_json TEXT NOT NULL CHECK (length(canonical_json) > 0)
               ) STRICT;
               INSERT INTO translation_resource (resource_kind, canonical_json)
-              VALUES ('terminology', '[]'), ('placeholder_rules', '[]');";
+              VALUES ('terminology', '[]'), ('placeholder_rules', '[]'),
+                     ('write_back_layout_rules', '[]');";
 const SELECT_GENERIC_ATT_SCHEMA: &str = "SELECT type, name, tbl_name, sql
     FROM main.sqlite_schema
     WHERE sql IS NOT NULL
@@ -1444,6 +1447,89 @@ impl GenericProjectStore {
         load_translation_resources_rows_with_cancellation(&connection, &self.cancellation)
     }
 
+    /// 读取项目保存的现行 WriteBack 排版规则；保存的是规范内容而不是外部路径。
+    pub(crate) fn load_write_back_layout_rules(
+        &self,
+    ) -> Result<LayoutRuleSet, GenericProjectError> {
+        self.ensure_not_cancelled()?;
+        self.finish_cancellable(self.load_write_back_layout_rules_inner())
+    }
+
+    fn load_write_back_layout_rules_inner(&self) -> Result<LayoutRuleSet, GenericProjectError> {
+        let connection = self.open_connection(false)?;
+        validate_current_generic_schema_with_cancellation(&connection, &self.cancellation)?;
+        let canonical_json = load_translation_resource_row_with_cancellation(
+            &connection,
+            LAYOUT_RULES_RESOURCE,
+            &self.cancellation,
+        )?;
+        LayoutRuleSet::from_canonical_json(&canonical_json)
+            .map_err(GenericProjectError::InvalidLayoutRules)
+    }
+
+    /// 在 Extract 快照仍一致时原子替换项目排版规则；失败会回滚并保留旧规则。
+    pub(crate) fn replace_write_back_layout_rules(
+        &self,
+        expected_raw_fingerprint: Sha256Fingerprint,
+        rules: &LayoutRuleSet,
+    ) -> Result<(), GenericProjectError> {
+        self.ensure_not_cancelled()?;
+        self.finish_cancellable(
+            self.replace_write_back_layout_rules_inner(expected_raw_fingerprint, rules),
+        )
+    }
+
+    fn replace_write_back_layout_rules_inner(
+        &self,
+        expected_raw_fingerprint: Sha256Fingerprint,
+        rules: &LayoutRuleSet,
+    ) -> Result<(), GenericProjectError> {
+        let mut connection = self.open_connection(false)?;
+        run_cancellable_transaction(
+            &mut connection,
+            &self.cancellation,
+            "开始保存 Generic 排版规则",
+            "提交 Generic 排版规则",
+            "回滚 Generic 排版规则",
+            |transaction| {
+                let actual = read_optional_fingerprint(
+                    transaction
+                        .query_row(
+                            "SELECT extracted_raw_fingerprint
+                             FROM generic_project WHERE singleton = 1",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .map_err(|source| GenericProjectError::Sqlite {
+                            operation: "读取 Generic Extract 指纹",
+                            source,
+                        })?,
+                    "extracted_raw_fingerprint",
+                )?;
+                if actual != Some(expected_raw_fingerprint) {
+                    return Err(GenericProjectError::TranslationSnapshotChanged);
+                }
+                let changed = transaction
+                    .execute(
+                        "UPDATE translation_resource
+                         SET canonical_json = ?1 WHERE resource_kind = ?2",
+                        params![rules.canonical_json(), LAYOUT_RULES_RESOURCE],
+                    )
+                    .map_err(|source| GenericProjectError::Sqlite {
+                        operation: "保存 Generic 排版规则",
+                        source,
+                    })?;
+                if changed != 1 {
+                    return Err(GenericProjectError::Sqlite {
+                        operation: "保存 Generic 排版规则",
+                        source: rusqlite::Error::QueryReturnedNoRows,
+                    });
+                }
+                Ok(())
+            },
+        )
+    }
+
     /// 原子保存本轮资源，并以 CAS 清除规划时已经确认失效的旧译文。
     pub(crate) fn apply_translation_resources(
         &self,
@@ -2130,6 +2216,7 @@ pub(crate) enum GenericProjectError {
     },
     BlankProfileId,
     InvalidResource(GenericProjectResourceError),
+    InvalidLayoutRules(LayoutRulesError),
 }
 
 impl fmt::Display for GenericProjectError {
@@ -2238,6 +2325,9 @@ impl fmt::Display for GenericProjectError {
             ),
             Self::BlankProfileId => formatter.write_str("Generic Profile ID 不能为空白"),
             Self::InvalidResource(source) => write!(formatter, "Generic 翻译资源无效：{source}"),
+            Self::InvalidLayoutRules(source) => {
+                write!(formatter, "Generic WriteBack 排版规则无效：{source}")
+            }
         }
     }
 }
@@ -2266,6 +2356,7 @@ impl Error for GenericProjectError {
                 ..
             } => Some(source.as_ref()),
             Self::InvalidResource(source) => Some(source),
+            Self::InvalidLayoutRules(source) => Some(source),
             Self::InvalidDatabase {
                 source: Some(source),
                 ..
@@ -2474,6 +2565,11 @@ impl GenericProjectError {
             }
             Self::BlankProfileId => generic(GenericProblem::BlankProfileId),
             Self::InvalidResource(source) => generic_project_resource_report(source, stage, effect),
+            Self::InvalidLayoutRules(source) => generic(GenericProblem::WriteBackLayoutRules {
+                path: None,
+                rule_number: source.rule_number(),
+                project_snapshot: true,
+            }),
         }
     }
 }
@@ -2691,7 +2787,8 @@ impl GenericProjectError {
             | Self::DuplicateTranslationWrite { .. }
             | Self::DuplicateTranslationClear { .. }
             | Self::BlankProfileId
-            | Self::InvalidResource(_) => false,
+            | Self::InvalidResource(_)
+            | Self::InvalidLayoutRules(_) => false,
         }
     }
 }
@@ -4353,7 +4450,9 @@ fn validate_schema_with_compiled_resources(
     let resource_count: i64 = connection
         .query_row(
             "SELECT count(*) FROM main.translation_resource
-             WHERE (resource_kind = 'terminology' OR resource_kind = 'placeholder_rules')
+             WHERE resource_kind IN (
+                 'terminology', 'placeholder_rules', 'write_back_layout_rules'
+             )
                AND length(canonical_json) > 0",
             [],
             |row| row.get(0),
@@ -4361,14 +4460,22 @@ fn validate_schema_with_compiled_resources(
         .map_err(|source| {
             cancellable_sqlite_error("检查 Generic 翻译资源", source, cancellation)
         })?;
-    if resource_count != 2 {
+    if resource_count != 3 {
         return Err(invalid_database(
             GenericProjectDatabaseProblem::TranslationResourceCount {
-                expected: 2,
+                expected: 3,
                 actual: resource_count,
             },
         ));
     }
+    ensure_generic_operation_not_cancelled(cancellation)?;
+    let layout_rules_json = load_translation_resource_row_with_cancellation(
+        connection,
+        LAYOUT_RULES_RESOURCE,
+        cancellation,
+    )?;
+    LayoutRuleSet::from_canonical_json(&layout_rules_json)
+        .map_err(GenericProjectError::InvalidLayoutRules)?;
     ensure_generic_operation_not_cancelled(cancellation)?;
     let resources = load_translation_resources_rows_with_cancellation(connection, cancellation)?;
     let compiled_resources = match compiled_resources {
@@ -5495,6 +5602,72 @@ mod tests {
 
     fn write_source(source: &Path, content: &str) {
         fs::write(source.join("text.jsonl"), content).expect("测试输入应写入");
+    }
+
+    #[test]
+    fn write_back_layout_rules_are_persisted_reused_cleared_and_rollback_safe() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).expect("应建立测试来源目录");
+        write_source(
+            &source,
+            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"原文\"}]}\n",
+        );
+        let store = init(&temp.path().join("project"), &source);
+        store.extract().expect("首次 Extract 应成功");
+        let fingerprint = store
+            .open()
+            .unwrap()
+            .extracted_raw_fingerprint()
+            .expect("已提取项目必须有来源指纹");
+
+        assert!(
+            store
+                .load_write_back_layout_rules()
+                .expect("尚未设置规则时必须读取空规则")
+                .is_empty()
+        );
+        let selected = LayoutRuleSet::parse_toml(
+            b"[[rule]]\nmax_fullwidth_chars = 20\nscopes = ['dialogue']\n",
+        )
+        .expect("测试规则必须有效");
+        store
+            .replace_write_back_layout_rules(fingerprint, &selected)
+            .expect("有效规则必须原子保存");
+        assert_eq!(
+            store
+                .load_write_back_layout_rules()
+                .expect("省略外部文件时必须可复用保存内容")
+                .canonical_json(),
+            selected.canonical_json()
+        );
+
+        assert!(LayoutRuleSet::parse_toml(b"[[rule]]\nmax_fullwidth_chars = 0\n").is_err());
+        assert_eq!(
+            store
+                .load_write_back_layout_rules()
+                .expect("无效新文件不得改变旧规则")
+                .canonical_json(),
+            selected.canonical_json()
+        );
+
+        let empty = LayoutRuleSet::parse_toml(b"rule = []").expect("显式空规则必须有效");
+        store
+            .replace_write_back_layout_rules(fingerprint, &empty)
+            .expect("空规则必须清除已保存规则");
+        assert!(store.load_write_back_layout_rules().unwrap().is_empty());
+
+        let stale = Sha256Fingerprint::from_bytes([0x7f; 32]);
+        assert!(matches!(
+            store.replace_write_back_layout_rules(stale, &selected),
+            Err(GenericProjectError::TranslationSnapshotChanged)
+        ));
+        assert!(
+            store
+                .load_write_back_layout_rules()
+                .expect("CAS 失败必须回滚并保留空规则")
+                .is_empty()
+        );
     }
 
     #[test]

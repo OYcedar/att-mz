@@ -5226,7 +5226,12 @@ mod tests {
     #[tokio::test]
     async fn scrambled_extract_input_round_trips_through_the_write_back_reader() {
         let owner = RpgMakerAssetOwner::Rules;
-        let extracted_groups = vec![scalar_group(9, "name", "后组"), two_field_group(true)];
+        let mut extracted_groups = vec![scalar_group(9, "name", "后组"), two_field_group(true)];
+        for group in &mut extracted_groups {
+            for unit in group.units_mut() {
+                unit.set_rule_number(1);
+            }
+        }
         let snapshot = EncodedSnapshot::merge(
             owner,
             vec![encode_test_batch(extracted_groups.clone()).expect("乱序测试快照应可编码")],
@@ -6125,6 +6130,7 @@ ORDER BY name"#,
                 );
                 INSERT INTO rpg_maker_translation_resource VALUES ('terminology', '[]');
                 INSERT INTO rpg_maker_translation_resource VALUES ('placeholder_rules', '[]');
+                INSERT INTO rpg_maker_translation_resource VALUES ('write_back_layout_rules', '[]');
                 CREATE TABLE rpg_maker_text_group (
                     owner TEXT NOT NULL,
                     group_id INTEGER NOT NULL CHECK (group_id > 0),
