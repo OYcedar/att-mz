@@ -44,7 +44,6 @@ use crate::translation::placeholder::placeholder_bindings_match_within_slot;
 const MAX_PLANNING_PROGRESS_UPDATES: u64 = 1_024;
 
 /// 同一数据库读快照中解析、编译完成的候选验收资源。
-#[derive(Clone)]
 pub(crate) struct RpgMakerWriteBackCandidateValidationContext {
     engine: RpgMakerEngine,
     placeholder_service: Pcre2PlaceholderService,
@@ -912,7 +911,7 @@ fn validate_scrolling_projection(
 }
 
 /// Reader 在同一个一致读视图中建立的完整 RPG Maker 写回快照。
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Debug, Default, Eq, PartialEq)]
 pub(crate) struct RpgMakerWriteBackSnapshot {
     groups: Vec<RpgMakerWriteBackGroup>,
     candidate_validation: Option<RpgMakerWriteBackCandidateValidationContext>,
@@ -2009,18 +2008,20 @@ where
             Arc::clone(&self.progress),
             total_groups,
         ));
-        let groups = groups
-            .into_iter()
-            .map(|group| ProgressTrackedPlanningJob {
-                group,
-                candidate_validation: candidate_validation.clone(),
-                cancellation: self.cancellation.clone(),
-                progress: Arc::clone(&planning_progress),
-            })
-            .collect();
+        let cancellation = self.cancellation.clone();
         let planned_groups = self
             .cpu
-            .execute_ordered_map(groups, plan_rpg_maker_write_back_group_with_progress)
+            .execute_ordered_map(groups, move |group| {
+                let planned = plan_rpg_maker_write_back_group(
+                    group,
+                    candidate_validation.as_ref(),
+                    &cancellation,
+                );
+                if matches!(planned, Ok(OperationCompletion::Completed(_))) {
+                    planning_progress.complete();
+                }
+                planned
+            })
             .await
             .map_err(RpgMakerWriteBackServiceError::SchedulePlanning)?;
         let mut completed_groups = Vec::with_capacity(planned_groups.len());
@@ -2069,13 +2070,6 @@ struct PlannedRpgMakerWriteBackGroup {
     summary: RpgMakerWriteBackSummary,
 }
 
-struct ProgressTrackedPlanningJob {
-    group: RpgMakerWriteBackGroup,
-    candidate_validation: Option<RpgMakerWriteBackCandidateValidationContext>,
-    cancellation: CooperativeCancellation,
-    progress: Arc<PlanningProgress>,
-}
-
 struct PlanningProgress {
     observer: Arc<dyn ProgressObserver<WriteBackProgressPhase>>,
     completed: AtomicU64,
@@ -2120,23 +2114,6 @@ impl PlanningProgress {
             self.total,
         ));
     }
-}
-
-fn plan_rpg_maker_write_back_group_with_progress(
-    job: ProgressTrackedPlanningJob,
-) -> Result<
-    OperationCompletion<PlannedRpgMakerWriteBackGroup>,
-    RpgMakerWriteBackPlaceholderValidationError,
-> {
-    let planned = plan_rpg_maker_write_back_group(
-        job.group,
-        job.candidate_validation.as_ref(),
-        &job.cancellation,
-    );
-    if matches!(planned, Ok(OperationCompletion::Completed(_))) {
-        job.progress.complete();
-    }
-    planned
 }
 
 struct GroupPlanningOutputs<'a> {
