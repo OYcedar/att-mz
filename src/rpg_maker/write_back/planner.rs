@@ -1409,7 +1409,7 @@ impl ReplaceChoicesMutation {
         if source_lines
             .iter()
             .zip(&replacement_lines)
-            .any(|(source, replacement)| is_structural_blank(source) && source != replacement)
+            .any(|(source, replacement)| is_structural_blank(source) && !replacement.is_empty())
         {
             return Err(RpgMakerWriteBackMutationPlanError::InvalidChoices {
                 group_location: Box::new(group_location),
@@ -1683,7 +1683,7 @@ impl fmt::Display for WriteBackChoicesPlanViolation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::EmptyOrMismatchedLineCount => "选项原文与译文必须是等长非空行序列",
-            Self::BlankSlotChanged => "选项空白槽必须逐字保持冻结原文",
+            Self::BlankSlotChanged => "选项空白槽必须物化为精确空字符串",
             Self::InvalidRecipeShape => "选项配方必须只包含一个 Choices 行槽",
             Self::RecipeSourceMismatch => "选项配方与冻结原文不一致",
             Self::IncompleteCommandCoverage => "每个选项必须同时对应 102 列表项和同层 402 标签",
@@ -2026,7 +2026,16 @@ where
             .map_err(RpgMakerWriteBackServiceError::SchedulePlanning)?;
         let mut completed_groups = Vec::with_capacity(planned_groups.len());
         for planned in planned_groups {
-            match planned.map_err(RpgMakerWriteBackServiceError::InvalidPlaceholder)? {
+            let planned = match planned {
+                Ok(planned) => planned,
+                Err(RpgMakerWriteBackGroupPlanningError::InvalidPlaceholder(source)) => {
+                    return Err(RpgMakerWriteBackServiceError::InvalidPlaceholder(source));
+                }
+                Err(RpgMakerWriteBackGroupPlanningError::InvalidPlan(source)) => {
+                    return Err(RpgMakerWriteBackServiceError::InvalidPlan(source));
+                }
+            };
+            match planned {
                 OperationCompletion::Completed(planned) => completed_groups.push(planned),
                 OperationCompletion::Cancelled => return Ok(OperationCompletion::Cancelled),
             }
@@ -2068,6 +2077,12 @@ struct PlannedRpgMakerWriteBack {
 struct PlannedRpgMakerWriteBackGroup {
     mutations: Vec<RpgMakerWriteBackMutation>,
     summary: RpgMakerWriteBackSummary,
+}
+
+#[derive(Debug)]
+enum RpgMakerWriteBackGroupPlanningError {
+    InvalidPlaceholder(RpgMakerWriteBackPlaceholderValidationError),
+    InvalidPlan(RpgMakerWriteBackMutationPlanError),
 }
 
 struct PlanningProgress {
@@ -2146,10 +2161,8 @@ fn plan_rpg_maker_write_back_group(
     group: RpgMakerWriteBackGroup,
     candidate_validation: Option<&RpgMakerWriteBackCandidateValidationContext>,
     cancellation: &CooperativeCancellation,
-) -> Result<
-    OperationCompletion<PlannedRpgMakerWriteBackGroup>,
-    RpgMakerWriteBackPlaceholderValidationError,
-> {
+) -> Result<OperationCompletion<PlannedRpgMakerWriteBackGroup>, RpgMakerWriteBackGroupPlanningError>
+{
     if cancellation.is_requested() {
         return Ok(OperationCompletion::Cancelled);
     }
@@ -2184,12 +2197,14 @@ fn plan_rpg_maker_write_back_group(
                     cancellation,
                 )
                 .map_err(|reason| {
-                    RpgMakerWriteBackPlaceholderValidationError::new(
-                        owner,
-                        kind,
-                        group_location.clone(),
-                        unit.role.clone(),
-                        reason,
+                    RpgMakerWriteBackGroupPlanningError::InvalidPlaceholder(
+                        RpgMakerWriteBackPlaceholderValidationError::new(
+                            owner,
+                            kind,
+                            group_location.clone(),
+                            unit.role.clone(),
+                            reason,
+                        ),
                     )
                 })?;
                 let OperationCompletion::Completed(()) = validated else {
@@ -2211,13 +2226,16 @@ fn plan_rpg_maker_write_back_group(
                 mutation_claims,
                 &mut outputs,
             ),
-            TextGroupKind::EventChoices => plan_choices_group(
-                group_location,
-                units,
-                recipes,
-                mutation_claims,
-                &mut outputs,
-            ),
+            TextGroupKind::EventChoices => {
+                plan_choices_group(
+                    group_location,
+                    units,
+                    recipes,
+                    mutation_claims,
+                    &mut outputs,
+                )
+                .map_err(RpgMakerWriteBackGroupPlanningError::InvalidPlan)?;
+            }
             _ => plan_scalar_group(units, recipes, &mut outputs),
         }
         if cancellation.is_requested() {
@@ -2361,12 +2379,12 @@ fn plan_choices_group(
     recipes: Vec<TextProjectionRecipe>,
     mutation_claims: MutationClaimSet,
     outputs: &mut GroupPlanningOutputs<'_>,
-) {
+) -> Result<(), RpgMakerWriteBackMutationPlanError> {
     let [unit] = units.as_slice() else {
         unreachable!("受信选项组必须只包含一个语义单元")
     };
     let Some(replacement_lines) = aligned_replacement_lines(unit) else {
-        return;
+        return Ok(());
     };
     let source_lines = unit
         .source_content
@@ -2386,11 +2404,11 @@ fn plan_choices_group(
         mutation_claims,
         source_lines.to_vec(),
         replacement_lines,
-    )
-    .expect("受信选项资产必须建立合法原子 Mutation");
+    )?;
     outputs
         .mutations
         .push(RpgMakerWriteBackMutation::ReplaceChoices(mutation));
+    Ok(())
 }
 
 fn plan_scalar_group(
@@ -3115,15 +3133,17 @@ mod tests {
     }
 
     #[test]
-    fn choices_are_planned_as_one_strictly_aligned_atomic_mutation() {
+    fn choices_normalize_whitespace_slots_and_are_planned_as_one_atomic_mutation() {
         let group_location = location(20, None);
-        let source_lines = vec!["はい".to_owned(), "いいえ".to_owned()];
-        let translated_lines = vec!["是".to_owned(), "否".to_owned()];
+        let source_lines = vec!["はい".to_owned(), " ".to_owned(), "いいえ".to_owned()];
+        let translated_lines = vec!["是".to_owned(), String::new(), "否".to_owned()];
         let physical_targets = [
             (location(20, Some(0)), 0),
             (location(20, Some(1)), 1),
+            (location(20, Some(2)), 2),
             (location(21, Some(1)), 0),
             (location(22, Some(1)), 1),
+            (location(23, Some(1)), 2),
         ];
         let mut recipes = physical_targets
             .clone()
@@ -3146,7 +3166,12 @@ mod tests {
             .into_iter()
             .map(|(target, _)| target)
             .collect::<Vec<_>>();
-        covered_values.extend([location(21, None), location(22, None), location(23, None)]);
+        covered_values.extend([
+            location(21, None),
+            location(22, None),
+            location(23, None),
+            location(24, None),
+        ]);
         recipes.push(TextProjectionRecipe::Claim(
             MutationClaim::event_block(group_location.clone(), covered_values)
                 .expect("选项测试 EventBlock Claim 应合法"),
@@ -3178,6 +3203,70 @@ mod tests {
         };
         assert_eq!(mutation.source_lines(), source_lines);
         assert_eq!(mutation.replacement_lines(), translated_lines);
+    }
+
+    #[test]
+    fn invalid_choice_plan_returns_a_typed_error_instead_of_panicking() {
+        let group_location = location(25, None);
+        let source_lines = vec!["保留".to_owned(), " ".to_owned()];
+        let replacement_lines = vec!["保留".to_owned(), "错误文字".to_owned()];
+        let physical_targets = [
+            (location(25, Some(0)), 0),
+            (location(25, Some(1)), 1),
+            (location(26, Some(1)), 0),
+            (location(27, Some(1)), 1),
+        ];
+        let recipes = physical_targets
+            .into_iter()
+            .map(|(target, source_line_index)| {
+                TextProjectionRecipe::Direct(
+                    DirectTextRecipe::new(
+                        target,
+                        source_lines[source_line_index].clone(),
+                        vec![DirectTextPart::LineSlot {
+                            role: TextUnitRole::Choices,
+                            source_line_index,
+                        }],
+                    )
+                    .expect("选项配方应合法"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mutation_claims =
+            mutation_claims_for_group(TextGroupKind::EventChoices, &group_location, &recipes)
+                .expect("选项配方应建立修改声明");
+        let units = vec![
+            RpgMakerWriteBackUnit::new(
+                TextUnitRole::Choices,
+                TextUnitContent::Lines(source_lines),
+                Some(TextUnitContent::Lines(replacement_lines)),
+            )
+            .expect("测试单元应建立"),
+        ];
+        let mut mutations = Vec::new();
+        let mut summary = RpgMakerWriteBackSummary::default();
+        let mut outputs = GroupPlanningOutputs {
+            mutations: &mut mutations,
+            summary: &mut summary,
+        };
+
+        let error = plan_choices_group(
+            group_location.clone(),
+            units,
+            recipes,
+            mutation_claims,
+            &mut outputs,
+        )
+        .expect_err("非法空白槽必须返回规划错误");
+
+        assert!(matches!(
+            error,
+            RpgMakerWriteBackMutationPlanError::InvalidChoices {
+                group_location: actual,
+                violation: WriteBackChoicesPlanViolation::BlankSlotChanged,
+            } if *actual == group_location
+        ));
+        assert!(mutations.is_empty());
     }
 
     #[test]
