@@ -1053,6 +1053,9 @@ fn manual_target_error(path: &Path, source: WindowsFsError) -> ManualDocumentErr
         WindowsFsError::RenameTargetExists { path } => {
             ManualOutputTargetProblem::TargetAlreadyExists { path }
         }
+        WindowsFsError::RenameTargetUnconfirmed { path } => {
+            ManualOutputTargetProblem::IdentityChanged { path }
+        }
         WindowsFsError::FileIdentityChanged { path } => {
             ManualOutputTargetProblem::IdentityChanged { path }
         }

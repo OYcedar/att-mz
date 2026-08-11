@@ -61,6 +61,9 @@ pub(crate) enum WindowsFsError {
     RenameTargetExists {
         path: PathBuf,
     },
+    RenameTargetUnconfirmed {
+        path: PathBuf,
+    },
     FileIdentityChanged {
         path: PathBuf,
     },
@@ -91,6 +94,9 @@ impl WindowsFsError {
                 path: SafePath::new(path),
             },
             Self::RenameTargetExists { path } => FileSystemProblem::TargetExists {
+                path: SafePath::new(path),
+            },
+            Self::RenameTargetUnconfirmed { path } => FileSystemProblem::IdentityChanged {
                 path: SafePath::new(path),
             },
             Self::FileIdentityChanged { path } => FileSystemProblem::IdentityChanged {
@@ -133,6 +139,9 @@ impl fmt::Display for WindowsFsError {
             Self::RenameTargetExists { path } => {
                 write!(formatter, "无覆盖重命名的目标已经存在：{}", path.display())
             }
+            Self::RenameTargetUnconfirmed { path } => {
+                write!(formatter, "重命名后无法确认目标身份：{}", path.display())
+            }
             Self::FileIdentityChanged { path } => {
                 write!(
                     formatter,
@@ -154,6 +163,7 @@ impl std::error::Error for WindowsFsError {
             | Self::CaseSensitiveDirectory { .. }
             | Self::LockCancelled { .. }
             | Self::RenameTargetExists { .. }
+            | Self::RenameTargetUnconfirmed { .. }
             | Self::FileIdentityChanged { .. } => None,
         }
     }
@@ -720,14 +730,6 @@ pub(crate) fn rename_without_replace_if_identity(
     target: &Path,
     expected: FileIdentity,
 ) -> Result<(), WindowsFsError> {
-    rename_without_replace_inner(source, target, Some(expected))
-}
-
-fn rename_without_replace_inner(
-    source: &Path,
-    target: &Path,
-    expected: Option<FileIdentity>,
-) -> Result<(), WindowsFsError> {
     let source_parent_path = source.parent().ok_or_else(|| {
         io_error(
             "无覆盖重命名",
@@ -751,13 +753,11 @@ fn rename_without_replace_inner(
         .open(source)
         .map_err(|source_error| io_error("打开待重命名对象", source, source_error))?;
     reject_reparse(&source_file, source)?;
-    if let Some(expected) = expected {
-        let actual = FileIdentity::of(&source_file, source)?;
-        if actual != expected {
-            return Err(WindowsFsError::FileIdentityChanged {
-                path: source.to_path_buf(),
-            });
-        }
+    let actual = FileIdentity::of(&source_file, source)?;
+    if actual != expected {
+        return Err(WindowsFsError::FileIdentityChanged {
+            path: source.to_path_buf(),
+        });
     }
 
     let target_wide: Vec<u16> = target.as_os_str().encode_wide().collect();
@@ -799,6 +799,26 @@ fn rename_without_replace_inner(
             });
         }
         return Err(io_error("无覆盖重命名", target, source_error));
+    }
+
+    // SetFileInformationByHandle 成功只证明内核已经接受重命名。先关闭执行重命名的
+    // 句柄，再从目标路径重新打开同一文件身份，调用方随后触发进程故障时才不会把
+    // 一个尚未可见的候选误判成“从未移动”。成功调用之后的任何确认失败都属于
+    // 结果未知，不能伪装成普通的重命名前 I/O 失败并清理恢复现场。
+    drop(source_file);
+    let confirmed = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(target)
+        .ok()
+        .filter(|target_file| reject_reparse(target_file, target).is_ok())
+        .and_then(|target_file| FileIdentity::of(&target_file, target).ok())
+        .is_some_and(|actual| actual == expected);
+    if !confirmed {
+        return Err(WindowsFsError::RenameTargetUnconfirmed {
+            path: target.to_path_buf(),
+        });
     }
     Ok(())
 }
@@ -949,6 +969,32 @@ mod tests {
         assert_eq!(
             first,
             FileIdentity::of(&reopened, &directory).expect("应该可读取重开候选身份")
+        );
+    }
+
+    #[test]
+    fn identity_checked_rename_returns_only_after_target_is_observable() {
+        let temporary = tempfile::tempdir().expect("应该可创建临时目录");
+        let source = temporary.path().join("candidate");
+        let target = temporary.path().join("published");
+        fs::create_dir(&source).expect("应该可创建候选目录");
+        fs::write(source.join("value.txt"), b"new").expect("应该可写入候选内容");
+        let source_handle = open_directory(&source, true).expect("应该可打开候选目录");
+        let expected = FileIdentity::of(&source_handle, &source).expect("应该可读取候选身份");
+        drop(source_handle);
+
+        rename_without_replace_if_identity(&source, &target, expected)
+            .expect("身份匹配的候选应该可完成重命名");
+
+        assert!(!source.exists());
+        let target_handle = open_directory(&target, true).expect("目标应该已经可重新打开");
+        assert_eq!(
+            FileIdentity::of(&target_handle, &target).expect("应该可读取目标身份"),
+            expected
+        );
+        assert_eq!(
+            fs::read(target.join("value.txt")).expect("应该可读取发布内容"),
+            b"new"
         );
     }
 
