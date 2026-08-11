@@ -219,6 +219,102 @@ def test_translation_qa_groups_heuristics_and_only_expands_selected_reviews(tmp_
     assert corrected["qa_status"] == "clean"
 
 
+def test_translation_qa_accepts_rejected_candidates_as_opaque_json_text(tmp_path: Path) -> None:
+    translations = tmp_path / "translations.jsonl"
+    rows: list[dict[str, object]] = [
+        {
+            "manual_id": "Map001.json:event1:page1:command1",
+            "source": ["Rejected"],
+            "translation": None,
+            "state": "rejected",
+            "origin": "automatic",
+            "type": "fixed",
+            "owner": "builtin",
+            "rejected_candidate_json": '{\n  "translation": ["候选"],\n  "translation": null\n}',
+        },
+        {
+            "manual_id": "Map001.json:event1:page1:command2",
+            "source": ["Rejected null"],
+            "translation": None,
+            "state": "rejected",
+            "origin": "automatic",
+            "type": "fixed",
+            "owner": "builtin",
+            "rejected_candidate_json": "null",
+        },
+    ]
+    write_jsonl(translations, rows)
+    locations: list[dict[str, object]] = [
+        {
+            "candidate_id": f"location-{number:06d}",
+            "source": "data/System.json",
+            "source_text": cast(list[str], row["source"])[0],
+            "classification": "builtin",
+            "expected_manual_id": row["manual_id"],
+            "roles": ["display"],
+            "control_contract": {"consumer": "extended_text"},
+        }
+        for number, row in enumerate(rows, start=1)
+    ]
+    survey = write_survey(tmp_path, locations)
+
+    scan = tmp_path / "qa"
+    run_script(
+        [
+            "scan",
+            "--translations",
+            translations,
+            "--survey",
+            survey,
+            "--output",
+            scan,
+        ]
+    )
+
+    assert len(translations.read_text(encoding="utf-8").splitlines()) == 2
+    summary = json.loads((scan / "qa-summary.json").read_text(encoding="utf-8"))
+    assert summary["qa_status"] == "needs_review"
+    assert summary["counts"]["rejected_translation"] == 2
+    assert summary["revision_ids"] == [row["manual_id"] for row in rows]
+
+
+def test_translation_qa_rejects_invalid_state_field_combinations(tmp_path: Path) -> None:
+    survey = write_survey(tmp_path, [])
+    base = {
+        "manual_id": "Map001.json:event1:page1:command1",
+        "source": ["Source"],
+        "translation": None,
+        "state": "rejected",
+        "origin": "automatic",
+        "type": "fixed",
+        "owner": "builtin",
+        "rejected_candidate_json": "null",
+    }
+    cases = [
+        ("missing-candidate", {key: value for key, value in base.items() if key != "rejected_candidate_json"}),
+        ("rejected-translation", {**base, "translation": ["译文"]}),
+        ("pending-candidate", {**base, "state": "pending", "origin": "none"}),
+        ("invalid-origin", {**base, "origin": "provider"}),
+    ]
+
+    for name, row in cases:
+        translations = tmp_path / f"{name}.jsonl"
+        write_jsonl(translations, [row])
+        result = run_script(
+            [
+                "scan",
+                "--translations",
+                translations,
+                "--survey",
+                survey,
+                "--output",
+                tmp_path / f"qa-{name}",
+            ],
+            expected=1,
+        )
+        assert "重新" in result.stderr
+
+
 def test_static_qa_uses_frozen_survey_but_final_evidence_rechecks_the_game(tmp_path: Path) -> None:
     rows = translation_rows(corrected=True)
     translations = tmp_path / "translations.jsonl"
