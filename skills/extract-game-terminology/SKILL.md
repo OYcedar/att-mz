@@ -8,6 +8,11 @@ description: 使用 ATT 随包 Formic 从最终 Manual 的完整游戏原文并�
 最终只交付审核后的 ATT 术语 TOML。Formic 是从完整游戏语料并发找术语候选的外部工具；它的网络等待
 单独记录，不计 Agent 调查、审核和返工时间。本 Skill 的唯一 Python 入口是 `terminology_job.py`。
 
+作为长期翻译任务的一部分执行时，按 `docs/guides/task-artifacts.md` 放置材料：Formic 作业目录
+留在任务根的 `artifacts/work/`，审核决定留在 `artifacts/decisions/`，最终实际使用的
+`terminology.toml` 留在 `artifacts/rules/`。任务专用或临时脚本分别放该任务的 `scripts/` 或
+`scratch/`，不得写进本 Skill。
+
 ## 1. 建立作业
 
 输入必须是所有权审计后固定的完整 Manual（ATT 可编辑译文 TOML）。它应在最终 Extract 后、首次

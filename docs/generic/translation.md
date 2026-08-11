@@ -56,6 +56,10 @@ Group 是不可拆分的最小语义整体；同一稳定 TaskBlock 内的相邻
 TaskBlock。完整公共规则见
 [TaskBlock 规划规格](../translation/task-planning.md)。
 
+因此，外部转换不得把大量相互独立的记录放进单个 Group。ATT 只会在 Group 之间分配
+TaskBlock，不会在一个 Group 内按容量切断语境。真正不可拆的长 Group 可以独占任务；由错误
+分组造成的超长任务必须回到 JSONL 转换步骤修正，不能靠重试、临时分片或放宽响应验收处理。
+
 发送 TaskBlock 时：
 
 - 只发送至少含一个模型代表的完整 TaskBlock；

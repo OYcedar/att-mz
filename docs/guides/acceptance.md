@@ -145,7 +145,10 @@ Manual 不检查语言质量、术语、文风、语境或源语残留，这些�
 - 源语言残留、拒绝语、模型说明、JSON 痕迹和异常转义。
 
 标准流程使用 `translation_qa.py scan` 一次读取 `translation export`、survey、术语和可选
-WriteBack 预览或 NW.js 运行记录，生成按原因分类的问题清单和 `qa-summary.json`。状态只取
+WriteBack 预览或 NW.js 运行记录，生成 `qa-summary.json`、完整机器明细 `findings.jsonl` 和
+紧凑的 `review-groups.jsonl`。Agent 先读 Review 组及少量样例，只有决定处理某组时才按
+`review_group_id` 查看对应明细；不得把数千条启发式命中逐项读完后再分类。`manual` 默认只
+输出确定问题的自然 ID，使用一个或多个 `--review-group` 才加入已审核的启发式组。状态只取
 `clean`、`needs_review` 或 `unverified`；问题数量不会使该工具非零退出，也不会把结构合法
 译文改成 Rejected。
 

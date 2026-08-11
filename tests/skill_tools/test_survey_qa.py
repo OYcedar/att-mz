@@ -207,6 +207,7 @@ def test_survey_keeps_every_fact_and_builds_relation_groups(survey_game: Path, t
         "survey.json",
         "locations.jsonl",
         "review-groups.jsonl",
+        "ownership-decisions.jsonl",
         "source-baseline.json",
         "agent-work-metrics.json",
     }
@@ -272,6 +273,10 @@ def test_survey_keeps_every_fact_and_builds_relation_groups(survey_game: Path, t
     groups = read_jsonl(output / "review-groups.jsonl")
     assert [group["group_id"] for group in groups] == [
         f"group-{number:06d}" for number in range(1, len(groups) + 1)
+    ]
+    decision_template = read_jsonl(output / "ownership-decisions.jsonl")
+    assert decision_template == [
+        {"target": f"group:{group['group_id']}", "owner": "unresolved"} for group in groups
     ]
     category_ids = {
         str(item["candidate_id"])
@@ -751,8 +756,6 @@ def test_review_grouping_keeps_map_locations_and_finalizes_actual_files(
     assert len({item["review_group_id"] for item in map_names}) == 1
 
     groups = read_jsonl(survey_root / "review-groups.jsonl")
-    empty_decisions = tmp_path / "empty.jsonl"
-    write_jsonl(empty_decisions, [])
     incomplete_plan = tmp_path / "incomplete"
     run_script(
         SURVEY,
@@ -760,15 +763,14 @@ def test_review_grouping_keeps_map_locations_and_finalizes_actual_files(
             "finalize",
             "--survey",
             survey_root,
-            "--decisions",
-            empty_decisions,
             "--output",
             incomplete_plan,
         ],
     )
     incomplete = json.loads((incomplete_plan / "coverage.json").read_text(encoding="utf-8"))
     assert incomplete["complete"] is False
-    assert incomplete["missing_targets"]
+    assert incomplete["missing_targets"] == []
+    assert len(incomplete["unresolved"]) == len(groups)
 
     decisions = tmp_path / "decisions.jsonl"
     write_jsonl(decisions, _decisions_for(groups))
