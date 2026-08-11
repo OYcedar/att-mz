@@ -488,6 +488,8 @@ impl Pcre2PlaceholderService {
         )
     }
 
+    // 引擎语义、精确目标、文本边界和当前规则都是一次保护操作的直接输入。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn protect_profile_with_cancellation<E>(
         &self,
         engine: RpgMakerEngine,

@@ -1909,7 +1909,7 @@ fn push_text_field(
     exact_location: RpgMakerLocation,
     original_text: &str,
 ) -> Result<(), SnapshotModelError> {
-    if is_structural_blank(&original_text) {
+    if is_structural_blank(original_text) {
         return Ok(());
     }
     fields.push(ExtractedTextUnit::new(

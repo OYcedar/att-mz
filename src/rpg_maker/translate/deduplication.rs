@@ -31,6 +31,8 @@ pub(crate) struct TranslationDeduplicationCandidate {
 }
 
 impl TranslationDeduplicationCandidate {
+    // 每项参数都是去重判断直接使用的候选事实；额外参数对象只会复制本结构。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         identity: TranslationUnitIdentity,
         protected_text: impl Into<String>,

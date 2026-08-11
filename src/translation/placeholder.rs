@@ -464,6 +464,8 @@ impl PlaceholderService {
     }
 
     /// 保护一个已经由引擎确认自然 ID 和 consumer 的精确 Unit。
+    // scope、自然 ID、文本边界和两类已编译规则都由引擎边界明确提供。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn protect_with_target_and_builtins_with_cancellation<E>(
         &self,
         scope: &str,
