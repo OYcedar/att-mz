@@ -145,8 +145,10 @@ Ownership 每行只含自然 ID、owner，以及 Rules 条目的自然规则序�
 
 Translation 每行含 `manual_id`、`source`、`translation`、`state`、`origin` 和 `type`；
 RPG Maker 另含 owner 和 Rules 的 `rule_number`。`state` 为 `pending`、`current` 或
-`rejected`，`origin` 为 `none`、`automatic` 或 `manual`。Rejected 的 `translation` 保留
-原候选 JSON；pending 为 `null`。输出不含数据库 ID、hash 或编码位置。
+`rejected`，`origin` 为 `none`、`automatic` 或 `manual`。只有 current 的 `translation` 是
+已经接受的 string array；pending 和 rejected 都是 `null`。Rejected 另含
+`rejected_candidate_json` string，逐字保存原候选 JSON 文本；该文本是诊断材料，不作为外层
+JSONL 的嵌套 JSON 解析。输出始终一行一条完整 JSON，不含数据库 ID、hash 或编码位置。
 
 ## 6. 运行文件
 

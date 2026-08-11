@@ -264,9 +264,8 @@ struct ManualOwnershipRecord<'a> {
 struct TranslationExportRecord<'a> {
     manual_id: &'a str,
     source: &'a [String],
-    translation: TranslationExportValue<'a>,
-    state: &'static str,
-    origin: &'static str,
+    #[serde(flatten)]
+    status: TranslationExportStatus<'a>,
     #[serde(rename = "type")]
     kind: ManualTranslationType,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -275,23 +274,22 @@ struct TranslationExportRecord<'a> {
     rule_number: Option<usize>,
 }
 
-enum TranslationExportValue<'a> {
-    Lines(&'a [String]),
-    Rejected(&'a serde_json::value::RawValue),
-    Null,
-}
-
-impl Serialize for TranslationExportValue<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        match self {
-            Self::Lines(lines) => lines.serialize(serializer),
-            Self::Rejected(candidate) => candidate.serialize(serializer),
-            Self::Null => serializer.serialize_none(),
-        }
-    }
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case", tag = "state")]
+enum TranslationExportStatus<'a> {
+    Current {
+        translation: &'a [String],
+        origin: &'static str,
+    },
+    Pending {
+        translation: (),
+        origin: &'static str,
+    },
+    Rejected {
+        translation: (),
+        origin: &'static str,
+        rejected_candidate_json: &'a str,
+    },
 }
 
 #[derive(Deserialize)]
@@ -628,31 +626,24 @@ fn export_translation_document_with_cancellation(
     let mut encoded = String::new();
     for entry in index.entries() {
         ensure_manual_document_running(cancellation)?;
-        let rejected_json = entry.rejected.as_ref().map(|rejected| {
-            serde_json::value::RawValue::from_string(rejected.candidate_json.clone())
-                .expect("数据库快照已校验 Rejected candidate_json")
-        });
-        let (translation, state, origin) = match (
+        let status = match (
             entry.current_translation.as_deref(),
             entry.origin,
-            rejected_json.as_deref(),
+            entry.rejected.as_ref(),
         ) {
-            (Some(translation), Some(origin), _) => (
-                TranslationExportValue::Lines(translation),
-                "current",
-                origin.as_str(),
-            ),
-            (None, None, Some(rejected)) => (
-                TranslationExportValue::Rejected(rejected),
-                "rejected",
-                entry
-                    .rejected
-                    .as_ref()
-                    .expect("已确认 Rejected 条目存在")
-                    .origin
-                    .as_str(),
-            ),
-            (None, None, None) => (TranslationExportValue::Null, "pending", "none"),
+            (Some(translation), Some(origin), _) => TranslationExportStatus::Current {
+                translation,
+                origin: origin.as_str(),
+            },
+            (None, None, Some(rejected)) => TranslationExportStatus::Rejected {
+                translation: (),
+                origin: rejected.origin.as_str(),
+                rejected_candidate_json: &rejected.candidate_json,
+            },
+            (None, None, None) => TranslationExportStatus::Pending {
+                translation: (),
+                origin: "none",
+            },
             _ => unreachable!("Manual 快照的译文、来源和 Rejected 状态必须一致"),
         };
         let (owner, rule_number) = match entry.rpg_maker_owner {
@@ -664,9 +655,7 @@ fn export_translation_document_with_cancellation(
             &serde_json::to_string(&TranslationExportRecord {
                 manual_id: &entry.id,
                 source: &entry.source,
-                translation,
-                state,
-                origin,
+                status,
                 kind: entry.kind,
                 owner,
                 rule_number,
@@ -3764,6 +3753,76 @@ mod tests {
                 "{\"manual_id\":\"plugins.js:Quest:Title\",\"owner\":\"rules\",\"rule_number\":7}\n",
             )
         );
+    }
+
+    #[test]
+    fn translation_export_keeps_rejected_candidates_opaque_and_one_record_per_line() {
+        const FORMATTED_DUPLICATE_CANDIDATE: &str =
+            "{\n  \"translation\": [\"候选\"],\n  \"translation\": null\n}";
+        let directory = tempfile::tempdir().expect("应建立 Translation export 测试目录");
+        let export = directory.path().join("translations.jsonl");
+
+        let mut current = indexed_entry(ManualTranslationType::Fixed, &["Current"]);
+        current.id = "Actors.json:1:name".to_owned();
+        current.current_translation = Some(vec!["当前译文".to_owned()]);
+        current.origin = Some(ManualTranslationOrigin::Automatic);
+
+        let mut pending = indexed_entry(ManualTranslationType::Fixed, &["Pending"]);
+        pending.id = "Actors.json:2:name".to_owned();
+
+        let mut rejected = indexed_entry(ManualTranslationType::Fixed, &["Rejected"]);
+        rejected.id = "Actors.json:3:name".to_owned();
+        rejected.rejected = Some(ManualRejectedCandidate {
+            origin: ManualTranslationOrigin::Automatic,
+            candidate_json: FORMATTED_DUPLICATE_CANDIDATE.to_owned(),
+            translation: None,
+            violation: ProvenInvariantViolation::InvalidCandidateShape,
+        });
+
+        let mut rejected_null = indexed_entry(ManualTranslationType::Fixed, &["Rejected null"]);
+        rejected_null.id = "Actors.json:4:name".to_owned();
+        rejected_null.rejected = Some(ManualRejectedCandidate {
+            origin: ManualTranslationOrigin::Automatic,
+            candidate_json: "null".to_owned(),
+            translation: None,
+            violation: ProvenInvariantViolation::InvalidCandidateShape,
+        });
+
+        let index = ManualTranslationIndex::new(vec![current, pending, rejected, rejected_null])
+            .expect("测试 ID 必须唯一");
+        let count = export_translation_document_with_cancellation(
+            &export,
+            &index,
+            &CooperativeCancellation::default(),
+        )
+        .expect("Translation export 应成功");
+
+        assert_eq!(count, 4);
+        let document = fs::read_to_string(&export).expect("Translation export 应可读取");
+        let lines = document.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 4);
+        let rows = lines
+            .iter()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).expect("每行必须是完整 JSON")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(rows[0]["state"], "current");
+        assert_eq!(rows[0]["translation"], serde_json::json!(["当前译文"]));
+        assert!(rows[0].get("rejected_candidate_json").is_none());
+        assert_eq!(rows[1]["state"], "pending");
+        assert!(rows[1]["translation"].is_null());
+        assert!(rows[1].get("rejected_candidate_json").is_none());
+        assert_eq!(rows[2]["state"], "rejected");
+        assert!(rows[2]["translation"].is_null());
+        assert_eq!(
+            rows[2]["rejected_candidate_json"].as_str(),
+            Some(FORMATTED_DUPLICATE_CANDIDATE)
+        );
+        assert_eq!(rows[3]["state"], "rejected");
+        assert!(rows[3]["translation"].is_null());
+        assert_eq!(rows[3]["rejected_candidate_json"].as_str(), Some("null"));
     }
 
     #[test]

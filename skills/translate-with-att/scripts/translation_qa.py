@@ -51,6 +51,7 @@ _EXPORT_FIELDS = {
     "type",
     "owner",
     "rule_number",
+    "rejected_candidate_json",
 }
 _REVIEW_EXAMPLE_LIMIT = 5
 
@@ -171,13 +172,15 @@ def _read_translation_export(path: Path) -> list[dict[str, JsonValue]]:
         kind = row.get("type")
         origin = row.get("origin")
         translation = row.get("translation")
+        has_rejected_candidate = "rejected_candidate_json" in row
+        rejected_candidate = row.get("rejected_candidate_json")
         if not isinstance(manual_id, str) or not manual_id or manual_id in seen:
             fail(str(source), f"第 {line_number} 行 manual_id 无效或重复", "重新执行 ATT translation export")
         if not isinstance(source_lines, list) or any(not isinstance(value, str) for value in source_lines):
             fail(str(source), f"{manual_id} 的 source 不是 string array", "重新执行 ATT translation export")
         if state not in {"current", "pending", "rejected"} or kind not in {"fixed", "free"}:
             fail(str(source), f"{manual_id} 的 state 或 type 无效", "重新执行 ATT translation export")
-        if not isinstance(origin, str):
+        if origin not in {"none", "automatic", "manual"}:
             fail(str(source), f"{manual_id} 的 origin 无效", "重新执行 ATT translation export")
         owner = row.get("owner")
         rule_number = row.get("rule_number")
@@ -191,10 +194,24 @@ def _read_translation_export(path: Path) -> list[dict[str, JsonValue]]:
         if state == "current":
             if not isinstance(translation, list) or any(not isinstance(value, str) for value in translation):
                 fail(str(source), f"{manual_id} 的 current translation 不是 string array", "重新导出当前项目")
-        elif state == "pending" and translation is not None:
-            fail(str(source), f"{manual_id} 的 pending translation 必须为 null", "重新导出当前项目")
-        elif state == "rejected" and translation is None:
-            fail(str(source), f"{manual_id} 缺少 Rejected candidate", "重新导出当前项目")
+            if origin not in {"automatic", "manual"}:
+                fail(str(source), f"{manual_id} 的 current origin 无效", "重新导出当前项目")
+            if has_rejected_candidate:
+                fail(str(source), f"{manual_id} 不应包含 rejected_candidate_json", "重新导出当前项目")
+        elif state == "pending":
+            if translation is not None:
+                fail(str(source), f"{manual_id} 的 pending translation 必须为 null", "重新导出当前项目")
+            if origin != "none":
+                fail(str(source), f"{manual_id} 的 pending origin 必须为 none", "重新导出当前项目")
+            if has_rejected_candidate:
+                fail(str(source), f"{manual_id} 不应包含 rejected_candidate_json", "重新导出当前项目")
+        else:
+            if translation is not None:
+                fail(str(source), f"{manual_id} 的 rejected translation 必须为 null", "重新导出当前项目")
+            if origin not in {"automatic", "manual"}:
+                fail(str(source), f"{manual_id} 的 rejected origin 无效", "重新导出当前项目")
+            if not isinstance(rejected_candidate, str) or not rejected_candidate:
+                fail(str(source), f"{manual_id} 缺少 rejected_candidate_json", "重新导出当前项目")
         seen.add(manual_id)
         rows.append(row)
     return rows
