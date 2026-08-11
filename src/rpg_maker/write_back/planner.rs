@@ -1772,13 +1772,13 @@ impl ReplaceDialogueMutation {
                 violation: WriteBackDialoguePlanViolation::UnexpectedBodyTranslation,
             });
         }
-        if let Some(lines) = &body_lines {
-            if lines.is_empty() {
-                return Err(RpgMakerWriteBackMutationPlanError::InvalidDialogue {
-                    group_location: Box::new(recipe.group_location().clone()),
-                    violation: WriteBackDialoguePlanViolation::EmptyBodyLines,
-                });
-            }
+        if let Some(lines) = &body_lines
+            && lines.is_empty()
+        {
+            return Err(RpgMakerWriteBackMutationPlanError::InvalidDialogue {
+                group_location: Box::new(recipe.group_location().clone()),
+                violation: WriteBackDialoguePlanViolation::EmptyBodyLines,
+            });
         }
         if body_lines.as_ref().map(Vec::len) != body_line_sources.as_ref().map(Vec::len) {
             return Err(RpgMakerWriteBackMutationPlanError::InvalidDialogue {
