@@ -9,6 +9,8 @@ import sys
 from pathlib import Path
 from typing import cast
 
+# Skill 目录是发行资源，入口进程不得把解释器缓存写回包内。
+sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "_shared"))
 
 from att_skill_tools import (

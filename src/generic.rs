@@ -17,11 +17,14 @@ pub(crate) use placeholder::{
     GenericCompiledPlaceholderRules, GenericPlaceholderError, GenericPlaceholderService,
     GenericProtectedText, validate_translation_placeholders_with_cancellation,
 };
+#[cfg(test)]
+pub(crate) use project::create_current_generic_schema_for_test;
 pub(crate) use project::{
     CommitTranslationResultsOutcome, CommitTranslationsOutcome, ExtractOutcome, GenericInitRequest,
     GenericProject, GenericProjectError, GenericProjectStore, GenericStoredSnapshot,
     RejectedTranslationWrite, TranslationWrite,
     ensure_input_fingerprints_current_with_cancellation,
+    validate_current_generic_schema_with_cancellation,
 };
 pub(crate) use task_record::{GenericTaskRecordDocument, GenericTaskRecordState};
 pub(crate) use translate::{

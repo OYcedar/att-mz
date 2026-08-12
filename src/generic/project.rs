@@ -163,6 +163,13 @@ const CREATE_INITIAL_SCHEMA_SQL: &str = "CREATE TABLE generic_project (
               INSERT INTO translation_resource (resource_kind, canonical_json)
               VALUES ('terminology', '[]'), ('placeholder_rules', '[]'),
                      ('write_back_layout_rules', '[]');";
+
+#[cfg(test)]
+pub(crate) fn create_current_generic_schema_for_test(
+    connection: &Connection,
+) -> Result<(), rusqlite::Error> {
+    connection.execute_batch(CREATE_INITIAL_SCHEMA_SQL)
+}
 const SELECT_GENERIC_ATT_SCHEMA: &str = "SELECT type, name, tbl_name, sql
     FROM main.sqlite_schema
     WHERE sql IS NOT NULL
@@ -598,6 +605,7 @@ pub(crate) struct RejectedTranslationWrite {
     pub(crate) expected_source_text: String,
     pub(crate) source: Vec<String>,
     pub(crate) expected_group_context: Sha256Fingerprint,
+    pub(crate) expected_manual_applicability: Sha256Fingerprint,
     pub(crate) candidate_json: String,
     pub(crate) translation: Option<Vec<String>>,
     pub(crate) violation: ProvenInvariantViolation,
@@ -1320,12 +1328,17 @@ impl GenericProjectStore {
                                    SELECT 1 FROM generic_manual_translation AS manual
                                    WHERE manual.group_id = unit.group_id
                                      AND manual.unit_id = unit.unit_id
+                                     AND manual.applicability_fingerprint = ?5
                                )",
                             params![
                                 rejection.group_id,
                                 rejection.unit_id,
                                 rejection.expected_source_text,
                                 rejection.expected_group_context.as_bytes().as_slice(),
+                                rejection
+                                    .expected_manual_applicability
+                                    .as_bytes()
+                                    .as_slice(),
                             ],
                             |row| row.get(0),
                         )
@@ -6678,14 +6691,22 @@ mod tests {
         let group = &snapshot.files()[0].groups()[0];
         let unit = &group.units()[0];
         let state = Sha256Fingerprint::from_bytes([42; 32]);
+        let source_lines = vec![unit.source_text().to_owned()];
         let rejected = RejectedTranslationWrite {
             group_id: group.id().to_owned(),
             unit_id: unit.id().to_owned(),
             readable_id: "input.jsonl:line1:unit1:text".to_owned(),
             origin: TranslationOrigin::Automatic,
             expected_source_text: unit.source_text().to_owned(),
-            source: vec![unit.source_text().to_owned()],
+            source: source_lines.clone(),
             expected_group_context: group.context_fingerprint(),
+            expected_manual_applicability: crate::manual::generic_manual_applicability(
+                group.id(),
+                unit.id(),
+                "text.jsonl",
+                group.kind(),
+                &source_lines,
+            ),
             candidate_json: "{\"wrong\":true}".to_owned(),
             translation: None,
             violation: ProvenInvariantViolation::InvalidCandidateShape,
@@ -6753,6 +6774,126 @@ mod tests {
         let unit = &snapshot.files()[0].groups()[0].units()[0];
         assert_eq!(unit.translation().unwrap().translation(), "译文");
         assert!(unit.rejected().is_none());
+    }
+
+    #[test]
+    fn stale_manual_translation_does_not_block_current_rejected_candidate() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let workspace = temp.path().join("project");
+        write_source(
+            &source,
+            "{\"id\":\"g\",\"kind\":\"k\",\"units\":[{\"id\":\"u\",\"text\":\"旧原文\"}]}\n",
+        );
+        let store = init(&workspace, &source);
+        store.extract().unwrap();
+        let snapshot = store.load_snapshot().unwrap();
+        let group = &snapshot.files()[0].groups()[0];
+        let unit = &group.units()[0];
+        let old_source = vec![unit.source_text().to_owned()];
+        let old_applicability = crate::manual::generic_manual_applicability(
+            group.id(),
+            unit.id(),
+            "text.jsonl",
+            group.kind(),
+            &old_source,
+        );
+        let connection = Connection::open(&store.database_path).unwrap();
+        crate::manual::apply_generic_manual_translations(
+            &connection,
+            &[crate::manual::ValidatedManualTranslation {
+                id: "text.jsonl:line1:unit1:text".to_owned(),
+                kind: crate::manual::ManualTranslationType::Free,
+                source: old_source,
+                translation: vec!["旧译文".to_owned()],
+                locator: crate::manual::ManualTranslationLocator::Generic {
+                    group_id: group.id().to_owned(),
+                    unit_id: unit.id().to_owned(),
+                },
+                applicability: old_applicability,
+            }],
+        )
+        .unwrap();
+        drop(connection);
+
+        let current_rejection = RejectedTranslationWrite {
+            group_id: group.id().to_owned(),
+            unit_id: unit.id().to_owned(),
+            readable_id: "text.jsonl:line1:unit1:text".to_owned(),
+            origin: TranslationOrigin::Automatic,
+            expected_source_text: unit.source_text().to_owned(),
+            source: vec![unit.source_text().to_owned()],
+            expected_group_context: group.context_fingerprint(),
+            expected_manual_applicability: old_applicability,
+            candidate_json: "{\"wrong\":true}".to_owned(),
+            translation: None,
+            violation: ProvenInvariantViolation::InvalidCandidateShape,
+            planning_state: Sha256Fingerprint::from_bytes([41; 32]),
+        };
+        let current_outcome = store
+            .commit_translation_results_for_profile(
+                snapshot.project().extracted_raw_fingerprint().unwrap(),
+                &[],
+                &[current_rejection],
+                "primary",
+            )
+            .unwrap();
+        assert_eq!(current_outcome.rejected, 0);
+        assert_eq!(
+            current_outcome.conflicts,
+            [(group.id().to_owned(), unit.id().to_owned())],
+            "当前人工译文仍必须阻止模型候选覆盖该 Unit"
+        );
+
+        write_source(
+            &source,
+            "{\"id\":\"g\",\"kind\":\"k\",\"units\":[{\"id\":\"u\",\"text\":\"新原文\"}]}\n",
+        );
+        store.extract().unwrap();
+        let snapshot = store.load_snapshot().unwrap();
+        let group = &snapshot.files()[0].groups()[0];
+        let unit = &group.units()[0];
+        assert!(unit.translation().is_none(), "旧人工译文必须已经过期");
+        let source_lines = vec![unit.source_text().to_owned()];
+        let rejected = RejectedTranslationWrite {
+            group_id: group.id().to_owned(),
+            unit_id: unit.id().to_owned(),
+            readable_id: "text.jsonl:line1:unit1:text".to_owned(),
+            origin: TranslationOrigin::Automatic,
+            expected_source_text: unit.source_text().to_owned(),
+            source: source_lines.clone(),
+            expected_group_context: group.context_fingerprint(),
+            expected_manual_applicability: crate::manual::generic_manual_applicability(
+                group.id(),
+                unit.id(),
+                "text.jsonl",
+                group.kind(),
+                &source_lines,
+            ),
+            candidate_json: "{\"wrong\":true}".to_owned(),
+            translation: None,
+            violation: ProvenInvariantViolation::InvalidCandidateShape,
+            planning_state: Sha256Fingerprint::from_bytes([42; 32]),
+        };
+
+        let outcome = store
+            .commit_translation_results_for_profile(
+                snapshot.project().extracted_raw_fingerprint().unwrap(),
+                &[],
+                &[rejected],
+                "primary",
+            )
+            .unwrap();
+        assert_eq!(outcome.rejected, 1);
+        assert!(outcome.conflicts.is_empty());
+        let snapshot = store.load_snapshot().unwrap();
+        assert!(
+            snapshot.files()[0].groups()[0].units()[0]
+                .rejected()
+                .is_some(),
+            "当前 Rejected 候选必须在过期人工记录存在时仍可保存"
+        );
     }
 
     #[test]

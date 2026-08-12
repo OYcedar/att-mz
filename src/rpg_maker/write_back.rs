@@ -696,7 +696,6 @@ mod tests {
         let summary = RpgMakerWriteBackSummary {
             translated_units: 2,
             original_units: 1,
-            ..RpgMakerWriteBackSummary::default()
         };
         WriteBackService::new(
             FakeProjectOpener {

@@ -15,23 +15,27 @@ use std::thread;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, HANDLE};
+use windows_sys::Win32::Foundation::{
+    ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, GENERIC_WRITE, HANDLE,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_CASE_SENSITIVE_INFO,
     FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
     FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FileCaseSensitiveInfo, FileDispositionInfo, FileIdInfo, FileRenameInfo, GetDriveTypeW,
-    GetFileInformationByHandle, GetFileInformationByHandleEx, GetVolumeInformationByHandleW,
-    GetVolumePathNameW, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
-    SetFileInformationByHandle, UnlockFileEx,
+    FileCaseSensitiveInfo, FileDispositionInfo, FileIdInfo, FileRenameInfo, FileRenameInfoEx,
+    GetDriveTypeW, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    GetVolumeInformationByHandleW, GetVolumePathNameW, LOCKFILE_EXCLUSIVE_LOCK,
+    LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, SetFileInformationByHandle, UnlockFileEx,
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 use windows_sys::Win32::System::SystemServices::FILE_CS_FLAG_CASE_SENSITIVE_DIR;
-use windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED;
+use windows_sys::Win32::System::WindowsProgramming::{
+    DRIVE_FIXED, FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
+};
 
 use crate::diagnostic::{
-    Diagnostic, FileSystemDiagnosticContext, FileSystemIssue, FileSystemProblem, IoFailure,
-    SafePath, SafeText,
+    Diagnostic, FileSystemDiagnosticContext, FileSystemIssue, FileSystemProblem,
+    FileSystemRecoveryViolation, IoFailure, SafePath, SafeText,
 };
 
 /// Win32 文件系统边界保留的精确失败。
@@ -96,8 +100,10 @@ impl WindowsFsError {
             Self::RenameTargetExists { path } => FileSystemProblem::TargetExists {
                 path: SafePath::new(path),
             },
-            Self::RenameTargetUnconfirmed { path } => FileSystemProblem::IdentityChanged {
-                path: SafePath::new(path),
+            Self::RenameTargetUnconfirmed { path } => FileSystemProblem::OutcomeUnknown {
+                target_root: SafePath::new(path),
+                artifacts: Vec::new(),
+                violation: FileSystemRecoveryViolation::TargetIdentityUnknown,
             },
             Self::FileIdentityChanged { path } => FileSystemProblem::IdentityChanged {
                 path: SafePath::new(path),
@@ -730,30 +736,226 @@ pub(crate) fn rename_without_replace_if_identity(
     target: &Path,
     expected: FileIdentity,
 ) -> Result<(), WindowsFsError> {
+    rename_if_identity(source, target, expected, None)
+}
+
+/// 为单文件原子替换独占建立一个新候选，并预先取得后续句柄删除所需权限。
+///
+/// 句柄存活期间不共享读、写或删除，避免候选在写入、读取 file ID 或失败清理之间
+/// 被另一个进程改写或换走。调用方必须把此句柄直接交给
+/// [`rename_open_atomic_replace_candidate_without_replace`] 或
+/// [`rename_open_atomic_replace_candidate_with_replace`]；不能在重命名前释放后再按路径打开。
+pub(crate) fn create_new_atomic_replace_candidate(path: &Path) -> Result<File, WindowsFsError> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .access_mode(GENERIC_WRITE | FILE_READ_ATTRIBUTES | DELETE)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|source| io_error("建立原子替换候选", path, source))
+}
+
+/// 通过调用方仍持有的精确文件句柄删除新建候选，不再按路径选择删除对象。
+pub(crate) fn delete_open_atomic_replace_candidate(
+    file: &File,
+    path: &Path,
+) -> Result<(), WindowsFsError> {
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: 句柄以 DELETE 权限创建，结构地址、大小和对齐在同步调用期间有效。
+    let deleted = unsafe {
+        SetFileInformationByHandle(
+            handle(file),
+            FileDispositionInfo,
+            (&raw const disposition).cast(),
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+    if deleted == 0 {
+        return Err(io_error(
+            "按已打开句柄删除原子替换候选",
+            path,
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+/// 仅当来源和目标仍是调用方确认的 file ID 时原子替换目标路径。
+///
+/// 本函数在紧邻内核替换的位置确认目标身份，并持续持有该目标句柄；来源则完全通过
+/// 已确认身份的文件句柄重命名。父目录由调用方和本函数共同固定，目标名称始终解析在
+/// 同一个已确认目录内。
+#[cfg(test)]
+pub(crate) fn rename_with_replace_if_identity(
+    source: &Path,
+    target: &Path,
+    expected_source: FileIdentity,
+    expected_target: FileIdentity,
+) -> Result<(), WindowsFsError> {
+    rename_if_identity(source, target, expected_source, Some(expected_target))
+}
+
+/// 已打开候选的重命名失败。
+///
+/// `candidate` 只在内核尚未接受重命名时存在，调用方可继续通过同一个独占句柄精确清理。
+/// 内核接受重命名后若无法确认目标，候选已经没有可安全清理的确定位置，因此该字段为空。
+#[derive(Debug)]
+pub(crate) struct OpenAtomicReplaceRenameError {
+    source: WindowsFsError,
+    candidate: Option<File>,
+}
+
+impl OpenAtomicReplaceRenameError {
+    pub(crate) fn into_parts(self) -> (WindowsFsError, Option<File>) {
+        (self.source, self.candidate)
+    }
+}
+
+/// 持续持有最初独占建立的候选句柄，完成无覆盖原子发布。
+pub(crate) fn rename_open_atomic_replace_candidate_without_replace(
+    source_file: File,
+    source: &Path,
+    target: &Path,
+    expected_source: FileIdentity,
+) -> Result<(), OpenAtomicReplaceRenameError> {
+    rename_open_atomic_replace_candidate(source_file, source, target, expected_source, None)
+}
+
+/// 持续持有最初独占建立的候选句柄，仅替换调用方确认身份的目标。
+pub(crate) fn rename_open_atomic_replace_candidate_with_replace(
+    source_file: File,
+    source: &Path,
+    target: &Path,
+    expected_source: FileIdentity,
+    expected_target: FileIdentity,
+) -> Result<(), OpenAtomicReplaceRenameError> {
+    rename_open_atomic_replace_candidate(
+        source_file,
+        source,
+        target,
+        expected_source,
+        Some(expected_target),
+    )
+}
+
+fn rename_open_atomic_replace_candidate(
+    source_file: File,
+    source: &Path,
+    target: &Path,
+    expected: FileIdentity,
+    expected_target: Option<FileIdentity>,
+) -> Result<(), OpenAtomicReplaceRenameError> {
+    let renamed = bind_rename(source, target, expected_target)
+        .and_then(|bound| rename_bound_source(&source_file, source, target, expected, &bound));
+    if let Err(source) = renamed {
+        return Err(OpenAtomicReplaceRenameError {
+            source,
+            candidate: Some(source_file),
+        });
+    }
+    drop(source_file);
+    confirm_renamed_identity(target, expected).map_err(|source| OpenAtomicReplaceRenameError {
+        source,
+        candidate: None,
+    })
+}
+
+fn rename_if_identity(
+    source: &Path,
+    target: &Path,
+    expected: FileIdentity,
+    expected_target: Option<FileIdentity>,
+) -> Result<(), WindowsFsError> {
+    let bound = bind_rename(source, target, expected_target)?;
+    let source_file = OpenOptions::new()
+        .access_mode(DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(source)
+        .map_err(|source_error| io_error("打开待重命名对象", source, source_error))?;
+    rename_bound_source(&source_file, source, target, expected, &bound)?;
+    drop(source_file);
+    confirm_renamed_identity(target, expected)
+}
+
+struct BoundRename {
+    _source_parent: PinnedPath,
+    _target_parent: PinnedPath,
+    _target: Option<File>,
+    replace: bool,
+    operation: &'static str,
+}
+
+fn bind_rename(
+    source: &Path,
+    target: &Path,
+    expected_target: Option<FileIdentity>,
+) -> Result<BoundRename, WindowsFsError> {
+    let operation = if expected_target.is_some() {
+        "原子替换"
+    } else {
+        "无覆盖重命名"
+    };
     let source_parent_path = source.parent().ok_or_else(|| {
         io_error(
-            "无覆盖重命名",
+            operation,
             source,
             io::Error::new(io::ErrorKind::InvalidInput, "来源路径没有父目录"),
         )
     })?;
     let target_parent_path = target.parent().ok_or_else(|| {
         io_error(
-            "无覆盖重命名",
+            operation,
             target,
             io::Error::new(io::ErrorKind::InvalidInput, "目标路径没有父目录"),
         )
     })?;
-    let _source_parent = pin_directory_without_reparse(source_parent_path)?;
-    let _target_parent = pin_directory_without_reparse(target_parent_path)?;
-    let source_file = OpenOptions::new()
-        .access_mode(DELETE)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(source)
-        .map_err(|source_error| io_error("打开待重命名对象", source, source_error))?;
-    reject_reparse(&source_file, source)?;
-    let actual = FileIdentity::of(&source_file, source)?;
+    let source_parent = pin_directory_without_reparse(source_parent_path)?;
+    let target_parent = pin_directory_without_reparse(target_parent_path)?;
+    let pinned_target = if let Some(expected_target) = expected_target {
+        let pinned = match OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES | DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(target)
+        {
+            Ok(pinned) => pinned,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                return Err(WindowsFsError::FileIdentityChanged {
+                    path: target.to_path_buf(),
+                });
+            }
+            Err(source) => return Err(io_error("打开待替换目标", target, source)),
+        };
+        reject_reparse(&pinned, target)?;
+        if FileIdentity::of(&pinned, target)? != expected_target {
+            return Err(WindowsFsError::FileIdentityChanged {
+                path: target.to_path_buf(),
+            });
+        }
+        Some(pinned)
+    } else {
+        None
+    };
+    Ok(BoundRename {
+        _source_parent: source_parent,
+        _target_parent: target_parent,
+        _target: pinned_target,
+        replace: expected_target.is_some(),
+        operation,
+    })
+}
+
+fn rename_bound_source(
+    source_file: &File,
+    source: &Path,
+    target: &Path,
+    expected: FileIdentity,
+    bound: &BoundRename,
+) -> Result<(), WindowsFsError> {
+    reject_reparse(source_file, source)?;
+    let actual = FileIdentity::of(source_file, source)?;
     if actual != expected {
         return Err(WindowsFsError::FileIdentityChanged {
             path: source.to_path_buf(),
@@ -771,7 +973,12 @@ pub(crate) fn rename_without_replace_if_identity(
     let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
     // SAFETY: `storage` 按 `FILE_RENAME_INFO` 对齐，容量覆盖结构头和全部 UTF-16 单元。
     unsafe {
-        (*info).Anonymous.ReplaceIfExists = false;
+        if bound.replace {
+            (*info).Anonymous.Flags =
+                FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+        } else {
+            (*info).Anonymous.ReplaceIfExists = false;
+        }
         // SetFileInformationByHandle 在目标名使用 Win32 绝对路径时要求根句柄为空。
         // `_target_parent` 仍被持有，用于防止目标父链在该同步调用期间被替换。
         (*info).RootDirectory = ptr::null_mut();
@@ -785,27 +992,32 @@ pub(crate) fn rename_without_replace_if_identity(
     // SAFETY: 源句柄在同步调用期间保持有效，`storage` 的生命周期覆盖整个调用。
     let renamed = unsafe {
         SetFileInformationByHandle(
-            handle(&source_file),
-            FileRenameInfo,
+            handle(source_file),
+            if bound.replace {
+                FileRenameInfoEx
+            } else {
+                FileRenameInfo
+            },
             storage.as_ptr().cast(),
             buffer_bytes as u32,
         )
     };
     if renamed == 0 {
         let source_error = io::Error::last_os_error();
-        if matches!(source_error.kind(), io::ErrorKind::AlreadyExists) {
+        if !bound.replace && matches!(source_error.kind(), io::ErrorKind::AlreadyExists) {
             return Err(WindowsFsError::RenameTargetExists {
                 path: target.to_path_buf(),
             });
         }
-        return Err(io_error("无覆盖重命名", target, source_error));
+        return Err(io_error(bound.operation, target, source_error));
     }
+    Ok(())
+}
 
-    // SetFileInformationByHandle 成功只证明内核已经接受重命名。先关闭执行重命名的
-    // 句柄，再从目标路径重新打开同一文件身份，调用方随后触发进程故障时才不会把
-    // 一个尚未可见的候选误判成“从未移动”。成功调用之后的任何确认失败都属于
-    // 结果未知，不能伪装成普通的重命名前 I/O 失败并清理恢复现场。
-    drop(source_file);
+fn confirm_renamed_identity(target: &Path, expected: FileIdentity) -> Result<(), WindowsFsError> {
+    // 调用方已在 SetFileInformationByHandle 成功后关闭执行重命名的句柄。此处从目标
+    // 路径重新打开同一文件身份，调用方随后触发进程故障时才不会把一个尚未可见的候选
+    // 误判成“从未移动”。成功调用之后的任何确认失败都属于结果未知，不能清理恢复现场。
     let confirmed = OpenOptions::new()
         .access_mode(FILE_READ_ATTRIBUTES)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
@@ -995,6 +1207,70 @@ mod tests {
         assert_eq!(
             fs::read(target.join("value.txt")).expect("应该可读取发布内容"),
             b"new"
+        );
+    }
+
+    #[test]
+    fn identity_checked_rename_rejects_a_candidate_open_for_concurrent_write() {
+        let temporary = tempfile::tempdir().expect("应该可创建临时目录");
+        let source = temporary.path().join("candidate.txt");
+        let target = temporary.path().join("published.txt");
+        fs::write(&source, b"fixed content").expect("应该可创建候选文件");
+        let source_handle = File::open(&source).expect("应该可读取候选文件");
+        let expected = FileIdentity::of(&source_handle, &source).expect("应该可取得候选身份");
+        drop(source_handle);
+        let concurrent_writer = OpenOptions::new()
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&source)
+            .expect("应该可模拟已经打开的并发写入者");
+
+        let error = rename_without_replace_if_identity(&source, &target, expected)
+            .expect_err("候选仍向其他句柄开放写入时不得发布");
+
+        assert!(matches!(
+            error,
+            WindowsFsError::Io { source, .. }
+                if source.raw_os_error().map(|code| code as u32)
+                    == Some(ERROR_SHARING_VIOLATION)
+        ));
+        drop(concurrent_writer);
+        assert_eq!(fs::read(&source).expect("原候选必须保留"), b"fixed content");
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn open_atomic_replace_candidate_stays_exclusive_until_rename() {
+        let temporary = tempfile::tempdir().expect("应该可创建临时目录");
+        let source = temporary.path().join("candidate.txt");
+        let target = temporary.path().join("published.txt");
+        let mut source_file =
+            create_new_atomic_replace_candidate(&source).expect("应该可独占建立候选文件");
+        std::io::Write::write_all(&mut source_file, b"fixed content").expect("应该可写入候选内容");
+        source_file.sync_all().expect("应该可同步候选内容");
+        let expected = FileIdentity::of(&source_file, &source).expect("应该可取得候选身份");
+
+        let writer_error = OpenOptions::new()
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&source)
+            .expect_err("原始候选句柄存活时不得出现第二个写入者");
+        assert_eq!(
+            writer_error.raw_os_error().map(|code| code as u32),
+            Some(ERROR_SHARING_VIOLATION)
+        );
+
+        rename_open_atomic_replace_candidate_without_replace(
+            source_file,
+            &source,
+            &target,
+            expected,
+        )
+        .expect("应该直接通过最初的独占句柄发布候选");
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read(&target).expect("应该可读取发布内容"),
+            b"fixed content"
         );
     }
 
