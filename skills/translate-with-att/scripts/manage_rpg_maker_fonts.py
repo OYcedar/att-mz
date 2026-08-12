@@ -60,11 +60,11 @@ def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = ToolArgumentParser(description="递归调查并可逆替换 RPG Maker MV/MZ 的完整字体引用。")
+    parser = ToolArgumentParser(description="递归调查并可逆替换 RPG Maker MV/MZ 字体资源。")
     commands = parser.add_subparsers(dest="command", required=True)
     inspect = commands.add_parser("inspect", help="只读生成完整引用、动态 Review 和字符覆盖报告")
     _add_plan_arguments(inspect)
-    apply = commands.add_parser("apply", help="保存前后字节 state 后自动替换全部已证明的完整引用")
+    apply = commands.add_parser("apply", help="保存前后字节 state 后替换已证明资源并保留注册别名")
     _add_plan_arguments(apply)
     apply.add_argument("--state", type=Path, required=True, help="新建的可逆事务 state 目录")
     restore = commands.add_parser("restore", help="当前字节未漂移时恢复 apply 前的逐字节内容")
@@ -177,7 +177,8 @@ def _font_report(plan: FontPlan, *, applied: bool) -> dict[str, JsonValue]:
         "review_required": bool(reviews),
         "no_op": not plan.mutations,
         "interpretation": (
-            "confirmed_references 会在 apply 中全部自动处理；review 只包含动态、无法解析或未证明消费者的字体事实。"
+            "apply 会处理 confirmed_references 指向的字体资源并保留已注册运行时别名；"
+            "review 只包含动态、无法解析或未证明消费者的字体事实。"
         ),
     }
 

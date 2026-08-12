@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, TextIO, cast
@@ -62,7 +62,12 @@ def _parser() -> argparse.ArgumentParser:
             action="store_true",
             help="确认 --game 是可丢弃副本，不是源游戏或唯一成品",
         )
-        command.add_argument("--startup-timeout", type=float, default=30.0, help="等待 CDP 启动的秒数")
+        command.add_argument(
+            "--startup-timeout",
+            type=float,
+            default=75.0,
+            help="等待 CDP 和游戏离开启动场景的秒数；默认覆盖 MV 的 60 秒字体失败窗口",
+        )
 
     smoke = commands.add_parser("smoke", help="不注入键盘地检查预定义标题、菜单和游戏场景")
     add_common(smoke)
@@ -196,11 +201,54 @@ def _wait_for_observer(connection: CdpConnection, timeout: float) -> dict[str, o
         if result.get("installed") is True:
             return result
         time.sleep(0.05)
-    raise CdpUnavailableError("页面 reload 后观察器没有建立")
+    raise CdpUnavailableError("页面观察器没有建立")
 
 
 def _take_events(connection: CdpConnection) -> list[dict[str, object]]:
     return _event_list(connection.evaluate("__ATT_NW_OBSERVER__.take()"))
+
+
+def _take_runtime_errors(connection: CdpConnection) -> list[dict[str, object]]:
+    return _event_list(connection.evaluate("__ATT_NW_OBSERVER__.takeErrors()"))
+
+
+@dataclass(frozen=True, slots=True)
+class StartupObservation:
+    status: str
+    scene: str
+    wait_seconds: float
+    runtime_errors: tuple[dict[str, object], ...]
+
+
+def wait_for_runtime_start(
+    connection: CdpConnection,
+    *,
+    timeout: float,
+    process_exited: Callable[[], bool],
+    poll_seconds: float = 0.05,
+) -> StartupObservation:
+    """等待游戏离开 Scene_Boot，或取得阻止正常启动的直接证据。"""
+
+    started = time.monotonic()
+    deadline = started + timeout
+    runtime_errors: list[dict[str, object]] = []
+    scene = ""
+    while True:
+        elapsed = time.monotonic() - started
+        if process_exited():
+            return StartupObservation("process_exited", scene, elapsed, tuple(runtime_errors))
+        runtime_errors.extend(_take_runtime_errors(connection))
+        state = _mapping(connection.evaluate("({scene:__ATT_NW_OBSERVER__.scene()})"))
+        value = state.get("scene")
+        scene = value if isinstance(value, str) else ""
+        elapsed = time.monotonic() - started
+        if runtime_errors:
+            return StartupObservation("runtime_error", scene, elapsed, tuple(runtime_errors))
+        if scene and scene != "Scene_Boot":
+            return StartupObservation("ready", scene, elapsed, ())
+        if elapsed >= timeout:
+            return StartupObservation("timed_out", scene, elapsed, ())
+        time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
 
 
 @dataclass(slots=True)
@@ -211,6 +259,7 @@ class _ObservationStats:
     requested_font_not_loaded_count: int = 0
     measurement_unverified_count: int = 0
     glyph_fallback_unverified: bool = False
+    runtime_error_count: int = 0
     message_draw_observed: bool = False
     scene_and_context: set[str] = field(default_factory=set)
 
@@ -287,6 +336,20 @@ def _record_events(work: Path, events: list[dict[str, object]], stats: _Observat
             font_handle,
         ):
             handle.flush()
+
+
+def _record_runtime_errors(
+    work: Path,
+    errors: list[dict[str, object]] | tuple[dict[str, object], ...],
+    stats: _ObservationStats,
+) -> None:
+    if not errors:
+        return
+    with (work / "runtime-errors.jsonl").open("a", encoding="utf-8", newline="\n") as handle:
+        for error in errors:
+            _write_event(handle, error)
+            stats.runtime_error_count += 1
+        handle.flush()
 
 
 def _scenario_status(
@@ -411,48 +474,103 @@ def main() -> int:
         connection = candidate_connection
         connection.call("Runtime.enable")
         connection.call("Page.enable")
-        connection.call("Page.addScriptToEvaluateOnNewDocument", {"source": OBSERVER_SCRIPT})
-        connection.call("Page.reload", {"ignoreCache": True})
+        connection.evaluate(OBSERVER_SCRIPT)
         installation = _wait_for_observer(connection, startup_timeout)
 
         stats = _ObservationStats()
         scenarios: list[dict[str, object]] = []
         observation_stop: str | None = None
+        startup = wait_for_runtime_start(
+            connection,
+            timeout=startup_timeout,
+            process_exited=lambda: _owned_process_exited(process),
+        )
+        _record_runtime_errors(work, startup.runtime_errors, stats)
+        startup_screenshot: str | None = None
+        if startup.status != "ready" and process.poll() is None:
+            startup_screenshot = "screenshots/00-startup.png"
+            files[startup_screenshot] = _capture_screenshot(connection)
         observation_started = time.monotonic()
         if mode == "smoke":
-            for index, name in enumerate(_SCENARIOS, start=1):
-                action = scenario_action(connection, name)
-                time.sleep(settle_ms / 1000.0)
-                events = _take_events(connection)
-                _record_events(work, events, stats)
-                status, evidence = _scenario_status(name, action, stats)
-                screenshot_name = f"screenshots/{index:02d}-{name}.png"
-                files[screenshot_name] = _capture_screenshot(connection)
-                scenarios.append(
-                    {
-                        "name": name,
-                        "status": status,
-                        "evidence": evidence,
-                        "action": action,
-                        "observed_draws": len(events),
-                        "screenshot": screenshot_name,
-                    }
-                )
+            if startup.status != "ready":
+                reason = {
+                    "runtime_error": "启动阶段发生运行时错误",
+                    "timed_out": "游戏没有在时限内离开启动场景",
+                    "process_exited": "游戏进程在启动完成前退出",
+                }.get(startup.status, "游戏没有完成启动")
+                for name in _SCENARIOS:
+                    scenarios.append(
+                        {
+                            "name": name,
+                            "status": "unverified",
+                            "evidence": reason,
+                            "action": {"supported": False, "reason": f"startup_{startup.status}"},
+                            "observed_draws": 0,
+                            "screenshot": None,
+                        }
+                    )
+            else:
+                for index, name in enumerate(_SCENARIOS, start=1):
+                    action = scenario_action(connection, name)
+                    time.sleep(settle_ms / 1000.0)
+                    events = _take_events(connection)
+                    _record_events(work, events, stats)
+                    runtime_errors = _take_runtime_errors(connection)
+                    _record_runtime_errors(work, runtime_errors, stats)
+                    status, evidence = _scenario_status(name, action, stats)
+                    if runtime_errors:
+                        status = "unverified"
+                        evidence = "场景执行期间发生运行时错误"
+                    screenshot_name = f"screenshots/{index:02d}-{name}.png"
+                    files[screenshot_name] = _capture_screenshot(connection)
+                    scenarios.append(
+                        {
+                            "name": name,
+                            "status": status,
+                            "evidence": evidence,
+                            "action": action,
+                            "observed_draws": len(events),
+                            "screenshot": screenshot_name,
+                        }
+                    )
+                    if runtime_errors:
+                        for remaining in _SCENARIOS[index:]:
+                            scenarios.append(
+                                {
+                                    "name": remaining,
+                                    "status": "unverified",
+                                    "evidence": "前一场景发生运行时错误，未继续执行",
+                                    "action": {"supported": False, "reason": "runtime_error"},
+                                    "observed_draws": 0,
+                                    "screenshot": None,
+                                }
+                            )
+                        break
         else:
-            deadline = None if duration is None else time.monotonic() + duration
-            try:
-                while process.poll() is None and (deadline is None or time.monotonic() < deadline):
-                    wait = 0.5 if deadline is None else min(0.5, max(0.0, deadline - time.monotonic()))
-                    time.sleep(wait)
+            if startup.status != "ready":
+                observation_stop = f"startup_{startup.status}"
+            else:
+                deadline = None if duration is None else time.monotonic() + duration
+                try:
+                    while process.poll() is None and (deadline is None or time.monotonic() < deadline):
+                        wait = 0.5 if deadline is None else min(0.5, max(0.0, deadline - time.monotonic()))
+                        time.sleep(wait)
+                        _record_events(work, _take_events(connection), stats)
+                        runtime_errors = _take_runtime_errors(connection)
+                        _record_runtime_errors(work, runtime_errors, stats)
+                        if runtime_errors:
+                            observation_stop = "runtime_error"
+                            break
+                except KeyboardInterrupt:
+                    observation_stop = "keyboard_interrupt"
+                if observation_stop is None:
+                    observation_stop = "game_closed" if process.poll() is not None else "duration_elapsed"
+                if process.poll() is None:
                     _record_events(work, _take_events(connection), stats)
-            except KeyboardInterrupt:
-                observation_stop = "keyboard_interrupt"
-            if observation_stop is None:
-                observation_stop = "game_closed" if process.poll() is not None else "duration_elapsed"
-            if process.poll() is None:
-                _record_events(work, _take_events(connection), stats)
-                files["screenshots/final.png"] = _capture_screenshot(connection)
+                    _record_runtime_errors(work, _take_runtime_errors(connection), stats)
+                    files["screenshots/final.png"] = _capture_screenshot(connection)
         if process.poll() is None:
+            _record_runtime_errors(work, _take_runtime_errors(connection), stats)
             installation = _mapping(
                 connection.evaluate(
                     "({installed:!!window.__ATT_NW_OBSERVER__,hooks:__ATT_NW_OBSERVER__.installed,"
@@ -465,6 +583,7 @@ def main() -> int:
             "pixel-overflows.jsonl",
             "layout-measurement-unverified.jsonl",
             "font-load-review.jsonl",
+            "runtime-errors.jsonl",
         ):
             path = work / name
             if not path.exists():
@@ -482,7 +601,11 @@ def main() -> int:
         font_review = _font_review(stats)
         unverified_scenarios = sum(1 for item in scenarios if item.get("status") != "verified")
         actual_finding = bool(
-            stats.english_count or stats.overflow_count or stats.requested_font_not_loaded_count
+            stats.english_count
+            or stats.overflow_count
+            or stats.requested_font_not_loaded_count
+            or stats.runtime_error_count
+            or startup.status != "ready"
         )
         has_unverified = bool(
             unverified_scenarios
@@ -505,17 +628,26 @@ def main() -> int:
             "owned_pid": process.pid,
             "input_confirmed_isolated_copy": True,
             "keyboard_injection_used": False,
+            "startup": {
+                "status": startup.status,
+                "scene": startup.scene,
+                "wait_seconds": startup.wait_seconds,
+                "screenshot": startup_screenshot,
+            },
             "observer": installation,
             "scenarios": scenarios,
             "unverified_scenario_count": unverified_scenarios,
             "observation_seconds": (time.monotonic() - observation_started if mode == "observe" else None),
             "observation_stop": observation_stop,
+            "runtime_error_count": stats.runtime_error_count,
+            "runtime_errors_file": "runtime-errors.jsonl",
             **summary,
             "font_review": font_review,
             "interpretation": (
                 "英文项只是实际绘制候选，仍需区分专名、资源名和漏译；"
                 "像素越界只报告 drawText 已提供可测宽度的调用；"
                 "控制符、多行文本或缺少测量 API 的 drawTextEx 只标记为 unverified；"
+                "未捕获异常、引擎错误画面和启动未完成会标记为 needs_review；"
                 "observe 不代表预定义场景已经验收。"
             ),
         }
@@ -532,12 +664,13 @@ def main() -> int:
             _cleanup_work_directory(work) if main_error is not None or stop_problem is not None else None
         )
         if main_error is not None:
-            reason = (
+            category = (
                 "NW.js 本地调试协议不可用"
                 if isinstance(main_error, CdpUnavailableError)
                 else "NW.js 运行时观察没有完成"
             )
-            details = [reason]
+            direct_reason = str(main_error).strip()
+            details = [f"{category}：{direct_reason}" if direct_reason else category]
             if stop_problem is not None:
                 details.append(stop_problem)
             if cleanup_error is not None:

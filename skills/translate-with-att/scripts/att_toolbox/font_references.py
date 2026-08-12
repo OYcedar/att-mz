@@ -31,7 +31,9 @@ _CSS_FAMILY_DECLARATION = re.compile(
     r"(?is)\bfont-family\s*:\s*(?P<quote>['\"]?)(?P<value>[^;'\"}\r\n]+)(?P=quote)\s*;"
 )
 _JS_FONT_LOADER = re.compile(r"(?:\bGraphics\.loadFont|\bFontManager\.load|\bnew\s+FontFace)\s*\(\s*$")
-_JS_FONT_CALL = re.compile(r"(?:\bGraphics\.loadFont|\bFontManager\.load|\bnew\s+FontFace)\s*\([^()\r\n;]*$")
+_JS_FONT_CALL = re.compile(
+    r"(?:\bGraphics\.(?:isFontLoaded|loadFont)|\bFontManager\.load|\bnew\s+FontFace)\s*\([^()\r\n;]*$"
+)
 _HTML_SCRIPT_SRC = re.compile(
     r"(?is)<script\b[^>]*\bsrc\s*=\s*(?P<quote>['\"])(?P<value>[^'\"<>]+)(?P=quote)"
 )
@@ -72,6 +74,14 @@ class FontAlias:
     basis: str
     source: str
     line: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _AliasTarget:
+    """别名解析结果；显式注册的运行时名称不是字体文件身份，替换资源时必须保留。"""
+
+    asset: FontAsset
+    preserve_value: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -432,7 +442,7 @@ def _discover_aliases(
     files: Sequence[Path],
     assets: Sequence[FontAsset],
     runtime_javascript: frozenset[Path],
-) -> tuple[tuple[FontAlias, ...], dict[str, FontAsset], list[ReviewItem]]:
+) -> tuple[tuple[FontAlias, ...], dict[str, _AliasTarget], list[ReviewItem]]:
     """从字体资产 stem、@font-face 和静态加载 API 建立别名到资产的证明图。"""
 
     facts: list[tuple[FontAlias, FontAsset]] = []
@@ -564,7 +574,7 @@ def _discover_aliases(
     by_value: dict[str, list[tuple[FontAlias, FontAsset]]] = {}
     for fact in facts:
         by_value.setdefault(fact[0].value.casefold(), []).append(fact)
-    mapping: dict[str, FontAsset] = {}
+    mapping: dict[str, _AliasTarget] = {}
     accepted: list[FontAlias] = []
     for normalized, candidates in sorted(by_value.items()):
         distinct = {candidate[1].relative_path.casefold() for candidate in candidates}
@@ -578,7 +588,12 @@ def _discover_aliases(
                 )
             )
             continue
-        mapping[normalized] = candidates[0][1]
+        mapping[normalized] = _AliasTarget(
+            asset=candidates[0][1],
+            preserve_value=any(
+                alias.basis in {"css_font_face", "javascript_font_loader"} for alias, _asset in candidates
+            ),
+        )
         accepted.extend(candidate[0] for candidate in candidates)
     return tuple(accepted), mapping, reviews
 
@@ -590,7 +605,7 @@ def _resolve_token(
     game_root: Path,
     content_root: Path,
     assets: Sequence[FontAsset],
-    aliases: Mapping[str, FontAsset],
+    aliases: Mapping[str, _AliasTarget],
     selected_name: str,
     allow_alias: bool,
     allow_asset_path: bool = True,
@@ -610,10 +625,11 @@ def _resolve_token(
         return asset, _new_value(value, selected_name), "asset_path"
     if not value or value != value.strip() or any(character in value for character in "\r\n\x00"):
         return None
-    alias_asset = aliases.get(value.casefold()) if allow_alias else None
-    if alias_asset is None:
+    alias_target = aliases.get(value.casefold()) if allow_alias else None
+    if alias_target is None:
         return None
-    return alias_asset, Path(selected_name).stem, "font_alias"
+    replacement = value if alias_target.preserve_value else Path(selected_name).stem
+    return alias_target.asset, replacement, "font_alias"
 
 
 def _is_font_semantic_name(value: str) -> bool:
@@ -930,7 +946,7 @@ def _nested_json_patches(
     game_root: Path,
     content_root: Path,
     assets: Sequence[FontAsset],
-    aliases: Mapping[str, FontAsset],
+    aliases: Mapping[str, _AliasTarget],
     selected_name: str,
     source_relative: str,
     source_text: str,
@@ -1047,7 +1063,7 @@ def _scan_css(
     game_root: Path,
     content_root: Path,
     assets: Sequence[FontAsset],
-    aliases: Mapping[str, FontAsset],
+    aliases: Mapping[str, _AliasTarget],
     selected_name: str,
 ) -> tuple[list[_TextPatch], list[ReviewItem]]:
     relative = path.relative_to(game_root).as_posix()
@@ -1184,7 +1200,7 @@ def _scan_json(
     game_root: Path,
     content_root: Path,
     assets: Sequence[FontAsset],
-    aliases: Mapping[str, FontAsset],
+    aliases: Mapping[str, _AliasTarget],
     selected_name: str,
 ) -> tuple[list[_TextPatch], list[ReviewItem]]:
     relative = path.relative_to(game_root).as_posix()
@@ -1289,7 +1305,7 @@ def _scan_javascript(
     game_root: Path,
     content_root: Path,
     assets: Sequence[FontAsset],
-    aliases: Mapping[str, FontAsset],
+    aliases: Mapping[str, _AliasTarget],
     selected_name: str,
 ) -> tuple[list[_TextPatch], list[ReviewItem]]:
     relative = path.relative_to(game_root).as_posix()
@@ -1404,7 +1420,7 @@ def _scan_html(
     game_root: Path,
     content_root: Path,
     assets: Sequence[FontAsset],
-    aliases: Mapping[str, FontAsset],
+    aliases: Mapping[str, _AliasTarget],
     selected_name: str,
 ) -> tuple[list[_TextPatch], list[ReviewItem]]:
     """只在 HTML 属性和真实 style/script 内容中处理字体引用。"""
@@ -1527,7 +1543,7 @@ def _scan_generic_text(
     game_root: Path,
     content_root: Path,
     assets: Sequence[FontAsset],
-    aliases: Mapping[str, FontAsset],
+    aliases: Mapping[str, _AliasTarget],
     selected_name: str,
 ) -> tuple[list[_TextPatch], list[ReviewItem]]:
     """处理配置/XML/TXT 中作为完整值出现的已证明字体 token。"""

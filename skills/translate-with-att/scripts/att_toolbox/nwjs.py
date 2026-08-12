@@ -549,12 +549,47 @@ class CdpConnection:
 OBSERVER_SCRIPT = r"""
 (() => {
   if (window.__ATT_NW_OBSERVER__) return {installed: true, reused: true};
-  const state = {events: [], sequence: 0, installedAt: Date.now(), installed: {}};
+  const state = {
+    events: [], runtimeErrors: [], runtimeErrorKeys: Object.create(null),
+    sequence: 0, installedAt: Date.now(), installed: {}
+  };
   const clean = value => String(value == null ? "" : value).replace(/[\u0000-\u001f\u007f]/g, " ");
   const sceneName = () => {
     const scene = window.SceneManager && SceneManager._scene;
     return scene && scene.constructor ? clean(scene.constructor.name) : "";
   };
+  const recordRuntimeError = (kind, message, source, line, column, stack) => {
+    const item = {
+      timestampMs: Date.now(), kind: clean(kind), message: clean(message),
+      source: clean(source), line: Number(line || 0), column: Number(column || 0),
+      stack: clean(stack), scene: sceneName()
+    };
+    const key = [item.message, item.source, item.line, item.column].join("|");
+    if (!item.message || state.runtimeErrorKeys[key]) return;
+    state.runtimeErrorKeys[key] = true;
+    state.runtimeErrors.push(item);
+  };
+  const captureErrorPrinter = () => {
+    const node = document.getElementById("ErrorPrinter");
+    if (!node) return;
+    const text = clean(node.innerText || node.textContent || "").trim();
+    if (text) recordRuntimeError("error_printer", text, "", 0, 0, "");
+  };
+  window.addEventListener("error", event => {
+    const error = event && event.error;
+    recordRuntimeError(
+      "uncaught_error", event && event.message, event && event.filename,
+      event && event.lineno, event && event.colno, error && error.stack
+    );
+  });
+  window.addEventListener("unhandledrejection", event => {
+    const reason = event && event.reason;
+    recordRuntimeError(
+      "unhandled_rejection",
+      reason && (reason.message || reason.stack) || reason,
+      "", 0, 0, reason && reason.stack
+    );
+  });
   const fontEvidence = owner => {
     const face = clean(owner && owner.fontFace || "");
     const size = Number(owner && owner.fontSize || 0);
@@ -668,15 +703,29 @@ OBSERVER_SCRIPT = r"""
     record("FontManager.load", url, {}, name, {requestedFontFace:clean(name), requestedFontSize:0, requestedFontLoaded:null, glyphFallback:"unverified"});
     return original.apply(this, arguments);
   });
+  installed.graphicsPrintError = patch(window.Graphics, "printError", original => function(name, message) {
+    recordRuntimeError("graphics_print_error", clean(name) + ": " + clean(message), "", 0, 0, "");
+    return original.apply(this, arguments);
+  });
+  installed.graphicsPrintLoadingError = patch(window.Graphics, "printLoadingError", original => function(url) {
+    recordRuntimeError("graphics_loading_error", "Failed to load " + clean(url), clean(url), 0, 0, "");
+    return original.apply(this, arguments);
+  });
   const coreReady = installed.bitmapDrawText && installed.windowDrawText && installed.windowDrawTextEx && installed.addCommand;
   const graphicsFontReady = !window.Graphics || typeof Graphics.loadFont !== "function" || installed.loadFont;
   const managerFontReady = !window.FontManager || typeof FontManager.load !== "function" || installed.fontManagerLoad;
-  if (coreReady && graphicsFontReady && managerFontReady && state.installTimer) {
+  const printErrorReady = !window.Graphics || typeof Graphics.printError !== "function" || installed.graphicsPrintError;
+  const loadingErrorReady = !window.Graphics || typeof Graphics.printLoadingError !== "function" || installed.graphicsPrintLoadingError;
+  if (coreReady && graphicsFontReady && managerFontReady && printErrorReady && loadingErrorReady && state.installTimer) {
     clearInterval(state.installTimer);
     state.installTimer = null;
   }
   };
   state.take = () => state.events.splice(0, state.events.length);
+  state.takeErrors = () => {
+    captureErrorPrinter();
+    return state.runtimeErrors.splice(0, state.runtimeErrors.length);
+  };
   state.scene = sceneName;
   window.__ATT_NW_OBSERVER__ = state;
   installHooks();
@@ -703,7 +752,10 @@ def scenario_expression(name: str) -> str:
     """返回不使用键盘事件的场景切换表达式。"""
 
     expressions = {
-        "title": "({supported: !!window.Scene_Title, scene: __ATT_NW_OBSERVER__.scene()})",
+        "title": (
+            "(() => { if (!window.SceneManager || !window.Scene_Title) return {supported:false}; "
+            "SceneManager.goto(Scene_Title); return {supported:true}; })()"
+        ),
         "new_game": (
             "(() => { if (!window.DataManager || !window.SceneManager || !window.Scene_Map) "
             "return {supported:false}; DataManager.setupNewGame(); SceneManager.goto(Scene_Map); "

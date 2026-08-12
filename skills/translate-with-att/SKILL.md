@@ -179,22 +179,15 @@ python <Skill>\scripts\translation_qa.py scan --translations <工作目录>\tran
 
 ## WriteBack、最终运行观察和 QA
 
-集中 Manual apply 后执行 WriteBack，再把输出部署到可丢弃的隔离游戏副本。最终字体 apply、smoke
-（尝试标准场景的自动检查）和 observe（记录正常游玩中的实际绘制）只在该副本执行：
+集中 Manual apply 后执行 WriteBack，再把输出部署到可丢弃的隔离游戏副本。先在该副本完成最终
+字体 apply，再按玩家方式正常启动并等待标题或第一个可交互画面。优先使用 smoke 尝试标准场景，
+需要检查正常游玩分支时再用 observe 记录实际绘制；这些操作都只在隔离副本执行：
 
 只有已经确认具体位置和宽度时才编写 WriteBack 排版规则，并把采用的文件保存到
 `<任务根>\artifacts\rules\write-back-layout.toml`。首次采用时传
 `--layout-rules <该文件>`；校验成功后项目保存规范内容，后续省略参数即可复用。要明确清空时
 传入只含 `rule = []` 的文件。不得用一条统一宽度规则覆盖未经确认的全部文本；字段和
 401/405、字符串 LF 的物化边界以 `docs/translation/write-back-layout-rules.md` 为准。
-
-```powershell
-python <Skill>\scripts\inspect_nwjs_runtime.py smoke --game <隔离副本> --output <任务根>\artifacts\qa\nwjs-smoke --confirm-isolated-copy
-python <Skill>\scripts\inspect_nwjs_runtime.py observe --game <隔离副本> --output <任务根>\artifacts\qa\nwjs-observe --confirm-isolated-copy
-```
-
-单个场景无法安全进入时记为 `unsupported` 并继续；未访问场景是 `unverified`。窗口宽度、
-溢出、字体回退和英文命中只生成 Review。
 
 默认直接 apply；apply 每次都按隔离副本和最终字体输入重新扫描、生成计划并验证，同时输出检查报告。
 只在需要修改前比较或只读调查时先 inspect。每次修改都有事务记录，可按记录 restore：
@@ -204,10 +197,27 @@ python <Skill>\scripts\manage_rpg_maker_fonts.py apply --game <隔离副本> --f
 python <Skill>\scripts\manage_rpg_maker_fonts.py restore --game <隔离副本> --state <工作目录>\font-state --output <任务根>\artifacts\qa\font-restore.json
 ```
 
-字体工具递归处理已确认的完整字体引用，不只修改 MV `gamefont.css` 或 MZ 的单个标准字段。
+字体工具递归处理已确认的完整字体引用，不只修改 MV `gamefont.css` 或 MZ 的单个标准字段；
+`@font-face` 和字体加载 API 已注册的运行时别名必须保留，只替换别名指向的字体资源。
+
+```powershell
+python <Skill>\scripts\inspect_nwjs_runtime.py smoke --game <隔离副本> --output <任务根>\artifacts\qa\nwjs-smoke --confirm-isolated-copy
+python <Skill>\scripts\inspect_nwjs_runtime.py observe --game <隔离副本> --output <任务根>\artifacts\qa\nwjs-observe --confirm-isolated-copy
+```
+
+smoke 必须等游戏离开启动场景，并把未捕获异常、引擎错误画面和启动超时记为 `needs_review`。
+单个后续场景无法安全进入时记为 `unsupported` 并继续；未访问场景是 `unverified`。窗口宽度、
+溢出、字体回退和英文命中只生成 Review。
+
 完成 WriteBack、字体和 NW.js 观察后，使用 Manual 后已经重新导出的 `translation export`、WriteBack 验证报告和运行报告合并
 最终 QA。运行报告、用户实机检查或返修后新出现的可观察事实可以触发下一轮 Manual、WriteBack 和受影响场景复查；
 不得为了避免第二轮而在译前穷举无法确认的内容，也不得因同一静态问题重复返工。
+
+部分 NW.js 包装器不接受 smoke 使用的调试端口。此时不能跳过启动：改用 Windows 界面按玩家方式
+启动同一隔离副本，等待正常交互画面，确认没有错误并保存截图。两种方式都无法取得正常启动证据，
+或实际出现运行时错误时，产物只能称为静态候选，处理完成前不得交给用户作为首次可测试译本。
+译本启动失败后，再用未修改的原版隔离副本执行相同检查以判断问题来源；原版通过而译本失败时，
+即使最先报错的插件文件没有变化，也必须先检查翻译、字体、资源或配置是否破坏了它依赖的启动条件。
 
 ## 恢复与完成
 
@@ -217,5 +227,5 @@ python <Skill>\scripts\manage_rpg_maker_fonts.py restore --game <隔离副本> -
   无法访问的场景保持 `unverified`。
 - 完成必须覆盖声明范围、所有项目、全部输出、Generic 外部消费和实际场景；一次成功退出、
   `Complete` 或抽样检查都不能单独证明整个游戏完成。
-- 首次交付完成只表示用户已有可测试版本；用户实玩反馈尚未处理时，任务处于等待反馈状态，
+- 只有取得正常启动证据后，首次交付才表示用户已有可测试版本；用户实玩反馈尚未处理时，任务处于等待反馈状态，
   不能声称循环结束。反馈到达后只复查受影响范围，不重复已经验证且未受影响的首次流程。
